@@ -1,6 +1,12 @@
 import { useEffect, useState } from "react";
 import { Box, Typography, Chip, Stack } from "@mui/material";
 
+// NB: src/spikes/AlignerSmoke.tsx is intentionally NOT imported here.
+// The aligner package builds under webpack (used by gatewayEdit) but its
+// deep deps mix core-js v2 and v3 paths, which Rollup/Vite can't resolve
+// without significant config work. Parked as a Phase 3 problem — see
+// docs/plan.md "Phase 3 — Alignment editor" for the strategy.
+
 type Health = { ok: boolean; service: string; time: string };
 
 export function App() {
