@@ -2,6 +2,7 @@ node_modules/
 dist/
 build/
 .wrangler/
+*.tsbuildinfo
 .dev.vars
 .dev.vars.*
 .env
