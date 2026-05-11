@@ -15,6 +15,7 @@
   "dependencies": {
     "hono": "^4.6.0",
     "jose": "^5.9.0",
+    "usfm-js": "^3.4.3",
     "zod": "^3.23.0"
   },
   "devDependencies": {
