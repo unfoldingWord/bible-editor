@@ -6,6 +6,7 @@ import DragIndicatorIcon from "@mui/icons-material/DragIndicator";
 import SaveIcon from "@mui/icons-material/Save";
 import SaveOutlinedIcon from "@mui/icons-material/SaveOutlined";
 import UndoIcon from "@mui/icons-material/Undo";
+import AutoAwesomeIcon from "@mui/icons-material/AutoAwesome";
 import type { TnRow } from "../sync/api";
 import { useCatalogs } from "../hooks/useCatalogs";
 import { CatalogPicker } from "./CatalogPicker";
@@ -376,20 +377,28 @@ export function NoteCard({
           />
         </Stack>
         <Stack direction="row" spacing={1} alignItems="flex-start">
-          <Typography
-            variant="caption"
-            sx={{
-              fontFamily: "monospace",
-              color: "text.secondary",
-              textTransform: "uppercase",
-              minWidth: 54,
-              textAlign: "right",
-              pt: 1.25,
-              flexShrink: 0,
-            }}
+          <Stack
+            direction="column"
+            alignItems="center"
+            spacing={0.5}
+            sx={{ minWidth: 54, flexShrink: 0, pt: 1.25 }}
           >
-            Note
-          </Typography>
+            <Typography
+              variant="caption"
+              sx={{
+                fontFamily: "monospace",
+                color: "text.secondary",
+                textTransform: "uppercase",
+              }}
+            >
+              Note
+            </Typography>
+            <Tooltip title="generate this note with AI (not wired up yet)">
+              <IconButton size="small" disabled sx={{ p: 0.25, color: "secondary.main" }}>
+                <AutoAwesomeIcon fontSize="inherit" />
+              </IconButton>
+            </Tooltip>
+          </Stack>
           <TextField
             value={note}
             onChange={(e) => {

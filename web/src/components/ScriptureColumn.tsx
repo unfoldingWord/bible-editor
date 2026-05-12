@@ -401,6 +401,8 @@ function StackedBody({
             key={v}
             onClick={() => onSelectVerse(v)}
             sx={{
+              display: "flex",
+              gap: 1,
               p: 1,
               my: 0.5,
               borderRadius: 1,
@@ -414,33 +416,49 @@ function StackedBody({
             <Typography
               component="span"
               variant="caption"
-              sx={{ fontFamily: "monospace", mr: 0.5, color: "text.disabled" }}
+              sx={{
+                fontFamily: "monospace",
+                color: "text.disabled",
+                minWidth: 36,
+                flexShrink: 0,
+                pt: 0.25,
+              }}
             >
               {v === 0 ? "intro" : `${chapter}:${v}`}
             </Typography>
-            <Typography
-              component="span"
-              variant="caption"
-              sx={{ fontFamily: "monospace", mr: 0.5, textTransform: "uppercase" }}
-            >
-              ULT
-            </Typography>
-            <span>{ultV?.plain_text ?? ""}</span>
-            {ustV && (
-              <Box sx={{ pl: 2, mt: 0.25 }}>
-                <Typography
-                  component="span"
-                  variant="caption"
-                  sx={{ fontFamily: "monospace", mr: 0.5, textTransform: "uppercase" }}
-                >
-                  UST
-                </Typography>
-                <span>{ustV.plain_text ?? ""}</span>
-              </Box>
-            )}
+            <Box sx={{ flex: 1, minWidth: 0 }}>
+              <InactiveLine label="ULT" text={ultV?.plain_text ?? ""} />
+              {ustV && <InactiveLine label="UST" text={ustV.plain_text ?? ""} sx={{ mt: 0.25 }} />}
+            </Box>
           </Box>
         );
       })}
+    </Box>
+  );
+}
+
+// Inactive verse line: version label in a fixed-width gutter so the text
+// wraps consistently across ULT and UST. Matches the gutter used by
+// ActiveLine, just narrower and read-only.
+function InactiveLine({ label, text, sx }: { label: string; text: string; sx?: object }) {
+  return (
+    <Box sx={{ display: "flex", gap: 0.75, ...sx }}>
+      <Typography
+        component="span"
+        variant="caption"
+        sx={{
+          fontFamily: "monospace",
+          textTransform: "uppercase",
+          minWidth: 28,
+          flexShrink: 0,
+          pt: 0.25,
+        }}
+      >
+        {label}
+      </Typography>
+      <Box component="span" sx={{ flex: 1 }}>
+        {text}
+      </Box>
     </Box>
   );
 }
