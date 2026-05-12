@@ -367,19 +367,6 @@ function VerseStrip({
         {chapter}:{verseNum}
       </Box>
       <Box>
-        <Chip
-          label={bibleVersion}
-          size="small"
-          color="primary"
-          variant="filled"
-          sx={{ mr: 1, fontFamily: "monospace", height: 18, fontWeight: 700 }}
-        />
-        <EditableStripCell
-          verse={verse}
-          onEdit={onEditVerseText ? (plain, base) => onEditVerseText(bibleVersion, plain, base) : undefined}
-        />
-      </Box>
-      <Box>
         <Tooltip title={switchable ? `align ${otherLabel} for this verse instead` : ""}>
           <Chip
             label={otherLabel}
@@ -398,6 +385,19 @@ function VerseStrip({
         <EditableStripCell
           verse={other}
           onEdit={onEditVerseText ? (plain, base) => onEditVerseText(otherLabel, plain, base) : undefined}
+        />
+      </Box>
+      <Box>
+        <Chip
+          label={bibleVersion}
+          size="small"
+          color="primary"
+          variant="filled"
+          sx={{ mr: 1, fontFamily: "monospace", height: 18, fontWeight: 700 }}
+        />
+        <EditableStripCell
+          verse={verse}
+          onEdit={onEditVerseText ? (plain, base) => onEditVerseText(bibleVersion, plain, base) : undefined}
         />
       </Box>
       <Box>

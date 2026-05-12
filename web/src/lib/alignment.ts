@@ -1,54 +1,73 @@
 // Parse and serialize word alignments to/from the usfm-js verse-objects
-// JSON tree. Each `zaln` milestone is one alignment group: a single source
-// word (Hebrew/Greek, via x-content + x-strong + x-lemma + x-morph) with N
-// target-language `\w` children aligned to it. Target words that sit
-// outside any milestone are "unaligned" — they exist in the verse but
-// aren't tied to a source token yet.
+// JSON tree.
 //
-// This file handles only the **flat** case (one source word per milestone,
-// no nesting). Compound alignments where multiple source words map to a
-// single phrase are a Phase 4 enhancement; for v1 we preserve them on read
-// and round-trip them unchanged if the user doesn't touch them.
+// Internal model: target English (or other GL) text is a flat document-order
+// stream of word + text items. Each word optionally carries an `alignedTo`
+// tag pointing at a source group; the source groups themselves live in a
+// separate list keyed by uid. This decouples target-text order from
+// alignment metadata so an alignment edit never reorders the verse's
+// natural reading order.
+//
+// On parse, two `\zaln-s` pairs that wrap the same Hebrew/Greek source
+// (e.g. Zec 3:4 "Take ... off" around "those filthy clothes") merge into
+// one group. On serialize, a group whose tagged target words are
+// non-contiguous in the stream splits back into multiple `\zaln-s` pairs
+// — one per contiguous run — so the emitted USFM stays valid (milestones
+// always wrap contiguous text).
+//
+// Public API exposes `state.groups` (with derived `targets[]` per group,
+// in stream order) and `state.unaligned` (flat list of words with no
+// alignment), unchanged for callers / UI.
 
 import { nfc } from "./hebrew";
 
 export interface SourceWord {
-  id: string;             // local-only id for drag/drop between groups
+  id: string;
   strong: string;
   lemma: string;
   morph: string;
   occurrence: string;
   occurrences: string;
-  content: string;        // the actual Hebrew/Greek text
+  content: string;
 }
 
 export interface TargetWord {
-  id: string;             // local-only id for drag/drop
+  id: string;
   text: string;
   occurrence: string;
   occurrences: string;
 }
 
 export interface AlignmentGroup {
-  id: string;             // local-only id
+  id: string;
   source: SourceWord[];   // 1+ source words; 2+ = compound (nested milestones)
-  targets: TargetWord[];
-  // Raw text that appeared in the USFM stream between the previous
-  // alignment element and this milestone — usually a single space, but
-  // also where verse-internal punctuation lives (",", "{", "."). Without
-  // this we'd dump all punctuation into the trailing tail and the verse
-  // would render with clumped punctuation at the end.
-  textBefore: string;
+  targets: TargetWord[];  // derived view — stream words with alignedTo === this.id, in stream order
 }
 
+interface StreamWord {
+  kind: "word";
+  word: TargetWord;
+  alignedTo: string | null; // group id, or null when unaligned
+}
+interface StreamText {
+  kind: "text";
+  text: string;
+}
+type StreamItem = StreamWord | StreamText;
+
 export interface AlignmentState {
+  // Internal document-order stream of target text + words. The single
+  // source of truth for "where each target word sits in the verse".
+  stream: StreamItem[];
+  // Source-word groups, keyed by id, independent of stream order. UHB
+  // display order is computed separately in the dialog.
+  sourceGroups: AlignmentGroup[];
+  // Derived views, refreshed on every mutation for UI compat.
   groups: AlignmentGroup[];
   unaligned: TargetWord[];
-  prefix: ParsedNode[];   // leading non-alignment, non-text passthrough nodes (paragraph markers, etc.)
-  passthroughTail: ParsedNode[]; // trailing non-text passthrough nodes
-  // Text after the last alignment element (before any non-text passthrough).
-  // Common case: closing punctuation that follows the last \zaln-e\* marker.
-  trailingText: string;
+  // Passthrough nodes that the alignment model doesn't touch.
+  prefix: ParsedNode[];
+  passthroughTail: ParsedNode[];
 }
 
 type ParsedNode = Record<string, unknown>;
@@ -56,9 +75,11 @@ type ParsedNode = Record<string, unknown>;
 function nodeIsZaln(n: ParsedNode | undefined): boolean {
   return !!n && n["type"] === "milestone" && n["tag"] === "zaln";
 }
-
 function nodeIsWord(n: ParsedNode | undefined): boolean {
   return !!n && n["type"] === "word" && n["tag"] === "w";
+}
+function nodeIsText(n: ParsedNode | undefined): boolean {
+  return !!n && n["type"] === "text" && typeof n["text"] === "string";
 }
 
 function sourceOf(node: ParsedNode): SourceWord {
@@ -82,115 +103,131 @@ function targetOf(node: ParsedNode): TargetWord {
   };
 }
 
-function nodeIsText(n: ParsedNode | undefined): boolean {
-  return !!n && n["type"] === "text" && typeof n["text"] === "string";
+function uid(): string {
+  return (typeof crypto !== "undefined" && "randomUUID" in crypto)
+    ? crypto.randomUUID()
+    : `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
-// Walk a list of nodes (already filtered to alignment + word + text)
-// in document order, attaching the running text buffer to each new group
-// as `textBefore`. Bare \w tokens become unaligned. Text nodes seen
-// before any group accumulate into `leadingTextSink` (which the caller
-// then assigns to the first group, or to trailingText if no groups
-// exist).
+// Two source chains identify the same alignment group when their source
+// words match position-for-position on (strong, occurrence, content). Used
+// to merge multiple `\zaln-s` pairs that wrap the same Hebrew/Greek token
+// (non-contiguous alignment in the original USFM) into one logical group.
+function sameSourceChain(a: SourceWord[], b: SourceWord[]): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i].strong !== b[i].strong) return false;
+    if (a[i].occurrence !== b[i].occurrence) return false;
+    if (nfc(a[i].content) !== nfc(b[i].content)) return false;
+  }
+  return true;
+}
+
+function findExistingGroup(
+  groups: AlignmentGroup[],
+  chain: SourceWord[],
+): string | null {
+  for (const g of groups) {
+    if (sameSourceChain(g.source, chain)) return g.id;
+  }
+  return null;
+}
+
 function walk(
   nodes: ParsedNode[],
   sourceChain: SourceWord[],
-  groups: AlignmentGroup[],
-  unaligned: TargetWord[],
-  textBufferRef: { text: string },
+  stream: StreamItem[],
+  sourceGroups: AlignmentGroup[],
+  currentGroupId: string | null,
 ): void {
   for (const node of nodes ?? []) {
     if (!node || typeof node !== "object") continue;
     if (nodeIsZaln(node)) {
       const chain = [...sourceChain, sourceOf(node)];
       const children = (node["children"] as ParsedNode[] | undefined) ?? [];
-      const directTargets: TargetWord[] = [];
-      const nestedMilestones: ParsedNode[] = [];
-      for (const child of children) {
-        if (nodeIsWord(child)) directTargets.push(targetOf(child));
-        else if (nodeIsZaln(child)) nestedMilestones.push(child);
+      const hasDirectWord = children.some(nodeIsWord);
+      let nextGroupId = currentGroupId;
+      if (hasDirectWord) {
+        const existing = findExistingGroup(sourceGroups, chain);
+        if (existing) {
+          nextGroupId = existing;
+        } else {
+          const id = uid();
+          sourceGroups.push({ id, source: chain, targets: [] });
+          nextGroupId = id;
+        }
       }
-      if (directTargets.length > 0) {
-        groups.push({
-          id: uid(),
-          source: chain,
-          targets: directTargets,
-          textBefore: textBufferRef.text,
-        });
-        textBufferRef.text = "";
-      }
-      if (nestedMilestones.length > 0) {
-        walk(nestedMilestones, chain, groups, unaligned, textBufferRef);
-      }
-    } else if (nodeIsWord(node) && sourceChain.length === 0) {
-      unaligned.push(targetOf(node));
-    } else if (nodeIsText(node) && sourceChain.length === 0) {
-      // Only top-level text contributes to between-milestone text. Text
-      // inside a milestone's children is part of that milestone.
-      textBufferRef.text += String(node["text"] ?? "");
+      walk(children, chain, stream, sourceGroups, nextGroupId);
+    } else if (nodeIsWord(node)) {
+      stream.push({ kind: "word", word: targetOf(node), alignedTo: currentGroupId });
+    } else if (nodeIsText(node)) {
+      stream.push({ kind: "text", text: String(node["text"] ?? "") });
     }
   }
 }
 
-function uid(): string {
-  // Browser + worker support crypto.randomUUID. Node 19+ does too.
-  return (typeof crypto !== "undefined" && "randomUUID" in crypto)
-    ? crypto.randomUUID()
-    : `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+function deriveViews(state: Omit<AlignmentState, "groups" | "unaligned">): {
+  groups: AlignmentGroup[];
+  unaligned: TargetWord[];
+} {
+  const byGroup = new Map<string, TargetWord[]>();
+  const unaligned: TargetWord[] = [];
+  for (const item of state.stream) {
+    if (item.kind !== "word") continue;
+    if (item.alignedTo) {
+      const list = byGroup.get(item.alignedTo) ?? [];
+      list.push(item.word);
+      byGroup.set(item.alignedTo, list);
+    } else {
+      unaligned.push(item.word);
+    }
+  }
+  const groups = state.sourceGroups.map((g) => ({
+    ...g,
+    targets: byGroup.get(g.id) ?? [],
+  }));
+  return { groups, unaligned };
+}
+
+function finalize(state: Omit<AlignmentState, "groups" | "unaligned">): AlignmentState {
+  return { ...state, ...deriveViews(state) };
 }
 
 export function parseAlignment(
   verseObjects: unknown[],
   sourceVerseObjects?: unknown[] | null,
 ): AlignmentState {
-  const groups: AlignmentGroup[] = [];
-  const unaligned: TargetWord[] = [];
-  const prefix: ParsedNode[] = [];
-  const tail: ParsedNode[] = [];
-
-  let seenContent = false;
   const inputs = (verseObjects ?? []) as ParsedNode[];
+  const prefix: ParsedNode[] = [];
+  const passthroughTail: ParsedNode[] = [];
 
-  // Split into:
-  //   prefix: leading non-text passthrough nodes (paragraph markers, etc.)
-  //   tail:   trailing non-text passthrough nodes
-  // Text and alignment-stream nodes are handled by the walk below; they
-  // need to stay interleaved with the alignment groups, not lumped at the
-  // end of the verse.
+  // Split into prefix/tail (non-text passthrough markers like \p) and the
+  // alignment stream (milestones, words, text in document order).
+  let seenContent = false;
   for (const node of inputs) {
     if (!node || typeof node !== "object") continue;
     if (nodeIsZaln(node) || nodeIsWord(node)) {
       seenContent = true;
       continue;
     }
-    if (nodeIsText(node)) continue; // text is captured by walk
+    if (nodeIsText(node)) continue;
     if (!seenContent) prefix.push(node);
-    else tail.push(node);
+    else passthroughTail.push(node);
   }
 
-  // Walk milestone / word / text nodes in document order so each new
-  // group picks up the text that preceded it as `textBefore`.
-  const textBufferRef = { text: "" };
+  const stream: StreamItem[] = [];
+  const sourceGroups: AlignmentGroup[] = [];
   walk(
     inputs.filter((n) => nodeIsZaln(n) || nodeIsWord(n) || nodeIsText(n)),
     [],
-    groups,
-    unaligned,
-    textBufferRef,
+    stream,
+    sourceGroups,
+    null,
   );
-  // Whatever text ran past the last group becomes the verse's trailing
-  // text (closing punctuation, etc.).
-  const trailingText = textBufferRef.text;
 
-  const state: AlignmentState = {
-    groups,
-    unaligned,
-    prefix,
-    passthroughTail: tail,
-    trailingText,
-  };
-  if (!sourceVerseObjects) return state;
-  return withSourceCoverage(state, sourceVerseObjects);
+  const base = { stream, sourceGroups, prefix, passthroughTail };
+  if (!sourceVerseObjects) return finalize(base);
+  return finalize(withSourceCoverage(base, sourceVerseObjects));
 }
 
 export function verseHasUnalignedWork(
@@ -209,18 +246,10 @@ interface CollectedSourceWord {
   lemma: string;
   morph: string;
   text: string;
-  textKey: string;        // NFC-normalized text, used for milestone matching
-  textOccurrence: number; // running count keyed on textKey
+  textKey: string;
+  textOccurrence: number;
 }
 
-
-// Walk the UHB/UGNT verse tree to enumerate every \w token with its
-// document-order position. UHB tokens lack an explicit `occurrence` field;
-// we derive a text-keyed counter so a milestone whose x-content matches the
-// Nth same-text token in source resolves to that exact position. Strong-
-// keyed counting isn't useful because multiple source words can share a
-// Strong's (e.g. אֶל and אֵלָיו both H0413), and the milestone's occurrence
-// is measured relative to its content, not its strong.
 function collectSourceWords(verseObjects: unknown[]): CollectedSourceWord[] {
   const out: CollectedSourceWord[] = [];
   const textCounts = new Map<string, number>();
@@ -252,18 +281,6 @@ function collectSourceWords(verseObjects: unknown[]): CollectedSourceWord[] {
   return out;
 }
 
-// Find a parsed source word's UHB position. Multiple source words can share
-// a Strong's (e.g. אֶל and אֵלָיו are both H0413), so match by content text
-// first — the milestone's x-content uniquely identifies the UHB token. Fall
-// back to strong-only when content lookup fails (cantillation marks can
-// differ between an x-content attribute and a \w token's text).
-//
-// Over-numbered occurrence fallback: ULT/UST occasionally tag the same UHB
-// token across two milestones with x-occurrence="1/2" + "2/2" even when the
-// UHB has just one match (e.g. Zec 2:8's two אָמַר֮ milestones, one inside
-// a compound and one standalone, against a single UHB אָמַר֮). When the
-// requested occurrence overshoots the available matches, fall back to the
-// first match — both milestones reference the same Hebrew token.
 function findSourcePosition(
   sourceWords: CollectedSourceWord[],
   s: SourceWord,
@@ -297,20 +314,18 @@ function findSourcePosition(
   return -1;
 }
 
-// Augment the parsed alignment with synthetic placeholder groups for any
-// UHB/UGNT source word the target USFM didn't reference. This makes
-// previously-invisible source words (e.g. UST has no milestone for
-// לֵאמֹר) appear in the dialog as empty drop slots the editor can fill.
-// On save, empty groups are filtered out so the USFM stays clean unless
-// the editor populates them.
+// Augment with synthetic source groups for any UHB/UGNT word the target
+// USFM didn't reference, so the dialog can show empty drop slots. Empty
+// groups don't emit anything; when populated, the chips emit at their
+// stream positions wrapped in milestones tagged to the placeholder source.
 function withSourceCoverage(
-  state: AlignmentState,
+  base: Omit<AlignmentState, "groups" | "unaligned">,
   sourceVerseObjects: unknown[],
-): AlignmentState {
+): Omit<AlignmentState, "groups" | "unaligned"> {
   const sourceWords = collectSourceWords(sourceVerseObjects);
-  if (sourceWords.length === 0) return state;
+  if (sourceWords.length === 0) return base;
   const covered = new Set<number>();
-  for (const g of state.groups) {
+  for (const g of base.sourceGroups) {
     for (const s of g.source) {
       const p = findSourcePosition(sourceWords, s);
       if (p >= 0) covered.add(p);
@@ -337,10 +352,9 @@ function withSourceCoverage(
         },
       ],
       targets: [],
-      textBefore: "",
     });
   }
-  return { ...state, groups: [...state.groups, ...placeholders] };
+  return { ...base, sourceGroups: [...base.sourceGroups, ...placeholders] };
 }
 
 function buildMilestone(source: SourceWord, children: ParsedNode[]): ParsedNode {
@@ -358,108 +372,146 @@ function buildMilestone(source: SourceWord, children: ParsedNode[]): ParsedNode 
   };
 }
 
+function buildNestedMilestone(chain: SourceWord[], children: ParsedNode[]): ParsedNode {
+  // Innermost source wraps children directly; each outer source wraps the
+  // resulting milestone, recreating the original `\zaln-s` nesting for
+  // compounds (multiple source words → one alignment group).
+  let node: ParsedNode = buildMilestone(chain[chain.length - 1], children);
+  for (let i = chain.length - 2; i >= 0; i--) {
+    node = buildMilestone(chain[i], [node]);
+  }
+  return node;
+}
+
+function wordNode(t: TargetWord): ParsedNode {
+  return {
+    text: t.text,
+    tag: "w",
+    type: "word",
+    occurrence: t.occurrence,
+    occurrences: t.occurrences,
+  };
+}
+
+// Walk the document-order stream. Open a milestone on entering an aligned
+// run, close it on exit, and let unaligned words and text segments emit as
+// bare top-level nodes between milestones. Text that sits between two
+// stream words with the SAME alignment lives inside that milestone; text
+// flanking an alignment change goes outside.
 export function serializeAlignment(state: AlignmentState): unknown[] {
   const out: ParsedNode[] = [...state.prefix];
+  const groupById = new Map(state.sourceGroups.map((g) => [g.id, g]));
 
-  // Empty groups (synthesized placeholders or compounds the user cleared
-  // without re-aligning) don't emit a milestone — but their `textBefore`
-  // shouldn't vanish either. We fold it into the next emittable group's
-  // textBefore, or into the trailing text if no more groups remain.
+  let current: string | null = null;
+  let openChildren: ParsedNode[] | null = null;
   let pendingText = "";
-  for (const group of state.groups) {
-    const combined = pendingText + (group.textBefore || "");
-    if (group.targets.length === 0) {
-      pendingText = combined;
+
+  const closeMilestone = (): void => {
+    if (current === null || !openChildren) return;
+    const group = groupById.get(current);
+    if (group) out.push(buildNestedMilestone(group.source, openChildren));
+    current = null;
+    openChildren = null;
+  };
+
+  const flushPendingOutside = (): void => {
+    if (pendingText) {
+      out.push({ type: "text", text: pendingText });
+      pendingText = "";
+    }
+  };
+
+  const flushPendingInside = (): void => {
+    if (pendingText && openChildren) {
+      openChildren.push({ type: "text", text: pendingText });
+      pendingText = "";
+    }
+  };
+
+  for (const item of state.stream) {
+    if (item.kind === "text") {
+      pendingText += item.text;
       continue;
     }
-    if (combined) out.push({ type: "text", text: combined });
-    pendingText = "";
-
-    const targetTokens: ParsedNode[] = [];
-    group.targets.forEach((t, ti) => {
-      if (ti > 0) targetTokens.push({ type: "text", text: " " });
-      targetTokens.push({
-        text: t.text,
-        tag: "w",
-        type: "word",
-        occurrence: t.occurrence,
-        occurrences: t.occurrences,
-      });
-    });
-
-    // Nest from the innermost source outward.
-    let node: ParsedNode = buildMilestone(
-      group.source[group.source.length - 1],
-      targetTokens,
-    );
-    for (let i = group.source.length - 2; i >= 0; i--) {
-      node = buildMilestone(group.source[i], [node]);
+    const next = item.alignedTo;
+    if (next === current && current !== null) {
+      flushPendingInside();
+      openChildren!.push(wordNode(item.word));
+      continue;
     }
-    out.push(node);
-  }
-
-  // Trailing text from the original USFM (post-final-milestone punctuation)
-  // plus anything that pooled up from skipped empty groups.
-  const tail = pendingText + (state.trailingText || "");
-  if (tail) out.push({ type: "text", text: tail });
-
-  // Unaligned target words tail.
-  if (state.unaligned.length > 0) {
-    if (out[out.length - 1]?.["type"] !== "text") {
-      out.push({ type: "text", text: " " });
+    if (current !== null) {
+      // Text accumulated while a milestone was open belongs OUTSIDE that
+      // milestone when the next word breaks the run — it was the gap
+      // between two milestones, not internal whitespace.
+      closeMilestone();
     }
-    state.unaligned.forEach((t, i) => {
-      if (i > 0) out.push({ type: "text", text: " " });
-      out.push({
-        text: t.text,
-        tag: "w",
-        type: "word",
-        occurrence: t.occurrence,
-        occurrences: t.occurrences,
-      });
-    });
+    flushPendingOutside();
+    if (next !== null) {
+      const group = groupById.get(next);
+      if (!group) {
+        // Word references a group that no longer exists — fall back to
+        // emitting it as bare to avoid losing the text.
+        out.push(wordNode(item.word));
+        current = null;
+        openChildren = null;
+        continue;
+      }
+      current = next;
+      openChildren = [wordNode(item.word)];
+    } else {
+      out.push(wordNode(item.word));
+      current = null;
+      openChildren = null;
+    }
   }
+  if (current !== null) closeMilestone();
+  flushPendingOutside();
 
   out.push(...state.passthroughTail);
   return out;
 }
 
-// Helper for the dialog: render the GL text strung together from groups +
-// unaligned, in target-word order, with spaces.
 export function alignmentPlainText(state: AlignmentState): string {
-  const words: string[] = [];
-  for (const g of state.groups) for (const t of g.targets) words.push(t.text);
-  for (const t of state.unaligned) words.push(t.text);
-  return words.join(" ");
+  const parts: string[] = [];
+  for (const item of state.stream) {
+    if (item.kind === "text") parts.push(item.text);
+    else parts.push(item.word.text);
+  }
+  return parts.join("").replace(/\s+/g, " ").trim();
 }
 
-// Clear all target words from `groupId` (back to unaligned) and split any
-// compound source chain into singleton groups so the user can re-align each
-// Hebrew word independently. The source words themselves are preserved.
+// Clear all target words from `groupId` (back to unaligned). For compound
+// source chains, split into singleton groups so the user can re-align
+// each Hebrew word independently. The first singleton inherits the
+// cleared group's id so stream items still resolve to a live group.
 export function clearGroup(state: AlignmentState, groupId: string): AlignmentState {
-  const idx = state.groups.findIndex((g) => g.id === groupId);
+  const idx = state.sourceGroups.findIndex((g) => g.id === groupId);
   if (idx < 0) return state;
-  const target = state.groups[idx];
-  const orphanedTargets = target.targets;
-  // Replace the group in-place with one singleton group per source word.
-  // textBefore stays with the first singleton — that's where the original
-  // milestone's leading text logically belongs.
+  const target = state.sourceGroups[idx];
   const singletons: AlignmentGroup[] = target.source.map((s, i) => ({
-    id: uid(),
+    id: i === 0 ? target.id : uid(),
     source: [s],
     targets: [],
-    textBefore: i === 0 ? target.textBefore : "",
   }));
-  const groups = [...state.groups.slice(0, idx), ...singletons, ...state.groups.slice(idx + 1)];
-  const unaligned = [...state.unaligned, ...orphanedTargets];
-  return { ...state, groups, unaligned };
+  const sourceGroups = [
+    ...state.sourceGroups.slice(0, idx),
+    ...singletons,
+    ...state.sourceGroups.slice(idx + 1),
+  ];
+  // Any stream word that pointed at the cleared group becomes unaligned;
+  // the first singleton owns the cleared id but starts with no targets.
+  const stream = state.stream.map((item) =>
+    item.kind === "word" && item.alignedTo === groupId
+      ? { ...item, alignedTo: null }
+      : item,
+  );
+  return finalize({ ...state, sourceGroups, stream });
 }
 
-// Move a source word (identified by SourceWord.id) into `destGroupId`'s
-// source chain, making that group compound. If the source's previous group
-// becomes empty (no remaining sources), its targets merge into the
-// destination group's targets — the user merged the source words, so their
-// already-aligned GL words logically belong with the merged group.
+// Move a source word from its current group into `destGroupId`'s source
+// chain, making that group compound. If the source group collapses (its
+// last source word left), every stream word aligned to it re-points at
+// the destination so previously-attached targets follow their source.
 export function moveSource(
   state: AlignmentState,
   sourceId: string,
@@ -467,7 +519,7 @@ export function moveSource(
 ): AlignmentState {
   let moving: SourceWord | null = null;
   let fromGroupId: string | null = null;
-  for (const g of state.groups) {
+  for (const g of state.sourceGroups) {
     const found = g.source.find((s) => s.id === sourceId);
     if (found) {
       moving = found;
@@ -476,49 +528,34 @@ export function moveSource(
     }
   }
   if (!moving || !fromGroupId || fromGroupId === destGroupId) return state;
-  let mergedTargets: TargetWord[] = [];
-  // If the source group is collapsing because its last source is moving,
-  // its textBefore would orphan — hand it to the next group so it lands
-  // somewhere sensible during serialize.
-  let orphanedText = "";
-  const intermediate: AlignmentGroup[] = [];
-  for (const g of state.groups) {
+  let collapsed = false;
+  const sourceGroups: AlignmentGroup[] = [];
+  for (const g of state.sourceGroups) {
     if (g.id === fromGroupId) {
-      const remainingSources = g.source.filter((s) => s.id !== sourceId);
-      if (remainingSources.length === 0) {
-        mergedTargets = g.targets;
-        orphanedText = g.textBefore || "";
+      const remaining = g.source.filter((s) => s.id !== sourceId);
+      if (remaining.length === 0) {
+        collapsed = true;
         continue;
       }
-      intermediate.push({ ...g, source: remainingSources });
+      sourceGroups.push({ ...g, source: remaining });
+    } else if (g.id === destGroupId) {
+      sourceGroups.push({ ...g, source: [...g.source, moving] });
     } else {
-      intermediate.push(g);
+      sourceGroups.push(g);
     }
   }
-  // Apply orphanedText to the first group after the collapsed slot — keeps
-  // post-collapse word order looking right when no remaining group sits in
-  // the original spot.
-  let textApplied = false;
-  const groups = intermediate.map((g) => {
-    if (g.id === destGroupId) {
-      return {
-        ...g,
-        source: [...g.source, moving!],
-        targets: [...g.targets, ...mergedTargets],
-      };
-    }
-    if (!textApplied && orphanedText) {
-      textApplied = true;
-      return { ...g, textBefore: orphanedText + (g.textBefore || "") };
-    }
-    return g;
-  });
-  return { ...state, groups };
+  const stream = collapsed
+    ? state.stream.map((item) =>
+        item.kind === "word" && item.alignedTo === fromGroupId
+          ? { ...item, alignedTo: destGroupId }
+          : item,
+      )
+    : state.stream;
+  return finalize({ ...state, sourceGroups, stream });
 }
 
-// Apply moveTarget for multiple word ids in document order. Used when the
-// user shift-selects several chips in the unaligned bag and drags the bundle
-// onto a single destination.
+// Apply moveTarget for multiple word ids. Used when the user shift-selects
+// chips and drags the bundle onto one destination.
 export function moveTargets(
   state: AlignmentState,
   wordIds: string[],
@@ -532,37 +569,22 @@ export function moveTargets(
 }
 
 // Move a target word identified by `wordId` to a destination ("g:<groupId>"
-// or "u" for the unaligned bag). Returns a new AlignmentState.
+// or "u" for unaligned). Crucially, the word stays in its original stream
+// position; only its `alignedTo` tag changes. The verse's plain text
+// order is invariant across alignment edits.
 export function moveTarget(state: AlignmentState, wordId: string, dest: string): AlignmentState {
-  let moving: TargetWord | null = null;
-  const groups = state.groups.map((g) => {
-    const targets = g.targets.filter((t) => {
-      if (t.id === wordId) {
-        moving = t;
-        return false;
-      }
-      return true;
-    });
-    return { ...g, targets };
+  let newAlignment: string | null | undefined = undefined;
+  if (dest === "u") newAlignment = null;
+  else if (dest.startsWith("g:")) newAlignment = dest.slice(2);
+  if (newAlignment === undefined) return state;
+
+  let changed = false;
+  const stream = state.stream.map((item) => {
+    if (item.kind !== "word" || item.word.id !== wordId) return item;
+    if (item.alignedTo === newAlignment) return item;
+    changed = true;
+    return { ...item, alignedTo: newAlignment };
   });
-  let unaligned = state.unaligned.filter((t) => {
-    if (t.id === wordId) {
-      moving = t;
-      return false;
-    }
-    return true;
-  });
-  if (!moving) return state;
-  if (dest === "u") {
-    unaligned = [...unaligned, moving];
-  } else if (dest.startsWith("g:")) {
-    const targetId = dest.slice(2);
-    for (const g of groups) {
-      if (g.id === targetId) {
-        g.targets = [...g.targets, moving];
-        break;
-      }
-    }
-  }
-  return { ...state, groups, unaligned };
+  if (!changed) return state;
+  return finalize({ ...state, stream });
 }
