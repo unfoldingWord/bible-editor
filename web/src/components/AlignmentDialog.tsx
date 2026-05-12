@@ -67,15 +67,20 @@ export function AlignmentDialog({
 
   const [state, setState] = useState<AlignmentState | null>(initial);
   const [selectedUnaligned, setSelectedUnaligned] = useState<Set<string>>(new Set());
+  // Anchor for shift-range select — the last chip the user clicked without
+  // shift. Cleared with the bag's × button or after a drop.
+  const [selectionAnchor, setSelectionAnchor] = useState<string | null>(null);
   useEffect(() => {
     setState(initial);
     setSelectedUnaligned(new Set());
+    setSelectionAnchor(null);
   }, [initial]);
 
   const handleTargetsDrop = (dest: string, wordIds: string[]) => {
     if (!state || wordIds.length === 0) return;
     setState(moveTargets(state, wordIds, dest));
     setSelectedUnaligned(new Set());
+    setSelectionAnchor(null);
   };
 
   const handleSourceDrop = (destGroupId: string, sourceId: string) => {
@@ -88,19 +93,37 @@ export function AlignmentDialog({
     setState(clearGroup(state, groupId));
   };
 
+  const handleClearSelection = () => {
+    setSelectedUnaligned(new Set());
+    setSelectionAnchor(null);
+  };
+
+  // Click toggles a single chip (additive); shift-click extends the selection
+  // from the last-clicked anchor through the chip the user just clicked.
   const handleChipClick = (id: string, shift: boolean) => {
-    setSelectedUnaligned((prev) => {
-      if (shift) {
-        const next = new Set(prev);
-        if (next.has(id)) next.delete(id);
-        else next.add(id);
-        return next;
+    if (!state) return;
+    if (shift && selectionAnchor) {
+      const all = state.unaligned.map((w) => w.id);
+      const a = all.indexOf(selectionAnchor);
+      const b = all.indexOf(id);
+      if (a >= 0 && b >= 0) {
+        const [lo, hi] = a < b ? [a, b] : [b, a];
+        const range = all.slice(lo, hi + 1);
+        setSelectedUnaligned((prev) => {
+          const next = new Set(prev);
+          for (const w of range) next.add(w);
+          return next;
+        });
+        return;
       }
-      // Plain click: if this chip is the only one selected, deselect it;
-      // otherwise reset selection to just this chip.
-      if (prev.size === 1 && prev.has(id)) return new Set();
-      return new Set([id]);
+    }
+    setSelectedUnaligned((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
     });
+    setSelectionAnchor(id);
   };
 
   // When the user starts dragging an unaligned chip that's part of the
@@ -113,6 +136,7 @@ export function AlignmentDialog({
   const handleReset = () => {
     setState(initial);
     setSelectedUnaligned(new Set());
+    setSelectionAnchor(null);
   };
   const handleSave = () => {
     if (!state || !verse) return;
@@ -161,6 +185,7 @@ export function AlignmentDialog({
                 selectedIds={selectedUnaligned}
                 onChipClick={handleChipClick}
                 idsForDrag={idsForUnalignedDrag}
+                onClearSelection={handleClearSelection}
                 onDrop={(wordIds) => handleTargetsDrop("u", wordIds)}
               />
               <AlignmentGrid
@@ -259,15 +284,18 @@ function UnalignedBag({
   selectedIds,
   onChipClick,
   idsForDrag,
+  onClearSelection,
   onDrop,
 }: {
   state: AlignmentState;
   selectedIds: Set<string>;
   onChipClick: (id: string, shift: boolean) => void;
   idsForDrag: (id: string) => string[];
+  onClearSelection: () => void;
   onDrop: (wordIds: string[]) => void;
 }) {
   const [over, setOver] = useState(false);
+  const unalignedIds = new Set(state.unaligned.map((w) => w.id));
   return (
     <Box
       onDragOver={(e) => {
@@ -279,7 +307,10 @@ function UnalignedBag({
         e.preventDefault();
         setOver(false);
         const ids = readWordIds(e.dataTransfer);
-        if (ids.length > 0) onDrop(ids);
+        // Reorder within the bag is intentionally a no-op: only ship ids
+        // that aren't already in the unaligned pool back to the parent.
+        const movable = ids.filter((id) => !unalignedIds.has(id));
+        if (movable.length > 0) onDrop(movable);
       }}
       sx={{
         bgcolor: over ? "primary.50" : "grey.50",
@@ -289,20 +320,28 @@ function UnalignedBag({
         overflowY: "auto",
       }}
     >
-      <Typography
-        variant="caption"
-        sx={{
-          fontFamily: "monospace",
-          color: "text.disabled",
-          textTransform: "uppercase",
-          letterSpacing: 0.5,
-          display: "block",
-          mb: 1,
-        }}
-      >
-        unaligned GL words ({state.unaligned.length})
-        {selectedIds.size > 1 && ` · ${selectedIds.size} selected`}
-      </Typography>
+      <Stack direction="row" alignItems="center" spacing={0.5} sx={{ mb: 1 }}>
+        <Typography
+          variant="caption"
+          sx={{
+            fontFamily: "monospace",
+            color: "text.disabled",
+            textTransform: "uppercase",
+            letterSpacing: 0.5,
+            flex: 1,
+          }}
+        >
+          unaligned ({state.unaligned.length})
+          {selectedIds.size > 0 && ` · ${selectedIds.size} sel`}
+        </Typography>
+        {selectedIds.size > 0 && (
+          <Tooltip title="clear selection">
+            <IconButton size="small" onClick={onClearSelection} sx={{ p: 0.25 }}>
+              <CloseIcon sx={{ fontSize: 14 }} />
+            </IconButton>
+          </Tooltip>
+        )}
+      </Stack>
       {state.unaligned.length === 0 && (
         <Typography variant="caption" color="text.disabled">
           drag a word here to detach it from its source
@@ -312,7 +351,7 @@ function UnalignedBag({
         variant="caption"
         sx={{ color: "text.disabled", display: "block", mb: 0.5, fontStyle: "italic" }}
       >
-        shift-click to multi-select, then drag any selected chip
+        click to add to selection · shift-click for range · drag any selected
       </Typography>
       <Stack spacing={0.5}>
         {state.unaligned.map((w) => (
