@@ -1,9 +1,10 @@
 import { useMemo, useState } from "react";
 import { Box, Typography, CircularProgress, Alert } from "@mui/material";
 import { useChapter } from "../hooks/useChapter";
+import type { UseBookReturn } from "../hooks/useBook";
 import { outbox } from "../sync/outbox";
 import { api } from "../sync/api";
-import type { TnRow, TqRow, TwlRow } from "../sync/api";
+import type { TnRow, TqRow, TwlRow, VerseDto } from "../sync/api";
 import { TimelineRail } from "./TimelineRail";
 import { ScriptureColumn, type ScriptureMode } from "./ScriptureColumn";
 import { ResourceColumn } from "./ResourceColumn";
@@ -11,6 +12,7 @@ import { AlignmentDialog } from "./AlignmentDialog";
 import { TopBar } from "./TopBar";
 
 interface AlignerTarget {
+  chapter: number;
   verse: number;
   bibleVersion: string;
 }
@@ -40,10 +42,11 @@ interface Props {
   book: string;
   chapter: number;
   initialVerse?: number;
-  onNavigate?: (book: string, chapter: number) => void;
+  onNavigate?: (book: string, chapter: number, verse?: number) => void;
+  bookHook?: UseBookReturn;
 }
 
-export function Shell({ book, chapter, initialVerse = 1, onNavigate }: Props) {
+export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook }: Props) {
   const {
     status,
     data,
@@ -173,6 +176,48 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate }: Props) {
           mode={mode}
           enabledVersions={visibleVersions.length > 0 ? visibleVersions : availableVersions.slice(0, 1)}
           availableVersions={availableVersions}
+          bookChapterList={
+            bookHook && mode === "book"
+              ? (bookHook.summary?.chapters ?? []).map((c) => c.chapter)
+              : undefined
+          }
+          bookChapters={bookHook && mode === "book" ? bookHook.chapters : undefined}
+          onLoadBookChapter={bookHook ? bookHook.loadChapter : undefined}
+          onSelectBookVerse={(ch, v) => {
+            // Verse click in book mode navigates via URL so the chapter
+            // payload + resources reload through the existing useChapter
+            // flow. App.tsx lifts the useBook cache so this round-trip is
+            // cheap.
+            if (ch !== chapter) {
+              onNavigate?.(book, ch, v);
+            } else {
+              setActiveVerse(v);
+            }
+          }}
+          onEditBookVerse={(ch, verseNum, bibleVersion, plain, base) => {
+            const newContent = { verseObjects: [{ type: "text", text: plain + " " }] };
+            // Optimistic local update — useBook's onOutboxResult listener
+            // will adopt the server's confirmed row when the patch lands.
+            bookHook?.applyLocalVerse({
+              ...base,
+              chapter: ch,
+              verse: verseNum,
+              bible_version: bibleVersion,
+              plain_text: plain,
+              content: newContent,
+            } as VerseDto);
+            void outbox.enqueueVerse(
+              book,
+              ch,
+              verseNum,
+              bibleVersion,
+              base.version,
+              { content: newContent, plain_text: plain },
+            );
+          }}
+          onOpenBookAligner={(ch, v, bv) =>
+            setAlignerTarget({ chapter: ch, verse: v, bibleVersion: bv })
+          }
           onSelectVerse={setActiveVerse}
           onModeChange={(m) => {
             setMode(m);
@@ -198,7 +243,9 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate }: Props) {
               { content: newContent, plain_text: plain },
             );
           }}
-          onOpenAligner={(v, bv) => setAlignerTarget({ verse: v, bibleVersion: bv })}
+          onOpenAligner={(v, bv) =>
+            setAlignerTarget({ chapter, verse: v, bibleVersion: bv })
+          }
         />
         <ResourceColumn
           activeVerse={activeVerse}
@@ -331,20 +378,39 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate }: Props) {
         />
       </Box>
       {alignerTarget && (() => {
-        const sourceLabel = data.verses["UHB"] ? "UHB" : "UGNT";
+        // Aligner data comes from the same chapter's payload — either the
+        // active chapter via useChapter (chapter mode) or the loaded book
+        // cache (book mode). We prefer useChapter when the target chapter
+        // matches, since that data is always fresher.
+        const sameChapter = alignerTarget.chapter === chapter;
+        const bookData =
+          !sameChapter && bookHook
+            ? (() => {
+                const cs = bookHook.chapters.get(alignerTarget.chapter);
+                return cs?.kind === "ready" ? cs.data : null;
+              })()
+            : null;
+        const sourceData = sameChapter ? data : bookData;
+        if (!sourceData) {
+          // Target chapter isn't loaded — drop silently; the user can click ⌭
+          // again once the chapter pulls in. In practice BookView only renders
+          // ⌭ for loaded chapters so this branch is defensive.
+          return null;
+        }
+        const sourceLabel = sourceData.verses["UHB"] ? "UHB" : "UGNT";
         const sourceVerse =
-          data.verses[sourceLabel]?.[alignerTarget.verse] ?? null;
-        const twlForVerse = data.twl.filter((r) => r.verse === alignerTarget.verse);
+          sourceData.verses[sourceLabel]?.[alignerTarget.verse] ?? null;
+        const twlForVerse = sourceData.twl.filter((r) => r.verse === alignerTarget.verse);
         return (
           <AlignmentDialog
             open
             book={book}
-            chapter={chapter}
+            chapter={alignerTarget.chapter}
             verseNum={alignerTarget.verse}
             bibleVersion={alignerTarget.bibleVersion}
-            verse={data.verses[alignerTarget.bibleVersion]?.[alignerTarget.verse] ?? null}
+            verse={sourceData.verses[alignerTarget.bibleVersion]?.[alignerTarget.verse] ?? null}
             contextOther={
-              data.verses[alignerTarget.bibleVersion === "ULT" ? "UST" : "ULT"]?.[
+              sourceData.verses[alignerTarget.bibleVersion === "ULT" ? "UST" : "ULT"]?.[
                 alignerTarget.verse
               ] ?? null
             }
@@ -355,7 +421,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate }: Props) {
             onSave={(content, plain, expectedVersion) => {
               void outbox.enqueueVerse(
                 book,
-                chapter,
+                alignerTarget.chapter,
                 alignerTarget.verse,
                 alignerTarget.bibleVersion,
                 expectedVersion,

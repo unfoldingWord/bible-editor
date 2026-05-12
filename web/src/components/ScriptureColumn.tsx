@@ -2,12 +2,15 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { Box, Stack, Typography, Paper, IconButton, Tooltip, ToggleButton, ToggleButtonGroup, Button } from "@mui/material";
 import LinkIcon from "@mui/icons-material/Link";
 import ViewColumnIcon from "@mui/icons-material/ViewColumn";
+import MenuBookIcon from "@mui/icons-material/MenuBook";
 import UndoIcon from "@mui/icons-material/Undo";
 import type { VerseDto } from "../sync/api";
 import { DocColumn } from "./DocColumn";
+import { BookView } from "./BookView";
+import type { ChapterState } from "../hooks/useBook";
 import { highlightsFor, renderHighlightedHTML, type HighlightKey } from "../lib/highlight";
 
-export type ScriptureMode = "stacked" | "columns";
+export type ScriptureMode = "stacked" | "columns" | "book";
 
 interface Props {
   book: string;
@@ -20,6 +23,14 @@ interface Props {
   mode: ScriptureMode;
   enabledVersions: string[];
   availableVersions: string[];
+  // Book-mode props: present only when mode === 'book'. The book view drives
+  // (chapter, verse) navigation, so its callbacks carry the chapter.
+  bookChapterList?: number[];
+  bookChapters?: Map<number, ChapterState>;
+  onLoadBookChapter?: (ch: number) => void;
+  onSelectBookVerse?: (chapter: number, verse: number) => void;
+  onEditBookVerse?: (chapter: number, verse: number, bibleVersion: string, plain: string, base: VerseDto) => void;
+  onOpenBookAligner?: (chapter: number, verse: number, bibleVersion: string) => void;
   onSelectVerse: (v: number) => void;
   onOpenAligner: (verse: number, bibleVersion: string) => void;
   onModeChange: (mode: ScriptureMode) => void;
@@ -47,6 +58,12 @@ export function ScriptureColumn({
   mode,
   enabledVersions,
   availableVersions,
+  bookChapterList,
+  bookChapters,
+  onLoadBookChapter,
+  onSelectBookVerse,
+  onEditBookVerse,
+  onOpenBookAligner,
   onSelectVerse,
   onOpenAligner,
   onModeChange,
@@ -54,7 +71,7 @@ export function ScriptureColumn({
   onEditVerse,
 }: Props) {
   const activeRef = useRef<HTMLDivElement | null>(null);
-  // Bumped on "go to active" clicks so columns-mode DocColumns can re-scroll
+  // Bumped on "go to active" clicks so columns/book-mode views can re-scroll
   // to their active span even when activeVerse hasn't changed.
   const [scrollNonce, setScrollNonce] = useState(0);
 
@@ -111,7 +128,18 @@ export function ScriptureColumn({
         >
           {mode === "columns" ? `${enabledVersions.length} col${enabledVersions.length === 1 ? "" : "s"}` : "columns"}
         </Button>
-        {mode === "columns" && (
+        <Tooltip title={mode === "book" ? "back to single-chapter view" : "scroll the whole book across all enabled versions (lazy loads as you scroll)"}>
+          <Button
+            size="small"
+            variant={mode === "book" ? "contained" : "outlined"}
+            startIcon={<MenuBookIcon fontSize="small" />}
+            onClick={() => onModeChange(mode === "book" ? "columns" : "book")}
+            sx={{ textTransform: "none" }}
+          >
+            book
+          </Button>
+        </Tooltip>
+        {(mode === "columns" || mode === "book") && (
           <ToggleButtonGroup
             size="small"
             value={enabledVersions}
@@ -156,6 +184,22 @@ export function ScriptureColumn({
           activeNoteOccurrence={activeNoteOccurrence}
           onSelectVerse={onSelectVerse}
           onOpenAligner={onOpenAligner}
+        />
+      ) : mode === "book" && bookChapterList && bookChapters && onLoadBookChapter && onSelectBookVerse && onEditBookVerse && onOpenBookAligner ? (
+        <BookView
+          book={book}
+          chapterList={bookChapterList}
+          chapters={bookChapters}
+          enabledVersions={enabledVersions}
+          activeChapter={chapter}
+          activeVerse={activeVerse}
+          activeNoteQuote={activeNoteQuote}
+          activeNoteOccurrence={activeNoteOccurrence}
+          scrollNonce={scrollNonce}
+          onLoadChapter={onLoadBookChapter}
+          onSelectVerse={onSelectBookVerse}
+          onEditVerse={onEditBookVerse}
+          onOpenAligner={onOpenBookAligner}
         />
       ) : (
         <Box sx={{ flex: 1, display: "flex", gap: 1, p: 1, overflow: "hidden" }}>
