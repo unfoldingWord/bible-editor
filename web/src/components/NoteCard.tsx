@@ -2,17 +2,27 @@ import { useEffect, useRef, useState } from "react";
 import { Paper, Stack, Chip, IconButton, Typography, Box, TextField, Tooltip } from "@mui/material";
 import DeleteOutlineIcon from "@mui/icons-material/DeleteOutline";
 import AddIcon from "@mui/icons-material/Add";
+import DragIndicatorIcon from "@mui/icons-material/DragIndicator";
 import type { TnRow } from "../sync/api";
 import { useCatalogs } from "../hooks/useCatalogs";
 import { CatalogPicker } from "./CatalogPicker";
 
+export type DropPosition = "before" | "after";
+
 interface Props {
   row: TnRow;
   active: boolean;
+  dragging: boolean;
+  isDropTarget: boolean;
   onChange: (patch: Partial<TnRow>) => void;
   onDelete: () => void;
   onInsertAfter: () => void;
   onFocus?: () => void;
+  onGripDragStart: () => void;
+  onDragEnd: () => void;
+  onCardDragOver: (position: DropPosition) => void;
+  onCardDragLeave: () => void;
+  onCardDrop: (position: DropPosition) => void;
 }
 
 // Notes coming from TSV imports use literal "\n" (two characters) as the
@@ -23,11 +33,32 @@ function tsvToDisplay(s: string | null): string {
   return (s ?? "").replace(/\\n/g, "\n");
 }
 
-export function NoteCard({ row, active, onChange, onDelete, onInsertAfter, onFocus }: Props) {
+export function NoteCard({
+  row,
+  active,
+  dragging,
+  isDropTarget,
+  onChange,
+  onDelete,
+  onInsertAfter,
+  onFocus,
+  onGripDragStart,
+  onDragEnd,
+  onCardDragOver,
+  onCardDragLeave,
+  onCardDrop,
+}: Props) {
   const [quote, setQuote] = useState(tsvToDisplay(row.quote));
   const [note, setNote] = useState(tsvToDisplay(row.note));
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const paperRef = useRef<HTMLDivElement | null>(null);
   const catalogs = useCatalogs();
+
+  const positionFromEvent = (e: React.DragEvent): DropPosition => {
+    const rect = paperRef.current?.getBoundingClientRect();
+    if (!rect) return "after";
+    return e.clientY < rect.top + rect.height / 2 ? "before" : "after";
+  };
 
   // Re-sync when the row changes from outside (e.g. server-confirmed update).
   useEffect(() => {
@@ -47,16 +78,34 @@ export function NoteCard({ row, active, onChange, onDelete, onInsertAfter, onFoc
 
   return (
     <Paper
+      ref={paperRef}
       elevation={0}
       variant="outlined"
       onMouseDown={onFocus}
       onFocus={onFocus}
+      onDragOver={(e) => {
+        if (!isDropTarget) return;
+        e.preventDefault();
+        e.dataTransfer.dropEffect = "move";
+        onCardDragOver(positionFromEvent(e));
+      }}
+      onDragLeave={() => {
+        if (!isDropTarget) return;
+        onCardDragLeave();
+      }}
+      onDrop={(e) => {
+        if (!isDropTarget) return;
+        e.preventDefault();
+        onCardDrop(positionFromEvent(e));
+      }}
       sx={{
         my: 1,
         border: active ? "1.5px solid" : "1px solid",
         borderColor: active ? "primary.main" : "divider",
         bgcolor: active ? "primary.50" : "background.paper",
         overflow: "hidden",
+        opacity: dragging ? 0.4 : 1,
+        transition: "opacity 120ms ease",
       }}
     >
       <Stack
@@ -72,7 +121,29 @@ export function NoteCard({ row, active, onChange, onDelete, onInsertAfter, onFoc
           flexWrap: "wrap",
         }}
       >
-        <Box sx={{ cursor: "grab", color: "text.disabled", fontFamily: "monospace", fontSize: 13 }}>⋮⋮</Box>
+        <Tooltip title="drag to reorder">
+          <Box
+            draggable
+            onDragStart={(e) => {
+              e.dataTransfer.effectAllowed = "move";
+              e.dataTransfer.setData("text/plain", row.id);
+              if (paperRef.current) {
+                e.dataTransfer.setDragImage(paperRef.current, 12, 12);
+              }
+              onGripDragStart();
+            }}
+            onDragEnd={onDragEnd}
+            sx={{
+              cursor: "grab",
+              color: "text.disabled",
+              display: "inline-flex",
+              alignItems: "center",
+              "&:active": { cursor: "grabbing" },
+            }}
+          >
+            <DragIndicatorIcon fontSize="small" />
+          </Box>
+        </Tooltip>
         <Chip
           label={row.id}
           size="small"

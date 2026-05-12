@@ -1,8 +1,8 @@
-import { useRef } from "react";
+import { Fragment, useRef, useState } from "react";
 import { Box, Stack, Typography, Chip, Button } from "@mui/material";
 import AddIcon from "@mui/icons-material/Add";
 import type { TnRow, TqRow, TwlRow } from "../sync/api";
-import { NoteCard } from "./NoteCard";
+import { NoteCard, type DropPosition } from "./NoteCard";
 import { WordsTable } from "./WordsTable";
 import { QuestionsTable } from "./QuestionsTable";
 
@@ -16,6 +16,7 @@ interface Props {
   onNoteChange: (id: string, patch: Partial<TnRow>) => void;
   onNoteDelete: (id: string) => void;
   onNoteInsertAfter: (refId: string) => void;
+  onNoteReorder: (draggedId: string, refId: string, position: DropPosition) => void;
   onNoteFocus: (row: TnRow) => void;
   onNoteCreate: () => void;
   onWordChange: (id: string, patch: Partial<TwlRow>) => void;
@@ -37,6 +38,7 @@ export function ResourceColumn({
   onNoteChange,
   onNoteDelete,
   onNoteInsertAfter,
+  onNoteReorder,
   onNoteFocus,
   onNoteCreate,
   onWordChange,
@@ -47,9 +49,20 @@ export function ResourceColumn({
   onQuestionDelete,
   onQuestionCreate,
 }: Props) {
-  const tnForVerse = tn.filter((r) => r.verse === activeVerse);
+  const tnForVerse = tn
+    .filter((r) => r.verse === activeVerse)
+    .sort(
+      (a, b) =>
+        (a.sort_order ?? Number.MAX_SAFE_INTEGER) -
+          (b.sort_order ?? Number.MAX_SAFE_INTEGER) || a.id.localeCompare(b.id),
+    );
   const tqForVerse = tq.filter((r) => r.verse === activeVerse);
   const twlForVerse = twl.filter((r) => r.verse === activeVerse);
+
+  const [dragId, setDragId] = useState<string | null>(null);
+  const [dragOver, setDragOver] = useState<
+    { targetId: string; position: DropPosition } | null
+  >(null);
 
   const notesRef = useRef<HTMLDivElement | null>(null);
   const wordsRef = useRef<HTMLDivElement | null>(null);
@@ -113,17 +126,52 @@ export function ResourceColumn({
             no notes for this verse
           </Typography>
         )}
-        {tnForVerse.map((r) => (
-          <NoteCard
-            key={r.id}
-            row={r}
-            active={r.id === activeNoteId}
-            onChange={(p) => onNoteChange(r.id, p)}
-            onDelete={() => onNoteDelete(r.id)}
-            onInsertAfter={() => onNoteInsertAfter(r.id)}
-            onFocus={() => onNoteFocus(r)}
-          />
-        ))}
+        {tnForVerse.map((r) => {
+          const showBefore =
+            dragId && dragId !== r.id && dragOver?.targetId === r.id && dragOver.position === "before";
+          const showAfter =
+            dragId && dragId !== r.id && dragOver?.targetId === r.id && dragOver.position === "after";
+          return (
+            <Fragment key={r.id}>
+              {showBefore && <DropIndicator />}
+              <NoteCard
+                row={r}
+                active={r.id === activeNoteId}
+                dragging={dragId === r.id}
+                isDropTarget={dragId !== null && dragId !== r.id}
+                onChange={(p) => onNoteChange(r.id, p)}
+                onDelete={() => onNoteDelete(r.id)}
+                onInsertAfter={() => onNoteInsertAfter(r.id)}
+                onFocus={() => onNoteFocus(r)}
+                onGripDragStart={() => setDragId(r.id)}
+                onDragEnd={() => {
+                  setDragId(null);
+                  setDragOver(null);
+                }}
+                onCardDragOver={(position) => {
+                  setDragOver((cur) =>
+                    cur && cur.targetId === r.id && cur.position === position
+                      ? cur
+                      : { targetId: r.id, position },
+                  );
+                }}
+                onCardDragLeave={() => {
+                  // Don't clear on leave — the next onDragOver from the
+                  // adjacent card or the same card's other half will
+                  // immediately overwrite this. Clearing here causes flicker.
+                }}
+                onCardDrop={(position) => {
+                  if (dragId && dragId !== r.id) {
+                    onNoteReorder(dragId, r.id, position);
+                  }
+                  setDragId(null);
+                  setDragOver(null);
+                }}
+              />
+              {showAfter && <DropIndicator />}
+            </Fragment>
+          );
+        })}
 
         <Box sx={{ height: 16 }} />
         <div ref={wordsRef} />
@@ -142,6 +190,20 @@ export function ResourceColumn({
         <QuestionsTable rows={tqForVerse} onChange={onQuestionChange} onDelete={onQuestionDelete} />
       </Box>
     </Box>
+  );
+}
+
+function DropIndicator() {
+  return (
+    <Box
+      sx={{
+        height: 3,
+        my: 0.5,
+        bgcolor: "primary.main",
+        borderRadius: 1,
+        boxShadow: "0 0 4px rgba(25,118,210,0.5)",
+      }}
+    />
   );
 }
 

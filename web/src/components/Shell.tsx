@@ -222,12 +222,15 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate }: Props) {
             if (row.verse !== activeVerse) setActiveVerse(row.verse);
           }}
           onNoteCreate={async () => {
+            const list = sortedTnForVerse(data.tn, activeVerse);
+            const sort_order = pickSortOrder(list, null, "after");
             const created = (await api.createRow<TnRow>("tn", {
               book,
               chapter,
               verse: activeVerse,
               ref_raw: activeVerse === 0 ? `${chapter}:intro` : `${chapter}:${activeVerse}`,
               note: "",
+              sort_order,
             }));
             applyLocalRowInsert("tn", created);
             setActiveNoteId(created.id);
@@ -236,6 +239,8 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate }: Props) {
           onNoteInsertAfter={async (refId) => {
             const ref = data.tn.find((r) => r.id === refId);
             if (!ref) return;
+            const list = sortedTnForVerse(data.tn, ref.verse);
+            const sort_order = pickSortOrder(list, refId, "after");
             const created = (await api.createRow<TnRow>("tn", {
               book,
               chapter,
@@ -243,10 +248,19 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate }: Props) {
               ref_raw: ref.ref_raw,
               support_reference: ref.support_reference,
               note: "",
+              sort_order,
             }));
             applyLocalRowInsert("tn", created, { afterId: refId });
             setActiveNoteId(created.id);
             setActiveWordId(null);
+          }}
+          onNoteReorder={(draggedId, refId, position) => {
+            const dragged = data.tn.find((r) => r.id === draggedId);
+            if (!dragged) return;
+            const list = sortedTnForVerse(data.tn, dragged.verse);
+            const sort_order = pickSortOrder(list, refId, position, draggedId);
+            applyLocalRowPatch("tn", draggedId, { sort_order });
+            void outbox.enqueueRow("tn", draggedId, dragged.version, { sort_order });
           }}
           onWordCreate={async () => {
             const created = (await api.createRow<TwlRow>("twl", {
@@ -330,4 +344,50 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate }: Props) {
       )}
     </Box>
   );
+}
+
+// ---------- sort_order helpers ----------
+
+function sortedTnForVerse(rows: TnRow[], verse: number): TnRow[] {
+  return rows
+    .filter((r) => r.verse === verse)
+    .sort(
+      (a, b) =>
+        (a.sort_order ?? Number.MAX_SAFE_INTEGER) -
+          (b.sort_order ?? Number.MAX_SAFE_INTEGER) || a.id.localeCompare(b.id),
+    );
+}
+
+// Pick a sort_order so the new/moved row lands at the requested slot. Falls
+// back to step-of-100 gaps when neighbors lack a sort_order yet. `excludeId`
+// is set when reordering an existing row — we don't want it in the list when
+// computing midpoints, otherwise drop-after-self collapses to a no-op midpoint
+// inside its own slot.
+function pickSortOrder(
+  rows: TnRow[],
+  refId: string | null,
+  position: "before" | "after",
+  excludeId?: string,
+): number {
+  const list = excludeId ? rows.filter((r) => r.id !== excludeId) : rows;
+  if (list.length === 0) return 100;
+  if (!refId) {
+    const last = list[list.length - 1];
+    return (last.sort_order ?? list.length * 100) + 100;
+  }
+  const idx = list.findIndex((r) => r.id === refId);
+  if (idx < 0) {
+    const last = list[list.length - 1];
+    return (last.sort_order ?? list.length * 100) + 100;
+  }
+  const target = list[idx];
+  const targetSort = target.sort_order ?? (idx + 1) * 100;
+  if (position === "before") {
+    const prev = list[idx - 1];
+    const prevSort = prev?.sort_order ?? targetSort - 200;
+    return (prevSort + targetSort) / 2;
+  }
+  const next = list[idx + 1];
+  const nextSort = next?.sort_order ?? targetSort + 200;
+  return (targetSort + nextSort) / 2;
 }

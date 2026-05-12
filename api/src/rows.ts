@@ -28,6 +28,7 @@ const TnPatch = z.object({
   quote: z.string().nullable().optional(),
   occurrence: z.number().int().nullable().optional(),
   note: z.string().nullable().optional(),
+  sort_order: z.number().nullable().optional(),
 });
 
 const TqPatch = z.object({
@@ -67,6 +68,7 @@ const CreateTn = z.object({
   quote: z.string().nullable().optional(),
   occurrence: z.number().int().nullable().optional(),
   note: z.string().nullable().optional(),
+  sort_order: z.number().nullable().optional(),
 });
 const CreateTq = z.object({
   book: z.string(),

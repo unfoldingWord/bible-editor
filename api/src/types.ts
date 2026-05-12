@@ -13,6 +13,7 @@ export interface TnRow {
   quote: string | null;
   occurrence: number | null;
   note: string | null;
+  sort_order: number | null;
   version: number;
   updated_by: number | null;
   updated_at: number;

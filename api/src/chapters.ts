@@ -23,7 +23,7 @@ chapters.get("/:book/:chapter", async (c) => {
       .all<VerseRow>(),
     db
       .prepare(
-        "SELECT * FROM tn_rows WHERE book = ?1 AND chapter = ?2 AND deleted_at IS NULL ORDER BY verse, id",
+        "SELECT * FROM tn_rows WHERE book = ?1 AND chapter = ?2 AND deleted_at IS NULL ORDER BY verse, sort_order ASC NULLS LAST, id",
       )
       .bind(book, chapter)
       .all<TnRow>(),
