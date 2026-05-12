@@ -265,7 +265,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook }:
           onOpenBookAligner={(ch, v, bv) =>
             setAlignerTarget({ chapter: ch, verse: v, bibleVersion: bv })
           }
-          onReplaceBookVerse={(ch, verseNum, bibleVersion, newContent, newPlainText, base) => {
+          onReplaceVerse={(ch, verseNum, bibleVersion, newContent, newPlainText, base) => {
             // Find/replace ships pre-built content from smartReplaceVerse —
             // alignment is preserved when word counts match, fully
             // re-tokenized otherwise. Dual-apply to useChapter so opening

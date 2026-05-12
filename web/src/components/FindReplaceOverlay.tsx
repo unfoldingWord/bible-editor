@@ -301,10 +301,12 @@ export function FindReplaceOverlay({
           </span>
         </Tooltip>
         <Box sx={{ flex: 1 }} />
-        <Typography variant="caption" sx={{ color: "text.disabled", fontFamily: "monospace" }}>
-          scope: {counts.ready}/{chapterList.length} ch loaded
-        </Typography>
-        {counts.ready < chapterList.length && (
+        {chapterList.length > 1 && (
+          <Typography variant="caption" sx={{ color: "text.disabled", fontFamily: "monospace" }}>
+            scope: {counts.ready}/{chapterList.length} ch loaded
+          </Typography>
+        )}
+        {chapterList.length > 1 && counts.ready < chapterList.length && (
           <Tooltip title="fetch every chapter of this book now so search covers the whole book — only useful once per session">
             <Button
               size="small"

@@ -6,7 +6,7 @@ import ViewStreamIcon from "@mui/icons-material/ViewStream";
 import MenuBookIcon from "@mui/icons-material/MenuBook";
 import SearchIcon from "@mui/icons-material/Search";
 import UndoIcon from "@mui/icons-material/Undo";
-import type { VerseDto } from "../sync/api";
+import type { ChapterPayload, VerseDto } from "../sync/api";
 import { DocColumn } from "./DocColumn";
 import { BookView } from "./BookView";
 import { FindReplaceOverlay, type FindMatch } from "./FindReplaceOverlay";
@@ -42,7 +42,10 @@ interface Props {
   onSelectBookVerse?: (chapter: number, verse: number) => void;
   onEditBookVerse?: (chapter: number, verse: number, bibleVersion: string, plain: string, base: VerseDto) => void;
   onOpenBookAligner?: (chapter: number, verse: number, bibleVersion: string) => void;
-  onReplaceBookVerse?: (chapter: number, verse: number, bibleVersion: string, newContent: unknown, newPlainText: string, base: VerseDto) => void;
+  // Find/replace target. Used in all three modes — book mode passes a
+  // chapter from the book cache; stacked/columns always pass the current
+  // chapter. Shell dual-applies to useChapter when the chapter is loaded.
+  onReplaceVerse: (chapter: number, verse: number, bibleVersion: string, newContent: unknown, newPlainText: string, base: VerseDto) => void;
   // Shared with the rest of the shell — bumped here on the "go to active"
   // click, and shipped to ResourceColumn so it can scroll the active
   // note/word/verse-group into view alongside the scripture.
@@ -84,7 +87,7 @@ export function ScriptureColumn({
   onSelectBookVerse,
   onEditBookVerse,
   onOpenBookAligner,
-  onReplaceBookVerse,
+  onReplaceVerse,
   scrollNonce,
   onRequestScrollToActive,
   lexiconMap,
@@ -95,29 +98,91 @@ export function ScriptureColumn({
   onEditVerse,
 }: Props) {
   const activeRef = useRef<HTMLDivElement | null>(null);
+  const bodyRef = useRef<HTMLDivElement | null>(null);
   const [findOpen, setFindOpen] = useState(false);
   const [findQuery, setFindQuery] = useState<FindQuery | null>(null);
   // Set only when the overlay reports a user-initiated scroll target; the
-  // BookView's scroll effect keys off this so external content changes
-  // don't yank the user to the next match.
+  // BookView's scroll effect (book mode) and the bodyRef scroll effect
+  // (stacked/columns) key off this so external content changes don't yank
+  // the user to the next match.
   const [findScrollTarget, setFindScrollTarget] = useState<FindMatch | null>(null);
 
-  // Ctrl/Cmd+F opens the find overlay (book mode only). Esc inside the
+  // Ctrl/Cmd+F opens the find overlay in any mode. Esc inside the
   // overlay closes it via the overlay's own handler.
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
-      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "f" && mode === "book") {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "f") {
         e.preventDefault();
         setFindOpen(true);
       }
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [mode]);
+  }, []);
+
+  // Closing the overlay should drop the query so cells stop painting find
+  // marks (otherwise the previous query lingers as highlights).
+  const closeFind = useCallback(() => {
+    setFindOpen(false);
+    setFindQuery(null);
+    setFindScrollTarget(null);
+  }, []);
 
   // Stable callback identities so the overlay's effect deps don't churn.
   const onFindQueryChange = useCallback((q: FindQuery | null) => setFindQuery(q), []);
   const onFindScrollToMatch = useCallback((m: FindMatch | null) => setFindScrollTarget(m), []);
+
+  // Synthesize a one-chapter cache for stacked/columns modes so the
+  // overlay's existing collectMatches logic works without bookHook. Only
+  // `verses` is consulted — the row stubs satisfy the ChapterPayload type.
+  const singleChapterCache = useMemo<Map<number, ChapterState>>(() => {
+    const m = new Map<number, ChapterState>();
+    m.set(chapter, {
+      kind: "ready",
+      data: {
+        book,
+        chapter,
+        verses: versesByVersion,
+        tn: [],
+        tq: [],
+        twl: [],
+        verseStatuses: [],
+      } as ChapterPayload,
+    });
+    return m;
+  }, [book, chapter, versesByVersion]);
+
+  const overlayChapters = mode === "book" && bookChapters ? bookChapters : singleChapterCache;
+  const overlayChapterList = mode === "book" && bookChapterList ? bookChapterList : [chapter];
+  const overlayLoadChapter = useCallback(
+    (ch: number) => {
+      if (mode === "book" && onLoadBookChapter) onLoadBookChapter(ch);
+    },
+    [mode, onLoadBookChapter],
+  );
+
+  // Compile the regex once and feed it to stacked/columns cells for in-line
+  // mark painting. Book mode rebuilds its own copy inside BookView.
+  const compiledFindRe = useMemo(() => {
+    if (!findQuery) return null;
+    try {
+      const pattern = findQuery.regex
+        ? findQuery.find
+        : findQuery.find.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      return new RegExp(pattern, findQuery.caseSensitive ? "g" : "gi");
+    } catch {
+      return null;
+    }
+  }, [findQuery]);
+
+  // Stacked/columns scroll-to-match: BookView handles book mode internally.
+  useEffect(() => {
+    if (!findScrollTarget || mode === "book") return;
+    if (findScrollTarget.chapter !== chapter) return;
+    const sel = `[data-find-cell="${findScrollTarget.chapter}-${findScrollTarget.verse}-${findScrollTarget.bibleVersion}"]`;
+    const el = bodyRef.current?.querySelector<HTMLElement>(sel);
+    el?.scrollIntoView({ behavior: "smooth", block: "center" });
+  }, [findScrollTarget, mode, chapter]);
 
   useEffect(() => {
     if (mode === "stacked") {
@@ -200,19 +265,26 @@ export function ScriptureColumn({
             book
           </Button>
         </Tooltip>
-        {mode === "book" && (
-          <Tooltip title="find / replace across loaded chapters (Ctrl+F)">
-            <Button
-              size="small"
-              variant={findOpen ? "contained" : "outlined"}
-              startIcon={<SearchIcon fontSize="small" />}
-              onClick={() => setFindOpen((o) => !o)}
-              sx={{ textTransform: "none" }}
-            >
-              find
-            </Button>
-          </Tooltip>
-        )}
+        <Tooltip
+          title={
+            mode === "book"
+              ? "find / replace across loaded chapters (Ctrl+F)"
+              : "find / replace in this chapter (Ctrl+F)"
+          }
+        >
+          <Button
+            size="small"
+            variant={findOpen ? "contained" : "outlined"}
+            startIcon={<SearchIcon fontSize="small" />}
+            onClick={() => {
+              if (findOpen) closeFind();
+              else setFindOpen(true);
+            }}
+            sx={{ textTransform: "none" }}
+          >
+            find
+          </Button>
+        </Tooltip>
         {(mode === "columns" || mode === "book") && (
           <ToggleButtonGroup
             size="small"
@@ -246,35 +318,36 @@ export function ScriptureColumn({
           {book} {chapter}:{activeVerse === 0 ? "intro" : activeVerse}
         </Typography>
       </Stack>
-      {mode === "stacked" ? (
-        <StackedBody
-          versesByVersion={versesByVersion}
-          verseNumbers={verseNumbers}
-          activeVerse={activeVerse}
-          activeRef={activeRef}
-          chapter={chapter}
-          isHebrew={isHebrew}
-          activeNoteQuote={activeNoteQuote}
-          activeNoteOccurrence={activeNoteOccurrence}
-          lexiconMap={lexiconMap}
-          onSelectVerse={onSelectVerse}
-          onOpenAligner={onOpenAligner}
-        />
-      ) : mode === "book" && bookChapterList && bookChapters && onLoadBookChapter && onSelectBookVerse && onEditBookVerse && onOpenBookAligner ? (
-        <Box sx={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden" }}>
-          {findOpen && onReplaceBookVerse && (
-            <FindReplaceOverlay
-              open
-              onClose={() => setFindOpen(false)}
-              chapters={bookChapters}
-              chapterList={bookChapterList}
-              onLoadChapter={onLoadBookChapter}
-              enabledVersions={enabledVersions}
-              onReplaceVerse={onReplaceBookVerse}
-              onScrollToMatch={onFindScrollToMatch}
-              onQueryChange={onFindQueryChange}
-            />
-          )}
+      <Box ref={bodyRef} sx={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden" }}>
+        {findOpen && (
+          <FindReplaceOverlay
+            open
+            onClose={closeFind}
+            chapters={overlayChapters}
+            chapterList={overlayChapterList}
+            onLoadChapter={overlayLoadChapter}
+            enabledVersions={enabledVersions}
+            onReplaceVerse={onReplaceVerse}
+            onScrollToMatch={onFindScrollToMatch}
+            onQueryChange={onFindQueryChange}
+          />
+        )}
+        {mode === "stacked" ? (
+          <StackedBody
+            versesByVersion={versesByVersion}
+            verseNumbers={verseNumbers}
+            activeVerse={activeVerse}
+            activeRef={activeRef}
+            chapter={chapter}
+            isHebrew={isHebrew}
+            activeNoteQuote={activeNoteQuote}
+            activeNoteOccurrence={activeNoteOccurrence}
+            lexiconMap={lexiconMap}
+            findRe={compiledFindRe}
+            onSelectVerse={onSelectVerse}
+            onOpenAligner={onOpenAligner}
+          />
+        ) : mode === "book" && bookChapterList && bookChapters && onLoadBookChapter && onSelectBookVerse && onEditBookVerse && onOpenBookAligner ? (
           <BookView
             book={book}
             chapterList={bookChapterList}
@@ -293,30 +366,31 @@ export function ScriptureColumn({
             onEditVerse={onEditBookVerse}
             onOpenAligner={onOpenBookAligner}
           />
-        </Box>
-      ) : (
-        <Box sx={{ flex: 1, display: "flex", gap: 1, p: 1, overflow: "hidden" }}>
-          {enabledVersions.map((v) => (
-            <DocColumn
-              key={v}
-              bibleVersion={v}
-              versesByVerseNum={versesByVersion[v] ?? {}}
-              verseNumbers={verseNumbers}
-              chapter={chapter}
-              activeVerse={activeVerse}
-              readOnly={READ_ONLY_VERSIONS.has(v)}
-              rtl={v === "UHB"}
-              activeNoteQuote={activeNoteQuote}
-              activeNoteOccurrence={activeNoteOccurrence}
-              scrollNonce={scrollNonce}
-              lexiconMap={v === "UHB" ? lexiconMap : undefined}
-              onSelectVerse={onSelectVerse}
-              onEditVerse={(verseNum, plain, base) => onEditVerse(verseNum, v, plain, base)}
-              onOpenAligner={(verseNum) => onOpenAligner(verseNum, v)}
-            />
-          ))}
-        </Box>
-      )}
+        ) : (
+          <Box sx={{ flex: 1, display: "flex", gap: 1, p: 1, overflow: "hidden" }}>
+            {enabledVersions.map((v) => (
+              <DocColumn
+                key={v}
+                bibleVersion={v}
+                versesByVerseNum={versesByVersion[v] ?? {}}
+                verseNumbers={verseNumbers}
+                chapter={chapter}
+                activeVerse={activeVerse}
+                readOnly={READ_ONLY_VERSIONS.has(v)}
+                rtl={v === "UHB"}
+                activeNoteQuote={activeNoteQuote}
+                activeNoteOccurrence={activeNoteOccurrence}
+                scrollNonce={scrollNonce}
+                lexiconMap={v === "UHB" ? lexiconMap : undefined}
+                findRe={compiledFindRe}
+                onSelectVerse={onSelectVerse}
+                onEditVerse={(verseNum, plain, base) => onEditVerse(verseNum, v, plain, base)}
+                onOpenAligner={(verseNum) => onOpenAligner(verseNum, v)}
+              />
+            ))}
+          </Box>
+        )}
+      </Box>
     </Box>
   );
 }
@@ -331,6 +405,7 @@ function StackedBody({
   activeNoteQuote,
   activeNoteOccurrence,
   lexiconMap,
+  findRe,
   onSelectVerse,
   onOpenAligner,
 }: {
@@ -343,14 +418,30 @@ function StackedBody({
   activeNoteQuote: string | null;
   activeNoteOccurrence: number | null;
   lexiconMap: Map<string, LexiconEntry | null>;
+  findRe: RegExp | null;
   onSelectVerse: (v: number) => void;
   onOpenAligner: (verse: number, bibleVersion: string) => void;
 }) {
   const ult = versesByVersion["ULT"] ?? {};
   const ust = versesByVersion["UST"] ?? {};
   const uhb = versesByVersion["UHB"] ?? versesByVersion["UGNT"] ?? {};
+  const uhbLabel = isHebrew ? "UHB" : "UGNT";
   return (
-    <Box sx={{ flex: 1, overflowY: "auto", px: 2, py: 1 }}>
+    <Box
+      sx={{
+        flex: 1,
+        overflowY: "auto",
+        px: 2,
+        py: 1,
+        "& mark.be-find": {
+          backgroundColor: "#ffd966",
+          outline: "1px solid #d97706",
+          padding: "0 1px",
+          borderRadius: 0.5,
+          color: "inherit",
+        },
+      }}
+    >
       {verseNumbers.map((v) => {
         const isActive = v === activeVerse;
         const ultV = ult[v];
@@ -359,7 +450,7 @@ function StackedBody({
         if (isActive) {
           const ultHL = highlightsFor("ULT", ultV?.content, activeNoteQuote, activeNoteOccurrence);
           const ustHL = highlightsFor("UST", ustV?.content, activeNoteQuote, activeNoteOccurrence);
-          const uhbHL = highlightsFor(isHebrew ? "UHB" : "UGNT", uhbV?.content, activeNoteQuote, activeNoteOccurrence);
+          const uhbHL = highlightsFor(uhbLabel, uhbV?.content, activeNoteQuote, activeNoteOccurrence);
           return (
             <Paper
               ref={activeRef}
@@ -380,14 +471,37 @@ function StackedBody({
               >
                 {v === 0 ? "intro" : `${chapter}:${v}`}
               </Typography>
-              <ActiveLine label="ULT" text={ultV?.plain_text ?? ""} content={ultV?.content} highlights={ultHL} editable onOpenAligner={() => onOpenAligner(v, "ULT")} />
-              <ActiveLine label="UST" text={ustV?.plain_text ?? ""} content={ustV?.content} highlights={ustHL} editable onOpenAligner={() => onOpenAligner(v, "UST")} />
+              <ActiveLine
+                label="ULT"
+                chapter={chapter}
+                verseNum={v}
+                text={ultV?.plain_text ?? ""}
+                content={ultV?.content}
+                highlights={ultHL}
+                findRe={findRe}
+                editable
+                onOpenAligner={() => onOpenAligner(v, "ULT")}
+              />
+              <ActiveLine
+                label="UST"
+                chapter={chapter}
+                verseNum={v}
+                text={ustV?.plain_text ?? ""}
+                content={ustV?.content}
+                highlights={ustHL}
+                findRe={findRe}
+                editable
+                onOpenAligner={() => onOpenAligner(v, "UST")}
+              />
               {uhbV && (
                 <ActiveLine
-                  label={isHebrew ? "UHB" : "UGNT"}
+                  label={uhbLabel}
+                  chapter={chapter}
+                  verseNum={v}
                   text={uhbV.plain_text ?? ""}
                   content={uhbV.content}
                   highlights={uhbHL}
+                  findRe={findRe}
                   rtl={isHebrew}
                   readOnly
                   lexiconMap={lexiconMap}
@@ -453,7 +567,12 @@ function StackedBody({
             >
               ULT
             </Typography>
-            <Box sx={{ gridColumn: 2, gridRow: 2, minWidth: 0 }}>{ultV?.plain_text ?? ""}</Box>
+            <Box
+              data-find-cell={`${chapter}-${v}-ULT`}
+              sx={{ gridColumn: 2, gridRow: 2, minWidth: 0 }}
+            >
+              <FindAwareText text={ultV?.plain_text ?? ""} findRe={findRe} />
+            </Box>
             {ustV && (
               <>
                 <Typography
@@ -471,7 +590,12 @@ function StackedBody({
                 >
                   UST
                 </Typography>
-                <Box sx={{ gridColumn: 2, gridRow: 3, minWidth: 0 }}>{ustV.plain_text ?? ""}</Box>
+                <Box
+                  data-find-cell={`${chapter}-${v}-UST`}
+                  sx={{ gridColumn: 2, gridRow: 3, minWidth: 0 }}
+                >
+                  <FindAwareText text={ustV.plain_text ?? ""} findRe={findRe} />
+                </Box>
               </>
             )}
           </Box>
@@ -483,9 +607,12 @@ function StackedBody({
 
 function ActiveLine({
   label,
+  chapter,
+  verseNum,
   text,
   content,
   highlights,
+  findRe,
   rtl,
   readOnly,
   editable,
@@ -493,9 +620,12 @@ function ActiveLine({
   lexiconMap,
 }: {
   label: string;
+  chapter: number;
+  verseNum: number;
   text: string;
   content?: unknown;
   highlights?: Set<HighlightKey>;
+  findRe?: RegExp | null;
   rtl?: boolean;
   readOnly?: boolean;
   editable?: boolean;
@@ -503,12 +633,24 @@ function ActiveLine({
   lexiconMap?: Map<string, LexiconEntry | null>;
 }) {
   const elRef = useRef<HTMLDivElement | null>(null);
-  const html = useMemo(() => {
+
+  // Find marks override note highlights while the overlay is active —
+  // matches BookView's behaviour so users see search results cleanly.
+  const findHTML = useMemo(() => {
+    if (!findRe || !text) return null;
+    const out = renderFindMatchesHTML(text, findRe);
+    return out.includes("be-find") ? out : null;
+  }, [findRe, text]);
+
+  const noteHTML = useMemo(() => {
+    if (findHTML) return null;
     if (!content || !highlights || highlights.size === 0) return null;
     const verseObjects = (content as { verseObjects?: unknown[] } | null)?.verseObjects;
     if (!Array.isArray(verseObjects)) return null;
     return renderHighlightedHTML(verseObjects, highlights);
-  }, [content, highlights]);
+  }, [findHTML, content, highlights]);
+  const html = findHTML ?? noteHTML;
+
   // Only resync the DOM when the highlight/content state actually changes —
   // not on every keystroke. This lets the user type freely; clicking a
   // different note triggers a re-set that includes the new highlights.
@@ -554,6 +696,7 @@ function ActiveLine({
       </Stack>
       {rtl && lexiconMap ? (
         <Box
+          data-find-cell={`${chapter}-${verseNum}-${label}`}
           sx={{
             flex: 1,
             bgcolor: "grey.100",
@@ -579,6 +722,7 @@ function ActiveLine({
       ) : (
         <Box
           ref={elRef}
+          data-find-cell={`${chapter}-${verseNum}-${label}`}
           contentEditable={editable && !readOnly}
           suppressContentEditableWarning
           spellCheck={!rtl}
@@ -604,6 +748,13 @@ function ActiveLine({
               borderRadius: 0.5,
               color: "inherit",
             },
+            "& mark.be-find": {
+              backgroundColor: "#ffd966",
+              outline: "1px solid #d97706",
+              padding: "0 1px",
+              borderRadius: 0.5,
+              color: "inherit",
+            },
             "&:focus": readOnly
               ? {}
               : {
@@ -615,4 +766,36 @@ function ActiveLine({
       )}
     </Stack>
   );
+}
+
+// Render plain text with find-match marks for non-active stacked rows. We
+// use innerHTML when there are matches so the <mark> tags paint; otherwise
+// render the raw string so React handles escaping the normal way.
+function FindAwareText({ text, findRe }: { text: string; findRe: RegExp | null }) {
+  const html = useMemo(() => {
+    if (!findRe || !text) return null;
+    const out = renderFindMatchesHTML(text, findRe);
+    return out.includes("be-find") ? out : null;
+  }, [findRe, text]);
+  if (html === null) return <>{text}</>;
+  return <span dangerouslySetInnerHTML={{ __html: html }} />;
+}
+
+function renderFindMatchesHTML(plainText: string, re: RegExp): string {
+  let html = "";
+  let lastIdx = 0;
+  let m: RegExpExecArray | null;
+  const local = new RegExp(re.source, re.flags);
+  while ((m = local.exec(plainText)) !== null) {
+    html += escapeHtml(plainText.slice(lastIdx, m.index));
+    html += `<mark class="be-find">${escapeHtml(m[0])}</mark>`;
+    lastIdx = m.index + m[0].length;
+    if (m[0].length === 0) local.lastIndex++;
+  }
+  html += escapeHtml(plainText.slice(lastIdx));
+  return html;
+}
+
+function escapeHtml(s: string): string {
+  return s.replace(/[&<>]/g, (c) => (c === "&" ? "&amp;" : c === "<" ? "&lt;" : "&gt;"));
 }

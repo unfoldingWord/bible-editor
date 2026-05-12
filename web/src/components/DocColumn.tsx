@@ -22,6 +22,10 @@ interface Props {
   // Present only when this column is UHB — caller pre-loads the lexicon
   // and we render each \w with a hover tooltip.
   lexiconMap?: Map<string, LexiconEntry | null>;
+  // Active find regex from the overlay; paints <mark.be-find> on every
+  // match in this column. Note highlights step aside while a query is
+  // active to keep the search results visually clean.
+  findRe?: RegExp | null;
   onSelectVerse: (v: number) => void;
   onEditVerse: (verseNum: number, plain: string, base: VerseDto) => void;
   onOpenAligner: (verseNum: number) => void;
@@ -47,6 +51,7 @@ export function DocColumn({
   activeNoteOccurrence,
   scrollNonce,
   lexiconMap,
+  findRe,
   onSelectVerse,
   onEditVerse,
   onOpenAligner,
@@ -117,6 +122,13 @@ export function DocColumn({
             borderRadius: 0.5,
             color: "inherit",
           },
+          "& mark.be-find": {
+            backgroundColor: "#ffd966",
+            outline: "1px solid #d97706",
+            padding: "0 1px",
+            borderRadius: 0.5,
+            color: "inherit",
+          },
         }}
       >
         {verseNumbers.map((v) => {
@@ -131,6 +143,7 @@ export function DocColumn({
               key={v}
               chapter={chapter}
               verseNum={v}
+              bibleVersion={bibleVersion}
               text={dto.plain_text ?? ""}
               content={dto.content}
               highlights={highlights}
@@ -138,6 +151,7 @@ export function DocColumn({
               readOnly={!!readOnly}
               rtl={!!rtl}
               lexiconMap={lexiconMap}
+              findRe={findRe ?? null}
               spanRef={isActive ? activeRef : null}
               onClick={() => onSelectVerse(v)}
               onAlign={() => onOpenAligner(v)}
@@ -153,6 +167,7 @@ export function DocColumn({
 function VerseSpan({
   chapter,
   verseNum,
+  bibleVersion,
   text,
   content,
   highlights,
@@ -160,6 +175,7 @@ function VerseSpan({
   readOnly,
   rtl,
   lexiconMap,
+  findRe,
   spanRef,
   onClick,
   onAlign,
@@ -167,6 +183,7 @@ function VerseSpan({
 }: {
   chapter: number;
   verseNum: number;
+  bibleVersion: string;
   text: string;
   content?: unknown;
   highlights?: Set<string> | null;
@@ -174,6 +191,7 @@ function VerseSpan({
   readOnly: boolean;
   rtl: boolean;
   lexiconMap?: Map<string, LexiconEntry | null>;
+  findRe: RegExp | null;
   spanRef: React.MutableRefObject<HTMLSpanElement | null> | null;
   onClick: () => void;
   onAlign: () => void;
@@ -183,12 +201,20 @@ function VerseSpan({
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lastTextRef = useRef(text);
 
+  // Find marks override note highlights — same precedence as BookView.
+  const findHTML = useMemo(() => {
+    if (!findRe || !text) return null;
+    const out = renderFindMatchesHTML(text, findRe);
+    return out.includes("be-find") ? out : null;
+  }, [findRe, text]);
+
   const html = useMemo(() => {
+    if (findHTML) return findHTML;
     if (!content || !highlights || highlights.size === 0) return null;
     const verseObjects = (content as { verseObjects?: unknown[] } | null)?.verseObjects;
     if (!Array.isArray(verseObjects)) return null;
     return renderHighlightedHTML(verseObjects, highlights);
-  }, [content, highlights]);
+  }, [findHTML, content, highlights]);
 
   // Resync the editable span when (a) text changes from outside and the user
   // hasn't been typing since, or (b) highlights change. We let the user type
@@ -220,6 +246,7 @@ function VerseSpan({
 
   return (
     <span
+      data-find-cell={`${chapter}-${verseNum}-${bibleVersion}`}
       onClick={onClick}
       style={{
         display: "inline",
@@ -300,4 +327,23 @@ function VerseSpan({
       )}{" "}
     </span>
   );
+}
+
+function renderFindMatchesHTML(plainText: string, re: RegExp): string {
+  let html = "";
+  let lastIdx = 0;
+  let m: RegExpExecArray | null;
+  const local = new RegExp(re.source, re.flags);
+  while ((m = local.exec(plainText)) !== null) {
+    html += escapeHtml(plainText.slice(lastIdx, m.index));
+    html += `<mark class="be-find">${escapeHtml(m[0])}</mark>`;
+    lastIdx = m.index + m[0].length;
+    if (m[0].length === 0) local.lastIndex++;
+  }
+  html += escapeHtml(plainText.slice(lastIdx));
+  return html;
+}
+
+function escapeHtml(s: string): string {
+  return s.replace(/[&<>]/g, (c) => (c === "&" ? "&amp;" : c === "<" ? "&lt;" : "&gt;"));
 }
