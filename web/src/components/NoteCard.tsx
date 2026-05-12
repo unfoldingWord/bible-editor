@@ -197,6 +197,7 @@ export function NoteCard({
       ref={paperRef}
       elevation={0}
       variant="outlined"
+      data-note-id={row.id}
       onMouseDown={onFocus}
       onFocus={onFocus}
       onDragOver={(e) => {

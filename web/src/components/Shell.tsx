@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useCallback, useMemo, useState } from "react";
 import { Box, Typography, CircularProgress, Alert } from "@mui/material";
 import { useChapter } from "../hooks/useChapter";
 import type { UseBookReturn } from "../hooks/useBook";
@@ -66,6 +66,11 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook }:
     loadFromStorage<string[]>(ENABLED_VERSIONS_KEY, ["ULT", "UST"]),
   );
   const [alignerTarget, setAlignerTarget] = useState<AlignerTarget | null>(null);
+  // Shared by the scripture + resource columns so a single "go to active"
+  // click re-centers both. Bumped via requestScrollToActive (and elsewhere
+  // when the active selection changes through other paths).
+  const [scrollNonce, setScrollNonce] = useState(0);
+  const requestScrollToActive = useCallback(() => setScrollNonce((n) => n + 1), []);
 
   const tileSet = useMemo(() => {
     if (!data) return [] as Array<{ verse: number; has: boolean; done?: boolean }>;
@@ -267,6 +272,8 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook }:
           onOpenAligner={(v, bv) =>
             setAlignerTarget({ chapter, verse: v, bibleVersion: bv })
           }
+          scrollNonce={scrollNonce}
+          onRequestScrollToActive={requestScrollToActive}
         />
         <ResourceColumn
           activeVerse={activeVerse}
@@ -275,6 +282,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook }:
           twl={data.twl}
           activeNoteId={activeNoteId}
           activeWordId={activeWordId}
+          scrollNonce={scrollNonce}
           onNoteChange={(id, patch) => {
             applyLocalRowPatch("tn", id, patch);
           }}

@@ -40,6 +40,11 @@ interface Props {
   onEditBookVerse?: (chapter: number, verse: number, bibleVersion: string, plain: string, base: VerseDto) => void;
   onOpenBookAligner?: (chapter: number, verse: number, bibleVersion: string) => void;
   onReplaceBookVerse?: (chapter: number, verse: number, bibleVersion: string, newContent: unknown, newPlainText: string, base: VerseDto) => void;
+  // Shared with the rest of the shell — bumped here on the "go to active"
+  // click, and shipped to ResourceColumn so it can scroll the active
+  // note/word/verse-group into view alongside the scripture.
+  scrollNonce: number;
+  onRequestScrollToActive: () => void;
   onSelectVerse: (v: number) => void;
   onOpenAligner: (verse: number, bibleVersion: string) => void;
   onModeChange: (mode: ScriptureMode) => void;
@@ -74,6 +79,8 @@ export function ScriptureColumn({
   onEditBookVerse,
   onOpenBookAligner,
   onReplaceBookVerse,
+  scrollNonce,
+  onRequestScrollToActive,
   onSelectVerse,
   onOpenAligner,
   onModeChange,
@@ -81,9 +88,6 @@ export function ScriptureColumn({
   onEditVerse,
 }: Props) {
   const activeRef = useRef<HTMLDivElement | null>(null);
-  // Bumped on "go to active" clicks so columns/book-mode views can re-scroll
-  // to their active span even when activeVerse hasn't changed.
-  const [scrollNonce, setScrollNonce] = useState(0);
   const [findOpen, setFindOpen] = useState(false);
   const [findQuery, setFindQuery] = useState<FindQuery | null>(null);
   const [findActiveMatch, setFindActiveMatch] = useState<FindMatch | null>(null);
@@ -111,13 +115,17 @@ export function ScriptureColumn({
     }
   }, [activeVerse, mode]);
 
-  const scrollToActive = () => {
+  // Stacked mode does its own activeRef scroll; columns/book modes react to
+  // the shared scrollNonce. The button asks the shell to bump the nonce, and
+  // we mirror that here for stacked so all three modes behave the same.
+  const prevNonceRef = useRef(scrollNonce);
+  useEffect(() => {
+    if (prevNonceRef.current === scrollNonce) return;
+    prevNonceRef.current = scrollNonce;
     if (mode === "stacked") {
       activeRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
-    } else {
-      setScrollNonce((n) => n + 1);
     }
-  };
+  }, [scrollNonce, mode]);
 
   const isHebrew = !!versesByVersion["UHB"];
 
@@ -201,11 +209,11 @@ export function ScriptureColumn({
           </ToggleButtonGroup>
         )}
         <Box sx={{ flex: 1 }} />
-        <Tooltip title="scroll the active verse back into view if you've scrolled away">
+        <Tooltip title="scroll the active verse + its resources back into view">
           <Button
             size="small"
             startIcon={<UndoIcon fontSize="small" />}
-            onClick={scrollToActive}
+            onClick={onRequestScrollToActive}
             sx={{ textTransform: "none" }}
           >
             go to active

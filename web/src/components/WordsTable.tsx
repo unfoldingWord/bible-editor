@@ -167,6 +167,7 @@ function WordRow({
       ref={rowRef}
       direction="row"
       spacing={1}
+      data-word-id={row.id}
       onMouseDown={onFocus}
       onFocus={onFocus}
       onDragOver={(e) => {

@@ -1,4 +1,4 @@
-import { Fragment, useMemo, useRef, useState } from "react";
+import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import { Box, Stack, Typography, Chip, Button, IconButton, Tooltip } from "@mui/material";
 import AddIcon from "@mui/icons-material/Add";
 import PushPinIcon from "@mui/icons-material/PushPin";
@@ -15,6 +15,10 @@ interface Props {
   twl: TwlRow[];
   activeNoteId: string | null;
   activeWordId: string | null;
+  // Bumped by Shell's "go to active" button so the resource column can
+  // recentre on the active note / word / verse group alongside the
+  // scripture column.
+  scrollNonce: number;
   onNoteChange: (id: string, patch: Partial<TnRow>) => void;
   onNoteSave: (id: string, patch: Partial<TnRow>) => void;
   onNoteDelete: (id: string) => void;
@@ -87,6 +91,7 @@ export function ResourceColumn({
   twl,
   activeNoteId,
   activeWordId,
+  scrollNonce,
   onNoteChange,
   onNoteSave,
   onNoteDelete,
@@ -156,8 +161,47 @@ export function ResourceColumn({
   const notesRef = useRef<HTMLDivElement | null>(null);
   const wordsRef = useRef<HTMLDivElement | null>(null);
   const questionsRef = useRef<HTMLDivElement | null>(null);
+  const scrollBodyRef = useRef<HTMLDivElement | null>(null);
   const scrollTo = (r: React.RefObject<HTMLDivElement | null>) =>
     r.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+
+  // Keep the resource column lined up with the active selection. We fire on:
+  //   - scrollNonce (Shell's "go to active" button)
+  //   - activeNoteId / activeWordId (focus shifts that came from elsewhere)
+  //   - activeVerse (timeline click, especially relevant when a section is
+  //     pinned and the user wants to jump into that verse's group)
+  //   - pinned.* (pin toggles, so the user lands on the same conceptual
+  //     spot they were viewing before the layout reshuffled)
+  // Priority: active note > active word > active-verse group in any pinned
+  // section. Without any of those, no scroll.
+  const prevNonceRef = useRef(scrollNonce);
+  useEffect(() => {
+    const root = scrollBodyRef.current;
+    if (!root) return;
+    const fromButton = prevNonceRef.current !== scrollNonce;
+    prevNonceRef.current = scrollNonce;
+    let target: HTMLElement | null = null;
+    if (activeNoteId) {
+      target = root.querySelector<HTMLElement>(`[data-note-id="${activeNoteId}"]`);
+    } else if (activeWordId) {
+      target = root.querySelector<HTMLElement>(`[data-word-id="${activeWordId}"]`);
+    }
+    if (!target && (pinned.notes || pinned.words || pinned.questions)) {
+      target = root.querySelector<HTMLElement>(`[data-verse-group="${activeVerse}"]`);
+    }
+    target?.scrollIntoView({
+      behavior: "smooth",
+      block: fromButton ? "center" : "nearest",
+    });
+  }, [
+    scrollNonce,
+    activeNoteId,
+    activeWordId,
+    activeVerse,
+    pinned.notes,
+    pinned.words,
+    pinned.questions,
+  ]);
 
   return (
     <Box
@@ -207,7 +251,7 @@ export function ResourceColumn({
           onClick={() => scrollTo(questionsRef)}
         />
       </Stack>
-      <Box sx={{ flex: 1, overflowY: "auto", px: 2, py: 1 }}>
+      <Box ref={scrollBodyRef} sx={{ flex: 1, overflowY: "auto", px: 2, py: 1 }}>
         <div ref={notesRef} />
         <SectionHead
           title="Notes"
@@ -376,6 +420,7 @@ function VerseGroupHead({ verse, active }: { verse: number; active: boolean }) {
       direction="row"
       spacing={1}
       alignItems="center"
+      data-verse-group={verse}
       sx={{
         mt: 1,
         mb: 0.25,
