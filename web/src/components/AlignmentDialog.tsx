@@ -326,8 +326,8 @@ function VerseStrip({
         gap: 2,
         px: 3,
         py: 1.5,
-        bgcolor: "primary.50",
-        borderBottom: "1px dashed",
+        bgcolor: "background.paper",
+        borderBottom: "1px solid",
         borderColor: "divider",
         fontSize: 13.5,
         lineHeight: 1.4,
@@ -444,7 +444,7 @@ function EditableStripCell({
         outline: "none",
         borderRadius: 3,
         padding: "1px 3px",
-        background: onEdit ? "rgba(255,255,255,0.6)" : "transparent",
+        background: "transparent",
       }}
     />
   );
