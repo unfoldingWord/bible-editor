@@ -327,32 +327,41 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate }: Props) {
           }}
         />
       </Box>
-      {alignerTarget && (
-        <AlignmentDialog
-          open
-          book={book}
-          chapter={chapter}
-          verseNum={alignerTarget.verse}
-          bibleVersion={alignerTarget.bibleVersion}
-          verse={data.verses[alignerTarget.bibleVersion]?.[alignerTarget.verse] ?? null}
-          contextOther={
-            data.verses[alignerTarget.bibleVersion === "ULT" ? "UST" : "ULT"]?.[
-              alignerTarget.verse
-            ] ?? null
-          }
-          onClose={() => setAlignerTarget(null)}
-          onSave={(content, plain, expectedVersion) => {
-            void outbox.enqueueVerse(
-              book,
-              chapter,
-              alignerTarget.verse,
-              alignerTarget.bibleVersion,
-              expectedVersion,
-              { content, plain_text: plain },
-            );
-          }}
-        />
-      )}
+      {alignerTarget && (() => {
+        const sourceLabel = data.verses["UHB"] ? "UHB" : "UGNT";
+        const sourceVerse =
+          data.verses[sourceLabel]?.[alignerTarget.verse] ?? null;
+        const twlForVerse = data.twl.filter((r) => r.verse === alignerTarget.verse);
+        return (
+          <AlignmentDialog
+            open
+            book={book}
+            chapter={chapter}
+            verseNum={alignerTarget.verse}
+            bibleVersion={alignerTarget.bibleVersion}
+            verse={data.verses[alignerTarget.bibleVersion]?.[alignerTarget.verse] ?? null}
+            contextOther={
+              data.verses[alignerTarget.bibleVersion === "ULT" ? "UST" : "ULT"]?.[
+                alignerTarget.verse
+              ] ?? null
+            }
+            sourceVerse={sourceVerse}
+            sourceLabel={sourceLabel}
+            twlForVerse={twlForVerse}
+            onClose={() => setAlignerTarget(null)}
+            onSave={(content, plain, expectedVersion) => {
+              void outbox.enqueueVerse(
+                book,
+                chapter,
+                alignerTarget.verse,
+                alignerTarget.bibleVersion,
+                expectedVersion,
+                { content, plain_text: plain },
+              );
+            }}
+          />
+        );
+      })()}
     </Box>
   );
 }

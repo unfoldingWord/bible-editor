@@ -236,8 +236,9 @@ export function clearGroup(state: AlignmentState, groupId: string): AlignmentSta
 
 // Move a source word (identified by SourceWord.id) into `destGroupId`'s
 // source chain, making that group compound. If the source's previous group
-// becomes empty (no remaining sources), its targets fall back to unaligned
-// and the empty group is removed.
+// becomes empty (no remaining sources), its targets merge into the
+// destination group's targets — the user merged the source words, so their
+// already-aligned GL words logically belong with the merged group.
 export function moveSource(
   state: AlignmentState,
   sourceId: string,
@@ -254,24 +255,45 @@ export function moveSource(
     }
   }
   if (!moving || !fromGroupId || fromGroupId === destGroupId) return state;
-  const orphaned: TargetWord[] = [];
-  const groups: AlignmentGroup[] = [];
+  let mergedTargets: TargetWord[] = [];
+  const intermediate: AlignmentGroup[] = [];
   for (const g of state.groups) {
     if (g.id === fromGroupId) {
       const remainingSources = g.source.filter((s) => s.id !== sourceId);
       if (remainingSources.length === 0) {
-        orphaned.push(...g.targets);
-        // skip this group — it's emptied out
+        mergedTargets = g.targets;
         continue;
       }
-      groups.push({ ...g, source: remainingSources });
-    } else if (g.id === destGroupId) {
-      groups.push({ ...g, source: [...g.source, moving!] });
+      intermediate.push({ ...g, source: remainingSources });
     } else {
-      groups.push(g);
+      intermediate.push(g);
     }
   }
-  return { ...state, groups, unaligned: [...state.unaligned, ...orphaned] };
+  const groups = intermediate.map((g) =>
+    g.id === destGroupId
+      ? {
+          ...g,
+          source: [...g.source, moving!],
+          targets: [...g.targets, ...mergedTargets],
+        }
+      : g,
+  );
+  return { ...state, groups };
+}
+
+// Apply moveTarget for multiple word ids in document order. Used when the
+// user shift-selects several chips in the unaligned bag and drags the bundle
+// onto a single destination.
+export function moveTargets(
+  state: AlignmentState,
+  wordIds: string[],
+  dest: string,
+): AlignmentState {
+  let s = state;
+  for (const id of wordIds) {
+    s = moveTarget(s, id, dest);
+  }
+  return s;
 }
 
 // Move a target word identified by `wordId` to a destination ("g:<groupId>"

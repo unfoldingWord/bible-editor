@@ -19,12 +19,15 @@ import {
   alignmentPlainText,
   clearGroup,
   moveSource,
-  moveTarget,
+  moveTargets,
   parseAlignment,
   serializeAlignment,
   type AlignmentState,
 } from "../lib/alignment";
-import type { VerseDto } from "../sync/api";
+import type { TwlRow, VerseDto } from "../sync/api";
+
+const WORD_IDS_MIME = "text/word-ids";
+const SOURCE_ID_MIME = "text/source-id";
 
 interface Props {
   open: boolean;
@@ -34,6 +37,9 @@ interface Props {
   bibleVersion: string;
   verse: VerseDto | null;
   contextOther: VerseDto | null; // the "other" gateway translation (UST when editing ULT, etc.)
+  sourceVerse: VerseDto | null;  // UHB/UGNT verse for context
+  sourceLabel: string;           // "UHB" or "UGNT"
+  twlForVerse: TwlRow[];         // chapter twl rows filtered to this verse, for TW-article hints
   onClose: () => void;
   onSave: (newContent: unknown, plainText: string, expectedVersion: number) => void;
 }
@@ -46,6 +52,9 @@ export function AlignmentDialog({
   bibleVersion,
   verse,
   contextOther,
+  sourceVerse,
+  sourceLabel,
+  twlForVerse,
   onClose,
   onSave,
 }: Props) {
@@ -57,13 +66,16 @@ export function AlignmentDialog({
   }, [verse]);
 
   const [state, setState] = useState<AlignmentState | null>(initial);
+  const [selectedUnaligned, setSelectedUnaligned] = useState<Set<string>>(new Set());
   useEffect(() => {
     setState(initial);
+    setSelectedUnaligned(new Set());
   }, [initial]);
 
-  const handleTargetDrop = (dest: string, wordId: string) => {
-    if (!state) return;
-    setState(moveTarget(state, wordId, dest));
+  const handleTargetsDrop = (dest: string, wordIds: string[]) => {
+    if (!state || wordIds.length === 0) return;
+    setState(moveTargets(state, wordIds, dest));
+    setSelectedUnaligned(new Set());
   };
 
   const handleSourceDrop = (destGroupId: string, sourceId: string) => {
@@ -76,7 +88,32 @@ export function AlignmentDialog({
     setState(clearGroup(state, groupId));
   };
 
-  const handleReset = () => setState(initial);
+  const handleChipClick = (id: string, shift: boolean) => {
+    setSelectedUnaligned((prev) => {
+      if (shift) {
+        const next = new Set(prev);
+        if (next.has(id)) next.delete(id);
+        else next.add(id);
+        return next;
+      }
+      // Plain click: if this chip is the only one selected, deselect it;
+      // otherwise reset selection to just this chip.
+      if (prev.size === 1 && prev.has(id)) return new Set();
+      return new Set([id]);
+    });
+  };
+
+  // When the user starts dragging an unaligned chip that's part of the
+  // current selection, ship all selected ids. Otherwise ship just that one.
+  const idsForUnalignedDrag = (id: string) =>
+    selectedUnaligned.has(id) && selectedUnaligned.size > 1
+      ? Array.from(selectedUnaligned)
+      : [id];
+
+  const handleReset = () => {
+    setState(initial);
+    setSelectedUnaligned(new Set());
+  };
   const handleSave = () => {
     if (!state || !verse) return;
     const newVerseObjects = serializeAlignment(state);
@@ -109,12 +146,28 @@ export function AlignmentDialog({
         )}
         {state && (
           <>
-            <VerseStrip verse={verse} other={contextOther} bibleVersion={bibleVersion} chapter={chapter} verseNum={verseNum} />
+            <VerseStrip
+              verse={verse}
+              other={contextOther}
+              source={sourceVerse}
+              sourceLabel={sourceLabel}
+              bibleVersion={bibleVersion}
+              chapter={chapter}
+              verseNum={verseNum}
+            />
             <Box sx={{ display: "grid", gridTemplateColumns: "220px 1fr", height: 480, overflow: "hidden" }}>
-              <UnalignedBag state={state} onDrop={(wordId) => handleTargetDrop("u", wordId)} />
+              <UnalignedBag
+                state={state}
+                selectedIds={selectedUnaligned}
+                onChipClick={handleChipClick}
+                idsForDrag={idsForUnalignedDrag}
+                onDrop={(wordIds) => handleTargetsDrop("u", wordIds)}
+              />
               <AlignmentGrid
                 state={state}
-                onTargetDrop={handleTargetDrop}
+                twlForVerse={twlForVerse}
+                verseNum={verseNum}
+                onTargetsDrop={handleTargetsDrop}
                 onSourceDrop={handleSourceDrop}
                 onClearGroup={handleClearGroup}
               />
@@ -139,22 +192,27 @@ export function AlignmentDialog({
 function VerseStrip({
   verse,
   other,
+  source,
+  sourceLabel,
   bibleVersion,
   chapter,
   verseNum,
 }: {
   verse: VerseDto | null;
   other: VerseDto | null;
+  source: VerseDto | null;
+  sourceLabel: string;
   bibleVersion: string;
   chapter: number;
   verseNum: number;
 }) {
   const otherLabel = bibleVersion === "ULT" ? "UST" : bibleVersion === "UST" ? "ULT" : "UST";
+  const sourceIsHebrew = sourceLabel === "UHB";
   return (
     <Box
       sx={{
         display: "grid",
-        gridTemplateColumns: "54px 1fr 1fr",
+        gridTemplateColumns: "54px 1fr 1fr 1fr",
         gap: 2,
         px: 3,
         py: 1.5,
@@ -176,16 +234,38 @@ function VerseStrip({
         <Chip label={otherLabel} size="small" sx={{ mr: 1, fontFamily: "monospace", height: 18 }} />
         {other?.plain_text}
       </Box>
+      <Box>
+        <Chip label={sourceLabel} size="small" sx={{ mr: 1, fontFamily: "monospace", height: 18 }} />
+        <Box
+          component="span"
+          dir={sourceIsHebrew ? "rtl" : "ltr"}
+          sx={{
+            fontFamily: sourceIsHebrew
+              ? '"Times New Roman","SBL Hebrew","Cardo",serif'
+              : '"Times New Roman","Cardo",serif',
+            fontSize: 16,
+            unicodeBidi: "isolate",
+          }}
+        >
+          {source?.plain_text}
+        </Box>
+      </Box>
     </Box>
   );
 }
 
 function UnalignedBag({
   state,
+  selectedIds,
+  onChipClick,
+  idsForDrag,
   onDrop,
 }: {
   state: AlignmentState;
-  onDrop: (wordId: string) => void;
+  selectedIds: Set<string>;
+  onChipClick: (id: string, shift: boolean) => void;
+  idsForDrag: (id: string) => string[];
+  onDrop: (wordIds: string[]) => void;
 }) {
   const [over, setOver] = useState(false);
   return (
@@ -198,8 +278,8 @@ function UnalignedBag({
       onDrop={(e) => {
         e.preventDefault();
         setOver(false);
-        const wordId = e.dataTransfer.getData("text/word-id");
-        if (wordId) onDrop(wordId);
+        const ids = readWordIds(e.dataTransfer);
+        if (ids.length > 0) onDrop(ids);
       }}
       sx={{
         bgcolor: over ? "primary.50" : "grey.50",
@@ -221,15 +301,28 @@ function UnalignedBag({
         }}
       >
         unaligned GL words ({state.unaligned.length})
+        {selectedIds.size > 1 && ` · ${selectedIds.size} selected`}
       </Typography>
       {state.unaligned.length === 0 && (
         <Typography variant="caption" color="text.disabled">
           drag a word here to detach it from its source
         </Typography>
       )}
+      <Typography
+        variant="caption"
+        sx={{ color: "text.disabled", display: "block", mb: 0.5, fontStyle: "italic" }}
+      >
+        shift-click to multi-select, then drag any selected chip
+      </Typography>
       <Stack spacing={0.5}>
         {state.unaligned.map((w) => (
-          <DraggableChip key={w.id} wordId={w.id} text={w.text} />
+          <SelectableChip
+            key={w.id}
+            text={w.text}
+            selected={selectedIds.has(w.id)}
+            onClick={(shift) => onChipClick(w.id, shift)}
+            idsForDrag={() => idsForDrag(w.id)}
+          />
         ))}
       </Stack>
     </Box>
@@ -238,12 +331,16 @@ function UnalignedBag({
 
 function AlignmentGrid({
   state,
-  onTargetDrop,
+  twlForVerse,
+  verseNum,
+  onTargetsDrop,
   onSourceDrop,
   onClearGroup,
 }: {
   state: AlignmentState;
-  onTargetDrop: (dest: string, wordId: string) => void;
+  twlForVerse: TwlRow[];
+  verseNum: number;
+  onTargetsDrop: (dest: string, wordIds: string[]) => void;
   onSourceDrop: (destGroupId: string, sourceId: string) => void;
   onClearGroup: (groupId: string) => void;
 }) {
@@ -266,7 +363,7 @@ function AlignmentGrid({
         <DropTargetBox
           key={g.id}
           groupId={g.id}
-          onTargetDrop={(wordId) => onTargetDrop(`g:${g.id}`, wordId)}
+          onTargetsDrop={(wordIds) => onTargetsDrop(`g:${g.id}`, wordIds)}
           onSourceDrop={(sourceId) => onSourceDrop(g.id, sourceId)}
         >
           <Stack direction="row" alignItems="flex-start" sx={{ mb: 0.5, direction: "ltr" }}>
@@ -275,10 +372,13 @@ function AlignmentGrid({
                 <Tooltip
                   key={s.id}
                   title={
-                    <Box>
-                      <div>{s.strong}</div>
-                      <div>{s.lemma}</div>
-                      <div>{s.morph}</div>
+                    <Box sx={{ fontSize: 12 }}>
+                      <div>strong: {s.strong || "—"}</div>
+                      <div>lemma: {s.lemma || "—"}</div>
+                      <div>morph: {s.morph || "—"}</div>
+                      {twHintFor(twlForVerse, verseNum, s.content) && (
+                        <div>tw: {twHintFor(twlForVerse, verseNum, s.content)}</div>
+                      )}
                     </Box>
                   }
                 >
@@ -286,7 +386,7 @@ function AlignmentGrid({
                     elevation={0}
                     draggable
                     onDragStart={(e) => {
-                      e.dataTransfer.setData("text/source-id", s.id);
+                      e.dataTransfer.setData(SOURCE_ID_MIME, s.id);
                       e.dataTransfer.effectAllowed = "move";
                     }}
                     sx={{
@@ -327,7 +427,9 @@ function AlignmentGrid({
                 drop here
               </Typography>
             ) : (
-              g.targets.map((t) => <DraggableChip key={t.id} wordId={t.id} text={t.text} />)
+              g.targets.map((t) => (
+                <SimpleDraggableChip key={t.id} wordId={t.id} text={t.text} />
+              ))
             )}
           </Stack>
         </DropTargetBox>
@@ -338,12 +440,12 @@ function AlignmentGrid({
 
 function DropTargetBox({
   groupId,
-  onTargetDrop,
+  onTargetsDrop,
   onSourceDrop,
   children,
 }: {
   groupId: string;
-  onTargetDrop: (wordId: string) => void;
+  onTargetsDrop: (wordIds: string[]) => void;
   onSourceDrop: (sourceId: string) => void;
   children: React.ReactNode;
 }) {
@@ -359,12 +461,12 @@ function DropTargetBox({
       onDrop={(e) => {
         e.preventDefault();
         setOver(false);
-        const wordId = e.dataTransfer.getData("text/word-id");
-        if (wordId) {
-          onTargetDrop(wordId);
+        const wordIds = readWordIds(e.dataTransfer);
+        if (wordIds.length > 0) {
+          onTargetsDrop(wordIds);
           return;
         }
-        const sourceId = e.dataTransfer.getData("text/source-id");
+        const sourceId = e.dataTransfer.getData(SOURCE_ID_MIME);
         if (sourceId) onSourceDrop(sourceId);
       }}
       data-group-id={groupId}
@@ -385,7 +487,45 @@ function DropTargetBox({
   );
 }
 
-function DraggableChip({ wordId, text }: { wordId: string; text: string }) {
+function SelectableChip({
+  text,
+  selected,
+  onClick,
+  idsForDrag,
+}: {
+  text: string;
+  selected: boolean;
+  onClick: (shift: boolean) => void;
+  idsForDrag: () => string[];
+}) {
+  return (
+    <Chip
+      label={text}
+      size="small"
+      variant={selected ? "filled" : "outlined"}
+      color={selected ? "primary" : "default"}
+      draggable
+      onClick={(e) => onClick(e.shiftKey)}
+      onDragStart={(e) => {
+        const ids = idsForDrag();
+        e.dataTransfer.setData(WORD_IDS_MIME, JSON.stringify(ids));
+        // Also ship the legacy single-id form so the rest of the dialog
+        // still works if multi-form parsing ever flakes.
+        if (ids.length === 1) e.dataTransfer.setData("text/word-id", ids[0]);
+        e.dataTransfer.effectAllowed = "move";
+      }}
+      sx={{
+        cursor: "grab",
+        fontFamily: '"Roboto","Helvetica",sans-serif',
+        borderLeft: "3px solid",
+        borderLeftColor: "primary.main",
+        userSelect: "none",
+      }}
+    />
+  );
+}
+
+function SimpleDraggableChip({ wordId, text }: { wordId: string; text: string }) {
   return (
     <Chip
       label={text}
@@ -393,6 +533,7 @@ function DraggableChip({ wordId, text }: { wordId: string; text: string }) {
       variant="outlined"
       draggable
       onDragStart={(e) => {
+        e.dataTransfer.setData(WORD_IDS_MIME, JSON.stringify([wordId]));
         e.dataTransfer.setData("text/word-id", wordId);
         e.dataTransfer.effectAllowed = "move";
       }}
@@ -405,4 +546,47 @@ function DraggableChip({ wordId, text }: { wordId: string; text: string }) {
       }}
     />
   );
+}
+
+// ---------- helpers ----------
+
+function readWordIds(dt: DataTransfer): string[] {
+  const raw = dt.getData(WORD_IDS_MIME);
+  if (raw) {
+    try {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed) && parsed.every((x) => typeof x === "string")) {
+        return parsed;
+      }
+    } catch {
+      /* fall through */
+    }
+  }
+  const single = dt.getData("text/word-id");
+  return single ? [single] : [];
+}
+
+// Find a TWL tw_link whose orig_words includes this source word, so the
+// tooltip can point the editor at the article path (e.g. "names/yahweh").
+// No definition text is shipped from the API yet — the link is the hint.
+function twHintFor(twlRows: TwlRow[], verseNum: number, content: string): string | null {
+  if (!content) return null;
+  for (const r of twlRows) {
+    if (r.verse !== verseNum) continue;
+    const ow = r.orig_words ?? "";
+    if (!ow) continue;
+    // The TWL orig_words may be a single word or a phrase. Match if any
+    // whitespace-separated chunk equals our content.
+    const chunks = ow.split(/\s+/).filter(Boolean);
+    if (chunks.includes(content)) {
+      return twShort(r.tw_link);
+    }
+  }
+  return null;
+}
+
+function twShort(link: string | null): string | null {
+  if (!link) return null;
+  const m = link.match(/\/bible\/([^/]+\/[^/]+)$/);
+  return m ? m[1] : link;
 }
