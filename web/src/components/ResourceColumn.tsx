@@ -16,6 +16,7 @@ interface Props {
   activeNoteId: string | null;
   activeWordId: string | null;
   onNoteChange: (id: string, patch: Partial<TnRow>) => void;
+  onNoteSave: (id: string, patch: Partial<TnRow>) => void;
   onNoteDelete: (id: string) => void;
   onNoteInsertAfter: (refId: string) => void;
   onNoteReorder: (draggedId: string, refId: string, position: DropPosition) => void;
@@ -87,6 +88,7 @@ export function ResourceColumn({
   activeNoteId,
   activeWordId,
   onNoteChange,
+  onNoteSave,
   onNoteDelete,
   onNoteInsertAfter,
   onNoteReorder,
@@ -319,6 +321,7 @@ export function ResourceColumn({
           dragging={dragId === r.id}
           isDropTarget={dragId !== null && dragId !== r.id}
           onChange={(p) => onNoteChange(r.id, p)}
+          onSave={(p) => onNoteSave(r.id, p)}
           onDelete={() => onNoteDelete(r.id)}
           onInsertAfter={() => onNoteInsertAfter(r.id)}
           onFocus={() => onNoteFocus(r)}

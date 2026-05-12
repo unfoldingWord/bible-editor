@@ -3,6 +3,9 @@ import { Paper, Stack, Chip, IconButton, Typography, Box, TextField, Tooltip } f
 import DeleteOutlineIcon from "@mui/icons-material/DeleteOutline";
 import AddIcon from "@mui/icons-material/Add";
 import DragIndicatorIcon from "@mui/icons-material/DragIndicator";
+import SaveIcon from "@mui/icons-material/Save";
+import SaveOutlinedIcon from "@mui/icons-material/SaveOutlined";
+import UndoIcon from "@mui/icons-material/Undo";
 import type { TnRow } from "../sync/api";
 import { useCatalogs } from "../hooks/useCatalogs";
 import { CatalogPicker } from "./CatalogPicker";
@@ -14,7 +17,13 @@ interface Props {
   active: boolean;
   dragging: boolean;
   isDropTarget: boolean;
+  // Optimistic local-only apply, fired on every keystroke / chip pick so
+  // parent state (e.g. activeQuote-driven highlighting) stays in sync. Does
+  // NOT hit the outbox.
   onChange: (patch: Partial<TnRow>) => void;
+  // Enqueue a row PATCH. Called once per edit session — at session end
+  // (active going false), on manual save, or on unmount.
+  onSave: (patch: Partial<TnRow>) => void;
   onDelete: () => void;
   onInsertAfter: () => void;
   onFocus?: () => void;
@@ -33,12 +42,19 @@ function tsvToDisplay(s: string | null): string {
   return (s ?? "").replace(/\\n/g, "\n");
 }
 
+interface SessionSnapshot {
+  quote: string;
+  note: string;
+  support_reference: string | null;
+}
+
 export function NoteCard({
   row,
   active,
   dragging,
   isDropTarget,
   onChange,
+  onSave,
   onDelete,
   onInsertAfter,
   onFocus,
@@ -50,10 +66,26 @@ export function NoteCard({
 }: Props) {
   const [quote, setQuote] = useState(tsvToDisplay(row.quote));
   const [note, setNote] = useState(tsvToDisplay(row.note));
-  const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [supportRef, setSupportRef] = useState<string | null>(row.support_reference);
+
+  // Session model: when this card becomes active, snapshot the current
+  // committed values so undo can revert to "what it was when I started
+  // editing", regardless of intra-session saves. Pending patches accumulate
+  // here and flush once at session end (or on manual save).
+  const sessionSnapshotRef = useRef<SessionSnapshot | null>(null);
   const pendingRef = useRef<Partial<TnRow>>({});
+  const [dirty, setDirty] = useState(false);
+  const cancelUnmountFlushRef = useRef(false);
+
   const paperRef = useRef<HTMLDivElement | null>(null);
   const catalogs = useCatalogs();
+
+  // Keep latest onSave reachable from the unmount cleanup without re-running
+  // the effect each time the parent re-renders.
+  const onSaveRef = useRef(onSave);
+  useEffect(() => {
+    onSaveRef.current = onSave;
+  }, [onSave]);
 
   const positionFromEvent = (e: React.DragEvent): DropPosition => {
     const rect = paperRef.current?.getBoundingClientRect();
@@ -61,27 +93,104 @@ export function NoteCard({
     return e.clientY < rect.top + rect.height / 2 ? "before" : "after";
   };
 
-  // Re-sync when the row changes from outside (e.g. server-confirmed update).
+  // Re-sync from the server-confirmed row, but only when no session is in
+  // progress. While a session is open, the local fields are the source of
+  // truth (a server response landing mid-session would otherwise clobber
+  // the user's unsaved edits).
   useEffect(() => {
+    if (sessionSnapshotRef.current !== null) return;
     setQuote(tsvToDisplay(row.quote));
   }, [row.id, row.version, row.quote]);
   useEffect(() => {
+    if (sessionSnapshotRef.current !== null) return;
     setNote(tsvToDisplay(row.note));
   }, [row.id, row.version, row.note]);
+  useEffect(() => {
+    if (sessionSnapshotRef.current !== null) return;
+    setSupportRef(row.support_reference);
+  }, [row.id, row.version, row.support_reference]);
 
-  // Accumulate field edits into one PATCH per debounce window so typing
-  // through quote and note within 350ms collapses to a single server save
-  // (and one version bump) instead of clobbering each other.
-  const queue = (patch: Partial<TnRow>) => {
-    pendingRef.current = { ...pendingRef.current, ...patch };
-    if (debounceRef.current) clearTimeout(debounceRef.current);
-    debounceRef.current = setTimeout(() => {
-      const merged = pendingRef.current;
-      pendingRef.current = {};
-      debounceRef.current = null;
-      onChange(merged);
-    }, 350);
+  // Session entry/exit. Snapshot is taken on active=false→true with the
+  // values currently in local state (which match the row when nothing is
+  // pending). On active=true→false the accumulated patch is flushed and
+  // the snapshot is cleared.
+  useEffect(() => {
+    if (active) {
+      if (sessionSnapshotRef.current === null) {
+        sessionSnapshotRef.current = { quote, note, support_reference: supportRef };
+      }
+    } else if (sessionSnapshotRef.current !== null) {
+      flushPending();
+      sessionSnapshotRef.current = null;
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [active]);
+
+  // Flush on unmount too — handles cases where the card unmounts without
+  // transitioning to inactive first (e.g. user navigates to another verse
+  // while this note is still active and gets filtered out of the list).
+  // Intentionally cancelled when this card itself is being deleted.
+  useEffect(() => {
+    return () => {
+      if (cancelUnmountFlushRef.current) return;
+      const p = pendingRef.current;
+      if (Object.keys(p).length > 0) {
+        onSaveRef.current(p);
+      }
+    };
+  }, []);
+
+  const flushPending = () => {
+    const p = pendingRef.current;
+    if (Object.keys(p).length === 0) {
+      setDirty(false);
+      return;
+    }
+    pendingRef.current = {};
+    setDirty(false);
+    onSave(p);
   };
+
+  const stashEdit = (patch: Partial<TnRow>) => {
+    pendingRef.current = { ...pendingRef.current, ...patch };
+    setDirty(true);
+    // Optimistic local apply so the parent's data.tn reflects the live
+    // value — keeps verse highlighting / aligner quote in step.
+    onChange(patch);
+  };
+
+  const handleUndo = () => {
+    const s = sessionSnapshotRef.current;
+    if (!s) return;
+    setQuote(s.quote);
+    setNote(s.note);
+    setSupportRef(s.support_reference);
+    const revert: Partial<TnRow> = {
+      quote: s.quote,
+      note: s.note,
+      support_reference: s.support_reference,
+    };
+    pendingRef.current = revert;
+    setDirty(true);
+    onChange(revert);
+  };
+
+  const handleDelete = () => {
+    cancelUnmountFlushRef.current = true;
+    pendingRef.current = {};
+    sessionSnapshotRef.current = null;
+    setDirty(false);
+    onDelete();
+  };
+
+  const snapshot = sessionSnapshotRef.current;
+  const differsFromSnapshot =
+    snapshot !== null &&
+    (quote !== snapshot.quote ||
+      note !== snapshot.note ||
+      supportRef !== snapshot.support_reference);
+  const canUndo = active && (dirty || differsFromSnapshot);
+  const showSessionButtons = active;
 
   return (
     <Paper
@@ -158,32 +267,71 @@ export function NoteCard({
           sx={{ fontFamily: "monospace", fontSize: 11, height: 22 }}
         />
         <CatalogPicker
-          value={row.support_reference}
+          value={supportRef}
           options={catalogs.supportReferences}
           display={(v) => (v ? shortSupport(v) : "+ support ref")}
           placeholder="figs-, translate-, writing-, …"
           color="primary"
           variant={active ? "filled" : "outlined"}
-          onChange={(next) => onChange({ support_reference: next })}
+          onChange={(next) => {
+            setSupportRef(next);
+            stashEdit({ support_reference: next });
+          }}
         />
         <Typography variant="caption" sx={{ color: "text.disabled", fontFamily: "monospace" }}>
           {row.ref_raw}
         </Typography>
         <Box sx={{ flex: 1 }} />
         <Tooltip
-          title={`v${row.version} — row was saved ${row.version - 1} time${row.version - 1 === 1 ? "" : "s"}; last update ${new Date(row.updated_at * 1000).toLocaleString()}`}
+          title={`v${row.version}${dirty ? " · unsaved edits" : ""} — saved ${row.version - 1} time${row.version - 1 === 1 ? "" : "s"}; last update ${new Date(row.updated_at * 1000).toLocaleString()}`}
         >
-          <Typography variant="caption" sx={{ color: "text.disabled", fontFamily: "monospace", cursor: "help" }}>
-            v{row.version}
+          <Typography
+            variant="caption"
+            sx={{
+              color: dirty ? "warning.main" : "text.disabled",
+              fontFamily: "monospace",
+              cursor: "help",
+              fontWeight: dirty ? 600 : 400,
+            }}
+          >
+            v{row.version}{dirty ? "*" : ""}
           </Typography>
         </Tooltip>
+        {showSessionButtons && (
+          <>
+            <Tooltip title={canUndo ? "discard every edit since this note became active" : "no changes since this note became active"}>
+              <span>
+                <IconButton
+                  size="small"
+                  onClick={handleUndo}
+                  disabled={!canUndo}
+                  sx={{ p: 0.25, color: canUndo ? "warning.main" : "action.disabled" }}
+                >
+                  <UndoIcon fontSize="inherit" />
+                </IconButton>
+              </span>
+            </Tooltip>
+            <Tooltip title={dirty ? "save pending edits now (auto-saves when you leave this note)" : "no pending edits"}>
+              <span>
+                <IconButton
+                  size="small"
+                  onClick={flushPending}
+                  disabled={!dirty}
+                  sx={{ p: 0.25, color: dirty ? "primary.main" : "action.disabled" }}
+                >
+                  {dirty ? <SaveIcon fontSize="inherit" /> : <SaveOutlinedIcon fontSize="inherit" />}
+                </IconButton>
+              </span>
+            </Tooltip>
+          </>
+        )}
         <Tooltip title="add a new note after this one">
           <IconButton size="small" onClick={onInsertAfter} color="success" sx={{ p: 0.25 }}>
             <AddIcon fontSize="inherit" />
           </IconButton>
         </Tooltip>
         <Tooltip title="delete this note">
-          <IconButton size="small" onClick={onDelete} color="error" sx={{ p: 0.25 }}>
+          <IconButton size="small" onClick={handleDelete} color="error" sx={{ p: 0.25 }}>
             <DeleteOutlineIcon fontSize="inherit" />
           </IconButton>
         </Tooltip>
@@ -208,7 +356,7 @@ export function NoteCard({
             value={quote}
             onChange={(e) => {
               setQuote(e.target.value);
-              queue({ quote: e.target.value });
+              stashEdit({ quote: e.target.value });
             }}
             multiline
             fullWidth
@@ -245,7 +393,7 @@ export function NoteCard({
             value={note}
             onChange={(e) => {
               setNote(e.target.value);
-              queue({ note: e.target.value });
+              stashEdit({ note: e.target.value });
             }}
             multiline
             fullWidth

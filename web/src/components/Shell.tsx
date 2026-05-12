@@ -208,6 +208,9 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate }: Props) {
           activeNoteId={activeNoteId}
           activeWordId={activeWordId}
           onNoteChange={(id, patch) => {
+            applyLocalRowPatch("tn", id, patch);
+          }}
+          onNoteSave={(id, patch) => {
             const row = data.tn.find((r) => r.id === id);
             if (row) enqueueRow("tn", row, patch);
           }}
