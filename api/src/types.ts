@@ -47,6 +47,7 @@ export interface TwlRow {
   orig_words: string | null;
   occurrence: number | null;
   tw_link: string | null;
+  sort_order: number | null;
   version: number;
   updated_by: number | null;
   updated_at: number;

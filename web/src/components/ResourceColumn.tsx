@@ -3,7 +3,7 @@ import { Box, Stack, Typography, Chip, Button } from "@mui/material";
 import AddIcon from "@mui/icons-material/Add";
 import type { TnRow, TqRow, TwlRow } from "../sync/api";
 import { NoteCard, type DropPosition } from "./NoteCard";
-import { WordsTable } from "./WordsTable";
+import { WordsTable, type WordDropPosition } from "./WordsTable";
 import { QuestionsTable } from "./QuestionsTable";
 
 interface Props {
@@ -23,6 +23,7 @@ interface Props {
   onWordDelete: (id: string) => void;
   onWordCreate: () => void;
   onWordFocus: (row: TwlRow) => void;
+  onWordReorder: (draggedId: string, refId: string, position: WordDropPosition) => void;
   onQuestionChange: (id: string, patch: Partial<TqRow>) => void;
   onQuestionDelete: (id: string) => void;
   onQuestionCreate: () => void;
@@ -45,6 +46,7 @@ export function ResourceColumn({
   onWordDelete,
   onWordCreate,
   onWordFocus,
+  onWordReorder,
   onQuestionChange,
   onQuestionDelete,
   onQuestionCreate,
@@ -57,7 +59,13 @@ export function ResourceColumn({
           (b.sort_order ?? Number.MAX_SAFE_INTEGER) || a.id.localeCompare(b.id),
     );
   const tqForVerse = tq.filter((r) => r.verse === activeVerse);
-  const twlForVerse = twl.filter((r) => r.verse === activeVerse);
+  const twlForVerse = twl
+    .filter((r) => r.verse === activeVerse)
+    .sort(
+      (a, b) =>
+        (a.sort_order ?? Number.MAX_SAFE_INTEGER) -
+          (b.sort_order ?? Number.MAX_SAFE_INTEGER) || a.id.localeCompare(b.id),
+    );
 
   const [dragId, setDragId] = useState<string | null>(null);
   const [dragOver, setDragOver] = useState<
@@ -182,6 +190,7 @@ export function ResourceColumn({
           onChange={onWordChange}
           onDelete={onWordDelete}
           onFocus={onWordFocus}
+          onReorder={onWordReorder}
         />
 
         <Box sx={{ height: 16 }} />

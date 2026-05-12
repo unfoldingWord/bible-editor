@@ -222,7 +222,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate }: Props) {
             if (row.verse !== activeVerse) setActiveVerse(row.verse);
           }}
           onNoteCreate={async () => {
-            const list = sortedTnForVerse(data.tn, activeVerse);
+            const list = sortedForVerse(data.tn, activeVerse);
             const sort_order = pickSortOrder(list, null, "after");
             const created = (await api.createRow<TnRow>("tn", {
               book,
@@ -239,7 +239,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate }: Props) {
           onNoteInsertAfter={async (refId) => {
             const ref = data.tn.find((r) => r.id === refId);
             if (!ref) return;
-            const list = sortedTnForVerse(data.tn, ref.verse);
+            const list = sortedForVerse(data.tn, ref.verse);
             const sort_order = pickSortOrder(list, refId, "after");
             const created = (await api.createRow<TnRow>("tn", {
               book,
@@ -257,12 +257,14 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate }: Props) {
           onNoteReorder={(draggedId, refId, position) => {
             const dragged = data.tn.find((r) => r.id === draggedId);
             if (!dragged) return;
-            const list = sortedTnForVerse(data.tn, dragged.verse);
+            const list = sortedForVerse(data.tn, dragged.verse);
             const sort_order = pickSortOrder(list, refId, position, draggedId);
             applyLocalRowPatch("tn", draggedId, { sort_order });
             void outbox.enqueueRow("tn", draggedId, dragged.version, { sort_order });
           }}
           onWordCreate={async () => {
+            const list = sortedForVerse(data.twl, activeVerse);
+            const sort_order = pickSortOrder(list, null, "after");
             const created = (await api.createRow<TwlRow>("twl", {
               book,
               chapter,
@@ -270,10 +272,19 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate }: Props) {
               ref_raw: activeVerse === 0 ? `${chapter}:intro` : `${chapter}:${activeVerse}`,
               orig_words: "",
               tw_link: "",
+              sort_order,
             }));
             applyLocalRowInsert("twl", created);
             setActiveWordId(created.id);
             setActiveNoteId(null);
+          }}
+          onWordReorder={(draggedId, refId, position) => {
+            const dragged = data.twl.find((r) => r.id === draggedId);
+            if (!dragged) return;
+            const list = sortedForVerse(data.twl, dragged.verse);
+            const sort_order = pickSortOrder(list, refId, position, draggedId);
+            applyLocalRowPatch("twl", draggedId, { sort_order });
+            void outbox.enqueueRow("twl", draggedId, dragged.version, { sort_order });
           }}
           onQuestionCreate={async () => {
             const created = (await api.createRow<TqRow>("tq", {
@@ -348,7 +359,9 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate }: Props) {
 
 // ---------- sort_order helpers ----------
 
-function sortedTnForVerse(rows: TnRow[], verse: number): TnRow[] {
+type Sortable = { id: string; verse: number; sort_order: number | null };
+
+function sortedForVerse<T extends Sortable>(rows: T[], verse: number): T[] {
   return rows
     .filter((r) => r.verse === verse)
     .sort(
@@ -363,8 +376,8 @@ function sortedTnForVerse(rows: TnRow[], verse: number): TnRow[] {
 // is set when reordering an existing row — we don't want it in the list when
 // computing midpoints, otherwise drop-after-self collapses to a no-op midpoint
 // inside its own slot.
-function pickSortOrder(
-  rows: TnRow[],
+function pickSortOrder<T extends Sortable>(
+  rows: T[],
   refId: string | null,
   position: "before" | "after",
   excludeId?: string,

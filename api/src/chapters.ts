@@ -35,7 +35,7 @@ chapters.get("/:book/:chapter", async (c) => {
       .all<TqRow>(),
     db
       .prepare(
-        "SELECT * FROM twl_rows WHERE book = ?1 AND chapter = ?2 AND deleted_at IS NULL ORDER BY verse, id",
+        "SELECT * FROM twl_rows WHERE book = ?1 AND chapter = ?2 AND deleted_at IS NULL ORDER BY verse, sort_order ASC NULLS LAST, id",
       )
       .bind(book, chapter)
       .all<TwlRow>(),

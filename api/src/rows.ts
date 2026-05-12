@@ -46,6 +46,7 @@ const TwlPatch = z.object({
   orig_words: z.string().nullable().optional(),
   occurrence: z.number().int().nullable().optional(),
   tw_link: z.string().nullable().optional(),
+  sort_order: z.number().nullable().optional(),
 });
 
 const PATCH_SCHEMA = { tn: TnPatch, tq: TqPatch, twl: TwlPatch };
@@ -90,6 +91,7 @@ const CreateTwl = z.object({
   orig_words: z.string().nullable().optional(),
   occurrence: z.number().int().nullable().optional(),
   tw_link: z.string().nullable().optional(),
+  sort_order: z.number().nullable().optional(),
 });
 const CREATE_SCHEMA = { tn: CreateTn, tq: CreateTq, twl: CreateTwl };
 

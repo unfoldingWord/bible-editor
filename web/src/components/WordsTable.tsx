@@ -1,9 +1,12 @@
 import { useEffect, useRef, useState } from "react";
-import { Box, Paper, Stack, TextField, IconButton, Typography } from "@mui/material";
+import { Box, Paper, Stack, TextField, IconButton, Typography, Tooltip } from "@mui/material";
 import DeleteOutlineIcon from "@mui/icons-material/DeleteOutline";
+import DragIndicatorIcon from "@mui/icons-material/DragIndicator";
 import type { TwlRow } from "../sync/api";
 import { useCatalogs } from "../hooks/useCatalogs";
 import { CatalogPicker } from "./CatalogPicker";
+
+export type WordDropPosition = "before" | "after";
 
 interface Props {
   rows: TwlRow[];
@@ -11,9 +14,15 @@ interface Props {
   onChange: (id: string, patch: Partial<TwlRow>) => void;
   onDelete: (id: string) => void;
   onFocus: (row: TwlRow) => void;
+  onReorder: (draggedId: string, refId: string, position: WordDropPosition) => void;
 }
 
-export function WordsTable({ rows, activeId, onChange, onDelete, onFocus }: Props) {
+export function WordsTable({ rows, activeId, onChange, onDelete, onFocus, onReorder }: Props) {
+  const [dragId, setDragId] = useState<string | null>(null);
+  const [dragOver, setDragOver] = useState<
+    { targetId: string; position: WordDropPosition } | null
+  >(null);
+
   if (rows.length === 0) {
     return (
       <Typography variant="body2" color="text.disabled" sx={{ py: 1, pl: 1 }}>
@@ -26,7 +35,7 @@ export function WordsTable({ rows, activeId, onChange, onDelete, onFocus }: Prop
       <Box
         sx={{
           display: "grid",
-          gridTemplateColumns: "60px 1fr 1.2fr 36px",
+          gridTemplateColumns: "28px 1fr 1.2fr 36px",
           gap: 1,
           alignItems: "center",
           px: 1,
@@ -40,60 +49,140 @@ export function WordsTable({ rows, activeId, onChange, onDelete, onFocus }: Prop
           borderColor: "divider",
         }}
       >
-        <span>Ref</span>
+        <span />
         <span>Quote</span>
         <span>TW article</span>
         <span />
       </Box>
-      {rows.map((r) => (
-        <WordRow
-          key={r.id}
-          row={r}
-          active={r.id === activeId}
-          onChange={(p) => onChange(r.id, p)}
-          onDelete={() => onDelete(r.id)}
-          onFocus={() => onFocus(r)}
-        />
-      ))}
+      {rows.map((r) => {
+        const showBefore =
+          dragId && dragId !== r.id && dragOver?.targetId === r.id && dragOver.position === "before";
+        const showAfter =
+          dragId && dragId !== r.id && dragOver?.targetId === r.id && dragOver.position === "after";
+        return (
+          <Box key={r.id}>
+            {showBefore && <RowDropIndicator />}
+            <WordRow
+              row={r}
+              active={r.id === activeId}
+              dragging={dragId === r.id}
+              isDropTarget={dragId !== null && dragId !== r.id}
+              onChange={(p) => onChange(r.id, p)}
+              onDelete={() => onDelete(r.id)}
+              onFocus={() => onFocus(r)}
+              onGripDragStart={() => setDragId(r.id)}
+              onDragEnd={() => {
+                setDragId(null);
+                setDragOver(null);
+              }}
+              onRowDragOver={(position) => {
+                setDragOver((cur) =>
+                  cur && cur.targetId === r.id && cur.position === position
+                    ? cur
+                    : { targetId: r.id, position },
+                );
+              }}
+              onRowDrop={(position) => {
+                if (dragId && dragId !== r.id) onReorder(dragId, r.id, position);
+                setDragId(null);
+                setDragOver(null);
+              }}
+            />
+            {showAfter && <RowDropIndicator />}
+          </Box>
+        );
+      })}
     </Paper>
+  );
+}
+
+function RowDropIndicator() {
+  return (
+    <Box
+      sx={{
+        height: 3,
+        my: 0.25,
+        bgcolor: "primary.main",
+        borderRadius: 1,
+        boxShadow: "0 0 4px rgba(25,118,210,0.5)",
+      }}
+    />
   );
 }
 
 function WordRow({
   row,
   active,
+  dragging,
+  isDropTarget,
   onChange,
   onDelete,
   onFocus,
+  onGripDragStart,
+  onDragEnd,
+  onRowDragOver,
+  onRowDrop,
 }: {
   row: TwlRow;
   active: boolean;
+  dragging: boolean;
+  isDropTarget: boolean;
   onChange: (patch: Partial<TwlRow>) => void;
   onDelete: () => void;
   onFocus: () => void;
+  onGripDragStart: () => void;
+  onDragEnd: () => void;
+  onRowDragOver: (position: WordDropPosition) => void;
+  onRowDrop: (position: WordDropPosition) => void;
 }) {
-  const [ref, setRef] = useState(row.ref_raw);
   const [quote, setQuote] = useState(row.orig_words ?? "");
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pendingRef = useRef<Partial<TwlRow>>({});
+  const rowRef = useRef<HTMLDivElement | null>(null);
   const catalogs = useCatalogs();
 
-  useEffect(() => setRef(row.ref_raw), [row.id, row.version, row.ref_raw]);
   useEffect(() => setQuote(row.orig_words ?? ""), [row.id, row.version, row.orig_words]);
 
+  // Accumulate field patches into one debounced save so quote+tw_link edits
+  // within the window collapse to a single PATCH (and one version bump).
   const queue = (patch: Partial<TwlRow>) => {
+    pendingRef.current = { ...pendingRef.current, ...patch };
     if (debounceRef.current) clearTimeout(debounceRef.current);
-    debounceRef.current = setTimeout(() => onChange(patch), 300);
+    debounceRef.current = setTimeout(() => {
+      const merged = pendingRef.current;
+      pendingRef.current = {};
+      debounceRef.current = null;
+      onChange(merged);
+    }, 350);
+  };
+
+  const positionFromEvent = (e: React.DragEvent): WordDropPosition => {
+    const rect = rowRef.current?.getBoundingClientRect();
+    if (!rect) return "after";
+    return e.clientY < rect.top + rect.height / 2 ? "before" : "after";
   };
 
   return (
     <Stack
+      ref={rowRef}
       direction="row"
       spacing={1}
       onMouseDown={onFocus}
       onFocus={onFocus}
+      onDragOver={(e) => {
+        if (!isDropTarget) return;
+        e.preventDefault();
+        e.dataTransfer.dropEffect = "move";
+        onRowDragOver(positionFromEvent(e));
+      }}
+      onDrop={(e) => {
+        if (!isDropTarget) return;
+        e.preventDefault();
+        onRowDrop(positionFromEvent(e));
+      }}
       sx={{
         display: "grid",
-        gridTemplateColumns: "60px 1fr 1.2fr 36px",
+        gridTemplateColumns: "28px 1fr 1.2fr 36px",
         alignItems: "center",
         gap: 1,
         px: 1,
@@ -102,21 +191,35 @@ function WordRow({
         borderColor: "divider",
         bgcolor: active ? "primary.50" : "transparent",
         boxShadow: active ? "inset 2px 0 0 0 var(--mui-palette-primary-main, #1976d2)" : "none",
+        opacity: dragging ? 0.4 : 1,
+        transition: "opacity 120ms ease",
         "&:last-of-type": { borderBottom: "none" },
       }}
     >
-      <TextField
-        value={ref}
-        onChange={(e) => {
-          setRef(e.target.value);
-          queue({ ref_raw: e.target.value });
-        }}
-        size="small"
-        variant="outlined"
-        inputProps={{
-          style: { fontFamily: "monospace", fontSize: 11, padding: "3px 6px", textAlign: "center" },
-        }}
-      />
+      <Tooltip title="drag to reorder">
+        <Box
+          draggable
+          onDragStart={(e) => {
+            e.dataTransfer.effectAllowed = "move";
+            e.dataTransfer.setData("text/plain", row.id);
+            if (rowRef.current) {
+              e.dataTransfer.setDragImage(rowRef.current, 12, 12);
+            }
+            onGripDragStart();
+          }}
+          onDragEnd={onDragEnd}
+          sx={{
+            cursor: "grab",
+            color: "text.disabled",
+            display: "inline-flex",
+            alignItems: "center",
+            justifyContent: "center",
+            "&:active": { cursor: "grabbing" },
+          }}
+        >
+          <DragIndicatorIcon fontSize="small" />
+        </Box>
+      </Tooltip>
       <TextField
         value={quote}
         onChange={(e) => {

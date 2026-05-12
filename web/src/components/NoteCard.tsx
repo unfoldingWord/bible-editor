@@ -51,6 +51,7 @@ export function NoteCard({
   const [quote, setQuote] = useState(tsvToDisplay(row.quote));
   const [note, setNote] = useState(tsvToDisplay(row.note));
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pendingRef = useRef<Partial<TnRow>>({});
   const paperRef = useRef<HTMLDivElement | null>(null);
   const catalogs = useCatalogs();
 
@@ -68,12 +69,18 @@ export function NoteCard({
     setNote(tsvToDisplay(row.note));
   }, [row.id, row.version, row.note]);
 
+  // Accumulate field edits into one PATCH per debounce window so typing
+  // through quote and note within 350ms collapses to a single server save
+  // (and one version bump) instead of clobbering each other.
   const queue = (patch: Partial<TnRow>) => {
+    pendingRef.current = { ...pendingRef.current, ...patch };
     if (debounceRef.current) clearTimeout(debounceRef.current);
     debounceRef.current = setTimeout(() => {
-      onChange(patch);
+      const merged = pendingRef.current;
+      pendingRef.current = {};
       debounceRef.current = null;
-    }, 300);
+      onChange(merged);
+    }, 350);
   };
 
   return (
