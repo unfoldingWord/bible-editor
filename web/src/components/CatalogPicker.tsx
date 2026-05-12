@@ -68,7 +68,11 @@ export function CatalogPicker({
         if (!q) return opts.slice(0, 50);
         return opts.filter((o) => o.toLowerCase().includes(q)).slice(0, 50);
       }}
-      getOptionLabel={(opt) => (display ? display(typeof opt === "string" ? opt : "") : (typeof opt === "string" ? opt : ""))}
+      getOptionLabel={(opt) => {
+        const str = typeof opt === "string" ? opt : "";
+        if (!str) return "";
+        return display ? display(str) : str;
+      }}
       renderOption={(props, opt) => (
         <li {...props} style={{ fontFamily: "monospace", fontSize: 12 }}>
           {display ? display(opt) : opt}
