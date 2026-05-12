@@ -453,26 +453,31 @@ function ActiveLine({
 
   return (
     <Stack direction="row" spacing={1} alignItems="flex-start" sx={{ py: 0.5 }}>
-      <Typography
-        variant="caption"
-        sx={{
-          fontFamily: "monospace",
-          color: "text.secondary",
-          textTransform: "uppercase",
-          minWidth: 32,
-          pt: 0.5,
-          flexShrink: 0,
-        }}
+      <Stack
+        direction="column"
+        alignItems="center"
+        spacing={0.25}
+        sx={{ minWidth: 36, pt: 0.5, flexShrink: 0 }}
       >
-        {VERSION_LABEL[label] ?? label}
-      </Typography>
-      {onOpenAligner && (
-        <Tooltip title={`align ${label}`}>
-          <IconButton size="small" onClick={onOpenAligner} sx={{ color: "success.main", mt: 0.25 }}>
-            <LinkIcon fontSize="inherit" />
-          </IconButton>
-        </Tooltip>
-      )}
+        <Typography
+          variant="caption"
+          sx={{
+            fontFamily: "monospace",
+            color: "text.secondary",
+            textTransform: "uppercase",
+            letterSpacing: 0.5,
+          }}
+        >
+          {VERSION_LABEL[label] ?? label}
+        </Typography>
+        {onOpenAligner && (
+          <Tooltip title={`align ${label}`} placement="left">
+            <IconButton size="small" onClick={onOpenAligner} sx={{ color: "success.main", p: 0.25 }}>
+              <LinkIcon fontSize="inherit" />
+            </IconButton>
+          </Tooltip>
+        )}
+      </Stack>
       <Box
         ref={elRef}
         contentEditable={editable && !readOnly}
@@ -480,7 +485,7 @@ function ActiveLine({
         spellCheck={!rtl}
         sx={{
           flex: 1,
-          bgcolor: readOnly ? "rgba(0,0,0,0.03)" : "background.paper",
+          bgcolor: readOnly ? "grey.100" : "background.paper",
           border: "1px solid",
           borderColor: "divider",
           borderRadius: 0.5,
@@ -504,7 +509,7 @@ function ActiveLine({
             ? {}
             : {
                 borderColor: "primary.main",
-                boxShadow: "0 0 0 2px rgba(25,118,210,0.2)",
+                boxShadow: "0 0 0 2px rgba(49,173,227,0.2)",
               },
         }}
       />

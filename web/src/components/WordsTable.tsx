@@ -104,7 +104,7 @@ function RowDropIndicator() {
         my: 0.25,
         bgcolor: "primary.main",
         borderRadius: 1,
-        boxShadow: "0 0 4px rgba(25,118,210,0.5)",
+        boxShadow: "0 0 4px rgba(49,173,227,0.5)",
       }}
     />
   );
@@ -191,7 +191,7 @@ function WordRow({
         borderBottom: "1px dashed",
         borderColor: "divider",
         bgcolor: active ? "primary.50" : "transparent",
-        boxShadow: active ? "inset 2px 0 0 0 var(--mui-palette-primary-main, #1976d2)" : "none",
+        boxShadow: active ? "inset 2px 0 0 0 var(--mui-palette-primary-main, #31ADE3)" : "none",
         opacity: dragging ? 0.4 : 1,
         transition: "opacity 120ms ease",
         "&:last-of-type": { borderBottom: "none" },

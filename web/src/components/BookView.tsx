@@ -380,8 +380,8 @@ function VerseRow({
               p: 0.5,
               borderRadius: 0.5,
               cursor: "pointer",
-              bgcolor: isActive ? "rgba(25,118,210,0.08)" : "transparent",
-              boxShadow: isActive && colIdx === 0 ? "inset 2px 0 0 0 #1976d2" : "none",
+              bgcolor: isActive ? "primary.50" : "transparent",
+              boxShadow: isActive && colIdx === 0 ? "inset 2px 0 0 0 #31ADE3" : "none",
             }}
           >
             <VerseCell

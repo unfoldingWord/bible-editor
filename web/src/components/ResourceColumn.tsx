@@ -408,7 +408,7 @@ function DropIndicator() {
         my: 0.5,
         bgcolor: "primary.main",
         borderRadius: 1,
-        boxShadow: "0 0 4px rgba(25,118,210,0.5)",
+        boxShadow: "0 0 4px rgba(49,173,227,0.5)",
       }}
     />
   );

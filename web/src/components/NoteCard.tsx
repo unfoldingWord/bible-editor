@@ -234,7 +234,7 @@ export function NoteCard({
           py: 0.5,
           borderBottom: "1px dashed",
           borderColor: "divider",
-          bgcolor: "rgba(0,0,0,0.02)",
+          bgcolor: "grey.100",
           flexWrap: "wrap",
         }}
       >

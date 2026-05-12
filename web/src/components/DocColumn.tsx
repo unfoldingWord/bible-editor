@@ -63,7 +63,7 @@ export function DocColumn({
         border: "1px solid",
         borderColor: "divider",
         borderRadius: 1,
-        bgcolor: readOnly ? "rgba(0,0,0,0.025)" : "background.paper",
+        bgcolor: readOnly ? "grey.100" : "background.paper",
         overflow: "hidden",
       }}
     >
@@ -216,8 +216,8 @@ function VerseSpan({
         display: "inline",
         borderRadius: 4,
         padding: isActive ? "1px 2px" : 0,
-        backgroundColor: isActive ? "rgba(25,118,210,0.12)" : "transparent",
-        boxShadow: isActive ? "0 0 0 1.5px #1976d2" : undefined,
+        backgroundColor: isActive ? "rgba(49,173,227,0.14)" : "transparent",
+        boxShadow: isActive ? "0 0 0 1.5px #31ADE3" : undefined,
       }}
     >
       <span
