@@ -22,7 +22,7 @@ export function QuestionsTable({ rows, onChange, onDelete }: Props) {
       <Box
         sx={{
           display: "grid",
-          gridTemplateColumns: "1fr 1fr 36px",
+          gridTemplateColumns: GRID_COLS,
           gap: 1,
           alignItems: "center",
           px: 1,
@@ -36,6 +36,7 @@ export function QuestionsTable({ rows, onChange, onDelete }: Props) {
           borderColor: "divider",
         }}
       >
+        <span>Ref</span>
         <span>Question</span>
         <span>Response</span>
         <span />
@@ -47,6 +48,10 @@ export function QuestionsTable({ rows, onChange, onDelete }: Props) {
   );
 }
 
+// Reference span can include ranges like "1:1-3", so give it a bit of room
+// without dominating the row.
+const GRID_COLS = "80px 1fr 1fr 36px";
+
 function Row({
   row,
   onChange,
@@ -56,16 +61,27 @@ function Row({
   onChange: (patch: Partial<TqRow>) => void;
   onDelete: () => void;
 }) {
+  const [refRaw, setRefRaw] = useState(row.ref_raw ?? "");
   const [question, setQuestion] = useState(row.question ?? "");
   const [response, setResponse] = useState(row.response ?? "");
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pendingRef = useRef<Partial<TqRow>>({});
 
+  useEffect(() => setRefRaw(row.ref_raw ?? ""), [row.id, row.version, row.ref_raw]);
   useEffect(() => setQuestion(row.question ?? ""), [row.id, row.version, row.question]);
   useEffect(() => setResponse(row.response ?? ""), [row.id, row.version, row.response]);
 
+  // Merge field edits per debounce window so editing ref + question together
+  // collapses into a single PATCH / version bump.
   const queue = (patch: Partial<TqRow>) => {
+    pendingRef.current = { ...pendingRef.current, ...patch };
     if (debounceRef.current) clearTimeout(debounceRef.current);
-    debounceRef.current = setTimeout(() => onChange(patch), 300);
+    debounceRef.current = setTimeout(() => {
+      const merged = pendingRef.current;
+      pendingRef.current = {};
+      debounceRef.current = null;
+      onChange(merged);
+    }, 300);
   };
 
   return (
@@ -74,7 +90,7 @@ function Row({
       spacing={1}
       sx={{
         display: "grid",
-        gridTemplateColumns: "1fr 1fr 36px",
+        gridTemplateColumns: GRID_COLS,
         gap: 1,
         alignItems: "center",
         px: 1,
@@ -84,6 +100,20 @@ function Row({
         "&:last-of-type": { borderBottom: "none" },
       }}
     >
+      <TextField
+        value={refRaw}
+        onChange={(e) => {
+          setRefRaw(e.target.value);
+          queue({ ref_raw: e.target.value });
+        }}
+        size="small"
+        spellCheck={false}
+        variant="outlined"
+        placeholder="1:1"
+        inputProps={{
+          style: { fontSize: 12, padding: "3px 6px", fontFamily: "monospace" },
+        }}
+      />
       <TextField
         value={question}
         onChange={(e) => {
