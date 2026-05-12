@@ -22,6 +22,7 @@ import {
   moveTargets,
   parseAlignment,
   serializeAlignment,
+  type AlignmentGroup,
   type AlignmentState,
 } from "../lib/alignment";
 import type { TwlRow, VerseDto } from "../sync/api";
@@ -133,6 +134,23 @@ export function AlignmentDialog({
       ? Array.from(selectedUnaligned)
       : [id];
 
+  // For DISPLAY only: order the alignment cards by where each block's first
+  // source word falls in the source-language verse (Hebrew/Greek reading
+  // order). Matches word-aligner-rcl's alignmentComparator. state.groups
+  // itself stays in target/USFM order so serialization keeps the GL reading
+  // order intact.
+  const sourceIndexMap = useMemo(() => buildSourceIndexMap(sourceVerse), [sourceVerse]);
+  const displayGroups = useMemo(() => {
+    if (!state) return [];
+    const sortKey = (g: (typeof state.groups)[number]) => {
+      if (g.source.length === 0) return Number.MAX_SAFE_INTEGER;
+      const s = g.source[0];
+      const k = `${s.content}|${s.occurrence}`;
+      return sourceIndexMap.get(k) ?? Number.MAX_SAFE_INTEGER;
+    };
+    return [...state.groups].sort((a, b) => sortKey(a) - sortKey(b));
+  }, [state, sourceIndexMap]);
+
   const handleReset = () => {
     setState(initial);
     setSelectedUnaligned(new Set());
@@ -189,7 +207,7 @@ export function AlignmentDialog({
                 onDrop={(wordIds) => handleTargetsDrop("u", wordIds)}
               />
               <AlignmentGrid
-                state={state}
+                groups={displayGroups}
                 twlForVerse={twlForVerse}
                 verseNum={verseNum}
                 onTargetsDrop={handleTargetsDrop}
@@ -268,7 +286,8 @@ function VerseStrip({
             fontFamily: sourceIsHebrew
               ? '"Times New Roman","SBL Hebrew","Cardo",serif'
               : '"Times New Roman","Cardo",serif',
-            fontSize: 16,
+            fontSize: 20,
+            lineHeight: 1.4,
             unicodeBidi: "isolate",
           }}
         >
@@ -369,14 +388,14 @@ function UnalignedBag({
 }
 
 function AlignmentGrid({
-  state,
+  groups,
   twlForVerse,
   verseNum,
   onTargetsDrop,
   onSourceDrop,
   onClearGroup,
 }: {
-  state: AlignmentState;
+  groups: AlignmentGroup[];
   twlForVerse: TwlRow[];
   verseNum: number;
   onTargetsDrop: (dest: string, wordIds: string[]) => void;
@@ -398,7 +417,7 @@ function AlignmentGrid({
         direction: "rtl",
       }}
     >
-      {state.groups.map((g) => (
+      {groups.map((g) => (
         <DropTargetBox
           key={g.id}
           groupId={g.id}
@@ -431,10 +450,11 @@ function AlignmentGrid({
                     sx={{
                       bgcolor: "grey.900",
                       color: "grey.50",
-                      px: 1.2,
+                      px: 1.5,
                       py: 0.5,
                       fontFamily: '"Times New Roman", "SBL Hebrew", "Cardo", serif',
-                      fontSize: 20,
+                      fontSize: 26,
+                      lineHeight: 1.3,
                       textAlign: "center",
                       direction: "rtl",
                       borderRadius: 0.5,
@@ -628,4 +648,33 @@ function twShort(link: string | null): string | null {
   if (!link) return null;
   const m = link.match(/\/bible\/([^/]+\/[^/]+)$/);
   return m ? m[1] : link;
+}
+
+// Walk the source verse's USFM tree and build a "text|occurrence" → index
+// map for every \w token. Used to order alignment blocks by their first
+// source word's position in the source-language verse.
+function buildSourceIndexMap(sourceVerse: VerseDto | null): Map<string, number> {
+  const map = new Map<string, number>();
+  if (!sourceVerse?.content) return map;
+  const verseObjects = (sourceVerse.content as { verseObjects?: unknown[] }).verseObjects;
+  if (!Array.isArray(verseObjects)) return map;
+  let idx = 0;
+  const walk = (nodes: unknown[]) => {
+    for (const n of nodes ?? []) {
+      const o = n as Record<string, unknown> | null;
+      if (!o) continue;
+      if (o["type"] === "word" && o["tag"] === "w") {
+        const text = String(o["text"] ?? "");
+        const occ = String(o["occurrence"] ?? "1");
+        if (!map.has(`${text}|${occ}`)) {
+          map.set(`${text}|${occ}`, idx);
+        }
+        idx++;
+      } else if (o["type"] === "milestone") {
+        walk((o["children"] as unknown[] | undefined) ?? []);
+      }
+    }
+  };
+  walk(verseObjects);
+  return map;
 }
