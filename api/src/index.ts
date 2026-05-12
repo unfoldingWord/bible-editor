@@ -1,5 +1,8 @@
 import { Hono } from "hono";
 import { cors } from "hono/cors";
+import { chapters } from "./chapters";
+import { rows } from "./rows";
+import { verses } from "./verses";
 
 export interface Env {
   DB: D1Database;
@@ -27,6 +30,10 @@ app.get("/api/health", (c) =>
     time: new Date().toISOString(),
   }),
 );
+
+app.route("/api/chapters", chapters);
+app.route("/api/rows", rows);
+app.route("/api/verses", verses);
 
 app.notFound((c) => c.json({ error: "not_found", path: c.req.path }, 404));
 
