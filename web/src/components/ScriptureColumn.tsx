@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef } from "react";
 import { Box, Stack, Typography, Paper, IconButton, Tooltip, ToggleButton, ToggleButtonGroup, Button } from "@mui/material";
 import LinkIcon from "@mui/icons-material/Link";
 import ViewColumnIcon from "@mui/icons-material/ViewColumn";
-import PushPinIcon from "@mui/icons-material/PushPin";
+import UndoIcon from "@mui/icons-material/Undo";
 import type { VerseDto } from "../sync/api";
 import { DocColumn } from "./DocColumn";
 import { highlightsFor, renderHighlightedHTML, type HighlightKey } from "../lib/highlight";
@@ -122,7 +122,7 @@ export function ScriptureColumn({
         <Tooltip title="scroll the active verse back into view if you've scrolled away">
           <Button
             size="small"
-            startIcon={<PushPinIcon fontSize="small" />}
+            startIcon={<UndoIcon fontSize="small" />}
             onClick={() => activeRef.current?.scrollIntoView({ behavior: "smooth", block: "center" })}
             sx={{ textTransform: "none" }}
           >
@@ -362,7 +362,7 @@ function ActiveLine({
           borderRadius: 0.5,
           px: 1,
           py: 0.5,
-          fontSize: rtl ? 17 : 14.5,
+          fontSize: rtl ? 20 : 14.5,
           lineHeight: 1.5,
           direction: rtl ? "rtl" : "ltr",
           textAlign: rtl ? "right" : "left",

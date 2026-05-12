@@ -212,7 +212,7 @@ export function NoteCard({
               dir: "rtl",
               style: {
                 fontFamily: '"Times New Roman","SBL Hebrew","Cardo",serif',
-                fontSize: 16,
+                fontSize: 19,
                 textAlign: "right",
                 lineHeight: 1.5,
               },

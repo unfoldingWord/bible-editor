@@ -130,7 +130,7 @@ function WordRow({
           dir: "rtl",
           style: {
             fontFamily: '"Times New Roman","SBL Hebrew","Cardo",serif',
-            fontSize: 15,
+            fontSize: 19,
             padding: "3px 6px",
             textAlign: "right",
           },
