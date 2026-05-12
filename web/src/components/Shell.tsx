@@ -4,8 +4,29 @@ import { useChapter } from "../hooks/useChapter";
 import { outbox } from "../sync/outbox";
 import type { TnRow, TqRow, TwlRow } from "../sync/api";
 import { TimelineRail } from "./TimelineRail";
-import { ScriptureColumn } from "./ScriptureColumn";
+import { ScriptureColumn, type ScriptureMode } from "./ScriptureColumn";
 import { ResourceColumn } from "./ResourceColumn";
+
+const SCRIPTURE_MODE_KEY = "be:scriptureMode";
+const ENABLED_VERSIONS_KEY = "be:enabledVersions";
+
+function loadFromStorage<T>(key: string, fallback: T): T {
+  try {
+    const raw = localStorage.getItem(key);
+    if (!raw) return fallback;
+    return JSON.parse(raw) as T;
+  } catch {
+    return fallback;
+  }
+}
+
+function saveToStorage<T>(key: string, value: T) {
+  try {
+    localStorage.setItem(key, JSON.stringify(value));
+  } catch {
+    /* ignore */
+  }
+}
 
 interface Props {
   book: string;
@@ -17,6 +38,12 @@ export function Shell({ book, chapter, initialVerse = 1 }: Props) {
   const { status, data, error, applyLocalRowPatch } = useChapter(book, chapter);
   const [activeVerse, setActiveVerse] = useState(initialVerse);
   const [activeNoteId, setActiveNoteId] = useState<string | null>(null);
+  const [mode, setMode] = useState<ScriptureMode>(() =>
+    loadFromStorage<ScriptureMode>(SCRIPTURE_MODE_KEY, "stacked"),
+  );
+  const [enabledVersions, setEnabledVersions] = useState<string[]>(() =>
+    loadFromStorage<string[]>(ENABLED_VERSIONS_KEY, ["ULT", "UST"]),
+  );
 
   const tileSet = useMemo(() => {
     if (!data) return [] as Array<{ verse: number; has: boolean }>;
@@ -36,6 +63,16 @@ export function Shell({ book, chapter, initialVerse = 1 }: Props) {
   const verseNumbers = useMemo(
     () => tileSet.map((t) => t.verse),
     [tileSet],
+  );
+
+  const availableVersions = useMemo(
+    () => (data ? Object.keys(data.verses) : []),
+    [data],
+  );
+
+  const visibleVersions = useMemo(
+    () => enabledVersions.filter((v) => availableVersions.includes(v)),
+    [enabledVersions, availableVersions],
   );
 
   if (status === "loading" || status === "idle") {
@@ -92,7 +129,34 @@ export function Shell({ book, chapter, initialVerse = 1 }: Props) {
           versesByVersion={data.verses}
           verseNumbers={verseNumbers}
           activeVerse={activeVerse}
+          mode={mode}
+          enabledVersions={visibleVersions.length > 0 ? visibleVersions : availableVersions.slice(0, 1)}
+          availableVersions={availableVersions}
           onSelectVerse={setActiveVerse}
+          onModeChange={(m) => {
+            setMode(m);
+            saveToStorage(SCRIPTURE_MODE_KEY, m);
+          }}
+          onEnabledVersionsChange={(versions) => {
+            setEnabledVersions(versions);
+            saveToStorage(ENABLED_VERSIONS_KEY, versions);
+          }}
+          onEditVerse={(verseNum, bibleVersion, plain, base) => {
+            // Edits replace the verse content with a single text token. This
+            // intentionally invalidates any alignment markers for this verse
+            // — re-align via the ⌭ icon (Phase 3).
+            const newContent = {
+              verseObjects: [{ type: "text", text: plain + " " }],
+            };
+            void outbox.enqueueVerse(
+              book,
+              chapter,
+              verseNum,
+              bibleVersion,
+              base.version,
+              { content: newContent, plain_text: plain },
+            );
+          }}
           onOpenAligner={(_v, _bv) => {
             /* aligner deferred — see docs/plan.md "Phase 3" */
           }}
