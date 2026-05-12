@@ -428,6 +428,9 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook }:
                 { content, plain_text: plain },
               );
             }}
+            onSwitchVersion={(bv) => {
+              setAlignerTarget((cur) => (cur ? { ...cur, bibleVersion: bv } : cur));
+            }}
           />
         );
       })()}

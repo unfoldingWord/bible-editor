@@ -45,6 +45,10 @@ interface Props {
   twlForVerse: TwlRow[];         // chapter twl rows filtered to this verse, for TW-article hints
   onClose: () => void;
   onSave: (newContent: unknown, plainText: string, expectedVersion: number) => void;
+  // Switching to the other gateway-language version reframes the alignment
+  // session — caller swaps which version's verse + contextOther it ships in.
+  // Undefined disables the switch affordance.
+  onSwitchVersion?: (bibleVersion: string) => void;
 }
 
 export function AlignmentDialog({
@@ -60,6 +64,7 @@ export function AlignmentDialog({
   twlForVerse,
   onClose,
   onSave,
+  onSwitchVersion,
 }: Props) {
   const initial = useMemo<AlignmentState | null>(() => {
     if (!verse?.content) return null;
@@ -163,15 +168,33 @@ export function AlignmentDialog({
   }, [state, sourceIndexMap]);
 
   // Pre-load lexicon entries for every unique Strong's referenced by the
-  // current alignment so tooltips don't shimmer on hover.
+  // current alignment AND every \w token in the source verse strip, so
+  // tooltips on either don't shimmer on hover.
   const allStrongs = useMemo(() => {
-    if (!state) return [] as string[];
     const set = new Set<string>();
-    for (const g of state.groups) {
-      for (const s of g.source) if (s.strong) set.add(s.strong);
+    if (state) {
+      for (const g of state.groups) {
+        for (const s of g.source) if (s.strong) set.add(s.strong);
+      }
+    }
+    const sourceObjects = (sourceVerse?.content as { verseObjects?: unknown[] } | null)?.verseObjects;
+    if (Array.isArray(sourceObjects)) {
+      const walk = (nodes: unknown[]) => {
+        for (const n of nodes ?? []) {
+          const o = n as Record<string, unknown> | null;
+          if (!o) continue;
+          if (o["type"] === "word" && o["tag"] === "w") {
+            const s = String(o["strong"] ?? "");
+            if (s) set.add(s);
+          } else if (o["type"] === "milestone") {
+            walk((o["children"] as unknown[] | undefined) ?? []);
+          }
+        }
+      };
+      walk(sourceObjects);
     }
     return [...set];
-  }, [state]);
+  }, [state, sourceVerse]);
   const lexiconMap = useLexicon(allStrongs);
 
   const handleReset = () => {
@@ -219,6 +242,9 @@ export function AlignmentDialog({
               bibleVersion={bibleVersion}
               chapter={chapter}
               verseNum={verseNum}
+              lexiconMap={lexiconMap}
+              onSwitchVersion={onSwitchVersion}
+              twlForVerse={twlForVerse}
             />
             <Box sx={{ display: "grid", gridTemplateColumns: "220px 1fr", height: 480, overflow: "hidden" }}>
               <UnalignedBag
@@ -264,6 +290,9 @@ function VerseStrip({
   bibleVersion,
   chapter,
   verseNum,
+  lexiconMap,
+  onSwitchVersion,
+  twlForVerse,
 }: {
   verse: VerseDto | null;
   other: VerseDto | null;
@@ -272,9 +301,13 @@ function VerseStrip({
   bibleVersion: string;
   chapter: number;
   verseNum: number;
+  lexiconMap: Map<string, LexiconEntry | null>;
+  onSwitchVersion?: (bv: string) => void;
+  twlForVerse: TwlRow[];
 }) {
   const otherLabel = bibleVersion === "ULT" ? "UST" : bibleVersion === "UST" ? "ULT" : "UST";
   const sourceIsHebrew = sourceLabel === "UHB";
+  const switchable = !!onSwitchVersion && otherLabel !== bibleVersion && (otherLabel === "ULT" || otherLabel === "UST");
   return (
     <Box
       sx={{
@@ -294,11 +327,31 @@ function VerseStrip({
         {chapter}:{verseNum}
       </Box>
       <Box>
-        <Chip label={bibleVersion} size="small" sx={{ mr: 1, fontFamily: "monospace", height: 18 }} />
+        <Chip
+          label={bibleVersion}
+          size="small"
+          color="primary"
+          variant="filled"
+          sx={{ mr: 1, fontFamily: "monospace", height: 18, fontWeight: 700 }}
+        />
         {verse?.plain_text}
       </Box>
       <Box>
-        <Chip label={otherLabel} size="small" sx={{ mr: 1, fontFamily: "monospace", height: 18 }} />
+        <Tooltip title={switchable ? `align ${otherLabel} for this verse instead` : ""}>
+          <Chip
+            label={otherLabel}
+            size="small"
+            variant="outlined"
+            clickable={switchable}
+            onClick={switchable ? () => onSwitchVersion?.(otherLabel) : undefined}
+            sx={{
+              mr: 1,
+              fontFamily: "monospace",
+              height: 18,
+              cursor: switchable ? "pointer" : "default",
+            }}
+          />
+        </Tooltip>
         {other?.plain_text}
       </Box>
       <Box>
@@ -315,11 +368,77 @@ function VerseStrip({
             unicodeBidi: "isolate",
           }}
         >
-          {source?.plain_text}
+          <SourceVerseTokens
+            verseObjects={(source?.content as { verseObjects?: unknown[] } | null)?.verseObjects}
+            lexiconMap={lexiconMap}
+            twlForVerse={twlForVerse}
+            verseNum={verseNum}
+            fallbackText={source?.plain_text ?? ""}
+          />
         </Box>
       </Box>
     </Box>
   );
+}
+
+// Render the source verse's \w tokens one at a time so each carries a
+// lexicon tooltip; intervening text nodes (spaces, punctuation, maqaf) pass
+// through untouched.
+function SourceVerseTokens({
+  verseObjects,
+  lexiconMap,
+  twlForVerse,
+  verseNum,
+  fallbackText,
+}: {
+  verseObjects: unknown[] | undefined;
+  lexiconMap: Map<string, LexiconEntry | null>;
+  twlForVerse: TwlRow[];
+  verseNum: number;
+  fallbackText: string;
+}) {
+  if (!Array.isArray(verseObjects)) return <>{fallbackText}</>;
+  const out: React.ReactNode[] = [];
+  const walk = (nodes: unknown[]) => {
+    for (const n of nodes ?? []) {
+      const o = n as Record<string, unknown> | null;
+      if (!o) continue;
+      if (o["type"] === "text") {
+        out.push(<span key={`t${out.length}`}>{String(o["text"] ?? "")}</span>);
+      } else if (o["type"] === "word" && o["tag"] === "w") {
+        const text = String(o["text"] ?? "");
+        const strong = String(o["strong"] ?? "");
+        const src: SourceWord = {
+          id: "",
+          strong,
+          lemma: String(o["lemma"] ?? ""),
+          morph: String(o["morph"] ?? ""),
+          occurrence: String(o["occurrence"] ?? "1"),
+          occurrences: String(o["occurrences"] ?? "1"),
+          content: text,
+        };
+        out.push(
+          <Tooltip
+            key={`w${out.length}`}
+            title={
+              <SourceTooltipBody
+                source={src}
+                lex={lexiconMap.get(strong) ?? null}
+                twHint={twHintFor(twlForVerse, verseNum, text)}
+              />
+            }
+            slotProps={{ popper: { sx: { pointerEvents: "none" } } }}
+          >
+            <span style={{ cursor: "help" }}>{text}</span>
+          </Tooltip>,
+        );
+      } else if (o["type"] === "milestone") {
+        walk((o["children"] as unknown[] | undefined) ?? []);
+      }
+    }
+  };
+  walk(verseObjects);
+  return <>{out}</>;
 }
 
 function UnalignedBag({
