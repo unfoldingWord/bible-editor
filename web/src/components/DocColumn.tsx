@@ -1,7 +1,8 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useMemo, useRef } from "react";
 import { Box, Stack, Typography, IconButton, Tooltip } from "@mui/material";
 import LinkIcon from "@mui/icons-material/Link";
 import type { VerseDto } from "../sync/api";
+import { highlightsFor, renderHighlightedHTML } from "../lib/highlight";
 
 interface Props {
   bibleVersion: string;
@@ -11,6 +12,8 @@ interface Props {
   activeVerse: number;
   readOnly?: boolean;
   rtl?: boolean;
+  activeNoteQuote?: string | null;
+  activeNoteOccurrence?: number | null;
   onSelectVerse: (v: number) => void;
   onEditVerse: (verseNum: number, plain: string, base: VerseDto) => void;
   onOpenAligner: (verseNum: number) => void;
@@ -32,6 +35,8 @@ export function DocColumn({
   activeVerse,
   readOnly,
   rtl,
+  activeNoteQuote,
+  activeNoteOccurrence,
   onSelectVerse,
   onEditVerse,
   onOpenAligner,
@@ -96,18 +101,29 @@ export function DocColumn({
             : '"Source Serif Pro","Cambria","Times New Roman",serif',
           direction: rtl ? "rtl" : "ltr",
           textAlign: rtl ? "right" : "left",
+          "& mark.be-hl": {
+            backgroundColor: "#fff48a",
+            padding: "0 2px",
+            borderRadius: 0.5,
+            color: "inherit",
+          },
         }}
       >
         {verseNumbers.map((v) => {
           const dto = versesByVerseNum[v];
           if (!dto) return null;
           const isActive = v === activeVerse;
+          const highlights = isActive
+            ? highlightsFor(bibleVersion, dto.content, activeNoteQuote, activeNoteOccurrence)
+            : null;
           return (
             <VerseSpan
               key={v}
               chapter={chapter}
               verseNum={v}
               text={dto.plain_text ?? ""}
+              content={dto.content}
+              highlights={highlights}
               isActive={isActive}
               readOnly={!!readOnly}
               rtl={!!rtl}
@@ -127,6 +143,8 @@ function VerseSpan({
   chapter,
   verseNum,
   text,
+  content,
+  highlights,
   isActive,
   readOnly,
   rtl,
@@ -138,6 +156,8 @@ function VerseSpan({
   chapter: number;
   verseNum: number;
   text: string;
+  content?: unknown;
+  highlights?: Set<string> | null;
   isActive: boolean;
   readOnly: boolean;
   rtl: boolean;
@@ -150,17 +170,35 @@ function VerseSpan({
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lastTextRef = useRef(text);
 
-  // Keep DOM text in sync with prop when the prop changes from outside
-  // (e.g. server-confirmed update). Avoid clobbering during live edits —
-  // only resync when the DOM text matches the previous prop value.
+  const html = useMemo(() => {
+    if (!content || !highlights || highlights.size === 0) return null;
+    const verseObjects = (content as { verseObjects?: unknown[] } | null)?.verseObjects;
+    if (!Array.isArray(verseObjects)) return null;
+    return renderHighlightedHTML(verseObjects, highlights);
+  }, [content, highlights]);
+
+  // Resync the editable span when (a) text changes from outside and the user
+  // hasn't been typing since, or (b) highlights change. We let the user type
+  // freely between resyncs.
+  const lastSetRef = useRef<string | null>(null);
   useEffect(() => {
     if (!elRef.current) return;
     const dom = elRef.current.innerText;
+    if (html !== null) {
+      if (html !== lastSetRef.current) {
+        elRef.current.innerHTML = html;
+        lastSetRef.current = html;
+        lastTextRef.current = text;
+      }
+      return;
+    }
+    // Plain-text mode.
     if (dom === lastTextRef.current) {
       elRef.current.innerText = text;
+      lastSetRef.current = text;
     }
     lastTextRef.current = text;
-  }, [text]);
+  }, [text, html]);
 
   const setMarkerRef = (node: HTMLSpanElement | null) => {
     if (spanRef) spanRef.current = node;
@@ -224,9 +262,8 @@ function VerseSpan({
           outline: "none",
           background: "transparent",
         }}
-      >
-        {text}
-      </span>{" "}
+        className="be-verse-span"
+      />{" "}
     </span>
   );
 }

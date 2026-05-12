@@ -87,6 +87,15 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate }: Props) {
     [enabledVersions, availableVersions],
   );
 
+  // When a note is "active" (focused or clicked), look up its quote +
+  // occurrence so the scripture column can highlight aligned target words.
+  const activeNote = useMemo(
+    () => (activeNoteId && data ? data.tn.find((r) => r.id === activeNoteId) ?? null : null),
+    [activeNoteId, data],
+  );
+  const activeNoteQuote = activeNote?.quote ?? null;
+  const activeNoteOccurrence = activeNote?.occurrence ?? null;
+
   if (status === "loading" || status === "idle") {
     return (
       <Box sx={{ p: 4, display: "flex", alignItems: "center", gap: 2 }}>
@@ -141,6 +150,8 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate }: Props) {
           versesByVersion={data.verses}
           verseNumbers={verseNumbers}
           activeVerse={activeVerse}
+          activeNoteQuote={activeNoteQuote}
+          activeNoteOccurrence={activeNoteOccurrence}
           mode={mode}
           enabledVersions={visibleVersions.length > 0 ? visibleVersions : availableVersions.slice(0, 1)}
           availableVersions={availableVersions}

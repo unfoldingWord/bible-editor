@@ -1,10 +1,11 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useMemo, useRef } from "react";
 import { Box, Stack, Typography, Paper, IconButton, Tooltip, ToggleButton, ToggleButtonGroup, Button } from "@mui/material";
 import LinkIcon from "@mui/icons-material/Link";
 import ViewColumnIcon from "@mui/icons-material/ViewColumn";
 import PushPinIcon from "@mui/icons-material/PushPin";
 import type { VerseDto } from "../sync/api";
 import { DocColumn } from "./DocColumn";
+import { highlightsFor, renderHighlightedHTML, type HighlightKey } from "../lib/highlight";
 
 export type ScriptureMode = "stacked" | "columns";
 
@@ -14,6 +15,8 @@ interface Props {
   versesByVersion: Record<string, Record<number, VerseDto>>;
   verseNumbers: number[];
   activeVerse: number;
+  activeNoteQuote: string | null;
+  activeNoteOccurrence: number | null;
   mode: ScriptureMode;
   enabledVersions: string[];
   availableVersions: string[];
@@ -39,6 +42,8 @@ export function ScriptureColumn({
   versesByVersion,
   verseNumbers,
   activeVerse,
+  activeNoteQuote,
+  activeNoteOccurrence,
   mode,
   enabledVersions,
   availableVersions,
@@ -136,6 +141,8 @@ export function ScriptureColumn({
           activeRef={activeRef}
           chapter={chapter}
           isHebrew={isHebrew}
+          activeNoteQuote={activeNoteQuote}
+          activeNoteOccurrence={activeNoteOccurrence}
           onSelectVerse={onSelectVerse}
           onOpenAligner={onOpenAligner}
         />
@@ -151,6 +158,8 @@ export function ScriptureColumn({
               activeVerse={activeVerse}
               readOnly={READ_ONLY_VERSIONS.has(v)}
               rtl={v === "UHB"}
+              activeNoteQuote={activeNoteQuote}
+              activeNoteOccurrence={activeNoteOccurrence}
               onSelectVerse={onSelectVerse}
               onEditVerse={(verseNum, plain, base) => onEditVerse(verseNum, v, plain, base)}
               onOpenAligner={(verseNum) => onOpenAligner(verseNum, v)}
@@ -169,6 +178,8 @@ function StackedBody({
   activeRef,
   chapter,
   isHebrew,
+  activeNoteQuote,
+  activeNoteOccurrence,
   onSelectVerse,
   onOpenAligner,
 }: {
@@ -178,6 +189,8 @@ function StackedBody({
   activeRef: React.MutableRefObject<HTMLDivElement | null>;
   chapter: number;
   isHebrew: boolean;
+  activeNoteQuote: string | null;
+  activeNoteOccurrence: number | null;
   onSelectVerse: (v: number) => void;
   onOpenAligner: (verse: number, bibleVersion: string) => void;
 }) {
@@ -192,6 +205,9 @@ function StackedBody({
         const ustV = ust[v];
         const uhbV = uhb[v];
         if (isActive) {
+          const ultHL = highlightsFor("ULT", ultV?.content, activeNoteQuote, activeNoteOccurrence);
+          const ustHL = highlightsFor("UST", ustV?.content, activeNoteQuote, activeNoteOccurrence);
+          const uhbHL = highlightsFor(isHebrew ? "UHB" : "UGNT", uhbV?.content, activeNoteQuote, activeNoteOccurrence);
           return (
             <Paper
               ref={activeRef}
@@ -212,10 +228,10 @@ function StackedBody({
               >
                 {v === 0 ? "intro" : `${chapter}:${v}`}
               </Typography>
-              <ActiveLine label="ULT" text={ultV?.plain_text ?? ""} editable onOpenAligner={() => onOpenAligner(v, "ULT")} />
-              <ActiveLine label="UST" text={ustV?.plain_text ?? ""} editable onOpenAligner={() => onOpenAligner(v, "UST")} />
+              <ActiveLine label="ULT" text={ultV?.plain_text ?? ""} content={ultV?.content} highlights={ultHL} editable onOpenAligner={() => onOpenAligner(v, "ULT")} />
+              <ActiveLine label="UST" text={ustV?.plain_text ?? ""} content={ustV?.content} highlights={ustHL} editable onOpenAligner={() => onOpenAligner(v, "UST")} />
               {uhbV && (
-                <ActiveLine label={isHebrew ? "UHB" : "UGNT"} text={uhbV.plain_text ?? ""} rtl={isHebrew} readOnly />
+                <ActiveLine label={isHebrew ? "UHB" : "UGNT"} text={uhbV.plain_text ?? ""} content={uhbV.content} highlights={uhbHL} rtl={isHebrew} readOnly />
               )}
             </Paper>
           );
@@ -272,6 +288,8 @@ function StackedBody({
 function ActiveLine({
   label,
   text,
+  content,
+  highlights,
   rtl,
   readOnly,
   editable,
@@ -279,11 +297,36 @@ function ActiveLine({
 }: {
   label: string;
   text: string;
+  content?: unknown;
+  highlights?: Set<HighlightKey>;
   rtl?: boolean;
   readOnly?: boolean;
   editable?: boolean;
   onOpenAligner?: () => void;
 }) {
+  const elRef = useRef<HTMLDivElement | null>(null);
+  const html = useMemo(() => {
+    if (!content || !highlights || highlights.size === 0) return null;
+    const verseObjects = (content as { verseObjects?: unknown[] } | null)?.verseObjects;
+    if (!Array.isArray(verseObjects)) return null;
+    return renderHighlightedHTML(verseObjects, highlights);
+  }, [content, highlights]);
+  // Only resync the DOM when the highlight/content state actually changes —
+  // not on every keystroke. This lets the user type freely; clicking a
+  // different note triggers a re-set that includes the new highlights.
+  const lastSetRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!elRef.current) return;
+    const next = html ?? text;
+    if (next === lastSetRef.current) return;
+    if (html === null) {
+      elRef.current.textContent = text;
+    } else {
+      elRef.current.innerHTML = html;
+    }
+    lastSetRef.current = next;
+  }, [html, text]);
+
   return (
     <Stack direction="row" spacing={1} alignItems="flex-start" sx={{ py: 0.5 }}>
       <Typography
@@ -307,6 +350,7 @@ function ActiveLine({
         </Tooltip>
       )}
       <Box
+        ref={elRef}
         contentEditable={editable && !readOnly}
         suppressContentEditableWarning
         spellCheck={!rtl}
@@ -326,6 +370,12 @@ function ActiveLine({
             ? '"Times New Roman","SBL Hebrew","Cardo",serif'
             : '"Source Serif Pro","Cambria","Times New Roman",serif',
           outline: "none",
+          "& mark.be-hl": {
+            backgroundColor: "#fff48a",
+            padding: "0 2px",
+            borderRadius: 0.5,
+            color: "inherit",
+          },
           "&:focus": readOnly
             ? {}
             : {
@@ -333,9 +383,7 @@ function ActiveLine({
                 boxShadow: "0 0 0 2px rgba(25,118,210,0.2)",
               },
         }}
-      >
-        {text}
-      </Box>
+      />
     </Stack>
   );
 }

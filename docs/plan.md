@@ -274,6 +274,7 @@ The web frontend runs under `vite dev` on a separate port and is proxied to the 
 - IndexedDB outbox + drain worker.
 - Build Screen A (stacked mode) of the design: Timeline rail + Scripture column (stacked, read-only initially) + Resource column with Notes/Words/Questions editing.
 - Type-ahead popovers backed by `ta`/`tw` catalog endpoints.
+- Verse-status "done" checkbox in the Timeline rail — **starts as a single global flag per (book, chapter, verse)** in `verse_statuses`; when OAuth lands, migrate to per-user state by adding a `user_id` column and keying on the JWT subject. The current global table becomes a "team consensus" overlay that any editor can flip; per-user state is the personal check-off.
 - Nightly export cron (TSV for tn/tq/twl; USFM passed through unchanged from import).
 - Verify with 2-3 editors on the same chapter for a week.
 
@@ -289,6 +290,7 @@ The web frontend runs under `vite dev` on a separate port and is proxied to the 
 
 **Phase 4 — Hardening for the remaining months**
 - Error reporting, admin views (recent changes, who edited what), export history.
+- **Full edit-history view per row.** `edit_log` already captures every patch with prev/new version + payload + author; add `GET /api/history/:kind/:id` and a slide-out drawer in `NoteCard` / `WordsTable` / `QuestionsTable` that shows the timeline of revisions and lets an editor revert to a prior version. Same plumbing covers verse edits keyed by `book/ch/v/bible_version`.
 - Final-snapshot script for the end-of-7-months handoff.
 
 ## Critical files to create (in the new `bible-editor` repo)
