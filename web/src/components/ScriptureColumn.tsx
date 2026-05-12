@@ -439,9 +439,9 @@ function StackedBody({
               <Typography
                 component="span"
                 variant="caption"
-                sx={{ fontFamily: "monospace", color: "text.disabled", fontWeight: 600, fontSize: 11 }}
+                sx={{ fontFamily: "monospace", color: "text.disabled", fontWeight: 600, fontSize: 10 }}
               >
-                L
+                ULT
               </Typography>
             </Box>
             <Box sx={{ gridColumn: 2, gridRow: 1, minWidth: 0 }}>{ultV?.plain_text ?? ""}</Box>
@@ -456,10 +456,10 @@ function StackedBody({
                     fontFamily: "monospace",
                     color: "text.disabled",
                     fontWeight: 600,
-                    fontSize: 11,
+                    fontSize: 10,
                   }}
                 >
-                  S
+                  UST
                 </Typography>
                 <Box sx={{ gridColumn: 2, gridRow: 2, minWidth: 0 }}>{ustV.plain_text ?? ""}</Box>
               </>
