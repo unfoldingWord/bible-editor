@@ -4,7 +4,15 @@
 // re-fetch (cheap and avoids flicker).
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { api, ApiError, type ChapterPayload, type TnRow, type TqRow, type TwlRow } from "../sync/api";
+import {
+  api,
+  ApiError,
+  type ChapterPayload,
+  type TnRow,
+  type TqRow,
+  type TwlRow,
+  type VerseDto,
+} from "../sync/api";
 import { onOutboxResult } from "../sync/outbox";
 
 type Status = "idle" | "loading" | "ready" | "error";
@@ -22,6 +30,7 @@ export interface UseChapterReturn {
     row: TnRow | TqRow | TwlRow,
     position?: { afterId?: string },
   ) => void;
+  applyLocalVerse: (verse: VerseDto) => void;
 }
 
 export function useChapter(book: string, chapter: number): UseChapterReturn {
@@ -115,17 +124,40 @@ export function useChapter(book: string, chapter: number): UseChapterReturn {
     [],
   );
 
+  const applyLocalVerse = useCallback<UseChapterReturn["applyLocalVerse"]>(
+    (verse) => {
+      setData((prev) => {
+        if (!prev) return prev;
+        const byVersion = prev.verses[verse.bible_version] ?? {};
+        const nextVersion = { ...byVersion, [verse.verse]: verse };
+        return {
+          ...prev,
+          verses: { ...prev.verses, [verse.bible_version]: nextVersion },
+        };
+      });
+    },
+    [],
+  );
+
   // Adopt server-confirmed values when an outbox op succeeds.
   useEffect(() => {
     return onOutboxResult((op, result) => {
       if (result.kind !== "ok") return;
-      if (op.target.kind !== "row") return;
-      const u = result.updated as TnRow | TqRow | TwlRow;
-      if (u && u.book === book && u.chapter === chapter) {
-        applyLocalRowReplacement(op.target.rowKind, u);
+      if (op.target.kind === "row") {
+        const u = result.updated as TnRow | TqRow | TwlRow;
+        if (u && u.book === book && u.chapter === chapter) {
+          applyLocalRowReplacement(op.target.rowKind, u);
+        }
+        return;
+      }
+      if (op.target.kind === "verse") {
+        const v = result.updated as VerseDto;
+        if (v && v.book === book && v.chapter === chapter) {
+          applyLocalVerse(v);
+        }
       }
     });
-  }, [book, chapter, applyLocalRowReplacement]);
+  }, [book, chapter, applyLocalRowReplacement, applyLocalVerse]);
 
   return {
     status,
@@ -136,5 +168,6 @@ export function useChapter(book: string, chapter: number): UseChapterReturn {
     applyLocalRowReplacement,
     applyLocalRowDelete,
     applyLocalRowInsert,
+    applyLocalVerse,
   };
 }
