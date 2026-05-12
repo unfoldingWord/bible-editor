@@ -54,6 +54,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook }:
     applyLocalRowPatch,
     applyLocalRowDelete,
     applyLocalRowInsert,
+    applyLocalVerse,
     refetch,
   } = useChapter(book, chapter);
   const [activeVerse, setActiveVerse] = useState(initialVerse);
@@ -201,16 +202,20 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook }:
           }}
           onEditBookVerse={(ch, verseNum, bibleVersion, plain, base) => {
             const newContent = { verseObjects: [{ type: "text", text: plain + " " }] };
-            // Optimistic local update — useBook's onOutboxResult listener
-            // will adopt the server's confirmed row when the patch lands.
-            bookHook?.applyLocalVerse({
+            const newDto = {
               ...base,
               chapter: ch,
               verse: verseNum,
               bible_version: bibleVersion,
               plain_text: plain,
               content: newContent,
-            } as VerseDto);
+            } as VerseDto;
+            bookHook?.applyLocalVerse(newDto);
+            // Dual-apply to useChapter when the edited verse is in the
+            // currently-loaded chapter, so the aligner (which pulls from
+            // useChapter for sameChapter targets) doesn't see stale data
+            // before the outbox round-trips.
+            if (ch === chapter) applyLocalVerse(newDto);
             void outbox.enqueueVerse(
               book,
               ch,
@@ -226,15 +231,19 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook }:
           onReplaceBookVerse={(ch, verseNum, bibleVersion, newContent, newPlainText, base) => {
             // Find/replace ships pre-built content from smartReplaceVerse —
             // alignment is preserved when word counts match, fully
-            // re-tokenized otherwise.
-            bookHook?.applyLocalVerse({
+            // re-tokenized otherwise. Dual-apply to useChapter so opening
+            // ⌭ right after a replace shows the new content instead of the
+            // pre-replace cache.
+            const newDto = {
               ...base,
               chapter: ch,
               verse: verseNum,
               bible_version: bibleVersion,
               plain_text: newPlainText,
               content: newContent,
-            } as VerseDto);
+            } as VerseDto;
+            bookHook?.applyLocalVerse(newDto);
+            if (ch === chapter) applyLocalVerse(newDto);
             void outbox.enqueueVerse(
               book,
               ch,
