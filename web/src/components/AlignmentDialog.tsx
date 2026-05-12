@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Dialog,
   DialogTitle,
@@ -50,6 +50,11 @@ interface Props {
   // session — caller swaps which version's verse + contextOther it ships in.
   // Undefined disables the switch affordance.
   onSwitchVersion?: (bibleVersion: string) => void;
+  // Inline edit on ULT / UST in the verse strip — fires per-debounce-window
+  // with the new plain text. Caller PATCHes via outbox; the new verse
+  // payload flows back through `verse`/`contextOther` and re-initializes
+  // the alignment state from the re-tokenized content.
+  onEditVerseText?: (bibleVersion: string, plain: string, base: VerseDto) => void;
 }
 
 export function AlignmentDialog({
@@ -66,6 +71,7 @@ export function AlignmentDialog({
   onClose,
   onSave,
   onSwitchVersion,
+  onEditVerseText,
 }: Props) {
   const initial = useMemo<AlignmentState | null>(() => {
     if (!verse?.content) return null;
@@ -245,6 +251,7 @@ export function AlignmentDialog({
               verseNum={verseNum}
               lexiconMap={lexiconMap}
               onSwitchVersion={onSwitchVersion}
+              onEditVerseText={onEditVerseText}
               twlForVerse={twlForVerse}
             />
             <Box sx={{ display: "grid", gridTemplateColumns: "220px 1fr", height: 480, overflow: "hidden" }}>
@@ -293,6 +300,7 @@ function VerseStrip({
   verseNum,
   lexiconMap,
   onSwitchVersion,
+  onEditVerseText,
   twlForVerse,
 }: {
   verse: VerseDto | null;
@@ -304,6 +312,7 @@ function VerseStrip({
   verseNum: number;
   lexiconMap: Map<string, LexiconEntry | null>;
   onSwitchVersion?: (bv: string) => void;
+  onEditVerseText?: (bv: string, plain: string, base: VerseDto) => void;
   twlForVerse: TwlRow[];
 }) {
   const otherLabel = bibleVersion === "ULT" ? "UST" : bibleVersion === "UST" ? "ULT" : "UST";
@@ -335,7 +344,10 @@ function VerseStrip({
           variant="filled"
           sx={{ mr: 1, fontFamily: "monospace", height: 18, fontWeight: 700 }}
         />
-        {verse?.plain_text}
+        <EditableStripCell
+          verse={verse}
+          onEdit={onEditVerseText ? (plain, base) => onEditVerseText(bibleVersion, plain, base) : undefined}
+        />
       </Box>
       <Box>
         <Tooltip title={switchable ? `align ${otherLabel} for this verse instead` : ""}>
@@ -353,7 +365,10 @@ function VerseStrip({
             }}
           />
         </Tooltip>
-        {other?.plain_text}
+        <EditableStripCell
+          verse={other}
+          onEdit={onEditVerseText ? (plain, base) => onEditVerseText(otherLabel, plain, base) : undefined}
+        />
       </Box>
       <Box>
         <Chip label={sourceLabel} size="small" sx={{ mr: 1, fontFamily: "monospace", height: 18 }} />
@@ -379,6 +394,59 @@ function VerseStrip({
         </Box>
       </Box>
     </Box>
+  );
+}
+
+// Inline-editable plain-text cell for the ULT/UST line of the verse
+// strip. Mirrors the contentEditable + lastTextRef pattern used by
+// ScriptureColumn's verse spans: outside updates only repaint the DOM
+// when the user hasn't typed since the last sync, so the cursor doesn't
+// jump under the user when the dialog state resets after a save.
+function EditableStripCell({
+  verse,
+  onEdit,
+}: {
+  verse: VerseDto | null;
+  onEdit?: (plain: string, base: VerseDto) => void;
+}) {
+  const elRef = useRef<HTMLSpanElement | null>(null);
+  const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const text = verse?.plain_text ?? "";
+  const lastTextRef = useRef(text);
+  const lastSetRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!elRef.current) return;
+    const dom = elRef.current.innerText;
+    if (lastSetRef.current === null || dom === lastTextRef.current) {
+      elRef.current.innerText = text;
+      lastSetRef.current = text;
+    }
+    lastTextRef.current = text;
+  }, [text]);
+  if (!verse) return null;
+  return (
+    <span
+      ref={elRef}
+      contentEditable={!!onEdit}
+      suppressContentEditableWarning
+      spellCheck
+      onInput={(e) => {
+        if (!onEdit) return;
+        const value = (e.currentTarget as HTMLSpanElement).innerText;
+        if (debounceRef.current) clearTimeout(debounceRef.current);
+        debounceRef.current = setTimeout(() => {
+          onEdit(value, verse);
+          lastTextRef.current = value;
+          debounceRef.current = null;
+        }, 350);
+      }}
+      style={{
+        outline: "none",
+        borderRadius: 3,
+        padding: "1px 3px",
+        background: onEdit ? "rgba(255,255,255,0.6)" : "transparent",
+      }}
+    />
   );
 }
 

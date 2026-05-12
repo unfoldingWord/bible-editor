@@ -497,6 +497,30 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook }:
             onSwitchVersion={(bv) => {
               setAlignerTarget((cur) => (cur ? { ...cur, bibleVersion: bv } : cur));
             }}
+            onEditVerseText={(bv, plain, base) => {
+              // Inline edits in the aligner strip flow through the same
+              // path as plain-text edits in the doc / book views: rewrite
+              // the verse content to a single text token, apply
+              // optimistically to both caches that might be observing,
+              // then enqueue the PATCH. After the round-trip the dialog's
+              // useEffect re-tokenizes and resets alignment state.
+              const newContent = { verseObjects: [{ type: "text", text: plain + " " }] };
+              const newDto = {
+                ...base,
+                plain_text: plain,
+                content: newContent,
+              } as VerseDto;
+              bookHook?.applyLocalVerse(newDto);
+              if (alignerTarget.chapter === chapter) applyLocalVerse(newDto);
+              void outbox.enqueueVerse(
+                book,
+                alignerTarget.chapter,
+                alignerTarget.verse,
+                bv,
+                base.version,
+                { content: newContent, plain_text: plain },
+              );
+            }}
           />
         );
       })()}
