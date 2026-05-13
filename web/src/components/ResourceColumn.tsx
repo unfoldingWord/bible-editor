@@ -504,8 +504,8 @@ function SectionHead({
       spacing={1}
       alignItems="center"
       sx={{
-        pb: 0.5,
-        mb: 0.5,
+        pb: 0.25,
+        mb: 0.25,
         borderBottom: "1px solid",
         borderColor: "divider",
         ...(sticky
@@ -514,7 +514,7 @@ function SectionHead({
               top: 0,
               bgcolor: "background.paper",
               zIndex: 2,
-              pt: 0.5,
+              pt: 0.25,
             }
           : {}),
       }}

@@ -14,7 +14,6 @@ import { TimelineRail } from "./TimelineRail";
 import { ScriptureColumn, type ScriptureMode } from "./ScriptureColumn";
 import { ResourceColumn } from "./ResourceColumn";
 import { TopBar } from "./TopBar";
-import { SyncStatusBar } from "./SyncStatusBar";
 import { PipelineMenu } from "./PipelineMenu";
 import { PipelineStatusBar } from "./PipelineStatusBar";
 import { pipelineStore, type PipelineJob } from "../sync/pipelineStore";
@@ -349,6 +348,13 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook }:
           setActiveWordId(null);
           onNavigate?.(b, c);
         }}
+        pipelineMenu={
+          <PipelineMenu
+            book={book}
+            chapter={chapter}
+            onMessage={(msg) => pushPipelineToast(msg, "info")}
+          />
+        }
       />
       {chapterLock && (
         <Alert
@@ -368,23 +374,6 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook }:
           set lands.
         </Alert>
       )}
-      <Box
-        sx={{
-          display: "flex",
-          justifyContent: "flex-end",
-          px: 2,
-          py: 0.5,
-          borderBottom: "1px solid",
-          borderColor: "divider",
-          bgcolor: "background.paper",
-        }}
-      >
-        <PipelineMenu
-          book={book}
-          chapter={chapter}
-          onMessage={(msg) => pushPipelineToast(msg, "info")}
-        />
-      </Box>
       <Box sx={{ flex: 1, display: "flex", overflow: "hidden" }}>
         <TimelineRail
           book={book}
@@ -732,7 +721,6 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook }:
         toast={pipelineToast}
         onToastClear={() => setPipelineToast(null)}
       />
-      <SyncStatusBar />
     </Box>
   );
 }
