@@ -19,18 +19,23 @@ You are picking this up mid-flight. Read this end-to-end, then [`docs/ai-pipelin
 - **Frontend lock awareness.** [`Shell.tsx`](../web/src/components/Shell.tsx) derives `chapterLock` from `pipelineStore` (any non-terminal job covering the active chapter), threads it to columns, mounts an Alert banner above the pipeline-menu strip, and surfaces an outbox-result toast when a write is rejected as `chapter_locked`. [`ScriptureColumn.tsx`](../web/src/components/ScriptureColumn.tsx) + [`DocColumn.tsx`](../web/src/components/DocColumn.tsx) + [`BookView.tsx`](../web/src/components/BookView.tsx) OR `locked` into their existing `readOnly` derivation (which already handled UHB/UGNT). [`ResourceColumn.tsx`](../web/src/components/ResourceColumn.tsx) hides "new" buttons when locked. [`QuestionsTable.tsx`](../web/src/components/QuestionsTable.tsx) renders inputs read-only. [`WordsTable.tsx`](../web/src/components/WordsTable.tsx) disables interaction (pointer-events). [`NoteCard.tsx`](../web/src/components/NoteCard.tsx) is the most involved — when locked + `updated_by IS NULL`, the card is read-only with a Keep checkbox at the top of its header; when locked + `updated_by IS NOT NULL`, a Kept chip shows and the card stays editable.
 - **Outbox 409 handling.** [`outbox.ts`](../web/src/sync/outbox.ts) gained a `locked` result kind. Ops that hit `chapter_locked` are dropped (not retried) — retrying would race with the auto-apply step. Shell subscribes to result events and toasts a "Edit dropped" message.
 
-**Phase 2d shipped (asymmetric alignment + AI chip + stage bar + cron polling).**
+**Phase 2d shipped — merged to main as PR #14.**
+
+Four items landed together:
 
 - **Asymmetric ULT/UST alignment.** Migration [`0011_pipeline_followup.sql`](../api/migrations/0011_pipeline_followup.sql) adds `follow_up_options` + `follow_up_job_id` columns to `pipeline_jobs`. The PipelineMenu generate dialog now has four independent checkboxes — picking e.g. ULT-aligned + UST-not-aligned splits into two upstream calls (parent runs ULT alone with alignment; on the parent's `done` transition the status-poll handler fires a follow-up with `contentTypes: ["ust"], textOnly: true`). The child uses a `${parentSessionKey}/followup` sessionKey so upstream's `(sessionKey, pipelineType, scope)` dedup doesn't collide. Claim + child INSERT run in one D1 batch — a crash between them can't orphan the upstream-running follow-up, and upstream idempotency makes retries safe.
 - **AI provenance chip.** Chapter handler now computes `latest_source` per TN/TQ row via a correlated subquery against `edit_log` (cheap because of the existing `(kind, row_key)` index). NoteCard renders a small "AI" chip with a sparkle next to the row id; QuestionsTable shows the sparkle inline by the Ref input. Any subsequent human edit or keep action writes a fresh `edit_log` entry with `source=NULL` so the chip disappears on the next chapter read.
 - **Per-stage progress.** PipelineStatusBar's expanded panel now renders a horizontal stepper per job, indexed off `current.skill`. `generate` is Draft → Align → Push (matching `initial-pipeline` → `align-all-parallel` → `door43-push`); `notes` and `tqs` have shorter ladders. Completed stages fill green, the running stage fills blue, future stages outline. Unrecognized skills fall back to the textual line so we don't lie about progress.
 - **Worker-side cron polling.** [`api/wrangler.toml`](../api/wrangler.toml) now has a second cron at `*/5 * * * *`. [`api/src/pipelines.ts`](../api/src/pipelines.ts) exports `pollAllNonTerminal(env)` and a shared `pollPipelineJob` helper (the GET handler now delegates to the same code path so the two never drift). On each tick we SELECT non-terminal jobs and poll them in parallel via `Promise.allSettled`; per-job errors are isolated. Tab-closed `done` transitions now auto-apply within 5 minutes — translators see the chapter already updated on next sign-in.
 
+**Phase 2d verification status — partial.** Type-check passes on both api and web; migration 0011 applies locally; parser smoke test still passes. **Not yet verified end-to-end against a live bp-assistant run** (each costs 30–100 min of bot time and a translator's attention). The first real generate with asymmetric alignment, and the first cron-driven `done` transition for a closed-tab job, are the two highest-risk untouched paths. Next session should treat these as "compiled and reasoned about, not battle-tested" and avoid changes that would obscure failure modes.
+
 Out of scope so far — every one of these is "still to do":
-- Cancellation. Contract §11 says it's not in v1; needs a bp-assistant change too.
-- Concurrency UX for shared chapters (Phase 3.3).
-- `generate` chapter macro (Phase 3.6).
-- `already_running` UX when it's the user's own (Phase 3.7).
+- Cancellation. Contract §11 says it's not in v1; needs a bp-assistant change too. **Not autonomous-safe** — coordinated work with the partner repo.
+- Concurrency UX for shared chapters (Phase 3.1). **Autonomous-safe.**
+- `generate` chapter macro (Phase 3.3). **Autonomous-safe but verify the spawn-order semantics against the contract first.**
+- `already_running` UX when it's the user's own (Phase 3.4). **Autonomous-safe and small.**
+- Surface the follow-up's relationship to its parent (Phase 3.5). **Autonomous-safe and small** — data is already in `follow_up_job_id`.
 
 ## One-paragraph mental model
 
@@ -152,20 +157,50 @@ All four original decisions are closed under the revised lock + auto-apply model
 
 ## What to do first
 
-In order, when you start a fresh session with the user:
+### Always (any session)
 
 1. Read this file and `ai-pipeline-integration.md`.
 2. Sanity-check the build:
    - `cd api && npx tsc --noEmit`
    - `cd web && npx tsc -b --noEmit`
    - `cd api && node --experimental-strip-types --no-warnings src/importParsers.test.mjs` (parser smoke against `docs/samples/`)
+   - `cd api && npm run db:migrate:local` (idempotent — applies any unapplied migration)
+
+   All four should pass cleanly on a freshly-pulled main. If one fails, that's the first thing to fix — don't layer new work on a broken baseline.
+
+### With a translator in the room
+
 3. Verify lock + auto-apply end-to-end against an **untouched** chapter (ZEC 6–12 — ZEC 3 has prior editor work and a partial tqs run that'd give noisy diffs):
    - Navigate `#/ZEC/7`, click "AI pipelines → Write translation questions" → Start.
    - The chapter banner should appear within ~2s ("AI tqs run in progress…").
    - Try to edit a TQ in the UI — input is read-only. Try via curl — receives 409 chapter_locked.
    - Click Keep on a TN — card flips to editable, Kept chip shows.
-   - When the run completes: `wrangler d1 execute bible_editor --local --command "SELECT count(*), source FROM edit_log WHERE row_key LIKE 'ZEC/7%' GROUP BY source"` should show a chunk of `source='ai_pipeline'` rows. The same TN cards now carry a small "AI" chip.
-4. To exercise asymmetric alignment without burning a full hour, point `PIPELINE_API_BASE` at a stub that responds quickly. End-to-end against the real bot: pick a generate, tick ULT + ULT-alignment + UST (no UST-alignment), Start. The dialog warns "runs as two pipelines back-to-back." Confirm by watching `pipeline_jobs` — parent shows up first, then on its `done` transition a second row appears with `session_key = '${parent}/followup'`.
-5. The cron poller runs every 5 minutes in production; it does NOT run under `wrangler dev` unless you pass `--test-scheduled` or invoke `__scheduled` directly. The browser poll at 2 minutes is enough for local testing.
+   - When the run completes (~30–60 min): `wrangler d1 execute bible_editor --local --command "SELECT count(*), source FROM edit_log WHERE row_key LIKE 'ZEC/7%' GROUP BY source"` should show a chunk of `source='ai_pipeline'` rows. The same TN cards now carry a small "AI" chip.
+4. Asymmetric alignment dry-run: pick a generate, tick ULT + ULT-alignment + UST (no UST-alignment), Start. The dialog warns "runs as two pipelines back-to-back." Confirm by watching `pipeline_jobs` — parent shows up first, then on its `done` transition a second row appears with `session_key = '${parent}/followup'`. (~2× run time.)
 
-Do NOT propose changes to bp-assistant from inside this repo. That's a separate session in a separate clone with its own Claude. If you discover the contract needs revision, write up the proposed change as text and hand it to the user to relay.
+### Autonomous (no translator available)
+
+Skip steps 3–4. Live runs cost real bot time and translator attention; don't trigger them unsupervised.
+
+Safe-to-pick-up items, in priority order:
+
+- **Phase 3.4 `already_running` UX** — small. When `pipelineStore.start` gets `status: "already_running"` from a re-POST that the user just made (same `sessionKey`), open the status panel instead of showing a toast. See [`PipelineMenu.tsx`](../web/src/components/PipelineMenu.tsx) `start()` and [`PipelineStatusBar.tsx`](../web/src/components/PipelineStatusBar.tsx). One PR.
+- **Phase 3.5 follow-up parent-child link** — small. Server: include `follow_up_job_id` in the GET `/api/pipelines` list response. Client: render "step 2 of 2 (after job …)" under the child in `PipelineStatusBar`. One PR.
+- **Phase 3.1 concurrency UX** — medium. When the start request 409s with `error: "conflict"` and an existing `jobId`, show translator B a read-only view of A's running job rather than a bare toast. Needs a new endpoint to fetch a job's metadata when the current user doesn't own it (the existing GET /:jobId 403s).
+- **Phase 3.3 generate chapter macro** — medium. A "Generate everything" button that fires `generate` + `notes` + `tqs`. Watch the chapter-lock semantics — these can't all run in parallel against the same chapter. Likely a follow-up chain like the asymmetric-alignment case.
+- **Worker-side cron poll cap.** [`pollAllNonTerminal`](../api/src/pipelines.ts) has `LIMIT 50`. Healthy in normal operation. If a stuck row gets older than 24h, we should auto-fail it so it stops eating cron budget. Add a sentinel UPDATE that sets state='failed' on rows with `updated_at < now - 86400 * 2`. Self-contained, low risk.
+
+What NOT to pick up without the user:
+
+- **Anything that requires a real pipeline run to verify** — including changes to `pollPipelineJob`, `pipelineImport.ts`, or the chapter-lock semantics. Type-check + reasoning is fine for review prep; merging without an end-to-end run is not.
+- **Cancellation (Phase 3.2)** — needs a coordinated contract change with bp-assistant.
+- **Anything in PSA.** The user has carved Psalms out of the editor's scope while other work happens there.
+
+Do NOT propose changes to bp-assistant from inside this repo. That's a separate session in a separate clone with its own Claude. If you discover the contract needs revision, write up the proposed change as text and leave it in `docs/` for the user to relay.
+
+### After shipping
+
+For each PR you land:
+1. `gh pr create --title "..." --body "..."` with a real test plan.
+2. If you have permission and the change is mergeable, `gh pr merge --merge` and `git pull --ff-only origin main` in the main worktree so local stays current.
+3. Update this file's status section in the same PR so the next session reads the right state.
