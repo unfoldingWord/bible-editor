@@ -19,6 +19,22 @@ import type { FindMatch } from "./FindReplaceOverlay";
 import type { FindQuery } from "./ScriptureColumn";
 import { HebrewLine } from "./HebrewLine";
 import type { LexiconEntry } from "../hooks/useLexicon";
+import {
+  classifySourceQuery,
+  matchSourceVerse,
+  renderFindMatchesByOffsets,
+  type SourceQueryKind,
+  type SourceTokenMatch,
+} from "../lib/sourceSearch";
+
+// Compiled find state passed down through the verse-cell tree. `re` is the
+// English/regex-mode pattern; `sourceQuery` covers Strong's / Hebrew / Greek.
+// When sourceQuery.kind === "english" the `re` path runs; otherwise per-verse
+// token matching runs only on UHB/UGNT cells.
+interface SearchState {
+  re: RegExp | null;
+  sourceQuery: SourceQueryKind;
+}
 
 const READ_ONLY = new Set(["UHB", "UGNT"]);
 
@@ -75,17 +91,21 @@ export function BookView({
     el?.scrollIntoView({ behavior: "smooth", block: "center" });
   }, [findActiveMatch]);
 
-  const compiledFindRe = useMemo(() => {
+  const search = useMemo<SearchState | null>(() => {
     if (!findQuery) return null;
+    const sourceQuery: SourceQueryKind = findQuery.regex
+      ? { kind: "english" }
+      : classifySourceQuery(findQuery.find, book, findQuery.strongs);
     try {
       const pattern = findQuery.regex
         ? findQuery.find
         : findQuery.find.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-      return new RegExp(pattern, findQuery.caseSensitive ? "g" : "gi");
+      const re = new RegExp(pattern, findQuery.caseSensitive ? "g" : "gi");
+      return { re, sourceQuery };
     } catch {
-      return null;
+      return { re: null, sourceQuery };
     }
-  }, [findQuery]);
+  }, [findQuery, book]);
 
   const cols = enabledVersions.length;
   const gridTemplateColumns = `repeat(${cols}, minmax(0, 1fr))`;
@@ -156,7 +176,7 @@ export function BookView({
               activeNoteQuote={activeNoteQuote}
               activeNoteOccurrence={activeNoteOccurrence}
               activeRowRef={activeRowRef}
-              findRe={compiledFindRe}
+              search={search}
               lexiconMap={lexiconMap}
               onLoadChapter={onLoadChapter}
               onSelectVerse={onSelectVerse}
@@ -187,7 +207,7 @@ function ChapterBlock({
   activeNoteQuote,
   activeNoteOccurrence,
   activeRowRef,
-  findRe,
+  search,
   lexiconMap,
   onLoadChapter,
   onSelectVerse,
@@ -204,7 +224,7 @@ function ChapterBlock({
   activeNoteQuote: string | null;
   activeNoteOccurrence: number | null;
   activeRowRef: React.MutableRefObject<HTMLDivElement | null>;
-  findRe: RegExp | null;
+  search: SearchState | null;
   lexiconMap: Map<string, LexiconEntry | null>;
   onLoadChapter: (ch: number) => void;
   onSelectVerse: (chapter: number, verse: number) => void;
@@ -331,7 +351,7 @@ function ChapterBlock({
             activeNoteQuote={isActive ? activeNoteQuote : null}
             activeNoteOccurrence={isActive ? activeNoteOccurrence : null}
             rowRef={isActive ? activeRowRef : null}
-            findRe={findRe}
+            search={search}
             lexiconMap={lexiconMap}
             onSelectVerse={() => onSelectVerse(chapter, v)}
             onEditVerse={(bv, plain, base) => onEditVerse(chapter, v, bv, plain, base)}
@@ -353,7 +373,7 @@ function VerseRow({
   activeNoteQuote,
   activeNoteOccurrence,
   rowRef,
-  findRe,
+  search,
   lexiconMap,
   onSelectVerse,
   onEditVerse,
@@ -368,7 +388,7 @@ function VerseRow({
   activeNoteQuote: string | null;
   activeNoteOccurrence: number | null;
   rowRef: React.MutableRefObject<HTMLDivElement | null> | null;
-  findRe: RegExp | null;
+  search: SearchState | null;
   lexiconMap: Map<string, LexiconEntry | null>;
   onSelectVerse: () => void;
   onEditVerse: (bv: string, plain: string, base: VerseDto) => void;
@@ -402,7 +422,7 @@ function VerseRow({
               isActive={isActive}
               activeNoteQuote={activeNoteQuote}
               activeNoteOccurrence={activeNoteOccurrence}
-              findRe={findRe}
+              search={search}
               lexiconMap={lexiconMap}
               onAlign={() => onOpenAligner(bv)}
               onEdit={(plain) => dto && onEditVerse(bv, plain, dto)}
@@ -422,7 +442,7 @@ function VerseCell({
   isActive,
   activeNoteQuote,
   activeNoteOccurrence,
-  findRe,
+  search,
   lexiconMap,
   onAlign,
   onEdit,
@@ -434,26 +454,52 @@ function VerseCell({
   isActive: boolean;
   activeNoteQuote: string | null;
   activeNoteOccurrence: number | null;
-  findRe: RegExp | null;
+  search: SearchState | null;
   lexiconMap: Map<string, LexiconEntry | null>;
   onAlign: () => void;
   onEdit: (plain: string) => void;
 }) {
   const readOnly = READ_ONLY.has(bibleVersion);
   const rtl = bibleVersion === "UHB";
+  const isSource = bibleVersion === "UHB" || bibleVersion === "UGNT";
   const elRef = useRef<HTMLSpanElement | null>(null);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lastTextRef = useRef(dto?.plain_text ?? "");
   const lastSetRef = useRef<string | null>(null);
 
+  // Source-language matches for this cell. Only meaningful for UHB/UGNT in
+  // non-english find modes. Drives both the offset painter (UGNT) and the
+  // HebrewLine findHighlights set (UHB).
+  const sourceHits = useMemo<SourceTokenMatch[] | null>(() => {
+    if (!isSource || !search || search.sourceQuery.kind === "english") return null;
+    const vo = (dto?.content as { verseObjects?: unknown[] } | null)?.verseObjects;
+    if (!Array.isArray(vo)) return null;
+    return matchSourceVerse(vo, search.sourceQuery);
+  }, [isSource, search, dto?.content]);
+
+  const findHighlights = useMemo<Set<HighlightKey> | null>(() => {
+    if (!sourceHits || sourceHits.length === 0) return null;
+    const set = new Set<HighlightKey>();
+    for (const h of sourceHits) set.add(`${h.text}|${h.occurrence}`);
+    return set;
+  }, [sourceHits]);
+
   // Find marks override note highlights while the overlay is open — fewer
   // visual layers, easier to scan results. Note highlights resume when the
   // overlay closes.
   const findHTML = useMemo(() => {
-    if (!findRe || !dto?.plain_text) return null;
-    const html = renderFindMatchesHTML(dto.plain_text, findRe);
+    if (!dto?.plain_text) return null;
+    // Source-language query: ULT/UST cells stay clean; UGNT uses the offset
+    // painter (UHB renders via HebrewLine, ignoring findHTML).
+    if (search && search.sourceQuery.kind !== "english") {
+      if (!isSource || !sourceHits || sourceHits.length === 0) return null;
+      return renderFindMatchesByOffsets(dto.plain_text, sourceHits);
+    }
+    // English / regex path — unchanged.
+    if (!search?.re) return null;
+    const html = renderFindMatchesHTML(dto.plain_text, search.re);
     return html.includes("be-find") ? html : null;
-  }, [findRe, dto?.plain_text]);
+  }, [search, sourceHits, dto?.plain_text, isSource]);
 
   const highlights = useMemo<Set<HighlightKey> | null>(() => {
     if (findHTML) return null;
@@ -537,6 +583,7 @@ function VerseCell({
           <HebrewLine
             verseObjects={(dto.content as { verseObjects?: unknown[] } | null)?.verseObjects}
             lexiconMap={lexiconMap}
+            findHighlights={findHighlights}
             fallbackText={dto.plain_text ?? ""}
           />
         </span>

@@ -14,11 +14,27 @@ import { HebrewLine } from "./HebrewLine";
 import type { LexiconEntry } from "../hooks/useLexicon";
 import type { ChapterState } from "../hooks/useBook";
 import { highlightsFor, renderHighlightedHTML, type HighlightKey } from "../lib/highlight";
+import {
+  classifySourceQuery,
+  matchSourceVerse,
+  renderFindMatchesByOffsets,
+  type SourceQueryKind,
+  type SourceTokenMatch,
+} from "../lib/sourceSearch";
+
+interface SearchState {
+  re: RegExp | null;
+  sourceQuery: SourceQueryKind;
+}
 
 export interface FindQuery {
   find: string;
   regex: boolean;
   caseSensitive: boolean;
+  // User has opted in to interpreting bare-digit queries as Strong's numbers
+  // (toggle in the find overlay). Has no effect on H/G-prefixed or non-digit
+  // queries — those classify unambiguously.
+  strongs: boolean;
 }
 
 export type ScriptureMode = "stacked" | "columns" | "book";
@@ -161,19 +177,24 @@ export function ScriptureColumn({
     [mode, onLoadBookChapter],
   );
 
-  // Compile the regex once and feed it to stacked/columns cells for in-line
-  // mark painting. Book mode rebuilds its own copy inside BookView.
-  const compiledFindRe = useMemo(() => {
+  // Compile the regex + classify the source-language query once and feed both
+  // to stacked/columns cells for in-line mark painting. Book mode rebuilds
+  // its own copy inside BookView.
+  const search = useMemo<SearchState | null>(() => {
     if (!findQuery) return null;
+    const sourceQuery: SourceQueryKind = findQuery.regex
+      ? { kind: "english" }
+      : classifySourceQuery(findQuery.find, book, findQuery.strongs);
     try {
       const pattern = findQuery.regex
         ? findQuery.find
         : findQuery.find.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-      return new RegExp(pattern, findQuery.caseSensitive ? "g" : "gi");
+      const re = new RegExp(pattern, findQuery.caseSensitive ? "g" : "gi");
+      return { re, sourceQuery };
     } catch {
-      return null;
+      return { re: null, sourceQuery };
     }
-  }, [findQuery]);
+  }, [findQuery, book]);
 
   // Stacked/columns scroll-to-match: BookView handles book mode internally.
   useEffect(() => {
@@ -323,6 +344,7 @@ export function ScriptureColumn({
           <FindReplaceOverlay
             open
             onClose={closeFind}
+            book={book}
             chapters={overlayChapters}
             chapterList={overlayChapterList}
             onLoadChapter={overlayLoadChapter}
@@ -343,7 +365,7 @@ export function ScriptureColumn({
             activeNoteQuote={activeNoteQuote}
             activeNoteOccurrence={activeNoteOccurrence}
             lexiconMap={lexiconMap}
-            findRe={compiledFindRe}
+            search={search}
             onSelectVerse={onSelectVerse}
             onOpenAligner={onOpenAligner}
             onEditVerse={onEditVerse}
@@ -383,7 +405,7 @@ export function ScriptureColumn({
                 activeNoteOccurrence={activeNoteOccurrence}
                 scrollNonce={scrollNonce}
                 lexiconMap={v === "UHB" ? lexiconMap : undefined}
-                findRe={compiledFindRe}
+                search={search}
                 onSelectVerse={onSelectVerse}
                 onEditVerse={(verseNum, plain, base) => onEditVerse(verseNum, v, plain, base)}
                 onOpenAligner={(verseNum) => onOpenAligner(verseNum, v)}
@@ -406,7 +428,7 @@ function StackedBody({
   activeNoteQuote,
   activeNoteOccurrence,
   lexiconMap,
-  findRe,
+  search,
   onSelectVerse,
   onOpenAligner,
   onEditVerse,
@@ -420,7 +442,7 @@ function StackedBody({
   activeNoteQuote: string | null;
   activeNoteOccurrence: number | null;
   lexiconMap: Map<string, LexiconEntry | null>;
-  findRe: RegExp | null;
+  search: SearchState | null;
   onSelectVerse: (v: number) => void;
   onOpenAligner: (verse: number, bibleVersion: string) => void;
   onEditVerse: (verseNum: number, bibleVersion: string, plain: string, base: VerseDto) => void;
@@ -481,7 +503,7 @@ function StackedBody({
                 text={ultV?.plain_text ?? ""}
                 content={ultV?.content}
                 highlights={ultHL}
-                findRe={findRe}
+                search={search}
                 editable
                 onOpenAligner={() => onOpenAligner(v, "ULT")}
                 onEditPlain={
@@ -495,7 +517,7 @@ function StackedBody({
                 text={ustV?.plain_text ?? ""}
                 content={ustV?.content}
                 highlights={ustHL}
-                findRe={findRe}
+                search={search}
                 editable
                 onOpenAligner={() => onOpenAligner(v, "UST")}
                 onEditPlain={
@@ -510,7 +532,7 @@ function StackedBody({
                   text={uhbV.plain_text ?? ""}
                   content={uhbV.content}
                   highlights={uhbHL}
-                  findRe={findRe}
+                  search={search}
                   rtl={isHebrew}
                   readOnly
                   lexiconMap={lexiconMap}
@@ -580,7 +602,7 @@ function StackedBody({
               data-find-cell={`${chapter}-${v}-ULT`}
               sx={{ gridColumn: 2, gridRow: 2, minWidth: 0 }}
             >
-              <FindAwareText text={ultV?.plain_text ?? ""} findRe={findRe} />
+              <FindAwareText text={ultV?.plain_text ?? ""} search={search} />
             </Box>
             {ustV && (
               <>
@@ -603,7 +625,7 @@ function StackedBody({
                   data-find-cell={`${chapter}-${v}-UST`}
                   sx={{ gridColumn: 2, gridRow: 3, minWidth: 0 }}
                 >
-                  <FindAwareText text={ustV.plain_text ?? ""} findRe={findRe} />
+                  <FindAwareText text={ustV.plain_text ?? ""} search={search} />
                 </Box>
               </>
             )}
@@ -621,7 +643,7 @@ function ActiveLine({
   text,
   content,
   highlights,
-  findRe,
+  search,
   rtl,
   readOnly,
   editable,
@@ -635,7 +657,7 @@ function ActiveLine({
   text: string;
   content?: unknown;
   highlights?: Set<HighlightKey>;
-  findRe?: RegExp | null;
+  search?: SearchState | null;
   rtl?: boolean;
   readOnly?: boolean;
   editable?: boolean;
@@ -643,6 +665,7 @@ function ActiveLine({
   onEditPlain?: (plain: string) => void;
   lexiconMap?: Map<string, LexiconEntry | null>;
 }) {
+  const isSource = label === "UHB" || label === "UGNT";
   const elRef = useRef<HTMLDivElement | null>(null);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Latest onEditPlain reachable from the timer/unmount paths without
@@ -666,13 +689,37 @@ function ActiveLine({
     return () => flushRef.current();
   }, []);
 
+  // Source-language token matches for this line. Only meaningful for UHB/
+  // UGNT lines in non-english find modes. Drives the offset painter (UGNT)
+  // and the HebrewLine findHighlights set (UHB).
+  const sourceHits = useMemo<SourceTokenMatch[] | null>(() => {
+    if (!isSource || !search || search.sourceQuery.kind === "english") return null;
+    const vo = (content as { verseObjects?: unknown[] } | null)?.verseObjects;
+    if (!Array.isArray(vo)) return null;
+    return matchSourceVerse(vo, search.sourceQuery);
+  }, [isSource, search, content]);
+
+  const findHighlights = useMemo<Set<HighlightKey> | null>(() => {
+    if (!sourceHits || sourceHits.length === 0) return null;
+    const set = new Set<HighlightKey>();
+    for (const h of sourceHits) set.add(`${h.text}|${h.occurrence}`);
+    return set;
+  }, [sourceHits]);
+
   // Find marks override note highlights while the overlay is active —
   // matches BookView's behaviour so users see search results cleanly.
   const findHTML = useMemo(() => {
-    if (!findRe || !text) return null;
-    const out = renderFindMatchesHTML(text, findRe);
+    if (!text) return null;
+    // Source-language query: ULT/UST cells stay clean; source cells use the
+    // offset painter (UHB renders via HebrewLine and ignores findHTML).
+    if (search && search.sourceQuery.kind !== "english") {
+      if (!isSource || !sourceHits || sourceHits.length === 0) return null;
+      return renderFindMatchesByOffsets(text, sourceHits);
+    }
+    if (!search?.re) return null;
+    const out = renderFindMatchesHTML(text, search.re);
     return out.includes("be-find") ? out : null;
-  }, [findRe, text]);
+  }, [search, sourceHits, text, isSource]);
 
   const noteHTML = useMemo(() => {
     if (findHTML) return null;
@@ -751,6 +798,7 @@ function ActiveLine({
             verseObjects={(content as { verseObjects?: unknown[] } | null)?.verseObjects}
             lexiconMap={lexiconMap}
             highlights={highlights}
+            findHighlights={findHighlights}
             fallbackText={text}
           />
         </Box>
@@ -825,12 +873,15 @@ function ActiveLine({
 // Render plain text with find-match marks for non-active stacked rows. We
 // use innerHTML when there are matches so the <mark> tags paint; otherwise
 // render the raw string so React handles escaping the normal way.
-function FindAwareText({ text, findRe }: { text: string; findRe: RegExp | null }) {
+function FindAwareText({ text, search }: { text: string; search: SearchState | null }) {
   const html = useMemo(() => {
-    if (!findRe || !text) return null;
-    const out = renderFindMatchesHTML(text, findRe);
+    if (!text || !search?.re) return null;
+    // Source-language queries don't match ULT/UST cells — return null so the
+    // non-active stacked rows stay clean.
+    if (search.sourceQuery.kind !== "english") return null;
+    const out = renderFindMatchesHTML(text, search.re);
     return out.includes("be-find") ? out : null;
-  }, [findRe, text]);
+  }, [search, text]);
   if (html === null) return <>{text}</>;
   return <span dangerouslySetInnerHTML={{ __html: html }} />;
 }

@@ -14,12 +14,15 @@ interface Props {
   verseObjects: unknown[] | undefined | null;
   lexiconMap: Map<string, LexiconEntry | null>;
   highlights?: Set<HighlightKey> | null;
+  // Find-overlay matches that should paint orange (be-find), overriding
+  // any yellow note highlight on the same token. Keyed `${text}|${occ}`.
+  findHighlights?: Set<HighlightKey> | null;
   // Used when the parent supplies a flat fallback string (e.g. when the
   // verseObjects tree is missing or invalid).
   fallbackText?: string;
 }
 
-export function HebrewLine({ verseObjects, lexiconMap, highlights, fallbackText }: Props) {
+export function HebrewLine({ verseObjects, lexiconMap, highlights, findHighlights, fallbackText }: Props) {
   if (!Array.isArray(verseObjects)) {
     return <>{fallbackText ?? ""}</>;
   }
@@ -36,7 +39,9 @@ export function HebrewLine({ verseObjects, lexiconMap, highlights, fallbackText 
         const text = String(o["text"] ?? "");
         const strong = String(o["strong"] ?? "");
         const occ = parseInt(String(o["occurrence"] ?? "1"), 10) || 1;
-        const isHighlighted = !!highlights && highlights.has(`${text}|${occ}`);
+        const key: HighlightKey = `${text}|${occ}`;
+        const isFindHit = !!findHighlights && findHighlights.has(key);
+        const isHighlighted = !!highlights && highlights.has(key);
         const src: SourceWord = {
           id: "",
           strong,
@@ -51,13 +56,20 @@ export function HebrewLine({ verseObjects, lexiconMap, highlights, fallbackText 
             component="span"
             sx={{
               cursor: "help",
-              ...(isHighlighted
+              ...(isFindHit
                 ? {
-                    backgroundColor: "#fff48a",
-                    padding: "0 2px",
+                    backgroundColor: "#ffd966",
+                    outline: "1px solid #d97706",
+                    padding: "0 1px",
                     borderRadius: 0.5,
                   }
-                : {}),
+                : isHighlighted
+                  ? {
+                      backgroundColor: "#fff48a",
+                      padding: "0 2px",
+                      borderRadius: 0.5,
+                    }
+                  : {}),
             }}
           >
             {text}

@@ -2,9 +2,20 @@ import { useEffect, useMemo, useRef } from "react";
 import { Box, Stack, Typography, IconButton, Tooltip } from "@mui/material";
 import LinkIcon from "@mui/icons-material/Link";
 import type { VerseDto } from "../sync/api";
-import { highlightsFor, renderHighlightedHTML } from "../lib/highlight";
+import { highlightsFor, renderHighlightedHTML, type HighlightKey } from "../lib/highlight";
 import { HebrewLine } from "./HebrewLine";
 import type { LexiconEntry } from "../hooks/useLexicon";
+import {
+  matchSourceVerse,
+  renderFindMatchesByOffsets,
+  type SourceQueryKind,
+  type SourceTokenMatch,
+} from "../lib/sourceSearch";
+
+interface SearchState {
+  re: RegExp | null;
+  sourceQuery: SourceQueryKind;
+}
 
 interface Props {
   bibleVersion: string;
@@ -22,10 +33,11 @@ interface Props {
   // Present only when this column is UHB — caller pre-loads the lexicon
   // and we render each \w with a hover tooltip.
   lexiconMap?: Map<string, LexiconEntry | null>;
-  // Active find regex from the overlay; paints <mark.be-find> on every
-  // match in this column. Note highlights step aside while a query is
-  // active to keep the search results visually clean.
-  findRe?: RegExp | null;
+  // Compiled find state from the overlay: English regex + classified source-
+  // language query. Paints <mark.be-find> on plain_text for English mode,
+  // and on token offsets / HebrewLine highlights for source-language mode.
+  // Note highlights step aside while a query is active.
+  search?: SearchState | null;
   onSelectVerse: (v: number) => void;
   onEditVerse: (verseNum: number, plain: string, base: VerseDto) => void;
   onOpenAligner: (verseNum: number) => void;
@@ -51,7 +63,7 @@ export function DocColumn({
   activeNoteOccurrence,
   scrollNonce,
   lexiconMap,
-  findRe,
+  search,
   onSelectVerse,
   onEditVerse,
   onOpenAligner,
@@ -151,7 +163,7 @@ export function DocColumn({
               readOnly={!!readOnly}
               rtl={!!rtl}
               lexiconMap={lexiconMap}
-              findRe={findRe ?? null}
+              search={search ?? null}
               spanRef={isActive ? activeRef : null}
               onClick={() => onSelectVerse(v)}
               onAlign={() => onOpenAligner(v)}
@@ -175,7 +187,7 @@ function VerseSpan({
   readOnly,
   rtl,
   lexiconMap,
-  findRe,
+  search,
   spanRef,
   onClick,
   onAlign,
@@ -191,12 +203,13 @@ function VerseSpan({
   readOnly: boolean;
   rtl: boolean;
   lexiconMap?: Map<string, LexiconEntry | null>;
-  findRe: RegExp | null;
+  search: SearchState | null;
   spanRef: React.MutableRefObject<HTMLSpanElement | null> | null;
   onClick: () => void;
   onAlign: () => void;
   onEdit: (plain: string) => void;
 }) {
+  const isSource = bibleVersion === "UHB" || bibleVersion === "UGNT";
   const elRef = useRef<HTMLSpanElement | null>(null);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lastTextRef = useRef(text);
@@ -217,12 +230,36 @@ function VerseSpan({
     };
   }, []);
 
+  // Source-language token hits for this verse (only meaningful for UHB/UGNT
+  // in non-english find modes). Drives the offset painter for UGNT and the
+  // HebrewLine findHighlights set for UHB.
+  const sourceHits = useMemo<SourceTokenMatch[] | null>(() => {
+    if (!isSource || !search || search.sourceQuery.kind === "english") return null;
+    const vo = (content as { verseObjects?: unknown[] } | null)?.verseObjects;
+    if (!Array.isArray(vo)) return null;
+    return matchSourceVerse(vo, search.sourceQuery);
+  }, [isSource, search, content]);
+
+  const findHighlights = useMemo<Set<HighlightKey> | null>(() => {
+    if (!sourceHits || sourceHits.length === 0) return null;
+    const set = new Set<HighlightKey>();
+    for (const h of sourceHits) set.add(`${h.text}|${h.occurrence}`);
+    return set;
+  }, [sourceHits]);
+
   // Find marks override note highlights — same precedence as BookView.
   const findHTML = useMemo(() => {
-    if (!findRe || !text) return null;
-    const out = renderFindMatchesHTML(text, findRe);
+    if (!text) return null;
+    // Source-language query: ULT/UST stay clean; UGNT uses offset painter
+    // (UHB renders via HebrewLine and ignores findHTML).
+    if (search && search.sourceQuery.kind !== "english") {
+      if (!isSource || !sourceHits || sourceHits.length === 0) return null;
+      return renderFindMatchesByOffsets(text, sourceHits);
+    }
+    if (!search?.re) return null;
+    const out = renderFindMatchesHTML(text, search.re);
     return out.includes("be-find") ? out : null;
-  }, [findRe, text]);
+  }, [search, sourceHits, text, isSource]);
 
   const html = useMemo(() => {
     if (findHTML) return findHTML;
@@ -312,6 +349,7 @@ function VerseSpan({
             verseObjects={(content as { verseObjects?: unknown[] } | null)?.verseObjects}
             lexiconMap={lexiconMap}
             highlights={highlights ?? undefined}
+            findHighlights={findHighlights}
             fallbackText={text}
           />
         </span>

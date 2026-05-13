@@ -25,6 +25,13 @@ import ArrowDownwardIcon from "@mui/icons-material/ArrowDownward";
 import type { ChapterState } from "../hooks/useBook";
 import type { VerseDto } from "../sync/api";
 import { smartReplaceVerse } from "../lib/replace";
+import {
+  classifySourceQuery,
+  describeSourceMode,
+  isBareNumberQuery,
+  matchSourceVerse,
+  type SourceQueryKind,
+} from "../lib/sourceSearch";
 
 // UHB / UGNT are upstream source texts — the worker returns 403 on PATCH.
 // Filtering replace matches here keeps the outbox from queueing ops that
@@ -43,6 +50,9 @@ export interface FindMatch {
 interface Props {
   open: boolean;
   onClose: () => void;
+  // Active book code (e.g. "ZEC" / "MAT"). Used to disambiguate bare
+  // Strong's queries — "559" in an OT book → H559, in an NT book → G559.
+  book: string;
   chapters: Map<number, ChapterState>;
   chapterList: number[];
   onLoadChapter: (ch: number) => void;
@@ -65,12 +75,15 @@ interface Props {
   onScrollToMatch: (match: FindMatch | null) => void;
   // Lift the query state up so VerseCell can paint inline marks alongside the
   // existing note-quote highlights.
-  onQueryChange: (query: { find: string; regex: boolean; caseSensitive: boolean } | null) => void;
+  onQueryChange: (
+    query: { find: string; regex: boolean; caseSensitive: boolean; strongs: boolean } | null,
+  ) => void;
 }
 
 export function FindReplaceOverlay({
   open,
   onClose,
+  book,
   chapters,
   chapterList,
   onLoadChapter,
@@ -83,7 +96,12 @@ export function FindReplaceOverlay({
   const [replace, setReplace] = useState("");
   const [regex, setRegex] = useState(false);
   const [caseSensitive, setCaseSensitive] = useState(false);
+  // Opt-in: interpret bare-digit queries as Strong's numbers. Off by default
+  // because bible text has lots of numbers ("eighth month", "1:1") and the
+  // user would expect those to hit. Toggle only appears when relevant.
+  const [strongs, setStrongs] = useState(false);
   const [activeIdx, setActiveIdx] = useState(0);
+  const showStrongsToggle = isBareNumberQuery(find) && !regex;
   const findInputRef = useRef<HTMLInputElement | null>(null);
   const replaceInputRef = useRef<HTMLInputElement | null>(null);
   // Set right before any user action that should pull the active match
@@ -110,16 +128,24 @@ export function FindReplaceOverlay({
       return;
     }
     wantsScrollRef.current = true;
-    onQueryChange({ find, regex, caseSensitive });
-  }, [open, find, regex, caseSensitive, onQueryChange]);
+    onQueryChange({ find, regex, caseSensitive, strongs });
+  }, [open, find, regex, caseSensitive, strongs, onQueryChange]);
 
   const compiled = useMemo(() => buildSearchRegex(find, regex, caseSensitive), [find, regex, caseSensitive]);
   const regexInvalid = !!find && compiled.error;
+  // In regex mode the user wants a literal JS regex against plain_text — skip
+  // source-language classification so a Hebrew query in regex mode goes through
+  // the existing path unmodified.
+  const sourceQuery = useMemo<SourceQueryKind>(
+    () => (regex ? { kind: "english" } : classifySourceQuery(find, book, strongs)),
+    [find, regex, book, strongs],
+  );
 
   const matches = useMemo<FindMatch[]>(() => {
-    if (!open || !compiled.re) return [];
-    return collectMatches(chapters, enabledVersions, compiled.re);
-  }, [open, compiled.re, chapters, enabledVersions]);
+    if (!open) return [];
+    if (sourceQuery.kind === "english" && !compiled.re) return [];
+    return collectMatches(chapters, enabledVersions, compiled.re, sourceQuery);
+  }, [open, compiled.re, sourceQuery, chapters, enabledVersions]);
 
   // Clamp activeIdx whenever the match list reshapes. Only fire
   // onScrollToMatch if a user action flagged that they want the scroll —
@@ -298,8 +324,14 @@ export function FindReplaceOverlay({
           size="small"
           placeholder="find"
           error={regexInvalid}
-          helperText={regexInvalid ? "invalid regex" : undefined}
-          sx={{ minWidth: 240, "& .MuiFormHelperText-root": { m: 0, lineHeight: 1.2 } }}
+          helperText={
+            regexInvalid
+              ? "invalid regex"
+              : sourceQuery.kind !== "english"
+                ? describeSourceMode(sourceQuery)
+                : undefined
+          }
+          sx={{ minWidth: 240, "& .MuiFormHelperText-root": { m: 0, lineHeight: 1.2, fontFamily: "monospace", fontSize: 11 } }}
           inputProps={{ style: { fontFamily: "monospace", fontSize: 13 } }}
         />
         <Tooltip title="use the input as a JavaScript regex">
@@ -324,6 +356,19 @@ export function FindReplaceOverlay({
             Aa
           </ToggleButton>
         </Tooltip>
+        {showStrongsToggle && (
+          <Tooltip title="treat this number as a Strong's number — search Hebrew/Greek tokens instead of bible text">
+            <ToggleButton
+              value="strongs"
+              size="small"
+              selected={strongs}
+              onChange={() => setStrongs((s) => !s)}
+              sx={{ px: 1, fontFamily: "monospace", fontSize: 12, textTransform: "none" }}
+            >
+              H#
+            </ToggleButton>
+          </Tooltip>
+        )}
         <Typography
           variant="caption"
           sx={{ fontFamily: "monospace", minWidth: 72, textAlign: "center", color: "text.secondary" }}
@@ -464,21 +509,48 @@ function buildSearchRegex(
 function collectMatches(
   chapters: Map<number, ChapterState>,
   enabledVersions: string[],
-  re: RegExp,
+  re: RegExp | null,
+  sourceQuery: SourceQueryKind,
 ): FindMatch[] {
   const out: FindMatch[] = [];
+  const sourceMode = sourceQuery.kind !== "english";
+  // In source mode we want to search UHB/UGNT even if the user hasn't
+  // ticked them in the version toggles (in stacked mode they aren't toggle-
+  // able at all, but the active verse's source row is still shown).
+  const versionsToScan = sourceMode
+    ? Array.from(new Set([...enabledVersions, "UHB", "UGNT"]))
+    : enabledVersions;
   const chList = [...chapters.keys()].sort((a, b) => a - b);
   for (const ch of chList) {
     const state = chapters.get(ch);
     if (!state || state.kind !== "ready") continue;
-    for (const bv of enabledVersions) {
+    for (const bv of versionsToScan) {
       const byVerse = state.data.verses[bv];
       if (!byVerse) continue;
-      const verseNums = Object.keys(byVerse)
-        .map(Number)
-        .sort((a, b) => a - b);
+      const isSource = bv === "UHB" || bv === "UGNT";
+      // Source-language query: only run on UHB/UGNT, skip ULT/UST entirely.
+      // English query: run regex on every version's plain_text as before.
+      if (sourceMode && !isSource) continue;
+      const verseNums = Object.keys(byVerse).map(Number).sort((a, b) => a - b);
       for (const v of verseNums) {
-        const text = byVerse[v].plain_text ?? "";
+        const dto = byVerse[v];
+        if (sourceMode && isSource) {
+          const vo = (dto.content as { verseObjects?: unknown[] } | null)?.verseObjects;
+          if (!Array.isArray(vo)) continue;
+          for (const m of matchSourceVerse(vo, sourceQuery as Exclude<SourceQueryKind, { kind: "english" }>)) {
+            out.push({
+              chapter: ch,
+              verse: v,
+              bibleVersion: bv,
+              startIndex: m.start,
+              endIndex: m.end,
+              matchText: m.text,
+            });
+          }
+          continue;
+        }
+        if (!re) continue;
+        const text = dto.plain_text ?? "";
         if (!text) continue;
         // Use a fresh regex per verse so lastIndex doesn't bleed.
         const localRe = new RegExp(re.source, re.flags);
