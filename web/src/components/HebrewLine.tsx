@@ -17,12 +17,16 @@ interface Props {
   // Find-overlay matches that should paint orange (be-find), overriding
   // any yellow note highlight on the same token. Keyed `${text}|${occ}`.
   findHighlights?: Set<HighlightKey> | null;
+  // The single active match in this verse (the one the user is currently
+  // navigated to via prev/next). Painted with a stronger color than the
+  // other find hits so the user can see which one is "selected".
+  activeFindKey?: HighlightKey | null;
   // Used when the parent supplies a flat fallback string (e.g. when the
   // verseObjects tree is missing or invalid).
   fallbackText?: string;
 }
 
-export function HebrewLine({ verseObjects, lexiconMap, highlights, findHighlights, fallbackText }: Props) {
+export function HebrewLine({ verseObjects, lexiconMap, highlights, findHighlights, activeFindKey, fallbackText }: Props) {
   if (!Array.isArray(verseObjects)) {
     return <>{fallbackText ?? ""}</>;
   }
@@ -41,6 +45,7 @@ export function HebrewLine({ verseObjects, lexiconMap, highlights, findHighlight
         const occ = parseInt(String(o["occurrence"] ?? "1"), 10) || 1;
         const key: HighlightKey = `${text}|${occ}`;
         const isFindHit = !!findHighlights && findHighlights.has(key);
+        const isActiveFind = !!activeFindKey && activeFindKey === key;
         const isHighlighted = !!highlights && highlights.has(key);
         const src: SourceWord = {
           id: "",
@@ -56,20 +61,27 @@ export function HebrewLine({ verseObjects, lexiconMap, highlights, findHighlight
             component="span"
             sx={{
               cursor: "help",
-              ...(isFindHit
+              ...(isActiveFind
                 ? {
-                    backgroundColor: "#ffd966",
-                    outline: "1px solid #d97706",
+                    backgroundColor: "#fb923c",
+                    outline: "2px solid #c2410c",
                     padding: "0 1px",
                     borderRadius: 0.5,
                   }
-                : isHighlighted
+                : isFindHit
                   ? {
-                      backgroundColor: "#fff48a",
-                      padding: "0 2px",
+                      backgroundColor: "#ffd966",
+                      outline: "1px solid #d97706",
+                      padding: "0 1px",
                       borderRadius: 0.5,
                     }
-                  : {}),
+                  : isHighlighted
+                    ? {
+                        backgroundColor: "#fff48a",
+                        padding: "0 2px",
+                        borderRadius: 0.5,
+                      }
+                    : {}),
             }}
           >
             {text}

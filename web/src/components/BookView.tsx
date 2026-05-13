@@ -160,6 +160,10 @@ export function BookView({
             borderRadius: 0.5,
             color: "inherit",
           },
+          "& mark.be-find-active": {
+            backgroundColor: "#fb923c",
+            outline: "2px solid #c2410c",
+          },
         }}
       >
         <Box sx={{ display: "grid", gridTemplateColumns, gap: 1, px: 1.5, py: 1 }}>
@@ -177,6 +181,7 @@ export function BookView({
               activeNoteOccurrence={activeNoteOccurrence}
               activeRowRef={activeRowRef}
               search={search}
+              findActiveMatch={findActiveMatch}
               lexiconMap={lexiconMap}
               onLoadChapter={onLoadChapter}
               onSelectVerse={onSelectVerse}
@@ -208,6 +213,7 @@ function ChapterBlock({
   activeNoteOccurrence,
   activeRowRef,
   search,
+  findActiveMatch,
   lexiconMap,
   onLoadChapter,
   onSelectVerse,
@@ -225,6 +231,7 @@ function ChapterBlock({
   activeNoteOccurrence: number | null;
   activeRowRef: React.MutableRefObject<HTMLDivElement | null>;
   search: SearchState | null;
+  findActiveMatch: FindMatch | null;
   lexiconMap: Map<string, LexiconEntry | null>;
   onLoadChapter: (ch: number) => void;
   onSelectVerse: (chapter: number, verse: number) => void;
@@ -352,6 +359,7 @@ function ChapterBlock({
             activeNoteOccurrence={isActive ? activeNoteOccurrence : null}
             rowRef={isActive ? activeRowRef : null}
             search={search}
+            findActiveMatch={findActiveMatch}
             lexiconMap={lexiconMap}
             onSelectVerse={() => onSelectVerse(chapter, v)}
             onEditVerse={(bv, plain, base) => onEditVerse(chapter, v, bv, plain, base)}
@@ -374,6 +382,7 @@ function VerseRow({
   activeNoteOccurrence,
   rowRef,
   search,
+  findActiveMatch,
   lexiconMap,
   onSelectVerse,
   onEditVerse,
@@ -389,6 +398,7 @@ function VerseRow({
   activeNoteOccurrence: number | null;
   rowRef: React.MutableRefObject<HTMLDivElement | null> | null;
   search: SearchState | null;
+  findActiveMatch: FindMatch | null;
   lexiconMap: Map<string, LexiconEntry | null>;
   onSelectVerse: () => void;
   onEditVerse: (bv: string, plain: string, base: VerseDto) => void;
@@ -423,6 +433,7 @@ function VerseRow({
               activeNoteQuote={activeNoteQuote}
               activeNoteOccurrence={activeNoteOccurrence}
               search={search}
+              findActiveMatch={findActiveMatch}
               lexiconMap={lexiconMap}
               onAlign={() => onOpenAligner(bv)}
               onEdit={(plain) => dto && onEditVerse(bv, plain, dto)}
@@ -443,6 +454,7 @@ function VerseCell({
   activeNoteQuote,
   activeNoteOccurrence,
   search,
+  findActiveMatch,
   lexiconMap,
   onAlign,
   onEdit,
@@ -455,6 +467,7 @@ function VerseCell({
   activeNoteQuote: string | null;
   activeNoteOccurrence: number | null;
   search: SearchState | null;
+  findActiveMatch: FindMatch | null;
   lexiconMap: Map<string, LexiconEntry | null>;
   onAlign: () => void;
   onEdit: (plain: string) => void;
@@ -462,6 +475,14 @@ function VerseCell({
   const readOnly = READ_ONLY.has(bibleVersion);
   const rtl = bibleVersion === "UHB";
   const isSource = bibleVersion === "UHB" || bibleVersion === "UGNT";
+  // The active match is at most one cell; this is non-null only on that cell.
+  const activeRange = useMemo<{ start: number; end: number } | null>(() => {
+    if (!findActiveMatch) return null;
+    if (findActiveMatch.chapter !== chapter) return null;
+    if (findActiveMatch.verse !== verseNum) return null;
+    if (findActiveMatch.bibleVersion !== bibleVersion) return null;
+    return { start: findActiveMatch.startIndex, end: findActiveMatch.endIndex };
+  }, [findActiveMatch, chapter, verseNum, bibleVersion]);
   const elRef = useRef<HTMLSpanElement | null>(null);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lastTextRef = useRef(dto?.plain_text ?? "");
@@ -484,6 +505,14 @@ function VerseCell({
     return set;
   }, [sourceHits]);
 
+  // For the UHB HebrewLine path: which token corresponds to the active
+  // match (so it can paint with the stronger be-find-active style).
+  const activeFindKey = useMemo<HighlightKey | null>(() => {
+    if (!activeRange || !sourceHits) return null;
+    const hit = sourceHits.find((h) => h.start === activeRange.start && h.end === activeRange.end);
+    return hit ? `${hit.text}|${hit.occurrence}` : null;
+  }, [activeRange, sourceHits]);
+
   // Find marks override note highlights while the overlay is open — fewer
   // visual layers, easier to scan results. Note highlights resume when the
   // overlay closes.
@@ -493,13 +522,13 @@ function VerseCell({
     // painter (UHB renders via HebrewLine, ignoring findHTML).
     if (search && search.sourceQuery.kind !== "english") {
       if (!isSource || !sourceHits || sourceHits.length === 0) return null;
-      return renderFindMatchesByOffsets(dto.plain_text, sourceHits);
+      return renderFindMatchesByOffsets(dto.plain_text, sourceHits, activeRange);
     }
     // English / regex path — unchanged.
     if (!search?.re) return null;
-    const html = renderFindMatchesHTML(dto.plain_text, search.re);
+    const html = renderFindMatchesHTML(dto.plain_text, search.re, activeRange);
     return html.includes("be-find") ? html : null;
-  }, [search, sourceHits, dto?.plain_text, isSource]);
+  }, [search, sourceHits, dto?.plain_text, isSource, activeRange]);
 
   const highlights = useMemo<Set<HighlightKey> | null>(() => {
     if (findHTML) return null;
@@ -584,6 +613,7 @@ function VerseCell({
             verseObjects={(dto.content as { verseObjects?: unknown[] } | null)?.verseObjects}
             lexiconMap={lexiconMap}
             findHighlights={findHighlights}
+            activeFindKey={activeFindKey}
             fallbackText={dto.plain_text ?? ""}
           />
         </span>
@@ -621,14 +651,20 @@ function VerseCell({
   );
 }
 
-function renderFindMatchesHTML(plainText: string, re: RegExp): string {
+function renderFindMatchesHTML(
+  plainText: string,
+  re: RegExp,
+  activeRange?: { start: number; end: number } | null,
+): string {
   let html = "";
   let lastIdx = 0;
   let m: RegExpExecArray | null;
   const local = new RegExp(re.source, re.flags);
   while ((m = local.exec(plainText)) !== null) {
+    const isActive = !!activeRange && m.index === activeRange.start && m.index + m[0].length === activeRange.end;
+    const cls = isActive ? "be-find be-find-active" : "be-find";
     html += escapeHtml(plainText.slice(lastIdx, m.index));
-    html += `<mark class="be-find">${escapeHtml(m[0])}</mark>`;
+    html += `<mark class="${cls}">${escapeHtml(m[0])}</mark>`;
     lastIdx = m.index + m[0].length;
     if (m[0].length === 0) local.lastIndex++;
   }

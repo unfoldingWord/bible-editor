@@ -197,13 +197,20 @@ export function ScriptureColumn({
   }, [findQuery, book]);
 
   // Stacked/columns scroll-to-match: BookView handles book mode internally.
+  // In stacked mode also promote the match verse to "active" so its full card
+  // expands (otherwise non-active rows collapse to a one-line grid). The
+  // active-verse useEffect below handles the scroll once expansion lands.
   useEffect(() => {
     if (!findScrollTarget || mode === "book") return;
     if (findScrollTarget.chapter !== chapter) return;
+    if (mode === "stacked" && findScrollTarget.verse !== activeVerse) {
+      onSelectVerse(findScrollTarget.verse);
+      return;
+    }
     const sel = `[data-find-cell="${findScrollTarget.chapter}-${findScrollTarget.verse}-${findScrollTarget.bibleVersion}"]`;
     const el = bodyRef.current?.querySelector<HTMLElement>(sel);
     el?.scrollIntoView({ behavior: "smooth", block: "center" });
-  }, [findScrollTarget, mode, chapter]);
+  }, [findScrollTarget, mode, chapter, activeVerse, onSelectVerse]);
 
   useEffect(() => {
     if (mode === "stacked") {
@@ -366,6 +373,7 @@ export function ScriptureColumn({
             activeNoteOccurrence={activeNoteOccurrence}
             lexiconMap={lexiconMap}
             search={search}
+            findActiveMatch={findScrollTarget}
             onSelectVerse={onSelectVerse}
             onOpenAligner={onOpenAligner}
             onEditVerse={onEditVerse}
@@ -406,6 +414,7 @@ export function ScriptureColumn({
                 scrollNonce={scrollNonce}
                 lexiconMap={v === "UHB" ? lexiconMap : undefined}
                 search={search}
+                findActiveMatch={findScrollTarget}
                 onSelectVerse={onSelectVerse}
                 onEditVerse={(verseNum, plain, base) => onEditVerse(verseNum, v, plain, base)}
                 onOpenAligner={(verseNum) => onOpenAligner(verseNum, v)}
@@ -429,6 +438,7 @@ function StackedBody({
   activeNoteOccurrence,
   lexiconMap,
   search,
+  findActiveMatch,
   onSelectVerse,
   onOpenAligner,
   onEditVerse,
@@ -443,6 +453,7 @@ function StackedBody({
   activeNoteOccurrence: number | null;
   lexiconMap: Map<string, LexiconEntry | null>;
   search: SearchState | null;
+  findActiveMatch: FindMatch | null;
   onSelectVerse: (v: number) => void;
   onOpenAligner: (verse: number, bibleVersion: string) => void;
   onEditVerse: (verseNum: number, bibleVersion: string, plain: string, base: VerseDto) => void;
@@ -464,6 +475,10 @@ function StackedBody({
           padding: "0 1px",
           borderRadius: 0.5,
           color: "inherit",
+        },
+        "& mark.be-find-active": {
+          backgroundColor: "#fb923c",
+          outline: "2px solid #c2410c",
         },
       }}
     >
@@ -504,6 +519,7 @@ function StackedBody({
                 content={ultV?.content}
                 highlights={ultHL}
                 search={search}
+                findActiveMatch={findActiveMatch}
                 editable
                 onOpenAligner={() => onOpenAligner(v, "ULT")}
                 onEditPlain={
@@ -518,6 +534,7 @@ function StackedBody({
                 content={ustV?.content}
                 highlights={ustHL}
                 search={search}
+                findActiveMatch={findActiveMatch}
                 editable
                 onOpenAligner={() => onOpenAligner(v, "UST")}
                 onEditPlain={
@@ -533,6 +550,7 @@ function StackedBody({
                   content={uhbV.content}
                   highlights={uhbHL}
                   search={search}
+                  findActiveMatch={findActiveMatch}
                   rtl={isHebrew}
                   readOnly
                   lexiconMap={lexiconMap}
@@ -602,7 +620,18 @@ function StackedBody({
               data-find-cell={`${chapter}-${v}-ULT`}
               sx={{ gridColumn: 2, gridRow: 2, minWidth: 0 }}
             >
-              <FindAwareText text={ultV?.plain_text ?? ""} search={search} />
+              <FindAwareText
+                text={ultV?.plain_text ?? ""}
+                search={search}
+                activeRange={
+                  findActiveMatch &&
+                  findActiveMatch.chapter === chapter &&
+                  findActiveMatch.verse === v &&
+                  findActiveMatch.bibleVersion === "ULT"
+                    ? { start: findActiveMatch.startIndex, end: findActiveMatch.endIndex }
+                    : null
+                }
+              />
             </Box>
             {ustV && (
               <>
@@ -625,7 +654,18 @@ function StackedBody({
                   data-find-cell={`${chapter}-${v}-UST`}
                   sx={{ gridColumn: 2, gridRow: 3, minWidth: 0 }}
                 >
-                  <FindAwareText text={ustV.plain_text ?? ""} search={search} />
+                  <FindAwareText
+                    text={ustV.plain_text ?? ""}
+                    search={search}
+                    activeRange={
+                      findActiveMatch &&
+                      findActiveMatch.chapter === chapter &&
+                      findActiveMatch.verse === v &&
+                      findActiveMatch.bibleVersion === "UST"
+                        ? { start: findActiveMatch.startIndex, end: findActiveMatch.endIndex }
+                        : null
+                    }
+                  />
                 </Box>
               </>
             )}
@@ -644,6 +684,7 @@ function ActiveLine({
   content,
   highlights,
   search,
+  findActiveMatch,
   rtl,
   readOnly,
   editable,
@@ -658,6 +699,7 @@ function ActiveLine({
   content?: unknown;
   highlights?: Set<HighlightKey>;
   search?: SearchState | null;
+  findActiveMatch?: FindMatch | null;
   rtl?: boolean;
   readOnly?: boolean;
   editable?: boolean;
@@ -666,6 +708,13 @@ function ActiveLine({
   lexiconMap?: Map<string, LexiconEntry | null>;
 }) {
   const isSource = label === "UHB" || label === "UGNT";
+  const activeRange = useMemo<{ start: number; end: number } | null>(() => {
+    if (!findActiveMatch) return null;
+    if (findActiveMatch.chapter !== chapter) return null;
+    if (findActiveMatch.verse !== verseNum) return null;
+    if (findActiveMatch.bibleVersion !== label) return null;
+    return { start: findActiveMatch.startIndex, end: findActiveMatch.endIndex };
+  }, [findActiveMatch, chapter, verseNum, label]);
   const elRef = useRef<HTMLDivElement | null>(null);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Latest onEditPlain reachable from the timer/unmount paths without
@@ -706,6 +755,12 @@ function ActiveLine({
     return set;
   }, [sourceHits]);
 
+  const activeFindKey = useMemo<HighlightKey | null>(() => {
+    if (!activeRange || !sourceHits) return null;
+    const hit = sourceHits.find((h) => h.start === activeRange.start && h.end === activeRange.end);
+    return hit ? `${hit.text}|${hit.occurrence}` : null;
+  }, [activeRange, sourceHits]);
+
   // Find marks override note highlights while the overlay is active —
   // matches BookView's behaviour so users see search results cleanly.
   const findHTML = useMemo(() => {
@@ -714,12 +769,12 @@ function ActiveLine({
     // offset painter (UHB renders via HebrewLine and ignores findHTML).
     if (search && search.sourceQuery.kind !== "english") {
       if (!isSource || !sourceHits || sourceHits.length === 0) return null;
-      return renderFindMatchesByOffsets(text, sourceHits);
+      return renderFindMatchesByOffsets(text, sourceHits, activeRange);
     }
     if (!search?.re) return null;
-    const out = renderFindMatchesHTML(text, search.re);
+    const out = renderFindMatchesHTML(text, search.re, activeRange);
     return out.includes("be-find") ? out : null;
-  }, [search, sourceHits, text, isSource]);
+  }, [search, sourceHits, text, isSource, activeRange]);
 
   const noteHTML = useMemo(() => {
     if (findHTML) return null;
@@ -799,6 +854,7 @@ function ActiveLine({
             lexiconMap={lexiconMap}
             highlights={highlights}
             findHighlights={findHighlights}
+            activeFindKey={activeFindKey}
             fallbackText={text}
           />
         </Box>
@@ -857,6 +913,10 @@ function ActiveLine({
               borderRadius: 0.5,
               color: "inherit",
             },
+            "& mark.be-find-active": {
+              backgroundColor: "#fb923c",
+              outline: "2px solid #c2410c",
+            },
             "&:focus": readOnly
               ? {}
               : {
@@ -873,27 +933,41 @@ function ActiveLine({
 // Render plain text with find-match marks for non-active stacked rows. We
 // use innerHTML when there are matches so the <mark> tags paint; otherwise
 // render the raw string so React handles escaping the normal way.
-function FindAwareText({ text, search }: { text: string; search: SearchState | null }) {
+function FindAwareText({
+  text,
+  search,
+  activeRange,
+}: {
+  text: string;
+  search: SearchState | null;
+  activeRange?: { start: number; end: number } | null;
+}) {
   const html = useMemo(() => {
     if (!text || !search?.re) return null;
     // Source-language queries don't match ULT/UST cells — return null so the
     // non-active stacked rows stay clean.
     if (search.sourceQuery.kind !== "english") return null;
-    const out = renderFindMatchesHTML(text, search.re);
+    const out = renderFindMatchesHTML(text, search.re, activeRange);
     return out.includes("be-find") ? out : null;
-  }, [search, text]);
+  }, [search, text, activeRange]);
   if (html === null) return <>{text}</>;
   return <span dangerouslySetInnerHTML={{ __html: html }} />;
 }
 
-function renderFindMatchesHTML(plainText: string, re: RegExp): string {
+function renderFindMatchesHTML(
+  plainText: string,
+  re: RegExp,
+  activeRange?: { start: number; end: number } | null,
+): string {
   let html = "";
   let lastIdx = 0;
   let m: RegExpExecArray | null;
   const local = new RegExp(re.source, re.flags);
   while ((m = local.exec(plainText)) !== null) {
+    const isActive = !!activeRange && m.index === activeRange.start && m.index + m[0].length === activeRange.end;
+    const cls = isActive ? "be-find be-find-active" : "be-find";
     html += escapeHtml(plainText.slice(lastIdx, m.index));
-    html += `<mark class="be-find">${escapeHtml(m[0])}</mark>`;
+    html += `<mark class="${cls}">${escapeHtml(m[0])}</mark>`;
     lastIdx = m.index + m[0].length;
     if (m[0].length === 0) local.lastIndex++;
   }
