@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import {
   Stack,
   Typography,
@@ -12,14 +12,16 @@ import {
 import NavigateBeforeIcon from "@mui/icons-material/NavigateBefore";
 import NavigateNextIcon from "@mui/icons-material/NavigateNext";
 import { api, type BookListEntry, type BookSummary } from "../sync/api";
+import { SyncStatusBar } from "./SyncStatusBar";
 
 interface Props {
   book: string;
   chapter: number;
   onNavigate: (book: string, chapter: number) => void;
+  pipelineMenu?: ReactNode;
 }
 
-export function TopBar({ book, chapter, onNavigate }: Props) {
+export function TopBar({ book, chapter, onNavigate, pipelineMenu }: Props) {
   const [books, setBooks] = useState<BookListEntry[]>([]);
   const [summary, setSummary] = useState<BookSummary | null>(null);
 
@@ -120,6 +122,8 @@ export function TopBar({ book, chapter, onNavigate }: Props) {
       <Typography variant="caption" color="text.secondary">
         {summary?.chapters && `${summary.chapters.reduce((a, c) => a + c.tn, 0)} notes · ${summary.chapters.reduce((a, c) => a + c.twl, 0)} words · ${summary.chapters.reduce((a, c) => a + c.tq, 0)} questions`}
       </Typography>
+      <SyncStatusBar />
+      {pipelineMenu}
     </Stack>
   );
 }

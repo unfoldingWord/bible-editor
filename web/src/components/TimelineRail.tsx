@@ -31,22 +31,6 @@ export function TimelineRail({ book, chapter, tiles, activeVerse, onSelect, onTo
         py: 0.5,
       }}
     >
-      <Box
-        sx={{
-          fontFamily: "monospace",
-          fontSize: 10,
-          color: "text.secondary",
-          textAlign: "center",
-          pb: 0.5,
-          mb: 0.5,
-          borderBottom: "1px dashed",
-          borderColor: "divider",
-        }}
-      >
-        {book}
-        <br />
-        {chapter}
-      </Box>
       {tiles.map((t) => {
         const active = t.verse === activeVerse;
         return (

@@ -33,13 +33,13 @@ export function SyncStatusBar() {
   const idle = pending === 0 && conflicts.length === 0 && failed.length === 0;
   if (idle) {
     return (
-      <Tooltip title="all edits saved" placement="left">
+      <Tooltip title="all edits saved" placement="bottom">
         <Chip
           icon={<CloudDoneIcon />}
           label="synced"
           size="small"
           variant="outlined"
-          sx={{ position: "fixed", right: 12, bottom: 12, opacity: 0.5, "&:hover": { opacity: 1 } }}
+          sx={{ opacity: 0.5, "&:hover": { opacity: 1 } }}
         />
       </Tooltip>
     );
