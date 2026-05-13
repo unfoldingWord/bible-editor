@@ -13,6 +13,7 @@ import { ScriptureColumn, type ScriptureMode } from "./ScriptureColumn";
 import { ResourceColumn } from "./ResourceColumn";
 import { AlignmentDialog } from "./AlignmentDialog";
 import { TopBar } from "./TopBar";
+import { SyncStatusBar } from "./SyncStatusBar";
 import { collectStrongs } from "./HebrewLine";
 
 interface AlignerTarget {
@@ -59,7 +60,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook }:
     applyLocalRowDelete,
     applyLocalRowInsert,
     applyLocalVerse,
-    refetch,
+    applyLocalVerseStatus,
   } = useChapter(book, chapter);
   const [activeVerse, setActiveVerse] = useState(initialVerse);
   const [activeNoteId, setActiveNoteId] = useState<string | null>(null);
@@ -241,9 +242,17 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook }:
           tiles={tileSet}
           activeVerse={activeVerse}
           onSelect={setActiveVerse}
-          onToggleDone={async (v, done) => {
-            await api.setVerseDone(book, chapter, v, done);
-            await refetch();
+          onToggleDone={(v, done) => {
+            // Through the outbox so an offline toggle isn't dropped. The
+            // payload is coalesced per (book, chapter, verse) so a rapid
+            // click-click only ships the final state.
+            void outbox.enqueueVerseStatus(book, chapter, v, done);
+            // Optimistic local update — useChapter would also reconcile on
+            // the outbox "ok" callback once that handler covers
+            // verse_status (currently it only mirrors row + verse). For
+            // now, refetching when the queue settles keeps the rail in
+            // step without a re-render race.
+            applyLocalVerseStatus(v, done);
           }}
         />
         <ScriptureColumn
@@ -523,6 +532,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook }:
           />
         );
       })()}
+      <SyncStatusBar />
     </Box>
   );
 }

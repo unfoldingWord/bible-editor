@@ -12,6 +12,7 @@ import {
   type TqRow,
   type TwlRow,
   type VerseDto,
+  type VerseStatus,
 } from "../sync/api";
 import { onOutboxResult } from "../sync/outbox";
 
@@ -31,6 +32,7 @@ export interface UseChapterReturn {
     position?: { afterId?: string },
   ) => void;
   applyLocalVerse: (verse: VerseDto) => void;
+  applyLocalVerseStatus: (verse: number, done: boolean) => void;
 }
 
 export function useChapter(book: string, chapter: number): UseChapterReturn {
@@ -139,6 +141,27 @@ export function useChapter(book: string, chapter: number): UseChapterReturn {
     [],
   );
 
+  const applyLocalVerseStatus = useCallback<UseChapterReturn["applyLocalVerseStatus"]>(
+    (verse, done) => {
+      setData((prev) => {
+        if (!prev) return prev;
+        const existing = prev.verseStatuses.find((s) => s.verse === verse);
+        const updated: VerseStatus = {
+          book: prev.book,
+          chapter: prev.chapter,
+          verse,
+          done: done ? 1 : 0,
+          updated_at: Math.floor(Date.now() / 1000),
+        };
+        const next = existing
+          ? prev.verseStatuses.map((s) => (s.verse === verse ? updated : s))
+          : [...prev.verseStatuses, updated];
+        return { ...prev, verseStatuses: next };
+      });
+    },
+    [],
+  );
+
   // Adopt server-confirmed values when an outbox op succeeds.
   useEffect(() => {
     return onOutboxResult((op, result) => {
@@ -155,9 +178,16 @@ export function useChapter(book: string, chapter: number): UseChapterReturn {
         if (v && v.book === book && v.chapter === chapter) {
           applyLocalVerse(v);
         }
+        return;
+      }
+      if (op.target.kind === "verse_status") {
+        const s = result.updated as VerseStatus;
+        if (s && s.book === book && s.chapter === chapter) {
+          applyLocalVerseStatus(s.verse, s.done === 1);
+        }
       }
     });
-  }, [book, chapter, applyLocalRowReplacement, applyLocalVerse]);
+  }, [book, chapter, applyLocalRowReplacement, applyLocalVerse, applyLocalVerseStatus]);
 
   return {
     status,
@@ -169,5 +199,6 @@ export function useChapter(book: string, chapter: number): UseChapterReturn {
     applyLocalRowDelete,
     applyLocalRowInsert,
     applyLocalVerse,
+    applyLocalVerseStatus,
   };
 }

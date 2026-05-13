@@ -200,6 +200,22 @@ function VerseSpan({
   const elRef = useRef<HTMLSpanElement | null>(null);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lastTextRef = useRef(text);
+  // Latest onEdit reachable from the unmount path without restarting the
+  // effect — and a flush so a pending debounce isn't dropped when the
+  // verse navigates away mid-type (e.g. Shell remounts on verse change).
+  const onEditRef = useRef(onEdit);
+  useEffect(() => {
+    onEditRef.current = onEdit;
+  }, [onEdit]);
+  useEffect(() => {
+    return () => {
+      if (!debounceRef.current) return;
+      clearTimeout(debounceRef.current);
+      debounceRef.current = null;
+      const node = elRef.current;
+      if (node) onEditRef.current(node.innerText);
+    };
+  }, []);
 
   // Find marks override note highlights — same precedence as BookView.
   const findHTML = useMemo(() => {

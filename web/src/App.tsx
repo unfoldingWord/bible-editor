@@ -1,8 +1,10 @@
 // NB: src/spikes/AlignerSmoke.tsx is intentionally NOT imported.
 // Aligner integration is deferred to Phase 3 — see docs/plan.md.
 import { useEffect, useState } from "react";
+import { Alert, Box, CircularProgress, Stack, Typography } from "@mui/material";
 import { Shell } from "./components/Shell";
 import { useBook } from "./hooks/useBook";
+import { devSignIn, getAuthToken } from "./sync/api";
 
 interface Location {
   book: string;
@@ -20,13 +22,51 @@ function parseHash(): Location {
   };
 }
 
+// Auth gate. The API requires a Bearer token for every write, so we must
+// have one before mounting the editor — otherwise every save 401s. In dev
+// we silently mint a token via /api/auth/dev; once DCS OAuth ships this
+// branch redirects there instead.
+type AuthState =
+  | { kind: "loading" }
+  | { kind: "ready" }
+  | { kind: "missing" }
+  | { kind: "error"; message: string };
+
+function useAuthGate(): AuthState {
+  const [state, setState] = useState<AuthState>(() =>
+    getAuthToken() ? { kind: "ready" } : { kind: "loading" },
+  );
+  useEffect(() => {
+    if (state.kind !== "loading") return;
+    let cancelled = false;
+    devSignIn("dev")
+      .then(() => {
+        if (!cancelled) setState({ kind: "ready" });
+      })
+      .catch((err: unknown) => {
+        if (cancelled) return;
+        // /api/auth/dev returns 404 when DEV_AUTH_ENABLED is false; treat
+        // that as "you need to sign in" rather than a hard error so prod
+        // can swap in a real OAuth redirect later.
+        const status = (err as { status?: number })?.status;
+        if (status === 404) setState({ kind: "missing" });
+        else setState({ kind: "error", message: String(err) });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [state.kind]);
+  return state;
+}
+
 export function App() {
   const [loc, setLoc] = useState<Location>(() => parseHash());
+  const auth = useAuthGate();
   // useBook is hoisted here so its chapter cache survives Shell remounts
   // (which happen when the user navigates between chapters via the URL).
-  // It's enabled at the App level so the BookSummary loads up-front; the
-  // per-chapter payloads stay lazy.
-  const bookHook = useBook(loc.book, true);
+  // Don't initialize it until auth is ready — the BookSummary fetch is now
+  // gated and would otherwise burn a 401 every reload.
+  const bookHook = useBook(loc.book, auth.kind === "ready");
 
   useEffect(() => {
     const handler = () => setLoc(parseHash());
@@ -40,6 +80,32 @@ export function App() {
         ? `#/${book}/${chapter}/${verse}`
         : `#/${book}/${chapter}`;
   };
+
+  if (auth.kind === "loading") {
+    return (
+      <Stack alignItems="center" justifyContent="center" sx={{ height: "100vh" }} spacing={2}>
+        <CircularProgress />
+        <Typography variant="body2" color="text.secondary">signing in…</Typography>
+      </Stack>
+    );
+  }
+  if (auth.kind === "missing") {
+    return (
+      <Box sx={{ p: 4 }}>
+        <Alert severity="warning">
+          Sign-in required. The dev token endpoint is disabled — wire DCS OAuth or set
+          DEV_AUTH_ENABLED=true on the worker.
+        </Alert>
+      </Box>
+    );
+  }
+  if (auth.kind === "error") {
+    return (
+      <Box sx={{ p: 4 }}>
+        <Alert severity="error">auth failed: {auth.message}</Alert>
+      </Box>
+    );
+  }
 
   return (
     <Shell

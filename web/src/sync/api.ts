@@ -107,14 +107,44 @@ export class ApiError extends Error {
   }
 }
 
+// Bearer token storage. The token is opaque to the client — it carries the
+// user id in its `sub` claim and the worker verifies HS256 against the
+// shared JWT_SIGNING_KEY. localStorage is good-enough for a 7-month tactical
+// tool; revisit if the app starts handling sensitive data (the obvious next
+// step would be httpOnly cookies, which also requires SameSite=Lax + CSRF).
+const TOKEN_KEY = "bible-editor.auth.token";
+let cachedToken: string | null | undefined;
+
+export function getAuthToken(): string | null {
+  if (cachedToken !== undefined) return cachedToken;
+  try {
+    cachedToken = typeof localStorage !== "undefined" ? localStorage.getItem(TOKEN_KEY) : null;
+  } catch {
+    cachedToken = null;
+  }
+  return cachedToken;
+}
+
+export function setAuthToken(token: string | null) {
+  cachedToken = token;
+  try {
+    if (token) localStorage.setItem(TOKEN_KEY, token);
+    else localStorage.removeItem(TOKEN_KEY);
+  } catch {
+    /* private mode etc. */
+  }
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(path, {
-    ...init,
-    headers: {
-      "Content-Type": "application/json",
-      ...(init?.headers ?? {}),
-    },
-  });
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    ...((init?.headers as Record<string, string>) ?? {}),
+  };
+  const token = getAuthToken();
+  if (token && !headers.Authorization) {
+    headers.Authorization = `Bearer ${token}`;
+  }
+  const res = await fetch(path, { ...init, headers });
   if (!res.ok) {
     let body: unknown = null;
     try {
@@ -125,6 +155,37 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     throw new ApiError(res.status, `HTTP ${res.status}`, body);
   }
   return (await res.json()) as T;
+}
+
+export interface DevAuthResponse {
+  token: string;
+  userId: number;
+  username: string;
+  expiresIn: number;
+}
+
+// Dev-only sign-in. Mints a JWT for `username`, creating a users row on
+// first use. Only works while the worker has DEV_AUTH_ENABLED=true and a
+// JWT_SIGNING_KEY configured. Production should route through DCS OAuth
+// (not yet wired — see docs/plan.md).
+export async function devSignIn(username = "dev"): Promise<DevAuthResponse> {
+  const res = await fetch(`/api/auth/dev`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ username }),
+  });
+  if (!res.ok) {
+    let body: unknown = null;
+    try {
+      body = await res.json();
+    } catch {
+      /* ignore */
+    }
+    throw new ApiError(res.status, `HTTP ${res.status}`, body);
+  }
+  const data = (await res.json()) as DevAuthResponse;
+  setAuthToken(data.token);
+  return data;
 }
 
 export interface Catalogs {
