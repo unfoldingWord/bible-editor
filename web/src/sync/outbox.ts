@@ -6,7 +6,7 @@
 // crashes — see docs/plan.md "Save protocol".
 
 import { openDB, type IDBPDatabase } from "idb";
-import { api, ApiError, type RowKind } from "./api";
+import { api, ApiError, isChapterLockedBody, type ChapterLockedBody, type RowKind } from "./api";
 
 const DB_NAME = "bible-editor-outbox";
 const DB_VERSION = 1;
@@ -265,7 +265,13 @@ type Result =
   | { kind: "ok"; updated: unknown }
   | { kind: "conflict"; current: unknown }
   | { kind: "retry"; reason: string }
-  | { kind: "fatal"; reason: string };
+  | { kind: "fatal"; reason: string }
+  // Chapter is locked because an AI pipeline is mid-flight. The auto-apply
+  // step will overwrite the row anyway, so retrying is pointless — the op
+  // gets dropped and the listener can surface a toast.
+  | { kind: "locked"; lockBody: ChapterLockedBody };
+
+export type { Result as OutboxResult };
 
 type ResultListener = (op: OutboxOp, result: Result) => void;
 const resultListeners = new Set<ResultListener>();
@@ -316,6 +322,9 @@ async function dispatch(op: OutboxOp): Promise<Result> {
   } catch (e) {
     if (e instanceof ApiError) {
       if (e.status === 409) {
+        if (isChapterLockedBody(e.body)) {
+          return { kind: "locked", lockBody: e.body };
+        }
         const body = e.body as { current?: unknown } | undefined;
         return { kind: "conflict", current: body?.current };
       }
@@ -396,6 +405,10 @@ export async function drain() {
       // doesn't strand at in_flight.
       try {
         if (result.kind === "ok") {
+          await (await db()).delete(STORE, next.id);
+        } else if (result.kind === "locked") {
+          // The chapter is mid-pipeline; the auto-apply will overwrite this
+          // row anyway. Drop the op and let the listener surface a toast.
           await (await db()).delete(STORE, next.id);
         } else if (result.kind === "conflict") {
           next.status = "conflict";

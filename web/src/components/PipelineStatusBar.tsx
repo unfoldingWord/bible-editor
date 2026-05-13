@@ -221,7 +221,7 @@ export function PipelineStatusBar({ toast, onToastClear }: Props = {}) {
                 </Stack>
                 {job.state === "done" && (
                   <Typography variant="caption" color="text.secondary" sx={{ ml: 3 }} display="block">
-                    Output landed on Door43. Review UI coming in a follow-up.
+                    AI output applied to {job.book} {job.start_chapter}.
                   </Typography>
                 )}
               </Box>

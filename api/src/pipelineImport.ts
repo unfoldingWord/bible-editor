@@ -1,0 +1,672 @@
+// Pulls a done pipeline_jobs row's output[] from Door43, parses each file,
+// and stages the rows into pending_imports for translator review (Phase 2).
+//
+// Called from the GET /api/pipelines/:jobId handler when the upstream poll
+// surfaces state='done' for the first time. Idempotent on re-poll: a guard
+// query on pending_imports.job_id short-circuits if rows already exist for
+// this job.
+
+import type { Env } from "./index";
+import {
+  extractVersesForRange,
+  parseTsv,
+  refParts,
+  type VerseExtract,
+} from "./importParsers";
+import { newRowId } from "./rows";
+
+interface OutputEntry {
+  type?: string;
+  repo?: string;
+  branch?: string;
+  path?: string;
+  rawUrl?: string;
+  prNumber?: number;
+  mergedAt?: string;
+  commitSha?: string;
+}
+
+interface ImportContext {
+  jobId: string;
+  pipelineType: "generate" | "notes" | "tqs" | string;
+  book: string;
+  startChapter: number;
+  endChapter: number;
+}
+
+export interface ImportResult {
+  inserted: number;
+  byKind: { tn: number; tq: number; verse: number };
+  skipped: string[];           // human-readable reasons (one per output entry skipped)
+  applied?: ApplyResult;
+}
+
+// Classify a single output[] entry into the resource kind we know how to
+// parse. Returns null for entries we don't recognize — those get surfaced
+// in result.skipped and the job is otherwise marked imported.
+type Classification =
+  | { kind: "verse"; bibleVersion: "ULT" | "UST"; format: "usfm" }
+  | { kind: "tn"; format: "tsv" }
+  | { kind: "tq"; format: "tsv" }
+  | { kind: "unknown" };
+
+function classify(entry: OutputEntry): Classification {
+  const repo = (entry.repo ?? "").toLowerCase();
+  // Trailing match — repo strings look like "unfoldingWord/en_ult" or sometimes
+  // just "en_ult"; either way the last path segment is what we want.
+  const tail = repo.split("/").pop() ?? "";
+  if (tail.endsWith("en_ult")) return { kind: "verse", bibleVersion: "ULT", format: "usfm" };
+  if (tail.endsWith("en_ust")) return { kind: "verse", bibleVersion: "UST", format: "usfm" };
+  if (tail.endsWith("en_tn")) return { kind: "tn", format: "tsv" };
+  if (tail.endsWith("en_tq")) return { kind: "tq", format: "tsv" };
+  return { kind: "unknown" };
+}
+
+async function fetchText(rawUrl: string): Promise<string> {
+  const r = await fetch(rawUrl);
+  if (!r.ok) {
+    throw new Error(`fetch ${rawUrl} -> ${r.status}`);
+  }
+  return await r.text();
+}
+
+interface StagedRow {
+  kind: "tn" | "tq" | "verse";
+  chapter: number;
+  verse: number;
+  bibleVersion: string | null;
+  payload: Record<string, unknown>;
+}
+
+function tnPayload(book: string, refRaw: string, row: Record<string, string>) {
+  const [ch, v] = refParts(refRaw);
+  const occRaw = row["Occurrence"];
+  const occurrence = occRaw === "" || occRaw == null ? null : parseInt(occRaw, 10) || 0;
+  return {
+    chapter: ch,
+    verse: v,
+    payload: {
+      id: row["ID"] || null,
+      book,
+      chapter: ch,
+      verse: v,
+      ref_raw: refRaw,
+      tags: row["Tags"] || null,
+      support_reference: row["SupportReference"] || null,
+      quote: row["Quote"] || null,
+      occurrence,
+      note: row["Note"] || null,
+    },
+  };
+}
+
+function tqPayload(book: string, refRaw: string, row: Record<string, string>) {
+  const [ch, v] = refParts(refRaw);
+  const occRaw = row["Occurrence"];
+  const occurrence = occRaw === "" || occRaw == null ? null : parseInt(occRaw, 10) || 0;
+  return {
+    chapter: ch,
+    verse: v,
+    payload: {
+      id: row["ID"] || null,
+      book,
+      chapter: ch,
+      verse: v,
+      ref_raw: refRaw,
+      tags: row["Tags"] || null,
+      quote: row["Quote"] || null,
+      occurrence,
+      question: row["Question"] || null,
+      response: row["Response"] || null,
+    },
+  };
+}
+
+function versePayload(book: string, bibleVersion: "ULT" | "UST", v: VerseExtract) {
+  return {
+    book,
+    chapter: v.chapter,
+    verse: v.verse,
+    bible_version: bibleVersion,
+    content_json: v.contentJson,
+    plain_text: v.plainText,
+  };
+}
+
+async function parseOutputEntry(
+  ctx: ImportContext,
+  entry: OutputEntry,
+): Promise<{ staged: StagedRow[]; skipReason?: string }> {
+  if (!entry.rawUrl) return { staged: [], skipReason: "missing rawUrl" };
+  const cls = classify(entry);
+  if (cls.kind === "unknown") {
+    return { staged: [], skipReason: `unrecognized repo: ${entry.repo ?? "(none)"}` };
+  }
+
+  const raw = await fetchText(entry.rawUrl);
+  const staged: StagedRow[] = [];
+
+  if (cls.format === "tsv") {
+    const { rows } = parseTsv(raw);
+    for (const row of rows) {
+      const refRaw = row["Reference"];
+      if (!refRaw) continue;
+      const [ch] = refParts(refRaw);
+      if (ch < ctx.startChapter || ch > ctx.endChapter) continue;
+      const built = cls.kind === "tn"
+        ? tnPayload(ctx.book, refRaw, row)
+        : tqPayload(ctx.book, refRaw, row);
+      staged.push({
+        kind: cls.kind,
+        chapter: built.chapter,
+        verse: built.verse,
+        bibleVersion: null,
+        payload: built.payload,
+      });
+    }
+    return { staged };
+  }
+
+  // USFM
+  const verses = extractVersesForRange(raw, ctx.startChapter, ctx.endChapter);
+  for (const v of verses) {
+    staged.push({
+      kind: "verse",
+      chapter: v.chapter,
+      verse: v.verse,
+      bibleVersion: cls.bibleVersion,
+      payload: versePayload(ctx.book, cls.bibleVersion, v),
+    });
+  }
+  return { staged };
+}
+
+// Top-level entry. Two phases:
+//   1. STAGE — fetch each rawUrl, parse, INSERT into pending_imports.
+//      Idempotent on the existence of any pending_imports row for the job.
+//   2. APPLY — for every unresolved pending_imports row, mutate the live
+//      tn_rows / tq_rows / verses tables and mark accepted_at.
+//      Idempotent at the per-row level (accepted_at IS NULL filter) plus
+//      the TN-delete phase, which only targets unkept rows.
+//
+// Throws on hard errors (Door43 fetch failure, malformed input, batch error).
+// Callers should NOT mark output_json in pipeline_jobs unless this resolves
+// successfully — that's how the next poll re-runs apply after a partial
+// failure.
+export async function importJobOutput(
+  env: Env,
+  job: ImportContext,
+  outputs: OutputEntry[],
+): Promise<ImportResult> {
+  const stageResult = await stageJobOutput(env, job, outputs);
+  const applyResult = await applyJobOutput(env, job);
+  return { ...stageResult, applied: applyResult };
+}
+
+async function stageJobOutput(
+  env: Env,
+  job: ImportContext,
+  outputs: OutputEntry[],
+): Promise<ImportResult> {
+  // Idempotency guard: if we've already staged for this job, skip the parse.
+  // Apply phase below will pick up any still-unresolved rows on retry.
+  const existing = await env.DB.prepare(
+    `SELECT 1 FROM pending_imports WHERE job_id = ?1 LIMIT 1`,
+  )
+    .bind(job.jobId)
+    .first<{ "1": number }>();
+  if (existing) {
+    return { inserted: 0, byKind: { tn: 0, tq: 0, verse: 0 }, skipped: ["already staged"] };
+  }
+
+  const skipped: string[] = [];
+  const allStaged: StagedRow[] = [];
+  for (const entry of outputs) {
+    const { staged, skipReason } = await parseOutputEntry(job, entry);
+    if (skipReason) skipped.push(skipReason);
+    allStaged.push(...staged);
+  }
+
+  if (allStaged.length === 0) {
+    return { inserted: 0, byKind: { tn: 0, tq: 0, verse: 0 }, skipped };
+  }
+
+  // Batch insert in chunks. D1 batch() caps at 100 statements per call.
+  const stmt = env.DB.prepare(
+    `INSERT INTO pending_imports
+       (job_id, kind, book, chapter, verse, bible_version, payload_json)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)`,
+  );
+
+  const CHUNK = 100;
+  let inserted = 0;
+  const byKind = { tn: 0, tq: 0, verse: 0 };
+  for (let i = 0; i < allStaged.length; i += CHUNK) {
+    const chunk = allStaged.slice(i, i + CHUNK);
+    await env.DB.batch(
+      chunk.map((s) =>
+        stmt.bind(
+          job.jobId,
+          s.kind,
+          job.book,
+          s.chapter,
+          s.verse,
+          s.bibleVersion,
+          JSON.stringify(s.payload),
+        ),
+      ),
+    );
+    inserted += chunk.length;
+    for (const s of chunk) byKind[s.kind] += 1;
+  }
+
+  return { inserted, byKind, skipped };
+}
+
+// ── Apply phase ───────────────────────────────────────────────────────────
+
+export interface ApplyResult {
+  tnDeleted: number;
+  tnCreated: number;
+  tqCreated: number;
+  tqUpdated: number;
+  verseUpdated: number;
+}
+
+interface PendingImportRow {
+  id: number;
+  kind: "tn" | "tq" | "verse";
+  book: string;
+  chapter: number;
+  verse: number;
+  bible_version: string | null;
+  payload_json: string;
+}
+
+const AI_SOURCE = "ai_pipeline";
+
+async function applyJobOutput(env: Env, job: ImportContext): Promise<ApplyResult> {
+  // Look up the pipeline-starter's user id — every audit and updated_by
+  // write is attributed to them, matching the contract that says the run
+  // was triggered on their behalf.
+  const starter = await env.DB.prepare(
+    `SELECT user_id FROM pipeline_jobs WHERE job_id = ?1`,
+  )
+    .bind(job.jobId)
+    .first<{ user_id: number }>();
+  if (!starter) throw new Error(`apply: pipeline_jobs row not found for ${job.jobId}`);
+  const userId = starter.user_id;
+
+  // All unresolved proposals for this job, in stable order so retries do
+  // the same work in the same sequence.
+  const rs = await env.DB.prepare(
+    `SELECT id, kind, book, chapter, verse, bible_version, payload_json
+       FROM pending_imports
+      WHERE job_id = ?1
+        AND accepted_at IS NULL AND rejected_at IS NULL
+      ORDER BY kind, chapter, verse, id`,
+  )
+    .bind(job.jobId)
+    .all<PendingImportRow>();
+  const rows = rs.results ?? [];
+
+  const tnProposals = rows.filter((r) => r.kind === "tn");
+  const tqProposals = rows.filter((r) => r.kind === "tq");
+  const verseProposals = rows.filter((r) => r.kind === "verse");
+
+  const result: ApplyResult = {
+    tnDeleted: 0,
+    tnCreated: 0,
+    tqCreated: 0,
+    tqUpdated: 0,
+    verseUpdated: 0,
+  };
+
+  // TN delete phase: only fires when this job produced TN proposals AND
+  // there are unkept TNs in scope. Idempotent — re-running finds none left.
+  if (tnProposals.length > 0) {
+    result.tnDeleted = await deleteUnkeptTns(env, job, userId);
+  }
+
+  for (const p of tnProposals) {
+    await applyTnInsert(env, p, userId);
+    result.tnCreated += 1;
+  }
+
+  for (const p of tqProposals) {
+    const action = await applyTqUpsert(env, p, userId);
+    if (action === "created") result.tqCreated += 1;
+    else result.tqUpdated += 1;
+  }
+
+  for (const p of verseProposals) {
+    await applyVerseUpdate(env, p, userId);
+    result.verseUpdated += 1;
+  }
+
+  return result;
+}
+
+async function deleteUnkeptTns(
+  env: Env,
+  job: ImportContext,
+  userId: number,
+): Promise<number> {
+  // Identify which rows we're about to delete so the audit row can carry
+  // the right pre-deletion version. A bulk UPDATE would lose that fidelity.
+  const targets = await env.DB.prepare(
+    `SELECT id, version FROM tn_rows
+      WHERE book = ?1 AND chapter BETWEEN ?2 AND ?3
+        AND updated_by IS NULL AND deleted_at IS NULL`,
+  )
+    .bind(job.book, job.startChapter, job.endChapter)
+    .all<{ id: string; version: number }>();
+  const list = targets.results ?? [];
+  if (list.length === 0) return 0;
+
+  const now = Math.floor(Date.now() / 1000);
+  const CHUNK = 25; // 2 statements per row + headroom
+  for (let i = 0; i < list.length; i += CHUNK) {
+    const slice = list.slice(i, i + CHUNK);
+    const stmts = [];
+    for (const t of slice) {
+      stmts.push(
+        env.DB
+          .prepare(
+            `UPDATE tn_rows
+               SET deleted_at = ?1, version = version + 1,
+                   updated_at = ?1, updated_by = ?2
+             WHERE id = ?3 AND deleted_at IS NULL`,
+          )
+          .bind(now, userId, t.id),
+        env.DB
+          .prepare(
+            `INSERT INTO edit_log
+               (kind, row_key, user_id, prev_version, new_version, action, source)
+             VALUES ('tn', ?1, ?2, ?3, ?4, 'delete', ?5)`,
+          )
+          .bind(t.id, userId, t.version, t.version + 1, AI_SOURCE),
+      );
+    }
+    await env.DB.batch(stmts);
+  }
+  return list.length;
+}
+
+async function applyTnInsert(
+  env: Env,
+  p: PendingImportRow,
+  userId: number,
+): Promise<void> {
+  const payload = JSON.parse(p.payload_json) as Record<string, unknown>;
+  const insertCols = [
+    "id",
+    "book",
+    "chapter",
+    "verse",
+    "ref_raw",
+    "tags",
+    "support_reference",
+    "quote",
+    "occurrence",
+    "note",
+    "updated_by",
+  ];
+
+  // ID collision retry — same shape as rows.ts POST. The AI's proposed `id`
+  // (when present in the TSV) is ignored; bp-assistant produces fresh ids
+  // for TNs that don't have a stable lineage on the editor side.
+  let id = "";
+  let lastErr: unknown = null;
+  for (let attempt = 0; attempt < 8; attempt++) {
+    id = newRowId();
+    const values: unknown[] = [
+      id,
+      payload.book ?? null,
+      payload.chapter ?? null,
+      payload.verse ?? null,
+      payload.ref_raw ?? null,
+      payload.tags ?? null,
+      payload.support_reference ?? null,
+      payload.quote ?? null,
+      payload.occurrence ?? null,
+      payload.note ?? null,
+      userId,
+    ];
+    try {
+      await env.DB.batch([
+        env.DB
+          .prepare(
+            `INSERT INTO tn_rows (${insertCols.join(", ")})
+             VALUES (${insertCols.map((_, i) => `?${i + 1}`).join(", ")})`,
+          )
+          .bind(...values),
+        env.DB
+          .prepare(
+            `INSERT INTO edit_log
+               (kind, row_key, user_id, prev_version, new_version, action, payload_json, source)
+             VALUES ('tn', ?1, ?2, NULL, 1, 'create', ?3, ?4)`,
+          )
+          .bind(id, userId, JSON.stringify(payload), AI_SOURCE),
+        env.DB
+          .prepare(
+            `UPDATE pending_imports
+                SET accepted_at = unixepoch(), accepted_by = ?2
+              WHERE id = ?1`,
+          )
+          .bind(p.id, userId),
+      ]);
+      lastErr = null;
+      break;
+    } catch (e) {
+      lastErr = e;
+      const msg = e instanceof Error ? e.message : String(e);
+      if (!/UNIQUE|PRIMARY KEY/i.test(msg)) throw e;
+    }
+  }
+  if (lastErr) throw new Error(`tn id collision exhausted after 8 attempts`);
+}
+
+async function applyTqUpsert(
+  env: Env,
+  p: PendingImportRow,
+  userId: number,
+): Promise<"created" | "updated"> {
+  const payload = JSON.parse(p.payload_json) as Record<string, unknown>;
+  const proposedId = typeof payload.id === "string" && payload.id.length > 0 ? payload.id : null;
+
+  if (proposedId) {
+    // Try update first. The version + updated_by/at bump matches the human
+    // PATCH semantics so history rendering treats the row uniformly.
+    const existing = await env.DB.prepare(
+      `SELECT version FROM tq_rows WHERE id = ?1 AND deleted_at IS NULL`,
+    )
+      .bind(proposedId)
+      .first<{ version: number }>();
+    if (existing) {
+      const newVersion = existing.version + 1;
+      const now = Math.floor(Date.now() / 1000);
+      const patch = {
+        ref_raw: payload.ref_raw ?? null,
+        tags: payload.tags ?? null,
+        quote: payload.quote ?? null,
+        occurrence: payload.occurrence ?? null,
+        question: payload.question ?? null,
+        response: payload.response ?? null,
+      };
+      await env.DB.batch([
+        env.DB
+          .prepare(
+            `UPDATE tq_rows
+                SET ref_raw = ?1, tags = ?2, quote = ?3, occurrence = ?4,
+                    question = ?5, response = ?6,
+                    version = version + 1, updated_at = ?7, updated_by = ?8
+              WHERE id = ?9 AND deleted_at IS NULL`,
+          )
+          .bind(
+            patch.ref_raw,
+            patch.tags,
+            patch.quote,
+            patch.occurrence,
+            patch.question,
+            patch.response,
+            now,
+            userId,
+            proposedId,
+          ),
+        env.DB
+          .prepare(
+            `INSERT INTO edit_log
+               (kind, row_key, user_id, prev_version, new_version, action, payload_json, source)
+             VALUES ('tq', ?1, ?2, ?3, ?4, 'update', ?5, ?6)`,
+          )
+          .bind(proposedId, userId, existing.version, newVersion, JSON.stringify(patch), AI_SOURCE),
+        env.DB
+          .prepare(
+            `UPDATE pending_imports SET accepted_at = unixepoch(), accepted_by = ?2 WHERE id = ?1`,
+          )
+          .bind(p.id, userId),
+      ]);
+      return "updated";
+    }
+  }
+
+  // New row — proposedId either absent or not in tq_rows. Use it as the
+  // sticky id when present (preserves AI-side correlation); otherwise mint
+  // a fresh id with the same retry pattern as TN insert.
+  if (proposedId) {
+    await insertTqAtId(env, p, payload, proposedId, userId);
+  } else {
+    let lastErr: unknown = null;
+    for (let attempt = 0; attempt < 8; attempt++) {
+      const fresh = newRowId();
+      try {
+        await insertTqAtId(env, p, payload, fresh, userId);
+        lastErr = null;
+        break;
+      } catch (e) {
+        lastErr = e;
+        const msg = e instanceof Error ? e.message : String(e);
+        if (!/UNIQUE|PRIMARY KEY/i.test(msg)) throw e;
+      }
+    }
+    if (lastErr) throw new Error(`tq id collision exhausted after 8 attempts`);
+  }
+  return "created";
+}
+
+async function insertTqAtId(
+  env: Env,
+  p: PendingImportRow,
+  payload: Record<string, unknown>,
+  id: string,
+  userId: number,
+): Promise<void> {
+  const cols = ["id", "book", "chapter", "verse", "ref_raw", "tags", "quote", "occurrence", "question", "response", "updated_by"];
+  const values = [
+    id,
+    payload.book ?? null,
+    payload.chapter ?? null,
+    payload.verse ?? null,
+    payload.ref_raw ?? null,
+    payload.tags ?? null,
+    payload.quote ?? null,
+    payload.occurrence ?? null,
+    payload.question ?? null,
+    payload.response ?? null,
+    userId,
+  ];
+  await env.DB.batch([
+    env.DB
+      .prepare(
+        `INSERT INTO tq_rows (${cols.join(", ")})
+         VALUES (${cols.map((_, i) => `?${i + 1}`).join(", ")})`,
+      )
+      .bind(...values),
+    env.DB
+      .prepare(
+        `INSERT INTO edit_log
+           (kind, row_key, user_id, prev_version, new_version, action, payload_json, source)
+         VALUES ('tq', ?1, ?2, NULL, 1, 'create', ?3, ?4)`,
+      )
+      .bind(id, userId, JSON.stringify(payload), AI_SOURCE),
+    env.DB
+      .prepare(
+        `UPDATE pending_imports SET accepted_at = unixepoch(), accepted_by = ?2 WHERE id = ?1`,
+      )
+      .bind(p.id, userId),
+  ]);
+}
+
+async function applyVerseUpdate(
+  env: Env,
+  p: PendingImportRow,
+  userId: number,
+): Promise<void> {
+  const payload = JSON.parse(p.payload_json) as Record<string, unknown>;
+  const book = String(payload.book ?? p.book);
+  const chapter = Number(payload.chapter ?? p.chapter);
+  const verse = Number(payload.verse ?? p.verse);
+  const bibleVersion = String(payload.bible_version ?? p.bible_version ?? "");
+  const contentJson = String(payload.content_json ?? "");
+  const plainText = (payload.plain_text as string | null) ?? null;
+  const rowKey = `${book}/${chapter}/${verse}/${bibleVersion}`;
+
+  const existing = await env.DB.prepare(
+    `SELECT version FROM verses
+      WHERE book = ?1 AND chapter = ?2 AND verse = ?3 AND bible_version = ?4`,
+  )
+    .bind(book, chapter, verse, bibleVersion)
+    .first<{ version: number }>();
+
+  const now = Math.floor(Date.now() / 1000);
+  if (existing) {
+    const newVersion = existing.version + 1;
+    await env.DB.batch([
+      env.DB
+        .prepare(
+          `UPDATE verses
+              SET content_json = ?1, plain_text = ?2,
+                  version = version + 1, updated_at = ?3, updated_by = ?4
+            WHERE book = ?5 AND chapter = ?6 AND verse = ?7 AND bible_version = ?8`,
+        )
+        .bind(contentJson, plainText, now, userId, book, chapter, verse, bibleVersion),
+      env.DB
+        .prepare(
+          `INSERT INTO edit_log
+             (kind, row_key, user_id, prev_version, new_version, action, payload_json, source)
+           VALUES ('verse', ?1, ?2, ?3, ?4, 'update', ?5, ?6)`,
+        )
+        .bind(rowKey, userId, existing.version, newVersion, JSON.stringify({ plain_text: plainText }), AI_SOURCE),
+      env.DB
+        .prepare(
+          `UPDATE pending_imports SET accepted_at = unixepoch(), accepted_by = ?2 WHERE id = ?1`,
+        )
+        .bind(p.id, userId),
+    ]);
+    return;
+  }
+
+  // The verse should exist from the initial book import; this branch is the
+  // defensive case where the seed missed something. Insert as a brand-new row.
+  await env.DB.batch([
+    env.DB
+      .prepare(
+        `INSERT INTO verses (book, chapter, verse, bible_version, content_json, plain_text, updated_by)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)`,
+      )
+      .bind(book, chapter, verse, bibleVersion, contentJson, plainText, userId),
+    env.DB
+      .prepare(
+        `INSERT INTO edit_log
+           (kind, row_key, user_id, prev_version, new_version, action, payload_json, source)
+         VALUES ('verse', ?1, ?2, NULL, 1, 'create', ?3, ?4)`,
+      )
+      .bind(rowKey, userId, JSON.stringify({ plain_text: plainText }), AI_SOURCE),
+    env.DB
+      .prepare(
+        `UPDATE pending_imports SET accepted_at = unixepoch(), accepted_by = ?2 WHERE id = ?1`,
+      )
+      .bind(p.id, userId),
+  ]);
+}

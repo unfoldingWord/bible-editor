@@ -74,6 +74,10 @@ interface Props {
   onModeChange: (mode: ScriptureMode) => void;
   onEnabledVersionsChange: (versions: string[]) => void;
   onEditVerse: (verseNum: number, bibleVersion: string, plain: string, base: VerseDto) => void;
+  // Chapter is mid-flight for an AI pipeline. Renders all editable bibles
+  // (ULT/UST) as read-only too — UHB/UGNT already are by virtue of
+  // READ_ONLY_VERSIONS. The banner above the column tells the user why.
+  locked?: boolean;
 }
 
 const VERSION_LABEL: Record<string, string> = {
@@ -118,6 +122,7 @@ export function ScriptureColumn({
   onModeChange,
   onEnabledVersionsChange,
   onEditVerse,
+  locked = false,
 }: Props) {
   const activeRef = useRef<HTMLDivElement | null>(null);
   const bodyRef = useRef<HTMLDivElement | null>(null);
@@ -385,6 +390,7 @@ export function ScriptureColumn({
             onSelectVerse={onSelectVerse}
             onOpenAligner={onOpenAligner}
             onEditVerse={onEditVerse}
+            locked={locked}
           />
         ) : mode === "book" && bookChapterList && bookChapters && onLoadBookChapter && onSelectBookVerse && onEditBookVerse && onOpenBookAligner ? (
           <Suspense fallback={null}>
@@ -405,6 +411,7 @@ export function ScriptureColumn({
               onSelectVerse={onSelectBookVerse}
               onEditVerse={onEditBookVerse}
               onOpenAligner={onOpenBookAligner}
+              locked={locked}
             />
           </Suspense>
         ) : (
@@ -417,7 +424,7 @@ export function ScriptureColumn({
                 verseNumbers={verseNumbers}
                 chapter={chapter}
                 activeVerse={activeVerse}
-                readOnly={READ_ONLY_VERSIONS.has(v)}
+                readOnly={READ_ONLY_VERSIONS.has(v) || locked}
                 rtl={v === "UHB"}
                 activeNoteQuote={activeNoteQuote}
                 activeNoteOccurrence={activeNoteOccurrence}
@@ -452,6 +459,7 @@ function StackedBody({
   onSelectVerse,
   onOpenAligner,
   onEditVerse,
+  locked,
 }: {
   versesByVersion: Record<string, Record<number, VerseDto>>;
   verseNumbers: number[];
@@ -467,6 +475,7 @@ function StackedBody({
   onSelectVerse: (v: number) => void;
   onOpenAligner: (verse: number, bibleVersion: string) => void;
   onEditVerse: (verseNum: number, bibleVersion: string, plain: string, base: VerseDto) => void;
+  locked: boolean;
 }) {
   const ult = versesByVersion["ULT"] ?? {};
   const ust = versesByVersion["UST"] ?? {};
@@ -530,7 +539,7 @@ function StackedBody({
                 highlights={ultHL}
                 search={search}
                 findActiveMatch={findActiveMatch}
-                editable
+                editable={!locked}
                 onOpenAligner={() => onOpenAligner(v, "ULT")}
                 onEditPlain={
                   ultV ? (plain) => onEditVerse(v, "ULT", plain, ultV) : undefined

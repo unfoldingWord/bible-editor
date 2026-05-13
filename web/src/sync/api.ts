@@ -110,6 +110,23 @@ export class ApiError extends Error {
   }
 }
 
+// 409 body returned by mutation routes when a chapter has a non-terminal
+// AI pipeline targeting it. The Worker returns this for POST/PATCH/DELETE on
+// rows + PATCH on verses; client widgets can surface "AI run in progress
+// (started X min ago)" without a second fetch.
+export interface ChapterLockedBody {
+  error: "chapter_locked";
+  jobId: string;
+  pipelineType: PipelineType;
+  startedAt: number; // unix seconds
+}
+
+export function isChapterLockedBody(body: unknown): body is ChapterLockedBody {
+  if (!body || typeof body !== "object") return false;
+  const b = body as Record<string, unknown>;
+  return b.error === "chapter_locked" && typeof b.jobId === "string";
+}
+
 // Bearer token storage. The token is opaque to the client — it carries the
 // user id in its `sub` claim and the worker verifies HS256 against the
 // shared JWT_SIGNING_KEY. localStorage is good-enough for a 7-month tactical
@@ -286,13 +303,38 @@ export type PipelineErrorKind =
   | "stale_output"
   | "interrupted";
 
+// Mirrors the bp-assistant contract (docs/ai-pipeline-integration.md §3).
+// Server validates with .strict(); unknown keys are rejected. Per-pipeline-type
+// flag mixing (e.g. contentTypes on a "notes" run) is also rejected.
+export interface PipelineRequestOptions {
+  model?: "sonnet" | "opus";
+  /** Clear prior checkpoint + outputs. Useful for retrying a failed run. */
+  fresh?: boolean;
+
+  // -- generate-only --
+  /** Restrict to a subset of content types. Default is both. */
+  contentTypes?: ("ult" | "ust")[];
+  /** Skip alignment + repo-insert; USFM is NOT pushed to Door43. */
+  noAlign?: boolean;
+  /** Reuse already-generated USFM and only run alignment + repo-insert. */
+  alignOnly?: boolean;
+  /** Push the unaligned USFM to Door43 (no alignment performed). */
+  textOnly?: boolean;
+
+  // -- notes-only --
+  /** Skip the chapter intro generation step. */
+  noIntro?: boolean;
+  /** Pause before generating Alternate Translations so a human can review. */
+  pauseBeforeATs?: boolean;
+}
+
 export interface PipelineStartRequest {
   pipelineType: PipelineType;
   book: string;
   startChapter: number;
   endChapter?: number;
   sessionKey: string;
-  options?: { model?: "sonnet" | "opus" };
+  options?: PipelineRequestOptions;
 }
 
 export interface PipelineStartResponse {
@@ -329,6 +371,23 @@ export interface PipelineStatusResponse {
   createdAt: string;
   interrupted?: boolean;
   output?: PipelineOutput[];
+}
+
+// AI pipeline proposal staged in pending_imports. The server parses payload
+// from TEXT into a JSON object so clients don't repeat that work. Phase 2b
+// renders these as a placeholder list; Phase 2c is the real diff UI.
+export interface PendingImport {
+  id: number;
+  jobId: string;
+  kind: "tn" | "tq" | "verse";
+  book: string;
+  chapter: number;
+  verse: number;
+  bibleVersion: string | null;
+  payload: unknown;
+  createdAt: number;
+  pipelineType: PipelineType;
+  startedByUsername: string | null;
 }
 
 // Row shape returned by GET /api/pipelines (list). Columns are snake_case —
@@ -403,6 +462,14 @@ export const api = {
       headers: { "If-Match": String(expectedVersion) },
     }),
 
+  // Lock-exempt during an active pipeline. Bumps version, sets updated_by =
+  // current user, lets the auto-apply step skip this row when it sweeps un-
+  // kept TNs. Returns the updated row so the caller can refresh local state.
+  keepNote: (id: string) =>
+    request<TnRow>(`/api/rows/tn/${encodeURIComponent(id)}/keep`, {
+      method: "POST",
+    }),
+
   patchVerse: <T = unknown>(
     book: string,
     chapter: number,
@@ -448,6 +515,12 @@ export const api = {
       states && states.length > 0
         ? `/api/pipelines?state=${encodeURIComponent(states.join(","))}`
         : `/api/pipelines`,
+      { signal },
+    ),
+
+  getPendingImports: (book: string, chapter: number, signal?: AbortSignal) =>
+    request<{ items: PendingImport[] }>(
+      `/api/pending-imports?book=${encodeURIComponent(book)}&chapter=${chapter}`,
       { signal },
     ),
 };

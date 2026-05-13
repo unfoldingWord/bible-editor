@@ -17,7 +17,8 @@ import { TopBar } from "./TopBar";
 import { SyncStatusBar } from "./SyncStatusBar";
 import { PipelineMenu } from "./PipelineMenu";
 import { PipelineStatusBar } from "./PipelineStatusBar";
-import { pipelineStore } from "../sync/pipelineStore";
+import { pipelineStore, type PipelineJob } from "../sync/pipelineStore";
+import { onOutboxResult } from "../sync/outbox";
 import { AiCompletionToasts } from "./AiCompletionToasts";
 import { collectStrongs } from "./HebrewLine";
 
@@ -107,11 +108,69 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook }:
     pipelineStore.onComplete((job, prev) => {
       const where = `${job.book} ${job.start_chapter}`;
       if (job.state === "done") {
-        pushPipelineToast(`AI ${job.pipeline_type} ready for ${where}. Review coming soon.`, "success");
+        pushPipelineToast(`AI ${job.pipeline_type} applied to ${where}.`, "success");
       } else if (job.state === "failed" && prev !== "failed") {
         pushPipelineToast(`AI ${job.pipeline_type} failed for ${where}: ${job.error_kind ?? "error"}`, "error");
       }
     }), [pushPipelineToast]);
+
+  // Surface a toast when the outbox drops an op because the chapter was
+  // locked. The user's edit was rejected by the server (409 chapter_locked)
+  // and discarded — retrying would race the auto-apply step.
+  useEffect(
+    () =>
+      onOutboxResult((_op, result) => {
+        if (result.kind === "locked") {
+          pushPipelineToast(
+            "Edit dropped — the AI run for this chapter is mid-flight. Try again after it finishes.",
+            "error",
+          );
+        }
+      }),
+    [pushPipelineToast],
+  );
+
+  // Derive the chapter lock from active pipeline jobs. Any non-terminal job
+  // whose scope covers this (book, chapter) locks the editor; the banner
+  // surfaces the started-at time and the TN cards switch to keep-mode.
+  const [activeJobs, setActiveJobs] = useState<PipelineJob[]>([]);
+  useEffect(() => pipelineStore.subscribe(setActiveJobs), []);
+  const chapterLock = useMemo(() => {
+    const found = activeJobs.find(
+      (j) =>
+        j.book === book &&
+        j.start_chapter <= chapter &&
+        j.end_chapter >= chapter &&
+        (j.state === "running" ||
+          j.state === "paused_for_outage" ||
+          j.state === "paused_for_usage_limit"),
+    );
+    if (!found) return null;
+    return {
+      jobId: found.job_id,
+      pipelineType: found.pipeline_type,
+      startedAt: found.created_at,
+    };
+  }, [activeJobs, book, chapter]);
+
+  const handleKeepNote = useCallback(
+    async (id: string) => {
+      try {
+        const updated = await api.keepNote(id);
+        // Mirror the row's new server state locally so the card flips to
+        // editable + Kept on the next render.
+        applyLocalRowPatch("tn", id, {
+          updated_by: updated.updated_by,
+          updated_at: updated.updated_at,
+          version: updated.version,
+        });
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : "unknown error";
+        pushPipelineToast(`Couldn't mark note as kept: ${msg}`, "error");
+      }
+    },
+    [applyLocalRowPatch, pushPipelineToast],
+  );
 
   // Async AI-draft lifecycle. State outlives any single NoteCard so the
   // user can scroll away / edit a different note while one is in flight.
@@ -291,6 +350,24 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook }:
           onNavigate?.(b, c);
         }}
       />
+      {chapterLock && (
+        <Alert
+          severity="info"
+          icon={false}
+          sx={{
+            borderRadius: 0,
+            borderBottom: "1px solid",
+            borderColor: "divider",
+            py: 0.5,
+            "& .MuiAlert-message": { width: "100%" },
+          }}
+        >
+          AI {chapterLock.pipelineType} run in progress for {book} {chapter} —
+          started {formatRelative(chapterLock.startedAt)}. Editing is locked
+          for this chapter. You can still mark notes to keep before the new
+          set lands.
+        </Alert>
+      )}
       <Box
         sx={{
           display: "flex",
@@ -406,6 +483,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook }:
           scrollNonce={scrollNonce}
           onRequestScrollToActive={requestScrollToActive}
           lexiconMap={lexiconMap}
+          locked={Boolean(chapterLock)}
         />
         <ResourceColumn
           activeVerse={activeVerse}
@@ -566,6 +644,8 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook }:
             applyLocalRowDelete("tq", id);
             void outbox.enqueueDeleteRow("tq", id, row.version);
           }}
+          locked={Boolean(chapterLock)}
+          onKeepNote={handleKeepNote}
         />
       </Box>
       {alignerTarget && (
@@ -660,6 +740,14 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook }:
 // ---------- sort_order helpers ----------
 
 type Sortable = { id: string; verse: number; sort_order: number | null };
+
+function formatRelative(unixSeconds: number): string {
+  const diff = Math.floor(Date.now() / 1000) - unixSeconds;
+  if (diff < 60) return `${diff}s ago`;
+  if (diff < 3600) return `${Math.floor(diff / 60)} min ago`;
+  if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
+  return `${Math.floor(diff / 86400)}d ago`;
+}
 
 function sortedForVerse<T extends Sortable>(rows: T[], verse: number): T[] {
   return rows

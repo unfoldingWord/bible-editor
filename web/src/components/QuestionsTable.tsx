@@ -7,9 +7,13 @@ interface Props {
   rows: TqRow[];
   onChange: (id: string, patch: Partial<TqRow>) => void;
   onDelete: (id: string) => void;
+  // When true, rows render read-only and the delete button is hidden. Used
+  // while an AI pipeline is mid-flight for the chapter — the auto-apply step
+  // will overwrite TQs anyway.
+  locked?: boolean;
 }
 
-export function QuestionsTable({ rows, onChange, onDelete }: Props) {
+export function QuestionsTable({ rows, onChange, onDelete, locked = false }: Props) {
   if (rows.length === 0) {
     return (
       <Typography variant="body2" color="text.disabled" sx={{ py: 1, pl: 1 }}>
@@ -42,7 +46,13 @@ export function QuestionsTable({ rows, onChange, onDelete }: Props) {
         <span />
       </Box>
       {rows.map((r) => (
-        <Row key={r.id} row={r} onChange={(p) => onChange(r.id, p)} onDelete={() => onDelete(r.id)} />
+        <Row
+          key={r.id}
+          row={r}
+          onChange={(p) => onChange(r.id, p)}
+          onDelete={() => onDelete(r.id)}
+          locked={locked}
+        />
       ))}
     </Paper>
   );
@@ -56,10 +66,12 @@ function Row({
   row,
   onChange,
   onDelete,
+  locked,
 }: {
   row: TqRow;
   onChange: (patch: Partial<TqRow>) => void;
   onDelete: () => void;
+  locked: boolean;
 }) {
   const [refRaw, setRefRaw] = useState(row.ref_raw ?? "");
   const [question, setQuestion] = useState(row.question ?? "");
@@ -110,6 +122,7 @@ function Row({
         spellCheck={false}
         variant="outlined"
         placeholder="1:1"
+        InputProps={{ readOnly: locked }}
         inputProps={{
           style: { fontSize: 12, padding: "3px 6px", fontFamily: "monospace" },
         }}
@@ -124,6 +137,7 @@ function Row({
         multiline
         spellCheck
         variant="outlined"
+        InputProps={{ readOnly: locked }}
         inputProps={{ style: { fontSize: 13, padding: "3px 6px" } }}
       />
       <TextField
@@ -136,11 +150,16 @@ function Row({
         multiline
         spellCheck
         variant="outlined"
+        InputProps={{ readOnly: locked }}
         inputProps={{ style: { fontSize: 13, padding: "3px 6px" } }}
       />
-      <IconButton size="small" onClick={onDelete} color="error" sx={{ p: 0.25 }}>
-        <DeleteOutlineIcon fontSize="inherit" />
-      </IconButton>
+      {locked ? (
+        <span />
+      ) : (
+        <IconButton size="small" onClick={onDelete} color="error" sx={{ p: 0.25 }}>
+          <DeleteOutlineIcon fontSize="inherit" />
+        </IconButton>
+      )}
     </Stack>
   );
 }

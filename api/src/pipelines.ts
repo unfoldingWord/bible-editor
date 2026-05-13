@@ -11,6 +11,7 @@ import { Hono } from "hono";
 import { z } from "zod";
 import type { Env } from "./index";
 import { currentUserId, requireAuth } from "./auth";
+import { importJobOutput } from "./pipelineImport";
 
 export const pipelines = new Hono<{
   Bindings: Env;
@@ -29,13 +30,37 @@ const NON_TERMINAL_STATES = new Set([
   "failed",
 ]);
 
+// Mirrors the bp-assistant contract (docs/ai-pipeline-integration.md §3).
+// .strict() rejects unknown keys so a typo here surfaces as a 400 rather
+// than getting silently dropped on its way upstream. Mutual-exclusion of
+// the align flags is checked client-side AND server-side here AND in
+// bp-assistant — three layers of paranoia is appropriate for a 1h run.
+const PipelineOptions = z
+  .object({
+    model: z.enum(["sonnet", "opus"]).optional(),
+    fresh: z.boolean().optional(),
+    // generate-only
+    contentTypes: z.array(z.enum(["ult", "ust"])).min(1).max(2).optional(),
+    noAlign: z.boolean().optional(),
+    alignOnly: z.boolean().optional(),
+    textOnly: z.boolean().optional(),
+    // notes-only
+    noIntro: z.boolean().optional(),
+    pauseBeforeATs: z.boolean().optional(),
+  })
+  .strict()
+  .refine(
+    (o) => [o.noAlign, o.alignOnly, o.textOnly].filter(Boolean).length <= 1,
+    { message: "align_flags_mutually_exclusive" },
+  );
+
 const StartBody = z.object({
   pipelineType: z.enum(PIPELINE_TYPES),
   book: z.string().min(1).max(8),
   startChapter: z.number().int().positive(),
   endChapter: z.number().int().positive().optional(),
   sessionKey: z.string().min(1).max(120).regex(/^[A-Za-z0-9_\-/]+$/),
-  options: z.object({ model: z.enum(["sonnet", "opus"]).optional() }).optional(),
+  options: PipelineOptions.optional(),
 });
 
 interface StartResponse {
@@ -201,11 +226,22 @@ pipelines.get("/:jobId", requireAuth, async (c) => {
   if (!jobId) return c.json({ error: "missing_job_id" }, 400);
 
   // Ownership check before any upstream call — prevents jobId enumeration.
+  // Also pulls the scope + output-status flag we need to gate the inbound
+  // importer on a state='done' transition.
   const owned = await c.env.DB.prepare(
-    `SELECT user_id FROM pipeline_jobs WHERE job_id = ?1`,
+    `SELECT user_id, pipeline_type, book, start_chapter, end_chapter,
+            (output_json IS NULL) AS no_output_yet
+       FROM pipeline_jobs WHERE job_id = ?1`,
   )
     .bind(jobId)
-    .first<{ user_id: number }>();
+    .first<{
+      user_id: number;
+      pipeline_type: string;
+      book: string;
+      start_chapter: number;
+      end_chapter: number;
+      no_output_yet: number;
+    }>();
   if (!owned) return c.json({ error: "not_found" }, 404);
   if (owned.user_id !== userId) return c.json({ error: "forbidden" }, 403);
 
@@ -234,6 +270,34 @@ pipelines.get("/:jobId", requireAuth, async (c) => {
     return c.json({ error: "upstream_malformed" }, 502);
   }
 
+  // First-time done transition with output present → stage proposals into
+  // pending_imports. If this throws (Door43 unreachable, parser bug), we
+  // leave output_json NULL so the next poll retries the import.
+  const shouldImport =
+    owned.no_output_yet === 1 &&
+    data.state === "done" &&
+    Array.isArray(data.output) &&
+    data.output.length > 0;
+  let importFailed = false;
+  if (shouldImport && data.output) {
+    try {
+      await importJobOutput(
+        c.env,
+        {
+          jobId,
+          pipelineType: owned.pipeline_type,
+          book: owned.book,
+          startChapter: owned.start_chapter,
+          endChapter: owned.end_chapter,
+        },
+        data.output,
+      );
+    } catch (err) {
+      importFailed = true;
+      console.error(`[pipelineImport] job=${jobId} failed:`, err);
+    }
+  }
+
   await c.env.DB.prepare(
     `UPDATE pipeline_jobs SET
        state = ?2,
@@ -254,7 +318,9 @@ pipelines.get("/:jobId", requireAuth, async (c) => {
       data.current?.status ?? null,
       data.current?.errorKind ?? null,
       data.current?.error ?? null,
-      data.output ? JSON.stringify(data.output) : null,
+      // Only persist output_json once the importer has staged the rows.
+      // Leaving it NULL on import failure makes the next poll retry.
+      data.output && !importFailed ? JSON.stringify(data.output) : null,
       text,
     )
     .run();

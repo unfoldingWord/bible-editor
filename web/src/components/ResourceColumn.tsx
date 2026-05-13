@@ -48,6 +48,11 @@ interface Props {
   onQuestionChange: (id: string, patch: Partial<TqRow>) => void;
   onQuestionDelete: (id: string) => void;
   onQuestionCreate: () => void;
+  // Chapter is locked for editing because an AI pipeline is mid-flight.
+  // Hides "new" buttons, propagates read-only to children.
+  locked?: boolean;
+  // Called when a TN's Keep checkbox is checked. Threaded through to NoteCard.
+  onKeepNote?: (id: string) => void;
 }
 
 type PinKey = "notes" | "words" | "questions";
@@ -125,6 +130,8 @@ export function ResourceColumn({
   onQuestionChange,
   onQuestionDelete,
   onQuestionCreate,
+  locked = false,
+  onKeepNote,
 }: Props) {
   const [pinned, setPinned] = useState<Pinned>(() => loadPinned());
   const togglePinned = (k: PinKey) => {
@@ -278,6 +285,7 @@ export function ResourceColumn({
           onTogglePin={() => togglePinned("notes")}
           onAdd={onNoteCreate}
           sticky
+          hideAdd={locked}
         />
         {tnGroups ? (
           tnGroups.length === 0 ? (
@@ -308,6 +316,7 @@ export function ResourceColumn({
           pinned={pinned.words}
           onTogglePin={() => togglePinned("words")}
           onAdd={onWordCreate}
+          hideAdd={locked}
         />
         {twlGroups ? (
           twlGroups.length === 0 ? (
@@ -325,6 +334,7 @@ export function ResourceColumn({
                   onDelete={onWordDelete}
                   onFocus={onWordFocus}
                   onReorder={onWordReorder}
+                  locked={locked}
                 />
               </Fragment>
             ))
@@ -337,6 +347,7 @@ export function ResourceColumn({
             onDelete={onWordDelete}
             onFocus={onWordFocus}
             onReorder={onWordReorder}
+            locked={locked}
           />
         )}
 
@@ -348,6 +359,7 @@ export function ResourceColumn({
           pinned={pinned.questions}
           onTogglePin={() => togglePinned("questions")}
           onAdd={onQuestionCreate}
+          hideAdd={locked}
         />
         {tqGroups ? (
           tqGroups.length === 0 ? (
@@ -358,12 +370,12 @@ export function ResourceColumn({
             tqGroups.map(([verse, rows]) => (
               <Fragment key={`tq-${verse}`}>
                 <VerseGroupHead verse={verse} active={verse === activeVerse} />
-                <QuestionsTable rows={rows} onChange={onQuestionChange} onDelete={onQuestionDelete} />
+                <QuestionsTable rows={rows} onChange={onQuestionChange} onDelete={onQuestionDelete} locked={locked} />
               </Fragment>
             ))
           )
         ) : (
-          <QuestionsTable rows={tqForVerse} onChange={onQuestionChange} onDelete={onQuestionDelete} />
+          <QuestionsTable rows={tqForVerse} onChange={onQuestionChange} onDelete={onQuestionDelete} locked={locked} />
         )}
       </Box>
     </Box>
@@ -415,6 +427,8 @@ export function ResourceColumn({
           isAiPending={isNoteAiPending?.(r.id) ?? false}
           aiRecentlyCompletedAt={noteAiRecentlyCompletedAt?.(r.id) ?? null}
           onVisibilityChange={onNoteVisibilityChange}
+          locked={locked}
+          onKeep={onKeepNote ? () => onKeepNote(r.id) : undefined}
         />
         {showAfter && <DropIndicator />}
       </Fragment>
@@ -474,6 +488,7 @@ function SectionHead({
   onTogglePin,
   onAdd,
   sticky,
+  hideAdd,
 }: {
   title: string;
   count: number;
@@ -481,6 +496,7 @@ function SectionHead({
   onTogglePin: () => void;
   onAdd: () => void;
   sticky?: boolean;
+  hideAdd?: boolean;
 }) {
   return (
     <Stack
@@ -518,16 +534,18 @@ function SectionHead({
         </IconButton>
       </Tooltip>
       <Box sx={{ flex: 1 }} />
-      <Button
-        size="small"
-        startIcon={<AddIcon fontSize="small" />}
-        color="success"
-        variant="outlined"
-        sx={{ minWidth: 0, fontSize: 11 }}
-        onClick={onAdd}
-      >
-        new
-      </Button>
+      {hideAdd ? null : (
+        <Button
+          size="small"
+          startIcon={<AddIcon fontSize="small" />}
+          color="success"
+          variant="outlined"
+          sx={{ minWidth: 0, fontSize: 11 }}
+          onClick={onAdd}
+        >
+          new
+        </Button>
+      )}
     </Stack>
   );
 }
