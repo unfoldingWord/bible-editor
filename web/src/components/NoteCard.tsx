@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { lazy, Suspense, useEffect, useRef, useState } from "react";
 import {
   Paper,
   Stack,
@@ -26,8 +26,11 @@ import AutoAwesomeIcon from "@mui/icons-material/AutoAwesome";
 import type { TnRow } from "../sync/api";
 import { useCatalogs } from "../hooks/useCatalogs";
 import { CatalogPicker } from "./CatalogPicker";
-import { NoteHistoryDialog } from "./NoteHistoryDialog";
 import { shortSupport } from "../lib/supportReference";
+
+const NoteHistoryDialog = lazy(() =>
+  import("./NoteHistoryDialog").then((m) => ({ default: m.NoteHistoryDialog })),
+);
 
 export type DropPosition = "before" | "after";
 
@@ -208,6 +211,10 @@ export function NoteCard({
     // Optimistic local apply so the parent's data.tn reflects the live
     // value — keeps verse highlighting / aligner quote in step.
     onChange(patch);
+  };
+
+  const stashLocalEdit = (patch: Partial<TnRow>) => {
+    pendingRef.current = { ...pendingRef.current, ...patch };
   };
 
   const handleUndo = () => {
@@ -597,7 +604,7 @@ export function NoteCard({
             value={note}
             onChange={(e) => {
               setNote(e.target.value);
-              stashEdit({ note: e.target.value });
+              stashLocalEdit({ note: e.target.value });
             }}
             multiline
             fullWidth
@@ -610,13 +617,15 @@ export function NoteCard({
         </Stack>
       </Box>
       {historyOpen && (
-        <NoteHistoryDialog
-          open={historyOpen}
-          noteId={row.id}
-          currentVersion={row.version}
-          onClose={() => setHistoryOpen(false)}
-          onUseVersion={handleUseVersion}
-        />
+        <Suspense fallback={null}>
+          <NoteHistoryDialog
+            open={historyOpen}
+            noteId={row.id}
+            currentVersion={row.version}
+            onClose={() => setHistoryOpen(false)}
+            onUseVersion={handleUseVersion}
+          />
+        </Suspense>
       )}
       <Dialog open={aiConfirmOpen} onClose={() => setAiConfirmOpen(false)}>
         <DialogTitle>Replace existing note?</DialogTitle>

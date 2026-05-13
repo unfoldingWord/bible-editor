@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Box, Stack, Typography, Paper, IconButton, Tooltip, ToggleButton, ToggleButtonGroup, Button } from "@mui/material";
 import LinkIcon from "@mui/icons-material/Link";
 import ViewColumnIcon from "@mui/icons-material/ViewColumn";
@@ -8,8 +8,7 @@ import SearchIcon from "@mui/icons-material/Search";
 import UndoIcon from "@mui/icons-material/Undo";
 import type { ChapterPayload, VerseDto } from "../sync/api";
 import { DocColumn } from "./DocColumn";
-import { BookView } from "./BookView";
-import { FindReplaceOverlay, type FindMatch } from "./FindReplaceOverlay";
+import type { FindMatch } from "./FindReplaceOverlay";
 import { HebrewLine } from "./HebrewLine";
 import type { LexiconEntry } from "../hooks/useLexicon";
 import type { ChapterState } from "../hooks/useBook";
@@ -85,6 +84,13 @@ const VERSION_LABEL: Record<string, string> = {
 };
 
 const READ_ONLY_VERSIONS = new Set(["UHB", "UGNT"]);
+
+const BookView = lazy(() =>
+  import("./BookView").then((m) => ({ default: m.BookView })),
+);
+const FindReplaceOverlay = lazy(() =>
+  import("./FindReplaceOverlay").then((m) => ({ default: m.FindReplaceOverlay })),
+);
 
 export function ScriptureColumn({
   book,
@@ -348,18 +354,20 @@ export function ScriptureColumn({
       </Stack>
       <Box ref={bodyRef} sx={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden" }}>
         {findOpen && (
-          <FindReplaceOverlay
-            open
-            onClose={closeFind}
-            book={book}
-            chapters={overlayChapters}
-            chapterList={overlayChapterList}
-            onLoadChapter={overlayLoadChapter}
-            enabledVersions={enabledVersions}
-            onReplaceVerse={onReplaceVerse}
-            onScrollToMatch={onFindScrollToMatch}
-            onQueryChange={onFindQueryChange}
-          />
+          <Suspense fallback={null}>
+            <FindReplaceOverlay
+              open
+              onClose={closeFind}
+              book={book}
+              chapters={overlayChapters}
+              chapterList={overlayChapterList}
+              onLoadChapter={overlayLoadChapter}
+              enabledVersions={enabledVersions}
+              onReplaceVerse={onReplaceVerse}
+              onScrollToMatch={onFindScrollToMatch}
+              onQueryChange={onFindQueryChange}
+            />
+          </Suspense>
         )}
         {mode === "stacked" ? (
           <StackedBody
@@ -379,24 +387,26 @@ export function ScriptureColumn({
             onEditVerse={onEditVerse}
           />
         ) : mode === "book" && bookChapterList && bookChapters && onLoadBookChapter && onSelectBookVerse && onEditBookVerse && onOpenBookAligner ? (
-          <BookView
-            book={book}
-            chapterList={bookChapterList}
-            chapters={bookChapters}
-            enabledVersions={enabledVersions}
-            activeChapter={chapter}
-            activeVerse={activeVerse}
-            activeNoteQuote={activeNoteQuote}
-            activeNoteOccurrence={activeNoteOccurrence}
-            scrollNonce={scrollNonce}
-            findQuery={findQuery}
-            findActiveMatch={findScrollTarget}
-            lexiconMap={lexiconMap}
-            onLoadChapter={onLoadBookChapter}
-            onSelectVerse={onSelectBookVerse}
-            onEditVerse={onEditBookVerse}
-            onOpenAligner={onOpenBookAligner}
-          />
+          <Suspense fallback={null}>
+            <BookView
+              book={book}
+              chapterList={bookChapterList}
+              chapters={bookChapters}
+              enabledVersions={enabledVersions}
+              activeChapter={chapter}
+              activeVerse={activeVerse}
+              activeNoteQuote={activeNoteQuote}
+              activeNoteOccurrence={activeNoteOccurrence}
+              scrollNonce={scrollNonce}
+              findQuery={findQuery}
+              findActiveMatch={findScrollTarget}
+              lexiconMap={lexiconMap}
+              onLoadChapter={onLoadBookChapter}
+              onSelectVerse={onSelectBookVerse}
+              onEditVerse={onEditBookVerse}
+              onOpenAligner={onOpenBookAligner}
+            />
+          </Suspense>
         ) : (
           <Box sx={{ flex: 1, display: "flex", gap: 1, p: 1, overflow: "hidden" }}>
             {enabledVersions.map((v) => (
