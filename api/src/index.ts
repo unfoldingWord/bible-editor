@@ -8,6 +8,7 @@ import { lexicon } from "./lexicon";
 import { exports as exportsRoutes } from "./exports";
 import { tnQuick } from "./tnQuick";
 import { pipelines } from "./pipelines";
+import { pendingImports } from "./pendingImports";
 import { attachAuth, mintDevToken, startDcsAuth, callbackDcsAuth, authMe } from "./auth";
 
 export interface Env {
@@ -121,6 +122,7 @@ app.route("/api/lexicon", lexicon);
 app.route("/api/exports", exportsRoutes);
 app.route("/api/tn-quick", tnQuick);
 app.route("/api/pipelines", pipelines);
+app.route("/api/pending-imports", pendingImports);
 
 // /api/* misses get the JSON 404. Anything else falls through to the static
 // SPA bundle (when the [assets] binding is configured for production deploy).

@@ -3,6 +3,7 @@ import { z } from "zod";
 import type { Env } from "./index";
 import type { VerseRow } from "./types";
 import { currentUserId, requireAuth } from "./auth";
+import { activePipelineForChapter, lockedResponseBody } from "./chapterLock";
 
 export const verses = new Hono<{ Bindings: Env; Variables: { userId?: number } }>();
 
@@ -75,6 +76,12 @@ verses.patch("/:book/:chapter/:verse/:bibleVersion", requireAuth, async (c) => {
   if (bibleVersion === "UHB" || bibleVersion === "UGNT") {
     return c.json({ error: "source_text_is_read_only" }, 403);
   }
+
+  // Lock verse writes while an AI pipeline targets this chapter. The
+  // auto-apply step overwrites verse content on completion; concurrent edits
+  // would race with it and silently lose to the AI result.
+  const lock = await activePipelineForChapter(c.env, book, chapter);
+  if (lock) return c.json(lockedResponseBody(lock), 409);
 
   const userId = currentUserId(c);
   const now = Math.floor(Date.now() / 1000);

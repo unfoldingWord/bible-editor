@@ -55,6 +55,11 @@ interface Props {
   onSelectVerse: (chapter: number, verse: number) => void;
   onEditVerse: (chapter: number, verse: number, bibleVersion: string, plain: string, base: VerseDto) => void;
   onOpenAligner: (chapter: number, verse: number, bibleVersion: string) => void;
+  // The active chapter is mid-pipeline. Locks editing on every chapter
+  // displayed in book mode — simplest defensive choice; AI typically scopes
+  // to one chapter so other chapters in view are still safe, but explaining
+  // "chapter X is locked, others aren't" is more confusing than it's worth.
+  locked?: boolean;
 }
 
 export function BookView({
@@ -74,6 +79,7 @@ export function BookView({
   onSelectVerse,
   onEditVerse,
   onOpenAligner,
+  locked = false,
 }: Props) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const activeRowRef = useRef<HTMLDivElement | null>(null);
@@ -187,6 +193,7 @@ export function BookView({
               onSelectVerse={onSelectVerse}
               onEditVerse={onEditVerse}
               onOpenAligner={onOpenAligner}
+              locked={locked}
             />
           ))}
         </Box>
@@ -219,6 +226,7 @@ function ChapterBlock({
   onSelectVerse,
   onEditVerse,
   onOpenAligner,
+  locked,
 }: {
   book: string;
   chapter: number;
@@ -237,6 +245,7 @@ function ChapterBlock({
   onSelectVerse: (chapter: number, verse: number) => void;
   onEditVerse: (chapter: number, verse: number, bibleVersion: string, plain: string, base: VerseDto) => void;
   onOpenAligner: (chapter: number, verse: number, bibleVersion: string) => void;
+  locked: boolean;
 }) {
   // Sentinel observed by IntersectionObserver — fires loadChapter when the
   // chapter is near (within ~one viewport of) the visible area.
@@ -364,6 +373,7 @@ function ChapterBlock({
             onSelectVerse={() => onSelectVerse(chapter, v)}
             onEditVerse={(bv, plain, base) => onEditVerse(chapter, v, bv, plain, base)}
             onOpenAligner={(bv) => onOpenAligner(chapter, v, bv)}
+            locked={locked}
           />
         );
       })}
@@ -387,6 +397,7 @@ function VerseRow({
   onSelectVerse,
   onEditVerse,
   onOpenAligner,
+  locked,
 }: {
   book: string;
   chapter: number;
@@ -403,6 +414,7 @@ function VerseRow({
   onSelectVerse: () => void;
   onEditVerse: (bv: string, plain: string, base: VerseDto) => void;
   onOpenAligner: (bv: string) => void;
+  locked: boolean;
 }) {
   // Render is intentionally a row of N independent cells driven by the same
   // grid container above — placement is via CSS grid auto-flow.
@@ -437,6 +449,7 @@ function VerseRow({
               lexiconMap={lexiconMap}
               onAlign={() => onOpenAligner(bv)}
               onEdit={(plain) => dto && onEditVerse(bv, plain, dto)}
+              locked={locked}
             />
           </Box>
         );
@@ -458,6 +471,7 @@ function VerseCell({
   lexiconMap,
   onAlign,
   onEdit,
+  locked,
 }: {
   chapter: number;
   verseNum: number;
@@ -471,8 +485,9 @@ function VerseCell({
   lexiconMap: Map<string, LexiconEntry | null>;
   onAlign: () => void;
   onEdit: (plain: string) => void;
+  locked: boolean;
 }) {
-  const readOnly = READ_ONLY.has(bibleVersion);
+  const readOnly = READ_ONLY.has(bibleVersion) || locked;
   const rtl = bibleVersion === "UHB";
   const isSource = bibleVersion === "UHB" || bibleVersion === "UGNT";
   // The active match is at most one cell; this is non-null only on that cell.

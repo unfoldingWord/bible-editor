@@ -15,9 +15,13 @@ interface Props {
   onDelete: (id: string) => void;
   onFocus: (row: TwlRow) => void;
   onReorder: (draggedId: string, refId: string, position: WordDropPosition) => void;
+  // Chapter has an active AI pipeline. Disables all interaction in this
+  // table — TWLs aren't AI-touched, but locking the whole chapter is
+  // simpler and avoids partial-edit confusion.
+  locked?: boolean;
 }
 
-export function WordsTable({ rows, activeId, onChange, onDelete, onFocus, onReorder }: Props) {
+export function WordsTable({ rows, activeId, onChange, onDelete, onFocus, onReorder, locked = false }: Props) {
   const [dragId, setDragId] = useState<string | null>(null);
   const [dragOver, setDragOver] = useState<
     { targetId: string; position: WordDropPosition } | null
@@ -31,7 +35,13 @@ export function WordsTable({ rows, activeId, onChange, onDelete, onFocus, onReor
     );
   }
   return (
-    <Paper variant="outlined" sx={{ overflow: "hidden" }}>
+    <Paper
+      variant="outlined"
+      sx={{
+        overflow: "hidden",
+        ...(locked ? { pointerEvents: "none", opacity: 0.6 } : null),
+      }}
+    >
       <Box
         sx={{
           display: "grid",

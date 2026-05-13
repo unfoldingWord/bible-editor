@@ -3,6 +3,7 @@ import { z } from "zod";
 import type { Env } from "./index";
 import type { RowKind, TnRow, TqRow, TwlRow } from "./types";
 import { currentUserId, requireAuth } from "./auth";
+import { activePipelineForChapter, lockedResponseBody } from "./chapterLock";
 
 export const rows = new Hono<{ Bindings: Env; Variables: { userId?: number } }>();
 
@@ -58,7 +59,9 @@ const TwlPatch = z.object({
 const PATCH_SCHEMA = { tn: TnPatch, tq: TqPatch, twl: TwlPatch };
 
 // Generate a 4-char alphanumeric ID matching the DCS sticky-id convention.
-function newRowId(): string {
+// Exported so the AI auto-apply path in pipelineImport.ts can mint TN ids
+// without duplicating the alphabet.
+export function newRowId(): string {
   const chars = "abcdefghijkmnpqrstuvwxyz23456789";
   let out = "";
   for (let i = 0; i < 4; i++) out += chars[Math.floor(Math.random() * chars.length)];
@@ -114,6 +117,15 @@ rows.post("/:kind", requireAuth, async (c) => {
   if (!parsed.success) return c.json({ error: "invalid_body", details: parsed.error.format() }, 400);
   const data = parsed.data as Record<string, unknown>;
   const userId = currentUserId(c);
+
+  // Block new rows while an AI pipeline is running for this chapter — the
+  // auto-apply step will overwrite or rearrange the row set when it lands.
+  const lock = await activePipelineForChapter(
+    c.env,
+    parsed.data.book,
+    parsed.data.chapter,
+  );
+  if (lock) return c.json(lockedResponseBody(lock), 409);
 
   // Retry around PK collision: insert under a fresh id and let the DB be the
   // source of truth instead of SELECT-then-INSERT (which races between two
@@ -349,6 +361,23 @@ rows.patch("/:kind/:id", requireAuth, async (c) => {
     return c.json({ error: "empty_patch" }, 400);
   }
 
+  // Lock check for non-tn kinds. TN edits are always allowed during a run —
+  // the first PATCH on an updated_by-NULL row implicitly "keeps" it; further
+  // PATCHes on already-kept rows are normal edits. tq/twl have no such
+  // carve-out: any pipeline writing to this chapter overwrites them.
+  if (kind !== "tn") {
+    const scope = await c.env.DB.prepare(
+      `SELECT book, chapter FROM ${KIND_TO_TABLE[kind]} WHERE id = ?1`,
+    )
+      .bind(id)
+      .first<{ book: string; chapter: number }>();
+    if (scope) {
+      const lock = await activePipelineForChapter(c.env, scope.book, scope.chapter);
+      if (lock) return c.json(lockedResponseBody(lock), 409);
+    }
+    // If the row doesn't exist the UPDATE below will return 404 the usual way.
+  }
+
   const userId = currentUserId(c);
   const now = Math.floor(Date.now() / 1000);
   const setClauses = fields.map((f, i) => `${f} = ?${i + 1}`);
@@ -423,6 +452,19 @@ rows.delete("/:kind/:id", requireAuth, async (c) => {
     return c.json({ error: "if_match_required" }, 428);
   }
 
+  // Lock check applies to all kinds on delete — no carve-out for tn here.
+  // The auto-apply step is responsible for removing un-kept TNs; manual
+  // deletion mid-run would race with it.
+  const scope = await c.env.DB.prepare(
+    `SELECT book, chapter FROM ${KIND_TO_TABLE[kind]} WHERE id = ?1`,
+  )
+    .bind(id)
+    .first<{ book: string; chapter: number }>();
+  if (scope) {
+    const lock = await activePipelineForChapter(c.env, scope.book, scope.chapter);
+    if (lock) return c.json(lockedResponseBody(lock), 409);
+  }
+
   const userId = currentUserId(c);
   const now = Math.floor(Date.now() / 1000);
   const newVersion = expected + 1;
@@ -453,4 +495,46 @@ rows.delete("/:kind/:id", requireAuth, async (c) => {
     return c.json({ error: "version_mismatch", current: fresh }, 409);
   }
   return c.json({ ok: true });
+});
+
+// POST /api/rows/tn/:id/keep — "claim" a TN during a pipeline run. Bumps the
+// row's version and sets updated_by to the caller; the auto-apply step then
+// treats the row as kept (updated_by IS NOT NULL) and won't soft-delete it.
+// Lock-exempt: this is the carve-out that lets translators preserve work
+// while the chapter is otherwise read-only. Idempotent — calling it on an
+// already-kept row just bumps the version again (cheap; no harm).
+rows.post("/tn/:id/keep", requireAuth, async (c) => {
+  const id = c.req.param("id");
+  const userId = currentUserId(c);
+  const now = Math.floor(Date.now() / 1000);
+
+  // Single batched UPDATE + audit row. The audit INSERT is conditional on the
+  // UPDATE affecting a live row, matching the pattern used elsewhere here.
+  const [updateRes] = await c.env.DB.batch([
+    c.env.DB
+      .prepare(
+        `UPDATE tn_rows
+           SET version = version + 1, updated_at = ?1, updated_by = ?2
+         WHERE id = ?3 AND deleted_at IS NULL`,
+      )
+      .bind(now, userId, id),
+    c.env.DB
+      .prepare(
+        `INSERT INTO edit_log (kind, row_key, user_id, prev_version, new_version, action)
+         SELECT 'tn', ?1, ?2, version - 1, version, 'keep'
+           FROM tn_rows
+          WHERE id = ?1 AND deleted_at IS NULL`,
+      )
+      .bind(id, userId),
+  ]);
+
+  if (!updateRes.meta.changes) {
+    return c.json({ error: "not_found" }, 404);
+  }
+  const updated = await c.env.DB.prepare(
+    `SELECT * FROM tn_rows WHERE id = ?1`,
+  )
+    .bind(id)
+    .first<TnRow>();
+  return c.json(updated);
 });

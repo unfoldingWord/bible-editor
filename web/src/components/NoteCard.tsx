@@ -15,6 +15,8 @@ import {
   DialogContentText,
   DialogActions,
   Button,
+  FormControlLabel,
+  Checkbox,
 } from "@mui/material";
 import DeleteOutlineIcon from "@mui/icons-material/DeleteOutline";
 import AddIcon from "@mui/icons-material/Add";
@@ -71,6 +73,14 @@ interface Props {
   // the in-place pulse. Default root (viewport) is good enough for our
   // resource column scroll setup.
   onVisibilityChange?: (rowId: string, isVisible: boolean) => void;
+  // Chapter has an active AI pipeline (state from pipelineStore). When
+  // true, untouched rows (updated_by IS NULL) are read-only and show a
+  // Keep checkbox; rows the user already touched (or just kept) are
+  // editable and show a "Kept" chip. Off → behaves normally.
+  locked?: boolean;
+  // Called when the user checks the Keep box on an untouched row during a
+  // run. Fires POST /api/rows/tn/:id/keep upstream.
+  onKeep?: () => void;
 }
 
 // Notes coming from TSV imports use literal "\n" (two characters) as the
@@ -117,7 +127,14 @@ export function NoteCard({
   aiRecentlyCompletedAt = null,
   onStartAi,
   onVisibilityChange,
+  locked = false,
+  onKeep,
 }: Props) {
+  // updated_by != null means a human has touched the row at some point; in a
+  // locked chapter that's our "keep this row" signal — kept rows stay
+  // editable, the auto-apply step skips them when it sweeps untouched TNs.
+  const isKept = row.updated_by !== null;
+  const readOnly = locked && !isKept;
   const [quote, setQuote] = useState(tsvToDisplay(row.quote));
   const [note, setNote] = useState(tsvToDisplay(row.note));
   const [supportRef, setSupportRef] = useState<string | null>(row.support_reference);
@@ -445,18 +462,53 @@ export function NoteCard({
           variant="outlined"
           sx={{ fontFamily: "monospace", fontSize: 11, height: 22 }}
         />
-        <CatalogPicker
-          value={supportRef}
-          options={catalogs.supportReferences}
-          display={(v) => (v ? shortSupport(v) : "+ support ref")}
-          placeholder="figs-, translate-, writing-, …"
-          color="primary"
-          variant={active ? "filled" : "outlined"}
-          onChange={(next) => {
-            setSupportRef(next);
-            stashEdit({ support_reference: next });
-          }}
-        />
+        {locked && !isKept && onKeep && (
+          <Tooltip title="Mark this note to survive the AI run. Other notes in this chapter will be replaced.">
+            <FormControlLabel
+              control={
+                <Checkbox
+                  size="small"
+                  checked={false}
+                  onChange={() => onKeep()}
+                  sx={{ p: 0.25 }}
+                />
+              }
+              label={
+                <Typography variant="caption" sx={{ fontWeight: 500 }}>
+                  Keep
+                </Typography>
+              }
+              sx={{ ml: 0, mr: 0 }}
+            />
+          </Tooltip>
+        )}
+        {locked && isKept && (
+          <Tooltip title="This note is marked Kept — the AI run won't replace it.">
+            <Chip
+              label="Kept"
+              size="small"
+              color="success"
+              variant="outlined"
+              sx={{ fontFamily: "monospace", fontSize: 11, height: 22 }}
+            />
+          </Tooltip>
+        )}
+        <Box
+          sx={readOnly ? { pointerEvents: "none", opacity: 0.6 } : undefined}
+        >
+          <CatalogPicker
+            value={supportRef}
+            options={catalogs.supportReferences}
+            display={(v) => (v ? shortSupport(v) : "+ support ref")}
+            placeholder="figs-, translate-, writing-, …"
+            color="primary"
+            variant={active ? "filled" : "outlined"}
+            onChange={(next) => {
+              setSupportRef(next);
+              stashEdit({ support_reference: next });
+            }}
+          />
+        </Box>
         <Typography variant="caption" sx={{ color: "text.disabled", fontFamily: "monospace" }}>
           {row.ref_raw}
         </Typography>
@@ -515,16 +567,20 @@ export function NoteCard({
             </Tooltip>
           </>
         )}
-        <Tooltip title="add a new note after this one">
-          <IconButton size="small" onClick={onInsertAfter} color="success" sx={{ p: 0.25 }}>
-            <AddIcon fontSize="inherit" />
-          </IconButton>
-        </Tooltip>
-        <Tooltip title="delete this note">
-          <IconButton size="small" onClick={handleDelete} color="error" sx={{ p: 0.25 }}>
-            <DeleteOutlineIcon fontSize="inherit" />
-          </IconButton>
-        </Tooltip>
+        {!readOnly && (
+          <>
+            <Tooltip title="add a new note after this one">
+              <IconButton size="small" onClick={onInsertAfter} color="success" sx={{ p: 0.25 }}>
+                <AddIcon fontSize="inherit" />
+              </IconButton>
+            </Tooltip>
+            <Tooltip title="delete this note">
+              <IconButton size="small" onClick={handleDelete} color="error" sx={{ p: 0.25 }}>
+                <DeleteOutlineIcon fontSize="inherit" />
+              </IconButton>
+            </Tooltip>
+          </>
+        )}
       </Stack>
       <Box sx={{ p: 1 }}>
         <Stack direction="row" spacing={1} alignItems="flex-start" sx={{ mb: 0.5 }}>
@@ -553,6 +609,7 @@ export function NoteCard({
             size="small"
             spellCheck={false}
             onFocus={onFocus}
+            InputProps={{ readOnly }}
             inputProps={{
               dir: "rtl",
               style: {
@@ -598,7 +655,7 @@ export function NoteCard({
                 <IconButton
                   size="small"
                   onClick={handleAiClick}
-                  disabled={!onStartAi || !aiPrereqsMet || isAiPending}
+                  disabled={!onStartAi || !aiPrereqsMet || isAiPending || readOnly}
                   sx={{ p: 0.25, color: "secondary.main" }}
                 >
                   {isAiPending ? (
@@ -622,6 +679,7 @@ export function NoteCard({
             size="small"
             spellCheck
             onFocus={onFocus}
+            InputProps={{ readOnly }}
             inputProps={{ style: { fontSize: 13, lineHeight: 1.5, fontFamily: '"Source Serif Pro","Cambria","Times New Roman",serif' } }}
           />
         </Stack>
