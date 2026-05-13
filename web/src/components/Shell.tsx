@@ -1,4 +1,4 @@
-import { lazy, Suspense, useCallback, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Box, Typography, CircularProgress, Alert } from "@mui/material";
 import { useChapter } from "../hooks/useChapter";
 import type { UseBookReturn } from "../hooks/useBook";
@@ -15,6 +15,9 @@ import { ScriptureColumn, type ScriptureMode } from "./ScriptureColumn";
 import { ResourceColumn } from "./ResourceColumn";
 import { TopBar } from "./TopBar";
 import { SyncStatusBar } from "./SyncStatusBar";
+import { PipelineMenu } from "./PipelineMenu";
+import { PipelineStatusBar } from "./PipelineStatusBar";
+import { pipelineStore } from "../sync/pipelineStore";
 import { AiCompletionToasts } from "./AiCompletionToasts";
 import { collectStrongs } from "./HebrewLine";
 
@@ -83,6 +86,32 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook }:
   // when the active selection changes through other paths).
   const [scrollNonce, setScrollNonce] = useState(0);
   const requestScrollToActive = useCallback(() => setScrollNonce((n) => n + 1), []);
+
+  // Toast state shared between the pipeline trigger menu and the status bar.
+  // Cleared on dismiss or after a short auto-timeout.
+  const [pipelineToast, setPipelineToast] = useState<{ id: number; text: string; kind: "success" | "error" | "info" } | null>(null);
+  const pipelineToastIdRef = useRef(0);
+  const pushPipelineToast = useCallback((text: string, kind: "success" | "error" | "info" = "info") => {
+    pipelineToastIdRef.current += 1;
+    setPipelineToast({ id: pipelineToastIdRef.current, text, kind });
+  }, []);
+  useEffect(() => {
+    if (!pipelineToast) return;
+    const id = pipelineToast.id;
+    const t = setTimeout(() => {
+      setPipelineToast((cur) => (cur && cur.id === id ? null : cur));
+    }, 8000);
+    return () => clearTimeout(t);
+  }, [pipelineToast]);
+  useEffect(() =>
+    pipelineStore.onComplete((job, prev) => {
+      const where = `${job.book} ${job.start_chapter}`;
+      if (job.state === "done") {
+        pushPipelineToast(`AI ${job.pipeline_type} ready for ${where}. Review coming soon.`, "success");
+      } else if (job.state === "failed" && prev !== "failed") {
+        pushPipelineToast(`AI ${job.pipeline_type} failed for ${where}: ${job.error_kind ?? "error"}`, "error");
+      }
+    }), [pushPipelineToast]);
 
   // Async AI-draft lifecycle. State outlives any single NoteCard so the
   // user can scroll away / edit a different note while one is in flight.
@@ -262,6 +291,23 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook }:
           onNavigate?.(b, c);
         }}
       />
+      <Box
+        sx={{
+          display: "flex",
+          justifyContent: "flex-end",
+          px: 2,
+          py: 0.5,
+          borderBottom: "1px solid",
+          borderColor: "divider",
+          bgcolor: "background.paper",
+        }}
+      >
+        <PipelineMenu
+          book={book}
+          chapter={chapter}
+          onMessage={(msg) => pushPipelineToast(msg, "info")}
+        />
+      </Box>
       <Box sx={{ flex: 1, display: "flex", overflow: "hidden" }}>
         <TimelineRail
           book={book}
@@ -601,6 +647,10 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook }:
           setActiveWordId(null);
           requestScrollToActive();
         }}
+      />
+      <PipelineStatusBar
+        toast={pipelineToast}
+        onToastClear={() => setPipelineToast(null)}
       />
       <SyncStatusBar />
     </Box>

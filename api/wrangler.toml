@@ -59,8 +59,9 @@ crons = ["0 6 * * *"]
 # DEV_AUTH_ENABLED gates the /api/auth/dev mint endpoint; must be unset in prod.
 # DCS_EXPORT_OWNER / DCS_EXPORT_BRANCH control where nightly exports land on
 # DCS. Defaults: unfoldingWord owner, "live-snapshot" branch. Override per env.
-# BT_API_TOKEN (secret) authorizes /api/tn-quick → uw-bt-bot. Absence disables
-# the route. TN_QUICK_URL overrides the bot URL (default below).
+# BT_API_TOKEN (secret) authorizes /api/tn-quick + /api/pipelines/* → uw-bt-bot.
+# Absence disables those routes. TN_QUICK_URL overrides the tn-quick endpoint;
+# PIPELINE_API_BASE overrides the base URL for /api/pipeline/* (defaults below).
 [vars]
 DCS_BASE_URL = "https://git.door43.org"
 DCS_OAUTH_AUTHORIZE_URL = "https://git.door43.org/login/oauth/authorize"
@@ -72,3 +73,4 @@ DEV_AUTH_ENABLED = "true"
 DCS_EXPORT_OWNER = "unfoldingWord"
 DCS_EXPORT_BRANCH = "live-snapshot"
 TN_QUICK_URL = "https://uw-bt-bot.fly.dev/api/tn-quick"
+PIPELINE_API_BASE = "https://uw-bt-bot.fly.dev"

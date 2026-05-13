@@ -7,6 +7,7 @@ import { catalogs } from "./catalogs";
 import { lexicon } from "./lexicon";
 import { exports as exportsRoutes } from "./exports";
 import { tnQuick } from "./tnQuick";
+import { pipelines } from "./pipelines";
 import { attachAuth, mintDevToken, startDcsAuth, callbackDcsAuth, authMe } from "./auth";
 
 export interface Env {
@@ -40,6 +41,10 @@ export interface Env {
   // Override the bot URL (defaults to https://uw-bt-bot.fly.dev/api/tn-quick
   // when unset). Useful for staging / local bot dev.
   TN_QUICK_URL?: string;
+  // Base URL for the bp-assistant pipeline API (POST /api/pipeline/start,
+  // GET /api/pipeline/:jobId). Defaults to the prod bot at uw-bt-bot.fly.dev
+  // when unset.
+  PIPELINE_API_BASE?: string;
 }
 
 const app = new Hono<{ Bindings: Env; Variables: { userId?: number; username?: string } }>();
@@ -115,6 +120,7 @@ app.route("/api/catalogs", catalogs);
 app.route("/api/lexicon", lexicon);
 app.route("/api/exports", exportsRoutes);
 app.route("/api/tn-quick", tnQuick);
+app.route("/api/pipelines", pipelines);
 
 // /api/* misses get the JSON 404. Anything else falls through to the static
 // SPA bundle (when the [assets] binding is configured for production deploy).

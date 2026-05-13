@@ -263,6 +263,95 @@ export interface TnQuickResponse {
   warnings: string[];
 }
 
+// ── AI pipeline (chapter-scale) — see docs/ai-pipeline-integration.md ──────
+// Types mirror the bp-assistant client-side contract; both sides change
+// together if the contract is revised.
+
+export type PipelineType = "generate" | "notes" | "tqs";
+
+export type PipelineState =
+  | "running"
+  | "paused_for_outage"
+  | "paused_for_usage_limit"
+  | "failed"
+  | "done";
+
+export type PipelineErrorKind =
+  | "transient_outage"
+  | "auth_error"
+  | "usage_limit"
+  | "sdk_error"
+  | "non_success_result"
+  | "missing_output"
+  | "stale_output"
+  | "interrupted";
+
+export interface PipelineStartRequest {
+  pipelineType: PipelineType;
+  book: string;
+  startChapter: number;
+  endChapter?: number;
+  sessionKey: string;
+  options?: { model?: "sonnet" | "opus" };
+}
+
+export interface PipelineStartResponse {
+  jobId: string;
+  scope: { book: string; startChapter: number; endChapter: number };
+  status: "running" | "already_running";
+}
+
+export interface PipelineOutput {
+  type: "ult" | "ust" | "tn" | "tq";
+  repo: string;
+  branch: string;
+  path: string;
+  rawUrl: string;
+  prNumber: number;
+  mergedAt: string;
+  commitSha: string;
+}
+
+export interface PipelineStatusResponse {
+  jobId: string;
+  pipelineType: PipelineType;
+  scope: { book: string; startChapter: number; endChapter: number };
+  state: PipelineState;
+  current?: {
+    chapter: number;
+    skill: string;
+    status: "running" | "succeeded" | "failed" | "skipped_complete";
+    startedAt: string;
+    errorKind?: PipelineErrorKind;
+    error?: string;
+  };
+  updatedAt: string;
+  createdAt: string;
+  interrupted?: boolean;
+  output?: PipelineOutput[];
+}
+
+// Row shape returned by GET /api/pipelines (list). Columns are snake_case —
+// this is the persisted D1 row, not the live upstream response shape.
+export interface PipelineJobRow {
+  job_id: string;
+  user_id: number;
+  pipeline_type: PipelineType;
+  book: string;
+  start_chapter: number;
+  end_chapter: number;
+  session_key: string;
+  state: PipelineState;
+  current_skill: string | null;
+  current_status: string | null;
+  error_kind: PipelineErrorKind | null;
+  error_message: string | null;
+  output_json: string | null;
+  created_at: number;
+  updated_at: number;
+  last_polled_at: number | null;
+}
+
 export const api = {
   getBookSummary: (book: string) =>
     request<BookSummary>(`/api/chapters/${encodeURIComponent(book)}`),
@@ -337,4 +426,28 @@ export const api = {
       body: JSON.stringify(body),
       signal,
     }),
+
+  pipelineStart: (body: PipelineStartRequest, signal?: AbortSignal) =>
+    request<PipelineStartResponse>(`/api/pipelines/start`, {
+      method: "POST",
+      body: JSON.stringify(body),
+      signal,
+    }),
+
+  pipelineStatus: (jobId: string, signal?: AbortSignal) =>
+    request<PipelineStatusResponse>(
+      `/api/pipelines/${encodeURIComponent(jobId)}`,
+      { signal },
+    ),
+
+  pipelineList: (
+    states?: PipelineState[],
+    signal?: AbortSignal,
+  ) =>
+    request<{ jobs: PipelineJobRow[] }>(
+      states && states.length > 0
+        ? `/api/pipelines?state=${encodeURIComponent(states.join(","))}`
+        : `/api/pipelines`,
+      { signal },
+    ),
 };
