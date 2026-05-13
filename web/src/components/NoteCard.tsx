@@ -44,8 +44,11 @@ interface Props {
   // NOT hit the outbox.
   onChange: (patch: Partial<TnRow>) => void;
   // Enqueue a row PATCH. Called once per edit session — at session end
-  // (active going false), on manual save, or on unmount.
-  onSave: (patch: Partial<TnRow>) => void;
+  // (active going false), on manual save, or on unmount. When the patch
+  // comes from "switch to v{N}" in the history dialog, opts carries the
+  // origin version so the server can mark the new edit_log entry + row
+  // column for chip-label purposes.
+  onSave: (patch: Partial<TnRow>, opts?: { restoredFromVersion?: number }) => void;
   onDelete: () => void;
   onInsertAfter: () => void;
   onFocus?: () => void;
@@ -244,11 +247,14 @@ export function NoteCard({
   // edit_log, including the v(current) we're moving away from. Local
   // state is rewritten outright so any in-progress session is discarded
   // in favor of the chosen version.
-  const handleUseVersion = (snap: {
-    quote: string | null;
-    note: string | null;
-    support_reference: string | null;
-  }) => {
+  const handleUseVersion = (
+    snap: {
+      quote: string | null;
+      note: string | null;
+      support_reference: string | null;
+    },
+    fromVersion: number,
+  ) => {
     const rawQuote = snap.quote ?? "";
     const rawNote = snap.note ?? "";
     const rawSr = snap.support_reference ?? null;
@@ -278,7 +284,7 @@ export function NoteCard({
     if (rawSr !== row.support_reference) patch.support_reference = rawSr;
     if (Object.keys(patch).length === 0) return;
     onChange(patch);
-    onSave(patch);
+    onSave(patch, { restoredFromVersion: fromVersion });
   };
 
   const aiPrereqsMet = !!supportRef && quote.trim().length > 0;
@@ -456,10 +462,14 @@ export function NoteCard({
         </Typography>
         <Box sx={{ flex: 1 }} />
         <Tooltip
-          title={`v${row.version}${hasNetChanges ? " · unsaved edits" : ""} — saved ${row.version - 1} time${row.version - 1 === 1 ? "" : "s"}; last update ${new Date(row.updated_at * 1000).toLocaleString()}. Click to view history.`}
+          title={
+            row.restored_from_version != null
+              ? `v${row.restored_from_version} (restored)${hasNetChanges ? " · unsaved edits" : ""} — currently at row v${row.version}; last update ${new Date(row.updated_at * 1000).toLocaleString()}. Click to view history.`
+              : `v${row.version}${hasNetChanges ? " · unsaved edits" : ""} — saved ${row.version - 1} time${row.version - 1 === 1 ? "" : "s"}; last update ${new Date(row.updated_at * 1000).toLocaleString()}. Click to view history.`
+          }
         >
           <Chip
-            label={`v${row.version}${hasNetChanges ? "*" : ""}`}
+            label={`v${row.restored_from_version ?? row.version}${hasNetChanges ? "*" : ""}`}
             size="small"
             variant="outlined"
             clickable
@@ -622,6 +632,7 @@ export function NoteCard({
             open={historyOpen}
             noteId={row.id}
             currentVersion={row.version}
+            effectiveVersion={row.restored_from_version ?? row.version}
             onClose={() => setHistoryOpen(false)}
             onUseVersion={handleUseVersion}
           />

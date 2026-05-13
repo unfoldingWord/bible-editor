@@ -213,6 +213,7 @@ rows.get("/:kind/:id/history", async (c) => {
             el.action,
             el.created_at,
             el.payload_json,
+            el.restored_from_version,
             u.id AS user_id,
             u.dcs_username AS username,
             u.dcs_full_name AS full_name
@@ -227,6 +228,7 @@ rows.get("/:kind/:id/history", async (c) => {
       action: string;
       created_at: number;
       payload_json: string | null;
+      restored_from_version: number | null;
       user_id: number | null;
       username: string | null;
       full_name: string | null;
@@ -251,6 +253,7 @@ rows.get("/:kind/:id/history", async (c) => {
           payload_json: JSON.stringify(
             Object.fromEntries(fields.map((f) => [f, currentRow[f] ?? null])),
           ),
+          restored_from_version: null,
           user_id: null,
           username: null,
           full_name: null,
@@ -292,6 +295,7 @@ rows.get("/:kind/:id/history", async (c) => {
       patch: trimmedPatch,
       snapshot: trimmedSnapshot,
       synthetic: e.synthetic ?? false,
+      restored_from_version: e.restored_from_version ?? null,
     };
   });
 
@@ -319,6 +323,20 @@ rows.patch("/:kind/:id", requireAuth, async (c) => {
     return c.json({ error: "invalid_body" }, 400);
   }
 
+  // restored_from_version is a metadata flag sent alongside the content
+  // patch when the user picks "switch to v{N}" from the history dialog. The
+  // row's DB version still climbs monotonically (needed for optimistic
+  // concurrency), but this flag lets the UI display the chip as v{N}. Any
+  // normal edit comes in without this flag, which clears the marker.
+  let restoredFromVersion: number | null = null;
+  if (body && typeof body === "object" && "restored_from_version" in body) {
+    const raw = (body as Record<string, unknown>).restored_from_version;
+    if (typeof raw === "number" && Number.isFinite(raw) && raw >= 1) {
+      restoredFromVersion = Math.floor(raw);
+    }
+    delete (body as Record<string, unknown>).restored_from_version;
+  }
+
   const schema = PATCH_SCHEMA[kind];
   const parsed = schema.safeParse(body);
   if (!parsed.success) {
@@ -340,10 +358,12 @@ rows.patch("/:kind/:id", requireAuth, async (c) => {
   setClauses.push(`version = version + 1`);
   setClauses.push(`updated_at = ?${baseParams + 1}`);
   setClauses.push(`updated_by = ?${baseParams + 2}`);
+  setClauses.push(`restored_from_version = ?${baseParams + 3}`);
   const values = [
     ...fields.map((f) => (patch as Record<string, unknown>)[f]),
     now,
     userId,
+    restoredFromVersion,
     id,
     expected,
   ];
@@ -359,18 +379,18 @@ rows.patch("/:kind/:id", requireAuth, async (c) => {
       .prepare(
         `UPDATE ${KIND_TO_TABLE[kind]}
            SET ${setClauses.join(", ")}
-         WHERE id = ?${baseParams + 3}
-           AND version = ?${baseParams + 4}
+         WHERE id = ?${baseParams + 4}
+           AND version = ?${baseParams + 5}
            AND deleted_at IS NULL`,
       )
       .bind(...values),
     c.env.DB
       .prepare(
-        `INSERT INTO edit_log (kind, row_key, user_id, prev_version, new_version, action, payload_json)
-         SELECT ?1, ?2, ?3, ?4, ?5, 'update', ?6
+        `INSERT INTO edit_log (kind, row_key, user_id, prev_version, new_version, action, payload_json, restored_from_version)
+         SELECT ?1, ?2, ?3, ?4, ?5, 'update', ?6, ?7
          WHERE EXISTS (SELECT 1 FROM ${KIND_TO_TABLE[kind]} WHERE id = ?2 AND version = ?5)`,
       )
-      .bind(kind, id, userId, expected, newVersion, JSON.stringify(patch)),
+      .bind(kind, id, userId, expected, newVersion, JSON.stringify(patch), restoredFromVersion),
   ]);
 
   if (!updateRes.meta.changes) {

@@ -15,6 +15,7 @@ export interface TnRow {
   note: string | null;
   sort_order: number | null;
   version: number;
+  restored_from_version: number | null;
   updated_by: number | null;
   updated_at: number;
   deleted_at: number | null;
@@ -32,6 +33,7 @@ export interface TqRow {
   question: string | null;
   response: string | null;
   version: number;
+  restored_from_version: number | null;
   updated_by: number | null;
   updated_at: number;
   deleted_at: number | null;
@@ -49,6 +51,7 @@ export interface TwlRow {
   tw_link: string | null;
   sort_order: number | null;
   version: number;
+  restored_from_version: number | null;
   updated_by: number | null;
   updated_at: number;
   deleted_at: number | null;

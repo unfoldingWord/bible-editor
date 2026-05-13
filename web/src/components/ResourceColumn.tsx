@@ -20,7 +20,11 @@ interface Props {
   // scripture column.
   scrollNonce: number;
   onNoteChange: (id: string, patch: Partial<TnRow>) => void;
-  onNoteSave: (id: string, patch: Partial<TnRow>) => void;
+  onNoteSave: (
+    id: string,
+    patch: Partial<TnRow>,
+    opts?: { restoredFromVersion?: number },
+  ) => void;
   onNoteDelete: (id: string) => void;
   onNoteInsertAfter: (refId: string) => void;
   onNoteReorder: (draggedId: string, refId: string, position: DropPosition) => void;
@@ -379,7 +383,7 @@ export function ResourceColumn({
           dragging={dragId === r.id}
           isDropTarget={dragId !== null && dragId !== r.id}
           onChange={(p) => onNoteChange(r.id, p)}
-          onSave={(p) => onNoteSave(r.id, p)}
+          onSave={(p, opts) => onNoteSave(r.id, p, opts)}
           onDelete={() => onNoteDelete(r.id)}
           onInsertAfter={() => onNoteInsertAfter(r.id)}
           onFocus={() => onNoteFocus(r)}

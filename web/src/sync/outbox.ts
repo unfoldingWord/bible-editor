@@ -46,6 +46,10 @@ export interface OutboxOp {
   status: OpStatus;
   lastError?: string;
   conflictCurrent?: unknown;
+  // Set when this patch came from "switch to v{N}" in the history dialog.
+  // The server stores it on the new edit_log entry + the row's column so
+  // the UI can label the chip v{N} even though row.version is now N+1.
+  restoredFromVersion?: number;
 }
 
 type Subscriber = (ops: OutboxOp[]) => void;
@@ -106,6 +110,7 @@ export const outbox = {
     id: string,
     expectedVersion: number,
     patch: Record<string, unknown>,
+    opts?: { restoredFromVersion?: number },
   ): Promise<OutboxOp> {
     const op: OutboxOp = {
       id: uid(),
@@ -116,6 +121,9 @@ export const outbox = {
       queuedAt: Date.now(),
       attempts: 0,
       status: "pending",
+      ...(opts?.restoredFromVersion !== undefined
+        ? { restoredFromVersion: opts.restoredFromVersion }
+        : {}),
     };
     await (await db()).put(STORE, op);
     void notify();
@@ -282,6 +290,9 @@ async function dispatch(op: OutboxOp): Promise<Result> {
           op.target.id,
           op.expectedVersion,
           op.patch,
+          op.restoredFromVersion !== undefined
+            ? { restoredFromVersion: op.restoredFromVersion }
+            : undefined,
         );
       }
     } else if (op.target.kind === "verse_status") {

@@ -17,6 +17,7 @@ export interface TnRow {
   note: string | null;
   sort_order: number | null;
   version: number;
+  restored_from_version: number | null;
   updated_by: number | null;
   updated_at: number;
   deleted_at: number | null;
@@ -34,6 +35,7 @@ export interface TqRow {
   question: string | null;
   response: string | null;
   version: number;
+  restored_from_version: number | null;
   updated_by: number | null;
   updated_at: number;
   deleted_at: number | null;
@@ -51,6 +53,7 @@ export interface TwlRow {
   tw_link: string | null;
   sort_order: number | null;
   version: number;
+  restored_from_version: number | null;
   updated_by: number | null;
   updated_at: number;
   deleted_at: number | null;
@@ -209,6 +212,10 @@ export interface RowHistoryEntry {
   // after this entry was applied.
   snapshot: Record<string, unknown>;
   synthetic: boolean;
+  // Set when this entry was created by "switch to v{N}" from the history
+  // dialog. The snapshot is identical to v{N}'s, so the UI hides these
+  // phantom entries and surfaces the restored version as current instead.
+  restored_from_version: number | null;
 }
 
 export interface RowHistory {
@@ -289,11 +296,16 @@ export const api = {
     id: string,
     expectedVersion: number,
     patch: Record<string, unknown>,
+    opts?: { restoredFromVersion?: number | null },
   ) =>
     request<T>(`/api/rows/${kind}/${encodeURIComponent(id)}`, {
       method: "PATCH",
       headers: { "If-Match": String(expectedVersion) },
-      body: JSON.stringify(patch),
+      body: JSON.stringify(
+        opts && typeof opts.restoredFromVersion === "number"
+          ? { ...patch, restored_from_version: opts.restoredFromVersion }
+          : patch,
+      ),
     }),
 
   deleteRow: (kind: RowKind, id: string, expectedVersion: number) =>

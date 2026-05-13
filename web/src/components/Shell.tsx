@@ -204,9 +204,18 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook }:
     kind: "tn" | "tq" | "twl",
     row: T,
     patch: Partial<T>,
+    opts?: { restoredFromVersion?: number },
   ) => {
-    applyLocalRowPatch(kind, row.id, patch as Partial<TnRow & TqRow & TwlRow>);
-    void outbox.enqueueRow(kind, row.id, row.version, patch as Record<string, unknown>);
+    // Optimistic local apply mirrors what the server will do: any non-revert
+    // patch clears the restored_from_version marker so the chip immediately
+    // drops the v{N} override instead of waiting for the round-trip.
+    const localPatch = {
+      ...patch,
+      restored_from_version:
+        opts?.restoredFromVersion !== undefined ? opts.restoredFromVersion : null,
+    } as Partial<TnRow & TqRow & TwlRow>;
+    applyLocalRowPatch(kind, row.id, localPatch);
+    void outbox.enqueueRow(kind, row.id, row.version, patch as Record<string, unknown>, opts);
   };
 
   // Plain-text edit pipeline shared by the doc / book / aligner-strip
@@ -363,9 +372,9 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook }:
           onNoteChange={(id, patch) => {
             applyLocalRowPatch("tn", id, patch);
           }}
-          onNoteSave={(id, patch) => {
+          onNoteSave={(id, patch, opts) => {
             const row = data.tn.find((r) => r.id === id);
-            if (row) enqueueRow("tn", row, patch);
+            if (row) enqueueRow("tn", row, patch, opts);
           }}
           onNoteFocus={(row) => {
             setActiveNoteId(row.id);
