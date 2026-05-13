@@ -3,7 +3,7 @@ import { Box, Stack, Typography, Chip, Button, IconButton, Tooltip } from "@mui/
 import AddIcon from "@mui/icons-material/Add";
 import PushPinIcon from "@mui/icons-material/PushPin";
 import PushPinOutlinedIcon from "@mui/icons-material/PushPinOutlined";
-import type { TnRow, TqRow, TwlRow, TnQuickResponse } from "../sync/api";
+import type { TnRow, TqRow, TwlRow } from "../sync/api";
 import { NoteCard, type DropPosition } from "./NoteCard";
 import { WordsTable, type WordDropPosition } from "./WordsTable";
 import { QuestionsTable } from "./QuestionsTable";
@@ -26,9 +26,16 @@ interface Props {
   onNoteReorder: (draggedId: string, refId: string, position: DropPosition) => void;
   onNoteFocus: (row: TnRow) => void;
   onNoteCreate: () => void;
-  // Optional — when provided, NoteCard renders an enabled AI sparkles
-  // button. Shell builds the request from its ChapterPayload.
-  onNoteAiDraft?: (row: TnRow, signal: AbortSignal) => Promise<TnQuickResponse>;
+  // Async AI-draft wiring. All optional — when absent, sparkles hides.
+  // start fires the request (returns immediately); the result lands
+  // later via the row patch pipeline. The two read-only accessors let
+  // each NoteCard show its spinner / pulse independently. Visibility
+  // bubbles up to Shell so it can route completions to either the
+  // in-place pulse or the off-screen toast stack.
+  onNoteStartAi?: (row: TnRow) => void;
+  isNoteAiPending?: (rowId: string) => boolean;
+  noteAiRecentlyCompletedAt?: (rowId: string) => number | null;
+  onNoteVisibilityChange?: (rowId: string, isVisible: boolean) => void;
   onWordChange: (id: string, patch: Partial<TwlRow>) => void;
   onWordDelete: (id: string) => void;
   onWordCreate: () => void;
@@ -102,7 +109,10 @@ export function ResourceColumn({
   onNoteReorder,
   onNoteFocus,
   onNoteCreate,
-  onNoteAiDraft,
+  onNoteStartAi,
+  isNoteAiPending,
+  noteAiRecentlyCompletedAt,
+  onNoteVisibilityChange,
   onWordChange,
   onWordDelete,
   onWordCreate,
@@ -397,7 +407,10 @@ export function ResourceColumn({
             setDragId(null);
             setDragOver(null);
           }}
-          onAiDraft={onNoteAiDraft ? (signal) => onNoteAiDraft(r, signal) : undefined}
+          onStartAi={onNoteStartAi ? () => onNoteStartAi(r) : undefined}
+          isAiPending={isNoteAiPending?.(r.id) ?? false}
+          aiRecentlyCompletedAt={noteAiRecentlyCompletedAt?.(r.id) ?? null}
+          onVisibilityChange={onNoteVisibilityChange}
         />
         {showAfter && <DropIndicator />}
       </Fragment>

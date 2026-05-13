@@ -1,8 +1,9 @@
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useMemo, useRef, useState } from "react";
 import { Box, Typography, CircularProgress, Alert } from "@mui/material";
 import { useChapter } from "../hooks/useChapter";
 import type { UseBookReturn } from "../hooks/useBook";
 import { useLexicon } from "../hooks/useLexicon";
+import { useAiDrafts } from "../hooks/useAiDrafts";
 import { outbox } from "../sync/outbox";
 import { api } from "../sync/api";
 import type { TnRow, TqRow, TwlRow, VerseDto } from "../sync/api";
@@ -15,6 +16,7 @@ import { ResourceColumn } from "./ResourceColumn";
 import { AlignmentDialog } from "./AlignmentDialog";
 import { TopBar } from "./TopBar";
 import { SyncStatusBar } from "./SyncStatusBar";
+import { AiCompletionToasts } from "./AiCompletionToasts";
 import { collectStrongs } from "./HebrewLine";
 
 interface AlignerTarget {
@@ -78,6 +80,18 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook }:
   // when the active selection changes through other paths).
   const [scrollNonce, setScrollNonce] = useState(0);
   const requestScrollToActive = useCallback(() => setScrollNonce((n) => n + 1), []);
+
+  // Async AI-draft lifecycle. State outlives any single NoteCard so the
+  // user can scroll away / edit a different note while one is in flight.
+  // visibleRowIdsRef tracks which TN cards are currently in viewport so
+  // we can route arriving results to either the in-place pulse (visible)
+  // or the persistent toast stack (off-screen).
+  const aiDrafts = useAiDrafts();
+  const visibleRowIdsRef = useRef<Set<string>>(new Set());
+  const handleNoteVisibilityChange = useCallback((rowId: string, isVisible: boolean) => {
+    if (isVisible) visibleRowIdsRef.current.add(rowId);
+    else visibleRowIdsRef.current.delete(rowId);
+  }, []);
 
   const tileSet = useMemo(() => {
     if (!data) return [] as Array<{ verse: number; has: boolean; done?: boolean }>;
@@ -355,12 +369,12 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook }:
             setActiveWordId(null);
             if (row.verse !== activeVerse) setActiveVerse(row.verse);
           }}
-          onNoteAiDraft={async (row, signal) => {
+          onNoteStartAi={(row) => {
             const built = buildTnQuickRequest(row, data);
             if (!built.ok) {
-              // NoteCard gates on quote + support_reference, so those
-              // reasons shouldn't fire. Surface the others with the
-              // most actionable message we can.
+              // NoteCard gates on quote + support_reference. The remaining
+              // reasons (missing ULT/UST or unalignable English) need a
+              // user-actionable message.
               const message =
                 built.error.reason === "missing_ult_verse"
                   ? "ULT verse text unavailable for this verse."
@@ -369,10 +383,21 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook }:
                     : built.error.reason === "hebrew_not_found"
                       ? "Couldn't match this English to the ULT alignment — copy the support phrase exactly from ULT."
                       : "AI prerequisites missing.";
-              throw new Error(message);
+              aiDrafts.pushError(row, message);
+              return;
             }
-            return api.tnQuick(built.request, signal);
+            aiDrafts.start(row, built.request, {
+              getIsVisible: (id) => visibleRowIdsRef.current.has(id),
+              onSuccess: (r, res) => {
+                const patch = { quote: res.quote, note: res.note };
+                applyLocalRowPatch("tn", r.id, patch);
+                void outbox.enqueueRow("tn", r.id, r.version, patch);
+              },
+            });
           }}
+          isNoteAiPending={aiDrafts.isPending}
+          noteAiRecentlyCompletedAt={aiDrafts.recentlyCompletedAt}
+          onNoteVisibilityChange={handleNoteVisibilityChange}
           onWordFocus={(row) => {
             setActiveWordId(row.id);
             setActiveNoteId(null);
@@ -551,6 +576,16 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook }:
           />
         );
       })()}
+      <AiCompletionToasts
+        notifications={aiDrafts.notifications}
+        onDismiss={aiDrafts.dismiss}
+        onView={(rowId, verse) => {
+          setActiveVerse(verse);
+          setActiveNoteId(rowId);
+          setActiveWordId(null);
+          requestScrollToActive();
+        }}
+      />
       <SyncStatusBar />
     </Box>
   );
