@@ -10,6 +10,7 @@ import AutoAwesomeIcon from "@mui/icons-material/AutoAwesome";
 import type { TnRow } from "../sync/api";
 import { useCatalogs } from "../hooks/useCatalogs";
 import { CatalogPicker } from "./CatalogPicker";
+import { NoteHistoryDialog } from "./NoteHistoryDialog";
 
 export type DropPosition = "before" | "after";
 
@@ -79,6 +80,7 @@ export function NoteCard({
   const [quote, setQuote] = useState(tsvToDisplay(row.quote));
   const [note, setNote] = useState(tsvToDisplay(row.note));
   const [supportRef, setSupportRef] = useState<string | null>(row.support_reference);
+  const [historyOpen, setHistoryOpen] = useState(false);
 
   // Session model: when this card becomes active, snapshot the current
   // committed values so undo can revert to "what it was when I started
@@ -194,6 +196,48 @@ export function NoteCard({
     onDelete();
   };
 
+  // Apply a historical snapshot. The patch goes through the normal save
+  // pipe so it lands as v(current+1) — every older entry stays in
+  // edit_log, including the v(current) we're moving away from. Local
+  // state is rewritten outright so any in-progress session is discarded
+  // in favor of the chosen version.
+  const handleUseVersion = (snap: {
+    quote: string | null;
+    note: string | null;
+    support_reference: string | null;
+  }) => {
+    const rawQuote = snap.quote ?? "";
+    const rawNote = snap.note ?? "";
+    const rawSr = snap.support_reference ?? null;
+
+    const displayQuote = tsvToDisplay(rawQuote);
+    const displayNote = tsvToDisplay(rawNote);
+    setQuote(displayQuote);
+    setNote(displayNote);
+    setSupportRef(rawSr);
+    pendingRef.current = {};
+    // If a session is open, reset its baseline so Undo reverts to the
+    // newly-applied version and the "unsaved edits" asterisk stays quiet.
+    if (sessionSnapshotRef.current) {
+      sessionSnapshotRef.current = {
+        quote: displayQuote,
+        note: displayNote,
+        support_reference: rawSr,
+      };
+    }
+
+    // Only patch the fields that actually differ from the live row so we
+    // don't trigger a needless version bump if the user picked the
+    // current version somehow.
+    const patch: Partial<TnRow> = {};
+    if (rawQuote !== (row.quote ?? "")) patch.quote = rawQuote;
+    if (rawNote !== (row.note ?? "")) patch.note = rawNote;
+    if (rawSr !== row.support_reference) patch.support_reference = rawSr;
+    if (Object.keys(patch).length === 0) return;
+    onChange(patch);
+    onSave(patch);
+  };
+
   // Net change vs the session snapshot. Drives the save / undo buttons
   // and the version-dirty asterisk — after Undo the local state matches
   // the snapshot again so the save button goes quiet, and accidental
@@ -299,19 +343,26 @@ export function NoteCard({
         </Typography>
         <Box sx={{ flex: 1 }} />
         <Tooltip
-          title={`v${row.version}${hasNetChanges ? " · unsaved edits" : ""} — saved ${row.version - 1} time${row.version - 1 === 1 ? "" : "s"}; last update ${new Date(row.updated_at * 1000).toLocaleString()}`}
+          title={`v${row.version}${hasNetChanges ? " · unsaved edits" : ""} — saved ${row.version - 1} time${row.version - 1 === 1 ? "" : "s"}; last update ${new Date(row.updated_at * 1000).toLocaleString()}. Click to view history.`}
         >
-          <Typography
-            variant="caption"
+          <Chip
+            label={`v${row.version}${hasNetChanges ? "*" : ""}`}
+            size="small"
+            variant="outlined"
+            clickable
+            onClick={(e) => {
+              e.stopPropagation();
+              setHistoryOpen(true);
+            }}
             sx={{
-              color: hasNetChanges ? "warning.main" : "text.disabled",
               fontFamily: "monospace",
-              cursor: "help",
+              fontSize: 11,
+              height: 22,
+              color: hasNetChanges ? "warning.main" : "text.secondary",
+              borderColor: hasNetChanges ? "warning.main" : "divider",
               fontWeight: hasNetChanges ? 600 : 400,
             }}
-          >
-            v{row.version}{hasNetChanges ? "*" : ""}
-          </Typography>
+          />
         </Tooltip>
         {showSessionButtons && (
           <>
@@ -429,6 +480,15 @@ export function NoteCard({
           />
         </Stack>
       </Box>
+      {historyOpen && (
+        <NoteHistoryDialog
+          open={historyOpen}
+          noteId={row.id}
+          currentVersion={row.version}
+          onClose={() => setHistoryOpen(false)}
+          onUseVersion={handleUseVersion}
+        />
+      )}
     </Paper>
   );
 }

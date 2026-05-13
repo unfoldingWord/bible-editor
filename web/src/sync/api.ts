@@ -188,6 +188,33 @@ export async function devSignIn(username = "dev"): Promise<DevAuthResponse> {
   return data;
 }
 
+export interface RowHistoryUser {
+  id: number;
+  username: string | null;
+  full_name: string | null;
+}
+
+export interface RowHistoryEntry {
+  version: number;
+  // "imported" is synthesized server-side for rows that never had a real
+  // `create` entry — the server fills it in from the current row state so
+  // every row has a v1 anchor in its history.
+  action: "create" | "update" | "delete" | "restore" | "imported";
+  created_at: number;
+  user: RowHistoryUser | null;
+  // Just the fields that changed in this entry, intersected with the
+  // kind-specific content fields the server tracks.
+  patch: Record<string, unknown>;
+  // The full reconstructed value of every content field at this version,
+  // after this entry was applied.
+  snapshot: Record<string, unknown>;
+  synthetic: boolean;
+}
+
+export interface RowHistory {
+  versions: RowHistoryEntry[];
+}
+
 export interface Catalogs {
   supportReferences: string[];
   twLinks: string[];
@@ -220,6 +247,11 @@ export const api = {
       method: "POST",
       body: JSON.stringify(body),
     }),
+
+  getRowHistory: (kind: RowKind, id: string) =>
+    request<RowHistory>(
+      `/api/rows/${kind}/${encodeURIComponent(id)}/history`,
+    ),
 
   patchRow: <T = unknown>(
     kind: RowKind,

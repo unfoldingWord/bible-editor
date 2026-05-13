@@ -173,6 +173,131 @@ rows.get("/:kind/:id", async (c) => {
   return c.json(row);
 });
 
+// Per-kind content fields that the history endpoint exposes in each
+// version's snapshot. Identity fields (book/chapter/verse/ref_raw) and
+// transient fields like sort_order are deliberately omitted — they aren't
+// what users mean when they say "switch to an older version".
+const HISTORY_FIELDS: Record<RowKind, string[]> = {
+  tn: ["quote", "note", "support_reference", "occurrence", "tags"],
+  tq: ["quote", "question", "response", "occurrence", "tags"],
+  twl: ["orig_words", "tw_link", "occurrence", "tags"],
+};
+
+// Replay edit_log entries forward to reconstruct the snapshot of each
+// version. `create` carries the full posted body; `update` carries only the
+// patch. Either way we merge into a running snapshot so the value at
+// version N is whatever survived after the Nth log entry.
+//
+// Imported rows never went through POST so they have no `create` entry. We
+// detect this and synthesize a v1 baseline from the current row's content.
+// For never-patched fields this baseline is exact; for fields that were
+// edited later, the synthesized v1 still reflects the current value (the
+// real pre-edit value is lost), but the higher-version reconstructions are
+// correct because patches always override the baseline going forward.
+rows.get("/:kind/:id/history", async (c) => {
+  const kind = c.req.param("kind");
+  const id = c.req.param("id");
+  if (!isRowKind(kind)) return c.json({ error: "invalid_kind" }, 400);
+
+  const currentRow = await c.env.DB.prepare(
+    `SELECT * FROM ${KIND_TO_TABLE[kind]} WHERE id = ?1`,
+  )
+    .bind(id)
+    .first<Record<string, unknown> & { version: number; deleted_at: number | null; updated_at: number }>();
+  if (!currentRow || currentRow.deleted_at) {
+    return c.json({ error: "not_found" }, 404);
+  }
+
+  const rs = await c.env.DB.prepare(
+    `SELECT el.new_version AS version,
+            el.action,
+            el.created_at,
+            el.payload_json,
+            u.id AS user_id,
+            u.dcs_username AS username,
+            u.dcs_full_name AS full_name
+       FROM edit_log el
+       LEFT JOIN users u ON u.id = el.user_id
+      WHERE el.kind = ?1 AND el.row_key = ?2 AND el.new_version IS NOT NULL
+      ORDER BY el.new_version ASC`,
+  )
+    .bind(kind, id)
+    .all<{
+      version: number;
+      action: string;
+      created_at: number;
+      payload_json: string | null;
+      user_id: number | null;
+      username: string | null;
+      full_name: string | null;
+    }>();
+
+  const logEntries = rs.results ?? [];
+  const fields = HISTORY_FIELDS[kind];
+
+  // Always anchor the list with a v1 entry. If a real `create` exists at
+  // version 1, use it; otherwise synthesize one from the current row.
+  const hasCreateAtV1 = logEntries.some(
+    (e) => e.action === "create" && e.version === 1,
+  );
+  type Entry = (typeof logEntries)[number] & { synthetic?: boolean };
+  const entries: Entry[] = hasCreateAtV1
+    ? logEntries
+    : [
+        {
+          version: 1,
+          action: "imported",
+          created_at: currentRow.updated_at,
+          payload_json: JSON.stringify(
+            Object.fromEntries(fields.map((f) => [f, currentRow[f] ?? null])),
+          ),
+          user_id: null,
+          username: null,
+          full_name: null,
+          synthetic: true,
+        },
+        ...logEntries.filter((e) => e.version > 1),
+      ];
+
+  const snapshot: Record<string, unknown> = {};
+  const versions = entries.map((e) => {
+    let payload: Record<string, unknown> = {};
+    if (e.payload_json) {
+      try {
+        payload = JSON.parse(e.payload_json) as Record<string, unknown>;
+      } catch {
+        payload = {};
+      }
+    }
+    if (e.action !== "delete") {
+      for (const k of Object.keys(payload)) {
+        snapshot[k] = payload[k];
+      }
+    }
+    const trimmedSnapshot: Record<string, unknown> = {};
+    for (const f of fields) {
+      trimmedSnapshot[f] = snapshot[f] ?? null;
+    }
+    const trimmedPatch: Record<string, unknown> = {};
+    for (const f of fields) {
+      if (f in payload) trimmedPatch[f] = payload[f];
+    }
+    return {
+      version: e.version,
+      action: e.action,
+      created_at: e.created_at,
+      user: e.user_id
+        ? { id: e.user_id, username: e.username, full_name: e.full_name }
+        : null,
+      patch: trimmedPatch,
+      snapshot: trimmedSnapshot,
+      synthetic: e.synthetic ?? false,
+    };
+  });
+
+  return c.json({ versions });
+});
+
 // Single-row PATCH with optimistic concurrency. If-Match is mandatory and
 // the version check is enforced inside the UPDATE itself — a SELECT-then-
 // UPDATE pair would race between two concurrent writers, both seeing the
