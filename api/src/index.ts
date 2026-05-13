@@ -5,12 +5,18 @@ import { rows } from "./rows";
 import { verses } from "./verses";
 import { catalogs } from "./catalogs";
 import { lexicon } from "./lexicon";
+import { exports as exportsRoutes } from "./exports";
 import { attachAuth, mintDevToken, startDcsAuth, callbackDcsAuth, authMe } from "./auth";
 
 export interface Env {
   DB: D1Database;
   BLOBS: R2Bucket;
   CHAPTER_ROOM: DurableObjectNamespace;
+  EXPORT_WORKFLOW: Workflow;
+  // Static SPA bundle, served for any non-/api path on production (wrangler
+  // builds this binding automatically when [assets] is configured). The
+  // SPA's URL hash routes itself; ASSETS just serves index.html + bundle.
+  ASSETS: Fetcher;
   DCS_BASE_URL: string;
   DCS_OAUTH_AUTHORIZE_URL: string;
   DCS_OAUTH_TOKEN_URL: string;
@@ -22,6 +28,11 @@ export interface Env {
   DCS_CLIENT_SECRET?: string;
   JWT_SIGNING_KEY?: string;
   DCS_SERVICE_TOKEN?: string;
+  // Where nightly exports land on DCS. Owner = the user/org that owns the
+  // fork repos (e.g. a service account). Branch = a long-lived fork branch.
+  // Defaults below cover the unfoldingWord canonical owner; override per env.
+  DCS_EXPORT_OWNER?: string;
+  DCS_EXPORT_BRANCH?: string;
 }
 
 const app = new Hono<{ Bindings: Env; Variables: { userId?: number; username?: string } }>();
@@ -95,14 +106,30 @@ app.route("/api/rows", rows);
 app.route("/api/verses", verses);
 app.route("/api/catalogs", catalogs);
 app.route("/api/lexicon", lexicon);
+app.route("/api/exports", exportsRoutes);
 
-app.notFound((c) => c.json({ error: "not_found", path: c.req.path }, 404));
+// /api/* misses get the JSON 404. Anything else falls through to the static
+// SPA bundle (when the [assets] binding is configured for production deploy).
+// In local dev the ASSETS binding may be undefined; we still return a clean
+// 404 in that case so the dev experience matches.
+app.notFound((c) => {
+  if (c.req.path.startsWith("/api/")) {
+    return c.json({ error: "not_found", path: c.req.path }, 404);
+  }
+  const assets = c.env.ASSETS as Fetcher | undefined;
+  if (assets) return assets.fetch(c.req.raw);
+  return c.json({ error: "not_found", path: c.req.path }, 404);
+});
 
 export default {
   fetch: app.fetch,
-  async scheduled(_controller: ScheduledController, _env: Env, _ctx: ExecutionContext) {
-    // Nightly DCS export will live here. Phase 1.
+  async scheduled(_controller: ScheduledController, env: Env, _ctx: ExecutionContext) {
+    // Nightly DCS export at 06:00 UTC (configured in wrangler.toml). The
+    // Workflow runs each (book × resource) as an independently retryable
+    // step, so a flaky DCS commit won't take the whole run down.
+    await env.EXPORT_WORKFLOW.create();
   },
 } satisfies ExportedHandler<Env>;
 
 export { ChapterRoom } from "./chapterRoom";
+export { ExportWorkflow } from "./exportWorkflow";

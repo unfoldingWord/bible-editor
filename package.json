@@ -16,7 +16,9 @@
     "build:web": "npm --workspace web run build",
     "typecheck": "npm-run-all --parallel typecheck:api typecheck:web",
     "typecheck:api": "npm --workspace api run typecheck",
-    "typecheck:web": "npm --workspace web run typecheck"
+    "typecheck:web": "npm --workspace web run typecheck",
+    "deploy": "npm-run-all build:web deploy:api",
+    "deploy:api": "npm --workspace api run deploy"
   },
   "devDependencies": {
     "npm-run-all": "^4.1.5"

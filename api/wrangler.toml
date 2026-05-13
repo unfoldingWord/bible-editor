@@ -7,6 +7,19 @@ compatibility_flags = ["nodejs_compat"]
 [dev]
 port = 8787
 
+# Static-asset hosting for the SPA. After `npm --workspace web run build`,
+# Vite emits web/dist; wrangler serves it for any path that isn't matched by
+# a Worker route. `single-page-application` makes deep links (#/ZEC/3) work
+# by falling back to index.html for unknown paths.
+#
+# In dev we keep the existing split (vite on 5173, wrangler on 8787 via vite
+# proxy); this block only kicks in on `wrangler deploy`. wrangler dev tolerates
+# a missing dist dir but will warn — run a build first to silence it.
+[assets]
+directory = "../web/dist"
+binding = "ASSETS"
+not_found_handling = "single-page-application"
+
 # D1 database — replace `database_id` once we run `wrangler d1 create bible_editor`.
 [[d1_databases]]
 binding = "DB"
@@ -28,6 +41,13 @@ class_name = "ChapterRoom"
 tag = "v1"
 new_classes = ["ChapterRoom"]
 
+# Workflow for the nightly DCS export. Each (book × resource) is its own
+# retryable step, so a flaky DCS commit doesn't take the whole run down.
+[[workflows]]
+name = "bible-editor-export"
+binding = "EXPORT_WORKFLOW"
+class_name = "ExportWorkflow"
+
 # Nightly export to DCS at 06:00 UTC.
 [triggers]
 crons = ["0 6 * * *"]
@@ -37,6 +57,8 @@ crons = ["0 6 * * *"]
 # inside src/index.ts (localhost:5173 / 8787 only). Set this to the deployed
 # SPA origin once the worker leaves dev.
 # DEV_AUTH_ENABLED gates the /api/auth/dev mint endpoint; must be unset in prod.
+# DCS_EXPORT_OWNER / DCS_EXPORT_BRANCH control where nightly exports land on
+# DCS. Defaults: unfoldingWord owner, "live-snapshot" branch. Override per env.
 [vars]
 DCS_BASE_URL = "https://git.door43.org"
 DCS_OAUTH_AUTHORIZE_URL = "https://git.door43.org/login/oauth/authorize"
@@ -45,3 +67,5 @@ JWT_ISSUER = "bible-editor"
 JWT_TTL_SECONDS = "1209600"
 ALLOWED_ORIGINS = ""
 DEV_AUTH_ENABLED = "true"
+DCS_EXPORT_OWNER = "unfoldingWord"
+DCS_EXPORT_BRANCH = "live-snapshot"

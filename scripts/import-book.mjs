@@ -81,12 +81,21 @@ lines.push(`DELETE FROM tn_rows  WHERE book = ${q(book)};`);
 lines.push(`DELETE FROM tq_rows  WHERE book = ${q(book)};`);
 lines.push(`DELETE FROM twl_rows WHERE book = ${q(book)};`);
 lines.push(`DELETE FROM verses   WHERE book = ${q(book)};`);
+lines.push(`DELETE FROM book_usfm_meta WHERE book = ${q(book)};`);
 
 // ---------- USFM verses ----------
 function importVerses(bibleVersion, srcPath) {
   if (!existsSync(srcPath)) return 0;
   const raw = readFileSync(srcPath, "utf8");
   const json = usfm.toJSON(raw);
+  // Stash the USFM headers (\id, \h, \toc*, \mt1, …) so nightly export can
+  // emit them verbatim. Without this, the export would synthesize a minimum
+  // set and lose the real book titles.
+  if (Array.isArray(json.headers) && json.headers.length > 0) {
+    lines.push(
+      `INSERT OR REPLACE INTO book_usfm_meta (book, bible_version, headers_json) VALUES (${q(book)}, ${q(bibleVersion)}, ${q(JSON.stringify(json.headers))});`,
+    );
+  }
   let count = 0;
   for (const chapter of Object.keys(json.chapters || {})) {
     const chNum = parseInt(chapter, 10);
