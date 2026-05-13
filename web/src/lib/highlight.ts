@@ -147,6 +147,84 @@ export function findTargetHighlights(
   return out;
 }
 
+// Reverse of findTargetHighlights: given an English support phrase
+// (the user-typed text in the QUOTE field BEFORE AI runs), find the
+// Hebrew/Greek source words that align to those English target words
+// via the verse's \zaln-s milestones. Words match case-insensitively
+// after stripping non-letter chars, so "{with}" matches "with" and
+// "jealousy." matches "jealousy".
+//
+// Returns the Hebrew snippet as space-joined source words in
+// document order, de-duped. Returns "" if none of the input words
+// align — callers use empty to short-circuit the AI call with a
+// clearer message than the bot's 422 no_rtl.
+export function findSourceForTargetText(
+  verseObjects: unknown[],
+  englishText: string,
+): string {
+  const wanted = new Set(
+    englishText
+      .toLowerCase()
+      .replace(/[^\p{L}\p{N}\s]+/gu, " ")
+      .split(/\s+/)
+      .filter(Boolean),
+  );
+  if (wanted.size === 0) return "";
+
+  const runs = collectMilestoneRuns(verseObjects);
+  if (runs.length === 0) return "";
+
+  const seenSources = new Set<string>();
+  const out: string[] = [];
+  for (const run of runs) {
+    const matched = run.targets.some((t) => {
+      const norm = t.text.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, "");
+      return norm.length > 0 && wanted.has(norm);
+    });
+    if (!matched) continue;
+    if (seenSources.has(run.source)) continue;
+    seenSources.add(run.source);
+    out.push(run.source);
+  }
+  return out.join(" ");
+}
+
+// Walk the verseObjects in document order and pull out the highlighted
+// target words for `quote` at `occurrence`, joined with spaces. Used to
+// derive the English support phrase from the Hebrew quote when handing
+// off to the tn-quick AI endpoint. Returns "" if nothing matches —
+// callers should treat empty as "selection unavailable".
+export function extractTargetSelectionText(
+  verseObjects: unknown[],
+  quote: string,
+  occurrence: number,
+): string {
+  const highlights = findTargetHighlights(verseObjects, quote, occurrence);
+  if (highlights.size === 0) return "";
+  const seen = new Set<HighlightKey>();
+  const words: string[] = [];
+  function walk(nodes: unknown[]) {
+    for (const node of nodes ?? []) {
+      const o = node as Record<string, unknown> | null;
+      if (!o) continue;
+      if (nodeIsWord(o)) {
+        const text = String(o["text"] ?? "");
+        const occ = parseInt(String(o["occurrence"] ?? "1"), 10) || 1;
+        const key = k(text, occ);
+        if (highlights.has(key) && !seen.has(key)) {
+          seen.add(key);
+          words.push(text);
+        }
+      } else if (nodeIsMilestone(o)) {
+        const children = (o["children"] as unknown[] | undefined) ?? [];
+        walk(children);
+      }
+    }
+  }
+  walk(verseObjects);
+  return words.join(" ");
+}
+
 // For UHB/UGNT: returns source-word keys that should be highlighted.
 export function findSourceHighlights(
   verseObjects: unknown[],

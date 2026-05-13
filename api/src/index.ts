@@ -6,6 +6,7 @@ import { verses } from "./verses";
 import { catalogs } from "./catalogs";
 import { lexicon } from "./lexicon";
 import { exports as exportsRoutes } from "./exports";
+import { tnQuick } from "./tnQuick";
 import { attachAuth, mintDevToken, startDcsAuth, callbackDcsAuth, authMe } from "./auth";
 
 export interface Env {
@@ -33,6 +34,12 @@ export interface Env {
   // Defaults below cover the unfoldingWord canonical owner; override per env.
   DCS_EXPORT_OWNER?: string;
   DCS_EXPORT_BRANCH?: string;
+  // Shared service token for the uw-bt-bot AI endpoint. Set via
+  // `wrangler secret put BT_API_TOKEN`. Absence disables /api/tn-quick.
+  BT_API_TOKEN?: string;
+  // Override the bot URL (defaults to https://uw-bt-bot.fly.dev/api/tn-quick
+  // when unset). Useful for staging / local bot dev.
+  TN_QUICK_URL?: string;
 }
 
 const app = new Hono<{ Bindings: Env; Variables: { userId?: number; username?: string } }>();
@@ -107,6 +114,7 @@ app.route("/api/verses", verses);
 app.route("/api/catalogs", catalogs);
 app.route("/api/lexicon", lexicon);
 app.route("/api/exports", exportsRoutes);
+app.route("/api/tn-quick", tnQuick);
 
 // /api/* misses get the JSON 404. Anything else falls through to the static
 // SPA bundle (when the [assets] binding is configured for production deploy).

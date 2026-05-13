@@ -8,6 +8,7 @@ import { api } from "../sync/api";
 import type { TnRow, TqRow, TwlRow, VerseDto } from "../sync/api";
 import { smartEditVerse } from "../lib/replace";
 import { verseHasUnalignedWork } from "../lib/alignment";
+import { buildTnQuickRequest } from "../lib/tnQuickRequest";
 import { TimelineRail } from "./TimelineRail";
 import { ScriptureColumn, type ScriptureMode } from "./ScriptureColumn";
 import { ResourceColumn } from "./ResourceColumn";
@@ -353,6 +354,24 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook }:
             setActiveNoteId(row.id);
             setActiveWordId(null);
             if (row.verse !== activeVerse) setActiveVerse(row.verse);
+          }}
+          onNoteAiDraft={async (row, signal) => {
+            const built = buildTnQuickRequest(row, data);
+            if (!built.ok) {
+              // NoteCard gates on quote + support_reference, so those
+              // reasons shouldn't fire. Surface the others with the
+              // most actionable message we can.
+              const message =
+                built.error.reason === "missing_ult_verse"
+                  ? "ULT verse text unavailable for this verse."
+                  : built.error.reason === "missing_ust_verse"
+                    ? "UST verse text unavailable for this verse."
+                    : built.error.reason === "hebrew_not_found"
+                      ? "Couldn't match this English to the ULT alignment — copy the support phrase exactly from ULT."
+                      : "AI prerequisites missing.";
+              throw new Error(message);
+            }
+            return api.tnQuick(built.request, signal);
           }}
           onWordFocus={(row) => {
             setActiveWordId(row.id);

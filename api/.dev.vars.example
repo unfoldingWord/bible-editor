@@ -10,3 +10,9 @@ JWT_SIGNING_KEY=dev-only-replace-with-a-random-32-byte-string
 # Optional: DCS OAuth credentials. Not used until the DCS auth flow ships.
 # DCS_CLIENT_ID=
 # DCS_CLIENT_SECRET=
+
+# Shared service token for the uw-bt-bot AI draft endpoint. Absence
+# disables /api/tn-quick (the NoteCard sparkles button greys out with
+# "AI generation unavailable"). In production set with:
+#   wrangler secret put BT_API_TOKEN
+BT_API_TOKEN=

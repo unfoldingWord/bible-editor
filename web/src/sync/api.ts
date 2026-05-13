@@ -225,6 +225,37 @@ export interface BookListEntry {
   imported_at: number;
 }
 
+// Translation-note AI draft endpoint (proxied through this Worker; the
+// shared bot lives at uw-bt-bot.fly.dev). Schema is the bot's; keep in
+// sync with its zod definition. The Worker only adds the BT_API_TOKEN
+// bearer and forwards the body verbatim, so types live on this side.
+export interface TnQuickRequest {
+  ref: {
+    book: string;
+    chapter: number;
+    verse: number;
+  };
+  issueType: string;
+  ult: {
+    selection: string;
+    verse: string;
+    context: { prev5: string[]; next5: string[] };
+  };
+  ust: {
+    selection: string;
+    verse: string;
+    context: { prev5: string[]; next5: string[] };
+  };
+  hebrewGuess: string;
+  model?: "sonnet" | "opus";
+}
+
+export interface TnQuickResponse {
+  quote: string;
+  note: string;
+  warnings: string[];
+}
+
 export const api = {
   getBookSummary: (book: string) =>
     request<BookSummary>(`/api/chapters/${encodeURIComponent(book)}`),
@@ -287,4 +318,11 @@ export const api = {
         body: JSON.stringify(payload),
       },
     ),
+
+  tnQuick: (body: TnQuickRequest, signal?: AbortSignal) =>
+    request<TnQuickResponse>(`/api/tn-quick`, {
+      method: "POST",
+      body: JSON.stringify(body),
+      signal,
+    }),
 };

@@ -1,5 +1,23 @@
 import { useEffect, useRef, useState } from "react";
-import { Paper, Stack, Chip, IconButton, Typography, Box, TextField, Tooltip } from "@mui/material";
+import {
+  Paper,
+  Stack,
+  Chip,
+  IconButton,
+  Typography,
+  Box,
+  TextField,
+  Tooltip,
+  CircularProgress,
+  Dialog,
+  DialogTitle,
+  DialogContent,
+  DialogContentText,
+  DialogActions,
+  Button,
+  Snackbar,
+  Alert,
+} from "@mui/material";
 import DeleteOutlineIcon from "@mui/icons-material/DeleteOutline";
 import AddIcon from "@mui/icons-material/Add";
 import DragIndicatorIcon from "@mui/icons-material/DragIndicator";
@@ -7,10 +25,11 @@ import SaveIcon from "@mui/icons-material/Save";
 import SaveOutlinedIcon from "@mui/icons-material/SaveOutlined";
 import UndoIcon from "@mui/icons-material/Undo";
 import AutoAwesomeIcon from "@mui/icons-material/AutoAwesome";
-import type { TnRow } from "../sync/api";
+import { ApiError, type TnRow, type TnQuickResponse } from "../sync/api";
 import { useCatalogs } from "../hooks/useCatalogs";
 import { CatalogPicker } from "./CatalogPicker";
 import { NoteHistoryDialog } from "./NoteHistoryDialog";
+import { shortSupport } from "../lib/supportReference";
 
 export type DropPosition = "before" | "after";
 
@@ -34,6 +53,12 @@ interface Props {
   onCardDragOver: (position: DropPosition) => void;
   onCardDragLeave: () => void;
   onCardDrop: (position: DropPosition) => void;
+  // Calls the /api/tn-quick proxy to draft a note from this row's quote +
+  // issue type. Optional — when absent, the sparkles button is hidden.
+  // Implementation lives at Shell, which has the ChapterPayload needed
+  // to build the request body. The AbortSignal aborts the in-flight
+  // call if the user clicks elsewhere or the component unmounts.
+  onAiDraft?: (signal: AbortSignal) => Promise<TnQuickResponse>;
 }
 
 // Notes coming from TSV imports use literal "\n" (two characters) as the
@@ -76,11 +101,16 @@ export function NoteCard({
   onCardDragOver,
   onCardDragLeave,
   onCardDrop,
+  onAiDraft,
 }: Props) {
   const [quote, setQuote] = useState(tsvToDisplay(row.quote));
   const [note, setNote] = useState(tsvToDisplay(row.note));
   const [supportRef, setSupportRef] = useState<string | null>(row.support_reference);
   const [historyOpen, setHistoryOpen] = useState(false);
+  const [aiLoading, setAiLoading] = useState(false);
+  const [aiConfirmOpen, setAiConfirmOpen] = useState(false);
+  const [aiToast, setAiToast] = useState<{ severity: "error" | "warning" | "info"; message: string } | null>(null);
+  const aiAbortRef = useRef<AbortController | null>(null);
 
   // Session model: when this card becomes active, snapshot the current
   // committed values so undo can revert to "what it was when I started
@@ -236,6 +266,126 @@ export function NoteCard({
     if (Object.keys(patch).length === 0) return;
     onChange(patch);
     onSave(patch);
+  };
+
+  // Cancel any in-flight AI draft on unmount or when the card goes inactive.
+  // The session model already flushes pending edits on inactive, but the AI
+  // call itself is long enough that the user has typically moved on by the
+  // time it would land — and a stale completion writing into the previous
+  // note's local state would be a confusing experience.
+  useEffect(() => {
+    if (!active && aiAbortRef.current) {
+      aiAbortRef.current.abort();
+      aiAbortRef.current = null;
+      setAiLoading(false);
+    }
+  }, [active]);
+  useEffect(() => {
+    return () => {
+      aiAbortRef.current?.abort();
+    };
+  }, []);
+
+  const aiPrereqsMet = !!supportRef && quote.trim().length > 0;
+
+  const applyAiResult = (res: TnQuickResponse) => {
+    const newQuote = res.quote;
+    const newNote = res.note;
+    setQuote(newQuote);
+    setNote(newNote);
+    stashEdit({ quote: newQuote, note: newNote });
+    if (res.warnings.length > 0) {
+      setAiToast({ severity: "warning", message: res.warnings.join("; ") });
+    }
+  };
+
+  const mapAiError = (err: unknown): string => {
+    if (err instanceof ApiError) {
+      const code =
+        err.body && typeof err.body === "object" && "error" in err.body
+          ? String((err.body as { error?: unknown }).error)
+          : "";
+      switch (code) {
+        case "unknown_issue_type":
+          return "Issue type not recognized — pick a different one.";
+        case "unknown_book":
+          return "Unknown book code.";
+        case "no_rtl":
+          return "Your Quote has no Hebrew characters.";
+        case "hebrew_words_not_in_verse":
+          return "Couldn't validate Hebrew against the verse — check the Quote.";
+        case "body_too_large":
+          return "Verse context too large — try again on a shorter chapter.";
+        case "rate_limited":
+          return "Too many AI requests — wait 30 s and try again.";
+        case "model_call_failed":
+          return "AI service unavailable — try again later.";
+        case "tn_quick_disabled":
+        case "unauthorized":
+        case "cache_unavailable":
+        case "uhb_missing_for_verse":
+        case "anthropic_api_key_missing":
+          return "AI generation unavailable.";
+        default:
+          return `AI request failed (HTTP ${err.status}).`;
+      }
+    }
+    if (err instanceof DOMException && err.name === "AbortError") return "";
+    if (err instanceof Error && err.message) return err.message;
+    return "Network error.";
+  };
+
+  const runAiDraft = async () => {
+    if (!onAiDraft || !aiPrereqsMet || aiLoading) return;
+    aiAbortRef.current?.abort();
+    const controller = new AbortController();
+    aiAbortRef.current = controller;
+    setAiLoading(true);
+    try {
+      let res: TnQuickResponse;
+      try {
+        res = await onAiDraft(controller.signal);
+      } catch (err) {
+        // Retry-once on 502 model_call_failed per the bot's contract.
+        if (
+          err instanceof ApiError &&
+          err.status === 502 &&
+          err.body &&
+          typeof err.body === "object" &&
+          "error" in err.body &&
+          (err.body as { error?: unknown }).error === "model_call_failed"
+        ) {
+          await new Promise<void>((resolve, reject) => {
+            const t = setTimeout(resolve, 2000);
+            controller.signal.addEventListener("abort", () => {
+              clearTimeout(t);
+              reject(new DOMException("aborted", "AbortError"));
+            });
+          });
+          res = await onAiDraft(controller.signal);
+        } else {
+          throw err;
+        }
+      }
+      if (controller.signal.aborted) return;
+      applyAiResult(res);
+    } catch (err) {
+      if (controller.signal.aborted) return;
+      const message = mapAiError(err);
+      if (message) setAiToast({ severity: "error", message });
+    } finally {
+      if (aiAbortRef.current === controller) aiAbortRef.current = null;
+      setAiLoading(false);
+    }
+  };
+
+  const handleAiClick = () => {
+    if (!aiPrereqsMet || aiLoading) return;
+    if (note.trim().length > 0) {
+      setAiConfirmOpen(true);
+      return;
+    }
+    void runAiDraft();
   };
 
   // Net change vs the session snapshot. Drives the save / undo buttons
@@ -458,10 +608,33 @@ export function NoteCard({
             >
               Note
             </Typography>
-            <Tooltip title="generate this note with AI (not wired up yet)">
-              <IconButton size="small" disabled sx={{ p: 0.25, color: "secondary.main" }}>
-                <AutoAwesomeIcon fontSize="inherit" />
-              </IconButton>
+            <Tooltip
+              title={
+                aiLoading
+                  ? "drafting…"
+                  : !onAiDraft
+                    ? "AI generation unavailable"
+                    : !supportRef
+                      ? "pick a support reference first"
+                      : !quote.trim()
+                        ? "fill in the Quote first"
+                        : "generate this note with AI"
+              }
+            >
+              <span>
+                <IconButton
+                  size="small"
+                  onClick={handleAiClick}
+                  disabled={!onAiDraft || !aiPrereqsMet || aiLoading}
+                  sx={{ p: 0.25, color: "secondary.main" }}
+                >
+                  {aiLoading ? (
+                    <CircularProgress size={14} color="inherit" />
+                  ) : (
+                    <AutoAwesomeIcon fontSize="inherit" />
+                  )}
+                </IconButton>
+              </span>
             </Tooltip>
           </Stack>
           <TextField
@@ -489,12 +662,45 @@ export function NoteCard({
           onUseVersion={handleUseVersion}
         />
       )}
+      <Dialog open={aiConfirmOpen} onClose={() => setAiConfirmOpen(false)}>
+        <DialogTitle>Replace existing note?</DialogTitle>
+        <DialogContent>
+          <DialogContentText>
+            This note already has text. Generating with AI will replace both the Quote and Note.
+            You can hit Undo on the toolbar afterwards to restore the original.
+          </DialogContentText>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setAiConfirmOpen(false)}>Cancel</Button>
+          <Button
+            onClick={() => {
+              setAiConfirmOpen(false);
+              void runAiDraft();
+            }}
+            color="primary"
+            variant="contained"
+          >
+            Replace
+          </Button>
+        </DialogActions>
+      </Dialog>
+      <Snackbar
+        open={aiToast !== null}
+        autoHideDuration={6000}
+        onClose={() => setAiToast(null)}
+        anchorOrigin={{ vertical: "bottom", horizontal: "center" }}
+      >
+        {aiToast ? (
+          <Alert
+            severity={aiToast.severity}
+            variant="filled"
+            onClose={() => setAiToast(null)}
+            sx={{ width: "100%" }}
+          >
+            {aiToast.message}
+          </Alert>
+        ) : undefined}
+      </Snackbar>
     </Paper>
   );
-}
-
-function shortSupport(s: string): string {
-  // 'rc://*/ta/man/translate/figs-explicit' -> 'figs-explicit'
-  const m = s.match(/\/([^/]+)$/);
-  return m ? m[1] : s;
 }
