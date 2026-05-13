@@ -5,6 +5,7 @@ import type { VerseDto } from "../sync/api";
 import { highlightsFor, renderHighlightedHTML, type HighlightKey } from "../lib/highlight";
 import { HebrewLine } from "./HebrewLine";
 import type { LexiconEntry } from "../hooks/useLexicon";
+import type { FindMatch } from "./FindReplaceOverlay";
 import {
   matchSourceVerse,
   renderFindMatchesByOffsets,
@@ -38,6 +39,9 @@ interface Props {
   // and on token offsets / HebrewLine highlights for source-language mode.
   // Note highlights step aside while a query is active.
   search?: SearchState | null;
+  // The single active find match (the one prev/next navigates to). The cell
+  // containing it paints with the stronger be-find-active style.
+  findActiveMatch?: FindMatch | null;
   onSelectVerse: (v: number) => void;
   onEditVerse: (verseNum: number, plain: string, base: VerseDto) => void;
   onOpenAligner: (verseNum: number) => void;
@@ -64,6 +68,7 @@ export function DocColumn({
   scrollNonce,
   lexiconMap,
   search,
+  findActiveMatch,
   onSelectVerse,
   onEditVerse,
   onOpenAligner,
@@ -141,6 +146,10 @@ export function DocColumn({
             borderRadius: 0.5,
             color: "inherit",
           },
+          "& mark.be-find-active": {
+            backgroundColor: "#fb923c",
+            outline: "2px solid #c2410c",
+          },
         }}
       >
         {verseNumbers.map((v) => {
@@ -164,6 +173,7 @@ export function DocColumn({
               rtl={!!rtl}
               lexiconMap={lexiconMap}
               search={search ?? null}
+              findActiveMatch={findActiveMatch ?? null}
               spanRef={isActive ? activeRef : null}
               onClick={() => onSelectVerse(v)}
               onAlign={() => onOpenAligner(v)}
@@ -188,6 +198,7 @@ function VerseSpan({
   rtl,
   lexiconMap,
   search,
+  findActiveMatch,
   spanRef,
   onClick,
   onAlign,
@@ -204,12 +215,20 @@ function VerseSpan({
   rtl: boolean;
   lexiconMap?: Map<string, LexiconEntry | null>;
   search: SearchState | null;
+  findActiveMatch: FindMatch | null;
   spanRef: React.MutableRefObject<HTMLSpanElement | null> | null;
   onClick: () => void;
   onAlign: () => void;
   onEdit: (plain: string) => void;
 }) {
   const isSource = bibleVersion === "UHB" || bibleVersion === "UGNT";
+  const activeRange = useMemo<{ start: number; end: number } | null>(() => {
+    if (!findActiveMatch) return null;
+    if (findActiveMatch.chapter !== chapter) return null;
+    if (findActiveMatch.verse !== verseNum) return null;
+    if (findActiveMatch.bibleVersion !== bibleVersion) return null;
+    return { start: findActiveMatch.startIndex, end: findActiveMatch.endIndex };
+  }, [findActiveMatch, chapter, verseNum, bibleVersion]);
   const elRef = useRef<HTMLSpanElement | null>(null);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lastTextRef = useRef(text);
@@ -247,6 +266,12 @@ function VerseSpan({
     return set;
   }, [sourceHits]);
 
+  const activeFindKey = useMemo<HighlightKey | null>(() => {
+    if (!activeRange || !sourceHits) return null;
+    const hit = sourceHits.find((h) => h.start === activeRange.start && h.end === activeRange.end);
+    return hit ? `${hit.text}|${hit.occurrence}` : null;
+  }, [activeRange, sourceHits]);
+
   // Find marks override note highlights — same precedence as BookView.
   const findHTML = useMemo(() => {
     if (!text) return null;
@@ -254,12 +279,12 @@ function VerseSpan({
     // (UHB renders via HebrewLine and ignores findHTML).
     if (search && search.sourceQuery.kind !== "english") {
       if (!isSource || !sourceHits || sourceHits.length === 0) return null;
-      return renderFindMatchesByOffsets(text, sourceHits);
+      return renderFindMatchesByOffsets(text, sourceHits, activeRange);
     }
     if (!search?.re) return null;
-    const out = renderFindMatchesHTML(text, search.re);
+    const out = renderFindMatchesHTML(text, search.re, activeRange);
     return out.includes("be-find") ? out : null;
-  }, [search, sourceHits, text, isSource]);
+  }, [search, sourceHits, text, isSource, activeRange]);
 
   const html = useMemo(() => {
     if (findHTML) return findHTML;
@@ -350,6 +375,7 @@ function VerseSpan({
             lexiconMap={lexiconMap}
             highlights={highlights ?? undefined}
             findHighlights={findHighlights}
+            activeFindKey={activeFindKey}
             fallbackText={text}
           />
         </span>
@@ -383,14 +409,20 @@ function VerseSpan({
   );
 }
 
-function renderFindMatchesHTML(plainText: string, re: RegExp): string {
+function renderFindMatchesHTML(
+  plainText: string,
+  re: RegExp,
+  activeRange?: { start: number; end: number } | null,
+): string {
   let html = "";
   let lastIdx = 0;
   let m: RegExpExecArray | null;
   const local = new RegExp(re.source, re.flags);
   while ((m = local.exec(plainText)) !== null) {
+    const isActive = !!activeRange && m.index === activeRange.start && m.index + m[0].length === activeRange.end;
+    const cls = isActive ? "be-find be-find-active" : "be-find";
     html += escapeHtml(plainText.slice(lastIdx, m.index));
-    html += `<mark class="be-find">${escapeHtml(m[0])}</mark>`;
+    html += `<mark class="${cls}">${escapeHtml(m[0])}</mark>`;
     lastIdx = m.index + m[0].length;
     if (m[0].length === 0) local.lastIndex++;
   }

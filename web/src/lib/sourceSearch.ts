@@ -277,6 +277,7 @@ function escapeHtml(s: string): string {
 export function renderFindMatchesByOffsets(
   plainText: string,
   ranges: Array<{ start: number; end: number }>,
+  activeRange?: { start: number; end: number } | null,
 ): string {
   if (ranges.length === 0) return escapeHtml(plainText);
   const sorted = [...ranges].sort((a, b) => a.start - b.start);
@@ -285,8 +286,10 @@ export function renderFindMatchesByOffsets(
   for (const r of sorted) {
     if (r.start < pos) continue; // overlap — skip
     if (r.end <= r.start) continue;
+    const isActive = !!activeRange && r.start === activeRange.start && r.end === activeRange.end;
+    const cls = isActive ? "be-find be-find-active" : "be-find";
     html += escapeHtml(plainText.slice(pos, r.start));
-    html += `<mark class="be-find">${escapeHtml(plainText.slice(r.start, r.end))}</mark>`;
+    html += `<mark class="${cls}">${escapeHtml(plainText.slice(r.start, r.end))}</mark>`;
     pos = r.end;
   }
   html += escapeHtml(plainText.slice(pos));
