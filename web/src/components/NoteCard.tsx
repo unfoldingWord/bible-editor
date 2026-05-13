@@ -15,8 +15,6 @@ import {
   DialogContentText,
   DialogActions,
   Button,
-  Snackbar,
-  Alert,
 } from "@mui/material";
 import DeleteOutlineIcon from "@mui/icons-material/DeleteOutline";
 import AddIcon from "@mui/icons-material/Add";
@@ -25,7 +23,7 @@ import SaveIcon from "@mui/icons-material/Save";
 import SaveOutlinedIcon from "@mui/icons-material/SaveOutlined";
 import UndoIcon from "@mui/icons-material/Undo";
 import AutoAwesomeIcon from "@mui/icons-material/AutoAwesome";
-import { ApiError, type TnRow, type TnQuickResponse } from "../sync/api";
+import type { TnRow } from "../sync/api";
 import { useCatalogs } from "../hooks/useCatalogs";
 import { CatalogPicker } from "./CatalogPicker";
 import { NoteHistoryDialog } from "./NoteHistoryDialog";
@@ -53,12 +51,20 @@ interface Props {
   onCardDragOver: (position: DropPosition) => void;
   onCardDragLeave: () => void;
   onCardDrop: (position: DropPosition) => void;
-  // Calls the /api/tn-quick proxy to draft a note from this row's quote +
-  // issue type. Optional — when absent, the sparkles button is hidden.
-  // Implementation lives at Shell, which has the ChapterPayload needed
-  // to build the request body. The AbortSignal aborts the in-flight
-  // call if the user clicks elsewhere or the component unmounts.
-  onAiDraft?: (signal: AbortSignal) => Promise<TnQuickResponse>;
+  // Async AI-draft lifecycle. State lives in Shell so the call can
+  // survive the card un-focusing / scrolling off-screen. NoteCard is
+  // purely presentational w.r.t. AI: shows spinner while pending,
+  // pulses briefly when a result lands.
+  isAiPending?: boolean;
+  aiRecentlyCompletedAt?: number | null;
+  // Fires the request. Returns immediately; result lands later via the
+  // row patch pipeline. Absent => sparkles is hidden.
+  onStartAi?: () => void;
+  // Reported on intersection changes so Shell can decide whether an
+  // arriving AI result needs the persistent off-screen toast or just
+  // the in-place pulse. Default root (viewport) is good enough for our
+  // resource column scroll setup.
+  onVisibilityChange?: (rowId: string, isVisible: boolean) => void;
 }
 
 // Notes coming from TSV imports use literal "\n" (two characters) as the
@@ -101,16 +107,16 @@ export function NoteCard({
   onCardDragOver,
   onCardDragLeave,
   onCardDrop,
-  onAiDraft,
+  isAiPending = false,
+  aiRecentlyCompletedAt = null,
+  onStartAi,
+  onVisibilityChange,
 }: Props) {
   const [quote, setQuote] = useState(tsvToDisplay(row.quote));
   const [note, setNote] = useState(tsvToDisplay(row.note));
   const [supportRef, setSupportRef] = useState<string | null>(row.support_reference);
   const [historyOpen, setHistoryOpen] = useState(false);
-  const [aiLoading, setAiLoading] = useState(false);
   const [aiConfirmOpen, setAiConfirmOpen] = useState(false);
-  const [aiToast, setAiToast] = useState<{ severity: "error" | "warning" | "info"; message: string } | null>(null);
-  const aiAbortRef = useRef<AbortController | null>(null);
 
   // Session model: when this card becomes active, snapshot the current
   // committed values so undo can revert to "what it was when I started
@@ -268,124 +274,65 @@ export function NoteCard({
     onSave(patch);
   };
 
-  // Cancel any in-flight AI draft on unmount or when the card goes inactive.
-  // The session model already flushes pending edits on inactive, but the AI
-  // call itself is long enough that the user has typically moved on by the
-  // time it would land — and a stale completion writing into the previous
-  // note's local state would be a confusing experience.
-  useEffect(() => {
-    if (!active && aiAbortRef.current) {
-      aiAbortRef.current.abort();
-      aiAbortRef.current = null;
-      setAiLoading(false);
-    }
-  }, [active]);
-  useEffect(() => {
-    return () => {
-      aiAbortRef.current?.abort();
-    };
-  }, []);
-
   const aiPrereqsMet = !!supportRef && quote.trim().length > 0;
 
-  const applyAiResult = (res: TnQuickResponse) => {
-    const newQuote = res.quote;
-    const newNote = res.note;
+  // When AI completes (Shell sets a fresh `aiRecentlyCompletedAt`), force
+  // local fields to the new row.quote/row.note even if a session is
+  // open — the user expects the AI patch to show up regardless of
+  // whether they happened to be editing this note when it landed. Also
+  // re-baseline the session snapshot so Undo reverts to the AI result
+  // (not pre-AI), matching the user's mental model of "AI just wrote
+  // this; undo would undo the writing".
+  useEffect(() => {
+    if (!aiRecentlyCompletedAt) return;
+    const newQuote = tsvToDisplay(row.quote);
+    const newNote = tsvToDisplay(row.note);
     setQuote(newQuote);
     setNote(newNote);
-    stashEdit({ quote: newQuote, note: newNote });
-    if (res.warnings.length > 0) {
-      setAiToast({ severity: "warning", message: res.warnings.join("; ") });
+    pendingRef.current = {};
+    if (sessionSnapshotRef.current !== null) {
+      sessionSnapshotRef.current = {
+        quote: newQuote,
+        note: newNote,
+        support_reference: supportRef,
+      };
     }
-  };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [aiRecentlyCompletedAt]);
 
-  const mapAiError = (err: unknown): string => {
-    if (err instanceof ApiError) {
-      const code =
-        err.body && typeof err.body === "object" && "error" in err.body
-          ? String((err.body as { error?: unknown }).error)
-          : "";
-      switch (code) {
-        case "unknown_issue_type":
-          return "Issue type not recognized — pick a different one.";
-        case "unknown_book":
-          return "Unknown book code.";
-        case "no_rtl":
-          return "Your Quote has no Hebrew characters.";
-        case "hebrew_words_not_in_verse":
-          return "Couldn't validate Hebrew against the verse — check the Quote.";
-        case "body_too_large":
-          return "Verse context too large — try again on a shorter chapter.";
-        case "rate_limited":
-          return "Too many AI requests — wait 30 s and try again.";
-        case "model_call_failed":
-          return "AI service unavailable — try again later.";
-        case "tn_quick_disabled":
-        case "unauthorized":
-        case "cache_unavailable":
-        case "uhb_missing_for_verse":
-        case "anthropic_api_key_missing":
-          return "AI generation unavailable.";
-        default:
-          return `AI request failed (HTTP ${err.status}).`;
-      }
-    }
-    if (err instanceof DOMException && err.name === "AbortError") return "";
-    if (err instanceof Error && err.message) return err.message;
-    return "Network error.";
-  };
-
-  const runAiDraft = async () => {
-    if (!onAiDraft || !aiPrereqsMet || aiLoading) return;
-    aiAbortRef.current?.abort();
-    const controller = new AbortController();
-    aiAbortRef.current = controller;
-    setAiLoading(true);
-    try {
-      let res: TnQuickResponse;
-      try {
-        res = await onAiDraft(controller.signal);
-      } catch (err) {
-        // Retry-once on 502 model_call_failed per the bot's contract.
-        if (
-          err instanceof ApiError &&
-          err.status === 502 &&
-          err.body &&
-          typeof err.body === "object" &&
-          "error" in err.body &&
-          (err.body as { error?: unknown }).error === "model_call_failed"
-        ) {
-          await new Promise<void>((resolve, reject) => {
-            const t = setTimeout(resolve, 2000);
-            controller.signal.addEventListener("abort", () => {
-              clearTimeout(t);
-              reject(new DOMException("aborted", "AbortError"));
-            });
-          });
-          res = await onAiDraft(controller.signal);
-        } else {
-          throw err;
+  // Visibility reporting. Default root means "browser viewport" — close
+  // enough for the resource column's scroll model and avoids threading
+  // a scroll-container ref through props.
+  useEffect(() => {
+    if (!onVisibilityChange) return;
+    const el = paperRef.current;
+    if (!el) return;
+    const rowId = row.id;
+    const observer = new IntersectionObserver(
+      (entries) => {
+        for (const entry of entries) {
+          onVisibilityChange(rowId, entry.isIntersecting);
         }
-      }
-      if (controller.signal.aborted) return;
-      applyAiResult(res);
-    } catch (err) {
-      if (controller.signal.aborted) return;
-      const message = mapAiError(err);
-      if (message) setAiToast({ severity: "error", message });
-    } finally {
-      if (aiAbortRef.current === controller) aiAbortRef.current = null;
-      setAiLoading(false);
-    }
-  };
+      },
+      { threshold: 0 },
+    );
+    observer.observe(el);
+    return () => {
+      observer.disconnect();
+      // Cards are visible right up until unmount; tell Shell they're
+      // no longer in viewport so an in-flight AI doesn't think the card
+      // is still rendered when it lands.
+      onVisibilityChange(rowId, false);
+    };
+  }, [row.id, onVisibilityChange]);
 
   const handleAiClick = () => {
-    if (!aiPrereqsMet || aiLoading) return;
+    if (!onStartAi || !aiPrereqsMet || isAiPending) return;
     if (note.trim().length > 0) {
       setAiConfirmOpen(true);
       return;
     }
-    void runAiDraft();
+    onStartAi();
   };
 
   // Net change vs the session snapshot. Drives the save / undo buttons
@@ -432,6 +379,15 @@ export function NoteCard({
         overflow: "hidden",
         opacity: dragging ? 0.4 : 1,
         transition: "opacity 120ms ease",
+        // Glow pulse on AI completion. The flag is set by useAiDrafts
+        // for ~4 s, so the animation finishes naturally and the rule
+        // becomes a no-op once the flag clears.
+        "@keyframes ai-pulse": {
+          "0%": { boxShadow: "0 0 0 0 rgba(49,173,227,0)" },
+          "30%": { boxShadow: "0 0 18px 4px rgba(49,173,227,0.55)" },
+          "100%": { boxShadow: "0 0 0 0 rgba(49,173,227,0)" },
+        },
+        animation: aiRecentlyCompletedAt ? "ai-pulse 1.4s ease-in-out 0s 2" : "none",
       }}
     >
       <Stack
@@ -610,9 +566,9 @@ export function NoteCard({
             </Typography>
             <Tooltip
               title={
-                aiLoading
-                  ? "drafting…"
-                  : !onAiDraft
+                isAiPending
+                  ? "drafting in background — feel free to edit other notes"
+                  : !onStartAi
                     ? "AI generation unavailable"
                     : !supportRef
                       ? "pick a support reference first"
@@ -625,10 +581,10 @@ export function NoteCard({
                 <IconButton
                   size="small"
                   onClick={handleAiClick}
-                  disabled={!onAiDraft || !aiPrereqsMet || aiLoading}
+                  disabled={!onStartAi || !aiPrereqsMet || isAiPending}
                   sx={{ p: 0.25, color: "secondary.main" }}
                 >
-                  {aiLoading ? (
+                  {isAiPending ? (
                     <CircularProgress size={14} color="inherit" />
                   ) : (
                     <AutoAwesomeIcon fontSize="inherit" />
@@ -675,7 +631,7 @@ export function NoteCard({
           <Button
             onClick={() => {
               setAiConfirmOpen(false);
-              void runAiDraft();
+              onStartAi?.();
             }}
             color="primary"
             variant="contained"
@@ -684,23 +640,6 @@ export function NoteCard({
           </Button>
         </DialogActions>
       </Dialog>
-      <Snackbar
-        open={aiToast !== null}
-        autoHideDuration={6000}
-        onClose={() => setAiToast(null)}
-        anchorOrigin={{ vertical: "bottom", horizontal: "center" }}
-      >
-        {aiToast ? (
-          <Alert
-            severity={aiToast.severity}
-            variant="filled"
-            onClose={() => setAiToast(null)}
-            sx={{ width: "100%" }}
-          >
-            {aiToast.message}
-          </Alert>
-        ) : undefined}
-      </Snackbar>
     </Paper>
   );
 }
