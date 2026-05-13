@@ -37,6 +37,98 @@ const TYPE_LABEL: Record<PipelineJobRow["pipeline_type"], string> = {
   tqs: "Translation questions",
 };
 
+// Coarse stage milestones reported via current.skill. For generate, the
+// contract documents the 3 transitions explicitly. For notes/tqs the
+// skill name comes through directly; we list the ones we expect so the
+// stepper has something to anchor to. Unknown skills fall through and
+// the bar still shows the pipeline as "running" without a position.
+const STAGES: Record<PipelineJobRow["pipeline_type"], string[]> = {
+  generate: ["initial-pipeline", "align-all-parallel", "door43-push"],
+  notes: ["tn-writer", "parallel-batch", "repo-insert"],
+  tqs: ["tq-writer", "repo-insert"],
+};
+
+const STAGE_LABEL: Record<string, string> = {
+  "initial-pipeline": "Draft",
+  "align-all-parallel": "Align",
+  "door43-push": "Push",
+  "tn-writer": "Draft",
+  "parallel-batch": "Batch",
+  "tq-writer": "Draft",
+  "repo-insert": "Push",
+};
+
+function StageBar({
+  pipelineType,
+  currentSkill,
+  state,
+}: {
+  pipelineType: PipelineJobRow["pipeline_type"];
+  currentSkill: string | null;
+  state: PipelineState;
+}) {
+  const stages = STAGES[pipelineType];
+  if (!stages || stages.length === 0) return null;
+  const currentIdx = currentSkill ? stages.indexOf(currentSkill) : -1;
+  // Treat "done" as all stages complete; unknown current_skill while
+  // running falls through to "no stage highlighted" (-1) without making
+  // the bar lie.
+  return (
+    <Stack direction="row" alignItems="center" spacing={0.5} sx={{ mt: 0.5, ml: 3 }}>
+      {stages.map((skill, i) => {
+        const isDone = state === "done" || (currentIdx >= 0 && i < currentIdx);
+        const isCurrent = state !== "done" && i === currentIdx;
+        return (
+          <Stack key={skill} direction="row" alignItems="center" spacing={0.5}>
+            <Box
+              sx={{
+                width: 8,
+                height: 8,
+                borderRadius: "50%",
+                bgcolor: isDone
+                  ? "success.main"
+                  : isCurrent
+                    ? "primary.main"
+                    : "transparent",
+                border: 1,
+                borderColor: isDone
+                  ? "success.main"
+                  : isCurrent
+                    ? "primary.main"
+                    : "divider",
+              }}
+            />
+            <Typography
+              variant="caption"
+              sx={{
+                fontSize: 10,
+                fontFamily: "monospace",
+                color: isCurrent
+                  ? "primary.main"
+                  : isDone
+                    ? "success.main"
+                    : "text.disabled",
+                fontWeight: isCurrent ? 600 : 400,
+              }}
+            >
+              {STAGE_LABEL[skill] ?? skill}
+            </Typography>
+            {i < stages.length - 1 && (
+              <Box
+                sx={{
+                  width: 10,
+                  height: 1,
+                  bgcolor: isDone ? "success.main" : "divider",
+                }}
+              />
+            )}
+          </Stack>
+        );
+      })}
+    </Stack>
+  );
+}
+
 function relativeTime(seconds: number): string {
   const diff = Math.floor(Date.now() / 1000) - seconds;
   if (diff < 60) return `${diff}s ago`;
@@ -196,7 +288,9 @@ export function PipelineStatusBar({ toast, onToastClear }: Props = {}) {
                     </Typography>
                     <Typography variant="caption" color="text.secondary" display="block">
                       {stateLabel(job.state)}
-                      {job.current_skill ? ` · ${job.current_skill}` : ""}
+                      {job.current_skill && !STAGES[job.pipeline_type]?.includes(job.current_skill)
+                        ? ` · ${job.current_skill}`
+                        : ""}
                       {` · updated ${relativeTime(job.updated_at)}`}
                     </Typography>
                     {job.error_message && (
@@ -219,8 +313,13 @@ export function PipelineStatusBar({ toast, onToastClear }: Props = {}) {
                     </Tooltip>
                   )}
                 </Stack>
+                <StageBar
+                  pipelineType={job.pipeline_type}
+                  currentSkill={job.current_skill}
+                  state={job.state}
+                />
                 {job.state === "done" && (
-                  <Typography variant="caption" color="text.secondary" sx={{ ml: 3 }} display="block">
+                  <Typography variant="caption" color="text.secondary" sx={{ ml: 3, mt: 0.5 }} display="block">
                     AI output applied to {job.book} {job.start_chapter}.
                   </Typography>
                 )}
