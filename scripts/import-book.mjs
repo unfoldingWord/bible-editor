@@ -158,6 +158,17 @@ function refParts(refRaw) {
   return [chNum, vsNum];
 }
 
+// Each TSV row also gets a matching edit_log v1 entry. Without this, the
+// history endpoint has no record of the imported baseline — so anyone who
+// later edits an imported row would lose the ability to view (or revert
+// to) the original content. The payload is the same shape the API stores
+// for a `create` action via POST /api/rows.
+function emitEditLogCreate(kind, rowKey, payload) {
+  lines.push(
+    `INSERT INTO edit_log (kind, row_key, prev_version, new_version, action, payload_json) VALUES (${q(kind)}, ${q(rowKey)}, NULL, 1, 'create', ${q(JSON.stringify(payload))});`,
+  );
+}
+
 // tn: Reference, ID, Tags, SupportReference, Quote, Occurrence, Note
 let tnCount = 0;
 {
@@ -169,6 +180,17 @@ let tnCount = 0;
     lines.push(
       `INSERT INTO tn_rows (id, book, chapter, verse, ref_raw, tags, support_reference, quote, occurrence, note) VALUES (${q(r.ID)}, ${q(book)}, ${q(ch)}, ${q(v)}, ${q(r.Reference)}, ${q(r.Tags || null)}, ${q(r.SupportReference || null)}, ${q(r.Quote || null)}, ${q(occ)}, ${q(r.Note || null)});`,
     );
+    emitEditLogCreate("tn", r.ID, {
+      book,
+      chapter: ch,
+      verse: v,
+      ref_raw: r.Reference,
+      tags: r.Tags || null,
+      support_reference: r.SupportReference || null,
+      quote: r.Quote || null,
+      occurrence: occ,
+      note: r.Note || null,
+    });
     tnCount++;
   }
 }
@@ -184,6 +206,17 @@ let tqCount = 0;
     lines.push(
       `INSERT INTO tq_rows (id, book, chapter, verse, ref_raw, tags, quote, occurrence, question, response) VALUES (${q(r.ID)}, ${q(book)}, ${q(ch)}, ${q(v)}, ${q(r.Reference)}, ${q(r.Tags || null)}, ${q(r.Quote || null)}, ${q(occ)}, ${q(r.Question || null)}, ${q(r.Response || null)});`,
     );
+    emitEditLogCreate("tq", r.ID, {
+      book,
+      chapter: ch,
+      verse: v,
+      ref_raw: r.Reference,
+      tags: r.Tags || null,
+      quote: r.Quote || null,
+      occurrence: occ,
+      question: r.Question || null,
+      response: r.Response || null,
+    });
     tqCount++;
   }
 }
@@ -199,6 +232,16 @@ let twlCount = 0;
     lines.push(
       `INSERT INTO twl_rows (id, book, chapter, verse, ref_raw, tags, orig_words, occurrence, tw_link) VALUES (${q(r.ID)}, ${q(book)}, ${q(ch)}, ${q(v)}, ${q(r.Reference)}, ${q(r.Tags || null)}, ${q(r.OrigWords || null)}, ${q(occ)}, ${q(r.TWLink || null)});`,
     );
+    emitEditLogCreate("twl", r.ID, {
+      book,
+      chapter: ch,
+      verse: v,
+      ref_raw: r.Reference,
+      tags: r.Tags || null,
+      orig_words: r.OrigWords || null,
+      occurrence: occ,
+      tw_link: r.TWLink || null,
+    });
     twlCount++;
   }
 }
