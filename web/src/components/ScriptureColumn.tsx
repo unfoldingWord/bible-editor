@@ -346,6 +346,7 @@ export function ScriptureColumn({
             findRe={compiledFindRe}
             onSelectVerse={onSelectVerse}
             onOpenAligner={onOpenAligner}
+            onEditVerse={onEditVerse}
           />
         ) : mode === "book" && bookChapterList && bookChapters && onLoadBookChapter && onSelectBookVerse && onEditBookVerse && onOpenBookAligner ? (
           <BookView
@@ -408,6 +409,7 @@ function StackedBody({
   findRe,
   onSelectVerse,
   onOpenAligner,
+  onEditVerse,
 }: {
   versesByVersion: Record<string, Record<number, VerseDto>>;
   verseNumbers: number[];
@@ -421,6 +423,7 @@ function StackedBody({
   findRe: RegExp | null;
   onSelectVerse: (v: number) => void;
   onOpenAligner: (verse: number, bibleVersion: string) => void;
+  onEditVerse: (verseNum: number, bibleVersion: string, plain: string, base: VerseDto) => void;
 }) {
   const ult = versesByVersion["ULT"] ?? {};
   const ust = versesByVersion["UST"] ?? {};
@@ -481,6 +484,9 @@ function StackedBody({
                 findRe={findRe}
                 editable
                 onOpenAligner={() => onOpenAligner(v, "ULT")}
+                onEditPlain={
+                  ultV ? (plain) => onEditVerse(v, "ULT", plain, ultV) : undefined
+                }
               />
               <ActiveLine
                 label="UST"
@@ -492,6 +498,9 @@ function StackedBody({
                 findRe={findRe}
                 editable
                 onOpenAligner={() => onOpenAligner(v, "UST")}
+                onEditPlain={
+                  ustV ? (plain) => onEditVerse(v, "UST", plain, ustV) : undefined
+                }
               />
               {uhbV && (
                 <ActiveLine
@@ -617,6 +626,7 @@ function ActiveLine({
   readOnly,
   editable,
   onOpenAligner,
+  onEditPlain,
   lexiconMap,
 }: {
   label: string;
@@ -630,9 +640,31 @@ function ActiveLine({
   readOnly?: boolean;
   editable?: boolean;
   onOpenAligner?: () => void;
+  onEditPlain?: (plain: string) => void;
   lexiconMap?: Map<string, LexiconEntry | null>;
 }) {
   const elRef = useRef<HTMLDivElement | null>(null);
+  const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Latest onEditPlain reachable from the timer/unmount paths without
+  // restarting the debounce when the parent re-renders.
+  const onEditPlainRef = useRef(onEditPlain);
+  useEffect(() => {
+    onEditPlainRef.current = onEditPlain;
+  }, [onEditPlain]);
+  // Flush any pending edit before the line unmounts (e.g. user navigates
+  // away mid-type). Without this, the trailing keystroke is silently lost.
+  const flushRef = useRef<() => void>(() => {});
+  flushRef.current = () => {
+    if (!debounceRef.current) return;
+    clearTimeout(debounceRef.current);
+    debounceRef.current = null;
+    const handler = onEditPlainRef.current;
+    const node = elRef.current;
+    if (handler && node) handler(node.textContent ?? "");
+  };
+  useEffect(() => {
+    return () => flushRef.current();
+  }, []);
 
   // Find marks override note highlights while the overlay is active —
   // matches BookView's behaviour so users see search results cleanly.
@@ -654,6 +686,9 @@ function ActiveLine({
   // Only resync the DOM when the highlight/content state actually changes —
   // not on every keystroke. This lets the user type freely; clicking a
   // different note triggers a re-set that includes the new highlights.
+  // Setting lastSetRef before flushing an edit keeps this effect from
+  // resetting textContent (and the caret with it) when the parent
+  // applyLocalVerse round-trips back as the new `text` prop.
   const lastSetRef = useRef<string | null>(null);
   useEffect(() => {
     if (!elRef.current) return;
@@ -726,6 +761,25 @@ function ActiveLine({
           contentEditable={editable && !readOnly}
           suppressContentEditableWarning
           spellCheck={!rtl}
+          onInput={(e) => {
+            if (readOnly || !editable || !onEditPlain) return;
+            const value = (e.currentTarget as HTMLDivElement).textContent ?? "";
+            if (debounceRef.current) clearTimeout(debounceRef.current);
+            debounceRef.current = setTimeout(() => {
+              debounceRef.current = null;
+              lastSetRef.current = value;
+              onEditPlainRef.current?.(value);
+            }, 350);
+          }}
+          onBlur={() => {
+            if (readOnly || !editable || !onEditPlain) return;
+            if (!debounceRef.current) return;
+            clearTimeout(debounceRef.current);
+            debounceRef.current = null;
+            const value = elRef.current?.textContent ?? "";
+            lastSetRef.current = value;
+            onEditPlainRef.current?.(value);
+          }}
           sx={{
             flex: 1,
             bgcolor: readOnly ? "grey.100" : "background.paper",

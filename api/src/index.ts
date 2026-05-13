@@ -5,6 +5,7 @@ import { rows } from "./rows";
 import { verses } from "./verses";
 import { catalogs } from "./catalogs";
 import { lexicon } from "./lexicon";
+import { attachAuth, mintDevToken } from "./auth";
 
 export interface Env {
   DB: D1Database;
@@ -15,15 +16,44 @@ export interface Env {
   DCS_OAUTH_TOKEN_URL: string;
   JWT_ISSUER: string;
   JWT_TTL_SECONDS: string;
+  ALLOWED_ORIGINS?: string;
+  DEV_AUTH_ENABLED?: string;
   DCS_CLIENT_ID?: string;
   DCS_CLIENT_SECRET?: string;
   JWT_SIGNING_KEY?: string;
   DCS_SERVICE_TOKEN?: string;
 }
 
-const app = new Hono<{ Bindings: Env }>();
+const app = new Hono<{ Bindings: Env; Variables: { userId?: number; username?: string } }>();
 
-app.use("*", cors({ origin: (origin) => origin ?? "*", credentials: true }));
+// CORS — strict allowlist sourced from the ALLOWED_ORIGINS env var (comma
+// separated). The previous origin echo + credentials:true combination was a
+// CSRF gift: any third-party page could call /api/* on behalf of a logged-in
+// user. Now an Origin must match an entry verbatim; misses get no
+// Access-Control-Allow-Origin header and the browser blocks the call. The
+// dev default covers Vite (5173) and wrangler (8787) on localhost.
+const DEFAULT_DEV_ORIGINS = [
+  "http://localhost:5173",
+  "http://127.0.0.1:5173",
+  "http://localhost:8787",
+  "http://127.0.0.1:8787",
+];
+
+app.use("*", (c, next) => {
+  const allowed = (c.env.ALLOWED_ORIGINS ?? "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const list = allowed.length > 0 ? allowed : DEFAULT_DEV_ORIGINS;
+  return cors({
+    origin: (origin) => (origin && list.includes(origin) ? origin : null),
+    credentials: true,
+    allowHeaders: ["Content-Type", "Authorization", "If-Match"],
+    exposeHeaders: ["ETag"],
+  })(c, next);
+});
+
+app.use("*", attachAuth);
 
 app.get("/api/health", (c) =>
   c.json({
@@ -38,6 +68,22 @@ app.get("/api/books", async (c) => {
     `SELECT book, imported_at FROM book_imports ORDER BY book`,
   ).all<{ book: string; imported_at: number }>();
   return c.json({ books: rs.results });
+});
+
+// Dev-only: mint a JWT against a known/created users.id. Gated by
+// DEV_AUTH_ENABLED so it can't be left on in prod.
+app.post("/api/auth/dev", async (c) => {
+  if (c.env.DEV_AUTH_ENABLED !== "true") {
+    return c.json({ error: "disabled" }, 404);
+  }
+  let body: { username?: string } = {};
+  try {
+    body = await c.req.json();
+  } catch {
+    /* allow empty body */
+  }
+  const username = (body.username ?? "").trim() || "dev";
+  return mintDevToken(c, username);
 });
 
 app.route("/api/chapters", chapters);

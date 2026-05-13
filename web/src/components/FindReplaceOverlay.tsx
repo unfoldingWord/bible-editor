@@ -9,6 +9,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
+  Alert,
   Box,
   Stack,
   TextField,
@@ -24,6 +25,11 @@ import ArrowDownwardIcon from "@mui/icons-material/ArrowDownward";
 import type { ChapterState } from "../hooks/useBook";
 import type { VerseDto } from "../sync/api";
 import { smartReplaceVerse } from "../lib/replace";
+
+// UHB / UGNT are upstream source texts — the worker returns 403 on PATCH.
+// Filtering replace matches here keeps the outbox from queueing ops that
+// will fatally fail.
+const READ_ONLY_VERSIONS = new Set(["UHB", "UGNT"]);
 
 export interface FindMatch {
   chapter: number;
@@ -148,7 +154,20 @@ export function FindReplaceOverlay({
     onScrollToMatch(matches[next]);
   };
 
+  // Status surfaced after a replace-all so the user sees when alignment
+  // milestones were destroyed (no inline indicator otherwise — the verse
+  // looks the same except for missing \zaln-s tags). Cleared on the next
+  // find-query change.
+  const [replaceSummary, setReplaceSummary] = useState<
+    | null
+    | { versesReplaced: number; alignmentLost: number; readOnlySkipped: number }
+  >(null);
+  useEffect(() => {
+    setReplaceSummary(null);
+  }, [find, regex, caseSensitive]);
+
   const doReplaceMatch = (m: FindMatch) => {
+    if (READ_ONLY_VERSIONS.has(m.bibleVersion)) return;
     const state = chapters.get(m.chapter);
     if (!state || state.kind !== "ready") return;
     const verse = state.data.verses[m.bibleVersion]?.[m.verse];
@@ -164,6 +183,11 @@ export function FindReplaceOverlay({
       replace,
     );
     if (result.plainText === text) return;
+    if (!result.preservedAlignment) {
+      setReplaceSummary({ versesReplaced: 1, alignmentLost: 1, readOnlySkipped: 0 });
+    } else {
+      setReplaceSummary({ versesReplaced: 1, alignmentLost: 0, readOnlySkipped: 0 });
+    }
     // The replace will trigger a matches reshape (the current match is
     // gone); flag the upcoming reshape so we scroll to whatever's next.
     wantsScrollRef.current = true;
@@ -172,16 +196,25 @@ export function FindReplaceOverlay({
 
   const doReplaceAll = () => {
     if (!compiled.re || matches.length === 0) return;
-    // Sort matches per-verse from end → start so each rewrite doesn't
-    // invalidate the indices of later ones; we still ship one PATCH per
-    // verse by collapsing the intermediate results.
+    // Group matches by verse. Re-derive matches in the *current* plain text
+    // for each iteration instead of trusting `startIndex` from the original
+    // collection — normalize() inside smartReplaceVerse can collapse
+    // whitespace and shift the indices of every later match. The original
+    // reverse-sort approach was correct only when normalize was a no-op.
     const byVerse = new Map<string, FindMatch[]>();
+    let readOnlySkipped = 0;
     for (const m of matches) {
+      if (READ_ONLY_VERSIONS.has(m.bibleVersion)) {
+        readOnlySkipped += 1;
+        continue;
+      }
       const key = `${m.chapter}|${m.verse}|${m.bibleVersion}`;
       const list = byVerse.get(key) ?? [];
       list.push(m);
       byVerse.set(key, list);
     }
+    let versesReplaced = 0;
+    let alignmentLost = 0;
     for (const [key, list] of byVerse) {
       const [chStr, vStr, bv] = key.split("|");
       const ch = parseInt(chStr, 10);
@@ -190,26 +223,37 @@ export function FindReplaceOverlay({
       if (!state || state.kind !== "ready") continue;
       const verse = state.data.verses[bv]?.[v];
       if (!verse) continue;
-      // Apply replacements in reverse plain-text order so the earlier
-      // matches' indices stay valid as we mutate.
-      const ordered = [...list].sort((a, b) => b.startIndex - a.startIndex);
       let content: unknown = verse.content;
       let plainText = verse.plain_text ?? "";
-      for (const mm of ordered) {
+      // Replace one occurrence at a time, re-scanning the current plain
+      // text. Cap iterations at the original match count so a runaway
+      // replace pattern (where the result keeps matching the regex) can't
+      // loop forever — same safety the per-verse counter gives us.
+      const maxIters = list.length;
+      let preservedThisVerse = true;
+      for (let i = 0; i < maxIters; i++) {
+        const localRe = new RegExp(compiled.re.source, compiled.re.flags);
+        const next = localRe.exec(plainText);
+        if (!next) break;
         const result = smartReplaceVerse(
           content,
           plainText,
           compiled.re,
-          mm.startIndex,
-          mm.endIndex - mm.startIndex,
+          next.index,
+          next[0].length,
           replace,
         );
+        if (result.plainText === plainText) break;
+        if (!result.preservedAlignment) preservedThisVerse = false;
         content = result.content;
         plainText = result.plainText;
       }
       if (plainText === verse.plain_text) continue;
+      versesReplaced += 1;
+      if (!preservedThisVerse) alignmentLost += 1;
       onReplaceVerse(ch, v, bv, content, plainText, verse);
     }
+    setReplaceSummary({ versesReplaced, alignmentLost, readOnlySkipped });
   };
 
   if (!open) return null;
@@ -380,6 +424,22 @@ export function FindReplaceOverlay({
           </span>
         </Tooltip>
       </Stack>
+      {replaceSummary && (replaceSummary.versesReplaced > 0 || replaceSummary.readOnlySkipped > 0) && (
+        <Alert
+          severity={replaceSummary.alignmentLost > 0 ? "warning" : "success"}
+          sx={{ mt: 0.75, py: 0.25, "& .MuiAlert-message": { py: 0.5, fontSize: 12 } }}
+          onClose={() => setReplaceSummary(null)}
+        >
+          replaced {replaceSummary.versesReplaced} verse
+          {replaceSummary.versesReplaced === 1 ? "" : "s"}
+          {replaceSummary.alignmentLost > 0 &&
+            ` — alignment milestones destroyed in ${replaceSummary.alignmentLost}`}
+          {replaceSummary.readOnlySkipped > 0 &&
+            ` — ${replaceSummary.readOnlySkipped} match${
+              replaceSummary.readOnlySkipped === 1 ? "" : "es"
+            } in UHB/UGNT skipped (read-only)`}
+        </Alert>
+      )}
     </Box>
   );
 }

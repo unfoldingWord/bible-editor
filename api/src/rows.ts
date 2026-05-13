@@ -2,8 +2,9 @@ import { Hono } from "hono";
 import { z } from "zod";
 import type { Env } from "./index";
 import type { RowKind, TnRow, TqRow, TwlRow } from "./types";
+import { currentUserId, requireAuth } from "./auth";
 
-export const rows = new Hono<{ Bindings: Env }>();
+export const rows = new Hono<{ Bindings: Env; Variables: { userId?: number } }>();
 
 const KIND_TO_TABLE: Record<RowKind, string> = {
   tn: "tn_rows",
@@ -17,7 +18,12 @@ const isRowKind = (k: string): k is RowKind => k in KIND_TO_TABLE;
 // If-Match header. We accept a bare integer ("If-Match: 7") for simplicity.
 function parseIfMatch(header: string | undefined): number | null {
   if (!header) return null;
-  const n = parseInt(header.replace(/[^0-9]/g, ""), 10);
+  const trimmed = header.trim();
+  // Accept bare integers or quoted ETags; reject anything else so a
+  // malformed header isn't silently treated as "no precondition".
+  const m = /^"?(\d+)"?$/.exec(trimmed);
+  if (!m) return null;
+  const n = parseInt(m[1], 10);
   return Number.isFinite(n) ? n : null;
 }
 
@@ -95,7 +101,7 @@ const CreateTwl = z.object({
 });
 const CREATE_SCHEMA = { tn: CreateTn, tq: CreateTq, twl: CreateTwl };
 
-rows.post("/:kind", async (c) => {
+rows.post("/:kind", requireAuth, async (c) => {
   const kind = c.req.param("kind");
   if (!isRowKind(kind)) return c.json({ error: "invalid_kind" }, 400);
   let body: unknown;
@@ -107,30 +113,44 @@ rows.post("/:kind", async (c) => {
   const parsed = CREATE_SCHEMA[kind].safeParse(body);
   if (!parsed.success) return c.json({ error: "invalid_body", details: parsed.error.format() }, 400);
   const data = parsed.data as Record<string, unknown>;
+  const userId = currentUserId(c);
 
-  // Generate ids until we miss any existing collision. With 32^4 = ~1M space
-  // a collision is rare; this loop is paranoia.
-  let id = newRowId();
-  for (let i = 0; i < 8; i++) {
-    const exists = await c.env.DB.prepare(`SELECT 1 FROM ${KIND_TO_TABLE[kind]} WHERE id = ?1`).bind(id).first();
-    if (!exists) break;
-    id = newRowId();
-  }
-
-  const cols = ["id", ...Object.keys(data)];
+  // Retry around PK collision: insert under a fresh id and let the DB be the
+  // source of truth instead of SELECT-then-INSERT (which races between two
+  // concurrent POSTs). 32^4 ≈ 1M ids; ~8 tries covers any plausible book.
+  const cols = ["id", ...Object.keys(data), "updated_by"];
   const placeholders = cols.map((_c, i) => `?${i + 1}`).join(", ");
-  const values: unknown[] = [id, ...Object.values(data)];
-  await c.env.DB.prepare(
-    `INSERT INTO ${KIND_TO_TABLE[kind]} (${cols.join(", ")}) VALUES (${placeholders})`,
-  )
-    .bind(...values)
-    .run();
-
-  await c.env.DB.prepare(
-    `INSERT INTO edit_log (kind, row_key, prev_version, new_version, action, payload_json) VALUES (?1, ?2, NULL, 1, 'create', ?3)`,
-  )
-    .bind(kind, id, JSON.stringify(data))
-    .run();
+  let id = "";
+  let lastErr: unknown = null;
+  for (let i = 0; i < 8; i++) {
+    id = newRowId();
+    const values: unknown[] = [id, ...Object.values(data), userId];
+    try {
+      await c.env.DB.batch([
+        c.env.DB
+          .prepare(
+            `INSERT INTO ${KIND_TO_TABLE[kind]} (${cols.join(", ")}) VALUES (${placeholders})`,
+          )
+          .bind(...values),
+        c.env.DB
+          .prepare(
+            `INSERT INTO edit_log (kind, row_key, user_id, prev_version, new_version, action, payload_json) VALUES (?1, ?2, ?3, NULL, 1, 'create', ?4)`,
+          )
+          .bind(kind, id, userId, JSON.stringify(data)),
+      ]);
+      lastErr = null;
+      break;
+    } catch (e) {
+      lastErr = e;
+      // Only retry on a unique-constraint collision. Anything else is a real
+      // failure that should bubble up.
+      const msg = e instanceof Error ? e.message : String(e);
+      if (!/UNIQUE|PRIMARY KEY/i.test(msg)) throw e;
+    }
+  }
+  if (lastErr) {
+    return c.json({ error: "id_collision_exhausted" }, 503);
+  }
 
   const created = await c.env.DB.prepare(
     `SELECT * FROM ${KIND_TO_TABLE[kind]} WHERE id = ?1`,
@@ -153,13 +173,19 @@ rows.get("/:kind/:id", async (c) => {
   return c.json(row);
 });
 
-// Single-row PATCH with optimistic concurrency via If-Match.
-rows.patch("/:kind/:id", async (c) => {
+// Single-row PATCH with optimistic concurrency. If-Match is mandatory and
+// the version check is enforced inside the UPDATE itself — a SELECT-then-
+// UPDATE pair would race between two concurrent writers, both seeing the
+// same version and both committing, silently losing one user's edit.
+rows.patch("/:kind/:id", requireAuth, async (c) => {
   const kind = c.req.param("kind");
   const id = c.req.param("id");
   if (!isRowKind(kind)) return c.json({ error: "invalid_kind" }, 400);
 
   const expected = parseIfMatch(c.req.header("if-match"));
+  if (expected === null) {
+    return c.json({ error: "if_match_required" }, 428);
+  }
 
   let body: unknown;
   try {
@@ -175,50 +201,64 @@ rows.patch("/:kind/:id", async (c) => {
   }
   const patch = parsed.data;
 
-  const current = await c.env.DB.prepare(
-    `SELECT * FROM ${KIND_TO_TABLE[kind]} WHERE id = ?1`,
-  )
-    .bind(id)
-    .first<{ version: number; deleted_at: number | null }>();
-  if (!current || current.deleted_at) return c.json({ error: "not_found" }, 404);
-
-  if (expected !== null && expected !== current.version) {
-    // Conflict — caller's expected version doesn't match. Return the fresh row.
-    const fresh = await c.env.DB.prepare(
-      `SELECT * FROM ${KIND_TO_TABLE[kind]} WHERE id = ?1`,
-    )
-      .bind(id)
-      .first();
-    return c.json({ error: "version_mismatch", current: fresh }, 409);
-  }
-
   const fields = Object.keys(patch);
   if (fields.length === 0) {
     return c.json({ error: "empty_patch" }, 400);
   }
 
-  const newVersion = current.version + 1;
+  const userId = currentUserId(c);
   const now = Math.floor(Date.now() / 1000);
   const setClauses = fields.map((f, i) => `${f} = ?${i + 1}`);
-  setClauses.push(`version = ?${fields.length + 1}`);
-  setClauses.push(`updated_at = ?${fields.length + 2}`);
+  const baseParams = fields.length;
+  // version bump and metadata go after the patch fields, then the WHERE
+  // params (id + expected version) tail the bindings.
+  setClauses.push(`version = version + 1`);
+  setClauses.push(`updated_at = ?${baseParams + 1}`);
+  setClauses.push(`updated_by = ?${baseParams + 2}`);
   const values = [
     ...fields.map((f) => (patch as Record<string, unknown>)[f]),
-    newVersion,
     now,
+    userId,
+    id,
+    expected,
   ];
 
-  await c.env.DB.prepare(
-    `UPDATE ${KIND_TO_TABLE[kind]} SET ${setClauses.join(", ")} WHERE id = ?${values.length + 1}`,
-  )
-    .bind(...values, id)
-    .run();
+  // Atomic: the audit INSERT is conditional on the UPDATE matching, so a
+  // version-mismatch never leaves an orphan audit row. D1 batch() commits
+  // both statements together; SQLite evaluates the INSERT ... SELECT WHERE
+  // against the post-UPDATE row state, so the audit only lands if the row
+  // is now at expected+1.
+  const newVersion = expected + 1;
+  const [updateRes] = await c.env.DB.batch([
+    c.env.DB
+      .prepare(
+        `UPDATE ${KIND_TO_TABLE[kind]}
+           SET ${setClauses.join(", ")}
+         WHERE id = ?${baseParams + 3}
+           AND version = ?${baseParams + 4}
+           AND deleted_at IS NULL`,
+      )
+      .bind(...values),
+    c.env.DB
+      .prepare(
+        `INSERT INTO edit_log (kind, row_key, user_id, prev_version, new_version, action, payload_json)
+         SELECT ?1, ?2, ?3, ?4, ?5, 'update', ?6
+         WHERE EXISTS (SELECT 1 FROM ${KIND_TO_TABLE[kind]} WHERE id = ?2 AND version = ?5)`,
+      )
+      .bind(kind, id, userId, expected, newVersion, JSON.stringify(patch)),
+  ]);
 
-  await c.env.DB.prepare(
-    `INSERT INTO edit_log (kind, row_key, prev_version, new_version, action, payload_json) VALUES (?1, ?2, ?3, ?4, 'update', ?5)`,
-  )
-    .bind(kind, id, current.version, newVersion, JSON.stringify(patch))
-    .run();
+  if (!updateRes.meta.changes) {
+    // No row updated: either gone, soft-deleted, or version moved on. Fetch
+    // current to distinguish 404 vs 409 for the client.
+    const fresh = await c.env.DB.prepare(
+      `SELECT * FROM ${KIND_TO_TABLE[kind]} WHERE id = ?1`,
+    )
+      .bind(id)
+      .first<{ version: number; deleted_at: number | null }>();
+    if (!fresh || fresh.deleted_at) return c.json({ error: "not_found" }, 404);
+    return c.json({ error: "version_mismatch", current: fresh }, 409);
+  }
 
   const updated = await c.env.DB.prepare(
     `SELECT * FROM ${KIND_TO_TABLE[kind]} WHERE id = ?1`,
@@ -228,32 +268,44 @@ rows.patch("/:kind/:id", async (c) => {
   return c.json(updated);
 });
 
-// Soft delete.
-rows.delete("/:kind/:id", async (c) => {
+// Soft delete with the same atomic version guard as PATCH.
+rows.delete("/:kind/:id", requireAuth, async (c) => {
   const kind = c.req.param("kind");
   const id = c.req.param("id");
   if (!isRowKind(kind)) return c.json({ error: "invalid_kind" }, 400);
   const expected = parseIfMatch(c.req.header("if-match"));
-
-  const current = await c.env.DB.prepare(
-    `SELECT version, deleted_at FROM ${KIND_TO_TABLE[kind]} WHERE id = ?1`,
-  )
-    .bind(id)
-    .first<{ version: number; deleted_at: number | null }>();
-  if (!current || current.deleted_at) return c.json({ error: "not_found" }, 404);
-  if (expected !== null && expected !== current.version) {
-    return c.json({ error: "version_mismatch" }, 409);
+  if (expected === null) {
+    return c.json({ error: "if_match_required" }, 428);
   }
+
+  const userId = currentUserId(c);
   const now = Math.floor(Date.now() / 1000);
-  await c.env.DB.prepare(
-    `UPDATE ${KIND_TO_TABLE[kind]} SET deleted_at = ?1, version = version + 1, updated_at = ?1 WHERE id = ?2`,
-  )
-    .bind(now, id)
-    .run();
-  await c.env.DB.prepare(
-    `INSERT INTO edit_log (kind, row_key, prev_version, new_version, action) VALUES (?1, ?2, ?3, ?4, 'delete')`,
-  )
-    .bind(kind, id, current.version, current.version + 1)
-    .run();
+  const newVersion = expected + 1;
+  const [updateRes] = await c.env.DB.batch([
+    c.env.DB
+      .prepare(
+        `UPDATE ${KIND_TO_TABLE[kind]}
+           SET deleted_at = ?1, version = version + 1, updated_at = ?1, updated_by = ?2
+         WHERE id = ?3 AND version = ?4 AND deleted_at IS NULL`,
+      )
+      .bind(now, userId, id, expected),
+    c.env.DB
+      .prepare(
+        `INSERT INTO edit_log (kind, row_key, user_id, prev_version, new_version, action)
+         SELECT ?1, ?2, ?3, ?4, ?5, 'delete'
+         WHERE EXISTS (SELECT 1 FROM ${KIND_TO_TABLE[kind]} WHERE id = ?2 AND version = ?5 AND deleted_at IS NOT NULL)`,
+      )
+      .bind(kind, id, userId, expected, newVersion),
+  ]);
+
+  if (!updateRes.meta.changes) {
+    const fresh = await c.env.DB.prepare(
+      `SELECT version, deleted_at FROM ${KIND_TO_TABLE[kind]} WHERE id = ?1`,
+    )
+      .bind(id)
+      .first<{ version: number; deleted_at: number | null }>();
+    if (!fresh || fresh.deleted_at) return c.json({ error: "not_found" }, 404);
+    return c.json({ error: "version_mismatch", current: fresh }, 409);
+  }
   return c.json({ ok: true });
 });

@@ -572,10 +572,21 @@ export function moveTargets(
 // or "u" for unaligned). Crucially, the word stays in its original stream
 // position; only its `alignedTo` tag changes. The verse's plain text
 // order is invariant across alignment edits.
+//
+// Rejects a destination group that doesn't exist — without that guard a
+// drag landing on a group that was just cleared/collapsed would silently
+// point at nothing, and the serializer would demote the word to unaligned
+// on save. The user can't see the demotion until they re-open the verse,
+// so a no-op is the safer behaviour.
 export function moveTarget(state: AlignmentState, wordId: string, dest: string): AlignmentState {
   let newAlignment: string | null | undefined = undefined;
-  if (dest === "u") newAlignment = null;
-  else if (dest.startsWith("g:")) newAlignment = dest.slice(2);
+  if (dest === "u") {
+    newAlignment = null;
+  } else if (dest.startsWith("g:")) {
+    const groupId = dest.slice(2);
+    if (!state.groups.some((g) => g.id === groupId)) return state;
+    newAlignment = groupId;
+  }
   if (newAlignment === undefined) return state;
 
   let changed = false;

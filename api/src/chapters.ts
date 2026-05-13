@@ -2,8 +2,9 @@ import { Hono } from "hono";
 import { z } from "zod";
 import type { Env } from "./index";
 import type { ChapterPayload, TnRow, TqRow, TwlRow, VerseRow, VerseDto, VerseStatus } from "./types";
+import { currentUserId, requireAuth } from "./auth";
 
-export const chapters = new Hono<{ Bindings: Env }>();
+export const chapters = new Hono<{ Bindings: Env; Variables: { userId?: number } }>();
 
 // Bulk read everything for a chapter.
 chapters.get("/:book/:chapter", async (c) => {
@@ -75,7 +76,7 @@ chapters.get("/:book/:chapter", async (c) => {
 
 // Toggle / set the done flag for a verse.
 const StatusPatch = z.object({ done: z.boolean() });
-chapters.patch("/:book/:chapter/:verse/status", async (c) => {
+chapters.patch("/:book/:chapter/:verse/status", requireAuth, async (c) => {
   const book = c.req.param("book").toUpperCase();
   const chapter = parseInt(c.req.param("chapter"), 10);
   const verse = parseInt(c.req.param("verse"), 10);
@@ -92,13 +93,22 @@ chapters.patch("/:book/:chapter/:verse/status", async (c) => {
   if (!parsed.success) return c.json({ error: "invalid_body" }, 400);
   const done = parsed.data.done ? 1 : 0;
   const now = Math.floor(Date.now() / 1000);
-  await c.env.DB.prepare(
-    `INSERT INTO verse_statuses (book, chapter, verse, done, updated_at)
-     VALUES (?1, ?2, ?3, ?4, ?5)
-     ON CONFLICT(book, chapter, verse) DO UPDATE SET done = ?4, updated_at = ?5`,
-  )
-    .bind(book, chapter, verse, done, now)
-    .run();
+  const userId = currentUserId(c);
+  await c.env.DB.batch([
+    c.env.DB
+      .prepare(
+        `INSERT INTO verse_statuses (book, chapter, verse, done, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(book, chapter, verse) DO UPDATE SET done = ?4, updated_at = ?5`,
+      )
+      .bind(book, chapter, verse, done, now),
+    c.env.DB
+      .prepare(
+        `INSERT INTO edit_log (kind, row_key, user_id, prev_version, new_version, action, payload_json)
+         VALUES ('verse_status', ?1, ?2, NULL, NULL, 'update', ?3)`,
+      )
+      .bind(`${book}/${chapter}/${verse}`, userId, JSON.stringify({ done: !!parsed.data.done })),
+  ]);
   const row = await c.env.DB.prepare(
     `SELECT * FROM verse_statuses WHERE book = ?1 AND chapter = ?2 AND verse = ?3`,
   )

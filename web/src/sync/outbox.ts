@@ -24,7 +24,13 @@ export interface VerseTarget {
   verse: number;
   bibleVersion: string;
 }
-export type OpTarget = RowTarget | VerseTarget;
+export interface VerseStatusTarget {
+  kind: "verse_status";
+  book: string;
+  chapter: number;
+  verse: number;
+}
+export type OpTarget = RowTarget | VerseTarget | VerseStatusTarget;
 
 export type OpStatus = "pending" | "in_flight" | "conflict" | "failed";
 export type OpAction = "patch" | "delete";
@@ -76,6 +82,16 @@ async function notify() {
 function uid() {
   // crypto.randomUUID is universally available in modern browsers / workers.
   return crypto.randomUUID();
+}
+
+// Two ops belong to the same target iff they touch the same row/verse. A
+// conflict on one of them must not block ops to *other* targets — but it
+// must keep blocking siblings, since the user's expectedVersion is stale
+// for them too.
+function targetKey(t: OpTarget): string {
+  if (t.kind === "row") return `row:${t.rowKind}:${t.id}`;
+  if (t.kind === "verse_status") return `vstatus:${t.book}:${t.chapter}:${t.verse}`;
+  return `verse:${t.book}:${t.chapter}:${t.verse}:${t.bibleVersion}`;
 }
 
 export const outbox = {
@@ -152,13 +168,71 @@ export const outbox = {
     return op;
   },
 
+  // verse_status (done flag) has no version field — the worker upserts on
+  // primary key (book, chapter, verse) with a UPSERT-style ON CONFLICT. We
+  // still want it in the outbox so an offline toggle survives a crash and
+  // doesn't need the user to re-click after reconnecting. Coalesce queued
+  // toggles for the same verse so a rapid click→click→click only ships the
+  // last value.
+  async enqueueVerseStatus(
+    book: string,
+    chapter: number,
+    verse: number,
+    done: boolean,
+  ): Promise<OutboxOp> {
+    const idb = await db();
+    const key = `vstatus:${book}:${chapter}:${verse}`;
+    const all = (await idb.getAll(STORE)) as OutboxOp[];
+    const pending = all.find(
+      (o) => targetKey(o.target) === key && (o.status === "pending" || o.status === "in_flight"),
+    );
+    if (pending) {
+      // Coalesce: rewrite the existing op's payload rather than queue a
+      // second one that would just race to overwrite the first.
+      pending.patch = { done };
+      pending.queuedAt = Date.now();
+      await idb.put(STORE, pending);
+      void notify();
+      void drain();
+      return pending;
+    }
+    const op: OutboxOp = {
+      id: uid(),
+      target: { kind: "verse_status", book, chapter, verse },
+      action: "patch",
+      patch: { done },
+      expectedVersion: 0,
+      queuedAt: Date.now(),
+      attempts: 0,
+      status: "pending",
+    };
+    await idb.put(STORE, op);
+    void notify();
+    void drain();
+    return op;
+  },
+
+  // Re-arm a conflicted op against the freshly-observed server version. Also
+  // resets every op for the same target so a single user resolution doesn't
+  // cascade-conflict the queue (otherwise N edits to one row produce N
+  // prompts for what was logically one upstream change).
   async resolveConflict(opId: string, newExpectedVersion: number) {
-    const op = (await (await db()).get(STORE, opId)) as OutboxOp | undefined;
+    const idb = await db();
+    const op = (await idb.get(STORE, opId)) as OutboxOp | undefined;
     if (!op) return;
-    op.expectedVersion = newExpectedVersion;
-    op.status = "pending";
-    op.conflictCurrent = undefined;
-    await (await db()).put(STORE, op);
+    const key = targetKey(op.target);
+    const all = (await idb.getAll(STORE)) as OutboxOp[];
+    const tx = idb.transaction(STORE, "readwrite");
+    for (const o of all) {
+      if (targetKey(o.target) !== key) continue;
+      if (o.status === "conflict" || o.status === "pending") {
+        o.expectedVersion = newExpectedVersion;
+        o.status = "pending";
+        o.conflictCurrent = undefined;
+        await tx.store.put(o);
+      }
+    }
+    await tx.done;
     void notify();
     void drain();
   },
@@ -166,6 +240,7 @@ export const outbox = {
   async drop(opId: string) {
     await (await db()).delete(STORE, opId);
     void notify();
+    void drain();
   },
 
   async list(): Promise<OutboxOp[]> {
@@ -209,6 +284,13 @@ async function dispatch(op: OutboxOp): Promise<Result> {
           op.patch,
         );
       }
+    } else if (op.target.kind === "verse_status") {
+      updated = await api.setVerseDone(
+        op.target.book,
+        op.target.chapter,
+        op.target.verse,
+        Boolean((op.patch as { done?: boolean }).done),
+      );
     } else {
       updated = await api.patchVerse(
         op.target.book,
@@ -226,57 +308,115 @@ async function dispatch(op: OutboxOp): Promise<Result> {
         const body = e.body as { current?: unknown } | undefined;
         return { kind: "conflict", current: body?.current };
       }
-      if (e.status === 401 || e.status === 403) {
+      if (e.status === 401) {
+        // Token missing/expired. Don't burn retries against a wall — pause
+        // and let an outer reauth refresh the token. The op stays pending.
         return { kind: "retry", reason: `auth ${e.status}` };
       }
-      if (e.status >= 500) {
-        return { kind: "retry", reason: `server ${e.status}` };
+      // Transient HTTP signals: rate-limit, timeout, too-early. 5xx is the
+      // server saying "try again". 503 / 504 explicitly.
+      if (
+        e.status === 408 ||
+        e.status === 425 ||
+        e.status === 429 ||
+        e.status >= 500
+      ) {
+        return { kind: "retry", reason: `transient ${e.status}` };
       }
+      // 403, 404, 422, 428 etc. are non-retryable client errors — sending
+      // the same payload again won't change the outcome.
       return { kind: "fatal", reason: `http ${e.status}` };
     }
     return { kind: "retry", reason: "network" };
   }
 }
 
+// Re-arm anything stuck mid-flight from a previous tab crash / hot reload.
+// Without this, the drain filter (status === "pending") would skip ops that
+// were transitioned to "in_flight" but never resolved.
+async function recoverInFlight() {
+  const idb = await db();
+  const all = (await idb.getAll(STORE)) as OutboxOp[];
+  const stuck = all.filter((o) => o.status === "in_flight");
+  if (stuck.length === 0) return;
+  const tx = idb.transaction(STORE, "readwrite");
+  for (const o of stuck) {
+    o.status = "pending";
+    o.lastError = "recovered_from_in_flight";
+    await tx.store.put(o);
+  }
+  await tx.done;
+}
+
 export async function drain() {
   if (draining) return;
   draining = true;
   try {
+    await recoverInFlight();
+    // Targets with an unresolved conflict are skipped for *this* pass but
+    // we keep draining other targets so a single hot row doesn't freeze
+    // the entire queue.
+    const blocked = new Set<string>();
     while (true) {
       const ops = await listAll();
-      const next = ops.find((o) => o.status === "pending");
+      // Mark any target with a still-conflicted op as blocked, so we don't
+      // pick up sibling pending ops with stale expectedVersion either.
+      for (const o of ops) {
+        if (o.status === "conflict") blocked.add(targetKey(o.target));
+      }
+      const next = ops.find(
+        (o) => o.status === "pending" && !blocked.has(targetKey(o.target)),
+      );
       if (!next) break;
       next.status = "in_flight";
       next.attempts += 1;
       await (await db()).put(STORE, next);
       void notify();
 
-      const result = await dispatch(next);
-      for (const l of resultListeners) l(next, result);
-
-      if (result.kind === "ok") {
-        await (await db()).delete(STORE, next.id);
-      } else if (result.kind === "conflict") {
-        next.status = "conflict";
-        next.conflictCurrent = result.current;
-        next.lastError = "version_mismatch";
-        await (await db()).put(STORE, next);
-        // Don't continue draining past a conflict — wait for the UI to resolve it.
-        void notify();
-        break;
-      } else if (result.kind === "retry") {
-        next.status = "pending";
-        next.lastError = result.reason;
-        await (await db()).put(STORE, next);
-        scheduleDrain(backoffMs(next.attempts));
-        void notify();
-        break;
-      } else {
-        next.status = "failed";
-        next.lastError = result.reason;
-        await (await db()).put(STORE, next);
-        void notify();
+      let result: Result;
+      try {
+        result = await dispatch(next);
+      } catch (err) {
+        result = { kind: "retry", reason: `dispatch_threw: ${String(err)}` };
       }
+
+      // Persist the new status *before* notifying listeners. If a put() or
+      // delete() throws, the catch below resets the op to pending so it
+      // doesn't strand at in_flight.
+      try {
+        if (result.kind === "ok") {
+          await (await db()).delete(STORE, next.id);
+        } else if (result.kind === "conflict") {
+          next.status = "conflict";
+          next.conflictCurrent = result.current;
+          next.lastError = "version_mismatch";
+          await (await db()).put(STORE, next);
+          blocked.add(targetKey(next.target));
+        } else if (result.kind === "retry") {
+          next.status = "pending";
+          next.lastError = result.reason;
+          await (await db()).put(STORE, next);
+          scheduleDrain(backoffMs(next.attempts));
+          blocked.add(targetKey(next.target));
+        } else {
+          next.status = "failed";
+          next.lastError = result.reason;
+          await (await db()).put(STORE, next);
+        }
+      } catch (persistErr) {
+        // Best-effort recovery — if IndexedDB itself failed, the op may be
+        // half-written. Force pending so the next drain pass tries again.
+        try {
+          next.status = "pending";
+          next.lastError = `persist_failed: ${String(persistErr)}`;
+          await (await db()).put(STORE, next);
+        } catch {
+          /* nothing we can do; will be picked up by recoverInFlight on reload */
+        }
+      }
+
+      for (const l of resultListeners) l(next, result);
+      void notify();
     }
   } finally {
     draining = false;
@@ -297,8 +437,11 @@ function scheduleDrain(ms: number) {
   }, ms);
 }
 
-// Drain on focus / online so a sleeping tab catches up on wake.
+// Drain on focus / online so a sleeping tab catches up on wake. Also kick
+// off an initial drain (which runs recoverInFlight first) so any ops left
+// stranded by a previous tab crash get re-armed at startup.
 if (typeof window !== "undefined") {
   window.addEventListener("online", () => void drain());
   window.addEventListener("focus", () => void drain());
+  void drain();
 }

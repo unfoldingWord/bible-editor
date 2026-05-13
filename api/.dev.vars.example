@@ -1,0 +1,12 @@
+# Copy this file to api/.dev.vars and replace the placeholder. Wrangler
+# auto-loads .dev.vars when running `wrangler dev`. NEVER commit the real
+# .dev.vars — it's in .gitignore.
+
+# Used to sign / verify JWTs minted by /api/auth/dev and (later) /api/auth/dcs.
+# Any high-entropy string ≥ 32 chars. In production set with:
+#   wrangler secret put JWT_SIGNING_KEY
+JWT_SIGNING_KEY=dev-only-replace-with-a-random-32-byte-string
+
+# Optional: DCS OAuth credentials. Not used until the DCS auth flow ships.
+# DCS_CLIENT_ID=
+# DCS_CLIENT_SECRET=
