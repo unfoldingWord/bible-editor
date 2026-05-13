@@ -23,3 +23,9 @@ spikes/out/
 # are not.
 scripts/out/
 scripts/tmp/
+
+# Local working files — present in the working tree but not part of the
+# committed history. Listed here so `git status` stays clean across branch
+# switches.
+/AGENTS.md
+/docs/ai-alignment-unicode-fix.md
