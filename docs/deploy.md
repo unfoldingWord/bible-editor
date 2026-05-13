@@ -1,0 +1,183 @@
+# Deploy — Cloudflare
+
+Tactical 7-month tool. One Worker serves both `/api/*` and the SPA from the
+same origin; the SPA bundle ships as static assets bound into the Worker. A
+single `npm run deploy` from the repo root publishes everything.
+
+This is a runbook, not a tutorial. It assumes you have:
+
+- A Cloudflare account with **Workers Paid** ($5/month) enabled — required
+  for D1, Durable Objects, Workflows, and the nightly Cron trigger.
+- `wrangler` ≥ 4.0 on your `PATH` (already in `api/devDependencies`).
+- Authenticated wrangler: `npx wrangler login`.
+
+## Test the workflow locally first
+
+You do not need any of the Cloudflare provisioning below to exercise the
+nightly export end-to-end on your laptop. Miniflare runs the Workflow
+runtime locally.
+
+```sh
+# 1. Apply the new migration (book_usfm_meta) to local D1.
+cd api && npx wrangler d1 migrations apply bible_editor --local && cd ..
+
+# 2. Re-import any book whose USFM headers you want preserved (optional —
+#    older imports still export with synthesized minimal headers).
+node scripts/import-book.mjs ZEC
+cd api && npx wrangler d1 execute bible_editor --local --file=../scripts/out/import-ZEC.sql && cd ..
+
+# 3. Run the stack.
+npm run dev
+
+# 4. Trigger a manual export (auth required — use the dev-mint flow):
+TOKEN=$(curl -s -X POST http://localhost:8787/api/auth/dev -d '{}' | jq -r .token)
+curl -X POST http://localhost:8787/api/exports/run \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{ "book": "ZEC", "dryDcs": true }'
+# → { "id": "...", "status": "queued" }
+
+# 5. Watch the snapshot table.
+curl -s http://localhost:8787/api/exports | jq '.snapshots[0:5]'
+
+# 6. Inspect the rendered files in local R2 storage.
+cd api && npx wrangler r2 object list bible-editor-blobs --prefix exports/ && cd ..
+```
+
+`dryDcs: true` skips the Gitea commit even if `DCS_SERVICE_TOKEN` is set;
+files still land in R2 and snapshots still record. Drop it once you want to
+push to a real DCS branch.
+
+## First production deploy
+
+### 1. Create the D1 database
+
+```sh
+cd api
+npx wrangler d1 create bible_editor
+# → copy the printed database_id into wrangler.toml's [[d1_databases]] block
+```
+
+Replace the `REPLACE_AFTER_wrangler_d1_create` placeholder with the printed
+id. Then apply all migrations to remote:
+
+```sh
+npx wrangler d1 migrations apply bible_editor --remote
+```
+
+### 2. Create the R2 bucket
+
+```sh
+npx wrangler r2 bucket create bible-editor-blobs
+```
+
+The bucket name in `wrangler.toml` already matches; no edit needed.
+
+### 3. Set secrets
+
+```sh
+# 32+ char random key used to sign our JWTs. Generate fresh per environment.
+openssl rand -hex 32 | npx wrangler secret put JWT_SIGNING_KEY
+
+# DCS OAuth app — register at https://git.door43.org/user/settings/applications.
+# Redirect URI must be: https://<your-worker>.workers.dev/api/auth/dcs/callback
+npx wrangler secret put DCS_CLIENT_ID
+npx wrangler secret put DCS_CLIENT_SECRET
+
+# Service-account token for the nightly export. Create a personal access token
+# for a dedicated DCS service user. Scope: write:repository on the export fork.
+# Optional — leave unset to skip DCS commits (snapshots still land in R2).
+npx wrangler secret put DCS_SERVICE_TOKEN
+```
+
+### 4. Lock down the public-facing vars
+
+Edit `wrangler.toml`:
+
+```toml
+[vars]
+ALLOWED_ORIGINS = "https://bible-editor-api.<your-account>.workers.dev"
+DEV_AUTH_ENABLED = "false"
+DCS_EXPORT_OWNER = "your-service-account-username"   # owns the fork repos
+DCS_EXPORT_BRANCH = "live-snapshot"                  # long-lived export branch
+```
+
+`ALLOWED_ORIGINS` is comma-separated. List every origin that should be
+allowed to call the API (custom domain too, if you set one up). An empty
+value falls back to localhost only — production calls will be CORS-blocked.
+
+`DEV_AUTH_ENABLED=false` disables `/api/auth/dev`, the local-dev token mint.
+Production must use the DCS OAuth flow.
+
+### 5. Import seed data
+
+The remote D1 starts empty. Run the importer for each book you want active,
+then apply the generated SQL to **remote**:
+
+```sh
+cd ..  # back to repo root
+node scripts/import-book.mjs ZEC
+cd api && npx wrangler d1 execute bible_editor --remote \
+  --file=../scripts/out/import-ZEC.sql && cd ..
+
+# Lexicon (UHAL + UGL) — large file, takes a minute.
+node scripts/import-lexicon.mjs
+cd api && npx wrangler d1 execute bible_editor --remote \
+  --file=../scripts/out/import-lexicon.sql && cd ..
+```
+
+### 6. Deploy
+
+```sh
+# From the repo root. Builds web/dist then `wrangler deploy` from api/.
+npm run deploy
+```
+
+This bundles the SPA into the Worker as static assets, registers the
+Workflow class, and schedules the nightly cron. First deploy also creates
+the Workflow binding on Cloudflare.
+
+### 7. Verify
+
+```sh
+# API health
+curl https://bible-editor-api.<your-account>.workers.dev/api/health
+
+# Trigger a real export (after one signed-in editor session has written
+# anything to the row tables). DRY-RUN first — verify rendered files
+# under R2 before pushing to DCS.
+curl -X POST https://<host>/api/exports/run \
+  -H "Authorization: Bearer <token-from-OAuth-roundtrip>" \
+  -H "Content-Type: application/json" \
+  -d '{ "dryDcs": true }'
+
+# Inspect snapshot rows
+curl https://<host>/api/exports?limit=20
+```
+
+## Operating
+
+- **Logs**: `npm --workspace api run tail` (wrangler tail).
+- **Workflow status**: Cloudflare dashboard → Workers & Pages → your worker
+  → Workflows tab. Each scheduled run appears as an instance with per-step
+  state — green for committed, red for failed.
+- **Replay a failed export**: trigger `POST /api/exports/run` with the
+  failed book + resource. The workflow records a new snapshot row; if DCS
+  is up the commit lands.
+- **Rotate JWT key**: `wrangler secret put JWT_SIGNING_KEY` with a new
+  value. Existing tokens stop validating immediately — all editors get
+  bounced to sign-in. Outbox edits survive.
+
+## Known gaps before first prod use
+
+- **`book_usfm_meta` is populated only by the updated importer.** Books
+  imported before this migration ship USFM with synthesized headers (\id,
+  \h, \toc*, \mt1 set to the book code). Re-run `import-book.mjs` for any
+  book you care about before the first nightly export.
+- **Repo conventions are hardcoded** to unfoldingWord (`en_tn`, `en_tq`,
+  `en_twl`, `en_ult`, `en_ust`). If you fork to different repo names,
+  override in `api/src/export.ts → RESOURCE_TARGETS`.
+- **The cron always exports every imported book.** With <10 active books
+  and <50 commits/run, this is well within Gitea's rate limits, but skip-
+  when-unchanged could be added later via a `MAX(updated_at)` vs last-
+  snapshot check.
