@@ -19,9 +19,10 @@ interface Props {
   chapter: number;
   onNavigate: (book: string, chapter: number) => void;
   pipelineMenu?: ReactNode;
+  logosSyncToggle?: ReactNode;
 }
 
-export function TopBar({ book, chapter, onNavigate, pipelineMenu }: Props) {
+export function TopBar({ book, chapter, onNavigate, pipelineMenu, logosSyncToggle }: Props) {
   const [books, setBooks] = useState<BookListEntry[]>([]);
   const [summary, setSummary] = useState<BookSummary | null>(null);
 
@@ -122,6 +123,7 @@ export function TopBar({ book, chapter, onNavigate, pipelineMenu }: Props) {
       <Typography variant="caption" color="text.secondary">
         {summary?.chapters && `${summary.chapters.reduce((a, c) => a + c.tn, 0)} notes · ${summary.chapters.reduce((a, c) => a + c.twl, 0)} words · ${summary.chapters.reduce((a, c) => a + c.tq, 0)} questions`}
       </Typography>
+      {logosSyncToggle}
       <SyncStatusBar />
       {pipelineMenu}
     </Stack>
