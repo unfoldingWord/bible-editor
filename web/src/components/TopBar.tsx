@@ -120,6 +120,7 @@ export function TopBar({ book, chapter, onNavigate, pipelineMenu, logosSyncToggl
           </span>
         </Tooltip>
       </Stack>
+      {logosSyncToggle}
       <Box sx={{ flex: 1 }} />
       {summary?.chapters && (
         <>
@@ -129,8 +130,6 @@ export function TopBar({ book, chapter, onNavigate, pipelineMenu, logosSyncToggl
           <Divider orientation="vertical" flexItem sx={{ my: 0.5 }} />
         </>
       )}
-      {logosSyncToggle}
-      <Divider orientation="vertical" flexItem sx={{ my: 0.5 }} />
       <SyncStatusBar />
       <Divider orientation="vertical" flexItem sx={{ my: 0.5 }} />
       {pipelineMenu}
