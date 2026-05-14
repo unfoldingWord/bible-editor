@@ -150,41 +150,79 @@ export function findTargetHighlights(
 // Reverse of findTargetHighlights: given an English support phrase
 // (the user-typed text in the QUOTE field BEFORE AI runs), find the
 // Hebrew/Greek source words that align to those English target words
-// via the verse's \zaln-s milestones. Words match case-insensitively
-// after stripping non-letter chars, so "{with}" matches "with" and
-// "jealousy." matches "jealousy".
+// via the verse's \zaln-s milestones. Matching is case-insensitive,
+// strips non-letter chars ("{with}" -> "with", "jealousy." -> "jealousy"),
+// and looks for the LONGEST CONTIGUOUS run of input words that appears
+// consecutively in the verse's target words.
 //
-// Returns the Hebrew snippet as space-joined source words in
-// document order, de-duped. Returns "" if none of the input words
-// align — callers use empty to short-circuit the AI call with a
-// clearer message than the bot's 422 no_rtl.
+// Nested milestones are handled: each target word carries its full chain
+// of ancestor milestone sources (outer to inner), so a match inside a
+// deeply-nested `\zaln-s` pulls all enclosing source words too.
+//
+// Returns the Hebrew snippet as space-joined source words in document
+// order (outer to inner within a chain), de-duped. Returns "" when no
+// input word matches — callers use empty to short-circuit the AI call
+// with a clearer message than the bot's 422 no_rtl.
 export function findSourceForTargetText(
   verseObjects: unknown[],
   englishText: string,
 ): string {
-  const wanted = new Set(
-    englishText
-      .toLowerCase()
-      .replace(/[^\p{L}\p{N}\s]+/gu, " ")
-      .split(/\s+/)
-      .filter(Boolean),
-  );
-  if (wanted.size === 0) return "";
+  const wantedWords = englishText
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s]+/gu, " ")
+    .split(/\s+/)
+    .filter(Boolean);
+  if (wantedWords.length === 0) return "";
 
-  const runs = collectMilestoneRuns(verseObjects);
-  if (runs.length === 0) return "";
+  type Target = { norm: string; sources: string[] };
+  const targets: Target[] = [];
+  function walk(nodes: unknown[], stack: string[]) {
+    for (const node of nodes ?? []) {
+      const o = node as Record<string, unknown> | null;
+      if (!o) continue;
+      if (nodeIsMilestone(o)) {
+        const source = String(o["content"] ?? "");
+        const children = (o["children"] as unknown[] | undefined) ?? [];
+        walk(children, source ? [...stack, source] : stack);
+      } else if (nodeIsWord(o)) {
+        const text = String(o["text"] ?? "");
+        const norm = text.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, "");
+        if (norm.length > 0) targets.push({ norm, sources: stack });
+      }
+    }
+  }
+  walk(verseObjects, []);
+  if (targets.length === 0) return "";
 
-  const seenSources = new Set<string>();
+  let bestStart = -1;
+  let bestLen = 0;
+  for (let ti = 0; ti < targets.length; ti++) {
+    for (let wi = 0; wi < wantedWords.length; wi++) {
+      if (targets[ti].norm !== wantedWords[wi]) continue;
+      let len = 0;
+      while (
+        ti + len < targets.length &&
+        wi + len < wantedWords.length &&
+        targets[ti + len].norm === wantedWords[wi + len]
+      ) {
+        len++;
+      }
+      if (len > bestLen) {
+        bestLen = len;
+        bestStart = ti;
+      }
+    }
+  }
+  if (bestStart < 0) return "";
+
   const out: string[] = [];
-  for (const run of runs) {
-    const matched = run.targets.some((t) => {
-      const norm = t.text.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, "");
-      return norm.length > 0 && wanted.has(norm);
-    });
-    if (!matched) continue;
-    if (seenSources.has(run.source)) continue;
-    seenSources.add(run.source);
-    out.push(run.source);
+  const seen = new Set<string>();
+  for (let i = bestStart; i < bestStart + bestLen; i++) {
+    for (const src of targets[i].sources) {
+      if (seen.has(src)) continue;
+      seen.add(src);
+      out.push(src);
+    }
   }
   return out.join(" ");
 }
