@@ -19,7 +19,7 @@ import {
   Checkbox,
   Box,
   TextField,
-  InputAdornment,
+  Typography,
 } from "@mui/material";
 import AutoAwesomeIcon from "@mui/icons-material/AutoAwesome";
 import { ApiError } from "../sync/api";
@@ -320,7 +320,8 @@ export function PipelineMenu({ book, chapter, onMessage }: Props) {
               ? `Run ${confirm.label}? ${confirm.approxDuration} per chapter — you can keep working in other chapters while it runs.`
               : ""}
           </DialogContentText>
-          <Box sx={{ mt: 2 }}>
+          <Box sx={{ mt: 2, display: "flex", alignItems: "flex-start", gap: 1.5 }}>
+            <Typography sx={{ pt: 1, fontWeight: 500 }}>{book}</Typography>
             <TextField
               label="Chapter or range"
               value={refInput}
@@ -331,11 +332,6 @@ export function PipelineMenu({ book, chapter, onMessage }: Props) {
               autoFocus
               error={!refParsed.ok}
               inputProps={{ inputMode: "numeric", pattern: "[0-9-]*" }}
-              InputProps={{
-                startAdornment: (
-                  <InputAdornment position="start">{book}</InputAdornment>
-                ),
-              }}
               helperText={
                 refParsed.ok
                   ? refParsed.range.startChapter === refParsed.range.endChapter
