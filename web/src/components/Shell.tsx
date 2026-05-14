@@ -10,6 +10,7 @@ import type { TnRow, TqRow, TwlRow, VerseDto } from "../sync/api";
 import { smartEditVerse } from "../lib/replace";
 import { verseHasUnalignedWork } from "../lib/alignment";
 import { buildTnQuickRequest } from "../lib/tnQuickRequest";
+import { findSourceForTargetText } from "../lib/highlight";
 import { TimelineRail } from "./TimelineRail";
 import { ScriptureColumn, type ScriptureMode } from "./ScriptureColumn";
 import { ResourceColumn } from "./ResourceColumn";
@@ -523,6 +524,16 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook }:
           isNoteAiPending={aiDrafts.isPending}
           noteAiRecentlyCompletedAt={aiDrafts.recentlyCompletedAt}
           onNoteVisibilityChange={handleNoteVisibilityChange}
+          onNoteTranslateQuote={(row, english) => {
+            const vo = (
+              data.verses.ULT?.[row.verse]?.content as
+                | { verseObjects?: unknown[] }
+                | null
+                | undefined
+            )?.verseObjects;
+            if (!Array.isArray(vo)) return null;
+            return findSourceForTargetText(vo, english) || null;
+          }}
           onWordFocus={(row) => {
             setActiveWordId(row.id);
             setActiveNoteId(null);
