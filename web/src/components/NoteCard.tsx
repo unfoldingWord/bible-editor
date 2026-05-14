@@ -559,18 +559,17 @@ export function NoteCard({
         </Tooltip>
         {showSessionButtons && (
           <>
-            <Tooltip title={canUndo ? "discard every edit since this note became active" : "no changes since this note became active"}>
-              <span>
+            {canUndo && (
+              <Tooltip title="discard every edit since this note became active">
                 <IconButton
                   size="small"
                   onClick={handleUndo}
-                  disabled={!canUndo}
-                  sx={{ p: 0.25, color: canUndo ? "warning.main" : "action.disabled" }}
+                  sx={{ p: 0.25, color: "warning.main" }}
                 >
                   <UndoIcon fontSize="inherit" />
                 </IconButton>
-              </span>
-            </Tooltip>
+              </Tooltip>
+            )}
             <Tooltip title={hasNetChanges ? "save pending edits now (auto-saves when you leave this note)" : "no pending edits"}>
               <span>
                 <IconButton
