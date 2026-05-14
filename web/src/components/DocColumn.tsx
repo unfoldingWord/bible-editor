@@ -323,6 +323,7 @@ function VerseSpan({
   };
 
   return (
+    <>
     <span
       data-find-cell={`${chapter}-${verseNum}-${bibleVersion}`}
       onClick={onClick}
@@ -331,7 +332,6 @@ function VerseSpan({
         borderRadius: 4,
         padding: isActive ? "1px 2px" : 0,
         backgroundColor: isActive ? "rgba(49,173,227,0.14)" : "transparent",
-        boxShadow: isActive ? "0 0 0 1.5px #31ADE3" : undefined,
       }}
     >
       <span
@@ -404,8 +404,10 @@ function VerseSpan({
         }}
         className="be-verse-span"
       />
-      )}{" "}
+      )}
     </span>
+    {" "}
+    </>
   );
 }
 
