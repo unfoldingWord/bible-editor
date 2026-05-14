@@ -8,6 +8,7 @@ import {
   MenuItem,
   FormControl,
   Box,
+  Divider,
 } from "@mui/material";
 import NavigateBeforeIcon from "@mui/icons-material/NavigateBefore";
 import NavigateNextIcon from "@mui/icons-material/NavigateNext";
@@ -120,11 +121,18 @@ export function TopBar({ book, chapter, onNavigate, pipelineMenu, logosSyncToggl
         </Tooltip>
       </Stack>
       <Box sx={{ flex: 1 }} />
-      <Typography variant="caption" color="text.secondary">
-        {summary?.chapters && `${summary.chapters.reduce((a, c) => a + c.tn, 0)} notes · ${summary.chapters.reduce((a, c) => a + c.twl, 0)} words · ${summary.chapters.reduce((a, c) => a + c.tq, 0)} questions`}
-      </Typography>
+      {summary?.chapters && (
+        <>
+          <Typography variant="caption" color="text.secondary" sx={{ whiteSpace: "nowrap" }}>
+            {summary.chapters.reduce((a, c) => a + c.tn, 0)} notes · {summary.chapters.reduce((a, c) => a + c.twl, 0)} words · {summary.chapters.reduce((a, c) => a + c.tq, 0)} questions
+          </Typography>
+          <Divider orientation="vertical" flexItem sx={{ my: 0.5 }} />
+        </>
+      )}
       {logosSyncToggle}
+      <Divider orientation="vertical" flexItem sx={{ my: 0.5 }} />
       <SyncStatusBar />
+      <Divider orientation="vertical" flexItem sx={{ my: 0.5 }} />
       {pipelineMenu}
     </Stack>
   );

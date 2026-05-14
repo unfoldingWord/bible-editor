@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import {
+  Box,
   Button,
   Checkbox,
   Dialog,
@@ -12,7 +13,7 @@ import {
   Stack,
   Tooltip,
 } from "@mui/material";
-import SyncIcon from "@mui/icons-material/Sync";
+import OpenInNewIcon from "@mui/icons-material/OpenInNew";
 
 // USFM 3-letter code (lowercase) → Logos Bible abbreviation.
 // Matches the table from the upstream Logos-sync bookmarklet.
@@ -116,10 +117,35 @@ export function LogosSyncToggle({ book, chapter, verse }: Props) {
   };
 
   return (
-    <Stack direction="row" alignItems="center" spacing={0.5}>
-      <Tooltip title="Send the active verse to Logos now">
+    <Stack
+      direction="row"
+      alignItems="center"
+      spacing={0.25}
+      sx={{
+        px: 1,
+        py: 0.25,
+        border: "1px solid",
+        borderColor: "divider",
+        borderRadius: 1,
+        bgcolor: "background.paper",
+      }}
+    >
+      <Box
+        component="span"
+        sx={{
+          fontSize: 11,
+          fontWeight: 600,
+          letterSpacing: 0.5,
+          textTransform: "uppercase",
+          color: "text.secondary",
+          mr: 0.5,
+        }}
+      >
+        Logos
+      </Box>
+      <Tooltip title="Open this verse in Logos">
         <IconButton size="small" onClick={() => fireLogos(book, chapter, verse)}>
-          <SyncIcon fontSize="small" />
+          <OpenInNewIcon fontSize="small" />
         </IconButton>
       </Tooltip>
       <Tooltip title="Auto-follow active verse in Logos (steals focus on each change)">
@@ -131,7 +157,7 @@ export function LogosSyncToggle({ book, chapter, verse }: Props) {
               onChange={(e) => handleCheckboxChange(e.target.checked)}
             />
           }
-          label="Logos sync"
+          label="auto-follow"
           sx={{
             mr: 0,
             "& .MuiFormControlLabel-label": { fontSize: 13 },
