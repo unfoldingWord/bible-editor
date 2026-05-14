@@ -542,6 +542,16 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook }:
             if (!Array.isArray(vo)) return null;
             return findSourceForTargetText(vo, english) || null;
           }}
+          onWordTranslateQuote={(row, english) => {
+            const vo = (
+              data.verses.ULT?.[row.verse]?.content as
+                | { verseObjects?: unknown[] }
+                | null
+                | undefined
+            )?.verseObjects;
+            if (!Array.isArray(vo)) return null;
+            return findSourceForTargetText(vo, english) || null;
+          }}
           onWordFocus={(row) => {
             setActiveWordId(row.id);
             setActiveNoteId(null);

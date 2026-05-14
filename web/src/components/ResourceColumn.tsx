@@ -56,6 +56,8 @@ interface Props {
   // Translate English in a note's quote field to source-language text using
   // ULT alignment. Returns null when no alignment match is found.
   onNoteTranslateQuote?: (row: TnRow, english: string) => string | null;
+  // Same translate flow but for the TWL quote (orig_words) column.
+  onWordTranslateQuote?: (row: TwlRow, english: string) => string | null;
 }
 
 type PinKey = "notes" | "words" | "questions";
@@ -136,6 +138,7 @@ export function ResourceColumn({
   locked = false,
   onKeepNote,
   onNoteTranslateQuote,
+  onWordTranslateQuote,
 }: Props) {
   const [pinned, setPinned] = useState<Pinned>(() => loadPinned());
   const togglePinned = (k: PinKey) => {
@@ -339,6 +342,7 @@ export function ResourceColumn({
                   onFocus={onWordFocus}
                   onReorder={onWordReorder}
                   locked={locked}
+                  onTranslateQuote={onWordTranslateQuote}
                 />
               </Fragment>
             ))
@@ -352,6 +356,7 @@ export function ResourceColumn({
             onFocus={onWordFocus}
             onReorder={onWordReorder}
             locked={locked}
+            onTranslateQuote={onWordTranslateQuote}
           />
         )}
 

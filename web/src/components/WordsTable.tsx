@@ -1,12 +1,29 @@
 import { useEffect, useRef, useState } from "react";
-import { Box, Paper, Stack, TextField, IconButton, Typography, Tooltip } from "@mui/material";
+import { Box, InputAdornment, Paper, Stack, TextField, IconButton, Typography, Tooltip } from "@mui/material";
 import DeleteOutlineIcon from "@mui/icons-material/DeleteOutline";
 import DragIndicatorIcon from "@mui/icons-material/DragIndicator";
+import TranslateIcon from "@mui/icons-material/Translate";
 import type { TwlRow } from "../sync/api";
 import { useCatalogs } from "../hooks/useCatalogs";
 import { CatalogPicker } from "./CatalogPicker";
 
 export type WordDropPosition = "before" | "after";
+
+// Mirrors the NoteCard quote-script detector: Hebrew (U+0590–U+05FF) is
+// RTL, Greek + Latin are LTR. We only show the translate icon when the
+// user has typed English (LTR) into a field that normally holds the
+// source-language Hebrew/Greek.
+const RTL_CHAR = /[֐-׿]/;
+const LTR_CHAR = /[a-zA-ZͰ-Ͽἀ-῿]/;
+
+type QuoteScript = "empty" | "rtl" | "ltr";
+
+function detectQuoteScript(text: string): QuoteScript {
+  if (!text.trim()) return "empty";
+  if (RTL_CHAR.test(text)) return "rtl";
+  if (LTR_CHAR.test(text)) return "ltr";
+  return "empty";
+}
 
 interface Props {
   rows: TwlRow[];
@@ -19,9 +36,13 @@ interface Props {
   // table — TWLs aren't AI-touched, but locking the whole chapter is
   // simpler and avoids partial-edit confusion.
   locked?: boolean;
+  // Translate English in the quote field to source-language text via ULT
+  // alignment. Returns the derived Hebrew/Greek string, or null if no
+  // alignment match was found. Mirrors the NoteCard wiring.
+  onTranslateQuote?: (row: TwlRow, english: string) => string | null;
 }
 
-export function WordsTable({ rows, activeId, onChange, onDelete, onFocus, onReorder, locked = false }: Props) {
+export function WordsTable({ rows, activeId, onChange, onDelete, onFocus, onReorder, locked = false, onTranslateQuote }: Props) {
   const [dragId, setDragId] = useState<string | null>(null);
   const [dragOver, setDragOver] = useState<
     { targetId: string; position: WordDropPosition } | null
@@ -97,6 +118,9 @@ export function WordsTable({ rows, activeId, onChange, onDelete, onFocus, onReor
                 setDragId(null);
                 setDragOver(null);
               }}
+              onTranslateQuote={
+                onTranslateQuote ? (english) => onTranslateQuote(r, english) : undefined
+              }
             />
             {showAfter && <RowDropIndicator />}
           </Box>
@@ -132,6 +156,7 @@ function WordRow({
   onDragEnd,
   onRowDragOver,
   onRowDrop,
+  onTranslateQuote,
 }: {
   row: TwlRow;
   active: boolean;
@@ -144,6 +169,7 @@ function WordRow({
   onDragEnd: () => void;
   onRowDragOver: (position: WordDropPosition) => void;
   onRowDrop: (position: WordDropPosition) => void;
+  onTranslateQuote?: (english: string) => string | null;
 }) {
   const [quote, setQuote] = useState(row.orig_words ?? "");
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -170,6 +196,18 @@ function WordRow({
     const rect = rowRef.current?.getBoundingClientRect();
     if (!rect) return "after";
     return e.clientY < rect.top + rect.height / 2 ? "before" : "after";
+  };
+
+  const quoteScript = detectQuoteScript(quote);
+  const showTranslateIcon = quoteScript === "ltr" && !!onTranslateQuote;
+
+  const handleTranslateQuote = () => {
+    if (!onTranslateQuote || quoteScript !== "ltr") return;
+    const result = onTranslateQuote(quote);
+    if (result) {
+      setQuote(result);
+      queue({ orig_words: result });
+    }
   };
 
   return (
@@ -240,13 +278,32 @@ function WordRow({
         size="small"
         variant="outlined"
         spellCheck={false}
+        InputProps={
+          showTranslateIcon
+            ? {
+                endAdornment: (
+                  <InputAdornment position="end">
+                    <Tooltip title="translate to Hebrew/Greek using ULT alignment">
+                      <IconButton
+                        size="small"
+                        onClick={handleTranslateQuote}
+                        sx={{ p: 0.25, color: "primary.main" }}
+                      >
+                        <TranslateIcon fontSize="small" />
+                      </IconButton>
+                    </Tooltip>
+                  </InputAdornment>
+                ),
+              }
+            : undefined
+        }
         inputProps={{
-          dir: "rtl",
+          dir: quoteScript === "ltr" ? "ltr" : "rtl",
           style: {
             fontFamily: '"Times New Roman","SBL Hebrew","Cardo",serif',
             fontSize: 19,
             padding: "3px 6px",
-            textAlign: "right",
+            textAlign: quoteScript === "ltr" ? "left" : "right",
           },
         }}
       />
