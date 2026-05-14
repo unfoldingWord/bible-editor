@@ -22,9 +22,9 @@ const PATTERN = /^([A-Za-z0-9]{3})?\s*(\d+)(?:\s*-\s*(\d+))?$/;
 
 export function parseChapterRange(input: string, currentBook: string): ParseResult {
   const trimmed = input.trim();
-  if (!trimmed) return { ok: false, error: "enter a chapter (e.g. PSA 130 or 130-135)" };
+  if (!trimmed) return { ok: false, error: "enter a chapter (e.g. 130 or 130-135)" };
   const m = PATTERN.exec(trimmed);
-  if (!m) return { ok: false, error: "format: BOOK CH or CH or CH-CH (e.g. PSA 130-135)" };
+  if (!m) return { ok: false, error: "format: CH or CH-CH (e.g. 130-135)" };
   const book = (m[1] ?? currentBook).toUpperCase();
   const startChapter = Number.parseInt(m[2], 10);
   const endChapter = m[3] !== undefined ? Number.parseInt(m[3], 10) : startChapter;

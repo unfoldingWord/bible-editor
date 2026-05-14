@@ -19,6 +19,7 @@ import {
   Checkbox,
   Box,
   TextField,
+  InputAdornment,
 } from "@mui/material";
 import AutoAwesomeIcon from "@mui/icons-material/AutoAwesome";
 import { ApiError } from "../sync/api";
@@ -185,7 +186,7 @@ export function PipelineMenu({ book, chapter, onMessage }: Props) {
   // a change made in a different tab is reflected.
   useEffect(() => {
     if (confirm?.type === "generate") setGenOpts(loadGenOpts());
-    if (confirm) setRefInput(`${book} ${chapter}`);
+    if (confirm) setRefInput(String(chapter));
   }, [confirm, book, chapter]);
 
   const genNothingSelected = !genOpts.ult && !genOpts.ust;
@@ -323,12 +324,18 @@ export function PipelineMenu({ book, chapter, onMessage }: Props) {
             <TextField
               label="Chapter or range"
               value={refInput}
-              onChange={(e) => setRefInput(e.target.value)}
+              onChange={(e) => setRefInput(e.target.value.replace(/[^\d-]/g, ""))}
               disabled={submitting}
               fullWidth
               size="small"
               autoFocus
               error={!refParsed.ok}
+              inputProps={{ inputMode: "numeric", pattern: "[0-9-]*" }}
+              InputProps={{
+                startAdornment: (
+                  <InputAdornment position="start">{book}</InputAdornment>
+                ),
+              }}
               helperText={
                 refParsed.ok
                   ? refParsed.range.startChapter === refParsed.range.endChapter
