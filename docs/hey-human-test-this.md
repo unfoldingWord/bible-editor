@@ -57,6 +57,49 @@ The four items below shipped on 2026-05-13. Type-checks pass and the logic was r
 - [ ] **Cron tail shows the poller running.** With `wrangler tail` connected, watch for scheduled-handler invocations every 5 minutes. They should print quickly when no non-terminal jobs exist; spend longer when polling each non-terminal job.
 - [ ] **Cron skips when there's nothing to poll.** With no running pipelines, the scheduled handler should return in <1s. Confirm via `wrangler tail` that we don't see upstream-fetch errors when the table is empty.
 
+### Phase 3 — PR #18 (cron sentinel, focus event, parent-child link, conflict dialog, chapter macro)
+
+Shipped 2026-05-14 as five small commits. Type-checks pass and the macro chain was reasoned through, but live verification is open. The chapter macro is the highest-risk path — a single live run exercises the full chain.
+
+#### Cron auto-fail sentinel
+
+- [ ] **Stuck row flips to failed.** Manually insert a wedged row:
+  ```sh
+  wrangler d1 execute bible_editor --local --command \
+    "INSERT INTO pipeline_jobs (job_id, user_id, pipeline_type, book, start_chapter, end_chapter, session_key, state, created_at, updated_at) VALUES ('stuck-test-1', 1, 'tqs', 'ZEC', 9, 9, 'bible-editor/1/stuck-test', 'running', unixepoch() - 86400 * 3, unixepoch() - 86400 * 3)"
+  ```
+  Wait for the next 5-minute cron tick (or invoke the scheduled handler manually via `wrangler dev --test-scheduled` + `curl localhost:8787/__scheduled`). Re-query — the row should now be `state='failed'`, `error_kind='interrupted'`, `error_message='auto-failed: no progress for 48h'`.
+- [ ] **Healthy long runs untouched.** With a real ~3-hour generate active (within the 48h window), confirm the cron tick leaves it `running`.
+
+#### `already_running` UX (Phase 3.4)
+
+- [ ] **Re-POSTing the same scope opens the status panel.** Start a `tqs` run for ZEC 8 → wait for it to be `running`. Open a SECOND tab to the same `#/ZEC/8` URL (same browser → same sessionKey). Click AI pipelines → Write translation questions → Start. Expect: NO toast about "Started" or "Already running"; the status-bar pill auto-opens to show the running job. No second pipeline_jobs row appears.
+- [ ] **Different browser still toasts.** Same scenario but from a different browser (different sessionKey) — should go through the 409 conflict path (see below), NOT the focus path.
+
+#### Parent-child follow-up link (Phase 3.5)
+
+- [ ] **Asymmetric generate shows the link in both directions.** Trigger an asymmetric ULT/UST run (Phase 2d). While both rows are running, open the status-bar panel. Parent row shows "Step 1 of 2 · follow-up …xyz" (last 6 chars of child id). Child row shows "Step 2 of 2 · after …xyz" (last 6 chars of parent id).
+- [ ] **Single-pipeline runs show no chain line.** A plain `tqs` run with no follow-up shows no Step-of-N line in the panel. (Negative check — verifies we're reading the column correctly, not always rendering.)
+
+#### Concurrency UX (Phase 3.1, minimum viable)
+
+- [ ] **Cross-user 409 opens an enriched dialog.** Simulate translator A by inserting a `pipeline_jobs` row with `user_id` matching a user other than your dev session. Try to start the same `(pipelineType, book, chapter)` from your session. Expect a dialog (not a toast) showing: pipelineType, scope, state, current_skill, "started by &lt;username&gt;", and "X min ago". Click Close — dialog dismisses, no state changes.
+- [ ] **Conflict body falls through when the conflicting job isn't in our D1.** Manually trigger upstream via Zulip (without going through the editor) so the bp-assistant side has a running job that's NOT in our `pipeline_jobs`. Then attempt the same scope from the editor. Worker should fail to find the existing row and pass the bare 409 through → bare toast surfaces. (Edge case; only verify if convenient.)
+
+#### Chapter macro (Phase 3.3) — **highest-risk path**
+
+- [ ] **Macro creates first row + stashes the chain.** Pick an untouched chapter (ZEC 11 or later — avoid ZEC 3, 7, 8 that other tests use). Click AI pipelines → Generate everything → Start. Immediately:
+  ```sh
+  wrangler d1 execute bible_editor --local --command \
+    "SELECT job_id, pipeline_type, follow_up_chain, follow_up_job_id FROM pipeline_jobs WHERE book='ZEC' AND start_chapter=<N> ORDER BY created_at DESC LIMIT 5"
+  ```
+  Expect: ONE row, `pipeline_type='generate'`, `follow_up_chain='[{"pipelineType":"notes"},{"pipelineType":"tqs"}]'`, `follow_up_job_id=NULL`.
+- [ ] **Step 2 (notes) fires on the generate's done-transition.** When the generate row transitions to `state='done'` (panel pill green), re-run the query. Expect: TWO rows. Generate's `follow_up_job_id` now points at row 2. Row 2 is `pipeline_type='notes'`, `state='running'`, `follow_up_chain='[{"pipelineType":"tqs"}]'` (only tqs left), `session_key` ends in `/chain1`.
+- [ ] **Step 3 (tqs) fires on the notes' done-transition.** When the notes row transitions to `state='done'`, re-query. Expect: THREE rows. Notes' `follow_up_job_id` points at row 3. Row 3 is `pipeline_type='tqs'`, `state='running'`, `follow_up_chain=NULL` (terminal), `session_key` ends in `/chain2`.
+- [ ] **Chapter lock holds across all three steps.** While ANY of the three runs are active, the chapter banner is visible and TN cards are read-only. There's a brief gap (≤5 min — the cron tick interval) between one step's done and the next step's running where the lock could release; note if any translator edits land during that window.
+- [ ] **Done state shows AI output applied to chapter.** When all three complete, the chapter has new ULT/UST verses (with alignment), AI-authored TNs, and AI-authored TQs. `edit_log` shows three batches of `source='ai_pipeline'` (one per step).
+- [ ] **Re-triggering the macro after completion is safe.** If you click "Generate everything" again on the same chapter post-completion, the upstream returns `already_running` for `pipeline_type='generate'` (the original done row), so we just open the status panel via the focus event. No new chain fires. (May need to verify the upstream semantics — depends on whether bp-assistant treats done jobs as "still occupying" the (sessionKey, scope) bucket.)
+
 ### Phase 2c — PR #12 (lock + auto-apply + TN keep marks)
 
 Originally shipped 2026-05-13; sanity-check that PR #14's refactor of `pollPipelineJob` didn't regress anything.
