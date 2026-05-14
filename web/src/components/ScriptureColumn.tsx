@@ -250,8 +250,6 @@ export function ScriptureColumn({
         minWidth: 0,
         display: "flex",
         flexDirection: "column",
-        borderRight: "1px dashed",
-        borderColor: "divider",
         overflow: "hidden",
       }}
     >
