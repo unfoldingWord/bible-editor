@@ -320,6 +320,21 @@ function escapeSql(s) {
     });
   }
 
+  // Phase 3b: gloss overrides for the divine name. UHAL leaves H3068/H3050
+  // as "NeedsEdits" stubs and has no entry for H3069, so the tooltip falls
+  // through to 1890 Strong's text ("Existent", "Jah") — too archaic for the
+  // most visible word in the Hebrew Bible. We override the gloss only;
+  // definition still shows the Strong's prose below.
+  const GLOSS_OVERRIDES = {
+    H3068: "Yahweh", // יהוה — the Tetragrammaton
+    H3069: "Yahweh", // יהוה — alt pointing used after אֲדֹנָי
+    H3050: "Yah",    // יָהּ — short form
+  };
+  for (const [strong, gloss] of Object.entries(GLOSS_OVERRIDES)) {
+    const row = merged.get(strong);
+    if (row) row.gloss = gloss;
+  }
+
   const all = [...merged.values()];
   const withGloss = all.filter((e) => e.gloss);
   const withDefinition = all.filter((e) => e.definition);
