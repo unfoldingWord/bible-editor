@@ -22,8 +22,12 @@ import {
 import DeleteOutlineIcon from "@mui/icons-material/DeleteOutline";
 import AddIcon from "@mui/icons-material/Add";
 import DragIndicatorIcon from "@mui/icons-material/DragIndicator";
+// Kept for the hidden save IconButton (search "hidden 2026-05-14" below);
+// drop these and the void below once we decide to delete the button.
 import SaveIcon from "@mui/icons-material/Save";
 import SaveOutlinedIcon from "@mui/icons-material/SaveOutlined";
+void SaveIcon;
+void SaveOutlinedIcon;
 import TranslateIcon from "@mui/icons-material/Translate";
 import UndoIcon from "@mui/icons-material/Undo";
 import AutoAwesomeIcon from "@mui/icons-material/AutoAwesome";
@@ -604,6 +608,7 @@ export function NoteCard({
                 </IconButton>
               </Tooltip>
             )}
+            {/* hidden 2026-05-14 — autosave handles it; re-enable if users ask
             <Tooltip title={hasNetChanges ? "save pending edits now (auto-saves when you leave this note)" : "no pending edits"}>
               <span>
                 <IconButton
@@ -616,6 +621,7 @@ export function NoteCard({
                 </IconButton>
               </span>
             </Tooltip>
+            */}
           </>
         )}
         {!readOnly && (

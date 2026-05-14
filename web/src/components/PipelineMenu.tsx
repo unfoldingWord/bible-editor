@@ -2,7 +2,7 @@
 // docs/ai-pipeline-integration.md). Three pipeline types, ~1h each, run on
 // the bot; we kick off and surface status via the bottom pill.
 
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   Button,
   Menu,
@@ -18,6 +18,7 @@ import {
   FormControlLabel,
   Checkbox,
   Box,
+  TextField,
 } from "@mui/material";
 import AutoAwesomeIcon from "@mui/icons-material/AutoAwesome";
 import { ApiError } from "../sync/api";
@@ -29,6 +30,7 @@ import type {
   PipelineType,
 } from "../sync/api";
 import { getSessionKey, pipelineStore, type PipelineJob } from "../sync/pipelineStore";
+import { parseChapterRange } from "../lib/refParser";
 
 interface Props {
   book: string;
@@ -71,15 +73,6 @@ const OPTIONS: PipelineOption[] = [
     label: "Write translation questions",
     description: "Translation questions (tq) aligned to the current ULT/UST.",
     approxDuration: "~30–60 min",
-  },
-  {
-    key: "generate_macro",
-    type: "generate",
-    label: "Generate everything",
-    description:
-      "Run generate, then notes, then questions back-to-back. The chapter stays locked the whole time.",
-    approxDuration: "~2–3 hours",
-    followUpChain: [{ pipelineType: "notes" }, { pipelineType: "tqs" }],
   },
 ];
 
@@ -184,6 +177,7 @@ export function PipelineMenu({ book, chapter, onMessage }: Props) {
   const [activeJobs, setActiveJobs] = useState<PipelineJob[]>([]);
   const [genOpts, setGenOpts] = useState<GenUiState>(() => loadGenOpts());
   const [conflict, setConflict] = useState<PipelineConflictExisting | null>(null);
+  const [refInput, setRefInput] = useState("");
 
   useEffect(() => pipelineStore.subscribe(setActiveJobs), []);
 
@@ -191,9 +185,11 @@ export function PipelineMenu({ book, chapter, onMessage }: Props) {
   // a change made in a different tab is reflected.
   useEffect(() => {
     if (confirm?.type === "generate") setGenOpts(loadGenOpts());
-  }, [confirm]);
+    if (confirm) setRefInput(`${book} ${chapter}`);
+  }, [confirm, book, chapter]);
 
   const genNothingSelected = !genOpts.ult && !genOpts.ust;
+  const refParsed = useMemo(() => parseChapterRange(refInput, book), [refInput, book]);
 
   const runningType = (type: PipelineType): PipelineJob | undefined =>
     activeJobs.find(
@@ -209,8 +205,12 @@ export function PipelineMenu({ book, chapter, onMessage }: Props) {
 
   const start = async () => {
     if (!confirm) return;
+    if (!refParsed.ok) return;
     const isMacro = Boolean(confirm.followUpChain);
     if (confirm.type === "generate" && !isMacro && genNothingSelected) return;
+    const { book: rangeBook, startChapter, endChapter } = refParsed.range;
+    const chapters: number[] = [];
+    for (let c = startChapter; c <= endChapter; c++) chapters.push(c);
     setSubmitting(true);
     try {
       let wire: GenerateWireShape = {};
@@ -218,23 +218,34 @@ export function PipelineMenu({ book, chapter, onMessage }: Props) {
         wire = buildGenerateWire(genOpts);
         saveGenOpts(genOpts);
       }
-      const res = await pipelineStore.start({
-        pipelineType: confirm.type,
-        book,
-        startChapter: chapter,
-        endChapter: chapter,
-        sessionKey: getSessionKey(),
-        ...(wire.options ? { options: wire.options } : {}),
-        ...(wire.followUpOptions ? { followUpOptions: wire.followUpOptions } : {}),
-        ...(confirm.followUpChain ? { followUpChain: confirm.followUpChain } : {}),
-      });
-      if (res.status !== "already_running") {
-        const suffix = isMacro
-          ? ` (${1 + (confirm.followUpChain?.length ?? 0)} runs)`
-          : wire.followUpOptions
-            ? " (2 runs)"
-            : "";
-        onMessage?.(`Started: ${confirm.label} for ${book} ${chapter}${suffix}`);
+      let startedCount = 0;
+      for (const ch of chapters) {
+        const res = await pipelineStore.start({
+          pipelineType: confirm.type,
+          book: rangeBook,
+          startChapter: ch,
+          endChapter: ch,
+          sessionKey: getSessionKey(),
+          ...(wire.options ? { options: wire.options } : {}),
+          ...(wire.followUpOptions ? { followUpOptions: wire.followUpOptions } : {}),
+          ...(confirm.followUpChain ? { followUpChain: confirm.followUpChain } : {}),
+        });
+        if (res.status !== "already_running") startedCount++;
+      }
+      const rangeLabel =
+        chapters.length === 1
+          ? `${rangeBook} ${startChapter}`
+          : `${rangeBook} ${startChapter}-${endChapter}`;
+      if (startedCount > 0) {
+        const suffix =
+          chapters.length > 1
+            ? ` (${startedCount} runs)`
+            : isMacro
+              ? ` (${1 + (confirm.followUpChain?.length ?? 0)} runs)`
+              : wire.followUpOptions
+                ? " (2 runs)"
+                : "";
+        onMessage?.(`Started: ${confirm.label} for ${rangeLabel}${suffix}`);
       }
       // already_running: pipelineStore emits a focus event that opens the
       // status panel on the existing run — no toast needed.
@@ -305,9 +316,28 @@ export function PipelineMenu({ book, chapter, onMessage }: Props) {
         <DialogContent>
           <DialogContentText>
             {confirm
-              ? `Run ${confirm.label} for ${book} ${chapter}? ${confirm.approxDuration} — you can keep working in other chapters while it runs.`
+              ? `Run ${confirm.label}? ${confirm.approxDuration} per chapter — you can keep working in other chapters while it runs.`
               : ""}
           </DialogContentText>
+          <Box sx={{ mt: 2 }}>
+            <TextField
+              label="Chapter or range"
+              value={refInput}
+              onChange={(e) => setRefInput(e.target.value)}
+              disabled={submitting}
+              fullWidth
+              size="small"
+              autoFocus
+              error={!refParsed.ok}
+              helperText={
+                refParsed.ok
+                  ? refParsed.range.startChapter === refParsed.range.endChapter
+                    ? `Runs once for ${refParsed.range.book} ${refParsed.range.startChapter}.`
+                    : `Runs ${refParsed.range.endChapter - refParsed.range.startChapter + 1} times across ${refParsed.range.book} ${refParsed.range.startChapter}-${refParsed.range.endChapter}.`
+                  : refParsed.error
+              }
+            />
+          </Box>
           {confirm?.type === "generate" && !confirm.followUpChain ? (
             <Box sx={{ mt: 2 }}>
               <DialogContentText sx={{ mb: 1, fontSize: "0.875rem" }}>
@@ -379,6 +409,7 @@ export function PipelineMenu({ book, chapter, onMessage }: Props) {
             variant="contained"
             disabled={
               submitting ||
+              !refParsed.ok ||
               (confirm?.type === "generate" &&
                 !confirm.followUpChain &&
                 genNothingSelected)

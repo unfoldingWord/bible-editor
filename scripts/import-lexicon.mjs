@@ -1,7 +1,11 @@
 // One-shot importer for UHAL (Unlocked Hebrew/Aramaic Lexicon) and UGL
-// (Unlocked Greek Lexicon) from Door43 Content Service. Downloads each
-// archive as a single zip, parses the per-Strong's markdown files, and
-// emits a SQL file that targets the lexicon_entries table.
+// (Unlocked Greek Lexicon) from Door43 Content Service.
+//
+// Two-phase: a Strong's Dictionary baseline (bundled from translationCore
+// at scripts/lexicon-data/, public domain, near-complete coverage) is
+// loaded first, then unfoldingWord UHAL/UGL is overlaid on top — uW lemma
+// and part_of_speech always win; uW gloss/definition wins when present,
+// falls back to Strong's brief/long otherwise.
 //
 // Run:
 //   node scripts/import-lexicon.mjs
@@ -10,9 +14,8 @@
 //
 // Each entry stores: strong (e.g. "H2320"), resource ("uhal" / "ugl"),
 // lemma (Hebrew/Greek wordform), part_of_speech, gloss (terse, shown in
-// tooltip), and definition (longer paragraph). Source format is documented
-// at https://ugl-info.readthedocs.io/en/latest/markdown.html and uses a
-// shared ## Word data / ## Senses structure between the two lexica.
+// tooltip), and definition (longer paragraph). uW source format is
+// documented at https://ugl-info.readthedocs.io/en/latest/markdown.html.
 
 import { execSync } from "node:child_process";
 import {
@@ -21,6 +24,7 @@ import {
   writeFileSync,
   mkdirSync,
   existsSync,
+  rmSync,
 } from "node:fs";
 import { resolve, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -29,6 +33,7 @@ const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(here, "..");
 const tmpDir = join(repoRoot, "scripts", "tmp");
 const outDir = join(repoRoot, "scripts", "out");
+const dataDir = join(repoRoot, "scripts", "lexicon-data");
 
 mkdirSync(tmpDir, { recursive: true });
 mkdirSync(outDir, { recursive: true });
@@ -45,6 +50,89 @@ const SOURCES = [
     archiveRoot: "en_ugl",
   },
 ];
+
+// Pull translationCore's bundled Strong's data (public domain classic
+// Strong's Dictionary). Provides ~14,000 H/G entries with brief + long
+// definitions — the only surviving copy now that Door43-Catalog/{uhl,ugl}
+// have been removed from DCS. See scripts/lexicon-data/README.md.
+const BASELINE_SOURCES = [
+  { resource: "uhal", prefix: "H", zip: join(dataDir, "uhl-contents.zip") },
+  { resource: "ugl", prefix: "G", zip: join(dataDir, "ugl-contents.zip") },
+];
+const UHL_INDEX_PATH = join(dataDir, "uhl-index.json");
+
+// Cross-platform zip extraction. The bundled contents.zip files use a
+// format that bsdtar (the default `tar` on Windows) chokes on with
+// "Inconsistent CRC32 values" — PowerShell's Expand-Archive handles them
+// fine. On macOS/Linux we use `unzip`, which is universally available.
+function extractZip(zipPath, destDir) {
+  rmSync(destDir, { recursive: true, force: true });
+  mkdirSync(destDir, { recursive: true });
+  if (process.platform === "win32") {
+    execSync(
+      `powershell -NoProfile -Command "Expand-Archive -LiteralPath '${zipPath.replace(/'/g, "''")}' -DestinationPath '${destDir.replace(/'/g, "''")}' -Force"`,
+      { stdio: "inherit" },
+    );
+  } else {
+    execSync(`unzip -oq "${zipPath}" -d "${destDir}"`, { stdio: "inherit" });
+  }
+}
+
+// Load the bundled Strong's-keyed JSON files into a Map<strong, {gloss,
+// definition}>. Each `content/{n}.json` is `{brief, long}` where `brief`
+// is a short gloss and `long` is the full Strong's entry (with inline HTML
+// tags <i>/<br/> we strip on the way in).
+function loadBaseline({ resource, prefix, zip }) {
+  const extractDir = join(tmpDir, `baseline-${resource}`);
+  if (!existsSync(zip)) {
+    throw new Error(`baseline zip not found: ${zip}`);
+  }
+  console.log(`  extracting baseline ${zip} ...`);
+  extractZip(zip, extractDir);
+  const contentDir = join(extractDir, "content");
+  const map = new Map();
+  for (const f of readdirSync(contentDir).filter((f) => /^\d+\.json$/.test(f))) {
+    const num = parseInt(f, 10);
+    const strong = `${prefix}${num}`;
+    let parsed;
+    try {
+      parsed = JSON.parse(readFileSync(join(contentDir, f), "utf-8"));
+    } catch {
+      continue;
+    }
+    const gloss = cleanStrongsText(parsed.brief, 200);
+    const definition = cleanStrongsText(parsed.long, 600);
+    map.set(strong, { gloss, definition });
+  }
+  console.log(`  baseline ${resource}: ${map.size} entries`);
+  return map;
+}
+
+// The bundled long-form text carries HTML markup (<i>, <br/>) and label
+// prefixes like "<i>Meaning:</i>". Normalize to a single clean line that
+// fits the tooltip + transport payload constraints, matching how senseOne
+// shapes uW entries.
+function cleanStrongsText(value, max) {
+  if (typeof value !== "string") return null;
+  let v = value
+    .replace(/<br\s*\/?>/gi, " ")
+    .replace(/<[^>]+>/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!v) return null;
+  if (v.length > max) v = v.slice(0, max - 1) + "…";
+  return v;
+}
+
+function loadUhlLemmaIndex() {
+  if (!existsSync(UHL_INDEX_PATH)) return new Map();
+  const list = JSON.parse(readFileSync(UHL_INDEX_PATH, "utf-8"));
+  const map = new Map();
+  for (const e of list) {
+    if (e?.id && e?.name) map.set(String(e.id).toUpperCase(), String(e.name));
+  }
+  return map;
+}
 
 async function downloadAndExtract(url, archiveRoot, resource) {
   const zipPath = join(tmpDir, `${resource}.zip`);
@@ -181,17 +269,65 @@ function escapeSql(s) {
 }
 
 (async () => {
-  const all = [];
+  // Phase 1: Strong's baseline (bundled).
+  const baselines = new Map(); // strong → { resource, gloss, definition }
+  for (const src of BASELINE_SOURCES) {
+    console.log(`loading baseline ${src.resource}`);
+    const m = loadBaseline(src);
+    for (const [strong, val] of m) {
+      baselines.set(strong, { resource: src.resource, ...val });
+    }
+  }
+  const uhlLemmas = loadUhlLemmaIndex();
+  if (uhlLemmas.size > 0) console.log(`  uhl-index.json: ${uhlLemmas.size} lemmas`);
+
+  // Phase 2: unfoldingWord overlay (markdown).
+  const uwEntries = [];
   for (const src of SOURCES) {
     console.log(`processing ${src.resource}`);
     const dir = await downloadAndExtract(src.url, src.archiveRoot, src.resource);
     const entries = src.resource === "uhal" ? walkUhal(dir) : walkUgl(dir);
-    console.log(`  parsed ${entries.length} entries`);
-    all.push(...entries);
+    console.log(`  parsed ${entries.length} uW entries`);
+    uwEntries.push(...entries);
   }
-  console.log(`total: ${all.length} entries`);
-  const nonEmpty = all.filter((e) => e.gloss || e.definition || e.part_of_speech);
-  console.log(`  ${nonEmpty.length} have at least one of gloss/definition/POS`);
+
+  // Phase 3: merge. One row per Strong's. uW wins for lemma/POS always,
+  // and for gloss/definition when uW value is non-empty; otherwise the
+  // Strong's baseline fills in.
+  const merged = new Map(); // strong → final row
+  // Seed from baseline so Strong's-only entries still land in the table.
+  for (const [strong, base] of baselines) {
+    merged.set(strong, {
+      strong,
+      resource: base.resource,
+      lemma: uhlLemmas.get(strong) ?? null,
+      part_of_speech: null,
+      gloss: base.gloss,
+      definition: base.definition,
+    });
+  }
+  // Overlay uW.
+  for (const e of uwEntries) {
+    const base = baselines.get(e.strong);
+    const existing = merged.get(e.strong);
+    merged.set(e.strong, {
+      strong: e.strong,
+      resource: e.resource,
+      lemma: e.lemma ?? existing?.lemma ?? null,
+      part_of_speech: e.part_of_speech ?? existing?.part_of_speech ?? null,
+      gloss: e.gloss ?? base?.gloss ?? existing?.gloss ?? null,
+      definition: e.definition ?? base?.definition ?? existing?.definition ?? null,
+    });
+  }
+
+  const all = [...merged.values()];
+  const withGloss = all.filter((e) => e.gloss);
+  const withDefinition = all.filter((e) => e.definition);
+  const withAnyProse = all.filter((e) => e.gloss || e.definition);
+  console.log(`total merged entries: ${all.length}`);
+  console.log(`  with gloss: ${withGloss.length} (${((100 * withGloss.length) / all.length).toFixed(0)}%)`);
+  console.log(`  with definition: ${withDefinition.length} (${((100 * withDefinition.length) / all.length).toFixed(0)}%)`);
+  console.log(`  with any prose (gloss or definition): ${withAnyProse.length} (${((100 * withAnyProse.length) / all.length).toFixed(0)}%)`);
 
   const sqlPath = join(outDir, "import-lexicon.sql");
   const lines = [];

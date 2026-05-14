@@ -455,7 +455,11 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook }:
               { content: newContent, plain_text: newPlainText },
             );
           }}
-          onSelectVerse={setActiveVerse}
+          onSelectVerse={(v) => {
+            setActiveVerse(v);
+            setActiveNoteId(null);
+            setActiveWordId(null);
+          }}
           onModeChange={(m) => {
             setMode(m);
             saveToStorage(SCRIPTURE_MODE_KEY, m);

@@ -87,6 +87,16 @@ This is the only existing AI surface in `bible-editor` and the obvious reference
 
 ---
 
+### 3.1 Chapter-range UX (client-side fan-out, 2026-05-14)
+
+The `PipelineMenu` confirmation dialog now exposes an editable chapter reference (`PSA 130` by default, accepts `PSA 130-135` or `130-135`). For multi-chapter ranges the client **fans out N single-chapter `POST /api/pipeline/start` calls**, one per chapter, sequentially. Each call uses `startChapter === endChapter`. Rationale:
+
+- bp-assistant pipelines are documented as single-chapter scope (§4 below) and we don't know whether the upstream actually honors `endChapter > startChapter`.
+- Per-chapter fan-out reuses the existing chapter-lock, conflict, and status-pill plumbing without bp-assistant changes.
+- Visibility: each chapter shows up as its own job in the status panel.
+
+**Future direction (bp-assistant could add):** native range support — accept one `POST /api/pipeline/start` with `endChapter > startChapter`, hold a single lock for the whole range, share model context across adjacent chapters. Response shape is already compatible (`{ jobId, scope: { book, startChapter, endChapter }, status }`). When that lands, swap the fan-out for a single call.
+
 ## 4. The new requirement
 
 We want translators to trigger, from inside `bible-editor`, the same pipelines `bp-assistant` already runs from Zulip:

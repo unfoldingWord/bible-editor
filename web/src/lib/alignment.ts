@@ -480,6 +480,26 @@ export function alignmentPlainText(state: AlignmentState): string {
   return parts.join("").replace(/\s+/g, " ").trim();
 }
 
+// Clear every alignment in the verse — all stream words become unaligned,
+// every compound source chain splits into singletons (matching clearGroup's
+// behaviour). The whole-verse "start over" action.
+export function clearAll(state: AlignmentState): AlignmentState {
+  const sourceGroups: AlignmentGroup[] = [];
+  for (const g of state.sourceGroups) {
+    for (let i = 0; i < g.source.length; i++) {
+      sourceGroups.push({
+        id: i === 0 ? g.id : uid(),
+        source: [g.source[i]],
+        targets: [],
+      });
+    }
+  }
+  const stream = state.stream.map((item) =>
+    item.kind === "word" ? { ...item, alignedTo: null } : item,
+  );
+  return finalize({ ...state, sourceGroups, stream });
+}
+
 // Clear all target words from `groupId` (back to unaligned). For compound
 // source chains, split into singleton groups so the user can re-align
 // each Hebrew word independently. The first singleton inherits the

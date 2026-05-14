@@ -17,6 +17,7 @@ import LinkIcon from "@mui/icons-material/Link";
 import CloseIcon from "@mui/icons-material/Close";
 import {
   alignmentPlainText,
+  clearAll,
   clearGroup,
   moveSource,
   moveTargets,
@@ -239,6 +240,12 @@ export function AlignmentDialog({
     setSelectedUnaligned(new Set());
     setSelectionAnchor(null);
   };
+  const handleClearAll = () => {
+    if (!state) return;
+    setState(clearAll(state));
+    setSelectedUnaligned(new Set());
+    setSelectionAnchor(null);
+  };
   const handleSave = () => {
     if (!state || !verse) return;
     const newVerseObjects = serializeAlignment(state);
@@ -308,6 +315,9 @@ export function AlignmentDialog({
       </DialogContent>
       <DialogActions sx={{ px: 3, py: 1, gap: 1 }}>
         <Box sx={{ flex: 1 }} />
+        <Button onClick={handleClearAll} disabled={!state} color="warning">
+          clear all
+        </Button>
         <Button onClick={handleReset} disabled={!state}>
           reset
         </Button>
