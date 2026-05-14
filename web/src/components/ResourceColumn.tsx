@@ -53,6 +53,9 @@ interface Props {
   locked?: boolean;
   // Called when a TN's Keep checkbox is checked. Threaded through to NoteCard.
   onKeepNote?: (id: string) => void;
+  // Translate English in a note's quote field to source-language text using
+  // ULT alignment. Returns null when no alignment match is found.
+  onNoteTranslateQuote?: (row: TnRow, english: string) => string | null;
 }
 
 type PinKey = "notes" | "words" | "questions";
@@ -132,6 +135,7 @@ export function ResourceColumn({
   onQuestionCreate,
   locked = false,
   onKeepNote,
+  onNoteTranslateQuote,
 }: Props) {
   const [pinned, setPinned] = useState<Pinned>(() => loadPinned());
   const togglePinned = (k: PinKey) => {
@@ -429,6 +433,9 @@ export function ResourceColumn({
           onVisibilityChange={onNoteVisibilityChange}
           locked={locked}
           onKeep={onKeepNote ? () => onKeepNote(r.id) : undefined}
+          onTranslateQuote={
+            onNoteTranslateQuote ? (english) => onNoteTranslateQuote(r, english) : undefined
+          }
         />
         {showAfter && <DropIndicator />}
       </Fragment>

@@ -4,6 +4,7 @@ import {
   Stack,
   Chip,
   IconButton,
+  InputAdornment,
   Typography,
   Box,
   TextField,
@@ -23,6 +24,7 @@ import AddIcon from "@mui/icons-material/Add";
 import DragIndicatorIcon from "@mui/icons-material/DragIndicator";
 import SaveIcon from "@mui/icons-material/Save";
 import SaveOutlinedIcon from "@mui/icons-material/SaveOutlined";
+import TranslateIcon from "@mui/icons-material/Translate";
 import UndoIcon from "@mui/icons-material/Undo";
 import AutoAwesomeIcon from "@mui/icons-material/AutoAwesome";
 import type { TnRow } from "../sync/api";
@@ -81,6 +83,10 @@ interface Props {
   // Called when the user checks the Keep box on an untouched row during a
   // run. Fires POST /api/rows/tn/:id/keep upstream.
   onKeep?: () => void;
+  // Translate English in the quote field to source-language text via ULT
+  // alignment. Returns the derived Hebrew/Greek string, or null if no
+  // alignment match was found.
+  onTranslateQuote?: (english: string) => string | null;
 }
 
 // Notes coming from TSV imports use literal "\n" (two characters) as the
@@ -89,6 +95,21 @@ interface Props {
 // data in D1 transitions to true newlines as users edit.
 function tsvToDisplay(s: string | null): string {
   return (s ?? "").replace(/\\n/g, "\n");
+}
+
+// Detect the primary script of a string for directing RTL/LTR rendering and
+// showing the translate icon. Only Hebrew (U+0590–U+05FF) is RTL; Greek is
+// LTR and is grouped with Latin for detection purposes.
+const RTL_CHAR = /[֐-׿]/;
+const LTR_CHAR = /[a-zA-ZͰ-Ͽἀ-῿]/;
+
+type QuoteScript = "empty" | "rtl" | "ltr";
+
+function detectQuoteScript(text: string): QuoteScript {
+  if (!text.trim()) return "empty";
+  if (RTL_CHAR.test(text)) return "rtl";
+  if (LTR_CHAR.test(text)) return "ltr";
+  return "empty";
 }
 
 interface SessionSnapshot {
@@ -129,6 +150,7 @@ export function NoteCard({
   onVisibilityChange,
   locked = false,
   onKeep,
+  onTranslateQuote,
 }: Props) {
   // updated_by != null means a human has touched the row at some point; in a
   // locked chapter that's our "keep this row" signal — kept rows stay
@@ -305,6 +327,18 @@ export function NoteCard({
   };
 
   const aiPrereqsMet = !!supportRef && quote.trim().length > 0;
+
+  const quoteScript = detectQuoteScript(quote);
+  const showTranslateIcon = quoteScript === "ltr" && !readOnly && !!onTranslateQuote;
+
+  const handleTranslateQuote = () => {
+    if (!onTranslateQuote || quoteScript !== "ltr") return;
+    const result = onTranslateQuote(quote);
+    if (result) {
+      setQuote(result);
+      stashEdit({ quote: result });
+    }
+  };
 
   // When AI completes (Shell sets a fresh `aiRecentlyCompletedAt`), force
   // local fields to the new row.quote/row.note even if a session is
@@ -626,13 +660,30 @@ export function NoteCard({
             size="small"
             spellCheck={false}
             onFocus={onFocus}
-            InputProps={{ readOnly }}
+            InputProps={{
+              readOnly,
+              ...(showTranslateIcon && {
+                endAdornment: (
+                  <InputAdornment position="end" sx={{ alignSelf: "flex-start", mt: 0.5 }}>
+                    <Tooltip title="translate to Hebrew/Greek using ULT alignment">
+                      <IconButton
+                        size="small"
+                        onClick={handleTranslateQuote}
+                        sx={{ p: 0.25, color: "primary.main" }}
+                      >
+                        <TranslateIcon fontSize="small" />
+                      </IconButton>
+                    </Tooltip>
+                  </InputAdornment>
+                ),
+              }),
+            }}
             inputProps={{
-              dir: "rtl",
+              dir: quoteScript === "ltr" ? "ltr" : "rtl",
               style: {
                 fontFamily: '"Times New Roman","SBL Hebrew","Cardo",serif',
                 fontSize: 19,
-                textAlign: "right",
+                textAlign: quoteScript === "ltr" ? "left" : "right",
                 lineHeight: 1.5,
               },
             }}
