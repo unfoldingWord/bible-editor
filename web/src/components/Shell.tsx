@@ -89,6 +89,10 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook }:
   const [scrollNonce, setScrollNonce] = useState(0);
   const requestScrollToActive = useCallback(() => setScrollNonce((n) => n + 1), []);
 
+  const [splitRatio, setSplitRatio] = useState<number | null>(null);
+  const splitContainerRef = useRef<HTMLDivElement>(null);
+  const isDraggingRef = useRef(false);
+
   // Toast state shared between the pipeline trigger menu and the status bar.
   // Cleared on dismiss or after a short auto-timeout.
   const [pipelineToast, setPipelineToast] = useState<{ id: number; text: string; kind: "success" | "error" | "info" } | null>(null);
@@ -231,6 +235,34 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook }:
     () => enabledVersions.filter((v) => availableVersions.includes(v)),
     [enabledVersions, availableVersions],
   );
+
+  const colsVisible = (visibleVersions.length > 0 ? visibleVersions : availableVersions.slice(0, 1)).length;
+  const autoSplit = mode === "columns" ? Math.min(0.75, 0.55 + (colsVisible - 1) * 0.05) : 0.5;
+  const effectiveSplit = splitRatio ?? autoSplit;
+  useEffect(() => { setSplitRatio(null); }, [colsVisible, mode]);
+  useEffect(() => () => { document.body.style.cursor = ""; document.body.style.userSelect = ""; }, []);
+  const handleDividerMouseDown = useCallback((e: React.MouseEvent) => {
+    e.preventDefault();
+    isDraggingRef.current = true;
+    document.body.style.cursor = "ew-resize";
+    document.body.style.userSelect = "none";
+    const onMouseMove = (ev: MouseEvent) => {
+      if (!isDraggingRef.current || !splitContainerRef.current) return;
+      const rect = splitContainerRef.current.getBoundingClientRect();
+      const available = rect.width - 88;
+      const offset = ev.clientX - rect.left - 88;
+      setSplitRatio(Math.min(0.8, Math.max(0.2, offset / available)));
+    };
+    const onMouseUp = () => {
+      isDraggingRef.current = false;
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+      window.removeEventListener("mousemove", onMouseMove);
+      window.removeEventListener("mouseup", onMouseUp);
+    };
+    window.addEventListener("mousemove", onMouseMove);
+    window.addEventListener("mouseup", onMouseUp);
+  }, []);
 
   // Pre-load lexicon entries for every UHB Strong's in the loaded chapter
   // AND every loaded chapter in book mode, so the per-word tooltips in the
@@ -379,7 +411,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook }:
           set lands.
         </Alert>
       )}
-      <Box sx={{ flex: 1, display: "flex", overflow: "hidden" }}>
+      <Box ref={splitContainerRef} sx={{ flex: 1, display: "flex", overflow: "hidden" }}>
         <TimelineRail
           book={book}
           chapter={chapter}
@@ -399,6 +431,15 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook }:
             applyLocalVerseStatus(v, done);
           }}
         />
+        <Box
+          sx={{
+            width: `${effectiveSplit * 100}%`,
+            flexShrink: 0,
+            display: "flex",
+            flexDirection: "column",
+            overflow: "hidden",
+          }}
+        >
         <ScriptureColumn
           book={book}
           chapter={chapter}
@@ -483,6 +524,37 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook }:
           lexiconMap={lexiconMap}
           locked={Boolean(chapterLock)}
         />
+        </Box>
+        <Box
+          onMouseDown={handleDividerMouseDown}
+          sx={{
+            width: "8px",
+            flexShrink: 0,
+            cursor: "ew-resize",
+            position: "relative",
+            "&::after": {
+              content: '""',
+              position: "absolute",
+              left: "50%",
+              top: 0,
+              bottom: 0,
+              width: "1px",
+              bgcolor: "divider",
+              transform: "translateX(-50%)",
+              transition: "background-color 0.15s",
+            },
+            "&:hover::after": { bgcolor: "primary.main" },
+          }}
+        />
+        <Box
+          sx={{
+            flex: 1,
+            minWidth: 0,
+            display: "flex",
+            flexDirection: "column",
+            overflow: "hidden",
+          }}
+        >
         <ResourceColumn
           activeVerse={activeVerse}
           tn={data.tn}
@@ -665,6 +737,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook }:
           locked={Boolean(chapterLock)}
           onKeepNote={handleKeepNote}
         />
+        </Box>
       </Box>
       {alignerTarget && (
         <Suspense fallback={null}>
