@@ -364,6 +364,11 @@ export interface PipelineRequestOptions {
   pauseBeforeATs?: boolean;
 }
 
+export interface PipelineChainStep {
+  pipelineType: PipelineType;
+  options?: PipelineRequestOptions;
+}
+
 export interface PipelineStartRequest {
   pipelineType: PipelineType;
   book: string;
@@ -376,8 +381,16 @@ export interface PipelineStartRequest {
    * to express asymmetric ULT/UST alignment (e.g. ULT aligned + UST text-
    * only) since the upstream contract can't carry asymmetric align flags
    * in one call. Same scope and pipelineType — only the options differ.
+   * Mutually exclusive with followUpChain.
    */
   followUpOptions?: PipelineRequestOptions;
+  /**
+   * Cross-type follow-up chain. First entry fires on the parent's done-
+   * transition; the rest is stored on the child and fires in turn. Used by
+   * the chapter macro to chain generate -> notes -> tqs without leaving the
+   * chapter unlocked between steps. Mutually exclusive with followUpOptions.
+   */
+  followUpChain?: PipelineChainStep[];
 }
 
 export interface PipelineStartResponse {

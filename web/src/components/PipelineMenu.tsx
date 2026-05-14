@@ -22,6 +22,7 @@ import {
 import AutoAwesomeIcon from "@mui/icons-material/AutoAwesome";
 import { ApiError } from "../sync/api";
 import type {
+  PipelineChainStep,
   PipelineConflictBody,
   PipelineConflictExisting,
   PipelineRequestOptions,
@@ -36,30 +37,49 @@ interface Props {
 }
 
 interface PipelineOption {
+  key: string;
   type: PipelineType;
   label: string;
   description: string;
   approxDuration: string;
+  /**
+   * When set, fires this pipeline plus a chain of cross-type follow-ups
+   * after each step completes. The chapter lock holds across the full run.
+   * Currently only used by the "Generate everything" macro.
+   */
+  followUpChain?: PipelineChainStep[];
 }
 
 const OPTIONS: PipelineOption[] = [
   {
+    key: "generate",
     type: "generate",
     label: "Generate ULT + UST",
     description: "Aligned literal + simplified text and a draft issues list for the chapter.",
     approxDuration: "~60–100 min",
   },
   {
+    key: "notes",
     type: "notes",
     label: "Write translation notes",
     description: "Translation notes (tn) for every verse in the chapter.",
     approxDuration: "~30–60 min",
   },
   {
+    key: "tqs",
     type: "tqs",
     label: "Write translation questions",
     description: "Translation questions (tq) aligned to the current ULT/UST.",
     approxDuration: "~30–60 min",
+  },
+  {
+    key: "generate_macro",
+    type: "generate",
+    label: "Generate everything",
+    description:
+      "Run generate, then notes, then questions back-to-back. The chapter stays locked the whole time.",
+    approxDuration: "~2–3 hours",
+    followUpChain: [{ pipelineType: "notes" }, { pipelineType: "tqs" }],
   },
 ];
 
@@ -189,11 +209,12 @@ export function PipelineMenu({ book, chapter, onMessage }: Props) {
 
   const start = async () => {
     if (!confirm) return;
-    if (confirm.type === "generate" && genNothingSelected) return;
+    const isMacro = Boolean(confirm.followUpChain);
+    if (confirm.type === "generate" && !isMacro && genNothingSelected) return;
     setSubmitting(true);
     try {
       let wire: GenerateWireShape = {};
-      if (confirm.type === "generate") {
+      if (confirm.type === "generate" && !isMacro) {
         wire = buildGenerateWire(genOpts);
         saveGenOpts(genOpts);
       }
@@ -205,9 +226,14 @@ export function PipelineMenu({ book, chapter, onMessage }: Props) {
         sessionKey: getSessionKey(),
         ...(wire.options ? { options: wire.options } : {}),
         ...(wire.followUpOptions ? { followUpOptions: wire.followUpOptions } : {}),
+        ...(confirm.followUpChain ? { followUpChain: confirm.followUpChain } : {}),
       });
       if (res.status !== "already_running") {
-        const suffix = wire.followUpOptions ? " (2 runs)" : "";
+        const suffix = isMacro
+          ? ` (${1 + (confirm.followUpChain?.length ?? 0)} runs)`
+          : wire.followUpOptions
+            ? " (2 runs)"
+            : "";
         onMessage?.(`Started: ${confirm.label} for ${book} ${chapter}${suffix}`);
       }
       // already_running: pipelineStore emits a focus event that opens the
@@ -255,7 +281,7 @@ export function PipelineMenu({ book, chapter, onMessage }: Props) {
           const running = runningType(opt.type);
           return (
             <MenuItem
-              key={opt.type}
+              key={opt.key}
               disabled={Boolean(running)}
               onClick={() => {
                 close();
@@ -282,7 +308,7 @@ export function PipelineMenu({ book, chapter, onMessage }: Props) {
               ? `Run ${confirm.label} for ${book} ${chapter}? ${confirm.approxDuration} — you can keep working in other chapters while it runs.`
               : ""}
           </DialogContentText>
-          {confirm?.type === "generate" ? (
+          {confirm?.type === "generate" && !confirm.followUpChain ? (
             <Box sx={{ mt: 2 }}>
               <DialogContentText sx={{ mb: 1, fontSize: "0.875rem" }}>
                 What to generate:
@@ -352,7 +378,10 @@ export function PipelineMenu({ book, chapter, onMessage }: Props) {
             onClick={start}
             variant="contained"
             disabled={
-              submitting || (confirm?.type === "generate" && genNothingSelected)
+              submitting ||
+              (confirm?.type === "generate" &&
+                !confirm.followUpChain &&
+                genNothingSelected)
             }
             startIcon={submitting ? <CircularProgress size={14} /> : undefined}
           >

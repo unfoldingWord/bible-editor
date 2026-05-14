@@ -1,0 +1,13 @@
+-- Cross-type follow-up chain. The 0011 follow_up_options handles same-type
+-- asymmetric alignment (e.g. ULT-aligned then UST text-only). For the
+-- "Generate everything for this chapter" macro, we need a sequence of
+-- different pipelineTypes: generate -> notes -> tqs. Each runs after the
+-- previous transitions to done (chapter lock holds across the full run).
+--
+-- follow_up_chain : JSON-encoded Array<{ pipelineType, options? }>. The
+--                   first element is the immediate next step. When the
+--                   follow-up fires, the new row inherits the remainder
+--                   (elements [1..]) as its own follow_up_chain. NULL on
+--                   the terminal step. Mutually exclusive with
+--                   follow_up_options at the start-request level.
+ALTER TABLE pipeline_jobs ADD COLUMN follow_up_chain TEXT;

@@ -54,20 +54,42 @@ const PipelineOptions = z
     { message: "align_flags_mutually_exclusive" },
   );
 
-const StartBody = z.object({
-  pipelineType: z.enum(PIPELINE_TYPES),
-  book: z.string().min(1).max(8),
-  startChapter: z.number().int().positive(),
-  endChapter: z.number().int().positive().optional(),
-  sessionKey: z.string().min(1).max(120).regex(/^[A-Za-z0-9_\-/]+$/),
-  options: PipelineOptions.optional(),
-  // Optional second pipeline to fire on the parent's done-transition. Used
-  // to express asymmetric ULT/UST alignment (e.g. ULT aligned + UST text-
-  // only) since the upstream contract can't carry asymmetric flags in one
-  // call. Same scope/pipelineType — only the options differ. See
-  // docs/ai-pipeline-handoff.md.
-  followUpOptions: PipelineOptions.optional(),
-});
+// One step of a cross-type follow-up chain (e.g. the "Generate everything"
+// macro: generate -> notes -> tqs). Same scope as the parent; only the
+// pipelineType + options differ. The chain is a linked list — each row
+// stores its remainder, and on each done-transition the next step is
+// fired with its own remainder.
+const ChainStep = z
+  .object({
+    pipelineType: z.enum(PIPELINE_TYPES),
+    options: PipelineOptions.optional(),
+  })
+  .strict();
+
+const StartBody = z
+  .object({
+    pipelineType: z.enum(PIPELINE_TYPES),
+    book: z.string().min(1).max(8),
+    startChapter: z.number().int().positive(),
+    endChapter: z.number().int().positive().optional(),
+    sessionKey: z.string().min(1).max(120).regex(/^[A-Za-z0-9_\-/]+$/),
+    options: PipelineOptions.optional(),
+    // Optional second pipeline to fire on the parent's done-transition. Used
+    // to express asymmetric ULT/UST alignment (e.g. ULT aligned + UST text-
+    // only) since the upstream contract can't carry asymmetric flags in one
+    // call. Same scope/pipelineType — only the options differ. See
+    // docs/ai-pipeline-handoff.md.
+    followUpOptions: PipelineOptions.optional(),
+    // Optional cross-type chain. First entry fires on the parent's done-
+    // transition; subsequent entries are stored on the new row's
+    // follow_up_chain and fire in turn. Used by the chapter macro to chain
+    // generate -> notes -> tqs. Mutually exclusive with followUpOptions
+    // (we'd otherwise need to define an ordering between them).
+    followUpChain: z.array(ChainStep).min(1).max(4).optional(),
+  })
+  .refine((b) => !(b.followUpOptions && b.followUpChain), {
+    message: "follow_up_options_and_chain_mutually_exclusive",
+  });
 
 interface StartResponse {
   jobId: string;
@@ -134,8 +156,14 @@ interface PolledJob {
   end_chapter: number;
   session_key: string;
   follow_up_options: string | null;
+  follow_up_chain: string | null;
   follow_up_job_id: string | null;
   no_output_yet: number;
+}
+
+interface ChainStepValue {
+  pipelineType: PipelineType;
+  options?: unknown;
 }
 
 // Shared "fetch upstream, run import, update DB, fire follow-up" body used
@@ -223,10 +251,21 @@ async function pollPipelineJob(
     )
     .run();
 
-  if (data.state === "done" && job.follow_up_options && !job.follow_up_job_id) {
+  if (data.state === "done" && !job.follow_up_job_id) {
     try {
       const username = await resolveUsernameFromDb(env, job.user_id);
-      if (username) {
+      if (username && job.follow_up_chain) {
+        await fireFollowUpFromChain(env, {
+          parentJobId: job.job_id,
+          parentSessionKey: job.session_key,
+          book: job.book,
+          startChapter: job.start_chapter,
+          endChapter: job.end_chapter,
+          chainJson: job.follow_up_chain,
+          userId: job.user_id,
+          username,
+        });
+      } else if (username && job.follow_up_options) {
         await fireFollowUp(env, {
           parentJobId: job.job_id,
           parentSessionKey: job.session_key,
@@ -271,7 +310,7 @@ export async function pollAllNonTerminal(env: Env): Promise<void> {
     .run();
   const rs = await env.DB.prepare(
     `SELECT job_id, user_id, pipeline_type, book, start_chapter, end_chapter,
-            session_key, follow_up_options, follow_up_job_id,
+            session_key, follow_up_options, follow_up_chain, follow_up_job_id,
             (output_json IS NULL) AS no_output_yet
        FROM pipeline_jobs
       WHERE state IN ('running', 'paused_for_outage', 'paused_for_usage_limit')
@@ -389,14 +428,18 @@ pipelines.post("/start", requireAuth, async (c) => {
   const followUpJson = parsed.data.followUpOptions
     ? JSON.stringify(parsed.data.followUpOptions)
     : null;
+  const followUpChainJson = parsed.data.followUpChain
+    ? JSON.stringify(parsed.data.followUpChain)
+    : null;
   await c.env.DB.prepare(
     `INSERT INTO pipeline_jobs (
        job_id, user_id, pipeline_type, book, start_chapter, end_chapter,
-       session_key, state, follow_up_options, created_at, updated_at
-     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'running', ?8, unixepoch(), unixepoch())
+       session_key, state, follow_up_options, follow_up_chain, created_at, updated_at
+     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'running', ?8, ?9, unixepoch(), unixepoch())
      ON CONFLICT(job_id) DO UPDATE SET
        state = excluded.state,
        follow_up_options = COALESCE(excluded.follow_up_options, pipeline_jobs.follow_up_options),
+       follow_up_chain = COALESCE(excluded.follow_up_chain, pipeline_jobs.follow_up_chain),
        updated_at = unixepoch()`,
   )
     .bind(
@@ -408,6 +451,7 @@ pipelines.post("/start", requireAuth, async (c) => {
       endChapter,
       parsed.data.sessionKey,
       followUpJson,
+      followUpChainJson,
     )
     .run();
 
@@ -432,7 +476,7 @@ pipelines.get("/:jobId", requireAuth, async (c) => {
   // it on the requester owning the job.
   const owned = await c.env.DB.prepare(
     `SELECT job_id, user_id, pipeline_type, book, start_chapter, end_chapter,
-            session_key, follow_up_options, follow_up_job_id,
+            session_key, follow_up_options, follow_up_chain, follow_up_job_id,
             (output_json IS NULL) AS no_output_yet
        FROM pipeline_jobs WHERE job_id = ?1`,
   )
@@ -534,6 +578,111 @@ async function fireFollowUp(env: Env, input: FollowUpInput): Promise<void> {
         childSessionKey,
       ),
   ]);
+}
+
+interface FollowUpChainInput {
+  parentJobId: string;
+  parentSessionKey: string;
+  book: string;
+  startChapter: number;
+  endChapter: number;
+  chainJson: string;
+  userId: number;
+  username: string;
+}
+
+// Fires the next step of a cross-type chain (e.g. generate -> notes -> tqs)
+// on a parent done-transition. Pops the first chain element, uses it as the
+// child's pipelineType + options, and stores the remainder on the child row
+// so the same logic fires the next step when this child completes.
+//
+// Idempotent against concurrent polls via the WHERE follow_up_job_id IS NULL
+// guard on the parent UPDATE. Same atomicity story as fireFollowUp.
+async function fireFollowUpFromChain(env: Env, input: FollowUpChainInput): Promise<void> {
+  let chain: ChainStepValue[];
+  try {
+    chain = JSON.parse(input.chainJson) as ChainStepValue[];
+  } catch {
+    throw new Error(`invalid follow_up_chain JSON on ${input.parentJobId}`);
+  }
+  if (!Array.isArray(chain) || chain.length === 0) {
+    return; // nothing to fire
+  }
+  const [next, ...rest] = chain;
+  if (!next || !next.pipelineType) {
+    throw new Error(`malformed chain head on ${input.parentJobId}`);
+  }
+
+  // Each chain link gets its own sessionKey suffix. Counting the depth keeps
+  // upstream's (sessionKey, pipelineType, scope) dedup buckets distinct even
+  // if two adjacent links happen to share a pipelineType.
+  const depth = countChainSuffixes(input.parentSessionKey);
+  const childSessionKey = `${input.parentSessionKey}/chain${depth + 1}`;
+  const childChainJson = rest.length > 0 ? JSON.stringify(rest) : null;
+
+  const upstreamBody = {
+    pipelineType: next.pipelineType,
+    book: input.book,
+    startChapter: input.startChapter,
+    endChapter: input.endChapter,
+    username: input.username,
+    sessionKey: childSessionKey,
+    ...(next.options ? { options: next.options } : {}),
+  };
+
+  const upstream = await fetch(`${upstreamBase(env)}/api/pipeline/start`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${env.BT_API_TOKEN}`,
+    },
+    body: JSON.stringify(upstreamBody),
+  });
+  const text = await upstream.text();
+  if (!upstream.ok) {
+    throw new Error(`upstream ${upstream.status}: ${text.slice(0, 200)}`);
+  }
+  let parsed: StartResponse | null = null;
+  try {
+    parsed = JSON.parse(text) as StartResponse;
+  } catch {
+    throw new Error(`upstream returned non-JSON: ${text.slice(0, 200)}`);
+  }
+  if (!parsed || typeof parsed.jobId !== "string") {
+    throw new Error(`upstream missing jobId: ${text.slice(0, 200)}`);
+  }
+
+  await env.DB.batch([
+    env.DB
+      .prepare(
+        `UPDATE pipeline_jobs SET follow_up_job_id = ?1
+          WHERE job_id = ?2 AND follow_up_job_id IS NULL`,
+      )
+      .bind(parsed.jobId, input.parentJobId),
+    env.DB
+      .prepare(
+        `INSERT INTO pipeline_jobs (
+           job_id, user_id, pipeline_type, book, start_chapter, end_chapter,
+           session_key, state, follow_up_chain, created_at, updated_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'running', ?8, unixepoch(), unixepoch())
+         ON CONFLICT(job_id) DO NOTHING`,
+      )
+      .bind(
+        parsed.jobId,
+        input.userId,
+        next.pipelineType,
+        input.book,
+        input.startChapter,
+        input.endChapter,
+        childSessionKey,
+        childChainJson,
+      ),
+  ]);
+}
+
+function countChainSuffixes(sessionKey: string): number {
+  const m = sessionKey.match(/\/chain(\d+)$/);
+  return m ? parseInt(m[1], 10) : 0;
 }
 
 // GET /api/pipelines  — list current user's jobs from D1 (no upstream call).
