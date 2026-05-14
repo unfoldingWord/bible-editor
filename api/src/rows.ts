@@ -497,44 +497,99 @@ rows.delete("/:kind/:id", requireAuth, async (c) => {
   return c.json({ ok: true });
 });
 
-// POST /api/rows/tn/:id/keep — "claim" a TN during a pipeline run. Bumps the
-// row's version and sets updated_by to the caller; the auto-apply step then
-// treats the row as kept (updated_by IS NOT NULL) and won't soft-delete it.
-// Lock-exempt: this is the carve-out that lets translators preserve work
-// while the chapter is otherwise read-only. Idempotent — calling it on an
-// already-kept row just bumps the version again (cheap; no harm).
-rows.post("/tn/:id/keep", requireAuth, async (c) => {
-  const id = c.req.param("id");
-  const userId = currentUserId(c);
-  const now = Math.floor(Date.now() / 1000);
+// Shared body shape for /preserve and /hint. Both toggle a bit on tn_rows
+// and append an audit row; neither touches `updated_by` (these are intent
+// signals, not content edits) or `version` (collisions on these bits are
+// idempotent in practice). Lock-exempt for the same reason the legacy
+// /keep was — the translator must be able to claim/release a row mid-run.
+const TnBitBody = z.object({ value: z.union([z.literal(0), z.literal(1), z.boolean()]) });
 
-  // Single batched UPDATE + audit row. The audit INSERT is conditional on the
-  // UPDATE affecting a live row, matching the pattern used elsewhere here.
-  const [updateRes] = await c.env.DB.batch([
-    c.env.DB
+async function setTnBit(
+  env: Env,
+  id: string,
+  userId: number | null,
+  column: "preserve" | "hint",
+  value: 0 | 1,
+): Promise<TnRow | null> {
+  const now = Math.floor(Date.now() / 1000);
+  const action = value === 1 ? column : `un${column}`;
+  const [updateRes] = await env.DB.batch([
+    env.DB
       .prepare(
+        // updated_at moves so the row sorts to "recently touched" in any
+        // mtime-based view, but updated_by stays NULL — standing authorship
+        // is whoever wrote the note content, not whoever toggled the bit.
         `UPDATE tn_rows
-           SET version = version + 1, updated_at = ?1, updated_by = ?2
+           SET ${column} = ?1, updated_at = ?2
          WHERE id = ?3 AND deleted_at IS NULL`,
       )
-      .bind(now, userId, id),
-    c.env.DB
+      .bind(value, now, id),
+    env.DB
       .prepare(
         `INSERT INTO edit_log (kind, row_key, user_id, prev_version, new_version, action)
-         SELECT 'tn', ?1, ?2, version - 1, version, 'keep'
+         SELECT 'tn', ?1, ?2, version, version, ?3
            FROM tn_rows
           WHERE id = ?1 AND deleted_at IS NULL`,
       )
-      .bind(id, userId),
+      .bind(id, userId ?? null, action),
   ]);
+  if (!updateRes.meta.changes) return null;
+  return env.DB.prepare(`SELECT * FROM tn_rows WHERE id = ?1`).bind(id).first<TnRow>();
+}
 
-  if (!updateRes.meta.changes) {
-    return c.json({ error: "not_found" }, 404);
+function coerceBitValue(raw: 0 | 1 | boolean): 0 | 1 {
+  return raw === true || raw === 1 ? 1 : 0;
+}
+
+// POST /api/rows/tn/:id/preserve — toggle the "survive future AI pipeline
+// sweeps" bit. Body: { value: 0 | 1 | boolean }. Lock-exempt. Idempotent.
+rows.post("/tn/:id/preserve", requireAuth, async (c) => {
+  const id = c.req.param("id");
+  const userId = currentUserId(c);
+  let body: unknown;
+  try {
+    body = await c.req.json();
+  } catch {
+    return c.json({ error: "invalid_json" }, 400);
   }
-  const updated = await c.env.DB.prepare(
-    `SELECT * FROM tn_rows WHERE id = ?1`,
-  )
-    .bind(id)
-    .first<TnRow>();
+  const parsed = TnBitBody.safeParse(body);
+  if (!parsed.success) {
+    return c.json({ error: "validation_failed", issues: parsed.error.issues }, 400);
+  }
+  const updated = await setTnBit(c.env, id, userId, "preserve", coerceBitValue(parsed.data.value));
+  if (!updated) return c.json({ error: "not_found" }, 404);
+  return c.json(updated);
+});
+
+// POST /api/rows/tn/:id/hint — toggle the "queue as AI-pipeline hint" bit.
+// hint=1 rows are sent into the next /api/pipelines/start as options.hints
+// and are excluded from deleteUnkeptTns; AI expansion clears the bit.
+rows.post("/tn/:id/hint", requireAuth, async (c) => {
+  const id = c.req.param("id");
+  const userId = currentUserId(c);
+  let body: unknown;
+  try {
+    body = await c.req.json();
+  } catch {
+    return c.json({ error: "invalid_json" }, 400);
+  }
+  const parsed = TnBitBody.safeParse(body);
+  if (!parsed.success) {
+    return c.json({ error: "validation_failed", issues: parsed.error.issues }, 400);
+  }
+  const updated = await setTnBit(c.env, id, userId, "hint", coerceBitValue(parsed.data.value));
+  if (!updated) return c.json({ error: "not_found" }, 404);
+  return c.json(updated);
+});
+
+// POST /api/rows/tn/:id/keep — legacy alias for /preserve with value=1.
+// The old semantics ("claim a row during a run by setting updated_by") are
+// folded into the always-on preserve bit. Kept so external callers and
+// in-flight outbox ops keep working without a coordinated migration.
+rows.post("/tn/:id/keep", requireAuth, async (c) => {
+  const id = c.req.param("id");
+  const userId = currentUserId(c);
+  const updated = await setTnBit(c.env, id, userId, "preserve", 1);
+  if (!updated) return c.json({ error: "not_found" }, 404);
   return c.json(updated);
 });

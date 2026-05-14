@@ -35,6 +35,7 @@ import type { TnRow } from "../sync/api";
 import { useCatalogs } from "../hooks/useCatalogs";
 import { CatalogPicker } from "./CatalogPicker";
 import { shortSupport } from "../lib/supportReference";
+import { TCM, SH } from "../lib/noteTemplates";
 
 const NoteHistoryDialog = lazy(() =>
   import("./NoteHistoryDialog").then((m) => ({ default: m.NoteHistoryDialog })),
@@ -79,14 +80,18 @@ interface Props {
   // the in-place pulse. Default root (viewport) is good enough for our
   // resource column scroll setup.
   onVisibilityChange?: (rowId: string, isVisible: boolean) => void;
-  // Chapter has an active AI pipeline (state from pipelineStore). When
-  // true, untouched rows (updated_by IS NULL) are read-only and show a
-  // Keep checkbox; rows the user already touched (or just kept) are
-  // editable and show a "Kept" chip. Off → behaves normally.
+  // Chapter has an active AI pipeline (state from pipelineStore). When true
+  // and the row is neither preserved nor a hint, the card is read-only.
+  // Preserved or hinted rows stay editable even during a run.
   locked?: boolean;
-  // Called when the user checks the Keep box on an untouched row during a
-  // run. Fires POST /api/rows/tn/:id/keep upstream.
-  onKeep?: () => void;
+  // Toggle the row's "survive future AI pipeline sweeps" bit. Always
+  // available — these are pre-run intent signals, not in-run claims.
+  // Fires POST /api/rows/tn/:id/preserve upstream.
+  onSetPreserve?: (value: boolean) => void;
+  // Toggle the row's "queue as AI-pipeline hint" bit. hint=1 rows are sent
+  // to the chapter-wide AI run as directives and are excluded from the
+  // sweep until the AI expansion lands. Fires POST /api/rows/tn/:id/hint.
+  onSetHint?: (value: boolean) => void;
   // Translate English in the quote field to source-language text via ULT
   // alignment. Returns the derived Hebrew/Greek string, or null if no
   // alignment match was found.
@@ -153,14 +158,19 @@ export function NoteCard({
   onStartAi,
   onVisibilityChange,
   locked = false,
-  onKeep,
+  onSetPreserve,
+  onSetHint,
   onTranslateQuote,
 }: Props) {
-  // updated_by != null means a human has touched the row at some point; in a
-  // locked chapter that's our "keep this row" signal — kept rows stay
-  // editable, the auto-apply step skips them when it sweeps untouched TNs.
-  const isKept = row.updated_by !== null;
-  const readOnly = locked && !isKept;
+  // Two explicit bits drive lock-time behavior now:
+  //   - preserve=1: translator marked this row "survive AI runs"
+  //   - hint=1:    this row is a stub queued for AI expansion in place
+  // Either bit keeps the card editable during a locked chapter. The legacy
+  // implicit "kept = updated_by IS NOT NULL" signal is folded into the
+  // preserve bit on the server (see rows.ts /keep alias).
+  const isPreserved = row.preserve === 1;
+  const isHint = row.hint === 1;
+  const readOnly = locked && !isPreserved && !isHint;
   const [quote, setQuote] = useState(tsvToDisplay(row.quote));
   const [note, setNote] = useState(tsvToDisplay(row.note));
   const [supportRef, setSupportRef] = useState<string | null>(row.support_reference);
@@ -518,34 +528,65 @@ export function NoteCard({
             />
           </Tooltip>
         )}
-        {locked && !isKept && onKeep && (
-          <Tooltip title="Mark this note to survive the AI run. Other notes in this chapter will be replaced.">
+        {isHint && (
+          <Tooltip title="This note is queued as a hint for the next AI pipeline run — the AI will expand it in place.">
+            <Chip
+              label="Hint"
+              size="small"
+              color="warning"
+              variant="outlined"
+              sx={{ fontFamily: "monospace", fontSize: 11, height: 22 }}
+            />
+          </Tooltip>
+        )}
+        {isPreserved && (
+          <Tooltip title="This note is marked Preserved — future AI runs won't replace it.">
+            <Chip
+              label="Preserved"
+              size="small"
+              color="success"
+              variant="outlined"
+              sx={{ fontFamily: "monospace", fontSize: 11, height: 22 }}
+            />
+          </Tooltip>
+        )}
+        {onSetPreserve && (
+          <Tooltip title="Mark this note to survive future AI pipeline runs.">
             <FormControlLabel
               control={
                 <Checkbox
                   size="small"
-                  checked={false}
-                  onChange={() => onKeep()}
+                  checked={isPreserved}
+                  onChange={(e) => onSetPreserve(e.target.checked)}
                   sx={{ p: 0.25 }}
                 />
               }
               label={
                 <Typography variant="caption" sx={{ fontWeight: 500 }}>
-                  Keep
+                  Preserve
                 </Typography>
               }
               sx={{ ml: 0, mr: 0 }}
             />
           </Tooltip>
         )}
-        {locked && isKept && (
-          <Tooltip title="This note is marked Kept — the AI run won't replace it.">
-            <Chip
-              label="Kept"
-              size="small"
-              color="success"
-              variant="outlined"
-              sx={{ fontFamily: "monospace", fontSize: 11, height: 22 }}
+        {onSetHint && !readOnly && (
+          <Tooltip title="Send this stub to the next AI pipeline run as a hint. The AI will expand it in place; the row survives the sweep.">
+            <FormControlLabel
+              control={
+                <Checkbox
+                  size="small"
+                  checked={isHint}
+                  onChange={(e) => onSetHint(e.target.checked)}
+                  sx={{ p: 0.25 }}
+                />
+              }
+              label={
+                <Typography variant="caption" sx={{ fontWeight: 500 }}>
+                  Hint
+                </Typography>
+              }
+              sx={{ ml: 0, mr: 0 }}
             />
           </Tooltip>
         )}
@@ -738,6 +779,38 @@ export function NoteCard({
                     <AutoAwesomeIcon fontSize="inherit" />
                   )}
                 </IconButton>
+              </span>
+            </Tooltip>
+            <Tooltip title='Fill with "This could mean" template. Double-click any placeholder (NOTE, ALT) to replace it.'>
+              <span>
+                <Button
+                  size="small"
+                  variant="text"
+                  disabled={readOnly}
+                  onClick={() => {
+                    setNote(TCM);
+                    stashLocalEdit({ note: TCM });
+                  }}
+                  sx={{ minWidth: 0, p: 0.25, fontSize: 10, fontFamily: "monospace", lineHeight: 1 }}
+                >
+                  TCM
+                </Button>
+              </span>
+            </Tooltip>
+            <Tooltip title='Fill with "See how you translated" template. Double-click REF to replace it.'>
+              <span>
+                <Button
+                  size="small"
+                  variant="text"
+                  disabled={readOnly}
+                  onClick={() => {
+                    setNote(SH);
+                    stashLocalEdit({ note: SH });
+                  }}
+                  sx={{ minWidth: 0, p: 0.25, fontSize: 10, fontFamily: "monospace", lineHeight: 1 }}
+                >
+                  SH
+                </Button>
               </span>
             </Tooltip>
           </Stack>

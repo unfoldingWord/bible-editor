@@ -354,10 +354,14 @@ async function deleteUnkeptTns(
 ): Promise<number> {
   // Identify which rows we're about to delete so the audit row can carry
   // the right pre-deletion version. A bulk UPDATE would lose that fidelity.
+  // preserve=1 rows are translator-marked "keep through AI runs"; hint=1
+  // rows are stubs queued for in-place expansion by the AI — both must
+  // survive the sweep.
   const targets = await env.DB.prepare(
     `SELECT id, version FROM tn_rows
       WHERE book = ?1 AND chapter BETWEEN ?2 AND ?3
-        AND updated_by IS NULL AND deleted_at IS NULL`,
+        AND updated_by IS NULL AND deleted_at IS NULL
+        AND preserve = 0 AND hint = 0`,
   )
     .bind(job.book, job.startChapter, job.endChapter)
     .all<{ id: string; version: number }>();
