@@ -15,6 +15,7 @@ import { TimelineRail } from "./TimelineRail";
 import { ScriptureColumn, type ScriptureMode } from "./ScriptureColumn";
 import { ResourceColumn } from "./ResourceColumn";
 import { TopBar } from "./TopBar";
+import { LogosSyncToggle } from "./LogosSyncToggle";
 import { PipelineMenu } from "./PipelineMenu";
 import { PipelineStatusBar } from "./PipelineStatusBar";
 import { pipelineStore, type PipelineJob } from "../sync/pipelineStore";
@@ -355,6 +356,9 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook }:
             chapter={chapter}
             onMessage={(msg) => pushPipelineToast(msg, "info")}
           />
+        }
+        logosSyncToggle={
+          <LogosSyncToggle book={book} chapter={chapter} verse={activeVerse} />
         }
       />
       {chapterLock && (
