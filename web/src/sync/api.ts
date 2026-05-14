@@ -135,6 +135,34 @@ export function isChapterLockedBody(body: unknown): body is ChapterLockedBody {
   return b.error === "chapter_locked" && typeof b.jobId === "string";
 }
 
+// 409 body returned by /api/pipelines/start when the upstream rejects the
+// request because another sessionKey already has this (pipelineType, scope)
+// running. The Worker enriches the bare upstream body with `existing` —
+// pulled from D1 so translator B can see who's running it without an
+// ownership-bumping endpoint.
+export interface PipelineConflictExisting {
+  job_id: string;
+  pipeline_type: PipelineType;
+  book: string;
+  start_chapter: number;
+  end_chapter: number;
+  state: PipelineState;
+  current_skill: string | null;
+  current_status: string | null;
+  created_at: number;
+  updated_at: number;
+  started_by_username: string | null;
+}
+export interface PipelineConflictBody {
+  error: "conflict";
+  jobId: string;
+  /**
+   * Present when the conflicting job was started via this editor (it lives
+   * in our D1). Absent for jobs started outside the editor (e.g. Zulip).
+   */
+  existing?: PipelineConflictExisting;
+}
+
 // Bearer token storage. The token is opaque to the client — it carries the
 // user id in its `sub` claim and the worker verifies HS256 against the
 // shared JWT_SIGNING_KEY. localStorage is good-enough for a 7-month tactical

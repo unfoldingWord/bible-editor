@@ -349,6 +349,29 @@ pipelines.post("/start", requireAuth, async (c) => {
 
   // Pass non-2xx through verbatim (matches the contract's error shapes).
   if (!upstream.ok) {
+    // 409 conflict means another sessionKey already has this (pipelineType,
+    // scope) running upstream. The conflicting jobId is usually in our D1
+    // already because every editor-triggered start inserts a row. Enrich the
+    // response so translator B can see who's running it and how long ago
+    // without a second round-trip or an ownership-bumping endpoint.
+    if (upstream.status === 409 && parsedUpstream) {
+      const conflict = parsedUpstream as { error?: string; jobId?: string };
+      if (conflict.error === "conflict" && typeof conflict.jobId === "string") {
+        const existing = await c.env.DB.prepare(
+          `SELECT j.job_id, j.pipeline_type, j.book, j.start_chapter, j.end_chapter,
+                  j.state, j.current_skill, j.current_status, j.created_at,
+                  j.updated_at, u.dcs_username AS started_by_username
+             FROM pipeline_jobs j
+             LEFT JOIN users u ON u.id = j.user_id
+            WHERE j.job_id = ?1`,
+        )
+          .bind(conflict.jobId)
+          .first();
+        if (existing) {
+          return c.json({ ...conflict, existing }, 409);
+        }
+      }
+    }
     return new Response(text, {
       status: upstream.status,
       headers: { "Content-Type": "application/json" },

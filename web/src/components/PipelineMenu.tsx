@@ -21,7 +21,12 @@ import {
 } from "@mui/material";
 import AutoAwesomeIcon from "@mui/icons-material/AutoAwesome";
 import { ApiError } from "../sync/api";
-import type { PipelineRequestOptions, PipelineType } from "../sync/api";
+import type {
+  PipelineConflictBody,
+  PipelineConflictExisting,
+  PipelineRequestOptions,
+  PipelineType,
+} from "../sync/api";
 import { getSessionKey, pipelineStore, type PipelineJob } from "../sync/pipelineStore";
 
 interface Props {
@@ -139,12 +144,26 @@ function buildGenerateWire(g: GenUiState): GenerateWireShape {
   return {};
 }
 
+const TYPE_LABEL: Record<PipelineType, string> = {
+  generate: "Generate ULT + UST",
+  notes: "Translation notes",
+  tqs: "Translation questions",
+};
+
+function relativeMinutes(seconds: number): string {
+  const diff = Math.floor(Date.now() / 1000) - seconds;
+  if (diff < 60) return `${diff}s`;
+  if (diff < 3600) return `${Math.floor(diff / 60)} min`;
+  return `${Math.floor(diff / 3600)}h ${Math.floor((diff % 3600) / 60)} min`;
+}
+
 export function PipelineMenu({ book, chapter, onMessage }: Props) {
   const [anchorEl, setAnchorEl] = useState<HTMLElement | null>(null);
   const [confirm, setConfirm] = useState<PipelineOption | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [activeJobs, setActiveJobs] = useState<PipelineJob[]>([]);
   const [genOpts, setGenOpts] = useState<GenUiState>(() => loadGenOpts());
+  const [conflict, setConflict] = useState<PipelineConflictExisting | null>(null);
 
   useEffect(() => pipelineStore.subscribe(setActiveJobs), []);
 
@@ -196,10 +215,18 @@ export function PipelineMenu({ book, chapter, onMessage }: Props) {
       setConfirm(null);
     } catch (e) {
       if (e instanceof ApiError) {
-        const body = e.body as { error?: string; jobId?: string } | undefined;
+        const body = e.body as PipelineConflictBody | { error?: string; jobId?: string } | undefined;
         if (e.status === 409 && body?.error === "conflict") {
-          onMessage?.(`Another translator already started this pipeline (job ${body.jobId}).`);
-          setConfirm(null);
+          const enriched = (body as PipelineConflictBody).existing;
+          if (enriched) {
+            setConflict(enriched);
+            setConfirm(null);
+          } else {
+            // Conflict with a job started outside the editor (e.g. Zulip).
+            // We have no metadata to show — fall back to the bare toast.
+            onMessage?.(`Another translator already started this pipeline (job ${body.jobId ?? "unknown"}).`);
+            setConfirm(null);
+          }
         } else if (e.status === 401) {
           onMessage?.("Sign in to start a pipeline.");
         } else {
@@ -331,6 +358,41 @@ export function PipelineMenu({ book, chapter, onMessage }: Props) {
           >
             Start
           </Button>
+        </DialogActions>
+      </Dialog>
+      <Dialog open={Boolean(conflict)} onClose={() => setConflict(null)}>
+        <DialogTitle>Already running</DialogTitle>
+        <DialogContent>
+          {conflict && (
+            <>
+              <DialogContentText>
+                {conflict.started_by_username
+                  ? `${conflict.started_by_username} started `
+                  : "Someone already started "}
+                <strong>{TYPE_LABEL[conflict.pipeline_type]}</strong> for{" "}
+                <strong>
+                  {conflict.book} {conflict.start_chapter}
+                  {conflict.end_chapter !== conflict.start_chapter
+                    ? `–${conflict.end_chapter}`
+                    : ""}
+                </strong>{" "}
+                {relativeMinutes(conflict.created_at)} ago.
+              </DialogContentText>
+              <DialogContentText sx={{ mt: 1, fontSize: "0.875rem" }}>
+                State: <strong>{conflict.state}</strong>
+                {conflict.current_skill ? ` · ${conflict.current_skill}` : ""}
+                {` · updated ${relativeMinutes(conflict.updated_at)} ago`}
+              </DialogContentText>
+              <DialogContentText sx={{ mt: 1, fontSize: "0.8125rem", fontStyle: "italic" }}>
+                This chapter is locked while the pipeline runs. You can keep
+                editing other chapters; the AI output will overwrite this one
+                when it completes.
+              </DialogContentText>
+            </>
+          )}
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setConflict(null)}>Close</Button>
         </DialogActions>
       </Dialog>
     </>
