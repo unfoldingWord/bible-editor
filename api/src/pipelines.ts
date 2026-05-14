@@ -354,6 +354,44 @@ pipelines.post("/start", requireAuth, async (c) => {
   const endChapter = parsed.data.endChapter ?? startChapter;
   const book = parsed.data.book.toUpperCase();
 
+  // For notes pipelines, gather any hint=1 stubs the editor has queued in
+  // the chapter range and fold them into options.hints. The proxy is the
+  // authoritative source (not the client) so D1 state at start time wins
+  // over any stale local cache. bp-assistant echoes each hint's rowId back
+  // as the TSV ID column for the expanded row, which is how the apply
+  // phase correlates expansion → stub. See docs/bp-assistant-tn-hints-
+  // contract.md for the full design.
+  // Wider type for mergedOptions: hints is a server-added field, not part of
+  // the client-validated PipelineOptions schema (clients never send it).
+  let mergedOptions: Record<string, unknown> | undefined = parsed.data.options;
+  if (parsed.data.pipelineType === "notes") {
+    const hintRows = await c.env.DB.prepare(
+      `SELECT id, verse, quote, support_reference, note
+         FROM tn_rows
+        WHERE book = ?1 AND chapter BETWEEN ?2 AND ?3
+          AND hint = 1 AND deleted_at IS NULL
+        ORDER BY chapter, verse, sort_order ASC NULLS LAST, id`,
+    )
+      .bind(book, startChapter, endChapter)
+      .all<{
+        id: string;
+        verse: number;
+        quote: string | null;
+        support_reference: string | null;
+        note: string | null;
+      }>();
+    const hints = (hintRows.results ?? []).map((r) => ({
+      rowId: r.id,
+      verse: r.verse,
+      quote: r.quote,
+      supportReference: r.support_reference,
+      seed: r.note,
+    }));
+    if (hints.length > 0) {
+      mergedOptions = { ...(parsed.data.options ?? {}), hints };
+    }
+  }
+
   const upstreamBody = {
     pipelineType: parsed.data.pipelineType,
     book,
@@ -361,7 +399,7 @@ pipelines.post("/start", requireAuth, async (c) => {
     endChapter,
     username,
     sessionKey: parsed.data.sessionKey,
-    ...(parsed.data.options ? { options: parsed.data.options } : {}),
+    ...(mergedOptions ? { options: mergedOptions } : {}),
   };
 
   let upstream: Response;

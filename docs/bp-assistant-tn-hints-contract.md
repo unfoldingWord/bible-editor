@@ -1,12 +1,26 @@
-# bp-assistant: TN hint expansion contract
+# bp-assistant ↔ bible-editor: TN hint expansion contract
 
-## Context
+## Status
 
-bible-editor (the translator-facing app) now lets editors mark TN rows as "hints" — issue type + quote phrase + optional seed prose — and queue them for the next chapter-wide notes pipeline run. Today, `/api/pipeline/start` from bible-editor sends `{ pipelineType: "notes", book, startChapter, endChapter, username, sessionKey, options? }` and the `notes` skill (`tn-writer`) emits a TSV that bible-editor merges, sweeping every un-kept row first. We're adding `options.hints` so the editor can pre-seed specific notes the AI must produce, and so those specific seed rows aren't clobbered by the sweep.
+**Final agreed design.** Bible-editor side is pre-staged on branch
+`claude/note-hints-preservation-LrRj7` (Ship 1 + Ship 2). bp-assistant ships
+the corresponding `tn-writer` update on their side. End-to-end activates as
+soon as both sides land.
 
-The bible-editor side is already shipped behind a flag on the API: an editor can mark hints today, but they don't reach you yet because we're gating the upstream change. This brief is the contract bp-assistant needs to land for the end-to-end flow.
+## Core design
 
-## What bible-editor will send
+bible-editor sends a 4-char TN row id with each hint. bp-assistant writes that
+same id into the **TSV `ID` column** (column 1) for the row that expands that
+hint. The id round-trip IS the mapping — no extra columns, no sidecar files,
+no status-endpoint extensions, no atomicity coordination.
+
+- The TSV pushed to DCS (`unfoldingWord/en_tn`) stays canonical 7-col
+  (`Reference`, `ID`, `Tags`, `SupportReference`, `Quote`, `Occurrence`,
+  `Note`). Downstream consumers see no schema change.
+- The whole exchange is invisible to existing Zulip-triggered runs and to any
+  API caller that doesn't send `options.hints`.
+
+## What bible-editor sends
 
 `POST /api/pipeline/start` body gains an optional `options.hints` array:
 
@@ -41,57 +55,81 @@ The bible-editor side is already shipped behind a flag on the API: an editor can
 
 Field semantics:
 
-- `rowId` — opaque 4-char string. bible-editor's stable TN row id. **Must be echoed back unchanged** (see output below).
+- `rowId` — 4-char `[a-z][a-z0-9]{3}` string. bible-editor's stable TN row id.
+  Same format and purpose as the TSV `ID` column. **Must be echoed back as the
+  TSV `ID` column value** for the corresponding expanded row.
 - `verse` — integer. The verse the hint targets.
-- `quote` — string. Source-language phrase the note explains. May be Hebrew, Greek, or empty.
+- `quote` — string. Source-language phrase the note explains. May be Hebrew,
+  Greek, or empty.
 - `supportReference` — string or null. The issue type / TA link.
-- `seed` — string or null. Editor's seed prose for the note. May be a stub like `"This could mean: (1) NOTE Alternate translation: [ALT] (2) NOTE Alternate translation: [ALT]"`, a one-line reason, or null. Expand into a fully-formed note when present; write fresh when null.
+- `seed` — string or null. Editor's seed prose for the note. May be a stub
+  like `"This could mean: (1) NOTE Alternate translation: [ALT] (2) NOTE
+  Alternate translation: [ALT]"`, a one-line reason, or null. Expand into a
+  fully-formed note when present; write fresh when null.
 
-`hints` may be empty / absent on any run.
+`hints` may be empty or absent on any run. When empty/absent, behave as
+today.
 
-## What tn-writer must do
+## What `tn-writer` must do
 
 For each hint:
 
-1. **Produce exactly one TN row** whose `verse`, `quote`, and `supportReference` match the hint. Use the `seed` as guidance for content; produce a complete, well-formed note (not just the seed echoed back).
-2. **Echo `rowId` as `hintRowId`** in the output (see TSV column below). bible-editor uses this to UPDATE the existing stub row in place rather than INSERT-new + delete.
-3. **Suppress competing notes** for the same `(verse, quote)` pair. The translator has already chosen the issue framing — don't generate alternative notes that would conflict.
+1. **Produce exactly one TN row** matching the hint's `verse`, `quote`, and
+   `supportReference`. Use `seed` as guidance for the note content; produce a
+   complete, well-formed note (not just the seed echoed back).
+2. **Set the TSV `ID` column to the hint's `rowId` value.** Do not mint a
+   fresh id for these rows.
+3. **Suppress competing notes** for the same `(verse, quote)` pair. The
+   translator has already chosen the issue framing; don't generate alternative
+   notes that would conflict.
 
-For verses not covered by a hint: behave exactly as today.
+For verses not covered by a hint: behave exactly as today (fresh ids, normal
+output).
 
-## Output format
+bp-assistant has confirmed that the hint's `rowId` will be preserved into the
+final DCS output TSV that gets merged.
 
-Existing notes TSV columns stay as-is. Add one optional column at the end: `HintRowID`.
+## What bible-editor does on its side
 
-- For AI-generated rows expanding a hint: `HintRowID` = the hint's `rowId`.
-- For all other rows (normal AI output): `HintRowID` empty.
+For your awareness:
 
-If TSV column addition is awkward, a sidecar JSON `hints-applied.json` with `[{ hintRowId, tnRowIdInTsv }]` is acceptable instead — let us know which you prefer.
-
-## What bible-editor will do on its side
-
-(For your awareness, not your responsibility.)
-
-- Server-side gather: at `/api/pipelines/start` time, bible-editor SELECTs all `hint = 1` rows in scope from D1 and folds them into `options.hints`. The wire shape above is authoritative — what's in D1 at start time, not whatever was in the editor's local cache.
-- Sweep filter already excludes `hint = 1` rows, so the stub survives until your output lands.
-- Apply phase: when a TN proposal carries `HintRowID`, bible-editor UPDATEs the existing row in place (preserving `updated_by`, version history, sort position). Standing authorship stays with the human; `edit_log` records the AI as the writer of that revision but the row's AI chip is **not** shown (the note's existence is human-attributed).
+- **Outbound** (`api/src/pipelines.ts`): at `/api/pipelines/start` time the
+  proxy SELECTs all `hint = 1` rows from D1 in `(book, startChapter..endChapter)`
+  and folds them into `options.hints`. Wire shape above is authoritative — what's
+  in D1 at start time, not whatever was in the editor's local cache.
+- **Sweep** (`api/src/pipelineImport.ts`, `deleteUnkeptTns`): already excludes
+  `hint = 1` rows (Ship 1, already merged). The stub row survives until the
+  expanded version lands.
+- **Apply** (`api/src/pipelineImport.ts`, new `applyTnHintExpansion`): when a
+  TN proposal's `id` matches an existing `hint = 1` row in D1 for the chapter,
+  UPDATE the stub in place — preserves version history, sort position,
+  `updated_by`, and the `preserve` bit. Clears `hint`. The `edit_log` entry is
+  written with `source = 'hint_expansion'` so the history dialog can attribute
+  the revision to AI but the row's "AI" chip (keyed on `source = 'ai_pipeline'`)
+  does not show — standing authorship of the note's existence stays with the
+  human who created the hint.
 
 ## Verification
 
-Minimal smoke test from bp-assistant side:
+bp-assistant smoke test:
 
-1. Call `tn-writer` (or whichever skill `pipelineType: "notes"` dispatches to) with `options.hints` containing two entries, one with a `seed`, one with `seed: null`.
-2. Verify the output TSV has:
-   - Exactly one row per hint matching `(verse, quote, supportReference)`.
-   - `HintRowID` populated with the corresponding `rowId`.
-   - No second note generated for the same `(verse, quote)`.
-   - Normal output for un-hinted verses.
-3. Confirm `repo-insert` (or however output is committed) carries the `HintRowID` column through unchanged.
+1. Call `tn-writer` (or whichever skill `pipelineType: "notes"` dispatches to)
+   with `options.hints` containing two entries — one with a `seed`, one with
+   `seed: null`.
+2. Verify the output TSV:
+   - Has exactly one row per hint with `ID` column equal to the hint's `rowId`.
+   - Each such row's `Reference` / `Quote` / `SupportReference` matches the
+     hint.
+   - No second AI-generated note exists for the same `(verse, quote)` pair.
+   - Un-hinted verses generate fresh ids and normal output.
+3. Confirm `repo-insert` preserves the `ID` column unchanged when pushing to
+   DCS.
 
-## Open coordination points
+bible-editor smoke test (post-merge of Ship 2):
 
-- Confirm `options` pass-through reaches the skill — bible-editor currently treats it as opaque.
-- Confirm column-add vs sidecar-JSON preference for `HintRowID`.
-- Confirm there's no concurrency rule that would reject `options.hints` (e.g. existing schema validation in `api-runner/`).
-
-Tag the bible-editor side (`deferredreward/bible-editor`, branch `claude/note-hints-preservation-LrRj7`) when the contract lands so we can wire up Ship 2 (proxy gather + apply-phase routing) against it.
+1. Mark a TN stub with `hint = 1`, with `quote` and `supportReference` set.
+2. Trigger the notes pipeline for the chapter.
+3. Confirm: stub row survives the sweep; on pipeline completion, the same row
+   id now has the AI-expanded `note` content; `hint = 0`; `preserve` and
+   `updated_by` unchanged; row has v2+ on the version chip; history dialog
+   shows the v(N) entry attributed to AI; no "AI" chip on the row.
