@@ -19,6 +19,7 @@ import {
   alignmentPlainText,
   clearAll,
   clearGroup,
+  extractSource,
   moveSource,
   moveTargets,
   parseAlignment,
@@ -108,6 +109,11 @@ export function AlignmentDialog({
   const handleSourceDrop = (destGroupId: string, sourceId: string) => {
     if (!state) return;
     setState(moveSource(state, sourceId, destGroupId));
+  };
+
+  const handleExtractSource = (sourceId: string) => {
+    if (!state) return;
+    setState(extractSource(state, sourceId));
   };
 
   const handleClearGroup = (groupId: string) => {
@@ -307,6 +313,7 @@ export function AlignmentDialog({
                 verseNum={verseNum}
                 onTargetsDrop={handleTargetsDrop}
                 onSourceDrop={handleSourceDrop}
+                onExtractSource={handleExtractSource}
                 onClearGroup={handleClearGroup}
               />
             </Box>
@@ -567,6 +574,13 @@ function UnalignedBag({
 }) {
   const [over, setOver] = useState(false);
   const unalignedIds = new Set(state.unaligned.map((w) => w.id));
+  // Render every target word in stream (document) order so the left column
+  // mirrors the verse. Aligned chips appear ghosted but stay in place —
+  // this is the familiar layout from word-aligner-rcl, and it lets the
+  // editor see at a glance which English words are still unattached.
+  const streamWords = state.stream.flatMap((item, idx) =>
+    item.kind === "word" ? [{ idx, word: item.word, aligned: item.alignedTo !== null }] : [],
+  );
   return (
     <Box
       onDragOver={(e) => {
@@ -602,7 +616,7 @@ function UnalignedBag({
             flex: 1,
           }}
         >
-          unaligned ({state.unaligned.length})
+          words ({state.unaligned.length} unaligned)
           {selectedIds.size > 0 && ` · ${selectedIds.size} sel`}
         </Typography>
         {selectedIds.size > 0 && (
@@ -613,11 +627,6 @@ function UnalignedBag({
           </Tooltip>
         )}
       </Stack>
-      {state.unaligned.length === 0 && (
-        <Typography variant="caption" color="text.disabled">
-          drag a word here to detach it from its source
-        </Typography>
-      )}
       <Typography
         variant="caption"
         sx={{ color: "text.disabled", display: "block", mb: 0.5, fontStyle: "italic" }}
@@ -625,15 +634,19 @@ function UnalignedBag({
         click to add to selection · shift-click for range · drag any selected
       </Typography>
       <Stack spacing={0.5}>
-        {state.unaligned.map((w) => (
-          <SelectableChip
-            key={w.id}
-            text={w.text}
-            selected={selectedIds.has(w.id)}
-            onClick={(shift) => onChipClick(w.id, shift)}
-            idsForDrag={() => idsForDrag(w.id)}
-          />
-        ))}
+        {streamWords.map(({ idx, word, aligned }) =>
+          aligned ? (
+            <GhostedChip key={`${word.id}-${idx}`} text={word.text} />
+          ) : (
+            <SelectableChip
+              key={`${word.id}-${idx}`}
+              text={word.text}
+              selected={selectedIds.has(word.id)}
+              onClick={(shift) => onChipClick(word.id, shift)}
+              idsForDrag={() => idsForDrag(word.id)}
+            />
+          ),
+        )}
       </Stack>
     </Box>
   );
@@ -646,6 +659,7 @@ function AlignmentGrid({
   verseNum,
   onTargetsDrop,
   onSourceDrop,
+  onExtractSource,
   onClearGroup,
 }: {
   groups: AlignmentGroup[];
@@ -654,6 +668,7 @@ function AlignmentGrid({
   verseNum: number;
   onTargetsDrop: (dest: string, wordIds: string[]) => void;
   onSourceDrop: (destGroupId: string, sourceId: string) => void;
+  onExtractSource: (sourceId: string) => void;
   onClearGroup: (groupId: string) => void;
 }) {
   // Hebrew/Greek reads RTL, so order the alignment cards right-to-left to
@@ -681,44 +696,14 @@ function AlignmentGrid({
           <Stack direction="row" alignItems="flex-start" sx={{ mb: 0.5, direction: "ltr" }}>
             <Stack direction="row" spacing={0.25} sx={{ flex: 1, direction: "rtl", flexWrap: "wrap" }}>
               {g.source.map((s) => (
-                <Tooltip
+                <SourceChip
                   key={s.id}
-                  title={
-                    <SourceTooltipBody
-                      source={s}
-                      lex={lexiconMap.get(s.strong) ?? null}
-                      twHint={twHintFor(twlForVerse, verseNum, s.content)}
-                    />
-                  }
-                  // Click-through the popper so it doesn't swallow hover for
-                  // adjacent source words when the user sweeps across them.
-                  slotProps={{ popper: { sx: { pointerEvents: "none" } } }}
-                >
-                  <Paper
-                    elevation={0}
-                    draggable
-                    onDragStart={(e) => {
-                      e.dataTransfer.setData(SOURCE_ID_MIME, s.id);
-                      e.dataTransfer.effectAllowed = "move";
-                    }}
-                    sx={{
-                      bgcolor: "grey.900",
-                      color: "grey.50",
-                      px: 1.25,
-                      py: 0.5,
-                      fontFamily: '"Times New Roman", "SBL Hebrew", "Cardo", serif',
-                      fontSize: 26,
-                      lineHeight: 1.3,
-                      textAlign: "center",
-                      direction: "rtl",
-                      borderRadius: 0.5,
-                      cursor: "grab",
-                      "&:active": { cursor: "grabbing" },
-                    }}
-                  >
-                    {s.content}
-                  </Paper>
-                </Tooltip>
+                  source={s}
+                  lex={lexiconMap.get(s.strong) ?? null}
+                  twHint={twHintFor(twlForVerse, verseNum, s.content)}
+                  canExtract={g.source.length > 1}
+                  onExtract={() => onExtractSource(s.id)}
+                />
               ))}
             </Stack>
             {(g.targets.length > 0 || g.source.length > 1) && (
@@ -799,6 +784,101 @@ function DropTargetBox({
     >
       {children}
     </Paper>
+  );
+}
+
+function SourceChip({
+  source,
+  lex,
+  twHint,
+  canExtract,
+  onExtract,
+}: {
+  source: SourceWord;
+  lex: LexiconEntry | null;
+  twHint: string | null;
+  canExtract: boolean;
+  onExtract: () => void;
+}) {
+  const [hover, setHover] = useState(false);
+  return (
+    <Tooltip
+      title={<SourceTooltipBody source={source} lex={lex} twHint={twHint} />}
+      slotProps={{ popper: { sx: { pointerEvents: "none" } } }}
+    >
+      <Box
+        onMouseEnter={() => setHover(true)}
+        onMouseLeave={() => setHover(false)}
+        sx={{ position: "relative" }}
+      >
+        <Paper
+          elevation={0}
+          draggable
+          onDragStart={(e) => {
+            e.dataTransfer.setData(SOURCE_ID_MIME, source.id);
+            e.dataTransfer.effectAllowed = "move";
+          }}
+          sx={{
+            bgcolor: "grey.900",
+            color: "grey.50",
+            px: 1.25,
+            py: 0.5,
+            fontFamily: '"Times New Roman", "SBL Hebrew", "Cardo", serif',
+            fontSize: 26,
+            lineHeight: 1.3,
+            textAlign: "center",
+            direction: "rtl",
+            borderRadius: 0.5,
+            cursor: "grab",
+            "&:active": { cursor: "grabbing" },
+          }}
+        >
+          {source.content}
+        </Paper>
+        {canExtract && hover && (
+          <Tooltip title="split this word out of the compound (creates a new alignment box)">
+            <IconButton
+              size="small"
+              onClick={onExtract}
+              sx={{
+                position: "absolute",
+                top: -8,
+                right: -8,
+                p: 0.125,
+                bgcolor: "background.paper",
+                border: "1px solid",
+                borderColor: "divider",
+                color: "text.secondary",
+                "&:hover": { bgcolor: "error.main", color: "common.white", borderColor: "error.main" },
+                boxShadow: 1,
+              }}
+            >
+              <CloseIcon sx={{ fontSize: 12 }} />
+            </IconButton>
+          </Tooltip>
+        )}
+      </Box>
+    </Tooltip>
+  );
+}
+
+function GhostedChip({ text }: { text: string }) {
+  return (
+    <Chip
+      label={text}
+      size="small"
+      variant="outlined"
+      sx={{
+        fontFamily: '"Roboto","Helvetica",sans-serif',
+        color: "text.disabled",
+        bgcolor: "transparent",
+        borderColor: "divider",
+        borderLeft: "3px solid",
+        borderLeftColor: "grey.300",
+        userSelect: "none",
+        opacity: 0.55,
+      }}
+    />
   );
 }
 

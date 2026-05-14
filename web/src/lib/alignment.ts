@@ -528,6 +528,36 @@ export function clearGroup(state: AlignmentState, groupId: string): AlignmentSta
   return finalize({ ...state, sourceGroups, stream });
 }
 
+// Pull a source word out of a compound group into its own new singleton
+// group with empty targets. The previous group keeps its remaining source
+// words AND its attached target chips — only the extracted source becomes
+// detached. No-op when the source is already alone in its group.
+export function extractSource(
+  state: AlignmentState,
+  sourceId: string,
+): AlignmentState {
+  const idx = state.sourceGroups.findIndex((g) =>
+    g.source.some((s) => s.id === sourceId),
+  );
+  if (idx < 0) return state;
+  const from = state.sourceGroups[idx];
+  if (from.source.length <= 1) return state;
+  const moving = from.source.find((s) => s.id === sourceId)!;
+  const remaining = from.source.filter((s) => s.id !== sourceId);
+  const newGroup: AlignmentGroup = {
+    id: uid(),
+    source: [moving],
+    targets: [],
+  };
+  const sourceGroups = [
+    ...state.sourceGroups.slice(0, idx),
+    { ...from, source: remaining },
+    ...state.sourceGroups.slice(idx + 1),
+    newGroup,
+  ];
+  return finalize({ ...state, sourceGroups });
+}
+
 // Move a source word from its current group into `destGroupId`'s source
 // chain, making that group compound. If the source group collapses (its
 // last source word left), every stream word aligned to it re-points at
