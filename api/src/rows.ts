@@ -4,6 +4,7 @@ import type { Env } from "./index";
 import type { RowKind, TnRow, TqRow, TwlRow } from "./types";
 import { currentUserId, requireAuth } from "./auth";
 import { activePipelineForChapter, lockedResponseBody } from "./chapterLock";
+import { broadcastChapter } from "./wsEvents";
 
 export const rows = new Hono<{ Bindings: Env; Variables: { userId?: number } }>();
 
@@ -169,6 +170,12 @@ rows.post("/:kind", requireAuth, async (c) => {
   )
     .bind(id)
     .first();
+  if (created) {
+    const row = created as unknown as TnRow | TqRow | TwlRow;
+    c.executionCtx.waitUntil(
+      broadcastChapter(c.env, row.book, row.chapter, { type: "row.upserted", kind, row }),
+    );
+  }
   return c.json(created, 201);
 });
 
@@ -439,6 +446,12 @@ rows.patch("/:kind/:id", requireAuth, async (c) => {
   )
     .bind(id)
     .first();
+  if (updated) {
+    const row = updated as unknown as TnRow | TqRow | TwlRow;
+    c.executionCtx.waitUntil(
+      broadcastChapter(c.env, row.book, row.chapter, { type: "row.upserted", kind, row }),
+    );
+  }
   return c.json(updated);
 });
 
@@ -493,6 +506,16 @@ rows.delete("/:kind/:id", requireAuth, async (c) => {
       .first<{ version: number; deleted_at: number | null }>();
     if (!fresh || fresh.deleted_at) return c.json({ error: "not_found" }, 404);
     return c.json({ error: "version_mismatch", current: fresh }, 409);
+  }
+  if (scope) {
+    c.executionCtx.waitUntil(
+      broadcastChapter(c.env, scope.book, scope.chapter, {
+        type: "row.deleted",
+        kind,
+        id,
+        version: newVersion,
+      }),
+    );
   }
   return c.json({ ok: true });
 });

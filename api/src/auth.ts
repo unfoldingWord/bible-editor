@@ -28,7 +28,7 @@ function signingKey(env: Env): Uint8Array | null {
   return new TextEncoder().encode(env.JWT_SIGNING_KEY);
 }
 
-async function verify(token: string, env: Env): Promise<AuthClaims | null> {
+export async function verifyToken(token: string, env: Env): Promise<AuthClaims | null> {
   const key = signingKey(env);
   if (!key) return null;
   try {
@@ -53,7 +53,7 @@ export const attachAuth: MiddlewareHandler = async (c, next) => {
   const header = c.req.header("authorization");
   if (header && header.toLowerCase().startsWith("bearer ")) {
     const token = header.slice(7).trim();
-    const claims = await verify(token, c.env as Env);
+    const claims = await verifyToken(token, c.env as Env);
     if (claims) {
       (c as AppContext).set("userId", claims.userId);
       if (claims.username) (c as AppContext).set("username", claims.username);

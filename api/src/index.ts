@@ -9,7 +9,7 @@ import { exports as exportsRoutes } from "./exports";
 import { tnQuick } from "./tnQuick";
 import { pipelines, pollAllNonTerminal } from "./pipelines";
 import { pendingImports } from "./pendingImports";
-import { attachAuth, mintDevToken, startDcsAuth, callbackDcsAuth, authMe } from "./auth";
+import { attachAuth, mintDevToken, startDcsAuth, callbackDcsAuth, authMe, verifyToken } from "./auth";
 
 export interface Env {
   DB: D1Database;
@@ -123,6 +123,34 @@ app.route("/api/exports", exportsRoutes);
 app.route("/api/tn-quick", tnQuick);
 app.route("/api/pipelines", pipelines);
 app.route("/api/pending-imports", pendingImports);
+
+// WebSocket upgrade into the ChapterRoom DO. Subprotocol-based bearer auth
+// is the only browser-compatible way to carry the JWT on a WS upgrade —
+// the standard Authorization header isn't settable on `new WebSocket(...)`.
+// Client opens `new WebSocket(url, [\`bearer.${jwt}\`])`; we verify the
+// token and forward the raw request to the DO (which echoes the protocol
+// back so the handshake completes).
+app.get("/api/ws/chapter/:book/:chapter", async (c) => {
+  if (c.req.header("upgrade") !== "websocket") {
+    return c.text("expected websocket", 426);
+  }
+  const protoHeader = c.req.header("sec-websocket-protocol") ?? "";
+  const proto = protoHeader
+    .split(",")
+    .map((s) => s.trim())
+    .find((s) => s.startsWith("bearer."));
+  const token = proto ? proto.slice("bearer.".length) : "";
+  if (!token) return c.text("unauthorized", 401);
+  const claims = await verifyToken(token, c.env);
+  if (!claims) return c.text("unauthorized", 401);
+
+  const book = c.req.param("book").toUpperCase();
+  const chapter = parseInt(c.req.param("chapter"), 10);
+  if (!Number.isFinite(chapter)) return c.text("invalid chapter", 400);
+
+  const id = c.env.CHAPTER_ROOM.idFromName(`${book}:${chapter}`);
+  return c.env.CHAPTER_ROOM.get(id).fetch(c.req.raw);
+});
 
 // /api/* misses get the JSON 404. Anything else falls through to the static
 // SPA bundle (when the [assets] binding is configured for production deploy).

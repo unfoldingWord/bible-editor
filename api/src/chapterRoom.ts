@@ -1,5 +1,15 @@
 import type { Env } from "./index";
+import type { WsEvent } from "./wsEvents";
 
+// One DO per {book, chapter}. Holds a Set of open WebSockets; server-
+// initiated broadcasts (POST /broadcast, called from rows.ts) fan to all
+// of them. Clients are listen-only for the MVP — no client→client echo,
+// no presence; both are future polish that won't require redoing this.
+//
+// In-memory state is fine because the DO stays alive only while at least
+// one socket is open. Hibernation (state.acceptWebSocket) is deliberately
+// skipped for now; revisit if active rooms grow enough that DO duration
+// billing matters.
 export class ChapterRoom implements DurableObject {
   private clients = new Set<WebSocket>();
 
@@ -12,21 +22,51 @@ export class ChapterRoom implements DurableObject {
   }
 
   async fetch(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+
+    if (request.method === "POST" && url.pathname === "/broadcast") {
+      let event: WsEvent;
+      try {
+        event = (await request.json()) as WsEvent;
+      } catch {
+        return new Response("invalid body", { status: 400 });
+      }
+      const payload = JSON.stringify(event);
+      for (const ws of this.clients) {
+        if (ws.readyState === WebSocket.READY_STATE_OPEN) {
+          try {
+            ws.send(payload);
+          } catch {
+            // Dead socket — the close listener will prune it. Best effort.
+          }
+        }
+      }
+      return new Response(null, { status: 204 });
+    }
+
     if (request.headers.get("upgrade") !== "websocket") {
       return new Response("expected websocket", { status: 426 });
     }
+
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair) as [WebSocket, WebSocket];
     server.accept();
     this.clients.add(server);
     server.addEventListener("close", () => this.clients.delete(server));
-    server.addEventListener("message", (event) => {
-      for (const c of this.clients) {
-        if (c !== server && c.readyState === WebSocket.READY_STATE_OPEN) {
-          c.send(event.data);
-        }
-      }
-    });
-    return new Response(null, { status: 101, webSocket: client });
+    server.addEventListener("error", () => this.clients.delete(server));
+
+    // Echo the negotiated subprotocol so the browser handshake completes.
+    // index.ts already verified the JWT carried in this header — the DO
+    // doesn't re-validate; it just bounces the value back to the client.
+    const protoHeader = request.headers.get("sec-websocket-protocol");
+    const init: ResponseInit & { webSocket: WebSocket } = {
+      status: 101,
+      webSocket: client,
+    };
+    if (protoHeader) {
+      const proto = protoHeader.split(",")[0].trim();
+      init.headers = { "sec-websocket-protocol": proto };
+    }
+    return new Response(null, init);
   }
 }

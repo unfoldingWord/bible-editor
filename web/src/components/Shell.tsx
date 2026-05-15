@@ -12,6 +12,7 @@ import {
   Button,
 } from "@mui/material";
 import { useChapter } from "../hooks/useChapter";
+import { useChapterRoom } from "../hooks/useChapterRoom";
 import type { UseBookReturn } from "../hooks/useBook";
 import { useLexicon } from "../hooks/useLexicon";
 import { useAiDrafts } from "../hooks/useAiDrafts";
@@ -77,11 +78,35 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook }:
     data,
     error,
     applyLocalRowPatch,
+    applyLocalRowReplacement,
     applyLocalRowDelete,
     applyLocalRowInsert,
     applyLocalVerse,
     applyLocalVerseStatus,
   } = useChapter(book, chapter);
+
+  // Live cross-tab updates. The server broadcasts row writes via the
+  // ChapterRoom DO; we dedupe by version so the originating user's tab
+  // (whose state was already updated by the PATCH response) is a no-op.
+  // NoteCard's session guard already shields an in-progress edit from
+  // being clobbered when the underlying row prop changes — so we can
+  // apply unconditionally here.
+  const dataRef = useRef(data);
+  useEffect(() => {
+    dataRef.current = data;
+  }, [data]);
+  useChapterRoom(book, chapter, {
+    onUpsert: (kind, row) => {
+      const list = dataRef.current?.[kind] as Array<TnRow | TqRow | TwlRow> | undefined;
+      const existing = list?.find((r) => r.id === row.id);
+      if (!existing) {
+        applyLocalRowInsert(kind, row);
+      } else if (row.version > existing.version) {
+        applyLocalRowReplacement(kind, row);
+      }
+    },
+    onDelete: (kind, id) => applyLocalRowDelete(kind, id),
+  });
   const [activeVerse, setActiveVerse] = useState(initialVerse);
   const [activeNoteId, setActiveNoteId] = useState<string | null>(null);
   const [activeWordId, setActiveWordId] = useState<string | null>(null);
