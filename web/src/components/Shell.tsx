@@ -35,6 +35,7 @@ interface AlignerTarget {
 
 const SCRIPTURE_MODE_KEY = "be:scriptureMode";
 const ENABLED_VERSIONS_KEY = "be:enabledVersions";
+const RAIL_COLLAPSED_KEY = "be:railCollapsed";
 
 function loadFromStorage<T>(key: string, fallback: T): T {
   try {
@@ -82,6 +83,16 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook }:
   const [enabledVersions, setEnabledVersions] = useState<string[]>(() =>
     loadFromStorage<string[]>(ENABLED_VERSIONS_KEY, ["ULT", "UST"]),
   );
+  const [railCollapsed, setRailCollapsed] = useState<boolean>(() =>
+    loadFromStorage<boolean>(RAIL_COLLAPSED_KEY, false),
+  );
+  const toggleRail = useCallback(() => {
+    setRailCollapsed((prev) => {
+      const next = !prev;
+      saveToStorage(RAIL_COLLAPSED_KEY, next);
+      return next;
+    });
+  }, []);
   const [alignerTarget, setAlignerTarget] = useState<AlignerTarget | null>(null);
   // Shared by the scripture + resource columns so a single "go to active"
   // click re-centers both. Bumped via requestScrollToActive (and elsewhere
@@ -261,11 +272,12 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook }:
     isDraggingRef.current = true;
     document.body.style.cursor = "ew-resize";
     document.body.style.userSelect = "none";
+    const railWidth = railCollapsed ? 0 : 88;
     const onMouseMove = (ev: MouseEvent) => {
       if (!isDraggingRef.current || !splitContainerRef.current) return;
       const rect = splitContainerRef.current.getBoundingClientRect();
-      const available = rect.width - 88;
-      const offset = ev.clientX - rect.left - 88;
+      const available = rect.width - railWidth;
+      const offset = ev.clientX - rect.left - railWidth;
       setSplitRatio(Math.min(0.8, Math.max(0.2, offset / available)));
     };
     const onMouseUp = () => {
@@ -277,7 +289,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook }:
     };
     window.addEventListener("mousemove", onMouseMove);
     window.addEventListener("mouseup", onMouseUp);
-  }, []);
+  }, [railCollapsed]);
 
   // Pre-load lexicon entries for every UHB Strong's in the loaded chapter
   // AND every loaded chapter in book mode, so the per-word tooltips in the
@@ -391,11 +403,11 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook }:
       <TopBar
         book={book}
         chapter={chapter}
-        onNavigate={(b, c) => {
-          setActiveVerse(1);
+        onNavigate={(b, c, v) => {
+          setActiveVerse(v ?? 1);
           setActiveNoteId(null);
           setActiveWordId(null);
-          onNavigate?.(b, c);
+          onNavigate?.(b, c, v);
         }}
         pipelineMenu={
           <PipelineMenu
@@ -407,6 +419,8 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook }:
         logosSyncToggle={
           <LogosSyncToggle book={book} chapter={chapter} verse={activeVerse} />
         }
+        railCollapsed={railCollapsed}
+        onToggleRail={toggleRail}
       />
       {chapterLock && (
         <Alert
@@ -427,25 +441,27 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook }:
         </Alert>
       )}
       <Box ref={splitContainerRef} sx={{ flex: 1, display: "flex", overflow: "hidden" }}>
-        <TimelineRail
-          book={book}
-          chapter={chapter}
-          tiles={tileSet}
-          activeVerse={activeVerse}
-          onSelect={setActiveVerse}
-          onToggleDone={(v, done) => {
-            // Through the outbox so an offline toggle isn't dropped. The
-            // payload is coalesced per (book, chapter, verse) so a rapid
-            // click-click only ships the final state.
-            void outbox.enqueueVerseStatus(book, chapter, v, done);
-            // Optimistic local update — useChapter would also reconcile on
-            // the outbox "ok" callback once that handler covers
-            // verse_status (currently it only mirrors row + verse). For
-            // now, refetching when the queue settles keeps the rail in
-            // step without a re-render race.
-            applyLocalVerseStatus(v, done);
-          }}
-        />
+        {!railCollapsed && (
+          <TimelineRail
+            book={book}
+            chapter={chapter}
+            tiles={tileSet}
+            activeVerse={activeVerse}
+            onSelect={setActiveVerse}
+            onToggleDone={(v, done) => {
+              // Through the outbox so an offline toggle isn't dropped. The
+              // payload is coalesced per (book, chapter, verse) so a rapid
+              // click-click only ships the final state.
+              void outbox.enqueueVerseStatus(book, chapter, v, done);
+              // Optimistic local update — useChapter would also reconcile on
+              // the outbox "ok" callback once that handler covers
+              // verse_status (currently it only mirrors row + verse). For
+              // now, refetching when the queue settles keeps the rail in
+              // step without a re-render race.
+              applyLocalVerseStatus(v, done);
+            }}
+          />
+        )}
         <Box
           sx={{
             width: `${effectiveSplit * 100}%`,
