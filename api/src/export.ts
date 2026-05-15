@@ -94,7 +94,12 @@ export function buildUsfm(input: UsfmInputs): string {
     }
     const ch = String(v.chapter);
     if (!chapters[ch]) chapters[ch] = {};
-    chapters[ch][String(v.verse)] = parsed;
+    // verse 0 stores the chapter-front pseudo-verse (e.g. `\d` Psalm
+    // titles). usfm-js's emitter expects the literal key "front" there;
+    // a numeric "0" key wouldn't be recognised and the content would
+    // emit incorrectly. See importParsers.ts:extractVersesForRange.
+    const verseKey = v.verse === 0 ? "front" : String(v.verse);
+    chapters[ch][verseKey] = parsed;
   }
 
   const headers = input.headers ?? synthesizeHeaders(input.book, input.bibleVersion);

@@ -12,8 +12,11 @@ export interface VerseExtract {
   plainText: string;
 }
 
-// Walk verse-objects and concatenate all text. Mirrors the logic in
-// scripts/import-book.mjs (extractPlainText). usfm-js verse-object shapes:
+// Walk verse-objects and concatenate all text. Same shape and behaviour
+// as the client-side `extractPlainText` in web/src/lib/usfm.ts — kept
+// duplicated because the Worker bundle and the web bundle are built
+// separately and cross-package imports are non-trivial. Any change
+// here must be mirrored there.
 //   { type: 'text', text: '...' }
 //   { type: 'word', text: '...', occurrence, ... }
 //   { type: 'milestone', tag: 'zaln-s', children: [...] }
@@ -34,8 +37,10 @@ function extractPlainText(verseObj: unknown): string {
 }
 
 // Extract every verse in [startChapter, endChapter] from a whole-book USFM
-// blob. Verse keys like 'front' or 'intro' are skipped; a hyphenated key
-// (e.g. '12-13') collapses to its first verse number for indexing.
+// blob. Verse keys can be numeric ("3"), hyphenated ranges ("12-13"
+// collapses to its first verse), or the "front" pseudo-verse (where
+// usfm-js puts a chapter-level `\d` Psalm title — stored as verse 0).
+// Book-level `intro` keys are still skipped.
 export function extractVersesForRange(
   rawUsfm: string,
   startChapter: number,
@@ -50,8 +55,17 @@ export function extractVersesForRange(
     if (chNum < startChapter || chNum > endChapter) continue;
     const chapterObj = chapters[chapterKey] as Record<string, unknown>;
     for (const verseKey of Object.keys(chapterObj)) {
-      if (!/^\d+(-\d+)?$/.test(verseKey)) continue;
-      const vNum = parseInt(verseKey.split("-")[0], 10);
+      let vNum: number;
+      if (verseKey === "front") {
+        // Chapter-front pseudo-verse — Psalm titles (\d), descriptive
+        // titles, etc. Store as verse 0 so the chapter view's "intro"
+        // row picks them up.
+        vNum = 0;
+      } else if (/^\d+(-\d+)?$/.test(verseKey)) {
+        vNum = parseInt(verseKey.split("-")[0], 10);
+      } else {
+        continue;
+      }
       if (!Number.isFinite(vNum)) continue;
       const verseObj = chapterObj[verseKey];
       out.push({

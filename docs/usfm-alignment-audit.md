@@ -293,6 +293,14 @@ first-class UI affordances.
 
 ## 4. Proposed model — positional opaque wrappers
 
+> **Status (2026-05-15):** §4 + Phase D shipped on branch
+> `claude/fix-usfm-alignment-lU8H3`. See
+> `/root/.claude/plans/show-phase-a-as-harmonic-karp.md` for the
+> approved plan and `web/src/lib/alignment.test.mjs` for the
+> regression suite (7/7 cases passing). The `isContentWrapper`
+> heuristic was replaced by an explicit `ALIGNMENT_WRAPPER_TAGS`
+> whitelist (`{"qs"}`) per the Plan-agent critique — see §4.2 below.
+
 The fix is a minimal extension to the internal stream model: stop
 sinking unknown nodes into `passthroughTail`, and instead capture them
 in stream order with structural awareness of "wrapper opens / wrapper

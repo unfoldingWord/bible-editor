@@ -2,11 +2,17 @@
 // JSON tree.
 //
 // Internal model: target English (or other GL) text is a flat document-order
-// stream of word + text items. Each word optionally carries an `alignedTo`
-// tag pointing at a source group; the source groups themselves live in a
-// separate list keyed by uid. This decouples target-text order from
-// alignment metadata so an alignment edit never reorders the verse's
-// natural reading order.
+// stream of words, text segments, and opaque/wrapper marker brackets. Each
+// word optionally carries an `alignedTo` tag pointing at a source group;
+// the source groups themselves live in a separate list keyed by uid. This
+// decouples target-text order from alignment metadata so an alignment edit
+// never reorders the verse's natural reading order.
+//
+// The stream is the single source of truth for "where everything in the
+// verse sits", including non-zaln inline markup. There is no prefix /
+// passthroughTail: every node — paragraph markers, footnotes, Selah's
+// `\qs` wrapper, etc. — has a defined position in the stream and survives
+// a round-trip in place. See docs/usfm-alignment-audit.md §4.
 //
 // On parse, two `\zaln-s` pairs that wrap the same Hebrew/Greek source
 // (e.g. Zec 3:4 "Take ... off" around "those filthy clothes") merge into
@@ -19,7 +25,8 @@
 // in stream order) and `state.unaligned` (flat list of words with no
 // alignment), unchanged for callers / UI.
 
-import { nfc } from "./hebrew";
+import { nfc } from "./hebrew.ts";
+import { extractPlainText } from "./usfm.ts";
 
 export interface SourceWord {
   id: string;
@@ -53,11 +60,39 @@ interface StreamText {
   kind: "text";
   text: string;
 }
-type StreamItem = StreamWord | StreamText;
+// A self-contained inline node with no alignment-bearing content:
+// footnotes (\f), blank lines (\b), chunk milestones (\ts*), section
+// headings (\ms), bare `\qs Selah\qs*` without an inner \zaln-s,
+// paragraph markers (\p, \q1, \q2, \m). Preserved verbatim on serialize.
+interface StreamMarker {
+  kind: "marker";
+  node: ParsedNode;
+}
+// Brackets around a wrapper whose children include alignment-bearing
+// content — the production-ULT Selah shape, `\qs \zaln-s ...\w Selah\w*\zaln-e\* \qs*`.
+// The walker descends through, the inner words / zalns become stream
+// words and source groups, and the open/close brackets remember the
+// wrapper so serialize can rebuild it.
+interface StreamOpenMarker {
+  kind: "openMarker";
+  tag: string;
+  node: ParsedNode;
+}
+interface StreamCloseMarker {
+  kind: "closeMarker";
+  tag: string;
+}
+type StreamItem =
+  | StreamWord
+  | StreamText
+  | StreamMarker
+  | StreamOpenMarker
+  | StreamCloseMarker;
 
 export interface AlignmentState {
-  // Internal document-order stream of target text + words. The single
-  // source of truth for "where each target word sits in the verse".
+  // Internal document-order stream of target text, words, and inline
+  // markup brackets. The single source of truth for "where everything
+  // in the verse sits" — both aligned content and passthrough markup.
   stream: StreamItem[];
   // Source-word groups, keyed by id, independent of stream order. UHB
   // display order is computed separately in the dialog.
@@ -65,12 +100,18 @@ export interface AlignmentState {
   // Derived views, refreshed on every mutation for UI compat.
   groups: AlignmentGroup[];
   unaligned: TargetWord[];
-  // Passthrough nodes that the alignment model doesn't touch.
-  prefix: ParsedNode[];
-  passthroughTail: ParsedNode[];
 }
 
 type ParsedNode = Record<string, unknown>;
+
+// Whitelist (NOT "has text children" — that would walk \f footnote
+// prose into the alignment stream and into plain_text). \qs is the
+// only USFM 3 character-style wrapper unfoldingWord ULT/UST emits
+// today (audit §3.1). Add new tags here as they appear in real
+// corpora; misclassifying an unknown wrapper as opaque is visible
+// (text doesn't appear for alignment), while the reverse is silent
+// data loss into plain_text.
+const ALIGNMENT_WRAPPER_TAGS = new Set<string>(["qs"]);
 
 function nodeIsZaln(n: ParsedNode | undefined): boolean {
   return !!n && n["type"] === "milestone" && n["tag"] === "zaln";
@@ -80,6 +121,36 @@ function nodeIsWord(n: ParsedNode | undefined): boolean {
 }
 function nodeIsText(n: ParsedNode | undefined): boolean {
   return !!n && n["type"] === "text" && typeof n["text"] === "string";
+}
+function isAlignmentWrapper(n: ParsedNode | undefined): boolean {
+  if (!n || typeof n !== "object") return false;
+  if (n["type"] !== "quote") return false;
+  const tag = n["tag"];
+  if (typeof tag !== "string") return false;
+  if (!ALIGNMENT_WRAPPER_TAGS.has(tag)) return false;
+  const children = n["children"];
+  return Array.isArray(children) && children.length > 0;
+}
+
+// Shallow-clone a node's own properties, dropping `children` (the
+// serializer rebuilds those). Used for wrapper open-markers, whose
+// inner content is rebuilt from the stream. Prevents the serializer
+// from mutating verseObjects that React props still reference.
+function cloneNodeShallow(n: ParsedNode): ParsedNode {
+  const out: ParsedNode = {};
+  for (const key of Object.keys(n)) {
+    if (key === "children") continue;
+    out[key] = n[key];
+  }
+  return out;
+}
+
+// Deep-clone a node verbatim — children included. Used for opaque
+// markers (footnotes, paragraph markers, etc.) whose stored content
+// IS the serialization. JSON-clone is sufficient: usfm-js verseObject
+// nodes are plain JSON (strings / numbers / arrays / objects).
+function cloneNodeOpaque(n: ParsedNode): ParsedNode {
+  return JSON.parse(JSON.stringify(n)) as ParsedNode;
 }
 
 function sourceOf(node: ParsedNode): SourceWord {
@@ -162,6 +233,26 @@ function walk(
       stream.push({ kind: "word", word: targetOf(node), alignedTo: currentGroupId });
     } else if (nodeIsText(node)) {
       stream.push({ kind: "text", text: String(node["text"] ?? "") });
+    } else if (isAlignmentWrapper(node)) {
+      // Descend through a `\qs` (or similar whitelisted) wrapper whose
+      // children include alignment-bearing content. The inner zaln /
+      // word / text nodes enter the stream like any other content; the
+      // wrapper itself is reconstructed at serialize time from these
+      // brackets.
+      const tag = String(node["tag"] ?? "");
+      stream.push({ kind: "openMarker", tag, node: cloneNodeShallow(node) });
+      const children = (node["children"] as ParsedNode[] | undefined) ?? [];
+      walk(children, sourceChain, stream, sourceGroups, currentGroupId);
+      stream.push({ kind: "closeMarker", tag });
+    } else {
+      // Opaque inline node — footnotes (\f), blank lines (\b), chunk
+      // milestones (\ts*), section headings (\ms), bare `\qs Selah\qs*`
+      // without inner alignment, paragraph markers (\p, \q1, \q2, \m).
+      // The whole node (attrs + children) rides along verbatim on the
+      // marker; serializer emits it as-is. extractPlainText still
+      // recursively concatenates `text` fields out of these children,
+      // matching importer behaviour for Selah / Psalm titles / etc.
+      stream.push({ kind: "marker", node: cloneNodeOpaque(node) });
     }
   }
 }
@@ -198,34 +289,11 @@ export function parseAlignment(
   sourceVerseObjects?: unknown[] | null,
 ): AlignmentState {
   const inputs = (verseObjects ?? []) as ParsedNode[];
-  const prefix: ParsedNode[] = [];
-  const passthroughTail: ParsedNode[] = [];
-
-  // Split into prefix/tail (non-text passthrough markers like \p) and the
-  // alignment stream (milestones, words, text in document order).
-  let seenContent = false;
-  for (const node of inputs) {
-    if (!node || typeof node !== "object") continue;
-    if (nodeIsZaln(node) || nodeIsWord(node)) {
-      seenContent = true;
-      continue;
-    }
-    if (nodeIsText(node)) continue;
-    if (!seenContent) prefix.push(node);
-    else passthroughTail.push(node);
-  }
-
   const stream: StreamItem[] = [];
   const sourceGroups: AlignmentGroup[] = [];
-  walk(
-    inputs.filter((n) => nodeIsZaln(n) || nodeIsWord(n) || nodeIsText(n)),
-    [],
-    stream,
-    sourceGroups,
-    null,
-  );
+  walk(inputs, [], stream, sourceGroups, null);
 
-  const base = { stream, sourceGroups, prefix, passthroughTail };
+  const base = { stream, sourceGroups };
   if (!sourceVerseObjects) return finalize(base);
   return finalize(withSourceCoverage(base, sourceVerseObjects));
 }
@@ -393,91 +461,173 @@ function wordNode(t: TargetWord): ParsedNode {
   };
 }
 
-// Walk the document-order stream. Open a milestone on entering an aligned
-// run, close it on exit, and let unaligned words and text segments emit as
-// bare top-level nodes between milestones. Text that sits between two
-// stream words with the SAME alignment lives inside that milestone; text
-// flanking an alignment change goes outside.
+// Walk the document-order stream and rebuild the verseObjects tree. The
+// output is a stack of frames: the bottom frame is the verse-level
+// array; each `openMarker` pushes a new frame whose accumulated
+// children become the wrapper node's content when its matching
+// `closeMarker` arrives. Within any frame, words with the same
+// `alignedTo` collapse into one `\zaln-s ... \zaln-e\*` milestone;
+// text sandwiched between two words of the same alignment lives
+// inside that milestone, text flanking an alignment change goes
+// outside. Opaque markers (`\f`, `\b`, `\ts*`, etc.) emit verbatim.
+//
+// Invariant: a `\zaln-s` milestone is always closed before crossing
+// an `openMarker`/`closeMarker` boundary. Matches the production
+// ULT/UST encoding where `\zaln-e\*` precedes `\qs*`.
 export function serializeAlignment(state: AlignmentState): unknown[] {
-  const out: ParsedNode[] = [...state.prefix];
   const groupById = new Map(state.sourceGroups.map((g) => [g.id, g]));
 
-  let current: string | null = null;
-  let openChildren: ParsedNode[] | null = null;
-  let pendingText = "";
+  // Per-frame mutable state. The output-stack grows when we open a
+  // wrapper and shrinks when we close one.
+  interface Frame {
+    out: ParsedNode[];
+    wrapper: ParsedNode | null; // null for the verse-level frame
+    current: string | null;
+    openChildren: ParsedNode[] | null;
+    pendingText: string;
+  }
 
-  const closeMilestone = (): void => {
-    if (current === null || !openChildren) return;
-    const group = groupById.get(current);
-    if (group) out.push(buildNestedMilestone(group.source, openChildren));
-    current = null;
-    openChildren = null;
+  const frames: Frame[] = [{
+    out: [],
+    wrapper: null,
+    current: null,
+    openChildren: null,
+    pendingText: "",
+  }];
+  const top = (): Frame => frames[frames.length - 1];
+
+  const closeMilestone = (f: Frame): void => {
+    if (f.current === null || !f.openChildren) return;
+    const group = groupById.get(f.current);
+    if (group) f.out.push(buildNestedMilestone(group.source, f.openChildren));
+    f.current = null;
+    f.openChildren = null;
   };
 
-  const flushPendingOutside = (): void => {
-    if (pendingText) {
-      out.push({ type: "text", text: pendingText });
-      pendingText = "";
+  const flushPendingOutside = (f: Frame): void => {
+    if (f.pendingText) {
+      f.out.push({ type: "text", text: f.pendingText });
+      f.pendingText = "";
     }
   };
 
-  const flushPendingInside = (): void => {
-    if (pendingText && openChildren) {
-      openChildren.push({ type: "text", text: pendingText });
-      pendingText = "";
+  const flushPendingInside = (f: Frame): void => {
+    if (f.pendingText && f.openChildren) {
+      f.openChildren.push({ type: "text", text: f.pendingText });
+      f.pendingText = "";
     }
   };
 
   for (const item of state.stream) {
+    const f = top();
     if (item.kind === "text") {
-      pendingText += item.text;
+      f.pendingText += item.text;
       continue;
     }
+    if (item.kind === "marker") {
+      // Close any open milestone in the current frame, then drop the
+      // opaque marker into the frame's output verbatim.
+      if (f.current !== null) closeMilestone(f);
+      flushPendingOutside(f);
+      f.out.push(item.node);
+      continue;
+    }
+    if (item.kind === "openMarker") {
+      // Close any open milestone in the parent frame; push a new
+      // frame whose `wrapper` will be rebuilt on the matching close.
+      if (f.current !== null) closeMilestone(f);
+      flushPendingOutside(f);
+      frames.push({
+        out: [],
+        wrapper: item.node,
+        current: null,
+        openChildren: null,
+        pendingText: "",
+      });
+      continue;
+    }
+    if (item.kind === "closeMarker") {
+      // Close any open milestone inside the current frame, build the
+      // wrapper node from this frame's accumulated children, and push
+      // the wrapper into the parent frame's output.
+      if (f.current !== null) closeMilestone(f);
+      flushPendingOutside(f);
+      const finished = frames.pop()!;
+      const parent = top();
+      const wrapper = finished.wrapper ?? { tag: item.tag, type: "quote" };
+      const wrapperNode: ParsedNode = { ...wrapper, children: finished.out };
+      // Close any open milestone in the parent before splicing in the
+      // wrapper — should already be closed by openMarker handling.
+      if (parent.current !== null) closeMilestone(parent);
+      flushPendingOutside(parent);
+      parent.out.push(wrapperNode);
+      continue;
+    }
+    // item.kind === "word"
     const next = item.alignedTo;
-    if (next === current && current !== null) {
-      flushPendingInside();
-      openChildren!.push(wordNode(item.word));
+    if (next === f.current && f.current !== null) {
+      flushPendingInside(f);
+      f.openChildren!.push(wordNode(item.word));
       continue;
     }
-    if (current !== null) {
-      // Text accumulated while a milestone was open belongs OUTSIDE that
-      // milestone when the next word breaks the run — it was the gap
-      // between two milestones, not internal whitespace.
-      closeMilestone();
+    if (f.current !== null) {
+      // Text accumulated while a milestone was open belongs OUTSIDE
+      // that milestone when the next word breaks the run.
+      closeMilestone(f);
     }
-    flushPendingOutside();
+    flushPendingOutside(f);
     if (next !== null) {
       const group = groupById.get(next);
       if (!group) {
-        // Word references a group that no longer exists — fall back to
-        // emitting it as bare to avoid losing the text.
-        out.push(wordNode(item.word));
-        current = null;
-        openChildren = null;
+        // Word references a group that no longer exists — fall back
+        // to emitting it as bare to avoid losing the text.
+        f.out.push(wordNode(item.word));
+        f.current = null;
+        f.openChildren = null;
         continue;
       }
-      current = next;
-      openChildren = [wordNode(item.word)];
+      f.current = next;
+      f.openChildren = [wordNode(item.word)];
     } else {
-      out.push(wordNode(item.word));
-      current = null;
-      openChildren = null;
+      f.out.push(wordNode(item.word));
+      f.current = null;
+      f.openChildren = null;
     }
   }
-  if (current !== null) closeMilestone();
-  flushPendingOutside();
 
-  out.push(...state.passthroughTail);
-  return out;
+  // Flush any open milestone / pending text at the verse-level frame.
+  // openMarker/closeMarker pairs are required to be balanced; if a
+  // closeMarker is missing the unfinished wrapper's contents stay in
+  // the popped frame's output array and would be lost. We don't
+  // expect unbalanced streams from `walk`, but guard by collapsing
+  // any leftover frames into the verse frame.
+  while (frames.length > 1) {
+    const f = top();
+    if (f.current !== null) closeMilestone(f);
+    flushPendingOutside(f);
+    const finished = frames.pop()!;
+    const parent = top();
+    const wrapper = finished.wrapper ?? null;
+    if (wrapper) {
+      parent.out.push({ ...wrapper, children: finished.out });
+    } else {
+      parent.out.push(...finished.out);
+    }
+  }
+  const verse = top();
+  if (verse.current !== null) closeMilestone(verse);
+  flushPendingOutside(verse);
+
+  return verse.out;
 }
 
+// Compute the plain text of an alignment state by serializing back to
+// verseObjects and running the shared `extractPlainText`. Using the
+// shared extractor keeps the save path byte-equal with the importer
+// (api/src/importParsers.ts → extractPlainText), so Selah and other
+// non-zaln content survive Save → reload without `plain_text` drift.
 export function alignmentPlainText(state: AlignmentState): string {
-  const parts: string[] = [];
-  for (const item of state.stream) {
-    if (item.kind === "text") parts.push(item.text);
-    else parts.push(item.word.text);
-  }
-  return parts.join("").replace(/\s+/g, " ").trim();
+  return extractPlainText(serializeAlignment(state));
 }
 
 // Clear every alignment in the verse — all stream words become unaligned,
