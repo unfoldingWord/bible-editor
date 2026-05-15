@@ -13,11 +13,25 @@ the verse. Selah, footnotes, mid-verse paragraph markers, and any other
 character style are all affected.
 
 This doc:
-1. Pins the exact bugs with verbatim traces.
-2. Anchors them to the USFM 3 spec and what other tools do.
-3. Proposes a minimal change to the internal model that fixes them
-   without changing on-disk USFM or breaking the existing alignment
-   round-trip for non-Selah verses.
+1. Pins the exact bugs with verbatim traces (§1).
+2. Anchors them to the USFM 3 spec and what other tools do (§2).
+3. Documents the production unfoldingWord ULT/UST encoding for the
+   markers in question, end-to-end (§3).
+4. Proposes a minimal change to the internal model that fixes the
+   bugs without changing on-disk USFM or breaking the existing
+   alignment round-trip for non-Selah verses (§4), then phases the
+   work and the tests (§5–§8).
+5. **Evaluates Proskomma + the wider Open Components Ecosystem (OCE)
+   as a possible larger refactor (§9), since the user raised it as
+   not out of bounds.** TL;DR of §9: the active OCE work has moved
+   (Pankosmia / Pithekos under `mvahowe`, plus
+   `eten-tech-foundation/scripture-editors`), but no Proskomma-native
+   alignment editor exists in any of those repos today; every
+   alignment editor in the ecosystem still falls back to
+   `word-aligner-rcl` via a PERF↔verseObjects adapter. Recommendation
+   stands: ship the §4 local fix now, run a 1-day Proskomma spike in
+   parallel, re-evaluate in 6 months if/when an alignment surface
+   ships in `pankosmia/uw-client-checks` or `scripture-editors`.
 
 Status: spec — no code changes yet.
 
@@ -535,129 +549,279 @@ miss — Selah today, an unrelated marker tomorrow.
 
 ---
 
-## 9. Addendum — Proskomma as the round-trip layer
+## 9. Proskomma and the wider Open Components Ecosystem (OCE)
 
-User's call (2026-05-15): "I believe Proskomma is the premier USFM
-handler right now. Refactoring to full Proskomma should not be
-considered out of bounds if it's the best fix."
+User's framing (2026-05-15): Proskomma is the premier USFM handler;
+refactoring to full Proskomma should not be considered out of bounds.
+Then, after a first pass that looked stale: "chase down OCE, that's
+the Bible Open Components Ecosystem. Proskomma may have migrated.
+There's a new Lumina project or tCore 4 it might being integrated
+into. Mark Howe is the dev."
 
-This addendum compares (a) the local fix proposed in §4, and (b) a
-Proskomma migration. Both are real options.
+That instinct was right. The Proskomma ecosystem did NOT stall — it
+forked into three parallel active streams under names that don't
+carry the legacy `proskomma-*` prefix. This section locates the
+active work, asks whether it solves our problem better than the §4
+local fix, and lands a recommendation.
 
-### 9.1 What Proskomma buys us
+### 9.1 Where active OCE work actually lives
 
-- **Scope/graft model** — not a tree. Scopes (`span/qs`, milestone
-  scopes with `attribute/...` children, paragraph scopes) open and
-  close around token positions; overlapping is native. The "qs
-  opens, zaln opens, qs* closes first" cross-nesting case is
-  representable. The `passthroughTail` concept doesn't exist; every
-  marker lives at its actual position.
-- **PERF JSON** as the on-disk format. Proskomma's "Performance
-  Representation Format" is a canonical, stable token stream. The
-  `uw-editor` PERF editor and a growing set of unfoldingWord tools
-  speak it. Storing PERF in D1 instead of usfm-js verseObjects would
-  align us with the wider ecosystem — and PERF→USFM round-trip is
-  more thoroughly tested than usfm-js's verseObjects round-trip.
-- **A real parser**. Single phrase stack vs proper scope machine.
-  Issues like usfm-js #98 / #103 don't exist in Proskomma because the
-  data shape doesn't force them.
-- **Future fit**. unfoldingWord's `uw-editor`, BibleNLP tooling, and
-  the Mast / proskomma-render / scripture-burrito stack all sit on
-  Proskomma. If we want to plug into any of that later (auto-suggest,
-  cross-language alignment learning, etc.), we're already there.
+| Project | What it is | Last push (2026-05) | Stack | URLs |
+|---|---|---|---|---|
+| **Pankosmia / Pithekos** | Mark Howe's new ecosystem. 43 repos. Successor to oce-editor-tools. | **2026-05-14** | Electronite + Rust localhost HTTP server + React/MUI clients. Scripture Burrito + Proskomma under the hood. | https://pankosmia.dev/ · https://github.com/pankosmia · `pankosmia-rcl@0.1.46` (2026-05-05) · `pithekos-lib@0.11.20` |
+| **eten-tech-foundation / scripture-editors** | Lexical-based monorepo. Browser-friendly. PERF data shape. | **2026-05-15** (today) | TypeScript 97%, React, Lexical. `platform-editor` on npm. | https://github.com/eten-tech-foundation/scripture-editors |
+| **eten-tech-foundation / fluent-web** | Vite/React/Auth0 translation app. Right architecture for our stack, no USFM/alignment surface yet. | **2026-05-13** | Vite + React 18 + TanStack Router. | https://github.com/eten-tech-foundation/fluent-web · app.fluent.bible |
+| **Proskomma / proskomma-core** | The engine. Still alive — npm releases healthy. No GitHub release tags. | **2025-12-01** (npm 0.11.3) | JS, GraphQL runtime, succinct binary internal format. | https://github.com/Proskomma/proskomma-core |
+| **unfoldingWord / oce-editor-tools** | Still active (346 commits); explicitly NOT an alignment editor. | 2024-07 (stale) | mui-core / mui-pk / mui-simple text editors on Proskomma. | https://github.com/unfoldingWord/oce-editor-tools |
+| **bible-technology / scribe-scripture-editor** | Bridgeconn's separate "Scribe" — Electron + React + Tailwind. v1.1.0 released Nov 2025. | 2026-03-03 | Electron-only target. | https://github.com/bible-technology/scribe-scripture-editor |
+| **unfoldingWord-dev / word-aligner-rcl** | THE alignment dialog component. Still the only ready-to-drop alignment UI in the ecosystem. NOT Proskomma-native. | active (npm 1.3.6) | React + verseObjects (usfm-js shape). | https://github.com/unfoldingWord-dev/word-aligner-rcl |
 
-### 9.2 What it costs
+Things the user mentioned that we could NOT confirm exist:
 
-- **Bundle size and load time.** `proskomma-core` is ~1–2 MB
-  unminified including the parser. It's tractable in the browser
-  (uw-editor ships it), but it's noticeably heavier than usfm-js
-  (~120 KB).
-- **Workers/D1 fit.** Cloudflare Workers' code-size and CPU-time
-  limits are tight. Running Proskomma server-side in the import path
-  (`api/src/importParsers.ts` / `pipelineImport.ts`) is feasible but
-  needs a load test; if Proskomma's parse-and-query cycle blows the
-  50 ms cumulative-CPU budget on a 100-verse chapter, we need a
-  chunked or off-Worker import path. Verify with a spike before
-  committing.
-- **Data shape change.** D1 currently stores per-verse usfm-js JSON
-  in `verses.content_json`. PERF is structurally different (token
-  stream + scope deltas, not a verseObject tree). Two viable paths:
-  - **Replace.** Store PERF in `content_json`; rewrite the export
-    pipeline to emit USFM from PERF; rewrite the alignment dialog
-    against PERF tokens / scopes.
-  - **Layer.** Keep usfm-js verseObjects on disk, use Proskomma only
-    inside the alignment path (parse USFM with Proskomma, serialize
-    with Proskomma, persist via the existing schema). Smaller blast
-    radius; doesn't get the full ecosystem-fit benefit.
-- **Aligner UI rewrite.** Our alignment dialog
-  (web/src/components/AlignmentDialog.tsx, 1174 LOC) is built around
-  the `AlignmentState.stream` model. A PERF-native dialog operates on
-  alignment-attribute scopes — different data shape, similar UI
-  affordances. Probably a real rewrite of ~600–800 LOC of dialog code,
-  not a refactor. The UI shell (verse strip, unaligned bag, source
-  chips, lexicon tooltips) is reusable.
-- **Removing `\zaln`-specific code.** withSourceCoverage,
-  AlignmentGroup, sourceShowsOccurrence, etc. all assume the usfm-js
-  shape. Most of `lib/alignment.ts`, `lib/replace.ts`, and the dialog's
-  display-layer helpers (sourceKey, stripCompoundOverlaps,
-  mergeAdjacentSameSource, buildSourceIndexMap) need rewrites against
-  PERF.
+- **"Lumina"** — zero hits for a Lumina Bible *editor* across npm and
+  the relevant GitHub orgs (`pankosmia`, `unfoldingWord`,
+  `BiblioNexus-Foundation`, `eten-tech-foundation`, `Bible-Open-Components`,
+  `mvahowe`). Only result is bible.org's NET Bible study tool,
+  unrelated. Best inference: this name refers internally to Pankosmia
+  or to Fluent, or it's pre-release / unannounced. If you have a URL,
+  share it and we'll re-evaluate.
+- **"tCore 4"** — no public repo under that name. Closest match is
+  `pankosmia/core-contenthandler_t_core` (note `t_core`, pushed
+  2026-05-14) — a "translationCore-style" content-handler client
+  inside Pankosmia's plugin model. Functionally the successor concept
+  to tCore v3, but it doesn't ship as "tCore 4".
 
-### 9.3 Recommendation
+### 9.2 What Proskomma actually represents
 
-**Ship Phase A–D first (local fix). Spike Proskomma in parallel.**
+For the record, since this is the load-bearing question: a
+fully-aligned word in Proskomma is a sequence of three things in the
+token stream — a `start_milestone`, a `wrapper`, and an `end_milestone`.
+PERF representation (verbatim from
+`Proskomma/proskomma-json-tools/test/test_data/perfs/titus_aligned_eng.json`):
 
-Reasons:
+```jsonc
+{ "type": "start_milestone", "subtype": "usfm:zaln",
+  "atts": { "x-strong": "G2064", "x-lemma": "ἔρχομαι",
+            "x-morph": "Gr,V,IAA3,P", "x-occurrence": "1",
+            "x-occurrences": "1", "x-content": "ἦλθεν" } }
+{ "type": "wrapper", "subtype": "usfm:w",
+  "content": ["he came"] }
+{ "type": "end_milestone", "subtype": "usfm:zaln" }
+```
 
-1. The user-reported Selah bug, the plain-text-desync bug, and the
-   yellow-dot false positive are all live data-quality issues today.
-   Phase A is ~60 LOC + tests and ships them this week.
-2. Phase D (Psalm-title UI) is wanted in the same PR — we need
-   alignment.ts to work for `\d`-bearing verses regardless of which
-   parser backs them.
-3. Proskomma migration is a 2–4 week project (parse/query spike,
-   bundle audit, PERF schema migration, dialog rewrite, regression
-   suite). Worth doing, but not on the critical path for a hot bug.
-4. The fix in §4 is forward-compatible with a later Proskomma
-   migration: the StreamItem model is purely internal; nothing
-   persists that shape. Replacing the parser/serializer pair under
-   the dialog later is straightforward as long as we keep
-   AlignmentState as the dialog's contract.
+Internally Proskomma stores this as scope strings on token positions:
 
-Proskomma spike scope (parallel work, not blocking this PR):
+```
+attribute/milestone/zaln/x-strong/0/G2064
+attribute/milestone/zaln/x-lemma/0/ἔρχομαι
+attribute/milestone/zaln/x-morph/0/Gr,V,IAA3,P
+attribute/milestone/zaln/x-content/0/ἦλθεν
+```
 
-- Verify Proskomma parses production ULT Psa and surfaces the Selah
-  zaln + qs interleaving correctly.
-- Measure import-path CPU time on a 50-chapter book under the Worker
-  CPU budget.
-- Sketch the PERF → D1 storage shape and the migration path from the
-  existing usfm-js JSON.
-- Build a PERF-native alignment dialog prototype against a single
-  Selah-bearing verse; A/B it against the §4 fix.
+Scopes can overlap freely, so `\qs` (a `span/qs` scope) wrapping a
+`\zaln-s` (a milestone scope) is representable without any LIFO
+constraint. PERF is positioned as the "editor-ready" working format;
+raw USFM is the import/export face.
 
-Decide go/no-go on full migration after the spike. If green, the §4
-fix is throwaway code but the audit and the tests stay; the tests
-re-target Proskomma's round-trip with the same fixtures.
+Source for scope strings: `Proskomma/proskomma-core/test/code/main/token_alignment.cjs`.
 
-If you'd rather skip the local fix and go straight to Proskomma, the
-spike scope above becomes the actual work, the user-reported bug
-stays live for another 2–4 weeks, and we ship one larger PR instead
-of two staged ones.
+### 9.3 The alignment-UI gap
 
-### 9.4 Sources
+The critical finding for our stack: **no Proskomma-native word-alignment
+editor exists anywhere in this ecosystem today.** Every editor that
+needs drag-and-drop alignment falls back to `word-aligner-rcl` via a
+PERF ↔ verseObjects adapter. Concretely:
 
-- Proskomma core: https://github.com/Proskomma/proskomma-core
-- Proskomma docs: https://doc.proskomma.bible/
-- PERF spec: https://github.com/proskomma/proskomma-docs/tree/main/source/perf
-- uw-editor (PERF editor on Proskomma):
-  https://github.com/unfoldingWord/uw-editor
-- Scripture Burrito (PERF-compatible scripture metadata):
-  https://github.com/bible-technology/scripture-burrito
-- Mast (Proskomma-based markdown→USFM): https://github.com/Proskomma/mast
+- **Pankosmia** has `uw-client-checks` (unfoldingWord checks, pushed
+  2026-05-13), but no documented `\zaln-s` editing surface yet. The
+  README focuses on the platform shell, not alignment.
+- **scripture-editors** (`platform-editor`, `scribe-editor`) is
+  Lexical-based and PERF-shaped, but its docs do not describe a
+  word-level alignment dialog. It's a paragraph/text editor that
+  preserves PERF round-trips, not an aligner.
+- **oce-editor-tools** explicitly does not document alignment as a
+  capability.
+- **bible-technology/scribe-scripture-editor** is Electron-only,
+  doesn't target our deployment shape.
+
+So even if we adopt Proskomma server-side and store PERF (or USFM)
+in D1, **the alignment dialog itself is still our own ~1100 LOC of
+React in `web/src/components/AlignmentDialog.tsx` plus the ~650 LOC
+in `web/src/lib/alignment.ts`** — unless we glue in word-aligner-rcl,
+which has its own bundler / core-js v2-vs-v3 problems
+(`web/src/spikes/AlignerSmoke.tsx`) and operates on `verseObjects`
+rather than PERF. Either way, we own the alignment UI.
+
+### 9.4 Three migration shapes
+
+**Option A — Local fix (§4 of this doc).**
+- Scope: walker / serializer / alignmentPlainText / withSourceCoverage
+  / replace.ts / `\d` Psalm-title UI.
+- LOC: ~60 in alignment.ts, similar in replace.ts, plus dialog
+  rendering for verse 0. Tests: 6 new.
+- Effort: ~3–5 days end-to-end.
+- Risk: well-bounded, all behaviour observable in browser + tests.
+- Forward-compat: the StreamItem model never persists; switching
+  parsers later is just swapping the `parseAlignment` / `serializeAlignment`
+  implementations.
+
+**Option B — Proskomma as a layer (no schema change).**
+- Scope: replace `usfm-js` calls in `api/src/importParsers.ts` and
+  `api/src/pipelineImport.ts` with Proskomma-based parsers; keep
+  storing `verseObjects`-shaped JSON in D1 by re-deriving it from
+  PERF on import; alignment dialog continues to consume `verseObjects`.
+- LOC: import path swap ~100, plus a PERF→verseObjects adapter shim
+  (which Pankosmia's clients do, so the pattern is known but
+  unmaintained as a standalone library).
+- Effort: ~2 weeks. Includes a Workers compatibility spike (§9.5).
+- Risk: medium. Proskomma's own docs concede "USFM is unlikely to
+  be fully roundtripable"
+  (https://github.com/Proskomma/proskomma-docs `source/background/challenges.rst`),
+  i.e. we'd be migrating to a parser that admits the same family of
+  round-trip bugs we have today, with weaker downstream test coverage.
+  PERF→verseObjects derivation introduces a second translation step
+  where alignment fidelity can drop.
+- **Selah benefit: zero.** The bug is in OUR walker, not in usfm-js.
+  Proskomma parses Selah-in-qs correctly; so does usfm-js. The
+  layer-only migration doesn't solve the user-reported bug — we'd
+  still need §4's walker changes.
+
+**Option C — Full Proskomma migration (PERF in D1, dialog rewrite).**
+- Scope: store PERF (versioned schema `0_4_0` today) in
+  `verses.content_json`; rewrite the alignment dialog to operate on
+  PERF tokens + scopes; rewrite all of `web/src/lib/alignment.ts`,
+  `web/src/lib/replace.ts`, and helper paths in the dialog;
+  PERF↔USFM round-trip for export; D1 migration for existing rows.
+- LOC: large. AlignmentDialog (1174) + alignment.ts (651) + replace.ts
+  (470) + parts of Shell.tsx, ScriptureColumn.tsx, DocColumn.tsx,
+  exportWorkflow.ts. Realistic estimate: 1500–2500 LOC churn.
+- Effort: 4–8 weeks if we're being honest, including PERF schema
+  versioning policy (PERF moved 0.2.1 → 0.3.0 → 0.4.0, so we need a
+  pinning strategy) and the migration path for existing D1 rows.
+- Risk: high.
+  - Bundle: `proskomma-core@0.11.3` is 3.35 MB unpacked, pulls in
+    `graphql@16` + `@graphql-tools/schema@9` + `fs-extra` (Node-only)
+    + `sax` + `bitset` + polyfills. Even with Workers' `nodejs_compat`
+    flag, the compressed Worker bundle is plausibly over the 3 MB
+    Paid-plan limit; Free is out.
+  - CPU: no published benchmarks. The Worker CPU budget (50 ms Free
+    / 30 s Paid) for a chapter-sized parse is unknown. Spike required.
+  - Bus factor: `proskomma-core` has one primary maintainer (Mark
+    Howe / `mvahowe`); zero GitHub releases tagged; npm versions
+    still 0.x. Active, not battle-hardened.
+  - PERF lock-in: schema is Proskomma-specific and versioned. USJ
+    (Unified Scripture JSON — https://github.com/usfm-bible/tcdocs) is
+    the standards-track alternative the USFM Technical Committee is
+    adopting. If we're going to leave usfm-js, **USJ may be a better
+    long-term storage target than PERF** — though USJ support in the
+    ecosystem is still nascent (Proskomma added USJ input/output in
+    Sept 2025).
+
+### 9.5 What Proskomma migration would NOT solve
+
+- **Selah-as-alignable UX decision.** Proskomma faithfully parses
+  `\qs` around `\zaln-s`, but `word-aligner-rcl` (the only off-the-shelf
+  alignment UI) excludes `\qs`-content from the alignable target set
+  anyway. We still own this decision; it's a UI question, not a
+  parser question.
+- **plain_text desync on save (Bug 3).** One-liner regardless of parser.
+- **Psalm-title import (Bug 5).** Verse-key filter on the importer
+  side; parser-agnostic.
+- **Daily DCS round-trip safety net (§8).** Independent.
+
+### 9.6 Cloudflare Workers fit (the deciding constraint)
+
+Our `api/` is a Cloudflare Worker. The import path runs there.
+Pankosmia is explicitly "radically offline-first" with an Electronite
+shell + Rust localhost server — anti-edge. Proskomma's own JS
+implementation pulls Node-only deps (`fs-extra`, `buffer`, `stream`)
+and weighs in at 3.35 MB unpacked. There's no public evidence of
+anyone running Proskomma on Cloudflare Workers, AWS Lambda@Edge, or
+similar. All shipped Proskomma deployments are Node servers
+(Pankosmia: Rust localhost) or browsers.
+
+Two ways out:
+- **Move the import path off Workers** (Durable Object with high CPU
+  limits, or a separate Node service). Architecturally larger than
+  the alignment fix.
+- **Run Proskomma only in the browser, not in the Worker.** Doable
+  for the dialog, but the import path (`pipelineImport.ts`,
+  `importParsers.ts`) still needs a USFM parser server-side, and
+  doing import in the browser is worse for big books.
+
+### 9.7 Recommendation
+
+**Ship Phases A–D (local fix). Don't migrate now. Subscribe to the
+active OCE work and re-evaluate in 6 months.**
+
+Reasoning:
+
+1. The §4 local fix is bounded (~3–5 days), tested against the
+   existing round-trip spike, fixes every confirmed bug, and is
+   forward-compatible with any future parser migration.
+2. No off-the-shelf Proskomma-based alignment editor exists today.
+   Migrating to Proskomma would mean inheriting `word-aligner-rcl`
+   anyway (with its bundler problems) or building our own
+   PERF-native dialog from scratch — a much bigger project than this
+   bug warrants.
+3. The Workers + edge architecture choice makes Proskomma awkward;
+   Pankosmia / Fluent / scripture-editors haven't crossed the
+   alignment-editor finish line in a form we can plug in.
+4. Proskomma is single-maintainer, no GitHub releases, npm still
+   0.x; usfm-js (the devil we know) is at least at 3.x.
+5. **Forward indicator to watch:** if either Pankosmia's
+   `uw-client-checks` adds an alignment surface, OR `scripture-editors`
+   ships a `\zaln-s` editor on PERF/Lexical, OR USJ tooling matures,
+   we should re-open this evaluation. None of those is imminent.
+
+**Concrete actions (parallel to Phase A–D):**
+
+- **Capped 1-day Proskomma spike.** Load production ULT Psa 3 (Selah
+  shape) into `proskomma-core@0.11.3` in a Node REPL. Dump PERF.
+  Round-trip to USFM. Measure cold-parse time and peak heap for a
+  Psalms-sized book. Confirm or refute "Proskomma round-trips Selah
+  losslessly." Update this doc with the result. This closes the
+  evidence gap and gives us a baseline if/when we revisit.
+- **Wire `spikes/usfm-roundtrip.mjs` (or its successor) into the
+  daily DCS export.** Independent of parser choice; this is the
+  marker-drift safety net that catches the next surprise.
+- **Subscribe (issue notifications) to:**
+  `Proskomma/proskomma-core`, `pankosmia/uw-client-checks`,
+  `eten-tech-foundation/scripture-editors`, `unfoldingWord-dev/word-aligner-rcl`,
+  `usfm-bible/tcdocs` (USJ).
+
+### 9.8 Sources
+
+- https://pankosmia.dev/
+- https://github.com/pankosmia
+- https://github.com/pankosmia/pankosmia-web
+- https://crates.io/crates/pankosmia_web
+- https://github.com/pankosmia/core-contenthandler_t_core (the "tCore 4" successor concept)
+- https://github.com/pankosmia/uw-client-checks
+- https://www.npmjs.com/package/pithekos-lib (0.11.20, 2025-10-27)
+- https://www.npmjs.com/package/pankosmia-rcl (0.1.46, 2026-05-05)
+- https://www.npmjs.com/package/proskomma-core (0.11.3, 2025-12-01)
+- https://github.com/Proskomma/proskomma-core
+- https://github.com/Proskomma/proskomma-core/blob/main/test/code/main/token_alignment.cjs
+- https://github.com/Proskomma/proskomma-json-tools
+- https://github.com/Proskomma/proskomma-json-tools/blob/main/test/test_data/perfs/titus_aligned_eng.json
+- https://github.com/Proskomma/proskomma-docs/blob/main/source/background/challenges.rst (Proskomma's own round-trip caveats)
+- https://github.com/eten-tech-foundation/scripture-editors
+- https://github.com/eten-tech-foundation/scribe
+- https://github.com/eten-tech-foundation/fluent-web
+- https://github.com/bible-technology/scribe-scripture-editor
+- https://github.com/BiblioNexus-Foundation/scripture-editors
+- https://github.com/unfoldingWord/oce-editor-tools (still active text editing; not alignment)
+- https://github.com/unfoldingWord-dev/word-aligner-rcl (the ecosystem's only alignment dialog component)
+- https://github.com/usfm-bible/tcdocs (USJ standards track)
+- https://github.com/genesis-ai-dev/codex-editor (adjacent VS Code editor; not Proskomma)
+- https://mvh.bible/ (Mark Howe consultancy)
+- https://xenizo.fr/ (Howe's French consultancy)
+- https://etenlab.substack.com/p/oce-hackathon-2025-tech-and-testament (OCE Hackathon 2025 — surveyed second-hand; direct fetch blocked)
 
 ---
 
-## 8. Evidence / sources
+## 10. Evidence / sources
 
 Live traces on the running sandbox:
 
