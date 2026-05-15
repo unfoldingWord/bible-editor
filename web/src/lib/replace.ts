@@ -445,7 +445,13 @@ function localizedRewriteVerse(
       if (before) out.push({ type: "text", text: before });
       emitChange();
       if (after) out.push({ type: "text", text: after });
-    } else if (o["type"] === "milestone") {
+    } else if (Array.isArray(o["children"]) && (o["children"] as unknown[]).length > 0) {
+      // Milestone (\zaln) or content wrapper (\qs around \zaln, etc.).
+      // Partition children by their raw-text position relative to the
+      // change range; children that fall entirely outside survive,
+      // overlapping children are dropped (their text gets re-emitted by
+      // tokenizePlainText). Wrapper attributes are preserved on each
+      // surviving half.
       const { before, after } = partitionMilestoneChildren(o, nodeStart, rawStart, rawEnd);
       if (before.length > 0) {
         out.push({ ...o, children: before });
@@ -454,8 +460,30 @@ function localizedRewriteVerse(
       if (after.length > 0) {
         out.push({ ...o, children: after });
       }
+    } else if (o["type"] === "word" && o["tag"] === "w") {
+      // Bare \w at top level overlapping the change — re-tokenized
+      // inside the change region.
+      emitChange();
+    } else if (typeof o["text"] === "string" && (o["text"] as string).length > 0) {
+      // Single-text marker (`\q1 hello`, bare `\qs Selah\qs*` without
+      // alignment children). If the change fully covers the marker's
+      // text, drop the marker — the user is editing through it.
+      // Otherwise preserve verbatim; splitting the marker's text into
+      // two adjacent copies (`\qs Se\qs*` + `\qs lah\qs*`) would corrupt
+      // the structure.
+      if (rawStart <= nodeStart && rawEnd >= nodeEnd) {
+        emitChange();
+      } else {
+        out.push(node);
+        emitChange();
+      }
     } else {
-      // Bare \w at top level overlapping the change — drop.
+      // Structural marker with no raw text and no children (\b, \f
+      // with `content` only, \ts*, empty \q1, \p). Position-anchor
+      // only — preserve verbatim regardless of overlap. A long edit
+      // that brackets a footnote should leave the footnote in place,
+      // not silently delete it.
+      out.push(node);
       emitChange();
     }
   }

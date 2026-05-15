@@ -31,11 +31,16 @@ import { extractPlainText } from "./usfm.ts";
 export interface SourceWord {
   id: string;
   strong: string;
-  lemma: string;
-  morph: string;
+  // `undefined` means the original USFM had no `x-lemma`/`x-morph`/
+  // `x-content` attribute; the empty string means the attribute was
+  // present with an empty value (legitimate for clitic prepositions,
+  // e.g. OBA's `\zaln-s |x-strong="l" x-lemma=""...`). Preserving the
+  // distinction is required for byte-clean DCS round-trips.
+  lemma?: string;
+  morph?: string;
   occurrence: string;
   occurrences: string;
-  content: string;
+  content?: string;
 }
 
 export interface TargetWord {
@@ -154,15 +159,16 @@ function cloneNodeOpaque(n: ParsedNode): ParsedNode {
 }
 
 function sourceOf(node: ParsedNode): SourceWord {
-  return {
+  const out: SourceWord = {
     id: uid(),
     strong: String(node["strong"] ?? ""),
-    lemma: String(node["lemma"] ?? ""),
-    morph: String(node["morph"] ?? ""),
     occurrence: String(node["occurrence"] ?? "1"),
     occurrences: String(node["occurrences"] ?? "1"),
-    content: String(node["content"] ?? ""),
   };
+  if (node["lemma"] !== undefined) out.lemma = String(node["lemma"]);
+  if (node["morph"] !== undefined) out.morph = String(node["morph"]);
+  if (node["content"] !== undefined) out.content = String(node["content"]);
+  return out;
 }
 
 function targetOf(node: ParsedNode): TargetWord {
@@ -189,7 +195,7 @@ function sameSourceChain(a: SourceWord[], b: SourceWord[]): boolean {
   for (let i = 0; i < a.length; i++) {
     if (a[i].strong !== b[i].strong) return false;
     if (a[i].occurrence !== b[i].occurrence) return false;
-    if (nfc(a[i].content) !== nfc(b[i].content)) return false;
+    if (nfc(a[i].content ?? "") !== nfc(b[i].content ?? "")) return false;
   }
   return true;
 }
@@ -426,18 +432,22 @@ function withSourceCoverage(
 }
 
 function buildMilestone(source: SourceWord, children: ParsedNode[]): ParsedNode {
-  return {
-    tag: "zaln",
-    type: "milestone",
-    strong: source.strong,
-    lemma: source.lemma,
-    morph: source.morph,
-    occurrence: source.occurrence,
-    occurrences: source.occurrences,
-    content: source.content,
-    children,
-    endTag: "zaln-e\\*",
-  };
+  // Emit attributes that were present in the original (including
+  // legitimate `x-lemma=""` for clitic prepositions like OBA's `l`,
+  // `b`, `m`). Skip attrs that were absent — usfm-js otherwise emits
+  // `x-foo=""` for any defined key, which would pollute the daily DCS
+  // export diff for any milestone synthesised from a partially-known
+  // SourceWord.
+  const out: ParsedNode = { tag: "zaln", type: "milestone" };
+  if (source.strong)               out["strong"] = source.strong;
+  if (source.lemma !== undefined)  out["lemma"] = source.lemma;
+  if (source.morph !== undefined)  out["morph"] = source.morph;
+  if (source.occurrence)           out["occurrence"] = source.occurrence;
+  if (source.occurrences)          out["occurrences"] = source.occurrences;
+  if (source.content !== undefined) out["content"] = source.content;
+  out["children"] = children;
+  out["endTag"] = "zaln-e\\*";
+  return out;
 }
 
 function buildNestedMilestone(chain: SourceWord[], children: ParsedNode[]): ParsedNode {

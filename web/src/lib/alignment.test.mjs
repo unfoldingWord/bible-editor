@@ -250,6 +250,108 @@ function roundtripVerseUsfm(rawUsfm, sourceVO = null) {
   assert(/\\d[\s\S]*\\zaln-s[\s\S]*A psalm of David[\s\S]*\\zaln-e\\\*[\s\S]*\\v 1/.test(reEmitted), "export places Psalm title above \\v 1 with alignment intact");
 }
 
+// ─── Case 8: Phase B — buildMilestone omits empty attributes ─────────────
+{
+  console.log("\n[Case 8] Phase B — empty zaln attributes are omitted on round-trip");
+  // Synthetic verse with only x-strong set. Phase B should emit a
+  // milestone without x-lemma="" / x-morph="" pollution.
+  const target = String.raw`\id PSA
+\c 3
+\v 99 \zaln-s |x-strong="H1697"\*\w Word|x-occurrence="1" x-occurrences="1"\w*\zaln-e\*
+`;
+  const rt = roundtripVerseUsfm(target);
+  assert(/x-strong="H1697"/.test(rt), "x-strong survives round-trip");
+  assert(!/x-lemma=""/.test(rt), "no empty x-lemma=\"\" pollution");
+  assert(!/x-morph=""/.test(rt), "no empty x-morph=\"\" pollution");
+  assert(!/x-content=""/.test(rt), "no empty x-content=\"\" pollution");
+}
+
+// ─── Case 9: Phase C — \qs and \f survive inline plain-text edits ────────
+{
+  console.log("\n[Case 9] Phase C — replace.ts preserves \\qs / \\f across overlap");
+  // Dynamic import so the test file is self-contained even if web/ is
+  // built / served separately.
+  const { smartEditVerse } = await import("./replace.ts");
+
+  // (a) Footnote outside the edit range stays put.
+  {
+    const target = String.raw`\v 1 \zaln-s |x-strong="H1697"\*\w Word|x-occurrence="1" x-occurrences="1"\w*\zaln-e\*\f + \ft note\f* \zaln-s |x-strong="H3068"\*\w of the LORD|x-occurrence="1" x-occurrences="1"\w*\zaln-e\*`;
+    const wrapped = `\\id TST\n\\c 1\n${target}\n`;
+    const json = usfm.toJSON(wrapped);
+    const verseObj = json.chapters["1"]["1"];
+    const content = { verseObjects: verseObj.verseObjects };
+    const oldPlain = "Word of the LORD";
+    const newPlain = "Wordy of the LORD"; // change to "Word" only
+    const result = smartEditVerse(content, oldPlain, newPlain);
+    const verseObjects = result.content.verseObjects;
+    const flatten = (vos) => {
+      const tags = [];
+      const walk = (xs) => {
+        for (const n of xs ?? []) {
+          if (n?.tag) tags.push(n.tag);
+          if (Array.isArray(n?.children)) walk(n.children);
+        }
+      };
+      walk(vos);
+      return tags;
+    };
+    const tags = flatten(verseObjects);
+    assert(tags.includes("f"), `\\f footnote survives edit to nearby word (tags=${tags.join(",")})`);
+  }
+
+  // (b) Editing OVER the footnote anchor (which has zero raw-text)
+  // still preserves the footnote.
+  {
+    const target = String.raw`\v 1 \zaln-s |x-strong="H7965"\*\w Peace|x-occurrence="1" x-occurrences="1"\w*\zaln-e\*\f + \ft note\f* world`;
+    const wrapped = `\\id TST\n\\c 1\n${target}\n`;
+    const json = usfm.toJSON(wrapped);
+    const verseObj = json.chapters["1"]["1"];
+    const content = { verseObjects: verseObj.verseObjects };
+    const oldPlain = "Peace world";
+    const newPlain = "Quiet world"; // change "Peace" only
+    const result = smartEditVerse(content, oldPlain, newPlain);
+    const flatten = (vos) => {
+      const tags = [];
+      const walk = (xs) => {
+        for (const n of xs ?? []) {
+          if (n?.tag) tags.push(n.tag);
+          if (Array.isArray(n?.children)) walk(n.children);
+        }
+      };
+      walk(vos);
+      return tags;
+    };
+    const tags = flatten(result.content.verseObjects);
+    assert(tags.includes("f"), `\\f survives edit to adjacent word (tags=${tags.join(",")})`);
+  }
+
+  // (c) \qs wrapping \zaln with alignment survives edit to nearby word.
+  {
+    const target = String.raw`\v 1 \zaln-s |x-strong="H3068"\*\w Praise|x-occurrence="1" x-occurrences="1"\w*\zaln-e\* \qs \zaln-s |x-strong="H5542"\*\w Selah|x-occurrence="1" x-occurrences="1"\w*\zaln-e\*\qs*`;
+    const wrapped = `\\id TST\n\\c 1\n${target}\n`;
+    const json = usfm.toJSON(wrapped);
+    const verseObj = json.chapters["1"]["1"];
+    const content = { verseObjects: verseObj.verseObjects };
+    const oldPlain = "Praise Selah";
+    const newPlain = "Praising Selah"; // edit "Praise" only
+    const result = smartEditVerse(content, oldPlain, newPlain);
+    const flatten = (vos) => {
+      const tags = [];
+      const walk = (xs) => {
+        for (const n of xs ?? []) {
+          if (n?.tag) tags.push(n.tag);
+          if (Array.isArray(n?.children)) walk(n.children);
+        }
+      };
+      walk(vos);
+      return tags;
+    };
+    const tags = flatten(result.content.verseObjects);
+    assert(tags.includes("qs"), `\\qs wrapper survives edit to adjacent aligned word (tags=${tags.join(",")})`);
+    assert(tags.filter((t) => t === "zaln").length >= 1, `at least one \\zaln milestone survives`);
+  }
+}
+
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed.`);
   process.exit(1);

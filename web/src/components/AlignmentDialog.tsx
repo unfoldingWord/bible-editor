@@ -187,7 +187,7 @@ export function AlignmentDialog({
     const sortKey = (g: (typeof state.groups)[number]) => {
       if (g.source.length === 0) return Number.MAX_SAFE_INTEGER;
       const s = g.source[0];
-      const c = nfc(s.content);
+      const c = nfc(s.content ?? "");
       const byText =
         sourceIndexMap.get(`t:${c}|${s.occurrence}`) ??
         sourceIndexMap.get(`t:${c}|1`);
@@ -707,7 +707,7 @@ function AlignmentGrid({
                   key={s.id}
                   source={s}
                   lex={lexiconMap.get(s.strong) ?? null}
-                  twHint={twHintFor(twlForVerse, verseNum, s.content)}
+                  twHint={twHintFor(twlForVerse, verseNum, s.content ?? "")}
                   canExtract={g.source.length > 1}
                   onExtract={() => onExtractSource(s.id)}
                 />
@@ -1055,13 +1055,13 @@ function stripCompoundOverlaps(groups: AlignmentGroup[]): AlignmentGroup[] {
   const standaloneContents = new Set<string>();
   for (const g of groups) {
     if (g.source.length === 1) {
-      standaloneContents.add(nfc(g.source[0].content));
+      standaloneContents.add(nfc(g.source[0].content ?? ""));
     }
   }
   if (standaloneContents.size === 0) return groups;
   return groups.map((g) => {
     if (g.source.length <= 1) return g;
-    const kept = g.source.filter((s) => !standaloneContents.has(nfc(s.content)));
+    const kept = g.source.filter((s) => !standaloneContents.has(nfc(s.content ?? "")));
     if (kept.length === g.source.length || kept.length === 0) return g;
     return { ...g, source: kept };
   });
