@@ -586,66 +586,67 @@ export function NoteCard({
         )}
       </Stack>
 
-      {/* ── Quote (pull-quote with accent rule) ── */}
-      <Box sx={{ px: 2, pt: 1.25, pb: 0.5 }}>
-        <Box
-          dir={quoteScript === "rtl" ? "rtl" : "ltr"}
+      {/* ── Quote ── */}
+      <Box sx={{ px: 1.5, pt: 0.75, pb: 0.5 }}>
+        <Typography
+          variant="caption"
           sx={{
-            borderInlineStart: "3px solid",
-            borderColor: "primary.main",
-            pl: 1.5,
-            display: "flex",
-            alignItems: "flex-start",
-            gap: 0.5,
+            display: "block",
+            mb: 0.5,
+            fontFamily: "monospace",
+            color: "text.secondary",
+            textTransform: "uppercase",
+            fontSize: 10.5,
+            fontWeight: 600,
+            letterSpacing: "0.12em",
           }}
         >
-          <TextField
-            value={quote}
-            onChange={(e) => {
-              setQuote(e.target.value);
-              stashEdit({ quote: e.target.value });
-            }}
-            multiline
-            fullWidth
-            variant="standard"
-            spellCheck={false}
-            onFocus={onFocus}
-            InputProps={{
-              readOnly,
-              disableUnderline: true,
-              ...(showTranslateIcon && {
-                endAdornment: (
-                  <InputAdornment position="end" sx={{ alignSelf: "flex-start", mt: 0.5 }}>
-                    <Tooltip title="translate to Hebrew/Greek using ULT alignment">
-                      <IconButton
-                        size="small"
-                        onClick={handleTranslateQuote}
-                        sx={{ p: 0.25, color: "primary.main" }}
-                      >
-                        <TranslateIcon fontSize="small" />
-                      </IconButton>
-                    </Tooltip>
-                  </InputAdornment>
-                ),
-              }),
-            }}
-            inputProps={{
-              dir: quoteScript === "ltr" ? "ltr" : "rtl",
-              style: {
-                fontFamily: '"Times New Roman","SBL Hebrew","Cardo",serif',
-                fontSize: quoteScript === "rtl" ? 20 : 19,
-                textAlign: quoteScript === "ltr" ? "left" : "right",
-                lineHeight: quoteScript === "rtl" ? 1.9 : 1.5,
-                padding: 0,
-              },
-            }}
-          />
-        </Box>
+          Quote
+        </Typography>
+        <TextField
+          value={quote}
+          onChange={(e) => {
+            setQuote(e.target.value);
+            stashEdit({ quote: e.target.value });
+          }}
+          multiline
+          fullWidth
+          size="small"
+          spellCheck={false}
+          onFocus={onFocus}
+          InputProps={{
+            readOnly,
+            ...(showTranslateIcon && {
+              endAdornment: (
+                <InputAdornment position="end" sx={{ alignSelf: "flex-start" }}>
+                  <Tooltip title="translate to Hebrew/Greek using ULT alignment">
+                    <IconButton
+                      size="small"
+                      onClick={handleTranslateQuote}
+                      sx={{ p: 0.25, color: "primary.main" }}
+                    >
+                      <TranslateIcon fontSize="small" />
+                    </IconButton>
+                  </Tooltip>
+                </InputAdornment>
+              ),
+            }),
+          }}
+          inputProps={{
+            dir: quoteScript === "ltr" ? "ltr" : "rtl",
+            style: {
+              fontFamily: '"Times New Roman","SBL Hebrew","Cardo",serif',
+              fontSize: quoteScript === "rtl" ? 20 : 19,
+              textAlign: quoteScript === "ltr" ? "left" : "right",
+              lineHeight: quoteScript === "rtl" ? 1.9 : 1.5,
+            },
+          }}
+        />
       </Box>
 
       {/* ── Note (hero) ── */}
-      <Box sx={{ px: 2, pt: 1.5, pb: 1 }}>
-        <Stack direction="row" alignItems="center" sx={{ mb: 0.75 }}>
+      <Box sx={{ px: 1.5, pt: 0.75, pb: 0.75 }}>
+        <Stack direction="row" alignItems="center" sx={{ mb: 0.5 }}>
           <Typography
             variant="caption"
             sx={{
@@ -702,16 +703,15 @@ export function NoteCard({
           multiline
           fullWidth
           minRows={2}
-          variant="standard"
+          size="small"
           spellCheck
           onFocus={onFocus}
-          InputProps={{ readOnly, disableUnderline: true }}
+          InputProps={{ readOnly }}
           inputProps={{
             style: {
               fontSize: 13,
               lineHeight: 1.55,
               fontFamily: '"Source Serif Pro","Cambria","Times New Roman",serif',
-              padding: 0,
             },
           }}
         />
