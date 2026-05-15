@@ -3,6 +3,7 @@ import { Box, Stack, Typography, IconButton, Tooltip } from "@mui/material";
 import LinkIcon from "@mui/icons-material/Link";
 import type { VerseDto } from "../sync/api";
 import { highlightsFor, renderHighlightedHTML, type HighlightKey } from "../lib/highlight";
+import { markHighlightSx } from "../lib/highlightStyles";
 import { HebrewLine } from "./HebrewLine";
 import type { LexiconEntry } from "../hooks/useLexicon";
 import type { FindMatch } from "./FindReplaceOverlay";
@@ -121,7 +122,7 @@ export function DocColumn({
         </Typography>
       </Stack>
       <Box
-        sx={{
+        sx={(theme) => ({
           flex: 1,
           overflowY: "auto",
           px: 1.5,
@@ -133,24 +134,8 @@ export function DocColumn({
             : '"Source Serif Pro","Cambria","Times New Roman",serif',
           direction: rtl ? "rtl" : "ltr",
           textAlign: rtl ? "right" : "left",
-          "& mark.be-hl": {
-            backgroundColor: "#fff48a",
-            padding: "0 2px",
-            borderRadius: 0.5,
-            color: "inherit",
-          },
-          "& mark.be-find": {
-            backgroundColor: "#ffd966",
-            outline: "1px solid #d97706",
-            padding: "0 1px",
-            borderRadius: 0.5,
-            color: "inherit",
-          },
-          "& mark.be-find-active": {
-            backgroundColor: "#fb923c",
-            outline: "2px solid #c2410c",
-          },
-        }}
+          ...markHighlightSx(theme.palette.mode),
+        })}
       >
         {verseNumbers.map((v) => {
           const dto = versesByVerseNum[v];

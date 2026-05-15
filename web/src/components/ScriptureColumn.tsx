@@ -13,6 +13,7 @@ import { HebrewLine } from "./HebrewLine";
 import type { LexiconEntry } from "../hooks/useLexicon";
 import type { ChapterState } from "../hooks/useBook";
 import { highlightsFor, renderHighlightedHTML, type HighlightKey } from "../lib/highlight";
+import { markHighlightSx } from "../lib/highlightStyles";
 import {
   classifySourceQuery,
   matchSourceVerse,
@@ -481,23 +482,13 @@ function StackedBody({
   const uhbLabel = isHebrew ? "UHB" : "UGNT";
   return (
     <Box
-      sx={{
+      sx={(theme) => ({
         flex: 1,
         overflowY: "auto",
         px: 2,
         py: 1,
-        "& mark.be-find": {
-          backgroundColor: "#ffd966",
-          outline: "1px solid #d97706",
-          padding: "0 1px",
-          borderRadius: 0.5,
-          color: "inherit",
-        },
-        "& mark.be-find-active": {
-          backgroundColor: "#fb923c",
-          outline: "2px solid #c2410c",
-        },
-      }}
+        ...markHighlightSx(theme.palette.mode),
+      })}
     >
       {verseNumbers.map((v) => {
         const isActive = v === activeVerse;
@@ -901,7 +892,7 @@ function ActiveLine({
             lastSetRef.current = value;
             onEditPlainRef.current?.(value);
           }}
-          sx={{
+          sx={(theme) => ({
             flex: 1,
             bgcolor: readOnly ? "grey.100" : "background.paper",
             border: "1px solid",
@@ -917,30 +908,14 @@ function ActiveLine({
               ? '"Times New Roman","SBL Hebrew","Cardo",serif'
               : '"Source Serif Pro","Cambria","Times New Roman",serif',
             outline: "none",
-            "& mark.be-hl": {
-              backgroundColor: "#fff48a",
-              padding: "0 2px",
-              borderRadius: 0.5,
-              color: "inherit",
-            },
-            "& mark.be-find": {
-              backgroundColor: "#ffd966",
-              outline: "1px solid #d97706",
-              padding: "0 1px",
-              borderRadius: 0.5,
-              color: "inherit",
-            },
-            "& mark.be-find-active": {
-              backgroundColor: "#fb923c",
-              outline: "2px solid #c2410c",
-            },
+            ...markHighlightSx(theme.palette.mode),
             "&:focus": readOnly
               ? {}
               : {
                   borderColor: "primary.main",
                   boxShadow: "0 0 0 2px rgba(49,173,227,0.2)",
                 },
-          }}
+          })}
         />
       )}
     </Stack>

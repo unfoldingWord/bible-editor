@@ -15,10 +15,12 @@ import {
   Paper,
   Tooltip,
   Button,
+  useTheme,
 } from "@mui/material";
 import CloseIcon from "@mui/icons-material/Close";
 import ExpandLessIcon from "@mui/icons-material/ExpandLess";
 import ExpandMoreIcon from "@mui/icons-material/ExpandMore";
+import { assignChipHues, chipAccentColor, chipSupColor } from "../lib/highlightStyles";
 import {
   alignmentPlainText,
   clearAll,
@@ -40,25 +42,6 @@ import { SourceTooltipBody } from "./SourceTooltipBody";
 const WORD_IDS_MIME = "text/word-ids";
 const SOURCE_ID_MIME = "text/source-id";
 
-// Subtle pastel palette for the "match instances by color" toggle. Each
-// (text, occurrence) pair gets a deterministic color so the same chip wears
-// the same tint everywhere it appears (word bank, alignment card, UHB
-// strip's aligned Hebrew). 12 hues, modulo if a verse has more repeats.
-const MATCH_PALETTE = [
-  "#fef9c3", // soft yellow
-  "#dcfce7", // soft green
-  "#fce7f3", // soft pink
-  "#dbeafe", // soft blue
-  "#fed7aa", // soft orange
-  "#ede9fe", // soft purple
-  "#ccfbf1", // soft teal
-  "#fef3c7", // cream
-  "#fce4ec", // rose
-  "#f3e8ff", // lavender
-  "#ecfccb", // lime
-  "#ffe4e6", // blush
-];
-
 // Storage keys for sticky toolbar prefs.
 const LS_HIDE_UHB = "be:alignmentHideUhb";
 const LS_COLORIZE = "be:alignmentColorize";
@@ -74,7 +57,10 @@ type HighlightTone = "exact" | "linked" | null;
 interface HighlightCtx {
   colorize: boolean;
   hoverLink: boolean;
-  matchColorMap: Map<string, string>;
+  // Per-(text|occurrence) hue degree assignment for the "colors" toggle.
+  // Only duplicate-occurrence words get an entry; missing = no accent.
+  matchHues: Map<string, number>;
+  themeMode: "light" | "dark";
   onEnglishEnter: (wordId: string, text: string, occurrence: string, groupIdOverride?: string) => void;
   // Hebrew is keyed by Strong number (invariant) + occurrence — content
   // text can differ between the alignment milestone and the UHB \w token
@@ -264,24 +250,23 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
         ? Array.from(selectedUnaligned)
         : [id];
 
-    // Per-(text, occurrence) tint for the "match instances by color" toggle.
-    // Each unique (text, occurrence) gets a palette slot deterministically by
-    // stream order, so colors are stable across re-renders.
-    const matchColorMap = useMemo(() => {
-      const map = new Map<string, string>();
-      if (!state) return map;
-      let idx = 0;
+    const themeMode = useTheme().palette.mode;
+
+    // Per-(text|occurrence) hue assignment for the "match instances by
+    // color" toggle. Same lemma → distinct hues spaced around the OKLCH
+    // wheel; chips with a single occurrence get no entry. Stream order
+    // anchors left-to-right hue progression within each duplicate group.
+    const matchHues = useMemo(() => {
+      if (!state) return new Map<string, number>();
+      const items: Array<{ key: string; lemma: string }> = [];
       for (const item of state.stream) {
         if (item.kind !== "word") continue;
         const w = item.word;
         const n = parseInt(w.occurrences, 10);
         if (!Number.isFinite(n) || n <= 1) continue;
-        const key = `${w.text}|${w.occurrence}`;
-        if (map.has(key)) continue;
-        map.set(key, MATCH_PALETTE[idx % MATCH_PALETTE.length]);
-        idx++;
+        items.push({ key: `${w.text}|${w.occurrence}`, lemma: w.text });
       }
-      return map;
+      return assignChipHues(items);
     }, [state]);
 
     // Cross-language hover linking needs to know which alignment group each
@@ -372,7 +357,8 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
       () => ({
         colorize,
         hoverLink,
-        matchColorMap,
+        matchHues,
+        themeMode,
         onEnglishEnter: onEnglishHover,
         onHebrewEnter: onHebrewHover,
         onLeave: onHoverLeave,
@@ -382,7 +368,8 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
       [
         colorize,
         hoverLink,
-        matchColorMap,
+        matchHues,
+        themeMode,
         onEnglishHover,
         onHebrewHover,
         onHoverLeave,
@@ -1210,7 +1197,7 @@ function SourceWordTypography({
           whiteSpace: "nowrap",
           transition: "background-color 0.12s, box-shadow 0.12s",
           userSelect: "none",
-          boxShadow: hoverShadow(tone),
+          boxShadow: hoverShadow(tone, hctx.themeMode),
           "&:active": { cursor: "grabbing" },
         }}
       >
@@ -1329,7 +1316,7 @@ function SourceVerseToken({
           display: "inline",
           borderRadius: 0.5,
           px: tone ? 0.25 : 0,
-          boxShadow: hoverShadow(tone),
+          boxShadow: hoverShadow(tone, hctx.themeMode),
           transition: "box-shadow 0.12s",
         }}
       >
@@ -1354,10 +1341,12 @@ function AlignedChip({
   hctx: HighlightCtx;
 }) {
   const tone = hctx.englishHighlight(wordId, text, occurrence);
-  const tint = hctx.colorize ? hctx.matchColorMap.get(`${text}|${occurrence}`) : undefined;
+  const hueDeg = hctx.colorize ? hctx.matchHues.get(`${text}|${occurrence}`) : undefined;
+  const accent = hueDeg != null ? chipAccentColor(hueDeg, hctx.themeMode) : undefined;
+  const supColor = hueDeg != null ? chipSupColor(hueDeg, hctx.themeMode) : "text.disabled";
   return (
     <Chip
-      label={targetLabel(text, occurrence, occurrences, "text.disabled")}
+      label={targetLabel(text, occurrence, occurrences, supColor)}
       size="small"
       variant="outlined"
       onMouseEnter={() => hctx.onEnglishEnter(wordId, text, occurrence)}
@@ -1365,13 +1354,14 @@ function AlignedChip({
       sx={{
         fontFamily: '"Roboto","Helvetica",sans-serif',
         color: "text.disabled",
-        bgcolor: tint ?? "grey.50",
+        bgcolor: "grey.50",
         borderColor: "divider",
         userSelect: "none",
         height: 26,
         borderRadius: 0.75,
-        boxShadow: hoverShadow(tone),
+        boxShadow: hoverShadow(tone, hctx.themeMode),
         transition: "box-shadow 0.12s",
+        ...(accent ? { borderBottom: `3px solid ${accent}`, pb: "2px" } : {}),
         "& .MuiChip-label": { overflow: "visible", px: 1 },
       }}
     />
@@ -1398,10 +1388,19 @@ function SelectableChip({
   hctx: HighlightCtx;
 }) {
   const tone = hctx.englishHighlight(wordId, text, occurrence);
-  const tint = hctx.colorize ? hctx.matchColorMap.get(`${text}|${occurrence}`) : undefined;
+  const hueDeg =
+    !selected && hctx.colorize
+      ? hctx.matchHues.get(`${text}|${occurrence}`)
+      : undefined;
+  const accent = hueDeg != null ? chipAccentColor(hueDeg, hctx.themeMode) : undefined;
+  const supColor = selected
+    ? "primary.contrastText"
+    : hueDeg != null
+      ? chipSupColor(hueDeg, hctx.themeMode)
+      : "primary.dark";
   return (
     <Chip
-      label={targetLabel(text, occurrence, occurrences, selected ? "primary.contrastText" : "primary.dark")}
+      label={targetLabel(text, occurrence, occurrences, supColor)}
       size="small"
       variant={selected ? "filled" : "outlined"}
       color={selected ? "primary" : "default"}
@@ -1421,9 +1420,10 @@ function SelectableChip({
         userSelect: "none",
         height: 26,
         borderRadius: 0.75,
-        bgcolor: selected ? "primary.main" : tint ?? "background.paper",
-        boxShadow: hoverShadow(tone),
+        bgcolor: selected ? "primary.main" : "background.paper",
+        boxShadow: hoverShadow(tone, hctx.themeMode),
         transition: "box-shadow 0.12s",
+        ...(accent ? { borderBottom: `3px solid ${accent}`, pb: "2px" } : {}),
         "& .MuiChip-label": { overflow: "visible", px: 1 },
         "&:active": { cursor: "grabbing" },
       }}
@@ -1449,11 +1449,13 @@ function SimpleDraggableChip({
   hctx: HighlightCtx;
 }) {
   const tone = hctx.englishHighlight(wordId, text, occurrence, groupId);
-  const tint = hctx.colorize ? hctx.matchColorMap.get(`${text}|${occurrence}`) : undefined;
+  const hueDeg = hctx.colorize ? hctx.matchHues.get(`${text}|${occurrence}`) : undefined;
+  const accent = hueDeg != null ? chipAccentColor(hueDeg, hctx.themeMode) : undefined;
+  const supColor = hueDeg != null ? chipSupColor(hueDeg, hctx.themeMode) : "primary.dark";
   return (
     <Tooltip title="double-click or drag back to the word bank to unalign">
       <Chip
-        label={targetLabel(text, occurrence, occurrences, "primary.dark")}
+        label={targetLabel(text, occurrence, occurrences, supColor)}
         size="small"
         variant="outlined"
         draggable
@@ -1471,9 +1473,10 @@ function SimpleDraggableChip({
           userSelect: "none",
           height: 26,
           borderRadius: 0.75,
-          bgcolor: tint ?? "background.paper",
-          boxShadow: hoverShadow(tone),
+          bgcolor: "background.paper",
+          boxShadow: hoverShadow(tone, hctx.themeMode),
           transition: "box-shadow 0.12s",
+          ...(accent ? { borderBottom: `3px solid ${accent}`, pb: "2px" } : {}),
           "& .MuiChip-label": { overflow: "visible", px: 1 },
           "&:active": { cursor: "grabbing" },
         }}
@@ -1541,9 +1544,12 @@ function ToolbarToggle({
 // Soft outer-ring "glow" applied to chips / Hebrew tokens when the current
 // hover targets them or their alignment-group partner. Two tones so the
 // exact-match and the cross-language linked partner are distinguishable.
-function hoverShadow(tone: HighlightTone): string | undefined {
-  if (tone === "exact") return "0 0 0 2px rgba(49,173,227,0.55)";
-  if (tone === "linked") return "0 0 0 2px rgba(229,157,51,0.55)";
+// Dark mode lifts the ring alpha noticeably so saturated colors still
+// register against the dark canvas; light mode gets a small bump.
+function hoverShadow(tone: HighlightTone, mode: "light" | "dark"): string | undefined {
+  const alpha = mode === "dark" ? 1 : 0.6;
+  if (tone === "exact") return `0 0 0 2px rgba(49,173,227,${alpha})`;
+  if (tone === "linked") return `0 0 0 2px rgba(229,157,51,${alpha})`;
   return undefined;
 }
 

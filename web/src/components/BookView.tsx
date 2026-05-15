@@ -15,6 +15,7 @@ import LinkIcon from "@mui/icons-material/Link";
 import type { VerseDto } from "../sync/api";
 import type { ChapterState } from "../hooks/useBook";
 import { highlightsFor, renderHighlightedHTML, type HighlightKey } from "../lib/highlight";
+import { markHighlightSx } from "../lib/highlightStyles";
 import type { FindMatch } from "./FindReplaceOverlay";
 import type { FindQuery } from "./ScriptureColumn";
 import { HebrewLine } from "./HebrewLine";
@@ -150,27 +151,11 @@ export function BookView({
       </Stack>
       <Box
         ref={containerRef}
-        sx={{
+        sx={(theme) => ({
           flex: 1,
           overflowY: "auto",
-          "& mark.be-hl": {
-            backgroundColor: "#fff48a",
-            padding: "0 2px",
-            borderRadius: 0.5,
-            color: "inherit",
-          },
-          "& mark.be-find": {
-            backgroundColor: "#ffd966",
-            outline: "1px solid #d97706",
-            padding: "0 1px",
-            borderRadius: 0.5,
-            color: "inherit",
-          },
-          "& mark.be-find-active": {
-            backgroundColor: "#fb923c",
-            outline: "2px solid #c2410c",
-          },
-        }}
+          ...markHighlightSx(theme.palette.mode),
+        })}
       >
         <Box sx={{ display: "grid", gridTemplateColumns, gap: 1, px: 1.5, py: 1 }}>
           {chapterList.map((ch) => (

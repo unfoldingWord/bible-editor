@@ -8,6 +8,7 @@ import { Tooltip, Box } from "@mui/material";
 import type { LexiconEntry } from "../hooks/useLexicon";
 import type { SourceWord } from "../lib/alignment";
 import type { HighlightKey } from "../lib/highlight";
+import { wordHighlightStyles } from "../lib/highlightStyles";
 import { SourceTooltipBody } from "./SourceTooltipBody";
 
 interface Props {
@@ -59,29 +60,18 @@ export function HebrewLine({ verseObjects, lexiconMap, highlights, findHighlight
         const wordSpan = (
           <Box
             component="span"
-            sx={{
-              cursor: "help",
-              ...(isActiveFind
-                ? {
-                    backgroundColor: "#fb923c",
-                    outline: "2px solid #c2410c",
-                    padding: "0 1px",
-                    borderRadius: 0.5,
-                  }
-                : isFindHit
-                  ? {
-                      backgroundColor: "#ffd966",
-                      outline: "1px solid #d97706",
-                      padding: "0 1px",
-                      borderRadius: 0.5,
-                    }
-                  : isHighlighted
-                    ? {
-                        backgroundColor: "#fff48a",
-                        padding: "0 2px",
-                        borderRadius: 0.5,
-                      }
-                    : {}),
+            sx={(theme) => {
+              const hl = wordHighlightStyles(theme.palette.mode);
+              return {
+                cursor: "help",
+                ...(isActiveFind
+                  ? hl.findActive
+                  : isFindHit
+                    ? hl.find
+                    : isHighlighted
+                      ? hl.hl
+                      : {}),
+              };
             }}
           >
             {text}

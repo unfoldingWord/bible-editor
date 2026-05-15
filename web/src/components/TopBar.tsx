@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { useContext, useEffect, useMemo, useState, type ReactNode } from "react";
 import {
   Stack,
   Typography,
@@ -16,10 +16,13 @@ import NavigateNextIcon from "@mui/icons-material/NavigateNext";
 import ArrowForwardIcon from "@mui/icons-material/ArrowForward";
 import MenuOpenIcon from "@mui/icons-material/MenuOpen";
 import MenuIcon from "@mui/icons-material/Menu";
+import Brightness4Icon from "@mui/icons-material/Brightness4";
+import Brightness7Icon from "@mui/icons-material/Brightness7";
 import { api, type BookListEntry, type BookSummary } from "../sync/api";
 import { SyncStatusBar } from "./SyncStatusBar";
 import { bookName, resolveBook } from "../lib/bookNames";
 import { parseReference } from "../lib/referenceParser";
+import { ThemeModeContext } from "../theme";
 
 interface Props {
   book: string;
@@ -44,6 +47,7 @@ export function TopBar({
   const [summary, setSummary] = useState<BookSummary | null>(null);
   const [refInput, setRefInput] = useState("");
   const [refError, setRefError] = useState<string | null>(null);
+  const { mode, toggle } = useContext(ThemeModeContext);
 
   useEffect(() => {
     api.getBooks().then((r) => setBooks(r.books)).catch(() => setBooks([]));
@@ -126,9 +130,12 @@ export function TopBar({
           renderOption={(props, opt) => (
             <li {...props} key={opt} style={{ fontFamily: "monospace" }}>
               <span style={{ minWidth: 40, display: "inline-block" }}>{opt}</span>
-              <span style={{ color: "rgba(0,0,0,0.55)", fontSize: 12, marginLeft: 8 }}>
+              <Box
+                component="span"
+                sx={{ color: "text.secondary", fontSize: 12, ml: 1 }}
+              >
                 {bookName(opt)}
-              </span>
+              </Box>
             </li>
           )}
           renderInput={(params) => (
@@ -262,6 +269,11 @@ export function TopBar({
         </>
       )}
       <SyncStatusBar />
+      <Tooltip title={mode === "dark" ? "switch to light mode" : "switch to dark mode"}>
+        <IconButton size="small" onClick={toggle} aria-label="toggle color mode">
+          {mode === "dark" ? <Brightness7Icon fontSize="small" /> : <Brightness4Icon fontSize="small" />}
+        </IconButton>
+      </Tooltip>
       <Divider orientation="vertical" flexItem sx={{ my: 0.5 }} />
       {pipelineMenu}
     </Stack>
