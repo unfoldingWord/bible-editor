@@ -268,6 +268,7 @@ async function stageJobOutput(
 export interface ApplyResult {
   tnDeleted: number;
   tnCreated: number;
+  tnHintExpanded: number;
   tqCreated: number;
   tqUpdated: number;
   verseUpdated: number;
@@ -317,6 +318,7 @@ async function applyJobOutput(env: Env, job: ImportContext): Promise<ApplyResult
   const result: ApplyResult = {
     tnDeleted: 0,
     tnCreated: 0,
+    tnHintExpanded: 0,
     tqCreated: 0,
     tqUpdated: 0,
     verseUpdated: 0,
@@ -329,6 +331,15 @@ async function applyJobOutput(env: Env, job: ImportContext): Promise<ApplyResult
   }
 
   for (const p of tnProposals) {
+    // Hint expansion: if the AI's proposed id matches a queued hint stub in
+    // this job's scope, UPDATE that row in place instead of minting a new
+    // one. The hint's rowId round-trips through bp-assistant as the TSV ID
+    // column — see docs/bp-assistant-tn-hints-contract.md.
+    const expanded = await applyTnHintExpansionIfMatch(env, p, job, userId);
+    if (expanded) {
+      result.tnHintExpanded += 1;
+      continue;
+    }
     await applyTnInsert(env, p, userId);
     result.tnCreated += 1;
   }
@@ -354,10 +365,14 @@ async function deleteUnkeptTns(
 ): Promise<number> {
   // Identify which rows we're about to delete so the audit row can carry
   // the right pre-deletion version. A bulk UPDATE would lose that fidelity.
+  // preserve=1 rows are translator-marked "keep through AI runs"; hint=1
+  // rows are stubs queued for in-place expansion by the AI — both must
+  // survive the sweep.
   const targets = await env.DB.prepare(
     `SELECT id, version FROM tn_rows
       WHERE book = ?1 AND chapter BETWEEN ?2 AND ?3
-        AND updated_by IS NULL AND deleted_at IS NULL`,
+        AND updated_by IS NULL AND deleted_at IS NULL
+        AND preserve = 0 AND hint = 0`,
   )
     .bind(job.book, job.startChapter, job.endChapter)
     .all<{ id: string; version: number }>();
@@ -391,6 +406,95 @@ async function deleteUnkeptTns(
     await env.DB.batch(stmts);
   }
   return list.length;
+}
+
+// Per-revision source label for hint expansions. Distinct from AI_SOURCE so
+// the row's AI chip (keyed on latest_source === 'ai_pipeline' in chapters.ts)
+// stays off — standing authorship of a hinted note's existence is the human
+// who created the stub, even though this specific revision was written by
+// the AI. The history dialog can render this label however it likes.
+const HINT_EXPANSION_SOURCE = "hint_expansion";
+
+// Returns true if the proposal was applied as a hint expansion (UPDATE in
+// place against an existing hint=1 stub), false if there's no match and the
+// caller should fall through to applyTnInsert. Scoped to the job's chapter
+// range so an id collision outside that range (vanishingly rare with 4-char
+// random ids, but possible) doesn't accidentally clobber an unrelated row.
+async function applyTnHintExpansionIfMatch(
+  env: Env,
+  p: PendingImportRow,
+  job: ImportContext,
+  userId: number,
+): Promise<boolean> {
+  const payload = JSON.parse(p.payload_json) as Record<string, unknown>;
+  const proposedId = typeof payload.id === "string" ? payload.id : null;
+  if (!proposedId) return false;
+
+  const stub = await env.DB.prepare(
+    `SELECT id, version FROM tn_rows
+      WHERE id = ?1 AND hint = 1 AND deleted_at IS NULL
+        AND book = ?2 AND chapter BETWEEN ?3 AND ?4`,
+  )
+    .bind(proposedId, job.book, job.startChapter, job.endChapter)
+    .first<{ id: string; version: number }>();
+  if (!stub) return false;
+
+  const now = Math.floor(Date.now() / 1000);
+  await env.DB.batch([
+    env.DB
+      .prepare(
+        // Update content; clear hint so the row stops being queued for
+        // future runs. Leave preserve and updated_by alone — the row's
+        // standing authorship stays with whoever created the stub, and
+        // any prior preserve intent survives the expansion.
+        `UPDATE tn_rows
+            SET quote = ?1,
+                support_reference = ?2,
+                note = ?3,
+                occurrence = ?4,
+                ref_raw = COALESCE(?5, ref_raw),
+                tags = ?6,
+                hint = 0,
+                version = version + 1,
+                updated_at = ?7
+          WHERE id = ?8 AND deleted_at IS NULL`,
+      )
+      .bind(
+        (payload.quote as string | null | undefined) ?? null,
+        (payload.support_reference as string | null | undefined) ?? null,
+        (payload.note as string | null | undefined) ?? null,
+        (payload.occurrence as number | null | undefined) ?? null,
+        (payload.ref_raw as string | null | undefined) ?? null,
+        (payload.tags as string | null | undefined) ?? null,
+        now,
+        stub.id,
+      ),
+    env.DB
+      .prepare(
+        // Audit row: AI wrote this revision, but with the hint_expansion
+        // label so the row-level AI chip stays off. NoteHistoryDialog can
+        // surface this as "AI hint expansion" or similar.
+        `INSERT INTO edit_log
+           (kind, row_key, user_id, prev_version, new_version, action, payload_json, source)
+         VALUES ('tn', ?1, ?2, ?3, ?4, 'update', ?5, ?6)`,
+      )
+      .bind(
+        stub.id,
+        userId,
+        stub.version,
+        stub.version + 1,
+        JSON.stringify(payload),
+        HINT_EXPANSION_SOURCE,
+      ),
+    env.DB
+      .prepare(
+        `UPDATE pending_imports
+            SET accepted_at = unixepoch(), accepted_by = ?2
+          WHERE id = ?1`,
+      )
+      .bind(p.id, userId),
+  ]);
+  return true;
 }
 
 async function applyTnInsert(

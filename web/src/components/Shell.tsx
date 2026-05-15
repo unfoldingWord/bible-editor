@@ -158,20 +158,35 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook }:
     };
   }, [activeJobs, book, chapter]);
 
-  const handleKeepNote = useCallback(
-    async (id: string) => {
+  const handleSetNotePreserve = useCallback(
+    async (id: string, value: boolean) => {
       try {
-        const updated = await api.keepNote(id);
-        // Mirror the row's new server state locally so the card flips to
-        // editable + Kept on the next render.
+        const updated = await api.setPreserveNote(id, value);
+        // Mirror server state locally so the card's chip + checkbox flip on
+        // the next render without waiting for a chapter refetch.
         applyLocalRowPatch("tn", id, {
-          updated_by: updated.updated_by,
+          preserve: updated.preserve,
           updated_at: updated.updated_at,
-          version: updated.version,
         });
       } catch (e) {
         const msg = e instanceof Error ? e.message : "unknown error";
-        pushPipelineToast(`Couldn't mark note as kept: ${msg}`, "error");
+        pushPipelineToast(`Couldn't update Preserve: ${msg}`, "error");
+      }
+    },
+    [applyLocalRowPatch, pushPipelineToast],
+  );
+
+  const handleSetNoteHint = useCallback(
+    async (id: string, value: boolean) => {
+      try {
+        const updated = await api.setHintNote(id, value);
+        applyLocalRowPatch("tn", id, {
+          hint: updated.hint,
+          updated_at: updated.updated_at,
+        });
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : "unknown error";
+        pushPipelineToast(`Couldn't update Hint: ${msg}`, "error");
       }
     },
     [applyLocalRowPatch, pushPipelineToast],
@@ -735,7 +750,8 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook }:
             void outbox.enqueueDeleteRow("tq", id, row.version);
           }}
           locked={Boolean(chapterLock)}
-          onKeepNote={handleKeepNote}
+          onSetNotePreserve={handleSetNotePreserve}
+          onSetNoteHint={handleSetNoteHint}
         />
         </Box>
       </Box>

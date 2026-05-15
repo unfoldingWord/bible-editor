@@ -19,6 +19,14 @@ export interface TnRow {
   updated_by: number | null;
   updated_at: number;
   deleted_at: number | null;
+  /** Explicit "survive future AI pipeline sweeps" bit. Set via /preserve. */
+  preserve: 0 | 1;
+  /**
+   * Editor-authored stub queued for the next chapter-wide AI pipeline run:
+   * the proxy gathers these into options.hints, the sweep excludes them,
+   * and applyTnHintExpansion updates the row in place when the AI returns.
+   */
+  hint: 0 | 1;
   /**
    * Source label from the row's most recent edit_log entry. 'ai_pipeline'
    * when the last write came from the AI auto-apply step (which means the

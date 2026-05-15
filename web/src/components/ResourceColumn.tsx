@@ -51,8 +51,12 @@ interface Props {
   // Chapter is locked for editing because an AI pipeline is mid-flight.
   // Hides "new" buttons, propagates read-only to children.
   locked?: boolean;
-  // Called when a TN's Keep checkbox is checked. Threaded through to NoteCard.
-  onKeepNote?: (id: string) => void;
+  // Toggle the TN's preserve bit ("survive future AI pipeline sweeps").
+  // Threaded through to NoteCard. Always available, regardless of lock.
+  onSetNotePreserve?: (id: string, value: boolean) => void;
+  // Toggle the TN's hint bit ("queue as AI-pipeline directive"). Threaded
+  // through to NoteCard.
+  onSetNoteHint?: (id: string, value: boolean) => void;
   // Translate English in a note's quote field to source-language text using
   // ULT alignment. Returns null when no alignment match is found.
   onNoteTranslateQuote?: (row: TnRow, english: string) => string | null;
@@ -136,7 +140,8 @@ export function ResourceColumn({
   onQuestionDelete,
   onQuestionCreate,
   locked = false,
-  onKeepNote,
+  onSetNotePreserve,
+  onSetNoteHint,
   onNoteTranslateQuote,
   onWordTranslateQuote,
 }: Props) {
@@ -437,7 +442,10 @@ export function ResourceColumn({
           aiRecentlyCompletedAt={noteAiRecentlyCompletedAt?.(r.id) ?? null}
           onVisibilityChange={onNoteVisibilityChange}
           locked={locked}
-          onKeep={onKeepNote ? () => onKeepNote(r.id) : undefined}
+          onSetPreserve={
+            onSetNotePreserve ? (value) => onSetNotePreserve(r.id, value) : undefined
+          }
+          onSetHint={onSetNoteHint ? (value) => onSetNoteHint(r.id, value) : undefined}
           onTranslateQuote={
             onNoteTranslateQuote ? (english) => onNoteTranslateQuote(r, english) : undefined
           }

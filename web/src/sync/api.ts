@@ -21,6 +21,10 @@ export interface TnRow {
   updated_by: number | null;
   updated_at: number;
   deleted_at: number | null;
+  /** Explicit "survive future AI pipeline sweeps" bit. Set via /preserve. */
+  preserve: 0 | 1;
+  /** Editor-authored stub queued for the next chapter-wide AI pipeline run. */
+  hint: 0 | 1;
   /**
    * AI provenance: 'ai_pipeline' when the last edit came from the auto-apply
    * step (chip should show), otherwise null. Cleared by any later human
@@ -525,12 +529,30 @@ export const api = {
       headers: { "If-Match": String(expectedVersion) },
     }),
 
-  // Lock-exempt during an active pipeline. Bumps version, sets updated_by =
-  // current user, lets the auto-apply step skip this row when it sweeps un-
-  // kept TNs. Returns the updated row so the caller can refresh local state.
+  // Legacy: alias for setPreserveNote(id, true). Server still accepts it for
+  // any in-flight outbox ops; new code should call setPreserveNote.
   keepNote: (id: string) =>
     request<TnRow>(`/api/rows/tn/${encodeURIComponent(id)}/keep`, {
       method: "POST",
+    }),
+
+  // Toggle the "survive future AI pipeline sweeps" bit. Lock-exempt.
+  // Returns the updated row so the caller can refresh local state.
+  setPreserveNote: (id: string, value: boolean) =>
+    request<TnRow>(`/api/rows/tn/${encodeURIComponent(id)}/preserve`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ value }),
+    }),
+
+  // Toggle the "queue as AI-pipeline hint" bit. Lock-exempt. hint=1 rows
+  // are sent into the next pipeline run as options.hints and are excluded
+  // from the sweep; AI expansion clears the bit.
+  setHintNote: (id: string, value: boolean) =>
+    request<TnRow>(`/api/rows/tn/${encodeURIComponent(id)}/hint`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ value }),
     }),
 
   patchVerse: <T = unknown>(

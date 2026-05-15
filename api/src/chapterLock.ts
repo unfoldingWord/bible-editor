@@ -2,7 +2,7 @@
 // for a given (book, chapter), the chapter is read-only for mutations on
 // tn / tq / twl / verses — the AI run will overwrite anything edited mid-flight
 // when it completes. See docs/ai-pipeline-handoff.md (Phase 2c) and the plan
-// for the exemption rules (tn PATCH, /keep route).
+// for the exemption rules (tn PATCH, /preserve, /hint, legacy /keep alias).
 
 import type { Env } from "./index";
 
