@@ -24,6 +24,11 @@ spikes/out/
 scripts/out/
 scripts/tmp/
 
+# Playwright artifacts — HTML report, trace zips, screenshots from failures.
+# Regenerated on every `npm run test:e2e` run.
+playwright-report/
+test-results/
+
 # Local working files — present in the working tree but not part of the
 # committed history. Listed here so `git status` stays clean across branch
 # switches.

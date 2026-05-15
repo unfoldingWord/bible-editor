@@ -1,0 +1,5 @@
+{
+  "name": "@bible-editor/tests",
+  "private": true,
+  "type": "module"
+}
