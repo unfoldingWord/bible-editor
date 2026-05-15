@@ -1,12 +1,30 @@
-import { Fragment, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, type Ref, useEffect, useMemo, useRef, useState } from "react";
 import { Box, Stack, Typography, Chip, Button, IconButton, Tooltip } from "@mui/material";
 import AddIcon from "@mui/icons-material/Add";
 import PushPinIcon from "@mui/icons-material/PushPin";
 import PushPinOutlinedIcon from "@mui/icons-material/PushPinOutlined";
-import type { TnRow, TqRow, TwlRow } from "../sync/api";
+import type { TnRow, TqRow, TwlRow, VerseDto } from "../sync/api";
 import { NoteCard, type DropPosition } from "./NoteCard";
 import { WordsTable, type WordDropPosition } from "./WordsTable";
 import { QuestionsTable } from "./QuestionsTable";
+import { AlignmentPanel, type AlignmentPanelHandle } from "./AlignmentPanel";
+
+export type PanelMode = "resources" | "alignment";
+
+export interface AlignmentTabProps {
+  book: string;
+  chapter: number;
+  verseNum: number;
+  bibleVersion: string;
+  verse: VerseDto | null;
+  sourceVerse: VerseDto | null;
+  sourceLabel: string;
+  twlForVerse: TwlRow[];
+  onSave: (newContent: unknown, plainText: string, expectedVersion: number) => void;
+  onCancel: () => void;
+  onDirtyChange?: (dirty: boolean) => void;
+  panelRef?: Ref<AlignmentPanelHandle>;
+}
 
 interface Props {
   activeVerse: number;
@@ -62,6 +80,13 @@ interface Props {
   onNoteTranslateQuote?: (row: TnRow, english: string) => string | null;
   // Same translate flow but for the TWL quote (orig_words) column.
   onWordTranslateQuote?: (row: TwlRow, english: string) => string | null;
+  // Tab + alignment-panel wiring. When mode === "alignment", the Resources
+  // column body swaps to the AlignmentPanel; the Notes/Words/Questions tabs
+  // stay in the strip but their click acts as a scroll-to in resources mode.
+  panelMode?: PanelMode;
+  onSetPanelMode?: (mode: PanelMode) => void;
+  alignmentProps?: AlignmentTabProps;
+  alignmentBadge?: string;
 }
 
 type PinKey = "notes" | "words" | "questions";
@@ -144,6 +169,10 @@ export function ResourceColumn({
   onSetNoteHint,
   onNoteTranslateQuote,
   onWordTranslateQuote,
+  panelMode = "resources",
+  onSetPanelMode,
+  alignmentProps,
+  alignmentBadge,
 }: Props) {
   const [pinned, setPinned] = useState<Pinned>(() => loadPinned());
   const togglePinned = (k: PinKey) => {
@@ -252,42 +281,88 @@ export function ResourceColumn({
     >
       <Stack
         direction="row"
-        spacing={1}
+        spacing={0.25}
         alignItems="center"
         sx={{
-          px: 2,
-          py: 1,
+          px: 1.5,
+          pt: 0.5,
           borderBottom: "1px solid",
           borderColor: "divider",
           bgcolor: "grey.50",
         }}
       >
-        <Typography variant="subtitle2">
-          Resources · {activeVerse === 0 ? "intro" : activeVerse}
+        <Typography
+          variant="subtitle2"
+          sx={{ fontSize: 12, color: "text.secondary", mr: 0.5 }}
+        >
+          Resources · {activeVerse === 0 ? "i" : activeVerse}
         </Typography>
         <Box sx={{ flex: 1 }} />
-        <Chip
-          label={`${totalTn} notes${pinned.notes ? " · ch" : ""}`}
-          size="small"
-          variant="outlined"
-          clickable
-          onClick={() => scrollTo(notesRef)}
+        <PanelTab
+          label="Notes"
+          count={totalTn}
+          countSuffix={pinned.notes ? " · ch" : ""}
+          active={panelMode === "resources"}
+          accent={false}
+          onClick={() => {
+            if (panelMode !== "resources") onSetPanelMode?.("resources");
+            scrollTo(notesRef);
+          }}
         />
-        <Chip
-          label={`${totalTwl} words${pinned.words ? " · ch" : ""}`}
-          size="small"
-          variant="outlined"
-          clickable
-          onClick={() => scrollTo(wordsRef)}
+        <PanelTab
+          label="Words"
+          count={totalTwl}
+          countSuffix={pinned.words ? " · ch" : ""}
+          active={panelMode === "resources"}
+          accent={false}
+          onClick={() => {
+            if (panelMode !== "resources") onSetPanelMode?.("resources");
+            scrollTo(wordsRef);
+          }}
         />
-        <Chip
-          label={`${totalTq} Q${pinned.questions ? " · ch" : ""}`}
-          size="small"
-          variant="outlined"
-          clickable
-          onClick={() => scrollTo(questionsRef)}
+        <PanelTab
+          label="Questions"
+          count={totalTq}
+          countSuffix={pinned.questions ? " · ch" : ""}
+          active={panelMode === "resources"}
+          accent={false}
+          onClick={() => {
+            if (panelMode !== "resources") onSetPanelMode?.("resources");
+            scrollTo(questionsRef);
+          }}
+        />
+        <PanelTab
+          label="Alignment"
+          countLabel={alignmentBadge}
+          active={panelMode === "alignment"}
+          accent
+          onClick={() => onSetPanelMode?.("alignment")}
         />
       </Stack>
+      {panelMode === "alignment" ? (
+        alignmentProps ? (
+          <AlignmentPanel
+            ref={alignmentProps.panelRef}
+            book={alignmentProps.book}
+            chapter={alignmentProps.chapter}
+            verseNum={alignmentProps.verseNum}
+            bibleVersion={alignmentProps.bibleVersion}
+            verse={alignmentProps.verse}
+            sourceVerse={alignmentProps.sourceVerse}
+            sourceLabel={alignmentProps.sourceLabel}
+            twlForVerse={alignmentProps.twlForVerse}
+            onSave={alignmentProps.onSave}
+            onCancel={alignmentProps.onCancel}
+            onDirtyChange={alignmentProps.onDirtyChange}
+          />
+        ) : (
+          <Box sx={{ p: 3 }}>
+            <Typography variant="body2" color="text.secondary">
+              Click the link icon on a ULT or UST verse to start aligning.
+            </Typography>
+          </Box>
+        )
+      ) : (
       <Box ref={scrollBodyRef} sx={{ flex: 1, overflowY: "auto", px: 2, py: 1 }}>
         <div ref={notesRef} />
         <SectionHead
@@ -392,6 +467,7 @@ export function ResourceColumn({
           <QuestionsTable rows={tqForVerse} onChange={onQuestionChange} onDelete={onQuestionDelete} locked={locked} />
         )}
       </Box>
+      )}
     </Box>
   );
 
@@ -567,5 +643,77 @@ function SectionHead({
         </Button>
       )}
     </Stack>
+  );
+}
+
+function PanelTab({
+  label,
+  count,
+  countLabel,
+  countSuffix,
+  active,
+  accent,
+  onClick,
+}: {
+  label: string;
+  count?: number;
+  countLabel?: string;
+  countSuffix?: string;
+  active: boolean;
+  accent: boolean;
+  onClick: () => void;
+}) {
+  const showCount =
+    countLabel !== undefined ? countLabel : count !== undefined ? `${count}${countSuffix ?? ""}` : null;
+  return (
+    <Box
+      component="button"
+      onClick={onClick}
+      sx={{
+        position: "relative",
+        display: "inline-flex",
+        alignItems: "center",
+        gap: 0.5,
+        px: 1,
+        pt: 0.75,
+        pb: 1,
+        border: 0,
+        background: "transparent",
+        cursor: "pointer",
+        fontFamily: "inherit",
+        fontSize: 12.5,
+        fontWeight: active ? 600 : 500,
+        color: active && accent ? "primary.main" : active ? "text.primary" : "text.secondary",
+        borderBottom: "2px solid",
+        borderColor: active && accent ? "primary.main" : "transparent",
+        marginBottom: "-1px",
+        "&:hover": { color: accent ? "primary.main" : "text.primary" },
+      }}
+    >
+      {label}
+      {showCount !== null && (
+        <Box
+          component="span"
+          sx={{
+            display: "inline-flex",
+            alignItems: "center",
+            px: 0.75,
+            py: "1px",
+            borderRadius: 999,
+            fontFamily: "monospace",
+            fontSize: 10,
+            fontWeight: 600,
+            bgcolor: active && accent ? "primary.main" : "transparent",
+            color: active && accent ? "primary.contrastText" : "text.disabled",
+            border: active && accent ? "none" : "1px solid",
+            borderColor: "divider",
+            letterSpacing: "0.02em",
+            lineHeight: 1.4,
+          }}
+        >
+          {showCount}
+        </Box>
+      )}
+    </Box>
   );
 }

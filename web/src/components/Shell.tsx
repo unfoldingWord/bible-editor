@@ -1,5 +1,16 @@
-import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Box, Typography, CircularProgress, Alert } from "@mui/material";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  Box,
+  Typography,
+  CircularProgress,
+  Alert,
+  Dialog,
+  DialogActions,
+  DialogContent,
+  DialogContentText,
+  DialogTitle,
+  Button,
+} from "@mui/material";
 import { useChapter } from "../hooks/useChapter";
 import type { UseBookReturn } from "../hooks/useBook";
 import { useLexicon } from "../hooks/useLexicon";
@@ -13,7 +24,8 @@ import { buildTnQuickRequest } from "../lib/tnQuickRequest";
 import { findSourceForTargetText } from "../lib/highlight";
 import { TimelineRail } from "./TimelineRail";
 import { ScriptureColumn, type ScriptureMode } from "./ScriptureColumn";
-import { ResourceColumn } from "./ResourceColumn";
+import { ResourceColumn, type AlignmentTabProps, type PanelMode } from "./ResourceColumn";
+import type { AlignmentPanelHandle } from "./AlignmentPanel";
 import { TopBar } from "./TopBar";
 import { LogosSyncToggle } from "./LogosSyncToggle";
 import { PipelineMenu } from "./PipelineMenu";
@@ -22,10 +34,6 @@ import { pipelineStore, type PipelineJob } from "../sync/pipelineStore";
 import { onOutboxResult } from "../sync/outbox";
 import { AiCompletionToasts } from "./AiCompletionToasts";
 import { collectStrongs } from "./HebrewLine";
-
-const AlignmentDialog = lazy(() =>
-  import("./AlignmentDialog").then((m) => ({ default: m.AlignmentDialog })),
-);
 
 interface AlignerTarget {
   chapter: number;
@@ -94,6 +102,14 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook }:
     });
   }, []);
   const [alignerTarget, setAlignerTarget] = useState<AlignerTarget | null>(null);
+  const [panelMode, setPanelMode] = useState<PanelMode>("resources");
+  const [alignmentDirty, setAlignmentDirty] = useState(false);
+  const alignmentPanelRef = useRef<AlignmentPanelHandle | null>(null);
+  // Queued action that should run after the user resolves the dirty-confirm
+  // popup. Verse / version changes attempted while the alignment panel has
+  // unsaved drags stash their apply() here; the dialog decides which branch
+  // to invoke.
+  const [pendingNav, setPendingNav] = useState<{ run: () => void } | null>(null);
   // Shared by the scripture + resource columns so a single "go to active"
   // click re-centers both. Bumped via requestScrollToActive (and elsewhere
   // when the active selection changes through other paths).
@@ -332,6 +348,129 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook }:
     return { activeQuote: null, activeOccurrence: null };
   }, [activeNoteId, activeWordId, data]);
 
+  // Routes any verse / version / aligner-target change through the dirty
+  // gate when the alignment panel has unsaved drags. Plain wrapper around
+  // setState if the gate is clear; otherwise queues for the popup.
+  const runWithDirtyGate = useCallback(
+    (apply: () => void) => {
+      if (panelMode === "alignment" && alignmentDirty) {
+        setPendingNav({ run: apply });
+      } else {
+        apply();
+      }
+    },
+    [panelMode, alignmentDirty],
+  );
+
+  const requestSelectVerse = useCallback(
+    (v: number) => {
+      runWithDirtyGate(() => {
+        setActiveVerse(v);
+        setActiveNoteId(null);
+        setActiveWordId(null);
+      });
+    },
+    [runWithDirtyGate],
+  );
+
+  // Keep the alignment target's verse in step with the active verse while
+  // we're in alignment mode. Bible version is sticky — only LinkIcon clicks
+  // change it. Effect, not direct setter, so it survives both rail clicks
+  // and book-mode chapter swaps.
+  useEffect(() => {
+    if (panelMode !== "alignment") return;
+    if (!alignerTarget) return;
+    if (alignerTarget.verse === activeVerse && alignerTarget.chapter === chapter) return;
+    setAlignerTarget({ ...alignerTarget, chapter, verse: activeVerse });
+  }, [activeVerse, chapter, panelMode, alignerTarget]);
+
+  const openAligner = useCallback(
+    (chapterNum: number, v: number, bv: string) => {
+      runWithDirtyGate(() => {
+        setAlignerTarget({ chapter: chapterNum, verse: v, bibleVersion: bv });
+        setActiveVerse(v);
+        setActiveNoteId(null);
+        setActiveWordId(null);
+        setPanelMode("alignment");
+      });
+    },
+    [runWithDirtyGate],
+  );
+
+  const handleSetPanelMode = useCallback(
+    (mode: PanelMode) => {
+      if (mode === "alignment" && !alignerTarget) {
+        setAlignerTarget({ chapter, verse: activeVerse, bibleVersion: "ULT" });
+      }
+      setPanelMode(mode);
+    },
+    [alignerTarget, chapter, activeVerse],
+  );
+
+  const dismissPendingNav = useCallback(() => setPendingNav(null), []);
+  const resolvePendingNav = useCallback(
+    (choice: "save" | "discard") => {
+      const nav = pendingNav;
+      setPendingNav(null);
+      if (!nav) return;
+      if (choice === "save") alignmentPanelRef.current?.save();
+      else alignmentPanelRef.current?.discard();
+      nav.run();
+    },
+    [pendingNav],
+  );
+
+  // Compute the alignment panel's props from the current chapter cache.
+  // Memoized so identity stays stable when the chapter hasn't changed under
+  // it; the panel uses verse identity to re-init its internal state.
+  const alignmentTabProps = useMemo<AlignmentTabProps | undefined>(() => {
+    if (!alignerTarget) return undefined;
+    if (!data) return undefined;
+    const sameChapter = alignerTarget.chapter === chapter;
+    const bookData =
+      !sameChapter && bookHook
+        ? (() => {
+            const cs = bookHook.chapters.get(alignerTarget.chapter);
+            return cs?.kind === "ready" ? cs.data : null;
+          })()
+        : null;
+    const sourceData = sameChapter ? data : bookData;
+    if (!sourceData) return undefined;
+    const sourceLabel = sourceData.verses["UHB"] ? "UHB" : "UGNT";
+    const targetVerse = sourceData.verses[alignerTarget.bibleVersion]?.[alignerTarget.verse] ?? null;
+    const sourceVerse = sourceData.verses[sourceLabel]?.[alignerTarget.verse] ?? null;
+    const twlForVerse = sourceData.twl.filter((r) => r.verse === alignerTarget.verse);
+    return {
+      book,
+      chapter: alignerTarget.chapter,
+      verseNum: alignerTarget.verse,
+      bibleVersion: alignerTarget.bibleVersion,
+      verse: targetVerse,
+      sourceVerse,
+      sourceLabel,
+      twlForVerse,
+      onSave: (content, plain, expectedVersion) => {
+        void outbox.enqueueVerse(
+          book,
+          alignerTarget.chapter,
+          alignerTarget.verse,
+          alignerTarget.bibleVersion,
+          expectedVersion,
+          { content, plain_text: plain },
+        );
+      },
+      onCancel: () => {
+        setPanelMode("resources");
+      },
+      onDirtyChange: setAlignmentDirty,
+      panelRef: alignmentPanelRef,
+    };
+  }, [alignerTarget, data, chapter, bookHook, book]);
+
+  const alignmentBadge = alignerTarget
+    ? `${alignerTarget.chapter}:${alignerTarget.verse === 0 ? "i" : alignerTarget.verse}`
+    : undefined;
+
   if (status === "loading" || status === "idle") {
     return (
       <Box sx={{ p: 4, display: "flex", alignItems: "center", gap: 2 }}>
@@ -447,7 +586,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook }:
             chapter={chapter}
             tiles={tileSet}
             activeVerse={activeVerse}
-            onSelect={setActiveVerse}
+            onSelect={requestSelectVerse}
             onToggleDone={(v, done) => {
               // Through the outbox so an offline toggle isn't dropped. The
               // payload is coalesced per (book, chapter, verse) so a rapid
@@ -494,18 +633,20 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook }:
             // payload + resources reload through the existing useChapter
             // flow. App.tsx lifts the useBook cache so this round-trip is
             // cheap.
-            if (ch !== chapter) {
-              onNavigate?.(book, ch, v);
-            } else {
-              setActiveVerse(v);
-            }
+            runWithDirtyGate(() => {
+              if (ch !== chapter) {
+                onNavigate?.(book, ch, v);
+              } else {
+                setActiveVerse(v);
+                setActiveNoteId(null);
+                setActiveWordId(null);
+              }
+            });
           }}
           onEditBookVerse={(ch, verseNum, bibleVersion, plain, base) => {
             persistVerseEdit(ch, verseNum, bibleVersion, plain, base);
           }}
-          onOpenBookAligner={(ch, v, bv) =>
-            setAlignerTarget({ chapter: ch, verse: v, bibleVersion: bv })
-          }
+          onOpenBookAligner={(ch, v, bv) => openAligner(ch, v, bv)}
           onReplaceVerse={(ch, verseNum, bibleVersion, newContent, newPlainText, base) => {
             // Find/replace ships pre-built content from smartReplaceVerse —
             // alignment is preserved when word counts match, fully
@@ -531,11 +672,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook }:
               { content: newContent, plain_text: newPlainText },
             );
           }}
-          onSelectVerse={(v) => {
-            setActiveVerse(v);
-            setActiveNoteId(null);
-            setActiveWordId(null);
-          }}
+          onSelectVerse={(v) => requestSelectVerse(v)}
           onModeChange={(m) => {
             setMode(m);
             saveToStorage(SCRIPTURE_MODE_KEY, m);
@@ -547,9 +684,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook }:
           onEditVerse={(verseNum, bibleVersion, plain, base) => {
             persistVerseEdit(chapter, verseNum, bibleVersion, plain, base);
           }}
-          onOpenAligner={(v, bv) =>
-            setAlignerTarget({ chapter, verse: v, bibleVersion: bv })
-          }
+          onOpenAligner={(v, bv) => openAligner(chapter, v, bv)}
           scrollNonce={scrollNonce}
           onRequestScrollToActive={requestScrollToActive}
           lexiconMap={lexiconMap}
@@ -768,79 +903,31 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook }:
           locked={Boolean(chapterLock)}
           onSetNotePreserve={handleSetNotePreserve}
           onSetNoteHint={handleSetNoteHint}
+          panelMode={panelMode}
+          onSetPanelMode={handleSetPanelMode}
+          alignmentProps={alignmentTabProps}
+          alignmentBadge={alignmentBadge}
         />
         </Box>
       </Box>
-      {alignerTarget && (
-        <Suspense fallback={null}>
-          {(() => {
-            // Aligner data comes from the same chapter's payload — either the
-            // active chapter via useChapter (chapter mode) or the loaded book
-            // cache (book mode). We prefer useChapter when the target chapter
-            // matches, since that data is always fresher.
-            const sameChapter = alignerTarget.chapter === chapter;
-            const bookData =
-              !sameChapter && bookHook
-                ? (() => {
-                    const cs = bookHook.chapters.get(alignerTarget.chapter);
-                    return cs?.kind === "ready" ? cs.data : null;
-                  })()
-                : null;
-            const sourceData = sameChapter ? data : bookData;
-            if (!sourceData) {
-              // Target chapter isn't loaded — drop silently; the user can click ⌭
-              // again once the chapter pulls in. In practice BookView only renders
-              // ⌭ for loaded chapters so this branch is defensive.
-              return null;
-            }
-            const sourceLabel = sourceData.verses["UHB"] ? "UHB" : "UGNT";
-            const sourceVerse =
-              sourceData.verses[sourceLabel]?.[alignerTarget.verse] ?? null;
-            const twlForVerse = sourceData.twl.filter((r) => r.verse === alignerTarget.verse);
-            return (
-              <AlignmentDialog
-                open
-                book={book}
-                chapter={alignerTarget.chapter}
-                verseNum={alignerTarget.verse}
-                bibleVersion={alignerTarget.bibleVersion}
-                verse={sourceData.verses[alignerTarget.bibleVersion]?.[alignerTarget.verse] ?? null}
-                contextOther={
-                  sourceData.verses[alignerTarget.bibleVersion === "ULT" ? "UST" : "ULT"]?.[
-                    alignerTarget.verse
-                  ] ?? null
-                }
-                sourceVerse={sourceVerse}
-                sourceLabel={sourceLabel}
-                twlForVerse={twlForVerse}
-                onClose={() => setAlignerTarget(null)}
-                onSave={(content, plain, expectedVersion) => {
-                  void outbox.enqueueVerse(
-                    book,
-                    alignerTarget.chapter,
-                    alignerTarget.verse,
-                    alignerTarget.bibleVersion,
-                    expectedVersion,
-                    { content, plain_text: plain },
-                  );
-                }}
-                onSwitchVersion={(bv) => {
-                  setAlignerTarget((cur) => (cur ? { ...cur, bibleVersion: bv } : cur));
-                }}
-                onEditVerseText={(bv, plain, base) => {
-                  // Strip edits go through the shared persistVerseEdit pipe
-                  // (smartEditVerse) so unchanged milestones in the verse
-                  // survive a one-word change. The dialog's useEffect picks
-                  // up the new content via the verse prop and re-derives the
-                  // alignment state — only the touched milestones land in
-                  // the unaligned bag.
-                  persistVerseEdit(alignerTarget.chapter, alignerTarget.verse, bv, plain, base);
-                }}
-              />
-            );
-          })()}
-        </Suspense>
-      )}
+      <Dialog open={!!pendingNav} onClose={dismissPendingNav}>
+        <DialogTitle>Unsaved alignment changes</DialogTitle>
+        <DialogContent>
+          <DialogContentText>
+            You have unsaved changes in the alignment editor. Save them before switching
+            verses, discard them, or cancel to stay here.
+          </DialogContentText>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={dismissPendingNav}>Cancel</Button>
+          <Button color="error" onClick={() => resolvePendingNav("discard")}>
+            Discard
+          </Button>
+          <Button variant="contained" onClick={() => resolvePendingNav("save")}>
+            Save
+          </Button>
+        </DialogActions>
+      </Dialog>
       <AiCompletionToasts
         notifications={aiDrafts.notifications}
         onDismiss={aiDrafts.dismiss}

@@ -22,7 +22,7 @@ export function TimelineRail({ book, chapter, tiles, activeVerse, onSelect, onTo
   return (
     <Box
       sx={{
-        width: 88,
+        width: 64,
         flexShrink: 0,
         bgcolor: "grey.50",
         borderRight: "1px solid",
@@ -57,7 +57,10 @@ export function TimelineRail({ book, chapter, tiles, activeVerse, onSelect, onTo
                 sx={{ p: 0.25 }}
               />
             </Tooltip>
-            <Tooltip title={`${book} ${chapter}:${t.verse}`} placement="right">
+            <Tooltip
+              title={t.verse === 0 ? `${book} ${chapter} introduction` : `${book} ${chapter}:${t.verse}`}
+              placement="right"
+            >
               <Box
                 onClick={() => onSelect(t.verse)}
                 sx={{
@@ -72,7 +75,7 @@ export function TimelineRail({ book, chapter, tiles, activeVerse, onSelect, onTo
                   textDecoration: t.done && !active ? "line-through" : "none",
                 }}
               >
-                {t.verse === 0 ? "intro" : t.verse}
+                {t.verse === 0 ? "i" : t.verse}
                 {t.has && !active && (
                   <Box
                     aria-label="unaligned words remain"
