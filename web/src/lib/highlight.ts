@@ -31,7 +31,7 @@ function quoteWords(quote: string): string[] {
   if (!quote) return [];
   return quote
     .replace(GAP, " ")
-    .split(/\s+/)
+    .split(/[\s־]+/)
     .map((w) => w.trim())
     .filter((w) => w.length > 0);
 }
