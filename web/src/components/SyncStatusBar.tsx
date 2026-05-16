@@ -8,7 +8,6 @@
 import { useEffect, useState, type ReactNode } from "react";
 import { Box, Button, Chip, Stack, Tooltip } from "@mui/material";
 import CloudDoneIcon from "@mui/icons-material/CloudDone";
-import CloudOffIcon from "@mui/icons-material/CloudOff";
 import CloudQueueIcon from "@mui/icons-material/CloudQueue";
 import ErrorOutlineIcon from "@mui/icons-material/ErrorOutline";
 import WarningAmberIcon from "@mui/icons-material/WarningAmber";
@@ -129,7 +128,7 @@ export function SyncStatusBar() {
     inline = (
       <Tooltip title={offlineTooltip}>
         <Chip
-          icon={<CloudOffIcon />}
+          icon={<CloudQueueIcon />}
           label={offlineLabel}
           size="small"
           variant="outlined"
