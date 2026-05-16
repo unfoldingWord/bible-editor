@@ -141,11 +141,23 @@ function rowFromStatus(prev: PipelineJob, status: PipelineStatusResponse): Pipel
 function mergeAndNotify(jobId: string, next: PipelineJob) {
   const prev = jobs.get(jobId);
   jobs.set(jobId, next);
+  let firedCompletion = false;
   if (prev && prev.state !== next.state && !NON_TERMINAL_STATES.has(next.state)) {
     // transitioned to a terminal state (done)
     emitCompletion(next, prev.state);
+    firedCompletion = true;
   } else if (prev && prev.state !== next.state && next.state === "failed") {
     emitCompletion(next, prev.state);
+    firedCompletion = true;
+  }
+  // Live transition to a terminal state with a toast already shown — tell
+  // the server so a reload doesn't re-fire the "while you were away" path.
+  // Skip the call if the job is already marked (e.g. the upstream status
+  // payload didn't include notified_user_at so we kept the previous value).
+  if (firedCompletion && next.notified_user_at === null) {
+    const now = Math.floor(Date.now() / 1000);
+    jobs.set(jobId, { ...next, notified_user_at: now });
+    void api.pipelineNotified(jobId).catch(() => { /* best effort */ });
   }
   notify();
 }
@@ -185,13 +197,60 @@ function ensurePolling() {
   }
 }
 
+// 24h cutoff for "completed while you were away" toasts. A job that
+// finished last week and was never notified is too stale to surface as a
+// fresh toast — the user has either moved on or already noticed via the
+// pipeline panel. We still mark it notified so it doesn't pile up.
+const STALE_NOTIFICATION_CUTOFF_SECONDS = 24 * 60 * 60;
+
 async function loadFromServer() {
   try {
     const res = await api.pipelineList();
+    // Collect terminal jobs we haven't toasted yet *before* mutating the
+    // jobs map. Anything in the response with state=done/failed and
+    // notified_user_at=null is a "while you were away" completion.
+    const unannounced: PipelineJob[] = [];
+    const nowSec = Math.floor(Date.now() / 1000);
     for (const row of res.jobs) {
+      const isTerminal = !NON_TERMINAL_STATES.has(row.state) || row.state === "failed";
+      if (
+        isTerminal &&
+        row.notified_user_at === null &&
+        nowSec - row.updated_at <= STALE_NOTIFICATION_CUTOFF_SECONDS
+      ) {
+        unannounced.push(row);
+      }
       jobs.set(row.job_id, row);
     }
     notify();
+
+    // Emit "while you were away" toasts. prev=null so the listener can
+    // distinguish these from live transitions if it cares (it currently
+    // doesn't — same toast either way).
+    for (const job of unannounced) {
+      emitCompletion(job, null);
+      // Mark notified server-side fire-and-forget. If the request fails
+      // (offline / network), we'll re-toast next reload — acceptable
+      // because the toast is idempotent from the user's perspective.
+      void api.pipelineNotified(job.job_id).catch(() => { /* see comment */ });
+      // Optimistically update local memory so a same-session re-list doesn't
+      // double-fire.
+      const updated = jobs.get(job.job_id);
+      if (updated) jobs.set(job.job_id, { ...updated, notified_user_at: nowSec });
+    }
+    // Also silently mark any stale unannounced job notified so it doesn't
+    // keep matching the "unnotified" filter on every reload forever.
+    for (const row of res.jobs) {
+      const isTerminal = !NON_TERMINAL_STATES.has(row.state) || row.state === "failed";
+      if (
+        isTerminal &&
+        row.notified_user_at === null &&
+        nowSec - row.updated_at > STALE_NOTIFICATION_CUTOFF_SECONDS
+      ) {
+        void api.pipelineNotified(row.job_id).catch(() => { /* best effort */ });
+      }
+    }
+
     // After reconciling, immediately refresh each polling job from upstream
     // so the user sees the latest state without waiting for the 2-min tick.
     await pollTick();
@@ -280,6 +339,7 @@ export const pipelineStore = {
       created_at: now,
       updated_at: now,
       last_polled_at: null,
+      notified_user_at: null,
     };
     jobs.set(res.jobId, jobs.get(res.jobId) ?? seeded);
     notify();

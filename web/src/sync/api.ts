@@ -605,6 +605,12 @@ export interface PipelineJobRow {
   created_at: number;
   updated_at: number;
   last_polled_at: number | null;
+  /**
+   * Set the first time the browser surfaces a "completed-while-away" toast
+   * for this job (via POST /api/pipelines/:id/notified). Null on jobs the
+   * user hasn't yet been told about — those drive the toast.
+   */
+  notified_user_at: number | null;
 }
 
 export const api = {
@@ -733,6 +739,15 @@ export const api = {
         ? `/api/pipelines?state=${encodeURIComponent(states.join(","))}`
         : `/api/pipelines`,
       { signal },
+    ),
+
+  // Acknowledge a "completed-while-away" toast so the server clears its
+  // unnotified flag. Fire-and-forget — if it fails the user just sees the
+  // toast again on the next reload, which is harmless.
+  pipelineNotified: (jobId: string, signal?: AbortSignal) =>
+    request<{ ok: boolean; changed: number }>(
+      `/api/pipelines/${encodeURIComponent(jobId)}/notified`,
+      { method: "POST", signal },
     ),
 
   getPendingImports: (book: string, chapter: number, signal?: AbortSignal) =>

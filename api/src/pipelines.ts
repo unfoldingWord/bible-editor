@@ -725,6 +725,16 @@ function countChainSuffixes(sessionKey: string): number {
 
 // GET /api/pipelines  — list current user's jobs from D1 (no upstream call).
 // Reconciliation surface for the browser when a tab opens/reloads.
+//
+// Default behavior (no ?state= filter) returns:
+//   - non-terminal jobs (running, paused_*, failed — the failure case is
+//     listed here even though it's terminal because the user might still
+//     retry it), AND
+//   - terminal jobs that haven't been "notified" yet, so the browser can
+//     fire a "while you were away" toast on first load after the server's
+//     cron finished a job in the user's absence.
+//
+// An explicit ?state= filter overrides this and returns exactly that set.
 pipelines.get("/", requireAuth, async (c) => {
   const userId = currentUserId(c);
   if (!userId) return c.json({ error: "unauthorized" }, 401);
@@ -735,43 +745,91 @@ pipelines.get("/", requireAuth, async (c) => {
         .split(",")
         .map((s) => s.trim())
         .filter(Boolean)
-    : Array.from(NON_TERMINAL_STATES);
+    : null;
 
-  if (stateList.length === 0) {
-    return c.json({ jobs: [] });
-  }
-
-  const placeholders = stateList.map((_, i) => `?${i + 2}`).join(",");
-  const rs = await c.env.DB.prepare(
-    `SELECT job_id, user_id, pipeline_type, book, start_chapter, end_chapter,
+  let rs;
+  const columns = `job_id, user_id, pipeline_type, book, start_chapter, end_chapter,
             session_key, state, current_skill, current_status, error_kind,
             error_message, output_json, follow_up_job_id, created_at, updated_at,
-            last_polled_at
-       FROM pipeline_jobs
-      WHERE user_id = ?1 AND state IN (${placeholders})
-      ORDER BY updated_at DESC
-      LIMIT 100`,
-  )
-    .bind(userId, ...stateList)
-    .all<{
-      job_id: string;
-      user_id: number;
-      pipeline_type: PipelineType;
-      book: string;
-      start_chapter: number;
-      end_chapter: number;
-      session_key: string;
-      state: string;
-      current_skill: string | null;
-      current_status: string | null;
-      error_kind: string | null;
-      error_message: string | null;
-      output_json: string | null;
-      follow_up_job_id: string | null;
-      created_at: number;
-      updated_at: number;
-      last_polled_at: number | null;
-    }>();
+            last_polled_at, notified_user_at`;
+
+  if (stateList === null) {
+    // Default: non-terminal OR unnotified terminal. Keeps the "running set"
+    // small (capped 100) while still surfacing any completed-while-away job
+    // exactly once.
+    const nonTerminal = Array.from(NON_TERMINAL_STATES);
+    const placeholders = nonTerminal.map((_, i) => `?${i + 2}`).join(",");
+    rs = await c.env.DB.prepare(
+      `SELECT ${columns}
+         FROM pipeline_jobs
+        WHERE user_id = ?1
+          AND (state IN (${placeholders}) OR notified_user_at IS NULL)
+        ORDER BY updated_at DESC
+        LIMIT 100`,
+    )
+      .bind(userId, ...nonTerminal)
+      .all<PipelineRowSelect>();
+  } else if (stateList.length === 0) {
+    return c.json({ jobs: [] });
+  } else {
+    const placeholders = stateList.map((_, i) => `?${i + 2}`).join(",");
+    rs = await c.env.DB.prepare(
+      `SELECT ${columns}
+         FROM pipeline_jobs
+        WHERE user_id = ?1 AND state IN (${placeholders})
+        ORDER BY updated_at DESC
+        LIMIT 100`,
+    )
+      .bind(userId, ...stateList)
+      .all<PipelineRowSelect>();
+  }
 
   return c.json({ jobs: rs.results });
+});
+
+interface PipelineRowSelect {
+  job_id: string;
+  user_id: number;
+  pipeline_type: PipelineType;
+  book: string;
+  start_chapter: number;
+  end_chapter: number;
+  session_key: string;
+  state: string;
+  current_skill: string | null;
+  current_status: string | null;
+  error_kind: string | null;
+  error_message: string | null;
+  output_json: string | null;
+  follow_up_job_id: string | null;
+  created_at: number;
+  updated_at: number;
+  last_polled_at: number | null;
+  notified_user_at: number | null;
+}
+
+// POST /api/pipelines/:jobId/notified  — mark a terminal job as having
+// surfaced a toast in the user's UI, so the next page load doesn't re-toast
+// the same completion. Idempotent: setting notified_user_at on an already-
+// notified job is a no-op (we only write where it's currently NULL).
+pipelines.post("/:jobId/notified", requireAuth, async (c) => {
+  const userId = currentUserId(c);
+  if (!userId) return c.json({ error: "unauthorized" }, 401);
+  const jobId = c.req.param("jobId");
+  if (!jobId) return c.json({ error: "missing_job_id" }, 400);
+
+  const res = await c.env.DB.prepare(
+    `UPDATE pipeline_jobs
+        SET notified_user_at = unixepoch()
+      WHERE job_id = ?1
+        AND user_id = ?2
+        AND notified_user_at IS NULL`,
+  )
+    .bind(jobId, userId)
+    .run();
+
+  // res.meta.changes is 0 if the row didn't exist, didn't belong to this
+  // user, or was already notified. None of these are errors — the client
+  // doesn't care.
+  return c.json({ ok: true, changed: res.meta?.changes ?? 0 });
 });
