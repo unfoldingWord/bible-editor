@@ -222,6 +222,53 @@ export async function authMe(c: AppContext): Promise<Response> {
   return c.json({ userId, username: username ?? null });
 }
 
+// POST /api/auth/refresh — exchanges a current-or-recently-expired bearer
+// token for a fresh one. A 7-day clockTolerance lets a translator come back
+// from a long offline stretch and silently get a new token before they have
+// to re-OAuth. Beyond grace, 401 → client falls back to the sign-in flow.
+const REFRESH_GRACE_SECONDS = 7 * 24 * 60 * 60;
+
+export async function refreshToken(c: AppContext): Promise<Response> {
+  const key = signingKey(c.env);
+  if (!key) return c.json({ error: "jwt_signing_key_not_configured" }, 500);
+  const header = c.req.header("authorization");
+  if (!header || !header.toLowerCase().startsWith("bearer ")) {
+    return c.json({ error: "unauthorized" }, 401);
+  }
+  const token = header.slice(7).trim();
+
+  let userId: number | null = null;
+  let username: string | null = null;
+  try {
+    const { payload } = await jwtVerify(token, key, {
+      issuer: c.env.JWT_ISSUER,
+      clockTolerance: REFRESH_GRACE_SECONDS,
+    });
+    const sub = payload.sub;
+    if (!sub) return c.json({ error: "unauthorized" }, 401);
+    const parsed = parseInt(String(sub), 10);
+    if (!Number.isFinite(parsed)) return c.json({ error: "unauthorized" }, 401);
+    userId = parsed;
+    if (typeof payload.username === "string") username = payload.username;
+  } catch {
+    return c.json({ error: "unauthorized" }, 401);
+  }
+
+  // Verify the user still exists — a refreshed token for a deleted account
+  // would let revoked users keep editing for another TTL window.
+  const row = await c.env.DB.prepare(
+    `SELECT id, dcs_username FROM users WHERE id = ?1`,
+  )
+    .bind(userId)
+    .first<{ id: number; dcs_username: string }>();
+  if (!row) return c.json({ error: "unauthorized" }, 401);
+
+  const newToken = await mintToken(c, row.id, row.dcs_username ?? username ?? "user");
+  const ttl = parseInt(c.env.JWT_TTL_SECONDS, 10);
+  const expiresIn = Number.isFinite(ttl) && ttl > 0 ? ttl : 1209600;
+  return c.json({ token: newToken, expiresIn });
+}
+
 // ── Dev-only token mint ───────────────────────────────────────────────────────
 
 // Looks up (or inserts) a user row by dcs_username and returns a signed JWT.

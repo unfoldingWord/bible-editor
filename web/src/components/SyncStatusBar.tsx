@@ -8,10 +8,18 @@
 import { useEffect, useState, type ReactNode } from "react";
 import { Box, Button, Chip, Stack, Tooltip } from "@mui/material";
 import CloudDoneIcon from "@mui/icons-material/CloudDone";
+import CloudOffIcon from "@mui/icons-material/CloudOff";
 import CloudQueueIcon from "@mui/icons-material/CloudQueue";
 import ErrorOutlineIcon from "@mui/icons-material/ErrorOutline";
 import WarningAmberIcon from "@mui/icons-material/WarningAmber";
-import { outbox, type OutboxOp } from "../sync/outbox";
+import { onOutboxResult, outbox, type OutboxOp } from "../sync/outbox";
+
+// If we believe we're online but haven't seen a successful save in this
+// long while pending ops exist, treat it as effectively offline —
+// navigator.onLine returns true on any LAN even with no real internet.
+// Picked 30s because outbox backoff caps there: by then at least one full
+// retry has been attempted and failed.
+const STALE_PROGRESS_MS = 30_000;
 
 interface FreshRow {
   version: number;
@@ -25,9 +33,44 @@ export function SyncStatusBar() {
   const [ops, setOps] = useState<OutboxOp[]>([]);
   useEffect(() => outbox.subscribe(setOps), []);
 
+  // Track navigator.onLine + last successful drain so we can distinguish
+  // "actively saving" from "queueing because we have no internet". A separate
+  // "stale-progress" check guards against navigator.onLine lying (it goes
+  // true on any LAN regardless of actual reachability).
+  const [online, setOnline] = useState<boolean>(
+    typeof navigator === "undefined" ? true : navigator.onLine,
+  );
+  const [lastSuccessAt, setLastSuccessAt] = useState<number>(() => Date.now());
+  useEffect(() => {
+    const onOnline = () => setOnline(true);
+    const onOffline = () => setOnline(false);
+    window.addEventListener("online", onOnline);
+    window.addEventListener("offline", onOffline);
+    return () => {
+      window.removeEventListener("online", onOnline);
+      window.removeEventListener("offline", onOffline);
+    };
+  }, []);
+  useEffect(() =>
+    onOutboxResult((_op, result) => {
+      if (result.kind === "ok") setLastSuccessAt(Date.now());
+    }),
+  []);
+
   const pending = ops.filter((o) => o.status === "pending" || o.status === "in_flight").length;
   const conflicts = ops.filter((o) => o.status === "conflict");
   const failed = ops.filter((o) => o.status === "failed");
+
+  // Tick once a second when pending > 0 so the "stale progress" heuristic
+  // can flip the pill to offline-style without waiting for the next outbox
+  // event. Cheap: 1Hz timer only when there's actually work outstanding.
+  const [now, setNow] = useState(Date.now());
+  useEffect(() => {
+    if (pending === 0) return;
+    const t = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(t);
+  }, [pending]);
+  const effectivelyOffline = !online || (pending > 0 && now - lastSuccessAt > STALE_PROGRESS_MS);
 
   const resolveAllConflicts = async () => {
     for (const op of conflicts) {
@@ -44,6 +87,10 @@ export function SyncStatusBar() {
     }
   };
 
+  // Priority: conflicts > failed > offline > saving > saved.
+  // Conflicts and failed always win because they need user action regardless
+  // of connection state. Offline outranks "saving N" because they describe
+  // the same fact (ops queued, no progress) — offline is the honest framing.
   let inline: ReactNode;
   if (conflicts.length > 0) {
     inline = (
@@ -66,6 +113,31 @@ export function SyncStatusBar() {
           size="small"
           variant="outlined"
           color="error"
+        />
+      </Tooltip>
+    );
+  } else if (effectivelyOffline) {
+    const offlineLabel = pending > 0
+      ? `${pending} queued — ${online ? "reconnecting…" : "offline"}`
+      : online ? "reconnecting…" : "offline";
+    const offlineTooltip = pending > 0
+      ? `${pending} edit${pending === 1 ? "" : "s"} queued locally. ${online ? "Trying to reach the server…" : "Will save when back online."}`
+      : online ? "trying to reach the server…" : "you are offline";
+    // Kindle warning accent (#E59D33 from CLAUDE.md brand palette) — offline
+    // is a transient state, not a failure, so the MUI default error red is
+    // wrong tone.
+    inline = (
+      <Tooltip title={offlineTooltip}>
+        <Chip
+          icon={<CloudOffIcon />}
+          label={offlineLabel}
+          size="small"
+          variant="outlined"
+          sx={{
+            color: "#E59D33",
+            borderColor: "#E59D33",
+            "& .MuiChip-icon": { color: "#E59D33" },
+          }}
         />
       </Tooltip>
     );

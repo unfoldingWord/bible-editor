@@ -7,6 +7,7 @@
 
 import { openDB, type IDBPDatabase } from "idb";
 import { api, ApiError, isChapterLockedBody, type ChapterLockedBody, type RowKind } from "./api";
+import { backoffMs } from "./backoff";
 
 const DB_NAME = "bible-editor-outbox";
 const DB_VERSION = 1;
@@ -446,11 +447,6 @@ export async function drain() {
     draining = false;
     void notify();
   }
-}
-
-function backoffMs(attempts: number) {
-  // Exponential up to 30s.
-  return Math.min(30_000, 250 * 2 ** Math.max(0, attempts - 1));
 }
 
 function scheduleDrain(ms: number) {

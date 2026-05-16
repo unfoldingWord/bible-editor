@@ -52,6 +52,18 @@ export class ChapterRoom implements DurableObject {
     const [client, server] = Object.values(pair) as [WebSocket, WebSocket];
     server.accept();
     this.clients.add(server);
+    // App-level pong reply. Clients ping every 20s to detect half-open
+    // sockets; without this the client would tear down healthy connections.
+    server.addEventListener("message", (ev) => {
+      try {
+        const data = JSON.parse(typeof ev.data === "string" ? ev.data : "");
+        if (data && typeof data === "object" && (data as { type?: unknown }).type === "ping") {
+          server.send(JSON.stringify({ type: "pong" }));
+        }
+      } catch {
+        /* malformed frame — ignore */
+      }
+    });
     server.addEventListener("close", () => this.clients.delete(server));
     server.addEventListener("error", () => this.clients.delete(server));
 
