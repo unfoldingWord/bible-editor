@@ -31,6 +31,7 @@ import { TopBar } from "./TopBar";
 import { LogosSyncToggle } from "./LogosSyncToggle";
 import { PipelineMenu } from "./PipelineMenu";
 import { PipelineStatusBar } from "./PipelineStatusBar";
+import { SyncStatusBar } from "./SyncStatusBar";
 import { pipelineStore, type PipelineJob } from "../sync/pipelineStore";
 import { onOutboxResult } from "../sync/outbox";
 import { AiCompletionToasts } from "./AiCompletionToasts";
@@ -77,6 +78,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook }:
     status,
     data,
     error,
+    retryAttempts,
     applyLocalRowPatch,
     applyLocalRowReplacement,
     applyLocalRowDelete,
@@ -496,18 +498,27 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook }:
     ? `${alignerTarget.chapter}:${alignerTarget.verse === 0 ? "i" : alignerTarget.verse}`
     : undefined;
 
-  if (status === "loading" || status === "idle") {
+  // Initial load (or retry from scratch) — no data to show yet. We still
+  // render the SyncStatusBar so an offline user sees their connection state
+  // and any queued edits even when the chapter itself can't load.
+  if (!data) {
     return (
-      <Box sx={{ p: 4, display: "flex", alignItems: "center", gap: 2 }}>
-        <CircularProgress size={20} />
-        <Typography variant="body2">loading {book} {chapter}…</Typography>
-      </Box>
-    );
-  }
-  if (status === "error" || !data) {
-    return (
-      <Box sx={{ p: 4 }}>
-        <Alert severity="error">failed to load {book} {chapter}: {error}</Alert>
+      <Box sx={{ display: "flex", flexDirection: "column", height: "100vh" }}>
+        <Box sx={{ display: "flex", justifyContent: "flex-end", p: 1 }}>
+          <SyncStatusBar />
+        </Box>
+        <Box sx={{ p: 4, display: "flex", alignItems: "center", gap: 2 }}>
+          {status === "error" ? (
+            <Alert severity="error">failed to load {book} {chapter}: {error}</Alert>
+          ) : (
+            <>
+              <CircularProgress size={20} />
+              <Typography variant="body2">
+                {status === "retrying" ? `reconnecting… (attempt ${retryAttempts})` : `loading ${book} ${chapter}…`}
+              </Typography>
+            </>
+          )}
+        </Box>
       </Box>
     );
   }

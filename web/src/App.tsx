@@ -1,10 +1,10 @@
 // NB: src/spikes/AlignerSmoke.tsx is intentionally NOT imported.
 // Aligner integration is deferred to Phase 3 — see docs/plan.md.
 import { useEffect, useState } from "react";
-import { Alert, Box, Button, CircularProgress, Stack, Typography } from "@mui/material";
+import { Alert, Box, Button, CircularProgress, Snackbar, Stack, Typography } from "@mui/material";
 import { Shell } from "./components/Shell";
 import { useBook } from "./hooks/useBook";
-import { devSignIn, getAuthToken, setAuthToken } from "./sync/api";
+import { devSignIn, getAuthToken, onAuthError, setAuthToken } from "./sync/api";
 
 interface Location {
   book: string;
@@ -78,6 +78,7 @@ function useAuthGate(): AuthState {
 export function App() {
   const [loc, setLoc] = useState<Location>(() => parseHash());
   const auth = useAuthGate();
+  const [sessionExpired, setSessionExpired] = useState(false);
   // useBook is hoisted here so its chapter cache survives Shell remounts
   // (which happen when the user navigates between chapters via the URL).
   // Don't initialize it until auth is ready — the BookSummary fetch is now
@@ -89,6 +90,8 @@ export function App() {
     window.addEventListener("hashchange", handler);
     return () => window.removeEventListener("hashchange", handler);
   }, []);
+
+  useEffect(() => onAuthError(() => setSessionExpired(true)), []);
 
   const navigate = (book: string, chapter: number, verse?: number) => {
     location.hash =
@@ -123,14 +126,41 @@ export function App() {
     );
   }
 
+  const handleReSignIn = () => {
+    setAuthToken(null);
+    if (import.meta.env.DEV) {
+      location.reload();
+    } else {
+      location.href = "/api/auth/dcs/start";
+    }
+  };
+
   return (
-    <Shell
-      key={`${loc.book}-${loc.chapter}-${loc.verse}`}
-      book={loc.book}
-      chapter={loc.chapter}
-      initialVerse={loc.verse}
-      onNavigate={navigate}
-      bookHook={bookHook}
-    />
+    <>
+      <Shell
+        key={`${loc.book}-${loc.chapter}-${loc.verse}`}
+        book={loc.book}
+        chapter={loc.chapter}
+        initialVerse={loc.verse}
+        onNavigate={navigate}
+        bookHook={bookHook}
+      />
+      <Snackbar
+        open={sessionExpired}
+        anchorOrigin={{ vertical: "top", horizontal: "center" }}
+      >
+        <Alert
+          severity="warning"
+          variant="filled"
+          action={
+            <Button color="inherit" size="small" onClick={handleReSignIn}>
+              Sign in
+            </Button>
+          }
+        >
+          Your session expired — sign in to keep saving. Queued edits will sync after sign-in.
+        </Alert>
+      </Snackbar>
+    </>
   );
 }

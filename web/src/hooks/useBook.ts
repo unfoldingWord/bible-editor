@@ -19,6 +19,7 @@ import {
   type TwlRow,
   type VerseDto,
 } from "../sync/api";
+import { fetchWithRetry } from "../sync/fetchWithRetry";
 import { onOutboxResult } from "../sync/outbox";
 
 export type ChapterState =
@@ -61,20 +62,35 @@ export function useBook(book: string, enabled: boolean): UseBookReturn {
     setSummaryStatus("loading");
     setChapters(new Map());
     inFlight.current.clear();
-    let cancelled = false;
-    api
-      .getBookSummary(book)
+    const ctrl = new AbortController();
+    fetchWithRetry(
+      (signal) => api.getBookSummary(book, signal),
+      { signal: ctrl.signal },
+    )
       .then((s) => {
-        if (cancelled) return;
+        if (ctrl.signal.aborted) return;
         setSummary(s);
         setSummaryStatus("ready");
       })
-      .catch(() => {
-        if (cancelled) return;
+      .catch((e) => {
+        if (ctrl.signal.aborted) return;
+        if (e instanceof DOMException && e.name === "AbortError") return;
         setSummaryStatus("error");
       });
     return () => {
-      cancelled = true;
+      ctrl.abort();
+    };
+  }, [book, enabled]);
+
+  // One AbortController per chapter so a book change can cancel them all.
+  const chapterCtrls = useRef<Map<number, AbortController>>(new Map());
+
+  // When the book toggles or `enabled` drops, abort every in-flight chapter
+  // load (the effect above already clears the cache).
+  useEffect(() => {
+    return () => {
+      for (const ctrl of chapterCtrls.current.values()) ctrl.abort();
+      chapterCtrls.current.clear();
     };
   }, [book, enabled]);
 
@@ -90,10 +106,16 @@ export function useBook(book: string, enabled: boolean): UseBookReturn {
         return next;
       });
       inFlight.current.add(ch);
-      api
-        .getChapter(book, ch)
+      const ctrl = new AbortController();
+      chapterCtrls.current.set(ch, ctrl);
+      fetchWithRetry(
+        (signal) => api.getChapter(book, ch, signal),
+        { signal: ctrl.signal },
+      )
         .then((data) => {
           inFlight.current.delete(ch);
+          chapterCtrls.current.delete(ch);
+          if (ctrl.signal.aborted) return;
           setChapters((prev) => {
             const next = new Map(prev);
             next.set(ch, { kind: "ready", data });
@@ -102,6 +124,9 @@ export function useBook(book: string, enabled: boolean): UseBookReturn {
         })
         .catch((e) => {
           inFlight.current.delete(ch);
+          chapterCtrls.current.delete(ch);
+          if (ctrl.signal.aborted) return;
+          if (e instanceof DOMException && e.name === "AbortError") return;
           setChapters((prev) => {
             const next = new Map(prev);
             next.set(ch, {

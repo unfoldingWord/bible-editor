@@ -1,8 +1,14 @@
 // Module-level lexicon cache: each unique Strong's key is fetched at most
 // once per page load. Components subscribe via useLexicon, which batches
 // requested strongs into a single GET /api/lexicon?strongs=... call.
+//
+// The in-memory `cache` Map is mirrored to IndexedDB via lexiconCache.ts so
+// F5 (or reload while offline) still renders tooltips and resource cards
+// without hitting the network.
 
 import { useEffect, useState } from "react";
+
+import { getEntries as getCachedEntries, putEntries as putCachedEntries } from "../sync/lexiconCache";
 
 export interface LexiconEntry {
   strong: string;
@@ -29,23 +35,45 @@ export function normalizeStrong(raw: string): string[] {
 }
 
 async function ensure(rawStrongs: string[]) {
-  const want: string[] = [];
+  const candidates: string[] = [];
   for (const s of rawStrongs) {
     const keys = normalizeStrong(s);
     for (const k of keys) {
-      if (!cache.has(k) && !inFlight.has(k)) want.push(k);
+      if (!cache.has(k) && !inFlight.has(k)) candidates.push(k);
     }
   }
+  if (candidates.length === 0) return;
+
+  // Try the persistent cache first — every IDB hit is one less network call,
+  // and the only path that works while offline.
+  const cached = await getCachedEntries(candidates);
+  for (const [k, entry] of cached) {
+    cache.set(k, entry);
+  }
+  const want = candidates.filter((k) => !cache.has(k));
+  if (cached.size > 0) {
+    for (const fn of subscribers) fn();
+  }
   if (want.length === 0) return;
+
   for (const k of want) inFlight.add(k);
   try {
     const url = `/api/lexicon?strongs=${encodeURIComponent(want.join(","))}`;
     const res = await fetch(url);
     const data = (await res.json()) as { entries?: LexiconEntry[] };
     const byStrong = new Map((data.entries ?? []).map((e) => [e.strong, e]));
-    for (const k of want) cache.set(k, byStrong.get(k) ?? null);
+    const fresh = new Map<string, LexiconEntry | null>();
+    for (const k of want) {
+      const entry = byStrong.get(k) ?? null;
+      cache.set(k, entry);
+      fresh.set(k, entry);
+    }
+    // Persist for next reload. Includes nulls so an explicit "we asked, no
+    // such Strong's" answer is remembered too.
+    void putCachedEntries(fresh);
   } catch {
-    for (const k of want) cache.set(k, null);
+    // Network failure (offline, fetch threw, server down) — don't poison the
+    // in-memory cache with nulls so a later online retry can succeed.
   } finally {
     for (const k of want) inFlight.delete(k);
     for (const fn of subscribers) fn();

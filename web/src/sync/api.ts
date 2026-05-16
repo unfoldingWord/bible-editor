@@ -195,7 +195,88 @@ export function setAuthToken(token: string | null) {
   }
 }
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
+// Surface to the UI that we tried to silently refresh a 401 and it failed.
+// App.tsx subscribes to render a "Session expired — sign in again" banner;
+// the outbox keeps queuing edits in the meantime so nothing is lost.
+type AuthErrorListener = () => void;
+const authErrorListeners = new Set<AuthErrorListener>();
+export function onAuthError(fn: AuthErrorListener): () => void {
+  authErrorListeners.add(fn);
+  return () => authErrorListeners.delete(fn);
+}
+function emitAuthError() {
+  for (const fn of authErrorListeners) {
+    try { fn(); } catch { /* listener bug — don't break the request pipeline */ }
+  }
+}
+
+// Concurrent failing requests share a single refresh attempt so we don't
+// trigger N refresh calls when N in-flight outbox ops all 401 at once.
+let refreshInFlight: Promise<boolean> | null = null;
+async function refreshAuthOnce(): Promise<boolean> {
+  if (refreshInFlight) return refreshInFlight;
+  refreshInFlight = (async () => {
+    try {
+      const token = getAuthToken();
+      if (!token) return false;
+      const res = await fetch("/api/auth/refresh", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (!res.ok) return false;
+      const data = (await res.json().catch(() => null)) as { token?: string } | null;
+      if (!data?.token) return false;
+      setAuthToken(data.token);
+      return true;
+    } catch {
+      return false;
+    } finally {
+      // Clear after a brief delay so a burst of concurrent 401s coalesce on
+      // the same refresh promise. Without the delay we could race a second
+      // refresh between resolution and the next call's `if (refreshInFlight)`
+      // check.
+      setTimeout(() => { refreshInFlight = null; }, 0);
+    }
+  })();
+  return refreshInFlight;
+}
+
+// Default 30s. Picked over 15s because verse PATCH with full USFM tree on a
+// slow link can legitimately take double-digit seconds. Higher than this and
+// a half-open socket starts to block sibling outbox ops (the outbox's per-
+// target FIFO means a hung op holds back everything on that row).
+const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
+
+export interface RequestInitWithTimeout extends RequestInit {
+  /** Override the default 30s timeout. Pass 0 to disable. */
+  timeoutMs?: number;
+}
+
+// Compose any number of AbortSignals into one. Aborts as soon as any input
+// aborts. We can't use AbortSignal.any directly because Safari < 17.4 and
+// Firefox < 124 didn't ship it yet.
+function composeSignals(signals: AbortSignal[]): AbortSignal {
+  if (signals.length === 1) return signals[0]!;
+  const controller = new AbortController();
+  const onAbort = (s: AbortSignal) => {
+    if (controller.signal.aborted) return;
+    controller.abort(s.reason);
+  };
+  for (const s of signals) {
+    if (s.aborted) {
+      onAbort(s);
+      break;
+    }
+    s.addEventListener("abort", () => onAbort(s), { once: true });
+  }
+  return controller.signal;
+}
+
+async function request<T>(
+  path: string,
+  init?: RequestInitWithTimeout,
+  _retriedAfterRefresh = false,
+): Promise<T> {
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
     ...((init?.headers as Record<string, string>) ?? {}),
@@ -204,7 +285,55 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   if (token && !headers.Authorization) {
     headers.Authorization = `Bearer ${token}`;
   }
-  const res = await fetch(path, { ...init, headers });
+
+  const timeoutMs = init?.timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
+  let signal = init?.signal ?? undefined;
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  if (timeoutMs > 0) {
+    const timeoutCtrl = new AbortController();
+    timer = setTimeout(
+      () => timeoutCtrl.abort(new DOMException("timeout", "TimeoutError")),
+      timeoutMs,
+    );
+    signal = signal ? composeSignals([signal, timeoutCtrl.signal]) : timeoutCtrl.signal;
+  }
+
+  // Strip our extension before handing to fetch.
+  const fetchInit: RequestInit = { ...init, headers, signal };
+  delete (fetchInit as RequestInitWithTimeout).timeoutMs;
+
+  let res: Response;
+  try {
+    res = await fetch(path, fetchInit);
+  } catch (e) {
+    if (timer) clearTimeout(timer);
+    // Surface our timeout as a plain Error so callers (notably the outbox at
+    // outbox.ts dispatch → `e instanceof ApiError === false` branch)
+    // classify it as `network`/retry instead of `fatal`.
+    if (e instanceof DOMException && e.name === "TimeoutError") {
+      throw new Error("request timeout");
+    }
+    throw e;
+  }
+  if (timer) clearTimeout(timer);
+
+  if (res.status === 401 && !_retriedAfterRefresh) {
+    // Silent refresh once per request. Only attempt while online — refreshing
+    // through a captive portal would just burn the refresh window. The
+    // outbox retries on `online`/`focus` so we'll get another shot then.
+    if (typeof navigator !== "undefined" && navigator.onLine === false) {
+      throw new ApiError(401, "HTTP 401");
+    }
+    const refreshed = await refreshAuthOnce();
+    if (refreshed) {
+      return request<T>(path, init, true);
+    }
+    // Refresh failed — token is dead or user was revoked. Surface to UI so
+    // the user sees *why* their edits are queueing forever.
+    emitAuthError();
+    throw new ApiError(401, "HTTP 401");
+  }
+
   if (!res.ok) {
     let body: unknown = null;
     try {
@@ -479,11 +608,14 @@ export interface PipelineJobRow {
 }
 
 export const api = {
-  getBookSummary: (book: string) =>
-    request<BookSummary>(`/api/chapters/${encodeURIComponent(book)}`),
+  getBookSummary: (book: string, signal?: AbortSignal) =>
+    request<BookSummary>(`/api/chapters/${encodeURIComponent(book)}`, { signal }),
 
-  getChapter: (book: string, chapter: number) =>
-    request<ChapterPayload>(`/api/chapters/${encodeURIComponent(book)}/${chapter}`),
+  getChapter: (book: string, chapter: number, signal?: AbortSignal) =>
+    request<ChapterPayload>(
+      `/api/chapters/${encodeURIComponent(book)}/${chapter}`,
+      { signal },
+    ),
 
   getCatalogs: () => request<Catalogs>(`/api/catalogs`),
 

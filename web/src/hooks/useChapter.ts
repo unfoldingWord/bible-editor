@@ -14,14 +14,17 @@ import {
   type VerseDto,
   type VerseStatus,
 } from "../sync/api";
+import { fetchWithRetry } from "../sync/fetchWithRetry";
 import { onOutboxResult } from "../sync/outbox";
 
-type Status = "idle" | "loading" | "ready" | "error";
+type Status = "idle" | "loading" | "ready" | "error" | "retrying";
 
 export interface UseChapterReturn {
   status: Status;
   data: ChapterPayload | null;
   error: string | null;
+  /** Incremented every failed attempt during the current retry loop. Useful for showing "reconnecting…". */
+  retryAttempts: number;
   refetch: () => Promise<void>;
   applyLocalRowPatch: (kind: "tn" | "tq" | "twl", id: string, patch: Partial<TnRow & TqRow & TwlRow>) => void;
   applyLocalRowReplacement: (kind: "tn" | "tq" | "twl", row: TnRow | TqRow | TwlRow) => void;
@@ -39,18 +42,40 @@ export function useChapter(book: string, chapter: number): UseChapterReturn {
   const [status, setStatus] = useState<Status>("idle");
   const [data, setData] = useState<ChapterPayload | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [retryAttempts, setRetryAttempts] = useState(0);
   const mounted = useRef(true);
+  const fetchCtrl = useRef<AbortController | null>(null);
 
   const refetch = useCallback(async () => {
+    // Abort any in-flight retry loop from a previous (book, chapter) before
+    // starting a new one — otherwise stale data could land after navigation.
+    fetchCtrl.current?.abort();
+    const ctrl = new AbortController();
+    fetchCtrl.current = ctrl;
+
     setStatus("loading");
     setError(null);
+    setRetryAttempts(0);
     try {
-      const payload = await api.getChapter(book, chapter);
-      if (!mounted.current) return;
+      const payload = await fetchWithRetry(
+        (signal) => api.getChapter(book, chapter, signal),
+        {
+          signal: ctrl.signal,
+          onAttempt: (attempts) => {
+            if (mounted.current && fetchCtrl.current === ctrl) {
+              setStatus("retrying");
+              setRetryAttempts(attempts);
+            }
+          },
+        },
+      );
+      if (!mounted.current || fetchCtrl.current !== ctrl) return;
       setData(payload);
       setStatus("ready");
+      setRetryAttempts(0);
     } catch (e) {
-      if (!mounted.current) return;
+      if (!mounted.current || fetchCtrl.current !== ctrl) return;
+      if (ctrl.signal.aborted) return;
       setError(e instanceof ApiError ? `HTTP ${e.status}` : String(e));
       setStatus("error");
     }
@@ -61,6 +86,7 @@ export function useChapter(book: string, chapter: number): UseChapterReturn {
     void refetch();
     return () => {
       mounted.current = false;
+      fetchCtrl.current?.abort();
     };
   }, [refetch]);
 
@@ -193,6 +219,7 @@ export function useChapter(book: string, chapter: number): UseChapterReturn {
     status,
     data,
     error,
+    retryAttempts,
     refetch,
     applyLocalRowPatch,
     applyLocalRowReplacement,

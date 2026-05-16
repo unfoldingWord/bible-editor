@@ -9,7 +9,7 @@ import { exports as exportsRoutes } from "./exports";
 import { tnQuick } from "./tnQuick";
 import { pipelines, pollAllNonTerminal } from "./pipelines";
 import { pendingImports } from "./pendingImports";
-import { attachAuth, mintDevToken, startDcsAuth, callbackDcsAuth, authMe, verifyToken } from "./auth";
+import { attachAuth, mintDevToken, startDcsAuth, callbackDcsAuth, authMe, refreshToken, verifyToken } from "./auth";
 
 export interface Env {
   DB: D1Database;
@@ -97,6 +97,7 @@ app.get("/api/books", async (c) => {
 app.get("/api/auth/dcs/start", startDcsAuth);
 app.get("/api/auth/dcs/callback", callbackDcsAuth);
 app.get("/api/auth/me", authMe);
+app.post("/api/auth/refresh", refreshToken);
 
 // Dev-only: mint a JWT against a known/created users.id. Gated by
 // DEV_AUTH_ENABLED so it can't be left on in prod.
