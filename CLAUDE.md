@@ -1,5 +1,7 @@
 # CLAUDE.md
 
+> **No remote backend deployed yet.** `--remote` D1 migrations, `wrangler deploy`, OAuth callbacks, and any path through `uw-bt-bot` will fail until provisioning per [`docs/deploy.md`](docs/deploy.md). Work in `--local` mode only. **Remove this notice once we've deployed.**
+
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## Context
