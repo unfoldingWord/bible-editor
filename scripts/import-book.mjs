@@ -105,8 +105,12 @@ function importVerses(bibleVersion, srcPath) {
       if (!/^\d+(-\d+)?$/.test(verse)) continue; // skip 'front', etc.
       const vNum = parseInt(verse.split("-")[0], 10);
       const verseObj = chapterObj[verse];
-      const text = extractPlainText(verseObj);
-      const json_blob = JSON.stringify(verseObj);
+      const normalized = {
+        ...verseObj,
+        verseObjects: normalizeWordPunctuation(verseObj.verseObjects ?? []),
+      };
+      const text = extractPlainText(normalized);
+      const json_blob = JSON.stringify(normalized);
       lines.push(
         `INSERT INTO verses (book, chapter, verse, bible_version, content_json, plain_text) VALUES (${q(book)}, ${q(chNum)}, ${q(vNum)}, ${q(bibleVersion)}, ${q(json_blob)}, ${q(text)});`,
       );
@@ -114,6 +118,41 @@ function importVerses(bibleVersion, srcPath) {
     }
   }
   return count;
+}
+
+// Mirror of `normalizeWordPunctuation` in api/src/importParsers.ts —
+// see that file for the rationale. Strips leading / trailing
+// non-letter chars off `\w` text, emitting them as adjacent text
+// nodes so the aligner doesn't show `"What` or `seeing?"` chips.
+const LETTER_RE = /[\p{L}\p{M}\p{N}]/u;
+function splitWordPunctuation(text) {
+  const first = text.search(LETTER_RE);
+  if (first < 0) return { leading: text, core: "", trailing: "" };
+  let last = first;
+  for (let i = text.length - 1; i >= first; i--) {
+    if (LETTER_RE.test(text[i])) { last = i; break; }
+  }
+  return { leading: text.slice(0, first), core: text.slice(first, last + 1), trailing: text.slice(last + 1) };
+}
+function normalizeNode(node) {
+  if (!node || typeof node !== "object") return [node];
+  if (node.type === "word" && node.tag === "w" && typeof node.text === "string") {
+    const s = splitWordPunctuation(node.text);
+    if (s.leading === "" && s.trailing === "") return [node];
+    const out = [];
+    if (s.leading) out.push({ type: "text", text: s.leading });
+    if (s.core) out.push({ ...node, text: s.core });
+    if (s.trailing) out.push({ type: "text", text: s.trailing });
+    return out;
+  }
+  if (Array.isArray(node.children)) {
+    return [{ ...node, children: node.children.flatMap(normalizeNode) }];
+  }
+  return [node];
+}
+function normalizeWordPunctuation(verseObjects) {
+  if (!Array.isArray(verseObjects)) return verseObjects;
+  return verseObjects.flatMap(normalizeNode);
 }
 
 function extractPlainText(verseObj) {
