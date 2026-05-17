@@ -75,33 +75,43 @@ function isWordLeaf(node: Record<string, unknown>): boolean {
   return node["type"] === "word" && node["tag"] === "w";
 }
 
+// A word run — Unicode letters/marks (plus ZWJ / word-joiner for
+// scripts that need them) with intra-word `-` / `'` / `’` allowed
+// between letter runs (so "don't", "don’t", "hello-world" stay one
+// `\w` token but flanking quotes / dashes ride as text). Mirrors
+// `string-punctuation-tokenizer`'s greedy pattern, the package
+// translationCore / gatewayEdit use for the same job.
+const WORD_RUN_RE = /[\p{L}\p{M}‍⁠]+(?:[-'’][\p{L}\p{M}‍⁠]+)*/gu;
+
 // Re-tokenize a plain string into a flat verseObjects-style array. Each
-// non-whitespace run becomes a `\w` node so the aligner has draggable
-// targets; the whitespace runs ride along as `text` nodes. Used only when
-// the smart path bails.
+// word run becomes a `\w` node so the aligner has draggable targets;
+// whitespace AND punctuation ride along as `text` nodes. Without
+// excluding punctuation, inserting a bare `{` (or any non-letter char)
+// between two existing words produces a `\w {\w*` token that shows up
+// as a draggable alignment chip. Used only when the smart path bails.
 export function tokenizePlainText(text: string): unknown[] {
   const out: unknown[] = [];
   const occByWord = new Map<string, number>();
-  let i = 0;
-  while (i < text.length) {
-    const isSpace = /\s/.test(text[i]);
-    let j = i + 1;
-    while (j < text.length && /\s/.test(text[j]) === isSpace) j++;
-    const chunk = text.slice(i, j);
-    if (isSpace) {
-      out.push({ type: "text", text: chunk });
-    } else {
-      const occ = (occByWord.get(chunk) ?? 0) + 1;
-      occByWord.set(chunk, occ);
-      out.push({
-        type: "word",
-        tag: "w",
-        text: chunk,
-        occurrence: String(occ),
-        occurrences: "1",
-      });
+  let last = 0;
+  for (const m of text.matchAll(WORD_RUN_RE)) {
+    const start = m.index ?? 0;
+    if (start > last) {
+      out.push({ type: "text", text: text.slice(last, start) });
     }
-    i = j;
+    const word = m[0];
+    const occ = (occByWord.get(word) ?? 0) + 1;
+    occByWord.set(word, occ);
+    out.push({
+      type: "word",
+      tag: "w",
+      text: word,
+      occurrence: String(occ),
+      occurrences: "1",
+    });
+    last = start + word.length;
+  }
+  if (last < text.length) {
+    out.push({ type: "text", text: text.slice(last) });
   }
   return out;
 }
