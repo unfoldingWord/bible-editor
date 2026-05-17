@@ -42,6 +42,7 @@ const NON_TERMINAL_STATES: ReadonlySet<PipelineState> = new Set([
 ]);
 
 const SESSION_KEY_LS = "bible-editor.pipeline.sessionKey";
+const DISMISSED_LS = "bible-editor.pipeline.dismissed";
 
 export type PipelineJob = PipelineJobRow;
 
@@ -56,6 +57,29 @@ const jobs = new Map<string, PipelineJob>();
 const subscribers = new Set<JobsListener>();
 const completionListeners = new Set<CompletionListener>();
 const focusListeners = new Set<FocusListener>();
+
+// Job IDs the user has explicitly dismissed from the status chip. Persists
+// across reloads so loadFromServer doesn't resurrect them. Done jobs stay
+// in D1 (the upstream pipeline service owns the lifecycle); we just hide
+// them client-side.
+function loadDismissed(): Set<string> {
+  try {
+    const raw = localStorage.getItem(DISMISSED_LS);
+    if (!raw) return new Set();
+    const arr = JSON.parse(raw);
+    return Array.isArray(arr) ? new Set(arr.filter((x): x is string => typeof x === "string")) : new Set();
+  } catch {
+    return new Set();
+  }
+}
+const dismissed: Set<string> = loadDismissed();
+function persistDismissed() {
+  try {
+    localStorage.setItem(DISMISSED_LS, JSON.stringify(Array.from(dismissed)));
+  } catch {
+    /* private mode / no storage */
+  }
+}
 
 let initStarted = false;
 let pollTimer: ReturnType<typeof setInterval> | null = null;
@@ -212,6 +236,9 @@ async function loadFromServer() {
     const unannounced: PipelineJob[] = [];
     const nowSec = Math.floor(Date.now() / 1000);
     for (const row of res.jobs) {
+      // Skip jobs the user has explicitly dismissed from the chip. They
+      // stay in D1; we just don't resurrect them into the local map.
+      if (dismissed.has(row.job_id)) continue;
       const isTerminal = !NON_TERMINAL_STATES.has(row.state) || row.state === "failed";
       if (
         isTerminal &&
@@ -358,5 +385,23 @@ export const pipelineStore = {
 
   async refresh(jobId: string) {
     await pollOne(jobId);
+  },
+
+  // Hide every currently-done job from the chip. Dismissed IDs persist in
+  // localStorage so a tab reload doesn't bring them back. Non-terminal /
+  // failed jobs are left alone — those still need user attention.
+  dismissDone() {
+    let changed = false;
+    for (const [id, j] of jobs) {
+      if (j.state === "done") {
+        jobs.delete(id);
+        dismissed.add(id);
+        changed = true;
+      }
+    }
+    if (changed) {
+      persistDismissed();
+      notify();
+    }
   },
 };

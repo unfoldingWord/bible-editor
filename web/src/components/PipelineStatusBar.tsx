@@ -1,6 +1,9 @@
-// Bottom-area pill summarizing active AI pipeline runs. Sits to the left of
-// SyncStatusBar so they don't overlap. Click expands to list each job with
-// its state, current skill, and (for resumable failures) a Retry button.
+// Top-right pill summarizing active AI pipeline runs. Lives below the TopBar
+// rather than at the bottom so it doesn't overlap the AlignmentPanel's
+// Cancel/Save action bar in the right column; the popover opens downward
+// into empty header space instead of upward across the column. Click
+// expands to list each job with its state, current skill, and (for
+// resumable failures) a Retry button.
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
@@ -180,6 +183,7 @@ export function PipelineStatusBar({ toast, onToastClear }: Props = {}) {
   const [jobs, setJobs] = useState<PipelineJobRow[]>([]);
   const [anchorEl, setAnchorEl] = useState<HTMLElement | null>(null);
   const [retrying, setRetrying] = useState<string | null>(null);
+  const [refreshing, setRefreshing] = useState(false);
   // When pipelineStore.requestFocus(jobId) fires (e.g. on already_running),
   // we stash the request and let the next render — once hasAnything flips
   // true and the chip mounts — anchor the popover to the chip.
@@ -262,8 +266,8 @@ export function PipelineStatusBar({ toast, onToastClear }: Props = {}) {
         ref={chipRef}
         sx={{
           position: "fixed",
-          right: 160,
-          bottom: 12,
+          right: 12,
+          top: 56,
           zIndex: (t) => t.zIndex.snackbar,
         }}
       >
@@ -292,6 +296,16 @@ export function PipelineStatusBar({ toast, onToastClear }: Props = {}) {
               variant="outlined"
               color={active.length > 0 ? "primary" : failed.length > 0 ? "error" : "success"}
               onClick={(e) => setAnchorEl(e.currentTarget)}
+              // Only the "done-only" variant is dismissable. Running and
+              // failed states need user attention, so no delete icon there.
+              onDelete={
+                active.length === 0 && failed.length === 0 && doneRecent.length > 0
+                  ? () => {
+                      pipelineStore.dismissDone();
+                      setAnchorEl(null);
+                    }
+                  : undefined
+              }
               sx={{ bgcolor: "background.paper", boxShadow: 2 }}
             />
           )}
@@ -301,8 +315,8 @@ export function PipelineStatusBar({ toast, onToastClear }: Props = {}) {
         open={Boolean(anchorEl)}
         anchorEl={anchorEl}
         onClose={() => setAnchorEl(null)}
-        anchorOrigin={{ vertical: "top", horizontal: "right" }}
-        transformOrigin={{ vertical: "bottom", horizontal: "right" }}
+        anchorOrigin={{ vertical: "bottom", horizontal: "right" }}
+        transformOrigin={{ vertical: "top", horizontal: "right" }}
       >
         <Box sx={{ p: 1.5, minWidth: 320, maxWidth: 420 }}>
           <Typography variant="caption" color="text.secondary">
@@ -380,15 +394,35 @@ export function PipelineStatusBar({ toast, onToastClear }: Props = {}) {
               );
             })}
           </Stack>
-          <Button
-            size="small"
-            sx={{ mt: 1 }}
-            onClick={() => {
-              for (const j of jobs) void pipelineStore.refresh(j.job_id);
-            }}
-          >
-            Refresh
-          </Button>
+          <Stack direction="row" spacing={1} sx={{ mt: 1 }} alignItems="center">
+            <Button
+              size="small"
+              disabled={refreshing || jobs.length === 0}
+              startIcon={refreshing ? <CircularProgress size={12} /> : undefined}
+              onClick={async () => {
+                setRefreshing(true);
+                try {
+                  await Promise.all(jobs.map((j) => pipelineStore.refresh(j.job_id)));
+                } finally {
+                  setRefreshing(false);
+                }
+              }}
+            >
+              {refreshing ? "Refreshing…" : "Refresh"}
+            </Button>
+            {doneRecent.length > 0 && active.length === 0 && failed.length === 0 && (
+              <Button
+                size="small"
+                color="inherit"
+                onClick={() => {
+                  pipelineStore.dismissDone();
+                  setAnchorEl(null);
+                }}
+              >
+                Dismiss
+              </Button>
+            )}
+          </Stack>
         </Box>
       </Popover>
     </>
