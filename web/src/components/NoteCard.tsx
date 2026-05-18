@@ -22,12 +22,8 @@ import LightbulbOutlinedIcon from "@mui/icons-material/LightbulbOutlined";
 import DeleteOutlineIcon from "@mui/icons-material/DeleteOutline";
 import AddIcon from "@mui/icons-material/Add";
 import DragIndicatorIcon from "@mui/icons-material/DragIndicator";
-// Kept for the hidden save IconButton (search "hidden 2026-05-14" below);
-// drop these and the void below once we decide to delete the button.
 import SaveIcon from "@mui/icons-material/Save";
 import SaveOutlinedIcon from "@mui/icons-material/SaveOutlined";
-void SaveIcon;
-void SaveOutlinedIcon;
 import TranslateIcon from "@mui/icons-material/Translate";
 import UndoIcon from "@mui/icons-material/Undo";
 import AutoAwesomeIcon from "@mui/icons-material/AutoAwesome";
@@ -265,12 +261,11 @@ export function NoteCard({
   const stashEdit = (patch: Partial<TnRow>) => {
     pendingRef.current = { ...pendingRef.current, ...patch };
     // Optimistic local apply so the parent's data.tn reflects the live
-    // value — keeps verse highlighting / aligner quote in step.
+    // value. Required so a mid-session remount (e.g. pin toggle reshaping
+    // the resource column) doesn't initialise the next instance from a
+    // stale row prop — that would freeze the display at pre-edit content
+    // even after the save lands as v(n+1).
     onChange(patch);
-  };
-
-  const stashLocalEdit = (patch: Partial<TnRow>) => {
-    pendingRef.current = { ...pendingRef.current, ...patch };
   };
 
   const handleUndo = () => {
@@ -556,7 +551,6 @@ export function NoteCard({
             </IconButton>
           </Tooltip>
         )}
-        {/* hidden 2026-05-14 — autosave handles it; re-enable if users ask
         <Tooltip title={hasNetChanges ? "save pending edits now (auto-saves when you leave this note)" : "no pending edits"}>
           <span>
             <IconButton
@@ -569,7 +563,6 @@ export function NoteCard({
             </IconButton>
           </span>
         </Tooltip>
-        */}
         {!readOnly && (
           <>
             <Tooltip title="add a new note after this one">
@@ -698,7 +691,7 @@ export function NoteCard({
           value={note}
           onChange={(e) => {
             setNote(e.target.value);
-            stashLocalEdit({ note: e.target.value });
+            stashEdit({ note: e.target.value });
           }}
           multiline
           fullWidth
@@ -780,7 +773,7 @@ export function NoteCard({
               disabled={readOnly}
               onClick={() => {
                 setNote(TCM);
-                stashLocalEdit({ note: TCM });
+                stashEdit({ note: TCM });
               }}
               sx={{
                 fontFamily: "monospace",
@@ -804,7 +797,7 @@ export function NoteCard({
               onClick={() => {
                 const t = buildSH(row.book);
                 setNote(t);
-                stashLocalEdit({ note: t });
+                stashEdit({ note: t });
               }}
               sx={{
                 fontFamily: "monospace",
