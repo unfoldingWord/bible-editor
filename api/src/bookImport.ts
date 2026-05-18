@@ -77,6 +77,23 @@ books.post("/:book/import", requireAuth, async (c) => {
     return c.json({ ok: true, book, alreadyImported: true, imported_at: existing.imported_at });
   }
 
+  // Orphan recovery: rows exist but book_imports is missing (import succeeded but
+  // the final INSERT crashed). Re-register without wiping so any edits are preserved.
+  const hasData = await c.env.DB.prepare(
+    `SELECT 1 FROM verses WHERE book = ?1 LIMIT 1`,
+  )
+    .bind(book)
+    .first();
+  if (hasData) {
+    await c.env.DB.prepare(
+      `INSERT OR IGNORE INTO book_imports (book, source_url, imported_at, imported_by)
+       VALUES (?1, 'recovered', unixepoch(), ?2)`,
+    )
+      .bind(book, userId)
+      .run();
+    return c.json({ ok: true, book, recovered: true });
+  }
+
   if (inFlight.has(book)) {
     return c.json({ error: "in_progress", book }, 409);
   }
