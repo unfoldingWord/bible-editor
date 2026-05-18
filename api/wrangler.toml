@@ -19,6 +19,11 @@ port = 8787
 directory = "../web/dist"
 binding = "ASSETS"
 not_found_handling = "single-page-application"
+# Document navigations to /api/* (Sec-Fetch-Dest: document) would otherwise be
+# swallowed by the SPA fallback and never hit the Worker — which breaks the
+# OAuth start redirect (Sign in with Door43 → 200 index.html instead of 302
+# to git.door43.org). Force the Worker to run first for /api/* paths.
+run_worker_first = ["/api/*"]
 
 # D1 database — replace `database_id` once we run `wrangler d1 create bible_editor`.
 [[d1_databases]]
