@@ -859,6 +859,7 @@ export function NoteCard({
           <NoteHistoryDialog
             open={historyOpen}
             noteId={row.id}
+            book={row.book}
             currentVersion={row.version}
             effectiveVersion={row.restored_from_version ?? row.version}
             onClose={() => setHistoryOpen(false)}
