@@ -108,6 +108,12 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook }:
       }
     },
     onDelete: (kind, id) => applyLocalRowDelete(kind, id),
+    onVerseUpdate: (verse) => {
+      const existing = dataRef.current?.verses[verse.bible_version]?.[verse.verse];
+      if (!existing || verse.version > existing.version) {
+        applyLocalVerse(verse);
+      }
+    },
   });
   const [activeVerse, setActiveVerse] = useState(initialVerse);
   const [activeNoteId, setActiveNoteId] = useState<string | null>(null);

@@ -4,6 +4,7 @@ import type { Env } from "./index";
 import type { VerseRow } from "./types";
 import { currentUserId, requireAuth } from "./auth";
 import { activePipelineForChapter, lockedResponseBody } from "./chapterLock";
+import { broadcastChapter } from "./wsEvents";
 
 export const verses = new Hono<{ Bindings: Env; Variables: { userId?: number } }>();
 
@@ -162,6 +163,15 @@ verses.patch("/:book/:chapter/:verse/:bibleVersion", requireAuth, async (c) => {
     if (updated) updatedParsed = JSON.parse(updated.content_json);
   } catch {
     /* ignore */
+  }
+  if (updated) {
+    const verseDto = { ...updated, content: updatedParsed };
+    c.executionCtx.waitUntil(
+      broadcastChapter(c.env, updated.book, updated.chapter, {
+        type: "verse.updated",
+        verse: verseDto,
+      }),
+    );
   }
   return c.json(updated ? { ...updated, content: updatedParsed } : null);
 });
