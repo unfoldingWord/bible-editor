@@ -46,6 +46,11 @@ const SOURCE_ID_MIME = "text/source-id";
 const LS_HIDE_UHB = "be:alignmentHideUhb";
 const LS_COLORIZE = "be:alignmentColorize";
 const LS_HOVERLINK = "be:alignmentHoverLink";
+const LS_INVENTORY_HEIGHT = "be:alignmentInventoryHeight";
+
+const DEFAULT_INVENTORY_HEIGHT = 112;
+const MIN_INVENTORY_HEIGHT = 56;
+const MAX_INVENTORY_HEIGHT = 480;
 
 type HoverHighlight =
   | { kind: "english"; key: string; groupId: string | null }
@@ -93,6 +98,27 @@ function writeFlag(key: string, value: boolean) {
   } catch {
     /* ignore */
   }
+}
+function readNumber(key: string, fallback: number): number {
+  try {
+    const raw = localStorage.getItem(key);
+    if (raw == null) return fallback;
+    const n = parseInt(raw, 10);
+    return Number.isFinite(n) ? n : fallback;
+  } catch {
+    return fallback;
+  }
+}
+function writeNumber(key: string, value: number) {
+  try {
+    localStorage.setItem(key, String(value));
+  } catch {
+    /* ignore */
+  }
+}
+function clampInventoryHeight(n: number): number {
+  if (!Number.isFinite(n)) return DEFAULT_INVENTORY_HEIGHT;
+  return Math.max(MIN_INVENTORY_HEIGHT, Math.min(MAX_INVENTORY_HEIGHT, Math.round(n)));
 }
 
 export interface AlignmentPanelHandle {
@@ -666,6 +692,34 @@ function InventoryStrip({
   hctx: HighlightCtx;
 }) {
   const [over, setOver] = useState(false);
+  const [chipAreaHeight, setChipAreaHeight] = useState<number>(() =>
+    clampInventoryHeight(readNumber(LS_INVENTORY_HEIGHT, DEFAULT_INVENTORY_HEIGHT)),
+  );
+  const startResize = useCallback(
+    (e: React.MouseEvent) => {
+      e.preventDefault();
+      const startY = e.clientY;
+      const startHeight = chipAreaHeight;
+      let last = startHeight;
+      const onMove = (ev: MouseEvent) => {
+        const next = clampInventoryHeight(startHeight + (ev.clientY - startY));
+        last = next;
+        setChipAreaHeight(next);
+      };
+      const onUp = () => {
+        window.removeEventListener("mousemove", onMove);
+        window.removeEventListener("mouseup", onUp);
+        document.body.style.cursor = "";
+        document.body.style.userSelect = "";
+        writeNumber(LS_INVENTORY_HEIGHT, last);
+      };
+      window.addEventListener("mousemove", onMove);
+      window.addEventListener("mouseup", onUp);
+      document.body.style.cursor = "ns-resize";
+      document.body.style.userSelect = "none";
+    },
+    [chipAreaHeight],
+  );
   const unalignedIds = new Set(state.unaligned.map((w) => w.id));
   const streamWords = state.stream.flatMap((item, idx) =>
     item.kind === "word" ? [{ idx, word: item.word, aligned: item.alignedTo !== null }] : [],
@@ -688,11 +742,11 @@ function InventoryStrip({
       }}
       sx={{
         px: 2,
-        py: 1,
+        pt: 1,
+        pb: 1.25,
         bgcolor: over ? "primary.50" : "grey.100",
-        borderBottom: "1px solid",
-        borderColor: "divider",
         flexShrink: 0,
+        position: "relative",
       }}
     >
       <Stack direction="row" alignItems="center" spacing={1} sx={{ mb: 0.5 }}>
@@ -767,7 +821,7 @@ function InventoryStrip({
           flexWrap: "wrap",
           gap: 0.5,
           rowGap: 1.25,
-          maxHeight: 112,
+          maxHeight: chipAreaHeight,
           overflowY: "auto",
           // Extra top padding so chip superscripts (`mt: -2px` in targetLabel)
           // aren't clipped by the strip's overflow region. Also small
@@ -809,6 +863,34 @@ function InventoryStrip({
           ),
         )}
       </Box>
+      <Box
+        onMouseDown={startResize}
+        title="drag to resize"
+        sx={{
+          position: "absolute",
+          left: 0,
+          right: 0,
+          bottom: -4,
+          height: 8,
+          cursor: "ns-resize",
+          zIndex: 1,
+          "&::after": {
+            content: '""',
+            position: "absolute",
+            left: 0,
+            right: 0,
+            top: "50%",
+            height: "1px",
+            bgcolor: "divider",
+            transform: "translateY(-50%)",
+            transition: "background-color 0.15s, height 0.15s",
+          },
+          "&:hover::after, &:active::after": {
+            bgcolor: "primary.main",
+            height: "2px",
+          },
+        }}
+      />
     </Box>
   );
 }
