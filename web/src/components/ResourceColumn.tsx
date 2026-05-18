@@ -247,6 +247,7 @@ export function ResourceColumn({
     const fromButton = prevNonceRef.current !== scrollNonce;
     prevNonceRef.current = scrollNonce;
     let target: HTMLElement | null = null;
+    let isVerseGroup = false;
     if (activeNoteId) {
       target = root.querySelector<HTMLElement>(`[data-note-id="${activeNoteId}"]`);
     } else if (activeWordId) {
@@ -254,10 +255,11 @@ export function ResourceColumn({
     }
     if (!target && (pinned.notes || pinned.words || pinned.questions)) {
       target = root.querySelector<HTMLElement>(`[data-verse-group="${activeVerse}"]`);
+      isVerseGroup = !!target;
     }
     target?.scrollIntoView({
       behavior: "smooth",
-      block: fromButton ? "center" : "nearest",
+      block: isVerseGroup ? "start" : fromButton ? "center" : "nearest",
     });
   }, [
     scrollNonce,
