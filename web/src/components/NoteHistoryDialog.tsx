@@ -29,6 +29,7 @@ interface NoteSnapshot {
 interface Props {
   open: boolean;
   noteId: string;
+  book: string;
   // The actual row.version — monotonically increasing, used as the
   // If-Match expectation when we PATCH.
   currentVersion: number;
@@ -60,6 +61,7 @@ type ViewMode = "snapshot" | "diff";
 export function NoteHistoryDialog({
   open,
   noteId,
+  book,
   currentVersion,
   effectiveVersion,
   onClose,
@@ -77,7 +79,7 @@ export function NoteHistoryDialog({
     setLoading(true);
     setError(null);
     api
-      .getRowHistory("tn", noteId)
+      .getRowHistory("tn", noteId, book)
       .then((res) => {
         if (cancelled) return;
         setEntries(res.versions);

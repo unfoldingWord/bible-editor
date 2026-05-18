@@ -17,6 +17,7 @@ export interface RowTarget {
   kind: "row";
   rowKind: RowKind;
   id: string;
+  book?: string;
 }
 export interface VerseTarget {
   kind: "verse";
@@ -111,11 +112,11 @@ export const outbox = {
     id: string,
     expectedVersion: number,
     patch: Record<string, unknown>,
-    opts?: { restoredFromVersion?: number },
+    opts?: { restoredFromVersion?: number; book?: string },
   ): Promise<OutboxOp> {
     const op: OutboxOp = {
       id: uid(),
-      target: { kind: "row", rowKind, id },
+      target: { kind: "row", rowKind, id, book: opts?.book },
       action: "patch",
       patch,
       expectedVersion,
@@ -136,10 +137,11 @@ export const outbox = {
     rowKind: RowKind,
     id: string,
     expectedVersion: number,
+    book?: string,
   ): Promise<OutboxOp> {
     const op: OutboxOp = {
       id: uid(),
-      target: { kind: "row", rowKind, id },
+      target: { kind: "row", rowKind, id, book },
       action: "delete",
       patch: {},
       expectedVersion,
@@ -290,6 +292,7 @@ async function dispatch(op: OutboxOp): Promise<Result> {
           op.target.rowKind,
           op.target.id,
           op.expectedVersion,
+          op.target.book,
         );
       } else {
         updated = await api.patchRow(
@@ -297,9 +300,10 @@ async function dispatch(op: OutboxOp): Promise<Result> {
           op.target.id,
           op.expectedVersion,
           op.patch,
-          op.restoredFromVersion !== undefined
-            ? { restoredFromVersion: op.restoredFromVersion }
-            : undefined,
+          {
+            ...(op.restoredFromVersion !== undefined ? { restoredFromVersion: op.restoredFromVersion } : {}),
+            book: op.target.book,
+          },
         );
       }
     } else if (op.target.kind === "verse_status") {

@@ -656,9 +656,9 @@ export const api = {
       body: JSON.stringify(body),
     }),
 
-  getRowHistory: (kind: RowKind, id: string) =>
+  getRowHistory: (kind: RowKind, id: string, book?: string) =>
     request<RowHistory>(
-      `/api/rows/${kind}/${encodeURIComponent(id)}/history`,
+      `/api/rows/${kind}/${encodeURIComponent(id)}/history${book ? `?book=${encodeURIComponent(book)}` : ""}`,
     ),
 
   patchRow: <T = unknown>(
@@ -666,9 +666,9 @@ export const api = {
     id: string,
     expectedVersion: number,
     patch: Record<string, unknown>,
-    opts?: { restoredFromVersion?: number | null },
+    opts?: { restoredFromVersion?: number | null; book?: string },
   ) =>
-    request<T>(`/api/rows/${kind}/${encodeURIComponent(id)}`, {
+    request<T>(`/api/rows/${kind}/${encodeURIComponent(id)}${opts?.book ? `?book=${encodeURIComponent(opts.book)}` : ""}`, {
       method: "PATCH",
       headers: { "If-Match": String(expectedVersion) },
       body: JSON.stringify(
@@ -678,23 +678,23 @@ export const api = {
       ),
     }),
 
-  deleteRow: (kind: RowKind, id: string, expectedVersion: number) =>
-    request<{ ok: true }>(`/api/rows/${kind}/${encodeURIComponent(id)}`, {
+  deleteRow: (kind: RowKind, id: string, expectedVersion: number, book?: string) =>
+    request<{ ok: true }>(`/api/rows/${kind}/${encodeURIComponent(id)}${book ? `?book=${encodeURIComponent(book)}` : ""}`, {
       method: "DELETE",
       headers: { "If-Match": String(expectedVersion) },
     }),
 
   // Legacy: alias for setPreserveNote(id, true). Server still accepts it for
   // any in-flight outbox ops; new code should call setPreserveNote.
-  keepNote: (id: string) =>
-    request<TnRow>(`/api/rows/tn/${encodeURIComponent(id)}/keep`, {
+  keepNote: (id: string, book?: string) =>
+    request<TnRow>(`/api/rows/tn/${encodeURIComponent(id)}/keep${book ? `?book=${encodeURIComponent(book)}` : ""}`, {
       method: "POST",
     }),
 
   // Toggle the "survive future AI pipeline sweeps" bit. Lock-exempt.
   // Returns the updated row so the caller can refresh local state.
-  setPreserveNote: (id: string, value: boolean) =>
-    request<TnRow>(`/api/rows/tn/${encodeURIComponent(id)}/preserve`, {
+  setPreserveNote: (id: string, book: string | undefined, value: boolean) =>
+    request<TnRow>(`/api/rows/tn/${encodeURIComponent(id)}/preserve${book ? `?book=${encodeURIComponent(book)}` : ""}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ value }),
@@ -703,8 +703,8 @@ export const api = {
   // Toggle the "queue as AI-pipeline hint" bit. Lock-exempt. hint=1 rows
   // are sent into the next pipeline run as options.hints and are excluded
   // from the sweep; AI expansion clears the bit.
-  setHintNote: (id: string, value: boolean) =>
-    request<TnRow>(`/api/rows/tn/${encodeURIComponent(id)}/hint`, {
+  setHintNote: (id: string, book: string | undefined, value: boolean) =>
+    request<TnRow>(`/api/rows/tn/${encodeURIComponent(id)}/hint${book ? `?book=${encodeURIComponent(book)}` : ""}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ value }),

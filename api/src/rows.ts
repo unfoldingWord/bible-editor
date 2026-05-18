@@ -16,6 +16,14 @@ const KIND_TO_TABLE: Record<RowKind, string> = {
 
 const isRowKind = (k: string): k is RowKind => k in KIND_TO_TABLE;
 
+// Adds an optional book filter to a WHERE clause using NULL-safe semantics:
+//   AND (?N IS NULL OR book = ?N)
+// Bind the book (or null) at position paramN. When null the clause is always
+// true (backwards-compat for old IndexedDB ops that pre-date this field).
+function bookClause(paramN: number): string {
+  return ` AND (?${paramN} IS NULL OR book = ?${paramN})`;
+}
+
 // Reuse the Hono request lifecycle to pull "expected version" off the
 // If-Match header. We accept a bare integer ("If-Match: 7") for simplicity.
 function parseIfMatch(header: string | undefined): number | null {
@@ -182,11 +190,12 @@ rows.post("/:kind", requireAuth, async (c) => {
 rows.get("/:kind/:id", async (c) => {
   const kind = c.req.param("kind");
   const id = c.req.param("id");
+  const book = c.req.query("book") ?? null;
   if (!isRowKind(kind)) return c.json({ error: "invalid_kind" }, 400);
   const row = await c.env.DB.prepare(
-    `SELECT * FROM ${KIND_TO_TABLE[kind]} WHERE id = ?1`,
+    `SELECT * FROM ${KIND_TO_TABLE[kind]} WHERE id = ?1${bookClause(2)}`,
   )
-    .bind(id)
+    .bind(id, book)
     .first<TnRow | TqRow | TwlRow>();
   if (!row || row.deleted_at) return c.json({ error: "not_found" }, 404);
   return c.json(row);
@@ -216,12 +225,13 @@ const HISTORY_FIELDS: Record<RowKind, string[]> = {
 rows.get("/:kind/:id/history", async (c) => {
   const kind = c.req.param("kind");
   const id = c.req.param("id");
+  const book = c.req.query("book") ?? null;
   if (!isRowKind(kind)) return c.json({ error: "invalid_kind" }, 400);
 
   const currentRow = await c.env.DB.prepare(
-    `SELECT * FROM ${KIND_TO_TABLE[kind]} WHERE id = ?1`,
+    `SELECT * FROM ${KIND_TO_TABLE[kind]} WHERE id = ?1${bookClause(2)}`,
   )
-    .bind(id)
+    .bind(id, book)
     .first<Record<string, unknown> & { version: number; deleted_at: number | null; updated_at: number }>();
   if (!currentRow || currentRow.deleted_at) {
     return c.json({ error: "not_found" }, 404);
@@ -328,6 +338,7 @@ rows.get("/:kind/:id/history", async (c) => {
 rows.patch("/:kind/:id", requireAuth, async (c) => {
   const kind = c.req.param("kind");
   const id = c.req.param("id");
+  const book = c.req.query("book") ?? null;
   if (!isRowKind(kind)) return c.json({ error: "invalid_kind" }, 400);
 
   const expected = parseIfMatch(c.req.header("if-match"));
@@ -374,9 +385,9 @@ rows.patch("/:kind/:id", requireAuth, async (c) => {
   // carve-out: any pipeline writing to this chapter overwrites them.
   if (kind !== "tn") {
     const scope = await c.env.DB.prepare(
-      `SELECT book, chapter FROM ${KIND_TO_TABLE[kind]} WHERE id = ?1`,
+      `SELECT book, chapter FROM ${KIND_TO_TABLE[kind]} WHERE id = ?1${bookClause(2)}`,
     )
-      .bind(id)
+      .bind(id, book)
       .first<{ book: string; chapter: number }>();
     if (scope) {
       const lock = await activePipelineForChapter(c.env, scope.book, scope.chapter);
@@ -390,7 +401,7 @@ rows.patch("/:kind/:id", requireAuth, async (c) => {
   const setClauses = fields.map((f, i) => `${f} = ?${i + 1}`);
   const baseParams = fields.length;
   // version bump and metadata go after the patch fields, then the WHERE
-  // params (id + expected version) tail the bindings.
+  // params (id + expected version + book) tail the bindings.
   setClauses.push(`version = version + 1`);
   setClauses.push(`updated_at = ?${baseParams + 1}`);
   setClauses.push(`updated_by = ?${baseParams + 2}`);
@@ -402,6 +413,7 @@ rows.patch("/:kind/:id", requireAuth, async (c) => {
     restoredFromVersion,
     id,
     expected,
+    book,
   ];
 
   // Atomic: the audit INSERT is conditional on the UPDATE matching, so a
@@ -417,7 +429,7 @@ rows.patch("/:kind/:id", requireAuth, async (c) => {
            SET ${setClauses.join(", ")}
          WHERE id = ?${baseParams + 4}
            AND version = ?${baseParams + 5}
-           AND deleted_at IS NULL`,
+           AND deleted_at IS NULL${bookClause(baseParams + 6)}`,
       )
       .bind(...values),
     c.env.DB
@@ -433,18 +445,18 @@ rows.patch("/:kind/:id", requireAuth, async (c) => {
     // No row updated: either gone, soft-deleted, or version moved on. Fetch
     // current to distinguish 404 vs 409 for the client.
     const fresh = await c.env.DB.prepare(
-      `SELECT * FROM ${KIND_TO_TABLE[kind]} WHERE id = ?1`,
+      `SELECT * FROM ${KIND_TO_TABLE[kind]} WHERE id = ?1${bookClause(2)}`,
     )
-      .bind(id)
+      .bind(id, book)
       .first<{ version: number; deleted_at: number | null }>();
     if (!fresh || fresh.deleted_at) return c.json({ error: "not_found" }, 404);
     return c.json({ error: "version_mismatch", current: fresh }, 409);
   }
 
   const updated = await c.env.DB.prepare(
-    `SELECT * FROM ${KIND_TO_TABLE[kind]} WHERE id = ?1`,
+    `SELECT * FROM ${KIND_TO_TABLE[kind]} WHERE id = ?1${bookClause(2)}`,
   )
-    .bind(id)
+    .bind(id, book)
     .first();
   if (updated) {
     const row = updated as unknown as TnRow | TqRow | TwlRow;
@@ -459,6 +471,7 @@ rows.patch("/:kind/:id", requireAuth, async (c) => {
 rows.delete("/:kind/:id", requireAuth, async (c) => {
   const kind = c.req.param("kind");
   const id = c.req.param("id");
+  const book = c.req.query("book") ?? null;
   if (!isRowKind(kind)) return c.json({ error: "invalid_kind" }, 400);
   const expected = parseIfMatch(c.req.header("if-match"));
   if (expected === null) {
@@ -469,9 +482,9 @@ rows.delete("/:kind/:id", requireAuth, async (c) => {
   // The auto-apply step is responsible for removing un-kept TNs; manual
   // deletion mid-run would race with it.
   const scope = await c.env.DB.prepare(
-    `SELECT book, chapter FROM ${KIND_TO_TABLE[kind]} WHERE id = ?1`,
+    `SELECT book, chapter FROM ${KIND_TO_TABLE[kind]} WHERE id = ?1${bookClause(2)}`,
   )
-    .bind(id)
+    .bind(id, book)
     .first<{ book: string; chapter: number }>();
   if (scope) {
     const lock = await activePipelineForChapter(c.env, scope.book, scope.chapter);
@@ -486,9 +499,9 @@ rows.delete("/:kind/:id", requireAuth, async (c) => {
       .prepare(
         `UPDATE ${KIND_TO_TABLE[kind]}
            SET deleted_at = ?1, version = version + 1, updated_at = ?1, updated_by = ?2
-         WHERE id = ?3 AND version = ?4 AND deleted_at IS NULL`,
+         WHERE id = ?3 AND version = ?4 AND deleted_at IS NULL${bookClause(5)}`,
       )
-      .bind(now, userId, id, expected),
+      .bind(now, userId, id, expected, book),
     c.env.DB
       .prepare(
         `INSERT INTO edit_log (kind, row_key, user_id, prev_version, new_version, action)
@@ -500,9 +513,9 @@ rows.delete("/:kind/:id", requireAuth, async (c) => {
 
   if (!updateRes.meta.changes) {
     const fresh = await c.env.DB.prepare(
-      `SELECT version, deleted_at FROM ${KIND_TO_TABLE[kind]} WHERE id = ?1`,
+      `SELECT version, deleted_at FROM ${KIND_TO_TABLE[kind]} WHERE id = ?1${bookClause(2)}`,
     )
-      .bind(id)
+      .bind(id, book)
       .first<{ version: number; deleted_at: number | null }>();
     if (!fresh || fresh.deleted_at) return c.json({ error: "not_found" }, 404);
     return c.json({ error: "version_mismatch", current: fresh }, 409);
@@ -530,6 +543,7 @@ const TnBitBody = z.object({ value: z.union([z.literal(0), z.literal(1), z.boole
 async function setTnBit(
   env: Env,
   id: string,
+  book: string | null,
   userId: number | null,
   column: "preserve" | "hint",
   value: 0 | 1,
@@ -544,20 +558,20 @@ async function setTnBit(
         // is whoever wrote the note content, not whoever toggled the bit.
         `UPDATE tn_rows
            SET ${column} = ?1, updated_at = ?2
-         WHERE id = ?3 AND deleted_at IS NULL`,
+         WHERE id = ?3 AND deleted_at IS NULL${bookClause(4)}`,
       )
-      .bind(value, now, id),
+      .bind(value, now, id, book),
     env.DB
       .prepare(
         `INSERT INTO edit_log (kind, row_key, user_id, prev_version, new_version, action)
          SELECT 'tn', ?1, ?2, version, version, ?3
            FROM tn_rows
-          WHERE id = ?1 AND deleted_at IS NULL`,
+          WHERE id = ?1 AND deleted_at IS NULL${bookClause(4)}`,
       )
-      .bind(id, userId ?? null, action),
+      .bind(id, userId ?? null, action, book),
   ]);
   if (!updateRes.meta.changes) return null;
-  return env.DB.prepare(`SELECT * FROM tn_rows WHERE id = ?1`).bind(id).first<TnRow>();
+  return env.DB.prepare(`SELECT * FROM tn_rows WHERE id = ?1${bookClause(2)}`).bind(id, book).first<TnRow>();
 }
 
 function coerceBitValue(raw: 0 | 1 | boolean): 0 | 1 {
@@ -568,6 +582,7 @@ function coerceBitValue(raw: 0 | 1 | boolean): 0 | 1 {
 // sweeps" bit. Body: { value: 0 | 1 | boolean }. Lock-exempt. Idempotent.
 rows.post("/tn/:id/preserve", requireAuth, async (c) => {
   const id = c.req.param("id");
+  const book = c.req.query("book") ?? null;
   const userId = currentUserId(c);
   let body: unknown;
   try {
@@ -579,7 +594,7 @@ rows.post("/tn/:id/preserve", requireAuth, async (c) => {
   if (!parsed.success) {
     return c.json({ error: "validation_failed", issues: parsed.error.issues }, 400);
   }
-  const updated = await setTnBit(c.env, id, userId, "preserve", coerceBitValue(parsed.data.value));
+  const updated = await setTnBit(c.env, id, book, userId, "preserve", coerceBitValue(parsed.data.value));
   if (!updated) return c.json({ error: "not_found" }, 404);
   return c.json(updated);
 });
@@ -589,6 +604,7 @@ rows.post("/tn/:id/preserve", requireAuth, async (c) => {
 // and are excluded from deleteUnkeptTns; AI expansion clears the bit.
 rows.post("/tn/:id/hint", requireAuth, async (c) => {
   const id = c.req.param("id");
+  const book = c.req.query("book") ?? null;
   const userId = currentUserId(c);
   let body: unknown;
   try {
@@ -600,7 +616,7 @@ rows.post("/tn/:id/hint", requireAuth, async (c) => {
   if (!parsed.success) {
     return c.json({ error: "validation_failed", issues: parsed.error.issues }, 400);
   }
-  const updated = await setTnBit(c.env, id, userId, "hint", coerceBitValue(parsed.data.value));
+  const updated = await setTnBit(c.env, id, book, userId, "hint", coerceBitValue(parsed.data.value));
   if (!updated) return c.json({ error: "not_found" }, 404);
   return c.json(updated);
 });
@@ -611,8 +627,9 @@ rows.post("/tn/:id/hint", requireAuth, async (c) => {
 // in-flight outbox ops keep working without a coordinated migration.
 rows.post("/tn/:id/keep", requireAuth, async (c) => {
   const id = c.req.param("id");
+  const book = c.req.query("book") ?? null;
   const userId = currentUserId(c);
-  const updated = await setTnBit(c.env, id, userId, "preserve", 1);
+  const updated = await setTnBit(c.env, id, book, userId, "preserve", 1);
   if (!updated) return c.json({ error: "not_found" }, 404);
   return c.json(updated);
 });

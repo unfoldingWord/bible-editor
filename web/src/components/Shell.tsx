@@ -225,7 +225,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   const handleSetNotePreserve = useCallback(
     async (id: string, value: boolean) => {
       try {
-        const updated = await api.setPreserveNote(id, value);
+        const updated = await api.setPreserveNote(id, book, value);
         // Mirror server state locally so the card's chip + checkbox flip on
         // the next render without waiting for a chapter refetch.
         applyLocalRowPatch("tn", id, {
@@ -243,7 +243,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   const handleSetNoteHint = useCallback(
     async (id: string, value: boolean) => {
       try {
-        const updated = await api.setHintNote(id, value);
+        const updated = await api.setHintNote(id, book, value);
         applyLocalRowPatch("tn", id, {
           hint: updated.hint,
           updated_at: updated.updated_at,
@@ -548,7 +548,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         opts?.restoredFromVersion !== undefined ? opts.restoredFromVersion : null,
     } as Partial<TnRow & TqRow & TwlRow>;
     applyLocalRowPatch(kind, row.id, localPatch);
-    void outbox.enqueueRow(kind, row.id, row.version, patch as Record<string, unknown>, opts);
+    void outbox.enqueueRow(kind, row.id, row.version, patch as Record<string, unknown>, { ...opts, book: row.book });
   };
 
   // Plain-text edit pipeline shared by the doc / book / aligner-strip
@@ -837,7 +837,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
               onSuccess: (r, res) => {
                 const patch = { quote: res.quote, note: res.note };
                 applyLocalRowPatch("tn", r.id, patch);
-                void outbox.enqueueRow("tn", r.id, r.version, patch);
+                void outbox.enqueueRow("tn", r.id, r.version, patch, { book: r.book });
               },
             });
           }}
@@ -909,7 +909,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
             const list = sortedForVerse(data.tn, dragged.verse);
             const sort_order = pickSortOrder(list, refId, position, draggedId);
             applyLocalRowPatch("tn", draggedId, { sort_order });
-            void outbox.enqueueRow("tn", draggedId, dragged.version, { sort_order });
+            void outbox.enqueueRow("tn", draggedId, dragged.version, { sort_order }, { book: dragged.book });
           }}
           onWordCreate={async () => {
             const list = sortedForVerse(data.twl, activeVerse);
@@ -933,7 +933,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
             const list = sortedForVerse(data.twl, dragged.verse);
             const sort_order = pickSortOrder(list, refId, position, draggedId);
             applyLocalRowPatch("twl", draggedId, { sort_order });
-            void outbox.enqueueRow("twl", draggedId, dragged.version, { sort_order });
+            void outbox.enqueueRow("twl", draggedId, dragged.version, { sort_order }, { book: dragged.book });
           }}
           onQuestionCreate={async () => {
             const created = (await api.createRow<TqRow>("tq", {
@@ -951,7 +951,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
             if (!row) return;
             applyLocalRowDelete("tn", id);
             if (activeNoteId === id) setActiveNoteId(null);
-            void outbox.enqueueDeleteRow("tn", id, row.version);
+            void outbox.enqueueDeleteRow("tn", id, row.version, row.book);
           }}
           onWordChange={(id, patch) => {
             const row = data.twl.find((r) => r.id === id);
@@ -962,7 +962,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
             if (!row) return;
             applyLocalRowDelete("twl", id);
             if (activeWordId === id) setActiveWordId(null);
-            void outbox.enqueueDeleteRow("twl", id, row.version);
+            void outbox.enqueueDeleteRow("twl", id, row.version, row.book);
           }}
           onQuestionChange={(id, patch) => {
             const row = data.tq.find((r) => r.id === id);
@@ -972,7 +972,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
             const row = data.tq.find((r) => r.id === id);
             if (!row) return;
             applyLocalRowDelete("tq", id);
-            void outbox.enqueueDeleteRow("tq", id, row.version);
+            void outbox.enqueueDeleteRow("tq", id, row.version, row.book);
           }}
           locked={Boolean(chapterLock)}
           onSetNotePreserve={handleSetNotePreserve}
