@@ -147,9 +147,8 @@ async function downloadAndExtract(url, archiveRoot, resource) {
   }
   const extractDir = join(tmpDir, resource);
   if (!existsSync(join(extractDir, archiveRoot))) {
-    mkdirSync(extractDir, { recursive: true });
     console.log(`  extracting ${zipPath} ...`);
-    execSync(`tar -xf "${zipPath}" -C "${extractDir}"`, { stdio: "inherit" });
+    extractZip(zipPath, extractDir);
   } else {
     console.log(`  reusing extracted ${extractDir}`);
   }
