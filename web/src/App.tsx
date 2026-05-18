@@ -144,6 +144,7 @@ export function App() {
         initialVerse={loc.verse}
         onNavigate={navigate}
         bookHook={bookHook}
+        onLogout={handleReSignIn}
       />
       <Snackbar
         open={sessionExpired}

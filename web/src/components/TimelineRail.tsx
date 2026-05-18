@@ -24,6 +24,7 @@ export function TimelineRail({ book, chapter, tiles, activeVerse, onSelect, onTo
       sx={{
         width: 64,
         flexShrink: 0,
+        flexGrow: 1,
         bgcolor: "grey.50",
         borderRight: "1px solid",
         borderColor: "divider",

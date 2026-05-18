@@ -10,7 +10,10 @@ import {
   DialogContentText,
   DialogTitle,
   Button,
+  IconButton,
+  Tooltip,
 } from "@mui/material";
+import LogoutIcon from "@mui/icons-material/Logout";
 import { useChapter } from "../hooks/useChapter";
 import { useChapterRoom } from "../hooks/useChapterRoom";
 import type { UseBookReturn } from "../hooks/useBook";
@@ -71,9 +74,10 @@ interface Props {
   initialVerse?: number;
   onNavigate?: (book: string, chapter: number, verse?: number) => void;
   bookHook?: UseBookReturn;
+  onLogout?: () => void;
 }
 
-export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook }: Props) {
+export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, onLogout }: Props) {
   const {
     status,
     data,
@@ -623,25 +627,53 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook }:
       )}
       <Box ref={splitContainerRef} sx={{ flex: 1, display: "flex", overflow: "hidden" }}>
         {!railCollapsed && (
-          <TimelineRail
-            book={book}
-            chapter={chapter}
-            tiles={tileSet}
-            activeVerse={activeVerse}
-            onSelect={requestSelectVerse}
-            onToggleDone={(v, done) => {
-              // Through the outbox so an offline toggle isn't dropped. The
-              // payload is coalesced per (book, chapter, verse) so a rapid
-              // click-click only ships the final state.
-              void outbox.enqueueVerseStatus(book, chapter, v, done);
-              // Optimistic local update — useChapter would also reconcile on
-              // the outbox "ok" callback once that handler covers
-              // verse_status (currently it only mirrors row + verse). For
-              // now, refetching when the queue settles keeps the rail in
-              // step without a re-render race.
-              applyLocalVerseStatus(v, done);
-            }}
-          />
+          <Box sx={{ width: 64, flexShrink: 0, display: "flex", flexDirection: "column" }}>
+            <TimelineRail
+              book={book}
+              chapter={chapter}
+              tiles={tileSet}
+              activeVerse={activeVerse}
+              onSelect={requestSelectVerse}
+              onToggleDone={(v, done) => {
+                // Through the outbox so an offline toggle isn't dropped. The
+                // payload is coalesced per (book, chapter, verse) so a rapid
+                // click-click only ships the final state.
+                void outbox.enqueueVerseStatus(book, chapter, v, done);
+                // Optimistic local update — useChapter would also reconcile on
+                // the outbox "ok" callback once that handler covers
+                // verse_status (currently it only mirrors row + verse). For
+                // now, refetching when the queue settles keeps the rail in
+                // step without a re-render race.
+                applyLocalVerseStatus(v, done);
+              }}
+            />
+            <Box
+              sx={{
+                flexShrink: 0,
+                bgcolor: "grey.50",
+                borderRight: "1px solid",
+                borderColor: "divider",
+                borderTop: "1px solid",
+                borderTopColor: "divider",
+                p: 0.5,
+              }}
+            >
+              <Tooltip title="Sign out" placement="right">
+                <IconButton
+                  size="small"
+                  onClick={onLogout}
+                  sx={{
+                    width: "100%",
+                    borderRadius: 0.5,
+                    color: "text.disabled",
+                    "&:hover": { color: "text.secondary" },
+                  }}
+                >
+                  <LogoutIcon sx={{ fontSize: 16 }} />
+                </IconButton>
+              </Tooltip>
+            </Box>
+          </Box>
         )}
         <Box
           sx={{
