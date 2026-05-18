@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-> **No remote backend deployed yet.** `--remote` D1 migrations, `wrangler deploy`, OAuth callbacks, and any path through `uw-bt-bot` will fail until provisioning per [`docs/deploy.md`](docs/deploy.md). Work in `--local` mode only. **Remove this notice once we've deployed.**
+> Deployed to `https://bible-editor-api.unfoldingword.workers.dev` (Cloudflare Workers, unfoldingWord account). The default env in `api/wrangler.toml` carries dev-friendly values for `wrangler dev`; prod overrides live under `[env.production.*]` and ship via `wrangler deploy --env production`. Any `--remote` D1 / `wrangler secret` / `wrangler tail` command needs `--env production` to target the deployed worker.
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
@@ -32,10 +32,10 @@ npx playwright test tests/concurrency/s2-same-verse.spec.ts -g "<grep>"
 API-only operations (from `api/`):
 
 ```sh
-npx wrangler d1 migrations apply bible_editor --local    # apply migrations locally
-npx wrangler d1 migrations apply bible_editor --remote   # apply migrations to prod
+npx wrangler d1 migrations apply bible_editor --local                       # apply migrations locally
+npx wrangler d1 migrations apply bible_editor --remote --env production     # apply migrations to prod
 npx wrangler d1 execute bible_editor --local --file=../scripts/out/import-ZEC.sql
-npm run tail                                              # wrangler tail (live API logs)
+npm run tail                                                                 # wrangler tail (live API logs)
 ```
 
 Web-only:
@@ -99,6 +99,6 @@ The `webServer` polls `/api/health` through Vite's proxy so it waits for **both*
 
 ### Deploy
 
-Single command from repo root: `npm run deploy` builds `web/dist` then `wrangler deploy` from `api/`. The Worker serves both `/api/*` and the SPA. See [`docs/deploy.md`](docs/deploy.md) for first-time provisioning (D1 create, R2 bucket, secrets `JWT_SIGNING_KEY` / `DCS_CLIENT_ID` / `DCS_CLIENT_SECRET` / `DCS_SERVICE_TOKEN` / `BT_API_TOKEN`).
+Single command from repo root: `npm run deploy` builds `web/dist` then runs `wrangler deploy --env production` from `api/`. The Worker serves both `/api/*` and the SPA. See [`docs/deploy.md`](docs/deploy.md) for first-time provisioning (D1 create, R2 bucket, secrets `JWT_SIGNING_KEY` / `DCS_CLIENT_ID` / `DCS_CLIENT_SECRET` / `DCS_SERVICE_TOKEN` / `BT_API_TOKEN`).
 
-Production must set `ALLOWED_ORIGINS` (CORS allowlist) and `DEV_AUTH_ENABLED=false` in `wrangler.toml`.
+Prod-only vars (`ALLOWED_ORIGINS`, `DEV_AUTH_ENABLED=false`) live in `[env.production.vars]` so the default env stays dev-friendly. Don't put prod values at the top level — that broke local dev once already.

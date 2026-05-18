@@ -7,14 +7,13 @@ compatibility_flags = ["nodejs_compat"]
 [dev]
 port = 8787
 
-# Static-asset hosting for the SPA. After `npm --workspace web run build`,
-# Vite emits web/dist; wrangler serves it for any path that isn't matched by
-# a Worker route. `single-page-application` makes deep links (#/ZEC/3) work
-# by falling back to index.html for unknown paths.
-#
-# In dev we keep the existing split (vite on 5173, wrangler on 8787 via vite
-# proxy); this block only kicks in on `wrangler deploy`. wrangler dev tolerates
-# a missing dist dir but will warn — run a build first to silence it.
+# ── DEFAULT ENV (local dev) ─────────────────────────────────────────────────
+# `wrangler dev` (and `npm run dev`) reads everything from the top level.
+# Vars here are dev-friendly; the prod overrides live in [env.production.*]
+# blocks at the bottom. Bindings (D1/R2/DO/Workflow/Assets) are NOT inherited
+# by env blocks in wrangler v4 — they're duplicated, pointing at the same
+# Cloudflare resources so both envs share state.
+
 [assets]
 directory = "../web/dist"
 binding = "ASSETS"
@@ -25,19 +24,16 @@ not_found_handling = "single-page-application"
 # to git.door43.org). Force the Worker to run first for /api/* paths.
 run_worker_first = ["/api/*"]
 
-# D1 database — replace `database_id` once we run `wrangler d1 create bible_editor`.
 [[d1_databases]]
 binding = "DB"
 database_name = "bible_editor"
-database_id = "REPLACE_AFTER_wrangler_d1_create"
+database_id = "7e566abf-454d-43d6-b24e-11df74f1c0ed"
 migrations_dir = "migrations"
 
-# R2 bucket — for USFM originals and export snapshots. Create with `wrangler r2 bucket create bible-editor-blobs`.
 [[r2_buckets]]
 binding = "BLOBS"
 bucket_name = "bible-editor-blobs"
 
-# Durable Object for per-chapter presence + fanout.
 [[durable_objects.bindings]]
 name = "CHAPTER_ROOM"
 class_name = "ChapterRoom"
@@ -46,31 +42,23 @@ class_name = "ChapterRoom"
 tag = "v1"
 new_classes = ["ChapterRoom"]
 
-# Workflow for the nightly DCS export. Each (book × resource) is its own
-# retryable step, so a flaky DCS commit doesn't take the whole run down.
 [[workflows]]
 name = "bible-editor-export"
 binding = "EXPORT_WORKFLOW"
 class_name = "ExportWorkflow"
 
-# Two crons:
-#   • 06:00 UTC daily — full DCS export via the Workflow.
-#   • Every 5 min   — poll non-terminal AI-pipeline jobs so the auto-apply
-#     step fires even when no translator has a tab open. Branches on
-#     ScheduledController.cron in src/index.ts.
 [triggers]
 crons = ["0 6 * * *", "*/5 * * * *"]
 
-# Public-safe defaults; secrets go in `wrangler secret put` (DCS_CLIENT_ID, DCS_CLIENT_SECRET, JWT_SIGNING_KEY, DCS_SERVICE_TOKEN, BT_API_TOKEN).
-# ALLOWED_ORIGINS is comma-separated. Empty falls back to the dev allowlist
-# inside src/index.ts (localhost:5173 / 8787 only). Set this to the deployed
-# SPA origin once the worker leaves dev.
-# DEV_AUTH_ENABLED gates the /api/auth/dev mint endpoint; must be unset in prod.
+# Public-safe defaults; secrets go in `wrangler secret put` (DCS_CLIENT_ID,
+# DCS_CLIENT_SECRET, JWT_SIGNING_KEY, DCS_SERVICE_TOKEN, BT_API_TOKEN).
+# ALLOWED_ORIGINS empty → falls back to the dev allowlist inside src/index.ts
+# (localhost:5173 / 8787 only).
+# DEV_AUTH_ENABLED gates the /api/auth/dev mint endpoint; flipped to "false"
+# in the prod env block below.
 # DCS_EXPORT_OWNER / DCS_EXPORT_BRANCH control where nightly exports land on
-# DCS. Defaults: unfoldingWord owner, "live-snapshot" branch. Override per env.
-# BT_API_TOKEN (secret) authorizes /api/tn-quick + /api/pipelines/* → uw-bt-bot.
-# Absence disables those routes. TN_QUICK_URL overrides the tn-quick endpoint;
-# PIPELINE_API_BASE overrides the base URL for /api/pipeline/* (defaults below).
+# DCS. BT_API_TOKEN (secret) authorizes /api/tn-quick + /api/pipelines/*.
+# TN_QUICK_URL / PIPELINE_API_BASE override the bot endpoints.
 [vars]
 DCS_BASE_URL = "https://git.door43.org"
 DCS_OAUTH_AUTHORIZE_URL = "https://git.door43.org/login/oauth/authorize"
@@ -79,6 +67,61 @@ JWT_ISSUER = "bible-editor"
 JWT_TTL_SECONDS = "1209600"
 ALLOWED_ORIGINS = ""
 DEV_AUTH_ENABLED = "true"
+DCS_EXPORT_OWNER = "unfoldingWord"
+DCS_EXPORT_BRANCH = "live-snapshot"
+TN_QUICK_URL = "https://uw-bt-bot.fly.dev/api/tn-quick"
+PIPELINE_API_BASE = "https://uw-bt-bot.fly.dev"
+
+# ── PRODUCTION ENV ──────────────────────────────────────────────────────────
+# Activated by `wrangler deploy --env production` (which is what `npm run
+# deploy` runs). `name` is repeated so the deploy lands on the existing
+# `bible-editor-api` worker instead of a name-suffixed
+# `bible-editor-api-production`. Secrets are scoped to the Worker, so they
+# carry over without re-uploading.
+
+[env.production]
+name = "bible-editor-api"
+
+[env.production.assets]
+directory = "../web/dist"
+binding = "ASSETS"
+not_found_handling = "single-page-application"
+run_worker_first = ["/api/*"]
+
+[[env.production.d1_databases]]
+binding = "DB"
+database_name = "bible_editor"
+database_id = "7e566abf-454d-43d6-b24e-11df74f1c0ed"
+migrations_dir = "migrations"
+
+[[env.production.r2_buckets]]
+binding = "BLOBS"
+bucket_name = "bible-editor-blobs"
+
+[[env.production.durable_objects.bindings]]
+name = "CHAPTER_ROOM"
+class_name = "ChapterRoom"
+
+[[env.production.migrations]]
+tag = "v1"
+new_classes = ["ChapterRoom"]
+
+[[env.production.workflows]]
+name = "bible-editor-export"
+binding = "EXPORT_WORKFLOW"
+class_name = "ExportWorkflow"
+
+[env.production.triggers]
+crons = ["0 6 * * *", "*/5 * * * *"]
+
+[env.production.vars]
+DCS_BASE_URL = "https://git.door43.org"
+DCS_OAUTH_AUTHORIZE_URL = "https://git.door43.org/login/oauth/authorize"
+DCS_OAUTH_TOKEN_URL = "https://git.door43.org/login/oauth/access_token"
+JWT_ISSUER = "bible-editor"
+JWT_TTL_SECONDS = "1209600"
+ALLOWED_ORIGINS = "https://bible-editor-api.unfoldingword.workers.dev"
+DEV_AUTH_ENABLED = "false"
 DCS_EXPORT_OWNER = "unfoldingWord"
 DCS_EXPORT_BRANCH = "live-snapshot"
 TN_QUICK_URL = "https://uw-bt-bot.fly.dev/api/tn-quick"

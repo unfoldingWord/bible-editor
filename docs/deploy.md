@@ -58,11 +58,12 @@ npx wrangler d1 create bible_editor
 # → copy the printed database_id into wrangler.toml's [[d1_databases]] block
 ```
 
-Replace the `REPLACE_AFTER_wrangler_d1_create` placeholder with the printed
-id. Then apply all migrations to remote:
+Replace the `database_id` value (in both the top-level `[[d1_databases]]`
+block and the `[[env.production.d1_databases]]` block) with the printed id.
+Then apply all migrations to the remote prod DB:
 
 ```sh
-npx wrangler d1 migrations apply bible_editor --remote
+npx wrangler d1 migrations apply bible_editor --remote --env production
 ```
 
 ### 2. Create the R2 bucket
@@ -75,27 +76,32 @@ The bucket name in `wrangler.toml` already matches; no edit needed.
 
 ### 3. Set secrets
 
+Secrets are scoped per env in wrangler v4. With the `[env.production]` env
+named, every `wrangler secret put` for the prod worker needs `--env
+production`:
+
 ```sh
 # 32+ char random key used to sign our JWTs. Generate fresh per environment.
-openssl rand -hex 32 | npx wrangler secret put JWT_SIGNING_KEY
+openssl rand -hex 32 | npx wrangler secret put JWT_SIGNING_KEY --env production
 
 # DCS OAuth app — register at https://git.door43.org/user/settings/applications.
 # Redirect URI must be: https://<your-worker>.workers.dev/api/auth/dcs/callback
-npx wrangler secret put DCS_CLIENT_ID
-npx wrangler secret put DCS_CLIENT_SECRET
+npx wrangler secret put DCS_CLIENT_ID --env production
+npx wrangler secret put DCS_CLIENT_SECRET --env production
 
 # Service-account token for the nightly export. Create a personal access token
 # for a dedicated DCS service user. Scope: write:repository on the export fork.
 # Optional — leave unset to skip DCS commits (snapshots still land in R2).
-npx wrangler secret put DCS_SERVICE_TOKEN
+npx wrangler secret put DCS_SERVICE_TOKEN --env production
 ```
 
 ### 4. Lock down the public-facing vars
 
-Edit `wrangler.toml`:
+Prod-only overrides go in `[env.production.vars]` (NOT the top-level
+`[vars]`, which `wrangler dev` reads for local dev). Edit `wrangler.toml`:
 
 ```toml
-[vars]
+[env.production.vars]
 ALLOWED_ORIGINS = "https://bible-editor-api.<your-account>.workers.dev"
 DEV_AUTH_ENABLED = "false"
 DCS_EXPORT_OWNER = "your-service-account-username"   # owns the fork repos
@@ -117,19 +123,22 @@ then apply the generated SQL to **remote**:
 ```sh
 cd ..  # back to repo root
 node scripts/import-book.mjs ZEC
-cd api && npx wrangler d1 execute bible_editor --remote \
+cd api && npx wrangler d1 execute bible_editor --remote --env production \
   --file=../scripts/out/import-ZEC.sql && cd ..
 
 # Lexicon (UHAL + UGL) — large file, takes a minute.
 node scripts/import-lexicon.mjs
-cd api && npx wrangler d1 execute bible_editor --remote \
+cd api && npx wrangler d1 execute bible_editor --remote --env production \
   --file=../scripts/out/import-lexicon.sql && cd ..
 ```
 
 ### 6. Deploy
 
 ```sh
-# From the repo root. Builds web/dist then `wrangler deploy` from api/.
+# From the repo root. Builds web/dist then `wrangler deploy --env production`
+# from api/. The --env flag activates the [env.production.*] blocks in
+# wrangler.toml; `name` is repeated inside that block so the deploy lands on
+# the existing `bible-editor-api` worker (no name suffix).
 npm run deploy
 ```
 
@@ -164,9 +173,9 @@ curl https://<host>/api/exports?limit=20
 - **Replay a failed export**: trigger `POST /api/exports/run` with the
   failed book + resource. The workflow records a new snapshot row; if DCS
   is up the commit lands.
-- **Rotate JWT key**: `wrangler secret put JWT_SIGNING_KEY` with a new
-  value. Existing tokens stop validating immediately — all editors get
-  bounced to sign-in. Outbox edits survive.
+- **Rotate JWT key**: `wrangler secret put JWT_SIGNING_KEY --env production`
+  with a new value. Existing tokens stop validating immediately — all editors
+  get bounced to sign-in. Outbox edits survive.
 
 ## Known gaps before first prod use
 
