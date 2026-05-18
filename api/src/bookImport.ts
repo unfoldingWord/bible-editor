@@ -266,8 +266,8 @@ async function insertTnRows(
 
   const insertStmt = env.DB.prepare(
     `INSERT INTO tn_rows
-       (id, book, chapter, verse, ref_raw, tags, support_reference, quote, occurrence, note)
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)`,
+       (id, book, chapter, verse, ref_raw, tags, support_reference, quote, occurrence, note, sort_order)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)`,
   );
   const auditStmt = env.DB.prepare(
     `INSERT INTO edit_log (kind, row_key, user_id, prev_version, new_version, action, payload_json)
@@ -304,6 +304,7 @@ async function insertTnRows(
       insertStmt.bind(
         id, book, ch, v, refRaw,
         payload.tags, payload.support_reference, payload.quote, payload.occurrence, payload.note,
+        (count + 1) * 100,
       ),
       auditStmt.bind(id, userId, JSON.stringify(payload)),
     );
@@ -386,8 +387,8 @@ async function insertTwlRows(
 
   const insertStmt = env.DB.prepare(
     `INSERT INTO twl_rows
-       (id, book, chapter, verse, ref_raw, tags, orig_words, occurrence, tw_link)
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)`,
+       (id, book, chapter, verse, ref_raw, tags, orig_words, occurrence, tw_link, sort_order)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)`,
   );
   const auditStmt = env.DB.prepare(
     `INSERT INTO edit_log (kind, row_key, user_id, prev_version, new_version, action, payload_json)
@@ -423,6 +424,7 @@ async function insertTwlRows(
       insertStmt.bind(
         id, book, ch, v, refRaw,
         payload.tags, payload.orig_words, payload.occurrence, payload.tw_link,
+        (count + 1) * 100,
       ),
       auditStmt.bind(id, userId, JSON.stringify(payload)),
     );
