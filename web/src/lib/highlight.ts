@@ -8,10 +8,13 @@
 //     text matches each quote word directly.
 //
 // Quotes may include gap markers — "&", "...", "…" — for non-contiguous
-// references. We strip those to get a flat sequence of words; matching
-// tolerates intervening unmatched runs so non-contiguous quotes still hit.
-// `occurrence` (1-based) picks the Nth match when the same phrase appears
-// multiple times in a verse.
+// references. Gap markers split the quote into GROUPS; within a group
+// (words joined by whitespace or maqaf ־) the match must be exactly
+// adjacent in document order, but between groups we tolerate intervening
+// unmatched tokens. That distinction is what stops "כָּל־הַגֹּנֵב" from
+// grabbing an earlier stray "כָּל" that sits several words upstream of
+// "הַגֹּנֵב". `occurrence` (1-based) picks the Nth match when the same
+// phrase appears multiple times in a verse.
 //
 // Hebrew note: TN/TQ quote text typically arrives NFC-normalized while UHB
 // stores legacy combining-mark order (see lib/hebrew.ts), so all source-
@@ -25,15 +28,72 @@ type WordToken = { text: string; occurrence: number };
 type Run = { source: string; occurrence: number; targets: WordToken[] };
 
 const GAP = /[&…]+|\.{3}/g;
-const MAX_RUN_GAP = 6; // bail out if too many unrelated milestones between matched words
+const MAX_RUN_GAP = 6; // bail out if too many unrelated milestones between matched groups
 
-function quoteWords(quote: string): string[] {
+// Parse quote into contiguous-word groups separated by explicit gap markers.
+// Inside a group, words must be exactly adjacent in the verse; between groups,
+// the matcher allows up to MAX_RUN_GAP intervening tokens.
+function quoteGroups(quote: string): string[][] {
   if (!quote) return [];
   return quote
-    .replace(GAP, " ")
-    .split(/[\s־]+/)
-    .map((w) => w.trim())
-    .filter((w) => w.length > 0);
+    .split(GAP)
+    .map((segment) =>
+      segment
+        .split(/[\s־]+/)
+        .map((w) => w.trim())
+        .filter((w) => w.length > 0),
+    )
+    .filter((g) => g.length > 0);
+}
+
+// Try to match `groups` against `normSources` starting at index `start`.
+// Returns the list of matched indices (document order) on success, or null.
+// First group must align at `start`; later groups slide forward looking for
+// an exact-adjacent run, bounded by MAX_RUN_GAP from the previously matched
+// index.
+function matchGroupsAt(
+  start: number,
+  groups: string[][],
+  normSources: string[],
+): number[] | null {
+  const matched: number[] = [];
+  let pos = start;
+  for (let gi = 0; gi < groups.length; gi++) {
+    const group = groups[gi];
+    let runStart: number;
+    if (gi === 0) {
+      if (pos + group.length > normSources.length) return null;
+      for (let wi = 0; wi < group.length; wi++) {
+        if (normSources[pos + wi] !== group[wi]) return null;
+      }
+      runStart = pos;
+    } else {
+      const lastMatched = matched[matched.length - 1];
+      const maxStart = Math.min(
+        normSources.length - group.length,
+        lastMatched + MAX_RUN_GAP,
+      );
+      let found = -1;
+      for (let s = pos; s <= maxStart; s++) {
+        let ok = true;
+        for (let wi = 0; wi < group.length; wi++) {
+          if (normSources[s + wi] !== group[wi]) {
+            ok = false;
+            break;
+          }
+        }
+        if (ok) {
+          found = s;
+          break;
+        }
+      }
+      if (found < 0) return null;
+      runStart = found;
+    }
+    for (let wi = 0; wi < group.length; wi++) matched.push(runStart + wi);
+    pos = runStart + group.length;
+  }
+  return matched;
 }
 
 function nodeIsMilestone(n: unknown): n is Record<string, unknown> {
@@ -111,32 +171,18 @@ export function findTargetHighlights(
   occurrence: number,
 ): Set<HighlightKey> {
   const runs = collectMilestoneRuns(verseObjects);
-  const words = quoteWords(quote);
+  const groups = quoteGroups(quote);
   const out = new Set<HighlightKey>();
-  if (runs.length === 0 || words.length === 0) return out;
+  if (runs.length === 0 || groups.length === 0) return out;
   const wantOcc = Math.max(1, occurrence | 0);
 
-  const normWords = words.map(nfc);
+  const normGroups = groups.map((g) => g.map(nfc));
   const normSources = runs.map((r) => nfc(r.source));
 
   const matches: number[][] = [];
   for (let start = 0; start < runs.length; start++) {
-    if (normSources[start] !== normWords[0]) continue;
-    let runIdx = start;
-    let wordIdx = 0;
-    const matched: number[] = [];
-    while (runIdx < runs.length && wordIdx < words.length) {
-      if (normSources[runIdx] === normWords[wordIdx]) {
-        matched.push(runIdx);
-        wordIdx++;
-        runIdx++;
-      } else {
-        if (matched.length === 0) break;
-        if (runIdx - matched[matched.length - 1] > MAX_RUN_GAP) break;
-        runIdx++;
-      }
-    }
-    if (wordIdx === words.length) matches.push(matched);
+    const m = matchGroupsAt(start, normGroups, normSources);
+    if (m) matches.push(m);
   }
 
   const chosen = matches[wantOcc - 1];
@@ -269,33 +315,19 @@ export function findSourceHighlights(
   quote: string,
   occurrence: number,
 ): Set<HighlightKey> {
-  const words = quoteWords(quote);
+  const groups = quoteGroups(quote);
   const tokens = collectBareWords(verseObjects);
   const out = new Set<HighlightKey>();
-  if (words.length === 0 || tokens.length === 0) return out;
+  if (groups.length === 0 || tokens.length === 0) return out;
   const wantOcc = Math.max(1, occurrence | 0);
 
-  const normWords = words.map(nfc);
+  const normGroups = groups.map((g) => g.map(nfc));
   const normTokens = tokens.map((t) => nfc(t.text));
 
   const matches: number[][] = [];
   for (let start = 0; start < tokens.length; start++) {
-    if (normTokens[start] !== normWords[0]) continue;
-    let tIdx = start;
-    let wIdx = 0;
-    const matched: number[] = [];
-    while (tIdx < tokens.length && wIdx < words.length) {
-      if (normTokens[tIdx] === normWords[wIdx]) {
-        matched.push(tIdx);
-        wIdx++;
-        tIdx++;
-      } else {
-        if (matched.length === 0) break;
-        if (tIdx - matched[matched.length - 1] > MAX_RUN_GAP) break;
-        tIdx++;
-      }
-    }
-    if (wIdx === words.length) matches.push(matched);
+    const m = matchGroupsAt(start, normGroups, normTokens);
+    if (m) matches.push(m);
   }
 
   const chosen = matches[wantOcc - 1];
