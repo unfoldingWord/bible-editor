@@ -220,9 +220,23 @@ export async function commitToDcs(
   if (existingSha) body.sha = existingSha;
 
   const method = existingSha ? "PUT" : "POST";
-  const res = await fetch(base, { method, headers, body: JSON.stringify(body) });
+  let res = await fetch(base, { method, headers, body: JSON.stringify(body) });
   if (!res.ok) {
-    throw new Error(`dcs_commit_failed: ${method} ${res.status} ${await res.text()}`);
+    const errText = await res.text();
+    if (res.status === 404 && errText.includes("branch does not exist")) {
+      // Branch hasn't been created yet — create it from master then retry once.
+      const branchRes = await fetch(
+        `${config.baseUrl}/api/v1/repos/${encodeURIComponent(config.owner)}/${encodeURIComponent(config.repo)}/branches`,
+        { method: "POST", headers, body: JSON.stringify({ new_branch_name: config.branch, old_branch_name: "master" }) },
+      );
+      if (!branchRes.ok && branchRes.status !== 409) {
+        throw new Error(`dcs_branch_create_failed: ${branchRes.status} ${await branchRes.text()}`);
+      }
+      res = await fetch(base, { method, headers, body: JSON.stringify(body) });
+      if (!res.ok) throw new Error(`dcs_commit_failed: ${method} ${res.status} ${await res.text()}`);
+    } else {
+      throw new Error(`dcs_commit_failed: ${method} ${res.status} ${errText}`);
+    }
   }
   const data = (await res.json()) as {
     content?: { sha?: string };
