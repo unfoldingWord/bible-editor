@@ -10,6 +10,9 @@ import {
   Autocomplete,
   TextField,
   InputAdornment,
+  Snackbar,
+  Alert,
+  CircularProgress,
 } from "@mui/material";
 import NavigateBeforeIcon from "@mui/icons-material/NavigateBefore";
 import NavigateNextIcon from "@mui/icons-material/NavigateNext";
@@ -18,9 +21,10 @@ import MenuOpenIcon from "@mui/icons-material/MenuOpen";
 import MenuIcon from "@mui/icons-material/Menu";
 import Brightness4Icon from "@mui/icons-material/Brightness4";
 import Brightness7Icon from "@mui/icons-material/Brightness7";
+import CloudDownloadIcon from "@mui/icons-material/CloudDownload";
 import { api, type BookListEntry, type BookSummary } from "../sync/api";
 import { SyncStatusBar } from "./SyncStatusBar";
-import { bookName, resolveBook } from "../lib/bookNames";
+import { BOOKS, bookName, resolveBook } from "../lib/bookNames";
 import { parseReference } from "../lib/referenceParser";
 import { ThemeModeContext } from "../theme";
 
@@ -47,6 +51,8 @@ export function TopBar({
   const [summary, setSummary] = useState<BookSummary | null>(null);
   const [refInput, setRefInput] = useState("");
   const [refError, setRefError] = useState<string | null>(null);
+  const [importing, setImporting] = useState<string | null>(null);
+  const [importError, setImportError] = useState<string | null>(null);
   const { mode, toggle } = useContext(ThemeModeContext);
 
   useEffect(() => {
@@ -58,12 +64,35 @@ export function TopBar({
     api.getBookSummary(book).then(setSummary).catch(() => setSummary(null));
   }, [book]);
 
+  // Trigger a DCS import for an unfetched book, then refresh the books list
+  // and navigate. The caller's onChange short-circuits if the book is
+  // already imported, so this is the cold path only.
+  const importAndNavigate = async (code: string) => {
+    setImporting(code);
+    setImportError(null);
+    try {
+      await api.importBook(code);
+      const r = await api.getBooks();
+      setBooks(r.books);
+      onNavigate(code, 1);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      setImportError(`Couldn't import ${bookName(code)}: ${msg}`);
+    } finally {
+      setImporting(null);
+    }
+  };
+
   const chapterList = (summary?.chapters ?? []).map((c) => c.chapter);
   const idx = chapterList.indexOf(chapter);
   const canPrev = idx > 0;
   const canNext = idx >= 0 && idx < chapterList.length - 1;
 
-  const bookOptions = useMemo(() => books.map((b) => b.book), [books]);
+  // Canonical 66-book list — unimported books surface in the dropdown with
+  // a "+" hint, and selecting one kicks off importAndNavigate. Keeping the
+  // canonical order means books always land in their familiar slot.
+  const importedSet = useMemo(() => new Set(books.map((b) => b.book)), [books]);
+  const bookOptions = useMemo(() => BOOKS.map((b) => b.code), []);
 
   const chapterOptions = useMemo(
     () => (chapterList.length > 0 ? chapterList.map(String) : [String(chapter)]),
@@ -113,8 +142,14 @@ export function TopBar({
           value={book}
           options={bookOptions.includes(book) ? bookOptions : [book, ...bookOptions]}
           disableClearable
+          disabled={importing !== null}
           onChange={(_, v) => {
-            if (v && v !== book) onNavigate(v, 1);
+            if (!v || v === book) return;
+            if (importedSet.has(v)) {
+              onNavigate(v, 1);
+            } else {
+              void importAndNavigate(v);
+            }
           }}
           filterOptions={(options, state) => {
             const q = state.inputValue.trim().toLowerCase();
@@ -127,17 +162,32 @@ export function TopBar({
             });
           }}
           getOptionLabel={(opt) => opt}
-          renderOption={(props, opt) => (
-            <li {...props} key={opt} style={{ fontFamily: "monospace" }}>
-              <span style={{ minWidth: 40, display: "inline-block" }}>{opt}</span>
-              <Box
-                component="span"
-                sx={{ color: "text.secondary", fontSize: 12, ml: 1 }}
+          renderOption={(props, opt) => {
+            const isImported = importedSet.has(opt);
+            return (
+              <li
+                {...props}
+                key={opt}
+                style={{ fontFamily: "monospace", opacity: isImported ? 1 : 0.6 }}
               >
-                {bookName(opt)}
-              </Box>
-            </li>
-          )}
+                <span style={{ minWidth: 40, display: "inline-block" }}>{opt}</span>
+                <Box
+                  component="span"
+                  sx={{ color: "text.secondary", fontSize: 12, ml: 1, flex: 1 }}
+                >
+                  {bookName(opt)}
+                </Box>
+                {!isImported && (
+                  <Tooltip title="not imported — selecting will fetch from DCS">
+                    <CloudDownloadIcon
+                      fontSize="inherit"
+                      sx={{ ml: 1, color: "text.disabled", fontSize: 14 }}
+                    />
+                  </Tooltip>
+                )}
+              </li>
+            );
+          }}
           renderInput={(params) => (
             <TextField
               {...params}
@@ -145,9 +195,17 @@ export function TopBar({
                 ...params.inputProps,
                 style: { fontFamily: "monospace", textTransform: "uppercase" },
               }}
+              InputProps={{
+                ...params.InputProps,
+                endAdornment: importing ? (
+                  <InputAdornment position="end">
+                    <CircularProgress size={14} />
+                  </InputAdornment>
+                ) : params.InputProps.endAdornment,
+              }}
             />
           )}
-          sx={{ width: 96 }}
+          sx={{ width: 112 }}
         />
       </FormControl>
       <Stack direction="row" alignItems="center" spacing={0.5}>
@@ -276,6 +334,24 @@ export function TopBar({
       </Tooltip>
       <Divider orientation="vertical" flexItem sx={{ my: 0.5 }} />
       {pipelineMenu}
+      <Snackbar
+        open={importing !== null}
+        anchorOrigin={{ vertical: "bottom", horizontal: "center" }}
+      >
+        <Alert severity="info" icon={<CircularProgress size={16} />}>
+          Importing {importing ? bookName(importing) : ""} from DCS…
+        </Alert>
+      </Snackbar>
+      <Snackbar
+        open={importError !== null}
+        autoHideDuration={6000}
+        onClose={() => setImportError(null)}
+        anchorOrigin={{ vertical: "bottom", horizontal: "center" }}
+      >
+        <Alert severity="error" onClose={() => setImportError(null)}>
+          {importError}
+        </Alert>
+      </Snackbar>
     </Stack>
   );
 }

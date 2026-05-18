@@ -627,6 +627,23 @@ export const api = {
 
   getBooks: () => request<{ books: BookListEntry[] }>(`/api/books`),
 
+  // Trigger a server-side import of a book from DCS. Long-running: ~5-60s
+  // depending on book size, so the caller gets a wider timeout.
+  importBook: (book: string) =>
+    request<{
+      ok: true;
+      book: string;
+      alreadyImported?: boolean;
+      verses?: number;
+      tn?: number;
+      tq?: number;
+      twl?: number;
+      fetched?: { ult: boolean; ust: boolean; orig: boolean; tn: boolean; tq: boolean; twl: boolean };
+    }>(`/api/books/${encodeURIComponent(book)}/import`, {
+      method: "POST",
+      timeoutMs: 120_000,
+    }),
+
   setVerseDone: (book: string, chapter: number, verse: number, done: boolean) =>
     request<VerseStatus>(
       `/api/chapters/${encodeURIComponent(book)}/${chapter}/${verse}/status`,

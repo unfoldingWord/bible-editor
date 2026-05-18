@@ -9,6 +9,7 @@ import { exports as exportsRoutes } from "./exports";
 import { tnQuick } from "./tnQuick";
 import { pipelines, pollAllNonTerminal } from "./pipelines";
 import { pendingImports } from "./pendingImports";
+import { books } from "./bookImport";
 import { attachAuth, mintDevToken, startDcsAuth, callbackDcsAuth, authMe, refreshToken, verifyToken } from "./auth";
 
 export interface Env {
@@ -87,12 +88,7 @@ app.get("/api/health", (c) =>
   }),
 );
 
-app.get("/api/books", async (c) => {
-  const rs = await c.env.DB.prepare(
-    `SELECT book, imported_at FROM book_imports ORDER BY book`,
-  ).all<{ book: string; imported_at: number }>();
-  return c.json({ books: rs.results });
-});
+app.route("/api/books", books);
 
 app.get("/api/auth/dcs/start", startDcsAuth);
 app.get("/api/auth/dcs/callback", callbackDcsAuth);

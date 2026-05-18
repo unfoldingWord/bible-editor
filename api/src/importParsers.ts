@@ -101,6 +101,14 @@ function extractPlainText(verseObj: unknown): string {
   return parts.join("").replace(/\s+/g, " ").trim();
 }
 
+// Whole-book USFM headers (\id, \h, \toc*, \mt1, …) as the usfm-js
+// `headers` array. Stashed in book_usfm_meta so the nightly export can
+// emit them verbatim instead of synthesizing a minimum set.
+export function extractUsfmHeaders(rawUsfm: string): unknown[] | null {
+  const json = usfm.toJSON(rawUsfm);
+  return Array.isArray(json.headers) && json.headers.length > 0 ? json.headers : null;
+}
+
 // Extract every verse in [startChapter, endChapter] from a whole-book USFM
 // blob. Verse keys can be numeric ("3"), hyphenated ranges ("12-13"
 // collapses to its first verse), or the "front" pseudo-verse (where
