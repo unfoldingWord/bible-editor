@@ -175,9 +175,19 @@ export function NoteCard({
 
   // Session model: when this card becomes active, snapshot the current
   // committed values so undo can revert to "what it was when I started
-  // editing", regardless of intra-session saves. Pending patches accumulate
-  // here and flush once at session end (or on manual save).
+  // editing". Pending patches accumulate here and flush on manual save,
+  // session end, or unmount. On manual save the snapshot rebases to the
+  // saved state so the chip's "*" reflects "unsaved since last save".
+  //
+  // Backed by state (drives re-renders so the chip clears its dirty
+  // asterisk) with a mirrored ref for the unmount cleanup, which runs
+  // after the component is gone and can't read state from closure.
+  const [sessionSnapshot, setSessionSnapshotState] = useState<SessionSnapshot | null>(null);
   const sessionSnapshotRef = useRef<SessionSnapshot | null>(null);
+  const setSessionSnapshot = (next: SessionSnapshot | null) => {
+    sessionSnapshotRef.current = next;
+    setSessionSnapshotState(next);
+  };
   const pendingRef = useRef<Partial<TnRow>>({});
   const cancelUnmountFlushRef = useRef(false);
 
@@ -221,11 +231,11 @@ export function NoteCard({
   useEffect(() => {
     if (active) {
       if (sessionSnapshotRef.current === null) {
-        sessionSnapshotRef.current = { quote, note, support_reference: supportRef };
+        setSessionSnapshot({ quote, note, support_reference: supportRef });
       }
     } else if (sessionSnapshotRef.current !== null) {
       flushPending();
-      sessionSnapshotRef.current = null;
+      setSessionSnapshot(null);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [active]);
@@ -256,6 +266,12 @@ export function NoteCard({
     // and then reverted (or hit undo) — no net change to persist.
     if (s && pendingMatchesSnapshot(p, s)) return;
     onSave(p);
+    // Rebase the snapshot so the chip stops showing "*" after a manual
+    // save mid-session — and so a subsequent Undo reverts to the saved
+    // state rather than pre-edit.
+    if (sessionSnapshotRef.current !== null) {
+      setSessionSnapshot({ quote, note, support_reference: supportRef });
+    }
   };
 
   const stashEdit = (patch: Partial<TnRow>) => {
@@ -286,7 +302,7 @@ export function NoteCard({
   const handleDelete = () => {
     cancelUnmountFlushRef.current = true;
     pendingRef.current = {};
-    sessionSnapshotRef.current = null;
+    setSessionSnapshot(null);
     onDelete();
   };
 
@@ -316,11 +332,11 @@ export function NoteCard({
     // If a session is open, reset its baseline so Undo reverts to the
     // newly-applied version and the "unsaved edits" asterisk stays quiet.
     if (sessionSnapshotRef.current) {
-      sessionSnapshotRef.current = {
+      setSessionSnapshot({
         quote: displayQuote,
         note: displayNote,
         support_reference: rawSr,
-      };
+      });
     }
 
     // Only patch the fields that actually differ from the live row so we
@@ -364,11 +380,11 @@ export function NoteCard({
     setNote(newNote);
     pendingRef.current = {};
     if (sessionSnapshotRef.current !== null) {
-      sessionSnapshotRef.current = {
+      setSessionSnapshot({
         quote: newQuote,
         note: newNote,
         support_reference: supportRef,
-      };
+      });
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [aiRecentlyCompletedAt]);
@@ -409,15 +425,14 @@ export function NoteCard({
   };
 
   // Net change vs the session snapshot. Drives the save / undo buttons
-  // and the version-dirty asterisk — after Undo the local state matches
-  // the snapshot again so the save button goes quiet, and accidental
-  // empty-then-revert sessions don't appear dirty in the UI either.
-  const snapshot = sessionSnapshotRef.current;
+  // and the version-dirty asterisk — after Undo or a manual save the
+  // local state matches the snapshot again so the asterisk goes quiet,
+  // and accidental empty-then-revert sessions don't appear dirty either.
   const hasNetChanges =
-    snapshot !== null &&
-    (quote !== snapshot.quote ||
-      note !== snapshot.note ||
-      supportRef !== snapshot.support_reference);
+    sessionSnapshot !== null &&
+    (quote !== sessionSnapshot.quote ||
+      note !== sessionSnapshot.note ||
+      supportRef !== sessionSnapshot.support_reference);
   const canUndo = active && hasNetChanges;
   const showSessionButtons = active;
 
