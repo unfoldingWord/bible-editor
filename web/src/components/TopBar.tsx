@@ -151,9 +151,15 @@ export function TopBar({
               void importAndNavigate(v);
             }
           }}
+          selectOnFocus
+          openOnFocus
           filterOptions={(options, state) => {
             const q = state.inputValue.trim().toLowerCase();
-            if (!q) return options;
+            // When the input is empty OR still matches the current value
+            // (user just opened the dropdown without typing), show every
+            // book so they can pick a new one. Filtering only kicks in
+            // once they actually type something else.
+            if (!q || q === book.toLowerCase()) return options;
             const resolved = resolveBook(q);
             return options.filter((opt) => {
               if (opt.toLowerCase().startsWith(q)) return true;
