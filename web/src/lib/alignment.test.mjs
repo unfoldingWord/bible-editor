@@ -352,6 +352,39 @@ function roundtripVerseUsfm(rawUsfm, sourceVO = null) {
     assert(tags.includes("qs"), `\\qs wrapper survives edit to adjacent aligned word (tags=${tags.join(",")})`);
     assert(tags.filter((t) => t === "zaln").length >= 1, `at least one \\zaln milestone survives`);
   }
+
+  // (d) Multi-word edit (e.g. is→are in several places) across a USFM verse
+  // whose `\w` tokens land on separate lines — usfm-js leaves a single
+  // space between consecutive `\w`, but pre-fix code matched the literal
+  // plainText regex against `raw` which could contain `\n` near `{...}`
+  // word-addition markers. The whole-verse alignment got nuked. Regression
+  // guard: every \zaln milestone must survive a clean is→are sweep.
+  {
+    const target = String.raw`\v 1 \zaln-s |x-strong="H1"\*\w he|x-occurrence="1" x-occurrences="1"\w*\zaln-e\*
+\zaln-s |x-strong="H2"\*\w is|x-occurrence="1" x-occurrences="3"\w*\zaln-e\*
+\zaln-s |x-strong="H3"\*\w good|x-occurrence="1" x-occurrences="1"\w*\zaln-e\*,
+\zaln-s |x-strong="H4"\*\w she|x-occurrence="1" x-occurrences="1"\w*\zaln-e\*
+\zaln-s |x-strong="H2"\*\w is|x-occurrence="2" x-occurrences="3"\w*\zaln-e\*
+\zaln-s |x-strong="H5"\*\w kind|x-occurrence="1" x-occurrences="1"\w*\zaln-e\*.`;
+    const wrapped = `\\id TST\n\\c 1\n${target}\n`;
+    const json = usfm.toJSON(wrapped);
+    const verseObj = json.chapters["1"]["1"];
+    const content = { verseObjects: verseObj.verseObjects };
+    const oldPlain = "he is good, she is kind.";
+    const newPlain = "he are good, she are kind.";
+    const result = smartEditVerse(content, oldPlain, newPlain);
+    const flatten = (vos) => {
+      const tags = [];
+      const w = (xs) => { for (const n of xs ?? []) { if (n?.tag) tags.push(n.tag); if (Array.isArray(n?.children)) w(n.children); } };
+      w(vos);
+      return tags;
+    };
+    const tags = flatten(result.content.verseObjects);
+    const zalnCount = tags.filter((t) => t === "zaln").length;
+    assert(zalnCount === 6, `multi-word edit preserves every \\zaln milestone (got ${zalnCount}/6 — tags=${tags.join(",")})`);
+    assert(result.preservedAlignment === true, `multi-word edit reports preservedAlignment=true (got ${result.preservedAlignment})`);
+    assert(result.plainText === newPlain, `plain text round-trips cleanly (got ${JSON.stringify(result.plainText)})`);
+  }
 }
 
 // ─── Case 10: Highlight precision — quote shouldn't bleed across milestones ──

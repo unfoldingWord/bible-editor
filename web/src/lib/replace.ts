@@ -29,25 +29,30 @@ interface Leaf {
   node: Record<string, unknown>;
   start: number;
   end: number;
+  // 0 = top-level child of verseObjects. > 0 = nested inside a milestone /
+  // wrapper. Top-level text leaves can be split mid-character by the
+  // localized rewrite; nested leaves are dropped whole, so a partial
+  // overlap on a nested leaf loses text.
+  depth: number;
 }
 
 function walkLeaves(verseObjects: unknown[]): { raw: string; leaves: Leaf[] } {
   const leaves: Leaf[] = [];
   let pos = 0;
-  const walk = (nodes: unknown[]) => {
+  const walk = (nodes: unknown[], depth: number) => {
     for (const n of nodes ?? []) {
       const o = n as Record<string, unknown> | null;
       if (!o) continue;
       const text = o["text"];
       if (typeof text === "string") {
-        leaves.push({ node: o, start: pos, end: pos + text.length });
+        leaves.push({ node: o, start: pos, end: pos + text.length, depth });
         pos += text.length;
       }
       const children = o["children"];
-      if (Array.isArray(children)) walk(children);
+      if (Array.isArray(children)) walk(children, depth + 1);
     }
   };
-  walk(verseObjects);
+  walk(verseObjects, 0);
   return { raw: leaves.map((l) => String(l.node["text"])).join(""), leaves };
 }
 
@@ -116,6 +121,16 @@ export function tokenizePlainText(text: string): unknown[] {
   return out;
 }
 
+// Rewrite a regex so literal-space chars in the source match `\s+`. Used
+// when re-running a plain-text-derived regex against the unnormalized
+// `raw` concatenation of leaf text, which may contain `\n` (e.g. before
+// `{...}` word-additions) where plain text has a single space.
+function relaxWhitespace(regex: RegExp): RegExp {
+  const relaxed = regex.source.replace(/ /g, "\\s+");
+  const flags = regex.flags.includes("g") ? regex.flags : regex.flags + "g";
+  return new RegExp(relaxed, flags);
+}
+
 // Find the Nth (1-based) occurrence of `regex` in `text`. Returns null if
 // fewer than `n` matches exist.
 function nthMatchIn(text: string, regex: RegExp, n: number): { index: number; length: number } | null {
@@ -181,7 +196,13 @@ export function smartReplaceVerse(
   const occurrenceNum = countMatchesBefore(plainText, regex, matchStartInPlain) + 1;
   const cloned = cloneVerseObjects(verseObjects);
   const { raw, leaves } = walkLeaves(cloned);
-  const rawMatch = nthMatchIn(raw, regex, occurrenceNum);
+  // Raw can contain `\n` (or multi-space) where plainText has a single space —
+  // notably around `{...}` word-addition markers and across line-broken
+  // `\w` tokens. The strict regex was derived from normalized plainText, so
+  // when we search raw, treat each literal space as `\s+` so the same
+  // structural match anchors regardless of internal whitespace.
+  const rawRegex = relaxWhitespace(regex);
+  const rawMatch = nthMatchIn(raw, rawRegex, occurrenceNum);
 
   // If the raw search yields nothing (normalization wiped a match), fall
   // back to the flat tokenized path so we at least produce \w nodes.
@@ -204,18 +225,29 @@ export function smartReplaceVerse(
   //   (a) match boundaries align with leaf boundaries — no mid-leaf splits;
   //   (b) word-count parity between find and replace strings;
   //   (c) same number of \w leaves in the affected range as words on
-  //       either side, so the 1:1 mapping is unambiguous.
+  //       either side, so the 1:1 mapping is unambiguous;
+  //   (d) every \w leaf's existing text equals the corresponding word
+  //       extracted from rawMatchText — guards against attached punctuation
+  //       (e.g. raw `"good,"` parses as text "good" inside a \w then a
+  //       sibling text node ",". A naive `split(/\s+/)` would group those
+  //       as one token "good," and we'd write "," back into the word leaf.)
   const affected = leaves.filter((l) => l.start < rawEnd && l.end > rawStart);
   const startsAtBoundary = affected.length > 0 && affected[0].start === rawStart;
   const endsAtBoundary = affected.length > 0 && affected[affected.length - 1].end === rawEnd;
-  const matchWords = rawMatchText.split(/\s+/).filter(Boolean);
-  const replaceWords = replaceText.split(/\s+/).filter(Boolean);
+  // Use the same word-run regex as tokenizePlainText so "word characters"
+  // (letters / marks / intra-word `-` `'` `'`) define a word — punctuation
+  // doesn't ride along.
+  const matchWords = [...rawMatchText.matchAll(WORD_RUN_RE)].map((m) => m[0]);
+  const replaceWords = [...replaceText.matchAll(WORD_RUN_RE)].map((m) => m[0]);
   const wordLeaves = affected.filter((l) => isWordLeaf(l.node));
+  const wordsMatchLeaves =
+    wordLeaves.length === matchWords.length &&
+    wordLeaves.every((l, i) => String(l.node["text"]) === matchWords[i]);
   const canPreserve =
     startsAtBoundary &&
     endsAtBoundary &&
     matchWords.length === replaceWords.length &&
-    wordLeaves.length === matchWords.length;
+    wordsMatchLeaves;
 
   if (canPreserve) {
     // 1:1 word mapping. Whitespace text leaves between words stay as-is.
@@ -228,6 +260,36 @@ export function smartReplaceVerse(
       plainText: normalize(newRaw),
       preservedAlignment: true,
     };
+  }
+
+  // Single-leaf in-place edit: the change starts and ends within ONE word
+  // leaf (e.g. `Praise` → `Praising` types into the middle/end of a single
+  // \w word). Splice the new chars directly into that leaf's text so the
+  // wrapping milestones — and any sibling content like a \qs or \f — survive
+  // intact. Only safe when the resulting text is still a single clean word
+  // (no whitespace, no punctuation that would normally split it into
+  // multiple \w tokens).
+  if (affected.length === 1 && isWordLeaf(affected[0].node)) {
+    const leaf = affected[0];
+    const leafText = String(leaf.node["text"]);
+    const newLeafText =
+      leafText.slice(0, rawStart - leaf.start) +
+      replaceText +
+      leafText.slice(rawEnd - leaf.start);
+    if (newLeafText.length > 0 && !/\s/.test(newLeafText) && WORD_RUN_RE.test(newLeafText)) {
+      WORD_RUN_RE.lastIndex = 0;
+      const onlyWord = newLeafText.match(WORD_RUN_RE)?.[0] === newLeafText;
+      WORD_RUN_RE.lastIndex = 0;
+      if (onlyWord) {
+        leaf.node["text"] = newLeafText;
+        const newRaw = rebuildRaw(cloned);
+        return {
+          content: { verseObjects: cloned },
+          plainText: normalize(newRaw),
+          preservedAlignment: true,
+        };
+      }
+    }
   }
 
   // Structural mismatch — fall through to the localized rewrite so only
@@ -382,11 +444,13 @@ function localizedRewriteVerse(
   const cloned = cloneVerseObjects(verseObjects);
   const rawTotal = rebuildRaw(cloned);
 
-  // Map plain-text positions to raw-text positions by counting occurrences
-  // of the literal matchText. For pure insertions (oldLen === 0) we use
-  // plain position as a rough proxy — works as long as whitespace
-  // normalization didn't shift much, which is true for typical edits.
+  // Map plain-text positions to raw-text positions. For oldLen > 0 we find
+  // the Nth occurrence of the matchText in raw, treating each literal space
+  // in the pattern as `\s+` so we match across leaf-boundary newlines (e.g.
+  // raw `"where\n{are} they"` for plain `"where {are} they"`). For pure
+  // insertions (oldLen === 0) we use the plain position as a rough proxy.
   let rawStart = -1;
+  let rawLen = oldLen;
   if (oldLen > 0) {
     const matchText = oldPlain.slice(start, start + oldLen);
     let occurrence = 1;
@@ -395,15 +459,18 @@ function localizedRewriteVerse(
       occurrence++;
       scan = oldPlain.indexOf(matchText, scan + 1);
     }
-    let rawScan = rawTotal.indexOf(matchText);
+    const escaped = matchText.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const rawRegex = new RegExp(escaped.replace(/ /g, "\\s+"), "g");
+    let m: RegExpExecArray | null;
     let count = 0;
-    while (rawScan >= 0) {
+    while ((m = rawRegex.exec(rawTotal)) !== null) {
       count++;
       if (count === occurrence) {
-        rawStart = rawScan;
+        rawStart = m.index;
+        rawLen = m[0].length;
         break;
       }
-      rawScan = rawTotal.indexOf(matchText, rawScan + 1);
+      if (m[0].length === 0) rawRegex.lastIndex++;
     }
   } else {
     rawStart = Math.min(start, rawTotal.length);
@@ -418,7 +485,30 @@ function localizedRewriteVerse(
       preservedAlignment: false,
     };
   }
-  const rawEnd = rawStart + oldLen;
+  const rawEnd = rawStart + rawLen;
+
+  // Text-correctness guard. The partition walk treats milestone children as
+  // opaque — any child whose extent overlaps the change is dropped wholly,
+  // replaced by the tokenized newSubstring. If a NESTED leaf (depth > 0,
+  // i.e. inside a milestone) is only PARTIALLY overlapped, the unchanged
+  // half of that leaf's text disappears from the saved verse. Top-level
+  // text leaves are fine — the per-node walk splits them at the boundary.
+  // Losing alignment is bad; losing user text they just typed is worse.
+  const { leaves } = walkLeaves(cloned);
+  const splitsNestedLeaf = leaves.some((l) => {
+    if (l.depth === 0) return false;
+    const startsInside = l.start < rawStart && l.end > rawStart;
+    const endsInside = l.start < rawEnd && l.end > rawEnd;
+    return startsInside || endsInside;
+  });
+  if (splitsNestedLeaf) {
+    const newPlain = oldPlain.slice(0, start) + newSubstring + oldPlain.slice(start + oldLen);
+    return {
+      content: { verseObjects: tokenizePlainText(newPlain) },
+      plainText: normalize(newPlain),
+      preservedAlignment: false,
+    };
+  }
 
   const out: unknown[] = [];
   let emittedChange = false;
