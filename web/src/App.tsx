@@ -55,8 +55,8 @@ function isDefaultLoc(l: Location): boolean {
 //      (suppresses dev silent re-mint after an explicit logout).
 //   2. If the URL has ?_auth_denied=1, the OAuth callback rejected this DCS
 //      account (not on the editor allowlist). Show the denied screen.
-//   3. If the URL has ?_auth=<token> (DCS OAuth callback success), store it
-//      and clean URL, then verify the role via /api/auth/me.
+//   3. If the URL has #_auth=<token> (DCS OAuth callback success), store it
+//      and strip the fragment, then verify the role via /api/auth/me.
 //   4. If a token is already in localStorage, verify via /api/auth/me.
 //   5. In dev mode (import.meta.env.DEV), silently mint via /api/auth/dev.
 //   6. Otherwise show the sign-in button (production OAuth flow).
@@ -98,11 +98,24 @@ function useAuthGate(): [AuthState, (s: AuthState) => void] {
 
     // Step 3: absorb token from DCS OAuth callback (clears any stale
     // signed-out flag — a successful OAuth callback is an explicit sign-in).
-    const urlToken = params.get("_auth");
+    // The token rides in the URL fragment (#_auth=...) so it never hits
+    // browser history, the Referer header, or edge logs — fragments are
+    // browser-only. Note this prefix can never collide with the hash router
+    // (which always starts "#/", e.g. "#/ZEC/1/1"); the leading underscore
+    // also means parseHash's [A-Za-z0-9] capture won't match it.
+    const hash = location.hash;
+    let urlToken: string | null = null;
+    if (hash.startsWith("#_auth=")) {
+      try {
+        urlToken = decodeURIComponent(hash.slice("#_auth=".length));
+      } catch {
+        urlToken = null;
+      }
+    }
     if (urlToken) {
       clearSignedOutFlag();
       setAuthToken(urlToken);
-      history.replaceState(null, "", location.pathname + location.hash);
+      history.replaceState(null, "", location.pathname + location.search);
       return { kind: "verifying" };
     }
 

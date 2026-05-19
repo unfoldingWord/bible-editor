@@ -20,6 +20,11 @@ chapters.get("/:book/:chapter", async (c) => {
   // last write was AI-driven; any later human edit / keep overwrites with
   // NULL via a fresh edit_log row, so the chip disappears automatically.
   // The (kind, row_key) index makes the correlated subquery cheap.
+  //
+  // Book-scope the subquery on edit_log.book (added in migration 0017) so
+  // cross-book id collisions can't leak the wrong source chip. Pre-0017
+  // audit rows have NULL book; the `OR book IS NULL` keeps them visible
+  // until the next edit naturally backfills.
   const [verses, tn, tq, twl, statuses] = await Promise.all([
     db
       .prepare(
@@ -32,6 +37,7 @@ chapters.get("/:book/:chapter", async (c) => {
         `SELECT t.*, (
            SELECT source FROM edit_log
             WHERE kind = 'tn' AND row_key = t.id
+              AND (book = t.book OR book IS NULL)
             ORDER BY id DESC LIMIT 1
          ) AS latest_source
             FROM tn_rows t
@@ -45,6 +51,7 @@ chapters.get("/:book/:chapter", async (c) => {
         `SELECT t.*, (
            SELECT source FROM edit_log
             WHERE kind = 'tq' AND row_key = t.id
+              AND (book = t.book OR book IS NULL)
             ORDER BY id DESC LIMIT 1
          ) AS latest_source
             FROM tq_rows t

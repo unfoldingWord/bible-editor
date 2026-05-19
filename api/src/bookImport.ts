@@ -53,12 +53,6 @@ books.get("/", async (c) => {
   return c.json({ books: rs.results });
 });
 
-// One in-flight import per book at a time. A second concurrent POST for the
-// same book short-circuits to "in_progress"; the client should retry the GET
-// /api/books a few seconds later to see it appear. Without this, two tabs
-// selecting LUK at the same moment race the DELETEs and double-insert.
-const inFlight = new Set<string>();
-
 books.post("/:book/import", requireEditor, async (c) => {
   const userId = currentUserId(c);
   if (!userId) return c.json({ error: "unauthorized" }, 401);
@@ -94,10 +88,21 @@ books.post("/:book/import", requireEditor, async (c) => {
     return c.json({ ok: true, book, recovered: true });
   }
 
-  if (inFlight.has(book)) {
+  // Cross-isolate import lock — `INSERT OR IGNORE` on the PK gives us an
+  // atomic "first writer wins" handshake. The previous in-memory Set was
+  // per-Worker-isolate, so a second POST that happened to land on a
+  // different edge node would have raced the DELETE-then-INSERT pipeline
+  // below and double-imported the book. A stale lock from a crashed Worker
+  // is reclaimed by the */5 sweep in api/src/index.ts.
+  const lock = await c.env.DB.prepare(
+    `INSERT OR IGNORE INTO book_import_locks (book, started_at, started_by)
+     VALUES (?1, unixepoch(), ?2)`,
+  )
+    .bind(book, userId)
+    .run();
+  if (!lock.meta.changes) {
     return c.json({ error: "in_progress", book }, 409);
   }
-  inFlight.add(book);
 
   try {
     const result = await importBookFromDcs(c.env, book, num, userId);
@@ -106,7 +111,11 @@ books.post("/:book/import", requireEditor, async (c) => {
     const msg = e instanceof Error ? e.message : String(e);
     return c.json({ error: "import_failed", book, message: msg }, 502);
   } finally {
-    inFlight.delete(book);
+    await c.env.DB.prepare(
+      `DELETE FROM book_import_locks WHERE book = ?1`,
+    )
+      .bind(book)
+      .run();
   }
 });
 
