@@ -1,9 +1,9 @@
 // Thin WebSocket connection manager for the per-chapter ChapterRoom DO.
 //
-// Opens a socket to /api/ws/chapter/:book/:chapter with the user's JWT in
-// the subprotocol slot ("bearer.<jwt>") — the standard Authorization
-// header isn't settable on `new WebSocket(...)` so subprotocol is the
-// browser-compatible escape hatch.
+// Opens a same-origin WebSocket to /api/ws/chapter/:book/:chapter. The
+// Access cookie travels with the upgrade request automatically (cookies
+// ride on WS handshakes same-origin); no token plumbing needed on the
+// client.
 //
 // Listen-only for now: clients don't push anything on this socket. Server
 // broadcasts on row writes (see api/src/rows.ts → broadcastChapter).
@@ -11,8 +11,6 @@
 // Reconnects with exponential backoff (1s, 2s, 4s, ..., cap 30s). On a
 // successful `open`, backoff resets to 1s so a brief blip during a deploy
 // doesn't leave the client paused for half a minute on the next failure.
-
-import { getAuthToken } from "./api";
 
 export interface WsHandlers {
   onEvent: (event: unknown) => void;
@@ -86,17 +84,9 @@ export function openChapterRoom(
 
   const connect = () => {
     if (disposed) return;
-    const token = getAuthToken();
-    if (!token) {
-      // Token not yet in localStorage (App.tsx still completing its dev
-      // mint). Hold off and try again — don't burn the backoff window on
-      // a state that resolves in <1s.
-      reconnectTimer = setTimeout(connect, 250);
-      return;
-    }
     let ws: WebSocket;
     try {
-      ws = new WebSocket(wsUrl(book, chapter), [`bearer.${token}`]);
+      ws = new WebSocket(wsUrl(book, chapter));
     } catch (e) {
       handlers.onError?.(new Event("error"));
       scheduleReconnect();

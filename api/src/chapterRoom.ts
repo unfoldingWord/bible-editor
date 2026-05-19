@@ -10,6 +10,13 @@ import type { WsEvent } from "./wsEvents";
 // one socket is open. Hibernation (state.acceptWebSocket) is deliberately
 // skipped for now; revisit if active rooms grow enough that DO duration
 // billing matters.
+// Max concurrent WS clients per chapter room. A single DO holds these all in
+// memory and fans every broadcast through them, so the cap protects against
+// both runaway memory and broadcast amplification (one PATCH × N sockets).
+// Real chapter rooms peak at a handful of translators; 100 is well above
+// any legitimate load.
+const MAX_CLIENTS_PER_ROOM = 100;
+
 export class ChapterRoom implements DurableObject {
   private clients = new Set<WebSocket>();
 
@@ -46,6 +53,12 @@ export class ChapterRoom implements DurableObject {
 
     if (request.headers.get("upgrade") !== "websocket") {
       return new Response("expected websocket", { status: 426 });
+    }
+
+    // Cap before accept() — once we accept the socket, refusing it later is
+    // an ugly handshake error in the browser.
+    if (this.clients.size >= MAX_CLIENTS_PER_ROOM) {
+      return new Response("room full", { status: 503 });
     }
 
     const pair = new WebSocketPair();

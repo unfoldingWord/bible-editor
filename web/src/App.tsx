@@ -8,9 +8,7 @@ import {
   authLogout,
   devSignIn,
   fetchAuthMe,
-  getAuthToken,
   onAuthError,
-  setAuthToken,
   setReadOnly,
   updateLastLocation,
   type MeResponse,
@@ -31,6 +29,8 @@ const DEFAULT_BOOK = "OBA";
 
 // Set when the user explicitly clicks "Sign out". Read at boot to suppress
 // the dev-mode silent re-mint and show the signed-out screen instead.
+// This is a UX flag only — auth state lives in HttpOnly cookies and is
+// gone by the time we read this. Cleared on next successful sign-in.
 const SIGNED_OUT_KEY = "bible-editor.signed_out";
 
 function parseHash(): Location {
@@ -47,25 +47,25 @@ function isDefaultLoc(l: Location): boolean {
   return l.book === DEFAULT_BOOK && l.chapter === 1 && l.verse === 1;
 }
 
-// Auth gate. The API requires a Bearer token for every write, so we must
-// have one before mounting the editor — otherwise every save 401s.
+// Auth gate. The API requires a valid Access cookie for every write, so we
+// must have one before mounting the editor — otherwise every save 401s.
 //
 // Boot sequence:
-//   1. If localStorage has the signed-out flag, show the signed-out screen
-//      (suppresses dev silent re-mint after an explicit logout).
-//   2. If the URL has ?_auth_denied=1, the OAuth callback rejected this DCS
+//   1. If the URL has ?_auth_denied=1, the OAuth callback rejected this DCS
 //      account (not on the editor allowlist). Show the denied screen.
-//   3. If the URL has #_auth=<token> (DCS OAuth callback success), store it
-//      and strip the fragment, then verify the role via /api/auth/me.
-//   4. If a token is already in localStorage, verify via /api/auth/me.
-//   5. In dev mode (import.meta.env.DEV), silently mint via /api/auth/dev.
-//   6. Otherwise show the sign-in button (production OAuth flow).
+//   2. Otherwise call /api/auth/me. The HttpOnly Access cookie is sent
+//      automatically; we never see the token itself. On 200 → ready; on
+//      401 → fall through.
+//   3. If the user explicitly signed out (SIGNED_OUT_KEY), stay in missing
+//      — block the dev silent re-mint so the "Sign in with Door43" flow
+//      is required after logout.
+//   4. In dev mode, attempt /api/auth/dev silent mint. If 404 (disabled)
+//      or any other failure → missing.
+//   5. In prod, fall straight to missing.
 type AuthState =
   | { kind: "loading" }
-  | { kind: "verifying" }                          // have a token; checking role
   | { kind: "ready"; me: MeResponse | null; role: Role }
-  | { kind: "signed_out" }                         // explicit logout; awaits sign-in click
-  | { kind: "missing" }                            // DCS OAuth available — show sign-in button
+  | { kind: "missing" }                            // not signed in — show "Sign in with Door43"
   | { kind: "denied"; username: string | null }    // signed in but not on editor allowlist
   | { kind: "error"; message: string };
 
@@ -88,118 +88,70 @@ function clearSignedOutFlag() {
 function useAuthGate(): [AuthState, (s: AuthState) => void] {
   const [state, setState] = useState<AuthState>(() => {
     const params = new URLSearchParams(location.search);
-
-    // Step 2: OAuth callback rejected this account (not on the allowlist).
+    // Step 1: OAuth callback rejected this account (not on the allowlist).
     if (params.get("_auth_denied")) {
       const username = params.get("u");
       history.replaceState(null, "", location.pathname + location.hash);
       return { kind: "denied", username };
     }
-
-    // Step 3: absorb token from DCS OAuth callback (clears any stale
-    // signed-out flag — a successful OAuth callback is an explicit sign-in).
-    // The token rides in the URL fragment (#_auth=...) so it never hits
-    // browser history, the Referer header, or edge logs — fragments are
-    // browser-only. Note this prefix can never collide with the hash router
-    // (which always starts "#/", e.g. "#/ZEC/1/1"); the leading underscore
-    // also means parseHash's [A-Za-z0-9] capture won't match it.
-    const hash = location.hash;
-    let urlToken: string | null = null;
-    if (hash.startsWith("#_auth=")) {
-      try {
-        urlToken = decodeURIComponent(hash.slice("#_auth=".length));
-      } catch {
-        urlToken = null;
-      }
-    }
-    if (urlToken) {
-      clearSignedOutFlag();
-      setAuthToken(urlToken);
-      history.replaceState(null, "", location.pathname + location.search);
-      return { kind: "verifying" };
-    }
-
-    // Step 1: explicit logout takes precedence over any leftover token in
-    // localStorage. Token survives only as a fallback for the (rare) case
-    // where logout's POST failed before the client could clear it.
-    if (isSignedOut()) return { kind: "signed_out" };
-
-    return getAuthToken() ? { kind: "verifying" } : { kind: "loading" };
+    return { kind: "loading" };
   });
 
-  // verifying → ready/denied/error. Single fetch of /api/auth/me; the role
-  // claim is also in the JWT so we trust the response.
+  // loading → /api/auth/me probe → ready/missing/denied/error. The Access
+  // cookie (if any) rides automatically. A successful 200 also clears any
+  // stale signed_out flag — implicit "we got back in" signal.
   useEffect(() => {
-    if (state.kind !== "verifying") return;
+    if (state.kind !== "loading") return;
     let cancelled = false;
     fetchAuthMe()
-      .then((me) => {
+      .then(async (me) => {
         if (cancelled) return;
-        if (!me) {
-          setState({ kind: "loading" });
-          return;
-        }
-        if (me.role === "admin" || me.role === "editor" || me.role === "viewer") {
+        if (me && (me.role === "admin" || me.role === "editor" || me.role === "viewer")) {
+          clearSignedOutFlag();
           setReadOnly(me.role === "viewer");
           setState({ kind: "ready", me, role: me.role });
-        } else if (import.meta.env.DEV) {
-          // Dev convenience: a stale token from before the role claim was
-          // added has role=null. Drop it and let the loading branch silently
-          // re-mint via /api/auth/dev with a fresh role claim.
-          setAuthToken(null);
-          setState({ kind: "loading" });
-        } else {
+          return;
+        }
+        if (me && !me.role) {
           setState({ kind: "denied", username: me.username });
+          return;
+        }
+        // me === null → 401, no cookie. Decide whether to silent-mint (dev)
+        // or land on the sign-in screen.
+        if (isSignedOut() || !import.meta.env.DEV) {
+          setState({ kind: "missing" });
+          return;
+        }
+        try {
+          const devMe = await devSignIn("dev");
+          if (cancelled) return;
+          if (devMe.role !== "admin" && devMe.role !== "editor" && devMe.role !== "viewer") {
+            setState({ kind: "denied", username: devMe.username });
+            return;
+          }
+          clearSignedOutFlag();
+          setReadOnly(devMe.role === "viewer");
+          setState({ kind: "ready", me: devMe, role: devMe.role });
+        } catch (err: unknown) {
+          if (cancelled) return;
+          const status = (err as { status?: number })?.status;
+          if (status === 404) {
+            // DEV_AUTH_ENABLED=false (e.g. running prod build locally).
+            setState({ kind: "missing" });
+          } else {
+            setState({ kind: "error", message: String(err) });
+          }
         }
       })
       .catch((err: unknown) => {
         if (cancelled) return;
         const status = (err as { status?: number })?.status;
-        if (status === 401) {
-          // Token bad / refresh path failed. Clear and start over.
-          setAuthToken(null);
-          setState({ kind: "loading" });
-        } else if (status === 403) {
+        if (status === 403) {
           setState({ kind: "denied", username: null });
         } else {
           setState({ kind: "error", message: String(err) });
         }
       });
-    return () => { cancelled = true; };
-  }, [state.kind]);
-
-  useEffect(() => {
-    if (state.kind !== "loading") return;
-    let cancelled = false;
-
-    if (import.meta.env.DEV) {
-      // Step 5: silent dev mint — only when DEV_AUTH_ENABLED=true on the worker.
-      devSignIn("dev")
-        .then(async (resp) => {
-          if (cancelled) return;
-          if (resp.role !== "admin" && resp.role !== "editor" && resp.role !== "viewer") {
-            setState({ kind: "denied", username: resp.username });
-            return;
-          }
-          setReadOnly(resp.role === "viewer");
-          // devSignIn doesn't return last_* — pull it separately so we can
-          // hydrate the view. Failure here is non-fatal: the user just lands
-          // on the URL hash (or the default book).
-          const me = await fetchAuthMe().catch(() => null);
-          setState({ kind: "ready", me, role: resp.role });
-        })
-        .catch((err: unknown) => {
-          if (cancelled) return;
-          const status = (err as { status?: number })?.status;
-          // 404 = DEV_AUTH_ENABLED is false; fall through to the sign-in button.
-          if (status === 404) setState({ kind: "missing" });
-          else setState({ kind: "error", message: String(err) });
-        });
-    } else {
-      // Step 6: production — show the sign-in button (user must click to OAuth).
-      setState({ kind: "missing" });
-    }
-
     return () => { cancelled = true; };
   }, [state.kind]);
 
@@ -255,7 +207,7 @@ export function App() {
     return () => clearTimeout(t);
   }, [auth.kind, loc.book, loc.chapter, loc.verse]);
 
-  if (auth.kind === "loading" || auth.kind === "verifying") {
+  if (auth.kind === "loading") {
     return (
       <Stack alignItems="center" justifyContent="center" sx={{ height: "100vh" }} spacing={2}>
         <CircularProgress />
@@ -263,34 +215,34 @@ export function App() {
       </Stack>
     );
   }
-  if (auth.kind === "signed_out") {
-    const handleSignIn = () => {
+  if (auth.kind === "missing") {
+    // After an explicit logout (signed_out flag set) we surface a "queued
+    // edits are safe" reassurance line. First-time visitors with no token
+    // see the bare "Sign in to continue" screen instead — they have no
+    // queued edits to worry about.
+    const wasSignedOut = isSignedOut();
+    const devSignInClick = () => {
       clearSignedOutFlag();
-      if (import.meta.env.DEV) {
-        setAuth({ kind: "loading" });
-      } else {
-        location.href = "/api/auth/dcs/start";
-      }
+      setAuth({ kind: "loading" });
     };
     return (
       <Stack alignItems="center" justifyContent="center" sx={{ height: "100vh" }} spacing={2}>
-        <Typography variant="h6">You're signed out</Typography>
-        <Typography variant="body2" color="text.secondary">
-          Queued edits stay in your browser until you sign back in.
+        <Typography variant="h6">
+          {wasSignedOut ? "You're signed out" : "Sign in to continue"}
         </Typography>
-        <Button variant="contained" onClick={handleSignIn} size="large">
-          {import.meta.env.DEV ? "Sign in (dev)" : "Sign in with Door43"}
-        </Button>
-      </Stack>
-    );
-  }
-  if (auth.kind === "missing") {
-    return (
-      <Stack alignItems="center" justifyContent="center" sx={{ height: "100vh" }} spacing={2}>
-        <Typography variant="h6">Sign in to continue</Typography>
+        {wasSignedOut && (
+          <Typography variant="body2" color="text.secondary">
+            Queued edits stay in your browser until you sign back in.
+          </Typography>
+        )}
         <Button variant="contained" href="/api/auth/dcs/start" size="large">
           Sign in with Door43
         </Button>
+        {import.meta.env.DEV && (
+          <Button variant="text" size="small" onClick={devSignInClick}>
+            Sign in (dev)
+          </Button>
+        )}
       </Stack>
     );
   }
@@ -307,8 +259,12 @@ export function App() {
         <Button
           variant="outlined"
           onClick={() => {
-            setAuthToken(null);
-            location.href = "/api/auth/dcs/start";
+            // Server-side: clear cookies via logout, then start the OAuth
+            // dance. The user still has to sign out of DCS separately to
+            // actually switch accounts (DCS session cookie is sticky).
+            void authLogout().finally(() => {
+              location.href = "/api/auth/dcs/start";
+            });
           }}
           size="small"
         >
@@ -326,11 +282,10 @@ export function App() {
   }
 
   const handleSignOut = async () => {
-    // Best-effort server-side cleanup BEFORE we drop the bearer token, so
-    // the request actually carries Authorization. We don't await the result
-    // for the UI transition — the local token is what gates editing.
+    // Server-side cleanup clears all three session cookies, revokes the
+    // session row, and best-effort revokes the DCS access token. Set the
+    // local UX flag so the next boot doesn't silent-mint in dev.
     await authLogout();
-    setAuthToken(null);
     try {
       localStorage.setItem(SIGNED_OUT_KEY, "1");
     } catch {
@@ -343,16 +298,14 @@ export function App() {
     history.replaceState(null, "", location.pathname);
     setLoc({ book: DEFAULT_BOOK, chapter: 1, verse: 1 });
     hydratedRef.current = false;
-    setAuth({ kind: "signed_out" });
+    setAuth({ kind: "missing" });
   };
 
   const handleSessionExpired = () => {
-    setAuthToken(null);
-    if (import.meta.env.DEV) {
-      location.reload();
-    } else {
-      location.href = "/api/auth/dcs/start";
-    }
+    // Cookies are still set but the Access token expired and refresh failed
+    // (e.g. session revoked). Send the user through OAuth in both dev and
+    // prod — there's no silent recovery from this state.
+    location.href = "/api/auth/dcs/start";
   };
 
   const isViewer = auth.kind === "ready" && auth.role === "viewer";

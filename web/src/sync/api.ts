@@ -167,32 +167,35 @@ export interface PipelineConflictBody {
   existing?: PipelineConflictExisting;
 }
 
-// Bearer token storage. The token is opaque to the client — it carries the
-// user id in its `sub` claim and the worker verifies HS256 against the
-// shared JWT_SIGNING_KEY. localStorage is good-enough for a 7-month tactical
-// tool; revisit if the app starts handling sensitive data (the obvious next
-// step would be httpOnly cookies, which also requires SameSite=Lax + CSRF).
-const TOKEN_KEY = "bible-editor.auth.token";
-let cachedToken: string | null | undefined;
+// Auth lives in cookies set by the server (be_access HttpOnly + be_refresh
+// HttpOnly + be_csrf non-HttpOnly). We never store the JWT on the client.
+// All fetches in this module pass `credentials: "include"` so the cookies
+// ride along even on cross-origin requests (the prod deployment is same-
+// origin, but the credentials flag is harmless either way).
+//
+// Writes also mirror the be_csrf cookie value into an X-CSRF-Token header so
+// the server can validate double-submit.
 
-export function getAuthToken(): string | null {
-  if (cachedToken !== undefined) return cachedToken;
-  try {
-    cachedToken = typeof localStorage !== "undefined" ? localStorage.getItem(TOKEN_KEY) : null;
-  } catch {
-    cachedToken = null;
+const CSRF_COOKIE_NAME = "be_csrf";
+
+function readCookie(name: string): string | null {
+  if (typeof document === "undefined") return null;
+  const prefix = `${name}=`;
+  for (const part of document.cookie.split(";")) {
+    const t = part.trim();
+    if (t.startsWith(prefix)) {
+      try {
+        return decodeURIComponent(t.slice(prefix.length));
+      } catch {
+        return t.slice(prefix.length);
+      }
+    }
   }
-  return cachedToken;
+  return null;
 }
 
-export function setAuthToken(token: string | null) {
-  cachedToken = token;
-  try {
-    if (token) localStorage.setItem(TOKEN_KEY, token);
-    else localStorage.removeItem(TOKEN_KEY);
-  } catch {
-    /* private mode etc. */
-  }
+function getCsrfToken(): string | null {
+  return readCookie(CSRF_COOKIE_NAME);
 }
 
 // Read-only flag — set when the current JWT carries role='viewer'. The
@@ -223,23 +226,19 @@ function emitAuthError() {
 }
 
 // Concurrent failing requests share a single refresh attempt so we don't
-// trigger N refresh calls when N in-flight outbox ops all 401 at once.
+// trigger N refresh calls when N in-flight outbox ops all 401 at once. The
+// server reads the be_refresh cookie (SameSite=Strict, sent automatically
+// on same-origin POST) and rotates the be_access cookie.
 let refreshInFlight: Promise<boolean> | null = null;
 async function refreshAuthOnce(): Promise<boolean> {
   if (refreshInFlight) return refreshInFlight;
   refreshInFlight = (async () => {
     try {
-      const token = getAuthToken();
-      if (!token) return false;
       const res = await fetch("/api/auth/refresh", {
         method: "POST",
-        headers: { Authorization: `Bearer ${token}` },
+        credentials: "include",
       });
-      if (!res.ok) return false;
-      const data = (await res.json().catch(() => null)) as { token?: string } | null;
-      if (!data?.token) return false;
-      setAuthToken(data.token);
-      return true;
+      return res.ok;
     } catch {
       return false;
     } finally {
@@ -302,9 +301,11 @@ async function request<T>(
     "Content-Type": "application/json",
     ...((init?.headers as Record<string, string>) ?? {}),
   };
-  const token = getAuthToken();
-  if (token && !headers.Authorization) {
-    headers.Authorization = `Bearer ${token}`;
+  // Double-submit CSRF on writes. Server matches X-CSRF-Token against the
+  // be_csrf cookie and 403s on mismatch. GETs are exempt server-side.
+  if (method !== "GET" && method !== "HEAD" && !headers["X-CSRF-Token"]) {
+    const csrf = getCsrfToken();
+    if (csrf) headers["X-CSRF-Token"] = csrf;
   }
 
   const timeoutMs = init?.timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
@@ -319,8 +320,10 @@ async function request<T>(
     signal = signal ? composeSignals([signal, timeoutCtrl.signal]) : timeoutCtrl.signal;
   }
 
-  // Strip our extension before handing to fetch.
-  const fetchInit: RequestInit = { ...init, headers, signal };
+  // Strip our extension before handing to fetch. credentials: "include"
+  // means cookies always ride along — same-origin in production, and Vite's
+  // dev proxy preserves them too.
+  const fetchInit: RequestInit = { ...init, headers, signal, credentials: "include" };
   delete (fetchInit as RequestInitWithTimeout).timeoutMs;
 
   let res: Response;
@@ -380,19 +383,22 @@ export interface MeResponse {
   lastVerse: number | null;
 }
 
-// GET /api/auth/me — confirms the current Bearer token's identity + role.
-// Returns null when no token is present (so callers can show the sign-in
-// flow). Throws ApiError on 4xx/5xx (App.tsx classifies 401 → re-auth,
-// anything else → error state).
+// GET /api/auth/me — confirms the current cookie session's identity + role.
+// Returns null on 401 (no cookie / expired) so callers can show the sign-in
+// flow. Throws ApiError on other 4xx/5xx.
 export async function fetchAuthMe(): Promise<MeResponse | null> {
-  if (!getAuthToken()) return null;
-  return request<MeResponse>(`/api/auth/me`);
+  try {
+    return await request<MeResponse>(`/api/auth/me`);
+  } catch (err) {
+    if (err instanceof ApiError && err.status === 401) return null;
+    throw err;
+  }
 }
 
-// POST /api/auth/logout — best-effort DCS revoke + clears stored access
-// token. The caller is responsible for clearing the local JWT afterwards.
+// POST /api/auth/logout — server-side: revokes the session row, clears
+// cookies, best-effort revokes DCS token. Always succeeds from the client's
+// perspective; failures don't block the UI.
 export async function authLogout(): Promise<void> {
-  if (!getAuthToken()) return;
   try {
     await request<{ ok: true }>(`/api/auth/logout`, { method: "POST" });
   } catch {
@@ -408,7 +414,6 @@ export async function updateLastLocation(
   chapter: number,
   verse: number,
 ): Promise<void> {
-  if (!getAuthToken()) return;
   try {
     await request<{ ok: true }>(`/api/users/me/location`, {
       method: "PUT",
@@ -419,23 +424,16 @@ export async function updateLastLocation(
   }
 }
 
-export interface DevAuthResponse {
-  token: string;
-  userId: number;
-  username: string;
-  role: Role;
-  expiresIn: number;
-}
-
-// Dev-only sign-in. Mints a JWT for `username`, creating a users row on
-// first use. Only works while the worker has DEV_AUTH_ENABLED=true and a
-// JWT_SIGNING_KEY configured. Production should route through DCS OAuth
-// (not yet wired — see docs/plan.md).
-export async function devSignIn(username = "dev"): Promise<DevAuthResponse> {
+// Dev-only sign-in. Sets the session cookies for `username`, creating a
+// users row on first use. Only works while the worker has DEV_AUTH_ENABLED=
+// true and a JWT_SIGNING_KEY configured. Returns the same shape as
+// /api/auth/me so callers can skip a follow-up fetch.
+export async function devSignIn(username = "dev"): Promise<MeResponse> {
   const res = await fetch(`/api/auth/dev`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ username }),
+    credentials: "include",
   });
   if (!res.ok) {
     let body: unknown = null;
@@ -446,9 +444,7 @@ export async function devSignIn(username = "dev"): Promise<DevAuthResponse> {
     }
     throw new ApiError(res.status, `HTTP ${res.status}`, body);
   }
-  const data = (await res.json()) as DevAuthResponse;
-  setAuthToken(data.token);
-  return data;
+  return (await res.json()) as MeResponse;
 }
 
 export interface RowHistoryUser {

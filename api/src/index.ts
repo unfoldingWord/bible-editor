@@ -10,7 +10,7 @@ import { tnQuick } from "./tnQuick";
 import { pipelines, pollAllNonTerminal } from "./pipelines";
 import { pendingImports } from "./pendingImports";
 import { books } from "./bookImport";
-import { attachAuth, requireAuth, mintDevToken, startDcsAuth, callbackDcsAuth, authMe, authLogout, refreshToken, updateLastLocation, verifyToken } from "./auth";
+import { attachAuth, requireAuth, requireCsrf, mintDevToken, startDcsAuth, callbackDcsAuth, authMe, authLogout, refreshToken, updateLastLocation, currentUserId, verifyToken } from "./auth";
 
 export interface Env {
   DB: D1Database;
@@ -52,6 +52,13 @@ export interface Env {
   PIPELINE_API_BASE?: string;
 }
 
+// Cron patterns must match the [triggers] crons list in wrangler.toml. There's
+// no runtime way to assert they line up (wrangler doesn't expose triggers to
+// the Worker), but constants in code give grep something to find when the
+// schedule changes.
+const EXPORT_CRON = "0 6 * * *";
+const POLL_CRON = "*/5 * * * *";
+
 const app = new Hono<{ Bindings: Env; Variables: { userId?: number; username?: string } }>();
 
 // CORS — strict allowlist sourced from the ALLOWED_ORIGINS env var (comma
@@ -76,12 +83,28 @@ app.use("*", (c, next) => {
   return cors({
     origin: (origin) => (origin && list.includes(origin) ? origin : null),
     credentials: true,
-    allowHeaders: ["Content-Type", "Authorization", "If-Match"],
+    allowHeaders: ["Content-Type", "Authorization", "If-Match", "X-CSRF-Token"],
     exposeHeaders: ["ETag"],
   })(c, next);
 });
 
 app.use("*", attachAuth);
+app.use("*", requireCsrf);
+
+// Defense-in-depth response headers. CSP locks the SPA to its own bundle
+// (no third-party scripts/styles aside from inline styles emotion/MUI need).
+// Referrer-Policy keeps querystrings out of cross-origin Referer headers.
+// X-Content-Type-Options stops the browser from sniffing a response into a
+// different MIME than what we send. Applied to every response.
+app.use("*", async (c, next) => {
+  await next();
+  c.res.headers.set(
+    "Content-Security-Policy",
+    "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self' wss: ws:",
+  );
+  c.res.headers.set("Referrer-Policy", "strict-origin-when-cross-origin");
+  c.res.headers.set("X-Content-Type-Options", "nosniff");
+});
 
 app.get("/api/health", (c) =>
   c.json({
@@ -97,7 +120,10 @@ app.get("/api/auth/dcs/start", startDcsAuth);
 app.get("/api/auth/dcs/callback", callbackDcsAuth);
 app.get("/api/auth/me", authMe);
 app.post("/api/auth/refresh", refreshToken);
-app.post("/api/auth/logout", requireAuth, authLogout);
+// Logout intentionally NOT gated by requireAuth — we want it to clear cookies
+// even if the Access cookie is missing/expired (the Refresh cookie is what
+// gets us to the session row for revocation).
+app.post("/api/auth/logout", authLogout);
 app.put("/api/users/me/location", requireAuth, updateLastLocation);
 
 // Dev-only: mint a JWT against a known/created users.id. Gated by
@@ -126,25 +152,33 @@ app.route("/api/tn-quick", tnQuick);
 app.route("/api/pipelines", pipelines);
 app.route("/api/pending-imports", pendingImports);
 
-// WebSocket upgrade into the ChapterRoom DO. Subprotocol-based bearer auth
-// is the only browser-compatible way to carry the JWT on a WS upgrade —
-// the standard Authorization header isn't settable on `new WebSocket(...)`.
-// Client opens `new WebSocket(url, [\`bearer.${jwt}\`])`; we verify the
-// token and forward the raw request to the DO (which echoes the protocol
-// back so the handshake completes).
+// WebSocket upgrade into the ChapterRoom DO. WS handshakes are normal HTTP
+// upgrades, so they carry the Access cookie (same-origin) and attachAuth has
+// already stamped userId on the context. Old bearer.<jwt> subprotocol path
+// remains read here only for the cutover window — drop once all clients are
+// on cookies. Forward the raw request to the DO; it echoes the subprotocol
+// back so the handshake completes.
 app.get("/api/ws/chapter/:book/:chapter", async (c) => {
   if (c.req.header("upgrade") !== "websocket") {
     return c.text("expected websocket", 426);
   }
-  const protoHeader = c.req.header("sec-websocket-protocol") ?? "";
-  const proto = protoHeader
-    .split(",")
-    .map((s) => s.trim())
-    .find((s) => s.startsWith("bearer."));
-  const token = proto ? proto.slice("bearer.".length) : "";
-  if (!token) return c.text("unauthorized", 401);
-  const claims = await verifyToken(token, c.env);
-  if (!claims) return c.text("unauthorized", 401);
+  // Cookie path: attachAuth has already stamped userId for browser clients.
+  // Subprotocol bearer.<jwt> fallback covers cutover-era clients that still
+  // hold a localStorage token; drop once we're confident nobody does.
+  let authed = currentUserId(c) !== null;
+  if (!authed) {
+    const protoHeader = c.req.header("sec-websocket-protocol") ?? "";
+    const proto = protoHeader
+      .split(",")
+      .map((s) => s.trim())
+      .find((s) => s.startsWith("bearer."));
+    const token = proto ? proto.slice("bearer.".length) : "";
+    if (token) {
+      const claims = await verifyToken(token, c.env);
+      if (claims) authed = true;
+    }
+  }
+  if (!authed) return c.text("unauthorized", 401);
 
   const book = c.req.param("book").toUpperCase();
   const chapter = parseInt(c.req.param("chapter"), 10);
@@ -175,11 +209,11 @@ export default {
     // every non-terminal pipeline_job so the auto-apply step lands even
     // when no translator has a tab open. Branching on controller.cron
     // keeps the work cheaply separated.
-    if (controller.cron === "0 6 * * *") {
+    if (controller.cron === EXPORT_CRON) {
       await env.EXPORT_WORKFLOW.create();
       return;
     }
-    if (controller.cron === "*/5 * * * *") {
+    if (controller.cron === POLL_CRON) {
       await pollAllNonTerminal(env);
       // Stale-lock sweep for book_import_locks. Imports take 5-60s in
       // practice; anything past 10 minutes is a Worker that died mid-import
@@ -188,6 +222,16 @@ export default {
       await env.DB.prepare(
         `DELETE FROM book_import_locks WHERE started_at < unixepoch() - 600`,
       ).run();
+      // Once-per-hour edit_log retention sweep. 180 days is defensive — we
+      // don't have a real policy yet, but the table grows without bound
+      // otherwise (every keystroke that lands a PATCH writes a row). Gated
+      // on minute-of-hour so it fires ~once/hour instead of every 5 min.
+      const minuteOfHour = Math.floor(Date.now() / 60_000) % 60;
+      if (minuteOfHour < 5) {
+        await env.DB.prepare(
+          `DELETE FROM edit_log WHERE created_at < unixepoch() - (180 * 86400)`,
+        ).run();
+      }
       return;
     }
   },

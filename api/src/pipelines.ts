@@ -292,6 +292,11 @@ async function pollPipelineJob(
 // from the UI; the failed row will be replaced on the next start.
 const STUCK_JOB_THRESHOLD_SECONDS = 86400 * 2;
 
+// Belt-and-suspenders for jobs that keep returning state="running" forever
+// (some upstream failure modes refresh updated_at on every poll). ~100 polls
+// at the */5 cron cadence ≈ 8 hours; well past any legitimate slow run.
+const MAX_POLL_ATTEMPTS = 100;
+
 // Polls every non-terminal pipeline_job. Designed for the scheduled
 // handler — runs in parallel with per-job error isolation so one stuck
 // upstream call doesn't drag the batch down.
@@ -308,6 +313,20 @@ export async function pollAllNonTerminal(env: Env): Promise<void> {
   )
     .bind(STUCK_JOB_THRESHOLD_SECONDS)
     .run();
+  // Auto-fail anything that has been polled more than MAX_POLL_ATTEMPTS times
+  // without reaching a terminal state. Independent backstop from the time-
+  // based one above — catches the "fresh updated_at but never done" case.
+  await env.DB.prepare(
+    `UPDATE pipeline_jobs
+        SET state = 'failed',
+            error_kind = 'interrupted',
+            error_message = 'auto-failed: poll attempts exhausted',
+            updated_at = unixepoch()
+      WHERE state IN ('running', 'paused_for_outage', 'paused_for_usage_limit')
+        AND attempt_count > ?1`,
+  )
+    .bind(MAX_POLL_ATTEMPTS)
+    .run();
   const rs = await env.DB.prepare(
     `SELECT job_id, user_id, pipeline_type, book, start_chapter, end_chapter,
             session_key, follow_up_options, follow_up_chain, follow_up_job_id,
@@ -319,6 +338,16 @@ export async function pollAllNonTerminal(env: Env): Promise<void> {
   ).all<PolledJob>();
   const jobs = rs.results ?? [];
   if (jobs.length === 0) return;
+  // Bump attempt_count for everything we're about to poll, in one batch. We
+  // do this BEFORE the upstream calls so a Worker crash doesn't undo the
+  // increment — the cap is the whole point of this column.
+  await env.DB.prepare(
+    `UPDATE pipeline_jobs
+        SET attempt_count = attempt_count + 1
+      WHERE job_id IN (${jobs.map((_, i) => `?${i + 1}`).join(",")})`,
+  )
+    .bind(...jobs.map((j) => j.job_id))
+    .run();
   await Promise.allSettled(
     jobs.map((j) =>
       pollPipelineJob(env, j).catch((err) => {
