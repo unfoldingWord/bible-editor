@@ -8,6 +8,9 @@ import usfm from "usfm-js";
 export interface VerseExtract {
   chapter: number;
   verse: number;
+  // Inclusive end of a multi-verse block (e.g. `\v 6-9` → verse=6, verseEnd=9).
+  // null for singleton verses and the chapter-front pseudo-verse.
+  verseEnd: number | null;
   contentJson: string;       // JSON-stringified verseObj suitable for verses.content_json
   plainText: string;
 }
@@ -110,10 +113,10 @@ export function extractUsfmHeaders(rawUsfm: string): unknown[] | null {
 }
 
 // Extract every verse in [startChapter, endChapter] from a whole-book USFM
-// blob. Verse keys can be numeric ("3"), hyphenated ranges ("12-13"
-// collapses to its first verse), or the "front" pseudo-verse (where
-// usfm-js puts a chapter-level `\d` Psalm title — stored as verse 0).
-// Book-level `intro` keys are still skipped.
+// blob. Verse keys can be numeric ("3"), hyphenated ranges ("12-13" — kept
+// as a single row with verse=12, verseEnd=13 so export round-trips `\v 12-13`),
+// or the "front" pseudo-verse (where usfm-js puts a chapter-level `\d` Psalm
+// title — stored as verse 0). Book-level `intro` keys are still skipped.
 export function extractVersesForRange(
   rawUsfm: string,
   startChapter: number,
@@ -129,15 +132,21 @@ export function extractVersesForRange(
     const chapterObj = chapters[chapterKey] as Record<string, unknown>;
     for (const verseKey of Object.keys(chapterObj)) {
       let vNum: number;
+      let vEnd: number | null = null;
       if (verseKey === "front") {
         // Chapter-front pseudo-verse — Psalm titles (\d), descriptive
         // titles, etc. Store as verse 0 so the chapter view's "intro"
         // row picks them up.
         vNum = 0;
-      } else if (/^\d+(-\d+)?$/.test(verseKey)) {
-        vNum = parseInt(verseKey.split("-")[0], 10);
       } else {
-        continue;
+        const m = verseKey.match(/^(\d+)(?:-(\d+))?$/);
+        if (!m) continue;
+        vNum = parseInt(m[1], 10);
+        if (m[2]) {
+          const end = parseInt(m[2], 10);
+          // Inverted ranges (e.g. "9-8") are nonsense — collapse to singleton.
+          vEnd = end > vNum ? end : null;
+        }
       }
       if (!Number.isFinite(vNum)) continue;
       const verseObj = chapterObj[verseKey] as { verseObjects?: unknown[] };
@@ -148,6 +157,7 @@ export function extractVersesForRange(
       out.push({
         chapter: chNum,
         verse: vNum,
+        verseEnd: vEnd,
         contentJson: JSON.stringify(normalized),
         plainText: extractPlainText(normalized),
       });

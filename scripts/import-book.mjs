@@ -102,8 +102,17 @@ function importVerses(bibleVersion, srcPath) {
     if (Number.isNaN(chNum)) continue;
     const chapterObj = json.chapters[chapter];
     for (const verse of Object.keys(chapterObj)) {
-      if (!/^\d+(-\d+)?$/.test(verse)) continue; // skip 'front', etc.
-      const vNum = parseInt(verse.split("-")[0], 10);
+      const m = verse.match(/^(\d+)(?:-(\d+))?$/);
+      if (!m) continue; // skip 'front', etc.
+      const vNum = parseInt(m[1], 10);
+      // Multi-verse blocks like `\v 6-9` round-trip through verse_end so
+      // export emits `\v 6-9` instead of dropping verses 7-9. Inverted
+      // ranges (e.g. "9-8") collapse to singleton.
+      let vEnd = null;
+      if (m[2]) {
+        const end = parseInt(m[2], 10);
+        if (end > vNum) vEnd = end;
+      }
       const verseObj = chapterObj[verse];
       const normalized = {
         ...verseObj,
@@ -112,7 +121,7 @@ function importVerses(bibleVersion, srcPath) {
       const text = extractPlainText(normalized);
       const json_blob = JSON.stringify(normalized);
       lines.push(
-        `INSERT INTO verses (book, chapter, verse, bible_version, content_json, plain_text) VALUES (${q(book)}, ${q(chNum)}, ${q(vNum)}, ${q(bibleVersion)}, ${q(json_blob)}, ${q(text)});`,
+        `INSERT INTO verses (book, chapter, verse, verse_end, bible_version, content_json, plain_text) VALUES (${q(book)}, ${q(chNum)}, ${q(vNum)}, ${q(vEnd)}, ${q(bibleVersion)}, ${q(json_blob)}, ${q(text)});`,
       );
       count++;
     }

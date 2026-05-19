@@ -49,6 +49,39 @@ function assert(cond, msg) {
   assert(noMatch.length === 0, `out-of-range chapter yields no verses`);
 }
 
+// --- USFM: multi-verse block (\v 8-9 in UST ISA 7) preserves the range ---
+{
+  const raw = readFileSync(resolve(samples, "en_ust_23-ISA.usfm"), "utf8");
+  const ch7 = extractVersesForRange(raw, 7, 7);
+  const block = ch7.find((v) => v.verse === 8);
+  assert(block, `UST ISA 7:8 verse row exists`);
+  assert(block.verseEnd === 9, `UST ISA 7:8 carries verseEnd=9 (got ${block.verseEnd})`);
+  const singleton = ch7.find((v) => v.verse === 1);
+  assert(singleton && singleton.verseEnd === null, `UST ISA 7:1 is singleton (verseEnd null)`);
+  // No row at verse=9 — the 8-9 block owns that slot.
+  const nine = ch7.find((v) => v.verse === 9);
+  assert(!nine, `UST ISA 7:9 has no standalone row (consumed by 8-9 block)`);
+  console.log(`  UST ISA 7:8-9 plain: ${block.plainText.slice(0, 80)}…`);
+}
+
+// --- USFM: inverted range collapses to singleton ---
+{
+  const synthetic = "\\id TST\n\\c 1\n\\v 1 first\n\\v 9-8 inverted\n\\v 10 tenth\n";
+  const out = extractVersesForRange(synthetic, 1, 1);
+  const inv = out.find((v) => v.verse === 9);
+  assert(inv, `inverted range row exists at start`);
+  assert(inv.verseEnd === null, `inverted range "9-8" collapses to singleton (verseEnd null)`);
+}
+
+// --- USFM: plain singleton has verseEnd=null ---
+{
+  const synthetic = "\\id TST\n\\c 1\n\\v 7 plain content\n";
+  const out = extractVersesForRange(synthetic, 1, 1);
+  const v7 = out.find((v) => v.verse === 7);
+  assert(v7, `singleton verse 7 row exists`);
+  assert(v7.verseEnd === null, `singleton has verseEnd null`);
+}
+
 // --- TSV: TN ZEC ---
 {
   const raw = readFileSync(resolve(samples, "en_tn_tn_ZEC.tsv"), "utf8");

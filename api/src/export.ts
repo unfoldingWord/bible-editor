@@ -98,7 +98,16 @@ export function buildUsfm(input: UsfmInputs): string {
     // titles). usfm-js's emitter expects the literal key "front" there;
     // a numeric "0" key wouldn't be recognised and the content would
     // emit incorrectly. See importParsers.ts:extractVersesForRange.
-    const verseKey = v.verse === 0 ? "front" : String(v.verse);
+    //
+    // Multi-verse blocks (`\v 6-9 <combined>`) are stored as one row with
+    // verse=6 and verse_end=9. Round-trip them by reconstructing the
+    // hyphenated key — usfm-js.toUSFM emits the `-9` portion verbatim.
+    const verseKey =
+      v.verse === 0
+        ? "front"
+        : v.verse_end != null && v.verse_end > v.verse
+          ? `${v.verse}-${v.verse_end}`
+          : String(v.verse);
     chapters[ch][verseKey] = parsed;
   }
 

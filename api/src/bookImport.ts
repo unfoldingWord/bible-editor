@@ -249,14 +249,14 @@ async function insertVerses(
   if (verses.length === 0) return 0;
 
   const stmt = env.DB.prepare(
-    `INSERT INTO verses (book, chapter, verse, bible_version, content_json, plain_text)
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6)`,
+    `INSERT INTO verses (book, chapter, verse, verse_end, bible_version, content_json, plain_text)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)`,
   );
   for (let i = 0; i < verses.length; i += CHUNK) {
     const slice = verses.slice(i, i + CHUNK);
     await env.DB.batch(
       slice.map((v) =>
-        stmt.bind(book, v.chapter, v.verse, bibleVersion, v.contentJson, v.plainText),
+        stmt.bind(book, v.chapter, v.verse, v.verseEnd, bibleVersion, v.contentJson, v.plainText),
       ),
     );
   }

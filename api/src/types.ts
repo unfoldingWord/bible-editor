@@ -78,6 +78,9 @@ export interface VerseRow {
   book: string;
   chapter: number;
   verse: number;
+  // Inclusive end of a multi-verse block (e.g. `\v 6-9` → verse=6, verse_end=9).
+  // NULL for singleton verses.
+  verse_end: number | null;
   bible_version: string;
   content_json: string;
   plain_text: string | null;

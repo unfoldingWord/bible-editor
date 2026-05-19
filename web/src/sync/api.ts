@@ -75,6 +75,9 @@ export interface VerseDto {
   book: string;
   chapter: number;
   verse: number;
+  // Inclusive end of a multi-verse block (e.g. `\v 6-9` → verse=6, verse_end=9).
+  // NULL for singleton verses. PR 2 widens UI rendering to span these.
+  verse_end: number | null;
   bible_version: string;
   plain_text: string | null;
   version: number;
