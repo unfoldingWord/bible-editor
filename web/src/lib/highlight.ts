@@ -22,7 +22,7 @@
 // RAW verseObjects text — the consumer (HebrewLine, renderHighlightedHTML)
 // reads from the same tree, so raw matches raw with no further work.
 
-import { nfc } from "./hebrew";
+import { nfc } from "./hebrew.ts";
 
 type WordToken = { text: string; occurrence: number };
 type Run = { source: string; occurrence: number; targets: WordToken[] };

@@ -17,6 +17,7 @@ import {
   verseHasUnalignedWork,
 } from "./alignment.ts";
 import { extractPlainText } from "./usfm.ts";
+import { findTargetHighlights, findSourceHighlights } from "./highlight.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(here, "../../..");
@@ -350,6 +351,177 @@ function roundtripVerseUsfm(rawUsfm, sourceVO = null) {
     assert(tags.includes("qs"), `\\qs wrapper survives edit to adjacent aligned word (tags=${tags.join(",")})`);
     assert(tags.filter((t) => t === "zaln").length >= 1, `at least one \\zaln milestone survives`);
   }
+}
+
+// ─── Case 10: Highlight precision — quote shouldn't bleed across milestones ──
+//
+// ZEC 1:1 UST has two separate zaln milestones whose direct \w children
+// each include a "the" token:
+//
+//   zaln(content="בֶּרֶכְיָה") { \w the (occ=1)  \w son  \w of  \w Berechiah }
+//   zaln(content="עִדּוֹ")    { \w and  \w the (occ=2)  \w grandson  ... }
+//
+// A TN whose quote is "בֶּרֶכְיָה" (occurrence 1) must highlight ONLY the
+// first "the" and friends — the second "the" belongs to a different
+// Hebrew word's alignment and should stay untouched. The user-reported
+// over-highlighting bug looks like this: a 2-Hebrew-word quote lights up
+// extra "the"s elsewhere in the verse. ZEC 1:1 is the closest analogue
+// in our fixtures.
+{
+  console.log("\n[Case 10] Highlight precision in ZEC 1:1");
+  const sample = resolve(repoRoot, "docs/samples/en_ust_38-ZEC.usfm");
+  const ust = readFileSync(sample, "utf-8");
+  const json = usfm.toJSON(ust);
+  const verseObjects = json.chapters["1"]["1"].verseObjects;
+
+  // Single-word quote: "בֶּ֣רֶכְיָ֔ה" — the milestone tagged that way owns
+  // \w the (occurrence 1). The other "the" belongs to עִדּוֹ.
+  const hl = findTargetHighlights(verseObjects, "בֶּ֣רֶכְיָ֔ה", 1);
+  assert(hl.has("the|1"), "ZEC 1:1: בֶּרֶכְיָה quote highlights the (occ=1)");
+  assert(hl.has("son|1"), "ZEC 1:1: בֶּרֶכְיָה quote highlights son");
+  assert(hl.has("Berechiah|1"), "ZEC 1:1: בֶּרֶכְיָה quote highlights Berechiah");
+  assert(
+    !hl.has("the|2"),
+    `ZEC 1:1: בֶּרֶכְיָה quote must NOT highlight the (occ=2). Got: ${[...hl].join(",")}`,
+  );
+  assert(
+    !hl.has("the|3"),
+    `ZEC 1:1: בֶּרֶכְיָה quote must NOT highlight the (occ=3). Got: ${[...hl].join(",")}`,
+  );
+  assert(
+    !hl.has("grandson|1"),
+    `ZEC 1:1: בֶּרֶכְיָה quote must NOT highlight grandson (Iddo's milestone)`,
+  );
+
+  // Multi-word quote: "בַּ⁠חֹ֨דֶשׁ֙ הַ⁠שְּׁמִינִ֔י" (In the eighth month) —
+  // a real TN quote from en_tn_tn_ZEC.tsv 1:1 bra8. Should only highlight
+  // words from those two milestones, not bleed into nearby ones.
+  const hl2 = findTargetHighlights(
+    verseObjects,
+    "בַּ⁠חֹ֨דֶשׁ֙ הַ⁠שְּׁמִינִ֔י",
+    1,
+  );
+  // Sanity: at least one ULT/UST gateway word must light up — empty would
+  // mean the matcher couldn't anchor at all.
+  assert(hl2.size > 0, `ZEC 1:1: multi-word quote produces non-empty highlights (got ${[...hl2].join(",")})`);
+  // Specific over-match guard: "Berechiah" lives in a totally different
+  // milestone and must not light up.
+  assert(
+    !hl2.has("Berechiah|1"),
+    `ZEC 1:1: month/year quote must NOT highlight Berechiah. Got: ${[...hl2].join(",")}`,
+  );
+  assert(
+    !hl2.has("Iddo|1"),
+    `ZEC 1:1: month/year quote must NOT highlight Iddo. Got: ${[...hl2].join(",")}`,
+  );
+}
+
+// ─── Case 11: NUM 20:1 — nested milestones + repeated Hebrew compound ─────
+//
+// The exact structure the user hit on production: the compound
+// "בַּ⁠חֹ֣דֶשׁ הָֽ⁠רִאשׁ֔וֹן" appears TWICE in the verse (x-occurrences=2),
+// with NESTED milestones (the outer בַּ⁠חֹ֣דֶשׁ wraps the inner הָֽ⁠רִאשׁ֔וֹן,
+// and only the inner one carries the \w children).
+//
+//   {first occurrence}                 {second occurrence}
+//   zaln(בַ⁠חֹדֶשׁ, occ=1) {            zaln(בַ⁠חֹדֶשׁ, occ=2) {
+//     zaln(הָ⁠רִאשׁוֹן, occ=1) {            zaln(הָ⁠רִאשׁוֹן, occ=2) {
+//       \w In  \w the  \w first  \w month     \w of  \w the  \w next  \w year
+//     }                                    }
+//   }                                    }
+//
+// With TN quote `בַ⁠חֹדֶשׁ הָ⁠רִאשׁוֹן` occurrence=1 the highlight set MUST
+// be exactly {In, the(occ=1), first, month} — never bleeding into the
+// second occurrence's "of, the(occ=2), next, year".
+{
+  console.log("\n[Case 11] NUM 20:1 nested-milestone disambiguation");
+  const verseObjects = [
+    {
+      tag: "zaln",
+      type: "milestone",
+      occurrence: 1,
+      occurrences: 2,
+      content: "בַּ⁠חֹ֣דֶשׁ",
+      children: [
+        {
+          tag: "zaln",
+          type: "milestone",
+          occurrence: 1,
+          occurrences: 2,
+          content: "הָֽ⁠רִאשׁ֔וֹן",
+          children: [
+            { type: "word", tag: "w", text: "In", occurrence: 1, occurrences: 1 },
+            { type: "word", tag: "w", text: "the", occurrence: 1, occurrences: 5 },
+            { type: "word", tag: "w", text: "first", occurrence: 1, occurrences: 1 },
+            { type: "word", tag: "w", text: "month", occurrence: 1, occurrences: 1 },
+          ],
+        },
+      ],
+    },
+    {
+      tag: "zaln",
+      type: "milestone",
+      occurrence: 2,
+      occurrences: 2,
+      content: "בַּ⁠חֹ֣דֶשׁ",
+      children: [
+        {
+          tag: "zaln",
+          type: "milestone",
+          occurrence: 2,
+          occurrences: 2,
+          content: "הָֽ⁠רִאשׁ֔וֹן",
+          children: [
+            { type: "word", tag: "w", text: "of", occurrence: 1, occurrences: 2 },
+            { type: "word", tag: "w", text: "the", occurrence: 2, occurrences: 5 },
+            { type: "word", tag: "w", text: "next", occurrence: 1, occurrences: 1 },
+            { type: "word", tag: "w", text: "year", occurrence: 1, occurrences: 1 },
+          ],
+        },
+      ],
+    },
+    // a downstream milestone whose direct children also include "the" — a red
+    // herring to make sure we never bleed past the matched range.
+    {
+      tag: "zaln",
+      type: "milestone",
+      occurrence: 1,
+      occurrences: 1,
+      content: "הָ֨⁠עֵדָ֤ה",
+      children: [
+        { type: "word", tag: "w", text: "the", occurrence: 4, occurrences: 5 },
+        { type: "word", tag: "w", text: "whole", occurrence: 1, occurrences: 1 },
+        { type: "word", tag: "w", text: "community", occurrence: 1, occurrences: 1 },
+      ],
+    },
+  ];
+
+  const hl = findTargetHighlights(verseObjects, "בַּ⁠חֹ֣דֶשׁ הָֽ⁠רִאשׁ֔וֹן", 1);
+  assert(hl.has("In|1"), "NUM 20:1 occ=1 highlights In");
+  assert(hl.has("the|1"), "NUM 20:1 occ=1 highlights the(1)");
+  assert(hl.has("first|1"), "NUM 20:1 occ=1 highlights first");
+  assert(hl.has("month|1"), "NUM 20:1 occ=1 highlights month");
+  assert(
+    !hl.has("the|2"),
+    `NUM 20:1 occ=1 must NOT highlight the(2) from occ=2 scope. Got: ${[...hl].join(",")}`,
+  );
+  assert(
+    !hl.has("the|4"),
+    `NUM 20:1 occ=1 must NOT highlight the(4) from הָ⁠עֵדָה's scope. Got: ${[...hl].join(",")}`,
+  );
+  assert(
+    !hl.has("of|1"),
+    `NUM 20:1 occ=1 must NOT highlight "of" from occ=2 scope. Got: ${[...hl].join(",")}`,
+  );
+
+  // Symmetric check: occurrence=2 lights up the second range exclusively.
+  const hl2 = findTargetHighlights(verseObjects, "בַּ⁠חֹ֣דֶשׁ הָֽ⁠רִאשׁ֔וֹן", 2);
+  assert(hl2.has("of|1"), "NUM 20:1 occ=2 highlights of");
+  assert(hl2.has("the|2"), "NUM 20:1 occ=2 highlights the(2)");
+  assert(
+    !hl2.has("the|1"),
+    `NUM 20:1 occ=2 must NOT highlight the(1) from occ=1 scope. Got: ${[...hl2].join(",")}`,
+  );
 }
 
 if (failed > 0) {
