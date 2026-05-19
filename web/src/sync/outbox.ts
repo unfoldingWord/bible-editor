@@ -13,6 +13,15 @@ const DB_NAME = "bible-editor-outbox";
 const DB_VERSION = 1;
 const STORE = "ops";
 
+// Hard cap on retry attempts. backoffMs() saturates around 30s, so 20
+// attempts is ~10 minutes of real-world wall-clock for a transient error.
+// Beyond that the op is almost certainly stuck on something structural
+// (revoked token, deleted row, malformed payload) — keep retrying and we
+// just churn the network and battery. The op transitions to `failed` with
+// `lastError = "max_attempts_exceeded"`; the user sees it in the failed-ops
+// drawer and can Retry (resets attempts) or Discard.
+const MAX_ATTEMPTS = 20;
+
 export interface RowTarget {
   kind: "row";
   rowKind: RowKind;
@@ -287,6 +296,22 @@ export const outbox = {
     void drain();
   },
 
+  // User-driven recovery for a `failed` op (typically one that hit
+  // max_attempts_exceeded against a transient back-end issue that has since
+  // cleared). Resets the attempt counter so it gets a full retry budget,
+  // not just one more shot before re-failing.
+  async retry(opId: string) {
+    const idb = await db();
+    const op = (await idb.get(STORE, opId)) as OutboxOp | undefined;
+    if (!op) return;
+    op.status = "pending";
+    op.attempts = 0;
+    op.lastError = undefined;
+    await idb.put(STORE, op);
+    void notify();
+    void drain();
+  },
+
   async list(): Promise<OutboxOp[]> {
     return listAll();
   },
@@ -455,11 +480,20 @@ export async function drain() {
           await (await db()).put(STORE, next);
           blocked.add(targetKey(next.target));
         } else if (result.kind === "retry") {
-          next.status = "pending";
-          next.lastError = result.reason;
-          await (await db()).put(STORE, next);
-          scheduleDrain(backoffMs(next.attempts));
-          blocked.add(targetKey(next.target));
+          if (next.attempts >= MAX_ATTEMPTS) {
+            // Out of retries — promote to `failed` so the UI can surface
+            // it. `attempts` carries the count so the drawer can show how
+            // long we tried before giving up.
+            next.status = "failed";
+            next.lastError = "max_attempts_exceeded";
+            await (await db()).put(STORE, next);
+          } else {
+            next.status = "pending";
+            next.lastError = result.reason;
+            await (await db()).put(STORE, next);
+            scheduleDrain(backoffMs(next.attempts));
+            blocked.add(targetKey(next.target));
+          }
         } else {
           next.status = "failed";
           next.lastError = result.reason;

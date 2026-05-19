@@ -331,9 +331,13 @@ export async function callbackDcsAuth(c: AppContext): Promise<Response> {
 
   const token = await mintToken(c, userRow.id, dcsUser.login, role);
 
-  // Redirect the SPA back to the root with the token in the query string.
-  // App.tsx reads _auth on load, persists it to localStorage, and cleans the URL.
-  return c.redirect(`${origin}/?_auth=${encodeURIComponent(token)}`, 302);
+  // Redirect the SPA back to the root with the token in the URL fragment.
+  // Fragments are never sent in the HTTP request — they don't end up in
+  // server access logs, the Referer header, or browser history records that
+  // sync to the cloud. Query-string delivery (the previous shape) leaked the
+  // bearer in all three of those places. App.tsx reads `#_auth=` on load,
+  // persists it to localStorage, and strips the hash.
+  return c.redirect(`${origin}/#_auth=${encodeURIComponent(token)}`, 302);
 }
 
 // GET /api/auth/me — returns identity from the bearer token plus the user's

@@ -6,12 +6,14 @@
 // A proper diff/merge UI is docs/plan.md territory and out of scope here.
 
 import { useEffect, useState, type ReactNode } from "react";
-import { Box, Button, Chip, Stack, Tooltip } from "@mui/material";
+import { Box, Button, Chip, Divider, IconButton, Stack, Tooltip, Typography } from "@mui/material";
 import CloudDoneIcon from "@mui/icons-material/CloudDone";
 import CloudQueueIcon from "@mui/icons-material/CloudQueue";
 import ErrorOutlineIcon from "@mui/icons-material/ErrorOutline";
+import RefreshIcon from "@mui/icons-material/Refresh";
+import DeleteOutlineIcon from "@mui/icons-material/DeleteOutline";
 import WarningAmberIcon from "@mui/icons-material/WarningAmber";
-import { onOutboxResult, outbox, type OutboxOp } from "../sync/outbox";
+import { onOutboxResult, outbox, type OutboxOp, type OpTarget } from "../sync/outbox";
 
 // If we believe we're online but haven't seen a successful save in this
 // long while pending ops exist, treat it as effectively offline —
@@ -26,6 +28,15 @@ interface FreshRow {
 
 function isFreshRow(x: unknown): x is FreshRow {
   return typeof x === "object" && x !== null && typeof (x as { version?: unknown }).version === "number";
+}
+
+// Short label for the failed-ops drawer. Doesn't need to be unique — the
+// op.id key handles React reconciliation — just needs to be readable enough
+// that the translator can recognize which row didn't save.
+function formatTarget(t: OpTarget): string {
+  if (t.kind === "row") return `${t.rowKind.toUpperCase()} ${t.book} · ${t.id}`;
+  if (t.kind === "verse_status") return `status ${t.book} ${t.chapter}:${t.verse}`;
+  return `${t.bibleVersion} ${t.book} ${t.chapter}:${t.verse}`;
 }
 
 export function SyncStatusBar() {
@@ -185,10 +196,11 @@ export function SyncStatusBar() {
             boxShadow: 2,
             px: 1.25,
             py: 0.75,
+            maxWidth: 360,
             zIndex: (t) => t.zIndex.snackbar,
           }}
         >
-          <Stack direction="row" spacing={1} alignItems="center">
+          <Stack spacing={0.75}>
             {conflicts.length > 0 && (
               <Tooltip title="version mismatch — retry with current server version (your edit wins)">
                 <Button
@@ -202,20 +214,92 @@ export function SyncStatusBar() {
                 </Button>
               </Tooltip>
             )}
+            {failed.length > 0 && conflicts.length > 0 && <Divider flexItem />}
             {failed.length > 0 && (
-              <Tooltip title="these edits will not be retried — click to discard">
-                <Button
-                  size="small"
-                  variant="outlined"
-                  color="error"
-                  startIcon={<ErrorOutlineIcon />}
-                  onClick={async () => {
-                    for (const op of failed) await outbox.drop(op.id);
-                  }}
-                >
-                  {failed.length} failed
-                </Button>
-              </Tooltip>
+              <Stack spacing={0.25}>
+                <Stack direction="row" alignItems="center" justifyContent="space-between">
+                  <Typography variant="caption" color="error" sx={{ fontWeight: 600 }}>
+                    {failed.length} failed
+                  </Typography>
+                  <Tooltip title="discard all failed edits">
+                    <Button
+                      size="small"
+                      variant="text"
+                      color="error"
+                      onClick={async () => {
+                        for (const op of failed) await outbox.drop(op.id);
+                      }}
+                      sx={{ minWidth: 0, py: 0, fontSize: 11 }}
+                    >
+                      discard all
+                    </Button>
+                  </Tooltip>
+                </Stack>
+                {failed.map((op) => (
+                  <Stack
+                    key={op.id}
+                    direction="row"
+                    alignItems="center"
+                    spacing={0.5}
+                    sx={{
+                      bgcolor: "action.hover",
+                      borderRadius: 0.5,
+                      px: 0.75,
+                      py: 0.25,
+                    }}
+                  >
+                    <Box sx={{ flex: 1, minWidth: 0 }}>
+                      <Typography
+                        variant="caption"
+                        sx={{
+                          display: "block",
+                          whiteSpace: "nowrap",
+                          overflow: "hidden",
+                          textOverflow: "ellipsis",
+                          fontFamily: "monospace",
+                        }}
+                      >
+                        {formatTarget(op.target)}
+                      </Typography>
+                      {op.lastError && (
+                        <Typography
+                          variant="caption"
+                          color="text.secondary"
+                          sx={{
+                            display: "block",
+                            fontSize: 10,
+                            whiteSpace: "nowrap",
+                            overflow: "hidden",
+                            textOverflow: "ellipsis",
+                          }}
+                        >
+                          {op.lastError}
+                        </Typography>
+                      )}
+                    </Box>
+                    <Tooltip title="retry this edit">
+                      <IconButton
+                        size="small"
+                        color="primary"
+                        onClick={() => void outbox.retry(op.id)}
+                        sx={{ p: 0.25 }}
+                      >
+                        <RefreshIcon fontSize="inherit" />
+                      </IconButton>
+                    </Tooltip>
+                    <Tooltip title="discard this edit">
+                      <IconButton
+                        size="small"
+                        color="error"
+                        onClick={() => void outbox.drop(op.id)}
+                        sx={{ p: 0.25 }}
+                      >
+                        <DeleteOutlineIcon fontSize="inherit" />
+                      </IconButton>
+                    </Tooltip>
+                  </Stack>
+                ))}
+              </Stack>
             )}
           </Stack>
         </Box>

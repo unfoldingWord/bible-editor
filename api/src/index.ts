@@ -181,6 +181,13 @@ export default {
     }
     if (controller.cron === "*/5 * * * *") {
       await pollAllNonTerminal(env);
+      // Stale-lock sweep for book_import_locks. Imports take 5-60s in
+      // practice; anything past 10 minutes is a Worker that died mid-import
+      // (OOM, isolate eviction) and left the row behind. The next POST for
+      // that book would otherwise see the dangling lock and 409 forever.
+      await env.DB.prepare(
+        `DELETE FROM book_import_locks WHERE started_at < unixepoch() - 600`,
+      ).run();
       return;
     }
   },
