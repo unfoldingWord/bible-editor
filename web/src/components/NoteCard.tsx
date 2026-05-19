@@ -93,15 +93,14 @@ interface Props {
   // alignment. Returns the derived Hebrew/Greek string, or null if no
   // alignment match was found.
   onTranslateQuote?: (english: string) => string | null;
-  // Quote-builder workflow: when quoteBuildMode is true on THIS card, the
-  // active card shows "Use selection" / "Cancel" buttons next to the quote
-  // field, and the UHB row above goes into click-to-toggle mode. Shell owns
-  // the selection state — these handlers just drive the lifecycle.
+  // Quote-builder workflow: the "build from source" button opens a picker
+  // popup mounted at Shell level. While the picker is open for this note,
+  // quoteBuildMode is true and the button label reflects the selection
+  // count. Shell owns the selection state + cancel/commit handlers — the
+  // card just opens the picker.
   quoteBuildMode?: boolean;
   quoteBuildSelectionCount?: number;
   onStartQuoteBuild?: () => void;
-  onCancelQuoteBuild?: () => void;
-  onCommitQuoteBuild?: () => void;
 }
 
 // Notes coming from TSV imports use literal "\n" (two characters) as the
@@ -170,8 +169,6 @@ export function NoteCard({
   quoteBuildMode = false,
   quoteBuildSelectionCount = 0,
   onStartQuoteBuild,
-  onCancelQuoteBuild,
-  onCommitQuoteBuild,
 }: Props) {
   // Two explicit bits drive lock-time behavior now:
   //   - preserve=1: translator marked this row "survive AI runs"
@@ -667,44 +664,26 @@ export function NoteCard({
             Quote
           </Typography>
           <Box sx={{ flex: 1 }} />
-          {active && !readOnly && !quoteBuildMode && onStartQuoteBuild && (
-            <Tooltip title="pick Hebrew/Greek words by clicking them in the source row above">
+          {active && !readOnly && onStartQuoteBuild && (
+            <Tooltip title="open the picker to pick Hebrew/Greek words — or click ULT/UST words and the picker resolves their alignment">
               <Button
                 size="small"
-                variant="text"
+                variant={quoteBuildMode ? "outlined" : "text"}
+                color={quoteBuildMode ? "primary" : "inherit"}
                 onClick={onStartQuoteBuild}
-                sx={{ fontSize: 11, minWidth: 0, py: 0.25, px: 0.75, color: "text.secondary" }}
+                sx={{
+                  fontSize: 11,
+                  minWidth: 0,
+                  py: 0.25,
+                  px: 0.75,
+                  color: quoteBuildMode ? "primary.main" : "text.secondary",
+                }}
               >
-                build from source
+                {quoteBuildMode
+                  ? `picker open · ${quoteBuildSelectionCount} selected`
+                  : "build from source"}
               </Button>
             </Tooltip>
-          )}
-          {quoteBuildMode && (
-            <Stack direction="row" alignItems="center" spacing={0.5}>
-              <Typography
-                variant="caption"
-                sx={{ fontFamily: "monospace", color: "primary.main", fontSize: 11 }}
-              >
-                {quoteBuildSelectionCount} selected
-              </Typography>
-              <Button
-                size="small"
-                variant="text"
-                disabled={quoteBuildSelectionCount === 0}
-                onClick={onCommitQuoteBuild}
-                sx={{ fontSize: 11, minWidth: 0, py: 0.25, px: 0.75, fontWeight: 600 }}
-              >
-                use selection
-              </Button>
-              <Button
-                size="small"
-                variant="text"
-                onClick={onCancelQuoteBuild}
-                sx={{ fontSize: 11, minWidth: 0, py: 0.25, px: 0.75, color: "text.secondary" }}
-              >
-                cancel
-              </Button>
-            </Stack>
           )}
         </Stack>
         <TextField

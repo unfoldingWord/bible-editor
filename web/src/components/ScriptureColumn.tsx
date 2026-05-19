@@ -10,7 +10,6 @@ import SaveIcon from "@mui/icons-material/Save";
 import SaveOutlinedIcon from "@mui/icons-material/SaveOutlined";
 import type { ChapterPayload, VerseDto } from "../sync/api";
 import { drafts, verseKey } from "../sync/drafts";
-import type { HighlightKey as HK } from "../lib/highlight";
 import { DocColumn } from "./DocColumn";
 import type { FindMatch } from "./FindReplaceOverlay";
 import { HebrewLine } from "./HebrewLine";
@@ -87,11 +86,6 @@ interface Props {
   // runs it through smartEditVerse, and enqueues. Shell wires this; both
   // stacked rows and the column-style modes call it on Save click.
   onSaveVerse: (verseNum: number, bibleVersion: string, plain: string, base: VerseDto) => void;
-  // Quote-builder: when truthy, the active card's UHB row treats clicks
-  // as add/remove toggles into selectedKeys. Shell wires both.
-  quoteBuildMode?: boolean;
-  quoteBuildSelectedKeys?: Set<HK> | null;
-  onQuoteBuildWordToggle?: (key: HK, text: string, occurrence: number) => void;
   // Chapter is mid-flight for an AI pipeline. Renders all editable bibles
   // (ULT/UST) as read-only too — UHB/UGNT already are by virtue of
   // READ_ONLY_VERSIONS. The banner above the column tells the user why.
@@ -142,9 +136,6 @@ export function ScriptureColumn({
   onEnabledVersionsChange,
   onEditVerse,
   onSaveVerse,
-  quoteBuildMode,
-  quoteBuildSelectedKeys,
-  onQuoteBuildWordToggle,
   locked = false,
 }: Props) {
   const activeRef = useRef<HTMLDivElement | null>(null);
@@ -425,9 +416,6 @@ export function ScriptureColumn({
             onOpenAligner={onOpenAligner}
             onEditVerse={onEditVerse}
             onSaveVerse={onSaveVerse}
-            quoteBuildMode={quoteBuildMode}
-            quoteBuildSelectedKeys={quoteBuildSelectedKeys}
-            onQuoteBuildWordToggle={onQuoteBuildWordToggle}
             locked={locked}
           />
         ) : mode === "book" && bookChapterList && bookChapters && onLoadBookChapter && onSelectBookVerse && onEditBookVerse && onSaveBookVerse && onOpenBookAligner ? (
@@ -510,9 +498,6 @@ function StackedBody({
   onOpenAligner,
   onEditVerse,
   onSaveVerse,
-  quoteBuildMode,
-  quoteBuildSelectedKeys,
-  onQuoteBuildWordToggle,
   locked,
 }: {
   book: string;
@@ -531,9 +516,6 @@ function StackedBody({
   onOpenAligner: (verse: number, bibleVersion: string) => void;
   onEditVerse: (verseNum: number, bibleVersion: string, plain: string, base: VerseDto) => void;
   onSaveVerse: (verseNum: number, bibleVersion: string, plain: string, base: VerseDto) => void;
-  quoteBuildMode?: boolean;
-  quoteBuildSelectedKeys?: Set<HK> | null;
-  onQuoteBuildWordToggle?: (key: HK, text: string, occurrence: number) => void;
   locked: boolean;
 }) {
   const ult = indexByVersion["ULT"] ?? {};
@@ -639,9 +621,6 @@ function StackedBody({
                   rtl={isHebrew}
                   readOnly
                   lexiconMap={lexiconMap}
-                  quoteBuildMode={quoteBuildMode}
-                  quoteBuildSelectedKeys={quoteBuildSelectedKeys}
-                  onQuoteBuildWordToggle={onQuoteBuildWordToggle}
                 />
               )}
             </Paper>
@@ -792,9 +771,6 @@ function ActiveLine({
   onEditPlain,
   onSave,
   lexiconMap,
-  quoteBuildMode,
-  quoteBuildSelectedKeys,
-  onQuoteBuildWordToggle,
 }: {
   // book + bibleVersion identify the verse for draft keying.
   // bibleVersion is the bare code ("ULT") not the rendered label ("ULT 6-9").
@@ -819,9 +795,6 @@ function ActiveLine({
   // and enqueues. Only rendered when editable && draft exists.
   onSave?: (plain: string) => void;
   lexiconMap?: Map<string, LexiconEntry | null>;
-  quoteBuildMode?: boolean;
-  quoteBuildSelectedKeys?: Set<HK> | null;
-  onQuoteBuildWordToggle?: (key: HK, text: string, occurrence: number) => void;
 }) {
   const isSource = label === "UHB" || label === "UGNT";
   const draftKey = useMemo(
@@ -1017,9 +990,6 @@ function ActiveLine({
             findHighlights={findHighlights}
             activeFindKey={activeFindKey}
             fallbackText={text}
-            quoteBuildMode={quoteBuildMode}
-            selectedKeys={quoteBuildSelectedKeys}
-            onWordToggle={onQuoteBuildWordToggle}
           />
         </Box>
       ) : (

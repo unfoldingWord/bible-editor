@@ -42,6 +42,7 @@ import { pipelineStore, type PipelineJob } from "../sync/pipelineStore";
 import { onOutboxResult } from "../sync/outbox";
 import { AiCompletionToasts } from "./AiCompletionToasts";
 import { UnsavedToasts } from "./UnsavedToasts";
+import { QuoteBuilderPopper } from "./QuoteBuilderPopper";
 import { collectStrongs } from "./HebrewLine";
 
 interface AlignerTarget {
@@ -444,6 +445,41 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     setQuoteBuildNoteId(null);
     setQuoteBuildSelectedKeys(new Set());
   }, []);
+
+  // Anchor element for the picker popup. Resolves via the data-note-id
+  // attribute set on each NoteCard's Paper — the picker mounts at Shell
+  // level so it isn't clipped by the resource column overflow.
+  const [quoteBuildAnchor, setQuoteBuildAnchor] = useState<HTMLElement | null>(null);
+  useEffect(() => {
+    if (!quoteBuildNoteId) {
+      setQuoteBuildAnchor(null);
+      return;
+    }
+    setQuoteBuildAnchor(
+      document.querySelector<HTMLElement>(`[data-note-id="${quoteBuildNoteId}"]`),
+    );
+  }, [quoteBuildNoteId]);
+
+  // Verse objects bundled for the picker — UHB always; ULT/UST may be
+  // absent for OT-only or NT-only deployments, so default to null and
+  // let the picker show an empty-state hint.
+  const quoteBuildContext = useMemo(() => {
+    if (!quoteBuildNoteId || !data) return null;
+    const row = data.tn.find((r) => r.id === quoteBuildNoteId);
+    if (!row) return null;
+    const grab = (bv: string): unknown[] | null => {
+      const dto = data.verses[bv]?.[row.verse];
+      const vo = (dto?.content as { verseObjects?: unknown[] } | null)?.verseObjects;
+      return Array.isArray(vo) ? vo : null;
+    };
+    return {
+      noteId: quoteBuildNoteId,
+      verse: row.verse,
+      uhb: grab("UHB") ?? grab("UGNT"),
+      ult: grab("ULT"),
+      ust: grab("UST"),
+    };
+  }, [quoteBuildNoteId, data]);
 
   // Materialize the in-flight quote-build selection into a row patch and
   // fire the existing note save pipe. Pulls UHB verseObjects for the
@@ -878,9 +914,6 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           onSaveVerse={(verseNum, bibleVersion, plain, base) => {
             saveVerseDraft(chapter, verseNum, bibleVersion, plain, base);
           }}
-          quoteBuildMode={!!quoteBuildNoteId && quoteBuildNoteId === activeNoteId}
-          quoteBuildSelectedKeys={quoteBuildSelectedKeys}
-          onQuoteBuildWordToggle={(key) => toggleQuoteBuildWord(key)}
           onOpenAligner={(v, bv) => openAligner(chapter, v, bv)}
           scrollNonce={scrollNonce}
           onRequestScrollToActive={requestScrollToActive}
@@ -1104,8 +1137,6 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           quoteBuildActiveNoteId={quoteBuildNoteId}
           quoteBuildSelectionCount={quoteBuildSelectedKeys.size}
           onStartQuoteBuild={startQuoteBuild}
-          onCancelQuoteBuild={cancelQuoteBuild}
-          onCommitQuoteBuild={commitQuoteBuild}
           panelMode={panelMode}
           onSetPanelMode={handleSetPanelMode}
           alignmentProps={alignmentTabProps}
@@ -1176,6 +1207,22 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         toast={pipelineToast}
         onToastClear={() => setPipelineToast(null)}
       />
+      {quoteBuildContext && (
+        <QuoteBuilderPopper
+          open={!!quoteBuildAnchor}
+          anchorEl={quoteBuildAnchor}
+          book={book}
+          chapter={chapter}
+          verse={quoteBuildContext.verse}
+          uhbVerseObjects={quoteBuildContext.uhb}
+          ultVerseObjects={quoteBuildContext.ult}
+          ustVerseObjects={quoteBuildContext.ust}
+          selectedKeys={quoteBuildSelectedKeys}
+          onToggleKey={toggleQuoteBuildWord}
+          onCancel={cancelQuoteBuild}
+          onCommit={commitQuoteBuild}
+        />
+      )}
     </Box>
   );
 }

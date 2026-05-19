@@ -86,6 +86,64 @@ export function buildQuoteFromSelection(
   return { quote, occurrence };
 }
 
+// One source ancestor: the content + occurrence from a \zaln-s milestone.
+// The picker turns a click on a target word into a set of these so the
+// existing UHB-keyed selection (used by buildQuoteFromSelection) can be
+// fed without translating between formats.
+export interface SourceAncestor {
+  content: string;
+  occurrence: number;
+}
+
+// Per-token shape returned by collectTargetTokens. Outer-to-inner ancestor
+// chain — same direction findSourceForTargetText emits, so the picker can
+// preserve the convention.
+export interface TargetToken {
+  text: string;
+  occurrence: number;
+  position: number;
+  sources: SourceAncestor[];
+}
+
+// Walk a ULT/UST verseObjects tree. For each \w token, capture its
+// enclosing \zaln-s ancestor chain (outer first) as SourceAncestor[].
+// Mirrors findSourceForTargetText's stack-based walk but emits per-token
+// records instead of merging into one string. Used by the picker so a
+// click on "first" inside zaln(בַחֹדֶשׁ) > zaln(הָרִאשׁוֹן) > w(first)
+// can toggle both Hebrew words at their correct occurrence indices.
+export function collectTargetTokens(
+  verseObjects: unknown[] | undefined | null,
+): TargetToken[] {
+  if (!Array.isArray(verseObjects)) return [];
+  const out: TargetToken[] = [];
+  function walk(nodes: unknown[], stack: SourceAncestor[]) {
+    for (const node of nodes ?? []) {
+      const o = node as Record<string, unknown> | null;
+      if (!o) continue;
+      if (o["type"] === "milestone" && o["tag"] === "zaln") {
+        const content = String(o["content"] ?? "");
+        const occurrence = parseInt(String(o["occurrence"] ?? "1"), 10) || 1;
+        const children = (o["children"] as unknown[] | undefined) ?? [];
+        // Skip ancestors with no content — defensive: a malformed milestone
+        // without x-content would otherwise insert empty selection keys.
+        const nextStack = content ? [...stack, { content, occurrence }] : stack;
+        walk(children, nextStack);
+      } else if (o["type"] === "word" && o["tag"] === "w") {
+        const text = String(o["text"] ?? "");
+        const occurrence = parseInt(String(o["occurrence"] ?? "1"), 10) || 1;
+        out.push({
+          text,
+          occurrence,
+          position: out.length,
+          sources: stack.slice(),
+        });
+      }
+    }
+  }
+  walk(verseObjects, []);
+  return out;
+}
+
 function matchGroupsAt(
   start: number,
   groups: UhbWord[][],

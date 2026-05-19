@@ -25,17 +25,9 @@ interface Props {
   // Used when the parent supplies a flat fallback string (e.g. when the
   // verseObjects tree is missing or invalid).
   fallbackText?: string;
-  // When set, words become clickable for the "build quote from Hebrew"
-  // workflow: clicking a word toggles it in/out of the active note's
-  // quote selection. selectedKeys uses the same `${text}|${occ}` shape
-  // as `highlights` so HebrewLine can show selected words with a chip
-  // outline regardless of which highlight source produced them.
-  quoteBuildMode?: boolean;
-  selectedKeys?: Set<HighlightKey> | null;
-  onWordToggle?: (key: HighlightKey, text: string, occurrence: number) => void;
 }
 
-export function HebrewLine({ verseObjects, lexiconMap, highlights, findHighlights, activeFindKey, fallbackText, quoteBuildMode, selectedKeys, onWordToggle }: Props) {
+export function HebrewLine({ verseObjects, lexiconMap, highlights, findHighlights, activeFindKey, fallbackText }: Props) {
   if (!Array.isArray(verseObjects)) {
     return <>{fallbackText ?? ""}</>;
   }
@@ -65,22 +57,13 @@ export function HebrewLine({ verseObjects, lexiconMap, highlights, findHighlight
           occurrences: String(o["occurrences"] ?? "1"),
           content: text,
         };
-        const isSelected = !!selectedKeys && selectedKeys.has(key);
         const wordSpan = (
           <Box
             component="span"
-            onClick={
-              quoteBuildMode && onWordToggle
-                ? (e) => {
-                    e.stopPropagation();
-                    onWordToggle(key, text, occ);
-                  }
-                : undefined
-            }
             sx={(theme) => {
               const hl = wordHighlightStyles(theme.palette.mode);
               return {
-                cursor: quoteBuildMode ? "pointer" : "help",
+                cursor: "help",
                 ...(isActiveFind
                   ? hl.findActive
                   : isFindHit
@@ -88,17 +71,6 @@ export function HebrewLine({ verseObjects, lexiconMap, highlights, findHighlight
                     : isHighlighted
                       ? hl.hl
                       : {}),
-                // Build-mode chip outline. Sits on top of any highlight
-                // background so selected words always read as "picked".
-                ...(quoteBuildMode
-                  ? {
-                      borderRadius: 0.5,
-                      outline: isSelected
-                        ? `2px solid ${theme.palette.primary.main}`
-                        : `1px dashed ${theme.palette.divider}`,
-                      outlineOffset: 1,
-                    }
-                  : {}),
               };
             }}
           >

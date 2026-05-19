@@ -18,7 +18,7 @@ import {
 } from "./alignment.ts";
 import { extractPlainText } from "./usfm.ts";
 import { findTargetHighlights, findSourceHighlights } from "./highlight.ts";
-import { buildQuoteFromSelection } from "./quoteBuilder.ts";
+import { buildQuoteFromSelection, collectTargetTokens } from "./quoteBuilder.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(here, "../../..");
@@ -572,6 +572,142 @@ function roundtripVerseUsfm(rawUsfm, sourceVO = null) {
   // Empty selection → null.
   const b4 = buildQuoteFromSelection(verseObjects, new Set());
   assert(b4 === null, "empty selection returns null");
+}
+
+// ─── Case 13: collectTargetTokens — ancestor chain per \w ────────────────
+//
+// The picker resolves an English click to its \zaln-s ancestor chain so
+// non-Hebrew speakers can build a quote without typing Hebrew. Outer-to-
+// inner order, with each ancestor's exact occurrence index from its
+// milestone — that's what the picker needs to turn into ${content}|${occ}
+// keys for the existing UHB-keyed selection set.
+{
+  console.log("\n[Case 13] collectTargetTokens ancestor resolution");
+  const ust = [
+    {
+      tag: "zaln",
+      type: "milestone",
+      occurrence: 1,
+      occurrences: 2,
+      content: "בַּ⁠חֹ֣דֶשׁ",
+      children: [
+        {
+          tag: "zaln",
+          type: "milestone",
+          occurrence: 1,
+          occurrences: 2,
+          content: "הָֽ⁠רִאשׁ֔וֹן",
+          children: [
+            { type: "word", tag: "w", text: "In", occurrence: 1, occurrences: 1 },
+            { type: "word", tag: "w", text: "the", occurrence: 1, occurrences: 3 },
+            { type: "word", tag: "w", text: "first", occurrence: 1, occurrences: 1 },
+          ],
+        },
+      ],
+    },
+    // Sibling that doesn't share the ancestor chain — the "the" inside
+    // here is a different instance, used to confirm the walker keeps
+    // ancestor stacks disjoint between siblings.
+    {
+      tag: "zaln",
+      type: "milestone",
+      occurrence: 1,
+      occurrences: 1,
+      content: "הָ֨⁠עֵדָ֤ה",
+      children: [
+        { type: "word", tag: "w", text: "the", occurrence: 2, occurrences: 3 },
+        { type: "word", tag: "w", text: "whole", occurrence: 1, occurrences: 1 },
+      ],
+    },
+  ];
+
+  const tokens = collectTargetTokens(ust);
+  assert(tokens.length === 5, `5 \\w tokens emitted (got ${tokens.length})`);
+
+  const first = tokens.find((t) => t.text === "first");
+  assert(first !== undefined, "first \\w token resolved");
+  assert(
+    first?.sources.length === 2,
+    `first has two ancestors (got ${first?.sources.length})`,
+  );
+  assert(
+    first?.sources[0].content === "בַּ⁠חֹ֣דֶשׁ" && first?.sources[0].occurrence === 1,
+    `outer ancestor is בַּחֹדֶשׁ occ=1 (got ${JSON.stringify(first?.sources[0])})`,
+  );
+  assert(
+    first?.sources[1].content === "הָֽ⁠רִאשׁ֔וֹן" && first?.sources[1].occurrence === 1,
+    `inner ancestor is הָרִאשׁוֹן occ=1 (got ${JSON.stringify(first?.sources[1])})`,
+  );
+
+  // The "the" inside בַחֹדֶשׁ has ancestors [בַחֹדֶשׁ, הָרִאשׁוֹן].
+  // The "the" inside הָעֵדָה has ancestor [הָעֵדָה] only — different chain.
+  const the1 = tokens.find((t) => t.text === "the" && t.occurrence === 1);
+  const the2 = tokens.find((t) => t.text === "the" && t.occurrence === 2);
+  assert(
+    the1?.sources.length === 2,
+    `the(1) has two ancestors (the בַחֹדֶשׁ chain)`,
+  );
+  assert(
+    the2?.sources.length === 1 && the2?.sources[0].content === "הָ֨⁠עֵדָ֤ה",
+    `the(2) has one ancestor (הָעֵדָה only). Got: ${JSON.stringify(the2?.sources)}`,
+  );
+}
+
+// ─── Case 14: end-to-end picker round-trip (no UI) ────────────────────────
+//
+// Simulate the picker's click handler: user clicks "first" in UST, which
+// adds its ancestor chain to the selection set; then buildQuoteFromSelection
+// against the UHB verseObjects produces the right quote+occurrence.
+{
+  console.log("\n[Case 14] Picker click → quote round-trip");
+
+  // UHB version of the same fragment — used for quote rendering.
+  const uhb = [
+    { type: "word", tag: "w", text: "בַּ⁠חֹ֣דֶשׁ", occurrence: 1, occurrences: 1 },
+    { type: "word", tag: "w", text: "הָֽ⁠רִאשׁ֔וֹן", occurrence: 1, occurrences: 1 },
+  ];
+  // UST with nested zaln (same as Case 13 first milestone).
+  const ust = [
+    {
+      tag: "zaln",
+      type: "milestone",
+      occurrence: 1,
+      occurrences: 1,
+      content: "בַּ⁠חֹ֣דֶשׁ",
+      children: [
+        {
+          tag: "zaln",
+          type: "milestone",
+          occurrence: 1,
+          occurrences: 1,
+          content: "הָֽ⁠רִאשׁ֔וֹן",
+          children: [
+            { type: "word", tag: "w", text: "In", occurrence: 1, occurrences: 1 },
+            { type: "word", tag: "w", text: "the", occurrence: 1, occurrences: 1 },
+            { type: "word", tag: "w", text: "first", occurrence: 1, occurrences: 1 },
+          ],
+        },
+      ],
+    },
+  ];
+
+  const tokens = collectTargetTokens(ust);
+  const firstTok = tokens.find((t) => t.text === "first");
+  assert(firstTok !== undefined, "found 'first' target token");
+
+  // Picker click handler: dump every ancestor into the selection set.
+  const selection = new Set();
+  for (const a of firstTok?.sources ?? []) {
+    selection.add(`${a.content}|${a.occurrence}`);
+  }
+
+  const built = buildQuoteFromSelection(uhb, selection);
+  assert(built !== null, "buildQuoteFromSelection returns a quote");
+  assert(
+    built?.quote === "בַּ⁠חֹ֣דֶשׁ הָֽ⁠רִאשׁ֔וֹן",
+    `quote round-trips through UHB (got: ${built?.quote})`,
+  );
+  assert(built?.occurrence === 1, `occurrence=1 (got: ${built?.occurrence})`);
 }
 
 if (failed > 0) {
