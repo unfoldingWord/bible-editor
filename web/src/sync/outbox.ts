@@ -6,7 +6,7 @@
 // crashes — see docs/plan.md "Save protocol".
 
 import { openDB, type IDBPDatabase } from "idb";
-import { api, ApiError, isChapterLockedBody, type ChapterLockedBody, type RowKind } from "./api";
+import { api, ApiError, isChapterLockedBody, isReadOnly, type ChapterLockedBody, type RowKind } from "./api";
 import { backoffMs } from "./backoff";
 
 const DB_NAME = "bible-editor-outbox";
@@ -90,6 +90,23 @@ function uid() {
   return crypto.randomUUID();
 }
 
+// In read-only mode (viewer role), enqueue methods short-circuit before
+// touching IndexedDB so a viewer who types in a note never produces a
+// "failed" chip downstream. Local React state still reflects the typing —
+// the read-only banner above the Shell explains why nothing persists.
+function noopOp(target: OpTarget, action: OpAction, patch: Record<string, unknown>): OutboxOp {
+  return {
+    id: "readonly-noop",
+    target,
+    action,
+    patch,
+    expectedVersion: 0,
+    queuedAt: Date.now(),
+    attempts: 0,
+    status: "pending",
+  };
+}
+
 // Two ops belong to the same target iff they touch the same row/verse. A
 // conflict on one of them must not block ops to *other* targets — but it
 // must keep blocking siblings, since the user's expectedVersion is stale
@@ -114,6 +131,9 @@ export const outbox = {
     patch: Record<string, unknown>,
     opts: { restoredFromVersion?: number; book: string },
   ): Promise<OutboxOp> {
+    if (isReadOnly()) {
+      return noopOp({ kind: "row", rowKind, id, book: opts.book }, "patch", patch);
+    }
     const op: OutboxOp = {
       id: uid(),
       target: { kind: "row", rowKind, id, book: opts.book },
@@ -139,6 +159,9 @@ export const outbox = {
     expectedVersion: number,
     book: string,
   ): Promise<OutboxOp> {
+    if (isReadOnly()) {
+      return noopOp({ kind: "row", rowKind, id, book }, "delete", {});
+    }
     const op: OutboxOp = {
       id: uid(),
       target: { kind: "row", rowKind, id, book },
@@ -163,6 +186,13 @@ export const outbox = {
     expectedVersion: number,
     patch: { content: unknown; plain_text?: string | null },
   ): Promise<OutboxOp> {
+    if (isReadOnly()) {
+      return noopOp(
+        { kind: "verse", book, chapter, verse, bibleVersion },
+        "patch",
+        patch as Record<string, unknown>,
+      );
+    }
     const op: OutboxOp = {
       id: uid(),
       target: { kind: "verse", book, chapter, verse, bibleVersion },
@@ -191,6 +221,9 @@ export const outbox = {
     verse: number,
     done: boolean,
   ): Promise<OutboxOp> {
+    if (isReadOnly()) {
+      return noopOp({ kind: "verse_status", book, chapter, verse }, "patch", { done });
+    }
     const idb = await db();
     const key = `vstatus:${book}:${chapter}:${verse}`;
     const all = (await idb.getAll(STORE)) as OutboxOp[];

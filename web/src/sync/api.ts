@@ -195,6 +195,18 @@ export function setAuthToken(token: string | null) {
   }
 }
 
+// Read-only flag — set when the current JWT carries role='viewer'. The
+// outbox checks this before enqueueing a write so editor UI components that
+// haven't been individually gated still can't trigger 403s. UI components
+// that want to disable inputs can read this directly.
+let readOnly = false;
+export function isReadOnly(): boolean {
+  return readOnly;
+}
+export function setReadOnly(v: boolean) {
+  readOnly = v;
+}
+
 // Surface to the UI that we tried to silently refresh a 401 and it failed.
 // App.tsx subscribes to render a "Session expired — sign in again" banner;
 // the outbox keeps queuing edits in the meantime so nothing is lost.
@@ -277,6 +289,15 @@ async function request<T>(
   init?: RequestInitWithTimeout,
   _retriedAfterRefresh = false,
 ): Promise<T> {
+  // Viewer (read-only) accounts: short-circuit anything that isn't a GET so
+  // the server never sees a write attempt. ApiError(403, "read_only") is a
+  // distinct sentinel callers can detect; the outbox already treats 403 as
+  // fatal so it won't loop.
+  const method = (init?.method ?? "GET").toUpperCase();
+  if (readOnly && method !== "GET" && method !== "HEAD") {
+    throw new ApiError(403, "read_only");
+  }
+
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
     ...((init?.headers as Record<string, string>) ?? {}),
@@ -346,7 +367,7 @@ async function request<T>(
   return (await res.json()) as T;
 }
 
-export type Role = "admin" | "editor";
+export type Role = "admin" | "editor" | "viewer";
 
 export interface MeResponse {
   userId: number;

@@ -11,8 +11,10 @@ import {
   getAuthToken,
   onAuthError,
   setAuthToken,
+  setReadOnly,
   updateLastLocation,
   type MeResponse,
+  type Role,
 } from "./sync/api";
 
 interface Location {
@@ -61,7 +63,7 @@ function isDefaultLoc(l: Location): boolean {
 type AuthState =
   | { kind: "loading" }
   | { kind: "verifying" }                          // have a token; checking role
-  | { kind: "ready"; me: MeResponse | null }       // me may be null in dev path until hydrated
+  | { kind: "ready"; me: MeResponse | null; role: Role }
   | { kind: "signed_out" }                         // explicit logout; awaits sign-in click
   | { kind: "missing" }                            // DCS OAuth available — show sign-in button
   | { kind: "denied"; username: string | null }    // signed in but not on editor allowlist
@@ -124,8 +126,9 @@ function useAuthGate(): [AuthState, (s: AuthState) => void] {
           setState({ kind: "loading" });
           return;
         }
-        if (me.role === "admin" || me.role === "editor") {
-          setState({ kind: "ready", me });
+        if (me.role === "admin" || me.role === "editor" || me.role === "viewer") {
+          setReadOnly(me.role === "viewer");
+          setState({ kind: "ready", me, role: me.role });
         } else if (import.meta.env.DEV) {
           // Dev convenience: a stale token from before the role claim was
           // added has role=null. Drop it and let the loading branch silently
@@ -161,15 +164,16 @@ function useAuthGate(): [AuthState, (s: AuthState) => void] {
       devSignIn("dev")
         .then(async (resp) => {
           if (cancelled) return;
-          if (resp.role !== "admin" && resp.role !== "editor") {
+          if (resp.role !== "admin" && resp.role !== "editor" && resp.role !== "viewer") {
             setState({ kind: "denied", username: resp.username });
             return;
           }
+          setReadOnly(resp.role === "viewer");
           // devSignIn doesn't return last_* — pull it separately so we can
           // hydrate the view. Failure here is non-fatal: the user just lands
           // on the URL hash (or the default book).
           const me = await fetchAuthMe().catch(() => null);
-          setState({ kind: "ready", me });
+          setState({ kind: "ready", me, role: resp.role });
         })
         .catch((err: unknown) => {
           if (cancelled) return;
@@ -338,17 +342,27 @@ export function App() {
     }
   };
 
+  const isViewer = auth.kind === "ready" && auth.role === "viewer";
+
   return (
-    <>
-      <Shell
-        key={`${loc.book}-${loc.chapter}-${loc.verse}`}
-        book={loc.book}
-        chapter={loc.chapter}
-        initialVerse={loc.verse}
-        onNavigate={navigate}
-        bookHook={bookHook}
-        onLogout={handleSignOut}
-      />
+    <Box sx={{ height: "100vh", display: "flex", flexDirection: "column" }}>
+      {isViewer && (
+        <Alert severity="info" variant="filled" sx={{ borderRadius: 0, py: 0.5 }}>
+          You're signed in as an <strong>unfoldingWord</strong> member — read-only access.
+          Edits won't be saved. Ask an admin to add you to the editor allowlist if you need to edit.
+        </Alert>
+      )}
+      <Box sx={{ flex: 1, minHeight: 0 }}>
+        <Shell
+          key={`${loc.book}-${loc.chapter}-${loc.verse}`}
+          book={loc.book}
+          chapter={loc.chapter}
+          initialVerse={loc.verse}
+          onNavigate={navigate}
+          bookHook={bookHook}
+          onLogout={handleSignOut}
+        />
+      </Box>
       <Snackbar
         open={sessionExpired}
         anchorOrigin={{ vertical: "top", horizontal: "center" }}
@@ -365,6 +379,6 @@ export function App() {
           Your session expired — sign in to keep saving. Queued edits will sync after sign-in.
         </Alert>
       </Snackbar>
-    </>
+    </Box>
   );
 }

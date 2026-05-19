@@ -37,6 +37,9 @@ export interface Env {
   // Defaults below cover the unfoldingWord canonical owner; override per env.
   DCS_EXPORT_OWNER?: string;
   DCS_EXPORT_BRANCH?: string;
+  // DCS org whose members get read-only ("viewer") access when not on the
+  // editor allowlist. Defaults to "unfoldingWord" when unset.
+  VIEWER_ORG?: string;
   // Shared service token for the uw-bt-bot AI endpoint. Set via
   // `wrangler secret put BT_API_TOKEN`. Absence disables /api/tn-quick.
   BT_API_TOKEN?: string;

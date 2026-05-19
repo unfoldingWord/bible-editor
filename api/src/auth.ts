@@ -16,12 +16,56 @@ import { getCookie, setCookie, deleteCookie } from "hono/cookie";
 import { SignJWT, jwtVerify } from "jose";
 import type { Env } from "./index";
 
-export type Role = "admin" | "editor";
+export type Role = "admin" | "editor" | "viewer";
 
 export interface AuthClaims {
   userId: number;
   username?: string;
   role?: Role;
+}
+
+// Org granted read-only access via DCS membership. Lookup is case-insensitive;
+// can be overridden per-env via VIEWER_ORG (defaults to "unfoldingWord").
+function viewerOrgName(env: Env): string {
+  return (env.VIEWER_ORG ?? "unfoldingWord").trim() || "unfoldingWord";
+}
+
+// Calls the Gitea API to check whether `dcsUsername` is a member of the
+// viewer-eligible org. `accessToken` (the user's OAuth token, when present)
+// picks up private memberships; otherwise the unauthenticated call only sees
+// public memberships. Returns false on any network/parse failure — we'd
+// rather deny ambiguously than mint a token by accident.
+async function isViewerOrgMember(
+  env: Env,
+  dcsUsername: string,
+  accessToken: string | null,
+): Promise<boolean> {
+  const orgName = viewerOrgName(env).toLowerCase();
+  try {
+    if (accessToken) {
+      // Authenticated: lists current user's orgs including private memberships.
+      const res = await fetch(`${env.DCS_BASE_URL}/api/v1/user/orgs`, {
+        headers: { Authorization: `token ${accessToken}` },
+      });
+      if (!res.ok) return false;
+      const orgs = (await res.json()) as Array<{ username?: string }>;
+      return orgs.some((o) => (o.username ?? "").toLowerCase() === orgName);
+    }
+    // Unauthenticated path (refresh): only sees public memberships, but the
+    // uW org membership is public so this is sufficient in practice. If the
+    // DCS_SERVICE_TOKEN is configured, use it to also catch private members.
+    const headers: Record<string, string> = {};
+    if (env.DCS_SERVICE_TOKEN) headers.Authorization = `token ${env.DCS_SERVICE_TOKEN}`;
+    const res = await fetch(
+      `${env.DCS_BASE_URL}/api/v1/users/${encodeURIComponent(dcsUsername)}/orgs`,
+      { headers },
+    );
+    if (!res.ok) return false;
+    const orgs = (await res.json()) as Array<{ username?: string }>;
+    return orgs.some((o) => (o.username ?? "").toLowerCase() === orgName);
+  } catch {
+    return false;
+  }
 }
 
 type AppContext = Context<{
@@ -60,7 +104,9 @@ export async function verifyToken(token: string, env: Env): Promise<AuthClaims |
     if (!Number.isFinite(userId)) return null;
     const rawRole = payload.role;
     const role: Role | undefined =
-      rawRole === "admin" || rawRole === "editor" ? rawRole : undefined;
+      rawRole === "admin" || rawRole === "editor" || rawRole === "viewer"
+        ? rawRole
+        : undefined;
     return {
       userId,
       username: typeof payload.username === "string" ? payload.username : undefined,
@@ -127,7 +173,7 @@ export function currentUserId(c: Context): number | null {
 
 export function currentUserRole(c: Context): Role | null {
   const v = (c as AppContext).get("role");
-  return v === "admin" || v === "editor" ? v : null;
+  return v === "admin" || v === "editor" || v === "viewer" ? v : null;
 }
 
 // ── DCS OAuth ────────────────────────────────────────────────────────────────
@@ -246,16 +292,22 @@ export async function callbackDcsAuth(c: AppContext): Promise<Response> {
   if (!userRes.ok) return c.json({ error: "user_fetch_failed" }, 502);
   const dcsUser = (await userRes.json()) as { id: number; login: string; full_name?: string };
 
-  // Allowlist gate. Look up user_roles BEFORE upserting into users so denied
-  // accounts never persist. SPA reads _auth_denied off the redirect and shows
-  // a "contact admin" screen.
+  // Allowlist gate. user_roles is the source of truth for edit access; an
+  // account missing from it falls through to a DCS org-membership check so
+  // members of the viewer org (default: unfoldingWord) get read-only access.
+  // Anything else hits the denied screen.
   const origin = new URL(c.req.url).origin;
-  const role = await lookupUserRole(c.env, dcsUser.login);
+  let role: Role | null = await lookupUserRole(c.env, dcsUser.login);
   if (!role) {
-    return c.redirect(
-      `${origin}/?_auth_denied=1&u=${encodeURIComponent(dcsUser.login)}`,
-      302,
-    );
+    const isMember = await isViewerOrgMember(c.env, dcsUser.login, accessToken);
+    if (isMember) {
+      role = "viewer";
+    } else {
+      return c.redirect(
+        `${origin}/?_auth_denied=1&u=${encodeURIComponent(dcsUser.login)}`,
+        302,
+      );
+    }
   }
 
   // Upsert users row keyed by dcs_user_id. We stash the DCS access_token so
@@ -351,7 +403,14 @@ export async function refreshToken(c: AppContext): Promise<Response> {
 
   // Re-check the allowlist on refresh — yanking a user from user_roles takes
   // effect by the next refresh, not via the old JWT's natural expiration.
-  const role = await lookupUserRole(c.env, row.dcs_username ?? username ?? "");
+  // Viewers (org-only access) re-verify org membership via the service token
+  // (or public org listing) each refresh so removal from the org also revokes.
+  const lookupName = row.dcs_username ?? username ?? "";
+  let role: Role | null = await lookupUserRole(c.env, lookupName);
+  if (!role) {
+    const isMember = await isViewerOrgMember(c.env, lookupName, null);
+    if (isMember) role = "viewer";
+  }
   if (!role) {
     return c.json({ error: "forbidden", reason: "not_an_editor" }, 403);
   }
