@@ -29,8 +29,12 @@ import {
   Tooltip,
 } from "@mui/material";
 import CloseIcon from "@mui/icons-material/Close";
-import { collectTargetTokens, buildQuoteFromSelection } from "../lib/quoteBuilder";
+import { collectTargetTokens, buildQuoteFromSelection, tokenKey } from "../lib/quoteBuilder";
 import type { HighlightKey } from "../lib/highlight";
+import type { SourceAncestor } from "../lib/quoteBuilder";
+import type { LexiconEntry } from "../hooks/useLexicon";
+import type { SourceWord } from "../lib/alignment";
+import { SourceTooltipBody } from "./SourceTooltipBody";
 
 interface Props {
   open: boolean;
@@ -41,6 +45,10 @@ interface Props {
   uhbVerseObjects: unknown[] | null;
   ultVerseObjects: unknown[] | null;
   ustVerseObjects: unknown[] | null;
+  // Pre-loaded Strong's → lexicon entry map. Shell already maintains this
+  // for the scripture column's HebrewLine hover tooltips; the picker
+  // reuses it so the UHB chips show the same gloss/morphology card.
+  lexiconMap: Map<string, LexiconEntry | null>;
   selectedKeys: Set<HighlightKey>;
   onToggleKey: (key: HighlightKey) => void;
   onCancel: () => void;
@@ -56,6 +64,7 @@ export function QuoteBuilderPopper({
   uhbVerseObjects,
   ultVerseObjects,
   ustVerseObjects,
+  lexiconMap,
   selectedKeys,
   onToggleKey,
   onCancel,
@@ -72,13 +81,15 @@ export function QuoteBuilderPopper({
     [uhbVerseObjects, selectedKeys],
   );
 
-  const handleEnglishClick = (sources: Array<{ content: string; occurrence: number }>) => {
+  const handleEnglishClick = (sources: SourceAncestor[]) => {
     if (sources.length === 0) return;
     // Compute current chain coverage. If every ancestor is already in the
     // set, treat the click as "remove the chain"; otherwise add the
     // missing pieces. Avoids the awkward middle state where one click adds
     // some and the next click toggles them back individually.
-    const keys = sources.map((a) => `${a.content}|${a.occurrence}` as HighlightKey);
+    // Keys are nfc-normalized via tokenKey() so they match what
+    // buildQuoteFromSelection's UhbWord lookup expects.
+    const keys = sources.map((a) => a.key);
     const allPresent = keys.every((k) => selectedKeys.has(k));
     for (const k of keys) {
       const present = selectedKeys.has(k);
@@ -139,8 +150,20 @@ export function QuoteBuilderPopper({
               <EmptyHint>no source words for this verse</EmptyHint>
             ) : (
               uhbTokens.map((tok) => {
-                const key: HighlightKey = `${tok.text}|${tok.occurrence}`;
+                // Always use nfc-normalized keys — UHB \w text drifts from
+                // zaln x-content in combining-mark order, so a raw
+                // `${text}|${occ}` comparison would miss cross-row matches.
+                const key = tokenKey(tok.text, tok.occurrence);
                 const selected = selectedKeys.has(key);
+                const src: SourceWord = {
+                  id: "",
+                  strong: tok.strong,
+                  lemma: tok.lemma,
+                  morph: tok.morph,
+                  occurrence: String(tok.occurrence),
+                  occurrences: String(tok.occurrences),
+                  content: tok.text,
+                };
                 return (
                   <SourceChip
                     key={`${key}|${tok.position}`}
@@ -149,6 +172,12 @@ export function QuoteBuilderPopper({
                     selected={selected}
                     rtl
                     onClick={() => onToggleKey(key)}
+                    lexiconBody={
+                      <SourceTooltipBody
+                        source={src}
+                        lex={lexiconMap.get(tok.strong) ?? null}
+                      />
+                    }
                   />
                 );
               })
@@ -303,14 +332,18 @@ function SourceChip({
   selected,
   rtl,
   onClick,
+  lexiconBody,
 }: {
   text: string;
   occurrence: number;
   selected: boolean;
   rtl?: boolean;
   onClick: () => void;
+  // When provided, wraps the chip in the same SourceTooltipBody hovercard
+  // the scripture column's HebrewLine uses — strong/lemma/morph/gloss.
+  lexiconBody?: React.ReactNode;
 }) {
-  return (
+  const chip = (
     <Chip
       label={text}
       size="small"
@@ -327,8 +360,17 @@ function SourceChip({
         userSelect: "none",
         "& .MuiChip-label": { px: 1 },
       }}
-      title={occurrence > 1 ? `occurrence ${occurrence}` : undefined}
+      title={!lexiconBody && occurrence > 1 ? `occurrence ${occurrence}` : undefined}
     />
+  );
+  if (!lexiconBody) return chip;
+  return (
+    <Tooltip
+      title={lexiconBody}
+      slotProps={{ popper: { sx: { pointerEvents: "none" } } }}
+    >
+      <Box sx={{ display: "inline-flex" }}>{chip}</Box>
+    </Tooltip>
   );
 }
 
@@ -381,22 +423,31 @@ function TargetChip({
 }
 
 function chainSelected(
-  sources: Array<{ content: string; occurrence: number }>,
+  sources: SourceAncestor[],
   selectedKeys: Set<HighlightKey>,
 ): boolean {
   if (sources.length === 0) return false;
-  return sources.every((a) => selectedKeys.has(`${a.content}|${a.occurrence}`));
+  return sources.every((a) => selectedKeys.has(a.key));
 }
 
 // Helper analogue of collectUhbWords (which is private in quoteBuilder).
 // We need the same shape here so the picker's UHB row mirrors what the
-// quote builder operates on. Kept tiny / inline rather than exporting the
-// internal helper.
-function collectUhbWords(
-  verseObjects: unknown[] | null,
-): Array<{ text: string; occurrence: number; position: number }> {
+// quote builder operates on, plus the per-word strong/lemma/morph so the
+// chip can render a SourceTooltipBody-driven lexicon hovercard. Kept
+// inline rather than exporting the internal helper.
+interface UhbChip {
+  text: string;
+  occurrence: number;
+  occurrences: number;
+  position: number;
+  strong: string;
+  lemma: string;
+  morph: string;
+}
+
+function collectUhbWords(verseObjects: unknown[] | null): UhbChip[] {
   if (!Array.isArray(verseObjects)) return [];
-  const out: Array<{ text: string; occurrence: number; position: number }> = [];
+  const out: UhbChip[] = [];
   function walk(nodes: unknown[]) {
     for (const node of nodes ?? []) {
       const o = node as Record<string, unknown> | null;
@@ -404,7 +455,16 @@ function collectUhbWords(
       if (o["type"] === "word" && o["tag"] === "w") {
         const text = String(o["text"] ?? "");
         const occurrence = parseInt(String(o["occurrence"] ?? "1"), 10) || 1;
-        out.push({ text, occurrence, position: out.length });
+        const occurrences = parseInt(String(o["occurrences"] ?? "1"), 10) || 1;
+        out.push({
+          text,
+          occurrence,
+          occurrences,
+          position: out.length,
+          strong: String(o["strong"] ?? ""),
+          lemma: String(o["lemma"] ?? ""),
+          morph: String(o["morph"] ?? ""),
+        });
       } else if (o["type"] === "milestone") {
         const children = (o["children"] as unknown[] | undefined) ?? [];
         walk(children);

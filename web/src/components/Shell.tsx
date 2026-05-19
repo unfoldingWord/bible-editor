@@ -1217,6 +1217,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           uhbVerseObjects={quoteBuildContext.uhb}
           ultVerseObjects={quoteBuildContext.ult}
           ustVerseObjects={quoteBuildContext.ust}
+          lexiconMap={lexiconMap}
           selectedKeys={quoteBuildSelectedKeys}
           onToggleKey={toggleQuoteBuildWord}
           onCancel={cancelQuoteBuild}

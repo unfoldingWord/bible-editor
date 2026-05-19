@@ -11,9 +11,22 @@
 // always 1, matching how new TNs are typically written.
 
 import type { HighlightKey } from "./highlight";
+import { nfc } from "./hebrew.ts";
+
+// Build a HighlightKey from a Hebrew/Greek string + 1-based occurrence.
+// All callers (picker + buildQuoteFromSelection + collectTargetTokens)
+// MUST go through this — UHB \w text is stored in legacy combining-mark
+// order while UST/ULT zaln x-content is NFC, so a raw `${text}|${occ}`
+// comparison loses the join. nfc() normalizes both sides to the same
+// canonical form. Same rule findSourceHighlights / findTargetHighlights
+// have used since the start.
+export function tokenKey(text: string, occurrence: number): HighlightKey {
+  return `${nfc(text)}|${occurrence}`;
+}
 
 interface UhbWord {
-  text: string;
+  text: string;       // raw text, preserved for quote string rendering
+  key: HighlightKey;  // nfc-normalized lookup key
   occurrence: number;
   // 0-based document position among all \w tokens in this verse. Stable
   // across re-render because the verseObjects tree is immutable while
@@ -30,7 +43,7 @@ function collectUhbWords(verseObjects: unknown[]): UhbWord[] {
       if (o["type"] === "word" && o["tag"] === "w") {
         const text = String(o["text"] ?? "");
         const occurrence = parseInt(String(o["occurrence"] ?? "1"), 10) || 1;
-        out.push({ text, occurrence, position: out.length });
+        out.push({ text, key: tokenKey(text, occurrence), occurrence, position: out.length });
       } else if (o["type"] === "milestone") {
         const children = (o["children"] as unknown[] | undefined) ?? [];
         walk(children);
@@ -52,7 +65,7 @@ export function buildQuoteFromSelection(
 ): BuiltQuote | null {
   if (!Array.isArray(verseObjects) || selectedKeys.size === 0) return null;
   const all = collectUhbWords(verseObjects);
-  const selected = all.filter((w) => selectedKeys.has(`${w.text}|${w.occurrence}`));
+  const selected = all.filter((w) => selectedKeys.has(w.key));
   if (selected.length === 0) return null;
 
   // selected is already in document order — collectUhbWords walks in order
@@ -89,10 +102,13 @@ export function buildQuoteFromSelection(
 // One source ancestor: the content + occurrence from a \zaln-s milestone.
 // The picker turns a click on a target word into a set of these so the
 // existing UHB-keyed selection (used by buildQuoteFromSelection) can be
-// fed without translating between formats.
+// fed without translating between formats. The `key` field is the
+// nfc-normalized selection key — always compare keys, never raw content,
+// since UHB \w text and zaln x-content can drift in combining-mark order.
 export interface SourceAncestor {
-  content: string;
+  content: string;     // raw, for display in tooltips
   occurrence: number;
+  key: HighlightKey;   // nfc-normalized, for selection set lookups
 }
 
 // Per-token shape returned by collectTargetTokens. Outer-to-inner ancestor
@@ -126,7 +142,9 @@ export function collectTargetTokens(
         const children = (o["children"] as unknown[] | undefined) ?? [];
         // Skip ancestors with no content — defensive: a malformed milestone
         // without x-content would otherwise insert empty selection keys.
-        const nextStack = content ? [...stack, { content, occurrence }] : stack;
+        const nextStack = content
+          ? [...stack, { content, occurrence, key: tokenKey(content, occurrence) }]
+          : stack;
         walk(children, nextStack);
       } else if (o["type"] === "word" && o["tag"] === "w") {
         const text = String(o["text"] ?? "");
@@ -149,13 +167,17 @@ function matchGroupsAt(
   groups: UhbWord[][],
   all: UhbWord[],
 ): boolean {
+  // Compare via nfc-normalized keys (sans the occurrence suffix) so the
+  // matcher tolerates legacy-vs-NFC drift between identical-looking
+  // Hebrew strings — same reason `tokenKey` exists.
+  const norm = (w: UhbWord) => w.key.split("|")[0];
   let pos = start;
   for (let gi = 0; gi < groups.length; gi++) {
     const group = groups[gi];
     if (gi === 0) {
       if (pos + group.length > all.length) return false;
       for (let wi = 0; wi < group.length; wi++) {
-        if (all[pos + wi].text !== group[wi].text) return false;
+        if (norm(all[pos + wi]) !== norm(group[wi])) return false;
       }
       pos = pos + group.length;
     } else {
@@ -163,7 +185,7 @@ function matchGroupsAt(
       for (let s = pos; s + group.length <= all.length; s++) {
         let ok = true;
         for (let wi = 0; wi < group.length; wi++) {
-          if (all[s + wi].text !== group[wi].text) {
+          if (norm(all[s + wi]) !== norm(group[wi])) {
             ok = false;
             break;
           }
