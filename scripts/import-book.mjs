@@ -102,16 +102,26 @@ function importVerses(bibleVersion, srcPath) {
     if (Number.isNaN(chNum)) continue;
     const chapterObj = json.chapters[chapter];
     for (const verse of Object.keys(chapterObj)) {
-      const m = verse.match(/^(\d+)(?:-(\d+))?$/);
-      if (!m) continue; // skip 'front', etc.
-      const vNum = parseInt(m[1], 10);
-      // Multi-verse blocks like `\v 6-9` round-trip through verse_end so
-      // export emits `\v 6-9` instead of dropping verses 7-9. Inverted
-      // ranges (e.g. "9-8") collapse to singleton.
+      let vNum;
       let vEnd = null;
-      if (m[2]) {
-        const end = parseInt(m[2], 10);
-        if (end > vNum) vEnd = end;
+      if (verse === "front") {
+        // Chapter-front pseudo-verse — `\p` / `\s1` / `\d` etc. before the
+        // first `\v`. Store as verse 0 so the nightly export's `front` key
+        // reconstruction in api/src/export.ts emits these markers above
+        // `\v 1`. Skipping `front` here was the cause of the
+        // live-snapshot diff that dropped chapter-leading `\p` and `\s1`.
+        vNum = 0;
+      } else {
+        const m = verse.match(/^(\d+)(?:-(\d+))?$/);
+        if (!m) continue; // skip book-level 'intro' etc.
+        vNum = parseInt(m[1], 10);
+        // Multi-verse blocks like `\v 6-9` round-trip through verse_end so
+        // export emits `\v 6-9` instead of dropping verses 7-9. Inverted
+        // ranges (e.g. "9-8") collapse to singleton.
+        if (m[2]) {
+          const end = parseInt(m[2], 10);
+          if (end > vNum) vEnd = end;
+        }
       }
       const verseObj = chapterObj[verse];
       const normalized = {
