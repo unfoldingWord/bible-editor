@@ -18,6 +18,7 @@ import {
 } from "./alignment.ts";
 import { extractPlainText } from "./usfm.ts";
 import { findTargetHighlights, findSourceHighlights } from "./highlight.ts";
+import { buildQuoteFromSelection } from "./quoteBuilder.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(here, "../../..");
@@ -522,6 +523,55 @@ function roundtripVerseUsfm(rawUsfm, sourceVO = null) {
     !hl2.has("the|1"),
     `NUM 20:1 occ=2 must NOT highlight the(1) from occ=1 scope. Got: ${[...hl2].join(",")}`,
   );
+}
+
+// ─── Case 12: Hebrew-click → quote builder ────────────────────────────────
+//
+// Selecting contiguous Hebrew words produces a single space-joined quote;
+// disjoint selections insert " & " between groups. Occurrence is computed
+// by counting how many positions in the verse start a matching pattern up
+// to and including the selected one.
+{
+  console.log("\n[Case 12] Quote builder from Hebrew selection");
+  // Fake verseObjects: a flat list of \w tokens with predictable text.
+  const verseObjects = [
+    { type: "word", tag: "w", text: "וַ⁠יָּבֹ֣אוּ", occurrence: 1, occurrences: 1 },
+    { type: "word", tag: "w", text: "בְנֵֽי", occurrence: 1, occurrences: 1 },
+    { type: "word", tag: "w", text: "יִ֠שְׂרָאֵל", occurrence: 1, occurrences: 1 },
+    { type: "word", tag: "w", text: "בַּ⁠חֹ֣דֶשׁ", occurrence: 1, occurrences: 2 },
+    { type: "word", tag: "w", text: "הָֽ⁠רִאשׁ֔וֹן", occurrence: 1, occurrences: 2 },
+    { type: "word", tag: "w", text: "בַּ⁠חֹ֣דֶשׁ", occurrence: 2, occurrences: 2 },
+    { type: "word", tag: "w", text: "הָֽ⁠רִאשׁ֔וֹן", occurrence: 2, occurrences: 2 },
+  ];
+
+  // Two adjacent words → single quote, occurrence 1.
+  const sel1 = new Set(["בַּ⁠חֹ֣דֶשׁ|1", "הָֽ⁠רִאשׁ֔וֹן|1"]);
+  const b1 = buildQuoteFromSelection(verseObjects, sel1);
+  assert(b1 !== null, "builder returns non-null for valid selection");
+  assert(
+    b1?.quote === "בַּ⁠חֹ֣דֶשׁ הָֽ⁠רִאשׁ֔וֹן",
+    `single-group quote (got: ${b1?.quote})`,
+  );
+  assert(b1?.occurrence === 1, `occurrence=1 for first instance (got: ${b1?.occurrence})`);
+
+  // The same pair, but the SECOND occurrence → occurrence 2.
+  const sel2 = new Set(["בַּ⁠חֹ֣דֶשׁ|2", "הָֽ⁠רִאשׁ֔וֹן|2"]);
+  const b2 = buildQuoteFromSelection(verseObjects, sel2);
+  assert(b2?.quote === "בַּ⁠חֹ֣דֶשׁ הָֽ⁠רִאשׁ֔וֹן", `same quote shape for second occurrence`);
+  assert(b2?.occurrence === 2, `occurrence=2 for second instance (got: ${b2?.occurrence})`);
+
+  // Disjoint selection → ' & ' separator. Picking word 1 and word 4
+  // produces a two-group quote.
+  const sel3 = new Set(["וַ⁠יָּבֹ֣אוּ|1", "בַּ⁠חֹ֣דֶשׁ|1"]);
+  const b3 = buildQuoteFromSelection(verseObjects, sel3);
+  assert(
+    b3?.quote === "וַ⁠יָּבֹ֣אוּ & בַּ⁠חֹ֣דֶשׁ",
+    `disjoint groups joined by ' & ' (got: ${b3?.quote})`,
+  );
+
+  // Empty selection → null.
+  const b4 = buildQuoteFromSelection(verseObjects, new Set());
+  assert(b4 === null, "empty selection returns null");
 }
 
 if (failed > 0) {

@@ -85,6 +85,13 @@ interface Props {
   onNoteTranslateQuote?: (row: TnRow, english: string) => string | null;
   // Same translate flow but for the TWL quote (orig_words) column.
   onWordTranslateQuote?: (row: TwlRow, english: string) => string | null;
+  // Quote-builder session. Shell owns the selection state; the cards
+  // surface the "build / use selection / cancel" controls.
+  quoteBuildActiveNoteId?: string | null;
+  quoteBuildSelectionCount?: number;
+  onStartQuoteBuild?: (noteId: string) => void;
+  onCancelQuoteBuild?: () => void;
+  onCommitQuoteBuild?: () => void;
   // Tab + alignment-panel wiring. When mode === "alignment", the Resources
   // column body swaps to the AlignmentPanel; the Notes/Words/Questions tabs
   // stay in the strip but their click acts as a scroll-to in resources mode.
@@ -175,6 +182,11 @@ export function ResourceColumn({
   onSetNoteHint,
   onNoteTranslateQuote,
   onWordTranslateQuote,
+  quoteBuildActiveNoteId,
+  quoteBuildSelectionCount = 0,
+  onStartQuoteBuild,
+  onCancelQuoteBuild,
+  onCommitQuoteBuild,
   panelMode = "resources",
   onSetPanelMode,
   alignmentProps,
@@ -534,6 +546,13 @@ export function ResourceColumn({
           onTranslateQuote={
             onNoteTranslateQuote ? (english) => onNoteTranslateQuote(r, english) : undefined
           }
+          quoteBuildMode={quoteBuildActiveNoteId === r.id}
+          quoteBuildSelectionCount={
+            quoteBuildActiveNoteId === r.id ? quoteBuildSelectionCount : 0
+          }
+          onStartQuoteBuild={onStartQuoteBuild ? () => onStartQuoteBuild(r.id) : undefined}
+          onCancelQuoteBuild={onCancelQuoteBuild}
+          onCommitQuoteBuild={onCommitQuoteBuild}
         />
         {showAfter && <DropIndicator />}
       </Fragment>

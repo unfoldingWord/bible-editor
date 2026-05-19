@@ -27,7 +27,8 @@ import { smartEditVerse } from "../lib/replace";
 import { verseHasUnalignedWork } from "../lib/alignment";
 import { concatSourceRange, formatVerseLabel } from "../lib/verseRange";
 import { buildTnQuickRequest } from "../lib/tnQuickRequest";
-import { findSourceForTargetText } from "../lib/highlight";
+import { findSourceForTargetText, type HighlightKey } from "../lib/highlight";
+import { buildQuoteFromSelection } from "../lib/quoteBuilder";
 import { TimelineRail } from "./TimelineRail";
 import { ScriptureColumn, type ScriptureMode } from "./ScriptureColumn";
 import { ResourceColumn, type AlignmentTabProps, type PanelMode } from "./ResourceColumn";
@@ -409,6 +410,59 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     }
     return { activeQuote: null, activeOccurrence: null };
   }, [activeNoteId, activeWordId, data]);
+
+  // Quote-builder session: when active, clicking Hebrew words in the UHB
+  // row of the active verse toggles them into selectedKeys; "Use selection"
+  // on the note card converts the set into row.quote + row.occurrence.
+  // Tied to a specific note id so switching notes cancels the session.
+  const [quoteBuildNoteId, setQuoteBuildNoteId] = useState<string | null>(null);
+  const [quoteBuildSelectedKeys, setQuoteBuildSelectedKeys] = useState<Set<HighlightKey>>(
+    () => new Set(),
+  );
+  useEffect(() => {
+    if (quoteBuildNoteId && activeNoteId !== quoteBuildNoteId) {
+      setQuoteBuildNoteId(null);
+      setQuoteBuildSelectedKeys(new Set());
+    }
+  }, [activeNoteId, quoteBuildNoteId]);
+  const toggleQuoteBuildWord = useCallback(
+    (key: HighlightKey) => {
+      setQuoteBuildSelectedKeys((prev) => {
+        const next = new Set(prev);
+        if (next.has(key)) next.delete(key);
+        else next.add(key);
+        return next;
+      });
+    },
+    [],
+  );
+  const startQuoteBuild = useCallback((noteId: string) => {
+    setQuoteBuildNoteId(noteId);
+    setQuoteBuildSelectedKeys(new Set());
+  }, []);
+  const cancelQuoteBuild = useCallback(() => {
+    setQuoteBuildNoteId(null);
+    setQuoteBuildSelectedKeys(new Set());
+  }, []);
+
+  // Materialize the in-flight quote-build selection into a row patch and
+  // fire the existing note save pipe. Pulls UHB verseObjects for the
+  // current verse — the buildQuoteFromSelection helper does the grouping
+  // and " & " join + occurrence calculation.
+  const commitQuoteBuild = useCallback(() => {
+    if (!quoteBuildNoteId || !data) return;
+    const row = data.tn.find((r) => r.id === quoteBuildNoteId);
+    if (!row) return;
+    const uhb = data.verses["UHB"]?.[row.verse] ?? data.verses["UGNT"]?.[row.verse];
+    const verseObjects =
+      (uhb?.content as { verseObjects?: unknown[] } | null)?.verseObjects;
+    if (!Array.isArray(verseObjects)) return;
+    const built = buildQuoteFromSelection(verseObjects, quoteBuildSelectedKeys);
+    if (!built) return;
+    enqueueRow("tn", row, { quote: built.quote, occurrence: built.occurrence });
+    setQuoteBuildNoteId(null);
+    setQuoteBuildSelectedKeys(new Set());
+  }, [quoteBuildNoteId, quoteBuildSelectedKeys, data]);
 
   // Routes any verse / version / aligner-target change through the dirty
   // gate when the alignment panel has unsaved drags. Plain wrapper around
@@ -824,6 +878,9 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           onSaveVerse={(verseNum, bibleVersion, plain, base) => {
             saveVerseDraft(chapter, verseNum, bibleVersion, plain, base);
           }}
+          quoteBuildMode={!!quoteBuildNoteId && quoteBuildNoteId === activeNoteId}
+          quoteBuildSelectedKeys={quoteBuildSelectedKeys}
+          onQuoteBuildWordToggle={(key) => toggleQuoteBuildWord(key)}
           onOpenAligner={(v, bv) => openAligner(chapter, v, bv)}
           scrollNonce={scrollNonce}
           onRequestScrollToActive={requestScrollToActive}
@@ -1044,6 +1101,11 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           locked={Boolean(chapterLock)}
           onSetNotePreserve={handleSetNotePreserve}
           onSetNoteHint={handleSetNoteHint}
+          quoteBuildActiveNoteId={quoteBuildNoteId}
+          quoteBuildSelectionCount={quoteBuildSelectedKeys.size}
+          onStartQuoteBuild={startQuoteBuild}
+          onCancelQuoteBuild={cancelQuoteBuild}
+          onCommitQuoteBuild={commitQuoteBuild}
           panelMode={panelMode}
           onSetPanelMode={handleSetPanelMode}
           alignmentProps={alignmentTabProps}
