@@ -1,11 +1,21 @@
 // NB: src/spikes/AlignerSmoke.tsx is intentionally NOT imported.
 // Aligner integration is deferred to Phase 3 — see docs/plan.md.
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Alert, Box, Button, CircularProgress, Snackbar, Stack, Typography } from "@mui/material";
 import { Shell } from "./components/Shell";
 import { useBook } from "./hooks/useBook";
-import { devSignIn, fetchAuthMe, getAuthToken, onAuthError, setAuthToken, setReadOnly } from "./sync/api";
-import type { Role } from "./sync/api";
+import {
+  authLogout,
+  devSignIn,
+  fetchAuthMe,
+  getAuthToken,
+  onAuthError,
+  setAuthToken,
+  setReadOnly,
+  updateLastLocation,
+  type MeResponse,
+  type Role,
+} from "./sync/api";
 
 interface Location {
   book: string;
@@ -13,9 +23,19 @@ interface Location {
   verse: number;
 }
 
+// OBA (Obadiah) is the shortest book in the canon — one chapter, 21 verses.
+// Loads faster than ZEC on a cold cache and keeps the default landing page
+// snappy. Bookmarks / direct links still win because parseHash only falls
+// back to this when no hash is present.
+const DEFAULT_BOOK = "OBA";
+
+// Set when the user explicitly clicks "Sign out". Read at boot to suppress
+// the dev-mode silent re-mint and show the signed-out screen instead.
+const SIGNED_OUT_KEY = "bible-editor.signed_out";
+
 function parseHash(): Location {
   const m = location.hash.match(/^#\/?([A-Za-z0-9]+)(?:\/(\d+))?(?:\/(\d+))?/);
-  if (!m) return { book: "ZEC", chapter: 1, verse: 1 };
+  if (!m) return { book: DEFAULT_BOOK, chapter: 1, verse: 1 };
   return {
     book: m[1].toUpperCase(),
     chapter: m[2] ? parseInt(m[2], 10) : 1,
@@ -23,43 +43,73 @@ function parseHash(): Location {
   };
 }
 
+function isDefaultLoc(l: Location): boolean {
+  return l.book === DEFAULT_BOOK && l.chapter === 1 && l.verse === 1;
+}
+
 // Auth gate. The API requires a Bearer token for every write, so we must
 // have one before mounting the editor — otherwise every save 401s.
 //
 // Boot sequence:
-//   1. If the URL has ?_auth_denied=1, the OAuth callback rejected this DCS
+//   1. If localStorage has the signed-out flag, show the signed-out screen
+//      (suppresses dev silent re-mint after an explicit logout).
+//   2. If the URL has ?_auth_denied=1, the OAuth callback rejected this DCS
 //      account (not on the editor allowlist). Show the denied screen.
-//   2. If the URL has ?_auth=<token> (DCS OAuth callback success), store it
+//   3. If the URL has ?_auth=<token> (DCS OAuth callback success), store it
 //      and clean URL, then verify the role via /api/auth/me.
-//   3. If a token is already in localStorage, verify via /api/auth/me.
-//   4. In dev mode (import.meta.env.DEV), silently mint via /api/auth/dev.
-//   5. Otherwise redirect to /api/auth/dcs/start (production OAuth flow).
+//   4. If a token is already in localStorage, verify via /api/auth/me.
+//   5. In dev mode (import.meta.env.DEV), silently mint via /api/auth/dev.
+//   6. Otherwise show the sign-in button (production OAuth flow).
 type AuthState =
   | { kind: "loading" }
   | { kind: "verifying" }                          // have a token; checking role
-  | { kind: "ready"; role: Role }
+  | { kind: "ready"; me: MeResponse | null; role: Role }
+  | { kind: "signed_out" }                         // explicit logout; awaits sign-in click
   | { kind: "missing" }                            // DCS OAuth available — show sign-in button
   | { kind: "denied"; username: string | null }    // signed in but not on editor allowlist
   | { kind: "error"; message: string };
 
-function useAuthGate(): AuthState {
+function isSignedOut(): boolean {
+  try {
+    return localStorage.getItem(SIGNED_OUT_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
+function clearSignedOutFlag() {
+  try {
+    localStorage.removeItem(SIGNED_OUT_KEY);
+  } catch {
+    /* private mode */
+  }
+}
+
+function useAuthGate(): [AuthState, (s: AuthState) => void] {
   const [state, setState] = useState<AuthState>(() => {
     const params = new URLSearchParams(location.search);
 
-    // Step 1: OAuth callback rejected this account (not on the allowlist).
+    // Step 2: OAuth callback rejected this account (not on the allowlist).
     if (params.get("_auth_denied")) {
       const username = params.get("u");
       history.replaceState(null, "", location.pathname + location.hash);
       return { kind: "denied", username };
     }
 
-    // Step 2: absorb token from DCS OAuth callback.
+    // Step 3: absorb token from DCS OAuth callback (clears any stale
+    // signed-out flag — a successful OAuth callback is an explicit sign-in).
     const urlToken = params.get("_auth");
     if (urlToken) {
+      clearSignedOutFlag();
       setAuthToken(urlToken);
       history.replaceState(null, "", location.pathname + location.hash);
       return { kind: "verifying" };
     }
+
+    // Step 1: explicit logout takes precedence over any leftover token in
+    // localStorage. Token survives only as a fallback for the (rare) case
+    // where logout's POST failed before the client could clear it.
+    if (isSignedOut()) return { kind: "signed_out" };
 
     return getAuthToken() ? { kind: "verifying" } : { kind: "loading" };
   });
@@ -78,7 +128,7 @@ function useAuthGate(): AuthState {
         }
         if (me.role === "admin" || me.role === "editor" || me.role === "viewer") {
           setReadOnly(me.role === "viewer");
-          setState({ kind: "ready", role: me.role });
+          setState({ kind: "ready", me, role: me.role });
         } else if (import.meta.env.DEV) {
           // Dev convenience: a stale token from before the role claim was
           // added has role=null. Drop it and let the loading branch silently
@@ -110,16 +160,20 @@ function useAuthGate(): AuthState {
     let cancelled = false;
 
     if (import.meta.env.DEV) {
-      // Step 4: silent dev mint — only when DEV_AUTH_ENABLED=true on the worker.
+      // Step 5: silent dev mint — only when DEV_AUTH_ENABLED=true on the worker.
       devSignIn("dev")
-        .then((resp) => {
+        .then(async (resp) => {
           if (cancelled) return;
-          if (resp.role === "admin" || resp.role === "editor" || resp.role === "viewer") {
-            setReadOnly(resp.role === "viewer");
-            setState({ kind: "ready", role: resp.role });
-          } else {
+          if (resp.role !== "admin" && resp.role !== "editor" && resp.role !== "viewer") {
             setState({ kind: "denied", username: resp.username });
+            return;
           }
+          setReadOnly(resp.role === "viewer");
+          // devSignIn doesn't return last_* — pull it separately so we can
+          // hydrate the view. Failure here is non-fatal: the user just lands
+          // on the URL hash (or the default book).
+          const me = await fetchAuthMe().catch(() => null);
+          setState({ kind: "ready", me, role: resp.role });
         })
         .catch((err: unknown) => {
           if (cancelled) return;
@@ -129,19 +183,19 @@ function useAuthGate(): AuthState {
           else setState({ kind: "error", message: String(err) });
         });
     } else {
-      // Step 5: production — hand off to DCS OAuth.
+      // Step 6: production — show the sign-in button (user must click to OAuth).
       setState({ kind: "missing" });
     }
 
     return () => { cancelled = true; };
   }, [state.kind]);
 
-  return state;
+  return [state, setState];
 }
 
 export function App() {
   const [loc, setLoc] = useState<Location>(() => parseHash());
-  const auth = useAuthGate();
+  const [auth, setAuth] = useAuthGate();
   const [sessionExpired, setSessionExpired] = useState(false);
   // useBook is hoisted here so its chapter cache survives Shell remounts
   // (which happen when the user navigates between chapters via the URL).
@@ -164,11 +218,56 @@ export function App() {
         : `#/${book}/${chapter}`;
   };
 
+  // Hydrate from server-side last-position. Fires once per auth session,
+  // only when `loc` is the default book — a bookmarked deep link (which
+  // makes `loc` non-default on mount) always wins. Reset on sign-out so the
+  // next sign-in re-hydrates instead of stranding the user on the default.
+  const hydratedRef = useRef(false);
+  useEffect(() => {
+    if (auth.kind !== "ready" || hydratedRef.current) return;
+    hydratedRef.current = true;
+    const me = auth.me;
+    if (!me?.lastBook || me.lastChapter === null || me.lastVerse === null) return;
+    if (!isDefaultLoc(loc)) return;
+    navigate(me.lastBook, me.lastChapter, me.lastVerse);
+  }, [auth, loc]);
+
+  // Debounced push of the current location to the server so the next sign-in
+  // on a different device / after a logout can land back here.
+  useEffect(() => {
+    if (auth.kind !== "ready") return;
+    const t = setTimeout(() => {
+      void updateLastLocation(loc.book, loc.chapter, loc.verse);
+    }, 1500);
+    return () => clearTimeout(t);
+  }, [auth.kind, loc.book, loc.chapter, loc.verse]);
+
   if (auth.kind === "loading" || auth.kind === "verifying") {
     return (
       <Stack alignItems="center" justifyContent="center" sx={{ height: "100vh" }} spacing={2}>
         <CircularProgress />
         <Typography variant="body2" color="text.secondary">signing in…</Typography>
+      </Stack>
+    );
+  }
+  if (auth.kind === "signed_out") {
+    const handleSignIn = () => {
+      clearSignedOutFlag();
+      if (import.meta.env.DEV) {
+        setAuth({ kind: "loading" });
+      } else {
+        location.href = "/api/auth/dcs/start";
+      }
+    };
+    return (
+      <Stack alignItems="center" justifyContent="center" sx={{ height: "100vh" }} spacing={2}>
+        <Typography variant="h6">You're signed out</Typography>
+        <Typography variant="body2" color="text.secondary">
+          Queued edits stay in your browser until you sign back in.
+        </Typography>
+        <Button variant="contained" onClick={handleSignIn} size="large">
+          {import.meta.env.DEV ? "Sign in (dev)" : "Sign in with Door43"}
+        </Button>
       </Stack>
     );
   }
@@ -213,7 +312,28 @@ export function App() {
     );
   }
 
-  const handleReSignIn = () => {
+  const handleSignOut = async () => {
+    // Best-effort server-side cleanup BEFORE we drop the bearer token, so
+    // the request actually carries Authorization. We don't await the result
+    // for the UI transition — the local token is what gates editing.
+    await authLogout();
+    setAuthToken(null);
+    try {
+      localStorage.setItem(SIGNED_OUT_KEY, "1");
+    } catch {
+      /* private mode */
+    }
+    // Strip the URL hash too: leaving #/JON/3 around would confuse the next
+    // boot into thinking the user requested a specific verse. Mirror that
+    // into React state (replaceState doesn't fire hashchange) so the next
+    // sign-in's hydration sees loc=default and pulls from the server.
+    history.replaceState(null, "", location.pathname);
+    setLoc({ book: DEFAULT_BOOK, chapter: 1, verse: 1 });
+    hydratedRef.current = false;
+    setAuth({ kind: "signed_out" });
+  };
+
+  const handleSessionExpired = () => {
     setAuthToken(null);
     if (import.meta.env.DEV) {
       location.reload();
@@ -240,7 +360,7 @@ export function App() {
           initialVerse={loc.verse}
           onNavigate={navigate}
           bookHook={bookHook}
-          onLogout={handleReSignIn}
+          onLogout={handleSignOut}
         />
       </Box>
       <Snackbar
@@ -251,7 +371,7 @@ export function App() {
           severity="warning"
           variant="filled"
           action={
-            <Button color="inherit" size="small" onClick={handleReSignIn}>
+            <Button color="inherit" size="small" onClick={handleSessionExpired}>
               Sign in
             </Button>
           }

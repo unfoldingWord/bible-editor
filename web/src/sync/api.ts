@@ -373,6 +373,11 @@ export interface MeResponse {
   userId: number;
   username: string | null;
   role: Role | null;
+  // Persisted last-visited location. Used to restore the view after sign-in
+  // (which round-trips through DCS OAuth and loses the URL hash).
+  lastBook: string | null;
+  lastChapter: number | null;
+  lastVerse: number | null;
 }
 
 // GET /api/auth/me — confirms the current Bearer token's identity + role.
@@ -382,6 +387,36 @@ export interface MeResponse {
 export async function fetchAuthMe(): Promise<MeResponse | null> {
   if (!getAuthToken()) return null;
   return request<MeResponse>(`/api/auth/me`);
+}
+
+// POST /api/auth/logout — best-effort DCS revoke + clears stored access
+// token. The caller is responsible for clearing the local JWT afterwards.
+export async function authLogout(): Promise<void> {
+  if (!getAuthToken()) return;
+  try {
+    await request<{ ok: true }>(`/api/auth/logout`, { method: "POST" });
+  } catch {
+    /* logout is best-effort — failure should never block the UI */
+  }
+}
+
+// PUT /api/users/me/location — fire-and-forget; App.tsx debounces calls so
+// we don't hammer D1 on every hashchange. Failures are silent — the URL hash
+// is still the source of truth in-session; this is just for cross-session.
+export async function updateLastLocation(
+  book: string,
+  chapter: number,
+  verse: number,
+): Promise<void> {
+  if (!getAuthToken()) return;
+  try {
+    await request<{ ok: true }>(`/api/users/me/location`, {
+      method: "PUT",
+      body: JSON.stringify({ book, chapter, verse }),
+    });
+  } catch {
+    /* non-critical */
+  }
 }
 
 export interface DevAuthResponse {

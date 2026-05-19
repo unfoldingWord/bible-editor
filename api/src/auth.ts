@@ -310,13 +310,16 @@ export async function callbackDcsAuth(c: AppContext): Promise<Response> {
     }
   }
 
-  // Upsert users row keyed by dcs_user_id.
+  // Upsert users row keyed by dcs_user_id. We stash the DCS access_token so
+  // /api/auth/logout can revoke it server-side (RFC 7009) — without it, the
+  // next sign-in silently re-auths against a live DCS cookie session.
   await c.env.DB.prepare(
-    `INSERT INTO users (dcs_user_id, dcs_username, dcs_full_name)
-     VALUES (?1, ?2, ?3)
-     ON CONFLICT(dcs_user_id) DO UPDATE SET dcs_username = ?2, dcs_full_name = ?3`,
+    `INSERT INTO users (dcs_user_id, dcs_username, dcs_full_name, dcs_access_token)
+     VALUES (?1, ?2, ?3, ?4)
+     ON CONFLICT(dcs_user_id) DO UPDATE SET
+       dcs_username = ?2, dcs_full_name = ?3, dcs_access_token = ?4`,
   )
-    .bind(dcsUser.id, dcsUser.login, dcsUser.full_name ?? dcsUser.login)
+    .bind(dcsUser.id, dcsUser.login, dcsUser.full_name ?? dcsUser.login, accessToken)
     .run();
 
   const userRow = await c.env.DB.prepare(
@@ -333,13 +336,27 @@ export async function callbackDcsAuth(c: AppContext): Promise<Response> {
   return c.redirect(`${origin}/?_auth=${encodeURIComponent(token)}`, 302);
 }
 
-// GET /api/auth/me — returns identity from the bearer token.
+// GET /api/auth/me — returns identity from the bearer token plus the user's
+// last-visited location (used by the SPA to restore where they left off when
+// the URL hash is missing — e.g. after the OAuth callback round-trip).
 export async function authMe(c: AppContext): Promise<Response> {
   const userId = (c as AppContext).get("userId");
   const username = (c as AppContext).get("username");
   const role = (c as AppContext).get("role");
   if (!userId) return c.json({ error: "unauthorized" }, 401);
-  return c.json({ userId, username: username ?? null, role: role ?? null });
+  const row = await c.env.DB.prepare(
+    `SELECT last_book, last_chapter, last_verse FROM users WHERE id = ?1`,
+  )
+    .bind(userId)
+    .first<{ last_book: string | null; last_chapter: number | null; last_verse: number | null }>();
+  return c.json({
+    userId,
+    username: username ?? null,
+    role: role ?? null,
+    lastBook: row?.last_book ?? null,
+    lastChapter: row?.last_chapter ?? null,
+    lastVerse: row?.last_verse ?? null,
+  });
 }
 
 // POST /api/auth/refresh — exchanges a current-or-recently-expired bearer
@@ -455,4 +472,87 @@ export async function mintDevToken(c: AppContext, username: string): Promise<Res
   const ttlSeconds = Number.isFinite(ttl) && ttl > 0 ? ttl : 1209600;
   const token = await mintToken(c, userId, username, role);
   return c.json({ token, userId, username, role, expiresIn: ttlSeconds });
+}
+
+// ── Logout ────────────────────────────────────────────────────────────────
+
+// POST /api/auth/logout — clears the user's DCS access token and best-effort
+// revokes it on DCS so the next sign-in actually prompts for credentials
+// instead of silently re-issuing against a live DCS cookie session.
+//
+// The JWT itself is bearer-only (stored only in the SPA's localStorage) — the
+// client clears it after this call, which is what makes our session dead.
+// We don't maintain a server-side token blocklist for that reason.
+export async function authLogout(c: AppContext): Promise<Response> {
+  const userId = (c as AppContext).get("userId");
+  if (!userId) return c.json({ error: "unauthorized" }, 401);
+
+  const row = await c.env.DB.prepare(
+    `SELECT dcs_access_token FROM users WHERE id = ?1`,
+  )
+    .bind(userId)
+    .first<{ dcs_access_token: string | null }>();
+
+  if (row?.dcs_access_token && c.env.DCS_CLIENT_ID && c.env.DCS_CLIENT_SECRET) {
+    // RFC 7009 token revocation. Gitea/DCS expects the same client creds as
+    // the token exchange. Fire-and-forget — a non-2xx here just means the DCS
+    // session may persist; the local JWT is gone either way.
+    try {
+      await fetch(`${c.env.DCS_BASE_URL}/login/oauth/revoke`, {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          token: row.dcs_access_token,
+          client_id: c.env.DCS_CLIENT_ID,
+          client_secret: c.env.DCS_CLIENT_SECRET,
+        }).toString(),
+      });
+    } catch {
+      /* best-effort */
+    }
+  }
+
+  // Clear stored token regardless of revoke outcome — keeping a stale token
+  // around would do nothing but accumulate sensitive material.
+  await c.env.DB.prepare(
+    `UPDATE users SET dcs_access_token = NULL WHERE id = ?1`,
+  )
+    .bind(userId)
+    .run();
+
+  return c.json({ ok: true });
+}
+
+// ── Last-position memory ───────────────────────────────────────────────────
+
+// PUT /api/users/me/location — persist where the translator is reading. The
+// SPA pushes this on hash change (debounced) so /api/auth/me can hydrate the
+// view after sign-in. Stored on the users row directly (1 row per user;
+// no history; cheap).
+export async function updateLastLocation(c: AppContext): Promise<Response> {
+  const userId = (c as AppContext).get("userId");
+  if (!userId) return c.json({ error: "unauthorized" }, 401);
+
+  let body: { book?: unknown; chapter?: unknown; verse?: unknown } = {};
+  try {
+    body = await c.req.json();
+  } catch {
+    return c.json({ error: "invalid_body" }, 400);
+  }
+
+  const book = typeof body.book === "string" ? body.book.toUpperCase() : null;
+  const chapter = typeof body.chapter === "number" && Number.isInteger(body.chapter) ? body.chapter : null;
+  const verse = typeof body.verse === "number" && Number.isInteger(body.verse) ? body.verse : null;
+
+  if (!book || !/^[A-Z0-9]{1,5}$/.test(book) || chapter === null || chapter < 0 || verse === null || verse < 0) {
+    return c.json({ error: "invalid_location" }, 400);
+  }
+
+  await c.env.DB.prepare(
+    `UPDATE users SET last_book = ?1, last_chapter = ?2, last_verse = ?3 WHERE id = ?4`,
+  )
+    .bind(book, chapter, verse, userId)
+    .run();
+
+  return c.json({ ok: true });
 }
