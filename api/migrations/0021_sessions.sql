@@ -8,6 +8,13 @@
 -- in the non-HttpOnly `be_csrf` cookie AND in the `X-CSRF-Token` header
 -- the client mirrors back on writes. Attacker without script access on
 -- our origin can't read the cookie to mirror it.
+--
+-- 0001_init.sql created an earlier `sessions` shape (no csrf_token /
+-- last_seen_at / user_agent / ip; `revoked` instead of `revoked_at`).
+-- It was never actually used in prod (Wave 1/2 auth was Bearer JWTs in
+-- localStorage), so drop-and-recreate is safe and lets this migration
+-- run on databases where 0001 already landed.
+DROP TABLE IF EXISTS sessions;
 CREATE TABLE sessions (
   id           TEXT PRIMARY KEY,
   user_id      INTEGER NOT NULL REFERENCES users(id),
