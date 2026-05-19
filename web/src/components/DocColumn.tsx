@@ -7,6 +7,7 @@ import { markHighlightSx } from "../lib/highlightStyles";
 import { HebrewLine } from "./HebrewLine";
 import type { LexiconEntry } from "../hooks/useLexicon";
 import type { FindMatch } from "./FindReplaceOverlay";
+import { formatVerseLabel, isFirstOfRange, isRangeRow } from "../lib/verseRange";
 import {
   matchSourceVerse,
   renderFindMatchesByOffsets,
@@ -21,6 +22,10 @@ interface SearchState {
 
 interface Props {
   bibleVersion: string;
+  // Pre-expanded per-version index: verses[7] returns the 6-9 range row when
+  // verse 7 is inside a UST multi-verse block. ScriptureColumn builds this
+  // via buildVerseIndex; the wire shape (keyed by verse_start) stays in
+  // versesByVersion at the Shell level.
   versesByVerseNum: Record<number, VerseDto>;
   verseNumbers: number[];
   chapter: number;
@@ -140,15 +145,23 @@ export function DocColumn({
         {verseNumbers.map((v) => {
           const dto = versesByVerseNum[v];
           if (!dto) return null;
-          const isActive = v === activeVerse;
+          // Multi-verse rows are emitted once at the start of their span;
+          // verses inside the range (e.g. 7, 8, 9 of a UST 6-9 block) point
+          // at the same DTO via the index but skip rendering here.
+          if (!isFirstOfRange(dto, v)) return null;
+          // "Active" if the user's navigated verse is inside this DTO's
+          // range. For singletons this reduces to v === activeVerse.
+          const isActive = activeVerse >= dto.verse && activeVerse <= (dto.verse_end ?? dto.verse);
           const highlights = isActive
             ? highlightsFor(bibleVersion, dto.content, activeNoteQuote, activeNoteOccurrence)
             : null;
           return (
             <VerseSpan
-              key={v}
+              key={dto.verse}
               chapter={chapter}
-              verseNum={v}
+              verseNum={dto.verse}
+              verseLabel={formatVerseLabel(dto)}
+              isRange={isRangeRow(dto)}
               bibleVersion={bibleVersion}
               text={dto.plain_text ?? ""}
               content={dto.content}
@@ -160,9 +173,9 @@ export function DocColumn({
               search={search ?? null}
               findActiveMatch={findActiveMatch ?? null}
               spanRef={isActive ? activeRef : null}
-              onClick={() => onSelectVerse(v)}
-              onAlign={() => onOpenAligner(v)}
-              onEdit={(plain) => onEditVerse(v, plain, dto)}
+              onClick={() => onSelectVerse(dto.verse)}
+              onAlign={() => onOpenAligner(dto.verse)}
+              onEdit={(plain) => onEditVerse(dto.verse, plain, dto)}
             />
           );
         })}
@@ -174,6 +187,8 @@ export function DocColumn({
 function VerseSpan({
   chapter,
   verseNum,
+  verseLabel,
+  isRange,
   bibleVersion,
   text,
   content,
@@ -190,7 +205,13 @@ function VerseSpan({
   onEdit,
 }: {
   chapter: number;
+  // Canonical verse_start for this row (used for find-cell keys + alignment).
   verseNum: number;
+  // Display label — "6-9" for ranges, "7" for singletons. See formatVerseLabel.
+  verseLabel: string;
+  // True when verseNum is a range row (verse_end > verse). Used to style the
+  // verse marker so users can tell the block spans multiple Bible verses.
+  isRange: boolean;
   bibleVersion: string;
   text: string;
   content?: unknown;
@@ -324,13 +345,13 @@ function VerseSpan({
         style={{
           fontFamily: "monospace",
           fontSize: 10,
-          fontWeight: 600,
-          color: "#9aa0a6",
+          fontWeight: isRange ? 700 : 600,
+          color: isRange ? "#014263" : "#9aa0a6",
           verticalAlign: "1px",
           marginRight: 4,
         }}
       >
-        {verseNum === 0 ? "intro" : `${chapter}:${verseNum}`}
+        {verseNum === 0 ? "intro" : `${chapter}:${verseLabel}`}
       </span>
       {!readOnly && (
         <Tooltip title={`align verse ${verseNum}`}>

@@ -14,6 +14,7 @@ import type { LexiconEntry } from "../hooks/useLexicon";
 import type { ChapterState } from "../hooks/useBook";
 import { highlightsFor, renderHighlightedHTML, type HighlightKey } from "../lib/highlight";
 import { markHighlightSx } from "../lib/highlightStyles";
+import { buildVerseIndex, formatVerseLabel, isFirstOfRange, isRangeRow } from "../lib/verseRange";
 import {
   classifySourceQuery,
   matchSourceVerse,
@@ -244,6 +245,18 @@ export function ScriptureColumn({
 
   const isHebrew = !!versesByVersion["UHB"];
 
+  // Per-version expansion: verses[bv][7] resolves to the 6-9 range row when
+  // the user navigates to verse 7 inside a UST multi-verse block. The wire
+  // shape (versesByVersion) keys only on the start of a range; this index
+  // makes lookups by-any-verse-in-range work. See web/src/lib/verseRange.ts.
+  const indexByVersion = useMemo(() => {
+    const out: Record<string, Record<number, VerseDto>> = {};
+    for (const bv of Object.keys(versesByVersion)) {
+      out[bv] = buildVerseIndex(versesByVersion[bv]);
+    }
+    return out;
+  }, [versesByVersion]);
+
   return (
     <Box
       sx={{
@@ -375,7 +388,7 @@ export function ScriptureColumn({
         )}
         {mode === "stacked" ? (
           <StackedBody
-            versesByVersion={versesByVersion}
+            indexByVersion={indexByVersion}
             verseNumbers={verseNumbers}
             activeVerse={activeVerse}
             activeRef={activeRef}
@@ -419,7 +432,7 @@ export function ScriptureColumn({
               <DocColumn
                 key={v}
                 bibleVersion={v}
-                versesByVerseNum={versesByVersion[v] ?? {}}
+                versesByVerseNum={indexByVersion[v] ?? {}}
                 verseNumbers={verseNumbers}
                 chapter={chapter}
                 activeVerse={activeVerse}
@@ -444,7 +457,7 @@ export function ScriptureColumn({
 }
 
 function StackedBody({
-  versesByVersion,
+  indexByVersion,
   verseNumbers,
   activeVerse,
   activeRef,
@@ -460,7 +473,10 @@ function StackedBody({
   onEditVerse,
   locked,
 }: {
-  versesByVersion: Record<string, Record<number, VerseDto>>;
+  // Per-version expansion of versesByVersion so verses inside a multi-verse
+  // range row (`\v 6-9`) resolve to the canonical row at verse=6. See
+  // web/src/lib/verseRange.ts.
+  indexByVersion: Record<string, Record<number, VerseDto>>;
   verseNumbers: number[];
   activeVerse: number;
   activeRef: React.MutableRefObject<HTMLDivElement | null>;
@@ -476,9 +492,9 @@ function StackedBody({
   onEditVerse: (verseNum: number, bibleVersion: string, plain: string, base: VerseDto) => void;
   locked: boolean;
 }) {
-  const ult = versesByVersion["ULT"] ?? {};
-  const ust = versesByVersion["UST"] ?? {};
-  const uhb = versesByVersion["UHB"] ?? versesByVersion["UGNT"] ?? {};
+  const ult = indexByVersion["ULT"] ?? {};
+  const ust = indexByVersion["UST"] ?? {};
+  const uhb = indexByVersion["UHB"] ?? indexByVersion["UGNT"] ?? {};
   const uhbLabel = isHebrew ? "UHB" : "UGNT";
   return (
     <Box
@@ -499,6 +515,11 @@ function StackedBody({
           const ultHL = highlightsFor("ULT", ultV?.content, activeNoteQuote, activeNoteOccurrence);
           const ustHL = highlightsFor("UST", ustV?.content, activeNoteQuote, activeNoteOccurrence);
           const uhbHL = highlightsFor(uhbLabel, uhbV?.content, activeNoteQuote, activeNoteOccurrence);
+          // For multi-verse blocks, PATCH and find/replace target the canonical
+          // row at verse_start (e.g. 6 for a 6-9 range), not the active integer.
+          const ultStart = ultV?.verse ?? v;
+          const ustStart = ustV?.verse ?? v;
+          const uhbStart = uhbV?.verse ?? v;
           return (
             <Paper
               ref={activeRef}
@@ -520,40 +541,40 @@ function StackedBody({
                 {v === 0 ? "intro" : `${chapter}:${v}`}
               </Typography>
               <ActiveLine
-                label="ULT"
+                label={ultV && isRangeRow(ultV) ? `ULT ${formatVerseLabel(ultV)}` : "ULT"}
                 chapter={chapter}
-                verseNum={v}
+                verseNum={ultStart}
                 text={ultV?.plain_text ?? ""}
                 content={ultV?.content}
                 highlights={ultHL}
                 search={search}
                 findActiveMatch={findActiveMatch}
                 editable={!locked}
-                onOpenAligner={() => onOpenAligner(v, "ULT")}
+                onOpenAligner={() => onOpenAligner(ultStart, "ULT")}
                 onEditPlain={
-                  ultV ? (plain) => onEditVerse(v, "ULT", plain, ultV) : undefined
+                  ultV ? (plain) => onEditVerse(ultStart, "ULT", plain, ultV) : undefined
                 }
               />
               <ActiveLine
-                label="UST"
+                label={ustV && isRangeRow(ustV) ? `UST ${formatVerseLabel(ustV)}` : "UST"}
                 chapter={chapter}
-                verseNum={v}
+                verseNum={ustStart}
                 text={ustV?.plain_text ?? ""}
                 content={ustV?.content}
                 highlights={ustHL}
                 search={search}
                 findActiveMatch={findActiveMatch}
                 editable
-                onOpenAligner={() => onOpenAligner(v, "UST")}
+                onOpenAligner={() => onOpenAligner(ustStart, "UST")}
                 onEditPlain={
-                  ustV ? (plain) => onEditVerse(v, "UST", plain, ustV) : undefined
+                  ustV ? (plain) => onEditVerse(ustStart, "UST", plain, ustV) : undefined
                 }
               />
               {uhbV && (
                 <ActiveLine
-                  label={uhbLabel}
+                  label={isRangeRow(uhbV) ? `${uhbLabel} ${formatVerseLabel(uhbV)}` : uhbLabel}
                   chapter={chapter}
-                  verseNum={v}
+                  verseNum={uhbStart}
                   text={uhbV.plain_text ?? ""}
                   content={uhbV.content}
                   highlights={uhbHL}
@@ -567,6 +588,12 @@ function StackedBody({
             </Paper>
           );
         }
+        // Only render this version's cell when it's the start of its row's
+        // span — keeps a UST 6-9 block from re-rendering on every verse 7,8,9
+        // row underneath it. For singletons, dto.verse === v always, so the
+        // first-of-range check passes naturally.
+        const showUlt = ultV && isFirstOfRange(ultV, v);
+        const showUst = ustV && isFirstOfRange(ustV, v);
         return (
           <Box
             key={v}
@@ -609,39 +636,43 @@ function StackedBody({
             >
               {v === 0 ? "intro" : `${chapter}:${v}`}
             </Typography>
-            <Typography
-              component="span"
-              variant="caption"
-              sx={{
-                gridColumn: 1,
-                gridRow: 2,
-                fontFamily: "monospace",
-                color: "text.disabled",
-                fontWeight: 600,
-                fontSize: 10,
-                textAlign: "right",
-              }}
-            >
-              ULT
-            </Typography>
-            <Box
-              data-find-cell={`${chapter}-${v}-ULT`}
-              sx={{ gridColumn: 2, gridRow: 2, minWidth: 0 }}
-            >
-              <FindAwareText
-                text={ultV?.plain_text ?? ""}
-                search={search}
-                activeRange={
-                  findActiveMatch &&
-                  findActiveMatch.chapter === chapter &&
-                  findActiveMatch.verse === v &&
-                  findActiveMatch.bibleVersion === "ULT"
-                    ? { start: findActiveMatch.startIndex, end: findActiveMatch.endIndex }
-                    : null
-                }
-              />
-            </Box>
-            {ustV && (
+            {showUlt && (
+              <>
+                <Typography
+                  component="span"
+                  variant="caption"
+                  sx={{
+                    gridColumn: 1,
+                    gridRow: 2,
+                    fontFamily: "monospace",
+                    color: "text.disabled",
+                    fontWeight: 600,
+                    fontSize: 10,
+                    textAlign: "right",
+                  }}
+                >
+                  {isRangeRow(ultV) ? `ULT ${formatVerseLabel(ultV)}` : "ULT"}
+                </Typography>
+                <Box
+                  data-find-cell={`${chapter}-${ultV.verse}-ULT`}
+                  sx={{ gridColumn: 2, gridRow: 2, minWidth: 0 }}
+                >
+                  <FindAwareText
+                    text={ultV.plain_text ?? ""}
+                    search={search}
+                    activeRange={
+                      findActiveMatch &&
+                      findActiveMatch.chapter === chapter &&
+                      findActiveMatch.verse === ultV.verse &&
+                      findActiveMatch.bibleVersion === "ULT"
+                        ? { start: findActiveMatch.startIndex, end: findActiveMatch.endIndex }
+                        : null
+                    }
+                  />
+                </Box>
+              </>
+            )}
+            {showUst && (
               <>
                 <Typography
                   component="span"
@@ -656,10 +687,10 @@ function StackedBody({
                     textAlign: "right",
                   }}
                 >
-                  UST
+                  {isRangeRow(ustV) ? `UST ${formatVerseLabel(ustV)}` : "UST"}
                 </Typography>
                 <Box
-                  data-find-cell={`${chapter}-${v}-UST`}
+                  data-find-cell={`${chapter}-${ustV.verse}-UST`}
                   sx={{ gridColumn: 2, gridRow: 3, minWidth: 0 }}
                 >
                   <FindAwareText
@@ -668,7 +699,7 @@ function StackedBody({
                     activeRange={
                       findActiveMatch &&
                       findActiveMatch.chapter === chapter &&
-                      findActiveMatch.verse === v &&
+                      findActiveMatch.verse === ustV.verse &&
                       findActiveMatch.bibleVersion === "UST"
                         ? { start: findActiveMatch.startIndex, end: findActiveMatch.endIndex }
                         : null

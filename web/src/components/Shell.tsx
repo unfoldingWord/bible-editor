@@ -24,6 +24,7 @@ import { api } from "../sync/api";
 import type { TnRow, TqRow, TwlRow, VerseDto } from "../sync/api";
 import { smartEditVerse } from "../lib/replace";
 import { verseHasUnalignedWork } from "../lib/alignment";
+import { concatSourceRange, formatVerseLabel } from "../lib/verseRange";
 import { buildTnQuickRequest } from "../lib/tnQuickRequest";
 import { findSourceForTargetText } from "../lib/highlight";
 import { TimelineRail } from "./TimelineRail";
@@ -310,6 +311,28 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     [data],
   );
 
+  // The widest range row across all versions that covers activeVerse. Used to
+  // scope TN/TQ/TWL filtering in ResourceColumn — if UST 6-9 covers the active
+  // verse, the user sees notes for verses 6-9, not just the navigated one.
+  // For singletons (the common case) this reduces to [activeVerse, activeVerse].
+  const displayVerseRange = useMemo<readonly [number, number]>(() => {
+    if (!data || activeVerse === 0) return [activeVerse, activeVerse] as const;
+    let start = activeVerse;
+    let end = activeVerse;
+    for (const byVerse of Object.values(data.verses)) {
+      for (const k of Object.keys(byVerse)) {
+        const dto = byVerse[Number(k)];
+        if (!dto) continue;
+        const rEnd = dto.verse_end ?? dto.verse;
+        if (dto.verse <= activeVerse && activeVerse <= rEnd) {
+          if (dto.verse < start) start = dto.verse;
+          if (rEnd > end) end = rEnd;
+        }
+      }
+    }
+    return [start, end] as const;
+  }, [data, activeVerse]);
+
   const visibleVersions = useMemo(
     () => enabledVersions.filter((v) => availableVersions.includes(v)),
     [enabledVersions, availableVersions],
@@ -475,8 +498,19 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     if (!sourceData) return undefined;
     const sourceLabel = sourceData.verses["UHB"] ? "UHB" : "UGNT";
     const targetVerse = sourceData.verses[alignerTarget.bibleVersion]?.[alignerTarget.verse] ?? null;
-    const sourceVerse = sourceData.verses[sourceLabel]?.[alignerTarget.verse] ?? null;
-    const twlForVerse = sourceData.twl.filter((r) => r.verse === alignerTarget.verse);
+    // Multi-verse target (e.g. UST 6-9): expand the source side by
+    // concatenating per-verse UHB/UGNT rows across the same span. The
+    // aligner sees a flat token stream and the TWL list widens to include
+    // every verse the range covers.
+    const rangeEnd = targetVerse?.verse_end ?? alignerTarget.verse;
+    const rangeStart = targetVerse?.verse ?? alignerTarget.verse;
+    const sourceVerse =
+      rangeEnd > rangeStart
+        ? concatSourceRange(sourceData.verses[sourceLabel] ?? {}, rangeStart, rangeEnd)
+        : sourceData.verses[sourceLabel]?.[alignerTarget.verse] ?? null;
+    const twlForVerse = sourceData.twl.filter(
+      (r) => r.verse >= rangeStart && r.verse <= rangeEnd,
+    );
     return {
       book,
       chapter: alignerTarget.chapter,
@@ -505,7 +539,13 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   }, [alignerTarget, data, chapter, bookHook, book]);
 
   const alignmentBadge = alignerTarget
-    ? `${alignerTarget.chapter}:${alignerTarget.verse === 0 ? "i" : alignerTarget.verse}`
+    ? `${alignerTarget.chapter}:${
+        alignerTarget.verse === 0
+          ? "i"
+          : alignmentTabProps?.verse
+            ? formatVerseLabel(alignmentTabProps.verse)
+            : alignerTarget.verse
+      }`
     : undefined;
 
   // Initial load (or retry from scratch) — no data to show yet. We still
@@ -797,6 +837,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         >
         <ResourceColumn
           activeVerse={activeVerse}
+          displayVerseRange={displayVerseRange}
           tn={data.tn}
           tq={data.tq}
           twl={data.twl}

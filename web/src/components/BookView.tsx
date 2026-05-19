@@ -20,6 +20,7 @@ import type { FindMatch } from "./FindReplaceOverlay";
 import type { FindQuery } from "./ScriptureColumn";
 import { HebrewLine } from "./HebrewLine";
 import type { LexiconEntry } from "../hooks/useLexicon";
+import { formatVerseLabel, isRangeRow } from "../lib/verseRange";
 import {
   classifySourceQuery,
   matchSourceVerse,
@@ -579,12 +580,12 @@ function VerseCell({
         sx={{
           fontFamily: "monospace",
           fontSize: 10,
-          fontWeight: 600,
-          color: "#9aa0a6",
+          fontWeight: isRangeRow(dto) ? 700 : 600,
+          color: isRangeRow(dto) ? "#014263" : "#9aa0a6",
           mr: 0.5,
         }}
       >
-        {verseNum === 0 ? "intro" : `${chapter}:${verseNum}`}
+        {verseNum === 0 ? "intro" : `${chapter}:${formatVerseLabel(dto)}`}
       </Typography>
       {!readOnly && (
         <Tooltip title={`align verse ${verseNum}`}>

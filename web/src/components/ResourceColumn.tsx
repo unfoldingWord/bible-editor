@@ -28,6 +28,11 @@ export interface AlignmentTabProps {
 
 interface Props {
   activeVerse: number;
+  // Inclusive [start, end] of verses to surface in TN/TQ/TWL panels. Equals
+  // [activeVerse, activeVerse] for the common singleton case; widens to the
+  // span of any multi-verse row (e.g. UST 6-9) that covers activeVerse so
+  // notes/words for verses 6,7,8,9 all show when the user navigates to v=7.
+  displayVerseRange: readonly [number, number];
   tn: TnRow[];
   tq: TqRow[];
   twl: TwlRow[];
@@ -139,6 +144,7 @@ function groupByVerse<T extends { verse: number }>(rows: T[]): Array<[number, T[
 
 export function ResourceColumn({
   activeVerse,
+  displayVerseRange,
   tn,
   tq,
   twl,
@@ -181,17 +187,18 @@ export function ResourceColumn({
     savePinned(next);
   };
 
+  const [rangeStart, rangeEnd] = displayVerseRange;
   const tnForVerse = useMemo(
-    () => sortBySortOrder(tn.filter((r) => r.verse === activeVerse)),
-    [tn, activeVerse],
+    () => sortBySortOrder(tn.filter((r) => r.verse >= rangeStart && r.verse <= rangeEnd)),
+    [tn, rangeStart, rangeEnd],
   );
   const tqForVerse = useMemo(
-    () => tq.filter((r) => r.verse === activeVerse),
-    [tq, activeVerse],
+    () => tq.filter((r) => r.verse >= rangeStart && r.verse <= rangeEnd),
+    [tq, rangeStart, rangeEnd],
   );
   const twlForVerse = useMemo(
-    () => sortBySortOrder(twl.filter((r) => r.verse === activeVerse)),
-    [twl, activeVerse],
+    () => sortBySortOrder(twl.filter((r) => r.verse >= rangeStart && r.verse <= rangeEnd)),
+    [twl, rangeStart, rangeEnd],
   );
 
   // Pinned sections show the whole chapter, grouped by verse. Within each
