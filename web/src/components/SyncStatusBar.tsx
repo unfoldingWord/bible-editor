@@ -13,7 +13,9 @@ import ErrorOutlineIcon from "@mui/icons-material/ErrorOutline";
 import RefreshIcon from "@mui/icons-material/Refresh";
 import DeleteOutlineIcon from "@mui/icons-material/DeleteOutline";
 import WarningAmberIcon from "@mui/icons-material/WarningAmber";
+import EditNoteIcon from "@mui/icons-material/EditNote";
 import { onOutboxResult, outbox, type OutboxOp, type OpTarget } from "../sync/outbox";
+import { drafts, type DraftRecord } from "../sync/drafts";
 
 // If we believe we're online but haven't seen a successful save in this
 // long while pending ops exist, treat it as effectively offline —
@@ -42,6 +44,13 @@ function formatTarget(t: OpTarget): string {
 export function SyncStatusBar() {
   const [ops, setOps] = useState<OutboxOp[]>([]);
   useEffect(() => outbox.subscribe(setOps), []);
+
+  // Draft count chip — unsaved typing the user hasn't clicked Save on yet.
+  // Distinct from outbox "saving N": those are in-flight to the server;
+  // drafts haven't left the browser.
+  const [draftList, setDraftList] = useState<DraftRecord[]>([]);
+  useEffect(() => drafts.subscribe(setDraftList), []);
+  const draftCount = draftList.length;
 
   // Track navigator.onLine + last successful drain so we can distinguish
   // "actively saving" from "queueing because we have no internet". A separate
@@ -180,9 +189,32 @@ export function SyncStatusBar() {
 
   const showFloating = conflicts.length > 0 || failed.length > 0;
 
+  // The drafts chip rides alongside the outbox chip. It surfaces unsaved
+  // typing — distinct from "saving N" which is server in-flight.
+  const draftsChip = draftCount > 0 ? (
+    <Tooltip
+      title={`${draftCount} unsaved edit${draftCount === 1 ? "" : "s"} — orange-bordered fields haven't been saved yet`}
+    >
+      <Chip
+        icon={<EditNoteIcon />}
+        label={`${draftCount} unsaved`}
+        size="small"
+        variant="outlined"
+        sx={{
+          color: "#E59D33",
+          borderColor: "#E59D33",
+          "& .MuiChip-icon": { color: "#E59D33" },
+        }}
+      />
+    </Tooltip>
+  ) : null;
+
   return (
     <>
-      {inline}
+      <Stack direction="row" spacing={0.5} alignItems="center">
+        {draftsChip}
+        {inline}
+      </Stack>
       {showFloating && (
         <Box
           sx={{

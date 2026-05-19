@@ -22,6 +22,7 @@ import { useAiDrafts } from "../hooks/useAiDrafts";
 import { outbox } from "../sync/outbox";
 import { api } from "../sync/api";
 import type { TnRow, TqRow, TwlRow, VerseDto } from "../sync/api";
+import { drafts, verseKey } from "../sync/drafts";
 import { smartEditVerse } from "../lib/replace";
 import { verseHasUnalignedWork } from "../lib/alignment";
 import { concatSourceRange, formatVerseLabel } from "../lib/verseRange";
@@ -39,6 +40,7 @@ import { SyncStatusBar } from "./SyncStatusBar";
 import { pipelineStore, type PipelineJob } from "../sync/pipelineStore";
 import { onOutboxResult } from "../sync/outbox";
 import { AiCompletionToasts } from "./AiCompletionToasts";
+import { UnsavedToasts } from "./UnsavedToasts";
 import { collectStrongs } from "./HebrewLine";
 
 interface AlignerTarget {
@@ -591,11 +593,29 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     void outbox.enqueueRow(kind, row.id, row.version, patch as Record<string, unknown>, { ...opts, book: row.book });
   };
 
-  // Plain-text edit pipeline shared by the doc / book / aligner-strip
-  // entry points. Routes through smartEditVerse so unchanged regions of
-  // the verse keep their `\zaln-s` milestones and only the affected
-  // milestones get split / re-tokenized.
-  const persistVerseEdit = (
+  // Draft-write path. Every keystroke in a verse-text cell calls this; it
+  // stashes the plain text in IndexedDB so unsaved typing survives tab
+  // close / chapter navigation. No PATCH fires here — only on saveVerseDraft.
+  const stashVerseDraft = (
+    chapterNum: number,
+    verseNum: number,
+    bibleVersion: string,
+    plain: string,
+    base: VerseDto,
+  ) => {
+    void drafts.set(
+      verseKey(book, chapterNum, verseNum, bibleVersion),
+      { plainText: plain },
+      base.version,
+      { kind: "verse", book, chapter: chapterNum, verse: verseNum, bibleVersion },
+    );
+  };
+
+  // User clicked Save on a verse cell. Runs smartEditVerse so unchanged
+  // regions keep their `\zaln-s` milestones, applies the new content
+  // locally so highlights re-render, then enqueues. Outbox-result listener
+  // (installed in main.ts) clears the draft on 200.
+  const saveVerseDraft = (
     chapterNum: number,
     verseNum: number,
     bibleVersion: string,
@@ -758,7 +778,10 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
             });
           }}
           onEditBookVerse={(ch, verseNum, bibleVersion, plain, base) => {
-            persistVerseEdit(ch, verseNum, bibleVersion, plain, base);
+            stashVerseDraft(ch, verseNum, bibleVersion, plain, base);
+          }}
+          onSaveBookVerse={(ch, verseNum, bibleVersion, plain, base) => {
+            saveVerseDraft(ch, verseNum, bibleVersion, plain, base);
           }}
           onOpenBookAligner={(ch, v, bv) => openAligner(ch, v, bv)}
           onReplaceVerse={(ch, verseNum, bibleVersion, newContent, newPlainText, base) => {
@@ -796,7 +819,10 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
             saveToStorage(ENABLED_VERSIONS_KEY, versions);
           }}
           onEditVerse={(verseNum, bibleVersion, plain, base) => {
-            persistVerseEdit(chapter, verseNum, bibleVersion, plain, base);
+            stashVerseDraft(chapter, verseNum, bibleVersion, plain, base);
+          }}
+          onSaveVerse={(verseNum, bibleVersion, plain, base) => {
+            saveVerseDraft(chapter, verseNum, bibleVersion, plain, base);
           }}
           onOpenAligner={(v, bv) => openAligner(chapter, v, bv)}
           scrollNonce={scrollNonce}
@@ -994,7 +1020,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
             if (activeNoteId === id) setActiveNoteId(null);
             void outbox.enqueueDeleteRow("tn", id, row.version, row.book);
           }}
-          onWordChange={(id, patch) => {
+          onWordSave={(id, patch) => {
             const row = data.twl.find((r) => r.id === id);
             if (row) enqueueRow("twl", row, patch);
           }}
@@ -1005,7 +1031,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
             if (activeWordId === id) setActiveWordId(null);
             void outbox.enqueueDeleteRow("twl", id, row.version, row.book);
           }}
-          onQuestionChange={(id, patch) => {
+          onQuestionSave={(id, patch) => {
             const row = data.tq.find((r) => r.id === id);
             if (row) enqueueRow("tq", row, patch);
           }}
@@ -1051,6 +1077,37 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           setActiveNoteId(rowId);
           setActiveWordId(null);
           requestScrollToActive();
+        }}
+      />
+      <UnsavedToasts
+        book={book}
+        onSaveVerseDraft={(b, ch, v, bv) => {
+          if (b !== book) return;
+          // Look up the latest plain from the draft (avoids racing with
+          // a still-pending typing flurry) and the base from whichever
+          // cache holds the chapter — current chapter via data.verses,
+          // book mode via bookHook.chapters.
+          void drafts.get(verseKey(b, ch, v, bv)).then((rec) => {
+            const payload = rec?.payload as { plainText?: string } | undefined;
+            const plain = payload?.plainText;
+            if (typeof plain !== "string") return;
+            const base =
+              ch === chapter
+                ? data?.verses[bv]?.[v]
+                : bookHook?.chapters.get(ch)?.kind === "ready"
+                  ? (bookHook.chapters.get(ch) as { kind: "ready"; data: { verses: Record<string, Record<number, VerseDto>> } }).data.verses[bv]?.[v]
+                  : undefined;
+            if (!base) return;
+            saveVerseDraft(ch, v, bv, plain, base);
+          });
+        }}
+        onJumpTo={(b, ch, v) => {
+          if (b !== book) return;
+          if (ch !== chapter) onNavigate?.(b, ch, v);
+          else {
+            setActiveVerse(v);
+            requestScrollToActive();
+          }
         }}
       />
       <PipelineStatusBar

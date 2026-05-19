@@ -1,11 +1,14 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Box, InputAdornment, Paper, Stack, TextField, IconButton, Typography, Tooltip } from "@mui/material";
 import DeleteOutlineIcon from "@mui/icons-material/DeleteOutline";
 import DragIndicatorIcon from "@mui/icons-material/DragIndicator";
 import TranslateIcon from "@mui/icons-material/Translate";
+import SaveIcon from "@mui/icons-material/Save";
+import SaveOutlinedIcon from "@mui/icons-material/SaveOutlined";
 import type { TwlRow } from "../sync/api";
 import { useCatalogs } from "../hooks/useCatalogs";
 import { CatalogPicker } from "./CatalogPicker";
+import { drafts, rowKey, draftDirtyBorderSx } from "../sync/drafts";
 
 export type WordDropPosition = "before" | "after";
 
@@ -28,7 +31,8 @@ function detectQuoteScript(text: string): QuoteScript {
 interface Props {
   rows: TwlRow[];
   activeId: string | null;
-  onChange: (id: string, patch: Partial<TwlRow>) => void;
+  // Manual save: applies + enqueues. No autosave during typing.
+  onSave: (id: string, patch: Partial<TwlRow>) => void;
   onDelete: (id: string) => void;
   onFocus: (row: TwlRow) => void;
   onReorder: (draggedId: string, refId: string, position: WordDropPosition) => void;
@@ -42,7 +46,7 @@ interface Props {
   onTranslateQuote?: (row: TwlRow, english: string) => string | null;
 }
 
-export function WordsTable({ rows, activeId, onChange, onDelete, onFocus, onReorder, locked = false, onTranslateQuote }: Props) {
+export function WordsTable({ rows, activeId, onSave, onDelete, onFocus, onReorder, locked = false, onTranslateQuote }: Props) {
   const [dragId, setDragId] = useState<string | null>(null);
   const [dragOver, setDragOver] = useState<
     { targetId: string; position: WordDropPosition } | null
@@ -60,13 +64,14 @@ export function WordsTable({ rows, activeId, onChange, onDelete, onFocus, onReor
       variant="outlined"
       sx={{
         overflow: "hidden",
+        ...draftDirtyBorderSx(),
         ...(locked ? { pointerEvents: "none", opacity: 0.6 } : null),
       }}
     >
       <Box
         sx={{
           display: "grid",
-          gridTemplateColumns: "28px 1fr 1.2fr 36px",
+          gridTemplateColumns: "28px 1fr 1.2fr 28px 28px",
           gap: 1,
           alignItems: "center",
           px: 1,
@@ -84,6 +89,7 @@ export function WordsTable({ rows, activeId, onChange, onDelete, onFocus, onReor
         <span>Quote</span>
         <span>TW article</span>
         <span />
+        <span />
       </Box>
       {rows.map((r) => {
         const showBefore =
@@ -98,7 +104,7 @@ export function WordsTable({ rows, activeId, onChange, onDelete, onFocus, onReor
               active={r.id === activeId}
               dragging={dragId === r.id}
               isDropTarget={dragId !== null && dragId !== r.id}
-              onChange={(p) => onChange(r.id, p)}
+              onSave={(p) => onSave(r.id, p)}
               onDelete={() => onDelete(r.id)}
               onFocus={() => onFocus(r)}
               onGripDragStart={() => setDragId(r.id)}
@@ -149,7 +155,7 @@ function WordRow({
   active,
   dragging,
   isDropTarget,
-  onChange,
+  onSave,
   onDelete,
   onFocus,
   onGripDragStart,
@@ -162,7 +168,7 @@ function WordRow({
   active: boolean;
   dragging: boolean;
   isDropTarget: boolean;
-  onChange: (patch: Partial<TwlRow>) => void;
+  onSave: (patch: Partial<TwlRow>) => void;
   onDelete: () => void;
   onFocus: () => void;
   onGripDragStart: () => void;
@@ -172,25 +178,51 @@ function WordRow({
   onTranslateQuote?: (english: string) => string | null;
 }) {
   const [quote, setQuote] = useState(row.orig_words ?? "");
-  const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const pendingRef = useRef<Partial<TwlRow>>({});
+  const [twLink, setTwLink] = useState<string | null>(row.tw_link);
   const rowRef = useRef<HTMLDivElement | null>(null);
   const catalogs = useCatalogs();
 
   useEffect(() => setQuote(row.orig_words ?? ""), [row.id, row.version, row.orig_words]);
+  useEffect(() => setTwLink(row.tw_link), [row.id, row.version, row.tw_link]);
 
-  // Accumulate field patches into one debounced save so quote+tw_link edits
-  // within the window collapse to a single PATCH (and one version bump).
-  const queue = (patch: Partial<TwlRow>) => {
-    pendingRef.current = { ...pendingRef.current, ...patch };
-    if (debounceRef.current) clearTimeout(debounceRef.current);
-    debounceRef.current = setTimeout(() => {
-      const merged = pendingRef.current;
-      pendingRef.current = {};
-      debounceRef.current = null;
-      onChange(merged);
-    }, 350);
-  };
+  const draftKey = useMemo(() => rowKey("twl", row.id), [row.id]);
+
+  // Hydrate from any persisted draft on first mount so unsaved typing
+  // survives navigation.
+  const hydratedFromDraftRef = useRef(false);
+  useEffect(() => {
+    if (hydratedFromDraftRef.current) return;
+    void drafts.get(draftKey).then((rec) => {
+      if (hydratedFromDraftRef.current) return;
+      hydratedFromDraftRef.current = true;
+      const patch = (rec?.payload as { patch?: Partial<TwlRow> } | undefined)?.patch;
+      if (!patch) return;
+      if (typeof patch.orig_words === "string") setQuote(patch.orig_words);
+      if ("tw_link" in patch) setTwLink((patch.tw_link as string | null) ?? null);
+    });
+  }, [draftKey]);
+  const diff = useMemo<Partial<TwlRow>>(() => {
+    const out: Partial<TwlRow> = {};
+    if (quote !== (row.orig_words ?? "")) out.orig_words = quote;
+    if (twLink !== row.tw_link) out.tw_link = twLink;
+    return out;
+  }, [quote, twLink, row.orig_words, row.tw_link]);
+  const isDirty = Object.keys(diff).length > 0;
+
+  useEffect(() => {
+    if (isDirty) {
+      void drafts.set(draftKey, { patch: diff }, row.version, {
+        kind: "row",
+        rowKind: "twl",
+        id: row.id,
+        book: row.book,
+        chapter: row.chapter,
+        verse: row.verse,
+      });
+    } else {
+      void drafts.clear(draftKey);
+    }
+  }, [draftKey, isDirty, diff, row.version, row.id, row.book, row.chapter, row.verse]);
 
   const positionFromEvent = (e: React.DragEvent): WordDropPosition => {
     const rect = rowRef.current?.getBoundingClientRect();
@@ -206,8 +238,12 @@ function WordRow({
     const result = onTranslateQuote(quote);
     if (result) {
       setQuote(result);
-      queue({ orig_words: result });
     }
+  };
+
+  const handleSave = () => {
+    if (!isDirty) return;
+    onSave(diff);
   };
 
   return (
@@ -231,7 +267,7 @@ function WordRow({
       }}
       sx={{
         display: "grid",
-        gridTemplateColumns: "28px 1fr 1.2fr 36px",
+        gridTemplateColumns: "28px 1fr 1.2fr 28px 28px",
         alignItems: "center",
         gap: 1,
         px: 1,
@@ -271,32 +307,26 @@ function WordRow({
       </Tooltip>
       <TextField
         value={quote}
-        onChange={(e) => {
-          setQuote(e.target.value);
-          queue({ orig_words: e.target.value });
-        }}
+        onChange={(e) => setQuote(e.target.value)}
         size="small"
         variant="outlined"
         spellCheck={false}
-        InputProps={
-          showTranslateIcon
-            ? {
-                endAdornment: (
-                  <InputAdornment position="end">
-                    <Tooltip title="translate to Hebrew/Greek using ULT alignment">
-                      <IconButton
-                        size="small"
-                        onClick={handleTranslateQuote}
-                        sx={{ p: 0.25, color: "primary.main" }}
-                      >
-                        <TranslateIcon fontSize="small" />
-                      </IconButton>
-                    </Tooltip>
-                  </InputAdornment>
-                ),
-              }
-            : undefined
-        }
+        InputProps={{
+          ...(isDirty ? { "data-dirty": "true" } : {}),
+          endAdornment: showTranslateIcon ? (
+            <InputAdornment position="end">
+              <Tooltip title="translate to Hebrew/Greek using ULT alignment">
+                <IconButton
+                  size="small"
+                  onClick={handleTranslateQuote}
+                  sx={{ p: 0.25, color: "primary.main" }}
+                >
+                  <TranslateIcon fontSize="small" />
+                </IconButton>
+              </Tooltip>
+            </InputAdornment>
+          ) : undefined,
+        }}
         inputProps={{
           dir: quoteScript === "ltr" ? "ltr" : "rtl",
           style: {
@@ -308,12 +338,28 @@ function WordRow({
         }}
       />
       <CatalogPicker
-        value={row.tw_link}
+        value={twLink}
         options={catalogs.twLinks}
         display={(v) => (v ? twShort(v) : "+ TW article")}
         placeholder="names/, kt/, other/, …"
-        onChange={(next) => onChange({ tw_link: next })}
+        onChange={(next) => setTwLink(next)}
       />
+      <Tooltip title={isDirty ? "save edits" : "no unsaved edits"}>
+        <span>
+          <IconButton
+            size="small"
+            disabled={!isDirty}
+            onClick={handleSave}
+            sx={{ p: 0.25, color: isDirty ? "primary.main" : "action.disabled" }}
+          >
+            {isDirty ? (
+              <SaveIcon fontSize="inherit" />
+            ) : (
+              <SaveOutlinedIcon fontSize="inherit" />
+            )}
+          </IconButton>
+        </span>
+      </Tooltip>
       <IconButton size="small" onClick={onDelete} color="error" sx={{ p: 0.25 }}>
         <DeleteOutlineIcon fontSize="inherit" />
       </IconButton>

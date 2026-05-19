@@ -1,12 +1,16 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Box, Paper, Stack, TextField, IconButton, Typography, Tooltip } from "@mui/material";
 import DeleteOutlineIcon from "@mui/icons-material/DeleteOutline";
 import AutoAwesomeIcon from "@mui/icons-material/AutoAwesome";
+import SaveIcon from "@mui/icons-material/Save";
+import SaveOutlinedIcon from "@mui/icons-material/SaveOutlined";
 import type { TqRow } from "../sync/api";
+import { drafts, rowKey, draftDirtyBorderSx } from "../sync/drafts";
 
 interface Props {
   rows: TqRow[];
-  onChange: (id: string, patch: Partial<TqRow>) => void;
+  // Apply local + enqueue. Caller is responsible for outbox.enqueueRow.
+  onSave: (id: string, patch: Partial<TqRow>) => void;
   onDelete: (id: string) => void;
   // When true, rows render read-only and the delete button is hidden. Used
   // while an AI pipeline is mid-flight for the chapter — the auto-apply step
@@ -14,7 +18,7 @@ interface Props {
   locked?: boolean;
 }
 
-export function QuestionsTable({ rows, onChange, onDelete, locked = false }: Props) {
+export function QuestionsTable({ rows, onSave, onDelete, locked = false }: Props) {
   if (rows.length === 0) {
     return (
       <Typography variant="body2" color="text.disabled" sx={{ py: 1, pl: 1 }}>
@@ -23,7 +27,7 @@ export function QuestionsTable({ rows, onChange, onDelete, locked = false }: Pro
     );
   }
   return (
-    <Paper variant="outlined" sx={{ overflow: "hidden" }}>
+    <Paper variant="outlined" sx={{ overflow: "hidden", ...draftDirtyBorderSx() }}>
       <Box
         sx={{
           display: "grid",
@@ -50,7 +54,7 @@ export function QuestionsTable({ rows, onChange, onDelete, locked = false }: Pro
         <Row
           key={r.id}
           row={r}
-          onChange={(p) => onChange(r.id, p)}
+          onSave={(p) => onSave(r.id, p)}
           onDelete={() => onDelete(r.id)}
           locked={locked}
         />
@@ -60,41 +64,76 @@ export function QuestionsTable({ rows, onChange, onDelete, locked = false }: Pro
 }
 
 // Reference span can include ranges like "1:1-3", so give it a bit of room
-// without dominating the row.
-const GRID_COLS = "80px 1fr 1fr 36px";
+// without dominating the row. One extra cell for the save button.
+const GRID_COLS = "80px 1fr 1fr 28px 28px";
 
 function Row({
   row,
-  onChange,
+  onSave,
   onDelete,
   locked,
 }: {
   row: TqRow;
-  onChange: (patch: Partial<TqRow>) => void;
+  onSave: (patch: Partial<TqRow>) => void;
   onDelete: () => void;
   locked: boolean;
 }) {
   const [refRaw, setRefRaw] = useState(row.ref_raw ?? "");
   const [question, setQuestion] = useState(row.question ?? "");
   const [response, setResponse] = useState(row.response ?? "");
-  const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const pendingRef = useRef<Partial<TqRow>>({});
 
   useEffect(() => setRefRaw(row.ref_raw ?? ""), [row.id, row.version, row.ref_raw]);
   useEffect(() => setQuestion(row.question ?? ""), [row.id, row.version, row.question]);
   useEffect(() => setResponse(row.response ?? ""), [row.id, row.version, row.response]);
 
-  // Merge field edits per debounce window so editing ref + question together
-  // collapses into a single PATCH / version bump.
-  const queue = (patch: Partial<TqRow>) => {
-    pendingRef.current = { ...pendingRef.current, ...patch };
-    if (debounceRef.current) clearTimeout(debounceRef.current);
-    debounceRef.current = setTimeout(() => {
-      const merged = pendingRef.current;
-      pendingRef.current = {};
-      debounceRef.current = null;
-      onChange(merged);
-    }, 300);
+  const draftKey = useMemo(() => rowKey("tq", row.id), [row.id]);
+
+  // Hydrate from any persisted draft on first mount so unsaved typing
+  // survives navigation. Subsequent server pushes are caught by the
+  // useEffects above (which only run when row.version changes).
+  const hydratedFromDraftRef = useRef(false);
+  useEffect(() => {
+    if (hydratedFromDraftRef.current) return;
+    void drafts.get(draftKey).then((rec) => {
+      if (hydratedFromDraftRef.current) return;
+      hydratedFromDraftRef.current = true;
+      const patch = (rec?.payload as { patch?: Partial<TqRow> } | undefined)?.patch;
+      if (!patch) return;
+      if (typeof patch.ref_raw === "string") setRefRaw(patch.ref_raw);
+      if (typeof patch.question === "string") setQuestion(patch.question);
+      if (typeof patch.response === "string") setResponse(patch.response);
+    });
+  }, [draftKey]);
+  const diff = useMemo<Partial<TqRow>>(() => {
+    const out: Partial<TqRow> = {};
+    if (refRaw !== (row.ref_raw ?? "")) out.ref_raw = refRaw;
+    if (question !== (row.question ?? "")) out.question = question;
+    if (response !== (row.response ?? "")) out.response = response;
+    return out;
+  }, [refRaw, question, response, row.ref_raw, row.question, row.response]);
+  const isDirty = Object.keys(diff).length > 0;
+
+  // Sync the draft store as the source of crash-recovery truth. Cleared
+  // when the user edits back to server state (so the orange border vanishes).
+  useEffect(() => {
+    if (locked) return;
+    if (isDirty) {
+      void drafts.set(draftKey, { patch: diff }, row.version, {
+        kind: "row",
+        rowKind: "tq",
+        id: row.id,
+        book: row.book,
+        chapter: row.chapter,
+        verse: row.verse,
+      });
+    } else {
+      void drafts.clear(draftKey);
+    }
+  }, [draftKey, isDirty, diff, row.version, row.id, row.book, row.chapter, row.verse, locked]);
+
+  const handleSave = () => {
+    if (!isDirty) return;
+    onSave(diff);
   };
 
   return (
@@ -123,15 +162,18 @@ function Row({
         )}
         <TextField
           value={refRaw}
-          onChange={(e) => {
-            setRefRaw(e.target.value);
-            queue({ ref_raw: e.target.value });
-          }}
+          onChange={(e) => setRefRaw(e.target.value)}
           size="small"
           spellCheck={false}
           variant="outlined"
           placeholder="1:1"
-          InputProps={{ readOnly: locked }}
+          InputProps={{
+            readOnly: locked,
+            // Apply dirty flag to the input root so the orange-border CSS
+            // catches it on blur. Marking the TextField wrapper wouldn't —
+            // :focus-within would still match while typing.
+            ...(isDirty ? { "data-dirty": "true" } : {}),
+          }}
           inputProps={{
             style: { fontSize: 12, padding: "3px 6px", fontFamily: "monospace" },
           }}
@@ -139,30 +181,50 @@ function Row({
       </Stack>
       <TextField
         value={question}
-        onChange={(e) => {
-          setQuestion(e.target.value);
-          queue({ question: e.target.value });
-        }}
+        onChange={(e) => setQuestion(e.target.value)}
         size="small"
         multiline
         spellCheck
         variant="outlined"
-        InputProps={{ readOnly: locked }}
+        InputProps={{
+          readOnly: locked,
+          ...(isDirty ? { "data-dirty": "true" } : {}),
+        }}
         inputProps={{ style: { fontSize: 13, padding: "3px 6px" } }}
       />
       <TextField
         value={response}
-        onChange={(e) => {
-          setResponse(e.target.value);
-          queue({ response: e.target.value });
-        }}
+        onChange={(e) => setResponse(e.target.value)}
         size="small"
         multiline
         spellCheck
         variant="outlined"
-        InputProps={{ readOnly: locked }}
+        InputProps={{
+          readOnly: locked,
+          ...(isDirty ? { "data-dirty": "true" } : {}),
+        }}
         inputProps={{ style: { fontSize: 13, padding: "3px 6px" } }}
       />
+      {locked ? (
+        <span />
+      ) : (
+        <Tooltip title={isDirty ? "save edits" : "no unsaved edits"}>
+          <span>
+            <IconButton
+              size="small"
+              disabled={!isDirty}
+              onClick={handleSave}
+              sx={{ p: 0.25, color: isDirty ? "primary.main" : "action.disabled" }}
+            >
+              {isDirty ? (
+                <SaveIcon fontSize="inherit" />
+              ) : (
+                <SaveOutlinedIcon fontSize="inherit" />
+              )}
+            </IconButton>
+          </span>
+        </Tooltip>
+      )}
       {locked ? (
         <span />
       ) : (

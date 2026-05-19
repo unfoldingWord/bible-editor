@@ -9,13 +9,17 @@
 // column alignment, which is what makes find/replace and side-by-side
 // comparison readable when the scroll spans an entire book.
 
-import { Fragment, useEffect, useMemo, useRef } from "react";
+import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import { Box, Stack, Typography, IconButton, Tooltip, CircularProgress } from "@mui/material";
 import LinkIcon from "@mui/icons-material/Link";
+import SaveIcon from "@mui/icons-material/Save";
+import SaveOutlinedIcon from "@mui/icons-material/SaveOutlined";
+import UndoIcon from "@mui/icons-material/Undo";
 import type { VerseDto } from "../sync/api";
 import type { ChapterState } from "../hooks/useBook";
 import { highlightsFor, renderHighlightedHTML, type HighlightKey } from "../lib/highlight";
 import { markHighlightSx } from "../lib/highlightStyles";
+import { drafts, verseKey, draftDirtyBorderSx } from "../sync/drafts";
 import type { FindMatch } from "./FindReplaceOverlay";
 import type { FindQuery } from "./ScriptureColumn";
 import { HebrewLine } from "./HebrewLine";
@@ -56,6 +60,12 @@ interface Props {
   onLoadChapter: (ch: number) => void;
   onSelectVerse: (chapter: number, verse: number) => void;
   onEditVerse: (chapter: number, verse: number, bibleVersion: string, plain: string, base: VerseDto) => void;
+  // Flush all drafts in one bibleVersion column. Triggered by the header
+  // Save button; each item maps to a single PATCH.
+  onSaveColumn: (
+    bibleVersion: string,
+    payload: Array<{ chapter: number; verse: number; plain: string; base: VerseDto }>,
+  ) => void;
   onOpenAligner: (chapter: number, verse: number, bibleVersion: string) => void;
   // The active chapter is mid-pipeline. Locks editing on every chapter
   // displayed in book mode — simplest defensive choice; AI typically scopes
@@ -80,11 +90,46 @@ export function BookView({
   onLoadChapter,
   onSelectVerse,
   onEditVerse,
+  onSaveColumn,
   onOpenAligner,
   locked = false,
 }: Props) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const activeRowRef = useRef<HTMLDivElement | null>(null);
+
+  // Per-bibleVersion dirty count for the header save buttons. Each value is
+  // the list of drafts for that column (across all chapters in book mode).
+  const [draftsByVersion, setDraftsByVersion] = useState<Map<string, Array<{ chapter: number; verse: number; plain: string }>>>(() => new Map());
+  useEffect(() => {
+    return drafts.subscribe((all) => {
+      const next = new Map<string, Array<{ chapter: number; verse: number; plain: string }>>();
+      for (const d of all) {
+        if (d.meta.kind !== "verse") continue;
+        if (d.meta.book !== book) continue;
+        const plain = (d.payload as { plainText?: unknown }).plainText;
+        if (typeof plain !== "string") continue;
+        const list = next.get(d.meta.bibleVersion) ?? [];
+        list.push({ chapter: d.meta.chapter, verse: d.meta.verse, plain });
+        next.set(d.meta.bibleVersion, list);
+      }
+      setDraftsByVersion(next);
+    });
+  }, [book]);
+
+  const handleSaveVersion = (bv: string) => {
+    const list = draftsByVersion.get(bv);
+    if (!list || list.length === 0) return;
+    const payload: Array<{ chapter: number; verse: number; plain: string; base: VerseDto }> = [];
+    for (const d of list) {
+      const base = chapters.get(d.chapter);
+      if (!base || base.kind !== "ready") continue;
+      const dto = base.data.verses[bv]?.[d.verse];
+      if (!dto) continue;
+      payload.push({ chapter: d.chapter, verse: d.verse, plain: d.plain, base: dto });
+    }
+    if (payload.length === 0) return;
+    onSaveColumn(bv, payload);
+  };
 
   useEffect(() => {
     activeRowRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
@@ -136,15 +181,44 @@ export function BookView({
         <Typography variant="caption" sx={{ fontFamily: "monospace", color: "primary.main", fontWeight: 700 }}>
           {book} · book
         </Typography>
-        {enabledVersions.map((v) => (
-          <Typography
-            key={v}
-            variant="caption"
-            sx={{ fontFamily: "monospace", color: "text.secondary", textTransform: "uppercase", letterSpacing: 0.5 }}
-          >
-            {v}{READ_ONLY.has(v) ? " (ro)" : ""}
-          </Typography>
-        ))}
+        {enabledVersions.map((v) => {
+          const dirty = (draftsByVersion.get(v)?.length ?? 0);
+          const isReadOnly = READ_ONLY.has(v) || locked;
+          return (
+            <Stack key={v} direction="row" alignItems="center" spacing={0.25}>
+              <Typography
+                variant="caption"
+                sx={{ fontFamily: "monospace", color: "text.secondary", textTransform: "uppercase", letterSpacing: 0.5 }}
+              >
+                {v}{isReadOnly ? " (ro)" : ""}
+              </Typography>
+              {!isReadOnly && (
+                <Tooltip
+                  title={
+                    dirty === 0
+                      ? `no unsaved edits in ${v}`
+                      : `save ${dirty} unsaved verse${dirty === 1 ? "" : "s"} in ${v}`
+                  }
+                >
+                  <span>
+                    <IconButton
+                      size="small"
+                      disabled={dirty === 0}
+                      onClick={() => handleSaveVersion(v)}
+                      sx={{ p: 0.25, color: dirty > 0 ? "primary.main" : "action.disabled" }}
+                    >
+                      {dirty > 0 ? (
+                        <SaveIcon fontSize="inherit" />
+                      ) : (
+                        <SaveOutlinedIcon fontSize="inherit" />
+                      )}
+                    </IconButton>
+                  </span>
+                </Tooltip>
+              )}
+            </Stack>
+          );
+        })}
         <Box sx={{ flex: 1 }} />
         <Typography variant="caption" color="text.disabled">
           {chapterList.length} ch · loaded {countLoaded(chapters)}
@@ -156,6 +230,7 @@ export function BookView({
           flex: 1,
           overflowY: "auto",
           ...markHighlightSx(theme.palette.mode),
+          ...draftDirtyBorderSx(),
         })}
       >
         <Box sx={{ display: "grid", gridTemplateColumns, gap: 1, px: 1.5, py: 1 }}>
@@ -368,7 +443,7 @@ function ChapterBlock({
 }
 
 function VerseRow({
-  book: _book,
+  book,
   chapter,
   verseNum,
   enabledVersions,
@@ -423,6 +498,7 @@ function VerseRow({
             }}
           >
             <VerseCell
+              book={book}
               chapter={chapter}
               verseNum={verseNum}
               bibleVersion={bv}
@@ -445,6 +521,7 @@ function VerseRow({
 }
 
 function VerseCell({
+  book,
   chapter,
   verseNum,
   bibleVersion,
@@ -459,6 +536,7 @@ function VerseCell({
   onEdit,
   locked,
 }: {
+  book: string;
   chapter: number;
   verseNum: number;
   bibleVersion: string;
@@ -485,9 +563,38 @@ function VerseCell({
     return { start: findActiveMatch.startIndex, end: findActiveMatch.endIndex };
   }, [findActiveMatch, chapter, verseNum, bibleVersion]);
   const elRef = useRef<HTMLSpanElement | null>(null);
-  const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lastTextRef = useRef(dto?.plain_text ?? "");
   const lastSetRef = useRef<string | null>(null);
+  const draftKey = useMemo(
+    () => verseKey(book, chapter, verseNum, bibleVersion),
+    [book, chapter, verseNum, bibleVersion],
+  );
+  const [hasDraft, setHasDraft] = useState(false);
+  const hydratedFromDraftRef = useRef(false);
+  useEffect(() => {
+    if (readOnly) {
+      setHasDraft(false);
+      return;
+    }
+    return drafts.subscribe((all) => {
+      const rec = all.find((d) => d.key === draftKey);
+      setHasDraft(!!rec);
+      if (
+        !hydratedFromDraftRef.current &&
+        rec &&
+        typeof (rec.payload as { plainText?: unknown }).plainText === "string" &&
+        elRef.current
+      ) {
+        const plain = (rec.payload as { plainText: string }).plainText;
+        if (elRef.current.innerText !== plain) {
+          elRef.current.innerText = plain;
+          lastSetRef.current = plain;
+          lastTextRef.current = plain;
+        }
+        hydratedFromDraftRef.current = true;
+      }
+    });
+  }, [draftKey, readOnly]);
 
   // Source-language matches for this cell. Only meaningful for UHB/UGNT in
   // non-english find modes. Drives both the offset painter (UGNT) and the
@@ -547,6 +654,9 @@ function VerseCell({
 
   useEffect(() => {
     if (!elRef.current) return;
+    // Never reset the DOM while a draft is in flight — the user's typing is
+    // the source of truth between mount/save.
+    if (hasDraft) return;
     const text = dto?.plain_text ?? "";
     const dom = elRef.current.innerText;
     if (html !== null) {
@@ -562,7 +672,7 @@ function VerseCell({
       lastSetRef.current = text;
     }
     lastTextRef.current = text;
-  }, [dto?.plain_text, html]);
+  }, [dto?.plain_text, html, hasDraft]);
 
   if (!dto) {
     return (
@@ -600,6 +710,27 @@ function VerseCell({
             <LinkIcon sx={{ fontSize: 14 }} />
           </IconButton>
         </Tooltip>
+      )}
+      {!readOnly && hasDraft && (
+        <Tooltip title={`undo edits to verse ${verseNum}`}>
+          <IconButton
+            onClick={(e) => {
+              e.stopPropagation();
+              void drafts.clear(draftKey);
+              hydratedFromDraftRef.current = false;
+              const text = dto?.plain_text ?? "";
+              if (elRef.current) {
+                elRef.current.innerText = text;
+                lastSetRef.current = text;
+                lastTextRef.current = text;
+              }
+            }}
+            size="small"
+            sx={{ color: "warning.main", p: 0.25, verticalAlign: "-3px" }}
+          >
+            <UndoIcon sx={{ fontSize: 14 }} />
+          </IconButton>
+        </Tooltip>
       )}{" "}
       {readOnly && rtl ? (
         <span
@@ -623,6 +754,7 @@ function VerseCell({
         ref={(node) => {
           elRef.current = node;
         }}
+        data-dirty={hasDraft ? "true" : undefined}
         contentEditable={!readOnly}
         suppressContentEditableWarning
         spellCheck={!rtl}
@@ -630,12 +762,9 @@ function VerseCell({
         onInput={(e) => {
           if (readOnly) return;
           const value = (e.currentTarget as HTMLSpanElement).innerText;
-          if (debounceRef.current) clearTimeout(debounceRef.current);
-          debounceRef.current = setTimeout(() => {
-            onEdit(value);
-            lastTextRef.current = value;
-            debounceRef.current = null;
-          }, 350);
+          onEdit(value);
+          lastTextRef.current = value;
+          lastSetRef.current = value;
         }}
         style={{
           outline: "none",

@@ -1,9 +1,13 @@
-import { useEffect, useMemo, useRef } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Box, Stack, Typography, IconButton, Tooltip } from "@mui/material";
 import LinkIcon from "@mui/icons-material/Link";
+import SaveIcon from "@mui/icons-material/Save";
+import SaveOutlinedIcon from "@mui/icons-material/SaveOutlined";
+import UndoIcon from "@mui/icons-material/Undo";
 import type { VerseDto } from "../sync/api";
 import { highlightsFor, renderHighlightedHTML, type HighlightKey } from "../lib/highlight";
 import { markHighlightSx } from "../lib/highlightStyles";
+import { drafts, verseKey, draftDirtyBorderSx } from "../sync/drafts";
 import { HebrewLine } from "./HebrewLine";
 import type { LexiconEntry } from "../hooks/useLexicon";
 import type { FindMatch } from "./FindReplaceOverlay";
@@ -21,6 +25,7 @@ interface SearchState {
 }
 
 interface Props {
+  book: string;
   bibleVersion: string;
   // Pre-expanded per-version index: verses[7] returns the 6-9 range row when
   // verse 7 is inside a UST multi-verse block. ScriptureColumn builds this
@@ -50,6 +55,9 @@ interface Props {
   findActiveMatch?: FindMatch | null;
   onSelectVerse: (v: number) => void;
   onEditVerse: (verseNum: number, plain: string, base: VerseDto) => void;
+  // Save every dirty draft in this column (one PATCH per verse). The
+  // header button calls this; per-verse undo handles single-verse rollback.
+  onSaveColumn: (drafts: Array<{ verseNum: number; plain: string; base: VerseDto }>) => void;
   onOpenAligner: (verseNum: number) => void;
 }
 
@@ -62,6 +70,7 @@ interface Props {
 // verse. Phase 3 (alignment editor) restores it.
 
 export function DocColumn({
+  book,
   bibleVersion,
   versesByVerseNum,
   verseNumbers,
@@ -77,14 +86,55 @@ export function DocColumn({
   findActiveMatch,
   onSelectVerse,
   onEditVerse,
+  onSaveColumn,
   onOpenAligner,
 }: Props) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const activeRef = useRef<HTMLSpanElement | null>(null);
 
+  // Track per-verse drafts in this column so the header save button knows
+  // what's dirty and how many. Keyed by verseNum so the click handler can
+  // produce the {verseNum, plain, base} list onSaveColumn expects.
+  const [dirtyVerses, setDirtyVerses] = useState<Map<number, string>>(() => new Map());
+  useEffect(() => {
+    if (readOnly) {
+      setDirtyVerses(new Map());
+      return;
+    }
+    return drafts.subscribe((all) => {
+      const next = new Map<number, string>();
+      for (const d of all) {
+        if (d.meta.kind !== "verse") continue;
+        if (
+          d.meta.book !== book ||
+          d.meta.chapter !== chapter ||
+          d.meta.bibleVersion !== bibleVersion
+        ) {
+          continue;
+        }
+        const plain = (d.payload as { plainText?: unknown }).plainText;
+        if (typeof plain === "string") next.set(d.meta.verse, plain);
+      }
+      setDirtyVerses(next);
+    });
+  }, [book, chapter, bibleVersion, readOnly]);
+
   useEffect(() => {
     activeRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
   }, [activeVerse, scrollNonce]);
+
+  const handleSaveColumn = () => {
+    const payload: Array<{ verseNum: number; plain: string; base: VerseDto }> = [];
+    for (const [verseNum, plain] of dirtyVerses) {
+      const base = versesByVerseNum[verseNum];
+      if (!base) continue;
+      payload.push({ verseNum, plain, base });
+    }
+    if (payload.length === 0) return;
+    onSaveColumn(payload);
+  };
+
+  const dirtyCount = dirtyVerses.size;
 
   return (
     <Box
@@ -121,10 +171,38 @@ export function DocColumn({
             fontWeight: 700,
             textTransform: "uppercase",
             letterSpacing: 0.5,
+            flex: 1,
           }}
         >
           {bibleVersion} · {readOnly ? "read-only" : "editing"}
         </Typography>
+        {!readOnly && (
+          <Tooltip
+            title={
+              dirtyCount === 0
+                ? "no unsaved edits in this column"
+                : `save ${dirtyCount} unsaved verse${dirtyCount === 1 ? "" : "s"} in ${bibleVersion}`
+            }
+          >
+            <span>
+              <IconButton
+                size="small"
+                disabled={dirtyCount === 0}
+                onClick={handleSaveColumn}
+                sx={{
+                  p: 0.25,
+                  color: dirtyCount > 0 ? "primary.main" : "action.disabled",
+                }}
+              >
+                {dirtyCount > 0 ? (
+                  <SaveIcon fontSize="inherit" />
+                ) : (
+                  <SaveOutlinedIcon fontSize="inherit" />
+                )}
+              </IconButton>
+            </span>
+          </Tooltip>
+        )}
       </Stack>
       <Box
         sx={(theme) => ({
@@ -140,6 +218,7 @@ export function DocColumn({
           direction: rtl ? "rtl" : "ltr",
           textAlign: rtl ? "right" : "left",
           ...markHighlightSx(theme.palette.mode),
+          ...draftDirtyBorderSx(),
         })}
       >
         {verseNumbers.map((v) => {
@@ -158,6 +237,7 @@ export function DocColumn({
           return (
             <VerseSpan
               key={dto.verse}
+              book={book}
               chapter={chapter}
               verseNum={dto.verse}
               verseLabel={formatVerseLabel(dto)}
@@ -185,6 +265,7 @@ export function DocColumn({
 }
 
 function VerseSpan({
+  book,
   chapter,
   verseNum,
   verseLabel,
@@ -204,6 +285,7 @@ function VerseSpan({
   onAlign,
   onEdit,
 }: {
+  book: string;
   chapter: number;
   // Canonical verse_start for this row (used for find-cell keys + alignment).
   verseNum: number;
@@ -236,24 +318,42 @@ function VerseSpan({
     return { start: findActiveMatch.startIndex, end: findActiveMatch.endIndex };
   }, [findActiveMatch, chapter, verseNum, bibleVersion]);
   const elRef = useRef<HTMLSpanElement | null>(null);
-  const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lastTextRef = useRef(text);
-  // Latest onEdit reachable from the unmount path without restarting the
-  // effect — and a flush so a pending debounce isn't dropped when the
-  // verse navigates away mid-type (e.g. Shell remounts on verse change).
-  const onEditRef = useRef(onEdit);
+  // Resync tracker for the editable span. lastSetRef.current is the most
+  // recent string we wrote to .innerText / .innerHTML; the reset effect
+  // skips when its target matches, preserving the caret during typing.
+  // Hoisted so the draft-hydration path can mark it in lockstep.
+  const lastSetRef = useRef<string | null>(null);
+  const draftKey = useMemo(
+    () => verseKey(book, chapter, verseNum, bibleVersion),
+    [book, chapter, verseNum, bibleVersion],
+  );
+  const [hasDraft, setHasDraft] = useState(false);
+  const hydratedFromDraftRef = useRef(false);
   useEffect(() => {
-    onEditRef.current = onEdit;
-  }, [onEdit]);
-  useEffect(() => {
-    return () => {
-      if (!debounceRef.current) return;
-      clearTimeout(debounceRef.current);
-      debounceRef.current = null;
-      const node = elRef.current;
-      if (node) onEditRef.current(node.innerText);
-    };
-  }, []);
+    if (readOnly) {
+      setHasDraft(false);
+      return;
+    }
+    return drafts.subscribe((all) => {
+      const rec = all.find((d) => d.key === draftKey);
+      setHasDraft(!!rec);
+      if (
+        !hydratedFromDraftRef.current &&
+        rec &&
+        typeof (rec.payload as { plainText?: unknown }).plainText === "string" &&
+        elRef.current
+      ) {
+        const plain = (rec.payload as { plainText: string }).plainText;
+        if (elRef.current.innerText !== plain) {
+          elRef.current.innerText = plain;
+          lastSetRef.current = plain;
+          lastTextRef.current = plain;
+        }
+        hydratedFromDraftRef.current = true;
+      }
+    });
+  }, [draftKey, readOnly]);
 
   // Source-language token hits for this verse (only meaningful for UHB/UGNT
   // in non-english find modes). Drives the offset painter for UGNT and the
@@ -303,10 +403,12 @@ function VerseSpan({
   // Resync the editable span when (a) text changes from outside and the user
   // hasn't been typing since, or (b) highlights change. We let the user type
   // freely between resyncs. On first render `lastSetRef.current` is null —
-  // treat that as "always write" so the verse paints at mount time.
-  const lastSetRef = useRef<string | null>(null);
+  // treat that as "always write" so the verse paints at mount time. If a
+  // draft exists, leave the user's typing alone — only the save flow ever
+  // overwrites the DOM during a draft session.
   useEffect(() => {
     if (!elRef.current) return;
+    if (hasDraft) return;
     const dom = elRef.current.innerText;
     if (html !== null) {
       if (html !== lastSetRef.current) {
@@ -322,7 +424,7 @@ function VerseSpan({
       lastSetRef.current = text;
     }
     lastTextRef.current = text;
-  }, [text, html]);
+  }, [text, html, hasDraft]);
 
   const setMarkerRef = (node: HTMLSpanElement | null) => {
     if (spanRef) spanRef.current = node;
@@ -366,6 +468,29 @@ function VerseSpan({
             <LinkIcon sx={{ fontSize: 14 }} />
           </IconButton>
         </Tooltip>
+      )}
+      {!readOnly && hasDraft && (
+        <Tooltip title={`undo edits to verse ${verseNum}`}>
+          <IconButton
+            onClick={(e) => {
+              e.stopPropagation();
+              // Drop the draft and force the DOM back to server text. The
+              // hydration guard resets too so the next mount goes through
+              // the normal text-prop path.
+              void drafts.clear(draftKey);
+              hydratedFromDraftRef.current = false;
+              if (elRef.current) {
+                elRef.current.innerText = text;
+                lastSetRef.current = text;
+                lastTextRef.current = text;
+              }
+            }}
+            size="small"
+            sx={{ color: "warning.main", p: 0.25, verticalAlign: "-3px" }}
+          >
+            <UndoIcon sx={{ fontSize: 14 }} />
+          </IconButton>
+        </Tooltip>
       )}{" "}
       {rtl && lexiconMap ? (
         <span
@@ -390,6 +515,7 @@ function VerseSpan({
         ref={(node) => {
           elRef.current = node;
         }}
+        data-dirty={hasDraft ? "true" : undefined}
         contentEditable={!readOnly}
         suppressContentEditableWarning
         spellCheck={!rtl}
@@ -397,12 +523,9 @@ function VerseSpan({
         onInput={(e) => {
           if (readOnly) return;
           const value = (e.currentTarget as HTMLSpanElement).innerText;
-          if (debounceRef.current) clearTimeout(debounceRef.current);
-          debounceRef.current = setTimeout(() => {
-            onEdit(value);
-            lastTextRef.current = value;
-            debounceRef.current = null;
-          }, 350);
+          onEdit(value);
+          lastTextRef.current = value;
+          lastSetRef.current = value;
         }}
         style={{
           outline: "none",

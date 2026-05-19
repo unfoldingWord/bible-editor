@@ -32,6 +32,7 @@ import { useCatalogs } from "../hooks/useCatalogs";
 import { CatalogPicker } from "./CatalogPicker";
 import { shortSupport } from "../lib/supportReference";
 import { TCM, buildSH } from "../lib/noteTemplates";
+import { drafts, rowKey, draftDirtyBorderSx } from "../sync/drafts";
 
 const NoteHistoryDialog = lazy(() =>
   import("./NoteHistoryDialog").then((m) => ({ default: m.NoteHistoryDialog })),
@@ -189,17 +190,9 @@ export function NoteCard({
     setSessionSnapshotState(next);
   };
   const pendingRef = useRef<Partial<TnRow>>({});
-  const cancelUnmountFlushRef = useRef(false);
 
   const paperRef = useRef<HTMLDivElement | null>(null);
   const catalogs = useCatalogs();
-
-  // Keep latest onSave reachable from the unmount cleanup without re-running
-  // the effect each time the parent re-renders.
-  const onSaveRef = useRef(onSave);
-  useEffect(() => {
-    onSaveRef.current = onSave;
-  }, [onSave]);
 
   const positionFromEvent = (e: React.DragEvent): DropPosition => {
     const rect = paperRef.current?.getBoundingClientRect();
@@ -224,38 +217,43 @@ export function NoteCard({
     setSupportRef(row.support_reference);
   }, [row.id, row.version, row.support_reference]);
 
+  // Restore unsaved typing on first mount. If a draft exists for this row,
+  // overwrite local state from its patch — otherwise the user's typing
+  // would be lost the first time they navigate away from this note.
+  // Guarded by a ref so subsequent re-renders don't keep clobbering the
+  // live state with a now-stale snapshot.
+  const hydratedFromDraftRef = useRef(false);
+  useEffect(() => {
+    if (hydratedFromDraftRef.current) return;
+    void drafts.get(rowKey("tn", row.id)).then((rec) => {
+      if (hydratedFromDraftRef.current) return;
+      const patch = (rec?.payload as { patch?: Partial<TnRow> } | undefined)?.patch;
+      hydratedFromDraftRef.current = true;
+      if (!patch) return;
+      if (typeof patch.quote === "string") setQuote(tsvToDisplay(patch.quote));
+      if (typeof patch.note === "string") setNote(tsvToDisplay(patch.note));
+      if ("support_reference" in patch) {
+        setSupportRef((patch.support_reference as string | null) ?? null);
+      }
+    });
+  }, [row.id]);
+
   // Session entry/exit. Snapshot is taken on active=false→true with the
-  // values currently in local state (which match the row when nothing is
-  // pending). On active=true→false the accumulated patch is flushed and
-  // the snapshot is cleared.
+  // values currently in local state (which may differ from the row if a
+  // draft was hydrated). On deactivate we just clear the snapshot — no
+  // PATCH fires until the user clicks Save. Edits survive in the drafts
+  // store across mount/unmount, so leaving an active card doesn't lose
+  // typing.
   useEffect(() => {
     if (active) {
       if (sessionSnapshotRef.current === null) {
         setSessionSnapshot({ quote, note, support_reference: supportRef });
       }
     } else if (sessionSnapshotRef.current !== null) {
-      flushPending();
       setSessionSnapshot(null);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [active]);
-
-  // Flush on unmount too — handles cases where the card unmounts without
-  // transitioning to inactive first (e.g. user navigates to another verse
-  // while this note is still active and gets filtered out of the list).
-  // Intentionally cancelled when this card itself is being deleted.
-  // Compares pending against the entry snapshot so a "typed then undone"
-  // session unmounts without an extra version bump.
-  useEffect(() => {
-    return () => {
-      if (cancelUnmountFlushRef.current) return;
-      const p = pendingRef.current;
-      const s = sessionSnapshotRef.current;
-      if (Object.keys(p).length === 0) return;
-      if (s && pendingMatchesSnapshot(p, s)) return;
-      onSaveRef.current(p);
-    };
-  }, []);
 
   const flushPending = () => {
     const p = pendingRef.current;
@@ -300,9 +298,11 @@ export function NoteCard({
   };
 
   const handleDelete = () => {
-    cancelUnmountFlushRef.current = true;
     pendingRef.current = {};
     setSessionSnapshot(null);
+    // Drop any draft so the delete doesn't get followed by a phantom save
+    // from a still-dirty buffer.
+    void drafts.clear(rowKey("tn", row.id));
     onDelete();
   };
 
@@ -436,6 +436,47 @@ export function NoteCard({
   const canUndo = active && hasNetChanges;
   const showSessionButtons = active;
 
+  // Sync the draft store against the diff vs server row. This is what feeds
+  // the offscreen-unsaved popup and survives chapter navigation. Separate
+  // from hasNetChanges because we want drafts to track divergence from the
+  // *saved* state, not from the session entry point.
+  const rowDiff: Partial<TnRow> = {};
+  const rowQuoteDisplay = tsvToDisplay(row.quote);
+  const rowNoteDisplay = tsvToDisplay(row.note);
+  if (quote !== rowQuoteDisplay) rowDiff.quote = quote;
+  if (note !== rowNoteDisplay) rowDiff.note = note;
+  if (supportRef !== row.support_reference) rowDiff.support_reference = supportRef;
+  const hasRowDiff = Object.keys(rowDiff).length > 0;
+  const draftKey = rowKey("tn", row.id);
+  useEffect(() => {
+    if (readOnly) return;
+    if (hasRowDiff) {
+      void drafts.set(draftKey, { patch: rowDiff }, row.version, {
+        kind: "row",
+        rowKind: "tn",
+        id: row.id,
+        book: row.book,
+        chapter: row.chapter,
+        verse: row.verse,
+      });
+    } else {
+      void drafts.clear(draftKey);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    draftKey,
+    hasRowDiff,
+    quote,
+    note,
+    supportRef,
+    row.version,
+    row.id,
+    row.book,
+    row.chapter,
+    row.verse,
+    readOnly,
+  ]);
+
   return (
     <Paper
       ref={paperRef}
@@ -467,6 +508,7 @@ export function NoteCard({
         overflow: "hidden",
         opacity: dragging ? 0.4 : 1,
         transition: "opacity 120ms ease",
+        ...draftDirtyBorderSx(),
         // Glow pulse on AI completion. The flag is set by useAiDrafts
         // for ~4 s, so the animation finishes naturally and the rule
         // becomes a no-op once the flag clears.
@@ -624,6 +666,7 @@ export function NoteCard({
           onFocus={onFocus}
           InputProps={{
             readOnly,
+            ...(hasRowDiff && quote !== rowQuoteDisplay ? { "data-dirty": "true" } : {}),
             ...(showTranslateIcon && {
               endAdornment: (
                 <InputAdornment position="end" sx={{ alignSelf: "flex-start" }}>
@@ -714,7 +757,10 @@ export function NoteCard({
           size="small"
           spellCheck
           onFocus={onFocus}
-          InputProps={{ readOnly }}
+          InputProps={{
+            readOnly,
+            ...(hasRowDiff && note !== rowNoteDisplay ? { "data-dirty": "true" } : {}),
+          }}
           inputProps={{
             style: {
               fontSize: 13,

@@ -6,7 +6,10 @@ import ViewStreamIcon from "@mui/icons-material/ViewStream";
 import MenuBookIcon from "@mui/icons-material/MenuBook";
 import SearchIcon from "@mui/icons-material/Search";
 import UndoIcon from "@mui/icons-material/Undo";
+import SaveIcon from "@mui/icons-material/Save";
+import SaveOutlinedIcon from "@mui/icons-material/SaveOutlined";
 import type { ChapterPayload, VerseDto } from "../sync/api";
+import { drafts, verseKey } from "../sync/drafts";
 import { DocColumn } from "./DocColumn";
 import type { FindMatch } from "./FindReplaceOverlay";
 import { HebrewLine } from "./HebrewLine";
@@ -58,6 +61,9 @@ interface Props {
   onLoadBookChapter?: (ch: number) => void;
   onSelectBookVerse?: (chapter: number, verse: number) => void;
   onEditBookVerse?: (chapter: number, verse: number, bibleVersion: string, plain: string, base: VerseDto) => void;
+  // Per-verse save callback for book mode. Same semantics as onSaveVerse but
+  // chapter is variable (book view spans the whole book).
+  onSaveBookVerse?: (chapter: number, verse: number, bibleVersion: string, plain: string, base: VerseDto) => void;
   onOpenBookAligner?: (chapter: number, verse: number, bibleVersion: string) => void;
   // Find/replace target. Used in all three modes — book mode passes a
   // chapter from the book cache; stacked/columns always pass the current
@@ -76,6 +82,10 @@ interface Props {
   onModeChange: (mode: ScriptureMode) => void;
   onEnabledVersionsChange: (versions: string[]) => void;
   onEditVerse: (verseNum: number, bibleVersion: string, plain: string, base: VerseDto) => void;
+  // Persist a draft to outbox: takes the row's current local plain text,
+  // runs it through smartEditVerse, and enqueues. Shell wires this; both
+  // stacked rows and the column-style modes call it on Save click.
+  onSaveVerse: (verseNum: number, bibleVersion: string, plain: string, base: VerseDto) => void;
   // Chapter is mid-flight for an AI pipeline. Renders all editable bibles
   // (ULT/UST) as read-only too — UHB/UGNT already are by virtue of
   // READ_ONLY_VERSIONS. The banner above the column tells the user why.
@@ -114,6 +124,7 @@ export function ScriptureColumn({
   onLoadBookChapter,
   onSelectBookVerse,
   onEditBookVerse,
+  onSaveBookVerse,
   onOpenBookAligner,
   onReplaceVerse,
   scrollNonce,
@@ -124,6 +135,7 @@ export function ScriptureColumn({
   onModeChange,
   onEnabledVersionsChange,
   onEditVerse,
+  onSaveVerse,
   locked = false,
 }: Props) {
   const activeRef = useRef<HTMLDivElement | null>(null);
@@ -388,6 +400,7 @@ export function ScriptureColumn({
         )}
         {mode === "stacked" ? (
           <StackedBody
+            book={book}
             indexByVersion={indexByVersion}
             verseNumbers={verseNumbers}
             activeVerse={activeVerse}
@@ -402,9 +415,10 @@ export function ScriptureColumn({
             onSelectVerse={onSelectVerse}
             onOpenAligner={onOpenAligner}
             onEditVerse={onEditVerse}
+            onSaveVerse={onSaveVerse}
             locked={locked}
           />
-        ) : mode === "book" && bookChapterList && bookChapters && onLoadBookChapter && onSelectBookVerse && onEditBookVerse && onOpenBookAligner ? (
+        ) : mode === "book" && bookChapterList && bookChapters && onLoadBookChapter && onSelectBookVerse && onEditBookVerse && onSaveBookVerse && onOpenBookAligner ? (
           <Suspense fallback={null}>
             <BookView
               book={book}
@@ -422,6 +436,11 @@ export function ScriptureColumn({
               onLoadChapter={onLoadBookChapter}
               onSelectVerse={onSelectBookVerse}
               onEditVerse={onEditBookVerse}
+              onSaveColumn={(bv, payload) => {
+                for (const item of payload) {
+                  onSaveBookVerse(item.chapter, item.verse, bv, item.plain, item.base);
+                }
+              }}
               onOpenAligner={onOpenBookAligner}
               locked={locked}
             />
@@ -431,6 +450,7 @@ export function ScriptureColumn({
             {enabledVersions.map((v) => (
               <DocColumn
                 key={v}
+                book={book}
                 bibleVersion={v}
                 versesByVerseNum={indexByVersion[v] ?? {}}
                 verseNumbers={verseNumbers}
@@ -446,6 +466,11 @@ export function ScriptureColumn({
                 findActiveMatch={findScrollTarget}
                 onSelectVerse={onSelectVerse}
                 onEditVerse={(verseNum, plain, base) => onEditVerse(verseNum, v, plain, base)}
+                onSaveColumn={(payload) => {
+                  for (const item of payload) {
+                    onSaveVerse(item.verseNum, v, item.plain, item.base);
+                  }
+                }}
                 onOpenAligner={(verseNum) => onOpenAligner(verseNum, v)}
               />
             ))}
@@ -457,6 +482,7 @@ export function ScriptureColumn({
 }
 
 function StackedBody({
+  book,
   indexByVersion,
   verseNumbers,
   activeVerse,
@@ -471,8 +497,10 @@ function StackedBody({
   onSelectVerse,
   onOpenAligner,
   onEditVerse,
+  onSaveVerse,
   locked,
 }: {
+  book: string;
   // Per-version expansion of versesByVersion so verses inside a multi-verse
   // range row (`\v 6-9`) resolve to the canonical row at verse=6. See
   // web/src/lib/verseRange.ts.
@@ -490,6 +518,7 @@ function StackedBody({
   onSelectVerse: (v: number) => void;
   onOpenAligner: (verse: number, bibleVersion: string) => void;
   onEditVerse: (verseNum: number, bibleVersion: string, plain: string, base: VerseDto) => void;
+  onSaveVerse: (verseNum: number, bibleVersion: string, plain: string, base: VerseDto) => void;
   locked: boolean;
 }) {
   const ult = indexByVersion["ULT"] ?? {};
@@ -541,6 +570,8 @@ function StackedBody({
                 {v === 0 ? "intro" : `${chapter}:${v}`}
               </Typography>
               <ActiveLine
+                book={book}
+                bibleVersion="ULT"
                 label={ultV && isRangeRow(ultV) ? `ULT ${formatVerseLabel(ultV)}` : "ULT"}
                 chapter={chapter}
                 verseNum={ultStart}
@@ -554,8 +585,13 @@ function StackedBody({
                 onEditPlain={
                   ultV ? (plain) => onEditVerse(ultStart, "ULT", plain, ultV) : undefined
                 }
+                onSave={
+                  ultV ? (plain) => onSaveVerse(ultStart, "ULT", plain, ultV) : undefined
+                }
               />
               <ActiveLine
+                book={book}
+                bibleVersion="UST"
                 label={ustV && isRangeRow(ustV) ? `UST ${formatVerseLabel(ustV)}` : "UST"}
                 chapter={chapter}
                 verseNum={ustStart}
@@ -569,9 +605,14 @@ function StackedBody({
                 onEditPlain={
                   ustV ? (plain) => onEditVerse(ustStart, "UST", plain, ustV) : undefined
                 }
+                onSave={
+                  ustV ? (plain) => onSaveVerse(ustStart, "UST", plain, ustV) : undefined
+                }
               />
               {uhbV && (
                 <ActiveLine
+                  book={book}
+                  bibleVersion={uhbLabel}
                   label={isRangeRow(uhbV) ? `${uhbLabel} ${formatVerseLabel(uhbV)}` : uhbLabel}
                   chapter={chapter}
                   verseNum={uhbStart}
@@ -716,6 +757,8 @@ function StackedBody({
 }
 
 function ActiveLine({
+  book,
+  bibleVersion,
   label,
   chapter,
   verseNum,
@@ -729,8 +772,13 @@ function ActiveLine({
   editable,
   onOpenAligner,
   onEditPlain,
+  onSave,
   lexiconMap,
 }: {
+  // book + bibleVersion identify the verse for draft keying.
+  // bibleVersion is the bare code ("ULT") not the rendered label ("ULT 6-9").
+  book?: string;
+  bibleVersion?: string;
   label: string;
   chapter: number;
   verseNum: number;
@@ -743,10 +791,20 @@ function ActiveLine({
   readOnly?: boolean;
   editable?: boolean;
   onOpenAligner?: () => void;
+  // Called on every keystroke. Implementation stashes a draft; no
+  // PATCH fires until onSave is invoked.
   onEditPlain?: (plain: string) => void;
+  // Click-to-save. Shell consumes the current plain text, runs smartEditVerse,
+  // and enqueues. Only rendered when editable && draft exists.
+  onSave?: (plain: string) => void;
   lexiconMap?: Map<string, LexiconEntry | null>;
 }) {
   const isSource = label === "UHB" || label === "UGNT";
+  const draftKey = useMemo(
+    () =>
+      book && bibleVersion ? verseKey(book, chapter, verseNum, bibleVersion) : null,
+    [book, bibleVersion, chapter, verseNum],
+  );
   const activeRange = useMemo<{ start: number; end: number } | null>(() => {
     if (!findActiveMatch) return null;
     if (findActiveMatch.chapter !== chapter) return null;
@@ -755,27 +813,40 @@ function ActiveLine({
     return { start: findActiveMatch.startIndex, end: findActiveMatch.endIndex };
   }, [findActiveMatch, chapter, verseNum, label]);
   const elRef = useRef<HTMLDivElement | null>(null);
-  const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  // Latest onEditPlain reachable from the timer/unmount paths without
-  // restarting the debounce when the parent re-renders.
-  const onEditPlainRef = useRef(onEditPlain);
+  // Tracks the last value we wrote into the contenteditable DOM. The DOM
+  // reset effect (further down) skips when its target string matches this,
+  // so a parent re-render with the same text doesn't blow away the caret.
+  // Hoisted above the draft subscription so the hydration path can update
+  // it in lockstep with the DOM write.
+  const lastSetRef = useRef<string | null>(null);
+  // Subscribe to the draft store so the row knows whether it's dirty and
+  // hydrates from any saved draft on mount. The subscription fires once
+  // immediately with the current list, and again on each set/clear.
+  const [hasDraft, setHasDraft] = useState(false);
+  const hydratedFromDraftRef = useRef(false);
   useEffect(() => {
-    onEditPlainRef.current = onEditPlain;
-  }, [onEditPlain]);
-  // Flush any pending edit before the line unmounts (e.g. user navigates
-  // away mid-type). Without this, the trailing keystroke is silently lost.
-  const flushRef = useRef<() => void>(() => {});
-  flushRef.current = () => {
-    if (!debounceRef.current) return;
-    clearTimeout(debounceRef.current);
-    debounceRef.current = null;
-    const handler = onEditPlainRef.current;
-    const node = elRef.current;
-    if (handler && node) handler(node.textContent ?? "");
-  };
-  useEffect(() => {
-    return () => flushRef.current();
-  }, []);
+    if (!draftKey) {
+      setHasDraft(false);
+      return;
+    }
+    return drafts.subscribe((all) => {
+      const rec = all.find((d) => d.key === draftKey);
+      setHasDraft(!!rec);
+      if (
+        !hydratedFromDraftRef.current &&
+        rec &&
+        typeof (rec.payload as { plainText?: unknown }).plainText === "string" &&
+        elRef.current
+      ) {
+        const plain = (rec.payload as { plainText: string }).plainText;
+        if (elRef.current.textContent !== plain) {
+          elRef.current.textContent = plain;
+          lastSetRef.current = plain;
+        }
+        hydratedFromDraftRef.current = true;
+      }
+    });
+  }, [draftKey]);
 
   // Source-language token matches for this line. Only meaningful for UHB/
   // UGNT lines in non-english find modes. Drives the offset painter (UGNT)
@@ -830,9 +901,12 @@ function ActiveLine({
   // Setting lastSetRef before flushing an edit keeps this effect from
   // resetting textContent (and the caret with it) when the parent
   // applyLocalVerse round-trips back as the new `text` prop.
-  const lastSetRef = useRef<string | null>(null);
   useEffect(() => {
     if (!elRef.current) return;
+    // If the user has unsaved typing in here, leave their text alone —
+    // a parent re-render (e.g. notes panel reflow re-passes `text` from
+    // server state) must not stomp the draft.
+    if (hasDraft) return;
     const next = html ?? text;
     if (next === lastSetRef.current) return;
     if (html === null) {
@@ -869,6 +943,30 @@ function ActiveLine({
             </IconButton>
           </Tooltip>
         )}
+        {editable && !readOnly && onSave && (
+          <Tooltip
+            title={hasDraft ? "save edits" : "no unsaved edits"}
+            placement="left"
+          >
+            <span>
+              <IconButton
+                size="small"
+                disabled={!hasDraft}
+                onClick={() => onSave(elRef.current?.textContent ?? "")}
+                sx={{
+                  p: 0.25,
+                  color: hasDraft ? "primary.main" : "action.disabled",
+                }}
+              >
+                {hasDraft ? (
+                  <SaveIcon fontSize="inherit" />
+                ) : (
+                  <SaveOutlinedIcon fontSize="inherit" />
+                )}
+              </IconButton>
+            </span>
+          </Tooltip>
+        )}
       </Stack>
       {rtl && lexiconMap ? (
         <Box
@@ -901,27 +999,17 @@ function ActiveLine({
         <Box
           ref={elRef}
           data-find-cell={`${chapter}-${verseNum}-${label}`}
+          data-dirty={hasDraft ? "true" : undefined}
           contentEditable={editable && !readOnly}
           suppressContentEditableWarning
           spellCheck={!rtl}
           onInput={(e) => {
             if (readOnly || !editable || !onEditPlain) return;
             const value = (e.currentTarget as HTMLDivElement).textContent ?? "";
-            if (debounceRef.current) clearTimeout(debounceRef.current);
-            debounceRef.current = setTimeout(() => {
-              debounceRef.current = null;
-              lastSetRef.current = value;
-              onEditPlainRef.current?.(value);
-            }, 350);
-          }}
-          onBlur={() => {
-            if (readOnly || !editable || !onEditPlain) return;
-            if (!debounceRef.current) return;
-            clearTimeout(debounceRef.current);
-            debounceRef.current = null;
-            const value = elRef.current?.textContent ?? "";
+            // Record what we'd write back if the parent passes the same value
+            // as the next `text` prop — keeps the DOM reset effect quiet.
             lastSetRef.current = value;
-            onEditPlainRef.current?.(value);
+            onEditPlain(value);
           }}
           sx={(theme) => ({
             flex: 1,
@@ -940,6 +1028,12 @@ function ActiveLine({
               : '"Source Serif Pro","Cambria","Times New Roman",serif',
             outline: "none",
             ...markHighlightSx(theme.palette.mode),
+            // Orange border when this row has unsaved typing and isn't
+            // currently focused — quiet while typing, loud after you click
+            // away. Inset box-shadow so the layout doesn't shift.
+            "&[data-dirty='true']:not(:focus)": {
+              boxShadow: `inset 0 0 0 2px ${theme.palette.warning.main}`,
+            },
             "&:focus": readOnly
               ? {}
               : {
