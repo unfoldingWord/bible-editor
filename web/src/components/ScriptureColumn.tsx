@@ -915,12 +915,12 @@ function ActiveLine({
   }, [html, text]);
 
   return (
-    <Stack direction="row" spacing={1} alignItems="flex-start" sx={{ py: 0.5 }}>
+    <Box sx={{ py: 0.5 }}>
       <Stack
-        direction="column"
+        direction="row"
+        spacing={0.5}
         alignItems="center"
-        spacing={0.25}
-        sx={{ minWidth: 36, pt: 0.5, flexShrink: 0 }}
+        sx={{ mb: 0.25, minHeight: 18 }}
       >
         <Typography
           variant="caption"
@@ -929,22 +929,21 @@ function ActiveLine({
             color: "text.secondary",
             textTransform: "uppercase",
             letterSpacing: 0.5,
+            fontSize: 10,
+            fontWeight: 600,
           }}
         >
           {VERSION_LABEL[label] ?? label}
         </Typography>
         {onOpenAligner && (
-          <Tooltip title={`align ${label}`} placement="left">
+          <Tooltip title={`align ${label}`}>
             <IconButton size="small" onClick={onOpenAligner} sx={{ color: "success.main", p: 0.25 }}>
-              <LinkIcon fontSize="inherit" />
+              <LinkIcon sx={{ fontSize: 14 }} />
             </IconButton>
           </Tooltip>
         )}
         {editable && !readOnly && onSave && (
-          <Tooltip
-            title={hasDraft ? "save edits" : "no unsaved edits"}
-            placement="left"
-          >
+          <Tooltip title={hasDraft ? "save edits" : "no unsaved edits"}>
             <span>
               <IconButton
                 size="small"
@@ -956,16 +955,16 @@ function ActiveLine({
                 }}
               >
                 {hasDraft ? (
-                  <SaveIcon fontSize="inherit" />
+                  <SaveIcon sx={{ fontSize: 14 }} />
                 ) : (
-                  <SaveOutlinedIcon fontSize="inherit" />
+                  <SaveOutlinedIcon sx={{ fontSize: 14 }} />
                 )}
               </IconButton>
             </span>
           </Tooltip>
         )}
         {editable && !readOnly && hasDraft && draftKey && (
-          <Tooltip title="undo edits to this verse" placement="left">
+          <Tooltip title="undo edits to this verse">
             <IconButton
               size="small"
               onClick={() => {
@@ -978,7 +977,7 @@ function ActiveLine({
               }}
               sx={{ p: 0.25, color: "warning.main" }}
             >
-              <UndoIcon fontSize="inherit" />
+              <UndoIcon sx={{ fontSize: 14 }} />
             </IconButton>
           </Tooltip>
         )}
@@ -1058,7 +1057,7 @@ function ActiveLine({
           })}
         />
       )}
-    </Stack>
+    </Box>
   );
 }
 
