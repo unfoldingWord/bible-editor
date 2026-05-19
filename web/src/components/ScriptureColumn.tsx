@@ -964,6 +964,24 @@ function ActiveLine({
             </span>
           </Tooltip>
         )}
+        {editable && !readOnly && hasDraft && draftKey && (
+          <Tooltip title="undo edits to this verse" placement="left">
+            <IconButton
+              size="small"
+              onClick={() => {
+                void drafts.clear(draftKey);
+                hydratedFromDraftRef.current = false;
+                if (elRef.current) {
+                  elRef.current.textContent = text;
+                  lastSetRef.current = text;
+                }
+              }}
+              sx={{ p: 0.25, color: "warning.main" }}
+            >
+              <UndoIcon fontSize="inherit" />
+            </IconButton>
+          </Tooltip>
+        )}
       </Stack>
       {rtl && lexiconMap ? (
         <Box

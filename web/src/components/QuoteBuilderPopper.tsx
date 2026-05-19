@@ -309,7 +309,10 @@ function Section({
           flexWrap: "wrap",
           gap: 0.5,
           direction: rtl ? "rtl" : "ltr",
-          justifyContent: rtl ? "flex-end" : "flex-start",
+          // justify-content stays flex-start for both directions. In RTL,
+          // flex-start IS the visual right; flex-end would push wrapped
+          // lines to the visual left and leave the 2nd line orphaned.
+          justifyContent: "flex-start",
         }}
       >
         {children}
