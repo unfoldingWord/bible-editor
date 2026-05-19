@@ -2,7 +2,7 @@ import { Hono } from "hono";
 import { z } from "zod";
 import type { Env } from "./index";
 import type { RowKind, TnRow, TqRow, TwlRow } from "./types";
-import { currentUserId, requireAuth } from "./auth";
+import { currentUserId, requireEditor } from "./auth";
 import { activePipelineForChapter, lockedResponseBody } from "./chapterLock";
 import { broadcastChapter } from "./wsEvents";
 
@@ -16,12 +16,12 @@ const KIND_TO_TABLE: Record<RowKind, string> = {
 
 const isRowKind = (k: string): k is RowKind => k in KIND_TO_TABLE;
 
-// Adds an optional book filter to a WHERE clause using NULL-safe semantics:
-//   AND (?N IS NULL OR book = ?N)
-// Bind the book (or null) at position paramN. When null the clause is always
-// true (backwards-compat for old IndexedDB ops that pre-date this field).
+// Adds a book filter to a WHERE clause. After the composite-(book, id) PK
+// migration (0015), every row lookup MUST be scoped by book — the same 4-char
+// id can exist in two books with different content. Handlers guarantee a
+// non-null book before threading the value through to bind position `paramN`.
 function bookClause(paramN: number): string {
-  return ` AND (?${paramN} IS NULL OR book = ?${paramN})`;
+  return ` AND book = ?${paramN}`;
 }
 
 // Reuse the Hono request lifecycle to pull "expected version" off the
@@ -113,7 +113,7 @@ const CreateTwl = z.object({
 });
 const CREATE_SCHEMA = { tn: CreateTn, tq: CreateTq, twl: CreateTwl };
 
-rows.post("/:kind", requireAuth, async (c) => {
+rows.post("/:kind", requireEditor, async (c) => {
   const kind = c.req.param("kind");
   if (!isRowKind(kind)) return c.json({ error: "invalid_kind" }, 400);
   let body: unknown;
@@ -155,9 +155,9 @@ rows.post("/:kind", requireAuth, async (c) => {
           .bind(...values),
         c.env.DB
           .prepare(
-            `INSERT INTO edit_log (kind, row_key, user_id, prev_version, new_version, action, payload_json) VALUES (?1, ?2, ?3, NULL, 1, 'create', ?4)`,
+            `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, payload_json) VALUES (?1, ?2, ?3, ?4, NULL, 1, 'create', ?5)`,
           )
-          .bind(kind, id, userId, JSON.stringify(data)),
+          .bind(kind, id, data.book, userId, JSON.stringify(data)),
       ]);
       lastErr = null;
       break;
@@ -174,9 +174,9 @@ rows.post("/:kind", requireAuth, async (c) => {
   }
 
   const created = await c.env.DB.prepare(
-    `SELECT * FROM ${KIND_TO_TABLE[kind]} WHERE id = ?1`,
+    `SELECT * FROM ${KIND_TO_TABLE[kind]} WHERE id = ?1 AND book = ?2`,
   )
-    .bind(id)
+    .bind(id, data.book)
     .first();
   if (created) {
     const row = created as unknown as TnRow | TqRow | TwlRow;
@@ -190,8 +190,9 @@ rows.post("/:kind", requireAuth, async (c) => {
 rows.get("/:kind/:id", async (c) => {
   const kind = c.req.param("kind");
   const id = c.req.param("id");
-  const book = c.req.query("book") ?? null;
+  const book = c.req.query("book");
   if (!isRowKind(kind)) return c.json({ error: "invalid_kind" }, 400);
+  if (!book) return c.json({ error: "book_required" }, 400);
   const row = await c.env.DB.prepare(
     `SELECT * FROM ${KIND_TO_TABLE[kind]} WHERE id = ?1${bookClause(2)}`,
   )
@@ -222,11 +223,12 @@ const HISTORY_FIELDS: Record<RowKind, string[]> = {
 // edited later, the synthesized v1 still reflects the current value (the
 // real pre-edit value is lost), but the higher-version reconstructions are
 // correct because patches always override the baseline going forward.
-rows.get("/:kind/:id/history", async (c) => {
+rows.get("/:kind/:id/history", requireEditor, async (c) => {
   const kind = c.req.param("kind");
   const id = c.req.param("id");
-  const book = c.req.query("book") ?? null;
+  const book = c.req.query("book");
   if (!isRowKind(kind)) return c.json({ error: "invalid_kind" }, 400);
+  if (!book) return c.json({ error: "book_required" }, 400);
 
   const currentRow = await c.env.DB.prepare(
     `SELECT * FROM ${KIND_TO_TABLE[kind]} WHERE id = ?1${bookClause(2)}`,
@@ -237,6 +239,10 @@ rows.get("/:kind/:id/history", async (c) => {
     return c.json({ error: "not_found" }, 404);
   }
 
+  // edit_log.book was backfilled in migration 0017. Legacy entries with no
+  // book column (kind = 'tn'/'tq'/'twl' from before the migration) fall back
+  // to (kind, row_key) only — the `el.book IS NULL` branch — so pre-migration
+  // audit trails still display, just without cross-book disambiguation.
   const rs = await c.env.DB.prepare(
     `SELECT el.new_version AS version,
             el.action,
@@ -248,10 +254,12 @@ rows.get("/:kind/:id/history", async (c) => {
             u.dcs_full_name AS full_name
        FROM edit_log el
        LEFT JOIN users u ON u.id = el.user_id
-      WHERE el.kind = ?1 AND el.row_key = ?2 AND el.new_version IS NOT NULL
+      WHERE el.kind = ?1 AND el.row_key = ?2
+        AND (el.book = ?3 OR el.book IS NULL)
+        AND el.new_version IS NOT NULL
       ORDER BY el.new_version ASC`,
   )
-    .bind(kind, id)
+    .bind(kind, id, book)
     .all<{
       version: number;
       action: string;
@@ -335,11 +343,12 @@ rows.get("/:kind/:id/history", async (c) => {
 // the version check is enforced inside the UPDATE itself — a SELECT-then-
 // UPDATE pair would race between two concurrent writers, both seeing the
 // same version and both committing, silently losing one user's edit.
-rows.patch("/:kind/:id", requireAuth, async (c) => {
+rows.patch("/:kind/:id", requireEditor, async (c) => {
   const kind = c.req.param("kind");
   const id = c.req.param("id");
-  const book = c.req.query("book") ?? null;
+  const book = c.req.query("book");
   if (!isRowKind(kind)) return c.json({ error: "invalid_kind" }, 400);
+  if (!book) return c.json({ error: "book_required" }, 400);
 
   const expected = parseIfMatch(c.req.header("if-match"));
   if (expected === null) {
@@ -434,11 +443,11 @@ rows.patch("/:kind/:id", requireAuth, async (c) => {
       .bind(...values),
     c.env.DB
       .prepare(
-        `INSERT INTO edit_log (kind, row_key, user_id, prev_version, new_version, action, payload_json, restored_from_version)
-         SELECT ?1, ?2, ?3, ?4, ?5, 'update', ?6, ?7
-         WHERE EXISTS (SELECT 1 FROM ${KIND_TO_TABLE[kind]} WHERE id = ?2 AND version = ?5)`,
+        `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, payload_json, restored_from_version)
+         SELECT ?1, ?2, ?3, ?4, ?5, ?6, 'update', ?7, ?8
+         WHERE EXISTS (SELECT 1 FROM ${KIND_TO_TABLE[kind]} WHERE id = ?2 AND book = ?3 AND version = ?6)`,
       )
-      .bind(kind, id, userId, expected, newVersion, JSON.stringify(patch), restoredFromVersion),
+      .bind(kind, id, book, userId, expected, newVersion, JSON.stringify(patch), restoredFromVersion),
   ]);
 
   if (!updateRes.meta.changes) {
@@ -468,11 +477,12 @@ rows.patch("/:kind/:id", requireAuth, async (c) => {
 });
 
 // Soft delete with the same atomic version guard as PATCH.
-rows.delete("/:kind/:id", requireAuth, async (c) => {
+rows.delete("/:kind/:id", requireEditor, async (c) => {
   const kind = c.req.param("kind");
   const id = c.req.param("id");
-  const book = c.req.query("book") ?? null;
+  const book = c.req.query("book");
   if (!isRowKind(kind)) return c.json({ error: "invalid_kind" }, 400);
+  if (!book) return c.json({ error: "book_required" }, 400);
   const expected = parseIfMatch(c.req.header("if-match"));
   if (expected === null) {
     return c.json({ error: "if_match_required" }, 428);
@@ -504,11 +514,11 @@ rows.delete("/:kind/:id", requireAuth, async (c) => {
       .bind(now, userId, id, expected, book),
     c.env.DB
       .prepare(
-        `INSERT INTO edit_log (kind, row_key, user_id, prev_version, new_version, action)
-         SELECT ?1, ?2, ?3, ?4, ?5, 'delete'
-         WHERE EXISTS (SELECT 1 FROM ${KIND_TO_TABLE[kind]} WHERE id = ?2 AND version = ?5 AND deleted_at IS NOT NULL)`,
+        `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action)
+         SELECT ?1, ?2, ?3, ?4, ?5, ?6, 'delete'
+         WHERE EXISTS (SELECT 1 FROM ${KIND_TO_TABLE[kind]} WHERE id = ?2 AND book = ?3 AND version = ?6 AND deleted_at IS NOT NULL)`,
       )
-      .bind(kind, id, userId, expected, newVersion),
+      .bind(kind, id, book, userId, expected, newVersion),
   ]);
 
   if (!updateRes.meta.changes) {
@@ -543,7 +553,7 @@ const TnBitBody = z.object({ value: z.union([z.literal(0), z.literal(1), z.boole
 async function setTnBit(
   env: Env,
   id: string,
-  book: string | null,
+  book: string,
   userId: number | null,
   column: "preserve" | "hint",
   value: 0 | 1,
@@ -563,8 +573,8 @@ async function setTnBit(
       .bind(value, now, id, book),
     env.DB
       .prepare(
-        `INSERT INTO edit_log (kind, row_key, user_id, prev_version, new_version, action)
-         SELECT 'tn', ?1, ?2, version, version, ?3
+        `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action)
+         SELECT 'tn', ?1, book, ?2, version, version, ?3
            FROM tn_rows
           WHERE id = ?1 AND deleted_at IS NULL${bookClause(4)}`,
       )
@@ -580,9 +590,10 @@ function coerceBitValue(raw: 0 | 1 | boolean): 0 | 1 {
 
 // POST /api/rows/tn/:id/preserve — toggle the "survive future AI pipeline
 // sweeps" bit. Body: { value: 0 | 1 | boolean }. Lock-exempt. Idempotent.
-rows.post("/tn/:id/preserve", requireAuth, async (c) => {
+rows.post("/tn/:id/preserve", requireEditor, async (c) => {
   const id = c.req.param("id");
-  const book = c.req.query("book") ?? null;
+  const book = c.req.query("book");
+  if (!book) return c.json({ error: "book_required" }, 400);
   const userId = currentUserId(c);
   let body: unknown;
   try {
@@ -602,9 +613,10 @@ rows.post("/tn/:id/preserve", requireAuth, async (c) => {
 // POST /api/rows/tn/:id/hint — toggle the "queue as AI-pipeline hint" bit.
 // hint=1 rows are sent into the next /api/pipelines/start as options.hints
 // and are excluded from deleteUnkeptTns; AI expansion clears the bit.
-rows.post("/tn/:id/hint", requireAuth, async (c) => {
+rows.post("/tn/:id/hint", requireEditor, async (c) => {
   const id = c.req.param("id");
-  const book = c.req.query("book") ?? null;
+  const book = c.req.query("book");
+  if (!book) return c.json({ error: "book_required" }, 400);
   const userId = currentUserId(c);
   let body: unknown;
   try {
@@ -625,9 +637,10 @@ rows.post("/tn/:id/hint", requireAuth, async (c) => {
 // The old semantics ("claim a row during a run by setting updated_by") are
 // folded into the always-on preserve bit. Kept so external callers and
 // in-flight outbox ops keep working without a coordinated migration.
-rows.post("/tn/:id/keep", requireAuth, async (c) => {
+rows.post("/tn/:id/keep", requireEditor, async (c) => {
   const id = c.req.param("id");
-  const book = c.req.query("book") ?? null;
+  const book = c.req.query("book");
+  if (!book) return c.json({ error: "book_required" }, 400);
   const userId = currentUserId(c);
   const updated = await setTnBit(c.env, id, book, userId, "preserve", 1);
   if (!updated) return c.json({ error: "not_found" }, 404);

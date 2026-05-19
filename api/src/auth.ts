@@ -16,12 +16,30 @@ import { getCookie, setCookie, deleteCookie } from "hono/cookie";
 import { SignJWT, jwtVerify } from "jose";
 import type { Env } from "./index";
 
+export type Role = "admin" | "editor";
+
 export interface AuthClaims {
   userId: number;
   username?: string;
+  role?: Role;
 }
 
-type AppContext = Context<{ Bindings: Env; Variables: { userId?: number; username?: string } }>;
+type AppContext = Context<{
+  Bindings: Env;
+  Variables: { userId?: number; username?: string; role?: Role };
+}>;
+
+// COLLATE NOCASE on user_roles.dcs_username means the WHERE compare is case-
+// insensitive without us having to lowercase anywhere. Returns null when the
+// user isn't on the allowlist — callers translate that to a denial.
+async function lookupUserRole(env: Env, dcsUsername: string): Promise<Role | null> {
+  const row = await env.DB.prepare(
+    `SELECT role FROM user_roles WHERE dcs_username = ?1`,
+  )
+    .bind(dcsUsername)
+    .first<{ role: Role }>();
+  return row?.role ?? null;
+}
 
 function signingKey(env: Env): Uint8Array | null {
   if (!env.JWT_SIGNING_KEY) return null;
@@ -33,13 +51,21 @@ export async function verifyToken(token: string, env: Env): Promise<AuthClaims |
   if (!key) return null;
   try {
     const { payload } = await jwtVerify(token, key, {
+      algorithms: ["HS256"],
       issuer: env.JWT_ISSUER,
     });
     const sub = payload.sub;
     if (!sub) return null;
     const userId = parseInt(String(sub), 10);
     if (!Number.isFinite(userId)) return null;
-    return { userId, username: typeof payload.username === "string" ? payload.username : undefined };
+    const rawRole = payload.role;
+    const role: Role | undefined =
+      rawRole === "admin" || rawRole === "editor" ? rawRole : undefined;
+    return {
+      userId,
+      username: typeof payload.username === "string" ? payload.username : undefined,
+      role,
+    };
   } catch {
     return null;
   }
@@ -57,6 +83,7 @@ export const attachAuth: MiddlewareHandler = async (c, next) => {
     if (claims) {
       (c as AppContext).set("userId", claims.userId);
       if (claims.username) (c as AppContext).set("username", claims.username);
+      if (claims.role) (c as AppContext).set("role", claims.role);
     }
   }
   await next();
@@ -70,9 +97,37 @@ export const requireAuth: MiddlewareHandler = async (c, next) => {
   await next();
 };
 
+// requireEditor: any role allowed on the user_roles table can write.
+// requireAdmin: role must be 'admin' (exports + future destructive ops).
+// Both still require a valid JWT (401 first), then role (403).
+export const requireEditor: MiddlewareHandler = async (c, next) => {
+  const userId = (c as AppContext).get("userId");
+  if (!userId) return c.json({ error: "unauthorized" }, 401);
+  const role = (c as AppContext).get("role");
+  if (role !== "admin" && role !== "editor") {
+    return c.json({ error: "forbidden", reason: "not_an_editor" }, 403);
+  }
+  await next();
+};
+
+export const requireAdmin: MiddlewareHandler = async (c, next) => {
+  const userId = (c as AppContext).get("userId");
+  if (!userId) return c.json({ error: "unauthorized" }, 401);
+  const role = (c as AppContext).get("role");
+  if (role !== "admin") {
+    return c.json({ error: "forbidden", reason: "not_an_admin" }, 403);
+  }
+  await next();
+};
+
 export function currentUserId(c: Context): number | null {
   const v = (c as AppContext).get("userId");
   return typeof v === "number" ? v : null;
+}
+
+export function currentUserRole(c: Context): Role | null {
+  const v = (c as AppContext).get("role");
+  return v === "admin" || v === "editor" ? v : null;
 }
 
 // ── DCS OAuth ────────────────────────────────────────────────────────────────
@@ -110,11 +165,12 @@ async function mintToken(
   c: AppContext,
   userId: number,
   username: string,
+  role: Role,
 ): Promise<string> {
   const key = signingKey(c.env)!;
   const ttl = parseInt(c.env.JWT_TTL_SECONDS, 10);
   const ttlSeconds = Number.isFinite(ttl) && ttl > 0 ? ttl : 1209600;
-  return new SignJWT({ username })
+  return new SignJWT({ username, role })
     .setProtectedHeader({ alg: "HS256" })
     .setSubject(String(userId))
     .setIssuer(c.env.JWT_ISSUER)
@@ -190,6 +246,18 @@ export async function callbackDcsAuth(c: AppContext): Promise<Response> {
   if (!userRes.ok) return c.json({ error: "user_fetch_failed" }, 502);
   const dcsUser = (await userRes.json()) as { id: number; login: string; full_name?: string };
 
+  // Allowlist gate. Look up user_roles BEFORE upserting into users so denied
+  // accounts never persist. SPA reads _auth_denied off the redirect and shows
+  // a "contact admin" screen.
+  const origin = new URL(c.req.url).origin;
+  const role = await lookupUserRole(c.env, dcsUser.login);
+  if (!role) {
+    return c.redirect(
+      `${origin}/?_auth_denied=1&u=${encodeURIComponent(dcsUser.login)}`,
+      302,
+    );
+  }
+
   // Upsert users row keyed by dcs_user_id.
   await c.env.DB.prepare(
     `INSERT INTO users (dcs_user_id, dcs_username, dcs_full_name)
@@ -206,11 +274,10 @@ export async function callbackDcsAuth(c: AppContext): Promise<Response> {
     .first<{ id: number }>();
   if (!userRow) return c.json({ error: "user_create_failed" }, 500);
 
-  const token = await mintToken(c, userRow.id, dcsUser.login);
+  const token = await mintToken(c, userRow.id, dcsUser.login, role);
 
   // Redirect the SPA back to the root with the token in the query string.
   // App.tsx reads _auth on load, persists it to localStorage, and cleans the URL.
-  const origin = new URL(c.req.url).origin;
   return c.redirect(`${origin}/?_auth=${encodeURIComponent(token)}`, 302);
 }
 
@@ -218,8 +285,9 @@ export async function callbackDcsAuth(c: AppContext): Promise<Response> {
 export async function authMe(c: AppContext): Promise<Response> {
   const userId = (c as AppContext).get("userId");
   const username = (c as AppContext).get("username");
+  const role = (c as AppContext).get("role");
   if (!userId) return c.json({ error: "unauthorized" }, 401);
-  return c.json({ userId, username: username ?? null });
+  return c.json({ userId, username: username ?? null, role: role ?? null });
 }
 
 // POST /api/auth/refresh — exchanges a current-or-recently-expired bearer
@@ -241,6 +309,7 @@ export async function refreshToken(c: AppContext): Promise<Response> {
   let username: string | null = null;
   try {
     const { payload } = await jwtVerify(token, key, {
+      algorithms: ["HS256"],
       issuer: c.env.JWT_ISSUER,
       clockTolerance: REFRESH_GRACE_SECONDS,
     });
@@ -263,22 +332,42 @@ export async function refreshToken(c: AppContext): Promise<Response> {
     .first<{ id: number; dcs_username: string }>();
   if (!row) return c.json({ error: "unauthorized" }, 401);
 
-  const newToken = await mintToken(c, row.id, row.dcs_username ?? username ?? "user");
+  // Re-check the allowlist on refresh — yanking a user from user_roles takes
+  // effect by the next refresh, not via the old JWT's natural expiration.
+  const role = await lookupUserRole(c.env, row.dcs_username ?? username ?? "");
+  if (!role) {
+    return c.json({ error: "forbidden", reason: "not_an_editor" }, 403);
+  }
+
+  const newToken = await mintToken(c, row.id, row.dcs_username ?? username ?? "user", role);
   const ttl = parseInt(c.env.JWT_TTL_SECONDS, 10);
   const expiresIn = Number.isFinite(ttl) && ttl > 0 ? ttl : 1209600;
-  return c.json({ token: newToken, expiresIn });
+  return c.json({ token: newToken, expiresIn, role });
 }
 
 // ── Dev-only token mint ───────────────────────────────────────────────────────
 
 // Looks up (or inserts) a user row by dcs_username and returns a signed JWT.
 // Production paths use /api/auth/dcs; this exists so local dev isn't blocked
-// on having a DCS OAuth app registered.
+// on having a DCS OAuth app registered. Dev users that aren't in user_roles
+// are auto-granted 'admin' so the local dev experience exercises all role
+// paths without needing a manual seed step.
 export async function mintDevToken(c: AppContext, username: string): Promise<Response> {
   const key = signingKey(c.env);
   if (!key) {
     return c.json({ error: "jwt_signing_key_not_configured" }, 500);
   }
+
+  let role = await lookupUserRole(c.env, username);
+  if (!role) {
+    await c.env.DB.prepare(
+      `INSERT OR IGNORE INTO user_roles (dcs_username, role) VALUES (?1, 'admin')`,
+    )
+      .bind(username)
+      .run();
+    role = "admin";
+  }
+
   const existing = await c.env.DB.prepare(
     `SELECT id FROM users WHERE dcs_username = ?1`,
   )
@@ -305,6 +394,6 @@ export async function mintDevToken(c: AppContext, username: string): Promise<Res
   }
   const ttl = parseInt(c.env.JWT_TTL_SECONDS, 10);
   const ttlSeconds = Number.isFinite(ttl) && ttl > 0 ? ttl : 1209600;
-  const token = await mintToken(c, userId, username);
-  return c.json({ token, userId, username, expiresIn: ttlSeconds });
+  const token = await mintToken(c, userId, username, role);
+  return c.json({ token, userId, username, role, expiresIn: ttlSeconds });
 }

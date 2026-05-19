@@ -4,7 +4,7 @@ import { useEffect, useState } from "react";
 import { Alert, Box, Button, CircularProgress, Snackbar, Stack, Typography } from "@mui/material";
 import { Shell } from "./components/Shell";
 import { useBook } from "./hooks/useBook";
-import { devSignIn, getAuthToken, onAuthError, setAuthToken } from "./sync/api";
+import { devSignIn, fetchAuthMe, getAuthToken, onAuthError, setAuthToken } from "./sync/api";
 
 interface Location {
   book: string;
@@ -26,37 +26,92 @@ function parseHash(): Location {
 // have one before mounting the editor — otherwise every save 401s.
 //
 // Boot sequence:
-//   1. If the URL has ?_auth=<token> (DCS OAuth callback), store it and clean URL.
-//   2. If a token is already in localStorage, skip straight to ready.
-//   3. In dev mode (import.meta.env.DEV), silently mint via /api/auth/dev.
-//   4. Otherwise redirect to /api/auth/dcs/start (production OAuth flow).
+//   1. If the URL has ?_auth_denied=1, the OAuth callback rejected this DCS
+//      account (not on the editor allowlist). Show the denied screen.
+//   2. If the URL has ?_auth=<token> (DCS OAuth callback success), store it
+//      and clean URL, then verify the role via /api/auth/me.
+//   3. If a token is already in localStorage, verify via /api/auth/me.
+//   4. In dev mode (import.meta.env.DEV), silently mint via /api/auth/dev.
+//   5. Otherwise redirect to /api/auth/dcs/start (production OAuth flow).
 type AuthState =
   | { kind: "loading" }
+  | { kind: "verifying" }                          // have a token; checking role
   | { kind: "ready" }
-  | { kind: "missing" }   // DCS OAuth available — show sign-in button
+  | { kind: "missing" }                            // DCS OAuth available — show sign-in button
+  | { kind: "denied"; username: string | null }    // signed in but not on editor allowlist
   | { kind: "error"; message: string };
 
 function useAuthGate(): AuthState {
   const [state, setState] = useState<AuthState>(() => {
-    // Step 1: absorb token from DCS OAuth callback.
     const params = new URLSearchParams(location.search);
+
+    // Step 1: OAuth callback rejected this account (not on the allowlist).
+    if (params.get("_auth_denied")) {
+      const username = params.get("u");
+      history.replaceState(null, "", location.pathname + location.hash);
+      return { kind: "denied", username };
+    }
+
+    // Step 2: absorb token from DCS OAuth callback.
     const urlToken = params.get("_auth");
     if (urlToken) {
       setAuthToken(urlToken);
       history.replaceState(null, "", location.pathname + location.hash);
-      return { kind: "ready" };
+      return { kind: "verifying" };
     }
-    return getAuthToken() ? { kind: "ready" } : { kind: "loading" };
+
+    return getAuthToken() ? { kind: "verifying" } : { kind: "loading" };
   });
+
+  // verifying → ready/denied/error. Single fetch of /api/auth/me; the role
+  // claim is also in the JWT so we trust the response.
+  useEffect(() => {
+    if (state.kind !== "verifying") return;
+    let cancelled = false;
+    fetchAuthMe()
+      .then((me) => {
+        if (cancelled) return;
+        if (!me) {
+          setState({ kind: "loading" });
+          return;
+        }
+        if (me.role === "admin" || me.role === "editor") {
+          setState({ kind: "ready" });
+        } else {
+          setState({ kind: "denied", username: me.username });
+        }
+      })
+      .catch((err: unknown) => {
+        if (cancelled) return;
+        const status = (err as { status?: number })?.status;
+        if (status === 401) {
+          // Token bad / refresh path failed. Clear and start over.
+          setAuthToken(null);
+          setState({ kind: "loading" });
+        } else if (status === 403) {
+          setState({ kind: "denied", username: null });
+        } else {
+          setState({ kind: "error", message: String(err) });
+        }
+      });
+    return () => { cancelled = true; };
+  }, [state.kind]);
 
   useEffect(() => {
     if (state.kind !== "loading") return;
     let cancelled = false;
 
     if (import.meta.env.DEV) {
-      // Step 3: silent dev mint — only when DEV_AUTH_ENABLED=true on the worker.
+      // Step 4: silent dev mint — only when DEV_AUTH_ENABLED=true on the worker.
       devSignIn("dev")
-        .then(() => { if (!cancelled) setState({ kind: "ready" }); })
+        .then((resp) => {
+          if (cancelled) return;
+          if (resp.role === "admin" || resp.role === "editor") {
+            setState({ kind: "ready" });
+          } else {
+            setState({ kind: "denied", username: resp.username });
+          }
+        })
         .catch((err: unknown) => {
           if (cancelled) return;
           const status = (err as { status?: number })?.status;
@@ -65,7 +120,7 @@ function useAuthGate(): AuthState {
           else setState({ kind: "error", message: String(err) });
         });
     } else {
-      // Step 4: production — hand off to DCS OAuth.
+      // Step 5: production — hand off to DCS OAuth.
       setState({ kind: "missing" });
     }
 
@@ -100,7 +155,7 @@ export function App() {
         : `#/${book}/${chapter}`;
   };
 
-  if (auth.kind === "loading") {
+  if (auth.kind === "loading" || auth.kind === "verifying") {
     return (
       <Stack alignItems="center" justifyContent="center" sx={{ height: "100vh" }} spacing={2}>
         <CircularProgress />
@@ -114,6 +169,29 @@ export function App() {
         <Typography variant="h6">Sign in to continue</Typography>
         <Button variant="contained" href="/api/auth/dcs/start" size="large">
           Sign in with Door43
+        </Button>
+      </Stack>
+    );
+  }
+  if (auth.kind === "denied") {
+    return (
+      <Stack alignItems="center" justifyContent="center" sx={{ height: "100vh", px: 4 }} spacing={2}>
+        <Typography variant="h6">Not authorized</Typography>
+        <Typography variant="body2" color="text.secondary" textAlign="center" sx={{ maxWidth: 480 }}>
+          {auth.username
+            ? `Your DCS account "${auth.username}" isn't on the editor allowlist for this app yet.`
+            : `Your DCS account isn't on the editor allowlist for this app yet.`}
+          {" "}If you should have access, ask an admin to add you.
+        </Typography>
+        <Button
+          variant="outlined"
+          onClick={() => {
+            setAuthToken(null);
+            location.href = "/api/auth/dcs/start";
+          }}
+          size="small"
+        >
+          Sign in with a different Door43 account
         </Button>
       </Stack>
     );

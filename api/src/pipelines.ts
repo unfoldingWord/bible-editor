@@ -2,7 +2,7 @@
 // docs/ai-pipeline-integration.md and the partner contract). Phase 1 keeps
 // state in D1 so polling survives a tab reload; we don't parse output yet.
 //
-// Auth: every route requires a JWT (requireAuth). The shared BT_API_TOKEN
+// Auth: every route requires a JWT (requireEditor). The shared BT_API_TOKEN
 // (same secret used by /api/tn-quick) authorizes us upstream. The translator's
 // DCS username is injected from the JWT — never from the request body — so a
 // caller can't attribute runs to other users.
@@ -10,7 +10,7 @@
 import { Hono } from "hono";
 import { z } from "zod";
 import type { Env } from "./index";
-import { currentUserId, requireAuth } from "./auth";
+import { currentUserId, requireEditor } from "./auth";
 import { importJobOutput } from "./pipelineImport";
 
 export const pipelines = new Hono<{
@@ -329,7 +329,7 @@ export async function pollAllNonTerminal(env: Env): Promise<void> {
 }
 
 // POST /api/pipelines/start
-pipelines.post("/start", requireAuth, async (c) => {
+pipelines.post("/start", requireEditor, async (c) => {
   if (!c.env.BT_API_TOKEN) {
     return c.json({ error: "pipeline_api_disabled" }, 503);
   }
@@ -500,7 +500,7 @@ pipelines.post("/start", requireAuth, async (c) => {
 });
 
 // GET /api/pipelines/:jobId
-pipelines.get("/:jobId", requireAuth, async (c) => {
+pipelines.get("/:jobId", requireEditor, async (c) => {
   if (!c.env.BT_API_TOKEN) {
     return c.json({ error: "pipeline_api_disabled" }, 503);
   }
@@ -735,7 +735,7 @@ function countChainSuffixes(sessionKey: string): number {
 //     cron finished a job in the user's absence.
 //
 // An explicit ?state= filter overrides this and returns exactly that set.
-pipelines.get("/", requireAuth, async (c) => {
+pipelines.get("/", requireEditor, async (c) => {
   const userId = currentUserId(c);
   if (!userId) return c.json({ error: "unauthorized" }, 401);
 
@@ -812,7 +812,7 @@ interface PipelineRowSelect {
 // surfaced a toast in the user's UI, so the next page load doesn't re-toast
 // the same completion. Idempotent: setting notified_user_at on an already-
 // notified job is a no-op (we only write where it's currently NULL).
-pipelines.post("/:jobId/notified", requireAuth, async (c) => {
+pipelines.post("/:jobId/notified", requireEditor, async (c) => {
   const userId = currentUserId(c);
   if (!userId) return c.json({ error: "unauthorized" }, 401);
   const jobId = c.req.param("jobId");

@@ -388,19 +388,21 @@ async function deleteUnkeptTns(
       stmts.push(
         env.DB
           .prepare(
+            // Composite-key scoped: a colliding-id row in another book must
+            // not be touched by this run.
             `UPDATE tn_rows
                SET deleted_at = ?1, version = version + 1,
                    updated_at = ?1, updated_by = ?2
-             WHERE id = ?3 AND deleted_at IS NULL`,
+             WHERE id = ?3 AND book = ?4 AND deleted_at IS NULL`,
           )
-          .bind(now, userId, t.id),
+          .bind(now, userId, t.id, job.book),
         env.DB
           .prepare(
             `INSERT INTO edit_log
-               (kind, row_key, user_id, prev_version, new_version, action, source)
-             VALUES ('tn', ?1, ?2, ?3, ?4, 'delete', ?5)`,
+               (kind, row_key, book, user_id, prev_version, new_version, action, source)
+             VALUES ('tn', ?1, ?2, ?3, ?4, ?5, 'delete', ?6)`,
           )
-          .bind(t.id, userId, t.version, t.version + 1, AI_SOURCE),
+          .bind(t.id, job.book, userId, t.version, t.version + 1, AI_SOURCE),
       );
     }
     await env.DB.batch(stmts);
@@ -446,7 +448,8 @@ async function applyTnHintExpansionIfMatch(
         // Update content; clear hint so the row stops being queued for
         // future runs. Leave preserve and updated_by alone — the row's
         // standing authorship stays with whoever created the stub, and
-        // any prior preserve intent survives the expansion.
+        // any prior preserve intent survives the expansion. book-scoped
+        // so a colliding stub id in another book isn't clobbered.
         `UPDATE tn_rows
             SET quote = ?1,
                 support_reference = ?2,
@@ -457,7 +460,7 @@ async function applyTnHintExpansionIfMatch(
                 hint = 0,
                 version = version + 1,
                 updated_at = ?7
-          WHERE id = ?8 AND deleted_at IS NULL`,
+          WHERE id = ?8 AND book = ?9 AND deleted_at IS NULL`,
       )
       .bind(
         (payload.quote as string | null | undefined) ?? null,
@@ -468,6 +471,7 @@ async function applyTnHintExpansionIfMatch(
         (payload.tags as string | null | undefined) ?? null,
         now,
         stub.id,
+        job.book,
       ),
     env.DB
       .prepare(
@@ -475,11 +479,12 @@ async function applyTnHintExpansionIfMatch(
         // label so the row-level AI chip stays off. NoteHistoryDialog can
         // surface this as "AI hint expansion" or similar.
         `INSERT INTO edit_log
-           (kind, row_key, user_id, prev_version, new_version, action, payload_json, source)
-         VALUES ('tn', ?1, ?2, ?3, ?4, 'update', ?5, ?6)`,
+           (kind, row_key, book, user_id, prev_version, new_version, action, payload_json, source)
+         VALUES ('tn', ?1, ?2, ?3, ?4, ?5, 'update', ?6, ?7)`,
       )
       .bind(
         stub.id,
+        job.book,
         userId,
         stub.version,
         stub.version + 1,
@@ -548,10 +553,10 @@ async function applyTnInsert(
         env.DB
           .prepare(
             `INSERT INTO edit_log
-               (kind, row_key, user_id, prev_version, new_version, action, payload_json, source)
-             VALUES ('tn', ?1, ?2, NULL, 1, 'create', ?3, ?4)`,
+               (kind, row_key, book, user_id, prev_version, new_version, action, payload_json, source)
+             VALUES ('tn', ?1, ?2, ?3, NULL, 1, 'create', ?4, ?5)`,
           )
-          .bind(id, userId, JSON.stringify(payload), AI_SOURCE),
+          .bind(id, p.book, userId, JSON.stringify(payload), AI_SOURCE),
         env.DB
           .prepare(
             `UPDATE pending_imports
@@ -580,12 +585,12 @@ async function applyTqUpsert(
   const proposedId = typeof payload.id === "string" && payload.id.length > 0 ? payload.id : null;
 
   if (proposedId) {
-    // Try update first. The version + updated_by/at bump matches the human
-    // PATCH semantics so history rendering treats the row uniformly.
+    // Try update first. Book-scoped to match the composite PK — a colliding
+    // proposed id in another book is a "not found here", not a stale match.
     const existing = await env.DB.prepare(
-      `SELECT version FROM tq_rows WHERE id = ?1 AND deleted_at IS NULL`,
+      `SELECT version FROM tq_rows WHERE id = ?1 AND book = ?2 AND deleted_at IS NULL`,
     )
-      .bind(proposedId)
+      .bind(proposedId, p.book)
       .first<{ version: number }>();
     if (existing) {
       const newVersion = existing.version + 1;
@@ -605,7 +610,7 @@ async function applyTqUpsert(
                 SET ref_raw = ?1, tags = ?2, quote = ?3, occurrence = ?4,
                     question = ?5, response = ?6,
                     version = version + 1, updated_at = ?7, updated_by = ?8
-              WHERE id = ?9 AND deleted_at IS NULL`,
+              WHERE id = ?9 AND book = ?10 AND deleted_at IS NULL`,
           )
           .bind(
             patch.ref_raw,
@@ -617,14 +622,15 @@ async function applyTqUpsert(
             now,
             userId,
             proposedId,
+            p.book,
           ),
         env.DB
           .prepare(
             `INSERT INTO edit_log
-               (kind, row_key, user_id, prev_version, new_version, action, payload_json, source)
-             VALUES ('tq', ?1, ?2, ?3, ?4, 'update', ?5, ?6)`,
+               (kind, row_key, book, user_id, prev_version, new_version, action, payload_json, source)
+             VALUES ('tq', ?1, ?2, ?3, ?4, ?5, 'update', ?6, ?7)`,
           )
-          .bind(proposedId, userId, existing.version, newVersion, JSON.stringify(patch), AI_SOURCE),
+          .bind(proposedId, p.book, userId, existing.version, newVersion, JSON.stringify(patch), AI_SOURCE),
         env.DB
           .prepare(
             `UPDATE pending_imports SET accepted_at = unixepoch(), accepted_by = ?2 WHERE id = ?1`,
@@ -690,10 +696,10 @@ async function insertTqAtId(
     env.DB
       .prepare(
         `INSERT INTO edit_log
-           (kind, row_key, user_id, prev_version, new_version, action, payload_json, source)
-         VALUES ('tq', ?1, ?2, NULL, 1, 'create', ?3, ?4)`,
+           (kind, row_key, book, user_id, prev_version, new_version, action, payload_json, source)
+         VALUES ('tq', ?1, ?2, ?3, NULL, 1, 'create', ?4, ?5)`,
       )
-      .bind(id, userId, JSON.stringify(payload), AI_SOURCE),
+      .bind(id, p.book, userId, JSON.stringify(payload), AI_SOURCE),
     env.DB
       .prepare(
         `UPDATE pending_imports SET accepted_at = unixepoch(), accepted_by = ?2 WHERE id = ?1`,
@@ -738,10 +744,10 @@ async function applyVerseUpdate(
       env.DB
         .prepare(
           `INSERT INTO edit_log
-             (kind, row_key, user_id, prev_version, new_version, action, payload_json, source)
-           VALUES ('verse', ?1, ?2, ?3, ?4, 'update', ?5, ?6)`,
+             (kind, row_key, book, user_id, prev_version, new_version, action, payload_json, source)
+           VALUES ('verse', ?1, ?2, ?3, ?4, ?5, 'update', ?6, ?7)`,
         )
-        .bind(rowKey, userId, existing.version, newVersion, JSON.stringify({ plain_text: plainText }), AI_SOURCE),
+        .bind(rowKey, book, userId, existing.version, newVersion, JSON.stringify({ plain_text: plainText }), AI_SOURCE),
       env.DB
         .prepare(
           `UPDATE pending_imports SET accepted_at = unixepoch(), accepted_by = ?2 WHERE id = ?1`,
@@ -763,10 +769,10 @@ async function applyVerseUpdate(
     env.DB
       .prepare(
         `INSERT INTO edit_log
-           (kind, row_key, user_id, prev_version, new_version, action, payload_json, source)
-         VALUES ('verse', ?1, ?2, NULL, 1, 'create', ?3, ?4)`,
+           (kind, row_key, book, user_id, prev_version, new_version, action, payload_json, source)
+         VALUES ('verse', ?1, ?2, ?3, NULL, 1, 'create', ?4, ?5)`,
       )
-      .bind(rowKey, userId, JSON.stringify({ plain_text: plainText }), AI_SOURCE),
+      .bind(rowKey, book, userId, JSON.stringify({ plain_text: plainText }), AI_SOURCE),
     env.DB
       .prepare(
         `UPDATE pending_imports SET accepted_at = unixepoch(), accepted_by = ?2 WHERE id = ?1`,

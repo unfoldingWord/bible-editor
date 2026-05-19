@@ -2,7 +2,7 @@ import { Hono } from "hono";
 import { z } from "zod";
 import type { Env } from "./index";
 import type { ChapterPayload, TnRow, TqRow, TwlRow, VerseRow, VerseDto, VerseStatus } from "./types";
-import { currentUserId, requireAuth } from "./auth";
+import { currentUserId, requireEditor } from "./auth";
 
 export const chapters = new Hono<{ Bindings: Env; Variables: { userId?: number } }>();
 
@@ -95,7 +95,7 @@ chapters.get("/:book/:chapter", async (c) => {
 
 // Toggle / set the done flag for a verse.
 const StatusPatch = z.object({ done: z.boolean() });
-chapters.patch("/:book/:chapter/:verse/status", requireAuth, async (c) => {
+chapters.patch("/:book/:chapter/:verse/status", requireEditor, async (c) => {
   const book = c.req.param("book").toUpperCase();
   const chapter = parseInt(c.req.param("chapter"), 10);
   const verse = parseInt(c.req.param("verse"), 10);

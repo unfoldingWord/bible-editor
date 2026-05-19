@@ -6,7 +6,7 @@
 import { Hono } from "hono";
 import { z } from "zod";
 import type { Env } from "./index";
-import { requireAuth } from "./auth";
+import { requireAdmin } from "./auth";
 import { ALL_RESOURCES, type Resource } from "./export";
 
 export const exports = new Hono<{ Bindings: Env; Variables: { userId?: number } }>();
@@ -17,7 +17,7 @@ const RunBody = z.object({
   dryDcs: z.boolean().optional(),
 });
 
-exports.post("/run", requireAuth, async (c) => {
+exports.post("/run", requireAdmin, async (c) => {
   let body: unknown = {};
   try {
     if (c.req.header("content-length")) body = await c.req.json();
@@ -39,7 +39,7 @@ exports.post("/run", requireAuth, async (c) => {
 
 // Plain listing of the last N snapshot rows. Useful for an /admin/exports
 // view and for verification after a manual run.
-exports.get("/", async (c) => {
+exports.get("/", requireAdmin, async (c) => {
   const limit = Math.min(parseInt(c.req.query("limit") ?? "50", 10) || 50, 200);
   const bookFilter = c.req.query("book")?.toUpperCase();
   const stmt = bookFilter
@@ -67,7 +67,7 @@ exports.get("/", async (c) => {
 
 // Workflow instance status. The Workflow's own `status()` returns a structured
 // payload that includes step-level state — useful for the admin UI later.
-exports.get("/instance/:id", requireAuth, async (c) => {
+exports.get("/instance/:id", requireAdmin, async (c) => {
   const id = c.req.param("id");
   try {
     const instance = await c.env.EXPORT_WORKFLOW.get(id);
@@ -79,6 +79,6 @@ exports.get("/instance/:id", requireAuth, async (c) => {
 });
 
 // Convenience: list the available resources (for an admin UI dropdown).
-exports.get("/resources", async (c) => {
+exports.get("/resources", requireAdmin, async (c) => {
   return c.json({ resources: ALL_RESOURCES });
 });

@@ -11,14 +11,14 @@
 
 import { Hono } from "hono";
 import type { Env } from "./index";
-import { requireAuth } from "./auth";
+import { requireEditor } from "./auth";
 
 export const tnQuick = new Hono<{ Bindings: Env; Variables: { userId?: number } }>();
 
 const DEFAULT_URL = "https://uw-bt-bot.fly.dev/api/tn-quick";
 const MAX_BODY_BYTES = 32 * 1024;
 
-tnQuick.post("/", requireAuth, async (c) => {
+tnQuick.post("/", requireEditor, async (c) => {
   if (!c.env.BT_API_TOKEN) {
     return c.json({ error: "tn_quick_disabled" }, 503);
   }

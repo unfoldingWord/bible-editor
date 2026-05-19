@@ -17,7 +17,7 @@ export interface RowTarget {
   kind: "row";
   rowKind: RowKind;
   id: string;
-  book?: string;
+  book: string;
 }
 export interface VerseTarget {
   kind: "verse";
@@ -112,18 +112,18 @@ export const outbox = {
     id: string,
     expectedVersion: number,
     patch: Record<string, unknown>,
-    opts?: { restoredFromVersion?: number; book?: string },
+    opts: { restoredFromVersion?: number; book: string },
   ): Promise<OutboxOp> {
     const op: OutboxOp = {
       id: uid(),
-      target: { kind: "row", rowKind, id, book: opts?.book },
+      target: { kind: "row", rowKind, id, book: opts.book },
       action: "patch",
       patch,
       expectedVersion,
       queuedAt: Date.now(),
       attempts: 0,
       status: "pending",
-      ...(opts?.restoredFromVersion !== undefined
+      ...(opts.restoredFromVersion !== undefined
         ? { restoredFromVersion: opts.restoredFromVersion }
         : {}),
     };
@@ -137,7 +137,7 @@ export const outbox = {
     rowKind: RowKind,
     id: string,
     expectedVersion: number,
-    book?: string,
+    book: string,
   ): Promise<OutboxOp> {
     const op: OutboxOp = {
       id: uid(),

@@ -346,10 +346,28 @@ async function request<T>(
   return (await res.json()) as T;
 }
 
+export type Role = "admin" | "editor";
+
+export interface MeResponse {
+  userId: number;
+  username: string | null;
+  role: Role | null;
+}
+
+// GET /api/auth/me — confirms the current Bearer token's identity + role.
+// Returns null when no token is present (so callers can show the sign-in
+// flow). Throws ApiError on 4xx/5xx (App.tsx classifies 401 → re-auth,
+// anything else → error state).
+export async function fetchAuthMe(): Promise<MeResponse | null> {
+  if (!getAuthToken()) return null;
+  return request<MeResponse>(`/api/auth/me`);
+}
+
 export interface DevAuthResponse {
   token: string;
   userId: number;
   username: string;
+  role: Role;
   expiresIn: number;
 }
 
@@ -656,9 +674,12 @@ export const api = {
       body: JSON.stringify(body),
     }),
 
-  getRowHistory: (kind: RowKind, id: string, book?: string) =>
+  // book is required after the composite-(book, id) PK migration (0015);
+  // the server returns 400 if it's missing because the same 4-char id can
+  // exist in two books with different content.
+  getRowHistory: (kind: RowKind, id: string, book: string) =>
     request<RowHistory>(
-      `/api/rows/${kind}/${encodeURIComponent(id)}/history${book ? `?book=${encodeURIComponent(book)}` : ""}`,
+      `/api/rows/${kind}/${encodeURIComponent(id)}/history?book=${encodeURIComponent(book)}`,
     ),
 
   patchRow: <T = unknown>(
@@ -666,35 +687,35 @@ export const api = {
     id: string,
     expectedVersion: number,
     patch: Record<string, unknown>,
-    opts?: { restoredFromVersion?: number | null; book?: string },
+    opts: { restoredFromVersion?: number | null; book: string },
   ) =>
-    request<T>(`/api/rows/${kind}/${encodeURIComponent(id)}${opts?.book ? `?book=${encodeURIComponent(opts.book)}` : ""}`, {
+    request<T>(`/api/rows/${kind}/${encodeURIComponent(id)}?book=${encodeURIComponent(opts.book)}`, {
       method: "PATCH",
       headers: { "If-Match": String(expectedVersion) },
       body: JSON.stringify(
-        opts && typeof opts.restoredFromVersion === "number"
+        typeof opts.restoredFromVersion === "number"
           ? { ...patch, restored_from_version: opts.restoredFromVersion }
           : patch,
       ),
     }),
 
-  deleteRow: (kind: RowKind, id: string, expectedVersion: number, book?: string) =>
-    request<{ ok: true }>(`/api/rows/${kind}/${encodeURIComponent(id)}${book ? `?book=${encodeURIComponent(book)}` : ""}`, {
+  deleteRow: (kind: RowKind, id: string, expectedVersion: number, book: string) =>
+    request<{ ok: true }>(`/api/rows/${kind}/${encodeURIComponent(id)}?book=${encodeURIComponent(book)}`, {
       method: "DELETE",
       headers: { "If-Match": String(expectedVersion) },
     }),
 
   // Legacy: alias for setPreserveNote(id, true). Server still accepts it for
   // any in-flight outbox ops; new code should call setPreserveNote.
-  keepNote: (id: string, book?: string) =>
-    request<TnRow>(`/api/rows/tn/${encodeURIComponent(id)}/keep${book ? `?book=${encodeURIComponent(book)}` : ""}`, {
+  keepNote: (id: string, book: string) =>
+    request<TnRow>(`/api/rows/tn/${encodeURIComponent(id)}/keep?book=${encodeURIComponent(book)}`, {
       method: "POST",
     }),
 
   // Toggle the "survive future AI pipeline sweeps" bit. Lock-exempt.
   // Returns the updated row so the caller can refresh local state.
-  setPreserveNote: (id: string, book: string | undefined, value: boolean) =>
-    request<TnRow>(`/api/rows/tn/${encodeURIComponent(id)}/preserve${book ? `?book=${encodeURIComponent(book)}` : ""}`, {
+  setPreserveNote: (id: string, book: string, value: boolean) =>
+    request<TnRow>(`/api/rows/tn/${encodeURIComponent(id)}/preserve?book=${encodeURIComponent(book)}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ value }),
@@ -703,8 +724,8 @@ export const api = {
   // Toggle the "queue as AI-pipeline hint" bit. Lock-exempt. hint=1 rows
   // are sent into the next pipeline run as options.hints and are excluded
   // from the sweep; AI expansion clears the bit.
-  setHintNote: (id: string, book: string | undefined, value: boolean) =>
-    request<TnRow>(`/api/rows/tn/${encodeURIComponent(id)}/hint${book ? `?book=${encodeURIComponent(book)}` : ""}`, {
+  setHintNote: (id: string, book: string, value: boolean) =>
+    request<TnRow>(`/api/rows/tn/${encodeURIComponent(id)}/hint?book=${encodeURIComponent(book)}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ value }),

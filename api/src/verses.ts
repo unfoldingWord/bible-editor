@@ -2,14 +2,23 @@ import { Hono } from "hono";
 import { z } from "zod";
 import type { Env } from "./index";
 import type { VerseRow } from "./types";
-import { currentUserId, requireAuth } from "./auth";
+import { currentUserId, requireEditor } from "./auth";
 import { activePipelineForChapter, lockedResponseBody } from "./chapterLock";
 import { broadcastChapter } from "./wsEvents";
 
 export const verses = new Hono<{ Bindings: Env; Variables: { userId?: number } }>();
 
+// content must be the usfm-js verse-objects tree (at minimum, a non-empty
+// verseObjects array). The whole tree is replaced on every PATCH; a malformed
+// body that passed validation as `unknown` would brick the verse — the
+// alignment dialog walks verseObjects without null-guarding.
+const VerseObjectSchema = z.object({}).passthrough();
 const PatchSchema = z.object({
-  content: z.unknown(),
+  content: z
+    .object({
+      verseObjects: z.array(VerseObjectSchema).min(1),
+    })
+    .passthrough(),
   plain_text: z.string().nullable().optional(),
 });
 
@@ -50,7 +59,7 @@ verses.get("/:book/:chapter/:verse/:bibleVersion", async (c) => {
   return c.json({ ...row, content: parsed });
 });
 
-verses.patch("/:book/:chapter/:verse/:bibleVersion", requireAuth, async (c) => {
+verses.patch("/:book/:chapter/:verse/:bibleVersion", requireEditor, async (c) => {
   const book = c.req.param("book").toUpperCase();
   const chapter = parseInt(c.req.param("chapter"), 10);
   const verse = parseInt(c.req.param("verse"), 10);
@@ -113,21 +122,21 @@ verses.patch("/:book/:chapter/:verse/:bibleVersion", requireAuth, async (c) => {
       ),
     c.env.DB
       .prepare(
-        `INSERT INTO edit_log (kind, row_key, user_id, prev_version, new_version, action, payload_json)
-         SELECT 'verse', ?1, ?2, ?3, ?4, 'update', ?5
+        `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, payload_json)
+         SELECT 'verse', ?1, ?2, ?3, ?4, ?5, 'update', ?6
          WHERE EXISTS (
            SELECT 1 FROM verses
-            WHERE book = ?6 AND chapter = ?7 AND verse = ?8 AND bible_version = ?9
-              AND version = ?4
+            WHERE book = ?2 AND chapter = ?7 AND verse = ?8 AND bible_version = ?9
+              AND version = ?5
          )`,
       )
       .bind(
         rowKey,
+        book,
         userId,
         expected,
         newVersion,
         JSON.stringify(parsed.data),
-        book,
         chapter,
         verse,
         bibleVersion,

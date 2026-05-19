@@ -17,7 +17,7 @@ import {
   parseTsv,
   refParts,
 } from "./importParsers";
-import { requireAuth, currentUserId } from "./auth";
+import { requireEditor, currentUserId } from "./auth";
 
 export const books = new Hono<{ Bindings: Env; Variables: { userId?: number } }>();
 
@@ -59,7 +59,7 @@ books.get("/", async (c) => {
 // selecting LUK at the same moment race the DELETEs and double-insert.
 const inFlight = new Set<string>();
 
-books.post("/:book/import", requireAuth, async (c) => {
+books.post("/:book/import", requireEditor, async (c) => {
   const userId = currentUserId(c);
   if (!userId) return c.json({ error: "unauthorized" }, 401);
 

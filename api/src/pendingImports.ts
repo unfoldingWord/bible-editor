@@ -11,7 +11,7 @@
 import { Hono } from "hono";
 import { z } from "zod";
 import type { Env } from "./index";
-import { requireAuth } from "./auth";
+import { requireEditor } from "./auth";
 
 export const pendingImports = new Hono<{
   Bindings: Env;
@@ -37,7 +37,7 @@ interface PendingImportRow {
   started_by_username: string | null;
 }
 
-pendingImports.get("/", requireAuth, async (c) => {
+pendingImports.get("/", requireEditor, async (c) => {
   const parsed = Query.safeParse({
     book: c.req.query("book"),
     chapter: c.req.query("chapter"),
