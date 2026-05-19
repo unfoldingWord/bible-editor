@@ -395,21 +395,49 @@ rows.patch("/:kind/:id", requireEditor, async (c) => {
     return c.json({ error: "empty_patch" }, 400);
   }
 
+  // Pull the current row once — used for the lock-scope lookup, the no-op
+  // short-circuit, and to disambiguate 404 vs 409 if the UPDATE later misses.
+  const current = await c.env.DB.prepare(
+    `SELECT * FROM ${KIND_TO_TABLE[kind]} WHERE id = ?1${bookClause(2)}`,
+  )
+    .bind(id, book)
+    .first<
+      Record<string, unknown> & {
+        version: number;
+        deleted_at: number | null;
+        book: string;
+        chapter: number;
+        restored_from_version: number | null;
+      }
+    >();
+  if (!current || current.deleted_at) return c.json({ error: "not_found" }, 404);
+
   // Lock check for non-tn kinds. TN edits are always allowed during a run —
   // the first PATCH on an updated_by-NULL row implicitly "keeps" it; further
   // PATCHes on already-kept rows are normal edits. tq/twl have no such
   // carve-out: any pipeline writing to this chapter overwrites them.
   if (kind !== "tn") {
-    const scope = await c.env.DB.prepare(
-      `SELECT book, chapter FROM ${KIND_TO_TABLE[kind]} WHERE id = ?1${bookClause(2)}`,
-    )
-      .bind(id, book)
-      .first<{ book: string; chapter: number }>();
-    if (scope) {
-      const lock = await activePipelineForChapter(c.env, scope.book, scope.chapter);
-      if (lock) return c.json(lockedResponseBody(lock), 409);
+    const lock = await activePipelineForChapter(c.env, current.book, current.chapter);
+    if (lock) return c.json(lockedResponseBody(lock), 409);
+  }
+
+  // No-op short-circuit: if the precondition still holds and every patched
+  // field already matches the stored value (and the restore marker isn't
+  // changing), return the row unchanged. Identical re-saves are common —
+  // picker re-commit, AI completion echoing the same content, an explicit
+  // Save click against a row whose draft was just cleared — and shouldn't
+  // burn a version. The version check guards against the TOCTOU window: if
+  // someone else moved the row forward, fall through and let the UPDATE's
+  // version=expected predicate produce the proper 409.
+  if (current.version === expected) {
+    const allMatch = fields.every(
+      (f) => (patch as Record<string, unknown>)[f] === current[f],
+    );
+    const restoreMatches =
+      (current.restored_from_version ?? null) === restoredFromVersion;
+    if (allMatch && restoreMatches) {
+      return c.json(current);
     }
-    // If the row doesn't exist the UPDATE below will return 404 the usual way.
   }
 
   const userId = currentUserId(c);
