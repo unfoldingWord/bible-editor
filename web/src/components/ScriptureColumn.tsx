@@ -90,8 +90,18 @@ interface Props {
   onSaveVerse: (verseNum: number, bibleVersion: string, plain: string, base: VerseDto) => void;
   // Section-band edit / delete. Splice the new (tag, text) into the
   // verse's verseObjects.sections (filtered by splitSectionHeaders) and
-  // save via outbox. tag === null deletes the band entirely.
+  // save via outbox. tag === null deletes the band entirely. Used by
+  // chapter-scoped modes (stacked, columns).
   onEditSection?: (
+    verseNum: number,
+    bibleVersion: string,
+    change: { index: number; tag: string | null; text: string },
+    base: VerseDto,
+  ) => void;
+  // Book-mode variant — chapter is variable because BookView spans the
+  // whole book. Same splice/save semantics as onEditSection above.
+  onEditBookSection?: (
+    chapter: number,
     verseNum: number,
     bibleVersion: string,
     change: { index: number; tag: string | null; text: string },
@@ -151,6 +161,7 @@ export function ScriptureColumn({
   onEditVerse,
   onSaveVerse,
   onEditSection,
+  onEditBookSection,
   locked = false,
 }: Props) {
   const activeRef = useRef<HTMLDivElement | null>(null);
@@ -458,6 +469,7 @@ export function ScriptureColumn({
                 }
               }}
               onOpenAligner={onOpenBookAligner}
+              onEditSection={onEditBookSection}
               locked={locked}
             />
           </Suspense>
@@ -488,6 +500,11 @@ export function ScriptureColumn({
                   }
                 }}
                 onOpenAligner={(verseNum) => onOpenAligner(verseNum, v)}
+              onEditSection={
+                onEditSection
+                  ? (verseNum, change, base) => onEditSection(verseNum, v, change, base)
+                  : undefined
+              }
               />
             ))}
           </Box>
@@ -790,6 +807,7 @@ function StackedBody({
                     ...markHighlightSx(theme.palette.mode),
                   })}
                 >
+                  <NonActiveSections verse={ultV} column="ULT" />
                   <StackedRowBody
                     dto={ultV}
                     prevDto={findPrevRowInColumn(ult, ultV.verse)}
@@ -832,6 +850,7 @@ function StackedBody({
                     ...markHighlightSx(theme.palette.mode),
                   })}
                 >
+                  <NonActiveSections verse={ustV} column="UST" />
                   <StackedRowBody
                     dto={ustV}
                     prevDto={findPrevRowInColumn(ust, ustV.verse)}
@@ -1381,6 +1400,25 @@ function ParagraphToolbar({
 // plain text + find marks via FindAwareText when there's nothing
 // marker-worthy to show — that path preserves find/replace highlighting
 // for normal prose verses.
+// Read-only section header bands for non-active stacked rows. The active
+// card renders them editable through ActiveLine; here we surface them so
+// the heading is visible at all times — click the row to activate it and
+// edit via the active card.
+function NonActiveSections({ verse, column }: { verse: VerseDto; column: string }) {
+  const verseObjects = (verse.content as { verseObjects?: unknown[] } | null)?.verseObjects;
+  const sections: SectionHeader[] = Array.isArray(verseObjects)
+    ? splitSectionHeaders(verseObjects).sections
+    : [];
+  if (sections.length === 0) return null;
+  return (
+    <Stack spacing={0.25} sx={{ mb: 0.25 }}>
+      {sections.map((s, i) => (
+        <SectionHeaderBand key={`${column}-${verse.verse}-sec-${i}`} tag={s.tag} text={s.text} />
+      ))}
+    </Stack>
+  );
+}
+
 function StackedRowBody({
   dto,
   prevDto,

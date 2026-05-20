@@ -61,6 +61,14 @@ interface Props {
   // header button calls this; per-verse undo handles single-verse rollback.
   onSaveColumn: (drafts: Array<{ verseNum: number; plain: string; base: VerseDto }>) => void;
   onOpenAligner: (verseNum: number) => void;
+  // Section-band edit/delete for this column's bibleVersion. Shell's
+  // saveSectionEdit splices verseObjects and enqueues. Omitted on read-
+  // only columns (UHB/UGNT) and locked chapters → band stays read-only.
+  onEditSection?: (
+    verseNum: number,
+    change: { index: number; tag: string | null; text: string },
+    base: VerseDto,
+  ) => void;
 }
 
 // Continuous Word-style editor for one bible_version. Each verse is its
@@ -90,6 +98,7 @@ export function DocColumn({
   onEditVerse,
   onSaveColumn,
   onOpenAligner,
+  onEditSection,
 }: Props) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const activeRef = useRef<HTMLSpanElement | null>(null);
@@ -257,7 +266,18 @@ export function DocColumn({
           return (
             <Fragment key={dto.verse}>
               {sections.map((s, i) => (
-                <SectionHeaderBand key={`sec-${dto.verse}-${i}`} tag={s.tag} text={s.text} />
+                <SectionHeaderBand
+                  key={`sec-${dto.verse}-${i}`}
+                  tag={s.tag}
+                  text={s.text}
+                  editable={!readOnly && !!onEditSection}
+                  onChange={
+                    onEditSection
+                      ? (next) =>
+                          onEditSection(dto.verse, { index: i, tag: next.tag, text: next.text }, dto)
+                      : undefined
+                  }
+                />
               ))}
               <VerseSpan
                 book={book}

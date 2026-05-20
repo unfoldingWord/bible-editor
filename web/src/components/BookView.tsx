@@ -69,6 +69,16 @@ interface Props {
     payload: Array<{ chapter: number; verse: number; plain: string; base: VerseDto }>,
   ) => void;
   onOpenAligner: (chapter: number, verse: number, bibleVersion: string) => void;
+  // Section-band edit/delete for book mode. Splices verseObjects and saves
+  // via outbox (Shell.saveSectionEdit). Omitted on read-only versions and
+  // locked chapters → band stays read-only.
+  onEditSection?: (
+    chapter: number,
+    verse: number,
+    bibleVersion: string,
+    change: { index: number; tag: string | null; text: string },
+    base: VerseDto,
+  ) => void;
   // The active chapter is mid-pipeline. Locks editing on every chapter
   // displayed in book mode — simplest defensive choice; AI typically scopes
   // to one chapter so other chapters in view are still safe, but explaining
@@ -94,6 +104,7 @@ export function BookView({
   onEditVerse,
   onSaveColumn,
   onOpenAligner,
+  onEditSection,
   locked = false,
 }: Props) {
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -256,6 +267,7 @@ export function BookView({
               onSelectVerse={onSelectVerse}
               onEditVerse={onEditVerse}
               onOpenAligner={onOpenAligner}
+              onEditSection={onEditSection}
               locked={locked}
             />
           ))}
@@ -289,6 +301,7 @@ function ChapterBlock({
   onSelectVerse,
   onEditVerse,
   onOpenAligner,
+  onEditSection,
   locked,
 }: {
   book: string;
@@ -308,6 +321,13 @@ function ChapterBlock({
   onSelectVerse: (chapter: number, verse: number) => void;
   onEditVerse: (chapter: number, verse: number, bibleVersion: string, plain: string, base: VerseDto) => void;
   onOpenAligner: (chapter: number, verse: number, bibleVersion: string) => void;
+  onEditSection?: (
+    chapter: number,
+    verse: number,
+    bibleVersion: string,
+    change: { index: number; tag: string | null; text: string },
+    base: VerseDto,
+  ) => void;
   locked: boolean;
 }) {
   // Sentinel observed by IntersectionObserver — fires loadChapter when the
@@ -436,6 +456,11 @@ function ChapterBlock({
             onSelectVerse={() => onSelectVerse(chapter, v)}
             onEditVerse={(bv, plain, base) => onEditVerse(chapter, v, bv, plain, base)}
             onOpenAligner={(bv) => onOpenAligner(chapter, v, bv)}
+            onEditSection={
+              onEditSection
+                ? (bv, change, base) => onEditSection(chapter, v, bv, change, base)
+                : undefined
+            }
             locked={locked}
           />
         );
@@ -460,6 +485,7 @@ function VerseRow({
   onSelectVerse,
   onEditVerse,
   onOpenAligner,
+  onEditSection,
   locked,
 }: {
   book: string;
@@ -477,6 +503,11 @@ function VerseRow({
   onSelectVerse: () => void;
   onEditVerse: (bv: string, plain: string, base: VerseDto) => void;
   onOpenAligner: (bv: string) => void;
+  onEditSection?: (
+    bv: string,
+    change: { index: number; tag: string | null; text: string },
+    base: VerseDto,
+  ) => void;
   locked: boolean;
 }) {
   // Render is intentionally a row of N independent cells driven by the same
@@ -526,6 +557,11 @@ function VerseRow({
               lexiconMap={lexiconMap}
               onAlign={() => onOpenAligner(bv)}
               onEdit={(plain) => dto && onEditVerse(bv, plain, dto)}
+              onEditSection={
+                onEditSection && dto
+                  ? (change) => onEditSection(bv, change, dto)
+                  : undefined
+              }
               locked={locked}
             />
           </Box>
@@ -550,6 +586,7 @@ function VerseCell({
   lexiconMap,
   onAlign,
   onEdit,
+  onEditSection,
   locked,
 }: {
   book: string;
@@ -569,6 +606,7 @@ function VerseCell({
   lexiconMap: Map<string, LexiconEntry | null>;
   onAlign: () => void;
   onEdit: (plain: string) => void;
+  onEditSection?: (change: { index: number; tag: string | null; text: string }) => void;
   locked: boolean;
 }) {
   const readOnly = READ_ONLY.has(bibleVersion) || locked;
@@ -718,7 +756,17 @@ function VerseCell({
   return (
     <Box sx={{ lineHeight: 1.6 }}>
       {sections.map((s, i) => (
-        <SectionHeaderBand key={`bv-sec-${i}`} tag={s.tag} text={s.text} />
+        <SectionHeaderBand
+          key={`bv-sec-${i}`}
+          tag={s.tag}
+          text={s.text}
+          editable={!readOnly && !!onEditSection}
+          onChange={
+            onEditSection
+              ? (next) => onEditSection({ index: i, tag: next.tag, text: next.text })
+              : undefined
+          }
+        />
       ))}
       <Typography
         component="span"

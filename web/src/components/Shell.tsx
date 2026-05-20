@@ -775,7 +775,12 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       ) {
         if (sectionIdx === change.index) {
           if (change.tag !== null) {
-            next.push({ ...o, tag: change.tag, text: change.text });
+            // usfm-js stores \s* heading text in `content` (with a
+            // trailing \n that the renderer/exporter expects).
+            // splitSectionHeaders prefers `content` over `text`, so we
+            // must write `content` for the change to round-trip.
+            const { text: _drop, ...rest } = o;
+            next.push({ ...rest, tag: change.tag, content: `${change.text}\n` });
           }
           // null tag → drop the node entirely.
           sectionIdx++;
@@ -991,6 +996,9 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           }}
           onEditSection={(verseNum, bibleVersion, change, base) => {
             saveSectionEdit(chapter, verseNum, bibleVersion, change, base);
+          }}
+          onEditBookSection={(ch, verseNum, bibleVersion, change, base) => {
+            saveSectionEdit(ch, verseNum, bibleVersion, change, base);
           }}
           onOpenAligner={(v, bv) => openAligner(chapter, v, bv)}
           scrollNonce={scrollNonce}
