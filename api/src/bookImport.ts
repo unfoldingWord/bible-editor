@@ -18,33 +18,10 @@ import {
   refParts,
 } from "./importParsers";
 import { requireEditor, currentUserId } from "./auth";
+import { BOOK_NUMBERS, dcsUrls, fetchText } from "./dcsSources";
+import { reimportBookFromDcs, type Resource } from "./bookReimport";
 
 export const books = new Hono<{ Bindings: Env; Variables: { userId?: number } }>();
-
-// Standard unfoldingWord book number prefixes for USFM filenames. Mirror of
-// the BOOK_NUMBERS map in scripts/import-book.mjs and api/src/export.ts;
-// kept duplicated to keep this module's surface small.
-const BOOK_NUMBERS: Record<string, string> = {
-  GEN: "01", EXO: "02", LEV: "03", NUM: "04", DEU: "05", JOS: "06", JDG: "07",
-  RUT: "08", "1SA": "09", "2SA": "10", "1KI": "11", "2KI": "12", "1CH": "13",
-  "2CH": "14", EZR: "15", NEH: "16", EST: "17", JOB: "18", PSA: "19",
-  PRO: "20", ECC: "21", SNG: "22", ISA: "23", JER: "24", LAM: "25",
-  EZK: "26", DAN: "27", HOS: "28", JOL: "29", AMO: "30", OBA: "31",
-  JON: "32", MIC: "33", NAM: "34", HAB: "35", ZEP: "36", HAG: "37",
-  ZEC: "38", MAL: "39",
-  MAT: "41", MRK: "42", LUK: "43", JHN: "44", ACT: "45",
-  ROM: "46", "1CO": "47", "2CO": "48", GAL: "49", EPH: "50",
-  PHP: "51", COL: "52", "1TH": "53", "2TH": "54", "1TI": "55",
-  "2TI": "56", TIT: "57", PHM: "58", HEB: "59", JAS: "60",
-  "1PE": "61", "2PE": "62", "1JN": "63", "2JN": "64", "3JN": "65",
-  JUD: "66", REV: "67",
-};
-
-const NT_BOOKS = new Set([
-  "MAT", "MRK", "LUK", "JHN", "ACT", "ROM", "1CO", "2CO", "GAL", "EPH",
-  "PHP", "COL", "1TH", "2TH", "1TI", "2TI", "TIT", "PHM", "HEB", "JAS",
-  "1PE", "2PE", "1JN", "2JN", "3JN", "JUD", "REV",
-]);
 
 books.get("/", async (c) => {
   const rs = await c.env.DB.prepare(
@@ -119,6 +96,55 @@ books.post("/:book/import", requireEditor, async (c) => {
   }
 });
 
+// POST /api/books/:book/reimport — non-destructive per-chapter, per-resource
+// re-import from DCS. Required body: { chapters: number[], resources: Resource[] }.
+// Skips rows that have been edited locally (see bookReimport.ts for the
+// pristine predicate). Requires the book to be bootstrapped (404 otherwise);
+// reuses book_import_locks (409 in_progress if held).
+const ALLOWED_RESOURCES: ReadonlyArray<Resource> = ["ult", "ust", "tn", "tq", "twl"];
+
+books.post("/:book/reimport", requireEditor, async (c) => {
+  const userId = currentUserId(c);
+  if (!userId) return c.json({ error: "unauthorized" }, 401);
+
+  const book = c.req.param("book").toUpperCase();
+  if (!BOOK_NUMBERS[book]) return c.json({ error: "unknown_book", book }, 400);
+
+  let body: { chapters?: unknown; resources?: unknown };
+  try {
+    body = (await c.req.json()) as typeof body;
+  } catch {
+    return c.json({ error: "invalid_body" }, 422);
+  }
+  const chapters = Array.isArray(body.chapters)
+    ? body.chapters
+        .map((n) => (typeof n === "number" ? Math.floor(n) : NaN))
+        .filter((n) => Number.isFinite(n) && n >= 1)
+    : [];
+  const resources = Array.isArray(body.resources)
+    ? body.resources.filter((r): r is Resource =>
+        typeof r === "string" && (ALLOWED_RESOURCES as readonly string[]).includes(r),
+      )
+    : [];
+  if (chapters.length === 0) {
+    return c.json({ error: "invalid_body", detail: "chapters must be a non-empty list of positive integers" }, 422);
+  }
+  if (resources.length === 0) {
+    return c.json({ error: "invalid_body", detail: "resources must include at least one of ult/ust/tn/tq/twl" }, 422);
+  }
+
+  try {
+    const result = await reimportBookFromDcs(c.env, book, chapters, resources, userId, { source: "user" });
+    return c.json({ ok: true, ...result });
+  } catch (e) {
+    const name = e instanceof Error ? e.constructor.name : "";
+    if (name === "BookNotImportedError") return c.json({ error: "book_not_imported", book }, 404);
+    if (name === "ImportInProgressError") return c.json({ error: "in_progress", book }, 409);
+    const msg = e instanceof Error ? e.message : String(e);
+    return c.json({ error: "reimport_failed", book, message: msg }, 502);
+  }
+});
+
 interface ImportCounts {
   verses: number;
   tn: number;
@@ -130,23 +156,12 @@ interface ImportCounts {
 async function importBookFromDcs(
   env: Env,
   book: string,
-  num: string,
+  _num: string,
   userId: number,
 ): Promise<ImportCounts> {
-  const base = (env.DCS_BASE_URL ?? "https://git.door43.org").replace(/\/$/, "");
-  const usfmName = `${num}-${book}.usfm`;
-  const isNt = NT_BOOKS.has(book);
-  const origRepo = isNt ? "el-x-koine_ugnt" : "hbo_uhb";
-  const origVersion = isNt ? "UGNT" : "UHB";
-
-  const urls = {
-    ult: `${base}/unfoldingWord/en_ult/raw/branch/master/${usfmName}`,
-    ust: `${base}/unfoldingWord/en_ust/raw/branch/master/${usfmName}`,
-    orig: `${base}/unfoldingWord/${origRepo}/raw/branch/master/${usfmName}`,
-    tn: `${base}/unfoldingWord/en_tn/raw/branch/master/tn_${book}.tsv`,
-    tq: `${base}/unfoldingWord/en_tq/raw/branch/master/tq_${book}.tsv`,
-    twl: `${base}/unfoldingWord/en_twl/raw/branch/master/twl_${book}.tsv`,
-  };
+  const urls = dcsUrls(env, book);
+  if (!urls) throw new Error(`unknown book: ${book}`);
+  const origVersion = urls.origVersion;
 
   // Fire all six fetches in parallel. A missing file (404) returns null and
   // the caller proceeds without that resource — matches the script's "warn
@@ -161,7 +176,8 @@ async function importBookFromDcs(
   ]);
 
   if (!ultRaw && !ustRaw && !origRaw && !tnRaw && !tqRaw && !twlRaw) {
-    throw new Error(`no files fetched from DCS (checked ${Object.values(urls).join(", ")})`);
+    const urlList = [urls.ult, urls.ust, urls.orig, urls.tn, urls.tq, urls.twl];
+    throw new Error(`no files fetched from DCS (checked ${urlList.join(", ")})`);
   }
 
   // Wipe any partial leftovers from a prior failed run. book_imports stays
@@ -211,16 +227,6 @@ async function importBookFromDcs(
     .run();
 
   return counts;
-}
-
-async function fetchText(url: string): Promise<string | null> {
-  try {
-    const r = await fetch(url);
-    if (!r.ok) return null;
-    return await r.text();
-  } catch {
-    return null;
-  }
 }
 
 // D1 batch() caps at 100 statements per call. Keep chunks well under that.

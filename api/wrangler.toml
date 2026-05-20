@@ -48,6 +48,10 @@ binding = "EXPORT_WORKFLOW"
 class_name = "ExportWorkflow"
 
 [triggers]
+# Future: nightly DCS re-import is wired up in src/index.ts (REIMPORT_CRON
+# branch) but deliberately not registered here yet. Uncomment "0 8 * * *"
+# below once the export → DCS git-action merge loop is verified end-to-end.
+# crons = ["0 6 * * *", "*/5 * * * *", "0 8 * * *"]
 crons = ["0 6 * * *", "*/5 * * * *"]
 
 # Public-safe defaults; secrets go in `wrangler secret put` (DCS_CLIENT_ID,
@@ -112,6 +116,7 @@ binding = "EXPORT_WORKFLOW"
 class_name = "ExportWorkflow"
 
 [env.production.triggers]
+# See [triggers] above re: dormant "0 8 * * *" nightly DCS re-import.
 crons = ["0 6 * * *", "*/5 * * * *"]
 
 [env.production.vars]

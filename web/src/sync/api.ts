@@ -491,6 +491,26 @@ export interface BookListEntry {
   imported_at: number;
 }
 
+// Mirrors api/src/bookReimport.ts. Counts of rows/verses touched per
+// resource by a single POST /api/books/:book/reimport call.
+export type ReimportResource = "ult" | "ust" | "tn" | "tq" | "twl";
+
+export interface ReimportCounts {
+  updated: number;
+  inserted: number;
+  skipped_edited: number;
+  skipped_locked: number;
+  dcs_404: number;
+  errors: string[];
+}
+
+export interface ReimportResponse {
+  ok: true;
+  book: string;
+  perResource: Record<ReimportResource, ReimportCounts>;
+  totals: ReimportCounts;
+}
+
 // Translation-note AI draft endpoint (proxied through this Worker; the
 // shared bot lives at uw-bt-bot.fly.dev). Schema is the bot's; keep in
 // sync with its zod definition. The Worker only adds the BT_API_TOKEN
@@ -716,6 +736,23 @@ export const api = {
       method: "POST",
       timeoutMs: 120_000,
     }),
+
+  // Non-destructive per-chapter, per-resource re-import from Door43. Only
+  // overwrites rows that have never been touched by a human; counts are
+  // returned per-resource so the dialog can summarize what changed vs. was
+  // skipped. Server-side: api/src/bookReimport.ts.
+  reimportFromDoor43: (
+    book: string,
+    body: { chapters: number[]; resources: ReimportResource[] },
+  ) =>
+    request<ReimportResponse>(
+      `/api/books/${encodeURIComponent(book)}/reimport`,
+      {
+        method: "POST",
+        body: JSON.stringify(body),
+        timeoutMs: 120_000,
+      },
+    ),
 
   setVerseDone: (book: string, chapter: number, verse: number, done: boolean) =>
     request<VerseStatus>(

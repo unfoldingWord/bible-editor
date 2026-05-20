@@ -8,6 +8,7 @@ import {
   Menu,
   MenuItem,
   ListItemText,
+  Divider,
   Dialog,
   DialogTitle,
   DialogContent,
@@ -22,7 +23,9 @@ import {
   Typography,
 } from "@mui/material";
 import AutoAwesomeIcon from "@mui/icons-material/AutoAwesome";
+import CloudDownloadIcon from "@mui/icons-material/CloudDownload";
 import { ApiError } from "../sync/api";
+import { ImportFromDoor43Dialog } from "./ImportFromDoor43Dialog";
 import type {
   PipelineChainStep,
   PipelineConflictBody,
@@ -37,6 +40,8 @@ interface Props {
   book: string;
   chapter: number;
   onMessage?: (msg: string) => void;
+  /** Called after a Door43 import completes so the parent can refetch the chapter. */
+  onImported?: () => void;
 }
 
 interface PipelineOption {
@@ -171,7 +176,7 @@ function relativeMinutes(seconds: number): string {
   return `${Math.floor(diff / 3600)}h ${Math.floor((diff % 3600) / 60)} min`;
 }
 
-export function PipelineMenu({ book, chapter, onMessage }: Props) {
+export function PipelineMenu({ book, chapter, onMessage, onImported }: Props) {
   const [anchorEl, setAnchorEl] = useState<HTMLElement | null>(null);
   const [confirm, setConfirm] = useState<PipelineOption | null>(null);
   const [submitting, setSubmitting] = useState(false);
@@ -179,6 +184,7 @@ export function PipelineMenu({ book, chapter, onMessage }: Props) {
   const [genOpts, setGenOpts] = useState<GenUiState>(() => loadGenOpts());
   const [conflict, setConflict] = useState<PipelineConflictExisting | null>(null);
   const [refInput, setRefInput] = useState("");
+  const [importOpen, setImportOpen] = useState(false);
 
   useEffect(() => pipelineStore.subscribe(setActiveJobs), []);
 
@@ -311,7 +317,28 @@ export function PipelineMenu({ book, chapter, onMessage }: Props) {
             </MenuItem>
           );
         })}
+        <Divider />
+        <MenuItem
+          onClick={() => {
+            close();
+            setImportOpen(true);
+          }}
+        >
+          <CloudDownloadIcon fontSize="small" sx={{ mr: 1, color: "text.secondary" }} />
+          <ListItemText
+            primary="Import from Door43"
+            secondary="Pull ULT/UST/TN/TQ/TWL — won't clobber local edits."
+          />
+        </MenuItem>
       </Menu>
+      <ImportFromDoor43Dialog
+        open={importOpen}
+        onClose={() => setImportOpen(false)}
+        book={book}
+        currentChapter={chapter}
+        onMessage={onMessage}
+        onImported={onImported}
+      />
       <Dialog open={Boolean(confirm)} onClose={() => !submitting && setConfirm(null)}>
         <DialogTitle>Start AI pipeline</DialogTitle>
         <DialogContent>

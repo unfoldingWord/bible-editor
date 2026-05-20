@@ -10,6 +10,7 @@ import { tnQuick } from "./tnQuick";
 import { pipelines, pollAllNonTerminal } from "./pipelines";
 import { pendingImports } from "./pendingImports";
 import { books } from "./bookImport";
+import { ALL_RESOURCES, reimportBookFromDcs } from "./bookReimport";
 import { attachAuth, requireAuth, requireCsrf, mintDevToken, startDcsAuth, callbackDcsAuth, authMe, authLogout, refreshToken, updateLastLocation, currentUserId, verifyToken } from "./auth";
 
 export interface Env {
@@ -58,6 +59,11 @@ export interface Env {
 // schedule changes.
 const EXPORT_CRON = "0 6 * * *";
 const POLL_CRON = "*/5 * * * *";
+// Dormant: not yet registered in wrangler.toml [triggers].crons. Branch
+// below is unreachable until the cron entry is uncommented in wrangler.toml.
+// Scheduled for 08:00 UTC — 2 hours after EXPORT_CRON so DCS-side merge of
+// our nightly snapshot has time to land before we pull master back.
+const REIMPORT_CRON = "0 8 * * *";
 
 const app = new Hono<{ Bindings: Env; Variables: { userId?: number; username?: string } }>();
 
@@ -231,6 +237,42 @@ export default {
         await env.DB.prepare(
           `DELETE FROM edit_log WHERE created_at < unixepoch() - (180 * 86400)`,
         ).run();
+      }
+      return;
+    }
+    if (controller.cron === REIMPORT_CRON) {
+      // Dormant: not yet listed in wrangler.toml [triggers].crons, so this
+      // branch never fires in current deployments. Will be enabled once the
+      // export → DCS git-action merge loop is verified end-to-end. Iterates
+      // every imported book and pulls fresh content from DCS, skipping rows
+      // a translator has touched (see bookReimport.ts).
+      const rs = await env.DB.prepare(
+        `SELECT book FROM book_imports ORDER BY book`,
+      ).all<{ book: string }>();
+      for (const { book } of rs.results ?? []) {
+        try {
+          const maxRow = await env.DB
+            .prepare(`SELECT MAX(chapter) AS m FROM verses WHERE book = ?1`)
+            .bind(book)
+            .first<{ m: number | null }>();
+          const maxCh = maxRow?.m ?? 0;
+          if (maxCh < 1) continue;
+          const chapters = Array.from({ length: maxCh }, (_, i) => i + 1);
+          await reimportBookFromDcs(
+            env,
+            book,
+            chapters,
+            [...ALL_RESOURCES],
+            null,
+            { source: "cron" },
+          );
+        } catch (e) {
+          // One book's failure shouldn't stop the rest. Log and continue.
+          console.error("nightly DCS reimport failed", {
+            book,
+            error: e instanceof Error ? e.message : String(e),
+          });
+        }
       }
       return;
     }

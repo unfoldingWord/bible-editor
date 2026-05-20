@@ -89,6 +89,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     data,
     error,
     retryAttempts,
+    refetch,
     applyLocalRowPatch,
     applyLocalRowReplacement,
     applyLocalRowDelete,
@@ -818,6 +819,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
             book={book}
             chapter={chapter}
             onMessage={(msg) => pushPipelineToast(msg, "info")}
+            onImported={() => void refetch()}
           />
         }
         logosSyncToggle={
