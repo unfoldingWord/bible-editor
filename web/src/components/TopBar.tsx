@@ -67,14 +67,18 @@ export function TopBar({
   // Trigger a DCS import for an unfetched book, then refresh the books list
   // and navigate. The caller's onChange short-circuits if the book is
   // already imported, so this is the cold path only.
-  const importAndNavigate = async (code: string) => {
+  const importAndNavigate = async (
+    code: string,
+    targetChapter: number = 1,
+    verse?: number,
+  ) => {
     setImporting(code);
     setImportError(null);
     try {
       await api.importBook(code);
       const r = await api.getBooks();
       setBooks(r.books);
-      onNavigate(code, 1);
+      onNavigate(code, targetChapter, verse);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       setImportError(`Couldn't import ${bookName(code)}: ${msg}`);
@@ -110,7 +114,11 @@ export function TopBar({
     const targetChapter = refChapter ?? chapter;
     setRefError(null);
     setRefInput("");
-    onNavigate(targetBook, targetChapter, verse);
+    if (importedSet.has(targetBook)) {
+      onNavigate(targetBook, targetChapter, verse);
+    } else {
+      void importAndNavigate(targetBook, targetChapter, verse);
+    }
   };
 
   return (
