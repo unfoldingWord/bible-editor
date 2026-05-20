@@ -174,6 +174,38 @@ export function NoteCard({
   const [historyOpen, setHistoryOpen] = useState(false);
   const [aiConfirmOpen, setAiConfirmOpen] = useState(false);
 
+  // Baseline of the last server-confirmed content. stashEdit() optimistically
+  // re-spreads row.{quote,note,support_reference} on every keystroke (so a
+  // mid-session remount can recover live typing from props), which would
+  // otherwise defeat the diff below — local state and "row" would tick in
+  // lockstep and hasRowDiff would never go true. Pinning the baseline to
+  // version means it only rebases on a real server confirmation (PATCH 200,
+  // restore, AI completion, or WS row.upserted), all of which bump version.
+  const savedRef = useRef({
+    quote: row.quote,
+    note: row.note,
+    support_reference: row.support_reference,
+    version: row.version,
+  });
+  const [savePendingVersion, setSavePendingVersion] = useState<number | null>(null);
+  if (row.version !== savedRef.current.version) {
+    savedRef.current = {
+      quote: row.quote,
+      note: row.note,
+      support_reference: row.support_reference,
+      version: row.version,
+    };
+  }
+  // Clear the in-flight gate once the server-confirmed version moves past
+  // the one we saved against. A conflict (409) keeps row.version stuck and
+  // savePendingVersion stays set — that's intentional, the user has to
+  // resolve via the SyncStatusBar before sending another save.
+  useEffect(() => {
+    if (savePendingVersion !== null && row.version > savePendingVersion) {
+      setSavePendingVersion(null);
+    }
+  }, [row.version, savePendingVersion]);
+
   // Session model: when this card becomes active, snapshot the current
   // committed values so undo can revert to "what it was when I started
   // editing". Pending patches accumulate here and flush on manual save,
@@ -263,18 +295,22 @@ export function NoteCard({
   // we no longer use pendingRef as the source of truth for what to PATCH.
   const flushPending = () => {
     const patch: Partial<TnRow> = {};
-    const rowQuote = row.quote ?? "";
-    const rowNote = row.note ?? "";
+    const savedQuote = savedRef.current.quote ?? "";
+    const savedNote = savedRef.current.note ?? "";
     // We send raw TSV (with literal \n escapes) so the server / DCS
     // round-trip stays stable. tsvToDisplay flips them to real newlines
     // for the UI; reverse here.
     const localQuote = quote.replace(/\n/g, "\\n");
     const localNote = note.replace(/\n/g, "\\n");
-    if (localQuote !== rowQuote) patch.quote = localQuote;
-    if (localNote !== rowNote) patch.note = localNote;
-    if (supportRef !== row.support_reference) patch.support_reference = supportRef;
+    if (localQuote !== savedQuote) patch.quote = localQuote;
+    if (localNote !== savedNote) patch.note = localNote;
+    if (supportRef !== savedRef.current.support_reference) patch.support_reference = supportRef;
     pendingRef.current = {};
     if (Object.keys(patch).length === 0) return;
+    // Gate further Save clicks against the same baseline. Without this,
+    // double-clicking Save before the server responds enqueues two PATCHes
+    // with the same If-Match, the second of which lands as a phantom 409.
+    setSavePendingVersion(savedRef.current.version);
     onSave(patch);
     // Rebase the snapshot so the chip stops showing "*" after a manual
     // save and a follow-up Undo reverts to the just-saved state.
@@ -294,18 +330,19 @@ export function NoteCard({
   };
 
   // Revert to the LAST SAVED row state — drops every unsaved keystroke
-  // since the row landed on the server. We compare against row props
-  // (not the in-session snapshot) so the button stays useful after a
-  // deactivate→reactivate cycle, which would otherwise rebase the
-  // snapshot onto the still-dirty current state and disable undo. Also
-  // clears the draft store so the orange border / unsaved-toasts forget
-  // about this row.
+  // since the row landed on the server. We compare against savedRef
+  // (not row props, which carry mid-typing optimistic values from
+  // stashEdit) so Undo reaches the actual last-saved content, not the
+  // dirty value the user just typed. Also clears the draft store so
+  // the orange border / unsaved-toasts forget about this row.
   const handleUndo = () => {
-    const rowQuote = tsvToDisplay(row.quote);
-    const rowNote = tsvToDisplay(row.note);
+    const savedQuote = savedRef.current.quote;
+    const savedSupportRef = savedRef.current.support_reference;
+    const rowQuote = tsvToDisplay(savedQuote);
+    const rowNote = tsvToDisplay(savedRef.current.note);
     setQuote(rowQuote);
     setNote(rowNote);
-    setSupportRef(row.support_reference);
+    setSupportRef(savedSupportRef);
     pendingRef.current = {};
     // Re-baseline the session snapshot to the saved state so a follow-up
     // edit produces a fresh hasNetChanges signal rather than thinking
@@ -314,14 +351,14 @@ export function NoteCard({
       setSessionSnapshot({
         quote: rowQuote,
         note: rowNote,
-        support_reference: row.support_reference,
+        support_reference: savedSupportRef,
       });
     }
     void drafts.clear(draftKey);
     onChange({
-      quote: row.quote,
-      note: row.note,
-      support_reference: row.support_reference,
+      quote: savedQuote,
+      note: savedRef.current.note,
+      support_reference: savedSupportRef,
     });
   };
 
@@ -367,13 +404,14 @@ export function NoteCard({
       });
     }
 
-    // Only patch the fields that actually differ from the live row so we
-    // don't trigger a needless version bump if the user picked the
-    // current version somehow.
+    // Only patch the fields that actually differ from the saved server
+    // state so we don't trigger a needless version bump if the user picked
+    // the current version somehow. Use savedRef (not row) because row
+    // carries optimistic mid-typing values from stashEdit().
     const patch: Partial<TnRow> = {};
-    if (rawQuote !== (row.quote ?? "")) patch.quote = rawQuote;
-    if (rawNote !== (row.note ?? "")) patch.note = rawNote;
-    if (rawSr !== row.support_reference) patch.support_reference = rawSr;
+    if (rawQuote !== (savedRef.current.quote ?? "")) patch.quote = rawQuote;
+    if (rawNote !== (savedRef.current.note ?? "")) patch.note = rawNote;
+    if (rawSr !== savedRef.current.support_reference) patch.support_reference = rawSr;
     if (Object.keys(patch).length === 0) return;
     onChange(patch);
     onSave(patch, { restoredFromVersion: fromVersion });
@@ -459,11 +497,11 @@ export function NoteCard({
   // from hasNetChanges because we want drafts to track divergence from the
   // *saved* state, not from the session entry point.
   const rowDiff: Partial<TnRow> = {};
-  const rowQuoteDisplay = tsvToDisplay(row.quote);
-  const rowNoteDisplay = tsvToDisplay(row.note);
+  const rowQuoteDisplay = tsvToDisplay(savedRef.current.quote);
+  const rowNoteDisplay = tsvToDisplay(savedRef.current.note);
   if (quote !== rowQuoteDisplay) rowDiff.quote = quote;
   if (note !== rowNoteDisplay) rowDiff.note = note;
-  if (supportRef !== row.support_reference) rowDiff.support_reference = supportRef;
+  if (supportRef !== savedRef.current.support_reference) rowDiff.support_reference = supportRef;
   const hasRowDiff = Object.keys(rowDiff).length > 0;
   const draftKey = rowKey("tn", row.id);
   useEffect(() => {
@@ -620,19 +658,49 @@ export function NoteCard({
           />
         </Tooltip>
         {showSessionButtons && hasRowDiff && (
-          <Tooltip title="discard unsaved edits — revert to the last saved version of this note">
-            <IconButton size="small" onClick={handleUndo} sx={{ p: 0.25, color: "warning.main" }}>
-              <UndoIcon fontSize="inherit" />
-            </IconButton>
+          <Tooltip
+            title={
+              savePendingVersion !== null
+                ? "can't discard while a save is in flight — wait for it to land"
+                : "discard unsaved edits — revert to the last saved version of this note"
+            }
+          >
+            <span>
+              <IconButton
+                size="small"
+                onClick={handleUndo}
+                disabled={savePendingVersion !== null}
+                sx={{
+                  p: 0.25,
+                  color: savePendingVersion !== null ? "action.disabled" : "warning.main",
+                }}
+              >
+                <UndoIcon fontSize="inherit" />
+              </IconButton>
+            </span>
           </Tooltip>
         )}
-        <Tooltip title={hasRowDiff ? "save pending edits to the server" : "no pending edits"}>
+        <Tooltip
+          title={
+            savePendingVersion !== null
+              ? "saving…"
+              : hasRowDiff
+                ? "save pending edits to the server"
+                : "no pending edits"
+          }
+        >
           <span>
             <IconButton
               size="small"
               onClick={flushPending}
-              disabled={!hasRowDiff}
-              sx={{ p: 0.25, color: hasRowDiff ? "primary.main" : "action.disabled" }}
+              disabled={!hasRowDiff || savePendingVersion !== null}
+              sx={{
+                p: 0.25,
+                color:
+                  hasRowDiff && savePendingVersion === null
+                    ? "primary.main"
+                    : "action.disabled",
+              }}
             >
               {hasRowDiff ? <SaveIcon fontSize="inherit" /> : <SaveOutlinedIcon fontSize="inherit" />}
             </IconButton>
