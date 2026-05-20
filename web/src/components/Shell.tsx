@@ -116,6 +116,18 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         applyLocalRowInsert(kind, row);
       } else if (row.version > existing.version) {
         applyLocalRowReplacement(kind, row);
+      } else if (
+        // Preserve/hint toggles on TN rows don't bump version (they're
+        // intent signals, not content — see api/src/rows.ts setTnBit).
+        // The version > existing.version guard above would drop these
+        // broadcasts, leaving other tabs stale until refetch. Same-
+        // version replace when the intent bits differ.
+        kind === "tn" &&
+        row.version === existing.version &&
+        ((row as TnRow).preserve !== (existing as TnRow).preserve ||
+          (row as TnRow).hint !== (existing as TnRow).hint)
+      ) {
+        applyLocalRowReplacement(kind, row);
       }
     },
     onDelete: (kind, id) => applyLocalRowDelete(kind, id),
