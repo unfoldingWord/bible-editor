@@ -112,6 +112,9 @@ const VERSION_LABEL: Record<string, string> = {
 
 const READ_ONLY_VERSIONS = new Set(["UHB", "UGNT"]);
 
+const INTRO_TOOLTIP =
+  "Chapter intro — chapter-level translation notes, Psalm superscriptions (\\d), and the paragraph / poetry markers that introduce verse 1.";
+
 const BookView = lazy(() =>
   import("./BookView").then((m) => ({ default: m.BookView })),
 );
@@ -600,12 +603,24 @@ function StackedBody({
                 borderRadius: 1,
               }}
             >
-              <Typography
-                variant="caption"
-                sx={{ fontFamily: "monospace", color: "primary.main", fontWeight: 700, mr: 1 }}
-              >
-                {v === 0 ? "intro" : `${chapter}:${v}`}
-              </Typography>
+              {v === 0 ? (
+                <Tooltip title={INTRO_TOOLTIP} placement="right">
+                  <Typography
+                    component="span"
+                    variant="caption"
+                    sx={{ fontFamily: "monospace", color: "primary.main", fontWeight: 700, mr: 1, cursor: "help" }}
+                  >
+                    intro
+                  </Typography>
+                </Tooltip>
+              ) : (
+                <Typography
+                  variant="caption"
+                  sx={{ fontFamily: "monospace", color: "primary.main", fontWeight: 700, mr: 1 }}
+                >
+                  {`${chapter}:${v}`}
+                </Typography>
+              )}
               <ActiveLine
                 book={book}
                 bibleVersion="ULT"
@@ -712,21 +727,43 @@ function StackedBody({
               "&:hover": { bgcolor: "action.hover" },
             }}
           >
-            <Typography
-              component="span"
-              variant="caption"
-              sx={{
-                gridColumn: "1 / -1",
-                gridRow: 1,
-                fontFamily: "monospace",
-                color: "text.disabled",
-                fontSize: 10,
-                lineHeight: 1.2,
-                mb: 0.25,
-              }}
-            >
-              {v === 0 ? "intro" : `${chapter}:${v}`}
-            </Typography>
+            {v === 0 ? (
+              <Tooltip title={INTRO_TOOLTIP} placement="right">
+                <Typography
+                  component="span"
+                  variant="caption"
+                  sx={{
+                    gridColumn: "1 / -1",
+                    gridRow: 1,
+                    fontFamily: "monospace",
+                    color: "text.disabled",
+                    fontSize: 10,
+                    lineHeight: 1.2,
+                    mb: 0.25,
+                    cursor: "help",
+                    width: "fit-content",
+                  }}
+                >
+                  intro
+                </Typography>
+              </Tooltip>
+            ) : (
+              <Typography
+                component="span"
+                variant="caption"
+                sx={{
+                  gridColumn: "1 / -1",
+                  gridRow: 1,
+                  fontFamily: "monospace",
+                  color: "text.disabled",
+                  fontSize: 10,
+                  lineHeight: 1.2,
+                  mb: 0.25,
+                }}
+              >
+                {`${chapter}:${v}`}
+              </Typography>
+            )}
             {showUlt && (
               <>
                 <Typography

@@ -298,10 +298,14 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       return false;
     };
     const introHasResource = [...data.tn, ...data.tq, ...data.twl].some((r) => r.verse === 0);
+    // Chapter-front USFM content (Psalm \d superscriptions, leading \p before \v 1)
+    // is stored as verse 0 in the verses table. Surface the intro tile when any of
+    // those exist even if no TN/TQ/TWL row is attached to verse 0.
+    const introHasScripture = versesWithSomething.has(0);
     const doneMap = new Map<number, boolean>();
     for (const s of data.verseStatuses ?? []) doneMap.set(s.verse, !!s.done);
     const tiles: Array<{ verse: number; has: boolean; done?: boolean }> = [];
-    if (introHasResource) tiles.push({ verse: 0, has: false, done: doneMap.get(0) });
+    if (introHasResource || introHasScripture) tiles.push({ verse: 0, has: false, done: doneMap.get(0) });
     const verseNums = [...versesWithSomething].filter((v) => v > 0).sort((a, b) => a - b);
     for (const v of verseNums) tiles.push({ verse: v, has: hasUnalignedFor(v), done: doneMap.get(v) });
     return tiles;
