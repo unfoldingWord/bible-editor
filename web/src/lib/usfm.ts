@@ -105,6 +105,40 @@ export function isInFlowMarker(node: unknown): boolean {
   return (t === "paragraph" || t === "quote") && typeof o["tag"] === "string";
 }
 
+// Peel trailing in-flow paragraph / quote markers off a verse's
+// verseObjects array. USFM places markers BEFORE the verse they lead
+// (`\q1 \v 9 ...`), but usfm-js attaches them to the PREVIOUS verse's
+// content_json — so the `\q1` that visually introduces the first line
+// of verse 9 actually lives at the end of verse 8. The display layer
+// uses this to drift those trailing markers down to the verse they
+// were meant to introduce, while the data stays USFM-correct on disk.
+//
+// Walks backward from the end of the array, collecting consecutive
+// in-flow markers. Stops at the first non-marker node. Returns the
+// markers in document order (oldest-first).
+export function extractTrailingMarkers(verseObjects: unknown[] | undefined | null): unknown[] {
+  if (!Array.isArray(verseObjects)) return [];
+  const out: unknown[] = [];
+  for (let i = verseObjects.length - 1; i >= 0; i--) {
+    const node = verseObjects[i];
+    if (isInFlowMarker(node)) {
+      out.unshift(node);
+    } else {
+      const o = node as Record<string, unknown> | null;
+      // Skip empty trailing text whitespace or chunk milestones (\ts\*)
+      // when looking past them for the marker run. Both are layout-only
+      // and shouldn't disqualify a trailing marker behind them.
+      const txt = typeof o?.["text"] === "string" ? (o["text"] as string) : null;
+      const tag = typeof o?.["tag"] === "string" ? (o["tag"] as string) : null;
+      const isWhitespace = txt !== null && /^\s*$/.test(txt);
+      const isTsMarker = tag !== null && tag.startsWith("ts");
+      if (isWhitespace || isTsMarker) continue;
+      break;
+    }
+  }
+  return out;
+}
+
 // Like extractPlainText but emits a literal USFM marker token (e.g.
 // "\p ", "\q1 ", "\b ") inline for each in-flow marker node. Used as
 // the BASELINE for diffing edits in the active-verse contenteditable

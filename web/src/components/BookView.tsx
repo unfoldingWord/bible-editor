@@ -19,7 +19,7 @@ import type { VerseDto } from "../sync/api";
 import type { ChapterState } from "../hooks/useBook";
 import { highlightsFor, renderHighlightedHTML, type HighlightKey } from "../lib/highlight";
 import { markHighlightSx } from "../lib/highlightStyles";
-import { splitSectionHeaders, type SectionHeader } from "../lib/usfm";
+import { extractTrailingMarkers, splitSectionHeaders, type SectionHeader } from "../lib/usfm";
 import { SectionHeaderBand } from "./SectionHeaderBand";
 import { drafts, verseKey, draftDirtyBorderSx } from "../sync/drafts";
 import type { FindMatch } from "./FindReplaceOverlay";
@@ -485,6 +485,18 @@ function VerseRow({
     <Fragment>
       {enabledVersions.map((bv, colIdx) => {
         const dto = versesByVersion[bv]?.[verseNum];
+        // Walk back through prior verseNum slots in the same column to
+        // find the actual predecessor row (multi-verse ranges share a
+        // single row, so [v-1] might still point at the same dto).
+        let prevDto: VerseDto | undefined;
+        for (let pv = verseNum - 1; pv >= 0; pv--) {
+          const candidate = versesByVersion[bv]?.[pv];
+          if (!candidate) continue;
+          if ((candidate.verse_end ?? candidate.verse) < verseNum) {
+            prevDto = candidate;
+            break;
+          }
+        }
         return (
           <Box
             key={bv}
@@ -505,6 +517,7 @@ function VerseRow({
               verseNum={verseNum}
               bibleVersion={bv}
               dto={dto}
+              prevDto={prevDto}
               isActive={isActive}
               activeNoteQuote={activeNoteQuote}
               activeNoteOccurrence={activeNoteOccurrence}
@@ -528,6 +541,7 @@ function VerseCell({
   verseNum,
   bibleVersion,
   dto,
+  prevDto,
   isActive,
   activeNoteQuote,
   activeNoteOccurrence,
@@ -543,6 +557,10 @@ function VerseCell({
   verseNum: number;
   bibleVersion: string;
   dto: VerseDto | undefined;
+  // The verse row immediately preceding this one in the same column.
+  // Its trailing markers (`\q1`, `\p`) drift down to lead this verse
+  // visually, matching USFM convention. Storage stays untouched.
+  prevDto: VerseDto | undefined;
   isActive: boolean;
   activeNoteQuote: string | null;
   activeNoteOccurrence: number | null;
@@ -650,10 +668,17 @@ function VerseCell({
     if (findHTML) return findHTML;
     const verseObjects = (dto?.content as { verseObjects?: unknown[] } | null)?.verseObjects;
     if (!Array.isArray(verseObjects)) return null;
+    // Drift trailing `\q1`/`\p` etc. from the previous verse so the
+    // visual break introduces this verse — usfm-js attaches markers
+    // to the prior verse (per USFM convention `\q1 \v N+1`).
+    const drifted = extractTrailingMarkers(
+      (prevDto?.content as { verseObjects?: unknown[] } | null)?.verseObjects,
+    );
+    const composed = drifted.length > 0 ? [...drifted, ...verseObjects] : verseObjects;
     // Render unconditionally so paragraph / poetry markers turn into
     // visual breaks / indents in book view even without active highlights.
-    return renderHighlightedHTML(verseObjects, highlights ?? new Set());
-  }, [findHTML, dto?.content, highlights]);
+    return renderHighlightedHTML(composed, highlights ?? new Set());
+  }, [findHTML, dto?.content, highlights, prevDto?.content]);
 
   useEffect(() => {
     if (!elRef.current) return;
