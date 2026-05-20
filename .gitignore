@@ -35,3 +35,10 @@ test-results/
 /AGENTS.md
 /docs/ai-alignment-unicode-fix.md
 scratch/
+
+# USFM files anywhere — ad-hoc fetches for re-generating per-book SQL
+# patches (e.g. the chapter-front verse-0 backfill) shouldn't show up in
+# git status. The originally-seeded samples (ZEC/LAM/OBA + ISA-ust under
+# docs/samples/) are already tracked and stay that way; gitignore only
+# affects untracked files.
+*.usfm
