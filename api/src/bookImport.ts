@@ -285,8 +285,8 @@ async function insertTnRows(
      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)`,
   );
   const auditStmt = env.DB.prepare(
-    `INSERT INTO edit_log (kind, row_key, user_id, prev_version, new_version, action, payload_json)
-     VALUES ('tn', ?1, ?2, NULL, 1, 'create', ?3)`,
+    `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, payload_json)
+     VALUES ('tn', ?1, ?2, ?3, NULL, 1, 'create', ?4)`,
   );
 
   let count = 0;
@@ -321,7 +321,7 @@ async function insertTnRows(
         payload.tags, payload.support_reference, payload.quote, payload.occurrence, payload.note,
         (count + 1) * 100,
       ),
-      auditStmt.bind(id, userId, JSON.stringify(payload)),
+      auditStmt.bind(id, book, userId, JSON.stringify(payload)),
     );
     count++;
     if (batch.length >= CHUNK) await flush();
@@ -346,8 +346,8 @@ async function insertTqRows(
      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)`,
   );
   const auditStmt = env.DB.prepare(
-    `INSERT INTO edit_log (kind, row_key, user_id, prev_version, new_version, action, payload_json)
-     VALUES ('tq', ?1, ?2, NULL, 1, 'create', ?3)`,
+    `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, payload_json)
+     VALUES ('tq', ?1, ?2, ?3, NULL, 1, 'create', ?4)`,
   );
 
   let count = 0;
@@ -381,7 +381,7 @@ async function insertTqRows(
         id, book, ch, v, refRaw,
         payload.tags, payload.quote, payload.occurrence, payload.question, payload.response,
       ),
-      auditStmt.bind(id, userId, JSON.stringify(payload)),
+      auditStmt.bind(id, book, userId, JSON.stringify(payload)),
     );
     count++;
     if (batch.length >= CHUNK) await flush();
@@ -406,8 +406,8 @@ async function insertTwlRows(
      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)`,
   );
   const auditStmt = env.DB.prepare(
-    `INSERT INTO edit_log (kind, row_key, user_id, prev_version, new_version, action, payload_json)
-     VALUES ('twl', ?1, ?2, NULL, 1, 'create', ?3)`,
+    `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, payload_json)
+     VALUES ('twl', ?1, ?2, ?3, NULL, 1, 'create', ?4)`,
   );
 
   let count = 0;
@@ -441,7 +441,7 @@ async function insertTwlRows(
         payload.tags, payload.orig_words, payload.occurrence, payload.tw_link,
         (count + 1) * 100,
       ),
-      auditStmt.bind(id, userId, JSON.stringify(payload)),
+      auditStmt.bind(id, book, userId, JSON.stringify(payload)),
     );
     count++;
     if (batch.length >= CHUNK) await flush();

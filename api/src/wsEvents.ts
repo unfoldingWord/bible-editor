@@ -11,12 +11,13 @@
 // updated their state).
 
 import type { Env } from "./index";
-import type { RowKind, TnRow, TqRow, TwlRow, VerseDto } from "./types";
+import type { RowKind, TnRow, TqRow, TwlRow, VerseDto, VerseStatus } from "./types";
 
 export type WsEvent =
   | { type: "row.upserted"; kind: RowKind; row: TnRow | TqRow | TwlRow }
   | { type: "row.deleted"; kind: RowKind; id: string; version: number }
-  | { type: "verse.updated"; verse: VerseDto };
+  | { type: "verse.updated"; verse: VerseDto }
+  | { type: "verse_status.updated"; status: VerseStatus };
 
 export async function broadcastChapter(
   env: Env,

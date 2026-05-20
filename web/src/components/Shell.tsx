@@ -125,6 +125,9 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         applyLocalVerse(verse);
       }
     },
+    onVerseStatusUpdate: (status) => {
+      applyLocalVerseStatus(status.verse, status.done === 1);
+    },
   });
   const [activeVerse, setActiveVerse] = useState(initialVerse);
   const [activeNoteId, setActiveNoteId] = useState<string | null>(null);
