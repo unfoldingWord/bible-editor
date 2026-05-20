@@ -93,6 +93,13 @@ npx wrangler secret put DCS_CLIENT_SECRET --env production
 # for a dedicated DCS service user. Scope: write:repository on the export fork.
 # Optional — leave unset to skip DCS commits (snapshots still land in R2).
 npx wrangler secret put DCS_SERVICE_TOKEN --env production
+
+# Shared service token for the unfoldingWord bot platform (uw-bt-bot.fly.dev).
+# Authorizes /api/tn-quick (single-note AI) and /api/pipelines/* (chapter-scale
+# AI). Without it both routes return 503 tn_quick_disabled and the UI shows
+# "AI generation unavailable." Obtain from the bot-platform team or reuse the
+# value from api/.dev.vars.
+npx wrangler secret put BT_API_TOKEN --env production
 ```
 
 ### 4. Lock down the public-facing vars

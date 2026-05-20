@@ -86,11 +86,15 @@ function mapAiError(err: unknown): string {
       case "model_call_failed":
         return "AI service unavailable.";
       case "tn_quick_disabled":
-      case "unauthorized":
-      case "cache_unavailable":
-      case "uhb_missing_for_verse":
+        return "AI not configured — admin must set BT_API_TOKEN.";
       case "anthropic_api_key_missing":
-        return "AI generation unavailable.";
+        return "AI not configured — admin must set the Anthropic API key.";
+      case "cache_unavailable":
+        return "AI cache unavailable — try again shortly.";
+      case "uhb_missing_for_verse":
+        return "Hebrew source not available for this verse.";
+      case "unauthorized":
+        return "Session expired — sign in again.";
       default:
         return `AI request failed (HTTP ${err.status}).`;
     }
