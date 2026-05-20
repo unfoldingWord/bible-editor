@@ -1,8 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Box, InputAdornment, Paper, Stack, TextField, IconButton, Typography, Tooltip } from "@mui/material";
+import { Alert, Box, InputAdornment, Paper, Snackbar, Stack, TextField, IconButton, Typography, Tooltip } from "@mui/material";
 import DeleteOutlineIcon from "@mui/icons-material/DeleteOutline";
 import DragIndicatorIcon from "@mui/icons-material/DragIndicator";
 import TranslateIcon from "@mui/icons-material/Translate";
+import UndoIcon from "@mui/icons-material/Undo";
 import SaveIcon from "@mui/icons-material/Save";
 import SaveOutlinedIcon from "@mui/icons-material/SaveOutlined";
 import type { TwlRow } from "../sync/api";
@@ -71,7 +72,7 @@ export function WordsTable({ rows, activeId, onSave, onDelete, onFocus, onReorde
       <Box
         sx={{
           display: "grid",
-          gridTemplateColumns: "28px 1fr 1.2fr 28px 28px",
+          gridTemplateColumns: "28px 1fr 1.2fr 28px 28px 28px",
           gap: 1,
           alignItems: "center",
           px: 1,
@@ -88,6 +89,7 @@ export function WordsTable({ rows, activeId, onSave, onDelete, onFocus, onReorde
         <span />
         <span>Quote</span>
         <span>TW article</span>
+        <span />
         <span />
         <span />
       </Box>
@@ -179,11 +181,16 @@ function WordRow({
 }) {
   const [quote, setQuote] = useState(row.orig_words ?? "");
   const [twLink, setTwLink] = useState<string | null>(row.tw_link);
+  const [translateError, setTranslateError] = useState(false);
   const rowRef = useRef<HTMLDivElement | null>(null);
+  const savedRef = useRef({ quote: row.orig_words ?? "", twLink: row.tw_link });
   const catalogs = useCatalogs();
 
   useEffect(() => setQuote(row.orig_words ?? ""), [row.id, row.version, row.orig_words]);
   useEffect(() => setTwLink(row.tw_link), [row.id, row.version, row.tw_link]);
+  useEffect(() => {
+    savedRef.current = { quote: row.orig_words ?? "", twLink: row.tw_link };
+  }, [row.id, row.version]);
 
   const draftKey = useMemo(() => rowKey("twl", row.id), [row.id]);
 
@@ -238,7 +245,14 @@ function WordRow({
     const result = onTranslateQuote(quote);
     if (result) {
       setQuote(result);
+    } else {
+      setTranslateError(true);
     }
+  };
+
+  const handleUndo = () => {
+    setQuote(savedRef.current.quote);
+    setTwLink(savedRef.current.twLink);
   };
 
   const handleSave = () => {
@@ -267,7 +281,7 @@ function WordRow({
       }}
       sx={{
         display: "grid",
-        gridTemplateColumns: "28px 1fr 1.2fr 28px 28px",
+        gridTemplateColumns: "28px 1fr 1.2fr 28px 28px 28px",
         alignItems: "center",
         gap: 1,
         px: 1,
@@ -360,9 +374,31 @@ function WordRow({
           </IconButton>
         </span>
       </Tooltip>
+      <Tooltip title={isDirty ? "undo edits" : ""}>
+        <span>
+          <IconButton
+            size="small"
+            onClick={handleUndo}
+            disabled={!isDirty}
+            sx={{ p: 0.25, color: "text.secondary", opacity: isDirty ? 1 : 0, transition: "opacity 150ms" }}
+          >
+            <UndoIcon fontSize="inherit" />
+          </IconButton>
+        </span>
+      </Tooltip>
       <IconButton size="small" onClick={onDelete} color="error" sx={{ p: 0.25 }}>
         <DeleteOutlineIcon fontSize="inherit" />
       </IconButton>
+      <Snackbar
+        open={translateError}
+        autoHideDuration={4000}
+        onClose={() => setTranslateError(false)}
+        anchorOrigin={{ vertical: "bottom", horizontal: "center" }}
+      >
+        <Alert severity="warning" onClose={() => setTranslateError(false)} sx={{ width: "100%" }}>
+          No ULT alignment match for &ldquo;{quote}&rdquo; in this verse.
+        </Alert>
+      </Snackbar>
     </Stack>
   );
 }
