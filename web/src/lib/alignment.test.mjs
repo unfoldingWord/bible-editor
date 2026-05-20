@@ -974,6 +974,36 @@ function roundtripVerseUsfm(rawUsfm, sourceVO = null) {
       extractTrailingMarkers(vo3).length === 0,
       `no trailing markers when verse ends in text`,
     );
+    // Zero-width space (U+200B) — from the editor's empty-block
+    // placeholder leaking into saved data. Must step past it like
+    // ordinary whitespace so drift still works on healed-or-not rows.
+    const vo4 = [
+      { type: "word", tag: "w", text: "end" },
+      { type: "text", text: ". " },
+      { type: "quote", tag: "q1" },
+      { type: "text", text: "​" },
+    ];
+    const trailing4 = extractTrailingMarkers(vo4);
+    assert(
+      trailing4.length === 1 && trailing4[0].tag === "q1",
+      `trailing \\q1 detected past trailing ZWSP placeholder (got ${JSON.stringify(trailing4)})`,
+    );
+  }
+
+  // (e**) tokenizeEditableText strips zero-width spaces. Otherwise the
+  // editor's caret-placeholder `​` (rendered as `&#8203;` in empty
+  // marker-led blocks) would accumulate in saved verseObjects every
+  // time the user saves.
+  {
+    const { tokenizeEditableText } = await import("./replace.ts");
+    const nodes = tokenizeEditableText("hello​ world​");
+    const texts = nodes
+      .filter((n) => n.type === "text" || n.type === "word")
+      .map((n) => n.text);
+    assert(
+      texts.every((t) => !t.includes("​")),
+      `no node text contains a zero-width space (got ${JSON.stringify(texts)})`,
+    );
   }
 
   // (e) splitSectionHeaders: \s1 hoisted, \d stays inline (alignable).

@@ -130,7 +130,10 @@ export function extractTrailingMarkers(verseObjects: unknown[] | undefined | nul
       // and shouldn't disqualify a trailing marker behind them.
       const txt = typeof o?.["text"] === "string" ? (o["text"] as string) : null;
       const tag = typeof o?.["tag"] === "string" ? (o["tag"] as string) : null;
-      const isWhitespace = txt !== null && /^\s*$/.test(txt);
+      // Tolerate zero-width spaces (U+200B) — they crept in from the
+      // editor's empty-block placeholder (&#8203;) and shouldn't block
+      // marker drift just because the user saved past one.
+      const isWhitespace = txt !== null && /^[\s​]*$/.test(txt);
       const isTsMarker = tag !== null && tag.startsWith("ts");
       if (isWhitespace || isTsMarker) continue;
       break;
