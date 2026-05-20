@@ -163,9 +163,12 @@ async function importBookFromDcs(
   if (!urls) throw new Error(`unknown book: ${book}`);
   const origVersion = urls.origVersion;
 
-  // Fire all six fetches in parallel. A missing file (404) returns null and
-  // the caller proceeds without that resource — matches the script's "warn
-  // and continue" behaviour for incomplete sample dirs.
+  // Fire all six fetches in parallel. unfoldingWord's repos carry every
+  // resource for every supported book, so any null here is a transient DCS
+  // issue (timeout, 5xx, partial outage). Marking the book as imported with
+  // a critical resource missing leaves it silently broken — see the ZEC
+  // bootstrap that landed without TWLs. Fail loudly so the next attempt
+  // succeeds cleanly.
   const [ultRaw, ustRaw, origRaw, tnRaw, tqRaw, twlRaw] = await Promise.all([
     fetchText(urls.ult),
     fetchText(urls.ust),
@@ -175,9 +178,15 @@ async function importBookFromDcs(
     fetchText(urls.twl),
   ]);
 
-  if (!ultRaw && !ustRaw && !origRaw && !tnRaw && !tqRaw && !twlRaw) {
-    const urlList = [urls.ult, urls.ust, urls.orig, urls.tn, urls.tq, urls.twl];
-    throw new Error(`no files fetched from DCS (checked ${urlList.join(", ")})`);
+  const missing: string[] = [];
+  if (!ultRaw) missing.push(`ult (${urls.ult})`);
+  if (!ustRaw) missing.push(`ust (${urls.ust})`);
+  if (!origRaw) missing.push(`${origVersion.toLowerCase()} (${urls.orig})`);
+  if (!tnRaw) missing.push(`tn (${urls.tn})`);
+  if (!tqRaw) missing.push(`tq (${urls.tq})`);
+  if (!twlRaw) missing.push(`twl (${urls.twl})`);
+  if (missing.length > 0) {
+    throw new Error(`DCS fetch failed for ${missing.length} resource(s); retry: ${missing.join("; ")}`);
   }
 
   // Wipe any partial leftovers from a prior failed run. book_imports stays
