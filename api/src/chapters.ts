@@ -3,6 +3,7 @@ import { z } from "zod";
 import type { Env } from "./index";
 import type { ChapterPayload, TnRow, TqRow, TwlRow, VerseRow, VerseDto, VerseStatus } from "./types";
 import { currentUserId, requireEditor } from "./auth";
+import { broadcastChapter } from "./wsEvents";
 
 export const chapters = new Hono<{ Bindings: Env; Variables: { userId?: number } }>();
 
@@ -140,6 +141,11 @@ chapters.patch("/:book/:chapter/:verse/status", requireEditor, async (c) => {
   )
     .bind(book, chapter, verse)
     .first<VerseStatus>();
+  if (row) {
+    c.executionCtx.waitUntil(
+      broadcastChapter(c.env, row.book, row.chapter, { type: "verse_status.updated", status: row }),
+    );
+  }
   return c.json(row);
 });
 

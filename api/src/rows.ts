@@ -642,6 +642,9 @@ rows.post("/tn/:id/preserve", requireEditor, async (c) => {
   }
   const updated = await setTnBit(c.env, id, book, userId, "preserve", coerceBitValue(parsed.data.value));
   if (!updated) return c.json({ error: "not_found" }, 404);
+  c.executionCtx.waitUntil(
+    broadcastChapter(c.env, updated.book, updated.chapter, { type: "row.upserted", kind: "tn", row: updated }),
+  );
   return c.json(updated);
 });
 
@@ -665,6 +668,9 @@ rows.post("/tn/:id/hint", requireEditor, async (c) => {
   }
   const updated = await setTnBit(c.env, id, book, userId, "hint", coerceBitValue(parsed.data.value));
   if (!updated) return c.json({ error: "not_found" }, 404);
+  c.executionCtx.waitUntil(
+    broadcastChapter(c.env, updated.book, updated.chapter, { type: "row.upserted", kind: "tn", row: updated }),
+  );
   return c.json(updated);
 });
 
@@ -679,5 +685,8 @@ rows.post("/tn/:id/keep", requireEditor, async (c) => {
   const userId = currentUserId(c);
   const updated = await setTnBit(c.env, id, book, userId, "preserve", 1);
   if (!updated) return c.json({ error: "not_found" }, 404);
+  c.executionCtx.waitUntil(
+    broadcastChapter(c.env, updated.book, updated.chapter, { type: "row.upserted", kind: "tn", row: updated }),
+  );
   return c.json(updated);
 });

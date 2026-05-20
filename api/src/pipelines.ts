@@ -207,6 +207,7 @@ async function pollPipelineJob(
     Array.isArray(data.output) &&
     data.output.length > 0;
   let importFailed = false;
+  let importErrMessage: string | null = null;
   if (shouldImport && data.output) {
     try {
       await importJobOutput(
@@ -222,9 +223,19 @@ async function pollPipelineJob(
       );
     } catch (err) {
       importFailed = true;
+      importErrMessage = err instanceof Error ? err.message : String(err);
       console.error(`[pipelineImport] job=${job.job_id} failed:`, err);
     }
   }
+
+  // When the local apply fails, hold state at 'running' so the */5 cron
+  // re-polls and re-imports (upstream is idempotent — its 'done' state
+  // sticks, so the next poll hits the same shouldImport branch). The
+  // MAX_POLL_ATTEMPTS / 48h guards above eventually force-fail a permanent
+  // failure. Surface the failure via error_kind so the UI can flag it.
+  const effectiveState = importFailed ? "running" : (data.state ?? "running");
+  const effectiveErrorKind = importFailed ? "import_failed" : (data.current?.errorKind ?? null);
+  const effectiveErrorMessage = importFailed ? importErrMessage : (data.current?.error ?? null);
 
   await env.DB.prepare(
     `UPDATE pipeline_jobs SET
@@ -241,17 +252,21 @@ async function pollPipelineJob(
   )
     .bind(
       job.job_id,
-      data.state ?? "running",
+      effectiveState,
       data.current?.skill ?? null,
       data.current?.status ?? null,
-      data.current?.errorKind ?? null,
-      data.current?.error ?? null,
+      effectiveErrorKind,
+      effectiveErrorMessage,
       data.output && !importFailed ? JSON.stringify(data.output) : null,
       text,
     )
     .run();
 
-  if (data.state === "done" && !job.follow_up_job_id) {
+  // Gate followups on !importFailed: the chain assumes the parent's rows
+  // are in D1 (e.g. the next step's prompt builder reads them). Without
+  // this, an upstream-done-but-import-failed run would still trigger
+  // notes -> tqs against an unimported parent.
+  if (data.state === "done" && !importFailed && !job.follow_up_job_id) {
     try {
       const username = await resolveUsernameFromDb(env, job.user_id);
       if (username && job.follow_up_chain) {
@@ -283,7 +298,25 @@ async function pollPipelineJob(
     }
   }
 
-  return { kind: "ok", text, status: upstream.status, state: data.state ?? "running" };
+  // If the local apply failed, the upstream JSON still says state='done'.
+  // The GET handler returns this text verbatim, so without adjustment the
+  // client would mark the job complete and stop polling. Rewrite the
+  // response to match what we actually stored.
+  let responseText = text;
+  if (importFailed) {
+    const adjusted = {
+      ...data,
+      state: effectiveState,
+      current: {
+        ...(data.current ?? { chapter: 0, skill: "", status: "", startedAt: "" }),
+        errorKind: "import_failed",
+        error: importErrMessage ?? "import failed",
+      },
+    };
+    responseText = JSON.stringify(adjusted);
+  }
+
+  return { kind: "ok", text: responseText, status: upstream.status, state: effectiveState };
 }
 
 // Two days. A non-terminal job that hasn't moved in this long is almost

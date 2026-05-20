@@ -563,7 +563,8 @@ export type PipelineErrorKind =
   | "non_success_result"
   | "missing_output"
   | "stale_output"
-  | "interrupted";
+  | "interrupted"
+  | "import_failed";
 
 // Mirrors the bp-assistant contract (docs/ai-pipeline-integration.md §3).
 // Server validates with .strict(); unknown keys are rejected. Per-pipeline-type

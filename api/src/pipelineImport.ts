@@ -127,6 +127,7 @@ function versePayload(book: string, bibleVersion: "ULT" | "UST", v: VerseExtract
     book,
     chapter: v.chapter,
     verse: v.verse,
+    verse_end: v.verseEnd,
     bible_version: bibleVersion,
     content_json: v.contentJson,
     plain_text: v.plainText,
@@ -717,6 +718,9 @@ async function applyVerseUpdate(
   const book = String(payload.book ?? p.book);
   const chapter = Number(payload.chapter ?? p.chapter);
   const verse = Number(payload.verse ?? p.verse);
+  const verseEndRaw = payload.verse_end;
+  const verseEnd =
+    typeof verseEndRaw === "number" && Number.isFinite(verseEndRaw) ? verseEndRaw : null;
   const bibleVersion = String(payload.bible_version ?? p.bible_version ?? "");
   const contentJson = String(payload.content_json ?? "");
   const plainText = (payload.plain_text as string | null) ?? null;
@@ -736,11 +740,11 @@ async function applyVerseUpdate(
       env.DB
         .prepare(
           `UPDATE verses
-              SET content_json = ?1, plain_text = ?2,
-                  version = version + 1, updated_at = ?3, updated_by = ?4
-            WHERE book = ?5 AND chapter = ?6 AND verse = ?7 AND bible_version = ?8`,
+              SET content_json = ?1, plain_text = ?2, verse_end = ?3,
+                  version = version + 1, updated_at = ?4, updated_by = ?5
+            WHERE book = ?6 AND chapter = ?7 AND verse = ?8 AND bible_version = ?9`,
         )
-        .bind(contentJson, plainText, now, userId, book, chapter, verse, bibleVersion),
+        .bind(contentJson, plainText, verseEnd, now, userId, book, chapter, verse, bibleVersion),
       env.DB
         .prepare(
           `INSERT INTO edit_log
@@ -762,10 +766,10 @@ async function applyVerseUpdate(
   await env.DB.batch([
     env.DB
       .prepare(
-        `INSERT INTO verses (book, chapter, verse, bible_version, content_json, plain_text, updated_by)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)`,
+        `INSERT INTO verses (book, chapter, verse, verse_end, bible_version, content_json, plain_text, updated_by)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)`,
       )
-      .bind(book, chapter, verse, bibleVersion, contentJson, plainText, userId),
+      .bind(book, chapter, verse, verseEnd, bibleVersion, contentJson, plainText, userId),
     env.DB
       .prepare(
         `INSERT INTO edit_log

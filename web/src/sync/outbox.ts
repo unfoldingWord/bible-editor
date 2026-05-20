@@ -121,7 +121,7 @@ function noopOp(target: OpTarget, action: OpAction, patch: Record<string, unknow
 // must keep blocking siblings, since the user's expectedVersion is stale
 // for them too.
 function targetKey(t: OpTarget): string {
-  if (t.kind === "row") return `row:${t.rowKind}:${t.id}`;
+  if (t.kind === "row") return `row:${t.rowKind}:${t.book}:${t.id}`;
   if (t.kind === "verse_status") return `vstatus:${t.book}:${t.chapter}:${t.verse}`;
   return `verse:${t.book}:${t.chapter}:${t.verse}:${t.bibleVersion}`;
 }

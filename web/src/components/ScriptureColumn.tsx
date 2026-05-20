@@ -659,7 +659,7 @@ function StackedBody({
                 highlights={ustHL}
                 search={search}
                 findActiveMatch={findActiveMatch}
-                editable
+                editable={!locked}
                 onOpenAligner={() => onOpenAligner(ustStart, "UST")}
                 onEditPlain={
                   ustV ? (plain) => onEditVerse(ustStart, "UST", plain, ustV) : undefined
