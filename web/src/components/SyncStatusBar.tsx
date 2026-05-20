@@ -15,7 +15,7 @@ import DeleteOutlineIcon from "@mui/icons-material/DeleteOutline";
 import WarningAmberIcon from "@mui/icons-material/WarningAmber";
 import EditNoteIcon from "@mui/icons-material/EditNote";
 import { onOutboxResult, outbox, type OutboxOp, type OpTarget } from "../sync/outbox";
-import { drafts, type DraftRecord } from "../sync/drafts";
+import { drafts, type DraftRecord, type DraftMeta } from "../sync/drafts";
 
 // If we believe we're online but haven't seen a successful save in this
 // long while pending ops exist, treat it as effectively offline —
@@ -40,6 +40,13 @@ function formatTarget(t: OpTarget): string {
   if (t.kind === "verse_status") return `status ${t.book} ${t.chapter}:${t.verse}`;
   return `${t.bibleVersion} ${t.book} ${t.chapter}:${t.verse}`;
 }
+
+function formatDraftMeta(m: DraftMeta): string {
+  if (m.kind === "verse") return `${m.bibleVersion} ${m.book} ${m.chapter}:${m.verse}`;
+  return `${m.rowKind.toUpperCase()} ${m.book} ${m.chapter}:${m.verse}`;
+}
+
+const DRAFT_TOOLTIP_LIMIT = 10;
 
 export function SyncStatusBar() {
   const [ops, setOps] = useState<OutboxOp[]>([]);
@@ -172,7 +179,7 @@ export function SyncStatusBar() {
         />
       </Tooltip>
     );
-  } else {
+  } else if (draftCount === 0) {
     inline = (
       <Tooltip title="all your edits are saved to the cloud">
         <Chip
@@ -185,16 +192,40 @@ export function SyncStatusBar() {
         />
       </Tooltip>
     );
+  } else {
+    // Drafts exist but no server-side activity — the unsaved chip alone tells
+    // the truth; showing "saved" next to "N unsaved" is contradictory.
+    inline = null;
   }
 
   const showFloating = conflicts.length > 0 || failed.length > 0;
 
   // The drafts chip rides alongside the outbox chip. It surfaces unsaved
   // typing — distinct from "saving N" which is server in-flight.
+  const draftsTooltip = draftCount > 0 ? (
+    <Stack spacing={0.25}>
+      <Typography variant="caption" sx={{ fontWeight: 600 }}>
+        {draftCount} unsaved edit{draftCount === 1 ? "" : "s"}:
+      </Typography>
+      {draftList.slice(0, DRAFT_TOOLTIP_LIMIT).map((d) => (
+        <Typography
+          key={d.key}
+          variant="caption"
+          sx={{ fontFamily: "monospace", display: "block" }}
+        >
+          {formatDraftMeta(d.meta)}
+        </Typography>
+      ))}
+      {draftCount > DRAFT_TOOLTIP_LIMIT && (
+        <Typography variant="caption" color="text.secondary">
+          … and {draftCount - DRAFT_TOOLTIP_LIMIT} more
+        </Typography>
+      )}
+    </Stack>
+  ) : null;
+
   const draftsChip = draftCount > 0 ? (
-    <Tooltip
-      title={`${draftCount} unsaved edit${draftCount === 1 ? "" : "s"} — orange-bordered fields haven't been saved yet`}
-    >
+    <Tooltip title={draftsTooltip ?? ""}>
       <Chip
         icon={<EditNoteIcon />}
         label={`${draftCount} unsaved`}

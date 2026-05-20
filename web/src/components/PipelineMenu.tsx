@@ -286,7 +286,7 @@ export function PipelineMenu({ book, chapter, onMessage }: Props) {
         startIcon={<AutoAwesomeIcon fontSize="small" />}
         onClick={(e) => setAnchorEl(e.currentTarget)}
       >
-        AI pipelines
+        AI
       </Button>
       <Menu anchorEl={anchorEl} open={Boolean(anchorEl)} onClose={close}>
         {OPTIONS.map((opt) => {
