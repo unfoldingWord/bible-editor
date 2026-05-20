@@ -7,7 +7,7 @@ import UndoIcon from "@mui/icons-material/Undo";
 import type { VerseDto } from "../sync/api";
 import { highlightsFor, renderHighlightedHTML, type HighlightKey } from "../lib/highlight";
 import { markHighlightSx } from "../lib/highlightStyles";
-import { splitSectionHeaders, type SectionHeader } from "../lib/usfm";
+import { extractTrailingMarkers, splitSectionHeaders, type SectionHeader } from "../lib/usfm";
 import { SectionHeaderBand } from "./SectionHeaderBand";
 import { drafts, verseKey, draftDirtyBorderSx } from "../sync/drafts";
 import { HebrewLine } from "./HebrewLine";
@@ -243,6 +243,17 @@ export function DocColumn({
           const sections: SectionHeader[] = Array.isArray(verseObjects)
             ? splitSectionHeaders(verseObjects).sections
             : [];
+          // Drift trailing \q1/\p etc. from the previous verse into the
+          // leading position of THIS verse — usfm-js attaches them to
+          // the prior verse (per `\q1 \v N+1`) but visually they introduce
+          // this verse. Composed into the rendered content here; storage
+          // stays untouched.
+          const prevDto = findPreviousVerse(versesByVerseNum, dto.verse);
+          const drift = prevDto
+            ? extractTrailingMarkers(
+                (prevDto.content as { verseObjects?: unknown[] } | null)?.verseObjects,
+              )
+            : [];
           return (
             <Fragment key={dto.verse}>
               {sections.map((s, i) => (
@@ -257,6 +268,7 @@ export function DocColumn({
                 bibleVersion={bibleVersion}
                 text={dto.plain_text ?? ""}
                 content={dto.content}
+                precedingMarkers={drift}
                 highlights={highlights}
                 isActive={isActive}
                 readOnly={!!readOnly}
@@ -277,6 +289,24 @@ export function DocColumn({
   );
 }
 
+// Locate the verse row immediately preceding `verse` in this column's
+// versesByVerseNum map. We can't just lookup [verse - 1] because the
+// prior row might be a multi-verse range (e.g. 6-9) — we look for the
+// row whose [verse, verseEnd] window ends at verse - 1. Returns null
+// when there is no prior verse in this chapter (verse 1, or front).
+function findPreviousVerse(
+  versesByVerseNum: Record<number, VerseDto>,
+  verse: number,
+): VerseDto | null {
+  for (let v = verse - 1; v >= 0; v--) {
+    const dto = versesByVerseNum[v];
+    if (!dto) continue;
+    // The first row whose end-of-range is < verse — that's the predecessor.
+    if ((dto.verse_end ?? dto.verse) < verse) return dto;
+  }
+  return null;
+}
+
 function VerseSpan({
   book,
   chapter,
@@ -286,6 +316,7 @@ function VerseSpan({
   bibleVersion,
   text,
   content,
+  precedingMarkers,
   highlights,
   isActive,
   readOnly,
@@ -310,6 +341,10 @@ function VerseSpan({
   bibleVersion: string;
   text: string;
   content?: unknown;
+  // Trailing markers drifted from the previous verse — composed at the
+  // start of the rendered verseObjects so visual paragraph / poetry
+  // breaks introduce this verse correctly.
+  precedingMarkers?: unknown[];
   highlights?: Set<string> | null;
   isActive: boolean;
   readOnly: boolean;
@@ -410,10 +445,16 @@ function VerseSpan({
     if (!content) return null;
     const verseObjects = (content as { verseObjects?: unknown[] } | null)?.verseObjects;
     if (!Array.isArray(verseObjects)) return null;
+    // Compose any drifted-down markers (from the previous verse's
+    // trailing `\q1`/`\p` etc.) at the front so the visual break
+    // introduces this verse, matching USFM intent.
+    const drifted = precedingMarkers && precedingMarkers.length > 0
+      ? [...precedingMarkers, ...verseObjects]
+      : verseObjects;
     // Render unconditionally so paragraph / poetry markers turn into
     // visual breaks / indents even without an active highlight set.
-    return renderHighlightedHTML(verseObjects, highlights ?? new Set());
-  }, [findHTML, content, highlights]);
+    return renderHighlightedHTML(drifted, highlights ?? new Set());
+  }, [findHTML, content, highlights, precedingMarkers]);
 
   // Resync the editable span when (a) text changes from outside and the user
   // hasn't been typing since, or (b) highlights change. We let the user type

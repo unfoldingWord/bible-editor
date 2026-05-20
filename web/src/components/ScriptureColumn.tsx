@@ -17,7 +17,7 @@ import type { LexiconEntry } from "../hooks/useLexicon";
 import type { ChapterState } from "../hooks/useBook";
 import { highlightsFor, renderEditableHTML, renderHighlightedHTML, type HighlightKey } from "../lib/highlight";
 import { markHighlightSx } from "../lib/highlightStyles";
-import { extractEditableText, splitSectionHeaders, type SectionHeader } from "../lib/usfm";
+import { extractEditableText, extractTrailingMarkers, splitSectionHeaders, type SectionHeader } from "../lib/usfm";
 import { SectionHeaderBand } from "./SectionHeaderBand";
 import { buildVerseIndex, formatVerseLabel, isFirstOfRange, isRangeRow } from "../lib/verseRange";
 import {
@@ -494,6 +494,21 @@ export function ScriptureColumn({
   );
 }
 
+// Find the row immediately preceding `verseNum` in this version's verse
+// map. Multi-verse rows live at their verse_start in the index, so we
+// scan back looking for the first row whose end-of-range is < verseNum.
+function findPrevRowInColumn(
+  column: Record<number, VerseDto>,
+  verseNum: number,
+): VerseDto | null {
+  for (let v = verseNum - 1; v >= 0; v--) {
+    const dto = column[v];
+    if (!dto) continue;
+    if ((dto.verse_end ?? dto.verse) < verseNum) return dto;
+  }
+  return null;
+}
+
 function StackedBody({
   book,
   indexByVersion,
@@ -566,6 +581,11 @@ function StackedBody({
           const ultStart = ultV?.verse ?? v;
           const ustStart = ustV?.verse ?? v;
           const uhbStart = uhbV?.verse ?? v;
+          // Find the predecessor row in each column so its trailing
+          // markers can drift down to lead this verse visually.
+          const ultPrev = findPrevRowInColumn(ult, ultStart);
+          const ustPrev = findPrevRowInColumn(ust, ustStart);
+          const uhbPrev = findPrevRowInColumn(uhb, uhbStart);
           return (
             <Paper
               ref={activeRef}
@@ -594,6 +614,7 @@ function StackedBody({
                 verseNum={ultStart}
                 text={ultV?.plain_text ?? ""}
                 content={ultV?.content}
+                prevContent={ultPrev?.content}
                 highlights={ultHL}
                 search={search}
                 findActiveMatch={findActiveMatch}
@@ -619,6 +640,7 @@ function StackedBody({
                 verseNum={ustStart}
                 text={ustV?.plain_text ?? ""}
                 content={ustV?.content}
+                prevContent={ustPrev?.content}
                 highlights={ustHL}
                 search={search}
                 findActiveMatch={findActiveMatch}
@@ -645,6 +667,7 @@ function StackedBody({
                   verseNum={uhbStart}
                   text={uhbV.plain_text ?? ""}
                   content={uhbV.content}
+                  prevContent={uhbPrev?.content}
                   highlights={uhbHL}
                   search={search}
                   findActiveMatch={findActiveMatch}
@@ -791,6 +814,7 @@ function ActiveLine({
   verseNum,
   text,
   content,
+  prevContent,
   highlights,
   search,
   findActiveMatch,
@@ -812,6 +836,12 @@ function ActiveLine({
   verseNum: number;
   text: string;
   content?: unknown;
+  // Previous verse's content_json. Its trailing in-flow markers (\q1,
+  // \p ...) are surfaced as read-only chip bands above this verse's
+  // editable area — usfm-js stores those markers on the prior verse
+  // because USFM places them before \v, but they conceptually
+  // introduce THIS verse. To edit them, navigate to the prior verse.
+  prevContent?: unknown;
   highlights?: Set<HighlightKey>;
   search?: SearchState | null;
   findActiveMatch?: FindMatch | null;
@@ -937,6 +967,17 @@ function ActiveLine({
     if (!Array.isArray(verseObjects)) return [];
     return splitSectionHeaders(verseObjects).sections;
   }, [verseObjects]);
+  // Markers attached to the previous verse that visually introduce
+  // THIS verse — usfm-js stores `\q1 \v N+1` markers on verse N. We
+  // render them as read-only chip bands above the editable area so
+  // users see the correct paragraph / poetry structure. Editing them
+  // requires navigating to the previous verse (where the data lives).
+  const driftedMarkers = useMemo<Array<{ tag: string }>>(() => {
+    const prevVo = (prevContent as { verseObjects?: unknown[] } | null)?.verseObjects;
+    return extractTrailingMarkers(prevVo).map((n) => ({
+      tag: String((n as Record<string, unknown>)["tag"] ?? ""),
+    }));
+  }, [prevContent]);
 
   const noteHTML = useMemo(() => {
     if (findHTML) return null;
@@ -1076,6 +1117,42 @@ function ActiveLine({
       )}
       {editable && !readOnly && !rtl && (
         <ParagraphToolbar elRef={elRef} onEditPlain={onEditPlain} />
+      )}
+      {driftedMarkers.length > 0 && !rtl && (
+        <Stack spacing={0} sx={{ mb: 0.25 }}>
+          {driftedMarkers.map((m, i) => (
+            <Tooltip
+              key={`drift-${i}`}
+              title={`from previous verse — edit there`}
+              placement="left"
+            >
+              <Box
+                sx={{
+                  display: "block",
+                  pl: m.tag === "q2" ? "2.5em" : m.tag === "q3" ? "3.75em" : m.tag === "q4" ? "5em" : m.tag.startsWith("q") ? "1.25em" : 0,
+                  fontSize: 11,
+                  opacity: 0.55,
+                  fontFamily: "Consolas, Menlo, monospace",
+                  color: "primary.main",
+                }}
+              >
+                <Box
+                  component="span"
+                  sx={{
+                    display: "inline-block",
+                    px: 0.5,
+                    border: "1px dashed",
+                    borderColor: "primary.main",
+                    borderRadius: 0.5,
+                    bgcolor: "rgba(49, 173, 227, 0.06)",
+                  }}
+                >
+                  \{m.tag}
+                </Box>
+              </Box>
+            </Tooltip>
+          ))}
+        </Stack>
       )}
       {rtl && lexiconMap ? (
         <Box

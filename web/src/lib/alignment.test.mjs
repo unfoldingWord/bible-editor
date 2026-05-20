@@ -938,6 +938,44 @@ function roundtripVerseUsfm(rawUsfm, sourceVO = null) {
     );
   }
 
+  // (e*) extractTrailingMarkers: \q1 at the END of a verse — usfm-js
+  // attaches markers to the prior verse (before `\v`), but visually
+  // they introduce the NEXT verse. The display layer drifts them down.
+  {
+    const { extractTrailingMarkers } = await import("./usfm.ts");
+    // ZEC 9:8 shape: ends with milestones, then a trailing \ts*, then \q1.
+    const vo = [
+      { type: "word", tag: "w", text: "Yahweh" },
+      { type: "text", text: "!\n\n" },
+      { type: "milestone", tag: "ts\\*" }, // chunk anchor, skip past
+      { type: "quote", tag: "q1" },
+    ];
+    const trailing = extractTrailingMarkers(vo);
+    assert(
+      trailing.length === 1 && trailing[0].tag === "q1",
+      `trailing \\q1 detected past \\ts\\* (got ${JSON.stringify(trailing)})`,
+    );
+    // Multiple stacked trailing markers
+    const vo2 = [
+      { type: "word", tag: "w", text: "end" },
+      { type: "paragraph", tag: "p" },
+      { type: "quote", tag: "q1" },
+    ];
+    const trailing2 = extractTrailingMarkers(vo2);
+    assert(
+      trailing2.length === 2 &&
+        trailing2[0].tag === "p" &&
+        trailing2[1].tag === "q1",
+      `both \\p + \\q1 detected, in order (got ${JSON.stringify(trailing2)})`,
+    );
+    // No trailing markers → empty
+    const vo3 = [{ type: "word", tag: "w", text: "plain" }, { type: "text", text: "." }];
+    assert(
+      extractTrailingMarkers(vo3).length === 0,
+      `no trailing markers when verse ends in text`,
+    );
+  }
+
   // (e) splitSectionHeaders: \s1 hoisted, \d stays inline (alignable).
   {
     const vo = [
