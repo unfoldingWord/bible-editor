@@ -8,11 +8,62 @@
 
 type Mode = "light" | "dark";
 
+// Layout styles for paragraph / poetry / blank / section markers
+// emitted by renderHighlightedHTML and renderEditableHTML. Shared across
+// rows / columns / book views via markHighlightSx so any container that
+// already pulls highlight styles also gets marker layout.
+function paragraphLayoutSx(mode: Mode) {
+  const tokenBg = mode === "dark" ? "rgba(49, 173, 227, 0.18)" : "rgba(49, 173, 227, 0.14)";
+  const tokenBorder = mode === "dark" ? "rgba(49, 173, 227, 0.55)" : "rgba(1, 66, 99, 0.45)";
+  const tokenText = mode === "dark" ? "#7fd1f0" : "#014263"; // Inspire/Ocean
+  return {
+    "& div.be-line": { display: "block" },
+    "& div.be-para": { display: "block", marginTop: "0.6em" },
+    "& div.be-q": { display: "block", textIndent: 0 },
+    "& div.be-q-1": { paddingLeft: "1.25em" },
+    "& div.be-q-2": { paddingLeft: "2.5em" },
+    "& div.be-q-3": { paddingLeft: "3.75em" },
+    "& div.be-q-4": { paddingLeft: "5em" },
+    "& div.be-blank": {
+      display: "block",
+      height: "0.6em",
+      lineHeight: "0.6em",
+      pointerEvents: "none",
+    },
+    "& div.be-pi-1": { paddingLeft: "1em" },
+    "& div.be-pi-2": { paddingLeft: "2em" },
+    "& div.be-pi-3": { paddingLeft: "3em" },
+    "& div.be-pc": { textAlign: "center" },
+    "& div.be-mi": { paddingLeft: "1em" },
+    "& div.be-nb": { marginTop: 0 },
+    "& span.be-d": {
+      fontStyle: "italic",
+      fontSize: "0.95em",
+      color: mode === "dark" ? "#bfd5e0" : "#345e74",
+    },
+    "& span.be-tok": {
+      display: "inline-block",
+      padding: "0 4px",
+      marginRight: "2px",
+      fontSize: "0.78em",
+      fontFamily: "Consolas, Menlo, monospace",
+      color: tokenText,
+      backgroundColor: tokenBg,
+      border: `1px solid ${tokenBorder}`,
+      borderRadius: "3px",
+      userSelect: "none",
+      verticalAlign: "0.08em",
+    },
+  };
+}
+
 // `& mark.be-*` selectors used inside <Box>/<Paper> sx blocks for the
 // scripture columns and book/doc views.
 export function markHighlightSx(mode: Mode) {
+  const layout = paragraphLayoutSx(mode);
   if (mode === "dark") {
     return {
+      ...layout,
       "& mark.be-hl": {
         backgroundColor: "rgba(255, 244, 138, 0.22)",
         padding: "0 2px",
@@ -33,6 +84,7 @@ export function markHighlightSx(mode: Mode) {
     };
   }
   return {
+    ...layout,
     "& mark.be-hl": {
       backgroundColor: "#fff48a",
       padding: "0 2px",

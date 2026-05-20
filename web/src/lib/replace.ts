@@ -121,6 +121,67 @@ export function tokenizePlainText(text: string): unknown[] {
   return out;
 }
 
+// Inline paragraph / poetry / blank markers, surfaced as visible literal
+// "\p" / "\q1" tokens in the active-verse contenteditable. The regex
+// matches the marker name followed by a word boundary so "\q1Hello"
+// won't accidentally bite (markers always end with whitespace from the
+// chip renderer's trailing space). The optional trailing \s is consumed
+// so the marker token doesn't leave a stranded space between marker
+// and following text.
+const MARKER_TOKEN_RE = /\\(p|m|mi|nb|pi[1-3]?|pc|q[1-4]?|qm[1-3]?|b)(?=\s|$|[^a-z0-9])\s?/g;
+
+// usfm-js distinguishes "paragraph" markers (\p, \m, \mi, \nb, \pi*,
+// \pc, \b) from "quote" markers (\q, \q1..q4, \qm*) using different
+// `type` fields on the parsed node. Mirror that here so re-emitted
+// markers round-trip through usfm.toUSFM in their original form.
+function nodeTypeForMarker(tag: string): "paragraph" | "quote" {
+  if (tag === "q" || /^q[1-4]$/.test(tag) || /^qm[1-3]?$/.test(tag)) {
+    return "quote";
+  }
+  return "paragraph";
+}
+
+// Tokenize editable text that may contain inline marker tokens (\p, \q1,
+// \b ...) into a flat verseObjects-style array. Each marker becomes a
+// `{type, tag}` node with the right type for its USFM class — the same
+// shape the importer / usfm-js produce — so localized rewrites that
+// consume this output keep markers in document position. Between
+// markers, the segment is fed through tokenizePlainText so word runs
+// become `\w` leaves and the aligner still has draggable targets. When
+// the input has no markers, the behavior is identical to
+// tokenizePlainText.
+export function tokenizeEditableText(text: string): unknown[] {
+  const out: unknown[] = [];
+  let last = 0;
+  const re = new RegExp(MARKER_TOKEN_RE.source, MARKER_TOKEN_RE.flags);
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text)) !== null) {
+    const start = m.index;
+    if (start > last) {
+      for (const node of tokenizePlainText(text.slice(last, start))) out.push(node);
+    }
+    const tag = m[1];
+    out.push({ type: nodeTypeForMarker(tag), tag });
+    last = start + m[0].length;
+    if (m[0].length === 0) re.lastIndex++;
+  }
+  if (last < text.length) {
+    for (const node of tokenizePlainText(text.slice(last))) out.push(node);
+  }
+  return out;
+}
+
+// Strip USFM marker tokens from a string so positions in editable text
+// can be mapped to positions in raw verseObjects text (which has no
+// markers — they're position-anchor nodes with no text payload). Used
+// in localizedRewriteVerse to remap pure-insertion positions when
+// markers are present in the baseline. Same regex as tokenizeEditableText
+// without the trailing-whitespace consume so we count only the marker
+// chars themselves.
+function stripMarkerTokens(text: string): string {
+  return text.replace(MARKER_TOKEN_RE, "");
+}
+
 // Letters / marks / numbers count as "core" word content — mirrors
 // api/src/importParsers.ts:LETTER_RE so the client-side normalize pass
 // agrees with the server importer about which trailing chars belong
@@ -317,7 +378,7 @@ export function smartReplaceVerse(
     const after = plainText.slice(matchStartInPlain + matchLenInPlain);
     const newPlain = normalize(before + replaceText + after);
     return {
-      content: { verseObjects: tokenizePlainText(newPlain) },
+      content: { verseObjects: tokenizeEditableText(newPlain) },
       plainText: newPlain,
       preservedAlignment: false,
     };
@@ -336,14 +397,17 @@ export function smartReplaceVerse(
   const rawRegex = relaxWhitespace(regex);
   const rawMatch = nthMatchIn(raw, rawRegex, occurrenceNum);
 
-  // If the raw search yields nothing (normalization wiped a match), fall
-  // back to the flat tokenized path so we at least produce \w nodes.
+  // If the raw search yields nothing (normalization wiped a match, or
+  // the match text spans an inline marker token like "\p " that has no
+  // counterpart in raw), fall back to the flat tokenized path so we at
+  // least produce \w nodes and any embedded markers stay as paragraph
+  // nodes.
   if (!rawMatch) {
     const before = plainText.slice(0, matchStartInPlain);
     const after = plainText.slice(matchStartInPlain + matchLenInPlain);
     const newPlain = normalize(before + replaceText + after);
     return {
-      content: { verseObjects: tokenizePlainText(newPlain) },
+      content: { verseObjects: tokenizeEditableText(newPlain) },
       plainText: newPlain,
       preservedAlignment: false,
     };
@@ -582,8 +646,9 @@ function partitionMilestoneChildren(
 // outside the change range untouched, split any text node that straddles
 // a boundary, and split any milestone that straddles a boundary into a
 // before-half + after-half (each wrapping just the children outside the
-// range). Insert tokenizePlainText(newSubstring) at the position of the
-// change. Milestones that survive keep their source-alignment attributes,
+// range). Insert tokenizeEditableText(newSubstring) at the position of
+// the change (so any inline \p / \q1 marker text becomes a paragraph
+// node). Milestones that survive keep their source-alignment attributes,
 // so any unchanged children continue to align to the same Hebrew word.
 function localizedRewriteVerse(
   content: unknown,
@@ -596,7 +661,7 @@ function localizedRewriteVerse(
   if (!Array.isArray(verseObjects)) {
     const newPlain = oldPlain.slice(0, start) + newSubstring + oldPlain.slice(start + oldLen);
     return {
-      content: { verseObjects: tokenizePlainText(newPlain) },
+      content: { verseObjects: tokenizeEditableText(newPlain) },
       plainText: normalize(newPlain),
       preservedAlignment: false,
     };
@@ -609,7 +674,10 @@ function localizedRewriteVerse(
   // the Nth occurrence of the matchText in raw, treating each literal space
   // in the pattern as `\s+` so we match across leaf-boundary newlines (e.g.
   // raw `"where\n{are} they"` for plain `"where {are} they"`). For pure
-  // insertions (oldLen === 0) we use the plain position as a rough proxy.
+  // insertions (oldLen === 0) we'd use the plain position as a rough
+  // proxy, but when oldPlain contains inline marker tokens (e.g. "\p ")
+  // those chars don't appear in rawTotal — so strip markers from the
+  // prefix and use that length instead.
   let rawStart = -1;
   let rawLen = oldLen;
   if (oldLen > 0) {
@@ -634,14 +702,16 @@ function localizedRewriteVerse(
       if (m[0].length === 0) rawRegex.lastIndex++;
     }
   } else {
-    rawStart = Math.min(start, rawTotal.length);
+    const prefixNoMarkers = stripMarkerTokens(oldPlain.slice(0, start));
+    rawStart = Math.min(prefixNoMarkers.length, rawTotal.length);
   }
   if (rawStart < 0) {
     // Couldn't map — bail to flat tokenization so we at least emit \w
-    // tokens for the aligner to work with.
+    // tokens for the aligner to work with and any embedded markers stay
+    // as paragraph nodes.
     const newPlain = oldPlain.slice(0, start) + newSubstring + oldPlain.slice(start + oldLen);
     return {
-      content: { verseObjects: tokenizePlainText(newPlain) },
+      content: { verseObjects: tokenizeEditableText(newPlain) },
       plainText: normalize(newPlain),
       preservedAlignment: false,
     };
@@ -665,7 +735,7 @@ function localizedRewriteVerse(
   if (splitsNestedLeaf) {
     const newPlain = oldPlain.slice(0, start) + newSubstring + oldPlain.slice(start + oldLen);
     return {
-      content: { verseObjects: tokenizePlainText(newPlain) },
+      content: { verseObjects: tokenizeEditableText(newPlain) },
       plainText: normalize(newPlain),
       preservedAlignment: false,
     };
@@ -677,7 +747,7 @@ function localizedRewriteVerse(
     if (emittedChange) return;
     emittedChange = true;
     if (newSubstring.length > 0) {
-      for (const t of tokenizePlainText(newSubstring)) out.push(t);
+      for (const t of tokenizeEditableText(newSubstring)) out.push(t);
     }
   };
 

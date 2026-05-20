@@ -818,6 +818,143 @@ function roundtripVerseUsfm(rawUsfm, sourceVO = null) {
   assert(built?.occurrence === 1, `occurrence=1 (got: ${built?.occurrence})`);
 }
 
+// ─── Case 15: Paragraph / poetry markers round-trip through edits ────────
+//
+// Stored shape: `{type:"paragraph", tag}` siblings inside verseObjects.
+// extractEditableText surfaces them as inline "\p ", "\q1 " etc. so the
+// active-verse contenteditable can show them as visible chips. When the
+// user edits text that's between (not over) markers, all marker nodes
+// must survive unmoved. When the user inserts a marker via the toolbar
+// (or types one literally), tokenizeEditableText turns it into a new
+// `{type:"paragraph", tag}` node at the right position.
+{
+  console.log("\n[Case 15] Paragraph / poetry markers round-trip");
+  const { smartEditVerse, tokenizeEditableText } = await import("./replace.ts");
+  const { extractEditableText, splitSectionHeaders } = await import("./usfm.ts");
+
+  // (a) extractEditableText surfaces \p and \q1 inline. usfm-js stores
+  // \q1 as type:"quote" while \p is type:"paragraph" — both are in-flow
+  // markers and both should surface.
+  {
+    const vo = [
+      { type: "paragraph", tag: "p" },
+      { type: "word", tag: "w", text: "Blessed", occurrence: "1", occurrences: "1" },
+      { type: "text", text: " " },
+      { type: "word", tag: "w", text: "is", occurrence: "1", occurrences: "1" },
+      { type: "quote", tag: "q1" },
+      { type: "word", tag: "w", text: "the", occurrence: "1", occurrences: "1" },
+      { type: "text", text: " " },
+      { type: "word", tag: "w", text: "man", occurrence: "1", occurrences: "1" },
+    ];
+    const editable = extractEditableText(vo);
+    // No space before \q1 — the marker node has no preceding text node,
+    // and the renderer's contenteditable textContent matches this shape.
+    assert(
+      editable === "\\p Blessed is\\q1 the man",
+      `editable text includes inline markers (got ${JSON.stringify(editable)})`,
+    );
+  }
+
+  // (b) Edit a word INSIDE the q1 line — both marker nodes survive at
+  // their original positions and are not duplicated. The \q1 keeps
+  // type:"quote" (poetry); \p stays type:"paragraph".
+  {
+    const vo = [
+      { type: "paragraph", tag: "p" },
+      { type: "word", tag: "w", text: "Blessed", occurrence: "1", occurrences: "1" },
+      { type: "text", text: " " },
+      { type: "word", tag: "w", text: "is", occurrence: "1", occurrences: "1" },
+      { type: "quote", tag: "q1" },
+      { type: "word", tag: "w", text: "the", occurrence: "1", occurrences: "1" },
+      { type: "text", text: " " },
+      { type: "word", tag: "w", text: "man", occurrence: "1", occurrences: "1" },
+    ];
+    const oldEditable = "\\p Blessed is\\q1 the man";
+    const newEditable = "\\p Blessed is\\q1 the woman";
+    const result = smartEditVerse({ verseObjects: vo }, oldEditable, newEditable);
+    const markers = result.content.verseObjects.filter(
+      (n) => n.type === "paragraph" || n.type === "quote",
+    );
+    assert(
+      markers.length === 2,
+      `still two marker nodes after text edit (got ${markers.length})`,
+    );
+    assert(
+      markers[0].tag === "p" && markers[1].tag === "q1",
+      `marker tags survive in order (got [${markers.map((p) => p.tag).join(",")}])`,
+    );
+    assert(
+      markers[0].type === "paragraph" && markers[1].type === "quote",
+      `marker types survive (got [${markers.map((p) => p.type).join(",")}])`,
+    );
+    const firstParaIdx = result.content.verseObjects.findIndex(
+      (n) => n.type === "paragraph" || n.type === "quote",
+    );
+    assert(firstParaIdx === 0, `leading \\p still at index 0 (got ${firstParaIdx})`);
+  }
+
+  // (c) tokenizeEditableText: input with literal markers emits marker
+  // nodes interleaved with text / word nodes. Words are still draggable
+  // (have tag:"w"). \q1 emits as type:"quote", \p as type:"paragraph".
+  {
+    const nodes = tokenizeEditableText("\\p hello \\q1 world");
+    const tags = nodes.map((n) => n.tag || n.type);
+    assert(
+      tags[0] === "p",
+      `first node is \\p (got ${tags.join(",")})`,
+    );
+    const firstNode = nodes[0];
+    assert(
+      firstNode.type === "paragraph",
+      `\\p emitted as type:"paragraph" (got ${firstNode.type})`,
+    );
+    const q1 = nodes.find((n) => n.tag === "q1");
+    assert(q1 !== undefined && q1.type === "quote", `q1 emitted as type:"quote" (got ${JSON.stringify(q1)})`);
+    const words = nodes.filter((n) => n.tag === "w").map((n) => n.text);
+    assert(
+      JSON.stringify(words) === JSON.stringify(["hello", "world"]),
+      `hello + world emitted as \\w nodes (got ${JSON.stringify(words)})`,
+    );
+  }
+
+  // (d) Inserting a NEW \q2 marker via the toolbar/typing: smartEditVerse
+  // sees the new marker text in the diff, falls back to localized rewrite,
+  // and emits the marker node in the right spot.
+  {
+    const vo = [
+      { type: "word", tag: "w", text: "fear", occurrence: "1", occurrences: "1" },
+      { type: "text", text: " " },
+      { type: "word", tag: "w", text: "not", occurrence: "1", occurrences: "1" },
+    ];
+    const oldEditable = "fear not";
+    const newEditable = "fear \\q2 not";
+    const result = smartEditVerse({ verseObjects: vo }, oldEditable, newEditable);
+    const markers = result.content.verseObjects.filter(
+      (n) => n && (n.type === "paragraph" || n.type === "quote"),
+    );
+    assert(
+      markers.length === 1 && markers[0].tag === "q2" && markers[0].type === "quote",
+      `new \\q2 quote node emitted (got ${JSON.stringify(markers)})`,
+    );
+  }
+
+  // (e) splitSectionHeaders: \s1 hoisted, \d stays inline (alignable).
+  {
+    const vo = [
+      { type: "section", tag: "s1", text: "The Cleansing" },
+      { type: "section", tag: "d", text: "A psalm of David." },
+      { type: "word", tag: "w", text: "Yahweh", occurrence: "1", occurrences: "1" },
+    ];
+    const { sections, body } = splitSectionHeaders(vo);
+    assert(
+      sections.length === 1 && sections[0].tag === "s1",
+      `only \\s1 hoisted (sections=${JSON.stringify(sections)})`,
+    );
+    const stillHasD = body.some((n) => n && n.tag === "d");
+    assert(stillHasD, `\\d stays inline in body (body tags=${body.map((n) => n?.tag).join(",")})`);
+  }
+}
+
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed.`);
   process.exit(1);

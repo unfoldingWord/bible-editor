@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import { Box, Stack, Typography, IconButton, Tooltip } from "@mui/material";
 import LinkIcon from "@mui/icons-material/Link";
 import SaveIcon from "@mui/icons-material/Save";
@@ -7,6 +7,8 @@ import UndoIcon from "@mui/icons-material/Undo";
 import type { VerseDto } from "../sync/api";
 import { highlightsFor, renderHighlightedHTML, type HighlightKey } from "../lib/highlight";
 import { markHighlightSx } from "../lib/highlightStyles";
+import { splitSectionHeaders, type SectionHeader } from "../lib/usfm";
+import { SectionHeaderBand } from "./SectionHeaderBand";
 import { drafts, verseKey, draftDirtyBorderSx } from "../sync/drafts";
 import { HebrewLine } from "./HebrewLine";
 import type { LexiconEntry } from "../hooks/useLexicon";
@@ -234,29 +236,40 @@ export function DocColumn({
           const highlights = isActive
             ? highlightsFor(bibleVersion, dto.content, activeNoteQuote, activeNoteOccurrence)
             : null;
+          // Lift any \s1/\s2/\s3 section headers in this verse's content
+          // up into block-level bands above the inline verse span. The
+          // remaining body still has them filtered by the renderer.
+          const verseObjects = (dto.content as { verseObjects?: unknown[] } | null)?.verseObjects;
+          const sections: SectionHeader[] = Array.isArray(verseObjects)
+            ? splitSectionHeaders(verseObjects).sections
+            : [];
           return (
-            <VerseSpan
-              key={dto.verse}
-              book={book}
-              chapter={chapter}
-              verseNum={dto.verse}
-              verseLabel={formatVerseLabel(dto)}
-              isRange={isRangeRow(dto)}
-              bibleVersion={bibleVersion}
-              text={dto.plain_text ?? ""}
-              content={dto.content}
-              highlights={highlights}
-              isActive={isActive}
-              readOnly={!!readOnly}
-              rtl={!!rtl}
-              lexiconMap={lexiconMap}
-              search={search ?? null}
-              findActiveMatch={findActiveMatch ?? null}
-              spanRef={isActive ? activeRef : null}
-              onClick={() => onSelectVerse(dto.verse)}
-              onAlign={() => onOpenAligner(dto.verse)}
-              onEdit={(plain) => onEditVerse(dto.verse, plain, dto)}
-            />
+            <Fragment key={dto.verse}>
+              {sections.map((s, i) => (
+                <SectionHeaderBand key={`sec-${dto.verse}-${i}`} tag={s.tag} text={s.text} />
+              ))}
+              <VerseSpan
+                book={book}
+                chapter={chapter}
+                verseNum={dto.verse}
+                verseLabel={formatVerseLabel(dto)}
+                isRange={isRangeRow(dto)}
+                bibleVersion={bibleVersion}
+                text={dto.plain_text ?? ""}
+                content={dto.content}
+                highlights={highlights}
+                isActive={isActive}
+                readOnly={!!readOnly}
+                rtl={!!rtl}
+                lexiconMap={lexiconMap}
+                search={search ?? null}
+                findActiveMatch={findActiveMatch ?? null}
+                spanRef={isActive ? activeRef : null}
+                onClick={() => onSelectVerse(dto.verse)}
+                onAlign={() => onOpenAligner(dto.verse)}
+                onEdit={(plain) => onEditVerse(dto.verse, plain, dto)}
+              />
+            </Fragment>
           );
         })}
       </Box>
@@ -394,10 +407,12 @@ function VerseSpan({
 
   const html = useMemo(() => {
     if (findHTML) return findHTML;
-    if (!content || !highlights || highlights.size === 0) return null;
+    if (!content) return null;
     const verseObjects = (content as { verseObjects?: unknown[] } | null)?.verseObjects;
     if (!Array.isArray(verseObjects)) return null;
-    return renderHighlightedHTML(verseObjects, highlights);
+    // Render unconditionally so paragraph / poetry markers turn into
+    // visual breaks / indents even without an active highlight set.
+    return renderHighlightedHTML(verseObjects, highlights ?? new Set());
   }, [findHTML, content, highlights]);
 
   // Resync the editable span when (a) text changes from outside and the user

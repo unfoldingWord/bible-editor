@@ -19,6 +19,8 @@ import type { VerseDto } from "../sync/api";
 import type { ChapterState } from "../hooks/useBook";
 import { highlightsFor, renderHighlightedHTML, type HighlightKey } from "../lib/highlight";
 import { markHighlightSx } from "../lib/highlightStyles";
+import { splitSectionHeaders, type SectionHeader } from "../lib/usfm";
+import { SectionHeaderBand } from "./SectionHeaderBand";
 import { drafts, verseKey, draftDirtyBorderSx } from "../sync/drafts";
 import type { FindMatch } from "./FindReplaceOverlay";
 import type { FindQuery } from "./ScriptureColumn";
@@ -646,10 +648,11 @@ function VerseCell({
 
   const html = useMemo(() => {
     if (findHTML) return findHTML;
-    if (!highlights || highlights.size === 0) return null;
     const verseObjects = (dto?.content as { verseObjects?: unknown[] } | null)?.verseObjects;
     if (!Array.isArray(verseObjects)) return null;
-    return renderHighlightedHTML(verseObjects, highlights);
+    // Render unconditionally so paragraph / poetry markers turn into
+    // visual breaks / indents in book view even without active highlights.
+    return renderHighlightedHTML(verseObjects, highlights ?? new Set());
   }, [findHTML, dto?.content, highlights]);
 
   useEffect(() => {
@@ -682,8 +685,16 @@ function VerseCell({
     );
   }
 
+  const verseObjects = (dto?.content as { verseObjects?: unknown[] } | null)?.verseObjects;
+  const sections: SectionHeader[] = Array.isArray(verseObjects)
+    ? splitSectionHeaders(verseObjects).sections
+    : [];
+
   return (
     <Box sx={{ lineHeight: 1.6 }}>
+      {sections.map((s, i) => (
+        <SectionHeaderBand key={`bv-sec-${i}`} tag={s.tag} text={s.text} />
+      ))}
       <Typography
         component="span"
         variant="caption"

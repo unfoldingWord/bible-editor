@@ -24,6 +24,7 @@ import { api } from "../sync/api";
 import type { TnRow, TqRow, TwlRow, VerseDto } from "../sync/api";
 import { drafts, verseKey } from "../sync/drafts";
 import { smartEditVerse } from "../lib/replace";
+import { extractEditableText, extractPlainText, SECTION_HEADER_TAGS } from "../lib/usfm";
 import { verseHasUnalignedWork } from "../lib/alignment";
 import { concatSourceRange, formatVerseLabel } from "../lib/verseRange";
 import { buildTnQuickRequest } from "../lib/tnQuickRequest";
@@ -705,6 +706,12 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // regions keep their `\zaln-s` milestones, applies the new content
   // locally so highlights re-render, then enqueues. Outbox-result listener
   // (installed in main.ts) clears the draft on 200.
+  //
+  // `plain` is the editable representation (paragraph / poetry markers
+  // surfaced as inline "\p" / "\q1" tokens) — extractEditableText on the
+  // base content produces the matching baseline for the diff. The DB
+  // `plain_text` column stays marker-free, so we recompute it from the
+  // resulting tree via extractPlainText.
   const saveVerseDraft = (
     chapterNum: number,
     verseNum: number,
@@ -712,13 +719,15 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     plain: string,
     base: VerseDto,
   ) => {
-    const result = smartEditVerse(base.content, base.plain_text ?? "", plain);
+    const oldEditable = extractEditableText(base.content);
+    const result = smartEditVerse(base.content, oldEditable, plain);
+    const newPlainText = extractPlainText(result.content);
     const newDto = {
       ...base,
       chapter: chapterNum,
       verse: verseNum,
       bible_version: bibleVersion,
-      plain_text: result.plainText,
+      plain_text: newPlainText,
       content: result.content,
     } as VerseDto;
     bookHook?.applyLocalVerse(newDto);
@@ -729,7 +738,67 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       verseNum,
       bibleVersion,
       base.version,
-      { content: result.content, plain_text: result.plainText },
+      { content: result.content, plain_text: newPlainText },
+    );
+  };
+
+  // Section header (\s1/\s2/\s3) edit / delete. `change.index` is the
+  // i'th section header inside this verse's content per
+  // splitSectionHeaders. tag === null deletes the band. The verseObjects
+  // tree is mutated structurally (no smartEditVerse — there's no text
+  // diff, just a structural node swap) and saved via the same outbox.
+  const saveSectionEdit = (
+    chapterNum: number,
+    verseNum: number,
+    bibleVersion: string,
+    change: { index: number; tag: string | null; text: string },
+    base: VerseDto,
+  ) => {
+    const verseObjects = (base.content as { verseObjects?: unknown[] } | null)?.verseObjects;
+    if (!Array.isArray(verseObjects)) return;
+    // Walk verseObjects in order; the index counter advances each time
+    // we hit a section heading. On match: swap (tag/text) or splice out.
+    const next: unknown[] = [];
+    let sectionIdx = 0;
+    for (const node of verseObjects) {
+      const o = node as Record<string, unknown> | null;
+      if (
+        o &&
+        o["type"] === "section" &&
+        typeof o["tag"] === "string" &&
+        SECTION_HEADER_TAGS.has(o["tag"] as string)
+      ) {
+        if (sectionIdx === change.index) {
+          if (change.tag !== null) {
+            next.push({ ...o, tag: change.tag, text: change.text });
+          }
+          // null tag → drop the node entirely.
+          sectionIdx++;
+          continue;
+        }
+        sectionIdx++;
+      }
+      next.push(node);
+    }
+    const newContent = { ...(base.content as Record<string, unknown> | null), verseObjects: next };
+    const newPlainText = extractPlainText(newContent);
+    const newDto = {
+      ...base,
+      chapter: chapterNum,
+      verse: verseNum,
+      bible_version: bibleVersion,
+      plain_text: newPlainText,
+      content: newContent,
+    } as VerseDto;
+    bookHook?.applyLocalVerse(newDto);
+    if (chapterNum === chapter) applyLocalVerse(newDto);
+    void outbox.enqueueVerse(
+      book,
+      chapterNum,
+      verseNum,
+      bibleVersion,
+      base.version,
+      { content: newContent, plain_text: newPlainText },
     );
   };
 
@@ -913,6 +982,9 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           }}
           onSaveVerse={(verseNum, bibleVersion, plain, base) => {
             saveVerseDraft(chapter, verseNum, bibleVersion, plain, base);
+          }}
+          onEditSection={(verseNum, bibleVersion, change, base) => {
+            saveSectionEdit(chapter, verseNum, bibleVersion, change, base);
           }}
           onOpenAligner={(v, bv) => openAligner(chapter, v, bv)}
           scrollNonce={scrollNonce}

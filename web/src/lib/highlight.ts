@@ -23,6 +23,7 @@
 // reads from the same tree, so raw matches raw with no further work.
 
 import { nfc } from "./hebrew.ts";
+import { isInFlowMarker, SECTION_HEADER_TAGS } from "./usfm.ts";
 
 type WordToken = { text: string; occurrence: number };
 type Run = { source: string; occurrence: number; targets: WordToken[] };
@@ -346,29 +347,89 @@ function escapeHtml(s: string): string {
   );
 }
 
-// Render the verse tree as a single HTML string, wrapping highlighted \w
-// tokens in <mark>. Used for contentEditable spans where we want the
-// browser to preserve the cursor between props changes.
-export function renderHighlightedHTML(
+// CSS class for a paragraph / poetry / blank marker. Returns a pair of
+// classes (one structural, one tag-specific) so the layout stylesheet
+// can attach indents per q-level or special spacing per p-variant.
+function paragraphClass(tag: string): { wrapper: string; isBlank: boolean } {
+  if (tag === "b") return { wrapper: "be-blank", isBlank: true };
+  if (tag === "q" || tag === "q1") return { wrapper: "be-q be-q-1", isBlank: false };
+  if (tag === "q2") return { wrapper: "be-q be-q-2", isBlank: false };
+  if (tag === "q3") return { wrapper: "be-q be-q-3", isBlank: false };
+  if (tag === "q4") return { wrapper: "be-q be-q-4", isBlank: false };
+  if (tag === "qm" || tag === "qm1") return { wrapper: "be-q be-q-1 be-qm", isBlank: false };
+  if (tag === "qm2") return { wrapper: "be-q be-q-2 be-qm", isBlank: false };
+  if (tag === "qm3") return { wrapper: "be-q be-q-3 be-qm", isBlank: false };
+  if (tag === "pi1" || tag === "pi") return { wrapper: "be-para be-pi-1", isBlank: false };
+  if (tag === "pi2") return { wrapper: "be-para be-pi-2", isBlank: false };
+  if (tag === "pi3") return { wrapper: "be-para be-pi-3", isBlank: false };
+  if (tag === "pc") return { wrapper: "be-para be-pc", isBlank: false };
+  if (tag === "mi") return { wrapper: "be-para be-mi", isBlank: false };
+  if (tag === "m") return { wrapper: "be-para be-m", isBlank: false };
+  if (tag === "nb") return { wrapper: "be-para be-nb", isBlank: false };
+  return { wrapper: "be-para be-p", isBlank: false };
+}
+
+interface Segment {
+  // CSS class applied to the wrapper <div>. The first (pre-marker)
+  // segment has wrapper="" — emitted without a wrapper div so verses
+  // with no paragraph markers render exactly as before.
+  wrapper: string;
+  // Marker tag that opens this segment, or null for the initial segment.
+  tag: string | null;
+  // Inner HTML for this segment.
+  html: string;
+  // \b — emit as an empty block (the html is intentionally empty).
+  isBlank: boolean;
+}
+
+// Walk the verse tree once and partition into segments separated by
+// `type:"paragraph"` nodes. Each segment's html is built using the
+// per-word callback so renderers can swap how words render (display
+// vs editable) without duplicating tree walking.
+function segmentByParagraphs(
   verseObjects: unknown[],
-  highlights: Set<HighlightKey>,
-): string {
-  let html = "";
+  renderWord: (text: string, occurrence: number) => string,
+): Segment[] {
+  const segments: Segment[] = [{ wrapper: "", tag: null, html: "", isBlank: false }];
+  let current = segments[0];
+
   function walk(nodes: unknown[]) {
     for (const node of nodes ?? []) {
       const o = node as Record<string, unknown> | null;
       if (!o) continue;
+      if (isInFlowMarker(o)) {
+        const tag = o["tag"] as string;
+        const { wrapper, isBlank } = paragraphClass(tag);
+        current = { wrapper, tag, html: "", isBlank };
+        segments.push(current);
+        continue;
+      }
+      if (
+        o["type"] === "section" &&
+        typeof o["tag"] === "string" &&
+        SECTION_HEADER_TAGS.has(o["tag"] as string)
+      ) {
+        continue;
+      }
+      // \d (Psalm superscription) is `type:"section"` but its text IS
+      // alignable Hebrew. Render inline with `.be-d` styling so children
+      // (\zaln-s milestones, \w words) still walk and align.
+      if (o["type"] === "section" && o["tag"] === "d") {
+        current.html += '<span class="be-d">';
+        if (Array.isArray(o["children"]) && (o["children"] as unknown[]).length > 0) {
+          walk(o["children"] as unknown[]);
+        } else if (typeof o["text"] === "string") {
+          current.html += escapeHtml(String(o["text"]));
+        }
+        current.html += "</span>";
+        continue;
+      }
       if (o["type"] === "text") {
-        html += escapeHtml(String(o["text"] ?? ""));
+        current.html += escapeHtml(String(o["text"] ?? ""));
       } else if (nodeIsWord(o)) {
         const text = String(o["text"] ?? "");
-        const occ = parseInt(String(o["occurrence"] ?? "1"), 10) || 1;
-        const key = k(text, occ);
-        if (highlights.has(key)) {
-          html += `<mark class="be-hl">${escapeHtml(text)}</mark>`;
-        } else {
-          html += escapeHtml(text);
-        }
+        const occurrence = parseInt(String(o["occurrence"] ?? "1"), 10) || 1;
+        current.html += renderWord(text, occurrence);
       } else if (nodeIsMilestone(o)) {
         const children = (o["children"] as unknown[] | undefined) ?? [];
         walk(children);
@@ -376,8 +437,85 @@ export function renderHighlightedHTML(
     }
   }
   walk(verseObjects);
-  // Collapse repeated whitespace just enough to keep punctuation tight.
-  return html;
+  return segments;
+}
+
+// Render a paragraph chip — the visible literal "\p" / "\q1" token
+// shown in the active-verse editor. `contenteditable="false"` keeps it
+// atomic (backspace removes the whole chip; cursor steps over it).
+function chipForTag(tag: string): string {
+  return `<span class="be-tok be-tok-${escapeHtml(tag)}" contenteditable="false" data-tag="${escapeHtml(tag)}">\\${escapeHtml(tag)}</span>`;
+}
+
+// Render segments to an HTML string. When the verse has no paragraph
+// markers the result is the pre-marker segment's html with no wrapper
+// (preserves the inline-flow look for non-poetic verses). When markers
+// are present, each segment becomes a block-level `<div>` so the layout
+// breaks at the marker. `emitChips` adds visible literal-USFM chips at
+// the start of each marker-opened block — used by the editable renderer
+// so translators can see and remove markers.
+function segmentsToHtml(segments: Segment[], emitChips: boolean): string {
+  if (segments.length === 1 && !segments[0].wrapper) {
+    return segments[0].html;
+  }
+  const out: string[] = [];
+  for (let i = 0; i < segments.length; i++) {
+    const seg = segments[i];
+    if (i === 0 && seg.html === "" && !seg.wrapper) continue;
+    const cls = seg.wrapper || "be-line";
+    if (seg.isBlank) {
+      out.push(`<div class="${cls}">${emitChips && seg.tag ? chipForTag(seg.tag) : "&nbsp;"}</div>`);
+      continue;
+    }
+    const chip = emitChips && seg.tag ? chipForTag(seg.tag) + " " : "";
+    // Empty segments need a zero-width space so contenteditable can put
+    // a caret inside them.
+    const body = seg.html || (emitChips ? "&#8203;" : "&#8203;");
+    out.push(`<div class="${cls}">${chip}${body}</div>`);
+  }
+  return out.join("");
+}
+
+// Render the verse tree as a single HTML string, wrapping highlighted \w
+// tokens in <mark>. Paragraph / poetry markers become block-level <div>
+// wrappers with CSS classes (be-q-1..4, be-para, be-blank) so all three
+// scripture views (rows, columns, book) lay out poetry with proper
+// indents and paragraphs with proper breaks. Used for contentEditable
+// spans where we want the browser to preserve the cursor between props
+// changes.
+export function renderHighlightedHTML(
+  verseObjects: unknown[],
+  highlights: Set<HighlightKey>,
+): string {
+  const segments = segmentByParagraphs(verseObjects, (text, occurrence) => {
+    const key = k(text, occurrence);
+    if (highlights.has(key)) {
+      return `<mark class="be-hl">${escapeHtml(text)}</mark>`;
+    }
+    return escapeHtml(text);
+  });
+  return segmentsToHtml(segments, false);
+}
+
+// Like renderHighlightedHTML but emits visible literal-USFM chips
+// (<span class="be-tok" contenteditable="false">\p</span>) at the start
+// of each paragraph-opened block. Used in the active-verse editor so
+// translators can see and adjust paragraph / poetry markers as they
+// type. The chip's textContent is exactly "\p" / "\q1", so reading the
+// containing div's textContent yields the same string format produced
+// by extractEditableText — the smartEditVerse diff lines up.
+export function renderEditableHTML(
+  verseObjects: unknown[],
+  highlights: Set<HighlightKey>,
+): string {
+  const segments = segmentByParagraphs(verseObjects, (text, occurrence) => {
+    const key = k(text, occurrence);
+    if (highlights.has(key)) {
+      return `<mark class="be-hl">${escapeHtml(text)}</mark>`;
+    }
+    return escapeHtml(text);
+  });
+  return segmentsToHtml(segments, true);
 }
 
 // Convenience: pick the right highlight set for a given bible_version.

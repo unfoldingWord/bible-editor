@@ -15,8 +15,10 @@ import type { FindMatch } from "./FindReplaceOverlay";
 import { HebrewLine } from "./HebrewLine";
 import type { LexiconEntry } from "../hooks/useLexicon";
 import type { ChapterState } from "../hooks/useBook";
-import { highlightsFor, renderHighlightedHTML, type HighlightKey } from "../lib/highlight";
+import { highlightsFor, renderEditableHTML, renderHighlightedHTML, type HighlightKey } from "../lib/highlight";
 import { markHighlightSx } from "../lib/highlightStyles";
+import { extractEditableText, splitSectionHeaders, type SectionHeader } from "../lib/usfm";
+import { SectionHeaderBand } from "./SectionHeaderBand";
 import { buildVerseIndex, formatVerseLabel, isFirstOfRange, isRangeRow } from "../lib/verseRange";
 import {
   classifySourceQuery,
@@ -86,6 +88,15 @@ interface Props {
   // runs it through smartEditVerse, and enqueues. Shell wires this; both
   // stacked rows and the column-style modes call it on Save click.
   onSaveVerse: (verseNum: number, bibleVersion: string, plain: string, base: VerseDto) => void;
+  // Section-band edit / delete. Splice the new (tag, text) into the
+  // verse's verseObjects.sections (filtered by splitSectionHeaders) and
+  // save via outbox. tag === null deletes the band entirely.
+  onEditSection?: (
+    verseNum: number,
+    bibleVersion: string,
+    change: { index: number; tag: string | null; text: string },
+    base: VerseDto,
+  ) => void;
   // Chapter is mid-flight for an AI pipeline. Renders all editable bibles
   // (ULT/UST) as read-only too — UHB/UGNT already are by virtue of
   // READ_ONLY_VERSIONS. The banner above the column tells the user why.
@@ -136,6 +147,7 @@ export function ScriptureColumn({
   onEnabledVersionsChange,
   onEditVerse,
   onSaveVerse,
+  onEditSection,
   locked = false,
 }: Props) {
   const activeRef = useRef<HTMLDivElement | null>(null);
@@ -416,6 +428,7 @@ export function ScriptureColumn({
             onOpenAligner={onOpenAligner}
             onEditVerse={onEditVerse}
             onSaveVerse={onSaveVerse}
+            onEditSection={onEditSection}
             locked={locked}
           />
         ) : mode === "book" && bookChapterList && bookChapters && onLoadBookChapter && onSelectBookVerse && onEditBookVerse && onSaveBookVerse && onOpenBookAligner ? (
@@ -498,6 +511,7 @@ function StackedBody({
   onOpenAligner,
   onEditVerse,
   onSaveVerse,
+  onEditSection,
   locked,
 }: {
   book: string;
@@ -516,6 +530,12 @@ function StackedBody({
   onOpenAligner: (verse: number, bibleVersion: string) => void;
   onEditVerse: (verseNum: number, bibleVersion: string, plain: string, base: VerseDto) => void;
   onSaveVerse: (verseNum: number, bibleVersion: string, plain: string, base: VerseDto) => void;
+  onEditSection?: (
+    verseNum: number,
+    bibleVersion: string,
+    change: { index: number; tag: string | null; text: string },
+    base: VerseDto,
+  ) => void;
   locked: boolean;
 }) {
   const ult = indexByVersion["ULT"] ?? {};
@@ -585,6 +605,11 @@ function StackedBody({
                 onSave={
                   ultV ? (plain) => onSaveVerse(ultStart, "ULT", plain, ultV) : undefined
                 }
+                onEditSection={
+                  ultV && onEditSection
+                    ? (change) => onEditSection(ultStart, "ULT", change, ultV)
+                    : undefined
+                }
               />
               <ActiveLine
                 book={book}
@@ -604,6 +629,11 @@ function StackedBody({
                 }
                 onSave={
                   ustV ? (plain) => onSaveVerse(ustStart, "UST", plain, ustV) : undefined
+                }
+                onEditSection={
+                  ustV && onEditSection
+                    ? (change) => onEditSection(ustStart, "UST", change, ustV)
+                    : undefined
                 }
               />
               {uhbV && (
@@ -770,6 +800,7 @@ function ActiveLine({
   onOpenAligner,
   onEditPlain,
   onSave,
+  onEditSection,
   lexiconMap,
 }: {
   // book + bibleVersion identify the verse for draft keying.
@@ -794,6 +825,11 @@ function ActiveLine({
   // Click-to-save. Shell consumes the current plain text, runs smartEditVerse,
   // and enqueues. Only rendered when editable && draft exists.
   onSave?: (plain: string) => void;
+  // Section header band edited / removed. Index is the position in
+  // splitSectionHeaders(verseObjects).sections at render time. tag === null
+  // means delete the section header at that index. Shell mutates the
+  // verseObjects tree directly and re-saves.
+  onEditSection?: (change: { index: number; tag: string | null; text: string }) => void;
   lexiconMap?: Map<string, LexiconEntry | null>;
 }) {
   const isSource = label === "UHB" || label === "UGNT";
@@ -883,13 +919,45 @@ function ActiveLine({
     return out.includes("be-find") ? out : null;
   }, [search, sourceHits, text, isSource, activeRange]);
 
+  // Editable representation: paragraph / poetry / blank markers surfaced
+  // as literal "\p" / "\q1" tokens inline. Used as the contentEditable's
+  // textContent target so when the user types, the markers appear as
+  // visible chips (via renderEditableHTML) and the diff in saveVerseDraft
+  // can see / preserve them. Falls back to plain `text` for source rows
+  // (Hebrew/Greek) or rows with no verseObjects tree.
+  const verseObjects = useMemo(
+    () => (content as { verseObjects?: unknown[] } | null)?.verseObjects,
+    [content],
+  );
+  const editableText = useMemo(() => {
+    if (!Array.isArray(verseObjects)) return text;
+    return extractEditableText(verseObjects);
+  }, [verseObjects, text]);
+  const sections = useMemo<SectionHeader[]>(() => {
+    if (!Array.isArray(verseObjects)) return [];
+    return splitSectionHeaders(verseObjects).sections;
+  }, [verseObjects]);
+
   const noteHTML = useMemo(() => {
     if (findHTML) return null;
-    if (!content || !highlights || highlights.size === 0) return null;
-    const verseObjects = (content as { verseObjects?: unknown[] } | null)?.verseObjects;
     if (!Array.isArray(verseObjects)) return null;
+    const hlSet = highlights ?? (new Set() as Set<HighlightKey>);
+    // When edit mode is on, render with visible chips so paragraph /
+    // poetry markers can be seen and adjusted in place. Otherwise emit
+    // the read-only display (no chips, just block layout).
+    if (editable && !readOnly) {
+      return renderEditableHTML(verseObjects, hlSet);
+    }
+    if (!highlights || highlights.size === 0) {
+      // Same code path used by columns/book views — also runs even without
+      // active highlights so paragraph markers render as visual breaks.
+      // For pure read-only inactive rows, the parent uses FindAwareText
+      // (plain text) instead of this `html`, so this branch only matters
+      // when the active line has no quote highlight.
+      return renderHighlightedHTML(verseObjects, new Set());
+    }
     return renderHighlightedHTML(verseObjects, highlights);
-  }, [findHTML, content, highlights]);
+  }, [findHTML, verseObjects, highlights, editable, readOnly]);
   const html = findHTML ?? noteHTML;
 
   // Only resync the DOM when the highlight/content state actually changes —
@@ -898,21 +966,22 @@ function ActiveLine({
   // Setting lastSetRef before flushing an edit keeps this effect from
   // resetting textContent (and the caret with it) when the parent
   // applyLocalVerse round-trips back as the new `text` prop.
+  const domBaseline = editable && !readOnly ? editableText : text;
   useEffect(() => {
     if (!elRef.current) return;
     // If the user has unsaved typing in here, leave their text alone —
     // a parent re-render (e.g. notes panel reflow re-passes `text` from
     // server state) must not stomp the draft.
     if (hasDraft) return;
-    const next = html ?? text;
+    const next = html ?? domBaseline;
     if (next === lastSetRef.current) return;
     if (html === null) {
-      elRef.current.textContent = text;
+      elRef.current.textContent = domBaseline;
     } else {
       elRef.current.innerHTML = html;
     }
     lastSetRef.current = next;
-  }, [html, text]);
+  }, [html, domBaseline]);
 
   return (
     <Box sx={{ py: 0.5 }}>
@@ -971,8 +1040,11 @@ function ActiveLine({
                 void drafts.clear(draftKey);
                 hydratedFromDraftRef.current = false;
                 if (elRef.current) {
-                  elRef.current.textContent = text;
-                  lastSetRef.current = text;
+                  // Re-render from the editable baseline so chips are
+                  // restored, not just plain text.
+                  elRef.current.innerHTML = html ?? "";
+                  if (!html) elRef.current.textContent = editableText;
+                  lastSetRef.current = html ?? editableText;
                 }
               }}
               sx={{ p: 0.25, color: "warning.main" }}
@@ -982,6 +1054,29 @@ function ActiveLine({
           </Tooltip>
         )}
       </Stack>
+      {sections.length > 0 && (
+        <Stack spacing={0.25} sx={{ mb: 0.5 }}>
+          {sections.map((s, i) => (
+            <SectionHeaderBand
+              key={`${s.tag}-${i}`}
+              tag={s.tag}
+              text={s.text}
+              editable={!!editable && !readOnly}
+              onChange={(next) => {
+                // Splice the updated/removed section back into verseObjects
+                // and let Shell handle the smart save via onEditContent.
+                // Wire-up handled in the parent Shell; this component just
+                // surfaces edits. For v1 we mutate textContent inline via
+                // a side channel — see Shell's onEditSection handler.
+                onEditSection?.({ index: i, tag: next.tag, text: next.text });
+              }}
+            />
+          ))}
+        </Stack>
+      )}
+      {editable && !readOnly && !rtl && (
+        <ParagraphToolbar elRef={elRef} onEditPlain={onEditPlain} />
+      )}
       {rtl && lexiconMap ? (
         <Box
           data-find-cell={`${chapter}-${verseNum}-${label}`}
@@ -1058,6 +1153,97 @@ function ActiveLine({
         />
       )}
     </Box>
+  );
+}
+
+// Small toolbar above the active editable verse with one button per
+// common paragraph / poetry marker. Clicking inserts a literal-USFM
+// chip (`<span class="be-tok" contenteditable="false">\p</span>` plus
+// a trailing space) at the current selection inside elRef. After the
+// chip is inserted we manually call onEditPlain with the updated
+// textContent so the draft fires — the synthetic edit doesn't trigger
+// a normal `input` event.
+const TOOLBAR_MARKERS: Array<{ tag: string; label: string; title: string }> = [
+  { tag: "p", label: "\\p", title: "paragraph" },
+  { tag: "m", label: "\\m", title: "margin paragraph" },
+  { tag: "q1", label: "\\q1", title: "poetry indent 1" },
+  { tag: "q2", label: "\\q2", title: "poetry indent 2" },
+  { tag: "q3", label: "\\q3", title: "poetry indent 3" },
+  { tag: "b", label: "\\b", title: "blank line" },
+];
+
+function ParagraphToolbar({
+  elRef,
+  onEditPlain,
+}: {
+  elRef: React.RefObject<HTMLDivElement | null>;
+  onEditPlain?: (plain: string) => void;
+}) {
+  const insert = useCallback(
+    (tag: string) => {
+      const el = elRef.current;
+      if (!el) return;
+      const chipHtml = `<span class="be-tok be-tok-${tag}" contenteditable="false" data-tag="${tag}">\\${tag}</span>&nbsp;`;
+      el.focus();
+      const sel = window.getSelection();
+      // If the caret isn't already in this contenteditable, place it at
+      // the end before inserting — feels less surprising than nothing
+      // happening when the user clicks the toolbar without first clicking
+      // into the verse.
+      if (!sel || sel.rangeCount === 0 || !el.contains(sel.anchorNode)) {
+        const r = document.createRange();
+        r.selectNodeContents(el);
+        r.collapse(false);
+        sel?.removeAllRanges();
+        sel?.addRange(r);
+      }
+      const ok = document.execCommand("insertHTML", false, chipHtml);
+      if (!ok) {
+        // execCommand is deprecated; the Selection API fallback inserts
+        // the chip as DOM nodes instead. Same end result.
+        const range = window.getSelection()?.getRangeAt(0);
+        if (range) {
+          const tmpl = document.createElement("template");
+          tmpl.innerHTML = chipHtml;
+          range.deleteContents();
+          const frag = tmpl.content;
+          range.insertNode(frag);
+          range.collapse(false);
+        }
+      }
+      // Fire the same path as a real keystroke so the draft captures.
+      onEditPlain?.(el.textContent ?? "");
+    },
+    [elRef, onEditPlain],
+  );
+  return (
+    <Stack direction="row" spacing={0.25} sx={{ mb: 0.5, flexWrap: "wrap" }}>
+      {TOOLBAR_MARKERS.map((m) => (
+        <Tooltip key={m.tag} title={m.title}>
+          <Button
+            size="small"
+            variant="outlined"
+            onMouseDown={(e) => {
+              // Prevent the editor losing focus when clicking the toolbar.
+              e.preventDefault();
+            }}
+            onClick={() => insert(m.tag)}
+            sx={{
+              minWidth: 0,
+              px: 0.75,
+              py: 0.1,
+              fontFamily: "Consolas, Menlo, monospace",
+              fontSize: 11,
+              textTransform: "none",
+              color: "primary.main",
+              borderColor: "divider",
+            }}
+          >
+            {m.label}
+          </Button>
+        </Tooltip>
+      ))}
+    </Stack>
   );
 }
 
