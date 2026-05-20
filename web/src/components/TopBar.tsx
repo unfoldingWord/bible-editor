@@ -117,13 +117,15 @@ export function TopBar({
     <Stack
       direction="row"
       alignItems="center"
-      spacing={1.5}
+      spacing={{ xs: 0.75, md: 1.5 }}
       sx={{
-        px: 2,
+        px: { xs: 1, md: 2 },
         py: 1,
         borderBottom: "1px solid",
         borderColor: "divider",
         bgcolor: "background.paper",
+        flexWrap: "wrap",
+        rowGap: 0.5,
       }}
     >
       {onToggleRail && (
@@ -133,9 +135,6 @@ export function TopBar({
           </IconButton>
         </Tooltip>
       )}
-      <Typography variant="h6" sx={{ fontWeight: 500, mr: 1 }}>
-        Bible Editor
-      </Typography>
       <FormControl size="small">
         <Autocomplete<string, false, true, false>
           size="small"
@@ -278,59 +277,63 @@ export function TopBar({
           </span>
         </Tooltip>
       </Stack>
-      <Tooltip
-        title={refError ?? "go to: 5 · 5:5 · zec 5:5 · ps 1:4 (Enter)"}
-        open={refError ? true : undefined}
-      >
-        <TextField
-          size="small"
-          placeholder="go to ref"
-          value={refInput}
-          onChange={(e) => {
-            setRefInput(e.target.value);
-            if (refError) setRefError(null);
-          }}
-          onKeyDown={(e) => {
-            if (e.key === "Enter") {
-              e.preventDefault();
-              submitRef();
-            } else if (e.key === "Escape") {
-              setRefInput("");
-              setRefError(null);
-            }
-          }}
-          error={Boolean(refError)}
-          inputProps={{ style: { fontFamily: "monospace", fontSize: 13 } }}
-          InputProps={{
-            endAdornment: (
-              <InputAdornment position="end">
-                <Tooltip title="go">
-                  <span>
-                    <IconButton
-                      size="small"
-                      onClick={submitRef}
-                      disabled={!refInput.trim()}
-                      edge="end"
-                    >
-                      <ArrowForwardIcon fontSize="small" />
-                    </IconButton>
-                  </span>
-                </Tooltip>
-              </InputAdornment>
-            ),
-          }}
-          sx={{ width: 170 }}
-        />
-      </Tooltip>
-      {logosSyncToggle}
+      <Box sx={{ display: { xs: "none", md: "block" } }}>
+        <Tooltip
+          title={refError ?? "go to: 5 · 5:5 · zec 5:5 · ps 1:4 (Enter)"}
+          open={refError ? true : undefined}
+        >
+          <TextField
+            size="small"
+            placeholder="go to ref"
+            value={refInput}
+            onChange={(e) => {
+              setRefInput(e.target.value);
+              if (refError) setRefError(null);
+            }}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                e.preventDefault();
+                submitRef();
+              } else if (e.key === "Escape") {
+                setRefInput("");
+                setRefError(null);
+              }
+            }}
+            error={Boolean(refError)}
+            inputProps={{ style: { fontFamily: "monospace", fontSize: 13 } }}
+            InputProps={{
+              endAdornment: (
+                <InputAdornment position="end">
+                  <Tooltip title="go">
+                    <span>
+                      <IconButton
+                        size="small"
+                        onClick={submitRef}
+                        disabled={!refInput.trim()}
+                        edge="end"
+                      >
+                        <ArrowForwardIcon fontSize="small" />
+                      </IconButton>
+                    </span>
+                  </Tooltip>
+                </InputAdornment>
+              ),
+            }}
+            sx={{ width: 170 }}
+          />
+        </Tooltip>
+      </Box>
+      <Box sx={{ display: { xs: "none", md: "flex" }, alignItems: "center" }}>
+        {logosSyncToggle}
+      </Box>
       <Box sx={{ flex: 1 }} />
       {summary?.chapters && (
-        <>
+        <Box sx={{ display: { xs: "none", lg: "flex" }, alignItems: "center", gap: 1.5 }}>
           <Typography variant="caption" color="text.secondary" sx={{ whiteSpace: "nowrap" }}>
             {summary.chapters.reduce((a, c) => a + c.tn, 0)} notes · {summary.chapters.reduce((a, c) => a + c.twl, 0)} words · {summary.chapters.reduce((a, c) => a + c.tq, 0)} questions
           </Typography>
           <Divider orientation="vertical" flexItem sx={{ my: 0.5 }} />
-        </>
+        </Box>
       )}
       <SyncStatusBar />
       <Tooltip title={mode === "dark" ? "switch to light mode" : "switch to dark mode"}>

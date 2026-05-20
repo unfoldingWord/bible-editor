@@ -11,6 +11,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - We are intentionally rethinking the backend to remove DCS from the loop except for once daily.
 - Volta-pinned: Node 24.15.0, npm 11.12.1. npm workspaces (`api/`, `web/`).
 
+## Before planning, and again before executing
+
+Multiple worktrees may be active in parallel. Twice — once before writing the plan, and again immediately after the plan is approved and before any edits — run:
+
+```sh
+git fetch origin main && git log --oneline HEAD..origin/main
+```
+
+Surface any commits the worktree is behind by, plus whether they touch files this plan will modify. Don't silently base a plan on a stale tree, and don't start executing without re-checking — main may have advanced between writing the plan and the user approving it (other worktrees may have landed work during the approval window).
+
 ## Common commands
 
 Run from repo root:
