@@ -97,12 +97,17 @@ export function splitSectionHeaders(verseObjects: unknown[] | undefined | null):
 // usfm-js stores poetry markers (\q1, \q2, \qm*) as `{type:"quote", tag}`
 // and plain-paragraph markers (\p, \m, \pi*, \nb, \b) as
 // `{type:"paragraph", tag}`. Both are inert structural anchors that we
-// render and surface for editing in the same way.
+// render and surface for editing in the same way. `\ts\*` (translator-
+// section chunk milestone) is parsed by usfm-js as `{tag:"ts",
+// content:"\\*"}` with no `type` field — we treat it as in-flow too so
+// it surfaces in the editor as a visible chunk divider.
 export function isInFlowMarker(node: unknown): boolean {
   const o = node as Record<string, unknown> | null;
   if (!o) return false;
   const t = o["type"];
-  return (t === "paragraph" || t === "quote") && typeof o["tag"] === "string";
+  if ((t === "paragraph" || t === "quote") && typeof o["tag"] === "string") return true;
+  if (o["tag"] === "ts" && o["content"] === "\\*") return true;
+  return false;
 }
 
 // Peel trailing in-flow paragraph / quote markers off a verse's
@@ -125,17 +130,13 @@ export function extractTrailingMarkers(verseObjects: unknown[] | undefined | nul
       out.unshift(node);
     } else {
       const o = node as Record<string, unknown> | null;
-      // Skip empty trailing text whitespace or chunk milestones (\ts\*)
-      // when looking past them for the marker run. Both are layout-only
-      // and shouldn't disqualify a trailing marker behind them.
+      // Skip empty trailing text whitespace when looking past it for the
+      // marker run. Tolerate zero-width spaces (U+200B) — they crept in
+      // from the editor's empty-block placeholder (&#8203;) and shouldn't
+      // block marker drift just because the user saved past one.
       const txt = typeof o?.["text"] === "string" ? (o["text"] as string) : null;
-      const tag = typeof o?.["tag"] === "string" ? (o["tag"] as string) : null;
-      // Tolerate zero-width spaces (U+200B) — they crept in from the
-      // editor's empty-block placeholder (&#8203;) and shouldn't block
-      // marker drift just because the user saved past one.
       const isWhitespace = txt !== null && /^[\s​]*$/.test(txt);
-      const isTsMarker = tag !== null && tag.startsWith("ts");
-      if (isWhitespace || isTsMarker) continue;
+      if (isWhitespace) continue;
       break;
     }
   }
@@ -156,7 +157,11 @@ export function extractEditableText(verseObjects: unknown): string {
       if (!vo || typeof vo !== "object") continue;
       const v = vo as Record<string, unknown>;
       if (isInFlowMarker(v)) {
-        parts.push(`\\${v["tag"]} `);
+        if (v["tag"] === "ts") {
+          parts.push("\\ts\\* ");
+        } else {
+          parts.push(`\\${v["tag"]} `);
+        }
         continue;
       }
       if (

@@ -51,8 +51,26 @@ function paragraphLayoutSx(mode: Mode) {
       backgroundColor: tokenBg,
       border: `1px solid ${tokenBorder}`,
       borderRadius: "3px",
-      userSelect: "none",
       verticalAlign: "0.08em",
+      // Selectable + caret-targetable so users can backspace through
+      // a chip's text (e.g. \q1 → \q2) instead of having to remove and
+      // re-insert the marker.
+      cursor: "text",
+    },
+    "& div.be-ts": {
+      display: "flex",
+      alignItems: "center",
+      gap: "8px",
+      margin: "0.6em 0",
+      "&::before, &::after": {
+        content: '""',
+        flex: 1,
+        borderTop: `1px dashed ${tokenBorder}`,
+        opacity: 0.6,
+      },
+      "& span.be-tok-ts": {
+        flex: "0 0 auto",
+      },
     },
   };
 }

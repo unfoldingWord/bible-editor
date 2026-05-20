@@ -1159,7 +1159,7 @@ function ActiveLine({
                     bgcolor: "rgba(49, 173, 227, 0.06)",
                   }}
                 >
-                  \{m.tag}
+                  {m.tag === "ts" ? "\\ts\\*" : `\\${m.tag}`}
                 </Box>
               </Box>
             </Tooltip>
@@ -1259,6 +1259,7 @@ const TOOLBAR_MARKERS: Array<{ tag: string; label: string; title: string }> = [
   { tag: "q2", label: "\\q2", title: "poetry indent 2" },
   { tag: "q3", label: "\\q3", title: "poetry indent 3" },
   { tag: "b", label: "\\b", title: "blank line" },
+  { tag: "ts", label: "\\ts\\*", title: "chunk divider" },
 ];
 
 function ParagraphToolbar({
@@ -1272,7 +1273,8 @@ function ParagraphToolbar({
     (tag: string) => {
       const el = elRef.current;
       if (!el) return;
-      const chipHtml = `<span class="be-tok be-tok-${tag}" contenteditable="false" data-tag="${tag}">\\${tag}</span>&nbsp;`;
+      const chipText = tag === "ts" ? "\\ts\\*" : `\\${tag}`;
+      const chipHtml = `<span class="be-tok be-tok-${tag}" data-tag="${tag}">${chipText}</span>&nbsp;`;
       el.focus();
       const sel = window.getSelection();
       // If the caret isn't already in this contenteditable, place it at

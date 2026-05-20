@@ -352,6 +352,7 @@ function escapeHtml(s: string): string {
 // can attach indents per q-level or special spacing per p-variant.
 function paragraphClass(tag: string): { wrapper: string; isBlank: boolean } {
   if (tag === "b") return { wrapper: "be-blank", isBlank: true };
+  if (tag === "ts") return { wrapper: "be-ts", isBlank: false };
   if (tag === "q" || tag === "q1") return { wrapper: "be-q be-q-1", isBlank: false };
   if (tag === "q2") return { wrapper: "be-q be-q-2", isBlank: false };
   if (tag === "q3") return { wrapper: "be-q be-q-3", isBlank: false };
@@ -400,8 +401,17 @@ function segmentByParagraphs(
       if (isInFlowMarker(o)) {
         const tag = o["tag"] as string;
         const { wrapper, isBlank } = paragraphClass(tag);
-        current = { wrapper, tag, html: "", isBlank };
-        segments.push(current);
+        const seg: Segment = { wrapper, tag, html: "", isBlank };
+        segments.push(seg);
+        if (tag === "ts") {
+          // \ts\* is a standalone chunk divider — anything that follows
+          // (text, the next paragraph marker, ...) belongs to a fresh
+          // segment, not inside the divider block.
+          current = { wrapper: "", tag: null, html: "", isBlank: false };
+          segments.push(current);
+        } else {
+          current = seg;
+        }
         continue;
       }
       if (
@@ -440,11 +450,15 @@ function segmentByParagraphs(
   return segments;
 }
 
-// Render a paragraph chip — the visible literal "\p" / "\q1" token
-// shown in the active-verse editor. `contenteditable="false"` keeps it
-// atomic (backspace removes the whole chip; cursor steps over it).
+// Render a paragraph chip — the visible literal "\p" / "\q1" / "\ts\*"
+// token shown in the active-verse editor. The chip is left as ordinary
+// editable text (no `contenteditable="false"`) so the user can put their
+// caret inside it and edit char-by-char — e.g. backspace over the `1`
+// in `\q1` and type `2` to convert it to `\q2`. Tokenizer round-trips
+// the new text on save.
 function chipForTag(tag: string): string {
-  return `<span class="be-tok be-tok-${escapeHtml(tag)}" contenteditable="false" data-tag="${escapeHtml(tag)}">\\${escapeHtml(tag)}</span>`;
+  const text = tag === "ts" ? "\\ts\\*" : `\\${escapeHtml(tag)}`;
+  return `<span class="be-tok be-tok-${escapeHtml(tag)}" data-tag="${escapeHtml(tag)}">${text}</span>`;
 }
 
 // Render segments to an HTML string. When the verse has no paragraph
@@ -461,10 +475,22 @@ function segmentsToHtml(segments: Segment[], emitChips: boolean): string {
   const out: string[] = [];
   for (let i = 0; i < segments.length; i++) {
     const seg = segments[i];
-    if (i === 0 && seg.html === "" && !seg.wrapper) continue;
+    // Drop empty wrapper-less segments wherever they fall — these come
+    // from the post-\ts\* fresh-segment push when nothing follows the
+    // divider, or from the initial pre-marker slot when the verse opens
+    // with a marker.
+    if (seg.html === "" && !seg.wrapper) continue;
     const cls = seg.wrapper || "be-line";
     if (seg.isBlank) {
       out.push(`<div class="${cls}">${emitChips && seg.tag ? chipForTag(seg.tag) : "&nbsp;"}</div>`);
+      continue;
+    }
+    if (seg.tag === "ts") {
+      // \ts\* renders as a horizontal divider regardless of edit mode.
+      // The chip carries the literal marker text so editing it still
+      // round-trips through tokenizeEditableText.
+      const chip = emitChips ? chipForTag("ts") : `<span class="be-tok be-tok-ts">\\ts\\*</span>`;
+      out.push(`<div class="${cls}">${chip}</div>`);
       continue;
     }
     const chip = emitChips && seg.tag ? chipForTag(seg.tag) + " " : "";

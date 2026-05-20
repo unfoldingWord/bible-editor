@@ -155,6 +155,24 @@ session) but stronger crash safety.
 | `tn_rows.sort_order` migration overwrites on rerun | [migrations/0003_tn_sort_order.sql](../api/migrations/0003_tn_sort_order.sql) | Add `WHERE sort_order IS NULL`. Same for `0004_twl_sort_order.sql`. Cheap. |
 | JSON parse failures silently → `null` | [api/src/chapters.ts:55-60](../api/src/chapters.ts), [api/src/verses.ts:29-32](../api/src/verses.ts) | A corrupt `content_json` renders as empty verse with no log. Add `console.error` at minimum; consider a server-side counter. |
 
+## Surface `\ts\*` chunk markers from imported USFM
+
+**Status:** Front-end ([PR #77](https://github.com/deferredreward/bible-editor/pull/77) onward) now renders, edits, and round-trips `\ts\*` chunk milestones — the moment they show up in `content_json.verseObjects` as `{tag:"ts", content:"\\*"}`, they appear in all three scripture views as a dashed chunk divider, are editable as a chip, drift to the next verse like `\q1`, and tokenize back on save.
+
+**The gap:** `usfm-js` silently drops them at parse time. Measured on `docs/samples/en_ult_38-ZEC.usfm`: 154 raw `\ts\*` lines in source, 1 surviving node in the parsed JSON. So even after re-importing every book, the chunk markers stay invisible to the editor because they never enter D1 in the first place.
+
+**Why this is OK to defer:** none of our current internal tooling actually consumes `\ts\*` for anything load-bearing — it's metadata for chunking translation work, useful for translators who want to see the chunk boundaries the source team set, but nothing downstream breaks without it. So this is a UX nice-to-have, not a data-integrity bug.
+
+**Plan if we do want to fix it:**
+
+1. **Post-process injection in the importer** (preferred). Re-scan the raw USFM line-by-line in parallel with `usfm.toJSON`, tracking which `\v N` block each `\ts\*` falls inside (or before, since usfm-js's convention is that markers preceding `\v` attach to the prior verse's verseObjects — `extractTrailingMarkers` already drifts them forward). For each `\ts\*` found, splice a `{tag:"ts", content:"\\*"}` node into the appropriate `verseObjects` array at the right offset.
+   - Touch points: [scripts/import-book.mjs](../scripts/import-book.mjs) (one-shot path) and [api/src/importParsers.ts](../api/src/importParsers.ts) (the shared importer used by the inbound-from-DCS pipeline).
+   - Round-trip safety check: `usfm.toUSFM` should re-emit `\ts\*` from `{tag:"ts", content:"\\*"}` cleanly — verify with a parse → serialize diff on ZEC.
+2. **Alternative — pre-process swap.** Convert `\ts\*` to a placeholder marker usfm-js does preserve (e.g. a custom `\zts\*` milestone) before `toJSON`, then unswap on export. Quick but adds a hidden encoding that future readers of `verseObjects` won't expect.
+3. **Patch / fork usfm-js.** Biggest lift; no obvious benefit over (1).
+
+**Once data is flowing, re-import every book** to populate the missing nodes in existing rows. No frontend changes needed.
+
 ## What did land in this pass
 
 - CORS: env allowlist replaces the origin-echo CSRF hole.

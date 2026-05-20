@@ -121,24 +121,29 @@ export function tokenizePlainText(text: string): unknown[] {
   return out;
 }
 
-// Inline paragraph / poetry / blank markers, surfaced as visible literal
-// "\p" / "\q1" tokens in the active-verse contenteditable. The regex
-// matches the marker name followed by a word boundary so "\q1Hello"
-// won't accidentally bite (markers always end with whitespace from the
-// chip renderer's trailing space). The optional trailing \s is consumed
-// so the marker token doesn't leave a stranded space between marker
-// and following text.
-const MARKER_TOKEN_RE = /\\(p|m|mi|nb|pi[1-3]?|pc|q[1-4]?|qm[1-3]?|b)(?=\s|$|[^a-z0-9])\s?/g;
+// Inline paragraph / poetry / blank / chunk markers, surfaced as visible
+// literal "\p" / "\q1" / "\ts\*" tokens in the active-verse
+// contenteditable. The regex matches the marker name followed by a word
+// boundary so "\q1Hello" won't accidentally bite (markers always end
+// with whitespace from the chip renderer's trailing space). The optional
+// trailing \s is consumed so the marker token doesn't leave a stranded
+// space between marker and following text. `ts\\\*` matches the literal
+// `\ts\*` chunk milestone (translator's section delimiter).
+const MARKER_TOKEN_RE = /\\(p|m|mi|nb|pi[1-3]?|pc|q[1-4]?|qm[1-3]?|b|ts\\\*)(?=\s|$|[^a-z0-9])\s?/g;
 
 // usfm-js distinguishes "paragraph" markers (\p, \m, \mi, \nb, \pi*,
 // \pc, \b) from "quote" markers (\q, \q1..q4, \qm*) using different
-// `type` fields on the parsed node. Mirror that here so re-emitted
-// markers round-trip through usfm.toUSFM in their original form.
-function nodeTypeForMarker(tag: string): "paragraph" | "quote" {
-  if (tag === "q" || /^q[1-4]$/.test(tag) || /^qm[1-3]?$/.test(tag)) {
-    return "quote";
+// `type` fields on the parsed node. `\ts\*` is parsed as `{tag:"ts",
+// content:"\\*"}` with no `type` field. Mirror those shapes here so
+// re-emitted markers round-trip through usfm.toUSFM in their original
+// form.
+function nodeForMarker(tag: string): unknown {
+  if (tag === "ts\\*") {
+    return { tag: "ts", content: "\\*" };
   }
-  return "paragraph";
+  const type =
+    tag === "q" || /^q[1-4]$/.test(tag) || /^qm[1-3]?$/.test(tag) ? "quote" : "paragraph";
+  return { type, tag };
 }
 
 // Tokenize editable text that may contain inline marker tokens (\p, \q1,
@@ -167,7 +172,7 @@ export function tokenizeEditableText(text: string): unknown[] {
       for (const node of tokenizePlainText(cleaned.slice(last, start))) out.push(node);
     }
     const tag = m[1];
-    out.push({ type: nodeTypeForMarker(tag), tag });
+    out.push(nodeForMarker(tag));
     last = start + m[0].length;
     if (m[0].length === 0) re.lastIndex++;
   }

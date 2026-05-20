@@ -943,17 +943,19 @@ function roundtripVerseUsfm(rawUsfm, sourceVO = null) {
   // they introduce the NEXT verse. The display layer drifts them down.
   {
     const { extractTrailingMarkers } = await import("./usfm.ts");
-    // ZEC 9:8 shape: ends with milestones, then a trailing \ts*, then \q1.
+    // ZEC 9:8 shape: ends with milestones, then a trailing \ts\*, then \q1.
+    // \ts\* parses as `{tag:"ts", content:"\\*"}` (no `type` field) and
+    // is now treated as an in-flow marker — it drifts along with \q1.
     const vo = [
       { type: "word", tag: "w", text: "Yahweh" },
       { type: "text", text: "!\n\n" },
-      { type: "milestone", tag: "ts\\*" }, // chunk anchor, skip past
+      { tag: "ts", content: "\\*" },
       { type: "quote", tag: "q1" },
     ];
     const trailing = extractTrailingMarkers(vo);
     assert(
-      trailing.length === 1 && trailing[0].tag === "q1",
-      `trailing \\q1 detected past \\ts\\* (got ${JSON.stringify(trailing)})`,
+      trailing.length === 2 && trailing[0].tag === "ts" && trailing[1].tag === "q1",
+      `\\ts\\* + \\q1 both detected as trailing markers (got ${JSON.stringify(trailing)})`,
     );
     // Multiple stacked trailing markers
     const vo2 = [
@@ -1003,6 +1005,27 @@ function roundtripVerseUsfm(rawUsfm, sourceVO = null) {
     assert(
       texts.every((t) => !t.includes("​")),
       `no node text contains a zero-width space (got ${JSON.stringify(texts)})`,
+    );
+  }
+
+  // (e***) \ts\* chunk markers surface in editable text and round-trip
+  // through tokenizeEditableText to the original `{tag:"ts", content:"\\*"}`
+  // shape (no `type` field — matches what usfm-js produces on import).
+  {
+    const vo = [
+      { tag: "ts", content: "\\*" },
+      { type: "word", tag: "w", text: "Then", occurrence: "1", occurrences: "1" },
+    ];
+    const editable = extractEditableText(vo);
+    assert(
+      editable === "\\ts\\* Then",
+      `\\ts\\* surfaced inline in editable text (got ${JSON.stringify(editable)})`,
+    );
+    const nodes = tokenizeEditableText(editable);
+    const ts = nodes.find((n) => n.tag === "ts");
+    assert(
+      ts !== undefined && ts.content === "\\*" && ts.type === undefined,
+      `\\ts\\* round-trips as {tag:"ts", content:"\\\\*"} with no type (got ${JSON.stringify(ts)})`,
     );
   }
 
