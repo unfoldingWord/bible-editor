@@ -151,22 +151,28 @@ function nodeTypeForMarker(tag: string): "paragraph" | "quote" {
 // the input has no markers, the behavior is identical to
 // tokenizePlainText.
 export function tokenizeEditableText(text: string): unknown[] {
+  // Strip zero-width spaces (U+200B). The active-verse editor uses them
+  // as caret placeholders in empty marker-led blocks (renderEditableHTML
+  // emits `&#8203;`), but they're rendering artifacts, not content —
+  // capturing them into the saved verseObjects would accumulate junk on
+  // every save and (worse) block marker drift to the next verse.
+  const cleaned = text.replace(/​/g, "");
   const out: unknown[] = [];
   let last = 0;
   const re = new RegExp(MARKER_TOKEN_RE.source, MARKER_TOKEN_RE.flags);
   let m: RegExpExecArray | null;
-  while ((m = re.exec(text)) !== null) {
+  while ((m = re.exec(cleaned)) !== null) {
     const start = m.index;
     if (start > last) {
-      for (const node of tokenizePlainText(text.slice(last, start))) out.push(node);
+      for (const node of tokenizePlainText(cleaned.slice(last, start))) out.push(node);
     }
     const tag = m[1];
     out.push({ type: nodeTypeForMarker(tag), tag });
     last = start + m[0].length;
     if (m[0].length === 0) re.lastIndex++;
   }
-  if (last < text.length) {
-    for (const node of tokenizePlainText(text.slice(last))) out.push(node);
+  if (last < cleaned.length) {
+    for (const node of tokenizePlainText(cleaned.slice(last))) out.push(node);
   }
   return out;
 }

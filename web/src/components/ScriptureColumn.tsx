@@ -746,10 +746,16 @@ function StackedBody({
                 </Typography>
                 <Box
                   data-find-cell={`${chapter}-${ultV.verse}-ULT`}
-                  sx={{ gridColumn: 2, gridRow: 2, minWidth: 0 }}
+                  sx={(theme) => ({
+                    gridColumn: 2,
+                    gridRow: 2,
+                    minWidth: 0,
+                    ...markHighlightSx(theme.palette.mode),
+                  })}
                 >
-                  <FindAwareText
-                    text={ultV.plain_text ?? ""}
+                  <StackedRowBody
+                    dto={ultV}
+                    prevDto={findPrevRowInColumn(ult, ultV.verse)}
                     search={search}
                     activeRange={
                       findActiveMatch &&
@@ -782,10 +788,16 @@ function StackedBody({
                 </Typography>
                 <Box
                   data-find-cell={`${chapter}-${ustV.verse}-UST`}
-                  sx={{ gridColumn: 2, gridRow: 3, minWidth: 0 }}
+                  sx={(theme) => ({
+                    gridColumn: 2,
+                    gridRow: 3,
+                    minWidth: 0,
+                    ...markHighlightSx(theme.palette.mode),
+                  })}
                 >
-                  <FindAwareText
-                    text={ustV.plain_text ?? ""}
+                  <StackedRowBody
+                    dto={ustV}
+                    prevDto={findPrevRowInColumn(ust, ustV.verse)}
                     search={search}
                     activeRange={
                       findActiveMatch &&
@@ -1322,6 +1334,54 @@ function ParagraphToolbar({
       ))}
     </Stack>
   );
+}
+
+// Inactive stacked rows: render paragraph / poetry layout (block-level
+// `\q1` indents etc.) when the verse has markers, with drifted leading
+// markers from the previous verse composed at the front. Falls back to
+// plain text + find marks via FindAwareText when there's nothing
+// marker-worthy to show — that path preserves find/replace highlighting
+// for normal prose verses.
+function StackedRowBody({
+  dto,
+  prevDto,
+  search,
+  activeRange,
+}: {
+  dto: VerseDto;
+  prevDto: VerseDto | null;
+  search: SearchState | null;
+  activeRange?: { start: number; end: number } | null;
+}) {
+  const verseObjects = (dto.content as { verseObjects?: unknown[] } | null)?.verseObjects;
+  const drift = useMemo(
+    () =>
+      extractTrailingMarkers(
+        (prevDto?.content as { verseObjects?: unknown[] } | null)?.verseObjects,
+      ),
+    [prevDto?.content],
+  );
+  const html = useMemo(() => {
+    if (!Array.isArray(verseObjects)) return null;
+    const composed = drift.length > 0 ? [...drift, ...verseObjects] : verseObjects;
+    // Skip the marker renderer if there's no structure to show — the
+    // FindAwareText fallback below paints find marks for plain prose.
+    const hasStructure =
+      drift.length > 0 ||
+      verseObjects.some((n) => {
+        const o = n as Record<string, unknown> | null;
+        if (!o) return false;
+        const t = o["type"];
+        return t === "paragraph" || t === "quote" || t === "section";
+      });
+    if (!hasStructure) return null;
+    return renderHighlightedHTML(composed, new Set());
+  }, [verseObjects, drift]);
+
+  if (html !== null) {
+    return <span dangerouslySetInnerHTML={{ __html: html }} />;
+  }
+  return <FindAwareText text={dto.plain_text ?? ""} search={search} activeRange={activeRange} />;
 }
 
 // Render plain text with find-match marks for non-active stacked rows. We
