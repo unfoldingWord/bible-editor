@@ -354,11 +354,9 @@ function roundtripVerseUsfm(rawUsfm, sourceVO = null) {
   }
 
   // (d) Multi-word edit (e.g. is→are in several places) across a USFM verse
-  // whose `\w` tokens land on separate lines — usfm-js leaves a single
-  // space between consecutive `\w`, but pre-fix code matched the literal
-  // plainText regex against `raw` which could contain `\n` near `{...}`
-  // word-addition markers. The whole-verse alignment got nuked. Regression
-  // guard: every \zaln milestone must survive a clean is→are sweep.
+  // whose `\w` tokens land on separate lines. Behavior under unalign-on-edit:
+  // each changed word lifts out of its `\zaln-s`, becoming a bare \w chip.
+  // Milestones wrapping unchanged neighbors survive untouched.
   {
     const target = String.raw`\v 1 \zaln-s |x-strong="H1"\*\w he|x-occurrence="1" x-occurrences="1"\w*\zaln-e\*
 \zaln-s |x-strong="H2"\*\w is|x-occurrence="1" x-occurrences="3"\w*\zaln-e\*
@@ -373,6 +371,53 @@ function roundtripVerseUsfm(rawUsfm, sourceVO = null) {
     const oldPlain = "he is good, she is kind.";
     const newPlain = "he are good, she are kind.";
     const result = smartEditVerse(content, oldPlain, newPlain);
+    const aligned = [];
+    const bare = [];
+    const walk = (xs, insideZaln) => {
+      for (const n of xs ?? []) {
+        if (n?.tag === "zaln") { walk(n.children, true); continue; }
+        if (n?.type === "word" && n?.tag === "w") (insideZaln ? aligned : bare).push(n.text);
+        if (Array.isArray(n?.children)) walk(n.children, insideZaln);
+      }
+    };
+    walk(result.content.verseObjects, false);
+    assert(
+      aligned.join(",") === "he,good,she,kind",
+      `unchanged neighbors stay aligned (got [${aligned.join(",")}])`,
+    );
+    assert(
+      bare.join(",") === "are,are",
+      `each edited 'is' is now a bare unaligned \\w (got [${bare.join(",")}])`,
+    );
+    assert(result.preservedAlignment === true, `still preserved=true (got ${result.preservedAlignment})`);
+    assert(result.plainText === newPlain, `plain text round-trips cleanly (got ${JSON.stringify(result.plainText)})`);
+  }
+
+  // (e) Single-word edit (Praise → Praising) inside a `\zaln-s` whose only
+  // child is the edited word: the milestone collapses to a bare \w, while
+  // the sibling `\qs` wrapper around Selah survives intact. Regression
+  // guard against the prior "preserve in place" behavior that kept the
+  // edited word aligned — translators want their edit to invalidate the
+  // old alignment so the new word becomes a draggable unaligned chip.
+  {
+    const target = String.raw`\v 1 \zaln-s |x-strong="H3068"\*\w Praise|x-occurrence="1" x-occurrences="1"\w*\zaln-e\* \qs \zaln-s |x-strong="H5542"\*\w Selah|x-occurrence="1" x-occurrences="1"\w*\zaln-e\*\qs*`;
+    const wrapped = `\\id TST\n\\c 1\n${target}\n`;
+    const json = usfm.toJSON(wrapped);
+    const verseObj = json.chapters["1"]["1"];
+    const content = { verseObjects: verseObj.verseObjects };
+    const result = smartEditVerse(content, "Praise Selah", "Praising Selah");
+    const aligned = [];
+    const bare = [];
+    const walk = (xs, insideZaln) => {
+      for (const n of xs ?? []) {
+        if (n?.tag === "zaln") { walk(n.children, true); continue; }
+        if (n?.type === "word" && n?.tag === "w") (insideZaln ? aligned : bare).push(n.text);
+        if (Array.isArray(n?.children)) walk(n.children, insideZaln);
+      }
+    };
+    walk(result.content.verseObjects, false);
+    assert(bare.includes("Praising"), `edited Praise becomes bare unaligned 'Praising' (bare=${JSON.stringify(bare)})`);
+    assert(aligned.includes("Selah"), `Selah stays aligned (aligned=${JSON.stringify(aligned)})`);
     const flatten = (vos) => {
       const tags = [];
       const w = (xs) => { for (const n of xs ?? []) { if (n?.tag) tags.push(n.tag); if (Array.isArray(n?.children)) w(n.children); } };
@@ -380,10 +425,40 @@ function roundtripVerseUsfm(rawUsfm, sourceVO = null) {
       return tags;
     };
     const tags = flatten(result.content.verseObjects);
-    const zalnCount = tags.filter((t) => t === "zaln").length;
-    assert(zalnCount === 6, `multi-word edit preserves every \\zaln milestone (got ${zalnCount}/6 — tags=${tags.join(",")})`);
-    assert(result.preservedAlignment === true, `multi-word edit reports preservedAlignment=true (got ${result.preservedAlignment})`);
-    assert(result.plainText === newPlain, `plain text round-trips cleanly (got ${JSON.stringify(result.plainText)})`);
+    assert(tags.includes("qs"), `\\qs wrapper survives (tags=${tags.join(",")})`);
+    assert(result.plainText === "Praising Selah", `plain text correct (got ${JSON.stringify(result.plainText)})`);
+  }
+
+  // (f) Legacy data with punct-attached \w (a curly quote ride-along that
+  // pre-dates the import-time normalize) gets healed by the next save.
+  // Translator edits "fathers" → "ancestors"; the `“Your` \w in an
+  // UNCHANGED neighbor milestone normalizes anyway as defense-in-depth.
+  {
+    const verseObjects = [
+      {
+        tag: "zaln", type: "milestone", strong: "H1",
+        children: [{ type: "word", tag: "w", text: "“Your", occurrence: "1", occurrences: "1" }],
+        endTag: "zaln-e\\*",
+      },
+      { type: "text", text: " " },
+      {
+        tag: "zaln", type: "milestone", strong: "H2",
+        children: [{ type: "word", tag: "w", text: "fathers", occurrence: "1", occurrences: "1" }],
+        endTag: "zaln-e\\*",
+      },
+      { type: "text", text: "." },
+    ];
+    const result = smartEditVerse({ verseObjects }, "“Your fathers.", "“Your ancestors.");
+    let badQuote = 0;
+    const walk = (xs) => {
+      for (const n of xs ?? []) {
+        if (n?.tag === "w" && typeof n.text === "string" && n.text.includes("“")) badQuote++;
+        if (Array.isArray(n?.children)) walk(n.children);
+      }
+    };
+    walk(result.content.verseObjects);
+    assert(badQuote === 0, `no \\w node carries a leading curly quote after save (found ${badQuote})`);
+    assert(result.plainText === "“Your ancestors.", `plain text preserves leading quote in a text node (got ${JSON.stringify(result.plainText)})`);
   }
 }
 

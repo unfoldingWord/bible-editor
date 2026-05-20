@@ -121,6 +121,138 @@ export function tokenizePlainText(text: string): unknown[] {
   return out;
 }
 
+// Letters / marks / numbers count as "core" word content — mirrors
+// api/src/importParsers.ts:LETTER_RE so the client-side normalize pass
+// agrees with the server importer about which trailing chars belong
+// inside a `\w` token. Numbers matter because the UST writes literal
+// counts (`\w 30\w*`) for measurements.
+const LETTER_RE = /[\p{L}\p{M}\p{N}]/u;
+
+function splitWordPunctuation(text: string): { leading: string; core: string; trailing: string } {
+  const first = text.search(LETTER_RE);
+  if (first < 0) return { leading: text, core: "", trailing: "" };
+  let last = first;
+  for (let i = text.length - 1; i >= first; i--) {
+    if (LETTER_RE.test(text[i])) {
+      last = i;
+      break;
+    }
+  }
+  return {
+    leading: text.slice(0, first),
+    core: text.slice(first, last + 1),
+    trailing: text.slice(last + 1),
+  };
+}
+
+// Strip leading / trailing non-letter characters off a `\w` token's text,
+// emitting them as adjacent text nodes. Mirrors the server-side
+// `normalizeWordPunctuation` in api/src/importParsers.ts so the client
+// produces the same shape the importer would have. Runs at the end of
+// `smartEditVerse` as defense-in-depth — even if every code path here
+// stays punct-clean by construction, this guarantees no `\w` carrying a
+// leading quote or trailing dash ever lands in D1 via the save path.
+// Also rehabilitates legacy rows that pre-date the import-time fix:
+// the user's next save normalizes them.
+//
+// Walks recursively into children (zaln-s milestones, \qs wrappers).
+function normalizeWordPunctuation(verseObjects: unknown[]): unknown[] {
+  if (!Array.isArray(verseObjects)) return verseObjects;
+  return verseObjects.flatMap((n) => normalizeNode(n));
+}
+
+function normalizeNode(node: unknown): unknown[] {
+  if (!node || typeof node !== "object") return [node];
+  const o = node as Record<string, unknown>;
+  if (o["type"] === "word" && o["tag"] === "w" && typeof o["text"] === "string") {
+    const text = o["text"];
+    const split = splitWordPunctuation(text);
+    if (split.leading === "" && split.trailing === "") return [node];
+    const out: unknown[] = [];
+    if (split.leading) out.push({ type: "text", text: split.leading });
+    if (split.core) out.push({ ...o, text: split.core });
+    if (split.trailing) out.push({ type: "text", text: split.trailing });
+    return out;
+  }
+  if (Array.isArray(o["children"])) {
+    return [{ ...o, children: (o["children"] as unknown[]).flatMap((c) => normalizeNode(c)) }];
+  }
+  return [node];
+}
+
+// Lift any node marked with `__edited` out of every enclosing `\zaln-s`
+// ancestor. The marked word becomes a bare `\w` (unaligned) at the
+// position the surrounding milestone used to occupy, with the milestone
+// split into pre/post halves around it. Non-`\zaln-s` wrappers (`\qs`,
+// `\f`, `\p`, etc.) are NOT split — a bare `\w` inside `\qs` but outside
+// `\zaln-s` is already unaligned in alignment.ts' state model. The
+// `__edited` sentinel is replaced with `__lifted` so outer-level
+// `\zaln-s` ancestors keep splitting around the same node; both
+// markers are stripped by `stripLiftedMarkers` at the end.
+function liftEditedOutOfZaln(nodes: unknown[]): unknown[] {
+  const out: unknown[] = [];
+  for (const node of nodes) {
+    if (!node || typeof node !== "object") {
+      out.push(node);
+      continue;
+    }
+    const o = node as Record<string, unknown>;
+    if (o["__edited"]) {
+      const { __edited: _drop, ...rest } = o as Record<string, unknown> & { __edited?: unknown };
+      (rest as Record<string, unknown>)["__lifted"] = true;
+      out.push(rest);
+      continue;
+    }
+    if (Array.isArray(o["children"])) {
+      const processed = liftEditedOutOfZaln(o["children"] as unknown[]);
+      if (o["tag"] === "zaln") {
+        // Split processed children around any node marked __lifted; each
+        // such node pops up to our level. Surrounding spans become
+        // separate copies of this milestone.
+        let segment: unknown[] = [];
+        const flush = () => {
+          if (segment.length > 0) {
+            out.push({ ...o, children: segment });
+            segment = [];
+          }
+        };
+        for (const child of processed) {
+          if (child && typeof child === "object" && (child as Record<string, unknown>)["__lifted"]) {
+            flush();
+            out.push(child); // keep __lifted so an outer \zaln-s also splits
+          } else {
+            segment.push(child);
+          }
+        }
+        flush();
+      } else {
+        // Non-\zaln-s wrapper — children stay nested. Any __lifted child
+        // inside a non-zaln wrapper is already structurally unaligned;
+        // the marker is no longer load-bearing and stripLiftedMarkers
+        // will clear it.
+        out.push({ ...o, children: processed });
+      }
+    } else {
+      out.push(node);
+    }
+  }
+  return out;
+}
+
+// Strip leftover `__lifted` markers from a fully-processed tree.
+function stripLiftedMarkers(nodes: unknown[]): unknown[] {
+  return nodes.map((n) => {
+    if (!n || typeof n !== "object") return n;
+    const { __lifted: _drop, ...rest } = n as Record<string, unknown> & { __lifted?: unknown };
+    if (Array.isArray((rest as Record<string, unknown>)["children"])) {
+      (rest as Record<string, unknown>)["children"] = stripLiftedMarkers(
+        (rest as Record<string, unknown>)["children"] as unknown[],
+      );
+    }
+    return rest;
+  });
+}
+
 // Rewrite a regex so literal-space chars in the source match `\s+`. Used
 // when re-running a plain-text-derived regex against the unnormalized
 // `raw` concatenation of leaf text, which may contain `\n` (e.g. before
@@ -251,12 +383,22 @@ export function smartReplaceVerse(
 
   if (canPreserve) {
     // 1:1 word mapping. Whitespace text leaves between words stay as-is.
+    // Each word leaf whose text actually changes is marked `__edited` so
+    // the lift pass below can pop it out of its `\zaln-s` ancestor(s) —
+    // a translator's edit invalidates the old alignment, so the new word
+    // becomes a bare unaligned chip. Unchanged neighbors stay aligned.
+    let anyChanged = false;
     for (let i = 0; i < wordLeaves.length; i++) {
-      wordLeaves[i].node["text"] = replaceWords[i];
+      if (String(wordLeaves[i].node["text"]) !== replaceWords[i]) {
+        wordLeaves[i].node["text"] = replaceWords[i];
+        wordLeaves[i].node["__edited"] = true;
+        anyChanged = true;
+      }
     }
-    const newRaw = rebuildRaw(cloned);
+    const verseObjectsOut = anyChanged ? stripLiftedMarkers(liftEditedOutOfZaln(cloned)) : cloned;
+    const newRaw = rebuildRaw(verseObjectsOut);
     return {
-      content: { verseObjects: cloned },
+      content: { verseObjects: verseObjectsOut },
       plainText: normalize(newRaw),
       preservedAlignment: true,
     };
@@ -264,11 +406,12 @@ export function smartReplaceVerse(
 
   // Single-leaf in-place edit: the change starts and ends within ONE word
   // leaf (e.g. `Praise` → `Praising` types into the middle/end of a single
-  // \w word). Splice the new chars directly into that leaf's text so the
-  // wrapping milestones — and any sibling content like a \qs or \f — survive
-  // intact. Only safe when the resulting text is still a single clean word
-  // (no whitespace, no punctuation that would normally split it into
-  // multiple \w tokens).
+  // \w word). Splice the new chars directly into that leaf's text. Only
+  // safe when the result is a single clean word (no whitespace, no
+  // punctuation that would normally split it into multiple \w tokens).
+  // Same unalign rule as the preserve path: the edited leaf gets lifted
+  // out of its `\zaln-s` ancestor — sibling content like `\qs` / `\f`
+  // and the OTHER half of a multi-word milestone survive intact.
   if (affected.length === 1 && isWordLeaf(affected[0].node)) {
     const leaf = affected[0];
     const leafText = String(leaf.node["text"]);
@@ -276,19 +419,23 @@ export function smartReplaceVerse(
       leafText.slice(0, rawStart - leaf.start) +
       replaceText +
       leafText.slice(rawEnd - leaf.start);
-    if (newLeafText.length > 0 && !/\s/.test(newLeafText) && WORD_RUN_RE.test(newLeafText)) {
-      WORD_RUN_RE.lastIndex = 0;
-      const onlyWord = newLeafText.match(WORD_RUN_RE)?.[0] === newLeafText;
-      WORD_RUN_RE.lastIndex = 0;
-      if (onlyWord) {
-        leaf.node["text"] = newLeafText;
-        const newRaw = rebuildRaw(cloned);
-        return {
-          content: { verseObjects: cloned },
-          plainText: normalize(newRaw),
-          preservedAlignment: true,
-        };
-      }
+    // Use a local, non-global regex so we don't fight WORD_RUN_RE.lastIndex.
+    const ONLY_WORD_RE = new RegExp(`^${WORD_RUN_RE.source}$`, "u");
+    if (
+      newLeafText.length > 0 &&
+      !/\s/.test(newLeafText) &&
+      ONLY_WORD_RE.test(newLeafText) &&
+      newLeafText !== leafText
+    ) {
+      leaf.node["text"] = newLeafText;
+      leaf.node["__edited"] = true;
+      const verseObjectsOut = stripLiftedMarkers(liftEditedOutOfZaln(cloned));
+      const newRaw = rebuildRaw(verseObjectsOut);
+      return {
+        content: { verseObjects: verseObjectsOut },
+        plainText: normalize(newRaw),
+        preservedAlignment: true,
+      };
     }
   }
 
@@ -348,11 +495,12 @@ export function smartEditVerse(
     return { content, plainText: oldPlain, preservedAlignment: true };
   }
   // Word-count-match preserve path lives in smartReplaceVerse.
+  let result: SmartReplaceResult;
   if (diff.oldLen > 0) {
     const matchText = oldPlain.slice(diff.start, diff.start + diff.oldLen);
     const escaped = matchText.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     const re = new RegExp(escaped, "g");
-    return smartReplaceVerse(
+    result = smartReplaceVerse(
       content,
       oldPlain,
       re,
@@ -360,15 +508,28 @@ export function smartEditVerse(
       diff.oldLen,
       diff.newSubstring,
     );
+  } else {
+    // Pure insertion — no matchText, can't do word-count preserve.
+    result = localizedRewriteVerse(
+      content,
+      oldPlain,
+      diff.start,
+      0,
+      diff.newSubstring,
+    );
   }
-  // Pure insertion — no matchText, can't do word-count preserve.
-  return localizedRewriteVerse(
-    content,
-    oldPlain,
-    diff.start,
-    0,
-    diff.newSubstring,
-  );
+  // Final defense-in-depth: strip any leading/trailing non-letter chars
+  // off every `\w` text into adjacent text nodes. Mirrors the server-side
+  // normalize on import. Catches legacy rows whose `\w "What\w*`-style
+  // punctuation persisted through this edit (it wouldn't be cleaned by
+  // the preserve / single-leaf paths since they only touch the changed
+  // leaf), so the user's next save heals them.
+  const verseObjects = (result.content as { verseObjects?: unknown[] } | null)?.verseObjects;
+  if (Array.isArray(verseObjects)) {
+    const normalized = normalizeWordPunctuation(verseObjects);
+    return { ...result, content: { verseObjects: normalized } };
+  }
+  return result;
 }
 
 // Full raw text length of a verseObjects node, recursing into milestone
