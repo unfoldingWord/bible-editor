@@ -102,13 +102,22 @@ function dcsHeaders(env: Env): Record<string, string> {
 }
 
 // POST /api/v1/repos/{owner}/{repo}/actions/workflows/{file}/dispatches?return_run_details=true
-// Returns 200 with {workflow_run_id, html_url, run_url} thanks to DCS's
-// return_run_details extension. Throws on non-2xx so the wrapping step.do
-// retries; raises an Error with the response body so wrangler tail shows
-// what went wrong (typically a 403 = service token lacks Actions writer).
+//
+// DCS's `return_run_details=true` extension *should* respond 200 with
+// {workflow_run_id, html_url}. But deployed door43 DCS (currently
+// 1.25.7+dcs.22) ignores that param and returns 204 No Content, which made
+// our previous `await res.json()` throw with "Unexpected end of JSON input"
+// and silently fail every nightly run. Defensive path:
+//   1. Read the body as text. If it's a parseable run-details payload,
+//      use it directly.
+//   2. Otherwise the dispatch was still accepted (Gitea returns 204 on
+//      successful dispatch without details). Fall back to listing recent
+//      workflow_dispatch runs and matching by workflow filename + dispatch
+//      timestamp.
 async function dispatchValidate(env: Env, cfg: ValidatorConfig): Promise<DispatchResult> {
   const base = env.DCS_BASE_URL.replace(/\/$/, "");
   const url = `${base}/api/v1/repos/${encodeURIComponent(cfg.owner)}/${encodeURIComponent(cfg.repo)}/actions/workflows/${encodeURIComponent(cfg.workflowFile)}/dispatches?return_run_details=true`;
+  const dispatchedAt = Math.floor(Date.now() / 1000);
   const res = await fetch(url, {
     method: "POST",
     headers: dcsHeaders(env),
@@ -117,14 +126,140 @@ async function dispatchValidate(env: Env, cfg: ValidatorConfig): Promise<Dispatc
   if (!res.ok) {
     throw new Error(`dispatch_failed: ${res.status} ${await res.text()}`);
   }
-  const body = (await res.json()) as {
-    workflow_run_id?: number;
-    html_url?: string;
-  };
-  if (typeof body.workflow_run_id !== "number" || !body.html_url) {
-    throw new Error(`dispatch_unexpected_body: ${JSON.stringify(body)}`);
+  const text = (await res.text()).trim();
+  if (text) {
+    try {
+      const body = JSON.parse(text) as {
+        workflow_run_id?: number;
+        html_url?: string;
+      };
+      if (typeof body.workflow_run_id === "number" && body.html_url) {
+        return { workflowRunId: body.workflow_run_id, htmlUrl: body.html_url };
+      }
+    } catch {
+      /* fall through to list-runs fallback */
+    }
   }
-  return { workflowRunId: body.workflow_run_id, htmlUrl: body.html_url };
+  return findDispatchedRun(env, cfg, dispatchedAt);
+}
+
+// Fallback when dispatch returns 204 (no run details). Lists recent
+// workflow_dispatch runs, filters to ones matching our workflow file
+// created at-or-after our dispatch time (60s clock-skew tolerance), and
+// picks the most recent. Race window: another workflow_dispatch firing
+// within the same minute could be mis-attributed, but the en_tn validator
+// is the only thing dispatching it and the cron only fires once per day.
+async function findDispatchedRun(
+  env: Env,
+  cfg: ValidatorConfig,
+  sinceUnix: number,
+): Promise<DispatchResult> {
+  const base = env.DCS_BASE_URL.replace(/\/$/, "");
+  const url = `${base}/api/v1/repos/${encodeURIComponent(cfg.owner)}/${encodeURIComponent(cfg.repo)}/actions/runs?event=workflow_dispatch&limit=10`;
+  // The new run may not be visible immediately — retry a few times.
+  let lastErr: string | null = null;
+  for (let attempt = 0; attempt < 8; attempt++) {
+    const res = await fetch(url, { method: "GET", headers: dcsHeaders(env) });
+    if (res.ok) {
+      const data = (await res.json()) as unknown;
+      // Gitea responses vary by version: sometimes {workflow_runs:[...]},
+      // sometimes a bare array. Handle both.
+      const runs = Array.isArray(data)
+        ? (data as Array<Record<string, unknown>>)
+        : ((data as { workflow_runs?: unknown }).workflow_runs as
+            | Array<Record<string, unknown>>
+            | undefined) ?? [];
+      const candidates = runs
+        .map((r) => ({
+          id: typeof r.id === "number" ? r.id : 0,
+          createdAt: typeof r.created_at === "string"
+            ? Math.floor(new Date(r.created_at).getTime() / 1000)
+            : 0,
+          htmlUrl: typeof r.html_url === "string" ? r.html_url : "",
+          path: typeof r.path === "string" ? r.path : "",
+        }))
+        .filter((r) => r.id > 0 && r.createdAt >= sinceUnix - 60)
+        .filter((r) => !r.path || r.path.endsWith(cfg.workflowFile));
+      candidates.sort((a, b) => b.createdAt - a.createdAt);
+      const match = candidates[0];
+      if (match) return { workflowRunId: match.id, htmlUrl: match.htmlUrl };
+      lastErr = `no matching run yet (saw ${runs.length})`;
+    } else {
+      lastErr = `list_runs ${res.status}`;
+    }
+    await new Promise((r) => setTimeout(r, 2000));
+  }
+  throw new Error(`dispatched_but_run_not_found: ${lastErr ?? "unknown"}`);
+}
+
+// Find or open the live-snapshot → master PR. The validate workflow's
+// first step is "find open PR from live-snapshot to master" — if no PR
+// exists, the workflow no-ops with conclusion=success and there's no merge.
+// Our nightly export pushes commits to live-snapshot but never opens a PR,
+// so we open one here right before dispatching.
+async function ensureSnapshotPr(
+  env: Env,
+  cfg: ValidatorConfig,
+): Promise<{ number: number | null; created: boolean; reason: string }> {
+  const base = env.DCS_BASE_URL.replace(/\/$/, "");
+  const headBranch = env.DCS_EXPORT_BRANCH ?? "live-snapshot";
+  const baseBranch = cfg.ref;
+  if (headBranch === baseBranch) {
+    return { number: null, created: false, reason: "head_equals_base" };
+  }
+
+  const listUrl = `${base}/api/v1/repos/${encodeURIComponent(cfg.owner)}/${encodeURIComponent(cfg.repo)}/pulls?state=open&limit=50`;
+  const listRes = await fetch(listUrl, { method: "GET", headers: dcsHeaders(env) });
+  if (!listRes.ok) {
+    throw new Error(`pulls_list_failed: ${listRes.status} ${await listRes.text()}`);
+  }
+  const pulls = (await listRes.json()) as Array<{
+    number: number;
+    head?: { ref?: string };
+    base?: { ref?: string };
+  }>;
+  const existing = pulls.find(
+    (p) => p.head?.ref === headBranch && p.base?.ref === baseBranch,
+  );
+  if (existing) return { number: existing.number, created: false, reason: "existing" };
+
+  const createUrl = `${base}/api/v1/repos/${encodeURIComponent(cfg.owner)}/${encodeURIComponent(cfg.repo)}/pulls`;
+  const createRes = await fetch(createUrl, {
+    method: "POST",
+    headers: dcsHeaders(env),
+    body: JSON.stringify({
+      head: headBranch,
+      base: baseBranch,
+      title: `Nightly snapshot: ${headBranch} → ${baseBranch}`,
+      body: `Automated PR opened by bible-editor's post-export step so the validate-and-merge workflow has something to merge.`,
+    }),
+  });
+  if (createRes.ok) {
+    const created = (await createRes.json()) as { number: number };
+    return { number: created.number, created: true, reason: "created" };
+  }
+  const errText = await createRes.text();
+  // Idempotency / common no-op outcomes that we treat as soft-success:
+  //   422 — "no commits between" (master is already at live-snapshot), or
+  //         a PR is already open (race between list and create).
+  if (createRes.status === 422) {
+    // Try the list once more to either pick up the racing PR or confirm
+    // there's nothing to merge.
+    const r2 = await fetch(listUrl, { method: "GET", headers: dcsHeaders(env) });
+    if (r2.ok) {
+      const ps = (await r2.json()) as Array<{
+        number: number;
+        head?: { ref?: string };
+        base?: { ref?: string };
+      }>;
+      const ex = ps.find(
+        (p) => p.head?.ref === headBranch && p.base?.ref === baseBranch,
+      );
+      if (ex) return { number: ex.number, created: false, reason: "raced" };
+    }
+    return { number: null, created: false, reason: `no_op:${errText.slice(0, 200)}` };
+  }
+  throw new Error(`pull_create_failed: ${createRes.status} ${errText}`);
 }
 
 async function getRunStatus(
@@ -208,12 +343,51 @@ export async function runPostExport(
   });
   if (skip.skip) return;
 
-  // 2. Dispatch.
-  const dispatched = await step.do(
-    `dispatch-${cfg.repo}`,
+  // 2a. Ensure a live-snapshot → master PR exists. The validate workflow's
+  //     first step is "find open PR" — without one it logs "nothing to do"
+  //     and exits clean, which means master never gets the snapshot. Our
+  //     export pushes commits to live-snapshot but never opens a PR, so we
+  //     do it here. If there's no diff (master == live-snapshot, 422), we
+  //     soft-skip the dispatch since there's nothing meaningful to validate.
+  const prInfo = await step.do(
+    `ensure-pr-${cfg.repo}`,
     { retries: { limit: 3, delay: "10 seconds", backoff: "exponential" } },
-    async () => dispatchValidate(env, cfg),
+    async () => ensureSnapshotPr(env, cfg),
   );
+  if (prInfo.number === null) {
+    // Nothing to validate (master already matches live-snapshot, or PR
+    // couldn't be opened for a benign reason). Clear any stale validation
+    // alert and skip the dispatch + reimport entirely.
+    await step.do(`act-${cfg.repo}-no-pr`, async () => {
+      await clearAlertsForSource(env, validateAlertSource(cfg));
+      return { acted: "no_pr", reason: prInfo.reason };
+    });
+    return;
+  }
+
+  // 2b. Dispatch. Wrapped in try/catch so a dispatch failure (e.g. service
+  //     token lacks Actions writer permission on the repo) becomes a
+  //     banner rather than a silently errored workflow instance.
+  let dispatched: DispatchResult;
+  try {
+    dispatched = await step.do(
+      `dispatch-${cfg.repo}`,
+      { retries: { limit: 3, delay: "10 seconds", backoff: "exponential" } },
+      async () => dispatchValidate(env, cfg),
+    );
+  } catch (e) {
+    const reason = e instanceof Error ? e.message : String(e);
+    await step.do(`act-${cfg.repo}-dispatch-failed`, async () => {
+      await recordFailureAlert(
+        env,
+        cfg,
+        `${env.DCS_BASE_URL}/${cfg.owner}/${cfg.repo}/actions?workflow=${cfg.workflowFile}`,
+        `dispatch failed: ${reason.slice(0, 160)}`,
+      );
+      return { acted: "dispatch_failed", reason };
+    });
+    return;
+  }
 
   // 3. Poll until completed or budget exhausted. Each tick is its own
   //    step.do WITH retries so a single transient 5xx from DCS doesn't
