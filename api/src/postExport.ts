@@ -25,16 +25,24 @@ export interface ValidatorConfig {
   alertTargetUsername: string;
 }
 
-export const VALIDATORS: ValidatorConfig[] = [
-  {
-    resource: "tn",
-    owner: "unfoldingWord",
-    repo: "en_tn",
-    workflowFile: "validate_and_merge_snapshot.yaml",
-    ref: "master",
-    alertTargetUsername: "deferredreward",
-  },
-];
+// TEMP DISABLED 2026-05-21: nightly export pushes to live-snapshot, but no
+// dispatch / poll / reimport runs. Two outstanding gaps before re-enable:
+//   1. The validate_and_merge_snapshot workflow file on en_tn got renamed
+//      to `.yamll` (typo) — Gitea doesn't register it. Needs rename back
+//      to `.yaml`.
+//   2. The validate-tn-files workflow reported 37 validation errors on the
+//      snapshot we pushed (1CH ID checks etc.). Even with a working
+//      dispatch, the merge would be refused until those are addressed.
+// Re-enable by restoring the en_tn entry:
+//   {
+//     resource: "tn",
+//     owner: "unfoldingWord",
+//     repo: "en_tn",
+//     workflowFile: "validate_and_merge_snapshot.yaml",
+//     ref: "master",
+//     alertTargetUsername: "deferredreward",
+//   },
+export const VALIDATORS: ValidatorConfig[] = [];
 
 interface DispatchResult {
   workflowRunId: number;
