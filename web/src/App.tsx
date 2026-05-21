@@ -319,31 +319,50 @@ export function App() {
 
   return (
     <Box sx={{ height: "100vh", display: "flex", flexDirection: "column" }}>
-      {alerts.map((a) => (
-        <Alert
-          key={a.id}
-          severity={a.severity}
-          variant="filled"
-          onClose={() => void dismiss(a.id)}
-          sx={{ borderRadius: 0, py: 0.5 }}
+      {alerts.length > 0 && (
+        // Float the alert stack so it doesn't push Shell down — the outer
+        // flex column's children can't actually shrink (Shell's internal
+        // box rejects flex:1 minHeight:0 sizing), and any added in-flow
+        // height makes <html> scroll the banner above the viewport.
+        // Fixed positioning keeps the banner visible regardless of scroll
+        // state and accepts the tradeoff of obscuring the top 44px of the
+        // TopBar — appropriate UX for a "Benjamin fix this" alert.
+        <Box
+          sx={{
+            position: "fixed",
+            top: 0,
+            left: 0,
+            right: 0,
+            zIndex: (theme) => theme.zIndex.appBar + 2,
+          }}
         >
-          {a.message}
-          {a.linkUrl && (
-            <>
-              {" — "}
-              <Link
-                href={a.linkUrl}
-                target="_blank"
-                rel="noopener"
-                color="inherit"
-                underline="always"
-              >
-                view run
-              </Link>
-            </>
-          )}
-        </Alert>
-      ))}
+          {alerts.map((a) => (
+            <Alert
+              key={a.id}
+              severity={a.severity}
+              variant="filled"
+              onClose={() => void dismiss(a.id)}
+              sx={{ borderRadius: 0, py: 0.5 }}
+            >
+              {a.message}
+              {a.linkUrl && (
+                <>
+                  {" — "}
+                  <Link
+                    href={a.linkUrl}
+                    target="_blank"
+                    rel="noopener"
+                    color="inherit"
+                    underline="always"
+                  >
+                    view run
+                  </Link>
+                </>
+              )}
+            </Alert>
+          ))}
+        </Box>
+      )}
       {isViewer && (
         <Alert severity="info" variant="filled" sx={{ borderRadius: 0, py: 0.5 }}>
           You're signed in as an <strong>unfoldingWord</strong> member — read-only access.
