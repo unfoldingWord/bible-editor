@@ -144,11 +144,13 @@ async function dispatchValidate(env: Env, cfg: ValidatorConfig): Promise<Dispatc
 }
 
 // Fallback when dispatch returns 204 (no run details). Lists recent
-// workflow_dispatch runs, filters to ones matching our workflow file
-// created at-or-after our dispatch time (60s clock-skew tolerance), and
-// picks the most recent. Race window: another workflow_dispatch firing
-// within the same minute could be mis-attributed, but the en_tn validator
-// is the only thing dispatching it and the cron only fires once per day.
+// workflow_dispatch runs and picks the most recent one created at-or-after
+// our dispatch time (60s clock-skew tolerance). We do NOT filter by
+// workflow file path — Gitea's `path` field shape varies across versions
+// (the first prod attempt rejected ALL runs because of an over-strict
+// `endsWith` check). Race window: another workflow_dispatch on this repo
+// within the same few seconds; the en_tn validator is the only thing
+// dispatching this, so fine in practice.
 async function findDispatchedRun(
   env: Env,
   cfg: ValidatorConfig,
@@ -156,34 +158,44 @@ async function findDispatchedRun(
 ): Promise<DispatchResult> {
   const base = env.DCS_BASE_URL.replace(/\/$/, "");
   const url = `${base}/api/v1/repos/${encodeURIComponent(cfg.owner)}/${encodeURIComponent(cfg.repo)}/actions/runs?event=workflow_dispatch&limit=10`;
-  // The new run may not be visible immediately — retry a few times.
   let lastErr: string | null = null;
   for (let attempt = 0; attempt < 8; attempt++) {
     const res = await fetch(url, { method: "GET", headers: dcsHeaders(env) });
     if (res.ok) {
       const data = (await res.json()) as unknown;
-      // Gitea responses vary by version: sometimes {workflow_runs:[...]},
-      // sometimes a bare array. Handle both.
       const runs = Array.isArray(data)
         ? (data as Array<Record<string, unknown>>)
         : ((data as { workflow_runs?: unknown }).workflow_runs as
             | Array<Record<string, unknown>>
             | undefined) ?? [];
       const candidates = runs
-        .map((r) => ({
-          id: typeof r.id === "number" ? r.id : 0,
-          createdAt: typeof r.created_at === "string"
-            ? Math.floor(new Date(r.created_at).getTime() / 1000)
-            : 0,
-          htmlUrl: typeof r.html_url === "string" ? r.html_url : "",
-          path: typeof r.path === "string" ? r.path : "",
-        }))
-        .filter((r) => r.id > 0 && r.createdAt >= sinceUnix - 60)
-        .filter((r) => !r.path || r.path.endsWith(cfg.workflowFile));
-      candidates.sort((a, b) => b.createdAt - a.createdAt);
-      const match = candidates[0];
-      if (match) return { workflowRunId: match.id, htmlUrl: match.htmlUrl };
-      lastErr = `no matching run yet (saw ${runs.length})`;
+        .map((r) => {
+          const id = typeof r.id === "number" ? r.id : 0;
+          const htmlUrl = typeof r.html_url === "string" ? r.html_url : "";
+          const createdRaw = r.created_at;
+          let createdMs = 0;
+          if (typeof createdRaw === "string") {
+            const t = new Date(createdRaw).getTime();
+            createdMs = Number.isFinite(t) ? t : 0;
+          } else if (typeof createdRaw === "number") {
+            // Some Gitea versions return seconds, some ms. Normalize to ms.
+            createdMs = createdRaw < 1e12 ? createdRaw * 1000 : createdRaw;
+          }
+          return { id, htmlUrl, createdMs };
+        })
+        .filter((r) => r.id > 0)
+        .sort((a, b) => b.createdMs - a.createdMs);
+      // Prefer a run timestamped at-or-after our dispatch (60s skew); fall
+      // back to the freshest run when timestamp parsing was unreliable
+      // (createdMs === 0).
+      const sinceMs = (sinceUnix - 60) * 1000;
+      const candidate = candidates.find(
+        (r) => r.createdMs === 0 || r.createdMs >= sinceMs,
+      );
+      if (candidate) return { workflowRunId: candidate.id, htmlUrl: candidate.htmlUrl };
+      // Diagnostic: capture first run's keys so the error reveals what we saw.
+      const sample = runs[0] ? Object.keys(runs[0]).join(",") : "empty";
+      lastErr = `no run within window (saw ${runs.length}; keys: ${sample})`;
     } else {
       lastErr = `list_runs ${res.status}`;
     }
