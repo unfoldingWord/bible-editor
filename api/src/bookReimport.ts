@@ -46,6 +46,7 @@ export interface ReimportCounts {
   inserted: number;
   skipped_edited: number;
   skipped_locked: number;
+  skipped_noop: number;
   dcs_404: number;
   errors: string[];
 }
@@ -64,6 +65,7 @@ function zeroCounts(): ReimportCounts {
     inserted: 0,
     skipped_edited: 0,
     skipped_locked: 0,
+    skipped_noop: 0,
     dcs_404: 0,
     errors: [],
   };
@@ -74,6 +76,7 @@ function addCounts(into: ReimportCounts, from: ReimportCounts): void {
   into.inserted += from.inserted;
   into.skipped_edited += from.skipped_edited;
   into.skipped_locked += from.skipped_locked;
+  into.skipped_noop += from.skipped_noop;
   into.dcs_404 += from.dcs_404;
   if (from.errors.length) into.errors.push(...from.errors);
 }
@@ -293,13 +296,17 @@ async function reimportTsvForChapter(
         await logEdit(env, kind, row.id, book, userId, null, 1, "create", row);
         continue;
       }
-      // Row exists. Try a pristine-scoped UPDATE; rowcount tells us whether
-      // we actually overwrote (1) or skipped because someone edited (0).
-      const updated = await tryUpdateTsvRow(env, book, kind, row, pristinePredicate);
-      if (updated) {
+      // Row exists. SELECT first so we can short-circuit when DCS content
+      // matches what's already in D1 — otherwise nightly reimports churn
+      // every pristine row's version and write useless edit_log entries,
+      // which silently invalidates every connected client's `If-Match`.
+      const outcome = await tryUpdateTsvRow(env, book, kind, row, pristinePredicate);
+      if (outcome === "noop") {
+        counts.skipped_noop++;
+      } else if (outcome === "edited") {
+        counts.skipped_edited++;
+      } else {
         counts.updated++;
-        // Pull the new version for the audit log. We don't have it from the
-        // UPDATE result (D1 doesn't return RETURNING), so a follow-up SELECT.
         const v = await env.DB.prepare(
           `SELECT version FROM ${kind}_rows WHERE id = ?1 AND book = ?2`,
         )
@@ -308,8 +315,6 @@ async function reimportTsvForChapter(
         if (v) {
           await logEdit(env, kind, row.id, book, userId, v.version - 1, v.version, "update", row);
         }
-      } else {
-        counts.skipped_edited++;
       }
     } catch (e) {
       counts.errors.push(`${kind} ${row.id}: ${e instanceof Error ? e.message : String(e)}`);
@@ -371,18 +376,55 @@ async function tryInsertTsvRow(
   return (r.meta.changes ?? 0) > 0;
 }
 
-// UPDATE only if the row is still pristine. updated_by stays NULL so future
-// re-imports still see it as "safe to overwrite" — re-import is conceptually
-// a re-seed, not a human edit.
+// SELECT-then-compare-then-UPDATE. Three outcomes:
+//   "noop"    — stored row matches DCS exactly; no UPDATE issued.
+//   "updated" — pristine UPDATE succeeded.
+//   "edited"  — row was touched by a translator since the read; pristine
+//               UPDATE matched 0 rows. Skip.
+//
+// The pristine guard stays on the UPDATE itself — a translator edit
+// landing between SELECT and UPDATE flips the outcome to "edited", not
+// silently clobbered. updated_by stays NULL so future re-imports still
+// see this as safe to overwrite.
+type UpdateOutcome = "noop" | "updated" | "edited";
+
 async function tryUpdateTsvRow(
   env: Env,
   book: string,
   kind: TsvKind,
   row: ParsedTsvRow,
   pristine: string,
-): Promise<boolean> {
+): Promise<UpdateOutcome> {
   const now = Math.floor(Date.now() / 1000);
   if (kind === "tn") {
+    const existing = await env.DB.prepare(
+      `SELECT ref_raw, chapter, verse, tags, support_reference, quote, occurrence, note
+         FROM tn_rows WHERE id = ?1 AND book = ?2`,
+    )
+      .bind(row.id, book)
+      .first<{
+        ref_raw: string;
+        chapter: number;
+        verse: number;
+        tags: string | null;
+        support_reference: string | null;
+        quote: string | null;
+        occurrence: number | null;
+        note: string | null;
+      }>();
+    if (
+      existing &&
+      existing.ref_raw === row.refRaw &&
+      existing.chapter === row.chapter &&
+      existing.verse === row.verse &&
+      (existing.tags ?? null) === (row.tags ?? null) &&
+      (existing.support_reference ?? null) === (row.support_reference ?? null) &&
+      (existing.quote ?? null) === (row.quote ?? null) &&
+      (existing.occurrence ?? null) === (row.occurrence ?? null) &&
+      (existing.note ?? null) === (row.note ?? null)
+    ) {
+      return "noop";
+    }
     const r = await env.DB.prepare(
       `UPDATE tn_rows
           SET ref_raw = ?1, chapter = ?2, verse = ?3, tags = ?4,
@@ -397,9 +439,37 @@ async function tryUpdateTsvRow(
         now, row.id, book,
       )
       .run();
-    return (r.meta.changes ?? 0) > 0;
+    return (r.meta.changes ?? 0) > 0 ? "updated" : "edited";
   }
   if (kind === "tq") {
+    const existing = await env.DB.prepare(
+      `SELECT ref_raw, chapter, verse, tags, quote, occurrence, question, response
+         FROM tq_rows WHERE id = ?1 AND book = ?2`,
+    )
+      .bind(row.id, book)
+      .first<{
+        ref_raw: string;
+        chapter: number;
+        verse: number;
+        tags: string | null;
+        quote: string | null;
+        occurrence: number | null;
+        question: string | null;
+        response: string | null;
+      }>();
+    if (
+      existing &&
+      existing.ref_raw === row.refRaw &&
+      existing.chapter === row.chapter &&
+      existing.verse === row.verse &&
+      (existing.tags ?? null) === (row.tags ?? null) &&
+      (existing.quote ?? null) === (row.quote ?? null) &&
+      (existing.occurrence ?? null) === (row.occurrence ?? null) &&
+      (existing.question ?? null) === (row.question ?? null) &&
+      (existing.response ?? null) === (row.response ?? null)
+    ) {
+      return "noop";
+    }
     const r = await env.DB.prepare(
       `UPDATE tq_rows
           SET ref_raw = ?1, chapter = ?2, verse = ?3, tags = ?4,
@@ -414,7 +484,33 @@ async function tryUpdateTsvRow(
         now, row.id, book,
       )
       .run();
-    return (r.meta.changes ?? 0) > 0;
+    return (r.meta.changes ?? 0) > 0 ? "updated" : "edited";
+  }
+  const existing = await env.DB.prepare(
+    `SELECT ref_raw, chapter, verse, tags, orig_words, occurrence, tw_link
+       FROM twl_rows WHERE id = ?1 AND book = ?2`,
+  )
+    .bind(row.id, book)
+    .first<{
+      ref_raw: string;
+      chapter: number;
+      verse: number;
+      tags: string | null;
+      orig_words: string | null;
+      occurrence: number | null;
+      tw_link: string | null;
+    }>();
+  if (
+    existing &&
+    existing.ref_raw === row.refRaw &&
+    existing.chapter === row.chapter &&
+    existing.verse === row.verse &&
+    (existing.tags ?? null) === (row.tags ?? null) &&
+    (existing.orig_words ?? null) === (row.orig_words ?? null) &&
+    (existing.occurrence ?? null) === (row.occurrence ?? null) &&
+    (existing.tw_link ?? null) === (row.tw_link ?? null)
+  ) {
+    return "noop";
   }
   const r = await env.DB.prepare(
     `UPDATE twl_rows
@@ -429,7 +525,7 @@ async function tryUpdateTsvRow(
       now, row.id, book,
     )
     .run();
-  return (r.meta.changes ?? 0) > 0;
+  return (r.meta.changes ?? 0) > 0 ? "updated" : "edited";
 }
 
 // ── Verses (ULT / UST) ─────────────────────────────────────────────────────
@@ -467,8 +563,26 @@ async function reimportVersesForChapter(
         );
         continue;
       }
-      // Exists locally — pristine UPDATE. updated_by IS NULL is the signal
-      // here (verses don't have preserve/hint). updated_by stays NULL.
+      // Exists locally — SELECT first so we can short-circuit on byte-equal
+      // content. content_json is produced by extractVersesForRange in both
+      // directions (bootstrap + reimport), so byte-compare is stable for
+      // pristine rows. updated_by IS NULL is the pristine signal here.
+      const existing = await env.DB.prepare(
+        `SELECT content_json, plain_text, verse_end
+           FROM verses
+          WHERE book = ?1 AND chapter = ?2 AND verse = ?3 AND bible_version = ?4`,
+      )
+        .bind(book, chapter, v.verse, bibleVersion)
+        .first<{ content_json: string; plain_text: string | null; verse_end: number | null }>();
+      if (
+        existing &&
+        existing.content_json === v.contentJson &&
+        (existing.plain_text ?? null) === (v.plainText ?? null) &&
+        (existing.verse_end ?? null) === (v.verseEnd ?? null)
+      ) {
+        counts.skipped_noop++;
+        continue;
+      }
       const upd = await env.DB.prepare(
         `UPDATE verses
             SET content_json = ?1, plain_text = ?2, verse_end = ?3,

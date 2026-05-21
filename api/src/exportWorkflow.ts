@@ -26,6 +26,7 @@ import {
   RESOURCE_TARGETS,
   type Resource,
 } from "./export";
+import { runPostExport, VALIDATORS } from "./postExport";
 import type { TnRow, TqRow, TwlRow, VerseRow } from "./types";
 
 export interface ExportParams {
@@ -36,6 +37,11 @@ export interface ExportParams {
   // Force-skip the DCS commit even if a service token is configured. Lets
   // us test the rendering pipeline against R2 without pushing anything live.
   dryDcs?: boolean;
+  // Run the post-export validate-and-merge orchestrator (dispatches a Gitea
+  // Actions workflow that auto-merges the live-snapshot PR on DCS). The
+  // 06:00 UTC cron sets this true; manual /api/exports/run leaves it false
+  // so a single-book test export doesn't accidentally trigger a real merge.
+  validateAndMerge?: boolean;
 }
 
 export interface StepResult {
@@ -77,9 +83,14 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
 
     // 2. One step per (book, resource). step.do persists, so a single flaky
     //    step retries without re-rendering the entire run.
+    //
+    //    Resource-major ordering: finish all books for one resource, then
+    //    run the post-export validator (if one is configured) before moving
+    //    on. Without this, a transient failure on TQ/TWL/ULT/UST would block
+    //    TN validation from ever firing even after TN successfully pushed.
     const results: StepResult[] = [];
-    for (const book of books) {
-      for (const resource of resources) {
+    for (const resource of resources) {
+      for (const book of books) {
         const stepName = `export-${book}-${resource}`;
         const result = await step.do(
           stepName,
@@ -87,6 +98,14 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
           async () => this.exportOne(book, resource, instanceId, dcsAllowed),
         );
         results.push(result);
+      }
+      // Post-export validate-and-merge is opt-in via params.validateAndMerge.
+      // The nightly cron sets it true; manual /api/exports/run defaults to
+      // false so a one-off "render and push my single book" test doesn't
+      // also kick off the auto-merge workflow on DCS.
+      const validatorCfg = VALIDATORS.find((v) => v.resource === resource);
+      if (validatorCfg && params.validateAndMerge === true) {
+        await runPostExport(this.env, step, validatorCfg, dcsAllowed);
       }
     }
 

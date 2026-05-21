@@ -386,6 +386,38 @@ export interface MeResponse {
   lastVerse: number | null;
 }
 
+export type AlertSeverity = "error" | "warning" | "info";
+
+export interface SystemAlert {
+  id: number;
+  severity: AlertSeverity;
+  message: string;
+  linkUrl: string | null;
+  createdAt: number;
+}
+
+// GET /api/alerts/me — undismissed banner alerts targeted at this user.
+// Empty array when there's nothing to show. Used by the App-level banner
+// stack rendered above the viewer alert.
+export async function fetchAlerts(): Promise<SystemAlert[]> {
+  try {
+    const res = await request<{ alerts: SystemAlert[] }>(`/api/alerts/me`);
+    return res.alerts;
+  } catch (err) {
+    if (err instanceof ApiError && err.status === 401) return [];
+    throw err;
+  }
+}
+
+// POST /api/alerts/:id/dismiss — sets dismissed_at = now so the row stops
+// showing up in /api/alerts/me. Returns { ok, changed }; we don't surface
+// `changed` to callers (dismissing an already-dismissed row is a no-op).
+export async function dismissAlert(id: number): Promise<void> {
+  await request<{ ok: true; changed: boolean }>(`/api/alerts/${id}/dismiss`, {
+    method: "POST",
+  });
+}
+
 // GET /api/auth/me — confirms the current cookie session's identity + role.
 // Returns null on 401 (no cookie / expired) so callers can show the sign-in
 // flow. Throws ApiError on other 4xx/5xx.
@@ -500,6 +532,7 @@ export interface ReimportCounts {
   inserted: number;
   skipped_edited: number;
   skipped_locked: number;
+  skipped_noop: number;
   dcs_404: number;
   errors: string[];
 }
