@@ -9,6 +9,7 @@ import { exports as exportsRoutes } from "./exports";
 import { tnQuick } from "./tnQuick";
 import { pipelines, pollAllNonTerminal } from "./pipelines";
 import { pendingImports } from "./pendingImports";
+import { alerts } from "./alerts";
 import { books } from "./bookImport";
 import { ALL_RESOURCES, reimportBookFromDcs } from "./bookReimport";
 import { attachAuth, requireAuth, requireCsrf, mintDevToken, startDcsAuth, callbackDcsAuth, authMe, authLogout, refreshToken, updateLastLocation, currentUserId, verifyToken } from "./auth";
@@ -157,6 +158,7 @@ app.route("/api/exports", exportsRoutes);
 app.route("/api/tn-quick", tnQuick);
 app.route("/api/pipelines", pipelines);
 app.route("/api/pending-imports", pendingImports);
+app.route("/api/alerts", alerts);
 
 // WebSocket upgrade into the ChapterRoom DO. WS handshakes are normal HTTP
 // upgrades, so they carry the Access cookie (same-origin) and attachAuth has
@@ -216,7 +218,11 @@ export default {
     // when no translator has a tab open. Branching on controller.cron
     // keeps the work cheaply separated.
     if (controller.cron === EXPORT_CRON) {
-      await env.EXPORT_WORKFLOW.create();
+      // Scheduled run opts into validate-and-merge — the whole point of the
+      // 06:00 UTC tick is to land the snapshot on DCS and let the validator
+      // merge it. Manual /api/exports/run leaves validateAndMerge unset so
+      // tests don't accidentally trigger the auto-merge.
+      await env.EXPORT_WORKFLOW.create({ params: { validateAndMerge: true } });
       return;
     }
     if (controller.cron === POLL_CRON) {

@@ -15,6 +15,10 @@ const RunBody = z.object({
   book: z.string().min(1).max(8).optional(),
   resource: z.enum(["tn", "tq", "twl", "ult", "ust"]).optional(),
   dryDcs: z.boolean().optional(),
+  // Opt-in to the post-export validate-and-merge orchestrator. Defaults
+  // unset (= false) so a manual single-book test export doesn't trigger
+  // the real auto-merge workflow on DCS. The 06:00 UTC cron passes true.
+  validateAndMerge: z.boolean().optional(),
 });
 
 exports.post("/run", requireAdmin, async (c) => {
@@ -32,6 +36,7 @@ exports.post("/run", requireAdmin, async (c) => {
     book: parsed.data.book?.toUpperCase(),
     resource: parsed.data.resource as Resource | undefined,
     dryDcs: parsed.data.dryDcs,
+    validateAndMerge: parsed.data.validateAndMerge,
   };
   const instance = await c.env.EXPORT_WORKFLOW.create({ params });
   return c.json({ id: instance.id, status: "queued" }, 202);

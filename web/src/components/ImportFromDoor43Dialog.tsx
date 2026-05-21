@@ -82,6 +82,7 @@ function summarize(res: ReimportResponse): string {
   if (t.inserted) parts.push(`${t.inserted} inserted`);
   if (t.skipped_edited) parts.push(`${t.skipped_edited} skipped (already edited)`);
   if (t.skipped_locked) parts.push(`${t.skipped_locked} skipped (AI pipeline running)`);
+  if (t.skipped_noop) parts.push(`${t.skipped_noop} unchanged`);
   if (t.dcs_404) parts.push(`${t.dcs_404} resource(s) not on DCS`);
   if (parts.length === 0) return `Imported ${res.book} — no changes.`;
   return `Imported ${res.book}: ${parts.join(", ")}.`;
