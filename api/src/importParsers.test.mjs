@@ -10,9 +10,23 @@ import { fileURLToPath } from "node:url";
 import {
   extractVersesForRange,
   normalizeWordPunctuation,
+  splitGluedAlignmentWords,
   parseTsv,
   refParts,
 } from "./importParsers.ts";
+
+// Collect target `\w` words with their alignment status (inside a `\zaln-s`?).
+function collectWords(nodes, inZaln, acc) {
+  for (const n of nodes ?? []) {
+    if (!n || typeof n !== "object") continue;
+    if (n.type === "word" && n.tag === "w") {
+      acc.push({ text: n.text, occurrence: n.occurrence, occurrences: n.occurrences, aligned: inZaln });
+    } else if (Array.isArray(n.children)) {
+      collectWords(n.children, inZaln || n.tag === "zaln", acc);
+    }
+  }
+  return acc;
+}
 
 const here = dirname(fileURLToPath(import.meta.url));
 const samples = resolve(here, "../../docs/samples");
@@ -189,6 +203,82 @@ function assert(cond, msg) {
     { type: "word", tag: "w", text: "30", occurrence: "1", occurrences: "1" },
   ]);
   assert(out.length === 1 && out[0].type === "word" && out[0].text === "30", `numeric \\w stays one token`);
+}
+
+// --- splitGluedAlignmentWords: de-glue AI punctuation-spanning `\w` tokens ---
+{
+  // (a) glued token inside a zaln → fragments fall out to unaligned, the
+  // preceding aligned word stays put, punctuation rides as a text node.
+  const out = splitGluedAlignmentWords([
+    {
+      type: "milestone", tag: "zaln", strong: "H1", content: "הוֹצֵאתִיהָ",
+      children: [
+        { type: "word", tag: "w", text: "it", occurrence: "1", occurrences: "1" },
+        { type: "text", text: " " },
+        { type: "word", tag: "w", text: "out”—the", occurrence: "1", occurrences: "1" },
+      ],
+    },
+  ]);
+  const words = collectWords(out, false, []);
+  assert(!words.some((w) => w.text === "out”—the"), `glued "out”—the" is no longer a single \\w token`);
+  const wOut = words.find((w) => w.text === "out");
+  const wThe = words.find((w) => w.text === "the");
+  const wIt = words.find((w) => w.text === "it");
+  assert(wOut && wOut.aligned === false, `"out" falls out to unaligned`);
+  assert(wThe && wThe.aligned === false, `"the" falls out to unaligned`);
+  assert(wIt && wIt.aligned === true, `preceding "it" stays aligned`);
+  assert(out.some((n) => n.type === "text" && n.text === "”—"), `punctuation "”—" rides as a top-level text node`);
+}
+{
+  // (b) occurrence recompute: the freed "the" plus an existing "the" resolve to
+  // a consistent 1/2 + 2/2 (the glued token carried a bogus 1/1).
+  const out = splitGluedAlignmentWords([
+    { type: "milestone", tag: "zaln", strong: "H1", content: "א",
+      children: [{ type: "word", tag: "w", text: "out”—the", occurrence: "1", occurrences: "1" }] },
+    { type: "text", text: " " },
+    { type: "milestone", tag: "zaln", strong: "H2", content: "ב",
+      children: [{ type: "word", tag: "w", text: "the", occurrence: "1", occurrences: "1" }] },
+  ]);
+  const thes = collectWords(out, false, []).filter((w) => w.text === "the");
+  assert(thes.length === 2, `two "the" tokens after split (got ${thes.length})`);
+  assert(thes.every((w) => w.occurrences === "2"), `both "the" share occurrences="2"`);
+  assert(
+    JSON.stringify(thes.map((w) => w.occurrence).sort()) === JSON.stringify(["1", "2"]),
+    `"the" occurrences numbered 1 and 2`,
+  );
+}
+{
+  // (c) negatives — never split; clean input returns the SAME array (no-op).
+  const multi = [{ type: "word", tag: "w", text: "of the LORD", occurrence: "1", occurrences: "1" }];
+  assert(splitGluedAlignmentWords(multi) === multi, `multi-word "of the LORD" untouched (identity)`);
+  const intra = [
+    { type: "word", tag: "w", text: "don't", occurrence: "1", occurrences: "1" },
+    { type: "word", tag: "w", text: "hello-world", occurrence: "1", occurrences: "1" },
+  ];
+  assert(splitGluedAlignmentWords(intra) === intra, `apostrophe / hyphen words untouched`);
+  const range = [{ type: "word", tag: "w", text: "1914–1918", occurrence: "1", occurrences: "1" }];
+  assert(splitGluedAlignmentWords(range) === range, `number range "1914–1918" untouched (dash between digits)`);
+}
+
+// --- integration: real ZEC 5:4 through extractVersesForRange ---
+{
+  const raw = readFileSync(resolve(samples, "en_ult_38-ZEC.usfm"), "utf8");
+  const v4 = extractVersesForRange(raw, 5, 5).find((v) => v.verse === 4);
+  assert(v4, "ZEC 5:4 ULT exists");
+  const words = collectWords(JSON.parse(v4.contentJson).verseObjects, false, []);
+  assert(
+    !words.some((w) => w.text === "out”—the" || w.text === "Armies—“and"),
+    `ZEC 5:4 glued tokens out”—the / Armies—“and are split`,
+  );
+  assert(words.some((w) => w.text === "out" && !w.aligned), `ZEC 5:4 "out" fell out to unaligned`);
+  assert(words.some((w) => w.text === "Armies" && !w.aligned), `ZEC 5:4 "Armies" fell out to unaligned`);
+  assert(words.some((w) => w.text === "the" && !w.aligned), `ZEC 5:4 freed "the" is unaligned`);
+  assert(words.some((w) => w.text === "and" && !w.aligned), `ZEC 5:4 freed "and" is unaligned`);
+  const thes = words.filter((w) => w.text === "the");
+  assert(new Set(thes.map((w) => w.occurrences)).size === 1, `all "the" agree on the occurrences total`);
+  assert(new Set(thes.map((w) => w.occurrence)).size === thes.length, `"the" occurrence numbers are unique`);
+  assert(v4.plainText.includes("out”—the"), `plain_text still reads "out”—the" (split is text-invariant)`);
+  console.log(`  ZEC 5:4 ULT words: ${words.length}; out/Armies unaligned, "the"×${thes.length} renumbered`);
 }
 
 console.log("\nAll parser smoke checks passed.");

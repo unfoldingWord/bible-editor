@@ -80,6 +80,206 @@ function splitWordPunctuation(text: string): { leading: string; core: string; tr
   };
 }
 
+// ─── De-glue AI-introduced punctuation-spanning word tokens ──────────────
+//
+// The AI/tC aligner sometimes emits a single `\w` that swallowed boundary
+// punctuation AND the next clause's first word, nested inside the PREVIOUS
+// source word's `\zaln-s` — e.g. `\w out”—the\w*` (aligned to הוֹצֵאתִיהָ in
+// ZEC 5:4) or `\w Armies—“and\w*`. normalizeWordPunctuation deliberately
+// can't touch these (both ends are letters, so its outer-strip is a no-op,
+// and interior content is preserved to keep legit multi-word targets like
+// `\w of the LORD\w*` intact). This is the sibling defect to the malformed
+// `x-occurrence` handled by effectiveOccurrence() in web/src/lib/alignment.ts.
+//
+// We split such a token on its interior boundary punctuation and lift every
+// fragment out of its `\zaln-s`, so the words fall into the word bank as
+// UNALIGNED for a human to re-align (matching gatewayEdit); the rest of each
+// group keeps its alignment. Runs at import (extractVersesForRange) so
+// AI-drafted and DCS content lands clean; the one-time cleanup script in
+// scripts/normalize-verse-punctuation.mjs imports this same function. The
+// lift / strip helpers below mirror the originals in web/src/lib/replace.ts —
+// keep them in sync.
+
+// Boundary punctuation that marks a clause break when it sits INSIDE a `\w`
+// flanked by word content: double quotes (straight + curly), guillemets, and
+// em / en dashes. NOT apostrophes / hyphens (intra-word: don't, hello-world)
+// and NOT spaces (legit multi-word targets). A run of these is a split point.
+const BOUNDARY_RUN_RE = /["“”«»—–]+/g;
+const WORD_CONTENT_RE = /[\p{L}\p{M}]/u;
+
+// Split a `\w` text into [word][punct-run][word]… segments, each emitted as a
+// node marked `__edited` so liftEditedOutOfZaln pops it out of the enclosing
+// `\zaln-s`. Returns null when the token is not glued (fewer than two
+// letter-bearing word segments) so callers leave it untouched — dash/quote
+// runs between digit-only segments (number ranges like "1914–1918") yield <2
+// letter-bearing segments → null. Marking the punct text `__edited` too avoids
+// leaving a degenerate punctuation-only milestone between the lifted words.
+function splitGluedNode(node: Record<string, unknown>): unknown[] | null {
+  const text = String(node["text"] ?? "");
+  const segments: Array<{ word: boolean; text: string }> = [];
+  let last = 0;
+  const re = new RegExp(BOUNDARY_RUN_RE.source, "g");
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text)) !== null) {
+    if (m.index > last) segments.push({ word: true, text: text.slice(last, m.index) });
+    segments.push({ word: false, text: m[0] });
+    last = m.index + m[0].length;
+  }
+  if (last < text.length) segments.push({ word: true, text: text.slice(last) });
+  const letterSegs = segments.filter((s) => s.word && WORD_CONTENT_RE.test(s.text));
+  if (letterSegs.length < 2) return null;
+  const out: unknown[] = [];
+  for (const s of segments) {
+    if (s.text === "") continue;
+    if (s.word && WORD_CONTENT_RE.test(s.text)) {
+      out.push({ ...node, text: s.text, __edited: true });
+    } else {
+      out.push({ type: "text", text: s.text, __edited: true });
+    }
+  }
+  return out;
+}
+
+// Walk the tree, replacing each glued `\w` with its split fragments. Reports
+// whether anything split so the caller can skip the lift / recompute passes on
+// clean verses (no occurrence churn there).
+function markGluedSplits(verseObjects: unknown[]): { result: unknown[]; didSplit: boolean } {
+  let didSplit = false;
+  const walk = (nodes: unknown[]): unknown[] => {
+    const out: unknown[] = [];
+    for (const node of nodes) {
+      if (node && typeof node === "object") {
+        const o = node as Record<string, unknown>;
+        if (o["type"] === "word" && o["tag"] === "w" && typeof o["text"] === "string") {
+          const split = splitGluedNode(o);
+          if (split) {
+            didSplit = true;
+            out.push(...split);
+            continue;
+          }
+        } else if (Array.isArray(o["children"])) {
+          out.push({ ...o, children: walk(o["children"] as unknown[]) });
+          continue;
+        }
+      }
+      out.push(node);
+    }
+    return out;
+  };
+  return { result: walk(verseObjects), didSplit };
+}
+
+// Lift any node marked `__edited` out of every enclosing `\zaln-s` ancestor:
+// the marked node becomes a bare (unaligned) sibling at the milestone's old
+// position, the milestone splitting into pre/post halves around it. Mirror of
+// web/src/lib/replace.ts:liftEditedOutOfZaln — keep in sync.
+function liftEditedOutOfZaln(nodes: unknown[]): unknown[] {
+  const out: unknown[] = [];
+  for (const node of nodes) {
+    if (!node || typeof node !== "object") {
+      out.push(node);
+      continue;
+    }
+    const o = node as Record<string, unknown>;
+    if (o["__edited"]) {
+      const { __edited: _drop, ...rest } = o as Record<string, unknown> & { __edited?: unknown };
+      (rest as Record<string, unknown>)["__lifted"] = true;
+      out.push(rest);
+      continue;
+    }
+    if (Array.isArray(o["children"])) {
+      const processed = liftEditedOutOfZaln(o["children"] as unknown[]);
+      if (o["tag"] === "zaln") {
+        let segment: unknown[] = [];
+        const flush = () => {
+          if (segment.length > 0) {
+            out.push({ ...o, children: segment });
+            segment = [];
+          }
+        };
+        for (const child of processed) {
+          if (child && typeof child === "object" && (child as Record<string, unknown>)["__lifted"]) {
+            flush();
+            out.push(child);
+          } else {
+            segment.push(child);
+          }
+        }
+        flush();
+      } else {
+        out.push({ ...o, children: processed });
+      }
+    } else {
+      out.push(node);
+    }
+  }
+  return out;
+}
+
+// Strip leftover `__lifted` markers from a fully-processed tree. Mirror of
+// web/src/lib/replace.ts:stripLiftedMarkers — keep in sync.
+function stripLiftedMarkers(nodes: unknown[]): unknown[] {
+  return nodes.map((n) => {
+    if (!n || typeof n !== "object") return n;
+    const { __lifted: _drop, ...rest } = n as Record<string, unknown> & { __lifted?: unknown };
+    if (Array.isArray((rest as Record<string, unknown>)["children"])) {
+      (rest as Record<string, unknown>)["children"] = stripLiftedMarkers(
+        (rest as Record<string, unknown>)["children"] as unknown[],
+      );
+    }
+    return rest;
+  });
+}
+
+// Renumber every target `\w`'s occurrence / occurrences across the verse in
+// document order. A split creates a fresh instance of an existing word (e.g. a
+// 7th "the"); without this the freed token keeps the glued token's bogus 1/1
+// and collides with the real occurrences on export / re-alignment. Source
+// `\zaln-s` x-occurrence attributes live on the milestone, not on `\w`, so
+// they're never touched here.
+function recomputeTargetOccurrences(verseObjects: unknown[]): unknown[] {
+  const words: Array<Record<string, unknown>> = [];
+  const collect = (nodes: unknown[]): void => {
+    for (const node of nodes) {
+      if (!node || typeof node !== "object") continue;
+      const o = node as Record<string, unknown>;
+      if (o["type"] === "word" && o["tag"] === "w" && typeof o["text"] === "string") {
+        words.push(o);
+      } else if (Array.isArray(o["children"])) {
+        collect(o["children"] as unknown[]);
+      }
+    }
+  };
+  collect(verseObjects);
+  const totals = new Map<string, number>();
+  for (const w of words) {
+    const key = String(w["text"]);
+    totals.set(key, (totals.get(key) ?? 0) + 1);
+  }
+  const running = new Map<string, number>();
+  for (const w of words) {
+    const key = String(w["text"]);
+    const n = (running.get(key) ?? 0) + 1;
+    running.set(key, n);
+    w["occurrence"] = String(n);
+    w["occurrences"] = String(totals.get(key) ?? 1);
+  }
+  return verseObjects;
+}
+
+// Split AI-glued `\w` tokens and drop their fragments to unaligned. No-op when
+// nothing is glued — clean verses (and Hebrew / Greek source text, which has
+// no Latin boundary punctuation) pass through untouched, no occurrence churn.
+export function splitGluedAlignmentWords(verseObjects: unknown[]): unknown[] {
+  if (!Array.isArray(verseObjects)) return verseObjects;
+  const { result, didSplit } = markGluedSplits(verseObjects);
+  if (!didSplit) return verseObjects;
+  const lifted = stripLiftedMarkers(liftEditedOutOfZaln(result));
+  // Clone before the in-place occurrence renumber so we never mutate caller
+  // state (cloneVerseObjects pattern from web/src/lib/replace.ts).
+  return recomputeTargetOccurrences(JSON.parse(JSON.stringify(lifted)) as unknown[]);
+}
+
 // Walk verse-objects and concatenate all text. Same shape and behaviour
 // as the client-side `extractPlainText` in web/src/lib/usfm.ts — kept
 // duplicated because the Worker bundle and the web bundle are built
@@ -152,7 +352,11 @@ export function extractVersesForRange(
       const verseObj = chapterObj[verseKey] as { verseObjects?: unknown[] };
       const normalized = {
         ...verseObj,
-        verseObjects: normalizeWordPunctuation(verseObj.verseObjects ?? []),
+        // Strip outer punctuation, then de-glue any AI-introduced
+        // punctuation-spanning `\w` (the freed words fall out to unaligned).
+        verseObjects: splitGluedAlignmentWords(
+          normalizeWordPunctuation(verseObj.verseObjects ?? []),
+        ),
       };
       out.push({
         chapter: chNum,

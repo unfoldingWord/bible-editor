@@ -1,26 +1,34 @@
-// One-time cleanup: strip leading/trailing punctuation off `\w` tokens in
-// existing verses.content_json rows. Pre-existing imports were written
-// with raw source-USFM contents — when the upstream ULT/UST author put
-// quotes / question marks INSIDE the `\w` markers (e.g. `\w "What\w*`),
-// the aligner shows those characters as part of draggable chips. Going
-// forward, importParsers.ts normalizes on the way in (see PR for context);
-// this script applies the same transform to data already in D1.
+// One-time cleanup for existing verses.content_json rows. Applies the SAME two
+// transforms importParsers.ts runs on import (imported below, not
+// re-implemented):
+//   1. normalizeWordPunctuation — strip leading/trailing punctuation off `\w`
+//      tokens (e.g. `\w "What\w*` → `"` + `\w What\w*`).
+//   2. splitGluedAlignmentWords — de-glue AI-introduced punctuation-spanning
+//      `\w` tokens (e.g. `\w out”—the\w*`), lifting the freed words out of
+//      their `\zaln-s` so they fall to unaligned for human review.
+// Pre-existing imports were written before these guards landed; this heals the
+// data already in D1.
 //
-// Usage:
+// Usage (run from repo root; --experimental-strip-types lets this .mjs import
+// the .ts transforms directly, same as the *.test.mjs runners):
 //   cd api && npx wrangler d1 execute bible_editor --local \
 //     --command="SELECT book, chapter, verse, bible_version, content_json FROM verses" \
 //     --json > ../scripts/out/verses-dump.json
-//   node scripts/normalize-verse-punctuation.mjs scripts/out/verses-dump.json
+//   node --experimental-strip-types --no-warnings scripts/normalize-verse-punctuation.mjs scripts/out/verses-dump.json
 //   cd api && npx wrangler d1 execute bible_editor --local \
 //     --file=../scripts/out/normalize-punctuation.sql
 //
-// Pass --remote on both wrangler calls when cleaning up production D1.
-// The version column is intentionally NOT bumped — this is a data fix,
-// not an edit, and outbox / If-Match guards key off changes by users.
+// Pass --remote (and --env production) on both wrangler calls when cleaning up
+// production D1. The version column is intentionally NOT bumped — this is a
+// data fix, not an edit, and outbox / If-Match guards key off user changes.
 
 import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+  normalizeWordPunctuation,
+  splitGluedAlignmentWords,
+} from "../api/src/importParsers.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(here, "..");
@@ -32,38 +40,6 @@ if (!inputArg) {
 }
 const dumpPath = resolve(process.cwd(), inputArg);
 
-// Mirror of `normalizeWordPunctuation` in api/src/importParsers.ts —
-// see that file for the rationale.
-const LETTER_RE = /[\p{L}\p{M}\p{N}]/u;
-function splitWordPunctuation(text) {
-  const first = text.search(LETTER_RE);
-  if (first < 0) return { leading: text, core: "", trailing: "" };
-  let last = first;
-  for (let i = text.length - 1; i >= first; i--) {
-    if (LETTER_RE.test(text[i])) { last = i; break; }
-  }
-  return { leading: text.slice(0, first), core: text.slice(first, last + 1), trailing: text.slice(last + 1) };
-}
-function normalizeNode(node) {
-  if (!node || typeof node !== "object") return [node];
-  if (node.type === "word" && node.tag === "w" && typeof node.text === "string") {
-    const s = splitWordPunctuation(node.text);
-    if (s.leading === "" && s.trailing === "") return [node];
-    const out = [];
-    if (s.leading) out.push({ type: "text", text: s.leading });
-    if (s.core) out.push({ ...node, text: s.core });
-    if (s.trailing) out.push({ type: "text", text: s.trailing });
-    return out;
-  }
-  if (Array.isArray(node.children)) {
-    return [{ ...node, children: node.children.flatMap(normalizeNode) }];
-  }
-  return [node];
-}
-function normalizeWordPunctuation(verseObjects) {
-  if (!Array.isArray(verseObjects)) return verseObjects;
-  return verseObjects.flatMap(normalizeNode);
-}
 function extractPlainText(verseObj) {
   const parts = [];
   const walk = (vos) => {
@@ -114,7 +90,7 @@ for (const row of rows) {
   }
   const before = parsedContent.verseObjects;
   if (!Array.isArray(before)) continue;
-  const after = normalizeWordPunctuation(before);
+  const after = splitGluedAlignmentWords(normalizeWordPunctuation(before));
   const beforeStr = JSON.stringify(before);
   const afterStr = JSON.stringify(after);
   if (beforeStr === afterStr) continue;
