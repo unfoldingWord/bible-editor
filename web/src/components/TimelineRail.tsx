@@ -83,6 +83,7 @@ export function TimelineRail({ book, chapter, tiles, activeVerse, showChapter = 
                   cursor: "pointer",
                   position: "relative",
                   textDecoration: t.done && !active ? "line-through" : "none",
+                  pr: t.has && !active ? "10px" : undefined,
                 }}
               >
                 {t.verse === 0 ? "i" : showChapter ? `${chapter}:${t.verse}` : t.verse}
