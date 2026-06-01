@@ -872,7 +872,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       )}
       <Box ref={splitContainerRef} sx={{ flex: 1, display: "flex", overflow: "hidden" }}>
         {!railCollapsed && (
-          <Box sx={{ width: 64, flexShrink: 0, display: "flex", flexDirection: "column" }}>
+          <Box sx={{ width: 64, flexShrink: 0, minHeight: 0, overflow: "hidden", display: "flex", flexDirection: "column" }}>
             <TimelineRail
               book={book}
               chapter={chapter}

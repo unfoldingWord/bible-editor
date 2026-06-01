@@ -23,8 +23,13 @@ export function TimelineRail({ book, chapter, tiles, activeVerse, onSelect, onTo
     <Box
       sx={{
         width: 64,
-        flexShrink: 0,
+        // flex-column child of the rail wrapper: must be able to shrink below
+        // its content height so overflowY:auto actually scrolls. flexShrink:0
+        // here pinned it to full content height, which both broke scrolling and
+        // overflowed the wrapper into the split container (scrolling the fixed
+        // headers off-screen via scrollIntoView).
         flexGrow: 1,
+        minHeight: 0,
         bgcolor: "grey.50",
         borderRight: "1px solid",
         borderColor: "divider",
