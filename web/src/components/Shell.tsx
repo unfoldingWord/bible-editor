@@ -878,6 +878,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
               chapter={chapter}
               tiles={tileSet}
               activeVerse={activeVerse}
+              showChapter={mode === "book"}
               onSelect={requestSelectVerse}
               onToggleDone={(v, done) => {
                 // Through the outbox so an offline toggle isn't dropped. The
