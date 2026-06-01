@@ -1,0 +1,7 @@
+{
+  "_comment": "Pinned canonical sources for alignment-memory training (scripts/train-aligner.mjs). To freeze to a published release, set 'ref' to a tag path like 'tag/v85'; 'branch/master' tracks the latest published master. Re-run the trainer and apply scripts/out/align-freq.sql whenever a new version publishes — that is the only time the model changes.",
+  "resources": [
+    { "bible": "ult", "repo": "unfoldingWord/en_ult", "ref": "tag/v88" },
+    { "bible": "ust", "repo": "unfoldingWord/en_ust", "ref": "tag/v88" }
+  ]
+}

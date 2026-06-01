@@ -19,6 +19,9 @@
     "typecheck:web": "npm --workspace web run typecheck",
     "deploy": "npm-run-all build:web deploy:api",
     "deploy:api": "npm --workspace api run deploy",
+    "train:align": "node scripts/train-aligner.mjs",
+    "db:align:local": "node scripts/apply-align-freq.mjs",
+    "db:align:remote": "node scripts/apply-align-freq.mjs --remote",
     "test:e2e": "playwright test",
     "test:e2e:ui": "playwright test --ui"
   },

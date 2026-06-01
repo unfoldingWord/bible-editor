@@ -36,6 +36,7 @@ import {
 } from "../lib/alignment";
 import type { TwlRow, VerseDto } from "../sync/api";
 import { useLexicon, type LexiconEntry } from "../hooks/useLexicon";
+import { useAlignmentSuggestions, type AlignSuggestion } from "../hooks/useAlignmentSuggestions";
 import { nfc } from "../lib/hebrew";
 import { SourceTooltipBody } from "./SourceTooltipBody";
 
@@ -453,6 +454,42 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
     }, [state, sourceVerse]);
     const lexiconMap = useLexicon(allStrongs);
 
+    // Non-AI alignment suggestions over the canonical corpus (see hook). The
+    // source-strong set is stable across alignment edits within a verse, so
+    // this fetches once per verse; ghostByGroup is recomputed locally as words
+    // get aligned. Ghosts only appear on still-empty groups.
+    const suggestions = useAlignmentSuggestions(bibleVersion, allStrongs);
+    // Document-order word tokens with their aligned state — phrase ghosts need
+    // adjacency, so this is the basis for the contiguous-run match.
+    const streamWords = useMemo<StreamWord[]>(
+      () =>
+        state
+          ? state.stream.flatMap((it) =>
+              it.kind === "word"
+                ? [{ id: it.word.id, text: it.word.text, aligned: it.alignedTo !== null }]
+                : [],
+            )
+          : [],
+      [state],
+    );
+    const ghostByGroup = useMemo(
+      () => computeGhosts(displayGroups, streamWords, suggestions),
+      [displayGroups, streamWords, suggestions],
+    );
+    const handleAcceptGhost = (groupId: string, wordIds: string[]) => {
+      handleTargetsDrop(`g:${groupId}`, wordIds);
+    };
+    const handleAcceptAllGhosts = () => {
+      if (!state || ghostByGroup.size === 0) return;
+      let next = state;
+      for (const gh of ghostByGroup.values()) {
+        next = moveTargets(next, gh.wordIds, `g:${gh.groupId}`);
+      }
+      setState(next);
+      setSelectedUnaligned(new Set());
+      setSelectionAnchor(null);
+    };
+
     const handleReset = useCallback(() => {
       setState(initial);
       setSelectedUnaligned(new Set());
@@ -545,6 +582,8 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
             >
               <AlignmentCards
                 groups={displayGroups}
+                ghostByGroup={ghostByGroup}
+                onAcceptGhost={handleAcceptGhost}
                 twlForVerse={twlForVerse}
                 lexiconMap={lexiconMap}
                 verseNum={verseNum}
@@ -557,6 +596,8 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
             </Box>
             <ActionBar
               dirty={dirty}
+              ghostCount={ghostByGroup.size}
+              onAcceptAll={handleAcceptAllGhosts}
               onClear={handleClearAll}
               onReset={handleReset}
               onCancel={() => {
@@ -931,6 +972,8 @@ function SectionHeader({ count }: { count: number }) {
 // ─── Action bar ────────────────────────────────────────────────────────
 function ActionBar({
   dirty,
+  ghostCount,
+  onAcceptAll,
   onClear,
   onReset,
   onCancel,
@@ -938,6 +981,8 @@ function ActionBar({
   bibleVersion,
 }: {
   dirty: boolean;
+  ghostCount: number;
+  onAcceptAll: () => void;
   onClear: () => void;
   onReset: () => void;
   onCancel: () => void;
@@ -965,6 +1010,23 @@ function ActionBar({
         editing {bibleVersion}
       </Typography>
       <Box sx={{ flex: 1 }} />
+      {ghostCount > 0 && (
+        <Button
+          size="small"
+          variant="outlined"
+          onClick={onAcceptAll}
+          sx={{
+            textTransform: "none",
+            fontSize: 11,
+            mr: 0.5,
+            borderStyle: "dashed",
+            color: "primary.main",
+            borderColor: "primary.main",
+          }}
+        >
+          ✓ accept {ghostCount} suggestion{ghostCount > 1 ? "s" : ""}
+        </Button>
+      )}
       <Button
         size="small"
         onClick={onClear}
@@ -1027,6 +1089,8 @@ function ActionBar({
 // ─── Cards grid (restyled) ─────────────────────────────────────────────
 function AlignmentCards({
   groups,
+  ghostByGroup,
+  onAcceptGhost,
   twlForVerse,
   lexiconMap,
   verseNum,
@@ -1037,6 +1101,8 @@ function AlignmentCards({
   hctx,
 }: {
   groups: AlignmentGroup[];
+  ghostByGroup: Map<string, Ghost>;
+  onAcceptGhost: (groupId: string, wordIds: string[]) => void;
   twlForVerse: TwlRow[];
   lexiconMap: Map<string, LexiconEntry | null>;
   verseNum: number;
@@ -1060,7 +1126,9 @@ function AlignmentCards({
         pt: 0.5,
       }}
     >
-      {groups.map((g) => (
+      {groups.map((g) => {
+        const ghost = ghostByGroup.get(g.id);
+        return (
         <DropTargetCard
           key={g.id}
           groupId={g.id}
@@ -1116,22 +1184,29 @@ function AlignmentCards({
           )}
           <Stack direction="row" spacing={0.5} flexWrap="wrap" rowGap={0.5} sx={{ direction: "ltr" }}>
             {g.targets.length === 0 ? (
-              <Box
-                sx={{
-                  width: "100%",
-                  border: "1px dashed",
-                  borderColor: "divider",
-                  borderRadius: 1,
-                  py: 0.5,
-                  px: 1,
-                  fontSize: 11.5,
-                  color: "text.disabled",
-                  fontStyle: "italic",
-                  textAlign: "center",
-                }}
-              >
-                drop English here
-              </Box>
+              ghost ? (
+                <GhostChip
+                  ghost={ghost}
+                  onAccept={() => onAcceptGhost(ghost.groupId, ghost.wordIds)}
+                />
+              ) : (
+                <Box
+                  sx={{
+                    width: "100%",
+                    border: "1px dashed",
+                    borderColor: "divider",
+                    borderRadius: 1,
+                    py: 0.5,
+                    px: 1,
+                    fontSize: 11.5,
+                    color: "text.disabled",
+                    fontStyle: "italic",
+                    textAlign: "center",
+                  }}
+                >
+                  drop English here
+                </Box>
+              )
             ) : (
               g.targets.map((t) => (
                 <SimpleDraggableChip
@@ -1148,7 +1223,8 @@ function AlignmentCards({
             )}
           </Stack>
         </DropTargetCard>
-      ))}
+        );
+      })}
     </Box>
   );
 }
@@ -1619,6 +1695,192 @@ function ToolbarToggle({
         </Box>
         {label}
       </Box>
+    </Tooltip>
+  );
+}
+
+// ─── Ghost (suggested alignment) chips ─────────────────────────────────
+// A non-AI suggestion: the backend ranks likely target words per source
+// Strong's (wordMAP alignment memory over canonical ULT/UST, lexicon gloss
+// fallback); here we match those candidates against the verse's still-unaligned
+// word bank and surface the best one as a faded, dashed, click-to-accept chip
+// inside an empty group. Ignoring a ghost costs nothing — there's no reject.
+export interface Ghost {
+  groupId: string;
+  wordIds: string[]; // one word, or several for a phrase ("the earth")
+  text: string; // display label — the matched words, original case
+  confidence: number;
+  source: "memory" | "lexicon";
+}
+
+// Light stemmer so "besprinkled" ↔ "sprinkle"-ish and plural/tense variants
+// still match. The memory path mostly matches exactly (same translation), so
+// this only rescues inflection and the lexicon-gloss fallback.
+function stemWord(w: string): string {
+  let s = w.toLowerCase().normalize("NFC").replace(/^[^\p{L}]+|[^\p{L}]+$/gu, "");
+  s = s.replace(/'s$/, "");
+  for (const suf of ["ing", "edly", "ed", "es", "ly", "s"]) {
+    if (s.length > suf.length + 2 && s.endsWith(suf)) return s.slice(0, -suf.length);
+  }
+  return s;
+}
+function surfaceMatch(candidate: string, word: string): boolean {
+  const a = candidate.toLowerCase().normalize("NFC");
+  const b = word.toLowerCase().normalize("NFC");
+  if (a === b) return true;
+  const sa = stemWord(a);
+  return sa.length >= 3 && sa === stemWord(b);
+}
+
+function ghostPipColor(c: number): string {
+  if (c >= 0.6) return "#4caf50"; // confident
+  if (c >= 0.35) return "#E59D33"; // plausible (brand Kindle)
+  return "#9e9e9e"; // weak
+}
+
+type StreamWord = { id: string; text: string; aligned: boolean };
+
+// Find the first run of CONSECUTIVE unaligned word tokens matching `tokens` in
+// order — so a phrase like "the earth" only matches when those words are
+// adjacent in the verse (not just both present somewhere). Returns the matched
+// words (or null). Text/markup nodes aren't in streamWords, so a normal space
+// between words still counts as adjacent.
+function findContiguousUnaligned(
+  streamWords: StreamWord[],
+  tokens: string[],
+): StreamWord[] | null {
+  if (tokens.length === 0) return null;
+  for (let i = 0; i + tokens.length <= streamWords.length; i++) {
+    let ok = true;
+    for (let j = 0; j < tokens.length; j++) {
+      const w = streamWords[i + j];
+      if (w.aligned || !surfaceMatch(tokens[j], w.text)) {
+        ok = false;
+        break;
+      }
+    }
+    if (ok) return streamWords.slice(i, i + tokens.length);
+  }
+  return null;
+}
+
+// Build ghosts for empty groups. Phrases win when their tokens match a
+// contiguous unaligned run ("the earth" stays together); otherwise the best
+// single matching word. Greedy by confidence so no unaligned word is claimed
+// by two groups, and phrases are placed before single words so a phrase keeps
+// its own "the" rather than losing it to a bare-article suggestion elsewhere.
+function computeGhosts(
+  groups: AlignmentGroup[],
+  streamWords: StreamWord[],
+  suggestions: Record<string, AlignSuggestion>,
+): Map<string, Ghost> {
+  const result = new Map<string, Ghost>();
+  const claimed = new Set<string>();
+  if (streamWords.length === 0) return result;
+  const emptyGroups = groups.filter((g) => g.targets.length === 0);
+
+  // Pass 1 — phrases (highest-count phrase with a contiguous unaligned run).
+  const phraseProps: Ghost[] = [];
+  for (const g of emptyGroups) {
+    const phrases = g.source
+      .flatMap((s) => suggestions[s.strong]?.phrases ?? [])
+      .sort((a, b) => b.count - a.count);
+    for (const p of phrases) {
+      const run = findContiguousUnaligned(streamWords, p.tokens);
+      if (run) {
+        phraseProps.push({
+          groupId: g.id,
+          wordIds: run.map((w) => w.id),
+          text: run.map((w) => w.text).join(" "),
+          confidence: p.confidence,
+          source: "memory",
+        });
+        break; // phrases sorted by count desc — first contiguous match is best
+      }
+    }
+  }
+  phraseProps.sort((a, b) => b.confidence - a.confidence);
+  for (const p of phraseProps) {
+    if (result.has(p.groupId) || p.wordIds.some((id) => claimed.has(id))) continue;
+    p.wordIds.forEach((id) => claimed.add(id));
+    result.set(p.groupId, p);
+  }
+
+  // Pass 2 — single-word fallback for groups still without a ghost.
+  const wordProps: Ghost[] = [];
+  for (const g of emptyGroups) {
+    if (result.has(g.id)) continue;
+    const words = g.source
+      .flatMap((s) => suggestions[s.strong]?.words ?? [])
+      .sort((a, b) => b.confidence - a.confidence);
+    let best: Ghost | null = null;
+    for (const cand of words) {
+      for (const w of streamWords) {
+        if (w.aligned || claimed.has(w.id)) continue;
+        if (!surfaceMatch(cand.surface, w.text)) continue;
+        if (!best || cand.confidence > best.confidence) {
+          best = {
+            groupId: g.id,
+            wordIds: [w.id],
+            text: w.text,
+            confidence: cand.confidence,
+            source: cand.source,
+          };
+        }
+      }
+    }
+    if (best) wordProps.push(best);
+  }
+  wordProps.sort((a, b) => b.confidence - a.confidence);
+  for (const p of wordProps) {
+    if (result.has(p.groupId) || claimed.has(p.wordIds[0])) continue;
+    claimed.add(p.wordIds[0]);
+    result.set(p.groupId, p);
+  }
+  return result;
+}
+
+function GhostChip({ ghost, onAccept }: { ghost: Ghost; onAccept: () => void }) {
+  const pct = Math.round(ghost.confidence * 100);
+  const srcLabel = ghost.source === "memory" ? "wordMAP" : "lexicon";
+  return (
+    <Tooltip title={`suggested · ${srcLabel} · ${pct}% — click to accept`}>
+      <Chip
+        size="small"
+        variant="outlined"
+        clickable
+        onClick={onAccept}
+        label={
+          <Box component="span" sx={{ display: "inline-flex", alignItems: "center", gap: 0.5 }}>
+            <Box
+              component="span"
+              sx={{
+                width: 7,
+                height: 7,
+                borderRadius: "50%",
+                bgcolor: ghostPipColor(ghost.confidence),
+                flexShrink: 0,
+              }}
+            />
+            <Box component="span" sx={{ fontStyle: "italic" }}>
+              {ghost.text}
+            </Box>
+          </Box>
+        }
+        sx={{
+          height: 26,
+          borderRadius: 0.75,
+          borderStyle: "dashed",
+          borderColor: "primary.main",
+          color: "text.secondary",
+          bgcolor: "transparent",
+          opacity: 0.72,
+          cursor: "pointer",
+          transition: "opacity 0.12s, background-color 0.12s",
+          "&:hover": { opacity: 1, bgcolor: "primary.50" },
+          "& .MuiChip-label": { px: 1 },
+        }}
+      />
     </Tooltip>
   );
 }
