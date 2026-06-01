@@ -14,11 +14,14 @@ interface Props {
   chapter: number;
   tiles: VerseTile[];
   activeVerse: number;
+  // In book mode the rail covers one chapter inside a whole-book scroll, so
+  // label tiles with chapter:verse (e.g. "2:3") instead of a bare verse number.
+  showChapter?: boolean;
   onSelect: (verse: number) => void;
   onToggleDone: (verse: number, done: boolean) => void;
 }
 
-export function TimelineRail({ book, chapter, tiles, activeVerse, onSelect, onToggleDone }: Props) {
+export function TimelineRail({ book, chapter, tiles, activeVerse, showChapter = false, onSelect, onToggleDone }: Props) {
   return (
     <Box
       sx={{
@@ -72,16 +75,17 @@ export function TimelineRail({ book, chapter, tiles, activeVerse, onSelect, onTo
                 sx={{
                   flex: 1,
                   fontFamily: "monospace",
-                  fontSize: 11,
+                  fontSize: showChapter ? 10 : 11,
                   fontWeight: active ? 700 : 400,
                   textAlign: "center",
+                  whiteSpace: "nowrap",
                   py: 0.5,
                   cursor: "pointer",
                   position: "relative",
                   textDecoration: t.done && !active ? "line-through" : "none",
                 }}
               >
-                {t.verse === 0 ? "i" : t.verse}
+                {t.verse === 0 ? "i" : showChapter ? `${chapter}:${t.verse}` : t.verse}
                 {t.has && !active && (
                   <Box
                     aria-label="unaligned words remain"
