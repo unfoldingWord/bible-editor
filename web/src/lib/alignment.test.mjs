@@ -1046,6 +1046,40 @@ function roundtripVerseUsfm(rawUsfm, sourceVO = null) {
   }
 }
 
+// ─── Case 16: malformed occurrence (occurrence > occurrences) on a split gloss ──
+// An AI/tC aligner emits the 2nd span of a non-contiguous split gloss as
+// occurrence="2" while occurrences stays "1" — impossible ("2 of 1"). Real
+// example: ZEC 5:5 וַיֵּצֵא → "And" … "went out". The bad value must not stop
+// the two spans from merging into one group, and a save must heal it.
+{
+  console.log("\n[Case 16] malformed occurrence (occurrence > occurrences) on a split gloss");
+  const target = String.raw`\id ZEC
+\c 5
+\v 5 \zaln-s |x-strong="c:H3318" x-lemma="יָצָא" x-morph="He,C:Vqw3ms" x-occurrence="1" x-occurrences="1" x-content="וַ⁠יֵּצֵא"\*\w And|x-occurrence="1" x-occurrences="1"\w*\zaln-e\* \zaln-s |x-strong="d:H4397" x-occurrence="1" x-occurrences="1" x-content="הַ⁠מַּלְאָךְ"\*\w the|x-occurrence="1" x-occurrences="1"\w*\w angel|x-occurrence="1" x-occurrences="1"\w*\zaln-e\* \zaln-s |x-strong="c:H3318" x-lemma="יָצָא" x-morph="He,C:Vqw3ms" x-occurrence="2" x-occurrences="1" x-content="וַ⁠יֵּצֵא"\*\w went|x-occurrence="1" x-occurrences="1"\w*\w out|x-occurrence="1" x-occurrences="1"\w*\zaln-e\*`;
+  const { verseObjects } = parseSingleVerse(target);
+  const state = parseAlignment(verseObjects, null);
+
+  const verb = state.groups.filter((g) => g.source.some((s) => s.strong === "c:H3318"));
+  assert(verb.length === 1, `the two split spans of c:H3318 merge into ONE group (got ${verb.length})`);
+  assert(state.groups.length === 2, `verse has 2 alignment groups, not 3 (got ${state.groups.length})`);
+  if (verb.length === 1) {
+    const targets = verb[0].targets.map((t) => t.text);
+    assert(
+      JSON.stringify(targets) === JSON.stringify(["And", "went", "out"]),
+      `merged group holds all three target words in stream order (got ${JSON.stringify(targets)})`,
+    );
+  }
+
+  // Save heals the malformed value: serialize re-splits the non-contiguous
+  // targets into two \zaln-s runs, both inheriting the surviving occurrence="1".
+  const rt = roundtripVerseUsfm(target);
+  assert(!/x-occurrence="2"/.test(rt), `round-trip drops the impossible occurrence="2"`);
+  assert(
+    (rt.match(/x-strong="c:H3318"/g) || []).length === 2,
+    "round-trip still emits two c:H3318 \\zaln-s runs (non-contiguous gloss preserved)",
+  );
+}
+
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed.`);
   process.exit(1);

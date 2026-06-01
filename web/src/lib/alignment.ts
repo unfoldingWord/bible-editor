@@ -186,6 +186,19 @@ function uid(): string {
     : `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
+// `x-occurrence` is only meaningful relative to `x-occurrences`. A milestone
+// claiming occurrence > occurrences is malformed source data: an AI/tC aligner
+// sometimes stamps the *second* span of a non-contiguous split gloss as
+// occurrence="2" while occurrences stays "1" (e.g. ZEC 5:5 וַיֵּצֵא → "And" …
+// "went out"). Clamp into [1, occurrences] so both spans resolve to the same
+// logical occurrence. This is a no-op for well-formed data (occurrence is
+// always ≤ occurrences there), so genuinely-repeated words never false-merge.
+function effectiveOccurrence(s: SourceWord): number {
+  const occ = parseInt(s.occurrence, 10) || 1;
+  const total = parseInt(s.occurrences, 10) || 1;
+  return Math.min(Math.max(occ, 1), Math.max(total, 1));
+}
+
 // Two source chains identify the same alignment group when their source
 // words match position-for-position on (strong, occurrence, content). Used
 // to merge multiple `\zaln-s` pairs that wrap the same Hebrew/Greek token
@@ -194,7 +207,7 @@ function sameSourceChain(a: SourceWord[], b: SourceWord[]): boolean {
   if (a.length !== b.length) return false;
   for (let i = 0; i < a.length; i++) {
     if (a[i].strong !== b[i].strong) return false;
-    if (a[i].occurrence !== b[i].occurrence) return false;
+    if (effectiveOccurrence(a[i]) !== effectiveOccurrence(b[i])) return false;
     if (nfc(a[i].content ?? "") !== nfc(b[i].content ?? "")) return false;
   }
   return true;
