@@ -138,7 +138,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     // commit still leaves a recoverable artifact.
     const target = RESOURCE_TARGETS[resource];
     const filename = target.path(book);
-    const r2Key = `exports/${instanceId}/${book}/${filename}`;
+    const r2Key = `exports/${instanceId}/${book}/${resource}/${filename}`;
     await this.env.BLOBS.put(r2Key, built.content, {
       httpMetadata: { contentType: filename.endsWith(".usfm") ? "text/plain" : "text/tab-separated-values" },
     });
@@ -198,7 +198,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       const rs = await db
         .prepare(
           `SELECT * FROM tq_rows WHERE book = ?1 AND deleted_at IS NULL
-           ORDER BY chapter, verse, id`,
+           ORDER BY chapter, verse, sort_order ASC NULLS LAST, id`,
         )
         .bind(book)
         .all<TqRow>();

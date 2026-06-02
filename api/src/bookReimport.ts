@@ -350,8 +350,8 @@ async function tryInsertTsvRow(
   if (kind === "tq") {
     const r = await env.DB.prepare(
       `INSERT INTO tq_rows
-         (id, book, chapter, verse, ref_raw, tags, quote, occurrence, question, response)
-       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+         (id, book, chapter, verse, ref_raw, tags, quote, occurrence, question, response, sort_order)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL)
        ON CONFLICT(id, book) DO NOTHING`,
     )
       .bind(

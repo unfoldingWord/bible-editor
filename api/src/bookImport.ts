@@ -351,8 +351,8 @@ async function insertTqRows(
 
   const insertStmt = env.DB.prepare(
     `INSERT INTO tq_rows
-       (id, book, chapter, verse, ref_raw, tags, quote, occurrence, question, response)
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)`,
+       (id, book, chapter, verse, ref_raw, tags, quote, occurrence, question, response, sort_order)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)`,
   );
   const auditStmt = env.DB.prepare(
     `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, payload_json)
@@ -389,6 +389,7 @@ async function insertTqRows(
       insertStmt.bind(
         id, book, ch, v, refRaw,
         payload.tags, payload.quote, payload.occurrence, payload.question, payload.response,
+        (count + 1) * 100,
       ),
       auditStmt.bind(id, book, userId, JSON.stringify(payload)),
     );
