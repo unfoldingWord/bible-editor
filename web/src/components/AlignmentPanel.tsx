@@ -1740,21 +1740,20 @@ function ghostPipColor(c: number): string {
 
 type StreamWord = { id: string; text: string; aligned: boolean };
 
-// Find the first run of CONSECUTIVE unaligned word tokens matching `tokens` in
-// order — so a phrase like "the earth" only matches when those words are
-// adjacent in the verse (not just both present somewhere). Returns the matched
-// words (or null). Text/markup nodes aren't in streamWords, so a normal space
-// between words still counts as adjacent.
+// Find the first run of CONSECUTIVE unaligned, still-UNCLAIMED word tokens
+// matching `tokens` in order — so "the earth" only matches adjacent words, and
+// a 2nd source instance can't reuse words a 1st instance already took.
 function findContiguousUnaligned(
   streamWords: StreamWord[],
   tokens: string[],
+  claimed: Set<string>,
 ): StreamWord[] | null {
   if (tokens.length === 0) return null;
   for (let i = 0; i + tokens.length <= streamWords.length; i++) {
     let ok = true;
     for (let j = 0; j < tokens.length; j++) {
       const w = streamWords[i + j];
-      if (w.aligned || !surfaceMatch(tokens[j], w.text)) {
+      if (w.aligned || claimed.has(w.id) || !surfaceMatch(tokens[j], w.text)) {
         ok = false;
         break;
       }
@@ -1764,11 +1763,12 @@ function findContiguousUnaligned(
   return null;
 }
 
-// Build ghosts for empty groups. Phrases win when their tokens match a
-// contiguous unaligned run ("the earth" stays together); otherwise the best
-// single matching word. Greedy by confidence so no unaligned word is claimed
-// by two groups, and phrases are placed before single words so a phrase keeps
-// its own "the" rather than losing it to a bare-article suggestion elsewhere.
+// Build ghosts for empty groups, processed in source order so repeated words
+// distribute across their occurrences instead of all landing on the first.
+// Each group greedily claims its best STILL-UNCLAIMED option — phrases first
+// (so "the earth" stays whole), then a single word — and marks those words
+// claimed immediately, so the next group (incl. a repeat of the same Strong's,
+// e.g. a 2nd כל) skips them and falls through to the next phrase/word/instance.
 function computeGhosts(
   groups: AlignmentGroup[],
   streamWords: StreamWord[],
@@ -1779,63 +1779,51 @@ function computeGhosts(
   if (streamWords.length === 0) return result;
   const emptyGroups = groups.filter((g) => g.targets.length === 0);
 
-  // Pass 1 — phrases (highest-count phrase with a contiguous unaligned run).
-  const phraseProps: Ghost[] = [];
+  // Pass 1 — phrases. Each group takes its best phrase whose tokens form a
+  // contiguous run of still-unclaimed words, claiming immediately.
   for (const g of emptyGroups) {
     const phrases = g.source
       .flatMap((s) => suggestions[s.strong]?.phrases ?? [])
       .sort((a, b) => b.count - a.count);
     for (const p of phrases) {
-      const run = findContiguousUnaligned(streamWords, p.tokens);
+      const run = findContiguousUnaligned(streamWords, p.tokens, claimed);
       if (run) {
-        phraseProps.push({
+        run.forEach((w) => claimed.add(w.id));
+        result.set(g.id, {
           groupId: g.id,
           wordIds: run.map((w) => w.id),
           text: run.map((w) => w.text).join(" "),
           confidence: p.confidence,
           source: "memory",
         });
-        break; // phrases sorted by count desc — first contiguous match is best
+        break;
       }
     }
   }
-  phraseProps.sort((a, b) => b.confidence - a.confidence);
-  for (const p of phraseProps) {
-    if (result.has(p.groupId) || p.wordIds.some((id) => claimed.has(id))) continue;
-    p.wordIds.forEach((id) => claimed.add(id));
-    result.set(p.groupId, p);
-  }
 
-  // Pass 2 — single-word fallback for groups still without a ghost.
-  const wordProps: Ghost[] = [];
+  // Pass 2 — single-word fallback for still-empty groups: the first matching
+  // unclaimed word in document order.
   for (const g of emptyGroups) {
     if (result.has(g.id)) continue;
     const words = g.source
       .flatMap((s) => suggestions[s.strong]?.words ?? [])
       .sort((a, b) => b.confidence - a.confidence);
-    let best: Ghost | null = null;
     for (const cand of words) {
-      for (const w of streamWords) {
-        if (w.aligned || claimed.has(w.id)) continue;
-        if (!surfaceMatch(cand.surface, w.text)) continue;
-        if (!best || cand.confidence > best.confidence) {
-          best = {
-            groupId: g.id,
-            wordIds: [w.id],
-            text: w.text,
-            confidence: cand.confidence,
-            source: cand.source,
-          };
-        }
+      const w = streamWords.find(
+        (sw) => !sw.aligned && !claimed.has(sw.id) && surfaceMatch(cand.surface, sw.text),
+      );
+      if (w) {
+        claimed.add(w.id);
+        result.set(g.id, {
+          groupId: g.id,
+          wordIds: [w.id],
+          text: w.text,
+          confidence: cand.confidence,
+          source: cand.source,
+        });
+        break;
       }
     }
-    if (best) wordProps.push(best);
-  }
-  wordProps.sort((a, b) => b.confidence - a.confidence);
-  for (const p of wordProps) {
-    if (result.has(p.groupId) || claimed.has(p.wordIds[0])) continue;
-    claimed.add(p.wordIds[0]);
-    result.set(p.groupId, p);
   }
   return result;
 }
