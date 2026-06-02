@@ -37,3 +37,15 @@ api/         Cloudflare Workers backend (Wrangler project)
 web/         React + Vite frontend
 docs/        plan, design bundle, screenshots
 ```
+
+## Credits
+
+This project builds on the work of several unfoldingWord open-source repositories:
+
+- **[gateway-edit](https://github.com/unfoldingWord/gateway-edit)** — harmonized book-package editor for gateway-language translation work.
+- **[tc-create-app](https://github.com/unfoldingWord/tc-create-app)** — web-based editor for translation notes, questions, and word links.
+- **[translationCore](https://github.com/unfoldingWord/translationCore)** — desktop application for checking Bible translations against checking resources.
+
+## License
+
+[MIT](LICENSE) © 2026 unfoldingWord
