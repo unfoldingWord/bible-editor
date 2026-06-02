@@ -57,7 +57,7 @@ chapters.get("/:book/:chapter", async (c) => {
          ) AS latest_source
             FROM tq_rows t
            WHERE t.book = ?1 AND t.chapter = ?2 AND t.deleted_at IS NULL
-           ORDER BY verse, id`,
+           ORDER BY verse, sort_order ASC NULLS LAST, id`,
       )
       .bind(book, chapter)
       .all<TqRow>(),
