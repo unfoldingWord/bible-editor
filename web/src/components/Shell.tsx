@@ -290,15 +290,34 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     else visibleRowIdsRef.current.delete(rowId);
   }, []);
 
+  // Whether ANY resource row sits on verse 0 (the intro tile). The cheap
+  // `.some` re-runs on every edit, but it yields a *stable boolean* so the
+  // expensive tileSet below doesn't re-run when a row's text changes.
+  const introHasResource = useMemo(
+    () =>
+      !!data &&
+      (data.tn.some((r) => r.verse === 0) ||
+        data.tq.some((r) => r.verse === 0) ||
+        data.twl.some((r) => r.verse === 0)),
+    [data],
+  );
+
+  // tileSet runs verseHasUnalignedWork (a full alignment parse) for EVERY
+  // verse, so it must not recompute when only a TN/TQ/TWL row changed. Keying
+  // it on the verse map + statuses + the intro flag means a note keystroke or
+  // save — which leaves data.verses untouched — skips the rescan entirely (and
+  // keeps verseNumbers referentially stable, so ScriptureColumn can memo-skip).
+  const versesForTiles = data?.verses;
+  const verseStatusesForTiles = data?.verseStatuses;
   const tileSet = useMemo(() => {
-    if (!data) return [] as Array<{ verse: number; has: boolean; done?: boolean }>;
+    if (!versesForTiles) return [] as Array<{ verse: number; has: boolean; done?: boolean }>;
     const versesWithSomething = new Set<number>();
-    Object.values(data.verses).forEach((byVerse) => {
+    Object.values(versesForTiles).forEach((byVerse) => {
       Object.keys(byVerse).forEach((v) => versesWithSomething.add(parseInt(v, 10)));
     });
-    const sourceByVerse = data.verses.UHB ?? data.verses.UGNT ?? {};
-    const ult = data.verses.ULT ?? {};
-    const ust = data.verses.UST ?? {};
+    const sourceByVerse = versesForTiles.UHB ?? versesForTiles.UGNT ?? {};
+    const ult = versesForTiles.ULT ?? {};
+    const ust = versesForTiles.UST ?? {};
     const getVO = (dto: VerseDto | undefined) => {
       const vo = (dto?.content as { verseObjects?: unknown[] } | null)?.verseObjects;
       return Array.isArray(vo) ? vo : null;
@@ -312,19 +331,18 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       if (ustVO && verseHasUnalignedWork(ustVO, sourceVO)) return true;
       return false;
     };
-    const introHasResource = [...data.tn, ...data.tq, ...data.twl].some((r) => r.verse === 0);
     // Chapter-front USFM content (Psalm \d superscriptions, leading \p before \v 1)
     // is stored as verse 0 in the verses table. Surface the intro tile when any of
     // those exist even if no TN/TQ/TWL row is attached to verse 0.
     const introHasScripture = versesWithSomething.has(0);
     const doneMap = new Map<number, boolean>();
-    for (const s of data.verseStatuses ?? []) doneMap.set(s.verse, !!s.done);
+    for (const s of verseStatusesForTiles ?? []) doneMap.set(s.verse, !!s.done);
     const tiles: Array<{ verse: number; has: boolean; done?: boolean }> = [];
     if (introHasResource || introHasScripture) tiles.push({ verse: 0, has: false, done: doneMap.get(0) });
     const verseNums = [...versesWithSomething].filter((v) => v > 0).sort((a, b) => a - b);
     for (const v of verseNums) tiles.push({ verse: v, has: hasUnalignedFor(v), done: doneMap.get(v) });
     return tiles;
-  }, [data]);
+  }, [versesForTiles, verseStatusesForTiles, introHasResource]);
 
   const verseNumbers = useMemo(
     () => tileSet.map((t) => t.verse),
@@ -332,8 +350,8 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   );
 
   const availableVersions = useMemo(
-    () => (data ? Object.keys(data.verses) : []),
-    [data],
+    () => (versesForTiles ? Object.keys(versesForTiles) : []),
+    [versesForTiles],
   );
 
   // The widest range row across all versions that covers activeVerse. Used to
@@ -341,10 +359,10 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // verse, the user sees notes for verses 6-9, not just the navigated one.
   // For singletons (the common case) this reduces to [activeVerse, activeVerse].
   const displayVerseRange = useMemo<readonly [number, number]>(() => {
-    if (!data || activeVerse === 0) return [activeVerse, activeVerse] as const;
+    if (!versesForTiles || activeVerse === 0) return [activeVerse, activeVerse] as const;
     let start = activeVerse;
     let end = activeVerse;
-    for (const byVerse of Object.values(data.verses)) {
+    for (const byVerse of Object.values(versesForTiles)) {
       for (const k of Object.keys(byVerse)) {
         const dto = byVerse[Number(k)];
         if (!dto) continue;
@@ -356,16 +374,34 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       }
     }
     return [start, end] as const;
-  }, [data, activeVerse]);
+  }, [versesForTiles, activeVerse]);
 
   const visibleVersions = useMemo(
     () => enabledVersions.filter((v) => availableVersions.includes(v)),
     [enabledVersions, availableVersions],
   );
 
-  const colsVisible = (visibleVersions.length > 0 ? visibleVersions : availableVersions.slice(0, 1)).length;
+  // The version set actually shown (falls back to the first available when the
+  // user has none enabled). Memoized so its identity is stable across row
+  // edits — it's the `enabledVersions` prop ScriptureColumn's memo compares.
+  const displayedVersions = useMemo(
+    () => (visibleVersions.length > 0 ? visibleVersions : availableVersions.slice(0, 1)),
+    [visibleVersions, availableVersions],
+  );
+
+  const colsVisible = displayedVersions.length;
   const autoSplit = mode === "columns" ? Math.min(0.75, 0.55 + (colsVisible - 1) * 0.05) : 0.5;
   const effectiveSplit = splitRatio ?? autoSplit;
+
+  // Book-mode chapter list, memoized so ScriptureColumn isn't handed a fresh
+  // array on every render (stacked / columns pass undefined — already stable).
+  const bookChapterList = useMemo(
+    () =>
+      bookHook && mode === "book"
+        ? (bookHook.summary?.chapters ?? []).map((c) => c.chapter)
+        : undefined,
+    [bookHook, mode, bookHook?.summary],
+  );
   useEffect(() => { setSplitRatio(null); }, [colsVisible, mode]);
   useEffect(() => () => { document.body.style.cursor = ""; document.body.style.userSelect = ""; }, []);
   const handleDividerMouseDown = useCallback((e: React.MouseEvent) => {
@@ -414,7 +450,17 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     }
     return [...set];
   }, [data?.verses, bookHook?.chapters]);
-  const lexiconMap = useLexicon(uhbStrongs);
+  const lexiconMapRaw = useLexicon(uhbStrongs);
+  // useLexicon hands back a fresh Map every render; stabilize its identity so
+  // ScriptureColumn's memo can compare it. The map's CONTENT only changes when
+  // a Strong's entry resolves, which bumps lexiconLoadedCount and rebases it.
+  const lexiconLoadedCount = useMemo(() => {
+    let c = 0;
+    for (const v of lexiconMapRaw.values()) if (v) c++;
+    return c;
+  }, [lexiconMapRaw]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const lexiconMap = useMemo(() => lexiconMapRaw, [uhbStrongs, lexiconLoadedCount]);
 
   // When a tn note OR a twl word row is "active", treat its quote as the
   // highlight source. Notes and words are mutually exclusive; clicking one
@@ -939,13 +985,9 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           activeNoteQuote={activeQuote}
           activeNoteOccurrence={activeOccurrence}
           mode={mode}
-          enabledVersions={visibleVersions.length > 0 ? visibleVersions : availableVersions.slice(0, 1)}
+          enabledVersions={displayedVersions}
           availableVersions={availableVersions}
-          bookChapterList={
-            bookHook && mode === "book"
-              ? (bookHook.summary?.chapters ?? []).map((c) => c.chapter)
-              : undefined
-          }
+          bookChapterList={bookChapterList}
           bookChapters={bookHook && mode === "book" ? bookHook.chapters : undefined}
           onLoadBookChapter={bookHook ? bookHook.loadChapter : undefined}
           onSelectBookVerse={(ch, v) => {

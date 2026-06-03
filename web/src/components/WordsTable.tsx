@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
 import { Alert, Box, InputAdornment, Paper, Snackbar, Stack, TextField, IconButton, Typography, Tooltip } from "@mui/material";
 import DeleteOutlineIcon from "@mui/icons-material/DeleteOutline";
 import DragIndicatorIcon from "@mui/icons-material/DragIndicator";
@@ -47,7 +47,7 @@ interface Props {
   onTranslateQuote?: (row: TwlRow, english: string) => string | null;
 }
 
-export function WordsTable({ rows, activeId, onSave, onDelete, onFocus, onReorder, locked = false, onTranslateQuote }: Props) {
+function WordsTableInner({ rows, activeId, onSave, onDelete, onFocus, onReorder, locked = false, onTranslateQuote }: Props) {
   const [dragId, setDragId] = useState<string | null>(null);
   const [dragOver, setDragOver] = useState<
     { targetId: string; position: WordDropPosition } | null
@@ -138,6 +138,15 @@ export function WordsTable({ rows, activeId, onSave, onDelete, onFocus, onReorde
   );
 }
 
+// Memoized: a change elsewhere in the resource column (e.g. editing a note)
+// leaves `rows`/`activeId` referentially stable — twlForVerse is a useMemo in
+// ResourceColumn — so the whole words table skips re-render. Callback props are
+// recreated each parent render but are intentionally ignored.
+export const WordsTable = memo(
+  WordsTableInner,
+  (a, b) => a.rows === b.rows && a.activeId === b.activeId && a.locked === b.locked,
+);
+
 function RowDropIndicator() {
   return (
     <Box
@@ -152,7 +161,7 @@ function RowDropIndicator() {
   );
 }
 
-function WordRow({
+const WordRow = memo(function WordRow({
   row,
   active,
   dragging,
@@ -401,7 +410,10 @@ function WordRow({
       </Snackbar>
     </Stack>
   );
-}
+}, (a, b) =>
+  // Skip sibling word rows when the table re-renders (selection / add / delete).
+  // row is referentially stable unless THIS word changed; callbacks ignored.
+  a.row === b.row && a.active === b.active && a.dragging === b.dragging && a.isDropTarget === b.isDropTarget);
 
 function twShort(link: string | null): string {
   if (!link) return "—";

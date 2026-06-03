@@ -1,4 +1,4 @@
-import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Box, Stack, Typography, Paper, IconButton, Tooltip, ToggleButton, ToggleButtonGroup, Button } from "@mui/material";
 import LinkIcon from "@mui/icons-material/Link";
 import ViewColumnIcon from "@mui/icons-material/ViewColumn";
@@ -122,6 +122,10 @@ const VERSION_LABEL: Record<string, string> = {
 
 const READ_ONLY_VERSIONS = new Set(["UHB", "UGNT"]);
 
+// Stable empty column so a missing version (`indexByVersion["ULT"] ?? …`)
+// doesn't hand InactiveVerseRow a fresh `{}` each render and defeat its memo.
+const EMPTY_COLUMN: Record<number, VerseDto> = {};
+
 const INTRO_TOOLTIP =
   "Chapter intro — chapter-level translation notes, Psalm superscriptions (\\d), and the paragraph / poetry markers that introduce verse 1.";
 
@@ -132,7 +136,7 @@ const FindReplaceOverlay = lazy(() =>
   import("./FindReplaceOverlay").then((m) => ({ default: m.FindReplaceOverlay })),
 );
 
-export function ScriptureColumn({
+function ScriptureColumnInner({
   book,
   chapter,
   versesByVersion,
@@ -514,6 +518,36 @@ export function ScriptureColumn({
   );
 }
 
+// Skip re-rendering the scripture column when only resource rows (TN/TQ/TWL)
+// changed. After the Shell-side memo work (stable verseNumbers / version lists
+// / lexiconMap), every value prop below is referentially stable across row
+// edits, so this comparator returns true and the verse list + highlight
+// subtree is left intact. Callback props are treated as stable — they close
+// over Shell state that doesn't change what's rendered here while the compared
+// inputs hold. versesByVersion / bookChapters change (new ref) on any real
+// verse-content edit, so genuine scripture changes still re-render.
+function areScriptureColumnPropsEqual(a: Props, b: Props): boolean {
+  return (
+    a.book === b.book &&
+    a.chapter === b.chapter &&
+    a.versesByVersion === b.versesByVersion &&
+    a.verseNumbers === b.verseNumbers &&
+    a.activeVerse === b.activeVerse &&
+    a.activeNoteQuote === b.activeNoteQuote &&
+    a.activeNoteOccurrence === b.activeNoteOccurrence &&
+    a.mode === b.mode &&
+    a.enabledVersions === b.enabledVersions &&
+    a.availableVersions === b.availableVersions &&
+    a.bookChapterList === b.bookChapterList &&
+    a.bookChapters === b.bookChapters &&
+    a.scrollNonce === b.scrollNonce &&
+    a.lexiconMap === b.lexiconMap &&
+    a.locked === b.locked
+  );
+}
+
+export const ScriptureColumn = memo(ScriptureColumnInner, areScriptureColumnPropsEqual);
+
 // Find the row immediately preceding `verseNum` in this version's verse
 // map. Multi-verse rows live at their verse_start in the index, so we
 // scan back looking for the first row whose end-of-range is < verseNum.
@@ -573,8 +607,8 @@ function StackedBody({
   ) => void;
   locked: boolean;
 }) {
-  const ult = indexByVersion["ULT"] ?? {};
-  const ust = indexByVersion["UST"] ?? {};
+  const ult = indexByVersion["ULT"] ?? EMPTY_COLUMN;
+  const ust = indexByVersion["UST"] ?? EMPTY_COLUMN;
   const uhb = indexByVersion["UHB"] ?? indexByVersion["UGNT"] ?? {};
   const uhbLabel = isHebrew ? "UHB" : "UGNT";
   return (
@@ -711,168 +745,217 @@ function StackedBody({
             </Paper>
           );
         }
-        // Only render this version's cell when it's the start of its row's
-        // span — keeps a UST 6-9 block from re-rendering on every verse 7,8,9
-        // row underneath it. For singletons, dto.verse === v always, so the
-        // first-of-range check passes naturally.
-        const showUlt = ultV && isFirstOfRange(ultV, v);
-        const showUst = ustV && isFirstOfRange(ustV, v);
+        // Inactive rows are memoized (InactiveVerseRow) so selecting a verse
+        // re-renders only the two rows whose active state actually flips — the
+        // rest of the chapter's verse list is skipped.
         return (
-          <Box
+          <InactiveVerseRow
             key={v}
-            onClick={() => onSelectVerse(v)}
-            sx={{
-              display: "grid",
-              // Narrow gutter for ULT/UST labels (right-aligned) + the
-              // wide text column. Verse-number gets its own row spanning
-              // both columns so it doesn't compete with the version
-              // labels for vertical space — the resulting extra row is
-              // tiny (10 px-ish) and pays for clean label/text baselines.
-              gridTemplateColumns: "28px 1fr",
-              columnGap: 0.75,
-              rowGap: 0,
-              alignItems: "baseline",
-              px: 1,
-              py: 0.5,
-              my: 0.25,
-              borderRadius: 1,
-              cursor: "pointer",
-              color: "text.secondary",
-              fontFamily: '"Source Serif Pro","Cambria","Times New Roman",serif',
-              fontSize: 14.5,
-              lineHeight: 1.45,
-              "&:hover": { bgcolor: "action.hover" },
-            }}
-          >
-            {v === 0 ? (
-              <Tooltip title={INTRO_TOOLTIP} placement="right">
-                <Typography
-                  component="span"
-                  variant="caption"
-                  sx={{
-                    gridColumn: "1 / -1",
-                    gridRow: 1,
-                    fontFamily: "monospace",
-                    color: "text.disabled",
-                    fontSize: 10,
-                    lineHeight: 1.2,
-                    mb: 0.25,
-                    cursor: "help",
-                    width: "fit-content",
-                  }}
-                >
-                  intro
-                </Typography>
-              </Tooltip>
-            ) : (
-              <Typography
-                component="span"
-                variant="caption"
-                sx={{
-                  gridColumn: "1 / -1",
-                  gridRow: 1,
-                  fontFamily: "monospace",
-                  color: "text.disabled",
-                  fontSize: 10,
-                  lineHeight: 1.2,
-                  mb: 0.25,
-                }}
-              >
-                {`${chapter}:${v}`}
-              </Typography>
-            )}
-            {showUlt && (
-              <>
-                <Typography
-                  component="span"
-                  variant="caption"
-                  sx={{
-                    gridColumn: 1,
-                    gridRow: 2,
-                    fontFamily: "monospace",
-                    color: "text.disabled",
-                    fontWeight: 600,
-                    fontSize: 10,
-                    textAlign: "right",
-                  }}
-                >
-                  {isRangeRow(ultV) ? `ULT ${formatVerseLabel(ultV)}` : "ULT"}
-                </Typography>
-                <Box
-                  data-find-cell={`${chapter}-${ultV.verse}-ULT`}
-                  sx={(theme) => ({
-                    gridColumn: 2,
-                    gridRow: 2,
-                    minWidth: 0,
-                    ...markHighlightSx(theme.palette.mode),
-                  })}
-                >
-                  <NonActiveSections verse={ultV} column="ULT" />
-                  <StackedRowBody
-                    dto={ultV}
-                    prevDto={findPrevRowInColumn(ult, ultV.verse)}
-                    search={search}
-                    activeRange={
-                      findActiveMatch &&
-                      findActiveMatch.chapter === chapter &&
-                      findActiveMatch.verse === ultV.verse &&
-                      findActiveMatch.bibleVersion === "ULT"
-                        ? { start: findActiveMatch.startIndex, end: findActiveMatch.endIndex }
-                        : null
-                    }
-                  />
-                </Box>
-              </>
-            )}
-            {showUst && (
-              <>
-                <Typography
-                  component="span"
-                  variant="caption"
-                  sx={{
-                    gridColumn: 1,
-                    gridRow: 3,
-                    fontFamily: "monospace",
-                    color: "text.disabled",
-                    fontWeight: 600,
-                    fontSize: 10,
-                    textAlign: "right",
-                  }}
-                >
-                  {isRangeRow(ustV) ? `UST ${formatVerseLabel(ustV)}` : "UST"}
-                </Typography>
-                <Box
-                  data-find-cell={`${chapter}-${ustV.verse}-UST`}
-                  sx={(theme) => ({
-                    gridColumn: 2,
-                    gridRow: 3,
-                    minWidth: 0,
-                    ...markHighlightSx(theme.palette.mode),
-                  })}
-                >
-                  <NonActiveSections verse={ustV} column="UST" />
-                  <StackedRowBody
-                    dto={ustV}
-                    prevDto={findPrevRowInColumn(ust, ustV.verse)}
-                    search={search}
-                    activeRange={
-                      findActiveMatch &&
-                      findActiveMatch.chapter === chapter &&
-                      findActiveMatch.verse === ustV.verse &&
-                      findActiveMatch.bibleVersion === "UST"
-                        ? { start: findActiveMatch.startIndex, end: findActiveMatch.endIndex }
-                        : null
-                    }
-                  />
-                </Box>
-              </>
-            )}
-          </Box>
+            v={v}
+            chapter={chapter}
+            ult={ult}
+            ust={ust}
+            search={search}
+            findActiveMatch={findActiveMatch}
+            onSelectVerse={onSelectVerse}
+          />
         );
       })}
     </Box>
   );
 }
+
+// Inactive (non-selected) verse row in stacked mode. Memoized so changing the
+// active verse — the common navigation — re-renders only the two rows whose
+// active state flips, not the whole chapter's verse list. Compared by the data
+// that affects its render; onSelectVerse is treated as stable (it only ever
+// calls onSelectVerse(v) for this row's own verse). ult / ust are stable column
+// maps, so they change ref only on a real verse-content edit.
+const InactiveVerseRow = memo(
+  function InactiveVerseRow({
+    v,
+    chapter,
+    ult,
+    ust,
+    search,
+    findActiveMatch,
+    onSelectVerse,
+  }: {
+    v: number;
+    chapter: number;
+    ult: Record<number, VerseDto>;
+    ust: Record<number, VerseDto>;
+    search: SearchState | null;
+    findActiveMatch: FindMatch | null;
+    onSelectVerse: (v: number) => void;
+  }) {
+    const ultV = ult[v];
+    const ustV = ust[v];
+    // Only render this version's cell when it's the start of its row's span —
+    // keeps a UST 6-9 block from re-rendering on every verse 7,8,9 row
+    // underneath it. For singletons, dto.verse === v always.
+    const showUlt = ultV && isFirstOfRange(ultV, v);
+    const showUst = ustV && isFirstOfRange(ustV, v);
+    return (
+      <Box
+        onClick={() => onSelectVerse(v)}
+        sx={{
+          display: "grid",
+          // Narrow gutter for ULT/UST labels (right-aligned) + the
+          // wide text column. Verse-number gets its own row spanning
+          // both columns so it doesn't compete with the version
+          // labels for vertical space — the resulting extra row is
+          // tiny (10 px-ish) and pays for clean label/text baselines.
+          gridTemplateColumns: "28px 1fr",
+          columnGap: 0.75,
+          rowGap: 0,
+          alignItems: "baseline",
+          px: 1,
+          py: 0.5,
+          my: 0.25,
+          borderRadius: 1,
+          cursor: "pointer",
+          color: "text.secondary",
+          fontFamily: '"Source Serif Pro","Cambria","Times New Roman",serif',
+          fontSize: 14.5,
+          lineHeight: 1.45,
+          "&:hover": { bgcolor: "action.hover" },
+        }}
+      >
+        {v === 0 ? (
+          <Tooltip title={INTRO_TOOLTIP} placement="right">
+            <Typography
+              component="span"
+              variant="caption"
+              sx={{
+                gridColumn: "1 / -1",
+                gridRow: 1,
+                fontFamily: "monospace",
+                color: "text.disabled",
+                fontSize: 10,
+                lineHeight: 1.2,
+                mb: 0.25,
+                cursor: "help",
+                width: "fit-content",
+              }}
+            >
+              intro
+            </Typography>
+          </Tooltip>
+        ) : (
+          <Typography
+            component="span"
+            variant="caption"
+            sx={{
+              gridColumn: "1 / -1",
+              gridRow: 1,
+              fontFamily: "monospace",
+              color: "text.disabled",
+              fontSize: 10,
+              lineHeight: 1.2,
+              mb: 0.25,
+            }}
+          >
+            {`${chapter}:${v}`}
+          </Typography>
+        )}
+        {showUlt && (
+          <>
+            <Typography
+              component="span"
+              variant="caption"
+              sx={{
+                gridColumn: 1,
+                gridRow: 2,
+                fontFamily: "monospace",
+                color: "text.disabled",
+                fontWeight: 600,
+                fontSize: 10,
+                textAlign: "right",
+              }}
+            >
+              {isRangeRow(ultV) ? `ULT ${formatVerseLabel(ultV)}` : "ULT"}
+            </Typography>
+            <Box
+              data-find-cell={`${chapter}-${ultV.verse}-ULT`}
+              sx={(theme) => ({
+                gridColumn: 2,
+                gridRow: 2,
+                minWidth: 0,
+                ...markHighlightSx(theme.palette.mode),
+              })}
+            >
+              <NonActiveSections verse={ultV} column="ULT" />
+              <StackedRowBody
+                dto={ultV}
+                prevDto={findPrevRowInColumn(ult, ultV.verse)}
+                search={search}
+                activeRange={
+                  findActiveMatch &&
+                  findActiveMatch.chapter === chapter &&
+                  findActiveMatch.verse === ultV.verse &&
+                  findActiveMatch.bibleVersion === "ULT"
+                    ? { start: findActiveMatch.startIndex, end: findActiveMatch.endIndex }
+                    : null
+                }
+              />
+            </Box>
+          </>
+        )}
+        {showUst && (
+          <>
+            <Typography
+              component="span"
+              variant="caption"
+              sx={{
+                gridColumn: 1,
+                gridRow: 3,
+                fontFamily: "monospace",
+                color: "text.disabled",
+                fontWeight: 600,
+                fontSize: 10,
+                textAlign: "right",
+              }}
+            >
+              {isRangeRow(ustV) ? `UST ${formatVerseLabel(ustV)}` : "UST"}
+            </Typography>
+            <Box
+              data-find-cell={`${chapter}-${ustV.verse}-UST`}
+              sx={(theme) => ({
+                gridColumn: 2,
+                gridRow: 3,
+                minWidth: 0,
+                ...markHighlightSx(theme.palette.mode),
+              })}
+            >
+              <NonActiveSections verse={ustV} column="UST" />
+              <StackedRowBody
+                dto={ustV}
+                prevDto={findPrevRowInColumn(ust, ustV.verse)}
+                search={search}
+                activeRange={
+                  findActiveMatch &&
+                  findActiveMatch.chapter === chapter &&
+                  findActiveMatch.verse === ustV.verse &&
+                  findActiveMatch.bibleVersion === "UST"
+                    ? { start: findActiveMatch.startIndex, end: findActiveMatch.endIndex }
+                    : null
+                }
+              />
+            </Box>
+          </>
+        )}
+      </Box>
+    );
+  },
+  (a, b) =>
+    a.v === b.v &&
+    a.chapter === b.chapter &&
+    a.ult === b.ult &&
+    a.ust === b.ust &&
+    a.search === b.search &&
+    a.findActiveMatch === b.findActiveMatch,
+);
 
 function ActiveLine({
   book,

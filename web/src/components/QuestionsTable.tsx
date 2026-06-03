@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
 import { Box, Paper, Stack, TextField, IconButton, Typography, Tooltip } from "@mui/material";
 import DeleteOutlineIcon from "@mui/icons-material/DeleteOutline";
 import AutoAwesomeIcon from "@mui/icons-material/AutoAwesome";
@@ -18,7 +18,7 @@ interface Props {
   locked?: boolean;
 }
 
-export function QuestionsTable({ rows, onSave, onDelete, locked = false }: Props) {
+function QuestionsTableInner({ rows, onSave, onDelete, locked = false }: Props) {
   if (rows.length === 0) {
     return (
       <Typography variant="body2" color="text.disabled" sx={{ py: 1, pl: 1 }}>
@@ -63,11 +63,18 @@ export function QuestionsTable({ rows, onSave, onDelete, locked = false }: Props
   );
 }
 
+// Memoized: a note/word edit leaves `rows` (tqForVerse, a ResourceColumn
+// useMemo) referentially stable, so the questions table skips re-render.
+export const QuestionsTable = memo(
+  QuestionsTableInner,
+  (a, b) => a.rows === b.rows && a.locked === b.locked,
+);
+
 // Reference span can include ranges like "1:1-3", so give it a bit of room
 // without dominating the row. One extra cell for the save button.
 const GRID_COLS = "80px 1fr 1fr 28px 28px";
 
-function Row({
+const Row = memo(function Row({
   row,
   onSave,
   onDelete,
@@ -234,4 +241,7 @@ function Row({
       )}
     </Stack>
   );
-}
+}, (a, b) =>
+  // Skip sibling question rows when the table re-renders; row is stable unless
+  // THIS question changed. Callbacks (onSave/onDelete) intentionally ignored.
+  a.row === b.row && a.locked === b.locked);

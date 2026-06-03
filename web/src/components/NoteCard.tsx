@@ -1,4 +1,4 @@
-import { lazy, Suspense, useEffect, useRef, useState } from "react";
+import { lazy, Suspense, memo, useEffect, useRef, useState } from "react";
 import {
   Paper,
   Stack,
@@ -132,7 +132,7 @@ interface SessionSnapshot {
   support_reference: string | null;
 }
 
-export function NoteCard({
+function NoteCardInner({
   row,
   active,
   dragging,
@@ -220,6 +220,32 @@ export function NoteCard({
     sessionSnapshotRef.current = next;
   };
   const pendingRef = useRef<Partial<TnRow>>({});
+
+  // The quote field drives the scripture highlight (Shell reads the active
+  // note's quote out of chapter state). Propagate quote edits to the parent
+  // on a short debounce instead of on every keystroke, so typing stays local
+  // to this card — every keystroke used to rebuild the whole chapter payload
+  // and re-render the entire app. quoteRef mirrors the latest local value so
+  // the timer always flushes the final text, even if an undo / template /
+  // translate set the quote through another path before it fires. The note
+  // BODY drives nothing outside this card, so it never propagates (it persists
+  // via the draft store and saves through flushPending).
+  const quoteRef = useRef(quote);
+  quoteRef.current = quote;
+  const quotePropagateTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const scheduleQuotePropagate = () => {
+    if (quotePropagateTimer.current !== null) clearTimeout(quotePropagateTimer.current);
+    quotePropagateTimer.current = setTimeout(() => {
+      quotePropagateTimer.current = null;
+      onChange({ quote: quoteRef.current });
+    }, 200);
+  };
+  useEffect(
+    () => () => {
+      if (quotePropagateTimer.current !== null) clearTimeout(quotePropagateTimer.current);
+    },
+    [],
+  );
 
   const paperRef = useRef<HTMLDivElement | null>(null);
   const catalogs = useCatalogs();
@@ -765,7 +791,9 @@ export function NoteCard({
           value={quote}
           onChange={(e) => {
             setQuote(e.target.value);
-            stashEdit({ quote: e.target.value });
+            // Debounced parent propagation for the live highlight; no longer
+            // a whole-app re-render per keystroke (see scheduleQuotePropagate).
+            scheduleQuotePropagate();
           }}
           multiline
           fullWidth
@@ -856,8 +884,10 @@ export function NoteCard({
         <TextField
           value={note}
           onChange={(e) => {
+            // Body text is consumed only by this card — keep it purely local
+            // (persisted via the draft store, saved through flushPending). No
+            // applyLocalRowPatch, so a keystroke doesn't re-render the app.
             setNote(e.target.value);
-            stashEdit({ note: e.target.value });
           }}
           multiline
           fullWidth
@@ -1046,3 +1076,25 @@ export function NoteCard({
     </Paper>
   );
 }
+
+// Skip re-rendering a card when only sibling cards changed. We compare the
+// data + UI-state props by value and treat the callback props as stable:
+// they close over this row's id plus Shell handlers, and a row whose data is
+// unchanged keeps a behaviourally-correct closure. The `row` reference is the
+// load-bearing check — useChapter.applyLocalRowPatch preserves identity for
+// untouched rows, so an edit or save on one note doesn't churn the others.
+function areNotePropsEqual(a: Props, b: Props): boolean {
+  return (
+    a.row === b.row &&
+    a.active === b.active &&
+    a.dragging === b.dragging &&
+    a.isDropTarget === b.isDropTarget &&
+    a.isAiPending === b.isAiPending &&
+    a.aiRecentlyCompletedAt === b.aiRecentlyCompletedAt &&
+    a.locked === b.locked &&
+    a.quoteBuildMode === b.quoteBuildMode &&
+    a.quoteBuildSelectionCount === b.quoteBuildSelectionCount
+  );
+}
+
+export const NoteCard = memo(NoteCardInner, areNotePropsEqual);
