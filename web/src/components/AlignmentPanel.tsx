@@ -39,6 +39,7 @@ import { useLexicon, type LexiconEntry } from "../hooks/useLexicon";
 import { useAlignmentSuggestions } from "../hooks/useAlignmentSuggestions";
 import {
   computeGhosts,
+  dismissedGhostKey,
   ghostPipColor,
   suggestKey,
   type Ghost,
@@ -186,6 +187,10 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
     const [colorize, setColorize] = useState<boolean>(() => readFlag(LS_COLORIZE));
     const [hoverLink, setHoverLink] = useState<boolean>(() => readFlag(LS_HOVERLINK));
     const [hover, setHover] = useState<HoverHighlight>(null);
+    // Session-scoped ghost rejections (keyed by dismissedGhostKey). Suppresses a
+    // suggestion the user dismissed via the chip's × so it can't immediately
+    // regenerate on the next render — the "predicted alignment" circle fix.
+    const [dismissedGhosts, setDismissedGhosts] = useState<Set<string>>(new Set());
 
     const toggleHideUhbStrip = () => {
       setHideUhbStrip((cur) => {
@@ -219,6 +224,14 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
       setSelectedUnaligned(new Set());
       setSelectionAnchor(null);
     }, [computedInitial]);
+
+    // Dismissals are per (verse, version) and only for this session — reset when
+    // the user navigates to a different verse / edits a different bible, but NOT
+    // on same-verse re-sync after a save (computedInitial churns then; the
+    // coordinate doesn't), so rejected ghosts stay rejected across a save.
+    useEffect(() => {
+      setDismissedGhosts(new Set());
+    }, [verseNum, bibleVersion]);
 
     const dirty = state !== initial && state !== null;
     useEffect(() => {
@@ -483,11 +496,22 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
       [state],
     );
     const ghostByGroup = useMemo(
-      () => computeGhosts(displayGroups, streamWords, suggestions),
-      [displayGroups, streamWords, suggestions],
+      () => computeGhosts(displayGroups, streamWords, suggestions, dismissedGhosts),
+      [displayGroups, streamWords, suggestions, dismissedGhosts],
     );
     const handleAcceptGhost = (groupId: string, wordIds: string[]) => {
       handleTargetsDrop(`g:${groupId}`, wordIds);
+    };
+    const handleDismissGhost = (ghost: Ghost) => {
+      const g = displayGroups.find((x) => x.id === ghost.groupId);
+      if (!g) return;
+      const key = dismissedGhostKey(g, ghost.text);
+      setDismissedGhosts((prev) => {
+        if (prev.has(key)) return prev;
+        const next = new Set(prev);
+        next.add(key);
+        return next;
+      });
     };
     const handleAcceptAllGhosts = () => {
       if (!state || ghostByGroup.size === 0) return;
@@ -594,6 +618,7 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
                 groups={displayGroups}
                 ghostByGroup={ghostByGroup}
                 onAcceptGhost={handleAcceptGhost}
+                onDismissGhost={handleDismissGhost}
                 twlForVerse={twlForVerse}
                 lexiconMap={lexiconMap}
                 verseNum={verseNum}
@@ -1101,6 +1126,7 @@ function AlignmentCards({
   groups,
   ghostByGroup,
   onAcceptGhost,
+  onDismissGhost,
   twlForVerse,
   lexiconMap,
   verseNum,
@@ -1113,6 +1139,7 @@ function AlignmentCards({
   groups: AlignmentGroup[];
   ghostByGroup: Map<string, Ghost>;
   onAcceptGhost: (groupId: string, wordIds: string[]) => void;
+  onDismissGhost: (ghost: Ghost) => void;
   twlForVerse: TwlRow[];
   lexiconMap: Map<string, LexiconEntry | null>;
   verseNum: number;
@@ -1198,6 +1225,7 @@ function AlignmentCards({
                 <GhostChip
                   ghost={ghost}
                   onAccept={() => onAcceptGhost(ghost.groupId, ghost.wordIds)}
+                  onDismiss={() => onDismissGhost(ghost)}
                 />
               ) : (
                 <Box
@@ -1713,18 +1741,30 @@ function ToolbarToggle({
 // Scoring + matching (computeGhosts, the weighted-average blend, surfaceMatch,
 // ghostPipColor, the Ghost/StreamWord types) live in ../lib/alignmentSuggest so
 // the offline eval harness scores exactly what ships. Below is only the chip's
-// presentation: a faded, dashed, click-to-accept chip inside an empty group;
-// ignoring a ghost costs nothing — there's no reject.
-function GhostChip({ ghost, onAccept }: { ghost: Ghost; onAccept: () => void }) {
+// presentation: a faded, dashed, click-to-accept chip inside an empty group.
+// The × (MUI onDelete) dismisses it for the session via dismissedGhosts, so a
+// rejected suggestion can't immediately regenerate — the "predicted alignment"
+// circle fix. Clicking × never fires onClick (MUI stops it), so reject ≠ accept.
+function GhostChip({
+  ghost,
+  onAccept,
+  onDismiss,
+}: {
+  ghost: Ghost;
+  onAccept: () => void;
+  onDismiss: () => void;
+}) {
   const pct = Math.round(ghost.confidence * 100);
   const srcLabel = ghost.source === "memory" ? "wordMAP" : "lexicon";
   return (
-    <Tooltip title={`suggested · ${srcLabel} · ${pct}% — click to accept`}>
+    <Tooltip title={`suggested · ${srcLabel} · ${pct}% — click to accept, × to dismiss`}>
       <Chip
         size="small"
         variant="outlined"
         clickable
         onClick={onAccept}
+        onDelete={onDismiss}
+        deleteIcon={<CloseIcon />}
         label={
           <Box component="span" sx={{ display: "inline-flex", alignItems: "center", gap: 0.5 }}>
             <Box
@@ -1754,6 +1794,12 @@ function GhostChip({ ghost, onAccept }: { ghost: Ghost; onAccept: () => void }) 
           transition: "opacity 0.12s, background-color 0.12s",
           "&:hover": { opacity: 1, bgcolor: "primary.50" },
           "& .MuiChip-label": { px: 1 },
+          "& .MuiChip-deleteIcon": {
+            fontSize: 15,
+            ml: "-2px",
+            color: "text.disabled",
+            "&:hover": { color: "error.main" },
+          },
         }}
       />
     </Tooltip>

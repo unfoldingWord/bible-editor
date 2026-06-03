@@ -134,6 +134,21 @@ function blend(
   ]);
 }
 
+// Stable identity for a dismissed ghost — "the user rejected suggesting
+// <target text> for <this source group>". The source side mirrors
+// AlignmentPanel's sourceKey (each source word's content + occurrence); the
+// target side is the matched surface normalized the way surfaceMatch compares
+// (lowercase + NFC) so casing / cantillation don't fork the key. Lives here so
+// the dismiss handler (AlignmentPanel) and the suppression (computeGhosts)
+// derive the exact same string from the same group objects. The \u0001
+// separator can't appear in content or target text, so src/text never blur.
+export function dismissedGhostKey(group: AlignmentGroup, text: string): string {
+  const src = group.source
+    .map((s) => `${(s.content ?? "").normalize("NFC")}|${s.occurrence}`)
+    .join("~");
+  return `${src}\u0001${text.toLowerCase().normalize("NFC")}`;
+}
+
 // Build ghosts for empty groups. Two passes (phrases first so "the earth" stays
 // whole, then single words), each claiming words immediately so repeated source
 // words distribute across their occurrences. Within a pass, every candidate is
@@ -145,6 +160,10 @@ export function computeGhosts(
   groups: AlignmentGroup[],
   streamWords: StreamWord[],
   suggestions: Record<string, AlignSuggestion>,
+  // Session-scoped rejections, keyed by dismissedGhostKey(group, text). A
+  // dismissed candidate is skipped during scoring so the NEXT-best suggestion
+  // surfaces (or the group goes blank) — never the rejected one again.
+  dismissed: Set<string> = new Set(),
 ): Map<string, Ghost> {
   const result = new Map<string, Ghost>();
   const claimed = new Set<string>();
@@ -197,10 +216,12 @@ export function computeGhosts(
             }
           }
           if (!ok) continue;
+          const run = streamWords.slice(i, i + len);
+          if (dismissed.has(dismissedGhostKey(g, run.map((w) => w.text).join(" ")))) continue;
           const tgtRel = rel(i + (len - 1) / 2, numStream);
           // occurrence neutral for phrases (they're effectively unique)
           const score = blend(p.confidence, srcRel, tgtRel, srcOcc, srcOcc);
-          if (!best || score > best.score) best = { score, run: streamWords.slice(i, i + len) };
+          if (!best || score > best.score) best = { score, run };
         }
       }
     }
@@ -228,6 +249,7 @@ export function computeGhosts(
         for (let wi = 0; wi < numStream; wi++) {
           const w = streamWords[wi];
           if (w.aligned || claimed.has(w.id) || !surfaceMatch(cand.surface, w.text)) continue;
+          if (dismissed.has(dismissedGhostKey(g, w.text))) continue;
           const score = blend(cand.confidence, srcRel, rel(wi, numStream), srcOcc, occ);
           if (!best || score > best.score) best = { score, word: w, source: cand.source };
         }

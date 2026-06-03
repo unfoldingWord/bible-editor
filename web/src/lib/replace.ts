@@ -551,6 +551,51 @@ function diffSingleChange(
   };
 }
 
+// Letters / marks that count as the "core" of a word — the same character
+// class WORD_RUN_RE builds words from (its intra-word connectors -'’ only
+// bind between letters, so they don't matter for a boundary-adjacency test).
+const WORD_CORE_RE = /[\p{L}\p{M}‍⁠]/u;
+
+// A minimal diff can report a word edit as a pure insertion: typing "Th"
+// immediately before the word "is" diffs as `insert "Th" at offset N`, not
+// `replace "is" with "This"`. Left as an insertion, localizedRewriteVerse
+// tokenizes the inserted run on its own and emits a SEPARATE \w — so the verse
+// ends up with two chips "Th" + "is" instead of one "This" (the ZEC 5:3 bug).
+//
+// When inserted text abuts existing word characters with no separator, those
+// characters form ONE token. Snap the change region outward over the adjacent
+// word run(s) so the edit becomes a word REPLACEMENT, which smartReplaceVerse
+// rewrites in place on the existing \w leaf (and unaligns it, like any other
+// word edit). Returns the diff unchanged when neither side merges — a genuine
+// new word, flanked by spaces/punctuation, is left as an insertion.
+function snapDiffToWordBoundaries(
+  oldText: string,
+  newText: string,
+  diff: { start: number; oldLen: number; newSubstring: string },
+): { start: number; oldLen: number; newSubstring: string } {
+  const isCore = (c: string | undefined): boolean => c !== undefined && WORD_CORE_RE.test(c);
+  const sub = diff.newSubstring;
+  if (sub.length === 0) return diff; // pure deletion — nothing to merge.
+  let start = diff.start;
+  let end = diff.start + diff.oldLen;
+  // Right edge: inserted run ends in a word char that runs straight into the
+  // word char after the change → absorb the trailing word.
+  if (isCore(sub[sub.length - 1]) && isCore(oldText[end])) {
+    while (end < oldText.length && isCore(oldText[end])) end++;
+  }
+  // Left edge: inserted run starts with a word char that runs straight out of
+  // the word char before the change → absorb the leading word.
+  if (isCore(sub[0]) && isCore(oldText[start - 1])) {
+    while (start > 0 && isCore(oldText[start - 1])) start--;
+  }
+  if (start === diff.start && end === diff.start + diff.oldLen) return diff;
+  // The expansion only ever covers characters shared by oldText / newText (the
+  // diff's common prefix on the left, common suffix on the right), so the
+  // matching newText window is the same span shifted by the length delta.
+  const newEnd = newText.length - (oldText.length - end);
+  return { start, oldLen: end - start, newSubstring: newText.slice(start, newEnd) };
+}
+
 // Top-level entry point for "the user just typed in a contentEditable
 // representation of this verse's plain text — please update the
 // verseObjects without nuking alignment for unchanged parts."
@@ -565,10 +610,14 @@ export function smartEditVerse(
   if (oldPlain === newPlain) {
     return { content, plainText: oldPlain, preservedAlignment: true };
   }
-  const diff = diffSingleChange(oldPlain, newPlain);
-  if (diff.oldLen === 0 && diff.newSubstring === "") {
+  const rawDiff = diffSingleChange(oldPlain, newPlain);
+  if (rawDiff.oldLen === 0 && rawDiff.newSubstring === "") {
     return { content, plainText: oldPlain, preservedAlignment: true };
   }
+  // A word-extending insertion ("Th" typed before "is") diffs as a pure
+  // insert; snap it to the adjacent word so it routes through the in-place
+  // word-replace path instead of emitting a standalone \w. (ZEC 5:3.)
+  const diff = snapDiffToWordBoundaries(oldPlain, newPlain, rawDiff);
   // Word-count-match preserve path lives in smartReplaceVerse.
   let result: SmartReplaceResult;
   if (diff.oldLen > 0) {

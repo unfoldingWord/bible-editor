@@ -1080,6 +1080,150 @@ function roundtripVerseUsfm(rawUsfm, sourceVO = null) {
   );
 }
 
+// ─── Case 17: word-extending insertion merges into the adjacent \w ───────
+// Regression for ZEC 5:3: the word "This" had been truncated to "is"; the
+// translator retyped the missing "Th" immediately before "is". The minimal
+// diff sees a pure insertion of "Th", which previously emitted a STANDALONE
+// \w "Th" next to "is" (two chips). It must instead extend the existing word
+// into a single \w "This".
+{
+  console.log("\n[Case 17] word-extending insertion merges into the adjacent \\w");
+  const { smartEditVerse } = await import("./replace.ts");
+
+  const collectWords = (vos, inZaln = false, aligned = [], bare = []) => {
+    for (const n of vos ?? []) {
+      if (n?.tag === "zaln") {
+        collectWords(n.children, true, aligned, bare);
+        continue;
+      }
+      if (n?.type === "word" && n?.tag === "w") (inZaln ? aligned : bare).push(n.text);
+      if (Array.isArray(n?.children)) collectWords(n.children, inZaln, aligned, bare);
+    }
+    return { aligned, bare };
+  };
+
+  // (a) Prepend into a bare (unaligned) word — two "is" words, fix the first.
+  {
+    const vo = [
+      { type: "text", text: '"' },
+      { type: "word", tag: "w", text: "is", occurrence: "1", occurrences: "2" },
+      { type: "text", text: " " },
+      { type: "word", tag: "w", text: "is", occurrence: "2", occurrences: "2" },
+      { type: "text", text: " the curse" },
+    ];
+    const result = smartEditVerse({ verseObjects: vo }, '"is is the curse', '"This is the curse');
+    const { aligned, bare } = collectWords(result.content.verseObjects);
+    const words = [...aligned, ...bare];
+    assert(
+      JSON.stringify(bare) === JSON.stringify(["This", "is"]),
+      `prepended "Th" merges into one \\w "This" (got ${JSON.stringify(words)})`,
+    );
+    assert(!words.includes("Th"), `no standalone "Th" token (got ${JSON.stringify(words)})`);
+    assert(
+      result.plainText === '"This is the curse',
+      `plain text correct (got ${JSON.stringify(result.plainText)})`,
+    );
+  }
+
+  // (b) Prepend into a word still inside a \zaln-s: the merged word lifts out
+  // (a translator edit invalidates the old alignment), exactly as the existing
+  // word-replace path does — and it's ONE \w, not "Th" + "is".
+  {
+    const vo = [
+      { type: "text", text: '"' },
+      {
+        tag: "zaln",
+        type: "milestone",
+        strong: "H2088",
+        children: [{ type: "word", tag: "w", text: "is", occurrence: "1", occurrences: "1" }],
+        endTag: "zaln-e\\*",
+      },
+      { type: "text", text: " the curse" },
+    ];
+    const result = smartEditVerse({ verseObjects: vo }, '"is the curse', '"This the curse');
+    const { aligned, bare } = collectWords(result.content.verseObjects);
+    assert(
+      bare.join(",") === "This" && aligned.length === 0,
+      `merged word is a single bare \\w "This" (bare=${JSON.stringify(bare)}, aligned=${JSON.stringify(aligned)})`,
+    );
+  }
+
+  // (c) Append to the end of a word ("going" → "goings") merges too — the
+  // mirror case (left-merge), so the fix isn't prepend-only.
+  {
+    const vo = [
+      { type: "word", tag: "w", text: "going", occurrence: "1", occurrences: "1" },
+      { type: "text", text: " out" },
+    ];
+    const result = smartEditVerse({ verseObjects: vo }, "going out", "goings out");
+    const { bare } = collectWords(result.content.verseObjects);
+    assert(
+      bare.join(",") === "goings",
+      `appended "s" merges into one \\w "goings" (got ${JSON.stringify(bare)})`,
+    );
+  }
+}
+
+// ─── Case 18: ghost dismissal suppresses the rejected suggestion ─────────
+// The "predicted alignment" circle: accept a ghost, send it back to the bank,
+// and it regenerates in the same box. The fix records a session dismissal
+// (keyed by source group + target text) that computeGhosts skips — so the
+// rejected suggestion can't reappear, and the NEXT-best one surfaces instead.
+{
+  console.log("\n[Case 18] ghost dismissal suppresses the rejected suggestion");
+  const { computeGhosts, dismissedGhostKey } = await import("./alignmentSuggest.ts");
+
+  // One empty group for a single Hebrew word; two candidate target surfaces.
+  const group = {
+    id: "g1",
+    source: [{ id: "s1", strong: "H1", lemma: "", morph: "", occurrence: "1", occurrences: "1", content: "חֶסֶד" }],
+    targets: [],
+  };
+  const suggestions = {
+    "H1~": {
+      words: [
+        { surface: "love", confidence: 0.9, source: "memory" },
+        { surface: "kindness", confidence: 0.6, source: "memory" },
+      ],
+      phrases: [],
+    },
+  };
+  const streamWords = [
+    { id: "w1", text: "love", aligned: false },
+    { id: "w2", text: "kindness", aligned: false },
+  ];
+
+  // (a) No dismissals → one of the two candidates is suggested (which one wins
+  // is the blend's call — position can outrank raw frequency; we don't pin it).
+  const g0 = computeGhosts([group], streamWords, suggestions);
+  const top = g0.get("g1")?.text;
+  assert(top === "love" || top === "kindness", `a candidate is suggested (got ${JSON.stringify(g0.get("g1"))})`);
+
+  // (b) Dismiss whichever was top → the OTHER candidate surfaces, never the
+  // rejected one again.
+  const dismissed = new Set([dismissedGhostKey(group, top)]);
+  const g1 = computeGhosts([group], streamWords, suggestions, dismissed);
+  const next = g1.get("g1")?.text;
+  assert(next && next !== top, `dismissing "${top}" surfaces the other candidate (got ${JSON.stringify(next)})`);
+
+  // (c) Dismiss both → the group goes blank (no ghost).
+  const dismissed2 = new Set([dismissedGhostKey(group, "love"), dismissedGhostKey(group, "kindness")]);
+  const g2 = computeGhosts([group], streamWords, suggestions, dismissed2);
+  assert(!g2.has("g1"), `after dismissing both candidates, no ghost remains (got ${JSON.stringify(g2.get("g1"))})`);
+
+  // (d) Key stability: same group + text → same key (so re-parsed group ids
+  // don't leak), and it's case / NFC-insensitive on the target text.
+  const groupClone = JSON.parse(JSON.stringify({ ...group, id: "g1-reparsed" }));
+  assert(
+    dismissedGhostKey(group, "love") === dismissedGhostKey(groupClone, "Love"),
+    `key ignores group id and target casing`,
+  );
+  assert(
+    dismissedGhostKey(group, "love") !== dismissedGhostKey(group, "kindness"),
+    `different target text → different key`,
+  );
+}
+
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed.`);
   process.exit(1);
