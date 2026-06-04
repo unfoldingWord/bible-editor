@@ -80,13 +80,15 @@ function isWordLeaf(node: Record<string, unknown>): boolean {
   return node["type"] === "word" && node["tag"] === "w";
 }
 
-// A word run — Unicode letters/marks (plus ZWJ / word-joiner for
-// scripts that need them) with intra-word `-` / `'` / `’` allowed
-// between letter runs (so "don't", "don’t", "hello-world" stay one
-// `\w` token but flanking quotes / dashes ride as text). Mirrors
-// `string-punctuation-tokenizer`'s greedy pattern, the package
+// A word run — Unicode letters/marks/numbers (plus ZWJ / word-joiner for
+// scripts that need them) with intra-word `-` / `’` / `’` allowed
+// between letter runs (so "don’t", "don’t", "hello-world" stay one
+// `\w` token but flanking quotes / dashes ride as text). \p{N} is
+// required because the UST writes literal counts (`\w 30\w*`) for
+// measurements — "30" must become a draggable alignment chip.
+// Mirrors `string-punctuation-tokenizer`’s greedy pattern, the package
 // translationCore / gatewayEdit use for the same job.
-const WORD_RUN_RE = /[\p{L}\p{M}‍⁠]+(?:[-'’][\p{L}\p{M}‍⁠]+)*/gu;
+const WORD_RUN_RE = /[\p{L}\p{M}\p{N}‍⁠]+(?:[-’’][\p{L}\p{M}\p{N}‍⁠]+)*/gu;
 
 // Re-tokenize a plain string into a flat verseObjects-style array. Each
 // word run becomes a `\w` node so the aligner has draggable targets;
@@ -442,7 +444,7 @@ export function smartReplaceVerse(
   const startsAtBoundary = affected.length > 0 && affected[0].start === rawStart;
   const endsAtBoundary = affected.length > 0 && affected[affected.length - 1].end === rawEnd;
   // Use the same word-run regex as tokenizePlainText so "word characters"
-  // (letters / marks / intra-word `-` `'` `'`) define a word — punctuation
+  // (letters / marks / numbers / intra-word `-` `'` `'`) define a word — punctuation
   // doesn't ride along.
   const matchWords = [...rawMatchText.matchAll(WORD_RUN_RE)].map((m) => m[0]);
   const replaceWords = [...replaceText.matchAll(WORD_RUN_RE)].map((m) => m[0]);
