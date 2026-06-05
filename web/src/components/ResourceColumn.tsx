@@ -135,8 +135,7 @@ function savePinned(p: Pinned) {
 function sortBySortOrder<T extends { sort_order: number | null; id: string }>(rows: T[]): T[] {
   return [...rows].sort(
     (a, b) =>
-      (a.sort_order ?? Number.MAX_SAFE_INTEGER) -
-        (b.sort_order ?? Number.MAX_SAFE_INTEGER) || a.id.localeCompare(b.id),
+      (a.sort_order ?? 1e9) - (b.sort_order ?? 1e9) || a.id.localeCompare(b.id),
   );
 }
 
@@ -497,9 +496,12 @@ export function ResourceColumn({
       dragId && dragId !== r.id && dragOver?.targetId === r.id && dragOver.position === "before";
     const showAfter =
       dragId && dragId !== r.id && dragOver?.targetId === r.id && dragOver.position === "after";
-    const idx = peers.indexOf(r);
-    const prevNote = idx > 0 ? peers[idx - 1] : null;
-    const nextNote = idx < peers.length - 1 ? peers[idx + 1] : null;
+    // Only navigate within the same verse — displayVerseRange can span multiple
+    // verses, but onNoteReorder in Shell operates per-verse via sortedForVerse.
+    const samePeers = peers.filter((p) => p.verse === r.verse);
+    const idx = samePeers.indexOf(r);
+    const prevNote = idx > 0 ? samePeers[idx - 1] : null;
+    const nextNote = idx < samePeers.length - 1 ? samePeers[idx + 1] : null;
     return (
       <Fragment key={r.id}>
         {showBefore && <DropIndicator />}

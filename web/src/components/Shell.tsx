@@ -1401,16 +1401,19 @@ function sortedForVerse<T extends Sortable>(rows: T[], verse: number): T[] {
     .filter((r) => r.verse === verse)
     .sort(
       (a, b) =>
-        (a.sort_order ?? Number.MAX_SAFE_INTEGER) -
-          (b.sort_order ?? Number.MAX_SAFE_INTEGER) || a.id.localeCompare(b.id),
+        (a.sort_order ?? 1e9) - (b.sort_order ?? 1e9) || a.id.localeCompare(b.id),
     );
 }
 
-// Pick a sort_order so the new/moved row lands at the requested slot. Falls
-// back to step-of-100 gaps when neighbors lack a sort_order yet. `excludeId`
+// Pick a sort_order so the new/moved row lands at the requested slot. `excludeId`
 // is set when reordering an existing row — we don't want it in the list when
 // computing midpoints, otherwise drop-after-self collapses to a no-op midpoint
 // inside its own slot.
+//
+// NULL sort_order handling: sortedForVerse places null entries at 1e9 (the sort
+// sentinel). We use matching virtual values here — null entries get 1e9 + n*100 in
+// list order — so a moved row ends up on the correct side of null-sort_order neighbors
+// rather than jumping to the front of the list.
 function pickSortOrder<T extends Sortable>(
   rows: T[],
   refId: string | null,
@@ -1419,23 +1422,26 @@ function pickSortOrder<T extends Sortable>(
 ): number {
   const list = excludeId ? rows.filter((r) => r.id !== excludeId) : rows;
   if (list.length === 0) return 100;
+
+  // Assign virtual sort values for all entries. Null entries receive 1e9 + offset,
+  // consistent with the 1e9 sentinel used in sortedForVerse / sortBySortOrder.
+  let nullCounter = 0;
+  const virt = (r: T) =>
+    r.sort_order != null ? r.sort_order : 1e9 + (nullCounter++) * 100;
+  const virtuals = list.map(virt);
+
   if (!refId) {
-    const last = list[list.length - 1];
-    return (last.sort_order ?? list.length * 100) + 100;
+    return virtuals[virtuals.length - 1] + 100;
   }
   const idx = list.findIndex((r) => r.id === refId);
   if (idx < 0) {
-    const last = list[list.length - 1];
-    return (last.sort_order ?? list.length * 100) + 100;
+    return virtuals[virtuals.length - 1] + 100;
   }
-  const target = list[idx];
-  const targetSort = target.sort_order ?? (idx + 1) * 100;
+  const targetSort = virtuals[idx];
   if (position === "before") {
-    const prev = list[idx - 1];
-    const prevSort = prev?.sort_order ?? targetSort - 200;
+    const prevSort = idx > 0 ? virtuals[idx - 1] : targetSort - 200;
     return (prevSort + targetSort) / 2;
   }
-  const next = list[idx + 1];
-  const nextSort = next?.sort_order ?? targetSort + 200;
+  const nextSort = idx < list.length - 1 ? virtuals[idx + 1] : targetSort + 200;
   return (targetSort + nextSort) / 2;
 }
