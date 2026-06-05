@@ -135,7 +135,8 @@ function savePinned(p: Pinned) {
 function sortBySortOrder<T extends { sort_order: number | null; id: string }>(rows: T[]): T[] {
   return [...rows].sort(
     (a, b) =>
-      (a.sort_order ?? 1e9) - (b.sort_order ?? 1e9) || a.id.localeCompare(b.id),
+      (a.sort_order ?? Number.MAX_SAFE_INTEGER) -
+        (b.sort_order ?? Number.MAX_SAFE_INTEGER) || a.id.localeCompare(b.id),
   );
 }
 
