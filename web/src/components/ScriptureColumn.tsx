@@ -1192,13 +1192,14 @@ function ActiveLine({
             letterSpacing: 0.5,
             fontSize: 10,
             fontWeight: 600,
+            flexGrow: 1,
           }}
         >
           {VERSION_LABEL[label] ?? label}
         </Typography>
         {onOpenAligner && (
           <Tooltip title={`align ${label}`}>
-            <IconButton size="small" onClick={onOpenAligner} sx={{ color: "success.main", p: 0.5, ml: "auto" }}>
+            <IconButton size="small" onClick={onOpenAligner} sx={{ color: "success.main", p: 0.5 }}>
               <LinkIcon sx={{ fontSize: 22 }} />
             </IconButton>
           </Tooltip>
@@ -1212,7 +1213,6 @@ function ActiveLine({
                 onClick={() => onSave(elRef.current?.textContent ?? "")}
                 sx={{
                   p: 0.5,
-                  ml: onOpenAligner ? 0 : "auto",
                   color: hasDraft ? "primary.main" : "action.disabled",
                 }}
               >
