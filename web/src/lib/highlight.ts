@@ -29,11 +29,15 @@ type WordToken = { text: string; occurrence: number };
 type Run = { source: string; occurrence: number; targets: WordToken[] };
 
 const GAP = /[&…]+|\.{3}/g;
-const MAX_RUN_GAP = 6; // bail out if too many unrelated milestones between matched groups
 
 // Parse quote into contiguous-word groups separated by explicit gap markers.
 // Inside a group, words must be exactly adjacent in the verse; between groups,
-// the matcher allows up to MAX_RUN_GAP intervening tokens.
+// the matcher allows any number of intervening tokens — the next group may sit
+// anywhere later in the verse. That matches quoteBuilder's matchGroupsAt (the
+// reverse direction that authors the quote + occurrence), so a discontinuous
+// quote it produces always highlights back. Discontinuous quotes routinely
+// span most of a verse (e.g. ZEC 5:4 וּבָאָה & וְלָנֶה & וְכִלַּתּוּ — first,
+// middle, and near-last word), so any fixed cap produces false negatives.
 function quoteGroups(quote: string): string[][] {
   if (!quote) return [];
   return quote
@@ -50,8 +54,7 @@ function quoteGroups(quote: string): string[][] {
 // Try to match `groups` against `normSources` starting at index `start`.
 // Returns the list of matched indices (document order) on success, or null.
 // First group must align at `start`; later groups slide forward looking for
-// an exact-adjacent run, bounded by MAX_RUN_GAP from the previously matched
-// index.
+// an exact-adjacent run, anywhere up to the end of `normSources`.
 function matchGroupsAt(
   start: number,
   groups: string[][],
@@ -69,11 +72,7 @@ function matchGroupsAt(
       }
       runStart = pos;
     } else {
-      const lastMatched = matched[matched.length - 1];
-      const maxStart = Math.min(
-        normSources.length - group.length,
-        lastMatched + MAX_RUN_GAP,
-      );
+      const maxStart = normSources.length - group.length;
       let found = -1;
       for (let s = pos; s <= maxStart; s++) {
         let ok = true;

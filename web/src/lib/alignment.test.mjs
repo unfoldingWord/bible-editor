@@ -1336,6 +1336,44 @@ function roundtripVerseUsfm(rawUsfm, sourceVO = null) {
   }
 }
 
+// ─── Case 20: ZEC 5:4 — wide-gap discontinuous source highlight ───────────
+// The zvhg writing-pronouns TN quote is three disjoint UHB words: וּבָאָה (5th
+// token), וְלָנֶה (14th, a 9-token gap later), and וְכִלַּתּוּ (17th, near the
+// end). A previous fixed cap (MAX_RUN_GAP=6) made the second group unreachable,
+// so the whole match returned null and NOTHING highlighted in the UHB on prod.
+// quoteBuilder's matcher never had that cap, so it would author a quote the
+// highlighter couldn't find. Regression: a discontinuous quote must highlight
+// exactly its group words — however far apart — and never the gap words.
+{
+  console.log("\n[Case 20] ZEC 5:4 wide-gap discontinuous source highlight");
+  const uhb = readFileSync(resolve(repoRoot, "docs/samples/hbo_uhb_38-ZEC.usfm"), "utf-8");
+  const verseObjects = usfm.toJSON(uhb).chapters["5"]["4"].verseObjects;
+
+  // Collect bare \w tokens in document order to derive exact-byte expectations
+  // (avoids hand-typed Hebrew drifting from the parsed source).
+  const words = [];
+  (function walk(nodes) {
+    for (const n of nodes ?? []) {
+      if (n?.type === "word" && n?.tag === "w") words.push(String(n.text ?? ""));
+      else if (n?.type === "milestone") walk(n.children ?? []);
+    }
+  })(verseObjects);
+
+  const g1 = words[4], g2 = words[13], g3 = words[16]; // the three quote words
+  const gapWord = words[7]; // הַ⁠גַּנָּב — sits between g1 and g2, must NOT light up
+  const quote = `${g1} & ${g2} & ${g3}`; // === the real zvhg TSV quote
+
+  const hl = findSourceHighlights(verseObjects, quote, 1);
+  assert(
+    hl.size === 3,
+    `ZEC 5:4: wide-gap quote highlights exactly its 3 group words (got ${hl.size}: ${[...hl].join(",")})`,
+  );
+  assert(hl.has(`${g1}|1`), `ZEC 5:4: highlights group 1 (וּבָאָה)`);
+  assert(hl.has(`${g2}|1`), `ZEC 5:4: highlights group 2 (וְלָנֶה, 9 tokens after group 1)`);
+  assert(hl.has(`${g3}|1`), `ZEC 5:4: highlights group 3 (וְכִלַּתּוּ)`);
+  assert(!hl.has(`${gapWord}|1`), `ZEC 5:4: must NOT highlight the gap word between groups`);
+}
+
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed.`);
   process.exit(1);
