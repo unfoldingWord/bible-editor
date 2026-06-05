@@ -7,6 +7,7 @@
 import { Box, Divider } from "@mui/material";
 import type { SourceWord } from "../lib/alignment";
 import type { LexiconEntry } from "../hooks/useLexicon";
+import { decodeMorph, morphemeText } from "../lib/morph";
 
 interface Props {
   source: SourceWord;
@@ -45,6 +46,13 @@ export function SourceTooltipBody({ source, lex, twHint }: Props) {
   const pos = lex?.part_of_speech || source.morph || "—";
   const sections = parseDefinition(lex?.definition);
   const hasEntry = !!(lex?.gloss || lex?.definition);
+
+  // In-context morphology from the word's x-morph — distinct from the lemma POS
+  // above. The chain skips the pronominal suffix (called out separately below).
+  const decoded = decodeMorph(source.morph);
+  const morphChain = decoded
+    ? decoded.morphemes.filter((m) => !m.pronoun).map(morphemeText).filter(Boolean).join("  +  ")
+    : "";
 
   return (
     <Box sx={{ fontSize: 12, maxWidth: 340, lineHeight: 1.5, p: 0.25 }}>
@@ -100,6 +108,37 @@ export function SourceTooltipBody({ source, lex, twHint }: Props) {
         >
           {lex.gloss}
         </Box>
+      )}
+
+      {decoded && (morphChain || decoded.pronounSuffix) && (
+        <>
+          <Divider sx={{ my: 0.75, borderColor: "rgba(255,255,255,0.18)" }} />
+          <Box sx={{ mb: decoded.pronounSuffix ? 0.5 : 0 }}>
+            <Box
+              component="span"
+              sx={{
+                fontWeight: 700,
+                fontSize: 10,
+                textTransform: "uppercase",
+                letterSpacing: 0.6,
+                opacity: 0.65,
+                mr: 0.75,
+              }}
+            >
+              Grammar
+            </Box>
+            {morphChain && <Box component="span" sx={{ opacity: 0.92 }}>{morphChain}</Box>}
+          </Box>
+          {decoded.pronounSuffix && (
+            <Box sx={{ fontSize: 11, opacity: 0.92 }}>
+              <Box component="span" sx={{ opacity: 0.7 }}>+ attached pronoun </Box>
+              <Box component="span" sx={{ color: "#a8dcf5", fontWeight: 700 }}>
+                “{decoded.pronounSuffix.gloss}”
+              </Box>
+              <Box component="span" sx={{ opacity: 0.7 }}> · {decoded.pronounSuffix.parse}</Box>
+            </Box>
+          )}
+        </>
       )}
 
       {sections.length > 0 && (
