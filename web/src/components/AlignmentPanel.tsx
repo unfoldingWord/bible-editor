@@ -15,6 +15,7 @@ import {
   Paper,
   Tooltip,
   Button,
+  Snackbar,
   useTheme,
 } from "@mui/material";
 import CloseIcon from "@mui/icons-material/Close";
@@ -26,6 +27,7 @@ import {
   clearAll,
   clearGroup,
   extractSource,
+  mergeGroups,
   moveSource,
   moveTargets,
   parseAlignment,
@@ -50,6 +52,7 @@ import { SourceTooltipBody } from "./SourceTooltipBody";
 
 const WORD_IDS_MIME = "text/word-ids";
 const SOURCE_ID_MIME = "text/source-id";
+const GROUP_ID_MIME = "text/group-id";
 
 // Storage keys for sticky toolbar prefs.
 const LS_HIDE_UHB = "be:alignmentHideUhb";
@@ -191,6 +194,11 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
     // suggestion the user dismissed via the chip's × so it can't immediately
     // regenerate on the next render — the "predicted alignment" circle fix.
     const [dismissedGhosts, setDismissedGhosts] = useState<Set<string>>(new Set());
+    // Whole-card merge: the group id currently being dragged by its grip
+    // (drives merge-target highlighting), plus a one-tap-undo snapshot of the
+    // state from just before the last merge.
+    const [draggingGroupId, setDraggingGroupId] = useState<string | null>(null);
+    const [mergeUndo, setMergeUndo] = useState<AlignmentState | null>(null);
 
     const toggleHideUhbStrip = () => {
       setHideUhbStrip((cur) => {
@@ -223,6 +231,8 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
       setState(computedInitial);
       setSelectedUnaligned(new Set());
       setSelectionAnchor(null);
+      setMergeUndo(null);
+      setDraggingGroupId(null);
     }, [computedInitial]);
 
     // Dismissals are per (verse, version) and only for this session — reset when
@@ -251,6 +261,31 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
     const handleExtractSource = (sourceId: string) => {
       if (!state) return;
       setState(extractSource(state, sourceId));
+    };
+    // Merge a whole card (the dragged group) into the card it was dropped on.
+    // survivor = the earlier-positioned of the two, so the combined Hebrew
+    // chain reads in verse order regardless of drag direction.
+    const handleMergeGroups = (dropTargetId: string, draggedId: string) => {
+      if (!state || dropTargetId === draggedId) return;
+      const order = displayGroups.map((g) => g.id);
+      const ti = order.indexOf(dropTargetId);
+      const di = order.indexOf(draggedId);
+      const [survivor, eaten] =
+        ti !== -1 && di !== -1 && di < ti
+          ? [draggedId, dropTargetId]
+          : [dropTargetId, draggedId];
+      const next = mergeGroups(state, survivor, eaten);
+      if (next === state) return;
+      setMergeUndo(state);
+      setState(next);
+      setDraggingGroupId(null);
+      setSelectedUnaligned(new Set());
+      setSelectionAnchor(null);
+    };
+    const handleUndoMerge = () => {
+      if (!mergeUndo) return;
+      setState(mergeUndo);
+      setMergeUndo(null);
     };
     const handleClearGroup = (groupId: string) => {
       if (!state) return;
@@ -626,6 +661,10 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
                 onSourceDrop={handleSourceDrop}
                 onExtractSource={handleExtractSource}
                 onClearGroup={handleClearGroup}
+                onMerge={handleMergeGroups}
+                draggingGroupId={draggingGroupId}
+                onGroupDragStart={setDraggingGroupId}
+                onGroupDragEnd={() => setDraggingGroupId(null)}
                 hctx={hctx}
               />
             </Box>
@@ -641,6 +680,23 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
               }}
               onSave={handleSave}
               bibleVersion={bibleVersion}
+            />
+            <Snackbar
+              open={mergeUndo !== null}
+              autoHideDuration={6000}
+              onClose={() => setMergeUndo(null)}
+              anchorOrigin={{ vertical: "bottom", horizontal: "center" }}
+              message="merged groups"
+              action={
+                <Button
+                  color="inherit"
+                  size="small"
+                  onClick={handleUndoMerge}
+                  sx={{ fontWeight: 700 }}
+                >
+                  UNDO
+                </Button>
+              }
             />
           </>
         )}
@@ -1134,6 +1190,10 @@ function AlignmentCards({
   onSourceDrop,
   onExtractSource,
   onClearGroup,
+  onMerge,
+  draggingGroupId,
+  onGroupDragStart,
+  onGroupDragEnd,
   hctx,
 }: {
   groups: AlignmentGroup[];
@@ -1147,6 +1207,10 @@ function AlignmentCards({
   onSourceDrop: (destGroupId: string, sourceId: string) => void;
   onExtractSource: (sourceId: string) => void;
   onClearGroup: (groupId: string) => void;
+  onMerge: (dropTargetId: string, draggedId: string) => void;
+  draggingGroupId: string | null;
+  onGroupDragStart: (groupId: string) => void;
+  onGroupDragEnd: () => void;
   hctx: HighlightCtx;
 }) {
   return (
@@ -1171,6 +1235,10 @@ function AlignmentCards({
           groupId={g.id}
           onTargetsDrop={(wordIds) => onTargetsDrop(`g:${g.id}`, wordIds)}
           onSourceDrop={(sourceId) => onSourceDrop(g.id, sourceId)}
+          onMerge={(draggedId) => onMerge(g.id, draggedId)}
+          draggingGroupId={draggingGroupId}
+          onGroupDragStart={onGroupDragStart}
+          onGroupDragEnd={onGroupDragEnd}
         >
           <Box
             dir="rtl"
@@ -1271,14 +1339,25 @@ function DropTargetCard({
   groupId,
   onTargetsDrop,
   onSourceDrop,
+  onMerge,
+  draggingGroupId,
+  onGroupDragStart,
+  onGroupDragEnd,
   children,
 }: {
   groupId: string;
   onTargetsDrop: (wordIds: string[]) => void;
   onSourceDrop: (sourceId: string) => void;
+  onMerge: (draggedGroupId: string) => void;
+  draggingGroupId: string | null;
+  onGroupDragStart: (groupId: string) => void;
+  onGroupDragEnd: () => void;
   children: React.ReactNode;
 }) {
   const [over, setOver] = useState(false);
+  const isBeingDragged = draggingGroupId === groupId;
+  const isMergeTarget = over && draggingGroupId !== null && !isBeingDragged;
+  const showOver = over && !isMergeTarget && !isBeingDragged;
   return (
     <Paper
       elevation={0}
@@ -1290,6 +1369,13 @@ function DropTargetCard({
       onDrop={(e) => {
         e.preventDefault();
         setOver(false);
+        // Whole-card merge takes priority: a dragged grip carries GROUP_ID_MIME.
+        // Ignore a drop of a card onto itself.
+        const draggedGroupId = e.dataTransfer.getData(GROUP_ID_MIME);
+        if (draggedGroupId) {
+          if (draggedGroupId !== groupId) onMerge(draggedGroupId);
+          return;
+        }
         const wordIds = readWordIds(e.dataTransfer);
         if (wordIds.length > 0) {
           onTargetsDrop(wordIds);
@@ -1301,25 +1387,82 @@ function DropTargetCard({
       data-group-id={groupId}
       sx={{
         position: "relative",
-        bgcolor: over ? "primary.50" : "background.paper",
-        borderColor: over ? "primary.main" : "divider",
+        bgcolor: isMergeTarget || showOver ? "primary.50" : "background.paper",
+        borderColor: isMergeTarget || showOver ? "primary.main" : "divider",
         borderWidth: 1,
-        borderStyle: "solid",
+        borderStyle: isMergeTarget ? "dashed" : "solid",
         borderRadius: 1.5,
         px: 1.25,
         // Extra headroom so superscript indicators (Hebrew sup occurrences,
         // chip sup-occurrence indicators) aren't clipped by the card border.
         pt: 1.5,
-        pb: 1,
+        // Extra bottom room for the grip handle below the chips.
+        pb: 2.25,
         minWidth: 160,
         maxWidth: 260,
         flex: "0 1 auto",
         display: "flex",
         flexDirection: "column",
         direction: "ltr",
+        opacity: isBeingDragged ? 0.4 : 1,
+        transition: "opacity 0.12s, border-color 0.12s, background-color 0.12s",
       }}
     >
       {children}
+      {/* Bottom grip — drag a whole card onto another to merge their groups.
+          Sits at the bottom edge, clear of the top-right Hebrew occurrence
+          superscripts and the top-left clear (×) button. */}
+      <Tooltip title="drag onto another card to merge the two groups">
+        <Box
+          draggable
+          onDragStart={(e) => {
+            e.dataTransfer.setData(GROUP_ID_MIME, groupId);
+            e.dataTransfer.effectAllowed = "move";
+            onGroupDragStart(groupId);
+          }}
+          onDragEnd={onGroupDragEnd}
+          sx={{
+            position: "absolute",
+            left: "50%",
+            bottom: 4,
+            transform: "translateX(-50%)",
+            width: 44,
+            height: 11,
+            cursor: "grab",
+            borderRadius: "6px",
+            color: "text.disabled",
+            backgroundImage:
+              "radial-gradient(circle, currentColor 1.3px, transparent 1.7px)",
+            backgroundSize: "8px 6px",
+            backgroundRepeat: "repeat-x",
+            backgroundPosition: "center",
+            opacity: 0.7,
+            transition: "color 0.12s, opacity 0.12s",
+            "&:hover": { color: "primary.main", opacity: 1 },
+            "&:active": { cursor: "grabbing" },
+          }}
+        />
+      </Tooltip>
+      {isMergeTarget && (
+        <Box
+          sx={{
+            position: "absolute",
+            inset: 0,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            bgcolor: "primary.50",
+            color: "primary.dark",
+            fontWeight: 600,
+            fontSize: 13,
+            borderRadius: 1.5,
+            pointerEvents: "none",
+            zIndex: 4,
+          }}
+        >
+          ⤵ merge into this group
+        </Box>
+      )}
     </Paper>
   );
 }
