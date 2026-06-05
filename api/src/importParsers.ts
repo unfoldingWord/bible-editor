@@ -237,7 +237,17 @@ function stripLiftedMarkers(nodes: unknown[]): unknown[] {
 // and collides with the real occurrences on export / re-alignment. Source
 // `\zaln-s` x-occurrence attributes live on the milestone, not on `\w`, so
 // they're never touched here.
-function recomputeTargetOccurrences(verseObjects: unknown[]): unknown[] {
+//
+// Also used as a defensive normalizer on the verse read/write boundaries
+// (chapters.ts, verses.ts, pipelineImport.ts): malformed AI/imported alignment
+// can stamp every `\w` `occurrences="1"` and collide `(text, occurrence)` pairs
+// (e.g. two "is" both occurrence=2), which breaks every feature that keys words
+// by `${text}|${occurrence}` (note-quote highlight, chip colors, quote builder).
+// Recomputing from document position makes the keys unique and correct. A no-op
+// on already-correct verses, so round-trip fidelity on clean data is preserved.
+// Mutates `verseObjects` in place and returns it.
+export function recomputeTargetOccurrences(verseObjects: unknown[]): unknown[] {
+  if (!Array.isArray(verseObjects)) return verseObjects;
   const words: Array<Record<string, unknown>> = [];
   const collect = (nodes: unknown[]): void => {
     for (const node of nodes) {

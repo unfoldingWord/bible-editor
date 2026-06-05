@@ -11,6 +11,7 @@ import {
   extractVersesForRange,
   normalizeWordPunctuation,
   splitGluedAlignmentWords,
+  recomputeTargetOccurrences,
   parseTsv,
   refParts,
 } from "./importParsers.ts";
@@ -279,6 +280,72 @@ function assert(cond, msg) {
   assert(new Set(thes.map((w) => w.occurrence)).size === thes.length, `"the" occurrence numbers are unique`);
   assert(v4.plainText.includes("out”—the"), `plain_text still reads "out”—the" (split is text-invariant)`);
   console.log(`  ZEC 5:4 ULT words: ${words.length}; out/Armies unaligned, "the"×${thes.length} renumbered`);
+}
+
+// --- recomputeTargetOccurrences: heal malformed / colliding occurrence data ---
+// Reproduces the real ZEC 5:3 production corruption: every `occurrences="1"`
+// and a colliding (text, occurrence) pair — two "is" both stamped
+// occurrence="2" — which made one highlight key match two physical words and
+// hid duplicates from the colors filter. Target `\w` are nested inside
+// `\zaln-s` milestones (the ULT/UST shape).
+{
+  const vos = [
+    {
+      type: "milestone", tag: "zaln", content: "זֹאת", occurrence: "1", occurrences: "1",
+      children: [
+        { type: "word", tag: "w", text: "This", occurrence: "1", occurrences: "1" },
+        { type: "word", tag: "w", text: "is", occurrence: "2", occurrences: "1" },
+      ],
+    },
+    { type: "text", text: " " },
+    {
+      type: "milestone", tag: "zaln", content: "הַגֹּנֵב", occurrence: "1", occurrences: "1",
+      children: [
+        { type: "word", tag: "w", text: "who", occurrence: "1", occurrences: "1" },
+        { type: "word", tag: "w", text: "is", occurrence: "2", occurrences: "1" },
+        { type: "word", tag: "w", text: "stealing", occurrence: "1", occurrences: "1" },
+      ],
+    },
+  ];
+  const ret = recomputeTargetOccurrences(vos);
+  assert(ret === vos, `recompute mutates in place and returns the same array`);
+  const words = collectWords(vos, false, []);
+  const ises = words.filter((w) => w.text === "is");
+  assert(ises.length === 2, `two "is" tokens collected`);
+  assert(ises.every((w) => w.occurrences === "2"), `both "is" now occurrences="2" (was the bogus "1")`);
+  assert(
+    JSON.stringify(ises.map((w) => w.occurrence)) === JSON.stringify(["1", "2"]),
+    `colliding "is" renumbered 1,2 in document order`,
+  );
+  const stealing = words.find((w) => w.text === "stealing");
+  assert(stealing.occurrence === "1" && stealing.occurrences === "1", `singleton "stealing" is 1/1`);
+  // The fix must NOT touch the source `\zaln-s` milestone occurrence.
+  assert(vos[0].occurrence === "1" && vos[2].occurrence === "1", `source milestone occurrence untouched`);
+}
+{
+  // Clean, already-correct input → values unchanged (no-op / round-trip safe).
+  const vos = [
+    { type: "word", tag: "w", text: "the", occurrence: "1", occurrences: "2" },
+    { type: "text", text: " " },
+    { type: "word", tag: "w", text: "the", occurrence: "2", occurrences: "2" },
+    { type: "word", tag: "w", text: "earth", occurrence: "1", occurrences: "1" },
+  ];
+  recomputeTargetOccurrences(vos);
+  const words = collectWords(vos, false, []);
+  const thes = words.filter((w) => w.text === "the");
+  assert(
+    JSON.stringify(thes.map((w) => `${w.occurrence}/${w.occurrences}`)) === JSON.stringify(["1/2", "2/2"]),
+    `clean "the" 1/2,2/2 unchanged (no-op)`,
+  );
+  const earth = words.find((w) => w.text === "earth");
+  assert(earth.occurrence === "1" && earth.occurrences === "1", `clean singleton unchanged`);
+}
+{
+  // Non-array / empty input is tolerated (defensive guard for the read/write
+  // boundaries that pass `parsed.verseObjects` of unknown shape).
+  assert(recomputeTargetOccurrences(undefined) === undefined, `undefined passes through`);
+  const empty = [];
+  assert(recomputeTargetOccurrences(empty) === empty, `empty array is a no-op`);
 }
 
 console.log("\nAll parser smoke checks passed.");

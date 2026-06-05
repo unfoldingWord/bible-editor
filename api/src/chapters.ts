@@ -4,6 +4,7 @@ import type { Env } from "./index";
 import type { ChapterPayload, TnRow, TqRow, TwlRow, VerseRow, VerseDto, VerseStatus } from "./types";
 import { currentUserId, requireEditor } from "./auth";
 import { broadcastChapter } from "./wsEvents";
+import { recomputeTargetOccurrences } from "./importParsers";
 
 export const chapters = new Hono<{ Bindings: Env; Variables: { userId?: number } }>();
 
@@ -85,6 +86,15 @@ chapters.get("/:book/:chapter", async (c) => {
       parsed = JSON.parse(content_json);
     } catch {
       parsed = null;
+    }
+    // Defensively renumber target `\w` occurrence/occurrences from document
+    // position so the client never sees malformed/colliding occurrence data
+    // (which breaks note-quote highlight, chip colors, and the quote builder —
+    // all key words by `${text}|${occurrence}`). No-op on clean verses. Source
+    // text (UHB/UGNT) is left untouched — its \w occurrence is the source's own.
+    if (v.bible_version === "ULT" || v.bible_version === "UST") {
+      const vos = (parsed as { verseObjects?: unknown[] } | null)?.verseObjects;
+      if (Array.isArray(vos)) recomputeTargetOccurrences(vos);
     }
     verseMap[v.bible_version][v.verse] = { ...rest, content: parsed };
   }
