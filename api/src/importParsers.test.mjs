@@ -341,6 +341,28 @@ function assert(cond, msg) {
   assert(earth.occurrence === "1" && earth.occurrences === "1", `clean singleton unchanged`);
 }
 {
+  // Source UHB shape: bare `\w` (no \zaln-s) with NO occurrence attribute —
+  // usfm-js leaves it undefined on import, so the two כָל in ZEC 5:3 would
+  // both default to `כָל|1` and a single note quote highlights both. The read
+  // boundary recomputes them by position. Mirrors the verse parsed live above.
+  const vos = [
+    { type: "word", tag: "w", text: "כָל" },
+    { type: "text", text: "־" },
+    { type: "word", tag: "w", text: "הָאָרֶץ" },
+    { type: "text", text: " " },
+    { type: "word", tag: "w", text: "כָל" },
+    { type: "text", text: "־" },
+    { type: "word", tag: "w", text: "הַגֹּנֵב" },
+  ];
+  recomputeTargetOccurrences(vos);
+  const words = collectWords(vos, false, []);
+  const kols = words.filter((w) => w.text === "כָל");
+  assert(
+    JSON.stringify(kols.map((w) => `${w.occurrence}/${w.occurrences}`)) === JSON.stringify(["1/2", "2/2"]),
+    `undefined-occurrence source כָל numbered 1/2,2/2 (was both undefined→1)`,
+  );
+}
+{
   // Non-array / empty input is tolerated (defensive guard for the read/write
   // boundaries that pass `parsed.verseObjects` of unknown shape).
   assert(recomputeTargetOccurrences(undefined) === undefined, `undefined passes through`);

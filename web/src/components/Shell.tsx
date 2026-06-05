@@ -30,6 +30,7 @@ import { concatSourceRange, formatVerseLabel } from "../lib/verseRange";
 import { buildTnQuickRequest } from "../lib/tnQuickRequest";
 import { findSourceForTargetText, type HighlightKey } from "../lib/highlight";
 import { buildQuoteFromSelection } from "../lib/quoteBuilder";
+import { nfc } from "../lib/hebrew";
 import { TimelineRail } from "./TimelineRail";
 import { ScriptureColumn, type ScriptureMode } from "./ScriptureColumn";
 import { ResourceColumn, type AlignmentTabProps, type PanelMode } from "./ResourceColumn";
@@ -570,9 +571,24 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     if (!Array.isArray(verseObjects)) return;
     const built = buildQuoteFromSelection(verseObjects, quoteBuildSelectedKeys);
     if (!built) return;
-    // Optimistic row patch first so row.quote is current, then signal the
-    // card (which stays active) to pull it into the box past its session guard.
-    enqueueRow("tn", row, { quote: built.quote, occurrence: built.occurrence });
+    // Only enqueue a save when the build actually changes the stored (quote,
+    // occurrence) — re-running "build from source" over an unchanged selection
+    // (or a quote that was itself built this way) must not bump the row version.
+    // Compare quotes NFC-normalized: the builder emits raw UHB legacy
+    // combining-mark order, while a stored quote may be NFC (typed / AI), so a
+    // raw compare would false-positive on visually-identical text — same nfc()
+    // rule the highlighter uses. A null stored occurrence means "first", == 1.
+    const changed =
+      nfc(built.quote) !== nfc(row.quote ?? "") || built.occurrence !== (row.occurrence ?? 1);
+    if (changed) {
+      // Optimistic row patch first so row.quote is current for the box-sync below.
+      enqueueRow("tn", row, { quote: built.quote, occurrence: built.occurrence });
+    }
+    // Always signal the card (which stays active) to force the box to the
+    // committed quote and rebaseline the session snapshot — the row→box sync
+    // effect is otherwise gated by the open session. Idempotent on a true
+    // no-op, and on a no-op over unsaved box edits it still lands the quote the
+    // user just committed (don't gate this on `changed`).
     setQuoteBuildAppliedTo((prev) => ({ noteId: row.id, nonce: (prev?.nonce ?? 0) + 1 }));
     setQuoteBuildNoteId(null);
     setQuoteBuildSelectedKeys(new Set());

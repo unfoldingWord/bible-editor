@@ -87,15 +87,20 @@ chapters.get("/:book/:chapter", async (c) => {
     } catch {
       parsed = null;
     }
-    // Defensively renumber target `\w` occurrence/occurrences from document
-    // position so the client never sees malformed/colliding occurrence data
-    // (which breaks note-quote highlight, chip colors, and the quote builder —
-    // all key words by `${text}|${occurrence}`). No-op on clean verses. Source
-    // text (UHB/UGNT) is left untouched — its \w occurrence is the source's own.
-    if (v.bible_version === "ULT" || v.bible_version === "UST") {
-      const vos = (parsed as { verseObjects?: unknown[] } | null)?.verseObjects;
-      if (Array.isArray(vos)) recomputeTargetOccurrences(vos);
-    }
+    // Defensively renumber `\w` occurrence/occurrences from document position
+    // so the client never sees malformed/colliding occurrence data (which
+    // breaks note-quote highlight, chip colors, and the quote builder — all key
+    // words by `${text}|${occurrence}`). No-op on clean verses.
+    //
+    // Source UHB/UGNT is included: our imported source carries NO x-occurrence
+    // on `\w` (usfm-js leaves it undefined), so identical surface forms — e.g.
+    // the two כָל in ZEC 5:3 — all collapse to `text|1` and a single note quote
+    // lights up every copy. Numbering by position matches the source's own
+    // occurrence semantics (and the ULT/UST \zaln-s occurrence: ZEC 5:3's
+    // second כָל is occ 2 on both sides). This is display-only — D1 storage and
+    // the nightly export still emit source verbatim, so round-trip stays exact.
+    const vos = (parsed as { verseObjects?: unknown[] } | null)?.verseObjects;
+    if (Array.isArray(vos)) recomputeTargetOccurrences(vos);
     verseMap[v.bible_version][v.verse] = { ...rest, content: parsed };
   }
 

@@ -7,14 +7,15 @@ import { activePipelineForChapter, lockedResponseBody } from "./chapterLock";
 import { broadcastChapter } from "./wsEvents";
 import { recomputeTargetOccurrences } from "./importParsers";
 
-// Target (ULT/UST) verse content can carry malformed `\w` occurrence data —
-// every `occurrences="1"` and colliding `(text, occurrence)` pairs — from a bad
-// import or AI alignment. Features that key words by `${text}|${occurrence}`
-// (note-quote highlight, chip colors, quote builder) break on it. Normalize the
-// occurrence numbering from document position on both read and write so the
-// served + stored content is always self-consistent. No-op on clean verses and
-// on source text (UHB/UGNT \w occurrence is left to the source importer).
-function normalizeTargetContent(parsed: unknown): void {
+// Verse content can carry malformed/missing `\w` occurrence data — colliding
+// `(text, occurrence)` pairs from a bad import or AI alignment (ULT/UST), or no
+// x-occurrence at all on imported source `\w` (UHB/UGNT, where usfm-js leaves
+// it undefined → every copy defaults to `text|1`). Features that key words by
+// `${text}|${occurrence}` (note-quote highlight, chip colors, quote builder)
+// break on it. Renumber from document position so the served content is always
+// self-consistent. No-op on clean verses; matches the source's own occurrence
+// semantics, so source highlight (e.g. the two כָל in ZEC 5:3) disambiguates.
+function normalizeOccurrences(parsed: unknown): void {
   const vos = (parsed as { verseObjects?: unknown[] } | null)?.verseObjects;
   if (Array.isArray(vos)) recomputeTargetOccurrences(vos);
 }
@@ -69,8 +70,10 @@ verses.get("/:book/:chapter/:verse/:bibleVersion", async (c) => {
   } catch {
     parsed = null;
   }
-  // ULT/UST only — UHB/UGNT \w occurrence belongs to the source importer.
-  if (bv === "ULT" || bv === "UST") normalizeTargetContent(parsed);
+  // All versions on read: source UHB/UGNT needs it too (no x-occurrence in the
+  // imported source — see normalizeOccurrences). Display-only; storage/export
+  // emit source verbatim, so round-trip fidelity is unaffected.
+  normalizeOccurrences(parsed);
   return c.json({ ...row, content: parsed });
 });
 
@@ -111,7 +114,7 @@ verses.patch("/:book/:chapter/:verse/:bibleVersion", requireEditor, async (c) =>
   // Self-heal the occurrence numbering before it lands in D1 (and therefore in
   // the nightly DCS export). Reaches this point only for ULT/UST — UHB/UGNT
   // were rejected above. Mutates parsed.data.content.verseObjects in place.
-  normalizeTargetContent(parsed.data.content);
+  normalizeOccurrences(parsed.data.content);
 
   const userId = currentUserId(c);
   const now = Math.floor(Date.now() / 1000);

@@ -682,6 +682,40 @@ function roundtripVerseUsfm(rawUsfm, sourceVO = null) {
   assert(b4 === null, "empty selection returns null");
 }
 
+// ─── Case 12b: maqqef-joined run keeps its maqqef ─────────────────────────
+//
+// ZEC 5:3 style: כָל and הַגֹּנֵב are separate \w tokens joined by a maqqef
+// text node (usfm-js emits "־" as a bare text sibling). Building a quote
+// from that consecutive run must reproduce כָל־הַגֹּנֵב, not כָל הַגֹּנֵב.
+// Distinct occurrences also disambiguate the two כָל so only the intended
+// run is selected.
+{
+  console.log("\n[Case 12b] Quote builder preserves the maqqef");
+  const verseObjects = [
+    { type: "word", tag: "w", text: "כָל", occurrence: 1, occurrences: 2 },
+    { type: "text", text: "־" },
+    { type: "word", tag: "w", text: "הָאָרֶץ", occurrence: 1, occurrences: 1 },
+    { type: "text", text: " " },
+    { type: "word", tag: "w", text: "כָל", occurrence: 2, occurrences: 2 },
+    { type: "text", text: "־" },
+    { type: "word", tag: "w", text: "הַגֹּנֵב", occurrence: 1, occurrences: 1 },
+  ];
+
+  // Select the SECOND כָל + הַגֹּנֵב (the maqqef-joined "all who steal").
+  const sel = new Set(["כָל|2", "הַגֹּנֵב|1"]);
+  const b = buildQuoteFromSelection(verseObjects, sel);
+  assert(b !== null, "builder returns non-null");
+  assert(b?.quote === "כָל־הַגֹּנֵב", `maqqef preserved (got: ${b?.quote})`);
+  // First (and only) occurrence of the phrase כָל־הַגֹּנֵב in the verse.
+  assert(b?.occurrence === 1, `occurrence=1 (got: ${b?.occurrence})`);
+
+  // A space-separated run still joins with a space, not a maqqef: הָאָרֶץ is
+  // followed by a " " text node before the second כָל.
+  const selSpace = new Set(["הָאָרֶץ|1", "כָל|2"]);
+  const bSpace = buildQuoteFromSelection(verseObjects, selSpace);
+  assert(bSpace?.quote === "הָאָרֶץ כָל", `space run stays space-joined (got: ${bSpace?.quote})`);
+}
+
 // ─── Case 13: collectTargetTokens — ancestor chain per \w ────────────────
 //
 // The picker resolves an English click to its \zaln-s ancestor chain so

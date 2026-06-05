@@ -32,6 +32,12 @@ interface UhbWord {
   // across re-render because the verseObjects tree is immutable while
   // the user is selecting.
   position: number;
+  // Text node(s) sitting between this \w and the next one — usually a
+  // single space, but a Hebrew maqqef (־) for joined words like
+  // כָל־הַגֹּנֵב. Used to rejoin a consecutive run with the ORIGINAL
+  // separator instead of a flat space, so a built quote reads כָל־הַגֹּנֵב
+  // (matching how TN quotes are written) and not כָל הַגֹּנֵב.
+  trailing: string;
 }
 
 function collectUhbWords(verseObjects: unknown[]): UhbWord[] {
@@ -43,7 +49,12 @@ function collectUhbWords(verseObjects: unknown[]): UhbWord[] {
       if (o["type"] === "word" && o["tag"] === "w") {
         const text = String(o["text"] ?? "");
         const occurrence = parseInt(String(o["occurrence"] ?? "1"), 10) || 1;
-        out.push({ text, key: tokenKey(text, occurrence), occurrence, position: out.length });
+        out.push({ text, key: tokenKey(text, occurrence), occurrence, position: out.length, trailing: "" });
+      } else if (o["type"] === "text") {
+        // Attach to the most recent word as its separator. usfm-js emits the
+        // maqqef / inter-word space as a bare text sibling of the \w tokens.
+        const prev = out[out.length - 1];
+        if (prev) prev.trailing += String(o["text"] ?? "");
       } else if (o["type"] === "milestone") {
         const children = (o["children"] as unknown[] | undefined) ?? [];
         walk(children);
@@ -57,6 +68,13 @@ function collectUhbWords(verseObjects: unknown[]): UhbWord[] {
 export interface BuiltQuote {
   quote: string;
   occurrence: number;
+}
+
+// Separator to place after `w` when rejoining it with the next word in the
+// same run. A maqqef in the trailing text wins (joined Hebrew word); anything
+// else is a plain space.
+function separatorAfter(w: UhbWord): string {
+  return w.trailing.includes("־") ? "־" : " ";
 }
 
 export function buildQuoteFromSelection(
@@ -82,7 +100,17 @@ export function buildQuoteFromSelection(
   }
   if (current.length > 0) groups.push(current);
 
-  const quote = groups.map((g) => g.map((w) => w.text).join(" ")).join(" & ");
+  // Join each consecutive run with the original inter-word separator so a
+  // maqqef-joined pair (כָל־הַגֹּנֵב) round-trips with its maqqef. Any other
+  // separator (a normal space, cantillation gaps) collapses to a single
+  // space — the highlight matcher splits on /[\s־]+/ either way.
+  const quote = groups
+    .map((g) =>
+      g
+        .map((w, i) => (i === 0 ? w.text : separatorAfter(g[i - 1]) + w.text))
+        .join(""),
+    )
+    .join(" & ");
 
   // Occurrence — count how many positions in `all` start a matching
   // pattern. A pattern matches when scanning forward from `start`: for
