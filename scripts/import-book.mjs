@@ -15,6 +15,11 @@ import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import usfm from "usfm-js";
+// De-glue AI punctuation-spanning `\w` tokens (e.g. ZEC 5:4 `\w out”—the\w*`).
+// Imported from the canonical importer rather than mirrored like
+// normalizeWordPunctuation below: the transform is large and must stay in
+// lockstep with extractVersesForRange. Node 24 strips the .ts types on import.
+import { splitGluedAlignmentWords } from "../api/src/importParsers.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(here, "..");
@@ -126,7 +131,11 @@ function importVerses(bibleVersion, srcPath) {
       const verseObj = chapterObj[verse];
       const normalized = {
         ...verseObj,
-        verseObjects: normalizeWordPunctuation(verseObj.verseObjects ?? []),
+        // Strip outer punctuation, then de-glue any punctuation-spanning `\w`
+        // (e.g. `\w out”—the\w*`) — same order as extractVersesForRange.
+        verseObjects: splitGluedAlignmentWords(
+          normalizeWordPunctuation(verseObj.verseObjects ?? []),
+        ),
       };
       const text = extractPlainText(normalized);
       const json_blob = JSON.stringify(normalized);

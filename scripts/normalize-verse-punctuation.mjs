@@ -108,9 +108,10 @@ lines.push(`-- Source: ${dumpPath}`);
 lines.push(`-- Generated: ${new Date().toISOString()}`);
 lines.push(`-- Rows scanned: ${scanned}`);
 lines.push(`-- Rows changed: ${changed}`);
-lines.push("BEGIN TRANSACTION;");
+// No explicit BEGIN/COMMIT: D1 rejects raw transaction statements over
+// --remote, and `wrangler d1 execute --file` already applies the batch
+// atomically (rolls back to the original state if any statement fails).
 lines.push(...updates);
-lines.push("COMMIT;");
 
 const outDir = resolve(repoRoot, "scripts/out");
 mkdirSync(outDir, { recursive: true });
