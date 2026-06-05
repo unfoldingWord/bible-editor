@@ -404,7 +404,7 @@ export function ResourceColumn({
             tnGroups.map(([verse, rows]) => (
               <Fragment key={`tn-${verse}`}>
                 <VerseGroupHead verse={verse} active={verse === activeVerse} />
-                {rows.map((r) => renderNoteCard(r))}
+                {rows.map((r) => renderNoteCard(r, rows))}
               </Fragment>
             ))
           )
@@ -413,7 +413,7 @@ export function ResourceColumn({
             no notes for this verse
           </Typography>
         ) : (
-          tnForVerse.map((r) => renderNoteCard(r))
+          tnForVerse.map((r) => renderNoteCard(r, tnForVerse))
         )}
 
         <Box sx={{ height: 16 }} />
@@ -492,11 +492,14 @@ export function ResourceColumn({
     </Box>
   );
 
-  function renderNoteCard(r: TnRow) {
+  function renderNoteCard(r: TnRow, peers: TnRow[]) {
     const showBefore =
       dragId && dragId !== r.id && dragOver?.targetId === r.id && dragOver.position === "before";
     const showAfter =
       dragId && dragId !== r.id && dragOver?.targetId === r.id && dragOver.position === "after";
+    const idx = peers.indexOf(r);
+    const prevNote = idx > 0 ? peers[idx - 1] : null;
+    const nextNote = idx < peers.length - 1 ? peers[idx + 1] : null;
     return (
       <Fragment key={r.id}>
         {showBefore && <DropIndicator />}
@@ -511,6 +514,8 @@ export function ResourceColumn({
           onInsertAfter={() => onNoteInsertAfter(r.id)}
           onFocus={() => onNoteFocus(r)}
           onGripDragStart={() => setDragId(r.id)}
+          onMoveUp={prevNote ? () => onNoteReorder(r.id, prevNote.id, "before") : undefined}
+          onMoveDown={nextNote ? () => onNoteReorder(r.id, nextNote.id, "after") : undefined}
           onDragEnd={() => {
             setDragId(null);
             setDragOver(null);

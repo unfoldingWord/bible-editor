@@ -22,6 +22,8 @@ import LightbulbOutlinedIcon from "@mui/icons-material/LightbulbOutlined";
 import DeleteOutlineIcon from "@mui/icons-material/DeleteOutline";
 import AddIcon from "@mui/icons-material/Add";
 import DragIndicatorIcon from "@mui/icons-material/DragIndicator";
+import ArrowUpwardIcon from "@mui/icons-material/ArrowUpward";
+import ArrowDownwardIcon from "@mui/icons-material/ArrowDownward";
 import SaveIcon from "@mui/icons-material/Save";
 import SaveOutlinedIcon from "@mui/icons-material/SaveOutlined";
 import TranslateIcon from "@mui/icons-material/Translate";
@@ -63,6 +65,8 @@ interface Props {
   onCardDragOver: (position: DropPosition) => void;
   onCardDragLeave: () => void;
   onCardDrop: (position: DropPosition) => void;
+  onMoveUp?: () => void;
+  onMoveDown?: () => void;
   // Async AI-draft lifecycle. State lives in Shell so the call can
   // survive the card un-focusing / scrolling off-screen. NoteCard is
   // purely presentational w.r.t. AI: shows spinner while pending,
@@ -154,6 +158,8 @@ function NoteCardInner({
   onCardDragOver,
   onCardDragLeave,
   onCardDrop,
+  onMoveUp,
+  onMoveDown,
   isAiPending = false,
   aiRecentlyCompletedAt = null,
   onStartAi,
@@ -664,6 +670,30 @@ function NoteCardInner({
           >
             <DragIndicatorIcon fontSize="small" />
           </Box>
+        </Tooltip>
+        <Tooltip title="move up">
+          <span>
+            <IconButton
+              size="small"
+              onClick={(e) => { e.stopPropagation(); onMoveUp?.(); }}
+              disabled={!onMoveUp}
+              sx={{ p: 0.25, color: "text.disabled" }}
+            >
+              <ArrowUpwardIcon sx={{ fontSize: 14 }} />
+            </IconButton>
+          </span>
+        </Tooltip>
+        <Tooltip title="move down">
+          <span>
+            <IconButton
+              size="small"
+              onClick={(e) => { e.stopPropagation(); onMoveDown?.(); }}
+              disabled={!onMoveDown}
+              sx={{ p: 0.25, color: "text.disabled" }}
+            >
+              <ArrowDownwardIcon sx={{ fontSize: 14 }} />
+            </IconButton>
+          </span>
         </Tooltip>
         <Box sx={readOnly ? { pointerEvents: "none", opacity: 0.6 } : undefined}>
           <CatalogPicker
