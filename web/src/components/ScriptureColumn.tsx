@@ -1198,8 +1198,8 @@ function ActiveLine({
         </Typography>
         {onOpenAligner && (
           <Tooltip title={`align ${label}`}>
-            <IconButton size="small" onClick={onOpenAligner} sx={{ color: "success.main", p: 0.25 }}>
-              <LinkIcon sx={{ fontSize: 14 }} />
+            <IconButton size="small" onClick={onOpenAligner} sx={{ color: "success.main", p: 0.5, ml: "auto" }}>
+              <LinkIcon sx={{ fontSize: 22 }} />
             </IconButton>
           </Tooltip>
         )}
@@ -1211,14 +1211,15 @@ function ActiveLine({
                 disabled={!hasDraft}
                 onClick={() => onSave(elRef.current?.textContent ?? "")}
                 sx={{
-                  p: 0.25,
+                  p: 0.5,
+                  ml: onOpenAligner ? 0 : "auto",
                   color: hasDraft ? "primary.main" : "action.disabled",
                 }}
               >
                 {hasDraft ? (
-                  <SaveIcon sx={{ fontSize: 14 }} />
+                  <SaveIcon sx={{ fontSize: 22 }} />
                 ) : (
-                  <SaveOutlinedIcon sx={{ fontSize: 14 }} />
+                  <SaveOutlinedIcon sx={{ fontSize: 22 }} />
                 )}
               </IconButton>
             </span>
@@ -1239,9 +1240,9 @@ function ActiveLine({
                   lastSetRef.current = html ?? editableText;
                 }
               }}
-              sx={{ p: 0.25, color: "warning.main" }}
+              sx={{ p: 0.5, color: "warning.main" }}
             >
-              <UndoIcon sx={{ fontSize: 14 }} />
+              <UndoIcon sx={{ fontSize: 22 }} />
             </IconButton>
           </Tooltip>
         )}
