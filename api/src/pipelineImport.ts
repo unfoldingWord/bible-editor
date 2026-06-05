@@ -10,6 +10,7 @@ import type { Env } from "./index";
 import {
   extractVersesForRange,
   parseTsv,
+  recomputeTargetOccurrences,
   refParts,
   type VerseExtract,
 } from "./importParsers";
@@ -722,9 +723,25 @@ async function applyVerseUpdate(
   const verseEnd =
     typeof verseEndRaw === "number" && Number.isFinite(verseEndRaw) ? verseEndRaw : null;
   const bibleVersion = String(payload.bible_version ?? p.bible_version ?? "");
-  const contentJson = String(payload.content_json ?? "");
+  let contentJson = String(payload.content_json ?? "");
   const plainText = (payload.plain_text as string | null) ?? null;
   const rowKey = `${book}/${chapter}/${verse}/${bibleVersion}`;
+
+  // Self-heal target `\w` occurrence numbering before the AI-applied alignment
+  // lands in D1. The bot can emit colliding/`occurrences="1"` data; recomputing
+  // from document position keeps note-highlight / colors / quote-builder correct
+  // and the DCS export valid. No-op on clean output; source text left untouched.
+  if (bibleVersion === "ULT" || bibleVersion === "UST") {
+    try {
+      const parsed = JSON.parse(contentJson) as { verseObjects?: unknown[] };
+      if (Array.isArray(parsed?.verseObjects)) {
+        recomputeTargetOccurrences(parsed.verseObjects);
+        contentJson = JSON.stringify(parsed);
+      }
+    } catch {
+      /* leave contentJson as-is if it isn't parseable JSON */
+    }
+  }
 
   const existing = await env.DB.prepare(
     `SELECT version FROM verses
