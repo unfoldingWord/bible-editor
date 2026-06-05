@@ -107,4 +107,26 @@ function mkVerse(chapter, verse, verseEnd, text) {
   assert(!out.includes("\\v 6-3"), `no \\v 6-3 emitted`);
 }
 
+// --- export heals malformed target occurrence (ULT/UST); leaves source (UHB) ---
+{
+  const verseRow = (bibleVersion, vos) => ({
+    book: "NUM", chapter: 20, verse: 3, verse_end: null, bible_version: bibleVersion,
+    content_json: JSON.stringify({ verseObjects: vos }),
+    plain_text: "is is", version: 1, updated_by: null, updated_at: 0,
+  });
+  // The real corruption shape: two "is" both stamped occurrence="2"/occurrences="1".
+  const corrupt = [
+    { type: "word", tag: "w", text: "is", occurrence: "2", occurrences: "1" },
+    { type: "text", text: " " },
+    { type: "word", tag: "w", text: "is", occurrence: "2", occurrences: "1" },
+  ];
+  const ult = buildUsfm({ book: "NUM", bibleVersion: "ULT", headers: null, verses: [verseRow("ULT", corrupt)] });
+  assert(ult.includes('x-occurrence="1" x-occurrences="2"'), `ULT export heals first "is" → 1/2`);
+  assert(ult.includes('x-occurrence="2" x-occurrences="2"'), `ULT export heals second "is" → 2/2`);
+  assert(!ult.includes('x-occurrences="1"'), `ULT export: no stale occurrences="1" shipped`);
+  // UHB is the source text — its \w occurrence is emitted exactly as stored.
+  const uhb = buildUsfm({ book: "NUM", bibleVersion: "UHB", headers: null, verses: [verseRow("UHB", corrupt)] });
+  assert(uhb.includes('x-occurrence="2" x-occurrences="1"'), `UHB export leaves source occurrence verbatim`);
+}
+
 console.log("\nAll export smoke checks passed.");

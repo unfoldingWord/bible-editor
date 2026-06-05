@@ -81,6 +81,44 @@ export interface UsfmInputs {
   verses: VerseRow[];
 }
 
+// Mirror of `recomputeTargetOccurrences` in importParsers.ts (kept local to
+// avoid a cross-module value import — export.ts is loaded by the node
+// strip-types test runner, which can't resolve extensionless `.ts` imports;
+// see import-book.mjs for the same mirror-with-pointer pattern). Renumbers
+// target `\w` occurrence/occurrences from document position so a stale stored
+// row never ships invalid USFM to DCS. Source `\zaln-s` milestone occurrence
+// lives on the milestone, not on `\w`, so it is never touched. No-op on clean
+// verses. Mutates `verseObjects` in place.
+function recomputeTargetOccurrences(verseObjects: unknown[]): void {
+  if (!Array.isArray(verseObjects)) return;
+  const words: Array<Record<string, unknown>> = [];
+  const collect = (nodes: unknown[]): void => {
+    for (const node of nodes) {
+      if (!node || typeof node !== "object") continue;
+      const o = node as Record<string, unknown>;
+      if (o["type"] === "word" && o["tag"] === "w" && typeof o["text"] === "string") {
+        words.push(o);
+      } else if (Array.isArray(o["children"])) {
+        collect(o["children"] as unknown[]);
+      }
+    }
+  };
+  collect(verseObjects);
+  const totals = new Map<string, number>();
+  for (const w of words) {
+    const key = String(w["text"]);
+    totals.set(key, (totals.get(key) ?? 0) + 1);
+  }
+  const running = new Map<string, number>();
+  for (const w of words) {
+    const key = String(w["text"]);
+    const n = (running.get(key) ?? 0) + 1;
+    running.set(key, n);
+    w["occurrence"] = String(n);
+    w["occurrences"] = String(totals.get(key) ?? 1);
+  }
+}
+
 export function buildUsfm(input: UsfmInputs): string {
   // Group verses by chapter, parsing the stored JSON. Unreadable verses are
   // skipped rather than failing the whole book — better to ship 99% than 0%.
@@ -91,6 +129,17 @@ export function buildUsfm(input: UsfmInputs): string {
       parsed = JSON.parse(v.content_json);
     } catch {
       continue;
+    }
+    // Emit valid occurrence numbering even when the stored row is stale.
+    // Malformed target `\w` occurrence/occurrences (every "1", colliding
+    // (text,occurrence) pairs) would otherwise ship invalid USFM to DCS for
+    // any verse not yet re-saved through the self-healing write path. Recompute
+    // from document position here so the exported snapshot is always correct;
+    // no-op on clean verses, and source text (UHB/UGNT) is left untouched.
+    const bv = input.bibleVersion.toUpperCase();
+    if ((bv === "ULT" || bv === "UST") && parsed && typeof parsed === "object") {
+      const vos = (parsed as { verseObjects?: unknown[] }).verseObjects;
+      if (Array.isArray(vos)) recomputeTargetOccurrences(vos);
     }
     const ch = String(v.chapter);
     if (!chapters[ch]) chapters[ch] = {};
