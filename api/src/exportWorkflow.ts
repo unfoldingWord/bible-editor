@@ -18,6 +18,7 @@ import { WorkflowEntrypoint, type WorkflowEvent, type WorkflowStep } from "cloud
 import type { Env } from "./index";
 import {
   ALL_RESOURCES,
+  buildExportBranch,
   buildTnTsv,
   buildTqTsv,
   buildTwlTsv,
@@ -50,6 +51,9 @@ export interface StepResult {
   rowCount: number;
   bytes: number;
   r2Key: string | null;
+  // The per-(book,resource) DCS branch this resource was committed to, named
+  // for the book + its human contributors. null only when nothing was rendered.
+  branch: string | null;
   dcsCommitSha: string | null;
   dcsChanged: boolean;
   dcsSkippedReason: string | null;
@@ -121,18 +125,23 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     const built = await this.buildResource(book, resource);
 
     if (built.content === "") {
-      await this.recordSnapshot(book, resource, null, built.rowCount, "no_rows");
+      await this.recordSnapshot(book, resource, null, null, built.rowCount, "no_rows");
       return {
         book,
         resource,
         rowCount: built.rowCount,
         bytes: 0,
         r2Key: null,
+        branch: null,
         dcsCommitSha: null,
         dcsChanged: false,
         dcsSkippedReason: "no_rows",
       };
     }
+
+    // Book-specific branch named for this resource's human contributors.
+    const contributors = await this.contributorsFor(book, resource);
+    const branch = buildExportBranch(book, contributors);
 
     // R2 is the local-only backup. Writing here first means a failed DCS
     // commit still leaves a recoverable artifact.
@@ -151,7 +160,6 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       dcsSkippedReason = this.env.DCS_SERVICE_TOKEN ? "dry_run" : "no_service_token";
     } else {
       const owner = this.env.DCS_EXPORT_OWNER ?? "unfoldingWord";
-      const branch = this.env.DCS_EXPORT_BRANCH ?? "live-snapshot";
       const commit = await commitToDcs(
         {
           baseUrl: this.env.DCS_BASE_URL,
@@ -162,13 +170,13 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
         },
         filename,
         built.content,
-        `bible-editor export: ${book} ${resource} (${instanceId})`,
+        `bible-editor export: ${book} ${resource} → ${branch} (${instanceId})`,
       );
       dcsCommitSha = commit.commitSha || null;
       dcsChanged = commit.changed;
     }
 
-    await this.recordSnapshot(book, resource, dcsCommitSha, built.rowCount, dcsSkippedReason);
+    await this.recordSnapshot(book, resource, branch, dcsCommitSha, built.rowCount, dcsSkippedReason);
 
     return {
       book,
@@ -176,6 +184,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       rowCount: built.rowCount,
       bytes: built.content.length,
       r2Key,
+      branch,
       dcsCommitSha,
       dcsChanged,
       dcsSkippedReason,
@@ -247,18 +256,47 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     };
   }
 
+  // Human contributors to one resource of one book, in first-edit order.
+  // Drives the export branch name. `source IS NULL` excludes AI-pipeline edits
+  // (the only non-null source today is 'ai_pipeline'; see migration 0010).
+  //
+  //   tn/tq/twl → edit_log.kind matches the resource directly.
+  //   ult/ust   → kind='verse'; the bible version lives in the last segment of
+  //               row_key ('{book}/{ch}/{v}/{VERSION}'), so match by suffix.
+  private async contributorsFor(book: string, resource: Resource): Promise<string[]> {
+    const isBible = resource === "ult" || resource === "ust";
+    const sql = isBible
+      ? `SELECT u.dcs_username AS username, MIN(e.created_at) AS first_at
+           FROM edit_log e JOIN users u ON u.id = e.user_id
+          WHERE e.kind = 'verse' AND e.book = ?1 AND e.source IS NULL
+            AND e.row_key LIKE ?2
+          GROUP BY u.id
+          ORDER BY first_at ASC, u.dcs_username ASC`
+      : `SELECT u.dcs_username AS username, MIN(e.created_at) AS first_at
+           FROM edit_log e JOIN users u ON u.id = e.user_id
+          WHERE e.kind = ?1 AND e.book = ?2 AND e.source IS NULL
+          GROUP BY u.id
+          ORDER BY first_at ASC, u.dcs_username ASC`;
+    const stmt = isBible
+      ? this.env.DB.prepare(sql).bind(book, `${book}/%/${resource.toUpperCase()}`)
+      : this.env.DB.prepare(sql).bind(resource, book);
+    const rs = await stmt.all<{ username: string; first_at: number }>();
+    return rs.results.map((r) => r.username);
+  }
+
   private async recordSnapshot(
     book: string,
     resource: Resource,
+    branch: string | null,
     commitSha: string | null,
     rowsExported: number,
     skippedReason: string | null,
   ): Promise<void> {
     await this.env.DB.prepare(
-      `INSERT INTO export_snapshots (book, resource, commit_sha, rows_exported, error)
-       VALUES (?1, ?2, ?3, ?4, ?5)`,
+      `INSERT INTO export_snapshots (book, resource, branch, commit_sha, rows_exported, error)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6)`,
     )
-      .bind(book, resource, commitSha, rowsExported, skippedReason)
+      .bind(book, resource, branch, commitSha, rowsExported, skippedReason)
       .run();
   }
 }

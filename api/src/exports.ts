@@ -49,12 +49,12 @@ exports.get("/", requireAdmin, async (c) => {
   const bookFilter = c.req.query("book")?.toUpperCase();
   const stmt = bookFilter
     ? c.env.DB.prepare(
-        `SELECT id, book, resource, commit_sha, committed_at, rows_exported, error
+        `SELECT id, book, resource, branch, commit_sha, committed_at, rows_exported, error
            FROM export_snapshots WHERE book = ?1
            ORDER BY id DESC LIMIT ?2`,
       ).bind(bookFilter, limit)
     : c.env.DB.prepare(
-        `SELECT id, book, resource, commit_sha, committed_at, rows_exported, error
+        `SELECT id, book, resource, branch, commit_sha, committed_at, rows_exported, error
            FROM export_snapshots
            ORDER BY id DESC LIMIT ?1`,
       ).bind(limit);
@@ -62,6 +62,7 @@ exports.get("/", requireAdmin, async (c) => {
     id: number;
     book: string;
     resource: string;
+    branch: string | null;
     commit_sha: string | null;
     committed_at: number;
     rows_exported: number;
