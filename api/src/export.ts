@@ -236,9 +236,61 @@ function utf8ToBase64(s: string): string {
   return btoa(bin);
 }
 
+// Force the export branch to point at the repo's current master HEAD, creating
+// it from master if it doesn't exist yet. This is what keeps the nightly PR
+// mergeable: the export branch is always a *direct child of current master*, so
+// the PR diff is exactly the rendered delta (the human edits) rather than a
+// 3-way merge against a frozen merge-base. Without it the branch's base freezes
+// the day it was cut and drifts into conflict as master moves underneath it.
+//
+// PATCH git/refs/{ref} uses `git update-ref` semantics (a `target` SHA, no force
+// flag in the option — non-fast-forward moves are allowed), so resetting a
+// diverged branch back onto master is a single call that PRESERVES any open PR.
+// (delete+recreate would close the PR, so we don't do that.)
+async function resetExportBranchToMaster(config: DcsCommitConfig): Promise<void> {
+  const headers: Record<string, string> = {
+    Authorization: `token ${config.token}`,
+    "Content-Type": "application/json",
+    Accept: "application/json",
+  };
+  const repoBase = `${config.baseUrl}/api/v1/repos/${encodeURIComponent(config.owner)}/${encodeURIComponent(config.repo)}`;
+
+  const masterRes = await fetch(`${repoBase}/git/refs/heads/master`, { method: "GET", headers });
+  if (!masterRes.ok) {
+    throw new Error(`dcs_master_ref_failed: ${masterRes.status} ${await masterRes.text()}`);
+  }
+  // An exact ref match may come back as a single object or a one-element array.
+  const refData = (await masterRes.json()) as
+    | { object?: { sha?: string } }
+    | Array<{ object?: { sha?: string } }>;
+  const masterSha = Array.isArray(refData) ? refData[0]?.object?.sha : refData.object?.sha;
+  if (!masterSha) throw new Error("dcs_master_ref_missing_sha");
+
+  const patchRes = await fetch(
+    `${repoBase}/git/refs/heads/${encodeURIComponent(config.branch)}`,
+    { method: "PATCH", headers, body: JSON.stringify({ target: masterSha }) },
+  );
+  if (patchRes.ok) return;
+  if (patchRes.status === 404) {
+    // Branch doesn't exist yet — create it from master. 409 = a concurrent
+    // create already made it; treat as success.
+    const createRes = await fetch(`${repoBase}/branches`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ new_branch_name: config.branch, old_branch_name: "master" }),
+    });
+    if (!createRes.ok && createRes.status !== 409) {
+      throw new Error(`dcs_branch_create_failed: ${createRes.status} ${await createRes.text()}`);
+    }
+    return;
+  }
+  throw new Error(`dcs_branch_reset_failed: ${patchRes.status} ${await patchRes.text()}`);
+}
+
 // PUT /api/v1/repos/:owner/:repo/contents/:path
-// - GET first to discover any existing SHA. 404 = new file.
-// - PUT if SHA exists (update), POST if not (create).
+// - Reset the branch onto current master first (resetExportBranchToMaster).
+// - GET to discover the existing SHA on the (now master-based) branch. 404 = new file.
+// - No-op when the file already matches master's. PUT if SHA exists, POST if not.
 // - Returns the new content SHA + the resulting commit SHA so the caller can
 //   record both for traceability.
 export async function commitToDcs(
@@ -253,6 +305,10 @@ export async function commitToDcs(
     Accept: "application/json",
   };
   const base = `${config.baseUrl}/api/v1/repos/${encodeURIComponent(config.owner)}/${encodeURIComponent(config.repo)}/contents/${path.split("/").map(encodeURIComponent).join("/")}`;
+
+  // Re-base the export branch onto current master before reading/committing, so
+  // the resulting PR is a clean child of master, not a stale 3-way merge.
+  await resetExportBranchToMaster(config);
 
   // Lookup existing SHA for this path on this branch.
   let existingSha: string | null = null;
@@ -285,24 +341,12 @@ export async function commitToDcs(
   };
   if (existingSha) body.sha = existingSha;
 
+  // The branch is guaranteed to exist (resetExportBranchToMaster created/reset
+  // it above), so a commit failure here is a real error, not a missing branch.
   const method = existingSha ? "PUT" : "POST";
-  let res = await fetch(base, { method, headers, body: JSON.stringify(body) });
+  const res = await fetch(base, { method, headers, body: JSON.stringify(body) });
   if (!res.ok) {
-    const errText = await res.text();
-    if (res.status === 404 && errText.includes("branch does not exist")) {
-      // Branch hasn't been created yet — create it from master then retry once.
-      const branchRes = await fetch(
-        `${config.baseUrl}/api/v1/repos/${encodeURIComponent(config.owner)}/${encodeURIComponent(config.repo)}/branches`,
-        { method: "POST", headers, body: JSON.stringify({ new_branch_name: config.branch, old_branch_name: "master" }) },
-      );
-      if (!branchRes.ok && branchRes.status !== 409) {
-        throw new Error(`dcs_branch_create_failed: ${branchRes.status} ${await branchRes.text()}`);
-      }
-      res = await fetch(base, { method, headers, body: JSON.stringify(body) });
-      if (!res.ok) throw new Error(`dcs_commit_failed: ${method} ${res.status} ${await res.text()}`);
-    } else {
-      throw new Error(`dcs_commit_failed: ${method} ${res.status} ${errText}`);
-    }
+    throw new Error(`dcs_commit_failed: ${method} ${res.status} ${await res.text()}`);
   }
   const data = (await res.json()) as {
     content?: { sha?: string };
