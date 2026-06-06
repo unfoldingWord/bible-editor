@@ -60,8 +60,9 @@ crons = ["0 6 * * *", "*/5 * * * *"]
 # (localhost:5173 / 8787 only).
 # DEV_AUTH_ENABLED gates the /api/auth/dev mint endpoint; flipped to "false"
 # in the prod env block below.
-# DCS_EXPORT_OWNER / DCS_EXPORT_BRANCH control where nightly exports land on
-# DCS. BT_API_TOKEN (secret) authorizes /api/tn-quick + /api/pipelines/*.
+# DCS_EXPORT_OWNER controls which owner nightly exports land on (the branch is
+# derived per-book from contributors, not configured).
+# BT_API_TOKEN (secret) authorizes /api/tn-quick + /api/pipelines/*.
 # TN_QUICK_URL / PIPELINE_API_BASE override the bot endpoints.
 [vars]
 DCS_BASE_URL = "https://git.door43.org"
@@ -72,7 +73,6 @@ JWT_TTL_SECONDS = "1209600"
 ALLOWED_ORIGINS = ""
 DEV_AUTH_ENABLED = "true"
 DCS_EXPORT_OWNER = "unfoldingWord"
-DCS_EXPORT_BRANCH = "live-snapshot"
 TN_QUICK_URL = "https://uw-bt-bot.fly.dev/api/tn-quick"
 PIPELINE_API_BASE = "https://uw-bt-bot.fly.dev"
 
@@ -128,6 +128,5 @@ JWT_TTL_SECONDS = "1209600"
 ALLOWED_ORIGINS = "https://bible-editor-api.unfoldingword.workers.dev"
 DEV_AUTH_ENABLED = "false"
 DCS_EXPORT_OWNER = "unfoldingWord"
-DCS_EXPORT_BRANCH = "live-snapshot"
 TN_QUICK_URL = "https://uw-bt-bot.fly.dev/api/tn-quick"
 PIPELINE_API_BASE = "https://uw-bt-bot.fly.dev"

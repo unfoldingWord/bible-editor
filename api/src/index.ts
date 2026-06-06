@@ -35,11 +35,11 @@ export interface Env {
   DCS_CLIENT_SECRET?: string;
   JWT_SIGNING_KEY?: string;
   DCS_SERVICE_TOKEN?: string;
-  // Where nightly exports land on DCS. Owner = the user/org that owns the
-  // fork repos (e.g. a service account). Branch = a long-lived fork branch.
-  // Defaults below cover the unfoldingWord canonical owner; override per env.
+  // Owner of the repos nightly exports land on. The branch is no longer
+  // configurable — exports go to a per-(book,resource) branch named for the
+  // book + its human contributors (see export.ts:buildExportBranch).
+  // Defaults to the unfoldingWord canonical owner; override per env.
   DCS_EXPORT_OWNER?: string;
-  DCS_EXPORT_BRANCH?: string;
   // DCS org whose members get read-only ("viewer") access when not on the
   // editor allowlist. Defaults to "unfoldingWord" when unset.
   VIEWER_ORG?: string;

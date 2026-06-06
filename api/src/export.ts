@@ -321,3 +321,23 @@ export async function commitToDcs(
     changed: true,
   };
 }
+
+// DELETE /api/v1/repos/:owner/:repo/branches/:branch
+// Best-effort: returns true if the branch was deleted, false if it was already
+// gone (404). Any other status throws so the caller can log it. Used by the
+// export workflow to prune branches it superseded (a contributor-set change
+// renames the branch) plus the legacy `live-snapshot` branch.
+export async function deleteDcsBranch(
+  config: Omit<DcsCommitConfig, "branch">,
+  branch: string,
+): Promise<boolean> {
+  const headers: Record<string, string> = {
+    Authorization: `token ${config.token}`,
+    Accept: "application/json",
+  };
+  const url = `${config.baseUrl}/api/v1/repos/${encodeURIComponent(config.owner)}/${encodeURIComponent(config.repo)}/branches/${encodeURIComponent(branch)}`;
+  const res = await fetch(url, { method: "DELETE", headers });
+  if (res.ok || res.status === 204) return true;
+  if (res.status === 404) return false;
+  throw new Error(`dcs_branch_delete_failed: ${res.status} ${await res.text()}`);
+}

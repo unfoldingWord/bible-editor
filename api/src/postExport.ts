@@ -222,7 +222,10 @@ async function ensureSnapshotPr(
   cfg: ValidatorConfig,
 ): Promise<{ number: number | null; created: boolean; reason: string }> {
   const base = env.DCS_BASE_URL.replace(/\/$/, "");
-  const headBranch = env.DCS_EXPORT_BRANCH ?? "live-snapshot";
+  // Legacy: this whole post-export PR flow is dormant (VALIDATORS=[]) since
+  // exports moved to per-book contributor branches. Kept compiling against the
+  // old live-snapshot branch name should it ever be re-enabled.
+  const headBranch = "live-snapshot";
   const baseBranch = cfg.ref;
   if (headBranch === baseBranch) {
     return { number: null, created: false, reason: "head_equals_base" };
