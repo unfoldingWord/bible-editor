@@ -958,6 +958,12 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
             onImported={() => void refetch()}
           />
         }
+        pipelineStatus={
+          <PipelineStatusBar
+            toast={pipelineToast}
+            onToastClear={() => setPipelineToast(null)}
+          />
+        }
         logosSyncToggle={
           <LogosSyncToggle book={book} chapter={chapter} verse={activeVerse} />
         }
@@ -1420,10 +1426,6 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
             requestScrollToActive();
           }
         }}
-      />
-      <PipelineStatusBar
-        toast={pipelineToast}
-        onToastClear={() => setPipelineToast(null)}
       />
       {quoteBuildContext && (
         <QuoteBuilderPopper

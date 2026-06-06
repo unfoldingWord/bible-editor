@@ -33,6 +33,7 @@ interface Props {
   chapter: number;
   onNavigate: (book: string, chapter: number, verse?: number) => void;
   pipelineMenu?: ReactNode;
+  pipelineStatus?: ReactNode;
   logosSyncToggle?: ReactNode;
   railCollapsed?: boolean;
   onToggleRail?: () => void;
@@ -43,6 +44,7 @@ export function TopBar({
   chapter,
   onNavigate,
   pipelineMenu,
+  pipelineStatus,
   logosSyncToggle,
   railCollapsed,
   onToggleRail,
@@ -351,6 +353,7 @@ export function TopBar({
       </Tooltip>
       <Divider orientation="vertical" flexItem sx={{ my: 0.5 }} />
       {pipelineMenu}
+      {pipelineStatus}
       <Snackbar
         open={importing !== null}
         anchorOrigin={{ vertical: "bottom", horizontal: "center" }}

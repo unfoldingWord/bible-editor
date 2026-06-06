@@ -1,9 +1,10 @@
-// Top-right pill summarizing active AI pipeline runs. Lives below the TopBar
-// rather than at the bottom so it doesn't overlap the AlignmentPanel's
-// Cancel/Save action bar in the right column; the popover opens downward
-// into empty header space instead of upward across the column. Click
-// expands to list each job with its state, current skill, and (for
-// resumable failures) a Retry button.
+// Pill summarizing active AI pipeline runs. Rendered inline in the TopBar's
+// status cluster (via the `pipelineStatus` prop) so it sits in normal flow
+// instead of floating over the resource-column tab strip; the popover opens
+// downward from the chip. Click expands to list each job with its state,
+// current skill, and (for resumable failures) a Retry button. The transient
+// start/complete toast rides a bottom-center Snackbar, matching the import
+// toasts in TopBar.
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
@@ -17,6 +18,8 @@ import {
   Button,
   Divider,
   CircularProgress,
+  Snackbar,
+  Alert,
 } from "@mui/material";
 import AutoAwesomeIcon from "@mui/icons-material/AutoAwesome";
 import RefreshIcon from "@mui/icons-material/Refresh";
@@ -294,67 +297,59 @@ export function PipelineStatusBar({ toast, onToastClear }: Props = {}) {
 
   return (
     <>
-      <Box
-        ref={chipRef}
-        sx={{
-          position: "fixed",
-          right: 12,
-          top: 56,
-          zIndex: (t) => t.zIndex.snackbar,
-        }}
+      {hasAnything && (
+        <Box ref={chipRef} sx={{ display: "inline-flex" }}>
+          <Chip
+            icon={<AutoAwesomeIcon />}
+            label={
+              active.length > 0
+                ? `${active.length} pipeline${active.length === 1 ? "" : "s"} running${
+                    queued.length > 0 ? ` · ${queued.length} queued` : ""
+                  }`
+                : queued.length > 0
+                  ? `${queued.length} queued`
+                  : failed.length > 0
+                    ? `${failed.length} failed`
+                    : "AI ready to review"
+            }
+            size="small"
+            variant="outlined"
+            color={
+              active.length > 0
+                ? "primary"
+                : queued.length > 0
+                  ? "default"
+                  : failed.length > 0
+                    ? "error"
+                    : "success"
+            }
+            onClick={(e) => setAnchorEl(e.currentTarget)}
+            // Only the "done-only" variant is dismissable. Running, queued,
+            // and failed states need user attention, so no delete icon there.
+            onDelete={
+              active.length === 0 && queued.length === 0 && failed.length === 0 && doneRecent.length > 0
+                ? () => {
+                    pipelineStore.dismissDone();
+                    setAnchorEl(null);
+                  }
+                : undefined
+            }
+          />
+        </Box>
+      )}
+      <Snackbar
+        open={Boolean(toast)}
+        anchorOrigin={{ vertical: "bottom", horizontal: "center" }}
+        // Lifecycle is owned by Shell's 8s timer; only dismiss on the explicit
+        // close action, not on click-away.
+        onClose={(_, reason) => reason !== "clickaway" && onToastClear?.()}
       >
-        <Stack direction="row" spacing={1} alignItems="center">
-          {toast && (
-            <Tooltip title="dismiss">
-              <Chip
-                size="small"
-                color={toast.kind === "error" ? "error" : toast.kind === "success" ? "success" : "default"}
-                label={toast.text}
-                onDelete={onToastClear}
-              />
-            </Tooltip>
-          )}
-          {hasAnything && (
-            <Chip
-              icon={<AutoAwesomeIcon />}
-              label={
-                active.length > 0
-                  ? `${active.length} pipeline${active.length === 1 ? "" : "s"} running${
-                      queued.length > 0 ? ` · ${queued.length} queued` : ""
-                    }`
-                  : queued.length > 0
-                    ? `${queued.length} queued`
-                    : failed.length > 0
-                      ? `${failed.length} failed`
-                      : "AI ready to review"
-              }
-              size="small"
-              variant="outlined"
-              color={
-                active.length > 0
-                  ? "primary"
-                  : queued.length > 0
-                    ? "default"
-                    : failed.length > 0
-                      ? "error"
-                      : "success"
-              }
-              onClick={(e) => setAnchorEl(e.currentTarget)}
-              // Only the "done-only" variant is dismissable. Running, queued,
-              // and failed states need user attention, so no delete icon there.
-              onDelete={
-                active.length === 0 && queued.length === 0 && failed.length === 0 && doneRecent.length > 0
-                  ? () => {
-                      pipelineStore.dismissDone();
-                      setAnchorEl(null);
-                    }
-                  : undefined
-              }
-              sx={{ bgcolor: "background.paper", boxShadow: 2 }}
-            />
-          )}
-        </Stack>
-      </Box>
+        {toast ? (
+          <Alert severity={toast.kind} variant="filled" onClose={onToastClear}>
+            {toast.text}
+          </Alert>
+        ) : undefined}
+      </Snackbar>
       <Popover
         open={Boolean(anchorEl)}
         anchorEl={anchorEl}
