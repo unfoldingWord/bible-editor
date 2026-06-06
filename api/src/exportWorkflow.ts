@@ -24,9 +24,15 @@ import {
   buildTwlTsv,
   buildUsfm,
   commitToDcs,
+  deleteDcsBranch,
   RESOURCE_TARGETS,
   type Resource,
 } from "./export";
+
+// Legacy export branch, superseded by per-(book,resource) contributor branches.
+// Pruned best-effort on each export so it doesn't linger; safe to delete since
+// the live-snapshot flow is no longer used (its post-export path is dormant).
+const LEGACY_EXPORT_BRANCH = "live-snapshot";
 import { runPostExport, VALIDATORS } from "./postExport";
 import type { TnRow, TqRow, TwlRow, VerseRow } from "./types";
 
@@ -174,6 +180,12 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       );
       dcsCommitSha = commit.commitSha || null;
       dcsChanged = commit.changed;
+
+      // Prune branches this export superseded: any prior {book}-be-* branch for
+      // this (book, resource) whose name changed because the contributor set
+      // changed, plus the legacy live-snapshot branch. Best-effort — a prune
+      // failure must never fail or retry the export step.
+      await this.pruneSupersededBranches(book, resource, owner, target.repo, branch);
     }
 
     await this.recordSnapshot(book, resource, branch, dcsCommitSha, built.rowCount, dcsSkippedReason);
@@ -282,6 +294,45 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       : this.env.DB.prepare(sql).bind(resource, book);
     const rs = await stmt.all<{ username: string; first_at: number }>();
     return rs.results.map((r) => r.username);
+  }
+
+  // Delete branches this export's branch replaces. Sources:
+  //   1. export_snapshots history — any prior branch we recorded for this
+  //      (book, resource) that differs from the current one (a contributor
+  //      joined/left and the name changed).
+  //   2. The legacy live-snapshot branch.
+  // Best-effort: per-branch errors are logged and swallowed so a prune failure
+  // never fails the export step (which would also retry the commit).
+  private async pruneSupersededBranches(
+    book: string,
+    resource: Resource,
+    owner: string,
+    repo: string,
+    keepBranch: string,
+  ): Promise<void> {
+    let stale: string[] = [];
+    try {
+      const rs = await this.env.DB.prepare(
+        `SELECT DISTINCT branch FROM export_snapshots
+          WHERE book = ?1 AND resource = ?2 AND branch IS NOT NULL AND branch <> ?3`,
+      )
+        .bind(book, resource, keepBranch)
+        .all<{ branch: string }>();
+      stale = rs.results.map((r) => r.branch);
+    } catch (e) {
+      console.error("prune: history query failed", { book, resource, error: e instanceof Error ? e.message : String(e) });
+    }
+    const targets = [...new Set([...stale, LEGACY_EXPORT_BRANCH])].filter((b) => b && b !== keepBranch);
+    for (const b of targets) {
+      try {
+        await deleteDcsBranch(
+          { baseUrl: this.env.DCS_BASE_URL, token: this.env.DCS_SERVICE_TOKEN!, owner, repo },
+          b,
+        );
+      } catch (e) {
+        console.error("prune: branch delete failed", { repo, branch: b, error: e instanceof Error ? e.message : String(e) });
+      }
+    }
   }
 
   private async recordSnapshot(
