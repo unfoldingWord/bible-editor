@@ -59,7 +59,7 @@ export interface Env {
 // no runtime way to assert they line up (wrangler doesn't expose triggers to
 // the Worker), but constants in code give grep something to find when the
 // schedule changes.
-const EXPORT_CRON = "0 6 * * *";
+const EXPORT_CRON = "30 5 * * *";
 const POLL_CRON = "*/5 * * * *";
 // Dormant: not yet registered in wrangler.toml [triggers].crons. Branch
 // below is unreachable until the cron entry is uncommented in wrangler.toml.
