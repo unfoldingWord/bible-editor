@@ -199,6 +199,113 @@ function utf8Base64(s) {
   }
 }
 
+// --- resetExportBranchToMaster is idempotent across 200/404/409/422 ---
+// Regression for the ISA-be-deferredreward wedge: a PATCH 409 ("reference
+// already exists") used to throw dcs_branch_reset_failed on every retry.
+{
+  const originalFetch = globalThis.fetch;
+  const cfg = { baseUrl: "https://dcs.example", token: "t", owner: "o", repo: "r", branch: "ISA-be-x" };
+  const okJson = (obj, status = 200) =>
+    new Response(JSON.stringify(obj), { status, headers: { "Content-Type": "application/json" } });
+  const masterRef = () => okJson({ ref: "refs/heads/master", object: { sha: "master-sha" } });
+  const writeOk = () => okJson({ content: { sha: "new-sha" }, commit: { sha: "commit-sha" } });
+
+  // Build a fetch mock from per-endpoint handlers. Order matters: the master
+  // ref GET and the POST /branches (no trailing slash) are matched before the
+  // generic /branches/:name GET.
+  const makeFetch = (h) => {
+    const calls = [];
+    const fn = async (url, init = {}) => {
+      const u = String(url);
+      const m = init.method ?? "GET";
+      calls.push({ u, m });
+      if (u.includes("/git/refs/heads/master") && m === "GET") return masterRef();
+      if (u.includes("/git/refs/heads/") && m === "PATCH") return h.patch();
+      if (u.endsWith("/branches") && m === "POST") return h.postBranch();
+      if (u.includes("/branches/") && m === "GET") return h.getBranch();
+      if (u.includes("/contents/") && m === "GET") return h.getContents();
+      if (u.includes("/contents/")) return writeOk(); // PUT/POST commit
+      throw new Error(`unexpected ${m} ${u}`);
+    };
+    return { fn, calls };
+  };
+  const notFound = () => okJson({ message: "Not Found" }, 404);
+
+  try {
+    // (1) PATCH 409 (branch exists) → confirmed via GET, no create, commit proceeds.
+    {
+      const { fn, calls } = makeFetch({
+        patch: () => okJson({ message: "reference already exists" }, 409),
+        getBranch: () => okJson({ name: "ISA-be-x" }),
+        postBranch: () => { throw new Error("must not POST /branches when it already exists"); },
+        getContents: notFound,
+      });
+      globalThis.fetch = fn;
+      const r = await commitToDcs(cfg, "23-ISA.usfm", "data", "msg");
+      assert(r.changed === true, `PATCH 409 (exists) → commit proceeds (regression for ISA-be wedge)`);
+      assert(calls.some((c) => c.u.includes("/branches/ISA-be-x") && c.m === "GET"), `409 path confirms branch via GET`);
+    }
+
+    // (2) PATCH 404 → create from master → visible → POST (new file) commit.
+    {
+      let posted = false;
+      const { fn } = makeFetch({
+        patch: notFound,
+        getBranch: () => okJson({ name: "ISA-be-x" }),
+        postBranch: () => { posted = true; return okJson({ name: "ISA-be-x" }, 201); },
+        getContents: notFound,
+      });
+      globalThis.fetch = fn;
+      const r = await commitToDcs(cfg, "23-ISA.usfm", "data", "msg");
+      assert(posted, `PATCH 404 → creates the branch from master`);
+      assert(r.changed === true, `404 create path commits the new file`);
+    }
+
+    // (3) create, then branch invisible on first GET, visible on second (read-after-write lag).
+    {
+      let getBranchCalls = 0;
+      const { fn } = makeFetch({
+        patch: notFound,
+        getBranch: () => { getBranchCalls++; return getBranchCalls < 2 ? notFound() : okJson({ name: "ISA-be-x" }); },
+        postBranch: () => okJson({ name: "ISA-be-x" }, 201),
+        getContents: notFound,
+      });
+      globalThis.fetch = fn;
+      const r = await commitToDcs(cfg, "23-ISA.usfm", "data", "msg");
+      assert(r.changed === true && getBranchCalls >= 2, `ensureBranchVisible polls past a read-after-write 404`);
+    }
+
+    // (4) POST /branches 409 (concurrent create) is benign.
+    {
+      const { fn } = makeFetch({
+        patch: notFound,
+        getBranch: () => okJson({ name: "ISA-be-x" }),
+        postBranch: () => okJson({ message: "branch already exists" }, 409),
+        getContents: notFound,
+      });
+      globalThis.fetch = fn;
+      const r = await commitToDcs(cfg, "23-ISA.usfm", "data", "msg");
+      assert(r.changed === true, `POST /branches 409 treated as benign`);
+    }
+
+    // (5) branch never becomes visible → throw dcs_branch_not_visible (fail the step, don't commit nowhere).
+    {
+      const { fn } = makeFetch({
+        patch: notFound,
+        getBranch: notFound,
+        postBranch: () => okJson({ name: "ISA-be-x" }, 201),
+        getContents: notFound,
+      });
+      globalThis.fetch = fn;
+      let threw = null;
+      try { await commitToDcs(cfg, "23-ISA.usfm", "data", "msg"); } catch (e) { threw = e; }
+      assert(threw && String(threw.message).includes("dcs_branch_not_visible"), `invisible branch throws dcs_branch_not_visible`);
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+}
+
 // --- corrupt content_json fails export instead of emitting a partial book ---
 {
   const bad = {

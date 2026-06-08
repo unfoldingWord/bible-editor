@@ -266,25 +266,90 @@ async function resetExportBranchToMaster(config: DcsCommitConfig): Promise<void>
   const masterSha = Array.isArray(refData) ? refData[0]?.object?.sha : refData.object?.sha;
   if (!masterSha) throw new Error("dcs_master_ref_missing_sha");
 
+  // Try to reset the export branch ref onto master. Happy path; preserves any
+  // open PR (delete+recreate would close it).
   const patchRes = await fetch(
     `${repoBase}/git/refs/heads/${encodeURIComponent(config.branch)}`,
     { method: "PATCH", headers, body: JSON.stringify({ target: masterSha }) },
   );
-  if (patchRes.ok) return;
-  if (patchRes.status === 404) {
-    // Branch doesn't exist yet — create it from master. 409 = a concurrent
-    // create already made it; treat as success.
-    const createRes = await fetch(`${repoBase}/branches`, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({ new_branch_name: config.branch, old_branch_name: "master" }),
-    });
-    if (!createRes.ok && createRes.status !== 409) {
-      throw new Error(`dcs_branch_create_failed: ${createRes.status} ${await createRes.text()}`);
-    }
+  if (patchRes.ok) {
+    await ensureBranchVisible(repoBase, headers, config.branch);
     return;
   }
-  throw new Error(`dcs_branch_reset_failed: ${patchRes.status} ${await patchRes.text()}`);
+  // 404 → the branch doesn't exist yet: create it from master.
+  if (patchRes.status === 404) {
+    await createBranchFromMaster(repoBase, headers, config.branch);
+    await ensureBranchVisible(repoBase, headers, config.branch);
+    return;
+  }
+  // 409 / 422 → the ref already exists and Gitea rejected the update via this
+  // path (observed: 409 "reference already exists"). The branch being PRESENT
+  // is all the commit below needs; it re-bases onto master on a later run. We
+  // must NOT throw here (throwing wedged every retry once the branch existed —
+  // the ISA-be-* failure) and must NOT delete (that closes the open PR).
+  // Confirm it exists, creating only in the contradictory case where the GET
+  // reports it actually absent.
+  if (patchRes.status === 409 || patchRes.status === 422) {
+    if (!(await branchExists(repoBase, headers, config.branch))) {
+      await createBranchFromMaster(repoBase, headers, config.branch);
+    }
+    await ensureBranchVisible(repoBase, headers, config.branch);
+    return;
+  }
+  throw new Error(`dcs_branch_ensure_failed: ${patchRes.status} ${await patchRes.text()}`);
+}
+
+// POST a new branch off master. 409 = a concurrent run already created it
+// (benign). Any other non-ok status is a real failure.
+async function createBranchFromMaster(
+  repoBase: string,
+  headers: Record<string, string>,
+  branch: string,
+): Promise<void> {
+  const createRes = await fetch(`${repoBase}/branches`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ new_branch_name: branch, old_branch_name: "master" }),
+  });
+  if (!createRes.ok && createRes.status !== 409) {
+    throw new Error(`dcs_branch_create_failed: ${createRes.status} ${await createRes.text()}`);
+  }
+}
+
+// GET /branches/:branch → true on 200, false on 404. Other statuses throw.
+async function branchExists(
+  repoBase: string,
+  headers: Record<string, string>,
+  branch: string,
+): Promise<boolean> {
+  const res = await fetch(`${repoBase}/branches/${encodeURIComponent(branch)}`, {
+    method: "GET",
+    headers,
+  });
+  if (res.ok) return true;
+  if (res.status === 404) return false;
+  throw new Error(`dcs_branch_get_failed: ${res.status} ${await res.text()}`);
+}
+
+// Gitea can be read-after-write inconsistent between creating a branch and the
+// contents API seeing it — the first ISA export 404'd on the commit right after
+// a "successful" create. Poll GET /branches/:branch a few times so the commit
+// doesn't race an invisible branch. Throw if it never appears: a failed step
+// (which the workflow retries) beats committing to nowhere.
+async function ensureBranchVisible(
+  repoBase: string,
+  headers: Record<string, string>,
+  branch: string,
+): Promise<void> {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const res = await fetch(`${repoBase}/branches/${encodeURIComponent(branch)}`, {
+      method: "GET",
+      headers,
+    });
+    if (res.ok) return;
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  throw new Error(`dcs_branch_not_visible: ${branch}`);
 }
 
 // PUT /api/v1/repos/:owner/:repo/contents/:path
@@ -341,8 +406,9 @@ export async function commitToDcs(
   };
   if (existingSha) body.sha = existingSha;
 
-  // The branch is guaranteed to exist (resetExportBranchToMaster created/reset
-  // it above), so a commit failure here is a real error, not a missing branch.
+  // resetExportBranchToMaster ensured the branch exists and is visible
+  // (idempotent across 200/404/409/422), so a commit failure here is a real
+  // error rather than a missing or racing branch.
   const method = existingSha ? "PUT" : "POST";
   const res = await fetch(base, { method, headers, body: JSON.stringify(body) });
   if (!res.ok) {
