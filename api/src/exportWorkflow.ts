@@ -35,7 +35,7 @@ import {
 // the live-snapshot flow is no longer used (its post-export path is dormant).
 const LEGACY_EXPORT_BRANCH = "live-snapshot";
 import { runPostExport, VALIDATORS } from "./postExport";
-import { reimportBookFromDcs, ALL_RESOURCES as REIMPORT_RESOURCES } from "./bookReimport";
+import { runChunkedReimport, ALL_RESOURCES as REIMPORT_RESOURCES } from "./bookReimport";
 import type { TnRow, TqRow, TwlRow, VerseRow } from "./types";
 
 export interface ExportParams {
@@ -51,6 +51,12 @@ export interface ExportParams {
   // 06:00 UTC cron sets this true; manual /api/exports/run leaves it false
   // so a single-book test export doesn't accidentally trigger a real merge.
   validateAndMerge?: boolean;
+  // Self-heal mode: run only the chunked DCS→D1 reimport for every book, then
+  // stop before rendering/committing. Used by the 08:00 REIMPORT_CRON (which
+  // has no WorkflowStep context of its own). Runs the reimport even without a
+  // service token (reads public raw files) — unlike the pre-export sync, which
+  // is gated on dcsAllowed.
+  reimportOnly?: boolean;
 }
 
 export interface StepResult {
@@ -109,26 +115,13 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     //     wrapped in try/catch so a single book's failure can't abort the whole
     //     export instance — same shape as the post-export reimport loop. Gated
     //     on dcsAllowed: a dry run / no-token run shouldn't mutate D1.
-    if (dcsAllowed) {
+    if (dcsAllowed || params.reimportOnly) {
       for (const book of books) {
         try {
-          await step.do(
-            `reimport-${book}`,
-            { retries: { limit: 2, delay: "10 seconds", backoff: "exponential" } },
-            async () => {
-              const maxRow = await this.env.DB
-                .prepare(`SELECT MAX(chapter) AS m FROM verses WHERE book = ?1`)
-                .bind(book)
-                .first<{ m: number | null }>();
-              const maxCh = maxRow?.m ?? 0;
-              if (maxCh < 1) return { book, reimported: false, reason: "not_seeded" };
-              const chapters = Array.from({ length: maxCh }, (_, i) => i + 1);
-              const r = await reimportBookFromDcs(
-                this.env, book, chapters, [...REIMPORT_RESOURCES], null, { source: "cron" },
-              );
-              return { book, reimported: true, totals: r.totals };
-            },
-          );
+          // Chunked + SHA-gated + diff-aware reimport — steps through chapters so
+          // a large book can't blow the 10-min step limit, and skips files whose
+          // DCS commit SHA is unchanged. See bookReimport.ts:runChunkedReimport.
+          await runChunkedReimport(this.env, step, book, instanceId, [...REIMPORT_RESOURCES], {});
         } catch (e) {
           // Lock contention / transient DCS failure: render proceeds on whatever
           // D1 holds (possibly slightly stale for this book); next run catches up.
@@ -138,6 +131,12 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
           });
         }
       }
+    }
+
+    // Self-heal mode (08:00 REIMPORT_CRON): D1 is now synced from DCS; there's
+    // nothing to render or commit, so stop before the export steps below.
+    if (params.reimportOnly) {
+      return { instanceId, totalSteps: 0, results: [] };
     }
 
     // 2. One step per (book, resource). step.do persists, so a single flaky

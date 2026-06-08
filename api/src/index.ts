@@ -12,7 +12,6 @@ import { pipelines, pollAllNonTerminal } from "./pipelines";
 import { pendingImports } from "./pendingImports";
 import { alerts } from "./alerts";
 import { books } from "./bookImport";
-import { ALL_RESOURCES, reimportBookFromDcs } from "./bookReimport";
 import { attachAuth, requireAuth, requireCsrf, mintDevToken, startDcsAuth, callbackDcsAuth, authMe, authLogout, refreshToken, updateLastLocation, currentUserId, verifyToken } from "./auth";
 
 export interface Env {
@@ -266,39 +265,12 @@ export default {
       return;
     }
     if (controller.cron === REIMPORT_CRON) {
-      // Dormant: not yet listed in wrangler.toml [triggers].crons, so this
-      // branch never fires in current deployments. Will be enabled once the
-      // export → DCS git-action merge loop is verified end-to-end. Iterates
-      // every imported book and pulls fresh content from DCS, skipping rows
-      // a translator has touched (see bookReimport.ts).
-      const rs = await env.DB.prepare(
-        `SELECT book FROM book_imports ORDER BY book`,
-      ).all<{ book: string }>();
-      for (const { book } of rs.results ?? []) {
-        try {
-          const maxRow = await env.DB
-            .prepare(`SELECT MAX(chapter) AS m FROM verses WHERE book = ?1`)
-            .bind(book)
-            .first<{ m: number | null }>();
-          const maxCh = maxRow?.m ?? 0;
-          if (maxCh < 1) continue;
-          const chapters = Array.from({ length: maxCh }, (_, i) => i + 1);
-          await reimportBookFromDcs(
-            env,
-            book,
-            chapters,
-            [...ALL_RESOURCES],
-            null,
-            { source: "cron" },
-          );
-        } catch (e) {
-          // One book's failure shouldn't stop the rest. Log and continue.
-          console.error("nightly DCS reimport failed", {
-            book,
-            error: e instanceof Error ? e.message : String(e),
-          });
-        }
-      }
+      // Dormant until wrangler.toml lists "0 8 * * *". Self-heal: pull fresh DCS
+      // content into D1 for every imported book. Dispatched as the export
+      // Workflow in reimportOnly mode — scheduled() has no WorkflowStep context,
+      // and the Workflow path chunks by chapter (so a large book can't blow the
+      // 10-min step limit) and SHA-skips unchanged files. See exportWorkflow.ts.
+      await env.EXPORT_WORKFLOW.create({ params: { reimportOnly: true } });
       return;
     }
   },

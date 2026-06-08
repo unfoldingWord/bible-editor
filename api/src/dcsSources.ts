@@ -72,3 +72,57 @@ export async function fetchText(url: string): Promise<string | null> {
     return null;
   }
 }
+
+// ── Per-resource repo/path + git-SHA helpers (incremental self-heal reimport) ──
+// The reimport reads the canonical unfoldingWord source on master — the same
+// org dcsUrls() hardcodes. The SHA check below MUST agree with the raw fetch on
+// owner/repo/path/ref, so both derive from this one mapping.
+const DCS_OWNER = "unfoldingWord";
+
+export type ReimportResource = "ult" | "ust" | "tn" | "tq" | "twl";
+
+// {repo, in-repo path} for a (book, resource). Mirror of dcsUrls()'s shape; null
+// for an unknown book. Keep in sync with dcsUrls — the path formulas are
+// identical (USFM `${num}-${BOOK}.usfm`, TSV `${res}_${BOOK}.tsv`).
+export function dcsResourceFile(
+  book: string,
+  resource: ReimportResource,
+): { repo: string; path: string } | null {
+  const num = BOOK_NUMBERS[book];
+  if (!num) return null;
+  switch (resource) {
+    case "ult": return { repo: "en_ult", path: `${num}-${book}.usfm` };
+    case "ust": return { repo: "en_ust", path: `${num}-${book}.usfm` };
+    case "tn":  return { repo: "en_tn",  path: `tn_${book}.tsv` };
+    case "tq":  return { repo: "en_tq",  path: `tq_${book}.tsv` };
+    case "twl": return { repo: "en_twl", path: `twl_${book}.tsv` };
+  }
+}
+
+// Raw master-branch content URL for a repo/path (same shape dcsUrls builds).
+export function dcsRawUrl(env: Env, repo: string, path: string): string {
+  const base = (env.DCS_BASE_URL ?? "https://git.door43.org").replace(/\/$/, "");
+  return `${base}/${DCS_OWNER}/${repo}/raw/branch/master/${path}`;
+}
+
+// Latest commit SHA on master that touched `path` in `repo`, or null on
+// 404 / empty history / network error. Used as the change-detection watermark
+// for the incremental reimport (skip a (book,resource) whose file SHA matches
+// what we last synced). Sends the service token when present so private repos
+// and rate limits are handled the same way the export path is.
+export async function fileCommitSha(env: Env, repo: string, path: string): Promise<string | null> {
+  const base = (env.DCS_BASE_URL ?? "https://git.door43.org").replace(/\/$/, "");
+  const url =
+    `${base}/api/v1/repos/${DCS_OWNER}/${encodeURIComponent(repo)}` +
+    `/commits?sha=master&path=${encodeURIComponent(path)}&limit=1&stat=false&verification=false&files=false`;
+  try {
+    const headers: Record<string, string> = { Accept: "application/json" };
+    if (env.DCS_SERVICE_TOKEN) headers.Authorization = `token ${env.DCS_SERVICE_TOKEN}`;
+    const r = await fetch(url, { headers });
+    if (!r.ok) return null;
+    const commits = (await r.json()) as Array<{ sha?: string }>;
+    return commits[0]?.sha ?? null;
+  } catch {
+    return null;
+  }
+}

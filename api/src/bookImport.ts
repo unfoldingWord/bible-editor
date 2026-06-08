@@ -18,8 +18,8 @@ import {
   refParts,
 } from "./importParsers";
 import { requireEditor, currentUserId } from "./auth";
-import { BOOK_NUMBERS, dcsUrls, fetchText } from "./dcsSources";
-import { reimportBookFromDcs, type Resource } from "./bookReimport";
+import { BOOK_NUMBERS, dcsUrls, dcsResourceFile, fileCommitSha, fetchText } from "./dcsSources";
+import { reimportBookFromDcs, recordResourceSync, type Resource } from "./bookReimport";
 
 export const books = new Hono<{ Bindings: Env; Variables: { userId?: number } }>();
 
@@ -257,6 +257,18 @@ async function importBookFromDcs(
   )
     .bind(book, `dcs:${sources}`, userId)
     .run();
+
+  // Seed per-resource SHA watermarks so the nightly self-heal can skip files
+  // that haven't changed since this import (see book_resource_syncs +
+  // bookReimport.ts). Best-effort — a missing watermark just means the first
+  // nightly reimports that resource.
+  for (const resource of ["ult", "ust", "tn", "tq", "twl"] as Resource[]) {
+    if (!counts.fetched[resource]) continue;
+    const file = dcsResourceFile(book, resource);
+    if (!file) continue;
+    const sha = await fileCommitSha(env, file.repo, file.path);
+    if (sha) await recordResourceSync(env, book, resource, sha, "import");
+  }
 
   return counts;
 }

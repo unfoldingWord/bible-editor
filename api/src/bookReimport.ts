@@ -31,7 +31,8 @@
 //     0 rows. No SELECT-then-UPDATE window.
 
 import type { Env } from "./index";
-import { dcsUrls, fetchText } from "./dcsSources";
+import type { WorkflowStep } from "cloudflare:workers";
+import { dcsUrls, dcsResourceFile, dcsRawUrl, fileCommitSha, fetchText } from "./dcsSources";
 import {
   extractVersesForRange,
   parseTsv,
@@ -42,6 +43,12 @@ import { activePipelineForChapter } from "./chapterLock";
 export type Resource = "ult" | "ust" | "tn" | "tq" | "twl";
 
 export const ALL_RESOURCES: readonly Resource[] = ["ult", "ust", "tn", "tq", "twl"];
+
+// Chapters per Workflow step in the chunked reimport. Sized so even the largest
+// book (Psalms, 150 ch) stays well under Cloudflare's 600 000 ms per-step limit
+// that the old whole-book reimport blew on Isaiah. In steady state the
+// per-resource SHA gate skips unchanged files entirely, so this rarely bites.
+export const REIMPORT_CHAPTER_CHUNK = 8;
 
 export interface ReimportCounts {
   updated: number;
@@ -232,38 +239,47 @@ interface ParsedTsvRow {
   tw_link?: string | null;
 }
 
+// Normalize one raw TSV record into a ParsedTsvRow (no chapter filter). Shared
+// by rowsForChapter (the reimport row loop) and changedTsvChapters (the diff
+// gate) so the two agree exactly on field normalization — otherwise the gate
+// could mis-classify a chapter as unchanged. Returns null for a row with no ID.
+function parseTsvRow(r: Record<string, string>, kind: TsvKind): ParsedTsvRow | null {
+  const id = r["ID"];
+  if (!id) return null;
+  const refRaw = r["Reference"] ?? "";
+  const [ch, v] = refParts(refRaw);
+  const occRaw = r["Occurrence"];
+  const occurrence = occRaw === "" || occRaw == null ? null : parseInt(occRaw, 10) || 0;
+  const base: ParsedTsvRow = {
+    id,
+    refRaw,
+    chapter: ch,
+    verse: v,
+    occurrence,
+    tags: r["Tags"] || null,
+  };
+  if (kind === "tn") {
+    base.support_reference = r["SupportReference"] || null;
+    base.quote = r["Quote"] || null;
+    base.note = r["Note"] || null;
+  } else if (kind === "tq") {
+    base.quote = r["Quote"] || null;
+    base.question = r["Question"] || null;
+    base.response = r["Response"] || null;
+  } else {
+    base.orig_words = r["OrigWords"] || null;
+    base.tw_link = r["TWLink"] || null;
+  }
+  return base;
+}
+
 function rowsForChapter(raw: string, kind: TsvKind, chapter: number): ParsedTsvRow[] {
   const { rows } = parseTsv(raw);
   const out: ParsedTsvRow[] = [];
   for (const r of rows) {
-    const id = r["ID"];
-    if (!id) continue;
-    const refRaw = r["Reference"] ?? "";
-    const [ch, v] = refParts(refRaw);
-    if (ch !== chapter) continue;
-    const occRaw = r["Occurrence"];
-    const occurrence = occRaw === "" || occRaw == null ? null : parseInt(occRaw, 10) || 0;
-    const base: ParsedTsvRow = {
-      id,
-      refRaw,
-      chapter: ch,
-      verse: v,
-      occurrence,
-      tags: r["Tags"] || null,
-    };
-    if (kind === "tn") {
-      base.support_reference = r["SupportReference"] || null;
-      base.quote = r["Quote"] || null;
-      base.note = r["Note"] || null;
-    } else if (kind === "tq") {
-      base.quote = r["Quote"] || null;
-      base.question = r["Question"] || null;
-      base.response = r["Response"] || null;
-    } else {
-      base.orig_words = r["OrigWords"] || null;
-      base.tw_link = r["TWLink"] || null;
-    }
-    out.push(base);
+    const parsed = parseTsvRow(r, kind);
+    if (!parsed || parsed.chapter !== chapter) continue;
+    out.push(parsed);
   }
   return out;
 }
@@ -642,4 +658,335 @@ async function logEdit(
   )
     .bind(kind, rowKey, book, userId, prevVersion, newVersion, action, JSON.stringify(payload), REIMPORT_SOURCE)
     .run();
+}
+
+// ── Chunked, SHA-gated, diff-aware reimport (Workflow path) ─────────────────
+//
+// reimportBookFromDcs (above) runs in one call and is used by the HTTP route
+// (client-supplied chapters) + first-time bootstrap. It is NOT safe inside a
+// Cloudflare Workflow step for a large book — per-chapter re-parse + sequential
+// D1 round-trips blow the 600 000 ms step limit (what failed on Isaiah). The
+// functions below run the same row-level logic but:
+//   1. skip a whole (book,resource) when its DCS file commit SHA is unchanged,
+//   2. fetch each changed file once and stage it to R2,
+//   3. process chapters in REIMPORT_CHAPTER_CHUNK-sized Workflow steps,
+//   4. for TSV, skip chapters whose pristine content already matches DCS.
+// No per-book lock is taken: a Workflow step REPLAYS on retry, so a held lock
+// would self-deadlock; the pristine `WHERE updated_by IS NULL ...` UPDATE guard
+// (unchanged) is the real protection against clobbering a concurrent edit.
+
+interface StagedResource {
+  resource: Resource;
+  changed: boolean;        // false → SHA unchanged or DCS 404; skipped
+  masterSha: string | null;
+  r2Key: string | null;    // staged file location when changed
+}
+
+interface ReimportPlan {
+  maxChapter: number;
+  entries: StagedResource[];
+}
+
+function freshPerResource(): Record<Resource, ReimportCounts> {
+  return { ult: zeroCounts(), ust: zeroCounts(), tn: zeroCounts(), tq: zeroCounts(), twl: zeroCounts() };
+}
+
+function mergePerResource(
+  into: Record<Resource, ReimportCounts>,
+  from: Record<Resource, ReimportCounts>,
+): void {
+  for (const r of ALL_RESOURCES) addCounts(into[r], from[r]);
+}
+
+function emptyResult(book: string): ReimportResult {
+  return { book, perResource: freshPerResource(), totals: zeroCounts() };
+}
+
+async function readStaged(env: Env, key: string): Promise<string | null> {
+  const obj = await env.BLOBS.get(key);
+  return obj ? await obj.text() : null;
+}
+
+// Upsert the per-(book,resource) sync watermark. `origin` is provenance only;
+// only 'import'/'reimport' watermarks are written as skip gates.
+export async function recordResourceSync(
+  env: Env,
+  book: string,
+  resource: Resource,
+  sha: string,
+  origin: "import" | "reimport" | "export",
+): Promise<void> {
+  await env.DB.prepare(
+    `INSERT INTO book_resource_syncs (book, resource, source_sha, synced_at, origin)
+     VALUES (?1, ?2, ?3, unixepoch(), ?4)
+     ON CONFLICT(book, resource) DO UPDATE SET
+       source_sha = excluded.source_sha,
+       synced_at = excluded.synced_at,
+       origin = excluded.origin`,
+  )
+    .bind(book, resource, sha, origin)
+    .run();
+}
+
+async function storedResourceSha(env: Env, book: string, resource: Resource): Promise<string | null> {
+  const row = await env.DB.prepare(
+    `SELECT source_sha FROM book_resource_syncs WHERE book = ?1 AND resource = ?2`,
+  )
+    .bind(book, resource)
+    .first<{ source_sha: string | null }>();
+  return row?.source_sha ?? null;
+}
+
+// Comparable-field signature for a normalized TSV row. MUST cover exactly the
+// columns tryUpdateTsvRow compares (same fields, same null normalization) so a
+// signature match is equivalent to a reimport no-op.
+function tsvRowSignature(kind: TsvKind, r: ParsedTsvRow): string {
+  const f =
+    kind === "tn"
+      ? [r.refRaw, r.chapter, r.verse, r.tags ?? null, r.support_reference ?? null, r.quote ?? null, r.occurrence ?? null, r.note ?? null]
+      : kind === "tq"
+        ? [r.refRaw, r.chapter, r.verse, r.tags ?? null, r.quote ?? null, r.occurrence ?? null, r.question ?? null, r.response ?? null]
+        : [r.refRaw, r.chapter, r.verse, r.tags ?? null, r.orig_words ?? null, r.occurrence ?? null, r.tw_link ?? null];
+  return JSON.stringify(f);
+}
+
+const TSV_STORED_COLS: Record<TsvKind, string> = {
+  tn: "ref_raw, chapter, verse, tags, support_reference, quote, occurrence, note",
+  tq: "ref_raw, chapter, verse, tags, quote, occurrence, question, response",
+  twl: "ref_raw, chapter, verse, tags, orig_words, occurrence, tw_link",
+};
+
+// Build a ParsedTsvRow from a stored D1 row so it yields the same signature an
+// incoming TSV row would.
+function storedTsvRowToParsed(kind: TsvKind, row: Record<string, unknown>): ParsedTsvRow {
+  const base: ParsedTsvRow = {
+    id: String(row.id),
+    refRaw: (row.ref_raw as string | null) ?? "",
+    chapter: Number(row.chapter),
+    verse: Number(row.verse),
+    occurrence: (row.occurrence as number | null) ?? null,
+    tags: (row.tags as string | null) ?? null,
+  };
+  if (kind === "tn") {
+    base.support_reference = (row.support_reference as string | null) ?? null;
+    base.quote = (row.quote as string | null) ?? null;
+    base.note = (row.note as string | null) ?? null;
+  } else if (kind === "tq") {
+    base.quote = (row.quote as string | null) ?? null;
+    base.question = (row.question as string | null) ?? null;
+    base.response = (row.response as string | null) ?? null;
+  } else {
+    base.orig_words = (row.orig_words as string | null) ?? null;
+    base.tw_link = (row.tw_link as string | null) ?? null;
+  }
+  return base;
+}
+
+// Chapters whose pristine D1 content differs from the incoming DCS TSV. A
+// chapter is "unchanged" (skippable) ONLY when its incoming {id → signature}
+// map equals its stored-pristine map exactly. Detects add/change/delete and id
+// moves; errs toward "changed" whenever an edited (non-pristine) row is present
+// (excluded from the stored map → chapter re-runs, edited row skipped
+// harmlessly). A perf filter — it can never skip a real update.
+export async function changedTsvChapters(
+  env: Env,
+  book: string,
+  kind: TsvKind,
+  rawTsv: string,
+): Promise<Set<number>> {
+  const pristine =
+    kind === "tn"
+      ? `updated_by IS NULL AND deleted_at IS NULL AND trashed_at IS NULL AND preserve = 0 AND hint = 0`
+      : `updated_by IS NULL AND deleted_at IS NULL`;
+
+  const incoming = new Map<number, Map<string, string>>();
+  for (const r of parseTsv(rawTsv).rows) {
+    const p = parseTsvRow(r, kind);
+    if (!p || p.chapter < 1) continue;
+    let m = incoming.get(p.chapter);
+    if (!m) incoming.set(p.chapter, (m = new Map()));
+    m.set(p.id, tsvRowSignature(kind, p));
+  }
+
+  const stored = new Map<number, Map<string, string>>();
+  const res = await env.DB.prepare(
+    `SELECT id, ${TSV_STORED_COLS[kind]} FROM ${kind}_rows WHERE book = ?1 AND ${pristine}`,
+  )
+    .bind(book)
+    .all<Record<string, unknown>>();
+  for (const row of res.results) {
+    const p = storedTsvRowToParsed(kind, row);
+    if (p.chapter < 1) continue;
+    let m = stored.get(p.chapter);
+    if (!m) stored.set(p.chapter, (m = new Map()));
+    m.set(p.id, tsvRowSignature(kind, p));
+  }
+
+  const changed = new Set<number>();
+  for (const ch of new Set<number>([...incoming.keys(), ...stored.keys()])) {
+    const a = incoming.get(ch) ?? new Map<string, string>();
+    const b = stored.get(ch) ?? new Map<string, string>();
+    if (a.size !== b.size) { changed.add(ch); continue; }
+    let same = true;
+    for (const [id, sig] of a) {
+      if (b.get(id) !== sig) { same = false; break; }
+    }
+    if (!same) changed.add(ch);
+  }
+  return changed;
+}
+
+// SHA-gate each requested resource and stage the changed ones to R2. Returns
+// the book's chapter extent + a manifest the chunk steps read from.
+async function planAndStageBookResources(
+  env: Env,
+  book: string,
+  resources: Resource[],
+  instanceId: string,
+): Promise<ReimportPlan> {
+  const maxRow = await env.DB
+    .prepare(`SELECT MAX(chapter) AS m FROM verses WHERE book = ?1`)
+    .bind(book)
+    .first<{ m: number | null }>();
+  const maxChapter = maxRow?.m ?? 0;
+  if (maxChapter < 1) return { maxChapter, entries: [] };
+
+  const entries: StagedResource[] = [];
+  for (const resource of resources) {
+    const file = dcsResourceFile(book, resource);
+    if (!file) { entries.push({ resource, changed: false, masterSha: null, r2Key: null }); continue; }
+
+    const masterSha = await fileCommitSha(env, file.repo, file.path);
+    const stored = await storedResourceSha(env, book, resource);
+    // Skip ONLY on a positive SHA match (fail-open: null/unknown → reimport).
+    if (masterSha && stored && masterSha === stored) {
+      entries.push({ resource, changed: false, masterSha, r2Key: null });
+      continue;
+    }
+
+    const raw = await fetchText(dcsRawUrl(env, file.repo, file.path));
+    if (raw == null) {
+      // DCS 404 / fetch error → nothing to import, no watermark.
+      entries.push({ resource, changed: false, masterSha: null, r2Key: null });
+      continue;
+    }
+    const r2Key = `reimport-stage/${instanceId}/${book}/${resource}`;
+    await env.BLOBS.put(r2Key, raw);
+    entries.push({ resource, changed: true, masterSha, r2Key });
+  }
+  return { maxChapter, entries };
+}
+
+// Reimport one chapter range from staged files. Reads each staged file once,
+// then loops chapters. TSV chapters absent from changedTsv[kind] are skipped.
+async function reimportStagedChunk(
+  env: Env,
+  book: string,
+  startChapter: number,
+  endChapter: number,
+  staged: StagedResource[],
+  changedTsv: Partial<Record<TsvKind, number[]>>,
+  userId: number | null,
+): Promise<Record<Resource, ReimportCounts>> {
+  const perResource = freshPerResource();
+
+  const rawByResource: Partial<Record<Resource, string>> = {};
+  for (const e of staged) {
+    if (!e.changed || !e.r2Key) continue;
+    const raw = await readStaged(env, e.r2Key);
+    if (raw != null) rawByResource[e.resource] = raw;
+  }
+  const changedSets: Partial<Record<TsvKind, Set<number>>> = {};
+  for (const k of ["tn", "tq", "twl"] as TsvKind[]) {
+    if (changedTsv[k]) changedSets[k] = new Set(changedTsv[k]);
+  }
+
+  for (let chapter = startChapter; chapter <= endChapter; chapter++) {
+    const lock = await activePipelineForChapter(env, book, chapter);
+    if (lock) {
+      for (const e of staged) if (e.changed) perResource[e.resource].skipped_locked++;
+      continue;
+    }
+    for (const kind of ["tn", "tq", "twl"] as TsvKind[]) {
+      const raw = rawByResource[kind];
+      if (!raw) continue;
+      const set = changedSets[kind];
+      if (set && !set.has(chapter)) continue;  // chapter unchanged — skip the row loop
+      addCounts(perResource[kind], await reimportTsvForChapter(env, book, chapter, raw, kind, userId));
+    }
+    if (rawByResource.ult) {
+      addCounts(perResource.ult, await reimportVersesForChapter(env, book, chapter, rawByResource.ult, "ULT", userId));
+    }
+    if (rawByResource.ust) {
+      addCounts(perResource.ust, await reimportVersesForChapter(env, book, chapter, rawByResource.ust, "UST", userId));
+    }
+  }
+  return perResource;
+}
+
+// Orchestrate a chunked, SHA-gated, diff-aware reimport of one book as a series
+// of Workflow steps. Lock-free (see section header). Returns aggregate counts.
+export async function runChunkedReimport(
+  env: Env,
+  step: WorkflowStep,
+  book: string,
+  instanceId: string,
+  resources: Resource[],
+  opts: { chunk?: number } = {},
+): Promise<ReimportResult> {
+  const chunkSize = opts.chunk ?? REIMPORT_CHAPTER_CHUNK;
+
+  const plan = await step.do(
+    `reimport-fetch-${book}`,
+    { retries: { limit: 2, delay: "10 seconds", backoff: "exponential" } },
+    async () => planAndStageBookResources(env, book, resources, instanceId),
+  );
+
+  const changed = plan.entries.filter((e) => e.changed);
+  if (plan.maxChapter < 1 || changed.length === 0) return emptyResult(book);
+
+  // Per-changed-TSV: which chapters actually differ (so chunks skip the rest).
+  const changedTsv = await step.do(`reimport-tsvgate-${book}`, async () => {
+    const out: Partial<Record<TsvKind, number[]>> = {};
+    for (const e of changed) {
+      if (e.resource === "ult" || e.resource === "ust" || !e.r2Key) continue;
+      const raw = await readStaged(env, e.r2Key);
+      if (raw == null) continue;
+      out[e.resource] = [...(await changedTsvChapters(env, book, e.resource, raw))];
+    }
+    return out;
+  });
+
+  const perResource = freshPerResource();
+  for (let start = 1; start <= plan.maxChapter; start += chunkSize) {
+    const end = Math.min(start + chunkSize - 1, plan.maxChapter);
+    const counts = await step.do(
+      `reimport-${book}-ch${start}-${end}`,
+      { retries: { limit: 2, delay: "10 seconds", backoff: "exponential" } },
+      async () => reimportStagedChunk(env, book, start, end, changed, changedTsv, null),
+    );
+    mergePerResource(perResource, counts);
+  }
+
+  // Record fetch-time SHAs for resources that ran (so a later night can skip).
+  await step.do(`reimport-sync-${book}`, async () => {
+    let recorded = 0;
+    for (const e of changed) {
+      if (e.masterSha) { await recordResourceSync(env, book, e.resource, e.masterSha, "reimport"); recorded++; }
+    }
+    return { recorded };
+  });
+
+  // Best-effort cleanup of staged R2 objects.
+  await step.do(`reimport-cleanup-${book}`, async () => {
+    let cleaned = 0;
+    for (const e of changed) {
+      if (e.r2Key) { try { await env.BLOBS.delete(e.r2Key); cleaned++; } catch { /* best-effort */ } }
+    }
+    return { cleaned };
+  });
+
+  const totals = zeroCounts();
+  for (const r of ALL_RESOURCES) addCounts(totals, perResource[r]);
+  return { book, perResource, totals };
 }
