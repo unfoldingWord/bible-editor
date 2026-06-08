@@ -48,14 +48,37 @@ books.post("/:book/import", requireEditor, async (c) => {
     return c.json({ ok: true, book, alreadyImported: true, imported_at: existing.imported_at });
   }
 
-  // Orphan recovery: rows exist but book_imports is missing (import succeeded but
-  // the final INSERT crashed). Re-register without wiping so any edits are preserved.
-  const hasData = await c.env.DB.prepare(
-    `SELECT 1 FROM verses WHERE book = ?1 LIMIT 1`,
+  // Orphan recovery: a prior import inserted rows but crashed before writing the
+  // final book_imports marker. That marker is the LAST write, so a clean crash
+  // leaves the FULL resource set present — only then is it safe to re-register
+  // without re-fetching. We therefore require ULT, UST, TN, TQ and TWL to all be
+  // non-empty. A partial leftover (e.g. the original-language source survived a
+  // delete but the translations/notes were removed) must NOT be mistaken for a
+  // recoverable import: it falls through to the clean wipe-and-import below,
+  // which re-fetches every resource from DCS.
+  //
+  // (Previously this checked only "any verse exists", so a book left with just
+  // its UHB/UGNT source got stamped source_url='recovered' and could never be
+  // re-imported — the marker made every later POST hit the alreadyImported fast
+  // path above. This is exactly how ISA got stuck with Hebrew-only content.)
+  const present = await c.env.DB.prepare(
+    `SELECT
+       (SELECT COUNT(*) FROM verses   WHERE book = ?1 AND bible_version = 'ULT') AS ult,
+       (SELECT COUNT(*) FROM verses   WHERE book = ?1 AND bible_version = 'UST') AS ust,
+       (SELECT COUNT(*) FROM tn_rows  WHERE book = ?1 AND deleted_at IS NULL)    AS tn,
+       (SELECT COUNT(*) FROM tq_rows  WHERE book = ?1 AND deleted_at IS NULL)    AS tq,
+       (SELECT COUNT(*) FROM twl_rows WHERE book = ?1 AND deleted_at IS NULL)    AS twl`,
   )
     .bind(book)
-    .first();
-  if (hasData) {
+    .first<{ ult: number; ust: number; tn: number; tq: number; twl: number }>();
+  const looksComplete =
+    !!present &&
+    present.ult > 0 &&
+    present.ust > 0 &&
+    present.tn > 0 &&
+    present.tq > 0 &&
+    present.twl > 0;
+  if (looksComplete) {
     await c.env.DB.prepare(
       `INSERT OR IGNORE INTO book_imports (book, source_url, imported_at, imported_by)
        VALUES (?1, 'recovered', unixepoch(), ?2)`,
