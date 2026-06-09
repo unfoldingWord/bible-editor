@@ -518,6 +518,29 @@ export function refParts(refRaw: string | null | undefined): [number, number] {
   return [chNum, vsNum];
 }
 
+// Allocator for the canonical sort_order scheme: a per-verse ordinal, where
+// sort_order = (1-based position within a chapter:verse) * 100, assigned in
+// DCS file order. Call the returned fn once per row in file order.
+//
+// Single source of truth shared by every write path — bookImport (bootstrap),
+// bookReimport (merge reimport), and scripts/backfill-sortorder.mjs — so all
+// agree. Because the editor's read/export sort is (chapter, verse, sort_order),
+// only the within-verse order matters, so the ordinal resets per verse: an
+// upstream insert renumbers just that verse (minimal churn), and an unchanged
+// file reproduces identical values (a reimport is then a no-op). The AI
+// pipeline (pipelineImport) uses the same per-verse stepping, seeded past any
+// kept/edited survivors. Keep the *100 step in sync with pickSortOrder /
+// reorderSequential in web Shell.tsx, which slot user edits between these.
+export function makeVerseSortOrder(): (chapter: number, verse: number) => number {
+  const counter = new Map<number, number>();
+  return (chapter, verse) => {
+    const key = chapter * 100000 + verse;
+    const n = (counter.get(key) ?? 0) + 1;
+    counter.set(key, n);
+    return n * 100;
+  };
+}
+
 export interface ParsedTsv {
   headers: string[];
   rows: Array<Record<string, string>>;
