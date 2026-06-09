@@ -331,25 +331,75 @@ async function branchExists(
   throw new Error(`dcs_branch_get_failed: ${res.status} ${await res.text()}`);
 }
 
-// Gitea can be read-after-write inconsistent between creating a branch and the
-// contents API seeing it — the first ISA export 404'd on the commit right after
-// a "successful" create. Poll GET /branches/:branch a few times so the commit
-// doesn't race an invisible branch. Throw if it never appears: a failed step
-// (which the workflow retries) beats committing to nowhere.
+// Ensure the branch is a valid, visible branch before the commit. Gitea can be
+// read-after-write inconsistent right after a create, so we poll. If it never
+// appears but a dangling ref exists (the ref is present yet GET /branches
+// 404s — a corrupt leftover from an earlier botched push, e.g. the original
+// ISA-be failure), delete the ref, recreate the branch from master, and
+// re-poll. Throw dcs_branch_not_visible only if it still can't be made usable:
+// a failed step retries, which beats committing to nowhere.
 async function ensureBranchVisible(
   repoBase: string,
   headers: Record<string, string>,
   branch: string,
 ): Promise<void> {
+  if (await pollBranchVisible(repoBase, headers, branch)) return;
+  if (await refExists(repoBase, headers, branch)) {
+    await deleteDanglingRef(repoBase, headers, branch);
+    await createBranchFromMaster(repoBase, headers, branch);
+    if (await pollBranchVisible(repoBase, headers, branch)) return;
+  }
+  throw new Error(`dcs_branch_not_visible: ${branch}`);
+}
+
+async function pollBranchVisible(
+  repoBase: string,
+  headers: Record<string, string>,
+  branch: string,
+): Promise<boolean> {
   for (let attempt = 0; attempt < 3; attempt++) {
     const res = await fetch(`${repoBase}/branches/${encodeURIComponent(branch)}`, {
       method: "GET",
       headers,
     });
-    if (res.ok) return;
+    if (res.ok) return true;
     await new Promise((resolve) => setTimeout(resolve, 250));
   }
-  throw new Error(`dcs_branch_not_visible: ${branch}`);
+  return false;
+}
+
+// True if refs/heads/:branch exists at the git level — including the corrupt
+// case where the ref is present but it's not a valid (visible) branch.
+async function refExists(
+  repoBase: string,
+  headers: Record<string, string>,
+  branch: string,
+): Promise<boolean> {
+  const res = await fetch(`${repoBase}/git/refs/heads/${encodeURIComponent(branch)}`, {
+    method: "GET",
+    headers,
+  });
+  return res.ok;
+}
+
+// Remove a dangling ref so a clean branch can be recreated from master. Try the
+// git-refs API first (it can delete a ref that has no valid branch), then the
+// branches API as a fallback. Best-effort: if both fail, the recreate will too
+// and ensureBranchVisible throws.
+async function deleteDanglingRef(
+  repoBase: string,
+  headers: Record<string, string>,
+  branch: string,
+): Promise<void> {
+  const refDel = await fetch(`${repoBase}/git/refs/heads/${encodeURIComponent(branch)}`, {
+    method: "DELETE",
+    headers,
+  });
+  if (refDel.ok || refDel.status === 404) return;
+  await fetch(`${repoBase}/branches/${encodeURIComponent(branch)}`, {
+    method: "DELETE",
+    headers,
+  });
 }
 
 // PUT /api/v1/repos/:owner/:repo/contents/:path

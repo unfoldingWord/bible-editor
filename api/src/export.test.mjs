@@ -221,7 +221,10 @@ function utf8Base64(s) {
       calls.push({ u, m });
       if (u.includes("/git/refs/heads/master") && m === "GET") return masterRef();
       if (u.includes("/git/refs/heads/") && m === "PATCH") return h.patch();
+      if (u.includes("/git/refs/heads/") && m === "GET") return (h.getRef ?? notFound)();
+      if (u.includes("/git/refs/heads/") && m === "DELETE") return (h.delRef ?? (() => okJson({})))();
       if (u.endsWith("/branches") && m === "POST") return h.postBranch();
+      if (u.includes("/branches/") && m === "DELETE") return (h.delBranch ?? (() => okJson({})))();
       if (u.includes("/branches/") && m === "GET") return h.getBranch();
       if (u.includes("/contents/") && m === "GET") return h.getContents();
       if (u.includes("/contents/")) return writeOk(); // PUT/POST commit
@@ -300,6 +303,26 @@ function utf8Base64(s) {
       let threw = null;
       try { await commitToDcs(cfg, "23-ISA.usfm", "data", "msg"); } catch (e) { threw = e; }
       assert(threw && String(threw.message).includes("dcs_branch_not_visible"), `invisible branch throws dcs_branch_not_visible`);
+    }
+
+    // (6) dangling ref (ref exists, branch 404 — the real ISA-be corruption):
+    //     heal by deleting the ref, recreating from master, then committing.
+    {
+      let refDeleted = false;
+      const { fn, calls } = makeFetch({
+        patch: () => okJson({ message: "reference already exists" }, 409),
+        // Branch only becomes visible once the dangling ref is deleted + recreated.
+        getBranch: () => (refDeleted ? okJson({ name: "ISA-be-x" }) : notFound()),
+        getRef: () => okJson({ ref: "refs/heads/ISA-be-x", object: { sha: "dangling" } }),
+        delRef: () => { refDeleted = true; return okJson({}); },
+        // POST /branches fails (ref still there) until the ref is deleted.
+        postBranch: () => (refDeleted ? okJson({ name: "ISA-be-x" }, 201) : okJson({ message: "reference already exists" }, 409)),
+        getContents: notFound,
+      });
+      globalThis.fetch = fn;
+      const r = await commitToDcs(cfg, "23-ISA.usfm", "data", "msg");
+      assert(refDeleted && r.changed === true, `dangling ref healed: delete ref → recreate → commit`);
+      assert(calls.some((c) => c.u.includes("/git/refs/heads/ISA-be-x") && c.m === "DELETE"), `heal issues a DELETE on the dangling ref`);
     }
   } finally {
     globalThis.fetch = originalFetch;

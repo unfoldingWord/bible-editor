@@ -37,6 +37,7 @@ import {
   extractVersesForRange,
   parseTsv,
   refParts,
+  type VerseExtract,
 } from "./importParsers";
 import { activePipelineForChapter } from "./chapterLock";
 
@@ -297,8 +298,21 @@ async function reimportTsvForChapter(
   kind: TsvKind,
   userId: number | null,
 ): Promise<ReimportCounts> {
+  return applyTsvRows(env, book, kind, rowsForChapter(raw, kind, chapter), userId);
+}
+
+// Per-row upsert loop over already-parsed TSV rows (any chapters). Split out so
+// the chunked path can parse a staged file ONCE and feed pre-grouped rows
+// rather than re-parsing the whole file per chapter (the CPU cost that tripped
+// the per-step limit on large books).
+async function applyTsvRows(
+  env: Env,
+  book: string,
+  kind: TsvKind,
+  incoming: ParsedTsvRow[],
+  userId: number | null,
+): Promise<ReimportCounts> {
   const counts = zeroCounts();
-  const incoming = rowsForChapter(raw, kind, chapter);
   if (incoming.length === 0) return counts;
 
   const pristinePredicate =
@@ -556,8 +570,21 @@ async function reimportVersesForChapter(
   bibleVersion: "ULT" | "UST",
   userId: number | null,
 ): Promise<ReimportCounts> {
+  return applyVerseRows(env, book, bibleVersion, extractVersesForRange(rawUsfm, chapter, chapter), userId);
+}
+
+// Per-verse upsert loop over already-parsed verses (keys off each verse's own
+// chapter, so it works across a whole chunk range). Split out so the chunked
+// path parses a staged USFM file ONCE per chunk instead of re-parsing the
+// whole book per chapter.
+async function applyVerseRows(
+  env: Env,
+  book: string,
+  bibleVersion: "ULT" | "UST",
+  verses: VerseExtract[],
+  userId: number | null,
+): Promise<ReimportCounts> {
   const counts = zeroCounts();
-  const verses = extractVersesForRange(rawUsfm, chapter, chapter);
   if (verses.length === 0) return counts;
 
   const now = Math.floor(Date.now() / 1000);
@@ -569,13 +596,13 @@ async function reimportVersesForChapter(
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
          ON CONFLICT(book, chapter, verse, bible_version) DO NOTHING`,
       )
-        .bind(book, chapter, v.verse, v.verseEnd, bibleVersion, v.contentJson, v.plainText)
+        .bind(book, v.chapter, v.verse, v.verseEnd, bibleVersion, v.contentJson, v.plainText)
         .run();
       if ((ins.meta.changes ?? 0) > 0) {
         counts.inserted++;
         await logEdit(
           env, "verse",
-          `${book}/${chapter}/${v.verse}/${bibleVersion}`,
+          `${book}/${v.chapter}/${v.verse}/${bibleVersion}`,
           book, userId, null, 1, "create",
           { plain_text: v.plainText },
         );
@@ -590,7 +617,7 @@ async function reimportVersesForChapter(
            FROM verses
           WHERE book = ?1 AND chapter = ?2 AND verse = ?3 AND bible_version = ?4`,
       )
-        .bind(book, chapter, v.verse, bibleVersion)
+        .bind(book, v.chapter, v.verse, bibleVersion)
         .first<{ content_json: string; plain_text: string | null; verse_end: number | null }>();
       if (
         existing &&
@@ -608,7 +635,7 @@ async function reimportVersesForChapter(
           WHERE book = ?5 AND chapter = ?6 AND verse = ?7 AND bible_version = ?8
             AND updated_by IS NULL`,
       )
-        .bind(v.contentJson, v.plainText, v.verseEnd, now, book, chapter, v.verse, bibleVersion)
+        .bind(v.contentJson, v.plainText, v.verseEnd, now, book, v.chapter, v.verse, bibleVersion)
         .run();
       if ((upd.meta.changes ?? 0) > 0) {
         counts.updated++;
@@ -616,12 +643,12 @@ async function reimportVersesForChapter(
           `SELECT version FROM verses
             WHERE book = ?1 AND chapter = ?2 AND verse = ?3 AND bible_version = ?4`,
         )
-          .bind(book, chapter, v.verse, bibleVersion)
+          .bind(book, v.chapter, v.verse, bibleVersion)
           .first<{ version: number }>();
         if (got) {
           await logEdit(
             env, "verse",
-            `${book}/${chapter}/${v.verse}/${bibleVersion}`,
+            `${book}/${v.chapter}/${v.verse}/${bibleVersion}`,
             book, userId, got.version - 1, got.version, "update",
             { plain_text: v.plainText },
           );
@@ -631,7 +658,7 @@ async function reimportVersesForChapter(
       }
     } catch (e) {
       counts.errors.push(
-        `verse ${bibleVersion} ${book} ${chapter}:${v.verse}: ${e instanceof Error ? e.message : String(e)}`,
+        `verse ${bibleVersion} ${book} ${v.chapter}:${v.verse}: ${e instanceof Error ? e.message : String(e)}`,
       );
     }
   }
@@ -890,12 +917,46 @@ async function reimportStagedChunk(
 ): Promise<Record<Resource, ReimportCounts>> {
   const perResource = freshPerResource();
 
+  // Read + parse each staged file ONCE for the whole chunk (not per chapter).
+  // The old per-chapter calls re-parsed the entire book each time (usfm.toJSON
+  // / parseTsv), which tripped the per-step CPU limit on large books.
   const rawByResource: Partial<Record<Resource, string>> = {};
   for (const e of staged) {
     if (!e.changed || !e.r2Key) continue;
     const raw = await readStaged(env, e.r2Key);
     if (raw != null) rawByResource[e.resource] = raw;
   }
+
+  // USFM: one parse of the chunk range per version, grouped by chapter.
+  const versesByChapter: Partial<Record<"ult" | "ust", Map<number, VerseExtract[]>>> = {};
+  for (const resource of ["ult", "ust"] as const) {
+    const raw = rawByResource[resource];
+    if (!raw) continue;
+    const byCh = new Map<number, VerseExtract[]>();
+    for (const ve of extractVersesForRange(raw, startChapter, endChapter)) {
+      let arr = byCh.get(ve.chapter);
+      if (!arr) byCh.set(ve.chapter, (arr = []));
+      arr.push(ve);
+    }
+    versesByChapter[resource] = byCh;
+  }
+
+  // TSV: one parse per kind, grouped by chapter (within the chunk range).
+  const rowsByChapter: Partial<Record<TsvKind, Map<number, ParsedTsvRow[]>>> = {};
+  for (const kind of ["tn", "tq", "twl"] as TsvKind[]) {
+    const raw = rawByResource[kind];
+    if (!raw) continue;
+    const byCh = new Map<number, ParsedTsvRow[]>();
+    for (const r of parseTsv(raw).rows) {
+      const p = parseTsvRow(r, kind);
+      if (!p || p.chapter < startChapter || p.chapter > endChapter) continue;
+      let arr = byCh.get(p.chapter);
+      if (!arr) byCh.set(p.chapter, (arr = []));
+      arr.push(p);
+    }
+    rowsByChapter[kind] = byCh;
+  }
+
   const changedSets: Partial<Record<TsvKind, Set<number>>> = {};
   for (const k of ["tn", "tq", "twl"] as TsvKind[]) {
     if (changedTsv[k]) changedSets[k] = new Set(changedTsv[k]);
@@ -908,17 +969,17 @@ async function reimportStagedChunk(
       continue;
     }
     for (const kind of ["tn", "tq", "twl"] as TsvKind[]) {
-      const raw = rawByResource[kind];
-      if (!raw) continue;
+      const byCh = rowsByChapter[kind];
+      if (!byCh) continue;
       const set = changedSets[kind];
       if (set && !set.has(chapter)) continue;  // chapter unchanged — skip the row loop
-      addCounts(perResource[kind], await reimportTsvForChapter(env, book, chapter, raw, kind, userId));
+      addCounts(perResource[kind], await applyTsvRows(env, book, kind, byCh.get(chapter) ?? [], userId));
     }
-    if (rawByResource.ult) {
-      addCounts(perResource.ult, await reimportVersesForChapter(env, book, chapter, rawByResource.ult, "ULT", userId));
+    if (versesByChapter.ult) {
+      addCounts(perResource.ult, await applyVerseRows(env, book, "ULT", versesByChapter.ult.get(chapter) ?? [], userId));
     }
-    if (rawByResource.ust) {
-      addCounts(perResource.ust, await reimportVersesForChapter(env, book, chapter, rawByResource.ust, "UST", userId));
+    if (versesByChapter.ust) {
+      addCounts(perResource.ust, await applyVerseRows(env, book, "UST", versesByChapter.ust.get(chapter) ?? [], userId));
     }
   }
   return perResource;
