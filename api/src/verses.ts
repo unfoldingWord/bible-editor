@@ -42,6 +42,26 @@ const PatchSchema = z.object({
   plain_text: z.string().nullable().optional(),
 });
 
+// Valid USFM marker names are alphanumeric (e.g. "p", "q1", "zaln", "ts"); a
+// marker `tag` carrying an HTML metacharacter has no legitimate origin and is
+// the only thing that could turn a stored paragraph marker into injected
+// markup when the editable renderer builds its chip span (see chipForTag in
+// web/src/lib/highlight.ts). Reject such tags on write — defense-in-depth
+// behind the renderer's own escaping. The `.passthrough()` schema otherwise
+// stores arbitrary verse-object structure verbatim.
+const UNSAFE_MARKER_TAG = /[<>&"'`]/;
+function hasUnsafeMarkerTag(nodes: unknown[]): boolean {
+  for (const node of nodes) {
+    const o = node as Record<string, unknown> | null;
+    if (!o || typeof o !== "object") continue;
+    if (typeof o["tag"] === "string" && UNSAFE_MARKER_TAG.test(o["tag"])) return true;
+    if (Array.isArray(o["children"]) && hasUnsafeMarkerTag(o["children"] as unknown[])) {
+      return true;
+    }
+  }
+  return false;
+}
+
 function parseIfMatch(header: string | undefined): number | null {
   if (!header) return null;
   const trimmed = header.trim();
@@ -113,6 +133,10 @@ verses.patch("/:book/:chapter/:verse/:bibleVersion", requireEditor, async (c) =>
 
   if (bibleVersion === "UHB" || bibleVersion === "UGNT") {
     return c.json({ error: "source_text_is_read_only" }, 403);
+  }
+
+  if (hasUnsafeMarkerTag(parsed.data.content.verseObjects)) {
+    return c.json({ error: "invalid_content", reason: "unsafe_marker_tag" }, 400);
   }
 
   // Lock verse writes while an AI pipeline targets this chapter. The

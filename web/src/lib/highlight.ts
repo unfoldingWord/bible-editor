@@ -341,8 +341,19 @@ export function findSourceHighlights(
 // ---------- rendering ----------
 
 function escapeHtml(s: string): string {
-  return s.replace(/[&<>]/g, (c) =>
-    c === "&" ? "&amp;" : c === "<" ? "&lt;" : "&gt;",
+  // Escapes quotes as well as &<> so the output is safe in attribute context
+  // (chipForTag interpolates the tag into class="…"/data-tag="…"). Harmless in
+  // text context — &quot;/&#39; round-trip back to "/' via textContent.
+  return s.replace(/[&<>"']/g, (c) =>
+    c === "&"
+      ? "&amp;"
+      : c === "<"
+        ? "&lt;"
+        : c === ">"
+          ? "&gt;"
+          : c === '"'
+            ? "&quot;"
+            : "&#39;",
   );
 }
 
