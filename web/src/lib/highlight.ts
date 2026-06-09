@@ -113,14 +113,17 @@ function nodeIsWord(n: unknown): n is Record<string, unknown> {
 //
 // Split-gloss healing: an AI/tC aligner sometimes renders a single source
 // token whose target words are NON-CONTIGUOUS as two separate `\zaln-s` runs
-// with the same content — and stamps the second occurrence="2" while
-// occurrences stays "1", which is impossible ("the 2nd of 1"). Real case:
-// ZEC 6:2 בַּ⁠מֶּרְכָּבָה → "In the" … (interrupted by "first") … "chariot".
-// Such a continuation run (occurrence > occurrences) folds its targets back
-// into the nearest preceding run with the same content, so the matcher sees
-// ONE logical token carrying ALL its target words ("chariot" included). It's
-// a no-op for well-formed data (occurrence ≤ occurrences), so genuinely
-// repeated words keep their own runs and positions and never false-merge.
+// with the same content. Two shapes occur in prod:
+//   1. ZEC 6:2 בַּ⁠מֶּרְכָּבָה → "In the" … (interrupted by "first") … "chariot",
+//      where the 2nd span is stamped occurrence="2" while occurrences stays
+//      "1" — impossible ("the 2nd of 1").
+//   2. ZEC 6:5 וַ⁠יַּעַן → "And" … (interrupted by "the angel") … "answered",
+//      where EVERY span keeps occurrence="1"/occurrences="1".
+// Both describe the same logical token. Fold each run into the nearest
+// preceding run with the SAME content AND the same EFFECTIVE occurrence
+// (clamped into [1, occurrences]), so the matcher sees ONE token carrying
+// ALL its target words. A genuinely repeated word carries a DISTINCT
+// occurrence (occ=1/2 vs 2/2 → effective 1 vs 2), so it never false-merges.
 // Mirrors effectiveOccurrence / sameSourceChain in lib/alignment.ts.
 function collectMilestoneRuns(verseObjects: unknown[]): Run[] {
   const out: Run[] = [];
@@ -141,20 +144,22 @@ function collectMilestoneRuns(verseObjects: unknown[]): Run[] {
           });
         }
       }
-      // Malformed split continuation: merge into the nearest preceding run
-      // with the same source content rather than starting a new run.
+      // Split continuation: merge into the nearest preceding run with the same
+      // source content AND the same effective occurrence, rather than starting
+      // a new run.
+      const effOcc = Math.min(Math.max(occurrence, 1), Math.max(occurrences, 1));
       let merged = false;
-      if (occurrence > occurrences && source) {
+      if (source) {
         const want = nfc(source);
         for (let i = out.length - 1; i >= 0; i--) {
-          if (nfc(out[i].source) === want) {
+          if (out[i].occurrence === effOcc && nfc(out[i].source) === want) {
             out[i].targets.push(...targets);
             merged = true;
             break;
           }
         }
       }
-      if (!merged) out.push({ source, occurrence, targets });
+      if (!merged) out.push({ source, occurrence: effOcc, targets });
       // Recurse into nested milestones as their own runs.
       for (const c of children) {
         if (nodeIsMilestone(c)) walk([c]);

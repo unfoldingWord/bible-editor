@@ -1600,6 +1600,60 @@ function roundtripVerseUsfm(rawUsfm, sourceVO = null) {
   assert(!lit("chariot", 1, sel2), `must NOT light the 1st "chariot"`);
 }
 
+// ─── Case 24: ZEC 6:5 — split source token (occurrence==occurrences) highlight ─
+// Sibling of Case 22, the OTHER split-gloss shape. Prod ULT renders the single
+// Hebrew token וַ⁠יַּעַן ("and he answered") as TWO `\zaln-s` runs with the same
+// x-content — "And" … (interrupted by "the angel") … "answered" — but this time
+// BOTH spans keep occurrence="1"/occurrences="1" (not the impossible "2 of 1" of
+// ZEC 6:2). So the occurrence>occurrences heal never fired: the matcher saw the
+// run sequence [וַיַּעַן, הַמַּלְאָךְ, וַיַּעַן, וַיֹּאמֶר, …] — an extra וַיַּעַן at
+// position 2 — and the 4-word writing-quotations quote (dalj) matched NOTHING,
+// so ULT highlighted no words at all. collectMilestoneRuns now folds runs that
+// share content AND effective occurrence, so the two וַיַּעַן spans become one.
+{
+  console.log("\n[Case 24] ZEC 6:5 split-source-token highlight (occurrence==occurrences)");
+  // Define each Hebrew content ONCE so milestone content and the quote share
+  // byte-identical strings (no hand-typed cantillation drift).
+  const wayyaan = "וַ⁠יַּ֥עַן"; //     "and he answered"
+  const hamalak = "הַ⁠מַּלְאָ֖ךְ"; //   "the angel"
+  const wayyomer = "וַ⁠יֹּ֣אמֶר"; //    "and he said"
+  const elay = "אֵלָ֑⁠י"; //           "to me"
+  const elleh = "אֵ֗לֶּה"; //          "these"
+  const arba = "אַרְבַּע֙"; //          "four"
+
+  const ms = (content, occurrence, occurrences, words) => ({
+    type: "milestone", tag: "zaln", content,
+    occurrence: String(occurrence), occurrences: String(occurrences),
+    children: words.map(([text, o, os]) => ({
+      type: "word", tag: "w", text, occurrence: String(o), occurrences: String(os),
+    })),
+  });
+
+  // Verbatim shape of prod ULT ZEC 6:5: the split continuation is marked ← below.
+  const verseObjects = [
+    ms(wayyaan, 1, 1, [["And", 1, 1]]),
+    ms(hamalak, 1, 1, [["the", 1, 5], ["angel", 1, 1]]),
+    ms(wayyaan, 1, 1, [["answered", 1, 1]]), //   ← split continuation (same occ)
+    ms(wayyomer, 1, 1, [["and", 1, 1], ["said", 1, 1]]),
+    ms(elay, 1, 1, [["to", 1, 1], ["me", 1, 1]]),
+    ms(elleh, 1, 1, [["These", 1, 1], ["are", 1, 1]]),
+    ms(arba, 1, 1, [["the", 2, 5], ["four", 1, 1]]),
+  ];
+
+  const quote = `${wayyaan} ${hamalak} ${wayyomer} ${elay}`; // dalj writing-quotations
+  const hl = findTargetHighlights(verseObjects, quote, 1);
+
+  // The regression: the whole clause "And the angel answered and said to me"
+  // now highlights — "answered" (parked in the split-continuation run) included.
+  for (const key of ["And|1", "the|1", "angel|1", "answered|1", "and|1", "said|1", "to|1", "me|1"]) {
+    assert(hl.has(key), `ZEC 6:5: highlights ${key}. Got: ${[...hl].join(",")}`);
+  }
+  // No bleed into the following clause ("These are the four …").
+  assert(!hl.has("These|1"), `ZEC 6:5: must NOT highlight "These". Got: ${[...hl].join(",")}`);
+  assert(!hl.has("the|2"), `ZEC 6:5: must NOT highlight "the"(2) of "the four". Got: ${[...hl].join(",")}`);
+  assert(!hl.has("four|1"), `ZEC 6:5: must NOT highlight "four". Got: ${[...hl].join(",")}`);
+}
+
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed.`);
   process.exit(1);
