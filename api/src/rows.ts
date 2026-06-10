@@ -462,9 +462,11 @@ rows.patch("/:kind/:id", requireEditor, async (c) => {
 
   // Atomic: the audit INSERT is conditional on the UPDATE matching, so a
   // version-mismatch never leaves an orphan audit row. D1 batch() commits
-  // both statements together; SQLite evaluates the INSERT ... SELECT WHERE
-  // against the post-UPDATE row state, so the audit only lands if the row
-  // is now at expected+1.
+  // both statements together and runs them sequentially on one connection,
+  // so changes() in the second statement is the row count of THIS batch's
+  // UPDATE. (An EXISTS probe on version = expected+1 is NOT equivalent: a
+  // racing writer can move the row to expected+1, which would log the
+  // rejected patch into history and corrupt version snapshots.)
   const newVersion = expected + 1;
   const [updateRes] = await c.env.DB.batch([
     c.env.DB
@@ -480,7 +482,7 @@ rows.patch("/:kind/:id", requireEditor, async (c) => {
       .prepare(
         `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, payload_json, restored_from_version)
          SELECT ?1, ?2, ?3, ?4, ?5, ?6, 'update', ?7, ?8
-         WHERE EXISTS (SELECT 1 FROM ${KIND_TO_TABLE[kind]} WHERE id = ?2 AND book = ?3 AND version = ?6)`,
+         WHERE changes() > 0`,
       )
       .bind(kind, id, book, userId, expected, newVersion, JSON.stringify(patch), restoredFromVersion),
   ]);
@@ -549,9 +551,12 @@ rows.delete("/:kind/:id", requireEditor, async (c) => {
       .bind(now, userId, id, expected, book),
     c.env.DB
       .prepare(
+        // changes()-gated like PATCH: the audit lands only when THIS batch's
+        // UPDATE soft-deleted the row, not when a racing writer matched the
+        // probed end state.
         `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action)
          SELECT ?1, ?2, ?3, ?4, ?5, ?6, 'delete'
-         WHERE EXISTS (SELECT 1 FROM ${KIND_TO_TABLE[kind]} WHERE id = ?2 AND book = ?3 AND version = ?6 AND deleted_at IS NOT NULL)`,
+         WHERE changes() > 0`,
       )
       .bind(kind, id, book, userId, expected, newVersion),
   ]);

@@ -5,7 +5,7 @@
 // instead of getting silently flattened to `\v 6`. Not a test framework;
 // failures exit non-zero.
 
-import { buildUsfm, commitToDcs, ensureDcsPr } from "./export.ts";
+import { buildTnTsv, buildUsfm, commitToDcs, ensureDcsPr, updateDcsPrBranch } from "./export.ts";
 import { CorruptContentJsonError } from "./contentJson.ts";
 
 function assert(cond, msg) {
@@ -137,6 +137,18 @@ function utf8Base64(s) {
   assert(uhb.includes('x-occurrence="2" x-occurrences="1"'), `UHB export leaves source occurrence verbatim`);
 }
 
+// --- tsvCell escapes bare \r (and \r\n) instead of leaking it into the TSV ---
+{
+  const row = (note) => ({
+    ref_raw: "1:1", id: "ab12", tags: null, support_reference: null,
+    quote: null, occurrence: 1, note,
+  });
+  const out = buildTnTsv([row("alpha\rbeta"), row("gamma\r\ndelta")]);
+  assert(!out.includes("\r"), `no raw carriage returns in TSV output`);
+  assert(out.includes("alpha\\nbeta"), `bare \\r escapes to the literal \\n`);
+  assert(out.includes("gamma\\ndelta"), `CRLF collapses to one literal \\n`);
+}
+
 // --- DCS no-op comparison handles UTF-8 content ---
 {
   const originalFetch = globalThis.fetch;
@@ -183,13 +195,16 @@ function utf8Base64(s) {
 
     const noop = await commitToDcs(config, "tn_ZEC.tsv", existing, "nightly");
     assert(noop.changed === false, `UTF-8 DCS match is a no-op`);
+    assert(noop.branchTouched === false, `master match skips the branch entirely`);
     assert(contentCalls().length === 1, `UTF-8 no-op does not send a write request`);
+    assert(!calls.some((c) => c.url.includes("/git/refs/")), `master match issues no branch-ref calls`);
 
     calls.length = 0;
     const changedContent = existing.replace("שלום עולם", "שלום חדש");
     const changed = await commitToDcs(config, "tn_ZEC.tsv", changedContent, "nightly");
     assert(changed.changed === true, `UTF-8 DCS mismatch sends a commit`);
-    assert(contentCalls().length === 2, `UTF-8 mismatch performs lookup plus write`);
+    assert(changed.branchTouched === true, `UTF-8 mismatch ensures the branch`);
+    assert(contentCalls().length === 3, `UTF-8 mismatch performs master + branch lookups plus write`);
     const writeCall = contentCalls().find((c) => (c.init.method ?? "GET") !== "GET");
     assert(writeCall && writeCall.init.method === "PUT", `UTF-8 mismatch updates existing file`);
     const body = JSON.parse(String(writeCall.init.body));
@@ -324,6 +339,31 @@ function utf8Base64(s) {
       assert(refDeleted && r.changed === true, `dangling ref healed: delete ref → recreate → commit`);
       assert(calls.some((c) => c.u.includes("/git/refs/heads/ISA-be-x") && c.m === "DELETE"), `heal issues a DELETE on the dangling ref`);
     }
+
+    // (7) content already matches MASTER → no branch is created/reset at all
+    //     (untouched pairs used to mint junk -be- branches the token can't delete).
+    {
+      const mustNotTouchBranch = () => { throw new Error("must not touch the branch when master matches"); };
+      const { fn } = makeFetch({
+        patch: mustNotTouchBranch,
+        getBranch: mustNotTouchBranch,
+        postBranch: mustNotTouchBranch,
+        getContents: () => okJson({ sha: "master-blob", encoding: "base64", content: utf8Base64("data") }),
+      });
+      globalThis.fetch = fn;
+      const r = await commitToDcs(cfg, "23-ISA.usfm", "data", "msg");
+      assert(r.changed === false && r.branchTouched === false, `master match skips branch + commit (no junk branch)`);
+      // forceBranch overrides the master pre-check (lingering-open-PR path).
+      const { fn: fn2 } = makeFetch({
+        patch: () => okJson({ ref: "refs/heads/ISA-be-x", object: { sha: "master-sha" } }),
+        getBranch: () => okJson({ name: "ISA-be-x" }),
+        postBranch: () => okJson({ name: "ISA-be-x" }, 201),
+        getContents: () => okJson({ sha: "master-blob", encoding: "base64", content: utf8Base64("data") }),
+      });
+      globalThis.fetch = fn2;
+      const forced = await commitToDcs(cfg, "23-ISA.usfm", "data", "msg", { forceBranch: true });
+      assert(forced.branchTouched === true && forced.changed === false, `forceBranch ensures the branch even on a content match`);
+    }
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -353,50 +393,105 @@ function utf8Base64(s) {
   }
 }
 
-// --- ensureDcsPr: reuse an open PR, create when absent, treat 422 as benign ---
+// --- ensureDcsPr: exact base/head lookup; reuse open PR; 409 + 422 benign ---
+// The lookup is GET /pulls/{base}/{head} (not the paged /pulls?state=open list,
+// which caps at 50 and let existing PRs fall off page 1 → nightly 409 loop).
 {
   const originalFetch = globalThis.fetch;
   const cfg = { baseUrl: "https://dcs.example", token: "t", owner: "o", repo: "r", branch: "ZEC-be-x" };
   const okJson = (obj, status = 200) =>
     new Response(JSON.stringify(obj), { status, headers: { "Content-Type": "application/json" } });
+  const isLookup = (u, m) => u.includes("/pulls/master/ZEC-be-x") && m === "GET";
   try {
-    // An open PR already exists for this head→base → reuse it, never POST.
+    // An open PR already exists for this base/head → reuse it, never POST.
     globalThis.fetch = async (url, init = {}) => {
       const u = String(url);
       const m = init.method ?? "GET";
-      if (u.includes("/pulls?") && m === "GET")
-        return okJson([{ number: 42, head: { ref: "ZEC-be-x" }, base: { ref: "master" } }]);
+      if (isLookup(u, m)) return okJson({ number: 42, state: "open" });
       throw new Error(`unexpected ${m} ${u}`);
     };
     const r1 = await ensureDcsPr(cfg, "t", "b");
-    assert(r1.number === 42 && !r1.created && r1.reason === "existing", `ensureDcsPr reuses an open PR`);
+    assert(r1.number === 42 && !r1.created && r1.reason === "existing", `ensureDcsPr reuses an open PR via exact lookup`);
 
-    // No open PR → create one.
+    // Lookup returns a CLOSED PR (the endpoint doesn't filter by state) →
+    // not reusable → create a fresh one.
     let posted = false;
     globalThis.fetch = async (url, init = {}) => {
       const u = String(url);
       const m = init.method ?? "GET";
-      if (u.includes("/pulls?") && m === "GET") return okJson([]);
+      if (isLookup(u, m)) return okJson({ number: 41, state: "closed" });
       if (u.endsWith("/pulls") && m === "POST") { posted = true; return okJson({ number: 99 }, 201); }
       throw new Error(`unexpected ${m} ${u}`);
     };
     const r2 = await ensureDcsPr(cfg, "t", "b");
-    assert(posted && r2.number === 99 && r2.created && r2.reason === "created", `ensureDcsPr creates a PR when none open`);
+    assert(posted && r2.number === 99 && r2.created && r2.reason === "created", `closed PR is not reused; a new one is created`);
+
+    // No PR at all (404) → create one.
+    posted = false;
+    globalThis.fetch = async (url, init = {}) => {
+      const u = String(url);
+      const m = init.method ?? "GET";
+      if (isLookup(u, m)) return okJson({ message: "Not Found" }, 404);
+      if (u.endsWith("/pulls") && m === "POST") { posted = true; return okJson({ number: 100 }, 201); }
+      throw new Error(`unexpected ${m} ${u}`);
+    };
+    const r3 = await ensureDcsPr(cfg, "t", "b");
+    assert(posted && r3.number === 100 && r3.created && r3.reason === "created", `ensureDcsPr creates a PR when none exists`);
+
+    // Create 409 — DCS's "PR already exists" (ErrPullRequestAlreadyExists) →
+    // re-lookup and return the existing PR instead of swallowing it forever.
+    let lookups = 0;
+    globalThis.fetch = async (url, init = {}) => {
+      const u = String(url);
+      const m = init.method ?? "GET";
+      if (isLookup(u, m)) {
+        lookups++;
+        return lookups === 1 ? okJson({ message: "Not Found" }, 404) : okJson({ number: 7, state: "open" });
+      }
+      if (u.endsWith("/pulls") && m === "POST") return okJson({ message: "pull request already exists" }, 409);
+      throw new Error(`unexpected ${m} ${u}`);
+    };
+    const r4 = await ensureDcsPr(cfg, "t", "b");
+    assert(r4.number === 7 && !r4.created && r4.reason === "raced", `create 409 (already exists) re-looks-up the existing PR`);
 
     // Create returns 422 (no commits between) and no racing PR → benign no_diff.
     globalThis.fetch = async (url, init = {}) => {
       const u = String(url);
       const m = init.method ?? "GET";
-      if (u.includes("/pulls?") && m === "GET") return okJson([]);
+      if (isLookup(u, m)) return okJson({ message: "Not Found" }, 404);
       if (u.endsWith("/pulls") && m === "POST") return okJson({ message: "no commits between" }, 422);
       throw new Error(`unexpected ${m} ${u}`);
     };
-    const r3 = await ensureDcsPr(cfg, "t", "b");
-    assert(!r3.created && r3.reason === "no_diff", `ensureDcsPr treats 422 as a benign no-op`);
+    const r5 = await ensureDcsPr(cfg, "t", "b");
+    assert(!r5.created && r5.reason === "no_diff", `ensureDcsPr treats 422 as a benign no-op`);
 
     // Head == base is a guarded no-op (no network at all).
-    const r4 = await ensureDcsPr({ ...cfg, branch: "master" }, "t", "b");
-    assert(!r4.created && r4.reason === "head_equals_base", `ensureDcsPr skips when head == base`);
+    const r6 = await ensureDcsPr({ ...cfg, branch: "master" }, "t", "b");
+    assert(!r6.created && r6.reason === "head_equals_base", `ensureDcsPr skips when head == base`);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+}
+
+// --- updateDcsPrBranch: 200 → ok; conflict statuses return, never throw ---
+{
+  const originalFetch = globalThis.fetch;
+  const cfg = { baseUrl: "https://dcs.example", token: "t", owner: "o", repo: "r" };
+  try {
+    globalThis.fetch = async (url, init = {}) => {
+      const u = String(url);
+      const m = init.method ?? "GET";
+      if (u.endsWith("/pulls/5/update") && m === "POST") return new Response("", { status: 200 });
+      throw new Error(`unexpected ${m} ${u}`);
+    };
+    const ok = await updateDcsPrBranch(cfg, 5);
+    assert(ok.ok === true && ok.status === 200, `updateDcsPrBranch 200 → ok`);
+
+    globalThis.fetch = async () =>
+      new Response(JSON.stringify({ message: "merge failed because of conflict" }), { status: 409 });
+    const conflict = await updateDcsPrBranch(cfg, 5);
+    assert(conflict.ok === false && conflict.status === 409 && conflict.detail.includes("conflict"),
+      `updateDcsPrBranch 409 (merge conflict) reports without throwing`);
   } finally {
     globalThis.fetch = originalFetch;
   }

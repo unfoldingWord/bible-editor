@@ -22,11 +22,17 @@ const RunBody = z.object({
 });
 
 exports.post("/run", requireAdmin, async (c) => {
+  // Read the body unconditionally — gating on content-length silently dropped
+  // chunked bodies, turning an intended single-book dry run into a full
+  // export. Empty body still means "run everything"; non-empty garbage 400s.
   let body: unknown = {};
-  try {
-    if (c.req.header("content-length")) body = await c.req.json();
-  } catch {
-    return c.json({ error: "invalid_body" }, 400);
+  const text = await c.req.text();
+  if (text.trim()) {
+    try {
+      body = JSON.parse(text);
+    } catch {
+      return c.json({ error: "invalid_body" }, 400);
+    }
   }
   const parsed = RunBody.safeParse(body);
   if (!parsed.success) {
@@ -38,8 +44,19 @@ exports.post("/run", requireAdmin, async (c) => {
     dryDcs: parsed.data.dryDcs,
     validateAndMerge: parsed.data.validateAndMerge,
   };
-  const instance = await c.env.EXPORT_WORKFLOW.create({ params });
-  return c.json({ id: instance.id, status: "queued" }, 202);
+  // Deterministic id (second precision) so a double-submitted manual run
+  // rejects on the duplicate instead of racing the first. The nightly cron
+  // uses `nightly-${day}` ids — see scheduled() in index.ts.
+  const id = `manual-${new Date().toISOString().replace(/[:.]/g, "-")}`;
+  try {
+    const instance = await c.env.EXPORT_WORKFLOW.create({ id, params });
+    return c.json({ id: instance.id, status: "queued" }, 202);
+  } catch (e) {
+    return c.json(
+      { error: "workflow_create_failed", details: e instanceof Error ? e.message : String(e) },
+      409,
+    );
+  }
 });
 
 // Plain listing of the last N snapshot rows. Useful for an /admin/exports
@@ -49,12 +66,12 @@ exports.get("/", requireAdmin, async (c) => {
   const bookFilter = c.req.query("book")?.toUpperCase();
   const stmt = bookFilter
     ? c.env.DB.prepare(
-        `SELECT id, book, resource, branch, commit_sha, committed_at, rows_exported, error
+        `SELECT id, book, resource, branch, commit_sha, committed_at, rows_exported, error, pr_number, pr_error
            FROM export_snapshots WHERE book = ?1
            ORDER BY id DESC LIMIT ?2`,
       ).bind(bookFilter, limit)
     : c.env.DB.prepare(
-        `SELECT id, book, resource, branch, commit_sha, committed_at, rows_exported, error
+        `SELECT id, book, resource, branch, commit_sha, committed_at, rows_exported, error, pr_number, pr_error
            FROM export_snapshots
            ORDER BY id DESC LIMIT ?1`,
       ).bind(limit);
@@ -67,6 +84,8 @@ exports.get("/", requireAdmin, async (c) => {
     committed_at: number;
     rows_exported: number;
     error: string | null;
+    pr_number: number | null;
+    pr_error: string | null;
   }>();
   return c.json({ snapshots: rs.results });
 });

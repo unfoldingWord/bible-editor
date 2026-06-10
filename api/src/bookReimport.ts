@@ -221,6 +221,15 @@ async function runReimport(
 
 type TsvKind = "tn" | "tq" | "twl";
 
+// Canonical "never touched by a human" predicate (see module header). Shared
+// by the update path, the chapter diff gate, and the removed-on-master soft
+// delete so the three can never disagree on what is safe to overwrite.
+function tsvPristinePredicate(kind: TsvKind): string {
+  return kind === "tn"
+    ? `updated_by IS NULL AND deleted_at IS NULL AND trashed_at IS NULL AND preserve = 0 AND hint = 0`
+    : `updated_by IS NULL AND deleted_at IS NULL`;
+}
+
 interface ParsedTsvRow {
   id: string;
   refRaw: string;
@@ -315,16 +324,26 @@ async function applyTsvRows(
   const counts = zeroCounts();
   if (incoming.length === 0) return counts;
 
-  const pristinePredicate =
-    kind === "tn"
-      ? `updated_by IS NULL AND deleted_at IS NULL AND trashed_at IS NULL AND preserve = 0 AND hint = 0`
-      : `updated_by IS NULL AND deleted_at IS NULL`;
+  const pristinePredicate = tsvPristinePredicate(kind);
 
-  for (const row of incoming) {
+  for (let i = 0; i < incoming.length; i++) {
+    const row = incoming[i];
     try {
       const inserted = await tryInsertTsvRow(env, book, kind, row);
       if (inserted) {
         counts.inserted++;
+        // DCS-new row: place it where the file orders it. Export sorting is
+        // `chapter, verse, sort_order ASC NULLS LAST, id`, so a NULL
+        // sort_order would dump the row at the end of its verse regardless
+        // of file position.
+        const so = await midpointSortOrder(env, book, kind, incoming, i);
+        if (so != null) {
+          await env.DB.prepare(
+            `UPDATE ${kind}_rows SET sort_order = ?1 WHERE id = ?2 AND book = ?3`,
+          )
+            .bind(so, row.id, book)
+            .run();
+        }
         await logEdit(env, kind, row.id, book, userId, null, 1, "create", row);
         continue;
       }
@@ -354,6 +373,40 @@ async function applyTsvRows(
   }
 
   return counts;
+}
+
+// sort_order for a DCS-new row, derived from its file position. Only the
+// row's own (chapter, verse) group matters (chapter/verse dominate the export
+// sort), so look at the file-adjacent same-verse neighbors' stored
+// sort_orders: between two placed neighbors → their midpoint; new head of the
+// group → just before the following neighbor; appended at the end of the
+// group → NULL (NULLS LAST is already the right position). When a neighbor
+// lacks a sort_order, fall back to NULL as before.
+async function midpointSortOrder(
+  env: Env,
+  book: string,
+  kind: TsvKind,
+  incoming: ParsedTsvRow[],
+  idx: number,
+): Promise<number | null> {
+  const me = incoming[idx];
+  const sameGroup = (r: ParsedTsvRow | undefined): r is ParsedTsvRow =>
+    r != null && r.chapter === me.chapter && r.verse === me.verse;
+  const sortOrderOf = async (id: string): Promise<number | null> => {
+    const r = await env.DB.prepare(
+      `SELECT sort_order FROM ${kind}_rows WHERE id = ?1 AND book = ?2`,
+    )
+      .bind(id, book)
+      .first<{ sort_order: number | null }>();
+    return r?.sort_order ?? null;
+  };
+  const prev = incoming[idx - 1];
+  const next = incoming[idx + 1];
+  const after = sameGroup(next) ? await sortOrderOf(next.id) : null;
+  if (after == null) return null;
+  if (!sameGroup(prev)) return after - 1;
+  const before = await sortOrderOf(prev.id);
+  return before == null ? null : (before + after) / 2;
 }
 
 // Returns true if the row was inserted (was new), false if it already existed
@@ -821,10 +874,7 @@ export async function changedTsvChapters(
   kind: TsvKind,
   rawTsv: string,
 ): Promise<Set<number>> {
-  const pristine =
-    kind === "tn"
-      ? `updated_by IS NULL AND deleted_at IS NULL AND trashed_at IS NULL AND preserve = 0 AND hint = 0`
-      : `updated_by IS NULL AND deleted_at IS NULL`;
+  const pristine = tsvPristinePredicate(kind);
 
   const incoming = new Map<number, Map<string, string>>();
   for (const r of parseTsv(rawTsv).rows) {
@@ -861,6 +911,71 @@ export async function changedTsvChapters(
     if (!same) changed.add(ch);
   }
   return changed;
+}
+
+// Soft-delete pristine rows that master no longer carries, so the nightly
+// export can't resurrect an out-of-band deletion. Mirrors pipelineImport.ts
+// deleteUnkeptTns and the app's DELETE handler shape (rows.ts): set
+// deleted_at, bump version, audit a 'delete'. Conservative on every axis:
+// only chapters the incoming file covers AND the diff gate flagged as changed
+// (a deletion always flags its chapter), only rows passing the pristine
+// predicate (kept on the UPDATE itself so an edit landing after the SELECT
+// skips the row), and never under an active pipeline lock. The id comparison
+// is against the WHOLE file's id set so a row the update path just moved to
+// another chapter isn't mistaken for removed.
+async function softDeleteRemovedTsvRows(
+  env: Env,
+  book: string,
+  kind: TsvKind,
+  rawTsv: string,
+  candidateChapters: number[],
+): Promise<{ deleted: number; skippedLocked: number }> {
+  const incomingIds = new Set<string>();
+  const coveredChapters = new Set<number>();
+  for (const r of parseTsv(rawTsv).rows) {
+    const p = parseTsvRow(r, kind);
+    if (!p) continue;
+    incomingIds.add(p.id);
+    if (p.chapter >= 1) coveredChapters.add(p.chapter);
+  }
+  // Defensive: an empty or garbled file must never sweep a book clean.
+  if (incomingIds.size === 0) return { deleted: 0, skippedLocked: 0 };
+
+  const pristine = tsvPristinePredicate(kind);
+  const now = Math.floor(Date.now() / 1000);
+  let deleted = 0;
+  let skippedLocked = 0;
+  for (const ch of candidateChapters) {
+    if (!coveredChapters.has(ch)) continue;
+    if (await activePipelineForChapter(env, book, ch)) {
+      skippedLocked++;
+      continue;
+    }
+    const rs = await env.DB.prepare(
+      `SELECT id, version FROM ${kind}_rows WHERE book = ?1 AND chapter = ?2 AND ${pristine}`,
+    )
+      .bind(book, ch)
+      .all<{ id: string; version: number }>();
+    const targets = (rs.results ?? []).filter((r) => !incomingIds.has(r.id));
+    for (const t of targets) {
+      const upd = await env.DB.prepare(
+        `UPDATE ${kind}_rows
+            SET deleted_at = ?1, version = version + 1, updated_at = ?1
+          WHERE id = ?2 AND book = ?3 AND ${pristine}`,
+      )
+        .bind(now, t.id, book)
+        .run();
+      if (!upd.meta.changes) continue;
+      deleted++;
+      await env.DB.prepare(
+        `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, source)
+         VALUES (?1, ?2, ?3, NULL, ?4, ?5, 'delete', ?6)`,
+      )
+        .bind(kind, t.id, book, t.version, t.version + 1, REIMPORT_SOURCE)
+        .run();
+    }
+  }
+  return { deleted, skippedLocked };
 }
 
 // SHA-gate each requested resource and stage the changed ones to R2. Returns
@@ -1027,6 +1142,26 @@ export async function runChunkedReimport(
       async () => reimportStagedChunk(env, book, start, end, changed, changedTsv, null),
     );
     mergePerResource(perResource, counts);
+  }
+
+  // After applying each changed TSV file, soft-delete pristine rows whose ids
+  // master no longer carries — otherwise the next export branch resurrects
+  // out-of-band deletions. See softDeleteRemovedTsvRows for the guardrails.
+  for (const e of changed) {
+    const kind = e.resource;
+    if (kind === "ult" || kind === "ust" || !e.r2Key) continue;
+    const chs = changedTsv[kind];
+    if (!chs || chs.length === 0) continue;
+    const r2Key = e.r2Key;
+    await step.do(`reimport-prune-${book}-${kind}`, async () => {
+      const raw = await readStaged(env, r2Key);
+      if (raw == null) return { deleted: 0, skippedLocked: 0 };
+      const res = await softDeleteRemovedTsvRows(env, book, kind, raw, chs);
+      if (res.deleted > 0 || res.skippedLocked > 0) {
+        console.log("reimport pruned rows removed on master", { book, resource: kind, ...res });
+      }
+      return res;
+    });
   }
 
   // Record fetch-time SHAs for resources that ran (so a later night can skip).
