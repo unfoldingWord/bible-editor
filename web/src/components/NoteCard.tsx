@@ -319,7 +319,7 @@ function NoteCardInner({
   const hydratedFromDraftRef = useRef(false);
   useEffect(() => {
     if (hydratedFromDraftRef.current) return;
-    void drafts.get(rowKey("tn", row.id)).then((rec) => {
+    void drafts.get(rowKey("tn", row.book, row.id)).then((rec) => {
       if (hydratedFromDraftRef.current) return;
       hydratedFromDraftRef.current = true;
       const payload = rec?.payload as
@@ -354,7 +354,7 @@ function NoteCardInner({
         setSupportRef((patch.support_reference as string | null) ?? null);
       }
     });
-  }, [row.id]);
+  }, [row.id, row.book]);
 
   // Session entry/exit. Snapshot is taken on active=false→true with the
   // values currently in local state (which may differ from the row if a
@@ -455,7 +455,7 @@ function NoteCardInner({
     setSessionSnapshot(null);
     // Drop any draft so the delete doesn't get followed by a phantom save
     // from a still-dirty buffer.
-    void drafts.clear(rowKey("tn", row.id));
+    void drafts.clear(rowKey("tn", row.book, row.id));
     onDelete();
   };
 
@@ -630,7 +630,7 @@ function NoteCardInner({
   if (note !== rowNoteDisplay) rowDiff.note = note;
   if (supportRef !== savedRef.current.support_reference) rowDiff.support_reference = supportRef;
   const hasRowDiff = Object.keys(rowDiff).length > 0;
-  const draftKey = rowKey("tn", row.id);
+  const draftKey = rowKey("tn", row.book, row.id);
   useEffect(() => {
     if (readOnly) return;
     if (hasRowDiff) {

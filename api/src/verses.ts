@@ -155,13 +155,18 @@ verses.patch("/:book/:chapter/:verse/:bibleVersion", requireEditor, async (c) =>
   const newVersion = expected + 1;
   const rowKey = `${book}/${chapter}/${verse}/${bibleVersion}`;
   // Atomic write + audit, conditional on the version check matching. See
-  // rows.ts for the matching pattern; the audit row only lands when the
-  // UPDATE successfully bumped the version to expected+1.
+  // rows.ts for the matching pattern; changes() in the second statement is
+  // the row count of THIS batch's UPDATE, so the audit row only lands when
+  // our own write bumped the version (an EXISTS probe on expected+1 could be
+  // satisfied by a racing writer, logging the rejected patch into history).
+  // plain_text uses COALESCE so an omitted field keeps the stored value
+  // instead of nulling the column (null here means "absent" — current
+  // callers always send it).
   const [updateRes] = await c.env.DB.batch([
     c.env.DB
       .prepare(
         `UPDATE verses
-           SET content_json = ?1, plain_text = ?2, version = version + 1,
+           SET content_json = ?1, plain_text = COALESCE(?2, plain_text), version = version + 1,
                updated_at = ?3, updated_by = ?4
          WHERE book = ?5 AND chapter = ?6 AND verse = ?7 AND bible_version = ?8
            AND version = ?9`,
@@ -181,11 +186,7 @@ verses.patch("/:book/:chapter/:verse/:bibleVersion", requireEditor, async (c) =>
       .prepare(
         `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, payload_json)
          SELECT 'verse', ?1, ?2, ?3, ?4, ?5, 'update', ?6
-         WHERE EXISTS (
-           SELECT 1 FROM verses
-            WHERE book = ?2 AND chapter = ?7 AND verse = ?8 AND bible_version = ?9
-              AND version = ?5
-         )`,
+         WHERE changes() > 0`,
       )
       .bind(
         rowKey,
@@ -194,9 +195,6 @@ verses.patch("/:book/:chapter/:verse/:bibleVersion", requireEditor, async (c) =>
         expected,
         newVersion,
         JSON.stringify(parsed.data),
-        chapter,
-        verse,
-        bibleVersion,
       ),
   ]);
 

@@ -57,10 +57,11 @@ const TWL_HEADERS = ["Reference", "ID", "Tags", "OrigWords", "Occurrence", "TWLi
 
 // Cell escape: TSV is line-oriented, so tab/newline in a cell would corrupt
 // the row. unfoldingWord convention encodes real newlines inside a Note as
-// the two-character literal "\n" (already how notes are stored in D1).
+// the two-character literal "\n" (already how notes are stored in D1). A bare
+// \r (no trailing \n) gets the same escape — it would otherwise pass through.
 function tsvCell(v: unknown): string {
   if (v === null || v === undefined) return "";
-  return String(v).replace(/\r\n/g, "\n").replace(/\n/g, "\\n").replace(/\t/g, " ");
+  return String(v).replace(/\r\n/g, "\n").replace(/\r/g, "\\n").replace(/\n/g, "\\n").replace(/\t/g, " ");
 }
 
 function tsvLine(cells: unknown[]): string {
@@ -226,6 +227,11 @@ export interface DcsCommitResult {
   contentSha: string;
   commitSha: string;
   changed: boolean;       // false when the file is already at this content
+  // false when the rendered content already matches master and the export
+  // branch was never created/reset/committed to. Untouched (book × resource)
+  // pairs must not mint junk `-be-` branches — the service token can't
+  // delete them. Callers skip prune/PR work when this is false.
+  branchTouched: boolean;
 }
 
 // Encode a UTF-8 string as base64 (the Gitea contents API expects base64).
@@ -402,10 +408,39 @@ async function deleteDanglingRef(
   });
 }
 
+// GET the file at a ref, returning its blob SHA and whitespace-stripped
+// base64 content (Gitea wraps base64 lines). null = the file doesn't exist
+// at that ref (404). Shared by the master pre-check and the branch lookup in
+// commitToDcs so both use identical comparison semantics.
+async function getDcsFileBase64(
+  base: string,
+  headers: Record<string, string>,
+  ref: string,
+): Promise<{ sha: string | null; base64: string | null } | null> {
+  const res = await fetch(`${base}?ref=${encodeURIComponent(ref)}`, { method: "GET", headers });
+  if (res.status === 404) return null;
+  if (!res.ok) {
+    throw new Error(`dcs_lookup_failed: ${res.status} ${await res.text()}`);
+  }
+  const data = (await res.json()) as { sha?: string; content?: string; encoding?: string };
+  return {
+    sha: data.sha ?? null,
+    base64:
+      data.encoding === "base64" && typeof data.content === "string"
+        ? data.content.replace(/\s+/g, "")
+        : null,
+  };
+}
+
 // PUT /api/v1/repos/:owner/:repo/contents/:path
-// - Reset the branch onto current master first (resetExportBranchToMaster).
-// - GET to discover the existing SHA on the (now master-based) branch. 404 = new file.
-// - No-op when the file already matches master's. PUT if SHA exists, POST if not.
+// - First compare the rendered content against MASTER. A match means nothing
+//   to export: return changed=false WITHOUT creating/resetting the branch —
+//   untouched (book × resource) pairs used to mint junk `-be-` branches that
+//   the token can't delete. opts.forceBranch skips this pre-check (used when
+//   a lingering open PR needs its diff collapsed even though master matches).
+// - When changed (or forced): reset the branch onto master, GET to discover
+//   the existing SHA on the branch (404 = new file), no-op if the branch file
+//   already matches, else PUT/POST.
 // - Returns the new content SHA + the resulting commit SHA so the caller can
 //   record both for traceability.
 export async function commitToDcs(
@@ -413,6 +448,7 @@ export async function commitToDcs(
   path: string,
   content: string,
   message: string,
+  opts?: { forceBranch?: boolean },
 ): Promise<DcsCommitResult> {
   const headers: Record<string, string> = {
     Authorization: `token ${config.token}`,
@@ -421,32 +457,27 @@ export async function commitToDcs(
   };
   const base = `${config.baseUrl}/api/v1/repos/${encodeURIComponent(config.owner)}/${encodeURIComponent(config.repo)}/contents/${path.split("/").map(encodeURIComponent).join("/")}`;
 
+  const contentBase64 = utf8ToBase64(content);
+  if (!opts?.forceBranch) {
+    const masterFile = await getDcsFileBase64(base, headers, "master");
+    if (masterFile?.base64 != null && masterFile.base64 === contentBase64) {
+      return { contentSha: masterFile.sha ?? "", commitSha: "", changed: false, branchTouched: false };
+    }
+  }
+
   // Re-base the export branch onto current master before reading/committing, so
   // the resulting PR is a clean child of master, not a stale 3-way merge.
   await resetExportBranchToMaster(config);
 
   // Lookup existing SHA for this path on this branch.
-  let existingSha: string | null = null;
-  let existingBase64: string | null = null;
-  const getRes = await fetch(`${base}?ref=${encodeURIComponent(config.branch)}`, {
-    method: "GET",
-    headers,
-  });
-  if (getRes.ok) {
-    const data = (await getRes.json()) as { sha?: string; content?: string; encoding?: string };
-    existingSha = data.sha ?? null;
-    if (data.encoding === "base64" && typeof data.content === "string") {
-      existingBase64 = data.content.replace(/\s+/g, "");
-    }
-  } else if (getRes.status !== 404) {
-    throw new Error(`dcs_lookup_failed: ${getRes.status} ${await getRes.text()}`);
-  }
+  const branchFile = await getDcsFileBase64(base, headers, config.branch);
+  const existingSha = branchFile?.sha ?? null;
+  const existingBase64 = branchFile?.base64 ?? null;
 
-  // No-op when the file already matches. Saves a commit per nightly run for
-  // resources nobody touched.
-  const contentBase64 = utf8ToBase64(content);
+  // No-op when the branch file already matches (last night's commit, PR
+  // still open). Saves a commit per nightly run.
   if (existingBase64 !== null && existingBase64 === contentBase64) {
-    return { contentSha: existingSha ?? "", commitSha: "", changed: false };
+    return { contentSha: existingSha ?? "", commitSha: "", changed: false, branchTouched: true };
   }
 
   const body: Record<string, unknown> = {
@@ -472,6 +503,7 @@ export async function commitToDcs(
     contentSha: data.content?.sha ?? "",
     commitSha: data.commit?.sha ?? "",
     changed: true,
+    branchTouched: true,
   };
 }
 
@@ -504,7 +536,9 @@ export async function deleteDcsBranch(
 // Idempotent: returns the existing open PR if there is one, creates it
 // otherwise. HTTP 422 from the create is treated as a benign no-op — it means
 // either "no commits between" (the branch matches master, nothing to merge) or
-// a PR was opened by a racing run between our list and create.
+// a PR was opened by a racing run between our lookup and create. HTTP 409 is
+// Gitea's "PR already exists" (ErrPullRequestAlreadyExists) and gets the same
+// re-lookup treatment.
 export interface DcsPrConfig {
   baseUrl: string;
   token: string;
@@ -520,6 +554,32 @@ export interface DcsPrResult {
   reason: "head_equals_base" | "existing" | "created" | "raced" | "no_diff";
 }
 
+function dcsPrHeaders(token: string): Record<string, string> {
+  return {
+    Authorization: `token ${token}`,
+    "Content-Type": "application/json",
+    Accept: "application/json",
+  };
+}
+
+// Exact lookup: GET /repos/{owner}/{repo}/pulls/{base}/{head}. (Replaces
+// paging /pulls?state=open — DCS caps the page at 50, so an existing PR could
+// fall off page 1, after which the create 409s every night.) 404 = no PR for
+// this base/head. A 200 can be a closed or merged PR — the endpoint doesn't
+// filter by state — so only an "open" one counts.
+export async function findDcsOpenPr(config: DcsPrConfig): Promise<number | null> {
+  const base = config.base ?? "master";
+  const apiBase = `${config.baseUrl}/api/v1/repos/${encodeURIComponent(config.owner)}/${encodeURIComponent(config.repo)}`;
+  const res = await fetch(
+    `${apiBase}/pulls/${encodeURIComponent(base)}/${encodeURIComponent(config.branch)}`,
+    { method: "GET", headers: dcsPrHeaders(config.token) },
+  );
+  if (res.status === 404) return null;
+  if (!res.ok) throw new Error(`dcs_pull_lookup_failed: ${res.status} ${await res.text()}`);
+  const pr = (await res.json()) as { number?: number; state?: string };
+  return pr.state === "open" && typeof pr.number === "number" ? pr.number : null;
+}
+
 export async function ensureDcsPr(
   config: DcsPrConfig,
   title: string,
@@ -528,44 +588,43 @@ export async function ensureDcsPr(
   const base = config.base ?? "master";
   if (config.branch === base) return { number: null, created: false, reason: "head_equals_base" };
 
-  const headers: Record<string, string> = {
-    Authorization: `token ${config.token}`,
-    "Content-Type": "application/json",
-    Accept: "application/json",
-  };
   const apiBase = `${config.baseUrl}/api/v1/repos/${encodeURIComponent(config.owner)}/${encodeURIComponent(config.repo)}`;
 
-  // Gitea's pulls list doesn't filter by head ref reliably across versions, so
-  // page the open PRs and match client-side. Realistically a handful per repo.
-  const findOpenPr = async (): Promise<number | null> => {
-    const res = await fetch(`${apiBase}/pulls?state=open&limit=50`, { method: "GET", headers });
-    if (!res.ok) throw new Error(`dcs_pulls_list_failed: ${res.status} ${await res.text()}`);
-    const pulls = (await res.json()) as Array<{
-      number: number;
-      head?: { ref?: string };
-      base?: { ref?: string };
-    }>;
-    const hit = pulls.find((p) => p.head?.ref === config.branch && p.base?.ref === base);
-    return hit ? hit.number : null;
-  };
-
-  const existing = await findOpenPr();
+  const existing = await findDcsOpenPr(config);
   if (existing != null) return { number: existing, created: false, reason: "existing" };
 
   const createRes = await fetch(`${apiBase}/pulls`, {
     method: "POST",
-    headers,
+    headers: dcsPrHeaders(config.token),
     body: JSON.stringify({ head: config.branch, base, title, body }),
   });
   if (createRes.ok) {
     const created = (await createRes.json()) as { number?: number };
     return { number: created.number ?? null, created: true, reason: "created" };
   }
-  if (createRes.status === 422) {
-    const raced = await findOpenPr();
+  if (createRes.status === 422 || createRes.status === 409) {
+    const raced = await findDcsOpenPr(config);
     return raced != null
       ? { number: raced, created: false, reason: "raced" }
       : { number: null, created: false, reason: "no_diff" };
   }
   throw new Error(`dcs_pull_create_failed: ${createRes.status} ${await createRes.text()}`);
+}
+
+// POST /repos/{owner}/{repo}/pulls/{index}/update — "merge base into head"
+// (Gitea's update-branch button). Heals merge-base drift on long-lived export
+// branches: door43's PATCH git/refs 409s whenever the ref exists (fork bug —
+// UpdateGitRef carries CreateGitRef's existence guard un-negated), so
+// resetExportBranchToMaster never actually re-bases an existing branch and
+// its PR drifts to mergeable:False. Default style (merge); the route takes no
+// body. Never throws on an HTTP status — expected non-fatal outcomes are 409
+// (merge conflict) and 422 (PR merged/closed); callers log and move on.
+export async function updateDcsPrBranch(
+  config: Omit<DcsCommitConfig, "branch">,
+  prNumber: number,
+): Promise<{ ok: boolean; status: number; detail: string }> {
+  const url = `${config.baseUrl}/api/v1/repos/${encodeURIComponent(config.owner)}/${encodeURIComponent(config.repo)}/pulls/${prNumber}/update`;
+  const res = await fetch(url, { method: "POST", headers: dcsPrHeaders(config.token) });
+  if (res.ok) return { ok: true, status: res.status, detail: "" };
+  return { ok: false, status: res.status, detail: (await res.text()).slice(0, 200) };
 }

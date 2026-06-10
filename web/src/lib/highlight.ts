@@ -18,12 +18,24 @@
 //
 // Hebrew note: TN/TQ quote text typically arrives NFC-normalized while UHB
 // stores legacy combining-mark order (see lib/hebrew.ts), so all source-
-// text equality checks go through `nfc()`. The Set keys still carry the
-// RAW verseObjects text — the consumer (HebrewLine, renderHighlightedHTML)
-// reads from the same tree, so raw matches raw with no further work.
+// text equality checks go through `matchNorm()` (NFC + joiner stripping).
+// The Set keys still carry the RAW verseObjects text — the consumer
+// (HebrewLine, renderHighlightedHTML) reads from the same tree, so raw
+// matches raw with no further work.
 
 import { nfc } from "./hebrew.ts";
 import { isInFlowMarker, SECTION_HEADER_TAGS } from "./usfm.ts";
+
+// U+2060 WORD JOINER glues UHB clitic morphemes to their host word
+// (הָ⁠אֶ֧בֶן); U+200D ZERO WIDTH JOINER plays the same role in some corpora.
+// They are format characters — nfc() does NOT fold them away — and TN/TQ
+// quote text routinely omits them (5 of 302 seeded ZEC quotes, e.g. ZEC
+// 4:10's הָאֶ֧בֶן), so every quote↔token EQUALITY check strips them from
+// BOTH sides. Matching only: stored text, rendered text, and HighlightKey
+// sets keep the raw joiners.
+export function matchNorm(s: string): string {
+  return nfc(s).replace(/[\u2060\u200d]/g, "");
+}
 
 type WordToken = { text: string; occurrence: number };
 type Run = { source: string; occurrence: number; targets: WordToken[] };
@@ -106,6 +118,15 @@ function nodeIsWord(n: unknown): n is Record<string, unknown> {
   return !!o && o["type"] === "word" && o["tag"] === "w";
 }
 
+// \d (Psalm superscription) is `type:"section"` but its content IS
+// alignable Hebrew verse body — the renderer already descends into it
+// (see segmentByParagraphs); the matchers must too or a quote on a
+// superscription word never highlights.
+function nodeIsPsalmTitle(n: unknown): n is Record<string, unknown> {
+  const o = n as Record<string, unknown> | null;
+  return !!o && o["type"] === "section" && o["tag"] === "d";
+}
+
 // Flatten the verse tree into one Run per zaln milestone (nested milestones
 // become their own runs in document order). Each run's `targets` is only
 // its DIRECT `\w` children — that way compound (nested) alignments stay
@@ -126,6 +147,10 @@ function collectMilestoneRuns(verseObjects: unknown[]): Run[] {
   const out: Run[] = [];
   function walk(nodes: unknown[]) {
     for (const node of nodes ?? []) {
+      if (nodeIsPsalmTitle(node)) {
+        walk((node["children"] as unknown[] | undefined) ?? []);
+        continue;
+      }
       if (!nodeIsMilestone(node)) continue;
       const source = String(node["content"] ?? "");
       const occurrence = parseInt(String(node["occurrence"] ?? "1"), 10) || 1;
@@ -145,9 +170,9 @@ function collectMilestoneRuns(verseObjects: unknown[]): Run[] {
       // with the same source content rather than starting a new run.
       let merged = false;
       if (occurrence > occurrences && source) {
-        const want = nfc(source);
+        const want = matchNorm(source);
         for (let i = out.length - 1; i >= 0; i--) {
-          if (nfc(out[i].source) === want) {
+          if (matchNorm(out[i].source) === want) {
             out[i].targets.push(...targets);
             merged = true;
             break;
@@ -177,7 +202,7 @@ function collectBareWords(verseObjects: unknown[]): WordToken[] {
           occurrence:
             parseInt(String((node as Record<string, unknown>)["occurrence"] ?? "1"), 10) || 1,
         });
-      } else if (nodeIsMilestone(node)) {
+      } else if (nodeIsMilestone(node) || nodeIsPsalmTitle(node)) {
         const children = ((node as Record<string, unknown>)["children"] as unknown[] | undefined) ?? [];
         walk(children);
       }
@@ -218,6 +243,8 @@ export function findTargetHighlights(
   const runs = collectMilestoneRuns(verseObjects);
   const out = new Set<HighlightKey>();
   if (runs.length === 0) return out;
+  // `occurrence: -1` means "every occurrence of the quote" (TSV spec).
+  const allOcc = (occurrence | 0) === -1;
   const wantOcc = Math.max(1, occurrence | 0);
 
   // Stage 1 + 2 (canonical): resolve the quote to source instances, join GL
@@ -227,7 +254,7 @@ export function findTargetHighlights(
     const olKeys = sourceInstanceKeys(sourceVerseObjects, quote, occurrence);
     if (olKeys.size > 0) {
       for (const r of runs) {
-        if (olKeys.has(`${nfc(r.source)}|${r.occurrence}`)) {
+        if (olKeys.has(`${matchNorm(r.source)}|${r.occurrence}`)) {
           for (const t of r.targets) out.add(k(t.text, t.occurrence));
         }
       }
@@ -244,9 +271,9 @@ export function findTargetHighlights(
   // path above uses whenever available.
   const groups = quoteGroups(quote);
   if (groups.length === 0) return out;
-  const wantWords = new Set(groups.flat().map(nfc));
+  const wantWords = new Set(groups.flat().map(matchNorm));
   for (const r of runs) {
-    if (wantWords.has(nfc(r.source)) && r.occurrence === wantOcc) {
+    if (wantWords.has(matchNorm(r.source)) && (allOcc || r.occurrence === wantOcc)) {
       for (const t of r.targets) out.add(k(t.text, t.occurrence));
     }
   }
@@ -342,8 +369,9 @@ export function extractTargetSelectionText(
   verseObjects: unknown[],
   quote: string,
   occurrence: number,
+  sourceVerseObjects?: unknown[],
 ): string {
-  const highlights = findTargetHighlights(verseObjects, quote, occurrence);
+  const highlights = findTargetHighlights(verseObjects, quote, occurrence, sourceVerseObjects);
   if (highlights.size === 0) return "";
   const seen = new Set<HighlightKey>();
   const words: string[] = [];
@@ -382,10 +410,12 @@ function matchSourceTokens(
   const groups = quoteGroups(quote);
   const tokens = collectBareWords(verseObjects);
   if (groups.length === 0 || tokens.length === 0) return [];
+  // `occurrence: -1` means "every occurrence of the quote" (TSV spec).
+  const allOcc = (occurrence | 0) === -1;
   const wantOcc = Math.max(1, occurrence | 0);
 
-  const normGroups = groups.map((g) => g.map(nfc));
-  const normTokens = tokens.map((t) => nfc(t.text));
+  const normGroups = groups.map((g) => g.map(matchNorm));
+  const normTokens = tokens.map((t) => matchNorm(t.text));
 
   const matches: number[][] = [];
   for (let start = 0; start < tokens.length; start++) {
@@ -393,6 +423,12 @@ function matchSourceTokens(
     if (m) matches.push(m);
   }
 
+  if (allOcc) {
+    // Union of every match, de-duped, in document order.
+    const union = new Set<number>();
+    for (const m of matches) for (const i of m) union.add(i);
+    return [...union].sort((a, b) => a - b).map((i) => tokens[i]);
+  }
   const chosen = matches[wantOcc - 1];
   if (!chosen) return [];
   return chosen.map((i) => tokens[i]);
@@ -412,10 +448,10 @@ export function findSourceHighlights(
   return out;
 }
 
-// OL instance keys for the ULT/UST alignment join: `${nfc(content)}|occurrence`.
-// NFC-normalized because UHB \w text is in legacy combining-mark order while
-// \zaln-s x-content is NFC (see lib/hebrew.ts) — the join must compare the
-// canonical form on both sides. Same rule as quoteBuilder's `tokenKey`.
+// OL instance keys for the ULT/UST alignment join: `${matchNorm(content)}|occurrence`.
+// Match-normalized because UHB \w text is in legacy combining-mark order while
+// \zaln-s x-content is NFC (see lib/hebrew.ts), and joiner presence can drift
+// — the join must compare the canonical form on both sides.
 function sourceInstanceKeys(
   verseObjects: unknown[],
   quote: string,
@@ -423,7 +459,7 @@ function sourceInstanceKeys(
 ): Set<string> {
   const out = new Set<string>();
   for (const t of matchSourceTokens(verseObjects, quote, occurrence)) {
-    out.add(`${nfc(t.text)}|${t.occurrence}`);
+    out.add(`${matchNorm(t.text)}|${t.occurrence}`);
   }
   return out;
 }

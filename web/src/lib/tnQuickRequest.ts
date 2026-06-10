@@ -28,6 +28,7 @@ import {
   findSourceForTargetText,
 } from "./highlight";
 import { shortSupport } from "./supportReference";
+import { buildVerseIndex } from "./verseRange";
 
 const CONTEXT_WINDOW = 5;
 const HEBREW_GAP = /[&…]+|\.{3}/g;
@@ -123,8 +124,10 @@ export function buildTnQuickRequest(
 
   const ultByVerse = data.verses.ULT;
   const ustByVerse = data.verses.UST;
-  const ultVerse = ultByVerse?.[row.verse];
-  const ustVerse = ustByVerse?.[row.verse];
+  // Resolve through the expanded index — verses[bv] is keyed by verse_start,
+  // so a direct [row.verse] lookup misses bridged ranges (\v 8-9).
+  const ultVerse = buildVerseIndex(ultByVerse)[row.verse];
+  const ustVerse = buildVerseIndex(ustByVerse)[row.verse];
 
   const ultText = plainOf(ultVerse);
   const ustText = plainOf(ustVerse);
@@ -133,6 +136,11 @@ export function buildTnQuickRequest(
 
   const ultVo = verseObjectsOf(ultVerse);
   const ustVo = verseObjectsOf(ustVerse);
+  // UHB/UGNT verse for OL-anchoring the selection lookups — without it,
+  // extractTargetSelectionText permanently degrades to GL-only matching
+  // even though the source is already in the payload.
+  const sourceVo =
+    verseObjectsOf(buildVerseIndex(data.verses.UHB ?? data.verses.UGNT)[row.verse]) ?? undefined;
 
   let ultSelection: string;
   let ustSelection: string;
@@ -145,10 +153,10 @@ export function buildTnQuickRequest(
     const occurrence = row.occurrence ?? 1;
     hebrewGuess = cleanHebrew(rawQuote);
     ultSelection =
-      (ultVo && extractTargetSelectionText(ultVo, rawQuote, occurrence)) ||
+      (ultVo && extractTargetSelectionText(ultVo, rawQuote, occurrence, sourceVo)) ||
       ultText.slice(0, 500);
     ustSelection =
-      (ustVo && extractTargetSelectionText(ustVo, rawQuote, occurrence)) ||
+      (ustVo && extractTargetSelectionText(ustVo, rawQuote, occurrence, sourceVo)) ||
       ustText.slice(0, 500);
   } else {
     // English path: user typed English from ULT. The English IS the
@@ -164,7 +172,7 @@ export function buildTnQuickRequest(
     hebrewGuess = derivedHebrew;
     ultSelection = rawQuote;
     ustSelection =
-      (ustVo && extractTargetSelectionText(ustVo, derivedHebrew, 1)) ||
+      (ustVo && extractTargetSelectionText(ustVo, derivedHebrew, 1, sourceVo)) ||
       ustText.slice(0, 500);
   }
 

@@ -93,7 +93,7 @@ const Row = memo(function Row({
   useEffect(() => setQuestion(row.question ?? ""), [row.id, row.version, row.question]);
   useEffect(() => setResponse(row.response ?? ""), [row.id, row.version, row.response]);
 
-  const draftKey = useMemo(() => rowKey("tq", row.id), [row.id]);
+  const draftKey = useMemo(() => rowKey("tq", row.book, row.id), [row.book, row.id]);
 
   // Hydrate from any persisted draft on first mount so unsaved typing
   // survives navigation. Subsequent server pushes are caught by the

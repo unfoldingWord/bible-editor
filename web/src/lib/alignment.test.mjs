@@ -1707,6 +1707,309 @@ function roundtripVerseUsfm(rawUsfm, sourceVO = null) {
   assert(degraded.has("ay1|1"), `degradation (no source) lights the first A — the limitation OL-anchoring fixes. Got: ${[...degraded].join(",")}`);
 }
 
+// ─── Case 27: ZEC 4:10 — word-joiner (U+2060) quote↔token mismatch ────────
+//
+// UHB glues clitic morphemes to their host with U+2060 WORD JOINER
+// (הָ⁠אֶ֧בֶן); TN quote text routinely omits it (5 of 302 seeded ZEC quotes).
+// nfc() does NOT fold format characters away, so the real seeded quote
+// `הָאֶ֧בֶן הַבְּדִ֛יל` never matched the joiner-carrying UHB tokens and
+// nothing highlighted. Every quote↔token equality now strips U+2060/U+200D
+// from BOTH sides (matchNorm); keys still carry the RAW token text.
+{
+  console.log("\n[Case 27] ZEC 4:10 word-joiner quote↔token match");
+  const uhb = usfm.toJSON(readFileSync(resolve(repoRoot, "docs/samples/hbo_uhb_38-ZEC.usfm"), "utf-8"));
+  const verseObjects = uhb.chapters["4"]["10"].verseObjects;
+
+  // Pull the two real tokens (WITH joiners) from the parsed sample so the
+  // expectations can't drift from the data.
+  const words = [];
+  (function walk(nodes) {
+    for (const n of nodes ?? []) {
+      if (n?.type === "word" && n?.tag === "w") words.push(String(n.text ?? ""));
+      else if (n?.type === "milestone") walk(n.children ?? []);
+    }
+  })(verseObjects);
+  const stoneTok = words[8]; // הָ⁠אֶ֧בֶן (carries U+2060)
+  const tinTok = words[9];   // הַ⁠בְּדִ֛יל (carries U+2060)
+  assert(stoneTok.includes("⁠") && tinTok.includes("⁠"), "UHB 4:10 tokens carry U+2060");
+
+  // (a) The real seeded TSV quote (NO joiners) lights the joiner-carrying
+  // tokens, and the highlight keys keep the RAW token text.
+  const seededQuote = "הָאֶ֧בֶן הַבְּדִ֛יל";
+  assert(!seededQuote.includes("⁠"), "seeded quote carries no U+2060");
+  const hl = findSourceHighlights(verseObjects, seededQuote, 1);
+  assert(hl.has(`${stoneTok}|1`), `joiner-less quote lights הָ⁠אֶ֧בֶן (raw key). Got: ${[...hl].join(",")}`);
+  assert(hl.has(`${tinTok}|1`), `joiner-less quote lights הַ⁠בְּדִ֛יל (raw key). Got: ${[...hl].join(",")}`);
+  assert(hl.size === 2, `exactly the two quoted tokens light up (got ${hl.size})`);
+
+  // (b) Builder-authored quotes (which DO carry the joiners — raw token
+  // text) keep round-tripping through the same matcher.
+  const sel = new Set([tokenKey(stoneTok, 1), tokenKey(tinTok, 1)]);
+  const built = buildQuoteFromSelection(verseObjects, sel);
+  assert(built !== null && built.quote.includes("⁠"), `built quote keeps the raw joiners (got ${JSON.stringify(built?.quote)})`);
+  const hlBuilt = findSourceHighlights(verseObjects, built.quote, built.occurrence);
+  assert(
+    [...hlBuilt].sort().join(",") === [...hl].sort().join(","),
+    `built (joiner-carrying) quote highlights the same set as the seeded quote`,
+  );
+
+  // (c) Target side: zaln x-content carries the joiner, quote doesn't —
+  // both the degradation path and the OL-anchored path must still join.
+  const ms27 = (content, words27) => ({
+    type: "milestone", tag: "zaln", content, occurrence: "1", occurrences: "1",
+    children: words27.map((text) => ({
+      type: "word", tag: "w", text, occurrence: "1", occurrences: "1",
+    })),
+  });
+  const targetVo = [ms27(stoneTok, ["the", "stone"]), ms27(tinTok, ["of", "tin"])];
+  const sourceVo27 = [
+    { type: "word", tag: "w", text: stoneTok, occurrence: "1", occurrences: "1" },
+    { type: "word", tag: "w", text: tinTok, occurrence: "1", occurrences: "1" },
+  ];
+  for (const [label, hlT] of [
+    ["degradation", findTargetHighlights(targetVo, seededQuote, 1)],
+    ["OL-anchored", findTargetHighlights(targetVo, seededQuote, 1, sourceVo27)],
+  ]) {
+    for (const key of ["the|1", "stone|1", "of|1", "tin|1"]) {
+      assert(hlT.has(key), `${label}: joiner-less quote lights ${key}. Got: ${[...hlT].join(",")}`);
+    }
+  }
+}
+
+// ─── Case 28: occurrence -1 — "every occurrence" per the TSV spec ─────────
+//
+// `occurrence: -1` was clamped to 1 (Math.max(1, occurrence|0)), silently
+// highlighting only the first instance. It must light EVERY match: the
+// union of all matches on the source path, and every matching run on the
+// target degradation path. Seeded data has no -1 rows, so synthetic.
+{
+  console.log("\n[Case 28] occurrence -1 highlights every occurrence");
+  const w28 = (text, occurrence, occurrences) => ({
+    type: "word", tag: "w", text, occurrence: String(occurrence), occurrences: String(occurrences),
+  });
+
+  // (a) Source path: single word, two instances.
+  const sourceVo = [w28("אָב", 1, 2), w28("בֵּן", 1, 1), w28("אָב", 2, 2)];
+  const all = findSourceHighlights(sourceVo, "אָב", -1);
+  assert(all.has("אָב|1") && all.has("אָב|2"), `-1 lights both instances. Got: ${[...all].join(",")}`);
+  assert(!all.has("בֵּן|1"), `-1 must NOT light the unquoted word. Got: ${[...all].join(",")}`);
+  // Positive occurrences still pick a single instance (no regression).
+  const one = findSourceHighlights(sourceVo, "אָב", 1);
+  assert(one.has("אָב|1") && !one.has("אָב|2"), `occ=1 still picks only the first. Got: ${[...one].join(",")}`);
+
+  // (b) Source path: two-word phrase, two instances → union of both runs.
+  const phraseVo = [w28("אָב", 1, 2), w28("בֵּן", 1, 2), w28("גַּם", 1, 1), w28("אָב", 2, 2), w28("בֵּן", 2, 2)];
+  const phraseAll = findSourceHighlights(phraseVo, "אָב בֵּן", -1);
+  assert(
+    phraseAll.size === 4 && phraseAll.has("אָב|2") && phraseAll.has("בֵּן|2"),
+    `-1 phrase lights both runs (got ${[...phraseAll].join(",")})`,
+  );
+  assert(!phraseAll.has("גַּם|1"), `-1 phrase must NOT light the gap word`);
+
+  // (c) Target paths: zaln runs at occ 1 and 2 for the quoted word.
+  const ms28 = (content, occurrence, en) => ({
+    type: "milestone", tag: "zaln", content, occurrence: String(occurrence), occurrences: "2",
+    children: [{ type: "word", tag: "w", text: en, occurrence: "1", occurrences: "1" }],
+  });
+  const targetVo = [ms28("אָב", 1, "father1"), ms28("בֵּן", 1, "son"), ms28("אָב", 2, "father2")];
+  for (const [label, hlT] of [
+    ["degradation", findTargetHighlights(targetVo, "אָב", -1)],
+    ["OL-anchored", findTargetHighlights(targetVo, "אָב", -1, sourceVo)],
+  ]) {
+    assert(hlT.has("father1|1") && hlT.has("father2|1"), `${label}: -1 lights both fathers. Got: ${[...hlT].join(",")}`);
+    assert(!hlT.has("son|1"), `${label}: -1 must NOT light son. Got: ${[...hlT].join(",")}`);
+  }
+  // Positive occurrence still scoped on the target side too.
+  const occ2 = findTargetHighlights(targetVo, "אָב", 2, sourceVo);
+  assert(occ2.has("father2|1") && !occ2.has("father1|1"), `occ=2 still picks only the second. Got: ${[...occ2].join(",")}`);
+}
+
+// ─── Case 29: \d (Psalm superscription) — matchers descend into it ────────
+//
+// \d is `type:"section"` but its content IS alignable verse body. The
+// renderer already descends (highlight.ts segmentByParagraphs special
+// case); collectBareWords / collectMilestoneRuns / collectUhbWords now do
+// too, so a quote on a superscription word matches.
+{
+  console.log("\n[Case 29] \\d superscription words match quotes");
+  const mizmor = "מִזְמ֥וֹר";
+  const ledavid = "לְ⁠דָוִ֑ד";
+  const yahweh = "יְהוָ֔ה";
+  const w29 = (text) => ({ type: "word", tag: "w", text, occurrence: "1", occurrences: "1" });
+
+  // UHB-style: bare \w inside the \d section node, then a \q1 verse body.
+  const uhbVo = [
+    { type: "section", tag: "d", children: [w29(mizmor), { type: "text", text: " " }, w29(ledavid)] },
+    { type: "quote", tag: "q1" },
+    w29(yahweh),
+  ];
+  // (a) collectBareWords descends: quote on a superscription word matches.
+  const hlSrc = findSourceHighlights(uhbVo, mizmor, 1);
+  assert(hlSrc.has(`${mizmor}|1`), `\\d source word highlights (got ${[...hlSrc].join(",")})`);
+  const hlSrc2 = findSourceHighlights(uhbVo, `${ledavid} & ${yahweh}`, 1);
+  assert(
+    hlSrc2.has(`${ledavid}|1`) && hlSrc2.has(`${yahweh}|1`),
+    `discontinuous quote spanning \\d boundary matches (got ${[...hlSrc2].join(",")})`,
+  );
+
+  // ULT-style: zaln milestones inside the \d section node.
+  const ultVo = [
+    {
+      type: "section", tag: "d",
+      children: [
+        {
+          type: "milestone", tag: "zaln", content: mizmor, occurrence: "1", occurrences: "1",
+          children: [w29("A"), { type: "text", text: " " }, w29("psalm")],
+        },
+      ],
+    },
+    { type: "quote", tag: "q1" },
+    {
+      type: "milestone", tag: "zaln", content: yahweh, occurrence: "1", occurrences: "1",
+      children: [w29("Yahweh")],
+    },
+  ];
+  // (b) collectMilestoneRuns descends: degradation + OL-anchored paths.
+  for (const [label, hlT] of [
+    ["degradation", findTargetHighlights(ultVo, mizmor, 1)],
+    ["OL-anchored", findTargetHighlights(ultVo, mizmor, 1, uhbVo)],
+  ]) {
+    assert(hlT.has("A|1") && hlT.has("psalm|1"), `${label}: quote on \\d zaln lights its targets. Got: ${[...hlT].join(",")}`);
+    assert(!hlT.has("Yahweh|1"), `${label}: must NOT bleed into the verse body. Got: ${[...hlT].join(",")}`);
+  }
+
+  // (c) collectUhbWords descends: the quote builder can select \d words.
+  const built = buildQuoteFromSelection(uhbVo, new Set([tokenKey(mizmor, 1)]));
+  assert(built?.quote === mizmor, `builder authors a quote from a \\d word (got ${JSON.stringify(built)})`);
+  assert(built?.occurrence === 1, `builder occurrence=1 (got ${built?.occurrence})`);
+}
+
+// ─── Case 30: \d wrapper round-trips byte-clean through parse/serialize ───
+//
+// alignment.ts's walk() previously treated a `type:"section", tag:"d"` node
+// carrying children as an opaque marker, so its inner zaln / \w never
+// entered the alignment stream (the dialog couldn't edit superscription
+// alignments). It now descends via openMarker/closeMarker brackets like
+// \qs. Gate: the rebuilt tree must be DEEPLY EQUAL to the input — this is
+// the proof required before letting the serializer rebuild \d nodes.
+{
+  console.log("\n[Case 30] \\d wrapper deep-equal round-trip through parse/serialize");
+  const { deepStrictEqual } = await import("node:assert");
+  const dVerse = [
+    {
+      type: "section",
+      tag: "d",
+      children: [
+        {
+          tag: "zaln", type: "milestone", strong: "H4210", lemma: "מִזְמוֹר", morph: "He,Ncmsa",
+          occurrence: "1", occurrences: "1", content: "מִזְמ֥וֹר",
+          children: [
+            { text: "A", tag: "w", type: "word", occurrence: "1", occurrences: "1" },
+            { type: "text", text: " " },
+            { text: "psalm", tag: "w", type: "word", occurrence: "1", occurrences: "1" },
+          ],
+          endTag: "zaln-e\\*",
+        },
+        { type: "text", text: " " },
+        {
+          tag: "zaln", type: "milestone", strong: "l:H1732",
+          occurrence: "1", occurrences: "1", content: "לְ⁠דָוִ֑ד",
+          children: [
+            { text: "of", tag: "w", type: "word", occurrence: "1", occurrences: "1" },
+            { type: "text", text: " " },
+            { text: "David", tag: "w", type: "word", occurrence: "1", occurrences: "1" },
+          ],
+          endTag: "zaln-e\\*",
+        },
+        { type: "text", text: ".\n" },
+      ],
+    },
+    { tag: "q1", nextChar: " ", type: "quote" },
+    {
+      tag: "zaln", type: "milestone", strong: "H3068",
+      occurrence: "1", occurrences: "1", content: "יְהוָה",
+      children: [{ text: "Yahweh", tag: "w", type: "word", occurrence: "1", occurrences: "1" }],
+      endTag: "zaln-e\\*",
+    },
+  ];
+  const state = parseAlignment(dVerse, null);
+
+  // (a) The superscription's zaln/\w entered the alignment stream.
+  const psalmGroup = state.groups.find((g) => g.source.some((s) => s.strong === "H4210"));
+  assert(!!psalmGroup, "source group exists for the \\d-wrapped H4210");
+  assert(
+    psalmGroup?.targets.map((t) => t.text).join(" ") === "A psalm",
+    `\\d targets derive in stream order (got ${JSON.stringify(psalmGroup?.targets.map((t) => t.text))})`,
+  );
+  assert(state.unaligned.length === 0, `every word (including \\d words) is aligned (got ${state.unaligned.length} unaligned)`);
+
+  // (b) Deep-equal round-trip — the byte-clean gate.
+  let deepEqual = true;
+  let diff = "";
+  try {
+    deepStrictEqual(serializeAlignment(state), dVerse);
+  } catch (e) {
+    deepEqual = false;
+    diff = String(e.message).slice(0, 400);
+  }
+  assert(deepEqual, `parse → serialize returns a deeply-equal tree${diff ? ` (${diff})` : ""}`);
+
+  // (c) Plain text matches the shared extractor (importer parity).
+  assert(
+    alignmentPlainText(state) === extractPlainText(dVerse),
+    `alignmentPlainText matches extractPlainText for the \\d verse`,
+  );
+
+  // (d) A childless / text-only \d still rides along verbatim (opaque path).
+  const bareDVerse = [
+    { tag: "d", text: "A psalm of David.\n" },
+    { type: "quote", tag: "q1" },
+    { text: "Yahweh", tag: "w", type: "word", occurrence: "1", occurrences: "1" },
+  ];
+  let bareEqual = true;
+  try {
+    deepStrictEqual(serializeAlignment(parseAlignment(bareDVerse, null)), bareDVerse);
+  } catch {
+    bareEqual = false;
+  }
+  assert(bareEqual, "text-only \\d (no children) round-trips verbatim through the opaque path");
+}
+
+// ─── Case 31: withSourceCoverage totals keyed by NFC (textKey) ────────────
+//
+// collectSourceWords counts textOccurrence per NFC textKey, but the
+// placeholder builder totalled occurrences by RAW sw.text — so two
+// raw-different / NFC-equal tokens (UHB legacy combining-mark order vs
+// NFC) produced occurrence="2" with occurrences="1", the same impossible
+// "2nd of 1" shape the split-gloss healers exist to clean up.
+{
+  console.log("\n[Case 31] withSourceCoverage occurrences keyed by NFC");
+  // kaf+dagesh+hiriq+yod in UHB legacy order; NFC reorders hiriq before
+  // dagesh (CCC 14 < 21) → raw-different, NFC-equal.
+  const legacy = "\u05DB\u05BC\u05B4\u05D9"; // כ + dagesh + hiriq + yod
+  const canonical = legacy.normalize("NFC");
+  assert(legacy !== canonical, "precondition: legacy and NFC forms differ byte-wise");
+  assert(legacy.normalize("NFC") === canonical.normalize("NFC"), "precondition: forms are NFC-equal");
+
+  const sourceVo = [
+    { type: "word", tag: "w", text: legacy, strong: "H1", lemma: "", morph: "" },
+    { type: "word", tag: "w", text: canonical, strong: "H1", lemma: "", morph: "" },
+  ];
+  // Empty target → both source words become placeholder groups.
+  const state = parseAlignment([], sourceVo);
+  assert(state.groups.length === 2, `two placeholder groups (got ${state.groups.length})`);
+  const occs = state.groups.map((g) => [g.source[0].occurrence, g.source[0].occurrences]);
+  assert(
+    JSON.stringify(occs) === JSON.stringify([["1", "2"], ["2", "2"]]),
+    `NFC-equal tokens count as one text: occurrence/occurrences = 1/2 and 2/2 (got ${JSON.stringify(occs)})`,
+  );
+  for (const g of state.groups) {
+    const occ = parseInt(g.source[0].occurrence, 10);
+    const total = parseInt(g.source[0].occurrences, 10);
+    assert(occ <= total, `placeholder occurrence ≤ occurrences (got ${occ}/${total})`);
+  }
+}
+
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed.`);
   process.exit(1);

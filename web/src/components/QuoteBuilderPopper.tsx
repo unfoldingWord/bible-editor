@@ -34,6 +34,7 @@ import type { HighlightKey } from "../lib/highlight";
 import type { SourceAncestor } from "../lib/quoteBuilder";
 import type { LexiconEntry } from "../hooks/useLexicon";
 import type { SourceWord } from "../lib/alignment";
+import { isHebrewBook } from "../lib/sourceSearch";
 import { SourceTooltipBody } from "./SourceTooltipBody";
 
 interface Props {
@@ -73,6 +74,12 @@ export function QuoteBuilderPopper({
   const uhbTokens = useMemo(() => collectUhbWords(uhbVerseObjects), [uhbVerseObjects]);
   const ultTokens = useMemo(() => collectTargetTokens(ultVerseObjects), [ultVerseObjects]);
   const ustTokens = useMemo(() => collectTargetTokens(ustVerseObjects), [ustVerseObjects]);
+
+  // OT books read their source from UHB (Hebrew, RTL); NT books from UGNT
+  // (Greek, LTR). Shell hands us whichever exists, so label and direction
+  // derive from the book code rather than hardcoding Hebrew.
+  const sourceIsHebrew = isHebrewBook(book);
+  const sourceLabel = sourceIsHebrew ? "UHB" : "UGNT";
 
   // Preview of the would-be quote string. Re-runs cheaply on every toggle
   // since collectUhbWords / matchGroupsAt scan an in-memory tree.
@@ -144,8 +151,8 @@ export function QuoteBuilderPopper({
             </IconButton>
           </Stack>
 
-          {/* UHB row */}
-          <Section label="UHB" rtl>
+          {/* Source row — UHB or UGNT */}
+          <Section label={sourceLabel} rtl={sourceIsHebrew}>
             {uhbTokens.length === 0 ? (
               <EmptyHint>no source words for this verse</EmptyHint>
             ) : (
@@ -170,7 +177,7 @@ export function QuoteBuilderPopper({
                     text={tok.text}
                     occurrence={tok.occurrence}
                     selected={selected}
-                    rtl
+                    rtl={sourceIsHebrew}
                     onClick={() => onToggleKey(key)}
                     lexiconBody={
                       <SourceTooltipBody
@@ -247,8 +254,8 @@ export function QuoteBuilderPopper({
                 sx={{
                   fontFamily: '"Times New Roman","SBL Hebrew","Cardo",serif',
                   fontSize: 18,
-                  direction: "rtl",
-                  textAlign: "right",
+                  direction: sourceIsHebrew ? "rtl" : "ltr",
+                  textAlign: sourceIsHebrew ? "right" : "left",
                   minHeight: 24,
                   color: preview ? "text.primary" : "text.disabled",
                 }}
@@ -468,7 +475,12 @@ function collectUhbWords(verseObjects: unknown[] | null): UhbChip[] {
           lemma: String(o["lemma"] ?? ""),
           morph: String(o["morph"] ?? ""),
         });
-      } else if (o["type"] === "milestone") {
+      } else if (
+        o["type"] === "milestone" ||
+        // \d (Psalm superscription) is `type:"section"` but its content IS
+        // alignable verse body — descend like the highlight matchers do.
+        (o["type"] === "section" && o["tag"] === "d")
+      ) {
         const children = (o["children"] as unknown[] | undefined) ?? [];
         walk(children);
       }

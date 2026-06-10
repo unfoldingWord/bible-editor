@@ -1,4 +1,8 @@
-name = "bible-editor-api"
+# Dev-suffixed on purpose: the production worker is `bible-editor-api` (set in
+# [env.production] below). With a distinct top-level name, a plain
+# `wrangler deploy` (missing `--env production`) lands on a separate dev worker
+# instead of overwriting prod with dev bindings.
+name = "bible-editor-api-dev"
 main = "src/index.ts"
 compatibility_date = "2025-04-01"
 compatibility_flags = ["nodejs_compat"]
@@ -47,16 +51,9 @@ name = "bible-editor-export"
 binding = "EXPORT_WORKFLOW"
 class_name = "ExportWorkflow"
 
-[triggers]
-# Future: nightly DCS re-import is wired up in src/index.ts (REIMPORT_CRON
-# branch) but deliberately not registered here yet. Uncomment "0 8 * * *"
-# below once the export → DCS git-action merge loop is verified end-to-end.
-# crons = ["0 6 * * *", "*/5 * * * *", "0 8 * * *"]
-# Export cron retimed to 05:30 UTC (was "0 6 * * *") so the -be- branches land
-# ~30 min before Rich's 06:00 UTC DCS-side validate-and-merge job (sequence:
-# export -> per-push validation -> 06:00 merge). The */5 pipeline-poll cron is
-# unrelated (AI auto-apply).
-crons = ["30 5 * * *", "*/5 * * * *"]
+# No [triggers] on the default env: crons are registered only on production
+# (below) so an accidental dev deploy can't double-fire the nightly export.
+# `wrangler dev --test-scheduled` exposes /__scheduled regardless.
 
 # Public-safe defaults; secrets go in `wrangler secret put` (DCS_CLIENT_ID,
 # DCS_CLIENT_SECRET, JWT_SIGNING_KEY, DCS_SERVICE_TOKEN, BT_API_TOKEN).
@@ -120,8 +117,13 @@ binding = "EXPORT_WORKFLOW"
 class_name = "ExportWorkflow"
 
 [env.production.triggers]
-# See [triggers] above re: dormant "0 8 * * *" nightly DCS re-import.
-# Export cron at 05:30 UTC, ~30 min before Rich's 06:00 merge (see [triggers]).
+# Export cron retimed to 05:30 UTC (was "0 6 * * *") so the -be- branches land
+# ~30 min before Rich's 06:00 UTC DCS-side validate-and-merge job (sequence:
+# export -> per-push validation -> 06:00 merge). The */5 pipeline-poll cron is
+# unrelated (AI auto-apply).
+# Future: nightly DCS re-import is wired up in src/index.ts (REIMPORT_CRON
+# branch) but deliberately not registered yet. Add "0 8 * * *" once the
+# export → DCS git-action merge loop is verified end-to-end.
 crons = ["30 5 * * *", "*/5 * * * *"]
 
 [env.production.vars]

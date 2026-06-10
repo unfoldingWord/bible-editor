@@ -55,14 +55,15 @@ export interface Env {
   PIPELINE_API_BASE?: string;
 }
 
-// Cron patterns must match the [triggers] crons list in wrangler.toml. There's
-// no runtime way to assert they line up (wrangler doesn't expose triggers to
-// the Worker), but constants in code give grep something to find when the
-// schedule changes.
+// Cron patterns must match the [env.production.triggers] crons list in
+// wrangler.toml (the default env registers no crons — see the note there).
+// There's no runtime way to assert they line up (wrangler doesn't expose
+// triggers to the Worker), but constants in code give grep something to find
+// when the schedule changes.
 const EXPORT_CRON = "30 5 * * *";
 const POLL_CRON = "*/5 * * * *";
-// Dormant: not yet registered in wrangler.toml [triggers].crons. Branch
-// below is unreachable until the cron entry is uncommented in wrangler.toml.
+// Dormant: not yet registered in wrangler.toml [env.production.triggers].
+// Branch below is unreachable until the cron entry is added there.
 // Scheduled for 08:00 UTC — 2 hours after EXPORT_CRON so DCS-side merge of
 // our nightly snapshot has time to land before we pull master back.
 const REIMPORT_CRON = "0 8 * * *";
@@ -226,23 +227,38 @@ export default {
       // permanent deleted_at tombstone — which is hidden from reads, excluded
       // from the export below, and skipped by the daily reimport so it can't
       // resurrect. Keep the original deletion time (deleted_at = trashed_at).
-      // Audit first (reads pre-update state), then promote.
-      await env.DB.batch([
-        env.DB.prepare(
-          `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, source)
-           SELECT 'tn', id, book, NULL, version, version, 'delete', 'nightly_finalize'
-             FROM tn_rows WHERE trashed_at IS NOT NULL AND deleted_at IS NULL`,
-        ),
-        env.DB.prepare(
-          `UPDATE tn_rows SET deleted_at = trashed_at, trashed_at = NULL
-            WHERE trashed_at IS NOT NULL AND deleted_at IS NULL`,
-        ),
-      ]);
+      // Audit first (reads pre-update state), then promote. A finalize failure
+      // must not cancel the night's export — buildResource's `trashed_at IS
+      // NULL` filter tolerates unfinalized trash, and the next tick retries.
+      try {
+        await env.DB.batch([
+          env.DB.prepare(
+            `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, source)
+             SELECT 'tn', id, book, NULL, version, version, 'delete', 'nightly_finalize'
+               FROM tn_rows WHERE trashed_at IS NOT NULL AND deleted_at IS NULL`,
+          ),
+          env.DB.prepare(
+            `UPDATE tn_rows SET deleted_at = trashed_at, trashed_at = NULL
+              WHERE trashed_at IS NOT NULL AND deleted_at IS NULL`,
+          ),
+        ]);
+      } catch (e) {
+        console.error("nightly trash finalize failed", e instanceof Error ? e.message : String(e));
+      }
       // Scheduled run opts into validate-and-merge — the whole point of the
       // 06:00 UTC tick is to land the snapshot on DCS and let the validator
       // merge it. Manual /api/exports/run leaves validateAndMerge unset so
       // tests don't accidentally trigger the auto-merge.
-      await env.EXPORT_WORKFLOW.create({ params: { validateAndMerge: true } });
+      //
+      // Deterministic per-day instance id: a double-fire of the cron (or a
+      // retried scheduled event) rejects on the duplicate id instead of
+      // running two overlapping nightly exports.
+      const day = new Date(controller.scheduledTime).toISOString().slice(0, 10);
+      try {
+        await env.EXPORT_WORKFLOW.create({ id: `nightly-${day}`, params: { validateAndMerge: true } });
+      } catch (e) {
+        console.log("nightly export already created for", day, e instanceof Error ? e.message : String(e));
+      }
       return;
     }
     if (controller.cron === POLL_CRON) {

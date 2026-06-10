@@ -83,14 +83,14 @@ function isWordLeaf(node: Record<string, unknown>): boolean {
 }
 
 // A word run — Unicode letters/marks/numbers (plus ZWJ / word-joiner for
-// scripts that need them) with intra-word `-` / `’` / `’` allowed
-// between letter runs (so "don’t", "don’t", "hello-world" stay one
+// scripts that need them) with intra-word `-` / `'` / `’` allowed
+// between letter runs (so "don't", "don’t", "hello-world" stay one
 // `\w` token but flanking quotes / dashes ride as text). \p{N} is
 // required because the UST writes literal counts (`\w 30\w*`) for
 // measurements — "30" must become a draggable alignment chip.
 // Mirrors `string-punctuation-tokenizer`’s greedy pattern, the package
 // translationCore / gatewayEdit use for the same job.
-const WORD_RUN_RE = /[\p{L}\p{M}\p{N}‍⁠]+(?:[-’’][\p{L}\p{M}\p{N}‍⁠]+)*/gu;
+const WORD_RUN_RE = /[\p{L}\p{M}\p{N}‍⁠]+(?:[-'’][\p{L}\p{M}\p{N}‍⁠]+)*/gu;
 
 // Re-tokenize a plain string into a flat verseObjects-style array. Each
 // word run becomes a `\w` node so the aligner has draggable targets;
@@ -334,9 +334,16 @@ function stripLiftedMarkers(nodes: unknown[]): unknown[] {
 // `raw` concatenation of leaf text, which may contain `\n` (e.g. before
 // `{...}` word-additions) where plain text has a single space.
 function relaxWhitespace(regex: RegExp): RegExp {
-  const relaxed = regex.source.replace(/ /g, "\\s+");
   const flags = regex.flags.includes("g") ? regex.flags : regex.flags + "g";
-  return new RegExp(relaxed, flags);
+  try {
+    return new RegExp(regex.source.replace(/ /g, "\\s+"), flags);
+  } catch {
+    // Raw user patterns (regex-mode Find & Replace) flow through here too,
+    // and the blind space rewrite can produce an invalid pattern (`son {2}of`
+    // → `son\s+{2}of`, "nothing to repeat"). Fall back to the original; if
+    // it then misses in raw, the caller's no-match path tokenizes flat.
+    return new RegExp(regex.source, flags);
+  }
 }
 
 // Find the Nth (1-based) occurrence of `regex` in `text`. Returns null if
@@ -442,11 +449,15 @@ export function smartReplaceVerse(
   //       (e.g. raw `"good,"` parses as text "good" inside a \w then a
   //       sibling text node ",". A naive `split(/\s+/)` would group those
   //       as one token "good," and we'd write "," back into the word leaf.)
+  //   (e) at least one word in the match — a zero-word (whitespace /
+  //       punctuation-only) change has nothing for the in-place loop to
+  //       rewrite, so the edit would be silently discarded; route it to
+  //       the localized rewrite instead.
   const affected = leaves.filter((l) => l.start < rawEnd && l.end > rawStart);
   const startsAtBoundary = affected.length > 0 && affected[0].start === rawStart;
   const endsAtBoundary = affected.length > 0 && affected[affected.length - 1].end === rawEnd;
   // Use the same word-run regex as tokenizePlainText so "word characters"
-  // (letters / marks / numbers / intra-word `-` `'` `'`) define a word — punctuation
+  // (letters / marks / numbers / intra-word `-` `'` `’`) define a word — punctuation
   // doesn't ride along.
   const matchWords = [...rawMatchText.matchAll(WORD_RUN_RE)].map((m) => m[0]);
   const replaceWords = [...replaceText.matchAll(WORD_RUN_RE)].map((m) => m[0]);
@@ -457,6 +468,7 @@ export function smartReplaceVerse(
   const canPreserve =
     startsAtBoundary &&
     endsAtBoundary &&
+    matchWords.length > 0 &&
     matchWords.length === replaceWords.length &&
     wordsMatchLeaves;
 
@@ -555,10 +567,10 @@ function diffSingleChange(
   };
 }
 
-// Letters / marks that count as the "core" of a word — the same character
+// Letters / marks / numbers that count as the "core" of a word — the same character
 // class WORD_RUN_RE builds words from (its intra-word connectors -'’ only
 // bind between letters, so they don't matter for a boundary-adjacency test).
-const WORD_CORE_RE = /[\p{L}\p{M}‍⁠]/u;
+const WORD_CORE_RE = /[\p{L}\p{M}\p{N}‍⁠]/u;
 
 // A minimal diff can report a word edit as a pure insertion: typing "Th"
 // immediately before the word "is" diffs as `insert "Th" at offset N`, not
@@ -688,10 +700,13 @@ function rawTextOfNode(node: unknown): string {
 
 // Walk a milestone's children once and partition them by their raw-text
 // position relative to the change range. Children entirely before the
-// range go into `before`, entirely after into `after`, anything that
-// overlaps is dropped (its content is replaced by tokenizePlainText in the
-// outer walk). Recurses into nested milestones at the top level only — a
-// fully-contained nested milestone is treated as a single child.
+// range go into `before`, entirely after into `after`. An overlapping
+// child that is itself a milestone / wrapper (nested \zaln-s compound
+// alignment) recurses, splitting into before/after halves like the outer
+// walk so its descendants outside the range keep their alignment. An
+// overlapping leaf is dropped (its content is replaced by the tokenized
+// newSubstring in the outer walk) — the splitsNestedLeaf guard upstream
+// guarantees it lies wholly inside the change range.
 function partitionMilestoneChildren(
   milestoneNode: Record<string, unknown>,
   milestoneStart: number,
@@ -711,8 +726,15 @@ function partitionMilestoneChildren(
       before.push(child);
     } else if (childStart >= rawEnd) {
       after.push(child);
+    } else {
+      const c = child as Record<string, unknown> | null;
+      if (c && Array.isArray(c["children"]) && (c["children"] as unknown[]).length > 0) {
+        const inner = partitionMilestoneChildren(c, childStart, rawStart, rawEnd);
+        if (inner.before.length > 0) before.push({ ...c, children: inner.before });
+        if (inner.after.length > 0) after.push({ ...c, children: inner.after });
+      }
+      // Overlapping leaves are dropped — the change region replaces them.
     }
-    // Overlapping children are dropped — the change region replaces them.
   }
   return { before, after };
 }
@@ -793,12 +815,13 @@ function localizedRewriteVerse(
   }
   const rawEnd = rawStart + rawLen;
 
-  // Text-correctness guard. The partition walk treats milestone children as
-  // opaque — any child whose extent overlaps the change is dropped wholly,
-  // replaced by the tokenized newSubstring. If a NESTED leaf (depth > 0,
-  // i.e. inside a milestone) is only PARTIALLY overlapped, the unchanged
-  // half of that leaf's text disappears from the saved verse. Top-level
-  // text leaves are fine — the per-node walk splits them at the boundary.
+  // Text-correctness guard. The partition walk recurses into overlapping
+  // milestone children, but any LEAF whose extent overlaps the change is
+  // dropped wholly, replaced by the tokenized newSubstring. If a NESTED
+  // leaf (depth > 0, i.e. inside a milestone) is only PARTIALLY overlapped,
+  // the unchanged half of that leaf's text would disappear from the saved
+  // verse. Top-level text leaves are fine — the per-node walk splits them
+  // at the boundary.
   // Losing alignment is bad; losing user text they just typed is worse.
   const { leaves } = walkLeaves(cloned);
   const splitsNestedLeaf = leaves.some((l) => {

@@ -131,7 +131,10 @@ export function DocColumn({
         const plain = (d.payload as { plainText?: unknown }).plainText;
         if (typeof plain === "string") next.set(d.meta.verse, plain);
       }
-      setDirtyVerses(next);
+      // drafts.subscribe fires for every draft write anywhere (other
+      // columns, note typing) — bail out when nothing in THIS column
+      // changed so those keystrokes don't re-render the whole column.
+      setDirtyVerses((prev) => (dirtyMapsEqual(prev, next) ? prev : next));
     });
   }, [book, chapter, bibleVersion, readOnly]);
 
@@ -312,6 +315,14 @@ export function DocColumn({
       </Box>
     </Box>
   );
+}
+
+function dirtyMapsEqual(a: Map<number, string>, b: Map<number, string>): boolean {
+  if (a.size !== b.size) return false;
+  for (const [k, v] of a) {
+    if (b.get(k) !== v) return false;
+  }
+  return true;
 }
 
 // Locate the verse row immediately preceding `verse` in this column's

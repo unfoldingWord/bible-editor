@@ -235,12 +235,30 @@ function emitAuthError() {
   }
 }
 
+// Fired after a *successful* silent refresh. The outbox subscribes to
+// revive ops that were parked as failed (max_attempts_exceeded) while the
+// session was dead — a fresh access cookie is exactly the condition change
+// that makes them worth a new retry budget.
+type AuthRefreshedListener = () => void;
+const authRefreshedListeners = new Set<AuthRefreshedListener>();
+export function onAuthRefreshed(fn: AuthRefreshedListener): () => void {
+  authRefreshedListeners.add(fn);
+  return () => authRefreshedListeners.delete(fn);
+}
+function emitAuthRefreshed() {
+  for (const fn of authRefreshedListeners) {
+    try { fn(); } catch { /* listener bug — don't break the request pipeline */ }
+  }
+}
+
 // Concurrent failing requests share a single refresh attempt so we don't
 // trigger N refresh calls when N in-flight outbox ops all 401 at once. The
 // server reads the be_refresh cookie (SameSite=Strict, sent automatically
 // on same-origin POST) and rotates the be_access cookie.
+// Exported for wsClient.ts — a WS handshake rejected before `open` can't go
+// through request()'s 401 path, so the reconnect loop calls this directly.
 let refreshInFlight: Promise<boolean> | null = null;
-async function refreshAuthOnce(): Promise<boolean> {
+export async function refreshAuthOnce(): Promise<boolean> {
   if (refreshInFlight) return refreshInFlight;
   refreshInFlight = (async () => {
     try {
@@ -248,6 +266,7 @@ async function refreshAuthOnce(): Promise<boolean> {
         method: "POST",
         credentials: "include",
       });
+      if (res.ok) emitAuthRefreshed();
       return res.ok;
     } catch {
       return false;
@@ -266,7 +285,8 @@ async function refreshAuthOnce(): Promise<boolean> {
 // slow link can legitimately take double-digit seconds. Higher than this and
 // a half-open socket starts to block sibling outbox ops (the outbox's per-
 // target FIFO means a hung op holds back everything on that row).
-const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
+// Exported so the outbox can derive its in-flight recovery threshold from it.
+export const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 
 export interface RequestInitWithTimeout extends RequestInit {
   /** Override the default 30s timeout. Pass 0 to disable. */
@@ -336,48 +356,69 @@ async function request<T>(
   const fetchInit: RequestInit = { ...init, headers, signal, credentials: "include" };
   delete (fetchInit as RequestInitWithTimeout).timeoutMs;
 
+  // The timeout signal must stay armed until the *body* is consumed, not
+  // just until headers arrive — a stalled response body would otherwise hang
+  // res.json() forever and freeze the globally-serial outbox drain. The
+  // finally below is the single release point.
   let res: Response;
   try {
-    res = await fetch(path, fetchInit);
-  } catch (e) {
-    if (timer) clearTimeout(timer);
-    // Surface our timeout as a plain Error so callers (notably the outbox at
-    // outbox.ts dispatch → `e instanceof ApiError === false` branch)
-    // classify it as `network`/retry instead of `fatal`.
-    if (e instanceof DOMException && e.name === "TimeoutError") {
-      throw new Error("request timeout");
+    try {
+      res = await fetch(path, fetchInit);
+    } catch (e) {
+      // Surface our timeout as a plain Error so callers (notably the outbox at
+      // outbox.ts dispatch → `e instanceof ApiError === false` branch)
+      // classify it as `network`/retry instead of `fatal`.
+      if (e instanceof DOMException && e.name === "TimeoutError") {
+        throw new Error("request timeout");
+      }
+      throw e;
     }
-    throw e;
-  }
-  if (timer) clearTimeout(timer);
 
-  if (res.status === 401 && !_retriedAfterRefresh) {
-    // Silent refresh once per request. Only attempt while online — refreshing
-    // through a captive portal would just burn the refresh window. The
-    // outbox retries on `online`/`focus` so we'll get another shot then.
-    if (typeof navigator !== "undefined" && navigator.onLine === false) {
+    if (res.status === 401 && !_retriedAfterRefresh) {
+      // First attempt is settled (we never read its body) — release its
+      // timer now; the retry below arms its own body-covering timeout.
+      if (timer) {
+        clearTimeout(timer);
+        timer = null;
+      }
+      // Silent refresh once per request. Only attempt while online — refreshing
+      // through a captive portal would just burn the refresh window. The
+      // outbox retries on `online`/`focus` so we'll get another shot then.
+      if (typeof navigator !== "undefined" && navigator.onLine === false) {
+        throw new ApiError(401, "HTTP 401");
+      }
+      const refreshed = await refreshAuthOnce();
+      if (refreshed) {
+        return await request<T>(path, init, true);
+      }
+      // Refresh failed — token is dead or user was revoked. Surface to UI so
+      // the user sees *why* their edits are queueing forever.
+      emitAuthError();
       throw new ApiError(401, "HTTP 401");
     }
-    const refreshed = await refreshAuthOnce();
-    if (refreshed) {
-      return request<T>(path, init, true);
-    }
-    // Refresh failed — token is dead or user was revoked. Surface to UI so
-    // the user sees *why* their edits are queueing forever.
-    emitAuthError();
-    throw new ApiError(401, "HTTP 401");
-  }
 
-  if (!res.ok) {
-    let body: unknown = null;
-    try {
-      body = await res.json();
-    } catch {
-      /* ignore */
+    if (!res.ok) {
+      let body: unknown = null;
+      try {
+        body = await res.json();
+      } catch {
+        /* ignore — status alone is enough to classify the error */
+      }
+      throw new ApiError(res.status, `HTTP ${res.status}`, body);
     }
-    throw new ApiError(res.status, `HTTP ${res.status}`, body);
+    try {
+      return (await res.json()) as T;
+    } catch (e) {
+      // A timeout firing mid-body-read aborts the stream with our reason —
+      // map it to the same plain Error as the fetch path above.
+      if (e instanceof DOMException && e.name === "TimeoutError") {
+        throw new Error("request timeout");
+      }
+      throw e;
+    }
+  } finally {
+    if (timer) clearTimeout(timer);
   }
-  return (await res.json()) as T;
 }
 
 export type Role = "admin" | "editor" | "viewer";

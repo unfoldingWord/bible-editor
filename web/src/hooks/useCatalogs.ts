@@ -41,6 +41,11 @@ function load(): Promise<Catalogs> {
     writePersisted(c);
     for (const s of subscribers) s(c);
     return c;
+  }).catch((err) => {
+    // Don't cache the rejection — a failed first fetch must retry on the
+    // next mount, not leave pickers empty for the whole session.
+    inflight = null;
+    throw err;
   });
   return inflight;
 }

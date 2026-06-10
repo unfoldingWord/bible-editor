@@ -136,6 +136,18 @@ function isAlignmentWrapper(n: ParsedNode | undefined): boolean {
   const children = n["children"];
   return Array.isArray(children) && children.length > 0;
 }
+// \d (Psalm superscription) is `type:"section"` — not `type:"quote"`, so
+// isAlignmentWrapper can't cover it — but its content IS alignable verse
+// body (see highlight.ts's renderer special case). When it arrives with
+// children, descend like a \qs wrapper so the inner zaln / word nodes
+// enter the alignment stream; a childless \d (bare marker or text-only)
+// stays opaque and rides along verbatim.
+function isPsalmTitleWrapper(n: ParsedNode | undefined): boolean {
+  if (!n || typeof n !== "object") return false;
+  if (n["type"] !== "section" || n["tag"] !== "d") return false;
+  const children = n["children"];
+  return Array.isArray(children) && children.length > 0;
+}
 
 // Shallow-clone a node's own properties, dropping `children` (the
 // serializer rebuilds those). Used for wrapper open-markers, whose
@@ -252,12 +264,12 @@ function walk(
       stream.push({ kind: "word", word: targetOf(node), alignedTo: currentGroupId });
     } else if (nodeIsText(node)) {
       stream.push({ kind: "text", text: String(node["text"] ?? "") });
-    } else if (isAlignmentWrapper(node)) {
-      // Descend through a `\qs` (or similar whitelisted) wrapper whose
-      // children include alignment-bearing content. The inner zaln /
-      // word / text nodes enter the stream like any other content; the
-      // wrapper itself is reconstructed at serialize time from these
-      // brackets.
+    } else if (isAlignmentWrapper(node) || isPsalmTitleWrapper(node)) {
+      // Descend through a `\qs` (or similar whitelisted) wrapper — or a
+      // `\d` Psalm superscription carrying children — whose children
+      // include alignment-bearing content. The inner zaln / word / text
+      // nodes enter the stream like any other content; the wrapper itself
+      // is reconstructed at serialize time from these brackets.
       const tag = String(node["tag"] ?? "");
       stream.push({ kind: "openMarker", tag, node: cloneNodeShallow(node) });
       const children = (node["children"] as ParsedNode[] | undefined) ?? [];
@@ -418,9 +430,12 @@ function withSourceCoverage(
       if (p >= 0) covered.add(p);
     }
   }
+  // Keyed by textKey (NFC) — textOccurrence was counted per textKey in
+  // collectSourceWords, so totals must use the same key or two raw-different
+  // / NFC-equal tokens get occurrence=2 with occurrences=1 (malformed).
   const textTotals = new Map<string, number>();
   for (const sw of sourceWords) {
-    textTotals.set(sw.text, (textTotals.get(sw.text) ?? 0) + 1);
+    textTotals.set(sw.textKey, (textTotals.get(sw.textKey) ?? 0) + 1);
   }
   const placeholders: AlignmentGroup[] = [];
   for (const sw of sourceWords) {
@@ -434,7 +449,7 @@ function withSourceCoverage(
           lemma: sw.lemma,
           morph: sw.morph,
           occurrence: String(sw.textOccurrence),
-          occurrences: String(textTotals.get(sw.text) ?? 1),
+          occurrences: String(textTotals.get(sw.textKey) ?? 1),
           content: sw.text,
         },
       ],

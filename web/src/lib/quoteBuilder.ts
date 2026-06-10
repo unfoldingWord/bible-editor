@@ -11,6 +11,7 @@
 // always 1, matching how new TNs are typically written.
 
 import type { HighlightKey } from "./highlight";
+import { matchNorm } from "./highlight.ts";
 import { nfc } from "./hebrew.ts";
 
 // Build a HighlightKey from a Hebrew/Greek string + 1-based occurrence.
@@ -55,7 +56,12 @@ function collectUhbWords(verseObjects: unknown[]): UhbWord[] {
         // maqqef / inter-word space as a bare text sibling of the \w tokens.
         const prev = out[out.length - 1];
         if (prev) prev.trailing += String(o["text"] ?? "");
-      } else if (o["type"] === "milestone") {
+      } else if (
+        o["type"] === "milestone" ||
+        // \d (Psalm superscription) is `type:"section"` but its content IS
+        // alignable verse body — descend like the highlight matchers do.
+        (o["type"] === "section" && o["tag"] === "d")
+      ) {
         const children = (o["children"] as unknown[] | undefined) ?? [];
         walk(children);
       }
@@ -207,10 +213,11 @@ function matchGroupsAt(
   groups: UhbWord[][],
   all: UhbWord[],
 ): boolean {
-  // Compare via nfc-normalized keys (sans the occurrence suffix) so the
-  // matcher tolerates legacy-vs-NFC drift between identical-looking
-  // Hebrew strings — same reason `tokenKey` exists.
-  const norm = (w: UhbWord) => w.key.split("|")[0];
+  // Compare via matchNorm (NFC + joiner stripping) so the occurrence this
+  // builder stamps counts the same matches the highlighter's
+  // matchSourceTokens will find — legacy-vs-NFC drift AND word-joiner
+  // presence both tolerated, keeping built quotes round-tripping.
+  const norm = (w: UhbWord) => matchNorm(w.text);
   let pos = start;
   for (let gi = 0; gi < groups.length; gi++) {
     const group = groups[gi];
