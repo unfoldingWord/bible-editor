@@ -19,8 +19,6 @@ import {
   useTheme,
 } from "@mui/material";
 import CloseIcon from "@mui/icons-material/Close";
-import ExpandLessIcon from "@mui/icons-material/ExpandLess";
-import ExpandMoreIcon from "@mui/icons-material/ExpandMore";
 import { assignChipHues, chipAccentColor, chipSupColor } from "../lib/highlightStyles";
 import {
   alignmentPlainText,
@@ -49,6 +47,12 @@ import {
 } from "../lib/alignmentSuggest";
 import { nfc } from "../lib/hebrew";
 import { SourceTooltipBody } from "./SourceTooltipBody";
+import { UhbStrip, twHintFor } from "./UhbStrip";
+import {
+  type HoverHighlight,
+  type HighlightCtx,
+  hoverShadow,
+} from "../lib/highlightTypes";
 
 const WORD_IDS_MIME = "text/word-ids";
 const SOURCE_ID_MIME = "text/source-id";
@@ -63,39 +67,6 @@ const LS_INVENTORY_HEIGHT = "be:alignmentInventoryHeight";
 const DEFAULT_INVENTORY_HEIGHT = 112;
 const MIN_INVENTORY_HEIGHT = 56;
 const MAX_INVENTORY_HEIGHT = 480;
-
-type HoverHighlight =
-  | { kind: "english"; key: string; groupId: string | null }
-  | { kind: "hebrew"; key: string; groupId: string | null }
-  | null;
-
-type HighlightTone = "exact" | "linked" | null;
-
-interface HighlightCtx {
-  colorize: boolean;
-  hoverLink: boolean;
-  // Per-(text|occurrence) hue degree assignment for the "colors" toggle.
-  // Only duplicate-occurrence words get an entry; missing = no accent.
-  matchHues: Map<string, number>;
-  themeMode: "light" | "dark";
-  onEnglishEnter: (wordId: string, text: string, occurrence: string, groupIdOverride?: string) => void;
-  // Hebrew is keyed by Strong number (invariant) + occurrence — content
-  // text can differ between the alignment milestone and the UHB \w token
-  // due to cantillation / NFC variation.
-  onHebrewEnter: (strong: string, occurrence: string, groupIdOverride?: string) => void;
-  onLeave: () => void;
-  englishHighlight: (
-    wordId: string,
-    text: string,
-    occurrence: string,
-    groupIdOverride?: string,
-  ) => HighlightTone;
-  hebrewHighlight: (
-    strong: string,
-    occurrence: string,
-    groupIdOverride?: string,
-  ) => HighlightTone;
-}
 
 function readFlag(key: string, fallback = false): boolean {
   try {
@@ -152,6 +123,25 @@ interface Props {
   onSave: (newContent: unknown, plainText: string, expectedVersion: number) => void;
   onCancel: () => void;
   onDirtyChange?: (dirty: boolean) => void;
+  // Side-by-side mode (all optional; absent = standalone single-panel behavior).
+  // When `hover`/`onHoverChange` are provided the hover state is controlled by a
+  // shared parent so two panels cross-highlight the same Hebrew. Likewise
+  // `hoverLink`/`onToggleHoverLink` let the parent keep both toolbars in sync.
+  // `renderUhbStrip={false}` suppresses the per-panel source strip (the parent
+  // renders one shared strip). `onOpenDual` adds a "Side-by-side" action.
+  hover?: HoverHighlight;
+  onHoverChange?: (h: HoverHighlight) => void;
+  hoverLink?: boolean;
+  onToggleHoverLink?: () => void;
+  renderUhbStrip?: boolean;
+  onOpenDual?: () => void;
+  // When false, Hebrew source words don't show their lexical tooltip on hover.
+  showSourceInfo?: boolean;
+  // Offset of this panel's first source token within the side-by-side
+  // aligner's union source span. Hover positions travel union-relative so the
+  // shared strip and the opposite panel agree on which Hebrew token is meant
+  // even when the two versions cover different verse ranges. 0 standalone.
+  posOffset?: number;
 }
 
 export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
@@ -166,6 +156,14 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
       onSave,
       onCancel,
       onDirtyChange,
+      hover: hoverProp,
+      onHoverChange,
+      hoverLink: hoverLinkProp,
+      onToggleHoverLink,
+      renderUhbStrip = true,
+      onOpenDual,
+      showSourceInfo = true,
+      posOffset = 0,
     },
     ref,
   ) {
@@ -188,8 +186,13 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
     const [showOnlyUnaligned, setShowOnlyUnaligned] = useState(false);
     const [hideUhbStrip, setHideUhbStrip] = useState<boolean>(() => readFlag(LS_HIDE_UHB));
     const [colorize, setColorize] = useState<boolean>(() => readFlag(LS_COLORIZE));
-    const [hoverLink, setHoverLink] = useState<boolean>(() => readFlag(LS_HOVERLINK));
-    const [hover, setHover] = useState<HoverHighlight>(null);
+    // hover + hoverLink are controlled when the side-by-side parent passes them
+    // in; otherwise they're local (standalone single-panel behavior unchanged).
+    const [localHoverLink, setLocalHoverLink] = useState<boolean>(() => readFlag(LS_HOVERLINK));
+    const hoverLink = hoverLinkProp !== undefined ? hoverLinkProp : localHoverLink;
+    const [localHover, setLocalHover] = useState<HoverHighlight>(null);
+    const hover = hoverProp !== undefined ? hoverProp : localHover;
+    const setHover: (h: HoverHighlight) => void = onHoverChange ?? setLocalHover;
     // Session-scoped ghost rejections (keyed by dismissedGhostKey). Suppresses a
     // suggestion the user dismissed via the chip's × so it can't immediately
     // regenerate on the next render — the "predicted alignment" circle fix.
@@ -215,7 +218,11 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
       });
     };
     const toggleHoverLink = () => {
-      setHoverLink((cur) => {
+      if (onToggleHoverLink) {
+        onToggleHoverLink();
+        return;
+      }
+      setLocalHoverLink((cur) => {
         const next = !cur;
         writeFlag(LS_HOVERLINK, next);
         if (!next) setHover(null);
@@ -362,24 +369,35 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
       }
       return map;
     }, [state]);
-    // Map Hebrew tokens to alignment groups using STRONG + occurrence as
-    // the key. Strong number is invariant across the \zaln-s milestone's
-    // x-content and the UHB verse's \w text — content text can differ on
-    // NFC ordering, cantillation marks, or maqaf attachment, which were
-    // silently breaking the strip's lookup. Occurrence comes through the
-    // same alignment pipeline on both sides so it lines up.
-    const sourceKeyToGroupId = useMemo(() => {
-      const map = new Map<string, string>();
-      if (!state) return map;
+    // Map Hebrew tokens to alignment groups by source-token POSITION.
+    // `strong|occurrence` is NOT unique: occurrence numbers the exact surface
+    // text (cantillation included), so same-Strong words with different
+    // pointing all carry occurrence 1 (three אֶל forms in ZEC 1:3 are each
+    // H0413|1 — 236 such collisions across ZEC) and the strong-keyed map lit
+    // the wrong word. Each group source word resolves to a position via the
+    // same text→strong fallback chain displayGroups sorts by; the strip's
+    // tokens carry their walk position natively. Positions in `hover` are
+    // union-relative (see highlightTypes.ts); these maps are own-relative and
+    // translate via posOffset at the comparison sites.
+    const sourceIndexMap = useMemo(() => buildSourceIndexMap(sourceVerse), [sourceVerse]);
+    const posMaps = useMemo(() => {
+      const posToGroupId = new Map<number, string>();
+      const sourcePosById = new Map<string, number>();
+      const groupPositions = new Map<string, number[]>();
+      if (!state) return { posToGroupId, sourcePosById, groupPositions };
       for (const g of state.groups) {
+        const positions: number[] = [];
         for (const s of g.source) {
-          if (!s.strong) continue;
-          const key = `${s.strong}|${s.occurrence}`;
-          if (!map.has(key)) map.set(key, g.id);
+          const pos = resolveSourcePos(s, sourceIndexMap);
+          sourcePosById.set(s.id, pos);
+          if (pos < 0) continue;
+          positions.push(pos);
+          if (!posToGroupId.has(pos)) posToGroupId.set(pos, g.id);
         }
+        groupPositions.set(g.id, positions);
       }
-      return map;
-    }, [state]);
+      return { posToGroupId, sourcePosById, groupPositions };
+    }, [state, sourceIndexMap]);
 
     // Highlight resolution. `hover` may name an English or Hebrew word; we
     // mark same-language matches as "exact" and aligned cross-language
@@ -388,29 +406,32 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
     const onEnglishHover = useCallback(
       (wordId: string, text: string, occurrence: string, groupIdOverride?: string) => {
         if (!hoverLink) return;
-        setHover({
-          kind: "english",
-          key: `${text}|${occurrence}`,
-          groupId: groupIdOverride ?? targetIdToGroupId.get(wordId) ?? null,
-        });
+        const groupId = groupIdOverride ?? targetIdToGroupId.get(wordId) ?? null;
+        // Union positions of the group's Hebrew — lets the shared strip and
+        // the opposite panel light their counterparts without sharing group
+        // ids (ids are regenerated per panel parse).
+        const positions = (groupId ? posMaps.groupPositions.get(groupId) ?? [] : []).map(
+          (p) => p + posOffset,
+        );
+        setHover({ kind: "english", key: `${text}|${occurrence}`, groupId, positions });
       },
-      [hoverLink, targetIdToGroupId],
+      [hoverLink, targetIdToGroupId, posMaps, posOffset, setHover],
     );
     const onHebrewHover = useCallback(
-      (strong: string, occurrence: string, groupIdOverride?: string) => {
+      (pos: number, groupIdOverride?: string) => {
         if (!hoverLink) return;
-        const key = `${strong}|${occurrence}`;
+        if (pos < 0 && !groupIdOverride) return;
         setHover({
           kind: "hebrew",
-          key,
-          groupId: groupIdOverride ?? sourceKeyToGroupId.get(key) ?? null,
+          pos,
+          groupId: groupIdOverride ?? posMaps.posToGroupId.get(pos - posOffset) ?? null,
         });
       },
-      [hoverLink, sourceKeyToGroupId],
+      [hoverLink, posMaps, posOffset, setHover],
     );
     const onHoverLeave = useCallback(() => {
       setHover(null);
-    }, []);
+    }, [setHover]);
 
     const englishHighlight = useCallback(
       (wordId: string, text: string, occurrence: string, groupIdOverride?: string): "exact" | "linked" | null => {
@@ -418,27 +439,49 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
         const myKey = `${text}|${occurrence}`;
         if (hover.kind === "english" && hover.key === myKey) return "exact";
         const myGroupId = groupIdOverride ?? targetIdToGroupId.get(wordId) ?? null;
-        if (myGroupId && hover.groupId === myGroupId && hover.kind === "hebrew") return "linked";
-        return null;
+        if (!myGroupId) return null;
+        if (hover.kind === "hebrew") {
+          // Resolve the hovered Hebrew position to THIS panel's own group.
+          // The carried hover.groupId belongs to whichever panel the cursor
+          // is in, so cross-panel linking resolves locally — each side lights
+          // its own English (ULT "And I answered" ↔ UST "I asked").
+          if (posMaps.posToGroupId.get(hover.pos - posOffset) === myGroupId) return "linked";
+          return null;
+        }
+        // English hovered (possibly in the other panel): its group's union
+        // Hebrew positions resolve here to the group that shares the Hebrew.
+        return hover.positions.some((p) => posMaps.posToGroupId.get(p - posOffset) === myGroupId)
+          ? "linked"
+          : null;
       },
-      [hoverLink, hover, targetIdToGroupId],
+      [hoverLink, hover, targetIdToGroupId, posMaps, posOffset],
     );
     const hebrewHighlight = useCallback(
-      (strong: string, occurrence: string, groupIdOverride?: string): "exact" | "linked" | null => {
+      (pos: number, groupIdOverride?: string): "exact" | "linked" | null => {
         if (!hoverLink || !hover) return null;
-        const myKey = `${strong}|${occurrence}`;
-        if (hover.kind === "hebrew" && hover.key === myKey) return "exact";
-        const myGroupId = groupIdOverride ?? sourceKeyToGroupId.get(myKey) ?? null;
-        if (myGroupId && hover.groupId === myGroupId && hover.kind === "english") return "linked";
-        return null;
+        if (pos >= 0 && hover.kind === "hebrew" && hover.pos === pos) return "exact";
+        const myGroupId =
+          groupIdOverride ?? (pos >= 0 ? posMaps.posToGroupId.get(pos - posOffset) ?? null : null);
+        if (!myGroupId) return null;
+        if (hover.kind === "hebrew") {
+          // Whole-group: the rest of the hovered word's group lights, resolved
+          // to THIS panel's grouping — a compound card shows its siblings even
+          // when the other side keeps them separate.
+          return posMaps.posToGroupId.get(hover.pos - posOffset) === myGroupId ? "linked" : null;
+        }
+        // English hover: its group's union positions name the Hebrew directly
+        // (works on the shared strip and across panels); the groupId equality
+        // covers this panel's own card words that failed position resolution.
+        return hover.positions.includes(pos) || hover.groupId === myGroupId ? "linked" : null;
       },
-      [hoverLink, hover, sourceKeyToGroupId],
+      [hoverLink, hover, posMaps, posOffset],
     );
 
     const hctx: HighlightCtx = useMemo(
       () => ({
         colorize,
         hoverLink,
+        showSourceInfo,
         matchHues,
         themeMode,
         onEnglishEnter: onEnglishHover,
@@ -450,6 +493,7 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
       [
         colorize,
         hoverLink,
+        showSourceInfo,
         matchHues,
         themeMode,
         onEnglishHover,
@@ -460,21 +504,12 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
       ],
     );
 
-    const sourceIndexMap = useMemo(() => buildSourceIndexMap(sourceVerse), [sourceVerse]);
     const displayGroups = useMemo(() => {
       if (!state) return [];
       const sortKey = (g: (typeof state.groups)[number]) => {
         if (g.source.length === 0) return Number.MAX_SAFE_INTEGER;
-        const s = g.source[0];
-        const c = nfc(s.content ?? "");
-        const byText =
-          sourceIndexMap.get(`t:${c}|${s.occurrence}`) ?? sourceIndexMap.get(`t:${c}|1`);
-        if (byText !== undefined) return byText;
-        return (
-          sourceIndexMap.get(`s:${s.strong}|${s.occurrence}`) ??
-          sourceIndexMap.get(`s:${s.strong}|1`) ??
-          Number.MAX_SAFE_INTEGER
-        );
+        const pos = resolveSourcePos(g.source[0], sourceIndexMap);
+        return pos >= 0 ? pos : Number.MAX_SAFE_INTEGER;
       };
       const sorted = [...state.groups].sort((a, b) => sortKey(a) - sortKey(b));
       const stripped = stripCompoundOverlaps(sorted);
@@ -614,16 +649,18 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
         )}
         {state && (
           <>
-            <UhbStrip
-              sourceVerse={sourceVerse}
-              sourceLabel={sourceLabel}
-              lexiconMap={lexiconMap}
-              twlForVerse={twlForVerse}
-              verseNum={verseNum}
-              hidden={hideUhbStrip}
-              onToggleHidden={toggleHideUhbStrip}
-              hctx={hctx}
-            />
+            {renderUhbStrip && (
+              <UhbStrip
+                sourceVerse={sourceVerse}
+                sourceLabel={sourceLabel}
+                lexiconMap={lexiconMap}
+                twlForVerse={twlForVerse}
+                verseNum={verseNum}
+                hidden={hideUhbStrip}
+                onToggleHidden={toggleHideUhbStrip}
+                hctx={hctx}
+              />
+            )}
             <InventoryStrip
               state={state}
               bibleVersion={bibleVersion}
@@ -666,6 +703,8 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
                 onGroupDragStart={setDraggingGroupId}
                 onGroupDragEnd={() => setDraggingGroupId(null)}
                 hctx={hctx}
+                sourcePos={posMaps.sourcePosById}
+                posOffset={posOffset}
               />
             </Box>
             <ActionBar
@@ -680,6 +719,7 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
               }}
               onSave={handleSave}
               bibleVersion={bibleVersion}
+              onOpenDual={onOpenDual}
             />
             <Snackbar
               open={mergeUndo !== null}
@@ -704,92 +744,6 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
     );
   },
 );
-
-// ─── UHB source strip ────────────────────────────────────────────────
-function UhbStrip({
-  sourceVerse,
-  sourceLabel,
-  lexiconMap,
-  twlForVerse,
-  verseNum,
-  hidden,
-  onToggleHidden,
-  hctx,
-}: {
-  sourceVerse: VerseDto | null;
-  sourceLabel: string;
-  lexiconMap: Map<string, LexiconEntry | null>;
-  twlForVerse: TwlRow[];
-  verseNum: number;
-  hidden: boolean;
-  onToggleHidden: () => void;
-  hctx: HighlightCtx;
-}) {
-  const sourceIsHebrew = sourceLabel === "UHB";
-  return (
-    <Box
-      sx={{
-        px: 2,
-        pt: 1,
-        pb: hidden ? 1 : 1.5,
-        borderBottom: "1px solid",
-        borderColor: "divider",
-        bgcolor: "background.paper",
-        flexShrink: 0,
-      }}
-    >
-      <Stack direction="row" alignItems="center" spacing={1} sx={{ mb: hidden ? 0 : 0.5 }}>
-        <Typography
-          variant="caption"
-          sx={{
-            fontFamily: "monospace",
-            fontSize: 10,
-            letterSpacing: "0.16em",
-            textTransform: "uppercase",
-            color: "text.secondary",
-            fontWeight: 600,
-          }}
-        >
-          {sourceLabel} · source
-        </Typography>
-        <Box sx={{ flex: 1 }} />
-        <Tooltip title={hidden ? `show ${sourceLabel} source` : `hide ${sourceLabel} source`}>
-          <IconButton size="small" onClick={onToggleHidden} sx={{ p: 0.25, color: "text.disabled" }}>
-            {hidden ? (
-              <ExpandMoreIcon sx={{ fontSize: 18 }} />
-            ) : (
-              <ExpandLessIcon sx={{ fontSize: 18 }} />
-            )}
-          </IconButton>
-        </Tooltip>
-      </Stack>
-      {!hidden && (
-        <Box
-          component="div"
-          dir={sourceIsHebrew ? "rtl" : "ltr"}
-          sx={{
-            fontFamily: sourceIsHebrew
-              ? '"Frank Ruhl Libre", "Times New Roman", "SBL Hebrew", "Cardo", serif'
-              : '"Times New Roman", "Cardo", serif',
-            fontSize: 21,
-            lineHeight: 1.55,
-            color: "text.primary",
-            unicodeBidi: "isolate",
-          }}
-        >
-          <SourceVerseTokens
-            verseObjects={(sourceVerse?.content as { verseObjects?: unknown[] } | null)?.verseObjects}
-            lexiconMap={lexiconMap}
-            twlForVerse={twlForVerse}
-            verseNum={verseNum}
-            fallbackText={sourceVerse?.plain_text ?? ""}
-            hctx={hctx}
-          />
-        </Box>
-      )}
-    </Box>
-  );
-}
 
 // ─── Inventory chip strip (aligned strikethrough + unaligned interactive) ──
 function InventoryStrip({
@@ -973,7 +927,7 @@ function InventoryStrip({
         {visible.map(({ idx, word, aligned }) =>
           aligned ? (
             <AlignedChip
-              key={`${word.id}-${idx}`}
+              key={`${word.text}|${word.occurrence}|${idx}`}
               wordId={word.id}
               text={word.text}
               occurrence={word.occurrence}
@@ -982,7 +936,7 @@ function InventoryStrip({
             />
           ) : (
             <SelectableChip
-              key={`${word.id}-${idx}`}
+              key={`${word.text}|${word.occurrence}|${idx}`}
               wordId={word.id}
               text={word.text}
               occurrence={word.occurrence}
@@ -1070,6 +1024,7 @@ function ActionBar({
   onCancel,
   onSave,
   bibleVersion,
+  onOpenDual,
 }: {
   dirty: boolean;
   ghostCount: number;
@@ -1079,6 +1034,7 @@ function ActionBar({
   onCancel: () => void;
   onSave: () => void;
   bibleVersion: string;
+  onOpenDual?: () => void;
 }) {
   return (
     <Stack
@@ -1101,6 +1057,22 @@ function ActionBar({
         editing {bibleVersion}
       </Typography>
       <Box sx={{ flex: 1 }} />
+      {onOpenDual && (
+        <Tooltip title="open ULT + UST side by side (aligned to the same Hebrew)">
+          <Button
+            size="small"
+            onClick={onOpenDual}
+            sx={{
+              textTransform: "none",
+              fontSize: 11,
+              mr: 0.5,
+              color: "text.secondary",
+            }}
+          >
+            ⇄ Side-by-side
+          </Button>
+        </Tooltip>
+      )}
       {ghostCount > 0 && (
         <Button
           size="small"
@@ -1195,6 +1167,8 @@ function AlignmentCards({
   onGroupDragStart,
   onGroupDragEnd,
   hctx,
+  sourcePos,
+  posOffset,
 }: {
   groups: AlignmentGroup[];
   ghostByGroup: Map<string, Ghost>;
@@ -1212,6 +1186,10 @@ function AlignmentCards({
   onGroupDragStart: (groupId: string) => void;
   onGroupDragEnd: () => void;
   hctx: HighlightCtx;
+  // Source word id → own-relative token position (-1 unresolved), and the
+  // union offset — for card keys and the position-keyed hover identity.
+  sourcePos: Map<string, number>;
+  posOffset: number;
 }) {
   return (
     <Box
@@ -1229,9 +1207,24 @@ function AlignmentCards({
     >
       {groups.map((g) => {
         const ghost = ghostByGroup.get(g.id);
+        // Stable, content-derived key (group ids are regenerated every parse via
+        // crypto.randomUUID, which would remount the whole grid on every
+        // re-derive — e.g. a reading-text edit — causing a jarring flash).
+        // Keyed by the first Hebrew word's source POSITION — unique per card by
+        // construction and stable across re-derives. NOT strong|occurrence:
+        // same-Strong words with different pointing share that pair (three אֶל
+        // forms in ZEC 1:3 are all H0413|1), which made duplicate React keys.
+        // Unresolved positions (-1, malformed data) fall back to a content key.
+        const s0 = g.source[0];
+        const s0pos = s0 ? sourcePos.get(s0.id) ?? -1 : -1;
+        const cardKey = s0
+          ? s0pos >= 0
+            ? `src:p${s0pos}`
+            : `src:${s0.strong}|${nfc(s0.content ?? "")}|${s0.occurrence}`
+          : g.id;
         return (
         <DropTargetCard
-          key={g.id}
+          key={cardKey}
           groupId={g.id}
           onTargetsDrop={(wordIds) => onTargetsDrop(`g:${g.id}`, wordIds)}
           onSourceDrop={(sourceId) => onSourceDrop(g.id, sourceId)}
@@ -1253,18 +1246,22 @@ function AlignmentCards({
               mb: 0.5,
             }}
           >
-            {g.source.map((s) => (
-              <SourceWordTypography
-                key={s.id}
-                source={s}
-                groupId={g.id}
-                lex={lexiconMap.get(s.strong) ?? null}
-                twHint={twHintFor(twlForVerse, verseNum, s.content ?? "")}
-                canExtract={g.source.length > 1}
-                onExtract={() => onExtractSource(s.id)}
-                hctx={hctx}
-              />
-            ))}
+            {g.source.map((s) => {
+              const own = sourcePos.get(s.id) ?? -1;
+              return (
+                <SourceWordTypography
+                  key={s.id}
+                  source={s}
+                  pos={own >= 0 ? own + posOffset : -1}
+                  groupId={g.id}
+                  lex={lexiconMap.get(s.strong) ?? null}
+                  twHint={twHintFor(twlForVerse, verseNum, s.content ?? "")}
+                  canExtract={g.source.length > 1}
+                  onExtract={() => onExtractSource(s.id)}
+                  hctx={hctx}
+                />
+              );
+            })}
           </Box>
           {(g.targets.length > 0 || g.source.length > 1) && (
             <Tooltip title="clear this group (send English back to the word bank, split compound source)">
@@ -1314,9 +1311,9 @@ function AlignmentCards({
                 </Box>
               )
             ) : (
-              g.targets.map((t) => (
+              g.targets.map((t, ti) => (
                 <SimpleDraggableChip
-                  key={t.id}
+                  key={`${t.text}|${t.occurrence}|${ti}`}
                   wordId={t.id}
                   text={t.text}
                   occurrence={t.occurrence}
@@ -1470,6 +1467,7 @@ function DropTargetCard({
 // ─── Hebrew source word as typography (no inverted block) ──────────────
 function SourceWordTypography({
   source,
+  pos,
   groupId,
   lex,
   twHint,
@@ -1478,6 +1476,9 @@ function SourceWordTypography({
   hctx,
 }: {
   source: SourceWord;
+  // Union-relative source position (-1 when unresolved — hover identity then
+  // falls back to the group id alone).
+  pos: number;
   groupId: string;
   lex: LexiconEntry | null;
   twHint: string | null;
@@ -1486,19 +1487,27 @@ function SourceWordTypography({
   hctx: HighlightCtx;
 }) {
   const [hover, setHover] = useState(false);
-  const tone = hctx.hebrewHighlight(source.strong, source.occurrence, groupId);
+  const tone = hctx.hebrewHighlight(pos, groupId);
+  const showInfo = hctx.showSourceInfo;
   return (
     <Tooltip
       title={
-        <Box>
-          <SourceTooltipBody source={source} lex={lex} twHint={twHint} />
-          {canExtract && (
-            <Box sx={{ mt: 0.5, fontSize: 11, opacity: 0.85 }}>
-              double-click to split out of compound
-            </Box>
-          )}
-        </Box>
+        showInfo ? (
+          <Box>
+            <SourceTooltipBody source={source} lex={lex} twHint={twHint} />
+            {canExtract && (
+              <Box sx={{ mt: 0.5, fontSize: 11, opacity: 0.85 }}>
+                double-click to split out of compound
+              </Box>
+            )}
+          </Box>
+        ) : (
+          ""
+        )
       }
+      disableHoverListener={!showInfo}
+      disableFocusListener={!showInfo}
+      disableTouchListener={!showInfo}
       slotProps={{ popper: { sx: { pointerEvents: "none" } } }}
     >
       <Box
@@ -1506,7 +1515,7 @@ function SourceWordTypography({
         draggable
         onMouseEnter={() => {
           setHover(true);
-          hctx.onHebrewEnter(source.strong, source.occurrence, groupId);
+          hctx.onHebrewEnter(pos, groupId);
         }}
         onMouseLeave={() => {
           setHover(false);
@@ -1560,106 +1569,6 @@ function SourceWordTypography({
             {source.occurrence}
           </Box>
         )}
-      </Box>
-    </Tooltip>
-  );
-}
-
-// ─── Source verse renderer for the UHB strip ───────────────────────────
-function SourceVerseTokens({
-  verseObjects,
-  lexiconMap,
-  twlForVerse,
-  verseNum,
-  fallbackText,
-  hctx,
-}: {
-  verseObjects: unknown[] | undefined;
-  lexiconMap: Map<string, LexiconEntry | null>;
-  twlForVerse: TwlRow[];
-  verseNum: number;
-  fallbackText: string;
-  hctx: HighlightCtx;
-}) {
-  if (!Array.isArray(verseObjects)) return <>{fallbackText}</>;
-  const out: React.ReactNode[] = [];
-  const walk = (nodes: unknown[]) => {
-    for (const n of nodes ?? []) {
-      const o = n as Record<string, unknown> | null;
-      if (!o) continue;
-      if (o["type"] === "text") {
-        out.push(<span key={`t${out.length}`}>{String(o["text"] ?? "")}</span>);
-      } else if (o["type"] === "word" && o["tag"] === "w") {
-        const text = String(o["text"] ?? "");
-        const strong = String(o["strong"] ?? "");
-        const occurrence = String(o["occurrence"] ?? "1");
-        const src: SourceWord = {
-          id: "",
-          strong,
-          lemma: String(o["lemma"] ?? ""),
-          morph: String(o["morph"] ?? ""),
-          occurrence,
-          occurrences: String(o["occurrences"] ?? "1"),
-          content: text,
-        };
-        out.push(
-          <SourceVerseToken
-            key={`w${out.length}`}
-            text={text}
-            strong={strong}
-            occurrence={occurrence}
-            source={src}
-            lex={lexiconMap.get(strong) ?? null}
-            twHint={twHintFor(twlForVerse, verseNum, text)}
-            hctx={hctx}
-          />,
-        );
-      } else if (o["type"] === "milestone") {
-        walk((o["children"] as unknown[] | undefined) ?? []);
-      }
-    }
-  };
-  walk(verseObjects);
-  return <>{out}</>;
-}
-
-function SourceVerseToken({
-  text,
-  strong,
-  occurrence,
-  source,
-  lex,
-  twHint,
-  hctx,
-}: {
-  text: string;
-  strong: string;
-  occurrence: string;
-  source: SourceWord;
-  lex: LexiconEntry | null;
-  twHint: string | null;
-  hctx: HighlightCtx;
-}) {
-  const tone = hctx.hebrewHighlight(strong, occurrence);
-  return (
-    <Tooltip
-      title={<SourceTooltipBody source={source} lex={lex} twHint={twHint} />}
-      slotProps={{ popper: { sx: { pointerEvents: "none" } } }}
-    >
-      <Box
-        component="span"
-        onMouseEnter={() => hctx.onHebrewEnter(strong, occurrence)}
-        onMouseLeave={hctx.onLeave}
-        sx={{
-          cursor: "help",
-          display: "inline",
-          borderRadius: 0.5,
-          px: tone ? 0.25 : 0,
-          boxShadow: hoverShadow(tone, hctx.themeMode),
-          transition: "box-shadow 0.12s",
-        }}
-      >
-        {text}
       </Box>
     </Tooltip>
   );
@@ -1949,18 +1858,6 @@ function GhostChip({
   );
 }
 
-// Soft outer-ring "glow" applied to chips / Hebrew tokens when the current
-// hover targets them or their alignment-group partner. Two tones so the
-// exact-match and the cross-language linked partner are distinguishable.
-// Dark mode lifts the ring alpha noticeably so saturated colors still
-// register against the dark canvas; light mode gets a small bump.
-function hoverShadow(tone: HighlightTone, mode: "light" | "dark"): string | undefined {
-  const alpha = mode === "dark" ? 1 : 0.6;
-  if (tone === "exact") return `0 0 0 2px rgba(49,173,227,${alpha})`;
-  if (tone === "linked") return `0 0 0 2px rgba(229,157,51,${alpha})`;
-  return undefined;
-}
-
 // ─── Helpers (carried over verbatim from AlignmentDialog) ──────────────
 function sourceShowsOccurrence(s: SourceWord): boolean {
   const n = parseInt(s.occurrences, 10);
@@ -2048,23 +1945,20 @@ function readWordIds(dt: DataTransfer): string[] {
   return single ? [single] : [];
 }
 
-function twHintFor(twlRows: TwlRow[], verseNum: number, content: string): string | null {
-  if (!content) return null;
-  const needle = nfc(content);
-  for (const r of twlRows) {
-    if (r.verse !== verseNum) continue;
-    const ow = r.orig_words ?? "";
-    if (!ow) continue;
-    const chunks = ow.split(/\s+/).filter(Boolean).map(nfc);
-    if (chunks.includes(needle)) return twShort(r.tw_link);
-  }
-  return null;
-}
-
-function twShort(link: string | null): string | null {
-  if (!link) return null;
-  const m = link.match(/\/bible\/([^/]+\/[^/]+)$/);
-  return m ? m[1] : link;
+// Resolve a group source word to its token position in the panel's source
+// verse: NFC content + occurrence first (exact), then content first-instance,
+// then strong + occurrence, then strong first-instance. The fallback chain
+// absorbs malformed occurrence data and cantillation drift between milestone
+// x-content and the UHB \w text. -1 when nothing matches.
+function resolveSourcePos(s: SourceWord, indexMap: Map<string, number>): number {
+  const c = nfc(s.content ?? "");
+  return (
+    indexMap.get(`t:${c}|${s.occurrence}`) ??
+    indexMap.get(`t:${c}|1`) ??
+    indexMap.get(`s:${s.strong}|${s.occurrence}`) ??
+    indexMap.get(`s:${s.strong}|1`) ??
+    -1
+  );
 }
 
 function buildSourceIndexMap(sourceVerse: VerseDto | null): Map<string, number> {
