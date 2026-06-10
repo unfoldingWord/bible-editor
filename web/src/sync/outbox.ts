@@ -493,6 +493,17 @@ async function dispatch(op: OutboxOp): Promise<Result> {
       ) {
         return { kind: "retry", reason: `transient ${e.status}` };
       }
+      // A csrf_mismatch 403 is recoverable: the be_csrf cookie expired but the
+      // session is still valid. api.ts already refreshes-and-retries inline; if
+      // one still reaches here (refresh raced/failed), keep the op pending and
+      // retry rather than failing it permanently. read_only 403s carry no
+      // `error` body and fall through to fatal, as they must (they'd loop).
+      if (
+        e.status === 403 &&
+        (e.body as { error?: string } | undefined)?.error === "csrf_mismatch"
+      ) {
+        return { kind: "retry", reason: "csrf_mismatch" };
+      }
       // 403, 404, 422, 428 etc. are non-retryable client errors — sending
       // the same payload again won't change the outcome.
       return { kind: "fatal", reason: `http ${e.status}` };
