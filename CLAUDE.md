@@ -2,7 +2,7 @@
 
 > Deployed to `https://bible-editor-api.unfoldingword.workers.dev` (Cloudflare Workers, unfoldingWord account). The default env in `api/wrangler.toml` carries dev-friendly values for `wrangler dev`; prod overrides live under `[env.production.*]` and ship via `wrangler deploy --env production`. Any `--remote` D1 / `wrangler secret` / `wrangler tail` command needs `--env production` to target the deployed worker.
 
-> **Pending: dev D1 database.** The default `[[d1_databases]]` env block currently points at the production database ID (`7e566abf-454d-43d6-b24e-11df74f1c0ed`). `wrangler dev` (local) is safe — it uses a local SQLite file and never touches the remote DB. But `wrangler d1 ... --remote` without `--env production` would hit prod. **To fix:** add `CLOUDFLARE_API_TOKEN` (D1:Edit permission) to the session env, then run `wrangler d1 create bible_editor_dev` from `api/`, paste the returned `database_id` into the default `[[d1_databases]]` block in `api/wrangler.toml`, and run `wrangler d1 migrations apply bible_editor_dev --remote`. See branch `claude/database-setup-006sls`.
+> **Dev D1 database separated.** Created `bible_editor_dev` (ID: `ceb458bf-4608-4696-a087-9026618a6cef`) as the default remote target for `wrangler d1 ... --remote`. Production ID (`7e566abf-454d-43d6-b24e-11df74f1c0ed`) is isolated to `[env.production.*]` so `wrangler deploy --env production` targets prod only. `wrangler dev` (local) remains unchanged — it uses a local SQLite file and never touches remote.
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
