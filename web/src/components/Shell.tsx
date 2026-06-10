@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
   Box,
   Typography,
@@ -26,7 +26,7 @@ import { drafts, verseKey } from "../sync/drafts";
 import { smartEditVerse } from "../lib/replace";
 import { extractEditableText, extractPlainText, SECTION_HEADER_TAGS } from "../lib/usfm";
 import { verseHasUnalignedWork } from "../lib/alignment";
-import { concatSourceRange, formatVerseLabel } from "../lib/verseRange";
+import { buildVerseIndex, concatSourceRange, formatVerseLabel } from "../lib/verseRange";
 import { buildTnQuickRequest } from "../lib/tnQuickRequest";
 import { findSourceForTargetText, type HighlightKey } from "../lib/highlight";
 import { buildQuoteFromSelection } from "../lib/quoteBuilder";
@@ -39,7 +39,6 @@ import { TopBar } from "./TopBar";
 import { LogosSyncToggle } from "./LogosSyncToggle";
 import { PipelineMenu } from "./PipelineMenu";
 import { PipelineStatusBar } from "./PipelineStatusBar";
-import { SyncStatusBar } from "./SyncStatusBar";
 import { pipelineStore, type PipelineJob } from "../sync/pipelineStore";
 import { onOutboxResult } from "../sync/outbox";
 import { AiCompletionToasts } from "./AiCompletionToasts";
@@ -394,6 +393,20 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     [versesForTiles],
   );
 
+  // Range-aware lookup: ChapterPayload.verses is keyed by verse_start, so a
+  // row anchored mid-bridge (e.g. verse 9 of a `\v 8-9` row) misses a direct
+  // verses[bv][row.verse] read. Built once per verses change and shared by
+  // the quote-builder / note-anchoring lookups below.
+  const verseIndexByVersion = useMemo(() => {
+    const out: Record<string, Record<number, VerseDto>> = {};
+    if (versesForTiles) {
+      for (const bv of Object.keys(versesForTiles)) {
+        out[bv] = buildVerseIndex(versesForTiles[bv]);
+      }
+    }
+    return out;
+  }, [versesForTiles]);
+
   // The widest range row across all versions that covers activeVerse. Used to
   // scope TN/TQ/TWL filtering in ResourceColumn — if UST 6-9 covers the active
   // verse, the user sees notes for verses 6-9, not just the navigated one.
@@ -583,7 +596,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     const row = data.tn.find((r) => r.id === quoteBuildNoteId);
     if (!row) return null;
     const grab = (bv: string): unknown[] | null => {
-      const dto = data.verses[bv]?.[row.verse];
+      const dto = verseIndexByVersion[bv]?.[row.verse];
       const vo = (dto?.content as { verseObjects?: unknown[] } | null)?.verseObjects;
       return Array.isArray(vo) ? vo : null;
     };
@@ -594,7 +607,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       ult: grab("ULT"),
       ust: grab("UST"),
     };
-  }, [quoteBuildNoteId, data]);
+  }, [quoteBuildNoteId, data, verseIndexByVersion]);
 
   // Materialize the in-flight quote-build selection into a row patch and
   // fire the existing note save pipe. Pulls UHB verseObjects for the
@@ -604,7 +617,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     if (!quoteBuildNoteId || !data) return;
     const row = data.tn.find((r) => r.id === quoteBuildNoteId);
     if (!row) return;
-    const uhb = data.verses["UHB"]?.[row.verse] ?? data.verses["UGNT"]?.[row.verse];
+    const uhb = verseIndexByVersion["UHB"]?.[row.verse] ?? verseIndexByVersion["UGNT"]?.[row.verse];
     const verseObjects =
       (uhb?.content as { verseObjects?: unknown[] } | null)?.verseObjects;
     if (!Array.isArray(verseObjects)) return;
@@ -631,21 +644,33 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     setQuoteBuildAppliedTo((prev) => ({ noteId: row.id, nonce: (prev?.nonce ?? 0) + 1 }));
     setQuoteBuildNoteId(null);
     setQuoteBuildSelectedKeys(new Set());
-  }, [quoteBuildNoteId, quoteBuildSelectedKeys, data]);
+  }, [quoteBuildNoteId, quoteBuildSelectedKeys, data, verseIndexByVersion]);
 
   // Routes any verse / version / aligner-target change through the dirty
   // gate when the alignment panel has unsaved drags. Plain wrapper around
   // setState if the gate is clear; otherwise queues for the popup.
-  const runWithDirtyGate = useCallback(
-    (apply: () => void) => {
-      if (panelMode === "alignment" && alignmentDirty) {
-        setPendingNav({ run: apply });
-      } else {
-        apply();
-      }
-    },
-    [panelMode, alignmentDirty],
-  );
+  //
+  // The gate reads panelMode / alignmentDirty through refs, NOT the state
+  // values, so its identity is stable. Memoized children (ScriptureColumn,
+  // InactiveVerseRow) deliberately skip comparing callback props, so a
+  // callback that closed over the state would go stale inside them and let
+  // navigation bypass the gate — silently dropping unsaved alignment drags.
+  // Layout effect (not passive) so the refs are current before any
+  // subsequent click can read them. Browser back/forward remounts the Shell
+  // entirely, so that navigation path stays ungated here.
+  const panelModeRef = useRef(panelMode);
+  const alignmentDirtyRef = useRef(alignmentDirty);
+  useLayoutEffect(() => {
+    panelModeRef.current = panelMode;
+    alignmentDirtyRef.current = alignmentDirty;
+  }, [panelMode, alignmentDirty]);
+  const runWithDirtyGate = useCallback((apply: () => void) => {
+    if (panelModeRef.current === "alignment" && alignmentDirtyRef.current) {
+      setPendingNav({ run: apply });
+    } else {
+      apply();
+    }
+  }, []);
 
   const requestSelectVerse = useCallback(
     (v: number) => {
@@ -773,15 +798,25 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       }`
     : undefined;
 
-  // Initial load (or retry from scratch) — no data to show yet. We still
-  // render the SyncStatusBar so an offline user sees their connection state
-  // and any queued edits even when the chapter itself can't load.
+  // Initial load (or retry from scratch) — no data to show yet. Render the
+  // TopBar anyway (it fetches its own book list, and includes SyncStatusBar)
+  // so a bad deep link / 404 chapter still leaves the user a way to navigate
+  // out and an offline user sees their connection state. Navigation here is
+  // deliberately ungated — the alignment panel and the dirty-confirm dialog
+  // only mount in the data branch, so runWithDirtyGate would soft-lock.
   if (!data) {
     return (
       <Box sx={{ display: "flex", flexDirection: "column", height: "100vh" }}>
-        <Box sx={{ display: "flex", justifyContent: "flex-end", p: 1 }}>
-          <SyncStatusBar />
-        </Box>
+        <TopBar
+          book={book}
+          chapter={chapter}
+          onNavigate={(b, c, v) => {
+            setActiveVerse(v ?? 1);
+            setActiveNoteId(null);
+            setActiveWordId(null);
+            onNavigate?.(b, c, v);
+          }}
+        />
         <Box sx={{ p: 4, display: "flex", alignItems: "center", gap: 2 }}>
           {status === "error" ? (
             <Alert severity="error">failed to load {book} {chapter}: {error}</Alert>
@@ -945,10 +980,12 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         book={book}
         chapter={chapter}
         onNavigate={(b, c, v) => {
-          setActiveVerse(v ?? 1);
-          setActiveNoteId(null);
-          setActiveWordId(null);
-          onNavigate?.(b, c, v);
+          runWithDirtyGate(() => {
+            setActiveVerse(v ?? 1);
+            setActiveNoteId(null);
+            setActiveWordId(null);
+            onNavigate?.(b, c, v);
+          });
         }}
         pipelineMenu={
           <PipelineMenu
@@ -1229,7 +1266,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           onNoteVisibilityChange={handleNoteVisibilityChange}
           onNoteTranslateQuote={(row, english) => {
             const vo = (
-              data.verses.ULT?.[row.verse]?.content as
+              verseIndexByVersion["ULT"]?.[row.verse]?.content as
                 | { verseObjects?: unknown[] }
                 | null
                 | undefined
@@ -1239,7 +1276,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           }}
           onWordTranslateQuote={(row, english) => {
             const vo = (
-              data.verses.ULT?.[row.verse]?.content as
+              verseIndexByVersion["ULT"]?.[row.verse]?.content as
                 | { verseObjects?: unknown[] }
                 | null
                 | undefined
@@ -1390,10 +1427,12 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         notifications={aiDrafts.notifications}
         onDismiss={aiDrafts.dismiss}
         onView={(rowId, verse) => {
-          setActiveVerse(verse);
-          setActiveNoteId(rowId);
-          setActiveWordId(null);
-          requestScrollToActive();
+          runWithDirtyGate(() => {
+            setActiveVerse(verse);
+            setActiveNoteId(rowId);
+            setActiveWordId(null);
+            requestScrollToActive();
+          });
         }}
       />
       <UnsavedToasts
@@ -1420,11 +1459,13 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         }}
         onJumpTo={(b, ch, v) => {
           if (b !== book) return;
-          if (ch !== chapter) onNavigate?.(b, ch, v);
-          else {
-            setActiveVerse(v);
-            requestScrollToActive();
-          }
+          runWithDirtyGate(() => {
+            if (ch !== chapter) onNavigate?.(b, ch, v);
+            else {
+              setActiveVerse(v);
+              requestScrollToActive();
+            }
+          });
         }}
       />
       {quoteBuildContext && (

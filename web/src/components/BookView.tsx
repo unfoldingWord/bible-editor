@@ -9,7 +9,7 @@
 // column alignment, which is what makes find/replace and side-by-side
 // comparison readable when the scroll spans an entire book.
 
-import { Fragment, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, memo, useEffect, useMemo, useRef, useState } from "react";
 import { Box, Stack, Typography, IconButton, Tooltip, CircularProgress } from "@mui/material";
 import LinkIcon from "@mui/icons-material/Link";
 import SaveIcon from "@mui/icons-material/Save";
@@ -45,6 +45,10 @@ interface SearchState {
 }
 
 const READ_ONLY = new Set(["UHB", "UGNT"]);
+
+// Stable placeholder so `chapters.get(ch) ?? UNLOADED_STATE` doesn't hand
+// ChapterBlock a fresh object every render and defeat its memo.
+const UNLOADED_STATE: ChapterState = { kind: "unloaded" };
 
 interface Props {
   book: string;
@@ -134,7 +138,10 @@ export function BookView({
         list.push({ chapter: d.meta.chapter, verse: d.meta.verse, plain });
         next.set(d.meta.bibleVersion, list);
       }
-      setDraftsByVersion(next);
+      // drafts.subscribe fires for every draft write anywhere (row drafts
+      // from note typing included) — bail out when the derived map is
+      // content-equal so those keystrokes don't re-render the whole book.
+      setDraftsByVersion((prev) => (draftMapsEqual(prev, next) ? prev : next));
     });
   }, [book]);
 
@@ -301,7 +308,7 @@ export function BookView({
               key={ch}
               book={book}
               chapter={ch}
-              state={chapters.get(ch) ?? { kind: "unloaded" }}
+              state={chapters.get(ch) ?? UNLOADED_STATE}
               enabledVersions={enabledVersions}
               cols={cols}
               activeChapter={activeChapter}
@@ -333,7 +340,32 @@ function countLoaded(chapters: Map<number, ChapterState>): number {
   return n;
 }
 
-function ChapterBlock({
+type VersionDrafts = Map<string, Array<{ chapter: number; verse: number; plain: string }>>;
+
+function draftMapsEqual(a: VersionDrafts, b: VersionDrafts): boolean {
+  if (a.size !== b.size) return false;
+  for (const [k, av] of a) {
+    const bl = b.get(k);
+    if (!bl || bl.length !== av.length) return false;
+    for (let i = 0; i < av.length; i++) {
+      if (
+        av[i].chapter !== bl[i].chapter ||
+        av[i].verse !== bl[i].verse ||
+        av[i].plain !== bl[i].plain
+      ) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+// Memoized (with VerseRow / VerseCell below) so the per-keystroke BookView
+// re-render — every draft write rebuilds draftsByVersion — skips the chapter
+// subtrees, whose props are all referentially stable during typing. Callback
+// props are passed through raw (no per-chapter/per-verse lambdas) so the
+// default shallow compare holds.
+const ChapterBlock = memo(function ChapterBlock({
   book,
   chapter,
   state,
@@ -506,23 +538,21 @@ function ChapterBlock({
             search={search}
             findActiveMatch={findActiveMatch}
             lexiconMap={lexiconMap}
-            onSelectVerse={() => onSelectVerse(chapter, v)}
-            onEditVerse={(bv, plain, base) => onEditVerse(chapter, v, bv, plain, base)}
-            onOpenAligner={(bv) => onOpenAligner(chapter, v, bv)}
-            onEditSection={
-              onEditSection
-                ? (bv, change, base) => onEditSection(chapter, v, bv, change, base)
-                : undefined
-            }
+            onSelectVerse={onSelectVerse}
+            onEditVerse={onEditVerse}
+            onOpenAligner={onOpenAligner}
+            onEditSection={onEditSection}
             locked={locked}
           />
         );
       })}
     </Fragment>
   );
-}
+});
 
-function VerseRow({
+// Raw top-level handlers (chapter / verse / bibleVersion supplied at call
+// time from this row's own props) keep the memo's shallow compare honest.
+const VerseRow = memo(function VerseRow({
   book,
   chapter,
   verseNum,
@@ -555,11 +585,13 @@ function VerseRow({
   search: SearchState | null;
   findActiveMatch: FindMatch | null;
   lexiconMap: Map<string, LexiconEntry | null>;
-  onSelectVerse: () => void;
-  onEditVerse: (bv: string, plain: string, base: VerseDto) => void;
-  onOpenAligner: (bv: string) => void;
+  onSelectVerse: (chapter: number, verse: number) => void;
+  onEditVerse: (chapter: number, verse: number, bibleVersion: string, plain: string, base: VerseDto) => void;
+  onOpenAligner: (chapter: number, verse: number, bibleVersion: string) => void;
   onEditSection?: (
-    bv: string,
+    chapter: number,
+    verse: number,
+    bibleVersion: string,
     change: { index: number; tag: string | null; text: string },
     base: VerseDto,
   ) => void;
@@ -588,7 +620,7 @@ function VerseRow({
             key={bv}
             ref={colIdx === 0 ? rowRef : null}
             data-find-cell={`${chapter}-${verseNum}-${bv}`}
-            onClick={onSelectVerse}
+            onClick={() => onSelectVerse(chapter, verseNum)}
             sx={{
               p: 0.5,
               borderRadius: 0.5,
@@ -611,13 +643,9 @@ function VerseRow({
               search={search}
               findActiveMatch={findActiveMatch}
               lexiconMap={lexiconMap}
-              onAlign={() => onOpenAligner(bv)}
-              onEdit={(plain) => dto && onEditVerse(bv, plain, dto)}
-              onEditSection={
-                onEditSection && dto
-                  ? (change) => onEditSection(bv, change, dto)
-                  : undefined
-              }
+              onOpenAligner={onOpenAligner}
+              onEditVerse={onEditVerse}
+              onEditSection={onEditSection}
               locked={locked}
             />
           </Box>
@@ -625,9 +653,9 @@ function VerseRow({
       })}
     </Fragment>
   );
-}
+});
 
-function VerseCell({
+const VerseCell = memo(function VerseCell({
   book,
   chapter,
   verseNum,
@@ -641,8 +669,8 @@ function VerseCell({
   search,
   findActiveMatch,
   lexiconMap,
-  onAlign,
-  onEdit,
+  onOpenAligner,
+  onEditVerse,
   onEditSection,
   locked,
 }: {
@@ -662,9 +690,15 @@ function VerseCell({
   search: SearchState | null;
   findActiveMatch: FindMatch | null;
   lexiconMap: Map<string, LexiconEntry | null>;
-  onAlign: () => void;
-  onEdit: (plain: string) => void;
-  onEditSection?: (change: { index: number; tag: string | null; text: string }) => void;
+  onOpenAligner: (chapter: number, verse: number, bibleVersion: string) => void;
+  onEditVerse: (chapter: number, verse: number, bibleVersion: string, plain: string, base: VerseDto) => void;
+  onEditSection?: (
+    chapter: number,
+    verse: number,
+    bibleVersion: string,
+    change: { index: number; tag: string | null; text: string },
+    base: VerseDto,
+  ) => void;
   locked: boolean;
 }) {
   const readOnly = READ_ONLY.has(bibleVersion) || locked;
@@ -782,6 +816,13 @@ function VerseCell({
     return renderHighlightedHTML(composed, highlights ?? new Set());
   }, [findHTML, dto?.content, highlights, prevDto?.content]);
 
+  // splitSectionHeaders walks the whole verseObjects tree — memoize on the
+  // content reference so re-renders without a content change skip the walk.
+  const sections = useMemo<SectionHeader[]>(() => {
+    const verseObjects = (dto?.content as { verseObjects?: unknown[] } | null)?.verseObjects;
+    return Array.isArray(verseObjects) ? splitSectionHeaders(verseObjects).sections : [];
+  }, [dto?.content]);
+
   useEffect(() => {
     if (!elRef.current) return;
     // Never reset the DOM while a draft is in flight — the user's typing is
@@ -812,11 +853,6 @@ function VerseCell({
     );
   }
 
-  const verseObjects = (dto?.content as { verseObjects?: unknown[] } | null)?.verseObjects;
-  const sections: SectionHeader[] = Array.isArray(verseObjects)
-    ? splitSectionHeaders(verseObjects).sections
-    : [];
-
   return (
     <Box sx={{ lineHeight: 1.6 }}>
       {sections.map((s, i) => (
@@ -827,7 +863,8 @@ function VerseCell({
           editable={!readOnly && !!onEditSection}
           onChange={
             onEditSection
-              ? (next) => onEditSection({ index: i, tag: next.tag, text: next.text })
+              ? (next) =>
+                  onEditSection(chapter, verseNum, bibleVersion, { index: i, tag: next.tag, text: next.text }, dto)
               : undefined
           }
         />
@@ -850,7 +887,7 @@ function VerseCell({
           <IconButton
             onClick={(e) => {
               e.stopPropagation();
-              onAlign();
+              onOpenAligner(chapter, verseNum, bibleVersion);
             }}
             size="small"
             sx={{ color: "success.main", p: 0.25, verticalAlign: "-3px" }}
@@ -916,7 +953,7 @@ function VerseCell({
           // which then corrupts the stored draft and the verse. textContent is
           // synchronous and reliable in both browsers (matches the rows editor).
           const value = (e.currentTarget as HTMLSpanElement).textContent ?? "";
-          onEdit(value);
+          onEditVerse(chapter, verseNum, bibleVersion, value, dto);
           lastTextRef.current = value;
           lastSetRef.current = value;
         }}
@@ -933,7 +970,7 @@ function VerseCell({
       )}
     </Box>
   );
-}
+});
 
 function renderFindMatchesHTML(
   plainText: string,

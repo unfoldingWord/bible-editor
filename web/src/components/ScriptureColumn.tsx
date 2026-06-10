@@ -992,10 +992,12 @@ function ActiveLine({
   onEditSection,
   lexiconMap,
 }: {
-  // book + bibleVersion identify the verse for draft keying.
-  // bibleVersion is the bare code ("ULT") not the rendered label ("ULT 6-9").
+  // book + bibleVersion identify the verse for draft keying and find-cell
+  // targeting. bibleVersion is the bare code ("ULT") not the rendered label
+  // ("ULT 6-9") — FindMatch.bibleVersion carries the bare code, so every
+  // find compare / selector must use it; `label` is display-only.
   book?: string;
-  bibleVersion?: string;
+  bibleVersion: string;
   label: string;
   chapter: number;
   verseNum: number;
@@ -1027,7 +1029,7 @@ function ActiveLine({
   onEditSection?: (change: { index: number; tag: string | null; text: string }) => void;
   lexiconMap?: Map<string, LexiconEntry | null>;
 }) {
-  const isSource = label === "UHB" || label === "UGNT";
+  const isSource = bibleVersion === "UHB" || bibleVersion === "UGNT";
   const draftKey = useMemo(
     () =>
       book && bibleVersion ? verseKey(book, chapter, verseNum, bibleVersion) : null,
@@ -1037,9 +1039,9 @@ function ActiveLine({
     if (!findActiveMatch) return null;
     if (findActiveMatch.chapter !== chapter) return null;
     if (findActiveMatch.verse !== verseNum) return null;
-    if (findActiveMatch.bibleVersion !== label) return null;
+    if (findActiveMatch.bibleVersion !== bibleVersion) return null;
     return { start: findActiveMatch.startIndex, end: findActiveMatch.endIndex };
-  }, [findActiveMatch, chapter, verseNum, label]);
+  }, [findActiveMatch, chapter, verseNum, bibleVersion]);
   const elRef = useRef<HTMLDivElement | null>(null);
   // Tracks the last value we wrote into the contenteditable DOM. The DOM
   // reset effect (further down) skips when its target string matches this,
@@ -1322,7 +1324,7 @@ function ActiveLine({
       )}
       {rtl && lexiconMap ? (
         <Box
-          data-find-cell={`${chapter}-${verseNum}-${label}`}
+          data-find-cell={`${chapter}-${verseNum}-${bibleVersion}`}
           sx={{
             flex: 1,
             bgcolor: "grey.100",
@@ -1350,7 +1352,7 @@ function ActiveLine({
       ) : (
         <Box
           ref={elRef}
-          data-find-cell={`${chapter}-${verseNum}-${label}`}
+          data-find-cell={`${chapter}-${verseNum}-${bibleVersion}`}
           data-dirty={hasDraft ? "true" : undefined}
           contentEditable={editable && !readOnly}
           suppressContentEditableWarning
