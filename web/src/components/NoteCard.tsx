@@ -300,14 +300,43 @@ function NoteCardInner({
   // would be lost the first time they navigate away from this note.
   // Guarded by a ref so subsequent re-renders don't keep clobbering the
   // live state with a now-stale snapshot.
+  // Flips true once the on-mount draft lookup resolves (draft or not). The
+  // draft-write effect gates its *clear* branch on this so a freshly-remounted
+  // card — whose state hasn't rehydrated yet — can't wipe the very draft we're
+  // about to read.
+  const [hydrated, setHydrated] = useState(false);
   const hydratedFromDraftRef = useRef(false);
   useEffect(() => {
     if (hydratedFromDraftRef.current) return;
     void drafts.get(rowKey("tn", row.id)).then((rec) => {
       if (hydratedFromDraftRef.current) return;
-      const patch = (rec?.payload as { patch?: Partial<TnRow> } | undefined)?.patch;
       hydratedFromDraftRef.current = true;
+      const payload = rec?.payload as
+        | {
+            patch?: Partial<TnRow>;
+            baseline?: { quote: string | null; note: string | null; support_reference: string | null };
+          }
+        | undefined;
+      const patch = payload?.patch;
+      setHydrated(true);
       if (!patch) return;
+      // Restore the server baseline this draft was diffed against. Optimistic
+      // applyLocalRowPatch() edits land in the cached row at an unchanged
+      // version, so a no-refetch remount (e.g. pin toggle reshaping the column)
+      // would otherwise initialise savedRef from that polluted row and compute
+      // hasRowDiff=false — the card looks saved, the Save button disables, and
+      // the draft-write effect clears the draft, stranding the edit in volatile
+      // state. Pinning savedRef to the persisted baseline keeps the dirty chip /
+      // Save button honest.
+      const baseline = payload?.baseline;
+      if (baseline) {
+        savedRef.current = {
+          quote: baseline.quote,
+          note: baseline.note,
+          support_reference: baseline.support_reference,
+          version: rec?.expectedVersion ?? savedRef.current.version,
+        };
+      }
       if (typeof patch.quote === "string") setQuote(tsvToDisplay(patch.quote));
       if (typeof patch.note === "string") setNote(tsvToDisplay(patch.note));
       if ("support_reference" in patch) {
@@ -573,21 +602,41 @@ function NoteCardInner({
   useEffect(() => {
     if (readOnly) return;
     if (hasRowDiff) {
-      void drafts.set(draftKey, { patch: rowDiff }, row.version, {
-        kind: "row",
-        rowKind: "tn",
-        id: row.id,
-        book: row.book,
-        chapter: row.chapter,
-        verse: row.verse,
-      });
-    } else {
+      void drafts.set(
+        draftKey,
+        {
+          patch: rowDiff,
+          // Persist the server baseline (savedRef stays version-pinned, immune
+          // to the optimistic same-version row mutations) so a remount restores
+          // an honest baseline instead of inheriting a polluted row. See the
+          // hydration effect above.
+          baseline: {
+            quote: savedRef.current.quote,
+            note: savedRef.current.note,
+            support_reference: savedRef.current.support_reference,
+          },
+        },
+        row.version,
+        {
+          kind: "row",
+          rowKind: "tn",
+          id: row.id,
+          book: row.book,
+          chapter: row.chapter,
+          verse: row.verse,
+        },
+      );
+    } else if (hydrated) {
+      // Only clear after the on-mount draft lookup has run — before that,
+      // hasRowDiff is measured against an unhydrated baseline and would
+      // spuriously wipe a draft we haven't had the chance to restore.
       void drafts.clear(draftKey);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
     draftKey,
     hasRowDiff,
+    hydrated,
     quote,
     note,
     supportRef,
