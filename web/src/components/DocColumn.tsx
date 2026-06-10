@@ -41,6 +41,10 @@ interface Props {
   rtl?: boolean;
   activeNoteQuote?: string | null;
   activeNoteOccurrence?: number | null;
+  // Active verse's UHB/UGNT verse content — lets ULT/UST columns OL-anchor the
+  // note highlight (resolve the OL quote against the source, then map via
+  // alignment) instead of guessing from milestone order. Ignored for UHB/UGNT.
+  activeSourceContent?: unknown;
   // Increment to request a scroll-to-active even when activeVerse hasn't
   // changed — used by ScriptureColumn's "go to active" button in columns mode.
   scrollNonce?: number;
@@ -90,6 +94,7 @@ export function DocColumn({
   rtl,
   activeNoteQuote,
   activeNoteOccurrence,
+  activeSourceContent,
   scrollNonce,
   lexiconMap,
   search,
@@ -243,7 +248,7 @@ export function DocColumn({
           // range. For singletons this reduces to v === activeVerse.
           const isActive = activeVerse >= dto.verse && activeVerse <= (dto.verse_end ?? dto.verse);
           const highlights = isActive
-            ? highlightsFor(bibleVersion, dto.content, activeNoteQuote, activeNoteOccurrence)
+            ? highlightsFor(bibleVersion, dto.content, activeNoteQuote, activeNoteOccurrence, activeSourceContent)
             : null;
           // Lift any \s1/\s2/\s3 section headers in this verse's content
           // up into block-level bands above the inline verse span. The

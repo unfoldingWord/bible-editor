@@ -299,6 +299,16 @@ function ScriptureColumnInner({
     return out;
   }, [versesByVersion]);
 
+  // The active verse's source (UHB/UGNT) verse content, used to OL-anchor
+  // ULT/UST note highlights in DocColumn (columns) and BookView (book). The
+  // active verse always lives in the active chapter (the route is
+  // book/chapter/verse), so the current chapter's index covers it for every
+  // mode. StackedBody reads its own uhbV inline.
+  const activeSourceContent = useMemo(
+    () => (indexByVersion["UHB"] ?? indexByVersion["UGNT"])?.[activeVerse]?.content,
+    [indexByVersion, activeVerse],
+  );
+
   return (
     <Box
       sx={{
@@ -460,6 +470,7 @@ function ScriptureColumnInner({
               activeVerse={activeVerse}
               activeNoteQuote={activeNoteQuote}
               activeNoteOccurrence={activeNoteOccurrence}
+              activeSourceContent={activeSourceContent}
               scrollNonce={scrollNonce}
               findQuery={findQuery}
               findActiveMatch={findScrollTarget}
@@ -492,6 +503,7 @@ function ScriptureColumnInner({
                 rtl={v === "UHB"}
                 activeNoteQuote={activeNoteQuote}
                 activeNoteOccurrence={activeNoteOccurrence}
+                activeSourceContent={activeSourceContent}
                 scrollNonce={scrollNonce}
                 lexiconMap={v === "UHB" ? lexiconMap : undefined}
                 search={search}
@@ -627,8 +639,10 @@ function StackedBody({
         const ustV = ust[v];
         const uhbV = uhb[v];
         if (isActive) {
-          const ultHL = highlightsFor("ULT", ultV?.content, activeNoteQuote, activeNoteOccurrence);
-          const ustHL = highlightsFor("UST", ustV?.content, activeNoteQuote, activeNoteOccurrence);
+          // OL-anchor the ULT/UST highlights on the active verse's source
+          // (UHB/UGNT) verse so reordered translations still light up.
+          const ultHL = highlightsFor("ULT", ultV?.content, activeNoteQuote, activeNoteOccurrence, uhbV?.content);
+          const ustHL = highlightsFor("UST", ustV?.content, activeNoteQuote, activeNoteOccurrence, uhbV?.content);
           const uhbHL = highlightsFor(uhbLabel, uhbV?.content, activeNoteQuote, activeNoteOccurrence);
           // For multi-verse blocks, PATCH and find/replace target the canonical
           // row at verse_start (e.g. 6 for a 6-9 range), not the active integer.

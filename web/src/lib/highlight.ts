@@ -191,30 +191,64 @@ export type HighlightKey = string; // `${text}|${occurrence}`
 const k = (text: string, occurrence: number): HighlightKey => `${text}|${occurrence}`;
 
 // For ULT/UST: returns target-word keys that should be highlighted.
+//
+// CANONICAL APPROACH (OL-anchored), matching gatewayEdit / tcCreate /
+// tsv-quote-converters: a TN quote is written in the SOURCE language, so we
+// resolve it against the SOURCE (UHB/UGNT) verse FIRST — giving the exact
+// (content, occurrence) source-word instances — then highlight the GL words
+// whose alignment scope (`\zaln-s` content + x-occurrence) matches one of
+// those instances. This is ORDER-INDEPENDENT: it never assumes the quoted
+// words stay adjacent (or even in source order) in the target. They usually
+// DON'T — the English freely permutes and interleaves the source words
+// (HOS 6:2 UST drops the verb between "after two days" and "on the third day";
+// ISA 28:1 UST scatters the four quoted words across the whole verse). The
+// `(content, occurrence)` join is the same one the quote-builder picker already
+// relies on (lib/quoteBuilder.ts `collectTargetTokens` + `tokenKey`).
+//
+// `sourceVerseObjects` (the OL verse) is required for the canonical path. When
+// it is absent — or the quote can't be resolved within it — we fall back to a
+// GL-only set match keyed on the milestones' own (content, occurrence); see the
+// degradation block below.
 export function findTargetHighlights(
   verseObjects: unknown[],
   quote: string,
   occurrence: number,
+  sourceVerseObjects?: unknown[],
 ): Set<HighlightKey> {
   const runs = collectMilestoneRuns(verseObjects);
-  const groups = quoteGroups(quote);
   const out = new Set<HighlightKey>();
-  if (runs.length === 0 || groups.length === 0) return out;
+  if (runs.length === 0) return out;
   const wantOcc = Math.max(1, occurrence | 0);
 
-  const normGroups = groups.map((g) => g.map(nfc));
-  const normSources = runs.map((r) => nfc(r.source));
-
-  const matches: number[][] = [];
-  for (let start = 0; start < runs.length; start++) {
-    const m = matchGroupsAt(start, normGroups, normSources);
-    if (m) matches.push(m);
+  // Stage 1 + 2 (canonical): resolve the quote to source instances, join GL
+  // milestones by (content, occurrence). Split-gloss duplicates share a key,
+  // so every fragment of a discontinuous gloss lights up together.
+  if (Array.isArray(sourceVerseObjects)) {
+    const olKeys = sourceInstanceKeys(sourceVerseObjects, quote, occurrence);
+    if (olKeys.size > 0) {
+      for (const r of runs) {
+        if (olKeys.has(`${nfc(r.source)}|${r.occurrence}`)) {
+          for (const t of r.targets) out.add(k(t.text, t.occurrence));
+        }
+      }
+      return out;
+    }
   }
 
-  const chosen = matches[wantOcc - 1];
-  if (!chosen) return out;
-  for (const i of chosen) {
-    for (const t of runs[i].targets) out.add(k(t.text, t.occurrence));
+  // Degradation: no source verse (e.g. UHB failed to load) or the quote didn't
+  // resolve in it. Match the quote as a SET of source words against the GL
+  // milestones' own (content, occurrence). Correct for the common
+  // single-occurrence case and lockstep repeats; for a quoted word whose source
+  // occurrence differs from the phrase occurrence it can pick the wrong instance
+  // — but that is unresolvable without the source verse, which the canonical
+  // path above uses whenever available.
+  const groups = quoteGroups(quote);
+  if (groups.length === 0) return out;
+  const wantWords = new Set(groups.flat().map(nfc));
+  for (const r of runs) {
+    if (wantWords.has(nfc(r.source)) && r.occurrence === wantOcc) {
+      for (const t of r.targets) out.add(k(t.text, t.occurrence));
+    }
   }
   return out;
 }
@@ -335,16 +369,19 @@ export function extractTargetSelectionText(
   return words.join(" ");
 }
 
-// For UHB/UGNT: returns source-word keys that should be highlighted.
-export function findSourceHighlights(
+// Resolve a quote + occurrence against the source/original verse words, in
+// SOURCE document order (where the quote IS contiguous and ordered, and gap
+// markers mark the real discontinuities). Returns the matched bare-word tokens
+// of the chosen occurrence, or [] if it doesn't resolve. Shared by the UHB/UGNT
+// highlighter and the OL-anchored target join.
+function matchSourceTokens(
   verseObjects: unknown[],
   quote: string,
   occurrence: number,
-): Set<HighlightKey> {
+): WordToken[] {
   const groups = quoteGroups(quote);
   const tokens = collectBareWords(verseObjects);
-  const out = new Set<HighlightKey>();
-  if (groups.length === 0 || tokens.length === 0) return out;
+  if (groups.length === 0 || tokens.length === 0) return [];
   const wantOcc = Math.max(1, occurrence | 0);
 
   const normGroups = groups.map((g) => g.map(nfc));
@@ -357,9 +394,36 @@ export function findSourceHighlights(
   }
 
   const chosen = matches[wantOcc - 1];
-  if (!chosen) return out;
-  for (const i of chosen) {
-    out.add(k(tokens[i].text, tokens[i].occurrence));
+  if (!chosen) return [];
+  return chosen.map((i) => tokens[i]);
+}
+
+// For UHB/UGNT: returns source-word keys that should be highlighted. Keys carry
+// RAW text — HebrewLine / renderHighlightedHTML read from the same tree.
+export function findSourceHighlights(
+  verseObjects: unknown[],
+  quote: string,
+  occurrence: number,
+): Set<HighlightKey> {
+  const out = new Set<HighlightKey>();
+  for (const t of matchSourceTokens(verseObjects, quote, occurrence)) {
+    out.add(k(t.text, t.occurrence));
+  }
+  return out;
+}
+
+// OL instance keys for the ULT/UST alignment join: `${nfc(content)}|occurrence`.
+// NFC-normalized because UHB \w text is in legacy combining-mark order while
+// \zaln-s x-content is NFC (see lib/hebrew.ts) — the join must compare the
+// canonical form on both sides. Same rule as quoteBuilder's `tokenKey`.
+function sourceInstanceKeys(
+  verseObjects: unknown[],
+  quote: string,
+  occurrence: number,
+): Set<string> {
+  const out = new Set<string>();
+  for (const t of matchSourceTokens(verseObjects, quote, occurrence)) {
+    out.add(`${nfc(t.text)}|${t.occurrence}`);
   }
   return out;
 }
@@ -581,11 +645,16 @@ export function renderEditableHTML(
 }
 
 // Convenience: pick the right highlight set for a given bible_version.
+// `sourceContent` is the active verse's UHB/UGNT verse content; pass it for
+// ULT/UST so the highlighter can OL-anchor the match (see findTargetHighlights).
+// Omitting it degrades ULT/UST to GL-only set matching; it's ignored for
+// UHB/UGNT (the source IS the verse).
 export function highlightsFor(
   bibleVersion: string,
   verseContent: unknown,
   quote: string | null | undefined,
   occurrence: number | null | undefined,
+  sourceContent?: unknown,
 ): Set<HighlightKey> {
   if (!quote) return new Set();
   const verseObjects = (verseContent as { verseObjects?: unknown[] } | null)?.verseObjects;
@@ -594,5 +663,6 @@ export function highlightsFor(
   if (bibleVersion === "UHB" || bibleVersion === "UGNT") {
     return findSourceHighlights(verseObjects, quote, occ);
   }
-  return findTargetHighlights(verseObjects, quote, occ);
+  const sourceVo = (sourceContent as { verseObjects?: unknown[] } | null)?.verseObjects;
+  return findTargetHighlights(verseObjects, quote, occ, Array.isArray(sourceVo) ? sourceVo : undefined);
 }

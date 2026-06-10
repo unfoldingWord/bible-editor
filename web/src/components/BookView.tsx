@@ -55,6 +55,10 @@ interface Props {
   activeVerse: number;
   activeNoteQuote: string | null;
   activeNoteOccurrence: number | null;
+  // Active verse's UHB/UGNT verse content — OL-anchors ULT/UST note highlights
+  // (resolve the OL quote against the source, then map via alignment) so a
+  // reordered English translation still highlights. Ignored for UHB/UGNT.
+  activeSourceContent?: unknown;
   scrollNonce?: number;
   findQuery: FindQuery | null;
   findActiveMatch: FindMatch | null;
@@ -95,6 +99,7 @@ export function BookView({
   activeVerse,
   activeNoteQuote,
   activeNoteOccurrence,
+  activeSourceContent,
   scrollNonce,
   findQuery,
   findActiveMatch,
@@ -303,6 +308,7 @@ export function BookView({
               activeVerse={activeVerse}
               activeNoteQuote={activeNoteQuote}
               activeNoteOccurrence={activeNoteOccurrence}
+              activeSourceContent={activeSourceContent}
               activeRowRef={activeRowRef}
               search={search}
               findActiveMatch={findActiveMatch}
@@ -337,6 +343,7 @@ function ChapterBlock({
   activeVerse,
   activeNoteQuote,
   activeNoteOccurrence,
+  activeSourceContent,
   activeRowRef,
   search,
   findActiveMatch,
@@ -357,6 +364,7 @@ function ChapterBlock({
   activeVerse: number;
   activeNoteQuote: string | null;
   activeNoteOccurrence: number | null;
+  activeSourceContent?: unknown;
   activeRowRef: React.MutableRefObject<HTMLDivElement | null>;
   search: SearchState | null;
   findActiveMatch: FindMatch | null;
@@ -493,6 +501,7 @@ function ChapterBlock({
             isActive={isActive}
             activeNoteQuote={isActive ? activeNoteQuote : null}
             activeNoteOccurrence={isActive ? activeNoteOccurrence : null}
+            activeSourceContent={isActive ? activeSourceContent : undefined}
             rowRef={isActive ? activeRowRef : null}
             search={search}
             findActiveMatch={findActiveMatch}
@@ -522,6 +531,7 @@ function VerseRow({
   isActive,
   activeNoteQuote,
   activeNoteOccurrence,
+  activeSourceContent,
   rowRef,
   search,
   findActiveMatch,
@@ -540,6 +550,7 @@ function VerseRow({
   isActive: boolean;
   activeNoteQuote: string | null;
   activeNoteOccurrence: number | null;
+  activeSourceContent?: unknown;
   rowRef: React.MutableRefObject<HTMLDivElement | null> | null;
   search: SearchState | null;
   findActiveMatch: FindMatch | null;
@@ -596,6 +607,7 @@ function VerseRow({
               isActive={isActive}
               activeNoteQuote={activeNoteQuote}
               activeNoteOccurrence={activeNoteOccurrence}
+              activeSourceContent={activeSourceContent}
               search={search}
               findActiveMatch={findActiveMatch}
               lexiconMap={lexiconMap}
@@ -625,6 +637,7 @@ function VerseCell({
   isActive,
   activeNoteQuote,
   activeNoteOccurrence,
+  activeSourceContent,
   search,
   findActiveMatch,
   lexiconMap,
@@ -645,6 +658,7 @@ function VerseCell({
   isActive: boolean;
   activeNoteQuote: string | null;
   activeNoteOccurrence: number | null;
+  activeSourceContent?: unknown;
   search: SearchState | null;
   findActiveMatch: FindMatch | null;
   lexiconMap: Map<string, LexiconEntry | null>;
@@ -749,8 +763,8 @@ function VerseCell({
   const highlights = useMemo<Set<HighlightKey> | null>(() => {
     if (findHTML) return null;
     if (!isActive || !activeNoteQuote || !dto?.content) return null;
-    return highlightsFor(bibleVersion, dto.content, activeNoteQuote, activeNoteOccurrence);
-  }, [findHTML, isActive, activeNoteQuote, activeNoteOccurrence, bibleVersion, dto?.content]);
+    return highlightsFor(bibleVersion, dto.content, activeNoteQuote, activeNoteOccurrence, activeSourceContent);
+  }, [findHTML, isActive, activeNoteQuote, activeNoteOccurrence, bibleVersion, dto?.content, activeSourceContent]);
 
   const html = useMemo(() => {
     if (findHTML) return findHTML;

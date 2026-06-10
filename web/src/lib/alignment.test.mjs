@@ -1600,6 +1600,113 @@ function roundtripVerseUsfm(rawUsfm, sourceVO = null) {
   assert(!lit("chariot", 1, sel2), `must NOT light the 1st "chariot"`);
 }
 
+// ─── Case 24: reordered target — quote contiguous in source, scattered in target ─
+//
+// ULT/UST milestone order follows the ENGLISH, which freely permutes and
+// interleaves source words relative to the Hebrew/Greek the quote is written
+// in. A quote that is contiguous in the source (and highlights fine on
+// UHB/UGNT) is then NON-adjacent — often non-monotonic — in target order.
+// findTargetHighlights OL-anchors: it resolves the quote against the SOURCE
+// (UHB) verse, then maps via the alignment (content, occurrence) — order
+// independent. With NO source verse it degrades to a GL-only set match.
+// Real bug: ISA 28:1 wdkm `עֲטֶרֶת גֵּאוּת שִׁכֹּרֵי אֶפְרַיִם` scatters its four
+// words across the whole UST verse.
+{
+  console.log("\n[Case 24] ISA 28:1 reordered UST target (real sample) — OL-anchored + degradation");
+  const ust = usfm.toJSON(readFileSync(resolve(repoRoot, "docs/samples/en_ust_23-ISA.usfm"), "utf-8"));
+  const uhb = usfm.toJSON(readFileSync(resolve(repoRoot, "docs/samples/hbo_uhb_23-ISA.usfm"), "utf-8"));
+  const ustVo = ust.chapters["28"]["1"].verseObjects;
+  const uhbVo = uhb.chapters["28"]["1"].verseObjects;
+  const quote = "עֲטֶ֤רֶת גֵּאוּת֙ שִׁכֹּרֵ֣י אֶפְרַ֔יִם";
+  // Run both the OL-anchored path (with the UHB source) and the degradation
+  // path (no source) — for this all-occurrence-1 quote they must agree.
+  for (const [label, hl] of [
+    ["OL-anchored", findTargetHighlights(ustVo, quote, 1, uhbVo)],
+    ["degradation", findTargetHighlights(ustVo, quote, 1)],
+  ]) {
+    // The four quoted source words land on four scattered English spans.
+    assert(hl.has("crown|1"), `ISA 28:1 (${label}): עֲטֶרֶת lights "crown". Got: ${[...hl].sort().join(",")}`);
+    assert(hl.has("proud|1"), `ISA 28:1 (${label}): גֵּאוּת lights "proud"`);
+    assert(hl.has("drunk|1"), `ISA 28:1 (${label}): שִׁכֹּרֵי lights "drunk"`);
+    assert(hl.has("Samaria|1"), `ISA 28:1 (${label}): אֶפְרַיִם lights "Samaria"`);
+    // No bleed into the unquoted neighbours (צְבִי תִפְאַרְתּוֹ / רֹאשׁ / וְצִיץ / יָיִן).
+    for (const key of ["beautiful|1", "hilltop|1", "flower|1", "wine|1"]) {
+      assert(!hl.has(key), `ISA 28:1 (${label}): must NOT highlight ${key}. Got: ${[...hl].sort().join(",")}`);
+    }
+  }
+}
+
+// ─── Case 25: degradation path respects occurrence + lights split-gloss dups ──
+//
+// Synthetic verse with NO source verse supplied (degradation path). The quote
+// "A B" is never adjacent in target order (an unquoted milestone always sits
+// between A and B). "A"/"B" each occur twice (occ 1 and 2): wantOcc must pick
+// the matching source occurrence and never bleed across. A split-gloss
+// duplicate (same content+occurrence appearing twice) must light both copies.
+{
+  console.log("\n[Case 25] degradation path: occurrence + split-gloss");
+  const A = "אָלֶף";
+  const B = "בֵּית";
+  const X = "גִּימֶל";
+  const ms = (content, occurrence, words) => ({
+    type: "milestone", tag: "zaln", content,
+    occurrence: String(occurrence), occurrences: "2",
+    children: words.map(([text, o]) => ({
+      type: "word", tag: "w", text, occurrence: String(o), occurrences: "1",
+    })),
+  });
+  const verseObjects = [
+    ms(A, 1, [["a1", 1]]),
+    ms(X, 1, [["x1", 1]]),   // intervening — breaks A|B adjacency
+    ms(B, 1, [["b1", 1]]),
+    ms(A, 1, [["a1dup", 1]]), // split-gloss continuation of A occ 1 (same content+occ)
+    ms(A, 2, [["a2", 1]]),
+    ms(X, 2, [["x2", 1]]),
+    ms(B, 2, [["b2", 1]]),
+  ];
+  const occ1 = findTargetHighlights(verseObjects, `${A} ${B}`, 1);
+  assert(occ1.has("a1|1") && occ1.has("b1|1"), `occ1 lights a1+b1. Got: ${[...occ1].join(",")}`);
+  assert(occ1.has("a1dup|1"), `occ1 lights the split-gloss duplicate a1dup. Got: ${[...occ1].join(",")}`);
+  assert(!occ1.has("a2|1") && !occ1.has("b2|1"), `occ1 must NOT bleed into occ2. Got: ${[...occ1].join(",")}`);
+  assert(!occ1.has("x1|1"), `occ1 must NOT light intervening x1. Got: ${[...occ1].join(",")}`);
+
+  const occ2 = findTargetHighlights(verseObjects, `${A} ${B}`, 2);
+  assert(occ2.has("a2|1") && occ2.has("b2|1"), `occ2 lights a2+b2. Got: ${[...occ2].join(",")}`);
+  assert(!occ2.has("a1|1") && !occ2.has("a1dup|1"), `occ2 must NOT light occ1. Got: ${[...occ2].join(",")}`);
+}
+
+// ─── Case 26: OL-anchoring fixes phrase-occurrence ≠ word-occurrence ──────────
+//
+// The case the GL-only degradation path CANNOT get right. Source order is
+// [A(1) B(1) A(2) C(1)]; the quoted phrase "A C" occurs once (occurrence 1) but
+// its "A" is the SECOND A in the verse (the first A stands alone earlier). The
+// English then reorders, emitting C before the A's. Only by resolving against
+// the source (A(2), C(1)) can we light the right A. The degradation path keys
+// on the phrase occurrence (1) and wrongly lights the first A.
+{
+  console.log("\n[Case 26] OL-anchored: phrase-occurrence ≠ word-occurrence");
+  // ASCII stand-ins for source words; nfc() is identity so the join is exact.
+  const w = (text, occurrence, occurrences) => ({ type: "word", tag: "w", text, occurrence: String(occurrence), occurrences: String(occurrences) });
+  const sourceVo = [w("A", 1, 2), w("B", 1, 1), w("A", 2, 2), w("C", 1, 1)];
+  const ms = (content, occurrence, occurrences, en) => ({
+    type: "milestone", tag: "zaln", content, occurrence: String(occurrence), occurrences: String(occurrences),
+    children: [{ type: "word", tag: "w", text: en, occurrence: "1", occurrences: "1" }],
+  });
+  // English reorders: C, then A(2), then A(1), then B.
+  const targetVo = [ms("C", 1, 1, "zee"), ms("A", 2, 2, "ay2"), ms("A", 1, 2, "ay1"), ms("B", 1, 1, "bee")];
+
+  const anchored = findTargetHighlights(targetVo, "A C", 1, sourceVo);
+  assert(anchored.has("ay2|1"), `OL-anchored lights the SECOND A (ay2). Got: ${[...anchored].join(",")}`);
+  assert(anchored.has("zee|1"), `OL-anchored lights C (zee). Got: ${[...anchored].join(",")}`);
+  assert(!anchored.has("ay1|1"), `OL-anchored must NOT light the first A (ay1). Got: ${[...anchored].join(",")}`);
+  assert(!anchored.has("bee|1"), `OL-anchored must NOT light unquoted B (bee). Got: ${[...anchored].join(",")}`);
+
+  // Document the limitation the OL-anchoring overcomes: without the source the
+  // degradation path keys on phrase occurrence (1) and lights the WRONG A.
+  const degraded = findTargetHighlights(targetVo, "A C", 1);
+  assert(degraded.has("ay1|1"), `degradation (no source) lights the first A — the limitation OL-anchoring fixes. Got: ${[...degraded].join(",")}`);
+}
+
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed.`);
   process.exit(1);
