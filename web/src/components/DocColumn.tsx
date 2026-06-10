@@ -519,7 +519,9 @@ function VerseSpan({
     const dom = elRef.current.textContent;
     if (html !== null) {
       if (html !== lastSetRef.current) {
-        elRef.current.innerHTML = html;
+        // Caret-preserving: activating this verse flips `html` to chip HTML and
+        // would otherwise wipe the selection the activating click just placed.
+        setInnerHtmlPreservingCaret(elRef.current, html);
         lastSetRef.current = html;
         lastTextRef.current = text;
       }
@@ -687,4 +689,72 @@ function renderFindMatchesHTML(
 
 function escapeHtml(s: string): string {
   return s.replace(/[&<>]/g, (c) => (c === "&" ? "&amp;" : c === "<" ? "&lt;" : "&gt;"));
+}
+
+// Caret-preserving innerHTML swap for the editable verse span. Activating a
+// verse flips the `html` memo from clean text to chip-rendered HTML, and the
+// resync effect rewrites innerHTML — which destroys the caret/selection the
+// activating click just placed (the "click twice to type" bug in poetry
+// chapters). Capture the caret as a character offset within textContent before
+// the swap, then re-walk the new text nodes to restore a collapsed range at the
+// same offset. Only acts when the element is focused and the selection lives
+// inside it; otherwise it's a plain assignment, leaving IME/composition and the
+// Firefox first-keystroke draft hydration untouched.
+function setInnerHtmlPreservingCaret(el: HTMLElement, html: string): void {
+  const sel = window.getSelection();
+  const focused = document.activeElement === el;
+  const inEl =
+    focused &&
+    sel &&
+    sel.rangeCount > 0 &&
+    sel.anchorNode != null &&
+    el.contains(sel.anchorNode);
+  if (!inEl) {
+    el.innerHTML = html;
+    return;
+  }
+  const offset = caretOffsetWithin(el, sel.getRangeAt(0));
+  el.innerHTML = html;
+  restoreCaretWithin(el, offset, sel);
+}
+
+// Number of textContent characters before the caret (anchor) within `el`.
+function caretOffsetWithin(el: HTMLElement, range: Range): number {
+  const pre = range.cloneRange();
+  pre.selectNodeContents(el);
+  pre.setEnd(range.startContainer, range.startOffset);
+  return pre.toString().length;
+}
+
+// Place a collapsed caret `offset` characters into `el`'s text, clamped to the
+// available text length.
+function restoreCaretWithin(el: HTMLElement, offset: number, sel: Selection): void {
+  const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+  let remaining = offset;
+  let node: Node | null = walker.nextNode();
+  let last: Text | null = null;
+  while (node) {
+    const len = node.textContent?.length ?? 0;
+    last = node as Text;
+    if (remaining <= len) {
+      const r = document.createRange();
+      r.setStart(node, remaining);
+      r.collapse(true);
+      sel.removeAllRanges();
+      sel.addRange(r);
+      return;
+    }
+    remaining -= len;
+    node = walker.nextNode();
+  }
+  // Offset ran past the end (text shrank) — drop the caret at the end.
+  const r = document.createRange();
+  if (last) {
+    r.setStart(last, last.textContent?.length ?? 0);
+  } else {
+    r.selectNodeContents(el);
+  }
+  r.collapse(true);
+  sel.removeAllRanges();
+  sel.addRange(r);
 }

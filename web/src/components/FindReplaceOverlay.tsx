@@ -193,15 +193,21 @@ export function FindReplaceOverlay({
   // Any change to the search inputs counts as user navigation — once the
   // new matches settle, scroll to the first hit.
   useEffect(() => {
+    // A new query is user navigation regardless of scope — flag the scroll
+    // BEFORE the Bible-scope early return so a TN-only search (Bible unchecked,
+    // TN checked) still auto-jumps to its first note hit. Only suppress when
+    // there's nothing to search.
+    if (open && find && (scope.bible || scope.tn)) {
+      wantsScrollRef.current = true;
+    }
     // Only paint scripture cells when the Bible scope is on — TN-only searches
     // shouldn't light up verse text.
     if (!open || !find || !scope.bible) {
       onQueryChange(null);
       return;
     }
-    wantsScrollRef.current = true;
     onQueryChange({ find, regex, caseSensitive, strongs });
-  }, [open, find, regex, caseSensitive, strongs, scope.bible, onQueryChange]);
+  }, [open, find, regex, caseSensitive, strongs, scope.bible, scope.tn, onQueryChange]);
 
   const compiled = useMemo(() => buildSearchRegex(find, regex, caseSensitive), [find, regex, caseSensitive]);
   const regexInvalid = !!find && compiled.error;
@@ -221,10 +227,15 @@ export function FindReplaceOverlay({
 
   // Note matches re-read live notes via searchNotes() whenever the query
   // changes — `find`/`compiled.re` in the deps are the recompute signal.
+  // `chapters` is also a dep: searchNotes() is a stable getter, so without it
+  // a note mutation (delete / trash / AI-patch) wouldn't recompute and the
+  // result list + "X / Y" count would go stale. Every note edit produces a new
+  // ChapterPayload reference (see useChapter applyLocalRow*), so the `chapters`
+  // map identity changes and this memo re-reads the fresh notes.
   const noteMatches = useMemo<NoteMatch[]>(() => {
     if (!open || !scope.tn || !find) return [];
     return collectNoteMatches(searchNotes(), compiled.re);
-  }, [open, scope.tn, find, compiled.re, searchNotes]);
+  }, [open, scope.tn, find, compiled.re, searchNotes, chapters]);
 
   // Merge + order both scopes by chapter then verse, bible before note within
   // the same verse, so prev/next walks the document top-to-bottom.

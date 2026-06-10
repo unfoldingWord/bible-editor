@@ -353,6 +353,14 @@ function NoteCardInner({
       if ("support_reference" in patch) {
         setSupportRef((patch.support_reference as string | null) ?? null);
       }
+    }).catch(() => {
+      // An IndexedDB read failure must still flip `hydrated` true — otherwise
+      // the draft-write effect's clear branch never fires and a reverted draft
+      // keeps nagging. We just skip restoring any persisted draft (the card
+      // falls back to the server row, and live editing still works).
+      if (hydratedFromDraftRef.current) return;
+      hydratedFromDraftRef.current = true;
+      setHydrated(true);
     });
   }, [row.id, row.book]);
 

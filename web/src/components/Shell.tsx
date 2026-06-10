@@ -24,7 +24,7 @@ import { api } from "../sync/api";
 import type { ChapterPayload, TnRow, TqRow, TwlRow, VerseDto } from "../sync/api";
 import { drafts, verseKey } from "../sync/drafts";
 import { smartEditVerse } from "../lib/replace";
-import { extractEditableText, extractPlainText, SECTION_HEADER_TAGS } from "../lib/usfm";
+import { extractEditableText, extractPlainText, normalizeEditable, SECTION_HEADER_TAGS } from "../lib/usfm";
 import { verseHasUnalignedWork } from "../lib/alignment";
 import { buildVerseIndex, concatSourceRange, formatVerseLabel } from "../lib/verseRange";
 import { buildTnQuickRequest } from "../lib/tnQuickRequest";
@@ -83,7 +83,16 @@ function countSourceWords(row: VerseDto | undefined): number {
       const o = x as Record<string, unknown> | null;
       if (!o) continue;
       if (o["type"] === "word" && o["tag"] === "w") n++;
-      else if (o["type"] === "milestone") walk((o["children"] as unknown[] | undefined) ?? []);
+      // \d (Psalm superscription) is `type:"section"` but its content IS
+      // alignable Hebrew verse body — descend it like a milestone, mirroring
+      // collectMilestoneRuns in highlight.ts. Half of a cross-PR \d fix; the
+      // other source-word walkers (highlight/quoteBuilder/alignment/
+      // AlignmentPanel/UhbStrip) gain the same descent so posOffsets stay aligned.
+      else if (
+        o["type"] === "milestone" ||
+        (o["type"] === "section" && o["tag"] === "d")
+      )
+        walk((o["children"] as unknown[] | undefined) ?? []);
     }
   };
   walk(verseObjects ?? []);
@@ -111,6 +120,15 @@ function saveToStorage<T>(key: string, value: T) {
     /* ignore */
   }
 }
+
+// Cross-chapter TN-find jump carry. A find-overlay match in another chapter
+// (book mode) navigates via the hash, which can't encode a note id, and Shell
+// is keyed on book/chapter/verse so it fully remounts on arrival. Stash the
+// target here just before navigating; the freshly-mounted Shell consumes it
+// once its chapter payload (with that note row) has loaded, then activates +
+// scrolls to the note. Module-level so it survives the remount; cleared on
+// consume so a later same-location mount doesn't re-grab a stale note.
+let pendingNoteJump: { book: string; chapter: number; noteId: string } | null = null;
 
 interface Props {
   book: string;
@@ -756,6 +774,9 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     (ch: number, v: number, noteId: string) => {
       runWithDirtyGate(() => {
         if (ch !== chapter) {
+          // The hash carries only book/chapter/verse; stash the note id so the
+          // remounted Shell can activate + scroll to it once its payload loads.
+          pendingNoteJump = { book, chapter: ch, noteId };
           onNavigate?.(book, ch, v);
           return;
         }
@@ -767,6 +788,22 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     },
     [runWithDirtyGate, chapter, book, onNavigate],
   );
+
+  // Consume a cross-chapter TN-find jump stashed before navigation. Waits for
+  // this chapter's payload (and the target note row) to load, then activates +
+  // scrolls to the note. Cleared on consume; ignored if the stash targets a
+  // different book/chapter (e.g. the user navigated elsewhere in the meantime).
+  useEffect(() => {
+    const jump = pendingNoteJump;
+    if (!jump) return;
+    if (jump.book !== book || jump.chapter !== chapter) return;
+    if (!data) return;
+    if (!data.tn.some((r) => r.id === jump.noteId)) return;
+    pendingNoteJump = null;
+    setActiveWordId(null);
+    setActiveNoteId(jump.noteId);
+    setScrollNonce((n) => n + 1);
+  }, [data, book, chapter]);
 
   // Keep the alignment target's verse in step with the active verse while
   // we're in alignment mode. Bible version is sticky — only LinkIcon clicks
@@ -1126,7 +1163,19 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     // not enqueue a PATCH — it would bump the verse version server-side for
     // nothing, adding noisy history and leaving a stale expected_version that a
     // later alignment save on the same row can 409 against.
-    if (oldEditable === plain) return;
+    //
+    // `oldEditable` is already normalizeEditable-collapsed, but `plain` is raw
+    // DOM textContent (may carry trailing \n / ZWSP / nbsp the editor emits),
+    // so normalize both sides — otherwise type-a-char-then-revert never matches
+    // and a version-bumping no-op PATCH fires. On a real no-op we must also
+    // CLEAR the stranded keystroke draft: drafts are written on every keystroke
+    // and only cleared by the outbox-200 listener, so returning without clearing
+    // leaves an orphaned draft (dirty border + SyncStatusBar entry + "unsaved
+    // edits" toast whose Save button re-hits this guard and never resolves).
+    if (oldEditable === normalizeEditable(plain)) {
+      void drafts.clear(verseKey(book, chapterNum, verseNum, bibleVersion));
+      return;
+    }
     const result = smartEditVerse(base.content, oldEditable, plain);
     const newPlainText = extractPlainText(result.content);
     const newDto = {
