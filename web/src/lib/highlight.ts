@@ -323,6 +323,13 @@ export function findSourceForTargetText(
   englishText: string,
 ): string {
   const wantedWords = englishText
+    // Proofreaders paste straight from the ULT, which can carry USFM
+    // markers (\q1, \q2, \p, \m, …) when the quote spans a poetry line
+    // or paragraph break. Strip them before the punctuation pass below —
+    // that pass removes the backslash but would leave the marker's
+    // letters/digits (q1, q2, p) behind as bogus words that break the
+    // contiguous-run match against the target.
+    .replace(/\\[a-z]+\d*\*?/gi, " ")
     .toLowerCase()
     .replace(/[^\p{L}\p{N}\s]+/gu, " ")
     .split(/\s+/)
