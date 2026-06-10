@@ -185,6 +185,9 @@ interface PolledJob {
   follow_up_chain: string | null;
   follow_up_job_id: string | null;
   no_output_yet: number;
+  // Prior poll's error_kind. Lets us detect a *repeated* import failure so a
+  // deterministically-bad apply force-fails instead of holding the slot/lock.
+  error_kind: string | null;
 }
 
 interface ChainStepValue {
@@ -445,12 +448,22 @@ async function pollPipelineJob(
     }
   }
 
-  // When the local apply fails, hold state at 'running' so the */5 cron
-  // re-polls and re-imports (upstream is idempotent — its 'done' state
-  // sticks, so the next poll hits the same shouldImport branch). The
-  // MAX_POLL_ATTEMPTS / 48h guards above eventually force-fail a permanent
-  // failure. Surface the failure via error_kind so the UI can flag it.
-  const effectiveState = importFailed ? "running" : (data.state ?? "running");
+  // When the local apply fails, hold state at 'running' for ONE retry so the
+  // */5 cron re-imports (upstream is idempotent — its 'done' state sticks, so
+  // the next poll hits the same shouldImport branch). This recovers a transient
+  // failure (e.g. a D1 write hiccup). But 'running' both occupies the single
+  // bot dispatch slot and globally locks the chapter for writes — so a
+  // *deterministically* bad apply (malformed output that throws identically
+  // every time) must not ride the 8h MAX_POLL_ATTEMPTS / 48h guards. If the
+  // prior poll already failed the import, give up now: force 'failed', which is
+  // terminal and frees both the slot (dispatchNext below) and the chapter lock.
+  // Surface the failure via error_kind either way so the UI can flag it.
+  const importFailedAgain = importFailed && job.error_kind === "import_failed";
+  const effectiveState = importFailed
+    ? importFailedAgain
+      ? "failed"
+      : "running"
+    : (data.state ?? "running");
   const effectiveErrorKind = importFailed ? "import_failed" : (data.current?.errorKind ?? null);
   const effectiveErrorMessage = importFailed ? importErrMessage : (data.current?.error ?? null);
 
@@ -514,8 +527,9 @@ async function pollPipelineJob(
   }
 
   // On any terminal transition the bot slot is now free — pull the next job
-  // (the priority=1 follow-up just enqueued, if any, wins). importFailed holds
-  // the job at 'running' deliberately, so it won't free the slot here.
+  // (the priority=1 follow-up just enqueued, if any, wins). A first import
+  // failure holds the job at 'running' (one retry) so it won't free the slot
+  // here; a repeated one force-fails above and falls into this branch.
   if (effectiveState === "done" || effectiveState === "failed") {
     try {
       await dispatchNext(env);
@@ -608,7 +622,7 @@ export async function pollAllNonTerminal(env: Env): Promise<void> {
   const rs = await env.DB.prepare(
     `SELECT job_id, upstream_job_id, user_id, pipeline_type, book, start_chapter,
             end_chapter, session_key, follow_up_options, follow_up_chain,
-            follow_up_job_id, (output_json IS NULL) AS no_output_yet
+            follow_up_job_id, error_kind, (output_json IS NULL) AS no_output_yet
        FROM pipeline_jobs
       WHERE state IN ('running', 'paused_for_outage', 'paused_for_usage_limit')
       ORDER BY updated_at ASC
@@ -846,8 +860,8 @@ pipelines.get("/:jobId", requireEditor, async (c) => {
   const owned = await c.env.DB.prepare(
     `SELECT job_id, upstream_job_id, user_id, pipeline_type, book, start_chapter,
             end_chapter, session_key, follow_up_options, follow_up_chain,
-            follow_up_job_id, state, current_skill, current_status, created_at,
-            updated_at, (output_json IS NULL) AS no_output_yet
+            follow_up_job_id, error_kind, state, current_skill, current_status,
+            created_at, updated_at, (output_json IS NULL) AS no_output_yet
        FROM pipeline_jobs WHERE job_id = ?1`,
   )
     .bind(jobId)

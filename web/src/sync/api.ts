@@ -424,6 +424,30 @@ async function request<T>(
       } catch {
         /* ignore — status alone is enough to classify the error */
       }
+      // csrf_mismatch is recoverable, not fatal: the be_csrf cookie expired
+      // (or was cleared) while the session itself is still valid. A refresh
+      // re-mints the cookie via setSessionCookies, so the retry reads a fresh
+      // value. Same one-shot, online-only refresh-and-retry as the 401 path
+      // above. (read_only 403s short-circuit before fetch, so they never land
+      // here.)
+      if (
+        res.status === 403 &&
+        !_retriedAfterRefresh &&
+        (body as { error?: string } | null)?.error === "csrf_mismatch" &&
+        !(typeof navigator !== "undefined" && navigator.onLine === false)
+      ) {
+        if (timer) {
+          clearTimeout(timer);
+          timer = null;
+        }
+        const refreshed = await refreshAuthOnce();
+        if (refreshed) {
+          return await request<T>(path, init, true);
+        }
+        // Refresh failed — the session is dead, not just the CSRF cookie.
+        emitAuthError();
+        throw new ApiError(401, "HTTP 401");
+      }
       throw new ApiError(res.status, `HTTP ${res.status}`, body);
     }
     try {
