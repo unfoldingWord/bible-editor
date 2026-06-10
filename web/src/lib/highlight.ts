@@ -127,10 +127,41 @@ function nodeIsPsalmTitle(n: unknown): n is Record<string, unknown> {
   return !!o && o["type"] === "section" && o["tag"] === "d";
 }
 
+// Collect every `\w` token in a subtree (descending through nested milestones
+// and \d sections), in document order. A merge group serializes as a chain of
+// nested `\zaln-s` with ALL its target words at the innermost level, so a run's
+// `targets` must be its whole subtree — see collectMilestoneRuns / atomic-group
+// note below.
+function collectSubtreeWords(children: unknown[]): WordToken[] {
+  const out: WordToken[] = [];
+  function walk(nodes: unknown[]) {
+    for (const c of nodes ?? []) {
+      if (nodeIsWord(c)) {
+        out.push({
+          text: String((c as Record<string, unknown>)["text"] ?? ""),
+          occurrence:
+            parseInt(String((c as Record<string, unknown>)["occurrence"] ?? "1"), 10) || 1,
+        });
+      } else if (nodeIsMilestone(c) || nodeIsPsalmTitle(c)) {
+        walk(((c as Record<string, unknown>)["children"] as unknown[] | undefined) ?? []);
+      }
+    }
+  }
+  walk(children);
+  return out;
+}
+
 // Flatten the verse tree into one Run per zaln milestone (nested milestones
-// become their own runs in document order). Each run's `targets` is only
-// its DIRECT `\w` children — that way compound (nested) alignments stay
-// disjoint and the matcher can highlight each level on its own.
+// become their own runs in document order). Each run's `targets` is its FULL
+// subtree of `\w` tokens, not just direct children. Nested `\zaln-s` encode a
+// MERGE GROUP (N source words ↔ M target words) whose target words all sit at
+// the innermost level; treating each level's targets as the whole subtree makes
+// the highlight ATOMIC — quoting ANY source word in the chain lights the whole
+// group, regardless of nesting depth (matching tC / gatewayEdit). With only the
+// direct children, an outer source word (whose direct children are the nested
+// milestone, not words) would highlight nothing while the innermost lit
+// everything — an indefensible depth-dependent asymmetry. Disjoint sibling
+// alignments stay disjoint because each subtree is scoped to its own milestone.
 //
 // Split-gloss healing: an AI/tC aligner sometimes renders a single source
 // token whose target words are NON-CONTIGUOUS as two separate `\zaln-s` runs
@@ -155,17 +186,8 @@ function collectMilestoneRuns(verseObjects: unknown[]): Run[] {
       const source = String(node["content"] ?? "");
       const occurrence = parseInt(String(node["occurrence"] ?? "1"), 10) || 1;
       const occurrences = parseInt(String(node["occurrences"] ?? "1"), 10) || 1;
-      const targets: WordToken[] = [];
       const children = (node["children"] as unknown[] | undefined) ?? [];
-      for (const c of children) {
-        if (nodeIsWord(c)) {
-          targets.push({
-            text: String((c as Record<string, unknown>)["text"] ?? ""),
-            occurrence:
-              parseInt(String((c as Record<string, unknown>)["occurrence"] ?? "1"), 10) || 1,
-          });
-        }
-      }
+      const targets = collectSubtreeWords(children);
       // Malformed split continuation: merge into the nearest preceding run
       // with the same source content rather than starting a new run.
       let merged = false;

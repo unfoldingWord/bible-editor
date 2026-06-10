@@ -635,6 +635,41 @@ function roundtripVerseUsfm(rawUsfm, sourceVO = null) {
   );
 }
 
+// ─── Case 11b: merge group is ATOMIC regardless of nesting depth ──────────
+//
+// A merge group (N source words ↔ M target words) serializes as a chain of
+// nested \zaln-s with ALL target \w at the innermost level. Quoting ANY source
+// word in the chain — outer, middle, or innermost — must light the WHOLE
+// group's targets. Before the subtree fix, only the innermost source word lit
+// the targets while every outer source word lit nothing (a depth-dependent
+// asymmetry). ZEC 6:5: מֵהִתְיַצֵּב>עַל>אֲדוֹן>כָּל>הָאָרֶץ ↔ "the earth one".
+{
+  console.log("\n[Case 11b] merge group is atomic regardless of nesting depth");
+  const nest = (content, occurrence, children) => ({
+    tag: "zaln",
+    type: "milestone",
+    occurrence,
+    occurrences: 1,
+    content,
+    children,
+  });
+  // Innermost milestone (כָּל) carries the two target words.
+  const inner = nest("כָּל", 1, [
+    { type: "word", tag: "w", text: "the", occurrence: 1, occurrences: 1 },
+    { type: "word", tag: "w", text: "earth", occurrence: 1, occurrences: 1 },
+  ]);
+  const verseObjects = [nest("מֵֽ⁠הִתְיַצֵּ֖ב", 1, [nest("עַל", 1, [nest("אֲד֥וֹן", 1, [inner])])])];
+
+  const expect = ["the|1", "earth|1"];
+  for (const src of ["מֵֽ⁠הִתְיַצֵּ֖ב", "עַל", "אֲד֥וֹן", "כָּל"]) {
+    const hl = findTargetHighlights(verseObjects, src, 1);
+    assert(
+      expect.every((k) => hl.has(k)) && hl.size === expect.length,
+      `quoting "${src}" lights the whole merge group {the,earth} (got ${[...hl].join(",") || "∅"})`,
+    );
+  }
+}
+
 // ─── Case 12: Hebrew-click → quote builder ────────────────────────────────
 //
 // Selecting contiguous Hebrew words produces a single space-joined quote;
