@@ -6,7 +6,7 @@
 // A proper diff/merge UI is docs/plan.md territory and out of scope here.
 
 import { useEffect, useState, type ReactNode } from "react";
-import { Box, Button, Chip, Divider, IconButton, Stack, Tooltip, Typography } from "@mui/material";
+import { Box, Button, Chip, Dialog, DialogActions, DialogContent, DialogContentText, DialogTitle, Divider, IconButton, Stack, Tooltip, Typography } from "@mui/material";
 import CloudDoneIcon from "@mui/icons-material/CloudDone";
 import CloudQueueIcon from "@mui/icons-material/CloudQueue";
 import ErrorOutlineIcon from "@mui/icons-material/ErrorOutline";
@@ -86,6 +86,10 @@ export function SyncStatusBar() {
   const pending = ops.filter((o) => o.status === "pending" || o.status === "in_flight").length;
   const conflicts = ops.filter((o) => o.status === "conflict");
   const failed = ops.filter((o) => o.status === "failed");
+
+  // "Discard all" permanently deletes queued edits — gate it behind an
+  // explicit confirm so it can't be a one-misclick data loss.
+  const [confirmDiscardAll, setConfirmDiscardAll] = useState(false);
 
   // Tick once a second when pending > 0 so the "stale progress" heuristic
   // can flip the pill to offline-style without waiting for the next outbox
@@ -289,9 +293,7 @@ export function SyncStatusBar() {
                       size="small"
                       variant="text"
                       color="error"
-                      onClick={async () => {
-                        for (const op of failed) await outbox.drop(op.id);
-                      }}
+                      onClick={() => setConfirmDiscardAll(true)}
                       sx={{ minWidth: 0, py: 0, fontSize: 11 }}
                     >
                       discard all
@@ -367,6 +369,35 @@ export function SyncStatusBar() {
           </Stack>
         </Box>
       )}
+      <Dialog
+        // Auto-closes if the failed list empties out from under it (retry /
+        // auto-revival) — nothing left to discard.
+        open={confirmDiscardAll && failed.length > 0}
+        onClose={() => setConfirmDiscardAll(false)}
+      >
+        <DialogTitle>
+          Discard {failed.length} failed edit{failed.length === 1 ? "" : "s"}?
+        </DialogTitle>
+        <DialogContent>
+          <DialogContentText>
+            These edits never reached the server. Discarding deletes them from
+            this device permanently — they cannot be recovered.
+          </DialogContentText>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setConfirmDiscardAll(false)}>cancel</Button>
+          <Button
+            color="error"
+            variant="contained"
+            onClick={async () => {
+              for (const op of failed) await outbox.drop(op.id);
+              setConfirmDiscardAll(false);
+            }}
+          >
+            discard all
+          </Button>
+        </DialogActions>
+      </Dialog>
     </>
   );
 }

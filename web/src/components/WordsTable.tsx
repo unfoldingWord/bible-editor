@@ -201,7 +201,7 @@ const WordRow = memo(function WordRow({
     savedRef.current = { quote: row.orig_words ?? "", twLink: row.tw_link };
   }, [row.id, row.version]);
 
-  const draftKey = useMemo(() => rowKey("twl", row.id), [row.id]);
+  const draftKey = useMemo(() => rowKey("twl", row.book, row.id), [row.book, row.id]);
 
   // Hydrate from any persisted draft on first mount so unsaved typing
   // survives navigation.

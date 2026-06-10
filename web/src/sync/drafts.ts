@@ -89,8 +89,12 @@ export function verseKey(
   return `verse:${book}:${chapter}:${verse}:${bibleVersion}`;
 }
 
-export function rowKey(rowKind: RowKind, id: string): string {
-  return `row:${rowKind}:${id}`;
+// Row ids are only unique per (book, id) — the same 4-char id can exist in
+// two books with unrelated content — so the key must carry the book or
+// cross-book drafts collide (wrong text shown/saved). Pre-book records
+// ("row:{kind}:{id}") are migrated lazily in get() below.
+export function rowKey(rowKind: RowKind, book: string, id: string): string {
+  return `row:${rowKind}:${book}:${id}`;
 }
 
 export const drafts = {
@@ -119,7 +123,27 @@ export const drafts = {
   },
 
   async get(key: string): Promise<DraftRecord | undefined> {
-    return (await (await db()).get(STORE, key)) as DraftRecord | undefined;
+    const idb = await db();
+    const rec = (await idb.get(STORE, key)) as DraftRecord | undefined;
+    if (rec) return rec;
+    // One-time tolerance for the pre-book row key format ("row:{kind}:{id}").
+    // On a miss, check whether a legacy record exists whose meta says it
+    // belongs to this book; if so, migrate it under the new key. A legacy
+    // record for the *other* book in a collision stays put until that book's
+    // card claims it.
+    const m = /^row:([^:]+):([^:]+):(.+)$/.exec(key);
+    if (!m) return undefined;
+    const [, rowKind, book, id] = m;
+    const legacyKey = `row:${rowKind}:${id}`;
+    const legacy = (await idb.get(STORE, legacyKey)) as DraftRecord | undefined;
+    if (!legacy || legacy.meta.kind !== "row" || legacy.meta.book !== book) {
+      return undefined;
+    }
+    const migrated: DraftRecord = { ...legacy, key };
+    await idb.put(STORE, migrated);
+    await idb.delete(STORE, legacyKey);
+    void notify();
+    return migrated;
   },
 
   async clear(key: string): Promise<void> {
@@ -157,6 +181,6 @@ onOutboxResult((op, result) => {
       verseKey(op.target.book, op.target.chapter, op.target.verse, op.target.bibleVersion),
     );
   } else if (op.target.kind === "row") {
-    void drafts.clear(rowKey(op.target.rowKind, op.target.id));
+    void drafts.clear(rowKey(op.target.rowKind, op.target.book, op.target.id));
   }
 });
