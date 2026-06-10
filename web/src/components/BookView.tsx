@@ -17,7 +17,7 @@ import SaveOutlinedIcon from "@mui/icons-material/SaveOutlined";
 import UndoIcon from "@mui/icons-material/Undo";
 import type { VerseDto } from "../sync/api";
 import type { ChapterState } from "../hooks/useBook";
-import { highlightsFor, renderHighlightedHTML, type HighlightKey } from "../lib/highlight";
+import { highlightsFor, renderEditableHTML, renderHighlightedHTML, type HighlightKey } from "../lib/highlight";
 import { markHighlightSx } from "../lib/highlightStyles";
 import { extractTrailingMarkers, splitSectionHeaders, type SectionHeader } from "../lib/usfm";
 import { SectionHeaderBand } from "./SectionHeaderBand";
@@ -804,6 +804,15 @@ const VerseCell = memo(function VerseCell({
     if (findHTML) return findHTML;
     const verseObjects = (dto?.content as { verseObjects?: unknown[] } | null)?.verseObjects;
     if (!Array.isArray(verseObjects)) return null;
+    // Active editable verse: surface paragraph / poetry markers as literal
+    // "\p" / "\q1" chips so they can be seen and adjusted in place — same as
+    // the rows view active line. Render the verse's OWN objects (not the
+    // drifted-composed set) so the contentEditable's textContent matches
+    // extractEditableText and the smartEditVerse save diff lines up. Only the
+    // active verse gets chips; the rest of the book stays clean.
+    if (isActive && !readOnly) {
+      return renderEditableHTML(verseObjects, highlights ?? new Set());
+    }
     // Drift trailing `\q1`/`\p` etc. from the previous verse so the
     // visual break introduces this verse — usfm-js attaches markers
     // to the prior verse (per USFM convention `\q1 \v N+1`).
@@ -814,7 +823,7 @@ const VerseCell = memo(function VerseCell({
     // Render unconditionally so paragraph / poetry markers turn into
     // visual breaks / indents in book view even without active highlights.
     return renderHighlightedHTML(composed, highlights ?? new Set());
-  }, [findHTML, dto?.content, highlights, prevDto?.content]);
+  }, [findHTML, dto?.content, highlights, prevDto?.content, isActive, readOnly]);
 
   // splitSectionHeaders walks the whole verseObjects tree — memoize on the
   // content reference so re-renders without a content change skip the walk.
@@ -907,8 +916,15 @@ const VerseCell = memo(function VerseCell({
               void drafts.clear(draftKey);
               const text = dto?.plain_text ?? "";
               if (elRef.current) {
-                elRef.current.textContent = text;
-                lastSetRef.current = text;
+                // Re-render from `html` when present (active verse) so the
+                // USFM-code chips come back, not just marker-free plain text.
+                if (html !== null) {
+                  elRef.current.innerHTML = html;
+                  lastSetRef.current = html;
+                } else {
+                  elRef.current.textContent = text;
+                  lastSetRef.current = text;
+                }
                 lastTextRef.current = text;
               }
             }}

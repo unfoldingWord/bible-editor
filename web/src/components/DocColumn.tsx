@@ -5,7 +5,7 @@ import SaveIcon from "@mui/icons-material/Save";
 import SaveOutlinedIcon from "@mui/icons-material/SaveOutlined";
 import UndoIcon from "@mui/icons-material/Undo";
 import type { VerseDto } from "../sync/api";
-import { highlightsFor, renderHighlightedHTML, type HighlightKey } from "../lib/highlight";
+import { highlightsFor, renderEditableHTML, renderHighlightedHTML, type HighlightKey } from "../lib/highlight";
 import { markHighlightSx } from "../lib/highlightStyles";
 import { extractTrailingMarkers, splitSectionHeaders, type SectionHeader } from "../lib/usfm";
 import { SectionHeaderBand } from "./SectionHeaderBand";
@@ -487,6 +487,15 @@ function VerseSpan({
     if (!content) return null;
     const verseObjects = (content as { verseObjects?: unknown[] } | null)?.verseObjects;
     if (!Array.isArray(verseObjects)) return null;
+    // Active editable verse: surface paragraph / poetry markers as literal
+    // "\p" / "\q1" chips so they can be seen and adjusted in place — same as
+    // the rows view active line. Render the verse's OWN objects (not the
+    // drifted-composed set) so the contentEditable's textContent matches
+    // extractEditableText and the smartEditVerse save diff lines up. Only the
+    // active verse gets chips; the rest of the column stays clean.
+    if (isActive && !readOnly) {
+      return renderEditableHTML(verseObjects, highlights ?? new Set());
+    }
     // Compose any drifted-down markers (from the previous verse's
     // trailing `\q1`/`\p` etc.) at the front so the visual break
     // introduces this verse, matching USFM intent.
@@ -496,7 +505,7 @@ function VerseSpan({
     // Render unconditionally so paragraph / poetry markers turn into
     // visual breaks / indents even without an active highlight set.
     return renderHighlightedHTML(drifted, highlights ?? new Set());
-  }, [findHTML, content, highlights, precedingMarkers]);
+  }, [findHTML, content, highlights, precedingMarkers, isActive, readOnly]);
 
   // Resync the editable span when (a) text changes from outside and the user
   // hasn't been typing since, or (b) highlights change. We let the user type
@@ -578,8 +587,15 @@ function VerseSpan({
               // the next keystroke's draft stomp the live DOM again.
               void drafts.clear(draftKey);
               if (elRef.current) {
-                elRef.current.textContent = text;
-                lastSetRef.current = text;
+                // Re-render from `html` when present (active verse) so the
+                // USFM-code chips come back, not just marker-free plain text.
+                if (html !== null) {
+                  elRef.current.innerHTML = html;
+                  lastSetRef.current = html;
+                } else {
+                  elRef.current.textContent = text;
+                  lastSetRef.current = text;
+                }
                 lastTextRef.current = text;
               }
             }}
