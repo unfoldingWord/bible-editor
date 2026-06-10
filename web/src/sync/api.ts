@@ -258,19 +258,39 @@ function emitAuthRefreshed() {
 // Exported for wsClient.ts — a WS handshake rejected before `open` can't go
 // through request()'s 401 path, so the reconnect loop calls this directly.
 let refreshInFlight: Promise<boolean> | null = null;
+
+// A refresh must not hang forever. wsClient.ts runs
+// `refreshAuthOnce().then(() => scheduleReconnect())` on a pre-open WS close;
+// if the refresh fetch stalls on a half-open socket (post network-change),
+// scheduleReconnect never fires *and* refreshInFlight stays pinned, blocking
+// every 401 caller behind it. Cap it like request() does. A bit shorter than
+// the 30s request default — refresh is a tiny POST, and we'd rather fail fast
+// and let the outbox's online/focus retries get another shot.
+const REFRESH_TIMEOUT_MS = 12_000;
+
 export async function refreshAuthOnce(): Promise<boolean> {
   if (refreshInFlight) return refreshInFlight;
   refreshInFlight = (async () => {
+    const ctrl = new AbortController();
+    const timer = setTimeout(
+      () => ctrl.abort(new DOMException("timeout", "TimeoutError")),
+      REFRESH_TIMEOUT_MS,
+    );
     try {
       const res = await fetch("/api/auth/refresh", {
         method: "POST",
         credentials: "include",
+        signal: ctrl.signal,
       });
       if (res.ok) emitAuthRefreshed();
       return res.ok;
     } catch {
+      // Timeout or network error — treat as a failed refresh. Resolving
+      // false (rather than rejecting) keeps wsClient's `.then()` chain intact
+      // so scheduleReconnect still fires.
       return false;
     } finally {
+      clearTimeout(timer);
       // Clear after a brief delay so a burst of concurrent 401s coalesce on
       // the same refresh promise. Without the delay we could race a second
       // refresh between resolution and the next call's `if (refreshInFlight)`

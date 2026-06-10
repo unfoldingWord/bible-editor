@@ -152,6 +152,18 @@ export function openChapterRoom(
         // Reconnect proceeds whether or not the refresh succeeded; if the
         // session is truly dead the next rejected handshake lands back here
         // (refreshAuthOnce never rejects).
+        //
+        // Skip the refresh while offline: it's guaranteed to fail, and every
+        // *successful* refresh fires onAuthRefreshed → reviveMaxAttemptsFailed,
+        // which resets the retry cap on parked ops. During a partial outage the
+        // pre-open close fires repeatedly; refreshing each cycle would revive
+        // max-attempts ops every reconnect and defeat the cap. The online/focus
+        // listeners and the outbox's own refresh path cover the reconnect once
+        // connectivity returns.
+        if (typeof navigator !== "undefined" && navigator.onLine === false) {
+          scheduleReconnect();
+          return;
+        }
         void refreshAuthOnce().then(() => scheduleReconnect());
         return;
       }

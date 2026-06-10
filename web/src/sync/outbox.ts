@@ -126,7 +126,18 @@ async function listAll(): Promise<OutboxOp[]> {
   return all;
 }
 
+// Coalesce notify() calls onto a single microtask. drainPass calls notify()
+// twice per drained op (after the in_flight flip, after the result persists),
+// and each call does a full-store read + sort. Batching collapses a burst of
+// calls in the same tick into one read+broadcast; subscribers only care about
+// the latest snapshot anyway.
+let notifyScheduled = false;
 async function notify() {
+  if (subscribers.size === 0) return;
+  if (notifyScheduled) return;
+  notifyScheduled = true;
+  await Promise.resolve();
+  notifyScheduled = false;
   if (subscribers.size === 0) return;
   const all = await listAll();
   for (const s of subscribers) s(all);
@@ -283,42 +294,50 @@ export const outbox = {
     }
     const idb = await db();
     const key = `vstatus:${book}:${chapter}:${verse}`;
-    const all = (await idb.getAll(STORE)) as OutboxOp[];
+    // Find-and-rewrite in a SINGLE readwrite transaction. The old two-step
+    // (getAll in one tx, put in another) raced the drain: between the read
+    // and the write, drain could flip the found op pending → in_flight and
+    // delete it on 200, so our coalesced payload landed on a doomed op and
+    // the toggle vanished unsent. One tx makes the check-and-rewrite atomic
+    // against drain's own single-tx pending → in_flight transition.
+    //
     // Coalesce only into *pending* ops. Rewriting an in_flight op's payload
-    // races the drain worker: the request already left with the old payload,
-    // and the 200 handler deletes the op — the rewritten toggle would vanish
-    // unsent. If the only op for this verse is mid-flight, fall through and
-    // queue a fresh one behind it (upsert route, no If-Match, so it simply
-    // lands after).
+    // races the drain worker regardless of tx boundaries (the request already
+    // left with the old payload, and the 200 handler deletes the op). If the
+    // only op for this verse is mid-flight, queue a fresh one behind it
+    // (upsert route, no If-Match, so it simply lands after).
+    const tx = idb.transaction(STORE, "readwrite");
+    const all = (await tx.store.getAll()) as OutboxOp[];
     const pending = all.find(
       (o) => targetKey(o.target) === key && o.status === "pending",
     );
+    let result: OutboxOp;
     if (pending) {
       // Coalesce: rewrite the existing op's payload rather than queue a
       // second one that would just race to overwrite the first.
       pending.patch = { done };
       pending.queuedAt = Date.now();
       pending.seq = nextSeq();
-      await idb.put(STORE, pending);
-      void notify();
-      void drain();
-      return pending;
+      await tx.store.put(pending);
+      result = pending;
+    } else {
+      result = {
+        id: uid(),
+        target: { kind: "verse_status", book, chapter, verse },
+        action: "patch",
+        patch: { done },
+        expectedVersion: 0,
+        queuedAt: Date.now(),
+        seq: nextSeq(),
+        attempts: 0,
+        status: "pending",
+      };
+      await tx.store.put(result);
     }
-    const op: OutboxOp = {
-      id: uid(),
-      target: { kind: "verse_status", book, chapter, verse },
-      action: "patch",
-      patch: { done },
-      expectedVersion: 0,
-      queuedAt: Date.now(),
-      seq: nextSeq(),
-      attempts: 0,
-      status: "pending",
-    };
-    await idb.put(STORE, op);
+    await tx.done;
     void notify();
     void drain();
-    return op;
+    return result;
   },
 
   // Re-arm a conflicted op against the freshly-observed server version. Also
@@ -477,16 +496,37 @@ async function dispatch(op: OutboxOp): Promise<Result> {
 // dispatchedAt so we never re-arm another live tab's in-flight request
 // (the request can't outlast its timeout; see IN_FLIGHT_RECOVERY_AGE_MS).
 // Records without dispatchedAt predate the field — recover them as before.
-async function recoverInFlight() {
+//
+// Returns the soonest wall-clock at which a *young* (skipped) in-flight op
+// becomes recovery-eligible, or undefined if there were none. drainPass uses
+// it to self-schedule the next pass: without it, a save → reload within the
+// recovery age leaves the op in_flight with no pending work and nothing arms
+// a timer, so the edit stalls until an unrelated trigger (focus/online/new
+// enqueue) fires after the age elapses.
+async function recoverInFlight(): Promise<number | undefined> {
   const idb = await db();
-  const all = (await idb.getAll(STORE)) as OutboxOp[];
+  // Query the status index instead of scanning the whole store — only
+  // in_flight ops are candidates here.
+  const inFlight = (await idb
+    .transaction(STORE, "readonly")
+    .store.index("status")
+    .getAll("in_flight")) as OutboxOp[];
   const now = Date.now();
-  const stuck = all.filter(
-    (o) =>
-      o.status === "in_flight" &&
-      (o.dispatchedAt === undefined || now - o.dispatchedAt > IN_FLIGHT_RECOVERY_AGE_MS),
-  );
-  if (stuck.length === 0) return;
+  const stuck: OutboxOp[] = [];
+  let soonestYoungEligibility: number | undefined;
+  for (const o of inFlight) {
+    if (o.dispatchedAt === undefined || now - o.dispatchedAt > IN_FLIGHT_RECOVERY_AGE_MS) {
+      stuck.push(o);
+    } else {
+      // Skipped (another live tab may own it) — track when it would become
+      // eligible so the caller can re-check then.
+      const eligibleAt = o.dispatchedAt + IN_FLIGHT_RECOVERY_AGE_MS;
+      if (soonestYoungEligibility === undefined || eligibleAt < soonestYoungEligibility) {
+        soonestYoungEligibility = eligibleAt;
+      }
+    }
+  }
+  if (stuck.length === 0) return soonestYoungEligibility;
   const tx = idb.transaction(STORE, "readwrite");
   for (const o of stuck) {
     o.status = "pending";
@@ -494,6 +534,7 @@ async function recoverInFlight() {
     await tx.store.put(o);
   }
   await tx.done;
+  return soonestYoungEligibility;
 }
 
 // A 200 means the server's version for this target just advanced; sibling
@@ -526,7 +567,7 @@ async function threadVersionToSiblings(done: OutboxOp, updated: unknown) {
 }
 
 async function drainPass() {
-  await recoverInFlight();
+  const youngInFlightEligibleAt = await recoverInFlight();
   // Targets with an unresolved conflict are skipped for *this* pass but
   // we keep draining other targets so a single hot row doesn't freeze
   // the entire queue.
@@ -543,14 +584,40 @@ async function drainPass() {
     for (const o of ops) {
       if (o.status === "conflict") blocked.add(targetKey(o.target));
     }
-    const next = ops.find(
+    let next = ops.find(
       (o) => o.status === "pending" && !blocked.has(targetKey(o.target)),
     );
-    if (!next) break;
-    next.status = "in_flight";
-    next.attempts += 1;
-    next.dispatchedAt = Date.now();
-    await (await db()).put(STORE, next);
+    if (!next) {
+      // No pending work, but recoverInFlight skipped a young in-flight op
+      // (its dispatching tab may have crashed/reloaded). Nothing else will
+      // re-check it — the retry-backoff and online/focus triggers only fire
+      // on other events — so schedule a pass for when it becomes recovery-
+      // eligible, plus a small margin to clear the age threshold. This keeps
+      // the retry chain self-continuing instead of stalling for the full age.
+      if (youngInFlightEligibleAt !== undefined) {
+        scheduleDrain(Math.max(0, youngInFlightEligibleAt - Date.now()) + 250);
+      }
+      break;
+    }
+    // Re-read the record fresh inside the same readwrite tx that flips it
+    // in_flight, rather than trusting the snapshot listAll() handed us. A
+    // verse-status coalesce (enqueueVerseStatus) may have rewritten this op's
+    // payload after listAll() read it; dispatching the stale `next` would
+    // ship the pre-coalesce value and the toggle would be lost. Re-reading
+    // here picks up the coalesced payload; if the op vanished or is no longer
+    // pending (another path claimed it), skip and re-loop.
+    const tx = (await db()).transaction(STORE, "readwrite");
+    const fresh = (await tx.store.get(next.id)) as OutboxOp | undefined;
+    if (!fresh || fresh.status !== "pending") {
+      await tx.done;
+      continue;
+    }
+    fresh.status = "in_flight";
+    fresh.attempts += 1;
+    fresh.dispatchedAt = Date.now();
+    await tx.store.put(fresh);
+    await tx.done;
+    next = fresh;
     void notify();
 
     let result: Result;
@@ -670,9 +737,14 @@ function scheduleDrain(ms: number) {
 // forever (drain only picks up `pending`), one discard click from gone.
 async function reviveMaxAttemptsFailed() {
   const idb = await db();
-  const all = (await idb.getAll(STORE)) as OutboxOp[];
-  const revivable = all.filter(
-    (o) => o.status === "failed" && o.lastError === "max_attempts_exceeded",
+  // Only `failed` ops are candidates — query the status index rather than
+  // scanning the whole store.
+  const failedOps = (await idb
+    .transaction(STORE, "readonly")
+    .store.index("status")
+    .getAll("failed")) as OutboxOp[];
+  const revivable = failedOps.filter(
+    (o) => o.lastError === "max_attempts_exceeded",
   );
   if (revivable.length === 0) return;
   const tx = idb.transaction(STORE, "readwrite");
