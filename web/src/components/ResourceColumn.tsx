@@ -287,9 +287,33 @@ export function ResourceColumn({
       target = root.querySelector<HTMLElement>(`[data-verse-group="${activeVerse}"]`);
       isVerseGroup = !!target;
     }
+    // Pinned notes, active verse has no notes of its own: there's no group
+    // head to land on, so fall back to the end of the previous verse's notes
+    // (the last note card before the active verse's slot in the chapter).
+    let atVerseEnd = false;
+    if (!target && pinned.notes) {
+      const heads = [...root.querySelectorAll<HTMLElement>('[data-vg-section="notes"]')];
+      const prevHead = heads
+        .filter((el) => Number(el.dataset.verseGroup) < activeVerse)
+        .at(-1);
+      if (prevHead) {
+        // Walk forward over the previous verse's note cards, stopping at the
+        // next verse group head; the last card is the end of that verse.
+        let lastNote = prevHead;
+        for (
+          let el = prevHead.nextElementSibling;
+          el && !el.hasAttribute("data-verse-group");
+          el = el.nextElementSibling
+        ) {
+          if (el.hasAttribute("data-note-id")) lastNote = el as HTMLElement;
+        }
+        target = lastNote;
+        atVerseEnd = true;
+      }
+    }
     target?.scrollIntoView({
       behavior: "smooth",
-      block: isVerseGroup ? "start" : fromButton ? "center" : "nearest",
+      block: isVerseGroup ? "start" : atVerseEnd ? "end" : fromButton ? "center" : "nearest",
     });
   }, [
     scrollNonce,
@@ -415,7 +439,7 @@ export function ResourceColumn({
           ) : (
             tnGroups.map(([verse, rows]) => (
               <Fragment key={`tn-${verse}`}>
-                <VerseGroupHead verse={verse} active={verse === activeVerse} />
+                <VerseGroupHead verse={verse} active={verse === activeVerse} section="notes" />
                 {rows.map((r) => renderNoteCard(r, rows))}
               </Fragment>
             ))
@@ -446,7 +470,7 @@ export function ResourceColumn({
           ) : (
             twlGroups.map(([verse, rows]) => (
               <Fragment key={`twl-${verse}`}>
-                <VerseGroupHead verse={verse} active={verse === activeVerse} />
+                <VerseGroupHead verse={verse} active={verse === activeVerse} section="words" />
                 <WordsTable
                   rows={rows}
                   activeId={activeWordId}
@@ -491,7 +515,7 @@ export function ResourceColumn({
           ) : (
             tqGroups.map(([verse, rows]) => (
               <Fragment key={`tq-${verse}`}>
-                <VerseGroupHead verse={verse} active={verse === activeVerse} />
+                <VerseGroupHead verse={verse} active={verse === activeVerse} section="questions" />
                 <QuestionsTable rows={rows} onSave={onQuestionSave} onDelete={onQuestionDelete} locked={locked} />
               </Fragment>
             ))
@@ -596,13 +620,22 @@ function DropIndicator() {
   );
 }
 
-function VerseGroupHead({ verse, active }: { verse: number; active: boolean }) {
+function VerseGroupHead({
+  verse,
+  active,
+  section,
+}: {
+  verse: number;
+  active: boolean;
+  section: PinKey;
+}) {
   return (
     <Stack
       direction="row"
       spacing={1}
       alignItems="center"
       data-verse-group={verse}
+      data-vg-section={section}
       sx={{
         mt: 1,
         mb: 0.25,
