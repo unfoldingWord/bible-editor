@@ -7,6 +7,7 @@
 // src/lib/alignment.test.mjs.
 
 import { smartEditVerse, smartReplaceVerse, tokenizePlainText } from "./replace.ts";
+import { extractEditableText } from "./usfm.ts";
 
 let failed = 0;
 function assert(cond, msg) {
@@ -218,6 +219,69 @@ const makeNested = () => ({
   assert(r.plainText === "a b", `plainText is "a b" (got ${JSON.stringify(r.plainText)})`);
   const words = alignedWords(r.content).map((x) => x.text);
   assert(JSON.stringify(words) === JSON.stringify(["a", "b"]), `splits into "a" + "b" (got ${JSON.stringify(words)})`);
+}
+
+// Count \zaln milestone nodes in a verseObjects tree.
+function milestoneCount(content) {
+  let n = 0;
+  const walk = (nodes) => {
+    for (const x of nodes ?? []) {
+      if (!x || typeof x !== "object") continue;
+      if (x.tag === "zaln") n++;
+      if (Array.isArray(x.children)) walk(x.children);
+    }
+  };
+  walk(content.verseObjects);
+  return n;
+}
+
+// ─── Case 13: editing inline \q markers must NOT drop alignment ───────────
+// Regression for the HOS 6:1 ULT prod incident: removing poetry markers (the
+// trailing \q1 kills the diff's common suffix) ballooned the bounding change
+// across the verse and flattened all 10 \zaln milestones. A marker-only edit
+// changes no word text, so alignment must survive intact.
+{
+  console.log("\n[Case 13] Removing \\q markers preserves every \\zaln milestone");
+  const q = (tag) => ({ type: "quote", tag });
+  // "Come, \q2 for he. \q1" with each content word aligned.
+  const verse = {
+    verseObjects: [
+      zaln("H1", [w("Come")]), t(", "),
+      q("q2"),
+      zaln("H2", [w("for")]), t(" "), zaln("H3", [w("he")]), t("."),
+      q("q1"),
+    ],
+  };
+  const old = extractEditableText(verse);
+  assert(old === "Come, \\q2 for he.\\q1", `baseline surfaces markers (got ${JSON.stringify(old)})`);
+  // User deletes both \q markers; no word/punctuation changes.
+  const r = smartEditVerse(verse, old, "Come, for he.");
+  assert(r.preservedAlignment === true, "marker-only removal keeps preservedAlignment true");
+  assert(milestoneCount(r.content) === 3, `all 3 milestones survive (got ${milestoneCount(r.content)})`);
+  assert(r.plainText === "Come, for he.", `text unchanged (got ${JSON.stringify(r.plainText)})`);
+  assert(!r.content.verseObjects.some((n) => n.type === "quote"), "the \\q markers are gone");
+  const aligned = alignedWords(r.content).map((x) => x.text);
+  assert(JSON.stringify(aligned) === JSON.stringify(["Come", "for", "he"]), `all words stay aligned (got ${JSON.stringify(aligned)})`);
+}
+
+// ─── Case 14: moving a \q marker keeps alignment and repositions it ───────
+{
+  console.log("\n[Case 14] Moving a \\q marker preserves alignment");
+  const q = (tag) => ({ type: "quote", tag });
+  const verse = {
+    verseObjects: [zaln("H1", [w("Come")]), t(", "), q("q2"), zaln("H2", [w("for")]), t(" "), zaln("H3", [w("he")]), t(".")],
+  };
+  const old = extractEditableText(verse); // "Come, \q2 for he."
+  // Move the marker to sit before "he" instead of before "for".
+  const r = smartEditVerse(verse, old, "Come, for \\q2 he.");
+  assert(r.preservedAlignment === true, "marker move keeps preservedAlignment true");
+  assert(milestoneCount(r.content) === 3, `all 3 milestones survive the move (got ${milestoneCount(r.content)})`);
+  // Marker now sits between the "for" and "he" milestones (a space text node
+  // may separate the marker from "he" — both round-trip to a break before "he").
+  const idx = r.content.verseObjects.findIndex((n) => n.type === "quote");
+  const forIdx = r.content.verseObjects.findIndex((n) => n.tag === "zaln" && n.strong === "H2");
+  const heIdx = r.content.verseObjects.findIndex((n) => n.tag === "zaln" && n.strong === "H3");
+  assert(idx > forIdx && idx < heIdx, `marker re-anchored between "for" and "he" (markerIdx ${idx}, forIdx ${forIdx}, heIdx ${heIdx})`);
 }
 
 if (failed > 0) {

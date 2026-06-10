@@ -19,7 +19,7 @@
 // Pure insertions (oldLen === 0) and pure deletions (newSubstring === "")
 // flow through the localized rewrite path too.
 
-import { normalizeEditable } from "./usfm.ts";
+import { normalizeEditable, isInFlowMarker } from "./usfm.ts";
 
 export interface SmartReplaceResult {
   content: unknown;
@@ -638,6 +638,75 @@ function snapDiffToWordBoundaries(
   return { start, oldLen: end - start, newSubstring: newText.slice(start, newEnd) };
 }
 
+// A marker-only edit changes which inert position-anchor markers (\p, \q1,
+// \q2, \ts\*) the verse carries — or where they sit — without altering any
+// word or punctuation text. In editable space those markers ARE text tokens,
+// so diffSingleChange sees the edit as a text change: removing the trailing
+// \q1 kills the common suffix, so the bounding change balloons across the
+// whole verse and localizedRewriteVerse flattens every \zaln milestone.
+//
+// Markers have no raw text, so handle them structurally instead: keep every
+// non-marker top-level node (words, text, milestones — and thus all
+// alignment) verbatim, drop the existing inert markers, and re-insert the
+// edited verse's markers at their new positions. Position is anchored by the
+// number of words that precede each marker, which is robust to whitespace
+// differences between editable and raw text. A marker whose anchor falls
+// inside a multi-word milestone lands just after that milestone rather than
+// splitting it — a cosmetic line-break placement at worst, never a loss of
+// alignment or text.
+function reconcileMarkerOnlyEdit(content: unknown, newPlain: string): SmartReplaceResult {
+  const verseObjects = (content as { verseObjects?: unknown[] } | null)?.verseObjects;
+  if (!Array.isArray(verseObjects)) {
+    return {
+      content: { verseObjects: tokenizeEditableText(newPlain) },
+      plainText: normalize(newPlain),
+      preservedAlignment: false,
+    };
+  }
+  const cloned = cloneVerseObjects(verseObjects);
+  // Every node that isn't an inert in-flow marker is kept exactly — this is
+  // where the \w words and \zaln milestones live. (Markers only ever sit at
+  // top level in aligned source: they wrap milestones, never nest inside one.)
+  const contentNodes = cloned.filter((n) => !isInFlowMarker(n));
+
+  const countWords = (s: string): number => [...s.matchAll(WORD_RUN_RE)].length;
+
+  // The edited verse's marker layout, each anchored by how many words precede it.
+  const markers: { node: unknown; wordsBefore: number }[] = [];
+  const re = new RegExp(MARKER_TOKEN_RE.source, MARKER_TOKEN_RE.flags);
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(newPlain)) !== null) {
+    const wordsBefore = countWords(stripMarkerTokens(newPlain.slice(0, m.index)));
+    markers.push({ node: nodeForMarker(m[1]), wordsBefore });
+    if (m[0].length === 0) re.lastIndex++;
+  }
+
+  // Walk the content nodes, inserting each marker before the node at which the
+  // running word count first reaches its anchor.
+  const out: unknown[] = [];
+  let wordCount = 0;
+  let mi = 0;
+  for (const node of contentNodes) {
+    while (mi < markers.length && markers[mi].wordsBefore <= wordCount) {
+      out.push(markers[mi].node);
+      mi++;
+    }
+    out.push(node);
+    wordCount += countWords(rawTextOfNode(node));
+  }
+  while (mi < markers.length) {
+    out.push(markers[mi].node);
+    mi++;
+  }
+
+  const newRaw = rebuildRaw(out);
+  return {
+    content: { verseObjects: out },
+    plainText: normalize(newRaw),
+    preservedAlignment: true,
+  };
+}
+
 // Top-level entry point for "the user just typed in a contentEditable
 // representation of this verse's plain text — please update the
 // verseObjects without nuking alignment for unchanged parts."
@@ -663,37 +732,48 @@ export function smartEditVerse(
   if (oldPlain === newPlain) {
     return { content, plainText: oldPlain, preservedAlignment: true };
   }
-  const rawDiff = diffSingleChange(oldPlain, newPlain);
-  if (rawDiff.oldLen === 0 && rawDiff.newSubstring === "") {
-    return { content, plainText: oldPlain, preservedAlignment: true };
-  }
-  // A word-extending insertion ("Th" typed before "is") diffs as a pure
-  // insert; snap it to the adjacent word so it routes through the in-place
-  // word-replace path instead of emitting a standalone \w. (ZEC 5:3.)
-  const diff = snapDiffToWordBoundaries(oldPlain, newPlain, rawDiff);
-  // Word-count-match preserve path lives in smartReplaceVerse.
   let result: SmartReplaceResult;
-  if (diff.oldLen > 0) {
-    const matchText = oldPlain.slice(diff.start, diff.start + diff.oldLen);
-    const escaped = matchText.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    const re = new RegExp(escaped, "g");
-    result = smartReplaceVerse(
-      content,
-      oldPlain,
-      re,
-      diff.start,
-      diff.oldLen,
-      diff.newSubstring,
-    );
+  // Marker-only edit: an in-flow marker (\p, \q1, \q2, \ts\*) was added,
+  // removed, or moved but no word/punctuation text changed. Strip the markers
+  // from both sides; if what's left is identical, reconcile the markers on the
+  // tree directly so every \zaln milestone survives. Without this, removing a
+  // marker (especially the trailing one, which kills the diff's common suffix)
+  // balloons the bounding change across the verse and the localized rewrite
+  // flattens all alignment.
+  if (normalizeEditable(stripMarkerTokens(oldPlain)) === normalizeEditable(stripMarkerTokens(newPlain))) {
+    result = reconcileMarkerOnlyEdit(content, newPlain);
   } else {
-    // Pure insertion — no matchText, can't do word-count preserve.
-    result = localizedRewriteVerse(
-      content,
-      oldPlain,
-      diff.start,
-      0,
-      diff.newSubstring,
-    );
+    const rawDiff = diffSingleChange(oldPlain, newPlain);
+    if (rawDiff.oldLen === 0 && rawDiff.newSubstring === "") {
+      return { content, plainText: oldPlain, preservedAlignment: true };
+    }
+    // A word-extending insertion ("Th" typed before "is") diffs as a pure
+    // insert; snap it to the adjacent word so it routes through the in-place
+    // word-replace path instead of emitting a standalone \w. (ZEC 5:3.)
+    const diff = snapDiffToWordBoundaries(oldPlain, newPlain, rawDiff);
+    // Word-count-match preserve path lives in smartReplaceVerse.
+    if (diff.oldLen > 0) {
+      const matchText = oldPlain.slice(diff.start, diff.start + diff.oldLen);
+      const escaped = matchText.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const re = new RegExp(escaped, "g");
+      result = smartReplaceVerse(
+        content,
+        oldPlain,
+        re,
+        diff.start,
+        diff.oldLen,
+        diff.newSubstring,
+      );
+    } else {
+      // Pure insertion — no matchText, can't do word-count preserve.
+      result = localizedRewriteVerse(
+        content,
+        oldPlain,
+        diff.start,
+        0,
+        diff.newSubstring,
+      );
+    }
   }
   // Final defense-in-depth: strip any leading/trailing non-letter chars
   // off every `\w` text into adjacent text nodes. Mirrors the server-side
