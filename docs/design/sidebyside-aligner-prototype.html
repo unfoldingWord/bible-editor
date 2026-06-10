@@ -1,0 +1,436 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Side-by-side ULT / UST aligner — full-width popup (A · Mirror)</title>
+<style>
+  /* ── unfoldingWord brand palette ──────────────────────────────────── */
+  :root {
+    --inspire:  #31ADE3;   /* primary blue — accents, exact-match ring   */
+    --ocean:    #014263;   /* deep blue — headers                        */
+    --tech:     #231F20;   /* near-black — body text                     */
+    --cultivate:#70C9CC;   /* light teal                                 */
+    --kindle:   #E59D33;   /* warm accent — linked (cross-language) ring */
+    --line:     #e0e0e0;
+    --paper:    #ffffff;
+    --bg:       #f4f6f8;
+    --grey100:  #f4f5f7;   /* inventory strip background (MUI grey.100)  */
+    --grey50:   #fafafa;   /* aligned-chip background                    */
+    --label:    #8a9099;
+    --warnbg:   #ffe2b8;   /* unaligned count chip (warning.light)       */
+    --warntx:   #6b4a16;
+    --grip:     #cfcfcf;
+    --chipsup:  var(--inspire);
+    --backdrop: rgba(2,18,28,.42);
+  }
+  /* No theme toggle — follow the environment (the real popup inherits the app theme). */
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --tech:     #e8eaed;
+      --paper:    #1e1e1e;
+      --bg:       #121212;
+      --line:     #3a3a3a;
+      --grey100:  #181a1c;
+      --grey50:   #242628;
+      --label:    #888e96;
+      --warnbg:   #4a3514;
+      --warntx:   #f0c886;
+      --grip:     #5c5c5c;
+      --chipsup:  #7fd0f0;
+      --backdrop: rgba(0,0,0,.6);
+    }
+    .note { color: #aeb3b7; }
+    .note h3 { color: var(--inspire); }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: "Roboto","Helvetica", system-ui, sans-serif;
+    color: var(--tech); background: var(--bg); -webkit-font-smoothing: antialiased; }
+
+  /* faint "underlying app" so the popup reads as a modal overlay */
+  .appbg { position: fixed; inset: 0; background: var(--bg);
+    background-image: repeating-linear-gradient(0deg, transparent 0 38px, rgba(0,0,0,.025) 38px 39px); }
+  .backdrop { position: fixed; inset: 0; background: var(--backdrop); }
+
+  /* ── the popup ─────────────────────────────────────────────────────── */
+  .popup {
+    position: fixed; inset: 3vh 2.5vw; background: var(--paper);
+    border-radius: 14px; box-shadow: 0 24px 70px rgba(0,0,0,.4);
+    display: flex; flex-direction: column; overflow: hidden;
+  }
+  .titlebar {
+    display: flex; align-items: center; gap: 12px; padding: 11px 16px;
+    background: var(--ocean); color: #fff; flex-shrink: 0;
+  }
+  .titlebar h1 { margin: 0; font-size: 15px; font-weight: 600; }
+  .titlebar .vref { font: 700 12px/1 monospace; background: rgba(255,255,255,.16); padding: 4px 8px; border-radius: 5px; }
+  .titlebar .sub { font-size: 12px; opacity: .8; }
+  .titlebar .sp { flex: 1; }
+  .titlebar button { border: none; background: rgba(255,255,255,.12); color: #fff; cursor: pointer;
+    border-radius: 6px; padding: 6px 10px; font-size: 12px; }
+  .titlebar button:hover { background: rgba(255,255,255,.24); }
+  .titlebar .x { font-size: 18px; line-height: 1; padding: 4px 9px; }
+
+  /* shared, small, scrollable reading strip */
+  .reading { display: grid; grid-template-columns: 1fr 1fr; gap: 1px; background: var(--line);
+    border-bottom: 1px solid var(--line); flex-shrink: 0; }
+  .reading .rc { background: var(--paper); padding: 7px 16px 8px; min-width: 0; }
+  .reading .rl { font: 600 9px/1 monospace; letter-spacing: .16em; text-transform: uppercase; color: var(--label); margin-bottom: 4px; }
+  .reading .scroll { max-height: 46px; overflow-y: auto; font-family: "Times New Roman","Cardo",serif;
+    font-size: 14.5px; line-height: 1.5; color: var(--tech); padding-right: 6px; }
+  .reading .scroll::-webkit-scrollbar { width: 7px; }
+  .reading .scroll::-webkit-scrollbar-thumb { background: var(--line); border-radius: 4px; }
+  .reading .rw { border-radius: 3px; padding: 0 1px; transition: box-shadow .12s, background-color .12s; }
+  /* editable reading text — click to change the English inline */
+  .reading .rl .pen { color: var(--inspire); margin-left: 5px; letter-spacing: 0; text-transform: none; font-weight: 600; }
+  .reading .scroll[contenteditable] { cursor: text; outline: none; border-radius: 4px; padding: 2px 6px; margin: -2px 0;
+    box-shadow: inset 0 0 0 1px var(--line); transition: box-shadow .12s, background-color .12s; }
+  .reading .scroll[contenteditable]:hover { box-shadow: inset 0 0 0 1px var(--inspire); }
+  .reading .scroll[contenteditable]:focus { box-shadow: inset 0 0 0 1.5px var(--inspire);
+    background: color-mix(in srgb, var(--inspire) 5%, var(--paper)); }
+
+  /* two panels side by side */
+  .panes { flex: 1; min-height: 0; display: flex; }
+  .pane { flex: 1; min-width: 0; display: flex; flex-direction: column; overflow: hidden;
+    border-right: 1px solid var(--line); }
+  .pane:last-child { border-right: none; }
+
+  /* ── UHB source strip (faithful to UhbStrip) ───────────────────────── */
+  .uhb { padding: 7px 16px 9px; border-bottom: 1px solid var(--line); background: var(--paper); flex-shrink: 0; }
+  .uhb .row { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
+  .lbl { font: 600 10px/1 monospace; letter-spacing: .16em; text-transform: uppercase; color: var(--label); font-weight: 600; }
+  .uhb .toggle { margin-left: auto; border: none; background: none; color: var(--grip); cursor: pointer; font-size: 13px; padding: 2px 4px; }
+  .uhb-words { direction: rtl; text-align: right; font-family: "Frank Ruhl Libre","Times New Roman","SBL Hebrew", serif;
+    font-size: 21px; line-height: 1.55; display: flex; flex-wrap: wrap; gap: 1px; justify-content: flex-start; }
+  .uhb.collapsed .uhb-words { display: none; }
+
+  /* ── inventory strip (faithful to InventoryStrip — the "word bank") ── */
+  .inv { background: var(--grey100); padding: 7px 16px 10px; flex-shrink: 0; position: relative; border-bottom: 1px solid var(--line); }
+  .inv .row { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+  .countchip { height: 18px; display: inline-flex; align-items: center; padding: 0 7px; border-radius: 9px;
+    font: 700 10px/1 monospace; background: var(--warnbg); color: var(--warntx); }
+  .countchip.zero { background: color-mix(in srgb, var(--inspire) 16%, transparent); color: var(--inspire); }
+  .invtoggle { display: inline-flex; align-items: center; gap: 5px; background: none; border: 0; cursor: pointer;
+    font: 500 11px/1 "Roboto",sans-serif; color: var(--label); padding: 2px; }
+  .invtoggle .box { width: 13px; height: 13px; border-radius: 3px; border: 1.5px solid var(--grip);
+    display: inline-flex; align-items: center; justify-content: center; font-size: 10px; color: #fff; }
+  .invtoggle.on { color: var(--inspire); }
+  .invtoggle.on .box { background: var(--inspire); border-color: var(--inspire); }
+  .invlink { background: none; border: 0; cursor: pointer; font-size: 11px; color: var(--label); padding: 2px 4px; }
+  .chips { display: flex; flex-wrap: wrap; gap: 5px; }
+  .inv .chips { max-height: 92px; overflow-y: auto; padding-top: 6px; }
+  .inv .grip { position: absolute; left: 0; right: 0; bottom: -4px; height: 8px; cursor: ns-resize; }
+  .inv .grip::after { content:""; position:absolute; left:0; right:0; top:50%; height:1px; background: var(--line); }
+  .inv .grip:hover::after { background: var(--inspire); height: 2px; }
+
+  /* chips */
+  .chip { border: 1px solid var(--line); border-radius: 6px; background: var(--paper);
+    padding: 4px 9px; font-size: 13px; height: 26px; line-height: 17px; white-space: nowrap;
+    transition: box-shadow .12s; cursor: grab; user-select: none; }
+  .chip sup { font: 700 9px/1 monospace; color: var(--chipsup); margin-left: 1px; vertical-align: super; }
+  .chip.aligned { background: var(--grey50); color: color-mix(in srgb, var(--tech) 38%, transparent); border-color: color-mix(in srgb, var(--line) 70%, transparent); cursor: default; }
+
+  /* ── section header + cards (faithful to SectionHeader + AlignmentCards) */
+  .sect { display: flex; align-items: baseline; gap: 8px; padding: 9px 16px 6px; flex-shrink: 0; }
+  .sect .hint { margin-left: auto; font-size: 10.5px; color: var(--grip); }
+  .grid-wrap { flex: 1; overflow-y: auto; padding: 4px 14px 18px; }
+  .grid { display: flex; flex-wrap: wrap; gap: 8px; direction: rtl; align-content: flex-start; }
+
+  .card { position: relative; direction: ltr; background: var(--paper); border: 1px solid var(--line);
+    border-radius: 12px; padding: 14px 11px 18px 13px; min-width: 150px; max-width: 250px;
+    display: flex; flex-direction: column; transition: box-shadow .12s, border-color .12s; }
+  .card .close { position: absolute; top: 4px; left: 4px; width: 18px; height: 18px; line-height: 16px;
+    text-align: center; border: none; background: none; color: var(--grip); cursor: pointer; border-radius: 4px; font-size: 14px; }
+  .card .close:hover { color: #d32f2f; }
+  .card .gripb { position: absolute; left: 50%; transform: translateX(-50%); bottom: 4px; width: 44px; height: 9px;
+    border-radius: 6px; cursor: grab; color: var(--grip); opacity: .7;
+    background: radial-gradient(circle, currentColor 1.3px, transparent 1.7px) center / 8px 6px repeat-x; }
+  .card .gripb:hover { color: var(--inspire); opacity: 1; }
+  .hebrew { direction: rtl; text-align: right; font-family: "Frank Ruhl Libre","Times New Roman","SBL Hebrew", serif;
+    font-size: 22px; line-height: 1.5; margin-bottom: 7px; padding-left: 20px; color: var(--tech);
+    display: flex; flex-wrap: wrap; gap: 1px; justify-content: flex-start; }
+  .heb-w { position: relative; padding: 1px 6px; white-space: nowrap; border-radius: 5px; cursor: grab;
+    transition: box-shadow .12s, background-color .12s; }
+  .heb-w:hover { background: color-mix(in srgb, var(--tech) 6%, transparent); }
+  .heb-w sup { position: absolute; top: -2px; right: 1px; font: 700 9px/1 monospace; color: var(--inspire); }
+  .card .chips { gap: 5px; }
+  .empty-drop { width: 100%; border: 1px dashed var(--line); border-radius: 7px; padding: 5px 8px;
+    font-size: 11.5px; color: var(--grip); font-style: italic; text-align: center; }
+
+  /* action bar (faithful to ActionBar) */
+  .actbar { display: flex; align-items: center; gap: 4px; padding: 8px 12px; border-top: 1px solid var(--line);
+    background: var(--paper); flex-shrink: 0; }
+  .actbar .editing { font: 600 10px/1 monospace; color: var(--grip); }
+  .actbar .sp { flex: 1; }
+  .actbar button { border: none; background: none; cursor: pointer; font: 600 11px/1 "Roboto",sans-serif;
+    letter-spacing: .06em; text-transform: uppercase; padding: 6px 8px; border-radius: 5px; color: var(--label); }
+  .actbar .clear { color: #d32f2f; }
+  .actbar .save { background: var(--inspire); color: #fff; padding: 6px 16px; }
+  .actbar .save:hover { background: #2698c9; }
+
+  /* ── cross-panel hover tones ───────────────────────────────────────── */
+  .heb-w.exact, .uhb-words .heb-w.exact { box-shadow: 0 0 0 2px var(--inspire); background: color-mix(in srgb, var(--inspire) 12%, transparent); }
+  .heb-w.linked { box-shadow: 0 0 0 2px var(--kindle); }
+  .chip.linked  { box-shadow: 0 0 0 2px var(--kindle); }
+  .rw.exact { box-shadow: 0 0 0 2px var(--inspire); }
+  .rw.linked { box-shadow: 0 0 0 2px var(--kindle); background: color-mix(in srgb, var(--kindle) 14%, transparent); }
+
+  .feeds { color: var(--grip); font-size: 16px; }
+  .note { padding: 14px 24px 40px; max-width: 96ch; color: #777; font-size: 13px; line-height: 1.6; background: var(--bg); }
+  .note h3 { color: var(--ocean); font-size: 13.5px; margin: 14px 0 5px; }
+  .note code { background: color-mix(in srgb, var(--tech) 8%, transparent); padding: 1px 5px; border-radius: 4px; font-size: 12px; }
+  .note .eg { font-family: "Frank Ruhl Libre", serif; font-size: 16px; }
+</style>
+</head>
+<body>
+
+<div class="appbg"></div>
+<div class="backdrop"></div>
+
+<div class="popup">
+  <div class="titlebar">
+    <span class="vref">ZEC 4:4</span>
+    <h1>Align side-by-side</h1>
+    <span class="sub">ULT ↔ UST · both aligned to UHB · hover Hebrew to bridge</span>
+    <span class="sp"></span>
+    <button class="x" title="close">✕</button>
+  </div>
+
+  <!-- small scrollable reading text (the bit you asked to keep) -->
+  <div class="reading">
+    <div class="rc"><div class="rl">ULT · reading text <span class="pen">✎ editable</span></div>
+      <div class="scroll" id="read-ult" contenteditable="true" spellcheck="false"></div></div>
+    <div class="rc"><div class="rl">UST · reading text <span class="pen">✎ editable</span></div>
+      <div class="scroll" id="read-ust" contenteditable="true" spellcheck="false"></div></div>
+  </div>
+
+  <!-- ONE shared UHB source strip — both bibles align to the same Hebrew -->
+  <div id="uhb-host"></div>
+
+  <div class="panes" id="panes"></div>
+</div>
+
+<div class="note">
+  <h3>What changed from the first mockup</h3>
+  Now it's <b>layout A only</b>, and each side is the <b>existing AlignmentPanel verbatim</b>, top to bottom:
+  the <b>UHB source strip</b>, then the <b>word inventory strip</b> (your real "word bank" — every word in stream order,
+  aligned ones greyed, unaligned ones live & draggable, with the <code>colors</code> / <code>hover-link</code> toggles and the
+  resize grip), then <b>Groups · n</b>, the cards, and the action bar with its own <b>Save</b>. No bottom word bank.
+  The only new chrome is the popup frame and the small shared reading strip up top.
+
+  <h3>Both editable</h3>
+  Each panel saves its own version independently — ULT and UST are different <code>bible_version</code>s, so their outbox
+  PATCHes don't collide (different <code>If-Match</code> targets). Two action bars, two Save buttons.
+
+  <h3>The cross-panel hover (whole-group, on by default)</h3>
+  Hovering a Hebrew word rings its <b>exact twin</b> in the other panel (blue), and rings that word's <b>whole group</b> in each
+  panel (gold — the English it maps to, plus any sibling Hebrew the group combines). Hover <span class="eg">וָאַ֗עַן</span>:
+  ULT lights only "And&nbsp;I&nbsp;answered"; UST lights <span class="eg">וָאַ֗עַן וָאֹמַ֔ר</span> → "I&nbsp;asked" — the split-vs-combine,
+  instantly. Governed by the existing per-panel <code>hover-link</code> toggle; lifting that hover state to the popup is the one
+  real code change.
+
+  <h3>Edit the English inline (reading strip)</h3>
+  The top reading strip is <b>editable</b> — click into either side and change the wording without leaving the aligner
+  (try it). In the real app this routes through the existing smart-edit path (<code>replace.ts</code> / <code>alignment.ts</code>):
+  when a word-count-preserving change is made, alignments survive; otherwise the touched words drop back to the inventory as
+  unaligned, exactly like editing in a normal scripture column. The edit saves the target verse via the same outbox PATCH, then
+  the inventory and cards below re-derive. So: tweak the English up top, re-align the chips below — one view.
+
+  <h3>Settled</h3>
+  • <b>One shared UHB strip</b> across the top (both bibles align to the same Hebrew) — collapsible via the ▾. &nbsp;•
+  <b>Reading strip kept.</b> &nbsp;• <b>Two per-panel Save buttons</b> (independent saves). &nbsp;• <b>No theme toggle</b> —
+  the popup follows the app/environment theme (this mockup respects <code>prefers-color-scheme</code>).
+</div>
+
+<script>
+// ── Shared model — ZEC 4:4, first clause. Hebrew is ONE sequence; both
+//    bibles reference it by id (mirrors strong|occurrence being global). ──
+const HEB = [
+  { id:"h0", t:"וָאַ֗עַן",     o:0 },
+  { id:"h1", t:"וָאֹמַ֔ר",     o:1, occ:1 },
+  { id:"h2", t:"אֶל",         o:2 },
+  { id:"h3", t:"הַמַּלְאָ֖ךְ",   o:3 },
+  { id:"h4", t:"הַדֹּבֵ֥ר",     o:4 },
+  { id:"h5", t:"בִּ֛י",        o:5 },
+  { id:"h6", t:"לֵאמֹ֑ר",      o:6, occ:2 },
+];
+const HEB_BY_ID = Object.fromEntries(HEB.map(h => [h.id, h]));
+
+// ULT — fully aligned, splits the verbs.
+const ULT = {
+  version: "ULT",
+  reading: ["And","I","answered","and","said","to","the","angel","who","was","speaking","with","me",",","saying",","],
+  groups: [
+    { id:"u0", heb:["h0"], chips:["And","I","answered"] },
+    { id:"u1", heb:["h1"], chips:["and","said"] },
+    { id:"u2", heb:["h2"], chips:["to"] },
+    { id:"u3", heb:["h3"], chips:["the","angel"] },
+    { id:"u4", heb:["h4"], chips:["who","was","speaking"] },
+    { id:"u5", heb:["h5"], chips:["with","me"] },
+    { id:"u6", heb:["h6"], chips:["saying"] },
+  ],
+};
+// UST — mid-work: combines verbs and prep+noun; הַדֹּבֵר not yet aligned.
+const UST = {
+  version: "UST",
+  reading: ["I","asked","the","angel","who","was","talking","with","me",","],
+  groups: [
+    { id:"s0", heb:["h0","h1"], chips:["I","asked"] },        // ← combines what ULT split
+    { id:"s1", heb:["h2","h3"], chips:["the","angel"] },      // ← combines prep + noun
+    { id:"s2", heb:["h4"], chips:[] },                        // ← empty: who/was/talking still in the bank
+    { id:"s3", heb:["h5"], chips:["with","me"] },
+  ],
+  unaligned: ["who","was","talking"],
+};
+
+function groupIndex(b){ const m={}; for(const g of b.groups) for(const h of g.heb) m[h]=g; return m; }
+const IDX = { ULT: groupIndex(ULT), UST: groupIndex(UST) };
+
+// build the per-version word inventory (stream order, aligned flag) from the
+// reading text: a reading word that appears as a group chip is "aligned".
+function inventory(b){
+  const pool = {};
+  for (const g of b.groups) for (const c of g.chips) pool[c] = (pool[c]||0)+1;
+  const out = [];
+  for (const w of b.reading){
+    if (/^[,.;:]$/.test(w)) continue;
+    if (pool[w] > 0){ pool[w]--; out.push({ w, aligned:true }); }
+    else out.push({ w, aligned:false });
+  }
+  return out;
+}
+
+let groupLink = true;            // "hover lights whole group" — on by default
+let hoverLinkOn = true;          // the existing per-panel "hover-link" toggle
+const panes = document.getElementById("panes");
+const body = document.body;
+
+// ── builders ────────────────────────────────────────────────────────────
+const hebWordHTML = h => `<span class="heb-w" data-heb="${h.id}">${h.t}${h.occ?`<sup>${h.occ}</sup>`:""}</span>`;
+
+function cardHTML(g){
+  const heb = g.heb.map(id => hebWordHTML(HEB_BY_ID[id])).join("");
+  const chips = g.chips.length
+    ? g.chips.map(c => `<span class="chip" data-chip>${c}</span>`).join("")
+    : `<span class="empty-drop">drop English here</span>`;
+  const showClose = g.chips.length > 0 || g.heb.length > 1;
+  return `<div class="card" data-group="${g.id}">
+    ${showClose ? `<button class="close" title="clear group">×</button>` : ""}
+    <div class="hebrew">${heb}</div>
+    <div class="chips">${chips}</div>
+    <div class="gripb" title="drag onto another card to merge"></div>
+  </div>`;
+}
+
+function invHTML(b){
+  const items = inventory(b);
+  const unaligned = items.filter(i => !i.aligned).length;
+  const chips = items.map(i =>
+    `<span class="chip${i.aligned?" aligned":""}">${i.w}</span>`).join("");
+  return `<div class="inv">
+    <div class="row">
+      <span class="lbl">${b.version} words</span>
+      <span class="countchip${unaligned?"":" zero"}">${unaligned} unaligned</span>
+      <span class="sp" style="flex:1"></span>
+      <button class="invtoggle"><span class="box"></span>colors</button>
+      <button class="invtoggle on" data-link><span class="box">✓</span>hover-link</button>
+      <button class="invlink">show only unaligned</button>
+    </div>
+    <div class="chips">${chips}</div>
+    <div class="grip" title="drag to resize"></div>
+  </div>`;
+}
+
+// ONE shared UHB strip across the full popup width (both bibles align to it).
+function uhbSharedHTML(){
+  return `<div class="uhb">
+    <div class="row"><span class="lbl">UHB · source (shared)</span><button class="toggle" title="hide source">▾</button></div>
+    <div class="uhb-words">${HEB.map(hebWordHTML).join("")}</div>
+  </div>`;
+}
+
+function paneHTML(b){
+  const gs = [...b.groups].sort((a,c)=>HEB_BY_ID[a.heb[0]].o - HEB_BY_ID[c.heb[0]].o);
+  return `<div class="pane" data-version="${b.version}">
+    ${invHTML(b)}
+    <div class="sect"><span class="lbl">Groups · ${b.groups.length}</span>
+      <span class="hint">drag chips · dbl-click Hebrew to split · dbl-click English to unalign</span></div>
+    <div class="grid-wrap"><div class="grid">${gs.map(cardHTML).join("")}</div></div>
+    <div class="actbar"><span class="editing">editing ${b.version}</span><span class="sp"></span>
+      <button class="clear">Clear</button><button>Reset</button>
+      <button class="save">Save ${b.version}</button></div>
+  </div>`;
+}
+
+function renderReading(){
+  const build = b => b.reading.map(w => {
+    if (/^[,.;:]$/.test(w)) return `<span>${w} </span>`;
+    const g = b.groups.find(g => g.chips.includes(w));
+    return `<span class="rw" data-group="${g?g.id:""}">${w}</span> `;
+  }).join("");
+  document.getElementById("read-ult").innerHTML = build(ULT);
+  document.getElementById("read-ust").innerHTML = build(UST);
+}
+
+function render(){
+  document.getElementById("uhb-host").innerHTML = uhbSharedHTML();
+  panes.innerHTML = paneHTML(ULT) + paneHTML(UST);
+  renderReading();
+  wire();
+}
+
+// ── cross-panel hover ─────────────────────────────────────────────────────
+function clearHL(){ document.querySelectorAll(".exact,.linked").forEach(e=>e.classList.remove("exact","linked")); }
+function lightHeb(hebId){
+  clearHL();
+  if (!hoverLinkOn) return;
+  document.querySelectorAll(`.heb-w[data-heb="${hebId}"]`).forEach(e=>e.classList.add("exact"));
+  for (const v of ["ULT","UST"]){
+    const g = IDX[v][hebId]; if (!g) continue;
+    // English the group maps to (scoped by unique group id → correct per panel)
+    document.querySelectorAll(`.card[data-group="${g.id}"] .chip, .rw[data-group="${g.id}"]`).forEach(e=>e.classList.add("linked"));
+    if (groupLink){
+      for (const hid of g.heb){
+        if (hid === hebId) continue;
+        document.querySelectorAll(`.card[data-group="${g.id}"] .heb-w[data-heb="${hid}"]`).forEach(e=>e.classList.add("linked"));
+      }
+    }
+  }
+}
+function wire(){
+  document.querySelectorAll(".heb-w[data-heb]").forEach(el=>{
+    const id = el.getAttribute("data-heb");
+    el.addEventListener("mouseenter", ()=>lightHeb(id));
+    el.addEventListener("mouseleave", clearHL);
+  });
+  document.querySelectorAll(".rw[data-group]").forEach(el=>{
+    const gid = el.getAttribute("data-group"); if(!gid) return;
+    // seed via the group's first Hebrew word
+    const grp = [...ULT.groups, ...UST.groups].find(g=>g.id===gid);
+    if (!grp) return;
+    el.addEventListener("mouseenter", ()=>lightHeb(grp.heb[0]));
+    el.addEventListener("mouseleave", clearHL);
+  });
+  // UHB strip collapse toggle
+  document.querySelectorAll(".uhb .toggle").forEach(btn=>{
+    btn.onclick = ()=>{ const u=btn.closest(".uhb"); u.classList.toggle("collapsed");
+      btn.textContent = u.classList.contains("collapsed") ? "▸" : "▾"; };
+  });
+  // hover-link toggle — governs the cross-panel bridge (one switch in the demo;
+  // both panels' checkboxes stay in sync).
+  document.querySelectorAll(".invtoggle[data-link]").forEach(btn=>{
+    btn.onclick = ()=>{
+      hoverLinkOn = !hoverLinkOn;
+      document.querySelectorAll(".invtoggle[data-link]").forEach(b=>{
+        b.classList.toggle("on", hoverLinkOn);
+        b.querySelector(".box").textContent = hoverLinkOn ? "✓" : "";
+      });
+      if (!hoverLinkOn) clearHL();
+    };
+  });
+}
+
+render();
+</script>
+</body>
+</html>

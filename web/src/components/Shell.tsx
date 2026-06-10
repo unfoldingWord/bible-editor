@@ -21,7 +21,7 @@ import { useLexicon } from "../hooks/useLexicon";
 import { useAiDrafts } from "../hooks/useAiDrafts";
 import { outbox } from "../sync/outbox";
 import { api } from "../sync/api";
-import type { TnRow, TqRow, TwlRow, VerseDto } from "../sync/api";
+import type { ChapterPayload, TnRow, TqRow, TwlRow, VerseDto } from "../sync/api";
 import { drafts, verseKey } from "../sync/drafts";
 import { smartEditVerse } from "../lib/replace";
 import { extractEditableText, extractPlainText, SECTION_HEADER_TAGS } from "../lib/usfm";
@@ -35,6 +35,7 @@ import { TimelineRail } from "./TimelineRail";
 import { ScriptureColumn, type ScriptureMode } from "./ScriptureColumn";
 import { ResourceColumn, type AlignmentTabProps, type PanelMode } from "./ResourceColumn";
 import type { AlignmentPanelHandle } from "./AlignmentPanel";
+import { SideBySideAligner, type PanelSlot } from "./SideBySideAligner";
 import { TopBar } from "./TopBar";
 import { LogosSyncToggle } from "./LogosSyncToggle";
 import { PipelineMenu } from "./PipelineMenu";
@@ -51,6 +52,22 @@ interface AlignerTarget {
   chapter: number;
   verse: number;
   bibleVersion: string;
+}
+
+// Per-version slice of the alignment props: target verse, the shared source
+// (concatenated across a multi-verse range), and the TWL rows for that span.
+// Used by both the single-panel aligner and the side-by-side popup.
+function buildAlignerSlice(sourceData: ChapterPayload, verse: number, bibleVersion: string) {
+  const sourceLabel = sourceData.verses["UHB"] ? "UHB" : "UGNT";
+  const targetVerse = sourceData.verses[bibleVersion]?.[verse] ?? null;
+  const rangeEnd = targetVerse?.verse_end ?? verse;
+  const rangeStart = targetVerse?.verse ?? verse;
+  const sourceVerse =
+    rangeEnd > rangeStart
+      ? concatSourceRange(sourceData.verses[sourceLabel] ?? {}, rangeStart, rangeEnd)
+      : sourceData.verses[sourceLabel]?.[verse] ?? null;
+  const twlForVerse = sourceData.twl.filter((r) => r.verse >= rangeStart && r.verse <= rangeEnd);
+  return { sourceLabel, targetVerse, sourceVerse, twlForVerse, rangeStart, rangeEnd };
 }
 
 const SCRIPTURE_MODE_KEY = "be:scriptureMode";
@@ -171,6 +188,16 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // unsaved drags stash their apply() here; the dialog decides which branch
   // to invoke.
   const [pendingNav, setPendingNav] = useState<{ run: () => void } | null>(null);
+  // Side-by-side aligner popup: which verse it targets (ULT + UST at once),
+  // per-panel handles for the save/discard gate, and per-panel dirty flags.
+  const [dualTarget, setDualTarget] = useState<{ chapter: number; verse: number } | null>(null);
+  const dualLeftRef = useRef<AlignmentPanelHandle | null>(null);
+  const dualRightRef = useRef<AlignmentPanelHandle | null>(null);
+  const [dualLeftDirty, setDualLeftDirty] = useState(false);
+  const [dualRightDirty, setDualRightDirty] = useState(false);
+  // Queued action (close / verse-nav) awaiting the user's save-or-discard
+  // choice when a dual panel has unsaved drags.
+  const [pendingDualAction, setPendingDualAction] = useState<{ run: () => void } | null>(null);
   // Shared by the scripture + resource columns so a single "go to active"
   // click re-centers both. Bumped via requestScrollToActive (and elsewhere
   // when the active selection changes through other paths).
@@ -682,6 +709,55 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     [runWithDirtyGate],
   );
 
+  // Open the side-by-side ULT/UST aligner on a verse. Layered over the UI as a
+  // Dialog (orthogonal to panelMode), so it gates only on the single panel's
+  // unsaved drags before opening.
+  const openDualAligner = useCallback(
+    (chapterNum: number, v: number) => {
+      runWithDirtyGate(() => {
+        setActiveVerse(v);
+        setDualTarget({ chapter: chapterNum, verse: v });
+      });
+    },
+    [runWithDirtyGate],
+  );
+  // Any action that leaves or re-targets the dual aligner gates on unsaved
+  // drags in either panel (save/discard prompt) — shared by close + verse nav.
+  const requestDualAction = useCallback(
+    (run: () => void) => {
+      if (dualLeftDirty || dualRightDirty) setPendingDualAction({ run });
+      else run();
+    },
+    [dualLeftDirty, dualRightDirty],
+  );
+  const requestCloseDual = useCallback(
+    () => requestDualAction(() => setDualTarget(null)),
+    [requestDualAction],
+  );
+  const dualNavTo = useCallback(
+    (v: number) =>
+      requestDualAction(() => {
+        setActiveVerse(v);
+        setDualTarget((t) => (t ? { ...t, verse: v } : t));
+      }),
+    [requestDualAction],
+  );
+  const resolveDualAction = useCallback(
+    (choice: "save" | "discard") => {
+      const action = pendingDualAction;
+      setPendingDualAction(null);
+      if (choice === "save") {
+        dualLeftRef.current?.save();
+        dualRightRef.current?.save();
+      } else {
+        dualLeftRef.current?.discard();
+        dualRightRef.current?.discard();
+      }
+      action?.run();
+    },
+    [pendingDualAction],
+  );
+
   const handleSetPanelMode = useCallback(
     (mode: PanelMode) => {
       if (mode === "alignment" && !alignerTarget) {
@@ -721,20 +797,13 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         : null;
     const sourceData = sameChapter ? data : bookData;
     if (!sourceData) return undefined;
-    const sourceLabel = sourceData.verses["UHB"] ? "UHB" : "UGNT";
-    const targetVerse = sourceData.verses[alignerTarget.bibleVersion]?.[alignerTarget.verse] ?? null;
-    // Multi-verse target (e.g. UST 6-9): expand the source side by
-    // concatenating per-verse UHB/UGNT rows across the same span. The
-    // aligner sees a flat token stream and the TWL list widens to include
-    // every verse the range covers.
-    const rangeEnd = targetVerse?.verse_end ?? alignerTarget.verse;
-    const rangeStart = targetVerse?.verse ?? alignerTarget.verse;
-    const sourceVerse =
-      rangeEnd > rangeStart
-        ? concatSourceRange(sourceData.verses[sourceLabel] ?? {}, rangeStart, rangeEnd)
-        : sourceData.verses[sourceLabel]?.[alignerTarget.verse] ?? null;
-    const twlForVerse = sourceData.twl.filter(
-      (r) => r.verse >= rangeStart && r.verse <= rangeEnd,
+    // Multi-verse target (e.g. UST 6-9): buildAlignerSlice expands the source
+    // side by concatenating per-verse UHB/UGNT rows across the span and widens
+    // the TWL list to every verse the range covers.
+    const { sourceLabel, targetVerse, sourceVerse, twlForVerse } = buildAlignerSlice(
+      sourceData,
+      alignerTarget.verse,
+      alignerTarget.bibleVersion,
     );
     return {
       book,
@@ -760,8 +829,91 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       },
       onDirtyChange: setAlignmentDirty,
       panelRef: alignmentPanelRef,
+      onOpenDual: () => openDualAligner(alignerTarget.chapter, alignerTarget.verse),
     };
-  }, [alignerTarget, data, chapter, bookHook, book]);
+  }, [alignerTarget, data, chapter, bookHook, book, openDualAligner]);
+
+  // Props for the side-by-side popup: ULT + UST slices against one shared
+  // source. Undefined (popup closed) unless a dualTarget is set and at least
+  // one of the two versions exists for the verse.
+  const dualAlignerProps = useMemo(() => {
+    if (!dualTarget || !data) return undefined;
+    const sameChapter = dualTarget.chapter === chapter;
+    const bookData =
+      !sameChapter && bookHook
+        ? (() => {
+            const cs = bookHook.chapters.get(dualTarget.chapter);
+            return cs?.kind === "ready" ? cs.data : null;
+          })()
+        : null;
+    const sourceData = sameChapter ? data : bookData;
+    if (!sourceData) return undefined;
+    const ult = buildAlignerSlice(sourceData, dualTarget.verse, "ULT");
+    const ust = buildAlignerSlice(sourceData, dualTarget.verse, "UST");
+    if (!ult.targetVerse && !ust.targetVerse) return undefined;
+    const sourceLabel = ult.sourceLabel; // identical across versions
+    // Shared source over the union span so a multi-verse UST and a per-verse
+    // ULT both see the Hebrew they reference.
+    const rangeStart = Math.min(ult.rangeStart, ust.rangeStart);
+    const rangeEnd = Math.max(ult.rangeEnd, ust.rangeEnd);
+    const sourceVerse =
+      rangeEnd > rangeStart
+        ? concatSourceRange(sourceData.verses[sourceLabel] ?? {}, rangeStart, rangeEnd)
+        : sourceData.verses[sourceLabel]?.[dualTarget.verse] ?? null;
+    const twlForVerse = sourceData.twl.filter((r) => r.verse >= rangeStart && r.verse <= rangeEnd);
+    const labelVerse = ult.targetVerse ?? ust.targetVerse;
+    const vref = `${book} ${dualTarget.chapter}:${
+      labelVerse ? formatVerseLabel(labelVerse) : dualTarget.verse
+    }`;
+    const enqueue = (bibleVersion: string) =>
+      (content: unknown, plain: string, expectedVersion: number) => {
+        void outbox.enqueueVerse(
+          book,
+          dualTarget.chapter,
+          dualTarget.verse,
+          bibleVersion,
+          expectedVersion,
+          { content, plain_text: plain },
+        );
+      };
+    const left: PanelSlot = {
+      bibleVersion: "ULT",
+      verse: ult.targetVerse,
+      onSave: enqueue("ULT"),
+      onDirtyChange: setDualLeftDirty,
+      panelRef: dualLeftRef,
+    };
+    const right: PanelSlot = {
+      bibleVersion: "UST",
+      verse: ust.targetVerse,
+      onSave: enqueue("UST"),
+      onDirtyChange: setDualRightDirty,
+      panelRef: dualRightRef,
+    };
+    return {
+      book,
+      chapter: dualTarget.chapter,
+      verseNum: dualTarget.verse,
+      vref,
+      sourceLabel,
+      sourceVerse,
+      twlForVerse,
+      left,
+      right,
+    };
+  }, [dualTarget, data, chapter, bookHook, book]);
+
+  // Prev/next verse for the dual aligner's titlebar arrows, within the current
+  // chapter's verse list (excluding the intro tile). Null at the ends.
+  const dualNav = useMemo(() => {
+    if (!dualAlignerProps || dualAlignerProps.chapter !== chapter) {
+      return { prev: null as number | null, next: null as number | null };
+    }
+    const nums = verseNumbers.filter((v) => v > 0);
+    const idx = nums.indexOf(dualAlignerProps.verseNum);
+    if (idx === -1) return { prev: null, next: null };
+    return { prev: nums[idx - 1] ?? null, next: nums[idx + 1] ?? null };
+  }, [dualAlignerProps, chapter, verseNumbers]);
 
   const alignmentBadge = alignerTarget
     ? `${alignerTarget.chapter}:${
@@ -1382,6 +1534,48 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
             Discard
           </Button>
           <Button variant="contained" onClick={() => resolvePendingNav("save")}>
+            Save
+          </Button>
+        </DialogActions>
+      </Dialog>
+      {dualAlignerProps && (
+        <SideBySideAligner
+          open
+          onClose={requestCloseDual}
+          book={dualAlignerProps.book}
+          chapter={dualAlignerProps.chapter}
+          verseNum={dualAlignerProps.verseNum}
+          vref={dualAlignerProps.vref}
+          sourceLabel={dualAlignerProps.sourceLabel}
+          sourceVerse={dualAlignerProps.sourceVerse}
+          twlForVerse={dualAlignerProps.twlForVerse}
+          lexiconMap={lexiconMap}
+          left={dualAlignerProps.left}
+          right={dualAlignerProps.right}
+          onPrevVerse={dualNav.prev != null ? () => dualNavTo(dualNav.prev!) : undefined}
+          onNextVerse={dualNav.next != null ? () => dualNavTo(dualNav.next!) : undefined}
+          onEditReading={(bv, plain, base) =>
+            stashVerseDraft(dualAlignerProps.chapter, dualAlignerProps.verseNum, bv, plain, base)
+          }
+          onSaveReading={(bv, plain, base) =>
+            saveVerseDraft(dualAlignerProps.chapter, dualAlignerProps.verseNum, bv, plain, base)
+          }
+        />
+      )}
+      <Dialog open={!!pendingDualAction} onClose={() => setPendingDualAction(null)}>
+        <DialogTitle>Unsaved alignment changes</DialogTitle>
+        <DialogContent>
+          <DialogContentText>
+            You have unsaved changes in the side-by-side aligner. Save them, discard them, or cancel
+            to keep editing.
+          </DialogContentText>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setPendingDualAction(null)}>Cancel</Button>
+          <Button color="error" onClick={() => resolveDualAction("discard")}>
+            Discard
+          </Button>
+          <Button variant="contained" onClick={() => resolveDualAction("save")}>
             Save
           </Button>
         </DialogActions>

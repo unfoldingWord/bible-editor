@@ -24,6 +24,7 @@ export interface AlignmentTabProps {
   onCancel: () => void;
   onDirtyChange?: (dirty: boolean) => void;
   panelRef?: Ref<AlignmentPanelHandle>;
+  onOpenDual?: () => void;
 }
 
 interface Props {
@@ -385,6 +386,7 @@ export function ResourceColumn({
             onSave={alignmentProps.onSave}
             onCancel={alignmentProps.onCancel}
             onDirtyChange={alignmentProps.onDirtyChange}
+            onOpenDual={alignmentProps.onOpenDual}
           />
         ) : (
           <Box sx={{ p: 3 }}>
