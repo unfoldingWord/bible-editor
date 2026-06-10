@@ -39,7 +39,10 @@ const PatchSchema = z.object({
       verseObjects: z.array(VerseObjectSchema).min(1),
     })
     .passthrough(),
-  plain_text: z.string().nullable().optional(),
+  // Optional, but NOT nullable: the SQL uses COALESCE(?2, plain_text), so an
+  // explicit null would silently mean "keep" rather than "clear". Restrict to
+  // string|absent so the API contract matches the SQL (omit to keep).
+  plain_text: z.string().optional(),
 });
 
 // Valid USFM marker names are alphanumeric (e.g. "p", "q1", "zaln", "ts"); a

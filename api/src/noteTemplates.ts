@@ -137,9 +137,29 @@ function currentBucket(nowMs: number): { bucketMs: number; nextMs: number } {
   return { bucketMs, nextMs };
 }
 
+// Isolate-global memo: the Cache API (caches.default) is a no-op on
+// *.workers.dev domains, and prod is bible-editor-api.unfoldingword.workers.dev,
+// so without this every request to this UNAUTHENTICATED route would live-fetch
+// the Google Sheet (and could be hammered into rate-limiting it). Module-scope
+// state survives across requests in a warm isolate; keyed on the time bucket so
+// it self-invalidates at each ET boundary. The Cache API stays as a second
+// layer (harmless where it works, e.g. custom domains).
+let memo: { bucketMs: number; body: string } | null = null;
+
 noteTemplates.get("/", async (c) => {
   const nowMs = Date.now();
   const { bucketMs, nextMs } = currentBucket(nowMs);
+
+  if (memo && memo.bucketMs === bucketMs) {
+    const maxAge = Math.max(60, Math.floor((nextMs - nowMs) / 1000));
+    return new Response(memo.body, {
+      headers: {
+        "content-type": "application/json; charset=utf-8",
+        "cache-control": `public, max-age=${maxAge}`,
+      },
+    });
+  }
+
   // Synthetic key (never fetched) — changes only when the bucket rolls over.
   const cacheKey = new Request(`https://note-templates.internal/v1?bucket=${bucketMs}`);
   const cache = caches.default;
@@ -157,8 +177,10 @@ noteTemplates.get("/", async (c) => {
   }
 
   const templates = buildTemplates(parseCsv(csv));
+  const body = JSON.stringify({ templates });
+  memo = { bucketMs, body };
   const maxAge = Math.max(60, Math.floor((nextMs - nowMs) / 1000));
-  const response = new Response(JSON.stringify({ templates }), {
+  const response = new Response(body, {
     headers: {
       "content-type": "application/json; charset=utf-8",
       "cache-control": `public, max-age=${maxAge}`,

@@ -189,7 +189,7 @@ Per [CLAUDE.md](../CLAUDE.md) "Browser-driven verification". Wave-3-specific smo
 
 1. Work on a feature branch in a worktree.
 2. `npm run typecheck` + `npm run build` clean.
-3. `(cd api && npx wrangler d1 migrations apply bible_editor --local)` for new migrations.
+3. `(cd api && npx wrangler d1 migrations apply bible_editor_dev --local)` for new migrations.
 4. Drive Chrome MCP to smoke-test.
 5. Commit: `git -c user.email=ju-cldai724@abidinginhesed.com -c user.name=Benjamin commit -m "$(cat <<'EOF' ...)"`.
 6. `git push origin <branch>:main`.

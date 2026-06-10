@@ -19,12 +19,12 @@ runtime locally.
 
 ```sh
 # 1. Apply the new migration (book_usfm_meta) to local D1.
-cd api && npx wrangler d1 migrations apply bible_editor --local && cd ..
+cd api && npx wrangler d1 migrations apply bible_editor_dev --local && cd ..
 
 # 2. Re-import any book whose USFM headers you want preserved (optional —
 #    older imports still export with synthesized minimal headers).
 node scripts/import-book.mjs ZEC
-cd api && npx wrangler d1 execute bible_editor --local --file=../scripts/out/import-ZEC.sql && cd ..
+cd api && npx wrangler d1 execute bible_editor_dev --local --file=../scripts/out/import-ZEC.sql && cd ..
 
 # 3. Run the stack.
 npm run dev
@@ -45,7 +45,7 @@ curl -X POST http://localhost:8787/api/exports/run \
 curl -s http://localhost:8787/api/exports | jq '.snapshots[0:5]'
 
 # 6. Inspect the rendered files in local R2 storage.
-cd api && npx wrangler r2 object list bible-editor-blobs --prefix exports/ && cd ..
+cd api && npx wrangler r2 object list bible-editor-blobs-dev --local --prefix exports/ && cd ..
 ```
 
 `dryDcs: true` skips the Gitea commit even if `DCS_SERVICE_TOKEN` is set;

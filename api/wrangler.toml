@@ -15,8 +15,12 @@ port = 8787
 # `wrangler dev` (and `npm run dev`) reads everything from the top level.
 # Vars here are dev-friendly; the prod overrides live in [env.production.*]
 # blocks at the bottom. Bindings (D1/R2/DO/Workflow/Assets) are NOT inherited
-# by env blocks in wrangler v4 — they're duplicated, pointing at the same
-# Cloudflare resources so both envs share state.
+# by env blocks in wrangler v4 — they're duplicated per env. Dev and prod are
+# isolated for stateful resources: D1 (bible_editor_dev vs bible_editor), R2
+# (bible-editor-blobs-dev vs bible-editor-blobs), and the Workflow name
+# (bible-editor-export-dev vs bible-editor-export). So a plain `wrangler deploy`
+# can never read/write prod state. DO + Assets remain identical (no shared
+# durable state to clobber).
 
 [assets]
 directory = "../web/dist"
@@ -36,7 +40,7 @@ migrations_dir = "migrations"
 
 [[r2_buckets]]
 binding = "BLOBS"
-bucket_name = "bible-editor-blobs"
+bucket_name = "bible-editor-blobs-dev"
 
 [[durable_objects.bindings]]
 name = "CHAPTER_ROOM"
@@ -47,7 +51,11 @@ tag = "v1"
 new_classes = ["ChapterRoom"]
 
 [[workflows]]
-name = "bible-editor-export"
+# Dev-suffixed: Workflow names are account-scoped and owned by one script, so
+# sharing prod's name ("bible-editor-export") would let a plain dev deploy
+# collide with prod's workflow. Binding stays EXPORT_WORKFLOW so code is
+# unaffected.
+name = "bible-editor-export-dev"
 binding = "EXPORT_WORKFLOW"
 class_name = "ExportWorkflow"
 

@@ -22,7 +22,7 @@ The four items below shipped on 2026-05-13. Type-checks pass and the logic was r
 - [ ] **Dialog warning shows when alignment is asymmetric.** Open AI pipelines → Generate ULT + UST. Tick ULT + ULT-alignment + UST (leave UST-alignment unticked). The italic line "Asymmetric alignment: runs as two pipelines back-to-back (ULT first)." appears below the checkboxes. Untick UST-alignment + tick ULT-alignment for the mirror case — same warning shows.
 - [ ] **Asymmetric start creates two `pipeline_jobs` rows in sequence.** With the dialog warning visible, click Start. Run this query immediately:
   ```sh
-  wrangler d1 execute bible_editor --local --command \
+  wrangler d1 execute bible_editor_dev --local --command \
     "SELECT job_id, pipeline_type, session_key, state, follow_up_options IS NOT NULL AS has_followup, follow_up_job_id FROM pipeline_jobs ORDER BY created_at DESC LIMIT 4"
   ```
   Expect: one row, `state='running'`, `has_followup=1`, `follow_up_job_id=NULL`, `session_key` matches the browser's `bible-editor.pipeline.sessionKey`.
@@ -30,7 +30,7 @@ The four items below shipped on 2026-05-13. Type-checks pass and the logic was r
 - [ ] **Chapter lock re-engages for the follow-up.** While the follow-up is running, the chapter banner shows again ("AI generate run in progress…") and TN cards are read-only. (~5-10s gap between parent-done and follow-up-running is expected; the chapter is briefly unlocked.)
 - [ ] **Both content types land correctly.** When the follow-up completes, ULT verses should be ALIGNED (zaln markers visible in `content_json`) and UST verses should be PLAIN (no zaln). Verify with:
   ```sh
-  wrangler d1 execute bible_editor --local --command \
+  wrangler d1 execute bible_editor_dev --local --command \
     "SELECT bible_version, SUBSTR(content_json, 1, 200) FROM verses WHERE book='ZEC' AND chapter=<N> AND verse=1"
   ```
 
@@ -65,7 +65,7 @@ Shipped 2026-05-14 as five small commits. Type-checks pass and the macro chain w
 
 - [ ] **Stuck row flips to failed.** Manually insert a wedged row:
   ```sh
-  wrangler d1 execute bible_editor --local --command \
+  wrangler d1 execute bible_editor_dev --local --command \
     "INSERT INTO pipeline_jobs (job_id, user_id, pipeline_type, book, start_chapter, end_chapter, session_key, state, created_at, updated_at) VALUES ('stuck-test-1', 1, 'tqs', 'ZEC', 9, 9, 'bible-editor/1/stuck-test', 'running', unixepoch() - 86400 * 3, unixepoch() - 86400 * 3)"
   ```
   Wait for the next 5-minute cron tick (or invoke the scheduled handler manually via `wrangler dev --test-scheduled` + `curl localhost:8787/__scheduled`). Re-query — the row should now be `state='failed'`, `error_kind='interrupted'`, `error_message='auto-failed: no progress for 48h'`.
@@ -90,7 +90,7 @@ Shipped 2026-05-14 as five small commits. Type-checks pass and the macro chain w
 
 - [ ] **Macro creates first row + stashes the chain.** Pick an untouched chapter (ZEC 11 or later — avoid ZEC 3, 7, 8 that other tests use). Click AI pipelines → Generate everything → Start. Immediately:
   ```sh
-  wrangler d1 execute bible_editor --local --command \
+  wrangler d1 execute bible_editor_dev --local --command \
     "SELECT job_id, pipeline_type, follow_up_chain, follow_up_job_id FROM pipeline_jobs WHERE book='ZEC' AND start_chapter=<N> ORDER BY created_at DESC LIMIT 5"
   ```
   Expect: ONE row, `pipeline_type='generate'`, `follow_up_chain='[{"pipelineType":"notes"},{"pipelineType":"tqs"}]'`, `follow_up_job_id=NULL`.

@@ -130,9 +130,9 @@ Workspace scripts:
 - `npm --workspace api run typecheck` / `run dev` / `run deploy` / `run tail`
 - `npm --workspace web run typecheck` / `run build`
 - `npm --workspace api run db:migrate:local` / `db:migrate:remote`
-- `node scripts/import-book.mjs <CODE>` then `(cd api && npx wrangler d1 execute bible_editor --local --file=../scripts/out/import-<CODE>.sql)`
-- `node scripts/import-lexicon.mjs` then `(cd api && npx wrangler d1 execute bible_editor --local --file=../scripts/out/import-lexicon.sql)`
-- `node scripts/refresh-verse.mjs <BOOK> <CH> <V> <VERSION>` then `(cd api && npx wrangler d1 execute bible_editor --local --file=../scripts/out/refresh-<BOOK>-<CH>-<V>-<VERSION>.sql)`
+- `node scripts/import-book.mjs <CODE>` then `(cd api && npx wrangler d1 execute bible_editor_dev --local --file=../scripts/out/import-<CODE>.sql)`
+- `node scripts/import-lexicon.mjs` then `(cd api && npx wrangler d1 execute bible_editor_dev --local --file=../scripts/out/import-lexicon.sql)`
+- `node scripts/refresh-verse.mjs <BOOK> <CH> <V> <VERSION>` then `(cd api && npx wrangler d1 execute bible_editor_dev --local --file=../scripts/out/refresh-<BOOK>-<CH>-<V>-<VERSION>.sql)`
 
 ## Quirks the next agent should remember
 
@@ -232,7 +232,7 @@ User has asked to **stop the empty `bookmark:` commits** this session — just c
 - **ZEC 1:10 ULT** still has the pre-fix clumped-punctuation tail (the user observed `… earth , " { . " ` at the end of the verse). The serializer fix in `d434f206` is forward-only — re-saving the verse round-trips the existing bad shape. To recover:
   ```sh
   node scripts/refresh-verse.mjs ZEC 1 10 ULT
-  (cd api && npx wrangler d1 execute bible_editor --local --file=../scripts/out/refresh-ZEC-1-10-ULT.sql)
+  (cd api && npx wrangler d1 execute bible_editor_dev --local --file=../scripts/out/refresh-ZEC-1-10-ULT.sql)
   ```
   The same script handles any other verses found in the same state — pass the (BOOK CH V VERSION) tuple. Output SQL is gitignored.
 

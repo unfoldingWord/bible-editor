@@ -44,9 +44,9 @@ npx playwright test tests/concurrency/s2-same-verse.spec.ts -g "<grep>"
 API-only operations (from `api/`):
 
 ```sh
-npx wrangler d1 migrations apply bible_editor --local                       # apply migrations locally
+npx wrangler d1 migrations apply bible_editor_dev --local                   # apply migrations locally
 npx wrangler d1 migrations apply bible_editor --remote --env production     # apply migrations to prod
-npx wrangler d1 execute bible_editor --local --file=../scripts/out/import-ZEC.sql
+npx wrangler d1 execute bible_editor_dev --local --file=../scripts/out/import-ZEC.sql
 npm run tail                                                                 # wrangler tail (live API logs)
 ```
 

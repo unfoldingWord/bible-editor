@@ -47,7 +47,7 @@ exports.post("/run", requireAdmin, async (c) => {
   // Deterministic id (second precision) so a double-submitted manual run
   // rejects on the duplicate instead of racing the first. The nightly cron
   // uses `nightly-${day}` ids — see scheduled() in index.ts.
-  const id = `manual-${new Date().toISOString().replace(/[:.]/g, "-")}`;
+  const id = `manual-${new Date().toISOString().slice(0, 19).replace(/:/g, "-")}`;
   try {
     const instance = await c.env.EXPORT_WORKFLOW.create({ id, params });
     return c.json({ id: instance.id, status: "queued" }, 202);

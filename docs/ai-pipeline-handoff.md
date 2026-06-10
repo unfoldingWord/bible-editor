@@ -197,7 +197,7 @@ All four original decisions are closed under the revised lock + auto-apply model
    - The chapter banner should appear within ~2s ("AI tqs run in progress…").
    - Try to edit a TQ in the UI — input is read-only. Try via curl — receives 409 chapter_locked.
    - Click Keep on a TN — card flips to editable, Kept chip shows.
-   - When the run completes (~30–60 min): `wrangler d1 execute bible_editor --local --command "SELECT count(*), source FROM edit_log WHERE row_key LIKE 'ZEC/7%' GROUP BY source"` should show a chunk of `source='ai_pipeline'` rows. The same TN cards now carry a small "AI" chip.
+   - When the run completes (~30–60 min): `wrangler d1 execute bible_editor_dev --local --command "SELECT count(*), source FROM edit_log WHERE row_key LIKE 'ZEC/7%' GROUP BY source"` should show a chunk of `source='ai_pipeline'` rows. The same TN cards now carry a small "AI" chip.
 4. Asymmetric alignment dry-run: pick a generate, tick ULT + ULT-alignment + UST (no UST-alignment), Start. The dialog warns "runs as two pipelines back-to-back." Confirm by watching `pipeline_jobs` — parent shows up first, then on its `done` transition a second row appears with `session_key = '${parent}/followup'`. (~2× run time.)
 
 ### Autonomous (no translator available)

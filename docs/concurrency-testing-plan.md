@@ -145,7 +145,7 @@ render and skips the sign-in screen.
 `docs/samples/` into the local D1 before any test runs. Specifically:
 
 1. If `scripts/out/import-ZEC.sql` doesn't exist, run `node scripts/import-book.mjs ZEC` to generate it.
-2. `wrangler d1 execute bible_editor --local --file=scripts/out/import-ZEC.sql` to apply.
+2. `wrangler d1 execute bible_editor_dev --local --file=scripts/out/import-ZEC.sql` to apply.
 
 The importer is idempotent (DELETE WHERE book='ZEC' + REPLACE INTO), so
 re-runs are safe. Each test picks its own row(s) on different verses so
