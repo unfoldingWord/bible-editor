@@ -284,6 +284,55 @@ function milestoneCount(content) {
   assert(idx > forIdx && idx < heIdx, `marker re-anchored between "for" and "he" (markerIdx ${idx}, forIdx ${forIdx}, heIdx ${heIdx})`);
 }
 
+// ─── Case 15: word edit in a verse WITH markers (markers unchanged) ───────
+// The word change must preserve alignment AND leave the markers in place —
+// the markers must not pollute the diff anchors.
+{
+  console.log("\n[Case 15] Word edit beside markers keeps alignment and the markers");
+  const q = (tag) => ({ type: "quote", tag });
+  const verse = {
+    verseObjects: [
+      zaln("H1", [w("Come")]), t(", "), q("q2"),
+      zaln("H2", [w("for")]), t(" "), zaln("H3", [w("he")]), t("."), q("q1"),
+    ],
+  };
+  const old = extractEditableText(verse); // "Come, \q2 for he.\q1"
+  // Replace "for" -> "unto"; markers untouched.
+  const r = smartEditVerse(verse, old, "Come, \\q2 unto he.\\q1");
+  assert(r.plainText === "Come, unto he.", `text edited (got ${JSON.stringify(r.plainText)})`);
+  assert(milestoneCount(r.content) === 2, `unchanged words stay aligned, edited word lifted (got ${milestoneCount(r.content)})`);
+  const words = alignedWords(r.content);
+  assert(words.find((x) => x.text === "Come")?.strongs.includes("H1"), "'Come' keeps alignment");
+  assert(words.find((x) => x.text === "he")?.strongs.includes("H3"), "'he' keeps alignment");
+  assert(words.find((x) => x.text === "unto")?.strongs.length === 0, "edited 'unto' is unaligned");
+  const quotes = r.content.verseObjects.filter((n) => n.type === "quote").map((n) => n.tag);
+  assert(JSON.stringify(quotes) === JSON.stringify(["q2", "q1"]), `both markers preserved in place (got ${JSON.stringify(quotes)})`);
+}
+
+// ─── Case 16: combined word edit + marker removal in one save ─────────────
+// A single debounced save changes a word AND deletes markers. Unedited words
+// must keep alignment; only the edited word unaligns; the markers are gone.
+{
+  console.log("\n[Case 16] Combined word edit + marker removal preserves alignment");
+  const q = (tag) => ({ type: "quote", tag });
+  const verse = {
+    verseObjects: [
+      zaln("H1", [w("Come")]), t(", "), q("q2"),
+      zaln("H2", [w("for")]), t(" "), zaln("H3", [w("he")]), t("."), q("q1"),
+    ],
+  };
+  const old = extractEditableText(verse); // "Come, \q2 for he.\q1"
+  // Edit "he" -> "they" AND remove both markers.
+  const r = smartEditVerse(verse, old, "Come, for they.");
+  assert(r.plainText === "Come, for they.", `text edited (got ${JSON.stringify(r.plainText)})`);
+  assert(!r.content.verseObjects.some((n) => n.type === "quote"), "both \\q markers removed");
+  assert(milestoneCount(r.content) === 2, `'Come' + 'for' stay aligned (got ${milestoneCount(r.content)})`);
+  const words = alignedWords(r.content);
+  assert(words.find((x) => x.text === "Come")?.strongs.includes("H1"), "'Come' keeps alignment");
+  assert(words.find((x) => x.text === "for")?.strongs.includes("H2"), "'for' keeps alignment");
+  assert(words.find((x) => x.text === "they")?.strongs.length === 0, "edited 'they' is unaligned");
+}
+
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed.`);
   process.exit(1);
