@@ -23,6 +23,7 @@ import {
   buildTqTsv,
   buildTwlTsv,
   buildUsfm,
+  closeDcsPr,
   commitToDcs,
   deleteDcsBranch,
   ensureDcsPr,
@@ -265,16 +266,25 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
         branch,
       };
       const message = `bible-editor export: ${book} ${resource} → ${branch} (${instanceId})`;
-      let commit = await commitToDcs(dcsCfg, filename, built.content, message);
+      const commit = await commitToDcs(dcsCfg, filename, built.content, message);
       if (!commit.branchTouched) {
-        // Rendered content already matches master — normally nothing to push,
-        // and skipping here is what stops untouched pairs from minting junk
-        // -be- branches. One exception: an open PR lingering from an earlier
-        // night (e.g. an edit since reverted in D1) would keep stale content
-        // mergeable; fall through to the old commit path so its diff collapses.
+        // Rendered content matches master — nothing to merge. Close any open PR
+        // lingering from an earlier night (an edit since reverted in D1, or
+        // already merged to master) so empty (0-diff) PRs don't pile up and the
+        // validate-and-merge job's worklist stays equal to "books with unmerged
+        // edits". We can't delete the branch (the service token lacks
+        // branch-delete), but closing the PR is enough; the branch gets a fresh
+        // PR the next time this (book, resource) actually diverges from master.
         const lingering = await findDcsOpenPr(dcsCfg);
         if (lingering != null) {
-          commit = await commitToDcs(dcsCfg, filename, built.content, message, { forceBranch: true });
+          try {
+            await closeDcsPr(dcsCfg, lingering);
+          } catch (e) {
+            console.error("export close-stale-PR failed", {
+              book, resource, repo: target.repo, pr: lingering,
+              error: e instanceof Error ? e.message : String(e),
+            });
+          }
         }
       }
       dcsCommitSha = commit.commitSha || null;

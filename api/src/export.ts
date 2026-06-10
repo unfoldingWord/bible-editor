@@ -628,3 +628,24 @@ export async function updateDcsPrBranch(
   if (res.ok) return { ok: true, status: res.status, detail: "" };
   return { ok: false, status: res.status, detail: (await res.text()).slice(0, 200) };
 }
+
+// PATCH /repos/{owner}/{repo}/pulls/{index} { state: "closed" } — close a PR the
+// export opened once its head no longer diverges from master (rendered content
+// matches master, so there is nothing to merge). The service token owns these
+// PRs, so it can close them even though it can't delete the branch. Closing
+// keeps the open-PR set equal to "books with unmerged edits" so empty (0-diff)
+// PRs don't accumulate. Never throws on an HTTP status — 404 (already gone) and
+// 422 are non-fatal; callers log and move on.
+export async function closeDcsPr(
+  config: Omit<DcsCommitConfig, "branch">,
+  prNumber: number,
+): Promise<{ ok: boolean; status: number; detail: string }> {
+  const url = `${config.baseUrl}/api/v1/repos/${encodeURIComponent(config.owner)}/${encodeURIComponent(config.repo)}/pulls/${prNumber}`;
+  const res = await fetch(url, {
+    method: "PATCH",
+    headers: dcsPrHeaders(config.token),
+    body: JSON.stringify({ state: "closed" }),
+  });
+  if (res.ok) return { ok: true, status: res.status, detail: "" };
+  return { ok: false, status: res.status, detail: (await res.text()).slice(0, 200) };
+}

@@ -254,7 +254,7 @@ let tnCount = 0;
     const [ch, v] = refParts(r.Reference);
     const occ = r.Occurrence === "" || r.Occurrence == null ? null : parseInt(r.Occurrence, 10) || 0;
     lines.push(
-      `INSERT INTO tn_rows (id, book, chapter, verse, ref_raw, tags, support_reference, quote, occurrence, note) VALUES (${q(r.ID)}, ${q(book)}, ${q(ch)}, ${q(v)}, ${q(r.Reference)}, ${q(r.Tags || null)}, ${q(r.SupportReference || null)}, ${q(r.Quote || null)}, ${q(occ)}, ${q(r.Note || null)});`,
+      `INSERT INTO tn_rows (id, book, chapter, verse, ref_raw, tags, support_reference, quote, occurrence, note, sort_order) VALUES (${q(r.ID)}, ${q(book)}, ${q(ch)}, ${q(v)}, ${q(r.Reference)}, ${q(r.Tags || null)}, ${q(r.SupportReference || null)}, ${q(r.Quote || null)}, ${q(occ)}, ${q(r.Note || null)}, ${(tnCount + 1) * 100});`,
     );
     emitEditLogCreate("tn", r.ID, {
       book,
@@ -280,7 +280,7 @@ let tqCount = 0;
     const [ch, v] = refParts(r.Reference);
     const occ = r.Occurrence === "" || r.Occurrence == null ? null : parseInt(r.Occurrence, 10) || 0;
     lines.push(
-      `INSERT INTO tq_rows (id, book, chapter, verse, ref_raw, tags, quote, occurrence, question, response) VALUES (${q(r.ID)}, ${q(book)}, ${q(ch)}, ${q(v)}, ${q(r.Reference)}, ${q(r.Tags || null)}, ${q(r.Quote || null)}, ${q(occ)}, ${q(r.Question || null)}, ${q(r.Response || null)});`,
+      `INSERT INTO tq_rows (id, book, chapter, verse, ref_raw, tags, quote, occurrence, question, response, sort_order) VALUES (${q(r.ID)}, ${q(book)}, ${q(ch)}, ${q(v)}, ${q(r.Reference)}, ${q(r.Tags || null)}, ${q(r.Quote || null)}, ${q(occ)}, ${q(r.Question || null)}, ${q(r.Response || null)}, ${(tqCount + 1) * 100});`,
     );
     emitEditLogCreate("tq", r.ID, {
       book,
@@ -306,7 +306,7 @@ let twlCount = 0;
     const [ch, v] = refParts(r.Reference);
     const occ = r.Occurrence === "" || r.Occurrence == null ? null : parseInt(r.Occurrence, 10) || 0;
     lines.push(
-      `INSERT INTO twl_rows (id, book, chapter, verse, ref_raw, tags, orig_words, occurrence, tw_link) VALUES (${q(r.ID)}, ${q(book)}, ${q(ch)}, ${q(v)}, ${q(r.Reference)}, ${q(r.Tags || null)}, ${q(r.OrigWords || null)}, ${q(occ)}, ${q(r.TWLink || null)});`,
+      `INSERT INTO twl_rows (id, book, chapter, verse, ref_raw, tags, orig_words, occurrence, tw_link, sort_order) VALUES (${q(r.ID)}, ${q(book)}, ${q(ch)}, ${q(v)}, ${q(r.Reference)}, ${q(r.Tags || null)}, ${q(r.OrigWords || null)}, ${q(occ)}, ${q(r.TWLink || null)}, ${(twlCount + 1) * 100});`,
     );
     emitEditLogCreate("twl", r.ID, {
       book,

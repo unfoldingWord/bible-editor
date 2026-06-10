@@ -136,6 +136,21 @@ rows.post("/:kind", requireEditor, async (c) => {
   );
   if (lock) return c.json(lockedResponseBody(lock), 409);
 
+  // A new row must carry a sort_order. Without one it lands NULL, and the
+  // export's `ORDER BY ... sort_order ASC NULLS LAST, id` dumps it at the end
+  // of its verse keyed by id — scrambling file order in the nightly DCS diff
+  // (pure-reorder churn). Honor a client-supplied value; otherwise place the
+  // row at the end of its verse (max + 100), matching the import spacing.
+  if (data.sort_order == null) {
+    const maxRow = await c.env.DB.prepare(
+      `SELECT MAX(sort_order) AS m FROM ${KIND_TO_TABLE[kind]}
+        WHERE book = ?1 AND chapter = ?2 AND verse = ?3 AND deleted_at IS NULL`,
+    )
+      .bind(data.book, data.chapter, data.verse)
+      .first<{ m: number | null }>();
+    data.sort_order = (maxRow?.m ?? 0) + 100;
+  }
+
   // Retry around PK collision: insert under a fresh id and let the DB be the
   // source of truth instead of SELECT-then-INSERT (which races between two
   // concurrent POSTs). 32^4 ≈ 1M ids; ~8 tries covers any plausible book.
