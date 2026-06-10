@@ -36,6 +36,14 @@ const STORE = "ops";
 // connection or session comes back (see reviveMaxAttemptsFailed).
 const MAX_ATTEMPTS = 20;
 
+// sort_order is a transient, last-write-wins field (see api/src/rows.ts —
+// "transient fields like sort_order"). A version mismatch on a reorder-only
+// patch should never surface a conflict prompt; we silently re-arm against the
+// server's current version and retry. This cap stops a pathological loop if
+// another writer is bumping the same row faster than we can land — beyond it,
+// fall through to the normal conflict flow.
+const MAX_CONFLICT_AUTOHEAL = 5;
+
 // recoverInFlight only re-arms in_flight ops at least this stale. A live
 // request can't outlast its api.ts timeout, so 2× that means "the tab that
 // dispatched this is gone (crash / reload), not mid-request" — without the
@@ -91,6 +99,9 @@ export interface OutboxOp {
   status: OpStatus;
   lastError?: string;
   conflictCurrent?: unknown;
+  // Count of silent re-arms after a sort_order-only 409 (see
+  // MAX_CONFLICT_AUTOHEAL). Absent = 0.
+  conflictRetries?: number;
   // Set when this patch came from "switch to v{N}" in the history dialog.
   // The server stores it on the new edit_log entry + the row's column so
   // the UI can label the chip v{N} even though row.version is now N+1.
@@ -525,6 +536,14 @@ async function threadVersionToSiblings(done: OutboxOp, updated: unknown) {
   await tx.done;
 }
 
+// A reorder enqueues a patch whose only field is sort_order. Such patches are
+// last-write-wins and must never raise a user-facing conflict — they auto-heal
+// against the server's current version instead.
+function isSortOrderOnlyPatch(patch: Record<string, unknown>): boolean {
+  const keys = Object.keys(patch);
+  return keys.length === 1 && keys[0] === "sort_order";
+}
+
 async function drainPass() {
   await recoverInFlight();
   // Targets with an unresolved conflict are skipped for *this* pass but
@@ -578,11 +597,31 @@ async function drainPass() {
         // row anyway. Drop the op and let the listener surface a toast.
         await (await db()).delete(STORE, next.id);
       } else if (result.kind === "conflict") {
-        next.status = "conflict";
-        next.conflictCurrent = result.current;
-        next.lastError = "version_mismatch";
-        await (await db()).put(STORE, next);
-        blocked.add(targetKey(next.target));
+        const serverVersion = (result.current as { version?: unknown } | null | undefined)
+          ?.version;
+        if (
+          next.target.kind === "row" &&
+          next.action === "patch" &&
+          isSortOrderOnlyPatch(next.patch) &&
+          typeof serverVersion === "number" &&
+          (next.conflictRetries ?? 0) < MAX_CONFLICT_AUTOHEAL
+        ) {
+          // Reorder-only mismatch — re-arm against the server's version and
+          // retry silently rather than surfacing a conflict. Don't block the
+          // target: it stays drainable so this pass picks it straight back up.
+          next.status = "pending";
+          next.expectedVersion = serverVersion;
+          next.conflictRetries = (next.conflictRetries ?? 0) + 1;
+          next.conflictCurrent = undefined;
+          next.lastError = "sort_order_autoheal";
+          await (await db()).put(STORE, next);
+        } else {
+          next.status = "conflict";
+          next.conflictCurrent = result.current;
+          next.lastError = "version_mismatch";
+          await (await db()).put(STORE, next);
+          blocked.add(targetKey(next.target));
+        }
       } else if (result.kind === "retry") {
         // Only genuine server errors (`transient NNN`) consume the
         // MAX_ATTEMPTS cap. Network failures (`network`, `dispatch_threw`)

@@ -110,6 +110,11 @@ type ResourceTab = "notes" | "words" | "questions";
 
 const PINNED_KEY = "be:pinned";
 
+// Drag auto-scroll: begin scrolling when the pointer is within this many px of
+// the list's top/bottom edge, advancing this many px per animation frame.
+const DRAG_SCROLL_EDGE_PX = 56;
+const DRAG_SCROLL_SPEED_PX = 12;
+
 function loadPinned(): Pinned {
   try {
     const raw = localStorage.getItem(PINNED_KEY);
@@ -267,6 +272,52 @@ export function ResourceColumn({
 
   const scrollBodyRef = useRef<HTMLDivElement | null>(null);
 
+  // Auto-scroll the list while a reorder drag hovers near its top/bottom edge.
+  // Native HTML5 DnD only auto-scrolls the window, never a nested overflow
+  // container, so without this a note/word can't be dropped onto a card that
+  // started scrolled out of view. Direction lives in a ref the rAF loop reads;
+  // a drag can end on a card, outside the list, or via Esc, but the global
+  // `dragend` always fires, so it's the reliable place to kill the loop.
+  const autoScrollRaf = useRef<number | null>(null);
+  const autoScrollDir = useRef(0);
+  useEffect(() => {
+    const stop = () => {
+      if (autoScrollRaf.current != null) {
+        cancelAnimationFrame(autoScrollRaf.current);
+        autoScrollRaf.current = null;
+      }
+      autoScrollDir.current = 0;
+    };
+    window.addEventListener("dragend", stop);
+    return () => {
+      window.removeEventListener("dragend", stop);
+      stop();
+    };
+  }, []);
+  const handleDragAutoScroll = (e: React.DragEvent) => {
+    const el = scrollBodyRef.current;
+    if (!el) return;
+    const rect = el.getBoundingClientRect();
+    autoScrollDir.current =
+      e.clientY < rect.top + DRAG_SCROLL_EDGE_PX
+        ? -1
+        : e.clientY > rect.bottom - DRAG_SCROLL_EDGE_PX
+          ? 1
+          : 0;
+    if (autoScrollDir.current !== 0 && autoScrollRaf.current == null) {
+      const step = () => {
+        const node = scrollBodyRef.current;
+        if (!node || autoScrollDir.current === 0) {
+          autoScrollRaf.current = null;
+          return;
+        }
+        node.scrollTop += autoScrollDir.current * DRAG_SCROLL_SPEED_PX;
+        autoScrollRaf.current = requestAnimationFrame(step);
+      };
+      autoScrollRaf.current = requestAnimationFrame(step);
+    }
+  };
+
   // Keep the resource column lined up with the active selection. We fire on:
   //   - scrollNonce (Shell's "go to active" button)
   //   - activeNoteId / activeWordId (focus shifts that came from elsewhere)
@@ -417,7 +468,11 @@ export function ResourceColumn({
           </Box>
         )
       ) : (
-      <Box ref={scrollBodyRef} sx={{ flex: 1, overflowY: "auto", px: 2, py: 1 }}>
+      <Box
+        ref={scrollBodyRef}
+        onDragOver={handleDragAutoScroll}
+        sx={{ flex: 1, overflowY: "auto", px: 2, py: 1 }}
+      >
         {resourceTab === "notes" && (
           <>
             <SectionHead

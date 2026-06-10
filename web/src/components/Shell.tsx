@@ -1566,9 +1566,14 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
             setActiveWordId(null);
           }}
           onNoteReorder={(draggedId, refId, position) => {
-            const dragged = data.tn.find((r) => r.id === draggedId);
+            // Read the live (ref) row list, not the render-scoped `data`
+            // closure: a rapid burst of arrow clicks fires several handlers
+            // before React re-renders, and a stale closure would renumber from
+            // an outdated order and enqueue ops carrying a stale version.
+            const tn = dataRef.current?.tn ?? [];
+            const dragged = tn.find((r) => r.id === draggedId);
             if (!dragged) return;
-            const sorted = sortedForVerse(data.tn, dragged.verse);
+            const sorted = sortedForVerse(tn, dragged.verse);
             const changes = reorderSequential(sorted, draggedId, refId, position);
             for (const { row, sort_order } of changes) {
               enqueueRow("tn", row, { sort_order });
@@ -1591,9 +1596,11 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
             setActiveNoteId(null);
           }}
           onWordReorder={(draggedId, refId, position) => {
-            const dragged = data.twl.find((r) => r.id === draggedId);
+            // See onNoteReorder: live ref list, not the stale render closure.
+            const twl = dataRef.current?.twl ?? [];
+            const dragged = twl.find((r) => r.id === draggedId);
             if (!dragged) return;
-            const sorted = sortedForVerse(data.twl, dragged.verse);
+            const sorted = sortedForVerse(twl, dragged.verse);
             const changes = reorderSequential(sorted, draggedId, refId, position);
             for (const { row, sort_order } of changes) {
               enqueueRow("twl", row, { sort_order });
