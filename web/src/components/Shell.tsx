@@ -731,6 +731,43 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     [runWithDirtyGate],
   );
 
+  // Notes the find overlay's TN scope searches. Single chapter in stacked /
+  // columns mode; every loaded chapter in book mode. Reads dataRef so the
+  // getter sees live notes (post-keystroke) without forcing the memoized
+  // ScriptureColumn to re-render on every edit. Identity only churns on
+  // mode / book-cache changes, both of which ScriptureColumn already re-renders
+  // for, so the overlay always receives a current getter.
+  const getSearchNotes = useCallback((): TnRow[] => {
+    if (mode === "book" && bookHook) {
+      const out: TnRow[] = [];
+      for (const cs of bookHook.chapters.values()) {
+        if (cs.kind === "ready") out.push(...cs.data.tn);
+      }
+      return out;
+    }
+    return dataRef.current?.tn ?? [];
+  }, [mode, bookHook]);
+
+  // Navigate to + activate a TN match from the find overlay. Cross-chapter
+  // (book mode) routes through the URL so the chapter payload reloads; the
+  // common same-chapter case just focuses the verse + note, and the bumped
+  // scrollNonce makes the resource column scroll it into view.
+  const focusNoteMatch = useCallback(
+    (ch: number, v: number, noteId: string) => {
+      runWithDirtyGate(() => {
+        if (ch !== chapter) {
+          onNavigate?.(book, ch, v);
+          return;
+        }
+        setActiveVerse(v);
+        setActiveWordId(null);
+        setActiveNoteId(noteId);
+        setScrollNonce((n) => n + 1);
+      });
+    },
+    [runWithDirtyGate, chapter, book, onNavigate],
+  );
+
   // Keep the alignment target's verse in step with the active verse while
   // we're in alignment mode. Bible version is sticky — only LinkIcon clicks
   // change it. Effect, not direct setter, so it survives both rail clicks
@@ -1368,6 +1405,8 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           onOpenAligner={(v, bv) => openAligner(chapter, v, bv)}
           scrollNonce={scrollNonce}
           onRequestScrollToActive={requestScrollToActive}
+          searchNotes={getSearchNotes}
+          onScrollToNoteMatch={focusNoteMatch}
           lexiconMap={lexiconMap}
           locked={Boolean(chapterLock)}
         />

@@ -11,6 +11,8 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Alert,
   Box,
+  Checkbox,
+  FormControlLabel,
   Stack,
   TextField,
   IconButton,
@@ -23,7 +25,7 @@ import CloseIcon from "@mui/icons-material/Close";
 import ArrowUpwardIcon from "@mui/icons-material/ArrowUpward";
 import ArrowDownwardIcon from "@mui/icons-material/ArrowDownward";
 import type { ChapterState } from "../hooks/useBook";
-import type { VerseDto } from "../sync/api";
+import type { TnRow, VerseDto } from "../sync/api";
 import { smartReplaceVerse } from "../lib/replace";
 import {
   classifySourceQuery,
@@ -45,6 +47,53 @@ export interface FindMatch {
   startIndex: number;
   endIndex: number;
   matchText: string;
+}
+
+// A translation-note hit. The TN checkbox folds the note body, support
+// reference, and note id into one searchable corpus — each is distinct
+// enough that a single query against all three rarely collides.
+export interface NoteMatch {
+  chapter: number;
+  verse: number;
+  noteId: string;
+  field: "note" | "support_reference" | "id";
+  matchText: string;
+}
+
+// Unified nav result: scripture (bible) hit or translation-note hit. The
+// "X / Y" counter and prev/next walk this combined, chapter/verse-ordered
+// list so the two scopes interleave naturally.
+type SearchResult =
+  | { kind: "bible"; chapter: number; verse: number; match: FindMatch }
+  | { kind: "note"; chapter: number; verse: number; match: NoteMatch };
+
+// Which corpora the find box searches. Persisted so the choice sticks across
+// sessions. At least one scope is always on (toggling the last one off is a
+// no-op) so the box never silently searches nothing.
+const SCOPE_KEY = "be:find-scope";
+type FindScope = { bible: boolean; tn: boolean };
+
+function loadScope(): FindScope {
+  try {
+    const raw = localStorage.getItem(SCOPE_KEY);
+    if (raw) {
+      const p = JSON.parse(raw) as Partial<FindScope>;
+      const bible = p.bible !== false;
+      const tn = !!p.tn;
+      return bible || tn ? { bible, tn } : { bible: true, tn: false };
+    }
+  } catch {
+    /* ignore */
+  }
+  return { bible: true, tn: false };
+}
+
+function saveScope(s: FindScope) {
+  try {
+    localStorage.setItem(SCOPE_KEY, JSON.stringify(s));
+  } catch {
+    /* ignore */
+  }
 }
 
 interface Props {
@@ -78,6 +127,14 @@ interface Props {
   onQueryChange: (
     query: { find: string; regex: boolean; caseSensitive: boolean; strongs: boolean } | null,
   ) => void;
+  // Live accessor for the translation notes in scope — the current chapter in
+  // stacked/columns mode, every loaded chapter in book mode. A getter (not a
+  // prop array) so the overlay reads fresh notes on each search without
+  // forcing the memoized ScriptureColumn to re-render on every note keystroke.
+  searchNotes: () => TnRow[];
+  // Navigate to + activate a TN match: focus its verse and note so the
+  // resource column scrolls it into view.
+  onScrollToNoteMatch: (chapter: number, verse: number, noteId: string) => void;
 }
 
 export function FindReplaceOverlay({
@@ -91,11 +148,14 @@ export function FindReplaceOverlay({
   onReplaceVerse,
   onScrollToMatch,
   onQueryChange,
+  searchNotes,
+  onScrollToNoteMatch,
 }: Props) {
   const [find, setFind] = useState("");
   const [replace, setReplace] = useState("");
   const [regex, setRegex] = useState(false);
   const [caseSensitive, setCaseSensitive] = useState(false);
+  const [scope, setScope] = useState<FindScope>(() => loadScope());
   // Opt-in: interpret bare-digit queries as Strong's numbers. Off by default
   // because bible text has lots of numbers ("eighth month", "1:1") and the
   // user would expect those to hit. Toggle only appears when relevant.
@@ -111,6 +171,16 @@ export function FindReplaceOverlay({
   // while they're typing.
   const wantsScrollRef = useRef(false);
 
+  // Flip a scope checkbox. Refuse to turn the last one off (the box would
+  // search nothing). Treat a scope change as user navigation so results settle
+  // and we scroll to the first hit.
+  const updateScope = (next: FindScope) => {
+    if (!next.bible && !next.tn) return;
+    setScope(next);
+    saveScope(next);
+    wantsScrollRef.current = true;
+  };
+
   // Focus the find input when the overlay opens (Ctrl/Cmd+F flow).
   useEffect(() => {
     if (open) {
@@ -123,13 +193,15 @@ export function FindReplaceOverlay({
   // Any change to the search inputs counts as user navigation — once the
   // new matches settle, scroll to the first hit.
   useEffect(() => {
-    if (!open || !find) {
+    // Only paint scripture cells when the Bible scope is on — TN-only searches
+    // shouldn't light up verse text.
+    if (!open || !find || !scope.bible) {
       onQueryChange(null);
       return;
     }
     wantsScrollRef.current = true;
     onQueryChange({ find, regex, caseSensitive, strongs });
-  }, [open, find, regex, caseSensitive, strongs, onQueryChange]);
+  }, [open, find, regex, caseSensitive, strongs, scope.bible, onQueryChange]);
 
   const compiled = useMemo(() => buildSearchRegex(find, regex, caseSensitive), [find, regex, caseSensitive]);
   const regexInvalid = !!find && compiled.error;
@@ -141,17 +213,65 @@ export function FindReplaceOverlay({
     [find, regex, book, strongs],
   );
 
-  const matches = useMemo<FindMatch[]>(() => {
-    if (!open) return [];
+  const bibleMatches = useMemo<FindMatch[]>(() => {
+    if (!open || !scope.bible) return [];
     if (sourceQuery.kind === "english" && !compiled.re) return [];
     return collectMatches(chapters, enabledVersions, compiled.re, sourceQuery);
-  }, [open, compiled.re, sourceQuery, chapters, enabledVersions]);
+  }, [open, scope.bible, compiled.re, sourceQuery, chapters, enabledVersions]);
 
-  // Clamp activeIdx whenever the match list reshapes. Only fire
-  // onScrollToMatch if a user action flagged that they want the scroll —
-  // ambient reshapes (external typing) clamp silently.
+  // Note matches re-read live notes via searchNotes() whenever the query
+  // changes — `find`/`compiled.re` in the deps are the recompute signal.
+  const noteMatches = useMemo<NoteMatch[]>(() => {
+    if (!open || !scope.tn || !find) return [];
+    return collectNoteMatches(searchNotes(), compiled.re);
+  }, [open, scope.tn, find, compiled.re, searchNotes]);
+
+  // Merge + order both scopes by chapter then verse, bible before note within
+  // the same verse, so prev/next walks the document top-to-bottom.
+  const results = useMemo<SearchResult[]>(() => {
+    const out: SearchResult[] = [];
+    for (const m of bibleMatches)
+      out.push({ kind: "bible", chapter: m.chapter, verse: m.verse, match: m });
+    for (const m of noteMatches)
+      out.push({ kind: "note", chapter: m.chapter, verse: m.verse, match: m });
+    out.sort(
+      (a, b) =>
+        a.chapter - b.chapter ||
+        a.verse - b.verse ||
+        (a.kind === b.kind ? 0 : a.kind === "bible" ? -1 : 1),
+    );
+    return out;
+  }, [bibleMatches, noteMatches]);
+
+  // Active scripture match (when the current result is a bible hit) — replace
+  // acts on this; null while sitting on a note result.
+  const activeBibleMatch =
+    results[activeIdx]?.kind === "bible"
+      ? (results[activeIdx] as Extract<SearchResult, { kind: "bible" }>).match
+      : null;
+
+  // Route the active result to the right surface: scripture cells scroll +
+  // highlight via onScrollToMatch; notes navigate + activate via
+  // onScrollToNoteMatch (and clear any scripture active-mark).
+  function navTo(idx: number) {
+    const r = results[idx];
+    if (!r) {
+      onScrollToMatch(null);
+      return;
+    }
+    if (r.kind === "bible") {
+      onScrollToMatch(r.match);
+    } else {
+      onScrollToMatch(null);
+      onScrollToNoteMatch(r.match.chapter, r.match.verse, r.match.noteId);
+    }
+  }
+
+  // Clamp activeIdx whenever the result list reshapes. Only navigate if a user
+  // action flagged that they want the scroll — ambient reshapes (external
+  // typing) clamp silently.
   useEffect(() => {
-    if (matches.length === 0) {
+    if (results.length === 0) {
       setActiveIdx(0);
       if (wantsScrollRef.current) {
         wantsScrollRef.current = false;
@@ -159,25 +279,28 @@ export function FindReplaceOverlay({
       }
       return;
     }
-    const idx = Math.min(activeIdx, matches.length - 1);
+    const idx = Math.min(activeIdx, results.length - 1);
     if (idx !== activeIdx) setActiveIdx(idx);
     if (wantsScrollRef.current) {
       wantsScrollRef.current = false;
-      onScrollToMatch(matches[idx]);
+      navTo(idx);
     }
-  }, [matches, activeIdx, onScrollToMatch]);
+    // navTo closes over the current results; onScrollToMatch is the stable
+    // dep that matters here (mirrors the original effect's dep list).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [results, activeIdx, onScrollToMatch]);
 
   const goPrev = () => {
-    if (matches.length === 0) return;
-    const next = (activeIdx - 1 + matches.length) % matches.length;
+    if (results.length === 0) return;
+    const next = (activeIdx - 1 + results.length) % results.length;
     setActiveIdx(next);
-    onScrollToMatch(matches[next]);
+    navTo(next);
   };
   const goNext = () => {
-    if (matches.length === 0) return;
-    const next = (activeIdx + 1) % matches.length;
+    if (results.length === 0) return;
+    const next = (activeIdx + 1) % results.length;
     setActiveIdx(next);
-    onScrollToMatch(matches[next]);
+    navTo(next);
   };
 
   // Status surfaced after a replace-all so the user sees when alignment
@@ -221,15 +344,17 @@ export function FindReplaceOverlay({
   };
 
   const doReplaceAll = () => {
-    if (!compiled.re || matches.length === 0) return;
-    // Group matches by verse. Re-derive matches in the *current* plain text
-    // for each iteration instead of trusting `startIndex` from the original
-    // collection — normalize() inside smartReplaceVerse can collapse
-    // whitespace and shift the indices of every later match. The original
-    // reverse-sort approach was correct only when normalize was a no-op.
+    if (!compiled.re || bibleMatches.length === 0) return;
+    // Replace only touches scripture (bible) matches — TN notes are never
+    // rewritten by find/replace. Group matches by verse. Re-derive matches in
+    // the *current* plain text for each iteration instead of trusting
+    // `startIndex` from the original collection — normalize() inside
+    // smartReplaceVerse can collapse whitespace and shift the indices of every
+    // later match. The original reverse-sort approach was correct only when
+    // normalize was a no-op.
     const byVerse = new Map<string, FindMatch[]>();
     let readOnlySkipped = 0;
-    for (const m of matches) {
+    for (const m of bibleMatches) {
       if (READ_ONLY_VERSIONS.has(m.bibleVersion)) {
         readOnlySkipped += 1;
         continue;
@@ -300,7 +425,7 @@ export function FindReplaceOverlay({
         py: 1,
       }}
     >
-      <Stack direction="row" alignItems="center" spacing={1}>
+      <Stack direction="row" alignItems="center" spacing={1} useFlexGap flexWrap="wrap">
         <TextField
           inputRef={findInputRef}
           value={find}
@@ -369,22 +494,50 @@ export function FindReplaceOverlay({
             </ToggleButton>
           </Tooltip>
         )}
+        <Tooltip title="search scripture text (ULT / UST / UHB / UGNT)">
+          <FormControlLabel
+            control={
+              <Checkbox
+                size="small"
+                checked={scope.bible}
+                onChange={(e) => updateScope({ ...scope, bible: e.target.checked })}
+                sx={{ p: 0.25 }}
+              />
+            }
+            label="Bible"
+            sx={{ m: 0, "& .MuiFormControlLabel-label": { fontSize: 12 } }}
+          />
+        </Tooltip>
+        <Tooltip title="search translation notes — note text, support reference (SR), and note id">
+          <FormControlLabel
+            control={
+              <Checkbox
+                size="small"
+                checked={scope.tn}
+                onChange={(e) => updateScope({ ...scope, tn: e.target.checked })}
+                sx={{ p: 0.25 }}
+              />
+            }
+            label="TN"
+            sx={{ m: 0, "& .MuiFormControlLabel-label": { fontSize: 12 } }}
+          />
+        </Tooltip>
         <Typography
           variant="caption"
           sx={{ fontFamily: "monospace", minWidth: 72, textAlign: "center", color: "text.secondary" }}
         >
-          {matches.length === 0 ? "no results" : `${activeIdx + 1} / ${matches.length}`}
+          {results.length === 0 ? "no results" : `${activeIdx + 1} / ${results.length}`}
         </Typography>
         <Tooltip title="previous match (Shift+Enter)">
           <span>
-            <IconButton size="small" onClick={goPrev} disabled={matches.length === 0}>
+            <IconButton size="small" onClick={goPrev} disabled={results.length === 0}>
               <ArrowUpwardIcon fontSize="small" />
             </IconButton>
           </span>
         </Tooltip>
         <Tooltip title="next match (Enter)">
           <span>
-            <IconButton size="small" onClick={goNext} disabled={matches.length === 0}>
+            <IconButton size="small" onClick={goNext} disabled={results.length === 0}>
               <ArrowDownwardIcon fontSize="small" />
             </IconButton>
           </span>
@@ -438,30 +591,29 @@ export function FindReplaceOverlay({
           sx={{ minWidth: 240 }}
           inputProps={{ style: { fontFamily: "monospace", fontSize: 13 } }}
         />
-        <Tooltip title="replace the active match (this verse only, overwrites alignment for it)">
+        <Tooltip title="replace the active match (scripture only, this verse, overwrites alignment for it)">
           <span>
             <Button
               size="small"
               variant="outlined"
               onClick={() => {
-                const m = matches[activeIdx];
-                if (m) doReplaceMatch(m);
+                if (activeBibleMatch) doReplaceMatch(activeBibleMatch);
               }}
-              disabled={matches.length === 0}
+              disabled={!activeBibleMatch}
               sx={{ textTransform: "none" }}
             >
               replace
             </Button>
           </span>
         </Tooltip>
-        <Tooltip title="replace every match in every loaded chapter (one PATCH per affected verse; alignment is overwritten where it lands)">
+        <Tooltip title="replace every scripture match in every loaded chapter (one PATCH per affected verse; alignment is overwritten where it lands; notes are never rewritten)">
           <span>
             <Button
               size="small"
               variant="contained"
               color="warning"
               onClick={doReplaceAll}
-              disabled={matches.length === 0}
+              disabled={bibleMatches.length === 0}
               sx={{ textTransform: "none" }}
             >
               replace all
@@ -566,6 +718,37 @@ function collectMatches(
           });
           if (m[0].length === 0) localRe.lastIndex++;
         }
+      }
+    }
+  }
+  return out;
+}
+
+// Match a query against translation notes. The TN checkbox searches three
+// fields per note — body, support reference, id — and emits at most one result
+// per note (the first field that hits) so prev/next jumps note-to-note rather
+// than field-to-field. Trashed / deleted notes are skipped: they aren't shown
+// in the resource column, so there'd be nothing to scroll to.
+function collectNoteMatches(notes: TnRow[], re: RegExp | null): NoteMatch[] {
+  if (!re) return [];
+  const out: NoteMatch[] = [];
+  const fields: NoteMatch["field"][] = ["note", "support_reference", "id"];
+  for (const n of notes) {
+    if (n.trashed_at != null || n.deleted_at != null) continue;
+    for (const field of fields) {
+      const value = n[field];
+      if (!value) continue;
+      // Fresh regex per test so a stateful /g lastIndex doesn't carry over.
+      const local = new RegExp(re.source, re.flags);
+      if (local.test(value)) {
+        out.push({
+          chapter: n.chapter,
+          verse: n.verse,
+          noteId: n.id,
+          field,
+          matchText: value,
+        });
+        break;
       }
     }
   }

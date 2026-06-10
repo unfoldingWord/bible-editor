@@ -8,7 +8,7 @@ import SearchIcon from "@mui/icons-material/Search";
 import UndoIcon from "@mui/icons-material/Undo";
 import SaveIcon from "@mui/icons-material/Save";
 import SaveOutlinedIcon from "@mui/icons-material/SaveOutlined";
-import type { ChapterPayload, VerseDto } from "../sync/api";
+import type { ChapterPayload, TnRow, VerseDto } from "../sync/api";
 import { drafts, verseKey } from "../sync/drafts";
 import { DocColumn } from "./DocColumn";
 import type { FindMatch } from "./FindReplaceOverlay";
@@ -76,6 +76,12 @@ interface Props {
   // note/word/verse-group into view alongside the scripture.
   scrollNonce: number;
   onRequestScrollToActive: () => void;
+  // Find-overlay TN search: a stable getter for the notes currently in scope
+  // (forwarded to the overlay), plus a callback to navigate to + activate a
+  // matched note. Stable identities so this component's memo still skips
+  // re-renders on every note keystroke.
+  searchNotes: () => TnRow[];
+  onScrollToNoteMatch: (chapter: number, verse: number, noteId: string) => void;
   // Pre-loaded UHB strong → entry map (Shell collects from useChapter +
   // useBook) so per-word hover tooltips don't shimmer.
   lexiconMap: Map<string, LexiconEntry | null>;
@@ -157,6 +163,8 @@ function ScriptureColumnInner({
   onReplaceVerse,
   scrollNonce,
   onRequestScrollToActive,
+  searchNotes,
+  onScrollToNoteMatch,
   lexiconMap,
   onSelectVerse,
   onOpenAligner,
@@ -435,6 +443,8 @@ function ScriptureColumnInner({
               onReplaceVerse={onReplaceVerse}
               onScrollToMatch={onFindScrollToMatch}
               onQueryChange={onFindQueryChange}
+              searchNotes={searchNotes}
+              onScrollToNoteMatch={onScrollToNoteMatch}
             />
           </Suspense>
         )}
