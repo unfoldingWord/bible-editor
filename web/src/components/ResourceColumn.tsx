@@ -106,6 +106,7 @@ interface Props {
 
 type PinKey = "notes" | "words" | "questions";
 type Pinned = Record<PinKey, boolean>;
+type ResourceTab = "notes" | "words" | "questions";
 
 const PINNED_KEY = "be:pinned";
 
@@ -210,6 +211,16 @@ export function ResourceColumn({
     savePinned(next);
   };
 
+  // Which resource the body shows when panelMode === "resources". Splitting
+  // Notes / Words / Questions into separate views keeps the Notes column free
+  // of TWL/TQ clutter; the tabs now switch the view instead of scroll-jumping
+  // within one stacked body.
+  const [resourceTab, setResourceTab] = useState<ResourceTab>("notes");
+  const showResource = (tab: ResourceTab) => {
+    if (panelMode !== "resources") onSetPanelMode?.("resources");
+    setResourceTab(tab);
+  };
+
   const [rangeStart, rangeEnd] = displayVerseRange;
   const tnForVerse = useMemo(
     () => sortBySortOrder(tn.filter((r) => r.verse >= rangeStart && r.verse <= rangeEnd)),
@@ -254,12 +265,7 @@ export function ResourceColumn({
     { targetId: string; position: DropPosition } | null
   >(null);
 
-  const notesRef = useRef<HTMLDivElement | null>(null);
-  const wordsRef = useRef<HTMLDivElement | null>(null);
-  const questionsRef = useRef<HTMLDivElement | null>(null);
   const scrollBodyRef = useRef<HTMLDivElement | null>(null);
-  const scrollTo = (r: React.RefObject<HTMLDivElement | null>) =>
-    r.current?.scrollIntoView({ behavior: "smooth", block: "start" });
 
   // Keep the resource column lined up with the active selection. We fire on:
   //   - scrollNonce (Shell's "go to active" button)
@@ -334,34 +340,25 @@ export function ResourceColumn({
           label="Notes"
           count={totalTn}
           countSuffix={pinned.notes ? " · ch" : ""}
-          active={panelMode === "resources"}
+          active={panelMode === "resources" && resourceTab === "notes"}
           accent={false}
-          onClick={() => {
-            if (panelMode !== "resources") onSetPanelMode?.("resources");
-            scrollTo(notesRef);
-          }}
+          onClick={() => showResource("notes")}
         />
         <PanelTab
           label="Words"
           count={totalTwl}
           countSuffix={pinned.words ? " · ch" : ""}
-          active={panelMode === "resources"}
+          active={panelMode === "resources" && resourceTab === "words"}
           accent={false}
-          onClick={() => {
-            if (panelMode !== "resources") onSetPanelMode?.("resources");
-            scrollTo(wordsRef);
-          }}
+          onClick={() => showResource("words")}
         />
         <PanelTab
           label="Questions"
           count={totalTq}
           countSuffix={pinned.questions ? " · ch" : ""}
-          active={panelMode === "resources"}
+          active={panelMode === "resources" && resourceTab === "questions"}
           accent={false}
-          onClick={() => {
-            if (panelMode !== "resources") onSetPanelMode?.("resources");
-            scrollTo(questionsRef);
-          }}
+          onClick={() => showResource("questions")}
         />
         <PanelTab
           label="Alignment"
@@ -397,107 +394,116 @@ export function ResourceColumn({
         )
       ) : (
       <Box ref={scrollBodyRef} sx={{ flex: 1, overflowY: "auto", px: 2, py: 1 }}>
-        <div ref={notesRef} />
-        <SectionHead
-          title="Notes"
-          count={totalTn}
-          pinned={pinned.notes}
-          onTogglePin={() => togglePinned("notes")}
-          onAdd={onNoteCreate}
-          sticky
-          hideAdd={locked}
-        />
-        {tnGroups ? (
-          tnGroups.length === 0 ? (
-            <Typography variant="body2" color="text.disabled" sx={{ py: 1, pl: 1 }}>
-              no notes in this chapter
-            </Typography>
-          ) : (
-            tnGroups.map(([verse, rows]) => (
-              <Fragment key={`tn-${verse}`}>
-                <VerseGroupHead verse={verse} active={verse === activeVerse} />
-                {rows.map((r) => renderNoteCard(r, rows))}
-              </Fragment>
-            ))
-          )
-        ) : tnForVerse.length === 0 ? (
-          <Typography variant="body2" color="text.disabled" sx={{ py: 1, pl: 1 }}>
-            no notes for this verse
-          </Typography>
-        ) : (
-          tnForVerse.map((r) => renderNoteCard(r, tnForVerse))
+        {resourceTab === "notes" && (
+          <>
+            <SectionHead
+              title="Notes"
+              count={totalTn}
+              pinned={pinned.notes}
+              onTogglePin={() => togglePinned("notes")}
+              onAdd={onNoteCreate}
+              sticky
+              hideAdd={locked}
+            />
+            {tnGroups ? (
+              tnGroups.length === 0 ? (
+                <Typography variant="body2" color="text.disabled" sx={{ py: 1, pl: 1 }}>
+                  no notes in this chapter
+                </Typography>
+              ) : (
+                tnGroups.map(([verse, rows]) => (
+                  <Fragment key={`tn-${verse}`}>
+                    <VerseGroupHead verse={verse} active={verse === activeVerse} />
+                    {rows.map((r) => renderNoteCard(r, rows))}
+                  </Fragment>
+                ))
+              )
+            ) : tnForVerse.length === 0 ? (
+              <Typography variant="body2" color="text.disabled" sx={{ py: 1, pl: 1 }}>
+                no notes for this verse
+              </Typography>
+            ) : (
+              tnForVerse.map((r) => renderNoteCard(r, tnForVerse))
+            )}
+          </>
         )}
 
-        <Box sx={{ height: 16 }} />
-        <div ref={wordsRef} />
-        <SectionHead
-          title="Words"
-          count={totalTwl}
-          pinned={pinned.words}
-          onTogglePin={() => togglePinned("words")}
-          onAdd={onWordCreate}
-          hideAdd={locked}
-        />
-        {twlGroups ? (
-          twlGroups.length === 0 ? (
-            <Typography variant="body2" color="text.disabled" sx={{ py: 1, pl: 1 }}>
-              no words in this chapter
-            </Typography>
-          ) : (
-            twlGroups.map(([verse, rows]) => (
-              <Fragment key={`twl-${verse}`}>
-                <VerseGroupHead verse={verse} active={verse === activeVerse} />
-                <WordsTable
-                  rows={rows}
-                  activeId={activeWordId}
-                  onSave={onWordSave}
-                  onDelete={onWordDelete}
-                  onFocus={onWordFocus}
-                  onReorder={onWordReorder}
-                  locked={locked}
-                  onTranslateQuote={onWordTranslateQuote}
-                />
-              </Fragment>
-            ))
-          )
-        ) : (
-          <WordsTable
-            rows={twlForVerse}
-            activeId={activeWordId}
-            onSave={onWordSave}
-            onDelete={onWordDelete}
-            onFocus={onWordFocus}
-            onReorder={onWordReorder}
-            locked={locked}
-            onTranslateQuote={onWordTranslateQuote}
-          />
+        {resourceTab === "words" && (
+          <>
+            <SectionHead
+              title="Words"
+              count={totalTwl}
+              pinned={pinned.words}
+              onTogglePin={() => togglePinned("words")}
+              onAdd={onWordCreate}
+              sticky
+              hideAdd={locked}
+            />
+            {twlGroups ? (
+              twlGroups.length === 0 ? (
+                <Typography variant="body2" color="text.disabled" sx={{ py: 1, pl: 1 }}>
+                  no words in this chapter
+                </Typography>
+              ) : (
+                twlGroups.map(([verse, rows]) => (
+                  <Fragment key={`twl-${verse}`}>
+                    <VerseGroupHead verse={verse} active={verse === activeVerse} />
+                    <WordsTable
+                      rows={rows}
+                      activeId={activeWordId}
+                      onSave={onWordSave}
+                      onDelete={onWordDelete}
+                      onFocus={onWordFocus}
+                      onReorder={onWordReorder}
+                      locked={locked}
+                      onTranslateQuote={onWordTranslateQuote}
+                    />
+                  </Fragment>
+                ))
+              )
+            ) : (
+              <WordsTable
+                rows={twlForVerse}
+                activeId={activeWordId}
+                onSave={onWordSave}
+                onDelete={onWordDelete}
+                onFocus={onWordFocus}
+                onReorder={onWordReorder}
+                locked={locked}
+                onTranslateQuote={onWordTranslateQuote}
+              />
+            )}
+          </>
         )}
 
-        <Box sx={{ height: 16 }} />
-        <div ref={questionsRef} />
-        <SectionHead
-          title="Questions"
-          count={totalTq}
-          pinned={pinned.questions}
-          onTogglePin={() => togglePinned("questions")}
-          onAdd={onQuestionCreate}
-          hideAdd={locked}
-        />
-        {tqGroups ? (
-          tqGroups.length === 0 ? (
-            <Typography variant="body2" color="text.disabled" sx={{ py: 1, pl: 1 }}>
-              no questions in this chapter
-            </Typography>
-          ) : (
-            tqGroups.map(([verse, rows]) => (
-              <Fragment key={`tq-${verse}`}>
-                <VerseGroupHead verse={verse} active={verse === activeVerse} />
-                <QuestionsTable rows={rows} onSave={onQuestionSave} onDelete={onQuestionDelete} locked={locked} />
-              </Fragment>
-            ))
-          )
-        ) : (
-          <QuestionsTable rows={tqForVerse} onSave={onQuestionSave} onDelete={onQuestionDelete} locked={locked} />
+        {resourceTab === "questions" && (
+          <>
+            <SectionHead
+              title="Questions"
+              count={totalTq}
+              pinned={pinned.questions}
+              onTogglePin={() => togglePinned("questions")}
+              onAdd={onQuestionCreate}
+              sticky
+              hideAdd={locked}
+            />
+            {tqGroups ? (
+              tqGroups.length === 0 ? (
+                <Typography variant="body2" color="text.disabled" sx={{ py: 1, pl: 1 }}>
+                  no questions in this chapter
+                </Typography>
+              ) : (
+                tqGroups.map(([verse, rows]) => (
+                  <Fragment key={`tq-${verse}`}>
+                    <VerseGroupHead verse={verse} active={verse === activeVerse} />
+                    <QuestionsTable rows={rows} onSave={onQuestionSave} onDelete={onQuestionDelete} locked={locked} />
+                  </Fragment>
+                ))
+              )
+            ) : (
+              <QuestionsTable rows={tqForVerse} onSave={onQuestionSave} onDelete={onQuestionDelete} locked={locked} />
+            )}
+          </>
         )}
       </Box>
       )}
@@ -735,7 +741,7 @@ function PanelTab({
         fontWeight: active ? 600 : 500,
         color: active && accent ? "primary.main" : active ? "text.primary" : "text.secondary",
         borderBottom: "2px solid",
-        borderColor: active && accent ? "primary.main" : "transparent",
+        borderColor: active ? (accent ? "primary.main" : "text.primary") : "transparent",
         marginBottom: "-1px",
         "&:hover": { color: accent ? "primary.main" : "text.primary" },
       }}
