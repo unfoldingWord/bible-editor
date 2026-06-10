@@ -525,6 +525,20 @@ export interface Catalogs {
   twLinks: string[];
 }
 
+// One curated note template for a support reference. `type` is the variant
+// label from the sheet ("generic", "plural", …); empty string is the default
+// unnamed variant.
+export interface NoteTemplate {
+  type: string;
+  body: string;
+}
+
+// Curated note templates keyed by short support reference (e.g. "figs-metaphor"),
+// each an ordered list of variants. Sourced from a Google Sheet, edge-cached.
+export interface NoteTemplatesResponse {
+  templates: Record<string, NoteTemplate[]>;
+}
+
 export interface BookListEntry {
   book: string;
   imported_at: number;
@@ -793,6 +807,8 @@ export const api = {
     ),
 
   getCatalogs: () => request<Catalogs>(`/api/catalogs`),
+
+  getNoteTemplates: () => request<NoteTemplatesResponse>(`/api/note-templates`),
 
   getBooks: () => request<{ books: BookListEntry[] }>(`/api/books`),
 

@@ -16,6 +16,9 @@ import {
   DialogContentText,
   DialogActions,
   Button,
+  Menu,
+  MenuItem,
+  ListItemText,
 } from "@mui/material";
 import PushPinOutlinedIcon from "@mui/icons-material/PushPinOutlined";
 import LightbulbOutlinedIcon from "@mui/icons-material/LightbulbOutlined";
@@ -30,8 +33,11 @@ import SaveOutlinedIcon from "@mui/icons-material/SaveOutlined";
 import TranslateIcon from "@mui/icons-material/Translate";
 import UndoIcon from "@mui/icons-material/Undo";
 import AutoAwesomeIcon from "@mui/icons-material/AutoAwesome";
+import DescriptionOutlinedIcon from "@mui/icons-material/DescriptionOutlined";
+import ArrowDropDownIcon from "@mui/icons-material/ArrowDropDown";
 import type { TnRow } from "../sync/api";
 import { useCatalogs } from "../hooks/useCatalogs";
+import { useNoteTemplates } from "../hooks/useNoteTemplates";
 import { CatalogPicker } from "./CatalogPicker";
 import { shortSupport } from "../lib/supportReference";
 import { TCM, buildSH } from "../lib/noteTemplates";
@@ -195,6 +201,10 @@ function NoteCardInner({
   const [supportRef, setSupportRef] = useState<string | null>(row.support_reference);
   const [historyOpen, setHistoryOpen] = useState(false);
   const [aiConfirmOpen, setAiConfirmOpen] = useState(false);
+  // Template dropdown anchor (only used when a support ref has >1 variant) and
+  // the body staged for the "replace existing note?" confirm dialog.
+  const [templateMenuAnchor, setTemplateMenuAnchor] = useState<HTMLElement | null>(null);
+  const [templateConfirmBody, setTemplateConfirmBody] = useState<string | null>(null);
 
   // Baseline of the last server-confirmed content. stashEdit() optimistically
   // re-spreads row.{quote,note,support_reference} on every keystroke (so a
@@ -271,6 +281,7 @@ function NoteCardInner({
 
   const paperRef = useRef<HTMLDivElement | null>(null);
   const catalogs = useCatalogs();
+  const noteTemplates = useNoteTemplates();
 
   const positionFromEvent = (e: React.DragEvent): DropPosition => {
     const rect = paperRef.current?.getBoundingClientRect();
@@ -583,6 +594,27 @@ function NoteCardInner({
       return;
     }
     onStartAi();
+  };
+
+  // Curated templates for the selected support reference (keyed on the short
+  // form, e.g. "figs-metaphor"). Empty when no support ref is picked or the
+  // ref has no templates in the sheet.
+  const templatesForRef = supportRef ? noteTemplates[shortSupport(supportRef)] ?? [] : [];
+
+  // Fill the note from a template, going through stashEdit so the parent's
+  // row.note reflects it (matches the TCM/SH chips). requestTemplate gates on
+  // existing text: a non-empty note opens a confirm dialog first.
+  const applyTemplate = (body: string) => {
+    setNote(body);
+    stashEdit({ note: body });
+  };
+  const requestTemplate = (body: string) => {
+    if (note.trim().length > 0) setTemplateConfirmBody(body);
+    else applyTemplate(body);
+  };
+  const handleTemplateClick = (e: React.MouseEvent<HTMLElement>) => {
+    if (templatesForRef.length === 1) requestTemplate(templatesForRef[0].body);
+    else if (templatesForRef.length > 1) setTemplateMenuAnchor(e.currentTarget);
   };
 
   const showSessionButtons = active;
@@ -988,6 +1020,35 @@ function NoteCardInner({
           <Box sx={{ flex: 1 }} />
           <Tooltip
             title={
+              !supportRef
+                ? "pick a support reference first"
+                : templatesForRef.length === 0
+                  ? `no template for ${shortSupport(supportRef)}`
+                  : templatesForRef.length > 1
+                    ? "choose a template"
+                    : "fill from template"
+            }
+          >
+            <span>
+              <Button
+                size="small"
+                variant="text"
+                onClick={handleTemplateClick}
+                disabled={readOnly || !supportRef || templatesForRef.length === 0}
+                startIcon={<DescriptionOutlinedIcon sx={{ fontSize: "14px !important" }} />}
+                endIcon={
+                  templatesForRef.length > 1 ? (
+                    <ArrowDropDownIcon sx={{ fontSize: "16px !important", ml: -0.75 }} />
+                  ) : undefined
+                }
+                sx={{ fontSize: 12, fontWeight: 500, color: "text.secondary", minWidth: 0, py: 0.25, px: 0.75 }}
+              >
+                Template
+              </Button>
+            </span>
+          </Tooltip>
+          <Tooltip
+            title={
               isAiPending
                 ? "drafting in background — feel free to edit other notes"
                 : !onStartAi
@@ -1203,6 +1264,50 @@ function NoteCardInner({
             onClick={() => {
               setAiConfirmOpen(false);
               onStartAi?.();
+            }}
+            color="primary"
+            variant="contained"
+          >
+            Replace
+          </Button>
+        </DialogActions>
+      </Dialog>
+      <Menu
+        anchorEl={templateMenuAnchor}
+        open={Boolean(templateMenuAnchor)}
+        onClose={() => setTemplateMenuAnchor(null)}
+        slotProps={{ paper: { sx: { maxWidth: 380 } } }}
+      >
+        {templatesForRef.map((t, i) => (
+          <MenuItem
+            key={`${t.type}-${i}`}
+            onClick={() => {
+              setTemplateMenuAnchor(null);
+              requestTemplate(t.body);
+            }}
+            sx={{ whiteSpace: "normal", alignItems: "flex-start" }}
+          >
+            <ListItemText
+              primary={t.type || "default"}
+              secondary={t.body.length > 90 ? `${t.body.slice(0, 90)}…` : t.body}
+            />
+          </MenuItem>
+        ))}
+      </Menu>
+      <Dialog open={templateConfirmBody !== null} onClose={() => setTemplateConfirmBody(null)}>
+        <DialogTitle>Replace existing note?</DialogTitle>
+        <DialogContent>
+          <DialogContentText>
+            This note already has text. Filling from the template will replace it. You can hit
+            Undo on the toolbar afterwards to restore the original.
+          </DialogContentText>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setTemplateConfirmBody(null)}>Cancel</Button>
+          <Button
+            onClick={() => {
+              if (templateConfirmBody !== null) applyTemplate(templateConfirmBody);
+              setTemplateConfirmBody(null);
             }}
             color="primary"
             variant="contained"
