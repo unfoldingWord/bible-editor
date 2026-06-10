@@ -12,22 +12,25 @@
 
 import type { HighlightKey } from "./highlight";
 import { matchNorm } from "./highlight.ts";
-import { nfc } from "./hebrew.ts";
 
 // Build a HighlightKey from a Hebrew/Greek string + 1-based occurrence.
 // All callers (picker + buildQuoteFromSelection + collectTargetTokens)
 // MUST go through this — UHB \w text is stored in legacy combining-mark
 // order while UST/ULT zaln x-content is NFC, so a raw `${text}|${occ}`
-// comparison loses the join. nfc() normalizes both sides to the same
-// canonical form. Same rule findSourceHighlights / findTargetHighlights
-// have used since the start.
+// comparison loses the join. Use matchNorm (NFC + word-joiner U+2060 /
+// U+200D stripping) — the SAME fold the highlighter joins by in
+// matchSourceTokens / matchGroupsAt. nfc() alone left the joiner in, so a
+// UHB token carrying a U+2060 (הָ⁠אֶבֶן) and an AI-generated x-content that
+// omitted it minted two different keys: clicking the English chip toggled a
+// phantom key the UHB row could never match, and the quote never built. One
+// fold must govern every quote/selection equality.
 export function tokenKey(text: string, occurrence: number): HighlightKey {
-  return `${nfc(text)}|${occurrence}`;
+  return `${matchNorm(text)}|${occurrence}`;
 }
 
 interface UhbWord {
   text: string;       // raw text, preserved for quote string rendering
-  key: HighlightKey;  // nfc-normalized lookup key
+  key: HighlightKey;  // matchNorm-normalized lookup key (see tokenKey)
   occurrence: number;
   // 0-based document position among all \w tokens in this verse. Stable
   // across re-render because the verseObjects tree is immutable while
@@ -137,12 +140,13 @@ export function buildQuoteFromSelection(
 // The picker turns a click on a target word into a set of these so the
 // existing UHB-keyed selection (used by buildQuoteFromSelection) can be
 // fed without translating between formats. The `key` field is the
-// nfc-normalized selection key — always compare keys, never raw content,
-// since UHB \w text and zaln x-content can drift in combining-mark order.
+// matchNorm-normalized selection key — always compare keys, never raw
+// content, since UHB \w text and zaln x-content can drift in combining-mark
+// order AND in word-joiner presence.
 export interface SourceAncestor {
   content: string;     // raw, for display in tooltips
   occurrence: number;
-  key: HighlightKey;   // nfc-normalized, for selection set lookups
+  key: HighlightKey;   // matchNorm-normalized, for selection set lookups
 }
 
 // Per-token shape returned by collectTargetTokens. Outer-to-inner ancestor
@@ -192,6 +196,12 @@ export function collectTargetTokens(
           ? [...stack, { content, occurrence, key: tokenKey(content, occurrence) }]
           : stack;
         walk(children, nextStack);
+      } else if (o["type"] === "section" && o["tag"] === "d") {
+        // \d (Psalm superscription) is type:"section" but its content IS
+        // alignable verse body — descend, carrying the current ancestor
+        // stack unchanged (it contributes no source of its own). Mirrors
+        // collectMilestoneRuns / collectUhbWords.
+        walk((o["children"] as unknown[] | undefined) ?? [], stack);
       } else if (o["type"] === "word" && o["tag"] === "w") {
         const text = String(o["text"] ?? "");
         const occurrence = parseInt(String(o["occurrence"] ?? "1"), 10) || 1;

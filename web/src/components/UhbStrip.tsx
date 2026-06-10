@@ -1,4 +1,4 @@
-import { type ReactNode } from "react";
+import { type ReactNode, useMemo } from "react";
 import { Box, Typography, Stack, IconButton, Tooltip } from "@mui/material";
 import ExpandLessIcon from "@mui/icons-material/ExpandLess";
 import ExpandMoreIcon from "@mui/icons-material/ExpandMore";
@@ -114,6 +114,12 @@ function SourceVerseTokens({
   fallbackText: string;
   hctx: HighlightCtx;
 }) {
+  // Precompute the per-verse TWL hint lookup once (see buildTwHintMap) so the
+  // token walk doesn't re-split + re-nfc every row's orig_words per token.
+  const twHints = useMemo(
+    () => buildTwHintMap(twlForVerse, verseNum),
+    [twlForVerse, verseNum],
+  );
   if (!Array.isArray(verseObjects)) return <>{fallbackText}</>;
   const out: ReactNode[] = [];
   // Word-token walk index — the hover identity (see highlightTypes.ts). Must
@@ -148,12 +154,19 @@ function SourceVerseTokens({
             pos={wordPos}
             source={src}
             lex={lexiconMap.get(strong) ?? null}
-            twHint={twHintFor(twlForVerse, verseNum, text)}
+            twHint={twHintFromMap(twHints, text)}
             hctx={hctx}
           />,
         );
         wordPos++;
-      } else if (o["type"] === "milestone") {
+      } else if (
+        o["type"] === "milestone" ||
+        // \d (Psalm superscription) is type:"section" but its content IS
+        // alignable verse body — descend so its \w tokens render and count
+        // toward wordPos exactly as buildSourceIndexMap counts them. Mirrors
+        // collectMilestoneRuns in highlight.ts.
+        (o["type"] === "section" && o["tag"] === "d")
+      ) {
         walk((o["children"] as unknown[] | undefined) ?? []);
       }
     }
@@ -207,17 +220,35 @@ function SourceVerseToken({
 }
 
 // ─── TWL hint helpers (shared by the strip + the alignment cards) ───────
-export function twHintFor(twlRows: TwlRow[], verseNum: number, content: string): string | null {
-  if (!content) return null;
-  const needle = nfc(content);
+// Precomputed nfc(orig-word) → tw hint map for one verse, so a per-token
+// lookup during hover re-renders is an O(1) Map.get instead of re-splitting
+// and re-nfc-ing every TWL row's orig_words for every token on every render
+// (the dual aligner rebuilds both card grids + strip on each mousemove).
+// "First row wins" is preserved exactly: rows are scanned in order and a key
+// already present is never overwritten, so the value (including a null hint
+// from a row whose tw_link doesn't resolve) matches twHintFor's first-match
+// return for the same needle.
+export function buildTwHintMap(twlRows: TwlRow[], verseNum: number): Map<string, string | null> {
+  const map = new Map<string, string | null>();
   for (const r of twlRows) {
     if (r.verse !== verseNum) continue;
     const ow = r.orig_words ?? "";
     if (!ow) continue;
-    const chunks = ow.split(/\s+/).filter(Boolean).map(nfc);
-    if (chunks.includes(needle)) return twShort(r.tw_link);
+    const hint = twShort(r.tw_link);
+    for (const chunk of ow.split(/\s+/).filter(Boolean)) {
+      const key = nfc(chunk);
+      if (!map.has(key)) map.set(key, hint);
+    }
   }
-  return null;
+  return map;
+}
+
+// Look up a precomputed map (see buildTwHintMap). Returns null both when the
+// content isn't a TWL orig-word and when its first matching row's link
+// didn't resolve — the same two cases twHintFor folds into a null return.
+export function twHintFromMap(map: Map<string, string | null>, content: string): string | null {
+  if (!content) return null;
+  return map.get(nfc(content)) ?? null;
 }
 
 function twShort(link: string | null): string | null {

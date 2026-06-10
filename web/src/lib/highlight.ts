@@ -346,6 +346,11 @@ export function findSourceForTargetText(
         const source = String(o["content"] ?? "");
         const children = (o["children"] as unknown[] | undefined) ?? [];
         walk(children, source ? [...stack, source] : stack);
+      } else if (nodeIsPsalmTitle(o)) {
+        // \d (Psalm superscription) is type:"section" but its content IS
+        // alignable verse body — walk its children like a milestone (no
+        // source contribution of its own). Mirrors collectMilestoneRuns.
+        walk((o["children"] as unknown[] | undefined) ?? [], stack);
       } else if (nodeIsWord(o)) {
         const text = String(o["text"] ?? "");
         const norm = text.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, "");
@@ -416,7 +421,9 @@ export function extractTargetSelectionText(
           seen.add(key);
           words.push(text);
         }
-      } else if (nodeIsMilestone(o)) {
+      } else if (nodeIsMilestone(o) || nodeIsPsalmTitle(o)) {
+        // \d (Psalm superscription) descends like a milestone — its inner
+        // \w tokens are alignable verse body. Mirrors collectMilestoneRuns.
         const children = (o["children"] as unknown[] | undefined) ?? [];
         walk(children);
       }

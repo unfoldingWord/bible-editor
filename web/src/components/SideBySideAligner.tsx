@@ -10,7 +10,13 @@ import type { TwlRow, VerseDto } from "../sync/api";
 import type { LexiconEntry } from "../hooks/useLexicon";
 import { extractEditableText } from "../lib/usfm";
 
-const LS_HOVERLINK = "be:alignmentHoverLink";
+// Separate key from the single-panel aligner's `be:alignmentHoverLink`
+// (which defaults OFF). The side-by-side popup's whole point is the
+// cross-highlight bridge ("hover Hebrew to bridge" in its titlebar), so it
+// defaults ON — and a distinct key keeps that intentional default from
+// colliding with (or being silently flipped by) the single-panel toggle,
+// whose `readFlag` reads the same string with the opposite default.
+const LS_HOVERLINK = "be:dualAlignmentHoverLink";
 function readHoverLink(): boolean {
   try {
     const raw = localStorage.getItem(LS_HOVERLINK);
@@ -94,6 +100,15 @@ export function SideBySideAligner({
   // Hebrew lexicon tooltip on hover — default on; turn off to see only what's
   // aligned (the highlight bridge) without the popup covering the panels.
   const [lexInfo, setLexInfo] = useState(true);
+  // Per-side panel dirty state, mirrored locally so we can lock that side's
+  // reading line while alignment drags are pending. A ReadingLine blur saves
+  // text → upstream swaps the verse prop → AlignmentPanel's reset effect
+  // recomputes its baseline and silently drops the unsaved drags AND clears
+  // `dirty` (so the close gate sees nothing to save). Disabling the reading
+  // line while the panel is dirty makes a pending alignment save un-pre-emptable
+  // by a same-side text edit. (Still forwards the upstream onDirtyChange.)
+  const [leftDirty, setLeftDirty] = useState(false);
+  const [rightDirty, setRightDirty] = useState(false);
   // Hover positions are verse-specific — a stale ring would attach to whatever
   // token happens to hold the same position after a verse nav.
   useEffect(() => {
@@ -107,7 +122,7 @@ export function SideBySideAligner({
       return next;
     });
 
-  const renderPanel = (slot: PanelSlot) => (
+  const renderPanel = (slot: PanelSlot, setLocalDirty: (dirty: boolean) => void) => (
     <AlignmentPanel
       ref={slot.panelRef}
       book={book}
@@ -121,7 +136,10 @@ export function SideBySideAligner({
       onSave={slot.onSave}
       onCancel={onClose}
       hideCancel
-      onDirtyChange={slot.onDirtyChange}
+      onDirtyChange={(dirty) => {
+        setLocalDirty(dirty);
+        slot.onDirtyChange(dirty);
+      }}
       hover={hover}
       onHoverChange={setHover}
       hoverLink={hoverLink}
@@ -236,8 +254,8 @@ export function SideBySideAligner({
             flexShrink: 0,
           }}
         >
-          <ReadingLine slot={left} onEdit={onEditReading} onSave={onSaveReading} />
-          <ReadingLine slot={right} onEdit={onEditReading} onSave={onSaveReading} />
+          <ReadingLine slot={left} onEdit={onEditReading} onSave={onSaveReading} locked={leftDirty} />
+          <ReadingLine slot={right} onEdit={onEditReading} onSave={onSaveReading} locked={rightDirty} />
         </Box>
 
         {/* one shared source strip — both sides align to the same Hebrew/Greek */}
@@ -266,7 +284,7 @@ export function SideBySideAligner({
               overflow: "hidden",
             }}
           >
-            {renderPanel(left)}
+            {renderPanel(left, setLeftDirty)}
           </Box>
           <Box
             sx={{
@@ -277,7 +295,7 @@ export function SideBySideAligner({
               overflow: "hidden",
             }}
           >
-            {renderPanel(right)}
+            {renderPanel(right, setRightDirty)}
           </Box>
         </Box>
       </Box>
@@ -359,10 +377,16 @@ function ReadingLine({
   slot,
   onEdit,
   onSave,
+  locked = false,
 }: {
   slot: PanelSlot;
   onEdit: (bibleVersion: string, plain: string, base: VerseDto) => void;
   onSave: (bibleVersion: string, plain: string, base: VerseDto) => void;
+  // Locked while this side's AlignmentPanel has unsaved drags: a text edit
+  // here would swap the verse prop and silently wipe those drags (see the
+  // dirty-state note in SideBySideAligner). The translator saves/cancels the
+  // alignment first, then the line unlocks.
+  locked?: boolean;
 }) {
   const { bibleVersion, verse } = slot;
   const editable = useMemo(() => (verse ? extractEditableText(verse.content) : ""), [verse]);
@@ -406,16 +430,28 @@ function ReadingLine({
         }}
       >
         {bibleVersion} · reading text{" "}
-        <Box component="span" sx={{ color: "primary.main", textTransform: "none", letterSpacing: 0 }}>
-          ✎ editable
+        <Box
+          component="span"
+          sx={{
+            color: locked ? "text.disabled" : "primary.main",
+            textTransform: "none",
+            letterSpacing: 0,
+          }}
+        >
+          {locked ? "🔒 save alignment first" : "✎ editable"}
         </Box>
       </Typography>
       {verse ? (
         <Box
           ref={elRef}
-          contentEditable
+          contentEditable={!locked}
           suppressContentEditableWarning
           spellCheck
+          title={
+            locked
+              ? "save or cancel the pending alignment edits before editing the reading text"
+              : undefined
+          }
           onInput={(e) => {
             const value = (e.currentTarget as HTMLDivElement).textContent ?? "";
             onEdit(bibleVersion, value, verse);
@@ -432,17 +468,22 @@ function ReadingLine({
             fontFamily: '"Times New Roman", "Cardo", serif',
             fontSize: 15,
             lineHeight: 1.5,
-            color: "text.primary",
+            color: locked ? "text.disabled" : "text.primary",
             outline: "none",
             borderRadius: 1,
             px: 0.75,
             py: 0.25,
             border: "1px solid",
             borderColor: "divider",
-            cursor: "text",
-            transition: "border-color 0.12s",
-            "&:hover": { borderColor: "primary.main" },
-            "&:focus": { borderColor: "primary.main", bgcolor: "action.hover" },
+            cursor: locked ? "not-allowed" : "text",
+            opacity: locked ? 0.6 : 1,
+            transition: "border-color 0.12s, opacity 0.12s",
+            ...(locked
+              ? {}
+              : {
+                  "&:hover": { borderColor: "primary.main" },
+                  "&:focus": { borderColor: "primary.main", bgcolor: "action.hover" },
+                }),
           }}
         />
       ) : (

@@ -371,7 +371,13 @@ function collectSourceWords(verseObjects: unknown[]): CollectedSourceWord[] {
           textKey,
           textOccurrence: tOcc,
         });
-      } else if (o["type"] === "milestone") {
+      } else if (
+        o["type"] === "milestone" ||
+        // \d (Psalm superscription) is type:"section" but its content IS
+        // alignable verse body — descend like a milestone so its \w tokens
+        // are covered. Mirrors collectMilestoneRuns in highlight.ts.
+        (o["type"] === "section" && o["tag"] === "d")
+      ) {
         walkSrc((o["children"] as unknown[] | undefined) ?? []);
       }
     }

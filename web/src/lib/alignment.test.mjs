@@ -689,8 +689,13 @@ function roundtripVerseUsfm(rawUsfm, sourceVO = null) {
     { type: "word", tag: "w", text: "הָֽ⁠רִאשׁ֔וֹן", occurrence: 2, occurrences: 2 },
   ];
 
+  // Selection keys go through tokenKey — the same fold the picker uses — so
+  // the U+2060 word-joiner inside these tokens is stripped on BOTH sides
+  // (matchNorm); a raw `${text}|${occ}` literal would no longer match the
+  // collectUhbWords key after the tokenKey→matchNorm change.
+
   // Two adjacent words → single quote, occurrence 1.
-  const sel1 = new Set(["בַּ⁠חֹ֣דֶשׁ|1", "הָֽ⁠רִאשׁ֔וֹן|1"]);
+  const sel1 = new Set([tokenKey("בַּ⁠חֹ֣דֶשׁ", 1), tokenKey("הָֽ⁠רִאשׁ֔וֹן", 1)]);
   const b1 = buildQuoteFromSelection(verseObjects, sel1);
   assert(b1 !== null, "builder returns non-null for valid selection");
   assert(
@@ -700,14 +705,14 @@ function roundtripVerseUsfm(rawUsfm, sourceVO = null) {
   assert(b1?.occurrence === 1, `occurrence=1 for first instance (got: ${b1?.occurrence})`);
 
   // The same pair, but the SECOND occurrence → occurrence 2.
-  const sel2 = new Set(["בַּ⁠חֹ֣דֶשׁ|2", "הָֽ⁠רִאשׁ֔וֹן|2"]);
+  const sel2 = new Set([tokenKey("בַּ⁠חֹ֣דֶשׁ", 2), tokenKey("הָֽ⁠רִאשׁ֔וֹן", 2)]);
   const b2 = buildQuoteFromSelection(verseObjects, sel2);
   assert(b2?.quote === "בַּ⁠חֹ֣דֶשׁ הָֽ⁠רִאשׁ֔וֹן", `same quote shape for second occurrence`);
   assert(b2?.occurrence === 2, `occurrence=2 for second instance (got: ${b2?.occurrence})`);
 
   // Disjoint selection → ' & ' separator. Picking word 1 and word 4
   // produces a two-group quote.
-  const sel3 = new Set(["וַ⁠יָּבֹ֣אוּ|1", "בַּ⁠חֹ֣דֶשׁ|1"]);
+  const sel3 = new Set([tokenKey("וַ⁠יָּבֹ֣אוּ", 1), tokenKey("בַּ⁠חֹ֣דֶשׁ", 1)]);
   const b3 = buildQuoteFromSelection(verseObjects, sel3);
   assert(
     b3?.quote === "וַ⁠יָּבֹ֣אוּ & בַּ⁠חֹ֣דֶשׁ",
@@ -874,10 +879,13 @@ function roundtripVerseUsfm(rawUsfm, sourceVO = null) {
   const firstTok = tokens.find((t) => t.text === "first");
   assert(firstTok !== undefined, "found 'first' target token");
 
-  // Picker click handler: dump every ancestor into the selection set.
+  // Picker click handler: dump every ancestor's selection KEY into the set —
+  // a.key is tokenKey(content, occ) (matchNorm-folded), exactly what
+  // QuoteBuilderPopper's handleEnglishClick adds. Using the raw
+  // `${content}|${occ}` would miss the U+2060-stripped key the UHB row carries.
   const selection = new Set();
   for (const a of firstTok?.sources ?? []) {
-    selection.add(`${a.content}|${a.occurrence}`);
+    selection.add(a.key);
   }
 
   const built = buildQuoteFromSelection(uhb, selection);
@@ -887,6 +895,38 @@ function roundtripVerseUsfm(rawUsfm, sourceVO = null) {
     `quote round-trips through UHB (got: ${built?.quote})`,
   );
   assert(built?.occurrence === 1, `occurrence=1 (got: ${built?.occurrence})`);
+}
+
+// ─── Case 14b: tokenKey folds U+2060 so picker ↔ builder agree ────────────
+//
+// The highlighter joins quote↔token equality via matchNorm (NFC + word-joiner
+// U+2060/U+200D stripping). The quote-builder's tokenKey used to fold by nfc()
+// ONLY, leaving the joiner in. When an AI-generated zaln x-content omits a
+// U+2060 that the UHB \w token carries (a known drift), the two minted
+// different keys: clicking the English chip toggled a phantom key, and
+// buildQuoteFromSelection (whose UhbWord.key is also tokenKey) never saw the
+// selection, so the quote never built. tokenKey now uses matchNorm too, so one
+// fold governs both sides regardless of which copy carries the joiner.
+{
+  console.log("\n[Case 14b] tokenKey folds U+2060 — picker chip ↔ UHB token");
+  const J = "⁠"; // WORD JOINER
+
+  // UHB token carries the joiner (הָ⁠אֶבֶן). Build a quote from a selection
+  // key authored WITHOUT the joiner (as an AI x-content would emit it).
+  const uhb = [
+    { type: "word", tag: "w", text: `הָ${J}אֶ֧בֶן`, occurrence: 1, occurrences: 1 },
+  ];
+  const selNoJoiner = new Set([tokenKey("הָאֶ֧בֶן", 1)]);
+  const built = buildQuoteFromSelection(uhb, selNoJoiner);
+  assert(built !== null, "builder matches a joiner-less selection key against a joiner-carrying UHB token");
+  assert(built?.quote === `הָ${J}אֶ֧בֶן`, `quote renders the RAW UHB text incl. joiner (got: ${JSON.stringify(built?.quote)})`);
+
+  // Symmetry: a zaln content WITHOUT the joiner and a UHB token WITH it mint
+  // the SAME key now (matchNorm strips it on both).
+  assert(
+    tokenKey(`הָ${J}אֶ֧בֶן`, 1) === tokenKey("הָאֶ֧בֶן", 1),
+    "tokenKey is joiner-insensitive (joiner and joiner-less mint one key)",
+  );
 }
 
 // ─── Case 15: Paragraph / poetry markers round-trip through edits ────────
