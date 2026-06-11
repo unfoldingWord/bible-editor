@@ -30,6 +30,9 @@ import {
   moveTargets,
   parseAlignment,
   serializeAlignment,
+  sourceKey,
+  stripCompoundOverlaps,
+  mergeAdjacentSameSource,
   type AlignmentGroup,
   type AlignmentState,
   type SourceWord,
@@ -1944,37 +1947,6 @@ function targetLabel(
       </Box>
     </Box>
   );
-}
-
-function sourceKey(g: AlignmentGroup): string {
-  return g.source.map((s) => `${s.content}|${s.occurrence}`).join("~");
-}
-
-function stripCompoundOverlaps(groups: AlignmentGroup[]): AlignmentGroup[] {
-  const standaloneContents = new Set<string>();
-  for (const g of groups) {
-    if (g.source.length === 1) standaloneContents.add(nfc(g.source[0].content ?? ""));
-  }
-  if (standaloneContents.size === 0) return groups;
-  return groups.map((g) => {
-    if (g.source.length <= 1) return g;
-    const kept = g.source.filter((s) => !standaloneContents.has(nfc(s.content ?? "")));
-    if (kept.length === g.source.length || kept.length === 0) return g;
-    return { ...g, source: kept };
-  });
-}
-
-function mergeAdjacentSameSource(groups: AlignmentGroup[]): AlignmentGroup[] {
-  const out: AlignmentGroup[] = [];
-  for (const g of groups) {
-    const last = out[out.length - 1];
-    if (last && sourceKey(last) === sourceKey(g)) {
-      out[out.length - 1] = { ...last, targets: [...last.targets, ...g.targets] };
-    } else {
-      out.push(g);
-    }
-  }
-  return out;
 }
 
 function readWordIds(dt: DataTransfer): string[] {

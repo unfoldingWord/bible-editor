@@ -17,6 +17,8 @@ import {
   verseHasUnalignedWork,
   mergeGroups,
   clearGroup,
+  stripCompoundOverlaps,
+  mergeAdjacentSameSource,
 } from "./alignment.ts";
 import { extractPlainText } from "./usfm.ts";
 import { findTargetHighlights, findSourceHighlights } from "./highlight.ts";
@@ -2083,6 +2085,59 @@ function roundtripVerseUsfm(rawUsfm, sourceVO = null) {
     const total = parseInt(g.source[0].occurrences, 10);
     assert(occ <= total, `placeholder occurrence ≤ occurrences (got ${occ}/${total})`);
   }
+}
+
+// ─── Case: stripCompoundOverlaps is occurrence-aware (ZEC 6:13 עַל) ─────────
+// A standalone source word must only strip an identical (content + occurrence)
+// sibling out of a compound — never a genuinely-distinct repeat. Regression
+// for the second עַל (occ 2) vanishing from the cards because a standalone
+// עַל (occ 1) shared its content.
+{
+  console.log("\n[Case] stripCompoundOverlaps keeps distinct occurrences (ZEC 6:13 עַל)");
+  const sw = (content, occurrence, occurrences = "2") => ({
+    id: `${content}-${occurrence}`,
+    strong: "H5921a",
+    occurrence,
+    occurrences,
+    content,
+  });
+  const tw = (text) => ({ id: text, text, occurrence: "1", occurrences: "1" });
+  // Standalone עַל(1) "on", and a compound [עַל(2), כִּסְאוֹ] "his throne".
+  const groups = [
+    { id: "g-standalone", source: [sw("עַל", "1")], targets: [tw("on")] },
+    {
+      id: "g-compound",
+      source: [sw("עַל", "2"), { id: "throne", strong: "H3678", occurrence: "1", occurrences: "1", content: "כִּסְאוֹ" }],
+      targets: [tw("his"), tw("throne")],
+    },
+  ];
+  const stripped = stripCompoundOverlaps(groups);
+  const compound = stripped.find((g) => g.id === "g-compound");
+  assert(
+    compound.source.some((s) => s.content === "עַל" && s.occurrence === "2"),
+    `עַל(2) survives in the compound (got [${compound.source.map((s) => `${s.content}|${s.occurrence}`).join(", ")}])`,
+  );
+  assert(compound.source.length === 2, `compound keeps both source words (got ${compound.source.length})`);
+
+  // Sanity: an identical-occurrence overlap IS still stripped.
+  const dupGroups = [
+    { id: "g-s", source: [sw("עַל", "1")], targets: [tw("on")] },
+    {
+      id: "g-c",
+      source: [sw("עַל", "1"), { id: "k", strong: "H3678", occurrence: "1", occurrences: "1", content: "כִּסְאוֹ" }],
+      targets: [tw("throne")],
+    },
+  ];
+  const dupStripped = stripCompoundOverlaps(dupGroups);
+  const dupCompound = dupStripped.find((g) => g.id === "g-c");
+  assert(
+    !dupCompound.source.some((s) => s.content === "עַל"),
+    `identical occurrence (עַל occ 1) still stripped from the compound (got [${dupCompound.source.map((s) => s.content).join(", ")}])`,
+  );
+
+  // mergeAdjacentSameSource only fuses truly identical source chains.
+  const merged = mergeAdjacentSameSource(stripped);
+  assert(merged.length === 2, `distinct-occurrence groups are not merged (got ${merged.length})`);
 }
 
 if (failed > 0) {

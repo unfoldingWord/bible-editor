@@ -315,6 +315,57 @@ function finalize(state: Omit<AlignmentState, "groups" | "unaligned">): Alignmen
   return { ...state, ...deriveViews(state) };
 }
 
+// ─── display-group post-processing (shared with the panel) ──────────────────
+// Pure transforms the aligner applies to `state.groups` before rendering:
+// collapse a compound's redundant source words and fuse adjacent same-source
+// groups. Live here (not in the component) so they're free of JSX and unit-
+// testable.
+
+// Identity of a single source word for overlap/merge purposes: NFC content +
+// occurrence. Keying on content ALONE conflates genuinely-distinct repeats —
+// e.g. ZEC 6:13 has two עַל (occ 1 and 2); a standalone עַל(1) would otherwise
+// strip עַל(2) out of its compound and the second עַל silently vanishes from
+// the cards (its source word stays bound — hover still bridges it — but no
+// chip renders).
+export function sourceWordKey(s: SourceWord): string {
+  return `${nfc(s.content ?? "")}|${s.occurrence}`;
+}
+
+// Whole-chain key, used to fuse adjacent groups that wrap the same source.
+export function sourceKey(g: AlignmentGroup): string {
+  return g.source.map(sourceWordKey).join("~");
+}
+
+// Drop a compound's source word when an identical (content + occurrence)
+// standalone group already owns it, so the token isn't double-represented.
+// Occurrence-aware: a standalone occ-1 never strips a genuine occ-2 sibling.
+export function stripCompoundOverlaps(groups: AlignmentGroup[]): AlignmentGroup[] {
+  const standaloneKeys = new Set<string>();
+  for (const g of groups) {
+    if (g.source.length === 1) standaloneKeys.add(sourceWordKey(g.source[0]));
+  }
+  if (standaloneKeys.size === 0) return groups;
+  return groups.map((g) => {
+    if (g.source.length <= 1) return g;
+    const kept = g.source.filter((s) => !standaloneKeys.has(sourceWordKey(s)));
+    if (kept.length === g.source.length || kept.length === 0) return g;
+    return { ...g, source: kept };
+  });
+}
+
+export function mergeAdjacentSameSource(groups: AlignmentGroup[]): AlignmentGroup[] {
+  const out: AlignmentGroup[] = [];
+  for (const g of groups) {
+    const last = out[out.length - 1];
+    if (last && sourceKey(last) === sourceKey(g)) {
+      out[out.length - 1] = { ...last, targets: [...last.targets, ...g.targets] };
+    } else {
+      out.push(g);
+    }
+  }
+  return out;
+}
+
 export function parseAlignment(
   verseObjects: unknown[],
   sourceVerseObjects?: unknown[] | null,
