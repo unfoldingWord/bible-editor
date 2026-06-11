@@ -110,6 +110,34 @@ export function isInFlowMarker(node: unknown): boolean {
   return false;
 }
 
+// usfm-js attaches the leading punctuation that follows an in-flow marker on
+// the same source line — the opening quote in `\q2 “I am…`, the `{` that opens
+// a word-addition — to the MARKER node's own `text` field:
+//   { tag:"q2", type:"quote", text:"“" }
+// We otherwise treat in-flow markers as text-less position anchors, so that
+// text is invisible in display/editing and silently dropped when
+// reconcileMarkers rebuilds the marker from its tag alone. Split it out into a
+// plain text node right after the marker so every consumer (the segment
+// renderer, the edit baseline, the marker reconcile) sees it as ordinary
+// leading line text. Lossless on export — `\q2 “` round-trips identically
+// whether the quote sits on the marker node or in a following text node.
+// Top-level only: in aligned source, markers never nest inside a milestone.
+export function liftMarkerText(verseObjects: unknown[]): unknown[] {
+  if (!Array.isArray(verseObjects)) return verseObjects;
+  const out: unknown[] = [];
+  for (const node of verseObjects) {
+    const o = node as Record<string, unknown> | null;
+    if (o && isInFlowMarker(o) && typeof o["text"] === "string" && o["text"] !== "") {
+      const { text, ...rest } = o;
+      out.push(rest);
+      out.push({ type: "text", text });
+    } else {
+      out.push(node);
+    }
+  }
+  return out;
+}
+
 // Peel trailing in-flow paragraph / quote markers off a verse's
 // verseObjects array. USFM places markers BEFORE the verse they lead
 // (`\q1 \v 9 ...`), but usfm-js attaches them to the PREVIOUS verse's
@@ -174,6 +202,11 @@ export function extractEditableText(verseObjects: unknown): string {
           parts.push("\\ts\\* ");
         } else {
           parts.push(`\\${v["tag"]} `);
+          // Surface any leading punctuation usfm-js attached to the marker
+          // node (`\q2 “…` → text:"“") so the quote shows in the editor and
+          // lands in the diff baseline. Mirrors liftMarkerText; harmless on
+          // already-lifted trees (the marker carries no text there).
+          if (typeof v["text"] === "string") parts.push(v["text"] as string);
         }
         continue;
       }

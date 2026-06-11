@@ -19,7 +19,7 @@
 // Pure insertions (oldLen === 0) and pure deletions (newSubstring === "")
 // flow through the localized rewrite path too.
 
-import { normalizeEditable, isInFlowMarker } from "./usfm.ts";
+import { normalizeEditable, isInFlowMarker, liftMarkerText } from "./usfm.ts";
 
 export interface SmartReplaceResult {
   content: unknown;
@@ -821,6 +821,18 @@ export function smartEditVerse(
   newPlain = normalizeEditable(newPlain);
   if (oldPlain === newPlain) {
     return { content, plainText: oldPlain, preservedAlignment: true };
+  }
+
+  // usfm-js parks the leading punctuation after a marker (`\q2 “…`) on the
+  // marker node's `text`. extractEditableText surfaces it into oldPlain, so the
+  // tree must agree or the diff offsets skew (the typed quote "pops" to the
+  // wrong side) and reconcileMarkers — which rebuilds markers from the tag
+  // alone — would drop it. Split it into a plain text node up front so every
+  // tier below sees the same shape the baseline does. No-op once a verse has
+  // been saved through here.
+  {
+    const vo = (content as { verseObjects?: unknown[] } | null)?.verseObjects;
+    if (Array.isArray(vo)) content = { verseObjects: liftMarkerText(vo) };
   }
 
   // Inline markers (\p, \q1, \q2, \ts\*) are surfaced as text tokens in the

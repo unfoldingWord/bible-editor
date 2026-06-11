@@ -486,6 +486,56 @@ function milestoneCount(content) {
   assert(quoteBeforeMarker, "closing quote stays before the marker");
 }
 
+// ─── Case 23: opening quote parked on a marker node is surfaced & editable ──
+// usfm-js attaches the leading punctuation after a marker (`\q2 “I am…`) to the
+// MARKER node's own `text` (ISA 28:12 / 28:15, 151 such nodes in ISA UST alone).
+// It used to be invisible in the editor and dropped on reconcile. extractEditableText
+// must now surface it, and a far-away word edit must keep it (lifted to a text node).
+{
+  console.log("\n[Case 23] Quote parked on a \\q marker node is visible and survives edits");
+  const qText = (tag, text) => ({ type: "quote", tag, text });
+  const verse = {
+    verseObjects: [
+      zaln("H1", [w("earlier")]), t(",\n"),
+      qText("q2", "“"), // ← opening quote on the marker node (usfm-js shape)
+      zaln("H2", [w("I"), t(" "), w("am"), t(" "), w("offering")]), t(".”\n"),
+    ],
+  };
+  const old = extractEditableText(verse);
+  assert(old.includes("\\q2 “"), `editable baseline surfaces the opening quote (got ${JSON.stringify(old)})`);
+  // Edit a far word; the hidden quote must survive, lifted to a text node after the marker.
+  const r = smartEditVerse(verse, old, old.replace("earlier", "before"));
+  const vos = r.content.verseObjects;
+  const qi = vos.findIndex((n) => n.type === "quote");
+  assert(typeof vos[qi].text !== "string", "marker node no longer carries text (lifted out)");
+  assert(vos[qi + 1]?.type === "text" && vos[qi + 1].text.includes("“"), "the opening quote is now a text node right after the marker");
+  assert(r.plainText.includes("“"), `the opening quote is not lost (got ${JSON.stringify(r.plainText)})`);
+  // The quoted clause after the marker is untouched, so its alignment survives.
+  assert(alignedWords(r.content).find((x) => x.text === "offering")?.strongs.includes("H2"), "the post-quote milestone keeps its alignment");
+}
+
+// ─── Case 24: typing an opening quote after a marker lands AFTER it ──────────
+// The priority bug: adding `"` in front of the first word of a poetic line must
+// not "pop" the quote in front of the \q marker.
+{
+  console.log("\n[Case 24] Typing a quote after a \\q marker keeps it after the marker");
+  const q = (tag) => ({ type: "quote", tag });
+  const verse = {
+    verseObjects: [
+      zaln("H1", [w("says")]), t(":\n"), q("q1"),
+      zaln("H2", [w("Behold")]), t(", "), zaln("H3", [w("a"), t(" "), w("man")]), t(".\n"),
+    ],
+  };
+  const old = extractEditableText(verse); // "says: \q1 Behold, a man."
+  const r = smartEditVerse(verse, old, old.replace("\\q1 Behold", '\\q1 "Behold'));
+  const vos = r.content.verseObjects;
+  const qi = vos.findIndex((n) => n.type === "quote");
+  const quoteBeforeMarker = vos.slice(0, qi).some((n) => n.type === "text" && n.text.includes('"'));
+  assert(!quoteBeforeMarker, "the typed quote did NOT pop in front of the marker");
+  assert(vos[qi + 1]?.type === "text" && vos[qi + 1].text.includes('"'), "the typed quote sits in a text node right after the marker");
+  assert(alignedWords(r.content).find((x) => x.text === "Behold")?.strongs.includes("H2"), "'Behold' keeps its alignment");
+}
+
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed.`);
   process.exit(1);

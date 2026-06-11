@@ -24,7 +24,7 @@
 // matches raw with no further work.
 
 import { nfc } from "./hebrew.ts";
-import { isInFlowMarker, SECTION_HEADER_TAGS } from "./usfm.ts";
+import { isInFlowMarker, liftMarkerText, SECTION_HEADER_TAGS } from "./usfm.ts";
 
 // U+2060 WORD JOINER glues UHB clitic morphemes to their host word
 // (הָ⁠אֶ֧בֶן); U+200D ZERO WIDTH JOINER plays the same role in some corpora.
@@ -618,7 +618,10 @@ function segmentByParagraphs(
       }
     }
   }
-  walk(verseObjects);
+  // Split any leading punctuation usfm-js parked on a marker node (`\q2 “…`)
+  // into a following text node so it renders at the start of its poetic line
+  // instead of vanishing. No-op when no marker carries text.
+  walk(liftMarkerText(verseObjects));
   return segments;
 }
 
