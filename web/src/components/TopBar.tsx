@@ -345,7 +345,7 @@ export function TopBar({
           <Divider orientation="vertical" flexItem sx={{ my: 0.5 }} />
         </Box>
       )}
-      <SyncStatusBar />
+      <SyncStatusBar onNavigate={onNavigate} />
       <Tooltip title={mode === "dark" ? "switch to light mode" : "switch to dark mode"}>
         <IconButton size="small" onClick={toggle} aria-label="toggle color mode">
           {mode === "dark" ? <Brightness7Icon fontSize="small" /> : <Brightness4Icon fontSize="small" />}
