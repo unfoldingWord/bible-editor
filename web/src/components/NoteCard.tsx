@@ -625,8 +625,6 @@ function NoteCardInner({
     else if (templatesForRef.length > 1) setTemplateMenuAnchor(e.currentTarget);
   };
 
-  const showSessionButtons = active;
-
   // Sync the draft store against the diff vs server row. This is what feeds
   // the offscreen-unsaved popup and survives chapter navigation. Separate
   // from hasNetChanges because we want drafts to track divergence from the
@@ -845,7 +843,14 @@ function NoteCardInner({
             }}
           />
         </Tooltip>
-        {showSessionButtons && hasRowDiff && (
+        {/* Gated on hasRowDiff alone (not `active`): a dirty note must show
+            its Undo button whether or not the card is focused. Tying it to
+            `active` made the button appear only after the activating click,
+            and clicking Save on an inactive-but-dirty card (the catch-up
+            save) would activate the card mid-click, inject this Undo button
+            to Save's left, and shove Save out from under the cursor — so the
+            first click landed on nothing and a second was needed. */}
+        {hasRowDiff && (
           <Tooltip
             title={
               savePendingVersion !== null

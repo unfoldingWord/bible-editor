@@ -5,6 +5,12 @@ import { defineConfig, devices } from "@playwright/test";
 // One worker, no test-level parallelism — every test in this suite shares the
 // seeded ZEC fixture and races multiple browserContexts inside the same test.
 // Running tests *themselves* in parallel would cross the streams.
+// Base URL of the dev web server. Defaults to :5173 (vite's default). On
+// hosts where another process (e.g. Windows svchost) permanently holds 5173,
+// vite relocates to 5174 — set BE_BASE_URL=http://localhost:5174 so the
+// health poll and page navigations follow it.
+const BASE_URL = process.env.BE_BASE_URL ?? "http://localhost:5173";
+
 export default defineConfig({
   testDir: "tests/concurrency",
   fullyParallel: false,
@@ -15,7 +21,7 @@ export default defineConfig({
   expect: { timeout: 5_000 },
   globalSetup: "./tests/concurrency/global-setup.ts",
   use: {
-    baseURL: "http://localhost:5173",
+    baseURL: BASE_URL,
     trace: "on-first-retry",
     video: "off",
     screenshot: "only-on-failure",
@@ -32,7 +38,7 @@ export default defineConfig({
   // /api/auth/dev call.
   webServer: {
     command: "npm run dev",
-    url: "http://localhost:5173/api/health",
+    url: `${BASE_URL}/api/health`,
     reuseExistingServer: true,
     timeout: 180_000,
     stdout: "pipe",
