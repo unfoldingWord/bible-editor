@@ -358,7 +358,22 @@ rows.get("/:kind/:id/history", requireEditor, async (c) => {
     };
   });
 
-  return c.json({ versions });
+  // Drop reorder-churn from the version list. Before the write path stopped
+  // versioning sort_order (see PATCH above), every drag wrote an `update`
+  // entry that touched no content field — these reconstruct to a snapshot
+  // identical to their predecessor and read as duplicate "versions" in the
+  // dialog. An update whose trimmedPatch is empty changed only excluded fields
+  // (sort_order), so hide it. Always keep non-update actions (create/imported/
+  // delete/restore) and the row's current version, so the snapshot replay's
+  // anchor and the dialog's "current" marker / diff target still resolve.
+  const displayVersions = versions.filter(
+    (v) =>
+      v.action !== "update" ||
+      Object.keys(v.patch).length > 0 ||
+      v.version === currentRow.version,
+  );
+
+  return c.json({ versions: displayVersions });
 });
 
 // Single-row PATCH with optimistic concurrency. If-Match is mandatory and
@@ -453,6 +468,51 @@ rows.patch("/:kind/:id", requireEditor, async (c) => {
     if (allMatch && restoreMatches) {
       return c.json(current);
     }
+  }
+
+  // Reorder-only fast path: sort_order is positional metadata, not content. A
+  // drag must not count as a new version — otherwise the row's version climbs
+  // and the history dialog fills with entries that reconstruct to identical
+  // content (sort_order is excluded from the snapshot), reading as duplicate
+  // "versions". Apply it under the same optimistic-concurrency guard, but skip
+  // the version bump AND the edit_log entry. Mirrors the preserve/hint/trash
+  // bit-toggles, which are likewise non-versioning. updated_at still moves so
+  // mtime views reflect the activity; updated_by stays put (standing authorship
+  // is whoever wrote the note, not whoever reordered it). Only tn/twl carry
+  // sort_order — a tq patch can never reach here (its schema has no field).
+  if (fields.length === 1 && fields[0] === "sort_order") {
+    const now = Math.floor(Date.now() / 1000);
+    const res = await c.env.DB.prepare(
+      `UPDATE ${KIND_TO_TABLE[kind]}
+         SET sort_order = ?1, updated_at = ?2
+       WHERE id = ?3 AND version = ?4 AND deleted_at IS NULL${bookClause(5)}`,
+    )
+      .bind((patch as Record<string, unknown>).sort_order, now, id, expected, book)
+      .run();
+    if (!res.meta.changes) {
+      // Version moved on under us (a content edit landed first). Surface 409
+      // so the outbox auto-heals against the server version and retries — the
+      // same path a content-field mismatch takes.
+      const fresh = await c.env.DB.prepare(
+        `SELECT * FROM ${KIND_TO_TABLE[kind]} WHERE id = ?1${bookClause(2)}`,
+      )
+        .bind(id, book)
+        .first<{ version: number; deleted_at: number | null }>();
+      if (!fresh || fresh.deleted_at) return c.json({ error: "not_found" }, 404);
+      return c.json({ error: "version_mismatch", current: fresh }, 409);
+    }
+    const updated = await c.env.DB.prepare(
+      `SELECT * FROM ${KIND_TO_TABLE[kind]} WHERE id = ?1${bookClause(2)}`,
+    )
+      .bind(id, book)
+      .first();
+    if (updated) {
+      const row = updated as unknown as TnRow | TqRow | TwlRow;
+      c.executionCtx.waitUntil(
+        broadcastChapter(c.env, row.book, row.chapter, { type: "row.upserted", kind, row }),
+      );
+    }
+    return c.json(updated);
   }
 
   const userId = currentUserId(c);
