@@ -328,11 +328,14 @@ export function ResourceColumn({
   // Priority: active note > active word > active-verse group in any pinned
   // section. Without any of those, no scroll.
   const prevNonceRef = useRef(scrollNonce);
+  const prevVerseRef = useRef(activeVerse);
   useEffect(() => {
     const root = scrollBodyRef.current;
     if (!root) return;
     const fromButton = prevNonceRef.current !== scrollNonce;
     prevNonceRef.current = scrollNonce;
+    const verseChanged = prevVerseRef.current !== activeVerse;
+    prevVerseRef.current = activeVerse;
     let target: HTMLElement | null = null;
     let isVerseGroup = false;
     if (activeNoteId) {
@@ -367,6 +370,14 @@ export function ResourceColumn({
         target = lastNote;
         atVerseEnd = true;
       }
+    }
+    // Individual-verse mode (nothing pinned): the list only ever shows the
+    // active verse's resources, so a verse change swaps the whole list and
+    // there's no target to land on. Reset to the top instead of stranding the
+    // scroll wherever the previous verse left it.
+    if (!target && verseChanged && !pinned.notes && !pinned.words && !pinned.questions) {
+      root.scrollTo({ top: 0, behavior: "auto" });
+      return;
     }
     target?.scrollIntoView({
       behavior: "smooth",
@@ -698,6 +709,10 @@ function VerseGroupHead({
       data-verse-group={verse}
       data-vg-section={section}
       sx={{
+        // Clear the sticky SectionHead when scrollIntoView lands here with
+        // block: "start", so the verse number stays visible rather than
+        // tucking behind the pinned header.
+        scrollMarginTop: "40px",
         mt: 1,
         mb: 0.25,
         py: 0.25,
