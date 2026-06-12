@@ -42,7 +42,8 @@ const EXPORT_ALERT_USERNAME = "deferredreward";
 // the live-snapshot flow is no longer used (its post-export path is dormant).
 const LEGACY_EXPORT_BRANCH = "live-snapshot";
 import { runPostExport, VALIDATORS } from "./postExport";
-import { runChunkedReimport, ALL_RESOURCES as REIMPORT_RESOURCES } from "./bookReimport";
+import { runChunkedReimport, storedResourceSha, ALL_RESOURCES as REIMPORT_RESOURCES } from "./bookReimport";
+import { dcsResourceFile, fileCommitSha, type ReimportResource } from "./dcsSources";
 import type { TnRow, TqRow, TwlRow, VerseRow } from "./types";
 
 export interface ExportParams {
@@ -130,12 +131,21 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
           // DCS commit SHA is unchanged. See bookReimport.ts:runChunkedReimport.
           await runChunkedReimport(this.env, step, book, instanceId, [...REIMPORT_RESOURCES], {});
         } catch (e) {
-          // Lock contention / transient DCS failure: render proceeds on whatever
-          // D1 holds (possibly slightly stale for this book); next run catches up.
-          console.error("export pre-reimport failed", {
-            book,
-            error: e instanceof Error ? e.message : String(e),
-          });
+          // Lock contention / transient DCS failure / Cloudflare subrequest cap:
+          // this book's D1 is now possibly stale relative to master. The
+          // freshness gate in exportOne (masterSha vs watermark) refuses to
+          // commit a stale render, so a failed sync no longer reverts master —
+          // it just skips this book's export until a later sync succeeds. Alert
+          // so the failure is visible rather than silently swallowed.
+          const msg = e instanceof Error ? e.message : String(e);
+          console.error("export pre-reimport failed", { book, error: msg });
+          try {
+            await step.do(`reimport-fail-alert-${book}`, async () =>
+              this.recordSyncFailureAlert(book, msg),
+            );
+          } catch {
+            /* alert is best-effort; never let it abort the export run */
+          }
         }
       }
     }
@@ -253,6 +263,37 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     let prNumber: number | null = null;
     let prReason: string | null = null;
     let prError: string | null = null;
+
+    // Freshness gate — the single guard against clobbering master. The export
+    // renders from D1; if master moved past what D1 last synced (the
+    // book_resource_syncs watermark), committing this render would REVERT
+    // master's out-of-band edits (the exact LAM 2:17 regression: a gatewayEdit
+    // alignment landed on master, the pre-export sync failed on the Cloudflare
+    // subrequest cap, and the export silently reverted it). So unless we can
+    // POSITIVELY confirm master == watermark, skip the commit and alert. Fail
+    // CLOSED on uncertainty (can't fetch master SHA) — a one-night skip beats a
+    // silent revert. A fresh book with no watermark has nothing to clobber.
+    // Only meaningful when we'd actually commit (dcsAllowed); a dry run renders
+    // to R2 only and can't clobber anything.
+    const fresh = dcsAllowed ? await this.checkMasterFreshness(book, resource) : { ok: true as const, detail: "dry", masterSha: null, watermark: null };
+    if (!fresh.ok) {
+      await this.recordStaleSkipAlert(book, resource, fresh.masterSha, fresh.watermark);
+      const reason = `stale_master:${fresh.detail}`;
+      await this.recordSnapshot(book, resource, null, null, built.rowCount, reason);
+      return {
+        book,
+        resource,
+        rowCount: built.rowCount,
+        bytes: built.content.length,
+        r2Key,
+        branch: null,
+        dcsCommitSha: null,
+        dcsChanged: false,
+        dcsSkippedReason: reason,
+        prNumber: null,
+        prReason: null,
+      };
+    }
 
     if (!dcsAllowed) {
       dcsSkippedReason = this.env.DCS_SERVICE_TOKEN ? "dry_run" : "no_service_token";
@@ -530,6 +571,80 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     )
       .bind(book, resource, branch, commitSha, rowsExported, skippedReason, prNumber, prError)
       .run();
+  }
+
+  // Is D1 for this (book, resource) current with master? Compares master's
+  // latest file-commit SHA to the book_resource_syncs watermark (what the last
+  // successful sync recorded). Returns ok only when we can POSITIVELY confirm
+  // freshness:
+  //   - no watermark        → fresh book, nothing on master to clobber → ok.
+  //   - masterSha == wm      → D1 is current → ok.
+  //   - masterSha != wm      → master moved past D1 → STALE → not ok.
+  //   - masterSha null (fetch failed) but watermark present → can't confirm →
+  //     not ok (fail closed; a skipped night beats a silent revert).
+  // Mirror of planAndStageBookResources's SHA gate, used here to gate the
+  // EXPORT rather than to skip the reimport.
+  private async checkMasterFreshness(
+    book: string,
+    resource: Resource,
+  ): Promise<{ ok: boolean; detail: string; masterSha: string | null; watermark: string | null }> {
+    const file = dcsResourceFile(book, resource as ReimportResource);
+    // Unknown book/resource → no file to compare; don't block (shouldn't happen
+    // for the five real resources).
+    if (!file) return { ok: true, detail: "no_file", masterSha: null, watermark: null };
+    const watermark = await storedResourceSha(this.env, book, resource);
+    if (!watermark) return { ok: true, detail: "no_watermark", masterSha: null, watermark: null };
+    const masterSha = await fileCommitSha(this.env, file.repo, file.path);
+    if (!masterSha) return { ok: false, detail: "master_sha_unknown", masterSha: null, watermark };
+    if (masterSha === watermark) return { ok: true, detail: "current", masterSha, watermark };
+    return { ok: false, detail: "master_ahead", masterSha, watermark };
+  }
+
+  // Banner alert when the freshness gate skips an export to avoid clobbering
+  // master. Same replace-undismissed shape as recordPrFailureAlert.
+  private async recordStaleSkipAlert(
+    book: string,
+    resource: Resource,
+    masterSha: string | null,
+    watermark: string | null,
+  ): Promise<void> {
+    const source = `export_stale:${book}:${resource}`;
+    const message =
+      `Benjamin — nightly export skipped ${book} ${resource.toUpperCase()} to avoid reverting master ` +
+      `(D1 is behind: master ${(masterSha ?? "unknown").slice(0, 8)} vs synced ${(watermark ?? "none").slice(0, 8)}). ` +
+      `The pre-export sync didn't catch up; re-run the sync for ${book}, then re-export.`;
+    await this.writeAlert(source, message, `${this.env.DCS_BASE_URL}/unfoldingWord`);
+  }
+
+  // Banner alert when the pre-export sync for a book failed outright (e.g. the
+  // Cloudflare subrequest cap). The export will skip any book left stale, so
+  // this is the heads-up that a manual re-sync is needed.
+  private async recordSyncFailureAlert(book: string, detail: string): Promise<void> {
+    const source = `export_sync_fail:${book}`;
+    const message =
+      `Benjamin — nightly pre-export sync failed for ${book}: ${detail.slice(0, 160)}. ` +
+      `Any book left behind master is skipped by the freshness gate (not reverted); re-sync ${book} and re-export.`;
+    await this.writeAlert(source, message, `${this.env.DCS_BASE_URL}/unfoldingWord`);
+  }
+
+  // Replace-undismissed alert writer shared by the export-side alerts. Best
+  // effort: an alert-write failure must never fail or retry the export.
+  private async writeAlert(source: string, message: string, linkUrl: string): Promise<void> {
+    try {
+      await this.env.DB.prepare(
+        `DELETE FROM system_alerts WHERE username = ?1 AND source = ?2 AND dismissed_at IS NULL`,
+      )
+        .bind(EXPORT_ALERT_USERNAME, source)
+        .run();
+      await this.env.DB.prepare(
+        `INSERT INTO system_alerts (username, severity, source, message, link_url)
+         VALUES (?1, 'error', ?2, ?3, ?4)`,
+      )
+        .bind(EXPORT_ALERT_USERNAME, source, message, linkUrl)
+        .run();
+    } catch (e) {
+      console.error("export alert write failed", { source, error: e instanceof Error ? e.message : String(e) });
+    }
   }
 
   // Surface a PR-ensure failure as a banner alert (the SPA polls
