@@ -2140,6 +2140,68 @@ function roundtripVerseUsfm(rawUsfm, sourceVO = null) {
   assert(merged.length === 2, `distinct-occurrence groups are not merged (got ${merged.length})`);
 }
 
+// ─── Case: parse normalizes a reversed compound's source order (ZEC 6:13) ──
+// Some AI-generated alignments nest a compound's `\zaln-s` milestones in
+// reverse — ZEC 6:13 UST stamped הֵיכַל before its אֵת direct-object marker.
+// parseAlignment must reorder the group's `source` into canonical UHB order
+// (אֵת then הֵיכַל) so the RTL card renders right AND serialize re-nests
+// correctly. Well-formed (already-canonical) data must be untouched.
+{
+  console.log("\n[Case] parse reorders a reversed compound to canonical source order (ZEC 6:13)");
+  // Target nests temple (הֵיכַל) FIRST, then the DO marker (אֵת) — reversed.
+  const target = String.raw`\id ZEC
+\c 6
+\v 13 \zaln-s |x-strong="H1964" x-lemma="הֵיכָל" x-occurrence="1" x-occurrences="1" x-content="הֵיכַל"\*\zaln-s |x-strong="H0853" x-lemma="אֵת" x-occurrence="1" x-occurrences="1" x-content="אֶת"\*\w temple|x-occurrence="1" x-occurrences="1"\w*\zaln-e\*\zaln-e\*
+`;
+  // UHB source in canonical order: אֶת precedes הֵיכַל.
+  const source = String.raw`\id ZEC
+\c 6
+\v 13 \w אֶת|x-strong="H0853" x-occurrence="1"\w* \w הֵיכַל|x-strong="H1964" x-occurrence="1"\w*
+`;
+  const tvo = usfm.toJSON(target).chapters["6"]["13"].verseObjects;
+  const svo = usfm.toJSON(source).chapters["6"]["13"].verseObjects;
+  const state = parseAlignment(tvo, svo);
+
+  const compound = state.groups.find((g) => g.source.length === 2);
+  assert(!!compound, "compound group with both Hebrew words exists");
+  const order = compound.source.map((s) => s.strong);
+  assert(
+    order[0] === "H0853" && order[1] === "H1964",
+    `source reordered to canonical [אֵת, הֵיכַל] (got [${order.join(", ")}])`,
+  );
+
+  // Serialize re-nests in the corrected order: \zaln-s(אֵת) wraps \zaln-s(הֵיכַל).
+  const rt = usfm.toUSFM(
+    (() => {
+      const j = usfm.toJSON(target);
+      j.chapters["6"]["13"].verseObjects = serializeAlignment(state);
+      return j;
+    })(),
+    { forcedNewLines: true },
+  );
+  const idxEt = rt.indexOf('x-content="אֶת"');
+  const idxTemple = rt.indexOf('x-content="הֵיכַל"');
+  assert(
+    idxEt >= 0 && idxTemple >= 0 && idxEt < idxTemple,
+    "serialized USFM nests אֵת before הֵיכַל",
+  );
+
+  // Already-canonical data is left untouched (no spurious reorder/churn).
+  const ok = String.raw`\id ZEC
+\c 6
+\v 13 \zaln-s |x-strong="H0853" x-lemma="אֵת" x-occurrence="1" x-occurrences="1" x-content="אֶת"\*\zaln-s |x-strong="H1964" x-lemma="הֵיכָל" x-occurrence="1" x-occurrences="1" x-content="הֵיכַל"\*\w temple|x-occurrence="1" x-occurrences="1"\w*\zaln-e\*\zaln-e\*
+`;
+  const okState = parseAlignment(
+    usfm.toJSON(ok).chapters["6"]["13"].verseObjects,
+    svo,
+  );
+  const okOrder = okState.groups.find((g) => g.source.length === 2).source.map((s) => s.strong);
+  assert(
+    okOrder[0] === "H0853" && okOrder[1] === "H1964",
+    `canonical input preserved (got [${okOrder.join(", ")}])`,
+  );
+}
+
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed.`);
   process.exit(1);

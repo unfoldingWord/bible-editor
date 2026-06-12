@@ -480,6 +480,24 @@ function withSourceCoverage(
 ): Omit<AlignmentState, "groups" | "unaligned"> {
   const sourceWords = collectSourceWords(sourceVerseObjects);
   if (sourceWords.length === 0) return base;
+  // Normalize each compound's source order to canonical (UHB/UGNT text) order.
+  // The chain comes out of `walk` in milestone-NESTING order, which a few
+  // AI-generated alignments stamp reversed (e.g. ZEC 6:13 UST nests הֵיכַל
+  // before its אֵת direct-object marker). Sorting by source position fixes the
+  // RTL card render AND the serialized nesting, so a touched verse exports the
+  // corrected order. Well-formed data is already canonical, so this is a no-op
+  // there (stable sort) — no export churn for legitimate alignments.
+  const sortedGroups = base.sourceGroups.map((g) => {
+    if (g.source.length < 2) return g;
+    const withPos = g.source.map((s, i) => {
+      const p = findSourcePosition(sourceWords, s);
+      return { s, key: p >= 0 ? p : Number.MAX_SAFE_INTEGER, i };
+    });
+    withPos.sort((a, b) => a.key - b.key || a.i - b.i);
+    if (withPos.every((x, idx) => x.i === idx)) return g; // already canonical
+    return { ...g, source: withPos.map((x) => x.s) };
+  });
+  base = { ...base, sourceGroups: sortedGroups };
   const covered = new Set<number>();
   for (const g of base.sourceGroups) {
     for (const s of g.source) {
