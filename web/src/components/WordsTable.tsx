@@ -1,5 +1,5 @@
 import { memo, useEffect, useMemo, useRef, useState } from "react";
-import { Alert, Box, InputAdornment, Paper, Snackbar, Stack, TextField, IconButton, Typography, Tooltip } from "@mui/material";
+import { Alert, Box, InputAdornment, Paper, Snackbar, TextField, IconButton, Typography, Tooltip } from "@mui/material";
 import DeleteOutlineIcon from "@mui/icons-material/DeleteOutline";
 import DragIndicatorIcon from "@mui/icons-material/DragIndicator";
 import TranslateIcon from "@mui/icons-material/Translate";
@@ -28,6 +28,34 @@ function detectQuoteScript(text: string): QuoteScript {
   if (LTR_CHAR.test(text)) return "ltr";
   return "empty";
 }
+
+// Container-query breakpoint: under this table width the quote + TW-article
+// columns plus three action buttons get too cramped, so the layout reflows to
+// keep the quote inline with the actions and drop the TW article to its own
+// full-width row.
+const NARROW_BP_PX = 460;
+
+// Wide: grip, quote, TW article, and three action cells in one row. Narrow
+// (container ≤ NARROW_BP_PX): the grip spans both rows on the left, the quote
+// (the source words — the content that matters most) gets its own full-width
+// row, and the short TW-article chip shares the second row with the action
+// buttons. Keeping the quote off the button row stops the save/trash icons
+// from crushing the Hebrew when the column is narrow.
+const responsiveGridSx = {
+  display: "grid",
+  gap: 1,
+  alignItems: "center",
+  gridTemplateColumns: "28px 1fr 1.2fr 28px 28px 28px",
+  gridTemplateAreas: '"grip quote twarticle save undo delete"',
+  [`@container (max-width: ${NARROW_BP_PX}px)`]: {
+    gridTemplateColumns: "28px 1fr 28px 28px 28px",
+    gridTemplateAreas: [
+      '"grip quote quote quote quote"',
+      '"grip twarticle save undo delete"',
+    ].join(" "),
+    rowGap: 0.5,
+  },
+} as const;
 
 interface Props {
   rows: TwlRow[];
@@ -65,16 +93,14 @@ function WordsTableInner({ rows, activeId, onSave, onDelete, onFocus, onReorder,
       variant="outlined"
       sx={{
         overflow: "hidden",
+        containerType: "inline-size",
         ...draftDirtyBorderSx(),
         ...(locked ? { pointerEvents: "none", opacity: 0.6 } : null),
       }}
     >
       <Box
         sx={{
-          display: "grid",
-          gridTemplateColumns: "28px 1fr 1.2fr 28px 28px 28px",
-          gap: 1,
-          alignItems: "center",
+          ...responsiveGridSx,
           px: 1,
           py: 0.5,
           bgcolor: "grey.50",
@@ -84,6 +110,9 @@ function WordsTableInner({ rows, activeId, onSave, onDelete, onFocus, onReorder,
           color: "text.disabled",
           borderBottom: "1px dashed",
           borderColor: "divider",
+          // The column labels don't map onto the stacked layout, so drop the
+          // header band once the rows reflow.
+          [`@container (max-width: ${NARROW_BP_PX}px)`]: { display: "none" },
         }}
       >
         <span />
@@ -270,10 +299,8 @@ const WordRow = memo(function WordRow({
   };
 
   return (
-    <Stack
+    <Box
       ref={rowRef}
-      direction="row"
-      spacing={1}
       data-word-id={row.id}
       onMouseDown={onFocus}
       onFocus={onFocus}
@@ -289,10 +316,7 @@ const WordRow = memo(function WordRow({
         onRowDrop(positionFromEvent(e));
       }}
       sx={{
-        display: "grid",
-        gridTemplateColumns: "28px 1fr 1.2fr 28px 28px 28px",
-        alignItems: "center",
-        gap: 1,
+        ...responsiveGridSx,
         px: 1,
         py: 0.5,
         borderBottom: "1px dashed",
@@ -317,6 +341,7 @@ const WordRow = memo(function WordRow({
           }}
           onDragEnd={onDragEnd}
           sx={{
+            gridArea: "grip",
             cursor: "grab",
             color: "text.disabled",
             display: "inline-flex",
@@ -334,6 +359,7 @@ const WordRow = memo(function WordRow({
         size="small"
         variant="outlined"
         spellCheck={false}
+        sx={{ gridArea: "quote" }}
         InputProps={{
           ...(isDirty ? { "data-dirty": "true" } : {}),
           endAdornment: showTranslateIcon ? (
@@ -360,15 +386,17 @@ const WordRow = memo(function WordRow({
           },
         }}
       />
-      <CatalogPicker
-        value={twLink}
-        options={catalogs.twLinks}
-        display={(v) => (v ? twShort(v) : "+ TW article")}
-        placeholder="names/, kt/, other/, …"
-        onChange={(next) => setTwLink(next)}
-      />
+      <Box sx={{ gridArea: "twarticle", minWidth: 0 }}>
+        <CatalogPicker
+          value={twLink}
+          options={catalogs.twLinks}
+          display={(v) => (v ? twShort(v) : "+ TW article")}
+          placeholder="names/, kt/, other/, …"
+          onChange={(next) => setTwLink(next)}
+        />
+      </Box>
       <Tooltip title={isDirty ? "save edits" : "no unsaved edits"}>
-        <span>
+        <span style={{ gridArea: "save" }}>
           <IconButton
             size="small"
             disabled={!isDirty}
@@ -384,7 +412,7 @@ const WordRow = memo(function WordRow({
         </span>
       </Tooltip>
       <Tooltip title={isDirty ? "undo edits" : ""}>
-        <span>
+        <span style={{ gridArea: "undo" }}>
           <IconButton
             size="small"
             onClick={handleUndo}
@@ -395,7 +423,12 @@ const WordRow = memo(function WordRow({
           </IconButton>
         </span>
       </Tooltip>
-      <IconButton size="small" onClick={onDelete} color="error" sx={{ p: 0.25 }}>
+      <IconButton
+        size="small"
+        onClick={onDelete}
+        color="error"
+        sx={{ p: 0.25, gridArea: "delete" }}
+      >
         <DeleteOutlineIcon fontSize="inherit" />
       </IconButton>
       <Snackbar
@@ -408,7 +441,7 @@ const WordRow = memo(function WordRow({
           No ULT alignment match for &ldquo;{quote}&rdquo; in this verse.
         </Alert>
       </Snackbar>
-    </Stack>
+    </Box>
   );
 }, (a, b) =>
   // Skip sibling word rows when the table re-renders (selection / add / delete).
