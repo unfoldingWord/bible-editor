@@ -674,7 +674,13 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
         sx={{
           display: "flex",
           flexDirection: "column",
-          height: "100%",
+          // Fill the remaining height of the flex-column parent (the resource
+          // column below its tabs header, or a side-by-side panel wrapper)
+          // rather than `height: 100%`, which overflowed by the header's height
+          // in the single-panel mount and clipped the footer. minHeight: 0 lets
+          // the inner cards area shrink and scroll on short viewports.
+          flex: 1,
+          minHeight: 0,
           overflow: "hidden",
           bgcolor: "background.paper",
         }}
@@ -721,6 +727,10 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
             <Box
               sx={{
                 flex: 1,
+                // Allow this scroller to shrink below its content height so it
+                // actually scrolls (and the footer stays visible) when the
+                // strips above it leave little room on a short viewport.
+                minHeight: 0,
                 overflowY: "auto",
                 px: 1.5,
                 pb: 1.5,
