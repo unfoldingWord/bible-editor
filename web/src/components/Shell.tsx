@@ -28,12 +28,12 @@ import { extractEditableText, extractPlainText, normalizeEditable, SECTION_HEADE
 import { verseHasUnalignedWork } from "../lib/alignment";
 import { buildVerseIndex, concatSourceRange, formatVerseLabel } from "../lib/verseRange";
 import { buildTnQuickRequest } from "../lib/tnQuickRequest";
-import { findSourceForTargetText, type HighlightKey } from "../lib/highlight";
+import { findSourceForTargetText, type HighlightKey, type ReorderHighlight } from "../lib/highlight";
 import { buildQuoteFromSelection } from "../lib/quoteBuilder";
 import { nfc } from "../lib/hebrew";
 import { TimelineRail } from "./TimelineRail";
 import { ScriptureColumn, type ScriptureMode } from "./ScriptureColumn";
-import { ResourceColumn, type AlignmentTabProps, type PanelMode } from "./ResourceColumn";
+import { ResourceColumn, type AlignmentTabProps, type PanelMode, type ReorderPreview } from "./ResourceColumn";
 import type { AlignmentPanelHandle } from "./AlignmentPanel";
 import { SideBySideAligner, type PanelSlot } from "./SideBySideAligner";
 import { TopBar } from "./TopBar";
@@ -597,6 +597,57 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     }
     return { activeQuote: null, activeOccurrence: null };
   }, [activeNoteId, activeWordId, data]);
+
+  // Reorder "stoplight": while a note is dragged (or for ~3s after an arrow
+  // move) ResourceColumn reports the moved note's candidate neighbours; we
+  // resolve their quotes and hand them to the scripture column so the active
+  // verse lights prev (green underline) / next (red overline) alongside the
+  // moved note's existing yellow fill.
+  const [reorderPreview, setReorderPreview] = useState<ReorderPreview | null>(null);
+  const reorderPreviewTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const reorderStickyRef = useRef(false);
+  const handleReorderPreview = useCallback((preview: ReorderPreview | null, sticky?: boolean) => {
+    // A live (non-sticky) clear — drag end or hover-leave — must not wipe a
+    // sticky arrow-move preview that's still counting down.
+    if (preview === null && !sticky && reorderStickyRef.current) return;
+    if (reorderPreviewTimer.current) {
+      clearTimeout(reorderPreviewTimer.current);
+      reorderPreviewTimer.current = null;
+    }
+    reorderStickyRef.current = !!(preview && sticky);
+    setReorderPreview(preview);
+    // Live previews (drag held / grip-or-arrow hover) pass sticky=false and are
+    // cleared on release/leave; arrow moves are momentary, so they linger 5s.
+    if (preview && sticky) {
+      reorderPreviewTimer.current = setTimeout(() => {
+        setReorderPreview(null);
+        reorderStickyRef.current = false;
+        reorderPreviewTimer.current = null;
+      }, 5000);
+    }
+  }, []);
+  useEffect(
+    () => () => {
+      if (reorderPreviewTimer.current) clearTimeout(reorderPreviewTimer.current);
+    },
+    [],
+  );
+  const reorderHighlight = useMemo<ReorderHighlight | null>(() => {
+    if (!data || !reorderPreview) return null;
+    const find = (id: string | null) => (id ? data.tn.find((r) => r.id === id) ?? null : null);
+    const moved = find(reorderPreview.movedId);
+    const prev = find(reorderPreview.prevId);
+    const next = find(reorderPreview.nextId);
+    if (!moved && !prev && !next) return null;
+    return {
+      movedQuote: moved?.quote ?? null,
+      movedOccurrence: moved?.occurrence ?? null,
+      prevQuote: prev?.quote ?? null,
+      prevOccurrence: prev?.occurrence ?? null,
+      nextQuote: next?.quote ?? null,
+      nextOccurrence: next?.occurrence ?? null,
+    };
+  }, [data, reorderPreview]);
 
   // Quote-builder session: when active, clicking Hebrew words in the UHB
   // row of the active verse toggles them into selectedKeys; "Use selection"
@@ -1382,6 +1433,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           activeVerse={activeVerse}
           activeNoteQuote={activeQuote}
           activeNoteOccurrence={activeOccurrence}
+          reorderHighlight={reorderHighlight}
           mode={mode}
           enabledVersions={displayedVersions}
           availableVersions={availableVersions}
@@ -1628,6 +1680,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
               enqueueRow("tn", row, { sort_order });
             }
           }}
+          onReorderPreview={handleReorderPreview}
           onWordCreate={async () => {
             const list = sortedForVerse(data.twl, activeVerse);
             const sort_order = pickSortOrder(list, null, "after");

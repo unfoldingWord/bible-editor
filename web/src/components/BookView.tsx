@@ -17,7 +17,7 @@ import SaveOutlinedIcon from "@mui/icons-material/SaveOutlined";
 import UndoIcon from "@mui/icons-material/Undo";
 import type { VerseDto } from "../sync/api";
 import type { ChapterState } from "../hooks/useBook";
-import { highlightsFor, renderEditableHTML, renderHighlightedHTML, type HighlightKey } from "../lib/highlight";
+import { highlightsFor, renderEditableHTML, renderHighlightedHTML, type HighlightKey, type ReorderHighlight } from "../lib/highlight";
 import { markHighlightSx } from "../lib/highlightStyles";
 import { extractTrailingMarkers, splitSectionHeaders, type SectionHeader } from "../lib/usfm";
 import { SectionHeaderBand } from "./SectionHeaderBand";
@@ -59,6 +59,9 @@ interface Props {
   activeVerse: number;
   activeNoteQuote: string | null;
   activeNoteOccurrence: number | null;
+  // Transient reorder stoplight for the active verse (drag held / ~3s after an
+  // arrow move): the moved note's candidate prev (green) + next (red).
+  reorderHighlight?: ReorderHighlight | null;
   // Active verse's UHB/UGNT verse content — OL-anchors ULT/UST note highlights
   // (resolve the OL quote against the source, then map via alignment) so a
   // reordered English translation still highlights. Ignored for UHB/UGNT.
@@ -103,6 +106,7 @@ export function BookView({
   activeVerse,
   activeNoteQuote,
   activeNoteOccurrence,
+  reorderHighlight,
   activeSourceContent,
   scrollNonce,
   findQuery,
@@ -315,6 +319,7 @@ export function BookView({
               activeVerse={activeVerse}
               activeNoteQuote={activeNoteQuote}
               activeNoteOccurrence={activeNoteOccurrence}
+              reorderHighlight={reorderHighlight ?? null}
               activeSourceContent={activeSourceContent}
               activeRowRef={activeRowRef}
               search={search}
@@ -375,6 +380,7 @@ const ChapterBlock = memo(function ChapterBlock({
   activeVerse,
   activeNoteQuote,
   activeNoteOccurrence,
+  reorderHighlight,
   activeSourceContent,
   activeRowRef,
   search,
@@ -396,6 +402,7 @@ const ChapterBlock = memo(function ChapterBlock({
   activeVerse: number;
   activeNoteQuote: string | null;
   activeNoteOccurrence: number | null;
+  reorderHighlight: ReorderHighlight | null;
   activeSourceContent?: unknown;
   activeRowRef: React.MutableRefObject<HTMLDivElement | null>;
   search: SearchState | null;
@@ -533,6 +540,7 @@ const ChapterBlock = memo(function ChapterBlock({
             isActive={isActive}
             activeNoteQuote={isActive ? activeNoteQuote : null}
             activeNoteOccurrence={isActive ? activeNoteOccurrence : null}
+            reorderHighlight={isActive ? reorderHighlight : null}
             activeSourceContent={isActive ? activeSourceContent : undefined}
             rowRef={isActive ? activeRowRef : null}
             search={search}
@@ -561,6 +569,7 @@ const VerseRow = memo(function VerseRow({
   isActive,
   activeNoteQuote,
   activeNoteOccurrence,
+  reorderHighlight,
   activeSourceContent,
   rowRef,
   search,
@@ -580,6 +589,7 @@ const VerseRow = memo(function VerseRow({
   isActive: boolean;
   activeNoteQuote: string | null;
   activeNoteOccurrence: number | null;
+  reorderHighlight: ReorderHighlight | null;
   activeSourceContent?: unknown;
   rowRef: React.MutableRefObject<HTMLDivElement | null> | null;
   search: SearchState | null;
@@ -639,6 +649,7 @@ const VerseRow = memo(function VerseRow({
               isActive={isActive}
               activeNoteQuote={activeNoteQuote}
               activeNoteOccurrence={activeNoteOccurrence}
+              reorderHighlight={reorderHighlight}
               activeSourceContent={activeSourceContent}
               search={search}
               findActiveMatch={findActiveMatch}
@@ -665,6 +676,7 @@ const VerseCell = memo(function VerseCell({
   isActive,
   activeNoteQuote,
   activeNoteOccurrence,
+  reorderHighlight,
   activeSourceContent,
   search,
   findActiveMatch,
@@ -686,6 +698,7 @@ const VerseCell = memo(function VerseCell({
   isActive: boolean;
   activeNoteQuote: string | null;
   activeNoteOccurrence: number | null;
+  reorderHighlight: ReorderHighlight | null;
   activeSourceContent?: unknown;
   search: SearchState | null;
   findActiveMatch: FindMatch | null;
@@ -795,10 +808,28 @@ const VerseCell = memo(function VerseCell({
   }, [search, sourceHits, dto?.plain_text, isSource, activeRange]);
 
   const highlights = useMemo<Set<HighlightKey> | null>(() => {
-    if (findHTML) return null;
-    if (!isActive || !activeNoteQuote || !dto?.content) return null;
-    return highlightsFor(bibleVersion, dto.content, activeNoteQuote, activeNoteOccurrence, activeSourceContent);
-  }, [findHTML, isActive, activeNoteQuote, activeNoteOccurrence, bibleVersion, dto?.content, activeSourceContent]);
+    if (findHTML || !isActive || !dto?.content) return null;
+    // During a preview the yellow follows the moved/hovered note; else active.
+    const aQuote = reorderHighlight?.movedQuote ?? activeNoteQuote;
+    const aOcc = reorderHighlight?.movedQuote ? reorderHighlight.movedOccurrence : activeNoteOccurrence;
+    if (!aQuote) return null;
+    return highlightsFor(bibleVersion, dto.content, aQuote, aOcc, activeSourceContent);
+  }, [findHTML, isActive, activeNoteQuote, activeNoteOccurrence, reorderHighlight, bibleVersion, dto?.content, activeSourceContent]);
+
+  // Reorder stoplight neighbour sets (green underline / red overline), active
+  // verse only and only while a drag / recent arrow-move is live.
+  const prevHighlights = useMemo<Set<HighlightKey> | null>(() => {
+    if (findHTML || !isActive || !reorderHighlight?.prevQuote || !dto?.content) return null;
+    return highlightsFor(bibleVersion, dto.content, reorderHighlight.prevQuote, reorderHighlight.prevOccurrence, activeSourceContent);
+  }, [findHTML, isActive, reorderHighlight, bibleVersion, dto?.content, activeSourceContent]);
+  const nextHighlights = useMemo<Set<HighlightKey> | null>(() => {
+    if (findHTML || !isActive || !reorderHighlight?.nextQuote || !dto?.content) return null;
+    return highlightsFor(bibleVersion, dto.content, reorderHighlight.nextQuote, reorderHighlight.nextOccurrence, activeSourceContent);
+  }, [findHTML, isActive, reorderHighlight, bibleVersion, dto?.content, activeSourceContent]);
+  const roles = useMemo(() => {
+    if (!prevHighlights?.size && !nextHighlights?.size) return undefined;
+    return { prev: prevHighlights, next: nextHighlights };
+  }, [prevHighlights, nextHighlights]);
 
   const html = useMemo(() => {
     if (findHTML) return findHTML;
@@ -811,7 +842,7 @@ const VerseCell = memo(function VerseCell({
     // extractEditableText and the smartEditVerse save diff lines up. Only the
     // active verse gets chips; the rest of the book stays clean.
     if (isActive && !readOnly) {
-      return renderEditableHTML(verseObjects, highlights ?? new Set());
+      return renderEditableHTML(verseObjects, highlights ?? new Set(), roles);
     }
     // Drift trailing `\q1`/`\p` etc. from the previous verse so the
     // visual break introduces this verse — usfm-js attaches markers
@@ -822,8 +853,8 @@ const VerseCell = memo(function VerseCell({
     const composed = drifted.length > 0 ? [...drifted, ...verseObjects] : verseObjects;
     // Render unconditionally so paragraph / poetry markers turn into
     // visual breaks / indents in book view even without active highlights.
-    return renderHighlightedHTML(composed, highlights ?? new Set());
-  }, [findHTML, dto?.content, highlights, prevDto?.content, isActive, readOnly]);
+    return renderHighlightedHTML(composed, highlights ?? new Set(), roles);
+  }, [findHTML, dto?.content, highlights, prevDto?.content, isActive, readOnly, roles]);
 
   // splitSectionHeaders walks the whole verseObjects tree — memoize on the
   // content reference so re-renders without a content change skip the walk.
@@ -935,6 +966,9 @@ const VerseCell = memo(function VerseCell({
           <HebrewLine
             verseObjects={(dto.content as { verseObjects?: unknown[] } | null)?.verseObjects}
             lexiconMap={lexiconMap}
+            highlights={highlights ?? undefined}
+            prevHighlights={prevHighlights ?? undefined}
+            nextHighlights={nextHighlights ?? undefined}
             findHighlights={findHighlights}
             activeFindKey={activeFindKey}
             fallbackText={dto.plain_text ?? ""}

@@ -1,4 +1,4 @@
-import { Fragment, type Ref, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, type Ref, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Box, Stack, Typography, Chip, Button, IconButton, Tooltip } from "@mui/material";
 import AddIcon from "@mui/icons-material/Add";
 import PushPinIcon from "@mui/icons-material/PushPin";
@@ -10,6 +10,18 @@ import { QuestionsTable } from "./QuestionsTable";
 import { AlignmentPanel, type AlignmentPanelHandle } from "./AlignmentPanel";
 
 export type PanelMode = "resources" | "alignment";
+
+// Candidate slot for the reorder "stoplight" — the moved note plus the note
+// ids that would become its predecessor / successor at the current drag target
+// (or after an arrow move). Shell resolves these ids to quotes and lights the
+// active verse green (prev) / red (next). null prev/next means "no neighbour on
+// that side" (moved note is first / last in its verse).
+export interface ReorderPreview {
+  verse: number;
+  movedId: string;
+  prevId: string | null;
+  nextId: string | null;
+}
 
 export interface AlignmentTabProps {
   book: string;
@@ -53,6 +65,11 @@ interface Props {
   onNoteRestore: (id: string) => void;
   onNoteInsertAfter: (refId: string) => void;
   onNoteReorder: (draggedId: string, refId: string, position: DropPosition) => void;
+  // Report the moved note's candidate neighbours so Shell can paint the
+  // active-verse stoplight. Fired live as a drag hovers each slot (sticky =
+  // false; cleared on drop), and once after an arrow move (sticky = true,
+  // auto-clears in Shell after ~3s). null clears the preview.
+  onReorderPreview?: (preview: ReorderPreview | null, sticky?: boolean) => void;
   onNoteFocus: (row: TnRow) => void;
   onNoteCreate: () => void;
   // Async AI-draft wiring. All optional — when absent, sparkles hides.
@@ -181,6 +198,7 @@ export function ResourceColumn({
   onNoteRestore,
   onNoteInsertAfter,
   onNoteReorder,
+  onReorderPreview,
   onNoteFocus,
   onNoteCreate,
   onNoteStartAi,
@@ -269,6 +287,40 @@ export function ResourceColumn({
   const [dragOver, setDragOver] = useState<
     { targetId: string; position: DropPosition } | null
   >(null);
+
+  // Resolve the moved note's candidate neighbours at a given drop target —
+  // shared by the live drag hover and the arrow moves. Scoped to the moved
+  // note's verse, excluding the moved note and any trashed notes (the same
+  // per-verse, non-trashed ordering the reorder itself renumbers).
+  const computeNeighbors = useCallback(
+    (movedId: string, targetId: string, position: DropPosition): ReorderPreview | null => {
+      const moved = tn.find((r) => r.id === movedId);
+      if (!moved) return null;
+      const list = sortBySortOrder(
+        tn.filter((r) => r.verse === moved.verse && r.trashed_at == null && r.id !== movedId),
+      );
+      const ti = list.findIndex((r) => r.id === targetId);
+      const insertion = ti < 0 ? list.length : position === "before" ? ti : ti + 1;
+      return {
+        verse: moved.verse,
+        movedId,
+        prevId: list[insertion - 1]?.id ?? null,
+        nextId: list[insertion]?.id ?? null,
+      };
+    },
+    [tn],
+  );
+
+  // Live drag preview: as the dragged card hovers each slot, report the
+  // neighbours it would land between. dragOver only changes ref when the slot
+  // actually changes (see onCardDragOver), so this fires once per slot. The
+  // preview is cleared on dragend (onDragEnd below), not here — returning early
+  // when the drag stops avoids wiping a sticky arrow-move preview.
+  useEffect(() => {
+    if (!onReorderPreview || !dragId || !dragOver) return;
+    const preview = computeNeighbors(dragId, dragOver.targetId, dragOver.position);
+    if (preview) onReorderPreview(preview, false);
+  }, [dragId, dragOver, computeNeighbors, onReorderPreview]);
 
   const scrollBodyRef = useRef<HTMLDivElement | null>(null);
 
@@ -636,11 +688,37 @@ export function ResourceColumn({
           onInsertAfter={() => onNoteInsertAfter(r.id)}
           onFocus={() => onNoteFocus(r)}
           onGripDragStart={() => setDragId(r.id)}
-          onMoveUp={prevNote ? () => onNoteReorder(r.id, prevNote.id, "before") : undefined}
-          onMoveDown={nextNote ? () => onNoteReorder(r.id, nextNote.id, "after") : undefined}
+          onMoveUp={
+            prevNote
+              ? () => {
+                  onNoteReorder(r.id, prevNote.id, "before");
+                  onReorderPreview?.(computeNeighbors(r.id, prevNote.id, "before"), true);
+                }
+              : undefined
+          }
+          onMoveDown={
+            nextNote
+              ? () => {
+                  onNoteReorder(r.id, nextNote.id, "after");
+                  onReorderPreview?.(computeNeighbors(r.id, nextNote.id, "after"), true);
+                }
+              : undefined
+          }
+          onReorderHover={
+            onReorderPreview
+              ? (entering) =>
+                  onReorderPreview(
+                    entering
+                      ? { verse: r.verse, movedId: r.id, prevId: prevNote?.id ?? null, nextId: nextNote?.id ?? null }
+                      : null,
+                    false,
+                  )
+              : undefined
+          }
           onDragEnd={() => {
             setDragId(null);
             setDragOver(null);
+            onReorderPreview?.(null, false);
           }}
           onCardDragOver={(position) => {
             setDragOver((cur) =>

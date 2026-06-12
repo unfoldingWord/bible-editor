@@ -8,13 +8,19 @@ import { Tooltip, Box } from "@mui/material";
 import type { LexiconEntry } from "../hooks/useLexicon";
 import type { SourceWord } from "../lib/alignment";
 import type { HighlightKey } from "../lib/highlight";
-import { wordHighlightStyles } from "../lib/highlightStyles";
+import { roleLineShadow, wordHighlightStyles } from "../lib/highlightStyles";
 import { SourceTooltipBody } from "./SourceTooltipBody";
 
 interface Props {
   verseObjects: unknown[] | undefined | null;
   lexiconMap: Map<string, LexiconEntry | null>;
   highlights?: Set<HighlightKey> | null;
+  // Reorder stoplight: words belonging to the moved note's candidate
+  // predecessor (green underline) / successor (red overline). Composed on top
+  // of the active fill via inset box-shadow; suppressed while a find hit owns
+  // the token (find precedence, same as the yellow note highlight).
+  prevHighlights?: Set<HighlightKey> | null;
+  nextHighlights?: Set<HighlightKey> | null;
   // Find-overlay matches that should paint orange (be-find), overriding
   // any yellow note highlight on the same token. Keyed `${text}|${occ}`.
   findHighlights?: Set<HighlightKey> | null;
@@ -27,7 +33,7 @@ interface Props {
   fallbackText?: string;
 }
 
-export function HebrewLine({ verseObjects, lexiconMap, highlights, findHighlights, activeFindKey, fallbackText }: Props) {
+export function HebrewLine({ verseObjects, lexiconMap, highlights, prevHighlights, nextHighlights, findHighlights, activeFindKey, fallbackText }: Props) {
   if (!Array.isArray(verseObjects)) {
     return <>{fallbackText ?? ""}</>;
   }
@@ -48,6 +54,8 @@ export function HebrewLine({ verseObjects, lexiconMap, highlights, findHighlight
         const isFindHit = !!findHighlights && findHighlights.has(key);
         const isActiveFind = !!activeFindKey && activeFindKey === key;
         const isHighlighted = !!highlights && highlights.has(key);
+        const isPrev = !!prevHighlights && prevHighlights.has(key);
+        const isNext = !!nextHighlights && nextHighlights.has(key);
         const src: SourceWord = {
           id: "",
           strong,
@@ -61,7 +69,13 @@ export function HebrewLine({ verseObjects, lexiconMap, highlights, findHighlight
           <Box
             component="span"
             sx={(theme) => {
-              const hl = wordHighlightStyles(theme.palette.mode);
+              const mode = theme.palette.mode;
+              const hl = wordHighlightStyles(mode);
+              // Find hits own the token (orange) and suppress both the yellow
+              // note fill and the reorder stoplight lines, matching the <mark>
+              // render path's find precedence.
+              const roleShadow =
+                !isFindHit && !isActiveFind ? roleLineShadow(mode, isPrev, isNext) : undefined;
               return {
                 cursor: "help",
                 ...(isActiveFind
@@ -71,6 +85,7 @@ export function HebrewLine({ verseObjects, lexiconMap, highlights, findHighlight
                     : isHighlighted
                       ? hl.hl
                       : {}),
+                ...(roleShadow ? { boxShadow: roleShadow } : {}),
               };
             }}
           >

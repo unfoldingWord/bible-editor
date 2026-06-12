@@ -237,6 +237,53 @@ function collectBareWords(verseObjects: unknown[]): WordToken[] {
 export type HighlightKey = string; // `${text}|${occurrence}`
 const k = (text: string, occurrence: number): HighlightKey => `${text}|${occurrence}`;
 
+// During a note reorder (drag held, or for a few seconds after an arrow move)
+// the active verse paints a "stoplight": the moved note keeps the normal yellow
+// fill (its quote is the existing activeNoteQuote), while its candidate
+// predecessor and successor light up on SEPARATE visual channels — green
+// underline (prev) and red overline (next). Carried as quote + occurrence so
+// each cell resolves them against its own version (and OL-anchors ULT/UST).
+export interface ReorderHighlight {
+  // The moved/hovered note itself (yellow fill). Carried explicitly so a HOVER
+  // over the grip/arrows can light the note even when it isn't the active
+  // selection; during a drag/arrow move it equals the active note.
+  movedQuote: string | null;
+  movedOccurrence: number | null;
+  prevQuote: string | null;
+  prevOccurrence: number | null;
+  nextQuote: string | null;
+  nextOccurrence: number | null;
+}
+
+// Per-token role sets handed to the renderers alongside the active highlight
+// set. A word can sit in more than one set at once (overlap is common — two
+// adjacent notes routinely quote the same or nested spans); each role rides its
+// own CSS channel (see markHighlightSx) so overlaps compose instead of one
+// colour clobbering another.
+export interface RoleHighlightSets {
+  prev?: Set<HighlightKey> | null;
+  next?: Set<HighlightKey> | null;
+}
+
+// Build the per-word renderer shared by renderHighlightedHTML /
+// renderEditableHTML. A token gets `be-hl` (active/yellow fill), `be-hl-prev`
+// (green underline) and/or `be-hl-next` (red overline); the classes stack on a
+// single <mark> so a multiply-claimed word shows every role at once.
+function markRenderer(
+  highlights: Set<HighlightKey>,
+  roles?: RoleHighlightSets,
+): (text: string, occurrence: number) => string {
+  return (text, occurrence) => {
+    const key = k(text, occurrence);
+    const cls: string[] = [];
+    if (highlights.has(key)) cls.push("be-hl");
+    if (roles?.prev?.has(key)) cls.push("be-hl-prev");
+    if (roles?.next?.has(key)) cls.push("be-hl-next");
+    if (cls.length === 0) return escapeHtml(text);
+    return `<mark class="${cls.join(" ")}">${escapeHtml(text)}</mark>`;
+  };
+}
+
 // For ULT/UST: returns target-word keys that should be highlighted.
 //
 // CANONICAL APPROACH (OL-anchored), matching gatewayEdit / tcCreate /
@@ -687,14 +734,9 @@ function segmentsToHtml(segments: Segment[], emitChips: boolean): string {
 export function renderHighlightedHTML(
   verseObjects: unknown[],
   highlights: Set<HighlightKey>,
+  roles?: RoleHighlightSets,
 ): string {
-  const segments = segmentByParagraphs(verseObjects, (text, occurrence) => {
-    const key = k(text, occurrence);
-    if (highlights.has(key)) {
-      return `<mark class="be-hl">${escapeHtml(text)}</mark>`;
-    }
-    return escapeHtml(text);
-  });
+  const segments = segmentByParagraphs(verseObjects, markRenderer(highlights, roles));
   return segmentsToHtml(segments, false);
 }
 
@@ -708,14 +750,9 @@ export function renderHighlightedHTML(
 export function renderEditableHTML(
   verseObjects: unknown[],
   highlights: Set<HighlightKey>,
+  roles?: RoleHighlightSets,
 ): string {
-  const segments = segmentByParagraphs(verseObjects, (text, occurrence) => {
-    const key = k(text, occurrence);
-    if (highlights.has(key)) {
-      return `<mark class="be-hl">${escapeHtml(text)}</mark>`;
-    }
-    return escapeHtml(text);
-  });
+  const segments = segmentByParagraphs(verseObjects, markRenderer(highlights, roles));
   return segmentsToHtml(segments, true);
 }
 

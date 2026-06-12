@@ -8,6 +8,45 @@
 
 type Mode = "light" | "dark";
 
+// Reorder "stoplight" channel colours. The moved note keeps the yellow be-hl
+// fill; its predecessor and successor ride separate edges so they compose with
+// the fill (and each other) instead of fighting for one background. Green/red
+// are the conventional stoplight pair, but the meaning is carried by the EDGE
+// (prev = bottom underline, next = top overline) so it survives red/green
+// colour-blindness. Dark mode lifts the hues so they read on the dark canvas.
+const ROLE_PREV_COLOR = { light: "#2e7d32", dark: "#66bb6a" }; // green — previous note
+const ROLE_NEXT_COLOR = { light: "#d32f2f", dark: "#ef5350" }; // red — next note
+
+// box-shadow string for a token that belongs to the prev and/or next note.
+// inset (not border) so adding it never reflows the line; the two insets sit in
+// one declaration so a word claimed by both shows underline + overline at once.
+// Returns undefined when neither role applies. Shared by the <mark> stylesheet
+// (markHighlightSx) and HebrewLine's per-token sx so both channels match.
+export function roleLineShadow(mode: Mode, isPrev: boolean, isNext: boolean): string | undefined {
+  const parts: string[] = [];
+  if (isPrev) parts.push(`inset 0 -3px 0 ${mode === "dark" ? ROLE_PREV_COLOR.dark : ROLE_PREV_COLOR.light}`);
+  if (isNext) parts.push(`inset 0 3px 0 ${mode === "dark" ? ROLE_NEXT_COLOR.dark : ROLE_NEXT_COLOR.light}`);
+  return parts.length ? parts.join(", ") : undefined;
+}
+
+// `& mark.be-hl-prev` / `.be-hl-next` channel rules for the reorder stoplight,
+// spread into both light/dark markHighlightSx branches. The :not(.be-hl) reset
+// clears the browser-default <mark> yellow on prev/next-ONLY words without
+// touching the active fill (active+prev keeps yellow bg + green underline). The
+// combined selector outranks the singles so a both-roles word shows both lines.
+function roleMarkSx(mode: Mode) {
+  return {
+    "& mark.be-hl-prev:not(.be-hl), & mark.be-hl-next:not(.be-hl)": {
+      backgroundColor: "transparent",
+      color: "inherit",
+      padding: "0 2px",
+    },
+    "& mark.be-hl-prev": { boxShadow: roleLineShadow(mode, true, false), borderRadius: 0 },
+    "& mark.be-hl-next": { boxShadow: roleLineShadow(mode, false, true), borderRadius: 0 },
+    "& mark.be-hl-prev.be-hl-next": { boxShadow: roleLineShadow(mode, true, true) },
+  };
+}
+
 // Layout styles for paragraph / poetry / blank / section markers
 // emitted by renderHighlightedHTML and renderEditableHTML. Shared across
 // rows / columns / book views via markHighlightSx so any container that
@@ -82,6 +121,7 @@ export function markHighlightSx(mode: Mode) {
   if (mode === "dark") {
     return {
       ...layout,
+      ...roleMarkSx(mode),
       "& mark.be-hl": {
         backgroundColor: "rgba(255, 244, 138, 0.22)",
         padding: "0 2px",
@@ -103,6 +143,7 @@ export function markHighlightSx(mode: Mode) {
   }
   return {
     ...layout,
+    ...roleMarkSx(mode),
     "& mark.be-hl": {
       backgroundColor: "#fff48a",
       padding: "0 2px",

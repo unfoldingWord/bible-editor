@@ -5,7 +5,7 @@ import SaveIcon from "@mui/icons-material/Save";
 import SaveOutlinedIcon from "@mui/icons-material/SaveOutlined";
 import UndoIcon from "@mui/icons-material/Undo";
 import type { VerseDto } from "../sync/api";
-import { highlightsFor, renderEditableHTML, renderHighlightedHTML, type HighlightKey } from "../lib/highlight";
+import { highlightsFor, renderEditableHTML, renderHighlightedHTML, type HighlightKey, type ReorderHighlight } from "../lib/highlight";
 import { markHighlightSx } from "../lib/highlightStyles";
 import { extractTrailingMarkers, splitSectionHeaders, type SectionHeader } from "../lib/usfm";
 import { SectionHeaderBand } from "./SectionHeaderBand";
@@ -41,6 +41,10 @@ interface Props {
   rtl?: boolean;
   activeNoteQuote?: string | null;
   activeNoteOccurrence?: number | null;
+  // Transient reorder stoplight for the active verse (drag held / ~3s after an
+  // arrow move): the moved note's candidate prev (green underline) + next (red
+  // overline), on channels separate from the yellow active fill.
+  reorderHighlight?: ReorderHighlight | null;
   // Active verse's UHB/UGNT verse content — lets ULT/UST columns OL-anchor the
   // note highlight (resolve the OL quote against the source, then map via
   // alignment) instead of guessing from milestone order. Ignored for UHB/UGNT.
@@ -94,6 +98,7 @@ export function DocColumn({
   rtl,
   activeNoteQuote,
   activeNoteOccurrence,
+  reorderHighlight,
   activeSourceContent,
   scrollNonce,
   lexiconMap,
@@ -250,9 +255,22 @@ export function DocColumn({
           // "Active" if the user's navigated verse is inside this DTO's
           // range. For singletons this reduces to v === activeVerse.
           const isActive = activeVerse >= dto.verse && activeVerse <= (dto.verse_end ?? dto.verse);
+          // During a preview the yellow follows the moved/hovered note; else the
+          // active note.
+          const aQuote = reorderHighlight?.movedQuote ?? activeNoteQuote;
+          const aOcc = reorderHighlight?.movedQuote ? reorderHighlight.movedOccurrence : activeNoteOccurrence;
           const highlights = isActive
-            ? highlightsFor(bibleVersion, dto.content, activeNoteQuote, activeNoteOccurrence, activeSourceContent)
+            ? highlightsFor(bibleVersion, dto.content, aQuote, aOcc, activeSourceContent)
             : null;
+          // Reorder stoplight neighbour sets (active verse only, while live).
+          const prevHighlights =
+            isActive && reorderHighlight?.prevQuote
+              ? highlightsFor(bibleVersion, dto.content, reorderHighlight.prevQuote, reorderHighlight.prevOccurrence, activeSourceContent)
+              : null;
+          const nextHighlights =
+            isActive && reorderHighlight?.nextQuote
+              ? highlightsFor(bibleVersion, dto.content, reorderHighlight.nextQuote, reorderHighlight.nextOccurrence, activeSourceContent)
+              : null;
           // Lift any \s1/\s2/\s3 section headers in this verse's content
           // into block-level bands rendered AFTER the inline verse span
           // (see below) — they sit in the verse's trailing objects and
@@ -286,6 +304,8 @@ export function DocColumn({
                 content={dto.content}
                 precedingMarkers={drift}
                 highlights={highlights}
+                prevHighlights={prevHighlights}
+                nextHighlights={nextHighlights}
                 isActive={isActive}
                 readOnly={!!readOnly}
                 rtl={!!rtl}
@@ -360,6 +380,8 @@ function VerseSpan({
   content,
   precedingMarkers,
   highlights,
+  prevHighlights,
+  nextHighlights,
   isActive,
   readOnly,
   rtl,
@@ -388,6 +410,10 @@ function VerseSpan({
   // breaks introduce this verse correctly.
   precedingMarkers?: unknown[];
   highlights?: Set<string> | null;
+  // Reorder stoplight neighbour sets (green underline / red overline). Set only
+  // for the active verse while a drag / recent arrow-move is live.
+  prevHighlights?: Set<string> | null;
+  nextHighlights?: Set<string> | null;
   isActive: boolean;
   readOnly: boolean;
   rtl: boolean;
@@ -488,6 +514,13 @@ function VerseSpan({
     return out.includes("be-find") ? out : null;
   }, [search, sourceHits, text, isSource, activeRange]);
 
+  // Stoplight role sets → render channels. undefined unless a reorder is live,
+  // so the common render path is byte-identical to before the feature.
+  const roles = useMemo(() => {
+    if (!prevHighlights?.size && !nextHighlights?.size) return undefined;
+    return { prev: prevHighlights, next: nextHighlights };
+  }, [prevHighlights, nextHighlights]);
+
   const html = useMemo(() => {
     if (findHTML) return findHTML;
     if (!content) return null;
@@ -500,7 +533,7 @@ function VerseSpan({
     // extractEditableText and the smartEditVerse save diff lines up. Only the
     // active verse gets chips; the rest of the column stays clean.
     if (isActive && !readOnly) {
-      return renderEditableHTML(verseObjects, highlights ?? new Set());
+      return renderEditableHTML(verseObjects, highlights ?? new Set(), roles);
     }
     // Compose any drifted-down markers (from the previous verse's
     // trailing `\q1`/`\p` etc.) at the front so the visual break
@@ -510,8 +543,8 @@ function VerseSpan({
       : verseObjects;
     // Render unconditionally so paragraph / poetry markers turn into
     // visual breaks / indents even without an active highlight set.
-    return renderHighlightedHTML(drifted, highlights ?? new Set());
-  }, [findHTML, content, highlights, precedingMarkers, isActive, readOnly]);
+    return renderHighlightedHTML(drifted, highlights ?? new Set(), roles);
+  }, [findHTML, content, highlights, precedingMarkers, isActive, readOnly, roles]);
 
   // Resync the editable span when (a) text changes from outside and the user
   // hasn't been typing since, or (b) highlights change. We let the user type
@@ -633,6 +666,8 @@ function VerseSpan({
             verseObjects={(content as { verseObjects?: unknown[] } | null)?.verseObjects}
             lexiconMap={lexiconMap}
             highlights={highlights ?? undefined}
+            prevHighlights={prevHighlights ?? undefined}
+            nextHighlights={nextHighlights ?? undefined}
             findHighlights={findHighlights}
             activeFindKey={activeFindKey}
             fallbackText={text}

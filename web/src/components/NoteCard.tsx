@@ -75,6 +75,10 @@ interface Props {
   onCardDrop: (position: DropPosition) => void;
   onMoveUp?: () => void;
   onMoveDown?: () => void;
+  // Hovering the reorder controls (grip / up / down) previews this note's
+  // current slot in the scripture stoplight without moving it: fires true on
+  // enter, false on leave.
+  onReorderHover?: (entering: boolean) => void;
   // Async AI-draft lifecycle. State lives in Shell so the call can
   // survive the card un-focusing / scrolling off-screen. NoteCard is
   // purely presentational w.r.t. AI: shows spinner while pending,
@@ -169,6 +173,7 @@ function NoteCardInner({
   onCardDrop,
   onMoveUp,
   onMoveDown,
+  onReorderHover,
   isAiPending = false,
   aiRecentlyCompletedAt = null,
   onStartAi,
@@ -751,6 +756,11 @@ function NoteCardInner({
           flexWrap: "wrap",
         }}
       >
+        <Box
+          onMouseEnter={!trashed && onReorderHover ? () => onReorderHover(true) : undefined}
+          onMouseLeave={!trashed && onReorderHover ? () => onReorderHover(false) : undefined}
+          sx={{ display: "inline-flex", alignItems: "center" }}
+        >
         <Tooltip title={trashed ? "restore to reorder" : "drag to reorder"}>
           <Box
             draggable={!trashed}
@@ -799,6 +809,7 @@ function NoteCardInner({
             </IconButton>
           </span>
         </Tooltip>
+        </Box>
         <Box sx={readOnly ? { pointerEvents: "none", opacity: 0.6 } : undefined}>
           <CatalogPicker
             value={supportRef}

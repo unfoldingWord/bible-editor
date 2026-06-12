@@ -15,7 +15,7 @@ import type { FindMatch } from "./FindReplaceOverlay";
 import { HebrewLine } from "./HebrewLine";
 import type { LexiconEntry } from "../hooks/useLexicon";
 import type { ChapterState } from "../hooks/useBook";
-import { highlightsFor, renderEditableHTML, renderHighlightedHTML, type HighlightKey } from "../lib/highlight";
+import { highlightsFor, renderEditableHTML, renderHighlightedHTML, type HighlightKey, type ReorderHighlight } from "../lib/highlight";
 import { markHighlightSx } from "../lib/highlightStyles";
 import { extractEditableText, extractTrailingMarkers, splitSectionHeaders, type SectionHeader } from "../lib/usfm";
 import { SectionHeaderBand } from "./SectionHeaderBand";
@@ -53,6 +53,11 @@ interface Props {
   activeVerse: number;
   activeNoteQuote: string | null;
   activeNoteOccurrence: number | null;
+  // Transient reorder "stoplight": while a note is dragged (or for ~3s after an
+  // arrow move) the active verse also lights the moved note's candidate
+  // predecessor (green underline) and successor (red overline) on channels
+  // separate from the yellow active fill. Null during normal editing.
+  reorderHighlight?: ReorderHighlight | null;
   mode: ScriptureMode;
   enabledVersions: string[];
   availableVersions: string[];
@@ -150,6 +155,7 @@ function ScriptureColumnInner({
   activeVerse,
   activeNoteQuote,
   activeNoteOccurrence,
+  reorderHighlight,
   mode,
   enabledVersions,
   availableVersions,
@@ -459,6 +465,7 @@ function ScriptureColumnInner({
             isHebrew={isHebrew}
             activeNoteQuote={activeNoteQuote}
             activeNoteOccurrence={activeNoteOccurrence}
+            reorderHighlight={reorderHighlight ?? null}
             lexiconMap={lexiconMap}
             search={search}
             findActiveMatch={findScrollTarget}
@@ -480,6 +487,7 @@ function ScriptureColumnInner({
               activeVerse={activeVerse}
               activeNoteQuote={activeNoteQuote}
               activeNoteOccurrence={activeNoteOccurrence}
+              reorderHighlight={reorderHighlight ?? null}
               activeSourceContent={activeSourceContent}
               scrollNonce={scrollNonce}
               findQuery={findQuery}
@@ -513,6 +521,7 @@ function ScriptureColumnInner({
                 rtl={v === "UHB"}
                 activeNoteQuote={activeNoteQuote}
                 activeNoteOccurrence={activeNoteOccurrence}
+                reorderHighlight={reorderHighlight ?? null}
                 activeSourceContent={activeSourceContent}
                 scrollNonce={scrollNonce}
                 lexiconMap={v === "UHB" ? lexiconMap : undefined}
@@ -557,6 +566,7 @@ function areScriptureColumnPropsEqual(a: Props, b: Props): boolean {
     a.activeVerse === b.activeVerse &&
     a.activeNoteQuote === b.activeNoteQuote &&
     a.activeNoteOccurrence === b.activeNoteOccurrence &&
+    a.reorderHighlight === b.reorderHighlight &&
     a.mode === b.mode &&
     a.enabledVersions === b.enabledVersions &&
     a.availableVersions === b.availableVersions &&
@@ -595,6 +605,7 @@ function StackedBody({
   isHebrew,
   activeNoteQuote,
   activeNoteOccurrence,
+  reorderHighlight,
   lexiconMap,
   search,
   findActiveMatch,
@@ -614,6 +625,7 @@ function StackedBody({
   isHebrew: boolean;
   activeNoteQuote: string | null;
   activeNoteOccurrence: number | null;
+  reorderHighlight: ReorderHighlight | null;
   lexiconMap: Map<string, LexiconEntry | null>;
   search: SearchState | null;
   findActiveMatch: FindMatch | null;
@@ -651,9 +663,23 @@ function StackedBody({
         if (isActive) {
           // OL-anchor the ULT/UST highlights on the active verse's source
           // (UHB/UGNT) verse so reordered translations still light up.
-          const ultHL = highlightsFor("ULT", ultV?.content, activeNoteQuote, activeNoteOccurrence, uhbV?.content);
-          const ustHL = highlightsFor("UST", ustV?.content, activeNoteQuote, activeNoteOccurrence, uhbV?.content);
-          const uhbHL = highlightsFor(uhbLabel, uhbV?.content, activeNoteQuote, activeNoteOccurrence);
+          // During a preview the yellow follows the MOVED note (so a hover over
+          // a non-selected note's grip still lights it); otherwise the active note.
+          const ro = reorderHighlight;
+          const aQuote = ro?.movedQuote ?? activeNoteQuote;
+          const aOcc = ro?.movedQuote ? ro.movedOccurrence : activeNoteOccurrence;
+          const ultHL = highlightsFor("ULT", ultV?.content, aQuote, aOcc, uhbV?.content);
+          const ustHL = highlightsFor("UST", ustV?.content, aQuote, aOcc, uhbV?.content);
+          const uhbHL = highlightsFor(uhbLabel, uhbV?.content, aQuote, aOcc);
+          // Reorder stoplight: the moved note's candidate neighbours, resolved
+          // per version (ULT/UST OL-anchored on UHB, like the active set).
+          // Undefined unless a drag / hover / recent arrow-move is in flight.
+          const ultPrevHL = ro?.prevQuote ? highlightsFor("ULT", ultV?.content, ro.prevQuote, ro.prevOccurrence, uhbV?.content) : undefined;
+          const ultNextHL = ro?.nextQuote ? highlightsFor("ULT", ultV?.content, ro.nextQuote, ro.nextOccurrence, uhbV?.content) : undefined;
+          const ustPrevHL = ro?.prevQuote ? highlightsFor("UST", ustV?.content, ro.prevQuote, ro.prevOccurrence, uhbV?.content) : undefined;
+          const ustNextHL = ro?.nextQuote ? highlightsFor("UST", ustV?.content, ro.nextQuote, ro.nextOccurrence, uhbV?.content) : undefined;
+          const uhbPrevHL = ro?.prevQuote ? highlightsFor(uhbLabel, uhbV?.content, ro.prevQuote, ro.prevOccurrence) : undefined;
+          const uhbNextHL = ro?.nextQuote ? highlightsFor(uhbLabel, uhbV?.content, ro.nextQuote, ro.nextOccurrence) : undefined;
           // For multi-verse blocks, PATCH and find/replace target the canonical
           // row at verse_start (e.g. 6 for a 6-9 range), not the active integer.
           const ultStart = ultV?.verse ?? v;
@@ -706,6 +732,8 @@ function StackedBody({
                 content={ultV?.content}
                 prevContent={ultPrev?.content}
                 highlights={ultHL}
+                prevHighlights={ultPrevHL}
+                nextHighlights={ultNextHL}
                 search={search}
                 findActiveMatch={findActiveMatch}
                 editable={!locked}
@@ -732,6 +760,8 @@ function StackedBody({
                 content={ustV?.content}
                 prevContent={ustPrev?.content}
                 highlights={ustHL}
+                prevHighlights={ustPrevHL}
+                nextHighlights={ustNextHL}
                 search={search}
                 findActiveMatch={findActiveMatch}
                 editable={!locked}
@@ -759,6 +789,8 @@ function StackedBody({
                   content={uhbV.content}
                   prevContent={uhbPrev?.content}
                   highlights={uhbHL}
+                  prevHighlights={uhbPrevHL}
+                  nextHighlights={uhbNextHL}
                   search={search}
                   findActiveMatch={findActiveMatch}
                   rtl={isHebrew}
@@ -991,6 +1023,8 @@ function ActiveLine({
   content,
   prevContent,
   highlights,
+  prevHighlights,
+  nextHighlights,
   search,
   findActiveMatch,
   rtl,
@@ -1020,6 +1054,10 @@ function ActiveLine({
   // introduce THIS verse. To edit them, navigate to the prior verse.
   prevContent?: unknown;
   highlights?: Set<HighlightKey>;
+  // Reorder stoplight neighbour sets (green underline / red overline). Only
+  // passed for the active verse while a drag / recent arrow-move is live.
+  prevHighlights?: Set<HighlightKey>;
+  nextHighlights?: Set<HighlightKey>;
   search?: SearchState | null;
   findActiveMatch?: FindMatch | null;
   rtl?: boolean;
@@ -1156,26 +1194,26 @@ function ActiveLine({
     }));
   }, [prevContent]);
 
+  // Stoplight role sets → render channels. undefined when neither neighbour
+  // resolves, so the common non-reorder render takes the exact pre-feature path.
+  const roles = useMemo(() => {
+    if (!prevHighlights?.size && !nextHighlights?.size) return undefined;
+    return { prev: prevHighlights, next: nextHighlights };
+  }, [prevHighlights, nextHighlights]);
+
   const noteHTML = useMemo(() => {
     if (findHTML) return null;
     if (!Array.isArray(verseObjects)) return null;
     const hlSet = highlights ?? (new Set() as Set<HighlightKey>);
-    // When edit mode is on, render with visible chips so paragraph /
-    // poetry markers can be seen and adjusted in place. Otherwise emit
-    // the read-only display (no chips, just block layout).
+    // Edit mode surfaces paragraph / poetry markers as literal chips; read-only
+    // emits block layout. Both render even with an empty active set so the
+    // paragraph structure still shows; `roles` adds the prev/next channels when
+    // a reorder is live (the parent uses FindAwareText for pure inactive rows).
     if (editable && !readOnly) {
-      return renderEditableHTML(verseObjects, hlSet);
+      return renderEditableHTML(verseObjects, hlSet, roles);
     }
-    if (!highlights || highlights.size === 0) {
-      // Same code path used by columns/book views — also runs even without
-      // active highlights so paragraph markers render as visual breaks.
-      // For pure read-only inactive rows, the parent uses FindAwareText
-      // (plain text) instead of this `html`, so this branch only matters
-      // when the active line has no quote highlight.
-      return renderHighlightedHTML(verseObjects, new Set());
-    }
-    return renderHighlightedHTML(verseObjects, highlights);
-  }, [findHTML, verseObjects, highlights, editable, readOnly]);
+    return renderHighlightedHTML(verseObjects, hlSet, roles);
+  }, [findHTML, verseObjects, highlights, editable, readOnly, roles]);
   const html = findHTML ?? noteHTML;
 
   // Only resync the DOM when the highlight/content state actually changes —
@@ -1334,6 +1372,8 @@ function ActiveLine({
             verseObjects={(content as { verseObjects?: unknown[] } | null)?.verseObjects}
             lexiconMap={lexiconMap}
             highlights={highlights}
+            prevHighlights={prevHighlights}
+            nextHighlights={nextHighlights}
             findHighlights={findHighlights}
             activeFindKey={activeFindKey}
             fallbackText={text}
