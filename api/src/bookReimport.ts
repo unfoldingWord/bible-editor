@@ -52,6 +52,11 @@ export const ALL_RESOURCES: readonly Resource[] = ["ult", "ust", "tn", "tq", "tw
 // per-resource SHA gate skips unchanged files entirely, so this rarely bites.
 export const REIMPORT_CHAPTER_CHUNK = 8;
 
+// Max statements per env.DB.batch() write. D1 caps a batch at 100 statements;
+// stay well under so a batch is always a single subrequest. Each changed row is
+// one write statement here (audit rows go in a separate follow-up batch).
+const WRITE_BATCH = 90;
+
 export interface ReimportCounts {
   updated: number;
   inserted: number;
@@ -295,11 +300,8 @@ function rowsForChapter(raw: string, kind: TsvKind, chapter: number): ParsedTsvR
   return out;
 }
 
-// One UPDATE per pristine row, plus one INSERT-OR-IGNORE per row to seed
-// any DCS-new entries. We don't batch into env.DB.batch() because the per-
-// row "did anything change?" signal comes from meta.changes, and batch()
-// reports aggregate counts only. Throughput is fine — a chapter's worth of
-// tn rows is dozens, not thousands.
+// Thin per-chapter wrapper for the HTTP reimport route; applyTsvRows does the
+// hoist-read + batched-write work for whatever rows it's handed.
 async function reimportTsvForChapter(
   env: Env,
   book: string,
@@ -311,10 +313,17 @@ async function reimportTsvForChapter(
   return applyTsvRows(env, book, kind, rowsForChapter(raw, kind, chapter), userId);
 }
 
-// Per-row upsert loop over already-parsed TSV rows (any chapters). Split out so
-// the chunked path can parse a staged file ONCE and feed pre-grouped rows
-// rather than re-parsing the whole file per chapter (the CPU cost that tripped
-// the per-step limit on large books).
+// Upsert over already-parsed TSV rows (any chapters). Split out so the chunked
+// path can parse a staged file ONCE and feed pre-grouped rows rather than
+// re-parsing the whole file per chapter.
+//
+// Subrequest-frugal like applyVerseRows: hoist one read (by id — a row may have
+// moved chapters), classify in memory, batch the writes. New rows keep the
+// proven per-row insert + file-position sort_order placement (they're rare and
+// midpointSortOrder chains off the preceding just-placed row). Updates batch a
+// CAS UPDATE (the full pristine predicate AND `version = <read version>`) so a
+// translator edit between read and write flips the row to skipped, never
+// clobbered — identical guarantee to the old per-row predicate, now race-safe.
 async function applyTsvRows(
   env: Env,
   book: string,
@@ -324,54 +333,158 @@ async function applyTsvRows(
 ): Promise<ReimportCounts> {
   const counts = zeroCounts();
   if (incoming.length === 0) return counts;
+  const now = Math.floor(Date.now() / 1000);
 
-  const pristinePredicate = tsvPristinePredicate(kind);
+  // Read the comparable columns PLUS the pristine-predicate columns in one
+  // (chunked) query so noop / edited / update classification is all in memory.
+  const pristineCols = kind === "tn"
+    ? "version, updated_by, deleted_at, trashed_at, preserve, hint"
+    : "version, updated_by, deleted_at";
+  const existing = new Map<string, Record<string, unknown>>();
+  const ids = incoming.map((r) => r.id);
+  for (let i = 0; i < ids.length; i += 90) {
+    const slice = ids.slice(i, i + 90);
+    const inClause = slice.map((_, j) => `?${j + 2}`).join(",");
+    const rs = await env.DB.prepare(
+      `SELECT id, ${TSV_STORED_COLS[kind]}, ${pristineCols}
+         FROM ${kind}_rows WHERE book = ?1 AND id IN (${inClause})`,
+    )
+      .bind(book, ...slice)
+      .all<Record<string, unknown>>();
+    for (const row of rs.results) existing.set(String(row.id), row);
+  }
 
+  const updates: Array<{ row: ParsedTsvRow; oldVersion: number }> = [];
   for (let i = 0; i < incoming.length; i++) {
     const row = incoming[i];
-    try {
-      const inserted = await tryInsertTsvRow(env, book, kind, row);
-      if (inserted) {
-        counts.inserted++;
-        // DCS-new row: place it where the file orders it. Export sorting is
-        // `chapter, verse, sort_order ASC NULLS LAST, id`, so a NULL
-        // sort_order would dump the row at the end of its verse regardless
-        // of file position.
-        const so = await midpointSortOrder(env, book, kind, incoming, i);
-        await env.DB.prepare(
-          `UPDATE ${kind}_rows SET sort_order = ?1 WHERE id = ?2 AND book = ?3`,
-        )
-          .bind(so, row.id, book)
-          .run();
-        await logEdit(env, kind, row.id, book, userId, null, 1, "create", row);
-        continue;
-      }
-      // Row exists. SELECT first so we can short-circuit when DCS content
-      // matches what's already in D1 — otherwise nightly reimports churn
-      // every pristine row's version and write useless edit_log entries,
-      // which silently invalidates every connected client's `If-Match`.
-      const outcome = await tryUpdateTsvRow(env, book, kind, row, pristinePredicate);
-      if (outcome === "noop") {
-        counts.skipped_noop++;
-      } else if (outcome === "edited") {
-        counts.skipped_edited++;
-      } else {
-        counts.updated++;
-        const v = await env.DB.prepare(
-          `SELECT version FROM ${kind}_rows WHERE id = ?1 AND book = ?2`,
-        )
-          .bind(row.id, book)
-          .first<{ version: number }>();
-        if (v) {
-          await logEdit(env, kind, row.id, book, userId, v.version - 1, v.version, "update", row);
+    const cur = existing.get(row.id);
+    if (!cur) {
+      // DCS-new row: place it where the file orders it. Export sorting is
+      // `chapter, verse, sort_order ASC NULLS LAST, id`, so a NULL sort_order
+      // would dump the row at the end of its verse regardless of file position.
+      try {
+        const inserted = await tryInsertTsvRow(env, book, kind, row);
+        if (inserted) {
+          counts.inserted++;
+          const so = await midpointSortOrder(env, book, kind, incoming, i);
+          await env.DB.prepare(
+            `UPDATE ${kind}_rows SET sort_order = ?1 WHERE id = ?2 AND book = ?3`,
+          )
+            .bind(so, row.id, book)
+            .run();
+          await logEdit(env, kind, row.id, book, userId, null, 1, "create", row);
+        } else {
+          counts.skipped_noop++; // raced — appeared concurrently
         }
+      } catch (e) {
+        counts.errors.push(`${kind} ${row.id}: ${e instanceof Error ? e.message : String(e)}`);
       }
+      continue;
+    }
+    // Exists — short-circuit when the comparable signature already matches
+    // (otherwise nightly reimports churn every pristine row's version and write
+    // useless edit_log entries, silently invalidating clients' If-Match).
+    if (tsvRowSignature(kind, storedTsvRowToParsed(kind, cur)) === tsvRowSignature(kind, row)) {
+      counts.skipped_noop++;
+      continue;
+    }
+    if (!isPristineTsv(kind, cur)) {
+      counts.skipped_edited++;
+      continue;
+    }
+    updates.push({ row, oldVersion: Number(cur.version) });
+  }
+
+  for (let i = 0; i < updates.length; i += WRITE_BATCH) {
+    const slice = updates.slice(i, i + WRITE_BATCH);
+    try {
+      const results = await env.DB.batch(
+        slice.map(({ row, oldVersion }) => buildTsvUpdateStmt(env, book, kind, row, oldVersion, now)),
+      );
+      const logs: D1PreparedStatement[] = [];
+      slice.forEach(({ row, oldVersion }, j) => {
+        if ((results[j]?.meta.changes ?? 0) > 0) {
+          counts.updated++;
+          logs.push(logEditStmt(env, kind, row.id, book, userId, oldVersion, oldVersion + 1, "update", row));
+        } else {
+          counts.skipped_edited++; // raced edit bumped version / set updated_by
+        }
+      });
+      if (logs.length) await env.DB.batch(logs);
     } catch (e) {
-      counts.errors.push(`${kind} ${row.id}: ${e instanceof Error ? e.message : String(e)}`);
+      counts.errors.push(`${kind} update batch: ${e instanceof Error ? e.message : String(e)}`);
     }
   }
 
   return counts;
+}
+
+// In-memory mirror of tsvPristinePredicate (keep in lockstep): is this stored
+// row safe to overwrite (never touched by a human)? Used to classify before
+// queuing an update; the UPDATE statement still carries the SQL predicate as
+// the authoritative race guard.
+function isPristineTsv(kind: TsvKind, row: Record<string, unknown>): boolean {
+  if (row.updated_by != null) return false;
+  if (row.deleted_at != null) return false;
+  if (kind === "tn") {
+    if (row.trashed_at != null) return false;
+    if (Number(row.preserve ?? 0) !== 0) return false;
+    if (Number(row.hint ?? 0) !== 0) return false;
+  }
+  return true;
+}
+
+// Build (don't run) the pristine, CAS-guarded UPDATE for one TSV row. Mirrors
+// the per-kind columns the old tryUpdateTsvRow wrote; sets version explicitly to
+// oldVersion+1 and guards on `version = oldVersion` so a concurrent edit can't
+// be clobbered between the hoisted read and this batched write.
+function buildTsvUpdateStmt(
+  env: Env,
+  book: string,
+  kind: TsvKind,
+  row: ParsedTsvRow,
+  oldVersion: number,
+  now: number,
+): D1PreparedStatement {
+  const pristine = tsvPristinePredicate(kind);
+  const newVersion = oldVersion + 1;
+  if (kind === "tn") {
+    return env.DB.prepare(
+      `UPDATE tn_rows
+          SET ref_raw = ?1, chapter = ?2, verse = ?3, tags = ?4,
+              support_reference = ?5, quote = ?6, occurrence = ?7, note = ?8,
+              version = ?9, updated_at = ?10
+        WHERE id = ?11 AND book = ?12 AND ${pristine} AND version = ?13`,
+    ).bind(
+      row.refRaw, row.chapter, row.verse, row.tags,
+      row.support_reference ?? null, row.quote ?? null, row.occurrence, row.note ?? null,
+      newVersion, now, row.id, book, oldVersion,
+    );
+  }
+  if (kind === "tq") {
+    return env.DB.prepare(
+      `UPDATE tq_rows
+          SET ref_raw = ?1, chapter = ?2, verse = ?3, tags = ?4,
+              quote = ?5, occurrence = ?6, question = ?7, response = ?8,
+              version = ?9, updated_at = ?10
+        WHERE id = ?11 AND book = ?12 AND ${pristine} AND version = ?13`,
+    ).bind(
+      row.refRaw, row.chapter, row.verse, row.tags,
+      row.quote ?? null, row.occurrence, row.question ?? null, row.response ?? null,
+      newVersion, now, row.id, book, oldVersion,
+    );
+  }
+  return env.DB.prepare(
+    `UPDATE twl_rows
+        SET ref_raw = ?1, chapter = ?2, verse = ?3, tags = ?4,
+            orig_words = ?5, occurrence = ?6, tw_link = ?7,
+            version = ?8, updated_at = ?9
+      WHERE id = ?10 AND book = ?11 AND ${pristine} AND version = ?12`,
+  ).bind(
+    row.refRaw, row.chapter, row.verse, row.tags,
+    row.orig_words ?? null, row.occurrence, row.tw_link ?? null,
+    newVersion, now, row.id, book, oldVersion,
+  );
 }
 
 // sort_order for a DCS-new row, derived from its file position. Only the
@@ -427,8 +540,9 @@ async function midpointSortOrder(
   return placeSortOrder(before, after);
 }
 
-// Returns true if the row was inserted (was new), false if it already existed
-// (caller falls through to the pristine UPDATE branch).
+// Returns true if the row was inserted (was new), false if a row with this id
+// already existed (a concurrent insert raced us between the hoisted read and
+// here — the caller counts it as a noop).
 async function tryInsertTsvRow(
   env: Env,
   book: string,
@@ -479,158 +593,6 @@ async function tryInsertTsvRow(
   return (r.meta.changes ?? 0) > 0;
 }
 
-// SELECT-then-compare-then-UPDATE. Three outcomes:
-//   "noop"    — stored row matches DCS exactly; no UPDATE issued.
-//   "updated" — pristine UPDATE succeeded.
-//   "edited"  — row was touched by a translator since the read; pristine
-//               UPDATE matched 0 rows. Skip.
-//
-// The pristine guard stays on the UPDATE itself — a translator edit
-// landing between SELECT and UPDATE flips the outcome to "edited", not
-// silently clobbered. updated_by stays NULL so future re-imports still
-// see this as safe to overwrite.
-type UpdateOutcome = "noop" | "updated" | "edited";
-
-async function tryUpdateTsvRow(
-  env: Env,
-  book: string,
-  kind: TsvKind,
-  row: ParsedTsvRow,
-  pristine: string,
-): Promise<UpdateOutcome> {
-  const now = Math.floor(Date.now() / 1000);
-  if (kind === "tn") {
-    const existing = await env.DB.prepare(
-      `SELECT ref_raw, chapter, verse, tags, support_reference, quote, occurrence, note
-         FROM tn_rows WHERE id = ?1 AND book = ?2`,
-    )
-      .bind(row.id, book)
-      .first<{
-        ref_raw: string;
-        chapter: number;
-        verse: number;
-        tags: string | null;
-        support_reference: string | null;
-        quote: string | null;
-        occurrence: number | null;
-        note: string | null;
-      }>();
-    if (
-      existing &&
-      existing.ref_raw === row.refRaw &&
-      existing.chapter === row.chapter &&
-      existing.verse === row.verse &&
-      (existing.tags ?? null) === (row.tags ?? null) &&
-      (existing.support_reference ?? null) === (row.support_reference ?? null) &&
-      (existing.quote ?? null) === (row.quote ?? null) &&
-      (existing.occurrence ?? null) === (row.occurrence ?? null) &&
-      (existing.note ?? null) === (row.note ?? null)
-    ) {
-      return "noop";
-    }
-    const r = await env.DB.prepare(
-      `UPDATE tn_rows
-          SET ref_raw = ?1, chapter = ?2, verse = ?3, tags = ?4,
-              support_reference = ?5, quote = ?6, occurrence = ?7, note = ?8,
-              version = version + 1, updated_at = ?9
-        WHERE id = ?10 AND book = ?11 AND ${pristine}`,
-    )
-      .bind(
-        row.refRaw, row.chapter, row.verse, row.tags,
-        row.support_reference ?? null, row.quote ?? null,
-        row.occurrence, row.note ?? null,
-        now, row.id, book,
-      )
-      .run();
-    return (r.meta.changes ?? 0) > 0 ? "updated" : "edited";
-  }
-  if (kind === "tq") {
-    const existing = await env.DB.prepare(
-      `SELECT ref_raw, chapter, verse, tags, quote, occurrence, question, response
-         FROM tq_rows WHERE id = ?1 AND book = ?2`,
-    )
-      .bind(row.id, book)
-      .first<{
-        ref_raw: string;
-        chapter: number;
-        verse: number;
-        tags: string | null;
-        quote: string | null;
-        occurrence: number | null;
-        question: string | null;
-        response: string | null;
-      }>();
-    if (
-      existing &&
-      existing.ref_raw === row.refRaw &&
-      existing.chapter === row.chapter &&
-      existing.verse === row.verse &&
-      (existing.tags ?? null) === (row.tags ?? null) &&
-      (existing.quote ?? null) === (row.quote ?? null) &&
-      (existing.occurrence ?? null) === (row.occurrence ?? null) &&
-      (existing.question ?? null) === (row.question ?? null) &&
-      (existing.response ?? null) === (row.response ?? null)
-    ) {
-      return "noop";
-    }
-    const r = await env.DB.prepare(
-      `UPDATE tq_rows
-          SET ref_raw = ?1, chapter = ?2, verse = ?3, tags = ?4,
-              quote = ?5, occurrence = ?6, question = ?7, response = ?8,
-              version = version + 1, updated_at = ?9
-        WHERE id = ?10 AND book = ?11 AND ${pristine}`,
-    )
-      .bind(
-        row.refRaw, row.chapter, row.verse, row.tags,
-        row.quote ?? null, row.occurrence,
-        row.question ?? null, row.response ?? null,
-        now, row.id, book,
-      )
-      .run();
-    return (r.meta.changes ?? 0) > 0 ? "updated" : "edited";
-  }
-  const existing = await env.DB.prepare(
-    `SELECT ref_raw, chapter, verse, tags, orig_words, occurrence, tw_link
-       FROM twl_rows WHERE id = ?1 AND book = ?2`,
-  )
-    .bind(row.id, book)
-    .first<{
-      ref_raw: string;
-      chapter: number;
-      verse: number;
-      tags: string | null;
-      orig_words: string | null;
-      occurrence: number | null;
-      tw_link: string | null;
-    }>();
-  if (
-    existing &&
-    existing.ref_raw === row.refRaw &&
-    existing.chapter === row.chapter &&
-    existing.verse === row.verse &&
-    (existing.tags ?? null) === (row.tags ?? null) &&
-    (existing.orig_words ?? null) === (row.orig_words ?? null) &&
-    (existing.occurrence ?? null) === (row.occurrence ?? null) &&
-    (existing.tw_link ?? null) === (row.tw_link ?? null)
-  ) {
-    return "noop";
-  }
-  const r = await env.DB.prepare(
-    `UPDATE twl_rows
-        SET ref_raw = ?1, chapter = ?2, verse = ?3, tags = ?4,
-            orig_words = ?5, occurrence = ?6, tw_link = ?7,
-            version = version + 1, updated_at = ?8
-      WHERE id = ?9 AND book = ?10 AND ${pristine}`,
-  )
-    .bind(
-      row.refRaw, row.chapter, row.verse, row.tags,
-      row.orig_words ?? null, row.occurrence, row.tw_link ?? null,
-      now, row.id, book,
-    )
-    .run();
-  return (r.meta.changes ?? 0) > 0 ? "updated" : "edited";
-}
-
 // ── Verses (ULT / UST) ─────────────────────────────────────────────────────
 
 async function reimportVersesForChapter(
@@ -644,10 +606,23 @@ async function reimportVersesForChapter(
   return applyVerseRows(env, book, bibleVersion, extractVersesForRange(rawUsfm, chapter, chapter), userId);
 }
 
-// Per-verse upsert loop over already-parsed verses (keys off each verse's own
+// Per-verse upsert over already-parsed verses (keys off each verse's own
 // chapter, so it works across a whole chunk range). Split out so the chunked
-// path parses a staged USFM file ONCE per chunk instead of re-parsing the
-// whole book per chapter.
+// path parses a staged USFM file ONCE per chunk instead of re-parsing the whole
+// book per chapter.
+//
+// Subrequest-frugal: the old version did INSERT-OR-IGNORE + SELECT for EVERY
+// verse of a changed file — thousands of D1 round-trips that exhausted
+// Cloudflare's per-invocation subrequest cap and aborted the nightly sync (the
+// LAM clobber's root cause). Now we hoist one SELECT per chapter, classify in
+// memory, and batch the writes:
+//   - byte-equal verse  → noop, zero writes (the common case)
+//   - new verse         → batched INSERT … ON CONFLICT DO NOTHING (+ audit)
+//   - changed pristine  → batched UPDATE guarded by `updated_by IS NULL AND
+//                         version = <read version>` (CAS), so a translator edit
+//                         landing between the read and the write flips the row
+//                         to skipped, never clobbered — same guarantee the
+//                         per-row predicate gave, now race-safe via the version.
 async function applyVerseRows(
   env: Env,
   book: string,
@@ -657,86 +632,124 @@ async function applyVerseRows(
 ): Promise<ReimportCounts> {
   const counts = zeroCounts();
   if (verses.length === 0) return counts;
-
   const now = Math.floor(Date.now() / 1000);
+
+  // One read for every chapter present (usually a single chapter per call).
+  const chapters = [...new Set(verses.map((v) => v.chapter))];
+  const inClause = chapters.map((_, i) => `?${i + 3}`).join(",");
+  const existingRs = await env.DB.prepare(
+    `SELECT chapter, verse, content_json, plain_text, verse_end, version, updated_by
+       FROM verses WHERE book = ?1 AND bible_version = ?2 AND chapter IN (${inClause})`,
+  )
+    .bind(book, bibleVersion, ...chapters)
+    .all<{
+      chapter: number; verse: number; content_json: string;
+      plain_text: string | null; verse_end: number | null;
+      version: number; updated_by: number | null;
+    }>();
+  const existing = new Map<string, { content_json: string; plain_text: string | null; verse_end: number | null; version: number; updated_by: number | null }>();
+  for (const r of existingRs.results) existing.set(`${r.chapter}:${r.verse}`, r);
+
+  const inserts: VerseExtract[] = [];
+  const updates: Array<{ v: VerseExtract; oldVersion: number }> = [];
   for (const v of verses) {
+    const cur = existing.get(`${v.chapter}:${v.verse}`);
+    if (!cur) {
+      inserts.push(v);
+      continue;
+    }
+    if (
+      cur.content_json === v.contentJson &&
+      (cur.plain_text ?? null) === (v.plainText ?? null) &&
+      (cur.verse_end ?? null) === (v.verseEnd ?? null)
+    ) {
+      counts.skipped_noop++;
+      continue;
+    }
+    if (cur.updated_by !== null) {
+      counts.skipped_edited++;
+      continue;
+    }
+    updates.push({ v, oldVersion: cur.version });
+  }
+
+  const insSql =
+    `INSERT INTO verses (book, chapter, verse, verse_end, bible_version, content_json, plain_text)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+     ON CONFLICT(book, chapter, verse, bible_version) DO NOTHING`;
+  for (let i = 0; i < inserts.length; i += WRITE_BATCH) {
+    const slice = inserts.slice(i, i + WRITE_BATCH);
     try {
-      // Try insert first; cheap signal for "doesn't exist locally".
-      const ins = await env.DB.prepare(
-        `INSERT INTO verses (book, chapter, verse, verse_end, bible_version, content_json, plain_text)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-         ON CONFLICT(book, chapter, verse, bible_version) DO NOTHING`,
-      )
-        .bind(book, v.chapter, v.verse, v.verseEnd, bibleVersion, v.contentJson, v.plainText)
-        .run();
-      if ((ins.meta.changes ?? 0) > 0) {
-        counts.inserted++;
-        await logEdit(
-          env, "verse",
-          `${book}/${v.chapter}/${v.verse}/${bibleVersion}`,
-          book, userId, null, 1, "create",
-          { plain_text: v.plainText },
-        );
-        continue;
-      }
-      // Exists locally — SELECT first so we can short-circuit on byte-equal
-      // content. content_json is produced by extractVersesForRange in both
-      // directions (bootstrap + reimport), so byte-compare is stable for
-      // pristine rows. updated_by IS NULL is the pristine signal here.
-      const existing = await env.DB.prepare(
-        `SELECT content_json, plain_text, verse_end
-           FROM verses
-          WHERE book = ?1 AND chapter = ?2 AND verse = ?3 AND bible_version = ?4`,
-      )
-        .bind(book, v.chapter, v.verse, bibleVersion)
-        .first<{ content_json: string; plain_text: string | null; verse_end: number | null }>();
-      if (
-        existing &&
-        existing.content_json === v.contentJson &&
-        (existing.plain_text ?? null) === (v.plainText ?? null) &&
-        (existing.verse_end ?? null) === (v.verseEnd ?? null)
-      ) {
-        counts.skipped_noop++;
-        continue;
-      }
-      const upd = await env.DB.prepare(
-        `UPDATE verses
-            SET content_json = ?1, plain_text = ?2, verse_end = ?3,
-                version = version + 1, updated_at = ?4
-          WHERE book = ?5 AND chapter = ?6 AND verse = ?7 AND bible_version = ?8
-            AND updated_by IS NULL`,
-      )
-        .bind(v.contentJson, v.plainText, v.verseEnd, now, book, v.chapter, v.verse, bibleVersion)
-        .run();
-      if ((upd.meta.changes ?? 0) > 0) {
-        counts.updated++;
-        const got = await env.DB.prepare(
-          `SELECT version FROM verses
-            WHERE book = ?1 AND chapter = ?2 AND verse = ?3 AND bible_version = ?4`,
-        )
-          .bind(book, v.chapter, v.verse, bibleVersion)
-          .first<{ version: number }>();
-        if (got) {
-          await logEdit(
-            env, "verse",
-            `${book}/${v.chapter}/${v.verse}/${bibleVersion}`,
-            book, userId, got.version - 1, got.version, "update",
-            { plain_text: v.plainText },
-          );
-        }
-      } else {
-        counts.skipped_edited++;
-      }
-    } catch (e) {
-      counts.errors.push(
-        `verse ${bibleVersion} ${book} ${v.chapter}:${v.verse}: ${e instanceof Error ? e.message : String(e)}`,
+      const results = await env.DB.batch(
+        slice.map((v) =>
+          env.DB.prepare(insSql).bind(book, v.chapter, v.verse, v.verseEnd, bibleVersion, v.contentJson, v.plainText),
+        ),
       );
+      const logs: D1PreparedStatement[] = [];
+      slice.forEach((v, j) => {
+        if ((results[j]?.meta.changes ?? 0) > 0) {
+          counts.inserted++;
+          logs.push(logEditStmt(env, "verse", `${book}/${v.chapter}/${v.verse}/${bibleVersion}`, book, userId, null, 1, "create", { plain_text: v.plainText }));
+        } else {
+          counts.skipped_noop++; // raced insert — already present
+        }
+      });
+      if (logs.length) await env.DB.batch(logs);
+    } catch (e) {
+      counts.errors.push(`verse ${bibleVersion} insert batch: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+
+  const updSql =
+    `UPDATE verses SET content_json = ?1, plain_text = ?2, verse_end = ?3, version = ?4, updated_at = ?5
+      WHERE book = ?6 AND chapter = ?7 AND verse = ?8 AND bible_version = ?9
+        AND updated_by IS NULL AND version = ?10`;
+  for (let i = 0; i < updates.length; i += WRITE_BATCH) {
+    const slice = updates.slice(i, i + WRITE_BATCH);
+    try {
+      const results = await env.DB.batch(
+        slice.map(({ v, oldVersion }) =>
+          env.DB.prepare(updSql).bind(v.contentJson, v.plainText, v.verseEnd, oldVersion + 1, now, book, v.chapter, v.verse, bibleVersion, oldVersion),
+        ),
+      );
+      const logs: D1PreparedStatement[] = [];
+      slice.forEach(({ v, oldVersion }, j) => {
+        if ((results[j]?.meta.changes ?? 0) > 0) {
+          counts.updated++;
+          logs.push(logEditStmt(env, "verse", `${book}/${v.chapter}/${v.verse}/${bibleVersion}`, book, userId, oldVersion, oldVersion + 1, "update", { plain_text: v.plainText }));
+        } else {
+          counts.skipped_edited++; // raced edit bumped version / set updated_by
+        }
+      });
+      if (logs.length) await env.DB.batch(logs);
+    } catch (e) {
+      counts.errors.push(`verse ${bibleVersion} update batch: ${e instanceof Error ? e.message : String(e)}`);
     }
   }
   return counts;
 }
 
 // ── Audit ──────────────────────────────────────────────────────────────────
+
+// Build (don't run) an edit_log insert so callers can collect statements into a
+// single env.DB.batch() instead of one round-trip per row.
+function logEditStmt(
+  env: Env,
+  kind: "tn" | "tq" | "twl" | "verse",
+  rowKey: string,
+  book: string,
+  userId: number | null,
+  prevVersion: number | null,
+  newVersion: number,
+  action: "create" | "update",
+  payload: unknown,
+): D1PreparedStatement {
+  return env.DB.prepare(
+    `INSERT INTO edit_log
+       (kind, row_key, book, user_id, prev_version, new_version, action, payload_json, source)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)`,
+  ).bind(kind, rowKey, book, userId, prevVersion, newVersion, action, JSON.stringify(payload), REIMPORT_SOURCE);
+}
 
 async function logEdit(
   env: Env,
@@ -749,13 +762,7 @@ async function logEdit(
   action: "create" | "update",
   payload: unknown,
 ): Promise<void> {
-  await env.DB.prepare(
-    `INSERT INTO edit_log
-       (kind, row_key, book, user_id, prev_version, new_version, action, payload_json, source)
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)`,
-  )
-    .bind(kind, rowKey, book, userId, prevVersion, newVersion, action, JSON.stringify(payload), REIMPORT_SOURCE)
-    .run();
+  await logEditStmt(env, kind, rowKey, book, userId, prevVersion, newVersion, action, payload).run();
 }
 
 // ── Chunked, SHA-gated, diff-aware reimport (Workflow path) ─────────────────
@@ -826,7 +833,7 @@ export async function recordResourceSync(
     .run();
 }
 
-async function storedResourceSha(env: Env, book: string, resource: Resource): Promise<string | null> {
+export async function storedResourceSha(env: Env, book: string, resource: Resource): Promise<string | null> {
   const row = await env.DB.prepare(
     `SELECT source_sha FROM book_resource_syncs WHERE book = ?1 AND resource = ?2`,
   )
