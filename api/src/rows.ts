@@ -16,6 +16,35 @@ const KIND_TO_TABLE: Record<RowKind, string> = {
 
 const isRowKind = (k: string): k is RowKind => k in KIND_TO_TABLE;
 
+// The original-language field per kind — the cell whose Hebrew/Greek content
+// forces Occurrence >= 1 (see origLangOccurrence below).
+const QUOTE_FIELD: Record<RowKind, "quote" | "orig_words"> = {
+  tn: "quote",
+  tq: "quote",
+  twl: "orig_words",
+};
+
+// uW TSV invariant: an original-language (Hebrew/Greek) quote must carry
+// Occurrence >= 1. The editor / AI quote-builder can rewrite a Gateway-Language
+// snippet to OL words without touching occurrence, leaving it null/0, which
+// exports as invalid TSV. Mirrors export.ts's guard (the export side is the
+// last-resort net; this fixes the stored row at the source). Keep the two in
+// sync. Unicode blocks: Hebrew (0590-05FF), Hebrew presentation forms
+// (FB1D-FB4F), Greek and Coptic (0370-03FF), Greek Extended (1F00-1FFF).
+function hasOrigLang(s: string): boolean {
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (
+      (c >= 0x0590 && c <= 0x05ff) ||
+      (c >= 0xfb1d && c <= 0xfb4f) ||
+      (c >= 0x0370 && c <= 0x03ff) ||
+      (c >= 0x1f00 && c <= 0x1fff)
+    )
+      return true;
+  }
+  return false;
+}
+
 // Adds a book filter to a WHERE clause. After the composite-(book, id) PK
 // migration (0015), every row lookup MUST be scoped by book — the same 4-char
 // id can exist in two books with different content. Handlers guarantee a
@@ -420,7 +449,7 @@ rows.patch("/:kind/:id", requireEditor, async (c) => {
   }
   const patch = parsed.data;
 
-  const fields = Object.keys(patch);
+  let fields = Object.keys(patch);
   if (fields.length === 0) {
     return c.json({ error: "empty_patch" }, 400);
   }
@@ -441,6 +470,24 @@ rows.patch("/:kind/:id", requireEditor, async (c) => {
       }
     >();
   if (!current || current.deleted_at) return c.json({ error: "not_found" }, 404);
+
+  // Enforce the OL-quote occurrence invariant at the source. Only fires when
+  // this patch actually touches the quote or occurrence — a reorder, note-only
+  // edit, or tag toggle must never trigger a retroactive heal (and the version
+  // bump it carries). Look at the post-patch values: if the resulting quote is
+  // original-language and the resulting occurrence is null/0, force it to 1 so
+  // the stored row (and every export from it) satisfies the invariant. An
+  // existing occurrence >= 1 — a real second-occurrence target — is untouched.
+  const p = patch as Record<string, unknown>;
+  const quoteField = QUOTE_FIELD[kind];
+  if (quoteField in p || "occurrence" in p) {
+    const effQuote = quoteField in p ? p[quoteField] : current[quoteField];
+    const effOcc = "occurrence" in p ? p.occurrence : current.occurrence;
+    if (typeof effQuote === "string" && hasOrigLang(effQuote) && (effOcc == null || effOcc === 0)) {
+      p.occurrence = 1;
+      fields = Object.keys(patch);
+    }
+  }
 
   // Lock check for non-tn kinds. TN edits are always allowed during a run —
   // the first PATCH on an updated_by-NULL row implicitly "keeps" it; further
