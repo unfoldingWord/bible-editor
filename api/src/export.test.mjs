@@ -5,7 +5,7 @@
 // instead of getting silently flattened to `\v 6`. Not a test framework;
 // failures exit non-zero.
 
-import { buildTnTsv, buildUsfm, commitToDcs, ensureDcsPr, updateDcsPrBranch } from "./export.ts";
+import { buildTnTsv, buildTwlTsv, buildUsfm, commitToDcs, ensureDcsPr, updateDcsPrBranch } from "./export.ts";
 import { CorruptContentJsonError } from "./contentJson.ts";
 
 function assert(cond, msg) {
@@ -147,6 +147,27 @@ function utf8Base64(s) {
   assert(!out.includes("\r"), `no raw carriage returns in TSV output`);
   assert(out.includes("alpha\\nbeta"), `bare \\r escapes to the literal \\n`);
   assert(out.includes("gamma\\ndelta"), `CRLF collapses to one literal \\n`);
+}
+
+// --- OL-quote occurrence invariant: Hebrew/Greek quote forces Occurrence >= 1 ---
+{
+  const tn = (quote, occurrence) => ({
+    ref_raw: "7:1", id: "vut4", tags: null, support_reference: null,
+    quote, occurrence, note: "n",
+  });
+  // Hebrew quote with null/0 occurrence → coerced to 1.
+  const heb = buildTnTsv([tn("הַ⁠תְּשִׁעִ֖י לַ⁠חֹ֥דֶשׁ", 0), tn("פְּנֵ֥י יְהוָֽה", null)]).split("\n");
+  assert(heb[1].split("\t")[5] === "1", `Hebrew quote, occurrence 0 → 1`);
+  assert(heb[2].split("\t")[5] === "1", `Hebrew quote, occurrence null → 1`);
+  // Gateway-Language (English) quote keeps occurrence 0 — invariant doesn't apply.
+  const gl = buildTnTsv([tn("the ninth month", 0)]).split("\n");
+  assert(gl[1].split("\t")[5] === "0", `GL quote keeps occurrence 0`);
+  // A real second-occurrence Hebrew target is left untouched.
+  const second = buildTnTsv([tn("יְהוָֽה", 2)]).split("\n");
+  assert(second[1].split("\t")[5] === "2", `Hebrew quote, occurrence 2 left as 2`);
+  // TWL OrigWords (always OL) gets the same guard.
+  const twl = buildTwlTsv([{ ref_raw: "7:1", id: "x", tags: null, orig_words: "יְהוָֽה", occurrence: 0, tw_link: "rc://x" }]).split("\n");
+  assert(twl[1].split("\t")[4] === "1", `TWL OrigWords occurrence 0 → 1`);
 }
 
 // --- DCS no-op comparison handles UTF-8 content ---
