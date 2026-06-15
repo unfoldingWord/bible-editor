@@ -290,6 +290,115 @@ export function splitGluedAlignmentWords(verseObjects: unknown[]): unknown[] {
   return recomputeTargetOccurrences(JSON.parse(JSON.stringify(lifted)) as unknown[]);
 }
 
+// ─── Collapse doubled leading poetry / paragraph markers ─────────────────────
+//
+// unfoldingWord ULT/UST USFM puts a verse's leading in-flow marker BEFORE its
+// `\v` (`\q1 \v 17 \zaln-s …`), so usfm-js parks that marker as a TRAILING node
+// on the PREVIOUS verse. When the AI emits a DOUBLED marker — `\q1 \v 17 \q1 …`
+// — the importer faithfully splits it into a trailing `\q1` on verse 16 PLUS a
+// LEADING `\q1` stored as the first node of verse 17; on export both re-emit
+// (`\q1 \v 17 \q1` again) and a uW checker has to hand-remove the extra. The
+// interactive editor never creates these (drifted markers render as read-only
+// bands and never enter the saved text) — the defect is purely AI-output
+// faithfully imported, so we absorb it here, mirroring splitGluedAlignmentWords.
+//
+// Mirror of isInFlowMarker in web/src/lib/usfm.ts — keep in sync. usfm-js stores
+// poetry markers (\q1, \q2, \qa, …) as {type:"quote", tag} and plain-paragraph
+// markers (\p, \m, \nb, \b, …) as {type:"paragraph", tag}.
+function isInFlowMarker(node: unknown): boolean {
+  const o = node as Record<string, unknown> | null;
+  if (!o) return false;
+  const t = o["type"];
+  if ((t === "paragraph" || t === "quote") && typeof o["tag"] === "string") return true;
+  if (o["tag"] === "ts" && o["content"] === "\\*") return true;
+  return false;
+}
+
+function markerTag(node: unknown): unknown {
+  return (node as Record<string, unknown> | null)?.["tag"];
+}
+
+// Normalised text fused onto a marker node, for the heading-vs-body test below.
+function markerText(node: unknown): string {
+  const t = (node as Record<string, unknown> | null)?.["text"];
+  return typeof t === "string" ? t.replace(/\s+/g, " ").trim() : "";
+}
+
+// The run of in-flow markers at the END of a verse's objects, in document order
+// (oldest-first). Skips trailing whitespace-only text so an empty `\n` node
+// between the last word and the marker doesn't hide it. Mirror of
+// extractTrailingMarkers in web/src/lib/usfm.ts.
+function trailingMarkerRun(verseObjects: unknown[]): unknown[] {
+  const out: unknown[] = [];
+  for (let i = verseObjects.length - 1; i >= 0; i--) {
+    const node = verseObjects[i];
+    if (isInFlowMarker(node)) {
+      out.unshift(node);
+      continue;
+    }
+    const o = node as Record<string, unknown> | null;
+    const txt = typeof o?.["text"] === "string" ? (o["text"] as string) : null;
+    if (txt !== null && /^[\s​]*$/.test(txt)) continue;
+    break;
+  }
+  return out;
+}
+
+// Drop the leading in-flow marker(s) of verse N when they duplicate the trailing
+// marker run of verse N-1 — the `\qX(trailing N-1) + \qX(leading N)` doubling.
+// `prev` is the (already-normalised) verseObjects of the immediately preceding
+// verse in the SAME chapter, or null for the first verse / chapter-front, which
+// never de-dup: their leading marker may be the only legitimate copy (chapter
+// fronts open with a real `\p` / `\q1`). Returns `curr` unchanged (identity)
+// when nothing matches; otherwise a trimmed copy. Neither input is mutated.
+//
+// A verse can stack several leading markers (`\qa LETTER` + `\q1`); we de-dup
+// each that lines up, in order, against the tail of N-1's trailing run.
+//
+// usfm-js fuses text that follows a marker on the same line onto the marker
+// node's `text`. When we drop a leading marker we KEEP that text as a plain text
+// node if it is verse body (the AI bare-text shape `\q1 \v 17 \q1 In the
+// beginning`), and DROP it only when it just repeats the matching trailing
+// marker's own text (the acrostic letter on `\qa ALEPH`, which already rides on
+// verse N-1) — so the letter is never doubled into the verse body.
+export function dropDoubledLeadingMarkers(prev: unknown[] | null, curr: unknown[]): unknown[] {
+  if (!prev || !Array.isArray(curr) || curr.length === 0) return curr;
+  const trailing = trailingMarkerRun(prev);
+  if (trailing.length === 0) return curr;
+  let leadCount = 0;
+  while (leadCount < curr.length && isInFlowMarker(curr[leadCount])) leadCount++;
+  if (leadCount === 0) return curr;
+  // Largest k where the last k trailing tags equal curr's first k leading tags —
+  // the verbatim doubled run. Search from the longest candidate down so the
+  // maximal de-dup wins; a leading marker that doesn't line up is left alone.
+  let k = 0;
+  for (let cand = Math.min(trailing.length, leadCount); cand >= 1; cand--) {
+    let match = true;
+    for (let i = 0; i < cand; i++) {
+      if (markerTag(trailing[trailing.length - cand + i]) !== markerTag(curr[i])) {
+        match = false;
+        break;
+      }
+    }
+    if (match) {
+      k = cand;
+      break;
+    }
+  }
+  if (k === 0) return curr;
+  const out: unknown[] = [];
+  for (let i = 0; i < k; i++) {
+    const lead = curr[i] as Record<string, unknown>;
+    const text = typeof lead["text"] === "string" ? (lead["text"] as string) : "";
+    const trail = trailing[trailing.length - k + i];
+    if (text !== "" && markerText(lead) !== markerText(trail)) {
+      out.push({ type: "text", text });
+    }
+  }
+  for (let i = k; i < curr.length; i++) out.push(curr[i]);
+  return out;
+}
+
 // Walk verse-objects and concatenate all text. Same shape and behaviour
 // as the client-side `extractPlainText` in web/src/lib/usfm.ts — kept
 // duplicated because the Worker bundle and the web bundle are built
@@ -340,6 +449,13 @@ export function extractVersesForRange(
     if (!Number.isFinite(chNum)) continue;
     if (chNum < startChapter || chNum > endChapter) continue;
     const chapterObj = chapters[chapterKey] as Record<string, unknown>;
+
+    // Resolve verse keys to document order (chapter-front, then verses ascending)
+    // before the cross-verse marker de-dup walks the chapter. JS object-key order
+    // floats "front" and hyphenated ranges ("8-9") past the integer keys, which
+    // would pair a verse with the wrong predecessor. Each row is keyed by
+    // chapter+verse downstream, so the emit order itself is immaterial.
+    const entries: Array<{ vNum: number; vEnd: number | null; verseObj: { verseObjects?: unknown[] } }> = [];
     for (const verseKey of Object.keys(chapterObj)) {
       let vNum: number;
       let vEnd: number | null = null;
@@ -359,15 +475,24 @@ export function extractVersesForRange(
         }
       }
       if (!Number.isFinite(vNum)) continue;
-      const verseObj = chapterObj[verseKey] as { verseObjects?: unknown[] };
-      const normalized = {
-        ...verseObj,
-        // Strip outer punctuation, then de-glue any AI-introduced
-        // punctuation-spanning `\w` (the freed words fall out to unaligned).
-        verseObjects: splitGluedAlignmentWords(
-          normalizeWordPunctuation(verseObj.verseObjects ?? []),
-        ),
-      };
+      entries.push({ vNum, vEnd, verseObj: chapterObj[verseKey] as { verseObjects?: unknown[] } });
+    }
+    entries.sort((a, b) => a.vNum - b.vNum);
+
+    // Trailing markers of verse N-1 are what verse N's leading copy duplicates.
+    // Chapter-front (verse 0) never seeds this — its trailing markers legitimately
+    // lead verse 1, whose copy we must keep — so it leaves prev null.
+    let prevVerseObjects: unknown[] | null = null;
+    for (const { vNum, vEnd, verseObj } of entries) {
+      // Strip outer punctuation, de-glue any AI-introduced punctuation-spanning
+      // `\w` (the freed words fall out to unaligned), then drop any leading marker
+      // that merely doubles the previous verse's trailing one.
+      let verseObjects = splitGluedAlignmentWords(
+        normalizeWordPunctuation(verseObj.verseObjects ?? []),
+      );
+      verseObjects = dropDoubledLeadingMarkers(prevVerseObjects, verseObjects);
+      prevVerseObjects = vNum >= 1 ? verseObjects : null;
+      const normalized = { ...verseObj, verseObjects };
       out.push({
         chapter: chNum,
         verse: vNum,
