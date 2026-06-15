@@ -764,7 +764,11 @@ pipelines.post("/start", requireEditor, async (c) => {
     const hints = (hintRows.results ?? []).map((r) => ({
       rowId: r.id,
       verse: r.verse,
-      quote: r.quote,
+      // Contract requires quote to be a string ("may be Hebrew, Greek, or
+      // empty") — general-information hints have a null quote in D1, so coerce
+      // to "" rather than sending null (upstream 400s on null). See
+      // docs/bp-assistant-tn-hints-contract.md.
+      quote: r.quote ?? "",
       supportReference: r.support_reference,
       seed: r.note,
     }));
