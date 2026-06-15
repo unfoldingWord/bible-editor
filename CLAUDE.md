@@ -23,6 +23,10 @@ git fetch origin main && git log --oneline HEAD..origin/main
 
 Surface any commits the worktree is behind by, plus whether they touch files this plan will modify. Don't silently base a plan on a stale tree, and don't start executing without re-checking — main may have advanced between writing the plan and the user approving it (other worktrees may have landed work during the approval window).
 
+## Committing
+
+Commit messages with a body: pass repeated `-m` flags (`git commit -m "subject" -m "body para" -m "Co-Authored-By: …"`). Do **not** use PowerShell here-string syntax (`@'…'@`) for the message — these git commands run through the **Bash** tool, where `@'…'@` is not heredoc and leaks a literal `@` into the subject line.
+
 ## Common commands
 
 Run from repo root:
