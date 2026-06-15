@@ -34,6 +34,7 @@ import {
   sourceKey,
   stripCompoundOverlaps,
   mergeAdjacentSameSource,
+  mergeSamePositionGroups,
   type AlignmentGroup,
   type AlignmentState,
   type SourceWord,
@@ -398,9 +399,19 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
         const pos = resolveSourcePos(g.source[0], sourceIndexMap);
         return pos >= 0 ? pos : Number.MAX_SAFE_INTEGER;
       };
+      // Position-sequence identity for a group. null when any source word is
+      // unresolved (don't merge — can't prove it's a physical duplicate).
+      const positionKey = (g: (typeof state.groups)[number]) => {
+        if (g.source.length === 0) return null;
+        const positions = g.source.map((s) => resolveSourcePos(s, sourceIndexMap));
+        return positions.some((p) => p < 0) ? null : positions.join(".");
+      };
       const sorted = [...state.groups].sort((a, b) => sortKey(a) - sortKey(b));
       const stripped = stripCompoundOverlaps(sorted);
-      return mergeAdjacentSameSource(stripped);
+      const merged = mergeAdjacentSameSource(stripped);
+      // Collapse same-position duplicates (one physical Hebrew token the AI
+      // stamped with occurrences>actual — see mergeSamePositionGroups).
+      return mergeSamePositionGroups(merged, positionKey);
     }, [state, sourceIndexMap]);
 
     const posMaps = useMemo(() => {
