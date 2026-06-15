@@ -19,6 +19,7 @@ import {
   clearGroup,
   stripCompoundOverlaps,
   mergeAdjacentSameSource,
+  mergeSamePositionGroups,
   cardKey,
 } from "./alignment.ts";
 import { extractPlainText } from "./usfm.ts";
@@ -2356,6 +2357,50 @@ function roundtripVerseUsfm(rawUsfm, sourceVO = null) {
     cardKey({ id: "ph", source: [], targets: [] }, sourcePos) === "ph",
     "empty-source group falls back to group id",
   );
+}
+
+// ─── Same-position groups collapse to one card (JER 28:1 UST doubling) ───
+// A source token the AI stamped with occurrences>actual yields two groups that
+// resolve to the SAME physical Hebrew position. mergeSamePositionGroups fuses
+// them (targets concatenated) so the Hebrew word renders once; genuine repeats
+// at different positions are left alone.
+{
+  console.log("\n[Case] mergeSamePositionGroups collapses a doubled source token (JER 28:1)");
+  const g = (id, posSeq, targets) => ({
+    id,
+    source: posSeq.map((p, i) => ({ id: `${id}-s${i}`, strong: "X", occurrence: "1", occurrences: "1", content: `w${p}` })),
+    targets: targets.map((t, i) => ({ id: `${id}-t${i}`, text: t, occurrence: "1", occurrences: "1" })),
+    _posSeq: posSeq, // test-only carrier so positionKey is deterministic
+  });
+  // חֲנַנְיָה (pos 14) appears twice as two groups; אָמַר אֵלַי (pos 12,13) twice.
+  const hanan1 = g("hanan1", [14], ["Hananiah"]);
+  const hanan2 = g("hanan2", [14], ["Hananiah"]);
+  const spoke1 = g("spoke1", [12, 13], ["spoke", "to", "me"]);
+  const spoke2 = g("spoke2", [12, 13], ["spoke", "to", "me"]);
+  // A genuinely-repeated word at TWO distinct positions must NOT merge.
+  const son1 = g("son1", [15], ["son"]);
+  const azzur = g("azzur", [16], ["Azzur"]);
+  const positionKey = (grp) => (grp._posSeq ? grp._posSeq.join(".") : null);
+
+  const merged = mergeSamePositionGroups(
+    [hanan1, hanan2, spoke1, spoke2, son1, azzur],
+    positionKey,
+  );
+  assert(merged.length === 4, `6 groups collapse to 4 (got ${merged.length})`);
+  const hanan = merged.find((x) => positionKey(x) === "14");
+  assert(hanan.targets.map((t) => t.text).join(" ") === "Hananiah Hananiah", "the two Hananiah groups merge into one card with both chips");
+  const spoke = merged.find((x) => positionKey(x) === "12.13");
+  assert(spoke.targets.length === 6, "the two compound 'spoke to me' groups merge (6 target chips)");
+  assert(
+    merged.some((x) => positionKey(x) === "15") && merged.some((x) => positionKey(x) === "16"),
+    "distinct positions (son, Azzur) stay separate",
+  );
+
+  // Unresolved position (null key) never merges, even against another null.
+  const u1 = { id: "u1", source: [], targets: [{ id: "u1t", text: "x", occurrence: "1", occurrences: "1" }] };
+  const u2 = { id: "u2", source: [], targets: [{ id: "u2t", text: "y", occurrence: "1", occurrences: "1" }] };
+  const unmerged = mergeSamePositionGroups([u1, u2], () => null);
+  assert(unmerged.length === 2, "groups with unresolved positions are never merged");
 }
 
 if (failed > 0) {
