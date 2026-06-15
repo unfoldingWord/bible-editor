@@ -12,6 +12,7 @@ import {
   normalizeWordPunctuation,
   splitGluedAlignmentWords,
   recomputeTargetOccurrences,
+  dropDoubledLeadingMarkers,
   parseTsv,
   refParts,
 } from "./importParsers.ts";
@@ -368,6 +369,162 @@ function assert(cond, msg) {
   assert(recomputeTargetOccurrences(undefined) === undefined, `undefined passes through`);
   const empty = [];
   assert(recomputeTargetOccurrences(empty) === empty, `empty array is a no-op`);
+}
+
+// ── dropDoubledLeadingMarkers: direct unit tests for the matching / text logic ─
+function isInFlow(n) {
+  return !!n && (n.type === "quote" || n.type === "paragraph");
+}
+{
+  // No predecessor (verse 1 / chapter-front) → identity, even if curr leads with
+  // a marker: that marker may be the only copy.
+  const curr = [{ tag: "q1", type: "quote" }, { type: "text", text: "x" }];
+  assert(dropDoubledLeadingMarkers(null, curr) === curr, `null prev → identity`);
+}
+{
+  // Prev ends with no in-flow marker → nothing to double → identity.
+  const prev = [{ type: "text", text: "done." }];
+  const curr = [{ tag: "q1", type: "quote" }, { type: "text", text: "x" }];
+  assert(dropDoubledLeadingMarkers(prev, curr) === curr, `no trailing marker on prev → identity`);
+}
+{
+  // Different tag (prev trails \p, curr leads \q1) → NOT a double → identity.
+  const prev = [{ type: "text", text: "done." }, { tag: "p", type: "paragraph" }];
+  const curr = [{ tag: "q1", type: "quote" }, { type: "text", text: "x" }];
+  assert(dropDoubledLeadingMarkers(prev, curr) === curr, `mismatched tag → identity (no false positive)`);
+}
+{
+  // Bare doubled \q1 (the real ULT/UST shape — content rides in a following
+  // milestone): drop the leading marker cleanly, keep everything after.
+  const prev = [{ type: "text", text: "sixteen" }, { tag: "q1", type: "quote", nextChar: " " }];
+  const curr = [
+    { tag: "q1", type: "quote", nextChar: " " },
+    { type: "milestone", tag: "zaln", children: [{ tag: "w", type: "word", text: "Workers" }] },
+  ];
+  const out = dropDoubledLeadingMarkers(prev, curr);
+  assert(out !== curr, `bare double → trimmed copy (not identity)`);
+  assert(!isInFlow(out[0]), `bare double: leading \\q1 dropped`);
+  assert(out.length === 1 && out[0].type === "milestone", `bare double: milestone content preserved`);
+}
+{
+  // Doubled \q1 with fused verse BODY text (the AI bare-text shape): drop the
+  // marker but KEEP the body as a plain text node — no data loss.
+  const prev = [{ type: "text", text: "sixteen" }, { tag: "q1", type: "quote", nextChar: " " }];
+  const curr = [{ tag: "q1", type: "quote", text: "In the beginning" }];
+  const out = dropDoubledLeadingMarkers(prev, curr);
+  assert(out.length === 1 && out[0].type === "text" && out[0].text === "In the beginning",
+    `fused body text preserved as text node when marker dropped`);
+  assert(!isInFlow(out[0]), `fused-body case: no leading marker remains`);
+}
+{
+  // Stacked \qa LETTER + \q1 doubled: both markers de-dup, in order. The acrostic
+  // letter on \qa repeats the trailing \qa's own text, so it is DROPPED (already
+  // on verse N-1) and never doubled into the body; the \q1's fused body survives.
+  const prev = [
+    { type: "text", text: "third" },
+    { tag: "qa", type: "quote", text: "BET\n" },
+    { tag: "q1", type: "quote", nextChar: " " },
+  ];
+  const curr = [
+    { tag: "qa", type: "quote", text: "BET " },
+    { tag: "q1", type: "quote", text: "fourth" },
+  ];
+  const out = dropDoubledLeadingMarkers(prev, curr);
+  assert(out.every((n) => !isInFlow(n)), `stacked: both \\qa and \\q1 leading markers dropped`);
+  assert(!out.some((n) => n.type === "text" && /BET/.test(n.text)), `stacked: acrostic letter NOT doubled into body`);
+  assert(out.some((n) => n.type === "text" && n.text === "fourth"), `stacked: \\q1 body "fourth" preserved`);
+}
+
+// ── extractVersesForRange: end-to-end collapse of doubled in-flow markers ──────
+function firstVo(extract) {
+  const vos = JSON.parse(extract.contentJson).verseObjects;
+  return (vos && vos[0]) || null;
+}
+function lastSignificantVo(extract) {
+  const vos = JSON.parse(extract.contentJson).verseObjects ?? [];
+  for (let i = vos.length - 1; i >= 0; i--) {
+    const o = vos[i];
+    const t = typeof o?.text === "string" ? o.text : null;
+    if (t !== null && /^\s*$/.test(t)) continue;
+    return o;
+  }
+  return null;
+}
+function quoteCount(extract, tag) {
+  const vos = JSON.parse(extract.contentJson).verseObjects ?? [];
+  return vos.filter((n) => n.type === "quote" && (tag == null || n.tag === tag)).length;
+}
+{
+  // (a) `\q1 \v 17 \q1` → the trailing \q1 stays on v16 (single copy), the
+  // leading doubled \q1 is removed from v17; verse body is preserved.
+  const raw = "\\id TST\n\\c 1\n\\v 16 sixteen content\n\\q1 \\v 17 \\q1 seventeen content\n";
+  const out = extractVersesForRange(raw, 1, 1);
+  const v16 = out.find((v) => v.verse === 16);
+  const v17 = out.find((v) => v.verse === 17);
+  assert(v16 && v17, `(a) v16 + v17 extracted`);
+  const last16 = lastSignificantVo(v16);
+  assert(isInFlow(last16) && last16.tag === "q1", `(a) v16 ends with its trailing \\q1`);
+  assert(quoteCount(v16, "q1") === 1, `(a) v16 carries exactly one \\q1 (not doubled)`);
+  assert(!isInFlow(firstVo(v17)), `(a) v17 no longer leads with a doubled \\q1`);
+  assert(quoteCount(v17, "q1") === 0, `(a) v17 has no leading \\q1 marker`);
+  assert(v17.plainText.includes("seventeen content"), `(a) v17 verse body preserved`);
+}
+{
+  // (b) Legit single `\q1 \v 17` (the marker trails v16 only) is untouched.
+  const raw = "\\id TST\n\\c 1\n\\v 16 sixteen content\n\\q1 \\v 17 seventeen content\n";
+  const out = extractVersesForRange(raw, 1, 1);
+  const v16 = out.find((v) => v.verse === 16);
+  const v17 = out.find((v) => v.verse === 17);
+  const last16 = lastSignificantVo(v16);
+  assert(isInFlow(last16) && last16.tag === "q1", `(b) v16 keeps its single trailing \\q1`);
+  assert(quoteCount(v16, "q1") === 1, `(b) v16 still has exactly one \\q1`);
+  assert(!isInFlow(firstVo(v17)), `(b) legit single: v17 leads with content, not a marker`);
+  assert(v17.plainText.includes("seventeen content"), `(b) v17 body intact`);
+}
+{
+  // (c) Chapter-front holds the first \q1 copy; verse 1's leading \q1 must NEVER
+  // be dropped (front is not a predecessor — the copy could be the only one).
+  const raw = "\\id TST\n\\c 1\n\\q1 \\v 1 \\q1 first line\n\\v 2 second\n";
+  const out = extractVersesForRange(raw, 1, 1);
+  const v1 = out.find((v) => v.verse === 1);
+  assert(v1, `(c) v1 extracted`);
+  const first1 = firstVo(v1);
+  assert(isInFlow(first1) && first1.tag === "q1", `(c) verse 1 leading \\q1 preserved`);
+  assert(v1.plainText.includes("first line"), `(c) verse 1 body intact`);
+}
+{
+  // (d) Stacked `\qa LETTER` + `\q1` doubled → both de-dup; the acrostic letter
+  // is not duplicated into v4's body, and v4's body text survives.
+  const raw = "\\id TST\n\\c 1\n\\v 3 third\n\\qa BET\n\\q1 \\v 4 \\qa BET \\q1 fourth content\n";
+  const out = extractVersesForRange(raw, 1, 1);
+  const v3 = out.find((v) => v.verse === 3);
+  const v4 = out.find((v) => v.verse === 4);
+  assert(v3 && v4, `(d) v3 + v4 extracted`);
+  assert(quoteCount(v3) === 2, `(d) v3 keeps both trailing markers (\\qa + \\q1)`);
+  assert(!isInFlow(firstVo(v4)), `(d) v4 no longer leads with a marker`);
+  assert(quoteCount(v4) === 0, `(d) v4 has no leading \\qa / \\q1`);
+  assert(!/BET/.test(v4.plainText), `(d) acrostic letter not doubled into v4 body`);
+  assert(v4.plainText.includes("fourth content"), `(d) v4 body preserved`);
+}
+
+// ── Real-data validation: en_ust ISA carries live upstream doubled-\q1 anomalies
+// at 19:9 and 54:3 (leading \q1 in storage duplicating 19:8 / 54:2's trailing
+// \q1). The importer must collapse them while keeping the prior verse's copy and
+// losing no verse content. (65:16 is clean in this snapshot — single marker.)
+{
+  const raw = readFileSync(resolve(samples, "en_ust_23-ISA.usfm"), "utf8");
+  for (const [ch, prevV, anomV] of [[19, 8, 9], [54, 2, 3]]) {
+    const chOut = extractVersesForRange(raw, ch, ch);
+    const prev = chOut.find((v) => v.verse === prevV);
+    const anom = chOut.find((v) => v.verse === anomV);
+    assert(prev && anom, `ISA ${ch}: verses ${prevV} + ${anomV} extracted`);
+    const lastPrev = lastSignificantVo(prev);
+    assert(isInFlow(lastPrev) && lastPrev.tag === "q1", `ISA ${ch}:${prevV} keeps its trailing \\q1`);
+    assert(!isInFlow(firstVo(anom)), `ISA ${ch}:${anomV} no longer leads with a doubled \\q1`);
+    assert(firstVo(anom).type === "milestone", `ISA ${ch}:${anomV} content (\\zaln-s) intact after de-dup`);
+    assert(anom.plainText.length > 0, `ISA ${ch}:${anomV} retains verse text`);
+    console.log(`  ISA ${ch}:${anomV} doubled \\q1 collapsed; ${prevV} trailing \\q1 kept`);
+  }
 }
 
 console.log("\nAll parser smoke checks passed.");
