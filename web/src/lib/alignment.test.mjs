@@ -20,6 +20,7 @@ import {
   stripCompoundOverlaps,
   mergeAdjacentSameSource,
   mergeSamePositionGroups,
+  sourceKey,
   cardKey,
 } from "./alignment.ts";
 import { extractPlainText } from "./usfm.ts";
@@ -1144,6 +1145,59 @@ function roundtripVerseUsfm(rawUsfm, sourceVO = null) {
     assert(
       Array.isArray(stripTrailingMarkers(null)) && stripTrailingMarkers(null).length === 0,
       `non-array input → []`,
+    );
+  }
+
+  // (e‡) A verse-final same-line `\qs Selah\qs*` is verse CONTENT, not a
+  // driftable line marker — it must NOT be peeled off / drifted to the next
+  // verse. usfm-js parses it as {tag:"qs", type:"quote", text:"Selah",
+  // endTag:"qs*"}: same type:"quote" as a poetry marker, but the `endTag`
+  // (the `\qs*` close) marks it a character-style wrapper that holds content.
+  {
+    const { extractTrailingMarkers, stripTrailingMarkers } = await import("./usfm.ts");
+    const selah = [
+      { type: "text", text: "Praise. " },
+      { tag: "qs", type: "quote", text: "Selah", endTag: "qs*" },
+      { type: "text", text: "\n" },
+    ];
+    assert(
+      extractTrailingMarkers(selah).length === 0,
+      `\\qs Selah\\qs* does not drift to the next verse (got ${JSON.stringify(extractTrailingMarkers(selah))})`,
+    );
+    assert(
+      stripTrailingMarkers(selah) === selah,
+      `\\qs Selah\\qs* stays in the verse body (Selah not stripped)`,
+    );
+    // A real poetry marker AFTER the wrapper still drifts; the wrapper stops the
+    // backward scan, so only the trailing \q1 is peeled (Selah stays put).
+    const selahThenQ1 = [
+      { type: "text", text: "Praise. " },
+      { tag: "qs", type: "quote", text: "Selah", endTag: "qs*" },
+      { tag: "q1", type: "quote", nextChar: " " },
+    ];
+    const drifted = extractTrailingMarkers(selahThenQ1);
+    assert(
+      drifted.length === 1 && drifted[0].tag === "q1",
+      `trailing \\q1 after \\qs still drifts; \\qs does not (got ${JSON.stringify(drifted)})`,
+    );
+    assert(
+      JSON.stringify(stripTrailingMarkers(selahThenQ1)).includes("Selah"),
+      `Selah survives in the stripped body`,
+    );
+    // Improperly-closed `\qs Selah` (no `\qs*`) — older gatewayEdit left these in
+    // DCS. usfm-js parses them with an EMPTY endTag ({tag:"qs", endTag:""}), so an
+    // endTag-only guard would miss them; the wrapper-tag check keeps Selah put.
+    const selahUnclosed = [
+      { type: "text", text: "He is good " },
+      { tag: "qs", type: "quote", text: "Selah\n", children: [], endTag: "" },
+    ];
+    assert(
+      extractTrailingMarkers(selahUnclosed).length === 0,
+      `unclosed \\qs Selah (endTag:"") does not drift (got ${JSON.stringify(extractTrailingMarkers(selahUnclosed))})`,
+    );
+    assert(
+      stripTrailingMarkers(selahUnclosed) === selahUnclosed,
+      `unclosed \\qs Selah stays in the verse body`,
     );
   }
 
@@ -2436,6 +2490,53 @@ function roundtripVerseUsfm(rawUsfm, sourceVO = null) {
   const u2 = { id: "u2", source: [], targets: [{ id: "u2t", text: "y", occurrence: "1", occurrences: "1" }] };
   const unmerged = mergeSamePositionGroups([u1, u2], () => null);
   assert(unmerged.length === 2, "groups with unresolved positions are never merged");
+}
+
+// ─── Clearing a collapsed over-count card unaligns EVERY underlying group ──────
+// AlignmentPanel collapses same-position duplicates (occ 1/2 + 2/2 → one card)
+// for display, but the card's clear button must unalign the GROUPS those cards
+// hid — not just the survivor whose id the card carries. sourceKey separates the
+// two over-count halves (different occurrence), so a sourceKey-only clear left
+// the second group aligned (and still serializable). The fix matches on
+// sourceKey OR position, exactly the keys the display collapse uses. Mirrors
+// AlignmentPanel.groupPositionKey + handleClearGroup with lib sourceKey.
+{
+  console.log("\n[Case] clearing a collapsed over-count card unaligns BOTH groups");
+  const positionKey = (grp) =>
+    grp._posSeq && !grp._posSeq.some((p) => p < 0) ? grp._posSeq.join(".") : null;
+  // One physical Hebrew token at pos 14, AI-stamped occurrences=2 → two groups
+  // (occ 1/2 and 2/2). Same position, DIFFERENT sourceKey.
+  const og1 = {
+    id: "og1", _posSeq: [14],
+    source: [{ id: "og1-s", strong: "X", occurrence: "1", occurrences: "2", content: "w14" }],
+    targets: [{ id: "og1-t", text: "A", occurrence: "1", occurrences: "1" }],
+  };
+  const og2 = {
+    id: "og2", _posSeq: [14],
+    source: [{ id: "og2-s", strong: "X", occurrence: "2", occurrences: "2", content: "w14" }],
+    targets: [{ id: "og2-t", text: "B", occurrence: "1", occurrences: "1" }],
+  };
+  const card = mergeSamePositionGroups([og1, og2], positionKey);
+  assert(card.length === 1, `occ 1/2 + 2/2 collapse to ONE card (got ${card.length})`);
+  assert(sourceKey(og1) !== sourceKey(og2), "the two over-count halves carry different sourceKeys");
+
+  const groups = [og1, og2];
+  const target = groups.find((x) => x.id === card[0].id);
+  const key = sourceKey(target);
+  const posKey = positionKey(target);
+  const cleared = groups
+    .filter((x) => sourceKey(x) === key || (posKey !== null && positionKey(x) === posKey))
+    .map((x) => x.id);
+  assert(
+    cleared.includes("og1") && cleared.includes("og2"),
+    `clearing the collapsed card unaligns BOTH groups (got ${JSON.stringify(cleared)})`,
+  );
+  // Regression: sourceKey alone (the old handler) cleared only the survivor.
+  const oldCleared = groups.filter((x) => sourceKey(x) === key).map((x) => x.id);
+  assert(
+    oldCleared.length === 1,
+    `sourceKey-only clear left the hidden group aligned — the bug this guards (got ${JSON.stringify(oldCleared)})`,
+  );
 }
 
 // ─── Case 32: ZEC 6:5 — split source token (occurrence==occurrences) highlight ─

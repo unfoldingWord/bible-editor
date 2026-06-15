@@ -110,6 +110,29 @@ export function isInFlowMarker(node: unknown): boolean {
   return false;
 }
 
+// Character-style wrapper tags that usfm-js parses as `type:"quote"` but which
+// hold verse CONTENT, not a line break — mirrors ALIGNMENT_WRAPPER_TAGS in
+// alignment.ts (kept local: usfm.ts is the lower layer and can't import it).
+const CHARACTER_WRAPPER_TAGS: ReadonlySet<string> = new Set(["qs"]);
+
+// usfm-js gives BOTH poetry/paragraph line markers (`\q1`, `\qa`) and same-line
+// character-style wrappers (`\qs Selah\qs*`) `type:"quote"`, so isInFlowMarker
+// matches both. Only line markers lead the NEXT verse and may drift onto it; a
+// character wrapper holds verse content that belongs to THIS verse and must
+// stay put. Two signals catch a wrapper: a well-closed one carries a non-empty
+// `endTag` (the `\qs*`); but an upstream tool can emit the wrapper WITHOUT its
+// close (older gatewayEdit mishandled Selah this way → `{tag:"qs", endTag:""}`),
+// so we also match the known wrapper tag. Real line markers have neither.
+// Used by the trailing-marker drift pair so a verse-final `\qs Selah[\qs*]`
+// isn't peeled off and shown on the following verse.
+function isDriftableMarker(node: unknown): boolean {
+  if (!isInFlowMarker(node)) return false;
+  const o = node as Record<string, unknown>;
+  if (typeof o["endTag"] === "string" && o["endTag"] !== "") return false;
+  if (typeof o["tag"] === "string" && CHARACTER_WRAPPER_TAGS.has(o["tag"])) return false;
+  return true;
+}
+
 // usfm-js attaches the leading punctuation that follows an in-flow marker on
 // the same source line — the opening quote in `\q2 “I am…`, the `{` that opens
 // a word-addition — to the MARKER node's own `text` field:
@@ -154,7 +177,7 @@ export function extractTrailingMarkers(verseObjects: unknown[] | undefined | nul
   const out: unknown[] = [];
   for (let i = verseObjects.length - 1; i >= 0; i--) {
     const node = verseObjects[i];
-    if (isInFlowMarker(node)) {
+    if (isDriftableMarker(node)) {
       out.unshift(node);
     } else {
       const o = node as Record<string, unknown> | null;
@@ -187,7 +210,7 @@ export function stripTrailingMarkers(verseObjects: unknown[] | undefined | null)
   let cut = verseObjects.length;
   for (let i = verseObjects.length - 1; i >= 0; i--) {
     const node = verseObjects[i];
-    if (isInFlowMarker(node)) {
+    if (isDriftableMarker(node)) {
       cut = i;
       continue;
     }

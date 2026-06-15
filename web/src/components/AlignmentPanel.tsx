@@ -309,10 +309,19 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
       if (!state) return;
       const target = state.groups.find((g) => g.id === groupId);
       if (!target) return;
+      // Clear EVERY underlying group the displayed card collapsed together, not
+      // just the one whose id the card carries. A card fuses groups by source
+      // identity (mergeAdjacentSameSource → sourceKey) AND by source position
+      // (mergeSamePositionGroups → positionKey); an AI over-count (occ 1/2 +
+      // 2/2 → one physical token) hides a second group under a DIFFERENT
+      // sourceKey, so clearing by sourceKey alone left its targets aligned.
       const key = sourceKey(target);
+      const posKey = groupPositionKey(target, sourceIndexMap);
       let next = state;
       for (const g of state.groups) {
-        if (sourceKey(g) === key) next = clearGroup(next, g.id);
+        if (sourceKey(g) === key || (posKey !== null && groupPositionKey(g, sourceIndexMap) === posKey)) {
+          next = clearGroup(next, g.id);
+        }
       }
       setState(next);
     };
@@ -399,19 +408,12 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
         const pos = resolveSourcePos(g.source[0], sourceIndexMap);
         return pos >= 0 ? pos : Number.MAX_SAFE_INTEGER;
       };
-      // Position-sequence identity for a group. null when any source word is
-      // unresolved (don't merge — can't prove it's a physical duplicate).
-      const positionKey = (g: (typeof state.groups)[number]) => {
-        if (g.source.length === 0) return null;
-        const positions = g.source.map((s) => resolveSourcePos(s, sourceIndexMap));
-        return positions.some((p) => p < 0) ? null : positions.join(".");
-      };
       const sorted = [...state.groups].sort((a, b) => sortKey(a) - sortKey(b));
       const stripped = stripCompoundOverlaps(sorted);
       const merged = mergeAdjacentSameSource(stripped);
       // Collapse same-position duplicates (one physical Hebrew token the AI
       // stamped with occurrences>actual — see mergeSamePositionGroups).
-      return mergeSamePositionGroups(merged, positionKey);
+      return mergeSamePositionGroups(merged, (g) => groupPositionKey(g, sourceIndexMap));
     }, [state, sourceIndexMap]);
 
     const posMaps = useMemo(() => {
@@ -1990,6 +1992,19 @@ function resolveSourcePos(s: SourceWord, indexMap: Map<string, number>): number 
     indexMap.get(`s:${s.strong}|1`) ??
     -1
   );
+}
+
+// Position-sequence identity for a group: a stable key from its resolved source
+// positions, or null when any source word is unresolved (then callers must not
+// treat it as a duplicate — we can't prove it). Shared by displayGroups (which
+// collapses same-position duplicate cards via mergeSamePositionGroups) and the
+// card-clear handler, which must unalign EVERY underlying group the card
+// collapsed — not just the one whose id the card carries — so the two agree on
+// what a single card owns.
+function groupPositionKey(g: AlignmentGroup, indexMap: Map<string, number>): string | null {
+  if (g.source.length === 0) return null;
+  const positions = g.source.map((s) => resolveSourcePos(s, indexMap));
+  return positions.some((p) => p < 0) ? null : positions.join(".");
 }
 
 function buildSourceIndexMap(sourceVerse: VerseDto | null): Map<string, number> {
