@@ -480,6 +480,42 @@ export function mergeAdjacentSameSource(groups: AlignmentGroup[]): AlignmentGrou
   return out;
 }
 
+// Fuse display groups whose source words occupy the SAME source position(s).
+// An AI aligner sometimes stamps a source token that appears ONCE in the
+// UHB/UGNT with occurrences="2" — one per repeated target phrase — so JER 28:1
+// UST yields two חֲנַנְיָה groups (occ 1/2 and 2/2), two אָמַר אֵלַי groups,
+// and two לְעֵינֵי groups that each resolve to a SINGLE physical Hebrew token.
+// They render as a "doubled" Hebrew card even though the source word appears
+// once. occurrence is unreliable here, so identity is taken from POSITION: two
+// groups with the same resolved position sequence are the same physical
+// source and collapse into one card (targets concatenated). Genuine repeats
+// (distinct physical tokens) carry different positions and are left alone.
+//
+// `positionKey` returns a stable key from a group's resolved source positions,
+// or null when any position is unresolved (then the group never merges — we
+// can't prove it's a duplicate). Display-only: callers pass display groups, so
+// state.sourceGroups (and therefore serialize/export) is untouched.
+export function mergeSamePositionGroups(
+  groups: AlignmentGroup[],
+  positionKey: (g: AlignmentGroup) => string | null,
+): AlignmentGroup[] {
+  const out: AlignmentGroup[] = [];
+  const indexByKey = new Map<string, number>();
+  for (const g of groups) {
+    const k = positionKey(g);
+    if (k !== null) {
+      const existing = indexByKey.get(k);
+      if (existing !== undefined) {
+        out[existing] = { ...out[existing], targets: [...out[existing].targets, ...g.targets] };
+        continue;
+      }
+      indexByKey.set(k, out.length);
+    }
+    out.push(g);
+  }
+  return out;
+}
+
 export function parseAlignment(
   verseObjects: unknown[],
   sourceVerseObjects?: unknown[] | null,
