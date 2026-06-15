@@ -128,6 +128,12 @@ function roundtripVerseUsfm(rawUsfm, sourceVO = null) {
 `;
   const { verseObjects } = parseSingleVerse(target);
   const state = parseAlignment(verseObjects, null);
+  // same-line `\qs Selah\qs*` parks Selah on the qs node's text (no children);
+  // it must still surface as a draggable, alignable unaligned word.
+  assert(
+    state.unaligned.map((w) => w.text).includes("Selah"),
+    `Selah surfaces as an alignable unaligned word (got ${JSON.stringify(state.unaligned.map((w) => w.text))})`,
+  );
   const plain = alignmentPlainText(state);
   assert(plain.includes("Selah"), "alignmentPlainText includes Selah for bare \\qs Selah\\qs*");
   assert(plain.includes("Peace"), "alignmentPlainText includes Peace");
