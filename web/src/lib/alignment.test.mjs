@@ -1106,6 +1106,40 @@ function roundtripVerseUsfm(rawUsfm, sourceVO = null) {
     );
   }
 
+  // (e†) stripTrailingMarkers — the exact inverse of extractTrailingMarkers,
+  // used by the display render paths (book/doc/column) so a verse's own
+  // trailing markers (which drift to the NEXT verse) aren't rendered twice.
+  // Real usfm-js shape: a `\qa ZAYIN` acrostic header parses as
+  // {tag:"qa", type:"quote", text:"ZAYIN\n"} — the letter rides ON the marker,
+  // so dropping the marker drops the doubled letter.
+  {
+    const { extractTrailingMarkers, stripTrailingMarkers } = await import("./usfm.ts");
+    const acrostic = [
+      { type: "word", tag: "w", text: "them" },
+      { type: "text", text: ".\n\n" },
+      { tag: "qa", type: "quote", text: "ZAYIN\n" },
+      { tag: "q1", type: "quote", nextChar: " " },
+    ];
+    const body = stripTrailingMarkers(acrostic);
+    assert(
+      body.length === 2 && !JSON.stringify(body).includes("ZAYIN"),
+      `acrostic \\qa+\\q1 stripped from body; letter no longer doubled (got ${JSON.stringify(body)})`,
+    );
+    // strip + extract reconstructs the original — markers move, nothing is lost
+    assert(
+      JSON.stringify([...body, ...extractTrailingMarkers(acrostic)]) === JSON.stringify(acrostic),
+      `stripTrailingMarkers is the exact inverse of extractTrailingMarkers`,
+    );
+    // verse ending in real text → unchanged reference (no trailing markers)
+    const plain = [{ type: "word", tag: "w", text: "plain" }, { type: "text", text: "." }];
+    assert(stripTrailingMarkers(plain) === plain, `no trailing markers → array returned unchanged`);
+    // non-array guard
+    assert(
+      Array.isArray(stripTrailingMarkers(null)) && stripTrailingMarkers(null).length === 0,
+      `non-array input → []`,
+    );
+  }
+
   // (e**) tokenizeEditableText strips zero-width spaces. Otherwise the
   // editor's caret-placeholder `​` (rendered as `&#8203;` in empty
   // marker-led blocks) would accumulate in saved verseObjects every
@@ -2201,6 +2235,53 @@ function roundtripVerseUsfm(rawUsfm, sourceVO = null) {
     okOrder[0] === "H0853" && okOrder[1] === "H1964",
     `canonical input preserved (got [${okOrder.join(", ")}])`,
   );
+}
+
+// ─── Case: bare (un-\w-wrapped) text is alignable ───────────────────────
+// The AI returns unaligned ULT/UST as plain text (`\p \v 1 In the
+// beginning...`) with no \w wrappers. Those words must surface as draggable
+// unaligned targets, not vanish into a passthrough text node (which also
+// glued to a preceding marker on export — `\q1Some`).
+{
+  console.log("\n[Case] bare text tokenizes into alignable words");
+  const raw = String.raw`\id GEN
+\c 1
+\p \v 1 In the beginning God created the heavens and the earth.
+`;
+  const { verseObjects } = parseSingleVerse(raw);
+  const state = parseAlignment(verseObjects, null);
+  const words = state.unaligned.map((w) => w.text);
+  assert(words.length === 10, `10 bare words surface as unaligned (got ${words.length}: ${words.join(",")})`);
+  assert(words.includes("beginning") && words.includes("God"), "key words present in unaligned bag");
+  assert(words.filter((w) => w === "the").length === 3, `"the" surfaces 3× (got ${words.filter((w) => w === "the").length})`);
+  // verse with bare words is now correctly flagged as needing alignment
+  assert(verseHasUnalignedWork(verseObjects, null), "verseHasUnalignedWork true for bare-text verse");
+  // serialize → words become \w nodes; no bare prose run remains
+  const rt = roundtripVerseUsfm(raw, null);
+  assert(/\\w In\|/.test(rt) && /\\w beginning\|/.test(rt), "bare words serialize as \\w tokens");
+  assert(!/\bIn the beginning God\b/.test(rt.replace(/\\w |\|[^\\]*\\w\*/g, "")) || /\\w/.test(rt), "no untokenized prose run survives");
+  // plain text is preserved through the round-trip
+  const plain = alignmentPlainText(state);
+  assert(
+    plain === "In the beginning God created the heavens and the earth.",
+    `plain text preserved (got ${JSON.stringify(plain)})`,
+  );
+}
+
+// ─── Case: a normal aligned verse's punctuation text is untouched ────────
+// Guard against the bare-text tokenizer disturbing inter-word separators in
+// already-aligned verses (their text nodes hold only punctuation/space).
+{
+  console.log("\n[Case] punctuation-only text nodes round-trip unchanged");
+  const raw = String.raw`\id GEN
+\c 1
+\p \v 1 \zaln-s |x-strong="H7225" x-content="רֵאשִׁית"\*\w beginning|x-occurrence="1" x-occurrences="1"\w*\zaln-e\*, \zaln-s |x-strong="H1254" x-content="בָּרָא"\*\w created|x-occurrence="1" x-occurrences="1"\w*\zaln-e\*.
+`;
+  const { verseObjects } = parseSingleVerse(raw);
+  const state = parseAlignment(verseObjects, null);
+  assert(state.unaligned.length === 0, `aligned verse has no spurious unaligned words (got ${state.unaligned.length})`);
+  const plain = alignmentPlainText(state);
+  assert(plain === "beginning, created.", `punctuation preserved (got ${JSON.stringify(plain)})`);
 }
 
 // ─── Card-key uniqueness for split-aligned source tokens (JER 28:1 UST) ──

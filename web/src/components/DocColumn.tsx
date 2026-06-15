@@ -7,7 +7,7 @@ import UndoIcon from "@mui/icons-material/Undo";
 import type { TwlRow, VerseDto } from "../sync/api";
 import { highlightsFor, renderEditableHTML, renderHighlightedHTML, type HighlightKey, type ReorderHighlight } from "../lib/highlight";
 import { markHighlightSx } from "../lib/highlightStyles";
-import { extractTrailingMarkers, splitSectionHeaders, type SectionHeader } from "../lib/usfm";
+import { extractTrailingMarkers, stripTrailingMarkers, splitSectionHeaders, type SectionHeader } from "../lib/usfm";
 import { SectionHeaderBand } from "./SectionHeaderBand";
 import { drafts, verseKey, draftDirtyBorderSx } from "../sync/drafts";
 import { HebrewLine } from "./HebrewLine";
@@ -545,9 +545,12 @@ function VerseSpan({
     // Compose any drifted-down markers (from the previous verse's
     // trailing `\q1`/`\p` etc.) at the front so the visual break
     // introduces this verse, matching USFM intent.
+    // Strip THIS verse's own trailing markers — they drift to the next verse,
+    // so rendering them here too would double a text-bearing `\qa` acrostic.
+    const body = stripTrailingMarkers(verseObjects);
     const drifted = precedingMarkers && precedingMarkers.length > 0
-      ? [...precedingMarkers, ...verseObjects]
-      : verseObjects;
+      ? [...precedingMarkers, ...body]
+      : body;
     // Render unconditionally so paragraph / poetry markers turn into
     // visual breaks / indents even without an active highlight set.
     return renderHighlightedHTML(drifted, highlights ?? new Set(), roles);

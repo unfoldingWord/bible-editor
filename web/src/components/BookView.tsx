@@ -19,7 +19,7 @@ import type { TwlRow, VerseDto } from "../sync/api";
 import type { ChapterState } from "../hooks/useBook";
 import { highlightsFor, renderEditableHTML, renderHighlightedHTML, type HighlightKey, type ReorderHighlight } from "../lib/highlight";
 import { markHighlightSx } from "../lib/highlightStyles";
-import { extractTrailingMarkers, splitSectionHeaders, type SectionHeader } from "../lib/usfm";
+import { extractTrailingMarkers, stripTrailingMarkers, splitSectionHeaders, type SectionHeader } from "../lib/usfm";
 import { SectionHeaderBand } from "./SectionHeaderBand";
 import { drafts, verseKey, draftDirtyBorderSx } from "../sync/drafts";
 import type { FindMatch } from "./FindReplaceOverlay";
@@ -856,7 +856,10 @@ const VerseCell = memo(function VerseCell({
     const drifted = extractTrailingMarkers(
       (prevDto?.content as { verseObjects?: unknown[] } | null)?.verseObjects,
     );
-    const composed = drifted.length > 0 ? [...drifted, ...verseObjects] : verseObjects;
+    // Strip THIS verse's own trailing markers — they drift to the next verse,
+    // so rendering them here too would double a text-bearing `\qa` acrostic.
+    const body = stripTrailingMarkers(verseObjects);
+    const composed = drifted.length > 0 ? [...drifted, ...body] : body;
     // Render unconditionally so paragraph / poetry markers turn into
     // visual breaks / indents in book view even without active highlights.
     return renderHighlightedHTML(composed, highlights ?? new Set(), roles);

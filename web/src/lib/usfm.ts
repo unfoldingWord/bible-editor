@@ -171,6 +171,35 @@ export function extractTrailingMarkers(verseObjects: unknown[] | undefined | nul
   return out;
 }
 
+// Inverse of extractTrailingMarkers: return verseObjects with their trailing
+// in-flow markers removed. Those markers belong to (and are drifted onto) the
+// NEXT verse's display, so a verse's own display body must NOT also render
+// them — otherwise a text-bearing trailing marker (e.g. an acrostic
+// `\qa ZAYIN` heading) shows TWICE: at the bottom of this verse's card AND
+// drifted to the top of the next. Empty markers (`\q1`/`\q2`) are invisible so
+// the doubling only surfaces for markers carrying text (LAM/PSA-119 acrostic
+// letters). Mirrors extractTrailingMarkers' scan exactly (skips whitespace-only
+// text nodes interspersed in the trailing-marker run) so the two stay in
+// lockstep. Display/read paths only — never the active-editable render, whose
+// save diff (extractEditableText) needs the verse's full objects.
+export function stripTrailingMarkers(verseObjects: unknown[] | undefined | null): unknown[] {
+  if (!Array.isArray(verseObjects)) return [];
+  let cut = verseObjects.length;
+  for (let i = verseObjects.length - 1; i >= 0; i--) {
+    const node = verseObjects[i];
+    if (isInFlowMarker(node)) {
+      cut = i;
+      continue;
+    }
+    const o = node as Record<string, unknown> | null;
+    const txt = typeof o?.["text"] === "string" ? (o["text"] as string) : null;
+    const isWhitespace = txt !== null && /^[\s​]*$/.test(txt);
+    if (isWhitespace) continue;
+    break;
+  }
+  return cut < verseObjects.length ? verseObjects.slice(0, cut) : verseObjects;
+}
+
 // Collapse editor whitespace so the diff baseline (extractEditableText)
 // and the captured contenteditable text (textContent / innerText) are
 // byte-comparable. Strips zero-width spaces (U+200B — empty-block caret

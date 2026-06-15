@@ -27,6 +27,7 @@
 
 import { nfc } from "./hebrew.ts";
 import { extractPlainText } from "./usfm.ts";
+import { tokenizePlainText } from "./replace.ts";
 
 export interface SourceWord {
   id: string;
@@ -263,7 +264,22 @@ function walk(
     } else if (nodeIsWord(node)) {
       stream.push({ kind: "word", word: targetOf(node), alignedTo: currentGroupId });
     } else if (nodeIsText(node)) {
-      stream.push({ kind: "text", text: String(node["text"] ?? "") });
+      // Tokenize bare text into draggable words. The AI returns unaligned
+      // ULT/UST as plain text (`\p \v 1 In the beginning...`) with no `\w`
+      // wrappers; without this, those words are invisible to the aligner and
+      // can never be aligned in-app (they also glue to a preceding marker on
+      // export, e.g. `\q1Some`). Word runs become unaligned stream words
+      // (alignedTo:null → the unaligned bag); punctuation / whitespace stays
+      // `text`. Normal aligned verses are unaffected: their text nodes hold
+      // only inter-word separators, which tokenize to zero word runs and
+      // round-trip back to the identical text node.
+      for (const tok of tokenizePlainText(String(node["text"] ?? "")) as ParsedNode[]) {
+        if (nodeIsWord(tok)) {
+          stream.push({ kind: "word", word: targetOf(tok), alignedTo: null });
+        } else {
+          stream.push({ kind: "text", text: String(tok["text"] ?? "") });
+        }
+      }
     } else if (isAlignmentWrapper(node) || isPsalmTitleWrapper(node)) {
       // Descend through a `\qs` (or similar whitelisted) wrapper — or a
       // `\d` Psalm superscription carrying children — whose children

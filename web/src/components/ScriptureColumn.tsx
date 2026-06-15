@@ -17,7 +17,7 @@ import type { LexiconEntry } from "../hooks/useLexicon";
 import type { ChapterState } from "../hooks/useBook";
 import { highlightsFor, renderEditableHTML, renderHighlightedHTML, type HighlightKey, type ReorderHighlight } from "../lib/highlight";
 import { markHighlightSx } from "../lib/highlightStyles";
-import { extractEditableText, extractTrailingMarkers, splitSectionHeaders, type SectionHeader } from "../lib/usfm";
+import { extractEditableText, extractTrailingMarkers, stripTrailingMarkers, splitSectionHeaders, type SectionHeader } from "../lib/usfm";
 import { SectionHeaderBand } from "./SectionHeaderBand";
 import { buildVerseIndex, formatVerseLabel, isFirstOfRange, isRangeRow } from "../lib/verseRange";
 import {
@@ -1612,7 +1612,10 @@ function StackedRowBody({
   );
   const html = useMemo(() => {
     if (!Array.isArray(verseObjects)) return null;
-    const composed = drift.length > 0 ? [...drift, ...verseObjects] : verseObjects;
+    // Strip THIS verse's own trailing markers — they drift to the next verse,
+    // so rendering them here too would double a text-bearing `\qa` acrostic.
+    const body = stripTrailingMarkers(verseObjects);
+    const composed = drift.length > 0 ? [...drift, ...body] : body;
     // Skip the marker renderer if there's no structure to show — the
     // FindAwareText fallback below paints find marks for plain prose.
     const hasStructure =
