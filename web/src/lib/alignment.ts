@@ -128,6 +128,23 @@ function nodeIsWord(n: ParsedNode | undefined): boolean {
 function nodeIsText(n: ParsedNode | undefined): boolean {
   return !!n && n["type"] === "text" && typeof n["text"] === "string";
 }
+// Poetry / paragraph LINE markers whose same-line trailing text (which usfm-js
+// parks on the marker's own `text` field — `\q1 Some enemies watched` →
+// {tag:"q1",text:"Some…"}) is alignable verse body. Deliberately EXCLUDES
+// `\qa` (acrostic header label — not verse text, must not become a draggable
+// word) and `\qs` (character wrapper around its content, e.g. bare Selah — its
+// text is preserved verbatim, not tokenized).
+const LINE_TEXT_MARKER_TAGS = new Set<string>([
+  "q", "q1", "q2", "q3", "q4", "qm", "qm1", "qm2", "qm3",
+  "p", "m", "mi", "pi", "pi1", "pi2", "pi3", "pc", "nb", "b",
+]);
+function nodeIsLineTextMarker(n: ParsedNode | undefined): boolean {
+  if (!n) return false;
+  if (n["type"] !== "quote" && n["type"] !== "paragraph") return false;
+  const tag = n["tag"];
+  return typeof tag === "string" && LINE_TEXT_MARKER_TAGS.has(tag)
+    && typeof n["text"] === "string" && n["text"] !== "";
+}
 function isAlignmentWrapper(n: ParsedNode | undefined): boolean {
   if (!n || typeof n !== "object") return false;
   if (n["type"] !== "quote") return false;
@@ -291,14 +308,31 @@ function walk(
       const children = (node["children"] as ParsedNode[] | undefined) ?? [];
       walk(children, sourceChain, stream, sourceGroups, currentGroupId);
       stream.push({ kind: "closeMarker", tag });
+    } else if (nodeIsLineTextMarker(node)) {
+      // Poetry/paragraph line marker carrying same-line verse text that
+      // usfm-js parked on its `text` field (`\q1 Some enemies watched`).
+      // Emit the marker text-less, then tokenize the parked text into
+      // alignable words — otherwise those words are invisible to the aligner
+      // (and glue back as `\q1Some` on export). Excludes \qa / \qs (see
+      // nodeIsLineTextMarker). The trailing newline rides along as text.
+      const { text, ...rest } = node;
+      stream.push({ kind: "marker", node: cloneNodeOpaque(rest) });
+      for (const tok of tokenizePlainText(String(text)) as ParsedNode[]) {
+        if (nodeIsWord(tok)) {
+          stream.push({ kind: "word", word: targetOf(tok), alignedTo: null });
+        } else {
+          stream.push({ kind: "text", text: String(tok["text"] ?? "") });
+        }
+      }
     } else {
       // Opaque inline node — footnotes (\f), blank lines (\b), chunk
       // milestones (\ts*), section headings (\ms), bare `\qs Selah\qs*`
-      // without inner alignment, paragraph markers (\p, \q1, \q2, \m).
-      // The whole node (attrs + children) rides along verbatim on the
-      // marker; serializer emits it as-is. extractPlainText still
-      // recursively concatenates `text` fields out of these children,
-      // matching importer behaviour for Selah / Psalm titles / etc.
+      // without inner alignment, acrostic headers (\qa ZAYIN), paragraph
+      // markers (\p, \q1, \q2, \m) with no parked text. The whole node
+      // (attrs + children) rides along verbatim on the marker; serializer
+      // emits it as-is. extractPlainText still recursively concatenates
+      // `text` fields out of these children, matching importer behaviour
+      // for Selah / Psalm titles / etc.
       stream.push({ kind: "marker", node: cloneNodeOpaque(node) });
     }
   }

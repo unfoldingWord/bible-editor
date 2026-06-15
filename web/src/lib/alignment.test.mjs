@@ -2284,6 +2284,35 @@ function roundtripVerseUsfm(rawUsfm, sourceVO = null) {
   assert(plain === "beginning, created.", `punctuation preserved (got ${JSON.stringify(plain)})`);
 }
 
+// ─── Case: text PARKED ON a marker node (LAM 1:7 UST `\q1 Some enemies…`) ──
+// usfm-js attaches same-line post-marker text to the marker's `text` field, not
+// a separate text node — so the bare-text branch never sees it. parseAlignment
+// must lift+tokenize it; otherwise the words are invisible to the aligner (and
+// were glued as `\q1Some` on export). This is the exact LAM 1:7 UST shape.
+{
+  console.log("\n[Case] text parked on a \\q marker tokenizes into alignable words");
+  const raw = String.raw`\id LAM
+\c 1
+\q1 \v 7 \zaln-s |x-strong="H3389" x-content="יְרוּשָׁלִַם"\*\w Jerusalem|x-occurrence="1" x-occurrences="1"\w*\zaln-e\*
+\q1 Some enemies watched
+`;
+  const { verseObjects } = parseSingleVerse(raw);
+  // precondition: confirm the fixture reproduces the marker-parked-text shape
+  const parked = verseObjects.some(
+    (n) => n && n.type === "quote" && typeof n.text === "string" && /Some/.test(n.text),
+  );
+  assert(parked, "precondition: usfm-js parks post-marker text on the \\q1 node");
+  const state = parseAlignment(verseObjects, null);
+  const words = state.unaligned.map((w) => w.text);
+  assert(
+    ["Some", "enemies", "watched"].every((w) => words.includes(w)),
+    `marker-parked words surface as unaligned (got ${JSON.stringify(words)})`,
+  );
+  const rt = roundtripVerseUsfm(raw, null);
+  assert(/\\w Some\|/.test(rt) && /\\w watched\|/.test(rt), "parked words serialize as \\w tokens, not glued to \\q1");
+  assert(!/\\q1Some/.test(rt), "no \\q1Some glue in the round-trip");
+}
+
 // ─── Card-key uniqueness for split-aligned source tokens (JER 28:1 UST) ──
 // One source token aligned to two non-contiguous target runs yields two
 // distinct groups whose source words resolve to the SAME source position (the
