@@ -166,6 +166,21 @@ function isPsalmTitleWrapper(n: ParsedNode | undefined): boolean {
   const children = n["children"];
   return Array.isArray(children) && children.length > 0;
 }
+// An alignment wrapper (`\qs`) whose content usfm-js parked on its own `text`
+// field instead of as children — the same-line `\qs Selah\qs*` shape parses to
+// {tag:"qs", text:"Selah"} with NO children, whereas `\qs`\nSelah\n`\qs*`
+// parses to a text CHILD (handled by isAlignmentWrapper). Without this, the
+// same-line Selah is opaque and its word can't be aligned. (The newline shape
+// already tokenizes via isAlignmentWrapper → nodeIsText.)
+function isAlignmentWrapperWithText(n: ParsedNode | undefined): boolean {
+  if (!n || typeof n !== "object") return false;
+  if (n["type"] !== "quote") return false;
+  const tag = n["tag"];
+  if (typeof tag !== "string" || !ALIGNMENT_WRAPPER_TAGS.has(tag)) return false;
+  const children = n["children"];
+  const hasChildren = Array.isArray(children) && children.length > 0;
+  return !hasChildren && typeof n["text"] === "string" && n["text"] !== "";
+}
 
 // Shallow-clone a node's own properties, dropping `children` (the
 // serializer rebuilds those). Used for wrapper open-markers, whose
@@ -307,6 +322,23 @@ function walk(
       stream.push({ kind: "openMarker", tag, node: cloneNodeShallow(node) });
       const children = (node["children"] as ParsedNode[] | undefined) ?? [];
       walk(children, sourceChain, stream, sourceGroups, currentGroupId);
+      stream.push({ kind: "closeMarker", tag });
+    } else if (isAlignmentWrapperWithText(node)) {
+      // `\qs Selah\qs*` — Selah parked on the qs node's `text` (no children).
+      // Open the wrapper, tokenize its text into alignable words INSIDE it,
+      // then close — so Selah becomes a draggable unaligned word that
+      // round-trips as `\qs <words>\qs*` (and aligns like the production
+      // `\qs \zaln-s…\w Selah\w*\zaln-e\*\qs*` shape once a source is bound).
+      const tag = String(node["tag"] ?? "");
+      const { text, ...rest } = node;
+      stream.push({ kind: "openMarker", tag, node: cloneNodeShallow(rest) });
+      for (const tok of tokenizePlainText(String(text)) as ParsedNode[]) {
+        if (nodeIsWord(tok)) {
+          stream.push({ kind: "word", word: targetOf(tok), alignedTo: null });
+        } else {
+          stream.push({ kind: "text", text: String(tok["text"] ?? "") });
+        }
+      }
       stream.push({ kind: "closeMarker", tag });
     } else if (nodeIsLineTextMarker(node)) {
       // Poetry/paragraph line marker carrying same-line verse text that
