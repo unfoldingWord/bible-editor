@@ -340,22 +340,43 @@ async function applyJobOutput(env: Env, job: ImportContext): Promise<ApplyResult
     result.tnDeleted = await deleteUnkeptTns(env, job, userId);
   }
 
+  // sort_order assignment. Proposals arrive ordered (chapter, verse, id) where
+  // id is the staging order = the AI file's row order, so a per-verse counter
+  // reproduces the source file order on export. For TN we seed each verse's
+  // counter from the MAX sort_order of the rows that SURVIVED the delete phase
+  // (preserve=1 / hint=1 / translator-edited), so freshly minted AI notes
+  // append after the translator's kept notes rather than colliding with them.
+  // For TQ there's no delete/preserve concept — every run fully reorders the
+  // verse to match the file — so its counters start from zero.
+  const tnBases = await maxSortOrderPerVerse(env, "tn_rows", job);
+  const tnCounters = new Map<number, number>();
+  const tqCounters = new Map<number, number>();
+  const verseKey = (p: PendingImportRow) => p.chapter * 100000 + p.verse;
+
   for (const p of tnProposals) {
     // Hint expansion: if the AI's proposed id matches a queued hint stub in
     // this job's scope, UPDATE that row in place instead of minting a new
     // one. The hint's rowId round-trips through bp-assistant as the TSV ID
-    // column — see docs/bp-assistant-tn-hints-contract.md.
+    // column — see docs/bp-assistant-tn-hints-contract.md. The stub keeps the
+    // sort_order it was created with (it's a surviving row, already folded
+    // into tnBases), so we don't consume a counter slot for it.
     const expanded = await applyTnHintExpansionIfMatch(env, p, job, userId);
     if (expanded) {
       result.tnHintExpanded += 1;
       continue;
     }
-    await applyTnInsert(env, p, userId);
+    const k = verseKey(p);
+    const sortOrder = (tnCounters.get(k) ?? tnBases.get(k) ?? 0) + 100;
+    tnCounters.set(k, sortOrder);
+    await applyTnInsert(env, p, userId, sortOrder);
     result.tnCreated += 1;
   }
 
   for (const p of tqProposals) {
-    const action = await applyTqUpsert(env, p, userId);
+    const k = verseKey(p);
+    const sortOrder = (tqCounters.get(k) ?? 0) + 100;
+    tqCounters.set(k, sortOrder);
+    const action = await applyTqUpsert(env, p, userId, sortOrder);
     if (action === "created") result.tqCreated += 1;
     else result.tqUpdated += 1;
   }
@@ -366,6 +387,28 @@ async function applyJobOutput(env: Env, job: ImportContext): Promise<ApplyResult
   }
 
   return result;
+}
+
+// Highest sort_order currently stored per (chapter, verse) in scope. Used to
+// seed AI insert counters so new rows append after surviving rows in a verse.
+// Run AFTER the TN delete phase so swept rows don't inflate the base.
+async function maxSortOrderPerVerse(
+  env: Env,
+  table: "tn_rows" | "tq_rows",
+  job: ImportContext,
+): Promise<Map<number, number>> {
+  const rs = await env.DB.prepare(
+    `SELECT chapter, verse, MAX(sort_order) AS mx FROM ${table}
+      WHERE book = ?1 AND chapter BETWEEN ?2 AND ?3 AND deleted_at IS NULL
+      GROUP BY chapter, verse`,
+  )
+    .bind(job.book, job.startChapter, job.endChapter)
+    .all<{ chapter: number; verse: number; mx: number | null }>();
+  const m = new Map<number, number>();
+  for (const r of rs.results ?? []) {
+    if (r.mx != null) m.set(r.chapter * 100000 + r.verse, r.mx);
+  }
+  return m;
 }
 
 async function deleteUnkeptTns(
@@ -516,6 +559,7 @@ async function applyTnInsert(
   env: Env,
   p: PendingImportRow,
   userId: number,
+  sortOrder: number,
 ): Promise<void> {
   const payload = JSON.parse(p.payload_json) as Record<string, unknown>;
   const insertCols = [
@@ -530,6 +574,7 @@ async function applyTnInsert(
     "occurrence",
     "note",
     "updated_by",
+    "sort_order",
   ];
 
   // PRESERVE bp-assistant's proposed id. It's the SAME id that lands on master,
@@ -558,6 +603,7 @@ async function applyTnInsert(
       payload.occurrence ?? null,
       payload.note ?? null,
       userId,
+      sortOrder,
     ];
     try {
       await env.DB.batch([
@@ -597,6 +643,7 @@ async function applyTqUpsert(
   env: Env,
   p: PendingImportRow,
   userId: number,
+  sortOrder: number,
 ): Promise<"created" | "updated"> {
   const payload = JSON.parse(p.payload_json) as Record<string, unknown>;
   const proposedId = typeof payload.id === "string" && payload.id.length > 0 ? payload.id : null;
@@ -623,11 +670,13 @@ async function applyTqUpsert(
       await env.DB.batch([
         env.DB
           .prepare(
+            // sort_order is refreshed too: TQ has no preserve/keep semantics —
+            // each run fully reorders the verse to match the incoming file.
             `UPDATE tq_rows
                 SET ref_raw = ?1, tags = ?2, quote = ?3, occurrence = ?4,
-                    question = ?5, response = ?6,
-                    version = version + 1, updated_at = ?7, updated_by = ?8
-              WHERE id = ?9 AND book = ?10 AND deleted_at IS NULL`,
+                    question = ?5, response = ?6, sort_order = ?7,
+                    version = version + 1, updated_at = ?8, updated_by = ?9
+              WHERE id = ?10 AND book = ?11 AND deleted_at IS NULL`,
           )
           .bind(
             patch.ref_raw,
@@ -636,6 +685,7 @@ async function applyTqUpsert(
             patch.occurrence,
             patch.question,
             patch.response,
+            sortOrder,
             now,
             userId,
             proposedId,
@@ -662,13 +712,13 @@ async function applyTqUpsert(
   // sticky id when present (preserves AI-side correlation); otherwise mint
   // a fresh id with the same retry pattern as TN insert.
   if (proposedId) {
-    await insertTqAtId(env, p, payload, proposedId, userId);
+    await insertTqAtId(env, p, payload, proposedId, userId, sortOrder);
   } else {
     let lastErr: unknown = null;
     for (let attempt = 0; attempt < 8; attempt++) {
       const fresh = newRowId();
       try {
-        await insertTqAtId(env, p, payload, fresh, userId);
+        await insertTqAtId(env, p, payload, fresh, userId, sortOrder);
         lastErr = null;
         break;
       } catch (e) {
@@ -688,8 +738,9 @@ async function insertTqAtId(
   payload: Record<string, unknown>,
   id: string,
   userId: number,
+  sortOrder: number,
 ): Promise<void> {
-  const cols = ["id", "book", "chapter", "verse", "ref_raw", "tags", "quote", "occurrence", "question", "response", "updated_by"];
+  const cols = ["id", "book", "chapter", "verse", "ref_raw", "tags", "quote", "occurrence", "question", "response", "updated_by", "sort_order"];
   const values = [
     id,
     payload.book ?? null,
@@ -702,6 +753,7 @@ async function insertTqAtId(
     payload.question ?? null,
     payload.response ?? null,
     userId,
+    sortOrder,
   ];
   await env.DB.batch([
     env.DB

@@ -14,6 +14,7 @@ import type { Env } from "./index";
 import {
   extractUsfmHeaders,
   extractVersesForRange,
+  makeVerseSortOrder,
   parseTsv,
   refParts,
 } from "./importParsers";
@@ -334,6 +335,7 @@ async function insertTnRows(
   );
 
   let count = 0;
+  const nextSort = makeVerseSortOrder();
   let batch: D1PreparedStatement[] = [];
   const flush = async () => {
     if (batch.length === 0) return;
@@ -363,7 +365,7 @@ async function insertTnRows(
       insertStmt.bind(
         id, book, ch, v, refRaw,
         payload.tags, payload.support_reference, payload.quote, payload.occurrence, payload.note,
-        (count + 1) * 100,
+        nextSort(ch, v),
       ),
       auditStmt.bind(id, book, userId, JSON.stringify(payload)),
     );
@@ -395,6 +397,7 @@ async function insertTqRows(
   );
 
   let count = 0;
+  const nextSort = makeVerseSortOrder();
   let batch: D1PreparedStatement[] = [];
   const flush = async () => {
     if (batch.length === 0) return;
@@ -424,7 +427,7 @@ async function insertTqRows(
       insertStmt.bind(
         id, book, ch, v, refRaw,
         payload.tags, payload.quote, payload.occurrence, payload.question, payload.response,
-        (count + 1) * 100,
+        nextSort(ch, v),
       ),
       auditStmt.bind(id, book, userId, JSON.stringify(payload)),
     );
@@ -456,6 +459,7 @@ async function insertTwlRows(
   );
 
   let count = 0;
+  const nextSort = makeVerseSortOrder();
   let batch: D1PreparedStatement[] = [];
   const flush = async () => {
     if (batch.length === 0) return;
@@ -484,7 +488,7 @@ async function insertTwlRows(
       insertStmt.bind(
         id, book, ch, v, refRaw,
         payload.tags, payload.orig_words, payload.occurrence, payload.tw_link,
-        (count + 1) * 100,
+        nextSort(ch, v),
       ),
       auditStmt.bind(id, book, userId, JSON.stringify(payload)),
     );

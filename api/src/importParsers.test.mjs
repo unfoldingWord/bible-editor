@@ -15,6 +15,7 @@ import {
   dropDoubledLeadingMarkers,
   parseTsv,
   refParts,
+  makeVerseSortOrder,
 } from "./importParsers.ts";
 
 // Collect target `\w` words with their alignment status (inside a `\zaln-s`?).
@@ -525,6 +526,40 @@ function quoteCount(extract, tag) {
     assert(anom.plainText.length > 0, `ISA ${ch}:${anomV} retains verse text`);
     console.log(`  ISA ${ch}:${anomV} doubled \\q1 collapsed; ${prevV} trailing \\q1 kept`);
   }
+}
+
+// --- makeVerseSortOrder: per-verse ordinal allocator ---
+// This is the single source of truth for sort_order across bootstrap import,
+// merge reimport, and the backfill script. The export/read sort is
+// (chapter, verse, sort_order), so the contract is: stable per-verse stepping
+// in call (= file) order, resetting per (chapter, verse).
+{
+  const next = makeVerseSortOrder();
+  // Two notes in 1:1, one in 1:2, back to a third in 1:1 (out-of-order source
+  // row), then chapter 2. Each verse counts independently from 100.
+  assert(next(1, 1) === 100, `1:1 #1 -> 100`);
+  assert(next(1, 1) === 200, `1:1 #2 -> 200`);
+  assert(next(1, 2) === 100, `1:2 #1 -> 100 (new verse resets)`);
+  assert(next(1, 1) === 300, `1:1 #3 -> 300 (continues 1:1's run)`);
+  assert(next(2, 1) === 100, `2:1 #1 -> 100 (new chapter resets)`);
+  assert(next(0, 0) === 100, `front:intro (0:0) -> 100`);
+}
+{
+  // Determinism: the same file order yields identical values on a fresh run —
+  // this is what makes an unchanged reimport a no-op (no sort_order churn).
+  const refs = [[1, 1], [1, 1], [1, 2], [2, 3], [2, 3], [2, 3]];
+  const a = makeVerseSortOrder();
+  const b = makeVerseSortOrder();
+  const seqA = refs.map(([c, v]) => a(c, v));
+  const seqB = refs.map(([c, v]) => b(c, v));
+  assert(
+    JSON.stringify(seqA) === JSON.stringify(seqB),
+    `identical inputs -> identical sort_orders (${seqA.join(",")})`,
+  );
+  assert(
+    JSON.stringify(seqA) === JSON.stringify([100, 200, 100, 100, 200, 300]),
+    `expected per-verse stepping (${seqA.join(",")})`,
+  );
 }
 
 console.log("\nAll parser smoke checks passed.");
