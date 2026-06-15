@@ -880,6 +880,74 @@ export async function changedTsvChapters(
   return changed;
 }
 
+// Soft-delete pristine rows that master no longer carries, so the nightly
+// export can't resurrect an out-of-band deletion. Mirrors pipelineImport.ts
+// deleteUnkeptTns and the app's DELETE handler shape (rows.ts): set
+// deleted_at, bump version, audit a 'delete'. Conservative on every axis:
+// only chapters the incoming file covers AND the diff gate flagged as changed
+// (a deletion always flags its chapter), only rows passing the pristine
+// predicate (kept on the UPDATE itself so an edit landing after the SELECT
+// skips the row), and never under an active pipeline lock. The id comparison
+// is against the WHOLE file's id set so a row the update path just moved to
+// another chapter isn't mistaken for removed.
+async function softDeleteRemovedTsvRows(
+  env: Env,
+  book: string,
+  kind: TsvKind,
+  rawTsv: string,
+  candidateChapters: number[],
+): Promise<{ deleted: number; skippedLocked: number }> {
+  const incomingIds = new Set<string>();
+  const coveredChapters = new Set<number>();
+  for (const r of parseTsv(rawTsv).rows) {
+    const p = parseTsvRow(r, kind);
+    if (!p) continue;
+    incomingIds.add(p.id);
+    if (p.chapter >= 1) coveredChapters.add(p.chapter);
+  }
+  // Defensive: an empty or garbled file must never sweep a book clean.
+  if (incomingIds.size === 0) return { deleted: 0, skippedLocked: 0 };
+
+  const pristine =
+    kind === "tn"
+      ? `updated_by IS NULL AND deleted_at IS NULL AND trashed_at IS NULL AND preserve = 0 AND hint = 0`
+      : `updated_by IS NULL AND deleted_at IS NULL`;
+  const now = Math.floor(Date.now() / 1000);
+  let deleted = 0;
+  let skippedLocked = 0;
+  for (const ch of candidateChapters) {
+    if (!coveredChapters.has(ch)) continue;
+    if (await activePipelineForChapter(env, book, ch)) {
+      skippedLocked++;
+      continue;
+    }
+    const rs = await env.DB.prepare(
+      `SELECT id, version FROM ${kind}_rows WHERE book = ?1 AND chapter = ?2 AND ${pristine}`,
+    )
+      .bind(book, ch)
+      .all<{ id: string; version: number }>();
+    const targets = (rs.results ?? []).filter((r) => !incomingIds.has(r.id));
+    for (const t of targets) {
+      const upd = await env.DB.prepare(
+        `UPDATE ${kind}_rows
+            SET deleted_at = ?1, version = version + 1, updated_at = ?1
+          WHERE id = ?2 AND book = ?3 AND ${pristine}`,
+      )
+        .bind(now, t.id, book)
+        .run();
+      if (!upd.meta.changes) continue;
+      deleted++;
+      await env.DB.prepare(
+        `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, source)
+         VALUES (?1, ?2, ?3, NULL, ?4, ?5, 'delete', ?6)`,
+      )
+        .bind(kind, t.id, book, t.version, t.version + 1, REIMPORT_SOURCE)
+        .run();
+    }
+  }
+  return { deleted, skippedLocked };
+}
+
 // SHA-gate each requested resource and stage the changed ones to R2. Returns
 // the book's chapter extent + a manifest the chunk steps read from.
 async function planAndStageBookResources(
@@ -1044,6 +1112,27 @@ export async function runChunkedReimport(
       async () => reimportStagedChunk(env, book, start, end, changed, changedTsv, null),
     );
     mergePerResource(perResource, counts);
+  }
+
+  // After applying each changed TSV file, soft-delete pristine rows whose ids
+  // master no longer carries — otherwise the next export branch resurrects
+  // out-of-band deletions. See softDeleteRemovedTsvRows for the guardrails.
+  // Runs before the staged-R2 cleanup step so the file is still readable.
+  for (const e of changed) {
+    const kind = e.resource;
+    if (kind === "ult" || kind === "ust" || !e.r2Key) continue;
+    const chs = changedTsv[kind];
+    if (!chs || chs.length === 0) continue;
+    const r2Key = e.r2Key;
+    await step.do(`reimport-prune-${book}-${kind}`, async () => {
+      const raw = await readStaged(env, r2Key);
+      if (raw == null) return { deleted: 0, skippedLocked: 0 };
+      const res = await softDeleteRemovedTsvRows(env, book, kind, raw, chs);
+      if (res.deleted > 0 || res.skippedLocked > 0) {
+        console.log("reimport pruned rows removed on master", { book, resource: kind, ...res });
+      }
+      return res;
+    });
   }
 
   // Record fetch-time SHAs for resources that ran (so a later night can skip).
