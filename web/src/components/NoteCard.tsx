@@ -1070,7 +1070,7 @@ function NoteCardInner({
             dir: quoteScript === "ltr" ? "ltr" : "rtl",
             style: {
               fontFamily: '"Times New Roman","SBL Hebrew","Cardo",serif',
-              fontSize: quoteScript === "rtl" ? 20 : 19,
+              fontSize: quoteScript === "rtl" ? 21 : 19,
               textAlign: quoteScript === "ltr" ? "left" : "right",
               lineHeight: quoteScript === "rtl" ? 1.9 : 1.5,
             },

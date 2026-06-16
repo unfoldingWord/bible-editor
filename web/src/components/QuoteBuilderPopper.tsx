@@ -253,7 +253,7 @@ export function QuoteBuilderPopper({
               <Typography
                 sx={{
                   fontFamily: '"Times New Roman","SBL Hebrew","Cardo",serif',
-                  fontSize: 18,
+                  fontSize: 19,
                   direction: sourceIsHebrew ? "rtl" : "ltr",
                   textAlign: sourceIsHebrew ? "right" : "left",
                   minHeight: 24,
@@ -364,7 +364,7 @@ function SourceChip({
         fontFamily: rtl
           ? '"Times New Roman","SBL Hebrew","Cardo",serif'
           : '"Roboto","Helvetica",sans-serif',
-        fontSize: rtl ? 18 : 13,
+        fontSize: rtl ? 19 : 13,
         height: rtl ? 30 : 26,
         cursor: "pointer",
         userSelect: "none",

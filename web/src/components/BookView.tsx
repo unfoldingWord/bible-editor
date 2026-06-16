@@ -967,7 +967,7 @@ const VerseCell = memo(function VerseCell({
         <span
           style={{
             fontFamily: '"Times New Roman","SBL Hebrew","Cardo",serif',
-            fontSize: rtl ? 18 : 14.5,
+            fontSize: rtl ? 19 : 14.5,
             direction: "rtl",
             unicodeBidi: "isolate",
           }}
@@ -1009,7 +1009,7 @@ const VerseCell = memo(function VerseCell({
         style={{
           outline: "none",
           background: "transparent",
-          fontSize: rtl ? 18 : 14.5,
+          fontSize: rtl ? 19 : 14.5,
           fontFamily: rtl
             ? '"Times New Roman","SBL Hebrew","Cardo",serif'
             : '"Source Serif Pro","Cambria","Times New Roman",serif',

@@ -392,7 +392,7 @@ function FieldPreview({
           fontFamily: rtl
             ? '"Times New Roman","SBL Hebrew","Cardo",serif'
             : '"Source Serif Pro","Cambria","Times New Roman",serif',
-          fontSize: rtl ? 19 : 13,
+          fontSize: rtl ? 20 : 13,
           direction: rtl ? "rtl" : "ltr",
           textAlign: rtl ? "right" : "left",
           color: value ? "text.primary" : "text.disabled",
@@ -505,7 +505,7 @@ function DiffPreview({
           fontFamily: rtl
             ? '"Times New Roman","SBL Hebrew","Cardo",serif'
             : '"Source Serif Pro","Cambria","Times New Roman",serif',
-          fontSize: rtl ? 19 : 13,
+          fontSize: rtl ? 20 : 13,
           direction: rtl ? "rtl" : "ltr",
           textAlign: rtl ? "right" : "left",
         }}

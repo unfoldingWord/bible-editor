@@ -1608,7 +1608,7 @@ function SourceWordTypography({
           bgcolor: hover ? "grey.100" : "transparent",
           borderRadius: 0.5,
           fontFamily: '"Frank Ruhl Libre", "Times New Roman", "SBL Hebrew", "Cardo", serif',
-          fontSize: 22,
+          fontSize: 23,
           lineHeight: 1.2,
           color: "text.primary",
           cursor: canExtract ? "grab" : "grab",

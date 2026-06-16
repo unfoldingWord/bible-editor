@@ -239,7 +239,7 @@ export function DocColumn({
           px: 1.5,
           py: 1,
           lineHeight: 1.7,
-          fontSize: rtl ? 20 : 15,
+          fontSize: rtl ? 21 : 15,
           fontFamily: rtl
             ? '"Times New Roman","SBL Hebrew","Cardo",serif'
             : '"Source Serif Pro","Cambria","Times New Roman",serif',
@@ -667,7 +667,7 @@ function VerseSpan({
         <span
           style={{
             fontFamily: '"Times New Roman","SBL Hebrew","Cardo",serif',
-            fontSize: 20,
+            fontSize: 21,
             direction: "rtl",
             unicodeBidi: "isolate",
           }}

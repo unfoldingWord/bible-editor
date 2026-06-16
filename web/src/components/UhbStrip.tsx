@@ -78,7 +78,7 @@ export function UhbStrip({
             fontFamily: sourceIsHebrew
               ? '"Frank Ruhl Libre", "Times New Roman", "SBL Hebrew", "Cardo", serif'
               : '"Times New Roman", "Cardo", serif',
-            fontSize: 21,
+            fontSize: 22,
             lineHeight: 1.55,
             color: "text.primary",
             unicodeBidi: "isolate",
