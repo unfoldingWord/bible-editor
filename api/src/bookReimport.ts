@@ -52,6 +52,15 @@ export const ALL_RESOURCES: readonly Resource[] = ["ult", "ust", "tn", "tq", "tw
 // per-resource SHA gate skips unchanged files entirely, so this rarely bites.
 export const REIMPORT_CHAPTER_CHUNK = 8;
 
+// Max statements per env.DB.batch() write. D1 caps a batch at 100 statements and
+// 100 bound params per statement; 90 stays safely under both. The batched
+// applyTsvRows / applyVerseRows paths exist to keep the nightly DCS→D1 sync under
+// the per-invocation subrequest cap — DO NOT revert them to a per-row loop. That
+// exact regression (PR #180 batched them → a later refactor un-batched them →
+// PR #195 re-batched) silently reintroduced the cap once. See bookReimport's
+// section header + the nightly-sync-subrequest-cap memory.
+const WRITE_BATCH = 90;
+
 export interface ReimportCounts {
   updated: number;
   inserted: number;
@@ -302,10 +311,20 @@ async function reimportTsvForChapter(
   return applyTsvRows(env, book, kind, rowsForChapter(raw, kind, chapter), userId);
 }
 
-// Per-row upsert loop over already-parsed TSV rows (any chapters). Split out so
-// the chunked path can parse a staged file ONCE and feed pre-grouped rows
-// rather than re-parsing the whole file per chapter (the CPU cost that tripped
-// the per-step limit on large books).
+// Upsert already-parsed TSV rows (any chapters). Batched to stay under the
+// per-invocation subrequest cap: ONE chunked read of the current rows, an
+// in-memory diff, then env.DB.batch() of the pristine UPDATEs (+ their edit_log
+// rows). New rows are rare in a reimport, so inserts stay a per-row path. The
+// old per-row UPDATE loop issued ~5 D1 calls per row and blew the 10k cap on
+// large books — DO NOT revert it (PR #180 batched this; a later refactor
+// reverted it; PR #195 re-batched). See the nightly-sync-subrequest-cap memory.
+//
+// sort_order is a per-verse ordinal (makeVerseSortOrder): deterministic and
+// chunk-independent, so an unchanged DCS file produces no churn; a reordered/
+// extended verse renumbers only that verse. `incoming` is the chapter's rows in
+// file order, so the ordinal tracks source order exactly. The pristine guard +
+// version-CAS stay ON each UPDATE, so a translator edit landing between the read
+// and the batch matches 0 rows (no clobber) and is counted skipped_edited.
 async function applyTsvRows(
   env: Env,
   book: string,
@@ -315,50 +334,84 @@ async function applyTsvRows(
 ): Promise<ReimportCounts> {
   const counts = zeroCounts();
   if (incoming.length === 0) return counts;
+  const now = Math.floor(Date.now() / 1000);
 
-  const pristinePredicate =
+  // One read of the comparable + pristine-predicate columns for the incoming
+  // ids (chunked under the 100 bound-param limit) so classification is in memory.
+  const pristineCols =
     kind === "tn"
-      ? `updated_by IS NULL AND deleted_at IS NULL AND trashed_at IS NULL AND preserve = 0 AND hint = 0`
-      : `updated_by IS NULL AND deleted_at IS NULL`;
+      ? "version, updated_by, deleted_at, trashed_at, preserve, hint"
+      : "version, updated_by, deleted_at";
+  const existing = new Map<string, Record<string, unknown>>();
+  const ids = incoming.map((r) => r.id);
+  for (let i = 0; i < ids.length; i += WRITE_BATCH) {
+    const slice = ids.slice(i, i + WRITE_BATCH);
+    const inClause = slice.map((_, j) => `?${j + 2}`).join(", ");
+    const rs = await env.DB.prepare(
+      `SELECT id, ${TSV_STORED_COLS[kind]}, sort_order, ${pristineCols}
+         FROM ${kind}_rows WHERE book = ?1 AND id IN (${inClause})`,
+    )
+      .bind(book, ...slice)
+      .all<Record<string, unknown>>();
+    for (const row of rs.results) existing.set(String(row.id), row);
+  }
 
-  // sort_order is a per-verse ordinal (see makeVerseSortOrder): deterministic
-  // and chunk-independent, so bootstrap / reimport / backfill all compute the
-  // identical value. An unchanged DCS file produces no sort_order churn here;
-  // a reordered/extended verse renumbers only that verse. `incoming` is the
-  // chapter's rows in file order (rowsForChapter / the chunked grouping both
-  // preserve it), so the ordinal tracks the source order exactly.
+  // Classify. Inserts run per-row (DCS-new rows are rare); updates are batched.
   const nextSort = makeVerseSortOrder();
+  const updates: Array<{ row: ParsedTsvRow; sortOrder: number; oldVersion: number }> = [];
   for (const row of incoming) {
     const sortOrder = nextSort(row.chapter, row.verse);
-    try {
-      const inserted = await tryInsertTsvRow(env, book, kind, row, sortOrder);
-      if (inserted) {
-        counts.inserted++;
-        await logEdit(env, kind, row.id, book, userId, null, 1, "create", row);
-        continue;
-      }
-      // Row exists. SELECT first so we can short-circuit when DCS content
-      // matches what's already in D1 — otherwise nightly reimports churn
-      // every pristine row's version and write useless edit_log entries,
-      // which silently invalidates every connected client's `If-Match`.
-      const outcome = await tryUpdateTsvRow(env, book, kind, row, pristinePredicate, sortOrder);
-      if (outcome === "noop") {
-        counts.skipped_noop++;
-      } else if (outcome === "edited") {
-        counts.skipped_edited++;
-      } else {
-        counts.updated++;
-        const v = await env.DB.prepare(
-          `SELECT version FROM ${kind}_rows WHERE id = ?1 AND book = ?2`,
-        )
-          .bind(row.id, book)
-          .first<{ version: number }>();
-        if (v) {
-          await logEdit(env, kind, row.id, book, userId, v.version - 1, v.version, "update", row);
+    const cur = existing.get(row.id);
+    if (!cur) {
+      try {
+        if (await tryInsertTsvRow(env, book, kind, row, sortOrder)) {
+          counts.inserted++;
+          await logEdit(env, kind, row.id, book, userId, null, 1, "create", row);
+        } else {
+          counts.skipped_noop++; // raced — appeared concurrently
         }
+      } catch (e) {
+        counts.errors.push(`${kind} ${row.id}: ${e instanceof Error ? e.message : String(e)}`);
       }
+      continue;
+    }
+    // No-op when the comparable signature AND the sort_order both match (mirrors
+    // the fields the old per-row UPDATE compared). Skips version churn / useless
+    // edit_log rows that would invalidate every connected client's If-Match.
+    const sortMatches = (cur.sort_order == null ? null : Number(cur.sort_order)) === sortOrder;
+    if (sortMatches && tsvRowSignature(kind, storedTsvRowToParsed(kind, cur)) === tsvRowSignature(kind, row)) {
+      counts.skipped_noop++;
+      continue;
+    }
+    if (!isPristineTsv(kind, cur)) {
+      counts.skipped_edited++;
+      continue;
+    }
+    updates.push({ row, sortOrder, oldVersion: Number(cur.version) });
+  }
+
+  // Batch the pristine UPDATEs, then audit only the ones that actually applied
+  // (meta.changes > 0 — a row edited between read and batch fails the pristine +
+  // version-CAS guard and is counted skipped_edited). On a batch() error record
+  // it and move on; the chunk step retries and the next sync catches up.
+  for (let i = 0; i < updates.length; i += WRITE_BATCH) {
+    const slice = updates.slice(i, i + WRITE_BATCH);
+    try {
+      const results = await env.DB.batch(
+        slice.map((u) => buildTsvUpdateStmt(env, book, kind, u.row, u.sortOrder, u.oldVersion, now)),
+      );
+      const logs: D1PreparedStatement[] = [];
+      slice.forEach((u, j) => {
+        if ((results[j]?.meta.changes ?? 0) > 0) {
+          counts.updated++;
+          logs.push(logEditStmt(env, kind, u.row.id, book, userId, u.oldVersion, u.oldVersion + 1, "update", u.row));
+        } else {
+          counts.skipped_edited++;
+        }
+      });
+      if (logs.length) await env.DB.batch(logs);
     } catch (e) {
-      counts.errors.push(`${kind} ${row.id}: ${e instanceof Error ? e.message : String(e)}`);
+      counts.errors.push(`${kind} update batch: ${e instanceof Error ? e.message : String(e)}`);
     }
   }
 
@@ -418,163 +471,96 @@ async function tryInsertTsvRow(
   return (r.meta.changes ?? 0) > 0;
 }
 
-// SELECT-then-compare-then-UPDATE. Three outcomes:
-//   "noop"    — stored row matches DCS exactly; no UPDATE issued.
-//   "updated" — pristine UPDATE succeeded.
-//   "edited"  — row was touched by a translator since the read; pristine
-//               UPDATE matched 0 rows. Skip.
-//
-// The pristine guard stays on the UPDATE itself — a translator edit
-// landing between SELECT and UPDATE flips the outcome to "edited", not
-// silently clobbered. updated_by stays NULL so future re-imports still
-// see this as safe to overwrite.
-type UpdateOutcome = "noop" | "updated" | "edited";
+// True iff this stored row has never been touched by a human and isn't pending
+// deletion — i.e. safe for the reimport to overwrite. In-memory mirror of the
+// pristine SQL predicate, evaluated against the batched read.
+function isPristineTsv(kind: TsvKind, row: Record<string, unknown>): boolean {
+  if (row.updated_by != null) return false;
+  if (row.deleted_at != null) return false;
+  if (kind === "tn") {
+    if (row.trashed_at != null) return false;
+    if (Number(row.preserve ?? 0) !== 0) return false;
+    if (Number(row.hint ?? 0) !== 0) return false;
+  }
+  return true;
+}
 
-async function tryUpdateTsvRow(
+// Build (don't run) the pristine UPDATE for one TSV row, for env.DB.batch().
+// version-CAS (`AND version = oldVersion`) + the pristine predicate keep the
+// write safe: a row a translator edited between the read and the batch matches
+// 0 rows (meta.changes 0 → caller counts skipped_edited; no clobber, no audit).
+// updated_by stays NULL so future re-imports still see the row as overwritable.
+function buildTsvUpdateStmt(
   env: Env,
   book: string,
   kind: TsvKind,
   row: ParsedTsvRow,
-  pristine: string,
   sortOrder: number,
-): Promise<UpdateOutcome> {
-  const now = Math.floor(Date.now() / 1000);
+  oldVersion: number,
+  now: number,
+): D1PreparedStatement {
+  const pristine =
+    kind === "tn"
+      ? `updated_by IS NULL AND deleted_at IS NULL AND trashed_at IS NULL AND preserve = 0 AND hint = 0`
+      : `updated_by IS NULL AND deleted_at IS NULL`;
+  const newVersion = oldVersion + 1;
   if (kind === "tn") {
-    const existing = await env.DB.prepare(
-      `SELECT ref_raw, chapter, verse, tags, support_reference, quote, occurrence, note, sort_order
-         FROM tn_rows WHERE id = ?1 AND book = ?2`,
-    )
-      .bind(row.id, book)
-      .first<{
-        ref_raw: string;
-        chapter: number;
-        verse: number;
-        tags: string | null;
-        support_reference: string | null;
-        quote: string | null;
-        occurrence: number | null;
-        note: string | null;
-        sort_order: number | null;
-      }>();
-    if (
-      existing &&
-      existing.ref_raw === row.refRaw &&
-      existing.chapter === row.chapter &&
-      existing.verse === row.verse &&
-      (existing.tags ?? null) === (row.tags ?? null) &&
-      (existing.support_reference ?? null) === (row.support_reference ?? null) &&
-      (existing.quote ?? null) === (row.quote ?? null) &&
-      (existing.occurrence ?? null) === (row.occurrence ?? null) &&
-      (existing.note ?? null) === (row.note ?? null) &&
-      existing.sort_order === sortOrder
-    ) {
-      return "noop";
-    }
-    const r = await env.DB.prepare(
+    return env.DB.prepare(
       `UPDATE tn_rows
           SET ref_raw = ?1, chapter = ?2, verse = ?3, tags = ?4,
               support_reference = ?5, quote = ?6, occurrence = ?7, note = ?8,
-              sort_order = ?9, version = version + 1, updated_at = ?10
-        WHERE id = ?11 AND book = ?12 AND ${pristine}`,
-    )
-      .bind(
-        row.refRaw, row.chapter, row.verse, row.tags,
-        row.support_reference ?? null, row.quote ?? null,
-        row.occurrence, row.note ?? null, sortOrder,
-        now, row.id, book,
-      )
-      .run();
-    return (r.meta.changes ?? 0) > 0 ? "updated" : "edited";
+              sort_order = ?9, version = ?10, updated_at = ?11
+        WHERE id = ?12 AND book = ?13 AND ${pristine} AND version = ?14`,
+    ).bind(
+      row.refRaw, row.chapter, row.verse, row.tags,
+      row.support_reference ?? null, row.quote ?? null, row.occurrence, row.note ?? null,
+      sortOrder, newVersion, now, row.id, book, oldVersion,
+    );
   }
   if (kind === "tq") {
-    const existing = await env.DB.prepare(
-      `SELECT ref_raw, chapter, verse, tags, quote, occurrence, question, response, sort_order
-         FROM tq_rows WHERE id = ?1 AND book = ?2`,
-    )
-      .bind(row.id, book)
-      .first<{
-        ref_raw: string;
-        chapter: number;
-        verse: number;
-        tags: string | null;
-        quote: string | null;
-        occurrence: number | null;
-        question: string | null;
-        response: string | null;
-        sort_order: number | null;
-      }>();
-    if (
-      existing &&
-      existing.ref_raw === row.refRaw &&
-      existing.chapter === row.chapter &&
-      existing.verse === row.verse &&
-      (existing.tags ?? null) === (row.tags ?? null) &&
-      (existing.quote ?? null) === (row.quote ?? null) &&
-      (existing.occurrence ?? null) === (row.occurrence ?? null) &&
-      (existing.question ?? null) === (row.question ?? null) &&
-      (existing.response ?? null) === (row.response ?? null) &&
-      existing.sort_order === sortOrder
-    ) {
-      return "noop";
-    }
-    const r = await env.DB.prepare(
+    return env.DB.prepare(
       `UPDATE tq_rows
           SET ref_raw = ?1, chapter = ?2, verse = ?3, tags = ?4,
               quote = ?5, occurrence = ?6, question = ?7, response = ?8,
-              sort_order = ?9, version = version + 1, updated_at = ?10
-        WHERE id = ?11 AND book = ?12 AND ${pristine}`,
-    )
-      .bind(
-        row.refRaw, row.chapter, row.verse, row.tags,
-        row.quote ?? null, row.occurrence,
-        row.question ?? null, row.response ?? null, sortOrder,
-        now, row.id, book,
-      )
-      .run();
-    return (r.meta.changes ?? 0) > 0 ? "updated" : "edited";
+              sort_order = ?9, version = ?10, updated_at = ?11
+        WHERE id = ?12 AND book = ?13 AND ${pristine} AND version = ?14`,
+    ).bind(
+      row.refRaw, row.chapter, row.verse, row.tags,
+      row.quote ?? null, row.occurrence, row.question ?? null, row.response ?? null,
+      sortOrder, newVersion, now, row.id, book, oldVersion,
+    );
   }
-  const existing = await env.DB.prepare(
-    `SELECT ref_raw, chapter, verse, tags, orig_words, occurrence, tw_link, sort_order
-       FROM twl_rows WHERE id = ?1 AND book = ?2`,
-  )
-    .bind(row.id, book)
-    .first<{
-      ref_raw: string;
-      chapter: number;
-      verse: number;
-      tags: string | null;
-      orig_words: string | null;
-      occurrence: number | null;
-      tw_link: string | null;
-      sort_order: number | null;
-    }>();
-  if (
-    existing &&
-    existing.ref_raw === row.refRaw &&
-    existing.chapter === row.chapter &&
-    existing.verse === row.verse &&
-    (existing.tags ?? null) === (row.tags ?? null) &&
-    (existing.orig_words ?? null) === (row.orig_words ?? null) &&
-    (existing.occurrence ?? null) === (row.occurrence ?? null) &&
-    (existing.tw_link ?? null) === (row.tw_link ?? null) &&
-    existing.sort_order === sortOrder
-  ) {
-    return "noop";
-  }
-  const r = await env.DB.prepare(
+  return env.DB.prepare(
     `UPDATE twl_rows
         SET ref_raw = ?1, chapter = ?2, verse = ?3, tags = ?4,
             orig_words = ?5, occurrence = ?6, tw_link = ?7,
-            sort_order = ?8, version = version + 1, updated_at = ?9
-      WHERE id = ?10 AND book = ?11 AND ${pristine}`,
-  )
-    .bind(
-      row.refRaw, row.chapter, row.verse, row.tags,
-      row.orig_words ?? null, row.occurrence, row.tw_link ?? null, sortOrder,
-      now, row.id, book,
-    )
-    .run();
-  return (r.meta.changes ?? 0) > 0 ? "updated" : "edited";
+            sort_order = ?8, version = ?9, updated_at = ?10
+      WHERE id = ?11 AND book = ?12 AND ${pristine} AND version = ?13`,
+  ).bind(
+    row.refRaw, row.chapter, row.verse, row.tags,
+    row.orig_words ?? null, row.occurrence, row.tw_link ?? null,
+    sortOrder, newVersion, now, row.id, book, oldVersion,
+  );
+}
+
+// edit_log INSERT as a statement, for batching alongside the writes it audits.
+// Same columns as logEdit (which stays for the per-row insert path).
+function logEditStmt(
+  env: Env,
+  kind: "tn" | "tq" | "twl" | "verse",
+  rowKey: string,
+  book: string,
+  userId: number | null,
+  prevVersion: number | null,
+  newVersion: number,
+  action: "create" | "update",
+  payload: unknown,
+): D1PreparedStatement {
+  return env.DB.prepare(
+    `INSERT INTO edit_log
+       (kind, row_key, book, user_id, prev_version, new_version, action, payload_json, source)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)`,
+  ).bind(kind, rowKey, book, userId, prevVersion, newVersion, action, JSON.stringify(payload), REIMPORT_SOURCE);
 }
 
 // ── Verses (ULT / UST) ─────────────────────────────────────────────────────
@@ -604,6 +590,9 @@ async function reimportVersesForChapter(
 // UPDATE, so a translator edit landing between the read and the batch matches
 // 0 rows — no clobber. On a batch error we fall back to the isolated per-row
 // path so one bad verse can't sink the whole chapter.
+// DO NOT revert this to a per-row loop: that regression silently reintroduced
+// the subrequest cap once (PR #180 batched it → a refactor un-batched it → PR
+// #195 re-batched). See the nightly-sync-subrequest-cap memory.
 async function applyVerseRows(
   env: Env,
   book: string,
@@ -907,8 +896,9 @@ export async function storedResourceSha(env: Env, book: string, resource: Resour
 }
 
 // Comparable-field signature for a normalized TSV row. MUST cover exactly the
-// columns tryUpdateTsvRow compares (same fields, same null normalization) so a
-// signature match is equivalent to a reimport no-op.
+// columns applyTsvRows' no-op check compares (same fields, same null
+// normalization) — note sort_order is NOT in the signature; applyTsvRows checks
+// it separately — so a signature + sort_order match is equivalent to a no-op.
 function tsvRowSignature(kind: TsvKind, r: ParsedTsvRow): string {
   const f =
     kind === "tn"
