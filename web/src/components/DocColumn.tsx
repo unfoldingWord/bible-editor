@@ -447,6 +447,13 @@ function VerseSpan({
   // skips when its target matches, preserving the caret during typing.
   // Hoisted so the draft-hydration path can mark it in lockstep.
   const lastSetRef = useRef<string | null>(null);
+  // Synchronous mirror of "this cell has unsaved typing." `hasDraft` is React
+  // state set asynchronously from the draft subscription, so there's a window
+  // right after a keystroke where it's still false. The DOM-reset effect below
+  // guards on it; a parent re-render in that window (e.g. a WebSocket verse
+  // update giving this verse a new prop) would otherwise re-apply the server
+  // render and wipe the in-progress edit. Set true synchronously on input.
+  const dirtyRef = useRef(false);
   const draftKey = useMemo(
     () => verseKey(book, chapter, verseNum, bibleVersion),
     [book, chapter, verseNum, bibleVersion],
@@ -461,6 +468,8 @@ function VerseSpan({
     return drafts.subscribe((all) => {
       const rec = all.find((d) => d.key === draftKey);
       setHasDraft(!!rec);
+      // Keep the synchronous dirty mirror in lockstep with draft existence.
+      dirtyRef.current = !!rec;
       // Hydrate from a PRE-EXISTING draft exactly once, on the first
       // (mount-snapshot) callback — never from a draft the user is creating
       // by typing right now. Writing to the live element mid-input resets the
@@ -564,7 +573,10 @@ function VerseSpan({
   // overwrites the DOM during a draft session.
   useEffect(() => {
     if (!elRef.current) return;
-    if (hasDraft) return;
+    // dirtyRef is the synchronous guard; hasDraft (async state) can still be
+    // false in the window right after a keystroke, so a WebSocket-driven prop
+    // change could otherwise slip through and wipe the in-progress edit.
+    if (hasDraft || dirtyRef.current) return;
     const dom = elRef.current.textContent;
     if (html !== null) {
       if (html !== lastSetRef.current) {
@@ -643,6 +655,7 @@ function VerseSpan({
               // (a fresh mount gets a fresh ref); re-arming it here would let
               // the next keystroke's draft stomp the live DOM again.
               void drafts.clear(draftKey);
+              dirtyRef.current = false;
               if (elRef.current) {
                 // Re-render from `html` when present (active verse) so the
                 // USFM-code chips come back, not just marker-free plain text.
@@ -705,6 +718,9 @@ function VerseSpan({
           onEdit(value);
           lastTextRef.current = value;
           lastSetRef.current = value;
+          // Mark dirty synchronously, ahead of the async draft write, so a
+          // parent re-render can't reset the DOM and wipe this keystroke.
+          dirtyRef.current = true;
         }}
         style={{
           outline: "none",

@@ -1113,6 +1113,16 @@ function ActiveLine({
   // Hoisted above the draft subscription so the hydration path can update
   // it in lockstep with the DOM write.
   const lastSetRef = useRef<string | null>(null);
+  // Synchronous mirror of "this cell has unsaved typing." `hasDraft` is React
+  // state set asynchronously from the draft-store subscription, so between a
+  // keystroke and that state catching up there's a window where `hasDraft` is
+  // still false. The DOM-reset effect guards on it; if a parent re-render
+  // (e.g. a WebSocket `onVerseUpdate` → applyLocalVerse, which gives the verse
+  // a new `content`/`text` prop) lands in that window, the effect re-applies
+  // the server render and wipes the in-progress edit — so the next Save reads
+  // the reverted text and the edit silently "reverts". Set this true
+  // synchronously on input so the reset effect can never wipe unsaved typing.
+  const dirtyRef = useRef(false);
   // Subscribe to the draft store so the row knows whether it's dirty and
   // hydrates from any saved draft on mount. The subscription fires once
   // immediately with the current list, and again on each set/clear.
@@ -1126,6 +1136,11 @@ function ActiveLine({
     return drafts.subscribe((all) => {
       const rec = all.find((d) => d.key === draftKey);
       setHasDraft(!!rec);
+      // Keep the synchronous dirty mirror in lockstep with draft existence:
+      // true while a draft exists (unsaved typing), false once it's cleared
+      // (saved / undone / no-op). onInput also flips it true ahead of the
+      // async draft write so the reset effect is protected in the meantime.
+      dirtyRef.current = !!rec;
       if (
         !hydratedFromDraftRef.current &&
         rec &&
@@ -1243,8 +1258,10 @@ function ActiveLine({
     if (!elRef.current) return;
     // If the user has unsaved typing in here, leave their text alone —
     // a parent re-render (e.g. notes panel reflow re-passes `text` from
-    // server state) must not stomp the draft.
-    if (hasDraft) return;
+    // server state, or a WebSocket onVerseUpdate applies a new verse prop)
+    // must not stomp the draft. dirtyRef is the synchronous guard; hasDraft
+    // (async state) can still be false in the window right after a keystroke.
+    if (hasDraft || dirtyRef.current) return;
     const next = html ?? domBaseline;
     if (next === lastSetRef.current) return;
     if (html === null) {
@@ -1311,6 +1328,7 @@ function ActiveLine({
               size="small"
               onClick={() => {
                 void drafts.clear(draftKey);
+                dirtyRef.current = false;
                 hydratedFromDraftRef.current = false;
                 if (elRef.current) {
                   // Re-render from the editable baseline so chips are
@@ -1411,6 +1429,10 @@ function ActiveLine({
             // Record what we'd write back if the parent passes the same value
             // as the next `text` prop — keeps the DOM reset effect quiet.
             lastSetRef.current = value;
+            // Mark dirty synchronously — before the async draft write resolves
+            // and flips `hasDraft` — so a parent re-render in that window can't
+            // reset the DOM and wipe this keystroke.
+            dirtyRef.current = true;
             onEditPlain(value);
           }}
           sx={(theme) => ({
