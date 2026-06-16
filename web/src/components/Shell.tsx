@@ -1590,8 +1590,20 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
             setActiveWordId(null);
             if (row.verse !== activeVerse) setActiveVerse(row.verse);
           }}
-          onNoteStartAi={(row) => {
-            const built = buildTnQuickRequest(row, data);
+          onNoteStartAi={(row, live) => {
+            // Build from the live (unsaved) note fields so SUGGEST works
+            // before an explicit save — the cached data.tn row can lag the
+            // box (quote propagates on a debounce; a freshly-built note may
+            // not be flushed at all), which is what produced the bogus "AI
+            // prerequisites missing." id/version/book/verse stay from the
+            // cached row so the outbox If-Match and toast targeting hold.
+            const aiRow: TnRow = {
+              ...row,
+              quote: live.quote,
+              note: live.note,
+              support_reference: live.support_reference,
+            };
+            const built = buildTnQuickRequest(aiRow, data);
             if (!built.ok) {
               // NoteCard gates on quote + support_reference. The remaining
               // reasons (missing ULT/UST or unalignable English) need a
@@ -1604,10 +1616,10 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
                     : built.error.reason === "hebrew_not_found"
                       ? "Couldn't match this English to the ULT alignment — copy the support phrase exactly from ULT."
                       : "AI prerequisites missing.";
-              aiDrafts.pushError(row, message);
+              aiDrafts.pushError(aiRow, message);
               return;
             }
-            aiDrafts.start(row, built.request, {
+            aiDrafts.start(aiRow, built.request, {
               getIsVisible: (id) => visibleRowIdsRef.current.has(id),
               onSuccess: (r, res) => {
                 const patch = { quote: res.quote, note: res.note };

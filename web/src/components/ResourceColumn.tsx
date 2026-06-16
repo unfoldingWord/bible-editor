@@ -78,7 +78,10 @@ interface Props {
   // each NoteCard show its spinner / pulse independently. Visibility
   // bubbles up to Shell so it can route completions to either the
   // in-place pulse or the off-screen toast stack.
-  onNoteStartAi?: (row: TnRow) => void;
+  onNoteStartAi?: (
+    row: TnRow,
+    live: { quote: string; note: string; support_reference: string | null },
+  ) => void;
   isNoteAiPending?: (rowId: string) => boolean;
   noteAiRecentlyCompletedAt?: (rowId: string) => number | null;
   onNoteVisibilityChange?: (rowId: string, isVisible: boolean) => void;
@@ -743,7 +746,7 @@ export function ResourceColumn({
             setDragId(null);
             setDragOver(null);
           }}
-          onStartAi={onNoteStartAi ? () => onNoteStartAi(r) : undefined}
+          onStartAi={onNoteStartAi ? (live) => onNoteStartAi(r, live) : undefined}
           isAiPending={isNoteAiPending?.(r.id) ?? false}
           aiRecentlyCompletedAt={noteAiRecentlyCompletedAt?.(r.id) ?? null}
           onVisibilityChange={onNoteVisibilityChange}
