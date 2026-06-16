@@ -971,14 +971,39 @@ export function extractSource(
   return finalize({ ...state, sourceGroups });
 }
 
+// Sort a group's source words into canonical UHB/UGNT verse order using the
+// supplied position resolver (−1 = unresolved → sorts last, stable). Mirrors
+// the parse-time canonicalisation in `withSourceCoverage` so a compound built
+// live by dragging chips together (`moveSource`) or folding cards
+// (`mergeGroups`) reads RTL and serialises in verse order regardless of drag
+// direction — without it, appending the dragged word to the end reverses pairs
+// like ZEC 7:2 `אֶת פְּנֵי` when the earlier word is dropped onto the later one.
+function canonicalizeSource(
+  source: SourceWord[],
+  sourcePos: (s: SourceWord) => number,
+): SourceWord[] {
+  if (source.length < 2) return source;
+  const withPos = source.map((s, i) => {
+    const p = sourcePos(s);
+    return { s, key: p >= 0 ? p : Number.MAX_SAFE_INTEGER, i };
+  });
+  withPos.sort((a, b) => a.key - b.key || a.i - b.i);
+  return withPos.map((x) => x.s);
+}
+
 // Move a source word from its current group into `destGroupId`'s source
 // chain, making that group compound. If the source group collapses (its
 // last source word left), every stream word aligned to it re-points at
 // the destination so previously-attached targets follow their source.
+//
+// `sourcePos`, when supplied, re-sorts the destination chain into canonical
+// verse order so the merged Hebrew reads correctly no matter which chip was
+// dragged onto which.
 export function moveSource(
   state: AlignmentState,
   sourceId: string,
   destGroupId: string,
+  sourcePos?: (s: SourceWord) => number,
 ): AlignmentState {
   let moving: SourceWord | null = null;
   let fromGroupId: string | null = null;
@@ -1002,7 +1027,11 @@ export function moveSource(
       }
       sourceGroups.push({ ...g, source: remaining });
     } else if (g.id === destGroupId) {
-      sourceGroups.push({ ...g, source: [...g.source, moving] });
+      const combined = [...g.source, moving];
+      sourceGroups.push({
+        ...g,
+        source: sourcePos ? canonicalizeSource(combined, sourcePos) : combined,
+      });
     } else {
       sourceGroups.push(g);
     }
@@ -1027,11 +1056,11 @@ export function moveSource(
 //
 // Reversible via `clearGroup`, which splits the compound back into singletons.
 //
-// Order: the merged source chain is `[...survivor.source, ...eaten.source]`.
-// Targets re-derive in stream (document) order, so they need no sorting. For
-// the merged Hebrew to read in verse order, callers should pass the
-// earlier-positioned card as `survivorId` (the dialog already sorts cards by
-// source position, so it knows which is earlier).
+// Order: the merged source chain is `[...survivor.source, ...eaten.source]`,
+// then re-sorted into canonical verse order when `sourcePos` is supplied — so
+// the merged Hebrew reads in verse order regardless of which card was dragged
+// onto which. Targets re-derive in stream (document) order, so they need no
+// sorting.
 //
 // No-op when the ids are equal, either group is missing, or the eaten group
 // has no source words.
@@ -1039,6 +1068,7 @@ export function mergeGroups(
   state: AlignmentState,
   survivorId: string,
   eatenId: string,
+  sourcePos?: (s: SourceWord) => number,
 ): AlignmentState {
   if (survivorId === eatenId) return state;
   const survivor = state.sourceGroups.find((g) => g.id === survivorId);
@@ -1046,9 +1076,14 @@ export function mergeGroups(
   if (!survivor || !eaten || eaten.source.length === 0) return state;
   const sourceGroups = state.sourceGroups
     .filter((g) => g.id !== eatenId)
-    .map((g) =>
-      g.id === survivorId ? { ...g, source: [...g.source, ...eaten.source] } : g,
-    );
+    .map((g) => {
+      if (g.id !== survivorId) return g;
+      const combined = [...g.source, ...eaten.source];
+      return {
+        ...g,
+        source: sourcePos ? canonicalizeSource(combined, sourcePos) : combined,
+      };
+    });
   const stream = state.stream.map((item) =>
     item.kind === "word" && item.alignedTo === eatenId
       ? { ...item, alignedTo: survivorId }

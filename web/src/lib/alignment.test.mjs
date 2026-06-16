@@ -16,6 +16,7 @@ import {
   alignmentPlainText,
   verseHasUnalignedWork,
   mergeGroups,
+  moveSource,
   clearGroup,
   stripCompoundOverlaps,
   mergeAdjacentSameSource,
@@ -2591,6 +2592,63 @@ function roundtripVerseUsfm(rawUsfm, sourceVO = null) {
   assert(!hl.has("These|1"), `ZEC 6:5: must NOT highlight "These". Got: ${[...hl].join(",")}`);
   assert(!hl.has("the|2"), `ZEC 6:5: must NOT highlight "the"(2) of "the four". Got: ${[...hl].join(",")}`);
   assert(!hl.has("four|1"), `ZEC 6:5: must NOT highlight "four". Got: ${[...hl].join(",")}`);
+}
+
+// ─── Case: moveSource / mergeGroups keep canonical source order (ZEC 7:2) ──
+// Dragging the EARLIER Hebrew chip (אֵת, pos 9) onto the LATER card (פְּנֵי,
+// pos 10) used to append it to the end → reversed "פְּנֵי אֵת". With a position
+// resolver the destination chain is re-sorted into verse order regardless of
+// drag direction. (mergeGroups was only saved by the dialog picking the earlier
+// card as survivor — the resolver makes both paths order-independent.)
+{
+  console.log("\n[Case] moveSource/mergeGroups canonicalize combined source order (ZEC 7:2 אֵת + פְּנֵי)");
+  // Two separate single-word aligned groups; UHB source has אֶת before פְּנֵי.
+  const target = String.raw`\id ZEC
+\c 7
+\v 2 \zaln-s |x-strong="H0853" x-lemma="אֵת" x-occurrence="1" x-occurrences="1" x-content="אֶת"\*\w obj|x-occurrence="1" x-occurrences="1"\w*\zaln-e\* \zaln-s |x-strong="H6440" x-lemma="פָּנֶה" x-occurrence="1" x-occurrences="1" x-content="פְּנֵי"\*\w before|x-occurrence="1" x-occurrences="1"\w*\zaln-e\*
+`;
+  const source = String.raw`\id ZEC
+\c 7
+\v 2 \w אֶת|x-strong="H0853" x-occurrence="1"\w* \w פְּנֵי|x-strong="H6440" x-occurrence="1"\w*
+`;
+  const tvo = usfm.toJSON(target).chapters["7"]["2"].verseObjects;
+  const svo = usfm.toJSON(source).chapters["7"]["2"].verseObjects;
+  const state = parseAlignment(tvo, svo);
+
+  // Position resolver mirroring the dialog: content (NFC) → verse position.
+  const posByContent = new Map();
+  svo.forEach((n, i) => {
+    if (n && n.type === "word" && n.tag === "w") posByContent.set(n.text.normalize("NFC"), i);
+  });
+  const sourcePos = (s) => posByContent.get((s.content ?? "").normalize("NFC")) ?? -1;
+
+  const etGroup = state.groups.find((g) => g.source.some((s) => s.strong === "H0853"));
+  const peneGroup = state.groups.find((g) => g.source.some((s) => s.strong === "H6440"));
+  const etSourceId = etGroup.source.find((s) => s.strong === "H0853").id;
+
+  // Without a resolver, dragging אֵת onto פְּנֵי reverses the chain (old bug).
+  const bad = moveSource(state, etSourceId, peneGroup.id);
+  const badOrder = bad.sourceGroups.find((g) => g.id === peneGroup.id).source.map((s) => s.strong);
+  assert(
+    badOrder[0] === "H6440" && badOrder[1] === "H0853",
+    `precondition: resolver-less moveSource reverses (got [${badOrder.join(", ")}])`,
+  );
+
+  // With the resolver, the destination chain is canonical [אֵת, פְּנֵי].
+  const fixed = moveSource(state, etSourceId, peneGroup.id, sourcePos);
+  const fixedOrder = fixed.sourceGroups.find((g) => g.id === peneGroup.id).source.map((s) => s.strong);
+  assert(
+    fixedOrder[0] === "H0853" && fixedOrder[1] === "H6440",
+    `moveSource canonicalizes to [אֵת, פְּנֵי] regardless of drag direction (got [${fixedOrder.join(", ")}])`,
+  );
+
+  // mergeGroups with the wrong survivor (later card) still lands canonical.
+  const m = mergeGroups(state, peneGroup.id, etGroup.id, sourcePos);
+  const mOrder = m.sourceGroups.find((g) => g.id === peneGroup.id).source.map((s) => s.strong);
+  assert(
+    mOrder[0] === "H0853" && mOrder[1] === "H6440",
+    `mergeGroups canonicalizes even with later-card survivor (got [${mOrder.join(", ")}])`,
+  );
 }
 
 if (failed > 0) {

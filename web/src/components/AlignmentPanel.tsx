@@ -274,7 +274,11 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
     };
     const handleSourceDrop = (destGroupId: string, sourceId: string) => {
       if (!state) return;
-      setState(moveSource(state, sourceId, destGroupId));
+      setState(
+        moveSource(state, sourceId, destGroupId, (s) =>
+          resolveSourcePos(s, sourceIndexMap),
+        ),
+      );
     };
     const handleExtractSource = (sourceId: string) => {
       if (!state) return;
@@ -292,7 +296,9 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
         ti !== -1 && di !== -1 && di < ti
           ? [draggedId, dropTargetId]
           : [dropTargetId, draggedId];
-      const next = mergeGroups(state, survivor, eaten);
+      const next = mergeGroups(state, survivor, eaten, (s) =>
+        resolveSourcePos(s, sourceIndexMap),
+      );
       if (next === state) return;
       setMergeUndo(state);
       setState(next);
