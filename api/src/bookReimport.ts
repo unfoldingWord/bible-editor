@@ -590,11 +590,136 @@ async function reimportVersesForChapter(
   return applyVerseRows(env, book, bibleVersion, extractVersesForRange(rawUsfm, chapter, chapter), userId);
 }
 
-// Per-verse upsert loop over already-parsed verses (keys off each verse's own
-// chapter, so it works across a whole chunk range). Split out so the chunked
-// path parses a staged USFM file ONCE per chunk instead of re-parsing the
-// whole book per chapter.
+// Per-verse upsert over already-parsed verses (keys off each verse's own
+// chapter, so it works across a whole chunk range). Batched: ONE read of the
+// current rows for these verses' chapters, an in-memory diff, then ONE atomic
+// batch() of the INSERT/UPDATE writes interleaved with their edit_log rows.
+// This collapses the old 2–5 D1 round-trips PER VERSE (insert-probe + select +
+// update + version re-select + edit_log) into ~2 subrequests per call regardless
+// of verse count — the fix for the nightly sync blowing the 10k-per-invocation
+// subrequest budget on large books (PSA's ~5k ULT+UST verses alone exceeded it,
+// starving every later book). content_json / plain_text / verse_end are stored
+// byte-for-byte exactly as extractVersesForRange produced them; nothing about
+// the USFM parse changes. The pristine guard (updated_by IS NULL) stays ON each
+// UPDATE, so a translator edit landing between the read and the batch matches
+// 0 rows — no clobber. On a batch error we fall back to the isolated per-row
+// path so one bad verse can't sink the whole chapter.
 async function applyVerseRows(
+  env: Env,
+  book: string,
+  bibleVersion: "ULT" | "UST",
+  verses: VerseExtract[],
+  userId: number | null,
+): Promise<ReimportCounts> {
+  const counts = zeroCounts();
+  if (verses.length === 0) return counts;
+
+  const now = Math.floor(Date.now() / 1000);
+
+  // 1. Read the current rows for exactly these verses' chapters in ONE query
+  //    (callers pass a single chapter's verses, so the IN list is tiny).
+  const chapters = [...new Set(verses.map((v) => v.chapter))];
+  const chPlaceholders = chapters.map((_, i) => `?${i + 3}`).join(", ");
+  const existingRs = await env.DB.prepare(
+    `SELECT chapter, verse, content_json, plain_text, verse_end, version, updated_by
+       FROM verses
+      WHERE book = ?1 AND bible_version = ?2 AND chapter IN (${chPlaceholders})`,
+  )
+    .bind(book, bibleVersion, ...chapters)
+    .all<{
+      chapter: number;
+      verse: number;
+      content_json: string;
+      plain_text: string | null;
+      verse_end: number | null;
+      version: number;
+      updated_by: number | null;
+    }>();
+  const existing = new Map<string, (typeof existingRs.results)[number]>();
+  for (const r of existingRs.results) existing.set(`${r.chapter}:${r.verse}`, r);
+
+  // 2. Diff in memory. Stage a write (+ interleaved audit row) only for verses
+  //    that are new or pristine-and-changed; count no-ops / edited rows straight
+  //    from the read. inserted/updated are tallied tentatively and only folded
+  //    into counts once the batch commits (so a fallback doesn't double-count).
+  const stmts = [];
+  const writes: VerseExtract[] = []; // candidates, for the per-row fallback
+  let inserted = 0;
+  let updated = 0;
+  for (const v of verses) {
+    const ex = existing.get(`${v.chapter}:${v.verse}`);
+    const rowKey = `${book}/${v.chapter}/${v.verse}/${bibleVersion}`;
+    if (!ex) {
+      inserted++;
+      writes.push(v);
+      stmts.push(
+        env.DB.prepare(
+          `INSERT INTO verses (book, chapter, verse, verse_end, bible_version, content_json, plain_text)
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+           ON CONFLICT(book, chapter, verse, bible_version) DO NOTHING`,
+        ).bind(book, v.chapter, v.verse, v.verseEnd, bibleVersion, v.contentJson, v.plainText),
+        env.DB.prepare(
+          `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, payload_json, source)
+           VALUES ('verse', ?1, ?2, ?3, NULL, 1, 'create', ?4, ?5)`,
+        ).bind(rowKey, book, userId, JSON.stringify({ plain_text: v.plainText }), REIMPORT_SOURCE),
+      );
+      continue;
+    }
+    if (ex.updated_by != null) {
+      counts.skipped_edited++;
+      continue;
+    }
+    if (
+      ex.content_json === v.contentJson &&
+      (ex.plain_text ?? null) === (v.plainText ?? null) &&
+      (ex.verse_end ?? null) === (v.verseEnd ?? null)
+    ) {
+      counts.skipped_noop++;
+      continue;
+    }
+    // Pristine + changed → update. The guard stays on the UPDATE; new_version is
+    // ex.version + 1 because the update only applies while the row is untouched.
+    updated++;
+    writes.push(v);
+    stmts.push(
+      env.DB.prepare(
+        `UPDATE verses
+            SET content_json = ?1, plain_text = ?2, verse_end = ?3,
+                version = version + 1, updated_at = ?4
+          WHERE book = ?5 AND chapter = ?6 AND verse = ?7 AND bible_version = ?8
+            AND updated_by IS NULL`,
+      ).bind(v.contentJson, v.plainText, v.verseEnd, now, book, v.chapter, v.verse, bibleVersion),
+      env.DB.prepare(
+        `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, payload_json, source)
+         VALUES ('verse', ?1, ?2, ?3, ?4, ?5, 'update', ?6, ?7)`,
+      ).bind(rowKey, book, userId, ex.version, ex.version + 1, JSON.stringify({ plain_text: v.plainText }), REIMPORT_SOURCE),
+    );
+  }
+
+  if (stmts.length === 0) return counts;
+
+  // 3. One atomic batch for all writes + their audit rows. On failure fall back
+  //    to the isolated per-row path so a single bad verse can't sink the chapter.
+  try {
+    await env.DB.batch(stmts);
+    counts.inserted += inserted;
+    counts.updated += updated;
+  } catch (e) {
+    console.error("reimport verse batch failed; falling back per-row", {
+      book,
+      bibleVersion,
+      chapters,
+      error: e instanceof Error ? e.message : String(e),
+    });
+    addCounts(counts, await applyVerseRowsPerRow(env, book, bibleVersion, writes, userId));
+  }
+  return counts;
+}
+
+// Per-row upsert fallback — the original, error-isolated implementation. Invoked
+// only when the batched applyVerseRows hits an atomic batch() error, so one bad
+// verse can't sink a whole chapter. Keys off each verse's own chapter.
+async function applyVerseRowsPerRow(
   env: Env,
   book: string,
   bibleVersion: "ULT" | "UST",
