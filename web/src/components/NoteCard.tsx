@@ -86,8 +86,10 @@ interface Props {
   isAiPending?: boolean;
   aiRecentlyCompletedAt?: number | null;
   // Fires the request. Returns immediately; result lands later via the
-  // row patch pipeline. Absent => sparkles is hidden.
-  onStartAi?: () => void;
+  // row patch pipeline. Absent => sparkles is hidden. Carries the LIVE
+  // (unsaved) note fields so Shell builds the request from what's on
+  // screen rather than the cached row — see buildAiLive below.
+  onStartAi?: (live: { quote: string; note: string; support_reference: string | null }) => void;
   // Reported on intersection changes so Shell can decide whether an
   // arriving AI result needs the persistent off-screen toast or just
   // the in-place pulse. Default root (viewport) is good enough for our
@@ -600,13 +602,25 @@ function NoteCardInner({
     };
   }, [row.id, onVisibilityChange]);
 
+  // Snapshot the live note fields for the AI request. SUGGEST must work
+  // before an explicit save: quote edits reach Shell's data.tn only on a
+  // 200ms debounce and a freshly-created note can still be blank there, so
+  // building from the cached row produced spurious "AI prerequisites
+  // missing." Mirror flushPending's TSV conversion so the request sees
+  // exactly what a save would persist.
+  const buildAiLive = () => ({
+    quote: quote.replace(/\n/g, "\\n"),
+    note: note.replace(/\n/g, "\\n"),
+    support_reference: supportRef,
+  });
+
   const handleAiClick = () => {
     if (!onStartAi || !aiPrereqsMet || isAiPending) return;
     if (note.trim().length > 0) {
       setAiConfirmOpen(true);
       return;
     }
-    onStartAi();
+    onStartAi(buildAiLive());
   };
 
   // Curated templates for the selected support reference (keyed on the short
@@ -1296,7 +1310,7 @@ function NoteCardInner({
           <Button
             onClick={() => {
               setAiConfirmOpen(false);
-              onStartAi?.();
+              onStartAi?.(buildAiLive());
             }}
             color="primary"
             variant="contained"
