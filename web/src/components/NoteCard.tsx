@@ -75,6 +75,11 @@ interface Props {
   onCardDrop: (position: DropPosition) => void;
   onMoveUp?: () => void;
   onMoveDown?: () => void;
+  // Verse numbers in this chapter, offered in the reference picker so a note
+  // can be retargeted to a different verse ("change reference"). Absent/empty
+  // => the ref shows as a static label with no picker.
+  verseOptions?: number[];
+  onChangeVerse?: (verse: number) => void;
   // Hovering the reorder controls (grip / up / down) previews this note's
   // current slot in the scripture stoplight without moving it: fires true on
   // enter, false on leave.
@@ -175,6 +180,8 @@ function NoteCardInner({
   onCardDrop,
   onMoveUp,
   onMoveDown,
+  verseOptions,
+  onChangeVerse,
   onReorderHover,
   isAiPending = false,
   aiRecentlyCompletedAt = null,
@@ -212,6 +219,8 @@ function NoteCardInner({
   // the body staged for the "replace existing note?" confirm dialog.
   const [templateMenuAnchor, setTemplateMenuAnchor] = useState<HTMLElement | null>(null);
   const [templateConfirmBody, setTemplateConfirmBody] = useState<string | null>(null);
+  // Reference (verse) picker anchor — opened from the ref_raw label.
+  const [refMenuAnchor, setRefMenuAnchor] = useState<HTMLElement | null>(null);
 
   // Baseline of the last server-confirmed content. stashEdit() optimistically
   // re-spreads row.{quote,note,support_reference} on every keystroke (so a
@@ -838,9 +847,30 @@ function NoteCardInner({
             }}
           />
         </Box>
-        <Typography variant="caption" sx={{ color: "text.disabled", fontFamily: "monospace" }}>
-          {row.ref_raw}
-        </Typography>
+        {onChangeVerse && verseOptions && verseOptions.length > 0 && !readOnly ? (
+          <Tooltip title="change reference">
+            <Chip
+              label={row.ref_raw}
+              size="small"
+              variant="outlined"
+              clickable
+              deleteIcon={<ArrowDropDownIcon />}
+              onDelete={(e) => {
+                e.stopPropagation();
+                setRefMenuAnchor(e.currentTarget.parentElement as HTMLElement);
+              }}
+              onClick={(e) => {
+                e.stopPropagation();
+                setRefMenuAnchor(e.currentTarget);
+              }}
+              sx={{ fontFamily: "monospace", fontSize: 11, height: 22, color: "text.secondary" }}
+            />
+          </Tooltip>
+        ) : (
+          <Typography variant="caption" sx={{ color: "text.disabled", fontFamily: "monospace" }}>
+            {row.ref_raw}
+          </Typography>
+        )}
         <Box sx={{ flex: 1 }} />
         {/* Right-side action controls grouped into one non-shrinking, non-wrapping
             row. The header itself still wraps (flexWrap on the Stack), but it can
@@ -1319,6 +1349,25 @@ function NoteCardInner({
           </Button>
         </DialogActions>
       </Dialog>
+      <Menu
+        anchorEl={refMenuAnchor}
+        open={Boolean(refMenuAnchor)}
+        onClose={() => setRefMenuAnchor(null)}
+        slotProps={{ paper: { sx: { maxHeight: 320 } } }}
+      >
+        {(verseOptions ?? []).map((v) => (
+          <MenuItem
+            key={v}
+            selected={v === row.verse}
+            onClick={() => {
+              setRefMenuAnchor(null);
+              if (v !== row.verse) onChangeVerse?.(v);
+            }}
+          >
+            {v === 0 ? "intro" : `v${v}`}
+          </MenuItem>
+        ))}
+      </Menu>
       <Menu
         anchorEl={templateMenuAnchor}
         open={Boolean(templateMenuAnchor)}

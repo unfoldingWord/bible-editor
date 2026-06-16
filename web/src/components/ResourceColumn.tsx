@@ -65,6 +65,10 @@ interface Props {
   onNoteRestore: (id: string) => void;
   onNoteInsertAfter: (refId: string) => void;
   onNoteReorder: (draggedId: string, refId: string, position: DropPosition) => void;
+  // Verse numbers in the loaded chapter, offered in each note's reference
+  // picker; onNoteChangeVerse retargets a note to a different verse.
+  verseOptions: number[];
+  onNoteChangeVerse: (id: string, verse: number) => void;
   // Report the moved note's candidate neighbours so Shell can paint the
   // active-verse stoplight. Fired live as a drag hovers each slot (sticky =
   // false; cleared on drop), and once after an arrow move (sticky = true,
@@ -201,6 +205,8 @@ export function ResourceColumn({
   onNoteRestore,
   onNoteInsertAfter,
   onNoteReorder,
+  verseOptions,
+  onNoteChangeVerse,
   onReorderPreview,
   onNoteFocus,
   onNoteCreate,
@@ -693,6 +699,8 @@ export function ResourceColumn({
           onDelete={() => onNoteDelete(r.id)}
           onRestore={() => onNoteRestore(r.id)}
           onInsertAfter={() => onNoteInsertAfter(r.id)}
+          verseOptions={verseOptions}
+          onChangeVerse={(v) => onNoteChangeVerse(r.id, v)}
           onFocus={() => onNoteFocus(r)}
           onGripDragStart={() => setDragId(r.id)}
           onMoveUp={

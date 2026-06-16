@@ -68,6 +68,12 @@ function parseIfMatch(header: string | undefined): number | null {
 
 const TnPatch = z.object({
   ref_raw: z.string().optional(),
+  // Retarget a note to a different verse within its chapter (the "change
+  // reference" action). chapter stays implicit — the move UI is same-chapter
+  // only — so the broadcast on a successful PATCH still covers one chapter.
+  // Sent alongside a recomputed ref_raw + sort_order, so it never hits the
+  // reorder-only fast path and correctly bumps the version + logs history.
+  verse: z.number().int().nonnegative().optional(),
   tags: z.string().nullable().optional(),
   support_reference: z.string().nullable().optional(),
   quote: z.string().nullable().optional(),
