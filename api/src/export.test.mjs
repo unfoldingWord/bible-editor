@@ -5,7 +5,7 @@
 // instead of getting silently flattened to `\v 6`. Not a test framework;
 // failures exit non-zero.
 
-import { buildTnTsv, buildTwlTsv, buildUsfm, commitToDcs, ensureDcsPr, updateDcsPrBranch } from "./export.ts";
+import { buildTnTsv, buildTwlTsv, buildUsfm, commitToDcs, ensureDcsPr, exportTsvShrinkRefused, updateDcsPrBranch } from "./export.ts";
 import { CorruptContentJsonError } from "./contentJson.ts";
 
 function assert(cond, msg) {
@@ -516,6 +516,26 @@ function utf8Base64(s) {
   } finally {
     globalThis.fetch = originalFetch;
   }
+}
+
+// --- exportTsvShrinkRefused: truncation backstop (the twl_PSA clobber) ---
+{
+  // The actual incident: D1 held 4880 of master's 7776 rows → must refuse.
+  assert(exportTsvShrinkRefused(4880, 7776) === true, `PSA 4880-of-7776 (37% loss) is refused`);
+  // Ordinary editorial cleanup (Beth removed ~61 of 7776, <1%) must pass.
+  assert(exportTsvShrinkRefused(7715, 7776) === false, `small cleanup (-61) is allowed`);
+  // Growth (D1 ahead of master, e.g. added notes) is never a shrink.
+  assert(exportTsvShrinkRefused(850, 742) === false, `growth (more rows than master) allowed`);
+  // Equal is allowed.
+  assert(exportTsvShrinkRefused(500, 500) === false, `no change allowed`);
+  // Tiny absolute loss on a small book is below the floor even past 5%.
+  assert(exportTsvShrinkRefused(280, 300) === false, `20-row loss under the 25-row floor allowed`);
+  // Just over both floors (>25 rows AND >5%) is refused.
+  assert(exportTsvShrinkRefused(440, 500) === true, `60-of-500 loss (12%) refused`);
+  // Empty master can't be shrunk (nothing to protect) — fresh book.
+  assert(exportTsvShrinkRefused(0, 0) === false, `empty master never refuses`);
+  // A render to zero rows against a populated master is the strongest signal.
+  assert(exportTsvShrinkRefused(0, 4000) === true, `render-to-empty against populated master refused`);
 }
 
 console.log("\nAll export smoke checks passed.");

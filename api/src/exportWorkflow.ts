@@ -27,6 +27,7 @@ import {
   commitToDcs,
   deleteDcsBranch,
   ensureDcsPr,
+  exportTsvShrinkRefused,
   findDcsOpenPr,
   updateDcsPrBranch,
   RESOURCE_TARGETS,
@@ -43,7 +44,7 @@ const EXPORT_ALERT_USERNAME = "deferredreward";
 const LEGACY_EXPORT_BRANCH = "live-snapshot";
 import { runPostExport, VALIDATORS } from "./postExport";
 import { runChunkedReimport, storedResourceSha, ALL_RESOURCES as REIMPORT_RESOURCES } from "./bookReimport";
-import { dcsResourceFile, fileCommitSha, type ReimportResource } from "./dcsSources";
+import { dcsRawUrl, dcsResourceFile, fetchText, fileCommitSha, type ReimportResource } from "./dcsSources";
 import type { TnRow, TqRow, TwlRow, VerseRow } from "./types";
 
 export interface ExportParams {
@@ -293,6 +294,33 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
         prNumber: null,
         prReason: null,
       };
+    }
+
+    // Shrink guard — refuse to commit a TSV render that would delete a large
+    // fraction of master's rows (truncation backstop; see exportTsvShrinkRefused).
+    // Only when we'd actually commit (dcsAllowed) and only for TSV resources,
+    // whose row==line model makes the count exact. This is what would have
+    // stopped the twl_PSA clobber (4880 rows shipped over master's 7776).
+    if (dcsAllowed && (resource === "tn" || resource === "tq" || resource === "twl")) {
+      const guard = await this.checkTsvShrink(book, resource, built.rowCount);
+      if (!guard.ok) {
+        await this.recordShrinkSkipAlert(book, resource, built.rowCount, guard.masterRows, guard.detail);
+        const reason = `shrink_guard:${guard.detail}`;
+        await this.recordSnapshot(book, resource, null, null, built.rowCount, reason);
+        return {
+          book,
+          resource,
+          rowCount: built.rowCount,
+          bytes: built.content.length,
+          r2Key,
+          branch: null,
+          dcsCommitSha: null,
+          dcsChanged: false,
+          dcsSkippedReason: reason,
+          prNumber: null,
+          prReason: null,
+        };
+      }
     }
 
     if (!dcsAllowed) {
@@ -613,6 +641,47 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       `Benjamin — nightly export skipped ${book} ${resource.toUpperCase()} to avoid reverting master ` +
       `(D1 is behind: master ${(masterSha ?? "unknown").slice(0, 8)} vs synced ${(watermark ?? "none").slice(0, 8)}). ` +
       `The pre-export sync didn't catch up; re-run the sync for ${book}, then re-export.`;
+    await this.writeAlert(source, message, `${this.env.DCS_BASE_URL}/unfoldingWord`);
+  }
+
+  // Fetch master's current TSV row count and decide whether this render would
+  // shrink it dangerously (see export.ts exportTsvShrinkRefused). Fail closed
+  // when master can't be read — a truncated master fetch now returns null from
+  // fetchText too, so "unreadable" rightly blocks rather than letting an
+  // unverified commit through.
+  private async checkTsvShrink(
+    book: string,
+    resource: Resource,
+    renderedRows: number,
+  ): Promise<{ ok: boolean; detail: string; masterRows: number | null }> {
+    const file = dcsResourceFile(book, resource as ReimportResource);
+    if (!file) return { ok: true, detail: "no_file", masterRows: null };
+    const raw = await fetchText(dcsRawUrl(this.env, file.repo, file.path));
+    if (raw == null) return { ok: false, detail: "master_unreadable", masterRows: null };
+    // Data rows = non-empty lines minus the header (mirrors parseTsv's model).
+    const masterRows = Math.max(0, raw.split(/\r?\n/).filter((l) => l.length > 0).length - 1);
+    if (exportTsvShrinkRefused(renderedRows, masterRows)) {
+      return { ok: false, detail: `shrink_${masterRows - renderedRows}_of_${masterRows}`, masterRows };
+    }
+    return { ok: true, detail: "ok", masterRows };
+  }
+
+  // Banner alert when the shrink guard blocks an export to avoid mass-deleting
+  // rows on master (the twl_PSA clobber signature). Same replace-undismissed
+  // shape as recordStaleSkipAlert.
+  private async recordShrinkSkipAlert(
+    book: string,
+    resource: Resource,
+    renderedRows: number,
+    masterRows: number | null,
+    detail: string,
+  ): Promise<void> {
+    const source = `export_shrink:${book}:${resource}`;
+    const message =
+      `Benjamin — nightly export BLOCKED ${book} ${resource.toUpperCase()}: the render has ${renderedRows} rows ` +
+      `but master has ${masterRows ?? "?"} (${detail}). This looks like an incomplete D1 load (truncated fetch), ` +
+      `not a real deletion — refusing to shrink master. Re-sync ${book} ${resource.toUpperCase()} from master, ` +
+      `verify the row count, then re-export.`;
     await this.writeAlert(source, message, `${this.env.DCS_BASE_URL}/unfoldingWord`);
   }
 

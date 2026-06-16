@@ -117,6 +117,27 @@ export function buildTwlTsv(rows: TwlRow[]): string {
   return [TWL_HEADERS.join("\t"), ...body].join("\n") + "\n";
 }
 
+// ── Export shrink guard (truncation backstop) ───────────────────────────────
+// Refuse to commit a TSV render that would delete a large fraction of the rows
+// currently on master. This is the second line of defense behind fetchText's
+// completeness check: the twl_PSA incident shipped a D1 holding 4880 of 7776
+// rows over master and silently deleted 2,896. Even if a partial load ever slips
+// past the fetch guard, the export must not wipe most of a book off master
+// without a human in the loop. A translator legitimately removing >5% of a
+// book's rows in a single night is effectively unheard of, so the cost of a
+// false positive (one skipped book + a banner alert to review) is negligible
+// next to the catastrophe it prevents. Returns true = REFUSE to commit.
+//   renderedRows — rows in the about-to-be-committed render (D1 live rows)
+//   masterRows   — rows in the current master file (data rows, header excluded)
+// Floors: ignore tiny books (>25 rows lost) and require >5% shrink so ordinary
+// edits never trip it; PSA lost 2,896 of 7,776 (37%) and trips easily.
+export function exportTsvShrinkRefused(renderedRows: number, masterRows: number): boolean {
+  if (masterRows <= 0) return false; // nothing on master to protect
+  const lost = masterRows - renderedRows;
+  if (lost <= 25) return false; // small/no shrink (incl. growth) — fine
+  return lost / masterRows > 0.05;
+}
+
 // ── USFM rebuilder ───────────────────────────────────────────────────────────
 
 export interface UsfmInputs {

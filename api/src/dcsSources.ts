@@ -63,14 +63,44 @@ export function dcsUrls(env: Env, book: string): DcsUrlSet | null {
 // Best-effort text fetch. 404 / network failure → null, so callers can warn
 // and continue when a single file is missing (matches the "incomplete sample
 // dir" behaviour of scripts/import-book.mjs).
+//
+// Completeness-checked: a SHORT body (fewer bytes than the declared
+// Content-Length) is a truncated fetch and is rejected, not silently accepted.
+// This is the root-cause guard for the twl_PSA data-loss incident — a partial
+// ~350KB read of a ~547KB file loaded 4880 of 7776 rows into D1, the watermark
+// certified it "in sync", and the nightly export then shipped the partial over
+// master (deleting 2,896 rows). Accepting half a file as if it were whole is
+// never the right answer, so we treat it as a fetch failure: the bootstrap
+// throws + retries, the reimport skips (and never stamps a false watermark).
+// One retry, since the truncation is transient (not a deterministic size cap —
+// larger files like tn_PSA / ISA tn fetch fine).
+//
+// We reject only SHORT bodies, never LONGER-than-declared ones: transparent
+// gzip makes the decoded length exceed the (compressed) Content-Length, which
+// is not a truncation. A response with no Content-Length is returned as-is.
 export async function fetchText(url: string): Promise<string | null> {
-  try {
-    const r = await fetch(url);
-    if (!r.ok) return null;
-    return await r.text();
-  } catch {
-    return null;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const r = await fetch(url);
+      if (!r.ok) return null;
+      const buf = await r.arrayBuffer();
+      const cl = r.headers.get("content-length");
+      const expected = cl == null ? null : Number(cl);
+      if (expected != null && Number.isFinite(expected) && buf.byteLength < expected) {
+        console.error("fetchText: short read (truncated fetch); retrying", {
+          url,
+          expectedBytes: expected,
+          gotBytes: buf.byteLength,
+          attempt,
+        });
+        continue;
+      }
+      return new TextDecoder("utf-8").decode(buf);
+    } catch {
+      // network error → retry once, then null
+    }
   }
+  return null;
 }
 
 // ── Per-resource repo/path + git-SHA helpers (incremental self-heal reimport) ──
