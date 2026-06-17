@@ -24,6 +24,7 @@ import Brightness7Icon from "@mui/icons-material/Brightness7";
 import CloudDownloadIcon from "@mui/icons-material/CloudDownload";
 import { api, type BookListEntry, type BookSummary } from "../sync/api";
 import { SyncStatusBar } from "./SyncStatusBar";
+import { VersionIndicator } from "./VersionIndicator";
 import { BOOKS, bookName, resolveBook } from "../lib/bookNames";
 import { parseReference } from "../lib/referenceParser";
 import { ThemeModeContext } from "../theme";
@@ -345,6 +346,7 @@ export function TopBar({
           <Divider orientation="vertical" flexItem sx={{ my: 0.5 }} />
         </Box>
       )}
+      <VersionIndicator />
       <SyncStatusBar onNavigate={onNavigate} />
       <Tooltip title={mode === "dark" ? "switch to light mode" : "switch to dark mode"}>
         <IconButton size="small" onClick={toggle} aria-label="toggle color mode">
