@@ -31,7 +31,7 @@ export function VersionIndicator() {
       <Tooltip title="A newer version is deployed. Click to reload and get the latest fixes.">
         <Chip
           icon={<RefreshIcon />}
-          label="Update available — refresh"
+          label="App update available — refresh"
           size="small"
           variant="outlined"
           clickable
