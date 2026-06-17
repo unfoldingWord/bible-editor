@@ -33,6 +33,13 @@
 
 ## Completed (recently merged → main, newest first)
 
+- #222 — confident-payne: user-triggered reimport (`runReimport`, the "Import from Door43" button) now
+  prunes master-deleted rows like the nightly does. `softDeleteRemovedTsvRows` lived only in
+  `runChunkedReimport`; the app path inserted/updated but never deleted, so an out-of-band master rewrite
+  that dropped/re-id'd rows (Zulip-run bp-assistant AI → master, then app Import) left orphans in D1 with
+  `updated_by NULL` → look pristine → export resurrects them. Surfaced via new `ReimportCounts.deleted`.
+  **PR open, not yet merged/deployed.** Existing HOS 9 orphans (47: 115 D1 vs 68 master) self-heal on the
+  nightly sync regardless.
 - #214 — Fix whole-verse unalign when adding quotes at a verse's edges (`7acb5266`)
 - #213 — Spacing between undo and save buttons + document PR merge-check workflow in CLAUDE.md
 - #212 — Move save button to verse level; add column labels above columns in book view
@@ -71,6 +78,13 @@ Highlights that bite repeatedly:
 - **`usfm-js` parks leading punctuation/markers on the node's `text`** — markers can carry text; opening
   quotes after a marker live on the marker node, not as a sibling.
 - **Export USFM puts punctuation outside `\w` (`\w earth\w*.`) on purpose** — correct uW form, not churn; don't "fix" it.
+- **Two reimport paths, asymmetric until #222.** `runChunkedReimport` (nightly) writes sync watermarks
+  (`recordResourceSync`) AND prunes master-deleted rows (`softDeleteRemovedTsvRows`). The user-triggered
+  `reimportBookFromDcs`→`runReimport` (app "Import from Door43") historically did NEITHER — it only
+  inserts/updates. So an app-triggered import after an out-of-band master rewrite (e.g. AI run on Zulip
+  committed to master) leaves orphaned-id rows in D1 that look pristine and get re-exported. #222 added
+  the prune to the app path; the watermark is still nightly-only (intentional — app import shouldn't gate
+  the nightly skip). Orphans always self-heal on the next nightly sync.
 
 ## Stop conditions / goals
 
