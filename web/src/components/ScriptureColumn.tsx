@@ -12,6 +12,7 @@ import type { ChapterPayload, TnRow, TwlRow, VerseDto } from "../sync/api";
 import { drafts, verseKey } from "../sync/drafts";
 import { DocColumn } from "./DocColumn";
 import type { FindMatch } from "./FindReplaceOverlay";
+import { findSession, resetFindSession } from "./findSession";
 import { HebrewLine } from "./HebrewLine";
 import type { LexiconEntry } from "../hooks/useLexicon";
 import type { ChapterState } from "../hooks/useBook";
@@ -189,7 +190,13 @@ function ScriptureColumnInner({
 }: Props) {
   const activeRef = useRef<HTMLDivElement | null>(null);
   const bodyRef = useRef<HTMLDivElement | null>(null);
-  const [findOpen, setFindOpen] = useState(false);
+  // Seed from the module-level session so a cross-chapter find walk (which
+  // remounts Shell via the URL) re-opens the overlay instead of vanishing.
+  const [findOpen, setFindOpen] = useState(() => findSession.open);
+  const openFind = useCallback(() => {
+    findSession.open = true;
+    setFindOpen(true);
+  }, []);
   const [findQuery, setFindQuery] = useState<FindQuery | null>(null);
   // Set only when the overlay reports a user-initiated scroll target; the
   // BookView's scroll effect (book mode) and the bodyRef scroll effect
@@ -203,19 +210,21 @@ function ScriptureColumnInner({
     const onKeyDown = (e: KeyboardEvent) => {
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "f") {
         e.preventDefault();
-        setFindOpen(true);
+        openFind();
       }
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, []);
+  }, [openFind]);
 
   // Closing the overlay should drop the query so cells stop painting find
-  // marks (otherwise the previous query lingers as highlights).
+  // marks (otherwise the previous query lingers as highlights). Clear the
+  // module session too so it doesn't re-open on the next navigation.
   const closeFind = useCallback(() => {
     setFindOpen(false);
     setFindQuery(null);
     setFindScrollTarget(null);
+    resetFindSession();
   }, []);
 
   // Stable callback identities so the overlay's effect deps don't churn.
@@ -400,7 +409,7 @@ function ScriptureColumnInner({
             startIcon={<SearchIcon fontSize="small" />}
             onClick={() => {
               if (findOpen) closeFind();
-              else setFindOpen(true);
+              else openFind();
             }}
             sx={{ textTransform: "none" }}
           >

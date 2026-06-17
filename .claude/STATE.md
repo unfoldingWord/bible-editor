@@ -18,11 +18,15 @@
 
 ## In progress
 
-- **trusting-galileo** — Fix: in book mode with TN scope on, typing in find collapsed the book + closed the
-  find box. Root cause: auto-jump-to-first-match fired `focusNoteMatch` on the chapter-0 book-intro note
-  (sorts first, matches common words), which is a *different* chapter than active → URL nav → Shell remount.
-  Fix gates the **auto** scroll path to skip cross-chapter notes (bible matches + explicit prev/next unchanged).
-  `FindReplaceOverlay.tsx` + `ScriptureColumn.tsx`. Verified live (Playwright). PR pending.
+- **trusting-galileo** (PR #220) — Find in book mode: two fixes for cross-chapter notes remounting Shell
+  (Shell is keyed on book/chapter/verse in App.tsx, and the resource column is bound to one chapter via
+  useChapter, so a cross-chapter note jump goes through the URL and remounts). (1) Auto-jump-to-first-match
+  on typing no longer navigates to a cross-chapter note (the chapter-0 book-intro note sorts first + matches
+  common words → was yanking to ZEC/0 on the first keystroke). (2) Explicit prev/next walking *does* cross
+  chapters — so the find session (open flag, query, activeIdx) now lives in a module singleton
+  `findSession.ts` and is restored after the remount (Shell's existing pendingNoteJump re-activates the note),
+  so the find box no longer vanishes mid-walk and next/prev continues seamlessly. Cleared on explicit close.
+  `FindReplaceOverlay.tsx` + `ScriptureColumn.tsx` + `findSession.ts`. Verified live (Playwright, full ZEC walk).
 - _(none currently tracked here — add the branch + a one-line status when you pick up work)_
 - Follow-up watch: edge-punctuation whole-verse unalign fix (PR #214, merged) is **code branch-only**;
   prod ZEC 7:14 ULT was healed to v5 by data fix but the engine change is **not yet deployed**.
