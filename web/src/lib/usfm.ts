@@ -117,19 +117,30 @@ const CHARACTER_WRAPPER_TAGS: ReadonlySet<string> = new Set(["qs"]);
 
 // usfm-js gives BOTH poetry/paragraph line markers (`\q1`, `\qa`) and same-line
 // character-style wrappers (`\qs Selah\qs*`) `type:"quote"`, so isInFlowMarker
-// matches both. Only line markers lead the NEXT verse and may drift onto it; a
-// character wrapper holds verse content that belongs to THIS verse and must
-// stay put. Two signals catch a wrapper: a well-closed one carries a non-empty
-// `endTag` (the `\qs*`); but an upstream tool can emit the wrapper WITHOUT its
-// close (older gatewayEdit mishandled Selah this way → `{tag:"qs", endTag:""}`),
-// so we also match the known wrapper tag. Real line markers have neither.
+// matches both. A character wrapper holds verse CONTENT (aligned `\zaln`/`\w`
+// children, or its own `text`), not a line break, and must be treated as a
+// content wrapper everywhere — surfaced via its children/text, never as a
+// literal `\qs` token. A well-closed one carries a non-empty `endTag` (`\qs*`);
+// an upstream tool can emit it WITHOUT its close (older gatewayEdit mishandled
+// Selah this way → `{tag:"qs", endTag:""}`), so we also match the known wrapper
+// tag defensively. Real line markers have neither.
+export function isCharacterWrapper(node: unknown): boolean {
+  const o = node as Record<string, unknown> | null;
+  if (!o) return false;
+  if (typeof o["endTag"] === "string" && o["endTag"] !== "" && typeof o["tag"] === "string" && CHARACTER_WRAPPER_TAGS.has(o["tag"]))
+    return true;
+  return typeof o["tag"] === "string" && CHARACTER_WRAPPER_TAGS.has(o["tag"]);
+}
+
+// A character wrapper holds verse content that belongs to THIS verse and must
+// stay put — only true line markers lead the NEXT verse and may drift onto it.
 // Used by the trailing-marker drift pair so a verse-final `\qs Selah[\qs*]`
 // isn't peeled off and shown on the following verse.
 function isDriftableMarker(node: unknown): boolean {
   if (!isInFlowMarker(node)) return false;
   const o = node as Record<string, unknown>;
   if (typeof o["endTag"] === "string" && o["endTag"] !== "") return false;
-  if (typeof o["tag"] === "string" && CHARACTER_WRAPPER_TAGS.has(o["tag"])) return false;
+  if (isCharacterWrapper(node)) return false;
   return true;
 }
 
@@ -150,7 +161,11 @@ export function liftMarkerText(verseObjects: unknown[]): unknown[] {
   const out: unknown[] = [];
   for (const node of verseObjects) {
     const o = node as Record<string, unknown> | null;
-    if (o && isInFlowMarker(o) && typeof o["text"] === "string" && o["text"] !== "") {
+    // A character wrapper (`\qs Selah\qs*`) is `type:"quote"` so isInFlowMarker
+    // matches it, but its `text` is CONTENT held between `\qs … \qs*`, not a
+    // quote parked on a line marker. Lifting it would move the word OUTSIDE the
+    // wrapper (`\qs\qs* Selah`) — so skip wrappers; only lift true line markers.
+    if (o && isInFlowMarker(o) && !isCharacterWrapper(o) && typeof o["text"] === "string" && o["text"] !== "") {
       const { text, ...rest } = o;
       out.push(rest);
       out.push({ type: "text", text });
@@ -249,7 +264,14 @@ export function extractEditableText(verseObjects: unknown): string {
     for (const vo of vos ?? []) {
       if (!vo || typeof vo !== "object") continue;
       const v = vo as Record<string, unknown>;
-      if (isInFlowMarker(v)) {
+      // Character-style wrappers (`\qs Selah\qs*`) are also `type:"quote"`, so
+      // isInFlowMarker matches them — but they hold aligned verse CONTENT, not a
+      // line break. Fall through to the generic text/children recursion below so
+      // the wrapped word (e.g. "Selah") lands in the editable baseline and lines
+      // up with the raw tree. Emitting a literal `\qs` token here instead (and
+      // not recursing) hid "Selah" from the diff baseline — an edit elsewhere in
+      // the verse then dropped it, and deleting the token unaligned the verse.
+      if (isInFlowMarker(v) && !isCharacterWrapper(v)) {
         if (v["tag"] === "ts") {
           parts.push("\\ts\\* ");
         } else {
