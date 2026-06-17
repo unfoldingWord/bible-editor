@@ -536,6 +536,120 @@ function milestoneCount(content) {
   assert(alignedWords(r.content).find((x) => x.text === "Behold")?.strongs.includes("H2"), "'Behold' keeps its alignment");
 }
 
+// ─── Case 25: a space typed INSIDE an aligned word keeps the whole verse aligned ─
+// The "felt bug": inserting a space (or any non-word char) mid-word used to
+// partially overlap the \w leaf NESTED inside a \zaln milestone, which bailed
+// to a whole-verse flat tokenize — every milestone in the verse vanished.
+// Now the straddling leaf is split in place, so only the touched word's
+// milestone splits and every OTHER milestone survives.
+{
+  console.log("\n[Case 25] Mid-word space keeps every other milestone aligned");
+  const verse = {
+    verseObjects: [
+      zaln("H1", [w("alpha")]), t(" "),
+      zaln("H2", [w("beta")]), t(" "),
+      zaln("H3", [w("gamma")]),
+    ],
+  };
+  const r = smartEditVerse(verse, "alpha beta gamma", "alpha be ta gamma");
+  assert(r.plainText === "alpha be ta gamma", `plainText is "alpha be ta gamma" (got ${JSON.stringify(r.plainText)})`);
+  assert(milestoneCount(r.content) >= 3, `no full unalign — at least the 3 source milestones survive (got ${milestoneCount(r.content)})`);
+  const words = alignedWords(r.content);
+  assert(words.find((x) => x.text === "alpha")?.strongs.includes("H1"), "untouched 'alpha' keeps alignment");
+  assert(words.find((x) => x.text === "gamma")?.strongs.includes("H3"), "untouched 'gamma' keeps alignment");
+  // The split fragments stay inside the original milestone (still aligned).
+  assert(words.find((x) => x.text === "be")?.strongs.includes("H2"), "split 'be' fragment stays aligned to H2");
+  assert(words.find((x) => x.text === "ta")?.strongs.includes("H2"), "split 'ta' fragment stays aligned to H2");
+}
+
+// ─── Case 26: a bracket typed inside an aligned word keeps the verse aligned ─
+{
+  console.log("\n[Case 26] Mid-word bracket keeps every other milestone aligned");
+  const verse = {
+    verseObjects: [
+      zaln("H1", [w("alpha")]), t(" "),
+      zaln("H2", [w("beta")]), t(" "),
+      zaln("H3", [w("gamma")]),
+    ],
+  };
+  const r = smartEditVerse(verse, "alpha beta gamma", "alpha be{ta gamma");
+  assert(r.plainText === "alpha be{ta gamma", `the bracket survives (got ${JSON.stringify(r.plainText)})`);
+  const words = alignedWords(r.content);
+  assert(words.find((x) => x.text === "alpha")?.strongs.includes("H1"), "untouched 'alpha' keeps alignment");
+  assert(words.find((x) => x.text === "gamma")?.strongs.includes("H3"), "untouched 'gamma' keeps alignment");
+  // The inserted "{" is a bare (unaligned) text/token between the fragments.
+  assert(milestoneCount(r.content) >= 3, `no full unalign (got ${milestoneCount(r.content)})`);
+}
+
+// ─── Case 27: mid-word edit inside a COMPOUND (nested) milestone preserves it ─
+// The straddling-leaf split must recurse through nested \zaln-s so a mid-word
+// edit inside the inner phrase doesn't collapse the outer alignment either.
+{
+  console.log("\n[Case 27] Mid-word edit inside nested \\zaln-s keeps both ancestors");
+  const r = smartEditVerse(makeNested(), "on that day.", "on th at day.");
+  assert(r.plainText === "on th at day.", `plainText is "on th at day." (got ${JSON.stringify(r.plainText)})`);
+  const words = alignedWords(r.content);
+  assert(words.find((x) => x.text === "on")?.strongs.join() === "H1,H2", "'on' keeps BOTH nested ancestors");
+  assert(words.find((x) => x.text === "day")?.strongs.join() === "H1,H2", "'day' keeps BOTH nested ancestors");
+  // Split fragments of "that" keep both ancestors too (not flattened to bare).
+  assert(words.find((x) => x.text === "th")?.strongs.join() === "H1,H2", "split 'th' keeps both nested ancestors");
+  assert(words.find((x) => x.text === "at")?.strongs.join() === "H1,H2", "split 'at' keeps both nested ancestors");
+}
+
+// ─── Case 28: inserting a word BEFORE an aligned word keeps the neighbour ─────
+// The dominant collateral-unalign bug: inserting "truly" before "the" diffs
+// (because both start with "t") as a mid-"the" straddle; snap then absorbed the
+// untouched "the" and re-tokenized it UNALIGNED. canonicalizePureInsertion
+// slides the insertion onto the word boundary first, so only the new word is
+// unaligned and every existing word keeps its alignment.
+{
+  console.log("\n[Case 28] Inserting a word before an aligned neighbour keeps the neighbour aligned");
+  const verse = {
+    verseObjects: [
+      zaln("H1", [w("In")]), t(" "),
+      zaln("H2", [w("the")]), t(" "),
+      zaln("H3", [w("day")]),
+    ],
+  };
+  const r = smartEditVerse(verse, "In the day", "In truly the day");
+  assert(r.plainText === "In truly the day", `plainText is "In truly the day" (got ${JSON.stringify(r.plainText)})`);
+  const words = alignedWords(r.content);
+  assert(words.find((x) => x.text === "In")?.strongs.includes("H1"), "'In' keeps alignment");
+  assert(words.find((x) => x.text === "the")?.strongs.includes("H2"), "untouched 'the' keeps alignment (was the bug)");
+  assert(words.find((x) => x.text === "day")?.strongs.includes("H3"), "'day' keeps alignment");
+  assert(words.find((x) => x.text === "truly")?.strongs.length === 0, "inserted 'truly' is unaligned");
+}
+
+// ─── Case 29: one→two word edit ("angry" → "also angry") keeps "angry" ─────────
+// Same family via the 1→2 word path: the minimal diff aliases on the shared
+// leading "a"; without canonicalization "angry" unaligned even though only
+// "also" was added in front of it.
+{
+  console.log("\n[Case 29] Adding a word in front of an aligned word keeps that word aligned");
+  const verse = {
+    verseObjects: [zaln("H1", [w("was")]), t(" "), zaln("H2", [w("angry")])],
+  };
+  const r = smartEditVerse(verse, "was angry", "was also angry");
+  assert(r.plainText === "was also angry", `plainText is "was also angry" (got ${JSON.stringify(r.plainText)})`);
+  const words = alignedWords(r.content);
+  assert(words.find((x) => x.text === "was")?.strongs.includes("H1"), "'was' keeps alignment");
+  assert(words.find((x) => x.text === "angry")?.strongs.includes("H2"), "untouched 'angry' keeps alignment (was the bug)");
+  assert(words.find((x) => x.text === "also")?.strongs.length === 0, "inserted 'also' is unaligned");
+}
+
+// ─── Case 30: canonicalization must NOT break a genuine word-extension ─────────
+// Guard: "Th" typed before "is" still snaps to one word "This" (no aliased
+// non-straddling position exists), and a digit against a number still extends.
+{
+  console.log("\n[Case 30] Genuine word-extensions still snap (canonicalization is a no-op for them)");
+  const r1 = smartEditVerse({ verseObjects: [zaln("H1", [w("is")])] }, "is", "This");
+  const w1 = alignedWords(r1.content).map((x) => x.text);
+  assert(r1.plainText === "This" && w1.length === 1 && w1[0] === "This", `"Th"+"is" → one "This" (got ${JSON.stringify(w1)})`);
+  const r2 = smartEditVerse({ verseObjects: [zaln("H1", [w("weighs")]), t(" "), zaln("H2", [w("0")])] }, "weighs 0", "weighs 30");
+  const w2 = alignedWords(r2.content).map((x) => x.text);
+  assert(w2.includes("30") && !w2.includes("3"), `digit extends "0"→"30" as one token (got ${JSON.stringify(w2)})`);
+}
+
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed.`);
   process.exit(1);

@@ -661,6 +661,54 @@ function snapDiffToWordBoundaries(
   return { start, oldLen: end - start, newSubstring: newText.slice(start, newEnd) };
 }
 
+// A pure insertion has a RANGE of equivalent positions: the inserted block can
+// be slid left/right wherever its rotation leaves the result string unchanged.
+// diffSingleChange always reports the rightmost such position (it maximizes the
+// common prefix). When the inserted text shares a boundary letter with the next
+// word, that rightmost position lands MID-word — e.g. inserting "truly " before
+// "the" reports `insert "ruly t"` straddling "the" (both start with "t"). snap
+// then absorbs the whole "the" into the change, so the localized rewrite re-
+// tokenizes "the" UNALIGNED even though the translator only added a word in
+// front of it. (Measured: the dominant collateral-unalign family.)
+//
+// Fix: for a pure insertion, slide the block across all its equivalent
+// positions and prefer one where it does NOT straddle a token — using snap
+// itself as the straddle oracle (snap leaves a non-straddling insertion
+// unchanged). A genuine word-extension ("Th" before "is" → "This", a digit
+// against a number, a grouping comma) has NO non-straddling position, so it
+// falls through to the original diff and snap handles it exactly as before.
+function canonicalizePureInsertion(
+  oldText: string,
+  newText: string,
+  diff: { start: number; oldLen: number; newSubstring: string },
+): { start: number; oldLen: number; newSubstring: string } {
+  if (diff.oldLen !== 0 || diff.newSubstring.length === 0) return diff;
+  const candidates: { start: number; oldLen: number; newSubstring: string }[] = [];
+  // Slide left: valid while the block's last char equals the char before it.
+  let s = diff.start;
+  let b = diff.newSubstring;
+  candidates.push({ start: s, oldLen: 0, newSubstring: b });
+  while (s > 0 && b[b.length - 1] === oldText[s - 1]) {
+    b = oldText[s - 1] + b.slice(0, -1);
+    s--;
+    candidates.push({ start: s, oldLen: 0, newSubstring: b });
+  }
+  // Slide right: valid while the block's first char equals the char after it.
+  s = diff.start;
+  b = diff.newSubstring;
+  while (s < oldText.length && b[0] === oldText[s]) {
+    b = b.slice(1) + oldText[s];
+    s++;
+    candidates.push({ start: s, oldLen: 0, newSubstring: b });
+  }
+  // A position is "clean" when snap finds no token to absorb on either side.
+  for (const c of candidates) {
+    const snapped = snapDiffToWordBoundaries(oldText, newText, c);
+    if (snapped.oldLen === 0 && snapped.start === c.start) return c;
+  }
+  return diff;
+}
+
 // A stable signature of the inline-marker layout: each marker's tag and the
 // number of words that precede it (whitespace-robust). Equal signatures mean
 // the markers weren't touched, so the marker reconcile can be skipped; a
@@ -864,7 +912,12 @@ export function smartEditVerse(
       // A word-extending insertion ("Th" typed before "is") diffs as a pure
       // insert; snap it to the adjacent word so it routes through the in-place
       // word-replace path instead of emitting a standalone \w. (ZEC 5:3.)
-      const diff = snapDiffToWordBoundaries(oldStripped, newStripped, rawDiff);
+      // First canonicalize the insertion off any aliased mid-word position so
+      // snap only fires for a TRUE word-extension — otherwise inserting a word
+      // in front of an aligned neighbour ("truly " before "the") unaligns the
+      // untouched neighbour.
+      const canon = canonicalizePureInsertion(oldStripped, newStripped, rawDiff);
+      const diff = snapDiffToWordBoundaries(oldStripped, newStripped, canon);
       // Word-count-match preserve path lives in smartReplaceVerse.
       if (diff.oldLen > 0) {
         const matchText = oldStripped.slice(diff.start, diff.start + diff.oldLen);
@@ -938,9 +991,10 @@ function rawTextOfNode(node: unknown): string {
 // child that is itself a milestone / wrapper (nested \zaln-s compound
 // alignment) recurses, splitting into before/after halves like the outer
 // walk so its descendants outside the range keep their alignment. An
-// overlapping leaf is dropped (its content is replaced by the tokenized
-// newSubstring in the outer walk) — the splitsNestedLeaf guard upstream
-// guarantees it lies wholly inside the change range.
+// overlapping leaf is SPLIT at the change boundary: the text before the
+// change stays in `before`, the text after stays in `after`, each still
+// inside this milestone so it keeps its source alignment (the replaced
+// middle is dropped — the outer walk re-emits the new text there).
 function partitionMilestoneChildren(
   milestoneNode: Record<string, unknown>,
   milestoneStart: number,
@@ -962,12 +1016,29 @@ function partitionMilestoneChildren(
       after.push(child);
     } else {
       const c = child as Record<string, unknown> | null;
-      if (c && Array.isArray(c["children"]) && (c["children"] as unknown[]).length > 0) {
+      if (!c) continue;
+      if (Array.isArray(c["children"]) && (c["children"] as unknown[]).length > 0) {
         const inner = partitionMilestoneChildren(c, childStart, rawStart, rawEnd);
         if (inner.before.length > 0) before.push({ ...c, children: inner.before });
         if (inner.after.length > 0) after.push({ ...c, children: inner.after });
+      } else {
+        // Overlapping leaf — split it instead of dropping the whole thing.
+        // Keeping the unchanged fragments inside this milestone is what stops
+        // a mid-word edit (a space / bracket typed inside an aligned word)
+        // from flattening the WHOLE verse: only the touched word's milestone
+        // is split; every other milestone survives. A \w fragment is re-
+        // tokenized so it stays a word; a text fragment stays text. A leaf
+        // wholly inside the range yields two empty fragments and is dropped.
+        const text = String(c["text"] ?? "");
+        const beforeText = text.slice(0, Math.max(0, rawStart - childStart));
+        const afterText = text.slice(Math.max(0, rawEnd - childStart));
+        const frag = (s: string): unknown[] =>
+          c["type"] === "word" && c["tag"] === "w"
+            ? tokenizePlainText(s)
+            : [{ type: "text", text: s }];
+        if (beforeText) for (const n of frag(beforeText)) before.push(n);
+        if (afterText) for (const n of frag(afterText)) after.push(n);
       }
-      // Overlapping leaves are dropped — the change region replaces them.
     }
   }
   return { before, after };
@@ -1049,29 +1120,12 @@ function localizedRewriteVerse(
   }
   const rawEnd = rawStart + rawLen;
 
-  // Text-correctness guard. The partition walk recurses into overlapping
-  // milestone children, but any LEAF whose extent overlaps the change is
-  // dropped wholly, replaced by the tokenized newSubstring. If a NESTED
-  // leaf (depth > 0, i.e. inside a milestone) is only PARTIALLY overlapped,
-  // the unchanged half of that leaf's text would disappear from the saved
-  // verse. Top-level text leaves are fine — the per-node walk splits them
-  // at the boundary.
-  // Losing alignment is bad; losing user text they just typed is worse.
-  const { leaves } = walkLeaves(cloned);
-  const splitsNestedLeaf = leaves.some((l) => {
-    if (l.depth === 0) return false;
-    const startsInside = l.start < rawStart && l.end > rawStart;
-    const endsInside = l.start < rawEnd && l.end > rawEnd;
-    return startsInside || endsInside;
-  });
-  if (splitsNestedLeaf) {
-    const newPlain = oldPlain.slice(0, start) + newSubstring + oldPlain.slice(start + oldLen);
-    return {
-      content: { verseObjects: tokenizeEditableText(newPlain) },
-      plainText: normalize(newPlain),
-      preservedAlignment: false,
-    };
-  }
+  // A nested leaf (a \w / text inside a milestone) that the change only
+  // partially overlaps is no longer a problem: partitionMilestoneChildren
+  // splits it at the boundary, so its unchanged text survives AND the
+  // surrounding milestones keep their alignment. (This used to bail to a
+  // whole-verse flat tokenize — "keep text, lose all alignment" — which is
+  // exactly what made a mid-word space / bracket unalign the entire verse.)
 
   const out: unknown[] = [];
   let emittedChange = false;
