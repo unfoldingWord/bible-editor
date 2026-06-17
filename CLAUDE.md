@@ -13,6 +13,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - We are intentionally rethinking the backend to remove DCS from the loop except for once daily.
 - Volta-pinned: Node 24.15.0, npm 11.12.1. npm workspaces (`api/`, `web/`).
 
+## Session state — read first, update last
+
+[`.claude/STATE.md`](.claude/STATE.md) is the persistent loop state: what just shipped, what's mid-flight, what's blocked on a human, and durable lessons that aren't in the code. **The agent forgets between sessions; this file does not.**
+
+- **At the start of non-trivial work:** read `.claude/STATE.md` so you resume rather than restart. It complements the standing spec (this file + `docs/plan.md`): state says where the work is, the spec says where it's going.
+- **Before you finish:** update it. Move shipped work into **Completed**, record anything blocked under **Escalated**, and write durable cross-session facts under **Lessons learned** (there, not in chat). Bump **Last run**.
+- **Parallel worktrees:** the dated sections are append-only and newest-first, so merge conflicts resolve by keeping both sides. The canonical copy lives on `main` — rebase before relying on it. Don't delete other branches' entries.
+
 ## Before planning, and again before executing
 
 Multiple worktrees may be active in parallel. Twice — once before writing the plan, and again immediately after the plan is approved and before any edits — run:
