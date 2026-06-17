@@ -14,10 +14,22 @@
 
 ## Last run
 
-2026-06-17 · Established this state file. Seeded from recent merged PRs + the memory index.
+2026-06-17 · **goofy-ptolemy** — Root-cause fix: Shell no longer remounts on chapter nav.
+App.tsx keys Shell on `book` only (was `book-chapter-verse`); a new Shell effect keyed on
+`[chapter, initialVerse]` (skips initial mount) resets the per-chapter transient state the
+remount used to clear (activeVerse/Note/Word, aligner + dual panels, their dirty/pending gates,
+panelMode). useChapter keeps prior `data` during the fetch, so cross-chapter nav now has no
+loading flash and find + book view survive. Removed the now-redundant `findSession.ts` singleton
+(added in #220/#221) and reverted its seeds in FindReplaceOverlay/ScriptureColumn; KEPT the
+`activeChapter` cross-chapter auto-jump suppression. Verified live (Playwright, all 3 modes):
+full ZEC "year" walk crosses ch1→7 with find box persisting + book view intact, aligner closes
+cleanly on nav with no stuck gate, back/forward + deep-link land correctly. typecheck clean.
+Not yet PR'd.
 
 ## In progress
 
+- **goofy-ptolemy** — Shell-remount root-cause fix (see Last run). Branch
+  `claude/goofy-ptolemy-e9369f`. Ready for PR.
 - **trusting-galileo** (PR #220) — Find in book mode: two fixes for cross-chapter notes remounting Shell
   (Shell is keyed on book/chapter/verse in App.tsx, and the resource column is bound to one chapter via
   useChapter, so a cross-chapter note jump goes through the URL and remounts). (1) Auto-jump-to-first-match
