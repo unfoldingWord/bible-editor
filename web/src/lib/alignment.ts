@@ -550,6 +550,18 @@ export function verseHasUnalignedWork(
   return state.groups.some((g) => g.targets.length === 0);
 }
 
+// Count of unaligned TARGET words — the same metric the aligner's "N unaligned"
+// badge shows (AlignmentPanel reads `state.unaligned.length`). Source-independent:
+// it counts `\w` words with no enclosing `\zaln-s` milestone, so it needs no UHB/
+// UGNT side. Used by the save path to tell the editor when an edit just left
+// words unaligned (a text edit to a word drops that word's alignment by design).
+export function countUnalignedTargetWords(
+  targetVerseObjects: unknown[] | null | undefined,
+): number {
+  if (!Array.isArray(targetVerseObjects)) return 0;
+  return parseAlignment(targetVerseObjects, null).unaligned.length;
+}
+
 interface CollectedSourceWord {
   position: number;
   strong: string;

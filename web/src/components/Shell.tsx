@@ -25,7 +25,7 @@ import type { ChapterPayload, TnRow, TqRow, TwlRow, VerseDto } from "../sync/api
 import { drafts, verseKey } from "../sync/drafts";
 import { smartEditVerse } from "../lib/replace";
 import { extractEditableText, extractPlainText, normalizeEditable, SECTION_HEADER_TAGS } from "../lib/usfm";
-import { verseHasUnalignedWork } from "../lib/alignment";
+import { verseHasUnalignedWork, countUnalignedTargetWords } from "../lib/alignment";
 import { buildVerseIndex, concatSourceRange, formatVerseLabel } from "../lib/verseRange";
 import { buildTnQuickRequest } from "../lib/tnQuickRequest";
 import { findSourceForTargetText, type HighlightKey, type ReorderHighlight } from "../lib/highlight";
@@ -1288,6 +1288,29 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       return;
     }
     const result = smartEditVerse(base.content, oldEditable, plain);
+    // Heads-up when this save drops alignment. Editing a word's text or order
+    // unaligns that word by design — the engine preserves only the words it
+    // didn't have to touch — and the loss is otherwise easy to miss: the editor
+    // shows plain text, so a translator who reworded a phrase and saved gets no
+    // in-place signal that they now have words to re-align (the prompt that led
+    // here: a verse reworded + repunctuated in one save came back with several
+    // words unaligned, read as "changing the period unaligned them"). Compare
+    // the unaligned-word count before vs after and notify only when it actually
+    // INCREASED, so a pure punctuation / spacing edit — which keeps every \zaln —
+    // stays silent.
+    const beforeUnaligned = countUnalignedTargetWords(
+      (base.content as { verseObjects?: unknown[] } | null)?.verseObjects,
+    );
+    const afterUnaligned = countUnalignedTargetWords(
+      (result.content as { verseObjects?: unknown[] } | null)?.verseObjects,
+    );
+    const newlyUnaligned = afterUnaligned - beforeUnaligned;
+    if (newlyUnaligned > 0) {
+      pushPipelineToast(
+        `This edit left ${newlyUnaligned} word${newlyUnaligned > 1 ? "s" : ""} unaligned in ${book} ${chapterNum}:${verseNum} ${bibleVersion} — re-align in the Alignment panel.`,
+        "info",
+      );
+    }
     const newPlainText = extractPlainText(result.content);
     const newDto = {
       ...base,
