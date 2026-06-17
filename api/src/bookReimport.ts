@@ -64,6 +64,9 @@ const WRITE_BATCH = 90;
 export interface ReimportCounts {
   updated: number;
   inserted: number;
+  // Pristine rows soft-deleted because master no longer carries their id. Only
+  // the TSV resources populate this (verses are never row-deleted on reimport).
+  deleted: number;
   skipped_edited: number;
   skipped_locked: number;
   skipped_noop: number;
@@ -83,6 +86,7 @@ function zeroCounts(): ReimportCounts {
   return {
     updated: 0,
     inserted: 0,
+    deleted: 0,
     skipped_edited: 0,
     skipped_locked: 0,
     skipped_noop: 0,
@@ -94,6 +98,7 @@ function zeroCounts(): ReimportCounts {
 function addCounts(into: ReimportCounts, from: ReimportCounts): void {
   into.updated += from.updated;
   into.inserted += from.inserted;
+  into.deleted += from.deleted;
   into.skipped_edited += from.skipped_edited;
   into.skipped_locked += from.skipped_locked;
   into.skipped_noop += from.skipped_noop;
@@ -219,6 +224,27 @@ async function runReimport(
     if (want.has("ust") && ustRaw) {
       const c = await reimportVersesForChapter(env, book, chapter, ustRaw, "UST", userId);
       addCounts(perResource.ust, c);
+    }
+  }
+
+  // Soft-delete pristine rows whose ids master no longer carries — for the
+  // chapters this run touched. The nightly runChunkedReimport already does
+  // this; the user-triggered path must too, or an out-of-band master deletion
+  // (e.g. a Zulip-run AI rewrite that replaced a verse's notes with new ids,
+  // imported via this route) leaves the old ids orphaned in D1 with no human
+  // edit to protect them — they then export back onto master as resurrected
+  // rows. softDeleteRemovedTsvRows compares against the WHOLE file's id set and
+  // only touches pristine rows in covered chapters (see its guardrails).
+  const tsvRawByKind: Record<TsvKind, string | null> = { tn: tnRaw, tq: tqRaw, twl: twlRaw };
+  for (const kind of ["tn", "tq", "twl"] as TsvKind[]) {
+    const raw = tsvRawByKind[kind];
+    if (!want.has(kind) || !raw) continue;
+    try {
+      const res = await softDeleteRemovedTsvRows(env, book, kind, raw, chapters);
+      perResource[kind].deleted += res.deleted;
+      perResource[kind].skipped_locked += res.skippedLocked;
+    } catch (e) {
+      perResource[kind].errors.push(`${kind} prune: ${e instanceof Error ? e.message : String(e)}`);
     }
   }
 
