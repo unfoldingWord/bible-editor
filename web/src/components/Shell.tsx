@@ -1041,6 +1041,16 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           expectedVersion,
           { content, plain_text: plain },
         );
+        // Optimistically fold the new alignment into the local chapter cache so
+        // content-derived UI (the broken-alignment link, OL-anchored note
+        // highlights) updates immediately instead of waiting for a refetch.
+        // Mirrors the verse-text / section save paths; the outbox 200 handler
+        // bumps the version, so we keep targetVerse's version here.
+        if (targetVerse) {
+          const newDto = { ...targetVerse, content, plain_text: plain } as VerseDto;
+          bookHook?.applyLocalVerse(newDto);
+          if (alignerTarget.chapter === chapter) applyLocalVerse(newDto);
+        }
       },
       onCancel: () => {
         setPanelMode("resources");
@@ -1049,7 +1059,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       panelRef: alignmentPanelRef,
       onOpenDual: () => openDualAligner(alignerTarget.chapter, alignerTarget.verse),
     };
-  }, [alignerTarget, data, chapter, bookHook, book, openDualAligner]);
+  }, [alignerTarget, data, chapter, bookHook, book, openDualAligner, applyLocalVerse]);
 
   // Props for the side-by-side popup: ULT + UST slices against one shared
   // source. Undefined (popup closed) unless a dualTarget is set and at least
@@ -1106,6 +1116,11 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           expectedVersion,
           { content, plain_text: plain },
         );
+        // Optimistic local update so content-derived UI (the broken-alignment
+        // link) refreshes immediately — same as the single-panel aligner.
+        const newDto = { ...row, content, plain_text: plain } as VerseDto;
+        bookHook?.applyLocalVerse(newDto);
+        if (dualTarget.chapter === chapter) applyLocalVerse(newDto);
       };
     const left: PanelSlot = {
       bibleVersion: "ULT",
@@ -1142,7 +1157,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       left,
       right,
     };
-  }, [dualTarget, data, chapter, bookHook, book]);
+  }, [dualTarget, data, chapter, bookHook, book, applyLocalVerse]);
 
   // Prev/next verse for the dual aligner's titlebar arrows, within the current
   // chapter's verse list (excluding the intro tile). Null at the ends.
