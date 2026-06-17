@@ -9,10 +9,9 @@
 // column alignment, which is what makes find/replace and side-by-side
 // comparison readable when the scroll spans an entire book.
 
-import { Fragment, memo, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Box, Stack, Typography, IconButton, Tooltip, CircularProgress } from "@mui/material";
 import SaveIcon from "@mui/icons-material/Save";
-import SaveOutlinedIcon from "@mui/icons-material/SaveOutlined";
 import UndoIcon from "@mui/icons-material/Undo";
 import type { TwlRow, VerseDto } from "../sync/api";
 import type { ChapterState } from "../hooks/useBook";
@@ -127,42 +126,9 @@ export function BookView({
   // see the scroll effect below.
   const [scrollPending, setScrollPending] = useState(false);
 
-  // Per-bibleVersion dirty count for the header save buttons. Each value is
-  // the list of drafts for that column (across all chapters in book mode).
-  const [draftsByVersion, setDraftsByVersion] = useState<Map<string, Array<{ chapter: number; verse: number; plain: string }>>>(() => new Map());
-  useEffect(() => {
-    return drafts.subscribe((all) => {
-      const next = new Map<string, Array<{ chapter: number; verse: number; plain: string }>>();
-      for (const d of all) {
-        if (d.meta.kind !== "verse") continue;
-        if (d.meta.book !== book) continue;
-        const plain = (d.payload as { plainText?: unknown }).plainText;
-        if (typeof plain !== "string") continue;
-        const list = next.get(d.meta.bibleVersion) ?? [];
-        list.push({ chapter: d.meta.chapter, verse: d.meta.verse, plain });
-        next.set(d.meta.bibleVersion, list);
-      }
-      // drafts.subscribe fires for every draft write anywhere (row drafts
-      // from note typing included) — bail out when the derived map is
-      // content-equal so those keystrokes don't re-render the whole book.
-      setDraftsByVersion((prev) => (draftMapsEqual(prev, next) ? prev : next));
-    });
-  }, [book]);
-
-  const handleSaveVersion = (bv: string) => {
-    const list = draftsByVersion.get(bv);
-    if (!list || list.length === 0) return;
-    const payload: Array<{ chapter: number; verse: number; plain: string; base: VerseDto }> = [];
-    for (const d of list) {
-      const base = chapters.get(d.chapter);
-      if (!base || base.kind !== "ready") continue;
-      const dto = base.data.verses[bv]?.[d.verse];
-      if (!dto) continue;
-      payload.push({ chapter: d.chapter, verse: d.verse, plain: d.plain, base: dto });
-    }
-    if (payload.length === 0) return;
-    onSaveColumn(bv, payload);
-  };
+  const handleSaveVerse = useCallback((bv: string, ch: number, v: number, plain: string, base: VerseDto) => {
+    onSaveColumn(bv, [{ chapter: ch, verse: v, plain, base }]);
+  }, [onSaveColumn]);
 
   // Scroll the active verse into view — on navigation (activeChapter /
   // activeVerse) and on the toolbar "go to active" click (scrollNonce).
@@ -245,49 +211,43 @@ export function BookView({
         <Typography variant="caption" sx={{ fontFamily: "monospace", color: "primary.main", fontWeight: 700 }}>
           {book} · book
         </Typography>
-        {enabledVersions.map((v) => {
-          const dirty = (draftsByVersion.get(v)?.length ?? 0);
-          const isReadOnly = READ_ONLY.has(v) || locked;
-          return (
-            <Stack key={v} direction="row" alignItems="center" spacing={0.25}>
-              <Typography
-                variant="caption"
-                sx={{ fontFamily: "monospace", color: "text.secondary", textTransform: "uppercase", letterSpacing: 0.5 }}
-              >
-                {v}{isReadOnly ? " (ro)" : ""}
-              </Typography>
-              {!isReadOnly && (
-                <Tooltip
-                  title={
-                    dirty === 0
-                      ? `no unsaved edits in ${v}`
-                      : `save ${dirty} unsaved verse${dirty === 1 ? "" : "s"} in ${v}`
-                  }
-                >
-                  <span>
-                    <IconButton
-                      size="small"
-                      disabled={dirty === 0}
-                      onClick={() => handleSaveVersion(v)}
-                      sx={{ p: 0.25, color: dirty > 0 ? "primary.main" : "action.disabled" }}
-                    >
-                      {dirty > 0 ? (
-                        <SaveIcon fontSize="inherit" />
-                      ) : (
-                        <SaveOutlinedIcon fontSize="inherit" />
-                      )}
-                    </IconButton>
-                  </span>
-                </Tooltip>
-              )}
-            </Stack>
-          );
-        })}
         <Box sx={{ flex: 1 }} />
         <Typography variant="caption" color="text.disabled">
           {chapterList.length} ch · loaded {countLoaded(chapters)}
         </Typography>
       </Stack>
+      <Box
+        sx={{
+          display: "grid",
+          gridTemplateColumns,
+          gap: 1,
+          px: 1.5,
+          py: 0.5,
+          borderBottom: "1px solid",
+          borderColor: "divider",
+          bgcolor: "primary.50",
+          flexShrink: 0,
+        }}
+      >
+        {enabledVersions.map((v) => {
+          const isReadOnly = READ_ONLY.has(v) || locked;
+          return (
+            <Typography
+              key={v}
+              variant="caption"
+              sx={{
+                fontFamily: "monospace",
+                color: isReadOnly ? "text.secondary" : "primary.main",
+                fontWeight: 700,
+                textTransform: "uppercase",
+                letterSpacing: 0.5,
+              }}
+            >
+              {v}{isReadOnly ? " (ro)" : ""}
+            </Typography>
+          );
+        })}
+      </Box>
       <Box
         ref={containerRef}
         sx={(theme) => ({
@@ -328,6 +288,7 @@ export function BookView({
               onLoadChapter={onLoadChapter}
               onSelectVerse={onSelectVerse}
               onEditVerse={onEditVerse}
+              onSaveVerse={handleSaveVerse}
               onOpenAligner={onOpenAligner}
               onEditSection={onEditSection}
               locked={locked}
@@ -343,26 +304,6 @@ function countLoaded(chapters: Map<number, ChapterState>): number {
   let n = 0;
   for (const s of chapters.values()) if (s.kind === "ready") n++;
   return n;
-}
-
-type VersionDrafts = Map<string, Array<{ chapter: number; verse: number; plain: string }>>;
-
-function draftMapsEqual(a: VersionDrafts, b: VersionDrafts): boolean {
-  if (a.size !== b.size) return false;
-  for (const [k, av] of a) {
-    const bl = b.get(k);
-    if (!bl || bl.length !== av.length) return false;
-    for (let i = 0; i < av.length; i++) {
-      if (
-        av[i].chapter !== bl[i].chapter ||
-        av[i].verse !== bl[i].verse ||
-        av[i].plain !== bl[i].plain
-      ) {
-        return false;
-      }
-    }
-  }
-  return true;
 }
 
 // Memoized (with VerseRow / VerseCell below) so the per-keystroke BookView
@@ -389,6 +330,7 @@ const ChapterBlock = memo(function ChapterBlock({
   onLoadChapter,
   onSelectVerse,
   onEditVerse,
+  onSaveVerse,
   onOpenAligner,
   onEditSection,
   locked,
@@ -411,6 +353,7 @@ const ChapterBlock = memo(function ChapterBlock({
   onLoadChapter: (ch: number) => void;
   onSelectVerse: (chapter: number, verse: number) => void;
   onEditVerse: (chapter: number, verse: number, bibleVersion: string, plain: string, base: VerseDto) => void;
+  onSaveVerse: (bv: string, chapter: number, verse: number, plain: string, base: VerseDto) => void;
   onOpenAligner: (chapter: number, verse: number, bibleVersion: string) => void;
   onEditSection?: (
     chapter: number,
@@ -549,6 +492,7 @@ const ChapterBlock = memo(function ChapterBlock({
             twl={data.twl}
             onSelectVerse={onSelectVerse}
             onEditVerse={onEditVerse}
+            onSaveVerse={onSaveVerse}
             onOpenAligner={onOpenAligner}
             onEditSection={onEditSection}
             locked={locked}
@@ -579,6 +523,7 @@ const VerseRow = memo(function VerseRow({
   twl,
   onSelectVerse,
   onEditVerse,
+  onSaveVerse,
   onOpenAligner,
   onEditSection,
   locked,
@@ -600,6 +545,7 @@ const VerseRow = memo(function VerseRow({
   twl: TwlRow[];
   onSelectVerse: (chapter: number, verse: number) => void;
   onEditVerse: (chapter: number, verse: number, bibleVersion: string, plain: string, base: VerseDto) => void;
+  onSaveVerse: (bv: string, chapter: number, verse: number, plain: string, base: VerseDto) => void;
   onOpenAligner: (chapter: number, verse: number, bibleVersion: string) => void;
   onEditSection?: (
     chapter: number,
@@ -664,6 +610,7 @@ const VerseRow = memo(function VerseRow({
               twl={twl}
               onOpenAligner={onOpenAligner}
               onEditVerse={onEditVerse}
+              onSaveVerse={onSaveVerse}
               onEditSection={onEditSection}
               locked={locked}
             />
@@ -693,6 +640,7 @@ const VerseCell = memo(function VerseCell({
   twl,
   onOpenAligner,
   onEditVerse,
+  onSaveVerse,
   onEditSection,
   locked,
 }: {
@@ -719,6 +667,7 @@ const VerseCell = memo(function VerseCell({
   twl: TwlRow[];
   onOpenAligner: (chapter: number, verse: number, bibleVersion: string) => void;
   onEditVerse: (chapter: number, verse: number, bibleVersion: string, plain: string, base: VerseDto) => void;
+  onSaveVerse: (bv: string, chapter: number, verse: number, plain: string, base: VerseDto) => void;
   onEditSection?: (
     chapter: number,
     verse: number,
@@ -979,6 +928,20 @@ const VerseCell = memo(function VerseCell({
             sx={{ color: "warning.main", p: 0.25, verticalAlign: "-3px" }}
           >
             <UndoIcon sx={{ fontSize: 14 }} />
+          </IconButton>
+        </Tooltip>
+      )}
+      {!readOnly && hasDraft && dto && (
+        <Tooltip title={`save verse ${verseNum}`}>
+          <IconButton
+            onClick={(e) => {
+              e.stopPropagation();
+              onSaveVerse(bibleVersion, chapter, verseNum, lastTextRef.current, dto);
+            }}
+            size="small"
+            sx={{ color: "primary.main", p: 0.25, verticalAlign: "-3px" }}
+          >
+            <SaveIcon sx={{ fontSize: 14 }} />
           </IconButton>
         </Tooltip>
       )}{" "}

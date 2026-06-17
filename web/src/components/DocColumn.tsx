@@ -1,7 +1,6 @@
 import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import { Box, Stack, Typography, IconButton, Tooltip } from "@mui/material";
 import SaveIcon from "@mui/icons-material/Save";
-import SaveOutlinedIcon from "@mui/icons-material/SaveOutlined";
 import UndoIcon from "@mui/icons-material/Undo";
 import type { TwlRow, VerseDto } from "../sync/api";
 import { highlightsFor, renderEditableHTML, renderHighlightedHTML, type HighlightKey, type ReorderHighlight } from "../lib/highlight";
@@ -122,52 +121,9 @@ export function DocColumn({
   const containerRef = useRef<HTMLDivElement | null>(null);
   const activeRef = useRef<HTMLSpanElement | null>(null);
 
-  // Track per-verse drafts in this column so the header save button knows
-  // what's dirty and how many. Keyed by verseNum so the click handler can
-  // produce the {verseNum, plain, base} list onSaveColumn expects.
-  const [dirtyVerses, setDirtyVerses] = useState<Map<number, string>>(() => new Map());
-  useEffect(() => {
-    if (readOnly) {
-      setDirtyVerses(new Map());
-      return;
-    }
-    return drafts.subscribe((all) => {
-      const next = new Map<number, string>();
-      for (const d of all) {
-        if (d.meta.kind !== "verse") continue;
-        if (
-          d.meta.book !== book ||
-          d.meta.chapter !== chapter ||
-          d.meta.bibleVersion !== bibleVersion
-        ) {
-          continue;
-        }
-        const plain = (d.payload as { plainText?: unknown }).plainText;
-        if (typeof plain === "string") next.set(d.meta.verse, plain);
-      }
-      // drafts.subscribe fires for every draft write anywhere (other
-      // columns, note typing) — bail out when nothing in THIS column
-      // changed so those keystrokes don't re-render the whole column.
-      setDirtyVerses((prev) => (dirtyMapsEqual(prev, next) ? prev : next));
-    });
-  }, [book, chapter, bibleVersion, readOnly]);
-
   useEffect(() => {
     activeRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
   }, [activeVerse, scrollNonce]);
-
-  const handleSaveColumn = () => {
-    const payload: Array<{ verseNum: number; plain: string; base: VerseDto }> = [];
-    for (const [verseNum, plain] of dirtyVerses) {
-      const base = versesByVerseNum[verseNum];
-      if (!base) continue;
-      payload.push({ verseNum, plain, base });
-    }
-    if (payload.length === 0) return;
-    onSaveColumn(payload);
-  };
-
-  const dirtyCount = dirtyVerses.size;
 
   return (
     <Box
@@ -209,33 +165,6 @@ export function DocColumn({
         >
           {bibleVersion} · {readOnly ? "read-only" : "editing"}
         </Typography>
-        {!readOnly && (
-          <Tooltip
-            title={
-              dirtyCount === 0
-                ? "no unsaved edits in this column"
-                : `save ${dirtyCount} unsaved verse${dirtyCount === 1 ? "" : "s"} in ${bibleVersion}`
-            }
-          >
-            <span>
-              <IconButton
-                size="small"
-                disabled={dirtyCount === 0}
-                onClick={handleSaveColumn}
-                sx={{
-                  p: 0.25,
-                  color: dirtyCount > 0 ? "primary.main" : "action.disabled",
-                }}
-              >
-                {dirtyCount > 0 ? (
-                  <SaveIcon fontSize="inherit" />
-                ) : (
-                  <SaveOutlinedIcon fontSize="inherit" />
-                )}
-              </IconButton>
-            </span>
-          </Tooltip>
-        )}
       </Stack>
       <Box
         sx={(theme) => ({
@@ -327,6 +256,7 @@ export function DocColumn({
                 onClick={() => onSelectVerse(dto.verse)}
                 onAlign={() => onOpenAligner(dto.verse)}
                 onEdit={(plain) => onEditVerse(dto.verse, plain, dto)}
+                onSave={(plain) => onSaveColumn([{ verseNum: dto.verse, plain, base: dto }])}
               />
               {/* `\s*` headings live in this verse's trailing verseObjects
                   but introduce the NEXT verse — render the band AFTER the
@@ -352,14 +282,6 @@ export function DocColumn({
       </Box>
     </Box>
   );
-}
-
-function dirtyMapsEqual(a: Map<number, string>, b: Map<number, string>): boolean {
-  if (a.size !== b.size) return false;
-  for (const [k, v] of a) {
-    if (b.get(k) !== v) return false;
-  }
-  return true;
 }
 
 // Locate the verse row immediately preceding `verse` in this column's
@@ -405,6 +327,7 @@ function VerseSpan({
   onClick,
   onAlign,
   onEdit,
+  onSave,
 }: {
   book: string;
   chapter: number;
@@ -441,6 +364,7 @@ function VerseSpan({
   onClick: () => void;
   onAlign: () => void;
   onEdit: (plain: string) => void;
+  onSave: (plain: string) => void;
 }) {
   const isSource = bibleVersion === "UHB" || bibleVersion === "UGNT";
   const activeRange = useMemo<{ start: number; end: number } | null>(() => {
@@ -682,6 +606,20 @@ function VerseSpan({
             sx={{ color: "warning.main", p: 0.25, verticalAlign: "-3px" }}
           >
             <UndoIcon sx={{ fontSize: 14 }} />
+          </IconButton>
+        </Tooltip>
+      )}
+      {!readOnly && hasDraft && (
+        <Tooltip title={`save verse ${verseNum}`}>
+          <IconButton
+            onClick={(e) => {
+              e.stopPropagation();
+              onSave(lastTextRef.current);
+            }}
+            size="small"
+            sx={{ color: "primary.main", p: 0.25, verticalAlign: "-3px" }}
+          >
+            <SaveIcon sx={{ fontSize: 14 }} />
           </IconButton>
         </Tooltip>
       )}{" "}
