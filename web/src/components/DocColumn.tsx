@@ -617,7 +617,7 @@ function VerseSpan({
               onSave(lastTextRef.current);
             }}
             size="small"
-            sx={{ color: "primary.main", p: 0.25, verticalAlign: "-3px" }}
+            sx={{ color: "primary.main", p: 0.25, ml: 0.75, verticalAlign: "-3px" }}
           >
             <SaveIcon sx={{ fontSize: 14 }} />
           </IconButton>
