@@ -75,7 +75,7 @@ npm run tail                                                                 # w
 Web-only:
 
 ```sh
-npm --workspace web run test    # node strip-types runner for src/lib/alignment.test.mjs
+npm --workspace web run test    # strip-types runner: alignment, morph, replace, sourceOccurrences suites
 ```
 
 Importing books / lexicon (from repo root):
@@ -107,7 +107,7 @@ The fetch client in `web/src/sync/api.ts` is the only thing that talks to `/api/
 - D1 SQLite stores tn/tq/twl rows, verses (`content_json` = `usfm-js` per-verse object), lexicon, edit_log audit, pipeline jobs, verse_statuses. Migrations in `api/migrations/`.
 - R2 (`BLOBS`) stores USFM originals + export snapshots.
 - Durable Object `ChapterRoom` (`api/src/chapterRoom.ts`) — per-`{book}/{chapter}` WS presence + change fanout. WS messages are hints; **HTTP + `If-Match` is the source of truth**.
-- Workflow `ExportWorkflow` (`api/src/exportWorkflow.ts`) — nightly DCS export, one retryable step per `book × resource`. Triggered by the 06:00 cron in `scheduled()`.
+- Workflow `ExportWorkflow` (`api/src/exportWorkflow.ts`) — nightly DCS export, one retryable step per `book × resource`. Triggered by the 06:00 cron in `scheduled()`. Two invariants, both added after a stale-D1 export silently reverted gatewayEdit work on master: (a) **stale or partial D1 must never overwrite master** — the pre-export DCS→D1 sync is batched to stay under Cloudflare's ~1000-subrequest cap (late-alphabet books used to die mid-sync), export has a freshness gate, and a shrink-guard rejects any render that would delete rows; (b) truncated DCS fetches are rejected rather than treated as authoritative. Reimport batches its upserts for the same subrequest-budget reason.
 - Second cron `*/5 * * * *` polls non-terminal pipeline_jobs (AI auto-apply needs to fire even when no translator has a tab open). The `scheduled()` handler branches on `controller.cron`.
 - Auth (`api/src/auth.ts`): DCS OAuth → our own JWT (TTL decoupled from DCS access token). Dev mode mints via `POST /api/auth/dev` (gated by `DEV_AUTH_ENABLED`); `web/src/App.tsx` silently mints on first load in `import.meta.env.DEV`.
 - AI pipeline proxy: `/api/tn-quick` and `/api/pipelines/*` forward to `uw-bt-bot.fly.dev` (override via `TN_QUICK_URL` / `PIPELINE_API_BASE`). Absence of `BT_API_TOKEN` disables those routes.
@@ -115,11 +115,17 @@ The fetch client in `web/src/sync/api.ts` is the only thing that talks to `/api/
 ### Frontend (`web/`)
 
 - React 18 + Vite + MUI v6 + emotion. Vite dev server proxies `/api/*` → `127.0.0.1:8787` (Wrangler).
-- Single `Shell` (3-column: Timeline rail · Scripture column · Resource column) with three scripture modes — **rows** (stacked active-verse card), **columns** (parallel doc), **book** (lazy-loaded whole book via IntersectionObserver). Alignment is a separate panel/dialog wrapping a custom HTML5 DnD aligner (NOT `enhanced-word-aligner-rcl`; see `docs/plan.md` for the Vite/Rollup bundler reason).
+- Single `Shell` (3-column: Timeline rail · Scripture column · Resource column) with three scripture modes — **rows** (stacked active-verse card), **columns** (parallel doc), **book** (lazy-loaded whole book via IntersectionObserver). Alignment is a separate panel/dialog wrapping a custom HTML5 DnD aligner (NOT `enhanced-word-aligner-rcl`; see `docs/plan.md` for the Vite/Rollup bundler reason); a side-by-side ULT/UST variant lives in `SideBySideAligner.tsx`.
 - Hooks: `useChapter` (rows + verses + statuses), `useBook` (summary for nav), `useLexicon` (UHAL + UGL by Strong's), `useCatalogs` (ta / tw type-ahead lists), `useAiDrafts`.
 - Routing is hash-based: `#/{book}/{chapter}/{verse}` (see `parseHash` in `App.tsx`). `useBook` is hoisted in `App.tsx` so its chapter cache survives chapter navigation.
 - USFM ↔ JSON via `usfm-js`. Word alignment data is part of the per-verse JSON tree; `\zaln-s`/`\zaln-e` round-trip losslessly. `web/src/lib/alignment.ts` and `web/src/lib/replace.ts` handle smart text edits that preserve alignments when word counts line up.
 - Hebrew Unicode: UHB stores combining marks in legacy "consonant-dagesh-vowel" order; milestones from ZEC/LAM come out NFC. Every Hebrew↔Hebrew compare must go through `nfc()` from `web/src/lib/hebrew.ts` (see `docs/handoff.md` for measured impact).
+
+### Edit engine (`web/src/lib/replace.ts`) — the alignment-preservation claim
+
+Every inline text edit and find/replace flows through `smartEditVerse` / `smartReplaceVerse`. **The invariant: an edit must never unalign words it didn't touch.** The failure mode is whole-verse flattening — the naive rewrite collapses the verse to one text node, destroying every `\w` and every `\zaln-s` milestone, so the aligner ends up with neither targets to drag nor alignment to reuse. The module avoids this in two tiers: (1) *preserve* — when the change spans full words with matching word counts, rewrite each affected `\w` leaf in place, leaving surrounding/containing milestones untouched; (2) *localized rewrite* — drop only the top-level nodes overlapping the change range, splitting partially-affected milestones into before/after halves so survivors keep their source alignment. Pure insertions and pure deletions flow through the localized path too.
+
+This surface is brittle and has been the source of repeated prod alignment loss. **Every edit-path bug gets a regression case added to `web/src/lib/replace.test.mjs`** (run via `npm --workspace web run test`) — the suite is the real safety net, not types. usfm-js quirks compound here: opening quotes/braces get parked on a marker node's `text` (markers can carry text), and combining-mark order differs between UHB and NFC milestones (compare via `nfc()`).
 
 ### Note save semantics
 
