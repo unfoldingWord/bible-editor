@@ -1643,6 +1643,21 @@ function StackedRowBody({
     [prevDto?.content],
   );
   const html = useMemo(() => {
+    // Find marks win over poetry/paragraph layout while the overlay is open —
+    // the same precedence DocColumn/BookView use. Without this, structured
+    // (poetry) verses fall to renderHighlightedHTML below, which ignores
+    // `search`, so their matches paint no highlight and "disappear" from an
+    // inactive row (only the active card + plain-prose rows lit up). The flat
+    // text loses its indents while searching — an accepted trade so every
+    // match is visible. Source-language queries never match ULT/UST cells, so
+    // this is gated to English mode.
+    if (search?.re && search.sourceQuery.kind === "english") {
+      const text = dto.plain_text ?? "";
+      if (text) {
+        const findHtml = renderFindMatchesHTML(text, search.re, activeRange);
+        if (findHtml.includes("be-find")) return findHtml;
+      }
+    }
     if (!Array.isArray(verseObjects)) return null;
     // Strip THIS verse's own trailing markers — they drift to the next verse,
     // so rendering them here too would double a text-bearing `\qa` acrostic.
@@ -1660,7 +1675,7 @@ function StackedRowBody({
       });
     if (!hasStructure) return null;
     return renderHighlightedHTML(composed, new Set());
-  }, [verseObjects, drift]);
+  }, [verseObjects, drift, search, activeRange, dto.plain_text]);
 
   if (html !== null) {
     return <span dangerouslySetInnerHTML={{ __html: html }} />;

@@ -554,6 +554,13 @@ export function FindReplaceOverlay({
           </span>
         </Tooltip>
         <Box sx={{ flex: 1 }} />
+        {chapterList.length === 1 && (
+          <Tooltip title="Find is searching the current chapter only. Switch Scripture to “book” mode to search the whole book.">
+            <Typography variant="caption" sx={{ color: "text.disabled", fontFamily: "monospace", cursor: "help" }}>
+              this chapter only
+            </Typography>
+          </Tooltip>
+        )}
         {chapterList.length > 1 && (
           <Typography variant="caption" sx={{ color: "text.disabled", fontFamily: "monospace" }}>
             scope: {counts.ready}/{chapterList.length} ch loaded
