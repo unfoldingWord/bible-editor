@@ -522,6 +522,140 @@ function relayoutPunctuation(
   return { content: { verseObjects: pruned }, plainText: normalize(newRaw), preservedAlignment: true };
 }
 
+// Index of the top-level node whose subtree contains `target`. Used to splice a
+// verse-leading gap OUTSIDE the first milestone (top level), matching the uW
+// form `\v N “\zaln-s …` rather than burying the opening quote inside the first
+// \zaln. Returns 0 if not found (splice at the very front).
+function topLevelIndexOf(verseObjects: unknown[], target: unknown): number {
+  const contains = (node: unknown): boolean => {
+    if (node === target) return true;
+    const ch = (node as { children?: unknown })?.children;
+    return Array.isArray(ch) && ch.some(contains);
+  };
+  for (let i = 0; i < verseObjects.length; i++) {
+    if (contains(verseObjects[i])) return i;
+  }
+  return 0;
+}
+
+// Whole-verse punctuation relayout for a PURE punctuation / whitespace edit —
+// the word sequence is completely unchanged and only the surrounding
+// punctuation / spacing differs. The diff tiers can't always handle this: two
+// disjoint edits at the verse edges (adding an opening `‘` before the first
+// word AND a closing `’` after the last, ZEC 7:14) collapse via
+// diffSingleChange into ONE bounding change spanning the whole verse, whose
+// right edge lands mid trailing-punctuation leaf. That fails the
+// startsAtBoundary/endsAtBoundary gate on the preserve / relayout / rebuild
+// tiers, so the edit drops to localizedRewriteVerse, which flattens every
+// \zaln. But the alignment never needs to change here: keep every \w (and its
+// milestone) exactly and re-lay the new punctuation across the whole verse.
+// Returns null when the words AREN'T identical 1:1 (caller uses the diff tiers)
+// or the self-check fails — so a real word edit can never reach this path.
+function relayoutUnchangedWords(
+  input: unknown[],
+  newStripped: string,
+): SmartReplaceResult | null {
+  // Inline markers (\q1, \p, editable \ts\*) are zero-width position anchors
+  // between words; a single gap can SPAN one (`says: \q1 "Behold` — the typed
+  // `"` belongs AFTER the marker, on the new poetic line). Splitting such a gap
+  // correctly is reconcileMarkers' job, not this naive first-leaf relayout, so
+  // bail when any in-flow marker is present and let the diff tiers handle it.
+  // (The imported trailing `\ts\*` node — tag `ts\*`, not `ts` — is NOT an
+  // in-flow marker, so prose verses like ZEC 7:14 still qualify.)
+  const hasMarker = (nodes: unknown[]): boolean =>
+    nodes.some((n) => {
+      if (isInFlowMarker(n)) return true;
+      const ch = (n as { children?: unknown } | null)?.children;
+      return Array.isArray(ch) && hasMarker(ch);
+    });
+  if (hasMarker(input)) return null;
+
+  const verseObjects = cloneVerseObjects(input);
+  const leaves = walkLeavesWithParents(verseObjects);
+  const wordLeaves = leaves.filter((l) => isWordLeaf(l.node));
+  const newWords = [...newStripped.matchAll(WORD_RUN_RE)].map((m) => m[0]);
+  if (wordLeaves.length === 0 || newWords.length === 0) return null;
+
+  const gaps = nonWordGaps(newStripped); // N+1 gaps around the N word UNITS
+  // extractEditableText whitespace-normalizes, dropping structural whitespace
+  // (the `\n\n` before a trailing `\ts\*` / the next verse). The in-place
+  // preserve path keeps the trailing text leaf verbatim, so mirror it: re-
+  // attach the original leading / trailing whitespace to the boundary gaps.
+  const raw = rebuildRaw(verseObjects);
+  gaps[0] = (raw.match(/^\s*/)?.[0] ?? "") + gaps[0];
+  gaps[gaps.length - 1] = gaps[gaps.length - 1] + (raw.match(/\s*$/)?.[0] ?? "");
+
+  const textNode = (text: string) => ({ type: "text", text });
+  const insertions: { parent: unknown[]; index: number; node: unknown }[] = [];
+  // Walk leaves, grouping consecutive `\w` leaves (plus the intra-token
+  // connector text leaves between them) into UNITS that each equal one
+  // WORD_RUN_RE token — so a split possessive (`warrior` + `’` + `s` =
+  // "warrior’s") or hyphenated name (`Regem` + `-` + `Melek`) counts as ONE
+  // word, matching newWords. Each inter-unit gap is re-laid from the new text;
+  // intra-unit connectors stay untouched. Any divergence from a clean
+  // punctuation-only edit returns null (→ diff tiers).
+  let ti = 0; // unit index → gaps[ti] is the gap before the next unit
+  let inUnit = false; // currently consuming a multi-leaf word unit
+  let acc = ""; // accumulated text of the current unit
+  let gapHasLeaf = false; // a text leaf has already carried gaps[ti]
+  for (const leaf of leaves) {
+    const text = String(leaf.node["text"]);
+    if (isWordLeaf(leaf.node)) {
+      if (!inUnit) {
+        if (ti >= newWords.length) return null; // more word units than tokens
+        if (!gapHasLeaf && gaps[ti]) {
+          if (ti === 0) {
+            // Verse-leading gap with no existing text leaf → splice OUTSIDE the
+            // first milestone at top level (uW `\v N “\zaln-s …` form), not inside.
+            insertions.push({ parent: verseObjects, index: topLevelIndexOf(verseObjects, leaf.node), node: textNode(gaps[ti]) });
+          } else {
+            insertions.push({ parent: leaf.parent, index: leaf.index, node: textNode(gaps[ti]) });
+          }
+        }
+        inUnit = true;
+        acc = text;
+      } else {
+        acc += text; // continuation half (the "s" of "warrior’s")
+      }
+      if (acc === newWords[ti]) { inUnit = false; ti++; gapHasLeaf = false; }
+      else if (!newWords[ti].startsWith(acc)) return null; // diverged from token
+    } else if (inUnit) {
+      // intra-unit connector (the `’` / `-` between split halves) — keep as-is.
+      acc += text;
+      if (!newWords[ti].startsWith(acc)) return null;
+    } else {
+      // inter-unit gap leaf
+      leaf.node["text"] = gapHasLeaf ? "" : (gaps[ti] ?? "");
+      gapHasLeaf = true;
+    }
+  }
+  if (inUnit || ti !== newWords.length) return null; // didn't map every token cleanly
+  // Trailing gap after the last unit with no following text leaf.
+  if (!gapHasLeaf && gaps[ti]) {
+    const lastWord = wordLeaves[wordLeaves.length - 1];
+    insertions.push({ parent: lastWord.parent, index: lastWord.index + 1, node: textNode(gaps[ti]) });
+  }
+
+  const byArray = new Map<unknown[], { index: number; node: unknown }[]>();
+  for (const ins of insertions) {
+    const list = byArray.get(ins.parent) ?? [];
+    list.push({ index: ins.index, node: ins.node });
+    byArray.set(ins.parent, list);
+  }
+  for (const [arr, list] of byArray) {
+    list.sort((a, b) => b.index - a.index);
+    for (const ins of list) arr.splice(ins.index, 0, ins.node);
+  }
+
+  const pruned = pruneEmptyText(verseObjects);
+  const newRaw = rebuildRaw(pruned);
+  // Self-check: the rebuilt verse (markers carry no raw text) must normalize to
+  // the new stripped text. Any divergence — exotic node shapes, marker-carried
+  // text — bails to the diff tiers rather than risk a wrong tree.
+  if (normalize(newRaw) !== normalize(newStripped)) return null;
+  return { content: { verseObjects: pruned }, plainText: normalize(newRaw), preservedAlignment: true };
+}
+
 // LCS over word surface text. Returns link[j] = the index in `oldWords` that
 // `newWords[j]` reuses, or -1 when newWords[j] is a genuinely new word. Each old
 // word is claimed at most once, order-preserving (leftmost on ties). LCS (not
@@ -1526,9 +1660,23 @@ export function smartEditVerse(
 
   // Step 1 — word/punctuation edit against the marker-stripped baseline.
   let result: SmartReplaceResult;
+  // Pure punctuation / whitespace relayout: when the edit leaves the WHOLE word
+  // sequence unchanged, re-lay punctuation over the entire verse with every \w
+  // (and \zaln) intact, before the diff tiers run. Catches edits the single-
+  // change diff can't localize — opening + closing quotes added at the verse
+  // edges collapse into one verse-spanning range that fails the boundary gate
+  // and would otherwise flatten every milestone (ZEC 7:14 `‘…’`). Returns null
+  // (→ diff tiers) unless every word maps 1:1.
+  const contentVo = (content as { verseObjects?: unknown[] } | null)?.verseObjects;
+  const relaid =
+    oldStripped !== newStripped && Array.isArray(contentVo)
+      ? relayoutUnchangedWords(contentVo, newStripped)
+      : null;
   if (oldStripped === newStripped) {
     // Pure marker edit — no word/punctuation change to apply.
     result = { content, plainText: oldStripped, preservedAlignment: true };
+  } else if (relaid) {
+    result = relaid;
   } else {
     const rawDiff = diffSingleChange(oldStripped, newStripped);
     if (rawDiff.oldLen === 0 && rawDiff.newSubstring === "") {

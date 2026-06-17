@@ -1367,6 +1367,40 @@ function transplants(origContent, resultContent) {
   assert(r.plainText.includes("Selah"), "'Selah' survives in the text");
 }
 
+// ─── Case 58: opening + closing quotes added at the verse EDGES keep alignment ─
+// ZEC 7:14: the user wraps a whole prose verse in single quotes — `‘` before the
+// first word AND `’` before the verse-final `”`. Two disjoint punctuation
+// insertions at opposite ends collapse via diffSingleChange into ONE bounding
+// change spanning the whole verse, whose right edge lands mid trailing-punct
+// leaf. That failed the boundary gate on every preserve/relayout/rebuild tier,
+// so it dropped to localizedRewriteVerse and flattened ALL milestones (16→0 in
+// prod). The pure-punctuation whole-verse relayout must keep every milestone.
+{
+  console.log("\n[Case 58] Opening + closing quotes at the verse edges keep all alignment");
+  const verse = {
+    verseObjects: [
+      zaln("H1", [w("For")]), t(" "),
+      zaln("H2", [w("I"), t(" "), w("will"), t(" "), w("scatter")]), t(" "),
+      zaln("H3", [w("them")]), t(".”\n\n"),
+    ],
+  };
+  const old = extractEditableText(verse); // "For I will scatter them.”"
+  const next = ("‘" + old).replace(/\.”/, ".’”"); // ‘…scatter them.’”
+  const r = smartEditVerse(verse, old, next);
+  assert(r.preservedAlignment === true, "alignment is reported preserved");
+  assert(alignedWords(r.content).length === 5, `all 5 \\w survive (got ${alignedWords(r.content).length})`);
+  const ms = (n) => (JSON.stringify(n).match(/"milestone"/g) || []).length;
+  assert(ms(r.content) === 3, `all 3 milestones survive (got ${ms(r.content)})`);
+  assert(r.plainText === "‘For I will scatter them.’”", `text exact (got ${JSON.stringify(r.plainText)})`);
+  // The opening quote lands OUTSIDE the first milestone, top level (uW form
+  // `\v N “\zaln-s …`), not buried inside the first \zaln.
+  const vos = r.content.verseObjects;
+  assert(vos[0]?.type === "text" && vos[0].text === "‘", "opening quote is a top-level text node before the first milestone");
+  assert(vos[1]?.type === "milestone", "the first milestone immediately follows the opening quote");
+  // Structural trailing whitespace (the \n\n before the next verse) is kept.
+  assert(JSON.stringify(r.content.verseObjects).includes(".’”\\n\\n"), "trailing \\n\\n structural whitespace is preserved");
+}
+
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed.`);
   process.exit(1);
