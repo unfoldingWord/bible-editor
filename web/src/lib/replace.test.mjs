@@ -1302,6 +1302,29 @@ function transplants(origContent, resultContent) {
   assert(noEmptyMilestone(r.content), "no empty \\zaln left behind");
 }
 
+// ─── Case 57: a \qs wrapper carrying its OWN text survives an unrelated edit ───
+// usfm-js's shape for a bare `\qs Selah\qs*` (no inner \zaln) puts "Selah" on the
+// wrapper node's `text`. liftMarkerText (run before every edit) must NOT lift it
+// out — doing so moves "Selah" OUTSIDE the \qs…\qs* wrapper (`\qs\qs* Selah`),
+// corrupting the structure on the next save. Reviewer-reported; complements the
+// children-shape \qs coverage in Cases 44–47.
+{
+  console.log("\n[Case 57] Direct-text \\qs wrapper keeps its content inside the wrapper");
+  const verse = {
+    verseObjects: [
+      zaln("H1", [w("Praise")]), t(". "),
+      { type: "quote", tag: "qs", endTag: "qs\\*", text: "Selah" },
+      t("\n"), { type: "quote", tag: "q1" },
+    ],
+  };
+  const old = extractEditableText(verse);
+  const r = smartEditVerse(verse, old, old.replace("Praise", "Praises")); // unrelated edit, far from \qs
+  const qs = r.content.verseObjects.find((n) => n.tag === "qs");
+  assert(qs && qs.text === "Selah", "the \\qs node still carries its 'Selah' text (not lifted out)");
+  assert(!r.content.verseObjects.some((n) => n.type === "text" && n.text === "Selah"), "'Selah' was NOT lifted to a bare sibling outside the wrapper");
+  assert(r.plainText.includes("Selah"), "'Selah' survives in the text");
+}
+
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed.`);
   process.exit(1);

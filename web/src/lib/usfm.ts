@@ -161,7 +161,11 @@ export function liftMarkerText(verseObjects: unknown[]): unknown[] {
   const out: unknown[] = [];
   for (const node of verseObjects) {
     const o = node as Record<string, unknown> | null;
-    if (o && isInFlowMarker(o) && typeof o["text"] === "string" && o["text"] !== "") {
+    // A character wrapper (`\qs Selah\qs*`) is `type:"quote"` so isInFlowMarker
+    // matches it, but its `text` is CONTENT held between `\qs … \qs*`, not a
+    // quote parked on a line marker. Lifting it would move the word OUTSIDE the
+    // wrapper (`\qs\qs* Selah`) — so skip wrappers; only lift true line markers.
+    if (o && isInFlowMarker(o) && !isCharacterWrapper(o) && typeof o["text"] === "string" && o["text"] !== "") {
       const { text, ...rest } = o;
       out.push(rest);
       out.push({ type: "text", text });
