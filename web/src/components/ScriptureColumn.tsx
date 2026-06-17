@@ -12,7 +12,6 @@ import type { ChapterPayload, TnRow, TwlRow, VerseDto } from "../sync/api";
 import { drafts, verseKey } from "../sync/drafts";
 import { DocColumn } from "./DocColumn";
 import type { FindMatch } from "./FindReplaceOverlay";
-import { findSession, resetFindSession } from "./findSession";
 import { HebrewLine } from "./HebrewLine";
 import type { LexiconEntry } from "../hooks/useLexicon";
 import type { ChapterState } from "../hooks/useBook";
@@ -190,11 +189,8 @@ function ScriptureColumnInner({
 }: Props) {
   const activeRef = useRef<HTMLDivElement | null>(null);
   const bodyRef = useRef<HTMLDivElement | null>(null);
-  // Seed from the module-level session so a cross-chapter find walk (which
-  // remounts Shell via the URL) re-opens the overlay instead of vanishing.
-  const [findOpen, setFindOpen] = useState(() => findSession.open);
+  const [findOpen, setFindOpen] = useState(false);
   const openFind = useCallback(() => {
-    findSession.open = true;
     setFindOpen(true);
   }, []);
   const [findQuery, setFindQuery] = useState<FindQuery | null>(null);
@@ -218,13 +214,11 @@ function ScriptureColumnInner({
   }, [openFind]);
 
   // Closing the overlay should drop the query so cells stop painting find
-  // marks (otherwise the previous query lingers as highlights). Clear the
-  // module session too so it doesn't re-open on the next navigation.
+  // marks (otherwise the previous query lingers as highlights).
   const closeFind = useCallback(() => {
     setFindOpen(false);
     setFindQuery(null);
     setFindScrollTarget(null);
-    resetFindSession();
   }, []);
 
   // Stable callback identities so the overlay's effect deps don't churn.

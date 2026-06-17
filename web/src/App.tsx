@@ -374,7 +374,7 @@ export function App() {
       )}
       <Box sx={{ flex: 1, minHeight: 0 }}>
         <Shell
-          key={`${loc.book}-${loc.chapter}-${loc.verse}`}
+          key={loc.book}
           book={loc.book}
           chapter={loc.chapter}
           initialVerse={loc.verse}

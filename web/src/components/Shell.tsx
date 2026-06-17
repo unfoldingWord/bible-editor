@@ -874,6 +874,36 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     [runWithDirtyGate, chapter, book, onNavigate],
   );
 
+  // App keys Shell on book only, so a cross-chapter navigation (URL /
+  // back-forward / TopBar / cross-chapter find) changes the chapter +
+  // initialVerse props WITHOUT remounting — useChapter keeps the prior
+  // chapter's data visible while the new payload loads, so there's no loading
+  // flash and find/book-view state survive. This effect does what the old
+  // remount used to: reset the per-chapter transient state. Keyed on
+  // [chapter, initialVerse] — internal same-chapter verse selection sets
+  // activeVerse directly without an URL push, so initialVerse doesn't change
+  // and this won't clobber it. Skips the initial mount.
+  const chapterResetMounted = useRef(false);
+  useEffect(() => {
+    if (!chapterResetMounted.current) {
+      chapterResetMounted.current = true;
+      return;
+    }
+    setActiveVerse(initialVerse);
+    setActiveNoteId(null);
+    setActiveWordId(null);
+    setAlignerTarget(null);
+    setDualTarget(null);
+    setPanelMode("resources");
+    setAlignmentDirty(false);
+    setDualLeftDirty(false);
+    setDualRightDirty(false);
+    setDualLeftReadingDirty(false);
+    setDualRightReadingDirty(false);
+    setPendingNav(null);
+    setPendingDualAction(null);
+  }, [chapter, initialVerse]);
+
   // Consume a cross-chapter TN-find jump stashed before navigation. Waits for
   // this chapter's payload (and the target note row) to load, then activates +
   // scrolls to the note. Cleared on consume; ignored if the stash targets a

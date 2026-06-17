@@ -26,7 +26,6 @@ import ArrowUpwardIcon from "@mui/icons-material/ArrowUpward";
 import ArrowDownwardIcon from "@mui/icons-material/ArrowDownward";
 import type { ChapterState } from "../hooks/useBook";
 import type { TnRow, VerseDto } from "../sync/api";
-import { findSession } from "./findSession";
 import { smartReplaceVerse } from "../lib/replace";
 import {
   classifySourceQuery,
@@ -157,20 +156,16 @@ export function FindReplaceOverlay({
   searchNotes,
   onScrollToNoteMatch,
 }: Props) {
-  // Seed from the module-level session (see findSession.ts) so a cross-chapter
-  // find walk — which remounts Shell via the URL — restores the query and
-  // position instead of resetting. A fresh open starts empty (closeFind
-  // resets the session).
-  const [find, setFind] = useState(() => findSession.find);
-  const [replace, setReplace] = useState(() => findSession.replace);
-  const [regex, setRegex] = useState(() => findSession.regex);
-  const [caseSensitive, setCaseSensitive] = useState(() => findSession.caseSensitive);
+  const [find, setFind] = useState("");
+  const [replace, setReplace] = useState("");
+  const [regex, setRegex] = useState(false);
+  const [caseSensitive, setCaseSensitive] = useState(false);
   const [scope, setScope] = useState<FindScope>(() => loadScope());
   // Opt-in: interpret bare-digit queries as Strong's numbers. Off by default
   // because bible text has lots of numbers ("eighth month", "1:1") and the
   // user would expect those to hit. Toggle only appears when relevant.
-  const [strongs, setStrongs] = useState(() => findSession.strongs);
-  const [activeIdx, setActiveIdx] = useState(() => findSession.activeIdx);
+  const [strongs, setStrongs] = useState(false);
+  const [activeIdx, setActiveIdx] = useState(0);
   const showStrongsToggle = isBareNumberQuery(find) && !regex;
   const findInputRef = useRef<HTMLInputElement | null>(null);
   const replaceInputRef = useRef<HTMLInputElement | null>(null);
@@ -198,17 +193,6 @@ export function FindReplaceOverlay({
       findInputRef.current?.select();
     }
   }, [open]);
-
-  // Mirror live state into the module session so it survives a Shell remount
-  // (cross-chapter find walk). Cleared by ScriptureColumn.closeFind.
-  useEffect(() => {
-    findSession.find = find;
-    findSession.replace = replace;
-    findSession.regex = regex;
-    findSession.caseSensitive = caseSensitive;
-    findSession.strongs = strongs;
-    findSession.activeIdx = activeIdx;
-  }, [find, replace, regex, caseSensitive, strongs, activeIdx]);
 
   // Push query down to the caller so verse cells can paint match marks.
   // Any change to the search inputs counts as user navigation — once the
@@ -316,15 +300,13 @@ export function FindReplaceOverlay({
     if (wantsScrollRef.current) {
       wantsScrollRef.current = false;
       // Auto-jump (typing / scope toggle) must NOT trigger a disruptive
-      // cross-chapter navigation. In book mode a note match in another
-      // chapter routes through focusNoteMatch → URL navigation, which
-      // remounts Shell — closing this overlay and collapsing the book view.
-      // The book-intro note (chapter 0) sorts first and matches common words,
-      // so the very first keystroke would yank the user to ZEC/0 and the find
-      // box would vanish. Bible matches scroll in-view without a remount, and
-      // same-chapter notes just re-focus, so only the cross-chapter note case
-      // is suppressed here — explicit prev/next (goPrev/goNext call navTo
-      // directly) may still cross chapters deliberately.
+      // cross-chapter navigation. The book-intro note (chapter 0) sorts first
+      // and matches common words, so the very first keystroke would otherwise
+      // yank the user from the chapter they're reading over to ZEC/0. Bible
+      // matches scroll in-view harmlessly and same-chapter notes just re-focus,
+      // so only the cross-chapter note case is suppressed here — explicit
+      // prev/next (goPrev/goNext call navTo directly) may still cross chapters
+      // deliberately.
       const r = results[idx];
       const crossChapterNote = r?.kind === "note" && r.chapter !== activeChapter;
       if (!crossChapterNote) navTo(idx);
@@ -337,16 +319,12 @@ export function FindReplaceOverlay({
   const goPrev = () => {
     if (results.length === 0) return;
     const next = (activeIdx - 1 + results.length) % results.length;
-    // Persist synchronously: navTo may remount Shell (cross-chapter note),
-    // and the passive sync effect might not flush before unmount.
-    findSession.activeIdx = next;
     setActiveIdx(next);
     navTo(next);
   };
   const goNext = () => {
     if (results.length === 0) return;
     const next = (activeIdx + 1) % results.length;
-    findSession.activeIdx = next;
     setActiveIdx(next);
     navTo(next);
   };
