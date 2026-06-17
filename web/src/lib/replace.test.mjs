@@ -6,7 +6,7 @@
 // Not a test framework; failures exit non-zero. Mirrors
 // src/lib/alignment.test.mjs.
 
-import { smartEditVerse, smartReplaceVerse, tokenizePlainText } from "./replace.ts";
+import { smartEditVerse, smartReplaceVerse, tokenizePlainText, tokenizeEditableText } from "./replace.ts";
 import { extractEditableText } from "./usfm.ts";
 
 let failed = 0;
@@ -307,6 +307,48 @@ function milestoneCount(content) {
   assert(words.find((x) => x.text === "unto")?.strongs.length === 0, "edited 'unto' is unaligned");
   const quotes = r.content.verseObjects.filter((n) => n.type === "quote").map((n) => n.tag);
   assert(JSON.stringify(quotes) === JSON.stringify(["q2", "q1"]), `both markers preserved in place (got ${JSON.stringify(quotes)})`);
+}
+
+// ─── Case 15b: a digit-bearing marker typed GLUED to the next word ────────
+// "she didn't use the \q2 button" — a hand-typed \q2 with no trailing space
+// (\q2destroy) was left as the literal word "q2destroy" because the marker
+// regex demanded a non-letter boundary. A numeric suffix makes the marker
+// unambiguous, so it's now recognized even when glued. Disambiguation for the
+// bare prefixes (\q vs \qa, \p vs \pi) must still hold.
+{
+  console.log("\n[Case 15b] Digit-bearing marker glued to the next word is recognized");
+  const q = (tag) => ({ type: "quote", tag });
+  const verse = {
+    verseObjects: [zaln("H1", [w("obeying")]), t(" "), zaln("H2", [w("me")]), t(" "), zaln("H3", [w("destroy")]), t(".")],
+  };
+  const old = extractEditableText(verse); // "obeying me destroy."
+  // Type a \q2 with NO trailing space, glued to "destroy".
+  const r = smartEditVerse(verse, old, "obeying me \\q2destroy.");
+  const quotes = r.content.verseObjects.filter((n) => n.type === "quote").map((n) => n.tag);
+  assert(JSON.stringify(quotes) === JSON.stringify(["q2"]), `glued \\q2 becomes a quote marker (got ${JSON.stringify(quotes)})`);
+  const words = alignedWords(r.content).map((x) => x.text);
+  assert(!words.some((t) => /q2/.test(t)), `no "q2"/"q2destroy" word survives (got ${JSON.stringify(words)})`);
+  assert(words.includes("destroy"), `"destroy" stays a word (got ${JSON.stringify(words)})`);
+
+  // tokenizeEditableText directly: glued digit-bearing forms recognized…
+  const glued = tokenizeEditableText("a \\q1word \\pi2line \\qm3meter");
+  const gluedTags = glued.filter((n) => n.type !== "text" && !(n.type === "word")).map((n) => n.tag);
+  assert(
+    JSON.stringify(gluedTags) === JSON.stringify(["q1", "pi2", "qm3"]),
+    `glued q1/pi2/qm3 all recognized (got ${JSON.stringify(gluedTags)})`,
+  );
+  // …but bare prefixes must NOT bite into a longer (out-of-set) marker.
+  const qa = tokenizeEditableText("text \\qa ZAYIN");
+  assert(
+    !qa.some((n) => n.type === "quote" && n.tag === "q"),
+    `bare \\q does NOT bite \\qa into \\q + "a" (got ${JSON.stringify(qa.map((n) => n.tag ?? n.type))})`,
+  );
+  const pi = tokenizeEditableText("a \\pc centered \\mi margin");
+  const piTags = pi.filter((n) => n.type === "paragraph").map((n) => n.tag);
+  assert(
+    JSON.stringify(piTags) === JSON.stringify(["pc", "mi"]),
+    `\\pc / \\mi win over their \\p / \\m prefixes (got ${JSON.stringify(piTags)})`,
+  );
 }
 
 // ─── Case 16: combined word edit + marker removal in one save ─────────────

@@ -132,14 +132,26 @@ export function tokenizePlainText(text: string): unknown[] {
 }
 
 // Inline paragraph / poetry / blank / chunk markers, surfaced as visible
-// literal "\p" / "\q1" / "\ts\*" tokens in the active-verse
-// contenteditable. The regex matches the marker name followed by a word
-// boundary so "\q1Hello" won't accidentally bite (markers always end
-// with whitespace from the chip renderer's trailing space). The optional
-// trailing \s is consumed so the marker token doesn't leave a stranded
-// space between marker and following text. `ts\\\*` matches the literal
-// `\ts\*` chunk milestone (translator's section delimiter).
-const MARKER_TOKEN_RE = /\\(p|m|mi|nb|pi[1-3]?|pc|q[1-4]?|qm[1-3]?|b|ts\\\*)(?=\s|$|[^a-z0-9])\s?/g;
+// literal "\p" / "\q1" / "\ts\*" tokens in the active-verse contenteditable
+// AND recognized in bare text by the aligner. Two alternation branches:
+//
+//   1. Digit-bearing forms (`pi1-3`, `q1-4`, `qm1-3`): a numeric suffix makes
+//      the marker unambiguous — no longer marker can extend it — so it's
+//      recognized even when typed glued to the next word (`\q2destroy` →
+//      marker `\q2` + "destroy"). This is the gap that left a hand-typed,
+//      button-less marker sitting as literal text.
+//   2. Bare forms (`p`, `m`, `mi`, `nb`, `pi`, `pc`, `q`, `qm`, `b`, `ts\*`):
+//      these keep the `(?=\s|$|[^a-z0-9])` boundary, because several are a
+//      PREFIX of a longer marker — bare `\q` must NOT bite into `\qa`/`\qr`
+//      (acrostic/right-aligned, not in this set) nor `\qm`, `\p` into `\pi`/
+//      `\pc`, `\m` into `\mi`. Longest-first ordering (`mi` before `m`, `pi`/
+//      `pc` before `p`, `qm` before `q`) keeps the boundary picking the full
+//      marker. `ts\\\*` matches the literal `\ts\*` chunk milestone.
+//
+// The optional trailing \s is consumed (both branches) so the marker token
+// doesn't leave a stranded space between marker and following text.
+const MARKER_TOKEN_RE =
+  /\\((?:pi[1-3]|q[1-4]|qm[1-3])|(?:mi|nb|pc|pi|qm|p|m|q|b|ts\\\*)(?=\s|$|[^a-z0-9]))\s?/g;
 
 // usfm-js distinguishes "paragraph" markers (\p, \m, \mi, \nb, \pi*,
 // \pc, \b) from "quote" markers (\q, \q1..q4, \qm*) using different

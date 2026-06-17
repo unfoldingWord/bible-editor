@@ -2330,6 +2330,39 @@ function roundtripVerseUsfm(rawUsfm, sourceVO = null) {
   );
 }
 
+// ─── Case: literal \q2 in bare text is a marker, not a target word ───────
+// HOS 7:13 UST bug: a \q2 poetry marker typed (or AI-drafted) straight into the
+// verse text — WITHOUT the marker button — landed as a literal "\q2" inside a
+// text node instead of a structural marker. The bare-text tokenizer then
+// surfaced it in the aligner as the unalignable target word "q2". It must be
+// recognized as a poetry marker and round-trip to a real \q2 node — which also
+// heals the data when the alignment is saved. Mirrors the corrupted content
+// shape directly (usfm-js would parse a \q2 in raw USFM as a marker; the bug is
+// when it is already sitting as literal text).
+{
+  console.log("\n[Case] literal \\q2 in bare text surfaces as a marker, not a target word");
+  const verseObjects = [
+    { type: "word", tag: "w", text: "obeying", occurrence: "1", occurrences: "1" },
+    { type: "text", text: " me \\q2 I will destroy them." },
+  ];
+  const state = parseAlignment(verseObjects, null);
+  const words = state.unaligned.map((w) => w.text);
+  assert(!words.includes("q2"), `\\q2 does NOT surface as a draggable word (got ${JSON.stringify(words)})`);
+  assert(
+    state.stream.some((s) => s.kind === "marker" && s.node.tag === "q2"),
+    "the \\q2 token becomes a structural marker stream node",
+  );
+  const reVO = serializeAlignment(state);
+  assert(
+    reVO.some((n) => n && n.tag === "q2" && n.type === "quote"),
+    `serialize emits a real \\q2 marker node (got tags ${reVO.map((n) => n.tag ?? n.type).join(",")})`,
+  );
+  assert(
+    !reVO.some((n) => n && n.type === "word" && /q2/.test(String(n.text))),
+    "no literal q2 word node survives serialize (data healed on save)",
+  );
+}
+
 // ─── Case: a normal aligned verse's punctuation text is untouched ────────
 // Guard against the bare-text tokenizer disturbing inter-word separators in
 // already-aligned verses (their text nodes hold only punctuation/space).

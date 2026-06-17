@@ -27,7 +27,7 @@
 
 import { nfc } from "./hebrew.ts";
 import { extractPlainText } from "./usfm.ts";
-import { tokenizePlainText } from "./replace.ts";
+import { tokenizeEditableText } from "./replace.ts";
 
 export interface SourceWord {
   id: string;
@@ -268,6 +268,32 @@ function findExistingGroup(
   return null;
 }
 
+// Tokenize a bare target-text string into stream items. Most text nodes hold
+// only inter-word whitespace / punctuation (zero word runs) or AI-drafted
+// prose with no `\w` wrappers; either way word runs become draggable unaligned
+// stream words and separators stay `text`. But a text node can also carry a
+// literal USFM marker token — `\q2`, `\p`, `\ts\*` — left there by an AI draft
+// or a hand-typed edit that never went through a marker button. Those must
+// surface as the SAME opaque structural markers the parser builds elsewhere,
+// NOT as the unalignable target words "q2"/"p" (the reported HOS 7:13 UST bug:
+// a typed `\q2` showed up in the aligner as draggable text). So tokenize
+// through the marker-aware tokenizeEditableText — the exact recognizer the
+// save path uses — and route marker nodes to StreamMarkers, which serialize
+// verbatim. That also heals the data: saving the alignment rewrites the literal
+// `\q2` text as a real marker node. Normal aligned verses are unaffected — their
+// text holds only separators, which tokenize identically to the old path.
+function pushBareTextTokens(text: string, stream: StreamItem[]): void {
+  for (const tok of tokenizeEditableText(text) as ParsedNode[]) {
+    if (nodeIsWord(tok)) {
+      stream.push({ kind: "word", word: targetOf(tok), alignedTo: null });
+    } else if (nodeIsText(tok)) {
+      stream.push({ kind: "text", text: String(tok["text"] ?? "") });
+    } else {
+      stream.push({ kind: "marker", node: tok });
+    }
+  }
+}
+
 function walk(
   nodes: ParsedNode[],
   sourceChain: SourceWord[],
@@ -304,14 +330,10 @@ function walk(
       // (alignedTo:null → the unaligned bag); punctuation / whitespace stays
       // `text`. Normal aligned verses are unaffected: their text nodes hold
       // only inter-word separators, which tokenize to zero word runs and
-      // round-trip back to the identical text node.
-      for (const tok of tokenizePlainText(String(node["text"] ?? "")) as ParsedNode[]) {
-        if (nodeIsWord(tok)) {
-          stream.push({ kind: "word", word: targetOf(tok), alignedTo: null });
-        } else {
-          stream.push({ kind: "text", text: String(tok["text"] ?? "") });
-        }
-      }
+      // round-trip back to the identical text node. A literal `\q2` / `\p`
+      // marker token embedded in the text becomes a structural marker, not a
+      // draggable word — see pushBareTextTokens.
+      pushBareTextTokens(String(node["text"] ?? ""), stream);
     } else if (isAlignmentWrapper(node) || isPsalmTitleWrapper(node)) {
       // Descend through a `\qs` (or similar whitelisted) wrapper — or a
       // `\d` Psalm superscription carrying children — whose children
@@ -332,13 +354,7 @@ function walk(
       const tag = String(node["tag"] ?? "");
       const { text, ...rest } = node;
       stream.push({ kind: "openMarker", tag, node: cloneNodeShallow(rest) });
-      for (const tok of tokenizePlainText(String(text)) as ParsedNode[]) {
-        if (nodeIsWord(tok)) {
-          stream.push({ kind: "word", word: targetOf(tok), alignedTo: null });
-        } else {
-          stream.push({ kind: "text", text: String(tok["text"] ?? "") });
-        }
-      }
+      pushBareTextTokens(String(text), stream);
       stream.push({ kind: "closeMarker", tag });
     } else if (nodeIsLineTextMarker(node)) {
       // Poetry/paragraph line marker carrying same-line verse text that
@@ -349,13 +365,7 @@ function walk(
       // nodeIsLineTextMarker). The trailing newline rides along as text.
       const { text, ...rest } = node;
       stream.push({ kind: "marker", node: cloneNodeOpaque(rest) });
-      for (const tok of tokenizePlainText(String(text)) as ParsedNode[]) {
-        if (nodeIsWord(tok)) {
-          stream.push({ kind: "word", word: targetOf(tok), alignedTo: null });
-        } else {
-          stream.push({ kind: "text", text: String(tok["text"] ?? "") });
-        }
-      }
+      pushBareTextTokens(String(text), stream);
     } else {
       // Opaque inline node — footnotes (\f), blank lines (\b), chunk
       // milestones (\ts*), section headings (\ms), bare `\qs Selah\qs*`
