@@ -1401,6 +1401,57 @@ function transplants(origContent, resultContent) {
   assert(JSON.stringify(r.content.verseObjects).includes(".’”\\n\\n"), "trailing \\n\\n structural whitespace is preserved");
 }
 
+// ─── Case 59: edge quotes on a verse with a TRAILING marker keep alignment ────
+// ZEC 8:3: a prose verse aligned with a verse-final `\q1` line break, wrapped in
+// `‘…!’`. The marker is purely TRAILING (no word after it), so the relayout
+// must still fire — the old "bail on ANY marker" gate left this at a partial
+// unalign (17→3 in prod). Step 2 reconcileMarkers keeps the closing `’` and the
+// `\q1` in place. (An INTERIOR marker — Case 24 — still bails to the diff path.)
+{
+  console.log("\n[Case 59] Edge quotes on a verse with a trailing \\q1 keep all alignment");
+  const verse = {
+    verseObjects: [
+      zaln("H1", [w("Yahweh"), t(" "), w("says")]), t(" "),
+      zaln("H2", [w("this")]), t(": "),
+      zaln("H3", [w("I"), t(" "), w("return")]), t("!\n\n"),
+      { type: "quote", tag: "q1" },
+    ],
+  };
+  const old = extractEditableText(verse); // "Yahweh says this: I return! \q1"
+  const next = old.replace("this: I", "this: ‘I").replace("return!", "return!’");
+  const r = smartEditVerse(verse, old, next);
+  assert(r.preservedAlignment === true, "alignment reported preserved");
+  assert(milestoneCount(r.content) === 3, `all 3 milestones survive (got ${milestoneCount(r.content)})`);
+  assert(alignedWords(r.content).find((x) => x.text === "return")?.strongs.includes("H3"), "'return' keeps alignment");
+  // plainText (rebuildRaw) excludes markers by design; the editable view surfaces them.
+  assert(extractEditableText(r.content) === "Yahweh says this: ‘I return!’ \\q1", `editable text exact incl. trailing marker (got ${JSON.stringify(extractEditableText(r.content))})`);
+  // The trailing \q1 stays AFTER the closing quote, last node in the verse.
+  const vos = r.content.verseObjects;
+  assert(vos[vos.length - 1]?.type === "quote" && vos[vos.length - 1]?.tag === "q1", "the \\q1 marker survives as the final node");
+}
+
+// ─── Case 60: an INTERIOR marker bails to the diff path (no quote pop) ─────────
+// Guards the relaxed gate: a marker with words on BOTH sides can have a gap that
+// spans it, so the whole-verse relayout must NOT fire — the typed quote would
+// land on the wrong side. (Mirrors Case 24's concern under the new gate.)
+{
+  console.log("\n[Case 60] Edge quote on a verse with an INTERIOR marker doesn't pop the quote");
+  const verse = {
+    verseObjects: [
+      zaln("H1", [w("he")]), t(" "), zaln("H2", [w("said")]), t(": "),
+      { type: "quote", tag: "q1" },
+      zaln("H3", [w("Come")]), t("!"),
+    ],
+  };
+  const old = extractEditableText(verse); // "he said: \q1 Come!"
+  const r = smartEditVerse(verse, old, old.replace("\\q1 Come", '\\q1 “Come'));
+  const vos = r.content.verseObjects;
+  const qi = vos.findIndex((n) => n.type === "quote");
+  const quoteBeforeMarker = vos.slice(0, qi).some((n) => n.type === "text" && n.text.includes("“"));
+  assert(!quoteBeforeMarker, "the typed quote did NOT pop in front of the marker");
+  assert(alignedWords(r.content).find((x) => x.text === "Come")?.strongs.includes("H3"), "'Come' keeps alignment");
+}
+
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed.`);
   process.exit(1);

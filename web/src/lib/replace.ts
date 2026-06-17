@@ -555,26 +555,52 @@ function relayoutUnchangedWords(
   input: unknown[],
   newStripped: string,
 ): SmartReplaceResult | null {
-  // Inline markers (\q1, \p, editable \ts\*) are zero-width position anchors
-  // between words; a single gap can SPAN one (`says: \q1 "Behold` — the typed
-  // `"` belongs AFTER the marker, on the new poetic line). Splitting such a gap
-  // correctly is reconcileMarkers' job, not this naive first-leaf relayout, so
-  // bail when any in-flow marker is present and let the diff tiers handle it.
-  // (The imported trailing `\ts\*` node — tag `ts\*`, not `ts` — is NOT an
-  // in-flow marker, so prose verses like ZEC 7:14 still qualify.)
-  const hasMarker = (nodes: unknown[]): boolean =>
-    nodes.some((n) => {
-      if (isInFlowMarker(n)) return true;
+  // Inline line-break markers (\q1, \p) are zero-width anchors between words. A
+  // gap that SPANS an INTERIOR marker — one with words on BOTH sides, e.g.
+  // `says: \q1 "Behold` where the typed `"` belongs AFTER the marker on the new
+  // poetic line — can't be split by this naive first-leaf relayout; that's
+  // reconcileMarkers' job, so bail. But a purely LEADING or TRAILING marker (no
+  // word before, or none after — e.g. ZEC 8:3's verse-final `\q1`) splits no
+  // gap: the relayout writes punctuation into the boundary text leaves and
+  // Step 2 reconcileMarkers keeps the marker on its side. Character wrappers
+  // (`\qs Selah\qs*`) hold aligned CONTENT, not a line break, and are tricky to
+  // re-lay around — bail on them outright. (The imported `\ts\*` node — tag
+  // `ts\*`, not `ts` — is NOT an in-flow marker, so prose verses still qualify.)
+  const order: ("w" | "m")[] = [];
+  let wrapperPresent = false;
+  const scan = (nodes: unknown[]): void => {
+    for (const n of nodes) {
+      if (isInFlowMarker(n)) {
+        if (isCharacterWrapper(n)) wrapperPresent = true;
+        else order.push("m");
+        continue;
+      }
+      if (isWordLeaf(n as Record<string, unknown>)) order.push("w");
       const ch = (n as { children?: unknown } | null)?.children;
-      return Array.isArray(ch) && hasMarker(ch);
-    });
-  if (hasMarker(input)) return null;
+      if (Array.isArray(ch)) scan(ch);
+    }
+  };
+  scan(input);
+  if (wrapperPresent) return null;
+  const firstW = order.indexOf("w");
+  const lastW = order.lastIndexOf("w");
+  if (firstW !== -1 && order.some((k, i) => k === "m" && i > firstW && i < lastW)) return null;
 
   const verseObjects = cloneVerseObjects(input);
   const leaves = walkLeavesWithParents(verseObjects);
   const wordLeaves = leaves.filter((l) => isWordLeaf(l.node));
   const newWords = [...newStripped.matchAll(WORD_RUN_RE)].map((m) => m[0]);
   if (wordLeaves.length === 0 || newWords.length === 0) return null;
+  // When a marker is present it gets re-placed by Step 2 reconcileMarkers, which
+  // anchors each marker by counting words PER content node. A word unit split
+  // across node boundaries (a possessive `Abram’s` = `…Abram`|`s`, a hyphenated
+  // name) is counted as 2 there but as 1 in the contiguous newPlain, so the
+  // marker anchors early and lands a word or two too soon (GEN 13:7's trailing
+  // `\p` jumping before "then"). The diff path's localized rewrite re-tokenizes
+  // those words contiguous and dodges it, so bail to it when both conditions
+  // hold. Marker-free verses (ZEC 7:14) and marker verses with no split units
+  // (ZEC 8:3) are unaffected.
+  if (order.includes("m") && wordLeaves.length !== newWords.length) return null;
 
   const gaps = nonWordGaps(newStripped); // N+1 gaps around the N word UNITS
   // extractEditableText whitespace-normalizes, dropping structural whitespace
