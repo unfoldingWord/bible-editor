@@ -19,7 +19,7 @@
 // Pure insertions (oldLen === 0) and pure deletions (newSubstring === "")
 // flow through the localized rewrite path too.
 
-import { normalizeEditable, isInFlowMarker, liftMarkerText } from "./usfm.ts";
+import { normalizeEditable, isInFlowMarker, isCharacterWrapper, liftMarkerText } from "./usfm.ts";
 
 export interface SmartReplaceResult {
   content: unknown;
@@ -387,6 +387,439 @@ function cloneVerseObjects(verseObjects: unknown[]): unknown[] {
   return JSON.parse(JSON.stringify(verseObjects)) as unknown[];
 }
 
+interface ParentLeaf {
+  node: Record<string, unknown>;
+  parent: unknown[];
+  index: number;
+  start: number;
+  end: number;
+}
+
+// Like walkLeaves, but records each text leaf's parent array + index so the
+// caller can splice new siblings in. Position is the running raw-text offset,
+// matching walkLeaves / rebuildRaw ordering.
+function walkLeavesWithParents(verseObjects: unknown[]): ParentLeaf[] {
+  const leaves: ParentLeaf[] = [];
+  let pos = 0;
+  const walk = (nodes: unknown[]) => {
+    for (let i = 0; i < nodes.length; i++) {
+      const o = nodes[i] as Record<string, unknown> | null;
+      if (!o) continue;
+      const text = o["text"];
+      if (typeof text === "string") {
+        leaves.push({ node: o, parent: nodes, index: i, start: pos, end: pos + text.length });
+        pos += text.length;
+      }
+      const children = o["children"];
+      if (Array.isArray(children)) walk(children);
+    }
+  };
+  walk(verseObjects);
+  return leaves;
+}
+
+// Split a string into the runs of non-word text surrounding each word run.
+// For N words returns N+1 gaps: gap[0] leads the first word, gap[i] sits
+// between word i-1 and word i, gap[N] trails the last word. Pairs with
+// WORD_RUN_RE so the gaps are exactly the punctuation/whitespace the aligner
+// does NOT treat as draggable.
+function nonWordGaps(text: string): string[] {
+  const gaps: string[] = [];
+  let last = 0;
+  for (const m of text.matchAll(WORD_RUN_RE)) {
+    gaps.push(text.slice(last, m.index ?? 0));
+    last = (m.index ?? 0) + m[0].length;
+  }
+  gaps.push(text.slice(last));
+  return gaps;
+}
+
+// Drop pure empty-text leaves (`{type:"text", text:""}`) the relayout may have
+// left behind when one gap absorbed several original text leaves.
+function pruneEmptyText(nodes: unknown[]): unknown[] {
+  const out: unknown[] = [];
+  for (const n of nodes) {
+    const o = n as Record<string, unknown> | null;
+    if (o && o["type"] === "text" && o["text"] === "" && !o["children"]) continue;
+    if (o && Array.isArray(o["children"])) out.push({ ...o, children: pruneEmptyText(o["children"] as unknown[]) });
+    else out.push(n);
+  }
+  return out;
+}
+
+// Punctuation-only relayout. Precondition: within [rawStart, rawEnd] the `\w`
+// words are UNCHANGED (same texts, 1:1) and only the surrounding punctuation /
+// whitespace differs — a translator wrapping an already-aligned phrase in
+// brackets / parentheses / quotes (MIC 5:14 `the {poles … goddess} Asherah`).
+// Keep every `\w` leaf (and therefore every enclosing `\zaln` milestone) exactly
+// where it is, and re-lay the new punctuation: write each gap's text into the
+// first existing text leaf of that gap (emptying any extras), and splice a new
+// text node beside the boundary word for a leading / trailing gap that has no
+// text leaf inside the range. The words never move, so their alignment survives.
+function relayoutPunctuation(
+  verseObjects: unknown[],
+  rawStart: number,
+  rawEnd: number,
+  replaceText: string,
+): SmartReplaceResult {
+  const leaves = walkLeavesWithParents(verseObjects);
+  const affected = leaves.filter((l) => l.start < rawEnd && l.end > rawStart);
+  const wordLeaves = affected.filter((l) => isWordLeaf(l.node));
+  const gaps = nonWordGaps(replaceText);
+  const textNode = (text: string) => ({ type: "text", text });
+  const insertions: { parent: unknown[]; index: number; node: unknown }[] = [];
+
+  let wi = 0; // words consumed so far → gaps[wi] is the gap before the next word
+  let gapHasLeaf = false; // a text leaf has already carried gaps[wi]
+  for (const leaf of affected) {
+    if (isWordLeaf(leaf.node)) {
+      // Leading gap for this word had no text leaf in range — splice it before
+      // the word (covers the range-edge gap, e.g. the opening "{").
+      if (!gapHasLeaf && gaps[wi]) {
+        insertions.push({ parent: leaf.parent, index: leaf.index, node: textNode(gaps[wi]) });
+      }
+      wi++;
+      gapHasLeaf = false;
+    } else {
+      leaf.node["text"] = gapHasLeaf ? "" : (gaps[wi] ?? "");
+      gapHasLeaf = true;
+    }
+  }
+  // Trailing gap after the last word (e.g. the closing "}").
+  if (!gapHasLeaf && gaps[wi] && wordLeaves.length > 0) {
+    const lastWord = wordLeaves[wordLeaves.length - 1];
+    insertions.push({ parent: lastWord.parent, index: lastWord.index + 1, node: textNode(gaps[wi]) });
+  }
+
+  // Apply splices grouped by array, highest index first so earlier indices in
+  // the SAME array stay valid (e.g. "}" after the last word then "{" before the
+  // first, both children of one milestone).
+  const byArray = new Map<unknown[], { index: number; node: unknown }[]>();
+  for (const ins of insertions) {
+    const list = byArray.get(ins.parent) ?? [];
+    list.push({ index: ins.index, node: ins.node });
+    byArray.set(ins.parent, list);
+  }
+  for (const [arr, list] of byArray) {
+    list.sort((a, b) => b.index - a.index);
+    for (const ins of list) arr.splice(ins.index, 0, ins.node);
+  }
+
+  const pruned = pruneEmptyText(verseObjects);
+  const newRaw = rebuildRaw(pruned);
+  return { content: { verseObjects: pruned }, plainText: normalize(newRaw), preservedAlignment: true };
+}
+
+// LCS over word surface text. Returns link[j] = the index in `oldWords` that
+// `newWords[j]` reuses, or -1 when newWords[j] is a genuinely new word. Each old
+// word is claimed at most once, order-preserving (leftmost on ties). LCS (not
+// greedy-by-occurrence) is mandatory: greedy silently transplants the WRONG
+// source word onto a survivor when a duplicate is deleted from between two equal
+// words or words are reordered — unaligning is acceptable, mis-aligning is not.
+function lcsLink(oldWords: string[], newWords: string[]): number[] {
+  const n = oldWords.length, m = newWords.length;
+  const dp: number[][] = Array.from({ length: n + 1 }, () => new Array(m + 1).fill(0));
+  for (let i = n - 1; i >= 0; i--)
+    for (let j = m - 1; j >= 0; j--)
+      dp[i][j] = oldWords[i] === newWords[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
+  const link = new Array<number>(m).fill(-1);
+  let i = 0, j = 0;
+  while (i < n && j < m) {
+    if (oldWords[i] === newWords[j]) { link[j] = i; i++; j++; }
+    else if (dp[i + 1][j] >= dp[i][j + 1]) i++; else j++;
+  }
+  return link;
+}
+
+// An inert line-break marker: an in-flow `\q*`/`\p`/`\b` quote/paragraph node
+// (NOT a `\qs`/`\f` content wrapper) with zero raw width — no `text`, no
+// `children`, no `endTag`. These sit BETWEEN content nodes as pure position
+// anchors. smartRebuildRange can re-lay a range that spans them (it splits any
+// straddling gap so closing punctuation lands BEFORE the marker), so the range
+// rebuild may include them; anything else markerish (a wrapper, a marker
+// carrying text/children) must still bail.
+function isInertLineBreakMarker(node: unknown): boolean {
+  if (!isInFlowMarker(node) || isCharacterWrapper(node)) return false;
+  const o = node as Record<string, unknown>;
+  if (typeof o["text"] === "string" && o["text"] !== "") return false;
+  if (Array.isArray(o["children"]) && o["children"].length > 0) return false;
+  if (typeof o["endTag"] === "string" && o["endTag"] !== "") return false;
+  return true;
+}
+
+// True when [rawStart,rawEnd) contains ONLY \w words, plain text, \zaln
+// milestones, and inert line-break markers (\q/\p/\b) — no \qs/\f content
+// wrappers, no markers carrying text/children. The range rebuild rewrites the
+// region wholesale; it can pass an inert marker through in document position and
+// split any gap that straddles it, but anything it can't safely reconstruct
+// means: don't fire, fall back.
+function rangeIsClean(nodes: unknown[], rawStart: number, rawEnd: number): boolean {
+  let pos = 0;
+  let clean = true;
+  const walk = (arr: unknown[]) => {
+    for (const n of arr) {
+      if (!clean) return;
+      const o = n as Record<string, unknown> | null;
+      const startPos = pos;
+      if (o && typeof o["text"] === "string") pos += (o["text"] as string).length;
+      if (o && Array.isArray(o["children"])) walk(o["children"] as unknown[]);
+      const endPos = pos;
+      if (!o) continue;
+      if (endPos <= rawStart || startPos >= rawEnd) continue; // outside range
+      const isWord = o["type"] === "word" && o["tag"] === "w";
+      const isText = o["type"] === "text" && typeof o["text"] === "string" && !Array.isArray(o["children"]);
+      const isZaln = o["tag"] === "zaln" && Array.isArray(o["children"]);
+      // An inert line-break marker is OK (handled by the gap-split below); any
+      // OTHER in-flow marker (wrapper / text-bearing) still bails.
+      if (isInertLineBreakMarker(n)) continue;
+      if (isInFlowMarker(n) || (!isWord && !isText && !isZaln)) { clean = false; return; }
+    }
+  };
+  walk(nodes);
+  return clean;
+}
+
+// Drop \zaln milestones that, after the rebuild, contain no \w descendant (e.g.
+// a milestone whose only word was deleted): promote their remaining children
+// (stray punctuation) up a level so no empty alignment wrapper survives.
+function pruneDeadMilestones(nodes: unknown[]): unknown[] {
+  const hasWord = (arr: unknown[]): boolean =>
+    arr.some((n) => {
+      const o = n as Record<string, unknown> | null;
+      if (!o) return false;
+      if (o["type"] === "word" && o["tag"] === "w") return true;
+      return Array.isArray(o["children"]) ? hasWord(o["children"] as unknown[]) : false;
+    });
+  const out: unknown[] = [];
+  for (const n of nodes) {
+    const o = n as Record<string, unknown> | null;
+    if (o && Array.isArray(o["children"])) {
+      const kids = pruneDeadMilestones(o["children"] as unknown[]);
+      if (o["tag"] === "zaln" && !hasWord(kids)) for (const k of kids) out.push(k);
+      else out.push({ ...o, children: kids });
+    } else out.push(n);
+  }
+  return out;
+}
+
+// Strip the transient rebuild marks off a node, returning a shallow copy.
+function stripRebuildMarks(o: Record<string, unknown>): Record<string, unknown> {
+  const { __planned: _p, __gapBefore: _gb, __gapAfter: _ga, __insBefore: _ib, __insAfter: _ia, __drop: _d, __markerClosing: _mc, ...rest } =
+    o as Record<string, unknown> & Record<string, unknown>;
+  return rest;
+}
+
+// Whitespace + CLOSING punctuation that hugs a word's RIGHT edge — the run that
+// belongs to the line BEFORE a `\q`/`\p` line break. Shared verbatim with
+// reconcileMarkers (its placement loop uses the same class) so smartRebuildRange
+// splits a marker-straddling gap on exactly the convention reconcileMarkers will
+// re-confirm in step 2. The em-dash is deliberately excluded: it leads as often
+// as it trails (ZEC 13:7 `companion” \q1 —the`).
+const MARKER_CLOSING_RE = /[\s,.;:!?)\]}”’…]/;
+
+// Split a gap string into the CLOSING run that trails the previous word (belongs
+// BEFORE a line-break marker) and the remainder that leads the next word
+// (belongs AFTER it). Mirrors reconcileMarkers' "skip whitespace+closing, drop
+// the marker at the first opening-punct/word" rule.
+function splitGapAtMarker(gap: string): { closing: string; rest: string } {
+  let i = 0;
+  while (i < gap.length && MARKER_CLOSING_RE.test(gap[i])) i++;
+  return { closing: gap.slice(0, i), rest: gap.slice(i) };
+}
+
+// Combined word+punctuation rebuild for a boundary-aligned, marker-free range
+// where the word COUNT or word IDENTITIES changed (insert / delete / replace)
+// AND/OR punctuation changed — the "fix the whole verse at once" case the four
+// tiers above all miss. Survivors (words present unchanged) keep their exact
+// milestone ancestry by STAYING IN the cloned tree; new words are spliced in as
+// bare `__edited` \w next to a survivor so the existing liftEditedOutOfZaln pops
+// them out and splits the milestone around them (handles nesting for free);
+// deleted survivors are dropped; the new punctuation is re-laid as gap text.
+// A reconstruction self-check guarantees no text is ever lost: on ANY mismatch
+// (or any failed gate) it returns null and the caller falls back to the exact
+// localizedRewriteVerse that runs today, so a verse is never made worse.
+function smartRebuildRange(
+  cloned: unknown[],
+  raw: string,
+  rawStart: number,
+  rawEnd: number,
+  matchWords: string[],
+  replaceText: string,
+  replaceWords: string[],
+): SmartReplaceResult | null {
+  if (!rangeIsClean(cloned, rawStart, rawEnd)) return null;
+  if (matchWords.length === 0 || replaceWords.length === 0) return null;
+
+  const leaves = walkLeavesWithParents(cloned);
+  const inRange = leaves.filter((l) => l.start < rawEnd && l.end > rawStart);
+
+  // Group in-range \w leaves into WORD UNITS. WORD_RUN_RE can bind several \w
+  // leaves into ONE token while the tree stores them apart: a connector splits
+  // them (Yahweh’s = \w "Yahweh" + text "’" + \w "s") or they sit adjacent
+  // across a milestone boundary (Asherahs = \w "Asherah" + \w "s" in two
+  // milestones). Map each matchWord token to the \w leaves whose raw offset
+  // falls in its span, so a survivor is reused as a whole unit (all its leaves
+  // + interior connector text stay put). Without this, a possessive anywhere in
+  // the range defeats the 1:1 leaf↔word assumption and the whole edit unaligns.
+  const tokens = [...raw.slice(rawStart, rawEnd).matchAll(WORD_RUN_RE)].map((m) => {
+    const s = rawStart + (m.index ?? 0);
+    return { start: s, end: s + m[0].length };
+  });
+  if (tokens.length !== matchWords.length) return null;
+  const units: { leaves: ParentLeaf[] }[] = tokens.map(() => ({ leaves: [] }));
+  for (const l of inRange) {
+    if (!isWordLeaf(l.node)) continue;
+    const k = tokens.findIndex((t) => l.start >= t.start && l.start < t.end);
+    if (k < 0) return null; // a \w leaf outside every token span — unexpected
+    units[k].leaves.push(l);
+  }
+  if (units.some((u) => u.leaves.length === 0)) return null; // a word with no \w leaf
+
+  const link = lcsLink(matchWords, replaceWords);
+  if (!link.some((x) => x >= 0)) return null; // no survivor → fall back
+  const consumed = new Set<number>(link.filter((x) => x >= 0));
+  const gaps = nonWordGaps(replaceText); // m+1 gaps; gaps[j] precedes word j
+
+  // Plan: tag each survivor unit (gapBefore on its first leaf), collect new words.
+  const newWords: { j: number; node: Record<string, unknown> }[] = [];
+  const trailNode: (Record<string, unknown>)[] = new Array(replaceWords.length);
+  for (let j = 0; j < replaceWords.length; j++) {
+    if (link[j] >= 0) {
+      const u = units[link[j]];
+      u.leaves[0].node["__planned"] = true;
+      u.leaves[0].node["__gapBefore"] = gaps[j];
+      trailNode[j] = u.leaves[u.leaves.length - 1].node;
+    } else {
+      const node: Record<string, unknown> = { type: "word", tag: "w", text: replaceWords[j], occurrence: "1", occurrences: "1", __edited: true, __gapBefore: gaps[j] };
+      newWords.push({ j, node });
+      trailNode[j] = node;
+    }
+  }
+  trailNode[replaceWords.length - 1]["__gapAfter"] = gaps[replaceWords.length];
+
+  // Deleted units → drop all their \w leaves. In-range text → dropped (gaps are
+  // re-laid fresh) EXCEPT text interior to a SURVIVING unit (its connectors).
+  for (let k = 0; k < units.length; k++) if (!consumed.has(k)) for (const l of units[k].leaves) l.node["__drop"] = true;
+  const survivorInterior = (l: ParentLeaf): boolean =>
+    tokens.some((t, k) => consumed.has(k) && l.start >= t.start && l.end <= t.end);
+  for (const l of inRange) if (!isWordLeaf(l.node) && !survivorInterior(l)) l.node["__drop"] = true;
+
+  // Anchor each new word to the nearest survivor unit edge (left unit's LAST leaf
+  // → insert after; else right unit's FIRST leaf → insert before), so it lands
+  // INSIDE that milestone and liftEditedOutOfZaln splits the milestone around it.
+  for (const nw of newWords) {
+    let anchor: Record<string, unknown> | null = null;
+    let key = "__insAfter";
+    for (let j2 = nw.j - 1; j2 >= 0; j2--) if (link[j2] >= 0) { const u = units[link[j2]]; anchor = u.leaves[u.leaves.length - 1].node; key = "__insAfter"; break; }
+    if (!anchor) for (let j2 = nw.j + 1; j2 < replaceWords.length; j2++) if (link[j2] >= 0) { const u = units[link[j2]]; anchor = u.leaves[0].node; key = "__insBefore"; break; }
+    if (!anchor) return null; // unreachable (survivor exists) — be safe
+    const list = (anchor[key] as unknown[] | undefined) ?? [];
+    list.push(nw.node);
+    anchor[key] = list;
+  }
+
+  // Marker-straddling gap split. An inert line-break marker (\q/\p/\b) sits at
+  // top level BETWEEN two words. The gap between those words was re-laid fresh as
+  // the next word's __gapBefore — which is emitted INSIDE that word's milestone,
+  // i.e. AFTER the marker, trapping a trailing comma on the wrong side of the
+  // line break. Split each such gap on the closing/opening boundary: the CLOSING
+  // run (belongs to the previous line) is stashed on the marker as __markerClosing
+  // and emitted as a bare text node BEFORE it; the remainder stays __gapBefore and
+  // leads the next word AFTER the marker. This is the same rule reconcileMarkers
+  // applies in step 2, so the output is a fixed point under it. Walk the top-level
+  // nodes in document order (markers only ever sit at top level in aligned source)
+  // and, for each marker, find the next word-bearing node carrying __gapBefore.
+  const firstGapLeafAfter = (fromIdx: number): Record<string, unknown> | null => {
+    for (let i = fromIdx; i < cloned.length; i++) {
+      const found = findGapBearer(cloned[i]);
+      if (found) return found;
+    }
+    return null;
+  };
+  function findGapBearer(node: unknown): Record<string, unknown> | null {
+    const o = node as Record<string, unknown> | null;
+    if (!o || o["__drop"]) return null;
+    // A new word spliced before/after this node carries the leading gap.
+    if (Array.isArray(o["__insBefore"]) && (o["__insBefore"] as Record<string, unknown>[])[0]?.["__gapBefore"] !== undefined)
+      return (o["__insBefore"] as Record<string, unknown>[])[0];
+    if (Object.prototype.hasOwnProperty.call(o, "__gapBefore")) return o;
+    if (Array.isArray(o["children"])) {
+      for (const c of o["children"] as unknown[]) {
+        const found = findGapBearer(c);
+        if (found) return found;
+      }
+    }
+    if (Array.isArray(o["__insAfter"]) && (o["__insAfter"] as Record<string, unknown>[])[0]?.["__gapBefore"] !== undefined)
+      return (o["__insAfter"] as Record<string, unknown>[])[0];
+    return null;
+  }
+  for (let i = 0; i < cloned.length; i++) {
+    const o = cloned[i] as Record<string, unknown> | null;
+    if (!o || !isInertLineBreakMarker(o)) continue;
+    const bearer = firstGapLeafAfter(i + 1);
+    if (!bearer) continue; // trailing marker — its preceding word's __gapAfter
+                            // already emits before it; nothing to split.
+    const gap = String(bearer["__gapBefore"] ?? "");
+    const { closing, rest } = splitGapAtMarker(gap);
+    o["__markerClosing"] = closing;
+    bearer["__gapBefore"] = rest;
+  }
+
+  const pushWord = (out: unknown[], nw: Record<string, unknown>) => {
+    if (nw["__gapBefore"]) out.push({ type: "text", text: nw["__gapBefore"] });
+    out.push({ type: "word", tag: "w", text: nw["text"], occurrence: "1", occurrences: "1", __edited: true });
+    if (nw["__gapAfter"]) out.push({ type: "text", text: nw["__gapAfter"] });
+  };
+  const has = (o: Record<string, unknown>, k: string) => Object.prototype.hasOwnProperty.call(o, k);
+  const pushNode = (out: unknown[], n: unknown) => {
+    const o = n as Record<string, unknown> | null;
+    // A survivor \w leaf carrying gap marks (a unit's first leaf has __gapBefore;
+    // the range's last word carries __gapAfter — which may be a non-first leaf of
+    // a multi-leaf unit). Mid-unit leaves carry no marks → emitted verbatim.
+    if (o && (o["__planned"] || has(o, "__gapBefore") || has(o, "__gapAfter"))) {
+      if (o["__gapBefore"]) out.push({ type: "text", text: o["__gapBefore"] });
+      out.push(stripRebuildMarks(o));
+      if (o["__gapAfter"]) out.push({ type: "text", text: o["__gapAfter"] });
+    } else if (o && Array.isArray(o["children"])) {
+      out.push({ ...stripRebuildMarks(o), children: rebuild(o["children"] as unknown[]) });
+    } else {
+      out.push(n);
+    }
+  };
+  function rebuild(nodes: unknown[]): unknown[] {
+    const out: unknown[] = [];
+    for (const n of nodes) {
+      const o = n as Record<string, unknown> | null;
+      if (o && o["__drop"]) continue;
+      // An inert line-break marker: emit its stashed CLOSING punctuation as a
+      // bare text node BEFORE it (so a trailing comma stays on the previous
+      // line), then the marker verbatim. Its trailing gap leads the next word.
+      if (o && isInertLineBreakMarker(o)) {
+        if (o["__markerClosing"]) out.push({ type: "text", text: o["__markerClosing"] });
+        out.push(stripRebuildMarks(o));
+        continue;
+      }
+      if (o && Array.isArray(o["__insBefore"])) for (const nw of o["__insBefore"] as Record<string, unknown>[]) pushWord(out, nw);
+      pushNode(out, n);
+      if (o && Array.isArray(o["__insAfter"])) for (const nw of o["__insAfter"] as Record<string, unknown>[]) pushWord(out, nw);
+    }
+    return out;
+  }
+
+  let outVOs = rebuild(cloned);
+  outVOs = stripLiftedMarkers(liftEditedOutOfZaln(outVOs));
+  outVOs = pruneDeadMilestones(outVOs);
+  outVOs = pruneEmptyText(outVOs);
+
+  // Self-check: the rebuilt raw text must equal exactly what the user typed for
+  // this range. Whitespace-collapse is allowed; anything else means a splice bug
+  // — discard and let the caller fall back to localizedRewriteVerse.
+  const newRaw = rebuildRaw(outVOs);
+  const expected = raw.slice(0, rawStart) + replaceText + raw.slice(rawEnd);
+  if (normalize(newRaw) !== normalize(expected)) return null;
+  return { content: { verseObjects: outVOs }, plainText: normalize(newRaw), preservedAlignment: true };
+}
+
 // Smart replace: given the verse content, the plain text the match was
 // found in, the regex used, and the literal active-match info, produce a
 // new content + plain text. Tries to keep alignment when possible.
@@ -552,6 +985,37 @@ export function smartReplaceVerse(
     }
   }
 
+  // Punctuation-only relayout: the words map 1:1 AND their text is unchanged —
+  // the ONLY difference is the surrounding punctuation/whitespace (the preserve
+  // path above bailed solely because the skeleton differs). This is a
+  // translator wrapping an aligned phrase in brackets / parentheses / quotes
+  // (MIC 5:14 `the {poles … goddess} Asherah`). The localized rewrite would
+  // re-tokenize the whole range UNALIGNED; instead keep every \w (and its
+  // milestone) put and just re-lay the new punctuation around them.
+  const wordsUnchanged =
+    startsAtBoundary &&
+    endsAtBoundary &&
+    matchWords.length > 0 &&
+    matchWords.length === replaceWords.length &&
+    wordsMatchLeaves &&
+    matchWords.every((mw, i) => mw === replaceWords[i]);
+  if (wordsUnchanged) {
+    return relayoutPunctuation(cloned, rawStart, rawEnd, replaceText);
+  }
+
+  // Combined word + punctuation edit (the "fix the whole verse at once" flow):
+  // the word count / identities changed AND/OR punctuation changed, but the
+  // surviving words still map 1:1 onto the old \w leaves. Keep every survivor's
+  // alignment, unalign only the genuinely new/changed words, re-lay punctuation.
+  // Gated + self-checked; returns null (→ localizedRewriteVerse) on any doubt.
+  // No wordsMatchLeaves requirement here: smartRebuildRange forms its own word
+  // UNITS (so split possessives like "Yahweh’s" / "Asherahs" are handled) and
+  // bails internally if it can't map cleanly.
+  if (startsAtBoundary && endsAtBoundary && matchWords.length > 0 && replaceWords.length > 0) {
+    const rebuilt = smartRebuildRange(cloned, raw, rawStart, rawEnd, matchWords, replaceText, replaceWords);
+    if (rebuilt) return rebuilt;
+  }
+
   // Structural mismatch — fall through to the localized rewrite so only
   // the milestones overlapping the change are destroyed (rather than the
   // whole verse).
@@ -709,17 +1173,163 @@ function canonicalizePureInsertion(
   return diff;
 }
 
-// A stable signature of the inline-marker layout: each marker's tag and the
-// number of words that precede it (whitespace-robust). Equal signatures mean
-// the markers weren't touched, so the marker reconcile can be skipped; a
-// different signature means a marker was added, removed, or moved.
+// The deletion counterpart of canonicalizePureInsertion. diffSingleChange reports
+// the CHARACTER-minimal deletion, which when the deleted word shares a boundary
+// letter with a neighbour cuts MID-NEIGHBOUR — e.g. deleting "again" from
+// "conceived again and" diffs as delete "gain a" (the "a" of "again" and of
+// "and" alias), so localizedRewriteVerse splits the untouched "and" into "a"
+// (left inside "again"'s milestone) + "nd". Slide the deleted block across its
+// equivalent positions (a rotation that leaves the result unchanged) and pick
+// one whose BOTH boundaries sit at word edges, so the range covers a whole word
+// and no neighbour is shattered. A deletion with no word-clean position (rare)
+// falls through unchanged. (Deletion analogue of the ZEC 5:3 insertion fix.)
+function canonicalizePureDeletion(
+  oldText: string,
+  diff: { start: number; oldLen: number; newSubstring: string },
+): { start: number; oldLen: number; newSubstring: string } {
+  if (diff.oldLen === 0 || diff.newSubstring.length !== 0) return diff;
+  const isCore = (c: string | undefined): boolean => c !== undefined && WORD_CORE_RE.test(c);
+  const len = diff.oldLen;
+  const straddles = (start: number): boolean =>
+    (isCore(oldText[start - 1]) && isCore(oldText[start])) ||
+    (isCore(oldText[start + len - 1]) && isCore(oldText[start + len]));
+  const candidates: number[] = [diff.start];
+  // Slide left: deleting one position earlier is equivalent while the char before
+  // the block equals the block's last char.
+  let s = diff.start;
+  while (s > 0 && oldText[s - 1] === oldText[s + len - 1]) { s--; candidates.push(s); }
+  // Slide right: equivalent while the char after the block equals its first char.
+  s = diff.start;
+  while (s + len < oldText.length && oldText[s + len] === oldText[s]) { s++; candidates.push(s); }
+  for (const c of candidates) if (!straddles(c)) return { start: c, oldLen: len, newSubstring: "" };
+  return diff;
+}
+
+// When two words that SHARE A BOUNDARY LETTER are swapped / reordered (or one is
+// an affix of the other), diffSingleChange produces a CHARACTER-minimal bounding
+// replacement that cuts MID-WORD — e.g. swapping 'their'/'the' in "their king the"
+// diffs as replace "ir king the" → " king their" (the shared "the" stays in the
+// common prefix), and 'net'/'dragnet' diffs as replace "net and drag" → "dragnet
+// and " (the shared "net" suffix aliases). Left mid-word, smartReplaceVerse's
+// boundary gates reject it and it drops to localizedRewriteVerse, which splits a
+// milestone mid-word and leaves a FRAGMENT of the OLD word (now carrying the NEW
+// word's text) INSIDE the foreign milestone — that fragment renders aligned to
+// Hebrew it never belonged to (HOS 7:3, ZEC 7:7, HAB 1:16).
+//
+// Fix: for a REPLACEMENT whose range straddles a word boundary AND spans MORE
+// THAN ONE word, expand both edges out to whole-word boundaries. localizedRewrite
+// then drops WHOLE milestones in the range (the reordered words go bare —
+// acceptable; reordering legitimately unaligns) instead of transplanting a
+// fragment. A SINGLE-word mid-word replacement (Case 5 "that"→"this", or the
+// mid-word single-word edits that diff as pure insertions in Cases 25/27) touches
+// only one word, so it is left untouched and keeps its own alignment.
+function snapReplacementToWordBoundaries(
+  oldText: string,
+  newText: string,
+  diff: { start: number; oldLen: number; newSubstring: string },
+): { start: number; oldLen: number; newSubstring: string } {
+  if (diff.oldLen === 0 || diff.newSubstring.length === 0) return diff;
+  const isCore = (c: string | undefined): boolean => c !== undefined && WORD_CORE_RE.test(c);
+  const start0 = diff.start;
+  const end0 = diff.start + diff.oldLen;
+  const leftMidWord = isCore(oldText[start0 - 1]) && isCore(oldText[start0]);
+  const rightMidWord = isCore(oldText[end0 - 1]) && isCore(oldText[end0]);
+  if (!leftMidWord && !rightMidWord) return diff; // already on word edges
+  // Count how many WORD_RUN_RE tokens the (unexpanded) range overlaps. A single
+  // word is a genuine in-word edit — leave it for the in-place / split paths.
+  let wordsTouched = 0;
+  for (const m of oldText.matchAll(WORD_RUN_RE)) {
+    const s = m.index ?? 0;
+    const e = s + m[0].length;
+    if (s < end0 && e > start0) wordsTouched++;
+  }
+  if (wordsTouched < 2) return diff;
+  // Expand each mid-word edge outward over the rest of its word. These chars sit
+  // in the diff's common prefix (left) / suffix (right), so they're identical in
+  // oldText / newText — the matching newText window is the same span shifted by
+  // the length delta, exactly as snapDiffToWordBoundaries computes it.
+  let start = start0;
+  let end = end0;
+  while (start > 0 && isCore(oldText[start - 1])) start--;
+  while (end < oldText.length && isCore(oldText[end])) end++;
+  if (start === start0 && end === end0) return diff;
+  const newEnd = newText.length - (oldText.length - end);
+  return { start, oldLen: end - start, newSubstring: newText.slice(start, newEnd) };
+}
+
+// A punctuation-only edit BETWEEN unchanged words can leave the diff's right (or
+// left) edge MID-GAP rather than on a word boundary: re-punctuating
+// "Uzziah, Jotham, Ahaz," → "(Uzziah); Jotham — Ahaz," diffs as replace
+// "Uzziah, Jotham," → "(Uzziah); Jotham —" — the right edge stops after the
+// comma that follows "Jotham" (the " Ahaz" tail is common suffix), so it lands
+// inside the `", "` text node that separates "Jotham" and "Ahaz". A mid-text-node
+// edge fails smartReplaceVerse's `endsAtBoundary` gate, so the words-unchanged
+// relayoutPunctuation path never fires and the edit drops to localizedRewrite,
+// which unaligns the untouched "Uzziah"/"Jotham" (HOS 1:1).
+//
+// Fix: when the diff's word SEQUENCE is unchanged (pure punctuation move), expand
+// each off-boundary edge to the nearest whole-word boundary — left to the start
+// of a word the edge bisects, right to the end of a bisected word OR, when the
+// right edge sits in a gap, forward over the next word so the inter-word
+// punctuation change is captured as one whole-word range. The expanded chars are
+// the diff's common prefix/suffix (identical in both strings), so the matching
+// newText window is the same span grown by the same amounts. The range now ends
+// on a word boundary and the words stay 1:1, so relayoutPunctuation keeps every
+// \w (and its milestone) put. A no-op for anything but a words-unchanged edit, or
+// one already on word boundaries.
+function snapPunctuationOnlyToWordBoundaries(
+  oldText: string,
+  newText: string,
+  diff: { start: number; oldLen: number; newSubstring: string },
+): { start: number; oldLen: number; newSubstring: string } {
+  if (diff.oldLen === 0 || diff.newSubstring.length === 0) return diff;
+  const start0 = diff.start;
+  const end0 = diff.start + diff.oldLen;
+  const matchText = oldText.slice(start0, end0);
+  const matchWords = [...matchText.matchAll(WORD_RUN_RE)].map((m) => m[0]);
+  const replaceWords = [...diff.newSubstring.matchAll(WORD_RUN_RE)].map((m) => m[0]);
+  if (matchWords.length === 0) return diff;
+  if (matchWords.length !== replaceWords.length) return diff;
+  if (!matchWords.every((mw, i) => mw === replaceWords[i])) return diff; // not punct-only
+  const runs = [...oldText.matchAll(WORD_RUN_RE)].map((m) => ({ s: m.index ?? 0, e: (m.index ?? 0) + m[0].length }));
+  let start = start0;
+  let end = end0;
+  const leftIn = runs.find((r) => r.s < start0 && r.e > start0);
+  if (leftIn) start = leftIn.s;
+  const rightIn = runs.find((r) => r.s < end0 && r.e > end0);
+  if (rightIn) end = rightIn.e;
+  else { const next = runs.find((r) => r.s >= end0); if (next) end = next.e; }
+  if (start === start0 && end === end0) return diff;
+  // Grown chars are common prefix (left) / suffix (right): identical in newText.
+  const rightGrow = end - end0;
+  const newStart = start; // left growth is shared prefix → same offset in newText
+  const newEnd = (start0 + diff.newSubstring.length) + rightGrow;
+  return { start: newStart, oldLen: end - start, newSubstring: newText.slice(newStart, newEnd) };
+}
+
+// A stable signature of the inline-marker layout: each marker's tag, the
+// number of words that precede it (whitespace-robust), AND the run of
+// punctuation that immediately precedes it (the trailing punctuation of the
+// previous word). Equal signatures mean the markers weren't touched, so the
+// marker reconcile can be skipped; a different signature means a marker was
+// added, removed, moved, OR had punctuation moved across it.
+//
+// The trailing-punctuation term is what catches "move the period to the end of
+// the line" edits: a trailing `.`/`,`/`”` on the far side of a `\q` line break
+// from its word (`among you \q1 .`) carries the SAME word count before the
+// marker whether it sits before or after the marker, so without it the move is
+// invisible (markerSignature unchanged → reconcile skipped → the edit no-ops,
+// the MIC 5:12 "refuses to move the period" report). Whitespace is trimmed
+// first so the term stays whitespace-robust like the word count.
 function markerSignature(plain: string): string {
   const re = new RegExp(MARKER_TOKEN_RE.source, MARKER_TOKEN_RE.flags);
   const parts: string[] = [];
   let m: RegExpExecArray | null;
   while ((m = re.exec(plain)) !== null) {
-    const wordsBefore = [...stripMarkerTokens(plain.slice(0, m.index)).matchAll(WORD_RUN_RE)].length;
-    parts.push(`${m[1]}@${wordsBefore}`);
+    const before = stripMarkerTokens(plain.slice(0, m.index));
+    const wordsBefore = [...before.matchAll(WORD_RUN_RE)].length;
+    const trailPunct = before.replace(/\s+$/u, "").match(/[^\p{L}\p{M}\p{N}\s]+$/u)?.[0] ?? "";
+    parts.push(`${m[1]}@${wordsBefore}:${trailPunct}`);
     if (m[0].length === 0) re.lastIndex++;
   }
   return parts.join(",");
@@ -756,7 +1366,10 @@ function reconcileMarkers(content: unknown, newPlain: string): SmartReplaceResul
   // Every node that isn't an inert in-flow marker is kept exactly — this is
   // where the \w words and \zaln milestones live. (Markers only ever sit at
   // top level in aligned source: they wrap milestones, never nest inside one.)
-  const contentNodes = cloned.filter((n) => !isInFlowMarker(n));
+  // Character wrappers (`\qs Selah\qs*`) are `type:"quote"` too, so
+  // isInFlowMarker matches them — but they hold aligned content, not a line
+  // break; keep them as content nodes or their wrapped word is dropped.
+  const contentNodes = cloned.filter((n) => !isInFlowMarker(n) || isCharacterWrapper(n));
 
   const countWords = (s: string): number => [...s.matchAll(WORD_RUN_RE)].length;
 
@@ -916,7 +1529,36 @@ export function smartEditVerse(
       // snap only fires for a TRUE word-extension — otherwise inserting a word
       // in front of an aligned neighbour ("truly " before "the") unaligns the
       // untouched neighbour.
-      const canon = canonicalizePureInsertion(oldStripped, newStripped, rawDiff);
+      // Symmetrically, a word DELETION can diff mid-neighbour when the deleted
+      // word shares a boundary letter with a neighbour (delete "again" from
+      // "conceived again and" → delete "gain a", splitting "and"). Slide it to a
+      // word-clean range first. Each canonicalizer is a no-op for the other's
+      // shape (insertion vs deletion), so chaining is safe.
+      // A REPLACEMENT can alias MID-WORD when two boundary-sharing words are
+      // swapped/reordered (swap 'their'/'the', affix 'net'/'dragnet'); left
+      // mid-word it drops to localizedRewriteVerse and transplants a fragment of
+      // one word onto another's milestone. Snap such a multi-word replacement out
+      // to whole-word edges so whole milestones drop (reordered words go bare)
+      // instead. Single-word replacements (Case 5) and the insertion/deletion
+      // shapes are no-ops here, so chaining with the other canonicalizers is safe.
+      // A pure PUNCTUATION move between unchanged words can diff with an edge
+      // mid-gap (HOS 1:1 "Uzziah, Jotham," → "(Uzziah); Jotham —"); grow it to
+      // whole-word boundaries so the words-unchanged relayout path can fire
+      // instead of localizedRewrite unaligning the untouched words. No-op for
+      // any edit that changes a word, or already on word boundaries — so it
+      // chains safely after the other canonicalizers.
+      const canon = snapPunctuationOnlyToWordBoundaries(
+        oldStripped,
+        newStripped,
+        snapReplacementToWordBoundaries(
+          oldStripped,
+          newStripped,
+          canonicalizePureDeletion(
+            oldStripped,
+            canonicalizePureInsertion(oldStripped, newStripped, rawDiff),
+          ),
+        ),
+      );
       const diff = snapDiffToWordBoundaries(oldStripped, newStripped, canon);
       // Word-count-match preserve path lives in smartReplaceVerse.
       if (diff.oldLen > 0) {
@@ -949,7 +1591,16 @@ export function smartEditVerse(
   // skip this when the markers weren't touched. Keep the word edit's
   // alignment verdict.
   if (markersChanged) {
-    const reconciled = reconcileMarkers(result.content, newPlain);
+    // Prune dead milestones BEFORE reconcile. If the word edit emptied a
+    // milestone of its `\w` (e.g. deleting the clause-final word whose milestone
+    // also held the trailing punctuation), the leftover punctuation must be a
+    // BARE text node so reconcileMarkers' closing-punctuation rule keeps it on
+    // the previous line. Left as a wordless milestone, reconcile treats it as a
+    // content node and wedges the marker BEFORE it — pushing e.g. a clause-final
+    // `;` onto the far side of the `\q` line break (the ZEC 6:12 corruption class).
+    const rc = (result.content as { verseObjects?: unknown[] } | null)?.verseObjects;
+    const preReconcile = Array.isArray(rc) ? { verseObjects: pruneDeadMilestones(rc) } : result.content;
+    const reconciled = reconcileMarkers(preReconcile, newPlain);
     result = {
       content: reconciled.content,
       plainText: reconciled.plainText,
@@ -964,7 +1615,14 @@ export function smartEditVerse(
   // leaf), so the user's next save heals them.
   const verseObjects = (result.content as { verseObjects?: unknown[] } | null)?.verseObjects;
   if (Array.isArray(verseObjects)) {
-    const normalized = normalizeWordPunctuation(verseObjects);
+    // Drop any `\zaln` milestone that an edit emptied of `\w` words. Lifting an
+    // edited/moved/deleted word out of a single-word milestone (the preserve,
+    // single-leaf, relayout AND localizedRewrite paths all do this) can leave a
+    // milestone wrapping only trailing punctuation/whitespace; usfm-js then
+    // serializes a dangling `\zaln-s …\*,\zaln-e\*` around bare text — corrupt
+    // alignment on disk. smartRebuildRange prunes its own output, but the other
+    // tiers don't, so prune globally here. Then clear any empty text it exposes.
+    const normalized = pruneEmptyText(pruneDeadMilestones(normalizeWordPunctuation(verseObjects)));
     return { ...result, content: { verseObjects: normalized } };
   }
   return result;
@@ -1044,6 +1702,38 @@ function partitionMilestoneChildren(
   return { before, after };
 }
 
+// Map a character position in the whitespace-NORMALIZED, marker-stripped plain
+// text to the matching position in the verse's UN-normalized raw concatenation.
+// The two diverge in whitespace WIDTH — raw keeps `\n` (line-broken `\w`),
+// double spaces, and any leading whitespace that `normalizeEditable` trimmed off
+// the plain side — so a pure-insertion offset taken as a raw char-length lands
+// short by exactly the accumulated whitespace delta. Left uncorrected, the
+// insertion splits the neighbouring word: inserting a bare word before a `\q`
+// marker whose preceding `\w` shares the prefix's trailing letter migrates that
+// letter onto the new word (HAB 1:12 "times"→"time"+"s", HAB 3:1
+// "shigyonoth"→"shigyono"+"th"). Walk both strings in lockstep, matching
+// non-whitespace chars by identity and collapsing each whitespace run on either
+// side, so positions stay anchored to real content regardless of whitespace
+// width. Returns -1 if the non-whitespace streams ever disagree (caller falls
+// back to the prefix-length proxy).
+function mapStrippedPosToRaw(plain: string, raw: string, pos: number): number {
+  const isWS = (c: string | undefined): boolean => c !== undefined && /\s/.test(c);
+  let pi = 0;
+  let ri = 0;
+  while (pi < pos) {
+    if (isWS(plain[pi])) {
+      while (pi < pos && isWS(plain[pi])) pi++;
+      while (ri < raw.length && isWS(raw[ri])) ri++;
+    } else {
+      while (ri < raw.length && isWS(raw[ri])) ri++;
+      if (raw[ri] !== plain[pi]) return -1;
+      pi++;
+      ri++;
+    }
+  }
+  return ri;
+}
+
 // Localized rewrite: walk top-level nodes once, keep those entirely
 // outside the change range untouched, split any text node that straddles
 // a boundary, and split any milestone that straddles a boundary into a
@@ -1105,7 +1795,14 @@ function localizedRewriteVerse(
     }
   } else {
     const prefixNoMarkers = stripMarkerTokens(oldPlain.slice(0, start));
-    rawStart = Math.min(prefixNoMarkers.length, rawTotal.length);
+    // Anchor by matching content, not raw char-length: raw whitespace width
+    // (leading `\n`, line-broken `\w`, double spaces) diverges from the
+    // normalized plain prefix, and a raw-length proxy lands short by that
+    // delta — splitting the neighbouring word when the insertion abuts it
+    // (the letter-migration corruption). Fall back to the length proxy only
+    // if the content streams disagree (shouldn't happen for a clean edit).
+    const mapped = mapStrippedPosToRaw(prefixNoMarkers, rawTotal, prefixNoMarkers.length);
+    rawStart = mapped >= 0 ? mapped : Math.min(prefixNoMarkers.length, rawTotal.length);
   }
   if (rawStart < 0) {
     // Couldn't map — bail to flat tokenization so we at least emit \w
