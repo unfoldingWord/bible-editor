@@ -577,7 +577,11 @@ function utf8Base64(s) {
   const r1 = usfmAlignmentShrinkRefused(incident, master);
   assert(r1.refused === true, `INCIDENT: text edit + collateral loss on an untouched word is refused`);
   assert(r1.offenders.length === 1 && r1.offenders[0].ref === "4:21", `offender is 4:21`);
-  assert(r1.offenders[0].renderedAligned === 2 && r1.offenders[0].masterAligned === 3, `2<3 aligned words reported`);
+  // The offender names the de-aligned word (Shelah) rather than a whole-verse count.
+  assert(
+    JSON.stringify(r1.offenders[0].lostWords) === JSON.stringify(["Shelah"]),
+    `offender names the de-aligned word "Shelah"`,
+  );
 
   // (1b) Pure collateral loss, NO text change (the classic NUM 24 shape) → REFUSE.
   const pureLoss = verse("1CH", 4, 21, ["Lekah", "and", "Shelah"], 1);
@@ -618,6 +622,40 @@ function utf8Base64(s) {
   // (6) Empty master → nothing to shrink.
   const r6 = usfmAlignmentShrinkRefused(master, "");
   assert(r6.refused === false, `empty master never refuses`);
+
+  // (7) Multiple words de-aligned in one verse → offender lists each lost word,
+  // in document order. The alert string (assembled in exportWorkflow.ts) caps
+  // the named words at 3 and appends "(+N more)" so the banner stays short while
+  // still naming WHICH words to re-align — the point of this refinement.
+  const big = ["the", "father", "of", "Bethrapha", "and", "Paseah"];
+  const bigMaster = verse("1CH", 4, 21, big);
+  // De-align the first three words (indices 0,1,2): "the","father","of".
+  const bigRender = verse("1CH", 4, 21, big)
+    .replace(/\\zaln-s \|x-strong="H100" x-content="the"\\\*/, "")
+    .replace(/\\zaln-s \|x-strong="H101" x-content="father"\\\*/, "")
+    .replace(/\\zaln-s \|x-strong="H102" x-content="of"\\\*/, "");
+  const r7 = usfmAlignmentShrinkRefused(bigRender, bigMaster);
+  assert(r7.refused === true, `multi-word de-alignment is refused`);
+  assert(
+    JSON.stringify(r7.offenders[0].lostWords) === JSON.stringify(["the", "father", "of"]),
+    `offender lists every lost word in document order`,
+  );
+  // Mirror of the exportWorkflow.ts alert-detail builder (cap 3 + "(+N more)").
+  const fmtOffender = (o) => {
+    const shown = o.lostWords.slice(0, 3).map((w) => `"${w}"`).join(",");
+    const extra = o.lostWords.length - 3;
+    return `${o.ref}: lost alignment on ${shown}${extra > 0 ? ` (+${extra} more)` : ""}`;
+  };
+  assert(
+    fmtOffender(r7.offenders[0]) === `4:21: lost alignment on "the","father","of"`,
+    `alert names up to 3 lost words (no "+N more" at exactly 3)`,
+  );
+  // Synthetic offender with 29 lost words → "(+26 more)" (the task's example).
+  const manyLost = { ref: "4:21", lostWords: ["the", "father", "of", ...Array(26).fill("x") ] };
+  assert(
+    fmtOffender(manyLost) === `4:21: lost alignment on "the","father","of" (+26 more)`,
+    `alert caps at 3 and appends "(+26 more)"`,
+  );
 }
 
 console.log("\nAll export smoke checks passed.");

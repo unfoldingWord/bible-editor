@@ -716,8 +716,13 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     if (result.refused) {
       const sample = result.offenders
         .slice(0, 5)
-        .map((o) => `${o.ref}(${o.renderedAligned}<${o.masterAligned})`)
-        .join(" ");
+        .map((o) => {
+          const shown = o.lostWords.slice(0, 3).map((w) => `"${w}"`).join(",");
+          const extra = o.lostWords.length - 3;
+          const more = extra > 0 ? ` (+${extra} more)` : "";
+          return `${o.ref}: lost alignment on ${shown}${more}`;
+        })
+        .join("; ");
       return { ok: false, detail: `align_loss_${result.offenders.length}:${sample}` };
     }
     return { ok: true, detail: "ok" };

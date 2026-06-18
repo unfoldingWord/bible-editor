@@ -227,7 +227,11 @@ function verseAlignStats(usfmText: string): Map<string, VerseAlignStat> {
 
 export interface AlignmentShrinkResult {
   refused: boolean;
-  offenders: Array<{ ref: string; renderedAligned: number; masterAligned: number }>;
+  // Each offending verse names the words that lost their \zaln source so the
+  // alert is actionable (which word to re-align), not just a whole-verse aligned
+  // count that reads oddly when a verse simultaneously loses one word's source
+  // and gains another's (e.g. 3<3, or even 4>3).
+  offenders: Array<{ ref: string; lostWords: string[] }>;
 }
 
 // Compare a rendered ULT/UST USFM against the current master USFM. For each
@@ -244,9 +248,9 @@ export interface AlignmentShrinkResult {
 // `reason === "changed_source"` (a re-pointed source on an unchanged word) is
 // the signature of a LEGITIMATE aligner-panel re-alignment, so it is NOT a
 // refusal — blocking it would over-correct. Empty master (fresh book) has
-// nothing aligned to lose. The reported offender numbers reuse the delta's
-// before/after aligned-word counts so the workflow's alert detail stays the same
-// shape (renderedAligned < masterAligned).
+// nothing aligned to lose. Each offender carries the de-aligned words' text
+// (the `lost` losses) so the workflow alert can name which words to re-align
+// instead of reporting an opaque whole-verse aligned count.
 export function usfmAlignmentShrinkRefused(
   renderedUsfm: string,
   masterUsfm: string,
@@ -264,13 +268,11 @@ export function usfmAlignmentShrinkRefused(
     );
     // Only a fully-lost \zaln source on a word that still exists is collateral
     // loss. changed_source (re-pointing) is legitimate re-alignment — log, allow.
-    const lostWords = delta.unexpectedLosses.filter((l) => l.reason === "lost");
+    const lostWords = delta.unexpectedLosses
+      .filter((l) => l.reason === "lost")
+      .map((l) => l.text);
     if (lostWords.length === 0) continue;
-    offenders.push({
-      ref,
-      renderedAligned: delta.afterAligned,
-      masterAligned: delta.beforeAligned,
-    });
+    offenders.push({ ref, lostWords });
   }
   return { refused: offenders.length > 0, offenders };
 }
