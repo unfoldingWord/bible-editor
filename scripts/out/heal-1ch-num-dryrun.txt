@@ -1,0 +1,80 @@
+Alignment-restoration dry-run — 1CH/NUM export damage
+Generated: 2026-06-18T14:19:05.960Z
+(read-only DCS fetch; cached under scripts/out/heal-cache/)
+
+==== 1CH ult  (unfoldingWord/en_ult/13-1CH.usfm) ====
+baseline commit: 666e6d9f8e   bible_version: ULT
+  4:21  NEEDS MANUAL RE-ALIGNMENT
+      text-changed: true   aligned: baseline 33 | master 4 (bare 29) | healed 32 (bare 1)
+      plain-text matches master: true   fully-aligned: false   preservedAlignment: true
+      REASON: 1 bare \w remain after heal
+      bare \w after heal: ["Lecah"]
+  4:30  HEALABLE
+      text-changed: true   aligned: baseline 9 | master 3 (bare 6) | healed 9 (bare 0)
+      plain-text matches master: true   fully-aligned: true   preservedAlignment: true
+  4:31  NEEDS MANUAL RE-ALIGNMENT
+      text-changed: true   aligned: baseline 24 | master 19 (bare 5) | healed 23 (bare 1)
+      plain-text matches master: true   fully-aligned: false   preservedAlignment: true
+      REASON: 1 bare \w remain after heal
+      bare \w after heal: ["Marcaboth"]
+
+==== NUM ult  (unfoldingWord/en_ult/04-NUM.usfm) ====
+baseline commit: e2418e7221   bible_version: ULT
+  24:7  NEEDS MANUAL RE-ALIGNMENT
+      text-changed: true   aligned: baseline 27 | master 0 (bare 29) | healed 22 (bare 7)
+      plain-text matches master: true   fully-aligned: false   preservedAlignment: true
+      REASON: 7 bare \w remain after heal
+      bare \w after heal: ["will","be","in","many","waters","be","lifted"]
+  24:8  NEEDS MANUAL RE-ALIGNMENT
+      text-changed: true   aligned: baseline 35 | master 0 (bare 36) | healed 28 (bare 8)
+      plain-text matches master: true   fully-aligned: false   preservedAlignment: true
+      REASON: 8 bare \w remain after heal
+      bare \w after heal: ["are","devour","and","crush","and","he","will","shatter"]
+  24:16  NEEDS MANUAL RE-ALIGNMENT
+      text-changed: true   aligned: baseline 33 | master 0 (bare 33) | healed 27 (bare 6)
+      plain-text matches master: true   fully-aligned: false   preservedAlignment: true
+      REASON: 6 bare \w remain after heal
+      bare \w after heal: ["one","hearing","knowing","the","one","who"]
+  24:19  NEEDS MANUAL RE-ALIGNMENT
+      text-changed: true   aligned: baseline 15 | master 0 (bare 15) | healed 1 (bare 14)
+      plain-text matches master: true   fully-aligned: false   preservedAlignment: false
+      REASON: 14 bare \w remain after heal
+      bare \w after heal: ["one","will","rule","from","Jacob","and","he","will","destroy","the","survivor","from","the","city"]
+  24:20  NEEDS MANUAL RE-ALIGNMENT
+      text-changed: true   aligned: baseline 26 | master 0 (bare 25) | healed 24 (bare 1)
+      plain-text matches master: true   fully-aligned: false   preservedAlignment: true
+      REASON: 1 bare \w remain after heal
+      bare \w after heal: ["unto"]
+  24:24  NEEDS MANUAL RE-ALIGNMENT
+      text-changed: true   aligned: baseline 26 | master 0 (bare 21) | healed 18 (bare 3)
+      plain-text matches master: true   fully-aligned: false   preservedAlignment: true
+      REASON: 3 bare \w remain after heal
+      bare \w after heal: ["coast","also","unto"]
+  18:23  HEALABLE
+      text-changed: false   aligned: baseline 43 | master 40 (bare 3) | healed 43 (bare 0)
+      plain-text matches master: true   fully-aligned: true   preservedAlignment: true
+
+==== 1CH ust  (unfoldingWord/en_ust/13-1CH.usfm) ====
+baseline commit: d7a567acfc   bible_version: UST
+  4:17  NEEDS MANUAL RE-ALIGNMENT
+      text-changed: true   aligned: baseline 75 | master 41 (bare 34) | healed 74 (bare 1)
+      plain-text matches master: true   fully-aligned: false   preservedAlignment: true
+      REASON: 1 bare \w remain after heal
+      bare \w after heal: ["Soco"]
+
+==== SUMMARY ====
+verse           text-chg base-al heal-al heal-bare plain-ok status
+1CH ult 4:21    true     33      32      1         true     NEEDS MANUAL RE-ALIGNMENT
+1CH ult 4:30    true     9       9       0         true     HEALABLE
+1CH ult 4:31    true     24      23      1         true     NEEDS MANUAL RE-ALIGNMENT
+NUM ult 24:7    true     27      22      7         true     NEEDS MANUAL RE-ALIGNMENT
+NUM ult 24:8    true     35      28      8         true     NEEDS MANUAL RE-ALIGNMENT
+NUM ult 24:16   true     33      27      6         true     NEEDS MANUAL RE-ALIGNMENT
+NUM ult 24:19   true     15      1       14        true     NEEDS MANUAL RE-ALIGNMENT
+NUM ult 24:20   true     26      24      1         true     NEEDS MANUAL RE-ALIGNMENT
+NUM ult 24:24   true     26      18      3         true     NEEDS MANUAL RE-ALIGNMENT
+NUM ult 18:23   false    43      43      0         true     HEALABLE
+1CH ust 4:17    true     75      74      1         true     NEEDS MANUAL RE-ALIGNMENT
+
+HEALABLE BY ENGINE: 2   NEEDS MANUAL RE-ALIGNMENT: 9
+  manual: 1CH ult 4:21, 1CH ult 4:31, NUM ult 24:7, NUM ult 24:8, NUM ult 24:16, NUM ult 24:19, NUM ult 24:20, NUM ult 24:24, 1CH ust 4:17
