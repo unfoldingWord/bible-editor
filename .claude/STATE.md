@@ -84,6 +84,23 @@ Not yet PR'd.
 
 ## In progress
 
+- **trusting-mclean** (2026-06-18) — Fix AI "-e"/orphan-`\zaln-e` corruption (MIC 6:10 UST; deferred
+  workstream from `project_ai_dash_e_zaln_corruption_mic610`). Confirmed via parsing the REAL en_ust master
+  verse that usfm-js produces two junk shapes — a node whose own `tag` IS the end-marker
+  (`{tag:"zaln-e\\*", content:"-e "}`) and a text node of standalone `-e` tokens that also carries the real
+  `?` (orphan `\zaln-e\*` markers ALONE are silently swallowed; `-e` is literal AI text). Shipped
+  `stripOrphanAlignmentMarkers` (`api/src/importParsers.ts`): drops orphan-tag nodes + strips standalone
+  `-e` tokens in place (token boundaries keep "re-entry" safe; touches only bare text + orphan-tag nodes,
+  never `\w` words → a broken clause just falls through as unaligned `\w`). Identity no-op on clean verses.
+  Wired into `extractVersesForRange` (bootstrap/reimport/AI raw-USFM) + the `pipelineImport` payload path,
+  mirroring `healReplacementChars`. Regression cases + full api suite + both typechecks green; verified on
+  the real master verse (0 junk, words preserved, plain_text clean). **Prod scan: exactly 1 affected row —
+  MIC 6:10 UST v12.** Editor rewrote the verse + deleted the visible `-e`, but 1 residual orphan node
+  survived (invisible in plain_text; re-exports `\zaln-e\* -e` to DCS on the nightly). **Heal SQL ready at
+  `scripts/out/heal-mic610.sql`** (version-guarded v12→v13, plain_text byte-identical, audited) but the
+  classifier BLOCKED the prod write — lead only asked to *check* prod. **PENDING lead OK to apply.** DCS
+  master 33-MIC.usfm still fully corrupt; the nightly D1→master export heals it once D1 is clean. Branch
+  `claude/trusting-mclean-8e3ba4`, commit 28854953. Not yet PR'd.
 - **vibrant-raman** (2026-06-18) — Heal AI-TN id/dup rot on en_tn master. tn_ISA.tsv had 3 unresolved
   git conflict markers (Richard Mahn's local `git merge origin/master` into the ISA `-be-` branch, then
   PR-merged to master) + 94 dup-note rows; ZEC 34 dups, NUM 1 dup, HOS 6 unique digit-first ids; ECC

@@ -13,6 +13,7 @@ import {
   splitGluedAlignmentWords,
   recomputeTargetOccurrences,
   dropDoubledLeadingMarkers,
+  stripOrphanAlignmentMarkers,
   parseTsv,
   refParts,
   makeVerseSortOrder,
@@ -732,6 +733,52 @@ const zaln = (attrs, targetText) => ({
   assert(findSuspiciousDoubleSpaces("clean note.").length === 0, `clean note → no suspects`);
   assert(findSuspiciousDoubleSpaces("| a  | b |").length === 0, `table padding not flagged`);
   assert(findSuspiciousDoubleSpaces("text\\n  indented").length === 0, `leading indentation not flagged`);
+}
+
+// --- stripOrphanAlignmentMarkers: AI-mangled "-e" / orphan \zaln-e junk -------
+// MIC 6:10 UST master: `\w others\w*\zaln-e\* -e -e -e -e -e -e -e -e?` — usfm-js
+// parks the junk as (a) a node tagged `zaln-e\*` with leaked content, and
+// (b) a text node of standalone "-e" tokens that also carries the real "?".
+{
+  // (a) orphan end-milestone node is dropped, its "-e" content discarded.
+  const out = stripOrphanAlignmentMarkers([
+    { tag: "w", type: "word", text: "others" },
+    { tag: "zaln-e\\*", content: "-e " },
+    { type: "text", text: "\\n" },
+  ]);
+  assert(!out.some((n) => typeof n.tag === "string" && n.tag.startsWith("zaln-e")), `orphan zaln-e node dropped`);
+  assert(out.some((n) => n.tag === "w" && n.text === "others"), `real \\w word kept`);
+}
+{
+  // (b) "-e" run stripped IN PLACE, trailing "?" preserved.
+  const out = stripOrphanAlignmentMarkers([{ type: "text", text: "-e -e -e -e -e -e -e -e?\\n" }]);
+  assert(out.length === 1 && out[0].text === "?\\n", `dash-e run stripped, "?" kept (got ${JSON.stringify(out[0]?.text)})`);
+}
+{
+  // A text node that is ONLY "-e" junk collapses to a single separator space —
+  // kept (not dropped) so two real words on either side don't merge.
+  const out = stripOrphanAlignmentMarkers([{ type: "text", text: "-e -e" }]);
+  assert(out.length === 1 && out[0].text === " ", `pure "-e" junk collapses to one space (got ${JSON.stringify(out[0]?.text)})`);
+  // A node that strips to truly empty IS dropped.
+  assert(stripOrphanAlignmentMarkers([{ type: "text", text: "-e" }]).length === 0, `"-e" alone (no space) dropped`);
+}
+{
+  // Boundary safety: real words are never touched.
+  assert(stripOrphanAlignmentMarkers([{ type: "text", text: "re-entry here" }])[0].text === "re-entry here", `hyphenated "re-entry" untouched`);
+  // "-e" mid-text between real words: token removed, single space kept.
+  assert(stripOrphanAlignmentMarkers([{ type: "text", text: "word -e word2" }])[0].text === "word word2", `interior "-e" token removed, spacing tidy`);
+  // A \w word is never altered (only bare text + orphan-tag nodes are).
+  const w = [{ tag: "w", type: "word", text: "-east" }];
+  assert(stripOrphanAlignmentMarkers(w) === w, `\\w word node left untouched (identity)`);
+}
+{
+  // No-op identity on a clean verse — no churn through the import pipeline.
+  const clean = [
+    { tag: "zaln", type: "milestone", content: "X", children: [{ tag: "w", type: "word", text: "hello" }], endTag: "zaln-e\\*" },
+    { type: "text", text: " " },
+    { tag: "w", type: "word", text: "world" },
+  ];
+  assert(stripOrphanAlignmentMarkers(clean) === clean, `clean verse returns the same array reference (identity)`);
 }
 
 console.log("\nAll parser smoke checks passed.");
