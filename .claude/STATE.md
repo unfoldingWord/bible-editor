@@ -44,6 +44,23 @@ Not yet PR'd.
 
 ## In progress
 
+- **vibrant-raman** (2026-06-18) — Heal AI-TN id/dup rot on en_tn master. tn_ISA.tsv had 3 unresolved
+  git conflict markers (Richard Mahn's local `git merge origin/master` into the ISA `-be-` branch, then
+  PR-merged to master) + 94 dup-note rows; ZEC 34 dups, NUM 1 dup, HOS 6 unique digit-first ids; ECC
+  already clean. Root cause = the AI-TN duplication round-trip ([[reimport re-inflates D1 from master]]):
+  validate-be `[5. ID Check]` flagged 132 digit-first ids (ISA 94/ZEC 28/HOS 6/ECC 3/NUM 1); proved the
+  newRowId fix is NOT regressed — D1's 94 ISA digit-first ids are an EXACT mirror of master's, so all
+  perpetuated from master by the nightly reimport, none freshly minted. **en_tn PR #7164** opened
+  (branch `bible-editor-heal-tn-ids-dups-20260618`, mergeable, +6/−144, 0 markers/0 digit-first/0 dups
+  in all 4 files). **DONE 2026-06-18**: PR #7164 MERGED (merge commit `8046caaab7`); D1 reconciled
+  (`scripts/out/heal/d1_*.sql`: 94+34+1 soft-deletes + 6 HOS renames via `heal-tn.mjs`, gitignored).
+  Verified master AND D1: **0 conflict markers, 0 digit-first ids, 0 pristine-AI dups** across all 5 books.
+  LESSON: dedup key MUST include `occurrence` (ISA 10:9 has 2 legit notes for אִם occ 1+2) and MUST exclude
+  editor-touched rows — 6 HOS rows that looked like dups were human-authored (user 35, `source=None`,
+  one `preserve`d, one `hint`/`unhint`) and were correctly LEFT untouched. Two follow-ups spawned as task
+  chips: (1) normalize double-space in AI notes (the whitespace divergence that caused the ISA conflict
+  markers); (2) bookReimport content-dedup + digit-first guard (defense-in-depth; PR #183/#225 already
+  disabled the mint engine, so cleanup alone stopped the bleeding).
 - **epic-yalow** — HOS 9:17 interior-marker edge-quote unalign fix → PR #226. Prod data checked:
   fully aligned (editor recovered it), no heal needed; minor markers left for in-app fix.
 - **goofy-ptolemy** — Shell-remount root-cause fix (see Last run). Branch
