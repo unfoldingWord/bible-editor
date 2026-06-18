@@ -1574,32 +1574,64 @@ function reconcileMarkers(content: unknown, newPlain: string): SmartReplaceResul
 
   const countWords = (s: string): number => [...s.matchAll(WORD_RUN_RE)].length;
 
-  // The edited verse's marker layout, each anchored by how many words precede it.
-  const markers: { node: unknown; wordsBefore: number }[] = [];
+  // The trailing run of non-word characters (punctuation + whitespace) in
+  // `text` — i.e. whatever the translator placed AFTER the last word. `\w`-class
+  // chars (letters/marks/numbers + intra-word joiners, the WORD_CHAR set) end the
+  // run, so a preceding marker's `q1`/`p` tag can't bleed into it.
+  const TRAILING_NONWORD_RE = new RegExp(`[^${WORD_CHAR.slice(1, -1)}]*$`, "u");
+
+  // The edited verse's marker layout, each anchored by how many words precede it,
+  // PLUS the punctuation the translator typed immediately before the marker token
+  // (`leadPunct`). That captured position is authoritative — it's where the user
+  // put the marker relative to the surrounding punctuation — so it drives the
+  // gap split below instead of a fixed closing-punctuation heuristic (which can't
+  // tell a line-ending em-dash from a line-opening one).
+  const markers: { node: unknown; wordsBefore: number; leadPunct: string }[] = [];
   const re = new RegExp(MARKER_TOKEN_RE.source, MARKER_TOKEN_RE.flags);
   let m: RegExpExecArray | null;
   while ((m = re.exec(newPlain)) !== null) {
-    const wordsBefore = countWords(stripMarkerTokens(newPlain.slice(0, m.index)));
-    markers.push({ node: nodeForMarker(m[1]), wordsBefore });
+    const before = newPlain.slice(0, m.index);
+    const wordsBefore = countWords(stripMarkerTokens(before));
+    const leadPunct = TRAILING_NONWORD_RE.exec(before)?.[0] ?? "";
+    markers.push({ node: nodeForMarker(m[1]), wordsBefore, leadPunct });
     if (m[0].length === 0) re.lastIndex++;
   }
 
   // Walk the content nodes, inserting each marker at the position where the
   // running word count reaches its anchor. The subtlety is WHERE within the
   // punctuation around that boundary the marker lands: a `\q`/`\p` is a line
-  // break, so CLOSING punctuation that trails the anchor word (`,`, `.`, `:`,
-  // `”`) belongs to the previous line and must stay BEFORE the marker, while
-  // OPENING punctuation that leads the next word (`“`, `‘`, `—the`) belongs to
-  // the new line and must stay AFTER it. Flushing greedily before every node
-  // wedged the marker ahead of trailing punctuation (the ZEC 6:12 ULT
-  // corruption: `saying \q1 :`, `sprout \q1 ,`, `Yahweh \q1 .`); skipping ALL
-  // 0-word nodes would instead push it past a leading em-dash (ZEC 13:7's
-  // `companion” \q1 —the declaration`). So: skip the run of whitespace + closing
-  // punctuation that follows the anchor word, then drop the marker at the first
-  // opening-punctuation / word character. CLOSING is everything that hugs a
-  // word's right edge; the dash is deliberately excluded — it leads as often as
-  // it trails, and the cases that put one next to a marker have it leading.
+  // break, so punctuation that trails the anchor word belongs to the previous
+  // line and stays BEFORE the marker, while punctuation that leads the next word
+  // belongs to the new line and stays AFTER it. The translator already told us
+  // which is which — `leadPunct` is exactly the punctuation they typed before the
+  // marker token — so we split the gap there. A fixed closing-punctuation class
+  // can't make this call: an em-dash ENDS a line as often as it OPENS one
+  // (`city—\q2 (and` vs `companion”\q1 —the`), and hard-coding it as
+  // "non-closing" stranded every line-ending dash/paren on the next line. CLOSING
+  // is the FALLBACK only — used when the captured position can't be matched
+  // against the tree gap (e.g. a marker with no surrounding text to anchor it).
   const CLOSING = /[\s,.;:!?)\]}”’…]/;
+
+  // Split a 0-word gap so its prefix equals `leadPunct` — the punctuation the
+  // translator put before the marker — tolerating whitespace differences between
+  // the captured plain text and the tree's gap. Returns the split index, or -1
+  // when `leadPunct`'s non-whitespace run isn't a clean prefix of `gap` (caller
+  // falls back to CLOSING).
+  const splitAtLead = (gap: string, leadPunct: string): number => {
+    const target = leadPunct.replace(/\s+/g, "");
+    let i = 0;
+    let matched = 0;
+    while (i < gap.length && matched < target.length) {
+      if (!/\s/.test(gap[i])) {
+        if (gap[i] !== target[matched]) return -1; // punctuation diverged
+        matched++;
+      }
+      i++;
+    }
+    if (matched < target.length) return -1; // gap ran out before matching
+    while (i < gap.length && /\s/.test(gap[i])) i++; // pull trailing ws before marker
+    return i;
+  };
   const isBareText = (n: unknown): n is { type: "text"; text: string } => {
     const o = n as Record<string, unknown> | null;
     return !!o && o["type"] === "text" && typeof o["text"] === "string";
@@ -1636,8 +1668,13 @@ function reconcileMarkers(content: unknown, newPlain: string): SmartReplaceResul
     if (!flushable()) {
       for (let k = ni; k < nj; k++) out.push(contentNodes[k]);
     } else {
-      let split = 0;
-      while (split < combined.length && CLOSING.test(combined[split])) split++;
+      // Honor the marker's typed position (leadPunct) when it cleanly maps onto
+      // the tree gap; otherwise fall back to the closing-punctuation heuristic.
+      let split = splitAtLead(combined, markers[mi].leadPunct);
+      if (split < 0) {
+        split = 0;
+        while (split < combined.length && CLOSING.test(combined[split])) split++;
+      }
       const before = combined.slice(0, split);
       const after = combined.slice(split);
       if (before) out.push({ type: "text", text: before });

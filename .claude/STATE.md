@@ -14,6 +14,21 @@
 
 ## Last run
 
+2026-06-18 · **editor-punctuation-placement** — Fixed reported prod bug: punctuation typed at
+the END of a poetic line (em-dash after "city" on a `\q1` line) jumped to the START of the next
+(`\q2`) line on save. Root cause in `reconcileMarkers` (`web/src/lib/replace.ts`): marker placement
+split the inter-word punctuation gap with a fixed `CLOSING` regex that **deliberately excluded the
+em-dash** ("leads as often as it trails"), so any line-ending dash/paren was always shoved past the
+marker. Fix: capture each marker's `leadPunct` (the punctuation the translator typed immediately
+before the marker token in `newPlain`) and split the gap there — honoring the *typed* position
+instead of guessing. `CLOSING` kept only as fallback when the captured position can't be matched
+against the tree gap. Strict generalization: Cases 21/22/23/24 still pass (their punctuation sits on
+the side the heuristic guessed). Regression Case 22b added (mirrors the screenshots). Pure-punctuation
+edits route relayoutUnchangedWords → reconcileMarkers, so reconcile is the placement authority; the
+parallel `splitGapAtMarker`/`MARKER_CLOSING_RE` in `smartRebuildRange` (word-edit tier, works on
+marker-stripped coords with no typed-position info) was left as-is. web suite + typecheck green.
+Branch `claude/editor-punctuation-placement-qdhflx`.
+
 2026-06-18 · **charming-gagarin** — Defense-in-depth guards on the DCS→D1 reimport so a
 still-dirty master can never re-introduce the TN id/duplication defects (mint engine already
 disabled by #183/#225; this is structural insurance). **Guard 1 (id):** `coerceRowId` (new pure
