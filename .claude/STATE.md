@@ -46,10 +46,13 @@ left UNTOUCHED (master is the normalized source; editor input is literal). Also 
 flags double spaces NOT after `.?!` (may mask a dropped word — ISA "**understanding**,  could" was missing
 "you") for human review without auto-editing content. One-time cleanup script `scripts/normalize-tn-whitespace.mjs`
 (dedup-tn.mjs pattern; PRISTINE `updated_by IS NULL` rows only; SQL guarded on unchanged-note + updated_by
-IS NULL so a row edited between dump/apply is skipped). **Prod dry-run: 20 rows would change — ISA 17, HOS 2,
-LAM 1; 16 flagged suspicious for review.** 38 unit assertions + full api+web typecheck green. NOT yet applied
-to prod / re-exported — awaiting go-ahead (and ideally a human pass over the 16 suspicious notes). Branch
-`claude/determined-meitner-67e5bf`.
+IS NULL so a row edited between dump/apply is skipped). 38 unit assertions + full api+web typecheck green.
+PR #229. **Prod cleanup APPLIED 2026-06-18: 20 rows healed (ISA 17, HOS 2, LAM 1), version-bumped + 20
+`normalize_whitespace` edit_log rows; post-apply dry-run = 0 remaining candidates (D1 converged to
+single-space).** Per user choice, did NOT manually re-export — the 06:00 UTC nightly cron will re-export
+ISA/HOS/LAM and (since D1 now matches master) the `-be-` branches stop diffing on whitespace. 16 notes
+flagged suspicious (possible dropped word, e.g. ISA "**understanding**,  could" missing "you") handed off
+for separate human content review — whitespace was still collapsed. Branch `claude/determined-meitner-67e5bf`.
 
 2026-06-17 · **epic-yalow** — Edge quotes on HOS 9:17 UST unaligned the WHOLE verse (13→0 ms).
 The verse is dense with INTERIOR `\q2`/`\q2`/`\q1` poetry markers, and `relayoutUnchangedWords`
