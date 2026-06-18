@@ -5,6 +5,7 @@ import type { RowKind, TnRow, TqRow, TwlRow } from "./types";
 import { currentUserId, requireEditor } from "./auth";
 import { activePipelineForChapter, lockedResponseBody } from "./chapterLock";
 import { broadcastChapter } from "./wsEvents";
+import { newRowId } from "./rowId";
 
 export const rows = new Hono<{ Bindings: Env; Variables: { userId?: number } }>();
 
@@ -102,20 +103,8 @@ const TwlPatch = z.object({
 
 const PATCH_SCHEMA = { tn: TnPatch, tq: TqPatch, twl: TwlPatch };
 
-// Generate a 4-char ID matching the DCS sticky-id convention. The TN TSV ID
-// grammar is ^[a-z][a-z0-9]{3}$ — the first char MUST be a letter. A
-// digit-first id can't legally exist in a TN TSV (it breaks round-tripping)
-// and bp-assistant rejects it when echoing hint rowIds, so the first position
-// draws from letters only; the remaining three are alphanumeric.
-// Exported so the AI auto-apply path in pipelineImport.ts can mint TN ids
-// without duplicating the alphabet.
-export function newRowId(): string {
-  const letters = "abcdefghijkmnpqrstuvwxyz";
-  const chars = letters + "23456789";
-  let out = letters[Math.floor(Math.random() * letters.length)];
-  for (let i = 0; i < 3; i++) out += chars[Math.floor(Math.random() * chars.length)];
-  return out;
-}
+// Row-id generation/validation/repair live in rowId.ts (pure leaf module, shared
+// with pipelineImport's id validation and the reimport's coerceRowId guard).
 
 const CreateTn = z.object({
   book: z.string(),

@@ -17,7 +17,7 @@ import {
   type VerseExtract,
 } from "./importParsers";
 import { NT_BOOKS } from "./dcsSources";
-import { newRowId } from "./rows";
+import { newRowId, isValidRowId } from "./rowId";
 
 interface OutputEntry {
   type?: string;
@@ -291,13 +291,11 @@ interface PendingImportRow {
 
 const AI_SOURCE = "ai_pipeline";
 
-// Canonical bible-editor row id: 4 chars, [a-z] then [a-z0-9]{3} — the format in
-// docs/bp-assistant-tn-hints-contract.md. bp-assistant normally emits this for
-// every TN row (hinted or not), and it's what gets pushed to master; preserving
-// it keeps D1 and master ids in lockstep. Only a malformed id (the occasional
-// incomplete emit) should be replaced with a freshly minted one.
-const ROW_ID_RE = /^[a-z][a-z0-9]{3}$/;
-const isValidRowId = (s: string): boolean => ROW_ID_RE.test(s);
+// Row-id grammar + validation now live in rowId.ts (ROW_ID_RE / isValidRowId),
+// shared with the reimport's coerceRowId guard. bp-assistant normally emits a
+// valid id for every TN row (hinted or not), and it's what gets pushed to
+// master; preserving it keeps D1 and master ids in lockstep. Only a malformed id
+// (the occasional incomplete emit) is replaced with a freshly minted one below.
 
 async function applyJobOutput(env: Env, job: ImportContext): Promise<ApplyResult> {
   // Look up the pipeline-starter's user id — every audit and updated_by

@@ -44,6 +44,8 @@ import {
   type VerseExtract,
 } from "./importParsers";
 import { activePipelineForChapter } from "./chapterLock";
+import { coerceRowId } from "./rowId";
+import { planTnContentDedup } from "./tnDedup";
 
 export type Resource = "ult" | "ust" | "tn" | "tq" | "twl";
 
@@ -73,6 +75,10 @@ export interface ReimportCounts {
   skipped_edited: number;
   skipped_locked: number;
   skipped_noop: number;
+  // Incoming row not inserted because an identical-content row already exists
+  // (Guard 2, content-dedup). Tracked separately from skipped_noop so the guard
+  // firing is visible in the reimport summary / logs.
+  skipped_dup: number;
   dcs_404: number;
   errors: string[];
 }
@@ -93,6 +99,7 @@ function zeroCounts(): ReimportCounts {
     skipped_edited: 0,
     skipped_locked: 0,
     skipped_noop: 0,
+    skipped_dup: 0,
     dcs_404: 0,
     errors: [],
   };
@@ -105,6 +112,7 @@ function addCounts(into: ReimportCounts, from: ReimportCounts): void {
   into.skipped_edited += from.skipped_edited;
   into.skipped_locked += from.skipped_locked;
   into.skipped_noop += from.skipped_noop;
+  into.skipped_dup += from.skipped_dup;
   into.dcs_404 += from.dcs_404;
   if (from.errors.length) into.errors.push(...from.errors);
 }
@@ -284,8 +292,20 @@ interface ParsedTsvRow {
 // gate) so the two agree exactly on field normalization — otherwise the gate
 // could mis-classify a chapter as unchanged. Returns null for a row with no ID.
 function parseTsvRow(r: Record<string, string>, kind: TsvKind): ParsedTsvRow | null {
-  const id = r["ID"];
-  if (!id) return null;
+  const rawId = r["ID"];
+  if (!rawId) return null;
+  // Guard 1 (defense-in-depth): coerce a malformed master id (e.g. the
+  // digit-first ids an old newRowId bug minted before PR #225) to a valid one
+  // BEFORE it's used anywhere. Coercing in this single shared normalizer is what
+  // keeps the three reimport consumers consistent — the apply path's by-id read,
+  // the diff gate (changedTsvChapters), and the prune (softDeleteRemovedTsvRows)
+  // all see the SAME coerced id, so an inserted-under-coerced-id row is never
+  // mistaken by the prune for a row master "no longer carries" and deleted. The
+  // coercion is deterministic, so it's idempotent across nights and a no-op for
+  // every well-formed id. (storedTsvRowToParsed deliberately does NOT coerce, so
+  // a legacy bad id already in D1 mismatches the coerced incoming id, re-runs the
+  // chapter, and self-heals: insert coerced + prune removes the stale raw id.)
+  const id = coerceRowId(rawId);
   const refRaw = r["Reference"] ?? "";
   const [ch, v] = refParts(refRaw);
   const occRaw = r["Occurrence"];
@@ -385,13 +405,38 @@ async function applyTsvRows(
     for (const row of rs.results) existing.set(String(row.id), row);
   }
 
+  // Guard 2 (defense-in-depth, TN only): content-dedup. Prevents the AI-note
+  // duplication round-trip (see tnDedup.ts). Decide up front which insert
+  // candidates duplicate a row that will already exist LIVE + PRISTINE under a
+  // different id — the decision is pure (no extra D1 read), off the by-id
+  // `existing` map we just loaded.
+  let skipDupIdx = new Set<number>();
+  if (kind === "tn") {
+    const existsAnyId = new Set(existing.keys());
+    const existsPristineId = new Set(
+      [...existing].filter(([, cur]) => isPristineTsv(kind, cur)).map(([id]) => id),
+    );
+    skipDupIdx = planTnContentDedup(incoming, existsPristineId, existsAnyId);
+  }
+
   // Classify. Inserts run per-row (DCS-new rows are rare); updates are batched.
   const nextSort = makeVerseSortOrder();
   const updates: Array<{ row: ParsedTsvRow; sortOrder: number; oldVersion: number }> = [];
-  for (const row of incoming) {
+  for (let i = 0; i < incoming.length; i++) {
+    const row = incoming[i];
     const sortOrder = nextSort(row.chapter, row.verse);
     const cur = existing.get(row.id);
     if (!cur) {
+      if (skipDupIdx.has(i)) {
+        counts.skipped_dup++;
+        console.warn("reimport: skipped duplicate-content tn row", {
+          book,
+          id: row.id,
+          chapter: row.chapter,
+          verse: row.verse,
+        });
+        continue;
+      }
       try {
         if (await tryInsertTsvRow(env, book, kind, row, sortOrder)) {
           counts.inserted++;
