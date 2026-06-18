@@ -1058,13 +1058,13 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         .join(", ");
       if (intent === "text_edit") {
         pushPipelineToast(
-          `Save blocked for ${book} ${chapterNum}:${verseNum} ${bibleVersion}: unexpected alignment loss${sample ? ` (${sample})` : ""}. The unsaved draft was discarded; re-open the alignment panel or make the text edit more narrowly.`,
+          `This edit can't preserve word alignment on words you didn't change, so it wasn't saved (${book} ${chapterNum}:${verseNum} ${bibleVersion}${sample ? `; affected: ${sample}` : ""}). The unsaved draft was discarded. Please note this verse (${book} ${chapterNum}:${verseNum}) for your admin to file a bug-fix review, or make the text edit more narrowly / re-align in the alignment panel.`,
           "error",
         );
         void drafts.clear(verseKey(book, chapterNum, verseNum, bibleVersion));
       } else {
         pushPipelineToast(
-          `Save blocked for ${book} ${chapterNum}:${verseNum} ${bibleVersion}: unexpected alignment loss${sample ? ` (${sample})` : ""}. Re-open the alignment panel or make the text edit more narrowly.`,
+          `This edit can't preserve word alignment on words you didn't change, so it wasn't saved (${book} ${chapterNum}:${verseNum} ${bibleVersion}${sample ? `; affected: ${sample}` : ""}). Please note this verse (${book} ${chapterNum}:${verseNum}) for your admin to file a bug-fix review, or re-align in the alignment panel.`,
           "error",
         );
       }

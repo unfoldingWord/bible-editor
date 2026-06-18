@@ -20,6 +20,7 @@
 // flow through the localized rewrite path too.
 
 import { normalizeEditable, isInFlowMarker, isCharacterWrapper, liftMarkerText } from "./usfm.ts";
+import { reassembleAlignment } from "./alignmentReassembly.ts";
 
 export interface SmartReplaceResult {
   content: unknown;
@@ -1726,16 +1727,41 @@ export function smartEditVerse(
     oldStripped !== newStripped && Array.isArray(contentVo)
       ? relayoutUnchangedWords(contentVo, newStripped)
       : null;
-  // The relayout leaves interior markers where the punctuation re-lay happened
-  // to land them; reconcileMarkers must re-place them even when markerSignature
-  // is unchanged (edge quotes shift no word count). Force Step 2 in that case.
+  // PRIMARY ENGINE — occurrence-keyed reassembly. When a WORD changed (so the
+  // pure-punctuation relayout above didn't fire), reassemble the verse word-by-
+  // word: every surviving target word (same NFC surface + occurrence) keeps its
+  // EXACT original \zaln milestone ancestry; only genuinely new/changed words go
+  // bare; punctuation is re-laid. This degrades LOCALLY BY CONSTRUCTION — a two-
+  // word edit at opposite ends of the verse (NUM 24:19) can only unalign those
+  // two words, never balloon a range and flatten untouched neighbours the way the
+  // single-range diff tiers do. Returns null on any structure it can't faithfully
+  // rebuild (\qs wrapper, text-bearing marker) or any reconstruction mismatch, so
+  // the diff tiers below remain the fallback, and the save guard the backstop.
+  // See alignmentReassembly.ts for the ported algorithm + what was NOT ported
+  // (gateway-edit's whole-verse flatten fallback).
+  const reassembled =
+    !relaid && oldStripped !== newStripped && Array.isArray(contentVo)
+      ? reassembleAlignment(contentVo, newStripped)
+      : null;
+  // Both the relayout and reassembly emit a tree with markers STRIPPED — Step 2
+  // reconcileMarkers must re-place them. The relayout only needs it for interior
+  // markers (edge quotes shift no word count); reassembly drops ALL markers, so
+  // it needs Step 2 whenever the verse has any in-flow marker at all.
   const relaidNeedsMarkerReconcile =
     relaid != null && Array.isArray(contentVo) && hasInteriorInflowMarker(contentVo);
+  const reassembledNeedsMarkerReconcile =
+    reassembled != null && Array.isArray(contentVo) && contentVo.some((n) => isInFlowMarker(n) && !isCharacterWrapper(n));
   if (oldStripped === newStripped) {
     // Pure marker edit — no word/punctuation change to apply.
     result = { content, plainText: oldStripped, preservedAlignment: true };
   } else if (relaid) {
     result = relaid;
+  } else if (reassembled) {
+    result = {
+      content: { verseObjects: reassembled.verseObjects },
+      plainText: normalizeEditable(newStripped),
+      preservedAlignment: reassembled.preservedAlignment,
+    };
   } else {
     const rawDiff = diffSingleChange(oldStripped, newStripped);
     if (rawDiff.oldLen === 0 && rawDiff.newSubstring === "") {
@@ -1810,8 +1836,10 @@ export function smartEditVerse(
   // skip this when the markers weren't touched. Keep the word edit's
   // alignment verdict. Also run it after a whole-verse relayout that crossed an
   // interior marker, to authoritatively re-place that marker (markersChanged can
-  // be false there — see relaidNeedsMarkerReconcile).
-  if (markersChanged || relaidNeedsMarkerReconcile) {
+  // be false there — see relaidNeedsMarkerReconcile). The reassembly engine
+  // strips ALL markers from its output, so it ALWAYS needs Step 2 to re-insert
+  // them at their new word-anchored positions (reassembledNeedsMarkerReconcile).
+  if (markersChanged || relaidNeedsMarkerReconcile || reassembledNeedsMarkerReconcile) {
     // Prune dead milestones BEFORE reconcile. If the word edit emptied a
     // milestone of its `\w` (e.g. deleting the clause-final word whose milestone
     // also held the trailing punctuation), the leftover punctuation must be a
