@@ -539,52 +539,81 @@ function utf8Base64(s) {
 }
 
 // --- usfmAlignmentShrinkRefused: ULT/UST verse alignment backstop ---
-// The 1CH 4:21 / NUM 24 signature — a verse keeps the same text but loses
-// \zaln milestones on words the translator never touched. The export must
-// refuse to ship that to master.
+// The 1CH 4:21 / NUM 24 signature — a verse loses \zaln milestones on words the
+// translator never touched. The export must refuse to ship that to master. This
+// now reuses analyzeAlignmentDelta (the SAME analyzer as the write-time guard):
+// it REFUSES on a word that survives the edit (matched by surface) but lost its
+// \zaln source (`reason === "lost"`) — REGARDLESS of whether the verse's plain
+// text also changed — and does NOT refuse on a re-pointed source on an unchanged
+// word (`reason === "changed_source"`, the legitimate re-alignment signature).
 {
   // One aligned token: \zaln-s ...\* \w word\w* \zaln-e\*. The explicit
   // \zaln-e\* close keeps each milestone a sibling span (usfm-js NESTS
   // consecutive open milestones with no close, which would keep a word "aligned"
-  // under an ancestor even after dropping its own \zaln). Passing dealignIdx
-  // emits a bare \w (no \zaln) for that word — the de-alignment under test.
-  const verse = (book, ch, v, words, dealignIdx = -1) =>
+  // under an ancestor even after dropping its own \zaln). dealignIdx emits a
+  // bare \w (no \zaln) for that word — the de-alignment under test. strongs lets
+  // a test override the per-word x-strong/x-content so a word can keep its
+  // surface text while its alignment source is re-pointed (changed_source).
+  const verse = (book, ch, v, words, dealignIdx = -1, strongs = null) =>
     `\\id ${book}\n\\c ${ch}\n\\p\n\\v ${v} ` +
     words
-      .map((word, i) =>
-        i === dealignIdx
-          ? `\\w ${word}|x-occurrence="1" x-occurrences="1"\\w*`
-          : `\\zaln-s |x-strong="H${100 + i}" x-content="${word}"\\*\\w ${word}|x-occurrence="1" x-occurrences="1"\\w*\\zaln-e\\*`,
-      )
+      .map((word, i) => {
+        if (i === dealignIdx) return `\\w ${word}|x-occurrence="1" x-occurrences="1"\\w*`;
+        const strong = strongs ? strongs[i] : `H${100 + i}`;
+        return `\\zaln-s |x-strong="${strong}" x-content="${word}"\\*\\w ${word}|x-occurrence="1" x-occurrences="1"\\w*\\zaln-e\\*`;
+      })
       .join(" ") +
     "\n";
 
   const master = verse("1CH", 4, 21, ["Lekah", "and", "Shelah"]);
 
-  // (1) Render lost an alignment on an untouched verse → REFUSE.
-  const lost = verse("1CH", 4, 21, ["Lekah", "and", "Shelah"], 1);
-  const r1 = usfmAlignmentShrinkRefused(lost, master);
-  assert(r1.refused === true, `de-alignment on unchanged-text verse is refused`);
+  // (1) INCIDENT regression: the verse's TEXT changed (Lekah→Lecah, a genuine
+  // edit) AND an UNTOUCHED neighbor (Shelah) lost its \zaln source. The OLD
+  // count-based, text-exempt code wrongly ALLOWED this — the plain-text change
+  // exempted exactly the verse that also carried collateral loss. The
+  // word-level analyzer matches Shelah in both by surface and sees its source
+  // is gone → `lost` → REFUSE.
+  const incident = verse("1CH", 4, 21, ["Lecah", "and", "Shelah"], 2);
+  const r1 = usfmAlignmentShrinkRefused(incident, master);
+  assert(r1.refused === true, `INCIDENT: text edit + collateral loss on an untouched word is refused`);
   assert(r1.offenders.length === 1 && r1.offenders[0].ref === "4:21", `offender is 4:21`);
   assert(r1.offenders[0].renderedAligned === 2 && r1.offenders[0].masterAligned === 3, `2<3 aligned words reported`);
 
-  // (2) Identical render → no shrink, allowed.
+  // (1b) Pure collateral loss, NO text change (the classic NUM 24 shape) → REFUSE.
+  const pureLoss = verse("1CH", 4, 21, ["Lekah", "and", "Shelah"], 1);
+  const r1b = usfmAlignmentShrinkRefused(pureLoss, master);
+  assert(r1b.refused === true, `de-alignment on an otherwise-unchanged verse is refused`);
+
+  // (2) Identical render → allowed.
   const r2 = usfmAlignmentShrinkRefused(master, master);
   assert(r2.refused === false, `identical render is allowed`);
 
-  // (3) Legitimate text rewrite (plain text changes) → exempt even if alignment drops.
+  // (3) Legitimate text rewrite where the ONLY de-aligned word is the one that
+  // CHANGED ("and"→"or", and the new word "or" is unaligned). No surviving word
+  // lost its source → no `lost` → ALLOWED.
   const rewritten = verse("1CH", 4, 21, ["Lekah", "or", "Shelah"], 1);
   const r3 = usfmAlignmentShrinkRefused(rewritten, master);
-  assert(r3.refused === false, `a real text change ("and"→"or") is allowed despite alignment drop`);
+  assert(r3.refused === false, `a real text change with no collateral lost word is allowed`);
 
-  // (4) Render ADDS alignment (more aligned words, same text) → never a shrink.
+  // (3b) Legitimate RE-ALIGNMENT: every word's surface text is UNCHANGED, every
+  // word stays aligned, but a word's \zaln source is RE-POINTED (changed_source).
+  // This is the aligner-panel signature — must NOT be over-blocked.
+  const repointed = verse("1CH", 4, 21, ["Lekah", "and", "Shelah"], -1, ["H100", "H999", "H102"]);
+  const r3b = usfmAlignmentShrinkRefused(repointed, master);
+  assert(r3b.refused === false, `a re-pointed source on an unchanged word (changed_source) is NOT over-blocked`);
+
+  // (4) Render ADDS alignment (more aligned words) → never a refusal.
   const r4 = usfmAlignmentShrinkRefused(master, verse("1CH", 4, 21, ["Lekah", "and", "Shelah"], 1));
-  assert(r4.refused === false, `growth in aligned words is not a shrink`);
+  assert(r4.refused === false, `growth in aligned words is not a refusal`);
 
-  // (5) Verse only on master (removed in render) → ignored (content change, not collateral).
+  // (5) Verse only on master (removed in render) → ignored (content change).
   const masterTwoVerses = master + verse("1CH", 4, 22, ["who", "ruled"]);
   const r5 = usfmAlignmentShrinkRefused(master, masterTwoVerses);
   assert(r5.refused === false, `a verse removed entirely is not flagged as alignment loss`);
+
+  // (5b) Verse ADDED in render (only on render side) → skipped, not a loss.
+  const r5b = usfmAlignmentShrinkRefused(masterTwoVerses, master);
+  assert(r5b.refused === false, `a verse added in the render is not flagged`);
 
   // (6) Empty master → nothing to shrink.
   const r6 = usfmAlignmentShrinkRefused(master, "");
