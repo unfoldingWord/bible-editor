@@ -15,6 +15,7 @@ import {
   parseTsv,
   recomputeTargetOccurrences,
   refParts,
+  stripOrphanAlignmentMarkers,
   type VerseExtract,
 } from "./importParsers";
 import { NT_BOOKS } from "./dcsSources";
@@ -808,6 +809,10 @@ async function applyVerseUpdate(
     try {
       const parsed = JSON.parse(contentJson) as { verseObjects?: unknown[] };
       if (Array.isArray(parsed?.verseObjects)) {
+        // Drop AI-mangled orphan `\zaln-e` end-markers / bare "-e" junk before
+        // recompute, so the cleaned tree lands in D1 (and exports clean). See
+        // stripOrphanAlignmentMarkers — MIC 6:10 UST.
+        parsed.verseObjects = stripOrphanAlignmentMarkers(parsed.verseObjects);
         recomputeTargetOccurrences(parsed.verseObjects);
         contentJson = JSON.stringify(parsed);
       }

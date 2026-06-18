@@ -430,6 +430,81 @@ export function splitGluedAlignmentWords(verseObjects: unknown[]): unknown[] {
   return recomputeTargetOccurrences(JSON.parse(JSON.stringify(lifted)) as unknown[]);
 }
 
+// ─── Strip AI-mangled orphan alignment end-markers ("-e" junk) ───────────────
+//
+// The AI aligner has emitted EXCESS `\zaln-e\*` end-milestones (more closes than
+// opens) and bare "-e" fragments — the mangled tail of a `\zaln-e\*` it failed to
+// write cleanly. Seen in MIC 6:10 UST master:
+//   \w others\w*\zaln-e\* -e -e -e -e -e -e -e -e?
+// usfm-js parks these as two junk shapes, NEITHER of which is ever legitimate:
+//   (a) a NODE whose own `tag` IS the end-marker — `{tag:"zaln-e\\*", content:"-e "}`.
+//       A real alignment is `{tag:"zaln", type:"milestone", …, endTag:"zaln-e\\*"}`;
+//       the close only ever lives in `endTag`, never as a node `tag`, so any node
+//       tagged `zaln-e…` is orphan junk. Dropped (its leaked `content` is "-e"
+//       garbage; any non-junk remainder is kept as a text node, just in case).
+//   (b) a TEXT node carrying standalone "-e" tokens — `"-e -e -e?…"`. It can also
+//       hold legitimate trailing punctuation (the verse's "?"), so we strip the
+//       tokens IN PLACE rather than dropping the node.
+//
+// We only ever touch bare `type:"text"` separator nodes and orphan-tagged nodes —
+// never `\w` words (type:"word") — so real translated text is never altered; an
+// un-`\zaln-s` clause just falls through as unaligned `\w` for the editor to
+// re-align. No-op (identity) on clean verses, the common case, so no churn.
+// Mirrors splitGluedAlignmentWords / dropDoubledLeadingMarkers: absorb the AI
+// defect at import so the nightly reimport of a still-corrupt master can't
+// re-inject it and a fresh AI apply lands clean.
+
+// Remove standalone "-e" tokens (bounded left by start/whitespace, right by
+// whitespace / closing punctuation / end) and tidy the whitespace they leave.
+// The boundaries keep real words safe: "re-entry" (no boundary before "-e") and
+// any "-e" mid-word never match.
+function stripDashETokens(s: string): string {
+  return s
+    .replace(/(?:^|(?<=\s))-e(?=\s|[.,?!;:”’")\]]|$)/g, "")
+    .replace(/ {2,}/g, " ")
+    .replace(/ +([.,?!;:?])/g, "$1");
+}
+
+export function stripOrphanAlignmentMarkers(verseObjects: unknown[]): unknown[] {
+  if (!Array.isArray(verseObjects)) return verseObjects;
+  const clean = (nodes: unknown[]): unknown[] => {
+    let changed = false;
+    const out: unknown[] = [];
+    for (const node of nodes) {
+      const o = node as Record<string, unknown> | null;
+      // (a) orphan end-milestone node — never legitimate.
+      if (o && typeof o["tag"] === "string" && (o["tag"] as string).startsWith("zaln-e")) {
+        changed = true;
+        const leaked = typeof o["content"] === "string" ? stripDashETokens(o["content"] as string) : "";
+        if (leaked.trim() !== "") out.push({ type: "text", text: leaked });
+        continue;
+      }
+      // (b) bare text node carrying "-e" junk — strip in place, keep punctuation.
+      if (o && o["type"] === "text" && typeof o["text"] === "string") {
+        const stripped = stripDashETokens(o["text"] as string);
+        if (stripped !== o["text"]) {
+          changed = true;
+          if (stripped !== "") out.push({ ...o, text: stripped });
+          continue;
+        }
+      }
+      // Recurse into children (milestone wrappers) — junk could nest if the AI
+      // mangled a close mid-milestone.
+      if (o && Array.isArray(o["children"])) {
+        const kids = clean(o["children"] as unknown[]);
+        if (kids !== o["children"]) {
+          changed = true;
+          out.push({ ...o, children: kids });
+          continue;
+        }
+      }
+      out.push(node);
+    }
+    return changed ? out : nodes;
+  };
+  return clean(verseObjects);
+}
+
 // ─── Collapse doubled leading poetry / paragraph markers ─────────────────────
 //
 // unfoldingWord ULT/UST USFM puts a verse's leading in-flow marker BEFORE its
@@ -627,8 +702,8 @@ export function extractVersesForRange(
       // Strip outer punctuation, de-glue any AI-introduced punctuation-spanning
       // `\w` (the freed words fall out to unaligned), then drop any leading marker
       // that merely doubles the previous verse's trailing one.
-      let verseObjects = splitGluedAlignmentWords(
-        normalizeWordPunctuation(verseObj.verseObjects ?? []),
+      let verseObjects = stripOrphanAlignmentMarkers(
+        splitGluedAlignmentWords(normalizeWordPunctuation(verseObj.verseObjects ?? [])),
       );
       verseObjects = dropDoubledLeadingMarkers(prevVerseObjects, verseObjects);
       prevVerseObjects = vNum >= 1 ? verseObjects : null;
