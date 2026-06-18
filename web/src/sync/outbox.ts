@@ -429,6 +429,21 @@ export function onOutboxResult(fn: ResultListener): () => void {
   return () => resultListeners.delete(fn);
 }
 
+function unexpectedAlignmentLossReason(body: unknown): string | null {
+  const error = (body as { error?: unknown } | null)?.error;
+  if (error !== "unexpected_alignment_loss") return null;
+  const losses = (body as { delta?: { unexpectedLosses?: unknown[] } } | null)
+    ?.delta?.unexpectedLosses;
+  const sample = Array.isArray(losses)
+    ? losses
+        .slice(0, 3)
+        .map((loss) => (loss as { text?: unknown } | null)?.text)
+        .filter((text): text is string => typeof text === "string" && text.length > 0)
+        .join(", ")
+    : "";
+  return `unexpected_alignment_loss${sample ? `: ${sample}` : ""}`;
+}
+
 async function dispatch(op: OutboxOp): Promise<Result> {
   try {
     let updated: unknown;
@@ -475,6 +490,10 @@ async function dispatch(op: OutboxOp): Promise<Result> {
       if (e.status === 409) {
         if (isChapterLockedBody(e.body)) {
           return { kind: "locked", lockBody: e.body };
+        }
+        const alignmentLoss = unexpectedAlignmentLossReason(e.body);
+        if (alignmentLoss) {
+          return { kind: "fatal", reason: alignmentLoss };
         }
         const body = e.body as { current?: unknown } | undefined;
         return { kind: "conflict", current: body?.current };

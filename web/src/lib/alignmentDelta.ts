@@ -1,3 +1,5 @@
+// Mirror of api/src/alignmentDelta.ts. Keep behavior in sync: the web copy
+// prevents optimistic local/outbox writes, and the API copy is the backstop.
 export type AlignmentIntent =
   | "text_edit"
   | "find_replace"
@@ -143,4 +145,3 @@ export function analyzeAlignmentDelta(beforeContent: unknown, afterContent: unkn
 export function intentAllowsUnexpectedAlignmentLoss(intent: AlignmentIntent): boolean {
   return intent === "alignment_edit";
 }
-

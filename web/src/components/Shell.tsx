@@ -1042,20 +1042,30 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     content: unknown,
     plainText: string,
     intent: AlignmentIntent,
+    expectedVersion = base.version,
   ): boolean => {
     const delta = analyzeAlignmentDelta(base.content, content);
     if (
       delta.unexpectedLosses.length > 0 &&
+      delta.wordSequenceUnchanged &&
       !intentAllowsUnexpectedAlignmentLoss(intent)
     ) {
       const sample = delta.unexpectedLosses
         .slice(0, 3)
         .map((loss) => loss.text)
         .join(", ");
-      pushPipelineToast(
-        `Save blocked for ${book} ${chapterNum}:${verseNum} ${bibleVersion}: unexpected alignment loss${sample ? ` (${sample})` : ""}. Re-open the alignment panel or make the text edit more narrowly.`,
-        "error",
-      );
+      if (intent === "text_edit") {
+        pushPipelineToast(
+          `Save blocked for ${book} ${chapterNum}:${verseNum} ${bibleVersion}: unexpected alignment loss${sample ? ` (${sample})` : ""}. The unsaved draft was discarded; re-open the alignment panel or make the text edit more narrowly.`,
+          "error",
+        );
+        void drafts.clear(verseKey(book, chapterNum, verseNum, bibleVersion));
+      } else {
+        pushPipelineToast(
+          `Save blocked for ${book} ${chapterNum}:${verseNum} ${bibleVersion}: unexpected alignment loss${sample ? ` (${sample})` : ""}. Re-open the alignment panel or make the text edit more narrowly.`,
+          "error",
+        );
+      }
       return false;
     }
     void outbox.enqueueVerse(
@@ -1063,7 +1073,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       chapterNum,
       verseNum,
       bibleVersion,
-      base.version,
+      expectedVersion,
       { content, plain_text: plainText, alignment_intent: intent },
     );
     return true;
@@ -1115,6 +1125,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
             content,
             plain,
             "alignment_edit",
+            _expectedVersion,
           );
         }
         // Optimistically fold the new alignment into the local chapter cache so
@@ -1192,6 +1203,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           content,
           plain,
           "alignment_edit",
+          _expectedVersion,
         );
         // Optimistic local update so content-derived UI (the broken-alignment
         // link) refreshes immediately — same as the single-panel aligner.

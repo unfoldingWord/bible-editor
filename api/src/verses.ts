@@ -167,6 +167,22 @@ verses.patch("/:book/:chapter/:verse/:bibleVersion", requireEditor, async (c) =>
     .bind(book, chapter, verse, bibleVersion)
     .first<VerseRow>();
   if (!existing) return c.json({ error: "not_found" }, 404);
+  if (existing.version !== expected) {
+    let freshParsed: unknown;
+    try {
+      freshParsed = parseVerseContentJson(existing);
+    } catch (err) {
+      if (err instanceof CorruptContentJsonError) {
+        logCorruptContentJson(err);
+        return c.json(corruptContentJsonBody(err), 500);
+      }
+      throw err;
+    }
+    return c.json(
+      { error: "version_mismatch", current: { ...existing, content: freshParsed } },
+      409,
+    );
+  }
   let existingParsed: unknown;
   try {
     existingParsed = parseVerseContentJson(existing);
@@ -181,6 +197,7 @@ verses.patch("/:book/:chapter/:verse/:bibleVersion", requireEditor, async (c) =>
   const delta = analyzeAlignmentDelta(existingParsed, parsed.data.content);
   if (
     delta.unexpectedLosses.length > 0 &&
+    delta.wordSequenceUnchanged &&
     !intentAllowsUnexpectedAlignmentLoss(alignmentIntent)
   ) {
     return c.json(
