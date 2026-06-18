@@ -1490,6 +1490,122 @@ function transplants(origContent, resultContent) {
     `round-trips to the typed text (got ${JSON.stringify(extractEditableText(r.content))})`);
 }
 
+// ─── Real-corpus fixtures (parsed from en_ult@e2418e7221 via usfm-js, then ───
+// slimmed to the fields the engine reads). NOT hand-fabricated alignment trees:
+// these are the verbatim parse of the pre-export DCS baseline that the NUM 24
+// alignment-loss investigation traced. Provenance + extraction probe documented
+// in the PR; re-derive with usfm.toJSON on 04-NUM.usfm / 13-1CH.usfm.
+
+// 1CH 4:21 — a long genealogy: 33/33 aligned, "of" ×7, "the" ×6, comma-separated
+// clauses. The shape the 1CH 4:21 prod report covered (current engine preserves
+// 32/33; only the actually-edited word unaligns).
+const CH1_4_21 = () => ({"verseObjects":[{"type":"milestone","tag":"zaln","strong":"H1121a","lemma":"בֵּן","morph":"He,Ncmpc","occurrence":"1","occurrences":"1","content":"בְּנֵי֙","endTag":"zaln-e\\*","children":[{"type":"word","tag":"w","text":"The","occurrence":"1","occurrences":"1"},{"type":"text","text":" "},{"type":"word","tag":"w","text":"sons","occurrence":"1","occurrences":"1"},{"type":"text","text":" "},{"type":"word","tag":"w","text":"of","occurrence":"1","occurrences":"7"}]},{"type":"text","text":" "},{"type":"milestone","tag":"zaln","strong":"H7956","lemma":"שֵׁלָה","morph":"He,Np","occurrence":"1","occurrences":"1","content":"שֵׁלָ֣ה","endTag":"zaln-e\\*","children":[{"type":"word","tag":"w","text":"Shelah","occurrence":"1","occurrences":"1"}]},{"type":"text","text":" "},{"type":"milestone","tag":"zaln","strong":"H1121a","lemma":"בֵּן","morph":"He,Ncmsc","occurrence":"1","occurrences":"1","content":"בֶן","endTag":"zaln-e\\*","children":[{"type":"word","tag":"w","text":"the","occurrence":"1","occurrences":"6"},{"type":"text","text":" "},{"type":"word","tag":"w","text":"son","occurrence":"1","occurrences":"1"},{"type":"text","text":" "},{"type":"word","tag":"w","text":"of","occurrence":"2","occurrences":"7"}]},{"type":"text","text":" "},{"type":"milestone","tag":"zaln","strong":"H3063","lemma":"יְהוּדָה","morph":"He,Np","occurrence":"1","occurrences":"1","content":"יְהוּדָ֔ה","endTag":"zaln-e\\*","children":[{"type":"word","tag":"w","text":"Judah","occurrence":"1","occurrences":"1"}]},{"type":"text","text":": "},{"type":"milestone","tag":"zaln","strong":"H6147","lemma":"עֵר","morph":"He,Np","occurrence":"1","occurrences":"1","content":"עֵ֚ר","endTag":"zaln-e\\*","children":[{"type":"word","tag":"w","text":"Er","occurrence":"1","occurrences":"1"}]},{"type":"text","text":", "},{"type":"milestone","tag":"zaln","strong":"H0001","lemma":"אָב","morph":"He,Ncmsc","occurrence":"1","occurrences":"2","content":"אֲבִ֣י","endTag":"zaln-e\\*","children":[{"type":"word","tag":"w","text":"the","occurrence":"2","occurrences":"6"},{"type":"text","text":" "},{"type":"word","tag":"w","text":"father","occurrence":"1","occurrences":"2"},{"type":"text","text":" "},{"type":"word","tag":"w","text":"of","occurrence":"3","occurrences":"7"}]},{"type":"text","text":" "},{"type":"milestone","tag":"zaln","strong":"H3922","lemma":"לֵכָה","morph":"He,Np","occurrence":"1","occurrences":"1","content":"לֵכָ֔ה","endTag":"zaln-e\\*","children":[{"type":"word","tag":"w","text":"Lekah","occurrence":"1","occurrences":"1"}]},{"type":"text","text":", "},{"type":"milestone","tag":"zaln","strong":"c:H3935","lemma":"לַעְדָּה","morph":"He,C:Np","occurrence":"1","occurrences":"1","content":"וְ⁠לַעְדָּ֖ה","endTag":"zaln-e\\*","children":[{"type":"word","tag":"w","text":"and","occurrence":"1","occurrences":"2"},{"type":"text","text":" "},{"type":"word","tag":"w","text":"Laadah","occurrence":"1","occurrences":"1"}]},{"type":"text","text":", "},{"type":"milestone","tag":"zaln","strong":"H0001","lemma":"אָב","morph":"He,Ncmsc","occurrence":"2","occurrences":"2","content":"אֲבִ֣י","endTag":"zaln-e\\*","children":[{"type":"word","tag":"w","text":"the","occurrence":"3","occurrences":"6"},{"type":"text","text":" "},{"type":"word","tag":"w","text":"father","occurrence":"2","occurrences":"2"},{"type":"text","text":" "},{"type":"word","tag":"w","text":"of","occurrence":"4","occurrences":"7"}]},{"type":"text","text":" "},{"type":"milestone","tag":"zaln","strong":"H4762","lemma":"מַרְאֵשָׁה","morph":"He,Np","occurrence":"1","occurrences":"1","content":"מָרֵשָׁ֑ה","endTag":"zaln-e\\*","children":[{"type":"word","tag":"w","text":"Mareshah","occurrence":"1","occurrences":"1"}]},{"type":"text","text":", "},{"type":"milestone","tag":"zaln","strong":"c:H4940","lemma":"מִשְׁפָּחָה","morph":"He,C:Ncfpc","occurrence":"1","occurrences":"1","content":"וּ⁠מִשְׁפְּח֛וֹת","endTag":"zaln-e\\*","children":[{"type":"word","tag":"w","text":"and","occurrence":"2","occurrences":"2"},{"type":"text","text":" "},{"type":"word","tag":"w","text":"the","occurrence":"4","occurrences":"6"},{"type":"text","text":" "},{"type":"word","tag":"w","text":"clans","occurrence":"1","occurrences":"1"},{"type":"text","text":" "},{"type":"word","tag":"w","text":"of","occurrence":"5","occurrences":"7"}]},{"type":"text","text":" "},{"type":"milestone","tag":"zaln","strong":"H1004b","lemma":"בַּיִת","morph":"He,Ncmsc","occurrence":"1","occurrences":"1","content":"בֵּית","endTag":"zaln-e\\*","children":[{"type":"word","tag":"w","text":"the","occurrence":"5","occurrences":"6"},{"type":"text","text":" "},{"type":"word","tag":"w","text":"house","occurrence":"1","occurrences":"1"},{"type":"text","text":" "},{"type":"word","tag":"w","text":"of","occurrence":"6","occurrences":"7"}]},{"type":"text","text":" "},{"type":"milestone","tag":"zaln","strong":"H5656","lemma":"עֲבֹדָה","morph":"He,Ncfsc","occurrence":"1","occurrences":"1","content":"עֲבֹדַ֥ת","endTag":"zaln-e\\*","children":[{"type":"word","tag":"w","text":"the","occurrence":"6","occurrences":"6"},{"type":"text","text":" "},{"type":"word","tag":"w","text":"service","occurrence":"1","occurrences":"1"},{"type":"text","text":" "},{"type":"word","tag":"w","text":"of","occurrence":"7","occurrences":"7"}]},{"type":"text","text":" "},{"type":"milestone","tag":"zaln","strong":"d:H0948","lemma":"בּוּץ","morph":"He,Td:Ncmsa","occurrence":"1","occurrences":"1","content":"הַ⁠בֻּ֖ץ","endTag":"zaln-e\\*","children":[{"type":"word","tag":"w","text":"linen","occurrence":"1","occurrences":"1"}]},{"type":"text","text":" "},{"type":"milestone","tag":"zaln","strong":"l:H1004b","lemma":"בַּיִת","morph":"He,R:Ncmsc","occurrence":"1","occurrences":"1","content":"לְ⁠בֵ֥ית","endTag":"zaln-e\\*","children":[{"type":"word","tag":"w","text":"at","occurrence":"1","occurrences":"1"},{"type":"text","text":" "},{"type":"word","tag":"w","text":"Beth","occurrence":"1","occurrences":"1"}]},{"type":"text","text":" "},{"type":"milestone","tag":"zaln","strong":"H0791","lemma":"אַשְׁבֵּעַ","morph":"He,Np","occurrence":"1","occurrences":"1","content":"אַשְׁבֵּֽעַ","endTag":"zaln-e\\*","children":[{"type":"word","tag":"w","text":"Ashbea","occurrence":"1","occurrences":"1"}]},{"type":"text","text":" \n"}]});
+
+// NUM 24:8 — 35/35 aligned; interleaved with \q1/\q2 line markers. The prod
+// edit was a heavy multi-clause rewrite (eat→devour, break→crush, strike→
+// shatter, + reordering). The current engine SHOULD keep every untouched word
+// aligned and only unalign the words that genuinely changed.
+const NUM_24_8 = () => ({"verseObjects":[{"type":"milestone","tag":"zaln","strong":"H0410","lemma":"אֵל","morph":"He,Ncmsa","occurrence":"1","occurrences":"1","content":"אֵ֚ל","endTag":"zaln-e\\*","children":[{"type":"word","tag":"w","text":"God","occurrence":"1","occurrences":"1"}]},{"type":"text","text":" "},{"type":"milestone","tag":"zaln","strong":"H3318","lemma":"יָצָא","morph":"He,Vhrmsc:Sp3ms","occurrence":"1","occurrences":"1","content":"מוֹצִיא֣⁠וֹ","endTag":"zaln-e\\*","children":[{"type":"word","tag":"w","text":"is","occurrence":"1","occurrences":"1"},{"type":"text","text":" "},{"type":"word","tag":"w","text":"bringing","occurrence":"1","occurrences":"1"},{"type":"text","text":" "},{"type":"word","tag":"w","text":"him","occurrence":"1","occurrences":"2"},{"type":"text","text":" "},{"type":"word","tag":"w","text":"out","occurrence":"1","occurrences":"1"}]},{"type":"text","text":" "},{"type":"milestone","tag":"zaln","strong":"m:H4714","lemma":"מִצְרַיִם","morph":"He,R:Np","occurrence":"1","occurrences":"1","content":"מִ⁠מִּצְרַ֔יִם","endTag":"zaln-e\\*","children":[{"type":"word","tag":"w","text":"from","occurrence":"1","occurrences":"1"},{"type":"text","text":" "},{"type":"word","tag":"w","text":"Egypt","occurrence":"1","occurrences":"1"}]},{"type":"text","text":",\n"},{"type":"quote","tag":"q1"},{"type":"milestone","tag":"zaln","strong":"k:H8443","lemma":"תּוֹעָפָה","morph":"He,R:Ncfpc","occurrence":"1","occurrences":"1","content":"כְּ⁠תוֹעֲפֹ֥ת","endTag":"zaln-e\\*","children":[{"type":"word","tag":"w","text":"like","occurrence":"1","occurrences":"1"},{"type":"text","text":" "},{"type":"word","tag":"w","text":"the","occurrence":"1","occurrences":"2"},{"type":"text","text":" "},{"type":"word","tag":"w","text":"horns","occurrence":"1","occurrences":"1"},{"type":"text","text":" "},{"type":"word","tag":"w","text":"of","occurrence":"1","occurrences":"1"}]},{"type":"text","text":" "},{"type":"milestone","tag":"zaln","strong":"H7214","lemma":"רְאֵם","morph":"He,Ncmsa","occurrence":"1","occurrences":"1","content":"רְאֵ֖ם","endTag":"zaln-e\\*","children":[{"type":"word","tag":"w","text":"a","occurrence":"1","occurrences":"1"},{"type":"text","text":" "},{"type":"word","tag":"w","text":"wild","occurrence":"1","occurrences":"1"},{"type":"text","text":" "},{"type":"word","tag":"w","text":"ox","occurrence":"1","occurrences":"1"}]},{"type":"text","text":" "},{"type":"milestone","tag":"zaln","strong":"l","lemma":"","morph":"He,R:Sp3ms","occurrence":"1","occurrences":"1","content":"ל֑⁠וֹ","endTag":"zaln-e\\*","children":[{"type":"word","tag":"w","text":"for","occurrence":"1","occurrences":"1"},{"type":"text","text":" "},{"type":"word","tag":"w","text":"him","occurrence":"2","occurrences":"2"}]},{"type":"text","text":".\n"},{"type":"quote","tag":"q2"},{"type":"milestone","tag":"zaln","strong":"H0398","lemma":"אָכַל","morph":"He,Vqi3ms","occurrence":"1","occurrences":"1","content":"יֹאכַ֞ל","endTag":"zaln-e\\*","children":[{"type":"word","tag":"w","text":"He","occurrence":"1","occurrences":"1"},{"type":"text","text":" "},{"type":"word","tag":"w","text":"will","occurrence":"1","occurrences":"3"},{"type":"text","text":" "},{"type":"word","tag":"w","text":"eat","occurrence":"1","occurrences":"1"}]},{"type":"text","text":" "},{"type":"milestone","tag":"zaln","strong":"H1471a","lemma":"גּוֹי","morph":"He,Ncmpa","occurrence":"1","occurrences":"1","content":"גּוֹיִ֣ם","endTag":"zaln-e\\*","children":[{"type":"word","tag":"w","text":"the","occurrence":"2","occurrences":"2"},{"type":"text","text":" "},{"type":"word","tag":"w","text":"nations","occurrence":"1","occurrences":"1"}]},{"type":"text","text":", "},{"type":"milestone","tag":"zaln","strong":"H6862c","lemma":"צַר","morph":"He,Ncmpc:Sp3ms","occurrence":"1","occurrences":"1","content":"צָרָ֗י⁠ו","endTag":"zaln-e\\*","children":[{"type":"word","tag":"w","text":"his","occurrence":"1","occurrences":"2"},{"type":"text","text":" "},{"type":"word","tag":"w","text":"enemies","occurrence":"1","occurrences":"1"}]},{"type":"text","text":".\n"},{"type":"quote","tag":"q2"},{"type":"milestone","tag":"zaln","strong":"c:H6106","lemma":"עֶצֶם","morph":"He,C:Ncfpc:Sp3mp","occurrence":"1","occurrences":"1","content":"וְ⁠עַצְמֹתֵי⁠הֶ֛ם","endTag":"zaln-e\\*","children":[{"type":"word","tag":"w","text":"And","occurrence":"1","occurrences":"2"}]},{"type":"text","text":" "},{"type":"milestone","tag":"zaln","strong":"H1633b","lemma":"גָּרַם","morph":"He,Vpi3ms","occurrence":"1","occurrences":"1","content":"יְגָרֵ֖ם","endTag":"zaln-e\\*","children":[{"type":"word","tag":"w","text":"he","occurrence":"1","occurrences":"2"},{"type":"text","text":" "},{"type":"word","tag":"w","text":"will","occurrence":"2","occurrences":"3"},{"type":"text","text":" "},{"type":"word","tag":"w","text":"break","occurrence":"1","occurrences":"1"}]},{"type":"text","text":" "},{"type":"milestone","tag":"zaln","strong":"c:H6106","lemma":"עֶצֶם","morph":"He,C:Ncfpc:Sp3mp","occurrence":"1","occurrences":"1","content":"וְ⁠עַצְמֹתֵי⁠הֶ֛ם","endTag":"zaln-e\\*","children":[{"type":"word","tag":"w","text":"their","occurrence":"1","occurrences":"1"},{"type":"text","text":" "},{"type":"word","tag":"w","text":"bones","occurrence":"1","occurrences":"1"}]},{"type":"text","text":".\n"},{"type":"quote","tag":"q2"},{"type":"milestone","tag":"zaln","strong":"c:H2671","lemma":"חֵץ","morph":"He,C:Ncmpc:Sp3ms","occurrence":"1","occurrences":"1","content":"וְ⁠חִצָּ֥י⁠ו","endTag":"zaln-e\\*","children":[{"type":"word","tag":"w","text":"And","occurrence":"2","occurrences":"2"}]},{"type":"text","text":" "},{"type":"milestone","tag":"zaln","strong":"H4272","lemma":"מָחַץ","morph":"He,Vqi3ms","occurrence":"1","occurrences":"1","content":"יִמְחָֽץ","endTag":"zaln-e\\*","children":[{"type":"word","tag":"w","text":"he","occurrence":"2","occurrences":"2"},{"type":"text","text":" "},{"type":"word","tag":"w","text":"will","occurrence":"3","occurrences":"3"},{"type":"text","text":" "},{"type":"word","tag":"w","text":"strike","occurrence":"1","occurrences":"1"}]},{"type":"text","text":" "},{"type":"milestone","tag":"zaln","strong":"c:H2671","lemma":"חֵץ","morph":"He,C:Ncmpc:Sp3ms","occurrence":"1","occurrences":"1","content":"וְ⁠חִצָּ֥י⁠ו","endTag":"zaln-e\\*","children":[{"type":"word","tag":"w","text":"his","occurrence":"2","occurrences":"2"},{"type":"text","text":" "},{"type":"word","tag":"w","text":"arrows","occurrence":"1","occurrences":"1"}]},{"type":"text","text":".\n\n"},{"tag":"ts\\*"},{"type":"quote","tag":"q1"}]});
+
+// NUM 24:19 — 15/15 aligned; one interior \q2 and a trailing \m. The prod edit
+// changed a word near the START (he→{one}) AND removed the closing quote at the
+// verse END (city.” → city.). Investigation fixture for the NUM 24 alignment
+// loss. See Case 64 for why this still flattens on the current engine.
+const NUM_24_19 = () => ({"verseObjects":[{"type":"milestone","tag":"zaln","strong":"c:H7287a","lemma":"רָדָה","morph":"He,C:Vqj3ms","occurrence":"1","occurrences":"1","content":"וְ⁠יֵ֖רְדְּ","endTag":"zaln-e\\*","children":[{"type":"word","tag":"w","text":"And","occurrence":"1","occurrences":"1"},{"type":"text","text":" "},{"type":"word","tag":"w","text":"he","occurrence":"1","occurrences":"2"},{"type":"text","text":" "},{"type":"word","tag":"w","text":"will","occurrence":"1","occurrences":"2"},{"type":"text","text":" "},{"type":"word","tag":"w","text":"rule","occurrence":"1","occurrences":"1"}]},{"type":"text","text":" "},{"type":"milestone","tag":"zaln","strong":"m:H3290","lemma":"יַעֲקֹב","morph":"He,R:Np","occurrence":"1","occurrences":"1","content":"מִֽ⁠יַּעֲקֹ֑ב","endTag":"zaln-e\\*","children":[{"type":"word","tag":"w","text":"from","occurrence":"1","occurrences":"2"},{"type":"text","text":" "},{"type":"word","tag":"w","text":"Jacob","occurrence":"1","occurrences":"1"}]},{"type":"text","text":",\n"},{"type":"quote","tag":"q2"},{"type":"milestone","tag":"zaln","strong":"c:H0006","lemma":"אָבַד","morph":"He,C:Vhq3ms","occurrence":"1","occurrences":"1","content":"וְ⁠הֶֽאֱבִ֥יד","endTag":"zaln-e\\*","children":[{"type":"word","tag":"w","text":"and","occurrence":"1","occurrences":"1"},{"type":"text","text":" "},{"type":"word","tag":"w","text":"he","occurrence":"2","occurrences":"2"},{"type":"text","text":" "},{"type":"word","tag":"w","text":"will","occurrence":"2","occurrences":"2"},{"type":"text","text":" "},{"type":"word","tag":"w","text":"destroy","occurrence":"1","occurrences":"1"}]},{"type":"text","text":" "},{"type":"milestone","tag":"zaln","strong":"H8300","lemma":"שָׂרִיד","morph":"He,Ncmsa","occurrence":"1","occurrences":"1","content":"שָׂרִ֖יד","endTag":"zaln-e\\*","children":[{"type":"word","tag":"w","text":"the","occurrence":"1","occurrences":"1"},{"type":"text","text":" "},{"type":"word","tag":"w","text":"survivor","occurrence":"1","occurrences":"1"}]},{"type":"text","text":" "},{"type":"milestone","tag":"zaln","strong":"m:H5892b","lemma":"עִיר","morph":"He,R:Ncfsa","occurrence":"1","occurrences":"1","content":"מֵ⁠עִֽיר","endTag":"zaln-e\\*","children":[{"type":"word","tag":"w","text":"from","occurrence":"2","occurrences":"2"},{"type":"text","text":" "},{"type":"word","tag":"w","text":"a","occurrence":"1","occurrences":"1"},{"type":"text","text":" "},{"type":"word","tag":"w","text":"city","occurrence":"1","occurrences":"1"}]},{"type":"text","text":".”\n\n"},{"tag":"ts\\*"},{"type":"paragraph","tag":"m"}]});
+
+function countAligned(content) {
+  const aw = alignedWords(content);
+  return { aligned: aw.filter((x) => x.strongs.length > 0).length, total: aw.length };
+}
+
+// ─── Case 62: 1CH 4:21 genealogy — edge punctuation + 1-char mid edit ────────
+// The shape that historically whole-verse-flattened (a dense genealogy with many
+// repeated short words). The current engine must keep all but the edited word.
+{
+  console.log("\n[Case 62] 1CH 4:21 genealogy: edge commas + one-char mid edit keep all but the edited word");
+  const verse = CH1_4_21();
+  const before = countAligned(verse);
+  assert(before.aligned === 33 && before.total === 33, `fixture starts fully aligned (got ${before.aligned}/${before.total})`);
+  const old = extractEditableText(verse);
+  // comma added in the start region (after "Judah"), one-char mid edit
+  // (Lekah→Lekha), and a trailing comma at the verse end — all in one save.
+  const after = old
+    .replace("Judah:", "Judah,:")
+    .replace("Lekah", "Lekha")
+    .replace(/Ashbea\s*$/, "Ashbea,");
+  const r = smartEditVerse(verse, old, after);
+  const out = alignedWords(r.content);
+  const aligned = out.filter((x) => x.strongs.length > 0).length;
+  assert(aligned >= out.length - 1, `>= (N-1)/N words stay aligned (got ${aligned}/${out.length})`);
+  const lekha = out.find((x) => x.text === "Lekha");
+  assert(lekha && lekha.strongs.length === 0, "the edited word 'Lekha' is the one that unaligns");
+  for (const word of ["The", "sons", "Judah", "Mareshah", "linen", "Beth", "Ashbea"]) {
+    const w = out.find((x) => x.text === word);
+    assert(w && w.strongs.length > 0, `untouched genealogy word '${word}' keeps its alignment`);
+  }
+}
+
+// ─── Case 63: NUM 24:8 — heavy multi-clause rewrite keeps untouched words ────
+// A real Balaam-oracle verse rewritten across several clauses. Confirms the
+// current engine localizes: only the genuinely changed words unalign.
+{
+  console.log("\n[Case 63] NUM 24:8: multi-clause rewrite unaligns only the edited words");
+  const verse = NUM_24_8();
+  const before = countAligned(verse);
+  assert(before.aligned === 35 && before.total === 35, `fixture starts fully aligned (got ${before.aligned}/${before.total})`);
+  const old = extractEditableText(verse);
+  const after = "God is bringing him out from Egypt; like the horns of a wild ox {are} for him. He will devour the nations, his enemies, and their bones he will crush, and his arrows he will shatter.";
+  const r = smartEditVerse(verse, old, after);
+  const out = alignedWords(r.content);
+  // Words present unchanged in both old and new must keep alignment.
+  for (const word of ["God", "bringing", "Egypt", "horns", "wild", "ox", "nations", "enemies", "bones", "arrows"]) {
+    const w = out.find((x) => x.text === word);
+    assert(w && w.strongs.length > 0, `untouched word '${word}' keeps its alignment`);
+  }
+  // The verse must NOT be flattened — most words survive.
+  const aligned = out.filter((x) => x.strongs.length > 0).length;
+  assert(aligned >= 25, `most words stay aligned, not flattened (got ${aligned}/${out.length})`);
+}
+
+// ─── Case 64: NUM 24:19 — KNOWN FAILURE / LIVE BUG ───────────────────────────
+// A word edit near the verse START combined with a punctuation removal at the
+// verse END produces TWO separated changes. diffSingleChange (replace.ts:1232)
+// collapses the common prefix to the first divergence and the common suffix to
+// the last, so the single change range BALLOONS to span almost the whole verse —
+// from "he…" all the way to the trailing "”". That ballooned range carries a
+// word change, so it routes to smartReplaceVerse/localizedRewriteVerse, which
+// flattens every \zaln milestone it spans. Result: 14 of 15 untouched words lose
+// alignment from a two-word edit.
+//
+// This is the NUM 24 prod alignment-loss pattern, STILL LIVE on the current
+// engine (the 1CH 4:21 fix did NOT cover it — that fix handled a SINGLE localized
+// range; this is a MULTI-range diff limitation). relayoutUnchangedWords can't
+// rescue it because a word genuinely changed, so it is not a pure-punctuation
+// relayout. A proper fix needs a multi-range diff (or splitting the edit into the
+// independent start-edit and end-punctuation changes before applying).
+//
+// The asserts below pin the CURRENT (buggy) output so the suite stays green and
+// fails LOUDLY the moment the engine is fixed — at which point flip the
+// expectations to "preserved" (~13/15, only {one}/{the} unalign) and delete this
+// banner.
+{
+  console.log("\n[Case 64] NUM 24:19: KNOWN FAILURE — start word edit + end punct removal flattens the verse");
+  const verse = NUM_24_19();
+  const before = countAligned(verse);
+  assert(before.aligned === 15 && before.total === 15, `fixture starts fully aligned (got ${before.aligned}/${before.total})`);
+  const old = extractEditableText(verse); // "And he will rule from Jacob, \q2 and he will destroy the survivor from a city.” \m"
+  const after = "And {one} will rule from Jacob, and he will destroy the survivor from {the} city.";
+  const r = smartEditVerse(verse, old, after);
+  const out = alignedWords(r.content);
+  const aligned = out.filter((x) => x.strongs.length > 0).length;
+  // KNOWN-BAD current behavior: near-total flatten. A CORRECT engine would keep
+  // ~13/15 (only "{one}" and "{the}" should unalign).
+  assert(aligned <= 1,
+    `KNOWN FAILURE: verse is flattened to ${aligned}/${out.length} (a correct engine should keep ~13/15). ` +
+    `If this assert fails because alignment IMPROVED, the multi-range diff bug was fixed — update this case.`);
+  assert(r.preservedAlignment === false, "KNOWN FAILURE: preservedAlignment is false (whole-verse rewrite)");
+}
+
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed.`);
   process.exit(1);
