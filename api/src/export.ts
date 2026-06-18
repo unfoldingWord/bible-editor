@@ -5,6 +5,7 @@
 import usfm from "usfm-js";
 import type { TnRow, TqRow, TwlRow, VerseRow } from "./types";
 import { parseVerseContentJson } from "./contentJson.ts";
+import { analyzeAlignmentDelta } from "./alignmentDelta.ts";
 
 export type Resource = "tn" | "tq" | "twl" | "ult" | "ust";
 
@@ -150,29 +151,31 @@ export function exportTsvShrinkRefused(renderedRows: number, masterRows: number)
 // regressed in D1 (e.g. it landed before the interactive guard existed, or via
 // an ingress path the guard doesn't cover).
 //
-// Conservative by construction — it only flags a verse whose aligned-word
-// count SHRANK while its plain text is UNCHANGED. A legitimate text rewrite
-// changes the plain text, so it is never blocked; only a silent de-alignment
-// of words the translator left alone trips it. Returns the list of offending
-// verse refs (empty = safe to commit).
+// This used to compare a coarse aligned-WORD COUNT and EXEMPT any verse whose
+// plain text changed — which exactly skipped the incident verses (1CH 4:21
+// "Lekah"→"Lecah" was a genuine text edit PLUS collateral \zaln loss on
+// untouched words; the text-changed exemption let it ship). That was the same
+// blind spot as the 6980fd72 `wordSequenceUnchanged` narrowing removed from the
+// interactive guard. Now it runs the SAME analyzer the write-time guard uses —
+// `analyzeAlignmentDelta` — per verse, so the export net and `guardBlocksSave`
+// agree on what "collateral loss" means.
+//
+// REFUSE if any word present in BOTH master and render (matched by surface +
+// occurrence via the LCS path) HAD a \zaln source and is now fully bare
+// (`reason === "lost"`) — the flatten / collateral-loss signature — REGARDLESS
+// of whether the verse's plain text also changed (that's the whole point). A
+// re-pointed source on an otherwise-unchanged word (`reason === "changed_source"`)
+// is the signature of a LEGITIMATE aligner-panel re-alignment, so it is NOT
+// blocked (blocking it would over-correct, the inverse error); it's only logged.
+//
+// Calibration rationale: a false positive costs one skipped nightly export plus
+// the existing "Benjamin fix this" alert (a human adjudicates and re-exports),
+// while a false negative ships silent alignment loss to master. So this backstop
+// errs toward flagging `lost`. Returns the list of offending verse refs
+// (empty = safe to commit).
 interface VerseAlignStat {
   alignedWords: number;
-  plainText: string;
-}
-
-function plainTextOfVerseObjects(nodes: unknown[]): string {
-  const parts: string[] = [];
-  const walk = (list: unknown[]): void => {
-    for (const node of list) {
-      if (!node || typeof node !== "object") continue;
-      const o = node as Record<string, unknown>;
-      if (typeof o["text"] === "string" && o["type"] !== "milestone") parts.push(o["text"]);
-      const children = o["children"];
-      if (Array.isArray(children)) walk(children);
-    }
-  };
-  walk(nodes);
-  return parts.join("").replace(/\s+/g, " ").trim().normalize("NFC");
+  verseObjects: unknown[];
 }
 
 function countAlignedWords(nodes: unknown[]): number {
@@ -194,8 +197,10 @@ function countAlignedWords(nodes: unknown[]): number {
   return count;
 }
 
-// Map every verse in a USFM blob to its aligned-word count + plain text.
+// Map every verse in a USFM blob to its aligned-word count + parsed verseObjects.
 // Keyed "chapter:verse" (verse keys can be "front", "12-13" — kept verbatim).
+// The verseObjects array is retained so the caller can re-run the SAME
+// word-level analyzer the interactive guard uses (analyzeAlignmentDelta).
 function verseAlignStats(usfmText: string): Map<string, VerseAlignStat> {
   const stats = new Map<string, VerseAlignStat>();
   let json: { chapters?: Record<string, Record<string, unknown>> };
@@ -213,7 +218,7 @@ function verseAlignStats(usfmText: string): Map<string, VerseAlignStat> {
       const vos = Array.isArray(verseObj?.verseObjects) ? verseObj.verseObjects : [];
       stats.set(`${chapterKey}:${verseKey}`, {
         alignedWords: countAlignedWords(vos),
-        plainText: plainTextOfVerseObjects(vos),
+        verseObjects: vos,
       });
     }
   }
@@ -222,16 +227,30 @@ function verseAlignStats(usfmText: string): Map<string, VerseAlignStat> {
 
 export interface AlignmentShrinkResult {
   refused: boolean;
-  offenders: Array<{ ref: string; renderedAligned: number; masterAligned: number }>;
+  // Each offending verse names the words that lost their \zaln source so the
+  // alert is actionable (which word to re-align), not just a whole-verse aligned
+  // count that reads oddly when a verse simultaneously loses one word's source
+  // and gains another's (e.g. 3<3, or even 4>3).
+  offenders: Array<{ ref: string; lostWords: string[] }>;
 }
 
-// Compare a rendered ULT/UST USFM against the current master USFM. REFUSE
-// (refused=true) if any verse present in BOTH has fewer aligned \w words in the
-// render than on master while its plain text is unchanged — the signature of a
-// silent de-alignment. Verses only on one side (added/removed) are ignored:
-// genuine content change, not collateral loss. A plain-text change on a verse
-// exempts it (a real rewrite legitimately re-aligns). Empty master (fresh book)
-// can't be shrunk.
+// Compare a rendered ULT/UST USFM against the current master USFM. For each
+// verse present in BOTH (added/removed verses are skipped — genuine content
+// change, not collateral loss), run `analyzeAlignmentDelta(masterVos,
+// renderedVos)` — the SAME analyzer the interactive write-time guard
+// (guardBlocksSave) uses — and REFUSE (refused=true) if any unexpected loss has
+// `reason === "lost"`: a word matched in both by surface + occurrence that HAD a
+// \zaln source on master and is now fully bare in the render. That is the
+// flatten / collateral-loss signature, and it fires REGARDLESS of whether the
+// verse's plain text also changed (the incident verses were genuine text edits
+// PLUS collateral loss — the old plain-text exemption skipped exactly them).
+//
+// `reason === "changed_source"` (a re-pointed source on an unchanged word) is
+// the signature of a LEGITIMATE aligner-panel re-alignment, so it is NOT a
+// refusal — blocking it would over-correct. Empty master (fresh book) has
+// nothing aligned to lose. Each offender carries the de-aligned words' text
+// (the `lost` losses) so the workflow alert can name which words to re-align
+// instead of reporting an opaque whole-verse aligned count.
 export function usfmAlignmentShrinkRefused(
   renderedUsfm: string,
   masterUsfm: string,
@@ -243,14 +262,17 @@ export function usfmAlignmentShrinkRefused(
     if (masterStat.alignedWords === 0) continue; // nothing aligned on master to lose
     const renderedStat = rendered.get(ref);
     if (!renderedStat) continue; // verse removed entirely — content change, not our concern
-    if (renderedStat.plainText !== masterStat.plainText) continue; // real text change — allowed
-    if (renderedStat.alignedWords < masterStat.alignedWords) {
-      offenders.push({
-        ref,
-        renderedAligned: renderedStat.alignedWords,
-        masterAligned: masterStat.alignedWords,
-      });
-    }
+    const delta = analyzeAlignmentDelta(
+      { verseObjects: masterStat.verseObjects },
+      { verseObjects: renderedStat.verseObjects },
+    );
+    // Only a fully-lost \zaln source on a word that still exists is collateral
+    // loss. changed_source (re-pointing) is legitimate re-alignment — log, allow.
+    const lostWords = delta.unexpectedLosses
+      .filter((l) => l.reason === "lost")
+      .map((l) => l.text);
+    if (lostWords.length === 0) continue;
+    offenders.push({ ref, lostWords });
   }
   return { refused: offenders.length > 0, offenders };
 }
