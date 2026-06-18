@@ -14,6 +14,39 @@
 
 ## Last run
 
+2026-06-18 · **elegant-jemison** — Alignment-bleed: root cause → fix → reconcile (1CH/NUM ULT). The
+"still bleeding" report (1CH ULT ~line 2500) was our OLD span-surgery `localizedRewrite` flattening
+`\zaln` on UNTOUCHED words when translators made small text edits (1CH 4:21 `Lekah→Lecah`, 4:26
+`Zakkur→Zaccur`, 4:31 `Markaboth→Marcaboth`, NUM 24); the nightly export shipped the wreckage to en_ult
+master. PREDATES #227. Confirmed export-caused loss is SMALL (baseline-validated): **1CH ult ch4**
+(4:21/4:30/4:31, base `666e6d9f8e`) + **NUM ult ch24** (24:7/8/16/19/20/24 + 18:23, base `e2418e7221`)
++ 1CH ust 4:17-18; the raw 1,432-verse scan is ~99% PRE-EXISTING upstream non-alignment (JER/EZK/NUM ust
+never aligned — do not attribute to us). SHIPPED 5 PRs (orchestrated via subagents, kept separate for review):
+• **#233** (MERGED) — de-narrowed the #227 guard: dropped the `&& wordSequenceUnchanged` clause that review
+  commit `6980fd72` added (it made the guard miss the exact word-edit-with-collateral-loss class) + added an
+  export-path `\zaln`-shrink backstop (per-verse `analyzeAlignmentDelta`, blocks `reason:"lost"`, allows
+  `changed_source`) + fixed the misleading "blocked" test. (memory: project_pr227_guard_wordsequence_gap)
+• **#231** (MERGED) — verified current `replace.ts` no longer flattens 1CH 4:21; found NUM 24:19 STILL
+  flattened on HEAD (multi-range diff balloons `diffSingleChange`) — pinned as Case 64. (memory: project_multirange_diff_flatten_num2419)
+• **#232** (MERGED) — restoration heal script (re-merge baseline alignment onto translators' CURRENT text via
+  the fixed engine; read-only dry-run, NO prod). **#236** then hardened its apply SQL = version-conditional
+  UPDATE + guarded audit INSERT. (memory: project_export_align_damage_1ch_num)
+• **#235** (SHIP, open) — THE REFACTOR: ported gatewayEdit occurrence-keyed reassembly into `smartEditVerse`
+  (`web/src/lib/alignmentReassembly.ts`; multi-region only, single-region defers to legacy tiers KEPT as
+  fallback; self-check; fail-closed → #233 guard). Fixes NUM 24:19 **1/15→13/15**. Review caught + fixed a P1
+  section-drop (unmerge skipped childless non-word leaves → `\s1` silently dropped; both self-check & guard
+  ignore section content) via bail-on-content-bearing-childless-leaf + a NODE-COMPLETENESS self-check.
+  Supersedes #230 (close it). (memory: reference_alignment_transient_state_tc_ge, project_reassembly_drops_section_nodes)
+• **#237** (ready) — export-backstop word-level fix + word-named alert. **#236/#237 ready to merge.**
+• **#238** (SHIP, stacked on #235, **carries this STATE update**) — extends reassembly to bare-text (AI-draft)
+  verses; reconciled onto the section-fixed #235; section×bare-text intersection tested; 32,748-edit sweep =
+  0 regressions. Empty `\s1` drop ruled ACCEPTABLE by lead (no title = no-op break) — not a bug.
+Suggested merge order: #236 + #237 anytime; **#235 → #238** (stacked). HELD (lead): **1CH/NUM restoration** —
+unblocks on #235 merge (re-run heal, 24:19 now heals to 13/15, residual = new/respelled words → manual drag),
+apply via #236 SQL + prod approval, re-export. DEFERRED (lead): **MIC 6:10 UST** AI `-e`/orphan-`\zaln`
+corruption (born corrupt at AI-generation, NOT an edit-engine bug; needs sanitizer + re-alignment) — separate
+spin-up. (memory: project_ai_dash_e_zaln_corruption_mic610) Branch `claude/elegant-jemison-02ec26`.
+
 2026-06-18 · **charming-gagarin** — Defense-in-depth guards on the DCS→D1 reimport so a
 still-dirty master can never re-introduce the TN id/duplication defects (mint engine already
 disabled by #183/#225; this is structural insurance). **Guard 1 (id):** `coerceRowId` (new pure
