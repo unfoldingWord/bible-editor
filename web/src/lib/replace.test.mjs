@@ -1406,7 +1406,8 @@ function transplants(origContent, resultContent) {
 // `‘…!’`. The marker is purely TRAILING (no word after it), so the relayout
 // must still fire — the old "bail on ANY marker" gate left this at a partial
 // unalign (17→3 in prod). Step 2 reconcileMarkers keeps the closing `’` and the
-// `\q1` in place. (An INTERIOR marker — Case 24 — still bails to the diff path.)
+// `\q1` in place. (An INTERIOR marker now also relays — Cases 60/61 — with
+// Step 2 reconcileMarkers re-placing the marker.)
 {
   console.log("\n[Case 59] Edge quotes on a verse with a trailing \\q1 keep all alignment");
   const verse = {
@@ -1430,10 +1431,13 @@ function transplants(origContent, resultContent) {
   assert(vos[vos.length - 1]?.type === "quote" && vos[vos.length - 1]?.tag === "q1", "the \\q1 marker survives as the final node");
 }
 
-// ─── Case 60: an INTERIOR marker bails to the diff path (no quote pop) ─────────
-// Guards the relaxed gate: a marker with words on BOTH sides can have a gap that
-// spans it, so the whole-verse relayout must NOT fire — the typed quote would
-// land on the wrong side. (Mirrors Case 24's concern under the new gate.)
+// ─── Case 60: an INTERIOR marker relays, reconcile keeps the quote on its side ─
+// A marker with words on BOTH sides can have a gap that spans it. The whole-verse
+// relayout now fires anyway (it gets the marker-STRIPPED text right); the typed
+// `“` lands before the marker in the relayout, but forced Step 2 reconcileMarkers
+// re-places the marker so the opening quote stays AFTER it (CLOSING rule). The
+// alternative — bailing to the diff path — flattened verses dense with interior
+// markers (HOS 9:17, Case 61).
 {
   console.log("\n[Case 60] Edge quote on a verse with an INTERIOR marker doesn't pop the quote");
   const verse = {
@@ -1450,6 +1454,40 @@ function transplants(origContent, resultContent) {
   const quoteBeforeMarker = vos.slice(0, qi).some((n) => n.type === "text" && n.text.includes("“"));
   assert(!quoteBeforeMarker, "the typed quote did NOT pop in front of the marker");
   assert(alignedWords(r.content).find((x) => x.text === "Come")?.strongs.includes("H3"), "'Come' keeps alignment");
+}
+
+// ─── Case 61: HOS 9:17 — edge quotes on a verse dense with INTERIOR markers ───
+// The reported bug: putting quotes around HOS 9:17 UST (a poetic verse threaded
+// with \q2/\q2/\q1 between words) unaligned the WHOLE verse. The old gate bailed
+// the relayout on the first interior marker → localizedRewrite flattened every
+// \zaln. The relayout now fires across all the markers; Step 2 reconcileMarkers
+// re-places each one. All milestones must survive and the markers stay put.
+{
+  console.log("\n[Case 61] HOS 9:17: edge quotes with multiple interior markers keep all alignment");
+  const verse = {
+    verseObjects: [
+      zaln("H1", [w("Hosea"), t(" "), w("says")]), t(","),
+      { type: "quote", tag: "q2" },
+      zaln("H2", [w("The"), t(" "), w("God")]), t(" "),
+      zaln("H3", [w("will"), t(" "), w("reject"), t(" "), w("them")]), t("."),
+      { type: "quote", tag: "q1" },
+      zaln("H4", [w("They"), t(" "), w("wander")]), t("."),
+    ],
+  };
+  const before = extractEditableText(verse); // "Hosea says, \q2 The God will reject them. \q1 They wander."
+  const after = "“" + before + "”";
+  const r = smartEditVerse(verse, before, after);
+  assert(r.preservedAlignment, "alignment reported preserved");
+  const ms = alignedWords(r.content);
+  assert(ms.length === 9, `all 9 \\w survive (got ${ms.length})`);
+  assert(ms.find((x) => x.text === "reject")?.strongs.includes("H3"), "'reject' keeps its H3 alignment");
+  assert(ms.find((x) => x.text === "wander")?.strongs.includes("H4"), "'wander' keeps its H4 alignment");
+  const markers = r.content.verseObjects.filter((n) => n.type === "quote");
+  assert(markers.length === 2, `both interior markers survive (got ${markers.length})`);
+  // Round-trip: the editable text re-extracted from the result (which re-
+  // synthesizes marker-adjacent spacing) must equal what the user typed.
+  assert(extractEditableText(r.content) === after,
+    `round-trips to the typed text (got ${JSON.stringify(extractEditableText(r.content))})`);
 }
 
 if (failed > 0) {

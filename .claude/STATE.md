@@ -14,6 +14,20 @@
 
 ## Last run
 
+2026-06-17 · **epic-yalow** — Edge quotes on HOS 9:17 UST unaligned the WHOLE verse (13→0 ms).
+The verse is dense with INTERIOR `\q2`/`\q2`/`\q1` poetry markers, and `relayoutUnchangedWords`
+(the #214/#215 whole-verse punctuation tier) still BAILED on any interior marker → dropped to
+`localizedRewrite` → flatten. Fix: removed the interior-marker bail (kept `\qs` wrapper +
+split-possessive guards), added `hasInteriorInflowMarker()`, and FORCE Step 2 `reconcileMarkers`
+when a relayout crossed an interior marker (`relaidNeedsMarkerReconcile`) — edge quotes shift no
+word count so `markersChanged` was false and Step 2 was being skipped. The relayout now only needs
+the marker-STRIPPED text correct (self-checked); reconcile re-places markers by word-anchor +
+closing-punct rule (opening `“`/`‘` correctly stay AFTER the marker). Verified on the REAL verse
+(DCS master `28-HOS.usfm` via usfm-js): 13→13 ms, 3 markers + both edge quotes intact. replace.test
+Cases 60 (updated) + 61 (new); 271 assertions + full typecheck green. CODE-ONLY, not deployed, not
+yet PR'd. ⚠️ Prod HOS/9/17/UST may be flattened in D1 if the editor's bad save persisted — needs a
+check + heal-from-master (master still had all 13 ms when fetched). Branch `claude/epic-yalow-f452cc`.
+
 2026-06-17 · **goofy-ptolemy** — Root-cause fix: Shell no longer remounts on chapter nav.
 App.tsx keys Shell on `book` only (was `book-chapter-verse`); a new Shell effect keyed on
 `[chapter, initialVerse]` (skips initial mount) resets the per-chapter transient state the
@@ -28,6 +42,9 @@ Not yet PR'd.
 
 ## In progress
 
+- **epic-yalow** — HOS 9:17 interior-marker edge-quote unalign fix (see Last run). Branch
+  `claude/epic-yalow-f452cc`. Ready for PR. ⚠️ separately, prod HOS/9/17/UST may need a
+  heal-from-master if the editor's bad save persisted.
 - **goofy-ptolemy** — Shell-remount root-cause fix (see Last run). Branch
   `claude/goofy-ptolemy-e9369f`. Ready for PR.
 - **trusting-galileo** (PR #220) — Find in book mode: two fixes for cross-chapter notes remounting Shell

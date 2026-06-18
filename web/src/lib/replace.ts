@@ -555,17 +555,22 @@ function relayoutUnchangedWords(
   input: unknown[],
   newStripped: string,
 ): SmartReplaceResult | null {
-  // Inline line-break markers (\q1, \p) are zero-width anchors between words. A
-  // gap that SPANS an INTERIOR marker — one with words on BOTH sides, e.g.
-  // `says: \q1 "Behold` where the typed `"` belongs AFTER the marker on the new
-  // poetic line — can't be split by this naive first-leaf relayout; that's
-  // reconcileMarkers' job, so bail. But a purely LEADING or TRAILING marker (no
-  // word before, or none after — e.g. ZEC 8:3's verse-final `\q1`) splits no
-  // gap: the relayout writes punctuation into the boundary text leaves and
-  // Step 2 reconcileMarkers keeps the marker on its side. Character wrappers
-  // (`\qs Selah\qs*`) hold aligned CONTENT, not a line break, and are tricky to
-  // re-lay around — bail on them outright. (The imported `\ts\*` node — tag
-  // `ts\*`, not `ts` — is NOT an in-flow marker, so prose verses still qualify.)
+  // Inline line-break markers (\q1, \p) are zero-width anchors between words.
+  // The relayout ignores them (they carry no raw text) and re-lays punctuation
+  // over the words; their final placement — including which side of a gap's
+  // punctuation each marker lands on — is reconcileMarkers' job, which the
+  // caller runs as Step 2 whenever the verse has an INTERIOR marker (one with
+  // words on both sides; see hasInteriorInflowMarker). So even an edit whose new
+  // punctuation belongs on the far side of an interior marker
+  // (`says: \q1 “Behold`) comes out right: the relayout gets the marker-stripped
+  // text correct (self-checked below) and reconcileMarkers re-places the marker
+  // by word-anchor + the closing-punctuation rule. Earlier this bailed outright
+  // on any interior marker, dropping whole-verse punctuation edits (quotes added
+  // at both edges of HOS 9:17, which is dense with \q1/\q2) to localizedRewrite,
+  // which flattens every \zaln. Character wrappers (`\qs Selah\qs*`) hold aligned
+  // CONTENT, not a line break, and are tricky to re-lay around — bail on them
+  // outright. (The imported `\ts\*` node — tag `ts\*`, not `ts` — is NOT an
+  // in-flow marker, so prose verses still qualify.)
   const order: ("w" | "m")[] = [];
   let wrapperPresent = false;
   const scan = (nodes: unknown[]): void => {
@@ -582,9 +587,6 @@ function relayoutUnchangedWords(
   };
   scan(input);
   if (wrapperPresent) return null;
-  const firstW = order.indexOf("w");
-  const lastW = order.lastIndexOf("w");
-  if (firstW !== -1 && order.some((k, i) => k === "m" && i > firstW && i < lastW)) return null;
 
   const verseObjects = cloneVerseObjects(input);
   const leaves = walkLeavesWithParents(verseObjects);
@@ -680,6 +682,32 @@ function relayoutUnchangedWords(
   // text — bails to the diff tiers rather than risk a wrong tree.
   if (normalize(newRaw) !== normalize(newStripped)) return null;
   return { content: { verseObjects: pruned }, plainText: normalize(newRaw), preservedAlignment: true };
+}
+
+// True when the verse has an inert in-flow marker (\q*/\p, NOT a `\qs` content
+// wrapper) sitting strictly BETWEEN two words. relayoutUnchangedWords no longer
+// positions such markers relative to surrounding punctuation — it just keeps
+// the marker-stripped text correct — so when this holds the caller must run
+// reconcileMarkers as Step 2 to re-place the marker by word-anchor + the
+// closing-punctuation rule, even when markerSignature is unchanged (a quote
+// added at the verse edges moves no word count, so markersChanged stays false).
+function hasInteriorInflowMarker(verseObjects: unknown[]): boolean {
+  const order: ("w" | "m")[] = [];
+  const scan = (nodes: unknown[]): void => {
+    for (const n of nodes) {
+      if (isInFlowMarker(n)) {
+        if (!isCharacterWrapper(n)) order.push("m");
+        continue;
+      }
+      if (isWordLeaf(n as Record<string, unknown>)) order.push("w");
+      const ch = (n as { children?: unknown } | null)?.children;
+      if (Array.isArray(ch)) scan(ch);
+    }
+  };
+  scan(verseObjects);
+  const firstW = order.indexOf("w");
+  const lastW = order.lastIndexOf("w");
+  return firstW !== -1 && order.some((k, i) => k === "m" && i > firstW && i < lastW);
 }
 
 // LCS over word surface text. Returns link[j] = the index in `oldWords` that
@@ -1698,6 +1726,11 @@ export function smartEditVerse(
     oldStripped !== newStripped && Array.isArray(contentVo)
       ? relayoutUnchangedWords(contentVo, newStripped)
       : null;
+  // The relayout leaves interior markers where the punctuation re-lay happened
+  // to land them; reconcileMarkers must re-place them even when markerSignature
+  // is unchanged (edge quotes shift no word count). Force Step 2 in that case.
+  const relaidNeedsMarkerReconcile =
+    relaid != null && Array.isArray(contentVo) && hasInteriorInflowMarker(contentVo);
   if (oldStripped === newStripped) {
     // Pure marker edit — no word/punctuation change to apply.
     result = { content, plainText: oldStripped, preservedAlignment: true };
@@ -1775,8 +1808,10 @@ export function smartEditVerse(
   // Step 2 — re-place inline markers on the (possibly word-edited) tree when
   // their layout changed. The word tiers leave markers where they were, so
   // skip this when the markers weren't touched. Keep the word edit's
-  // alignment verdict.
-  if (markersChanged) {
+  // alignment verdict. Also run it after a whole-verse relayout that crossed an
+  // interior marker, to authoritatively re-place that marker (markersChanged can
+  // be false there — see relaidNeedsMarkerReconcile).
+  if (markersChanged || relaidNeedsMarkerReconcile) {
     // Prune dead milestones BEFORE reconcile. If the word edit emptied a
     // milestone of its `\w` (e.g. deleting the clause-final word whose milestone
     // also held the trailing punctuation), the leftover punctuation must be a
