@@ -11,6 +11,7 @@ import {
   collectSourceWords,
   extractVersesForRange,
   healReplacementChars,
+  normalizeNoteWhitespace,
   parseTsv,
   recomputeTargetOccurrences,
   refParts,
@@ -99,7 +100,11 @@ function tnPayload(book: string, refRaw: string, row: Record<string, string>) {
       support_reference: row["SupportReference"] || null,
       quote: row["Quote"] || null,
       occurrence,
-      note: row["Note"] || null,
+      // Collapse bp-assistant's double-space-after-punctuation artifact so the
+      // stored note matches DCS master's normalized form (see
+      // normalizeNoteWhitespace) — both apply paths (applyTnInsert and the hint
+      // expansion) and the edit_log audit read this same staged note.
+      note: row["Note"] ? normalizeNoteWhitespace(row["Note"]) : null,
     },
   };
 }

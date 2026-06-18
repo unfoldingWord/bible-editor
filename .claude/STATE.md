@@ -34,6 +34,26 @@ wired into `npm --workspace api test`. typecheck + full API suite green. **Prod 
 6-18 sweep — a future audit must filter `deleted_at IS NULL`); but found **1 live pristine
 content-dup** still present (see Escalated). Branch `claude/charming-gagarin-4fbc55`. Not yet PR'd.
 
+2026-06-18 · **determined-meitner** — TN double-space-after-punctuation churn. bp-assistant emits
+notes with `.  ` / `,  ` double spaces; maintainers normalize to single-space on en_tn master, so D1
+diverges and every nightly export pushes a whitespace-only change to the `-be-` branch — which on
+2026-06-18 produced a real, committed-unresolved merge conflict in `tn_ISA.tsv` (vibrant-raman cleanup).
+Fix: added `normalizeNoteWhitespace` to `importParsers.ts` (collapses interior 2+ ASCII-space runs to
+one, per logical line split on the literal `\n` escape; preserves leading indentation, trailing space,
+and markdown table rows `|`) and wired it into the AI ingest chokepoint `pipelineImport.tnPayload`
+(covers applyTnInsert + hint-expansion + the edit_log audit). Reimport-from-master + editor PATCH paths
+left UNTOUCHED (master is the normalized source; editor input is literal). Also `findSuspiciousDoubleSpaces`
+flags double spaces NOT after `.?!` (may mask a dropped word — ISA "**understanding**,  could" was missing
+"you") for human review without auto-editing content. One-time cleanup script `scripts/normalize-tn-whitespace.mjs`
+(dedup-tn.mjs pattern; PRISTINE `updated_by IS NULL` rows only; SQL guarded on unchanged-note + updated_by
+IS NULL so a row edited between dump/apply is skipped). 38 unit assertions + full api+web typecheck green.
+PR #229. **Prod cleanup APPLIED 2026-06-18: 20 rows healed (ISA 17, HOS 2, LAM 1), version-bumped + 20
+`normalize_whitespace` edit_log rows; post-apply dry-run = 0 remaining candidates (D1 converged to
+single-space).** Per user choice, did NOT manually re-export — the 06:00 UTC nightly cron will re-export
+ISA/HOS/LAM and (since D1 now matches master) the `-be-` branches stop diffing on whitespace. 16 notes
+flagged suspicious (possible dropped word, e.g. ISA "**understanding**,  could" missing "you") handed off
+for separate human content review — whitespace was still collapsed. Branch `claude/determined-meitner-67e5bf`.
+
 2026-06-17 · **epic-yalow** — Edge quotes on HOS 9:17 UST unaligned the WHOLE verse (13→0 ms).
 The verse is dense with INTERIOR `\q2`/`\q2`/`\q1` poetry markers, and `relayoutUnchangedWords`
 (the #214/#215 whole-verse punctuation tier) still BAILED on any interior marker → dropped to
@@ -81,6 +101,9 @@ Not yet PR'd.
   chips: (1) normalize double-space in AI notes (the whitespace divergence that caused the ISA conflict
   markers); (2) bookReimport content-dedup + digit-first guard (defense-in-depth; PR #183/#225 already
   disabled the mint engine, so cleanup alone stopped the bleeding).
+- **determined-meitner** — TN double-space normalizer (ingest fix + cleanup script). Code + tests done,
+  branch `claude/determined-meitner-67e5bf`, ready for PR. Prod cleanup SQL generated (20 rows) but NOT
+  applied; awaiting human review of the 16 suspicious notes + go-ahead to apply + re-export ISA/HOS/LAM.
 - **epic-yalow** — HOS 9:17 interior-marker edge-quote unalign fix → PR #226. Prod data checked:
   fully aligned (editor recovered it), no heal needed; minor markers left for in-app fix.
 - **goofy-ptolemy** — Shell-remount root-cause fix (see Last run). Branch

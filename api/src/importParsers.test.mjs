@@ -19,6 +19,8 @@ import {
   collectSourceWords,
   healReplacementChars,
   hasReplacementChar,
+  normalizeNoteWhitespace,
+  findSuspiciousDoubleSpaces,
 } from "./importParsers.ts";
 
 // Collect target `\w` words with their alignment status (inside a `\zaln-s`?).
@@ -657,6 +659,79 @@ const zaln = (attrs, targetText) => ({
   const got = collectSourceWords(vo);
   assert(got.length === 2, `collectSourceWords found both \\w (incl. nested)`);
   assert(got[0].strong === "H1" && got[0].text === "אב", `nested source word collected with strong`);
+}
+
+// --- normalizeNoteWhitespace: collapse bp-assistant double spaces ------------
+// The two real artifacts from the ISA cleanup are the canonical cases.
+{
+  const a = "...state the meaning plainly.  Alternate translation: [...]";
+  assert(
+    normalizeNoteWhitespace(a) === "...state the meaning plainly. Alternate translation: [...]",
+    `double space after a period collapses`,
+  );
+  const b = "for the idea of **understanding**,  could express";
+  assert(
+    normalizeNoteWhitespace(b) === "for the idea of **understanding**, could express",
+    `double space after a comma collapses`,
+  );
+}
+{
+  // Runs of 3+ spaces collapse to one; multiple runs in a line all collapse.
+  assert(normalizeNoteWhitespace("a.   b") === "a. b", `triple space collapses to one`);
+  assert(normalizeNoteWhitespace("a.  b.  c") === "a. b. c", `multiple interior runs all collapse`);
+}
+{
+  // No-op when there is no double space (cheap gate) and on non-strings.
+  const clean = "a single-spaced note. No change here.";
+  assert(normalizeNoteWhitespace(clean) === clean, `single-spaced note unchanged (no-op)`);
+  assert(normalizeNoteWhitespace("don't  worry") === "don't worry", `apostrophe word unaffected by collapse`);
+  assert(normalizeNoteWhitespace(null) === null, `null passes through`);
+  assert(normalizeNoteWhitespace(undefined) === undefined, `undefined passes through`);
+}
+{
+  // The literal `\n` line-break escape is preserved exactly, and leading
+  // indentation after it (markdown list nesting) is NOT collapsed.
+  const note = "First para with a.  double space.\\n\\n  - nested item kept";
+  const out = normalizeNoteWhitespace(note);
+  assert(out === "First para with a. double space.\\n\\n  - nested item kept", `\\n preserved; leading indent kept; interior collapsed`);
+  assert(out.includes("\\n\\n"), `blank-line \\n\\n survives`);
+  assert(out.includes("\\n  - nested"), `2-space list indentation after \\n preserved`);
+}
+{
+  // Markdown table rows (lines containing `|`) keep their alignment padding.
+  const table = "intro.  collapse me\\n| Head  | Val |\\n| ---  | --- |";
+  const out = normalizeNoteWhitespace(table);
+  assert(out.startsWith("intro. collapse me"), `prose line before a table still collapses`);
+  assert(out.includes("| Head  | Val |"), `table row padding preserved`);
+  assert(out.includes("| ---  | --- |"), `table separator padding preserved`);
+}
+{
+  // Trailing whitespace (potential markdown hard break) is left alone; a
+  // whitespace-only line is not doubled by the lead/trail split.
+  assert(normalizeNoteWhitespace("text  \\nmore") === "text  \\nmore", `trailing double space before \\n preserved`);
+  assert(normalizeNoteWhitespace("a\\n   \\nb") === "a\\n   \\nb", `whitespace-only line left intact (not doubled)`);
+}
+
+// --- findSuspiciousDoubleSpaces: flag possible dropped words ------------------
+{
+  // The comma case masked a dropped "you" — flag it.
+  const susp = findSuspiciousDoubleSpaces("for the idea of **understanding**,  could express");
+  assert(susp.length === 1, `comma double space flagged as suspicious (got ${susp.length})`);
+  assert(/understanding/.test(susp[0]), `suspicious context includes the surrounding text`);
+}
+{
+  // The period case is the benign typographic convention — NOT flagged.
+  const susp = findSuspiciousDoubleSpaces("...state the meaning plainly.  Alternate translation: [...]");
+  assert(susp.length === 0, `double space after a period is not flagged (benign)`);
+  // Sentence terminator wrapped in a closing quote is also benign.
+  assert(findSuspiciousDoubleSpaces('end of quote.”  Next sentence').length === 0, `."  after closing quote is benign`);
+  assert(findSuspiciousDoubleSpaces("ask?  Then go").length === 0, `?  after a question mark is benign`);
+}
+{
+  // No double space, table rows, and leading indentation never flag.
+  assert(findSuspiciousDoubleSpaces("clean note.").length === 0, `clean note → no suspects`);
+  assert(findSuspiciousDoubleSpaces("| a  | b |").length === 0, `table padding not flagged`);
+  assert(findSuspiciousDoubleSpaces("text\\n  indented").length === 0, `leading indentation not flagged`);
 }
 
 console.log("\nAll parser smoke checks passed.");

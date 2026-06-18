@@ -681,6 +681,74 @@ export function makeVerseSortOrder(): (chapter: number, verse: number) => number
   };
 }
 
+// ─── Collapse double spaces in AI-generated TN note text ─────────────────────
+//
+// bp-assistant frequently emits TN notes with a DOUBLE space after sentence
+// punctuation (".  Alternate translation:", "**understanding**,  could"). DCS
+// maintainers normalize these to a single space on the en_tn master branch, so
+// the verbatim double-space copy in D1 diverges from master and every nightly
+// export pushes a whitespace-only change to the `-be-` branch — churn that has
+// already produced a real merge conflict (ISA, 2026-06-18). We collapse it at AI
+// ingest (pipelineImport tnPayload) so new notes match the normalized form.
+//
+// Conservative by construction — it touches ONLY interior runs of 2+ ASCII
+// spaces flanked by non-space content. It must NOT disturb:
+//   • the literal `\n` escape TN notes use for line breaks (split on it, rejoin),
+//   • leading indentation (markdown list nesting / code) — preserved per line,
+//   • trailing space (markdown hard break) — preserved per line,
+//   • markdown table alignment — any line containing `|` is left verbatim.
+// A no-op on notes without a double space (cheap `.includes("  ")` gate), so
+// already-clean notes and the reimport-from-master path round-trip untouched.
+
+// One logical line of a TN note (between literal `\n` escapes).
+function collapseInteriorSpaces(line: string): string {
+  if (line.includes("|")) return line; // markdown table row — padding is alignment
+  const m = line.match(/^( *)(.*?)( *)$/);
+  if (!m) return line;
+  const [, lead, core, trail] = m;
+  if (core === "") return line; // whitespace-only line — leave it untouched
+  return lead + core.replace(/ {2,}/g, " ") + trail;
+}
+
+export function normalizeNoteWhitespace(note: string): string {
+  if (typeof note !== "string" || !note.includes("  ")) return note;
+  // TN line breaks are the literal two-char escape "\n" (backslash-n), never a
+  // real newline (a TSV cell can't hold one) — split on it so each logical line
+  // is evaluated for leading indentation / table rows independently, then rejoin
+  // verbatim so the escape sequences are preserved.
+  return note.split("\\n").map(collapseInteriorSpaces).join("\\n");
+}
+
+// Flag interior double spaces that may MASK a dropped word, for human review
+// during the one-time cleanup. During the ISA pass, "**understanding**,  could
+// express" turned out to be missing "you" ("**understanding**, you could
+// express") — the double space sat where the word should have been. A double
+// space after a sentence terminator (".  ", "?”  ", "!)  ") is the well-known
+// benign typographic convention and is NOT flagged; anything else (comma,
+// semicolon, colon, a word char, markdown emphasis) is suspicious. Reports
+// context only — never auto-edits content. Mirrors normalizeNoteWhitespace's
+// per-line / table handling so the two agree on what counts as an interior run.
+const SUSPECT_RUN_RE = /(\S)( {2,})(?=\S)/g;
+const BENIGN_BEFORE_RE = /[.?!][)\]"'”’»]*$/;
+
+export function findSuspiciousDoubleSpaces(note: string): string[] {
+  if (typeof note !== "string" || !note.includes("  ")) return [];
+  const out: string[] = [];
+  for (const line of note.split("\\n")) {
+    if (line.includes("|")) continue;
+    const re = new RegExp(SUSPECT_RUN_RE.source, "g");
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(line)) !== null) {
+      const before = line.slice(0, m.index + 1); // through the char before the run
+      if (BENIGN_BEFORE_RE.test(before)) continue;
+      const start = Math.max(0, m.index - 25);
+      const end = Math.min(line.length, m.index + m[0].length + 25);
+      out.push((start > 0 ? "…" : "") + line.slice(start, end) + (end < line.length ? "…" : ""));
+    }
+  }
+  return out;
+}
+
 export interface ParsedTsv {
   headers: string[];
   rows: Array<Record<string, string>>;
