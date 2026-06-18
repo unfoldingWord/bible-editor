@@ -268,26 +268,48 @@ function healVerse(baselineVerse, currentVerse) {
 // ---------------------------------------------------------------------------
 // PROD-APPLY PLAN (templated, NOT executed).
 //
-// Applying the heal to prod requires, OUTSIDE this script and with explicit
+// Applying the heal to prod REQUIRES, OUTSIDE this script and with explicit
 // human approval:
-//   (a) a prod READ of each row's CURRENT version, to bump version = version+1
-//       (forces any stale client holding the corrupt copy to 409 + refetch
-//       instead of overwriting the repair), and
+//   (a) a prod READ of each row's CURRENT version, filled in for <OLD_VERSION>
+//       (= <NEW_VERSION> - 1) in the SQL below, and
 //   (b) the audit edit_log row using that same prev/new version.
 //
-// This mirrors the repo's reference_prod_verse_data_repair pattern:
-//   UPDATE verses SET content_json=?, version=version+1, updated_at=<epoch>,
-//          updated_by=<uid>
-//     WHERE book=? AND chapter=? AND verse=? AND bible_version=?;
+// OPTIMISTIC CONCURRENCY (the whole point of this template). The UPDATE is
+// VERSION-CONDITIONAL — `WHERE ... AND version=<OLD_VERSION>` — matching the
+// repo-wide invariant that every write carries an `If-Match`/`AND version=?`
+// guard. The apply flow is: (1) human reads each prod row's version, (2) fills
+// the placeholders, (3) applies. If a translator OR the nightly reimport edits a
+// row between (1) and (3), the version no longer matches, the UPDATE changes 0
+// rows, and the heal is a NO-OP for that row — the newer content is NOT
+// clobbered and its version is NOT bumped. A skipped row must then be
+// re-read and re-evaluated, not force-applied. (An earlier version of this
+// template used `version=version+1` with an UNGUARDED WHERE, which would
+// silently overwrite a concurrent edit — that was the bug this guard fixes.)
+//
+// The audit edit_log row is likewise GUARDED: it is an INSERT ... SELECT ...
+// WHERE EXISTS keyed on the row now being at the POST-update version
+// (<OLD_VERSION>+1) AND carrying exactly the healed content_json. It is written
+// ONLY when OUR conditional UPDATE actually landed. Matching on content_json
+// (not just the version number) is deliberate: a concurrent edit that happens to
+// leave the row at <OLD_VERSION>+1 would not carry our content, so no orphan
+// audit row is written for a heal that did not happen.
+//
+// Mirrors the repo's reference_prod_verse_data_repair pattern, made
+// version-safe:
+//   UPDATE verses SET content_json=?, plain_text=?, version=version+1,
+//          updated_at=<epoch>, updated_by=<uid>
+//     WHERE book=? AND chapter=? AND verse=? AND bible_version=?
+//       AND version=<OLD_VERSION>;
 //   INSERT INTO edit_log (kind,row_key,book,user_id,prev_version,new_version,
 //                         action,payload_json,source,created_at)
-//     VALUES ('verse','BOOK/CH/V/VER',<uid>,<old>,<old+1>,
-//             'heal-export-align-loss',<json>,'data_repair',<epoch>);
+//     SELECT 'verse','BOOK/CH/V/VER',<book>,<uid>,<old>,<old+1>,
+//            'heal-export-align-loss',<json>,'data_repair',<epoch>
+//      WHERE EXISTS (SELECT 1 FROM verses
+//                     WHERE book=? AND chapter=? AND verse=? AND bible_version=?
+//                       AND version=<OLD_VERSION>+1 AND content_json=<healed json>);
 //
-// We use `version=version+1` (relative) in the UPDATE so it is correct without
-// reading the row first; the matching edit_log row, however, needs the literal
-// prev/new versions, so the orchestrator must read them at apply time. The SQL
-// below leaves <OLD_VERSION>/<NEW_VERSION> as placeholders for that step.
+// The orchestrator must read the literal prev/new versions at apply time; the
+// SQL below leaves <OLD_VERSION>/<NEW_VERSION> as placeholders for that step.
 //
 // content_json is embedded as a double-quoted JSON string; single quotes inside
 // it (apostrophes in text) are escaped by doubling ('->'') for the SQL literal.
@@ -305,21 +327,35 @@ function applyPlanSql(entry, verse, heal) {
     incident: "1ch-num-export-align-loss",
     baselineSha: entry.baselineSha,
   });
+  const rowMatch =
+    `book='${entry.book}' AND chapter=${verse.chapter} AND verse=${verse.verse} ` +
+    `AND bible_version='${entry.bibleVersion}'`;
   const lines = [];
   lines.push(`-- ${entry.label} ${verse.chapter}:${verse.verse}  (row_key ${rowKey})`);
   lines.push(`-- baseline ${entry.baselineSha} -> heal; aligned ${heal.healedCount.aligned}, bare ${heal.healedCount.bare}`);
   lines.push(`-- REQUIRES: prod READ for <OLD_VERSION>; explicit human approval. Do NOT run blind.`);
+  lines.push(`-- Version-conditional: if the row moved on (translator/reimport edit) this is a no-op and the audit row is skipped.`);
+  // version-conditional UPDATE: the `AND version=<OLD_VERSION>` pin makes this a
+  // no-op (0 rows changed) if the row was edited between the prod READ and the
+  // apply, so a stale/concurrent edit is never clobbered.
   lines.push(
     `UPDATE verses SET content_json='${sqlEscape(contentJson)}', ` +
       `plain_text='${sqlEscape(plainText)}', version=version+1, ` +
       `updated_at=unixepoch(), updated_by=2 ` +
-      `WHERE book='${entry.book}' AND chapter=${verse.chapter} AND verse=${verse.verse} ` +
-      `AND bible_version='${entry.bibleVersion}';`,
+      `WHERE ${rowMatch} AND version=<OLD_VERSION>;`,
   );
+  // audit row guarded on OUR heal having landed: it fires only if the row is now
+  // at version <OLD_VERSION>+1 AND carries exactly the healed content_json we just
+  // wrote. Matching on content_json (not just the post-update version number) is
+  // deliberate — a concurrent edit that happens to leave the row at <OLD_VERSION>+1
+  // would NOT carry our content, so the EXISTS is false and no orphan audit row is
+  // written. A no-op UPDATE (row moved on) likewise leaves the EXISTS false.
   lines.push(
     `INSERT INTO edit_log (kind,row_key,book,user_id,prev_version,new_version,action,payload_json,source,created_at) ` +
-      `VALUES ('verse','${rowKey}','${entry.book}',2,<OLD_VERSION>,<NEW_VERSION>,` +
-      `'heal-export-align-loss','${sqlEscape(payload)}','data_repair',unixepoch());`,
+      `SELECT 'verse','${rowKey}','${entry.book}',2,<OLD_VERSION>,<NEW_VERSION>,` +
+      `'heal-export-align-loss','${sqlEscape(payload)}','data_repair',unixepoch() ` +
+      `WHERE EXISTS (SELECT 1 FROM verses WHERE ${rowMatch} ` +
+      `AND version=<OLD_VERSION>+1 AND content_json='${sqlEscape(contentJson)}');`,
   );
   return lines.join("\n");
 }
@@ -457,9 +493,13 @@ async function main() {
     const sqlPath = path.join(OUT_DIR, "heal-1ch-num-apply.sql");
     const header = [
       "-- PROD-APPLY PLAN — NOT executed by the dry-run. Requires explicit human approval.",
-      "-- Each block needs a prod READ to fill <OLD_VERSION>/<NEW_VERSION> for the edit_log row.",
-      "-- The UPDATE uses version=version+1 (relative) so it is safe without reading first;",
-      "-- the edit_log audit row needs the literal versions. updated_by/user_id 2 = known-good user.",
+      "-- Each block REQUIRES a prod READ to fill <OLD_VERSION>/<NEW_VERSION> before applying.",
+      "-- The UPDATE is VERSION-CONDITIONAL (WHERE ... AND version=<OLD_VERSION>): if the row",
+      "-- moved on (a translator or the nightly reimport edited it after the version was read),",
+      "-- the UPDATE changes 0 rows and the heal is SKIPPED — the newer content is NOT clobbered.",
+      "-- The audit edit_log row is INSERT ... SELECT ... WHERE EXISTS on the post-update version,",
+      "-- so a skipped (no-op) UPDATE leaves no orphan audit row. updated_by/user_id 2 = known-good user.",
+      "-- A skipped row must be re-read and re-evaluated, NOT force-applied.",
       "-- Apply (after approval) from api/:  npx wrangler d1 execute bible_editor --remote --env production --file=../scripts/out/heal-1ch-num-apply.sql",
       "",
     ].join("\n");
