@@ -5,7 +5,7 @@
 // instead of getting silently flattened to `\v 6`. Not a test framework;
 // failures exit non-zero.
 
-import { buildTnTsv, buildTwlTsv, buildUsfm, commitToDcs, ensureDcsPr, exportTsvShrinkRefused, updateDcsPrBranch } from "./export.ts";
+import { buildTnTsv, buildTwlTsv, buildUsfm, commitToDcs, ensureDcsPr, exportTsvShrinkRefused, updateDcsPrBranch, usfmAlignmentShrinkRefused } from "./export.ts";
 import { CorruptContentJsonError } from "./contentJson.ts";
 
 function assert(cond, msg) {
@@ -536,6 +536,59 @@ function utf8Base64(s) {
   assert(exportTsvShrinkRefused(0, 0) === false, `empty master never refuses`);
   // A render to zero rows against a populated master is the strongest signal.
   assert(exportTsvShrinkRefused(0, 4000) === true, `render-to-empty against populated master refused`);
+}
+
+// --- usfmAlignmentShrinkRefused: ULT/UST verse alignment backstop ---
+// The 1CH 4:21 / NUM 24 signature — a verse keeps the same text but loses
+// \zaln milestones on words the translator never touched. The export must
+// refuse to ship that to master.
+{
+  // One aligned token: \zaln-s ...\* \w word\w* \zaln-e\*. The explicit
+  // \zaln-e\* close keeps each milestone a sibling span (usfm-js NESTS
+  // consecutive open milestones with no close, which would keep a word "aligned"
+  // under an ancestor even after dropping its own \zaln). Passing dealignIdx
+  // emits a bare \w (no \zaln) for that word — the de-alignment under test.
+  const verse = (book, ch, v, words, dealignIdx = -1) =>
+    `\\id ${book}\n\\c ${ch}\n\\p\n\\v ${v} ` +
+    words
+      .map((word, i) =>
+        i === dealignIdx
+          ? `\\w ${word}|x-occurrence="1" x-occurrences="1"\\w*`
+          : `\\zaln-s |x-strong="H${100 + i}" x-content="${word}"\\*\\w ${word}|x-occurrence="1" x-occurrences="1"\\w*\\zaln-e\\*`,
+      )
+      .join(" ") +
+    "\n";
+
+  const master = verse("1CH", 4, 21, ["Lekah", "and", "Shelah"]);
+
+  // (1) Render lost an alignment on an untouched verse → REFUSE.
+  const lost = verse("1CH", 4, 21, ["Lekah", "and", "Shelah"], 1);
+  const r1 = usfmAlignmentShrinkRefused(lost, master);
+  assert(r1.refused === true, `de-alignment on unchanged-text verse is refused`);
+  assert(r1.offenders.length === 1 && r1.offenders[0].ref === "4:21", `offender is 4:21`);
+  assert(r1.offenders[0].renderedAligned === 2 && r1.offenders[0].masterAligned === 3, `2<3 aligned words reported`);
+
+  // (2) Identical render → no shrink, allowed.
+  const r2 = usfmAlignmentShrinkRefused(master, master);
+  assert(r2.refused === false, `identical render is allowed`);
+
+  // (3) Legitimate text rewrite (plain text changes) → exempt even if alignment drops.
+  const rewritten = verse("1CH", 4, 21, ["Lekah", "or", "Shelah"], 1);
+  const r3 = usfmAlignmentShrinkRefused(rewritten, master);
+  assert(r3.refused === false, `a real text change ("and"→"or") is allowed despite alignment drop`);
+
+  // (4) Render ADDS alignment (more aligned words, same text) → never a shrink.
+  const r4 = usfmAlignmentShrinkRefused(master, verse("1CH", 4, 21, ["Lekah", "and", "Shelah"], 1));
+  assert(r4.refused === false, `growth in aligned words is not a shrink`);
+
+  // (5) Verse only on master (removed in render) → ignored (content change, not collateral).
+  const masterTwoVerses = master + verse("1CH", 4, 22, ["who", "ruled"]);
+  const r5 = usfmAlignmentShrinkRefused(master, masterTwoVerses);
+  assert(r5.refused === false, `a verse removed entirely is not flagged as alignment loss`);
+
+  // (6) Empty master → nothing to shrink.
+  const r6 = usfmAlignmentShrinkRefused(master, "");
+  assert(r6.refused === false, `empty master never refuses`);
 }
 
 console.log("\nAll export smoke checks passed.");

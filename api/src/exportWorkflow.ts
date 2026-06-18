@@ -30,6 +30,7 @@ import {
   exportTsvShrinkRefused,
   findDcsOpenPr,
   updateDcsPrBranch,
+  usfmAlignmentShrinkRefused,
   RESOURCE_TARGETS,
   type Resource,
 } from "./export";
@@ -306,6 +307,37 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       if (!guard.ok) {
         await this.recordShrinkSkipAlert(book, resource, built.rowCount, guard.masterRows, guard.detail);
         const reason = `shrink_guard:${guard.detail}`;
+        await this.recordSnapshot(book, resource, null, null, built.rowCount, reason);
+        return {
+          book,
+          resource,
+          rowCount: built.rowCount,
+          bytes: built.content.length,
+          r2Key,
+          branch: null,
+          dcsCommitSha: null,
+          dcsChanged: false,
+          dcsSkippedReason: reason,
+          prNumber: null,
+          prReason: null,
+        };
+      }
+    }
+
+    // Alignment-shrink backstop for the scripture (verse) resources. The TSV
+    // shrink guard above protects row counts; this protects \zaln word
+    // alignment. A verse that lost \zaln milestones on UNTOUCHED words (the
+    // 1CH 4:21 / NUM 24 signature) has the same row count but fewer aligned
+    // words — invisible to the TSV guard. The interactive guard now catches
+    // this at write time, but a verse already regressed in D1 (landed before
+    // the guard, or via an ingress path it doesn't cover) would still ship.
+    // Conservative: only blocks a verse whose aligned-word count shrank while
+    // its plain text is unchanged — a real text rewrite is always allowed.
+    if (dcsAllowed && (resource === "ult" || resource === "ust")) {
+      const guard = await this.checkUsfmAlignmentShrink(book, resource, built.content);
+      if (!guard.ok) {
+        await this.recordAlignmentShrinkSkipAlert(book, resource, guard.detail);
+        const reason = `align_shrink_guard:${guard.detail}`;
         await this.recordSnapshot(book, resource, null, null, built.rowCount, reason);
         return {
           book,
@@ -664,6 +696,47 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       return { ok: false, detail: `shrink_${masterRows - renderedRows}_of_${masterRows}`, masterRows };
     }
     return { ok: true, detail: "ok", masterRows };
+  }
+
+  // Fetch master's current USFM and decide whether this ULT/UST render would
+  // silently drop \zaln word alignment (the 1CH 4:21 / NUM 24 signature; see
+  // export.ts usfmAlignmentShrinkRefused). Fail closed when master can't be
+  // read — a truncated master fetch returns null from fetchText, and an
+  // unverifiable master must block rather than let an unchecked render through.
+  private async checkUsfmAlignmentShrink(
+    book: string,
+    resource: Resource,
+    renderedUsfm: string,
+  ): Promise<{ ok: boolean; detail: string }> {
+    const file = dcsResourceFile(book, resource as ReimportResource);
+    if (!file) return { ok: true, detail: "no_file" };
+    const masterUsfm = await fetchText(dcsRawUrl(this.env, file.repo, file.path));
+    if (masterUsfm == null) return { ok: false, detail: "master_unreadable" };
+    const result = usfmAlignmentShrinkRefused(renderedUsfm, masterUsfm);
+    if (result.refused) {
+      const sample = result.offenders
+        .slice(0, 5)
+        .map((o) => `${o.ref}(${o.renderedAligned}<${o.masterAligned})`)
+        .join(" ");
+      return { ok: false, detail: `align_loss_${result.offenders.length}:${sample}` };
+    }
+    return { ok: true, detail: "ok" };
+  }
+
+  // Banner alert when the alignment-shrink backstop blocks an ULT/UST export to
+  // avoid shipping a silent de-alignment to master. Same replace-undismissed
+  // shape as recordShrinkSkipAlert.
+  private async recordAlignmentShrinkSkipAlert(
+    book: string,
+    resource: Resource,
+    detail: string,
+  ): Promise<void> {
+    const source = `export_align_shrink:${book}:${resource}`;
+    const message =
+      `Benjamin fix this — nightly export BLOCKED ${book} ${resource.toUpperCase()}: the render would drop \\zaln ` +
+      `word alignment on verses whose text is UNCHANGED (${detail}). This is the 1CH 4:21 / NUM 24 collateral ` +
+      `de-alignment signature — refusing to ship it to master. Re-align the affected verse(s) in the editor, then re-export.`;
+    await this.writeAlert(source, message, `${this.env.DCS_BASE_URL}/unfoldingWord`);
   }
 
   // Banner alert when the shrink guard blocks an export to avoid mass-deleting

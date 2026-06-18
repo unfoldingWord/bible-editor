@@ -14,7 +14,7 @@ import {
 } from "./contentJson.ts";
 import {
   analyzeAlignmentDelta,
-  intentAllowsUnexpectedAlignmentLoss,
+  guardBlocksSave,
   type AlignmentIntent,
 } from "./alignmentDelta.ts";
 
@@ -195,11 +195,13 @@ verses.patch("/:book/:chapter/:verse/:bibleVersion", requireEditor, async (c) =>
   }
   const alignmentIntent = (parsed.data.alignment_intent ?? "text_edit") as AlignmentIntent;
   const delta = analyzeAlignmentDelta(existingParsed, parsed.data.content);
-  if (
-    delta.unexpectedLosses.length > 0 &&
-    delta.wordSequenceUnchanged &&
-    !intentAllowsUnexpectedAlignmentLoss(alignmentIntent)
-  ) {
+  // Block any save that collaterally de-aligns untouched words. The enforced
+  // predicate lives in guardBlocksSave — DO NOT inline a narrowing such as
+  // `delta.wordSequenceUnchanged` here. That narrowing (commit 6980fd72) is
+  // exactly what let 1CH 4:21 / NUM 24 ship: a one-word spelling edit flips
+  // wordSequenceUnchanged to false, so the narrowed guard never fired and the
+  // collateral loss reached master. See guardBlocksSave for the full rationale.
+  if (guardBlocksSave(delta, alignmentIntent)) {
     return c.json(
       {
         error: "unexpected_alignment_loss",

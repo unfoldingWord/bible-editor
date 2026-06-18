@@ -145,3 +145,25 @@ export function analyzeAlignmentDelta(beforeContent: unknown, afterContent: unkn
 export function intentAllowsUnexpectedAlignmentLoss(intent: AlignmentIntent): boolean {
   return intent === "alignment_edit";
 }
+
+// The single enforced predicate: should this save be BLOCKED for collateral
+// alignment loss? Both the API PATCH handler (api/src/verses.ts) and the web
+// outbox guard (web/src/components/Shell.tsx) call this so there is exactly one
+// definition of "too much alignment loss" — and so the tests assert the real
+// thing, not a re-derived copy.
+//
+// DO NOT re-add a `delta.wordSequenceUnchanged` (or any similar) narrowing
+// here. That exact narrowing (commit 6980fd72) is what let 1CH 4:21 / NUM 24
+// ship: a one-word spelling edit (e.g. Lekah→Lecah) flips
+// wordSequenceUnchanged to false, the narrowed guard never fired, and the
+// editor collaterally de-aligned untouched neighbors straight onto master.
+// analyzeAlignmentDelta's LCS path only reports unexpectedLosses for words that
+// existed before AND still exist after (same surface + occurrence) but lost or
+// changed their \zaln source — i.e. genuine collateral loss, never the word the
+// translator actually edited. The guard MUST fire on collateral loss regardless
+// of whether the word sequence also changed. The only exemption is
+// alignment_edit (re-aligning in the aligner panel legitimately changes
+// sources).
+export function guardBlocksSave(delta: AlignmentDelta, intent: AlignmentIntent): boolean {
+  return delta.unexpectedLosses.length > 0 && !intentAllowsUnexpectedAlignmentLoss(intent);
+}

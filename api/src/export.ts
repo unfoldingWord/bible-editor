@@ -138,6 +138,123 @@ export function exportTsvShrinkRefused(renderedRows: number, masterRows: number)
   return lost / masterRows > 0.05;
 }
 
+// ── Export alignment-shrink guard (ULT/UST verse backstop) ───────────────────
+// The TSV shrink guard above protects row counts; this protects \zaln word
+// alignment on the scripture (verse) resources, where the row==line model
+// doesn't apply. The motivating incident: a translator's one-word text edit
+// collaterally flattened \zaln milestones on UNTOUCHED words (1CH 4:21,
+// NUM 24:7/8/16/19/20/24), the regressed verse landed in D1, and the nightly
+// export — which has no alignment check — committed the loss to en_ult master.
+// The interactive guard (guardBlocksSave) now catches that at write time, but
+// this is the export-path backstop for any aligned verse that is ALREADY
+// regressed in D1 (e.g. it landed before the interactive guard existed, or via
+// an ingress path the guard doesn't cover).
+//
+// Conservative by construction — it only flags a verse whose aligned-word
+// count SHRANK while its plain text is UNCHANGED. A legitimate text rewrite
+// changes the plain text, so it is never blocked; only a silent de-alignment
+// of words the translator left alone trips it. Returns the list of offending
+// verse refs (empty = safe to commit).
+interface VerseAlignStat {
+  alignedWords: number;
+  plainText: string;
+}
+
+function plainTextOfVerseObjects(nodes: unknown[]): string {
+  const parts: string[] = [];
+  const walk = (list: unknown[]): void => {
+    for (const node of list) {
+      if (!node || typeof node !== "object") continue;
+      const o = node as Record<string, unknown>;
+      if (typeof o["text"] === "string" && o["type"] !== "milestone") parts.push(o["text"]);
+      const children = o["children"];
+      if (Array.isArray(children)) walk(children);
+    }
+  };
+  walk(nodes);
+  return parts.join("").replace(/\s+/g, " ").trim().normalize("NFC");
+}
+
+function countAlignedWords(nodes: unknown[]): number {
+  let count = 0;
+  const walk = (list: unknown[], underZaln: boolean): void => {
+    for (const node of list) {
+      if (!node || typeof node !== "object") continue;
+      const o = node as Record<string, unknown>;
+      const isZaln = o["type"] === "milestone" && o["tag"] === "zaln";
+      const nowUnderZaln = underZaln || isZaln;
+      if (underZaln && o["type"] === "word" && o["tag"] === "w" && typeof o["text"] === "string") {
+        count++;
+      }
+      const children = o["children"];
+      if (Array.isArray(children)) walk(children, nowUnderZaln);
+    }
+  };
+  walk(nodes, false);
+  return count;
+}
+
+// Map every verse in a USFM blob to its aligned-word count + plain text.
+// Keyed "chapter:verse" (verse keys can be "front", "12-13" — kept verbatim).
+function verseAlignStats(usfmText: string): Map<string, VerseAlignStat> {
+  const stats = new Map<string, VerseAlignStat>();
+  let json: { chapters?: Record<string, Record<string, unknown>> };
+  try {
+    json = usfm.toJSON(usfmText);
+  } catch {
+    return stats; // unparseable master → treat as no comparison data (caller fails closed elsewhere)
+  }
+  const chapters = json.chapters ?? {};
+  for (const chapterKey of Object.keys(chapters)) {
+    const chapterObj = chapters[chapterKey] as Record<string, unknown>;
+    for (const verseKey of Object.keys(chapterObj)) {
+      if (verseKey === "front") continue; // chapter-front (\d titles) — not aligned verse body
+      const verseObj = chapterObj[verseKey] as { verseObjects?: unknown[] };
+      const vos = Array.isArray(verseObj?.verseObjects) ? verseObj.verseObjects : [];
+      stats.set(`${chapterKey}:${verseKey}`, {
+        alignedWords: countAlignedWords(vos),
+        plainText: plainTextOfVerseObjects(vos),
+      });
+    }
+  }
+  return stats;
+}
+
+export interface AlignmentShrinkResult {
+  refused: boolean;
+  offenders: Array<{ ref: string; renderedAligned: number; masterAligned: number }>;
+}
+
+// Compare a rendered ULT/UST USFM against the current master USFM. REFUSE
+// (refused=true) if any verse present in BOTH has fewer aligned \w words in the
+// render than on master while its plain text is unchanged — the signature of a
+// silent de-alignment. Verses only on one side (added/removed) are ignored:
+// genuine content change, not collateral loss. A plain-text change on a verse
+// exempts it (a real rewrite legitimately re-aligns). Empty master (fresh book)
+// can't be shrunk.
+export function usfmAlignmentShrinkRefused(
+  renderedUsfm: string,
+  masterUsfm: string,
+): AlignmentShrinkResult {
+  const rendered = verseAlignStats(renderedUsfm);
+  const master = verseAlignStats(masterUsfm);
+  const offenders: AlignmentShrinkResult["offenders"] = [];
+  for (const [ref, masterStat] of master) {
+    if (masterStat.alignedWords === 0) continue; // nothing aligned on master to lose
+    const renderedStat = rendered.get(ref);
+    if (!renderedStat) continue; // verse removed entirely — content change, not our concern
+    if (renderedStat.plainText !== masterStat.plainText) continue; // real text change — allowed
+    if (renderedStat.alignedWords < masterStat.alignedWords) {
+      offenders.push({
+        ref,
+        renderedAligned: renderedStat.alignedWords,
+        masterAligned: masterStat.alignedWords,
+      });
+    }
+  }
+  return { refused: offenders.length > 0, offenders };
+}
+
 // ── USFM rebuilder ───────────────────────────────────────────────────────────
 
 export interface UsfmInputs {

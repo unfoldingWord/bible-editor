@@ -28,7 +28,7 @@ import { extractEditableText, extractPlainText, normalizeEditable, SECTION_HEADE
 import { verseHasUnalignedWork, countUnalignedTargetWords } from "../lib/alignment";
 import {
   analyzeAlignmentDelta,
-  intentAllowsUnexpectedAlignmentLoss,
+  guardBlocksSave,
   type AlignmentIntent,
 } from "../lib/alignmentDelta";
 import { buildVerseIndex, concatSourceRange, formatVerseLabel } from "../lib/verseRange";
@@ -1045,11 +1045,13 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     expectedVersion = base.version,
   ): boolean => {
     const delta = analyzeAlignmentDelta(base.content, content);
-    if (
-      delta.unexpectedLosses.length > 0 &&
-      delta.wordSequenceUnchanged &&
-      !intentAllowsUnexpectedAlignmentLoss(intent)
-    ) {
+    // Block any save that collaterally de-aligns untouched words. The enforced
+    // predicate lives in guardBlocksSave — DO NOT inline a narrowing such as
+    // `delta.wordSequenceUnchanged` here. That narrowing (commit 6980fd72) is
+    // exactly what let 1CH 4:21 / NUM 24 ship: a one-word spelling edit flips
+    // wordSequenceUnchanged to false, so the narrowed guard never fired and the
+    // collateral loss reached master. See guardBlocksSave for the full rationale.
+    if (guardBlocksSave(delta, intent)) {
       const sample = delta.unexpectedLosses
         .slice(0, 3)
         .map((loss) => loss.text)
