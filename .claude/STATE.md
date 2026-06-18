@@ -98,9 +98,11 @@ Not yet PR'd.
   MIC 6:10 UST v12.** Editor rewrote the verse + deleted the visible `-e`, but 1 residual orphan node
   survived (invisible in plain_text; re-exports `\zaln-e\* -e` to DCS on the nightly). **Heal SQL ready at
   `scripts/out/heal-mic610.sql`** (version-guarded v12→v13, plain_text byte-identical, audited) but the
-  classifier BLOCKED the prod write — lead only asked to *check* prod. **PENDING lead OK to apply.** DCS
-  master 33-MIC.usfm still fully corrupt; the nightly D1→master export heals it once D1 is clean. Branch
-  `claude/trusting-mclean-8e3ba4`, commit 28854953. Not yet PR'd.
+  classifier first blocked the prod write; **lead authorized → APPLIED 2026-06-18**: MIC 6:10 UST v12→v13,
+  `has_orphan`/`has_dashe` both 0, audited edit_log `source='heal-orphan-align-markers'` (prev 12 / new 13).
+  prod D1 now fully clean. DCS master 33-MIC.usfm still fully corrupt; the nightly D1→master export heals it
+  now that D1 is clean (no manual master edit needed). Branch `claude/trusting-mclean-8e3ba4`, commit
+  28854953 → **PR #239**.
 - **vibrant-raman** (2026-06-18) — Heal AI-TN id/dup rot on en_tn master. tn_ISA.tsv had 3 unresolved
   git conflict markers (Richard Mahn's local `git merge origin/master` into the ISA `-be-` branch, then
   PR-merged to master) + 94 dup-note rows; ZEC 34 dups, NUM 1 dup, HOS 6 unique digit-first ids; ECC
