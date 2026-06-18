@@ -183,9 +183,54 @@ function unmerge(verseObjects: unknown[]): PivotWord[] | null {
         continue;
       }
 
-      // A plain text node carries punctuation/whitespace only — skip it (the gap
-      // re-layout rebuilds all non-word text fresh from the new target string).
-      if (o["type"] === "text") continue;
+      // A `type:"text"` node. For a CLEAN \w-wrapped verse this only ever holds the
+      // non-word GAPS between words (whitespace / punctuation) — tokenize() finds
+      // no word run there, so nothing is pushed and behavior is byte-identical to
+      // the pre-bare-text engine. But AI-drafted ULT/UST commonly leaves WORDS
+      // un-\w-wrapped as bare text (`\p \v 1 In the beginning …`); the aligner
+      // already tokenizes those into draggable \w targets (replace.ts
+      // tokenizePlainText / tokenizeEditableText). Mirror that here: lift each bare
+      // word run into an UNALIGNED pivot word (empty chain, sourceKey null) so the
+      // pivot list length matches the raw token count and GATE 1 no longer bails.
+      // Bare words are the wordBank equivalent — they re-emit as bare \w nodes (the
+      // same shape a genuinely new word gets) so they stay draggable, never gaining
+      // a \zaln source they didn't have. Only do this at the TOP LEVEL (chain
+      // empty): a letter-bearing text node nested INSIDE a milestone is a structure
+      // we can't faithfully rebuild (it has no \w source of its own), so bail and
+      // let the legacy tiers handle the whole verse.
+      //
+      // NOTE on the key: we read words ONLY from `o["text"]`. A `\s1`/`\s2` section
+      // header stores its heading in `content`, not `text`, so it never reaches the
+      // tokenizer here — and it is caught by the explicit content-bearing BAIL
+      // below, NOT silently skipped. Bare-text tokenization must never read a
+      // section node's content as words.
+      if (o["type"] === "text") {
+        const runs = tokenize(typeof o["text"] === "string" ? (o["text"] as string) : "");
+        if (runs.length > 0) {
+          // A letter-bearing text node nested inside a milestone has no \w source
+          // of its own — we can't faithfully rebuild it; bail to the legacy tiers.
+          if (chain.length > 0) {
+            bail = true;
+            return;
+          }
+          for (const run of runs) {
+            const surface = nfc(run);
+            const occ = (occBySurface.get(surface) ?? 0) + 1;
+            occBySurface.set(surface, occ);
+            words.push({
+              node: { type: "word", tag: "w", text: run, occurrence: "1", occurrences: "1" },
+              surface,
+              occurrence: occ,
+              chain: [],
+              sourceKey: null,
+              groupId: "",
+            });
+          }
+        }
+        // Whitespace/punctuation-only text → nothing pushed; the gap re-layout
+        // rebuilds all non-word text fresh from the new target string.
+        continue;
+      }
 
       // A childless, payload-free position anchor — the imported `\ts\*` chunk
       // milestone (tag `ts\*`, which isInFlowMarker doesn't match), an empty
@@ -200,12 +245,14 @@ function unmerge(verseObjects: unknown[]): PivotWord[] | null {
       if (!hasChildren && !hasContent && !hasText) continue;
 
       // Anything else carries CONTENT reassembly can't faithfully rebuild — a
-      // `\s1`/`\s2` section header (heading in `content`, not `children`, and
-      // invisible to the editable-text self-check since sections are excluded from
-      // extractEditableText), or any unknown wrapper/leaf bearing content/text/
+      // `\s1`/`\s2` section header (heading in `content`, NOT a `type:"text"` node,
+      // and invisible to the editable-text self-check since sections are excluded
+      // from extractEditableText), or any unknown wrapper/leaf bearing content/text/
       // children. BAIL so the caller falls back to the legacy diff tiers, which do
       // localized edits and leave such nodes untouched. Fail-closed for any future
-      // node type we don't explicitly handle here.
+      // node type we don't explicitly handle here. (This is the section fix; it
+      // runs AFTER the bare-text branch above, which only consumes `type:"text"`
+      // word runs — so a section node's `content` is never tokenized.)
       bail = true;
       return;
     }

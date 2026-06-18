@@ -1652,6 +1652,156 @@ function countAligned(content) {
   assert(r.plainText === after, `plainText reconstructs the typed text exactly (got ${JSON.stringify(r.plainText)})`);
 }
 
+// ─── Case 66: bare-text AI draft — multi-region edit keeps survivors aligned ──
+// AI-drafted ULT/UST commonly leaves words un-\w-wrapped as bare text
+// (`\p \v 1 In the beginning …`). The aligner tokenizes those into draggable \w
+// targets (tokenizePlainText), but the occurrence-keyed reassembly engine used to
+// NO-OP on any such verse: its GATE 1 bailed when the per-\w pivot count didn't
+// match the raw token count (bare words produce raw tokens but no \w leaves), so
+// the multi-region flatten protection didn't apply (the legacy tiers handled
+// them). Reassembly now lifts bare top-level word runs into UNALIGNED pivot words
+// so the counts match and the gate passes — bare words re-emit as bare \w, the
+// few \w-wrapped words keep their EXACT milestone ancestry, only the genuinely
+// changed word unaligns, and the text reconstructs byte-for-byte.
+{
+  console.log("\n[Case 66] Bare-text AI draft: multi-region edit keeps the wrapped survivors aligned");
+  // `\p` marker + bare "In the beginning " + aligned "God" (H430) + bare
+  // " created the " + a compound milestone over "heavens and the earth" (H8064).
+  const verse = {
+    verseObjects: [
+      { type: "paragraph", tag: "p" },
+      t("In the beginning "),
+      zaln("H430", [w("God")]),
+      t(" created the "),
+      zaln("H8064", [w("heavens"), t(" "), w("and"), t(" "), w("the"), t(" "), w("earth")]),
+      t("."),
+    ],
+  };
+  const old = extractEditableText(verse);
+  assert(old === "\\p In the beginning God created the heavens and the earth.",
+    `bare-text editable string surfaces words + marker (got ${JSON.stringify(old)})`);
+  // Two separated change regions: prepend "Now " near the START, replace the last
+  // word "earth"→"land" near the END.
+  const after = old.replace("In the beginning", "Now in the beginning").replace("earth", "land");
+  const r = smartEditVerse(verse, old, after);
+  assert(r.plainText === "Now in the beginning God created the heavens and the land.",
+    `plainText reconstructs the typed text exactly (got ${JSON.stringify(r.plainText)})`);
+  assert(r.preservedAlignment === true, "preservedAlignment true (a \\w survivor kept its ancestry)");
+  const out = alignedWords(r.content);
+  // The \w-wrapped survivors keep their EXACT milestone — God + the whole compound.
+  const god = out.find((x) => x.text === "God");
+  assert(god && god.strongs.includes("H430"), "untouched aligned 'God' keeps H430");
+  for (const word of ["heavens", "and", "the"]) {
+    const f = out.find((x) => x.text === word && x.strongs.includes("H8064"));
+    assert(!!f, `untouched compound word '${word}' keeps H8064`);
+  }
+  // Bare top-level words stay intact (present, unaligned) — text not lost.
+  for (const word of ["Now", "in", "beginning", "created"]) {
+    const f = out.find((x) => x.text === word);
+    assert(f && f.strongs.length === 0, `bare word '${word}' stays intact and unaligned`);
+  }
+  // Only the genuinely changed word unaligns; 'earth' is gone, 'land' is bare.
+  assert(!out.some((x) => x.text === "earth"), "replaced 'earth' is gone");
+  const land = out.find((x) => x.text === "land");
+  assert(land && land.strongs.length === 0, "new 'land' is bare (unaligned)");
+  // The \p marker survives the edit (Step 2 marker reconcile).
+  assert(r.content.verseObjects.some((n) => n.tag === "p"), "the \\p marker is preserved");
+}
+
+// ─── Case 67: bare-text verse with ONE aligned anchor — reassembly fires ──────
+// A mostly-bare AI draft carrying a single \w-wrapped aligned word. A multi-region
+// edit (a bare word near the start AND a bare word near the end) must route through
+// reassembly (there is an aligned survivor to protect), keep that anchor's
+// alignment, leave the bare words intact, and reconstruct the text byte-for-byte.
+// This is the bare-text case the GATE-1 extension exists for: without it the engine
+// no-opped and the multi-region protection didn't apply.
+{
+  console.log("\n[Case 67] Bare verse + one aligned anchor: multi-region edit fires reassembly, keeps anchor");
+  const verse = {
+    verseObjects: [
+      t("the quick brown "),
+      zaln("H7776", [w("fox")]),
+      t(" jumps over the lazy dog"),
+    ],
+  };
+  const old = extractEditableText(verse);
+  assert(old === "the quick brown fox jumps over the lazy dog",
+    `bare verse + anchor editable string (got ${JSON.stringify(old)})`);
+  // Two separated change regions: "quick"→"swift" near the start, "lazy"→"sleeping"
+  // near the end — the aligned "fox" sits between them, untouched.
+  const after = old.replace("quick", "swift").replace("lazy", "sleeping");
+  const r = smartEditVerse(verse, old, after);
+  assert(r.plainText === "the swift brown fox jumps over the sleeping dog",
+    `plainText reconstructs exactly, no text lost/duplicated (got ${JSON.stringify(r.plainText)})`);
+  assert(r.preservedAlignment === true, "preservedAlignment true (the aligned 'fox' survived)");
+  const out = alignedWords(r.content);
+  const fox = out.find((x) => x.text === "fox");
+  assert(fox && fox.strongs.includes("H7776"), "untouched aligned 'fox' keeps H7776");
+  // Untouched bare words stay intact and unaligned.
+  for (const word of ["brown", "jumps", "over", "dog"]) {
+    const f = out.find((x) => x.text === word);
+    assert(f && f.strongs.length === 0, `bare word '${word}' stays intact and unaligned`);
+  }
+  // The two changed words are the only ones gone.
+  assert(!out.some((x) => x.text === "quick" || x.text === "lazy"), "the two changed words are gone");
+  const swift = out.find((x) => x.text === "swift");
+  const sleeping = out.find((x) => x.text === "sleeping");
+  assert(swift && swift.strongs.length === 0, "new 'swift' is bare");
+  assert(sleeping && sleeping.strongs.length === 0, "new 'sleeping' is bare");
+}
+
+// ─── Case 68: INTERSECTION — bare-text verse that ALSO has a section header ───
+// The collision case the bare-text + section-fix integration must get right. A
+// `\s1` section heading precedes a verse whose words are a MIX of bare top-level
+// text ("Now in the beginning", "created the", trailing ".") and \w-wrapped
+// aligned words (God=H430, the heavens/and/the/earth compound=H8064). A multi-
+// region edit (prepend near the start, replace the last word near the end) is the
+// reassembly-class shape — but the section node is content-bearing and CHILDLESS,
+// so unmerge BAILS (the section fix), reassembly returns null, and the legacy diff
+// tiers run. The end-state we assert: (1) the section node SURVIVES with its
+// heading intact (bare-text tokenization must NEVER consume a section's `content`
+// as words, and must never defeat the section bail); (2) the untouched bare words
+// are intact; (3) only the changed words differ; (4) the text reconstructs exactly.
+{
+  console.log("\n[Case 68] INTERSECTION: bare-text verse + \\s1 section — section survives AND bare words handled");
+  const verse = {
+    verseObjects: [
+      { type: "section", tag: "s1", content: "Heading\n" },
+      { type: "paragraph", tag: "p" },
+      t("In the beginning "),
+      zaln("H430", [w("God")]),
+      t(" created the "),
+      zaln("H8064", [w("heavens"), t(" "), w("and"), t(" "), w("the"), t(" "), w("earth")]),
+      t("."),
+    ],
+  };
+  const old = extractEditableText(verse);
+  assert(old === "\\p In the beginning God created the heavens and the earth.",
+    `section excluded from editable text; bare words + marker surface (got ${JSON.stringify(old)})`);
+  // Two separated change regions, exactly the multi-region shape.
+  const after = old.replace("In the beginning", "Now in the beginning").replace("earth", "land");
+  const r = smartEditVerse(verse, old, after);
+  // (1) The section node SURVIVES with its heading intact.
+  const sec = (r.content.verseObjects ?? []).find((n) => n && n.type === "section" && n.tag === "s1");
+  assert(!!sec, "the \\s1 section node survives the intersection edit (must not be dropped)");
+  assert(sec && sec.content === "Heading\n", `the section heading content is intact (got ${JSON.stringify(sec && sec.content)})`);
+  // (2) + (4) the text reconstructs exactly — no bare word consumed as a section,
+  // no section content tokenized as a word, no text lost/duplicated.
+  assert(r.plainText === "Now in the beginning God created the heavens and the land.",
+    `plainText reconstructs the typed text exactly (got ${JSON.stringify(r.plainText)})`);
+  // The untouched bare words are intact and present.
+  const out = alignedWords(r.content);
+  for (const word of ["Now", "in", "beginning", "created"]) {
+    const f = out.find((x) => x.text === word);
+    assert(!!f, `untouched bare word '${word}' is intact`);
+  }
+  // (3) only the changed word differs near the end.
+  assert(!out.some((x) => x.text === "earth"), "replaced 'earth' is gone");
+  assert(out.some((x) => x.text === "land"), "new 'land' is present");
+  // The \p marker survives.
+  assert(r.content.verseObjects.some((n) => n.tag === "p"), "the \\p marker is preserved");
+}
+
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed.`);
   process.exit(1);
