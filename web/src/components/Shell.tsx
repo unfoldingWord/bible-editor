@@ -349,7 +349,10 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           updated_at: updated.updated_at,
         });
       } catch (e) {
-        const msg = e instanceof Error ? e.message : "unknown error";
+        // Prefer the server's human-readable message (e.g. the note_required
+        // 400) over the bare "HTTP 400" the ApiError carries as its message.
+        const serverMsg = (e as { body?: { message?: string } } | null)?.body?.message;
+        const msg = (typeof serverMsg === "string" && serverMsg) || (e instanceof Error ? e.message : "unknown error");
         pushPipelineToast(`Couldn't update Hint: ${msg}`, "error");
       }
     },

@@ -102,13 +102,18 @@ const TwlPatch = z.object({
 
 const PATCH_SCHEMA = { tn: TnPatch, tq: TqPatch, twl: TwlPatch };
 
-// Generate a 4-char alphanumeric ID matching the DCS sticky-id convention.
+// Generate a 4-char ID matching the DCS sticky-id convention. The TN TSV ID
+// grammar is ^[a-z][a-z0-9]{3}$ — the first char MUST be a letter. A
+// digit-first id can't legally exist in a TN TSV (it breaks round-tripping)
+// and bp-assistant rejects it when echoing hint rowIds, so the first position
+// draws from letters only; the remaining three are alphanumeric.
 // Exported so the AI auto-apply path in pipelineImport.ts can mint TN ids
 // without duplicating the alphabet.
 export function newRowId(): string {
-  const chars = "abcdefghijkmnpqrstuvwxyz23456789";
-  let out = "";
-  for (let i = 0; i < 4; i++) out += chars[Math.floor(Math.random() * chars.length)];
+  const letters = "abcdefghijkmnpqrstuvwxyz";
+  const chars = letters + "23456789";
+  let out = letters[Math.floor(Math.random() * letters.length)];
+  for (let i = 0; i < 3; i++) out += chars[Math.floor(Math.random() * chars.length)];
   return out;
 }
 
@@ -838,7 +843,26 @@ rows.post("/tn/:id/hint", requireEditor, async (c) => {
   if (!parsed.success) {
     return c.json({ error: "validation_failed", issues: parsed.error.issues }, 400);
   }
-  const updated = await setTnBit(c.env, id, book, userId, "hint", coerceBitValue(parsed.data.value));
+  const value = coerceBitValue(parsed.data.value);
+  // A hint with no note gives bp-assistant's tn-writer no framing to expand
+  // from — the hint's `seed` is this row's note, and an empty quote + empty
+  // seed has neither a source phrase nor any guidance (a path that has never
+  // run end-to-end). Require note text before a row can be queued as a hint.
+  if (value === 1) {
+    const row = await c.env.DB.prepare(
+      `SELECT note FROM tn_rows WHERE id = ?1 AND deleted_at IS NULL${bookClause(2)}`,
+    )
+      .bind(id, book)
+      .first<{ note: string | null }>();
+    if (!row) return c.json({ error: "not_found" }, 404);
+    if (!row.note || !row.note.trim()) {
+      return c.json(
+        { error: "note_required", message: "Add note text before queuing this row as an AI hint." },
+        400,
+      );
+    }
+  }
+  const updated = await setTnBit(c.env, id, book, userId, "hint", value);
   if (!updated) return c.json({ error: "not_found" }, 404);
   c.executionCtx.waitUntil(
     broadcastChapter(c.env, updated.book, updated.chapter, { type: "row.upserted", kind: "tn", row: updated }),
