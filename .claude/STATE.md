@@ -14,6 +14,26 @@
 
 ## Last run
 
+2026-06-18 · **charming-gagarin** — Defense-in-depth guards on the DCS→D1 reimport so a
+still-dirty master can never re-introduce the TN id/duplication defects (mint engine already
+disabled by #183/#225; this is structural insurance). **Guard 1 (id):** `coerceRowId` (new pure
+leaf `api/src/rowId.ts`, deterministic FNV-1a → valid `^[a-z][a-z0-9]{3}$`, no-op for valid ids)
+applied in the shared `parseTsvRow`, so the apply by-id read, diff gate, and prune all agree on the
+coerced id — the prune therefore never deletes an inserted-under-coerced-id row. Chose deterministic
+over random `newRowId()`+map (user-confirmed): no map to thread across nightly Workflow steps,
+idempotent across nights, even self-heals a bad id already in D1. **Guard 2 (content-dedup, TN
+only):** new pure leaf `api/src/tnDedup.ts` (`tnContentKey` + `planTnContentDedup`) skips inserting a
+row whose (chapter, verse, occurrence, support_reference, quote, note) already exists LIVE+PRISTINE
+under a different id; occurrence is in the key (ISA 10:9 אִם occ 1/2 stay distinct); never dedups
+against `updated_by`/`preserve`/`hint` rows (human work). Zero extra D1 reads (decision is pure off
+the existing by-id map). Added `skipped_dup` counter. Centralized `ROW_ID_RE`/`isValidRowId`/`newRowId`
+into `rowId.ts` (pipelineImport + rows.ts now import from there). Unit tests `rowId.test.mjs` (21
+asserts) + `tnDedup.test.mjs` (16 asserts, incl. doubling/rename/order-independence/human-protection),
+wired into `npm --workspace api test`. typecheck + full API suite green. **Prod read-only sanity:**
+0 LIVE digit-first TN ids (the 141 `id GLOB '[0-9]*'` hits are all `deleted_at` TOMBSTONES from the
+6-18 sweep — a future audit must filter `deleted_at IS NULL`); but found **1 live pristine
+content-dup** still present (see Escalated). Branch `claude/charming-gagarin-4fbc55`. Not yet PR'd.
+
 2026-06-17 · **epic-yalow** — Edge quotes on HOS 9:17 UST unaligned the WHOLE verse (13→0 ms).
 The verse is dense with INTERIOR `\q2`/`\q2`/`\q1` poetry markers, and `relayoutUnchangedWords`
 (the #214/#215 whole-verse punctuation tier) still BAILED on any interior marker → dropped to
@@ -83,6 +103,12 @@ Not yet PR'd.
 
 ## Escalated / blocked on a human (not a code change Claude can land alone)
 
+- **Prod `DEU 27:22` TN content-dup** — 2 live PRISTINE notes, same content (occ 1, quote `שֹׁכֵב֙ עִם`,
+  note "See how you translated 'lies with'…") under ids `y3oq` + `oi0y` (both valid ids — a pure
+  doubling, not a digit-first id). The new reimport Guard 2 PREVENTS new doubles but does NOT remediate
+  this existing pair (it's insert-time only). Remediate by soft-deleting one copy (`scripts/dedup-tn.mjs`
+  or the prod verse-repair pattern: version+1 + edit_log). Found 2026-06-18 via a corpus-wide live
+  pristine content-key scan (only 1 such group corpus-wide). (memory: tn-ai-duplication-roundtrip)
 - **en_ust master `PSA 24:6` UST** — unclosed `\qs` Selah still malformed on master; D1 already healed (v2).
   Needs the `-be-` export branch merged to land the fix. (memory: selah-qs-malformation-psa246)
 - **Prod `MIC 5:5`** — bracket/period-marker engine bugs fixed in code, but the already-stored verse
