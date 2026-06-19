@@ -1353,6 +1353,35 @@ function transplants(origContent, resultContent) {
   assert(alignedWords(r.content).find((x) => x.text === "word")?.strongs.includes("H3"), "'word' keeps alignment");
 }
 
+// --- Case 55b: a word edit that ALSO adds a line-ending em-dash keeps the dash
+// before the marker -----------------------------------------------------------
+// The reported prod class (em-dash typed at the end of a poetic line), but here
+// combined with a word change so it routes through the diff tier (smartReplace-
+// Verse) rather than the pure-punctuation relayout of Case 22b. Typing the dash
+// changes the marker's adjacent punctuation, flipping markerSignature ->
+// markersChanged, so Step 2 reconcileMarkers (which honors the typed position,
+// #240) owns the placement and keeps the dash on the line it was typed.
+{
+  console.log("\n[Case 55b] Word edit + line-ending em-dash keeps the dash before the marker");
+  const q = (tag) => ({ type: "quote", tag });
+  const verse = {
+    verseObjects: [
+      zaln("H1", [w("the")]), t(" "), zaln("H2", [w("city")]), t("\n"), q("q2"),
+      zaln("H3", [w("and")]), t(" "), zaln("H4", [w("wisdom")]),
+    ],
+  };
+  const old = extractEditableText(verse); // "the city \q2 and wisdom"
+  // Change "city"->"town" AND append an em-dash at the end of the \q1 line.
+  const r = smartEditVerse(verse, old, old.replace("city", "town—"));
+  const vos = r.content.verseObjects;
+  const qi = vos.findIndex((n) => n.type === "quote" && n.tag === "q2");
+  assert(qi >= 0, "the \\q2 marker is present");
+  const hasDash = (arr) => arr.some((n) => (n.type === "text" && n.text.includes("—")) || (Array.isArray(n.children) && n.children.some((c) => c.type === "text" && c.text.includes("—"))));
+  assert(hasDash(vos.slice(0, qi)) && !hasDash(vos.slice(qi + 1)), `em-dash stays BEFORE the \\q2 marker, on the line it was typed (raw ${JSON.stringify(r.plainText)})`);
+  assert(alignedWords(r.content).find((x) => x.text === "and")?.strongs.includes("H3"), "'and' keeps its alignment");
+  assert(alignedWords(r.content).find((x) => x.text === "wisdom")?.strongs.includes("H4"), "'wisdom' keeps its alignment");
+}
+
 // ─── Case 56: deleting a clause-final word doesn't push its punctuation across a \q ─
 // HOS 8:3 shape: a milestone wraps [w "good", text ";"] right before a \q line
 // break. Deleting "good" empties that milestone; the leftover ";" must stay a

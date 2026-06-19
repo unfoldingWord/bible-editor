@@ -810,12 +810,21 @@ function stripRebuildMarks(o: Record<string, unknown>): Record<string, unknown> 
   return rest;
 }
 
-// Whitespace + CLOSING punctuation that hugs a word's RIGHT edge — the run that
-// belongs to the line BEFORE a `\q`/`\p` line break. Shared verbatim with
-// reconcileMarkers (its placement loop uses the same class) so smartRebuildRange
-// splits a marker-straddling gap on exactly the convention reconcileMarkers will
-// re-confirm in step 2. The em-dash is deliberately excluded: it leads as often
-// as it trails (ZEC 13:7 `companion” \q1 —the`).
+// Whitespace + closing punctuation that hugs a word's RIGHT edge: the run that
+// belongs to the line BEFORE a `\q`/`\p` line break. smartRebuildRange re-lays an
+// inter-word gap as the FOLLOWING word's leading text, which lands INSIDE that
+// word's milestone, after the marker. Step 2 reconcileMarkers only re-splits
+// TOP-LEVEL bare text gaps; it cannot pull closing punctuation back out of a
+// milestone, so for milestone-trapped punctuation THIS pre-split is the authority
+// and must place it correctly on its own. Closing punctuation trails the previous
+// line and goes BEFORE the marker; opening punctuation (and the em-dash, which
+// leads as often as it trails) stays AFTER it. This agrees with reconcileMarkers'
+// typed-position split (added in #240) for every layout that reaches this tier: a
+// line-ending em-dash is the lone shape where the two could disagree, but typing
+// one changes the marker's adjacent punctuation, which flips markerSignature ->
+// markersChanged, so reconcileMarkers (which honors the typed position) runs and
+// owns that placement instead. If such a shape ever did reach here the dash would
+// sit after the marker: a cosmetic line-break, never a loss of alignment or text.
 const MARKER_CLOSING_RE = /[\s,.;:!?)\]}”’…]/;
 
 // Split a gap string into the CLOSING run that trails the previous word (belongs
@@ -926,8 +935,9 @@ function smartRebuildRange(
   // line break. Split each such gap on the closing/opening boundary: the CLOSING
   // run (belongs to the previous line) is stashed on the marker as __markerClosing
   // and emitted as a bare text node BEFORE it; the remainder stays __gapBefore and
-  // leads the next word AFTER the marker. This is the same rule reconcileMarkers
-  // applies in step 2, so the output is a fixed point under it. Walk the top-level
+  // leads the next word AFTER the marker. reconcileMarkers (Step 2) only re-splits top-level bare gaps
+  // and honors the typed position, so it leaves this milestone-internal split
+  // untouched and agrees with it for the layouts that reach this tier. Walk the top-level
   // nodes in document order (markers only ever sit at top level in aligned source)
   // and, for each marker, find the next word-bearing node carrying __gapBefore.
   const firstGapLeafAfter = (fromIdx: number): Record<string, unknown> | null => {
