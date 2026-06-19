@@ -14,6 +14,23 @@
 
 ## Last run
 
+2026-06-19 · **sweet-moore** — Fixed Perry's **JER 29:31 UST** alignment-save block (PR #248). Repro'd on
+`main` (NOT an outdated app): inserting "Because" mid-verse + changing the verse-final `.`→`,` flattened
+37→17 aligned and the #233 guard discarded the draft. Root cause = a gap in the #235 reassembly engine:
+`countChangeRegions` counts only WORD-token regions, so a word insert + a SEPARATED punctuation-only change
+is ONE region → reassembly bailed to the legacy single-range diff, whose common suffix is killed by the
+trailing-punct change, ballooning the range to the verse end → `localizedRewriteVerse` flattened every
+milestone in between. Fix: `reassembleAlignment` GATE 2 now ALSO fires when the single-range char diff would
+flatten an aligned SURVIVOR (`diffRangeCoversAlignedSurvivor` — computes the exact span localizedRewrite
+would rewrite, checks if a surviving aligned word sits fully inside). Single contiguous edits still defer
+(survivors stay in the common prefix/suffix), so in-word-split Cases 25/26/27/50 are unaffected. JER 29:31
+→ 37/37 (only the new "Because" bare). Regression: replace.test Case 66 (real `en_ust` JER 29:31 fixture,
+12 asserts). Full web suite (331 replace + 5 suites) + typecheck green. **Verified end-to-end through the
+running worker**: a multi-region edit on ZEC 1:3 UST now PATCHes 200 (server guard accepts), only the
+inserted word unaligns. Client-only engine change; no API/migration. Branch `claude/sweet-moore-86a875`,
+**PR #248** open (rebased onto main). NB: this verse can't be browser-tested locally (JER not in the ZEC
+seed) — the running-worker PATCH on ZEC is the integration proof. (memory: project_reassembly_separated_punct_gate_gap)
+
 2026-06-19 · **great-jemison** — Built **ULT/UST verse version history** (mirrors note history). There was
 no pre-existing admin versioning to "open up" — verses were audited to `edit_log` but had no endpoint/UI.
 **(A)** New `GET /api/verses/:book/:ch/:v/:bv/history` (`requireEditor`, same gate as notes) backed by a
