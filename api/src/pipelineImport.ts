@@ -2,9 +2,9 @@
 // and stages the rows into pending_imports for translator review (Phase 2).
 //
 // Called from the GET /api/pipelines/:jobId handler when the upstream poll
-// surfaces state='done' for the first time. Idempotent on re-poll: a guard
-// query on pending_imports.job_id short-circuits if rows already exist for
-// this job.
+// surfaces state='done' for the first time. Idempotent on re-poll: a complete-
+// staging marker (pipeline_jobs.staged_at) short-circuits the parse once the
+// full proposal set has landed; an incomplete prior attempt is restaged.
 
 import type { Env } from "./index";
 import {
@@ -194,7 +194,8 @@ async function parseOutputEntry(
 
 // Top-level entry. Two phases:
 //   1. STAGE — fetch each rawUrl, parse, INSERT into pending_imports.
-//      Idempotent on the existence of any pending_imports row for the job.
+//      Idempotent on the pipeline_jobs.staged_at marker, written only after
+//      the last chunk commits; a partial prior stage is dropped and redone.
 //   2. APPLY — for every unresolved pending_imports row, mutate the live
 //      tn_rows / tq_rows / verses tables and mark accepted_at.
 //      Idempotent at the per-row level (accepted_at IS NULL filter) plus
@@ -219,16 +220,34 @@ async function stageJobOutput(
   job: ImportContext,
   outputs: OutputEntry[],
 ): Promise<ImportResult> {
-  // Idempotency guard: if we've already staged for this job, skip the parse.
-  // Apply phase below will pick up any still-unresolved rows on retry.
-  const existing = await env.DB.prepare(
-    `SELECT 1 FROM pending_imports WHERE job_id = ?1 LIMIT 1`,
+  // Idempotency guard: staged_at is written ONLY after the final chunk below
+  // commits, so it — not the mere existence of a pending_imports row — is the
+  // authoritative "full proposal set is present" signal. Staging spans many
+  // D1 batch() calls (each atomic, the whole loop is not), so a mid-chunk
+  // crash leaves a PARTIAL set; keying idempotency on row-existence would let
+  // the retry apply that partial set and mark the job imported. See migration
+  // 0030. With the marker set, apply picks up any still-unresolved rows.
+  const marker = await env.DB.prepare(
+    `SELECT staged_at FROM pipeline_jobs WHERE job_id = ?1`,
   )
     .bind(job.jobId)
-    .first<{ "1": number }>();
-  if (existing) {
+    .first<{ staged_at: number | null }>();
+  if (marker?.staged_at != null) {
     return { inserted: 0, byKind: { tn: 0, tq: 0, verse: 0 }, skipped: ["already staged"] };
   }
+
+  // No complete-staging marker: either this is the first run, or a prior
+  // attempt died mid-chunk. Drop any partial, still-unresolved rows from that
+  // dead attempt and restage from scratch so apply never runs against a
+  // partial set. (Apply runs AFTER staging in importJobOutput, so for this job
+  // nothing is accepted yet; the accepted/rejected filter is belt-and-
+  // suspenders against a translator resolving a partial row in the retry gap.)
+  await env.DB.prepare(
+    `DELETE FROM pending_imports
+      WHERE job_id = ?1 AND accepted_at IS NULL AND rejected_at IS NULL`,
+  )
+    .bind(job.jobId)
+    .run();
 
   const skipped: string[] = [];
   const allStaged: StagedRow[] = [];
@@ -236,10 +255,6 @@ async function stageJobOutput(
     const { staged, skipReason } = await parseOutputEntry(job, entry);
     if (skipReason) skipped.push(skipReason);
     allStaged.push(...staged);
-  }
-
-  if (allStaged.length === 0) {
-    return { inserted: 0, byKind: { tn: 0, tq: 0, verse: 0 }, skipped };
   }
 
   // Batch insert in chunks. D1 batch() caps at 100 statements per call.
@@ -270,6 +285,16 @@ async function stageJobOutput(
     inserted += chunk.length;
     for (const s of chunk) byKind[s.kind] += 1;
   }
+
+  // Mark staging complete only after the last chunk committed (also covers the
+  // zero-row case — staging is then vacuously complete). Any throw above leaves
+  // staged_at NULL; importJobOutput's caller leaves output_json NULL on throw,
+  // so the next poll re-enters here and restages cleanly.
+  await env.DB.prepare(
+    `UPDATE pipeline_jobs SET staged_at = unixepoch() WHERE job_id = ?1`,
+  )
+    .bind(job.jobId)
+    .run();
 
   return { inserted, byKind, skipped };
 }
@@ -441,6 +466,7 @@ async function deleteUnkeptTns(
 
   const now = Math.floor(Date.now() / 1000);
   const CHUNK = 25; // 2 statements per row + headroom
+  let deleted = 0;
   for (let i = 0; i < list.length; i += CHUNK) {
     const slice = list.slice(i, i + CHUNK);
     const stmts = [];
@@ -448,26 +474,46 @@ async function deleteUnkeptTns(
       stmts.push(
         env.DB
           .prepare(
-            // Composite-key scoped: a colliding-id row in another book must
-            // not be touched by this run.
+            // Re-assert the pristine predicate at write time, not just in the
+            // SELECT above: TN edits are allowed mid-pipeline (rows.ts), so a
+            // translator content edit (sets updated_by + bumps version) or a
+            // preserve/hint toggle that lands between the SELECT and this
+            // UPDATE must ABORT the delete. Without these clauses the sweep
+            // deletes a row the user just claimed. Composite-key scoped so a
+            // colliding-id row in another book is never touched.
             `UPDATE tn_rows
                SET deleted_at = ?1, version = version + 1,
                    updated_at = ?1, updated_by = ?2
-             WHERE id = ?3 AND book = ?4 AND deleted_at IS NULL`,
+             WHERE id = ?3 AND book = ?4 AND deleted_at IS NULL
+               AND updated_by IS NULL AND preserve = 0 AND hint = 0`,
           )
           .bind(now, userId, t.id, job.book),
         env.DB
           .prepare(
+            // Audit only if the UPDATE above actually tombstoned this row in
+            // THIS batch (D1 runs batch statements sequentially on one
+            // connection, so this SELECT sees the prior UPDATE's effect). A
+            // delete the pristine guard aborted writes no edit_log row.
             `INSERT INTO edit_log
                (kind, row_key, book, user_id, prev_version, new_version, action, source)
-             VALUES ('tn', ?1, ?2, ?3, ?4, ?5, 'delete', ?6)`,
+             SELECT 'tn', ?1, ?2, ?3, ?4, ?5, 'delete', ?6
+              WHERE EXISTS (
+                SELECT 1 FROM tn_rows
+                 WHERE id = ?1 AND book = ?2
+                   AND deleted_at = ?7 AND updated_by = ?3
+              )`,
           )
-          .bind(t.id, job.book, userId, t.version, t.version + 1, AI_SOURCE),
+          .bind(t.id, job.book, userId, t.version, t.version + 1, AI_SOURCE, now),
       );
     }
-    await env.DB.batch(stmts);
+    const res = await env.DB.batch(stmts);
+    // UPDATE results sit at even indices (update, audit, update, audit, ...).
+    // Count only rows the guard actually deleted.
+    for (let j = 0; j < res.length; j += 2) {
+      deleted += res[j]?.meta?.changes ?? 0;
+    }
   }
-  return list.length;
+  return deleted;
 }
 
 // Per-revision source label for hint expansions. Distinct from AI_SOURCE so
@@ -502,14 +548,26 @@ async function applyTnHintExpansionIfMatch(
   if (!stub) return false;
 
   const now = Math.floor(Date.now() / 1000);
-  await env.DB.batch([
+  const newVersion = stub.version + 1;
+  const res = await env.DB.batch([
     env.DB
       .prepare(
         // Update content; clear hint so the row stops being queued for
         // future runs. Leave preserve and updated_by alone — the row's
         // standing authorship stays with whoever created the stub, and
-        // any prior preserve intent survives the expansion. book-scoped
-        // so a colliding stub id in another book isn't clobbered.
+        // any prior preserve intent survives the expansion.
+        //
+        // CAS-guarded: `hint = 1` and `version = ?` must STILL hold at write
+        // time. TN edits are allowed mid-pipeline (rows.ts), so between the
+        // SELECT above and here a translator may (a) un-queue the hint
+        // (hint -> 0, which does NOT bump version — caught by `hint = 1`) or
+        // (b) edit the stub's content (bumps version + sets updated_by —
+        // caught by `version = stub.version`). Either way the expansion must
+        // abort rather than clobber the user's change. NOTE: we deliberately
+        // do NOT guard on `updated_by IS NULL` — a human-created hint stub
+        // already carries the creator's id (createRow sets updated_by), so
+        // that predicate would abort every legitimate expansion.
+        // book-scoped so a colliding stub id in another book isn't clobbered.
         `UPDATE tn_rows
             SET quote = ?1,
                 support_reference = ?2,
@@ -520,7 +578,8 @@ async function applyTnHintExpansionIfMatch(
                 hint = 0,
                 version = version + 1,
                 updated_at = ?7
-          WHERE id = ?8 AND book = ?9 AND deleted_at IS NULL`,
+          WHERE id = ?8 AND book = ?9 AND deleted_at IS NULL
+            AND hint = 1 AND version = ?10`,
       )
       .bind(
         (payload.quote as string | null | undefined) ?? null,
@@ -532,34 +591,55 @@ async function applyTnHintExpansionIfMatch(
         now,
         stub.id,
         job.book,
+        stub.version,
       ),
     env.DB
       .prepare(
-        // Audit row: AI wrote this revision, but with the hint_expansion
-        // label so the row-level AI chip stays off. NoteHistoryDialog can
-        // surface this as "AI hint expansion" or similar.
+        // Audit row, gated on the CAS having WON: the post-update fingerprint
+        // (new version + hint cleared + our updated_at) is present only if the
+        // UPDATE above actually fired. A lost CAS writes neither audit nor
+        // accept. AI wrote this revision, but with the hint_expansion label so
+        // the row-level AI chip stays off.
         `INSERT INTO edit_log
            (kind, row_key, book, user_id, prev_version, new_version, action, payload_json, source)
-         VALUES ('tn', ?1, ?2, ?3, ?4, ?5, 'update', ?6, ?7)`,
+         SELECT 'tn', ?1, ?2, ?3, ?4, ?5, 'update', ?6, ?7
+          WHERE EXISTS (
+            SELECT 1 FROM tn_rows
+             WHERE id = ?1 AND book = ?2
+               AND version = ?5 AND hint = 0 AND updated_at = ?8
+          )`,
       )
       .bind(
         stub.id,
         job.book,
         userId,
         stub.version,
-        stub.version + 1,
+        newVersion,
         JSON.stringify(payload),
         HINT_EXPANSION_SOURCE,
+        now,
       ),
     env.DB
       .prepare(
+        // Mark the proposal accepted only if the CAS won (same fingerprint).
+        // On a lost CAS this stays unresolved and the caller falls through to
+        // applyTnInsert below, materializing the AI note as a fresh row
+        // instead of dropping it.
         `UPDATE pending_imports
             SET accepted_at = unixepoch(), accepted_by = ?2
-          WHERE id = ?1`,
+          WHERE id = ?1 AND EXISTS (
+            SELECT 1 FROM tn_rows
+             WHERE id = ?3 AND book = ?4
+               AND version = ?5 AND hint = 0 AND updated_at = ?6
+          )`,
       )
-      .bind(p.id, userId),
+      .bind(p.id, userId, stub.id, job.book, newVersion, now),
   ]);
-  return true;
+  // CAS won iff the UPDATE changed a row. On a lost CAS return false so the
+  // caller materializes the proposal via applyTnInsert (its proposed id now
+  // PK-collides with the concurrently-edited stub, so it retries to a fresh
+  // id) — the translator's edit survives and the AI note isn't lost.
+  return (res[0]?.meta?.changes ?? 0) > 0;
 }
 
 async function applyTnInsert(

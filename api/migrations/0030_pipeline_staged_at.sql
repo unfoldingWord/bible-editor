@@ -1,0 +1,17 @@
+-- Complete-staging marker for AI-pipeline imports.
+--
+-- stageJobOutput() inserts pending_imports rows in 100-row chunks across many
+-- D1 batch() calls. batch() is atomic per call but staging as a whole is not,
+-- so a mid-chunk crash (transient D1 failure, Worker death) used to leave a
+-- PARTIAL set of pending_imports rows. The old idempotency guard treated the
+-- mere existence of any pending_imports row as "already staged", so the retry
+-- skipped re-parsing and applied only the partial set, then marked the job
+-- imported — a permanently-incomplete import.
+--
+-- staged_at is written ONLY after the final chunk commits. A set marker is the
+-- authoritative "full proposal set is present" signal; a NULL marker (with the
+-- job's output_json still NULL) means stage was never completed and must be
+-- restaged from scratch. No backfill is needed: jobs that already finished
+-- importing carry a non-NULL output_json, so stageJobOutput is never re-entered
+-- for them regardless of this column.
+ALTER TABLE pipeline_jobs ADD COLUMN staged_at INTEGER;
