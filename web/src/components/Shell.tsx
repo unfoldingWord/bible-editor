@@ -1024,12 +1024,19 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
 
   const handleSetPanelMode = useCallback(
     (mode: PanelMode) => {
-      if (mode === "alignment" && !alignerTarget) {
-        setAlignerTarget({ chapter, verse: activeVerse, bibleVersion: "ULT" });
-      }
-      setPanelMode(mode);
+      // Route through the dirty gate so leaving alignment mode with unsaved
+      // drags (to Search or any sibling tab) prompts save/discard instead of
+      // silently unmounting AlignmentPanel and dropping the edits. The gate is
+      // a no-op unless we're currently in dirty alignment, so entering
+      // alignment and all clean switches still apply immediately.
+      runWithDirtyGate(() => {
+        if (mode === "alignment" && !alignerTarget) {
+          setAlignerTarget({ chapter, verse: activeVerse, bibleVersion: "ULT" });
+        }
+        setPanelMode(mode);
+      });
     },
-    [alignerTarget, chapter, activeVerse],
+    [runWithDirtyGate, alignerTarget, chapter, activeVerse],
   );
 
   const dismissPendingNav = useCallback(() => setPendingNav(null), []);
