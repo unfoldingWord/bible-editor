@@ -254,16 +254,33 @@ export function ResourceColumn({
   };
 
   const [rangeStart, rangeEnd] = displayVerseRange;
+  // When a UST verse bridge widens the range to span multiple verses (e.g. ISA
+  // 33:15-16, UST row verse=15/verse_end=16 while UHB/ULT keep them separate),
+  // the union must render grouped by verse — all of v15 then all of v16 — not
+  // interleaved by sort_order. Each verse numbers sort_order from 100
+  // independently, so a flat sort scrambles them (v15@100, v16@100, v15@200…).
+  // groupByVerse orders the buckets by verse ascending; within a verse each
+  // resource sorts by sort_order (the per-verse ordinal assigned in TSV file
+  // order at import). Singletons (the common case) reduce to the prior behavior.
   const tnForVerse = useMemo(
-    () => sortBySortOrder(tn.filter((r) => r.verse >= rangeStart && r.verse <= rangeEnd)),
+    () =>
+      groupByVerse(tn.filter((r) => r.verse >= rangeStart && r.verse <= rangeEnd)).flatMap(
+        ([, rows]) => sortBySortOrder(rows),
+      ),
     [tn, rangeStart, rangeEnd],
   );
   const tqForVerse = useMemo(
-    () => tq.filter((r) => r.verse >= rangeStart && r.verse <= rangeEnd),
+    () =>
+      groupByVerse(tq.filter((r) => r.verse >= rangeStart && r.verse <= rangeEnd)).flatMap(
+        ([, rows]) => sortBySortOrder(rows),
+      ),
     [tq, rangeStart, rangeEnd],
   );
   const twlForVerse = useMemo(
-    () => sortBySortOrder(twl.filter((r) => r.verse >= rangeStart && r.verse <= rangeEnd)),
+    () =>
+      groupByVerse(twl.filter((r) => r.verse >= rangeStart && r.verse <= rangeEnd)).flatMap(
+        ([, rows]) => sortBySortOrder(rows),
+      ),
     [twl, rangeStart, rangeEnd],
   );
 
@@ -277,7 +294,10 @@ export function ResourceColumn({
     [pinned.notes, tn],
   );
   const tqGroups = useMemo(
-    () => (pinned.questions ? groupByVerse(tq) : null),
+    () =>
+      pinned.questions
+        ? groupByVerse(tq).map(([v, rows]) => [v, sortBySortOrder(rows)] as [number, TqRow[]])
+        : null,
     [pinned.questions, tq],
   );
   const twlGroups = useMemo(

@@ -51,6 +51,7 @@ export interface TqRow {
   occurrence: number | null;
   question: string | null;
   response: string | null;
+  sort_order: number | null;
   version: number;
   restored_from_version: number | null;
   updated_by: number | null;
