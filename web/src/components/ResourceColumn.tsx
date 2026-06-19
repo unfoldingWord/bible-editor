@@ -9,7 +9,12 @@ import { WordsTable, type WordDropPosition } from "./WordsTable";
 import { QuestionsTable } from "./QuestionsTable";
 import { AlignmentPanel, type AlignmentPanelHandle } from "./AlignmentPanel";
 
-export type PanelMode = "resources" | "alignment";
+export type PanelMode = "resources" | "alignment" | "search";
+
+// External search tool embedded in the Search tab. Allow-listed in the API's
+// CSP frame-src (api/src/index.ts) — adding a different host requires updating
+// both.
+const SEARCH_IFRAME_URL = "https://swunrow.pythonanywhere.com/";
 
 // Candidate slot for the reorder "stoplight" — the moved note plus the note
 // ids that would become its predecessor / successor at the current drag target
@@ -260,6 +265,14 @@ export function ResourceColumn({
     if (panelMode !== "resources") onSetPanelMode?.("resources");
     setResourceTab(tab);
   };
+
+  // Lazily mount the Search iframe on first visit, then keep it alive (the body
+  // toggles its visibility rather than unmounting). Avoids loading the external
+  // tool on every page load for users who never open the tab.
+  const [searchVisited, setSearchVisited] = useState(false);
+  useEffect(() => {
+    if (panelMode === "search") setSearchVisited(true);
+  }, [panelMode]);
 
   const [rangeStart, rangeEnd] = displayVerseRange;
   // When a UST verse bridge widens the range to span multiple verses (e.g. ISA
@@ -542,6 +555,12 @@ export function ResourceColumn({
           accent
           onClick={() => onSetPanelMode?.("alignment")}
         />
+        <PanelTab
+          label="Search"
+          active={panelMode === "search"}
+          accent={false}
+          onClick={() => onSetPanelMode?.("search")}
+        />
       </Stack>
       {panelMode === "alignment" ? (
         alignmentProps ? (
@@ -578,7 +597,7 @@ export function ResourceColumn({
             </Typography>
           </Box>
         )
-      ) : (
+      ) : panelMode === "resources" ? (
       <Box
         ref={scrollBodyRef}
         onDragOver={handleDragAutoScroll}
@@ -700,6 +719,24 @@ export function ResourceColumn({
           </>
         )}
       </Box>
+      ) : null}
+      {/* Search tab: external tool in an iframe. Kept mounted once first
+          visited (toggled via display, not unmount) so switching to Notes and
+          back doesn't reload the page and lose an in-progress search. */}
+      {searchVisited && (
+        <Box
+          sx={{
+            flex: 1,
+            minHeight: 0,
+            display: panelMode === "search" ? "block" : "none",
+          }}
+        >
+          <iframe
+            src={SEARCH_IFRAME_URL}
+            title="Search"
+            style={{ width: "100%", height: "100%", border: 0 }}
+          />
+        </Box>
       )}
     </Box>
   );

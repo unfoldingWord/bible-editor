@@ -102,14 +102,17 @@ app.use("*", requireCsrf);
 
 // Defense-in-depth response headers. CSP locks the SPA to its own bundle
 // (no third-party scripts/styles aside from inline styles emotion/MUI need).
-// Referrer-Policy keeps querystrings out of cross-origin Referer headers.
-// X-Content-Type-Options stops the browser from sniffing a response into a
-// different MIME than what we send. Applied to every response.
+// frame-src allow-lists the swunrow search tool embedded in the Resources
+// column's Search tab — without it, frame-src falls back to default-src 'self'
+// and the iframe is blocked in prod (but not local Vite, which skips these
+// headers). Referrer-Policy keeps querystrings out of cross-origin Referer
+// headers. X-Content-Type-Options stops the browser from sniffing a response
+// into a different MIME than what we send. Applied to every response.
 app.use("*", async (c, next) => {
   await next();
   c.res.headers.set(
     "Content-Security-Policy",
-    "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self' wss: ws:",
+    "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self' wss: ws:; frame-src 'self' https://swunrow.pythonanywhere.com",
   );
   c.res.headers.set("Referrer-Policy", "strict-origin-when-cross-origin");
   c.res.headers.set("X-Content-Type-Options", "nosniff");
