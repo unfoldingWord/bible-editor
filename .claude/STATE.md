@@ -14,6 +14,30 @@
 
 ## Last run
 
+2026-06-20 · **sharp-jackson** — Root-caused + fixed Perry's **MIC 7:9 UST** "BE moves a word from the
+beginning of a line to the end of the previous line after save … no space between the word and the \q
+marker." **Confirmed real** (fetched his exact saved verse from the `MIC-be-pjoakes` export branch — not a
+prod query — and reproduced offline). Root cause: `stripMarkerTokens` (web/src/lib/replace.ts) replaced a
+marker token + its trailing space with `""`, so a WORD directly before a marker with no space (`from\q2
+Yahweh` — the textContent shape when a word milestone abuts the marker node, e.g. after dragging a poetic
+line break) FUSED into `fromYahweh`. That undercounts words → every later marker's word-anchor lands a word
+early (word jumps the line break) AND smartEditVerse's stripped diff drops to the non-preserving
+localizedRewrite (alignment loss). Fix: bridge with a single space ONLY when a word char flanks BOTH sides
+(punctuation-adjacent `says,\q2` stays `""` → zero churn; a blanket `" "` regressed Case 57 by churning
+marker-adjacent spacing into the tree). Regression: **replace.test Case 67** (no-space edit must equal
+with-space edit; fails on `preservedAlignment` without the fix). **Defense-in-depth** (the "auto-space after
+markers" the user asked for): `sanitizeMarkerSpacing` (api/src/importParsers.ts, wired into
+`extractVersesForRange` = the bootstrap/reimport/AI chokepoint) inserts a space after a NUMBERED marker
+(`\q1`–`\q4`/`\qm1`–`\qm3`/`\pi1`–`\pi3`) glued to a letter, because usfm-js otherwise reads `\q2because` as a
+garbage tag `{tag:"q2because"}`, swallowing the word + line break (proven in usfm-js, but NOT found in real
+data; scoped to numbered markers so it can't split valid `\qa`/`\qm`/`\pi`). usfm-js's toUSFM already
+auto-spaces on export, so export was never the vector. Web + api suites + typecheck all green. **Verified
+end-to-end LIVE** (Chrome MCP, worktree dev vite:5174/wrangler:8787, ZEC 9:9 UST — 5 `\q1`, 25/40 aligned):
+real save pipeline (contenteditable `because\q1 your` → smartEditVerse → outbox → PATCH → D1 → re-fetch) kept
+all 5 markers + 25/40 alignment, no word jumped; restored the local dev verse after. Client engine + import
+sanitizer; no API contract/migration change. Branch `claude/sharp-jackson-f10edf`, **NOT yet committed/PR'd**
+(awaiting user go-ahead). (memory: project_stripmarkertokens_nospace_marker_fusion)
+
 2026-06-19 · **sweet-moore** — Fixed Perry's **JER 29:31 UST** alignment-save block (PR #248). Repro'd on
 `main` (NOT an outdated app): inserting "Because" mid-verse + changing the verse-final `.`→`,` flattened
 37→17 aligned and the #233 guard discarded the draft. Root cause = a gap in the #235 reassembly engine:

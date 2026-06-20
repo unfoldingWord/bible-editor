@@ -1767,6 +1767,71 @@ function countAligned(content) {
     `no collateral alignment loss → guard passes (got ${JSON.stringify(delta.unexpectedLosses.map((l) => l.text))})`);
 }
 
+// ─── Case 67: no space BEFORE a \q marker must not fuse words / jump a line ──
+// Perry, MIC 7:9 UST: "BE moves a word from the beginning of a line to the end
+// of the previous line after hitting save … because there was no space between
+// the word and the \q marker." Moving a poetic line break so a word ends up
+// directly before the marker (`from\q2 Yahweh` — no space) used to make
+// stripMarkerTokens collapse `from\q2 Yahweh` → `fromYahweh` (one glued token).
+// That undercounts words by one, so every LATER marker's word-anchor lands a
+// word early and a word jumps across a line break — AND the verse dropped to
+// the non-preserving rewrite (alignment loss). Faithful slim of MIC 7:9's
+// first lines.
+{
+  console.log("\n[Case 67] MIC 7:9: moving a line break (word abuts \\q, no space) keeps later markers + alignment");
+  const verse = {
+    verseObjects: [
+      zaln("H1", [w("We"), t(" "), w("will"), t(" "), w("patiently"), t(" "), w("endure")]), t(" "),
+      zaln("H2", [w("our"), t(" "), w("punishment"), t(" "), w("from")]), t(" "),
+      zaln("H3", [w("Yahweh")]), t(" "),
+      { type: "quote", tag: "q2" },
+      zaln("H4", [w("because"), t(" "), w("we"), t(" "), w("have"), t(" "), w("sinned")]), t(". "),
+      { type: "quote", tag: "q1" },
+      zaln("H5", [w("Eventually"), t(" "), w("he"), t(" "), w("will"), t(" "), w("defend"), t(" "), w("us"), t(" "), w("and")]), t(" "),
+      { type: "quote", tag: "q2" },
+      zaln("H6", [w("make"), t(" "), w("things"), t(" "), w("right")]), t("."),
+    ],
+  };
+  const before = extractEditableText(verse);
+  // The same translator intent — "Yahweh" leads the \q2 line — captured two ways:
+  // with a space before the marker (the clean capture) and without one (the
+  // reported buggy shape, where a word milestone abuts the marker node). They
+  // MUST produce the identical verse; the no-space variant must not fuse words.
+  const withSpace = before.replace("from Yahweh \\q2 because", "from \\q2 Yahweh because");
+  const noSpace = before.replace("from Yahweh \\q2 because", "from\\q2 Yahweh because");
+  const rSpace = smartEditVerse(verse, before, withSpace);
+  const rNoSpace = smartEditVerse(verse, before, noSpace);
+
+  // Each \w grouped under the marker that opens its line — the visible layout.
+  const layout = (content) => {
+    const lines = [];
+    let cur = { tag: "(start)", words: [] };
+    const walk = (ns) => {
+      for (const n of ns ?? []) {
+        if (!n || typeof n !== "object") continue;
+        if (n.type === "quote" && /^q/.test(n.tag ?? "")) { lines.push(cur); cur = { tag: `\\${n.tag}`, words: [] }; continue; }
+        if (n.type === "word" && n.tag === "w") cur.words.push(n.text);
+        if (Array.isArray(n.children)) walk(n.children);
+      }
+    };
+    walk(content.verseObjects);
+    lines.push(cur);
+    return lines.map((l) => `${l.tag}: ${l.words.join(" ")}`).join(" | ");
+  };
+
+  const layoutNoSpace = layout(rNoSpace.content);
+  assert(rNoSpace.preservedAlignment, "no-space edit stays on the alignment-preserving path");
+  assert(layoutNoSpace === layout(rSpace.content),
+    `no-space marker produces the same line layout as with-space (got ${JSON.stringify(layoutNoSpace)})`);
+  // "Yahweh" landed on the \q2 line (intended), and the trailing words didn't shift.
+  assert(/\\q2: Yahweh because/.test(layoutNoSpace), `"Yahweh" leads the \\q2 line (got ${JSON.stringify(layoutNoSpace)})`);
+  assert(/defend us and(?: \||$)/.test(layoutNoSpace),
+    `"and" stays on its line, did not jump to the next (got ${JSON.stringify(layoutNoSpace)})`);
+  const delta = analyzeAlignmentDelta(verse, rNoSpace.content);
+  assert(delta.unexpectedLosses.length === 0,
+    `no collateral alignment loss → guard passes (got ${JSON.stringify(delta.unexpectedLosses.map((l) => l.text))})`);
+}
+
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed.`);
   process.exit(1);

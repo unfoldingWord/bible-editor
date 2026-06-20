@@ -22,7 +22,9 @@ import {
   hasReplacementChar,
   normalizeNoteWhitespace,
   findSuspiciousDoubleSpaces,
+  sanitizeMarkerSpacing,
 } from "./importParsers.ts";
+import usfm from "usfm-js";
 
 // Collect target `\w` words with their alignment status (inside a `\zaln-s`?).
 function collectWords(nodes, inZaln, acc) {
@@ -779,6 +781,40 @@ const zaln = (attrs, targetText) => ({
     { tag: "w", type: "word", text: "world" },
   ];
   assert(stripOrphanAlignmentMarkers(clean) === clean, `clean verse returns the same array reference (identity)`);
+}
+
+// --- sanitizeMarkerSpacing: auto-space a numbered marker glued to a word ---
+{
+  // Baseline: prove usfm-js corrupts a glued numbered marker (the hazard).
+  const glued = "\\id MIC\n\\c 7\n\\q1 \\v 9 first line\n\\q2because we sinned\n";
+  const badVo = usfm.toJSON(glued).chapters["7"]["9"].verseObjects;
+  const badTag = badVo.find((n) => typeof n.tag === "string" && n.tag.startsWith("q2"))?.tag;
+  assert(badTag === "q2because", `usfm-js swallows the glued word into the tag (got tag=${JSON.stringify(badTag)})`);
+
+  // sanitizeMarkerSpacing inserts the missing space → marker + word both survive.
+  const fixed = usfm.toJSON(sanitizeMarkerSpacing(glued)).chapters["7"]["9"].verseObjects;
+  const marker = fixed.find((n) => n.tag === "q2" && n.type === "quote");
+  assert(!!marker, `\\q2 parses as a real quote marker after sanitize`);
+  const text = fixed.map((n) => n.text ?? "").join("");
+  assert(text.includes("because we sinned"), `the word "because" survives as text (got ${JSON.stringify(text)})`);
+
+  // extractVersesForRange (the shared import chokepoint) recovers the word.
+  const verses = extractVersesForRange(glued, 7, 7);
+  const v9 = verses.find((v) => v.verse === 9);
+  const plain = JSON.stringify(v9?.content_json ?? v9);
+  assert(/because/.test(plain), `extractVersesForRange keeps "because" (not lost to a tag)`);
+}
+{
+  // Identity / safety: clean USFM and VALID markers are never touched.
+  assert(sanitizeMarkerSpacing("\\q2 word") === "\\q2 word", `\\q2 + space is unchanged`);
+  assert(sanitizeMarkerSpacing("\\q2\\zaln-s |x\\*") === "\\q2\\zaln-s |x\\*", `\\q2 before \\zaln (backslash) is unchanged`);
+  // Bare/acrostic markers that legitimately carry letters must NOT be split.
+  assert(sanitizeMarkerSpacing("\\qa ALEPH") === "\\qa ALEPH", `\\qa acrostic marker is left alone`);
+  assert(sanitizeMarkerSpacing("\\qm text") === "\\qm text", `\\qm (no digit) is left alone`);
+  // Only the numbered-marker-glued-to-letter shape is repaired.
+  assert(sanitizeMarkerSpacing("\\q3word") === "\\q3 word", `\\q3word → "\\q3 word"`);
+  assert(sanitizeMarkerSpacing("\\pi2word") === "\\pi2 word", `\\pi2word → "\\pi2 word"`);
+  assert(sanitizeMarkerSpacing("\\qm1word") === "\\qm1 word", `\\qm1word → "\\qm1 word"`);
 }
 
 console.log("\nAll parser smoke checks passed.");

@@ -209,11 +209,32 @@ export function tokenizeEditableText(text: string): unknown[] {
 // can be mapped to positions in raw verseObjects text (which has no
 // markers — they're position-anchor nodes with no text payload). Used
 // in localizedRewriteVerse to remap pure-insertion positions when
-// markers are present in the baseline. Same regex as tokenizeEditableText
-// without the trailing-whitespace consume so we count only the marker
-// chars themselves.
+// markers are present in the baseline.
+//
+// A line marker is a word separator, so dropping it must never FUSE the
+// tokens on either side. `word\q2 next` (a word directly before the marker —
+// the shape captured when a word milestone abuts the marker node with no
+// intervening space, e.g. after the translator moves a poetic line break)
+// would collapse to `wordnext`: one glued token instead of two. That
+// miscounts every word-anchor downstream — markerSignature / reconcileMarkers
+// place markers by words-before, and smartEditVerse diffs the stripped streams
+// — so a later marker lands a word early and a word jumps across the line
+// break (Perry's "no space between the word and the \q marker" report).
+//
+// Bridge with a single space ONLY when a word char sits on BOTH sides; collapse
+// to "" otherwise. Punctuation-adjacent markers (`says,\q2`, `them.\q1`) keep
+// collapsing to "" — the comma/period already separates the words, so a bare
+// "" doesn't miscount, and preserving it avoids churning marker-adjacent
+// spacing into the stored tree on every edit. Every consumer tolerates the
+// inserted space: word counts and mapStrippedPosToRaw (collapses whitespace
+// runs on both sides) are whitespace-insensitive, and smartEditVerse wraps the
+// result in normalizeEditable.
 function stripMarkerTokens(text: string): string {
-  return text.replace(MARKER_TOKEN_RE, "");
+  return text.replace(MARKER_TOKEN_RE, (match: string, _tag: string, offset: number) => {
+    const before = text[offset - 1] ?? "";
+    const after = text[offset + match.length] ?? "";
+    return LETTER_RE.test(before) && LETTER_RE.test(after) ? " " : "";
+  });
 }
 
 // Letters / marks / numbers count as "core" word content — mirrors

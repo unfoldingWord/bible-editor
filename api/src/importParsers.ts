@@ -651,12 +651,30 @@ export function extractUsfmHeaders(rawUsfm: string): unknown[] | null {
 // as a single row with verse=12, verseEnd=13 so export round-trips `\v 12-13`),
 // or the "front" pseudo-verse (where usfm-js puts a chapter-level `\d` Psalm
 // title — stored as verse 0). Book-level `intro` keys are still skipped.
+// Defense-in-depth for the "no space after a \q marker" hazard. usfm-js reads a
+// marker tag greedily as `[a-z0-9]+`, so a NUMBERED line/poetry marker glued to
+// a following letter — `\q2because` (no space, e.g. AI- or legacy-tool-authored
+// USFM) — parses to a garbage marker `{tag:"q2because", content:"…"}`: the word
+// is swallowed into the tag, destroying both the word and the line break. Insert
+// the missing space BEFORE parsing so the marker and word survive.
+//
+// Scoped to markers whose valid form ENDS IN A DIGIT (`\q1`–`\q4`, `\qm1`–`\qm3`,
+// `\pi1`–`\pi3`): a letter immediately after the digit is unambiguously invalid,
+// so a space is always the right repair. Bare `\q`/`\p`/`\m`/`\qm` + letter is
+// deliberately left alone — it can't be told apart from a longer valid marker
+// (`\qa`, `\qac`, `\qm`, `\pi`, `\pc`, `\mi`, …) by a regex. Identity no-op on
+// clean USFM (every real numbered marker is followed by a space, `\`, or `*`).
+const GLUED_NUMBERED_MARKER_RE = /(\\(?:q[1-4]|qm[1-3]|pi[1-3]))(?=[A-Za-z])/g;
+export function sanitizeMarkerSpacing(rawUsfm: string): string {
+  return rawUsfm.replace(GLUED_NUMBERED_MARKER_RE, "$1 ");
+}
+
 export function extractVersesForRange(
   rawUsfm: string,
   startChapter: number,
   endChapter: number,
 ): VerseExtract[] {
-  const json = usfm.toJSON(rawUsfm);
+  const json = usfm.toJSON(sanitizeMarkerSpacing(rawUsfm));
   const out: VerseExtract[] = [];
   const chapters = json.chapters ?? {};
   for (const chapterKey of Object.keys(chapters)) {
