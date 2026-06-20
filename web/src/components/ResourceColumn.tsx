@@ -40,6 +40,9 @@ export interface AlignmentTabProps {
   onSave: (newContent: unknown, plainText: string, expectedVersion: number) => void;
   onCancel: () => void;
   onDirtyChange?: (dirty: boolean) => void;
+  // Confirm-before-save when the edit would unalign a previously aligned word
+  // (forwarded to AlignmentPanel; see its onConfirmUnalign prop).
+  onConfirmUnalign?: (lostWords: string[], commit: () => void) => void;
   panelRef?: Ref<AlignmentPanelHandle>;
   onOpenDual?: () => void;
   // Restore a previously-saved verse version from the panel's history button.
@@ -585,6 +588,7 @@ export function ResourceColumn({
             sourceLabel={alignmentProps.sourceLabel}
             twlForVerse={alignmentProps.twlForVerse}
             onSave={alignmentProps.onSave}
+            onConfirmUnalign={alignmentProps.onConfirmUnalign}
             onCancel={alignmentProps.onCancel}
             onDirtyChange={alignmentProps.onDirtyChange}
             onOpenDual={alignmentProps.onOpenDual}

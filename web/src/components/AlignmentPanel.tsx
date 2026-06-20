@@ -43,6 +43,7 @@ import {
   type SourceWord,
 } from "../lib/alignment";
 import type { TwlRow, VerseDto } from "../sync/api";
+import { lostAlignedWords } from "../lib/alignmentDelta";
 import { useLexicon, type LexiconEntry } from "../hooks/useLexicon";
 import { useAlignmentSuggestions } from "../hooks/useAlignmentSuggestions";
 import {
@@ -114,7 +115,9 @@ function clampInventoryHeight(n: number): number {
 
 export interface AlignmentPanelHandle {
   isDirty: () => boolean;
-  save: () => void;
+  // Returns true if committed synchronously, false if deferred behind the unalign
+  // confirm. `afterCommit` runs only once the save actually lands (never on cancel).
+  save: (afterCommit?: () => void) => boolean;
   reset: () => void;
   discard: () => void;
 }
@@ -131,6 +134,16 @@ interface Props {
   onSave: (newContent: unknown, plainText: string, expectedVersion: number) => void;
   onCancel: () => void;
   onDirtyChange?: (dirty: boolean) => void;
+  // Confirm-before-save for an alignment edit that would leave a previously
+  // aligned word bare. alignment_edit is exempt from the collateral-loss save
+  // guard (re-aligning legitimately changes sources), so without this an
+  // accidental unlink saves silently and only surfaces when the nightly export
+  // refuses it. When provided and a save would unalign words, the panel calls
+  // this with the affected words + a `commit` that performs the save; the parent
+  // surfaces a confirm and runs `commit` only if the user proceeds. Absent ⇒ the
+  // save commits straight through (preserves prior behavior for any caller that
+  // doesn't wire the confirm).
+  onConfirmUnalign?: (lostWords: string[], commit: () => void) => void;
   // Side-by-side mode (all optional; absent = standalone single-panel behavior).
   // When `hover`/`onHoverChange` are provided the hover state is controlled by a
   // shared parent so two panels cross-highlight the same Hebrew. Likewise
@@ -180,6 +193,7 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
       onSave,
       onCancel,
       onDirtyChange,
+      onConfirmUnalign,
       hover: hoverProp,
       onHoverChange,
       hoverLink: hoverLinkProp,
@@ -681,17 +695,41 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
       setSelectedUnaligned(new Set());
       setSelectionAnchor(null);
     };
-    const handleSave = useCallback(() => {
-      if (!state || !verse) return;
+    // Returns true if the save COMMITTED synchronously, false if it was deferred
+    // behind the unalign confirm. `afterCommit` runs once the save actually lands
+    // — immediately on a clean save, or after "Save anyway"; it never runs if the
+    // user cancels. Callers that navigate/close after saving (the dirty gates in
+    // Shell) pass the nav as `afterCommit` so it waits for the real commit instead
+    // of firing while the confirm is still open.
+    const handleSave = useCallback((afterCommit?: () => void): boolean => {
+      if (!state || !verse) {
+        afterCommit?.();
+        return true;
+      }
       const newVerseObjects = serializeAlignment(state);
       const newContent = { verseObjects: newVerseObjects };
       const plain = alignmentPlainText(state);
-      onSave(newContent, plain, verse.version);
-      // Optimistic: the freshly-saved state is now the baseline. When the
-      // chapter cache eventually round-trips the new content, computedInitial
-      // recomputes and the useEffect resets state to it (idempotent).
-      setInitial(state);
-    }, [state, verse, onSave]);
+      // The commit closure captures `state`, so when it runs after a confirm the
+      // optimistic baseline reset still uses the state that was saved.
+      const commit = () => {
+        onSave(newContent, plain, verse.version);
+        // Optimistic: the freshly-saved state is now the baseline. When the
+        // chapter cache eventually round-trips the new content, computedInitial
+        // recomputes and the useEffect resets state to it (idempotent).
+        setInitial(state);
+        afterCommit?.();
+      };
+      // Warn before unaligning a previously-aligned word. On "Cancel" the parent
+      // runs nothing, so `commit` (and thus setInitial + afterCommit) never fires
+      // and the panel stays dirty — the user can re-align and save again.
+      const lostWords = lostAlignedWords(verse.content, newContent);
+      if (lostWords.length > 0 && onConfirmUnalign) {
+        onConfirmUnalign(lostWords, commit);
+        return false;
+      }
+      commit();
+      return true;
+    }, [state, verse, onSave, onConfirmUnalign]);
 
     useImperativeHandle(
       ref,
@@ -1262,7 +1300,7 @@ function ActionBar({
       <Button
         size="small"
         variant="contained"
-        onClick={onSave}
+        onClick={() => onSave()}
         disabled={!dirty}
         sx={{
           textTransform: "uppercase",

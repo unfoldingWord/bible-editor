@@ -56,6 +56,9 @@ export interface PanelSlot {
   posOffset: number;
   onSave: (newContent: unknown, plainText: string, expectedVersion: number) => void;
   onDirtyChange: (dirty: boolean) => void;
+  // Confirm-before-save when this side's edit would unalign a previously aligned
+  // word (forwarded to AlignmentPanel; see its onConfirmUnalign prop).
+  onConfirmUnalign?: (lostWords: string[], commit: () => void) => void;
   panelRef: Ref<AlignmentPanelHandle>;
   // Reading-line dirty mirror + imperative save/discard, so the close/verse-nav
   // gate can prompt before silently dropping an unsaved reading-text edit
@@ -158,6 +161,7 @@ export function SideBySideAligner({
       sourceLabel={sourceLabel}
       twlForVerse={slot.twlForVerse}
       onSave={slot.onSave}
+      onConfirmUnalign={slot.onConfirmUnalign}
       onCancel={onClose}
       hideCancel
       onDirtyChange={(dirty) => {

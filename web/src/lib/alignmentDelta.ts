@@ -167,3 +167,17 @@ export function intentAllowsUnexpectedAlignmentLoss(intent: AlignmentIntent): bo
 export function guardBlocksSave(delta: AlignmentDelta, intent: AlignmentIntent): boolean {
   return delta.unexpectedLosses.length > 0 && !intentAllowsUnexpectedAlignmentLoss(intent);
 }
+
+// Words that HAD a \zaln source before and are now fully bare (reason "lost"),
+// i.e. a previously-aligned word that an alignment_edit just unaligned. This is
+// the signal the aligner-panel "you're about to unalign X" confirm fires on —
+// alignment_edit is exempt from guardBlocksSave (re-aligning legitimately
+// removes/repoints sources), so a silent accidental unlink would otherwise sail
+// through and only surface when the nightly export's shrink guard blocks it
+// (the JER 30:1 "Jeremiah" incident). `changed_source` (a re-pointed source) is
+// excluded — that is normal re-alignment, not a loss worth warning about.
+export function lostAlignedWords(beforeContent: unknown, afterContent: unknown): string[] {
+  return analyzeAlignmentDelta(beforeContent, afterContent)
+    .unexpectedLosses.filter((l) => l.reason === "lost")
+    .map((l) => l.text);
+}

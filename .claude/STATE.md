@@ -14,6 +14,58 @@
 
 ## Last run
 
+2026-06-20 · **suspicious-poitras** — Cleared the nightly export's **align-shrink block on JER UST** (the
+`export_align_shrink:JER:ust` "BLOCKED … lost alignment on \"Jeremiah\"" alert). This was a **prod DATA
+repair, not a code change** — the export-side `usfmAlignmentShrinkRefused` guard (`exportWorkflow.ts`
+`checkUsfmAlignmentShrink`) is LIVE and did its job: it caught bad D1 data and refused to ship it. Root cause:
+**JER 30:1 UST** — a translator wrapped `another`→`{another}` (UST implied-word braces); that edit
+**collaterally de-aligned `Jeremiah`** at the far end of the verse (it fell out of `\zaln-s H3414`
+יִרְמְיָ֔הוּ and went bare) — the 1CH 4:21 / NUM 24 signature, landed in D1 before/around the engine fixes.
+Scanned ALL 1361 JER UST verses vs master: **exactly 1 offender**. Heal source = **master itself** (the
+guard kept master clean), unlike `heal-align-1ch-num.mjs` where master was the damaged side and a pre-export
+commit was the clean baseline. Heal = `smartEditVerse(masterAlignedVerse, masterEditable, d1Editable)` →
+re-applies the `{another}` edit onto master's fully-aligned tree through the CURRENT engine: 8 aligned / 0
+bare, plain text byte-identical to D1, structurally == master except the braces, post-heal guard delta 0
+`lost`. **Applied to prod D1** (`scripts/out/heal-jer30.sql`, gitignored): version-conditional UPDATE
+(`AND version=4`) v4→v5, `updated_by=2`, + guarded `edit_log` audit (`heal-export-align-loss`/`data_repair`).
+**Re-exported** targeted (`wrangler workflows trigger bible-editor-export '{"book":"JER","resource":"ust"}'`,
+instance `33a4ff9a…`): `dcsChanged:true`, `dcsSkippedReason:null` (gate passed), committed to branch
+`JER-be-Grant_Ailie` (`febe345e`), **PR #4122** created on en_ust; verified the committed branch carries
+`Jeremiah` re-aligned + `{another}` preserved. Safe against the pre-export DCS→D1 sync because reimport's
+verse UPDATE is guarded on `AND updated_by IS NULL` (`bookReimport.ts`) and the heal set `updated_by=2`. The
+banner alert (id 9) was already dismissed. PR #4122 still needs MERGE to land on master (manual export left
+`validateAndMerge=false`) — the 06:00 UTC nightly validate-and-merge will pick it up, or merge by hand.
+(memory: project_export_align_damage_1ch_num — guard now confirmed LIVE + firing in prod)
+
+2026-06-20 · **suspicious-poitras (follow-up: code hardening)** — After healing the data, traced HOW JER 30:1
+got de-aligned: the edit_log shows the de-align landed at v2→v3, an **editor save that did NOT change the
+verse text** (v2 plain == v3 plain == `…another…Jeremiah…`), so it was NOT a text edit — `smartEditVerse`
+replays of every transition on the CURRENT engine preserve alignment (0 collateral loss). It was an
+**alignment-panel save** (`alignment_edit` intent), which `guardBlocksSave` exempts by design (re-aligning
+legitimately removes/repoints sources). So the text engine has no bug to fix; the gap was that an accidental
+unlink in the aligner saves **silently** and only surfaces when the export shrink-guard blocks it. **Fix
+(preventive UI):** the aligner panel now WARNS (confirm dialog) before a save that would leave a
+previously-aligned word bare. New pure `lostAlignedWords(before, after)` in `web/src/lib/alignmentDelta.ts`
+(filters `reason==="lost"`, ignores `changed_source`); `AlignmentPanel.handleSave` defers the WHOLE commit
+(onSave + optimistic `setInitial`) behind a new optional `onConfirmUnalign(lostWords, commit)` prop so
+**Cancel keeps the panel dirty** (no save, re-editable) and **Save anyway** commits. Threaded through
+`ResourceColumn` (`AlignmentTabProps`) + `SideBySideAligner` (`PanelSlot`) so it covers BOTH the single panel
+and the dual aligner; Shell holds the `pendingAlignmentLoss` confirm (mirrors `pendingNav`/`pendingDualAction`).
+Regression: `alignmentDelta.test.mjs` (lostAlignedWords: flags an unalign, 0 on no-op, 0 on re-point).
+typecheck + full web suite + build green. **Browser-verified** (own isolated Playwright Chromium on :8799 against
+the worktree bundle): Clear→Save shows the dialog naming the words ("…block the nightly export…"), Cancel keeps
+dirty + fires 0 PATCHes, Save anyway PATCHes 200. Restored the test's local-DB mutation (ZEC 1:3 ULT) from the
+seed. Branch `claude/suspicious-poitras-2a402b`, folded into PR #250.
+**Codex review (`codex exec "review pr 250"`) caught a real high-sev interaction bug, now fixed:** the
+deferred-commit broke the existing nav/close dirty gates — `resolvePendingNav`/`resolveDualAction` called
+`panelRef.save()` then **immediately** ran the navigation, so with the unalign confirm open the nav fired
+anyway (Cancel couldn't "keep editing"; in the dual aligner a second confirm could clobber the first pending
+commit). Fix: `AlignmentPanelHandle.save(afterCommit?)` now returns committed-sync vs deferred and runs
+`afterCommit` only once the save actually lands (never on cancel); the gates pass `nav.run` as `afterCommit`
+(single panel) and **chain** the two dual panels so at most one confirm is open at a time; the confirm's
+"Save anyway" clears state BEFORE running commit so a chained confirm isn't clobbered. Browser-verified the
+gate path: Clear→switch tab→"Save"→unalign confirm→Cancel keeps the panel + fires 0 PATCHes; "Save anyway"
+PATCHes 200. typecheck + web suite + build green.
 2026-06-20 · **epic-bassi** — **DCS export validation: prevent · auto-fix · flag.** The open
 nightly `-be-` PRs were all `mergeable:true` but blocked by ONE failing `validate-be` check.
 Two root facts: (1) DCS validates the **whole repo** on a `-be-` branch (no `--book`), so a clean

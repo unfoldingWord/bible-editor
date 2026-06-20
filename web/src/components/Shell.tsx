@@ -257,6 +257,13 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // Queued action (close / verse-nav) awaiting the user's save-or-discard
   // choice when a dual panel has unsaved drags.
   const [pendingDualAction, setPendingDualAction] = useState<{ run: () => void } | null>(null);
+  // Confirm gate for an aligner save that would leave a previously-aligned word
+  // bare. alignment_edit is exempt from the collateral-loss save guard, so this
+  // is the "out loud" surface for an accidental unlink (the JER 30:1 incident):
+  // commit runs only if the user proceeds.
+  const [pendingAlignmentLoss, setPendingAlignmentLoss] = useState<
+    { ref: string; lostWords: string[]; commit: () => void } | null
+  >(null);
   // Shared by the scripture + resource columns so a single "go to active"
   // click re-centers both. Bumped via requestScrollToActive (and elsewhere
   // when the active selection changes through other paths).
@@ -1038,18 +1045,30 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       // Only touch the dirty panel(s): save() serializes + enqueues a PATCH
       // unconditionally, so calling it on the clean side would bump that
       // version row for nothing (and could 409 against a concurrent editor).
-      if (choice === "save") {
-        if (dualLeftDirty) dualLeftRef.current?.save();
-        if (dualRightDirty) dualRightRef.current?.save();
-        if (dualLeftReadingDirty) dualLeftReadingRef.current?.save();
-        if (dualRightReadingDirty) dualRightReadingRef.current?.save();
-      } else {
+      if (choice === "discard") {
         if (dualLeftDirty) dualLeftRef.current?.discard();
         if (dualRightDirty) dualRightRef.current?.discard();
         if (dualLeftReadingDirty) dualLeftReadingRef.current?.discard();
         if (dualRightReadingDirty) dualRightReadingRef.current?.discard();
+        action?.run();
+        return;
       }
-      action?.run();
+      // Save. Reading-line edits are plain text — synchronous, no unalign confirm.
+      if (dualLeftReadingDirty) dualLeftReadingRef.current?.save();
+      if (dualRightReadingDirty) dualRightReadingRef.current?.save();
+      // Each alignment panel may defer behind the unalign confirm, so CHAIN them:
+      // run the close/nav only after both have actually committed. Chaining (vs.
+      // firing both saves up front) also guarantees at most one unalign confirm is
+      // open at a time — the right panel's confirm opens only after the left one
+      // resolves — so a second setPendingAlignmentLoss can't clobber the first
+      // pending commit. A cancel anywhere in the chain stops the close entirely.
+      const finish = () => action?.run();
+      const saveRight = () => {
+        if (dualRightDirty && dualRightRef.current) dualRightRef.current.save(finish);
+        else finish();
+      };
+      if (dualLeftDirty && dualLeftRef.current) dualLeftRef.current.save(saveRight);
+      else saveRight();
     },
     [pendingDualAction, dualLeftDirty, dualRightDirty, dualLeftReadingDirty, dualRightReadingDirty],
   );
@@ -1077,9 +1096,18 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       const nav = pendingNav;
       setPendingNav(null);
       if (!nav) return;
-      if (choice === "save") alignmentPanelRef.current?.save();
-      else alignmentPanelRef.current?.discard();
-      nav.run();
+      if (choice === "discard") {
+        alignmentPanelRef.current?.discard();
+        nav.run();
+        return;
+      }
+      // Save: the panel may defer behind the unalign confirm, so DON'T navigate
+      // up front. Pass nav.run as the afterCommit — save() runs it once the save
+      // actually lands (immediately on a clean save, or after "Save anyway"), and
+      // never if the user cancels the confirm. Without a panel, just navigate.
+      const ref = alignmentPanelRef.current;
+      if (ref) ref.save(nav.run);
+      else nav.run();
     },
     [pendingNav],
   );
@@ -1191,6 +1219,12 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           if (alignerTarget.chapter === chapter) applyLocalVerse(newDto);
         }
       },
+      onConfirmUnalign: (lostWords, commit) =>
+        setPendingAlignmentLoss({
+          ref: `${book} ${alignerTarget.chapter}:${targetVerse?.verse ?? alignerTarget.verse} ${alignerTarget.bibleVersion}`,
+          lostWords,
+          commit,
+        }),
       onCancel: () => {
         setPanelMode("resources");
       },
@@ -1274,6 +1308,13 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         bookHook?.applyLocalVerse(newDto);
         if (dualTarget.chapter === chapter) applyLocalVerse(newDto);
       };
+    const confirmUnalign = (bibleVersion: string, row: VerseDto | null) =>
+      (lostWords: string[], commit: () => void) =>
+        setPendingAlignmentLoss({
+          ref: `${book} ${dualTarget.chapter}:${row?.verse ?? dualTarget.verse} ${bibleVersion}`,
+          lostWords,
+          commit,
+        });
     const left: PanelSlot = {
       bibleVersion: "ULT",
       verse: ult.targetVerse,
@@ -1281,6 +1322,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       twlForVerse: ult.twlForVerse,
       posOffset: offsetFor(ult.rangeStart),
       onSave: enqueue("ULT", ult.targetVerse),
+      onConfirmUnalign: confirmUnalign("ULT", ult.targetVerse),
       onDirtyChange: setDualLeftDirty,
       panelRef: dualLeftRef,
       onReadingDirtyChange: setDualLeftReadingDirty,
@@ -1293,6 +1335,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       twlForVerse: ust.twlForVerse,
       posOffset: offsetFor(ust.rangeStart),
       onSave: enqueue("UST", ust.targetVerse),
+      onConfirmUnalign: confirmUnalign("UST", ust.targetVerse),
       onDirtyChange: setDualRightDirty,
       panelRef: dualRightRef,
       onReadingDirtyChange: setDualRightReadingDirty,
@@ -2115,6 +2158,46 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           }
         />
       )}
+      <Dialog open={!!pendingAlignmentLoss} onClose={() => setPendingAlignmentLoss(null)}>
+        <DialogTitle>
+          {pendingAlignmentLoss && pendingAlignmentLoss.lostWords.length === 1
+            ? "A word will be unaligned"
+            : "Words will be unaligned"}
+        </DialogTitle>
+        <DialogContent>
+          <DialogContentText>
+            Saving this alignment will leave{" "}
+            {pendingAlignmentLoss?.lostWords.length === 1 ? "this word" : "these words"} with no
+            source link in {pendingAlignmentLoss?.ref}:{" "}
+            <Box component="span" sx={{ fontWeight: 700 }}>
+              {pendingAlignmentLoss?.lostWords.slice(0, 8).join(", ")}
+              {pendingAlignmentLoss && pendingAlignmentLoss.lostWords.length > 8
+                ? ` (+${pendingAlignmentLoss.lostWords.length - 8} more)`
+                : ""}
+            </Box>
+            . That's fine if you meant to re-align — but if it's accidental it will block the
+            nightly export to master until the {pendingAlignmentLoss?.lostWords.length === 1 ? "word is" : "words are"}{" "}
+            aligned again. Save anyway, or cancel to keep editing.
+          </DialogContentText>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setPendingAlignmentLoss(null)}>Cancel</Button>
+          <Button
+            color="error"
+            variant="contained"
+            onClick={() => {
+              // Clear BEFORE running commit: commit may chain into the next
+              // panel's save and open a fresh confirm (the dual aligner), and a
+              // trailing setPendingAlignmentLoss(null) would clobber it.
+              const commit = pendingAlignmentLoss?.commit;
+              setPendingAlignmentLoss(null);
+              commit?.();
+            }}
+          >
+            Save anyway
+          </Button>
+        </DialogActions>
+      </Dialog>
       <Dialog open={!!pendingDualAction} onClose={() => setPendingDualAction(null)}>
         <DialogTitle>Unsaved changes</DialogTitle>
         <DialogContent>

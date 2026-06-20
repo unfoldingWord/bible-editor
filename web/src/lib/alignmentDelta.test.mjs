@@ -1,4 +1,4 @@
-import { analyzeAlignmentDelta, guardBlocksSave } from "./alignmentDelta.ts";
+import { analyzeAlignmentDelta, guardBlocksSave, lostAlignedWords } from "./alignmentDelta.ts";
 
 let failed = 0;
 function assert(ok, msg) {
@@ -111,6 +111,37 @@ const content = (verseObjects) => ({ verseObjects });
   ]);
   const delta = analyzeAlignmentDelta(before, after);
   assert(delta.unexpectedLosses.length === 0, "duplicate is ambiguous after a real word edit");
+}
+
+{
+  // lostAlignedWords drives the aligner-panel "you're about to unalign X"
+  // confirm. It reports ONLY previously-aligned words that go fully bare
+  // (reason "lost") — the JER 30:1 "Jeremiah" incident shape — and ignores
+  // re-pointed sources (changed_source = normal re-alignment).
+  console.log("[alignmentDelta] lostAlignedWords flags a previously-aligned word going bare");
+  const before = content([
+    zaln("H1", [w("to")]), t(" "),
+    zaln("H2", [w("Jeremiah")]),
+  ]);
+  const afterBare = content([
+    zaln("H1", [w("to")]), t(" "),
+    w("Jeremiah"),
+  ]);
+  assert(
+    JSON.stringify(lostAlignedWords(before, afterBare)) === JSON.stringify(["Jeremiah"]),
+    "unaligning Jeremiah is reported as a lost word",
+  );
+  // No change → nothing to warn about.
+  assert(lostAlignedWords(before, before).length === 0, "an unchanged save reports no losses");
+  // Re-pointing a source (changed_source) is normal re-alignment, NOT a loss.
+  const afterRepointed = content([
+    zaln("H1", [w("to")]), t(" "),
+    zaln("H9", [w("Jeremiah")]),
+  ]);
+  assert(
+    lostAlignedWords(before, afterRepointed).length === 0,
+    "re-pointing a source is not flagged as an unalign",
+  );
 }
 
 if (failed > 0) {
