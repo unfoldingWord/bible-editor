@@ -106,19 +106,21 @@ export function lintTnRows(rows: TnRow[]): LintIssue[] {
   return issues;
 }
 
-// Count \f openings vs \f* closings across a verse's rendered text nodes.
+// Count UNCLOSED footnotes in a verse's parsed nodes. usfm-js represents a
+// whole footnote as ONE node `{ tag: "f", ... }`: a balanced `\f … \f*` carries
+// a non-empty `endTag` ("f*"), an unclosed footnote has `endTag` "" / missing
+// (its inner markers live in `content`, NOT as `\f*` text — so counting `\f*` in
+// text would never see the close and would flag every normal footnote). Only a
+// footnote node without an endTag is an integrity problem.
 function footnoteDelta(nodes: unknown[]): number {
   let delta = 0;
   const walk = (list: unknown[]): void => {
     for (const node of list) {
       if (!node || typeof node !== "object") continue;
       const o = node as Record<string, unknown>;
-      const tag = typeof o["tag"] === "string" ? (o["tag"] as string) : "";
-      if (tag === "f") delta += 1;
-      const text = typeof o["text"] === "string" ? (o["text"] as string) : "";
-      if (text) {
-        delta += (text.match(/\\f\s/g) || []).length;
-        delta -= (text.match(/\\f\*/g) || []).length;
+      if (o["tag"] === "f") {
+        const endTag = typeof o["endTag"] === "string" ? (o["endTag"] as string) : "";
+        if (!endTag) delta += 1; // open footnote with no matching \f*
       }
       const children = o["children"];
       if (Array.isArray(children)) walk(children);

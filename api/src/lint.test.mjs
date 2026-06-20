@@ -2,6 +2,7 @@
 // Run: node --experimental-strip-types --no-warnings src/lint.test.mjs
 
 import assert from "node:assert/strict";
+import usfm from "usfm-js";
 import { lintTnRows, lintUsfmVerses } from "./lint.ts";
 
 let passed = 0;
@@ -57,19 +58,31 @@ t("issue carries ref + rowId for jump", () => {
   assert.equal(i[0].rowId, "wxyz");
 });
 
-const verse = (cj) => ({ book: "1CH", chapter: 1, verse: 1, verse_end: null, bible_version: "ULT", version: 1, content_json: JSON.stringify(cj) });
+// Build content_json from REAL usfm-js output so the test exercises the actual
+// node shape (a balanced footnote is one `{tag:"f", endTag:"f*"}` node — the
+// close lives in endTag, not as `\f*` text; the original text-node tests missed
+// this and let a false-positive bug through).
+const verseFromUsfm = (usfmText) => {
+  const j = usfm.toJSON(usfmText);
+  const vos = j.chapters["1"]["1"].verseObjects;
+  return { book: "1CH", chapter: 1, verse: 1, verse_end: null, bible_version: "ULT", version: 1, content_json: JSON.stringify({ verseObjects: vos }) };
+};
 
-t("unclosed footnote escalated", () => {
-  const i = lintUsfmVerses([verse({ verseObjects: [{ type: "text", text: "word \\f + \\ft a note " }] })]);
+t("balanced footnote passes (real usfm-js node, endTag set)", () => {
+  assert.equal(lintUsfmVerses([verseFromUsfm("\\c 1\n\\p\n\\v 1 word \\f + \\ft a note\\f* end\n")]).length, 0);
+});
+t("unclosed footnote escalated (real usfm-js node, empty endTag)", () => {
+  const i = lintUsfmVerses([verseFromUsfm("\\c 1\n\\p\n\\v 1 word \\f + \\ft a note end\n")]);
   assert.equal(i.length, 1);
   assert.equal(i[0].check, "6. Footnote Syntax");
   assert.equal(i[0].bucket, "escalate");
 });
-t("balanced footnote passes", () => {
-  assert.equal(lintUsfmVerses([verse({ verseObjects: [{ type: "text", text: "word \\f + \\ft a note\\f*" }] })]).length, 0);
+t("verse with \\ft/\\fr inside a balanced footnote is NOT flagged", () => {
+  assert.equal(lintUsfmVerses([verseFromUsfm("\\c 1\n\\p\n\\v 1 a \\f + \\fr 1:1 \\ft note\\f* b\n")]).length, 0);
 });
 t("verse 0 (front) skipped", () => {
-  assert.equal(lintUsfmVerses([{ ...verse({ verseObjects: [{ type: "text", text: "\\f x" }] }), verse: 0 }]).length, 0);
+  const v = verseFromUsfm("\\c 1\n\\p\n\\v 1 word \\f + \\ft a note end\n");
+  assert.equal(lintUsfmVerses([{ ...v, verse: 0 }]).length, 0);
 });
 
 console.log(`\n${passed} lint tests passed`);
