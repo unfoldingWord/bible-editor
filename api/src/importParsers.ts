@@ -860,7 +860,11 @@ export interface ParsedTsv {
 // Naive split-by-tab parser matching scripts/import-book.mjs. The
 // unfoldingWord TSVs don't quote tabs inside cells, so this is sufficient.
 export function parseTsv(raw: string): ParsedTsv {
-  const lines = raw.split(/\r?\n/).filter((l) => l.length > 0);
+  // Strip a leading UTF-8 BOM (﻿). Without this, the first header becomes
+  // "﻿Reference"/"﻿ID", so every row lookup by the real header name
+  // (e.g. r["ID"]) is undefined and the entire import is silently skipped.
+  const text = raw.charCodeAt(0) === 0xfeff ? raw.slice(1) : raw;
+  const lines = text.split(/\r?\n/).filter((l) => l.length > 0);
   if (lines.length === 0) return { headers: [], rows: [] };
   const headers = lines[0].split("\t");
   const rows = lines.slice(1).map((line) => {

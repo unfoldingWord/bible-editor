@@ -656,6 +656,23 @@ function utf8Base64(s) {
     fmtOffender(manyLost) === `4:21: lost alignment on "the","father","of" (+26 more)`,
     `alert caps at 3 and appends "(+26 more)"`,
   );
+
+  // (8) FAIL-CLOSED on a broken render. usfm.toJSON does not throw on a
+  // malformed USFM *string* — an empty/garbled render parses to ZERO verses.
+  // Without the guard, every master verse is skipped (absent from render) and
+  // the corrupt render ships, deleting all alignment. Must REFUSE.
+  const r8empty = usfmAlignmentShrinkRefused("", master);
+  assert(r8empty.refused === true, `an empty render against an aligned master is refused (fail closed)`);
+  assert(r8empty.offenders.length === 1 && r8empty.offenders[0].ref === "*", `empty-render offender is the whole-render sentinel "*"`);
+
+  const r8garbage = usfmAlignmentShrinkRefused("not usfm at all {[}]", master);
+  assert(r8garbage.refused === true, `a garbled render that parses to zero verses is refused`);
+
+  // (8b) An empty render against an EMPTY master has nothing to lose → allowed
+  // (fresh book / no aligned baseline). The fail-closed gate is keyed on the
+  // master actually having aligned verses.
+  const r8freshboth = usfmAlignmentShrinkRefused("", "");
+  assert(r8freshboth.refused === false, `empty render + empty master never refuses`);
 }
 
 console.log("\nAll export smoke checks passed.");

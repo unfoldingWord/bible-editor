@@ -97,7 +97,7 @@ The whole point of this project: **edits never touch DCS in the hot path.** Ever
 2. Debounce → push op into IndexedDB outbox (`web/src/sync/outbox.ts`).
 3. Drain worker FIFOs each op as `PATCH /api/rows/{kind}/{id}` (or `/verses/...`) with `If-Match: <expected_version>`.
 4. **200** removes op, updates local version. **409** surfaces a merge prompt and re-queues. **401** triggers silent JWT refresh — outbox is never cleared on auth failure. **5xx/network** retries with backoff; durable across tab close.
-5. Cron Workflow at 06:00 UTC renders D1 → TSV + USFM and commits to a DCS fork branch (`live-snapshot`). If that fails, edits stay safe in D1; next night catches up.
+5. Cron Workflow at 05:30 UTC (retimed from 06:00 — see `wrangler.toml`) renders D1 → TSV + USFM and commits to a DCS fork branch (`live-snapshot`). If that fails, edits stay safe in D1; next night catches up.
 
 The fetch client in `web/src/sync/api.ts` is the only thing that talks to `/api/*`. Don't bypass it — its `If-Match` / 409 / 401 handling is what makes the outbox correct.
 

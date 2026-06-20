@@ -59,7 +59,7 @@ export interface ExportParams {
   dryDcs?: boolean;
   // Run the post-export validate-and-merge orchestrator (dispatches a Gitea
   // Actions workflow that auto-merges the live-snapshot PR on DCS). The
-  // 06:00 UTC cron sets this true; manual /api/exports/run leaves it false
+  // 05:30 UTC cron sets this true; manual /api/exports/run leaves it false
   // so a single-book test export doesn't accidentally trigger a real merge.
   validateAndMerge?: boolean;
   // Self-heal mode: run only the chunked DCS→D1 reimport for every book, then

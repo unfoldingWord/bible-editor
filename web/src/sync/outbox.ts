@@ -144,15 +144,33 @@ async function listAll(): Promise<OutboxOp[]> {
 // calls in the same tick into one read+broadcast; subscribers only care about
 // the latest snapshot anyway.
 let notifyScheduled = false;
+// Set when a notify() arrives while a read+dispatch is already in flight. The
+// flag stays raised across the whole read+dispatch (not reset before the await
+// resolves), so a swallowed notify in that window doesn't strand the UI on a
+// stale snapshot — we loop and re-read.
+let notifyPendingRerun = false;
 async function notify() {
   if (subscribers.size === 0) return;
-  if (notifyScheduled) return;
+  if (notifyScheduled) {
+    // A read+dispatch is in flight. Its listAll() may have already resolved,
+    // so the snapshot it broadcasts could predate the state this call reflects.
+    // Request a re-run instead of dropping the notification.
+    notifyPendingRerun = true;
+    return;
+  }
   notifyScheduled = true;
   await Promise.resolve();
+  // Keep the flag raised across the full read+dispatch so concurrent notify()
+  // calls coalesce into notifyPendingRerun rather than slipping through.
+  do {
+    notifyPendingRerun = false;
+    if (subscribers.size === 0) break;
+    const all = await listAll();
+    for (const s of subscribers) s(all);
+    // If a notify() arrived while listAll()/dispatch ran, re-read so the last
+    // snapshot the UI settles on reflects the latest committed state.
+  } while (notifyPendingRerun);
   notifyScheduled = false;
-  if (subscribers.size === 0) return;
-  const all = await listAll();
-  for (const s of subscribers) s(all);
 }
 
 function uid() {
@@ -358,11 +376,20 @@ export const outbox = {
   // prompts for what was logically one upstream change).
   async resolveConflict(opId: string, newExpectedVersion: number) {
     const idb = await db();
-    const op = (await idb.get(STORE, opId)) as OutboxOp | undefined;
-    if (!op) return;
-    const key = targetKey(op.target);
-    const all = (await idb.getAll(STORE)) as OutboxOp[];
+    // Read AND write inside ONE readwrite tx. The old two-step (get + getAll in
+    // autocommit txs, then put in a new tx) raced the drain: between the read
+    // and the write, drain could flip a sibling pending → in_flight, and the
+    // stale write here would clobber that transition (re-arming a live op and
+    // double-PATCHing it). Re-check status inside the tx so we only touch ops
+    // still safe to reset.
     const tx = idb.transaction(STORE, "readwrite");
+    const op = (await tx.store.get(opId)) as OutboxOp | undefined;
+    if (!op) {
+      await tx.done;
+      return;
+    }
+    const key = targetKey(op.target);
+    const all = (await tx.store.getAll()) as OutboxOp[];
     for (const o of all) {
       if (targetKey(o.target) !== key) continue;
       if (o.status === "conflict" || o.status === "pending") {
@@ -378,7 +405,22 @@ export const outbox = {
   },
 
   async drop(opId: string) {
-    await (await db()).delete(STORE, opId);
+    // Guard against dropping an op the drain just flipped to in_flight (same
+    // race the drain itself guards at the listAll → fresh re-read). A request
+    // is already on the wire; deleting the record here would race the 200
+    // handler's own delete and could strand or double-handle the result. Leave
+    // in_flight ops alone — they resolve on their own; the user can drop them
+    // once they settle. Read-and-check inside one readwrite tx so we don't
+    // open a window against drain's pending → in_flight transition.
+    const idb = await db();
+    const tx = idb.transaction(STORE, "readwrite");
+    const op = (await tx.store.get(opId)) as OutboxOp | undefined;
+    if (op && op.status === "in_flight") {
+      await tx.done;
+      return;
+    }
+    await tx.store.delete(opId);
+    await tx.done;
     void notify();
     void drain();
   },
@@ -389,13 +431,23 @@ export const outbox = {
   // not just one more shot before re-failing.
   async retry(opId: string) {
     const idb = await db();
-    const op = (await idb.get(STORE, opId)) as OutboxOp | undefined;
-    if (!op) return;
+    // Read-and-check inside one readwrite tx. If the drain just flipped this op
+    // to in_flight, a request is already on the wire — resetting it to pending
+    // here would let a second drain re-dispatch it (double-PATCH) or clobber
+    // the in-flight result. Leave in_flight ops alone; they resolve on their
+    // own. pending/failed ops retry as before (failed → fresh attempt budget).
+    const tx = idb.transaction(STORE, "readwrite");
+    const op = (await tx.store.get(opId)) as OutboxOp | undefined;
+    if (!op || op.status === "in_flight") {
+      await tx.done;
+      return;
+    }
     op.status = "pending";
     op.attempts = 0;
     op.hardAttempts = 0;
     op.lastError = undefined;
-    await idb.put(STORE, op);
+    await tx.store.put(op);
+    await tx.done;
     void notify();
     void drain();
   },
@@ -592,18 +644,22 @@ async function threadVersionToSiblings(done: OutboxOp, updated: unknown) {
   if (typeof version !== "number") return;
   const key = targetKey(done.target);
   const idb = await db();
-  const all = (await idb.getAll(STORE)) as OutboxOp[];
-  const siblings = all.filter(
-    (o) =>
+  // Read AND write inside ONE readwrite tx. The old two-step (getAll in an
+  // autocommit tx, then put in a new tx) raced the drain: between the read and
+  // the write, drain could flip a sibling pending → in_flight, and re-threading
+  // its version here would clobber that live op. Re-check status inside the tx
+  // so we only thread ops still pending/failed (never an in_flight one).
+  const tx = idb.transaction(STORE, "readwrite");
+  const all = (await tx.store.getAll()) as OutboxOp[];
+  for (const o of all) {
+    if (
       targetKey(o.target) === key &&
       (o.status === "pending" || o.status === "failed") &&
-      o.expectedVersion !== version,
-  );
-  if (siblings.length === 0) return;
-  const tx = idb.transaction(STORE, "readwrite");
-  for (const o of siblings) {
-    o.expectedVersion = version;
-    await tx.store.put(o);
+      o.expectedVersion !== version
+    ) {
+      o.expectedVersion = version;
+      await tx.store.put(o);
+    }
   }
   await tx.done;
 }

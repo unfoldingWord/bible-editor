@@ -203,13 +203,17 @@ function countAlignedWords(nodes: unknown[]): number {
 // Keyed "chapter:verse" (verse keys can be "front", "12-13" — kept verbatim).
 // The verseObjects array is retained so the caller can re-run the SAME
 // word-level analyzer the interactive guard uses (analyzeAlignmentDelta).
-function verseAlignStats(usfmText: string): Map<string, VerseAlignStat> {
+// Returns null on a PARSE FAILURE (distinct from a parsed-but-empty blob,
+// which returns an empty Map). The caller must distinguish the two: an empty
+// Map means "parsed, no verses to compare", but a null means "we can't trust
+// this USFM at all" and must fail closed.
+function verseAlignStats(usfmText: string): Map<string, VerseAlignStat> | null {
   const stats = new Map<string, VerseAlignStat>();
   let json: { chapters?: Record<string, Record<string, unknown>> };
   try {
     json = usfm.toJSON(usfmText);
   } catch {
-    return stats; // unparseable master → treat as no comparison data (caller fails closed elsewhere)
+    return null; // unparseable → signal failure so the caller can fail closed
   }
   const chapters = json.chapters ?? {};
   for (const chapterKey of Object.keys(chapters)) {
@@ -259,6 +263,31 @@ export function usfmAlignmentShrinkRefused(
 ): AlignmentShrinkResult {
   const rendered = verseAlignStats(renderedUsfm);
   const master = verseAlignStats(masterUsfm);
+  // An unparseable RENDER must never be treated as safe to ship: with no
+  // comparison data every master verse would be skipped and the guard would
+  // fail OPEN. A corrupt render is exactly the case we must refuse. Fail closed.
+  if (rendered === null) {
+    return { refused: true, offenders: [{ ref: "*", lostWords: ["unparseable_render"] }] };
+  }
+  // An unparseable MASTER (but a parseable render) leaves us with no baseline to
+  // compare against — lower risk (we can't prove loss), so we don't refuse on it,
+  // but we must not crash. Treat as no comparison data.
+  if (master === null) {
+    return { refused: false, offenders: [] };
+  }
+  // The reachable fail-open: usfm.toJSON does NOT throw on a malformed USFM
+  // *string* (only on non-string input), so an empty or garbled render surfaces
+  // here as a zero-verse Map, not null. A render that parsed to ZERO verses
+  // while master still HAS aligned verses is a render failure, not a legitimate
+  // full deletion — and the per-verse "absent from render → skip" rule below
+  // would otherwise wave it through (every master verse skipped → refused:false).
+  // Fail closed. (A genuinely empty master — fresh book — has nothing to lose.)
+  if (rendered.size === 0) {
+    const masterHasAligned = [...master.values()].some((s) => s.alignedWords > 0);
+    if (masterHasAligned) {
+      return { refused: true, offenders: [{ ref: "*", lostWords: ["empty_render"] }] };
+    }
+  }
   const offenders: AlignmentShrinkResult["offenders"] = [];
   for (const [ref, masterStat] of master) {
     if (masterStat.alignedWords === 0) continue; // nothing aligned on master to lose

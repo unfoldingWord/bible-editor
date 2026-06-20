@@ -142,6 +142,29 @@ const CreateTwl = z.object({
 });
 const CREATE_SCHEMA = { tn: CreateTn, tq: CreateTq, twl: CreateTwl };
 
+// Hardcoded per-kind allowlist of INSERT-able column names. The create path
+// interpolates column names directly into the SQL string (D1 can't bind
+// identifiers), so the set of names must NEVER be derived from request-shaped
+// data. Today the closed Zod schemas above already bound the keys, but this
+// allowlist is a defense-in-depth gate so a future schema widening can't open
+// a SQL-injection path through `Object.keys(data)`. Each entry must mirror the
+// corresponding Create* schema's fields (sort_order is server-defaulted but
+// still a valid column). Keep these two lists in sync.
+const INSERT_COLS: Record<RowKind, readonly string[]> = {
+  tn: [
+    "book", "chapter", "verse", "ref_raw", "tags", "support_reference",
+    "quote", "occurrence", "note", "sort_order",
+  ],
+  tq: [
+    "book", "chapter", "verse", "ref_raw", "tags", "quote", "occurrence",
+    "question", "response",
+  ],
+  twl: [
+    "book", "chapter", "verse", "ref_raw", "tags", "orig_words", "occurrence",
+    "tw_link", "sort_order",
+  ],
+};
+
 rows.post("/:kind", requireEditor, async (c) => {
   const kind = c.req.param("kind");
   if (!isRowKind(kind)) return c.json({ error: "invalid_kind" }, 400);
@@ -183,13 +206,21 @@ rows.post("/:kind", requireEditor, async (c) => {
   // Retry around PK collision: insert under a fresh id and let the DB be the
   // source of truth instead of SELECT-then-INSERT (which races between two
   // concurrent POSTs). 32^4 ≈ 1M ids; ~8 tries covers any plausible book.
-  const cols = ["id", ...Object.keys(data), "updated_by"];
+  // Build the column list from the hardcoded allowlist, not from
+  // Object.keys(data), so a request can never inject an identifier. Only keys
+  // actually present in `data` are included (preserving the prior behavior
+  // where unsupplied optional fields fall through to DB defaults). The
+  // matching values are read in the SAME order so placeholders line up.
+  const dataCols = INSERT_COLS[kind].filter((name) =>
+    Object.prototype.hasOwnProperty.call(data, name),
+  );
+  const cols = ["id", ...dataCols, "updated_by"];
   const placeholders = cols.map((_c, i) => `?${i + 1}`).join(", ");
   let id = "";
   let lastErr: unknown = null;
   for (let i = 0; i < 8; i++) {
     id = newRowId();
-    const values: unknown[] = [id, ...Object.values(data), userId];
+    const values: unknown[] = [id, ...dataCols.map((name) => data[name]), userId];
     try {
       await c.env.DB.batch([
         c.env.DB

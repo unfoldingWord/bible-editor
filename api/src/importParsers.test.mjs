@@ -817,4 +817,22 @@ const zaln = (attrs, targetText) => ({
   assert(sanitizeMarkerSpacing("\\qm1word") === "\\qm1 word", `\\qm1word → "\\qm1 word"`);
 }
 
+// --- TSV: leading UTF-8 BOM must not corrupt the header row ---
+// Regression: without the BOM strip, headers[0] becomes "﻿ID", so every
+// r["ID"] lookup is undefined and the entire import is silently skipped (0
+// usable rows) even though parseTsv reports rows.
+{
+  const body =
+    "Reference\tID\tTags\tSupportReference\tQuote\tOccurrence\tNote\n" +
+    "1:1\tabcd\t\t\tword\t1\tA note\n";
+  const withBom = "﻿" + body;
+  const plain = parseTsv(body);
+  const bommed = parseTsv(withBom);
+  assert(bommed.headers[0] === "Reference", `BOM is stripped from the first header (got ${JSON.stringify(bommed.headers[0])})`);
+  assert(!bommed.headers[0].includes("﻿"), `no BOM survives on any header`);
+  assert(bommed.rows.length === plain.rows.length, `BOM file yields the same row count as a clean file`);
+  assert(bommed.rows[0]["ID"] === "abcd", `lookup by real header name works on a BOM file (got ${JSON.stringify(bommed.rows[0]["ID"])})`);
+  assert(bommed.rows[0]["Reference"] === "1:1", `Reference resolves on a BOM file`);
+}
+
 console.log("\nAll parser smoke checks passed.");

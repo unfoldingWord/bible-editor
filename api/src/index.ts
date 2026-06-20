@@ -220,7 +220,7 @@ export default {
   fetch: app.fetch,
   async scheduled(controller: ScheduledController, env: Env, _ctx: ExecutionContext) {
     // Two crons share this handler — wrangler.toml has the full list. The
-    // 06:00 one kicks the nightly DCS-export Workflow; the 5-min one polls
+    // 05:30 one kicks the nightly DCS-export Workflow; the 5-min one polls
     // every non-terminal pipeline_job so the auto-apply step lands even
     // when no translator has a tab open. Branching on controller.cron
     // keeps the work cheaply separated.
@@ -249,7 +249,7 @@ export default {
         console.error("nightly trash finalize failed", e instanceof Error ? e.message : String(e));
       }
       // Scheduled run opts into validate-and-merge — the whole point of the
-      // 06:00 UTC tick is to land the snapshot on DCS and let the validator
+      // 05:30 UTC tick is to land the snapshot on DCS and let the validator
       // merge it. Manual /api/exports/run leaves validateAndMerge unset so
       // tests don't accidentally trigger the auto-merge.
       //

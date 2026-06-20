@@ -61,6 +61,18 @@ export class ChapterRoom implements DurableObject {
       return new Response("room full", { status: 503 });
     }
 
+    // ACCEPTED TRADEOFF — listen-only presence sockets are not re-validated.
+    // index.ts verifies the JWT once, at the upgrade request. After accept()
+    // the socket is never re-checked, so a tab whose token expires keeps
+    // receiving broadcasts until the socket itself drops (tab close, network
+    // blip, or the 20s app-ping detecting a half-open connection). This is
+    // intentional: our JWT TTL is deliberately decoupled from the DCS access
+    // token, the socket carries no write authority (HTTP + If-Match is the
+    // only mutation path and re-authes every request), and the broadcast
+    // payload is non-sensitive editorial presence/change-hint data. Re-auth on
+    // a long-lived presence socket would be a large change for no security
+    // gain here; if that calculus ever changes (sensitive payloads, write
+    // capability), this is the place to add periodic re-validation.
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair) as [WebSocket, WebSocket];
     server.accept();

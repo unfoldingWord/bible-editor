@@ -285,7 +285,7 @@ async function signStateCookie(state: string, key: Uint8Array): Promise<string> 
 
 async function verifyStateCookie(token: string, key: Uint8Array): Promise<string | null> {
   try {
-    const { payload } = await jwtVerify(token, key);
+    const { payload } = await jwtVerify(token, key, { algorithms: ["HS256"] });
     return typeof payload.state === "string" ? payload.state : null;
   } catch {
     return null;
