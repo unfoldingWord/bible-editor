@@ -14,6 +14,29 @@
 
 ## Last run
 
+2026-06-20 · **suspicious-poitras** — Cleared the nightly export's **align-shrink block on JER UST** (the
+`export_align_shrink:JER:ust` "BLOCKED … lost alignment on \"Jeremiah\"" alert). This was a **prod DATA
+repair, not a code change** — the export-side `usfmAlignmentShrinkRefused` guard (`exportWorkflow.ts`
+`checkUsfmAlignmentShrink`) is LIVE and did its job: it caught bad D1 data and refused to ship it. Root cause:
+**JER 30:1 UST** — a translator wrapped `another`→`{another}` (UST implied-word braces); that edit
+**collaterally de-aligned `Jeremiah`** at the far end of the verse (it fell out of `\zaln-s H3414`
+יִרְמְיָ֔הוּ and went bare) — the 1CH 4:21 / NUM 24 signature, landed in D1 before/around the engine fixes.
+Scanned ALL 1361 JER UST verses vs master: **exactly 1 offender**. Heal source = **master itself** (the
+guard kept master clean), unlike `heal-align-1ch-num.mjs` where master was the damaged side and a pre-export
+commit was the clean baseline. Heal = `smartEditVerse(masterAlignedVerse, masterEditable, d1Editable)` →
+re-applies the `{another}` edit onto master's fully-aligned tree through the CURRENT engine: 8 aligned / 0
+bare, plain text byte-identical to D1, structurally == master except the braces, post-heal guard delta 0
+`lost`. **Applied to prod D1** (`scripts/out/heal-jer30.sql`, gitignored): version-conditional UPDATE
+(`AND version=4`) v4→v5, `updated_by=2`, + guarded `edit_log` audit (`heal-export-align-loss`/`data_repair`).
+**Re-exported** targeted (`wrangler workflows trigger bible-editor-export '{"book":"JER","resource":"ust"}'`,
+instance `33a4ff9a…`): `dcsChanged:true`, `dcsSkippedReason:null` (gate passed), committed to branch
+`JER-be-Grant_Ailie` (`febe345e`), **PR #4122** created on en_ust; verified the committed branch carries
+`Jeremiah` re-aligned + `{another}` preserved. Safe against the pre-export DCS→D1 sync because reimport's
+verse UPDATE is guarded on `AND updated_by IS NULL` (`bookReimport.ts`) and the heal set `updated_by=2`. The
+banner alert (id 9) was already dismissed. PR #4122 still needs MERGE to land on master (manual export left
+`validateAndMerge=false`) — the 06:00 UTC nightly validate-and-merge will pick it up, or merge by hand.
+(memory: project_export_align_damage_1ch_num — guard now confirmed LIVE + firing in prod)
+
 2026-06-19 · **sweet-moore** — Fixed Perry's **JER 29:31 UST** alignment-save block (PR #248). Repro'd on
 `main` (NOT an outdated app): inserting "Because" mid-verse + changing the verse-final `.`→`,` flattened
 37→17 aligned and the #233 guard discarded the draft. Root cause = a gap in the #235 reassembly engine:
