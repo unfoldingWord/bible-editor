@@ -6,6 +6,8 @@ import usfm from "usfm-js";
 import type { TnRow, TqRow, TwlRow, VerseRow } from "./types";
 import { parseVerseContentJson } from "./contentJson.ts";
 import { analyzeAlignmentDelta } from "./alignmentDelta.ts";
+import { normalizeUsfmFormatting } from "./usfmFormat.ts";
+import { normalizeNoteText, sortRowsByReference } from "./tsvFormat.ts";
 
 export type Resource = "tn" | "tq" | "twl" | "ult" | "ust";
 
@@ -98,21 +100,21 @@ function origLangOccurrence(quote: string | null, occurrence: number | null): nu
 }
 
 export function buildTnTsv(rows: TnRow[]): string {
-  const body = rows.map((r) =>
-    tsvLine([r.ref_raw, r.id, r.tags, r.support_reference, r.quote, origLangOccurrence(r.quote, r.occurrence), r.note]),
+  const body = sortRowsByReference(rows).map((r) =>
+    tsvLine([r.ref_raw, r.id, r.tags, r.support_reference, r.quote, origLangOccurrence(r.quote, r.occurrence), normalizeNoteText(r.note)]),
   );
   return [TN_HEADERS.join("\t"), ...body].join("\n") + "\n";
 }
 
 export function buildTqTsv(rows: TqRow[]): string {
-  const body = rows.map((r) =>
-    tsvLine([r.ref_raw, r.id, r.tags, r.quote, origLangOccurrence(r.quote, r.occurrence), r.question, r.response]),
+  const body = sortRowsByReference(rows).map((r) =>
+    tsvLine([r.ref_raw, r.id, r.tags, r.quote, origLangOccurrence(r.quote, r.occurrence), normalizeNoteText(r.question), normalizeNoteText(r.response)]),
   );
   return [TQ_HEADERS.join("\t"), ...body].join("\n") + "\n";
 }
 
 export function buildTwlTsv(rows: TwlRow[]): string {
-  const body = rows.map((r) =>
+  const body = sortRowsByReference(rows).map((r) =>
     tsvLine([r.ref_raw, r.id, r.tags, r.orig_words, origLangOccurrence(r.orig_words, r.occurrence), r.tw_link]),
   );
   return [TWL_HEADERS.join("\t"), ...body].join("\n") + "\n";
@@ -364,9 +366,14 @@ export function buildUsfm(input: UsfmInputs): string {
   // usfm-js wants { headers, chapters } where chapters is keyed by string and
   // each chapter's verses are keyed by string. We built it that way above.
   const usfmInput = { headers, chapters };
-  return usfm.toUSFM(usfmInput as unknown as { chapters: Record<string, unknown> }, {
+  const rendered = usfm.toUSFM(usfmInput as unknown as { chapters: Record<string, unknown> }, {
     forcedNewLines: true,
   });
+  // usfm-js's line layout doesn't match DCS Check 8 (blank lines, own-line
+  // markers, `\v` line breaks, `\ts*` repair). Reflow to the DCS convention so
+  // the exported snapshot is valid by construction. Inert markers/whitespace
+  // only — alignment is untouched. See usfmFormat.ts.
+  return normalizeUsfmFormatting(rendered);
 }
 
 function synthesizeHeaders(book: string, bibleVersion: string): unknown[] {

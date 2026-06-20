@@ -129,6 +129,29 @@ export interface BookSummary {
   }>;
 }
 
+// One DCS-validation finding from GET /api/books/:book/lint. `bucket` splits
+// content problems a translator must resolve ("flag") from integrity issues
+// like footnotes ("escalate"). `ref` is "chapter:verse" (or "chapter"); `rowId`
+// is present for TN findings so the UI can jump straight to the offending note.
+export interface BookLintIssue {
+  check: string;
+  bucket: "flag" | "escalate";
+  ref: string;
+  rowId?: string;
+  message: string;
+  resource: "tn" | "ult" | "ust";
+}
+
+export interface BookLintReport {
+  book: string;
+  total: number;
+  /** Issues needing a human decision (the "flag" bucket). */
+  flagCount: number;
+  /** Integrity issues (footnotes) — secondary, count only. */
+  escalateCount: number;
+  issues: BookLintIssue[];
+}
+
 export class ApiError extends Error {
   constructor(
     public status: number,
@@ -918,6 +941,11 @@ export const api = {
       `/api/chapters/${encodeURIComponent(book)}/${chapter}`,
       { signal },
     ),
+
+  // DCS-validation summary for a book (issues that need a human decision).
+  // Book-level, fetched once per book change by useBookLint.
+  getBookLint: (book: string, signal?: AbortSignal) =>
+    request<BookLintReport>(`/api/books/${encodeURIComponent(book)}/lint`, { signal }),
 
   getCatalogs: () => request<Catalogs>(`/api/catalogs`),
 

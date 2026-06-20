@@ -36,6 +36,7 @@ interface Props {
   pipelineMenu?: ReactNode;
   pipelineStatus?: ReactNode;
   logosSyncToggle?: ReactNode;
+  lintIndicator?: ReactNode;
   railCollapsed?: boolean;
   onToggleRail?: () => void;
 }
@@ -47,6 +48,7 @@ export function TopBar({
   pipelineMenu,
   pipelineStatus,
   logosSyncToggle,
+  lintIndicator,
   railCollapsed,
   onToggleRail,
 }: Props) {
@@ -346,6 +348,7 @@ export function TopBar({
           <Divider orientation="vertical" flexItem sx={{ my: 0.5 }} />
         </Box>
       )}
+      {lintIndicator}
       <VersionIndicator />
       <SyncStatusBar onNavigate={onNavigate} />
       <Tooltip title={mode === "dark" ? "switch to light mode" : "switch to dark mode"}>

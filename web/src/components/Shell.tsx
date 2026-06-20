@@ -17,11 +17,12 @@ import LogoutIcon from "@mui/icons-material/Logout";
 import { useChapter } from "../hooks/useChapter";
 import { useChapterRoom } from "../hooks/useChapterRoom";
 import type { UseBookReturn } from "../hooks/useBook";
+import { useBookLint } from "../hooks/useBookLint";
 import { useLexicon } from "../hooks/useLexicon";
 import { useAiDrafts } from "../hooks/useAiDrafts";
 import { outbox } from "../sync/outbox";
 import { api } from "../sync/api";
-import type { ChapterPayload, TnRow, TqRow, TwlRow, VerseDto } from "../sync/api";
+import type { BookLintIssue, ChapterPayload, TnRow, TqRow, TwlRow, VerseDto } from "../sync/api";
 import { drafts, verseKey } from "../sync/drafts";
 import { smartEditVerse } from "../lib/replace";
 import { extractEditableText, extractPlainText, normalizeEditable, SECTION_HEADER_TAGS } from "../lib/usfm";
@@ -46,6 +47,7 @@ import {
   type ReadingLineHandle,
 } from "./SideBySideAligner";
 import { TopBar } from "./TopBar";
+import { BookLintIndicator } from "./BookLintIndicator";
 import { LogosSyncToggle } from "./LogosSyncToggle";
 import { PipelineMenu } from "./PipelineMenu";
 import { PipelineStatusBar } from "./PipelineStatusBar";
@@ -207,6 +209,10 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       applyLocalVerseStatus(status.verse, status.done === 1);
     },
   });
+  // Book-level DCS-validation summary for the topbar "issues to clean up"
+  // indicator. Keyed on book, so it fetches once per book change — never on
+  // chapter/verse navigation within a book.
+  const bookLint = useBookLint(book, true);
   const [activeVerse, setActiveVerse] = useState(initialVerse);
   const [activeNoteId, setActiveNoteId] = useState<string | null>(null);
   const [activeWordId, setActiveWordId] = useState<string | null>(null);
@@ -893,6 +899,32 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     [runWithDirtyGate, chapter, book, onNavigate],
   );
 
+  // Jump to a lint issue from the topbar indicator. `ref` is "chapter:verse"
+  // (or bare "chapter"). TN findings carry a rowId, so reuse focusNoteMatch —
+  // the same note-jump mechanism the find overlay uses (same-chapter focuses
+  // the note; cross-chapter stashes pendingNoteJump and navigates). ULT/UST
+  // findings have no row, so just navigate to the verse through the dirty gate.
+  const goToLintIssue = useCallback(
+    (issue: BookLintIssue) => {
+      const [chStr, vStr] = issue.ref.split(":");
+      const ch = parseInt(chStr, 10);
+      if (Number.isNaN(ch)) return;
+      const v = vStr ? parseInt(vStr, 10) : 1;
+      const verse = Number.isNaN(v) ? 1 : v;
+      if (issue.resource === "tn" && issue.rowId) {
+        focusNoteMatch(ch, verse, issue.rowId);
+        return;
+      }
+      runWithDirtyGate(() => {
+        setActiveVerse(verse);
+        setActiveNoteId(null);
+        setActiveWordId(null);
+        onNavigate?.(book, ch, verse);
+      });
+    },
+    [focusNoteMatch, runWithDirtyGate, book, onNavigate],
+  );
+
   // App keys Shell on book only, so a cross-chapter navigation (URL /
   // back-forward / TopBar / cross-chapter find) changes the chapter +
   // initialVerse props WITHOUT remounting — useChapter keeps the prior
@@ -1571,6 +1603,15 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         }
         logosSyncToggle={
           <LogosSyncToggle book={book} chapter={chapter} verse={activeVerse} />
+        }
+        lintIndicator={
+          <BookLintIndicator
+            book={book}
+            flagIssues={bookLint.flagIssues}
+            flagCount={bookLint.flagCount}
+            escalateCount={bookLint.escalateCount}
+            onGoToIssue={goToLintIssue}
+          />
         }
         railCollapsed={railCollapsed}
         onToggleRail={toggleRail}

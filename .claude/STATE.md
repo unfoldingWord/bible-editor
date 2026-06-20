@@ -14,6 +14,46 @@
 
 ## Last run
 
+2026-06-20 · **epic-bassi** — **DCS export validation: prevent · auto-fix · flag.** The open
+nightly `-be-` PRs were all `mergeable:true` but blocked by ONE failing `validate-be` check.
+Two root facts: (1) DCS validates the **whole repo** on a `-be-` branch (no `--book`), so a clean
+book's PR fails on *other* books' pre-existing master cruft; (2) `merge-be-prs.yaml` skips any PR
+whose status isn't `success`. Both confirmed against live door43. Plan + categorization of all 8
+USFM + 15 TN checks → `docs/export-validation-cleanup.md`. **Shipped (branch
+`claude/epic-bassi-b25819`, code NOT yet committed/deployed at time of writing — see below):**
+- **Lever 0 (for Rich):** `docs/dcs-workflows/` — ready-to-paste `validate-be-branch.yaml` for all
+  5 repos that scopes validation to the PR's book (`--book` from the branch name; validators
+  already support it). Greens a book whose own render is clean. **Rich must apply these** (still
+  `whole-repo` on master as of this run — verified).
+- **Lever 1 (source prevention):** `api/src/usfmFormat.ts` — line-reflow ported+extended from DCS's
+  `fix_usfm_formatting.py` (blank lines, own-line markers, `\b`/`\ts\*`/`\p` order, lift markers off
+  the `\v` line, split mid-line `\v`, repair malformed `\ts*`→`\ts\*`), run in `buildUsfm`.
+  `api/src/tsvFormat.ts` — trailing-`\n` trim, straight→curly quotes, Alternate-translation label
+  spelling/case/spacing, DCS reference-order sort, wired into `buildTn/Tq/TwlTsv`. **Inert markers
+  only — alignment counts identical, idempotent.** Verified with the REAL DCS validators: every
+  open-PR USFM book + the master-cruft books (NUM/EZK/ZEC/MIC) → **0 Check-8 errors**; tn HOS/NUM →
+  0; tn ISA → only the 7 genuine human-decision items. 33 unit tests (`usfmFormat.test.mjs` +
+  `tsvFormat.test.mjs`).
+- **Lever 2 (escalate):** `api/src/lint.ts` (TS port of the judgement-call checks) + a best-effort
+  `escalateIntegrityIssues` post-export step in `exportWorkflow.ts` → admin banner for `\f/\f*`
+  footnote imbalance (the un-auto-fixable integrity class). 14 unit tests (`lint.test.mjs`).
+- **Lever 3 (flag for user):** `GET /api/books/:book/lint` (`bookImport.ts`) returns the per-book
+  human-decision issues (brackets, labels, bad ref/rc://) with ref + rowId for jump-to. Verified it
+  finds EXACTLY the 7 real ISA flag items. **Frontend (in-app per-book indicator + dropdown + jump)
+  built by a sub-agent — integrate/verify before relying on it.**
+- **True export DONE:** re-rendered all 11 open-PR books from **prod D1** with the new code and
+  committed the clean renders onto the existing `-be-` branches via `scripts/reexport-be-prs.mjs`
+  (`--commit`; reuses `commitToDcs` + the export shrink/alignment guards; dry-run validated each
+  per-book first). Live branch files now validate **0 per-book**. Commits: 1CH/ISA/JER/MIC ult,
+  1CH/HOS/ISA/MIC ust, ISA/HOS tn; MIC tn already clean.
+- **⚠ ESCALATED (blocks persistence):** the checks stay **red** until Rich applies Lever 0
+  (whole-repo gate). AND the **deployed prod worker still runs the OLD export code** — the **06:00
+  UTC nightly will re-render these books WITHOUT the normalizer and re-dirty the `-be-` branches**,
+  undoing the manual export. **Must deploy this branch (or merge its PR) before the next nightly.**
+  After Lever 0 lands, the red checks need one re-trigger (a fresh push / re-run) to flip green.
+  ISA tn has 7 residual flag items (5 unmatched `[ ]`, 2 labels missing end-punctuation) for human
+  fix via the Lever-3 flag. (memory: project_dcs_be_validation_whole_repo)
+
 2026-06-20 · **sharp-jackson** — Root-caused + fixed Perry's **MIC 7:9 UST** "BE moves a word from the
 beginning of a line to the end of the previous line after save … no space between the word and the \q
 marker." **Confirmed real** (fetched his exact saved verse from the `MIC-be-pjoakes` export branch — not a

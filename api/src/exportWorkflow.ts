@@ -47,6 +47,7 @@ import { runPostExport, VALIDATORS } from "./postExport";
 import { runChunkedReimport, storedResourceSha, ALL_RESOURCES as REIMPORT_RESOURCES } from "./bookReimport";
 import { dcsRawUrl, dcsResourceFile, fetchText, fileCommitSha, type ReimportResource } from "./dcsSources";
 import type { TnRow, TqRow, TwlRow, VerseRow } from "./types";
+import { lintUsfmVerses } from "./lint";
 
 export interface ExportParams {
   // Restrict the run to one book. Useful for manual /api/exports/run.
@@ -218,7 +219,62 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       }
     }
 
+    // 3. Best-effort escalation of integrity issues the export can't auto-fix.
+    //    Footnote (\f/\f*) imbalance is real data corruption a translator must
+    //    resolve; surface it as an admin banner. Human-decision content issues
+    //    (square brackets, Alternate-translation labels) are NOT nagged here —
+    //    they're surfaced in-app via the per-book lint indicator
+    //    (GET /api/books/:book/lint). Never aborts the run.
+    try {
+      await step.do("lint-escalate", async () => this.escalateIntegrityIssues(books));
+    } catch (e) {
+      console.error("export lint-escalate failed", { error: e instanceof Error ? e.message : String(e) });
+    }
+
     return { instanceId, totalSteps: results.length, results };
+  }
+
+  // Lint each book's rendered scripture for footnote imbalance and raise/clear an
+  // admin banner accordingly. Per-book source so a fixed book's alert clears on
+  // the next run. Returns a small summary for step observability.
+  private async escalateIntegrityIssues(books: string[]): Promise<{ flagged: string[] }> {
+    const flagged: string[] = [];
+    for (const book of books) {
+      const source = `export_lint:${book}`;
+      try {
+        const offenders: string[] = [];
+        for (const bv of ["ULT", "UST"]) {
+          const rs = await this.env.DB.prepare(
+            `SELECT * FROM verses WHERE book = ?1 AND bible_version = ?2 ORDER BY chapter, verse`,
+          )
+            .bind(book, bv)
+            .all<VerseRow>();
+          for (const issue of lintUsfmVerses(rs.results ?? [])) {
+            if (issue.bucket === "escalate") offenders.push(`${bv} ${issue.ref}`);
+          }
+        }
+        if (offenders.length === 0) {
+          // Clear any stale undismissed alert for this book (the issue was fixed).
+          await this.env.DB.prepare(
+            `DELETE FROM system_alerts WHERE username = ?1 AND source = ?2 AND dismissed_at IS NULL`,
+          )
+            .bind(EXPORT_ALERT_USERNAME, source)
+            .run();
+          continue;
+        }
+        flagged.push(book);
+        const sample = offenders.slice(0, 6).join(", ");
+        const more = offenders.length > 6 ? `, +${offenders.length - 6} more` : "";
+        await this.writeAlert(
+          source,
+          `Benjamin — ${book}: ${offenders.length} footnote integrity issue(s) the export can't auto-fix (${sample}${more}). Fix the \\f/\\f* pairing in these verses.`,
+          `${this.env.DCS_BASE_URL}/unfoldingWord`,
+        );
+      } catch (e) {
+        console.error("escalateIntegrityIssues book failed", { book, error: e instanceof Error ? e.message : String(e) });
+      }
+    }
+    return { flagged };
   }
 
   private async exportOne(

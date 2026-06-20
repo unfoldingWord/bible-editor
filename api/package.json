@@ -7,7 +7,7 @@
     "dev": "wrangler dev",
     "build": "tsc --noEmit",
     "typecheck": "tsc --noEmit",
-    "test": "node --experimental-strip-types --no-warnings src/importParsers.test.mjs && node --experimental-strip-types --no-warnings src/alignmentDelta.test.mjs && node --experimental-strip-types --no-warnings src/export.test.mjs && node --experimental-strip-types --no-warnings src/rowId.test.mjs && node --experimental-strip-types --no-warnings src/tnDedup.test.mjs && node --experimental-strip-types --no-warnings src/verseHistory.test.mjs",
+    "test": "node --experimental-strip-types --no-warnings src/importParsers.test.mjs && node --experimental-strip-types --no-warnings src/alignmentDelta.test.mjs && node --experimental-strip-types --no-warnings src/export.test.mjs && node --experimental-strip-types --no-warnings src/usfmFormat.test.mjs && node --experimental-strip-types --no-warnings src/tsvFormat.test.mjs && node --experimental-strip-types --no-warnings src/lint.test.mjs && node --experimental-strip-types --no-warnings src/rowId.test.mjs && node --experimental-strip-types --no-warnings src/tnDedup.test.mjs && node --experimental-strip-types --no-warnings src/verseHistory.test.mjs",
     "deploy": "wrangler deploy --env production",
     "db:migrate:local": "wrangler d1 migrations apply bible_editor_dev --local",
     "db:migrate:remote": "wrangler d1 migrations apply bible_editor --remote --env production",

@@ -18,9 +18,11 @@ import {
   parseTsv,
   refParts,
 } from "./importParsers";
-import { requireEditor, currentUserId } from "./auth";
+import { requireAuth, requireEditor, currentUserId } from "./auth";
 import { BOOK_NUMBERS, dcsUrls, dcsResourceFile, fileCommitSha, fetchText } from "./dcsSources";
 import { reimportBookFromDcs, recordResourceSync, type Resource } from "./bookReimport";
+import { lintTnRows, lintUsfmVerses } from "./lint";
+import type { TnRow, VerseRow } from "./types";
 
 export const books = new Hono<{ Bindings: Env; Variables: { userId?: number } }>();
 
@@ -29,6 +31,41 @@ books.get("/", async (c) => {
     `SELECT book, imported_at FROM book_imports ORDER BY book`,
   ).all<{ book: string; imported_at: number }>();
   return c.json({ books: rs.results });
+});
+
+// GET /api/books/:book/lint — the in-app "issues to clean up" feed for a book.
+// Runs the flag/escalate lint (the DCS checks the export can't auto-fix) over the
+// book's live D1 rows and returns the issues, each with a ref + (for TN) a row id
+// so the UI can jump straight to it. Read-only; any authed user can view.
+books.get("/:book/lint", requireAuth, async (c) => {
+  const book = c.req.param("book").toUpperCase();
+  if (!BOOK_NUMBERS[book]) return c.json({ error: "unknown_book", book }, 400);
+
+  const tn = await c.env.DB.prepare(
+    `SELECT * FROM tn_rows WHERE book = ?1 AND deleted_at IS NULL AND trashed_at IS NULL
+       ORDER BY chapter, verse, sort_order ASC NULLS LAST, id`,
+  )
+    .bind(book)
+    .all<TnRow>();
+  const ult = await c.env.DB.prepare(
+    `SELECT * FROM verses WHERE book = ?1 AND bible_version = 'ULT' ORDER BY chapter, verse`,
+  )
+    .bind(book)
+    .all<VerseRow>();
+  const ust = await c.env.DB.prepare(
+    `SELECT * FROM verses WHERE book = ?1 AND bible_version = 'UST' ORDER BY chapter, verse`,
+  )
+    .bind(book)
+    .all<VerseRow>();
+
+  const issues = [
+    ...lintTnRows(tn.results ?? []).map((i) => ({ ...i, resource: "tn" })),
+    ...lintUsfmVerses(ult.results ?? []).map((i) => ({ ...i, resource: "ult" })),
+    ...lintUsfmVerses(ust.results ?? []).map((i) => ({ ...i, resource: "ust" })),
+  ];
+  const flagCount = issues.filter((i) => i.bucket === "flag").length;
+  const escalateCount = issues.filter((i) => i.bucket === "escalate").length;
+  return c.json({ book, total: issues.length, flagCount, escalateCount, issues });
 });
 
 books.post("/:book/import", requireEditor, async (c) => {

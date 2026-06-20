@@ -1,0 +1,31 @@
+name: Validate USFM -be- Branch
+on:
+  push:
+    branches:
+      - '*-be-*'
+
+jobs:
+  validate-be:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: python -m pip install --upgrade pip pyyaml
+
+      - name: USFM File Validation Results <==== Click Here
+        run: |
+          REF_NAME="${GITHUB_REF_NAME:-${GITHUB_REF##refs/heads/}}"
+          BOOK="$(printf '%s' "${REF_NAME}" | sed 's/-be.*//' | tr '[:upper:]' '[:lower:]')"
+          echo "Validating book '${BOOK}' from branch '${REF_NAME}'"
+          if [ -n "${BOOK}" ]; then
+            python .gitea/workflows/validate_usfm_files.py --book "${BOOK}"
+          else
+            python .gitea/workflows/validate_usfm_files.py
+          fi
