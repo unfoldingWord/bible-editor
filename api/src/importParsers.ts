@@ -628,7 +628,17 @@ function extractPlainText(verseObj: unknown): string {
   const walk = (vos: unknown[]): void => {
     for (const vo of vos || []) {
       if (!vo || typeof vo !== "object") continue;
-      const v = vo as { text?: unknown; children?: unknown[] };
+      const v = vo as { text?: unknown; children?: unknown[]; tag?: unknown };
+      // In-flow line markers are word separators — mirror of extractPlainText in
+      // web/src/lib/usfm.ts (keep in sync). A no-op for clean imported USFM (a
+      // marker is always followed by whitespace there), but guards against fusing
+      // words across a marker that abuts them with no whitespace node. `\qs`
+      // (Selah) is a content wrapper, not a break — recurse it normally.
+      if (isInFlowMarker(vo) && v.tag !== "qs") {
+        parts.push(" ");
+        if (typeof v.text === "string") parts.push(v.text);
+        continue;
+      }
       if (typeof v.text === "string") parts.push(v.text);
       if (Array.isArray(v.children)) walk(v.children);
     }

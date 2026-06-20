@@ -18,6 +18,20 @@ export function extractPlainText(verseObjects: unknown): string {
     for (const vo of vos ?? []) {
       if (!vo || typeof vo !== "object") continue;
       const v = vo as { text?: unknown; children?: unknown[] };
+      // An in-flow line marker (\p, \q1, …) carries no text but IS a word
+      // separator. Without this, a marker that directly abuts the words on
+      // either side with no whitespace text node — reachable after an edit
+      // moves a poetic line break (`{from}\q2{good}`) — fuses them in the
+      // derived plain text used for search / fallback display: "fromgood".
+      // Emit a separating space (collapsed below, so no churn when whitespace
+      // already surrounds the marker), then keep any leading punctuation usfm-js
+      // parked on the marker node. Character wrappers (\qs Selah\qs*) hold inline
+      // CONTENT, not a break — fall through so their wrapped word still counts.
+      if (isInFlowMarker(vo) && !isCharacterWrapper(vo)) {
+        parts.push(" ");
+        if (typeof v.text === "string") parts.push(v.text);
+        continue;
+      }
       if (typeof v.text === "string") parts.push(v.text);
       if (Array.isArray(v.children)) walk(v.children);
     }

@@ -7,7 +7,7 @@
 // src/lib/alignment.test.mjs.
 
 import { smartEditVerse, smartReplaceVerse, tokenizePlainText, tokenizeEditableText } from "./replace.ts";
-import { extractEditableText } from "./usfm.ts";
+import { extractEditableText, extractPlainText } from "./usfm.ts";
 import { analyzeAlignmentDelta } from "./alignmentDelta.ts";
 
 let failed = 0;
@@ -1830,6 +1830,33 @@ function countAligned(content) {
   const delta = analyzeAlignmentDelta(verse, rNoSpace.content);
   assert(delta.unexpectedLosses.length === 0,
     `no collateral alignment loss → guard passes (got ${JSON.stringify(delta.unexpectedLosses.map((l) => l.text))})`);
+}
+
+// ─── Case 68: derived plain_text must not fuse words across a \q marker ──────
+// Codex review of PR #251: the edit/alignment path treats a marker as a word
+// separator, but the PERSISTED plain_text comes from extractPlainText, which
+// skipped marker nodes. When a marker abuts the words on both sides with no
+// whitespace text node (`{from}\q2{good}` — reachable after moving a line break
+// + inserting a word), plain_text fused them ("fromgood") even though the
+// verseObjects + editable text were correct. plain_text drives search + fallback
+// display, so the fusion silently corrupts it. extractPlainText now emits a
+// separator for in-flow line markers (not \qs content wrappers).
+{
+  console.log("\n[Case 68] derived plain_text does not fuse words across a \\q marker");
+  // No whitespace text node between the milestone and the marker — Codex's shape.
+  const verse = { verseObjects: [ zaln("H1", [w("from")]), { type: "quote", tag: "q2" }, zaln("H2", [w("Yahweh")]) ] };
+  const before = extractEditableText(verse.verseObjects);
+  const r = smartEditVerse(verse, before, "from\\q2 good Yahweh"); // insert "good", no space before marker
+  // The \q2 token separates "from" and "good" in editable space (the tree has
+  // no whitespace node before the marker, which is fine — the token IS the break).
+  assert(/from\\q2 good/.test(extractEditableText(r.content.verseObjects)),
+    `editable keeps the marker between the words (got ${JSON.stringify(extractEditableText(r.content.verseObjects))})`);
+  const pt = extractPlainText(r.content);
+  assert(pt === "from good Yahweh", `plain_text is not fused (got ${JSON.stringify(pt)})`);
+  assert(!/fromgood/.test(pt), `"from" and "good" did not fuse across the marker`);
+  // \qs content wrappers must NOT be treated as a separator — their word stays.
+  const selah = { verseObjects: [ { tag: "qs", type: "quote", text: "Selah", endTag: "qs-e\\*" } ] };
+  assert(extractPlainText(selah) === "Selah", `\\qs Selah wrapper text survives (got ${JSON.stringify(extractPlainText(selah))})`);
 }
 
 if (failed > 0) {
