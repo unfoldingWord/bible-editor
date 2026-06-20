@@ -56,16 +56,14 @@ export function TimelineRail({ book, chapter, tiles, activeVerse, showChapter = 
               "&:hover": active ? {} : { bgcolor: "action.hover" },
             }}
           >
-            <Tooltip title={t.done ? "mark not done" : "mark done"} placement="right">
-              <Checkbox
-                size="small"
-                checked={!!t.done}
-                onChange={(_e, v) => onToggleDone(t.verse, v)}
-                icon={<RadioButtonUncheckedIcon sx={{ fontSize: 16 }} />}
-                checkedIcon={<CheckCircleIcon sx={{ fontSize: 16, color: "success.main" }} />}
-                sx={{ p: 0.25 }}
-              />
-            </Tooltip>
+            <Checkbox
+              size="small"
+              checked={!!t.done}
+              onChange={(_e, v) => onToggleDone(t.verse, v)}
+              icon={<RadioButtonUncheckedIcon sx={{ fontSize: 16 }} />}
+              checkedIcon={<CheckCircleIcon sx={{ fontSize: 16, color: "success.main" }} />}
+              sx={{ p: 0.25 }}
+            />
             <Tooltip
               title={t.verse === 0 ? `${book} ${chapter} introduction` : `${book} ${chapter}:${t.verse}`}
               placement="right"
