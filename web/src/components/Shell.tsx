@@ -237,7 +237,10 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     });
     return () => {
       unsub();
-      if (lintRefetchTimer.current) clearTimeout(lintRefetchTimer.current);
+      if (lintRefetchTimer.current) {
+        clearTimeout(lintRefetchTimer.current);
+        lintRefetchTimer.current = null;
+      }
     };
   }, [book, bookLintRefetch]);
   const [activeVerse, setActiveVerse] = useState(initialVerse);
