@@ -14,6 +14,27 @@
 
 ## Last run
 
+2026-06-22 · **relaxed-haslett** — Fixed the in-app **book-lint "issues to clean up" chip going stale**
+(proofreader cleaned ISA validation errors but the topbar count didn't go away until reload). Root cause:
+`useBookLint` (web/src/hooks/useBookLint.ts) fetches `GET /api/books/:book/lint` **once per book change** and
+exposes `refetch()` — but **nothing ever called it** (the chip was frozen for the whole session in a book; a
+full reload was the only refresh). Validation logic + endpoint were correct (reads live D1, filters
+`deleted_at`/`trashed_at`; `bracketProblems` is a standard balanced-matcher) — purely a UI-refresh gap.
+**Fix (PR #255, MERGED + DEPLOYED to prod, frontend-only):** `Shell.tsx` subscribes to `onOutboxResult` and,
+on a TN-row or verse write `ok` for the current book (the only edits lint covers — TN flag checks + ULT/UST
+footnote integrity), debounces 1s and calls `bookLint.refetch()` via a shared `scheduleLintRefetch`. **Codex
+review caught a reachable gap** that's now fixed: TN **trash/restore** are direct API calls
+(`api.trashNote`/`restoreNote`), NOT outbox ops, so the listener never fired for them — yet the lint endpoint
+filters `trashed_at IS NULL`, so trashing a flagged note must drop the count / restore re-adds it; both handlers
+now call `scheduleLintRefetch()` on success. (Also nulled the debounce timer ref in effect cleanup — Codex
+tidiness note.) **Verified end-to-end LIVE** (own single-server wrangler on :8795 against the worktree bundle,
+seeded ZEC): injected an unbalanced `[` into ZEC 1:3 note `hm40` via API → chip showed "1"; fixed it in the UI +
+Save → network trace `PATCH /api/rows/tn/hm40 [200]` → **app's own `GET /api/books/ZEC/lint [200]` ~1s later** →
+chip cleared, server flagCount 1→0. typecheck + build green. **Deployed `wrangler deploy --env production`**
+(version `a3421292`, prod `version.json` commit `57022238`); first attempt's ExportWorkflow-trigger registration
+hit a transient CF Workflows API error — worker/SPA/crons deployed fine, and an idempotent re-deploy registered
+`workflow: bible-editor-export` cleanly. Branch `claude/relaxed-haslett-09eb6f`.
+
 2026-06-22 · **lucid-lewin** — Diagnosed + fixed AI pipeline jobs stuck on **"running"**. Coworker
 reported `notes ISA 41` (justplainjane47) wedged on running even after a Zulip msg said it `failed: EACCES …
 /app/logs/notes.log`. **Task 1 (clear if running): nothing to clear** — prod D1 had two ISA 41 notes rows,
