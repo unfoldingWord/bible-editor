@@ -213,6 +213,43 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // indicator. Keyed on book, so it fetches once per book change — never on
   // chapter/verse navigation within a book.
   const bookLint = useBookLint(book, true);
+  // The lint report is otherwise fetched once per book, so a translator who
+  // fixes a flagged note (e.g. unbalanced brackets around an Alternate
+  // translation) would keep seeing the stale count until a reload. Refetch when
+  // a TN-row or verse write for THIS book lands successfully — those are the
+  // only edits the lint covers (TN flags + ULT/UST footnote integrity) —
+  // debounced so a burst of saves coalesces into one request.
+  const bookLintRefetch = bookLint.refetch;
+  const lintRefetchTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Debounced lint refetch — coalesces a burst of edits into one request.
+  // Used by the outbox listener below AND by the trash/restore handlers, which
+  // bypass the outbox (direct API calls) yet change the lint set: the lint
+  // endpoint filters `trashed_at IS NULL`, so trashing a flagged note drops the
+  // count and restoring one adds it back.
+  const scheduleLintRefetch = useCallback(() => {
+    if (lintRefetchTimer.current) clearTimeout(lintRefetchTimer.current);
+    lintRefetchTimer.current = setTimeout(() => {
+      lintRefetchTimer.current = null;
+      bookLintRefetch();
+    }, 1000);
+  }, [bookLintRefetch]);
+  useEffect(() => {
+    const unsub = onOutboxResult((op, result) => {
+      if (result.kind !== "ok") return;
+      const t = op.target;
+      const touchesLint =
+        (t.kind === "row" && t.rowKind === "tn" && t.book === book) ||
+        (t.kind === "verse" && t.book === book);
+      if (touchesLint) scheduleLintRefetch();
+    });
+    return () => {
+      unsub();
+      if (lintRefetchTimer.current) {
+        clearTimeout(lintRefetchTimer.current);
+        lintRefetchTimer.current = null;
+      }
+    };
+  }, [book, scheduleLintRefetch]);
   const [activeVerse, setActiveVerse] = useState(initialVerse);
   const [activeNoteId, setActiveNoteId] = useState<string | null>(null);
   const [activeWordId, setActiveWordId] = useState<string | null>(null);
@@ -390,13 +427,16 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       try {
         const updated = await api.trashNote(id, book);
         applyLocalRowReplacement("tn", updated);
+        // Trash bypasses the outbox, so refresh the lint chip directly — a
+        // trashed note leaves the lint set (trashed_at IS NULL filter).
+        scheduleLintRefetch();
       } catch (e) {
         applyLocalRowPatch("tn", id, { trashed_at: null });
         const msg = e instanceof Error ? e.message : "unknown error";
         pushPipelineToast(`Couldn't delete note: ${msg}`, "error");
       }
     },
-    [book, applyLocalRowPatch, applyLocalRowReplacement, pushPipelineToast],
+    [book, applyLocalRowPatch, applyLocalRowReplacement, pushPipelineToast, scheduleLintRefetch],
   );
 
   const handleRestoreNote = useCallback(
@@ -405,13 +445,16 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       try {
         const updated = await api.restoreNote(id, book);
         applyLocalRowReplacement("tn", updated);
+        // Restore re-adds the note to the lint set — refresh the chip (the
+        // outbox listener won't fire for this direct API call).
+        scheduleLintRefetch();
       } catch (e) {
         applyLocalRowPatch("tn", id, { trashed_at: Math.floor(Date.now() / 1000) });
         const msg = e instanceof Error ? e.message : "unknown error";
         pushPipelineToast(`Couldn't restore note: ${msg}`, "error");
       }
     },
-    [book, applyLocalRowPatch, applyLocalRowReplacement, pushPipelineToast],
+    [book, applyLocalRowPatch, applyLocalRowReplacement, pushPipelineToast, scheduleLintRefetch],
   );
 
   // Async AI-draft lifecycle. State outlives any single NoteCard so the
