@@ -35,6 +35,16 @@ export interface TnRow {
    */
   hint: 0 | 1;
   /**
+   * Workflow-only review flag (NOT exported to DCS — buildTnTsv emits an
+   * explicit column list). Set when a note was adapted from a parallel passage
+   * and needs a human check: review_kind categorizes it ('quote' | 'xref' |
+   * 'sundial' | …) and review_reason is the human-readable detail shown in the
+   * "issues to clean up" chip. Cleared on the next TN content save.
+   * NULL = no review needed.
+   */
+  review_kind: string | null;
+  review_reason: string | null;
+  /**
    * Source label from the row's most recent edit_log entry. 'ai_pipeline'
    * when the last write came from the AI auto-apply step (which means the
    * chip should show); NULL after any subsequent human edit/keep wipes it.

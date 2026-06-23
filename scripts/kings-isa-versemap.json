@@ -1,0 +1,594 @@
+{
+  "source": "2KI",
+  "target": "ISA",
+  "sourceShas": {
+    "uhb": null,
+    "ult": null,
+    "tn": null
+  },
+  "targetShas": {
+    "uhb": null,
+    "ult": null
+  },
+  "excludedTargetVerses": {
+    "37": "1-9 (already adapted by a human)",
+    "38": "9-20 (Hezekiah's writing — unique to Isaiah, no Kings source)"
+  },
+  "map": {
+    "18:1": {
+      "isa": [],
+      "zone": "exclude_no_parallel",
+      "note": "Isaiah's account begins at 2Ki 18:13; 18:1-12 (Hezekiah's reign summary) has no Isaiah parallel."
+    },
+    "18:2": {
+      "isa": [],
+      "zone": "exclude_no_parallel",
+      "note": "Isaiah's account begins at 2Ki 18:13; 18:1-12 (Hezekiah's reign summary) has no Isaiah parallel."
+    },
+    "18:3": {
+      "isa": [],
+      "zone": "exclude_no_parallel",
+      "note": "Isaiah's account begins at 2Ki 18:13; 18:1-12 (Hezekiah's reign summary) has no Isaiah parallel."
+    },
+    "18:4": {
+      "isa": [],
+      "zone": "exclude_no_parallel",
+      "note": "Isaiah's account begins at 2Ki 18:13; 18:1-12 (Hezekiah's reign summary) has no Isaiah parallel."
+    },
+    "18:5": {
+      "isa": [],
+      "zone": "exclude_no_parallel",
+      "note": "Isaiah's account begins at 2Ki 18:13; 18:1-12 (Hezekiah's reign summary) has no Isaiah parallel."
+    },
+    "18:6": {
+      "isa": [],
+      "zone": "exclude_no_parallel",
+      "note": "Isaiah's account begins at 2Ki 18:13; 18:1-12 (Hezekiah's reign summary) has no Isaiah parallel."
+    },
+    "18:7": {
+      "isa": [],
+      "zone": "exclude_no_parallel",
+      "note": "Isaiah's account begins at 2Ki 18:13; 18:1-12 (Hezekiah's reign summary) has no Isaiah parallel."
+    },
+    "18:8": {
+      "isa": [],
+      "zone": "exclude_no_parallel",
+      "note": "Isaiah's account begins at 2Ki 18:13; 18:1-12 (Hezekiah's reign summary) has no Isaiah parallel."
+    },
+    "18:9": {
+      "isa": [],
+      "zone": "exclude_no_parallel",
+      "note": "Isaiah's account begins at 2Ki 18:13; 18:1-12 (Hezekiah's reign summary) has no Isaiah parallel."
+    },
+    "18:10": {
+      "isa": [],
+      "zone": "exclude_no_parallel",
+      "note": "Isaiah's account begins at 2Ki 18:13; 18:1-12 (Hezekiah's reign summary) has no Isaiah parallel."
+    },
+    "18:11": {
+      "isa": [],
+      "zone": "exclude_no_parallel",
+      "note": "Isaiah's account begins at 2Ki 18:13; 18:1-12 (Hezekiah's reign summary) has no Isaiah parallel."
+    },
+    "18:12": {
+      "isa": [],
+      "zone": "exclude_no_parallel",
+      "note": "Isaiah's account begins at 2Ki 18:13; 18:1-12 (Hezekiah's reign summary) has no Isaiah parallel."
+    },
+    "18:13": {
+      "isa": [
+        "36:1"
+      ],
+      "zone": "clean"
+    },
+    "18:14": {
+      "isa": [],
+      "zone": "exclude_no_parallel",
+      "note": "Tribute payment to Sennacherib — omitted entirely in Isaiah 36."
+    },
+    "18:15": {
+      "isa": [],
+      "zone": "exclude_no_parallel",
+      "note": "Tribute payment to Sennacherib — omitted entirely in Isaiah 36."
+    },
+    "18:16": {
+      "isa": [],
+      "zone": "exclude_no_parallel",
+      "note": "Tribute payment to Sennacherib — omitted entirely in Isaiah 36."
+    },
+    "18:17": {
+      "isa": [
+        "36:2"
+      ],
+      "zone": "clean"
+    },
+    "18:18": {
+      "isa": [
+        "36:3"
+      ],
+      "zone": "clean"
+    },
+    "18:19": {
+      "isa": [
+        "36:4"
+      ],
+      "zone": "clean"
+    },
+    "18:20": {
+      "isa": [
+        "36:5"
+      ],
+      "zone": "clean"
+    },
+    "18:21": {
+      "isa": [
+        "36:6"
+      ],
+      "zone": "clean"
+    },
+    "18:22": {
+      "isa": [
+        "36:7"
+      ],
+      "zone": "clean"
+    },
+    "18:23": {
+      "isa": [
+        "36:8"
+      ],
+      "zone": "clean"
+    },
+    "18:24": {
+      "isa": [
+        "36:9"
+      ],
+      "zone": "clean"
+    },
+    "18:25": {
+      "isa": [
+        "36:10"
+      ],
+      "zone": "clean"
+    },
+    "18:26": {
+      "isa": [
+        "36:11"
+      ],
+      "zone": "clean"
+    },
+    "18:27": {
+      "isa": [
+        "36:12"
+      ],
+      "zone": "clean"
+    },
+    "18:28": {
+      "isa": [
+        "36:13"
+      ],
+      "zone": "clean"
+    },
+    "18:29": {
+      "isa": [
+        "36:14"
+      ],
+      "zone": "clean"
+    },
+    "18:30": {
+      "isa": [
+        "36:15"
+      ],
+      "zone": "clean"
+    },
+    "18:31": {
+      "isa": [
+        "36:16"
+      ],
+      "zone": "clean"
+    },
+    "18:32": {
+      "isa": [
+        "36:17"
+      ],
+      "zone": "clean"
+    },
+    "18:33": {
+      "isa": [
+        "36:18"
+      ],
+      "zone": "clean"
+    },
+    "18:34": {
+      "isa": [
+        "36:19"
+      ],
+      "zone": "clean"
+    },
+    "18:35": {
+      "isa": [
+        "36:20"
+      ],
+      "zone": "clean"
+    },
+    "18:36": {
+      "isa": [
+        "36:21"
+      ],
+      "zone": "clean"
+    },
+    "18:37": {
+      "isa": [
+        "36:22"
+      ],
+      "zone": "clean"
+    },
+    "19:1": {
+      "isa": [
+        "37:1"
+      ],
+      "zone": "exclude_target_human",
+      "note": "Isa 37:1-9 already adapted by the proofreader — excluded from migration."
+    },
+    "19:2": {
+      "isa": [
+        "37:2"
+      ],
+      "zone": "exclude_target_human",
+      "note": "Isa 37:1-9 already adapted by the proofreader — excluded from migration."
+    },
+    "19:3": {
+      "isa": [
+        "37:3"
+      ],
+      "zone": "exclude_target_human",
+      "note": "Isa 37:1-9 already adapted by the proofreader — excluded from migration."
+    },
+    "19:4": {
+      "isa": [
+        "37:4"
+      ],
+      "zone": "exclude_target_human",
+      "note": "Isa 37:1-9 already adapted by the proofreader — excluded from migration."
+    },
+    "19:5": {
+      "isa": [
+        "37:5"
+      ],
+      "zone": "exclude_target_human",
+      "note": "Isa 37:1-9 already adapted by the proofreader — excluded from migration."
+    },
+    "19:6": {
+      "isa": [
+        "37:6"
+      ],
+      "zone": "exclude_target_human",
+      "note": "Isa 37:1-9 already adapted by the proofreader — excluded from migration."
+    },
+    "19:7": {
+      "isa": [
+        "37:7"
+      ],
+      "zone": "exclude_target_human",
+      "note": "Isa 37:1-9 already adapted by the proofreader — excluded from migration."
+    },
+    "19:8": {
+      "isa": [
+        "37:8"
+      ],
+      "zone": "exclude_target_human",
+      "note": "Isa 37:1-9 already adapted by the proofreader — excluded from migration."
+    },
+    "19:9": {
+      "isa": [
+        "37:9"
+      ],
+      "zone": "exclude_target_human",
+      "note": "Isa 37:1-9 already adapted by the proofreader — excluded from migration."
+    },
+    "19:10": {
+      "isa": [
+        "37:10"
+      ],
+      "zone": "clean"
+    },
+    "19:11": {
+      "isa": [
+        "37:11"
+      ],
+      "zone": "clean"
+    },
+    "19:12": {
+      "isa": [
+        "37:12"
+      ],
+      "zone": "clean"
+    },
+    "19:13": {
+      "isa": [
+        "37:13"
+      ],
+      "zone": "clean"
+    },
+    "19:14": {
+      "isa": [
+        "37:14"
+      ],
+      "zone": "clean"
+    },
+    "19:15": {
+      "isa": [
+        "37:15",
+        "37:16"
+      ],
+      "zone": "split",
+      "note": "2Ki 19:15 is split into Isa 37:15 (prayer intro) + 37:16 (address to Yahweh)."
+    },
+    "19:16": {
+      "isa": [
+        "37:17"
+      ],
+      "zone": "clean"
+    },
+    "19:17": {
+      "isa": [
+        "37:18"
+      ],
+      "zone": "clean"
+    },
+    "19:18": {
+      "isa": [
+        "37:19"
+      ],
+      "zone": "clean"
+    },
+    "19:19": {
+      "isa": [
+        "37:20"
+      ],
+      "zone": "clean"
+    },
+    "19:20": {
+      "isa": [
+        "37:21"
+      ],
+      "zone": "clean"
+    },
+    "19:21": {
+      "isa": [
+        "37:22"
+      ],
+      "zone": "clean"
+    },
+    "19:22": {
+      "isa": [
+        "37:23"
+      ],
+      "zone": "clean"
+    },
+    "19:23": {
+      "isa": [
+        "37:24"
+      ],
+      "zone": "clean"
+    },
+    "19:24": {
+      "isa": [
+        "37:25"
+      ],
+      "zone": "clean"
+    },
+    "19:25": {
+      "isa": [
+        "37:26"
+      ],
+      "zone": "clean"
+    },
+    "19:26": {
+      "isa": [
+        "37:27"
+      ],
+      "zone": "clean"
+    },
+    "19:27": {
+      "isa": [
+        "37:28"
+      ],
+      "zone": "clean"
+    },
+    "19:28": {
+      "isa": [
+        "37:29"
+      ],
+      "zone": "clean"
+    },
+    "19:29": {
+      "isa": [
+        "37:30"
+      ],
+      "zone": "clean"
+    },
+    "19:30": {
+      "isa": [
+        "37:31"
+      ],
+      "zone": "clean"
+    },
+    "19:31": {
+      "isa": [
+        "37:32"
+      ],
+      "zone": "clean"
+    },
+    "19:32": {
+      "isa": [
+        "37:33"
+      ],
+      "zone": "clean"
+    },
+    "19:33": {
+      "isa": [
+        "37:34"
+      ],
+      "zone": "clean"
+    },
+    "19:34": {
+      "isa": [
+        "37:35"
+      ],
+      "zone": "clean"
+    },
+    "19:35": {
+      "isa": [
+        "37:36"
+      ],
+      "zone": "clean"
+    },
+    "19:36": {
+      "isa": [
+        "37:37"
+      ],
+      "zone": "clean"
+    },
+    "19:37": {
+      "isa": [
+        "37:38"
+      ],
+      "zone": "clean"
+    },
+    "20:1": {
+      "isa": [
+        "38:1"
+      ],
+      "zone": "clean"
+    },
+    "20:2": {
+      "isa": [
+        "38:2"
+      ],
+      "zone": "clean"
+    },
+    "20:3": {
+      "isa": [
+        "38:3"
+      ],
+      "zone": "clean"
+    },
+    "20:4": {
+      "isa": [
+        "38:4"
+      ],
+      "zone": "reorder",
+      "note": "Yahweh's healing response — reworded in Isaiah; verify quotes/wording."
+    },
+    "20:5": {
+      "isa": [
+        "38:5"
+      ],
+      "zone": "reorder",
+      "note": "Yahweh's healing response — reworded in Isaiah; verify quotes/wording."
+    },
+    "20:6": {
+      "isa": [
+        "38:6"
+      ],
+      "zone": "reorder",
+      "note": "Yahweh's healing response — reworded in Isaiah; verify quotes/wording."
+    },
+    "20:7": {
+      "isa": [
+        "38:21"
+      ],
+      "zone": "reorder",
+      "note": "The fig-poultice cure is moved to Isa 38:21."
+    },
+    "20:8": {
+      "isa": [
+        "38:22"
+      ],
+      "zone": "reorder",
+      "note": "Hezekiah's request for a sign is moved to Isa 38:22."
+    },
+    "20:9": {
+      "isa": [
+        "38:7",
+        "38:8"
+      ],
+      "zone": "reorder",
+      "note": "The shadow/sundial sign — heavily compressed and reworded in Isa 38:7-8; flag all."
+    },
+    "20:10": {
+      "isa": [
+        "38:7",
+        "38:8"
+      ],
+      "zone": "reorder",
+      "note": "The shadow/sundial sign — heavily compressed and reworded in Isa 38:7-8; flag all."
+    },
+    "20:11": {
+      "isa": [
+        "38:7",
+        "38:8"
+      ],
+      "zone": "reorder",
+      "note": "The shadow/sundial sign — heavily compressed and reworded in Isa 38:7-8; flag all."
+    },
+    "20:12": {
+      "isa": [
+        "39:1"
+      ],
+      "zone": "clean"
+    },
+    "20:13": {
+      "isa": [
+        "39:2"
+      ],
+      "zone": "clean"
+    },
+    "20:14": {
+      "isa": [
+        "39:3"
+      ],
+      "zone": "clean"
+    },
+    "20:15": {
+      "isa": [
+        "39:4"
+      ],
+      "zone": "clean"
+    },
+    "20:16": {
+      "isa": [
+        "39:5"
+      ],
+      "zone": "clean"
+    },
+    "20:17": {
+      "isa": [
+        "39:6"
+      ],
+      "zone": "clean"
+    },
+    "20:18": {
+      "isa": [
+        "39:7"
+      ],
+      "zone": "clean"
+    },
+    "20:19": {
+      "isa": [
+        "39:8"
+      ],
+      "zone": "clean"
+    },
+    "20:20": {
+      "isa": [],
+      "zone": "exclude_no_parallel",
+      "note": "Hezekiah's other deeds + death — no Isaiah parallel."
+    },
+    "20:21": {
+      "isa": [],
+      "zone": "exclude_no_parallel",
+      "note": "Hezekiah's other deeds + death — no Isaiah parallel."
+    }
+  }
+}

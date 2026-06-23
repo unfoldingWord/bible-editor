@@ -58,6 +58,19 @@ t("issue carries ref + rowId for jump", () => {
   assert.equal(i[0].rowId, "wxyz");
 });
 
+t("review_kind set → adapted-note flag with reason as message", () => {
+  const i = lintTnRows([tn({ ref_raw: "36:1-3", chapter: 36, verse: 1, id: "ab12", review_kind: "quote", review_reason: "Adapted from 2 Kings 18:13; verify Hebrew." })]);
+  assert.equal(i.length, 1);
+  assert.equal(i[0].check, "Adapted note — verify");
+  assert.equal(i[0].bucket, "flag");
+  assert.equal(i[0].ref, "36:1"); // chapter:verse, not the stale ref_raw range
+  assert.equal(i[0].rowId, "ab12");
+  assert.equal(i[0].message, "Adapted from 2 Kings 18:13; verify Hebrew.");
+});
+t("no review_kind → no adapted-note flag", () => {
+  assert.equal(lintTnRows([tn({ review_kind: null })]).filter((x) => x.check === "Adapted note — verify").length, 0);
+});
+
 // Build content_json from REAL usfm-js output so the test exercises the actual
 // node shape (a balanced footnote is one `{tag:"f", endTag:"f*"}` node — the
 // close lives in endTag, not as `\f*` text; the original text-node tests missed

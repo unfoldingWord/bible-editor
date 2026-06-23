@@ -102,6 +102,19 @@ export function lintTnRows(rows: TnRow[]): LintIssue[] {
     for (const msg of altLabelProblems(note)) {
       issues.push({ check: "12. Alternate translation Label", bucket: "flag", ref, rowId: r.id, message: msg });
     }
+    // Workflow-only review flag for adapted/migrated notes (review_kind set).
+    // Not a DCS check — surfaces the human-verify queue in the same chip.
+    // Use chapter:verse for the ref (ref_raw can be a stale/adapted range, and
+    // jump-to-note loads the chapter parsed from this ref).
+    if (r.review_kind) {
+      issues.push({
+        check: "Adapted note — verify",
+        bucket: "flag",
+        ref: `${r.chapter}:${r.verse}`,
+        rowId: r.id,
+        message: r.review_reason ?? "Adapted from a parallel passage — verify the Hebrew quote and wording.",
+      });
+    }
   }
   return issues;
 }

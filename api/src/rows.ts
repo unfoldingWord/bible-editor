@@ -544,6 +544,24 @@ rows.patch("/:kind/:id", requireEditor, async (c) => {
     const restoreMatches =
       (current.restored_from_version ?? null) === restoredFromVersion;
     if (allMatch && restoreMatches) {
+      // A re-save that changes no content still acknowledges a review flag:
+      // clear it (no version bump, like a bit-toggle) so the cleanup chip
+      // drops. Covers "proofreader verified the adapted quote, it was fine".
+      if (kind === "tn" && (current as unknown as TnRow).review_kind != null) {
+        const now = Math.floor(Date.now() / 1000);
+        await c.env.DB.prepare(
+          `UPDATE tn_rows SET review_kind = NULL, review_reason = NULL, updated_at = ?1
+             WHERE id = ?2${bookClause(3)}`,
+        )
+          .bind(now, id, book)
+          .run();
+        const fresh = await c.env.DB.prepare(
+          `SELECT * FROM tn_rows WHERE id = ?1${bookClause(2)}`,
+        )
+          .bind(id, book)
+          .first();
+        return c.json(fresh ?? current);
+      }
       return c.json(current);
     }
   }
@@ -596,6 +614,14 @@ rows.patch("/:kind/:id", requireEditor, async (c) => {
   const userId = currentUserId(c);
   const now = Math.floor(Date.now() / 1000);
   const setClauses = fields.map((f, i) => `${f} = ?${i + 1}`);
+  // Any TN content edit clears a pending review flag (the adapted-note verify
+  // queue). Literal NULLs — no bind params, so positional indices below are
+  // unaffected. The reorder-only fast path above returns before here, so a
+  // drag never clears a flag.
+  if (kind === "tn") {
+    setClauses.push("review_kind = NULL");
+    setClauses.push("review_reason = NULL");
+  }
   const baseParams = fields.length;
   // version bump and metadata go after the patch fields, then the WHERE
   // params (id + expected version + book) tail the bindings.

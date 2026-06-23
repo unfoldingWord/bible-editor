@@ -14,6 +14,12 @@
 
 ## Last run
 
+2026-06-23 · **inspiring-faraday** — Started the 2 Kings 18-20 → Isaiah 36-39 TN adaptation (see **In
+progress** for full detail). Track A (cleanup-chip review-flag feature: migration 0031 + lint + rows PATCH
+clear) is code-complete, API-typecheck-clean, 17 lint tests green, 0031 applied to local dev. Track B spine
+(verse map + validation) done: 236 of 305 notes migrate across 65 ISA verses. Remaining: the adaptation
+engine + AI pass + dry-run + prod deploy/load. Not committed/deployed yet.
+
 2026-06-22 · **relaxed-haslett** — Fixed the in-app **book-lint "issues to clean up" chip going stale**
 (proofreader cleaned ISA validation errors but the topbar count didn't go away until reload). Root cause:
 `useBookLint` (web/src/hooks/useBookLint.ts) fetches `GET /api/books/:book/lint` **once per book change** and
@@ -325,6 +331,29 @@ cleanly on nav with no stuck gate, back/forward + deep-link land correctly. type
 Not yet PR'd.
 
 ## In progress
+
+- **inspiring-faraday** (2026-06-23) — **Adapt 2 Kings 18-20 TN → Isaiah 36-39** (parallel-passage note
+  migration; plan at `C:\Users\benja\.claude\plans\quirky-finding-meerkat.md`, approved; reviewed twice by
+  `codex exec`). **Track A SHIPPED IN-BRANCH + verified locally:** new cleanup-chip "review flag" feature —
+  migration `0031_tn_review_flag.sql` adds `review_kind`/`review_reason` to `tn_rows` (INTERNAL — `buildTnTsv`
+  emits an explicit 7-col list so they never export; do NOT reuse `tags`, it's the exported Tags col, 652 ISA
+  rows populated); `lintTnRows` (lint.ts) emits a `flag` issue (`check:"Adapted note — verify"`, ref =
+  chapter:verse, message = review_reason) so flagged notes show in the existing "issues to clean up" chip;
+  `rows.ts` PATCH clears `review_*` on save (incl. the no-op early-return = "verified, unchanged" still clears).
+  Stored in edit_log was REJECTED by codex (AI-sweep tombstones it, 180-day retention drops it, no-op save
+  won't clear, malformed JSON breaks /lint). API typecheck clean; 17 lint tests pass; 0031 applied to LOCAL
+  dev D1 (columns confirmed). NOT yet committed/deployed (no PR per standing rule). **Track B spine DONE+validated:**
+  `scripts/build-kings-isa-versemap.mjs` → `scripts/kings-isa-versemap.json`. Of 305 2KI notes: **236 migrate**
+  (215 clean + 3 split @19:15 + 18 reorder), 43 drop (no parallel: 18:1-12, 18:14-16 tribute, 20:20-21), 23 skip
+  (target Isa 37:1-9 already human-done — user said NEVER touch). Migrated land in 65 ISA verses (36:84/37:101/
+  38:34/39:24). Hard zone = 2Ki 20:4-11 → Isa 38:4-8,21-22 (reorder/reword — every note auto-flagged).
+  **NEXT (Track B remainder, gated on a dry-run review):** `scripts/migrate-parallel-notes.mjs` — token-span
+  quote re-anchor (NFC/maqqef/`&`, exact-only, else flag); AI prose-adaptation pass via **Agent SDK subagents,
+  Sonnet 4.6** (cross-ref remap in-range / flag out-of-range, gloss align), validated; emit review doc + flags +
+  snapshot + load SQL; **dry-run for user**, then deploy Track A + apply 0031 to prod + load (insert
+  `source='parallel_migration'`, NOT ai_pipeline, so a later AI run won't sweep unreviewed flags; delete side
+  reuses `deleteUnkeptTns` predicate scoped to mapped verses, hard-excl 37:1-9 + 38:9-20). Branch
+  `claude/inspiring-faraday-15ddeb`.
 
 - **note-find-highlight** (2026-06-19, PR #246, based on #244 branch) — Highlight the active find match
   INSIDE a TN note (user follow-up to #244: matched word wasn't visible in the note column). Notes are an
