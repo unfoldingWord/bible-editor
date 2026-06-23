@@ -27,7 +27,14 @@ export interface TnDedupRow {
 // occurrence 1 and 2 that must never be deduped. tags is intentionally out of the
 // key (it's metadata, not the note's identity). This is NOT a no-op signature:
 // it deliberately omits ref_raw + tags so a re-id'd copy still collides.
-export function tnContentKey(r: TnDedupRow): string {
+export function tnContentKey(r: {
+  chapter: number;
+  verse: number;
+  occurrence: number | null;
+  support_reference?: string | null;
+  quote?: string | null;
+  note?: string | null;
+}): string {
   return JSON.stringify([
     r.chapter,
     r.verse,
