@@ -426,15 +426,9 @@ async function applyJobOutput(env: Env, job: ImportContext): Promise<ApplyResult
     // column — see docs/bp-assistant-tn-hints-contract.md. The stub keeps the
     // sort_order it was created with (it's a surviving row, already folded
     // into tnBases), so we don't consume a counter slot for it.
-    const expanded = await applyTnHintExpansionIfMatch(env, p, job, userId);
-    if (expanded) {
-      result.tnHintExpanded += 1;
-      continue;
-    }
-    // Drop a proposal whose exact content already exists live in scope (a kept
-    // note, or a prior-AI row the sweep somehow missed). Keyed on content, not
-    // id, so the fresh id bp-assistant mints each run can't sneak a duplicate
-    // past. A genuinely new/changed note has a different key and still inserts.
+    // Content key of this proposal — computed up front so a hint expansion can
+    // claim it too (the expanded stub now carries this content live, so a later
+    // identical insert proposal in the same run must be suppressed).
     const payload = JSON.parse(p.payload_json) as Record<string, unknown>;
     const contentKey = tnContentKey({
       chapter: p.chapter,
@@ -444,6 +438,18 @@ async function applyJobOutput(env: Env, job: ImportContext): Promise<ApplyResult
       quote: (payload.quote as string | null | undefined) ?? null,
       note: (payload.note as string | null | undefined) ?? null,
     });
+
+    const expanded = await applyTnHintExpansionIfMatch(env, p, job, userId);
+    if (expanded) {
+      claimedTnKeys.add(contentKey);
+      result.tnHintExpanded += 1;
+      continue;
+    }
+    // Drop a proposal whose exact content already exists live in scope (a kept
+    // note, an expanded hint, or a prior-AI row the sweep somehow missed). Keyed
+    // on content, not id, so the fresh id bp-assistant mints each run can't
+    // sneak a duplicate past. A genuinely new/changed note has a different key
+    // and still inserts.
     if (claimedTnKeys.has(contentKey)) {
       // Resolve the proposal so it doesn't linger as an unreviewed item in the
       // pending-imports review endpoint — the note it proposes already exists,
@@ -520,16 +526,27 @@ async function deleteUnkeptTns(
   // starter on every note it creates, so a re-run's notes are NOT pristine and
   // a plain `updated_by IS NULL` sweep would skip them — leaving them in place
   // while the re-run inserts a full fresh set, DOUBLING every note (ISA 36/41,
-  // 2026-06). Class (b) is identified by the row's most-recent edit_log source
-  // still being 'ai_pipeline': a later human edit (rows.ts writes a NULL-source
-  // edit_log row) or a hint expansion ('hint_expansion') flips latest_source
-  // off 'ai_pipeline', so an edited AI note is protected exactly like a human
-  // note. The reimport never rewrites an AI row (its UPDATE/prune are
-  // updated_by-IS-NULL gated), so latest_source stays 'ai_pipeline' reliably.
+  // 2026-06). Class (b) is identified by the most-recent CONTENT-bearing
+  // edit_log entry (action IN create/update) still being source 'ai_pipeline'.
+  // The action filter matters: /preserve/hint/trash toggles write NULL-source
+  // audit rows (rows.ts), so an AI note that was preserved-then-unpreserved
+  // would otherwise look human-owned (its LATEST audit row is 'unpreserve',
+  // source NULL) and dodge the sweep forever. A real human content edit writes
+  // action 'update' source NULL, and a hint expansion writes 'hint_expansion'
+  // — both correctly take the latest content action off 'ai_pipeline', so an
+  // edited / hint-owned note is protected. The reimport never rewrites an AI
+  // row (its UPDATE/prune are updated_by-IS-NULL gated), so the content source
+  // stays 'ai_pipeline' reliably.
+  //
+  // trashed_at IS NULL: a trashed AI note is left alone — the content-dedup
+  // claim set below (seeded from deleted_at IS NULL rows, which includes
+  // trashed) suppresses the AI's re-proposal of it, so it stays trashed.
+  // Sweeping it instead would delete it and let the re-insert RESURRECT it
+  // un-trashed against the user's intent.
   const targets = await env.DB.prepare(
     `SELECT id, version FROM tn_rows t
       WHERE book = ?1 AND chapter BETWEEN ?2 AND ?3
-        AND deleted_at IS NULL
+        AND deleted_at IS NULL AND trashed_at IS NULL
         AND preserve = 0 AND hint = 0
         AND (
           updated_by IS NULL
@@ -537,6 +554,7 @@ async function deleteUnkeptTns(
             SELECT source FROM edit_log
               WHERE kind = 'tn' AND row_key = t.id
                 AND (book = t.book OR book IS NULL)
+                AND action IN ('create', 'update')
               ORDER BY id DESC LIMIT 1
           ) = ?4
         )`,
@@ -561,7 +579,9 @@ async function deleteUnkeptTns(
             // change landing between the SELECT and this UPDATE must ABORT the
             // delete. A translator content edit bumps version — caught by the
             // version-CAS (`version = ?5`); a preserve/hint toggle is caught by
-            // re-asserting `preserve = 0 AND hint = 0`. (We can't re-use the old
+            // re-asserting `preserve = 0 AND hint = 0`; a trash toggle does NOT
+            // bump version (rows.ts setTnTrashed), so it needs its own
+            // `trashed_at IS NULL` re-assertion. (We can't re-use the old
             // `updated_by IS NULL` guard: a swept PRIOR-AI row already carries
             // the starter's updated_by, so that clause would abort every
             // legitimate AI-output delete.) Composite-key scoped so a
@@ -570,7 +590,7 @@ async function deleteUnkeptTns(
                SET deleted_at = ?1, version = version + 1,
                    updated_at = ?1, updated_by = ?2
              WHERE id = ?3 AND book = ?4 AND deleted_at IS NULL
-               AND preserve = 0 AND hint = 0 AND version = ?5`,
+               AND trashed_at IS NULL AND preserve = 0 AND hint = 0 AND version = ?5`,
           )
           .bind(now, userId, t.id, job.book, t.version),
         env.DB
