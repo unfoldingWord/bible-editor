@@ -547,20 +547,37 @@ rows.patch("/:kind/:id", requireEditor, async (c) => {
       // A re-save that changes no content still acknowledges a review flag:
       // clear it (no version bump, like a bit-toggle) so the cleanup chip
       // drops. Covers "proofreader verified the adapted quote, it was fine".
-      if (kind === "tn" && (current as unknown as TnRow).review_kind != null) {
+      // EXCLUDE a sort_order-only patch — a drag/reorder must not acknowledge a
+      // review (that path is handled separately below and never reaches here on
+      // a non-no-op). Guard the clear on version + deleted_at so a concurrent
+      // edit/delete in the SELECT→UPDATE window still yields 409/404, not a
+      // false 200 no-op.
+      const reorderOnly = fields.length === 1 && fields[0] === "sort_order";
+      if (kind === "tn" && !reorderOnly && (current as unknown as TnRow).review_kind != null) {
         const now = Math.floor(Date.now() / 1000);
-        await c.env.DB.prepare(
+        const res = await c.env.DB.prepare(
           `UPDATE tn_rows SET review_kind = NULL, review_reason = NULL, updated_at = ?1
-             WHERE id = ?2${bookClause(3)}`,
+             WHERE id = ?2 AND version = ?3 AND deleted_at IS NULL${bookClause(4)}`,
         )
-          .bind(now, id, book)
+          .bind(now, id, expected, book)
           .run();
+        if (res.meta.changes) {
+          const fresh = await c.env.DB.prepare(
+            `SELECT * FROM tn_rows WHERE id = ?1${bookClause(2)}`,
+          )
+            .bind(id, book)
+            .first();
+          return c.json(fresh ?? current);
+        }
+        // Row moved or was deleted between the SELECT and this UPDATE — surface
+        // the normal concurrency response instead of a stale 200.
         const fresh = await c.env.DB.prepare(
           `SELECT * FROM tn_rows WHERE id = ?1${bookClause(2)}`,
         )
           .bind(id, book)
-          .first();
-        return c.json(fresh ?? current);
+          .first<{ version: number; deleted_at: number | null }>();
+        if (!fresh || fresh.deleted_at) return c.json({ error: "not_found" }, 404);
+        return c.json({ error: "version_mismatch", current: fresh }, 409);
       }
       return c.json(current);
     }
