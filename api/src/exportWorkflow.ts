@@ -597,20 +597,35 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
   //               row_key ('{book}/{ch}/{v}/{VERSION}'), so match by suffix.
   private async contributorsFor(book: string, resource: Resource): Promise<string[]> {
     const isBible = resource === "ult" || resource === "ust";
+    // Only include editors who touched this resource since the last successful
+    // export (commit_sha IS NOT NULL). Using COALESCE(..., 0) means "include
+    // all edits" when no successful export exists yet.
     const sql = isBible
       ? `SELECT u.dcs_username AS username, MIN(e.created_at) AS first_at
            FROM edit_log e JOIN users u ON u.id = e.user_id
           WHERE e.kind = 'verse' AND e.book = ?1 AND e.source IS NULL
             AND e.row_key LIKE ?2
+            AND e.created_at > COALESCE(
+              (SELECT committed_at FROM export_snapshots
+                WHERE book = ?1 AND resource = ?3 AND commit_sha IS NOT NULL
+                ORDER BY committed_at DESC LIMIT 1),
+              0
+            )
           GROUP BY u.id
           ORDER BY first_at ASC, u.dcs_username ASC`
       : `SELECT u.dcs_username AS username, MIN(e.created_at) AS first_at
            FROM edit_log e JOIN users u ON u.id = e.user_id
           WHERE e.kind = ?1 AND e.book = ?2 AND e.source IS NULL
+            AND e.created_at > COALESCE(
+              (SELECT committed_at FROM export_snapshots
+                WHERE book = ?2 AND resource = ?1 AND commit_sha IS NOT NULL
+                ORDER BY committed_at DESC LIMIT 1),
+              0
+            )
           GROUP BY u.id
           ORDER BY first_at ASC, u.dcs_username ASC`;
     const stmt = isBible
-      ? this.env.DB.prepare(sql).bind(book, `${book}/%/${resource.toUpperCase()}`)
+      ? this.env.DB.prepare(sql).bind(book, `${book}/%/${resource.toUpperCase()}`, resource)
       : this.env.DB.prepare(sql).bind(resource, book);
     const rs = await stmt.all<{ username: string; first_at: number }>();
     return rs.results.map((r) => r.username);
