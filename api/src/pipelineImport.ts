@@ -20,6 +20,7 @@ import {
 } from "./importParsers";
 import { NT_BOOKS } from "./dcsSources";
 import { newRowId, isValidRowId } from "./rowId";
+import { tnContentKey } from "./tnDedup";
 
 interface OutputEntry {
   type?: string;
@@ -305,6 +306,9 @@ export interface ApplyResult {
   tnDeleted: number;
   tnCreated: number;
   tnHintExpanded: number;
+  // Insert proposals dropped because an identical-content note already exists
+  // live in scope (defense-in-depth content-dedup — see the loop below).
+  tnSkippedDup: number;
   tqCreated: number;
   tqUpdated: number;
   verseUpdated: number;
@@ -361,6 +365,7 @@ async function applyJobOutput(env: Env, job: ImportContext): Promise<ApplyResult
     tnDeleted: 0,
     tnCreated: 0,
     tnHintExpanded: 0,
+    tnSkippedDup: 0,
     tqCreated: 0,
     tqUpdated: 0,
     verseUpdated: 0,
@@ -370,6 +375,35 @@ async function applyJobOutput(env: Env, job: ImportContext): Promise<ApplyResult
   // there are unkept TNs in scope. Idempotent — re-running finds none left.
   if (tnProposals.length > 0) {
     result.tnDeleted = await deleteUnkeptTns(env, job, userId);
+  }
+
+  // Content-dedup claim set (defense-in-depth, layered ON TOP of the AI-aware
+  // sweep above). Seeded from the rows that SURVIVED the delete phase — kept
+  // notes (preserve/hint/human-edited) plus, if the sweep ever fails to clear a
+  // prior AI run, its leftovers — so a proposal whose exact content already
+  // exists live is dropped instead of inserted as a duplicate. tnContentKey is
+  // the same id-independent identity key the reimport's Guard 2 uses (includes
+  // occurrence; excludes id/sort_order/tags). Grown as we insert so two
+  // identical proposals in one file also collapse. This is the last line of
+  // defense against the re-run doubling (ISA 36/41): even if the sweep misses a
+  // row, its content key blocks the second copy.
+  const claimedTnKeys = new Set<string>();
+  if (tnProposals.length > 0) {
+    const live = await env.DB.prepare(
+      `SELECT chapter, verse, occurrence, support_reference, quote, note
+         FROM tn_rows
+        WHERE book = ?1 AND chapter BETWEEN ?2 AND ?3 AND deleted_at IS NULL`,
+    )
+      .bind(job.book, job.startChapter, job.endChapter)
+      .all<{
+        chapter: number;
+        verse: number;
+        occurrence: number | null;
+        support_reference: string | null;
+        quote: string | null;
+        note: string | null;
+      }>();
+    for (const r of live.results ?? []) claimedTnKeys.add(tnContentKey(r));
   }
 
   // sort_order assignment. Proposals arrive ordered (chapter, verse, id) where
@@ -397,6 +431,32 @@ async function applyJobOutput(env: Env, job: ImportContext): Promise<ApplyResult
       result.tnHintExpanded += 1;
       continue;
     }
+    // Drop a proposal whose exact content already exists live in scope (a kept
+    // note, or a prior-AI row the sweep somehow missed). Keyed on content, not
+    // id, so the fresh id bp-assistant mints each run can't sneak a duplicate
+    // past. A genuinely new/changed note has a different key and still inserts.
+    const payload = JSON.parse(p.payload_json) as Record<string, unknown>;
+    const contentKey = tnContentKey({
+      chapter: p.chapter,
+      verse: p.verse,
+      occurrence: (payload.occurrence as number | null | undefined) ?? null,
+      support_reference: (payload.support_reference as string | null | undefined) ?? null,
+      quote: (payload.quote as string | null | undefined) ?? null,
+      note: (payload.note as string | null | undefined) ?? null,
+    });
+    if (claimedTnKeys.has(contentKey)) {
+      // Resolve the proposal so it doesn't linger as an unreviewed item in the
+      // pending-imports review endpoint — the note it proposes already exists,
+      // so accepting (without inserting) is the truthful resolution.
+      await env.DB.prepare(
+        `UPDATE pending_imports SET accepted_at = unixepoch(), accepted_by = ?2 WHERE id = ?1`,
+      )
+        .bind(p.id, userId)
+        .run();
+      result.tnSkippedDup += 1;
+      continue;
+    }
+    claimedTnKeys.add(contentKey);
     const k = verseKey(p);
     const sortOrder = (tnCounters.get(k) ?? tnBases.get(k) ?? 0) + 100;
     tnCounters.set(k, sortOrder);
@@ -453,13 +513,35 @@ async function deleteUnkeptTns(
   // preserve=1 rows are translator-marked "keep through AI runs"; hint=1
   // rows are stubs queued for in-place expansion by the AI — both must
   // survive the sweep.
+  //
+  // Two classes are swept: (a) pristine rows the AI never touched
+  // (updated_by IS NULL — the original bootstrap/reimport notes), and (b) the
+  // PRIOR AI run's own output. applyTnInsert stamps updated_by = the pipeline
+  // starter on every note it creates, so a re-run's notes are NOT pristine and
+  // a plain `updated_by IS NULL` sweep would skip them — leaving them in place
+  // while the re-run inserts a full fresh set, DOUBLING every note (ISA 36/41,
+  // 2026-06). Class (b) is identified by the row's most-recent edit_log source
+  // still being 'ai_pipeline': a later human edit (rows.ts writes a NULL-source
+  // edit_log row) or a hint expansion ('hint_expansion') flips latest_source
+  // off 'ai_pipeline', so an edited AI note is protected exactly like a human
+  // note. The reimport never rewrites an AI row (its UPDATE/prune are
+  // updated_by-IS-NULL gated), so latest_source stays 'ai_pipeline' reliably.
   const targets = await env.DB.prepare(
-    `SELECT id, version FROM tn_rows
+    `SELECT id, version FROM tn_rows t
       WHERE book = ?1 AND chapter BETWEEN ?2 AND ?3
-        AND updated_by IS NULL AND deleted_at IS NULL
-        AND preserve = 0 AND hint = 0`,
+        AND deleted_at IS NULL
+        AND preserve = 0 AND hint = 0
+        AND (
+          updated_by IS NULL
+          OR (
+            SELECT source FROM edit_log
+              WHERE kind = 'tn' AND row_key = t.id
+                AND (book = t.book OR book IS NULL)
+              ORDER BY id DESC LIMIT 1
+          ) = ?4
+        )`,
   )
-    .bind(job.book, job.startChapter, job.endChapter)
+    .bind(job.book, job.startChapter, job.endChapter, AI_SOURCE)
     .all<{ id: string; version: number }>();
   const list = targets.results ?? [];
   if (list.length === 0) return 0;
@@ -474,20 +556,23 @@ async function deleteUnkeptTns(
       stmts.push(
         env.DB
           .prepare(
-            // Re-assert the pristine predicate at write time, not just in the
+            // Re-assert the safety predicate at write time, not just in the
             // SELECT above: TN edits are allowed mid-pipeline (rows.ts), so a
-            // translator content edit (sets updated_by + bumps version) or a
-            // preserve/hint toggle that lands between the SELECT and this
-            // UPDATE must ABORT the delete. Without these clauses the sweep
-            // deletes a row the user just claimed. Composite-key scoped so a
+            // change landing between the SELECT and this UPDATE must ABORT the
+            // delete. A translator content edit bumps version — caught by the
+            // version-CAS (`version = ?5`); a preserve/hint toggle is caught by
+            // re-asserting `preserve = 0 AND hint = 0`. (We can't re-use the old
+            // `updated_by IS NULL` guard: a swept PRIOR-AI row already carries
+            // the starter's updated_by, so that clause would abort every
+            // legitimate AI-output delete.) Composite-key scoped so a
             // colliding-id row in another book is never touched.
             `UPDATE tn_rows
                SET deleted_at = ?1, version = version + 1,
                    updated_at = ?1, updated_by = ?2
              WHERE id = ?3 AND book = ?4 AND deleted_at IS NULL
-               AND updated_by IS NULL AND preserve = 0 AND hint = 0`,
+               AND preserve = 0 AND hint = 0 AND version = ?5`,
           )
-          .bind(now, userId, t.id, job.book),
+          .bind(now, userId, t.id, job.book, t.version),
         env.DB
           .prepare(
             // Audit only if the UPDATE above actually tombstoned this row in
