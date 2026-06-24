@@ -545,10 +545,22 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     [tileSet],
   );
 
-  const availableVersions = useMemo(
-    () => (versesForTiles ? Object.keys(versesForTiles) : []),
-    [versesForTiles],
-  );
+  const availableVersions = useMemo(() => {
+    const set = new Set<string>(versesForTiles ? Object.keys(versesForTiles) : []);
+    // Book mode spans the whole book, so the version set must not collapse when
+    // the active chapter is a front-matter chapter (chapter 0) that carries
+    // notes but no scripture verses — Find can navigate there (the book-intro
+    // note sorts first). Without the union, availableVersions is [] →
+    // displayedVersions is [] → BookView renders no columns and every chapter's
+    // verseNums is empty: a blank book view that looks like the app crashed.
+    if (mode === "book" && bookHook) {
+      for (const cs of bookHook.chapters.values()) {
+        if (cs.kind !== "ready") continue;
+        for (const v of Object.keys(cs.data.verses)) set.add(v);
+      }
+    }
+    return [...set];
+  }, [versesForTiles, mode, bookHook?.chapters]);
 
   // Range-aware lookup: ChapterPayload.verses is keyed by verse_start, so a
   // row anchored mid-bridge (e.g. verse 9 of a `\v 8-9` row) misses a direct

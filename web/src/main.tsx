@@ -3,6 +3,7 @@ import ReactDOM from "react-dom/client";
 import { ThemeProvider, CssBaseline } from "@mui/material";
 import { makeTheme, ThemeModeContext, type ThemeMode } from "./theme";
 import { App } from "./App";
+import { AppErrorBoundary } from "./components/AppErrorBoundary";
 import { installCurlyQuotes } from "./lib/curlyQuotes";
 
 installCurlyQuotes();
@@ -44,7 +45,9 @@ function Root() {
     <ThemeModeContext.Provider value={ctx}>
       <ThemeProvider theme={theme}>
         <CssBaseline />
-        <App />
+        <AppErrorBoundary>
+          <App />
+        </AppErrorBoundary>
       </ThemeProvider>
     </ThemeModeContext.Provider>
   );

@@ -14,6 +14,20 @@
 
 ## Last run
 
+2026-06-24 · **objective-kilby** — Fixed "Find in book mode blanks the page / bumps me out." Root cause
+(reproduced live, ZEC seeded): Find's results sort the **book-intro note at chapter 0** first; pressing
+Enter/Next navigates there (`#/ZEC/0`). Chapter 0 (front matter) has a note but **no scripture verses**, so
+`availableVersions = Object.keys(data.verses)` for the active chapter was `[]` → `displayedVersions = []` →
+`BookView` got zero columns and every chapter's `verseNums` was empty: blank scripture column, reading
+position lost. **Fix (Shell.tsx):** in book mode `availableVersions` now unions versions across all loaded
+book chapters, so a notes-only front-matter active chapter can't collapse the whole book view. **Also added
+`AppErrorBoundary` (main.tsx):** the app had NO error boundary anywhere, so any uncaught render error blanked
+everything — notably stale `React.lazy` chunks (BookView / FindReplaceOverlay) after a deploy, which Suspense
+does NOT catch. Boundary auto-reloads once on a chunk-load error (15s guard against loops; matches both
+"Failed to fetch dynamically imported module" AND the Cloudflare-[assets] SPA-fallback MIME error "Failed to
+load module script…"), else shows a recoverable "Reload" screen. All paths browser-verified; typecheck clean.
+PR opened off `claude/objective-kilby-fa7b66`. Not yet deployed.
+
 2026-06-24 · **inspiring-faraday (follow-ups)** — Two scoped prod ops after the main migration.
 **(1) Isa 38:9-20 swap:** the user regenerated the Hezekiah-psalm AI notes on en_tn master (Hebrew-aligned,
 new ids ywad/rnsj/…). `scripts/import-isa-3820.mjs` (forced upsert+prune by DCS id, SCOPED to 38:9-20,
