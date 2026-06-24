@@ -250,6 +250,23 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       }
     };
   }, [book, scheduleLintRefetch]);
+  // Self-heal a stale "issues to clean up" chip: when the tab regains focus or
+  // becomes visible, re-pull the lint. A tab left open while edits land (here,
+  // in another tab, on another device, or via an out-of-band fix) otherwise
+  // shows a frozen count until a manual reload — the symptom that flagged-note
+  // saves "weren't clearing." Reuses the debounced refetch, so a quick blur/
+  // focus flurry coalesces into one request.
+  useEffect(() => {
+    const refresh = () => {
+      if (document.visibilityState === "visible") scheduleLintRefetch();
+    };
+    window.addEventListener("focus", refresh);
+    document.addEventListener("visibilitychange", refresh);
+    return () => {
+      window.removeEventListener("focus", refresh);
+      document.removeEventListener("visibilitychange", refresh);
+    };
+  }, [scheduleLintRefetch]);
   const [activeVerse, setActiveVerse] = useState(initialVerse);
   const [activeNoteId, setActiveNoteId] = useState<string | null>(null);
   const [activeWordId, setActiveWordId] = useState<string | null>(null);

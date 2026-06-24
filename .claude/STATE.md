@@ -14,6 +14,20 @@
 
 ## Last run
 
+2026-06-24 · **inspiring-faraday (follow-ups)** — Two scoped prod ops after the main migration.
+**(1) Isa 38:9-20 swap:** the user regenerated the Hezekiah-psalm AI notes on en_tn master (Hebrew-aligned,
+new ids ywad/rnsj/…). `scripts/import-isa-3820.mjs` (forced upsert+prune by DCS id, SCOPED to 38:9-20,
+handles composite-PK `(id,book)` collisions, safety-reports preserve/hint) → pruned 27 old, inserted 57 new
+(updated_by=NULL = clean master-backed, source='isa_3820_swap'); 0 protected, 0 collisions. Applied via 3
+segments. **(2) Chapter intros — provenance-gated:** checked first per the user — **Isa 36:intro (arr9 +
+nuia) + 37:intro (vy96) are HUMAN-EDITED (updated_by=31, edit_log update/source=null) → NOT touched.**
+38:intro (cgq6) + 39:intro (lz5x) pristine. Adapted the 2Ki 20 intro (figs/illness) onto **Isa 38 intro
+(cgq6)**, minimal pass, flagged review_kind='adapted-intro' (`scripts/build-intro-sql.mjs`). Isa 39 intro
+left (2Ki 20 intro has no envoy content). **2Ki 18/19 intro material (incl. the quotation-levels discussion
+the migrated notes reference) NOT folded into the human-edited Isa 36/37 intros — left for the user.**
+Final prod: ISA 36-39 = 328 live, 43 flagged. NB classifier (shell auto-approval) had a multi-hour transient
+outage mid-task; both scripts were prepped offline and run once it cleared.
+
 2026-06-23 (late) · **inspiring-faraday** — **SHIPPED + LOADED TO PROD.** PR #261 merged (Codex-reviewed:
 2 blocking — no-op review-clear now excludes reorder-only + version/deleted_at-guarded; load preflight done).
 Migration 0031 applied to prod; worker deployed (version 40695761). **Deterministic load applied to prod D1**
