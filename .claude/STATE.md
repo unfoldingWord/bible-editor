@@ -14,6 +14,32 @@
 
 ## Last run
 
+2026-06-24 · **xenodochial-almeida** — **Cleared the nightly export's HAB TN block** (two banners:
+`export_shrink:HAB:tn` render 4 vs master 252, and `export_stale:HAB:tn` master vs synced). **Prod DATA
+repair, no code change.** Root cause = **truncated-fetch prune on two consecutive nights** (06-23 05:34 +
+06-24 05:42, all 559 deletes `source='dcs_reimport'`): a short master fetch loaded ~1 row, `softDeleteRemovedTsvRows`
+soft-deleted every pristine row not in it → D1 left with **4 live** (1 pristine front-intro that was in the
+truncated fetch + 3 human chapter-intros `ehfp/nc48/dtwb` updated_by=35, correctly spared by the pristine
+predicate) + **559 tombstones**. Master `tn_HAB.tsv` healthy (252 rows @ `f71496f7`); cross-ref: 4 live, **248
+tombstoned, 0 absent**. tq(38)/twl(220)/ult(59)/ust(59) all in sync — **only tn damaged**. **KEY GOTCHA: the
+alert's prescribed "re-sync from master" does NOT work** — the reimport treats `deleted_at IS NOT NULL` as
+non-pristine, so the UPDATE is skipped and `INSERT … ON CONFLICT(id,book) DO NOTHING` is blocked by the
+tombstone → all 248 skipped, D1 stays at 4. **Fix (3 prod writes, user-approved each):** (1) `scripts/out/resurrect-hab-tn.sql`
+— one guarded UPDATE clearing `deleted_at` on the 248 master-carried tombstones (pristine-only) + audit → 252
+live. (2) Tried the reimport (`{"book":"HAB","reimportOnly":true}`) but it **SHA-skipped** (watermark already =
+`f71496f7`, stamped by the truncated 06-24 nightly onto a short body — the twl_PSA pattern), so resurrecting
+alone left **131/252 rows lagging master** (mostly the Hebrew `quote` field, master's "Quote fixes"). **Couldn't
+fix via reimport** (SHA-gated; re-fetch risks ANOTHER truncated prune — `fetchText`'s guard only catches short-vs-
+*declared* Content-Length, and HAB slipped through it twice → DCS raw likely omits Content-Length). So (3)
+`scripts/out/load-hab-tn.sql` — 131 guarded full-row UPDATEs from the **locally-verified** master TSV (no fetch),
+pristine-only (3 human intros untouched). Re-diff: **252 live, 0 substantive, 0 format-only — D1 == master
+exactly.** (4) Export `{"book":"HAB","resource":"tn"}`: pre-sync SHA-skipped (no re-prune), freshness + shrink
+guards passed, render **252 rows byte-matches master → `dcsSkippedReason:"unchanged"`, no PR** (correct — fully
+converged). No HAB banners remain. **Latent code gaps (follow-up):** (a) reimport can't self-heal a
+tombstoned-but-master-present row; (b) `fetchText` truncation guard is bypassed when DCS raw omits Content-Length
+— the reimport then stamps a watermark on a partial body (HAB hit this twice post-twl_PSA-fix). Repair SQL kept
+at `scripts/out/{resurrect,load}-hab-tn.sql`.
+
 2026-06-24 · **inspiring-faraday (follow-ups)** — Two scoped prod ops after the main migration.
 **(1) Isa 38:9-20 swap:** the user regenerated the Hezekiah-psalm AI notes on en_tn master (Hebrew-aligned,
 new ids ywad/rnsj/…). `scripts/import-isa-3820.mjs` (forced upsert+prune by DCS id, SCOPED to 38:9-20,
