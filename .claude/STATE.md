@@ -14,6 +14,26 @@
 
 ## Last run
 
+2026-06-23 (late) · **inspiring-faraday** — **SHIPPED + LOADED TO PROD.** PR #261 merged (Codex-reviewed:
+2 blocking — no-op review-clear now excludes reorder-only + version/deleted_at-guarded; load preflight done).
+Migration 0031 applied to prod; worker deployed (version 40695761). **Deterministic load applied to prod D1**
+(snapshot saved scripts/out/kings-isa/snapshot-ISA-36-39.json; 5664 existing ISA ids excluded → 0 id
+collisions; 0 preserve/hint rows in target verses): soft-deleted 207 live notes in 65 target verses, inserted
+236 adapted notes (source='parallel_migration'). **Verified prod: 298 live ISA 36-39 notes, 156 flagged (in
+cleanup chip), 37:1-9=23 untouched, 38:9-20=27 untouched.** **AI ENHANCEMENT LOOP COMPLETE (overnight):**
+Sonnet via Agent SDK adapted all 156 flagged notes in 15 verse-batches (build-ai-batches.mjs → 15
+subagents → validate-ai.mjs). Re-anchored **139 quotes to EXACT Isaiah UHB spans (0 hallucinated** — every
+AI quote hard-validated as a real Isaiah substring; invalid→fallback+keep-flag), reworded dropped
+cross-refs to prose, flagged 4 as likely-inapplicable. Applied to prod (update-ai-ISA.sql, 3 segments;
+seg002 needed a retry on the flaky link — "Not currently importing anything" is a transient D1
+import-session error, re-runs clean). **FINAL prod state: 298 live, 44 flagged** (16 reorder-zone + 16
+med-confidence + 8 quote-anchor + 4 delete-candidates), down from 156. Morning worklist:
+scripts/out/kings-isa/MORNING-WORKLIST.md. Rollback artifacts: snapshot-ISA-36-39.json (pre-migration) +
+adapt-batch.json (deterministic baseline). Tooling committed locally (512d13d1) on the merged branch —
+needs a fresh follow-up PR (build-ai-batches/validate-ai/split-sql.mjs). **Lesson:** coerceRowId mints from
+a geometric hash progression (mod 31) → only ~700 distinct ids, unusable for bulk minting; mint from
+independent hash bit-slices instead.
+
 2026-06-23 · **inspiring-faraday** — Started the 2 Kings 18-20 → Isaiah 36-39 TN adaptation (see **In
 progress** for full detail). Track A (cleanup-chip review-flag feature: migration 0031 + lint + rows PATCH
 clear) is code-complete, API-typecheck-clean, 17 lint tests green, 0031 applied to local dev. Track B spine
