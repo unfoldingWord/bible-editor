@@ -22,7 +22,7 @@ import { useLexicon } from "../hooks/useLexicon";
 import { useAiDrafts } from "../hooks/useAiDrafts";
 import { outbox } from "../sync/outbox";
 import { api } from "../sync/api";
-import type { BookLintIssue, ChapterPayload, TnRow, TqRow, TwlRow, VerseDto } from "../sync/api";
+import type { BookLintIssue, ChapterPayload, TnRow, TqRow, TwlRow, VerseDto, TwlSuggestion } from "../sync/api";
 import { drafts, verseKey } from "../sync/drafts";
 import { smartEditVerse } from "../lib/replace";
 import { extractEditableText, extractPlainText, normalizeEditable, SECTION_HEADER_TAGS } from "../lib/usfm";
@@ -36,6 +36,7 @@ import { buildVerseIndex, concatSourceRange, formatVerseLabel } from "../lib/ver
 import { buildTnQuickRequest } from "../lib/tnQuickRequest";
 import { findSourceForTargetText, extractTargetSelectionText, type HighlightKey, type ReorderHighlight } from "../lib/highlight";
 import { buildQuoteFromSelection, selectionFromQuote } from "../lib/quoteBuilder";
+import { resolveSpanToSource } from "../lib/twlResolve";
 import { nfc } from "../lib/hebrew";
 import { TimelineRail } from "./TimelineRail";
 import { ScriptureColumn, type ScriptureMode } from "./ScriptureColumn";
@@ -926,6 +927,50 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     setQuoteBuildTarget(null);
     setQuoteBuildSelectedKeys(new Set());
   }, [quoteBuildTarget, quoteBuildSelectedKeys, data, verseIndexByVersion]);
+
+  // Promote a per-verse TWL suggestion to a real link. Resolve its matched ULT
+  // English span to an OL quote + occurrence against the verse alignment
+  // (best-effort), create the twl row, and — when the resolution is unsure or
+  // empty — open the quote-builder on the new row so the editor confirms. Always
+  // goes through createRow("twl") so chapter locks / concurrency are respected.
+  const handleAddTwlSuggestion = useCallback(
+    async (s: TwlSuggestion, chosenArticleId: string) => {
+      if (!data) return;
+      const verse = activeVerse;
+      const grab = (bv: string): unknown[] | undefined => {
+        const vo = (verseIndexByVersion[bv]?.[verse]?.content as { verseObjects?: unknown[] } | null)
+          ?.verseObjects;
+        return Array.isArray(vo) ? vo : undefined;
+      };
+      const ult = grab("ULT");
+      const uhb = grab("UHB") ?? grab("UGNT");
+      const resolved = resolveSpanToSource(ult, uhb, s.matchedText, s.glOccurrence);
+
+      const twLink = `rc://*/tw/dict/bible/${chosenArticleId}`;
+      const list = sortedForVerse(data.twl, verse);
+      const sort_order = pickSortOrder(list, null, "after");
+      const created = await api.createRow<TwlRow>("twl", {
+        book,
+        chapter,
+        verse,
+        ref_raw: verse === 0 ? `${chapter}:intro` : `${chapter}:${verse}`,
+        orig_words: resolved?.orig_words ?? "",
+        occurrence: resolved?.occurrence ?? 1,
+        tw_link: twLink,
+        ...(s.tag ? { tags: s.tag } : {}),
+        sort_order,
+      });
+      applyLocalRowInsert("twl", created);
+      setActiveWordId(created.id);
+      setActiveNoteId(null);
+      // Low-confidence (or no source resolved) → let the human verify/complete
+      // the quote in the picker, pre-seeded with whatever did resolve.
+      if (!resolved || !resolved.confident || !resolved.orig_words) {
+        startQuoteBuild({ kind: "twl", id: created.id });
+      }
+    },
+    [data, activeVerse, verseIndexByVersion, book, chapter, startQuoteBuild],
+  );
 
   // Routes any verse / version / aligner-target change through the dirty
   // gate when the alignment panel has unsaved drags. Plain wrapper around
@@ -1985,6 +2030,8 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           }}
         >
         <ResourceColumn
+          book={book}
+          chapter={chapter}
           activeVerse={activeVerse}
           displayVerseRange={displayVerseRange}
           tn={data.tn}
@@ -2243,6 +2290,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           quoteBuildAppliedTo={quoteBuildAppliedTo}
           onStartQuoteBuild={(noteId) => startQuoteBuild({ kind: "tn", id: noteId })}
           onStartWordQuoteBuild={(wordId) => startQuoteBuild({ kind: "twl", id: wordId })}
+          onAddTwlSuggestion={handleAddTwlSuggestion}
           panelMode={panelMode}
           onSetPanelMode={handleSetPanelMode}
           alignmentProps={alignmentTabProps}

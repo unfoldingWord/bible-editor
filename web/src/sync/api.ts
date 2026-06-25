@@ -661,6 +661,17 @@ export interface Catalogs {
   twLinks: string[];
 }
 
+// One per-verse TWL suggestion from GET /api/twl-suggestions/:book/:ch/:v.
+// Mirrors api/src/twlSuggest.ts TwlSuggestion.
+export interface TwlSuggestion {
+  matchedText: string;
+  glOccurrence: number;
+  articleId: string;
+  twLink: string;
+  tag: string;
+  disambiguation: string[];
+}
+
 // One curated note template for a support reference. `type` is the variant
 // label from the sheet ("generic", "plural", …); empty string is the default
 // unnamed variant.
@@ -948,6 +959,15 @@ export const api = {
     request<BookLintReport>(`/api/books/${encodeURIComponent(book)}/lint`, { signal }),
 
   getCatalogs: () => request<Catalogs>(`/api/catalogs`),
+
+  // Per-verse TWL suggestions (links the verse doesn't already carry). The
+  // server scans the ULT with the en_tw headword matcher; the client resolves
+  // each match's English span to an OL quote + occurrence via twlResolve.
+  getTwlSuggestions: (book: string, chapter: number, verse: number, signal?: AbortSignal) =>
+    request<{ suggestions: TwlSuggestion[] }>(
+      `/api/twl-suggestions/${encodeURIComponent(book)}/${chapter}/${verse}`,
+      { signal },
+    ),
 
   getNoteTemplates: () => request<NoteTemplatesResponse>(`/api/note-templates`),
 

@@ -8,7 +8,7 @@
     "build": "tsc -b && vite build",
     "preview": "vite preview",
     "typecheck": "tsc -b --noEmit",
-    "test": "node --experimental-strip-types --no-warnings src/lib/alignment.test.mjs && node --experimental-strip-types --no-warnings src/lib/alignmentDelta.test.mjs && node --experimental-strip-types --no-warnings src/lib/morph.test.mjs && node --experimental-strip-types --no-warnings src/lib/replace.test.mjs && node --experimental-strip-types --no-warnings src/lib/sourceOccurrences.test.mjs && node --experimental-strip-types --no-warnings src/lib/wordDiff.test.mjs"
+    "test": "node --experimental-strip-types --no-warnings src/lib/alignment.test.mjs && node --experimental-strip-types --no-warnings src/lib/alignmentDelta.test.mjs && node --experimental-strip-types --no-warnings src/lib/morph.test.mjs && node --experimental-strip-types --no-warnings src/lib/replace.test.mjs && node --experimental-strip-types --no-warnings src/lib/sourceOccurrences.test.mjs && node --experimental-strip-types --no-warnings src/lib/wordDiff.test.mjs && node --experimental-strip-types --no-warnings src/lib/twlResolve.test.mjs"
   },
   "dependencies": {
     "@emotion/react": "^11.13.0",
