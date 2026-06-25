@@ -27,9 +27,11 @@ occ1 + keyterm tag confidently. **Codex review (manual + PR-open hook) → 3 fix
 OL↔GL occurrence so a server count mis-identified/duplicated; route now returns all matches + Shell
 `isTwlSuggestionExcluded` filters; (b) disambiguation Tags now follow the CHOSEN article's category; (c) low-confidence
 picker pre-seed reads resolved orig_words directly, not the stale (pre-insert) data snapshot. typecheck + api/web tests
-+ build all green. **DEPLOY NOTE after merge:** apply migration 0032 to prod + run import-tw.mjs → load import-tw.sql
-to prod D1 (until seeded, catalog falls back to usage-derived links and suggestions are empty). Memory:
-[[project_twl_generation_into_app]].
++ build all green. **PROD SEED DONE (2026-06-25):** migration 0032 applied to prod D1 (`bible_editor`,
+`7e566abf…`; was the only pending, no collision) + tw_articles seeded with **953 articles** (190 kt/355 names/408
+other) via import-tw.sql. Harmless until deploy — the LIVE worker still runs pre-PR code (old catalogs.ts ignores
+tw_articles; /api/twl-suggestions route not deployed). **ONLY REMAINING: merge #267 + `npm run deploy`** (wrangler
+deploy --env production) to make the feature live; data is already in place. Memory: [[project_twl_generation_into_app]].
 
 2026-06-25 · **great-shamir** — **Bringing Rich's TWL generation into the app (Beth/Rich Zulip ask).** Deep
 feasibility + Codex review + approved plan (`C:\Users\benja\.claude\plans\immutable-snuggling-snowflake.md`,
