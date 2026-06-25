@@ -144,6 +144,8 @@ interface Props {
   // Promote a per-verse TWL suggestion to a real link (resolve + createRow). When
   // absent, the Suggestions section hides.
   onAddTwlSuggestion?: (suggestion: TwlSuggestion, chosenArticleId: string) => void;
+  // Drop suggestions already linked on the active verse (resolved-OL identity).
+  isTwlSuggestionExcluded?: (suggestion: TwlSuggestion) => boolean;
   // Per-note commit signal — its nonce bumps when a quote-build commits for
   // that note, telling the matching card to land the built quote in the box.
   quoteBuildAppliedTo?: { noteId: string; nonce: number } | null;
@@ -266,6 +268,7 @@ export function ResourceColumn({
   onStartQuoteBuild,
   onStartWordQuoteBuild,
   onAddTwlSuggestion,
+  isTwlSuggestionExcluded,
   quoteBuildAppliedTo,
   panelMode = "resources",
   onSetPanelMode,
@@ -738,8 +741,9 @@ export function ResourceColumn({
                 book={book}
                 chapter={chapter}
                 verse={activeVerse}
-                refreshKey={twlForVerse.map((r) => r.tw_link ?? "").join("|")}
+                refreshKey={twlForVerse.map((r) => `${r.tw_link ?? ""}|${r.orig_words ?? ""}|${r.occurrence ?? 1}`).join("~")}
                 onAdd={onAddTwlSuggestion}
+                isExcluded={isTwlSuggestionExcluded}
                 locked={locked}
               />
             )}

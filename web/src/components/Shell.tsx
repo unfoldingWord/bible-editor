@@ -947,6 +947,12 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       const resolved = resolveSpanToSource(ult, uhb, s.matchedText, s.glOccurrence);
 
       const twLink = `rc://*/tw/dict/bible/${chosenArticleId}`;
+      // Tag follows the CHOSEN article's category, not the server's primary — a
+      // disambiguation pick can cross categories (e.g. kt/lawofmoses vs other/law),
+      // and the TWL Tags column must match the link actually written.
+      const chosenCategory = chosenArticleId.split("/")[0];
+      const tag =
+        chosenCategory === "kt" ? "keyterm" : chosenCategory === "names" ? "name" : "";
       const list = sortedForVerse(data.twl, verse);
       const sort_order = pickSortOrder(list, null, "after");
       const created = await api.createRow<TwlRow>("twl", {
@@ -957,19 +963,60 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         orig_words: resolved?.orig_words ?? "",
         occurrence: resolved?.occurrence ?? 1,
         tw_link: twLink,
-        ...(s.tag ? { tags: s.tag } : {}),
+        ...(tag ? { tags: tag } : {}),
         sort_order,
       });
       applyLocalRowInsert("twl", created);
       setActiveWordId(created.id);
       setActiveNoteId(null);
-      // Low-confidence (or no source resolved) → let the human verify/complete
-      // the quote in the picker, pre-seeded with whatever did resolve.
+      // Low-confidence (or nothing resolved) → open the picker on the new row so
+      // the editor verifies/completes the quote. Seed the selection directly from
+      // what DID resolve, NOT by re-finding the row via startQuoteBuild — the
+      // just-inserted row isn't in `data` yet (applyLocalRowInsert's setState
+      // hasn't flushed), so a row lookup would pre-seed empty. quoteBuildContext +
+      // the anchor effect pick the row up on the next render.
       if (!resolved || !resolved.confident || !resolved.orig_words) {
-        startQuoteBuild({ kind: "twl", id: created.id });
+        setQuoteBuildTarget({ kind: "twl", id: created.id });
+        setQuoteBuildSelectedKeys(
+          selectionFromQuote(uhb, resolved?.orig_words, resolved?.occurrence),
+        );
       }
     },
-    [data, activeVerse, verseIndexByVersion, book, chapter, startQuoteBuild],
+    [data, activeVerse, verseIndexByVersion, book, chapter],
+  );
+
+  // Whether a per-verse suggestion is already linked on the active verse. Done
+  // client-side (not on the suggest route) because the match is by RESOLVED
+  // original-language identity (tw_link, orig_words, occurrence): the existing
+  // TWL row stores the OL occurrence, which the server can't derive from the
+  // English-text occurrence without the alignment. Unresolvable suggestions fall
+  // back to a conservative "tw_link already present" check.
+  const isTwlSuggestionExcluded = useCallback(
+    (s: TwlSuggestion): boolean => {
+      if (!data) return false;
+      const verse = activeVerse;
+      const rows = data.twl.filter((r) => r.verse === verse && r.deleted_at == null);
+      if (rows.length === 0) return false;
+      const grab = (bv: string): unknown[] | undefined => {
+        const vo = (verseIndexByVersion[bv]?.[verse]?.content as { verseObjects?: unknown[] } | null)
+          ?.verseObjects;
+        return Array.isArray(vo) ? vo : undefined;
+      };
+      const resolved = resolveSpanToSource(
+        grab("ULT"),
+        grab("UHB") ?? grab("UGNT"),
+        s.matchedText,
+        s.glOccurrence,
+      );
+      if (resolved) {
+        const key = `${s.twLink}|${nfc(resolved.orig_words)}|${resolved.occurrence}`;
+        return rows.some(
+          (r) => `${r.tw_link}|${nfc(r.orig_words ?? "")}|${r.occurrence ?? 1}` === key,
+        );
+      }
+      return rows.some((r) => r.tw_link === s.twLink);
+    },
+    [data, activeVerse, verseIndexByVersion],
   );
 
   // Routes any verse / version / aligner-target change through the dirty
@@ -2291,6 +2338,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           onStartQuoteBuild={(noteId) => startQuoteBuild({ kind: "tn", id: noteId })}
           onStartWordQuoteBuild={(wordId) => startQuoteBuild({ kind: "twl", id: wordId })}
           onAddTwlSuggestion={handleAddTwlSuggestion}
+          isTwlSuggestionExcluded={isTwlSuggestionExcluded}
           panelMode={panelMode}
           onSetPanelMode={handleSetPanelMode}
           alignmentProps={alignmentTabProps}

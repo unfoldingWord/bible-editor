@@ -74,23 +74,17 @@ twlSuggest.get("/:book/:chapter/:verse", async (c) => {
   const trie = await getTrie(c.env);
   const matches = scanVerseMatches(text, trie);
 
-  // Links already on this verse — never re-suggest them. Counted (not just a
-  // set) so a term that occurs N times but is only linked M<N times still gets
-  // its remaining N−M occurrences suggested (uW writes one TWL row per
-  // occurrence). We "spend" one existing link per matched occurrence in
-  // document order, then suggest the rest.
-  const existing = await c.env.DB.prepare(
-    `SELECT tw_link, COUNT(*) AS n FROM twl_rows WHERE book = ? AND chapter = ? AND verse = ? AND deleted_at IS NULL AND tw_link IS NOT NULL GROUP BY tw_link`,
-  )
-    .bind(book, chapter, verse)
-    .all<{ tw_link: string; n: number }>();
-  const remainingExisting = new Map<string, number>();
-  for (const r of existing.results) remainingExisting.set(r.tw_link, r.n);
-
-  // GL occurrence counts every match of an exact span (case-insensitive) in
-  // document order — incremented before the exclude check so it stays the true
-  // Nth occurrence in the verse (what the client resolver needs to pick the
-  // right instance), regardless of which occurrences are already linked.
+  // glOccurrence: the 1-based index of each exact (case-insensitive) span among
+  // its occurrences in the verse, in document order. The client resolver uses it
+  // to pick the right instance.
+  //
+  // Excluding links the verse already has is done CLIENT-side (Shell
+  // isTwlSuggestionExcluded), not here: an existing TWL row stores the
+  // ORIGINAL-language occurrence, which can't be mapped to this English-text
+  // occurrence on the server without the alignment. A server-side count would
+  // mis-identify which occurrence is covered and could re-suggest an
+  // already-linked one (or hide an unlinked occurrence). So the route returns
+  // every match and the client filters by resolved (tw_link, orig_words, occurrence).
   const occCount = new Map<string, number>();
   const suggestions: TwlSuggestion[] = [];
   for (const m of matches) {
@@ -100,19 +94,12 @@ twlSuggest.get("/:book/:chapter/:verse", async (c) => {
 
     const primary = m.preferredArticle ?? m.articles[0];
     if (!primary) continue;
-    const twLink = `rc://*/tw/dict/bible/${primary}`;
-    const covered = remainingExisting.get(twLink) ?? 0;
-    if (covered > 0) {
-      remainingExisting.set(twLink, covered - 1); // this occurrence is already linked
-      continue;
-    }
-
     const category = primary.split("/")[0] ?? "";
     suggestions.push({
       matchedText: m.matchedText,
       glOccurrence,
       articleId: primary,
-      twLink,
+      twLink: `rc://*/tw/dict/bible/${primary}`,
       tag: TAG_BY_CATEGORY[category] ?? "",
       disambiguation: m.articles,
     });

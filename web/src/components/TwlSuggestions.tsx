@@ -36,10 +36,14 @@ interface Props {
   // refetches and drops anything just added (the server excludes existing links).
   refreshKey: string;
   onAdd: (suggestion: TwlSuggestion, chosenArticleId: string) => void;
+  // Drop suggestions already linked on the verse (resolved-OL identity, computed
+  // by Shell against the live rows). Applied after fetch so adds/deletes reflect
+  // without a server round-trip.
+  isExcluded?: (suggestion: TwlSuggestion) => boolean;
   locked?: boolean;
 }
 
-function TwlSuggestionsInner({ book, chapter, verse, refreshKey, onAdd, locked = false }: Props) {
+function TwlSuggestionsInner({ book, chapter, verse, refreshKey, onAdd, isExcluded, locked = false }: Props) {
   const [suggestions, setSuggestions] = useState<TwlSuggestion[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(false);
@@ -73,6 +77,9 @@ function TwlSuggestionsInner({ book, chapter, verse, refreshKey, onAdd, locked =
   }, [book, chapter, verse, refreshKey, reloadNonce]);
 
   const keyOf = (s: TwlSuggestion) => `${s.matchedText}|${s.glOccurrence}`;
+  // Filter out already-linked suggestions on each render — isExcluded closes over
+  // the live verse rows, so adding/deleting a link updates the list immediately.
+  const visible = isExcluded ? suggestions.filter((s) => !isExcluded(s)) : suggestions;
 
   return (
     <Box sx={{ mt: 1.5 }}>
@@ -85,7 +92,7 @@ function TwlSuggestionsInner({ book, chapter, verse, refreshKey, onAdd, locked =
           Suggestions
         </Typography>
         <Chip
-          label={loading ? "…" : suggestions.length}
+          label={loading ? "…" : visible.length}
           size="small"
           variant="outlined"
           sx={{ height: 16, fontFamily: "monospace", fontSize: 10 }}
@@ -104,13 +111,13 @@ function TwlSuggestionsInner({ book, chapter, verse, refreshKey, onAdd, locked =
         <Typography variant="caption" color="error" sx={{ pl: 1 }}>
           couldn&rsquo;t load suggestions
         </Typography>
-      ) : !loading && suggestions.length === 0 ? (
+      ) : !loading && visible.length === 0 ? (
         <Typography variant="caption" color="text.disabled" sx={{ pl: 1, fontStyle: "italic" }}>
           no new links suggested for this verse
         </Typography>
       ) : (
         <Stack spacing={0.5}>
-          {suggestions.map((s) => {
+          {visible.map((s) => {
             const k = keyOf(s);
             const selected = chosen[k] ?? s.articleId;
             const ambiguous = s.disambiguation.length > 1;
