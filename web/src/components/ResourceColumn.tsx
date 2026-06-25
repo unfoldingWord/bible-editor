@@ -3,9 +3,10 @@ import { Box, Stack, Typography, Chip, Button, IconButton, Tooltip } from "@mui/
 import AddIcon from "@mui/icons-material/Add";
 import PushPinIcon from "@mui/icons-material/PushPin";
 import PushPinOutlinedIcon from "@mui/icons-material/PushPinOutlined";
-import type { TnRow, TqRow, TwlRow, VerseDto } from "../sync/api";
+import type { TnRow, TqRow, TwlRow, VerseDto, TwlSuggestion } from "../sync/api";
 import { NoteCard, type DropPosition } from "./NoteCard";
 import { WordsTable, type WordDropPosition } from "./WordsTable";
+import { TwlSuggestions } from "./TwlSuggestions";
 import { QuestionsTable } from "./QuestionsTable";
 import { AlignmentPanel, type AlignmentPanelHandle } from "./AlignmentPanel";
 
@@ -50,6 +51,9 @@ export interface AlignmentTabProps {
 }
 
 interface Props {
+  // Active location — needed by the per-verse TWL suggestions fetch.
+  book: string;
+  chapter: number;
   activeVerse: number;
   // Inclusive [start, end] of verses to surface in TN/TQ/TWL panels. Equals
   // [activeVerse, activeVerse] for the common singleton case; widens to the
@@ -125,11 +129,23 @@ interface Props {
   onNoteTranslateQuote?: (row: TnRow, english: string) => string | null;
   // Same translate flow but for the TWL quote (orig_words) column.
   onWordTranslateQuote?: (row: TwlRow, english: string) => string | null;
+  // Read-only English (ULT) gloss for a TWL row's saved orig_words (alignment-
+  // derived). Shell owns the verse objects, so it computes the gloss.
+  onWordGloss?: (row: TwlRow) => string;
   // Quote-builder session. Shell owns the selection state + the picker
-  // popup; the note cards just surface a button that opens it.
+  // popup; the note cards / word rows just surface a button that opens it.
   quoteBuildActiveNoteId?: string | null;
+  // Same session, but when the active target is a TWL word row instead of a note.
+  quoteBuildActiveWordId?: string | null;
   quoteBuildSelectionCount?: number;
   onStartQuoteBuild?: (noteId: string) => void;
+  // Open the quote-builder for a TWL word row (writes orig_words + occurrence).
+  onStartWordQuoteBuild?: (wordId: string) => void;
+  // Promote a per-verse TWL suggestion to a real link (resolve + createRow). When
+  // absent, the Suggestions section hides.
+  onAddTwlSuggestion?: (suggestion: TwlSuggestion, chosenArticleId: string) => void;
+  // Drop suggestions already linked on the active verse (resolved-OL identity).
+  isTwlSuggestionExcluded?: (suggestion: TwlSuggestion) => boolean;
   // Per-note commit signal — its nonce bumps when a quote-build commits for
   // that note, telling the matching card to land the built quote in the box.
   quoteBuildAppliedTo?: { noteId: string; nonce: number } | null;
@@ -205,6 +221,8 @@ function groupByVerse<T extends { verse: number }>(rows: T[]): Array<[number, T[
 }
 
 export function ResourceColumn({
+  book,
+  chapter,
   activeVerse,
   displayVerseRange,
   tn,
@@ -243,9 +261,14 @@ export function ResourceColumn({
   onSetNoteHint,
   onNoteTranslateQuote,
   onWordTranslateQuote,
+  onWordGloss,
   quoteBuildActiveNoteId,
+  quoteBuildActiveWordId,
   quoteBuildSelectionCount = 0,
   onStartQuoteBuild,
+  onStartWordQuoteBuild,
+  onAddTwlSuggestion,
+  isTwlSuggestionExcluded,
   quoteBuildAppliedTo,
   panelMode = "resources",
   onSetPanelMode,
@@ -686,6 +709,10 @@ export function ResourceColumn({
                       onReorder={onWordReorder}
                       locked={locked}
                       onTranslateQuote={onWordTranslateQuote}
+                      onWordGloss={onWordGloss}
+                      activeQuoteBuildId={quoteBuildActiveWordId}
+                      quoteBuildSelectionCount={quoteBuildSelectionCount}
+                      onStartQuoteBuild={onStartWordQuoteBuild}
                     />
                   </Fragment>
                 ))
@@ -700,6 +727,24 @@ export function ResourceColumn({
                 onReorder={onWordReorder}
                 locked={locked}
                 onTranslateQuote={onWordTranslateQuote}
+                onWordGloss={onWordGloss}
+                activeQuoteBuildId={quoteBuildActiveWordId}
+                quoteBuildSelectionCount={quoteBuildSelectionCount}
+                onStartQuoteBuild={onStartWordQuoteBuild}
+              />
+            )}
+            {/* Per-verse suggestions — only in the active-verse (unpinned) view.
+                refreshKey is the verse's current link set so adding/removing a
+                link re-scans and drops/recovers it. */}
+            {!twlGroups && onAddTwlSuggestion && (
+              <TwlSuggestions
+                book={book}
+                chapter={chapter}
+                verse={activeVerse}
+                refreshKey={twlForVerse.map((r) => `${r.tw_link ?? ""}|${r.orig_words ?? ""}|${r.occurrence ?? 1}`).join("~")}
+                onAdd={onAddTwlSuggestion}
+                isExcluded={isTwlSuggestionExcluded}
+                locked={locked}
               />
             )}
           </>
