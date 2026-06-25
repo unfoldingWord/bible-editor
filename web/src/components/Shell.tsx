@@ -34,7 +34,7 @@ import {
 } from "../lib/alignmentDelta";
 import { buildVerseIndex, concatSourceRange, formatVerseLabel } from "../lib/verseRange";
 import { buildTnQuickRequest } from "../lib/tnQuickRequest";
-import { findSourceForTargetText, type HighlightKey, type ReorderHighlight } from "../lib/highlight";
+import { findSourceForTargetText, extractTargetSelectionText, type HighlightKey, type ReorderHighlight } from "../lib/highlight";
 import { buildQuoteFromSelection, selectionFromQuote } from "../lib/quoteBuilder";
 import { nfc } from "../lib/hebrew";
 import { TimelineRail } from "./TimelineRail";
@@ -754,9 +754,13 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
 
   // Quote-builder session: when active, clicking Hebrew words in the UHB
   // row of the active verse toggles them into selectedKeys; "Use selection"
-  // on the note card converts the set into row.quote + row.occurrence.
-  // Tied to a specific note id so switching notes cancels the session.
-  const [quoteBuildNoteId, setQuoteBuildNoteId] = useState<string | null>(null);
+  // converts the set into the row's source quote + occurrence. The target is
+  // either a TN note (writes quote/occurrence) or a TWL link (writes
+  // orig_words/occurrence). Tied to a specific row so switching selection
+  // cancels the session.
+  const [quoteBuildTarget, setQuoteBuildTarget] = useState<
+    { kind: "tn" | "twl"; id: string } | null
+  >(null);
   const [quoteBuildSelectedKeys, setQuoteBuildSelectedKeys] = useState<Set<HighlightKey>>(
     () => new Set(),
   );
@@ -764,16 +768,23 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // picker commits, so its row→quote sync effect is gated by the open session
   // guard; bumping this nonce after the optimistic row patch tells that card
   // to pull the built quote into its local state. nonce increments per commit
-  // so re-building the same note twice still fires the effect.
+  // so re-building the same note twice still fires the effect. (TWL word rows
+  // re-seed via their own row→state effect on the optimistic patch, so they
+  // don't need this signal.)
   const [quoteBuildAppliedTo, setQuoteBuildAppliedTo] = useState<
     { noteId: string; nonce: number } | null
   >(null);
   useEffect(() => {
-    if (quoteBuildNoteId && activeNoteId !== quoteBuildNoteId) {
-      setQuoteBuildNoteId(null);
+    if (!quoteBuildTarget) return;
+    const stillActive =
+      quoteBuildTarget.kind === "tn"
+        ? activeNoteId === quoteBuildTarget.id
+        : activeWordId === quoteBuildTarget.id;
+    if (!stillActive) {
+      setQuoteBuildTarget(null);
       setQuoteBuildSelectedKeys(new Set());
     }
-  }, [activeNoteId, quoteBuildNoteId]);
+  }, [activeNoteId, activeWordId, quoteBuildTarget]);
   const toggleQuoteBuildWord = useCallback(
     (key: HighlightKey) => {
       setQuoteBuildSelectedKeys((prev) => {
@@ -796,25 +807,31 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     });
   }, []);
   const startQuoteBuild = useCallback(
-    (noteId: string) => {
-      setQuoteBuildNoteId(noteId);
-      // Pre-seed the selection from the note's existing quote so the translator
+    (target: { kind: "tn" | "twl"; id: string }) => {
+      setQuoteBuildTarget(target);
+      // Pre-seed the selection from the row's existing quote so the translator
       // can ADD to it instead of starting over. Resolves the stored quote +
       // occurrence against the UHB/UGNT verse; an unresolvable quote (e.g.
       // hand-typed English) yields an empty set and the picker starts fresh.
-      const row = data?.tn.find((r) => r.id === noteId);
+      const row =
+        target.kind === "tn"
+          ? data?.tn.find((r) => r.id === target.id)
+          : data?.twl.find((r) => r.id === target.id);
       const uhb = row
         ? verseIndexByVersion["UHB"]?.[row.verse] ?? verseIndexByVersion["UGNT"]?.[row.verse]
         : undefined;
       const verseObjects = (uhb?.content as { verseObjects?: unknown[] } | null)?.verseObjects;
+      // TN stores its source quote in `quote`; TWL stores it in `orig_words`.
+      const existingQuote =
+        target.kind === "tn" ? (row as TnRow | undefined)?.quote : (row as TwlRow | undefined)?.orig_words;
       setQuoteBuildSelectedKeys(
-        row ? selectionFromQuote(verseObjects, row.quote, row.occurrence) : new Set(),
+        row ? selectionFromQuote(verseObjects, existingQuote, row.occurrence) : new Set(),
       );
     },
     [data, verseIndexByVersion],
   );
   const cancelQuoteBuild = useCallback(() => {
-    setQuoteBuildNoteId(null);
+    setQuoteBuildTarget(null);
     setQuoteBuildSelectedKeys(new Set());
   }, []);
 
@@ -823,21 +840,26 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // level so it isn't clipped by the resource column overflow.
   const [quoteBuildAnchor, setQuoteBuildAnchor] = useState<HTMLElement | null>(null);
   useEffect(() => {
-    if (!quoteBuildNoteId) {
+    if (!quoteBuildTarget) {
       setQuoteBuildAnchor(null);
       return;
     }
-    setQuoteBuildAnchor(
-      document.querySelector<HTMLElement>(`[data-note-id="${quoteBuildNoteId}"]`),
-    );
-  }, [quoteBuildNoteId]);
+    const selector =
+      quoteBuildTarget.kind === "tn"
+        ? `[data-note-id="${quoteBuildTarget.id}"]`
+        : `[data-word-id="${quoteBuildTarget.id}"]`;
+    setQuoteBuildAnchor(document.querySelector<HTMLElement>(selector));
+  }, [quoteBuildTarget]);
 
   // Verse objects bundled for the picker — UHB always; ULT/UST may be
   // absent for OT-only or NT-only deployments, so default to null and
   // let the picker show an empty-state hint.
   const quoteBuildContext = useMemo(() => {
-    if (!quoteBuildNoteId || !data) return null;
-    const row = data.tn.find((r) => r.id === quoteBuildNoteId);
+    if (!quoteBuildTarget || !data) return null;
+    const row =
+      quoteBuildTarget.kind === "tn"
+        ? data.tn.find((r) => r.id === quoteBuildTarget.id)
+        : data.twl.find((r) => r.id === quoteBuildTarget.id);
     if (!row) return null;
     const grab = (bv: string): unknown[] | null => {
       const dto = verseIndexByVersion[bv]?.[row.verse];
@@ -845,21 +867,23 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       return Array.isArray(vo) ? vo : null;
     };
     return {
-      noteId: quoteBuildNoteId,
       verse: row.verse,
       uhb: grab("UHB") ?? grab("UGNT"),
       ult: grab("ULT"),
       ust: grab("UST"),
     };
-  }, [quoteBuildNoteId, data, verseIndexByVersion]);
+  }, [quoteBuildTarget, data, verseIndexByVersion]);
 
   // Materialize the in-flight quote-build selection into a row patch and
   // fire the existing note save pipe. Pulls UHB verseObjects for the
   // current verse — the buildQuoteFromSelection helper does the grouping
   // and " & " join + occurrence calculation.
   const commitQuoteBuild = useCallback(() => {
-    if (!quoteBuildNoteId || !data) return;
-    const row = data.tn.find((r) => r.id === quoteBuildNoteId);
+    if (!quoteBuildTarget || !data) return;
+    const row =
+      quoteBuildTarget.kind === "tn"
+        ? data.tn.find((r) => r.id === quoteBuildTarget.id)
+        : data.twl.find((r) => r.id === quoteBuildTarget.id);
     if (!row) return;
     const uhb = verseIndexByVersion["UHB"]?.[row.verse] ?? verseIndexByVersion["UGNT"]?.[row.verse];
     const verseObjects =
@@ -867,28 +891,41 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     if (!Array.isArray(verseObjects)) return;
     const built = buildQuoteFromSelection(verseObjects, quoteBuildSelectedKeys);
     if (!built) return;
-    // Only enqueue a save when the build actually changes the stored (quote,
-    // occurrence) — re-running "build from source" over an unchanged selection
+    // Only enqueue a save when the build actually changes the stored quote +
+    // occurrence — re-running "build from source" over an unchanged selection
     // (or a quote that was itself built this way) must not bump the row version.
     // Compare quotes NFC-normalized: the builder emits raw UHB legacy
     // combining-mark order, while a stored quote may be NFC (typed / AI), so a
     // raw compare would false-positive on visually-identical text — same nfc()
     // rule the highlighter uses. A null stored occurrence means "first", == 1.
-    const changed =
-      nfc(built.quote) !== nfc(row.quote ?? "") || built.occurrence !== (row.occurrence ?? 1);
-    if (changed) {
-      // Optimistic row patch first so row.quote is current for the box-sync below.
-      enqueueRow("tn", row, { quote: built.quote, occurrence: built.occurrence });
+    if (quoteBuildTarget.kind === "tn") {
+      const note = row as TnRow;
+      const changed =
+        nfc(built.quote) !== nfc(note.quote ?? "") || built.occurrence !== (note.occurrence ?? 1);
+      if (changed) {
+        // Optimistic row patch first so row.quote is current for the box-sync below.
+        enqueueRow("tn", note, { quote: built.quote, occurrence: built.occurrence });
+      }
+      // Always signal the card (which stays active) to force the box to the
+      // committed quote and rebaseline the session snapshot — the row→box sync
+      // effect is otherwise gated by the open session. Idempotent on a true
+      // no-op, and on a no-op over unsaved box edits it still lands the quote the
+      // user just committed (don't gate this on `changed`).
+      setQuoteBuildAppliedTo((prev) => ({ noteId: note.id, nonce: (prev?.nonce ?? 0) + 1 }));
+    } else {
+      // TWL: the source quote lives in orig_words. The WordRow re-seeds from the
+      // optimistic patch (its row→state effect isn't session-gated), so no
+      // applied-nonce signal is needed.
+      const word = row as TwlRow;
+      const changed =
+        nfc(built.quote) !== nfc(word.orig_words ?? "") || built.occurrence !== (word.occurrence ?? 1);
+      if (changed) {
+        enqueueRow("twl", word, { orig_words: built.quote, occurrence: built.occurrence });
+      }
     }
-    // Always signal the card (which stays active) to force the box to the
-    // committed quote and rebaseline the session snapshot — the row→box sync
-    // effect is otherwise gated by the open session. Idempotent on a true
-    // no-op, and on a no-op over unsaved box edits it still lands the quote the
-    // user just committed (don't gate this on `changed`).
-    setQuoteBuildAppliedTo((prev) => ({ noteId: row.id, nonce: (prev?.nonce ?? 0) + 1 }));
-    setQuoteBuildNoteId(null);
+    setQuoteBuildTarget(null);
     setQuoteBuildSelectedKeys(new Set());
-  }, [quoteBuildNoteId, quoteBuildSelectedKeys, data, verseIndexByVersion]);
+  }, [quoteBuildTarget, quoteBuildSelectedKeys, data, verseIndexByVersion]);
 
   // Routes any verse / version / aligner-target change through the dirty
   // gate when the alignment panel has unsaved drags. Plain wrapper around
@@ -2041,6 +2078,28 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
             if (!Array.isArray(vo)) return null;
             return findSourceForTargetText(vo, english) || null;
           }}
+          onWordGloss={(row) => {
+            // English (ULT) words aligned to this row's saved orig_words.
+            // OL-anchored via the UHB/UGNT verse, mirroring the highlighter.
+            if (!row.orig_words) return "";
+            const ult = (
+              verseIndexByVersion["ULT"]?.[row.verse]?.content as
+                | { verseObjects?: unknown[] }
+                | null
+                | undefined
+            )?.verseObjects;
+            if (!Array.isArray(ult)) return "";
+            const src = (
+              (verseIndexByVersion["UHB"]?.[row.verse] ?? verseIndexByVersion["UGNT"]?.[row.verse])
+                ?.content as { verseObjects?: unknown[] } | null | undefined
+            )?.verseObjects;
+            return extractTargetSelectionText(
+              ult,
+              row.orig_words,
+              row.occurrence ?? 1,
+              Array.isArray(src) ? src : undefined,
+            );
+          }}
           onWordFocus={(row) => {
             setActiveWordId(row.id);
             setActiveNoteId(null);
@@ -2178,10 +2237,12 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           locked={Boolean(chapterLock)}
           onSetNotePreserve={handleSetNotePreserve}
           onSetNoteHint={handleSetNoteHint}
-          quoteBuildActiveNoteId={quoteBuildNoteId}
+          quoteBuildActiveNoteId={quoteBuildTarget?.kind === "tn" ? quoteBuildTarget.id : null}
+          quoteBuildActiveWordId={quoteBuildTarget?.kind === "twl" ? quoteBuildTarget.id : null}
           quoteBuildSelectionCount={quoteBuildSelectedKeys.size}
           quoteBuildAppliedTo={quoteBuildAppliedTo}
-          onStartQuoteBuild={startQuoteBuild}
+          onStartQuoteBuild={(noteId) => startQuoteBuild({ kind: "tn", id: noteId })}
+          onStartWordQuoteBuild={(wordId) => startQuoteBuild({ kind: "twl", id: wordId })}
           panelMode={panelMode}
           onSetPanelMode={handleSetPanelMode}
           alignmentProps={alignmentTabProps}

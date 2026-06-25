@@ -125,11 +125,18 @@ interface Props {
   onNoteTranslateQuote?: (row: TnRow, english: string) => string | null;
   // Same translate flow but for the TWL quote (orig_words) column.
   onWordTranslateQuote?: (row: TwlRow, english: string) => string | null;
+  // Read-only English (ULT) gloss for a TWL row's saved orig_words (alignment-
+  // derived). Shell owns the verse objects, so it computes the gloss.
+  onWordGloss?: (row: TwlRow) => string;
   // Quote-builder session. Shell owns the selection state + the picker
-  // popup; the note cards just surface a button that opens it.
+  // popup; the note cards / word rows just surface a button that opens it.
   quoteBuildActiveNoteId?: string | null;
+  // Same session, but when the active target is a TWL word row instead of a note.
+  quoteBuildActiveWordId?: string | null;
   quoteBuildSelectionCount?: number;
   onStartQuoteBuild?: (noteId: string) => void;
+  // Open the quote-builder for a TWL word row (writes orig_words + occurrence).
+  onStartWordQuoteBuild?: (wordId: string) => void;
   // Per-note commit signal — its nonce bumps when a quote-build commits for
   // that note, telling the matching card to land the built quote in the box.
   quoteBuildAppliedTo?: { noteId: string; nonce: number } | null;
@@ -243,9 +250,12 @@ export function ResourceColumn({
   onSetNoteHint,
   onNoteTranslateQuote,
   onWordTranslateQuote,
+  onWordGloss,
   quoteBuildActiveNoteId,
+  quoteBuildActiveWordId,
   quoteBuildSelectionCount = 0,
   onStartQuoteBuild,
+  onStartWordQuoteBuild,
   quoteBuildAppliedTo,
   panelMode = "resources",
   onSetPanelMode,
@@ -686,6 +696,10 @@ export function ResourceColumn({
                       onReorder={onWordReorder}
                       locked={locked}
                       onTranslateQuote={onWordTranslateQuote}
+                      onWordGloss={onWordGloss}
+                      activeQuoteBuildId={quoteBuildActiveWordId}
+                      quoteBuildSelectionCount={quoteBuildSelectionCount}
+                      onStartQuoteBuild={onStartWordQuoteBuild}
                     />
                   </Fragment>
                 ))
@@ -700,6 +714,10 @@ export function ResourceColumn({
                 onReorder={onWordReorder}
                 locked={locked}
                 onTranslateQuote={onWordTranslateQuote}
+                onWordGloss={onWordGloss}
+                activeQuoteBuildId={quoteBuildActiveWordId}
+                quoteBuildSelectionCount={quoteBuildSelectionCount}
+                onStartQuoteBuild={onStartWordQuoteBuild}
               />
             )}
           </>

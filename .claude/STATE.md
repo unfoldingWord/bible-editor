@@ -14,6 +14,24 @@
 
 ## Last run
 
+2026-06-25 · **great-shamir** — **Bringing Rich's TWL generation into the app (Beth/Rich Zulip ask).** Deep
+feasibility + Codex review + approved plan (`C:\Users\benja\.claude\plans\immutable-snuggling-snowflake.md`,
+full 4-phase build, port Rich's matcher core). **Phases 0a + 0b SHIPPED IN-BRANCH + browser-verified** (own
+wrangler dev :8795 against worktree bundle, junctioned to main's seeded local D1, ZEC). **0a:** WordsTable now
+shows an **editable Occurrence** field + a **read-only English (ULT) gloss** under each Hebrew quote (reuses
+`extractTargetSelectionText` in highlight.ts, OL-anchored via UHB; threaded `onWordGloss` Shell→ResourceColumn→
+WordsTable). Verified live: ZEC 1:3 shows occ=2 for the 2nd יְהוָה, gloss שׁ֣וּבוּ→"Return", יְהוָה→"Yahweh".
+**0b:** generalized Shell's quote-build session from note-only (`quoteBuildNoteId`) to a target
+`{kind:"tn"|"twl", id}` so the existing `QuoteBuilderPopper` mounts on **Words** rows too (build button per
+row; anchors via `[data-word-id]`; commit writes `{orig_words, occurrence}` via `enqueueRow("twl")`; WordRow
+re-seeds from the optimistic patch, so no applied-nonce needed). Verified live: picker opened on שׁ֣וּבוּ row,
+pre-seeded from existing quote, added אֵלַ֔⁠י → "USE SELECTION" → server v2→v3 orig_words="שׁ֣וּבוּ אֵלַ֔⁠י"
+tw_link preserved (reverted the seed row after). typecheck + build + console all clean. **NOT committed/PR'd
+yet** (no commit-without-ask). **Phases 1 + 2 REMAIN (the big build, see In progress).** Key feasibility
+finding: the app already owns occurrence round-trip + the English→OL quote+occurrence builder; node-twl-generator
+is English-first (match ULT→TW headwords; OL occurrence comes from alignment the app already has). Memory:
+[[project_twl_generation_into_app]].
+
 2026-06-24 · **reverent-nightingale** — Closed the TWO latent nightly-sync code gaps behind the HAB tn
 incident (truncated master fetch soft-deleted 559 pristine tn rows; export guards caught it, manual repair
 fixed the data). **Not yet committed/PR'd.** API typecheck + full api test suite green.
@@ -406,6 +424,26 @@ cleanly on nav with no stuck gate, back/forward + deep-link land correctly. type
 Not yet PR'd.
 
 ## In progress
+
+- **great-shamir** (2026-06-25) — **TWL generation into the app**, plan
+  `C:\Users\benja\.claude\plans\immutable-snuggling-snowflake.md` (approved, full build). **Phases 0a+0b DONE**
+  (WordsTable occurrence + English gloss; QuoteBuilderPopper generalized to Words — see Last run; branch
+  `claude/great-shamir-8b15f8`, NOT committed). **REMAINING — Phase 1 (en_tw data layer):** migration
+  `0032_tw_articles` (id `kt/god`, category, title, testament, tw_link, last_synced) + `scripts/import-tw.mjs`
+  (fetch `git.door43.org/unfoldingWord/en_tw/archive/master.zip` — ONE 12MB fetch — unzip, parse
+  `bible/{kt,names,other}/*.md` first `# Heading`→title, emit SQL; mirror `import-lexicon.mjs`; **DEP DECISION
+  PENDING**: fflate vs zero-dep tar/zlib — fflate leaks into junctioned node_modules, prefer zero-dep tarball +
+  Node `zlib.gunzipSync` + minimal ustar reader) + extend `/api/catalogs` to read canonical titles/links with
+  usage-derived fallback. **Phase 2 (suggestions):** port `buildTermTrie`/`scanVerseMatches` (self-contained,
+  zero imports) from node-twl-generator → `api/src/twlMatcher.ts` (+fixture test vs Rich's lib; preserve
+  variant gen + God/falsegod cap rule); route `GET /api/twl-suggestions/:book/:ch/:v` (trie from tw_articles,
+  testament-filtered via NT_BOOKS, exclude existing verse links); `web/src/lib/twlResolve.ts` English-span→
+  `{orig_words,occurrence,confident}` via collectTargetTokens+buildQuoteFromSelection (+test; **the crux** —
+  best-effort, fall back to opening the picker pre-seeded when not confident); Suggestions section under Words
+  (pick-to-add, disambiguation dropdown, create via `createRow("twl")` to respect chapter locks). TWLs are
+  single-verse: suggestions scope to the active ULT verse; only a UST bridge widens (label per-verse). **AI is
+  OUT of scope** (user). Dev env ready: junctioned `api/.wrangler`→main, `.dev.vars` copied; serve via
+  `wrangler dev --port <free> --assets "<abs worktree>/web/dist"` from api/, mint dev-auth in console.
 
 - **inspiring-faraday** (2026-06-23) — **Adapt 2 Kings 18-20 TN → Isaiah 36-39** (parallel-passage note
   migration; plan at `C:\Users\benja\.claude\plans\quirky-finding-meerkat.md`, approved; reviewed twice by

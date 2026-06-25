@@ -3,6 +3,7 @@ import { Alert, Box, InputAdornment, Paper, Snackbar, TextField, IconButton, Typ
 import DeleteOutlineIcon from "@mui/icons-material/DeleteOutline";
 import DragIndicatorIcon from "@mui/icons-material/DragIndicator";
 import TranslateIcon from "@mui/icons-material/Translate";
+import AutoFixHighIcon from "@mui/icons-material/AutoFixHigh";
 import UndoIcon from "@mui/icons-material/Undo";
 import SaveIcon from "@mui/icons-material/Save";
 import SaveOutlinedIcon from "@mui/icons-material/SaveOutlined";
@@ -43,15 +44,23 @@ const NARROW_BP_PX = 460;
 // from crushing the Hebrew when the column is narrow.
 const responsiveGridSx = {
   display: "grid",
-  gap: 1,
+  columnGap: 1,
+  rowGap: 0,
+  // Controls share one single-height row; the English gloss is its own row
+  // beneath (starting under the quote column) so it never stretches the row
+  // and pushes the grip / action icons off-center.
   alignItems: "center",
   gridTemplateColumns: "28px 1fr 1.2fr 28px 28px 28px",
-  gridTemplateAreas: '"grip quote twarticle save undo delete"',
+  gridTemplateAreas: [
+    '"grip quote twarticle save undo delete"',
+    '". gloss gloss gloss gloss gloss"',
+  ].join(" "),
   [`@container (max-width: ${NARROW_BP_PX}px)`]: {
     gridTemplateColumns: "28px 1fr 28px 28px 28px",
     gridTemplateAreas: [
       '"grip quote quote quote quote"',
       '"grip twarticle save undo delete"',
+      '". gloss gloss gloss gloss"',
     ].join(" "),
     rowGap: 0.5,
   },
@@ -73,9 +82,19 @@ interface Props {
   // alignment. Returns the derived Hebrew/Greek string, or null if no
   // alignment match was found. Mirrors the NoteCard wiring.
   onTranslateQuote?: (row: TwlRow, english: string) => string | null;
+  // Read-only English (ULT) gloss for a row's saved orig_words, derived from
+  // alignment. "" when the quote doesn't resolve in the verse. Shell owns the
+  // verse objects, so it computes the gloss (mirrors onTranslateQuote wiring).
+  onWordGloss?: (row: TwlRow) => string;
+  // Quote-builder ("build from source") wiring. Shell owns the picker popup +
+  // selection state; the row just opens it. activeQuoteBuildId is the row whose
+  // session is open (if any); the count drives that row's button label.
+  activeQuoteBuildId?: string | null;
+  quoteBuildSelectionCount?: number;
+  onStartQuoteBuild?: (id: string) => void;
 }
 
-function WordsTableInner({ rows, activeId, onSave, onDelete, onFocus, onReorder, locked = false, onTranslateQuote }: Props) {
+function WordsTableInner({ rows, activeId, onSave, onDelete, onFocus, onReorder, locked = false, onTranslateQuote, onWordGloss, activeQuoteBuildId = null, quoteBuildSelectionCount = 0, onStartQuoteBuild }: Props) {
   const [dragId, setDragId] = useState<string | null>(null);
   const [dragOver, setDragOver] = useState<
     { targetId: string; position: WordDropPosition } | null
@@ -158,6 +177,10 @@ function WordsTableInner({ rows, activeId, onSave, onDelete, onFocus, onReorder,
               onTranslateQuote={
                 onTranslateQuote ? (english) => onTranslateQuote(r, english) : undefined
               }
+              gloss={onWordGloss ? onWordGloss(r) : ""}
+              quoteBuildMode={r.id === activeQuoteBuildId}
+              quoteBuildSelectionCount={r.id === activeQuoteBuildId ? quoteBuildSelectionCount : 0}
+              onStartQuoteBuild={onStartQuoteBuild ? () => onStartQuoteBuild(r.id) : undefined}
             />
             {showAfter && <RowDropIndicator />}
           </Box>
@@ -173,7 +196,12 @@ function WordsTableInner({ rows, activeId, onSave, onDelete, onFocus, onReorder,
 // recreated each parent render but are intentionally ignored.
 export const WordsTable = memo(
   WordsTableInner,
-  (a, b) => a.rows === b.rows && a.activeId === b.activeId && a.locked === b.locked,
+  (a, b) =>
+    a.rows === b.rows &&
+    a.activeId === b.activeId &&
+    a.locked === b.locked &&
+    a.activeQuoteBuildId === b.activeQuoteBuildId &&
+    a.quoteBuildSelectionCount === b.quoteBuildSelectionCount,
 );
 
 function RowDropIndicator() {
@@ -203,6 +231,10 @@ const WordRow = memo(function WordRow({
   onRowDragOver,
   onRowDrop,
   onTranslateQuote,
+  gloss,
+  quoteBuildMode = false,
+  quoteBuildSelectionCount = 0,
+  onStartQuoteBuild,
 }: {
   row: TwlRow;
   active: boolean;
@@ -216,18 +248,30 @@ const WordRow = memo(function WordRow({
   onRowDragOver: (position: WordDropPosition) => void;
   onRowDrop: (position: WordDropPosition) => void;
   onTranslateQuote?: (english: string) => string | null;
+  // Read-only English (ULT) gloss of the saved orig_words; "" when unresolved.
+  gloss?: string;
+  // "Build from source" picker wiring (Shell owns the popup + selection state).
+  quoteBuildMode?: boolean;
+  quoteBuildSelectionCount?: number;
+  onStartQuoteBuild?: () => void;
 }) {
   const [quote, setQuote] = useState(row.orig_words ?? "");
   const [twLink, setTwLink] = useState<string | null>(row.tw_link);
+  // Occurrence is hidden in the schema but real (round-trips to the TSV
+  // Occurrence column). Display null/0 as 1 — the export coerces an OL quote's
+  // null occurrence to 1, so 1 and null are equivalent on disk and must not
+  // count as a dirty edit.
+  const [occurrence, setOccurrence] = useState(row.occurrence ?? 1);
   const [translateError, setTranslateError] = useState(false);
   const rowRef = useRef<HTMLDivElement | null>(null);
-  const savedRef = useRef({ quote: row.orig_words ?? "", twLink: row.tw_link });
+  const savedRef = useRef({ quote: row.orig_words ?? "", twLink: row.tw_link, occurrence: row.occurrence ?? 1 });
   const catalogs = useCatalogs();
 
   useEffect(() => setQuote(row.orig_words ?? ""), [row.id, row.version, row.orig_words]);
   useEffect(() => setTwLink(row.tw_link), [row.id, row.version, row.tw_link]);
+  useEffect(() => setOccurrence(row.occurrence ?? 1), [row.id, row.version, row.occurrence]);
   useEffect(() => {
-    savedRef.current = { quote: row.orig_words ?? "", twLink: row.tw_link };
+    savedRef.current = { quote: row.orig_words ?? "", twLink: row.tw_link, occurrence: row.occurrence ?? 1 };
   }, [row.id, row.version]);
 
   const draftKey = useMemo(() => rowKey("twl", row.book, row.id), [row.book, row.id]);
@@ -244,14 +288,18 @@ const WordRow = memo(function WordRow({
       if (!patch) return;
       if (typeof patch.orig_words === "string") setQuote(patch.orig_words);
       if ("tw_link" in patch) setTwLink((patch.tw_link as string | null) ?? null);
+      if (typeof patch.occurrence === "number") setOccurrence(patch.occurrence);
     });
   }, [draftKey]);
   const diff = useMemo<Partial<TwlRow>>(() => {
     const out: Partial<TwlRow> = {};
     if (quote !== (row.orig_words ?? "")) out.orig_words = quote;
     if (twLink !== row.tw_link) out.tw_link = twLink;
+    // null/0 stored occurrence is equivalent to 1 for an OL quote (see export
+    // coercion), so only a real numeric change counts as dirty.
+    if (occurrence !== (row.occurrence ?? 1)) out.occurrence = occurrence;
     return out;
-  }, [quote, twLink, row.orig_words, row.tw_link]);
+  }, [quote, twLink, occurrence, row.orig_words, row.tw_link, row.occurrence]);
   const isDirty = Object.keys(diff).length > 0;
 
   useEffect(() => {
@@ -291,6 +339,7 @@ const WordRow = memo(function WordRow({
   const handleUndo = () => {
     setQuote(savedRef.current.quote);
     setTwLink(savedRef.current.twLink);
+    setOccurrence(savedRef.current.occurrence);
   };
 
   const handleSave = () => {
@@ -353,39 +402,100 @@ const WordRow = memo(function WordRow({
           <DragIndicatorIcon fontSize="small" />
         </Box>
       </Tooltip>
-      <TextField
-        value={quote}
-        onChange={(e) => setQuote(e.target.value)}
-        size="small"
-        variant="outlined"
-        spellCheck={false}
-        sx={{ gridArea: "quote" }}
-        InputProps={{
-          ...(isDirty ? { "data-dirty": "true" } : {}),
-          endAdornment: showTranslateIcon ? (
-            <InputAdornment position="end">
-              <Tooltip title="translate to Hebrew/Greek using ULT alignment">
-                <IconButton
-                  size="small"
-                  onClick={handleTranslateQuote}
-                  sx={{ p: 0.25, color: "primary.main" }}
-                >
-                  <TranslateIcon fontSize="small" />
-                </IconButton>
-              </Tooltip>
-            </InputAdornment>
-          ) : undefined,
-        }}
-        inputProps={{
-          dir: quoteScript === "ltr" ? "ltr" : "rtl",
-          style: {
-            fontFamily: '"Times New Roman","SBL Hebrew","Cardo",serif',
-            fontSize: 19,
-            padding: "3px 6px",
-            textAlign: quoteScript === "ltr" ? "left" : "right",
-          },
-        }}
-      />
+      <Box sx={{ gridArea: "quote", minWidth: 0, display: "flex", gap: 0.5, alignItems: "center" }}>
+        <TextField
+          value={quote}
+          onChange={(e) => setQuote(e.target.value)}
+          size="small"
+          variant="outlined"
+          spellCheck={false}
+          // Shared fixed height keeps the quote box and the occurrence box the
+          // same height; InputBase centers the input within it.
+          sx={{ flex: 1, minWidth: 0, "& .MuiOutlinedInput-root": { height: 34 } }}
+          InputProps={{
+            ...(isDirty ? { "data-dirty": "true" } : {}),
+            endAdornment: showTranslateIcon ? (
+              <InputAdornment position="end">
+                <Tooltip title="translate to Hebrew/Greek using ULT alignment">
+                  <IconButton
+                    size="small"
+                    onClick={handleTranslateQuote}
+                    sx={{ p: 0.25, color: "primary.main" }}
+                  >
+                    <TranslateIcon fontSize="small" />
+                  </IconButton>
+                </Tooltip>
+              </InputAdornment>
+            ) : undefined,
+          }}
+          inputProps={{
+            dir: quoteScript === "ltr" ? "ltr" : "rtl",
+            style: {
+              fontFamily: '"Times New Roman","SBL Hebrew","Cardo",serif',
+              fontSize: 19,
+              padding: "0 6px",
+              textAlign: quoteScript === "ltr" ? "left" : "right",
+            },
+          }}
+        />
+        <Tooltip title="occurrence — which instance of this quote in the verse (usually 1)">
+          <TextField
+            value={occurrence}
+            onChange={(e) => {
+              const n = parseInt(e.target.value, 10);
+              setOccurrence(Number.isFinite(n) && n > 0 ? n : 1);
+            }}
+            size="small"
+            variant="outlined"
+            type="number"
+            sx={{ width: 52, flexShrink: 0, "& .MuiOutlinedInput-root": { height: 34 } }}
+            inputProps={{
+              min: 1,
+              "aria-label": "occurrence",
+              style: { fontSize: 13, padding: "0 4px", textAlign: "center" },
+            }}
+          />
+        </Tooltip>
+        {onStartQuoteBuild && (
+          <Tooltip
+            title={
+              quoteBuildMode
+                ? `picker open · ${quoteBuildSelectionCount} selected — click ULT/UST or Hebrew words`
+                : "build the Hebrew/Greek quote by picking aligned words"
+            }
+          >
+            <IconButton
+              size="small"
+              onClick={onStartQuoteBuild}
+              sx={{
+                p: 0.25,
+                flexShrink: 0,
+                color: quoteBuildMode ? "primary.main" : "text.secondary",
+              }}
+            >
+              <AutoFixHighIcon fontSize="small" />
+            </IconButton>
+          </Tooltip>
+        )}
+      </Box>
+      {gloss ? (
+        <Tooltip title="ULT words aligned to this quote (read-only)">
+          <Typography
+            variant="caption"
+            sx={{
+              gridArea: "gloss",
+              color: "text.secondary",
+              fontStyle: "italic",
+              lineHeight: 1.3,
+              pb: "2px",
+              whiteSpace: "normal",
+              wordBreak: "break-word",
+            }}
+          >
+            {gloss}
+          </Typography>
+        </Tooltip>
+      ) : null}
       <Box sx={{ gridArea: "twarticle", minWidth: 0 }}>
         <CatalogPicker
           value={twLink}
@@ -446,7 +556,14 @@ const WordRow = memo(function WordRow({
 }, (a, b) =>
   // Skip sibling word rows when the table re-renders (selection / add / delete).
   // row is referentially stable unless THIS word changed; callbacks ignored.
-  a.row === b.row && a.active === b.active && a.dragging === b.dragging && a.isDropTarget === b.isDropTarget);
+  // gloss is compared so a re-derived English gloss (e.g. after a realign) lands.
+  a.row === b.row &&
+  a.active === b.active &&
+  a.dragging === b.dragging &&
+  a.isDropTarget === b.isDropTarget &&
+  a.gloss === b.gloss &&
+  a.quoteBuildMode === b.quoteBuildMode &&
+  a.quoteBuildSelectionCount === b.quoteBuildSelectionCount);
 
 function twShort(link: string | null): string {
   if (!link) return "—";
