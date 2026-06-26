@@ -1,11 +1,12 @@
 import { Hono } from "hono";
 import { z } from "zod";
 import type { Env } from "./index";
-import type { RowKind, TnRow, TqRow, TwlRow } from "./types";
+import type { CheckLane, RowKind, TnRow, TqRow, TwlRow } from "./types";
 import { currentUserId, requireEditor } from "./auth";
 import { activePipelineForChapter, lockedResponseBody } from "./chapterLock";
 import { broadcastChapter } from "./wsEvents";
 import { newRowId } from "./rowId";
+import { reopenLaneChecks } from "./laneReopen";
 
 export const rows = new Hono<{ Bindings: Env; Variables: { userId?: number } }>();
 
@@ -16,6 +17,15 @@ const KIND_TO_TABLE: Record<RowKind, string> = {
 };
 
 const isRowKind = (k: string): k is RowKind => k in KIND_TO_TABLE;
+
+// "Edits reopen the checkoff": a successful tn/tq write reopens its own lane
+// ('tn'/'tq'). twl is intentionally null — adding/removing a TWL link is the
+// Words work itself, not an edit that should reopen the Words sign-off ('tw').
+const KIND_TO_REOPEN_LANE: Record<RowKind, CheckLane | null> = {
+  tn: "tn",
+  tq: "tq",
+  twl: null,
+};
 
 // The original-language field per kind — the cell whose Hebrew/Greek content
 // forces Occurrence >= 1 (see origLangOccurrence below).
@@ -258,6 +268,12 @@ rows.post("/:kind", requireEditor, async (c) => {
     c.executionCtx.waitUntil(
       broadcastChapter(c.env, row.book, row.chapter, { type: "row.upserted", kind, row }),
     );
+    const lane = KIND_TO_REOPEN_LANE[kind];
+    if (lane) {
+      c.executionCtx.waitUntil(
+        reopenLaneChecks(c.env, row.book, row.chapter, row.verse, [lane]),
+      );
+    }
   }
   return c.json(created, 201);
 });
@@ -705,6 +721,15 @@ rows.patch("/:kind/:id", requireEditor, async (c) => {
     c.executionCtx.waitUntil(
       broadcastChapter(c.env, row.book, row.chapter, { type: "row.upserted", kind, row }),
     );
+    // Edits reopen the checkoff. The reorder-only and no-op paths return
+    // before here, so reaching this point means real content changed and the
+    // version bumped. Best-effort and non-blocking; see reopenLaneChecks.
+    const lane = KIND_TO_REOPEN_LANE[kind];
+    if (lane) {
+      c.executionCtx.waitUntil(
+        reopenLaneChecks(c.env, row.book, row.chapter, row.verse, [lane]),
+      );
+    }
   }
   return c.json(updated);
 });
@@ -725,10 +750,10 @@ rows.delete("/:kind/:id", requireEditor, async (c) => {
   // The auto-apply step is responsible for removing un-kept TNs; manual
   // deletion mid-run would race with it.
   const scope = await c.env.DB.prepare(
-    `SELECT book, chapter FROM ${KIND_TO_TABLE[kind]} WHERE id = ?1${bookClause(2)}`,
+    `SELECT book, chapter, verse FROM ${KIND_TO_TABLE[kind]} WHERE id = ?1${bookClause(2)}`,
   )
     .bind(id, book)
-    .first<{ book: string; chapter: number }>();
+    .first<{ book: string; chapter: number; verse: number }>();
   if (scope) {
     const lock = await activePipelineForChapter(c.env, scope.book, scope.chapter);
     if (lock) return c.json(lockedResponseBody(lock), 409);
@@ -775,6 +800,15 @@ rows.delete("/:kind/:id", requireEditor, async (c) => {
         version: newVersion,
       }),
     );
+    // Edits reopen the checkoff: a successful delete (reached only after the
+    // changes()-gated soft-delete above landed) reopens the row's lane.
+    // Best-effort and non-blocking; see reopenLaneChecks.
+    const lane = KIND_TO_REOPEN_LANE[kind];
+    if (lane) {
+      c.executionCtx.waitUntil(
+        reopenLaneChecks(c.env, scope.book, scope.chapter, scope.verse, [lane]),
+      );
+    }
   }
   return c.json({ ok: true });
 });

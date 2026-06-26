@@ -38,6 +38,7 @@ function isFreshRow(x: unknown): x is FreshRow {
 function formatTarget(t: OpTarget): string {
   if (t.kind === "row") return `${t.rowKind.toUpperCase()} ${t.book} · ${t.id}`;
   if (t.kind === "verse_status") return `status ${t.book} ${t.chapter}:${t.verse}`;
+  if (t.kind === "lane_check") return `${t.lane} check ${t.book} ${t.chapter}:${t.verse}`;
   return `${t.bibleVersion} ${t.book} ${t.chapter}:${t.verse}`;
 }
 

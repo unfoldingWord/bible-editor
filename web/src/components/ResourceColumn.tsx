@@ -9,8 +9,24 @@ import { WordsTable, type WordDropPosition } from "./WordsTable";
 import { TwlSuggestions } from "./TwlSuggestions";
 import { QuestionsTable } from "./QuestionsTable";
 import { AlignmentPanel, type AlignmentPanelHandle } from "./AlignmentPanel";
+import CheckIcon from "@mui/icons-material/Check";
+import { LANE_FILL, type LaneShade } from "../lib/laneChecks";
 
 export type PanelMode = "resources" | "alignment" | "search";
+
+// In-context checkoff for the resource panels (Notes/Words/Questions), scoped to
+// the active verse. Shell computes these from the lane-check state.
+export type ResourceLane = "tn" | "tw" | "tq";
+export interface ResourceCheckoff {
+  canCheck: boolean;
+  shade: (lane: ResourceLane) => LaneShade;
+  applicable: (lane: ResourceLane) => boolean;
+  attribution: (lane: ResourceLane) => string;
+  onToggle: (lane: ResourceLane) => void;
+  // Bulk "all this chapter" — Shell decides direction (check-all unless every
+  // applicable verse is already mine, then clear-all).
+  onBulkToggle: (lane: ResourceLane) => void;
+}
 
 // External search tool embedded in the Search tab. Allow-listed in the API's
 // CSP frame-src (api/src/index.ts) — adding a different host requires updating
@@ -162,6 +178,8 @@ interface Props {
   onSetPanelMode?: (mode: PanelMode) => void;
   alignmentProps?: AlignmentTabProps;
   alignmentBadge?: string;
+  // Per-resource checkoff for the active verse (in-context "done" + bulk).
+  checkoff?: ResourceCheckoff;
 }
 
 type PinKey = "notes" | "words" | "questions";
@@ -282,6 +300,7 @@ export function ResourceColumn({
   onSetPanelMode,
   alignmentProps,
   alignmentBadge,
+  checkoff,
 }: Props) {
   const [pinned, setPinned] = useState<Pinned>(() => loadPinned());
   const togglePinned = (k: PinKey) => {
@@ -664,6 +683,8 @@ export function ResourceColumn({
               onAdd={onNoteCreate}
               sticky
               hideAdd={locked}
+              lane="tn"
+              checkoff={checkoff}
             />
             {tnGroups ? (
               tnGroups.length === 0 ? (
@@ -698,6 +719,8 @@ export function ResourceColumn({
               onAdd={onWordCreate}
               sticky
               hideAdd={locked}
+              lane="tw"
+              checkoff={checkoff}
             />
             {twlGroups ? (
               twlGroups.length === 0 ? (
@@ -755,6 +778,7 @@ export function ResourceColumn({
                 blockedArticleIds={twlBlockedArticleIds}
                 filtersReady={twlFiltersReady}
                 locked={locked}
+                paused={!!checkoff && checkoff.applicable("tw") && checkoff.shade("tw") !== "open"}
               />
             )}
           </>
@@ -770,6 +794,8 @@ export function ResourceColumn({
               onAdd={onQuestionCreate}
               sticky
               hideAdd={locked}
+              lane="tq"
+              checkoff={checkoff}
             />
             {tqGroups ? (
               tqGroups.length === 0 ? (
@@ -991,6 +1017,8 @@ function SectionHead({
   onAdd,
   sticky,
   hideAdd,
+  lane,
+  checkoff,
 }: {
   title: string;
   count: number;
@@ -999,7 +1027,12 @@ function SectionHead({
   onAdd: () => void;
   sticky?: boolean;
   hideAdd?: boolean;
+  lane?: ResourceLane;
+  checkoff?: ResourceCheckoff;
 }) {
+  const laneApplicable = checkoff && lane ? checkoff.applicable(lane) : false;
+  const shade = checkoff && lane && laneApplicable ? checkoff.shade(lane) : "open";
+  const fill = shade !== "open" ? LANE_FILL[shade as Exclude<LaneShade, "open">] : null;
   return (
     <Stack
       direction="row"
@@ -1035,6 +1068,45 @@ function SectionHead({
           {pinned ? <PushPinIcon fontSize="inherit" sx={{ fontSize: 16 }} /> : <PushPinOutlinedIcon fontSize="inherit" sx={{ fontSize: 16 }} />}
         </IconButton>
       </Tooltip>
+      {checkoff && lane && laneApplicable && checkoff.canCheck && !pinned && (
+        <Tooltip
+          title={`${title} for this verse — ${checkoff.attribution(lane)} · click to ${shade === "me" || shade === "both" ? "uncheck" : "check"}`}
+        >
+          <Box
+            role="checkbox"
+            aria-checked={shade !== "open"}
+            onClick={() => checkoff.onToggle(lane)}
+            sx={{
+              display: "flex",
+              alignItems: "center",
+              gap: 0.5,
+              cursor: "pointer",
+              px: 0.75,
+              height: 20,
+              borderRadius: 1,
+              fontSize: 11,
+              userSelect: "none",
+              bgcolor: fill ? fill.bg : "transparent",
+              color: fill ? fill.fg : "text.secondary",
+              border: fill ? "none" : "1px solid",
+              borderColor: fill ? "transparent" : "divider",
+            }}
+          >
+            <CheckIcon sx={{ fontSize: 13 }} /> done
+          </Box>
+        </Tooltip>
+      )}
+      {checkoff && lane && laneApplicable && checkoff.canCheck && (
+        <Tooltip title={`check ${title.toLowerCase()} for every applicable verse in this chapter`}>
+          <Typography
+            variant="caption"
+            onClick={() => checkoff.onBulkToggle(lane)}
+            sx={{ color: "primary.main", cursor: "pointer", whiteSpace: "nowrap", ml: 0.25 }}
+          >
+            all
+          </Typography>
+        </Tooltip>
+      )}
       <Box sx={{ flex: 1 }} />
       {hideAdd ? null : (
         <Button

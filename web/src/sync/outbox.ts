@@ -16,6 +16,7 @@ import {
   type ChapterLockedBody,
   type AlignmentIntent,
   type RowKind,
+  type CheckLane,
 } from "./api";
 import { backoffMs } from "./backoff";
 
@@ -71,7 +72,14 @@ export interface VerseStatusTarget {
   chapter: number;
   verse: number;
 }
-export type OpTarget = RowTarget | VerseTarget | VerseStatusTarget;
+export interface LaneCheckTarget {
+  kind: "lane_check";
+  book: string;
+  chapter: number;
+  verse: number;
+  lane: CheckLane;
+}
+export type OpTarget = RowTarget | VerseTarget | VerseStatusTarget | LaneCheckTarget;
 
 export type OpStatus = "pending" | "in_flight" | "conflict" | "failed";
 export type OpAction = "patch" | "delete";
@@ -209,6 +217,7 @@ function noopOp(target: OpTarget, action: OpAction, patch: Record<string, unknow
 function targetKey(t: OpTarget): string {
   if (t.kind === "row") return `row:${t.rowKind}:${t.book}:${t.id}`;
   if (t.kind === "verse_status") return `vstatus:${t.book}:${t.chapter}:${t.verse}`;
+  if (t.kind === "lane_check") return `lanecheck:${t.book}:${t.chapter}:${t.verse}:${t.lane}`;
   return `verse:${t.book}:${t.chapter}:${t.verse}:${t.bibleVersion}`;
 }
 
@@ -356,6 +365,51 @@ export const outbox = {
         target: { kind: "verse_status", book, chapter, verse },
         action: "patch",
         patch: { done },
+        expectedVersion: 0,
+        queuedAt: Date.now(),
+        seq: nextSeq(),
+        attempts: 0,
+        status: "pending",
+      };
+      await tx.store.put(result);
+    }
+    await tx.done;
+    void notify();
+    void drain();
+    return result;
+  },
+
+  // lane_check (per-resource checkoff stamp) — same upsert/coalesce shape as
+  // verse_status: no version, the (user, lane) row is what's toggled, so rapid
+  // click-click only ships the final state. Offline-safe like every other op.
+  async enqueueLaneCheck(
+    book: string,
+    chapter: number,
+    verse: number,
+    lane: CheckLane,
+    checked: boolean,
+  ): Promise<OutboxOp> {
+    if (isReadOnly()) {
+      return noopOp({ kind: "lane_check", book, chapter, verse, lane }, "patch", { checked });
+    }
+    const idb = await db();
+    const key = `lanecheck:${book}:${chapter}:${verse}:${lane}`;
+    const tx = idb.transaction(STORE, "readwrite");
+    const all = (await tx.store.getAll()) as OutboxOp[];
+    const pending = all.find((o) => targetKey(o.target) === key && o.status === "pending");
+    let result: OutboxOp;
+    if (pending) {
+      pending.patch = { checked };
+      pending.queuedAt = Date.now();
+      pending.seq = nextSeq();
+      await tx.store.put(pending);
+      result = pending;
+    } else {
+      result = {
+        id: uid(),
+        target: { kind: "lane_check", book, chapter, verse, lane },
+        action: "patch",
+        patch: { checked },
         expectedVersion: 0,
         queuedAt: Date.now(),
         seq: nextSeq(),
@@ -525,6 +579,14 @@ async function dispatch(op: OutboxOp): Promise<Result> {
         op.target.chapter,
         op.target.verse,
         Boolean((op.patch as { done?: boolean }).done),
+      );
+    } else if (op.target.kind === "lane_check") {
+      updated = await api.setLaneCheck(
+        op.target.book,
+        op.target.chapter,
+        op.target.verse,
+        op.target.lane,
+        Boolean((op.patch as { checked?: boolean }).checked),
       );
     } else {
       updated = await api.patchVerse(

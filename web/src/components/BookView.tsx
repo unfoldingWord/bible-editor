@@ -13,7 +13,9 @@ import { Fragment, memo, useCallback, useEffect, useMemo, useRef, useState } fro
 import { Box, Stack, Typography, IconButton, Tooltip, CircularProgress } from "@mui/material";
 import SaveIcon from "@mui/icons-material/Save";
 import UndoIcon from "@mui/icons-material/Undo";
+import CheckIcon from "@mui/icons-material/Check";
 import type { TwlRow, VerseDto } from "../sync/api";
+import { LANE_FILL, type TextLaneCheck } from "../lib/laneChecks";
 import type { ChapterState } from "../hooks/useBook";
 import { highlightsFor, renderEditableHTML, renderHighlightedHTML, type HighlightKey, type ReorderHighlight } from "../lib/highlight";
 import { markHighlightSx } from "../lib/highlightStyles";
@@ -94,6 +96,11 @@ interface Props {
   // to one chapter so other chapters in view are still safe, but explaining
   // "chapter X is locked, others aren't" is more confusing than it's worth.
   locked?: boolean;
+  // Optional per-verse Text-lane check. When present and canCheck, each verse
+  // cell gets a small check control + a tinted verse-number underline. Wired
+  // from Shell; absent in standalone use. Same value for every cell, so it
+  // stays referentially stable and the memoized subtrees still skip.
+  textCheck?: TextLaneCheck;
 }
 
 export function BookView({
@@ -118,6 +125,7 @@ export function BookView({
   onOpenAligner,
   onEditSection,
   locked = false,
+  textCheck,
 }: Props) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const activeRowRef = useRef<HTMLDivElement | null>(null);
@@ -292,6 +300,7 @@ export function BookView({
               onOpenAligner={onOpenAligner}
               onEditSection={onEditSection}
               locked={locked}
+              textCheck={textCheck}
             />
           ))}
         </Box>
@@ -334,6 +343,7 @@ const ChapterBlock = memo(function ChapterBlock({
   onOpenAligner,
   onEditSection,
   locked,
+  textCheck,
 }: {
   book: string;
   chapter: number;
@@ -363,6 +373,7 @@ const ChapterBlock = memo(function ChapterBlock({
     base: VerseDto,
   ) => void;
   locked: boolean;
+  textCheck?: TextLaneCheck;
 }) {
   // Sentinel observed by IntersectionObserver — fires loadChapter when the
   // chapter is near (within ~one viewport of) the visible area.
@@ -496,6 +507,7 @@ const ChapterBlock = memo(function ChapterBlock({
             onOpenAligner={onOpenAligner}
             onEditSection={onEditSection}
             locked={locked}
+            textCheck={textCheck}
           />
         );
       })}
@@ -527,6 +539,7 @@ const VerseRow = memo(function VerseRow({
   onOpenAligner,
   onEditSection,
   locked,
+  textCheck,
 }: {
   book: string;
   chapter: number;
@@ -555,6 +568,7 @@ const VerseRow = memo(function VerseRow({
     base: VerseDto,
   ) => void;
   locked: boolean;
+  textCheck?: TextLaneCheck;
 }) {
   // Render is intentionally a row of N independent cells driven by the same
   // grid container above — placement is via CSS grid auto-flow.
@@ -613,6 +627,7 @@ const VerseRow = memo(function VerseRow({
               onSaveVerse={onSaveVerse}
               onEditSection={onEditSection}
               locked={locked}
+              textCheck={textCheck}
             />
           </Box>
         );
@@ -643,6 +658,7 @@ const VerseCell = memo(function VerseCell({
   onSaveVerse,
   onEditSection,
   locked,
+  textCheck,
 }: {
   book: string;
   chapter: number;
@@ -676,6 +692,7 @@ const VerseCell = memo(function VerseCell({
     base: VerseDto,
   ) => void;
   locked: boolean;
+  textCheck?: TextLaneCheck;
 }) {
   const readOnly = READ_ONLY.has(bibleVersion) || locked;
   const rtl = bibleVersion === "UHB";
@@ -872,6 +889,11 @@ const VerseCell = memo(function VerseCell({
     );
   }
 
+  // Text-lane check state for this cell (when wired). The tinted underline on
+  // the verse marker keeps the checked state visible even with controls hidden.
+  const textShade = textCheck ? textCheck.shade(verseNum) : "open";
+  const showTextCheck = !!textCheck?.canCheck && !readOnly;
+
   return (
     <Box sx={{ lineHeight: 1.6 }}>
       <Typography
@@ -883,6 +905,8 @@ const VerseCell = memo(function VerseCell({
           fontWeight: isRangeRow(dto) ? 700 : 600,
           color: isRangeRow(dto) ? "#014263" : "#9aa0a6",
           mr: 0.5,
+          borderBottom:
+            textShade !== "open" ? `2px solid ${LANE_FILL[textShade].bg}` : undefined,
         }}
       >
         {verseNum === 0 ? "intro" : `${chapter}:${formatVerseLabel(dto)}`}
@@ -899,6 +923,31 @@ const VerseCell = memo(function VerseCell({
             onOpenAligner(chapter, verseNum, bibleVersion);
           }}
         />
+      )}
+      {showTextCheck && (
+        <Tooltip title={`Text — ${textCheck!.attribution(verseNum)}`}>
+          <IconButton
+            onClick={(e) => {
+              e.stopPropagation();
+              textCheck!.onToggle(verseNum);
+            }}
+            size="small"
+            sx={{
+              p: 0.25,
+              verticalAlign: "-3px",
+              borderRadius: 0.5,
+              border: textShade === "open" ? "1px solid" : "none",
+              borderColor: "divider",
+              bgcolor: textShade === "open" ? "transparent" : LANE_FILL[textShade].bg,
+              color: textShade === "open" ? "text.disabled" : LANE_FILL[textShade].fg,
+              "&:hover": {
+                bgcolor: textShade === "open" ? "action.hover" : LANE_FILL[textShade].bg,
+              },
+            }}
+          >
+            <CheckIcon sx={{ fontSize: 14 }} />
+          </IconButton>
+        </Tooltip>
       )}
       {!readOnly && hasDraft && (
         <Tooltip title={`undo edits to verse ${verseNum}`}>

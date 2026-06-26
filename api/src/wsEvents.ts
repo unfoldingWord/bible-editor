@@ -11,13 +11,25 @@
 // updated their state).
 
 import type { Env } from "./index";
-import type { RowKind, TnRow, TqRow, TwlRow, VerseDto, VerseStatus } from "./types";
+import type { CheckLane, RowKind, TnRow, TqRow, TwlRow, VerseDto, VerseStatus } from "./types";
+
+// The current set of checkers for one (verse, lane) after a toggle. `checkers`
+// is the full list of user ids so a receiving tab can recompute its own shade
+// (you / someone else / both) regardless of which user originated the change.
+export interface LaneCheckState {
+  book: string;
+  chapter: number;
+  verse: number;
+  lane: CheckLane;
+  checkers: number[];
+}
 
 export type WsEvent =
   | { type: "row.upserted"; kind: RowKind; row: TnRow | TqRow | TwlRow }
   | { type: "row.deleted"; kind: RowKind; id: string; version: number }
   | { type: "verse.updated"; verse: VerseDto }
-  | { type: "verse_status.updated"; status: VerseStatus };
+  | { type: "verse_status.updated"; status: VerseStatus }
+  | { type: "lane_check.updated"; check: LaneCheckState };
 
 export async function broadcastChapter(
   env: Env,

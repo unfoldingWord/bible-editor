@@ -115,6 +115,22 @@ export interface VerseStatus {
   updated_at: number;
 }
 
+// The per-resource checkoff lanes. "text" covers ULT + UST together (they are
+// never checked/proofread solo); the rest map to the resource panels.
+export type CheckLane = "text" | "tn" | "tw" | "tq";
+export const CHECK_LANES: readonly CheckLane[] = ["text", "tn", "tw", "tq"] as const;
+
+// One checkoff stamp: a (verse, lane) checked by one user. Multiple rows per
+// (verse, lane) — one per checker — drive the who-checked shading.
+export interface VerseLaneCheck {
+  book: string;
+  chapter: number;
+  verse: number;
+  lane: CheckLane;
+  checked_by: number;
+  checked_at: number;
+}
+
 export interface ChapterPayload {
   book: string;
   chapter: number;
@@ -123,6 +139,7 @@ export interface ChapterPayload {
   tq: TqRow[];
   twl: TwlRow[];
   verseStatuses: VerseStatus[];
+  verseLaneChecks: VerseLaneCheck[];
 }
 
 export interface VerseDto extends Omit<VerseRow, "content_json"> {

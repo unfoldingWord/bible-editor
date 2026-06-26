@@ -13,6 +13,9 @@ import {
   type TwlRow,
   type VerseDto,
   type VerseStatus,
+  type VerseLaneCheck,
+  type CheckLane,
+  type LaneCheckState,
 } from "../sync/api";
 import { fetchWithRetry } from "../sync/fetchWithRetry";
 import { onOutboxResult } from "../sync/outbox";
@@ -36,6 +39,12 @@ export interface UseChapterReturn {
   ) => void;
   applyLocalVerse: (verse: VerseDto) => void;
   applyLocalVerseStatus: (verse: number, done: boolean) => void;
+  /** Optimistically add/remove my own stamp on a (verse, lane). */
+  applyLocalLaneCheck: (verse: number, lane: CheckLane, userId: number, checked: boolean) => void;
+  /** Authoritative: replace a (verse, lane)'s checker set (server result / WS). */
+  applyLaneCheckers: (verse: number, lane: CheckLane, checkers: number[]) => void;
+  /** Authoritative: replace every check for one lane in the chapter (bulk result). */
+  replaceLaneChecksForLane: (lane: CheckLane, checks: VerseLaneCheck[]) => void;
 }
 
 export function useChapter(book: string, chapter: number): UseChapterReturn {
@@ -188,6 +197,67 @@ export function useChapter(book: string, chapter: number): UseChapterReturn {
     [],
   );
 
+  const applyLocalLaneCheck = useCallback<UseChapterReturn["applyLocalLaneCheck"]>(
+    (verse, lane, userId, checked) => {
+      setData((prev) => {
+        if (!prev) return prev;
+        const exists = prev.verseLaneChecks.some(
+          (c) => c.verse === verse && c.lane === lane && c.checked_by === userId,
+        );
+        if (checked && exists) return prev;
+        if (!checked && !exists) return prev;
+        const next = checked
+          ? [
+              ...prev.verseLaneChecks,
+              {
+                book: prev.book,
+                chapter: prev.chapter,
+                verse,
+                lane,
+                checked_by: userId,
+                checked_at: Math.floor(Date.now() / 1000),
+              } as VerseLaneCheck,
+            ]
+          : prev.verseLaneChecks.filter(
+              (c) => !(c.verse === verse && c.lane === lane && c.checked_by === userId),
+            );
+        return { ...prev, verseLaneChecks: next };
+      });
+    },
+    [],
+  );
+
+  const applyLaneCheckers = useCallback<UseChapterReturn["applyLaneCheckers"]>(
+    (verse, lane, checkers) => {
+      setData((prev) => {
+        if (!prev) return prev;
+        const rest = prev.verseLaneChecks.filter((c) => !(c.verse === verse && c.lane === lane));
+        const now = Math.floor(Date.now() / 1000);
+        const added: VerseLaneCheck[] = checkers.map((checked_by) => ({
+          book: prev.book,
+          chapter: prev.chapter,
+          verse,
+          lane,
+          checked_by,
+          checked_at: now,
+        }));
+        return { ...prev, verseLaneChecks: [...rest, ...added] };
+      });
+    },
+    [],
+  );
+
+  const replaceLaneChecksForLane = useCallback<UseChapterReturn["replaceLaneChecksForLane"]>(
+    (lane, checks) => {
+      setData((prev) => {
+        if (!prev) return prev;
+        const rest = prev.verseLaneChecks.filter((c) => c.lane !== lane);
+        return { ...prev, verseLaneChecks: [...rest, ...checks] };
+      });
+    },
+    [],
+  );
+
   // Adopt server-confirmed values when an outbox op succeeds.
   useEffect(() => {
     return onOutboxResult((op, result) => {
@@ -211,9 +281,16 @@ export function useChapter(book: string, chapter: number): UseChapterReturn {
         if (s && s.book === book && s.chapter === chapter) {
           applyLocalVerseStatus(s.verse, s.done === 1);
         }
+        return;
+      }
+      if (op.target.kind === "lane_check") {
+        const s = result.updated as LaneCheckState;
+        if (s && s.book === book && s.chapter === chapter) {
+          applyLaneCheckers(s.verse, s.lane, s.checkers);
+        }
       }
     });
-  }, [book, chapter, applyLocalRowReplacement, applyLocalVerse, applyLocalVerseStatus]);
+  }, [book, chapter, applyLocalRowReplacement, applyLocalVerse, applyLocalVerseStatus, applyLaneCheckers]);
 
   return {
     status,
@@ -227,5 +304,8 @@ export function useChapter(book: string, chapter: number): UseChapterReturn {
     applyLocalRowInsert,
     applyLocalVerse,
     applyLocalVerseStatus,
+    applyLocalLaneCheck,
+    applyLaneCheckers,
+    replaceLaneChecksForLane,
   };
 }

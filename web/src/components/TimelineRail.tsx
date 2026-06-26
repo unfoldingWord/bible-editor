@@ -1,12 +1,99 @@
-import { Box, Tooltip, Checkbox } from "@mui/material";
-import CheckCircleIcon from "@mui/icons-material/CheckCircle";
-import RadioButtonUncheckedIcon from "@mui/icons-material/RadioButtonUnchecked";
+import { Box, Tooltip } from "@mui/material";
+import CheckIcon from "@mui/icons-material/Check";
+import type { CheckLane } from "../sync/api";
+import { LANE_FILL, type LaneShade } from "../lib/laneChecks";
+
+export interface VerseTileLane {
+  lane: CheckLane;
+  shade: LaneShade;
+  applicable: boolean;
+  title: string;
+}
 
 export interface VerseTile {
   verse: number;
   has: boolean;
   warn?: boolean;
-  done?: boolean;
+  // One entry per lane, in display order (text, tn, tw, tq).
+  lanes: VerseTileLane[];
+}
+
+// Single-letter lane glyphs for the rail header.
+const LANE_GLYPH: Record<CheckLane, string> = { text: "T", tn: "N", tw: "W", tq: "Q" };
+
+function LaneCell({
+  lane,
+  onToggle,
+}: {
+  lane: VerseTileLane;
+  onToggle: () => void;
+}) {
+  if (!lane.applicable) {
+    // N/A: nothing to check — no tooltip, just the muted dash.
+    return (
+      <Box
+        sx={{
+          width: 18,
+          height: 18,
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          color: "text.disabled",
+          fontSize: 12,
+          lineHeight: 1,
+          userSelect: "none",
+        }}
+      >
+        –
+      </Box>
+    );
+  }
+  const filled = lane.shade !== "open";
+  const fill = filled ? LANE_FILL[lane.shade as Exclude<LaneShade, "open">] : null;
+  const box = (
+    <Box
+      role="checkbox"
+      aria-checked={filled}
+      aria-label={lane.title}
+      onClick={(e) => {
+        e.stopPropagation();
+        onToggle();
+      }}
+      sx={{
+        width: 18,
+        height: 18,
+        borderRadius: "4px",
+        cursor: "pointer",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        bgcolor: fill ? fill.bg : "transparent",
+        color: fill ? fill.fg : "transparent",
+        border: fill ? "none" : "1.5px solid",
+        borderColor: fill ? "transparent" : "action.disabled",
+        transition: "background-color 120ms",
+        "&:hover": { borderColor: fill ? "transparent" : "text.secondary" },
+      }}
+    >
+      {filled && <CheckIcon sx={{ fontSize: 13 }} />}
+    </Box>
+  );
+  // Tooltip only on a CHECKED cell — the attribution of who checked it. Unchecked
+  // cells show no tooltip. Slow to appear (>1s), instant to dismiss.
+  if (!filled) return box;
+  return (
+    <Tooltip
+      title={lane.title}
+      placement="top"
+      enterDelay={1200}
+      enterNextDelay={1200}
+      leaveDelay={0}
+      // Gentle fade in, but vanish instantly on mouse-out (no lingering exit fade).
+      TransitionProps={{ timeout: { appear: 0, enter: 150, exit: 0 } }}
+    >
+      {box}
+    </Tooltip>
+  );
 }
 
 interface Props {
@@ -18,35 +105,59 @@ interface Props {
   // label tiles with chapter:verse (e.g. "2:3") instead of a bare verse number.
   showChapter?: boolean;
   onSelect: (verse: number) => void;
-  onToggleDone: (verse: number, done: boolean) => void;
+  onToggleLane: (verse: number, lane: CheckLane) => void;
 }
 
-export function TimelineRail({ book, chapter, tiles, activeVerse, showChapter = false, onSelect, onToggleDone }: Props) {
+export function TimelineRail({ book, chapter, tiles, activeVerse, showChapter = false, onSelect, onToggleLane }: Props) {
+  const laneOrder: CheckLane[] = ["text", "tn", "tw", "tq"];
   return (
     <Box
       sx={{
-        width: 64,
-        // flex-column child of the rail wrapper: must be able to shrink below
-        // its content height so overflowY:auto actually scrolls. flexShrink:0
-        // here pinned it to full content height, which both broke scrolling and
-        // overflowed the wrapper into the split container (scrolling the fixed
-        // headers off-screen via scrollIntoView).
+        width: "100%",
         flexGrow: 1,
         minHeight: 0,
         bgcolor: "grey.50",
         borderRight: "1px solid",
         borderColor: "divider",
         overflowY: "auto",
+        overflowX: "hidden",
         py: 0.5,
       }}
     >
+      {/* Lane-letter header so the four cells per row are legible. */}
+      <Box
+        sx={{
+          display: "grid",
+          gridTemplateColumns: "30px repeat(4, 1fr)",
+          alignItems: "center",
+          px: 0.75,
+          pb: 0.5,
+          position: "sticky",
+          top: -4,
+          bgcolor: "grey.50",
+          zIndex: 1,
+        }}
+      >
+        <span />
+        {laneOrder.map((l) => (
+          <Box
+            key={l}
+            sx={{ textAlign: "center", fontSize: 10, fontWeight: 600, color: "text.secondary", userSelect: "none" }}
+          >
+            {LANE_GLYPH[l]}
+          </Box>
+        ))}
+      </Box>
+
       {tiles.map((t) => {
         const active = t.verse === activeVerse;
+        const byLane = new Map(t.lanes.map((l) => [l.lane, l]));
         return (
           <Box
             key={t.verse}
             sx={{
-              display: "flex",
+              display: "grid",
+              gridTemplateColumns: "30px repeat(4, 1fr)",
               alignItems: "center",
               mx: 0.5,
               mb: 0.25,
@@ -56,14 +167,6 @@ export function TimelineRail({ book, chapter, tiles, activeVerse, showChapter = 
               "&:hover": active ? {} : { bgcolor: "action.hover" },
             }}
           >
-            <Checkbox
-              size="small"
-              checked={!!t.done}
-              onChange={(_e, v) => onToggleDone(t.verse, v)}
-              icon={<RadioButtonUncheckedIcon sx={{ fontSize: 16 }} />}
-              checkedIcon={<CheckCircleIcon sx={{ fontSize: 16, color: "success.main" }} />}
-              sx={{ p: 0.25 }}
-            />
             <Tooltip
               title={t.verse === 0 ? `${book} ${chapter} introduction` : `${book} ${chapter}:${t.verse}`}
               placement="right"
@@ -71,17 +174,14 @@ export function TimelineRail({ book, chapter, tiles, activeVerse, showChapter = 
               <Box
                 onClick={() => onSelect(t.verse)}
                 sx={{
-                  flex: 1,
                   fontFamily: "monospace",
-                  fontSize: showChapter ? 10 : 11,
+                  fontSize: showChapter ? 11 : 12,
                   fontWeight: active ? 700 : 400,
                   textAlign: "center",
                   whiteSpace: "nowrap",
                   py: 0.5,
                   cursor: "pointer",
                   position: "relative",
-                  textDecoration: t.done && !active ? "line-through" : "none",
-                  pr: t.has && !active ? "10px" : undefined,
                 }}
               >
                 {t.verse === 0 ? "i" : showChapter ? `${chapter}:${t.verse}` : t.verse}
@@ -91,9 +191,8 @@ export function TimelineRail({ book, chapter, tiles, activeVerse, showChapter = 
                     title="unaligned words remain"
                     sx={{
                       position: "absolute",
-                      right: 4,
-                      top: "50%",
-                      transform: "translateY(-50%)",
+                      right: -2,
+                      top: 2,
                       width: 5,
                       height: 5,
                       borderRadius: "50%",
@@ -104,21 +203,22 @@ export function TimelineRail({ book, chapter, tiles, activeVerse, showChapter = 
                   />
                 )}
                 {t.warn && (
-                  <Box
-                    sx={{
-                      position: "absolute",
-                      left: 2,
-                      top: "50%",
-                      transform: "translateY(-50%)",
-                      fontSize: 9,
-                      color: "error.main",
-                    }}
-                  >
-                    ⚠
-                  </Box>
+                  <Box sx={{ position: "absolute", left: -2, top: 2, fontSize: 9, color: "error.main" }}>⚠</Box>
                 )}
               </Box>
             </Tooltip>
+            {laneOrder.map((laneKind) => {
+              const lane = byLane.get(laneKind);
+              return (
+                <Box key={laneKind} sx={{ display: "flex", justifyContent: "center" }}>
+                  {lane ? (
+                    <LaneCell lane={lane} onToggle={() => onToggleLane(t.verse, laneKind)} />
+                  ) : (
+                    <span />
+                  )}
+                </Box>
+              );
+            })}
           </Box>
         );
       })}

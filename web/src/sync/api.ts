@@ -108,6 +108,29 @@ export interface VerseStatus {
   updated_at: number;
 }
 
+// Per-resource checkoff lanes. "text" = ULT + UST together.
+export type CheckLane = "text" | "tn" | "tw" | "tq";
+export const CHECK_LANES: readonly CheckLane[] = ["text", "tn", "tw", "tq"] as const;
+
+export interface VerseLaneCheck {
+  book: string;
+  chapter: number;
+  verse: number;
+  lane: CheckLane;
+  checked_by: number;
+  checked_at: number;
+}
+
+// Response from a lane toggle / WS event: the full checker set for one (verse,
+// lane) so the client can recompute its own shade.
+export interface LaneCheckState {
+  book: string;
+  chapter: number;
+  verse: number;
+  lane: CheckLane;
+  checkers: number[];
+}
+
 export interface ChapterPayload {
   book: string;
   chapter: number;
@@ -116,6 +139,7 @@ export interface ChapterPayload {
   tq: TqRow[];
   twl: TwlRow[];
   verseStatuses: VerseStatus[];
+  verseLaneChecks: VerseLaneCheck[];
 }
 
 export interface BookSummary {
@@ -1029,6 +1053,21 @@ export const api = {
     request<VerseStatus>(
       `/api/chapters/${encodeURIComponent(book)}/${chapter}/${verse}/status`,
       { method: "PATCH", body: JSON.stringify({ done }) },
+    ),
+
+  // Toggle my checkoff stamp on one (verse, lane). Returns the full checker set.
+  setLaneCheck: (book: string, chapter: number, verse: number, lane: CheckLane, checked: boolean) =>
+    request<LaneCheckState>(
+      `/api/chapters/${encodeURIComponent(book)}/${chapter}/${verse}/lanes/${lane}`,
+      { method: "PATCH", body: JSON.stringify({ checked }) },
+    ),
+
+  // Bulk "I'm done with <lane> for the chapter": apply across the given verses
+  // (client supplies the applicable list). Returns the chapter+lane check set.
+  setLaneCheckBulk: (book: string, chapter: number, lane: CheckLane, checked: boolean, verses: number[]) =>
+    request<{ book: string; chapter: number; lane: CheckLane; checks: VerseLaneCheck[] }>(
+      `/api/chapters/${encodeURIComponent(book)}/${chapter}/lanes/${lane}/bulk`,
+      { method: "PATCH", body: JSON.stringify({ checked, verses }) },
     ),
 
   createRow: <T = unknown>(kind: RowKind, body: Record<string, unknown>) =>

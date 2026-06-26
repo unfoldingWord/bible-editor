@@ -2,7 +2,9 @@ import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import { Box, Stack, Typography, IconButton, Tooltip } from "@mui/material";
 import SaveIcon from "@mui/icons-material/Save";
 import UndoIcon from "@mui/icons-material/Undo";
+import CheckIcon from "@mui/icons-material/Check";
 import type { TwlRow, VerseDto } from "../sync/api";
+import { LANE_FILL, type TextLaneCheck } from "../lib/laneChecks";
 import { highlightsFor, renderEditableHTML, renderHighlightedHTML, type HighlightKey, type ReorderHighlight } from "../lib/highlight";
 import { markHighlightSx } from "../lib/highlightStyles";
 import { extractTrailingMarkers, stripTrailingMarkers, splitSectionHeaders, type SectionHeader } from "../lib/usfm";
@@ -83,6 +85,10 @@ interface Props {
     change: { index: number; tag: string | null; text: string },
     base: VerseDto,
   ) => void;
+  // Optional per-verse Text-lane check. When present and canCheck, each verse
+  // gets a small check control + a tinted verse-number underline. The
+  // integrator wires this from Shell; absent in standalone/source columns.
+  textCheck?: TextLaneCheck;
 }
 
 // Continuous Word-style editor for one bible_version. Each verse is its
@@ -117,6 +123,7 @@ export function DocColumn({
   onSaveColumn,
   onOpenAligner,
   onEditSection,
+  textCheck,
 }: Props) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const activeRef = useRef<HTMLSpanElement | null>(null);
@@ -253,6 +260,7 @@ export function DocColumn({
                 search={search ?? null}
                 findActiveMatch={findActiveMatch ?? null}
                 spanRef={isActive ? activeRef : null}
+                textCheck={textCheck}
                 onClick={() => onSelectVerse(dto.verse)}
                 onAlign={() => onOpenAligner(dto.verse)}
                 onEdit={(plain) => onEditVerse(dto.verse, plain, dto)}
@@ -324,6 +332,7 @@ function VerseSpan({
   search,
   findActiveMatch,
   spanRef,
+  textCheck,
   onClick,
   onAlign,
   onEdit,
@@ -361,6 +370,7 @@ function VerseSpan({
   search: SearchState | null;
   findActiveMatch: FindMatch | null;
   spanRef: React.MutableRefObject<HTMLSpanElement | null> | null;
+  textCheck?: TextLaneCheck;
   onClick: () => void;
   onAlign: () => void;
   onEdit: (plain: string) => void;
@@ -534,6 +544,11 @@ function VerseSpan({
     if (spanRef) spanRef.current = node;
   };
 
+  // Text-lane check state for this verse (when wired). The tinted underline on
+  // the verse marker keeps the checked state visible even with controls hidden.
+  const textShade = textCheck ? textCheck.shade(verseNum) : "open";
+  const showTextCheck = !!textCheck?.canCheck && !readOnly;
+
   return (
     <>
     <span
@@ -561,6 +576,8 @@ function VerseSpan({
           color: isRange ? "#014263" : "#9aa0a6",
           verticalAlign: "1px",
           marginRight: 4,
+          borderBottom:
+            textShade !== "open" ? `2px solid ${LANE_FILL[textShade].bg}` : undefined,
         }}
       >
         {verseNum === 0 ? "intro" : `${chapter}:${verseLabel}`}
@@ -577,6 +594,31 @@ function VerseSpan({
             onAlign();
           }}
         />
+      )}
+      {showTextCheck && (
+        <Tooltip title={`Text — ${textCheck!.attribution(verseNum)}`}>
+          <IconButton
+            onClick={(e) => {
+              e.stopPropagation();
+              textCheck!.onToggle(verseNum);
+            }}
+            size="small"
+            sx={{
+              p: 0.25,
+              verticalAlign: "-3px",
+              borderRadius: 0.5,
+              border: textShade === "open" ? "1px solid" : "none",
+              borderColor: "divider",
+              bgcolor: textShade === "open" ? "transparent" : LANE_FILL[textShade].bg,
+              color: textShade === "open" ? "text.disabled" : LANE_FILL[textShade].fg,
+              "&:hover": {
+                bgcolor: textShade === "open" ? "action.hover" : LANE_FILL[textShade].bg,
+              },
+            }}
+          >
+            <CheckIcon sx={{ fontSize: 14 }} />
+          </IconButton>
+        </Tooltip>
       )}
       {!readOnly && hasDraft && (
         <Tooltip title={`undo edits to verse ${verseNum}`}>
