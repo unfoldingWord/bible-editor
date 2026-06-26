@@ -127,6 +127,7 @@ function countSourceWords(row: VerseDto | undefined): number {
 const SCRIPTURE_MODE_KEY = "be:scriptureMode";
 const ENABLED_VERSIONS_KEY = "be:enabledVersions";
 const RAIL_COLLAPSED_KEY = "be:railCollapsed";
+const ENABLED_LANES_KEY = "be:enabledLanes";
 
 function loadFromStorage<T>(key: string, fallback: T): T {
   try {
@@ -312,6 +313,27 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       return next;
     });
   }, []);
+  // Which checkoff lanes show as columns in the timeline rail. Defaults to all
+  // four; users hide lanes they don't track (rail then narrows) and re-enable
+  // them from the Board dialog. Persisted; normalized to canonical order so a
+  // stale/corrupt value can't reorder or smuggle in unknown lane keys. An empty
+  // array (all lanes hidden) is a valid, intentional state.
+  const [enabledLanes, setEnabledLanes] = useState<CheckLane[]>(() => {
+    const saved = loadFromStorage<CheckLane[]>(ENABLED_LANES_KEY, [...CHECK_LANES]);
+    return CHECK_LANES.filter((l) => saved.includes(l));
+  });
+  const toggleLaneVisible = useCallback((lane: CheckLane) => {
+    setEnabledLanes((prev) => {
+      const next = prev.includes(lane)
+        ? prev.filter((l) => l !== lane)
+        : CHECK_LANES.filter((l) => l === lane || prev.includes(l));
+      saveToStorage(ENABLED_LANES_KEY, next);
+      return next;
+    });
+  }, []);
+  // Rail width tracks the visible lane count (verse column + ~25px per lane),
+  // floored so the "Board" button label stays readable. 0 when collapsed.
+  const railWidth = railCollapsed ? 0 : Math.max(96, 48 + enabledLanes.length * 25);
   const [alignerTarget, setAlignerTarget] = useState<AlignerTarget | null>(null);
   const [panelMode, setPanelMode] = useState<PanelMode>("resources");
   const [alignmentDirty, setAlignmentDirty] = useState(false);
@@ -756,7 +778,6 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     isDraggingRef.current = true;
     document.body.style.cursor = "ew-resize";
     document.body.style.userSelect = "none";
-    const railWidth = railCollapsed ? 0 : 148;
     const onMouseMove = (ev: MouseEvent) => {
       if (!isDraggingRef.current || !splitContainerRef.current) return;
       const rect = splitContainerRef.current.getBoundingClientRect();
@@ -773,7 +794,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     };
     window.addEventListener("mousemove", onMouseMove);
     window.addEventListener("mouseup", onMouseUp);
-  }, [railCollapsed]);
+  }, [railWidth]);
 
   // Pre-load lexicon entries for every UHB Strong's in the loaded chapter
   // AND every loaded chapter in book mode, so the per-word tooltips in the
@@ -2053,7 +2074,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       )}
       <Box ref={splitContainerRef} sx={{ flex: 1, display: "flex", overflow: "hidden" }}>
         {!railCollapsed && (
-          <Box sx={{ width: 148, flexShrink: 0, minHeight: 0, overflow: "hidden", display: "flex", flexDirection: "column" }}>
+          <Box sx={{ width: railWidth, flexShrink: 0, minHeight: 0, overflow: "hidden", display: "flex", flexDirection: "column" }}>
             <Tooltip title="Chapter checkoff board" placement="right">
               <Button
                 size="small"
@@ -2081,8 +2102,10 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
               tiles={tileSet}
               activeVerse={activeVerse}
               showChapter={mode === "book"}
+              enabledLanes={enabledLanes}
               onSelect={requestSelectVerse}
               onToggleLane={toggleLane}
+              onHideLane={toggleLaneVisible}
             />
             <Box
               sx={{
@@ -2536,6 +2559,8 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       <ChapterBoard
         open={boardOpen}
         onClose={() => setBoardOpen(false)}
+        enabledLanes={enabledLanes}
+        onToggleLaneVisible={toggleLaneVisible}
         book={book}
         chapter={chapter}
         tiles={tileSet}

@@ -10,6 +10,8 @@ import {
 import CloseIcon from "@mui/icons-material/Close";
 import CheckIcon from "@mui/icons-material/Check";
 import DoneAllIcon from "@mui/icons-material/DoneAll";
+import VisibilityIcon from "@mui/icons-material/Visibility";
+import VisibilityOffIcon from "@mui/icons-material/VisibilityOff";
 import { CHECK_LANES, type CheckLane } from "../sync/api";
 import { LANE_FILL, LANE_LABELS, type LaneShade } from "../lib/laneChecks";
 import type { VerseTile, VerseTileLane } from "./TimelineRail";
@@ -23,6 +25,10 @@ export interface ChapterBoardProps {
   canCheck: boolean;
   onToggle: (verse: number, lane: CheckLane) => void; // per cell
   onBulkToggle: (lane: CheckLane) => void; // column "all" (already confirm-gated upstream — just call it)
+  // Lanes currently shown in the timeline rail; the board always lists every
+  // lane so a hidden one can be turned back on here.
+  enabledLanes: CheckLane[];
+  onToggleLaneVisible: (lane: CheckLane) => void;
 }
 
 // Column layout shared by header / body / footer so the grid stays aligned.
@@ -99,6 +105,8 @@ export function ChapterBoard({
   canCheck,
   onToggle,
   onBulkToggle,
+  enabledLanes,
+  onToggleLaneVisible,
 }: ChapterBoardProps) {
   // Per-lane tally: applicable = cells where the lane applies; done = those with
   // a non-"open" shade (checked by me / others / both). Percent rounds done/applicable.
@@ -146,7 +154,9 @@ export function ChapterBoard({
             }}
           >
             <Box sx={{ fontSize: 14, fontWeight: 600, color: "text.secondary", pl: 0.5 }}>#</Box>
-            {CHECK_LANES.map((laneKind) => (
+            {CHECK_LANES.map((laneKind) => {
+              const shown = enabledLanes.includes(laneKind);
+              return (
               <Box
                 key={laneKind}
                 sx={{
@@ -156,9 +166,35 @@ export function ChapterBoard({
                   gap: 0.25,
                 }}
               >
-                <Typography sx={{ fontSize: 15, fontWeight: 600 }}>
+                <Typography
+                  sx={{ fontSize: 15, fontWeight: 600, color: shown ? "text.primary" : "text.disabled" }}
+                >
                   {LANE_LABELS[laneKind]}
                 </Typography>
+                <Tooltip title={shown ? "Hide this lane in the sidebar" : "Show this lane in the sidebar"}>
+                  <Box
+                    role="button"
+                    aria-label={`${shown ? "Hide" : "Show"} ${LANE_LABELS[laneKind]} in sidebar`}
+                    aria-pressed={shown}
+                    onClick={() => onToggleLaneVisible(laneKind)}
+                    sx={{
+                      display: "inline-flex",
+                      alignItems: "center",
+                      gap: 0.25,
+                      cursor: "pointer",
+                      color: shown ? "primary.main" : "text.disabled",
+                      fontSize: 12,
+                      "&:hover": { textDecoration: "underline" },
+                    }}
+                  >
+                    {shown ? (
+                      <VisibilityIcon sx={{ fontSize: 14 }} />
+                    ) : (
+                      <VisibilityOffIcon sx={{ fontSize: 14 }} />
+                    )}
+                    {shown ? "shown" : "hidden"}
+                  </Box>
+                </Tooltip>
                 {canCheck && (
                   <Box
                     role="button"
@@ -179,7 +215,8 @@ export function ChapterBoard({
                   </Box>
                 )}
               </Box>
-            ))}
+              );
+            })}
           </Box>
 
           {/* Body rows */}

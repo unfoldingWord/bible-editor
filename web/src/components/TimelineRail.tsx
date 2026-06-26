@@ -1,7 +1,7 @@
 import { Box, Tooltip } from "@mui/material";
 import CheckIcon from "@mui/icons-material/Check";
 import type { CheckLane } from "../sync/api";
-import { LANE_FILL, type LaneShade } from "../lib/laneChecks";
+import { LANE_FILL, LANE_LABELS, type LaneShade } from "../lib/laneChecks";
 
 export interface VerseTileLane {
   lane: CheckLane;
@@ -104,12 +104,17 @@ interface Props {
   // In book mode the rail covers one chapter inside a whole-book scroll, so
   // label tiles with chapter:verse (e.g. "2:3") instead of a bare verse number.
   showChapter?: boolean;
+  // Lanes to show as columns, in canonical order. Hiding lanes narrows the rail.
+  enabledLanes: CheckLane[];
   onSelect: (verse: number) => void;
   onToggleLane: (verse: number, lane: CheckLane) => void;
+  // Click a lane header to hide that lane (re-enable from the Board dialog).
+  onHideLane: (lane: CheckLane) => void;
 }
 
-export function TimelineRail({ book, chapter, tiles, activeVerse, showChapter = false, onSelect, onToggleLane }: Props) {
-  const laneOrder: CheckLane[] = ["text", "tn", "tw", "tq"];
+export function TimelineRail({ book, chapter, tiles, activeVerse, showChapter = false, enabledLanes, onSelect, onToggleLane, onHideLane }: Props) {
+  const laneOrder = enabledLanes;
+  const gridTemplate = `30px repeat(${laneOrder.length}, 1fr)`;
   return (
     <Box
       sx={{
@@ -124,11 +129,11 @@ export function TimelineRail({ book, chapter, tiles, activeVerse, showChapter = 
         py: 0.5,
       }}
     >
-      {/* Lane-letter header so the four cells per row are legible. */}
+      {/* Lane-letter header — each glyph is a link that hides its lane. */}
       <Box
         sx={{
           display: "grid",
-          gridTemplateColumns: "30px repeat(4, 1fr)",
+          gridTemplateColumns: gridTemplate,
           alignItems: "center",
           px: 0.75,
           pb: 0.5,
@@ -140,12 +145,34 @@ export function TimelineRail({ book, chapter, tiles, activeVerse, showChapter = 
       >
         <span />
         {laneOrder.map((l) => (
-          <Box
-            key={l}
-            sx={{ textAlign: "center", fontSize: 10, fontWeight: 600, color: "text.secondary", userSelect: "none" }}
-          >
-            {LANE_GLYPH[l]}
-          </Box>
+          <Tooltip key={l} title={`Hide ${LANE_LABELS[l]} — re-enable from Board`} placement="top">
+            <Box
+              role="button"
+              aria-label={`Hide ${LANE_LABELS[l]} lane`}
+              onClick={() => onHideLane(l)}
+              sx={{
+                textAlign: "center",
+                cursor: "pointer",
+                userSelect: "none",
+                "&:hover .lane-glyph": { color: "primary.main", borderColor: "primary.main" },
+              }}
+            >
+              <Box
+                component="span"
+                className="lane-glyph"
+                sx={{
+                  fontSize: 10,
+                  fontWeight: 600,
+                  color: "text.secondary",
+                  borderBottom: "1px dotted",
+                  borderColor: "text.disabled",
+                  pb: "1px",
+                }}
+              >
+                {LANE_GLYPH[l]}
+              </Box>
+            </Box>
+          </Tooltip>
         ))}
       </Box>
 
@@ -157,7 +184,7 @@ export function TimelineRail({ book, chapter, tiles, activeVerse, showChapter = 
             key={t.verse}
             sx={{
               display: "grid",
-              gridTemplateColumns: "30px repeat(4, 1fr)",
+              gridTemplateColumns: gridTemplate,
               alignItems: "center",
               mx: 0.5,
               mb: 0.25,
