@@ -22,12 +22,20 @@ import RefreshIcon from "@mui/icons-material/Refresh";
 import AutoAwesomeIcon from "@mui/icons-material/AutoAwesome";
 import BlockIcon from "@mui/icons-material/Block";
 import ReplayIcon from "@mui/icons-material/Replay";
+import OpenInNewIcon from "@mui/icons-material/OpenInNew";
 import { api, type TwlSuggestion } from "../sync/api";
 
 // rc://*/tw/dict/bible/names/moab → names/moab; bare id passes through.
 function twShort(idOrLink: string): string {
   const m = idOrLink.match(/\/bible\/([^/]+\/[^/]+)$/);
   return m ? m[1] : idOrLink;
+}
+
+// "kt/god" or "rc://*/tw/dict/bible/kt/god" → Door43 preview article URL.
+function twArticleUrl(articleId: string): string {
+  const m = articleId.match(/\/bible\/([^/]+)\/([^/]+)$/) ?? articleId.match(/^([^/]+)\/([^/]+)$/);
+  if (!m) return "";
+  return `https://preview.door43.org/u/unfoldingWord/en_tw/master#${m[1]}--${m[2]}`;
 }
 
 interface Props {
@@ -208,7 +216,7 @@ function TwlSuggestionsInner({ book, chapter, verse, refreshKey, onAdd, isExclud
                 key={k}
                 sx={{
                   display: "grid",
-                  gridTemplateColumns: "1fr auto 28px 28px",
+                  gridTemplateColumns: "1fr auto 28px 28px 28px",
                   alignItems: "center",
                   gap: 0.5,
                   px: 1,
@@ -278,6 +286,18 @@ function TwlSuggestionsInner({ book, chapter, verse, refreshKey, onAdd, isExclud
                     sx={{ p: 0.25 }}
                   >
                     {isRejected ? <ReplayIcon fontSize="small" /> : <BlockIcon fontSize="small" />}
+                  </IconButton>
+                </Tooltip>
+                <Tooltip title="read article on Door43 (opens new tab)">
+                  <IconButton
+                    size="small"
+                    component="a"
+                    href={twArticleUrl(selected)}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    sx={{ p: 0.25, color: "text.secondary" }}
+                  >
+                    <OpenInNewIcon sx={{ fontSize: 15 }} />
                   </IconButton>
                 </Tooltip>
               </Box>

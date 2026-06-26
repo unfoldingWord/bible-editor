@@ -7,6 +7,7 @@ import AutoFixHighIcon from "@mui/icons-material/AutoFixHigh";
 import UndoIcon from "@mui/icons-material/Undo";
 import SaveIcon from "@mui/icons-material/Save";
 import SaveOutlinedIcon from "@mui/icons-material/SaveOutlined";
+import OpenInNewIcon from "@mui/icons-material/OpenInNew";
 import type { TwlRow } from "../sync/api";
 import { useCatalogs } from "../hooks/useCatalogs";
 import { CatalogPicker } from "./CatalogPicker";
@@ -496,7 +497,7 @@ const WordRow = memo(function WordRow({
           </Typography>
         </Tooltip>
       ) : null}
-      <Box sx={{ gridArea: "twarticle", minWidth: 0 }}>
+      <Box sx={{ gridArea: "twarticle", minWidth: 0, display: "flex", alignItems: "center", gap: 0.5 }}>
         <CatalogPicker
           value={twLink}
           options={catalogs.twLinks}
@@ -504,6 +505,20 @@ const WordRow = memo(function WordRow({
           placeholder="names/, kt/, other/, …"
           onChange={(next) => setTwLink(next)}
         />
+        {twLink && (
+          <Tooltip title="read article on Door43 (opens new tab)">
+            <IconButton
+              size="small"
+              component="a"
+              href={twArticleUrl(twLink)}
+              target="_blank"
+              rel="noopener noreferrer"
+              sx={{ p: 0.25, color: "text.secondary", flexShrink: 0 }}
+            >
+              <OpenInNewIcon sx={{ fontSize: 15 }} />
+            </IconButton>
+          </Tooltip>
+        )}
       </Box>
       <Tooltip title={isDirty ? "save edits" : "no unsaved edits"}>
         <span style={{ gridArea: "save" }}>
@@ -570,4 +585,12 @@ function twShort(link: string | null): string {
   // rc://*/tw/dict/bible/names/moab → names/moab
   const m = link.match(/\/bible\/([^/]+\/[^/]+)$/);
   return m ? m[1] : link;
+}
+
+// rc://*/tw/dict/bible/kt/god → Door43 preview article URL.
+function twArticleUrl(link: string | null): string {
+  if (!link) return "";
+  const m = link.match(/\/bible\/([^/]+)\/([^/]+)$/);
+  if (!m) return "";
+  return `https://preview.door43.org/u/unfoldingWord/en_tw/master#${m[1]}--${m[2]}`;
 }
