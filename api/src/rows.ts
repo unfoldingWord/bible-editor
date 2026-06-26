@@ -271,7 +271,7 @@ rows.post("/:kind", requireEditor, async (c) => {
     const lane = KIND_TO_REOPEN_LANE[kind];
     if (lane) {
       c.executionCtx.waitUntil(
-        reopenLaneChecks(c.env.DB, row.book, row.chapter, row.verse, [lane]),
+        reopenLaneChecks(c.env, row.book, row.chapter, row.verse, [lane]),
       );
     }
   }
@@ -727,7 +727,7 @@ rows.patch("/:kind/:id", requireEditor, async (c) => {
     const lane = KIND_TO_REOPEN_LANE[kind];
     if (lane) {
       c.executionCtx.waitUntil(
-        reopenLaneChecks(c.env.DB, row.book, row.chapter, row.verse, [lane]),
+        reopenLaneChecks(c.env, row.book, row.chapter, row.verse, [lane]),
       );
     }
   }
@@ -806,7 +806,7 @@ rows.delete("/:kind/:id", requireEditor, async (c) => {
     const lane = KIND_TO_REOPEN_LANE[kind];
     if (lane) {
       c.executionCtx.waitUntil(
-        reopenLaneChecks(c.env.DB, scope.book, scope.chapter, scope.verse, [lane]),
+        reopenLaneChecks(c.env, scope.book, scope.chapter, scope.verse, [lane]),
       );
     }
   }

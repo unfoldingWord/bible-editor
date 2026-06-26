@@ -379,7 +379,7 @@ verses.patch("/:book/:chapter/:verse/:bibleVersion", requireEditor, async (c) =>
     // already landed above); see reopenLaneChecks.
     const lanes: CheckLane[] = bibleVersion === "ULT" ? ["text", "tw"] : ["text"];
     c.executionCtx.waitUntil(
-      reopenLaneChecks(c.env.DB, updated.book, updated.chapter, updated.verse, lanes),
+      reopenLaneChecks(c.env, updated.book, updated.chapter, updated.verse, lanes),
     );
   }
   return c.json(updated ? { ...updated, content: updatedParsed } : null);
