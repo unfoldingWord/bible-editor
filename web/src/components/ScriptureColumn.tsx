@@ -12,6 +12,7 @@ import SaveOutlinedIcon from "@mui/icons-material/SaveOutlined";
 import type { ChapterPayload, TnRow, TwlRow, VerseDto } from "../sync/api";
 import { drafts, verseKey } from "../sync/drafts";
 import { DocColumn } from "./DocColumn";
+import type { TextLaneCheck } from "../lib/laneChecks";
 import type { FindMatch } from "./FindReplaceOverlay";
 import { HebrewLine } from "./HebrewLine";
 import type { LexiconEntry } from "../hooks/useLexicon";
@@ -144,6 +145,8 @@ interface Props {
   // (ULT/UST) as read-only too — UHB/UGNT already are by virtue of
   // READ_ONLY_VERSIONS. The banner above the column tells the user why.
   locked?: boolean;
+  // Per-verse Text-lane checkoff, forwarded to the column/book scripture views.
+  textCheck?: TextLaneCheck;
 }
 
 const VERSION_LABEL: Record<string, string> = {
@@ -211,6 +214,7 @@ function ScriptureColumnInner({
   onEditSection,
   onEditBookSection,
   locked = false,
+  textCheck,
 }: Props) {
   const activeRef = useRef<HTMLDivElement | null>(null);
   const bodyRef = useRef<HTMLDivElement | null>(null);
@@ -265,6 +269,7 @@ function ScriptureColumnInner({
         tq: [],
         twl: [],
         verseStatuses: [],
+        verseLaneChecks: [],
       } as ChapterPayload,
     });
     return m;
@@ -543,6 +548,7 @@ function ScriptureColumnInner({
               onOpenAligner={onOpenBookAligner}
               onEditSection={onEditBookSection}
               locked={locked}
+              textCheck={textCheck}
             />
           </Suspense>
         ) : (
@@ -558,6 +564,7 @@ function ScriptureColumnInner({
                 chapter={chapter}
                 activeVerse={activeVerse}
                 readOnly={READ_ONLY_VERSIONS.has(v) || locked}
+                textCheck={READ_ONLY_VERSIONS.has(v) ? undefined : textCheck}
                 rtl={v === "UHB"}
                 activeNoteQuote={activeNoteQuote}
                 activeNoteOccurrence={activeNoteOccurrence}
@@ -619,7 +626,8 @@ function areScriptureColumnPropsEqual(a: Props, b: Props): boolean {
     // so re-render to keep the hint current (the row subtrees stay memoized,
     // so only the active UHB line actually re-renders).
     a.twl === b.twl &&
-    a.locked === b.locked
+    a.locked === b.locked &&
+    a.textCheck === b.textCheck
   );
 }
 

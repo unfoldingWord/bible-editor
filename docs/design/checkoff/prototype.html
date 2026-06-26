@@ -1,0 +1,276 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Bible editor — verse checkoff (design prototype)</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@tabler/icons-webfont@3/dist/tabler-icons.min.css" />
+<style>
+  :root{
+    --bg:#FFFFFF; --surface:#F4F8FB; --surface2:#E8EFF5;
+    --text:#231F20; --text2:#5C6A78; --text3:#9AA5B0;
+    --border:#E5EBF0; --border2:#D6DEE5; --border3:#9AA5B0;
+    --teal-others:#A0DEDF; --teal-me:#70C9CC; --teal-both:#3F9CA0;
+    --ocean:#014263; --inspire:#31ADE3; --info:#016693;
+    --kindle:#E59D33; --red:#E24B4A;
+    --radius:10px; --radius-lg:14px;
+  }
+  *{box-sizing:border-box;}
+  body{margin:0;background:var(--bg);color:var(--text);
+    font-family:"Segoe UI",Roboto,Helvetica,Arial,sans-serif;font-size:17px;line-height:1.5;}
+  .wrap{max-width:1080px;margin:0 auto;padding:24px 28px 64px;}
+  h1{font-size:24px;font-weight:600;margin:0 0 4px;}
+  .sub{font-size:15px;color:var(--text2);margin:0 0 20px;}
+  .bar{display:flex;flex-wrap:wrap;gap:18px;align-items:center;justify-content:space-between;
+    background:var(--surface);border-radius:var(--radius-lg);padding:12px 16px;margin-bottom:22px;}
+  .grp{display:flex;align-items:center;gap:10px;}
+  .grp .cap{font-size:14px;color:var(--text3);}
+  .seg{font-size:15px;padding:8px 16px;border-radius:18px;border:1px solid var(--border2);
+    background:transparent;color:var(--text2);cursor:pointer;font-family:inherit;}
+  .seg.on{background:var(--teal-me);color:var(--ocean);border-color:var(--teal-both);font-weight:500;}
+  .legend{display:flex;flex-wrap:wrap;gap:16px;font-size:14px;color:var(--text2);}
+  .legend span{display:inline-flex;align-items:center;gap:7px;}
+  .sw{width:20px;height:20px;border-radius:4px;display:inline-flex;align-items:center;justify-content:center;font-size:12px;}
+
+  .editor{display:flex;gap:18px;flex-wrap:wrap;align-items:flex-start;margin-bottom:22px;}
+  .rail{background:var(--surface);border-radius:var(--radius-lg);padding:12px 10px;width:182px;flex:0 0 auto;}
+  .railhead{display:grid;grid-template-columns:26px repeat(4,1fr);gap:6px;padding:0 4px 8px;
+    font-size:12px;color:var(--text3);text-align:center;}
+  .railrow{display:grid;grid-template-columns:26px repeat(4,1fr);gap:6px;align-items:center;padding:5px 4px;border-radius:8px;}
+  .railrow .vnum{font-size:15px;color:var(--text2);text-align:center;cursor:pointer;}
+  .cell{display:inline-flex;width:26px;height:26px;border-radius:5px;align-items:center;justify-content:center;font-size:14px;cursor:pointer;}
+  .cell.na{cursor:default;color:var(--text3);font-size:16px;}
+  .cell.open{border:2px solid var(--border3);}
+  .cell.others{background:var(--teal-others);color:var(--ocean);}
+  .cell.me{background:var(--teal-me);color:var(--ocean);}
+  .cell.both{background:var(--teal-both);color:#fff;}
+
+  .center{flex:1 1 420px;min-width:340px;display:flex;flex-direction:column;gap:16px;}
+  .card,.panel{background:var(--bg);border:1px solid var(--border);border-radius:var(--radius-lg);}
+  .card{padding:18px 20px;}
+  .card .top{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;}
+  .card .vlabel{font-size:19px;font-weight:600;margin:0;}
+  .vtext{font-size:18px;line-height:1.6;color:var(--text2);margin:0;}
+  .vtext .tag{font-size:12px;color:var(--text3);margin-right:6px;vertical-align:2px;}
+  .chip{display:inline-flex;align-items:center;gap:9px;font-size:15px;padding:8px 15px;border-radius:18px;
+    border:1px solid var(--border2);background:transparent;color:var(--text2);cursor:pointer;font-family:inherit;}
+  .lk{font-size:14px;color:var(--info);cursor:pointer;display:inline-flex;align-items:center;gap:5px;background:none;border:none;font-family:inherit;}
+  .tabs{display:flex;gap:4px;padding:10px 14px 0;border-bottom:1px solid var(--border);}
+  .tab{font-size:16px;padding:10px 16px;cursor:pointer;color:var(--text2);border-bottom:3px solid transparent;}
+  .tab.on{color:var(--ocean);border-bottom-color:var(--inspire);font-weight:500;}
+  .pbody{padding:16px;}
+  .sugg{display:flex;align-items:center;gap:12px;border:1px dashed var(--border2);border-radius:var(--radius);padding:12px 14px;}
+  .suggrow{display:flex;align-items:center;gap:10px;border:1px dashed var(--border2);border-radius:var(--radius);padding:9px 13px;background:#E6F4FB;}
+
+  .doc{position:relative;font-size:19px;line-height:2.4;color:var(--text2);
+    background:var(--bg);border:1px solid var(--border);border-radius:var(--radius-lg);padding:22px 26px;margin-bottom:22px;}
+  .vn{font-family:"Consolas",monospace;font-size:15px;cursor:pointer;margin-right:6px;vertical-align:3px;color:var(--text3);padding-bottom:2px;}
+  .vn.me{border-bottom:3px solid var(--teal-me);color:var(--text);}
+  .vn.others{border-bottom:3px solid var(--teal-others);color:var(--text);}
+  .vn.both{border-bottom:3px solid var(--teal-both);color:var(--text);}
+  .tbar{position:absolute;display:none;align-items:center;gap:5px;background:var(--bg);
+    border:1px solid var(--border2);border-radius:22px;padding:5px 8px;z-index:5;box-shadow:0 2px 10px rgba(1,66,99,.12);}
+  .tb{display:inline-flex;align-items:center;justify-content:center;width:36px;height:36px;border-radius:50%;cursor:pointer;font-size:19px;color:var(--text2);}
+  .tb:hover{background:var(--surface);}
+
+  .boardwrap{margin-top:8px;}
+  .boardwrap h2{font-size:17px;font-weight:500;color:var(--text2);margin:0 0 10px;}
+  table{width:100%;border-collapse:collapse;font-size:16px;}
+  th,td{border-top:1px solid var(--border);}
+  .note{font-size:14px;color:var(--text3);line-height:1.6;margin:10px 2px 0;}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Verse checkoff — design prototype</h1>
+  <p class="sub">Four lanes per verse, one shaded stamp each. Shade encodes <em>who</em>: light = someone else, mid = you, dark = you + others. Switch identity, click any cell, toggle the view.</p>
+
+  <div class="bar">
+    <div class="grp">
+      <span class="cap">view</span>
+      <span id="views"></span>
+    </div>
+    <div class="grp">
+      <span class="cap">viewing as</span>
+      <span id="ids"></span>
+    </div>
+    <div class="legend" id="legend"></div>
+  </div>
+
+  <div id="rowsView">
+    <div class="editor">
+      <div class="rail">
+        <div class="railhead"><span></span><span title="Text">T</span><span title="Notes">N</span><span title="Words">W</span><span title="Questions">Q</span></div>
+        <div id="rail"></div>
+      </div>
+      <div class="center">
+        <div class="card" id="card"></div>
+        <div class="panel" id="panel"></div>
+      </div>
+    </div>
+  </div>
+
+  <div id="docView" hidden>
+    <div class="doc" id="doc">
+      <span class="vn" data-v="1">1</span>In the eighth month, in the second year of Darius, the word of Yahweh came to the prophet Zechariah.
+      <span class="vn" data-v="2">2</span>Yahweh was very angry with your ancestors.
+      <span class="vn" data-v="3">3</span>Therefore say to them, &lsquo;Thus declares Yahweh of hosts: Return to me, and I will return to you,&rsquo; says Yahweh of hosts.
+      <span class="vn" data-v="4">4</span><span id="m4"></span>Do not be like your ancestors, to whom the former prophets proclaimed.
+      <span class="vn" data-v="5">5</span>Your ancestors, where are they? And the prophets, do they live forever?
+      <span class="vn" data-v="6">6</span>But my words and my statutes, which I commanded my servants the prophets, did they not overtake your ancestors?
+      <div class="tbar" id="tbar"></div>
+    </div>
+    <p class="note">At rest the column is just text + tinted numbers — state is always visible, buttons are not. Click a number to activate it; the toolbar floats above with no text reflow and no reserved gutter.</p>
+  </div>
+
+  <div class="boardwrap">
+    <h2>Chapter board — Zechariah 1</h2>
+    <div style="overflow-x:auto;"><table><thead><tr id="bhead"></tr></thead><tbody id="bbody"></tbody><tfoot><tr id="bfoot"></tr></tfoot></table></div>
+  </div>
+
+  <p class="note">Prototype only — no data is saved. Lane checks, shades, the Words→suggestions pause, bulk "all this chapter", and "simulate edit" (reopens a verse) are all live to click.</p>
+</div>
+
+<script>
+(function(){
+  var IDS=["You","Benjamin","Sue"], idi=0;
+  var LANES=[{k:"text",l:"Text"},{k:"tn",l:"Notes"},{k:"tw",l:"Words"},{k:"tq",l:"Questions"}];
+  var VS=[1,2,3,4,5,6], active=3, view="rows", tab="tw", peek={}, dirty={3:true}, broken={4:true}, docActive=null;
+  var TXT={
+    1:["In the eighth month, in the second year of Darius, the word of Yahweh came to the prophet Zechariah.","In the eighth month of the second year that Darius ruled, Yahweh gave this message to the prophet Zechariah."],
+    2:["Yahweh was very angry with your ancestors.","Yahweh was very angry with your ancestors long ago."],
+    3:["Therefore say to them, ‘Thus declares Yahweh of hosts: Return to me,’ says Yahweh of hosts.","So tell the people that the Commander of heaven’s armies says, ‘Come back to me.’"],
+    4:["Do not be like your ancestors, to whom the former prophets proclaimed.","Do not act the way your ancestors did, the people the earlier prophets warned."],
+    5:["Your ancestors, where are they? And the prophets, do they live forever?","Your ancestors have died, and the prophets do not live forever."],
+    6:["But my words and my statutes, which I commanded my servants the prophets, did they not overtake your ancestors?","But the things I commanded and warned about through the prophets did happen to your ancestors."]
+  };
+  function ap(v,k){ if(k==="text"||k==="tw")return true; if(k==="tn")return v!==5; return v===4; }
+  var st={};
+  VS.forEach(function(v){ st[v]={text:new Set(),tn:new Set(),tw:new Set(),tq:new Set()}; });
+  function seed(v,k,a){ a.forEach(function(n){st[v][k].add(n);}); }
+  seed(1,"text",["You","Benjamin"]);seed(1,"tn",["You","Benjamin"]);seed(1,"tw",["You","Benjamin"]);
+  seed(2,"text",["Benjamin"]);
+  seed(3,"text",["Benjamin"]);seed(3,"tn",["You"]);seed(3,"tw",["You","Benjamin"]);
+  seed(4,"tw",["Sue"]);
+  seed(5,"tw",["Benjamin"]);
+  seed(6,"text",["Benjamin"]);seed(6,"tn",["Benjamin"]);seed(6,"tw",["You","Benjamin"]);
+
+  function ME(){return IDS[idi];}
+  function shade(v,k){ if(!ap(v,k))return"na"; var s=st[v][k],me=ME(),hm=s.has(me),ho=false; s.forEach(function(n){if(n!==me)ho=true;}); if(!hm&&!ho)return"open"; if(hm&&!ho)return"me"; if(!hm&&ho)return"others"; return"both"; }
+  function attr(v,k){ if(!ap(v,k))return"nothing here"; var s=st[v][k],me=ME(); if(s.size===0)return"open"; var p=[],o=[]; s.forEach(function(n){ if(n===me)p.push("you"); else o.push(n); }); return p.concat(o).join(" + "); }
+  function cellHtml(v,k){ var sh=shade(v,k); if(sh==="na")return '<span class="cell na" data-v="'+v+'" data-k="'+k+'">–</span>'; var ic=sh==="open"?"":'<i class="ti ti-check"></i>'; return '<span class="cell '+sh+'" data-v="'+v+'" data-k="'+k+'" title="toggle your check">'+ic+'</span>'; }
+
+  function renderTop(){
+    document.getElementById("views").innerHTML=[["rows","List / rows"],["doc","Column / book"]].map(function(p){return '<button class="seg'+(view===p[0]?" on":"")+'" data-view="'+p[0]+'">'+p[1]+'</button>';}).join(" ");
+    document.getElementById("ids").innerHTML=IDS.map(function(n,i){return '<button class="seg'+(i===idi?" on":"")+'" data-id="'+i+'">'+n+'</button>';}).join(" ");
+    document.getElementById("legend").innerHTML=
+      '<span><span class="sw" style="border:2px solid var(--border3);"></span>open</span>'
+      +'<span><span class="sw" style="background:var(--teal-others);color:var(--ocean);"><i class="ti ti-check"></i></span>someone else</span>'
+      +'<span><span class="sw" style="background:var(--teal-me);color:var(--ocean);"><i class="ti ti-check"></i></span>you</span>'
+      +'<span><span class="sw" style="background:var(--teal-both);color:#fff;"><i class="ti ti-check"></i></span>you + others</span>';
+  }
+
+  function renderRows(){
+    document.getElementById("rail").innerHTML=VS.map(function(v){
+      var dots=LANES.map(function(L){return '<span style="display:flex;justify-content:center;">'+cellHtml(v,L.k)+'</span>';}).join("");
+      var hl=v===active?'background:var(--surface2);':'';
+      return '<div class="railrow" style="'+hl+'"><span class="vnum" data-act="'+v+'">'+v+'</span>'+dots+'</div>';
+    }).join("");
+
+    var done=LANES.filter(function(L){var s=shade(active,L.k);return s!=="open"&&s!=="na";}).length;
+    var appc=LANES.filter(function(L){return ap(active,L.k);}).length;
+    var dctrl=dirty[active]?'<button class="lk" data-rev style="color:var(--kindle);"><i class="ti ti-arrow-back-up"></i> revert</button><button class="lk" data-save><i class="ti ti-device-floppy"></i> save</button>':'';
+    document.getElementById("card").innerHTML=
+      '<div class="top"><p class="vlabel">Zechariah 1:'+active+'</p><span style="font-size:14px;color:var(--text3);">'+done+' / '+appc+' lanes checked</span></div>'
+      +'<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:12px;">'
+      +'<button class="chip" data-v="'+active+'" data-k="text">'+cellHtml(active,"text")+' Text &middot; '+attr(active,"text")+'</button>'
+      +'<button class="lk" data-align style="color:'+(broken[active]?"var(--red)":"var(--teal-both)")+';"><i class="ti ti-'+(broken[active]?"unlink":"link")+'"></i> '+(broken[active]?"align (unaligned words)":"aligned")+'</button>'
+      +dctrl+'</div>'
+      +'<p class="vtext"><span class="tag">ULT</span>'+TXT[active][0]+'</p>'
+      +'<p class="vtext" style="margin-top:8px;"><span class="tag">UST</span>'+TXT[active][1]+'</p>';
+
+    var tabsHtml=[{k:"tn",l:"Notes"},{k:"tw",l:"Words"},{k:"tq",l:"Questions"}].map(function(T){return '<span class="tab'+(tab===T.k?" on":"")+'" data-tab="'+T.k+'">'+T.l+'</span>';}).join("");
+    var L=LANES.filter(function(x){return x.k===tab;})[0], body;
+    if(!ap(active,tab)){ body='<p style="margin:0;color:var(--text3);font-style:italic;">no '+L.l.toLowerCase()+' on this verse</p>'; }
+    else {
+      body='<div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;">'
+        +'<button class="chip" data-v="'+active+'" data-k="'+tab+'">'+cellHtml(active,tab)+' '+L.l+' &middot; '+attr(active,tab)+'</button>'
+        +'<button class="lk" data-bulk="'+tab+'"><i class="ti ti-checks"></i> all this chapter</button></div>';
+      if(tab==="tw"){
+        var checked=st[active].tw.size>0, peeked=!!peek[active];
+        if(checked&&!peeked){
+          body+='<div class="sugg" style="margin-top:16px;"><i class="ti ti-sparkles" style="font-size:22px;color:var(--inspire);"></i><div style="flex:1;"><div style="font-size:15px;color:var(--text2);">Suggestions paused</div><div style="font-size:13px;color:var(--text3);">'+attr(active,"tw")+' marked Words done &middot; 3 hidden</div></div><button class="lk" data-peek="'+active+'"><i class="ti ti-refresh"></i> reopen</button></div>';
+        } else {
+          var rows=["Yahweh of hosts","ancestors","statutes"].map(function(t){return '<div class="suggrow"><span style="flex:1;">'+t+'</span><i class="ti ti-plus" style="color:var(--info);"></i><i class="ti ti-ban" style="color:var(--text2);"></i></div>';}).join("");
+          body+='<div style="margin-top:14px;display:flex;flex-direction:column;gap:8px;">'+rows+'</div><p class="note" style="margin-top:10px;"><i class="ti ti-sparkles"></i> checking Words pauses these for this verse'+(peeked?' &middot; <button class="lk" data-peek="'+active+'">collapse</button>':'')+'</p>';
+        }
+      }
+    }
+    document.getElementById("panel").innerHTML='<div class="tabs">'+tabsHtml+'</div><div class="pbody">'+body+'</div>';
+  }
+
+  function renderDoc(){
+    [].forEach.call(document.querySelectorAll("#doc .vn"),function(s){ var v=+s.getAttribute("data-v"),sh=shade(v,"text"); s.className="vn"+(sh!=="open"&&sh!=="na"?(" "+sh):""); });
+    document.getElementById("m4").innerHTML=broken[4]?'<i class="ti ti-unlink" style="color:var(--red);font-size:13px;vertical-align:5px;" title="has unaligned words"></i>':"";
+  }
+  function showBar(v,span){
+    var sh=shade(v,"text"),chk;
+    if(sh==="open") chk='<span class="cell open"></span>'; else chk='<span class="cell '+sh+'"><i class="ti ti-check"></i></span>';
+    var html='<span class="tb" data-align title="'+(broken[v]?"align — unaligned words":"aligned")+'" style="color:'+(broken[v]?"var(--red)":"var(--teal-both)")+';"><i class="ti ti-'+(broken[v]?"unlink":"link")+'"></i></span>'
+      +'<button class="chip" data-chk title="toggle your Text check" style="padding:6px 13px;">'+chk+' Text &middot; '+attr(v,"text")+'</button>';
+    if(dirty[v]) html+='<span class="tb" data-rev title="revert" style="color:var(--kindle);"><i class="ti ti-arrow-back-up"></i></span><span class="tb" data-save title="save" style="color:var(--info);"><i class="ti ti-device-floppy"></i></span>';
+    var tbar=document.getElementById("tbar"); tbar.innerHTML=html;
+    var top=span.offsetTop-44; if(top<2)top=span.offsetTop+26;
+    tbar.style.top=top+"px"; tbar.style.left=Math.max(2,span.offsetLeft-4)+"px"; tbar.style.display="inline-flex";
+  }
+
+  function renderBoard(){
+    document.getElementById("bhead").innerHTML='<th style="text-align:left;padding:8px 10px;font-weight:500;color:var(--text2);width:40px;border-top:none;">#</th>'
+      +LANES.map(function(L){return '<th style="padding:8px 6px;font-weight:500;color:var(--text2);border-top:none;"><div style="display:flex;flex-direction:column;align-items:center;gap:5px;">'+L.l+'<button class="lk" data-bulk="'+L.k+'"><i class="ti ti-checks"></i> all</button></div></th>';}).join("");
+    document.getElementById("bbody").innerHTML=VS.map(function(v){
+      var hl=v===active?'background:var(--surface2);':'';
+      var tds=LANES.map(function(L){return '<td style="text-align:center;padding:9px 6px;'+hl+'">'+cellHtml(v,L.k)+'</td>';}).join("");
+      return '<tr><td data-act="'+v+'" style="padding:9px 10px;color:var(--text2);cursor:pointer;'+hl+'">'+v+'</td>'+tds+'</tr>';
+    }).join("");
+    document.getElementById("bfoot").innerHTML='<td style="padding:10px;font-size:14px;color:var(--text3);">done</td>'
+      +LANES.map(function(L){ var a=0,d=0; VS.forEach(function(v){ if(ap(v,L.k)){a++; if(st[v][L.k].size>0)d++;} }); var p=a?Math.round(d/a*100):0; return '<td style="text-align:center;padding:10px 6px;font-size:14px;color:var(--text2);">'+d+'/'+a+'<div style="height:5px;border-radius:3px;margin-top:5px;background:var(--border);"><div style="height:5px;border-radius:3px;width:'+p+'%;background:var(--teal-me);"></div></div></td>';}).join("");
+  }
+
+  function render(){
+    renderTop();
+    document.getElementById("rowsView").hidden = view!=="rows";
+    document.getElementById("docView").hidden = view!=="doc";
+    if(view==="rows") renderRows(); else { renderDoc(); document.getElementById("tbar").style.display="none"; docActive=null; }
+    renderBoard();
+  }
+
+  document.body.addEventListener("click",function(e){
+    var t=e.target;
+    if(t.closest("[data-view]")){ view=t.closest("[data-view]").getAttribute("data-view"); return render(); }
+    if(t.closest("[data-id]")){ idi=+t.closest("[data-id]").getAttribute("data-id"); return render(); }
+    if(t.closest("[data-tab]")){ tab=t.closest("[data-tab]").getAttribute("data-tab"); return renderRows(); }
+    if(t.closest("[data-peek]")){ var pv=+t.closest("[data-peek]").getAttribute("data-peek"); peek[pv]=!peek[pv]; return renderRows(); }
+    if(t.closest("[data-bulk]")){ var k=t.closest("[data-bulk]").getAttribute("data-bulk"),me=ME(),all=true; VS.forEach(function(v){if(ap(v,k)&&!st[v][k].has(me))all=false;}); VS.forEach(function(v){if(ap(v,k)){if(all)st[v][k].delete(me);else st[v][k].add(me);}}); return render(); }
+    if(t.closest("[data-act]")){ active=+t.closest("[data-act]").getAttribute("data-act"); return render(); }
+    if(t.closest("[data-rev],[data-save]")){ var av=view==="doc"?docActive:active; if(av!=null){dirty[av]=false;} return render(); }
+
+    if(view==="doc"){
+      var vn=t.closest("#doc .vn");
+      if(vn){ docActive=+vn.getAttribute("data-v"); return showBar(docActive,vn); }
+      if(t.closest("[data-chk]")&&docActive!=null){ var s=st[docActive].text,me2=ME(); if(s.has(me2))s.delete(me2);else s.add(me2); renderDoc(); renderBoard(); return showBar(docActive,document.querySelector('#doc .vn[data-v="'+docActive+'"]')); }
+      if(t.closest("[data-align]")) return;
+      if(!t.closest(".tbar")){ document.getElementById("tbar").style.display="none"; docActive=null; }
+      return;
+    }
+
+    var cell=t.closest(".cell[data-v]");
+    if(cell&&!cell.classList.contains("na")){ var v=+cell.getAttribute("data-v"),k=cell.getAttribute("data-k"),me3=ME(); if(st[v][k].has(me3))st[v][k].delete(me3);else st[v][k].add(me3); return render(); }
+    var chip=t.closest(".chip[data-v]");
+    if(chip){ var cv=+chip.getAttribute("data-v"),ck=chip.getAttribute("data-k"); if(!ap(cv,ck))return; var me4=ME(); if(st[cv][ck].has(me4))st[cv][ck].delete(me4);else st[cv][ck].add(me4); return render(); }
+  });
+
+  render();
+})();
+</script>
+</body>
+</html>

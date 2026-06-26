@@ -14,6 +14,7 @@ import {
   Tooltip,
 } from "@mui/material";
 import LogoutIcon from "@mui/icons-material/Logout";
+import GridViewIcon from "@mui/icons-material/GridView";
 import { useChapter } from "../hooks/useChapter";
 import { useChapterRoom } from "../hooks/useChapterRoom";
 import type { UseBookReturn } from "../hooks/useBook";
@@ -22,8 +23,19 @@ import { useLexicon } from "../hooks/useLexicon";
 import { useAiDrafts } from "../hooks/useAiDrafts";
 import { useTwlFilters } from "../hooks/useTwlFilters";
 import { outbox } from "../sync/outbox";
-import { api } from "../sync/api";
-import type { BookLintIssue, ChapterPayload, TnRow, TqRow, TwlRow, VerseDto, TwlSuggestion } from "../sync/api";
+import { api, CHECK_LANES } from "../sync/api";
+import type { BookLintIssue, ChapterPayload, CheckLane, TnRow, TqRow, TwlRow, VerseDto, TwlSuggestion } from "../sync/api";
+import {
+  indexLaneChecks,
+  laneKey,
+  laneApplicable,
+  laneAttribution,
+  shadeFromCheckers,
+  LANE_LABELS,
+  type LaneShade,
+  type TextLaneCheck,
+} from "../lib/laneChecks";
+import { ChapterBoard } from "./ChapterBoard";
 import { drafts, verseKey } from "../sync/drafts";
 import { smartEditVerse } from "../lib/replace";
 import { extractEditableText, extractPlainText, normalizeEditable, SECTION_HEADER_TAGS } from "../lib/usfm";
@@ -39,9 +51,9 @@ import { findSourceForTargetText, extractTargetSelectionText, type HighlightKey,
 import { buildQuoteFromSelection, selectionFromQuote } from "../lib/quoteBuilder";
 import { resolveSpanToSource } from "../lib/twlResolve";
 import { nfc } from "../lib/hebrew";
-import { TimelineRail } from "./TimelineRail";
+import { TimelineRail, type VerseTile, type VerseTileLane } from "./TimelineRail";
 import { ScriptureColumn, type ScriptureMode } from "./ScriptureColumn";
-import { ResourceColumn, type AlignmentTabProps, type PanelMode, type ReorderPreview } from "./ResourceColumn";
+import { ResourceColumn, type AlignmentTabProps, type PanelMode, type ReorderPreview, type ResourceCheckoff, type ResourceLane } from "./ResourceColumn";
 import type { AlignmentPanelHandle } from "./AlignmentPanel";
 import {
   SideBySideAligner,
@@ -150,9 +162,11 @@ interface Props {
   onNavigate?: (book: string, chapter: number, verse?: number) => void;
   bookHook?: UseBookReturn;
   onLogout?: () => void;
+  // Current signed-in user id, for the checkoff lane shading (you vs others).
+  meUserId?: number | null;
 }
 
-export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, onLogout }: Props) {
+export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, onLogout, meUserId = null }: Props) {
   const {
     status,
     data,
@@ -165,6 +179,9 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     applyLocalRowInsert,
     applyLocalVerse,
     applyLocalVerseStatus,
+    applyLocalLaneCheck,
+    applyLaneCheckers,
+    replaceLaneChecksForLane,
   } = useChapter(book, chapter);
 
   // Live cross-tab updates. The server broadcasts row writes via the
@@ -209,6 +226,9 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     },
     onVerseStatusUpdate: (status) => {
       applyLocalVerseStatus(status.verse, status.done === 1);
+    },
+    onLaneCheckUpdate: (check) => {
+      applyLaneCheckers(check.verse, check.lane, check.checkers);
     },
   });
   // Book-level DCS-validation summary for the topbar "issues to clean up"
@@ -510,9 +530,28 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // save — which leaves data.verses untouched — skips the rescan entirely (and
   // keeps verseNumbers referentially stable, so ScriptureColumn can memo-skip).
   const versesForTiles = data?.verses;
-  const verseStatusesForTiles = data?.verseStatuses;
-  const tileSet = useMemo(() => {
-    if (!versesForTiles) return [] as Array<{ verse: number; has: boolean; done?: boolean }>;
+  const verseLaneChecksForTiles = data?.verseLaneChecks;
+  const tnRowsForTiles = data?.tn;
+  const tqRowsForTiles = data?.tq;
+  // verse:lane -> checker user ids, for shading the lane cells.
+  const laneIndex = useMemo(
+    () => indexLaneChecks(verseLaneChecksForTiles ?? []),
+    [verseLaneChecksForTiles],
+  );
+  // Which verses actually have notes / questions — drives "nothing to check"
+  // (N/A) vs an unchecked lane.
+  const versesWithTn = useMemo(() => {
+    const s = new Set<number>();
+    for (const r of tnRowsForTiles ?? []) s.add(r.verse);
+    return s;
+  }, [tnRowsForTiles]);
+  const versesWithTq = useMemo(() => {
+    const s = new Set<number>();
+    for (const r of tqRowsForTiles ?? []) s.add(r.verse);
+    return s;
+  }, [tqRowsForTiles]);
+  const tileSet = useMemo<VerseTile[]>(() => {
+    if (!versesForTiles) return [];
     const versesWithSomething = new Set<number>();
     Object.values(versesForTiles).forEach((byVerse) => {
       Object.keys(byVerse).forEach((v) => versesWithSomething.add(parseInt(v, 10)));
@@ -533,18 +572,98 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       if (ustVO && verseHasUnalignedWork(ustVO, sourceVO)) return true;
       return false;
     };
+    const buildLanes = (verse: number): VerseTileLane[] =>
+      CHECK_LANES.map((lane) => {
+        const applicable = laneApplicable(lane, versesWithTn.has(verse), versesWithTq.has(verse));
+        const checkers = laneIndex.get(laneKey(verse, lane));
+        const shade: LaneShade = applicable ? shadeFromCheckers(checkers, meUserId) : "open";
+        const title = `${LANE_LABELS[lane]} — ${applicable ? laneAttribution(checkers, meUserId) : "nothing to check"}`;
+        return { lane, shade, applicable, title };
+      });
     // Chapter-front USFM content (Psalm \d superscriptions, leading \p before \v 1)
     // is stored as verse 0 in the verses table. Surface the intro tile when any of
     // those exist even if no TN/TQ/TWL row is attached to verse 0.
     const introHasScripture = versesWithSomething.has(0);
-    const doneMap = new Map<number, boolean>();
-    for (const s of verseStatusesForTiles ?? []) doneMap.set(s.verse, !!s.done);
-    const tiles: Array<{ verse: number; has: boolean; done?: boolean }> = [];
-    if (introHasResource || introHasScripture) tiles.push({ verse: 0, has: false, done: doneMap.get(0) });
+    const tiles: VerseTile[] = [];
+    if (introHasResource || introHasScripture) tiles.push({ verse: 0, has: false, lanes: buildLanes(0) });
     const verseNums = [...versesWithSomething].filter((v) => v > 0).sort((a, b) => a - b);
-    for (const v of verseNums) tiles.push({ verse: v, has: hasUnalignedFor(v), done: doneMap.get(v) });
+    for (const v of verseNums) tiles.push({ verse: v, has: hasUnalignedFor(v), lanes: buildLanes(v) });
     return tiles;
-  }, [versesForTiles, verseStatusesForTiles, introHasResource]);
+  }, [versesForTiles, laneIndex, versesWithTn, versesWithTq, meUserId, introHasResource]);
+
+  // Toggle MY checkoff stamp on a (verse, lane): optimistic + outbox (offline-safe).
+  const toggleLane = useCallback(
+    (verse: number, lane: CheckLane) => {
+      if (meUserId == null) return;
+      const checkers = laneIndex.get(laneKey(verse, lane));
+      const next = !(checkers?.includes(meUserId));
+      applyLocalLaneCheck(verse, lane, meUserId, next);
+      void outbox.enqueueLaneCheck(book, chapter, verse, lane, next);
+    },
+    [book, chapter, meUserId, laneIndex, applyLocalLaneCheck],
+  );
+
+  // Bulk "all this chapter" for a lane. A fat-finger guard: clicking "all" only
+  // REQUESTS the action (opens a confirm); nothing is written until confirmed.
+  // Direction: check every applicable verse unless I've already checked them
+  // all, in which case clear mine.
+  const [pendingBulk, setPendingBulk] = useState<{ lane: CheckLane; checked: boolean; verses: number[] } | null>(null);
+  const bulkLaneToggle = useCallback(
+    (lane: CheckLane) => {
+      if (meUserId == null) return;
+      const verses = tileSet
+        .filter((t) => t.lanes.find((l) => l.lane === lane)?.applicable)
+        .map((t) => t.verse);
+      if (verses.length === 0) return;
+      const allMine = verses.every((v) => laneIndex.get(laneKey(v, lane))?.includes(meUserId));
+      setPendingBulk({ lane, checked: !allMine, verses });
+    },
+    [meUserId, tileSet, laneIndex],
+  );
+  // Run the confirmed bulk: optimistic apply + one direct PATCH (deliberate,
+  // online action), reconciled from the server response.
+  const confirmBulk = useCallback(() => {
+    const p = pendingBulk;
+    setPendingBulk(null);
+    if (!p || meUserId == null) return;
+    for (const v of p.verses) applyLocalLaneCheck(v, p.lane, meUserId, p.checked);
+    void api
+      .setLaneCheckBulk(book, chapter, p.lane, p.checked, p.verses)
+      .then((res) => replaceLaneChecksForLane(p.lane, res.checks))
+      .catch(() => {
+        /* leave optimistic state; a later load reconciles */
+      });
+  }, [pendingBulk, book, chapter, meUserId, applyLocalLaneCheck, replaceLaneChecksForLane]);
+
+  // In-context checkoff for the resource panels, scoped to the active verse.
+  const resourceCheckoff = useMemo<ResourceCheckoff>(() => {
+    const applic = (lane: ResourceLane) =>
+      laneApplicable(lane, versesWithTn.has(activeVerse), versesWithTq.has(activeVerse));
+    const checkersOf = (lane: ResourceLane) => laneIndex.get(laneKey(activeVerse, lane));
+    return {
+      canCheck: meUserId != null,
+      applicable: applic,
+      shade: (lane) => (applic(lane) ? shadeFromCheckers(checkersOf(lane), meUserId) : "open"),
+      attribution: (lane) => laneAttribution(checkersOf(lane), meUserId),
+      onToggle: (lane) => toggleLane(activeVerse, lane),
+      onBulkToggle: (lane) => bulkLaneToggle(lane),
+    };
+  }, [activeVerse, laneIndex, versesWithTn, versesWithTq, meUserId, toggleLane, bulkLaneToggle]);
+
+  // Text-lane checkoff for the column/book scripture views (per verse). Text is
+  // always applicable. Memoized so BookView's memoized verse subtree is stable.
+  const textLaneCheck = useMemo<TextLaneCheck>(
+    () => ({
+      canCheck: meUserId != null,
+      shade: (verse) => shadeFromCheckers(laneIndex.get(laneKey(verse, "text")), meUserId),
+      attribution: (verse) => laneAttribution(laneIndex.get(laneKey(verse, "text")), meUserId),
+      onToggle: (verse) => toggleLane(verse, "text"),
+    }),
+    [laneIndex, meUserId, toggleLane],
+  );
+
+  // Chapter board (verses × lanes overview) dialog.
+  const [boardOpen, setBoardOpen] = useState(false);
 
   const verseNumbers = useMemo(
     () => tileSet.map((t) => t.verse),
@@ -637,7 +756,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     isDraggingRef.current = true;
     document.body.style.cursor = "ew-resize";
     document.body.style.userSelect = "none";
-    const railWidth = railCollapsed ? 0 : 88;
+    const railWidth = railCollapsed ? 0 : 148;
     const onMouseMove = (ev: MouseEvent) => {
       if (!isDraggingRef.current || !splitContainerRef.current) return;
       const rect = splitContainerRef.current.getBoundingClientRect();
@@ -1934,7 +2053,28 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       )}
       <Box ref={splitContainerRef} sx={{ flex: 1, display: "flex", overflow: "hidden" }}>
         {!railCollapsed && (
-          <Box sx={{ width: 64, flexShrink: 0, minHeight: 0, overflow: "hidden", display: "flex", flexDirection: "column" }}>
+          <Box sx={{ width: 148, flexShrink: 0, minHeight: 0, overflow: "hidden", display: "flex", flexDirection: "column" }}>
+            <Tooltip title="Chapter checkoff board" placement="right">
+              <Button
+                size="small"
+                startIcon={<GridViewIcon sx={{ fontSize: 16 }} />}
+                onClick={() => setBoardOpen(true)}
+                sx={{
+                  flexShrink: 0,
+                  m: 0.5,
+                  minWidth: 0,
+                  fontSize: 12,
+                  justifyContent: "flex-start",
+                  bgcolor: "grey.50",
+                  borderBottom: "1px solid",
+                  borderColor: "divider",
+                  borderRadius: 0.5,
+                  color: "text.secondary",
+                }}
+              >
+                Board
+              </Button>
+            </Tooltip>
             <TimelineRail
               book={book}
               chapter={chapter}
@@ -1942,18 +2082,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
               activeVerse={activeVerse}
               showChapter={mode === "book"}
               onSelect={requestSelectVerse}
-              onToggleDone={(v, done) => {
-                // Through the outbox so an offline toggle isn't dropped. The
-                // payload is coalesced per (book, chapter, verse) so a rapid
-                // click-click only ships the final state.
-                void outbox.enqueueVerseStatus(book, chapter, v, done);
-                // Optimistic local update — useChapter would also reconcile on
-                // the outbox "ok" callback once that handler covers
-                // verse_status (currently it only mirrors row + verse). For
-                // now, refetching when the queue settles keeps the rail in
-                // step without a re-render race.
-                applyLocalVerseStatus(v, done);
-              }}
+              onToggleLane={toggleLane}
             />
             <Box
               sx={{
@@ -1995,6 +2124,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         <ScriptureColumn
           book={book}
           chapter={chapter}
+          textCheck={textLaneCheck}
           versesByVersion={data.verses}
           verseNumbers={verseNumbers}
           activeVerse={activeVerse}
@@ -2134,6 +2264,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           book={book}
           chapter={chapter}
           activeVerse={activeVerse}
+          checkoff={resourceCheckoff}
           displayVerseRange={displayVerseRange}
           tn={data.tn}
           tq={data.tq}
@@ -2402,6 +2533,34 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         />
         </Box>
       </Box>
+      <ChapterBoard
+        open={boardOpen}
+        onClose={() => setBoardOpen(false)}
+        book={book}
+        chapter={chapter}
+        tiles={tileSet}
+        canCheck={meUserId != null}
+        onToggle={toggleLane}
+        onBulkToggle={bulkLaneToggle}
+      />
+      <Dialog open={!!pendingBulk} onClose={() => setPendingBulk(null)}>
+        <DialogTitle>
+          {pendingBulk?.checked ? "Check" : "Clear"} all {pendingBulk ? LANE_LABELS[pendingBulk.lane] : ""} for this chapter?
+        </DialogTitle>
+        <DialogContent>
+          <DialogContentText>
+            {pendingBulk?.checked
+              ? `This marks ${pendingBulk ? LANE_LABELS[pendingBulk.lane] : ""} as checked by you for all ${pendingBulk?.verses.length ?? 0} applicable verses in ${book} ${chapter}.`
+              : `This removes your ${pendingBulk ? LANE_LABELS[pendingBulk.lane] : ""} checks from all ${pendingBulk?.verses.length ?? 0} applicable verses in ${book} ${chapter}.`}
+          </DialogContentText>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setPendingBulk(null)}>Cancel</Button>
+          <Button variant="contained" color={pendingBulk?.checked ? "primary" : "error"} onClick={confirmBulk}>
+            {pendingBulk?.checked ? "Check all" : "Clear all"}
+          </Button>
+        </DialogActions>
+      </Dialog>
       <Dialog open={!!pendingNav} onClose={dismissPendingNav}>
         <DialogTitle>Unsaved alignment changes</DialogTitle>
         <DialogContent>

@@ -1,7 +1,18 @@
 import { Hono } from "hono";
 import { z } from "zod";
 import type { Env } from "./index";
-import type { ChapterPayload, TnRow, TqRow, TwlRow, VerseRow, VerseDto, VerseStatus } from "./types";
+import type {
+  ChapterPayload,
+  CheckLane,
+  TnRow,
+  TqRow,
+  TwlRow,
+  VerseRow,
+  VerseDto,
+  VerseStatus,
+  VerseLaneCheck,
+} from "./types";
+import { CHECK_LANES } from "./types";
 import { currentUserId, requireEditor } from "./auth";
 import { broadcastChapter } from "./wsEvents";
 import { recomputeTargetOccurrences } from "./importParsers";
@@ -33,7 +44,7 @@ chapters.get("/:book/:chapter", async (c) => {
   // cross-book id collisions can't leak the wrong source chip. Pre-0017
   // audit rows have NULL book; the `OR book IS NULL` keeps them visible
   // until the next edit naturally backfills.
-  const [verses, tn, tq, twl, statuses] = await Promise.all([
+  const [verses, tn, tq, twl, statuses, laneChecks] = await Promise.all([
     db
       .prepare(
         "SELECT * FROM verses WHERE book = ?1 AND chapter = ?2 ORDER BY verse, bible_version",
@@ -80,6 +91,12 @@ chapters.get("/:book/:chapter", async (c) => {
       )
       .bind(book, chapter)
       .all<VerseStatus>(),
+    db
+      .prepare(
+        "SELECT * FROM verse_lane_checks WHERE book = ?1 AND chapter = ?2",
+      )
+      .bind(book, chapter)
+      .all<VerseLaneCheck>(),
   ]);
 
   // Reshape verses → verses[bibleVersion][verseNum] = VerseDto for easy client lookup.
@@ -123,6 +140,7 @@ chapters.get("/:book/:chapter", async (c) => {
     tq: tq.results,
     twl: twl.results,
     verseStatuses: statuses.results,
+    verseLaneChecks: laneChecks.results,
   };
   return c.json(payload);
 });
@@ -173,6 +191,135 @@ chapters.patch("/:book/:chapter/:verse/status", requireEditor, async (c) => {
     );
   }
   return c.json(row);
+});
+
+// --- Per-resource checkoff lanes (supersedes the single done flag above) ---
+
+function isCheckLane(s: string): s is CheckLane {
+  return (CHECK_LANES as readonly string[]).includes(s);
+}
+
+async function laneCheckersFor(
+  db: D1Database,
+  book: string,
+  chapter: number,
+  verse: number,
+  lane: CheckLane,
+): Promise<number[]> {
+  const r = await db
+    .prepare(
+      `SELECT checked_by FROM verse_lane_checks
+        WHERE book = ?1 AND chapter = ?2 AND verse = ?3 AND lane = ?4
+        ORDER BY checked_by`,
+    )
+    .bind(book, chapter, verse, lane)
+    .all<{ checked_by: number }>();
+  return r.results.map((x) => x.checked_by);
+}
+
+// Toggle MY check stamp on one (verse, lane). Idempotent: re-PUTting the same
+// state is a no-op. Returns the full checker set so the client recomputes its
+// shade. No version / If-Match — like verse_status, the row is owned by (user,
+// lane) so there is nothing to conflict on.
+const LaneCheckPatch = z.object({ checked: z.boolean() });
+chapters.patch("/:book/:chapter/:verse/lanes/:lane", requireEditor, async (c) => {
+  const book = c.req.param("book").toUpperCase();
+  const chapter = parseInt(c.req.param("chapter"), 10);
+  const verse = parseInt(c.req.param("verse"), 10);
+  const lane = c.req.param("lane");
+  if (!book || !Number.isFinite(chapter) || !Number.isFinite(verse) || !isCheckLane(lane)) {
+    return c.json({ error: "invalid_params" }, 400);
+  }
+  let body: unknown;
+  try {
+    body = await c.req.json();
+  } catch {
+    return c.json({ error: "invalid_body" }, 400);
+  }
+  const parsed = LaneCheckPatch.safeParse(body);
+  if (!parsed.success) return c.json({ error: "invalid_body" }, 400);
+  const userId = currentUserId(c);
+  const now = Math.floor(Date.now() / 1000);
+  const mutate = parsed.data.checked
+    ? c.env.DB.prepare(
+        `INSERT INTO verse_lane_checks (book, chapter, verse, lane, checked_by, checked_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(book, chapter, verse, lane, checked_by) DO NOTHING`,
+      ).bind(book, chapter, verse, lane, userId, now)
+    : c.env.DB.prepare(
+        `DELETE FROM verse_lane_checks
+          WHERE book = ?1 AND chapter = ?2 AND verse = ?3 AND lane = ?4 AND checked_by = ?5`,
+      ).bind(book, chapter, verse, lane, userId);
+  await c.env.DB.batch([
+    mutate,
+    c.env.DB
+      .prepare(
+        `INSERT INTO edit_log (kind, row_key, user_id, prev_version, new_version, action, payload_json)
+         VALUES ('verse_lane', ?1, ?2, NULL, NULL, 'update', ?3)`,
+      )
+      .bind(`${book}/${chapter}/${verse}/${lane}`, userId, JSON.stringify({ lane, checked: parsed.data.checked })),
+  ]);
+  const checkers = await laneCheckersFor(c.env.DB, book, chapter, verse, lane);
+  const check = { book, chapter, verse, lane, checkers };
+  c.executionCtx.waitUntil(
+    broadcastChapter(c.env, book, chapter, { type: "lane_check.updated", check }),
+  );
+  return c.json(check);
+});
+
+// Bulk "I'm done with <lane> for this chapter": add/remove my stamp across the
+// supplied verses (the client sends the applicable verse list — it knows which
+// verses actually have notes/questions). Returns the chapter+lane set so the
+// client reconciles in one shot; per-verse WS would be a fanout storm, so other
+// tabs pick this up on their next load.
+const LaneBulkPatch = z.object({
+  checked: z.boolean(),
+  verses: z.array(z.number().int().min(0)).min(1).max(400),
+});
+chapters.patch("/:book/:chapter/lanes/:lane/bulk", requireEditor, async (c) => {
+  const book = c.req.param("book").toUpperCase();
+  const chapter = parseInt(c.req.param("chapter"), 10);
+  const lane = c.req.param("lane");
+  if (!book || !Number.isFinite(chapter) || !isCheckLane(lane)) {
+    return c.json({ error: "invalid_params" }, 400);
+  }
+  let body: unknown;
+  try {
+    body = await c.req.json();
+  } catch {
+    return c.json({ error: "invalid_body" }, 400);
+  }
+  const parsed = LaneBulkPatch.safeParse(body);
+  if (!parsed.success) return c.json({ error: "invalid_body" }, 400);
+  const userId = currentUserId(c);
+  const now = Math.floor(Date.now() / 1000);
+  const verses = [...new Set(parsed.data.verses)];
+  const stmts = verses.map((v) =>
+    parsed.data.checked
+      ? c.env.DB.prepare(
+          `INSERT INTO verse_lane_checks (book, chapter, verse, lane, checked_by, checked_at)
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+           ON CONFLICT(book, chapter, verse, lane, checked_by) DO NOTHING`,
+        ).bind(book, chapter, v, lane, userId, now)
+      : c.env.DB.prepare(
+          `DELETE FROM verse_lane_checks
+            WHERE book = ?1 AND chapter = ?2 AND verse = ?3 AND lane = ?4 AND checked_by = ?5`,
+        ).bind(book, chapter, v, lane, userId),
+  );
+  stmts.push(
+    c.env.DB
+      .prepare(
+        `INSERT INTO edit_log (kind, row_key, user_id, prev_version, new_version, action, payload_json)
+         VALUES ('verse_lane', ?1, ?2, NULL, NULL, 'update', ?3)`,
+      )
+      .bind(`${book}/${chapter}/${lane}/bulk`, userId, JSON.stringify({ lane, checked: parsed.data.checked, verses })),
+  );
+  await c.env.DB.batch(stmts);
+  const all = await c.env.DB
+    .prepare(`SELECT * FROM verse_lane_checks WHERE book = ?1 AND chapter = ?2 AND lane = ?3`)
+    .bind(book, chapter, lane)
+    .all<VerseLaneCheck>();
+  return c.json({ book, chapter, lane, checks: all.results });
 });
 
 // Book-level summary: chapter list + row counts. Useful for the timeline.

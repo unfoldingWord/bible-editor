@@ -52,9 +52,18 @@ interface Props {
   // caller that doesn't wire filters is unaffected.
   filtersReady?: boolean;
   locked?: boolean;
+  // When the Words lane is checked for this verse, new suggestions are paused
+  // (the editor has signed off on the words here). The list collapses to a
+  // one-line "paused" strip; "reopen" peeks it without un-checking the lane.
+  paused?: boolean;
 }
 
-function TwlSuggestionsInner({ book, chapter, verse, refreshKey, onAdd, isExcluded, blockedArticleIds, filtersReady = true, locked = false }: Props) {
+function TwlSuggestionsInner({ book, chapter, verse, refreshKey, onAdd, isExcluded, blockedArticleIds, filtersReady = true, locked = false, paused = false }: Props) {
+  const [peeked, setPeeked] = useState(false);
+  // Re-collapse when the verse changes or the lane is re-checked.
+  useEffect(() => {
+    setPeeked(false);
+  }, [book, chapter, verse, paused]);
   const [suggestions, setSuggestions] = useState<TwlSuggestion[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(false);
@@ -67,7 +76,9 @@ function TwlSuggestionsInner({ book, chapter, verse, refreshKey, onAdd, isExclud
   const [reloadNonce, setReloadNonce] = useState(0);
 
   useEffect(() => {
-    if (verse === 0) {
+    // Skip the scan entirely while paused (and not peeking) — the whole point
+    // is to stop proposing once the editor has signed off on words here.
+    if (verse === 0 || (paused && !peeked)) {
       setSuggestions([]);
       return;
     }
@@ -89,7 +100,7 @@ function TwlSuggestionsInner({ book, chapter, verse, refreshKey, onAdd, isExclud
         if (!ctrl.signal.aborted) setLoading(false);
       });
     return () => ctrl.abort();
-  }, [book, chapter, verse, refreshKey, reloadNonce]);
+  }, [book, chapter, verse, refreshKey, reloadNonce, paused, peeked]);
 
   // Clear rejections only when the verse itself changes — NOT on refreshKey
   // (which ticks whenever a link is added/deleted on this verse). Otherwise a
@@ -118,6 +129,31 @@ function TwlSuggestionsInner({ book, chapter, verse, refreshKey, onAdd, isExclud
   // which suggestions are blocked, so showing the list would flash addable links
   // the deny-list will remove a moment later.
   const showLoading = loading || !filtersReady;
+
+  if (paused && !peeked) {
+    return (
+      <Box sx={{ mt: 1.5 }}>
+        <Stack
+          direction="row"
+          alignItems="center"
+          spacing={1}
+          sx={{ px: 1, py: 0.75, border: "1px dashed", borderColor: "divider", borderRadius: 1 }}
+        >
+          <AutoAwesomeIcon sx={{ fontSize: 16, color: "primary.main" }} />
+          <Typography variant="caption" sx={{ flex: 1, color: "text.secondary" }}>
+            Suggestions paused — Words checked here
+          </Typography>
+          <Typography
+            variant="caption"
+            sx={{ color: "primary.main", cursor: "pointer", whiteSpace: "nowrap" }}
+            onClick={() => setPeeked(true)}
+          >
+            reopen
+          </Typography>
+        </Stack>
+      </Box>
+    );
+  }
 
   return (
     <Box sx={{ mt: 1.5 }}>

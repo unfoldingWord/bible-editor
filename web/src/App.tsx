@@ -381,6 +381,7 @@ export function App() {
           onNavigate={navigate}
           bookHook={bookHook}
           onLogout={handleSignOut}
+          meUserId={auth.kind === "ready" ? auth.me?.userId ?? null : null}
         />
       </Box>
       <Snackbar

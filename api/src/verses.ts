@@ -18,6 +18,8 @@ import {
   type AlignmentIntent,
 } from "./alignmentDelta.ts";
 import { buildVerseHistory, type VerseHistoryLogRow } from "./verseHistory.ts";
+import { reopenLaneChecks } from "./laneReopen.ts";
+import type { CheckLane } from "./types";
 
 // Verse content can carry malformed/missing `\w` occurrence data — colliding
 // `(text, occurrence)` pairs from a bad import or AI alignment (ULT/UST), or no
@@ -370,6 +372,14 @@ verses.patch("/:book/:chapter/:verse/:bibleVersion", requireEditor, async (c) =>
         type: "verse.updated",
         verse: verseDto,
       }),
+    );
+    // Edits reopen the checkoff: a content version bump reopens the 'text'
+    // lane. A ULT edit additionally reopens 'tw' — the Words/TWL suggestions
+    // are derived from ULT text. Best-effort and non-blocking (the write
+    // already landed above); see reopenLaneChecks.
+    const lanes: CheckLane[] = bibleVersion === "ULT" ? ["text", "tw"] : ["text"];
+    c.executionCtx.waitUntil(
+      reopenLaneChecks(c.env.DB, updated.book, updated.chapter, updated.verse, lanes),
     );
   }
   return c.json(updated ? { ...updated, content: updatedParsed } : null);

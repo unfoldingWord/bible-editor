@@ -8,7 +8,7 @@
 
 import { useEffect, useRef } from "react";
 import { openChapterRoom } from "../sync/wsClient";
-import type { TnRow, TqRow, TwlRow, VerseDto, VerseStatus } from "../sync/api";
+import type { TnRow, TqRow, TwlRow, VerseDto, VerseStatus, LaneCheckState } from "../sync/api";
 
 type RowKind = "tn" | "tq" | "twl";
 type AnyRow = TnRow | TqRow | TwlRow;
@@ -21,6 +21,7 @@ interface WireEvent {
   version?: number;
   verse?: VerseDto;
   status?: VerseStatus;
+  check?: LaneCheckState;
 }
 
 export interface UseChapterRoomHandlers {
@@ -28,6 +29,7 @@ export interface UseChapterRoomHandlers {
   onDelete: (kind: RowKind, id: string) => void;
   onVerseUpdate: (verse: VerseDto) => void;
   onVerseStatusUpdate: (status: VerseStatus) => void;
+  onLaneCheckUpdate: (check: LaneCheckState) => void;
 }
 
 export function useChapterRoom(
@@ -59,6 +61,10 @@ export function useChapterRoom(
         }
         if (ev.type === "verse_status.updated" && ev.status) {
           handlersRef.current.onVerseStatusUpdate(ev.status);
+          return;
+        }
+        if (ev.type === "lane_check.updated" && ev.check) {
+          handlersRef.current.onLaneCheckUpdate(ev.check);
           return;
         }
       },
