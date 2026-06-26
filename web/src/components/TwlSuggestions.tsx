@@ -20,6 +20,8 @@ import {
 import AddIcon from "@mui/icons-material/Add";
 import RefreshIcon from "@mui/icons-material/Refresh";
 import AutoAwesomeIcon from "@mui/icons-material/AutoAwesome";
+import BlockIcon from "@mui/icons-material/Block";
+import ReplayIcon from "@mui/icons-material/Replay";
 import { api, type TwlSuggestion } from "../sync/api";
 
 // rc://*/tw/dict/bible/names/moab → names/moab; bare id passes through.
@@ -49,6 +51,10 @@ function TwlSuggestionsInner({ book, chapter, verse, refreshKey, onAdd, isExclud
   const [error, setError] = useState(false);
   // Per-suggestion chosen article for disambiguation (keyed by span+occurrence).
   const [chosen, setChosen] = useState<Record<string, string>>({});
+  // Proofreader-rejected suggestions (keyed by span+occurrence): crossed off in
+  // place so reviewers can mark a verse as worked through. Local/session-only and
+  // reversible — nothing is persisted or sent to the server.
+  const [rejected, setRejected] = useState<Record<string, boolean>>({});
   const [reloadNonce, setReloadNonce] = useState(0);
 
   useEffect(() => {
@@ -64,6 +70,7 @@ function TwlSuggestionsInner({ book, chapter, verse, refreshKey, onAdd, isExclud
       .then((r) => {
         setSuggestions(r.suggestions);
         setChosen({});
+        setRejected({});
       })
       .catch((e) => {
         if (ctrl.signal.aborted) return;
@@ -121,12 +128,13 @@ function TwlSuggestionsInner({ book, chapter, verse, refreshKey, onAdd, isExclud
             const k = keyOf(s);
             const selected = chosen[k] ?? s.articleId;
             const ambiguous = s.disambiguation.length > 1;
+            const isRejected = !!rejected[k];
             return (
               <Box
                 key={k}
                 sx={{
                   display: "grid",
-                  gridTemplateColumns: "1fr auto 28px",
+                  gridTemplateColumns: "1fr auto 28px 28px",
                   alignItems: "center",
                   gap: 0.5,
                   px: 1,
@@ -134,7 +142,8 @@ function TwlSuggestionsInner({ book, chapter, verse, refreshKey, onAdd, isExclud
                   border: "1px dashed",
                   borderColor: "divider",
                   borderRadius: 1,
-                  bgcolor: "primary.50",
+                  bgcolor: isRejected ? "action.disabledBackground" : "primary.50",
+                  opacity: isRejected ? 0.55 : 1,
                 }}
               >
                 <Box sx={{ minWidth: 0 }}>
@@ -146,6 +155,7 @@ function TwlSuggestionsInner({ book, chapter, verse, refreshKey, onAdd, isExclud
                       overflow: "hidden",
                       textOverflow: "ellipsis",
                       whiteSpace: "nowrap",
+                      textDecoration: isRejected ? "line-through" : "none",
                     }}
                   >
                     {s.matchedText}
@@ -178,13 +188,23 @@ function TwlSuggestionsInner({ book, chapter, verse, refreshKey, onAdd, isExclud
                     <IconButton
                       size="small"
                       color="success"
-                      disabled={locked}
+                      disabled={locked || isRejected}
                       onClick={() => onAdd(s, selected)}
                       sx={{ p: 0.25 }}
                     >
                       <AddIcon fontSize="small" />
                     </IconButton>
                   </span>
+                </Tooltip>
+                <Tooltip title={isRejected ? "undo rejection" : "reject suggestion"}>
+                  <IconButton
+                    size="small"
+                    color={isRejected ? "default" : "error"}
+                    onClick={() => setRejected((m) => ({ ...m, [k]: !m[k] }))}
+                    sx={{ p: 0.25 }}
+                  >
+                    {isRejected ? <ReplayIcon fontSize="small" /> : <BlockIcon fontSize="small" />}
+                  </IconButton>
                 </Tooltip>
               </Box>
             );
