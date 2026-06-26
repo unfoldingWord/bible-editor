@@ -15,7 +15,11 @@ import { twlFilterKey } from "../lib/hebrew";
 export interface TwlFilters {
   isUnlinked: (origWords: string, twLink: string) => boolean;
   isDeletedHere: (reference: string, origWords: string) => boolean;
-  ready: boolean;
+  // True once the fetch has resolved OR failed. Suggestions hold off rendering
+  // until this flips so a blocked link can't briefly show (and be added) before
+  // the deny-list arrives. On failure it still flips true → fail open (show all)
+  // rather than hiding every suggestion for the session on a filters outage.
+  settled: boolean;
 }
 
 interface FilterSets {
@@ -57,16 +61,24 @@ function load(book: string): Promise<FilterSets> {
 
 export function useTwlFilters(book: string): TwlFilters {
   const [sets, setSets] = useState<FilterSets>(() => cache.get(book) ?? EMPTY);
+  // Already-cached books are settled synchronously; otherwise the fetch flips it.
+  const [settled, setSettled] = useState<boolean>(() => cache.has(book));
 
   useEffect(() => {
     let mounted = true;
     setSets(cache.get(book) ?? EMPTY);
+    setSettled(cache.has(book));
     load(book)
       .then((f) => {
-        if (mounted) setSets(f);
+        if (mounted) {
+          setSets(f);
+          setSettled(true);
+        }
       })
       .catch(() => {
-        /* keep whatever we have */
+        // Fail open: mark settled so suggestions render (un-filtered) instead of
+        // staying hidden for the session on a filters-fetch outage.
+        if (mounted) setSettled(true);
       });
     let subs = subscribers.get(book);
     if (!subs) {
@@ -81,7 +93,7 @@ export function useTwlFilters(book: string): TwlFilters {
   }, [book]);
 
   return {
-    ready: cache.has(book),
+    settled,
     isUnlinked: (origWords, twLink) =>
       sets.unlinked.has(`${twlFilterKey(origWords)}|${twLink}`),
     isDeletedHere: (reference, origWords) =>

@@ -149,6 +149,9 @@ interface Props {
   // Article ids the unlinked deny-list blocks for a suggestion's resolved quote
   // — pruned from its picker; the whole suggestion hides when all are blocked.
   twlBlockedArticleIds?: (suggestion: TwlSuggestion) => Set<string>;
+  // Whether the TWL deny-lists have settled (loaded or failed). Suggestions hold
+  // off rendering until then so a blocked link can't show before filters arrive.
+  twlFiltersReady?: boolean;
   // Per-note commit signal — its nonce bumps when a quote-build commits for
   // that note, telling the matching card to land the built quote in the box.
   quoteBuildAppliedTo?: { noteId: string; nonce: number } | null;
@@ -273,6 +276,7 @@ export function ResourceColumn({
   onAddTwlSuggestion,
   isTwlSuggestionExcluded,
   twlBlockedArticleIds,
+  twlFiltersReady,
   quoteBuildAppliedTo,
   panelMode = "resources",
   onSetPanelMode,
@@ -749,6 +753,7 @@ export function ResourceColumn({
                 onAdd={onAddTwlSuggestion}
                 isExcluded={isTwlSuggestionExcluded}
                 blockedArticleIds={twlBlockedArticleIds}
+                filtersReady={twlFiltersReady}
                 locked={locked}
               />
             )}

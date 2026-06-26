@@ -2394,6 +2394,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           onAddTwlSuggestion={handleAddTwlSuggestion}
           isTwlSuggestionExcluded={isTwlSuggestionExcluded}
           twlBlockedArticleIds={twlBlockedArticleIds}
+          twlFiltersReady={twlFilters.settled}
           panelMode={panelMode}
           onSetPanelMode={handleSetPanelMode}
           alignmentProps={alignmentTabProps}

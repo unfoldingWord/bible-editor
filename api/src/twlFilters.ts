@@ -22,15 +22,18 @@ export interface TwlDeletedEntry {
 }
 
 // Cache the global unlinked list and per-book deleted lists at module scope.
-// Signatures are COUNT(*)+MAX(rowid) of each table (mirror twlSuggest getTrie):
-// the isolate is reused across requests so most calls hit the cache, and a
-// re-import (which changes counts/rowids) busts it.
+// Signatures are COUNT(*)+MAX(last_synced) of each table (mirror twlSuggest
+// getTrie): the isolate is reused across requests so most calls hit the cache,
+// and a re-import busts it. NOT MAX(rowid) — the importer does DELETE-then-
+// reinsert, and SQLite reuses rowids after a table is emptied, so a same-sized
+// re-import would keep an unchanged rowid signature and serve stale filters.
+// last_synced is stamped fresh (unixepoch()) on every import, so it always moves.
 let unlinkedCache: { sig: string; rows: TwlUnlinkedEntry[] } | null = null;
 const deletedCache = new Map<string, { sig: string; rows: TwlDeletedEntry[] }>();
 
 async function tableSig(env: Env, table: string): Promise<string> {
   const meta = await env.DB.prepare(
-    `SELECT COUNT(*) AS c, COALESCE(MAX(rowid), 0) AS m FROM ${table}`,
+    `SELECT COUNT(*) AS c, COALESCE(MAX(last_synced), 0) AS m FROM ${table}`,
   ).first<{ c: number; m: number }>();
   return `${meta?.c ?? 0}:${meta?.m ?? 0}`;
 }

@@ -46,10 +46,15 @@ interface Props {
   // quote. Blocked ids are pruned from the picker; a suggestion whose every
   // article is blocked is dropped entirely.
   blockedArticleIds?: (suggestion: TwlSuggestion) => Set<string>;
+  // Whether the deny-lists have settled (loaded or failed). The list holds off
+  // rendering until then so a blocked suggestion can't show — or be added —
+  // before isExcluded / blockedArticleIds have real data. Defaults to true so a
+  // caller that doesn't wire filters is unaffected.
+  filtersReady?: boolean;
   locked?: boolean;
 }
 
-function TwlSuggestionsInner({ book, chapter, verse, refreshKey, onAdd, isExcluded, blockedArticleIds, locked = false }: Props) {
+function TwlSuggestionsInner({ book, chapter, verse, refreshKey, onAdd, isExcluded, blockedArticleIds, filtersReady = true, locked = false }: Props) {
   const [suggestions, setSuggestions] = useState<TwlSuggestion[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(false);
@@ -109,6 +114,11 @@ function TwlSuggestionsInner({ book, chapter, verse, refreshKey, onAdd, isExclud
     })
     .filter(({ allowed }) => allowed.length > 0);
 
+  // Treat "filters not yet settled" as a loading state: until then we can't tell
+  // which suggestions are blocked, so showing the list would flash addable links
+  // the deny-list will remove a moment later.
+  const showLoading = loading || !filtersReady;
+
   return (
     <Box sx={{ mt: 1.5 }}>
       <Stack direction="row" alignItems="center" spacing={0.75} sx={{ mb: 0.5, pl: 0.5 }}>
@@ -120,7 +130,7 @@ function TwlSuggestionsInner({ book, chapter, verse, refreshKey, onAdd, isExclud
           Suggestions
         </Typography>
         <Chip
-          label={loading ? "…" : visible.length}
+          label={showLoading ? "…" : visible.length}
           size="small"
           variant="outlined"
           sx={{ height: 16, fontFamily: "monospace", fontSize: 10 }}
@@ -139,7 +149,7 @@ function TwlSuggestionsInner({ book, chapter, verse, refreshKey, onAdd, isExclud
         <Typography variant="caption" color="error" sx={{ pl: 1 }}>
           couldn&rsquo;t load suggestions
         </Typography>
-      ) : !loading && visible.length === 0 ? (
+      ) : showLoading ? null : visible.length === 0 ? (
         <Typography variant="caption" color="text.disabled" sx={{ pl: 1, fontStyle: "italic" }}>
           no new links suggested for this verse
         </Typography>
