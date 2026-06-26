@@ -100,4 +100,34 @@ const eq = (a, b, msg) => {
   ok(m && m.matchedText === "creature{s}", "brace-supplied 's' kept in matchedText, matched as 'creatures'");
 }
 
+// ── curated irregular forms (OT-prophet weighted) + -y verb fix ──────────────
+{
+  const trie = buildTermTrie(
+    buildTermMapFromArticles([
+      { id: "other/man", title: "man" },
+      { id: "kt/children", title: "child" },
+      { id: "other/ox", title: "ox" },
+      { id: "kt/brother", title: "brother" },
+      { id: "other/seraph", title: "seraph" },
+      { id: "kt/give", title: "give" },
+      { id: "other/go", title: "go" },
+      { id: "kt/prophet", title: "prophesy" },
+    ]),
+  );
+
+  const hasMatch = (text, surface, article) =>
+    scanVerseMatches(text, trie).some(
+      (m) => m.matchedText.toLowerCase() === surface && m.articles.includes(article),
+    );
+
+  ok(hasMatch("the men gathered", "men", "other/man"), "irregular plural: 'men' -> 'man'");
+  ok(hasMatch("her children wept", "children", "kt/children"), "irregular plural: 'children' -> 'child'");
+  ok(hasMatch("the oxen plowed", "oxen", "other/ox"), "irregular plural: 'oxen' -> 'ox'");
+  ok(hasMatch("my brethren", "brethren", "kt/brother"), "biblical plural: 'brethren' -> 'brother'");
+  ok(hasMatch("the seraphim called", "seraphim", "other/seraph"), "liturgical plural: 'seraphim' -> 'seraph'");
+  ok(hasMatch("he gave them bread", "gave", "kt/give"), "irregular verb: 'gave' -> 'give'");
+  ok(hasMatch("they had gone away", "gone", "other/go"), "irregular verb: 'gone' -> 'go'");
+  ok(hasMatch("he prophesied judgment", "prophesied", "kt/prophet"), "-y verb fix: 'prophesied' -> 'prophesy'");
+}
+
 console.log(`twlMatcher: ${passed} assertions passed`);
