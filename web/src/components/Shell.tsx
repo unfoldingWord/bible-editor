@@ -985,12 +985,13 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     [data, activeVerse, verseIndexByVersion, book, chapter],
   );
 
-  // Whether a per-verse suggestion is already linked on the active verse. Done
+  // Whether a per-verse suggestion is already covered on the active verse. Done
   // client-side (not on the suggest route) because the match is by RESOLVED
-  // original-language identity (tw_link, orig_words, occurrence): the existing
-  // TWL row stores the OL occurrence, which the server can't derive from the
-  // English-text occurrence without the alignment. Unresolvable suggestions fall
-  // back to a conservative "tw_link already present" check.
+  // original-language identity, which the server can't derive from the English
+  // text without the alignment. The tw_link is intentionally ignored: once a word
+  // carries any TWL we don't suggest a second article for it. Single words match
+  // by shared source token (tolerant of aligner-folded particles); multi-word
+  // phrases are kept unless the identical phrase quote is already linked.
   const isTwlSuggestionExcluded = useCallback(
     (s: TwlSuggestion): boolean => {
       if (!data) return false;
@@ -1008,13 +1009,22 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         s.matchedText,
         s.glOccurrence,
       );
-      if (resolved) {
-        const key = `${s.twLink}|${nfc(resolved.orig_words)}|${resolved.occurrence}`;
-        return rows.some(
-          (r) => `${r.tw_link}|${nfc(r.orig_words ?? "")}|${r.occurrence ?? 1}` === key,
-        );
+      // Couldn't resolve to OL — conservatively drop only an exact tw_link repeat.
+      if (!resolved) return rows.some((r) => r.tw_link === s.twLink);
+      // A multi-word phrase (e.g. "Yahweh of Armies") is its own lexical unit:
+      // suggest it even when a component word is already tagged. Only drop it when
+      // the identical phrase quote is already linked.
+      if (/\s/.test(s.matchedText.trim())) {
+        const key = `${nfc(resolved.orig_words)}|${resolved.occurrence}`;
+        return rows.some((r) => `${nfc(r.orig_words ?? "")}|${r.occurrence ?? 1}` === key);
       }
-      return rows.some((r) => r.tw_link === s.twLink);
+      // Single word: once the word carries any TWL we don't suggest a second
+      // article for it (regardless of article or occurrence). Compare by shared
+      // source token, split on whitespace + maqqef, so a particle the aligner
+      // folds into the quote ("אֶת־יִשְׂרָאֵל" vs the stored "יִשְׂרָאֵל") still matches.
+      const tokenize = (q: string) => nfc(q).split(/[\s־]+/).filter(Boolean);
+      const sugTokens = new Set(tokenize(resolved.orig_words));
+      return rows.some((r) => tokenize(r.orig_words ?? "").some((t) => sugTokens.has(t)));
     },
     [data, activeVerse, verseIndexByVersion],
   );
