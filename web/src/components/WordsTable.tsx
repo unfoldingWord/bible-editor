@@ -2,6 +2,8 @@ import { memo, useEffect, useMemo, useRef, useState } from "react";
 import { Alert, Box, InputAdornment, Paper, Snackbar, TextField, IconButton, Typography, Tooltip } from "@mui/material";
 import DeleteOutlineIcon from "@mui/icons-material/DeleteOutline";
 import DragIndicatorIcon from "@mui/icons-material/DragIndicator";
+import ArrowUpwardIcon from "@mui/icons-material/ArrowUpward";
+import ArrowDownwardIcon from "@mui/icons-material/ArrowDownward";
 import TranslateIcon from "@mui/icons-material/Translate";
 import AutoFixHighIcon from "@mui/icons-material/AutoFixHigh";
 import UndoIcon from "@mui/icons-material/Undo";
@@ -147,6 +149,12 @@ function WordsTableInner({ rows, activeId, onSave, onDelete, onFocus, onReorder,
           dragId && dragId !== r.id && dragOver?.targetId === r.id && dragOver.position === "before";
         const showAfter =
           dragId && dragId !== r.id && dragOver?.targetId === r.id && dragOver.position === "after";
+        // Arrows reorder within the same verse only — onReorder maps to Shell's
+        // sortedForVerse, which renumbers per-verse.
+        const samePeers = rows.filter((p) => p.verse === r.verse);
+        const idx = samePeers.indexOf(r);
+        const prevWord = idx > 0 ? samePeers[idx - 1] : null;
+        const nextWord = idx < samePeers.length - 1 ? samePeers[idx + 1] : null;
         return (
           <Box key={r.id}>
             {showBefore && <RowDropIndicator />}
@@ -159,6 +167,8 @@ function WordsTableInner({ rows, activeId, onSave, onDelete, onFocus, onReorder,
               onDelete={() => onDelete(r.id)}
               onFocus={() => onFocus(r)}
               onGripDragStart={() => setDragId(r.id)}
+              onMoveUp={prevWord ? () => onReorder(r.id, prevWord.id, "before") : undefined}
+              onMoveDown={nextWord ? () => onReorder(r.id, nextWord.id, "after") : undefined}
               onDragEnd={() => {
                 setDragId(null);
                 setDragOver(null);
@@ -228,6 +238,8 @@ const WordRow = memo(function WordRow({
   onDelete,
   onFocus,
   onGripDragStart,
+  onMoveUp,
+  onMoveDown,
   onDragEnd,
   onRowDragOver,
   onRowDrop,
@@ -245,6 +257,9 @@ const WordRow = memo(function WordRow({
   onDelete: () => void;
   onFocus: () => void;
   onGripDragStart: () => void;
+  // Reorder one slot within the verse. Undefined when already first/last.
+  onMoveUp?: () => void;
+  onMoveDown?: () => void;
   onDragEnd: () => void;
   onRowDragOver: (position: WordDropPosition) => void;
   onRowDrop: (position: WordDropPosition) => void;
@@ -378,31 +393,64 @@ const WordRow = memo(function WordRow({
         "&:last-of-type": { borderBottom: "none" },
       }}
     >
-      <Tooltip title="drag to reorder">
-        <Box
-          draggable
-          onDragStart={(e) => {
-            e.dataTransfer.effectAllowed = "move";
-            e.dataTransfer.setData("text/plain", row.id);
-            if (rowRef.current) {
-              e.dataTransfer.setDragImage(rowRef.current, 12, 12);
-            }
-            onGripDragStart();
-          }}
-          onDragEnd={onDragEnd}
-          sx={{
-            gridArea: "grip",
-            cursor: "grab",
-            color: "text.disabled",
-            display: "inline-flex",
-            alignItems: "center",
-            justifyContent: "center",
-            "&:active": { cursor: "grabbing" },
-          }}
-        >
-          <DragIndicatorIcon fontSize="small" />
-        </Box>
-      </Tooltip>
+      <Box
+        sx={{
+          gridArea: "grip",
+          display: "flex",
+          flexDirection: "column",
+          alignItems: "center",
+          justifyContent: "center",
+        }}
+      >
+        <Tooltip title="move up">
+          <span>
+            <IconButton
+              size="small"
+              onClick={onMoveUp}
+              disabled={!onMoveUp}
+              sx={{ p: 0, color: "text.disabled" }}
+            >
+              <ArrowUpwardIcon sx={{ fontSize: 14 }} />
+            </IconButton>
+          </span>
+        </Tooltip>
+        <Tooltip title="drag to reorder">
+          <Box
+            draggable
+            onDragStart={(e) => {
+              e.dataTransfer.effectAllowed = "move";
+              e.dataTransfer.setData("text/plain", row.id);
+              if (rowRef.current) {
+                e.dataTransfer.setDragImage(rowRef.current, 12, 12);
+              }
+              onGripDragStart();
+            }}
+            onDragEnd={onDragEnd}
+            sx={{
+              cursor: "grab",
+              color: "text.disabled",
+              display: "inline-flex",
+              alignItems: "center",
+              justifyContent: "center",
+              "&:active": { cursor: "grabbing" },
+            }}
+          >
+            <DragIndicatorIcon fontSize="small" />
+          </Box>
+        </Tooltip>
+        <Tooltip title="move down">
+          <span>
+            <IconButton
+              size="small"
+              onClick={onMoveDown}
+              disabled={!onMoveDown}
+              sx={{ p: 0, color: "text.disabled" }}
+            >
+              <ArrowDownwardIcon sx={{ fontSize: 14 }} />
+            </IconButton>
+          </span>
+        </Tooltip>
+      </Box>
       <Box sx={{ gridArea: "quote", minWidth: 0, display: "flex", gap: 0.5, alignItems: "center" }}>
         <TextField
           value={quote}
@@ -576,6 +624,8 @@ const WordRow = memo(function WordRow({
   a.active === b.active &&
   a.dragging === b.dragging &&
   a.isDropTarget === b.isDropTarget &&
+  !!a.onMoveUp === !!b.onMoveUp &&
+  !!a.onMoveDown === !!b.onMoveDown &&
   a.gloss === b.gloss &&
   a.quoteBuildMode === b.quoteBuildMode &&
   a.quoteBuildSelectionCount === b.quoteBuildSelectionCount);
