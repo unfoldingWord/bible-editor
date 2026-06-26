@@ -24,18 +24,12 @@ import BlockIcon from "@mui/icons-material/Block";
 import ReplayIcon from "@mui/icons-material/Replay";
 import OpenInNewIcon from "@mui/icons-material/OpenInNew";
 import { api, type TwlSuggestion } from "../sync/api";
+import { TwArticleDialog } from "./TwArticleDialog";
 
 // rc://*/tw/dict/bible/names/moab → names/moab; bare id passes through.
 function twShort(idOrLink: string): string {
   const m = idOrLink.match(/\/bible\/([^/]+\/[^/]+)$/);
   return m ? m[1] : idOrLink;
-}
-
-// "kt/god" or "rc://*/tw/dict/bible/kt/god" → Door43 raw markdown article URL.
-function twArticleUrl(articleId: string): string {
-  const m = articleId.match(/\/bible\/([^/]+)\/([^/]+)$/) ?? articleId.match(/^([^/]+)\/([^/]+)$/);
-  if (!m) return "";
-  return `https://git.door43.org/unfoldingWord/en_tw/src/branch/master/bible/${m[1]}/${m[2]}.md`;
 }
 
 interface Props {
@@ -82,6 +76,8 @@ function TwlSuggestionsInner({ book, chapter, verse, refreshKey, onAdd, isExclud
   // reversible — nothing is persisted or sent to the server.
   const [rejected, setRejected] = useState<Record<string, boolean>>({});
   const [reloadNonce, setReloadNonce] = useState(0);
+  // TW article shown in the in-app popup (null = closed).
+  const [articleId, setArticleId] = useState<string | null>(null);
 
   useEffect(() => {
     // Skip the scan entirely while paused (and not peeking) — the whole point
@@ -288,13 +284,10 @@ function TwlSuggestionsInner({ book, chapter, verse, refreshKey, onAdd, isExclud
                     {isRejected ? <ReplayIcon fontSize="small" /> : <BlockIcon fontSize="small" />}
                   </IconButton>
                 </Tooltip>
-                <Tooltip title="read article on Door43 (opens new tab)">
+                <Tooltip title="read article">
                   <IconButton
                     size="small"
-                    component="a"
-                    href={twArticleUrl(selected)}
-                    target="_blank"
-                    rel="noopener noreferrer"
+                    onClick={() => setArticleId(selected)}
                     sx={{ p: 0.25, color: "text.secondary" }}
                   >
                     <OpenInNewIcon sx={{ fontSize: 15 }} />
@@ -305,6 +298,7 @@ function TwlSuggestionsInner({ book, chapter, verse, refreshKey, onAdd, isExclud
           })}
         </Stack>
       )}
+      <TwArticleDialog articleId={articleId} onClose={() => setArticleId(null)} />
     </Box>
   );
 }

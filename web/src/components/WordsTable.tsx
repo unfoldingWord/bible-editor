@@ -11,6 +11,7 @@ import OpenInNewIcon from "@mui/icons-material/OpenInNew";
 import type { TwlRow } from "../sync/api";
 import { useCatalogs } from "../hooks/useCatalogs";
 import { CatalogPicker } from "./CatalogPicker";
+import { TwArticleDialog } from "./TwArticleDialog";
 import { drafts, rowKey, draftDirtyBorderSx } from "../sync/drafts";
 
 export type WordDropPosition = "before" | "after";
@@ -100,6 +101,9 @@ function WordsTableInner({ rows, activeId, onSave, onDelete, onFocus, onReorder,
   const [dragOver, setDragOver] = useState<
     { targetId: string; position: WordDropPosition } | null
   >(null);
+  // One TW article popup for the whole table (null = closed); lifted out of the
+  // memoized rows so opening it doesn't depend on per-row state.
+  const [articleId, setArticleId] = useState<string | null>(null);
 
   if (rows.length === 0) {
     return (
@@ -182,11 +186,13 @@ function WordsTableInner({ rows, activeId, onSave, onDelete, onFocus, onReorder,
               quoteBuildMode={r.id === activeQuoteBuildId}
               quoteBuildSelectionCount={r.id === activeQuoteBuildId ? quoteBuildSelectionCount : 0}
               onStartQuoteBuild={onStartQuoteBuild ? () => onStartQuoteBuild(r.id) : undefined}
+              onOpenArticle={setArticleId}
             />
             {showAfter && <RowDropIndicator />}
           </Box>
         );
       })}
+      <TwArticleDialog articleId={articleId} onClose={() => setArticleId(null)} />
     </Paper>
   );
 }
@@ -236,6 +242,7 @@ const WordRow = memo(function WordRow({
   quoteBuildMode = false,
   quoteBuildSelectionCount = 0,
   onStartQuoteBuild,
+  onOpenArticle,
 }: {
   row: TwlRow;
   active: boolean;
@@ -255,6 +262,8 @@ const WordRow = memo(function WordRow({
   quoteBuildMode?: boolean;
   quoteBuildSelectionCount?: number;
   onStartQuoteBuild?: () => void;
+  // Open the TW article popup for this row's link (handled at the table level).
+  onOpenArticle: (articleId: string) => void;
 }) {
   const [quote, setQuote] = useState(row.orig_words ?? "");
   const [twLink, setTwLink] = useState<string | null>(row.tw_link);
@@ -506,13 +515,10 @@ const WordRow = memo(function WordRow({
           onChange={(next) => setTwLink(next)}
         />
         {twLink && (
-          <Tooltip title="read article on Door43 (opens new tab)">
+          <Tooltip title="read article">
             <IconButton
               size="small"
-              component="a"
-              href={twArticleUrl(twLink)}
-              target="_blank"
-              rel="noopener noreferrer"
+              onClick={() => onOpenArticle(twLink)}
               sx={{ p: 0.25, color: "text.secondary", flexShrink: 0 }}
             >
               <OpenInNewIcon sx={{ fontSize: 15 }} />
@@ -585,12 +591,4 @@ function twShort(link: string | null): string {
   // rc://*/tw/dict/bible/names/moab → names/moab
   const m = link.match(/\/bible\/([^/]+\/[^/]+)$/);
   return m ? m[1] : link;
-}
-
-// rc://*/tw/dict/bible/kt/god → Door43 raw markdown article URL.
-function twArticleUrl(link: string | null): string {
-  if (!link) return "";
-  const m = link.match(/\/bible\/([^/]+)\/([^/]+)$/);
-  if (!m) return "";
-  return `https://git.door43.org/unfoldingWord/en_tw/src/branch/master/bible/${m[1]}/${m[2]}.md`;
 }
