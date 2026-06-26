@@ -6,6 +6,18 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Agent orchestration — default pattern
+
+**The main conversing session is the orchestrator.** This is a large codebase; keep the main thread lean (target <200k tokens, never exceed 400k). Default to subagents for anything that isn't a trivial one-liner:
+
+- **Exploration / research** — any question that takes more than 2–3 grep/read calls → `Explore` or `general-purpose` Agent.
+- **Implementation** — spawn a worktree Agent for non-trivial edits so the main thread doesn't accumulate file content.
+- **Parallel work** — fire independent tasks (e.g. read STATE.md + read docs/plan.md) simultaneously as multiple Agent calls in one message.
+- **Verification** — delegate browser smoke-test and build runs to an Agent.
+- **When NOT to subagent:** single-file edits already identified, direct answers to "what does this variable do", or trivial grep lookups you can do in one tool call.
+
+Rule of thumb: if you'd open more than two files or run more than two bash commands to complete it, delegate it.
+
 ## Context
 
 - Tactical 7-month replacement for gatewayEdit + tcCreate. Read [`docs/plan.md`](docs/plan.md) and [`docs/handoff.md`](docs/handoff.md) before non-trivial work. If a wave-specific handoff exists (e.g. [`docs/wave-2-handoff.md`](docs/wave-2-handoff.md)), read that first.
@@ -15,9 +27,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Session state — read first, update last
 
-[`.claude/STATE.md`](.claude/STATE.md) is the persistent loop state: what just shipped, what's mid-flight, what's blocked on a human, and durable lessons that aren't in the code. **The agent forgets between sessions; this file does not.**
+[`STATE.md`](STATE.md) is the persistent loop state: what just shipped, what's mid-flight, what's blocked on a human, and durable lessons that aren't in the code. **The agent forgets between sessions; this file does not.**
 
-- **At the start of non-trivial work:** read `.claude/STATE.md` so you resume rather than restart. It complements the standing spec (this file + `docs/plan.md`): state says where the work is, the spec says where it's going.
+- **At the start of non-trivial work:** read `STATE.md` so you resume rather than restart. It complements the standing spec (this file + `docs/plan.md`): state says where the work is, the spec says where it's going.
 - **Before you finish:** update it. Move shipped work into **Completed**, record anything blocked under **Escalated**, and write durable cross-session facts under **Lessons learned** (there, not in chat). Bump **Last run**.
 - **Parallel worktrees:** the dated sections are append-only and newest-first, so merge conflicts resolve by keeping both sides. The canonical copy lives on `main` — rebase before relying on it. Don't delete other branches' entries.
 

@@ -2,7 +2,7 @@
 // artifact in PRISTINE AI translation notes so D1 converges with the normalized
 // form DCS maintainers keep on en_tn master.
 //
-// Background (see .claude/STATE.md, theme "export-churn-convergence"): AI notes
+// Background (see STATE.md, theme "export-churn-convergence"): AI notes
 // land in D1 with double spaces (".  Alternate translation:", "**word**,  could").
 // Maintainers normalize them to single space on master, so every nightly export
 // pushes a whitespace-only change to the per-book `-be-` branch — churn that on
