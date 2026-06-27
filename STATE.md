@@ -14,6 +14,13 @@
 
 ## Last run
 
+2026-06-27 · **friendly-chebyshev** — **Two reviewer findings fixed → [PR #280](https://github.com/deferredreward/bible-editor/pull/280)** (branch `claude/friendly-chebyshev-a291c2`, NOT merged). **(1) Prod CSP blocked the TW article viewer:** `api/src/index.ts` CSP `connect-src` was `'self' wss: ws:`, but `web/src/lib/twArticle.ts` fetches raw markdown straight from `git.door43.org` (TwArticleDialog) — failed in prod only (local Vite skips these headers). Fix = add `https://git.door43.org` to `connect-src` (mirrors the existing `frame-src` swunrow allow-list). **(2) Bulk lane check-off didn't sync to other tabs:** single-verse route broadcast `lane_check.updated`, the bulk `/lanes/:lane/bulk` route returned JSON with NO WS broadcast → other open tabs stale until reload. Fix = new `lane_check.bulk` WS event (full per-lane checker set) → receiver calls existing `replaceLaneChecksForLane`; ONE event per chapter, not per-verse (route comment explicitly rejected per-verse as a fanout storm). Files: `wsEvents.ts`, `chapters.ts`, `useChapterRoom.ts`, `Shell.tsx`. typecheck green both workspaces; **live two-tab smoke PASS** (bulk PATCH fired as a separate request so the receiver could only update via the broadcast — all 20 lane cells flipped on check-all + clear-all, no reload, 0 console errors). No deploy notes beyond the standard `wrangler deploy --env production`.
+
+> **DEFERRED — two reviewer optimization suggestions NOT acted on (revisit only if a real latency symptom appears):**
+> - **Chunked reimport reparses staged TSV/USFM per chapter chunk** — `reimportStagedChunk` reads/parses at `api/src/bookReimport.ts:1543`, called per chunk at `~:1645`. If large-book reimports become expensive, stage parsed chapter maps once per resource (or stage per-chapter slices after the reimport-tsvgate) instead of reparsing each chunk.
+> - **Chapter loads run a correlated `edit_log` subquery per TN/TQ row for `latest_source`** — `api/src/chapters.ts:56` (tn) and `:70` (tq). Code comment there notes the `(kind, row_key)` index already makes it cheap, and no symptom is reported. If chapter-payload p95 grows, denormalize latest source onto the row or join a precomputed latest-log CTE for the chapter's rows. Of the two, this is the higher-leverage rewrite.
+> Both were judged speculative now (conditional "if latency grows", no measured baseline) — left as notes by design, not oversight.
+
 2026-06-26 · **crazy-bhabha** — **TWL suggestion deny-lists integrated (read-only consumption).** Two
 upstream-exported tables now suppress re-suggestions translators already rejected: **twl_unlinked_words** (182;
 word+article never linked, anywhere — encodes "son of god isn't in the OT" per-word) and **twl_deleted_rows**

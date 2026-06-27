@@ -270,8 +270,8 @@ chapters.patch("/:book/:chapter/:verse/lanes/:lane", requireEditor, async (c) =>
 // Bulk "I'm done with <lane> for this chapter": add/remove my stamp across the
 // supplied verses (the client sends the applicable verse list — it knows which
 // verses actually have notes/questions). Returns the chapter+lane set so the
-// client reconciles in one shot; per-verse WS would be a fanout storm, so other
-// tabs pick this up on their next load.
+// client reconciles in one shot, and broadcasts a single lane_check.bulk so
+// other open tabs reconcile live; per-verse WS would be a fanout storm.
 const LaneBulkPatch = z.object({
   checked: z.boolean(),
   verses: z.array(z.number().int().min(0)).min(1).max(400),
@@ -319,6 +319,15 @@ chapters.patch("/:book/:chapter/lanes/:lane/bulk", requireEditor, async (c) => {
     .prepare(`SELECT * FROM verse_lane_checks WHERE book = ?1 AND chapter = ?2 AND lane = ?3`)
     .bind(book, chapter, lane)
     .all<VerseLaneCheck>();
+  c.executionCtx.waitUntil(
+    broadcastChapter(c.env, book, chapter, {
+      type: "lane_check.bulk",
+      book,
+      chapter,
+      lane,
+      checks: all.results,
+    }),
+  );
   return c.json({ book, chapter, lane, checks: all.results });
 });
 
