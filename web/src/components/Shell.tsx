@@ -231,6 +231,9 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     onLaneCheckUpdate: (check) => {
       applyLaneCheckers(check.verse, check.lane, check.checkers);
     },
+    onLaneCheckBulkUpdate: (lane, checks) => {
+      replaceLaneChecksForLane(lane, checks);
+    },
   });
   // Book-level DCS-validation summary for the topbar "issues to clean up"
   // indicator. Keyed on book, so it fetches once per book change — never on

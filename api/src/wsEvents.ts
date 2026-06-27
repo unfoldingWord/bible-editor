@@ -11,7 +11,7 @@
 // updated their state).
 
 import type { Env } from "./index";
-import type { CheckLane, RowKind, TnRow, TqRow, TwlRow, VerseDto, VerseStatus } from "./types";
+import type { CheckLane, RowKind, TnRow, TqRow, TwlRow, VerseDto, VerseLaneCheck, VerseStatus } from "./types";
 
 // The current set of checkers for one (verse, lane) after a toggle. `checkers`
 // is the full list of user ids so a receiving tab can recompute its own shade
@@ -29,7 +29,12 @@ export type WsEvent =
   | { type: "row.deleted"; kind: RowKind; id: string; version: number }
   | { type: "verse.updated"; verse: VerseDto }
   | { type: "verse_status.updated"; status: VerseStatus }
-  | { type: "lane_check.updated"; check: LaneCheckState };
+  | { type: "lane_check.updated"; check: LaneCheckState }
+  // Bulk "I'm done with <lane> for this chapter": carries the full checker set
+  // for the lane so receiving tabs replace the whole lane in one shot. The
+  // single-verse event broadcasts one (verse, lane); broadcasting that per
+  // verse here would be a fanout storm, so the bulk path sends one event.
+  | { type: "lane_check.bulk"; book: string; chapter: number; lane: CheckLane; checks: VerseLaneCheck[] };
 
 export async function broadcastChapter(
   env: Env,
