@@ -7,6 +7,17 @@ import { createTheme, type Theme, type ThemeOptions } from "@mui/material/styles
 // pseudo-elements.
 function scrollbarComponents(track: string, thumb: string, thumbHover: string): ThemeOptions["components"] {
   return {
+    // Translators are confident with the UI and don't want tooltips popping up
+    // constantly. Make every tooltip wait until the pointer rests for 1.5s.
+    // enterNextDelay matches enterDelay so sweeping across a toolbar doesn't pop
+    // siblings instantly once one has opened. Greek/Hebrew lexical hovercards
+    // override this back to 0 at their call sites — those are wanted on hover.
+    MuiTooltip: {
+      defaultProps: {
+        enterDelay: 1500,
+        enterNextDelay: 1500,
+      },
+    },
     MuiCssBaseline: {
       styleOverrides: {
         "*": {

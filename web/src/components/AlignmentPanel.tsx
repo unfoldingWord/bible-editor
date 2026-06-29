@@ -1659,6 +1659,8 @@ function SourceWordTypography({
   const showInfo = hctx.showSourceInfo;
   return (
     <Tooltip
+      enterDelay={0}
+      enterNextDelay={0}
       title={
         showInfo ? (
           <Box>

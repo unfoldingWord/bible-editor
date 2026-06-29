@@ -195,6 +195,8 @@ function SourceVerseToken({
   return (
     <Tooltip
       title={showInfo ? <SourceTooltipBody source={source} lex={lex} twHint={twHint} /> : ""}
+      enterDelay={0}
+      enterNextDelay={0}
       disableHoverListener={!showInfo}
       disableFocusListener={!showInfo}
       disableTouchListener={!showInfo}
