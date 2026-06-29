@@ -316,18 +316,27 @@ function findPreviousVerse(
 // that introduces the verse. Map that drifted marker to the same wrapper class
 // the inactive (display) path uses, so we can put it directly on the editable
 // span and get the break/indent back from CSS without touching the text. Use
-// the marker closest to the verse (last in document order); skip `\b`/`\ts`
-// (spacer/divider blocks that would clip or restyle the content span) — a bare
-// block break is enough there.
+// the marker closest to the verse (last in document order). `\ts\*` is a flex
+// divider block (`be-ts`) that would relayout the content span, so it never
+// supplies the class — but if it's the ONLY drifted marker we still fall back
+// to a plain block break so the verse keeps its own line.
 function leadingBreakClass(markers: unknown[] | null | undefined): string {
   if (!Array.isArray(markers)) return "";
+  let sawDivider = false;
   for (let i = markers.length - 1; i >= 0; i--) {
     const tag = (markers[i] as { tag?: unknown } | null)?.tag;
-    if (typeof tag !== "string" || tag === "ts") continue;
+    if (typeof tag !== "string") continue;
+    if (tag === "ts") {
+      sawDivider = true;
+      continue;
+    }
     const { wrapper, isBlank } = paragraphClass(tag);
     return isBlank ? "be-line" : wrapper;
   }
-  return "";
+  // Only a `\ts\*` chunk divider drifted (no paragraph/poetry marker): the
+  // inactive path renders a divider block here, so keep the active verse on
+  // its own line with a plain block break rather than letting it run inline.
+  return sawDivider ? "be-line" : "";
 }
 
 function VerseSpan({
