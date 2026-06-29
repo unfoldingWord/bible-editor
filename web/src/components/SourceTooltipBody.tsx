@@ -36,7 +36,7 @@ function PinHint() {
           mt: 0.75,
           pt: 0.5,
           borderTop: "1px solid rgba(255,255,255,0.12)",
-          fontSize: 10.5,
+          fontSize: 12.5,
           textAlign: "center",
           fontStyle: "italic",
           opacity: 0.6,
@@ -88,12 +88,12 @@ export function SourceTooltipBody({ source, lex, twHint, pinHint }: Props) {
     : "";
 
   return (
-    <Box sx={{ fontSize: 12, maxWidth: 340, lineHeight: 1.5, p: 0.25 }}>
+    <Box sx={{ fontSize: 14, maxWidth: 340, lineHeight: 1.5, p: 0.25 }}>
       <Box sx={{ textAlign: "center", mb: 0.75 }}>
         <Box
           sx={{
             fontFamily: '"Times New Roman","SBL Hebrew",serif',
-            fontSize: 22,
+            fontSize: 26,
             lineHeight: 1.1,
             mb: 0.5,
           }}
@@ -105,7 +105,7 @@ export function SourceTooltipBody({ source, lex, twHint, pinHint }: Props) {
             display: "inline-flex",
             alignItems: "center",
             gap: 0.75,
-            fontSize: 11,
+            fontSize: 13,
           }}
         >
           {source.strong && (
@@ -134,7 +134,7 @@ export function SourceTooltipBody({ source, lex, twHint, pinHint }: Props) {
           sx={{
             textAlign: "center",
             fontWeight: 700,
-            fontSize: 14,
+            fontSize: 16,
             color: "#a8dcf5",
             mb: 0.5,
           }}
@@ -151,7 +151,7 @@ export function SourceTooltipBody({ source, lex, twHint, pinHint }: Props) {
               component="span"
               sx={{
                 fontWeight: 700,
-                fontSize: 10,
+                fontSize: 12,
                 textTransform: "uppercase",
                 letterSpacing: 0.6,
                 opacity: 0.65,
@@ -163,7 +163,7 @@ export function SourceTooltipBody({ source, lex, twHint, pinHint }: Props) {
             {morphChain && <Box component="span" sx={{ opacity: 0.92 }}>{morphChain}</Box>}
           </Box>
           {decoded.pronounSuffix && (
-            <Box sx={{ fontSize: 11, opacity: 0.92 }}>
+            <Box sx={{ fontSize: 13, opacity: 0.92 }}>
               <Box component="span" sx={{ opacity: 0.7 }}>+ attached pronoun </Box>
               <Box component="span" sx={{ color: "#a8dcf5", fontWeight: 700 }}>
                 “{decoded.pronounSuffix.gloss}”
@@ -184,7 +184,7 @@ export function SourceTooltipBody({ source, lex, twHint, pinHint }: Props) {
                   component="span"
                   sx={{
                     fontWeight: 700,
-                    fontSize: 10,
+                    fontSize: 12,
                     textTransform: "uppercase",
                     letterSpacing: 0.6,
                     opacity: 0.65,
@@ -209,12 +209,12 @@ export function SourceTooltipBody({ source, lex, twHint, pinHint }: Props) {
       {twHint && (
         <>
           <Divider sx={{ my: 0.75, borderColor: "rgba(255,255,255,0.18)" }} />
-          <Box sx={{ fontSize: 11 }}>
+          <Box sx={{ fontSize: 13 }}>
             <Box
               component="span"
               sx={{
                 fontWeight: 700,
-                fontSize: 10,
+                fontSize: 12,
                 textTransform: "uppercase",
                 letterSpacing: 0.6,
                 opacity: 0.65,
