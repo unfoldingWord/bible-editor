@@ -184,7 +184,7 @@ export function SourceTooltipBody({ source, lex, twHint, pinHint }: Props) {
                   component="span"
                   sx={{
                     fontWeight: 700,
-                    fontSize: 10,
+                    fontSize: 12,
                     textTransform: "uppercase",
                     letterSpacing: 0.6,
                     opacity: 0.65,
