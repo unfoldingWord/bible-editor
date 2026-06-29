@@ -1,4 +1,4 @@
-import { memo, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Alert, Box, InputAdornment, Paper, Snackbar, TextField, IconButton, Typography, Tooltip } from "@mui/material";
 import DeleteOutlineIcon from "@mui/icons-material/DeleteOutline";
 import DragIndicatorIcon from "@mui/icons-material/DragIndicator";
@@ -39,6 +39,16 @@ function detectQuoteScript(text: string): QuoteScript {
 // keep the quote inline with the actions and drop the TW article to its own
 // full-width row.
 const NARROW_BP_PX = 460;
+
+// Transient ring on the arrow a word was just reordered with. Mouse clicks
+// don't show a :focus-visible ring, so this is what signals "the word moved
+// here, press Enter/Space to keep nudging it." Self-clears via WordsTable state.
+const reorderFlashSx = {
+  color: "primary.main",
+  bgcolor: "primary.50",
+  boxShadow: "0 0 0 2px var(--mui-palette-primary-main, #31ADE3)",
+  borderRadius: "4px",
+} as const;
 
 // Wide: grip, quote, TW article, and three action cells in one row. Narrow
 // (container ≤ NARROW_BP_PX): the grip spans both rows on the left, the quote
@@ -107,6 +117,46 @@ function WordsTableInner({ rows, activeId, onSave, onDelete, onFocus, onReorder,
   // memoized rows so opening it doesn't depend on per-row state.
   const [articleId, setArticleId] = useState<string | null>(null);
 
+  // Arrow-reorder focus + visible hint. React preserves the moved row's keyed
+  // DOM node through the reorder, so focus already rides along (Enter/Space
+  // repeats the move) — but a mouse click never shows a focus ring, so nobody
+  // discovers it. After a reorder we re-assert focus on the moved word's arrow
+  // and flash a ring on it so the user sees where the word went and that they
+  // can keep nudging it from the keyboard.
+  const tableRef = useRef<HTMLDivElement | null>(null);
+  const pendingFocusRef = useRef<{ id: string; dir: "up" | "down" } | null>(null);
+  const [recentMove, setRecentMove] = useState<{ id: string; dir: "up" | "down" } | null>(null);
+  const flashTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useLayoutEffect(() => {
+    const pending = pendingFocusRef.current;
+    if (!pending) return;
+    pendingFocusRef.current = null;
+    const root = tableRef.current;
+    if (!root) return;
+    const find = (d: "up" | "down") =>
+      root.querySelector<HTMLButtonElement>(
+        `[data-word-id="${pending.id}"] [data-reorder-arrow="${d}"]`,
+      );
+    // If the word landed at an edge its same-direction arrow is now disabled;
+    // fall back to the opposite arrow so focus + the hint still land on the row.
+    let btn = find(pending.dir);
+    let dir = pending.dir;
+    if (!btn || btn.disabled) {
+      const alt = pending.dir === "up" ? "down" : "up";
+      const b2 = find(alt);
+      if (b2 && !b2.disabled) {
+        btn = b2;
+        dir = alt;
+      }
+    }
+    if (!btn) return;
+    btn.focus();
+    setRecentMove({ id: pending.id, dir });
+    if (flashTimer.current) clearTimeout(flashTimer.current);
+    flashTimer.current = setTimeout(() => setRecentMove(null), 1600);
+  });
+  useEffect(() => () => { if (flashTimer.current) clearTimeout(flashTimer.current); }, []);
+
   if (rows.length === 0) {
     return (
       <Typography variant="body2" color="text.disabled" sx={{ py: 1, pl: 1 }}>
@@ -116,6 +166,7 @@ function WordsTableInner({ rows, activeId, onSave, onDelete, onFocus, onReorder,
   }
   return (
     <Paper
+      ref={tableRef}
       variant="outlined"
       sx={{
         overflow: "hidden",
@@ -171,8 +222,23 @@ function WordsTableInner({ rows, activeId, onSave, onDelete, onFocus, onReorder,
               onDelete={() => onDelete(r.id)}
               onFocus={() => onFocus(r)}
               onGripDragStart={() => setDragId(r.id)}
-              onMoveUp={prevWord ? () => onReorder(r.id, prevWord.id, "before") : undefined}
-              onMoveDown={nextWord ? () => onReorder(r.id, nextWord.id, "after") : undefined}
+              onMoveUp={
+                prevWord
+                  ? () => {
+                      pendingFocusRef.current = { id: r.id, dir: "up" };
+                      onReorder(r.id, prevWord.id, "before");
+                    }
+                  : undefined
+              }
+              onMoveDown={
+                nextWord
+                  ? () => {
+                      pendingFocusRef.current = { id: r.id, dir: "down" };
+                      onReorder(r.id, nextWord.id, "after");
+                    }
+                  : undefined
+              }
+              flashArrow={recentMove?.id === r.id ? recentMove.dir : null}
               onDragEnd={() => {
                 setDragId(null);
                 setDragOver(null);
@@ -255,6 +321,7 @@ const WordRow = memo(function WordRow({
   quoteBuildSelectionCount = 0,
   onStartQuoteBuild,
   onOpenArticle,
+  flashArrow,
 }: {
   row: TwlRow;
   active: boolean;
@@ -267,6 +334,8 @@ const WordRow = memo(function WordRow({
   // Reorder one slot within the verse. Undefined when already first/last.
   onMoveUp?: () => void;
   onMoveDown?: () => void;
+  // The just-reordered arrow to flash a focus ring on ("up"/"down"), or null.
+  flashArrow?: "up" | "down" | null;
   onDragEnd: () => void;
   onRowDragOver: (position: WordDropPosition) => void;
   onRowDrop: (position: WordDropPosition) => void;
@@ -415,9 +484,10 @@ const WordRow = memo(function WordRow({
           <span>
             <IconButton
               size="small"
+              data-reorder-arrow="up"
               onClick={onMoveUp}
               disabled={!onMoveUp}
-              sx={{ p: 0, color: "text.disabled" }}
+              sx={{ p: 0, color: "text.disabled", ...(flashArrow === "up" ? reorderFlashSx : null) }}
             >
               <ArrowUpwardIcon sx={{ fontSize: 14 }} />
             </IconButton>
@@ -451,9 +521,10 @@ const WordRow = memo(function WordRow({
           <span>
             <IconButton
               size="small"
+              data-reorder-arrow="down"
               onClick={onMoveDown}
               disabled={!onMoveDown}
-              sx={{ p: 0, color: "text.disabled" }}
+              sx={{ p: 0, color: "text.disabled", ...(flashArrow === "down" ? reorderFlashSx : null) }}
             >
               <ArrowDownwardIcon sx={{ fontSize: 14 }} />
             </IconButton>

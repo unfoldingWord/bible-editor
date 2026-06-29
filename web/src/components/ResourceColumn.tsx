@@ -1,4 +1,4 @@
-import { Fragment, type Ref, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, type Ref, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Box, Stack, Typography, Chip, Button, IconButton, Tooltip } from "@mui/material";
 import AddIcon from "@mui/icons-material/Add";
 import PushPinIcon from "@mui/icons-material/PushPin";
@@ -390,6 +390,42 @@ export function ResourceColumn({
   const [dragOver, setDragOver] = useState<
     { targetId: string; position: DropPosition } | null
   >(null);
+
+  // Arrow-reorder focus + visible hint (mirrors WordsTable). React preserves
+  // the moved card's keyed DOM node, so focus already rides along and Enter/
+  // Space repeats the move — but a mouse click shows no focus ring, so we
+  // re-assert focus on the moved note's arrow and flash a ring to make that
+  // discoverable. tnRowsRef/scrollBodyRef are the query root.
+  const noteFocusRef = useRef<{ id: string; dir: "up" | "down" } | null>(null);
+  const [recentNoteMove, setRecentNoteMove] = useState<{ id: string; dir: "up" | "down" } | null>(null);
+  const noteFlashTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useLayoutEffect(() => {
+    const pending = noteFocusRef.current;
+    if (!pending) return;
+    noteFocusRef.current = null;
+    const root = scrollBodyRef.current;
+    if (!root) return;
+    const find = (d: "up" | "down") =>
+      root.querySelector<HTMLButtonElement>(
+        `[data-note-id="${pending.id}"] [data-reorder-arrow="${d}"]`,
+      );
+    let btn = find(pending.dir);
+    let dir = pending.dir;
+    if (!btn || btn.disabled) {
+      const alt = pending.dir === "up" ? "down" : "up";
+      const b2 = find(alt);
+      if (b2 && !b2.disabled) {
+        btn = b2;
+        dir = alt;
+      }
+    }
+    if (!btn) return;
+    btn.focus();
+    setRecentNoteMove({ id: pending.id, dir });
+    if (noteFlashTimer.current) clearTimeout(noteFlashTimer.current);
+    noteFlashTimer.current = setTimeout(() => setRecentNoteMove(null), 1600);
+  });
+  useEffect(() => () => { if (noteFlashTimer.current) clearTimeout(noteFlashTimer.current); }, []);
 
   // Resolve the moved note's candidate neighbours at a given drop target —
   // shared by the live drag hover and the arrow moves. Scoped to the moved
@@ -876,6 +912,7 @@ export function ResourceColumn({
           onMoveUp={
             prevNote
               ? () => {
+                  noteFocusRef.current = { id: r.id, dir: "up" };
                   onNoteReorder(r.id, prevNote.id, "before");
                   onReorderPreview?.(computeNeighbors(r.id, prevNote.id, "before"), true);
                 }
@@ -884,11 +921,13 @@ export function ResourceColumn({
           onMoveDown={
             nextNote
               ? () => {
+                  noteFocusRef.current = { id: r.id, dir: "down" };
                   onNoteReorder(r.id, nextNote.id, "after");
                   onReorderPreview?.(computeNeighbors(r.id, nextNote.id, "after"), true);
                 }
               : undefined
           }
+          flashArrow={recentNoteMove?.id === r.id ? recentNoteMove.dir : null}
           onReorderHover={
             onReorderPreview
               ? (entering) =>

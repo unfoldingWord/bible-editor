@@ -49,6 +49,15 @@ const NoteHistoryDialog = lazy(() =>
 
 export type DropPosition = "before" | "after";
 
+// Transient ring on the arrow a note was just reordered with — mouse clicks
+// don't show a :focus-visible ring, so this signals "the note moved, press
+// Enter/Space to keep nudging it." Self-clears via ResourceColumn state.
+const reorderFlashSx = {
+  color: "primary.main",
+  bgcolor: "primary.50",
+  boxShadow: "0 0 0 2px var(--mui-palette-primary-main, #31ADE3)",
+} as const;
+
 interface Props {
   row: TnRow;
   active: boolean;
@@ -80,6 +89,10 @@ interface Props {
   onCardDrop: (position: DropPosition) => void;
   onMoveUp?: () => void;
   onMoveDown?: () => void;
+  // The just-reordered arrow to flash a focus ring on ("up"/"down"), or null.
+  // Mirrors WordsTable: a mouse reorder keeps focus on the moved card's arrow
+  // (Enter/Space repeats) but shows no ring, so this makes that discoverable.
+  flashArrow?: "up" | "down" | null;
   // Verse numbers in this chapter, offered in the reference picker so a note
   // can be retargeted to a different verse ("change reference"). Absent/empty
   // => the ref shows as a static label with no picker.
@@ -291,6 +304,7 @@ function NoteCardInner({
   onCardDrop,
   onMoveUp,
   onMoveDown,
+  flashArrow,
   verseOptions,
   onChangeVerse,
   onReorderHover,
@@ -943,9 +957,10 @@ function NoteCardInner({
           <span>
             <IconButton
               size="small"
+              data-reorder-arrow="up"
               onClick={(e) => { e.stopPropagation(); onMoveUp?.(); }}
               disabled={!onMoveUp}
-              sx={{ p: 0.25, color: "text.disabled" }}
+              sx={{ p: 0.25, color: "text.disabled", ...(flashArrow === "up" ? reorderFlashSx : null) }}
             >
               <ArrowUpwardIcon sx={{ fontSize: 14 }} />
             </IconButton>
@@ -955,9 +970,10 @@ function NoteCardInner({
           <span>
             <IconButton
               size="small"
+              data-reorder-arrow="down"
               onClick={(e) => { e.stopPropagation(); onMoveDown?.(); }}
               disabled={!onMoveDown}
-              sx={{ p: 0.25, color: "text.disabled" }}
+              sx={{ p: 0.25, color: "text.disabled", ...(flashArrow === "down" ? reorderFlashSx : null) }}
             >
               <ArrowDownwardIcon sx={{ fontSize: 14 }} />
             </IconButton>
@@ -1584,7 +1600,8 @@ function areNotePropsEqual(a: Props, b: Props): boolean {
     a.aiRecentlyCompletedAt === b.aiRecentlyCompletedAt &&
     a.locked === b.locked &&
     a.quoteBuildMode === b.quoteBuildMode &&
-    a.quoteBuildSelectionCount === b.quoteBuildSelectionCount
+    a.quoteBuildSelectionCount === b.quoteBuildSelectionCount &&
+    (a.flashArrow ?? null) === (b.flashArrow ?? null)
   );
 }
 
