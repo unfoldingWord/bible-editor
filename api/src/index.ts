@@ -254,6 +254,35 @@ export default {
       } catch (e) {
         console.error("nightly trash finalize failed", e instanceof Error ? e.message : String(e));
       }
+      // Auto-clean resolved pipeline jobs so failed/done runs don't pile up in
+      // the AI-pipelines chip forever (the UI has a manual "mark as seen", this
+      // is the safety net for runs nobody dismissed). Failed/cancelled get a
+      // day's grace then clear; done keep a week of history. A failure here
+      // must not cancel the export — wrap and log.
+      //
+      // pending_imports.job_id REFERENCES pipeline_jobs(job_id) with no
+      // cascade, and a done (or staged-then-failed) job keeps its pending_imports
+      // rows as the apply/audit ledger — so the parent can't be deleted while
+      // children exist. Drop the children first, in the same batch (D1 runs
+      // batch statements sequentially in one transaction), then the jobs.
+      const failedCancelledCutoff = `state IN ('failed', 'cancelled') AND updated_at < unixepoch() - 86400`;
+      const doneCutoff = `state = 'done' AND updated_at < unixepoch() - (7 * 86400)`;
+      try {
+        await env.DB.batch([
+          env.DB.prepare(
+            `DELETE FROM pending_imports
+              WHERE job_id IN (SELECT job_id FROM pipeline_jobs WHERE ${failedCancelledCutoff})`,
+          ),
+          env.DB.prepare(
+            `DELETE FROM pending_imports
+              WHERE job_id IN (SELECT job_id FROM pipeline_jobs WHERE ${doneCutoff})`,
+          ),
+          env.DB.prepare(`DELETE FROM pipeline_jobs WHERE ${failedCancelledCutoff}`),
+          env.DB.prepare(`DELETE FROM pipeline_jobs WHERE ${doneCutoff}`),
+        ]);
+      } catch (e) {
+        console.error("nightly pipeline_jobs cleanup failed", e instanceof Error ? e.message : String(e));
+      }
       // Scheduled run opts into validate-and-merge — the whole point of the
       // 05:30 UTC tick is to land the snapshot on DCS and let the validator
       // merge it. Manual /api/exports/run leaves validateAndMerge unset so
