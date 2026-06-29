@@ -2684,6 +2684,88 @@ function roundtripVerseUsfm(rawUsfm, sourceVO = null) {
   );
 }
 
+// ─── Case 33: Hebrew object marker (H0853) suggestion rule ──────────────
+// The accusative particle אֵת carries no English of its own, so on its own it
+// must never draw a ghost. With a conjunction vav (וְאֵת) it may take "and" and
+// only "and"; with a pronominal suffix (אֹתוֹ "him") it has real content and
+// keeps normal suggestions; grouped with its object noun it inherits the noun's.
+{
+  console.log("\n[Case 33] object marker (H0853) alignment suggestion rule");
+  const { computeGhosts } = await import("./alignmentSuggest.ts");
+  const om = (over) => ({
+    id: "s",
+    strong: "H0853",
+    lemma: "אֵת",
+    morph: "He,To",
+    occurrence: "1",
+    occurrences: "1",
+    content: "אֶת",
+    ...over,
+  });
+
+  // (a) Bare ungrouped object marker → no ghost, even when the endpoint returns
+  // a tempting target.
+  {
+    const group = { id: "g", source: [om()], targets: [] };
+    const suggestions = { "H0853~To": { words: [{ surface: "the", confidence: 0.9, source: "memory" }], phrases: [] } };
+    const stream = [{ id: "w1", text: "the", aligned: false }];
+    const g = computeGhosts([group], stream, suggestions);
+    assert(!g.has("g"), `bare object marker draws no suggestion (got ${JSON.stringify(g.get("g"))})`);
+  }
+
+  // (b) Vav-prefixed object marker → suggests "and", and only "and" (the
+  // endpoint's other surfaces are ignored).
+  {
+    const group = { id: "g", source: [om({ strong: "c:H0853", morph: "He,C:To", content: "וְאֶת" })], targets: [] };
+    const suggestions = { "c:H0853~To": { words: [{ surface: "the", confidence: 0.95, source: "memory" }], phrases: [] } };
+    const stream = [
+      { id: "w1", text: "the", aligned: false },
+      { id: "w2", text: "and", aligned: false },
+    ];
+    const g = computeGhosts([group], stream, suggestions);
+    assert(g.get("g")?.text === "and", `vav object marker suggests only "and" (got ${JSON.stringify(g.get("g"))})`);
+  }
+
+  // (c) Vav-prefixed but no "and" present → no ghost (never a wrong word).
+  {
+    const group = { id: "g", source: [om({ strong: "c:H0853", morph: "He,C:To", content: "וְאֶת" })], targets: [] };
+    const suggestions = { "c:H0853~To": { words: [{ surface: "the", confidence: 0.95, source: "memory" }], phrases: [] } };
+    const stream = [{ id: "w1", text: "the", aligned: false }];
+    const g = computeGhosts([group], stream, suggestions);
+    assert(!g.has("g"), `vav object marker with no "and" stays blank (got ${JSON.stringify(g.get("g"))})`);
+  }
+
+  // (d) Object marker WITH a pronominal suffix (אֹתוֹ "him") → real content, so
+  // it keeps normal suggestions.
+  {
+    const group = { id: "g", source: [om({ morph: "He,To:Sp3ms", content: "אֹתוֹ" })], targets: [] };
+    const suggestions = { "H0853~Sp3ms": { words: [{ surface: "him", confidence: 0.9, source: "memory" }], phrases: [] } };
+    const stream = [{ id: "w1", text: "him", aligned: false }];
+    const g = computeGhosts([group], stream, suggestions);
+    assert(g.get("g")?.text === "him", `suffixed object marker keeps normal suggestion (got ${JSON.stringify(g.get("g"))})`);
+  }
+
+  // (e) Object marker GROUPED with its object noun → rule doesn't fire; the
+  // compound group takes the noun's suggestion.
+  {
+    const group = {
+      id: "g",
+      source: [
+        om(),
+        { id: "s2", strong: "H3389", lemma: "יְרוּשָׁלִַם", morph: "He,Np", occurrence: "1", occurrences: "1", content: "יְרוּשָׁלִַ֖ם" },
+      ],
+      targets: [],
+    };
+    const suggestions = {
+      "H0853~To": { words: [], phrases: [] },
+      "H3389~Np": { words: [{ surface: "Jerusalem", confidence: 0.95, source: "memory" }], phrases: [] },
+    };
+    const stream = [{ id: "w1", text: "Jerusalem", aligned: false }];
+    const g = computeGhosts([group], stream, suggestions);
+    assert(g.get("g")?.text === "Jerusalem", `grouped object marker inherits the noun's suggestion (got ${JSON.stringify(g.get("g"))})`);
+  }
+}
+
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed.`);
   process.exit(1);

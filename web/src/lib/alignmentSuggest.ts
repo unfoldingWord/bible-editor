@@ -149,6 +149,43 @@ export function dismissedGhostKey(group: AlignmentGroup, text: string): string {
   return `${src}\u0001${text.toLowerCase().normalize("NFC")}`;
 }
 
+// ── Hebrew direct object marker (Strong's H0853, אֵת / אֶת) ─────────────────
+// The accusative particle carries no independent English meaning
+// ("[as such unrepresented in English]"), so on its own it must never draw a
+// target suggestion. Two carve-outs, both decided from morph/strong:
+//   • a conjunction vav (וְאֵת — strong "c:H0853", morph "He,C:To") may align to
+//     "and", and ONLY "and";
+//   • a pronominal suffix (אֹתוֹ "him", morph "He,To:Sp3ms") gives it real
+//     English content, so it keeps normal suggestions.
+// Fires ONLY for an *ungrouped* marker (a one-source-word group). When the
+// marker is grouped with its object noun, the group inherits the noun's
+// suggestion — so we leave compound groups alone.
+function isObjectMarkerStrong(strong: string | undefined): boolean {
+  const m = /([HG])0*(\d+)/i.exec(strong ?? "");
+  return !!m && m[1].toUpperCase() === "H" && m[2] === "853";
+}
+
+export type ObjectMarkerRule = "skip" | "andOnly" | null;
+export function objectMarkerRule(group: AlignmentGroup): ObjectMarkerRule {
+  if (group.source.length !== 1) return null; // grouped → inherits the other word
+  const s = group.source[0];
+  if (!isObjectMarkerStrong(s.strong)) return null;
+  // A pronominal suffix (…:Sp…) makes it "him"/"them"/… — real content; leave it.
+  if (/:Sp/i.test(s.morph ?? "")) return null;
+  // Conjunction vav → "and" only; otherwise nothing. The vav shows up as the
+  // "c:" strong clitic, a "C" morph segment, or a leading waw in the surface.
+  const hasVav =
+    /(^|:)c:/i.test(s.strong ?? "") ||
+    /(^|,)C(:|,|$)/.test(s.morph ?? "") ||
+    (s.content ?? "").normalize("NFC").startsWith("ו");
+  return hasVav ? "andOnly" : "skip";
+}
+
+// The single permitted candidate for a vav-prefixed object marker.
+const AND_ONLY_CANDIDATES: AlignCandidate[] = [
+  { surface: "and", confidence: 1, source: "memory" },
+];
+
 // Build ghosts for empty groups. Two passes (phrases first so "the earth" stays
 // whole, then single words), each claiming words immediately so repeated source
 // words distribute across their occurrences. Within a pass, every candidate is
@@ -198,8 +235,18 @@ export function computeGhosts(
 
   const emptyGroups = groups.filter((g) => g.targets.length === 0);
 
+  // Object-marker rule, computed once per empty group (see objectMarkerRule).
+  const omRule = new Map<string, Exclude<ObjectMarkerRule, null>>();
+  for (const g of emptyGroups) {
+    const r = objectMarkerRule(g);
+    if (r) omRule.set(g.id, r);
+  }
+
   // Pass 1 — phrases.
   for (const g of emptyGroups) {
+    // The object marker only ever takes the single word "and" (or nothing), so
+    // it's resolved entirely in the word pass — never a phrase.
+    if (omRule.has(g.id)) continue;
     const srcRel = srcRelOf(g);
     let best: { score: number; run: StreamWord[] } | null = null;
     for (const s of g.source) {
@@ -240,11 +287,15 @@ export function computeGhosts(
   // Pass 2 — single-word fallback for still-empty groups.
   for (const g of emptyGroups) {
     if (result.has(g.id)) continue;
+    const rule = omRule.get(g.id);
+    if (rule === "skip") continue; // bare object marker → no suggestion at all
     const srcRel = srcRelOf(g);
     let best: { score: number; word: StreamWord; source: "memory" | "lexicon" } | null = null;
     for (const s of g.source) {
       const srcOcc = srcOccByStrong.get(s.strong) ?? 1;
-      for (const cand of suggestions[suggestKey(s.strong, s.morph)]?.words ?? []) {
+      const cands =
+        rule === "andOnly" ? AND_ONLY_CANDIDATES : suggestions[suggestKey(s.strong, s.morph)]?.words ?? [];
+      for (const cand of cands) {
         const occ = tgtOcc(cand.surface);
         for (let wi = 0; wi < numStream; wi++) {
           const w = streamWords[wi];
