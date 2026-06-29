@@ -1377,6 +1377,21 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     setPendingDualAction(null);
   }, [chapter, initialVerse]);
 
+  // A front-matter / intro chapter (chapter 0) has only the intro tile (verse 0)
+  // and no real verses. Navigation defaults activeVerse to 1, which doesn't
+  // exist there, so the intro note stayed hidden until the user clicked "i" on
+  // the rail. Once this chapter's tiles are known, snap to verse 0 so the intro
+  // note — the only thing in the chapter — shows on arrival.
+  useEffect(() => {
+    // Gate on data.chapter === chapter: useChapter keeps the *prior* chapter's
+    // payload visible while the new one loads, so acting on stale tiles would
+    // wrongly snap to 0 when navigating from an intro chapter into a real one.
+    if (!data || data.chapter !== chapter || activeVerse === 0) return;
+    if (verseNumbers.length > 0 && verseNumbers.every((v) => v === 0)) {
+      setActiveVerse(0);
+    }
+  }, [data, chapter, verseNumbers, activeVerse]);
+
   // Consume a cross-chapter TN-find jump stashed before navigation. Waits for
   // this chapter's payload (and the target note row) to load, then activates +
   // scrolls to the note. Cleared on consume; ignored if the stash targets a
