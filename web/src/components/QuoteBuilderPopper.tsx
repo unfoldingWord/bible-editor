@@ -431,6 +431,8 @@ function SourceChip({
   return (
     <Tooltip
       title={lexiconBody}
+      enterDelay={0}
+      enterNextDelay={0}
       slotProps={{ popper: { sx: { pointerEvents: "none" } } }}
     >
       <Box sx={{ display: "inline-flex" }}>{chip}</Box>

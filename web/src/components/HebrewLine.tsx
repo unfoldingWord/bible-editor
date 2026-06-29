@@ -109,6 +109,8 @@ export function HebrewLine({ verseObjects, lexiconMap, highlights, prevHighlight
           <Tooltip
             key={`w${items.length}`}
             title={<SourceTooltipBody source={src} lex={lexiconMap.get(strong) ?? null} twHint={twHints ? twHintFromMap(twHints, text) : null} />}
+            enterDelay={0}
+            enterNextDelay={0}
             slotProps={{ popper: { sx: { pointerEvents: "none" } } }}
           >
             {wordSpan}
