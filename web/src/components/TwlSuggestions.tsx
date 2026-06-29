@@ -5,7 +5,7 @@
 // a small dropdown disambiguates. "Add" hands the matched span back to the Shell,
 // which resolves it to an OL quote + occurrence (twlResolve) and creates the row.
 
-import { memo, useEffect, useState } from "react";
+import { memo, useEffect, useRef, useState } from "react";
 import {
   Box,
   Stack,
@@ -98,12 +98,25 @@ function TwlSuggestionsInner({ book, chapter, verse, refreshKey, onAdd, isExclud
     return group ? group.map((o) => twShort(o.link)) : [];
   };
 
+  // Tracks the location the current `suggestions` belong to. A same-verse
+  // refetch (add/delete a link → refreshKey ticks) keeps the old list visible
+  // while the new one loads — isExcluded already drops the just-added row, so
+  // the list shrinks smoothly instead of collapsing and re-expanding. Only an
+  // actual navigation blanks first, so we never flash the previous verse's
+  // suggestions against the new verse.
+  const locRef = useRef(`${book}|${chapter}|${verse}`);
+
   useEffect(() => {
     // Skip the scan entirely while paused (and not peeking) — the whole point
     // is to stop proposing once the editor has signed off on words here.
     if (verse === 0 || (paused && !peeked)) {
       setSuggestions([]);
       return;
+    }
+    const loc = `${book}|${chapter}|${verse}`;
+    if (locRef.current !== loc) {
+      locRef.current = loc;
+      setSuggestions([]);
     }
     const ctrl = new AbortController();
     setLoading(true);
@@ -159,6 +172,10 @@ function TwlSuggestionsInner({ book, chapter, verse, refreshKey, onAdd, isExclud
   // which suggestions are blocked, so showing the list would flash addable links
   // the deny-list will remove a moment later.
   const showLoading = loading || !filtersReady;
+  // Only blank the body on the FIRST load (nothing to show yet). A same-verse
+  // refetch keeps the current list rendered — see locRef above — so adding a
+  // link shrinks the list by one row instead of collapsing the whole box.
+  const showInitialLoading = showLoading && suggestions.length === 0;
 
   if (paused && !peeked) {
     return (
@@ -196,7 +213,7 @@ function TwlSuggestionsInner({ book, chapter, verse, refreshKey, onAdd, isExclud
           Suggestions
         </Typography>
         <Chip
-          label={showLoading ? "…" : visible.length}
+          label={showInitialLoading ? "…" : visible.length}
           size="small"
           variant="outlined"
           sx={{ height: 16, fontFamily: "monospace", fontSize: 10 }}
@@ -215,7 +232,7 @@ function TwlSuggestionsInner({ book, chapter, verse, refreshKey, onAdd, isExclud
         <Typography variant="caption" color="error" sx={{ pl: 1 }}>
           couldn&rsquo;t load suggestions
         </Typography>
-      ) : showLoading ? null : visible.length === 0 ? (
+      ) : showInitialLoading ? null : visible.length === 0 ? (
         <Typography variant="caption" color="text.disabled" sx={{ pl: 1, fontStyle: "italic" }}>
           no new links suggested for this verse
         </Typography>
