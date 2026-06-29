@@ -395,13 +395,26 @@ export const pipelineStore = {
     await pollOne(jobId);
   },
 
-  // Hide every currently-done job from the chip. Dismissed IDs persist in
-  // localStorage so a tab reload doesn't bring them back. Non-terminal /
-  // failed jobs are left alone — those still need user attention.
-  dismissDone() {
+  // Mark a single terminal job as seen — drop it from the chip and remember
+  // the id so loadFromServer doesn't resurrect it. Used by the per-row dismiss
+  // on failed/cancelled jobs (the "mark as seen" the chip otherwise lacks).
+  // The row stays in D1 until the nightly cleanup cron purges it.
+  dismiss(jobId: string) {
+    if (!jobs.has(jobId)) return;
+    jobs.delete(jobId);
+    dismissed.add(jobId);
+    persistDismissed();
+    notify();
+  },
+
+  // Hide every currently-resolved job (done / failed / cancelled) from the
+  // chip in one go. Dismissed IDs persist in localStorage so a tab reload
+  // doesn't bring them back. Active / queued jobs are left alone — those still
+  // need user attention.
+  dismissResolved() {
     let changed = false;
     for (const [id, j] of jobs) {
-      if (j.state === "done") {
+      if (j.state === "done" || j.state === "failed" || j.state === "cancelled") {
         jobs.delete(id);
         dismissed.add(id);
         changed = true;

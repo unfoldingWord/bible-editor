@@ -291,12 +291,13 @@ export function PipelineStatusBar({ toast, onToastClear }: Props = {}) {
                     : "success"
             }
             onClick={(e) => setAnchorEl(e.currentTarget)}
-            // Only the "done-only" variant is dismissable. Running, queued,
-            // and failed states need user attention, so no delete icon there.
+            // Dismissable once nothing is in flight — done and failed runs can
+            // both be marked as seen. Running / queued states still need user
+            // attention, so no delete icon there.
             onDelete={
-              active.length === 0 && queued.length === 0 && failed.length === 0 && doneRecent.length > 0
+              active.length === 0 && queued.length === 0 && doneRecent.length + failed.length > 0
                 ? () => {
-                    pipelineStore.dismissDone();
+                    pipelineStore.dismissResolved();
                     setAnchorEl(null);
                   }
                 : undefined
@@ -404,6 +405,13 @@ export function PipelineStatusBar({ toast, onToastClear }: Props = {}) {
                       </span>
                     </Tooltip>
                   )}
+                  {(job.state === "failed" || job.state === "cancelled") && (
+                    <Tooltip title="Mark as seen — hides this run from the list">
+                      <Button size="small" color="inherit" onClick={() => pipelineStore.dismiss(job.job_id)}>
+                        Dismiss
+                      </Button>
+                    </Tooltip>
+                  )}
                 </Stack>
                 {job.state !== "queued" && job.state !== "dispatching" && job.state !== "cancelled" && (
                   <StageBar
@@ -437,16 +445,16 @@ export function PipelineStatusBar({ toast, onToastClear }: Props = {}) {
             >
               {refreshing ? "Refreshing…" : "Refresh"}
             </Button>
-            {doneRecent.length > 0 && active.length === 0 && failed.length === 0 && (
+            {doneRecent.length + failed.length > 0 && active.length === 0 && queued.length === 0 && (
               <Button
                 size="small"
                 color="inherit"
                 onClick={() => {
-                  pipelineStore.dismissDone();
+                  pipelineStore.dismissResolved();
                   setAnchorEl(null);
                 }}
               >
-                Dismiss
+                Dismiss all
               </Button>
             )}
           </Stack>
