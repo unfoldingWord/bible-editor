@@ -746,7 +746,9 @@ export function ResourceColumn({
         )}
 
         {resourceTab === "words" && (
-          <>
+          // Flex column filling the scroll viewport so the suggestions block
+          // (mt:auto) is pushed to the bottom even when the Words list is short.
+          <Box sx={{ display: "flex", flexDirection: "column", minHeight: "100%" }}>
             <SectionHead
               title="Words"
               count={totalTwl}
@@ -804,20 +806,39 @@ export function ResourceColumn({
                 refreshKey is the verse's current link set so adding/removing a
                 link re-scans and drops/recovers it. */}
             {!twlGroups && onAddTwlSuggestion && (
-              <TwlSuggestions
-                book={book}
-                chapter={chapter}
-                verse={activeVerse}
-                refreshKey={twlForVerse.map((r) => `${r.tw_link ?? ""}|${r.orig_words ?? ""}|${r.occurrence ?? 1}`).join("~")}
-                onAdd={onAddTwlSuggestion}
-                isExcluded={isTwlSuggestionExcluded}
-                blockedArticleIds={twlBlockedArticleIds}
-                filtersReady={twlFiltersReady}
-                locked={locked}
-                paused={!!checkoff && checkoff.applicable("tw") && checkoff.shade("tw") !== "open"}
-              />
+              // Pin the suggestions to the bottom of the scroll viewport: mt:auto
+              // pushes it to the bottom of the flex column (so it stays there even
+              // when the Words list is short), and sticky bottom:-8 keeps it pinned
+              // while scrolling a long list. mx/px:2 + pb:1 extend the paper
+              // background; bottom:-8 sits it flush against the scroll body's py:1.
+              <Box
+                sx={{
+                  mt: "auto",
+                  position: "sticky",
+                  bottom: -8,
+                  zIndex: 1,
+                  bgcolor: "background.paper",
+                  mx: -2,
+                  px: 2,
+                  pb: 1,
+                  boxShadow: "0 -6px 8px -6px rgba(0,0,0,0.12)",
+                }}
+              >
+                <TwlSuggestions
+                  book={book}
+                  chapter={chapter}
+                  verse={activeVerse}
+                  refreshKey={twlForVerse.map((r) => `${r.tw_link ?? ""}|${r.orig_words ?? ""}|${r.occurrence ?? 1}`).join("~")}
+                  onAdd={onAddTwlSuggestion}
+                  isExcluded={isTwlSuggestionExcluded}
+                  blockedArticleIds={twlBlockedArticleIds}
+                  filtersReady={twlFiltersReady}
+                  locked={locked}
+                  paused={!!checkoff && checkoff.applicable("tw") && checkoff.shade("tw") !== "open"}
+                />
+              </Box>
             )}
-          </>
+          </Box>
         )}
 
         {resourceTab === "questions" && (
