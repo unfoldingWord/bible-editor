@@ -29,6 +29,7 @@ import {
   ensureDcsPr,
   exportTsvShrinkRefused,
   findDcsOpenPr,
+  recreateExportBranchFromMaster,
   updateDcsPrBranch,
   usfmAlignmentShrinkRefused,
   RESOURCE_TARGETS,
@@ -483,6 +484,29 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
                 console.log("export PR update-branch skipped", {
                   book, resource, repo: target.repo, pr: pr.number, status: upd.status, detail: upd.detail,
                 });
+                // 409 = genuine merge conflict: the branch drifted from master
+                // (an out-of-band master edit to the same rows) and won't
+                // auto-merge. D1 is authoritative, so rebuild the branch as a
+                // clean child of CURRENT master carrying the SAME rendered file
+                // and re-open the PR — diff becomes exactly the D1 delta, no
+                // conflict. built.content already passed the freshness + shrink
+                // gates above; we reuse it (never re-render). Gated on an admin
+                // token; absent → just alert (today's drift behavior). See
+                // docs/export-rebase-fix.md.
+                if (upd.status === 409) {
+                  const recovered = await this.recoverConflictedBranch(
+                    book, resource, owner, target.repo, branch, dcsCfg, filename, built.content, message,
+                  );
+                  if (recovered) {
+                    prNumber = recovered.prNumber;
+                    prReason = recovered.prReason;
+                    // Record the FRESH rebuilt commit, not the stale one from the
+                    // (now deleted) conflicted branch — otherwise the snapshot's
+                    // commit_sha is wrong and contributorsFor's `commit_sha IS
+                    // NOT NULL` cutoff can't advance.
+                    if (recovered.commitSha) dcsCommitSha = recovered.commitSha;
+                  }
+                }
               }
             } catch (e) {
               console.error("export PR update-branch failed", {
@@ -686,6 +710,67 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     }
   }
 
+  // Recover a conflicted export PR (updateDcsPrBranch 409). D1 is authoritative,
+  // so rebuild the drifted branch as a clean child of CURRENT master carrying
+  // the same already-rendered file, then re-open the PR. Reuses `content`
+  // (already past the freshness + shrink gates in exportOne — never re-renders),
+  // so this can't smuggle a stale/partial render past those guards. Gated on the
+  // admin token (DCS_TOKEN); without it we can't delete the branch, so we just
+  // alert and leave the conflicted PR for a human (today's behavior). Best-effort
+  // throughout: any failure alerts rather than failing the export step (the
+  // commit + snapshot already succeeded). Returns the new PR info to record, or
+  // null when nothing changed. See docs/export-rebase-fix.md.
+  private async recoverConflictedBranch(
+    book: string,
+    resource: Resource,
+    owner: string,
+    repo: string,
+    branch: string,
+    dcsCfg: { baseUrl: string; token: string; owner: string; repo: string; branch: string },
+    filename: string,
+    content: string,
+    message: string,
+  ): Promise<{ prNumber: number | null; prReason: string; commitSha: string | null } | null> {
+    const adminToken = this.env.DCS_TOKEN;
+    if (!adminToken) {
+      await this.recordPrConflictAlert(book, resource, repo, branch, "no_admin_token");
+      return null;
+    }
+    try {
+      const res = await recreateExportBranchFromMaster({
+        baseUrl: dcsCfg.baseUrl,
+        token: adminToken,
+        owner,
+        repo,
+        branch,
+      });
+      if (!res.rebuilt) {
+        await this.recordPrConflictAlert(book, resource, repo, branch, res.detail);
+        return null;
+      }
+      // Branch is now master HEAD. Re-commit the rendered D1 file (forceBranch:
+      // we know it differs from master — that's what conflicted) → one commit,
+      // child of master. The delete auto-closed the old PR, so ensureDcsPr mints
+      // a fresh one whose diff is exactly the D1 delta.
+      const recommit = await commitToDcs(dcsCfg, filename, content, message, { forceBranch: true });
+      const pr = await ensureDcsPr(
+        dcsCfg,
+        `bible-editor: ${book} ${resource} → master`,
+        `Rebuilt by the bible-editor nightly export: \`${branch}\` had drifted into a merge ` +
+          `conflict with master, so it was recreated as a clean child of current master carrying ` +
+          `the authoritative D1 render of ${book} ${resource.toUpperCase()}. Any rows present only on ` +
+          `master (not in D1) are intentionally dropped — D1 is authoritative.`,
+      );
+      await this.recordBranchRebuiltAlert(book, resource, repo, branch, pr.number);
+      return { prNumber: pr.number, prReason: `rebuilt:${pr.reason}`, commitSha: recommit.commitSha || null };
+    } catch (e) {
+      const detail = e instanceof Error ? e.message : String(e);
+      console.error("export conflict-recovery failed", { book, resource, repo, branch, error: detail });
+      await this.recordPrConflictAlert(book, resource, repo, branch, detail.slice(0, 120));
+      return null;
+    }
+  }
+
   private async recordSnapshot(
     book: string,
     resource: Resource,
@@ -847,7 +932,12 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
 
   // Replace-undismissed alert writer shared by the export-side alerts. Best
   // effort: an alert-write failure must never fail or retry the export.
-  private async writeAlert(source: string, message: string, linkUrl: string): Promise<void> {
+  private async writeAlert(
+    source: string,
+    message: string,
+    linkUrl: string,
+    severity: "error" | "warning" | "info" = "error",
+  ): Promise<void> {
     try {
       await this.env.DB.prepare(
         `DELETE FROM system_alerts WHERE username = ?1 AND source = ?2 AND dismissed_at IS NULL`,
@@ -856,9 +946,9 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
         .run();
       await this.env.DB.prepare(
         `INSERT INTO system_alerts (username, severity, source, message, link_url)
-         VALUES (?1, 'error', ?2, ?3, ?4)`,
+         VALUES (?1, ?5, ?2, ?3, ?4)`,
       )
-        .bind(EXPORT_ALERT_USERNAME, source, message, linkUrl)
+        .bind(EXPORT_ALERT_USERNAME, source, message, linkUrl, severity)
         .run();
     } catch (e) {
       console.error("export alert write failed", { source, error: e instanceof Error ? e.message : String(e) });
@@ -897,5 +987,46 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
         book, resource, repo, error: e instanceof Error ? e.message : String(e),
       });
     }
+  }
+
+  // Error banner when an export PR conflicted but we could NOT auto-recover —
+  // no admin token, the delete was forbidden, or the rebuild threw. The PR is
+  // left mergeable:false for a human to reconcile (today's behavior).
+  private async recordPrConflictAlert(
+    book: string,
+    resource: Resource,
+    repo: string,
+    branch: string,
+    detail: string,
+  ): Promise<void> {
+    const source = `export_conflict:${repo}:${book}:${resource}`;
+    const message =
+      `Benjamin fix this — nightly export PR for ${book} ${resource.toUpperCase()} (\`${branch}\` on ${repo}) ` +
+      `is in merge conflict with master and could NOT be auto-rebuilt (${detail}). Reconcile by hand ` +
+      `(merge master, \`git checkout --ours\` the file = D1's render, push), or provision DCS_TOKEN so the ` +
+      `export can rebuild the branch automatically.`;
+    const linkUrl = `${this.env.DCS_BASE_URL}/${this.env.DCS_EXPORT_OWNER ?? "unfoldingWord"}/${repo}/pulls`;
+    await this.writeAlert(source, message, linkUrl, "error");
+  }
+
+  // Informational banner when an export PR conflict WAS auto-recovered by
+  // rebuilding the branch off master. Surfaces (rather than silently swallows)
+  // the D1-authoritative resolution so Benjamin can eyeball the rebuilt PR diff
+  // and confirm any master-only rows that got dropped were meant to go.
+  private async recordBranchRebuiltAlert(
+    book: string,
+    resource: Resource,
+    repo: string,
+    branch: string,
+    prNumber: number | null,
+  ): Promise<void> {
+    const source = `export_rebuilt:${repo}:${book}:${resource}`;
+    const prRef = prNumber != null ? `#${prNumber}` : "(PR pending)";
+    const message =
+      `Heads up — nightly export rebuilt \`${branch}\` (${book} ${resource.toUpperCase()} on ${repo}) onto ` +
+      `current master to clear a merge conflict; D1's render is authoritative. Eyeball PR ${prRef} to confirm ` +
+      `any master-only rows dropped were intended.`;
+    const linkUrl = `${this.env.DCS_BASE_URL}/${this.env.DCS_EXPORT_OWNER ?? "unfoldingWord"}/${repo}/pulls`;
+    await this.writeAlert(source, message, linkUrl, "warning");
   }
 }

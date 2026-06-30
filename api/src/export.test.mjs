@@ -5,7 +5,7 @@
 // instead of getting silently flattened to `\v 6`. Not a test framework;
 // failures exit non-zero.
 
-import { buildTnTsv, buildTwlTsv, buildUsfm, commitToDcs, ensureDcsPr, exportTsvShrinkRefused, updateDcsPrBranch, usfmAlignmentShrinkRefused } from "./export.ts";
+import { buildTnTsv, buildTwlTsv, buildUsfm, commitToDcs, ensureDcsPr, exportTsvShrinkRefused, recreateExportBranchFromMaster, updateDcsPrBranch, usfmAlignmentShrinkRefused } from "./export.ts";
 import { CorruptContentJsonError } from "./contentJson.ts";
 
 function assert(cond, msg) {
@@ -673,6 +673,78 @@ function utf8Base64(s) {
   // master actually having aligned verses.
   const r8freshboth = usfmAlignmentShrinkRefused("", "");
   assert(r8freshboth.refused === false, `empty render + empty master never refuses`);
+}
+
+// --- recreateExportBranchFromMaster: delete + recreate off master ---
+// Recovers a drifted export branch whose PR conflicted. Needs branch-delete
+// (admin token); 403 → rebuilt:false WITHOUT throwing so the caller alerts.
+{
+  const originalFetch = globalThis.fetch;
+  const cfg = { baseUrl: "https://dcs.example", token: "admin", owner: "o", repo: "r", branch: "ISA-be-x" };
+  const okJson = (obj, status = 200) =>
+    new Response(JSON.stringify(obj), { status, headers: { "Content-Type": "application/json" } });
+
+  // Per-endpoint mock: DELETE /branches/:name, POST /branches (recreate),
+  // GET /branches/:name (ensureBranchVisible poll).
+  const makeFetch = (h) => {
+    const calls = [];
+    const fn = async (url, init = {}) => {
+      const u = String(url);
+      const m = init.method ?? "GET";
+      calls.push({ u, m });
+      if (u.endsWith("/branches") && m === "POST") return (h.postBranch ?? (() => okJson({ name: cfg.branch })))();
+      if (u.includes("/branches/") && m === "DELETE") return h.delBranch();
+      if (u.includes("/branches/") && m === "GET") return (h.getBranch ?? (() => okJson({ name: cfg.branch })))();
+      throw new Error(`unexpected ${m} ${u}`);
+    };
+    return { fn, calls };
+  };
+
+  try {
+    // (1) Happy path: delete 200 → recreate → visible → rebuilt.
+    {
+      const { fn, calls } = makeFetch({ delBranch: () => okJson({}) });
+      globalThis.fetch = fn;
+      const r = await recreateExportBranchFromMaster(cfg);
+      assert(r.rebuilt === true && r.detail === "rebuilt", `delete 200 → rebuilt`);
+      assert(calls.some((c) => c.m === "DELETE"), `issues a branch DELETE`);
+      assert(calls.some((c) => c.u.endsWith("/branches") && c.m === "POST"), `recreates the branch from master`);
+    }
+
+    // (2) Forbidden delete (service token lacks branch-delete): rebuilt:false,
+    // detail surfaces the status, and we do NOT recreate.
+    {
+      const { fn, calls } = makeFetch({
+        delBranch: () => okJson({ message: "Forbidden" }, 403),
+        postBranch: () => { throw new Error("must not recreate when delete is forbidden"); },
+      });
+      globalThis.fetch = fn;
+      const r = await recreateExportBranchFromMaster(cfg);
+      assert(r.rebuilt === false && r.detail === "delete_403", `403 delete → rebuilt:false, detail delete_403`);
+      assert(!calls.some((c) => c.u.endsWith("/branches") && c.m === "POST"), `no recreate after forbidden delete`);
+    }
+
+    // (3) Branch already gone (404 delete) → still recreates → rebuilt.
+    {
+      const { fn } = makeFetch({ delBranch: () => okJson({ message: "Not Found" }, 404) });
+      globalThis.fetch = fn;
+      const r = await recreateExportBranchFromMaster(cfg);
+      assert(r.rebuilt === true, `404 delete (already gone) still recreates → rebuilt`);
+    }
+
+    // (4) Benign 409 on recreate (a concurrent run already made it) → rebuilt.
+    {
+      const { fn } = makeFetch({
+        delBranch: () => okJson({}),
+        postBranch: () => okJson({ message: "branch already exists" }, 409),
+      });
+      globalThis.fetch = fn;
+      const r = await recreateExportBranchFromMaster(cfg);
+      assert(r.rebuilt === true, `409 on recreate (race) is benign → rebuilt`);
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 }
 
 console.log("\nAll export smoke checks passed.");

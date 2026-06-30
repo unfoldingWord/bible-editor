@@ -37,6 +37,12 @@ export interface Env {
   DCS_CLIENT_SECRET?: string;
   JWT_SIGNING_KEY?: string;
   DCS_SERVICE_TOKEN?: string;
+  // Admin PAT (branch-delete capable) used ONLY to recover a drifted export
+  // branch whose PR has conflicted (delete + recreate off current master; the
+  // service token 403s on branch-delete). Set via `wrangler secret put
+  // DCS_TOKEN`. Absent → the conflict recovery is inert and the PR just gets a
+  // banner alert (no behavior change). See docs/export-rebase-fix.md.
+  DCS_TOKEN?: string;
   // Owner of the repos nightly exports land on. The branch is no longer
   // configurable — exports go to a per-(book,resource) branch named for the
   // book + its human contributors (see export.ts:buildExportBranch).

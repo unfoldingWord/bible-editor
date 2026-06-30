@@ -731,6 +731,47 @@ export async function commitToDcs(
   };
 }
 
+// Rebuild a drifted export branch as a fresh child of CURRENT master so its PR
+// stops conflicting. This is the only mechanism that actually resets a branch's
+// frozen merge-base on door43: `PATCH /git/refs` can't re-base an existing ref
+// (fork existence-guard bug — see resetExportBranchToMaster) and the contents
+// API only makes single-parent commits, so we delete + recreate. That needs
+// branch-delete scope (the export's DCS_SERVICE_TOKEN 403s — pass an admin PAT
+// in config.token). Deleting the head branch auto-CLOSES its open PR; the caller
+// re-commits the rendered D1 file (forceBranch) and re-opens a fresh,
+// conflict-free PR. The branch comes back as a direct child of master, so the
+// new PR diff is exactly the D1 delta. Returns rebuilt=false WITHOUT throwing if
+// the delete was forbidden (403) or otherwise failed, so the caller can fall
+// back to alerting rather than failing the export step. See
+// docs/export-rebase-fix.md.
+export async function recreateExportBranchFromMaster(
+  config: DcsCommitConfig,
+): Promise<{ rebuilt: boolean; detail: string }> {
+  const headers: Record<string, string> = {
+    Authorization: `token ${config.token}`,
+    "Content-Type": "application/json",
+    Accept: "application/json",
+  };
+  const repoBase = `${config.baseUrl}/api/v1/repos/${encodeURIComponent(config.owner)}/${encodeURIComponent(config.repo)}`;
+
+  // Delete the diverged branch (needs branch-delete scope). 404 = already gone,
+  // which is fine — we recreate it below either way. A 403 means the token can't
+  // delete; surface it so the caller alerts instead of throwing.
+  const del = await fetch(
+    `${repoBase}/branches/${encodeURIComponent(config.branch)}`,
+    { method: "DELETE", headers },
+  );
+  if (!del.ok && del.status !== 404 && del.status !== 204) {
+    return { rebuilt: false, detail: `delete_${del.status}` };
+  }
+
+  // Recreate from master HEAD (createBranchFromMaster swallows a benign 409),
+  // then poll until it's a visible branch the commit can target.
+  await createBranchFromMaster(repoBase, headers, config.branch);
+  await ensureBranchVisible(repoBase, headers, config.branch);
+  return { rebuilt: true, detail: "rebuilt" };
+}
+
 // DELETE /api/v1/repos/:owner/:repo/branches/:branch
 // Best-effort: returns true if the branch was deleted, false if it was already
 // gone (404). Any other status throws so the caller can log it. Used by the
