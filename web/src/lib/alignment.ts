@@ -531,9 +531,16 @@ export function parseAlignment(
   sourceVerseObjects?: unknown[] | null,
 ): AlignmentState {
   const inputs = (verseObjects ?? []) as ParsedNode[];
+  // Re-anchor any AI-glued source milestones to the UHB/UGNT before walking, so
+  // a maqqef-spanning token becomes per-word milestones (correct strongs, no
+  // phantom duplicate, individually splittable). No-op when source is absent or
+  // the verse is clean — clean verses round-trip byte-identical.
+  const reformed = (sourceVerseObjects
+    ? reformGluedMilestones(inputs, sourceVerseObjects)
+    : inputs) as ParsedNode[];
   const stream: StreamItem[] = [];
   const sourceGroups: AlignmentGroup[] = [];
-  walk(inputs, [], stream, sourceGroups, null);
+  walk(reformed, [], stream, sourceGroups, null);
 
   const base = { stream, sourceGroups };
   if (!sourceVerseObjects) return finalize(base);
@@ -642,6 +649,191 @@ function findSourcePosition(
   return -1;
 }
 
+// Hebrew source tokens an AI/tC aligner glued across a maqqef (U+05BE) or a
+// minus/hyphen into ONE `\zaln-s` x-content — e.g. AMO 3:1 UST
+// `x-content="אֶת־הַדָּבָר"` over the UHB pair אֶת(H0853) + הַדָּבָר(d:H1697),
+// carrying only the first word's strong (3:3 even uses a U+2212 minus). Strip
+// pointing/cantillation and every joiner so such an x-content can be matched
+// against the run of separate UHB words it actually spans.
+const SOURCE_JOINER_CODES = new Set<number>([
+  0x05be, // maqqef (U+05BE)
+  0x002d, 0x2010, 0x2011, 0x2012, 0x2013, 0x2014, 0x2015, // hyphen-minus + dashes
+  0x2212, // minus sign (U+2212)
+  0x200b, 0x200c, 0x200d, 0x2060, // zero-width + word joiners
+]);
+function sourceFold(text: string): string {
+  let out = "";
+  for (const ch of nfc(text)) {
+    if (/[\p{Mn}\s]/u.test(ch)) continue;
+    if (SOURCE_JOINER_CODES.has(ch.codePointAt(0) ?? -1)) continue;
+    out += ch;
+  }
+  return out;
+}
+
+// Every UHB/UGNT position an existing source word covers. Normally just the one
+// `findSourcePosition` resolves. But a maqqef/minus-joined x-content (above)
+// spans SEVERAL adjacent UHB words while resolving by strong to only the first —
+// its neighbours would then look "uncovered" and `withSourceCoverage` would emit
+// a phantom empty placeholder for each (the reported Amos duplication: the
+// maqqef-joined word shows once inside the glued card and again as an empty
+// card). When the content's consonant fold is longer than the matched word's and
+// begins with it, greedily consume the following UHB words until the accumulated
+// fold matches exactly, covering the whole spanned run. Falls back to the single
+// position when there is no clean span match — so it never over-covers.
+function coveredPositions(
+  sourceWords: CollectedSourceWord[],
+  s: SourceWord,
+): number[] {
+  const start = findSourcePosition(sourceWords, s);
+  if (start < 0) return [];
+  const wantFold = sourceFold(s.content ?? "");
+  const startFold = sourceFold(sourceWords[start].text);
+  if (!wantFold || !startFold || wantFold === startFold || !wantFold.startsWith(startFold)) {
+    return [start];
+  }
+  const positions = [start];
+  let acc = startFold;
+  let p = start;
+  while (acc.length < wantFold.length && p + 1 < sourceWords.length) {
+    p += 1;
+    const f = sourceFold(sourceWords[p].text);
+    if (!f) break;
+    acc += f;
+    positions.push(p);
+    if (acc === wantFold) return positions;
+  }
+  return [start];
+}
+
+export interface ReformReport {
+  reformed: number;
+  skipped: number;
+  notes: string[];
+}
+
+// A cross-word GLUE joiner inside an x-content string — maqqef (U+05BE),
+// minus (U+2212), or any hyphen/dash. Deliberately EXCLUDES the zero-width
+// joiners (U+2060/U+200D) that appear INSIDE a single UHB word (e.g. the
+// article in הַ⁠דָּבָר): those are intra-word, not a sign of two glued words.
+function contentHasGlueJoiner(s: string): boolean {
+  for (const ch of s) {
+    const cp = ch.codePointAt(0) ?? -1;
+    if (cp === 0x05be || cp === 0x002d || (cp >= 0x2010 && cp <= 0x2015) || cp === 0x2212) return true;
+  }
+  return false;
+}
+
+// Reform AI-malformed source alignment off the UHB/UGNT. The upstream AI aligner
+// sometimes stamps a `\zaln-s` whose x-content SPANS a maqqef/minus — gluing two
+// separate UHB words into one source token that carries only the first word's
+// (often wrong) strong (e.g. AMO 3:1 UST `x-content="אֶת־הַדָּבָר" x-strong="H0853"`
+// over UHB אֶת(H0853) + הַדָּבָר(d:H1697)). Such a token can't be aligned per-word
+// and trips a phantom placeholder for its neighbour. We re-anchor it to the UHB:
+//
+//   - Only milestones whose x-content CONTAINS a glue joiner are candidates
+//     (`contentHasGlueJoiner`). Everything else is left byte-identical — a
+//     consonant fold drops pointing, so fold-matching a normal single word could
+//     "fix" attrs that are actually correct; we never do that.
+//   - For a candidate, enumerate EVERY contiguous UHB run whose concatenated
+//     `sourceFold` equals the content fold. Reform only when the run is UNIQUE;
+//     >1 match (or none) ⇒ leave the milestone untouched (never guess) and count
+//     it in `report`.
+//   - On a unique run of N words, replace the one milestone with N nested
+//     `\zaln-s` milestones (innermost wraps the original target `\w` children),
+//     each carrying that UHB word's strong/lemma/morph/content and a per-exact-
+//     surface occurrence (`collectSourceWords` textOccurrence). Every target word
+//     stays under a `\zaln`, so a later export sees `changed_source`, not `lost`.
+//
+// Returns the SAME array reference when nothing reformed (clean verses round-trip
+// untouched). Pure; never mutates the input. Reused by the aligner (at parse) and
+// the backfill script, so the logic lives in exactly one place.
+export function reformGluedMilestones(
+  targetVerseObjects: unknown[],
+  sourceVerseObjects: unknown[],
+  report?: ReformReport,
+): unknown[] {
+  if (!Array.isArray(targetVerseObjects) || !Array.isArray(sourceVerseObjects)) {
+    return targetVerseObjects;
+  }
+  const sourceWords = collectSourceWords(sourceVerseObjects);
+  if (sourceWords.length === 0) return targetVerseObjects;
+  const folds = sourceWords.map((sw) => sourceFold(sw.text));
+  const totals = new Map<string, number>();
+  for (const sw of sourceWords) totals.set(sw.textKey, (totals.get(sw.textKey) ?? 0) + 1);
+
+  // Every contiguous UHB run whose concatenated fold equals `contentFold`; a
+  // unique match disambiguates, anything else is refused.
+  const findUniqueRun = (contentFold: string): { start: number; len: number } | null => {
+    const matches: Array<{ start: number; len: number }> = [];
+    for (let i = 0; i < folds.length; i++) {
+      let acc = "";
+      for (let j = i; j < folds.length && acc.length < contentFold.length; j++) {
+        acc += folds[j];
+        if (acc === contentFold) { matches.push({ start: i, len: j - i + 1 }); break; }
+        if (!contentFold.startsWith(acc)) break;
+      }
+    }
+    return matches.length === 1 ? matches[0] : null;
+  };
+
+  const transform = (nodes: unknown[]): unknown[] => {
+    let localChanged = false;
+    const out: unknown[] = [];
+    for (const node of nodes ?? []) {
+      const o = node as ParsedNode | null;
+      if (o && o["type"] === "milestone" && o["tag"] === "zaln") {
+        const origKids = (o["children"] as unknown[] | undefined) ?? [];
+        const kids = transform(origKids);
+        const content = String(o["content"] ?? "");
+        if (contentHasGlueJoiner(content)) {
+          const run = findUniqueRun(sourceFold(content));
+          if (run) {
+            const chain: SourceWord[] = [];
+            for (let k = run.start; k < run.start + run.len; k++) {
+              const sw = sourceWords[k];
+              const reW: SourceWord = {
+                id: uid(),
+                strong: sw.strong,
+                occurrence: String(sw.textOccurrence),
+                occurrences: String(totals.get(sw.textKey) ?? 1),
+                content: sw.text,
+              };
+              if (sw.lemma) reW.lemma = sw.lemma;
+              if (sw.morph) reW.morph = sw.morph;
+              chain.push(reW);
+            }
+            out.push(buildNestedMilestone(chain, kids as ParsedNode[]));
+            localChanged = true;
+            if (report) {
+              report.reformed += 1;
+              report.notes.push(`reformed "${content}" → ${run.len} UHB word(s)`);
+            }
+            continue;
+          }
+          if (report) {
+            report.skipped += 1;
+            report.notes.push(`skipped (no unique UHB run): "${content}"`);
+          }
+        }
+        if (kids !== origKids) { out.push({ ...o, children: kids }); localChanged = true; }
+        else out.push(node);
+        continue;
+      }
+      if (o && Array.isArray(o["children"])) {
+        const kids = transform(o["children"] as unknown[]);
+        if (kids !== o["children"]) { out.push({ ...o, children: kids }); localChanged = true; }
+        else out.push(node);
+        continue;
+      }
+      out.push(node);
+    }
+    return localChanged ? out : nodes;
+  };
+
+  return transform(targetVerseObjects);
+}
+
 // Augment with synthetic source groups for any UHB/UGNT word the target
 // USFM didn't reference, so the dialog can show empty drop slots. Empty
 // groups don't emit anything; when populated, the chips emit at their
@@ -673,8 +865,7 @@ function withSourceCoverage(
   const covered = new Set<number>();
   for (const g of base.sourceGroups) {
     for (const s of g.source) {
-      const p = findSourcePosition(sourceWords, s);
-      if (p >= 0) covered.add(p);
+      for (const p of coveredPositions(sourceWords, s)) covered.add(p);
     }
   }
   // Keyed by textKey (NFC) — textOccurrence was counted per textKey in

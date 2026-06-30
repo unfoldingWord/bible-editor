@@ -98,4 +98,27 @@ t("verse 0 (front) skipped", () => {
   assert.equal(lintUsfmVerses([{ ...v, verse: 0 }]).length, 0);
 });
 
+// Joiner-glued alignment milestone detector (Amos UST AI-aligner defect).
+const MAQQEF = "־"; // ־
+const MINUS = "−"; // −
+t("maqqef-glued milestone x-content escalated as 'Glued alignment'", () => {
+  const i = lintUsfmVerses([verseFromUsfm(`\\c 1\n\\p\n\\v 1 \\zaln-s |x-strong="H0853" x-content="את${MAQQEF}הדבר"\\*\\w word\\w*\\zaln-e\\*\n`)]);
+  const glued = i.filter((x) => x.check === "Glued alignment");
+  assert.equal(glued.length, 1);
+  assert.equal(glued[0].bucket, "escalate");
+});
+t("minus-glued milestone x-content escalated", () => {
+  const i = lintUsfmVerses([verseFromUsfm(`\\c 1\n\\p\n\\v 1 \\zaln-s |x-strong="H0518a" x-content="אם${MINUS}נועדו"\\*\\w word\\w*\\zaln-e\\*\n`)]);
+  assert.equal(i.filter((x) => x.check === "Glued alignment").length, 1);
+});
+t("clean single-word milestone is NOT flagged as glued", () => {
+  const i = lintUsfmVerses([verseFromUsfm(`\\c 1\n\\p\n\\v 1 \\zaln-s |x-strong="H1" x-content="טוב"\\*\\w good\\w*\\zaln-e\\*\n`)]);
+  assert.equal(i.filter((x) => x.check === "Glued alignment").length, 0);
+});
+t("intra-word U+2060 joiner is NOT flagged as glued", () => {
+  // הַ⁠דָּבָר-shaped content: the article joiner U+2060 lives INSIDE one UHB word.
+  const i = lintUsfmVerses([verseFromUsfm(`\\c 1\n\\p\n\\v 1 \\zaln-s |x-strong="d:H1697" x-content="ה⁠דבר"\\*\\w word\\w*\\zaln-e\\*\n`)]);
+  assert.equal(i.filter((x) => x.check === "Glued alignment").length, 0);
+});
+
 console.log(`\n${passed} lint tests passed`);

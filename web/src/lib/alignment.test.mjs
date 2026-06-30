@@ -23,6 +23,7 @@ import {
   mergeSamePositionGroups,
   sourceKey,
   cardKey,
+  reformGluedMilestones,
 } from "./alignment.ts";
 import { extractPlainText } from "./usfm.ts";
 import { findTargetHighlights, findSourceHighlights } from "./highlight.ts";
@@ -2764,6 +2765,170 @@ function roundtripVerseUsfm(rawUsfm, sourceVO = null) {
     const g = computeGhosts([group], stream, suggestions);
     assert(g.get("g")?.text === "Jerusalem", `grouped object marker inherits the noun's suggestion (got ${JSON.stringify(g.get("g"))})`);
   }
+}
+
+// ─── Reform: re-anchor AI-glued source milestones off the UHB (Amos UST) ─────
+// AMO 3:1/3:3 UST glue a maqqef- (3:1) or minus- (3:3) joined UHB pair into ONE
+// \zaln-s whose x-content spans the joiner and carries only the FIRST word's
+// (often wrong) strong: 3:1 `x-content="אֶת־הַדָּבָר" x-strong="H0853"` over UHB
+// אֶת(H0853)+הַדָּבָר(d:H1697). reformGluedMilestones (run inside parseAlignment)
+// matches the content fold to the UHB run and SPLITS the milestone into per-word
+// milestones with the right strongs — no phantom duplicate, individually
+// splittable. Uses unpointed consonants except where pointing is the point; the
+// fold strips pointing, so they exercise the same logic.
+const MAQQEF = "־"; // U+05BE HEBREW PUNCTUATION MAQAF
+const MINUS = "−";  // U+2212 MINUS SIGN (AMO 3:3 really uses this, not a maqqef)
+const srcWordContents = (st) => st.groups.flatMap((g) => g.source).map((s) => ({ c: s.content, strong: s.strong }));
+
+{
+  console.log("\n[Case] reform splits a maqqef-glued milestone off the UHB (AMO 3:1)");
+  // glued את־הדבר milestone nests an inner הזה milestone (real compound shape);
+  // UHB has an extra unreferenced אשר (pos 4) that MUST still get a placeholder.
+  const target1 = String.raw`\id AMO
+\c 3
+\v 1 \zaln-s |x-strong="H8085" x-occurrence="1" x-occurrences="1" x-content="שמעו"\*\w listen|x-occurrence="1" x-occurrences="1"\w*\zaln-e\*
+\zaln-s |x-strong="H0853" x-lemma="אֵת" x-occurrence="1" x-occurrences="1" x-content="את${MAQQEF}הדבר"\*\zaln-s |x-strong="d:H1697" x-occurrence="1" x-occurrences="1" x-content="הזה"\*\w to|x-occurrence="1" x-occurrences="1"\w*
+\w this|x-occurrence="1" x-occurrences="2"\w*
+\w message|x-occurrence="1" x-occurrences="1"\w*\zaln-e\*\zaln-e\*
+`;
+  const source1 = String.raw`\id AMO
+\c 3
+\v 1 \w שמעו|strong="H8085"\w* \w את|strong="H0853"\w*${MAQQEF}\w הדבר|strong="d:H1697"\w* \w הזה|strong="d:H2088"\w* \w אשר|strong="H0834a"\w*
+`;
+  const tvo1 = usfm.toJSON(target1).chapters["3"]["1"].verseObjects;
+  const svo1 = usfm.toJSON(source1).chapters["3"]["1"].verseObjects;
+  const state1 = parseAlignment(tvo1, svo1);
+  const words1 = srcWordContents(state1);
+
+  // The glued token is gone: NO source word's content still spans the maqqef.
+  assert(!words1.some((w) => (w.c ?? "").includes(MAQQEF)), `glued "את־הדבר" was split (no maqqef-spanning source word remains)`);
+  // It split into correctly-attributed per-word milestones from the UHB.
+  assert(words1.some((w) => w.c === "את" && w.strong === "H0853"), `split produced את with UHB strong H0853 (got ${JSON.stringify(words1)})`);
+  assert(words1.some((w) => w.c === "הדבר" && w.strong === "d:H1697"), `split produced הדבר with UHB strong d:H1697 (got ${JSON.stringify(words1)})`);
+  // No phantom empty card for the joined word; only the unreferenced אשר.
+  const empties1 = state1.groups.filter((g) => g.targets.length === 0);
+  assert(empties1.length === 1 && empties1[0].source[0]?.content === "אשר", `only unreferenced אשר gets an empty card (got ${JSON.stringify(empties1.map((g) => g.source[0]?.content))})`);
+  // The reformed compound stays aligned to to/this/message.
+  const compound1 = state1.groups.find((g) => g.source.some((s) => s.content === "הדבר"));
+  assert(compound1?.targets.some((t) => t.text === "message"), `reformed compound kept its alignment to "message"`);
+
+  // Round-trip: serialize → reparse is stable (already split → reform is a no-op).
+  const reState1 = parseAlignment(serializeAlignment(state1), svo1);
+  const reWords1 = srcWordContents(reState1);
+  assert(
+    reWords1.some((w) => w.c === "את" && w.strong === "H0853") && reWords1.some((w) => w.c === "הדבר" && w.strong === "d:H1697"),
+    `reformed structure round-trips through serializeAlignment`,
+  );
+}
+
+{
+  console.log("\n[Case] reform splits a minus-glued milestone (AMO 3:3)");
+  const target3 = String.raw`\id AMO
+\c 3
+\v 3 \zaln-s |x-strong="H1115" x-occurrence="1" x-occurrences="1" x-content="בלתי"\*\zaln-s |x-strong="H0518a" x-occurrence="1" x-occurrences="1" x-content="אם${MINUS}נועדו"\*\w unless|x-occurrence="1" x-occurrences="1"\w*\zaln-e\*\zaln-e\*
+`;
+  const source3 = String.raw`\id AMO
+\c 3
+\v 3 \w בלתי|strong="H1115"\w* \w אם|strong="H0518a"\w*${MINUS}\w נועדו|strong="H3259"\w*
+`;
+  const state3 = parseAlignment(
+    usfm.toJSON(target3).chapters["3"]["3"].verseObjects,
+    usfm.toJSON(source3).chapters["3"]["3"].verseObjects,
+  );
+  const words3 = srcWordContents(state3);
+  assert(!words3.some((w) => (w.c ?? "").includes(MINUS)), `minus-glued "אם−נועדו" was split`);
+  assert(words3.some((w) => w.c === "נועדו" && w.strong === "H3259"), `split produced נועדו with UHB strong H3259 (got ${JSON.stringify(words3)})`);
+  assert(!state3.groups.some((g) => g.targets.length === 0 && g.source[0]?.content === "נועדו"), `no phantom empty נועדו card`);
+}
+
+{
+  console.log("\n[Case] reform occurrence is per exact UHB surface");
+  // Glued "גד־טוב" maps to UHB [גד(pos1), טוב(pos2)]; טוב is the 2nd "טוב".
+  const target = String.raw`\id AMO
+\c 1
+\v 1 \zaln-s |x-strong="H1" x-occurrence="1" x-occurrences="1" x-content="גד${MAQQEF}טוב"\*\w x|x-occurrence="1" x-occurrences="1"\w*\zaln-e\*
+`;
+  const source = String.raw`\id AMO
+\c 1
+\v 1 \w טוב|strong="H1"\w* \w גד|strong="H2"\w*${MAQQEF}\w טוב|strong="H1"\w*
+`;
+  const st = parseAlignment(usfm.toJSON(target).chapters["1"]["1"].verseObjects, usfm.toJSON(source).chapters["1"]["1"].verseObjects);
+  // Find the split טוב/גד source words inside the aligned (non-empty) group.
+  const aligned = st.groups.find((g) => g.targets.length > 0);
+  const tov = aligned.source.find((s) => s.content === "טוב");
+  const gad = aligned.source.find((s) => s.content === "גד");
+  assert(tov?.occurrence === "2" && tov?.occurrences === "2", `split טוב carries per-surface occurrence 2/2 (got ${tov?.occurrence}/${tov?.occurrences})`);
+  assert(gad?.strong === "H2", `split גד carries UHB strong H2 (got ${gad?.strong})`);
+}
+
+{
+  console.log("\n[Case] reform ignores a bogus x-occurrence on the glued milestone");
+  const target = String.raw`\id AMO
+\c 1
+\v 1 \zaln-s |x-strong="H0853" x-occurrence="9" x-occurrences="9" x-content="את${MAQQEF}הדבר"\*\w y|x-occurrence="1" x-occurrences="1"\w*\zaln-e\*
+`;
+  const source = String.raw`\id AMO
+\c 1
+\v 1 \w את|strong="H0853"\w*${MAQQEF}\w הדבר|strong="d:H1697"\w*
+`;
+  const st = parseAlignment(usfm.toJSON(target).chapters["1"]["1"].verseObjects, usfm.toJSON(source).chapters["1"]["1"].verseObjects);
+  const w = srcWordContents(st);
+  assert(w.some((x) => x.c === "את" && x.strong === "H0853") && w.some((x) => x.c === "הדבר" && x.strong === "d:H1697"), `bogus x-occurrence ignored; matched by content (got ${JSON.stringify(w)})`);
+}
+
+{
+  console.log("\n[Case] reform refuses an ambiguous glue (repeated fold) and reports it");
+  // fold("אב־גד") = "אבגד" occurs at UHB [0,1] AND [2,3] → not unique → skip.
+  const target = String.raw`\id AMO
+\c 1
+\v 1 \zaln-s |x-strong="H1" x-occurrence="1" x-occurrences="1" x-content="אב${MAQQEF}גד"\*\w z|x-occurrence="1" x-occurrences="1"\w*\zaln-e\*
+`;
+  const source = String.raw`\id AMO
+\c 1
+\v 1 \w אב|strong="H1"\w* \w גד|strong="H2"\w* \w אב|strong="H1"\w* \w גד|strong="H2"\w*
+`;
+  const tvo = usfm.toJSON(target).chapters["1"]["1"].verseObjects;
+  const svo = usfm.toJSON(source).chapters["1"]["1"].verseObjects;
+  const report = { reformed: 0, skipped: 0, notes: [] };
+  const out = reformGluedMilestones(tvo, svo, report);
+  assert(report.reformed === 0 && report.skipped === 1, `ambiguous glue is skipped, not guessed (got reformed=${report.reformed} skipped=${report.skipped})`);
+  // The glued milestone survives untouched in the output (the coverage backstop
+  // — Phase 0 — handles the dedupe at display time).
+  const stillGlued = JSON.stringify(out).includes(`אב${MAQQEF}גד`);
+  assert(stillGlued, `ambiguous glued milestone left untouched`);
+}
+
+{
+  console.log("\n[Case] reform is a no-op (identity) on clean data");
+  // Clean verse: every milestone is one UHB word, no joiner in any x-content.
+  const target = String.raw`\id AMO
+\c 1
+\v 1 \zaln-s |x-strong="H1" x-occurrence="1" x-occurrences="1" x-content="טוב"\*\w good|x-occurrence="1" x-occurrences="1"\w*\zaln-e\*
+`;
+  const source = String.raw`\id AMO
+\c 1
+\v 1 \w טוב|strong="H1"\w*
+`;
+  const tvo = usfm.toJSON(target).chapters["1"]["1"].verseObjects;
+  const svo = usfm.toJSON(source).chapters["1"]["1"].verseObjects;
+  assert(reformGluedMilestones(tvo, svo) === tvo, `clean verse returns the same array reference (no churn)`);
+}
+
+{
+  console.log("\n[Case] reform never touches a NON-joiner milestone (no fold-based 'fixing')");
+  // A single-word milestone whose content has no joiner is left byte-identical
+  // even though its fold matches a UHB word — only glued content is a candidate.
+  const target = String.raw`\id AMO
+\c 1
+\v 1 \zaln-s |x-strong="WRONG" x-occurrence="1" x-occurrences="1" x-content="טוב"\*\w good|x-occurrence="1" x-occurrences="1"\w*\zaln-e\*
+`;
+  const source = String.raw`\id AMO
+\c 1
+\v 1 \w טוב|strong="H1"\w*
+`;
+  const tvo = usfm.toJSON(target).chapters["1"]["1"].verseObjects;
+  const svo = usfm.toJSON(source).chapters["1"]["1"].verseObjects;
+  assert(reformGluedMilestones(tvo, svo) === tvo, `non-joiner milestone with a wrong strong is left untouched`);
 }
 
 if (failed > 0) {
