@@ -1551,6 +1551,11 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     plainText: string,
     intent: AlignmentIntent,
     expectedVersion = base.version,
+    // Local-cache apply to run AFTER the save is committed. For the synchronous
+    // success path the caller still applies it itself; this is invoked by the
+    // confirm-commit below (text_edit) so a deferred "Save anyway" updates the
+    // cache too.
+    onConfirmedApply?: () => void,
   ): boolean => {
     const delta = analyzeAlignmentDelta(base.content, content);
     // Block any save that collaterally de-aligns untouched words. The enforced
@@ -1560,22 +1565,42 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     // wordSequenceUnchanged to false, so the narrowed guard never fired and the
     // collateral loss reached master. See guardBlocksSave for the full rationale.
     if (guardBlocksSave(delta, intent)) {
-      const sample = delta.unexpectedLosses
-        .slice(0, 3)
-        .map((loss) => loss.text)
-        .join(", ");
+      const lost = delta.unexpectedLosses.map((loss) => loss.text);
+      // text_edit: a reword/reorder the edit engine can't keep aligned (e.g.
+      // relocating an aligned phrase across \q lines, or a verse whose UNCHANGED
+      // region holds a split-unit word like "Yahweh's" that disqualifies the
+      // occurrence-keyed reassembly tier — ZEC 9:1). Rather than DISCARD the
+      // translator's keystroke draft, surface the same confirm the aligner uses;
+      // on "Save anyway" re-enqueue with the alignment_edit intent — the only
+      // guard-exempt intent, mirrored in the API (verses.ts), so the PATCH MUST
+      // climb as alignment_edit or it is rejected there too. The affected words
+      // land unaligned for the translator to re-align in the Alignment panel.
       if (intent === "text_edit") {
-        pushPipelineToast(
-          `This edit can't preserve word alignment on words you didn't change, so it wasn't saved (${book} ${chapterNum}:${verseNum} ${bibleVersion}${sample ? `; affected: ${sample}` : ""}). The unsaved draft was discarded. Please note this verse (${book} ${chapterNum}:${verseNum}) for your admin to file a bug-fix review, or make the text edit more narrowly / re-align in the alignment panel.`,
-          "error",
-        );
-        void drafts.clear(verseKey(book, chapterNum, verseNum, bibleVersion));
-      } else {
-        pushPipelineToast(
-          `This edit can't preserve word alignment on words you didn't change, so it wasn't saved (${book} ${chapterNum}:${verseNum} ${bibleVersion}${sample ? `; affected: ${sample}` : ""}). Please note this verse (${book} ${chapterNum}:${verseNum}) for your admin to file a bug-fix review, or re-align in the alignment panel.`,
-          "error",
-        );
+        setPendingAlignmentLoss({
+          ref: `${book} ${chapterNum}:${verseNum} ${bibleVersion}`,
+          lostWords: lost,
+          commit: () => {
+            void outbox.enqueueVerse(
+              book,
+              chapterNum,
+              verseNum,
+              bibleVersion,
+              expectedVersion,
+              { content, plain_text: plainText, alignment_intent: "alignment_edit" },
+            );
+            onConfirmedApply?.();
+          },
+        });
+        return false;
       }
+      // find_replace / section_edit: keep the hard block + toast. There is no
+      // keystroke draft to preserve, and find/replace-all can touch many verses
+      // at once — a single shared confirm dialog would clobber across them.
+      const sample = lost.slice(0, 3).join(", ");
+      pushPipelineToast(
+        `This edit can't preserve word alignment on words you didn't change, so it wasn't saved (${book} ${chapterNum}:${verseNum} ${bibleVersion}${sample ? `; affected: ${sample}` : ""}). Please note this verse (${book} ${chapterNum}:${verseNum}) for your admin to file a bug-fix review, or re-align in the alignment panel.`,
+        "error",
+      );
       return false;
     }
     void outbox.enqueueVerse(
@@ -1945,11 +1970,14 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       plain_text: newPlainText,
       content: result.content,
     } as VerseDto;
-    if (!enqueueVerseSafely(chapterNum, verseNum, bibleVersion, base, result.content, newPlainText, "text_edit")) {
+    const applyLocal = () => {
+      bookHook?.applyLocalVerse(newDto);
+      if (chapterNum === chapter) applyLocalVerse(newDto);
+    };
+    if (!enqueueVerseSafely(chapterNum, verseNum, bibleVersion, base, result.content, newPlainText, "text_edit", base.version, applyLocal)) {
       return;
     }
-    bookHook?.applyLocalVerse(newDto);
-    if (chapterNum === chapter) applyLocalVerse(newDto);
+    applyLocal();
   };
 
   // Restore a previously-saved verse version (from the history dialog). Unlike
@@ -2670,7 +2698,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         </DialogTitle>
         <DialogContent>
           <DialogContentText>
-            Saving this alignment will leave{" "}
+            Saving will leave{" "}
             {pendingAlignmentLoss?.lostWords.length === 1 ? "this word" : "these words"} with no
             source link in {pendingAlignmentLoss?.ref}:{" "}
             <Box component="span" sx={{ fontWeight: 700 }}>
