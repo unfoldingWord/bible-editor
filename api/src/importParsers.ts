@@ -526,6 +526,26 @@ export function reconcileSourceAttrsFromMaster(
   };
   collectMaster(masterVerseObjects);
 
+  // Count how many TARGET milestones share each source key. >1 means the target
+  // is ambiguous for that key — a symptom of upstream strong-shift, e.g. AMO 3:1
+  // where the reform's הדבר and a pre-existing mislabeled הזה both key
+  // d:H1697|1|1. Master's single value can't be safely assigned to one of them,
+  // so we adopt NOTHING for that key (never guess) — without this, the reconcile
+  // clobbers a reformed split back onto the wrong word and re-corrupts the verse.
+  const targetKeyCount = new Map<string, number>();
+  const countTargetKeys = (nodes: unknown[]): void => {
+    for (const node of nodes) {
+      if (!node || typeof node !== "object") continue;
+      const o = node as Record<string, unknown>;
+      if (o["type"] === "milestone" && o["tag"] === "zaln") {
+        const key = milestoneSourceKey(o);
+        if (key !== null) targetKeyCount.set(key, (targetKeyCount.get(key) ?? 0) + 1);
+      }
+      if (Array.isArray(o["children"])) countTargetKeys(o["children"] as unknown[]);
+    }
+  };
+  countTargetKeys(targetVerseObjects);
+
   const applyTarget = (nodes: unknown[]): void => {
     for (const node of nodes) {
       if (!node || typeof node !== "object") continue;
@@ -533,14 +553,16 @@ export function reconcileSourceAttrsFromMaster(
       if (o["type"] === "milestone" && o["tag"] === "zaln") {
         const key = milestoneSourceKey(o);
         const attrs = key !== null ? masterByKey.get(key) : undefined;
+        const targetAmbiguous = key !== null && (targetKeyCount.get(key) ?? 0) > 1;
         if (key !== null && attrs) {
           for (const a of SOURCE_OWNED_MILESTONE_ATTRS) {
             const set = attrs.get(a);
             if (!set || set.size === 0) continue;
             const cur = typeof o[a] === "string" ? (o[a] as string) : "";
-            if (set.size > 1) {
-              // Master ambiguous for this key — never guess. Only flag when the
-              // target actually disagrees with every master candidate.
+            if (targetAmbiguous || set.size > 1) {
+              // Ambiguous on the TARGET (duplicate source key) or on MASTER (>1
+              // distinct value) — never guess. Flag only when the target value
+              // actually disagrees with master, so the residual is visible.
               if (!set.has(cur)) report.divergent.push({ key, attr: a });
               continue;
             }

@@ -808,6 +808,28 @@ const zalnMs = (attrs, targetText) => ({
   assert(d1b[0].content === "new", `clean (non-glued) master value still adopted`);
 }
 
+{
+  // TARGET-AMBIGUITY GUARD: the AMO 3:1 shape after the backfill. The reform
+  // split the glued את־הדבר into את(H0853) + הדבר(d:H1697), but the verse ALSO
+  // carries a pre-existing strong-shifted milestone הזה mislabeled d:H1697 — so
+  // the target now has TWO d:H1697|1|1 milestones. Master (still glued) carries a
+  // single non-glued d:H1697 = "הזה". Without the guard, the reconcile adopts
+  // "הזה" onto BOTH, clobbering the reformed "הדבר". The guard must leave both as-is.
+  const d1 = [
+    zalnMs({ strong: "H0853", content: "אֶת", lemma: "אֵת", morph: "He,To" }, "to"),
+    zalnMs({ strong: "d:H1697", content: "הַדָּבָר", lemma: "דָּבָר", morph: "He,Td:Ncmsa" }, "message"),
+    zalnMs({ strong: "d:H1697", content: "הַזֶּה", lemma: "זֶה", morph: "He,Td:Ncmsa" }, "this"),
+  ];
+  const master = [
+    zalnMs({ strong: "H0853", content: "אֶת־הַדָּבָר", lemma: "אֵת", morph: "He,To" }, "to"), // glued → guard #1 skips
+    zalnMs({ strong: "d:H1697", content: "הַזֶּה", lemma: "זֶה", morph: "He,Td:Ncmsa" }, "this"),
+  ];
+  const report = reconcileSourceAttrsFromMaster(d1, master);
+  assert(report.reconciled.length === 0, `target-ambiguous d:H1697 → nothing adopted (got ${report.reconciled.length})`);
+  assert(d1[1].content === "הַדָּבָר", `reformed "הַדָּבָר" survives (not clobbered to "הַזֶּה")`);
+  assert(d1[2].content === "הַזֶּה", `the pre-existing "הַזֶּה" is unchanged`);
+}
+
 // --- normalizeNoteWhitespace: collapse bp-assistant double spaces ------------
 // The two real artifacts from the ISA cleanup are the canonical cases.
 {
