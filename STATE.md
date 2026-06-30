@@ -25,7 +25,7 @@ empty placeholder card (the "duplicate"). **Corpus scan (ULT+UST vs UHB):** glue
 Amos UST = 29 milestones, all in ch3** — ISA/ZEC/HOS/JON + all ULT are CLEAN (0 glued). A one-off bad
 AI run, not systemic. x-content is 100% reliable; strongs on glued tokens are not. **Codex-reviewed
 the plan** → trimmed scope (auto-reform-everywhere is overbuilt). **Chosen scope = backfill +
-import detector.** Shipped IN-BRANCH (NOT committed/deployed):
+import detector.** **Committed (9128a5d2) + [PR #298](https://github.com/unfoldingWord/bible-editor/pull/298) open, awaiting review/merge:**
 - **Phase 0 — joiner-aware coverage** (`web/src/lib/alignment.ts` `sourceFold`+`coveredPositions`):
   a joiner-spanning token covers its whole UHB run → no phantom placeholder. Safety net.
 - **Phase 1 — reform (`reformGluedMilestones` in alignment.ts, run in `parseAlignment`)**: ONLY
@@ -46,9 +46,13 @@ import detector.** Shipped IN-BRANCH (NOT committed/deployed):
   vs a live DB (outage blocked Bash; logic == unit-tested detector).
 **Verified:** `npm --workspace web run test` (7 new reform cases inc. Codex counterexamples) + `npm
 --workspace api run test` (4 detector cases) + `npm run typecheck` all green; 29-verse dry-run clean.
-**Pending:** browser smoke on locally-seeded Amos (blocked this session by a transient
-model-availability outage on the Agent/Bash classifier — UI code unchanged, so logic is covered by
-units); commit/PR; Phase 2 prod backfill + re-export on go-ahead. Plan:
+**Verified live (browser smoke, locally-seeded Amos, Preview MCP):** UST 3:1 shows אֶת·הַדָּבָר·הַזֶּה
+as separate attributed chips in one compound card, 0 empty/phantom cards; 3:3 shows בִּלְתִּי·אִם·נוֹעָדוּ
+separate, 0 empty. **Codex PR review (P1): backfill `--emit-sql` wrote a non-existent `edit_log.payload`
+column → fixed to full audited shape + landing guard (commit `eab0e328`).** Codex also confirmed the
+runtime path clean (web+api tests + typecheck green). **Pending: after PR #298 merges** — Phase 2 prod
+backfill (`reform-amo-ust.mjs --snapshot --emit-sql`, after a full-corpus prod sweep to confirm Amos is
+the only affected book) + re-export `AMO/ust`. Plan:
 `~/.claude/plans/wiggly-dreaming-hoare.md`. TRAP hit + corrected: ran tests from MAIN checkout once
 (cd'd away from worktree) → they silently omit branch changes; always run from the worktree root.
 (memory: [[project_maqqef_glued_alignment_reform]])
