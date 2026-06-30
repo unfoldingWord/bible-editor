@@ -14,6 +14,21 @@
 
 ## Last run
 
+2026-06-30 · **reconcile-target-ambiguity** — **Close the LAST maqqef-reform durability gap (AMO 3:1).**
+After #300 deployed I re-ran the AMO-UST backfill: **D1 held this time (0 glued, 3:1 correctly split
+את+הדבר).** But found a residual #300 didn't cover: AMO 3:1's reform yields TWO `d:H1697|1|1`
+milestones (the reformed הדבר + a PRE-EXISTING strong-shifted הזה mislabeled d:H1697). Master (still
+glued) has a single non-glued `d:H1697`="הזה"; #300 only skips the *glued* master milestone, so the
+reconcile would still adopt "הזה" onto BOTH → clobber the reformed "הדבר". **Fix:** new TARGET-side
+ambiguity guard in `reconcileSourceAttrsFromMaster` — `countTargetKeys` pre-pass; when the target has
+>1 milestone for a source key, adopt NOTHING for it (flag divergent). Narrow: the legit
+two-distinct-occurrences case (different occ → different key) still reconciles. Test added; api +
+typecheck green. **State of play:** D1 AMO-UST reformed (0 glued); DCS master STILL glued; watermark
+stale (95324a80) vs master blob (4d48dbea) so the nightly reconcile WILL run — with this guard the
+10 non-collision verses hold AND 3:1 holds. **Deploy this before the nightly** or 3:1's הדבר
+re-corrupts. Then the nightly export propagates reformed D1 → master (self-heal) + the `export_glued:AMO`
+banner clears. en_ust PR #4198 = glued (don't merge). PR pending. (memory: [[project_maqqef_glued_alignment_reform]])
+
 2026-06-30 · **reconcile-glue-guard** — **Make the maqqef reform DURABLE: stop the reconcile from
 re-gluing.** Follow-up to happy-chebyshev/#298 (merged + deployed). The first prod AMO-UST backfill
 was reverted mid-export: the deployed `reconcileSourceAttrsFromMaster` (PR #268) re-adopted DCS
