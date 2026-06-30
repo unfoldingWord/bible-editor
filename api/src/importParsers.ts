@@ -464,6 +464,21 @@ function milestoneSourceKey(o: Record<string, unknown>): string | null {
   return `${strong}|${String(o["occurrence"] ?? "")}|${String(o["occurrences"] ?? "")}`;
 }
 
+// True when a milestone's x-content spans a cross-word GLUE joiner — maqqef
+// (U+05BE), minus (U+2212), or a hyphen/dash. That is the AI-aligner defect:
+// two original-language words glued into one source token (e.g. AMO UST
+// "אֶת־הַדָּבָר"). Such a master value must NOT be adopted onto a target — doing
+// so would RE-GLUE a verse already reformed in D1 (or re-corrupt a split), which
+// is exactly what undid the first Amos backfill. Excludes the zero-width joiners
+// (U+2060/U+200D) that legitimately sit INSIDE one UHB word.
+function contentSpansGlueJoiner(s: string): boolean {
+  for (const ch of s) {
+    const cp = ch.codePointAt(0) ?? -1;
+    if (cp === 0x05be || cp === 0x002d || (cp >= 0x2010 && cp <= 0x2015) || cp === 0x2212) return true;
+  }
+  return false;
+}
+
 export interface SourceAttrReconcileReport {
   // (key, attr) pairs whose target value was updated to match master.
   reconciled: Array<{ key: string; attr: string; from: string; to: string }>;
@@ -488,7 +503,13 @@ export function reconcileSourceAttrsFromMaster(
       const o = node as Record<string, unknown>;
       if (o["type"] === "milestone" && o["tag"] === "zaln") {
         const key = milestoneSourceKey(o);
-        if (key !== null) {
+        // Never offer a glue-joined master milestone's attrs as adoptable values:
+        // its x-content is the AI defect, and adopting it would re-glue a verse
+        // that D1 already reformed (see project_maqqef_glued_alignment_reform —
+        // this is what reverted the first Amos backfill mid-export).
+        const mContent = o["content"];
+        const glued = typeof mContent === "string" && contentSpansGlueJoiner(mContent);
+        if (key !== null && !glued) {
           let attrs = masterByKey.get(key);
           if (!attrs) masterByKey.set(key, (attrs = new Map()));
           for (const a of SOURCE_OWNED_MILESTONE_ATTRS) {

@@ -789,6 +789,25 @@ const zalnMs = (attrs, targetText) => ({
   assert(d1[0].children[0].children[0].text === "x", `target word under nested milestones preserved`);
 }
 
+{
+  // GLUE GUARD: a master milestone whose x-content spans a maqqef/minus (the
+  // AI-aligner defect) must NOT be adopted onto a verse D1 already reformed —
+  // otherwise the reconcile re-glues the split (this is what reverted the first
+  // Amos backfill). Master AMO 3:1 "אֶת־הַדָּבָר" (H0853, glued); D1 reformed to
+  // "אֶת". Reconcile must leave D1's "אֶת" alone.
+  const MAQQEF = "־";
+  const d1 = [zalnMs({ strong: "H0853", content: "אֶת", lemma: "אֵת", morph: "He,To" }, "to")];
+  const master = [zalnMs({ strong: "H0853", content: `אֶת${MAQQEF}הַדָּבָר`, lemma: "אֵת", morph: "He,To" }, "to")];
+  const report = reconcileSourceAttrsFromMaster(d1, master);
+  assert(report.reconciled.length === 0, `glued master content is NOT adopted (no re-glue)`);
+  assert(d1[0].content === "אֶת", `D1's reformed "אֶת" survives the reconcile`);
+  // And a CLEAN master milestone still reconciles normally (guard is narrow).
+  const d1b = [zalnMs({ strong: "H1", content: "old", lemma: "", morph: "" }, "w")];
+  const masterb = [zalnMs({ strong: "H1", content: "new", lemma: "", morph: "" }, "w")];
+  reconcileSourceAttrsFromMaster(d1b, masterb);
+  assert(d1b[0].content === "new", `clean (non-glued) master value still adopted`);
+}
+
 // --- normalizeNoteWhitespace: collapse bp-assistant double spaces ------------
 // The two real artifacts from the ISA cleanup are the canonical cases.
 {

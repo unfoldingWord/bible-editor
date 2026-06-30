@@ -14,6 +14,19 @@
 
 ## Last run
 
+2026-06-30 · **reconcile-glue-guard** — **Make the maqqef reform DURABLE: stop the reconcile from
+re-gluing.** Follow-up to happy-chebyshev/#298 (merged + deployed). The first prod AMO-UST backfill
+was reverted mid-export: the deployed `reconcileSourceAttrsFromMaster` (PR #268) re-adopted DCS
+master's still-glued x-content onto the edited verses during the export's pre-sync (re-glued 11,
+corrupted 3:1). Restored prod to baseline. **Fix (new branch off main):** `contentSpansGlueJoiner`
+guard in `api/src/importParsers.ts` — `collectMaster` now SKIPS any master `\zaln-s` whose x-content
+spans a maqqef/minus/hyphen joiner, so the reconcile never offers the known defect as an adoptable
+value. Narrow: clean master values still reconcile. Regression test in `importParsers.test.mjs`
+(glued master not adopted + D1 reformed value survives + clean value still adopted). api tests +
+typecheck green. **After this deploys:** re-run the AMO-UST backfill (`reform-amo-ust.mjs`) — it will
+then HOLD, and the nightly export pushes reformed D1 → DCS master (self-heal). PR pending.
+(memory: [[project_maqqef_glued_alignment_reform]])
+
 2026-06-30 · **happy-chebyshev** — **Maqqef-glued UST alignment: duplicate fix + reform off UHB
 (Amos).** Reported bug: in the **UST aligner for Amos**, maqqef-joined Hebrew (`אֶת־הַדָּבָר` 3:1,
 `אִם−נוֹעָדוּ` 3:3) showed **duplicated**, and couldn't be split like tC. **Root cause (proven vs
