@@ -143,9 +143,44 @@ function footnoteDelta(nodes: unknown[]): number {
   return delta;
 }
 
+// True when any `\zaln-s` in the verse carries an x-content that spans a
+// CROSS-WORD joiner — maqqef (U+05BE), minus (U+2212), or a hyphen/dash. That
+// glues two original-language words into one source token (carrying only the
+// first word's, often wrong, strong), which strands the joined word in the
+// aligner — the AI-aligner defect seen in Amos UST. The web aligner re-anchors
+// it off the UHB on open, but the stored data can't self-heal until it is
+// touched/back-filled, so we flag it for a human. Excludes the zero-width
+// joiners (U+2060/U+200D) that legitimately sit INSIDE one UHB word.
+function contentHasGlueJoiner(s: string): boolean {
+  for (const ch of s) {
+    const cp = ch.codePointAt(0) ?? -1;
+    if (cp === 0x05be || cp === 0x002d || (cp >= 0x2010 && cp <= 0x2015) || cp === 0x2212) return true;
+  }
+  return false;
+}
+function hasGluedMilestone(nodes: unknown[]): boolean {
+  const walk = (list: unknown[]): boolean => {
+    for (const node of list) {
+      if (!node || typeof node !== "object") continue;
+      const o = node as Record<string, unknown>;
+      if (
+        o["type"] === "milestone" && o["tag"] === "zaln" &&
+        typeof o["content"] === "string" && contentHasGlueJoiner(o["content"] as string)
+      ) {
+        return true;
+      }
+      const children = o["children"];
+      if (Array.isArray(children) && walk(children)) return true;
+    }
+    return false;
+  };
+  return walk(nodes);
+}
+
 // USFM (ult/ust) integrity lint over the stored verse rows: unbalanced footnotes
-// per verse. (Verse-coverage / chapter-count are guarded by the export shrink
-// guard and validated whole-file downstream; not duplicated here.)
+// and joiner-glued alignment milestones, per verse. (Verse-coverage / chapter-
+// count are guarded by the export shrink guard and validated whole-file
+// downstream; not duplicated here.)
 export function lintUsfmVerses(verses: VerseRow[]): LintIssue[] {
   const issues: LintIssue[] = [];
   for (const v of verses) {
@@ -158,14 +193,22 @@ export function lintUsfmVerses(verses: VerseRow[]): LintIssue[] {
     }
     const vos = (parsed as { verseObjects?: unknown[] })?.verseObjects;
     if (!Array.isArray(vos)) continue;
+    const ref = `${v.chapter}:${v.verse}`;
     const delta = footnoteDelta(vos);
     if (delta !== 0) {
-      const ref = `${v.chapter}:${v.verse}`;
       issues.push({
         check: "6. Footnote Syntax",
         bucket: "escalate",
         ref,
         message: delta > 0 ? `${delta} unclosed footnote(s) (\\f without \\f*).` : `${-delta} extra footnote close(s) (\\f* without \\f).`,
+      });
+    }
+    if (hasGluedMilestone(vos)) {
+      issues.push({
+        check: "Glued alignment",
+        bucket: "escalate",
+        ref,
+        message: "alignment milestone x-content spans a maqqef/minus (two source words glued into one).",
       });
     }
   }

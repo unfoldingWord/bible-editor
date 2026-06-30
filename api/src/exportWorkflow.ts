@@ -240,10 +240,26 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
   // the next run. Returns a small summary for step observability.
   private async escalateIntegrityIssues(books: string[]): Promise<{ flagged: string[] }> {
     const flagged: string[] = [];
+    // Raise a per-book admin banner when `offenders` is non-empty, else clear any
+    // stale undismissed alert for that source (the issue was fixed). One source
+    // per issue category so they raise/clear independently.
+    const raiseOrClear = async (source: string, offenders: string[], makeMsg: (n: number, sample: string) => string): Promise<boolean> => {
+      if (offenders.length === 0) {
+        await this.env.DB.prepare(
+          `DELETE FROM system_alerts WHERE username = ?1 AND source = ?2 AND dismissed_at IS NULL`,
+        )
+          .bind(EXPORT_ALERT_USERNAME, source)
+          .run();
+        return false;
+      }
+      const more = offenders.length > 6 ? `, +${offenders.length - 6} more` : "";
+      await this.writeAlert(source, makeMsg(offenders.length, offenders.slice(0, 6).join(", ") + more), `${this.env.DCS_BASE_URL}/unfoldingWord`);
+      return true;
+    };
     for (const book of books) {
-      const source = `export_lint:${book}`;
       try {
-        const offenders: string[] = [];
+        const footnoteOffenders: string[] = [];
+        const gluedOffenders: string[] = [];
         for (const bv of ["ULT", "UST"]) {
           const rs = await this.env.DB.prepare(
             `SELECT * FROM verses WHERE book = ?1 AND bible_version = ?2 ORDER BY chapter, verse`,
@@ -251,26 +267,22 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
             .bind(book, bv)
             .all<VerseRow>();
           for (const issue of lintUsfmVerses(rs.results ?? [])) {
-            if (issue.bucket === "escalate") offenders.push(`${bv} ${issue.ref}`);
+            if (issue.bucket !== "escalate") continue;
+            if (issue.check === "Glued alignment") gluedOffenders.push(`${bv} ${issue.ref}`);
+            else footnoteOffenders.push(`${bv} ${issue.ref}`);
           }
         }
-        if (offenders.length === 0) {
-          // Clear any stale undismissed alert for this book (the issue was fixed).
-          await this.env.DB.prepare(
-            `DELETE FROM system_alerts WHERE username = ?1 AND source = ?2 AND dismissed_at IS NULL`,
-          )
-            .bind(EXPORT_ALERT_USERNAME, source)
-            .run();
-          continue;
-        }
-        flagged.push(book);
-        const sample = offenders.slice(0, 6).join(", ");
-        const more = offenders.length > 6 ? `, +${offenders.length - 6} more` : "";
-        await this.writeAlert(
-          source,
-          `Benjamin — ${book}: ${offenders.length} footnote integrity issue(s) the export can't auto-fix (${sample}${more}). Fix the \\f/\\f* pairing in these verses.`,
-          `${this.env.DCS_BASE_URL}/unfoldingWord`,
+        const f = await raiseOrClear(
+          `export_lint:${book}`,
+          footnoteOffenders,
+          (n, s) => `Benjamin — ${book}: ${n} footnote integrity issue(s) the export can't auto-fix (${s}). Fix the \\f/\\f* pairing in these verses.`,
         );
+        const g = await raiseOrClear(
+          `export_glued:${book}`,
+          gluedOffenders,
+          (n, s) => `Benjamin — ${book}: ${n} alignment milestone(s) with maqqef/minus-glued source words (${s}). An AI run glued two OL words into one token; open the verse in the aligner (it re-anchors off the UHB) and save, or run the backfill.`,
+        );
+        if (f || g) flagged.push(book);
       } catch (e) {
         console.error("escalateIntegrityIssues book failed", { book, error: e instanceof Error ? e.message : String(e) });
       }

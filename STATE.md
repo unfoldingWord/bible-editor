@@ -14,6 +14,45 @@
 
 ## Last run
 
+2026-06-30 · **happy-chebyshev** — **Maqqef-glued UST alignment: duplicate fix + reform off UHB
+(Amos).** Reported bug: in the **UST aligner for Amos**, maqqef-joined Hebrew (`אֶת־הַדָּבָר` 3:1,
+`אִם−נוֹעָדוּ` 3:3) showed **duplicated**, and couldn't be split like tC. **Root cause (proven vs
+live `en_ust`/`hbo_uhb`):** the upstream AI aligner stamped `\zaln-s` x-content that SPANS the joiner
+— gluing two UHB words into one source token carrying only the first word's (often wrong) strong
+(3:1 `x-content="אֶת־הַדָּבָר" x-strong="H0853"`; 3:3 even uses a U+2212 MINUS, not a maqqef).
+`withSourceCoverage` resolved it to one UHB position → the joined neighbour was uncovered → a phantom
+empty placeholder card (the "duplicate"). **Corpus scan (ULT+UST vs UHB):** glue is **isolated to
+Amos UST = 29 milestones, all in ch3** — ISA/ZEC/HOS/JON + all ULT are CLEAN (0 glued). A one-off bad
+AI run, not systemic. x-content is 100% reliable; strongs on glued tokens are not. **Codex-reviewed
+the plan** → trimmed scope (auto-reform-everywhere is overbuilt). **Chosen scope = backfill +
+import detector.** Shipped IN-BRANCH (NOT committed/deployed):
+- **Phase 0 — joiner-aware coverage** (`web/src/lib/alignment.ts` `sourceFold`+`coveredPositions`):
+  a joiner-spanning token covers its whole UHB run → no phantom placeholder. Safety net.
+- **Phase 1 — reform (`reformGluedMilestones` in alignment.ts, run in `parseAlignment`)**: ONLY
+  joiner-spanning milestones are candidates; enumerate ALL UHB fold-runs, reform only on a UNIQUE
+  match (ambiguous/none ⇒ leave + count, never guess); split into N nested `\zaln-s` per UHB word
+  (correct strong/lemma/morph, per-exact-surface occurrence) wrapping the original target words. Result
+  = a correct compound card the user separates via the EXISTING double-click extract = tC-like split.
+  No-op on clean data (same array ref). Lives in ONE place (web); the backfill imports it.
+- **Phase 3 — glue DETECTOR** (`api/src/lint.ts` `hasGluedMilestone` → `lintUsfmVerses` "Glued
+  alignment" escalate issue; `exportWorkflow.ts` `escalateIntegrityIssues` raises a distinct
+  `export_glued:{book}` admin banner). Alerts on future glue; does NOT auto-rewrite.
+- **Phase 2 — backfill `scripts/reform-amo-ust.mjs`** (imports the web reform; dry-run + prod-SQL via
+  `--snapshot`/`--emit-sql`). **Dry-run over all Amos UST: 29/29 milestones reform, 0 ambiguous, 0
+  plain-text change.** Prod run AWAITS go-ahead (needs prod snapshot + authorization).
+- **Sweep tool `scripts/scan-glued-alignment.mjs`** (`--remote`/`--book`): on-demand corpus scan for
+  glued milestones (cheap D1 instr pre-filter on maqqef/minus → precise check → exit 1 if found).
+  User chose **manual** (no cron/routine) — rely on this + the nightly export detector. NOT yet run
+  vs a live DB (outage blocked Bash; logic == unit-tested detector).
+**Verified:** `npm --workspace web run test` (7 new reform cases inc. Codex counterexamples) + `npm
+--workspace api run test` (4 detector cases) + `npm run typecheck` all green; 29-verse dry-run clean.
+**Pending:** browser smoke on locally-seeded Amos (blocked this session by a transient
+model-availability outage on the Agent/Bash classifier — UI code unchanged, so logic is covered by
+units); commit/PR; Phase 2 prod backfill + re-export on go-ahead. Plan:
+`~/.claude/plans/wiggly-dreaming-hoare.md`. TRAP hit + corrected: ran tests from MAIN checkout once
+(cd'd away from worktree) → they silently omit branch changes; always run from the worktree root.
+(memory: [[project_maqqef_glued_alignment_reform]])
+
 2026-06-30 · **friendly-tharp** — **Export branch drift → unmergeable PR: automated the D1-authoritative
 rebuild.** The recurring failure: per-`(book,resource)` `{BOOK}-be-*` branches are cut once from master and
 never re-base; an out-of-band master edit to the same rows produces a 3-way conflict, `updateDcsPrBranch`
