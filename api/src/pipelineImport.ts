@@ -21,6 +21,7 @@ import {
 import { NT_BOOKS } from "./dcsSources";
 import { newRowId, isValidRowId } from "./rowId";
 import { tnContentKey } from "./tnDedup";
+import { IMPORT_CLAIM_STALE_SECONDS } from "./pipelineImportClaim";
 
 interface OutputEntry {
   type?: string;
@@ -193,7 +194,12 @@ async function parseOutputEntry(
   return { staged };
 }
 
-// Top-level entry. Two phases:
+// Top-level entry. Three phases:
+//   0. CLAIM — atomically take the single-applier slot for this job so two
+//      concurrent pollers (the */5 cron and a translator's open tab polling
+//      GET /api/pipelines/:jobId) can't both run the destructive apply. The
+//      loser no-ops. See migration 0035 — before this guard, interleaved
+//      concurrent applies wiped/doubled ISA 48 en_tn (2026-06-30).
 //   1. STAGE — fetch each rawUrl, parse, INSERT into pending_imports.
 //      Idempotent on the pipeline_jobs.staged_at marker, written only after
 //      the last chunk commits; a partial prior stage is dropped and redone.
@@ -211,9 +217,41 @@ export async function importJobOutput(
   job: ImportContext,
   outputs: OutputEntry[],
 ): Promise<ImportResult> {
-  const stageResult = await stageJobOutput(env, job, outputs);
-  const applyResult = await applyJobOutput(env, job);
-  return { ...stageResult, applied: applyResult };
+  // Atomic single-applier claim. The predicate mirrors mayClaimImport, but is
+  // enforced in one CAS UPDATE so a concurrent racer that read the same
+  // pre-apply state can't also win: exactly one UPDATE reports changes=1.
+  const claim = await env.DB.prepare(
+    `UPDATE pipeline_jobs SET import_claimed_at = unixepoch()
+      WHERE job_id = ?1
+        AND (import_claimed_at IS NULL OR import_claimed_at < unixepoch() - ?2)`,
+  )
+    .bind(job.jobId, IMPORT_CLAIM_STALE_SECONDS)
+    .run();
+  if ((claim.meta.changes ?? 0) === 0) {
+    // Another poll already owns the import — do nothing rather than run a
+    // second, interleaving delete/insert pass.
+    return {
+      inserted: 0,
+      byKind: { tn: 0, tq: 0, verse: 0 },
+      skipped: ["import already claimed by a concurrent poll"],
+    };
+  }
+  try {
+    const stageResult = await stageJobOutput(env, job, outputs);
+    const applyResult = await applyJobOutput(env, job);
+    return { ...stageResult, applied: applyResult };
+  } catch (err) {
+    // Release the slot so the caller's one-retry path (pollPipelineJob holds
+    // state at 'running' on the first failure) can re-import. Staging keys its
+    // own idempotency on staged_at and apply is per-row idempotent, so the
+    // retry resumes rather than duplicating.
+    await env.DB.prepare(
+      `UPDATE pipeline_jobs SET import_claimed_at = NULL WHERE job_id = ?1`,
+    )
+      .bind(job.jobId)
+      .run();
+    throw err;
+  }
 }
 
 async function stageJobOutput(
@@ -543,11 +581,23 @@ async function deleteUnkeptTns(
   // trashed) suppresses the AI's re-proposal of it, so it stays trashed.
   // Sweeping it instead would delete it and let the re-insert RESURRECT it
   // un-trashed against the user's intent.
+  // Verse-scope the sweep to verses this job actually produced proposals for
+  // (`pending_imports` for the job). The chapter-wide sweep assumed the result
+  // covers every verse it requested; when it doesn't — a partial result, or a
+  // concurrent apply that already consumed some proposals — deleting across the
+  // whole chapter wipes notes for verses the new run never re-supplies. Bounding
+  // the delete to supplied verses means a verse missing from the result keeps
+  // its existing notes (mildly stale) instead of being emptied. Defense-in-depth
+  // alongside the single-applier claim in importJobOutput.
   const targets = await env.DB.prepare(
     `SELECT id, version FROM tn_rows t
       WHERE book = ?1 AND chapter BETWEEN ?2 AND ?3
         AND deleted_at IS NULL AND trashed_at IS NULL
         AND preserve = 0 AND hint = 0
+        AND verse IN (
+          SELECT DISTINCT verse FROM pending_imports
+            WHERE job_id = ?5 AND kind = 'tn'
+        )
         AND (
           updated_by IS NULL
           OR (
@@ -559,7 +609,7 @@ async function deleteUnkeptTns(
           ) = ?4
         )`,
   )
-    .bind(job.book, job.startChapter, job.endChapter, AI_SOURCE)
+    .bind(job.book, job.startChapter, job.endChapter, AI_SOURCE, job.jobId)
     .all<{ id: string; version: number }>();
   const list = targets.results ?? [];
   if (list.length === 0) return 0;
