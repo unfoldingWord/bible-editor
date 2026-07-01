@@ -1,6 +1,7 @@
 // Intercepts straight ' and " in any editable field (input, textarea,
 // contentEditable) and inserts curly equivalents instead. Straight quotes
-// break our TSV format, so we normalize at input time.
+// break our TSV format, so we normalize at input time. Also collapses a
+// third consecutive "." into a single ellipsis character ("…").
 //
 // Decision rule: a quote is "opening" when the preceding character is
 // missing, whitespace, or another opener-ish punctuation; otherwise it's
@@ -10,6 +11,7 @@ const LDQUO = "“";
 const RDQUO = "”";
 const LSQUO = "‘";
 const RSQUO = "’";
+const ELLIPSIS = "…";
 
 function isOpeningContext(prev: string | undefined): boolean {
   if (!prev) return true;
@@ -32,7 +34,7 @@ export function curlifyString(s: string): string {
       out += ch;
     }
   }
-  return out;
+  return out.replace(/\.\.\.+/g, ELLIPSIS);
 }
 
 function isTextInput(el: EventTarget | null): el is HTMLInputElement {
@@ -62,7 +64,7 @@ function setNativeValue(el: HTMLInputElement | HTMLTextAreaElement, value: strin
 function handleBeforeInput(e: Event) {
   const ev = e as InputEvent;
   const data = ev.data;
-  if (data !== '"' && data !== "'") return;
+  if (data !== '"' && data !== "'" && data !== ".") return;
   if (ev.isComposing) return;
   if (ev.inputType !== "insertText" && ev.inputType !== "insertCompositionText") return;
 
@@ -72,6 +74,18 @@ function handleBeforeInput(e: Event) {
     if (target.readOnly || target.disabled) return;
     const start = target.selectionStart ?? target.value.length;
     const end = target.selectionEnd ?? start;
+
+    if (data === ".") {
+      if (target.value[start - 1] !== "." || target.value[start - 2] !== ".") return;
+      ev.preventDefault();
+      const before = target.value.slice(0, start - 2);
+      const after = target.value.slice(end);
+      setNativeValue(target, before + ELLIPSIS + after);
+      const caret = before.length + ELLIPSIS.length;
+      target.setSelectionRange(caret, caret);
+      return;
+    }
+
     const prev = start > 0 ? target.value[start - 1] : undefined;
     const curly = curlyFor(data, prev);
     ev.preventDefault();
@@ -87,8 +101,22 @@ function handleBeforeInput(e: Event) {
     const sel = window.getSelection();
     if (!sel || sel.rangeCount === 0) return;
     const range = sel.getRangeAt(0);
-    let prev: string | undefined;
     const { startContainer, startOffset } = range;
+
+    if (data === ".") {
+      if (startContainer.nodeType !== Node.TEXT_NODE || startOffset < 2) return;
+      const text = (startContainer as Text).data;
+      if (text[startOffset - 1] !== "." || text[startOffset - 2] !== ".") return;
+      ev.preventDefault();
+      const editRange = range.cloneRange();
+      editRange.setStart(startContainer, startOffset - 2);
+      sel.removeAllRanges();
+      sel.addRange(editRange);
+      document.execCommand("insertText", false, ELLIPSIS);
+      return;
+    }
+
+    let prev: string | undefined;
     if (startContainer.nodeType === Node.TEXT_NODE && startOffset > 0) {
       prev = (startContainer as Text).data[startOffset - 1];
     }
@@ -102,7 +130,7 @@ function handlePaste(e: ClipboardEvent) {
   const target = e.target;
   const text = e.clipboardData?.getData("text/plain");
   if (!text) return;
-  if (!/['"]/.test(text)) return;
+  if (!/['"]/.test(text) && !/\.\.\.+/.test(text)) return;
 
   if (isTextInput(target) || isTextarea(target)) {
     if (target.readOnly || target.disabled) return;
