@@ -409,19 +409,17 @@ export function ResourceColumn({
       root.querySelector<HTMLButtonElement>(
         `[data-note-id="${pending.id}"] [data-reorder-arrow="${d}"]`,
       );
-    let btn = find(pending.dir);
-    let dir = pending.dir;
+    const btn = find(pending.dir);
+    // Reached the top/bottom: the arrow we were moving with is now disabled.
+    // Don't hop focus to the opposite arrow — that turns repeated Space into an
+    // endless up-to-top-then-down-to-bottom loop. Drop focus instead so the run
+    // simply stops at the edge.
     if (!btn || btn.disabled) {
-      const alt = pending.dir === "up" ? "down" : "up";
-      const b2 = find(alt);
-      if (b2 && !b2.disabled) {
-        btn = b2;
-        dir = alt;
-      }
+      (document.activeElement as HTMLElement | null)?.blur?.();
+      return;
     }
-    if (!btn) return;
     btn.focus();
-    setRecentNoteMove({ id: pending.id, dir });
+    setRecentNoteMove({ id: pending.id, dir: pending.dir });
     if (noteFlashTimer.current) clearTimeout(noteFlashTimer.current);
     noteFlashTimer.current = setTimeout(() => setRecentNoteMove(null), 1600);
   });
