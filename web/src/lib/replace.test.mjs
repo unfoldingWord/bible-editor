@@ -1901,6 +1901,54 @@ function countAligned(content) {
     `no collateral alignment loss → guard passes (got ${JSON.stringify(delta.unexpectedLosses.map((l) => l.text))})`);
 }
 
+// ─── Case: two-edge deletion across a punctuation-free \q line break ──────
+// Regression for the ZEC 9:10 UST prod incident. The translator deleted the
+// leading "{Yahweh says} \"" and the trailing "\"" — two separated deletions at
+// the extreme verse edges, exactly the multi-region shape reassembly exists to
+// protect. But reassembly's rebuildRaw concatenated the text on either side of
+// the poetry line-break markers with no separator, so a punctuation-FREE break
+// ("...Ephraim" \q2 "and...") fused into "Ephraimand": oldTokens under-counted
+// by one, GATE 1 declined reassembly, and the edit fell through to the single-
+// range diff which ballooned the two edge deletions into one whole-verse range
+// and flattened every \zaln. rebuildRaw now bridges letter-flanked markers with
+// a space (mirroring stripMarkerTokens), so GATE 1 passes and alignment survives.
+{
+  console.log("\n[Case] Two-edge deletion across punctuation-free \\q break keeps alignment");
+  const q = (tag) => ({ type: "quote", tag });
+  // Leading "{Yahweh says} “" as bare (unaligned) \w leaves + a bare word ending
+  // line 1 with NO punctuation + \q2 + a bare word starting line 2 (this is the
+  // pair rebuildRaw fused into one token) + comma-terminated lines + trailing "”".
+  // Every word is a \w leaf so the OLD-token count equals the pivot's \w count —
+  // that's what makes the marker fusion (not stray plain-text words) the sole
+  // reason GATE 1's count diverges.
+  const verse = {
+    verseObjects: [
+      t("{"), w("Yahweh"), t(" "), w("says"), t("} “"),
+      zaln("H1", [w("take")]), t(" "), zaln("H2", [w("Ephraim")]),
+      q("q2"),
+      zaln("H3", [w("and")]), t(" "), zaln("H4", [w("Jerusalem")]), t(","),
+      q("q1"),
+      zaln("H5", [w("earth")]), t("”"),
+    ],
+  };
+  const old = extractEditableText(verse);
+  const before = milestoneCount(verse);
+  assert(before === 5, `baseline has 5 milestones (got ${before})`);
+  // Delete leading "{Yahweh says} “" and the trailing "”".
+  const next = old
+    .replace("{Yahweh says} “", "")
+    .replace(/”$/, "");
+  const r = smartEditVerse(verse, old, next);
+  assert(milestoneCount(r.content) === before,
+    `all ${before} milestones survive the two-edge deletion (got ${milestoneCount(r.content)})`);
+  assert(r.preservedAlignment === true, "preservedAlignment stays true");
+  // The words that end line 1 and start line 2 (fused as "Ephraimand" pre-fix)
+  // must each keep their own alignment.
+  const aligned = alignedWords(r.content);
+  assert(aligned.find((x) => x.text === "Ephraim")?.strongs.includes("H2"), "'Ephraim' keeps alignment");
+  assert(aligned.find((x) => x.text === "and")?.strongs.includes("H3"), "'and' keeps alignment");
+}
+
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed.`);
   process.exit(1);

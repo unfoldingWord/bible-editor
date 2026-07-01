@@ -335,19 +335,46 @@ function wrapInChain2(children: unknown[], chain: Record<string, unknown>[]): un
   return inner[0];
 }
 
-// Rebuild the raw concatenated text of a verseObjects tree (markers carry none).
+// Letters / marks / numbers — the "word core" test, kept byte-identical to
+// replace.ts LETTER_RE so this module's marker bridge agrees with the caller's
+// stripMarkerTokens about when two marker-separated tokens must stay apart.
+const LETTER_RE = /[\p{L}\p{M}\p{N}]/u;
+
+// Rebuild the raw concatenated text of a verseObjects tree. In-flow line markers
+// (`\q`/`\p`/`\b`) carry no text of their own, but each IS a word separator.
+// Naively concatenating the text on either side fuses two bare words abutting a
+// marker into one token: a punctuation-free poetry line break (`...Ephraim`
+// ending one line, `and...` starting the next, only `\q2` between) yields
+// `Ephraimand`, so oldTokens under-counts by one and GATE 1 wrongly declines
+// reassembly — which is how a two-edge deletion in ZEC 9:10 UST flattened the
+// whole verse. Mirror replace.ts stripMarkerTokens EXACTLY: bridge with a single
+// space ONLY when a word char sits on both sides of the marker; leave
+// punctuation-separated pairs (`Jerusalem,` `He`) untouched. Because this same
+// function feeds both GATE 1 (old text) and the output self-check, the bridge
+// stays consistent with the caller's already-bridged newStripped either way.
 function rebuildRaw(nodes: unknown[]): string {
-  const parts: string[] = [];
+  let out = "";
+  let pendingMarker = false;
   const walk = (ns: unknown[]) => {
     for (const n of ns ?? []) {
       const o = n as Record<string, unknown> | null;
       if (!o) continue;
-      if (typeof o["text"] === "string") parts.push(o["text"] as string);
+      if (isInFlowMarker(o)) pendingMarker = true;
+      if (typeof o["text"] === "string") {
+        const text = o["text"] as string;
+        if (pendingMarker) {
+          const before = out.slice(-1);
+          const after = text.slice(0, 1);
+          if (LETTER_RE.test(before) && LETTER_RE.test(after)) out += " ";
+          pendingMarker = false;
+        }
+        out += text;
+      }
       if (Array.isArray(o["children"])) walk(o["children"] as unknown[]);
     }
   };
   walk(nodes);
-  return parts.join("");
+  return out;
 }
 
 function normalizeWs(s: string): string {
