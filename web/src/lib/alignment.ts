@@ -834,6 +834,212 @@ export function reformGluedMilestones(
   return transform(targetVerseObjects);
 }
 
+// ─── doubled-source detection ───────────────────────────────────────────────
+// A DISTINCT AI/edit defect from the maqqef glue above: a single top-level
+// `\zaln-s` compound card whose nested source chain references the SAME UHB
+// word twice — e.g. JER 31:33 ULT stamped
+//   \zaln-s H0853 "אֶת" › \zaln-s H0854 "אֶת" › \zaln-s H1004b "בֵּית"
+// while the UHB has only ONE אֶת there (H0854, "with", before בֵּית); the
+// object-marker אֶת (H0853) is a separate token later in the verse. The card
+// renders the Hebrew doubled (`אֶת אֶת בֵּית`). The robust signature is
+// UHB-anchored: resolve each source word in a card to its UHB position; a
+// well-formed card covers a UNIQUE CONTIGUOUS run of UHB words in document
+// order, so two source words landing on the SAME position (`duplicate`) — or a
+// gap between them (`noncontiguous`) — means the card doesn't correspond to any
+// real UHB span. This reuses `collectSourceWords` + `findSourcePosition` (the
+// same resolver `coveredPositions`/`withSourceCoverage` use), so the detector
+// can't drift from what the aligner actually renders.
+//
+// Legit patterns this deliberately does NOT flag:
+//   - genuine Hebrew repetition (שָׁלוֹם שָׁלוֹם, הֵיכַל … הֵיכַל …) — the
+//     repeated tokens are distinct UHB positions, so a card spanning them is a
+//     contiguous run with no duplicate;
+//   - the "one UHB word → N non-adjacent target runs = N milestones" split
+//     (gatewayEdit Model a) — those are N separate SINGLE-source cards, never
+//     two source words in one card.
+
+export interface DoubledSourceIssue {
+  reason: "duplicate" | "noncontiguous";
+  // Source words in the card (chain order), each with its resolved UHB position
+  // (-1 never appears — a card with any unresolved word is skipped).
+  sources: { strong: string; content: string; occurrence: string; position: number }[];
+  targets: string[];
+}
+
+// Collect each MAXIMAL `\zaln-s` subtree in the target as one card: its full
+// nested source chain (outer→inner) plus the target words it wraps. Descends
+// through non-zaln wrappers (\d, \qs, paragraph markers) to find card roots, but
+// never treats a nested zaln as its own root.
+function collectAlignmentCards(
+  nodes: unknown[],
+): Array<{ chain: SourceWord[]; targets: string[] }> {
+  const cards: Array<{ chain: SourceWord[]; targets: string[] }> = [];
+  const collectCard = (root: ParsedNode): void => {
+    const chain: SourceWord[] = [];
+    const targets: string[] = [];
+    const rec = (node: ParsedNode): void => {
+      if (nodeIsZaln(node)) chain.push(sourceOf(node));
+      else if (nodeIsWord(node)) targets.push(String(node["text"] ?? ""));
+      for (const k of (node["children"] as unknown[] | undefined) ?? []) {
+        if (k && typeof k === "object") rec(k as ParsedNode);
+      }
+    };
+    rec(root);
+    cards.push({ chain, targets });
+  };
+  const walkForRoots = (list: unknown[]): void => {
+    for (const n of list ?? []) {
+      const o = n as ParsedNode | null;
+      if (!o || typeof o !== "object") continue;
+      if (nodeIsZaln(o)) {
+        collectCard(o); // a card root — do NOT recurse for more roots inside it
+      } else if (Array.isArray(o["children"])) {
+        walkForRoots(o["children"] as unknown[]);
+      }
+    }
+  };
+  walkForRoots(nodes);
+  return cards;
+}
+
+// Resolve a card source word to its UHB position by EXACT surface + occurrence —
+// the Nth UHB word whose NFC text equals this milestone's x-content (the app's
+// primary, cantillation-sensitive occurrence model; see `strong|occurrence NOT
+// unique`). When the milestone carries no x-content, fall back to strong +
+// occurrence. Returns -1 when it cannot resolve WITHOUT guessing — deliberately
+// NO first-match fallback (that's what makes `findSourcePosition` collapse two
+// distinct-surface same-strong words, e.g. 1SA 9:9 לְכָה vs נֵלְכָה, into one
+// position and fabricate a false duplicate). A card with any unresolved word is
+// skipped, so the detector never flags on a resolution it isn't sure of.
+function resolveExactPosition(
+  sourceWords: CollectedSourceWord[],
+  s: SourceWord,
+): number {
+  const want = parseInt(s.occurrence, 10) || 1;
+  const content = s.content;
+  if (content) {
+    const wantKey = nfc(content);
+    let count = 0;
+    for (const sw of sourceWords) {
+      if (sw.textKey === wantKey && ++count === want) return sw.position;
+    }
+    return -1;
+  }
+  if (s.strong) {
+    let count = 0;
+    for (const sw of sourceWords) {
+      if (sw.strong === s.strong && ++count === want) return sw.position;
+    }
+  }
+  return -1;
+}
+
+// Pure. Returns one issue per malformed compound card; empty array when the
+// verse is clean (or the source is absent). Only compound cards (≥2 source
+// words) can trip either signature.
+export function detectDoubledSourceMilestones(
+  targetVerseObjects: unknown[],
+  sourceVerseObjects: unknown[],
+): DoubledSourceIssue[] {
+  if (!Array.isArray(targetVerseObjects) || !Array.isArray(sourceVerseObjects)) return [];
+  const sourceWords = collectSourceWords(sourceVerseObjects);
+  if (sourceWords.length === 0) return [];
+  const issues: DoubledSourceIssue[] = [];
+  for (const card of collectAlignmentCards(targetVerseObjects)) {
+    if (card.chain.length < 2) continue;
+    const positions = card.chain.map((s) => resolveExactPosition(sourceWords, s));
+    if (positions.some((p) => p < 0)) continue; // unresolved → can't verify, skip
+    const sorted = [...positions].sort((a, b) => a - b);
+    let duplicate = false;
+    let contiguous = true;
+    for (let i = 1; i < sorted.length; i++) {
+      if (sorted[i] === sorted[i - 1]) duplicate = true;
+      else if (sorted[i] !== sorted[i - 1] + 1) contiguous = false;
+    }
+    if (!duplicate && contiguous) continue;
+    issues.push({
+      reason: duplicate ? "duplicate" : "noncontiguous",
+      sources: card.chain.map((s, i) => ({
+        strong: s.strong,
+        content: nfc(s.content ?? ""),
+        occurrence: s.occurrence,
+        position: positions[i],
+      })),
+      targets: card.targets,
+    });
+  }
+  return issues;
+}
+
+// Identity of a source milestone for doubled-source dedup: NFC x-content +
+// x-occurrence. This uniquely names a physical UHB/UGNT token (the surface-
+// occurrence model), so two milestones in ONE card sharing it can only be a
+// duplicate. Deliberately NOT keyed on x-strong — the JER 31:33 defect stamps a
+// spurious outer milestone with a DIFFERENT (wrong) strong but the same surface
+// (`H0853 "אֶת"` over the real `H0854 "אֶת"`); keying on strong would miss it.
+// Returns null when there's no x-content to identify the token — then the node
+// is never treated as a duplicate (conservative).
+function zalnDedupKey(node: ParsedNode): string | null {
+  const content = node["content"];
+  if (typeof content !== "string" || content === "") return null;
+  return `${nfc(content)}|${String(node["occurrence"] ?? "1")}`;
+}
+
+function subtreeHasZalnKey(nodes: unknown[], key: string): boolean {
+  for (const n of nodes ?? []) {
+    const o = n as ParsedNode | null;
+    if (!o || typeof o !== "object") continue;
+    if (nodeIsZaln(o) && zalnDedupKey(o) === key) return true;
+    if (Array.isArray(o["children"]) && subtreeHasZalnKey(o["children"] as unknown[], key)) return true;
+  }
+  return false;
+}
+
+// Collapse a `\zaln-s` compound that wraps the SAME source token twice — two
+// milestones in one chain with identical (NFC x-content, x-occurrence). A card
+// can never legitimately reference one UHB/UGNT word twice, so such a pair is an
+// AI/edit artifact that renders the Hebrew doubled (JER 31:33 `אֶת אֶת בֵּית`).
+// When a milestone has, anywhere in its own subtree, a nested milestone with the
+// same key, DROP THE OUTER one (splice its children up one level) — the surviving
+// inner milestone is the more specific one, which for the known shape carries the
+// correct strong. Pure; returns the SAME array reference when nothing is doubled,
+// so clean verses round-trip byte-identical. Genuine Hebrew repetition
+// (שָׁלוֹם שָׁלוֹם) is untouched: those tokens carry distinct occurrences → distinct
+// keys. Mirrored server-side in api/src/importParsers.ts.
+export function dropDuplicateSourceMilestones(verseObjects: unknown[]): unknown[] {
+  if (!Array.isArray(verseObjects)) return verseObjects;
+  const transform = (nodes: unknown[]): unknown[] => {
+    let changed = false;
+    const out: unknown[] = [];
+    for (const node of nodes ?? []) {
+      const o = node as ParsedNode | null;
+      if (o && nodeIsZaln(o)) {
+        const origKids = (o["children"] as unknown[] | undefined) ?? [];
+        const kids = transform(origKids);
+        const key = zalnDedupKey(o);
+        if (key !== null && subtreeHasZalnKey(kids, key)) {
+          // Outer duplicate — unwrap it, keeping the (deduped) inner subtree.
+          out.push(...kids);
+          changed = true;
+          continue;
+        }
+        if (kids !== origKids) { out.push({ ...o, children: kids }); changed = true; }
+        else out.push(node);
+        continue;
+      }
+      if (o && Array.isArray(o["children"])) {
+        const kids = transform(o["children"] as unknown[]);
+        if (kids !== o["children"]) { out.push({ ...o, children: kids }); changed = true; }
+        else out.push(node);
+        continue;
+      }
+      out.push(node);
+    }
+    return changed ? out : nodes;
+  };
+  return transform(verseObjects);
+}
+
 // Augment with synthetic source groups for any UHB/UGNT word the target
 // USFM didn't reference, so the dialog can show empty drop slots. Empty
 // groups don't emit anything; when populated, the chips emit at their
@@ -1094,7 +1300,10 @@ export function serializeAlignment(state: AlignmentState): unknown[] {
   if (verse.current !== null) closeMilestone(verse);
   flushPendingOutside(verse);
 
-  return verse.out;
+  // Never emit a compound that wraps the same source token twice (the doubled-
+  // source defect, e.g. JER 31:33 `אֶת אֶת בֵּית`) — an aligner save re-serializing
+  // already-doubled data would otherwise re-persist it. No-op on clean output.
+  return dropDuplicateSourceMilestones(verse.out);
 }
 
 // Compute the plain text of an alignment state by serializing back to

@@ -10,6 +10,7 @@ import type { Env } from "./index";
 import {
   collectSourceWords,
   extractVersesForRange,
+  dropDuplicateSourceMilestones,
   healReplacementChars,
   normalizeNoteWhitespace,
   parseTsv,
@@ -1061,6 +1062,10 @@ async function applyVerseUpdate(
         // recompute, so the cleaned tree lands in D1 (and exports clean). See
         // stripOrphanAlignmentMarkers — MIC 6:10 UST.
         parsed.verseObjects = stripOrphanAlignmentMarkers(parsed.verseObjects);
+        // Collapse any `\zaln-s` compound that wraps the same source token twice
+        // (the doubled-source defect, e.g. JER 31:33 `אֶת אֶת בֵּית`) before it
+        // lands in D1 / exports. No-op on clean output; source text untouched.
+        parsed.verseObjects = dropDuplicateSourceMilestones(parsed.verseObjects);
         recomputeTargetOccurrences(parsed.verseObjects);
         contentJson = JSON.stringify(parsed);
       }

@@ -14,6 +14,33 @@
 
 ## Last run
 
+2026-07-01 · **youthful-cannon** — **Doubled-source alignment defect: detector + import/serialize dedup
++ prod repair of 5 UST verses.** Reported: ULT aligner JER 31:33 showed Hebrew doubled `אֶת אֶת בֵּית`.
+DISTINCT from the maqqef glue class — this stamps a SPURIOUS extra `\zaln-s` so one compound wraps the
+SAME UHB token twice. **JER 31:33 ULT was already hand-fixed by user 45** (v3→v11); the v3 DCS-reimport
+snapshot was CLEAN, so the doubling is introduced by **in-app editing / aligner serialize, NOT AI
+import** (all 5 corpus hits are on EDITED verses, not pristine reimports). **Built UHB-anchored detector
+`detectDoubledSourceMilestones`** (web/src/lib/alignment.ts) + `scripts/scan-doubled-source.mjs` — only
+the `duplicate` signature (two source words in a card → same EXACT-content+occurrence UHB position) is
+reliable; `noncontiguous` is noisy (legit UST paraphrase — grouping two far-apart אמר is common) and
+excluded. Hardened the resolver to exact content+occurrence with NO strong/firstPos fallback (that
+fallback fabricated the 1CH/1SA false-positives seen mid-run). **Corpus scan (all 22 OT books, ULT+UST
+vs D1 UHB) = exactly 5 verses, all UST, zero ULT:** JER 28:4, NUM 24:2/4/12, ZEC 8:14 — all confirmed
+real vs UHB, zero detector FPs. **Fix = pure structural dedup `dropDuplicateSourceMilestones`** (drop the
+OUTER of any content+occurrence-duplicated milestone pair in a chain, keep inner = correct strong) in
+BOTH web (`serializeAlignment` return — stops aligner-save re-persisting) AND api (`importParsers` →
+wired into `pipelineImport` alongside stripOrphanAlignmentMarkers — stops AI import). Keyed on
+content+occurrence NOT strong (spurious outer carries a wrong strong). No-op on clean data + genuine
+repetition (שלום שלום). Regression tests in alignment.test.mjs + importParsers.test.mjs; typecheck +
+both suites green. **PROD REPAIR applied (user-authorized):** version-guarded UPDATE (updated_by=2) +
+edit_log (source=dedup-doubled-source) for all 5; 4 pure dedup, ZEC 8:14 re-anchored surviving צבאות
+occ→2/2 → `[יהוה(2/2) › צבאות(2/2)]` (real contiguous @13-14). Post-apply corpus scan = **0 duplicates**.
+Triggered targeted UST re-exports (JER/NUM/ZEC, all ✅ Completed, no shrink/glue block) — structural fix
+survives the pre-sync reconcile (it only reassigns attrs on existing milestones). **Opened
+[PR #309](https://github.com/unfoldingWord/bible-editor/pull/309); NOT merged/deployed** — deploy after
+merge (`npm run deploy`) to arm prevention (prod DATA already clean). (memory:
+[[project_doubled_source_milestone]])
+
 2026-07-01 · **practical-lamarr** — **Repaired ISA 48 TN corruption directly in prod D1.** A single
 BE→DCS push (deleted_at all stamped 2026-06-30 21:00Z) had **deleted the first-half notes (64 rows,
 verses 1–12 + some of 13–22) and duplicated the later notes (39 extra live rows)** — all 111 relevant

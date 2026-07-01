@@ -669,6 +669,74 @@ export function stripOrphanAlignmentMarkers(verseObjects: unknown[]): unknown[] 
   return clean(verseObjects);
 }
 
+// ─── Collapse a doubled source token in one alignment compound ───────────────
+//
+// A DISTINCT AI/edit defect: a single `\zaln-s` compound whose nested chain wraps
+// the SAME source token twice — two milestones with identical (NFC x-content,
+// x-occurrence). A card can never legitimately reference one UHB/UGNT word twice,
+// so the pair is an artifact that renders the Hebrew doubled (JER 31:33 UST/ULT
+// `אֶת אֶת בֵּית`: a spurious outer `H0853 "אֶת"` over the real `H0854 "אֶת" › H1004b`).
+// When a milestone has, anywhere in its own subtree, a nested milestone with the
+// same key, DROP THE OUTER one (splice its children up a level) — the surviving
+// inner milestone is the more specific one (correct strong for the known shape).
+//
+// Keyed on x-content+x-occurrence, NOT x-strong: the spurious outer often carries
+// a wrong strong but the same surface, so a strong-inclusive key would miss it.
+// Genuine Hebrew repetition (שָׁלוֹם שָׁלוֹם) is untouched — those tokens carry
+// distinct x-occurrence → distinct keys. No-op (identity) on clean verses.
+// Mirrors the web reform (web/src/lib/alignment.ts dropDuplicateSourceMilestones);
+// absorb the defect at AI import so it never lands in D1, matching the
+// splitGluedAlignmentWords / stripOrphanAlignmentMarkers family.
+function zalnDedupKey(node: Record<string, unknown>): string | null {
+  const content = node["content"];
+  if (typeof content !== "string" || content === "") return null;
+  return `${content.normalize("NFC")}|${String(node["occurrence"] ?? "1")}`;
+}
+function isZalnNode(n: Record<string, unknown> | null): boolean {
+  return !!n && n["type"] === "milestone" && n["tag"] === "zaln";
+}
+function subtreeHasZalnKey(nodes: unknown[], key: string): boolean {
+  for (const n of nodes ?? []) {
+    const o = n as Record<string, unknown> | null;
+    if (!o || typeof o !== "object") continue;
+    if (isZalnNode(o) && zalnDedupKey(o) === key) return true;
+    if (Array.isArray(o["children"]) && subtreeHasZalnKey(o["children"] as unknown[], key)) return true;
+  }
+  return false;
+}
+export function dropDuplicateSourceMilestones(verseObjects: unknown[]): unknown[] {
+  if (!Array.isArray(verseObjects)) return verseObjects;
+  const transform = (nodes: unknown[]): unknown[] => {
+    let changed = false;
+    const out: unknown[] = [];
+    for (const node of nodes ?? []) {
+      const o = node as Record<string, unknown> | null;
+      if (o && isZalnNode(o)) {
+        const origKids = (o["children"] as unknown[] | undefined) ?? [];
+        const kids = transform(origKids);
+        const key = zalnDedupKey(o);
+        if (key !== null && subtreeHasZalnKey(kids, key)) {
+          out.push(...kids); // outer duplicate — unwrap, keep the inner subtree
+          changed = true;
+          continue;
+        }
+        if (kids !== origKids) { out.push({ ...o, children: kids }); changed = true; }
+        else out.push(node);
+        continue;
+      }
+      if (o && Array.isArray(o["children"])) {
+        const kids = transform(o["children"] as unknown[]);
+        if (kids !== o["children"]) { out.push({ ...o, children: kids }); changed = true; }
+        else out.push(node);
+        continue;
+      }
+      out.push(node);
+    }
+    return changed ? out : nodes;
+  };
+  return transform(verseObjects);
+}
+
 // ─── Collapse doubled leading poetry / paragraph markers ─────────────────────
 //
 // unfoldingWord ULT/UST USFM puts a verse's leading in-flow marker BEFORE its

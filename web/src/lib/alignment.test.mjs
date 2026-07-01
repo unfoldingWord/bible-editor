@@ -24,6 +24,8 @@ import {
   sourceKey,
   cardKey,
   reformGluedMilestones,
+  detectDoubledSourceMilestones,
+  dropDuplicateSourceMilestones,
 } from "./alignment.ts";
 import { extractPlainText } from "./usfm.ts";
 import { findTargetHighlights, findSourceHighlights } from "./highlight.ts";
@@ -2929,6 +2931,70 @@ const srcWordContents = (st) => st.groups.flatMap((g) => g.source).map((s) => ({
   const tvo = usfm.toJSON(target).chapters["1"]["1"].verseObjects;
   const svo = usfm.toJSON(source).chapters["1"]["1"].verseObjects;
   assert(reformGluedMilestones(tvo, svo) === tvo, `non-joiner milestone with a wrong strong is left untouched`);
+}
+
+// ─── doubled-source detection + dedup (JER 31:33 `אֶת אֶת בֵּית`) ──────────────
+
+{
+  console.log("\n[Case] detect + drop a doubled source token in one compound");
+  // UHB: one אֶת (H0854 "with") before בֵּית; a spurious outer H0853 "אֶת" is
+  // stamped over it, so the card wraps אֶת twice → renders doubled.
+  const source = String.raw`\id JER
+\c 1
+\v 1 \w אֶת|strong="H0854"\w* \w בֵּית|strong="H1004b"\w*
+`;
+  const target = String.raw`\id JER
+\c 1
+\v 1 \zaln-s |x-strong="H0853" x-occurrence="1" x-occurrences="1" x-content="אֶת"\*\zaln-s |x-strong="H0854" x-occurrence="1" x-occurrences="1" x-content="אֶת"\*\zaln-s |x-strong="H1004b" x-occurrence="1" x-occurrences="1" x-content="בֵּית"\*\w with|x-occurrence="1" x-occurrences="1"\w* \w the|x-occurrence="1" x-occurrences="1"\w* \w house|x-occurrence="1" x-occurrences="1"\w*\zaln-e\*\zaln-e\*\zaln-e\*
+`;
+  const svo = usfm.toJSON(source).chapters["1"]["1"].verseObjects;
+  const tvo = usfm.toJSON(target).chapters["1"]["1"].verseObjects;
+
+  const issues = detectDoubledSourceMilestones(tvo, svo);
+  assert(issues.length === 1, `detects one doubled-source card (got ${issues.length})`);
+  assert(issues[0]?.reason === "duplicate", `reason is "duplicate" (got ${issues[0]?.reason})`);
+
+  const cleaned = dropDuplicateSourceMilestones(tvo);
+  assert(cleaned !== tvo, `cleaner returns a new tree when it changes something`);
+  assert(detectDoubledSourceMilestones(cleaned, svo).length === 0, `cleaned tree has no doubled-source card`);
+  // The surviving milestone is the correct inner H0854 (not the spurious H0853).
+  const strongs = [];
+  const walk = (ns) => { for (const n of ns ?? []) { if (n?.tag === "zaln") strongs.push(n.strong); if (n?.children) walk(n.children); } };
+  walk(cleaned);
+  assert(strongs.includes("H0854") && !strongs.includes("H0853"), `keeps H0854, drops spurious H0853 (got ${strongs.join(",")})`);
+  assert(extractPlainText(tvo) === extractPlainText(cleaned), `plain text is preserved`);
+}
+
+{
+  console.log("\n[Case] doubled-source dedup is a no-op on clean data + genuine repetition");
+  // Clean single-source cards.
+  const src1 = String.raw`\id JER
+\c 1
+\v 1 \w אֶת|strong="H0854"\w* \w בֵּית|strong="H1004b"\w*
+`;
+  const tgt1 = String.raw`\id JER
+\c 1
+\v 1 \zaln-s |x-strong="H0854" x-occurrence="1" x-occurrences="1" x-content="אֶת"\*\w with|x-occurrence="1" x-occurrences="1"\w*\zaln-e\* \zaln-s |x-strong="H1004b" x-occurrence="1" x-occurrences="1" x-content="בֵּית"\*\w house|x-occurrence="1" x-occurrences="1"\w*\zaln-e\*
+`;
+  const svo1 = usfm.toJSON(src1).chapters["1"]["1"].verseObjects;
+  const tvo1 = usfm.toJSON(tgt1).chapters["1"]["1"].verseObjects;
+  assert(detectDoubledSourceMilestones(tvo1, svo1).length === 0, `clean verse has no issue`);
+  assert(dropDuplicateSourceMilestones(tvo1) === tvo1, `cleaner is identity (same ref) on clean data`);
+
+  // Genuine Hebrew repetition (שָׁלוֹם שָׁלוֹם): two DISTINCT occurrences in one
+  // compound — must NOT be flagged or collapsed.
+  const src2 = String.raw`\id JER
+\c 1
+\v 1 \w שָׁלוֹם|strong="H7965"\w* \w שָׁלוֹם|strong="H7965"\w*
+`;
+  const tgt2 = String.raw`\id JER
+\c 1
+\v 1 \zaln-s |x-strong="H7965" x-occurrence="1" x-occurrences="2" x-content="שָׁלוֹם"\*\zaln-s |x-strong="H7965" x-occurrence="2" x-occurrences="2" x-content="שָׁלוֹם"\*\w peace|x-occurrence="1" x-occurrences="1"\w*\zaln-e\*\zaln-e\*
+`;
+  const svo2 = usfm.toJSON(src2).chapters["1"]["1"].verseObjects;
+  const tvo2 = usfm.toJSON(tgt2).chapters["1"]["1"].verseObjects;
+  assert(detectDoubledSourceMilestones(tvo2, svo2).length === 0, `genuine שלום שלום is not flagged`);
+  assert(dropDuplicateSourceMilestones(tvo2) === tvo2, `genuine repetition is left untouched (same ref)`);
 }
 
 if (failed > 0) {

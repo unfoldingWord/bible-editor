@@ -24,6 +24,7 @@ import {
   normalizeNoteWhitespace,
   findSuspiciousDoubleSpaces,
   sanitizeMarkerSpacing,
+  dropDuplicateSourceMilestones,
 } from "./importParsers.ts";
 import usfm from "usfm-js";
 
@@ -999,6 +1000,62 @@ const zalnMs = (attrs, targetText) => ({
   assert(bommed.rows.length === plain.rows.length, `BOM file yields the same row count as a clean file`);
   assert(bommed.rows[0]["ID"] === "abcd", `lookup by real header name works on a BOM file (got ${JSON.stringify(bommed.rows[0]["ID"])})`);
   assert(bommed.rows[0]["Reference"] === "1:1", `Reference resolves on a BOM file`);
+}
+
+// --- dropDuplicateSourceMilestones: doubled source token in one compound ------
+// JER 31:33 UST/ULT `אֶת אֶת בֵּית` — a spurious outer H0853 "אֶת" over the real
+// nested H0854 "אֶת" › H1004b "בֵּית"; the card wraps אֶת twice → renders doubled.
+{
+  const doubled = [
+    {
+      tag: "zaln", type: "milestone", strong: "H0853", occurrence: "1", occurrences: "1", content: "אֶת",
+      children: [{
+        tag: "zaln", type: "milestone", strong: "H0854", occurrence: "1", occurrences: "1", content: "אֶת",
+        children: [{
+          tag: "zaln", type: "milestone", strong: "H1004b", occurrence: "1", occurrences: "1", content: "בֵּית",
+          children: [{ tag: "w", type: "word", text: "with" }],
+          endTag: "zaln-e\\*",
+        }],
+        endTag: "zaln-e\\*",
+      }],
+      endTag: "zaln-e\\*",
+    },
+  ];
+  const out = dropDuplicateSourceMilestones(doubled);
+  const strongs = [];
+  const walk = (ns) => { for (const n of ns ?? []) { if (n?.tag === "zaln") strongs.push(n.strong); if (n?.children) walk(n.children); } };
+  walk(out);
+  assert(strongs.length === 2, `doubled אֶת collapsed to 2 milestones (got ${strongs.length}: ${strongs.join(",")})`);
+  assert(strongs.includes("H0854") && !strongs.includes("H0853"), `keeps inner H0854, drops spurious outer H0853`);
+  // Target word preserved.
+  let words = [];
+  const collectW = (ns) => { for (const n of ns ?? []) { if (n?.tag === "w") words.push(n.text); if (n?.children) collectW(n.children); } };
+  collectW(out);
+  assert(words.join(" ") === "with", `target word preserved`);
+}
+{
+  // No-op identity: a clean compound (distinct source tokens) is untouched.
+  const clean = [{
+    tag: "zaln", type: "milestone", strong: "H0854", occurrence: "1", occurrences: "1", content: "אֶת",
+    children: [{
+      tag: "zaln", type: "milestone", strong: "H1004b", occurrence: "1", occurrences: "1", content: "בֵּית",
+      children: [{ tag: "w", type: "word", text: "with" }],
+      endTag: "zaln-e\\*",
+    }],
+    endTag: "zaln-e\\*",
+  }];
+  assert(dropDuplicateSourceMilestones(clean) === clean, `clean compound returns same array reference (identity)`);
+  // Genuine repetition (distinct occurrences) is NOT collapsed.
+  const rep = [{
+    tag: "zaln", type: "milestone", strong: "H7965", occurrence: "1", occurrences: "2", content: "שָׁלוֹם",
+    children: [{
+      tag: "zaln", type: "milestone", strong: "H7965", occurrence: "2", occurrences: "2", content: "שָׁלוֹם",
+      children: [{ tag: "w", type: "word", text: "peace" }],
+      endTag: "zaln-e\\*",
+    }],
+    endTag: "zaln-e\\*",
+  }];
+  assert(dropDuplicateSourceMilestones(rep) === rep, `genuine שלום שלום (distinct occ) left untouched (identity)`);
 }
 
 console.log("\nAll parser smoke checks passed.");
