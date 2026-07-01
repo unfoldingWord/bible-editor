@@ -1,0 +1,23 @@
+-- Single-applier claim for AI-pipeline imports.
+--
+-- Two pollers race to import a job the moment the bot flips it to 'done': the
+-- */5 cron (pollAllNonTerminal) and a translator's open tab hitting
+-- GET /api/pipelines/:jobId. Both gate the import on no_output_yet, read from a
+-- SELECT that predates the ~minute-long apply, and output_json (which clears
+-- that flag) is only written AFTER the poll completes — so both pollers can
+-- enter importJobOutput concurrently. Each apply's chapter-scoped
+-- deleteUnkeptTns then sweeps the OTHER apply's freshly-inserted AI rows
+-- (the sweep predicate matches rows whose latest edit_log source is
+-- 'ai_pipeline'), so their delete/insert phases interleave: verses only one
+-- pass reached get annihilated, verses both reached get doubled. This is what
+-- corrupted ISA 48 en_tn on 2026-06-30 (vv.1–12 deleted, 13–22 duplicated).
+--
+-- importJobOutput now claims the job by atomically stamping this column
+-- (UPDATE ... WHERE import_claimed_at IS NULL OR it's older than the stale
+-- window); the poller that loses the CAS no-ops. The claim is released (set
+-- back to NULL) if the apply throws, so the existing one-retry path re-imports.
+-- The stale window lets a claim left dangling by a hard Worker death be
+-- reclaimed by a later poll (apply is idempotent at the per-row level).
+-- No backfill needed: finished jobs carry a non-NULL output_json and are never
+-- re-imported regardless of this column.
+ALTER TABLE pipeline_jobs ADD COLUMN import_claimed_at INTEGER;

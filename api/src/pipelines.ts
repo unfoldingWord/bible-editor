@@ -430,7 +430,7 @@ async function pollPipelineJob(
   let importErrMessage: string | null = null;
   if (shouldImport && data.output) {
     try {
-      await importJobOutput(
+      const importResult = await importJobOutput(
         env,
         {
           jobId: job.job_id,
@@ -441,6 +441,16 @@ async function pollPipelineJob(
         },
         data.output,
       );
+      if (importResult.claimLost) {
+        // A concurrent poll (the other of cron / open-tab) owns this import and
+        // may still be mid-apply. Do NOT fall through to the finalize+follow-up
+        // block: writing output_json / state='done' here would mark the import
+        // complete before the owning poll's apply finishes, and if that poll
+        // then fails the set output_json would suppress the retry. Return the
+        // upstream status unchanged; the owning poll finalizes when it's done,
+        // and the next poll (or this client's next tick) sees the result.
+        return { kind: "ok", text, status: upstream.status, state: data.state ?? "running" };
+      }
     } catch (err) {
       importFailed = true;
       importErrMessage = err instanceof Error ? err.message : String(err);

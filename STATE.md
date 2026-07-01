@@ -14,6 +14,41 @@
 
 ## Last run
 
+2026-07-01 · **practical-lamarr** — **Repaired ISA 48 TN corruption directly in prod D1.** A single
+BE→DCS push (deleted_at all stamped 2026-06-30 21:00Z) had **deleted the first-half notes (64 rows,
+verses 1–12 + some of 13–22) and duplicated the later notes (39 extra live rows)** — all 111 relevant
+rows `updated_by=31`. User fixed DCS master by hand, but reimport couldn't heal it: the same
+[[project_edited_row_skips_master_edit]] hole — `updated_by != null` rows are skipped and `deleted_at`
+tombstones are never resurrected by `applyTsvRows`. Diagnosed cleanly: **every** master id already
+existed in D1 (47 in live rows, 64 in tombstones, 0 missing) and **all content already byte-matched
+master** — the corruption was purely structural. Repair (scratchpad `repair-isa48-tn.exec.sql`, 207
+changes): resurrected 64 tombstones (`deleted_at=NULL`, master sort_order, version+1), soft-deleted the
+39 duplicates, +103 `edit_log` rows (`source=data_repair_isa48`, payload `{}` = history-safe).
+sort_order needed 0 fixes (survivors already carried master-position values). `updated_by` left =31
+(content ownership unchanged, HOS 11 precedent; also shields them from an AI `notes` re-run's
+`deleteUnkeptTns` NULL-sweep). **Post-repair verified: 111 live rows, export-order sequence == master
+order, content byte-matches master row-by-row.** D1==master so tonight's export renders no diff → no
+re-revert; **no manual re-export needed.**
+
+**ROOT CAUSE (found, not unknown) + FIX (implemented this session):** the 21:00Z damage was a
+**concurrent double-apply race**, NOT a bad bot result. The bot's master commit (f7117dd, PR #7232) had
+all 111 rows covering vv.1–22, and BE staged all 111 correctly (`pending_imports` 111/111). But TWO
+pollers — the `*/5` cron `pollAllNonTerminal` AND the HTTP route `GET /api/pipelines/:jobId` (a
+translator's open tab) — both passed the `no_output_yet` gate (read pre-apply; `output_json` written
+only ~52s later) and both ran `importJobOutput`. Their chapter-wide `deleteUnkeptTns` sweeps interleaved
+with each other's inserts (edit_log: del/cre interleaved, **64 ids created AND deleted in the same 52s**
+= the 64 I resurrected), annihilating vv.1–12 and doubling 13–22. **ISA 50 applied cleanly (verified
+82/82 == master, single non-interleaved burst) — confirms it's an intermittent race, not deterministic.**
+Fix (branch practical-lamarr, PR pending): (1) atomic single-applier claim inside `importJobOutput` —
+`UPDATE pipeline_jobs SET import_claimed_at=unixepoch() WHERE job_id=? AND (import_claimed_at IS NULL OR
+< unixepoch()-600)`, proceed only if changes=1, release on throw for the one-retry path (migration
+**0035** adds the column; leaf module `pipelineImportClaim.ts` + `mayClaimImport` unit-tested); (2)
+verse-scoped `deleteUnkeptTns` (only sweep verses present in the job's `pending_imports`) as
+defense-in-depth. typecheck + full api suite + build all green; migration applies locally.
+**DEPLOY ORDERING: apply migration 0035 to prod D1 (`npm --workspace api run db:migrate:remote`) BEFORE
+`wrangler deploy --env production`** — the new claim UPDATE references `import_claimed_at`, so deploying
+code first would make every import throw. (memory: [[project_isa48_tn_delete_duplicate_repair]])
+
 2026-07-01 · **fervent-greider** — **Dug into 3 overnight nightly-export alerts (07-01 06:02); 2 glue
 alerts HEALED + re-exported, 1 shrink alert handed back to the translator (Benjamin).** Prod deployed
 `c981376` (built 06-30 21:47) has #298 reform + #300 glue-guard + #301 target-ambiguity LIVE.
