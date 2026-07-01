@@ -138,21 +138,17 @@ function WordsTableInner({ rows, activeId, onSave, onDelete, onFocus, onReorder,
       root.querySelector<HTMLButtonElement>(
         `[data-word-id="${pending.id}"] [data-reorder-arrow="${d}"]`,
       );
-    // If the word landed at an edge its same-direction arrow is now disabled;
-    // fall back to the opposite arrow so focus + the hint still land on the row.
-    let btn = find(pending.dir);
-    let dir = pending.dir;
+    const btn = find(pending.dir);
+    // Reached the top/bottom: the arrow we were moving with is now disabled.
+    // Don't hop focus to the opposite arrow — that turns repeated Space into an
+    // endless up-to-top-then-down-to-bottom loop. Drop focus instead so the run
+    // simply stops at the edge.
     if (!btn || btn.disabled) {
-      const alt = pending.dir === "up" ? "down" : "up";
-      const b2 = find(alt);
-      if (b2 && !b2.disabled) {
-        btn = b2;
-        dir = alt;
-      }
+      (document.activeElement as HTMLElement | null)?.blur?.();
+      return;
     }
-    if (!btn) return;
     btn.focus();
-    setRecentMove({ id: pending.id, dir });
+    setRecentMove({ id: pending.id, dir: pending.dir });
     if (flashTimer.current) clearTimeout(flashTimer.current);
     flashTimer.current = setTimeout(() => setRecentMove(null), 1600);
   });
