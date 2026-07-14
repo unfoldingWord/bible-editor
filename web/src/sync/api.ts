@@ -863,6 +863,78 @@ export interface ArticleUnit {
   latest_source?: string | null;
 }
 
+// ── Translation preferences & memory (migration 0040) ──
+export type TermStatus = "preferred" | "admitted" | "deprecated" | "forbidden" | "do_not_translate";
+export type Register = "default" | "formal" | "informal";
+
+export interface TranslationPrefs {
+  id: number;
+  audience: string | null;
+  purpose: string | null;
+  register: Register;
+  script_notes: string | null;
+  instructions_md: string | null;
+  notes: string | null;
+  assisted_mode: 0 | 1;
+  version: number;
+  updated_at: number;
+  updated_by: number | null;
+}
+export type TranslationPrefsInput = {
+  audience: string | null;
+  purpose: string | null;
+  register: Register;
+  script_notes: string | null;
+  instructions_md: string | null;
+  notes: string | null;
+  assisted_mode: boolean;
+};
+
+export interface Term {
+  id: number;
+  concept_id: string;
+  source_term: string;
+  target_term: string | null;
+  status: TermStatus;
+  replacement: string | null;
+  comment: string | null;
+  tw_link: string | null;
+  source_status: string;
+  version: number;
+  created_at: number;
+  updated_at: number;
+  updated_by: number | null;
+}
+export type TermInput = {
+  concept_id: string;
+  source_term: string;
+  target_term?: string | null;
+  status?: TermStatus;
+  replacement?: string | null;
+  comment?: string | null;
+  tw_link?: string | null;
+};
+export interface TermImportResult {
+  dryRun: boolean;
+  added: number;
+  updated: number;
+  total: number;
+  parseErrors: { line: number; message: string }[];
+}
+export interface TranslationExample {
+  id: string;
+  book: string;
+  ref_raw: string;
+  support_reference?: string | null;
+  quote: string | null;
+  occurrence: number | null;
+  note?: string | null;
+  question?: string | null;
+  response?: string | null;
+  translation_state: string;
+  updated_at: number;
+}
+
 // Lightweight rail item (source_md/target_md excluded server-side for weight).
 export interface ArticleUnitMeta {
   resource: "tw" | "ta";
@@ -1333,6 +1405,55 @@ export const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ value: value ? 1 : 0 }),
     }),
+
+  // ── Translation preferences & memory (migration 0040) ──
+  getTranslationPrefs: () => request<{ prefs: TranslationPrefs }>(`/api/translation-memory/prefs`),
+  putTranslationPrefs: (expectedVersion: number, patch: Partial<TranslationPrefsInput>) =>
+    request<{ prefs: TranslationPrefs }>(`/api/translation-memory/prefs`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json", "If-Match": String(expectedVersion) },
+      body: JSON.stringify(patch),
+    }),
+  getTerms: (opts?: { status?: string; q?: string }) => {
+    const qs = new URLSearchParams();
+    if (opts?.status) qs.set("status", opts.status);
+    if (opts?.q) qs.set("q", opts.q);
+    const suffix = qs.toString() ? `?${qs}` : "";
+    return request<{ terms: Term[] }>(`/api/translation-memory/terms${suffix}`);
+  },
+  getTermsCount: () => request<{ count: number }>(`/api/translation-memory/terms/count`),
+  createTerm: (body: TermInput) =>
+    request<Term>(`/api/translation-memory/terms`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+  patchTerm: (id: number, expectedVersion: number, patch: Partial<TermInput>) =>
+    request<Term>(`/api/translation-memory/terms/${id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json", "If-Match": String(expectedVersion) },
+      body: JSON.stringify(patch),
+    }),
+  deleteTerm: (id: number) =>
+    request<{ ok: boolean }>(`/api/translation-memory/terms/${id}`, { method: "DELETE" }),
+  importTerms: (csvText: string, dryRun: boolean) =>
+    request<TermImportResult>(`/api/translation-memory/terms/import${dryRun ? "?dryRun=1" : ""}`, {
+      method: "POST",
+      headers: { "Content-Type": "text/csv" },
+      body: csvText,
+    }),
+  // CSV export is a plain GET (cookie-auth, same-origin); the caller downloads
+  // this URL via an anchor rather than parsing a JSON body.
+  termsExportPath: () => `/api/translation-memory/terms/export`,
+  getExamples: (opts: { resource: "tn" | "tq"; supportReference?: string; q?: string; limit?: number }) => {
+    const qs = new URLSearchParams({ resource: opts.resource });
+    if (opts.supportReference) qs.set("supportReference", opts.supportReference);
+    if (opts.q) qs.set("q", opts.q);
+    if (opts.limit) qs.set("limit", String(opts.limit));
+    return request<{ resource: string; examples: TranslationExample[] }>(
+      `/api/translation-memory/examples?${qs}`,
+    );
+  },
 
   // Move a note to the visible "trash" state (the delete button). Returns the
   // updated row with trashed_at set. Reversible via restoreNote; finalized to a

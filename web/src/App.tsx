@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { Alert, Box, Button, CircularProgress, Link, Snackbar, Stack, Typography } from "@mui/material";
 import { Shell } from "./components/Shell";
 import { ArticleWorkspace } from "./components/ArticleWorkspace";
+import { PreferencesWorkspace } from "./components/PreferencesWorkspace";
 import { useBook } from "./hooks/useBook";
 import { useAlerts } from "./hooks/useAlerts";
 import {
@@ -16,9 +17,13 @@ import {
 } from "./sync/api";
 import { setPipelineUser } from "./sync/pipelineStore";
 
+type PrefsSection = "brief" | "instructions" | "terminology" | "examples";
+const PREFS_SECTIONS: PrefsSection[] = ["brief", "instructions", "terminology", "examples"];
+
 type Location =
   | { view: "chapter"; book: string; chapter: number; verse: number }
-  | { view: "article"; resource: "tw" | "ta"; articleId: string | null };
+  | { view: "article"; resource: "tw" | "ta"; articleId: string | null }
+  | { view: "preferences"; section: PrefsSection };
 
 // OBA (Obadiah) is the shortest book in the canon — one chapter, 21 verses.
 // Loads faster than ZEC on a cold cache and keeps the default landing page
@@ -33,6 +38,11 @@ const DEFAULT_BOOK = "OBA";
 const SIGNED_OUT_KEY = "bible-editor.signed_out";
 
 function parseHash(): Location {
+  const pm = location.hash.match(/^#\/preferences(?:\/(\w+))?$/);
+  if (pm) {
+    const s = pm[1] as PrefsSection | undefined;
+    return { view: "preferences", section: s && PREFS_SECTIONS.includes(s) ? s : "brief" };
+  }
   const am = location.hash.match(/^#\/articles\/(tw|ta)(?:\/(.+))?$/);
   if (am) {
     return {
@@ -385,7 +395,14 @@ export function App() {
         </Alert>
       )}
       <Box sx={{ flex: 1, minHeight: 0 }}>
-        {loc.view === "article" ? (
+        {loc.view === "preferences" ? (
+          <PreferencesWorkspace
+            section={loc.section}
+            onNavigate={(s) => {
+              location.hash = `#/preferences/${s}`;
+            }}
+          />
+        ) : loc.view === "article" ? (
           <ArticleWorkspace
             resource={loc.resource}
             articleId={loc.articleId}

@@ -30,6 +30,7 @@ import CloudDownloadIcon from "@mui/icons-material/CloudDownload";
 import LanguageIcon from "@mui/icons-material/Language";
 import CheckIcon from "@mui/icons-material/Check";
 import ArticleOutlinedIcon from "@mui/icons-material/ArticleOutlined";
+import TuneIcon from "@mui/icons-material/Tune";
 import { Menu, MenuItem, ListItemIcon, ListItemText } from "@mui/material";
 import { useTranslation } from "react-i18next";
 import { useProjectConfig, isTranslationProject } from "../hooks/useProjectConfig";
@@ -514,6 +515,22 @@ export function TopBar({
             sx={{ textTransform: "none", color: "text.secondary" }}
           >
             {t("articles.title")}
+          </Button>
+        </Tooltip>
+      )}
+      {showArticles && (
+        <Tooltip title={t("preferences.title")}>
+          <Button
+            size="small"
+            variant="text"
+            color="inherit"
+            startIcon={<TuneIcon fontSize="small" />}
+            onClick={() => {
+              location.hash = "#/preferences";
+            }}
+            sx={{ textTransform: "none", color: "text.secondary" }}
+          >
+            {t("preferences.title")}
           </Button>
         </Tooltip>
       )}
