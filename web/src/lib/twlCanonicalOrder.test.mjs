@@ -269,6 +269,51 @@ const ids = (rows) => rows.map((r) => r.id);
   );
 }
 
+// ─── Same phrase text via DIFFERENT groupings — occurrence stays position-major ──
+// Mirrors the api-side fixture. The identical normalized phrase text can arise
+// two ways in one verse: a sibling pair (K=2) FIRST, then a single glued
+// milestone (K=1) for the SAME words SECOND. Occurrence must stay
+// position-major (left-to-right document order), not window-length-major.
+{
+  console.log("\n[phrase-occurrence-grouping] same phrase via sibling THEN glued milestone stays position-major");
+  const vo = [
+    { type: "milestone", tag: "zaln", content: "υἱοῦ", children: [{ type: "word", tag: "w", text: "Son1" }] },
+    { type: "milestone", tag: "zaln", content: "θεοῦ", children: [{ type: "word", tag: "w", text: "God1" }] },
+    { type: "milestone", tag: "zaln", content: "καὶ", children: [{ type: "word", tag: "w", text: "and" }] },
+    { type: "milestone", tag: "zaln", content: "υἱοῦ θεοῦ", children: [{ type: "word", tag: "w", text: "Son2" }] },
+  ];
+  const rows = [
+    twl("sonOfGod1", "υἱοῦ θεοῦ", 1, 100),
+    twl("and", "καὶ", 1, 200),
+    twl("sonOfGod2", "υἱοῦ θεοῦ", 2, 300),
+  ];
+  const ordered = ids(canonicalTwlOrder(rows, vo));
+  assert(
+    JSON.stringify(ordered) === JSON.stringify(["sonOfGod1", "and", "sonOfGod2"]),
+    `canonical order sonOfGod1,and,sonOfGod2 (got ${JSON.stringify(ordered)})`,
+  );
+}
+
+// ─── Phrase starts with a word that has no aligned English target ───────────
+// Mirrors the api-side fixture.
+{
+  console.log("\n[leading-unaligned] phrase whose first word has no ULT alignment still resolves");
+  const vo = [
+    { type: "milestone", tag: "zaln", content: "πρῶτον", children: [{ type: "word", tag: "w", text: "First" }] },
+    { type: "milestone", tag: "zaln", content: "καὶ", children: [] },
+    { type: "milestone", tag: "zaln", content: "ἐλάλησεν", children: [{ type: "word", tag: "w", text: "spoke" }] },
+  ];
+  const rows = [
+    twl("first", "πρῶτον", 1, 100),
+    twl("andSpoke", "καὶ ἐλάλησεν", 1, 200),
+  ];
+  const ordered = ids(canonicalTwlOrder(rows, vo));
+  assert(
+    JSON.stringify(ordered) === JSON.stringify(["first", "andSpoke"]),
+    `canonical order first,andSpoke (got ${JSON.stringify(ordered)})`,
+  );
+}
+
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed.`);
   process.exit(1);

@@ -34,8 +34,11 @@ interface MilestoneEntry {
 // 17:20). Both are just a CONTIGUOUS RUN in the pre-order milestone-entry
 // sequence — nesting only affects whether the next entry came from `children`
 // or from the next sibling in the same array. So resolving a phrase is a
-// sliding-window search over one flat list, not a nesting-aware walk.
-const MAX_PHRASE_WORDS = 6;
+// sliding-window search over one flat list, not a nesting-aware walk. No
+// fixed max phrase length: the window grows up to the full entry list, so a
+// legitimately long OrigWords phrase can't silently fail to resolve the way a
+// hardcoded cap would (a verse only ever has a handful of milestones, so this
+// costs nothing).
 
 export function buildUltSequenceMap(
   verseObjects: unknown[] | null | undefined,
@@ -92,18 +95,33 @@ export function buildUltSequenceMap(
 
   walk(verseObjects);
 
-  // Sliding window over the flat pre-order entry list: every contiguous run of
-  // 1..MAX_PHRASE_WORDS entries is a candidate OrigWords phrase, keyed by its
-  // joined content with its own per-phrase occurrence counter (same "which
-  // source instance" semantics as the single-word case — K=1 is just this
-  // with one entry per window, so single-word rows are unaffected).
+  // Sliding window over the flat pre-order entry list, POSITION-MAJOR (outer
+  // loop over start index, inner loop growing the length): every contiguous
+  // run starting at `i` is a candidate OrigWords phrase, its content built up
+  // incrementally (no re-slicing/re-joining per window) and keyed with its own
+  // per-phrase occurrence counter. Position-major order matters: counting
+  // length-major (every 1-word window before any 2-word window) numbers
+  // occurrences out of document order whenever the SAME phrase text arises via
+  // two different groupings at different verse positions — e.g. one instance
+  // is a single glued milestone, another is two separate sibling milestones
+  // for the identical underlying words. TWL occurrence is a structure-
+  // independent left-to-right scan over the source text (same convention
+  // quoteBuilder.ts's buildQuoteFromSelection uses), so counting must follow
+  // start-position order, not window-length order. The anchor is the FIRST
+  // entry in the window with a resolved englishIndex, not strictly the
+  // window's own first entry — a phrase can start with a word that has no
+  // aligned English target at all (e.g. a dropped connective).
   const phraseOccurrenceCount = new Map<string, number>();
-  for (let len = 1; len <= MAX_PHRASE_WORDS && len <= entries.length; len++) {
-    for (let i = 0; i + len <= entries.length; i++) {
-      const window = entries.slice(i, i + len);
-      const anchor = window[0].englishIndex;
-      if (anchor == null) continue; // shouldn't happen for well-formed alignment
-      const phrase = window.map((e) => e.content).join(" ");
+  for (let i = 0; i < entries.length; i++) {
+    let phrase = entries[i].content;
+    let anchor = entries[i].englishIndex;
+    for (let len = 1; i + len <= entries.length; len++) {
+      if (len > 1) {
+        const entry = entries[i + len - 1];
+        phrase += ` ${entry.content}`;
+        if (anchor == null) anchor = entry.englishIndex;
+      }
+      if (anchor == null) continue; // no aligned English word anywhere in the run yet
       const occurrence = (phraseOccurrenceCount.get(phrase) ?? 0) + 1;
       phraseOccurrenceCount.set(phrase, occurrence);
       sequenceMap.set(`${phrase}#${occurrence}`, anchor);
