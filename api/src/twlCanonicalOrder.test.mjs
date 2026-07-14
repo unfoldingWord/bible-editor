@@ -245,6 +245,129 @@ function toMap(updates) {
   );
 }
 
+// ─── Nested-phrase OrigWords (JHN 1:1 gj8t: Greek "τὸν Θεόν") ────────────────
+// A TWL row can point at a multi-word source PHRASE spanning a nested
+// article+noun milestone pair (outer "τὸν" wrapping inner "Θεόν"). OrigWords
+// stores the concatenated phrase "τὸν Θεόν", which matches neither milestone's
+// own `content` alone. Without keying the full nested chain, this row sank to
+// the end of the verse's Words list (after Θεὸς) instead of between the 2nd
+// λόγος and the final Θεὸς. Regression for the live prod bug found on JHN 1:1.
+{
+  console.log("\n[nested-phrase] TWL row on a multi-word nested phrase resolves");
+  const verseObjects = [
+    { type: "milestone", tag: "zaln", content: "λόγος", children: [{ type: "word", tag: "w", text: "Word1" }] },
+    { type: "milestone", tag: "zaln", content: "λόγος", children: [{ type: "word", tag: "w", text: "Word2" }] },
+    {
+      type: "milestone", tag: "zaln", content: "τὸν", // OUTER — article, no direct \w
+      children: [
+        {
+          type: "milestone", tag: "zaln", content: "Θεόν", // INNER — noun, wraps the English word
+          children: [{ type: "word", tag: "w", text: "God1" }],
+        },
+      ],
+    },
+    { type: "milestone", tag: "zaln", content: "λόγος", children: [{ type: "word", tag: "w", text: "Word3" }] },
+    { type: "milestone", tag: "zaln", content: "Θεὸς", children: [{ type: "word", tag: "w", text: "God2" }] },
+  ];
+  const verse = {
+    book: "JHN", chapter: 1, verse: 1, verse_end: null, bible_version: "ULT",
+    content_json: JSON.stringify({ verseObjects }), plain_text: null, version: 1, updated_by: null, updated_at: 0,
+  };
+  const rows = [
+    twl("logos1", 1, 1, "λόγος", 1, 100),
+    twl("logos2", 1, 1, "λόγος", 2, 200),
+    twl("tonTheon", 1, 1, "τὸν Θεόν", 1, 300), // spans the nested article+noun pair
+    twl("theos", 1, 1, "Θεὸς", 1, 400),
+    twl("logos3", 1, 1, "λόγος", 3, 500),
+  ];
+  const { versePositions } = orderTwlRows(rows, [verse]);
+  assert(versePositions.get("logos1") === 0, "λόγος#1 → index 0");
+  assert(versePositions.get("logos2") === 1, "λόγος#2 → index 1");
+  assert(
+    versePositions.get("tonTheon") === 2,
+    `τὸν Θεόν (nested phrase) → index 2, between λόγος#2 and λόγος#3 (NOT sunk to the end)`,
+  );
+  assert(versePositions.get("logos3") === 3, "λόγος#3 → index 3");
+  assert(versePositions.get("theos") === 4, "Θεὸς → index 4 (last, matches ULT English word order)");
+}
+
+// ─── Sibling-phrase OrigWords (LUK 17:20: Greek "Βασιλεία τοῦ Θεοῦ") ─────────
+// A multi-word OrigWords phrase doesn't always span a NESTED chain — real NT
+// data also spans SIBLING top-level milestones: "Βασιλεία" is its own
+// standalone milestone, immediately followed by "τοῦ" (which itself nests
+// "Θεοῦ"). Verified against prod LUK 17:20 content_json. The fix must resolve
+// this as a contiguous run in the flat entry list, not just a parent→child
+// chain, or 3-word "kingdom of God" phrases sink to the end just like the
+// nested case did.
+{
+  console.log("\n[sibling-phrase] TWL row spanning sibling + nested milestones resolves");
+  const verseObjects = [
+    { type: "milestone", tag: "zaln", content: "ἡ", children: [{ type: "word", tag: "w", text: "the" }] },
+    { type: "milestone", tag: "zaln", content: "Βασιλεία", children: [{ type: "word", tag: "w", text: "kingdom" }] },
+    {
+      type: "milestone", tag: "zaln", content: "τοῦ", // OUTER — article, no direct \w
+      children: [
+        {
+          type: "milestone", tag: "zaln", content: "Θεοῦ", // INNER — noun, wraps the English words
+          children: [
+            { type: "word", tag: "w", text: "of" },
+            { type: "word", tag: "w", text: "God" },
+          ],
+        },
+      ],
+    },
+    { type: "milestone", tag: "zaln", content: "ἔρχεται", children: [{ type: "word", tag: "w", text: "coming" }] },
+  ];
+  const verse = {
+    book: "LUK", chapter: 17, verse: 20, verse_end: null, bible_version: "ULT",
+    content_json: JSON.stringify({ verseObjects }), plain_text: null, version: 1, updated_by: null, updated_at: 0,
+  };
+  const rows = [
+    twl("the", 17, 20, "ἡ", 1, 100),
+    twl("kingdomOfGod", 17, 20, "Βασιλεία τοῦ Θεοῦ", 1, 200), // spans sibling "Βασιλεία" + nested "τοῦ"/"Θεοῦ"
+    twl("coming", 17, 20, "ἔρχεται", 1, 300),
+  ];
+  const { versePositions } = orderTwlRows(rows, [verse]);
+  assert(versePositions.get("the") === 0, "ἡ → index 0");
+  assert(
+    versePositions.get("kingdomOfGod") === 1,
+    "Βασιλεία τοῦ Θεοῦ (sibling + nested run) → index 1, between ἡ and ἔρχεται",
+  );
+  assert(versePositions.get("coming") === 2, "ἔρχεται → index 2");
+}
+
+// ─── Repeated multi-word phrase, occurrence disambiguates (REV 3:12-style) ──
+// The same multi-word phrase can appear more than once in a verse — the
+// per-phrase occurrence counter must track EXACT phrase text, not collide with
+// the single-word occurrence counters for its component words.
+{
+  console.log("\n[phrase-occurrence] repeated multi-word phrase disambiguated by Occurrence");
+  const verseObjects = [
+    {
+      type: "milestone", tag: "zaln", content: "τοῦ",
+      children: [{ type: "milestone", tag: "zaln", content: "Θεοῦ", children: [{ type: "word", tag: "w", text: "God1" }] }],
+    },
+    { type: "milestone", tag: "zaln", content: "καὶ", children: [{ type: "word", tag: "w", text: "and" }] },
+    {
+      type: "milestone", tag: "zaln", content: "τοῦ",
+      children: [{ type: "milestone", tag: "zaln", content: "Θεοῦ", children: [{ type: "word", tag: "w", text: "God2" }] }],
+    },
+  ];
+  const verse = {
+    book: "REV", chapter: 3, verse: 12, verse_end: null, bible_version: "ULT",
+    content_json: JSON.stringify({ verseObjects }), plain_text: null, version: 1, updated_by: null, updated_at: 0,
+  };
+  const rows = [
+    twl("god1", 3, 12, "τοῦ Θεοῦ", 1, 100),
+    twl("and", 3, 12, "καὶ", 1, 200),
+    twl("god2", 3, 12, "τοῦ Θεοῦ", 2, 300),
+  ];
+  const { versePositions } = orderTwlRows(rows, [verse]);
+  assert(versePositions.get("god1") === 0, "τοῦ Θεοῦ#1 → index 0");
+  assert(versePositions.get("and") === 1, "καὶ → index 1");
+  assert(versePositions.get("god2") === 2, "τοῦ Θεοῦ#2 → index 2 (AFTER καὶ, not confused with #1)");
+}
+
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed.`);
   process.exit(1);
