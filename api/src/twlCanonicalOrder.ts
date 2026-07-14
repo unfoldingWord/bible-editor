@@ -15,14 +15,29 @@ export function normalizeWordText(s: string | null | undefined): string {
   return s.normalize("NFC").toLowerCase().trim().replace(/[\s\p{P}\p{S}]+/gu, " ");
 }
 
-// A `\zaln` alignment milestone we are currently inside. `occurrence` is the
-// source-instance number of this exact word in the verse (1-based, reading
-// order); `recorded` guards so we key it to the FIRST English word under it.
-interface AlignmentFrame {
+// One `\zaln` alignment milestone, in the order it is ENTERED (pre-order —
+// matches ULT English reading order). `englishIndex` is the index of the
+// first English `\w` under it (direct or nested), filled in once the walk
+// reaches that word.
+interface MilestoneEntry {
   content: string;
-  occurrence: number;
-  recorded: boolean;
+  englishIndex: number | null;
 }
+
+// A TWL row's OrigWords can be a multi-word source PHRASE, and that phrase can
+// span milestones two different ways: (1) NESTED — an outer milestone wraps an
+// inner one (e.g. Greek "τὸν Θεόν" = article milestone wrapping a noun
+// milestone; JHN 1:1 gj8t), or (2) SIBLING — separate, adjacent top-level
+// milestones (e.g. "Βασιλεία τοῦ Θεοῦ" = a standalone "Βασιλεία" milestone
+// immediately followed by a "τοῦ" milestone that itself nests "Θεοῦ"; LUK
+// 17:20). Both are just a CONTIGUOUS RUN in the pre-order milestone-entry
+// sequence — nesting only affects whether the next entry came from `children`
+// or from the next sibling in the same array. So resolving a phrase is a
+// sliding-window search over one flat list, not a nesting-aware walk. No
+// fixed max phrase length: the window grows up to the full entry list, so a
+// legitimately long OrigWords phrase can't silently fail to resolve the way a
+// hardcoded cap would (a verse only ever has a handful of milestones, so this
+// costs nothing).
 
 export function buildUltSequenceMap(verse: VerseRow | null | undefined): Map<string, number> {
   const sequenceMap = new Map<string, number>();
@@ -36,12 +51,8 @@ export function buildUltSequenceMap(verse: VerseRow | null | undefined): Map<str
   if (!Array.isArray(verseObjects)) return sequenceMap;
 
   let englishIndex = 0;
-  // Per-normalized-content source-instance counter: how many `\zaln` milestones
-  // of this word we've entered so far. This is the OCCURRENCE a TWL row keys on
-  // (which source instance), NOT the number of English words the alignment fans
-  // out to — so a word aligned to several English words still owns one slot.
-  const occurrenceCount = new Map<string, number>();
-  const stack: AlignmentFrame[] = [];
+  const entries: MilestoneEntry[] = [];
+  const stack: MilestoneEntry[] = []; // currently-open milestones, for marking englishIndex
 
   const walk = (nodes: unknown[]): void => {
     for (const node of nodes) {
@@ -49,14 +60,13 @@ export function buildUltSequenceMap(verse: VerseRow | null | undefined): Map<str
       const o = node as Record<string, unknown>;
 
       // Start of an alignment milestone. usfm-js nests alignment via `children`
-      // (real ULT data carries NO milestoneEnd nodes), so scope the frame to the
-      // children walk: push, recurse, pop. A milestone with no children is
+      // (real ULT data carries NO milestoneEnd nodes), so scope the entry to
+      // the children walk: push, recurse, pop. A milestone with no children is
       // sibling-structured — leave it on the stack for a milestoneEnd below.
       if (o["type"] === "milestone" && o["tag"] === "zaln" && typeof o["content"] === "string") {
-        const content = normalizeWordText(o["content"] as string);
-        const occurrence = (occurrenceCount.get(content) ?? 0) + 1;
-        occurrenceCount.set(content, occurrence);
-        stack.push({ content, occurrence, recorded: false });
+        const entry: MilestoneEntry = { content: normalizeWordText(o["content"] as string), englishIndex: null };
+        entries.push(entry);
+        stack.push(entry);
         const children = o["children"];
         if (Array.isArray(children)) {
           walk(children);
@@ -71,16 +81,12 @@ export function buildUltSequenceMap(verse: VerseRow | null | undefined): Map<str
         continue;
       }
 
-      // English word. Key EVERY enclosing milestone (all nesting levels) to its
-      // FIRST English index — so a TWL link on an OUTER word of a nested
-      // alignment resolves (ZEC 3:1 "high priest" = הַכֹּהֵן wrapping הַגָּדוֹל)
-      // and each source instance owns exactly one position.
+      // English word. Mark EVERY currently-open milestone (all nesting levels)
+      // with its FIRST English index — so an OUTER word of a nested alignment
+      // resolves (ZEC 3:1 "high priest" = הַכֹּהֵן wrapping הַגָּדוֹל).
       if (o["type"] === "word" && o["tag"] === "w") {
-        for (const frame of stack) {
-          if (!frame.recorded) {
-            sequenceMap.set(`${frame.content}#${frame.occurrence}`, englishIndex);
-            frame.recorded = true;
-          }
+        for (const entry of stack) {
+          if (entry.englishIndex == null) entry.englishIndex = englishIndex;
         }
         englishIndex++;
         continue;
@@ -92,6 +98,44 @@ export function buildUltSequenceMap(verse: VerseRow | null | undefined): Map<str
   };
 
   walk(verseObjects);
+
+  // Sliding window over the flat pre-order entry list, POSITION-MAJOR (outer
+  // loop over start index, inner loop growing the length): every contiguous
+  // run starting at `i` is a candidate OrigWords phrase, its content built up
+  // incrementally (no re-slicing/re-joining per window) and keyed with its own
+  // per-phrase occurrence counter. Position-major order matters: counting
+  // length-major (every 1-word window before any 2-word window) numbers
+  // occurrences out of document order whenever the SAME phrase text arises via
+  // two different groupings at different verse positions — e.g. one instance
+  // is a single glued milestone, another is two separate sibling milestones
+  // for the identical underlying words. TWL occurrence is a structure-
+  // independent left-to-right scan over the source text (same convention
+  // quoteBuilder.ts's buildQuoteFromSelection uses), so counting must follow
+  // start-position order, not window-length order. The anchor is the FIRST
+  // entry in the window with a resolved englishIndex, not strictly the
+  // window's own first entry — a phrase can start with a word that has no
+  // aligned English target at all (e.g. a dropped connective). The occurrence
+  // counter advances for EVERY window regardless of anchor — even a fully
+  // unaligned instance still "consumes" an occurrence slot (mirrors the old
+  // per-milestone counter, which incremented at push time before knowing
+  // whether that milestone would ever get a \w) — only the sequenceMap WRITE
+  // is skipped when there's no anchor. Otherwise a later, aligned instance of
+  // the same phrase would be miscounted as occurrence #1 instead of #2.
+  const phraseOccurrenceCount = new Map<string, number>();
+  for (let i = 0; i < entries.length; i++) {
+    let phrase = entries[i].content;
+    let anchor = entries[i].englishIndex;
+    for (let len = 1; i + len <= entries.length; len++) {
+      if (len > 1) {
+        const entry = entries[i + len - 1];
+        phrase += ` ${entry.content}`;
+        if (anchor == null) anchor = entry.englishIndex;
+      }
+      const occurrence = (phraseOccurrenceCount.get(phrase) ?? 0) + 1;
+      phraseOccurrenceCount.set(phrase, occurrence);
+      if (anchor != null) sequenceMap.set(`${phrase}#${occurrence}`, anchor);
+    }
+  }
 
   return sequenceMap;
 }

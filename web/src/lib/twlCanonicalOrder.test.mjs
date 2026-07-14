@@ -171,6 +171,167 @@ const ids = (rows) => rows.map((r) => r.id);
     `foo#2 lands after mid (got ${JSON.stringify(ordered)})`);
 }
 
+// ─── Nested-phrase OrigWords (JHN 1:1 gj8t: Greek "τὸν Θεόν") ────────────────
+// Mirrors the api-side fixture. A TWL row can point at a multi-word source
+// PHRASE spanning a nested article+noun milestone pair — OrigWords stores the
+// concatenated phrase "τὸν Θεόν", matching neither milestone's own `content`
+// alone. Regression for the live prod bug found on JHN 1:1.
+{
+  console.log("\n[nested-phrase] TWL row on a multi-word nested phrase resolves");
+  const vo = [
+    { type: "milestone", tag: "zaln", content: "λόγος", children: [{ type: "word", tag: "w", text: "Word1" }] },
+    { type: "milestone", tag: "zaln", content: "λόγος", children: [{ type: "word", tag: "w", text: "Word2" }] },
+    {
+      type: "milestone", tag: "zaln", content: "τὸν", // OUTER — article, no direct \w
+      children: [
+        {
+          type: "milestone", tag: "zaln", content: "Θεόν", // INNER — noun, wraps the English word
+          children: [{ type: "word", tag: "w", text: "God1" }],
+        },
+      ],
+    },
+    { type: "milestone", tag: "zaln", content: "λόγος", children: [{ type: "word", tag: "w", text: "Word3" }] },
+    { type: "milestone", tag: "zaln", content: "Θεὸς", children: [{ type: "word", tag: "w", text: "God2" }] },
+  ];
+  const rows = [
+    twl("logos1", "λόγος", 1, 100),
+    twl("logos2", "λόγος", 2, 200),
+    twl("tonTheon", "τὸν Θεόν", 1, 300),
+    twl("theos", "Θεὸς", 1, 400),
+    twl("logos3", "λόγος", 3, 500),
+  ];
+  const ordered = ids(canonicalTwlOrder(rows, vo));
+  assert(
+    JSON.stringify(ordered) === JSON.stringify(["logos1", "logos2", "tonTheon", "logos3", "theos"]),
+    `canonical order logos1,logos2,tonTheon,logos3,theos (got ${JSON.stringify(ordered)})`,
+  );
+}
+
+// ─── Sibling-phrase OrigWords (LUK 17:20: Greek "Βασιλεία τοῦ Θεοῦ") ─────────
+// Mirrors the api-side fixture. A multi-word phrase can span SIBLING top-level
+// milestones, not just a nested parent→child chain: "Βασιλεία" is standalone,
+// immediately followed by "τοῦ" (which nests "Θεοῦ"). Verified against prod
+// LUK 17:20 content_json.
+{
+  console.log("\n[sibling-phrase] TWL row spanning sibling + nested milestones resolves");
+  const vo = [
+    { type: "milestone", tag: "zaln", content: "ἡ", children: [{ type: "word", tag: "w", text: "the" }] },
+    { type: "milestone", tag: "zaln", content: "Βασιλεία", children: [{ type: "word", tag: "w", text: "kingdom" }] },
+    {
+      type: "milestone", tag: "zaln", content: "τοῦ", // OUTER — article, no direct \w
+      children: [
+        {
+          type: "milestone", tag: "zaln", content: "Θεοῦ", // INNER — noun, wraps the English words
+          children: [
+            { type: "word", tag: "w", text: "of" },
+            { type: "word", tag: "w", text: "God" },
+          ],
+        },
+      ],
+    },
+    { type: "milestone", tag: "zaln", content: "ἔρχεται", children: [{ type: "word", tag: "w", text: "coming" }] },
+  ];
+  const rows = [
+    twl("the", "ἡ", 1, 100),
+    twl("kingdomOfGod", "Βασιλεία τοῦ Θεοῦ", 1, 200),
+    twl("coming", "ἔρχεται", 1, 300),
+  ];
+  const ordered = ids(canonicalTwlOrder(rows, vo));
+  assert(
+    JSON.stringify(ordered) === JSON.stringify(["the", "kingdomOfGod", "coming"]),
+    `canonical order the,kingdomOfGod,coming (got ${JSON.stringify(ordered)})`,
+  );
+}
+
+// ─── Repeated multi-word phrase, occurrence disambiguates (REV 3:12-style) ──
+{
+  console.log("\n[phrase-occurrence] repeated multi-word phrase disambiguated by Occurrence");
+  const vo = [
+    {
+      type: "milestone", tag: "zaln", content: "τοῦ",
+      children: [{ type: "milestone", tag: "zaln", content: "Θεοῦ", children: [{ type: "word", tag: "w", text: "God1" }] }],
+    },
+    { type: "milestone", tag: "zaln", content: "καὶ", children: [{ type: "word", tag: "w", text: "and" }] },
+    {
+      type: "milestone", tag: "zaln", content: "τοῦ",
+      children: [{ type: "milestone", tag: "zaln", content: "Θεοῦ", children: [{ type: "word", tag: "w", text: "God2" }] }],
+    },
+  ];
+  const rows = [
+    twl("god1", "τοῦ Θεοῦ", 1, 100),
+    twl("and", "καὶ", 1, 200),
+    twl("god2", "τοῦ Θεοῦ", 2, 300),
+  ];
+  const ordered = ids(canonicalTwlOrder(rows, vo));
+  assert(
+    JSON.stringify(ordered) === JSON.stringify(["god1", "and", "god2"]),
+    `canonical order god1,and,god2 (got ${JSON.stringify(ordered)})`,
+  );
+}
+
+// ─── Same phrase text via DIFFERENT groupings — occurrence stays position-major ──
+// Mirrors the api-side fixture. The identical normalized phrase text can arise
+// two ways in one verse: a sibling pair (K=2) FIRST, then a single glued
+// milestone (K=1) for the SAME words SECOND. Occurrence must stay
+// position-major (left-to-right document order), not window-length-major.
+{
+  console.log("\n[phrase-occurrence-grouping] same phrase via sibling THEN glued milestone stays position-major");
+  const vo = [
+    { type: "milestone", tag: "zaln", content: "υἱοῦ", children: [{ type: "word", tag: "w", text: "Son1" }] },
+    { type: "milestone", tag: "zaln", content: "θεοῦ", children: [{ type: "word", tag: "w", text: "God1" }] },
+    { type: "milestone", tag: "zaln", content: "καὶ", children: [{ type: "word", tag: "w", text: "and" }] },
+    { type: "milestone", tag: "zaln", content: "υἱοῦ θεοῦ", children: [{ type: "word", tag: "w", text: "Son2" }] },
+  ];
+  const rows = [
+    twl("sonOfGod1", "υἱοῦ θεοῦ", 1, 100),
+    twl("and", "καὶ", 1, 200),
+    twl("sonOfGod2", "υἱοῦ θεοῦ", 2, 300),
+  ];
+  const ordered = ids(canonicalTwlOrder(rows, vo));
+  assert(
+    JSON.stringify(ordered) === JSON.stringify(["sonOfGod1", "and", "sonOfGod2"]),
+    `canonical order sonOfGod1,and,sonOfGod2 (got ${JSON.stringify(ordered)})`,
+  );
+}
+
+// ─── Phrase starts with a word that has no aligned English target ───────────
+// Mirrors the api-side fixture.
+{
+  console.log("\n[leading-unaligned] phrase whose first word has no ULT alignment still resolves");
+  const vo = [
+    { type: "milestone", tag: "zaln", content: "πρῶτον", children: [{ type: "word", tag: "w", text: "First" }] },
+    { type: "milestone", tag: "zaln", content: "καὶ", children: [] },
+    { type: "milestone", tag: "zaln", content: "ἐλάλησεν", children: [{ type: "word", tag: "w", text: "spoke" }] },
+  ];
+  const rows = [
+    twl("first", "πρῶτον", 1, 100),
+    twl("andSpoke", "καὶ ἐλάλησεν", 1, 200),
+  ];
+  const ordered = ids(canonicalTwlOrder(rows, vo));
+  assert(
+    JSON.stringify(ordered) === JSON.stringify(["first", "andSpoke"]),
+    `canonical order first,andSpoke (got ${JSON.stringify(ordered)})`,
+  );
+}
+
+// ─── Unaligned occurrence #1 must still consume its occurrence slot ─────────
+// Mirrors the api-side fixture (Codex regression).
+{
+  console.log("\n[unaligned-occurrence-slot] unaligned occurrence#1 doesn't steal occurrence#2's number");
+  const vo = [
+    { type: "milestone", tag: "zaln", content: "foo", children: [] },
+    { type: "milestone", tag: "zaln", content: "foo", children: [{ type: "word", tag: "w", text: "Foo2" }] },
+  ];
+  const rows = [twl("foo2", "foo", 2, 100)];
+  const ordered = ids(canonicalTwlOrder(rows, vo));
+  assert(
+    JSON.stringify(ordered) === JSON.stringify(["foo2"]),
+    `foo#2 resolves via its OWN occurrence number (got ${JSON.stringify(ordered)})`,
+  );
+  const map = buildUltSequenceMap(vo);
+  assert(twlSortPosition({ orig_words: "foo", occurrence: 2 }, map) === 0, "foo#2 → index 0, not miscounted as foo#1");
+}
+
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed.`);
   process.exit(1);
