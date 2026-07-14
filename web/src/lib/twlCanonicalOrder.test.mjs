@@ -314,6 +314,24 @@ const ids = (rows) => rows.map((r) => r.id);
   );
 }
 
+// ─── Unaligned occurrence #1 must still consume its occurrence slot ─────────
+// Mirrors the api-side fixture (Codex regression).
+{
+  console.log("\n[unaligned-occurrence-slot] unaligned occurrence#1 doesn't steal occurrence#2's number");
+  const vo = [
+    { type: "milestone", tag: "zaln", content: "foo", children: [] },
+    { type: "milestone", tag: "zaln", content: "foo", children: [{ type: "word", tag: "w", text: "Foo2" }] },
+  ];
+  const rows = [twl("foo2", "foo", 2, 100)];
+  const ordered = ids(canonicalTwlOrder(rows, vo));
+  assert(
+    JSON.stringify(ordered) === JSON.stringify(["foo2"]),
+    `foo#2 resolves via its OWN occurrence number (got ${JSON.stringify(ordered)})`,
+  );
+  const map = buildUltSequenceMap(vo);
+  assert(twlSortPosition({ orig_words: "foo", occurrence: 2 }, map) === 0, "foo#2 → index 0, not miscounted as foo#1");
+}
+
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed.`);
   process.exit(1);

@@ -114,7 +114,13 @@ export function buildUltSequenceMap(verse: VerseRow | null | undefined): Map<str
   // start-position order, not window-length order. The anchor is the FIRST
   // entry in the window with a resolved englishIndex, not strictly the
   // window's own first entry — a phrase can start with a word that has no
-  // aligned English target at all (e.g. a dropped connective).
+  // aligned English target at all (e.g. a dropped connective). The occurrence
+  // counter advances for EVERY window regardless of anchor — even a fully
+  // unaligned instance still "consumes" an occurrence slot (mirrors the old
+  // per-milestone counter, which incremented at push time before knowing
+  // whether that milestone would ever get a \w) — only the sequenceMap WRITE
+  // is skipped when there's no anchor. Otherwise a later, aligned instance of
+  // the same phrase would be miscounted as occurrence #1 instead of #2.
   const phraseOccurrenceCount = new Map<string, number>();
   for (let i = 0; i < entries.length; i++) {
     let phrase = entries[i].content;
@@ -125,10 +131,9 @@ export function buildUltSequenceMap(verse: VerseRow | null | undefined): Map<str
         phrase += ` ${entry.content}`;
         if (anchor == null) anchor = entry.englishIndex;
       }
-      if (anchor == null) continue; // no aligned English word anywhere in the run yet
       const occurrence = (phraseOccurrenceCount.get(phrase) ?? 0) + 1;
       phraseOccurrenceCount.set(phrase, occurrence);
-      sequenceMap.set(`${phrase}#${occurrence}`, anchor);
+      if (anchor != null) sequenceMap.set(`${phrase}#${occurrence}`, anchor);
     }
   }
 

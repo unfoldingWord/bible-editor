@@ -431,6 +431,29 @@ function toMap(updates) {
   );
 }
 
+// ─── Unaligned occurrence #1 must still consume its occurrence slot ─────────
+// Codex regression: a single-word source instance can itself be fully
+// unaligned (no \w descendant at all) — its own occurrence counter must still
+// advance even though it never gets a sequenceMap entry, or a LATER, aligned
+// instance of the same word gets miscounted as occurrence #1 instead of #2.
+{
+  console.log("\n[unaligned-occurrence-slot] unaligned occurrence#1 doesn't steal occurrence#2's number");
+  const verseObjects = [
+    { type: "milestone", tag: "zaln", content: "foo", children: [] }, // occurrence 1 — fully unaligned, no \w
+    { type: "milestone", tag: "zaln", content: "foo", children: [{ type: "word", tag: "w", text: "Foo2" }] }, // occurrence 2 — aligned
+  ];
+  const verse = {
+    book: "GEN", chapter: 5, verse: 1, verse_end: null, bible_version: "ULT",
+    content_json: JSON.stringify({ verseObjects }), plain_text: null, version: 1, updated_by: null, updated_at: 0,
+  };
+  const rows = [twl("foo2", 5, 1, "foo", 2, 100)];
+  const { versePositions } = orderTwlRows(rows, [verse]);
+  assert(
+    versePositions.get("foo2") === 0,
+    "foo#2 (the aligned instance) resolves via its OWN occurrence number, not miscounted as foo#1",
+  );
+}
+
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed.`);
   process.exit(1);
