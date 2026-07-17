@@ -519,7 +519,8 @@
       "instructions": "คำแนะนำ",
       "terminology": "คำศัพท์เฉพาะ",
       "examples": "ตัวอย่าง",
-      "localization": "Localization"
+      "localization": "Localization",
+      "users": "Users"
     },
     "localization": {
       "intro": "Edit the {{language}} interface strings. English is shown on the left for reference; edit the {{language}} text on the right. Changes take effect immediately and are shared with everyone using {{language}} on their next load. Switch languages using the language menu in the top bar.",
@@ -529,6 +530,28 @@
       "saveCount": "Save changes ({{count}})",
       "noMatches": "No strings match your search.",
       "placeholderWarning": "Missing placeholder(s): {{tokens}} — keep these so values fill in correctly."
+    },
+    "users": {
+      "title": "User management",
+      "intro": "Grant or remove editor and admin access for Door43 (DCS) usernames. Role changes take effect within about an hour, once each admin's or editor's browser session refreshes. Read-only viewers aren't managed here — they come automatically from Door43 org membership; this list only covers editor and admin access.",
+      "username": "Username",
+      "role": "Role",
+      "added": "Added",
+      "addedBy": "Added by",
+      "roleAdmin": "Admin",
+      "roleEditor": "Editor",
+      "add": "Add",
+      "remove": "Remove",
+      "confirmRemove": "Remove {{username}} from the allowlist?",
+      "loadFailed": "Could not load the user list.",
+      "retry": "Retry",
+      "unverified": "Could not verify this username with Door43 — added anyway.",
+      "errors": {
+        "invalid_username": "That doesn't look like a valid Door43 username.",
+        "dcs_user_not_found": "No Door43 user found with that username.",
+        "last_admin": "Can't remove or demote the last remaining admin.",
+        "not_found": "That user isn't in the allowlist."
+      }
     },
     "save": "บันทึก",
     "cancel": "ยกเลิก",

@@ -551,6 +551,16 @@ async function request<T>(
 
 export type Role = "admin" | "editor" | "viewer";
 
+// user_roles allowlist row (api/src/adminUserRoutes.ts). role is really only
+// "admin"|"editor" here (viewers come from DCS org membership, not this
+// table) but Role is reused since the narrower union buys nothing.
+export interface AdminUser {
+  username: string;
+  role: Role;
+  addedAt: number | null;
+  addedBy: string | null;
+}
+
 export interface MeResponse {
   userId: number;
   username: string | null;
@@ -1833,4 +1843,16 @@ export const api = {
         body: JSON.stringify({ ...patch, configRevision }),
       },
     ),
+
+  // ── Admin user allowlist (migration 0016) ──
+  adminListUsers: () => request<{ users: AdminUser[] }>(`/api/admin/users`),
+  adminSetUserRole: (username: string, role: "admin" | "editor") =>
+    request<{ user: AdminUser; dcsVerified: boolean }>(
+      `/api/admin/users/${encodeURIComponent(username)}`,
+      { method: "PUT", body: JSON.stringify({ role }) },
+    ),
+  adminRemoveUser: (username: string) =>
+    request<{ ok: true }>(`/api/admin/users/${encodeURIComponent(username)}`, {
+      method: "DELETE",
+    }),
 };

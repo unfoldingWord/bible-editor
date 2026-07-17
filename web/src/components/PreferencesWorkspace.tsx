@@ -63,6 +63,7 @@ import {
 import { MarkdownView } from "./MarkdownView";
 import { useOrgDraft, OrgDraftFields } from "./OrgConfigDraftEditor";
 import { SetupWizard } from "./SetupWizard";
+import { UserManagementSection } from "./UserManagementSection";
 import { UI_LANGUAGES, dirForLang } from "../i18n";
 import {
   flattenEn,
@@ -114,14 +115,22 @@ function laneErrorMessage(
   return raw;
 }
 
-export type Section = "brief" | "instructions" | "terminology" | "examples" | "setup" | "localization";
+export type Section =
+  | "brief"
+  | "instructions"
+  | "terminology"
+  | "examples"
+  | "setup"
+  | "localization"
+  | "users";
 // Memory sections shown in the rail when a translation project + memory are
-// available. "setup" and "localization" are admin-only and gated separately
-// (they must show regardless of project type / memory), so they aren't listed.
+// available. "setup", "localization", and "users" are admin-only and gated
+// separately (they must show regardless of project type / memory), so they
+// aren't listed.
 export const SECTIONS: Section[] = ["brief", "instructions", "terminology", "examples"];
-// Every routable section (memory + the admin-only setup wizard + localization
-// editor) — used for hash-route validation in App.tsx.
-export const ALL_SECTIONS: Section[] = [...SECTIONS, "setup", "localization"];
+// Every routable section (memory + the admin-only setup wizard, localization
+// editor, and user management) — used for hash-route validation in App.tsx.
+export const ALL_SECTIONS: Section[] = [...SECTIONS, "setup", "localization", "users"];
 
 // Term-status → semantic palette (design §10). Not the violet AI identity —
 // status is not an AI-draft state.
@@ -248,6 +257,24 @@ export function PreferencesWorkspace({ onNavigate, section, role }: Props) {
               </Typography>
             </Box>
           )}
+          {role === "admin" && (
+            <Box
+              onClick={() => onNavigate("users")}
+              sx={{
+                px: 1.5,
+                py: 0.9,
+                cursor: "pointer",
+                borderInlineStart: "3px solid",
+                borderColor: section === "users" ? "primary.main" : "transparent",
+                bgcolor: section === "users" ? (theme) => alpha(theme.palette.primary.main, 0.08) : "transparent",
+                "&:hover": { bgcolor: "action.hover" },
+              }}
+            >
+              <Typography variant="body2" sx={{ fontWeight: section === "users" ? 700 : 400 }}>
+                {t("preferences.section.users")}
+              </Typography>
+            </Box>
+          )}
         </Box>
       </Box>
 
@@ -258,6 +285,8 @@ export function PreferencesWorkspace({ onNavigate, section, role }: Props) {
             <SetupWizard />
           ) : section === "localization" && role === "admin" ? (
             <LocalizationSection />
+          ) : section === "users" && role === "admin" ? (
+            <UserManagementSection />
           ) : (
           <>
           <ProjectModeControl cfg={cfg} role={role} />
