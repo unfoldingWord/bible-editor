@@ -61,6 +61,7 @@ import { classifyReimportRow, isReimportableRow } from "./reimportClassify";
 import { computeTwlSortOrderUpdates } from "./twlCanonicalOrder";
 import { applyTwlSortOrderUpdates } from "./twlSortOrderApply";
 import { loadTwTitles } from "./twTitles";
+import { loadTwlOrderLocks } from "./twlOrderLocks";
 import type { TwlRow, VerseRow } from "./types";
 
 export type Resource = "ult" | "ust" | "tn" | "tq" | "twl";
@@ -174,9 +175,11 @@ function addCounts(into: ReimportCounts, from: ReimportCounts): void {
 // (computeTwlSortOrderUpdates). TWL order is derived from ULT word position, not
 // preserved: classifyReimportRow deliberately no-ops a content-identical twl row's
 // sort_order (the HOS reorder-revert fix), so canonical order is owned here.
-// Positional metadata only — never touches content/updated_by, never logs edit
-// history; idempotent (empty diff when already canonical). Callers must have ULT
-// verses current in D1 first. Returns the number of rows re-sequenced.
+// Verses locked in twl_order_locks (a translator manually reordered them) are
+// excluded — their stored sort_order stands untouched. Positional metadata
+// only — never touches content/updated_by, never logs edit history; idempotent
+// (empty diff when already canonical). Callers must have ULT verses current in
+// D1 first. Returns the number of rows re-sequenced.
 async function canonicalizeTwlOrder(env: Env, book: string): Promise<number> {
   const twlRows = await env.DB.prepare(
     `SELECT * FROM twl_rows WHERE book = ?1 AND deleted_at IS NULL
@@ -194,6 +197,7 @@ async function canonicalizeTwlOrder(env: Env, book: string): Promise<number> {
     twlRows.results,
     ultVerses.results,
     await loadTwTitles(env.DB),
+    await loadTwlOrderLocks(env.DB, book),
   );
   await applyTwlSortOrderUpdates(env.DB, book, updates);
   return updates.length;

@@ -6,6 +6,7 @@ import type {
   CheckLane,
   TnRow,
   TqRow,
+  TwlOrderLock,
   TwlRow,
   VerseRow,
   VerseDto,
@@ -22,6 +23,9 @@ import {
   logCorruptContentJson,
   parseVerseContentJson,
 } from "./contentJson.ts";
+import { computeTwlSortOrderUpdates } from "./twlCanonicalOrder";
+import { applyTwlSortOrderUpdates } from "./twlSortOrderApply";
+import { loadTwTitles } from "./twTitles";
 
 export const chapters = new Hono<{ Bindings: Env; Variables: { userId?: number } }>();
 
@@ -44,7 +48,7 @@ chapters.get("/:book/:chapter", async (c) => {
   // cross-book id collisions can't leak the wrong source chip. Pre-0017
   // audit rows have NULL book; the `OR book IS NULL` keeps them visible
   // until the next edit naturally backfills.
-  const [verses, tn, tq, twl, statuses, laneChecks] = await Promise.all([
+  const [verses, tn, tq, twl, statuses, laneChecks, twlOrderLocks] = await Promise.all([
     db
       .prepare(
         "SELECT * FROM verses WHERE book = ?1 AND chapter = ?2 ORDER BY verse, bible_version",
@@ -97,6 +101,12 @@ chapters.get("/:book/:chapter", async (c) => {
       )
       .bind(book, chapter)
       .all<VerseLaneCheck>(),
+    db
+      .prepare(
+        "SELECT verse, locked_by, locked_at, dismissed_order FROM twl_order_locks WHERE book = ?1 AND chapter = ?2",
+      )
+      .bind(book, chapter)
+      .all<TwlOrderLock>(),
   ]);
 
   // Reshape verses → verses[bibleVersion][verseNum] = VerseDto for easy client lookup.
@@ -141,6 +151,7 @@ chapters.get("/:book/:chapter", async (c) => {
     twl: twl.results,
     verseStatuses: statuses.results,
     verseLaneChecks: laneChecks.results,
+    twlOrderLocks: twlOrderLocks.results,
   };
   return c.json(payload);
 });
@@ -329,6 +340,149 @@ chapters.patch("/:book/:chapter/lanes/:lane/bulk", requireEditor, async (c) => {
     }),
   );
   return c.json({ book, chapter, lane, checks: all.results });
+});
+
+// --- TWL manual order lock ---
+//
+// Locking a verse means a human owns its TWL row order; automatic canonical
+// ordering (reimport post-pass, export) must skip it. Unlocking hands the
+// verse back to automatic ordering, so we immediately recompute canonical
+// sort_order for that verse (best-effort — the nightly pass will catch up
+// if it fails).
+
+async function twlOrderLockRow(
+  db: D1Database,
+  book: string,
+  chapter: number,
+  verse: number,
+): Promise<TwlOrderLock | null> {
+  return db
+    .prepare(
+      `SELECT verse, locked_by, locked_at, dismissed_order FROM twl_order_locks
+        WHERE book = ?1 AND chapter = ?2 AND verse = ?3`,
+    )
+    .bind(book, chapter, verse)
+    .first<TwlOrderLock>();
+}
+
+// Take the verse manual: upsert the lock, leaving dismissed_order untouched.
+const TwlOrderLockPut = z.object({ verse: z.number().int().min(0) });
+chapters.put("/:book/:chapter/twl-order-lock", requireEditor, async (c) => {
+  const book = c.req.param("book").toUpperCase();
+  const chapter = parseInt(c.req.param("chapter"), 10);
+  if (!book || !Number.isFinite(chapter)) {
+    return c.json({ error: "invalid_params" }, 400);
+  }
+  let body: unknown;
+  try {
+    body = await c.req.json();
+  } catch {
+    return c.json({ error: "invalid_body" }, 400);
+  }
+  const parsed = TwlOrderLockPut.safeParse(body);
+  if (!parsed.success) return c.json({ error: "invalid_body" }, 400);
+  const verse = parsed.data.verse;
+  const userId = currentUserId(c);
+  const now = Math.floor(Date.now() / 1000);
+  await c.env.DB.prepare(
+    `INSERT INTO twl_order_locks (book, chapter, verse, locked_by, locked_at)
+     VALUES (?1,?2,?3,?4,?5)
+     ON CONFLICT(book, chapter, verse) DO UPDATE SET locked_by = ?4, locked_at = ?5`,
+  )
+    .bind(book, chapter, verse, userId, now)
+    .run();
+  const lock = await twlOrderLockRow(c.env.DB, book, chapter, verse);
+  c.executionCtx.waitUntil(
+    broadcastChapter(c.env, book, chapter, { type: "twl_order_lock.updated", verseNum: verse, lock }),
+  );
+  return c.json(lock);
+});
+
+// Hand the verse back to automatic ordering: drop the lock, then re-derive
+// canonical sort_order for just this verse so the nightly export doesn't
+// ship the stale manual order.
+chapters.delete("/:book/:chapter/twl-order-lock", requireEditor, async (c) => {
+  const book = c.req.param("book").toUpperCase();
+  const chapter = parseInt(c.req.param("chapter"), 10);
+  const verse = parseInt(c.req.query("verse") ?? "", 10);
+  if (!book || !Number.isFinite(chapter) || !Number.isFinite(verse)) {
+    return c.json({ error: "invalid_params" }, 400);
+  }
+  await c.env.DB.prepare(
+    `DELETE FROM twl_order_locks WHERE book = ?1 AND chapter = ?2 AND verse = ?3`,
+  )
+    .bind(book, chapter, verse)
+    .run();
+
+  try {
+    const [twlRows, ultVerse] = await Promise.all([
+      c.env.DB.prepare(
+        `SELECT * FROM twl_rows WHERE book = ?1 AND chapter = ?2 AND verse = ?3 AND deleted_at IS NULL
+         ORDER BY sort_order ASC NULLS LAST, id`,
+      )
+        .bind(book, chapter, verse)
+        .all<TwlRow>(),
+      c.env.DB.prepare(
+        `SELECT * FROM verses WHERE book = ?1 AND chapter = ?2 AND verse = ?3 AND bible_version = 'ULT'`,
+      )
+        .bind(book, chapter, verse)
+        .all<VerseRow>(),
+    ]);
+    const updates = computeTwlSortOrderUpdates(
+      twlRows.results,
+      ultVerse.results,
+      await loadTwTitles(c.env.DB),
+    );
+    await applyTwlSortOrderUpdates(c.env.DB, book, updates);
+  } catch (e) {
+    // Best-effort, mirroring applyTwlSortOrderUpdates's own posture: the lock
+    // release is the user's intent and must succeed regardless. The nightly
+    // reimport/export pass will re-derive canonical order if this hiccups.
+    console.error("twl-order-lock delete: re-sequence failed", {
+      book,
+      chapter,
+      verse,
+      error: e instanceof Error ? e.message : String(e),
+    });
+  }
+
+  c.executionCtx.waitUntil(
+    broadcastChapter(c.env, book, chapter, { type: "twl_order_lock.updated", verseNum: verse, lock: null }),
+  );
+  return c.json(null);
+});
+
+// "Keep mine": record the client's snapshot of the order it dismissed a
+// reorder prompt for, so it can detect if automatic order changes again.
+const TwlOrderLockDismiss = z.object({
+  verse: z.number().int().min(0),
+  dismissed_order: z.string().max(4000),
+});
+chapters.patch("/:book/:chapter/twl-order-lock", requireEditor, async (c) => {
+  const book = c.req.param("book").toUpperCase();
+  const chapter = parseInt(c.req.param("chapter"), 10);
+  if (!book || !Number.isFinite(chapter)) {
+    return c.json({ error: "invalid_params" }, 400);
+  }
+  let body: unknown;
+  try {
+    body = await c.req.json();
+  } catch {
+    return c.json({ error: "invalid_body" }, 400);
+  }
+  const parsed = TwlOrderLockDismiss.safeParse(body);
+  if (!parsed.success) return c.json({ error: "invalid_body" }, 400);
+  const { verse, dismissed_order } = parsed.data;
+  await c.env.DB.prepare(
+    `UPDATE twl_order_locks SET dismissed_order = ?4 WHERE book = ?1 AND chapter = ?2 AND verse = ?3`,
+  )
+    .bind(book, chapter, verse, dismissed_order)
+    .run();
+  const lock = await twlOrderLockRow(c.env.DB, book, chapter, verse);
+  c.executionCtx.waitUntil(
+    broadcastChapter(c.env, book, chapter, { type: "twl_order_lock.updated", verseNum: verse, lock }),
+  );
+  return c.json(lock);
 });
 
 // Book-level summary: chapter list + row counts. Useful for the timeline.

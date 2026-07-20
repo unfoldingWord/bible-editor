@@ -319,3 +319,42 @@ export function canonicalTwlOrder<
     })
     .map((x) => x.row);
 }
+
+// The order a HUMAN gave the verse: stored sort_order, nulls last, stable by
+// original index. Used when the verse carries a manual-order lock — see
+// twlDisplayOrder. Deliberately the same tiebreak chain canonicalTwlOrder falls
+// back to, so a locked verse whose rows all resolve identically doesn't shuffle.
+export function manualTwlOrder<T extends { sort_order: number | null }>(rows: T[]): T[] {
+  return rows
+    .map((row, originalIndex) => ({ row, originalIndex }))
+    .sort((a, b) => {
+      const aSort = a.row.sort_order ?? Number.POSITIVE_INFINITY;
+      const bSort = b.row.sort_order ?? Number.POSITIVE_INFINITY;
+      if (aSort !== bSort) return aSort - bSort;
+      return a.originalIndex - b.originalIndex;
+    })
+    .map((x) => x.row);
+}
+
+// The order to SHOW for a verse. Every display surface goes through here so the
+// manual/automatic split is decided in exactly one place: a verse is either
+// automatic (ordered from the ULT alignment) or manual (ordered by the human),
+// never a blend of the two — blending is what made "canonical plus overrides"
+// unworkable the first time. The lock lives server-side in twl_order_locks and
+// is mirrored into the chapter payload; the API honours the same split in its
+// export and reimport passes (api/src/twlCanonicalOrder.ts orderTwlRows).
+export function twlDisplayOrder<
+  T extends {
+    orig_words: string | null;
+    occurrence: number | null;
+    sort_order: number | null;
+    tw_link?: string | null;
+  },
+>(
+  rows: T[],
+  verseObjects: unknown[] | null | undefined,
+  twTitles?: Map<string, string> | null,
+  locked?: boolean,
+): T[] {
+  return locked ? manualTwlOrder(rows) : canonicalTwlOrder(rows, verseObjects, twTitles);
+}

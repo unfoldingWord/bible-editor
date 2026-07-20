@@ -133,6 +133,7 @@ export function buildTwlTsv(rows: TwlRow[], input?: UsfmInputs): TwlTsvResult {
     rows,
     input?.verses ?? [],
     input?.twTitles ?? null,
+    input?.lockedVerses ?? null,
   );
 
   const body = referenceOrdered
@@ -369,6 +370,10 @@ export interface UsfmInputs {
   // twlCanonicalOrder.ts). Only buildTwlTsv reads it; omitted/empty means
   // ordering falls back to its pre-headword behaviour.
   twTitles?: Map<string, string>;
+  // Verses (keys `${chapter}:${verse}`) whose TWL order is manually locked
+  // (twl_order_locks via twlOrderLocks.ts). Only buildTwlTsv reads it;
+  // omitted/empty means every verse is canonically reordered as before.
+  lockedVerses?: Set<string> | null;
 }
 
 // Mirror of `recomputeTargetOccurrences` in importParsers.ts (kept local to

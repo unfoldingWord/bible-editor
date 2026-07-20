@@ -15,6 +15,8 @@
 
 import {
   canonicalTwlOrder,
+  manualTwlOrder,
+  twlDisplayOrder,
   buildUltSequenceMap,
   twlSortPosition,
   twlAnchorContext,
@@ -629,6 +631,55 @@ function ultVerseOccSpans(chapter, verse, spans) {
     twlSortPosition(row, map, twlAnchorContext(null, new Map([["x", "# y"]]))) === 2,
     "null tw_link → tier 2, no throw",
   );
+}
+
+// ─── Manual-order lock ───────────────────────────────────────────────────────
+// Mirrors api/src/twlCanonicalOrder.test.mjs's [locked] cases. The whole point
+// of the lock: a verse is EITHER automatic OR manual, never a blend, and the
+// human's order is not re-derived from the ULT behind their back.
+{
+  console.log("\n[locked] a locked verse renders in the human's stored order");
+  const vo = ultVerseObjects([
+    { content: "א", text: "first" },
+    { content: "ב", text: "second" },
+    { content: "ג", text: "third" },
+  ]);
+  // Stored order deliberately DISAGREES with ULT position: the human moved
+  // "third" to the front and "first" to the back.
+  const rows = [
+    twl("a", "א", 1, 300),
+    twl("b", "ב", 1, 200),
+    twl("g", "ג", 1, 100),
+  ];
+
+  assert(
+    ids(canonicalTwlOrder(rows, vo, null)).join(",") === "a,b,g",
+    "unlocked: automatic ordering still follows ULT position (a,b,g)",
+  );
+  assert(
+    ids(manualTwlOrder(rows)).join(",") === "g,b,a",
+    "manual ordering follows stored sort_order (g,b,a)",
+  );
+  assert(
+    ids(twlDisplayOrder(rows, vo, null, true)).join(",") === "g,b,a",
+    "locked verse displays the human's order, NOT the ULT order",
+  );
+  assert(
+    ids(twlDisplayOrder(rows, vo, null, false)).join(",") === "a,b,g",
+    "unlocked verse displays the automatic order",
+  );
+  assert(
+    ids(twlDisplayOrder(rows, vo, null)).join(",") === "a,b,g",
+    "omitting the lock flag is exactly the pre-lock behaviour",
+  );
+}
+
+{
+  console.log("\n[locked] a manual verse with no stored order stays stable");
+  // sort_order nulls sort last and keep their input order — a locked verse whose
+  // rows were never renumbered must not shuffle at random.
+  const rows = [twl("x", "א", 1, null), twl("y", "ב", 1, null), twl("z", "ג", 1, null)];
+  assert(ids(manualTwlOrder(rows)).join(",") === "x,y,z", "all-null sort_order keeps input order");
 }
 
 if (failed > 0) {
