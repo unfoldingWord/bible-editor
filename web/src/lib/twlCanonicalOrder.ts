@@ -23,6 +23,19 @@
 //   3. else the span's first English word.
 // Tier 3 is exactly the pre-headword behaviour (the lowest English index in the
 // span), so any row we cannot headword-match keeps the position it has today.
+//
+// MANUAL ORDER LOCKS. A verse whose TWL order a human set by hand is excluded
+// from canonical ordering everywhere — nightly export, reimport post-pass, and
+// here. `twlDisplayOrder` at the bottom of this file is the one place that
+// decides manual vs automatic for the client; `manualTwlOrder` is the manual
+// half. The API mirrors this in `orderTwlRows`'s locked-bucket branch — SECOND
+// intentional shape difference from the server file (the first being
+// verseObjects vs VerseRow): the server applies the same comparator inline on
+// its verse bucket rather than through an exported function, because it sorts
+// decorated `{row, originalIndex}` pairs it already has in hand. The comparator
+// itself — sort_order asc with nulls last, then original position — must stay
+// identical on both sides, or a locked verse renders in one order and exports
+// in another.
 
 import { headwordTermsFromTitle, isFunctionWord, matchesHeadword } from "./twHeadword.ts";
 

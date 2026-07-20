@@ -259,6 +259,13 @@ async function importBookFromDcs(
     env.DB.prepare(`DELETE FROM twl_rows WHERE book = ?1`).bind(book),
     env.DB.prepare(`DELETE FROM verses   WHERE book = ?1`).bind(book),
     env.DB.prepare(`DELETE FROM book_usfm_meta WHERE book = ?1`).bind(book),
+    // Manual TWL order locks go too. They deliberately SURVIVE a reimport (the
+    // rows are matched by id and the human's order still applies), but a full
+    // import is a reset to DCS truth: every twl row above is deleted and
+    // re-inserted in file order, so a surviving lock would pin whatever DCS
+    // happened to ship and label it "a human ordered this" with no human
+    // involved — and permanently exclude those verses from canonical ordering.
+    env.DB.prepare(`DELETE FROM twl_order_locks WHERE book = ?1`).bind(book),
   ]);
 
   const counts: ImportCounts = {

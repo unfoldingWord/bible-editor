@@ -33,6 +33,14 @@ import { parseVerseContentJson } from "./contentJson.ts";
 import { sortRowsByReference } from "./tsvFormat.ts";
 import { headwordTermsFromTitle, isFunctionWord, matchesHeadword } from "./twHeadword.ts";
 
+// The per-verse key shared by the bucket map below and the lock set loaded in
+// twlOrderLocks.ts. It lives HERE, in the consumer that has to match it, because
+// the lock gate fails open: a drifted key format would silently reorder locked
+// verses again — no type error, no failing unlocked test.
+export function twlLockKey(chapter: number, verse: number): string {
+  return `${chapter}:${verse}`;
+}
+
 // Sequence TWLs by position of Hebrew word in aligned ULT.
 export function normalizeWordText(s: string | null | undefined): string {
   if (s == null) return "";
@@ -320,7 +328,7 @@ export function orderTwlRows(
 
   // Group rows by verse
   for (const [originalIndex, row] of referenceOrdered.entries()) {
-    const key = `${row.chapter}:${row.verse}`;
+    const key = twlLockKey(row.chapter, row.verse);
     const bucket = verseRows.get(key) ?? [];
     bucket.push({ row, originalIndex });
     verseRows.set(key, bucket);

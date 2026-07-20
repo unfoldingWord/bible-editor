@@ -270,7 +270,7 @@ function WordsTableInner({ rows, activeId, onSave, onDelete, onFocus, onReorder,
                         {
                           verse: r.verse,
                           movedId: r.id,
-                          prevId: idx > 1 ? samePeers[idx - 2].id : null,
+                          prevId: samePeers[idx - 2]?.id ?? null,
                           nextId: prevWord.id,
                         },
                         true,
@@ -288,28 +288,25 @@ function WordsTableInner({ rows, activeId, onSave, onDelete, onFocus, onReorder,
                           verse: r.verse,
                           movedId: r.id,
                           prevId: nextWord.id,
-                          nextId: idx + 2 < samePeers.length ? samePeers[idx + 2].id : null,
+                          nextId: samePeers[idx + 2]?.id ?? null,
                         },
                         true,
                       );
                     }
                   : undefined
               }
-              onReorderHover={
-                onReorderPreview
-                  ? (entering) =>
-                      onReorderPreview(
-                        entering
-                          ? {
-                              verse: r.verse,
-                              movedId: r.id,
-                              prevId: prevWord?.id ?? null,
-                              nextId: nextWord?.id ?? null,
-                            }
-                          : null,
-                        false,
-                      )
-                  : undefined
+              onReorderHover={(entering) =>
+                onReorderPreview?.(
+                  entering
+                    ? {
+                        verse: r.verse,
+                        movedId: r.id,
+                        prevId: prevWord?.id ?? null,
+                        nextId: nextWord?.id ?? null,
+                      }
+                    : null,
+                  false,
+                )
               }
               flashArrow={recentMove?.id === r.id ? recentMove.dir : null}
               onHoverPreview={onHoverPreview}

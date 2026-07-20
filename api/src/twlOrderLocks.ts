@@ -9,9 +9,13 @@
 // means canonical ordering runs for every verse, which is today's (pre-lock)
 // behaviour. So this is best-effort: log and return an empty Set on error.
 
-export function twlLockKey(chapter: number, verse: number): string {
-  return `${chapter}:${verse}`;
-}
+// The key format is owned by the CONSUMER (twlCanonicalOrder.ts builds the same
+// key for each verse bucket and looks it up here). Defining it there and
+// importing it means the two are one expression, not two string literals in two
+// files that happen to agree — this gate fails OPEN, so a drifted key would
+// silently reorder locked verses again with no type error and no test failure.
+export { twlLockKey } from "./twlCanonicalOrder.ts";
+import { twlLockKey } from "./twlCanonicalOrder.ts";
 
 export async function loadTwlOrderLocks(db: D1Database, book: string): Promise<Set<string>> {
   try {

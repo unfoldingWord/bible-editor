@@ -1,4 +1,5 @@
 import { Hono } from "hono";
+import type { Context } from "hono";
 import { z } from "zod";
 import type { Env } from "./index";
 import type {
@@ -25,9 +26,9 @@ import {
 } from "./contentJson.ts";
 import { computeTwlSortOrderUpdates } from "./twlCanonicalOrder";
 import { applyTwlSortOrderUpdates } from "./twlSortOrderApply";
-import { loadTwTitles } from "./twTitles";
 
 export const chapters = new Hono<{ Bindings: Env; Variables: { userId?: number } }>();
+type AppContext = Context<{ Bindings: Env; Variables: { userId?: number } }>;
 
 // Bulk read everything for a chapter.
 chapters.get("/:book/:chapter", async (c) => {
@@ -350,64 +351,80 @@ chapters.patch("/:book/:chapter/lanes/:lane/bulk", requireEditor, async (c) => {
 // sort_order for that verse (best-effort — the nightly pass will catch up
 // if it fails).
 
-async function twlOrderLockRow(
-  db: D1Database,
+// Shared preamble for the three routes below: book/chapter come from the URL
+// the same way the rest of the file parses them, so this just avoids
+// triplicating the parse + validate.
+function parseBookChapter(c: AppContext): { book: string; chapter: number } | null {
+  const book = (c.req.param("book") ?? "").toUpperCase();
+  const chapter = parseInt(c.req.param("chapter") ?? "", 10);
+  if (!book || !Number.isFinite(chapter)) return null;
+  return { book, chapter };
+}
+
+// Shared JSON-body read + zod validate for the two write routes. Returns
+// null on either a malformed body or a schema mismatch; callers can't tell
+// the two apart, but neither could the pre-refactor duplicated code — both
+// paths already returned the same "invalid_body" response.
+async function readBody<T>(c: AppContext, schema: z.ZodType<T>): Promise<T | null> {
+  let body: unknown;
+  try {
+    body = await c.req.json();
+  } catch {
+    return null;
+  }
+  const parsed = schema.safeParse(body);
+  return parsed.success ? parsed.data : null;
+}
+
+// PUT and PATCH both write, then re-fetch-and-broadcast the same shape.
+// Centralized so the two write paths can't drift on the broadcast payload.
+function broadcastTwlOrderLock(
+  c: AppContext,
   book: string,
   chapter: number,
   verse: number,
-): Promise<TwlOrderLock | null> {
-  return db
-    .prepare(
-      `SELECT verse, locked_by, locked_at, dismissed_order FROM twl_order_locks
-        WHERE book = ?1 AND chapter = ?2 AND verse = ?3`,
-    )
-    .bind(book, chapter, verse)
-    .first<TwlOrderLock>();
+  lock: TwlOrderLock | null,
+) {
+  c.executionCtx.waitUntil(
+    broadcastChapter(c.env, book, chapter, { type: "twl_order_lock.updated", verseNum: verse, lock }),
+  );
+  return c.json(lock);
 }
 
 // Take the verse manual: upsert the lock, leaving dismissed_order untouched.
 const TwlOrderLockPut = z.object({ verse: z.number().int().min(0) });
 chapters.put("/:book/:chapter/twl-order-lock", requireEditor, async (c) => {
-  const book = c.req.param("book").toUpperCase();
-  const chapter = parseInt(c.req.param("chapter"), 10);
-  if (!book || !Number.isFinite(chapter)) {
-    return c.json({ error: "invalid_params" }, 400);
-  }
-  let body: unknown;
-  try {
-    body = await c.req.json();
-  } catch {
-    return c.json({ error: "invalid_body" }, 400);
-  }
-  const parsed = TwlOrderLockPut.safeParse(body);
-  if (!parsed.success) return c.json({ error: "invalid_body" }, 400);
-  const verse = parsed.data.verse;
+  const bc = parseBookChapter(c);
+  if (!bc) return c.json({ error: "invalid_params" }, 400);
+  const { book, chapter } = bc;
+  const parsed = await readBody(c, TwlOrderLockPut);
+  if (!parsed) return c.json({ error: "invalid_body" }, 400);
+  const verse = parsed.verse;
   const userId = currentUserId(c);
   const now = Math.floor(Date.now() / 1000);
-  await c.env.DB.prepare(
+  // RETURNING avoids a second D1 subrequest just to echo the row back — this
+  // fires on the first drag of every verse a translator reorders.
+  const lock = await c.env.DB.prepare(
     `INSERT INTO twl_order_locks (book, chapter, verse, locked_by, locked_at)
      VALUES (?1,?2,?3,?4,?5)
-     ON CONFLICT(book, chapter, verse) DO UPDATE SET locked_by = ?4, locked_at = ?5`,
+     ON CONFLICT(book, chapter, verse) DO UPDATE SET locked_by = ?4, locked_at = ?5
+     RETURNING verse, locked_by, locked_at, dismissed_order`,
   )
     .bind(book, chapter, verse, userId, now)
-    .run();
-  const lock = await twlOrderLockRow(c.env.DB, book, chapter, verse);
-  c.executionCtx.waitUntil(
-    broadcastChapter(c.env, book, chapter, { type: "twl_order_lock.updated", verseNum: verse, lock }),
-  );
-  return c.json(lock);
+    .first<TwlOrderLock>();
+  return broadcastTwlOrderLock(c, book, chapter, verse, lock);
 });
 
 // Hand the verse back to automatic ordering: drop the lock, then re-derive
 // canonical sort_order for just this verse so the nightly export doesn't
 // ship the stale manual order.
 chapters.delete("/:book/:chapter/twl-order-lock", requireEditor, async (c) => {
-  const book = c.req.param("book").toUpperCase();
-  const chapter = parseInt(c.req.param("chapter"), 10);
+  const bc = parseBookChapter(c);
   const verse = parseInt(c.req.query("verse") ?? "", 10);
-  if (!book || !Number.isFinite(chapter) || !Number.isFinite(verse)) {
+  if (!bc || !Number.isFinite(verse)) {
     return c.json({ error: "invalid_params" }, 400);
   }
+  const { book, chapter } = bc;
   await c.env.DB.prepare(
     `DELETE FROM twl_order_locks WHERE book = ?1 AND chapter = ?2 AND verse = ?3`,
   )
@@ -415,25 +432,41 @@ chapters.delete("/:book/:chapter/twl-order-lock", requireEditor, async (c) => {
     .run();
 
   try {
-    const [twlRows, ultVerse] = await Promise.all([
-      c.env.DB.prepare(
-        `SELECT * FROM twl_rows WHERE book = ?1 AND chapter = ?2 AND verse = ?3 AND deleted_at IS NULL
-         ORDER BY sort_order ASC NULLS LAST, id`,
-      )
-        .bind(book, chapter, verse)
-        .all<TwlRow>(),
-      c.env.DB.prepare(
-        `SELECT * FROM verses WHERE book = ?1 AND chapter = ?2 AND verse = ?3 AND bible_version = 'ULT'`,
-      )
-        .bind(book, chapter, verse)
-        .all<VerseRow>(),
-    ]);
-    const updates = computeTwlSortOrderUpdates(
-      twlRows.results,
-      ultVerse.results,
-      await loadTwTitles(c.env.DB),
-    );
-    await applyTwlSortOrderUpdates(c.env.DB, book, updates);
+    const twlRows = await c.env.DB.prepare(
+      `SELECT * FROM twl_rows WHERE book = ?1 AND chapter = ?2 AND verse = ?3 AND deleted_at IS NULL
+       ORDER BY sort_order ASC NULLS LAST, id`,
+    )
+      .bind(book, chapter, verse)
+      .all<TwlRow>();
+    // This click doesn't warrant the export/reimport callers' full-book
+    // article scan below — skip it entirely when there's nothing to reorder.
+    if (twlRows.results.length > 0) {
+      const links = [...new Set(twlRows.results.map((r) => r.tw_link).filter((l): l is string => !!l))];
+      const [ultVerse, twTitles] = await Promise.all([
+        c.env.DB.prepare(
+          `SELECT * FROM verses WHERE book = ?1 AND chapter = ?2 AND verse = ?3 AND bible_version = 'ULT'`,
+        )
+          .bind(book, chapter, verse)
+          .all<VerseRow>(),
+        // Scope the titles query to just this verse's links instead of
+        // loadTwTitles' unfiltered ~1k-row scan — that's fine once per book
+        // (export/reimport) but disproportionate for one interactive unlock.
+        links.length > 0
+          ? c.env.DB.prepare(
+              `SELECT tw_link, title FROM tw_articles WHERE tw_link IN (${links.map((_, i) => `?${i + 1}`).join(",")})`,
+            )
+              .bind(...links)
+              .all<{ tw_link: string; title: string }>()
+              .then((rs) => {
+                const map = new Map<string, string>();
+                for (const r of rs.results) map.set(r.tw_link, r.title);
+                return map;
+              })
+          : Promise.resolve(new Map<string, string>()),
+      ]);
+      const updates = computeTwlSortOrderUpdates(twlRows.results, ultVerse.results, twTitles);
+      await applyTwlSortOrderUpdates(c.env.DB, book, updates);
+    }
   } catch (e) {
     // Best-effort, mirroring applyTwlSortOrderUpdates's own posture: the lock
     // release is the user's intent and must succeed regardless. The nightly
@@ -459,30 +492,22 @@ const TwlOrderLockDismiss = z.object({
   dismissed_order: z.string().max(4000),
 });
 chapters.patch("/:book/:chapter/twl-order-lock", requireEditor, async (c) => {
-  const book = c.req.param("book").toUpperCase();
-  const chapter = parseInt(c.req.param("chapter"), 10);
-  if (!book || !Number.isFinite(chapter)) {
-    return c.json({ error: "invalid_params" }, 400);
-  }
-  let body: unknown;
-  try {
-    body = await c.req.json();
-  } catch {
-    return c.json({ error: "invalid_body" }, 400);
-  }
-  const parsed = TwlOrderLockDismiss.safeParse(body);
-  if (!parsed.success) return c.json({ error: "invalid_body" }, 400);
-  const { verse, dismissed_order } = parsed.data;
-  await c.env.DB.prepare(
-    `UPDATE twl_order_locks SET dismissed_order = ?4 WHERE book = ?1 AND chapter = ?2 AND verse = ?3`,
+  const bc = parseBookChapter(c);
+  if (!bc) return c.json({ error: "invalid_params" }, 400);
+  const { book, chapter } = bc;
+  const parsed = await readBody(c, TwlOrderLockDismiss);
+  if (!parsed) return c.json({ error: "invalid_body" }, 400);
+  const { verse, dismissed_order } = parsed;
+  // RETURNING avoids a second D1 subrequest just to echo the row back. When
+  // no lock exists for this verse, the UPDATE matches zero rows and
+  // RETURNING yields none, so .first() returns null — same as before.
+  const lock = await c.env.DB.prepare(
+    `UPDATE twl_order_locks SET dismissed_order = ?4 WHERE book = ?1 AND chapter = ?2 AND verse = ?3
+     RETURNING verse, locked_by, locked_at, dismissed_order`,
   )
     .bind(book, chapter, verse, dismissed_order)
-    .run();
-  const lock = await twlOrderLockRow(c.env.DB, book, chapter, verse);
-  c.executionCtx.waitUntil(
-    broadcastChapter(c.env, book, chapter, { type: "twl_order_lock.updated", verseNum: verse, lock }),
-  );
-  return c.json(lock);
+    .first<TwlOrderLock>();
+  return broadcastTwlOrderLock(c, book, chapter, verse, lock);
 });
 
 // Book-level summary: chapter list + row counts. Useful for the timeline.

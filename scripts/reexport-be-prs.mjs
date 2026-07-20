@@ -96,7 +96,16 @@ function render(book, resource) {
       d1(`SELECT tw_link, title FROM tw_articles WHERE tw_link IS NOT NULL AND title IS NOT NULL`)
         .map((r) => [r.tw_link, r.title]),
     );
-    return { content: rows.length === 0 ? "" : buildTwlTsv(rows, { book, bibleVersion: "ULT", headers: null, verses, twTitles: titles }).tsv, rowCount: rows.length };
+    // Same argument for the manual-order locks: a verse a human has ordered by
+    // hand is excluded from canonical ordering by the nightly export. Without
+    // this set the script would re-derive canonical order for those verses and
+    // push a -be- PR reverting the human's ordering — the exact revert this
+    // feature exists to prevent.
+    const lockedVerses = new Set(
+      d1(`SELECT chapter, verse FROM twl_order_locks WHERE book='${book}'`)
+        .map((r) => `${r.chapter}:${r.verse}`),
+    );
+    return { content: rows.length === 0 ? "" : buildTwlTsv(rows, { book, bibleVersion: "ULT", headers: null, verses, twTitles: titles, lockedVerses }).tsv, rowCount: rows.length };
   }
   const bibleVersion = resource.toUpperCase();
   const verses = d1(`SELECT * FROM verses WHERE book='${book}' AND bible_version='${bibleVersion}' ORDER BY chapter, verse`);

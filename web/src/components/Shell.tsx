@@ -52,7 +52,7 @@ import { buildTnQuickRequest } from "../lib/tnQuickRequest";
 import { findSourceForTargetText, extractTargetSelectionText, type HighlightKey, type ReorderHighlight } from "../lib/highlight";
 import { buildQuoteFromSelection, selectionFromQuote } from "../lib/quoteBuilder";
 import { resolveSpanToSource } from "../lib/twlResolve";
-import { canonicalTwlOrder } from "../lib/twlCanonicalOrder";
+import { canonicalTwlOrder, manualTwlOrder } from "../lib/twlCanonicalOrder";
 import { useCatalogs } from "../hooks/useCatalogs";
 import { nfc } from "../lib/hebrew";
 import { TimelineRail, type VerseTile, type VerseTileLane } from "./TimelineRail";
@@ -1340,7 +1340,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       // the useful judgement), but we slot it into the order the human built
       // rather than re-deriving one they've already overridden.
       const slotList = lockedTwlVerses.has(verse)
-        ? sortedForVerse(data.twl, verse)
+        ? manualTwlOrder(list)
         : canonicalTwlOrder(list, ult ?? null, twTitles);
       const sort_order =
         list.length === 0
@@ -2903,7 +2903,6 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
             setActiveNoteId(id);
           }}
           onReorderPreview={handleReorderPreview}
-          lockedTwlVerses={lockedTwlVerses}
           twlOrderLocks={twlOrderLocks ?? []}
           onTwlOrderUnlock={handleTwlOrderUnlock}
           onTwlOrderDismiss={handleTwlOrderDismiss}
@@ -2959,8 +2958,13 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
             // 100/200/300…, which also materializes the automatic order into
             // sort_order on the way through — exactly what a locked verse needs.
             const rowsForVerse = twl.filter((r) => r.verse === verse);
+            // Seed from the SAME function the Words list renders with — not
+            // sortedForVerse, which breaks sort_order ties on id while
+            // manualTwlOrder breaks them on position. On a verse whose rows were
+            // never renumbered (null or duplicate sort_order) those two disagree,
+            // and the list being renumbered would not be the list on screen.
             const sorted = wasLocked
-              ? sortedForVerse(twl, verse)
+              ? manualTwlOrder(rowsForVerse)
               : canonicalTwlOrder(rowsForVerse, ultVerseObjectsFor(verse), twTitles);
             const changes = reorderSequential(sorted, draggedId, refId, position);
             for (const { row, sort_order } of changes) {

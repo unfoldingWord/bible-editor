@@ -193,11 +193,17 @@ async function canonicalizeTwlOrder(env: Env, book: string): Promise<number> {
   )
     .bind(book)
     .all<VerseRow>();
+  // Independent reads — awaiting them in the argument list would serialize two
+  // D1 round-trips per book for no reason.
+  const [twTitles, lockedVerses] = await Promise.all([
+    loadTwTitles(env.DB),
+    loadTwlOrderLocks(env.DB, book),
+  ]);
   const updates = computeTwlSortOrderUpdates(
     twlRows.results,
     ultVerses.results,
-    await loadTwTitles(env.DB),
-    await loadTwlOrderLocks(env.DB, book),
+    twTitles,
+    lockedVerses,
   );
   await applyTwlSortOrderUpdates(env.DB, book, updates);
   return updates.length;
