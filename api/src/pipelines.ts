@@ -20,6 +20,7 @@ import { z } from "zod";
 import type { Env } from "./index";
 import { currentUserId, requireEditor } from "./auth";
 import { importJobOutput } from "./pipelineImport";
+import { resourcesLockedByJob } from "./chapterLock";
 import { broadcastChapter } from "./wsEvents";
 
 export const pipelines = new Hono<{
@@ -1161,7 +1162,7 @@ pipelines.get("/", requireEditor, async (c) => {
   const columns = `job_id, upstream_job_id, user_id, pipeline_type, book,
             start_chapter, end_chapter, session_key, state, priority,
             current_skill, current_status, error_kind, error_message,
-            output_json, follow_up_job_id, created_at, updated_at,
+            output_json, follow_up_job_id, follow_up_chain, created_at, updated_at,
             last_polled_at, notified_user_at`;
 
   if (stateList === null) {
@@ -1227,11 +1228,20 @@ pipelines.get("/", requireEditor, async (c) => {
             error_message: null,
           }
         : row;
-    if (sanitized.state === "queued") {
-      const pos = snap.positions.get(sanitized.job_id);
-      return { ...sanitized, queue_position: pos?.position ?? null, queue_ahead: pos?.ahead ?? null };
+    // Tell the client which resources this run will overwrite (its own type
+    // plus any pending chain steps) so the editor can lock exactly those lanes
+    // without re-implementing the map. follow_up_chain itself stays server-side
+    // — it carries upstream options the UI has no business seeing.
+    const { follow_up_chain, ...rest } = sanitized;
+    const withLocks = {
+      ...rest,
+      locks_resources: Array.from(resourcesLockedByJob(row.pipeline_type, follow_up_chain)),
+    };
+    if (withLocks.state === "queued") {
+      const pos = snap.positions.get(withLocks.job_id);
+      return { ...withLocks, queue_position: pos?.position ?? null, queue_ahead: pos?.ahead ?? null };
     }
-    return sanitized;
+    return withLocks;
   });
 
   return c.json({
@@ -1257,6 +1267,9 @@ interface PipelineRowSelect {
   error_message: string | null;
   output_json: string | null;
   follow_up_job_id: string | null;
+  // Pending chain steps (JSON). Never returned to the client — it gets the
+  // derived locks_resources instead.
+  follow_up_chain: string | null;
   created_at: number;
   updated_at: number;
   last_polled_at: number | null;

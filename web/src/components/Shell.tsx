@@ -484,9 +484,10 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   );
 
   // Derive the chapter lock from active pipeline jobs. A run only locks the
-  // resource it will overwrite when it lands: "generate" writes scripture,
-  // "notes" writes TN, "tqs" writes TQ. Nothing writes TWL, so word links are
-  // never locked. Mirrors WRITERS in api/src/chapterLock.ts — keep in sync.
+  // resources it will overwrite when it lands, and the server says which those
+  // are (`locks_resources` — its own type plus any pending chain steps). We
+  // don't re-derive the mapping here: api/src/chapterLock.ts owns it, so the
+  // lanes the UI greys out can't drift from the ones the API rejects.
   const [activeJobs, setActiveJobs] = useState<PipelineJob[]>([]);
   useEffect(() => pipelineStore.subscribe(setActiveJobs), []);
   const chapterLocks = useMemo(() => {
@@ -500,8 +501,8 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           j.state === "paused_for_usage_limit" ||
           j.state === "dispatching"),
     );
-    const lockFor = (type: PipelineJob["pipeline_type"]) => {
-      const found = running.find((j) => j.pipeline_type === type);
+    const lockFor = (resource: "verse" | "tn" | "tq") => {
+      const found = running.find((j) => j.locks_resources?.includes(resource));
       if (!found) return null;
       return {
         jobId: found.job_id,
@@ -509,9 +510,30 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         startedAt: found.created_at,
       };
     };
-    return { verse: lockFor("generate"), tn: lockFor("notes"), tq: lockFor("tqs") };
+    return { verse: lockFor("verse"), tn: lockFor("tn"), tq: lockFor("tq") };
   }, [activeJobs, book, chapter]);
-  const anyLock = chapterLocks.verse ?? chapterLocks.tn ?? chapterLocks.tq;
+  // One banner line per active run, so a run's type and start time are never
+  // attributed to another run's locked lanes.
+  const lockBanners = useMemo(() => {
+    const byJob = new Map<string, { pipelineType: string; startedAt: number; resources: string[] }>();
+    for (const [resource, label] of [
+      ["verse", "scripture"],
+      ["tn", "notes"],
+      ["tq", "questions"],
+    ] as const) {
+      const lock = chapterLocks[resource];
+      if (!lock) continue;
+      const entry = byJob.get(lock.jobId);
+      if (entry) entry.resources.push(label);
+      else
+        byJob.set(lock.jobId, {
+          pipelineType: lock.pipelineType,
+          startedAt: lock.startedAt,
+          resources: [label],
+        });
+    }
+    return Array.from(byJob, ([jobId, v]) => ({ jobId, ...v }));
+  }, [chapterLocks]);
 
   const handleSetNotePreserve = useCallback(
     async (id: string, value: boolean) => {
@@ -2362,8 +2384,9 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         railCollapsed={railCollapsed}
         onToggleRail={toggleRail}
       />
-      {anyLock && (
+      {lockBanners.map((b) => (
         <Alert
+          key={b.jobId}
           severity="info"
           icon={false}
           sx={{
@@ -2374,19 +2397,15 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
             "& .MuiAlert-message": { width: "100%" },
           }}
         >
-          AI {anyLock.pipelineType} run in progress for {book} {chapter} —
-          started {formatRelative(anyLock.startedAt)}. Editing is locked for{" "}
-          {[
-            chapterLocks.verse ? "scripture" : null,
-            chapterLocks.tn ? "notes" : null,
-            chapterLocks.tq ? "questions" : null,
-          ]
-            .filter(Boolean)
-            .join(", ")}
-          {" "}in this chapter; everything else stays editable. You can still
-          mark notes to keep before the new set lands.
+          AI {b.pipelineType} run in progress for {book} {chapter} — started{" "}
+          {formatRelative(b.startedAt)}. Editing is locked for{" "}
+          {b.resources.join(", ")} in this chapter; everything else stays
+          editable.
+          {b.resources.includes("notes")
+            ? " You can still mark notes to keep before the new set lands."
+            : ""}
         </Alert>
-      )}
+      ))}
       <Box ref={splitContainerRef} sx={{ flex: 1, display: "flex", overflow: "hidden" }}>
         {!railCollapsed && (
           <Box sx={{ width: railWidth, flexShrink: 0, minHeight: 0, overflow: "hidden", display: "flex", flexDirection: "column" }}>
