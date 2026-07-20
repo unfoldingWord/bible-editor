@@ -11,6 +11,7 @@ import { QuestionsTable } from "./QuestionsTable";
 import { AlignmentPanel, type AlignmentPanelHandle } from "./AlignmentPanel";
 import { noteOverlapsRange } from "../lib/verseRange";
 import { canonicalTwlOrder } from "../lib/twlCanonicalOrder";
+import { useCatalogs } from "../hooks/useCatalogs";
 import CheckIcon from "@mui/icons-material/Check";
 import { LANE_FILL, type LaneShade } from "../lib/laneChecks";
 
@@ -349,6 +350,8 @@ export function ResourceColumn({
   }, [panelMode]);
 
   const [rangeStart, rangeEnd] = displayVerseRange;
+  // Feeds canonicalTwlOrder's headword anchoring (tw_link → TW article title).
+  const { twTitles } = useCatalogs();
   // When a UST verse bridge widens the range to span multiple verses (e.g. ISA
   // 33:15-16, UST row verse=15/verse_end=16 while UHB/ULT keep them separate),
   // the union must render grouped by verse — all of v15 then all of v16 — not
@@ -382,9 +385,9 @@ export function ResourceColumn({
   const twlForVerse = useMemo(
     () =>
       groupByVerse(twl.filter((r) => r.verse >= rangeStart && r.verse <= rangeEnd)).flatMap(
-        ([v, rows]) => canonicalTwlOrder(rows, ultVerseObjectsFor?.(v) ?? null),
+        ([v, rows]) => canonicalTwlOrder(rows, ultVerseObjectsFor?.(v) ?? null, twTitles),
       ),
-    [twl, rangeStart, rangeEnd, ultVerseObjectsFor],
+    [twl, rangeStart, rangeEnd, ultVerseObjectsFor, twTitles],
   );
 
   // Pinned sections show the whole chapter, grouped by verse. Within each
@@ -408,10 +411,10 @@ export function ResourceColumn({
       pinned.words
         ? groupByVerse(twl).map(
             ([v, rows]) =>
-              [v, canonicalTwlOrder(rows, ultVerseObjectsFor?.(v) ?? null)] as [number, TwlRow[]],
+              [v, canonicalTwlOrder(rows, ultVerseObjectsFor?.(v) ?? null, twTitles)] as [number, TwlRow[]],
           )
         : null,
-    [pinned.words, twl, ultVerseObjectsFor],
+    [pinned.words, twl, ultVerseObjectsFor, twTitles],
   );
 
   const totalTn = pinned.notes ? tn.length : tnForVerse.length;

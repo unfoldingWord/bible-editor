@@ -695,6 +695,10 @@ export interface Catalogs {
   // pre-feature payload still validates.
   disambiguationGroups?: DisambiguationOption[][];
   disambiguationIndex?: Record<string, number>;
+  // tw_link → TW article title. Feeds canonicalTwlOrder's headword anchoring
+  // (twlCanonicalOrder.ts). Optional so a client hitting an older server (or a
+  // cached pre-feature payload) still validates and falls back to tier 2/3.
+  twTitles?: Record<string, string>;
 }
 
 // One per-verse TWL suggestion from GET /api/twl-suggestions/:book/:ch/:v.

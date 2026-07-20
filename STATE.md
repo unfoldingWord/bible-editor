@@ -1228,6 +1228,17 @@ For the full corpus, see the memory index at
 `C:\Users\benja\.claude\projects\C--Users-benja-Documents-GitHub-bible-editor\memory\MEMORY.md`.
 Highlights that bite repeatedly:
 
+- **A green typecheck can mean "checked nothing".** If `node_modules` is damaged, an
+  unresolvable entry in tsconfig `types` (here `vite/client`) makes `tsc` emit one TS2688
+  and silently skip the entire program — it reports success while checking zero files.
+  Before trusting any "typecheck clean" claim on a checkout whose deps are questionable,
+  **plant a deliberate canary error** (`export const canary: number = "nope";`) and confirm
+  the checker reports it. Doing this on 2026-07-20 exposed a real bug that the broken check
+  had hidden. Workaround when a `types` entry can't resolve: a temp tsconfig that
+  `extends` the real one with `"types": []`, then ignore the resulting `import.meta.env`
+  errors as artifacts. The same "prove the tool runs before trusting its silence" rule
+  applies to any linter/test filter.
+
 - **Fresh worktree:** run `scripts/worktree-init.ps1` to junction `node_modules` from main —
   never reflexively `npm install` on a branch (it leaks deps into main). Only `npm install` in MAIN.
 - **Don't kill shared dev servers.** Multiple worktrees share Chrome MCP + dev ports (5173/5174/8787).

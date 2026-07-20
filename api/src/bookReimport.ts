@@ -60,6 +60,7 @@ import { isCatastrophicTsvShrink } from "./shrinkGuard";
 import { classifyReimportRow, isReimportableRow } from "./reimportClassify";
 import { computeTwlSortOrderUpdates } from "./twlCanonicalOrder";
 import { applyTwlSortOrderUpdates } from "./twlSortOrderApply";
+import { loadTwTitles } from "./twTitles";
 import type { TwlRow, VerseRow } from "./types";
 
 export type Resource = "ult" | "ust" | "tn" | "tq" | "twl";
@@ -189,7 +190,11 @@ async function canonicalizeTwlOrder(env: Env, book: string): Promise<number> {
   )
     .bind(book)
     .all<VerseRow>();
-  const updates = computeTwlSortOrderUpdates(twlRows.results, ultVerses.results);
+  const updates = computeTwlSortOrderUpdates(
+    twlRows.results,
+    ultVerses.results,
+    await loadTwTitles(env.DB),
+  );
   await applyTwlSortOrderUpdates(env.DB, book, updates);
   return updates.length;
 }

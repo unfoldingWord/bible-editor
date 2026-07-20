@@ -100,9 +100,21 @@ catalogs.get("/", async (c) => {
     canonical.results.map((r) => ({ id: r.id, title: r.title })),
   );
 
+  // tw_link → article title (the headword line, synonyms comma-separated).
+  // Canonical TWL ordering anchors each link on the English ULT word carrying
+  // its TW headword, and the live client MUST compute the same order the
+  // nightly export writes — so the client needs the same titles the server
+  // orders with. ~950 short entries riding along on a request the client
+  // already makes once and persists.
+  const twTitles: Record<string, string> = {};
+  for (const r of canonical.results) {
+    if (r.value && r.title) twTitles[r.value] = r.title;
+  }
+
   return c.json({
     supportReferences: TA_SUPPORT_REFERENCES,
     twLinks,
+    twTitles,
     disambiguationGroups: disambiguation.groups,
     disambiguationIndex: disambiguation.index,
   });

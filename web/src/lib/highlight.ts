@@ -453,16 +453,28 @@ export function findSourceForTargetText(
 // derive the English support phrase from the Hebrew quote when handing
 // off to the tn-quick AI endpoint. Returns "" if nothing matches —
 // callers should treat empty as "selection unavailable".
+// `gapMarker` (opt-in) makes DISCONTINUITY visible. A source word can align to
+// non-contiguous target words — ISA 60:6 וּתְהִלֹּת is rendered "and … the
+// praises of", with another word's "they will proclaim" sitting in the gap.
+// Joined with plain spaces that reads "and the praises of", which looks like a
+// contiguous phrase the ULT never says. Pass a marker (the Words-panel gloss
+// passes "…") to have it emitted wherever at least one unselected word was
+// skipped. Callers that feed machine consumers — tnQuickRequest.ts builds the
+// AI payload from this — must NOT pass one, so their strings stay unchanged.
 export function extractTargetSelectionText(
   verseObjects: unknown[],
   quote: string,
   occurrence: number,
   sourceVerseObjects?: unknown[],
+  options?: { gapMarker?: string },
 ): string {
   const highlights = findTargetHighlights(verseObjects, quote, occurrence, sourceVerseObjects);
   if (highlights.size === 0) return "";
+  const gapMarker = options?.gapMarker;
   const seen = new Set<HighlightKey>();
   const words: string[] = [];
+  let wordIndex = 0;        // position of every \w walked, selected or not
+  let lastSelected: number | null = null;
   function walk(nodes: unknown[]) {
     for (const node of nodes ?? []) {
       const o = node as Record<string, unknown> | null;
@@ -471,8 +483,13 @@ export function extractTargetSelectionText(
         const text = String(o["text"] ?? "");
         const occ = parseInt(String(o["occurrence"] ?? "1"), 10) || 1;
         const key = k(text, occ);
+        const index = wordIndex++;
         if (highlights.has(key) && !seen.has(key)) {
           seen.add(key);
+          if (gapMarker && lastSelected != null && index > lastSelected + 1) {
+            words.push(gapMarker);
+          }
+          lastSelected = index;
           words.push(text);
         }
       } else if (nodeIsMilestone(o) || nodeIsPsalmTitle(o)) {

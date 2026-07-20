@@ -52,6 +52,7 @@ import { findSourceForTargetText, extractTargetSelectionText, type HighlightKey,
 import { buildQuoteFromSelection, selectionFromQuote } from "../lib/quoteBuilder";
 import { resolveSpanToSource } from "../lib/twlResolve";
 import { canonicalTwlOrder } from "../lib/twlCanonicalOrder";
+import { useCatalogs } from "../hooks/useCatalogs";
 import { nfc } from "../lib/hebrew";
 import { TimelineRail, type VerseTile, type VerseTileLane } from "./TimelineRail";
 import { ScriptureColumn, type ScriptureMode } from "./ScriptureColumn";
@@ -171,6 +172,13 @@ interface Props {
 }
 
 export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, onLogout, meUserId = null }: Props) {
+  // tw_link → article title, for canonical (headword-anchored) TWL ordering.
+  // handleAddTwlSuggestion below places a NEW link at its canonical slot and
+  // persists a matching sort_order, so it must order with the SAME inputs the
+  // display and the nightly export use — without the titles it would compute
+  // the slot from the tier-2/3 fallback and write a sort_order around the
+  // wrong neighbour.
+  const { twTitles } = useCatalogs();
   const {
     status,
     data,
@@ -1207,6 +1215,10 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       const STUB = "__new_twl__";
       const newOrigWords = resolved?.orig_words ?? "";
       const newOccurrence = resolved?.occurrence ?? 1;
+      // tw_link must ride along (and the stub carries the article being added):
+      // the anchor tier that matches the TW headword is looked up BY link, so
+      // dropping it would silently demote every row to the function-word
+      // fallback and place the new link next to the wrong neighbour.
       const withNew = canonicalTwlOrder(
         [
           ...list.map((r) => ({
@@ -1214,15 +1226,23 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
             orig_words: r.orig_words,
             occurrence: r.occurrence,
             sort_order: r.sort_order,
+            tw_link: r.tw_link,
           })),
-          { id: STUB, orig_words: newOrigWords, occurrence: newOccurrence, sort_order: null },
+          {
+            id: STUB,
+            orig_words: newOrigWords,
+            occurrence: newOccurrence,
+            sort_order: null,
+            tw_link: twLink,
+          },
         ],
         ult ?? null,
+        twTitles,
       );
       const at = withNew.findIndex((r) => r.id === STUB);
       const prev = at > 0 ? withNew[at - 1] : null;
       const next = at >= 0 && at < withNew.length - 1 ? withNew[at + 1] : null;
-      const canonicalExisting = canonicalTwlOrder(list, ult ?? null);
+      const canonicalExisting = canonicalTwlOrder(list, ult ?? null, twTitles);
       const sort_order =
         list.length === 0
           ? 100
@@ -1258,7 +1278,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         );
       }
     },
-    [data, activeVerse, verseIndexByVersion, book, chapter],
+    [data, activeVerse, verseIndexByVersion, book, chapter, twTitles],
   );
 
   // Whether a per-verse suggestion is already covered on the active verse. Done
@@ -2691,6 +2711,10 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
               row.orig_words,
               row.occurrence ?? 1,
               Array.isArray(src) ? src : undefined,
+              // Show the gap: one source word can align to non-contiguous ULT
+              // words (ISA 60:6 "and … the praises of"), and hiding that reads
+              // as a phrase the ULT never says.
+              { gapMarker: "…" },
             );
           }}
           onWordFocus={(row) => {

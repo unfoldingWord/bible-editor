@@ -45,6 +45,7 @@ const EXPORT_ALERT_USERNAME = "deferredreward";
 // the live-snapshot flow is no longer used (its post-export path is dormant).
 const LEGACY_EXPORT_BRANCH = "live-snapshot";
 import { applyTwlSortOrderUpdates } from "./twlSortOrderApply";
+import { loadTwTitles } from "./twTitles";
 import { runPostExport, VALIDATORS } from "./postExport";
 import { runChunkedReimport, storedResourceSha, ALL_RESOURCES as REIMPORT_RESOURCES } from "./bookReimport";
 import { dcsRawUrl, dcsResourceFile, fetchText, fileCommitSha, type ReimportResource } from "./dcsSources";
@@ -618,6 +619,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
         bibleVersion: "ULT",
         headers: null,
         verses: ultVerses.results,
+        twTitles: await loadTwTitles(db),
       });
       return {
         content: result.tsv,

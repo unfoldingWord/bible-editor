@@ -13,7 +13,12 @@
 // content is pre-parsed), so fixtures here are the verseObjects array, not a
 // VerseRow.
 
-import { canonicalTwlOrder, buildUltSequenceMap, twlSortPosition } from "./twlCanonicalOrder.ts";
+import {
+  canonicalTwlOrder,
+  buildUltSequenceMap,
+  twlSortPosition,
+  twlAnchorContext,
+} from "./twlCanonicalOrder.ts";
 
 let failed = 0;
 function assert(cond, msg) {
@@ -36,8 +41,20 @@ function ultVerseObjects(words) {
   }));
 }
 
-function twl(id, orig_words, occurrence, sort_order) {
-  return { id, orig_words, occurrence, sort_order };
+// A span-based verseObjects builder: each { content, texts } becomes one
+// \zaln milestone (content = Hebrew/Greek word or phrase) wrapping MULTIPLE
+// \w words, in document order. Mirrors api-side ultVerseSpans.
+function spanVerseObjects(spans) {
+  return spans.map((s) => ({
+    type: "milestone",
+    tag: "zaln",
+    content: s.content,
+    children: s.texts.map((t) => ({ type: "word", tag: "w", text: t })),
+  }));
+}
+
+function twl(id, orig_words, occurrence, sort_order, tw_link = `rc://en/tw/dict/bible/kt/${id}`) {
+  return { id, orig_words, occurrence, sort_order, tw_link };
 }
 
 const ids = (rows) => rows.map((r) => r.id);
@@ -330,6 +347,288 @@ const ids = (rows) => rows.map((r) => r.id);
   );
   const map = buildUltSequenceMap(vo);
   assert(twlSortPosition({ orig_words: "foo", occurrence: 2 }, map) === 0, "foo#2 → index 0, not miscounted as foo#1");
+}
+
+// ─── Headword anchoring: tiers 1/2/3 pick the anchor inside one span ────────
+{
+  console.log("\n[headword-anchor] tiers 1/2/3 pick the anchor inside one span");
+  const vo = spanVerseObjects([
+    { content: "ק", texts: ["and", "the", "great", "house", "of"] },
+  ]);
+  const map = buildUltSequenceMap(vo);
+  const row = twl("house", "ק", 1, 100);
+
+  // Tier 3 (no title, single-word test not applicable here) is exercised below;
+  // with >1 word and no title we get tier 2: skip and/the → "great" at index 2.
+  assert(
+    twlSortPosition(row, map, null) === 2,
+    "tier 2: no headword → first non-function word 'great' (index 2), NOT 'and'",
+  );
+
+  // Tier 1: the article headword wins over the merely-first-content word.
+  assert(
+    twlSortPosition(row, map, { terms: ["house"], isName: false }) === 3,
+    "tier 1: headword 'house' (index 3) beats tier 2's 'great'",
+  );
+
+  // Morphology still applies: the ULT may inflect the headword.
+  const plural = spanVerseObjects([
+    { content: "ק", texts: ["and", "the", "houses", "of"] },
+  ]);
+  assert(
+    twlSortPosition(
+      twl("houses", "ק", 1, 100),
+      buildUltSequenceMap(plural),
+      { terms: ["house"], isName: false },
+    ) === 2,
+    "tier 1 matches inflected 'houses' (index 2) against headword 'house'",
+  );
+
+  // Tier 3: every word in the span is a function word — anchor on the first,
+  // exactly as the pre-headword implementation did.
+  const allFunction = spanVerseObjects([{ content: "ו", texts: ["and", "of"] }]);
+  assert(
+    twlSortPosition(twl("x", "ו", 1, 100), buildUltSequenceMap(allFunction), null) === 0,
+    "tier 3: span is all function words → first word (index 0)",
+  );
+
+  // A single-word span is never skipped, even when that word is a function
+  // word: there is nothing to skip TO, and skipping would strand the row.
+  const lone = spanVerseObjects([{ content: "ה", texts: ["the"] }]);
+  assert(
+    twlSortPosition(twl("y", "ה", 1, 100), buildUltSequenceMap(lone), null) === 0,
+    "single-word function-word span still resolves (index 0), not unresolved",
+  );
+}
+
+// ─── Headword anchoring flips a nested pair ─────────────────────────────────
+{
+  console.log("\n[headword-reorders] headword anchoring flips a nested pair");
+  // Outer milestone א wraps BOTH words; nested inner ב wraps only the first.
+  // Pre-headword both anchored at index 0 (a tie broken by sort_order, so the
+  // stored order stood). With headwords, א anchors on "beta" (1) and ב on
+  // "alpha" (0), so ב now sorts FIRST regardless of sort_order.
+  const vo = [
+    {
+      type: "milestone",
+      tag: "zaln",
+      content: "א",
+      children: [
+        {
+          type: "milestone",
+          tag: "zaln",
+          content: "ב",
+          children: [{ type: "word", tag: "w", text: "alpha" }],
+        },
+        { type: "word", tag: "w", text: "beta" },
+      ],
+    },
+  ];
+  // sort_order puts the outer row first — the order that stood before.
+  const outer = twl("outerbeta", "א", 1, 100);
+  const inner = twl("inneralpha", "ב", 1, 200);
+  const rows = [outer, inner];
+
+  const noTitles = ids(canonicalTwlOrder(rows, vo));
+  assert(
+    JSON.stringify(noTitles) === JSON.stringify(["outerbeta", "inneralpha"]),
+    "without titles the stored order stands (outer, inner)",
+  );
+
+  const titles = new Map([
+    [outer.tw_link, "# beta"],
+    [inner.tw_link, "# alpha"],
+  ]);
+  const withTitles = ids(canonicalTwlOrder(rows, vo, titles));
+  assert(
+    JSON.stringify(withTitles) === JSON.stringify(["inneralpha", "outerbeta"]),
+    "with titles the headwords reorder them (inner 'alpha' before outer 'beta')",
+  );
+}
+
+// ─── tier 2 skips pronouns and auxiliaries too ──────────────────────────────
+{
+  console.log("\n[tier2-pronoun-aux] tier 2 skips pronouns and auxiliaries too");
+  // Both cases come from the real-data measurement over 7 books: the headword
+  // failed to match the ULT's wording, and tier 2 — when it skipped only
+  // conjunctions/prepositions — stopped on a PRONOUN instead of the verb.
+  // Pronouns + auxiliaries are now skipped, so it reaches the content word.
+  const mic16 = spanVerseObjects([
+    { content: "ק", texts: ["So", "I", "will", "make"] },
+  ]);
+  assert(
+    twlSortPosition(twl("appoint", "ק", 1, 100), buildUltSequenceMap(mic16), null) === 3,
+    "MIC 1:6 'So I will make' → 'make' (index 3), not the pronoun 'I'",
+  );
+
+  const mic35 = spanVerseObjects([
+    { content: "ק", texts: ["then", "they", "call", "out"] },
+  ]);
+  assert(
+    twlSortPosition(twl("declare", "ק", 1, 100), buildUltSequenceMap(mic35), null) === 2,
+    "MIC 3:5 'then they call out' → 'call' (index 2), not the pronoun 'they'",
+  );
+
+  // "might" is an auxiliary AND the headword of other/mighty (251 live rows).
+  // Tier 1 must claim it before tier 2 can skip it — this is what makes adding
+  // auxiliaries to the skip list safe.
+  const mighty = spanVerseObjects([{ content: "ק", texts: ["by", "his", "might"] }]);
+  assert(
+    twlSortPosition(
+      twl("mighty", "ק", 1, 100),
+      buildUltSequenceMap(mighty),
+      { terms: ["might", "mighty"], isName: false },
+    ) === 2,
+    "tier 1 claims 'might' (index 2) even though it is also an auxiliary",
+  );
+  // …and with no headword context every word is skippable, so it falls to
+  // tier 3 rather than returning nothing.
+  assert(
+    twlSortPosition(twl("mighty", "ק", 1, 100), buildUltSequenceMap(mighty), null) === 0,
+    "same span with no headword → all words skippable → tier 3 first word (index 0)",
+  );
+}
+
+// A `\zaln` milestone list where entries carry an explicit x-occurrence, so a
+// single source word can be SPLIT into two non-contiguous chunks. Mirrors the
+// api-side ultVerseOccSpans. Returns the verseObjects array directly (web
+// buildUltSequenceMap/canonicalTwlOrder take verseObjects, not a VerseRow).
+function ultVerseOccSpans(chapter, verse, spans) {
+  return spans.map((s) => ({
+    type: "milestone",
+    tag: "zaln",
+    content: s.content,
+    occurrence: s.occurrence,
+    occurrences: s.occurrences ?? 1,
+    children: s.texts.map((t) => ({ type: "word", tag: "w", text: t })),
+  }));
+}
+
+{
+  console.log("\n[split-source-word] non-contiguous alignment reunites into one span");
+  // ISA 60:6 shape: וּתְהִלֹּת (occ 1/1) → "and", then יְבַשֵּׂרוּ → "they will
+  // proclaim", then וּתְהִלֹּת (occ 1/1 AGAIN) → "the praises of". One Hebrew
+  // word rendered "and … the praises of". Before the fix the two chunks looked
+  // like occurrence 1 and 2, so the praise row resolved to just "and" (index 0)
+  // and sorted AHEAD of proclaim.
+  const vo = ultVerseOccSpans(60, 6, [
+    { content: "וּתהלת", occurrence: 1, texts: ["and"] },
+    { content: "יבשרו", occurrence: 1, texts: ["they", "will", "proclaim"] },
+    { content: "וּתהלת", occurrence: 1, texts: ["the", "praises", "of"] },
+  ]);
+  const map = buildUltSequenceMap(vo);
+
+  const praise = twl("praise", "וּתהלת", 1, 100);
+  const declare = twl("declare", "יבשרו", 1, 200);
+
+  assert(
+    map.get("וּתהלת#1").map((w) => w.text).join(" ") === "and the praises of",
+    `split chunks reunite into one span (got "${map.get("וּתהלת#1").map((w) => w.text).join(" ")}")`,
+  );
+  assert(
+    twlSortPosition(praise, map, { terms: ["praise"], isName: false }) === 5,
+    "praise anchors on 'praises' (index 5), NOT the leading 'and' (index 0)",
+  );
+  assert(
+    twlSortPosition(declare, map, { terms: ["declare"], isName: false }) === 3,
+    "declare anchors on 'proclaim' (index 3)",
+  );
+
+  const titles = new Map([
+    [praise.tw_link, "# praise"],
+    [declare.tw_link, "# declare, proclaim"],
+  ]);
+  const ordered = ids(canonicalTwlOrder([praise, declare], vo, titles));
+  assert(
+    JSON.stringify(ordered) === JSON.stringify(["declare", "praise"]),
+    "declare sorts BEFORE praise (the reported ISA 60:6 bug)",
+  );
+}
+
+{
+  console.log("\n[split-source-word] a genuinely REPEATED word still splits");
+  // Guard against over-merging: same content but DIFFERENT x-occurrence is two
+  // real instances and must stay two spans with independent occurrence numbers.
+  const vo = ultVerseOccSpans(60, 7, [
+    { content: "דבר", occurrence: 1, occurrences: 2, texts: ["first", "word"] },
+    { content: "אחר", occurrence: 1, texts: ["middle"] },
+    { content: "דבר", occurrence: 2, occurrences: 2, texts: ["second", "word"] },
+  ]);
+  const map = buildUltSequenceMap(vo);
+  assert(
+    map.get("דבר#1").map((w) => w.text).join(" ") === "first word",
+    "occurrence 1 keeps only its own words",
+  );
+  assert(
+    map.get("דבר#2").map((w) => w.text).join(" ") === "second word",
+    "occurrence 2 keeps only its own words (not merged with #1)",
+  );
+}
+
+{
+  console.log("\n[split-source-word] NESTED same-content pair is NOT merged");
+  // The doubled-source-milestone defect (JER 31:33 class): one \zaln-s wraps the
+  // same token twice, NESTED, with identical content and occurrence. That is
+  // corrupt data, not a split alignment — merging it would delete the #2
+  // occurrence slot and strand a TWL row carrying Occurrence=2 at the tail of
+  // the verse. Only SIBLING chunks reunite.
+  const vo = [
+    {
+      type: "milestone",
+      tag: "zaln",
+      content: "דבר",
+      occurrence: 1,
+      occurrences: 1,
+      children: [
+        {
+          type: "milestone",
+          tag: "zaln",
+          content: "דבר",
+          occurrence: 1,
+          occurrences: 1,
+          children: [{ type: "word", tag: "w", text: "word" }],
+        },
+      ],
+    },
+    {
+      type: "milestone",
+      tag: "zaln",
+      content: "אחר",
+      occurrence: 1,
+      occurrences: 1,
+      children: [{ type: "word", tag: "w", text: "other" }],
+    },
+  ];
+  const map = buildUltSequenceMap(vo);
+  assert(map.has("דבר#1"), "nested doubled pair keeps occurrence #1");
+  assert(
+    map.has("דבר#2"),
+    "nested doubled pair KEEPS occurrence #2 (a row with Occurrence=2 still resolves)",
+  );
+  assert(
+    twlSortPosition(twl("w2", "דבר", 2, 100), map, null) === 0,
+    "Occurrence=2 on the doubled word resolves to the word (index 0), not the verse tail",
+  );
+}
+
+// ─── Unknown link falls through cleanly ─────────────────────────────────────
+{
+  console.log("\n[headword-missing-article] unknown link falls through cleanly");
+  const vo = spanVerseObjects([
+    { content: "ק", texts: ["and", "the", "great", "house"] },
+  ]);
+  const map = buildUltSequenceMap(vo);
+  const row = twl("orphan", "ק", 1, 100);
+  // Mirrors the one real prod row pointing at kt/arcofthecovenant (a typo for
+  // ark…), which has no tw_articles entry: no title → tier 2, never a crash.
+  assert(
+    twlSortPosition(row, map, twlAnchorContext(row.tw_link, new Map())) === 2,
+    "link absent from the title map → tier 2 ('great'), no throw",
+  );
+  assert(
+    twlSortPosition(row, map, twlAnchorContext(null, new Map([["x", "# y"]]))) === 2,
+    "null tw_link → tier 2, no throw",
+  );
 }
 
 if (failed > 0) {
