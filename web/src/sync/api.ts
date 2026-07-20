@@ -981,6 +981,14 @@ export interface PipelineJobRow {
    * column elsewhere in the list).
    */
   follow_up_job_id: string | null;
+  /**
+   * Resources this run will overwrite when it lands — its own pipeline type
+   * plus any pending chain steps ("generate everything" = generate → notes →
+   * tqs). Server-derived (api/src/chapterLock.ts is the only copy of the map),
+   * and what the editor locks. Absent on optimistic rows minted locally by
+   * pipelineStore.start() before the first list refresh.
+   */
+  locks_resources?: ("verse" | "tn" | "tq" | "twl")[];
   created_at: number;
   updated_at: number;
   last_polled_at: number | null;

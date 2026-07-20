@@ -225,12 +225,14 @@ rows.post("/:kind", requireEditor, async (c) => {
   const data = parsed.data as Record<string, unknown>;
   const userId = currentUserId(c);
 
-  // Block new rows while an AI pipeline is running for this chapter — the
-  // auto-apply step will overwrite or rearrange the row set when it lands.
+  // Block new rows while an AI pipeline that writes THIS kind is running for
+  // this chapter — its auto-apply step will overwrite or rearrange that kind's
+  // row set when it lands. A run on another resource is none of our business.
   const lock = await activePipelineForChapter(
     c.env,
     parsed.data.book,
     parsed.data.chapter,
+    kind,
   );
   if (lock) return c.json(lockedResponseBody(lock), 409);
 
@@ -596,10 +598,10 @@ rows.patch("/:kind/:id", requireEditor, async (c) => {
 
   // Lock check for non-tn kinds. TN edits are always allowed during a run —
   // the first PATCH on an updated_by-NULL row implicitly "keeps" it; further
-  // PATCHes on already-kept rows are normal edits. tq/twl have no such
-  // carve-out: any pipeline writing to this chapter overwrites them.
+  // PATCHes on already-kept rows are normal edits. tq has no such carve-out:
+  // the questions run overwrites them. (twl is never locked at all.)
   if (kind !== "tn") {
-    const lock = await activePipelineForChapter(c.env, current.book, current.chapter);
+    const lock = await activePipelineForChapter(c.env, current.book, current.chapter, kind);
     if (lock) return c.json(lockedResponseBody(lock), 409);
   }
 
@@ -811,7 +813,7 @@ rows.delete("/:kind/:id", requireEditor, async (c) => {
     .bind(id, book)
     .first<{ book: string; chapter: number; verse: number; ref_raw: string | null }>();
   if (scope) {
-    const lock = await activePipelineForChapter(c.env, scope.book, scope.chapter);
+    const lock = await activePipelineForChapter(c.env, scope.book, scope.chapter, kind);
     if (lock) return c.json(lockedResponseBody(lock), 409);
   }
 

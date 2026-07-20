@@ -98,10 +98,6 @@ interface Props {
   // Hover a row's "locate" spot to preview where its word is in the scripture
   // (row id on enter, null on leave). No click / focus change.
   onHoverPreview?: (id: string | null) => void;
-  // Chapter has an active AI pipeline. Disables all interaction in this
-  // table — TWLs aren't AI-touched, but locking the whole chapter is
-  // simpler and avoids partial-edit confusion.
-  locked?: boolean;
   // Translate English in the quote field to source-language text via ULT
   // alignment. Returns the derived Hebrew/Greek string, or null if no
   // alignment match was found. Mirrors the NoteCard wiring.
@@ -132,7 +128,7 @@ interface Props {
 // intact and still wired). tn/tq note reordering is unaffected.
 const ENABLE_TWL_MANUAL_REORDER = false;
 
-function WordsTableInner({ rows, activeId, onSave, onDelete, onFocus, onReorder, onHoverPreview, locked = false, onTranslateQuote, onWordGloss, activeQuoteBuildId = null, quoteBuildSelectionCount = 0, onStartQuoteBuild, suggestionAlternatives }: Props) {
+function WordsTableInner({ rows, activeId, onSave, onDelete, onFocus, onReorder, onHoverPreview, onTranslateQuote, onWordGloss, activeQuoteBuildId = null, quoteBuildSelectionCount = 0, onStartQuoteBuild, suggestionAlternatives }: Props) {
   const [dragId, setDragId] = useState<string | null>(null);
   const [dragOver, setDragOver] = useState<
     { targetId: string; position: WordDropPosition } | null
@@ -192,7 +188,6 @@ function WordsTableInner({ rows, activeId, onSave, onDelete, onFocus, onReorder,
         overflow: "hidden",
         containerType: "inline-size",
         ...draftDirtyBorderSx(),
-        ...(locked ? { pointerEvents: "none", opacity: 0.6 } : null),
       }}
     >
       <Box
@@ -306,7 +301,6 @@ export const WordsTable = memo(
   (a, b) =>
     a.rows === b.rows &&
     a.activeId === b.activeId &&
-    a.locked === b.locked &&
     a.activeQuoteBuildId === b.activeQuoteBuildId &&
     a.quoteBuildSelectionCount === b.quoteBuildSelectionCount &&
     a.suggestionAlternatives === b.suggestionAlternatives,

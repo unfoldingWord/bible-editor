@@ -384,9 +384,12 @@ export const pipelineStore = {
     jobs.set(res.jobId, jobs.get(res.jobId) ?? seeded);
     notify();
     ensurePolling();
-    // Eagerly fetch the canonical status so the UI doesn't sit on the
-    // seed shape for 2 minutes.
-    void pollOne(res.jobId);
+    // Eagerly re-list so the UI doesn't sit on the seed shape for 2 minutes.
+    // It has to be the list, not pollOne: locks_resources (which lanes the
+    // editor greys out) is only computed there, and the seed has none — so a
+    // status-only refresh would leave a run that's already locking rows on the
+    // server looking unlocked in the UI. loadFromServer polls this job too.
+    void loadFromServer();
     if (res.status === "already_running") {
       // Same sessionKey hit the same scope a second time — the user is
       // looking for the existing run, not starting a new one. Surface the

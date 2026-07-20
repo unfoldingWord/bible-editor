@@ -134,9 +134,12 @@ interface Props {
   onQuestionSave: (id: string, patch: Partial<TqRow>) => void;
   onQuestionDelete: (id: string) => void;
   onQuestionCreate: () => void;
-  // Chapter is locked for editing because an AI pipeline is mid-flight.
-  // Hides "new" buttons, propagates read-only to children.
-  locked?: boolean;
+  // A mid-flight AI pipeline locks only the resource it will overwrite:
+  // the notes run locks notes, the questions run locks questions. Nothing
+  // locks the word links — no pipeline writes them. Hides "new" buttons,
+  // propagates read-only to that tab's children.
+  lockedTn?: boolean;
+  lockedTq?: boolean;
   // Toggle the TN's preserve bit ("survive future AI pipeline sweeps").
   // Threaded through to NoteCard. Always available, regardless of lock.
   onSetNotePreserve?: (id: string, value: boolean) => void;
@@ -298,7 +301,8 @@ export function ResourceColumn({
   onQuestionSave,
   onQuestionDelete,
   onQuestionCreate,
-  locked = false,
+  lockedTn = false,
+  lockedTq = false,
   onSetNotePreserve,
   onSetNoteHint,
   onNoteTranslateQuote,
@@ -751,7 +755,7 @@ export function ResourceColumn({
               onTogglePin={() => togglePinned("notes")}
               onAdd={onNoteCreate}
               sticky
-              hideAdd={locked}
+              hideAdd={lockedTn}
               lane="tn"
               checkoff={checkoff}
             />
@@ -789,7 +793,6 @@ export function ResourceColumn({
               onTogglePin={() => togglePinned("words")}
               onAdd={onWordCreate}
               sticky
-              hideAdd={locked}
               lane="tw"
               checkoff={checkoff}
             />
@@ -810,7 +813,6 @@ export function ResourceColumn({
                       onFocus={onWordFocus}
                       onReorder={onWordReorder}
                       onHoverPreview={onWordHoverPreview}
-                      locked={locked}
                       onTranslateQuote={onWordTranslateQuote}
                       onWordGloss={onWordGloss}
                       suggestionAlternatives={twlRowAlternatives}
@@ -830,7 +832,6 @@ export function ResourceColumn({
                 onFocus={onWordFocus}
                 onReorder={onWordReorder}
                 onHoverPreview={onWordHoverPreview}
-                locked={locked}
                 onTranslateQuote={onWordTranslateQuote}
                 onWordGloss={onWordGloss}
                 suggestionAlternatives={twlRowAlternatives}
@@ -871,7 +872,6 @@ export function ResourceColumn({
                   onSuggestions={onTwlSuggestions}
                   blockedArticleIds={twlBlockedArticleIds}
                   filtersReady={twlFiltersReady}
-                  locked={locked}
                   paused={!!checkoff && checkoff.applicable("tw") && checkoff.shade("tw") !== "open"}
                 />
               </Box>
@@ -888,7 +888,7 @@ export function ResourceColumn({
               onTogglePin={() => togglePinned("questions")}
               onAdd={onQuestionCreate}
               sticky
-              hideAdd={locked}
+              hideAdd={lockedTq}
               lane="tq"
               checkoff={checkoff}
             />
@@ -901,12 +901,12 @@ export function ResourceColumn({
                 tqGroups.map(([verse, rows]) => (
                   <Fragment key={`tq-${verse}`}>
                     <VerseGroupHead verse={verse} active={verse === activeVerse} section="questions" />
-                    <QuestionsTable rows={rows} onSave={onQuestionSave} onDelete={onQuestionDelete} locked={locked} />
+                    <QuestionsTable rows={rows} onSave={onQuestionSave} onDelete={onQuestionDelete} locked={lockedTq} />
                   </Fragment>
                 ))
               )
             ) : (
-              <QuestionsTable rows={tqForVerse} onSave={onQuestionSave} onDelete={onQuestionDelete} locked={locked} />
+              <QuestionsTable rows={tqForVerse} onSave={onQuestionSave} onDelete={onQuestionDelete} locked={lockedTq} />
             )}
           </>
         )}
@@ -1026,7 +1026,7 @@ export function ResourceColumn({
           isAiPending={isNoteAiPending?.(r.id) ?? false}
           aiRecentlyCompletedAt={noteAiRecentlyCompletedAt?.(r.id) ?? null}
           onVisibilityChange={onNoteVisibilityChange}
-          locked={locked}
+          locked={lockedTn}
           onSetPreserve={
             onSetNotePreserve ? (value) => onSetNotePreserve(r.id, value) : undefined
           }
