@@ -489,6 +489,82 @@ const ids = (rows) => rows.map((r) => r.id);
   );
 }
 
+// A `\zaln` milestone list where entries carry an explicit x-occurrence, so a
+// single source word can be SPLIT into two non-contiguous chunks. Mirrors the
+// api-side ultVerseOccSpans. Returns the verseObjects array directly (web
+// buildUltSequenceMap/canonicalTwlOrder take verseObjects, not a VerseRow).
+function ultVerseOccSpans(chapter, verse, spans) {
+  return spans.map((s) => ({
+    type: "milestone",
+    tag: "zaln",
+    content: s.content,
+    occurrence: s.occurrence,
+    occurrences: s.occurrences ?? 1,
+    children: s.texts.map((t) => ({ type: "word", tag: "w", text: t })),
+  }));
+}
+
+{
+  console.log("\n[split-source-word] non-contiguous alignment reunites into one span");
+  // ISA 60:6 shape: וּתְהִלֹּת (occ 1/1) → "and", then יְבַשֵּׂרוּ → "they will
+  // proclaim", then וּתְהִלֹּת (occ 1/1 AGAIN) → "the praises of". One Hebrew
+  // word rendered "and … the praises of". Before the fix the two chunks looked
+  // like occurrence 1 and 2, so the praise row resolved to just "and" (index 0)
+  // and sorted AHEAD of proclaim.
+  const vo = ultVerseOccSpans(60, 6, [
+    { content: "וּתהלת", occurrence: 1, texts: ["and"] },
+    { content: "יבשרו", occurrence: 1, texts: ["they", "will", "proclaim"] },
+    { content: "וּתהלת", occurrence: 1, texts: ["the", "praises", "of"] },
+  ]);
+  const map = buildUltSequenceMap(vo);
+
+  const praise = twl("praise", "וּתהלת", 1, 100);
+  const declare = twl("declare", "יבשרו", 1, 200);
+
+  assert(
+    map.get("וּתהלת#1").map((w) => w.text).join(" ") === "and the praises of",
+    `split chunks reunite into one span (got "${map.get("וּתהלת#1").map((w) => w.text).join(" ")}")`,
+  );
+  assert(
+    twlSortPosition(praise, map, { terms: ["praise"], isName: false }) === 5,
+    "praise anchors on 'praises' (index 5), NOT the leading 'and' (index 0)",
+  );
+  assert(
+    twlSortPosition(declare, map, { terms: ["declare"], isName: false }) === 3,
+    "declare anchors on 'proclaim' (index 3)",
+  );
+
+  const titles = new Map([
+    [praise.tw_link, "# praise"],
+    [declare.tw_link, "# declare, proclaim"],
+  ]);
+  const ordered = ids(canonicalTwlOrder([praise, declare], vo, titles));
+  assert(
+    JSON.stringify(ordered) === JSON.stringify(["declare", "praise"]),
+    "declare sorts BEFORE praise (the reported ISA 60:6 bug)",
+  );
+}
+
+{
+  console.log("\n[split-source-word] a genuinely REPEATED word still splits");
+  // Guard against over-merging: same content but DIFFERENT x-occurrence is two
+  // real instances and must stay two spans with independent occurrence numbers.
+  const vo = ultVerseOccSpans(60, 7, [
+    { content: "דבר", occurrence: 1, occurrences: 2, texts: ["first", "word"] },
+    { content: "אחר", occurrence: 1, texts: ["middle"] },
+    { content: "דבר", occurrence: 2, occurrences: 2, texts: ["second", "word"] },
+  ]);
+  const map = buildUltSequenceMap(vo);
+  assert(
+    map.get("דבר#1").map((w) => w.text).join(" ") === "first word",
+    "occurrence 1 keeps only its own words",
+  );
+  assert(
+    map.get("דבר#2").map((w) => w.text).join(" ") === "second word",
+    "occurrence 2 keeps only its own words (not merged with #1)",
+  );
+}
+
 // ─── Unknown link falls through cleanly ─────────────────────────────────────
 {
   console.log("\n[headword-missing-article] unknown link falls through cleanly");

@@ -86,6 +86,16 @@ export function buildUltSequenceMap(
   let englishIndex = 0;
   const entries: MilestoneEntry[] = [];
   const stack: MilestoneEntry[] = []; // currently-open milestones, for marking englishIndex
+  // One SOURCE WORD can be aligned to NON-CONTIGUOUS English words, which USFM
+  // expresses as two `\zaln` milestones with the same content AND the same
+  // x-occurrence, split around whatever sits between them. ISA 60:6: וּתְהִלֹּת
+  // (occ 1/1) wraps "and", then יְבַשֵּׂרוּ wraps "they will proclaim", then
+  // וּתְהִלֹּת (occ 1/1 again) wraps "the praises of" — one Hebrew word rendered
+  // "and … the praises of". Treating those as two entries made them look like
+  // occurrence 1 and 2, so the TWL row (occurrence 1) resolved to just "and" and
+  // sorted ahead of "proclaim". Keyed by content + the milestone's OWN
+  // x-occurrence, both chunks reunite into a single span.
+  const entriesByInstance = new Map<string, MilestoneEntry>();
 
   const walk = (nodes: unknown[]): void => {
     for (const node of nodes) {
@@ -97,8 +107,23 @@ export function buildUltSequenceMap(
       // the children walk: push, recurse, pop. A childless milestone is
       // sibling-structured — left for a milestoneEnd below.
       if (o["type"] === "milestone" && o["tag"] === "zaln" && typeof o["content"] === "string") {
-        const entry: MilestoneEntry = { content: normalizeWordText(o["content"] as string), words: [] };
-        entries.push(entry);
+        const content = normalizeWordText(o["content"] as string);
+        // The milestone's own x-occurrence identifies the source instance. When
+        // absent (older/hand-built data) fall back to one entry per milestone,
+        // which is the pre-fix behaviour.
+        const rawOcc = o["occurrence"];
+        const occ =
+          typeof rawOcc === "number" ? rawOcc
+          : typeof rawOcc === "string" && rawOcc.trim() !== "" ? Number(rawOcc)
+          : null;
+        const instanceKey = occ != null && Number.isFinite(occ) ? `${content}#${occ}` : null;
+
+        let entry = instanceKey != null ? entriesByInstance.get(instanceKey) : undefined;
+        if (!entry) {
+          entry = { content, words: [] };
+          entries.push(entry);
+          if (instanceKey != null) entriesByInstance.set(instanceKey, entry);
+        }
         stack.push(entry);
         const children = o["children"];
         if (Array.isArray(children)) {

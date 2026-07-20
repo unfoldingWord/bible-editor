@@ -2691,6 +2691,10 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
               row.orig_words,
               row.occurrence ?? 1,
               Array.isArray(src) ? src : undefined,
+              // Show the gap: one source word can align to non-contiguous ULT
+              // words (ISA 60:6 "and … the praises of"), and hiding that reads
+              // as a phrase the ULT never says.
+              { gapMarker: "…" },
             );
           }}
           onWordFocus={(row) => {
