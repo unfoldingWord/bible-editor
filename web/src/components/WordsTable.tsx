@@ -189,6 +189,19 @@ function WordsTableInner({ rows, activeId, onSave, onDelete, onFocus, onReorder,
   });
   useEffect(() => () => { if (flashTimer.current) clearTimeout(flashTimer.current); }, []);
 
+  // Preview mode must be read-only to the KEYBOARD too. `pointerEvents: none`
+  // (below) only stops the mouse — the rows stay in the tab order, so a
+  // keyboard user could Tab into a proposed order and save, delete, or arrow-
+  // reorder against a sequence they never chose, from a panel that says
+  // "nothing saved". `inert` takes the whole subtree out of focus AND hit
+  // testing. Set through the ref because React 18 doesn't forward `inert` as a
+  // JSX prop (React 19 does); pointerEvents stays as the fallback for browsers
+  // without inert support.
+  useEffect(() => {
+    const el = tableRef.current;
+    if (el) el.inert = readOnly;
+  }, [readOnly]);
+
   if (rows.length === 0) {
     return (
       <Typography variant="body2" color="text.disabled" sx={{ py: 1, pl: 1 }}>
