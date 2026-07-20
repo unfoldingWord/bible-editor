@@ -1,10 +1,14 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { api, type Catalogs } from "../sync/api";
 
 // Persisted alongside the in-memory cache so an F5 while offline still shows
 // type-ahead suggestions. Single payload, ~50-100KB — localStorage is the
 // right tool (synchronous read, no schema, room to spare).
-const STORAGE_KEY = "bible-editor.catalogs.v1";
+// v2: added twTitles (feeds canonicalTwlOrder headword anchoring). Bumped so
+// a stale v1 payload (no twTitles) is never served — even under
+// stale-while-revalidate — which would silently disagree with the export
+// until the background refresh landed. The old v1 key is left alone.
+const STORAGE_KEY = "bible-editor.catalogs.v2";
 
 function readPersisted(): Catalogs | null {
   try {
@@ -17,6 +21,7 @@ function readPersisted(): Catalogs | null {
       twLinks: parsed.twLinks,
       disambiguationGroups: parsed.disambiguationGroups,
       disambiguationIndex: parsed.disambiguationIndex,
+      twTitles: parsed.twTitles,
     };
   } catch {
     return null;
@@ -55,7 +60,11 @@ function load(): Promise<Catalogs> {
   return inflight;
 }
 
-export function useCatalogs(): Catalogs {
+// twTitles arrives from the API as a Record and is handed on as a Map (what
+// canonicalTwlOrder takes), so the wire field has to be Omit-ted before being
+// re-declared — intersecting Catalogs directly would demand a value that is
+// both a Record and a Map, which nothing can satisfy.
+export function useCatalogs(): Omit<Catalogs, "twTitles"> & { twTitles: Map<string, string> } {
   const [val, setVal] = useState<Catalogs>(
     () => cache ?? { supportReferences: [], twLinks: [] },
   );
@@ -73,5 +82,8 @@ export function useCatalogs(): Catalogs {
       subscribers.delete(setVal);
     };
   }, []);
-  return val;
+  // Memoized so callers (e.g. canonicalTwlOrder call sites) don't rebuild the
+  // Map on every render — only when the underlying record actually changes.
+  const twTitles = useMemo(() => new Map(Object.entries(val.twTitles ?? {})), [val.twTitles]);
+  return { ...val, twTitles };
 }

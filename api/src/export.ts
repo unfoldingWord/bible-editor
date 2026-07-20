@@ -132,6 +132,7 @@ export function buildTwlTsv(rows: TwlRow[], input?: UsfmInputs): TwlTsvResult {
   const { referenceOrdered, versePositions, sortOrderUpdates } = orderTwlRows(
     rows,
     input?.verses ?? [],
+    input?.twTitles ?? null,
   );
 
   const body = referenceOrdered
@@ -364,6 +365,10 @@ export interface UsfmInputs {
   bibleVersion: string;
   headers: unknown[] | null;   // usfm-js headers array, or null to synthesize
   verses: VerseRow[];
+  // tw_link → TW article title, for canonical TWL headword anchoring (see
+  // twlCanonicalOrder.ts). Only buildTwlTsv reads it; omitted/empty means
+  // ordering falls back to its pre-headword behaviour.
+  twTitles?: Map<string, string>;
 }
 
 // Mirror of `recomputeTargetOccurrences` in importParsers.ts (kept local to
