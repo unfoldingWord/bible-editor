@@ -483,13 +483,14 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     [pushPipelineToast],
   );
 
-  // Derive the chapter lock from active pipeline jobs. Any non-terminal job
-  // whose scope covers this (book, chapter) locks the editor; the banner
-  // surfaces the started-at time and the TN cards switch to keep-mode.
+  // Derive the chapter lock from active pipeline jobs. A run only locks the
+  // resource it will overwrite when it lands: "generate" writes scripture,
+  // "notes" writes TN, "tqs" writes TQ. Nothing writes TWL, so word links are
+  // never locked. Mirrors WRITERS in api/src/chapterLock.ts — keep in sync.
   const [activeJobs, setActiveJobs] = useState<PipelineJob[]>([]);
   useEffect(() => pipelineStore.subscribe(setActiveJobs), []);
-  const chapterLock = useMemo(() => {
-    const found = activeJobs.find(
+  const chapterLocks = useMemo(() => {
+    const running = activeJobs.filter(
       (j) =>
         j.book === book &&
         j.start_chapter <= chapter &&
@@ -499,13 +500,18 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           j.state === "paused_for_usage_limit" ||
           j.state === "dispatching"),
     );
-    if (!found) return null;
-    return {
-      jobId: found.job_id,
-      pipelineType: found.pipeline_type,
-      startedAt: found.created_at,
+    const lockFor = (type: PipelineJob["pipeline_type"]) => {
+      const found = running.find((j) => j.pipeline_type === type);
+      if (!found) return null;
+      return {
+        jobId: found.job_id,
+        pipelineType: found.pipeline_type,
+        startedAt: found.created_at,
+      };
     };
+    return { verse: lockFor("generate"), tn: lockFor("notes"), tq: lockFor("tqs") };
   }, [activeJobs, book, chapter]);
+  const anyLock = chapterLocks.verse ?? chapterLocks.tn ?? chapterLocks.tq;
 
   const handleSetNotePreserve = useCallback(
     async (id: string, value: boolean) => {
@@ -2356,7 +2362,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         railCollapsed={railCollapsed}
         onToggleRail={toggleRail}
       />
-      {chapterLock && (
+      {anyLock && (
         <Alert
           severity="info"
           icon={false}
@@ -2368,10 +2374,17 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
             "& .MuiAlert-message": { width: "100%" },
           }}
         >
-          AI {chapterLock.pipelineType} run in progress for {book} {chapter} —
-          started {formatRelative(chapterLock.startedAt)}. Editing is locked
-          for this chapter. You can still mark notes to keep before the new
-          set lands.
+          AI {anyLock.pipelineType} run in progress for {book} {chapter} —
+          started {formatRelative(anyLock.startedAt)}. Editing is locked for{" "}
+          {[
+            chapterLocks.verse ? "scripture" : null,
+            chapterLocks.tn ? "notes" : null,
+            chapterLocks.tq ? "questions" : null,
+          ]
+            .filter(Boolean)
+            .join(", ")}
+          {" "}in this chapter; everything else stays editable. You can still
+          mark notes to keep before the new set lands.
         </Alert>
       )}
       <Box ref={splitContainerRef} sx={{ flex: 1, display: "flex", overflow: "hidden" }}>
@@ -2552,7 +2565,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           onActiveNoteMatchChange={setActiveNoteMatch}
           lexiconMap={lexiconMap}
           twl={data.twl}
-          locked={Boolean(chapterLock)}
+          locked={Boolean(chapterLocks.verse)}
         />
         </Box>
         <Box
@@ -2861,7 +2874,8 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
             applyLocalRowDelete("tq", id);
             void outbox.enqueueDeleteRow("tq", id, row.version, row.book);
           }}
-          locked={Boolean(chapterLock)}
+          lockedTn={Boolean(chapterLocks.tn)}
+          lockedTq={Boolean(chapterLocks.tq)}
           onSetNotePreserve={handleSetNotePreserve}
           onSetNoteHint={handleSetNoteHint}
           quoteBuildActiveNoteId={quoteBuildTarget?.kind === "tn" ? quoteBuildTarget.id : null}

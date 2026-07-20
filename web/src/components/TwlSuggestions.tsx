@@ -62,14 +62,13 @@ interface Props {
   // before isExcluded / blockedArticleIds have real data. Defaults to true so a
   // caller that doesn't wire filters is unaffected.
   filtersReady?: boolean;
-  locked?: boolean;
   // When the Words lane is checked for this verse, new suggestions are paused
   // (the editor has signed off on the words here). The list collapses to a
   // one-line "paused" strip; "reopen" peeks it without un-checking the lane.
   paused?: boolean;
 }
 
-function TwlSuggestionsInner({ book, chapter, verse, refreshKey, onAdd, isExcluded, onSuggestions, blockedArticleIds, filtersReady = true, locked = false, paused = false }: Props) {
+function TwlSuggestionsInner({ book, chapter, verse, refreshKey, onAdd, isExcluded, onSuggestions, blockedArticleIds, filtersReady = true, paused = false }: Props) {
   const [peeked, setPeeked] = useState(false);
   // Re-collapse when the verse changes or the lane is re-checked.
   useEffect(() => {
@@ -318,12 +317,12 @@ function TwlSuggestionsInner({ book, chapter, verse, refreshKey, onAdd, isExclud
                 ) : (
                   <Chip label={twShort(selected)} size="small" variant="outlined" sx={{ height: 20, fontSize: 11 }} />
                 )}
-                <Tooltip title={locked ? "" : "add this link"}>
+                <Tooltip title="add this link">
                   <span>
                     <IconButton
                       size="small"
                       color="success"
-                      disabled={locked || isRejected}
+                      disabled={isRejected}
                       onClick={() => onAdd(s, selected)}
                       sx={{ p: 0.25 }}
                     >

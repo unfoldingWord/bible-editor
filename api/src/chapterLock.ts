@@ -1,8 +1,8 @@
 // Centralized chapter-lock check. While a pipeline_jobs row is non-terminal
-// for a given (book, chapter), the chapter is read-only for mutations on
-// tn / tq / twl / verses — the AI run will overwrite anything edited mid-flight
-// when it completes. See docs/ai-pipeline-handoff.md (Phase 2c) and the plan
-// for the exemption rules (tn PATCH, /preserve, /hint, legacy /keep alias).
+// for a given (book, chapter), the chapter is read-only for mutations on the
+// resource that run will overwrite when it completes. See
+// docs/ai-pipeline-handoff.md (Phase 2c) and the plan for the exemption rules
+// (tn PATCH, /preserve, /hint, legacy /keep alias).
 
 import type { Env } from "./index";
 
@@ -24,25 +24,47 @@ const NON_TERMINAL = [
   "dispatching",
 ] as const;
 
-// Returns the first non-terminal job covering this (book, chapter), or null
-// if the chapter is unlocked. Locks are global — any translator's pipeline
-// locks the chapter for everyone, by design.
+// Which pipeline writes which resource. A run only locks what it will
+// overwrite: the questions run rewrites tq_rows and nothing else, so it must
+// not lock notes, words or scripture. No pipeline of any type writes twl_rows
+// (see api/src/pipelineImport.ts — it classifies output by repo, and there is
+// no en_twl repo), so TWL editing is never locked.
+export type LockedResource = "verse" | "tn" | "tq" | "twl";
+
+const WRITERS: Record<LockedResource, readonly string[]> = {
+  verse: ["generate"],
+  tn: ["notes"],
+  tq: ["tqs"],
+  twl: [],
+};
+
+// Returns the first non-terminal job covering this (book, chapter) that writes
+// `resource`, or null if that resource is unlocked. Omit `resource` to ask
+// "is anything running here?" (book reimport, which rewrites everything).
+// Locks are global across users — any translator's pipeline locks the resource
+// for everyone, by design.
 export async function activePipelineForChapter(
   env: Env,
   book: string,
   chapter: number,
+  resource?: LockedResource,
 ): Promise<ActiveLock | null> {
+  const types = resource ? WRITERS[resource] : null;
+  if (types && types.length === 0) return null;
   const statePlaceholders = NON_TERMINAL.map((_, i) => `?${i + 3}`).join(", ");
+  const typeClause = types
+    ? ` AND pipeline_type IN (${types.map((_, i) => `?${i + 3 + NON_TERMINAL.length}`).join(", ")})`
+    : "";
   const row = await env.DB.prepare(
     `SELECT job_id, pipeline_type, user_id, created_at
        FROM pipeline_jobs
       WHERE book = ?1
         AND start_chapter <= ?2 AND end_chapter >= ?2
-        AND state IN (${statePlaceholders})
+        AND state IN (${statePlaceholders})${typeClause}
       ORDER BY created_at ASC
       LIMIT 1`,
   )
-    .bind(book.toUpperCase(), chapter, ...NON_TERMINAL)
+    .bind(book.toUpperCase(), chapter, ...NON_TERMINAL, ...(types ?? []))
     .first<{
       job_id: string;
       pipeline_type: string;

@@ -216,10 +216,11 @@ verses.patch("/:book/:chapter/:verse/:bibleVersion", requireEditor, async (c) =>
     return c.json({ error: "invalid_content", reason: "unsafe_marker_tag" }, 400);
   }
 
-  // Lock verse writes while an AI pipeline targets this chapter. The
-  // auto-apply step overwrites verse content on completion; concurrent edits
-  // would race with it and silently lose to the AI result.
-  const lock = await activePipelineForChapter(c.env, book, chapter);
+  // Lock verse writes while a scripture-generating run targets this chapter.
+  // Its auto-apply step overwrites verse content on completion; concurrent
+  // edits would race with it and silently lose to the AI result. Notes and
+  // questions runs never write verses, so they don't lock this.
+  const lock = await activePipelineForChapter(c.env, book, chapter, "verse");
   if (lock) return c.json(lockedResponseBody(lock), 409);
 
   // Self-heal the occurrence numbering before it lands in D1 (and therefore in
