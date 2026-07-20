@@ -60,6 +60,10 @@ if ($LASTEXITCODE -ne 0 -or -not "$gitCommon".Trim()) {
 $gitCommon  = "$gitCommon".Trim()
 if (-not [IO.Path]::IsPathRooted($gitCommon)) { $gitCommon = Join-Path $scriptDir $gitCommon }
 $mainRoot   = (Resolve-Path (Join-Path $gitCommon '..')).Path
+# Re-derive gitCommon from the now-canonical $mainRoot: the raw value above can
+# carry an unresolved '..' segment (e.g. '...\scripts\..\.git'), which would
+# silently break any later string-prefix comparison against it.
+$gitCommon  = Join-Path $mainRoot '.git'
 
 # Normalize a path for case/slash-insensitive equality comparison.
 function Norm([string]$p) { if (-not $p) { return '' }; return $p.TrimEnd('\','/').Replace('/','\').ToLower() }
@@ -122,6 +126,23 @@ function Get-RegisteredWorktrees {
   return $items
 }
 
+# A directory only counts as an orphaned WORKTREE of this repo if its own
+# .git file (worktree checkouts have a plain-text .git FILE, not a folder)
+# points into this repo's .git/worktrees/. This is a pure file-content check
+# (no git invocation, so it can't itself fail on dubious-ownership) and stops
+# an unrelated directory that merely matches the be-*/BibleEditor-* naming
+# convention -- e.g. a user's own backup folder -- from being classified as
+# a removable orphan and reaching the -Remove guard below.
+function Test-IsOwnWorktreeDir([string]$p) {
+  $gitFile = Join-Path $p '.git'
+  if (-not (Test-Path -LiteralPath $gitFile -PathType Leaf)) { return $false }
+  $content = Get-Content -LiteralPath $gitFile -Raw -ErrorAction SilentlyContinue
+  if (-not $content -or $content -notmatch 'gitdir:\s*(.+)') { return $false }
+  $gitdir = ($Matches[1].Trim() -replace '/', '\')
+  $expectedPrefix = Join-Path $gitCommon 'worktrees'
+  return (Norm $gitdir).StartsWith((Norm $expectedPrefix))
+}
+
 # --- find on-disk worktree dirs that git no longer tracks (orphans) ---
 function Get-OrphanDirs([string[]]$registeredPaths) {
   $regNorm = $registeredPaths | ForEach-Object { Norm $_ }
@@ -134,7 +155,9 @@ function Get-OrphanDirs([string[]]$registeredPaths) {
   $orphans = @()
   foreach ($c in $candidates) {
     if ((Norm $c.FullName) -eq (Norm $mainRoot)) { continue }
-    if ($regNorm -notcontains (Norm $c.FullName)) { $orphans += $c.FullName }
+    if ($regNorm -contains (Norm $c.FullName)) { continue }
+    if (-not (Test-IsOwnWorktreeDir $c.FullName)) { continue }
+    $orphans += $c.FullName
   }
   return $orphans
 }
@@ -166,24 +189,36 @@ function Get-Classification {
     elseif ($w.locked){ $class='KEEP'; $reasons+='locked' }
     elseif (-not $onDisk) { $class='SAFE'; $reasons+='registered but directory missing (prune)' }
     else {
-      $uncommitted = @(& git -C $path status --porcelain 2>$null).Count -gt 0
-      $merged = if ($w.detached) { $false } else { Test-Merged $w.head }
-      $aheadOfMain = 0
-      if (-not $merged -and $w.head) {
-        $aheadOfMain = [int](& git -C $mainRoot rev-list --count $w.head --not origin/main main 2>$null)
-      }
-      $idleHours = [math]::Round(($now - (Get-Item -LiteralPath $path).LastWriteTime).TotalHours, 1)
+      # A single worktree's git calls can fail hard (e.g. Windows "detected
+      # dubious ownership" when the dir's ACL owner differs from the caller,
+      # which happens across sibling agent sessions). `-c safe.directory=*`
+      # avoids that for the common case, scoped to just this invocation --
+      # not a global git config change. The try/catch is defense in depth:
+      # ANY failure inspecting one worktree must degrade that worktree to
+      # GRAY (needs a human glance), never abort classification of the rest.
+      try {
+        $uncommitted = @(& git -c safe.directory=* -C $path status --porcelain 2>$null).Count -gt 0
+        $merged = if ($w.detached) { $false } else { Test-Merged $w.head }
+        $aheadOfMain = 0
+        if (-not $merged -and $w.head) {
+          $aheadOfMain = [int](& git -C $mainRoot rev-list --count $w.head --not origin/main main 2>$null)
+        }
+        $idleHours = [math]::Round(($now - (Get-Item -LiteralPath $path).LastWriteTime).TotalHours, 1)
 
-      if ($w.detached)       { $class='GRAY'; $reasons+='detached HEAD' }
-      elseif ($uncommitted)  { $class='GRAY'; $reasons+='uncommitted changes' }
-      elseif (-not $merged) {
-        if ($aheadOfMain -gt 0) { $class='KEEP'; $reasons+="active: $aheadOfMain commit(s) ahead of main" }
-        else { $class='GRAY'; $reasons+='not merged, nothing ahead of main (why does it exist?)' }
-      }
-      else {
-        # merged + clean
-        if ($idleHours -ge $GraceHours) { $class='SAFE'; $reasons+="merged, clean, idle ${idleHours}h (>= ${GraceHours}h grace)" }
-        else { $class='GRAY'; $reasons+="merged & clean but idle only ${idleHours}h (< ${GraceHours}h grace)" }
+        if ($w.detached)       { $class='GRAY'; $reasons+='detached HEAD' }
+        elseif ($uncommitted)  { $class='GRAY'; $reasons+='uncommitted changes' }
+        elseif (-not $merged) {
+          if ($aheadOfMain -gt 0) { $class='KEEP'; $reasons+="active: $aheadOfMain commit(s) ahead of main" }
+          else { $class='GRAY'; $reasons+='not merged, nothing ahead of main (why does it exist?)' }
+        }
+        else {
+          # merged + clean
+          if ($idleHours -ge $GraceHours) { $class='SAFE'; $reasons+="merged, clean, idle ${idleHours}h (>= ${GraceHours}h grace)" }
+          else { $class='GRAY'; $reasons+="merged & clean but idle only ${idleHours}h (< ${GraceHours}h grace)" }
+        }
+      } catch {
+        $class = 'GRAY'
+        $reasons += "could not inspect worktree: $($_.Exception.Message.Split("`n")[0])"
       }
     }
 
@@ -196,7 +231,8 @@ function Get-Classification {
 
   foreach ($o in $orphans) {
     $reasons = @('orphan: on disk but not a registered worktree')
-    $branch = (& git -C $o rev-parse --abbrev-ref HEAD 2>$null)
+    $branch = $null
+    try { $branch = (& git -c safe.directory=* -C $o rev-parse --abbrev-ref HEAD 2>$null) } catch {}
     $results += [ordered]@{
       path=$o; branch=$branch; head=$null; registered=$false
       onDisk=$true; locked=$false; detached=$false
