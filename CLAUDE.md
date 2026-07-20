@@ -97,7 +97,7 @@ node scripts/import-book.mjs ZEC      # generates scripts/out/import-ZEC.sql
 node scripts/import-lexicon.mjs       # UHAL + UGL → scripts/out/import-lexicon.sql
 ```
 
-Fresh git worktree: run `scripts/worktree-init.ps1` from the worktree root to junction `node_modules` from main (skips `npm install`). If you bump deps in the branch, delete the junctions and run `npm install` so changes don't leak into main.
+Fresh git worktree: run `scripts/worktree-init.ps1` from the worktree root — it runs a real (cache-fast) `npm install` so the worktree is self-contained. **Teardown: always use `scripts/worktree-cleanup.ps1` (dry-run by default; `-Remove '<path>'` to delete one). Never `rm -rf` / `Remove-Item -Recurse` a worktree by hand.** The init script no longer junctions `node_modules` from main: junctions were a Windows footgun — a recursive delete of a worktree followed the junction and wiped main's `node_modules` and (via npm's `@bible-editor` workspace links) main's `web/`+`api/` source. `worktree-cleanup.ps1` safely unlinks any leftover junctions (link only, never the target) before deleting.
 
 ## Architecture
 
