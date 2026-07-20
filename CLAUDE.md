@@ -25,13 +25,15 @@ Rule of thumb: if you'd open more than two files or run more than two bash comma
 - We are intentionally rethinking the backend to remove DCS from the loop except for once daily.
 - Volta-pinned: Node 24.15.0, npm 11.12.1. npm workspaces (`api/`, `web/`).
 
-## Session state — read first, update last
+## Project state — read first
 
-[`STATE.md`](STATE.md) is the persistent loop state: what just shipped, what's mid-flight, what's blocked on a human, and durable lessons that aren't in the code. **The agent forgets between sessions; this file does not.**
+[`STATE.md`](STATE.md) holds what this project **is**: the gotchas, the durable lessons, and what's blocked on a human. **The agent forgets between sessions; this file does not.**
 
-- **At the start of non-trivial work:** read `STATE.md` so you resume rather than restart. It complements the standing spec (this file + `docs/plan.md`): state says where the work is, the spec says where it's going.
-- **Before you finish:** update it. Move shipped work into **Completed**, record anything blocked under **Escalated**, and write durable cross-session facts under **Lessons learned** (there, not in chat). Bump **Last run**.
-- **Parallel worktrees:** the dated sections are append-only and newest-first, so merge conflicts resolve by keeping both sides. The canonical copy lives on `main` — rebase before relying on it. Don't delete other branches' entries.
+- **At the start of non-trivial work:** read `STATE.md` so you resume rather than restart. It complements the standing spec (this file + `docs/plan.md`): state says what bit us before, the spec says where we're going.
+- **Before you finish:** add anything blocked under **Escalated** and any durable cross-session fact under **Lessons learned** (there, not in chat). That is the *only* reason to touch this file.
+- **Never write a session log here, and never commit a `STATE.md`-only change to main.** What you just did goes in your commit message and PR description — per-branch, so it cannot conflict. A code-free commit to a shared file makes every open branch stale.
+- **In-flight status → `.claude/state/<worktree-name>.md`** (git-ignored, so it is local to this checkout), deleted when its PR merges. Separate files never collide, so parallel bursts cost nothing.
+- **To see what sibling sessions are doing, ask git and GitHub, not a file:** `git worktree list` and `gh pr list`. Those are always accurate. The tracked status section this replaced was not — when it was removed, all seven PRs it listed as "in progress" had already merged.
 
 ## Before planning, and again before executing
 
