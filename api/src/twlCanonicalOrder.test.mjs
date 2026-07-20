@@ -800,6 +800,74 @@ function ultVerseOccSpans(chapter, verse, spans) {
   );
 }
 
+// ─── Manual order lock ────────────────────────────────────────────────────────
+// A translator manually reordered a verse; canonical ordering must skip it
+// entirely — keep the stored (disagreeing) sort_order and emit no updates.
+{
+  console.log("\n[locked] a locked verse keeps its stored sort_order and emits no sortOrderUpdates");
+  const verse = ultVerse(6, 1, [
+    { content: "א", text: "first" },
+    { content: "ב", text: "second" },
+    { content: "ג", text: "third" },
+  ]);
+  // Canonical order would be a, b, g — but the verse is locked, so the stored
+  // (deliberately disagreeing) sort_order must stand instead.
+  const rows = [
+    twl("g", 6, 1, "ג", 1, 100),
+    twl("a", 6, 1, "א", 1, 200),
+    twl("b", 6, 1, "ב", 1, 300),
+  ];
+  const lockedVerses = new Set(["6:1"]);
+  const { versePositions, sortOrderUpdates } = orderTwlRows(rows, [verse], null, lockedVerses);
+  assert(versePositions.get("g") === 0, "locked: stored order stands — g (sort_order 100) first");
+  assert(versePositions.get("a") === 1, "locked: a (sort_order 200) second");
+  assert(versePositions.get("b") === 2, "locked: b (sort_order 300) third");
+  assert(sortOrderUpdates.length === 0, `locked verse emits no sortOrderUpdates (got ${JSON.stringify(sortOrderUpdates)})`);
+}
+
+// An unlocked verse in the SAME call must still be canonicalized normally —
+// the lock is per-verse, not a call-wide switch.
+{
+  console.log("\n[locked] an unlocked verse in the same book is still canonicalized");
+  const lockedVerse = ultVerse(7, 1, [
+    { content: "א", text: "first" },
+    { content: "ב", text: "second" },
+  ]);
+  const unlockedVerse = ultVerse(7, 2, [
+    { content: "ד", text: "first" },
+    { content: "ה", text: "second" },
+  ]);
+  const rows = [
+    // locked verse (7:1), stored order deliberately reversed
+    twl("l-b", 7, 1, "ב", 1, 100),
+    twl("l-a", 7, 1, "א", 1, 200),
+    // unlocked verse (7:2), stored order also reversed — must canonicalize
+    twl("u-h", 7, 2, "ה", 1, 100),
+    twl("u-d", 7, 2, "ד", 1, 200),
+  ];
+  const lockedVerses = new Set(["7:1"]); // locks 7:1 only (bucket key is chapter:verse)
+  const { versePositions, sortOrderUpdates } = orderTwlRows(
+    rows,
+    [lockedVerse, unlockedVerse],
+    null,
+    lockedVerses,
+  );
+
+  // Locked bucket: stored order stands.
+  assert(versePositions.get("l-b") === 0, "locked verse: stored order stands (l-b first)");
+  assert(versePositions.get("l-a") === 1, "locked verse: stored order stands (l-a second)");
+
+  // Unlocked bucket: canonicalized to ULT position (d before h).
+  assert(versePositions.get("u-d") === 0, "unlocked verse: canonical order (u-d first)");
+  assert(versePositions.get("u-h") === 1, "unlocked verse: canonical order (u-h second)");
+
+  const updates = toMap(sortOrderUpdates);
+  assert(
+    JSON.stringify(updates) === JSON.stringify({ "u-d": 100, "u-h": 200 }),
+    `only the unlocked verse's rows get sortOrderUpdates (got ${JSON.stringify(updates)})`,
+  );
+}
+
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed.`);
   process.exit(1);

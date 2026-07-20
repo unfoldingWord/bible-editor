@@ -1,16 +1,16 @@
 import { Fragment, type Ref, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { Box, Stack, Typography, Chip, Button, IconButton, Tooltip } from "@mui/material";
+import { Box, Stack, Typography, Chip, Button, IconButton, Tooltip, Link } from "@mui/material";
 import AddIcon from "@mui/icons-material/Add";
 import PushPinIcon from "@mui/icons-material/PushPin";
 import PushPinOutlinedIcon from "@mui/icons-material/PushPinOutlined";
-import type { TnRow, TqRow, TwlRow, VerseDto, TwlSuggestion } from "../sync/api";
+import type { TnRow, TqRow, TwlRow, VerseDto, TwlSuggestion, TwlOrderLock } from "../sync/api";
 import { NoteCard, type DropPosition } from "./NoteCard";
 import { WordsTable, type WordDropPosition } from "./WordsTable";
 import { TwlSuggestions } from "./TwlSuggestions";
 import { QuestionsTable } from "./QuestionsTable";
 import { AlignmentPanel, type AlignmentPanelHandle } from "./AlignmentPanel";
 import { noteOverlapsRange } from "../lib/verseRange";
-import { canonicalTwlOrder } from "../lib/twlCanonicalOrder";
+import { canonicalTwlOrder, twlDisplayOrder } from "../lib/twlCanonicalOrder";
 import { useCatalogs } from "../hooks/useCatalogs";
 import CheckIcon from "@mui/icons-material/Check";
 import { LANE_FILL, type LaneShade } from "../lib/laneChecks";
@@ -201,6 +201,21 @@ interface Props {
   alignmentBadge?: string;
   // Per-resource checkoff for the active verse (in-context "done" + bulk).
   checkoff?: ResourceCheckoff;
+  // The verses whose TWL link order a human has taken over — one row per locked
+  // verse. A locked verse's rows display/export/reimport in the human's
+  // sort_order, never the automatic (ULT-alignment) order; see twlDisplayOrder
+  // for the split. Passed as the rows rather than as a Set of verse numbers so
+  // there is one source of truth: the Set is derived below, and `dismissed_order`
+  // (whether the human already said "keep mine" to the CURRENT proposal) is read
+  // from the same array.
+  twlOrderLocks?: TwlOrderLock[];
+  // "Use automatic" — drops the lock so this verse goes back to automatic
+  // ordering everywhere (app, export, reimport).
+  onTwlOrderUnlock?: (verse: number) => void | Promise<void>;
+  // "Keep mine" — records the automatic order the human just declined, so the
+  // "automatic order differs" hint stays quiet until automatic ordering
+  // proposes something ELSE.
+  onTwlOrderDismiss?: (verse: number, dismissedOrder: string) => void | Promise<void>;
 }
 
 type PinKey = "notes" | "words" | "questions";
@@ -208,6 +223,11 @@ type Pinned = Record<PinKey, boolean>;
 type ResourceTab = "notes" | "words" | "questions";
 
 const PINNED_KEY = "be:pinned";
+
+// Stable empty defaults for the (optional) TWL manual-order-lock props — a
+// fresh `new Set()` / `[]` literal on every render would defeat the useMemo
+// deps below when Shell doesn't pass these (e.g. older call sites, tests).
+const EMPTY_TWL_ORDER_LOCKS: TwlOrderLock[] = [];
 
 // Drag auto-scroll: begin scrolling when the pointer is within this many px of
 // the list's top/bottom edge, advancing this many px per animation frame.
@@ -327,6 +347,9 @@ export function ResourceColumn({
   alignmentProps,
   alignmentBadge,
   checkoff,
+  twlOrderLocks = EMPTY_TWL_ORDER_LOCKS,
+  onTwlOrderUnlock,
+  onTwlOrderDismiss,
 }: Props) {
   const [pinned, setPinned] = useState<Pinned>(() => loadPinned());
   const togglePinned = (k: PinKey) => {
@@ -356,6 +379,12 @@ export function ResourceColumn({
   const [rangeStart, rangeEnd] = displayVerseRange;
   // Feeds canonicalTwlOrder's headword anchoring (tw_link → TW article title).
   const { twTitles } = useCatalogs();
+  // Derived from twlOrderLocks rather than taken as a second prop — two props
+  // carrying the same fact can disagree.
+  const lockedTwlVerses = useMemo(
+    () => new Set(twlOrderLocks.map((l) => l.verse)),
+    [twlOrderLocks],
+  );
   // When a UST verse bridge widens the range to span multiple verses (e.g. ISA
   // 33:15-16, UST row verse=15/verse_end=16 while UHB/ULT keep them separate),
   // the union must render grouped by verse — all of v15 then all of v16 — not
@@ -389,9 +418,9 @@ export function ResourceColumn({
   const twlForVerse = useMemo(
     () =>
       groupByVerse(twl.filter((r) => r.verse >= rangeStart && r.verse <= rangeEnd)).flatMap(
-        ([v, rows]) => canonicalTwlOrder(rows, ultVerseObjectsFor?.(v) ?? null, twTitles),
+        ([v, rows]) => twlDisplayOrder(rows, ultVerseObjectsFor?.(v) ?? null, twTitles, lockedTwlVerses.has(v)),
       ),
-    [twl, rangeStart, rangeEnd, ultVerseObjectsFor, twTitles],
+    [twl, rangeStart, rangeEnd, ultVerseObjectsFor, twTitles, lockedTwlVerses],
   );
 
   // Pinned sections show the whole chapter, grouped by verse. Within each
@@ -415,15 +444,52 @@ export function ResourceColumn({
       pinned.words
         ? groupByVerse(twl).map(
             ([v, rows]) =>
-              [v, canonicalTwlOrder(rows, ultVerseObjectsFor?.(v) ?? null, twTitles)] as [number, TwlRow[]],
+              [v, twlDisplayOrder(rows, ultVerseObjectsFor?.(v) ?? null, twTitles, lockedTwlVerses.has(v))] as [
+                number,
+                TwlRow[],
+              ],
           )
         : null,
-    [pinned.words, twl, ultVerseObjectsFor, twTitles],
+    [pinned.words, twl, ultVerseObjectsFor, twTitles, lockedTwlVerses],
   );
 
   const totalTn = pinned.notes ? tn.length : tnForVerse.length;
   const totalTwl = pinned.words ? twl.length : twlForVerse.length;
   const totalTq = pinned.questions ? tq.length : tqForVerse.length;
+
+  // What automatic (ULT-alignment) ordering would produce for each LOCKED
+  // verse — feeds the "Manual order" chip's "automatic order differs" hint.
+  // Computed only for locked verses (the ULT walk isn't free), so unlocked
+  // verses — the overwhelming majority — cost nothing extra here on every
+  // keystroke elsewhere in the column. Scoped like twlForVerse: when nothing
+  // is pinned, only the active verse's range needs a chip, so restricting the
+  // walk to rangeStart..rangeEnd avoids paying for every OTHER locked verse
+  // in the chapter on each keystroke; pinned view still needs the full sweep.
+  const automaticTwlByLockedVerse = useMemo(() => {
+    const map = new Map<number, TwlRow[]>();
+    if (lockedTwlVerses.size === 0) return map;
+    for (const [v, rows] of groupByVerse(twl)) {
+      if (!lockedTwlVerses.has(v)) continue;
+      if (!pinned.words && (v < rangeStart || v > rangeEnd)) continue;
+      map.set(v, canonicalTwlOrder(rows, ultVerseObjectsFor?.(v) ?? null, twTitles));
+    }
+    return map;
+  }, [twl, lockedTwlVerses, ultVerseObjectsFor, twTitles, pinned.words, rangeStart, rangeEnd]);
+
+  // Verses currently showing a live "automatic order" preview from the chip
+  // strip. Purely visual: swaps which row array a verse's WordsTable renders
+  // and disables that table's reorder controls (below) — no save, no enqueue.
+  const [previewTwlVerses, setPreviewTwlVerses] = useState<Set<number>>(
+    () => new Set(),
+  );
+  const toggleTwlOrderPreview = (verse: number) => {
+    setPreviewTwlVerses((prev) => {
+      const next = new Set(prev);
+      if (next.has(verse)) next.delete(verse);
+      else next.add(verse);
+      return next;
+    });
+  };
 
   const [dragId, setDragId] = useState<string | null>(null);
   const [dragOver, setDragOver] = useState<
@@ -805,40 +871,12 @@ export function ResourceColumn({
                 twlGroups.map(([verse, rows]) => (
                   <Fragment key={`twl-${verse}`}>
                     <VerseGroupHead verse={verse} active={verse === activeVerse} section="words" />
-                    <WordsTable
-                      rows={rows}
-                      activeId={activeWordId}
-                      onSave={onWordSave}
-                      onDelete={onWordDelete}
-                      onFocus={onWordFocus}
-                      onReorder={onWordReorder}
-                      onHoverPreview={onWordHoverPreview}
-                      onTranslateQuote={onWordTranslateQuote}
-                      onWordGloss={onWordGloss}
-                      suggestionAlternatives={twlRowAlternatives}
-                      activeQuoteBuildId={quoteBuildActiveWordId}
-                      quoteBuildSelectionCount={quoteBuildSelectionCount}
-                      onStartQuoteBuild={onStartWordQuoteBuild}
-                    />
+                    {renderTwlWords(verse, rows)}
                   </Fragment>
                 ))
               )
             ) : (
-              <WordsTable
-                rows={twlForVerse}
-                activeId={activeWordId}
-                onSave={onWordSave}
-                onDelete={onWordDelete}
-                onFocus={onWordFocus}
-                onReorder={onWordReorder}
-                onHoverPreview={onWordHoverPreview}
-                onTranslateQuote={onWordTranslateQuote}
-                onWordGloss={onWordGloss}
-                suggestionAlternatives={twlRowAlternatives}
-                activeQuoteBuildId={quoteBuildActiveWordId}
-                quoteBuildSelectionCount={quoteBuildSelectionCount}
-                onStartQuoteBuild={onStartWordQuoteBuild}
-              />
+              renderTwlWords(activeVerse, twlForVerse)
             )}
             {/* Per-verse suggestions — only in the active-verse (unpinned) view.
                 refreshKey is the verse's current link set so adding/removing a
@@ -932,6 +970,121 @@ export function ResourceColumn({
       )}
     </Box>
   );
+
+  // The Words panel's "Manual order" chip strip — rendered above a locked
+  // verse's WordsTable. `displayedRows` is that verse's CURRENTLY SHOWN order
+  // (manual, not the live preview), used only to detect whether automatic
+  // ordering would propose something different.
+  function renderTwlOrderHeader(verse: number, displayedRows: TwlRow[]) {
+    if (!lockedTwlVerses.has(verse)) return null;
+    const previewing = previewTwlVerses.has(verse);
+    const automatic = automaticTwlByLockedVerse.get(verse) ?? [];
+    const automaticSignature = automatic.map((r) => r.id).join(",");
+    const shownSignature = displayedRows.map((r) => r.id).join(",");
+    const differs = automatic.length > 0 && automaticSignature !== shownSignature;
+    const lock = twlOrderLocks.find((l) => l.verse === verse);
+    const dismissed = lock?.dismissed_order === automaticSignature;
+    return (
+      <Stack direction="row" spacing={0.75} alignItems="center" sx={{ mb: 0.5, flexWrap: "wrap", rowGap: 0.25 }}>
+        <Tooltip title="This verse's translationWords link order was set by hand. Automatic ordering (by ULT word position) leaves it alone.">
+          <Chip label="Manual order" size="small" variant="outlined" sx={{ height: 18, fontSize: 10 }} />
+        </Tooltip>
+        {/* Real buttons, not clickable text: these are the only way to hand a
+            verse back or dismiss the hint, so they have to be reachable from the
+            keyboard and announced as actions. Styled down to caption size to
+            stay quiet above a dense table. */}
+        {onTwlOrderUnlock && (
+          <Link
+            component="button"
+            type="button"
+            variant="caption"
+            underline="hover"
+            onClick={() => onTwlOrderUnlock(verse)}
+            sx={{ color: "text.secondary", fontSize: 10.5, "&:hover": { color: "primary.main" } }}
+          >
+            use automatic
+          </Link>
+        )}
+        {differs && !dismissed && (
+          <>
+            <Typography variant="caption" color="text.disabled" sx={{ fontSize: 10.5 }}>
+              · automatic order differs
+            </Typography>
+            <Link
+              component="button"
+              type="button"
+              variant="caption"
+              underline="hover"
+              aria-pressed={previewing}
+              onClick={() => toggleTwlOrderPreview(verse)}
+              sx={{ color: "primary.main", fontSize: 10.5 }}
+            >
+              {previewing ? "hide preview" : "preview"}
+            </Link>
+            {onTwlOrderDismiss && (
+              <Link
+                component="button"
+                type="button"
+                variant="caption"
+                underline="hover"
+                onClick={() => onTwlOrderDismiss(verse, automaticSignature)}
+                sx={{ color: "text.secondary", fontSize: 10.5, "&:hover": { color: "primary.main" } }}
+              >
+                keep mine
+              </Link>
+            )}
+          </>
+        )}
+      </Stack>
+    );
+  }
+
+  // The order-header + (optionally greyed) WordsTable for one verse — shared
+  // by the pinned (chapter-wide) and unpinned (active-verse) Words renders,
+  // which differ only in which verse/rows they pass in.
+  function renderTwlWords(verse: number, rows: TwlRow[]) {
+    const previewing = previewTwlVerses.has(verse);
+    const shownRows = previewing ? (automaticTwlByLockedVerse.get(verse) ?? rows) : rows;
+    return (
+      <>
+        {renderTwlOrderHeader(verse, rows)}
+        <Box
+          sx={
+            previewing
+              ? { opacity: 0.6, border: "1px dashed", borderColor: "divider", borderRadius: 1, p: 0.5 }
+              : undefined
+          }
+        >
+          {previewing && (
+            <Typography
+              variant="caption"
+              color="text.secondary"
+              sx={{ display: "block", fontStyle: "italic", mb: 0.5 }}
+            >
+              showing automatic order — nothing saved
+            </Typography>
+          )}
+          <WordsTable
+            rows={shownRows}
+            activeId={activeWordId}
+            onSave={onWordSave}
+            onDelete={onWordDelete}
+            onFocus={onWordFocus}
+            onReorder={onWordReorder}
+            onHoverPreview={onWordHoverPreview}
+            onReorderPreview={onReorderPreview}
+            readOnly={previewing}
+            onTranslateQuote={onWordTranslateQuote}
+            onWordGloss={onWordGloss}
+            suggestionAlternatives={twlRowAlternatives}
+            activeQuoteBuildId={quoteBuildActiveWordId}
+            quoteBuildSelectionCount={quoteBuildSelectionCount}
+            onStartQuoteBuild={onStartWordQuoteBuild}
+          />
+        </Box>
+      </>
+    );
+  }
 
   function renderNoteCard(r: TnRow, peers: TnRow[]) {
     const showBefore =

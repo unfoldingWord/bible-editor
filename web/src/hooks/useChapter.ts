@@ -16,6 +16,7 @@ import {
   type VerseLaneCheck,
   type CheckLane,
   type LaneCheckState,
+  type TwlOrderLock,
 } from "../sync/api";
 import { fetchWithRetry } from "../sync/fetchWithRetry";
 import { onOutboxResult } from "../sync/outbox";
@@ -45,6 +46,13 @@ export interface UseChapterReturn {
   applyLaneCheckers: (verse: number, lane: CheckLane, checkers: number[]) => void;
   /** Authoritative: replace every check for one lane in the chapter (bulk result). */
   replaceLaneChecksForLane: (lane: CheckLane, checks: VerseLaneCheck[]) => void;
+  /**
+   * Set or clear a verse's TWL manual-order lock locally. `null` clears it.
+   * Applied after the server call confirms — not optimistically: the lock is
+   * what stops automatic ordering from reverting a manual move, so showing it
+   * as taken before the server agrees would be a lie the user acts on.
+   */
+  applyLocalTwlOrderLock: (verse: number, lock: TwlOrderLock | null) => void;
 }
 
 export function useChapter(book: string, chapter: number): UseChapterReturn {
@@ -258,6 +266,17 @@ export function useChapter(book: string, chapter: number): UseChapterReturn {
     [],
   );
 
+  const applyLocalTwlOrderLock = useCallback<UseChapterReturn["applyLocalTwlOrderLock"]>(
+    (verse, lock) => {
+      setData((prev) => {
+        if (!prev) return prev;
+        const rest = (prev.twlOrderLocks ?? []).filter((l) => l.verse !== verse);
+        return { ...prev, twlOrderLocks: lock ? [...rest, lock] : rest };
+      });
+    },
+    [],
+  );
+
   // Adopt server-confirmed values when an outbox op succeeds.
   useEffect(() => {
     return onOutboxResult((op, result) => {
@@ -307,5 +326,6 @@ export function useChapter(book: string, chapter: number): UseChapterReturn {
     applyLocalLaneCheck,
     applyLaneCheckers,
     replaceLaneChecksForLane,
+    applyLocalTwlOrderLock,
   };
 }

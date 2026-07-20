@@ -12,6 +12,7 @@ import {
   Button,
   IconButton,
   Tooltip,
+  Snackbar,
 } from "@mui/material";
 import LogoutIcon from "@mui/icons-material/Logout";
 import GridViewIcon from "@mui/icons-material/GridView";
@@ -51,7 +52,7 @@ import { buildTnQuickRequest } from "../lib/tnQuickRequest";
 import { findSourceForTargetText, extractTargetSelectionText, type HighlightKey, type ReorderHighlight } from "../lib/highlight";
 import { buildQuoteFromSelection, selectionFromQuote } from "../lib/quoteBuilder";
 import { resolveSpanToSource } from "../lib/twlResolve";
-import { canonicalTwlOrder } from "../lib/twlCanonicalOrder";
+import { canonicalTwlOrder, manualTwlOrder } from "../lib/twlCanonicalOrder";
 import { useCatalogs } from "../hooks/useCatalogs";
 import { nfc } from "../lib/hebrew";
 import { TimelineRail, type VerseTile, type VerseTileLane } from "./TimelineRail";
@@ -194,7 +195,53 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     applyLocalLaneCheck,
     applyLaneCheckers,
     replaceLaneChecksForLane,
+    applyLocalTwlOrderLock,
   } = useChapter(book, chapter);
+
+  // Verses whose TW link order a human has taken over. A locked verse is ordered
+  // by its stored sort_order everywhere — display, export, reimport — instead of
+  // from the ULT alignment. Everything downstream asks this Set, so there is
+  // exactly one place that decides "is this verse manual or automatic".
+  const twlOrderLocks = data?.twlOrderLocks;
+  const lockedTwlVerses = useMemo(
+    () => new Set((twlOrderLocks ?? []).map((l) => l.verse)),
+    [twlOrderLocks],
+  );
+  // Surfaced when taking a verse manual fails, so an aborted reorder is visible
+  // rather than the drag just appearing to do nothing.
+  const [twlOrderToast, setTwlOrderToast] = useState<string | null>(null);
+
+  // "Use automatic": hand the verse back. The server also re-sequences that
+  // verse's sort_order on the way out, which bumps each row's version — so
+  // refetch rather than patching locally, or the next edit to one of those rows
+  // would go out with a stale version and take a needless 409.
+  const handleTwlOrderUnlock = useCallback(
+    async (verse: number) => {
+      try {
+        await api.unlockTwlOrder(book, chapter, verse);
+        applyLocalTwlOrderLock(verse, null);
+        await refetch();
+      } catch (e) {
+        console.error("twl order unlock failed", e);
+        setTwlOrderToast("Couldn't switch this verse back to automatic word order.");
+      }
+    },
+    [book, chapter, applyLocalTwlOrderLock, refetch],
+  );
+
+  // "Keep mine": remember the automatic order we just declined so the hint stays
+  // quiet until automatic ordering proposes something genuinely different.
+  const handleTwlOrderDismiss = useCallback(
+    async (verse: number, dismissedOrder: string) => {
+      try {
+        const lock = await api.dismissTwlOrderSuggestion(book, chapter, verse, dismissedOrder);
+        applyLocalTwlOrderLock(verse, lock);
+      } catch (e) {
+        console.error("twl order dismiss failed", e);
+      }
+    },
+    [book, chapter, applyLocalTwlOrderLock],
+  );
 
   // Live cross-tab updates. The server broadcasts row writes via the
   // ChapterRoom DO; we dedupe by version so the originating user's tab
@@ -248,6 +295,9 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     },
     onLaneCheckBulkUpdate: (lane, checks) => {
       replaceLaneChecksForLane(lane, checks);
+    },
+    onTwlOrderLockUpdate: (verse, lock) => {
+      applyLocalTwlOrderLock(verse, lock);
     },
     onPipelineApplied: (_book, _chapter, pipelineType) => {
       // This socket only carries events for the chapter in view, so any hint
@@ -1018,7 +1068,20 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   );
   const reorderHighlight = useMemo<ReorderHighlight | null>(() => {
     if (!data || !reorderPreview) return null;
-    const find = (id: string | null) => (id ? data.tn.find((r) => r.id === id) ?? null : null);
+    // Notes AND word links: the ids in a preview come from whichever table the
+    // user is reordering. A TWL row's source quote lives in `orig_words` rather
+    // than `quote`, but it is the same kind of value — an original-language
+    // quote the highlight path resolves against the source and maps through the
+    // alignment — so one lookup serves both. Ids are unique per book across
+    // kinds, so checking tn first and falling through to twl can't collide.
+    const find = (id: string | null): { quote: string | null; occurrence: number | null } | null => {
+      if (!id) return null;
+      const note = data.tn.find((r) => r.id === id);
+      if (note) return { quote: note.quote, occurrence: note.occurrence };
+      const word = data.twl.find((r) => r.id === id);
+      if (word) return { quote: word.orig_words, occurrence: word.occurrence };
+      return null;
+    };
     const moved = find(reorderPreview.movedId);
     const prev = find(reorderPreview.prevId);
     const next = find(reorderPreview.nextId);
@@ -1270,14 +1333,22 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       const at = withNew.findIndex((r) => r.id === STUB);
       const prev = at > 0 ? withNew[at - 1] : null;
       const next = at >= 0 && at < withNew.length - 1 ? withNew[at + 1] : null;
-      const canonicalExisting = canonicalTwlOrder(list, ult ?? null, twTitles);
+      // Which list the midpoint is measured against. Automatic verse: the
+      // canonical order, so the stored sort_order matches what export/reimport
+      // compute. MANUAL verse: the human's order — we still use canonical
+      // ordering to pick WHICH neighbour the new link belongs beside (that's
+      // the useful judgement), but we slot it into the order the human built
+      // rather than re-deriving one they've already overridden.
+      const slotList = lockedTwlVerses.has(verse)
+        ? manualTwlOrder(list)
+        : canonicalTwlOrder(list, ult ?? null, twTitles);
       const sort_order =
         list.length === 0
           ? 100
           : prev
-            ? pickSortOrder(canonicalExisting, prev.id, "after")
+            ? pickSortOrder(slotList, prev.id, "after")
             : next
-              ? pickSortOrder(canonicalExisting, next.id, "before")
+              ? pickSortOrder(slotList, next.id, "before")
               : pickSortOrder(list, null, "after");
       const created = await api.createRow<TwlRow>("twl", {
         book,
@@ -1306,7 +1377,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         );
       }
     },
-    [data, activeVerse, verseIndexByVersion, book, chapter, twTitles],
+    [data, activeVerse, verseIndexByVersion, book, chapter, twTitles, lockedTwlVerses],
   );
 
   // Whether a per-verse suggestion is already covered on the active verse. Done
@@ -2832,6 +2903,9 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
             setActiveNoteId(id);
           }}
           onReorderPreview={handleReorderPreview}
+          twlOrderLocks={twlOrderLocks ?? []}
+          onTwlOrderUnlock={handleTwlOrderUnlock}
+          onTwlOrderDismiss={handleTwlOrderDismiss}
           onWordCreate={async () => {
             const list = sortedForVerse(data.twl, activeVerse);
             const sort_order = pickSortOrder(list, null, "after");
@@ -2848,12 +2922,50 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
             setActiveWordId(created.id);
             setActiveNoteId(null);
           }}
-          onWordReorder={(draggedId, refId, position) => {
+          onWordReorder={async (draggedId, refId, position) => {
             // See onNoteReorder: live ref list, not the stale render closure.
             const twl = dataRef.current?.twl ?? [];
             const dragged = twl.find((r) => r.id === draggedId);
             if (!dragged) return;
-            const sorted = sortedForVerse(twl, dragged.verse);
+            const verse = dragged.verse;
+            const wasLocked = lockedTwlVerses.has(verse);
+
+            // TAKE THE VERSE MANUAL FIRST, and only move once the server agrees.
+            // Without the lock, automatic ordering recomputes this verse on the
+            // next export or reimport and the move is silently reverted — and
+            // because a reorder writes no edit_log, it would be unrecoverable
+            // (STATE.md: the HOS revert, where a translator's ordering was lost
+            // outright). So a failed lock must abort the move, not proceed with
+            // an order we know won't survive the night.
+            if (!wasLocked) {
+              try {
+                const lock = await api.lockTwlOrder(book, chapter, verse);
+                applyLocalTwlOrderLock(verse, lock);
+              } catch (e) {
+                console.error("twl order lock failed; reorder aborted", e);
+                setTwlOrderToast(
+                  "Couldn't switch this verse to manual word order — nothing was moved. Try again.",
+                );
+                return;
+              }
+            }
+
+            // Renumber from the order the user is LOOKING AT. Until this verse
+            // was locked it was displayed in automatic order, which is not what
+            // sort_order says — so seeding from sort_order would make the first
+            // move jump somewhere unrelated. Once locked, display IS sort_order
+            // and the two agree. reorderSequential renumbers the whole verse
+            // 100/200/300…, which also materializes the automatic order into
+            // sort_order on the way through — exactly what a locked verse needs.
+            const rowsForVerse = twl.filter((r) => r.verse === verse);
+            // Seed from the SAME function the Words list renders with — not
+            // sortedForVerse, which breaks sort_order ties on id while
+            // manualTwlOrder breaks them on position. On a verse whose rows were
+            // never renumbered (null or duplicate sort_order) those two disagree,
+            // and the list being renumbered would not be the list on screen.
+            const sorted = wasLocked
+              ? manualTwlOrder(rowsForVerse)
+              : canonicalTwlOrder(rowsForVerse, ultVerseObjectsFor(verse), twTitles);
             const changes = reorderSequential(sorted, draggedId, refId, position);
             for (const { row, sort_order } of changes) {
               enqueueRow("twl", row, { sort_order });
@@ -3045,6 +3157,16 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           </Button>
         </DialogActions>
       </Dialog>
+      <Snackbar
+        open={!!twlOrderToast}
+        autoHideDuration={6000}
+        onClose={() => setTwlOrderToast(null)}
+        anchorOrigin={{ vertical: "bottom", horizontal: "center" }}
+      >
+        <Alert severity="warning" onClose={() => setTwlOrderToast(null)} variant="filled">
+          {twlOrderToast}
+        </Alert>
+      </Snackbar>
       <AiCompletionToasts
         notifications={aiDrafts.notifications}
         onDismiss={aiDrafts.dismiss}

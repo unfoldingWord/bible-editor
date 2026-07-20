@@ -18,11 +18,28 @@
 //   3. else the span's first English word.
 // Tier 3 is exactly the pre-headword behaviour (the lowest English index in the
 // span), so any row we cannot headword-match keeps the position it has today.
+//
+// MANUAL ORDER LOCKS. A translator can manually reorder a verse's links; once
+// they do, canonical (ULT-position) reordering must never fight them for it
+// again. `lockedVerses` (keys `${chapter}:${verse}`, loaded from
+// twl_order_locks via twlOrderLocks.ts) marks those verses: their bucket is
+// sorted by STORED sort_order instead of the headword comparator, and they are
+// excluded from the sortOrderUpdates diff entirely, so a locked verse never
+// gets a sort_order write from export or reimport. Omitting the parameter (or
+// passing null/empty) reproduces today's behaviour byte-for-byte.
 
 import type { TwlRow, VerseRow } from "./types";
 import { parseVerseContentJson } from "./contentJson.ts";
 import { sortRowsByReference } from "./tsvFormat.ts";
 import { headwordTermsFromTitle, isFunctionWord, matchesHeadword } from "./twHeadword.ts";
+
+// The per-verse key shared by the bucket map below and the lock set loaded in
+// twlOrderLocks.ts. It lives HERE, in the consumer that has to match it, because
+// the lock gate fails open: a drifted key format would silently reorder locked
+// verses again — no type error, no failing unlocked test.
+export function twlLockKey(chapter: number, verse: number): string {
+  return `${chapter}:${verse}`;
+}
 
 // Sequence TWLs by position of Hebrew word in aligned ULT.
 export function normalizeWordText(s: string | null | undefined): string {
@@ -302,6 +319,7 @@ export function orderTwlRows(
   rows: TwlRow[],
   ultVerses: VerseRow[],
   twTitles?: Map<string, string> | null,
+  lockedVerses?: Set<string> | null,
 ): TwlOrdering {
   const referenceOrdered = sortRowsByReference(rows);
 
@@ -310,14 +328,32 @@ export function orderTwlRows(
 
   // Group rows by verse
   for (const [originalIndex, row] of referenceOrdered.entries()) {
-    const key = `${row.chapter}:${row.verse}`;
+    const key = twlLockKey(row.chapter, row.verse);
     const bucket = verseRows.get(key) ?? [];
     bucket.push({ row, originalIndex });
     verseRows.set(key, bucket);
   }
 
   // Compute the desired order within each verse
-  for (const bucket of verseRows.values()) {
+  for (const [key, bucket] of verseRows.entries()) {
+    const locked = lockedVerses?.has(key) ?? false;
+
+    if (locked) {
+      // Manually ordered: sort by stored sort_order (nulls last), never the
+      // headword comparator, and skip building a sequence map — that work is
+      // wasted on a bucket whose order the export/reimport must not touch.
+      bucket.sort((a, b) => {
+        const aOrder = a.row.sort_order ?? Number.POSITIVE_INFINITY;
+        const bOrder = b.row.sort_order ?? Number.POSITIVE_INFINITY;
+        if (aOrder !== bOrder) return aOrder - bOrder;
+        return a.originalIndex - b.originalIndex;
+      });
+      bucket.forEach(({ row }, index) => {
+        versePositions.set(row.id, index);
+      });
+      continue;
+    }
+
     const verse =
       ultVerses.find(
         (v) =>
@@ -370,7 +406,11 @@ export function orderTwlRows(
 
   // Track sort_order updates: only rows in verses where reordering happened
   const sortOrderUpdates: Array<{ id: string; sort_order: number }> = [];
-  for (const bucket of verseRows.values()) {
+  for (const [key, bucket] of verseRows.entries()) {
+    // Locked verses never produce a sort_order write — the human's order is
+    // authoritative and nothing here should overwrite it.
+    if (lockedVerses?.has(key)) continue;
+
     // Check if this verse's rows were reordered from their stored sort_order
     let verseReordered = false;
     for (let i = 0; i < bucket.length; i++) {
@@ -406,6 +446,7 @@ export function computeTwlSortOrderUpdates(
   rows: TwlRow[],
   ultVerses: VerseRow[],
   twTitles?: Map<string, string> | null,
+  lockedVerses?: Set<string> | null,
 ): Array<{ id: string; sort_order: number }> {
-  return orderTwlRows(rows, ultVerses, twTitles).sortOrderUpdates;
+  return orderTwlRows(rows, ultVerses, twTitles, lockedVerses).sortOrderUpdates;
 }

@@ -131,6 +131,19 @@ export interface LaneCheckState {
   checkers: number[];
 }
 
+// A verse whose TWL link order a human has taken over. Its presence is the whole
+// manual/automatic switch: automatic (ULT-alignment) ordering skips this verse in
+// the app, in the nightly export, and in the reimport post-pass, so the stored
+// sort_order stands. `dismissed_order` is the automatic id sequence at the moment
+// the user last said "keep mine" — the "automatic order differs" hint stays quiet
+// until automatic ordering proposes something different from it.
+export interface TwlOrderLock {
+  verse: number;
+  locked_by: number;
+  locked_at: number;
+  dismissed_order: string | null;
+}
+
 export interface ChapterPayload {
   book: string;
   chapter: number;
@@ -140,6 +153,9 @@ export interface ChapterPayload {
   twl: TwlRow[];
   verseStatuses: VerseStatus[];
   verseLaneChecks: VerseLaneCheck[];
+  // Optional so a web build running against an older API (which doesn't send the
+  // field) simply behaves as "no verse is locked" — today's behaviour.
+  twlOrderLocks?: TwlOrderLock[];
 }
 
 export interface BookSummary {
@@ -1103,6 +1119,34 @@ export const api = {
     request<{ book: string; chapter: number; lane: CheckLane; checks: VerseLaneCheck[] }>(
       `/api/chapters/${encodeURIComponent(book)}/${chapter}/lanes/${lane}/bulk`,
       { method: "PATCH", body: JSON.stringify({ checked, verses }) },
+    ),
+
+  // --- TWL manual-order lock (see TwlOrderLock) ---
+  // Take a verse's TW link order manual. Awaited BEFORE the reorder itself is
+  // enqueued: if the lock doesn't land, the move would be silently reverted by
+  // the next automatic pass, which is the exact failure this feature exists to
+  // prevent (STATE.md, the HOS reorder revert).
+  lockTwlOrder: (book: string, chapter: number, verse: number) =>
+    request<TwlOrderLock>(
+      `/api/chapters/${encodeURIComponent(book)}/${chapter}/twl-order-lock`,
+      { method: "PUT", body: JSON.stringify({ verse }) },
+    ),
+
+  // Hand the verse back to automatic ordering. The server also re-sequences that
+  // verse's sort_order to the automatic order on the way out, so Door43 agrees at
+  // the next export rather than the night after.
+  unlockTwlOrder: (book: string, chapter: number, verse: number) =>
+    request<null>(
+      `/api/chapters/${encodeURIComponent(book)}/${chapter}/twl-order-lock?verse=${verse}`,
+      { method: "DELETE" },
+    ),
+
+  // "Keep mine": remember the automatic order we just declined, so the hint stays
+  // quiet until automatic ordering proposes something genuinely different.
+  dismissTwlOrderSuggestion: (book: string, chapter: number, verse: number, dismissed_order: string) =>
+    request<TwlOrderLock>(
+      `/api/chapters/${encodeURIComponent(book)}/${chapter}/twl-order-lock`,
+      { method: "PATCH", body: JSON.stringify({ verse, dismissed_order }) },
     ),
 
   createRow: <T = unknown>(kind: RowKind, body: Record<string, unknown>) =>

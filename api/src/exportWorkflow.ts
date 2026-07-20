@@ -46,6 +46,7 @@ const EXPORT_ALERT_USERNAME = "deferredreward";
 const LEGACY_EXPORT_BRANCH = "live-snapshot";
 import { applyTwlSortOrderUpdates } from "./twlSortOrderApply";
 import { loadTwTitles } from "./twTitles";
+import { loadTwlOrderLocks } from "./twlOrderLocks";
 import { runPostExport, VALIDATORS } from "./postExport";
 import { runChunkedReimport, storedResourceSha, ALL_RESOURCES as REIMPORT_RESOURCES } from "./bookReimport";
 import { dcsRawUrl, dcsResourceFile, fetchText, fileCommitSha, type ReimportResource } from "./dcsSources";
@@ -614,12 +615,19 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       if (rs.results.length === 0) {
         return { content: "", rowCount: 0, sortOrderUpdates: [] };
       }
+      // Independent reads; object-literal properties evaluate in order, so
+      // awaiting them inline would serialize two D1 round-trips per book.
+      const [twTitles, lockedVerses] = await Promise.all([
+        loadTwTitles(db),
+        loadTwlOrderLocks(db, book),
+      ]);
       const result = buildTwlTsv(rs.results, {
         book,
         bibleVersion: "ULT",
         headers: null,
         verses: ultVerses.results,
-        twTitles: await loadTwTitles(db),
+        twTitles,
+        lockedVerses,
       });
       return {
         content: result.tsv,

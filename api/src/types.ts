@@ -131,6 +131,18 @@ export interface VerseLaneCheck {
   checked_at: number;
 }
 
+// A per-verse manual order lock for TWL: while locked, automatic canonical
+// ordering skips the verse and a human owns its row order. `dismissed_order`
+// is an opaque client-supplied snapshot (the joined row-id sequence at the
+// moment the user last dismissed a reorder prompt), used to detect whether
+// the automatic order has changed again since.
+export interface TwlOrderLock {
+  verse: number;
+  locked_by: number;
+  locked_at: number;
+  dismissed_order: string | null;
+}
+
 export interface ChapterPayload {
   book: string;
   chapter: number;
@@ -140,6 +152,7 @@ export interface ChapterPayload {
   twl: TwlRow[];
   verseStatuses: VerseStatus[];
   verseLaneChecks: VerseLaneCheck[];
+  twlOrderLocks: TwlOrderLock[];
 }
 
 export interface VerseDto extends Omit<VerseRow, "content_json"> {

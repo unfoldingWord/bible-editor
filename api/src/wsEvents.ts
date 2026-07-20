@@ -11,7 +11,17 @@
 // updated their state).
 
 import type { Env } from "./index";
-import type { CheckLane, RowKind, TnRow, TqRow, TwlRow, VerseDto, VerseLaneCheck, VerseStatus } from "./types";
+import type {
+  CheckLane,
+  RowKind,
+  TnRow,
+  TqRow,
+  TwlOrderLock,
+  TwlRow,
+  VerseDto,
+  VerseLaneCheck,
+  VerseStatus,
+} from "./types";
 
 // The current set of checkers for one (verse, lane) after a toggle. `checkers`
 // is the full list of user ids so a receiving tab can recompute its own shade
@@ -35,6 +45,9 @@ export type WsEvent =
   // single-verse event broadcasts one (verse, lane); broadcasting that per
   // verse here would be a fanout storm, so the bulk path sends one event.
   | { type: "lane_check.bulk"; book: string; chapter: number; lane: CheckLane; checks: VerseLaneCheck[] }
+  // A TWL manual order lock was taken, released, or its dismissed snapshot
+  // updated for one verse. `lock` is the current row, or null after a release.
+  | { type: "twl_order_lock.updated"; verseNum: number; lock: TwlOrderLock | null }
   // An AI pipeline just wrote rows into this chapter (out of the HTTP path, so
   // no row.upserted events fired). This is a coalesced *hint* — one per changed
   // chapter, not one per row — telling open tabs their row list is stale. The

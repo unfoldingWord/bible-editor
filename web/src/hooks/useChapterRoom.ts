@@ -8,7 +8,7 @@
 
 import { useEffect, useRef } from "react";
 import { openChapterRoom } from "../sync/wsClient";
-import type { TnRow, TqRow, TwlRow, VerseDto, VerseStatus, LaneCheckState, VerseLaneCheck, CheckLane } from "../sync/api";
+import type { TnRow, TqRow, TwlRow, VerseDto, VerseStatus, LaneCheckState, VerseLaneCheck, CheckLane, TwlOrderLock } from "../sync/api";
 
 type RowKind = "tn" | "tq" | "twl";
 type AnyRow = TnRow | TqRow | TwlRow;
@@ -27,6 +27,12 @@ interface WireEvent {
   book?: string;
   chapter?: number;
   pipeline_type?: string;
+  // TWL manual-order lock. `verseNum` rather than reusing `verse` above, which
+  // already means a VerseDto on the wire — a same-named field of a different
+  // type in one union is exactly the kind of thing that type-checks and then
+  // fails at runtime.
+  verseNum?: number;
+  lock?: TwlOrderLock | null;
 }
 
 export interface UseChapterRoomHandlers {
@@ -36,6 +42,10 @@ export interface UseChapterRoomHandlers {
   onVerseStatusUpdate: (status: VerseStatus) => void;
   onLaneCheckUpdate: (check: LaneCheckState) => void;
   onLaneCheckBulkUpdate: (lane: CheckLane, checks: VerseLaneCheck[]) => void;
+  // Another tab took a verse's TWL order manual (or handed it back). Ordering is
+  // a whole-verse switch, so a stale tab would otherwise keep showing the other
+  // order until a reload.
+  onTwlOrderLockUpdate?: (verse: number, lock: TwlOrderLock | null) => void;
   // An AI pipeline wrote rows into this chapter out of band — the row list is
   // stale. Optional: tabs that don't care (or aren't this chapter) can ignore it.
   onPipelineApplied?: (book: string, chapter: number, pipelineType: string) => void;
@@ -78,6 +88,10 @@ export function useChapterRoom(
         }
         if (ev.type === "lane_check.bulk" && ev.lane && Array.isArray(ev.checks)) {
           handlersRef.current.onLaneCheckBulkUpdate(ev.lane, ev.checks);
+          return;
+        }
+        if (ev.type === "twl_order_lock.updated" && typeof ev.verseNum === "number") {
+          handlersRef.current.onTwlOrderLockUpdate?.(ev.verseNum, ev.lock ?? null);
           return;
         }
         if (

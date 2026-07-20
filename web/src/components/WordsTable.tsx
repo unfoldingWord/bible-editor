@@ -98,6 +98,23 @@ interface Props {
   // Hover a row's "locate" spot to preview where its word is in the scripture
   // (row id on enter, null on leave). No click / focus change.
   onHoverPreview?: (id: string | null) => void;
+  // Reorder stoplight, same as the notes: hovering a row's grip/arrows (or
+  // dragging it, or moving it with an arrow) lights the moved link's word plus
+  // the neighbours it would land between. Structurally typed rather than
+  // importing ResourceColumn's ReorderPreview — ResourceColumn imports THIS
+  // file, so the type import would be circular. `sticky` previews linger after
+  // an arrow move; hover/drag previews clear on leave.
+  onReorderPreview?: (
+    preview: { verse: number; movedId: string; prevId: string | null; nextId: string | null } | null,
+    sticky?: boolean,
+  ) => void;
+  // The table is showing a PROPOSED order (the "automatic order differs"
+  // preview), so interaction is off: a drag here would renumber a sequence the
+  // user is only looking at, not the one they own. Deliberately NOT the old
+  // chapter-lock prop, which was removed when pipeline locks became
+  // per-resource — no pipeline writes twl_rows, so an AI run never locks word
+  // links (see api/src/chapterLock.ts).
+  readOnly?: boolean;
   // Translate English in the quote field to source-language text via ULT
   // alignment. Returns the derived Hebrew/Greek string, or null if no
   // alignment match was found. Mirrors the NoteCard wiring.
@@ -119,16 +136,15 @@ interface Props {
   suggestionAlternatives?: Map<string, string[]>;
 }
 
-// Reversible kill-switch for the manual TWL reorder gesture. TWL links are now
-// ordered CANONICALLY (by the Hebrew/Greek word's position in the aligned ULT —
-// see ../lib/twlCanonicalOrder), computed automatically on every surface, so a
-// manual drag/arrow reorder of an aligned link would just snap back. We disable
-// the gesture rather than delete it: flip this to `true` to fully restore the
-// drag grip + up/down arrows (Shell's onWordReorder / reorderSequential are left
-// intact and still wired). tn/tq note reordering is unaffected.
-const ENABLE_TWL_MANUAL_REORDER = false;
+// The manual reorder gesture (drag grip + up/down arrows) was disabled for a
+// while behind an ENABLE_TWL_MANUAL_REORDER kill-switch: TWL links are ordered
+// automatically from the ULT alignment (see ../lib/twlCanonicalOrder), so a
+// manual move used to be recomputed away on the next export or reimport. It is
+// back now that the two can coexist: reordering a verse LOCKS it, and automatic
+// ordering skips locked verses on every surface. See Shell's onWordReorder for
+// the lock-then-move sequence, and twlDisplayOrder for the display split.
 
-function WordsTableInner({ rows, activeId, onSave, onDelete, onFocus, onReorder, onHoverPreview, onTranslateQuote, onWordGloss, activeQuoteBuildId = null, quoteBuildSelectionCount = 0, onStartQuoteBuild, suggestionAlternatives }: Props) {
+function WordsTableInner({ rows, activeId, onSave, onDelete, onFocus, onReorder, onHoverPreview, onReorderPreview, readOnly = false, onTranslateQuote, onWordGloss, activeQuoteBuildId = null, quoteBuildSelectionCount = 0, onStartQuoteBuild, suggestionAlternatives }: Props) {
   const [dragId, setDragId] = useState<string | null>(null);
   const [dragOver, setDragOver] = useState<
     { targetId: string; position: WordDropPosition } | null
@@ -173,6 +189,19 @@ function WordsTableInner({ rows, activeId, onSave, onDelete, onFocus, onReorder,
   });
   useEffect(() => () => { if (flashTimer.current) clearTimeout(flashTimer.current); }, []);
 
+  // Preview mode must be read-only to the KEYBOARD too. `pointerEvents: none`
+  // (below) only stops the mouse — the rows stay in the tab order, so a
+  // keyboard user could Tab into a proposed order and save, delete, or arrow-
+  // reorder against a sequence they never chose, from a panel that says
+  // "nothing saved". `inert` takes the whole subtree out of focus AND hit
+  // testing. Set through the ref because React 18 doesn't forward `inert` as a
+  // JSX prop (React 19 does); pointerEvents stays as the fallback for browsers
+  // without inert support.
+  useEffect(() => {
+    const el = tableRef.current;
+    if (el) el.inert = readOnly;
+  }, [readOnly]);
+
   if (rows.length === 0) {
     return (
       <Typography variant="body2" color="text.disabled" sx={{ py: 1, pl: 1 }}>
@@ -188,6 +217,10 @@ function WordsTableInner({ rows, activeId, onSave, onDelete, onFocus, onReorder,
         overflow: "hidden",
         containerType: "inline-size",
         ...draftDirtyBorderSx(),
+        // Preview only: the rows shown are a proposal, so nothing here may be
+        // dragged, typed into, or deleted — a write would apply to a sequence
+        // the user never chose. ResourceColumn also greys the whole block.
+        ...(readOnly ? { pointerEvents: "none" } : null),
       }}
     >
       <Box
@@ -216,10 +249,8 @@ function WordsTableInner({ rows, activeId, onSave, onDelete, onFocus, onReorder,
       </Box>
       {rows.map((r) => {
         const showBefore =
-          ENABLE_TWL_MANUAL_REORDER &&
           dragId && dragId !== r.id && dragOver?.targetId === r.id && dragOver.position === "before";
         const showAfter =
-          ENABLE_TWL_MANUAL_REORDER &&
           dragId && dragId !== r.id && dragOver?.targetId === r.id && dragOver.position === "after";
         // Arrows reorder within the same verse only — onReorder maps to Shell's
         // sortedForVerse, which renumbers per-verse.
@@ -238,28 +269,64 @@ function WordsTableInner({ rows, activeId, onSave, onDelete, onFocus, onReorder,
               onSave={(p) => onSave(r.id, p)}
               onDelete={() => onDelete(r.id)}
               onFocus={() => onFocus(r)}
-              onGripDragStart={ENABLE_TWL_MANUAL_REORDER ? () => setDragId(r.id) : undefined}
+              onGripDragStart={() => setDragId(r.id)}
               onMoveUp={
-                ENABLE_TWL_MANUAL_REORDER && prevWord
+                prevWord
                   ? () => {
                       pendingFocusRef.current = { id: r.id, dir: "up" };
                       onReorder(r.id, prevWord.id, "before");
+                      // Sticky: an arrow move is momentary, so the stoplight
+                      // lingers to show where the link went. The neighbours are
+                      // the ones it lands BETWEEN after the move — i.e. the row
+                      // above the one it displaced.
+                      onReorderPreview?.(
+                        {
+                          verse: r.verse,
+                          movedId: r.id,
+                          prevId: samePeers[idx - 2]?.id ?? null,
+                          nextId: prevWord.id,
+                        },
+                        true,
+                      );
                     }
                   : undefined
               }
               onMoveDown={
-                ENABLE_TWL_MANUAL_REORDER && nextWord
+                nextWord
                   ? () => {
                       pendingFocusRef.current = { id: r.id, dir: "down" };
                       onReorder(r.id, nextWord.id, "after");
+                      onReorderPreview?.(
+                        {
+                          verse: r.verse,
+                          movedId: r.id,
+                          prevId: nextWord.id,
+                          nextId: samePeers[idx + 2]?.id ?? null,
+                        },
+                        true,
+                      );
                     }
                   : undefined
+              }
+              onReorderHover={(entering) =>
+                onReorderPreview?.(
+                  entering
+                    ? {
+                        verse: r.verse,
+                        movedId: r.id,
+                        prevId: prevWord?.id ?? null,
+                        nextId: nextWord?.id ?? null,
+                      }
+                    : null,
+                  false,
+                )
               }
               flashArrow={recentMove?.id === r.id ? recentMove.dir : null}
               onHoverPreview={onHoverPreview}
               onDragEnd={() => {
                 setDragId(null);
                 setDragOver(null);
+                onReorderPreview?.(null, false);
               }}
               onRowDragOver={(position) => {
                 setDragOver((cur) =>
@@ -272,6 +339,7 @@ function WordsTableInner({ rows, activeId, onSave, onDelete, onFocus, onReorder,
                 if (dragId && dragId !== r.id) onReorder(dragId, r.id, position);
                 setDragId(null);
                 setDragOver(null);
+                onReorderPreview?.(null, false);
               }}
               onTranslateQuote={
                 onTranslateQuote ? (english) => onTranslateQuote(r, english) : undefined
@@ -301,6 +369,9 @@ export const WordsTable = memo(
   (a, b) =>
     a.rows === b.rows &&
     a.activeId === b.activeId &&
+    // Toggling the preview changes only this flag on an otherwise identical
+    // render; without it the table would keep its interactive state.
+    a.readOnly === b.readOnly &&
     a.activeQuoteBuildId === b.activeQuoteBuildId &&
     a.quoteBuildSelectionCount === b.quoteBuildSelectionCount &&
     a.suggestionAlternatives === b.suggestionAlternatives,
@@ -342,6 +413,7 @@ const WordRow = memo(function WordRow({
   onOpenArticle,
   flashArrow,
   onHoverPreview,
+  onReorderHover,
   suggestionAltIds = "",
 }: {
   row: TwlRow;
@@ -351,16 +423,18 @@ const WordRow = memo(function WordRow({
   onSave: (patch: Partial<TwlRow>) => void;
   onDelete: () => void;
   onFocus: () => void;
-  // Undefined when the manual reorder gesture is disabled (canonical ordering).
   onGripDragStart?: () => void;
-  // Reorder one slot within the verse. Undefined when already first/last, or when
-  // the manual reorder gesture is disabled.
+  // Reorder one slot within the verse. Undefined when already first/last.
   onMoveUp?: () => void;
   onMoveDown?: () => void;
   // The just-reordered arrow to flash a focus ring on ("up"/"down"), or null.
   flashArrow?: "up" | "down" | null;
   // Hover the locate spot to preview the word's scripture highlight (id / null).
   onHoverPreview?: (id: string | null) => void;
+  // Entering/leaving the reorder controls (grip + both arrows) as one unit —
+  // drives the scripture stoplight. Same contract as NoteCard's prop of this
+  // name, so the two behave identically.
+  onReorderHover?: (entering: boolean) => void;
   onDragEnd: () => void;
   onRowDragOver: (position: WordDropPosition) => void;
   onRowDrop: (position: WordDropPosition) => void;
@@ -557,11 +631,17 @@ const WordRow = memo(function WordRow({
             </IconButton>
           </Tooltip>
         )}
-        {/* Manual reorder controls — hidden while TWL order is canonical (the
-            grip cell stays for layout). Restored by flipping
-            ENABLE_TWL_MANUAL_REORDER in this file. */}
-        {ENABLE_TWL_MANUAL_REORDER && (
-          <>
+        {/* Manual reorder controls. Hovering ANY of them (grip or either arrow)
+            previews the move in the scripture: this link's word plus the two it
+            would land between. Same gesture and same stoplight as the notes —
+            NoteCard.tsx wraps its grip+arrows in an identical hover Box. The
+            first use of these controls takes the verse manual (see Shell's
+            onWordReorder), after which automatic ordering leaves it alone. */}
+        <Box
+          onMouseEnter={onReorderHover ? () => onReorderHover(true) : undefined}
+          onMouseLeave={onReorderHover ? () => onReorderHover(false) : undefined}
+          sx={{ display: "flex", flexDirection: "column", alignItems: "center" }}
+        >
             <Tooltip title="move up">
               <span>
                 <IconButton
@@ -612,8 +692,7 @@ const WordRow = memo(function WordRow({
                 </IconButton>
               </span>
             </Tooltip>
-          </>
-        )}
+        </Box>
       </Box>
       <Box sx={{ gridArea: "quote", minWidth: 0, display: "flex", gap: 0.5, alignItems: "center" }}>
         <TextField
