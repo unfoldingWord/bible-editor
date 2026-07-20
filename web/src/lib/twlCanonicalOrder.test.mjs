@@ -565,6 +565,52 @@ function ultVerseOccSpans(chapter, verse, spans) {
   );
 }
 
+{
+  console.log("\n[split-source-word] NESTED same-content pair is NOT merged");
+  // The doubled-source-milestone defect (JER 31:33 class): one \zaln-s wraps the
+  // same token twice, NESTED, with identical content and occurrence. That is
+  // corrupt data, not a split alignment — merging it would delete the #2
+  // occurrence slot and strand a TWL row carrying Occurrence=2 at the tail of
+  // the verse. Only SIBLING chunks reunite.
+  const vo = [
+    {
+      type: "milestone",
+      tag: "zaln",
+      content: "דבר",
+      occurrence: 1,
+      occurrences: 1,
+      children: [
+        {
+          type: "milestone",
+          tag: "zaln",
+          content: "דבר",
+          occurrence: 1,
+          occurrences: 1,
+          children: [{ type: "word", tag: "w", text: "word" }],
+        },
+      ],
+    },
+    {
+      type: "milestone",
+      tag: "zaln",
+      content: "אחר",
+      occurrence: 1,
+      occurrences: 1,
+      children: [{ type: "word", tag: "w", text: "other" }],
+    },
+  ];
+  const map = buildUltSequenceMap(vo);
+  assert(map.has("דבר#1"), "nested doubled pair keeps occurrence #1");
+  assert(
+    map.has("דבר#2"),
+    "nested doubled pair KEEPS occurrence #2 (a row with Occurrence=2 still resolves)",
+  );
+  assert(
+    twlSortPosition(twl("w2", "דבר", 2, 100), map, null) === 0,
+    "Occurrence=2 on the doubled word resolves to the word (index 0), not the verse tail",
+  );
+}
+
 // ─── Unknown link falls through cleanly ─────────────────────────────────────
 {
   console.log("\n[headword-missing-article] unknown link falls through cleanly");

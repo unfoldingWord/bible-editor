@@ -119,10 +119,22 @@ export function buildUltSequenceMap(
         const instanceKey = occ != null && Number.isFinite(occ) ? `${content}#${occ}` : null;
 
         let entry = instanceKey != null ? entriesByInstance.get(instanceKey) : undefined;
+        // Merge SIBLINGS only. A same-content/same-occurrence milestone that is
+        // still OPEN (on the stack) is the outer half of a NESTED pair, which is
+        // the doubled-source-milestone defect (JER 31:33 class: one \zaln-s
+        // wrapping the same token twice), not a split alignment. Those must stay
+        // two entries so their occurrence numbering is unchanged — merging them
+        // would delete the #2 slot and strand any TWL row carrying Occurrence=2
+        // at the tail of the verse. Not registered either, so a genuine later
+        // sibling still reunites with the OUTER entry.
+        if (entry && stack.includes(entry)) entry = undefined;
         if (!entry) {
-          entry = { content, words: [] };
-          entries.push(entry);
-          if (instanceKey != null) entriesByInstance.set(instanceKey, entry);
+          const fresh: MilestoneEntry = { content, words: [] };
+          entries.push(fresh);
+          if (instanceKey != null && !entriesByInstance.has(instanceKey)) {
+            entriesByInstance.set(instanceKey, fresh);
+          }
+          entry = fresh;
         }
         stack.push(entry);
         const children = o["children"];
