@@ -43,7 +43,7 @@ Both existing repair mechanisms fail on this case for the *same root reason*:
 | `updateDcsPrBranch` | `export.ts:846`, called `exportWorkflow.ts:478` | Server-side merge; 409s on genuine conflict, by design can't resolve it. |
 
 **Verification note.** The `PATCH /git/refs` existence-guard bug is documented in
-the code comments at `export.ts:469–530` and `:838–845`, in `STATE.md`, and in
+the code comments at `export.ts:469–530` and `:838–845`, and in
 session memory (`project_export_branch_no_rebase_drift`, `project_export_service_token_no_delete`).
 This design treats it as confirmed; one live re-confirmation against door43 is a
 prerequisite before relying on the implementation (see follow-up).
