@@ -174,9 +174,6 @@ interface Props {
   // ULT alignment changes, not on every render. Null when unavailable → order
   // falls back to sort_order.
   ultVerseObjectsFor?: (verse: number) => unknown[] | null;
-  // Hover a Words row's "locate" spot → preview where its word is highlighted in
-  // the scripture (pass the row id; null on leave). No click / verse jump.
-  onWordHoverPreview?: (id: string | null) => void;
   // Report the raw (pre-exclusion) suggestion list up to Shell so it can merge
   // the matcher's candidates onto committed rows (twlRowAlternatives).
   onTwlSuggestions?: (suggestions: TwlSuggestion[]) => void;
@@ -336,7 +333,6 @@ export function ResourceColumn({
   onAddTwlSuggestion,
   isTwlSuggestionExcluded,
   ultVerseObjectsFor,
-  onWordHoverPreview,
   onTwlSuggestions,
   twlRowAlternatives,
   twlBlockedArticleIds,
@@ -1071,7 +1067,6 @@ export function ResourceColumn({
             onDelete={onWordDelete}
             onFocus={onWordFocus}
             onReorder={onWordReorder}
-            onHoverPreview={onWordHoverPreview}
             onReorderPreview={onReorderPreview}
             readOnly={previewing}
             onTranslateQuote={onWordTranslateQuote}

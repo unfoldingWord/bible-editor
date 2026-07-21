@@ -5,7 +5,6 @@ import DeleteOutlineIcon from "@mui/icons-material/DeleteOutline";
 import DragIndicatorIcon from "@mui/icons-material/DragIndicator";
 import ArrowUpwardIcon from "@mui/icons-material/ArrowUpward";
 import ArrowDownwardIcon from "@mui/icons-material/ArrowDownward";
-import CenterFocusStrongIcon from "@mui/icons-material/CenterFocusStrong";
 import TranslateIcon from "@mui/icons-material/Translate";
 import AutoFixHighIcon from "@mui/icons-material/AutoFixHigh";
 import UndoIcon from "@mui/icons-material/Undo";
@@ -95,9 +94,6 @@ interface Props {
   onDelete: (id: string) => void;
   onFocus: (row: TwlRow) => void;
   onReorder: (draggedId: string, refId: string, position: WordDropPosition) => void;
-  // Hover a row's "locate" spot to preview where its word is in the scripture
-  // (row id on enter, null on leave). No click / focus change.
-  onHoverPreview?: (id: string | null) => void;
   // Reorder stoplight, same as the notes: hovering a row's grip/arrows (or
   // dragging it, or moving it with an arrow) lights the moved link's word plus
   // the neighbours it would land between. Structurally typed rather than
@@ -144,7 +140,7 @@ interface Props {
 // ordering skips locked verses on every surface. See Shell's onWordReorder for
 // the lock-then-move sequence, and twlDisplayOrder for the display split.
 
-function WordsTableInner({ rows, activeId, onSave, onDelete, onFocus, onReorder, onHoverPreview, onReorderPreview, readOnly = false, onTranslateQuote, onWordGloss, activeQuoteBuildId = null, quoteBuildSelectionCount = 0, onStartQuoteBuild, suggestionAlternatives }: Props) {
+function WordsTableInner({ rows, activeId, onSave, onDelete, onFocus, onReorder, onReorderPreview, readOnly = false, onTranslateQuote, onWordGloss, activeQuoteBuildId = null, quoteBuildSelectionCount = 0, onStartQuoteBuild, suggestionAlternatives }: Props) {
   const [dragId, setDragId] = useState<string | null>(null);
   const [dragOver, setDragOver] = useState<
     { targetId: string; position: WordDropPosition } | null
@@ -322,7 +318,6 @@ function WordsTableInner({ rows, activeId, onSave, onDelete, onFocus, onReorder,
                 )
               }
               flashArrow={recentMove?.id === r.id ? recentMove.dir : null}
-              onHoverPreview={onHoverPreview}
               onDragEnd={() => {
                 setDragId(null);
                 setDragOver(null);
@@ -412,7 +407,6 @@ const WordRow = memo(function WordRow({
   onStartQuoteBuild,
   onOpenArticle,
   flashArrow,
-  onHoverPreview,
   onReorderHover,
   suggestionAltIds = "",
 }: {
@@ -429,8 +423,6 @@ const WordRow = memo(function WordRow({
   onMoveDown?: () => void;
   // The just-reordered arrow to flash a focus ring on ("up"/"down"), or null.
   flashArrow?: "up" | "down" | null;
-  // Hover the locate spot to preview the word's scripture highlight (id / null).
-  onHoverPreview?: (id: string | null) => void;
   // Entering/leaving the reorder controls (grip + both arrows) as one unit —
   // drives the scripture stoplight. Same contract as NoteCard's prop of this
   // name, so the two behave identically.
@@ -613,24 +605,6 @@ const WordRow = memo(function WordRow({
           justifyContent: "center",
         }}
       >
-        {/* Locate spot: hovering it lights up where this link's word sits in the
-            scripture (no click / focus change). onMouseLeave clears the preview;
-            onBlur covers keyboard focus leaving via Tab. */}
-        {onHoverPreview && (
-          <Tooltip title="show in text">
-            <IconButton
-              size="small"
-              aria-label="show in text"
-              onMouseEnter={() => onHoverPreview(row.id)}
-              onMouseLeave={() => onHoverPreview(null)}
-              onFocus={() => onHoverPreview(row.id)}
-              onBlur={() => onHoverPreview(null)}
-              sx={{ p: 0, color: "text.disabled", "&:hover": { color: "primary.main" } }}
-            >
-              <CenterFocusStrongIcon sx={{ fontSize: 14 }} />
-            </IconButton>
-          </Tooltip>
-        )}
         {/* Manual reorder controls. Hovering ANY of them (grip or either arrow)
             previews the move in the scripture: this link's word plus the two it
             would land between. Same gesture and same stoplight as the notes —

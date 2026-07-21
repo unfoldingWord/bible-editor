@@ -371,12 +371,6 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   const [activeVerse, setActiveVerse] = useState(initialVerse);
   const [activeNoteId, setActiveNoteId] = useState<string | null>(null);
   const [activeWordId, setActiveWordId] = useState<string | null>(null);
-  // Transient hover preview: hovering a Words row's "locate" spot lights up where
-  // its Hebrew/Greek word sits in the scripture, without clicking (no active
-  // switch, no verse jump). Feeds the same activeQuote/activeOccurrence highlight
-  // path below and takes precedence while set; cleared on mouse-leave / nav.
-  const [hoveredWordId, setHoveredWordId] = useState<string | null>(null);
-  const handleWordHoverPreview = useCallback((id: string | null) => setHoveredWordId(id), []);
   const [mode, setMode] = useState<ScriptureMode>(() =>
     loadFromStorage<ScriptureMode>(SCRIPTURE_MODE_KEY, "stacked"),
   );
@@ -1009,12 +1003,6 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // same matcher handles directly for UHB and via \zaln-s for ULT/UST.
   const { activeQuote, activeOccurrence } = useMemo(() => {
     if (!data) return { activeQuote: null, activeOccurrence: null };
-    // Hover preview wins while it's set — light up the hovered word's location
-    // over whatever is clicked-active, then fall back on mouse-leave.
-    if (hoveredWordId) {
-      const r = data.twl.find((r) => r.id === hoveredWordId);
-      if (r) return { activeQuote: r.orig_words ?? null, activeOccurrence: r.occurrence ?? null };
-    }
     if (activeNoteId) {
       const r = data.tn.find((r) => r.id === activeNoteId);
       return { activeQuote: r?.quote ?? null, activeOccurrence: r?.occurrence ?? null };
@@ -1024,13 +1012,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       return { activeQuote: r?.orig_words ?? null, activeOccurrence: r?.occurrence ?? null };
     }
     return { activeQuote: null, activeOccurrence: null };
-  }, [activeNoteId, activeWordId, hoveredWordId, data]);
-
-  // Drop a lingering hover preview if the row could unmount without a
-  // mouse-leave (keyboard nav / verse change), so the highlight never sticks.
-  useEffect(() => {
-    setHoveredWordId(null);
-  }, [activeVerse, chapter, book]);
+  }, [activeNoteId, activeWordId, data]);
 
   // Reorder "stoplight": while a note is dragged (or for ~3s after an arrow
   // move) ResourceColumn reports the moved note's candidate neighbours; we
@@ -2698,7 +2680,6 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           tq={data.tq}
           twl={data.twl}
           ultVerseObjectsFor={ultVerseObjectsFor}
-          onWordHoverPreview={handleWordHoverPreview}
           activeNoteId={activeNoteId}
           activeWordId={activeWordId}
           findNoteQuery={findNoteQuery}
