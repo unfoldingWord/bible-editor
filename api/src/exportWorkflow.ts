@@ -51,7 +51,7 @@ import { runPostExport, VALIDATORS } from "./postExport";
 import { runChunkedReimport, storedResourceSha, ALL_RESOURCES as REIMPORT_RESOURCES } from "./bookReimport";
 import { dcsRawUrl, dcsResourceFile, fetchText, fileCommitSha, type ReimportResource } from "./dcsSources";
 import type { TnRow, TqRow, TwlRow, VerseRow } from "./types";
-import { lintUsfmVerses } from "./lint";
+import { blankRequiredRefs, lintUsfmVerses } from "./lint";
 
 export interface ExportParams {
   // Restrict the run to one book. Useful for manual /api/exports/run.
@@ -402,6 +402,34 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       }
     }
 
+    // Blank required-field HOLD gate — defense in depth for the TSV resources.
+    // A tn with an empty note (or tq empty question/response, twl empty
+    // OrigWords/TWLink) is REJECTED by DCS's whole-repo validator, so shipping
+    // it just produces an unmergeable PR. Refuse to commit the render and raise
+    // a banner listing the offending refs; the edits stay safe in D1 and the
+    // next night catches up once the row is filled in or deleted. Same skip +
+    // alert + snapshot-reason shape as the shrink guards above. This is the same
+    // set the in-app "issues to clean up" chip flags (lint.ts), so a translator
+    // sees the exact rows this gate is holding on.
+    if (dcsAllowed && (resource === "tn" || resource === "tq" || resource === "twl") && built.blankRefs.length > 0) {
+      await this.recordBlankSkipAlert(book, resource, built.blankRefs);
+      const reason = `blank_field_guard:${built.blankRefs.length}`;
+      await this.recordSnapshot(book, resource, null, null, built.rowCount, reason);
+      return {
+        book,
+        resource,
+        rowCount: built.rowCount,
+        bytes: built.content.length,
+        r2Key,
+        branch: null,
+        dcsCommitSha: null,
+        dcsChanged: false,
+        dcsSkippedReason: reason,
+        prNumber: null,
+        prReason: null,
+      };
+    }
+
     // Alignment-shrink backstop for the scripture (verse) resources. The TSV
     // shrink guard above protects row counts; this protects \zaln word
     // alignment. A verse that lost \zaln milestones on UNTOUCHED words (the
@@ -571,7 +599,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
   private async buildResource(
     book: string,
     resource: Resource,
-  ): Promise<{ content: string; rowCount: number; sortOrderUpdates: Array<{ id: string; sort_order: number }> }> {
+  ): Promise<{ content: string; rowCount: number; sortOrderUpdates: Array<{ id: string; sort_order: number }>; blankRefs: string[] }> {
     const db = this.env.DB;
     if (resource === "tn") {
       // trashed_at IS NULL excludes notes pending deletion. The nightly cron
@@ -585,7 +613,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
         )
         .bind(book)
         .all<TnRow>();
-      return { content: rs.results.length === 0 ? "" : buildTnTsv(rs.results), rowCount: rs.results.length, sortOrderUpdates: [] };
+      return { content: rs.results.length === 0 ? "" : buildTnTsv(rs.results), rowCount: rs.results.length, sortOrderUpdates: [], blankRefs: blankRequiredRefs("tn", rs.results) };
     }
     if (resource === "tq") {
       const rs = await db
@@ -595,7 +623,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
         )
         .bind(book)
         .all<TqRow>();
-      return { content: rs.results.length === 0 ? "" : buildTqTsv(rs.results), rowCount: rs.results.length, sortOrderUpdates: [] };
+      return { content: rs.results.length === 0 ? "" : buildTqTsv(rs.results), rowCount: rs.results.length, sortOrderUpdates: [], blankRefs: blankRequiredRefs("tq", rs.results) };
     }
     if (resource === "twl") {
       const rs = await db
@@ -613,7 +641,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
         .bind(book, "ULT")
         .all<VerseRow>();
       if (rs.results.length === 0) {
-        return { content: "", rowCount: 0, sortOrderUpdates: [] };
+        return { content: "", rowCount: 0, sortOrderUpdates: [], blankRefs: [] };
       }
       // Independent reads; object-literal properties evaluate in order, so
       // awaiting them inline would serialize two D1 round-trips per book.
@@ -633,6 +661,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
         content: result.tsv,
         rowCount: rs.results.length,
         sortOrderUpdates: result.sortOrderUpdates,
+        blankRefs: blankRequiredRefs("twl", rs.results),
       };
     }
     // ult / ust
@@ -644,7 +673,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       )
       .bind(book, bibleVersion)
       .all<VerseRow>();
-    if (rs.results.length === 0) return { content: "", rowCount: 0, sortOrderUpdates: [] };
+    if (rs.results.length === 0) return { content: "", rowCount: 0, sortOrderUpdates: [], blankRefs: [] };
     const headersRow = await db
       .prepare(`SELECT headers_json FROM book_usfm_meta WHERE book = ?1 AND bible_version = ?2`)
       .bind(book, bibleVersion)
@@ -662,6 +691,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       content: buildUsfm({ book, bibleVersion, headers, verses: rs.results }),
       rowCount: rs.results.length,
       sortOrderUpdates: [],
+      blankRefs: [],
     };
   }
 
@@ -982,6 +1012,26 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       `but master has ${masterRows ?? "?"} (${detail}). This looks like an incomplete D1 load (truncated fetch), ` +
       `not a real deletion — refusing to shrink master. Re-sync ${book} ${resource.toUpperCase()} from master, ` +
       `verify the row count, then re-export.`;
+    await this.writeAlert(source, message, `${this.env.DCS_BASE_URL}/unfoldingWord`);
+  }
+
+  // Banner alert when the blank required-field gate blocks an export to avoid
+  // shipping a row DCS's validator will reject (empty tn note, tq question/
+  // response, twl OrigWords/TWLink). Same replace-undismissed shape as
+  // recordShrinkSkipAlert.
+  private async recordBlankSkipAlert(
+    book: string,
+    resource: Resource,
+    blankRefs: string[],
+  ): Promise<void> {
+    const source = `export_blank:${book}:${resource}`;
+    const shown = blankRefs.slice(0, 8).join(", ");
+    const more = blankRefs.length > 8 ? `, +${blankRefs.length - 8} more` : "";
+    const message =
+      `Benjamin — nightly export BLOCKED ${book} ${resource.toUpperCase()}: ${blankRefs.length} row(s) have a blank ` +
+      `required field (${shown}${more}). DCS's whole-repo validator rejects blank rows, so this render can't merge. ` +
+      `Open ${book} in the editor, use "issues to clean up" to jump to each row, then add the missing text or delete ` +
+      `the row and re-export.`;
     await this.writeAlert(source, message, `${this.env.DCS_BASE_URL}/unfoldingWord`);
   }
 

@@ -13,7 +13,7 @@
 // reference order, ids, occurrence) are auto-fixed at export and are NOT linted
 // here. See docs/export-validation-cleanup.md.
 
-import type { TnRow, VerseRow } from "./types";
+import type { RowKind, TnRow, TqRow, TwlRow, VerseRow } from "./types";
 import { parseVerseContentJson } from "./contentJson.ts";
 import { parseRefOrderKey } from "./tsvFormat.ts";
 
@@ -23,8 +23,28 @@ export interface LintIssue {
   check: string; // DCS check name
   bucket: IssueBucket; // flag = human decision in-app; escalate = admin banner
   ref: string; // chapter:verse (or chapter) for navigation
-  rowId?: string; // TN row id (for jump-to-note)
+  rowId?: string; // row id (for jump-to-row)
   message: string;
+}
+
+// The `check` values of the blank-required-field lint below. A row whose
+// REQUIRED field is blank is REJECTED by DCS's whole-repo validator, so the
+// export HOLD gate (exportWorkflow.ts) reuses this set to refuse shipping such a
+// row — single source of truth so the in-app flag and the export gate agree.
+export const BLANK_REQUIRED_CHECKS: ReadonlySet<string> = new Set([
+  "Empty note",
+  "Empty question",
+  "Empty response",
+  "Empty OrigWords",
+  "Empty TWLink",
+]);
+
+// A required field is "blank" when it is missing or only whitespace. Computed
+// dynamically from the live row (NOT persisted as review_kind) so the flag is
+// always current and self-clears the instant the field is filled in or the row
+// is deleted. This replaces hand-stamping review_kind='blank-note' via SQL.
+function isBlankRequired(s: string | null | undefined): boolean {
+  return !s || s.trim() === "";
 }
 
 const REFERENCE_RE = /^(?:front:intro|\d+:intro|\d+:front|\d+:\d+(?:[,-][\d,:-]*\d+)*)$/;
@@ -95,6 +115,19 @@ export function lintTnRows(rows: TnRow[]): LintIssue[] {
     if (r.support_reference && !SUPPORT_REFERENCE_RE.test(r.support_reference)) {
       issues.push({ check: "7. SupportReference", bucket: "flag", ref, rowId: r.id, message: `SupportReference '${r.support_reference}' is not a valid rc:// link.` });
     }
+    // A tn row with no note fails the DCS validator on export. Section-header
+    // rows carry their `# Heading` text IN the note, so a truly empty note is
+    // genuinely invalid — there is no legitimately note-less tn row. Use
+    // chapter:verse for the ref (jump-to-note loads the chapter parsed from it).
+    if (isBlankRequired(r.note)) {
+      issues.push({
+        check: "Empty note",
+        bucket: "flag",
+        ref: `${r.chapter}:${r.verse}`,
+        rowId: r.id,
+        message: "Empty note — this row will fail DCS validation. Add a note or delete the row.",
+      });
+    }
     const note = r.note ?? "";
     for (const msg of bracketProblems(note)) {
       issues.push({ check: "13. Paired Square Bracket", bucket: "flag", ref, rowId: r.id, message: msg });
@@ -117,6 +150,58 @@ export function lintTnRows(rows: TnRow[]): LintIssue[] {
     }
   }
   return issues;
+}
+
+// tq rows: both question and response are REQUIRED; a blank one is rejected by
+// DCS on export. (tq has no other flag/escalate DCS check the export can't
+// auto-fix, so this is the whole tq lint today.)
+export function lintTqRows(rows: TqRow[]): LintIssue[] {
+  const issues: LintIssue[] = [];
+  for (const r of rows) {
+    const ref = `${r.chapter}:${r.verse}`;
+    if (isBlankRequired(r.question)) {
+      issues.push({ check: "Empty question", bucket: "flag", ref, rowId: r.id, message: "Empty question — this row will fail DCS validation. Add a question or delete the row." });
+    }
+    if (isBlankRequired(r.response)) {
+      issues.push({ check: "Empty response", bucket: "flag", ref, rowId: r.id, message: "Empty response — this row will fail DCS validation. Add a response or delete the row." });
+    }
+  }
+  return issues;
+}
+
+// twl rows: both OrigWords (orig_words) and TWLink (tw_link) are REQUIRED; a
+// blank one is rejected by DCS on export.
+export function lintTwlRows(rows: TwlRow[]): LintIssue[] {
+  const issues: LintIssue[] = [];
+  for (const r of rows) {
+    const ref = `${r.chapter}:${r.verse}`;
+    if (isBlankRequired(r.orig_words)) {
+      issues.push({ check: "Empty OrigWords", bucket: "flag", ref, rowId: r.id, message: "Empty OrigWords — this row will fail DCS validation. Add the original-language word(s) or delete the row." });
+    }
+    if (isBlankRequired(r.tw_link)) {
+      issues.push({ check: "Empty TWLink", bucket: "flag", ref, rowId: r.id, message: "Empty TWLink — this row will fail DCS validation. Add a translationWords link or delete the row." });
+    }
+  }
+  return issues;
+}
+
+// Refs of rows with a blank REQUIRED field, for the export HOLD gate. Reuses the
+// in-app lint above (single source of truth) and keeps only the blank-field
+// checks. Deduped, in row order. `kind` selects the resource's lint.
+export function blankRequiredRefs(kind: RowKind, rows: TnRow[] | TqRow[] | TwlRow[]): string[] {
+  const issues =
+    kind === "tn" ? lintTnRows(rows as TnRow[])
+    : kind === "tq" ? lintTqRows(rows as TqRow[])
+    : lintTwlRows(rows as TwlRow[]);
+  const refs: string[] = [];
+  const seen = new Set<string>();
+  for (const i of issues) {
+    if (!BLANK_REQUIRED_CHECKS.has(i.check)) continue;
+    if (seen.has(i.ref)) continue;
+    seen.add(i.ref);
+    refs.push(i.ref);
+  }
+  return refs;
 }
 
 // Count UNCLOSED footnotes in a verse's parsed nodes. usfm-js represents a
