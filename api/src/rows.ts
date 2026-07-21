@@ -558,6 +558,31 @@ rows.patch("/:kind/:id", requireEditor, async (c) => {
     | null;
   if (!current || current.deleted_at) return c.json({ error: "not_found" }, 404);
 
+  // Backstop for the blank-note data-loss bug (NUM 22:10 v4→v5). The client
+  // (NoteCard.flushPending) already blocks this with a confirm dialog, but any
+  // other writer of a tn `note` PATCH — a future bug, a stale tab, a direct API
+  // call — must not be allowed to overwrite a substantive note with "": that
+  // exports to DCS and fails whole-repo validation. Scoped strictly to the
+  // non-empty→empty transition, so already-blank rows and legitimate deletes
+  // (which go through the /trash route, not a note-blanking PATCH) are
+  // untouched. 422 is a non-retryable client error the outbox drops with a
+  // toast rather than looping.
+  if (kind === "tn" && "note" in patch) {
+    const nextBlank =
+      (typeof patch.note === "string" ? patch.note : "").replace(/\\n/g, "\n").trim() === "";
+    const currentNote = (current.note as string | null) ?? "";
+    const currentHadText = currentNote.replace(/\\n/g, "\n").trim() !== "";
+    if (nextBlank && currentHadText) {
+      return c.json(
+        {
+          error: "blank_note",
+          message: "Refusing to blank a note that has text — delete the note instead.",
+        },
+        422,
+      );
+    }
+  }
+
   // Enforce the OL-quote occurrence invariant at the source. Only fires when
   // this patch actually touches the quote or occurrence — a reorder, note-only
   // edit, or tag toggle must never trigger a retroactive heal (and the version

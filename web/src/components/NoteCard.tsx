@@ -43,6 +43,7 @@ import { useNoteTemplates } from "../hooks/useNoteTemplates";
 import { CatalogPicker } from "./CatalogPicker";
 import { shortSupport } from "../lib/supportReference";
 import { TCM, buildSH } from "../lib/noteTemplates";
+import { wouldBlankExistingNote } from "../lib/noteGuard";
 import { drafts, rowKey, draftDirtyBorderSx } from "../sync/drafts";
 
 const NoteHistoryDialog = lazy(() =>
@@ -364,6 +365,10 @@ function NoteCardInner({
   const [supportRef, setSupportRef] = useState<string | null>(row.support_reference);
   const [historyOpen, setHistoryOpen] = useState(false);
   const [aiConfirmOpen, setAiConfirmOpen] = useState(false);
+  // Open when a save would blank out a previously-substantive note; see the
+  // guard in flushPending. Routes the user to delete-or-restore rather than
+  // shipping an export-invalid empty note.
+  const [blankNoteConfirmOpen, setBlankNoteConfirmOpen] = useState(false);
   // Template dropdown anchor (only used when a support ref has >1 variant) and
   // the body staged for the "replace existing note?" confirm dialog.
   const [templateMenuAnchor, setTemplateMenuAnchor] = useState<HTMLElement | null>(null);
@@ -578,6 +583,18 @@ function NoteCardInner({
     if (supportRef !== savedRef.current.support_reference) patch.support_reference = supportRef;
     pendingRef.current = {};
     if (Object.keys(patch).length === 0) return;
+    // Refuse to silently persist a note whose substantive body was blanked.
+    // An empty note exports to DCS and fails whole-repo validation (blank rows
+    // rejected for en_tn), and blanking is almost always an accidental
+    // select-all+delete rather than an intent to erase — see NUM 22:10 v4→v5.
+    // Surface it instead: the edit stays dirty (draft-backed, orange chip) and
+    // the dialog routes the user to the correct action (delete the note, or
+    // restore its text). We block the whole flush, not just the note field, so
+    // a co-edited quote can't slip through while the note sits invalidly blank.
+    if ("note" in patch && wouldBlankExistingNote(savedNote, patch.note)) {
+      setBlankNoteConfirmOpen(true);
+      return;
+    }
     // Gate further Save clicks against the same baseline. Without this,
     // double-clicking Save before the server responds enqueues two PATCHes
     // with the same If-Match, the second of which lands as a phantom 409.
@@ -1499,6 +1516,30 @@ function NoteCardInner({
           />
         </Suspense>
       )}
+      <Dialog open={blankNoteConfirmOpen} onClose={() => setBlankNoteConfirmOpen(false)}>
+        <DialogTitle>This note is empty</DialogTitle>
+        <DialogContent>
+          <DialogContentText>
+            The note text has been cleared. An empty note can't be saved — blank
+            notes are rejected when the repository is exported. Restore the text
+            and save again, or delete the note if you no longer need it. Your
+            edit is kept locally in the meantime.
+          </DialogContentText>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setBlankNoteConfirmOpen(false)}>Keep editing</Button>
+          <Button
+            onClick={() => {
+              setBlankNoteConfirmOpen(false);
+              handleDelete();
+            }}
+            color="error"
+            variant="contained"
+          >
+            Delete note
+          </Button>
+        </DialogActions>
+      </Dialog>
       <Dialog open={aiConfirmOpen} onClose={() => setAiConfirmOpen(false)}>
         <DialogTitle>Replace existing note?</DialogTitle>
         <DialogContent>
