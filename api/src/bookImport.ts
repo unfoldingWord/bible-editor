@@ -21,8 +21,8 @@ import {
 import { requireAuth, requireEditor, currentUserId } from "./auth";
 import { BOOK_NUMBERS, dcsUrls, dcsResourceFile, fileCommitSha, fetchText } from "./dcsSources";
 import { reimportBookFromDcs, recordResourceSync, type Resource } from "./bookReimport";
-import { lintTnRows, lintUsfmVerses } from "./lint";
-import type { TnRow, VerseRow } from "./types";
+import { lintTnRows, lintTqRows, lintTwlRows, lintUsfmVerses } from "./lint";
+import type { TnRow, TqRow, TwlRow, VerseRow } from "./types";
 
 export const books = new Hono<{ Bindings: Env; Variables: { userId?: number } }>();
 
@@ -47,6 +47,19 @@ books.get("/:book/lint", requireAuth, async (c) => {
   )
     .bind(book)
     .all<TnRow>();
+  // tq/twl have no trashed_at column (only tn does), so filter deleted_at only.
+  const tq = await c.env.DB.prepare(
+    `SELECT * FROM tq_rows WHERE book = ?1 AND deleted_at IS NULL
+       ORDER BY chapter, verse, sort_order ASC NULLS LAST, id`,
+  )
+    .bind(book)
+    .all<TqRow>();
+  const twl = await c.env.DB.prepare(
+    `SELECT * FROM twl_rows WHERE book = ?1 AND deleted_at IS NULL
+       ORDER BY chapter, verse, sort_order ASC NULLS LAST, id`,
+  )
+    .bind(book)
+    .all<TwlRow>();
   const ult = await c.env.DB.prepare(
     `SELECT * FROM verses WHERE book = ?1 AND bible_version = 'ULT' ORDER BY chapter, verse`,
   )
@@ -60,6 +73,8 @@ books.get("/:book/lint", requireAuth, async (c) => {
 
   const issues = [
     ...lintTnRows(tn.results ?? []).map((i) => ({ ...i, resource: "tn" })),
+    ...lintTqRows(tq.results ?? []).map((i) => ({ ...i, resource: "tq" })),
+    ...lintTwlRows(twl.results ?? []).map((i) => ({ ...i, resource: "twl" })),
     ...lintUsfmVerses(ult.results ?? []).map((i) => ({ ...i, resource: "ult" })),
     ...lintUsfmVerses(ust.results ?? []).map((i) => ({ ...i, resource: "ust" })),
   ];
