@@ -33,8 +33,23 @@ const STANDALONE_MARKER_RE = /\\ts\\\*|\\b(?![A-Za-z])|\\p(?![A-Za-z0-9])|\\c\s+
 // Paragraph/poetry markers that MAY precede `\v` on the same line (mirrors
 // `_VERSE_PREFIX_RE` in validate_usfm_files.py) — EXCLUDING `\p`, which is a
 // standalone marker (extracted above) and must always be on its own line.
-const ATTACHABLE_PREFIX_RE =
-  /^\\(q[0-9]?|qm[0-9]?|qr|qc|qa|qd|li[0-9]?|pi[0-9]?|ph[0-9]?|m|mi|nb|pc|cls)$/;
+// Shared by ATTACHABLE_PREFIX_RE (whole-string test) and POETRY_PREFIX_RE
+// (matched anywhere in a line) so the marker set can't drift between the two.
+// Alternative order doesn't matter for correctness: the `(?![A-Za-z0-9])`
+// lookahead in POETRY_PREFIX_RE rejects a too-short alternative (e.g. `q`
+// matching inside `qm2`) and regex backtracking then tries the next
+// alternative at the same position until one satisfies the lookahead.
+const POETRY_MARKER_ALTERNATION =
+  "q[0-9]?|qm[0-9]?|qr|qc|qa|qd|li[0-9]?|pi[0-9]?|ph[0-9]?|m|mi|nb|pc|cls";
+
+const ATTACHABLE_PREFIX_RE = new RegExp(String.raw`^\\(${POETRY_MARKER_ALTERNATION})$`);
+
+// Same marker family as ATTACHABLE_PREFIX_RE, but matched WHEREVER it appears
+// in a line, not just as a whole-string prefix.
+const POETRY_PREFIX_RE = new RegExp(
+  String.raw`\\(${POETRY_MARKER_ALTERNATION})(?![A-Za-z0-9])`,
+  "g",
+);
 
 const VERSE_RE = /\\v\s+\d+/;
 
@@ -88,6 +103,31 @@ function splitAtVerses(rest: string): string[] {
   return out;
 }
 
+// Break `seg` before every mid-line occurrence of a poetry/paragraph prefix
+// marker (e.g. `\q2`), leaving a marker that starts at position 0 attached to
+// whatever follows it (that leading case is `splitAtVerses`'s job — it decides
+// whether the marker attaches to an immediately-following `\v`). Fixes the
+// usfm-js shape where a poetry marker lands mid-line after a `\zaln-e`/`\w*`
+// with no newline before it (e.g. `…\zaln-e\*,\q2\zaln-s …`), which DCS
+// requires to start its own line.
+function splitMidlinePoetryMarkers(seg: string): string[] {
+  const s = seg.trim();
+  if (s === "") return [""];
+  POETRY_PREFIX_RE.lastIndex = 0;
+  const out: string[] = [];
+  let cursor = 0;
+  let m: RegExpExecArray | null;
+  while ((m = POETRY_PREFIX_RE.exec(s))) {
+    if (m.index === cursor) continue; // marker starts this segment — leave attached
+    const before = s.slice(cursor, m.index).trim();
+    if (before) out.push(before);
+    cursor = m.index;
+  }
+  const tail = s.slice(cursor).trim();
+  if (tail) out.push(tail);
+  return out.length ? out : [s];
+}
+
 // Split one physical line into the structural lines DCS expects: each standalone
 // marker on its own line, then verse lines (one `\v` each).
 function splitStructuralLine(raw: string): string[] {
@@ -95,7 +135,9 @@ function splitStructuralLine(raw: string): string[] {
   if (s === "") return [""];
   const out: string[] = [];
   for (const seg of extractStandaloneMarkers(s)) {
-    out.push(...splitAtVerses(seg));
+    for (const sub of splitMidlinePoetryMarkers(seg)) {
+      out.push(...splitAtVerses(sub));
+    }
   }
   return out.length ? out : [""];
 }
