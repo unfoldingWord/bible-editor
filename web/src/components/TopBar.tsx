@@ -27,6 +27,7 @@ import MenuIcon from "@mui/icons-material/Menu";
 import Brightness4Icon from "@mui/icons-material/Brightness4";
 import Brightness7Icon from "@mui/icons-material/Brightness7";
 import CloudDownloadIcon from "@mui/icons-material/CloudDownload";
+import LogoutIcon from "@mui/icons-material/Logout";
 import { api, type BookListEntry, type BookSummary } from "../sync/api";
 import { SyncStatusBar } from "./SyncStatusBar";
 import { VersionIndicator } from "./VersionIndicator";
@@ -132,6 +133,7 @@ interface Props {
   railCollapsed?: boolean;
   onToggleRail?: () => void;
   onRequestReload?: () => void;
+  onLogout?: () => void;
 }
 
 export function TopBar({
@@ -146,6 +148,7 @@ export function TopBar({
   railCollapsed,
   onToggleRail,
   onRequestReload,
+  onLogout,
 }: Props) {
   const [books, setBooks] = useState<BookListEntry[]>([]);
   const [summary, setSummary] = useState<BookSummary | null>(null);
@@ -456,6 +459,21 @@ export function TopBar({
       <Divider orientation="vertical" flexItem sx={{ my: 0.5 }} />
       {pipelineMenu}
       {pipelineStatus}
+      {onLogout && (
+        <>
+          <Divider orientation="vertical" flexItem sx={{ my: 0.5 }} />
+          <Tooltip title="Sign out">
+            <IconButton
+              size="small"
+              onClick={onLogout}
+              aria-label="sign out"
+              sx={{ color: "text.disabled", "&:hover": { color: "text.secondary" } }}
+            >
+              <LogoutIcon fontSize="small" />
+            </IconButton>
+          </Tooltip>
+        </>
+      )}
       <Snackbar
         open={importing !== null}
         anchorOrigin={{ vertical: "bottom", horizontal: "center" }}
