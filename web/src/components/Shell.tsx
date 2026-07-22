@@ -10,11 +10,9 @@ import {
   DialogContentText,
   DialogTitle,
   Button,
-  IconButton,
   Tooltip,
   Snackbar,
 } from "@mui/material";
-import LogoutIcon from "@mui/icons-material/Logout";
 import GridViewIcon from "@mui/icons-material/GridView";
 import { useChapter } from "../hooks/useChapter";
 import { useChapterRoom } from "../hooks/useChapterRoom";
@@ -2436,6 +2434,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         }
         railCollapsed={railCollapsed}
         onToggleRail={toggleRail}
+        onLogout={onLogout}
       />
       {lockBanners.map((b) => (
         <Alert
@@ -2494,32 +2493,6 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
               onToggleLane={toggleLane}
               onHideLane={toggleLaneVisible}
             />
-            <Box
-              sx={{
-                flexShrink: 0,
-                bgcolor: "grey.50",
-                borderRight: "1px solid",
-                borderColor: "divider",
-                borderTop: "1px solid",
-                borderTopColor: "divider",
-                p: 0.5,
-              }}
-            >
-              <Tooltip title="Sign out" placement="right">
-                <IconButton
-                  size="small"
-                  onClick={onLogout}
-                  sx={{
-                    width: "100%",
-                    borderRadius: 0.5,
-                    color: "text.disabled",
-                    "&:hover": { color: "text.secondary" },
-                  }}
-                >
-                  <LogoutIcon sx={{ fontSize: 16 }} />
-                </IconButton>
-              </Tooltip>
-            </Box>
           </Box>
         )}
         <Box
