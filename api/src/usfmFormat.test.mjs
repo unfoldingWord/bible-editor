@@ -112,6 +112,17 @@ t("alignment/word content is never modified (counts preserved)", () => {
   assert.equal(count(out, /\\v\s+\d+/g), count(src, /\\v\s+\d+/g));
 });
 
+t("mid-line \\q2 (no preceding newline, no following \\v) breaks onto its own line", () => {
+  // Real usfm-js shape from HOS 13:15: a poetry marker glued directly after a
+  // \zaln-e/\w* run with no \v anywhere nearby to trigger splitAtVerses.
+  const ls = lines(
+    `${HDR}\\q1 \\v 15 \\w Even\\w*\n\\q2 \\w text\\w*\\zaln-e\\*\\w wealth\\w*\\zaln-e\\*,\\q2\\zaln-s |x-strong="H1931"\\*\\w and\\w*\n`,
+  );
+  const q2Idx = ls.findIndex((l) => l.startsWith("\\q2\\zaln-s"));
+  assert.ok(q2Idx > 0, "second \\q2 starts its own line");
+  assert.ok(ls[q2Idx - 1].endsWith(","), "preceding line keeps its own content, ending at the comma");
+});
+
 t("clean input passes through unchanged (no-op)", () => {
   const clean = `${HDR}\\ts\\*\n\\c 1\n\\p\n\\q1 \\v 1 \\w a\\w*\n\n\\b\n\\q1 \\v 2 \\w b\\w*\n`;
   assert.equal(norm(clean), clean);
