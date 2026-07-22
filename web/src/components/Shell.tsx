@@ -2147,6 +2147,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
             setActiveWordId(null);
             onNavigate?.(b, c, v);
           }}
+          onLogout={onLogout}
         />
         <Box sx={{ p: 4, display: "flex", alignItems: "center", gap: 2 }}>
           {status === "error" ? (
