@@ -33,15 +33,23 @@ const STANDALONE_MARKER_RE = /\\ts\\\*|\\b(?![A-Za-z])|\\p(?![A-Za-z0-9])|\\c\s+
 // Paragraph/poetry markers that MAY precede `\v` on the same line (mirrors
 // `_VERSE_PREFIX_RE` in validate_usfm_files.py) — EXCLUDING `\p`, which is a
 // standalone marker (extracted above) and must always be on its own line.
-const ATTACHABLE_PREFIX_RE =
-  /^\\(q[0-9]?|qm[0-9]?|qr|qc|qa|qd|li[0-9]?|pi[0-9]?|ph[0-9]?|m|mi|nb|pc|cls)$/;
+// Shared by ATTACHABLE_PREFIX_RE (whole-string test) and POETRY_PREFIX_RE
+// (matched anywhere in a line) so the marker set can't drift between the two.
+// Alternative order doesn't matter for correctness: the `(?![A-Za-z0-9])`
+// lookahead in POETRY_PREFIX_RE rejects a too-short alternative (e.g. `q`
+// matching inside `qm2`) and regex backtracking then tries the next
+// alternative at the same position until one satisfies the lookahead.
+const POETRY_MARKER_ALTERNATION =
+  "q[0-9]?|qm[0-9]?|qr|qc|qa|qd|li[0-9]?|pi[0-9]?|ph[0-9]?|m|mi|nb|pc|cls";
+
+const ATTACHABLE_PREFIX_RE = new RegExp(String.raw`^\\(${POETRY_MARKER_ALTERNATION})$`);
 
 // Same marker family as ATTACHABLE_PREFIX_RE, but matched WHEREVER it appears
-// in a line, not just as a whole-string prefix. `qm`/`qr`/`qc`/`qa`/`qd`/`mi`
-// are ordered before their shorter prefixes (`q`, `m`) so the alternation
-// doesn't stop early and strand the rest of the marker name as content.
-const POETRY_PREFIX_RE =
-  /\\(qm[0-9]?|qr|qc|qa|qd|li[0-9]?|pi[0-9]?|ph[0-9]?|mi|nb|pc|cls|m|q[0-9]?)(?![A-Za-z0-9])/g;
+// in a line, not just as a whole-string prefix.
+const POETRY_PREFIX_RE = new RegExp(
+  String.raw`\\(${POETRY_MARKER_ALTERNATION})(?![A-Za-z0-9])`,
+  "g",
+);
 
 const VERSE_RE = /\\v\s+\d+/;
 

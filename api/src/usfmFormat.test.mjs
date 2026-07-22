@@ -123,6 +123,16 @@ t("mid-line \\q2 (no preceding newline, no following \\v) breaks onto its own li
   assert.ok(ls[q2Idx - 1].endsWith(","), "preceding line keeps its own content, ending at the comma");
 });
 
+t("mid-line poetry marker between two verses on one raw line stays attached to its \\v", () => {
+  // Two short verses glued onto one usfm-js line, each with a distinct poetry
+  // level. splitMidlinePoetryMarkers must split BEFORE splitAtVerses runs so
+  // \q2 still attaches to \v 2 instead of being force-isolated or left glued
+  // onto the end of \v 1's line.
+  const ls = lines(`${HDR}\\q1 \\v 1 \\w a\\w* \\q2 \\v 2 \\w b\\w*\n`);
+  assert.ok(ls.some((l) => /^\\q1 \\v 1 /.test(l)), "\\q1 stays attached to \\v 1");
+  assert.ok(ls.some((l) => /^\\q2 \\v 2 /.test(l)), "\\q2 stays attached to \\v 2");
+});
+
 t("clean input passes through unchanged (no-op)", () => {
   const clean = `${HDR}\\ts\\*\n\\c 1\n\\p\n\\q1 \\v 1 \\w a\\w*\n\n\\b\n\\q1 \\v 2 \\w b\\w*\n`;
   assert.equal(norm(clean), clean);
