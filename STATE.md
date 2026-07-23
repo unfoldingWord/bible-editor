@@ -71,6 +71,17 @@ Highlights that bite repeatedly:
   quotes after a marker live on the marker node, not as a sibling.
 - **Export USFM puts punctuation outside `\w` (`\w earth\w*.`) on purpose** — correct uW form, not churn; don't "fix" it.
 
+- **Chapter-front `\p` can pile up +1 per nightly export (EZK 8/11, 2026-07).** bp-assistant's out-of-band
+  direct-to-master push is only the *trigger*; the per-night pump is the DCS-side merge of the never-rebased
+  `-be-` export branch (frozen merge-base drift — same class as the `-be-` no-rebase issue). Every BE transform
+  (`extractVersesForRange`/`buildUsfm`/`normalizeUsfmFormatting`/`applyVerseRows`) is idempotent on real bytes,
+  so BE never *creates* the extra `\p` — but it also never *collapsed* it (`dropDoubledLeadingMarkers` excludes
+  verse-0 by design), so it carried the growth forward. Fix: a front-run collapse of consecutive bare `\p` → one,
+  in `normalizeUsfmFormatting` (export) **and** `extractVersesForRange`/verse-0 (import, so D1 self-heals). It only
+  ever *removes* a duplicate `\p` — never invents one, never touches poetry or a chapter that opens without `\p`.
+  Our export normalizer is a line-*formatter*, not a semantic validator: only DCS-side CI caught the stack — hence
+  the separate task to adopt DCS's USFM validation into our write path.
+
 ## Stop conditions / goals
 
 - No standing automated loop is wired to this file yet. When one is, record its goal here, e.g.:

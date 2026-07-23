@@ -1072,4 +1072,27 @@ const zalnMs = (attrs, targetText) => ({
   assert(dropDuplicateSourceMilestones(rep) === rep, `genuine שלום שלום (distinct occ) left untouched (identity)`);
 }
 
+// Import-side collapse of a stacked chapter-front `\p` run to a single `\p`
+// (the EZK 8/11 pile-up). Verifies the D1-stored content_json heals — the piece
+// that lets master self-heal on the next nightly reimport — not just the export.
+{
+  const usfmBlob = ["\\id EZK", "\\usfm 3.0", "\\h Ezekiel", "\\c 11", "\\p", "\\p", "\\p", "\\v 1 \\w And\\w*", ""].join("\n");
+  const rows = extractVersesForRange(usfmBlob, 11, 11);
+  const front = rows.find((r) => r.chapter === 11 && r.verse === 0);
+  assert(front, "chapter-front (verse 0) row exists");
+  const frontP = JSON.parse(front.contentJson).verseObjects.filter(
+    (v) => v && v.type === "paragraph" && v.tag === "p",
+  ).length;
+  assert(frontP === 1, `stacked front \\p collapses to one in D1 content (got ${frontP})`);
+
+  // A single clean front `\p` is untouched (idempotent no-op).
+  const clean = ["\\id EZK", "\\usfm 3.0", "\\h Ezekiel", "\\c 8", "\\p", "\\v 1 \\w The\\w*", ""].join("\n");
+  const cleanFront = extractVersesForRange(clean, 8, 8).find((r) => r.chapter === 8 && r.verse === 0);
+  assert(cleanFront, "clean chapter-front row exists");
+  const cleanP = JSON.parse(cleanFront.contentJson).verseObjects.filter(
+    (v) => v && v.type === "paragraph" && v.tag === "p",
+  ).length;
+  assert(cleanP === 1, `a single front \\p is preserved (got ${cleanP})`);
+}
+
 console.log("\nAll parser smoke checks passed.");

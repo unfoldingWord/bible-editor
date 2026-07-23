@@ -138,4 +138,29 @@ t("clean input passes through unchanged (no-op)", () => {
   assert.equal(norm(clean), clean);
 });
 
+// The chapter-front `\p` pile-up (EZK 8/11): a run of consecutive `\p` at the
+// chapter front collapses to one. Regression net for the accumulation that only
+// DCS-side validation caught.
+t("stacked \\p at chapter front collapses to a single \\p", () => {
+  const out = norm(`${HDR}\\c 11\n\\p\n\n\\p\n\n\\p\n\\v 1 \\w a\\w*\n`);
+  assert.match(out, /\\c 11\n\\p\n\\v 1 /);
+  assert.equal((out.match(/^\\p$/gm) || []).length, 1, "only one \\p remains");
+});
+
+t("the collapse is idempotent (re-normalizing a collapsed front is a no-op)", () => {
+  const once = norm(`${HDR}\\c 11\n\\p\n\n\\p\n\n\\p\n\\v 1 \\w a\\w*\n`);
+  assert.equal(norm(once), once);
+});
+
+t("two \\p separated by real content are both preserved", () => {
+  const out = norm(`${HDR}\\c 3\n\\p\n\\v 1 \\w a\\w*\n\\p\n\\v 2 \\w b\\w*\n`);
+  assert.equal((out.match(/^\\p$/gm) || []).length, 2, "both \\p kept — content between them");
+});
+
+t("chapter opening with poetry keeps no \\p (none is ever invented)", () => {
+  const out = norm(`${HDR}\\c 5\n\\q1 \\v 1 \\w a\\w*\n`);
+  assert.equal((out.match(/^\\p$/gm) || []).length, 0, "no \\p added at a poetry-opening chapter");
+  assert.match(out, /\\c 5\n\\q1 \\v 1 /);
+});
+
 console.log(`\n${passed} usfmFormat tests passed`);

@@ -846,6 +846,46 @@ export function dropDoubledLeadingMarkers(prev: unknown[] | null, curr: unknown[
   return out;
 }
 
+// Collapse a run of redundant empty `\p` paragraph markers — consecutive `\p`
+// nodes separated only by whitespace text — down to a single `\p`. An empty
+// paragraph carries no content and is always redundant, so this ONLY removes a
+// duplicate `\p`: it never adds a marker, never touches poetry (`\q…`), and
+// leaves a `\p` that is followed by real content untouched. This is the
+// import-side companion to the export-side collapse in usfmFormat.ts — applied
+// here so the D1-stored content_json heals too (not just the rendered export),
+// which is what lets master self-heal on the next nightly reimport. Guards the
+// chapter-front (verse-0) `\p` pile-up seen in EZK 8/11 (see STATE.md); a no-op
+// on clean verses. Neither the input array nor its nodes are mutated.
+function collapseRedundantParagraphs(verseObjects: unknown[]): unknown[] {
+  if (!Array.isArray(verseObjects)) return verseObjects;
+  const isBareParagraph = (vo: unknown): boolean => {
+    if (!vo || typeof vo !== "object") return false;
+    const v = vo as { type?: unknown; tag?: unknown };
+    return v.type === "paragraph" && v.tag === "p";
+  };
+  const isBlankText = (vo: unknown): boolean => {
+    if (!vo || typeof vo !== "object") return false;
+    const v = vo as { type?: unknown; text?: unknown };
+    return v.type === "text" && (typeof v.text !== "string" || v.text.trim() === "");
+  };
+  const out: unknown[] = [];
+  for (const vo of verseObjects) {
+    if (isBareParagraph(vo)) {
+      // Skip back over blank text already buffered; if the previous meaningful
+      // node is also a bare `\p`, this one is a redundant empty paragraph — drop
+      // it, along with any whitespace buffered between the two `\p` nodes.
+      let j = out.length - 1;
+      while (j >= 0 && isBlankText(out[j])) j--;
+      if (j >= 0 && isBareParagraph(out[j])) {
+        while (out.length > j + 1) out.pop();
+        continue;
+      }
+    }
+    out.push(vo);
+  }
+  return out.length === verseObjects.length ? verseObjects : out;
+}
+
 // Walk verse-objects and concatenate all text. Same shape and behaviour
 // as the client-side `extractPlainText` in web/src/lib/usfm.ts — kept
 // duplicated because the Worker bundle and the web bundle are built
@@ -966,6 +1006,7 @@ export function extractVersesForRange(
         splitGluedAlignmentWords(normalizeWordPunctuation(verseObj.verseObjects ?? [])),
       );
       verseObjects = dropDoubledLeadingMarkers(prevVerseObjects, verseObjects);
+      verseObjects = collapseRedundantParagraphs(verseObjects);
       prevVerseObjects = vNum >= 1 ? verseObjects : null;
       const normalized = { ...verseObj, verseObjects };
       out.push({
