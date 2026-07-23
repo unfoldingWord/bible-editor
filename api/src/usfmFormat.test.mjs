@@ -138,18 +138,36 @@ t("clean input passes through unchanged (no-op)", () => {
   assert.equal(norm(clean), clean);
 });
 
-// The chapter-front `\p` pile-up (EZK 8/11): a run of consecutive `\p` at the
-// chapter front collapses to one. Regression net for the accumulation that only
-// DCS-side validation caught.
+// ── DCS Check 7: consecutive paragraph-marker collapse ─────────────────────
+// The chapter-front `\p` pile-up (EZK 8/11): a stray extra `\p` accumulated at
+// the chapter front one per nightly export and only DCS-side validation caught
+// it. normalizeUsfmFormatting collapses consecutive identical paragraph-family
+// markers so we stop emitting it (and heal what master already carries on the
+// next clean export).
+const pCount = (s) => norm(s).split("\n").filter((l) => l.trim() === "\\p").length;
+
 t("stacked \\p at chapter front collapses to a single \\p", () => {
   const out = norm(`${HDR}\\c 11\n\\p\n\n\\p\n\n\\p\n\\v 1 \\w a\\w*\n`);
   assert.match(out, /\\c 11\n\\p\n\\v 1 /);
   assert.equal((out.match(/^\\p$/gm) || []).length, 1, "only one \\p remains");
 });
 
+t("two consecutive \\p at chapter front collapse to one (EZK signature)", () => {
+  assert.equal(pCount(`${HDR}\\c 8\n\\p\n\\p\n\\v 1 \\w a\\w*\n`), 1);
+});
+
+t("three consecutive \\p collapse to one", () => {
+  assert.equal(pCount(`${HDR}\\c 11\n\\p\n\\p\n\\p\n\\v 1 \\w a\\w*\n`), 1);
+});
+
+t("\\p separated only by a blank line still collapses", () => {
+  assert.equal(pCount(`${HDR}\\c 1\n\\p\n\n\\p\n\\v 1 \\w a\\w*\n`), 1);
+});
+
 t("the collapse is idempotent (re-normalizing a collapsed front is a no-op)", () => {
   const once = norm(`${HDR}\\c 11\n\\p\n\n\\p\n\n\\p\n\\v 1 \\w a\\w*\n`);
   assert.equal(norm(once), once);
+  assert.equal((once.match(/^\\p$/gm) || []).length, 1);
 });
 
 t("two \\p separated by real content are both preserved", () => {
@@ -161,6 +179,17 @@ t("chapter opening with poetry keeps no \\p (none is ever invented)", () => {
   const out = norm(`${HDR}\\c 5\n\\q1 \\v 1 \\w a\\w*\n`);
   assert.equal((out.match(/^\\p$/gm) || []).length, 0, "no \\p added at a poetry-opening chapter");
   assert.match(out, /\\c 5\n\\q1 \\v 1 /);
+});
+
+t("consecutive \\q1 are NOT collapsed (DCS allows repeated poetry markers)", () => {
+  const ls = lines(`${HDR}\\q1\n\\q1\n\\v 1 \\w a\\w*\n`);
+  assert.equal(ls.filter((l) => l.trim() === "\\q1").length, 2);
+});
+
+t("mixed \\p then \\m adjacency is left intact (validator's job, not auto-fix)", () => {
+  const ls = lines(`${HDR}\\c 3\n\\p\n\\m\n\\v 1 \\w a\\w*\n`);
+  assert.ok(ls.includes("\\p"), "\\p kept");
+  assert.ok(ls.includes("\\m"), "\\m kept — not silently dropped");
 });
 
 console.log(`\n${passed} usfmFormat tests passed`);

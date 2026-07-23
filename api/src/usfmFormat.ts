@@ -53,6 +53,12 @@ const POETRY_PREFIX_RE = new RegExp(
 
 const VERSE_RE = /\\v\s+\d+/;
 
+// DCS `validate_usfm_files.py` Check 7 ("Consecutive Paragraph Markers") flags
+// two back-to-back lines each equal to one of these markers. This is EXACTLY the
+// set the validator uses (PARAGRAPH_MARKERS frozenset). `\q`/`\qN` are NOT here:
+// DCS allows consecutive poetry markers, so we must never collapse those.
+const PARAGRAPH_MARKERS = new Set(["\\p", "\\m", "\\pi", "\\mi", "\\nb", "\\cls"]);
+
 // Repair the editor's malformed `\ts*` (missing backslash before the star) to
 // the proper self-closing milestone `\ts\*`. The pattern only matches `\ts*`,
 // never a well-formed `\ts\*` (which has a backslash before the star).
@@ -187,18 +193,44 @@ function reorderMarkerRuns(lines: string[]): string[] {
     }
     // Stable sort by priority (Array.prototype.sort is stable in Node 24).
     run.sort((a, b) => markerPriority(a) - markerPriority(b));
-    // Collapse a run of consecutive `\p` down to a single `\p`. A run contains
-    // ONLY standalone markers separated by blank lines — never content — so two
-    // `\p` here are an empty paragraph, always redundant. After the sort the `\p`
-    // markers are adjacent, so this reduces N→1. It ONLY removes a duplicate `\p`:
-    // it never adds a marker, never touches poetry (`\q…`, not a standalone
-    // marker), and never affects a chapter that legitimately opens without a `\p`.
-    // Guards the chapter-front `\p` pile-up (EZK 8/11 — see STATE.md).
-    for (let r = run.length - 1; r > 0; r--) {
-      if (run[r].trim() === "\\p" && run[r - 1].trim() === "\\p") run.splice(r, 1);
-    }
+    // NB: consecutive duplicate `\p` inside this run (the EZK 8/11 chapter-front
+    // pile-up) are collapsed by the general collapseConsecutiveParagraphMarkers
+    // pass below, which also handles the `\m`/`\pi`/`\mi`/`\nb`/`\cls` family and
+    // blank-separated runs — so we don't dedupe here.
     out.push(...run);
     i = j;
+  }
+  return out;
+}
+
+// Collapse a run of consecutive IDENTICAL paragraph-family markers to one
+// (`\p \p` -> `\p`). This is the export-side auto-fix for DCS Check 7
+// ("Consecutive Paragraph Markers") and the direct fix for the EZK 8/11 front-`\p`
+// pump — a stray extra `\p` accumulated at the chapter front one per nightly
+// export and only DCS CI ever caught it. Blank lines between the markers are
+// treated as separators for emission but do NOT reset the run, so `\p`+blank+`\p`
+// collapses too (the following blankLinePass re-adds any canonical blank line).
+// Any real content line (a `\v`, text, or a non-paragraph marker) resets the run,
+// so two `\p` on either side of actual paragraph content are always preserved.
+// Only identical markers collapse: a genuinely mixed `\p`/`\m` adjacency is left
+// intact for the validator to HOLD on rather than silently guessing which to drop.
+function collapseConsecutiveParagraphMarkers(lines: string[]): string[] {
+  const out: string[] = [];
+  let prevParagraph: string | null = null;
+  for (const line of lines) {
+    const s = line.trim();
+    if (s === "") {
+      out.push(line); // blank: keep, don't reset the run
+      continue;
+    }
+    if (PARAGRAPH_MARKERS.has(s)) {
+      if (prevParagraph === s) continue; // drop the duplicate
+      prevParagraph = s;
+      out.push(line);
+      continue;
+    }
+    prevParagraph = null; // any real content ends the run
+    out.push(line);
   }
   return out;
 }
@@ -283,6 +315,7 @@ export function normalizeUsfmFormatting(usfmText: string): string {
   let lines: string[] = [];
   for (const raw of rawLines) lines.push(...splitStructuralLine(raw));
   lines = reorderMarkerRuns(lines);
+  lines = collapseConsecutiveParagraphMarkers(lines);
   lines = blankLinePass(lines);
 
   let out = lines.join("\n");
