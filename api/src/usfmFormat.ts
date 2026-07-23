@@ -187,6 +187,16 @@ function reorderMarkerRuns(lines: string[]): string[] {
     }
     // Stable sort by priority (Array.prototype.sort is stable in Node 24).
     run.sort((a, b) => markerPriority(a) - markerPriority(b));
+    // Collapse a run of consecutive `\p` down to a single `\p`. A run contains
+    // ONLY standalone markers separated by blank lines — never content — so two
+    // `\p` here are an empty paragraph, always redundant. After the sort the `\p`
+    // markers are adjacent, so this reduces N→1. It ONLY removes a duplicate `\p`:
+    // it never adds a marker, never touches poetry (`\q…`, not a standalone
+    // marker), and never affects a chapter that legitimately opens without a `\p`.
+    // Guards the chapter-front `\p` pile-up (EZK 8/11 — see STATE.md).
+    for (let r = run.length - 1; r > 0; r--) {
+      if (run[r].trim() === "\\p" && run[r - 1].trim() === "\\p") run.splice(r, 1);
+    }
     out.push(...run);
     i = j;
   }
