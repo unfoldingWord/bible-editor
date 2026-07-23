@@ -860,7 +860,11 @@ function collapseRedundantParagraphs(verseObjects: unknown[]): unknown[] {
   if (!Array.isArray(verseObjects)) return verseObjects;
   const isBareParagraph = (vo: unknown): boolean => {
     if (!vo || typeof vo !== "object") return false;
-    const v = vo as { type?: unknown; tag?: unknown };
+    const v = vo as { type?: unknown; tag?: unknown; text?: unknown };
+    // A `\p` that carries parked leading text (usfm-js parks an opening
+    // quote/brace/word on the marker node) is a real paragraph with content, not
+    // an empty redundant one — never treat it as collapsible, or its text is lost.
+    if (typeof v.text === "string" && v.text.trim() !== "") return false;
     return v.type === "paragraph" && v.tag === "p";
   };
   const isBlankText = (vo: unknown): boolean => {

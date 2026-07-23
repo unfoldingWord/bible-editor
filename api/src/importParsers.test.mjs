@@ -1093,6 +1093,16 @@ const zalnMs = (attrs, targetText) => ({
     (v) => v && v.type === "paragraph" && v.tag === "p",
   ).length;
   assert(cleanP === 1, `a single front \\p is preserved (got ${cleanP})`);
+
+  // A `\p` carrying parked leading text is real content — it must NEVER be
+  // collapsed away, even when it follows a bare `\p`.
+  const parked = ["\\id EZK", "\\usfm 3.0", "\\h Ezekiel", "\\c 11", "\\p", "\\p “The", "\\v 1 \\w And\\w*", ""].join("\n");
+  const parkedFront = extractVersesForRange(parked, 11, 11).find((r) => r.chapter === 11 && r.verse === 0);
+  assert(parkedFront, "parked-text chapter-front row exists");
+  assert(
+    parkedFront.contentJson.includes("The"),
+    `a \\p carrying parked text keeps its text (content_json: ${parkedFront.contentJson})`,
+  );
 }
 
 console.log("\nAll parser smoke checks passed.");
