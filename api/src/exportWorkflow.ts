@@ -52,6 +52,7 @@ import { runChunkedReimport, storedResourceSha, ALL_RESOURCES as REIMPORT_RESOUR
 import { dcsRawUrl, dcsResourceFile, fetchText, fileCommitSha, type ReimportResource } from "./dcsSources";
 import type { TnRow, TqRow, TwlRow, VerseRow } from "./types";
 import { blankRequiredRefs, lintUsfmVerses } from "./lint";
+import { validateUsfm, summarizeUsfmIssues } from "./usfmValidate";
 
 export interface ExportParams {
   // Restrict the run to one book. Useful for manual /api/exports/run.
@@ -444,6 +445,38 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       if (!guard.ok) {
         await this.recordAlignmentShrinkSkipAlert(book, resource, guard.detail);
         const reason = `align_shrink_guard:${guard.detail}`;
+        await this.recordSnapshot(book, resource, null, null, built.rowCount, reason);
+        return {
+          book,
+          resource,
+          rowCount: built.rowCount,
+          bytes: built.content.length,
+          r2Key,
+          branch: null,
+          dcsCommitSha: null,
+          dcsChanged: false,
+          dcsSkippedReason: reason,
+          prNumber: null,
+          prReason: null,
+        };
+      }
+    }
+
+    // USFM structural validation HOLD gate for the scripture resources. Ports
+    // DCS's own validate_usfm_files.py Check 7 (consecutive paragraph markers)
+    // and Check 8 (formatting) and runs them on the FINAL rendered USFM. This is
+    // what would have caught the EZK 8/11 front-`\p` pump on OUR write path
+    // instead of only after export via DCS CI. The collapse pass in
+    // normalizeUsfmFormatting already auto-fixes the common case, so this is the
+    // backstop: if a structural corruption our renderer can't self-heal slips
+    // through, refuse to ship it to master rather than produce an unmergeable PR.
+    // Same skip + alert + snapshot-reason shape as the guards above.
+    if (dcsAllowed && (resource === "ult" || resource === "ust")) {
+      const issues = validateUsfm(built.content);
+      if (issues.length > 0) {
+        const summary = summarizeUsfmIssues(issues);
+        await this.recordUsfmInvalidSkipAlert(book, resource, summary);
+        const reason = `usfm_invalid_guard:${issues.length}:${summary}`;
         await this.recordSnapshot(book, resource, null, null, built.rowCount, reason);
         return {
           book,
@@ -993,6 +1026,23 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       `Benjamin fix this — nightly export BLOCKED ${book} ${resource.toUpperCase()}: the render would drop \\zaln ` +
       `word alignment on verses whose text is UNCHANGED (${detail}). This is the 1CH 4:21 / NUM 24 collateral ` +
       `de-alignment signature — refusing to ship it to master. Re-align the affected verse(s) in the editor, then re-export.`;
+    await this.writeAlert(source, message, `${this.env.DCS_BASE_URL}/unfoldingWord`);
+  }
+
+  // Banner alert when the USFM structural validator blocks an ULT/UST export
+  // because the render would fail DCS's own validate_usfm_files.py (Check 7
+  // consecutive paragraph markers / Check 8 formatting) — the EZK front-`\p`
+  // pump signature. Same replace-undismissed shape as recordShrinkSkipAlert.
+  private async recordUsfmInvalidSkipAlert(
+    book: string,
+    resource: Resource,
+    summary: string,
+  ): Promise<void> {
+    const source = `export_usfm_invalid:${book}:${resource}`;
+    const message =
+      `Benjamin fix this — nightly export BLOCKED ${book} ${resource.toUpperCase()}: the rendered USFM would fail ` +
+      `DCS's validate-usfm-files (${summary}). This is the EZK front-\\p stacked-marker signature — refusing to ship ` +
+      `invalid USFM to master. Inspect the chapter for stacked \\p/\\m markers or malformed lines, fix in the editor, then re-export.`;
     await this.writeAlert(source, message, `${this.env.DCS_BASE_URL}/unfoldingWord`);
   }
 
