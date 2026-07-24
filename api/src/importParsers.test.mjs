@@ -1105,4 +1105,52 @@ const zalnMs = (attrs, targetText) => ({
   );
 }
 
+// Import-side collapse of a stacked `\ts\*` section-milestone run to a single
+// `\ts\*` (the LAM chapter-boundary pile-up). usfm-js parks the run of `\ts\*`
+// markers that sit before `\c` as TRAILING nodes on the last verse of the prior
+// chapter; verify that run heals to one in the D1-stored content_json, so master
+// self-heals on the next reimport. The exact analog of the front-`\p` collapse.
+{
+  const isTs = (v) =>
+    v && (v.tag === "ts\\*" || v.tag === "ts*" || (v.tag === "ts" && (v.content === "\\*" || v.content === "*")));
+
+  const piled = [
+    "\\id LAM", "\\usfm 3.0", "\\h Lamentations",
+    "\\c 1", "\\q1 \\v 22 \\w word\\w*.",
+    "\\ts\\*", "\\ts\\*", "\\ts\\*", "\\ts\\*",
+    "\\c 2", "\\qa ALEPH", "\\q1 \\v 1 \\w How\\w*", "",
+  ].join("\n");
+  const rows = extractVersesForRange(piled, 1, 2);
+  const last = rows.find((r) => r.chapter === 1 && r.verse === 22);
+  assert(last, "LAM 1:22 (chapter-final) row exists");
+  const tsCount = JSON.parse(last.contentJson).verseObjects.filter(isTs).length;
+  assert(tsCount === 1, `stacked chapter-boundary \\ts\\* collapses to one in D1 content (got ${tsCount})`);
+
+  // A single clean `\ts\*` boundary is untouched (idempotent no-op).
+  const clean = [
+    "\\id LAM", "\\usfm 3.0", "\\h Lamentations",
+    "\\c 1", "\\q1 \\v 22 \\w word\\w*.",
+    "\\ts\\*",
+    "\\c 2", "\\qa ALEPH", "\\q1 \\v 1 \\w How\\w*", "",
+  ].join("\n");
+  const cleanLast = extractVersesForRange(clean, 1, 2).find((r) => r.chapter === 1 && r.verse === 22);
+  assert(cleanLast, "clean LAM 1:22 row exists");
+  const cleanTs = JSON.parse(cleanLast.contentJson).verseObjects.filter(isTs).length;
+  assert(cleanTs === 1, `a single boundary \\ts\\* is preserved (got ${cleanTs})`);
+
+  // Two `\ts\*` separated by a real verse are two distinct sections — both kept.
+  const separated = [
+    "\\id LAM", "\\usfm 3.0", "\\h Lamentations",
+    "\\c 1",
+    "\\ts\\*", "\\qa ALEPH", "\\q1 \\v 1 \\w How\\w*.",
+    "\\ts\\*", "\\qa BETH", "\\q1 \\v 2 \\w She\\w*.", "",
+  ].join("\n");
+  const sepRows = extractVersesForRange(separated, 1, 1);
+  const totalTs = sepRows.reduce(
+    (n, r) => n + JSON.parse(r.contentJson).verseObjects.filter(isTs).length,
+    0,
+  );
+  assert(totalTs === 2, `\\ts\\* around real verses are both preserved (got ${totalTs})`);
+}
+
 console.log("\nAll parser smoke checks passed.");

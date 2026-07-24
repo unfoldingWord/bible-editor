@@ -192,4 +192,49 @@ t("mixed \\p then \\m adjacency is left intact (validator's job, not auto-fix)",
   assert.ok(ls.includes("\\m"), "\\m kept — not silently dropped");
 });
 
+// ── \ts\* section-milestone collapse ───────────────────────────────────────
+// The chapter-boundary `\ts\*` pile-up (LAM): a stray extra `\ts\*` accumulated
+// on the last verse of a chapter, just before `\c`, one per nightly export — the
+// exact analog of the EZK front-`\p` pump, but for the translator-section chunk
+// milestone (which is NOT a DCS Check-7 paragraph marker, so the paragraph pass
+// leaves it alone). normalizeUsfmFormatting collapses a consecutive `\ts\*` run so
+// we stop emitting the growth and heal what master carries on the next export.
+const tsCount = (s) => norm(s).split("\n").filter((l) => l.trim() === "\\ts\\*").length;
+
+t("stacked \\ts\\* at a chapter boundary collapses to one (LAM signature)", () => {
+  const out = norm(`${HDR}\\c 1\n\\q1 \\v 22 \\w a\\w*.\n\\ts\\*\n\\ts\\*\n\\ts\\*\n\\ts\\*\n\\c 2\n\\q1 \\v 1 \\w b\\w*\n`);
+  assert.equal(tsCount(out), 1, "only one \\ts\\* remains");
+  assert.match(out, /\\ts\\\*\n\\c 2\n/, "the surviving \\ts\\* still precedes \\c 2");
+});
+
+t("two consecutive \\ts\\* collapse to one", () => {
+  assert.equal(tsCount(`${HDR}\\c 1\n\\v 1 \\w a\\w*.\n\\ts\\*\n\\ts\\*\n\\c 2\n\\v 1 \\w b\\w*\n`), 1);
+});
+
+t("\\ts\\* separated only by a blank line still collapses", () => {
+  assert.equal(tsCount(`${HDR}\\c 1\n\\v 1 \\w a\\w*.\n\\ts\\*\n\n\\ts\\*\n\\c 2\n\\v 1 \\w b\\w*\n`), 1);
+});
+
+t("the \\ts\\* collapse is idempotent", () => {
+  const once = norm(`${HDR}\\c 1\n\\q1 \\v 22 \\w a\\w*.\n\\ts\\*\n\\ts\\*\n\\ts\\*\n\\c 2\n\\q1 \\v 1 \\w b\\w*\n`);
+  assert.equal(norm(once), once);
+  assert.equal(tsCount(once), 1);
+});
+
+t("two \\ts\\* separated by real content are both preserved", () => {
+  const out = norm(`${HDR}\\c 1\n\\ts\\*\n\\q1 \\v 1 \\w a\\w*.\n\\ts\\*\n\\q1 \\v 2 \\w b\\w*\n`);
+  assert.equal(tsCount(out), 2, "both \\ts\\* kept — a real verse separates the two sections");
+});
+
+t("a single \\ts\\* is never invented or dropped", () => {
+  assert.equal(tsCount(`${HDR}\\c 1\n\\v 1 \\w a\\w*.\n\\ts\\*\n\\c 2\n\\v 1 \\w b\\w*\n`), 1);
+  assert.equal(tsCount(`${HDR}\\c 1\n\\v 1 \\w a\\w*\n`), 0, "none added where there was none");
+});
+
+t("malformed \\ts* pile collapses too (repaired then deduped)", () => {
+  // Editor emits the malformed `\ts*`; repairTsStar normalizes each to `\ts\*`
+  // before the collapse, so a malformed pile heals identically to a well-formed one.
+  assert.equal(tsCount(`${HDR}\\c 1\n\\v 1 \\w a\\w*.\n\\ts*\n\\ts*\n\\ts*\n\\c 2\n\\v 1 \\w b\\w*\n`), 1);
+});
+
 console.log(`\n${passed} usfmFormat tests passed`);
