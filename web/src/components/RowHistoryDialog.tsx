@@ -32,6 +32,10 @@ export interface HistoryFieldSpec {
   label: string;
   // Hebrew/Greek quote lanes render right-to-left in a serif Hebrew stack.
   rtl?: boolean;
+  // Skip the TSV `\n` → newline unescape on display. Set for fields that are
+  // single-line identifiers (rc:// links), where a literal backslash-n is part
+  // of the value rather than an escaped break.
+  raw?: boolean;
   // Draws a rule above this field, separating the short metadata lanes from
   // the long prose ones.
   dividerBefore?: boolean;
@@ -40,7 +44,7 @@ export interface HistoryFieldSpec {
 // Field sets mirror what each editor actually lets a user change, so a
 // restore never resurrects a column the UI can't otherwise touch.
 export const TN_HISTORY_FIELDS: HistoryFieldSpec[] = [
-  { key: "support_reference", label: "Support ref" },
+  { key: "support_reference", label: "Support ref", raw: true },
   { key: "quote", label: "Quote", rtl: true },
   { key: "note", label: "Note", dividerBefore: true },
 ];
@@ -58,9 +62,14 @@ interface Props {
   fields: HistoryFieldSpec[];
   // Dialog heading, e.g. "Note history" / "Question history".
   title: string;
-  // The actual row.version — monotonically increasing, used as the
-  // If-Match expectation when we PATCH.
+  // The actual row.version — monotonically increasing. Only used to label the
+  // header "(restored)" when it disagrees with effectiveVersion; the dialog
+  // itself never PATCHes.
   currentVersion: number;
+  // False puts the dialog in view-only mode. Set while the row is locked (an
+  // AI pipeline is mid-flight), where the server would reject the restore
+  // PATCH with 409 chapter_locked anyway.
+  canRestore?: boolean;
   // The version the chip displays — equals `restored_from_version` if the
   // latest edit was a revert, otherwise equals currentVersion. The dialog
   // surfaces this entry as "current" and hides revert phantoms from the
@@ -103,6 +112,7 @@ export function RowHistoryDialog({
   fields,
   title,
   currentVersion,
+  canRestore = true,
   effectiveVersion,
   onClose,
   onUseVersion,
@@ -325,25 +335,29 @@ export function RowHistoryDialog({
                       </ToggleButton>
                     </ToggleButtonGroup>
                   </Stack>
-                  {fields.map((f) => (
-                    <Box key={f.key}>
-                      {f.dividerBefore && <Divider sx={{ mb: 1.5 }} />}
-                      {viewMode === "diff" && canDiff ? (
-                        <DiffPreview
-                          label={f.label}
-                          from={tsvToDisplay(selectedSnapshot[f.key])}
-                          to={tsvToDisplay(effectiveSnapshot![f.key])}
-                          rtl={f.rtl}
-                        />
-                      ) : (
-                        <FieldPreview
-                          label={f.label}
-                          value={tsvToDisplay(selectedSnapshot[f.key])}
-                          rtl={f.rtl}
-                        />
-                      )}
-                    </Box>
-                  ))}
+                  {fields.map((f) => {
+                    const show = (v: string | null) =>
+                      f.raw ? v : tsvToDisplay(v);
+                    return (
+                      <Box key={f.key}>
+                        {f.dividerBefore && <Divider sx={{ mb: 1.5 }} />}
+                        {viewMode === "diff" && canDiff ? (
+                          <DiffPreview
+                            label={f.label}
+                            from={show(selectedSnapshot[f.key])}
+                            to={show(effectiveSnapshot![f.key])}
+                            rtl={f.rtl}
+                          />
+                        ) : (
+                          <FieldPreview
+                            label={f.label}
+                            value={show(selectedSnapshot[f.key])}
+                            rtl={f.rtl}
+                          />
+                        )}
+                      </Box>
+                    );
+                  })}
                 </Stack>
               ) : (
                 <Typography variant="body2" color="text.secondary">
@@ -358,18 +372,20 @@ export function RowHistoryDialog({
         <Button onClick={onClose}>Close</Button>
         <Button
           variant="contained"
-          disabled={!selected || isCurrent || loading}
+          disabled={!selected || isCurrent || loading || !canRestore}
           onClick={() => {
-            if (!selected || !selectedSnapshot) return;
+            if (!selected || !selectedSnapshot || !canRestore) return;
             onUseVersion(selectedSnapshot, selected.version);
             onClose();
           }}
         >
-          {isCurrent
-            ? "Already current"
-            : selected
-              ? `Switch to v${selected.version}`
-              : "Switch"}
+          {!canRestore
+            ? "Locked"
+            : isCurrent
+              ? "Already current"
+              : selected
+                ? `Switch to v${selected.version}`
+                : "Switch"}
         </Button>
       </DialogActions>
     </Dialog>

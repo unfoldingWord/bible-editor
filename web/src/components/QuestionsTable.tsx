@@ -186,16 +186,22 @@ const Row = memo(function Row({
 
   // Restore a version picked in the history dialog: mirror it into the local
   // fields, then PATCH only what actually differs from saved server state so
-  // picking the current version can't bump the version for nothing.
+  // picking the current version can't bump the version for nothing. The local
+  // mirror happens even when the patch is empty — the user asked for this
+  // version's text, which means discarding any unsaved typing on top of it.
   const handleUseVersion = (snapshot: RowSnapshot, fromVersion: number) => {
     const rawQuestion = snapshot.question ?? "";
     const rawResponse = snapshot.response ?? "";
+    setQuestion(rawQuestion);
+    setResponse(rawResponse);
     const patch: Partial<TqRow> = {};
     if (rawQuestion !== (row.question ?? "")) patch.question = rawQuestion;
     if (rawResponse !== (row.response ?? "")) patch.response = rawResponse;
     if (Object.keys(patch).length === 0) return;
-    setQuestion(rawQuestion);
-    setResponse(rawResponse);
+    // ref_raw isn't part of the history snapshot, so the version bump this
+    // PATCH triggers would resync it from the server and silently drop an
+    // unsaved ref edit. Carry it along instead of losing it.
+    if (refRaw !== (row.ref_raw ?? "")) patch.ref_raw = refRaw;
     onSave(patch, { restoredFromVersion: fromVersion });
   };
 
@@ -309,6 +315,7 @@ const Row = memo(function Row({
             fields={TQ_HISTORY_FIELDS}
             title="Question history"
             currentVersion={row.version}
+            canRestore={!locked}
             effectiveVersion={effectiveVersion}
             onClose={() => setHistoryOpen(false)}
             onUseVersion={handleUseVersion}
