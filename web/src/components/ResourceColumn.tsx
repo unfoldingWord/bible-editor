@@ -131,7 +131,11 @@ interface Props {
   onWordCreate: () => void;
   onWordFocus: (row: TwlRow) => void;
   onWordReorder: (draggedId: string, refId: string, position: WordDropPosition) => void;
-  onQuestionSave: (id: string, patch: Partial<TqRow>) => void;
+  onQuestionSave: (
+    id: string,
+    patch: Partial<TqRow>,
+    opts?: { restoredFromVersion?: number },
+  ) => void;
   onQuestionDelete: (id: string) => void;
   onQuestionCreate: () => void;
   // A mid-flight AI pipeline locks only the resource it will overwrite:
