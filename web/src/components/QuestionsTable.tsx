@@ -6,7 +6,7 @@ import SaveIcon from "@mui/icons-material/Save";
 import SaveOutlinedIcon from "@mui/icons-material/SaveOutlined";
 import type { TqRow } from "../sync/api";
 import { drafts, rowKey, draftDirtyBorderSx } from "../sync/drafts";
-import { TQ_HISTORY_FIELDS, type RowSnapshot } from "./RowHistoryDialog";
+import { TQ_HISTORY_FIELDS, type RowSnapshot } from "./rowHistoryFields";
 
 const RowHistoryDialog = lazy(() =>
   import("./RowHistoryDialog").then((m) => ({ default: m.RowHistoryDialog })),
@@ -128,7 +128,21 @@ const Row = memo(function Row({
   const [response, setResponse] = useState(row.response ?? "");
   const [historyOpen, setHistoryOpen] = useState(false);
 
-  useEffect(() => setRefRaw(row.ref_raw ?? ""), [row.id, row.version, row.ref_raw]);
+  // Set by a history restore that fires while the REF lane has unsaved typing.
+  // The restore bumps row.version, which would otherwise make the resync below
+  // overwrite the user's in-progress ref with the server value. Carrying the
+  // ref in the restore PATCH instead is NOT an option: the server re-derives
+  // the `verse` column from ref_raw (api/src/rows.ts), so persisting a
+  // half-typed "1:" would relocate the row to verse 0.
+  const pendingRefRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (pendingRefRef.current != null) {
+      setRefRaw(pendingRefRef.current);
+      pendingRefRef.current = null;
+      return;
+    }
+    setRefRaw(row.ref_raw ?? "");
+  }, [row.id, row.version, row.ref_raw]);
   useEffect(() => setQuestion(row.question ?? ""), [row.id, row.version, row.question]);
   useEffect(() => setResponse(row.response ?? ""), [row.id, row.version, row.response]);
 
@@ -200,8 +214,9 @@ const Row = memo(function Row({
     if (Object.keys(patch).length === 0) return;
     // ref_raw isn't part of the history snapshot, so the version bump this
     // PATCH triggers would resync it from the server and silently drop an
-    // unsaved ref edit. Carry it along instead of losing it.
-    if (refRaw !== (row.ref_raw ?? "")) patch.ref_raw = refRaw;
+    // unsaved ref edit. Hold it across the bump so it stays as the user left
+    // it — unsaved, still dirty — rather than being clobbered or written.
+    if (refRaw !== (row.ref_raw ?? "")) pendingRefRef.current = refRaw;
     onSave(patch, { restoredFromVersion: fromVersion });
   };
 

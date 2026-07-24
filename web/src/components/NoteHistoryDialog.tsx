@@ -1,8 +1,5 @@
-import {
-  RowHistoryDialog,
-  TN_HISTORY_FIELDS,
-  type RowSnapshot,
-} from "./RowHistoryDialog";
+import { RowHistoryDialog } from "./RowHistoryDialog";
+import { TN_HISTORY_FIELDS, type RowSnapshot } from "./rowHistoryFields";
 
 interface NoteSnapshot {
   quote: string | null;
