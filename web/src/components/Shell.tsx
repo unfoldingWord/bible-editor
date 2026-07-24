@@ -2950,9 +2950,9 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
             if (activeWordId === id) setActiveWordId(null);
             void outbox.enqueueDeleteRow("twl", id, row.version, row.book);
           }}
-          onQuestionSave={(id, patch) => {
+          onQuestionSave={(id, patch, opts) => {
             const row = data.tq.find((r) => r.id === id);
-            if (row) enqueueRow("tq", row, patch);
+            if (row) enqueueRow("tq", row, patch, opts);
           }}
           onQuestionDelete={(id) => {
             const row = data.tq.find((r) => r.id === id);

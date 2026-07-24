@@ -1,16 +1,27 @@
-import { memo, useEffect, useMemo, useRef, useState } from "react";
-import { Box, Paper, Stack, TextField, IconButton, Typography, Tooltip } from "@mui/material";
+import { lazy, memo, Suspense, useEffect, useMemo, useRef, useState } from "react";
+import { Box, Chip, Paper, Stack, TextField, IconButton, Typography, Tooltip } from "@mui/material";
 import DeleteOutlineIcon from "@mui/icons-material/DeleteOutline";
 import AutoAwesomeIcon from "@mui/icons-material/AutoAwesome";
 import SaveIcon from "@mui/icons-material/Save";
 import SaveOutlinedIcon from "@mui/icons-material/SaveOutlined";
 import type { TqRow } from "../sync/api";
 import { drafts, rowKey, draftDirtyBorderSx } from "../sync/drafts";
+import { TQ_HISTORY_FIELDS, type RowSnapshot } from "./rowHistoryFields";
+
+const RowHistoryDialog = lazy(() =>
+  import("./RowHistoryDialog").then((m) => ({ default: m.RowHistoryDialog })),
+);
 
 interface Props {
   rows: TqRow[];
   // Apply local + enqueue. Caller is responsible for outbox.enqueueRow.
-  onSave: (id: string, patch: Partial<TqRow>) => void;
+  // `opts.restoredFromVersion` marks the PATCH as a history revert so the
+  // history dialog can hide the phantom entry it writes.
+  onSave: (
+    id: string,
+    patch: Partial<TqRow>,
+    opts?: { restoredFromVersion?: number },
+  ) => void;
   onDelete: (id: string) => void;
   // When true, rows render read-only and the delete button is hidden. Used
   // while an AI pipeline is mid-flight for the chapter — the auto-apply step
@@ -52,12 +63,14 @@ function QuestionsTableInner({ rows, onSave, onDelete, locked = false }: Props) 
         <span>Question</span>
         <span>Response</span>
         <span />
+        <span />
+        <span />
       </Box>
       {rows.map((r) => (
         <Row
           key={r.id}
           row={r}
-          onSave={(p) => onSave(r.id, p)}
+          onSave={(p, opts) => onSave(r.id, p, opts)}
           onDelete={() => onDelete(r.id)}
           locked={locked}
         />
@@ -79,20 +92,21 @@ export const QuestionsTable = memo(
 const NARROW_BP_PX = 460;
 
 // Wide: ref lane (ranges like "1:1-3" fit), question + response share the rest,
-// two action cells. Narrow (container ≤ NARROW_BP_PX): ref shares the top row
-// with the action buttons; the text fields drop to full-width rows beneath.
+// then the version chip and two action cells. Narrow (container ≤
+// NARROW_BP_PX): ref shares the top row with the chip and action buttons; the
+// text fields drop to full-width rows beneath.
 const responsiveGridSx = {
   display: "grid",
   gap: 1,
   alignItems: "center",
-  gridTemplateColumns: "80px 1fr 1fr 28px 28px",
-  gridTemplateAreas: '"ref question response save delete"',
+  gridTemplateColumns: "80px 1fr 1fr 46px 28px 28px",
+  gridTemplateAreas: '"ref question response ver save delete"',
   [`@container (max-width: ${NARROW_BP_PX}px)`]: {
-    gridTemplateColumns: "1fr 28px 28px",
+    gridTemplateColumns: "1fr 46px 28px 28px",
     gridTemplateAreas: [
-      '"ref save delete"',
-      '"question question question"',
-      '"response response response"',
+      '"ref ver save delete"',
+      '"question question question question"',
+      '"response response response response"',
     ].join(" "),
     rowGap: 0.5,
   },
@@ -105,15 +119,30 @@ const Row = memo(function Row({
   locked,
 }: {
   row: TqRow;
-  onSave: (patch: Partial<TqRow>) => void;
+  onSave: (patch: Partial<TqRow>, opts?: { restoredFromVersion?: number }) => void;
   onDelete: () => void;
   locked: boolean;
 }) {
   const [refRaw, setRefRaw] = useState(row.ref_raw ?? "");
   const [question, setQuestion] = useState(row.question ?? "");
   const [response, setResponse] = useState(row.response ?? "");
+  const [historyOpen, setHistoryOpen] = useState(false);
 
-  useEffect(() => setRefRaw(row.ref_raw ?? ""), [row.id, row.version, row.ref_raw]);
+  // Set by a history restore that fires while the REF lane has unsaved typing.
+  // The restore bumps row.version, which would otherwise make the resync below
+  // overwrite the user's in-progress ref with the server value. Carrying the
+  // ref in the restore PATCH instead is NOT an option: the server re-derives
+  // the `verse` column from ref_raw (api/src/rows.ts), so persisting a
+  // half-typed "1:" would relocate the row to verse 0.
+  const pendingRefRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (pendingRefRef.current != null) {
+      setRefRaw(pendingRefRef.current);
+      pendingRefRef.current = null;
+      return;
+    }
+    setRefRaw(row.ref_raw ?? "");
+  }, [row.id, row.version, row.ref_raw]);
   useEffect(() => setQuestion(row.question ?? ""), [row.id, row.version, row.question]);
   useEffect(() => setResponse(row.response ?? ""), [row.id, row.version, row.response]);
 
@@ -165,6 +194,30 @@ const Row = memo(function Row({
   const handleSave = () => {
     if (!isDirty) return;
     onSave(diff);
+  };
+
+  const effectiveVersion = row.restored_from_version ?? row.version;
+
+  // Restore a version picked in the history dialog: mirror it into the local
+  // fields, then PATCH only what actually differs from saved server state so
+  // picking the current version can't bump the version for nothing. The local
+  // mirror happens even when the patch is empty — the user asked for this
+  // version's text, which means discarding any unsaved typing on top of it.
+  const handleUseVersion = (snapshot: RowSnapshot, fromVersion: number) => {
+    const rawQuestion = snapshot.question ?? "";
+    const rawResponse = snapshot.response ?? "";
+    setQuestion(rawQuestion);
+    setResponse(rawResponse);
+    const patch: Partial<TqRow> = {};
+    if (rawQuestion !== (row.question ?? "")) patch.question = rawQuestion;
+    if (rawResponse !== (row.response ?? "")) patch.response = rawResponse;
+    if (Object.keys(patch).length === 0) return;
+    // ref_raw isn't part of the history snapshot, so the version bump this
+    // PATCH triggers would resync it from the server and silently drop an
+    // unsaved ref edit. Hold it across the bump so it stays as the user left
+    // it — unsaved, still dirty — rather than being clobbered or written.
+    if (refRaw !== (row.ref_raw ?? "")) pendingRefRef.current = refRaw;
+    onSave(patch, { restoredFromVersion: fromVersion });
   };
 
   return (
@@ -238,6 +291,52 @@ const Row = memo(function Row({
         }}
         inputProps={{ style: { fontSize: 13, padding: "3px 6px" } }}
       />
+      <Tooltip
+        title={
+          row.restored_from_version != null
+            ? `v${row.restored_from_version} (restored)${isDirty ? " · unsaved edits" : ""} — currently at row v${row.version}; last update ${new Date(row.updated_at * 1000).toLocaleString()}. Click to view history.`
+            : `v${row.version}${isDirty ? " · unsaved edits" : ""} — saved ${row.version - 1} time${row.version - 1 === 1 ? "" : "s"}; last update ${new Date(row.updated_at * 1000).toLocaleString()}. Click to view history.`
+        }
+      >
+        <Chip
+          label={`v${effectiveVersion}${isDirty ? "*" : ""}`}
+          size="small"
+          variant="outlined"
+          clickable
+          onClick={(e) => {
+            e.stopPropagation();
+            setHistoryOpen(true);
+          }}
+          sx={{
+            gridArea: "ver",
+            fontFamily: "monospace",
+            fontSize: 10,
+            height: 20,
+            justifySelf: "center",
+            color: isDirty ? "warning.main" : "text.secondary",
+            borderColor: isDirty ? "warning.main" : "divider",
+            fontWeight: isDirty ? 600 : 400,
+            "& .MuiChip-label": { px: 0.5 },
+          }}
+        />
+      </Tooltip>
+      {historyOpen && (
+        <Suspense fallback={null}>
+          <RowHistoryDialog
+            open={historyOpen}
+            kind="tq"
+            rowId={row.id}
+            book={row.book}
+            fields={TQ_HISTORY_FIELDS}
+            title="Question history"
+            currentVersion={row.version}
+            canRestore={!locked}
+            effectiveVersion={effectiveVersion}
+            onClose={() => setHistoryOpen(false)}
+            onUseVersion={handleUseVersion}
+          />
+        </Suspense>
+      )}
       {locked ? (
         <span style={{ gridArea: "save" }} />
       ) : (
