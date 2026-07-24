@@ -235,6 +235,43 @@ function collapseConsecutiveParagraphMarkers(lines: string[]): string[] {
   return out;
 }
 
+// Collapse a run of consecutive `\ts\*` section-chunk milestones to one. Same
+// shape as collapseConsecutiveParagraphMarkers, but for the `\ts\*` self-closing
+// milestone, which is NOT a DCS Check-7 paragraph marker (so that pass leaves it
+// alone) yet piles up the same way: an extra `\ts\*` accumulated at LAM chapter
+// boundaries (trailing on the last verse, just before `\c`) one per nightly
+// export. BE renders `\ts\*` idempotently and never created the extra one — the
+// DCS-side merge of the never-rebased `-be-` export branch re-injects it — but BE
+// never collapsed the stack either, so it carried the growth forward. This is the
+// exact analog of the EZK 8/11 front-`\p` pump (see collapseConsecutiveParagraph
+// Markers + STATE.md). Two adjacent `\ts\*` mark the same chunk boundary twice and
+// are always redundant, so collapsing to one is safe. `repairTsStar` has already
+// normalized any malformed `\ts*` to `\ts\*` by the time this runs, so matching
+// the well-formed token is sufficient. Blank lines between the markers are
+// separators that do NOT reset the run (the following blankLinePass re-adds the
+// canonical blank line); any real content line resets it, so a `\ts\*` on either
+// side of genuine content is always preserved.
+function collapseConsecutiveTsMarkers(lines: string[]): string[] {
+  const out: string[] = [];
+  let prevWasTs = false;
+  for (const line of lines) {
+    const s = line.trim();
+    if (s === "") {
+      out.push(line); // blank: keep, don't reset the run
+      continue;
+    }
+    if (s === "\\ts\\*") {
+      if (prevWasTs) continue; // drop the duplicate
+      prevWasTs = true;
+      out.push(line);
+      continue;
+    }
+    prevWasTs = false; // any real content ends the run
+    out.push(line);
+  }
+  return out;
+}
+
 // Add/remove blank lines around `\b`/`\ts\*`/`\p`/`\c`. Ported faithfully from
 // fix_usfm_formatting.py's main pass.
 function blankLinePass(lines: string[]): string[] {
@@ -316,6 +353,7 @@ export function normalizeUsfmFormatting(usfmText: string): string {
   for (const raw of rawLines) lines.push(...splitStructuralLine(raw));
   lines = reorderMarkerRuns(lines);
   lines = collapseConsecutiveParagraphMarkers(lines);
+  lines = collapseConsecutiveTsMarkers(lines);
   lines = blankLinePass(lines);
 
   let out = lines.join("\n");

@@ -890,6 +890,54 @@ function collapseRedundantParagraphs(verseObjects: unknown[]): unknown[] {
   return out.length === verseObjects.length ? verseObjects : out;
 }
 
+// True iff `vo` is a `\ts\*` self-closing section-chunk milestone. usfm-js 3.5.0
+// parks the whole marker in the tag: a well-formed `\ts\*` is {tag:"ts\\*"}, the
+// editor's malformed `\ts*` is {tag:"ts*"}. Older shapes stored it as
+// {tag:"ts", content:"\\*"|"*"} — matched defensively so a version bump can't
+// silently un-detect it.
+function isTsMilestone(vo: unknown): boolean {
+  if (!vo || typeof vo !== "object") return false;
+  const v = vo as { tag?: unknown; content?: unknown };
+  if (v.tag === "ts\\*" || v.tag === "ts*") return true;
+  return v.tag === "ts" && (v.content === "\\*" || v.content === "*");
+}
+
+// Collapse a run of consecutive `\ts\*` section-chunk milestones (separated only
+// by whitespace-text nodes) down to a single `\ts\*`. Import-side companion to the
+// export-side collapseConsecutiveTsMarkers — applied here so the D1-stored
+// content_json heals too (not just the rendered export), which is what lets master
+// self-heal on the next nightly reimport. Guards the chapter-boundary `\ts\*`
+// pile-up seen in LAM (a section milestone trailing on the last verse before `\c`
+// grew +1 per nightly export; see STATE.md) — the exact analog of the EZK 8/11
+// front-`\p` pile collapseRedundantParagraphs guards. Two adjacent `\ts\*` mark the
+// same chunk boundary twice and are always redundant, so this ONLY removes a
+// duplicate milestone: it never adds a marker and never touches any other node. A
+// no-op on clean verses. Neither the input array nor its nodes are mutated.
+function collapseRedundantTsMilestones(verseObjects: unknown[]): unknown[] {
+  if (!Array.isArray(verseObjects)) return verseObjects;
+  const isBlankText = (vo: unknown): boolean => {
+    if (!vo || typeof vo !== "object") return false;
+    const v = vo as { type?: unknown; text?: unknown };
+    return v.type === "text" && (typeof v.text !== "string" || v.text.trim() === "");
+  };
+  const out: unknown[] = [];
+  for (const vo of verseObjects) {
+    if (isTsMilestone(vo)) {
+      // Skip back over blank text already buffered; if the previous meaningful
+      // node is also a `\ts\*`, this one is a redundant duplicate — drop it, along
+      // with any whitespace buffered between the two milestones.
+      let j = out.length - 1;
+      while (j >= 0 && isBlankText(out[j])) j--;
+      if (j >= 0 && isTsMilestone(out[j])) {
+        while (out.length > j + 1) out.pop();
+        continue;
+      }
+    }
+    out.push(vo);
+  }
+  return out.length === verseObjects.length ? verseObjects : out;
+}
+
 // Walk verse-objects and concatenate all text. Same shape and behaviour
 // as the client-side `extractPlainText` in web/src/lib/usfm.ts — kept
 // duplicated because the Worker bundle and the web bundle are built
@@ -1011,6 +1059,7 @@ export function extractVersesForRange(
       );
       verseObjects = dropDoubledLeadingMarkers(prevVerseObjects, verseObjects);
       verseObjects = collapseRedundantParagraphs(verseObjects);
+      verseObjects = collapseRedundantTsMilestones(verseObjects);
       prevVerseObjects = vNum >= 1 ? verseObjects : null;
       const normalized = { ...verseObj, verseObjects };
       out.push({
