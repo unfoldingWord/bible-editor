@@ -37,6 +37,11 @@ jobs:
       - name: Web unit tests
         run: npm --workspace web run test
 
+      # Export/import/lint/validate suites. Ungated until now, which meant
+      # regression tests in api/ protected nothing automatically.
+      - name: API unit tests
+        run: npm --workspace api run test
+
       # api typecheck + web vite build -> web/dist. Catches bundling breaks.
       - name: Build
         run: npm run build

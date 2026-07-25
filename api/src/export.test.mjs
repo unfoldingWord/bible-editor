@@ -151,9 +151,10 @@ function utf8Base64(s) {
 
 // --- every export branch carries `-be-` so the DCS gates don't skip it ---
 {
-  // The DCS workflows gate on contains(head_ref, '-be-') WITH the trailing
-  // dash; a suffix-less `LAM-be` made every step `skipped`, which Gitea reports
-  // as a green combined status. Machine-only exports get "mechanical".
+  // The DCS validate workflow triggers on push to '*-be-*' — WITH the trailing
+  // dash — so a suffix-less `LAM-be` was never validated or auto-merged while
+  // still reporting a green combined status. Machine-only exports get
+  // "mechanical" so the segment is always present.
   assert(buildExportBranch("LAM", []) === "LAM-be-mechanical", `no contributors → {BOOK}-be-mechanical`);
   assert(buildExportBranch("AMO", ["", "  "]) === "AMO-be-mechanical", `sanitized-to-empty usernames → mechanical`);
   assert(buildExportBranch("NUM", ["stephenwunrow"]) === "NUM-be-stephenwunrow", `single contributor unchanged`);

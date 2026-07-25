@@ -41,11 +41,16 @@ export function usfmFilename(book: string): string {
 // book, in first-edit order (see ExportWorkflow.contributorsFor). `be` = bible
 // editor. With no human contributors the name is `{BOOK}-be-mechanical` — the
 // synthetic "mechanical" contributor stands in for machine-only changes (e.g. a
-// TWL reorder). It is NOT cosmetic: the DCS-side gates both test
-// `contains(head_ref, '-be-')` *with* the trailing dash, so a suffix-less
-// `{BOOK}-be` branch made every validate/merge step `skipped` — which Gitea
-// counts as a green combined status. Suffix-less branches were therefore never
-// validated and never auto-merged. Keep every export branch carrying `-be-`.
+// TWL reorder). It is NOT cosmetic: the DCS-side validate workflow triggers on
+// `push: branches: ['*-be-*']` (see docs/dcs-workflows/*.validate-be-branch.yaml)
+// and the merge workflow re-checks for `-be-` — both requiring the *trailing*
+// dash. A suffix-less `{BOOK}-be` matches neither, so those branches were never
+// validated and never auto-merged, while Gitea still reported a green combined
+// status (no/skipped checks count as success). Keep every branch carrying `-be-`.
+//
+// "mechanical" is a name, not an authority: nothing reads a contributor list back
+// out of a branch name (consumers only take the book, splitting on "-be"), so a
+// real DCS user named "mechanical" would be indistinguishable here but harmless.
 //
 // usernames are sanitized to the git ref-safe set (alphanumerics, dot, dash,
 // underscore) so a stray character can't produce an unpushable branch. Our DCS
