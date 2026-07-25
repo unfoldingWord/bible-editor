@@ -39,16 +39,25 @@ export function usfmFilename(book: string): string {
 // Book-specific export branch name: `{BOOK}-be-{user1}-{user2}-...`, where the
 // usernames are everyone who made a human edit to *this* resource of *this*
 // book, in first-edit order (see ExportWorkflow.contributorsFor). `be` = bible
-// editor. With no human contributors the name collapses to `{BOOK}-be`.
+// editor. With no human contributors the name is `{BOOK}-be-mechanical` — the
+// synthetic "mechanical" contributor stands in for machine-only changes (e.g. a
+// TWL reorder). It is NOT cosmetic: the DCS-side gates both test
+// `contains(head_ref, '-be-')` *with* the trailing dash, so a suffix-less
+// `{BOOK}-be` branch made every validate/merge step `skipped` — which Gitea
+// counts as a green combined status. Suffix-less branches were therefore never
+// validated and never auto-merged. Keep every export branch carrying `-be-`.
 //
 // usernames are sanitized to the git ref-safe set (alphanumerics, dot, dash,
 // underscore) so a stray character can't produce an unpushable branch. Our DCS
 // usernames are already in that set; this is just belt-and-suspenders.
+// Stand-in "username" for a machine-only export (no human contributors).
+export const MECHANICAL_CONTRIBUTOR = "mechanical";
+
 export function buildExportBranch(book: string, usernames: string[]): string {
   const safe = usernames
     .map((u) => u.replace(/[^A-Za-z0-9._-]/g, ""))
     .filter((u) => u.length > 0);
-  return safe.length === 0 ? `${book}-be` : `${book}-be-${safe.join("-")}`;
+  return `${book}-be-${safe.length === 0 ? MECHANICAL_CONTRIBUTOR : safe.join("-")}`;
 }
 
 // ── TSV builders ─────────────────────────────────────────────────────────────
