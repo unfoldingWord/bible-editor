@@ -5,7 +5,7 @@
 // instead of getting silently flattened to `\v 6`. Not a test framework;
 // failures exit non-zero.
 
-import { buildTnTsv, buildTwlTsv, buildUsfm, commitToDcs, ensureDcsPr, exportTsvShrinkRefused, recreateExportBranchFromMaster, updateDcsPrBranch, usfmAlignmentShrinkRefused } from "./export.ts";
+import { buildExportBranch, buildTnTsv, buildTwlTsv, buildUsfm, commitToDcs, ensureDcsPr, exportTsvShrinkRefused, recreateExportBranchFromMaster, updateDcsPrBranch, usfmAlignmentShrinkRefused } from "./export.ts";
 import { CorruptContentJsonError } from "./contentJson.ts";
 
 function assert(cond, msg) {
@@ -147,6 +147,21 @@ function utf8Base64(s) {
   assert(!out.includes("\r"), `no raw carriage returns in TSV output`);
   assert(out.includes("alpha\\nbeta"), `bare \\r escapes to the literal \\n`);
   assert(out.includes("gamma\\ndelta"), `CRLF collapses to one literal \\n`);
+}
+
+// --- every export branch carries `-be-` so the DCS gates don't skip it ---
+{
+  // The DCS validate workflow triggers on push to '*-be-*' — WITH the trailing
+  // dash — so a suffix-less `LAM-be` was never validated or auto-merged while
+  // still reporting a green combined status. Machine-only exports get
+  // "mechanical" so the segment is always present.
+  assert(buildExportBranch("LAM", []) === "LAM-be-mechanical", `no contributors → {BOOK}-be-mechanical`);
+  assert(buildExportBranch("AMO", ["", "  "]) === "AMO-be-mechanical", `sanitized-to-empty usernames → mechanical`);
+  assert(buildExportBranch("NUM", ["stephenwunrow"]) === "NUM-be-stephenwunrow", `single contributor unchanged`);
+  assert(buildExportBranch("ISA", ["a", "b"]) === "ISA-be-a-b", `multiple contributors joined`);
+  for (const b of [buildExportBranch("LAM", []), buildExportBranch("NUM", ["x"])]) {
+    assert(b.includes("-be-"), `${b} contains "-be-" (DCS gate literal)`);
+  }
 }
 
 // --- OL-quote occurrence invariant: Hebrew/Greek quote forces Occurrence >= 1 ---
