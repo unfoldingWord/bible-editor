@@ -35,15 +35,16 @@ function normalizeOccurrences(parsed: unknown): void {
 
 export const verses = new Hono<{ Bindings: Env; Variables: { userId?: number } }>();
 
-// content must be the usfm-js verse-objects tree (at minimum, a non-empty
-// verseObjects array). The whole tree is replaced on every PATCH; a malformed
-// body that passed validation as `unknown` would brick the verse — the
-// alignment dialog walks verseObjects without null-guarding.
+// content must be the usfm-js verse-objects tree. The whole tree is replaced on
+// every PATCH; a malformed body that passed validation as `unknown` would brick
+// the verse — the alignment dialog walks verseObjects without null-guarding.
+// Emptiness is NOT checked here: whether an empty tree is legal depends on the
+// verse number, which zod never sees, so it is enforced at the call site below.
 const VerseObjectSchema = z.object({}).passthrough();
 const PatchSchema = z.object({
   content: z
     .object({
-      verseObjects: z.array(VerseObjectSchema).min(1),
+      verseObjects: z.array(VerseObjectSchema),
     })
     .passthrough(),
   // Optional, but NOT nullable: the SQL uses COALESCE(?2, plain_text), so an
@@ -210,6 +211,23 @@ verses.patch("/:book/:chapter/:verse/:bibleVersion", requireEditor, async (c) =>
 
   if (bibleVersion === "UHB" || bibleVersion === "UGNT") {
     return c.json({ error: "source_text_is_read_only" }, 403);
+  }
+
+  // An empty verseObjects array is legitimate for verse 0 ONLY. Verse 0 is the
+  // chapter-front pseudo-verse (see extractVersesForRange in importParsers.ts) —
+  // a container for chapter-front material such as an `\s1` section heading or a
+  // Psalm `\d` title. When that heading is the row's only node, deleting it
+  // through the section-header band leaves nothing behind, so the row must be
+  // allowed to become empty; buildUsfm keys verse 0 as usfm-js "front", so an
+  // empty front emits nothing at all (no stray `\v 0` — see export.test.mjs).
+  // Refusing it is what made a chapter-leading heading undeletable: the PATCH
+  // 400'd, the outbox files 4xx as fatal, and the heading stayed in D1 (#366).
+  //
+  // For a real verse (>= 1) an empty tree would blank the verse text with no way
+  // to type it back, so that stays rejected. The verse number is why this lives
+  // here and not in PatchSchema: zod never sees the route param.
+  if (parsed.data.content.verseObjects.length === 0 && verse !== 0) {
+    return c.json({ error: "invalid_body", reason: "empty_verse_objects" }, 400);
   }
 
   if (hasUnsafeMarkerTag(parsed.data.content.verseObjects)) {

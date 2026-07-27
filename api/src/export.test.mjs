@@ -100,6 +100,33 @@ function utf8Base64(s) {
   assert(out.match(/^\\v 1\b/m), `first verse still emits after front`);
 }
 
+// --- Emptied chapter-front pseudo-verse exports cleanly (issue #366) ---
+// Deleting a chapter-leading `\s1` whose verse-0 row holds nothing else leaves
+// verseObjects empty. That row must export as nothing at all — no stray `\v 0`,
+// no resurrected heading — or the nightly export would undo the deletion.
+{
+  const emptyFront = {
+    book: "MIC",
+    chapter: 2,
+    verse: 0,
+    verse_end: null,
+    bible_version: "UST",
+    content_json: JSON.stringify({ verseObjects: [] }),
+    plain_text: "",
+    version: 2,
+    updated_by: 1,
+    updated_at: 0,
+  };
+  const out = buildUsfm({
+    book: "MIC",
+    bibleVersion: "UST",
+    headers: null,
+    verses: [emptyFront, mkVerse(2, 1, null, "first")],
+  });
+  assert(!out.includes("\\v 0"), `empty front emits no stray \\v 0`);
+  assert(out.match(/^\\v 1\b/m), `first verse still emits after empty front`);
+}
+
 // --- Inverted verse_end (defensive) treats as singleton ---
 {
   const out = buildUsfm({
