@@ -579,7 +579,7 @@ interface CollectedSourceWord {
   textOccurrence: number;
 }
 
-function collectSourceWords(verseObjects: unknown[]): CollectedSourceWord[] {
+export function collectSourceWords(verseObjects: unknown[]): CollectedSourceWord[] {
   const out: CollectedSourceWord[] = [];
   const textCounts = new Map<string, number>();
   let pos = 0;
@@ -1040,6 +1040,163 @@ export function dropDuplicateSourceMilestones(verseObjects: unknown[]): unknown[
   return transform(verseObjects);
 }
 
+// ─── source occurrence renumbering ──────────────────────────────────────────
+// `x-occurrence`/`x-occurrences` on a `\zaln-s` name WHICH physical UHB/UGNT
+// token the milestone points at (the per-exact-surface occurrence model). AI and
+// legacy aligners stamp values that name no token at all — ZEC 11:14 ULT on
+// master carries `אֶת` occ 3/2 (the surface occurs twice) and `מַקְלִי` occ 2/1.
+// Nothing downstream can honour an impossible number: the card renders a
+// superscript "3" the reader can't reconcile with the verse, and
+// `findSourcePosition` falls back to the FIRST matching surface, so the card
+// highlights the wrong Hebrew word (issue #367).
+//
+// Re-derive the numbers from the source text, but ONLY for a chain that is
+// provably wrong. A well-formed chain is left byte-identical so clean verses
+// still round-trip without export churn. "Provably wrong" means, after
+// resolving every word to a UHB position:
+//   - a word's occurrence exceeds the number of matching surfaces, or its
+//     `occurrences` disagrees with the actual total for that surface;
+//   - two words in one chain land on the SAME position; or
+//   - the chain's positions are non-contiguous (a card always covers one
+//     contiguous run — the same invariant `detectDoubledSourceMilestones`
+//     asserts).
+// A chain containing any word whose content matches NO source surface is left
+// untouched: without an anchor we would be guessing.
+export function renumberSourceOccurrences(
+  groups: AlignmentGroup[],
+  sourceWords: CollectedSourceWord[],
+): AlignmentGroup[] {
+  if (sourceWords.length === 0) return groups;
+  const byKey = new Map<string, CollectedSourceWord[]>();
+  for (const sw of sourceWords) {
+    const list = byKey.get(sw.textKey);
+    if (list) list.push(sw);
+    else byKey.set(sw.textKey, [sw]);
+  }
+
+  // Highest position already claimed for each surface by an EARLIER group.
+  // Milestones for one surface run left-to-right through the verse, so a
+  // rewritten group should not point behind its predecessors, and should move
+  // on to the next token when one is free (JER 31:12 stamps three וְעַל
+  // milestones 2/4, 3/4, 4/4 over three tokens: renumbering each in isolation
+  // would keep the bogus 2 and 3 and wrap the last one round to 1).
+  const cursor = new Map<string, number>();
+  const advance = (chain: CollectedSourceWord[]) => {
+    for (const c of chain) {
+      cursor.set(c.textKey, Math.max(cursor.get(c.textKey) ?? -1, c.position));
+    }
+  };
+
+  let changedAny = false;
+  const out = groups.map((g) => {
+    if (g.source.length === 0) return g;
+    const candidates: CollectedSourceWord[][] = [];
+    for (const s of g.source) {
+      const matches = s.content ? byKey.get(nfc(s.content)) : undefined;
+      if (!matches || matches.length === 0) return g; // no anchor — never guess
+      candidates.push(matches);
+    }
+
+    // The assignment the CURRENT attributes name, when they name one at all.
+    const current: (CollectedSourceWord | null)[] = g.source.map((s, i) => {
+      const want = parseInt(s.occurrence, 10) || 0;
+      const match = candidates[i][want - 1] ?? null;
+      return match && String(candidates[i].length) === s.occurrences ? match : null;
+    });
+    const currentOk =
+      current.every((c) => c !== null) &&
+      new Set(current.map((c) => c!.position)).size === current.length &&
+      isContiguousRun(current.map((c) => c!.position));
+    if (currentOk) {
+      advance(current as CollectedSourceWord[]);
+      return g;
+    }
+
+    const picked = pickBestAssignment(candidates, cursor);
+    if (!picked) return g;
+    advance(picked);
+    let groupChanged = false;
+    const source = g.source.map((s, i) => {
+      const occurrence = String(candidates[i].indexOf(picked[i]) + 1);
+      const occurrences = String(candidates[i].length);
+      if (s.occurrence === occurrence && s.occurrences === occurrences) return s;
+      groupChanged = true;
+      return { ...s, occurrence, occurrences };
+    });
+    if (!groupChanged) return g;
+    changedAny = true;
+    return { ...g, source };
+  });
+  return changedAny ? out : groups;
+}
+
+function isContiguousRun(positions: number[]): boolean {
+  if (positions.length <= 1) return true;
+  const sorted = [...positions].sort((a, b) => a - b);
+  return sorted[sorted.length - 1] - sorted[0] === sorted.length - 1;
+}
+
+// Exhaustive search over candidate positions, ranked by:
+//   1. span — the card must cover one contiguous UHB/UGNT run, so the reading
+//      that puts the words next to each other beats a far-away same-surface
+//      token (ZEC 11:14: אֶת next to מַקְלִי, not the אֶת six words later);
+//   2. no back-step behind an earlier milestone for the same surface;
+//   3. most words moved PAST that cursor — consecutive milestones for a
+//      repeated surface should walk forward through its tokens rather than
+//      pile onto one (the pile-up is still reachable when nothing is free,
+//      which is exactly the one-token/two-milestones split alignment);
+//   4. leftmost.
+// Chains are 1–3 words with a handful of candidates each, so the exhaustive
+// search is trivial; it refuses rather than searching a pathological space.
+function pickBestAssignment(
+  candidates: CollectedSourceWord[][],
+  cursor: Map<string, number>,
+): CollectedSourceWord[] | null {
+  let space = 1;
+  for (const c of candidates) space *= c.length;
+  if (space > 4096) return null;
+
+  let best: CollectedSourceWord[] | null = null;
+  let bestScore: number[] | null = null;
+  const chosen: CollectedSourceWord[] = [];
+  const used = new Set<number>();
+
+  const better = (a: number[], b: number[]) => {
+    for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return a[i] < b[i];
+    return false;
+  };
+
+  const recurse = (i: number) => {
+    if (i === candidates.length) {
+      const positions = chosen.map((c) => c.position);
+      const span = Math.max(...positions) - Math.min(...positions);
+      let behind = 0;
+      let ahead = 0;
+      for (const c of chosen) {
+        const seen = cursor.get(c.textKey) ?? -1;
+        if (c.position < seen) behind++;
+        else if (c.position > seen) ahead++;
+      }
+      const score = [span, behind, -ahead, Math.min(...positions)];
+      if (!bestScore || better(score, bestScore)) {
+        bestScore = score;
+        best = [...chosen];
+      }
+      return;
+    }
+    for (const c of candidates[i]) {
+      if (used.has(c.position)) continue;
+      used.add(c.position);
+      chosen.push(c);
+      recurse(i + 1);
+      chosen.pop();
+      used.delete(c.position);
+    }
+  };
+  recurse(0);
+  return best;
+}
+
 // Augment with synthetic source groups for any UHB/UGNT word the target
 // USFM didn't reference, so the dialog can show empty drop slots. Empty
 // groups don't emit anything; when populated, the chips emit at their
@@ -1050,6 +1207,10 @@ function withSourceCoverage(
 ): Omit<AlignmentState, "groups" | "unaligned"> {
   const sourceWords = collectSourceWords(sourceVerseObjects);
   if (sourceWords.length === 0) return base;
+  // Re-derive impossible/stale x-occurrence numbers FIRST: everything below
+  // (position resolution, the canonical sort, coverage) reads occurrence to
+  // decide which physical source token a milestone means.
+  base = { ...base, sourceGroups: renumberSourceOccurrences(base.sourceGroups, sourceWords) };
   // Normalize each compound's source order to canonical (UHB/UGNT text) order.
   // The chain comes out of `walk` in milestone-NESTING order, which a few
   // AI-generated alignments stamp reversed (e.g. ZEC 6:13 UST nests הֵיכַל
