@@ -11,6 +11,7 @@ import {
   corruptContentJsonBody,
   logCorruptContentJson,
   parseVerseContentJson,
+  refusesEmptyVerseObjects,
 } from "./contentJson.ts";
 import {
   analyzeAlignmentDelta,
@@ -35,15 +36,16 @@ function normalizeOccurrences(parsed: unknown): void {
 
 export const verses = new Hono<{ Bindings: Env; Variables: { userId?: number } }>();
 
-// content must be the usfm-js verse-objects tree (at minimum, a non-empty
-// verseObjects array). The whole tree is replaced on every PATCH; a malformed
-// body that passed validation as `unknown` would brick the verse — the
-// alignment dialog walks verseObjects without null-guarding.
+// content must be the usfm-js verse-objects tree. The whole tree is replaced on
+// every PATCH; a malformed body that passed validation as `unknown` would brick
+// the verse — the alignment dialog walks verseObjects without null-guarding.
+// Emptiness is NOT checked here: whether an empty tree is legal depends on the
+// verse number, which zod never sees, so it is enforced at the call site below.
 const VerseObjectSchema = z.object({}).passthrough();
 const PatchSchema = z.object({
   content: z
     .object({
-      verseObjects: z.array(VerseObjectSchema).min(1),
+      verseObjects: z.array(VerseObjectSchema),
     })
     .passthrough(),
   // Optional, but NOT nullable: the SQL uses COALESCE(?2, plain_text), so an
@@ -210,6 +212,12 @@ verses.patch("/:book/:chapter/:verse/:bibleVersion", requireEditor, async (c) =>
 
   if (bibleVersion === "UHB" || bibleVersion === "UGNT") {
     return c.json({ error: "source_text_is_read_only" }, 403);
+  }
+
+  // Empty verseObjects is legal for the chapter-front pseudo-verse only —
+  // see refusesEmptyVerseObjects for the full rationale (#366).
+  if (refusesEmptyVerseObjects(verse, parsed.data.content.verseObjects)) {
+    return c.json({ error: "invalid_body", reason: "empty_verse_objects" }, 400);
   }
 
   if (hasUnsafeMarkerTag(parsed.data.content.verseObjects)) {
