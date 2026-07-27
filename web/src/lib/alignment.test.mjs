@@ -2765,14 +2765,19 @@ function roundtripVerseUsfm(rawUsfm, sourceVO = null) {
   ];
   assert(destGroupIds.length === 2, `card collapses two state groups (got ${destGroupIds.length})`);
 
-  // Regression: the OLD single-group path splits the card back into two.
+  // The over-count encoding (occ 1/2 + 2/2 over a once-occurring token) is now
+  // normalized to 1/1 + 1/1 at parse (renumberSourceOccurrences), and `walk`
+  // then folds two single-word groups with identical numbering into ONE group,
+  // so the single-group path can no longer split this card. The fused-card
+  // machinery below is still exercised by COMPOUND chains, which `walk` keeps
+  // separate — see the ZEC 11:14 case at the end of this file.
   const oldWay = moveSource(state, kiId, card.id, sourcePos);
   const oldTeraphimCards = displayOf(oldWay).filter((g) =>
     g.source.some((s) => s.strong === "d:H8655"),
   );
   assert(
-    oldTeraphimCards.length === 2,
-    `precondition: moveSource onto one group SPLITS the card (the bug) — got ${oldTeraphimCards.length} teraphim cards`,
+    oldTeraphimCards.length === 1,
+    `renumbered over-count groups stay one card even via the single-group path (got ${oldTeraphimCards.length})`,
   );
 
   // Fix: add כִּי to every fused group; the card stays fused.
@@ -2883,10 +2888,11 @@ function roundtripVerseUsfm(rawUsfm, sourceVO = null) {
   assert(kiIds.length === 1, `כִּי card is a single state group (got ${kiIds.length})`);
 
   // ── Direction A: SURVIVOR is the fused card (merge כִּי → teraphim). ──
-  // Regression: the old single-id merge splits the fused survivor back into two.
+  // As above: renumbering + `walk` fold the over-count pair into one group, so
+  // the single-id merge can no longer split the survivor.
   const oldA = mergeGroups(state, teraphimCard.id, kiCard.id, sourcePos);
   const oldACards = displayOf(oldA).filter((g) => g.source.some((s) => s.strong === "d:H8655"));
-  assert(oldACards.length === 2, `precondition: mergeGroups SPLITS the fused survivor (the bug) — got ${oldACards.length} teraphim cards`);
+  assert(oldACards.length === 1, `renumbered fused survivor stays one card (got ${oldACards.length})`);
 
   const fixedA = mergeGroupsToGroups(state, teraphimIds, kiIds, sourcePos);
   const aCards = displayOf(fixedA).filter((g) => g.source.some((s) => s.strong === "d:H8655"));
@@ -3305,6 +3311,120 @@ const srcWordContents = (st) => st.groups.flatMap((g) => g.source).map((s) => ({
   assert(
     Array.isArray(json.chapters[ch][v].verseObjects),
     "re-serialized content slots back into the verse envelope",
+  );
+}
+
+// ─── Case: impossible x-occurrence renumbering (issue #367, ZEC 11:14) ──────
+// ULT master stamps the object marker אֶת (two tokens in the verse) as occ 1/2,
+// 2/2 and 3/2, and מַקְלִי (one token) as 1/1 and 2/1. The card for the FIRST
+// object marker therefore renders a superscript "3", and `findSourcePosition`
+// falls back to the first matching surface, so it highlights the wrong word.
+{
+  console.log("\n[Case] impossible x-occurrence is renumbered from the source (ZEC 11:14)");
+  const src = String.raw`\id ZEC
+\c 11
+\v 14 \w וָ⁠אֶגְדַּע|x-strong="c:H1438"\w* \w אֶת|x-strong="H0853"\w*־\w מַקְלִי|x-strong="H4731"\w* \w הַ⁠שֵּׁנִי|x-strong="d:H8145"\w* \w אֵת|x-strong="H0853"\w* \w הַ⁠חֹבְלִים|x-strong="d:H2256c"\w* \w לְ⁠הָפֵר|x-strong="l:H6565a"\w* \w אֶת|x-strong="H0853"\w*־\w הָ⁠אַחֲוָה|x-strong="d:H0264"\w*
+`;
+  const tgt = String.raw`\id ZEC
+\c 11
+\v 14 \zaln-s |x-strong="H0853" x-occurrence="1" x-occurrences="2" x-content="אֶת"\*\zaln-s |x-strong="H4731" x-occurrence="1" x-occurrences="1" x-content="מַקְלִי"\*\w my|x-occurrence="1" x-occurrences="1"\w*\zaln-e\*\zaln-e\* \zaln-s |x-strong="d:H8145" x-occurrence="1" x-occurrences="1" x-content="הַ⁠שֵּׁנִי"\*\w second|x-occurrence="1" x-occurrences="1"\w*\zaln-e\* \zaln-s |x-strong="H0853" x-occurrence="2" x-occurrences="2" x-content="אֶת"\*\zaln-s |x-strong="H4731" x-occurrence="2" x-occurrences="1" x-content="מַקְלִי"\*\w staff|x-occurrence="1" x-occurrences="1"\w*\zaln-e\*\zaln-e\* \zaln-s |x-strong="H0853" x-occurrence="1" x-occurrences="1" x-content="אֵת"\*\zaln-s |x-strong="d:H2256c" x-occurrence="1" x-occurrences="1" x-content="הַ⁠חֹבְלִים"\*\w Union|x-occurrence="1" x-occurrences="1"\w*\zaln-e\*\zaln-e\* \zaln-s |x-strong="H0853" x-occurrence="3" x-occurrences="2" x-content="אֶת"\*\zaln-s |x-strong="d:H0264" x-occurrence="1" x-occurrences="1" x-content="הָ⁠אַחֲוָה"\*\w the|x-occurrence="1" x-occurrences="1"\w* \w brotherhood|x-occurrence="1" x-occurrences="1"\w*\zaln-e\*\zaln-e\*
+`;
+  const svo = usfm.toJSON(src).chapters["11"]["14"].verseObjects;
+  const tvo = usfm.toJSON(tgt).chapters["11"]["14"].verseObjects;
+  const state = parseAlignment(tvo, svo);
+  const chain = (targetText) => {
+    const g = state.groups.find((x) => x.targets.some((t) => t.text === targetText));
+    return g.source.map((s) => `${s.content}:${s.occurrence}/${s.occurrences}`).join("+");
+  };
+  assert(
+    chain("my") === "אֶת:1/2+מַקְלִי:1/1",
+    `the untouched first card keeps 1/2 + 1/1 (got ${chain("my")})`,
+  );
+  assert(
+    chain("staff") === "אֶת:1/2+מַקְלִי:1/1",
+    `מַקְלִי occ 2/1 is impossible; the split card re-resolves to the same tokens (got ${chain("staff")})`,
+  );
+  assert(
+    chain("Union") === "אֵת:1/1+הַ⁠חֹבְלִים:1/1",
+    `the distinct אֵת surface is its own occurrence 1 (got ${chain("Union")})`,
+  );
+  assert(
+    chain("brotherhood") === "אֶת:2/2+הָ⁠אַחֲוָה:1/1",
+    `אֶת occ 3/2 becomes the second (and last) אֶת token (got ${chain("brotherhood")})`,
+  );
+
+  // The two repaired אֶת+מַקְלִי chains now name the SAME pair of Hebrew tokens.
+  // `walk` keeps compounds as separate groups (so each target run keeps its own
+  // milestone on export), and `mergeSamePositionGroups` fuses them for display
+  // into one card carrying both "my" and "staff" — the fused-card path, reached
+  // here from well-formed numbering.
+  const posByContent = new Map();
+  svo.forEach((n, i) => {
+    if (n && n.type === "word" && n.tag === "w") posByContent.set(n.text.normalize("NFC"), i);
+  });
+  const posKey = (g) => {
+    if (g.source.length === 0) return null;
+    const ps = g.source.map((s) => posByContent.get((s.content ?? "").normalize("NFC")) ?? -1);
+    return ps.some((p) => p < 0) ? null : ps.join(".");
+  };
+  const maqlCards = mergeSamePositionGroups(state.groups, posKey).filter((g) =>
+    g.source.some((s) => s.content === "מַקְלִי"),
+  );
+  assert(
+    maqlCards.length === 1 &&
+      maqlCards[0].targets.map((t) => t.text).join(",") === "my,staff",
+    `the two repaired chains render as ONE card holding both runs (got ${maqlCards.length} card(s): ${maqlCards.map((g) => g.targets.map((t) => t.text).join("/")).join(" | ")})`,
+  );
+
+  // Clean data must round-trip untouched — no export churn.
+  const cleanState = parseAlignment(
+    usfm.toJSON(
+      String.raw`\id ZEC
+\c 11
+\v 14 \zaln-s |x-strong="H0853" x-occurrence="1" x-occurrences="2" x-content="אֶת"\*\zaln-s |x-strong="H4731" x-occurrence="1" x-occurrences="1" x-content="מַקְלִי"\*\w my|x-occurrence="1" x-occurrences="1"\w*\zaln-e\*\zaln-e\*
+`,
+    ).chapters["11"]["14"].verseObjects,
+    svo,
+  );
+  const cleanChain = cleanState.groups
+    .find((g) => g.targets.length > 0)
+    .source.map((s) => `${s.content}:${s.occurrence}/${s.occurrences}`)
+    .join("+");
+  assert(
+    cleanChain === "אֶת:1/2+מַקְלִי:1/1",
+    `well-formed numbering is left alone (got ${cleanChain})`,
+  );
+}
+
+// ─── Case: repeated surface renumbers in document order (JER 31:12 shape) ───
+// Three וְעַל milestones over three וְעַל tokens, stamped 2/4, 3/4, 4/4 (the
+// aligner counted עַל and וְעַל together). Renumbering each card in isolation
+// would keep the bogus 2 and 3 and wrap the last one back to 1; the cursor
+// makes them walk forward through the tokens.
+{
+  console.log("\n[Case] a mis-counted repeated surface renumbers in document order");
+  const src = String.raw`\id JER
+\c 31
+\v 12 \w עַל|x-strong="H5921a"\w* \w וְ⁠עַל|x-strong="c:H5921a"\w* \w וְ⁠עַל|x-strong="c:H5921a"\w* \w וְ⁠עַל|x-strong="c:H5921a"\w*
+`;
+  const tgt = String.raw`\id JER
+\c 31
+\v 12 \zaln-s |x-strong="H5921a" x-occurrence="1" x-occurrences="4" x-content="עַל"\*\w over|x-occurrence="1" x-occurrences="1"\w*\zaln-e\* \zaln-s |x-strong="c:H5921a" x-occurrence="2" x-occurrences="4" x-content="וְ⁠עַל"\*\w and|x-occurrence="1" x-occurrences="1"\w*\zaln-e\* \zaln-s |x-strong="c:H5921a" x-occurrence="3" x-occurrences="4" x-content="וְ⁠עַל"\*\w over|x-occurrence="2" x-occurrences="2"\w*\zaln-e\* \zaln-s |x-strong="c:H5921a" x-occurrence="4" x-occurrences="4" x-content="וְ⁠עַל"\*\w again|x-occurrence="1" x-occurrences="1"\w*\zaln-e\*
+`;
+  const svo = usfm.toJSON(src).chapters["31"]["12"].verseObjects;
+  const tvo = usfm.toJSON(tgt).chapters["31"]["12"].verseObjects;
+  const state = parseAlignment(tvo, svo);
+  const numbers = state.groups
+    .filter((g) => g.targets.length > 0 && g.source[0].content === "וְ⁠עַל")
+    .map((g) => `${g.source[0].occurrence}/${g.source[0].occurrences}`)
+    .join(",");
+  assert(numbers === "1/3,2/3,3/3", `the three וְעַל milestones walk forward (got ${numbers})`);
+  const alone = state.groups.find(
+    (g) => g.targets.length > 0 && g.source[0].content === "עַל",
+  ).source[0];
+  assert(
+    `${alone.occurrence}/${alone.occurrences}` === "1/1",
+    `עַל is counted per exact surface, not per Strong (got ${alone.occurrence}/${alone.occurrences})`,
   );
 }
 
