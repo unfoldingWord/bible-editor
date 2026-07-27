@@ -110,6 +110,43 @@ const lit = (vo, quote, occurrence, source) =>
   );
 }
 
+// --- 5. Guard: an AMBIGUOUS over-claim must not drag in a neighbour span. The
+// source holds לֹ֣א twice but the GL stamps three spans (1/3, 2/3, 3/3). Which
+// physical token span 3 meant is unknowable, so it must NOT be clamped onto
+// span 2 — same restraint lib/sourceOccurrences.ts shows for trueTotal > 1.
+{
+  const source = [src("לֹ֣א"), src("יְרַפֵּ֑א"), src("לֹ֣א"), src("יְכַלְכֵּ֔ל")];
+  const target = [
+    zaln("לֹ֣א", 1, 3, [tgt("a")]),
+    zaln("לֹ֣א", 2, 3, [tgt("b")]),
+    zaln("לֹ֣א", 3, 3, [tgt("c")]),
+    zaln("יְכַלְכֵּ֔ל", 1, 1, [tgt("sustain")]),
+  ];
+  const got = lit(target, "לֹ֣א יְכַלְכֵּ֔ל", 1, source);
+  assert(
+    JSON.stringify(got) === JSON.stringify(["b", "sustain"]),
+    `ambiguous over-claim doesn't merge onto a neighbour, got ${JSON.stringify(got)}`,
+  );
+}
+
+// --- 6. Guard: a quote that resolves in the OL but joins to NO span must fall
+// through to the set match rather than blanking. Here the OL holds לֹֽא twice
+// but both GL spans are stamped flat 1/1, so the 2nd instance's key matches
+// nothing — an empty highlight is the symptom this whole feature exists to
+// avoid, so the imprecise-but-visible fallback wins.
+{
+  const source = [src("לֹֽא"), src("יִפְקֹד֙"), src("לֹֽא"), src("יְבַקֵּ֔שׁ")];
+  const target = [
+    zaln("לֹֽא", 1, 1, [tgt("not-one")]),
+    zaln("לֹֽא", 1, 1, [tgt("not-two")]),
+  ];
+  const got = lit(target, "לֹֽא", 2, source);
+  assert(
+    JSON.stringify(got) === JSON.stringify(["not-one", "not-two"]),
+    `unjoinable canonical match degrades instead of blanking, got ${JSON.stringify(got)}`,
+  );
+}
+
 if (failed) {
   console.error(`\n${failed} test(s) failed`);
   process.exit(1);

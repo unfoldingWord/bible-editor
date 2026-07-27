@@ -217,11 +217,14 @@ function collectMilestoneRuns(verseObjects: unknown[], sourceTotals?: Map<string
       // carries a distinct effective occurrence and never false-merges.
       const want = source ? matchNorm(source) : "";
       const trueTotal = source ? sourceTotals?.get(want) : undefined;
-      const ceiling = Math.min(
-        Math.max(occurrences, 1),
-        trueTotal && trueTotal > 0 ? trueTotal : Number.POSITIVE_INFINITY,
-      );
-      const effOcc = Math.min(Math.max(occurrence, 1), ceiling);
+      // Appears-once ONLY. When the OL verse holds the word exactly once, every
+      // milestone for it must mean that one token, so any occurrence collapses
+      // to 1. When it holds the word 2+ times, an over-claiming milestone
+      // ("the 3rd of 3" over a source with two) is genuinely ambiguous — which
+      // physical token? — so it is left to the [1, occurrences] clamp rather
+      // than dragged onto a neighbour it may have nothing to do with.
+      const effOcc =
+        trueTotal === 1 ? 1 : Math.min(Math.max(occurrence, 1), Math.max(occurrences, 1));
       let merged = false;
       if (source) {
         for (let i = out.length - 1; i >= 0; i--) {
@@ -369,19 +372,38 @@ export function findTargetHighlights(
   // milestones by (content, occurrence). Split-gloss duplicates share a key,
   // so every fragment of a discontinuous gloss lights up together.
   if (Array.isArray(sourceVerseObjects)) {
-    const olKeys = sourceInstanceKeys(sourceVerseObjects, quote, occurrence);
-    if (olKeys.size > 0) {
+    const olTokens = matchSourceTokens(sourceVerseObjects, quote, occurrence);
+    if (olTokens.length > 0) {
+      const olKeys = new Set(
+        olTokens.map((t) => `${matchNorm(t.text)}|${t.surfaceOccurrence ?? t.occurrence}`),
+      );
       for (const r of runs) {
         if (olKeys.has(`${matchNorm(r.source)}|${r.occurrence}`)) {
           for (const t of r.targets) out.add(k(t.text, t.occurrence));
         }
       }
-      return out;
+      if (out.size > 0) return out;
+      // The quote resolved cleanly in the OL verse yet joined to no GL span.
+      // That happens when the GL numbering disagrees with the OL's — e.g. the
+      // OL holds לֹא twice but both GL spans are stamped flat 1/1 (prod
+      // "shape 2" above), so the 2nd instance's key matches nothing. Blanking
+      // is the worse of the two failures — it is the very symptom this feature
+      // exists to prevent — so retry on CONTENT alone. That is imprecise about
+      // WHICH instance (it lights every span for the word) but it lights the
+      // right word, which is what the pre-OL-anchoring behaviour did anyway.
+      const olContents = new Set(olTokens.map((t) => matchNorm(t.text)));
+      for (const r of runs) {
+        if (olContents.has(matchNorm(r.source))) {
+          for (const t of r.targets) out.add(k(t.text, t.occurrence));
+        }
+      }
+      if (out.size > 0) return out;
     }
   }
 
-  // Degradation: no source verse (e.g. UHB failed to load) or the quote didn't
-  // resolve in it. Match the quote as a SET of source words against the GL
+  // Degradation: no source verse (e.g. UHB failed to load), the quote didn't
+  // resolve in it, or it resolved but joined to no GL span (see above). Match
+  // the quote as a SET of source words against the GL
   // milestones' own (content, occurrence). Correct for the common
   // single-occurrence case and lockstep repeats; for a quoted word whose source
   // occurrence differs from the phrase occurrence it can pick the wrong instance
@@ -594,25 +616,6 @@ export function findSourceHighlights(
   const out = new Set<HighlightKey>();
   for (const t of matchSourceTokens(verseObjects, quote, occurrence)) {
     out.add(k(t.text, t.occurrence));
-  }
-  return out;
-}
-
-// OL instance keys for the ULT/UST alignment join: `${matchNorm(content)}|occurrence`.
-// Match-normalized because UHB \w text is in legacy combining-mark order while
-// \zaln-s x-content is NFC (see lib/hebrew.ts), and joiner presence can drift
-// — the join must compare the canonical form on both sides.
-//
-// The occurrence half is the COUNTED surface occurrence, not the token's own
-// (absent) x-occurrence — see collectBareWords.
-function sourceInstanceKeys(
-  verseObjects: unknown[],
-  quote: string,
-  occurrence: number,
-): Set<string> {
-  const out = new Set<string>();
-  for (const t of matchSourceTokens(verseObjects, quote, occurrence)) {
-    out.add(`${matchNorm(t.text)}|${t.surfaceOccurrence ?? t.occurrence}`);
   }
   return out;
 }
