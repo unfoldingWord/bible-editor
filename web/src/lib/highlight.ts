@@ -37,7 +37,13 @@ export function matchNorm(s: string): string {
   return nfc(s).replace(/[\u2060\u200d]/g, "");
 }
 
-type WordToken = { text: string; occurrence: number };
+// `occurrence` is the token's OWN `x-occurrence` attribute (defaulting to 1).
+// `surfaceOccurrence` — set only for SOURCE tokens (collectBareWords) — is the
+// token's 1-based position among same-surface tokens in the verse, counted
+// here rather than read. They agree on well-formed data, but imported UHB/UGNT
+// `\w` tokens carry NO x-occurrence at all, so only the counted value can name
+// "the 2nd לֹא" — which is exactly what a GL `\zaln-s` x-occurrence refers to.
+type WordToken = { text: string; occurrence: number; surfaceOccurrence?: number };
 type Run = { source: string; occurrence: number; targets: WordToken[] };
 
 const GAP = /[&…]+|\.{3}/g;
@@ -177,7 +183,20 @@ function collectSubtreeWords(children: unknown[]): WordToken[] {
 // ALL its target words. A genuinely repeated word carries a DISTINCT
 // occurrence (occ=1/2 vs 2/2 → effective 1 vs 2), so it never false-merges.
 // Mirrors effectiveOccurrence / sameSourceChain in lib/alignment.ts.
-function collectMilestoneRuns(verseObjects: unknown[]): Run[] {
+//
+// Shape 1 above assumes the bogus continuation over-claims `occurrence` while
+// `occurrences` stays honest, so clamping into [1, occurrences] folds it back.
+// A third prod shape defeats that: BOTH are inflated. ZEC 11:16 UST stamps
+// וּבְשַׂר, וּפַרְסֵיהֶן and וְהַנִּשְׁבֶּרֶת as 1/2 AND 2/2 even though each
+// occurs exactly ONCE in the UHB verse, so the clamp is a no-op, the two spans
+// stay separate runs, and the second one ("the meat of", "their hooves") never
+// joins — the visible bug in issue #371. `sourceTotals` (when the OL verse is
+// available) supplies the real count so the clamp becomes
+// [1, min(occurrences, trueTotal)]. This is the same appears-once rule
+// lib/sourceOccurrences.ts applies as a data fix, and it is equally
+// conservative: a token that genuinely appears 2+ times is left alone, because
+// which physical token an over-claiming milestone meant is unknowable.
+function collectMilestoneRuns(verseObjects: unknown[], sourceTotals?: Map<string, number>): Run[] {
   const out: Run[] = [];
   function walk(nodes: unknown[]) {
     for (const node of nodes ?? []) {
@@ -196,10 +215,18 @@ function collectMilestoneRuns(verseObjects: unknown[]): Run[] {
       // EFFECTIVE occurrence (clamped into [1, occurrences]) so the matcher sees
       // ONE token carrying ALL its target words. A genuinely repeated word
       // carries a distinct effective occurrence and never false-merges.
-      const effOcc = Math.min(Math.max(occurrence, 1), Math.max(occurrences, 1));
+      const want = source ? matchNorm(source) : "";
+      const trueTotal = source ? sourceTotals?.get(want) : undefined;
+      // Appears-once ONLY. When the OL verse holds the word exactly once, every
+      // milestone for it must mean that one token, so any occurrence collapses
+      // to 1. When it holds the word 2+ times, an over-claiming milestone
+      // ("the 3rd of 3" over a source with two) is genuinely ambiguous — which
+      // physical token? — so it is left to the [1, occurrences] clamp rather
+      // than dragged onto a neighbour it may have nothing to do with.
+      const effOcc =
+        trueTotal === 1 ? 1 : Math.min(Math.max(occurrence, 1), Math.max(occurrences, 1));
       let merged = false;
       if (source) {
-        const want = matchNorm(source);
         for (let i = out.length - 1; i >= 0; i--) {
           if (out[i].occurrence === effOcc && matchNorm(out[i].source) === want) {
             out[i].targets.push(...targets);
@@ -221,15 +248,30 @@ function collectMilestoneRuns(verseObjects: unknown[]): Run[] {
 
 // Flatten the verse tree into one bare \w token per entry, in document
 // order. Used for UHB/UGNT highlighting where the verse IS the source.
+//
+// `surfaceOccurrence` is COUNTED here, not read off the node: imported UHB/UGNT
+// `\w` tokens carry no `x-occurrence` attribute at all (hbo_uhb master has
+// none), so the attribute reads 1 for every token — including the 2nd and 3rd
+// לֹא of a verse. The GL `\zaln-s` x-occurrence that the OL-anchored join
+// compares against DOES number them, so without counting, every source word
+// past its first appearance fails to join and its GL words never highlight
+// (ZEC 11:16 ULT: the 2nd and 4th "not"). Counting is keyed on matchNorm so it
+// uses the same canonical surface form as the join.
 function collectBareWords(verseObjects: unknown[]): WordToken[] {
   const out: WordToken[] = [];
+  const seen = new Map<string, number>();
   function walk(nodes: unknown[]) {
     for (const node of nodes ?? []) {
       if (nodeIsWord(node)) {
+        const text = String((node as Record<string, unknown>)["text"] ?? "");
+        const norm = matchNorm(text);
+        const surfaceOccurrence = (seen.get(norm) ?? 0) + 1;
+        seen.set(norm, surfaceOccurrence);
         out.push({
-          text: String((node as Record<string, unknown>)["text"] ?? ""),
+          text,
           occurrence:
             parseInt(String((node as Record<string, unknown>)["occurrence"] ?? "1"), 10) || 1,
+          surfaceOccurrence,
         });
       } else if (nodeIsMilestone(node) || nodeIsPsalmTitle(node)) {
         const children = ((node as Record<string, unknown>)["children"] as unknown[] | undefined) ?? [];
@@ -316,7 +358,10 @@ export function findTargetHighlights(
   occurrence: number,
   sourceVerseObjects?: unknown[],
 ): Set<HighlightKey> {
-  const runs = collectMilestoneRuns(verseObjects);
+  const sourceTotals = Array.isArray(sourceVerseObjects)
+    ? sourceSurfaceTotals(sourceVerseObjects)
+    : undefined;
+  const runs = collectMilestoneRuns(verseObjects, sourceTotals);
   const out = new Set<HighlightKey>();
   if (runs.length === 0) return out;
   // `occurrence: -1` means "every occurrence of the quote" (TSV spec).
@@ -327,19 +372,34 @@ export function findTargetHighlights(
   // milestones by (content, occurrence). Split-gloss duplicates share a key,
   // so every fragment of a discontinuous gloss lights up together.
   if (Array.isArray(sourceVerseObjects)) {
-    const olKeys = sourceInstanceKeys(sourceVerseObjects, quote, occurrence);
-    if (olKeys.size > 0) {
+    const olTokens = matchSourceTokens(sourceVerseObjects, quote, occurrence);
+    if (olTokens.length > 0) {
+      const olKeys = new Set(
+        olTokens.map((t) => `${matchNorm(t.text)}|${t.surfaceOccurrence ?? t.occurrence}`),
+      );
       for (const r of runs) {
         if (olKeys.has(`${matchNorm(r.source)}|${r.occurrence}`)) {
           for (const t of r.targets) out.add(k(t.text, t.occurrence));
         }
       }
+      // An empty result is RETURNED, not retried more loosely. Counting source
+      // occurrences (above) makes it newly possible for a quote to resolve in
+      // the OL yet join to nothing — but the honest reading of that is "the GL
+      // never aligned this instance", and the GL usually hasn't: the UST is
+      // idiomatic and routinely drops tokens. Falling back to a content-only
+      // match there would light the FIRST instance's words for a quote on the
+      // second — a confidently wrong highlight, and (via
+      // extractTargetSelectionText) a confidently wrong AI selection payload.
+      // Measured on en_tn master × ZEC/HOS/ISA/JER — 19,750 quote×resource
+      // cases — counting blanks nothing that used to light, so there is no
+      // regression here to paper over.
       return out;
     }
   }
 
-  // Degradation: no source verse (e.g. UHB failed to load) or the quote didn't
-  // resolve in it. Match the quote as a SET of source words against the GL
+  // Degradation: no source verse (e.g. UHB failed to load), the quote didn't
+  // resolve in it, or it resolved but joined to no GL span (see above). Match
+  // the quote as a SET of source words against the GL
   // milestones' own (content, occurrence). Correct for the common
   // single-occurrence case and lockstep repeats; for a quoted word whose source
   // occurrence differs from the phrase occurrence it can pick the wrong instance
@@ -556,20 +616,16 @@ export function findSourceHighlights(
   return out;
 }
 
-// OL instance keys for the ULT/UST alignment join: `${matchNorm(content)}|occurrence`.
-// Match-normalized because UHB \w text is in legacy combining-mark order while
-// \zaln-s x-content is NFC (see lib/hebrew.ts), and joiner presence can drift
-// — the join must compare the canonical form on both sides.
-function sourceInstanceKeys(
-  verseObjects: unknown[],
-  quote: string,
-  occurrence: number,
-): Set<string> {
-  const out = new Set<string>();
-  for (const t of matchSourceTokens(verseObjects, quote, occurrence)) {
-    out.add(`${matchNorm(t.text)}|${t.occurrence}`);
+// How many times each source surface form appears in the OL verse, keyed by
+// matchNorm. Lets the GL side tell an IMPOSSIBLE `\zaln-s` x-occurrence
+// ("the 2nd וּבְשַׂר" in a verse that has exactly one) from a genuine repeat.
+function sourceSurfaceTotals(verseObjects: unknown[]): Map<string, number> {
+  const totals = new Map<string, number>();
+  for (const t of collectBareWords(verseObjects)) {
+    const key = matchNorm(t.text);
+    totals.set(key, (totals.get(key) ?? 0) + 1);
   }
-  return out;
+  return totals;
 }
 
 // ---------- rendering ----------
