@@ -129,21 +129,18 @@ const lit = (vo, quote, occurrence, source) =>
   );
 }
 
-// --- 6. Guard: a quote that resolves in the OL but joins to NO span must fall
-// through to the set match rather than blanking. Here the OL holds לֹֽא twice
-// but both GL spans are stamped flat 1/1, so the 2nd instance's key matches
-// nothing — an empty highlight is the symptom this whole feature exists to
-// avoid, so the imprecise-but-visible fallback wins.
+// --- 6. Guard: quoting an instance the GL never aligned must light NOTHING,
+// not the other instance's words. The OL holds לֹֽא twice but only the first is
+// aligned; lighting "not-one" for a quote on the second would be a confidently
+// wrong highlight (and a wrong AI selection payload via
+// extractTargetSelectionText). Silence is the honest answer.
 {
   const source = [src("לֹֽא"), src("יִפְקֹד֙"), src("לֹֽא"), src("יְבַקֵּ֔שׁ")];
-  const target = [
-    zaln("לֹֽא", 1, 1, [tgt("not-one")]),
-    zaln("לֹֽא", 1, 1, [tgt("not-two")]),
-  ];
+  const target = [zaln("לֹֽא", 1, 1, [tgt("not-one")]), zaln("יִפְקֹד֙", 1, 1, [tgt("attend")])];
   const got = lit(target, "לֹֽא", 2, source);
   assert(
-    JSON.stringify(got) === JSON.stringify(["not-one", "not-two"]),
-    `unjoinable canonical match degrades instead of blanking, got ${JSON.stringify(got)}`,
+    JSON.stringify(got) === JSON.stringify([]),
+    `unaligned 2nd instance lights nothing, not the 1st, got ${JSON.stringify(got)}`,
   );
 }
 

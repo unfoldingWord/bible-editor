@@ -382,22 +382,18 @@ export function findTargetHighlights(
           for (const t of r.targets) out.add(k(t.text, t.occurrence));
         }
       }
-      if (out.size > 0) return out;
-      // The quote resolved cleanly in the OL verse yet joined to no GL span.
-      // That happens when the GL numbering disagrees with the OL's — e.g. the
-      // OL holds לֹא twice but both GL spans are stamped flat 1/1 (prod
-      // "shape 2" above), so the 2nd instance's key matches nothing. Blanking
-      // is the worse of the two failures — it is the very symptom this feature
-      // exists to prevent — so retry on CONTENT alone. That is imprecise about
-      // WHICH instance (it lights every span for the word) but it lights the
-      // right word, which is what the pre-OL-anchoring behaviour did anyway.
-      const olContents = new Set(olTokens.map((t) => matchNorm(t.text)));
-      for (const r of runs) {
-        if (olContents.has(matchNorm(r.source))) {
-          for (const t of r.targets) out.add(k(t.text, t.occurrence));
-        }
-      }
-      if (out.size > 0) return out;
+      // An empty result is RETURNED, not retried more loosely. Counting source
+      // occurrences (above) makes it newly possible for a quote to resolve in
+      // the OL yet join to nothing — but the honest reading of that is "the GL
+      // never aligned this instance", and the GL usually hasn't: the UST is
+      // idiomatic and routinely drops tokens. Falling back to a content-only
+      // match there would light the FIRST instance's words for a quote on the
+      // second — a confidently wrong highlight, and (via
+      // extractTargetSelectionText) a confidently wrong AI selection payload.
+      // Measured on en_tn master × ZEC/HOS/ISA/JER — 19,750 quote×resource
+      // cases — counting blanks nothing that used to light, so there is no
+      // regression here to paper over.
+      return out;
     }
   }
 
