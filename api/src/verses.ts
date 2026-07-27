@@ -11,6 +11,7 @@ import {
   corruptContentJsonBody,
   logCorruptContentJson,
   parseVerseContentJson,
+  refusesEmptyVerseObjects,
 } from "./contentJson.ts";
 import {
   analyzeAlignmentDelta,
@@ -213,20 +214,9 @@ verses.patch("/:book/:chapter/:verse/:bibleVersion", requireEditor, async (c) =>
     return c.json({ error: "source_text_is_read_only" }, 403);
   }
 
-  // An empty verseObjects array is legitimate for verse 0 ONLY. Verse 0 is the
-  // chapter-front pseudo-verse (see extractVersesForRange in importParsers.ts) —
-  // a container for chapter-front material such as an `\s1` section heading or a
-  // Psalm `\d` title. When that heading is the row's only node, deleting it
-  // through the section-header band leaves nothing behind, so the row must be
-  // allowed to become empty; buildUsfm keys verse 0 as usfm-js "front", so an
-  // empty front emits nothing at all (no stray `\v 0` — see export.test.mjs).
-  // Refusing it is what made a chapter-leading heading undeletable: the PATCH
-  // 400'd, the outbox files 4xx as fatal, and the heading stayed in D1 (#366).
-  //
-  // For a real verse (>= 1) an empty tree would blank the verse text with no way
-  // to type it back, so that stays rejected. The verse number is why this lives
-  // here and not in PatchSchema: zod never sees the route param.
-  if (parsed.data.content.verseObjects.length === 0 && verse !== 0) {
+  // Empty verseObjects is legal for the chapter-front pseudo-verse only —
+  // see refusesEmptyVerseObjects for the full rationale (#366).
+  if (refusesEmptyVerseObjects(verse, parsed.data.content.verseObjects)) {
     return c.json({ error: "invalid_body", reason: "empty_verse_objects" }, 400);
   }
 
