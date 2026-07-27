@@ -2766,10 +2766,11 @@ function roundtripVerseUsfm(rawUsfm, sourceVO = null) {
   assert(destGroupIds.length === 2, `card collapses two state groups (got ${destGroupIds.length})`);
 
   // The over-count encoding (occ 1/2 + 2/2 over a once-occurring token) is now
-  // normalized to 1/1 + 1/1 at parse (renumberSourceOccurrences), so the two
-  // groups share a source key and the single-group path no longer splits the
-  // card. moveSourceToGroups still carries the fused set — proven below and by
-  // the cases where the source stays genuinely unresolvable.
+  // normalized to 1/1 + 1/1 at parse (renumberSourceOccurrences), and `walk`
+  // then folds two single-word groups with identical numbering into ONE group,
+  // so the single-group path can no longer split this card. The fused-card
+  // machinery below is still exercised by COMPOUND chains, which `walk` keeps
+  // separate — see the ZEC 11:14 case at the end of this file.
   const oldWay = moveSource(state, kiId, card.id, sourcePos);
   const oldTeraphimCards = displayOf(oldWay).filter((g) =>
     g.source.some((s) => s.strong === "d:H8655"),
@@ -2887,10 +2888,8 @@ function roundtripVerseUsfm(rawUsfm, sourceVO = null) {
   assert(kiIds.length === 1, `כִּי card is a single state group (got ${kiIds.length})`);
 
   // ── Direction A: SURVIVOR is the fused card (merge כִּי → teraphim). ──
-  // With the over-count encoding normalized at parse (renumberSourceOccurrences
-  // rewrites occ 1/2 + 2/2 over a once-occurring token to 1/1 + 1/1), the two
-  // teraphim groups share a source key, so even the old single-id merge leaves
-  // one card. mergeGroupsToGroups is still what carries the whole fused set.
+  // As above: renumbering + `walk` fold the over-count pair into one group, so
+  // the single-id merge can no longer split the survivor.
   const oldA = mergeGroups(state, teraphimCard.id, kiCard.id, sourcePos);
   const oldACards = displayOf(oldA).filter((g) => g.source.some((s) => s.strong === "d:H8655"));
   assert(oldACards.length === 1, `renumbered fused survivor stays one card (got ${oldACards.length})`);
@@ -3352,6 +3351,29 @@ const srcWordContents = (st) => st.groups.flatMap((g) => g.source).map((s) => ({
   assert(
     chain("brotherhood") === "אֶת:2/2+הָ⁠אַחֲוָה:1/1",
     `אֶת occ 3/2 becomes the second (and last) אֶת token (got ${chain("brotherhood")})`,
+  );
+
+  // The two repaired אֶת+מַקְלִי chains now name the SAME pair of Hebrew tokens.
+  // `walk` keeps compounds as separate groups (so each target run keeps its own
+  // milestone on export), and `mergeSamePositionGroups` fuses them for display
+  // into one card carrying both "my" and "staff" — the fused-card path, reached
+  // here from well-formed numbering.
+  const posByContent = new Map();
+  svo.forEach((n, i) => {
+    if (n && n.type === "word" && n.tag === "w") posByContent.set(n.text.normalize("NFC"), i);
+  });
+  const posKey = (g) => {
+    if (g.source.length === 0) return null;
+    const ps = g.source.map((s) => posByContent.get((s.content ?? "").normalize("NFC")) ?? -1);
+    return ps.some((p) => p < 0) ? null : ps.join(".");
+  };
+  const maqlCards = mergeSamePositionGroups(state.groups, posKey).filter((g) =>
+    g.source.some((s) => s.content === "מַקְלִי"),
+  );
+  assert(
+    maqlCards.length === 1 &&
+      maqlCards[0].targets.map((t) => t.text).join(",") === "my,staff",
+    `the two repaired chains render as ONE card holding both runs (got ${maqlCards.length} card(s): ${maqlCards.map((g) => g.targets.map((t) => t.text).join("/")).join(" | ")})`,
   );
 
   // Clean data must round-trip untouched — no export churn.

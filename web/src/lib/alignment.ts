@@ -579,7 +579,7 @@ interface CollectedSourceWord {
   textOccurrence: number;
 }
 
-export function collectSourceWords(verseObjects: unknown[]): CollectedSourceWord[] {
+function collectSourceWords(verseObjects: unknown[]): CollectedSourceWord[] {
   const out: CollectedSourceWord[] = [];
   const textCounts = new Map<string, number>();
   let pos = 0;
@@ -1055,14 +1055,19 @@ export function dropDuplicateSourceMilestones(verseObjects: unknown[]): unknown[
 // still round-trip without export churn. "Provably wrong" means, after
 // resolving every word to a UHB position:
 //   - a word's occurrence exceeds the number of matching surfaces, or its
-//     `occurrences` disagrees with the actual total for that surface;
-//   - two words in one chain land on the SAME position; or
-//   - the chain's positions are non-contiguous (a card always covers one
-//     contiguous run — the same invariant `detectDoubledSourceMilestones`
-//     asserts).
+//     `occurrences` disagrees with the actual total for that surface; or
+//   - two words in one chain land on the SAME position.
 // A chain containing any word whose content matches NO source surface is left
 // untouched: without an anchor we would be guessing.
-export function renumberSourceOccurrences(
+//
+// Deliberately NOT a trigger: a chain whose words resolve to non-contiguous
+// positions. A card should cover one contiguous run, but when every number
+// already names a real token we cannot tell which of them is the wrong one —
+// that is a case for `detectDoubledSourceMilestones` to report to a human, not
+// for this pass to guess at. (Measured on ULT ZEC/JER/EZK: it would have moved
+// exactly one card, EZK 41:1, on nothing better than a hunch.) Contiguity is
+// still what RANKS the candidates once a chain is known to be broken.
+function renumberSourceOccurrences(
   groups: AlignmentGroup[],
   sourceWords: CollectedSourceWord[],
 ): AlignmentGroup[] {
@@ -1105,8 +1110,7 @@ export function renumberSourceOccurrences(
     });
     const currentOk =
       current.every((c) => c !== null) &&
-      new Set(current.map((c) => c!.position)).size === current.length &&
-      isContiguousRun(current.map((c) => c!.position));
+      new Set(current.map((c) => c!.position)).size === current.length;
     if (currentOk) {
       advance(current as CollectedSourceWord[]);
       return g;
@@ -1128,12 +1132,6 @@ export function renumberSourceOccurrences(
     return { ...g, source };
   });
   return changedAny ? out : groups;
-}
-
-function isContiguousRun(positions: number[]): boolean {
-  if (positions.length <= 1) return true;
-  const sorted = [...positions].sort((a, b) => a - b);
-  return sorted[sorted.length - 1] - sorted[0] === sorted.length - 1;
 }
 
 // Exhaustive search over candidate positions, ranked by:
