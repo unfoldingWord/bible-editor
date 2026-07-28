@@ -73,6 +73,13 @@ export interface ExportParams {
   // service token (reads public raw files) — unlike the pre-export sync, which
   // is gated on dcsAllowed.
   reimportOnly?: boolean;
+  // Human override for the TSV shrink guard. The guard can't tell a truncated
+  // D1 load from a translator deliberately deleting rows, so a legitimate bulk
+  // deletion blocks the nightly forever (1CH tq: 55 rows deleted by hand on
+  // 2026-07-24, guard reported shrink_55_of_426 as a "truncated fetch"). Only
+  // honored for a single explicitly-named book AND resource — a run that omits
+  // either (every cron path) can never disable the guard wholesale.
+  allowShrink?: boolean;
 }
 
 export interface StepResult {
@@ -119,6 +126,16 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       : ALL_RESOURCES;
 
     const dcsAllowed = !params.dryDcs && !!this.env.DCS_SERVICE_TOKEN;
+
+    // Shrink-guard override, deliberately narrow: only a run that names ONE book
+    // and ONE resource can carry it. Every cron path omits both, so the nightly
+    // keeps the guard no matter what params get passed. `books` is resolved from
+    // book_imports, so requiring length === 1 also means the named book exists.
+    const shrinkOverride =
+      params.allowShrink === true && !!params.book && !!params.resource && books.length === 1;
+    if (params.allowShrink === true && !shrinkOverride) {
+      console.log("export: allowShrink ignored — requires an explicit single book + resource");
+    }
 
     // 1b. Sync D1 from current master before rendering. Pulls out-of-band master
     //     edits (other tooling, manual USFM cleanup, the bp-assistant bot) into
@@ -179,7 +196,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
           const result = await step.do(
             stepName,
             { retries: { limit: 3, delay: "5 seconds", backoff: "exponential" } },
-            async () => this.exportOne(book, resource, instanceId, dcsAllowed),
+            async () => this.exportOne(book, resource, instanceId, dcsAllowed, shrinkOverride),
           );
           results.push(result);
         } catch (e) {
@@ -299,6 +316,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     resource: Resource,
     instanceId: string,
     dcsAllowed: boolean,
+    allowShrink: boolean,
   ): Promise<StepResult> {
     const built = await this.buildResource(book, resource);
 
@@ -383,7 +401,14 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     // stopped the twl_PSA clobber (4880 rows shipped over master's 7776).
     if (dcsAllowed && (resource === "tn" || resource === "tq" || resource === "twl")) {
       const guard = await this.checkTsvShrink(book, resource, built.rowCount);
-      if (!guard.ok) {
+      if (!guard.ok && allowShrink && guard.detail.startsWith("shrink_")) {
+        // Explicit human override for a verified-intentional deletion. Scoped to
+        // a real shrink only — "master_unreadable" still fails closed, since an
+        // unverifiable master is exactly the case the override can't speak to.
+        console.log(
+          `export: shrink guard OVERRIDDEN for ${book} ${resource} (${guard.detail}) by explicit allowShrink`,
+        );
+      } else if (!guard.ok) {
         await this.recordShrinkSkipAlert(book, resource, built.rowCount, guard.masterRows, guard.detail);
         const reason = `shrink_guard:${guard.detail}`;
         await this.recordSnapshot(book, resource, null, null, built.rowCount, reason);
