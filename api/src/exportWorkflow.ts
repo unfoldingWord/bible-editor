@@ -53,6 +53,7 @@ import { dcsRawUrl, dcsResourceFile, fetchText, fileCommitSha, type ReimportReso
 import type { TnRow, TqRow, TwlRow, VerseRow } from "./types";
 import { blankRequiredRefs, lintUsfmVerses } from "./lint";
 import { validateUsfm, summarizeUsfmIssues } from "./usfmValidate";
+import { shrinkOverrideAllowed } from "./shrinkGuard";
 
 export interface ExportParams {
   // Restrict the run to one book. Useful for manual /api/exports/run.
@@ -73,6 +74,13 @@ export interface ExportParams {
   // service token (reads public raw files) — unlike the pre-export sync, which
   // is gated on dcsAllowed.
   reimportOnly?: boolean;
+  // Human override for the TSV shrink guard. The guard can't tell a truncated
+  // D1 load from a translator deliberately deleting rows, so a legitimate bulk
+  // deletion blocks the nightly forever (1CH tq: 55 rows deleted by hand on
+  // 2026-07-24, guard reported shrink_55_of_426 as a "truncated fetch"). Only
+  // honored for a single explicitly-named book AND resource — a run that omits
+  // either (every cron path) can never disable the guard wholesale.
+  allowShrink?: boolean;
 }
 
 export interface StepResult {
@@ -119,6 +127,16 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       : ALL_RESOURCES;
 
     const dcsAllowed = !params.dryDcs && !!this.env.DCS_SERVICE_TOKEN;
+
+    // Shrink-guard override, deliberately narrow: only a run that names ONE book
+    // and ONE resource can carry it. Every cron path omits both, so the nightly
+    // keeps the guard no matter what params get passed. Both counts are the
+    // RESOLVED lists (not the raw params) so an unrecognized book or resource —
+    // which widens to every book / ALL_RESOURCES above — fails safe.
+    const shrinkOverride = shrinkOverrideAllowed(params, books.length, resources.length);
+    if (params.allowShrink === true && !shrinkOverride) {
+      console.log("export: allowShrink ignored — requires an explicit single book + resource");
+    }
 
     // 1b. Sync D1 from current master before rendering. Pulls out-of-band master
     //     edits (other tooling, manual USFM cleanup, the bp-assistant bot) into
@@ -179,7 +197,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
           const result = await step.do(
             stepName,
             { retries: { limit: 3, delay: "5 seconds", backoff: "exponential" } },
-            async () => this.exportOne(book, resource, instanceId, dcsAllowed),
+            async () => this.exportOne(book, resource, instanceId, dcsAllowed, shrinkOverride),
           );
           results.push(result);
         } catch (e) {
@@ -299,6 +317,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     resource: Resource,
     instanceId: string,
     dcsAllowed: boolean,
+    allowShrink: boolean,
   ): Promise<StepResult> {
     const built = await this.buildResource(book, resource);
 
@@ -383,7 +402,47 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     // stopped the twl_PSA clobber (4880 rows shipped over master's 7776).
     if (dcsAllowed && (resource === "tn" || resource === "tq" || resource === "twl")) {
       const guard = await this.checkTsvShrink(book, resource, built.rowCount);
-      if (!guard.ok) {
+      if (!guard.ok && allowShrink && guard.detail.startsWith("shrink_")) {
+        // Explicit human override for a verified-intentional deletion. Scoped to
+        // a real shrink only — "master_unreadable" still fails closed, since an
+        // unverifiable master is exactly the case the override can't speak to.
+        console.log(
+          `export: shrink guard OVERRIDDEN for ${book} ${resource} (${guard.detail}) by explicit allowShrink`,
+        );
+        // Clear the stale BLOCKED banner for this (book, resource) first. It is a
+        // different alert source than the override notice below, so writeAlert's
+        // same-source replace would leave it standing — and its text tells the
+        // operator to "Re-sync from master, verify the row count, then
+        // re-export", which for an intentional deletion would RESURRECT every
+        // deleted row. Leaving a banner up that recommends the one destructive
+        // wrong move is worse than leaving no banner. Mirrors the raise/clear
+        // idiom in escalateIntegrityIssues.
+        await this.env.DB.prepare(
+          `DELETE FROM system_alerts WHERE username = ?1 AND source = ?2 AND dismissed_at IS NULL`,
+        )
+          .bind(EXPORT_ALERT_USERNAME, `export_shrink:${book}:${resource}`)
+          .run();
+        // Durable record of the bypass. A console.log lives only as long as a
+        // `wrangler tail` session, and the whole point of the override is that a
+        // human authorized a destructive push — that decision needs to outlive
+        // the terminal it was typed in. severity "info": this is a notice, not a
+        // problem, so it must not read as a failure in the alert banner.
+        //
+        // Worded for what is true HERE: the guard was cleared. The export can
+        // still be stopped further down by the blank-field gate, USFM
+        // validation, or a failed DCS commit, so this must not claim the push
+        // happened — a durable record that lies about a destructive action is
+        // worse than none.
+        await this.writeAlert(
+          `export_shrink_override:${book}:${resource}`,
+          `${book} ${resource.toUpperCase()}: shrink guard bypassed by explicit request ` +
+            `(${guard.detail}) — a render of ${built.rowCount} rows was allowed past master's ` +
+            `${guard.masterRows ?? "?"}. A human confirmed the deletion was intentional. ` +
+            `Check the export snapshot for whether the push itself then succeeded.`,
+          `${this.env.DCS_BASE_URL}/unfoldingWord`,
+          "info",
+        );
+      } else if (!guard.ok) {
         await this.recordShrinkSkipAlert(book, resource, built.rowCount, guard.masterRows, guard.detail);
         const reason = `shrink_guard:${guard.detail}`;
         await this.recordSnapshot(book, resource, null, null, built.rowCount, reason);

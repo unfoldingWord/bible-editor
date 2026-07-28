@@ -19,6 +19,9 @@ const RunBody = z.object({
   // unset (= false) so a manual single-book test export doesn't trigger
   // the real auto-merge workflow on DCS. The 06:00 UTC cron passes true.
   validateAndMerge: z.boolean().optional(),
+  // Override the TSV shrink guard for a verified-intentional bulk deletion.
+  // Requires book + resource to be set; the workflow ignores it otherwise.
+  allowShrink: z.boolean().optional(),
 });
 
 exports.post("/run", requireAdmin, async (c) => {
@@ -38,11 +41,15 @@ exports.post("/run", requireAdmin, async (c) => {
   if (!parsed.success) {
     return c.json({ error: "invalid_body", details: parsed.error.format() }, 400);
   }
+  if (parsed.data.allowShrink && !(parsed.data.book && parsed.data.resource)) {
+    return c.json({ error: "allow_shrink_requires_book_and_resource" }, 400);
+  }
   const params = {
     book: parsed.data.book?.toUpperCase(),
     resource: parsed.data.resource as Resource | undefined,
     dryDcs: parsed.data.dryDcs,
     validateAndMerge: parsed.data.validateAndMerge,
+    allowShrink: parsed.data.allowShrink,
   };
   // Deterministic id (second precision) so a double-submitted manual run
   // rejects on the duplicate instead of racing the first. The nightly cron
