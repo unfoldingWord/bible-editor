@@ -84,7 +84,6 @@ assert(
 assert(SHRINK_GUARD_MIN_LIVE === 20, "MIN_LIVE is 20");
 assert(SHRINK_GUARD_RATIO === 0.5, "RATIO is 0.5");
 
-console.log("shrinkGuard: all assertions passed");
 
 // --- Export shrink-guard override gating (shrinkOverrideAllowed) ------------
 // The 1CH tq incident (2026-07-28): 55 tq rows deleted by hand blocked the
@@ -155,3 +154,4 @@ assert(
   "no resources resolved → refused",
 );
 
+console.log("shrinkGuard: all assertions passed");

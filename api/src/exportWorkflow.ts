@@ -409,16 +409,36 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
         console.log(
           `export: shrink guard OVERRIDDEN for ${book} ${resource} (${guard.detail}) by explicit allowShrink`,
         );
+        // Clear the stale BLOCKED banner for this (book, resource) first. It is a
+        // different alert source than the override notice below, so writeAlert's
+        // same-source replace would leave it standing — and its text tells the
+        // operator to "Re-sync from master, verify the row count, then
+        // re-export", which for an intentional deletion would RESURRECT every
+        // deleted row. Leaving a banner up that recommends the one destructive
+        // wrong move is worse than leaving no banner. Mirrors the raise/clear
+        // idiom in escalateIntegrityIssues.
+        await this.env.DB.prepare(
+          `DELETE FROM system_alerts WHERE username = ?1 AND source = ?2 AND dismissed_at IS NULL`,
+        )
+          .bind(EXPORT_ALERT_USERNAME, `export_shrink:${book}:${resource}`)
+          .run();
         // Durable record of the bypass. A console.log lives only as long as a
         // `wrangler tail` session, and the whole point of the override is that a
         // human authorized a destructive push — that decision needs to outlive
         // the terminal it was typed in. severity "info": this is a notice, not a
         // problem, so it must not read as a failure in the alert banner.
+        //
+        // Worded for what is true HERE: the guard was cleared. The export can
+        // still be stopped further down by the blank-field gate, USFM
+        // validation, or a failed DCS commit, so this must not claim the push
+        // happened — a durable record that lies about a destructive action is
+        // worse than none.
         await this.writeAlert(
           `export_shrink_override:${book}:${resource}`,
-          `${book} ${resource.toUpperCase()} exported with the shrink guard overridden ` +
-            `(${guard.detail}) — ${built.rowCount} rows pushed over master's ${guard.masterRows ?? "?"}. ` +
-            `A human confirmed the deletion was intentional; the guard was bypassed deliberately.`,
+          `${book} ${resource.toUpperCase()}: shrink guard bypassed by explicit request ` +
+            `(${guard.detail}) — a render of ${built.rowCount} rows was allowed past master's ` +
+            `${guard.masterRows ?? "?"}. A human confirmed the deletion was intentional. ` +
+            `Check the export snapshot for whether the push itself then succeeded.`,
           `${this.env.DCS_BASE_URL}/unfoldingWord`,
           "info",
         );
