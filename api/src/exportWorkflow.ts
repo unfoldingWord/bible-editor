@@ -53,6 +53,7 @@ import { dcsRawUrl, dcsResourceFile, fetchText, fileCommitSha, type ReimportReso
 import type { TnRow, TqRow, TwlRow, VerseRow } from "./types";
 import { blankRequiredRefs, lintUsfmVerses } from "./lint";
 import { validateUsfm, summarizeUsfmIssues } from "./usfmValidate";
+import { shrinkOverrideAllowed } from "./shrinkGuard";
 
 export interface ExportParams {
   // Restrict the run to one book. Useful for manual /api/exports/run.
@@ -131,8 +132,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     // and ONE resource can carry it. Every cron path omits both, so the nightly
     // keeps the guard no matter what params get passed. `books` is resolved from
     // book_imports, so requiring length === 1 also means the named book exists.
-    const shrinkOverride =
-      params.allowShrink === true && !!params.book && !!params.resource && books.length === 1;
+    const shrinkOverride = shrinkOverrideAllowed(params, books.length);
     if (params.allowShrink === true && !shrinkOverride) {
       console.log("export: allowShrink ignored — requires an explicit single book + resource");
     }

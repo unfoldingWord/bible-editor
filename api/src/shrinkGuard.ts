@@ -21,3 +21,21 @@ export function isCatastrophicTsvShrink(liveRows: number, incomingRows: number):
   if (liveRows < SHRINK_GUARD_MIN_LIVE) return false;
   return incomingRows < liveRows * SHRINK_GUARD_RATIO;
 }
+
+// Whether an `allowShrink` request may override the EXPORT shrink guard (a
+// different guard from isCatastrophicTsvShrink above — see exportWorkflow's
+// checkTsvShrink). The export guard cannot tell a truncated D1 load from a
+// translator deliberately deleting rows, so a human who has verified the
+// deletion needs a way through. Deliberately narrow: only a run naming exactly
+// ONE book and ONE resource qualifies. Every cron path omits both, so the
+// nightly can never disable the guard wholesale — the property that keeps this
+// override from becoming the hole the guard was built to plug. Pure so the
+// negative cases are regression-testable without a Workflow context.
+export function shrinkOverrideAllowed(
+  params: { allowShrink?: boolean; book?: string; resource?: string },
+  resolvedBookCount: number,
+): boolean {
+  if (params.allowShrink !== true) return false;
+  if (!params.book || !params.resource) return false;
+  return resolvedBookCount === 1;
+}
