@@ -41,6 +41,9 @@ exports.post("/run", requireAdmin, async (c) => {
   if (!parsed.success) {
     return c.json({ error: "invalid_body", details: parsed.error.format() }, 400);
   }
+  if (parsed.data.allowShrink && !(parsed.data.book && parsed.data.resource)) {
+    return c.json({ error: "allow_shrink_requires_book_and_resource" }, 400);
+  }
   const params = {
     book: parsed.data.book?.toUpperCase(),
     resource: parsed.data.resource as Resource | undefined,
@@ -48,9 +51,6 @@ exports.post("/run", requireAdmin, async (c) => {
     validateAndMerge: parsed.data.validateAndMerge,
     allowShrink: parsed.data.allowShrink,
   };
-  if (parsed.data.allowShrink && !(parsed.data.book && parsed.data.resource)) {
-    return c.json({ error: "allow_shrink_requires_book_and_resource" }, 400);
-  }
   // Deterministic id (second precision) so a double-submitted manual run
   // rejects on the duplicate instead of racing the first. The nightly cron
   // uses `nightly-${day}` ids — see scheduled() in index.ts.

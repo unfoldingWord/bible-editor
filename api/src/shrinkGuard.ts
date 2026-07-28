@@ -31,11 +31,19 @@ export function isCatastrophicTsvShrink(liveRows: number, incomingRows: number):
 // nightly can never disable the guard wholesale — the property that keeps this
 // override from becoming the hole the guard was built to plug. Pure so the
 // negative cases are regression-testable without a Workflow context.
+// Both counts must be the RESOLVED list lengths, never the raw params. The raw
+// strings are the wrong thing to check: exportWorkflow widens an unrecognized
+// resource to ALL_RESOURCES (`isResource(params.resource) ? [it] : ALL`), so a
+// typo like resource:"tqq" is truthy yet actually selects five resources — a
+// truthiness check would hand the override to tn/tq/twl at once and let a
+// genuinely truncated tn ship to master. Gating on the resolved counts makes the
+// widening fail safe: more than one resource selected → no override.
 export function shrinkOverrideAllowed(
   params: { allowShrink?: boolean; book?: string; resource?: string },
   resolvedBookCount: number,
+  resolvedResourceCount: number,
 ): boolean {
   if (params.allowShrink !== true) return false;
   if (!params.book || !params.resource) return false;
-  return resolvedBookCount === 1;
+  return resolvedBookCount === 1 && resolvedResourceCount === 1;
 }

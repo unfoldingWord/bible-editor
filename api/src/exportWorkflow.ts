@@ -130,9 +130,10 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
 
     // Shrink-guard override, deliberately narrow: only a run that names ONE book
     // and ONE resource can carry it. Every cron path omits both, so the nightly
-    // keeps the guard no matter what params get passed. `books` is resolved from
-    // book_imports, so requiring length === 1 also means the named book exists.
-    const shrinkOverride = shrinkOverrideAllowed(params, books.length);
+    // keeps the guard no matter what params get passed. Both counts are the
+    // RESOLVED lists (not the raw params) so an unrecognized book or resource —
+    // which widens to every book / ALL_RESOURCES above — fails safe.
+    const shrinkOverride = shrinkOverrideAllowed(params, books.length, resources.length);
     if (params.allowShrink === true && !shrinkOverride) {
       console.log("export: allowShrink ignored — requires an explicit single book + resource");
     }
@@ -407,6 +408,19 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
         // unverifiable master is exactly the case the override can't speak to.
         console.log(
           `export: shrink guard OVERRIDDEN for ${book} ${resource} (${guard.detail}) by explicit allowShrink`,
+        );
+        // Durable record of the bypass. A console.log lives only as long as a
+        // `wrangler tail` session, and the whole point of the override is that a
+        // human authorized a destructive push — that decision needs to outlive
+        // the terminal it was typed in. severity "info": this is a notice, not a
+        // problem, so it must not read as a failure in the alert banner.
+        await this.writeAlert(
+          `export_shrink_override:${book}:${resource}`,
+          `${book} ${resource.toUpperCase()} exported with the shrink guard overridden ` +
+            `(${guard.detail}) — ${built.rowCount} rows pushed over master's ${guard.masterRows ?? "?"}. ` +
+            `A human confirmed the deletion was intentional; the guard was bypassed deliberately.`,
+          `${this.env.DCS_BASE_URL}/unfoldingWord`,
+          "info",
         );
       } else if (!guard.ok) {
         await this.recordShrinkSkipAlert(book, resource, built.rowCount, guard.masterRows, guard.detail);
