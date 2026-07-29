@@ -270,6 +270,39 @@ function trailingMarkerRunStart(verseObjects: unknown[]): number {
   return start;
 }
 
+// The `\ts\*` chunk dividers sitting in a verse's trailing marker run.
+//
+// Book mode alone needs these. Its verses are grid rows aligned across versions,
+// and a divider stored at the END of verse N draws at the BOTTOM of verse N's
+// cell — so when ULT and UST verse N differ in length (they almost always do),
+// the two dividers land at different heights and the line doesn't run straight
+// across the row. Book mode therefore draws the divider at the TOP of the verse
+// it introduces, which is the same grid row in every column. That's also what the
+// marker means in USFM, and it mirrors how `\q1` already drifts forward.
+//
+// Deliberately separate from extractTrailingMarkers rather than folded into it:
+// a divider still must never appear in the faded LOOKBACK band (it is not a
+// marker you'd go edit on the previous verse), and rows/columns mode still draw
+// it in the verse that owns it. Only book mode's body composition uses this pair.
+export function extractTrailingDividers(verseObjects: unknown[] | undefined | null): unknown[] {
+  if (!Array.isArray(verseObjects)) return [];
+  return verseObjects.slice(trailingMarkerRunStart(verseObjects)).filter(isTsMilestone);
+}
+
+// Companion to extractTrailingDividers: drop the trailing-run dividers that the
+// NEXT verse's cell is going to draw, so book mode never shows the same divider
+// twice. Filters the run rather than truncating it, for the same reason
+// stripTrailingMarkers does — the run can hold other nodes that must survive.
+export function stripTrailingDividers(verseObjects: unknown[] | undefined | null): unknown[] {
+  if (!Array.isArray(verseObjects)) return [];
+  const start = trailingMarkerRunStart(verseObjects);
+  if (start >= verseObjects.length) return verseObjects;
+  const kept = verseObjects.slice(start).filter((n) => !isTsMilestone(n));
+  return kept.length === verseObjects.length - start
+    ? verseObjects
+    : [...verseObjects.slice(0, start), ...kept];
+}
+
 // Inverse of extractTrailingMarkers: return verseObjects with their trailing
 // in-flow markers removed. Those markers belong to (and are drifted onto) the
 // NEXT verse's display, so a verse's own display body must NOT also render
