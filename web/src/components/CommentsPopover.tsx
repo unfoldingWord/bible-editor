@@ -42,6 +42,10 @@ export interface CommentsPopoverProps {
   highlightCommentId: number | null;
   loading?: boolean;
   errorText?: string | null;
+  // Retry the chapter's comments load. Offered in the error banner, because
+  // while the load is broken we also block posting — so the user needs a way
+  // out that isn't "reload the whole app".
+  onRetryLoad?: () => void;
   // Seeds the new-comment composer's body on mount, and reports back as the
   // user types — lets Shell stash unposted text across a close/reopen of this
   // (unmounting) popover, keyed by target. See the composer-persistence note
@@ -75,6 +79,7 @@ export function CommentsPopover({
   highlightCommentId,
   loading = false,
   errorText = null,
+  onRetryLoad,
   initialBody,
   onBodyChange,
   replyInitialBody,
@@ -184,7 +189,17 @@ export function CommentsPopover({
           </Stack>
 
           {errorText && (
-            <Alert severity="warning" sx={{ m: 1.5 }}>
+            <Alert
+              severity="warning"
+              sx={{ m: 1.5 }}
+              action={
+                onRetryLoad ? (
+                  <Button size="small" color="inherit" onClick={onRetryLoad}>
+                    Retry
+                  </Button>
+                ) : undefined
+              }
+            >
               {errorText}
             </Alert>
           )}
@@ -218,6 +233,9 @@ export function CommentsPopover({
                 <ThreadView
                   key={thread.root.id}
                   thread={thread}
+                  blockedReason={
+                    errorText ? "Comments couldn't be loaded for this chapter — retry above before posting." : null
+                  }
                   mentionUsers={mentionUsers}
                   meUserId={meUserId}
                   canWrite={canWrite}
@@ -239,6 +257,9 @@ export function CommentsPopover({
               <Divider />
               <NewCommentComposer
                 mentionUsers={mentionUsers}
+                blockedReason={
+                  errorText ? "Comments couldn't be loaded for this chapter — retry above before posting." : null
+                }
                 onCreate={onCreate}
                 onError={setActionError}
                 initialBody={initialBody}
@@ -256,6 +277,7 @@ export function CommentsPopover({
 
 function ThreadView({
   thread,
+  blockedReason,
   mentionUsers,
   meUserId,
   canWrite,
@@ -269,6 +291,7 @@ function ThreadView({
   onReplyBodyChange,
 }: {
   thread: CommentThread;
+  blockedReason: string | null;
   mentionUsers: MentionUser[];
   meUserId: number | null;
   canWrite: boolean;
@@ -332,6 +355,7 @@ function ThreadView({
             onCreate={onCreate}
             onError={onError}
             onDone={() => setReplying(false)}
+            blockedReason={blockedReason}
             initialBody={replyInitialBody?.(root.id) ?? ""}
             onBodyChange={(body) => onReplyBodyChange?.(root.id, body)}
           />
@@ -588,10 +612,12 @@ function ReplyComposer({
   onCreate,
   onError,
   onDone,
+  blockedReason,
   initialBody = "",
   onBodyChange,
 }: {
   parentId: number;
+  blockedReason: string | null;
   mentionUsers: MentionUser[];
   onCreate: (draft: NewCommentDraft) => Promise<void>;
   onError: (msg: string | null) => void;
@@ -642,7 +668,13 @@ function ReplyComposer({
         placeholder="Write a reply…"
       />
       <Stack direction="row" spacing={1}>
-        <Button size="small" variant="contained" onClick={handleSend} disabled={!body.trim() || pending}>
+        <Button
+          size="small"
+          variant="contained"
+          onClick={handleSend}
+          disabled={!body.trim() || pending || blockedReason != null}
+          title={blockedReason ?? undefined}
+        >
           Send
         </Button>
         <Button size="small" onClick={onDone}>
@@ -659,10 +691,12 @@ function NewCommentComposer({
   mentionUsers,
   onCreate,
   onError,
+  blockedReason,
   initialBody = "",
   onBodyChange,
 }: {
   mentionUsers: MentionUser[];
+  blockedReason: string | null;
   onCreate: (draft: NewCommentDraft) => Promise<void>;
   onError: (msg: string | null) => void;
   initialBody?: string;
@@ -722,11 +756,17 @@ function NewCommentComposer({
         size="small"
         placeholder="Ask a question or leave a note for the team…"
       />
+      {/* Blocked while the chapter's comments couldn't be loaded: the panel was
+          otherwise happy to take a post that then failed, so the user saw an
+          "unavailable" banner and a "failed to post" error side by side and had
+          no idea which to believe. Their text is kept either way; the banner's
+          Retry is the way forward. */}
       <Button
         size="small"
         variant="contained"
         onClick={handlePost}
-        disabled={!body.trim() || pending}
+        disabled={!body.trim() || pending || blockedReason != null}
+        title={blockedReason ?? undefined}
         sx={{ alignSelf: "flex-start" }}
       >
         Post
