@@ -670,6 +670,46 @@ export function paragraphClass(tag: string): { wrapper: string; isBlank: boolean
   return { wrapper: "be-para be-p", isBlank: false };
 }
 
+// The active/editable verse renders its OWN verseObjects (so the contentEditable
+// text matches the save diff), which drops the paragraph marker drifted from the
+// previous verse — and with it the visual line break that introduces the verse.
+// Map that drifted marker to the same wrapper class the inactive (display) path
+// uses, so the caller can put it directly on the editable span and get the
+// break/indent back from CSS without touching the text. Use the marker closest to
+// the verse (last in document order).
+//
+// `\ts\*` never supplies the class: it is its own chunk-boundary block (`be-ts`),
+// carrying block display and divider margins that would relayout the whole
+// content span if pinned to it. That intent still holds — but note
+// the divider branch is currently UNREACHABLE from the one caller, and was doubly
+// dead before: DocColumn feeds this extractTrailingMarkers() output, which filters
+// through isDriftableMarker, and that returns false for every `\ts\*` shape
+// (usfm.ts) because a chunk milestone stays in the verse that holds it rather than
+// drifting forward. The old test here was `tag === "ts"`, which additionally could
+// not match usfm-js 3.5.0's real shape (`{tag:"ts\\*"}`) — the Micah 4 bug class.
+// Kept (via the canonical isTsMilestone predicate) as a cheap guard so that if the
+// drift contract ever changes, a divider yields a plain block break instead of
+// falling through paragraphClass's default and inheriting a `\p` indent.
+export function leadingBreakClass(markers: unknown[] | null | undefined): string {
+  if (!Array.isArray(markers)) return "";
+  let sawDivider = false;
+  for (let i = markers.length - 1; i >= 0; i--) {
+    const node = markers[i];
+    if (isTsMilestone(node)) {
+      sawDivider = true;
+      continue;
+    }
+    const tag = (node as { tag?: unknown } | null)?.tag;
+    if (typeof tag !== "string") continue;
+    const { wrapper, isBlank } = paragraphClass(tag);
+    return isBlank ? "be-line" : wrapper;
+  }
+  // Only a `\ts\*` chunk divider drifted (no paragraph/poetry marker): the
+  // inactive path renders a divider block here, so keep the active verse on
+  // its own line with a plain block break rather than letting it run inline.
+  return sawDivider ? "be-line" : "";
+}
+
 interface Segment {
   // CSS class applied to the wrapper <div>. The first (pre-marker)
   // segment has wrapper="" — emitted without a wrapper div so verses
