@@ -7,7 +7,7 @@ import type { TwlRow, VerseDto } from "../sync/api";
 import { CopyChapterButton } from "./CopyChapterButton";
 import { LANE_FILL, type TextLaneCheck } from "../lib/laneChecks";
 import { highlightsFor, paragraphClass, renderEditableHTML, renderHighlightedHTML, type HighlightKey, type ReorderHighlight } from "../lib/highlight";
-import { markHighlightSx, columnsTsDividerSx } from "../lib/highlightStyles";
+import { markHighlightSx } from "../lib/highlightStyles";
 import { extractTrailingMarkers, stripTrailingMarkers, splitSectionHeaders, type SectionHeader } from "../lib/usfm";
 import { SectionHeaderBand } from "./SectionHeaderBand";
 import { DriftedMarkerBand, driftedMarkerTags } from "./DriftedMarkerBand";
@@ -198,7 +198,6 @@ export function DocColumn({
           direction: rtl ? "rtl" : "ltr",
           textAlign: rtl ? "right" : "left",
           ...markHighlightSx(theme.palette.mode),
-          ...columnsTsDividerSx,
           ...draftDirtyBorderSx(),
         })}
       >

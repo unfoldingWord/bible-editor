@@ -112,6 +112,40 @@ function paragraphLayoutSx(mode: Mode) {
       // re-insert the marker.
       cursor: "text",
     },
+    // DEFAULT chunk-divider treatment — rows and columns mode: a quiet inline
+    // label, NO rule lines. Both are read as continuous prose, and a full-width
+    // rule across them interrupts the reading line far more than the boundary
+    // warrants; the small marker alone is enough to place the chunk. Kept at a
+    // real secondary text colour rather than a disabled grey — "quiet" must not
+    // mean "makes people squint". Book mode overrides this (bookTsDividerSx):
+    // there the verses are grid rows, so a line straight across earns its keep.
+    "& div.be-ts": {
+      display: "block",
+      margin: "0.5em 0 0.35em",
+      "& span.be-tok-ts": {
+        fontSize: "0.78rem",
+        border: "none",
+        background: "none",
+        padding: 0,
+        color: "text.secondary",
+        opacity: 0.85,
+      },
+    },
+  };
+}
+
+// Book mode only: the divider as a dashed rule straight across with the `\ts\*`
+// chip centered in it. Book mode aligns verses into grid rows across versions, so
+// the rule reads as a real chunk boundary spanning the row — and BookView draws it
+// at the TOP of the verse it introduces so both columns' rules land on one line.
+//
+// NOTE: this is a COMPLETE restatement of `div.be-ts`, not a patch. Spreading it
+// after markHighlightSx replaces that key's object wholesale, so anything omitted
+// here is simply lost — including the label resets in the default above, which is
+// why the chip styling comes back on its own.
+export function bookTsDividerSx(mode: Mode) {
+  const tokenBorder = mode === "dark" ? "rgba(49, 173, 227, 0.55)" : "rgba(1, 66, 99, 0.45)";
+  return {
     "& div.be-ts": {
       display: "flex",
       alignItems: "center",
@@ -129,31 +163,6 @@ function paragraphLayoutSx(mode: Mode) {
     },
   };
 }
-
-// Columns mode: a bare label, NO rule lines. The parallel-column doc view is
-// dense continuous prose, and a full-width rule across it interrupts the reading
-// line far more than the boundary warrants — the small marker alone is enough to
-// place the chunk. Kept at a real secondary text colour rather than a disabled
-// grey: "quiet" must not mean "makes people squint".
-//
-// NOTE: this is a COMPLETE restatement of `div.be-ts`, not a patch. Spreading it
-// after markHighlightSx replaces that key's object wholesale, so every base
-// property (display:flex, the ::before/::after rules) is dropped — which is
-// exactly what's wanted here, but means nothing carries over implicitly.
-export const columnsTsDividerSx = {
-  "& div.be-ts": {
-    display: "block",
-    margin: "0.5em 0 0.35em",
-    "& span.be-tok-ts": {
-      fontSize: "0.78rem",
-      border: "none",
-      background: "none",
-      padding: 0,
-      color: "text.secondary",
-      opacity: 0.85,
-    },
-  },
-} as const;
 
 // `& mark.be-*` selectors used inside <Box>/<Paper> sx blocks for the
 // scripture columns and book/doc views.
