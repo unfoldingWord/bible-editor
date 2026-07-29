@@ -267,6 +267,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   const {
     index: commentsIndex,
     loading: commentsLoading,
+    loadedKey: commentsLoadedKey,
     error: commentsError,
     addComment,
     editComment,
@@ -1927,11 +1928,19 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     if (consumedCommentKeyRef.current === key) return;
     const comment = commentsIndex.byId.get(initialCommentId);
     if (!comment) {
-      // Not found yet — could just be mid-fetch (don't act) or genuinely
-      // gone (deleted, or the fetch failed). Only decide once the load has
-      // SETTLED: acting while commentsLoading is true would consume a link
-      // that's about to resolve just fine one render later.
-      if (commentsLoading) return;
+      // Not found YET could mean three different things, and only one of them
+      // justifies telling the user the comment is gone:
+      //   1. this chapter's comments haven't been fetched yet — say nothing;
+      //   2. the fetch failed — say nothing, the errorText banner covers it and
+      //      a later load may succeed (claiming "deleted" here would be a lie);
+      //   3. the fetch settled for THIS chapter and the id genuinely isn't in
+      //      it — consume the link so `?c=` stops stranding, and say so.
+      // `commentsLoading` alone cannot distinguish (1): on a chapter change it
+      // is still false from the previous chapter while the index is already
+      // empty, so a perfectly valid cross-chapter deep link was being reported
+      // as deleted. Gate on the loaded set actually belonging to this chapter.
+      const settledForThisChapter = commentsLoadedKey === `${book}/${chapter}`;
+      if (commentsLoading || !settledForThisChapter || commentsError) return;
       consumedCommentKeyRef.current = key;
       onCommentConsumed?.();
       pushPipelineToast("That comment is no longer available.", "info");
@@ -1957,7 +1966,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     // stayed set, this effect's deps never changed, and clicking the SAME alert
     // again was silently ignored (verified).
     onCommentConsumed?.();
-  }, [commentsIndex, commentsLoading, book, chapter, initialCommentId, onCommentConsumed, pushPipelineToast]);
+  }, [commentsIndex, commentsLoading, commentsLoadedKey, commentsError, book, chapter, initialCommentId, onCommentConsumed, pushPipelineToast]);
 
   // Keep the alignment target's verse in step with the active verse while
   // we're in alignment mode. Bible version is sticky — only LinkIcon clicks
