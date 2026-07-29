@@ -241,7 +241,85 @@ verses.patch("/:book/:chapter/:verse/:bibleVersion", requireEditor, async (c) =>
   )
     .bind(book, chapter, verse, bibleVersion)
     .first<VerseRow>();
-  if (!existing) return c.json({ error: "not_found" }, 404);
+
+  // Create the chapter-intro row on first write (#379). A chapter's opening
+  // paragraph marker (`\p`, `\q1`) lives BEFORE `\v 1` in USFM, so usfm-js parks
+  // it on the chapter-front pseudo-verse we store as verse 0 — and when the
+  // source USFM had no such marker, import never wrote that row at all (observed:
+  // MIC 5 ULT, MIC 2 UST). Without this branch there is nothing to PATCH, so the
+  // editor could not add the missing marker: the flag raised by
+  // lintChapterOpeningMarkers would be unfixable in-app.
+  //
+  // Deliberately narrow. Creation is allowed ONLY for verse 0, and only with
+  // `If-Match: 0` — an explicit "I expect no row here" assertion, so a create
+  // racing another create loses on the primary key instead of silently
+  // overwriting. Real verses still 404: inventing scripture verses that the
+  // source doesn't have would feed fabricated rows into the nightly export.
+  // Every guard above still applies (UHB/UGNT rejected, empty verseObjects
+  // legal for verse 0 only, unsafe marker tags rejected, pipeline lock honoured).
+  if (!existing) {
+    if (verse !== 0 || expected !== 0) return c.json({ error: "not_found" }, 404);
+    const userId = currentUserId(c);
+    const now = Math.floor(Date.now() / 1000);
+    const rowKey = `${book}/${chapter}/${verse}/${bibleVersion}`;
+    const contentJson = JSON.stringify(parsed.data.content);
+    let insertRes;
+    try {
+      [insertRes] = await c.env.DB.batch([
+        c.env.DB
+          .prepare(
+            `INSERT INTO verses (book, chapter, verse, bible_version, content_json, plain_text,
+                                 version, updated_at, updated_by)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7, ?8)`,
+          )
+          .bind(book, chapter, verse, bibleVersion, contentJson, parsed.data.plain_text ?? null, now, userId),
+        c.env.DB
+          .prepare(
+            `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, payload_json)
+             VALUES ('verse', ?1, ?2, ?3, NULL, 1, 'create', ?4)`,
+          )
+          .bind(rowKey, book, userId, JSON.stringify(parsed.data)),
+      ]);
+    } catch {
+      // Primary-key collision: a concurrent create landed first. Report it as a
+      // version conflict against the row that won so the client re-reads and
+      // retries, matching the 409 contract the outbox already handles.
+      const fresh = await c.env.DB.prepare(
+        `SELECT * FROM verses WHERE book = ?1 AND chapter = ?2 AND verse = ?3 AND bible_version = ?4`,
+      )
+        .bind(book, chapter, verse, bibleVersion)
+        .first<VerseRow>();
+      if (!fresh) throw new Error("verse_create_failed");
+      let freshParsed: unknown;
+      try {
+        freshParsed = parseVerseContentJson(fresh);
+      } catch (err) {
+        if (err instanceof CorruptContentJsonError) {
+          logCorruptContentJson(err);
+          return c.json(corruptContentJsonBody(err), 500);
+        }
+        throw err;
+      }
+      return c.json({ error: "version_mismatch", current: { ...fresh, content: freshParsed } }, 409);
+    }
+    if (!insertRes.meta.changes) return c.json({ error: "verse_create_failed" }, 500);
+    const created = await c.env.DB.prepare(
+      `SELECT * FROM verses WHERE book = ?1 AND chapter = ?2 AND verse = ?3 AND bible_version = ?4`,
+    )
+      .bind(book, chapter, verse, bibleVersion)
+      .first<VerseRow>();
+    if (!created) return c.json({ error: "verse_create_failed" }, 500);
+    const createdDto = { ...created, content: parsed.data.content };
+    c.executionCtx.waitUntil(
+      broadcastChapter(c.env, created.book, created.chapter, {
+        type: "verse.updated",
+        verse: createdDto,
+      }),
+    );
+    // No lane reopen: verse 0 carries no checkoff lanes of its own, and the
+    // marker it now holds introduces verse 1 without changing verse 1's words.
+    return c.json(createdDto);
+  }
   if (existing.version !== expected) {
     let freshParsed: unknown;
     try {
