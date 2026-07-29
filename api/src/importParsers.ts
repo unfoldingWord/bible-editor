@@ -752,6 +752,14 @@ export function dropDuplicateSourceMilestones(verseObjects: unknown[]): unknown[
 // Mirror of isInFlowMarker in web/src/lib/usfm.ts — keep in sync. usfm-js stores
 // poetry markers (\q1, \q2, \qa, …) as {type:"quote", tag} and plain-paragraph
 // markers (\p, \m, \nb, \b, …) as {type:"paragraph", tag}.
+//
+// DELIBERATE DIVERGENCE from the web copy: that one now also matches the real
+// usfm-js 3.5.0 `\ts\*` shape (`{tag:"ts\\*"}`) via isTsMilestone, because the
+// display layer must see chunk dividers. This copy must NOT — it feeds
+// dropDoubledLeadingMarkers (a leading `\ts\*` would become droppable) and the
+// extractPlainText word-separator rule (plain_text would gain a space for every
+// divider, churning stored rows). Use isTsMilestone below where a `\ts\*` test is
+// what you actually want.
 function isInFlowMarker(node: unknown): boolean {
   const o = node as Record<string, unknown> | null;
   if (!o) return false;

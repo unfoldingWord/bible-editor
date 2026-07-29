@@ -10,7 +10,7 @@
 // with no special drift handling.
 
 import type { VerseDto } from "../sync/api.ts";
-import { isInFlowMarker, isCharacterWrapper } from "./usfm.ts";
+import { isInFlowMarker, isCharacterWrapper, isTsMilestone } from "./usfm.ts";
 
 // Non-printing sentinels wrap a verse number in the assembled line text so we
 // can reliably promote just the number to a superscript later (a plain
@@ -105,7 +105,7 @@ function chapterLines(verses: VerseDto[]): Line[] {
       if (isInFlowMarker(o) && !isCharacterWrapper(o)) {
         // `\ts\*` is a translator chunk divider, invisible in reading — it must
         // not insert a paragraph break into the copied text.
-        if (o["tag"] === "ts") continue;
+        if (isTsMilestone(o)) continue;
         const ind = markerIndent(String(o["tag"] ?? ""));
         if (ind === null) {
           flush();

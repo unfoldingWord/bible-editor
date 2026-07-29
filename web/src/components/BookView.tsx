@@ -20,9 +20,10 @@ import { CopyChapterButton } from "./CopyChapterButton";
 import { LANE_FILL, type TextLaneCheck } from "../lib/laneChecks";
 import type { ChapterState } from "../hooks/useBook";
 import { highlightsFor, renderEditableHTML, renderHighlightedHTML, type HighlightKey, type ReorderHighlight } from "../lib/highlight";
-import { markHighlightSx } from "../lib/highlightStyles";
-import { extractTrailingMarkers, stripTrailingMarkers, splitSectionHeaders, type SectionHeader } from "../lib/usfm";
+import { markHighlightSx, bookTsDividerSx } from "../lib/highlightStyles";
+import { extractTrailingMarkers, extractTrailingDividers, stripTrailingDividers, stripTrailingMarkers, splitSectionHeaders, type SectionHeader } from "../lib/usfm";
 import { SectionHeaderBand } from "./SectionHeaderBand";
+import { DriftedMarkerBand, driftedMarkerTags } from "./DriftedMarkerBand";
 import { AlignLinkButton } from "./AlignLinkButton";
 import { drafts, verseKey, draftDirtyBorderSx } from "../sync/drafts";
 import type { FindMatch } from "./FindReplaceOverlay";
@@ -264,6 +265,7 @@ export function BookView({
           flex: 1,
           overflowY: "auto",
           ...markHighlightSx(theme.palette.mode),
+          ...bookTsDividerSx(theme.palette.mode),
           ...draftDirtyBorderSx(),
           // Each verse is its own grid cell led by an inline reference label.
           // When a verse's content opens with a paragraph / poetry block (its
@@ -627,7 +629,7 @@ const VerseRow = memo(function VerseRow({
               bibleVersion={bv}
               dto={dto}
               prevDto={prevDto}
-              sourceContent={
+                sourceContent={
                 versesByVersion["UHB"]?.[verseNum]?.content ??
                 versesByVersion["UGNT"]?.[verseNum]?.content
               }
@@ -854,17 +856,47 @@ const VerseCell = memo(function VerseCell({
     // Drift trailing `\q1`/`\p` etc. from the previous verse so the
     // visual break introduces this verse — usfm-js attaches markers
     // to the prior verse (per USFM convention `\q1 \v N+1`).
-    const drifted = extractTrailingMarkers(
-      (prevDto?.content as { verseObjects?: unknown[] } | null)?.verseObjects,
-    );
+    const prevVo = (prevDto?.content as { verseObjects?: unknown[] } | null)?.verseObjects;
+    const drifted = extractTrailingMarkers(prevVo);
+    // Book mode ALSO pulls the previous verse's `\ts\*` chunk divider up to the
+    // top of this cell. Stored at the end of verse N, it would otherwise draw at
+    // the bottom of verse N's cell — and since ULT and UST verse N are different
+    // lengths, the two dividers land at different heights and the line stops
+    // running straight across the row. Drawing it at the top of the verse it
+    // introduces puts it on one grid row in every column.
+    //
+    // Done unconditionally, INCLUDING when the previous verse is the active one.
+    // The active verse's editable render still holds its own trailing divider — it
+    // is part of that verse's editable text and has to stay there for the save diff
+    // to line up — so bookTsDividerSx hides that copy with `display:none`, which
+    // keeps it in `textContent` where the baseline comparison reads it. Suppressing
+    // the drawn copy here instead was the first attempt, and it left the active
+    // row's two dividers visibly out of line, which is the whole bug.
+    const leadingDividers = extractTrailingDividers(prevVo);
     // Strip THIS verse's own trailing markers — they drift to the next verse,
     // so rendering them here too would double a text-bearing `\qa` acrostic.
-    const body = stripTrailingMarkers(verseObjects);
-    const composed = drifted.length > 0 ? [...drifted, ...body] : body;
+    // Its trailing dividers go too: the next verse's cell draws them.
+    const body = stripTrailingDividers(stripTrailingMarkers(verseObjects));
+    const lead = [...leadingDividers, ...drifted];
+    const composed = lead.length > 0 ? [...lead, ...body] : body;
     // Render unconditionally so paragraph / poetry markers turn into
     // visual breaks / indents in book view even without active highlights.
     return renderHighlightedHTML(composed, highlights ?? new Set(), roles);
   }, [findHTML, dto?.content, highlights, prevDto?.content, isActive, readOnly, roles]);
+
+  // Markers that drifted from the previous verse, for the lookback band. The
+  // active-editable render above deliberately drops them from the verse body (its
+  // textContent has to match extractEditableText for the save diff), so book mode
+  // otherwise gave no sign that the previous verse's `\q1` leads this one.
+  const driftedMarkers = useMemo(
+    () =>
+      driftedMarkerTags(
+        extractTrailingMarkers(
+          (prevDto?.content as { verseObjects?: unknown[] } | null)?.verseObjects,
+        ),
+      ),
+    [prevDto?.content],
+  );
 
   // splitSectionHeaders walks the whole verseObjects tree — memoize on the
   // content reference so re-renders without a content change skip the walk.
@@ -1012,6 +1044,9 @@ const VerseCell = memo(function VerseCell({
           </IconButton>
         </Tooltip>
       )}{" "}
+      {isActive && !readOnly && !rtl && (
+        <DriftedMarkerBand markers={driftedMarkers} inline />
+      )}
       {readOnly && rtl ? (
         <span
           style={{
