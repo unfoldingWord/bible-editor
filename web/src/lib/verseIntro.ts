@@ -1,14 +1,14 @@
 // Create-on-save base for a chapter-intro row that does not exist yet (#379).
 //
-// A chapter's opening paragraph marker (`\p`, `\q1`) sits BEFORE `\v 1` in USFM,
-// so usfm-js parks it on the chapter-front pseudo-verse we store as verse 0. When
-// the source USFM carried no such marker, import never wrote that row at all
-// (observed: MIC 5 ULT, MIC 2 UST) — so there was nothing to edit, and the missing
-// marker that lintChapterOpeningMarkers flags could not be added in the app.
+// A chapter whose source USFM carried no opening `\p`/`\q1` has no verse-0 row at
+// all, so there is nothing to edit and the missing marker cannot be added. See
+// lintChapterOpeningMarkers in api/src/lint.ts for why the marker lives there.
 //
 // `version: 0` is the assertion the API's create path requires ("I expect no row
 // here"). It flows through unchanged as the outbox's `If-Match`, so a row that
-// appears underneath us comes back a 409 rather than silently overwriting.
+// appears underneath us comes back a 409 rather than silently overwriting. Note it
+// is a PLACEHOLDER version, not a real one — server versions start at 1, and UI
+// that keys off a version (e.g. the history chip) must treat 0 as "no row yet".
 //
 // Lives in lib/ rather than beside one component because two callers need the
 // same base and must agree on it: the intro cell in ScriptureColumn (so the save

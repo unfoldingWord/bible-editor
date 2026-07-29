@@ -1242,8 +1242,15 @@ function ActiveLine({
   const [historyOpen, setHistoryOpen] = useState(false);
   // The version chip + history are editable-ULT/UST only — read-only source
   // lines and any line without a known version/restore handler get nothing.
+  //
+  // `version >= 1`, not `!= null`: a chapter-intro row that does not exist yet is
+  // saved through a synthetic base carrying `version: 0` (see lib/verseIntro.ts),
+  // and the optimistic local apply seeds the chapter cache with that 0 before the
+  // server's real row (version 1) comes back. Gating on `!= null` showed a `v0`
+  // chip in that window, opening a history dialog for a row the server has never
+  // held. Server versions start at 1, so this only ever excludes the placeholder.
   const showHistory =
-    !!book && !!editable && !readOnly && !isSource && version != null && !!onRestoreVersion;
+    !!book && !!editable && !readOnly && !isSource && (version ?? 0) >= 1 && !!onRestoreVersion;
   const draftKey = useMemo(
     () =>
       book && bibleVersion ? verseKey(book, chapter, verseNum, bibleVersion) : null,

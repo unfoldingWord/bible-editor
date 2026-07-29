@@ -265,7 +265,7 @@ export function BookView({
           flex: 1,
           overflowY: "auto",
           ...markHighlightSx(theme.palette.mode),
-          ...bookTsDividerSx(theme.palette.mode),
+          ...bookTsDividerSx(),
           ...draftDirtyBorderSx(),
           // Each verse is its own grid cell led by an inline reference label.
           // When a verse's content opens with a paragraph / poetry block (its

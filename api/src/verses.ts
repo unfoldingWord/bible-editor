@@ -77,6 +77,25 @@ function hasUnsafeMarkerTag(nodes: unknown[]): boolean {
   return false;
 }
 
+// One verse row by its full primary key. The same SELECT is open-coded at several
+// points in this file; new code should call this so the column list and key stay
+// in one place. (The pre-existing call sites are deliberately left alone — folding
+// them in is a separate, wider change.)
+function loadVerseRow(
+  db: D1Database,
+  book: string,
+  chapter: number,
+  verse: number,
+  bibleVersion: string,
+): Promise<VerseRow | null> {
+  return db
+    .prepare(
+      `SELECT * FROM verses WHERE book = ?1 AND chapter = ?2 AND verse = ?3 AND bible_version = ?4`,
+    )
+    .bind(book, chapter, verse, bibleVersion)
+    .first<VerseRow>();
+}
+
 function parseIfMatch(header: string | undefined): number | null {
   if (!header) return null;
   const trimmed = header.trim();
@@ -243,12 +262,11 @@ verses.patch("/:book/:chapter/:verse/:bibleVersion", requireEditor, async (c) =>
     .first<VerseRow>();
 
   // Create the chapter-intro row on first write (#379). A chapter's opening
-  // paragraph marker (`\p`, `\q1`) lives BEFORE `\v 1` in USFM, so usfm-js parks
-  // it on the chapter-front pseudo-verse we store as verse 0 — and when the
-  // source USFM had no such marker, import never wrote that row at all (observed:
-  // MIC 5 ULT, MIC 2 UST). Without this branch there is nothing to PATCH, so the
-  // editor could not add the missing marker: the flag raised by
-  // lintChapterOpeningMarkers would be unfixable in-app.
+  // paragraph marker lives BEFORE `\v 1`, so it is stored on the chapter-front
+  // pseudo-verse (verse 0) — and a chapter whose source USFM had no such marker
+  // has no verse-0 row at all. See lintChapterOpeningMarkers in lint.ts for the
+  // full background. Without this branch there is nothing to PATCH, so the flag
+  // that lint raises would be unfixable in-app.
   //
   // Deliberately narrow. Creation is allowed ONLY for verse 0, and only with
   // `If-Match: 0` — an explicit "I expect no row here" assertion, so a create
@@ -306,11 +324,7 @@ verses.patch("/:book/:chapter/:verse/:bibleVersion", requireEditor, async (c) =>
       // now there, a racing create is the only thing that could have put it there,
       // and if it is NOT there the failure was something else (transient D1 error)
       // and must keep propagating as a 5xx instead of being reported as a conflict.
-      const fresh = await c.env.DB.prepare(
-        `SELECT * FROM verses WHERE book = ?1 AND chapter = ?2 AND verse = ?3 AND bible_version = ?4`,
-      )
-        .bind(book, chapter, verse, bibleVersion)
-        .first<VerseRow>();
+      const fresh = await loadVerseRow(c.env.DB, book, chapter, verse, bibleVersion);
       if (!fresh) throw err;
       let freshParsed: unknown;
       try {
@@ -325,11 +339,11 @@ verses.patch("/:book/:chapter/:verse/:bibleVersion", requireEditor, async (c) =>
       return c.json({ error: "version_mismatch", current: { ...fresh, content: freshParsed } }, 409);
     }
     if (!insertRes.meta.changes) return c.json({ error: "verse_create_failed" }, 500);
-    const created = await c.env.DB.prepare(
-      `SELECT * FROM verses WHERE book = ?1 AND chapter = ?2 AND verse = ?3 AND bible_version = ?4`,
-    )
-      .bind(book, chapter, verse, bibleVersion)
-      .first<VerseRow>();
+    // Re-read rather than synthesizing the response from the INSERT binds. It costs
+    // one query on a rare, human-triggered write, and in exchange the created row
+    // is returned by exactly the same shape as the UPDATE path below — including
+    // any column a hand-built literal would silently start getting wrong.
+    const created = await loadVerseRow(c.env.DB, book, chapter, verse, bibleVersion);
     if (!created) return c.json({ error: "verse_create_failed" }, 500);
     const createdDto = { ...created, content: parsed.data.content };
     c.executionCtx.waitUntil(

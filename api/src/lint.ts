@@ -15,6 +15,7 @@
 
 import type { RowKind, TnRow, TqRow, TwlRow, VerseRow } from "./types";
 import { parseVerseContentJson } from "./contentJson.ts";
+import { isTsMilestone } from "./importParsers.ts";
 import { parseRefOrderKey } from "./tsvFormat.ts";
 
 export type IssueBucket = "flag" | "escalate";
@@ -308,17 +309,6 @@ function isTransparentToEdgeScan(node: unknown): boolean {
   return isTsMilestone(o);
 }
 
-// Mirrors isTsMilestone in web/src/lib/usfm.ts and api/src/importParsers.ts.
-// Matches every shape usfm-js has produced for `\ts\*`; matching only the legacy
-// `{tag:"ts", content:"\\*"}` form was a silent no-op on real 3.5.0 data.
-function isTsMilestone(node: unknown): boolean {
-  const o = node as Record<string, unknown> | null;
-  if (!o) return false;
-  const tag = o["tag"];
-  if (tag === "ts\\*" || tag === "ts*") return true;
-  return tag === "ts" && (o["content"] === "\\*" || o["content"] === "*");
-}
-
 // POSITION MATTERS, and getting it wrong makes this lint useless. An opening
 // marker only counts if it sits at the boundary between the chapter start and
 // verse 1: trailing on the front matter, or leading verse 1 itself. Scanning the
@@ -332,6 +322,22 @@ function endsWithOpeningMarker(nodes: unknown[]): boolean {
     return false;
   }
   return false;
+}
+
+// A verse row's parsed `verseObjects`, or [] when the row is absent or its stored
+// JSON is unreadable. Lint must survive a corrupt row rather than throw and take
+// the whole book's report down with it — a corrupt intro simply reads as "carries
+// no marker", which is the safe direction (it flags for a human to look).
+function verseObjectsOf(row: VerseRow | undefined): unknown[] {
+  if (!row) return [];
+  let parsed: unknown;
+  try {
+    parsed = parseVerseContentJson(row);
+  } catch {
+    return [];
+  }
+  const vos = (parsed as { verseObjects?: unknown[] })?.verseObjects;
+  return Array.isArray(vos) ? vos : [];
 }
 
 function startsWithOpeningMarker(nodes: unknown[]): boolean {
@@ -375,19 +381,8 @@ export function lintChapterOpeningMarkers(verses: VerseRow[]): LintIssue[] {
     // A chapter with no verse 1 isn't scripture we can judge (front matter,
     // partial load) — say nothing rather than guess.
     if (!first) continue;
-    const nodesOf = (row: VerseRow | undefined): unknown[] => {
-      if (!row) return [];
-      let parsed: unknown;
-      try {
-        parsed = parseVerseContentJson(row);
-      } catch {
-        return [];
-      }
-      const vos = (parsed as { verseObjects?: unknown[] })?.verseObjects;
-      return Array.isArray(vos) ? vos : [];
-    };
-    if (endsWithOpeningMarker(nodesOf(front))) continue;
-    if (startsWithOpeningMarker(nodesOf(first))) continue;
+    if (endsWithOpeningMarker(verseObjectsOf(front))) continue;
+    if (startsWithOpeningMarker(verseObjectsOf(first))) continue;
     issues.push({
       check: "Chapter opening marker",
       bucket: "flag",
