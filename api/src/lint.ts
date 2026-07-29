@@ -262,6 +262,144 @@ function hasGluedMilestone(nodes: unknown[]): boolean {
   return walk(nodes);
 }
 
+// Paragraph / poetry tags that legitimately open a chapter. Mirror of
+// PARAGRAPH_TAGS in web/src/lib/usfm.ts — keep in sync.
+//
+// `\ts\*` is DELIBERATELY absent: a chunk divider is a translator-section
+// milestone, not a line-layout marker, so a chapter whose only leading node is
+// `\ts\*` still has no paragraph and must still flag. Character wrappers
+// (`\qs Selah\qs*`) are also `type:"quote"` but carry verse CONTENT rather than
+// a break — they're excluded by the tag-set test, since `qs` isn't in the set.
+const CHAPTER_OPENING_TAGS: ReadonlySet<string> = new Set([
+  "p", "m", "mi", "nb", "pi", "pi1", "pi2", "pi3", "pc",
+  "q", "q1", "q2", "q3", "q4", "qm", "qm1", "qm2", "qm3",
+  "b",
+]);
+
+function isChapterOpeningMarker(node: unknown): boolean {
+  const o = node as Record<string, unknown> | null;
+  if (!o) return false;
+  const t = o["type"];
+  if (t !== "paragraph" && t !== "quote") return false;
+  const tag = o["tag"];
+  return typeof tag === "string" && CHAPTER_OPENING_TAGS.has(tag);
+}
+
+// Nodes that carry no verse content and so must not stop the edge scans below.
+// This mirrors trailingMarkerRunStart in web/src/lib/usfm.ts — keep the two in
+// sync, because the app uses that function to decide which markers introduce the
+// next verse, and a lint that disagreed would flag chapters the editor already
+// shows as correctly marked (or stay silent on ones it shows as bare).
+//
+// Transparent: whitespace-only text (including U+200B, which the editor's empty
+// -block placeholder leaves behind) and `\ts\*` chunk milestones. The `\ts\*`
+// case is the Micah 4 lesson: prod stores tails as `\q1` then `\ts\*`, so a scan
+// that stopped at the divider would never see the `\q1` behind it and would
+// report a marked chapter as bare. Section headings (`\s1`) are deliberately NOT
+// transparent — the app stops at them too, so a `\p` sitting BEFORE a heading
+// does not introduce the verse that follows the heading.
+function isTransparentToEdgeScan(node: unknown): boolean {
+  const o = node as Record<string, unknown> | null;
+  if (!o) return false;
+  const t = o["text"];
+  if (typeof t === "string" && /^[\s​]*$/.test(t)) return true;
+  return isTsMilestone(o);
+}
+
+// Mirrors isTsMilestone in web/src/lib/usfm.ts and api/src/importParsers.ts.
+// Matches every shape usfm-js has produced for `\ts\*`; matching only the legacy
+// `{tag:"ts", content:"\\*"}` form was a silent no-op on real 3.5.0 data.
+function isTsMilestone(node: unknown): boolean {
+  const o = node as Record<string, unknown> | null;
+  if (!o) return false;
+  const tag = o["tag"];
+  if (tag === "ts\\*" || tag === "ts*") return true;
+  return tag === "ts" && (o["content"] === "\\*" || o["content"] === "*");
+}
+
+// POSITION MATTERS, and getting it wrong makes this lint useless. An opening
+// marker only counts if it sits at the boundary between the chapter start and
+// verse 1: trailing on the front matter, or leading verse 1 itself. Scanning the
+// whole array instead (an `Array.some`) silently passes every poetry chapter,
+// because verse 1 of a poetic verse carries its own mid-verse `\q1`/`\q2` line
+// breaks — MIC 2:1 UST is exactly that, and it hid a real missing-marker defect.
+function endsWithOpeningMarker(nodes: unknown[]): boolean {
+  for (let i = nodes.length - 1; i >= 0; i--) {
+    if (isChapterOpeningMarker(nodes[i])) return true;
+    if (isTransparentToEdgeScan(nodes[i])) continue;
+    return false;
+  }
+  return false;
+}
+
+function startsWithOpeningMarker(nodes: unknown[]): boolean {
+  for (const node of nodes) {
+    if (isChapterOpeningMarker(node)) return true;
+    if (isTransparentToEdgeScan(node)) continue;
+    return false;
+  }
+  return false;
+}
+
+// Flag chapters whose verse 1 is not introduced by a paragraph / poetry marker
+// (issue #378). USFM puts that marker BEFORE `\v 1`, so usfm-js parks it on the
+// chapter-front pseudo-verse that we store as verse 0 — meaning the marker is
+// normally the TRAILING content of verse 0, not the leading content of verse 1.
+// Two distinct defects produce an unmarked chapter, and both are reported here:
+//
+//   1. no verse-0 row exists at all (the observed case: MIC 5 ULT, MIC 2 UST) —
+//      nothing can hold the marker, and the editor cannot even create it without
+//      the verse-0 upsert path in verses.ts;
+//   2. a verse-0 row exists but holds no opening marker (e.g. only a `\d` Psalm
+//      superscription, or only a `\ts\*` chunk divider).
+//
+// Checking verse 1's own LEADING nodes as well keeps this from false-positiving
+// if usfm-js ever parks the marker inside verse 1 instead of on the front matter.
+// Both checks are position-sensitive — see endsWithOpeningMarker for why.
+// Bucket is `flag`, not `escalate`: this needs a human to choose WHICH marker
+// belongs (`\p` prose vs `\q1` poetry), and it does not corrupt the export.
+export function lintChapterOpeningMarkers(verses: VerseRow[]): LintIssue[] {
+  const byChapter = new Map<number, { front?: VerseRow; first?: VerseRow }>();
+  for (const v of verses) {
+    if (v.verse !== 0 && v.verse !== 1) continue;
+    const slot = byChapter.get(v.chapter) ?? {};
+    if (v.verse === 0) slot.front = v;
+    else slot.first = v;
+    byChapter.set(v.chapter, slot);
+  }
+  const issues: LintIssue[] = [];
+  for (const chapter of [...byChapter.keys()].sort((a, b) => a - b)) {
+    const { front, first } = byChapter.get(chapter)!;
+    // A chapter with no verse 1 isn't scripture we can judge (front matter,
+    // partial load) — say nothing rather than guess.
+    if (!first) continue;
+    const nodesOf = (row: VerseRow | undefined): unknown[] => {
+      if (!row) return [];
+      let parsed: unknown;
+      try {
+        parsed = parseVerseContentJson(row);
+      } catch {
+        return [];
+      }
+      const vos = (parsed as { verseObjects?: unknown[] })?.verseObjects;
+      return Array.isArray(vos) ? vos : [];
+    };
+    if (endsWithOpeningMarker(nodesOf(front))) continue;
+    if (startsWithOpeningMarker(nodesOf(first))) continue;
+    issues.push({
+      check: "Chapter opening marker",
+      bucket: "flag",
+      // Point at the intro row — that's where the fix goes, and it's a valid
+      // navigation target even when the row doesn't exist yet.
+      ref: `${chapter}:0`,
+      message: front
+        ? `chapter ${chapter} starts without a paragraph / poetry marker (\\p, \\q1, …) — add one to the chapter intro.`
+        : `chapter ${chapter} has no chapter-intro row, so it starts without a paragraph / poetry marker (\\p, \\q1, …) — add one to the chapter intro.`,
+    });
+  }
+  return issues;
+}
+
 // USFM (ult/ust) integrity lint over the stored verse rows: unbalanced footnotes
 // and joiner-glued alignment milestones, per verse. (Verse-coverage / chapter-
 // count are guarded by the export shrink guard and validated whole-file
