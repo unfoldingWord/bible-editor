@@ -1,6 +1,7 @@
 // Pure grouping of flat CommentDto rows into threads, keyed by verse or by
 // tn/tq/twl row. No React, no fetching — see useComments.ts for the hook that
-// wraps this with data. See docs/plan.md "Internal Comments & Notes".
+// wraps this with data. See api/migrations/0037_comments.sql for the schema
+// rationale (why replies are flat and anchors are denormalized).
 
 import type { CommentDto, CommentRowKind } from "../sync/api";
 
@@ -38,9 +39,11 @@ export function indexComments(list: CommentDto[]): CommentsIndex {
     else repliesByRoot.set(c.parentId, [c]);
   }
 
-  roots.sort((a, b) => a.createdAt - b.createdAt);
+  // createdAt is unix *seconds*, so same-second creations are common — tiebreak
+  // on id for a deterministic order.
+  roots.sort((a, b) => a.createdAt - b.createdAt || a.id - b.id);
   for (const replies of repliesByRoot.values()) {
-    replies.sort((a, b) => a.createdAt - b.createdAt);
+    replies.sort((a, b) => a.createdAt - b.createdAt || a.id - b.id);
   }
 
   const threadsByVerse = new Map<number, CommentThread[]>();

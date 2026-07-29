@@ -85,7 +85,8 @@ async function loadComment(db: D1Database, id: number): Promise<CommentDto | nul
   return row ? mapRow(row) : null;
 }
 
-// Registered BEFORE /:book/:chapter so "mention-users" isn't captured as book.
+// Every user we could mention. Small trusted roster (the users table only holds
+// role-allowlisted accounts), so no filtering or pagination.
 comments.get("/mention-users", requireEditor, async (c) => {
   const rs = await c.env.DB.prepare(
     `SELECT id, dcs_username, dcs_full_name FROM users ORDER BY COALESCE(dcs_full_name, dcs_username)`,
@@ -302,13 +303,15 @@ comments.post("/:id/resolve", requireEditor, async (c) => {
   const userId = currentUserId(c);
   if (parsed.data.resolved) {
     await c.env.DB.prepare(
-      `UPDATE comments SET resolved_at = unixepoch(), resolved_by = ?1, updated_at = unixepoch() WHERE id = ?2`,
+      `UPDATE comments SET resolved_at = unixepoch(), resolved_by = ?1, updated_at = unixepoch()
+        WHERE id = ?2 AND deleted_at IS NULL`,
     )
       .bind(userId, id)
       .run();
   } else {
     await c.env.DB.prepare(
-      `UPDATE comments SET resolved_at = NULL, resolved_by = NULL, updated_at = unixepoch() WHERE id = ?1`,
+      `UPDATE comments SET resolved_at = NULL, resolved_by = NULL, updated_at = unixepoch()
+        WHERE id = ?1 AND deleted_at IS NULL`,
     )
       .bind(id)
       .run();
@@ -338,15 +341,23 @@ comments.delete("/:id", requireEditor, async (c) => {
     return c.json({ error: "forbidden", reason: "not_author" }, 403);
   }
 
-  await c.env.DB.prepare(`UPDATE comments SET deleted_at = unixepoch() WHERE id = ?1`).bind(id).run();
-  // Soft-delete replies along with a top-level comment so tabs drop the whole thread.
+  // Batched so a root can never end up deleted while its replies survive as
+  // orphans (stored, invisible to the client's orphan guard, and un-deletable).
+  const deletes = [
+    c.env.DB
+      .prepare(`UPDATE comments SET deleted_at = unixepoch() WHERE id = ?1 AND deleted_at IS NULL`)
+      .bind(id),
+  ];
   if (existing.parent_id === null) {
-    await c.env.DB.prepare(
-      `UPDATE comments SET deleted_at = unixepoch() WHERE parent_id = ?1 AND deleted_at IS NULL`,
-    )
-      .bind(id)
-      .run();
+    deletes.push(
+      c.env.DB
+        .prepare(
+          `UPDATE comments SET deleted_at = unixepoch() WHERE parent_id = ?1 AND deleted_at IS NULL`,
+        )
+        .bind(id),
+    );
   }
+  await c.env.DB.batch(deletes);
 
   const deletedRow = await c.env.DB.prepare(`${SELECT_COMMENT} WHERE c.id = ?1`).bind(id).first<CommentRow>();
   if (deletedRow) {

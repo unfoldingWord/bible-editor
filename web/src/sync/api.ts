@@ -1030,7 +1030,7 @@ export interface PipelineQueueSummary {
   queuedCount: number;
 }
 
-// ── Internal comments & notes (docs/plan.md "Internal Comments & Notes") ──
+// ── Internal comments & notes (see api/migrations/0037_comments.sql) ──
 // D1-only, never exported. GET is a separate fetch (not part of ChapterPayload)
 // so a comments failure degrades gracefully without breaking chapter load.
 
