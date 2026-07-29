@@ -33,6 +33,11 @@
   -Json      Emit JSON (same data) for scripting.
   -NoPr      Skip the `gh` call (faster, or when offline / gh unauthenticated).
 #>
+#requires -Version 7
+# pwsh 7+ only, and NOT a formality: under Windows PowerShell 5.1 the
+# $PSNativeCommandUseErrorActionPreference assignment below is a silent no-op
+# (so every expected nonzero git/gh exit starts throwing) and this file's
+# non-ASCII characters mis-decode. Fail loudly instead of misbehaving quietly.
 [CmdletBinding()]
 param(
   [switch]$Json,
@@ -81,8 +86,10 @@ function Get-RegisteredWorktrees {
 function Get-PrsByBranch {
   if ($NoPr) { return @{} }
   if (-not (Get-Command gh -ErrorAction SilentlyContinue)) { return $null }
+  # Limit must exceed the repo's total PR count or old branches silently render
+  # as "no PR": at --limit 100 the window bottomed out at #268 of 367.
   $raw = & gh -R (& git -C $mainRoot remote get-url origin 2>$null) pr list `
-           --state all --limit 100 --json number,title,headRefName,state 2>$null
+           --state all --limit 600 --json number,title,headRefName,state 2>$null
   if ($LASTEXITCODE -ne 0 -or -not "$raw".Trim()) { return $null }
   try { $prs = "$raw" | ConvertFrom-Json } catch { return $null }
   $map = @{}
@@ -95,24 +102,37 @@ function Get-PrsByBranch {
 }
 
 # --- the human's own one-line summary, if they wrote one ---
-# .claude/state files are named for the worktree, conventionally WITHOUT the
-# harness hash suffix (worktree dreamy-leakey-b72e01 -> dreamy-leakey.md), so
-# try the full leaf name and the leaf minus a trailing -<hex> segment.
-function Get-StateHeadline([string]$leaf) {
+# .claude/ is git-ignored, so each worktree carries its OWN copy of
+# .claude/state/ and an agent following .claude/state/README.md from inside its
+# worktree writes there, not into main. Search the worktree FIRST and main
+# second -- looking only in main made this (the highest-priority description
+# source) dead in the common case.
+#
+# Files are named for the worktree, conventionally WITHOUT the harness hash
+# suffix (worktree dreamy-leakey-b72e01 -> dreamy-leakey.md), so try the full
+# leaf name and the leaf minus a trailing -<hex> segment.
+function Get-StateHeadline([string]$leaf, [string]$worktreePath) {
   $names = @($leaf)
   if ($leaf -match '^(.*)-[0-9a-f]{6,}$') { $names += $Matches[1] }
-  foreach ($n in $names) {
-    $f = Join-Path $mainRoot ".claude\state\$n.md"
-    if (Test-Path -LiteralPath $f -PathType Leaf) {
+  $roots = @()
+  if ($worktreePath) { $roots += $worktreePath }
+  $roots += $mainRoot
+  foreach ($root in $roots) {
+    foreach ($n in $names) {
+      $f = Join-Path $root ".claude\state\$n.md"
+      if (-not (Test-Path -LiteralPath $f -PathType Leaf)) { continue }
       $h1 = (Get-Content -LiteralPath $f -TotalCount 20 -ErrorAction SilentlyContinue |
              Where-Object { $_ -match '^\s*#\s+\S' } | Select-Object -First 1)
-      if ($h1) {
-        $t = ($h1 -replace '^\s*#\s+','').Trim()
-        # Entries are conventionally "# <worktree> - <what it is>"; keep the
-        # descriptive half so we don't just echo the folder name back.
-        if ($t -match '^\S+\s+[-—]\s+(.+)$') { $t = $Matches[1].Trim() }
-        return $t
+      if (-not $h1) { continue }
+      $t = ($h1 -replace '^\s*#\s+','').Trim()
+      # Entries are conventionally "# <worktree> - <what it is>"; keep the
+      # descriptive half so we don't just echo the folder name back. Only strip
+      # when the first token really IS one of this worktree's names -- a plain
+      # title like "Bug - alignment lost" must keep its first word.
+      if ($t -match '^(\S+)\s+[-—]\s+(.+)$' -and ($names -contains $Matches[1])) {
+        $t = $Matches[2].Trim()
       }
+      return $t
     }
   }
   return $null
@@ -121,6 +141,9 @@ function Get-StateHeadline([string]$leaf) {
 $prMap = Get-PrsByBranch
 $prLookupFailed = ($null -eq $prMap)
 if ($prLookupFailed) { $prMap = @{} }
+# Did we actually learn anything about PRs? False for -NoPr and for any failure,
+# so the renderer can say "unknown" instead of asserting "no PR".
+$prKnown = (-not $prLookupFailed) -and (-not $NoPr)
 
 $rows = @()
 foreach ($w in (Get-RegisteredWorktrees)) {
@@ -129,13 +152,18 @@ foreach ($w in (Get-RegisteredWorktrees)) {
   $leaf   = Split-Path -Leaf $path
   $onDisk = Test-Path -LiteralPath $path
 
-  $subject = $null; $age = $null; $dirty = 0; $ahead = 0; $sha = $null
+  # $dirty stays $null when we could not determine it. "Unknown" must never
+  # render as "clean": a sibling agent mid-`git add` holds index.lock, our
+  # status call fails, and a worktree with 20 uncommitted files would otherwise
+  # print "clean / candidate for cleanup" -- advice that precedes a deletion.
+  $subject = $null; $age = $null; $dirty = $null; $ahead = 0; $sha = $null
   # Any failure inspecting ONE worktree degrades that row, never the listing.
   try {
     if ($onDisk) {
       $log = (& git -c safe.directory=* -C $path log -1 --format='%h%x1f%s%x1f%cr' 2>$null)
       if ($log) { $parts = "$log" -split "`u{1f}"; $sha = $parts[0]; $subject = $parts[1]; $age = $parts[2] }
-      $dirty = @(& git -c safe.directory=* -C $path status --porcelain 2>$null).Count
+      $st = @(& git -c safe.directory=* -C $path status --porcelain 2>$null)
+      if ($LASTEXITCODE -eq 0) { $dirty = $st.Count }
     }
     if ($w.head -and -not $isMain) {
       $n = (& git -C $mainRoot rev-list --count $w.head --not origin/main main 2>$null)
@@ -144,7 +172,7 @@ foreach ($w in (Get-RegisteredWorktrees)) {
   } catch { }
 
   $pr = if ($w.branch -and $prMap.ContainsKey($w.branch)) { $prMap[$w.branch] } else { $null }
-  $note = Get-StateHeadline $leaf
+  $note = if ($isMain) { $null } else { Get-StateHeadline $leaf $path }
 
   # The honest description, best source first.
   #
@@ -157,12 +185,16 @@ foreach ($w in (Get-RegisteredWorktrees)) {
   $what = if ($note) { $note }
           elseif ($pr) { $pr.title }
           elseif ($ownWork -and $subject) { $subject }
+          elseif ($null -eq $dirty) { '(could not inspect this worktree -- look before assuming it is idle)' }
           elseif ($dirty -gt 0) { '(uncommitted work in progress -- nothing committed yet)' }
           else { '(nothing of its own -- sitting at main)' }
   $whatFrom = if ($note) { 'state' }
               elseif ($pr) { 'pr' }
               elseif ($ownWork -and $subject) { 'commit' }
               else { 'none' }
+  # main is rendered by its own one-liner and never shows a description; leaving
+  # a computed one in -Json output would just be a nonsense field.
+  if ($isMain) { $what = $null; $whatFrom = $null }
 
   $rows += [ordered]@{
     folder=$leaf; path=$path; isMain=$isMain; onDisk=$onDisk; locked=$w.locked
@@ -192,21 +224,30 @@ if ($prLookupFailed) {
 }
 Write-Host ("-" * 100)
 
+function Format-Dirty($d) {
+  if ($null -eq $d) { return 'working tree state UNKNOWN' }
+  if ($d -gt 0)     { return "$d file(s) uncommitted" }
+  return 'clean'
+}
+
 foreach ($r in $main) {
-  $state = if ($r.dirtyFiles -gt 0) { "$($r.dirtyFiles) file(s) uncommitted" } else { 'clean' }
-  Write-Host ("MAIN   {0}  [{1}]  {2}" -f $r.folder, $r.branch, $state)
+  Write-Host ("MAIN   {0}  [{1}]  {2}" -f $r.folder, $r.branch, (Format-Dirty $r.dirtyFiles))
 }
 if ($main.Count -and $other.Count) { Write-Host "" }
 
 foreach ($r in ($other | Sort-Object $rank, folder)) {
-  $tag = if ($r.prNumber) { "#{0} {1}" -f $r.prNumber, $r.prState } else { 'no PR' }
+  # "PR ?" when we never successfully asked -- asserting "no PR" from a lookup
+  # that did not happen is a claim we have not earned.
+  $tag = if ($r.prNumber)   { "#{0} {1}" -f $r.prNumber, $r.prState }
+         elseif ($prKnown)  { 'no PR' }
+         else               { 'PR ?' }
   Write-Host ("{0,-13} {1}" -f $tag, $r.what)
   Write-Host ("              folder  {0}" -f $r.folder)
   Write-Host ("              branch  {0}" -f $(if ($r.branch) { $r.branch } else { "(detached at $($r.sha))" }))
 
   $bits = @()
   $bits += if ($r.aheadOfMain -gt 0) { "$($r.aheadOfMain) commit(s) ahead of main" } else { 'nothing ahead of main' }
-  $bits += if ($r.dirtyFiles -gt 0)  { "$($r.dirtyFiles) file(s) uncommitted" } else { 'clean' }
+  $bits += (Format-Dirty $r.dirtyFiles)
   if ($r.lastCommitAge) { $bits += "last commit $($r.lastCommitAge)" }
   if ($r.locked)        { $bits += 'LOCKED' }
   if (-not $r.onDisk)   { $bits += 'DIRECTORY MISSING' }
@@ -215,14 +256,35 @@ foreach ($r in ($other | Sort-Object $rank, folder)) {
   # Name the source, so a folder/branch mismatch is visibly explained rather
   # than mysterious -- this is the confusion the script exists to remove.
   if ($r.whatFrom -eq 'commit') {
-    Write-Host "              (described by its last commit -- no .claude/state entry, no PR)"
+    # NOT named $noPr: PowerShell variable names are case-insensitive, so that
+    # would collide with the -NoPr [switch] parameter and fail to assign.
+    $prBit = if ($prKnown) { 'no PR' } else { 'PR lookup skipped' }
+    Write-Host ("              (described by its last commit -- no .claude/state entry, {0})" -f $prBit)
   } elseif ($r.whatFrom -eq 'state') {
     Write-Host "              (described by .claude/state)"
   } elseif ($r.whatFrom -eq 'none' -and $r.dirtyFiles -eq 0) {
-    # Only when genuinely empty. A dirty worktree is someone's live session.
+    # Only when genuinely empty AND we could actually read the tree. A dirty or
+    # uninspectable worktree may be someone's live session.
     Write-Host "              (nothing to describe it -- candidate for cleanup, or a fresh worktree)"
   }
   Write-Host ""
+}
+
+# Orphans: on disk under .claude/worktrees but no longer registered with git.
+# Someone standing in one of these asking "which worktree is this?" would
+# otherwise get no row at all. Enumeration is a single non-recursive listing --
+# it never descends, so it cannot traverse a node_modules junction.
+$wtDir = Join-Path $mainRoot '.claude\worktrees'
+if (Test-Path -LiteralPath $wtDir) {
+  $regNorm = @($rows | ForEach-Object { Norm $_.path })
+  $orphans = @(Get-ChildItem -LiteralPath $wtDir -Directory -ErrorAction SilentlyContinue |
+               Where-Object { $regNorm -notcontains (Norm $_.FullName) })
+  if ($orphans.Count) {
+    Write-Host "Not registered with git (on disk only) -- stale leftovers, or a worktree removed mid-session:"
+    foreach ($o in $orphans) { Write-Host ("  {0}" -f $o.Name) }
+    Write-Host "  -> classify these with scripts/worktree-cleanup.ps1 (it verifies each is really ours before removing)."
+    Write-Host ""
+  }
 }
 
 Write-Host ("-" * 100)
