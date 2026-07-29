@@ -13,6 +13,7 @@
 import type { Env } from "./index";
 import type {
   CheckLane,
+  CommentDto,
   RowKind,
   TnRow,
   TqRow,
@@ -52,7 +53,11 @@ export type WsEvent =
   // no row.upserted events fired). This is a coalesced *hint* — one per changed
   // chapter, not one per row — telling open tabs their row list is stale. The
   // client prompts the user to save and refresh rather than refetching silently.
-  | { type: "chapter.pipeline_applied"; book: string; chapter: number; pipeline_type: string };
+  | { type: "chapter.pipeline_applied"; book: string; chapter: number; pipeline_type: string }
+  // A comment/reply was created, edited, resolved/unresolved, or soft-deleted
+  // (deletedAt set). Last-write-wins upsert by id, like lane checks; a delete
+  // of a top-level comment also implies its replies are gone client-side.
+  | { type: "comment.updated"; comment: CommentDto };
 
 export async function broadcastChapter(
   env: Env,
