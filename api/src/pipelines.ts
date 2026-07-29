@@ -201,6 +201,48 @@ interface PolledJob {
   updated_at: number;
   resume_attempt_count: number;
   last_resume_at: number | null;
+  // The original /start options, replayed on resume so a resumed run keeps the
+  // flags the translator actually asked for. TEXT column: may be NULL or (in
+  // principle) malformed, so every read goes through resumeOptionsFromJson.
+  options_json: string | null;
+}
+
+// Options to replay on a resume call, parsed from pipeline_jobs.options_json.
+//
+// The distinction between "this run had no options" and "we don't know what its
+// options were" is load-bearing, so this returns `{}` for the former and
+// `undefined` for the latter. The bot cannot recover options from its own
+// checkpoint, so a resume that sends nothing runs with DEFAULTS — silently
+// re-enabling intros or dropping the editor's hints, producing output that
+// differs from what was originally asked for. The bot therefore refuses a resume
+// whose options are unknown, and we must not disguise "unknown" as "empty".
+//
+// `fresh` is stripped: it is a valid /start option (and so legitimately lives in
+// options_json), but the bot's resume schema omits it AND rejects unknown keys,
+// because on the resume path `fresh` would destroy the very checkpoint being
+// resumed. Sending it would 400 the whole resume.
+function resumeOptionsFromJson(
+  optionsJson: string | null,
+  jobId: string,
+): Record<string, unknown> | undefined {
+  // No stored options at all is authoritative: the run genuinely had none.
+  if (!optionsJson) return {};
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(optionsJson);
+  } catch {
+    // Genuinely unknown — let the bot refuse rather than resume on defaults.
+    console.error(
+      `[pipelineResume] job=${jobId} options_json unparseable — cannot replay options`,
+    );
+    return undefined;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    console.error(`[pipelineResume] job=${jobId} options_json is not an object — cannot replay`);
+    return undefined;
+  }
+  const { fresh: _fresh, ...rest } = parsed as Record<string, unknown>;
+  return rest;
 }
 
 interface ChainStepValue {
@@ -416,11 +458,22 @@ type ResumeCall =
 // poller must never force, because the time-box is what keeps auto-resume from
 // re-pushing content generated before a proofreader's edits (see
 // bp-bot/STALE-SOURCE-DIAGNOSIS.md).
+//
+// `username` and `options` are things the bot cannot recover from its own
+// checkpoint, so we are the authority for both: without a username it credits
+// Door43 commits to a literal 'bible-editor' instead of the translator, and
+// without the original options a resumed run silently reverts to default flags
+// (dropping e.g. noIntro / contentTypes) — doing something other than what was
+// asked. Both keys are OMITTED entirely when we don't have them, never sent as
+// null: the bot's resume schema is `.strict()`.
 async function callUpstreamResume(
   env: Env,
   upstreamJobId: string,
-  opts: { force: boolean },
+  opts: { force: boolean; username?: string; options?: unknown },
 ): Promise<ResumeCall> {
+  const payload: Record<string, unknown> = { force: opts.force };
+  if (opts.username) payload.username = opts.username;
+  if (opts.options !== undefined && opts.options !== null) payload.options = opts.options;
   let upstream: Response;
   try {
     upstream = await fetch(
@@ -431,7 +484,7 @@ async function callUpstreamResume(
           "Content-Type": "application/json",
           Authorization: `Bearer ${env.BT_API_TOKEN}`,
         },
-        body: JSON.stringify({ force: opts.force }),
+        body: JSON.stringify(payload),
       },
     );
   } catch {
@@ -499,6 +552,24 @@ async function attemptOutageResume(
     const parsed = Date.parse(data.pausedAt);
     if (Number.isFinite(parsed)) pausedAtSec = Math.floor(parsed / 1000);
   }
+  // Spacing comes FIRST, ahead of the age and cap gates, and that ordering is
+  // load-bearing. A resume attempt inside the spacing window means this job is
+  // already being retried — by an earlier poll, or by a human who just clicked
+  // Resume. The manual route deliberately ignores the time-box, but the bot
+  // keeps reporting `paused_for_outage` until the resumed run actually starts,
+  // so a poll landing in that gap would see "3 hours old" and fail the job the
+  // translator just rescued. Checking spacing first leaves it alone.
+  //
+  // This costs nothing in the auto case: a genuinely too-old pause is failed on
+  // the next poll instead of this one, and it can never be *resumed* meanwhile,
+  // because the age gate below still guards every actual resume call.
+  //
+  // (The original reason for spacing still holds: the poll cron is */5 and the
+  // window is 5m, so one attempt per poll, and a second poller — an open tab's
+  // GET — can't double up in the same window.)
+  if (job.last_resume_at !== null && now - job.last_resume_at < RESUME_RETRY_SPACING_SECONDS) {
+    return null;
+  }
   const ageSeconds = Math.max(0, now - pausedAtSec);
   if (ageSeconds > RESUME_MAX_PAUSE_AGE_SECONDS) {
     return `paused ${Math.floor(ageSeconds / 60)}m ago — too old to auto-resume safely (limit ${
@@ -507,12 +578,6 @@ async function attemptOutageResume(
   }
   if (job.resume_attempt_count >= MAX_RESUME_ATTEMPTS) {
     return `auto-resume exhausted after ${job.resume_attempt_count} attempts`;
-  }
-  // Spacing. The poll cron is */5 and the spacing window is 5m, so in practice
-  // this allows one attempt per poll and guards against a second poller (an
-  // open tab's GET) doubling up in the same window.
-  if (job.last_resume_at !== null && now - job.last_resume_at < RESUME_RETRY_SPACING_SECONDS) {
-    return null;
   }
 
   // Count the attempt BEFORE the call so a Worker crash mid-flight can't give
@@ -526,8 +591,18 @@ async function attemptOutageResume(
     .bind(job.job_id)
     .run();
 
+  // The bot can't recover either of these from its checkpoint, so we supply
+  // them (see callUpstreamResume). A missing username is not fatal — better a
+  // mis-attributed commit than a job stuck paused — so we just omit it.
+  const username = await resolveUsernameFromDb(env, job.user_id);
+  const options = resumeOptionsFromJson(job.options_json, job.job_id);
+
   // Never force from the automatic path — the bot's time-box is a safety gate here.
-  const call = await callUpstreamResume(env, job.upstream_job_id, { force: false });
+  const call = await callUpstreamResume(env, job.upstream_job_id, {
+    force: false,
+    ...(username ? { username } : {}),
+    ...(options ? { options } : {}),
+  });
   if (call.kind === "accepted") return null;
   if (call.kind === "refused") {
     return `auto-resume refused by bot: ${call.reason}`;
@@ -893,7 +968,7 @@ export async function pollAllNonTerminal(env: Env): Promise<void> {
     `SELECT job_id, upstream_job_id, user_id, pipeline_type, book, start_chapter,
             end_chapter, session_key, follow_up_options, follow_up_chain,
             follow_up_job_id, error_kind, updated_at, resume_attempt_count,
-            last_resume_at, (output_json IS NULL) AS no_output_yet
+            last_resume_at, options_json, (output_json IS NULL) AS no_output_yet
        FROM pipeline_jobs
       WHERE state IN ('running', 'paused_for_outage', 'paused_for_usage_limit')
       ORDER BY updated_at ASC
@@ -1137,7 +1212,7 @@ pipelines.get("/:jobId", requireEditor, async (c) => {
             end_chapter, session_key, follow_up_options, follow_up_chain,
             follow_up_job_id, error_kind, state, current_skill, current_status,
             created_at, updated_at, resume_attempt_count, last_resume_at,
-            (output_json IS NULL) AS no_output_yet
+            options_json, (output_json IS NULL) AS no_output_yet
        FROM pipeline_jobs WHERE job_id = ?1`,
   )
     .bind(jobId)
@@ -1553,10 +1628,16 @@ pipelines.post("/:jobId/resume", requireEditor, async (c) => {
   if (!jobId) return c.json({ error: "missing_job_id" }, 400);
 
   const owned = await c.env.DB.prepare(
-    `SELECT user_id, state, upstream_job_id FROM pipeline_jobs WHERE job_id = ?1`,
+    `SELECT user_id, state, upstream_job_id, options_json
+       FROM pipeline_jobs WHERE job_id = ?1`,
   )
     .bind(jobId)
-    .first<{ user_id: number; state: string; upstream_job_id: string | null }>();
+    .first<{
+      user_id: number;
+      state: string;
+      upstream_job_id: string | null;
+      options_json: string | null;
+    }>();
   if (!owned) return c.json({ error: "not_found" }, 404);
   if (owned.user_id !== userId) return c.json({ error: "forbidden" }, 403);
   if (owned.state !== "paused_for_outage" && owned.state !== "paused_for_usage_limit") {
@@ -1568,8 +1649,17 @@ pipelines.post("/:jobId/resume", requireEditor, async (c) => {
     return c.json({ error: "cannot_resume", state: owned.state }, 409);
   }
 
+  // Same as the automatic path: the bot can't recover the requesting username or
+  // the original options from its checkpoint, so send both (see callUpstreamResume).
+  const username = await resolveUsername(c, owned.user_id);
+  const options = resumeOptionsFromJson(owned.options_json, jobId);
+
   // A human asked explicitly, so bypass the bot's time-box as well as ours.
-  const call = await callUpstreamResume(c.env, owned.upstream_job_id, { force: true });
+  const call = await callUpstreamResume(c.env, owned.upstream_job_id, {
+    force: true,
+    ...(username ? { username } : {}),
+    ...(options ? { options } : {}),
+  });
   if (call.kind === "accepted") {
     // Record the attempt for observability and reset the poller's spacing
     // window; leave the state alone — the next poll observes real progress.
