@@ -23,6 +23,7 @@ import { highlightsFor, renderEditableHTML, renderHighlightedHTML, type Highligh
 import { markHighlightSx } from "../lib/highlightStyles";
 import { extractTrailingMarkers, stripTrailingMarkers, splitSectionHeaders, type SectionHeader } from "../lib/usfm";
 import { SectionHeaderBand } from "./SectionHeaderBand";
+import { DriftedMarkerBand, driftedMarkerTags } from "./DriftedMarkerBand";
 import { AlignLinkButton } from "./AlignLinkButton";
 import { drafts, verseKey, draftDirtyBorderSx } from "../sync/drafts";
 import type { FindMatch } from "./FindReplaceOverlay";
@@ -866,6 +867,20 @@ const VerseCell = memo(function VerseCell({
     return renderHighlightedHTML(composed, highlights ?? new Set(), roles);
   }, [findHTML, dto?.content, highlights, prevDto?.content, isActive, readOnly, roles]);
 
+  // Markers that drifted from the previous verse, for the lookback band. The
+  // active-editable render above deliberately drops them from the verse body (its
+  // textContent has to match extractEditableText for the save diff), so book mode
+  // otherwise gave no sign that the previous verse's `\q1` leads this one.
+  const driftedMarkers = useMemo(
+    () =>
+      driftedMarkerTags(
+        extractTrailingMarkers(
+          (prevDto?.content as { verseObjects?: unknown[] } | null)?.verseObjects,
+        ),
+      ),
+    [prevDto?.content],
+  );
+
   // splitSectionHeaders walks the whole verseObjects tree — memoize on the
   // content reference so re-renders without a content change skip the walk.
   const sections = useMemo<SectionHeader[]>(() => {
@@ -1012,6 +1027,9 @@ const VerseCell = memo(function VerseCell({
           </IconButton>
         </Tooltip>
       )}{" "}
+      {isActive && !readOnly && !rtl && (
+        <DriftedMarkerBand markers={driftedMarkers} inline />
+      )}
       {readOnly && rtl ? (
         <span
           style={{

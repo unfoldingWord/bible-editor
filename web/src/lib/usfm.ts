@@ -120,8 +120,29 @@ export function isInFlowMarker(node: unknown): boolean {
   if (!o) return false;
   const t = o["type"];
   if ((t === "paragraph" || t === "quote") && typeof o["tag"] === "string") return true;
-  if (o["tag"] === "ts" && o["content"] === "\\*") return true;
+  if (isTsMilestone(o)) return true;
   return false;
+}
+
+// True iff `node` is a `\ts\*` translator-section chunk milestone, in ANY of the
+// shapes usfm-js has produced for it. This predicate exists because matching only
+// the legacy shape was a silent no-op on real data for as long as we've shipped
+// usfm-js 3.5.0: it parks the whole marker in the tag (`{tag:"ts\\*"}`) and emits
+// no `type` and no `content`, so the `tag === "ts"` test never fired. The visible
+// cost was Micah 4 — a verse whose trailing marker run ended in a `\ts\*` failed
+// to seed the next verse's lookback band at all (extractTrailingMarkers saw an
+// unrecognized node and stopped scanning), and the divider itself never rendered.
+// Shapes, newest first:
+//   usfm-js 3.5.0, well-formed  → {tag:"ts\\*"}
+//   editor-written, malformed   → {tag:"ts*"}     (repaired on export)
+//   legacy usfm-js              → {tag:"ts", content:"\\*"|"*"}
+// Mirrors isTsMilestone in api/src/importParsers.ts — keep the two in sync.
+export function isTsMilestone(node: unknown): boolean {
+  const o = node as Record<string, unknown> | null;
+  if (!o) return false;
+  const tag = o["tag"];
+  if (tag === "ts\\*" || tag === "ts*") return true;
+  return tag === "ts" && (o["content"] === "\\*" || o["content"] === "*");
 }
 
 // Character-style wrapper tags that usfm-js parses as `type:"quote"` but which
@@ -155,6 +176,12 @@ function isDriftableMarker(node: unknown): boolean {
   const o = node as Record<string, unknown>;
   if (typeof o["endTag"] === "string" && o["endTag"] !== "") return false;
   if (isCharacterWrapper(node)) return false;
+  // A `\ts\*` chunk milestone marks a translator-section boundary AT the point it
+  // sits — it is not a line marker leading the next verse, so it stays in the
+  // verse that holds it and is rendered there rather than ghosted forward into
+  // the next verse's lookback band. It is still transparent to the trailing-run
+  // scan (trailingMarkerRunStart) so real line markers behind it still drift.
+  if (isTsMilestone(node)) return false;
   return true;
 }
 
@@ -203,24 +230,44 @@ export function liftMarkerText(verseObjects: unknown[]): unknown[] {
 // markers in document order (oldest-first).
 export function extractTrailingMarkers(verseObjects: unknown[] | undefined | null): unknown[] {
   if (!Array.isArray(verseObjects)) return [];
-  const out: unknown[] = [];
+  const start = trailingMarkerRunStart(verseObjects);
+  return verseObjects.slice(start).filter(isDriftableMarker);
+}
+
+// Index of the first node in the verse-final "trailing marker run" — the tail of
+// the array that holds no verse content, only line markers and the inert nodes
+// that may be interleaved with them. Everything from here to the end is either
+// drifted onto the next verse (the line markers) or left in place (the rest);
+// `verseObjects.length` means there is no run at all. Shared by
+// extractTrailingMarkers and stripTrailingMarkers so the two can never disagree
+// about where the run begins.
+//
+// Three node kinds are transparent to the scan:
+//   - driftable line markers (`\q1`, `\p`, …) — what we're collecting;
+//   - whitespace-only text, INCLUDING zero-width spaces (U+200B), which crept in
+//     from the editor's empty-block placeholder (`&#8203;`) and must not block
+//     drift just because a user saved past one;
+//   - a `\ts\*` chunk milestone, which is transparent but NOT driftable (see
+//     isDriftableMarker). Making it transparent is the Micah 4 fix: prod stores
+//     the tail as `\q1` then `\ts\*`, so a scan that stopped at the divider never
+//     reached the `\q1` behind it and verses 2/4/6/9 lost their lookback band.
+function trailingMarkerRunStart(verseObjects: unknown[]): number {
+  let start = verseObjects.length;
   for (let i = verseObjects.length - 1; i >= 0; i--) {
     const node = verseObjects[i];
-    if (isDriftableMarker(node)) {
-      out.unshift(node);
-    } else {
-      const o = node as Record<string, unknown> | null;
-      // Skip empty trailing text whitespace when looking past it for the
-      // marker run. Tolerate zero-width spaces (U+200B) — they crept in
-      // from the editor's empty-block placeholder (&#8203;) and shouldn't
-      // block marker drift just because the user saved past one.
-      const txt = typeof o?.["text"] === "string" ? (o["text"] as string) : null;
-      const isWhitespace = txt !== null && /^[\s​]*$/.test(txt);
-      if (isWhitespace) continue;
-      break;
+    if (isDriftableMarker(node) || isTsMilestone(node)) {
+      start = i;
+      continue;
     }
+    const o = node as Record<string, unknown> | null;
+    const txt = typeof o?.["text"] === "string" ? (o["text"] as string) : null;
+    if (txt !== null && /^[\s​]*$/.test(txt)) {
+      start = i;
+      continue;
+    }
+    break;
   }
-  return out;
+  return start;
 }
 
 // Inverse of extractTrailingMarkers: return verseObjects with their trailing
@@ -236,20 +283,18 @@ export function extractTrailingMarkers(verseObjects: unknown[] | undefined | nul
 // save diff (extractEditableText) needs the verse's full objects.
 export function stripTrailingMarkers(verseObjects: unknown[] | undefined | null): unknown[] {
   if (!Array.isArray(verseObjects)) return [];
-  let cut = verseObjects.length;
-  for (let i = verseObjects.length - 1; i >= 0; i--) {
-    const node = verseObjects[i];
-    if (isDriftableMarker(node)) {
-      cut = i;
-      continue;
-    }
-    const o = node as Record<string, unknown> | null;
-    const txt = typeof o?.["text"] === "string" ? (o["text"] as string) : null;
-    const isWhitespace = txt !== null && /^[\s​]*$/.test(txt);
-    if (isWhitespace) continue;
-    break;
-  }
-  return cut < verseObjects.length ? verseObjects.slice(0, cut) : verseObjects;
+  const start = trailingMarkerRunStart(verseObjects);
+  if (start >= verseObjects.length) return verseObjects;
+  // Drop ONLY the markers that actually drifted. The run can also hold a
+  // `\ts\*` chunk milestone, which does not drift and must still render in this
+  // verse — so this filters the run rather than truncating at `start`. (Prod
+  // stores Micah 4's tails as `\q1` then `\ts\*`: a plain `slice(0, start)` would
+  // delete the divider from the only verse that shows it.) Trailing whitespace in
+  // the run is inert either way; keeping it preserves the pre-existing spacing.
+  const kept = verseObjects.slice(start).filter((n) => !isDriftableMarker(n));
+  return kept.length === verseObjects.length - start
+    ? verseObjects
+    : [...verseObjects.slice(0, start), ...kept];
 }
 
 // Collapse editor whitespace so the diff baseline (extractEditableText)
@@ -286,7 +331,7 @@ export function extractEditableText(verseObjects: unknown): string {
       // not recursing) hid "Selah" from the diff baseline — an edit elsewhere in
       // the verse then dropped it, and deleting the token unaligned the verse.
       if (isInFlowMarker(v) && !isCharacterWrapper(v)) {
-        if (v["tag"] === "ts") {
+        if (isTsMilestone(v)) {
           parts.push("\\ts\\* ");
         } else {
           parts.push(`\\${v["tag"]} `);

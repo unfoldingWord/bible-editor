@@ -21,6 +21,7 @@ import { highlightsFor, renderEditableHTML, renderHighlightedHTML, type Highligh
 import { markHighlightSx } from "../lib/highlightStyles";
 import { extractEditableText, extractTrailingMarkers, stripTrailingMarkers, splitSectionHeaders, type SectionHeader } from "../lib/usfm";
 import { SectionHeaderBand } from "./SectionHeaderBand";
+import { DriftedMarkerBand, driftedMarkerTags } from "./DriftedMarkerBand";
 import { buildVerseIndex, formatVerseLabel, isFirstOfRange, isRangeRow } from "../lib/verseRange";
 import {
   classifySourceQuery,
@@ -1302,9 +1303,7 @@ function ActiveLine({
   // requires navigating to the previous verse (where the data lives).
   const driftedMarkers = useMemo<Array<{ tag: string }>>(() => {
     const prevVo = (prevContent as { verseObjects?: unknown[] } | null)?.verseObjects;
-    return extractTrailingMarkers(prevVo).map((n) => ({
-      tag: String((n as Record<string, unknown>)["tag"] ?? ""),
-    }));
+    return driftedMarkerTags(extractTrailingMarkers(prevVo));
   }, [prevContent]);
 
   // Stoplight role sets → render channels. undefined when neither neighbour
@@ -1451,42 +1450,7 @@ function ActiveLine({
       {editable && !readOnly && !rtl && (
         <ParagraphToolbar elRef={elRef} onEditPlain={onEditPlain} />
       )}
-      {driftedMarkers.length > 0 && !rtl && (
-        <Stack spacing={0} sx={{ mb: 0.25 }}>
-          {driftedMarkers.map((m, i) => (
-            <Tooltip
-              key={`drift-${i}`}
-              title={`from previous verse — edit there`}
-              placement="left"
-            >
-              <Box
-                sx={{
-                  display: "block",
-                  pl: m.tag === "q2" ? "2.5em" : m.tag === "q3" ? "3.75em" : m.tag === "q4" ? "5em" : m.tag.startsWith("q") ? "1.25em" : 0,
-                  fontSize: 11,
-                  opacity: 0.55,
-                  fontFamily: "Consolas, Menlo, monospace",
-                  color: "primary.main",
-                }}
-              >
-                <Box
-                  component="span"
-                  sx={{
-                    display: "inline-block",
-                    px: 0.5,
-                    border: "1px dashed",
-                    borderColor: "primary.main",
-                    borderRadius: 0.5,
-                    bgcolor: "rgba(49, 173, 227, 0.06)",
-                  }}
-                >
-                  {m.tag === "ts" ? "\\ts\\*" : `\\${m.tag}`}
-                </Box>
-              </Box>
-            </Tooltip>
-          ))}
-        </Stack>
-      )}
+      {!rtl && <DriftedMarkerBand markers={driftedMarkers} />}
       {rtl && lexiconMap ? (
         <Box
           data-find-cell={`${chapter}-${verseNum}-${bibleVersion}`}

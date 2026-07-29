@@ -1070,10 +1070,11 @@ function roundtripVerseUsfm(rawUsfm, sourceVO = null) {
   // attaches markers to the prior verse (before `\v`), but visually
   // they introduce the NEXT verse. The display layer drifts them down.
   {
-    const { extractTrailingMarkers } = await import("./usfm.ts");
+    const { extractTrailingMarkers, stripTrailingMarkers } = await import("./usfm.ts");
     // ZEC 9:8 shape: ends with milestones, then a trailing \ts\*, then \q1.
-    // \ts\* parses as `{tag:"ts", content:"\\*"}` (no `type` field) and
-    // is now treated as an in-flow marker — it drifts along with \q1.
+    // A `\ts\*` chunk divider marks a boundary AT its own position, so it never
+    // drifts — only the `\q1` does. The divider must still be transparent to the
+    // scan so the marker behind it is found either way round.
     const vo = [
       { type: "word", tag: "w", text: "Yahweh" },
       { type: "text", text: "!\n\n" },
@@ -1082,8 +1083,33 @@ function roundtripVerseUsfm(rawUsfm, sourceVO = null) {
     ];
     const trailing = extractTrailingMarkers(vo);
     assert(
-      trailing.length === 2 && trailing[0].tag === "ts" && trailing[1].tag === "q1",
-      `\\ts\\* + \\q1 both detected as trailing markers (got ${JSON.stringify(trailing)})`,
+      trailing.length === 1 && trailing[0].tag === "q1",
+      `\\q1 drifts and \\ts\\* does not (got ${JSON.stringify(trailing)})`,
+    );
+
+    // MIC 4 regression. Prod stores the tail the other way round — `\q1` then a
+    // `\ts\*` LAST — because usfm-js 3.5.0 writes the divider as {tag:"ts\\*"}.
+    // The old scan matched only the legacy {tag:"ts",content} shape, so it hit an
+    // unrecognized node, stopped, and returned nothing: MIC 4:2/4/6/9 lost their
+    // lookback band entirely. Both orders must now yield exactly the \q1.
+    const micTail = [
+      { type: "word", tag: "w", text: "afflicted" },
+      { type: "text", text: ".\n\n" },
+      { type: "quote", tag: "q1" },
+      { tag: "ts\\*" },
+    ];
+    const micDrift = extractTrailingMarkers(micTail);
+    assert(
+      micDrift.length === 1 && micDrift[0].tag === "q1",
+      `\\q1 still drifts when a real {tag:"ts\\\\*"} sits after it (got ${JSON.stringify(micDrift)})`,
+    );
+    // ...and the divider stays in the verse that owns it — stripping the drifted
+    // \q1 must not truncate the \ts\* away with it, or the only verse that renders
+    // the divider loses it.
+    const micKept = stripTrailingMarkers(micTail);
+    assert(
+      micKept.length === 3 && micKept[2].tag === "ts\\*" && !micKept.some((n) => n.tag === "q1"),
+      `strip drops the drifted \\q1 but keeps \\ts\\* in place (got ${JSON.stringify(micKept)})`,
     );
     // Multiple stacked trailing markers
     const vo2 = [
