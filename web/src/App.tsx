@@ -33,7 +33,7 @@ function parseHash(): Location {
 }
 
 function isDefaultLoc(l: Location): boolean {
-  return l.book === DEFAULT_BOOK && l.chapter === 1 && l.verse === 1;
+  return l.book === DEFAULT_BOOK && l.chapter === 1 && l.verse === 1 && l.commentId == null;
 }
 
 // Auth gate. The API requires a valid Access cookie for every write, so we

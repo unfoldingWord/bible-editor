@@ -22,6 +22,7 @@ import {
   List,
   ListItemButton,
   ListItemText,
+  CircularProgress,
 } from "@mui/material";
 import CloseIcon from "@mui/icons-material/Close";
 import type { CommentTarget, NewCommentDraft } from "./commentsTarget";
@@ -39,7 +40,7 @@ export interface CommentsPopoverProps {
   meUserId: number | null;
   canWrite: boolean;
   highlightCommentId: number | null;
-  busy?: boolean;
+  loading?: boolean;
   errorText?: string | null;
   onClose: () => void;
   onCreate: (draft: NewCommentDraft) => Promise<void>;
@@ -63,7 +64,7 @@ export function CommentsPopover({
   meUserId,
   canWrite,
   highlightCommentId,
-  busy = false,
+  loading = false,
   errorText = null,
   onClose,
   onCreate,
@@ -84,7 +85,20 @@ export function CommentsPopover({
     setActionError(null);
   }, [target.verse, target.rowKind, target.rowId]);
 
-  if (!open) return null;
+  // Escape closes, at the document level rather than only via the Paper's own
+  // onKeyDown. We deliberately don't trap focus, so focus is usually NOT inside
+  // the panel — on a deep-link arrival it's wherever the user left it — and a
+  // Paper-only handler would never see the key. The mention picker's own
+  // Escape handler stopPropagation()s, so it still gets first refusal and
+  // closes the picker before this ever closes the panel.
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [open, onClose]);
 
   return (
     <Popper
@@ -95,11 +109,29 @@ export function CommentsPopover({
         { name: "offset", options: { offset: [0, 8] } },
         { name: "preventOverflow", options: { padding: 8 } },
       ]}
+      popperOptions={{ strategy: "fixed" }}
       sx={{ zIndex: (t) => t.zIndex.modal }}
     >
-      <ClickAwayListener onClickAway={onClose}>
+      <ClickAwayListener
+        onClickAway={(event) => {
+          // A badge click for a DIFFERENT anchor lands outside this Paper's
+          // React tree, so without this guard onClickAway fires alongside the
+          // badge's own onOpen and React 18 batches them into a net "closed"
+          // — the user would have to click twice to move the popover. Badge
+          // buttons carry data-comments-badge so their clicks are excluded
+          // here; Shell's openComments handles same-anchor toggle-close.
+          const target = event.target;
+          if (target instanceof Element && target.closest("[data-comments-badge]")) return;
+          onClose();
+        }}
+      >
         <Paper
           elevation={8}
+          role="dialog"
+          aria-label={title}
+          onKeyDown={(e) => {
+            if (e.key === "Escape") onClose();
+          }}
           sx={{
             width: 440,
             maxHeight: "70vh",
@@ -150,7 +182,16 @@ export function CommentsPopover({
               // Only claim "none" when we actually know there are none. If the
               // load failed, errorText is already saying so and asserting
               // emptiness next to it is the exact confusion we're avoiding.
-              errorText ? null : (
+              // Same reasoning for a fetch still in flight: don't assert
+              // emptiness while we don't yet know.
+              errorText ? null : loading ? (
+                <Stack direction="row" spacing={1} alignItems="center">
+                  <CircularProgress size={16} />
+                  <Typography variant="caption" color="text.secondary">
+                    Loading…
+                  </Typography>
+                </Stack>
+              ) : (
                 <Typography variant="caption" color="text.disabled" sx={{ fontStyle: "italic" }}>
                   No comments yet.
                 </Typography>
@@ -164,7 +205,6 @@ export function CommentsPopover({
                   meUserId={meUserId}
                   canWrite={canWrite}
                   highlightCommentId={highlightCommentId}
-                  busy={busy}
                   onEdit={onEdit}
                   onResolve={onResolve}
                   onDelete={onDelete}
@@ -180,7 +220,6 @@ export function CommentsPopover({
               <Divider />
               <NewCommentComposer
                 mentionUsers={mentionUsers}
-                busy={busy}
                 onCreate={onCreate}
                 onError={setActionError}
               />
@@ -200,7 +239,6 @@ function ThreadView({
   meUserId,
   canWrite,
   highlightCommentId,
-  busy,
   onEdit,
   onResolve,
   onDelete,
@@ -212,7 +250,6 @@ function ThreadView({
   meUserId: number | null;
   canWrite: boolean;
   highlightCommentId: number | null;
-  busy: boolean;
   onEdit: (id: number, body: string) => Promise<void>;
   onResolve: (id: number, resolved: boolean) => Promise<void>;
   onDelete: (id: number) => Promise<void>;
@@ -233,7 +270,6 @@ function ThreadView({
         meUserId={meUserId}
         canWrite={canWrite}
         highlightCommentId={highlightCommentId}
-        busy={busy}
         onEdit={onEdit}
         onResolve={onResolve}
         onDelete={onDelete}
@@ -256,7 +292,6 @@ function ThreadView({
             meUserId={meUserId}
             canWrite={canWrite}
             highlightCommentId={highlightCommentId}
-            busy={busy}
             onEdit={onEdit}
             onResolve={onResolve}
             onDelete={onDelete}
@@ -269,7 +304,6 @@ function ThreadView({
           <ReplyComposer
             parentId={root.id}
             mentionUsers={mentionUsers}
-            busy={busy}
             onCreate={onCreate}
             onError={onError}
             onDone={() => setReplying(false)}
@@ -290,7 +324,6 @@ function CommentCard({
   meUserId,
   canWrite,
   highlightCommentId,
-  busy,
   onEdit,
   onResolve,
   onDelete,
@@ -304,7 +337,6 @@ function CommentCard({
   meUserId: number | null;
   canWrite: boolean;
   highlightCommentId: number | null;
-  busy: boolean;
   onEdit: (id: number, body: string) => Promise<void>;
   onResolve: (id: number, resolved: boolean) => Promise<void>;
   onDelete: (id: number) => Promise<void>;
@@ -314,6 +346,13 @@ function CommentCard({
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(comment.body);
   const [confirmingDelete, setConfirmingDelete] = useState(false);
+  // Local in-flight guard for this card's own mutations (save/resolve/delete).
+  // Local rather than a prop threaded from Shell so it can't get out of sync.
+  // The REF is what actually blocks a double-click: clicks landing in one tick
+  // all read the pre-render value of `pending`, so a state-only guard lets them
+  // all through. `pending` just drives the disabled styling.
+  const [pending, setPending] = useState(false);
+  const inFlight = useRef(false);
   const cardRef = useRef<HTMLDivElement | null>(null);
   const isHighlighted = comment.id === highlightCommentId;
   const isMine = comment.authorId === meUserId;
@@ -332,34 +371,60 @@ function CommentCard({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [highlightCommentId]);
 
+  // Resync the draft when the comment's body changes out from under us (e.g. a
+  // comment.updated WS event) — but only while not actively editing, so we
+  // never clobber text the user is mid-typing. Without this, editing after
+  // such an update would silently revert the newer body on save.
+  useEffect(() => {
+    if (!editing) setDraft(comment.body);
+  }, [comment.body, editing]);
+
   async function handleSave() {
+    if (inFlight.current) return;
     const body = draft.trim();
     if (!body) return;
+    inFlight.current = true;
+    setPending(true);
     try {
       await onEdit(comment.id, body);
       setEditing(false);
       onError(null);
     } catch {
       onError("Failed to save the edit. Your text is still here — try again.");
+    } finally {
+      inFlight.current = false;
+      setPending(false);
     }
   }
 
   async function handleResolveToggle() {
+    if (inFlight.current) return;
+    inFlight.current = true;
+    setPending(true);
     try {
       await onResolve(comment.id, !resolved);
       onError(null);
     } catch {
       onError(`Failed to ${resolved ? "reopen" : "resolve"} the thread.`);
+    } finally {
+      inFlight.current = false;
+      setPending(false);
     }
   }
 
   async function handleDelete() {
+    if (inFlight.current) return;
+    inFlight.current = true;
+    setPending(true);
     try {
       await onDelete(comment.id);
       onError(null);
     } catch {
       onError("Failed to delete the comment.");
       setConfirmingDelete(false);
+    } finally {
+      inFlight.current = false;
+      setPending(false);
     }
   }
 
@@ -418,7 +483,7 @@ function CommentCard({
             autoFocus
           />
           <Stack direction="row" spacing={1}>
-            <Button size="small" onClick={handleSave} disabled={!draft.trim() || busy}>
+            <Button size="small" onClick={handleSave} disabled={!draft.trim() || pending}>
               Save
             </Button>
             <Button
@@ -453,14 +518,14 @@ function CommentCard({
       {!editing && (
         <Stack direction="row" spacing={1} sx={{ mt: 0.5 }}>
           {canWrite && kind !== null && (
-            <Button size="small" onClick={handleResolveToggle} disabled={busy}>
+            <Button size="small" onClick={handleResolveToggle} disabled={pending}>
               {resolved ? "Reopen" : "Resolve"}
             </Button>
           )}
           {extraActions}
           {isMine && canWrite && (
             <>
-              <Button size="small" onClick={() => setEditing(true)} disabled={busy}>
+              <Button size="small" onClick={() => setEditing(true)} disabled={pending}>
                 Edit
               </Button>
               {confirmingDelete ? (
@@ -468,7 +533,7 @@ function CommentCard({
                   <Typography variant="caption" sx={{ alignSelf: "center" }}>
                     Delete?
                   </Typography>
-                  <Button size="small" color="error" onClick={handleDelete} disabled={busy}>
+                  <Button size="small" color="error" onClick={handleDelete} disabled={pending}>
                     Yes
                   </Button>
                   <Button size="small" onClick={() => setConfirmingDelete(false)}>
@@ -476,7 +541,7 @@ function CommentCard({
                   </Button>
                 </>
               ) : (
-                <Button size="small" onClick={() => setConfirmingDelete(true)} disabled={busy}>
+                <Button size="small" onClick={() => setConfirmingDelete(true)} disabled={pending}>
                   Delete
                 </Button>
               )}
@@ -493,23 +558,27 @@ function CommentCard({
 function ReplyComposer({
   parentId,
   mentionUsers,
-  busy,
   onCreate,
   onError,
   onDone,
 }: {
   parentId: number;
   mentionUsers: MentionUser[];
-  busy: boolean;
   onCreate: (draft: NewCommentDraft) => Promise<void>;
   onError: (msg: string | null) => void;
   onDone: () => void;
 }) {
   const [body, setBody] = useState("");
+  // Local in-flight guard — see the identical comment on CommentCard.
+  const [pending, setPending] = useState(false);
+  const inFlight = useRef(false);
 
   async function handleSend() {
+    if (inFlight.current) return;
     const trimmed = body.trim();
     if (!trimmed) return;
+    inFlight.current = true;
+    setPending(true);
     try {
       // kind is ignored server-side for replies (inherits the root's kind).
       await onCreate({ kind: "note", body: trimmed, parentId });
@@ -518,6 +587,9 @@ function ReplyComposer({
       onDone();
     } catch {
       onError("Failed to post the reply. Your text is still here — try again.");
+    } finally {
+      inFlight.current = false;
+      setPending(false);
     }
   }
 
@@ -533,7 +605,7 @@ function ReplyComposer({
         placeholder="Write a reply…"
       />
       <Stack direction="row" spacing={1}>
-        <Button size="small" variant="contained" onClick={handleSend} disabled={!body.trim() || busy}>
+        <Button size="small" variant="contained" onClick={handleSend} disabled={!body.trim() || pending}>
           Send
         </Button>
         <Button size="small" onClick={onDone}>
@@ -548,27 +620,39 @@ function ReplyComposer({
 
 function NewCommentComposer({
   mentionUsers,
-  busy,
   onCreate,
   onError,
 }: {
   mentionUsers: MentionUser[];
-  busy: boolean;
   onCreate: (draft: NewCommentDraft) => Promise<void>;
   onError: (msg: string | null) => void;
 }) {
   const [kind, setKind] = useState<CommentKind>("question");
   const [body, setBody] = useState("");
+  // Local in-flight guard — see the identical comment on CommentCard.
+  const [pending, setPending] = useState(false);
+  const inFlight = useRef(false);
 
   async function handlePost() {
+    // The ref, not the state, is what actually prevents a double post: several
+    // clicks in one tick all observe the pre-render value of `pending`, so
+    // guarding on state lets every one of them through and posts duplicates
+    // (verified — three fast clicks created three comments). The state exists
+    // only to disable the button visually once React re-renders.
+    if (inFlight.current) return;
     const trimmed = body.trim();
     if (!trimmed) return;
+    inFlight.current = true;
+    setPending(true);
     try {
       await onCreate({ kind, body: trimmed });
       onError(null);
       setBody("");
     } catch {
       onError("Failed to post the comment. Your text is still here — try again.");
+    } finally {
+      inFlight.current = false;
+      setPending(false);
     }
   }
 
@@ -595,7 +679,7 @@ function NewCommentComposer({
         size="small"
         variant="contained"
         onClick={handlePost}
-        disabled={!body.trim() || busy}
+        disabled={!body.trim() || pending}
         sx={{ alignSelf: "flex-start" }}
       >
         Post

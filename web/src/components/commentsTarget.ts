@@ -16,6 +16,12 @@ export function targetsMatch(a: CommentTarget | null, b: CommentTarget | null): 
   return a.verse === b.verse && a.rowKind === b.rowKind && a.rowId === b.rowId;
 }
 
+// A stable string identity for a target, for use as a React `key` so a
+// popover remounts (clearing composer/edit state) when it re-targets.
+export function targetKey(target: CommentTarget): string {
+  return `${target.verse}/${target.rowKind ?? ""}/${target.rowId ?? ""}`;
+}
+
 // What a badge needs to open a popover: the anchor element it was clicked from,
 // plus what it's anchored to.
 export type OpenCommentsFn = (anchorEl: HTMLElement, target: CommentTarget) => void;

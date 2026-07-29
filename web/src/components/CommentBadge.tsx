@@ -49,6 +49,7 @@ export function CommentBadge({
       size="small"
       disabled={disabled}
       onClick={(e) => onOpen(e.currentTarget)}
+      data-comments-badge="1"
       sx={{ p: 0.25, color, opacity, gap: 0.25 }}
     >
       {icon}

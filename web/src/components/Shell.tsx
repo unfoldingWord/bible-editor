@@ -29,6 +29,7 @@ import { useComments } from "../hooks/useComments";
 import { countThreads, rowKey, type CommentThread } from "../lib/commentsIndex";
 import { CommentsPopover } from "./CommentsPopover";
 import type { CommentTarget, NewCommentDraft, OpenCommentsFn } from "./commentsTarget";
+import { targetKey, targetsMatch } from "./commentsTarget";
 import {
   indexLaneChecks,
   laneKey,
@@ -163,14 +164,18 @@ function saveToStorage<T>(key: string, value: T) {
 // consume so a later same-location mount doesn't re-grab a stale note.
 let pendingNoteJump: { book: string; chapter: number; noteId: string } | null = null;
 
-// Same carry, for a comment deep link. Set this just before navigating when you
-// need to land on a specific comment thread and the destination can't be
-// expressed in the hash (or you don't want a `?c=` in the URL at all); the
-// freshly-arrived Shell consumes it once that chapter's comments have loaded,
-// then clears it so a later mount at the same location doesn't re-grab a stale
-// thread. `?c=<id>` (via the initialCommentId prop) is the other, URL-borne
-// entry point — both feed the one consumer effect below.
-let pendingCommentJump: { book: string; chapter: number; commentId: number } | null = null;
+// Strip only the `c=<id>` query param from a hash, preserving any other
+// params and repairing the `?`/`&` separator — so `#/X/1/2?c=1&y=2` becomes
+// `#/X/1/2?y=2` rather than leaving a dangling `&y=2`.
+function stripCommentParam(hash: string): string {
+  const qIdx = hash.indexOf("?");
+  if (qIdx === -1) return hash;
+  const base = hash.slice(0, qIdx);
+  const params = new URLSearchParams(hash.slice(qIdx + 1));
+  params.delete("c");
+  const rest = params.toString();
+  return rest ? `${base}?${rest}` : base;
+}
 
 // Stable empty list so the popover's `threads` prop doesn't churn identity while
 // a target has no threads yet.
@@ -270,6 +275,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   const commentsEnabled = !isReadOnly();
   const {
     index: commentsIndex,
+    loading: commentsLoading,
     error: commentsError,
     addComment,
     editComment,
@@ -354,9 +360,20 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // lands centred-right instead.
   const [commentFallbackAnchor, setCommentFallbackAnchor] = useState<HTMLElement | null>(null);
 
+  // Toggle-close when the incoming click targets the same anchor that's
+  // already open (a second click on the same badge), otherwise re-anchor to
+  // the new target. This — combined with CommentsPopover's click-away
+  // ignoring clicks on badge buttons — is what lets clicking a DIFFERENT
+  // badge move the popover there in a single click instead of just closing it.
   const openComments: OpenCommentsFn = useCallback((anchorEl, target) => {
-    setCommentAnchor(anchorEl);
-    setCommentTarget(target);
+    setCommentTarget((prevTarget) => {
+      if (prevTarget && targetsMatch(prevTarget, target)) {
+        setCommentAnchor(null);
+        return null;
+      }
+      setCommentAnchor(anchorEl);
+      return target;
+    });
   }, []);
 
   const closeComments = useCallback(() => {
@@ -1827,24 +1844,34 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     setScrollNonce((n) => n + 1);
   }, [data, book, chapter]);
 
-  // Consume a comment deep link — either `?c=<id>` in the hash (initialCommentId)
-  // or a pendingCommentJump stashed before navigating. Waits for this chapter's
-  // comments to load and for that id to actually be present, then selects the
-  // comment's verse, opens the popover on its anchor and highlights it. Runs
-  // AFTER the per-chapter reset effect above in source order, so the reset's
-  // setActiveVerse(initialVerse) can't clobber the jump on the same navigation.
-  // The consumed id is remembered so dismissing the popover doesn't re-open it.
-  const consumedCommentIdRef = useRef<number | null>(null);
+  // Consume a comment deep link — `?c=<id>` in the hash (initialCommentId).
+  // Waits for this chapter's comments to load and for that id to actually be
+  // present, then selects the comment's verse, opens the popover on its
+  // anchor and highlights it. Runs AFTER the per-chapter reset effect above in
+  // source order, so the reset's setActiveVerse(initialVerse) can't clobber
+  // the jump on the same navigation. The consumed key is remembered (keyed by
+  // book/chapter, not just id) so dismissing the popover doesn't re-open it.
+  const consumedCommentKeyRef = useRef<string | null>(null);
+
+  // Clearing the marker when the URL stops carrying `?c=` is what lets the SAME
+  // alert link be clicked twice. Keying the marker alone isn't enough: leaving
+  // the chapter and coming back rebuilds the identical key, so the second
+  // arrival was silently dropped and `?c=` was left stranded in the URL
+  // (verified). Since we strip the param immediately after consuming, its
+  // absence is exactly the signal that the previous jump is finished; the
+  // marker still guards the window before the hash actually updates, where a
+  // commentsIndex change could otherwise re-run the effect.
   useEffect(() => {
-    const jump = pendingCommentJump;
-    const wanted =
-      jump && jump.book === book && jump.chapter === chapter ? jump.commentId : initialCommentId;
-    if (wanted == null) return;
-    if (consumedCommentIdRef.current === wanted) return;
-    const comment = commentsIndex.byId.get(wanted);
+    if (initialCommentId == null) consumedCommentKeyRef.current = null;
+  }, [initialCommentId]);
+
+  useEffect(() => {
+    if (initialCommentId == null) return;
+    const key = `${book}/${chapter}/${initialCommentId}`;
+    if (consumedCommentKeyRef.current === key) return;
+    const comment = commentsIndex.byId.get(initialCommentId);
     if (!comment) return; // still loading, or belongs to another chapter
-    consumedCommentIdRef.current = wanted;
-    pendingCommentJump = null;
+    consumedCommentKeyRef.current = key;
     setActiveVerse(comment.verse);
     setActiveNoteId(comment.rowKind === "tn" ? comment.rowId : null);
     setCommentAnchor(null); // no clicked element — falls back to the centred anchor
@@ -1858,7 +1885,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     // Drop the `?c=` so a refresh (or a later navigation back here) doesn't
     // re-jump. replaceState, so it doesn't add a history entry.
     if (location.hash.includes("c=")) {
-      history.replaceState(null, "", location.hash.replace(/[?&]c=\d+/, ""));
+      history.replaceState(null, "", stripCommentParam(location.hash));
     }
   }, [commentsIndex, book, chapter, initialCommentId]);
 
@@ -3377,6 +3404,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       />
       {commentTarget && (
         <CommentsPopover
+          key={targetKey(commentTarget)}
           open
           anchorEl={commentAnchor ?? commentFallbackAnchor}
           target={commentTarget}
@@ -3385,6 +3413,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           meUserId={meUserId}
           canWrite={commentsEnabled}
           highlightCommentId={highlightCommentId}
+          loading={commentsLoading}
           errorText={
             commentsError ? "Comments unavailable — could not load them for this chapter." : null
           }
