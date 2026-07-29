@@ -29,9 +29,12 @@
   is which. For teardown, see worktree-cleanup.ps1 -- this script never writes.
 
 .MODES
-  (default)  Human-readable table.
-  -Json      Emit JSON (same data) for scripting.
+  (default)  Human-readable table, plus a trailing list of unregistered
+             (on-disk-only) worktree directories.
+  -Json      Emit the registered worktrees as JSON, for scripting. Does NOT
+             include the unregistered-directories section.
   -NoPr      Skip the `gh` call (faster, or when offline / gh unauthenticated).
+             Rows then read "PR ?" rather than asserting "no PR".
 #>
 #requires -Version 7
 # pwsh 7+ only, and NOT a formality: under Windows PowerShell 5.1 the
