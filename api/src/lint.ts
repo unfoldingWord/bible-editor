@@ -270,10 +270,12 @@ function hasGluedMilestone(nodes: unknown[]): boolean {
 // `\ts\*` still has no paragraph and must still flag. Character wrappers
 // (`\qs Selah\qs*`) are also `type:"quote"` but carry verse CONTENT rather than
 // a break — they're excluded by the tag-set test, since `qs` isn't in the set.
+// `b` is DELIBERATELY absent, unlike PARAGRAPH_TAGS: `\b` is a blank line, not a
+// paragraph opener, so a chapter whose front matter ends in `\b` still needs a
+// real `\p`/`\q` and must keep flagging.
 const CHAPTER_OPENING_TAGS: ReadonlySet<string> = new Set([
   "p", "m", "mi", "nb", "pi", "pi1", "pi2", "pi3", "pc",
   "q", "q1", "q2", "q3", "q4", "qm", "qm1", "qm2", "qm3",
-  "b",
 ]);
 
 function isChapterOpeningMarker(node: unknown): boolean {

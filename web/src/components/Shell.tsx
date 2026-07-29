@@ -44,6 +44,7 @@ import { ChapterBoard } from "./ChapterBoard";
 import { drafts, verseKey } from "../sync/drafts";
 import { smartEditVerse } from "../lib/replace";
 import { extractEditableText, extractPlainText, normalizeEditable, SECTION_HEADER_TAGS } from "../lib/usfm";
+import { introEditBase } from "../lib/verseIntro";
 import { verseHasUnalignedWork, countUnalignedTargetWords } from "../lib/alignment";
 import {
   analyzeAlignmentDelta,
@@ -3436,12 +3437,19 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
             const payload = rec?.payload as { plainText?: string } | undefined;
             const plain = payload?.plainText;
             if (typeof plain !== "string") return;
-            const base =
+            const cached =
               ch === chapter
                 ? data?.verses[bv]?.[v]
                 : bookHook?.chapters.get(ch)?.kind === "ready"
                   ? (bookHook.chapters.get(ch) as { kind: "ready"; data: { verses: Record<string, Record<number, VerseDto>> } }).data.verses[bv]?.[v]
                   : undefined;
+            // A chapter-intro draft can exist before its row does (#379). Falling
+            // back to the create-on-save base matters here specifically: without
+            // it this handler returned early, so the "unsaved edits" toast offered
+            // a Save button that silently did nothing and left the draft stranded
+            // — the dirty border and SyncStatusBar entry that saveVerseDraft's own
+            // no-op guard goes out of its way to avoid.
+            const base = introEditBase(cached, b, ch, v, bv);
             if (!base) return;
             saveVerseDraft(ch, v, bv, plain, base);
           });

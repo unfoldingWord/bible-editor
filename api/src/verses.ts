@@ -259,6 +259,22 @@ verses.patch("/:book/:chapter/:verse/:bibleVersion", requireEditor, async (c) =>
   // legal for verse 0 only, unsafe marker tags rejected, pipeline lock honoured).
   if (!existing) {
     if (verse !== 0 || expected !== 0) return c.json({ error: "not_found" }, 404);
+    // The chapter must already exist in this resource. On the UPDATE path "the row
+    // is there" implicitly proved the reference was real; a create has no such
+    // proof, and book/chapter come straight off the URL. Without this probe an
+    // editor could PATCH /api/verses/MIC/999/0/ULT and mint a row that the nightly
+    // export renders as a genuine `\c 999` in the DCS commit (exportWorkflow reads
+    // every verse row for the book, in chapter order). Requiring a sibling verse in
+    // the same (book, chapter, bible_version) closes both the bogus-chapter and
+    // bogus-book cases without a canon table.
+    const sibling = await c.env.DB.prepare(
+      `SELECT 1 AS ok FROM verses
+         WHERE book = ?1 AND chapter = ?2 AND bible_version = ?3 AND verse > 0
+         LIMIT 1`,
+    )
+      .bind(book, chapter, bibleVersion)
+      .first<{ ok: number }>();
+    if (!sibling) return c.json({ error: "not_found", reason: "unknown_chapter" }, 404);
     const userId = currentUserId(c);
     const now = Math.floor(Date.now() / 1000);
     const rowKey = `${book}/${chapter}/${verse}/${bibleVersion}`;
@@ -280,16 +296,22 @@ verses.patch("/:book/:chapter/:verse/:bibleVersion", requireEditor, async (c) =>
           )
           .bind(rowKey, book, userId, JSON.stringify(parsed.data)),
       ]);
-    } catch {
-      // Primary-key collision: a concurrent create landed first. Report it as a
-      // version conflict against the row that won so the client re-reads and
-      // retries, matching the 409 contract the outbox already handles.
+    } catch (err) {
+      // A concurrent create landed first, so the primary key rejected ours. Report
+      // it as a version conflict against the row that won, which sends the client
+      // through the same re-read-and-retry path a normal verse 409 uses (the
+      // outbox's silent auto-heal is row-only, so this surfaces the merge prompt).
+      //
+      // Re-probe rather than pattern-match the driver's error string: if the row is
+      // now there, a racing create is the only thing that could have put it there,
+      // and if it is NOT there the failure was something else (transient D1 error)
+      // and must keep propagating as a 5xx instead of being reported as a conflict.
       const fresh = await c.env.DB.prepare(
         `SELECT * FROM verses WHERE book = ?1 AND chapter = ?2 AND verse = ?3 AND bible_version = ?4`,
       )
         .bind(book, chapter, verse, bibleVersion)
         .first<VerseRow>();
-      if (!fresh) throw new Error("verse_create_failed");
+      if (!fresh) throw err;
       let freshParsed: unknown;
       try {
         freshParsed = parseVerseContentJson(fresh);

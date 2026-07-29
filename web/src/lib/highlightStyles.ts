@@ -117,8 +117,9 @@ function paragraphLayoutSx(mode: Mode) {
     // rule across them interrupts the reading line far more than the boundary
     // warrants; the small marker alone is enough to place the chunk. Kept at a
     // real secondary text colour rather than a disabled grey — "quiet" must not
-    // mean "makes people squint". Book mode overrides this (bookTsDividerSx):
-    // there the verses are grid rows, so a line straight across earns its keep.
+    // mean "makes people squint". Book mode restates this block (bookTsDividerSx)
+    // to get the same look WITHOUT the `.be-ts-quiet` hide below, because it draws
+    // the divider on a verse you are not editing by design.
     "& div.be-ts": {
       display: "block",
       margin: "0.5em 0 0.35em",

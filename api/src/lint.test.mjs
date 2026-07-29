@@ -221,6 +221,15 @@ t("\\ts\\* alone does not count as an opening marker", () => {
   const i = lintChapterOpeningMarkers(chapterRows("\\c 1\n\\ts\\*\n\\v 1 word\n"));
   assert.equal(i.length, 1);
 });
+t("a front row ending in \\b still flags (blank line is not a paragraph opener)", () => {
+  const rows = [
+    { book: "MIC", chapter: 1, verse: 0, verse_end: null, bible_version: "ULT", version: 1,
+      content_json: JSON.stringify({ verseObjects: [{ type: "paragraph", tag: "b" }] }) },
+    { book: "MIC", chapter: 1, verse: 1, verse_end: null, bible_version: "ULT", version: 1,
+      content_json: JSON.stringify({ verseObjects: [{ type: "text", text: "word" }] }) },
+  ];
+  assert.equal(lintChapterOpeningMarkers(rows).length, 1);
+});
 t("chapter with no verse 1 is not judged", () => {
   const rows = chapterRows("\\c 1\n\\p\n\\v 1 word\n").filter((r) => r.verse !== 1);
   assert.equal(lintChapterOpeningMarkers(rows).length, 0);

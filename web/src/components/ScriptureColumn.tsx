@@ -20,6 +20,7 @@ import type { ChapterState } from "../hooks/useBook";
 import { highlightsFor, renderEditableHTML, renderHighlightedHTML, type HighlightKey, type ReorderHighlight } from "../lib/highlight";
 import { markHighlightSx } from "../lib/highlightStyles";
 import { extractEditableText, extractTrailingMarkers, stripTrailingMarkers, splitSectionHeaders, type SectionHeader } from "../lib/usfm";
+import { introEditBase } from "../lib/verseIntro";
 import { SectionHeaderBand } from "./SectionHeaderBand";
 import { CommentBadge } from "./CommentBadge";
 import type { CommentCounts } from "../lib/commentsIndex";
@@ -180,40 +181,6 @@ const EMPTY_COMMENT_COUNTS: CommentCounts = { openQuestions: 0, notes: 0, total:
 
 const INTRO_TOOLTIP =
   "Chapter intro — chapter-level translation notes, Psalm superscriptions (\\d), and the paragraph / poetry markers that introduce verse 1.";
-
-// Editing base for the chapter-intro row when D1 has no row for it (#379).
-// A chapter whose source USFM carried no opening `\p`/`\q1` never got a verse-0
-// row at import (observed: MIC 5 ULT, MIC 2 UST), so there is nothing to edit and
-// the missing marker that lintChapterOpeningMarkers flags could not be added.
-// `version: 0` is the create assertion the API requires ("I expect no row here"),
-// and it flows through unchanged as the outbox's If-Match, so a row that appears
-// underneath us comes back a 409 rather than an overwrite.
-//
-// Intro only, and only for the editable translations — a synthetic base for a real
-// verse would let the UI invent scripture the source doesn't have.
-function introEditBase(
-  dto: VerseDto | undefined,
-  book: string | undefined,
-  chapter: number,
-  verse: number,
-  bibleVersion: string,
-): VerseDto | undefined {
-  if (dto) return dto;
-  if (verse !== 0 || !book) return undefined;
-  if (bibleVersion !== "ULT" && bibleVersion !== "UST") return undefined;
-  return {
-    book,
-    chapter,
-    verse: 0,
-    verse_end: null,
-    bible_version: bibleVersion,
-    plain_text: "",
-    version: 0,
-    updated_by: null,
-    updated_at: 0,
-    content: { verseObjects: [] },
-  };
-}
 
 const BookView = lazy(() =>
   import("./BookView").then((m) => ({ default: m.BookView })),
