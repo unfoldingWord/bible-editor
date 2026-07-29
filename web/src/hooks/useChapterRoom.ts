@@ -8,7 +8,7 @@
 
 import { useEffect, useRef } from "react";
 import { openChapterRoom } from "../sync/wsClient";
-import type { TnRow, TqRow, TwlRow, VerseDto, VerseStatus, LaneCheckState, VerseLaneCheck, CheckLane, TwlOrderLock } from "../sync/api";
+import type { TnRow, TqRow, TwlRow, VerseDto, VerseStatus, LaneCheckState, VerseLaneCheck, CheckLane, TwlOrderLock, CommentDto } from "../sync/api";
 
 type RowKind = "tn" | "tq" | "twl";
 type AnyRow = TnRow | TqRow | TwlRow;
@@ -33,6 +33,7 @@ interface WireEvent {
   // fails at runtime.
   verseNum?: number;
   lock?: TwlOrderLock | null;
+  comment?: CommentDto;
 }
 
 export interface UseChapterRoomHandlers {
@@ -49,6 +50,9 @@ export interface UseChapterRoomHandlers {
   // An AI pipeline wrote rows into this chapter out of band — the row list is
   // stale. Optional: tabs that don't care (or aren't this chapter) can ignore it.
   onPipelineApplied?: (book: string, chapter: number, pipelineType: string) => void;
+  // A comment was created, edited, resolved, or deleted (soft) by any tab.
+  // Optional: tabs without a comments UI mounted can ignore it.
+  onCommentUpdate?: (comment: CommentDto) => void;
 }
 
 export function useChapterRoom(
@@ -84,6 +88,10 @@ export function useChapterRoom(
         }
         if (ev.type === "lane_check.updated" && ev.check) {
           handlersRef.current.onLaneCheckUpdate(ev.check);
+          return;
+        }
+        if (ev.type === "comment.updated" && ev.comment) {
+          handlersRef.current.onCommentUpdate?.(ev.comment);
           return;
         }
         if (ev.type === "lane_check.bulk" && ev.lane && Array.isArray(ev.checks)) {

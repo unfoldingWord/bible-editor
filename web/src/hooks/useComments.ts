@@ -17,6 +17,7 @@ export function useComments(
   comments: CommentDto[];
   index: CommentsIndex;
   loading: boolean;
+  loadedKey: string;
   error: boolean;
   addComment: (input: NewCommentInput) => Promise<CommentDto>;
   editComment: (id: number, body: string) => Promise<void>;
@@ -147,6 +148,13 @@ export function useComments(
     comments,
     index,
     loading,
+    // The (book, chapter) this loaded set belongs to, so a caller can tell
+    // "this chapter's fetch has settled and really has no comments" from
+    // "we haven't fetched this chapter yet". `loading` alone can't: it stays
+    // false from the previous chapter until this chapter's effect runs, while
+    // `comments` is already empty — a window in which an absent comment looks
+    // deleted rather than not-yet-loaded.
+    loadedKey: loaded.key,
     error,
     addComment,
     editComment,

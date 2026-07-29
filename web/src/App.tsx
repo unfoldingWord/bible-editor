@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Alert, Box, Button, CircularProgress, Link, Snackbar, Stack, Typography } from "@mui/material";
 import { Shell } from "./components/Shell";
 import { useBook } from "./hooks/useBook";
@@ -14,12 +14,7 @@ import {
   type Role,
 } from "./sync/api";
 import { setPipelineUser } from "./sync/pipelineStore";
-
-interface Location {
-  book: string;
-  chapter: number;
-  verse: number;
-}
+import { parseHashString, stripCommentParam, type Location } from "./lib/parseHash";
 
 // OBA (Obadiah) is the shortest book in the canon — one chapter, 21 verses.
 // Loads faster than ZEC on a cold cache and keeps the default landing page
@@ -34,17 +29,11 @@ const DEFAULT_BOOK = "OBA";
 const SIGNED_OUT_KEY = "bible-editor.signed_out";
 
 function parseHash(): Location {
-  const m = location.hash.match(/^#\/?([A-Za-z0-9]+)(?:\/(\d+))?(?:\/(\d+))?/);
-  if (!m) return { book: DEFAULT_BOOK, chapter: 1, verse: 1 };
-  return {
-    book: m[1].toUpperCase(),
-    chapter: m[2] ? parseInt(m[2], 10) : 1,
-    verse: m[3] ? parseInt(m[3], 10) : 1,
-  };
+  return parseHashString(location.hash, DEFAULT_BOOK);
 }
 
 function isDefaultLoc(l: Location): boolean {
-  return l.book === DEFAULT_BOOK && l.chapter === 1 && l.verse === 1;
+  return l.book === DEFAULT_BOOK && l.chapter === 1 && l.verse === 1 && l.commentId == null;
 }
 
 // Auth gate. The API requires a valid Access cookie for every write, so we
@@ -175,6 +164,18 @@ export function App() {
   }, []);
 
   useEffect(() => onAuthError(() => setSessionExpired(true)), []);
+
+  // Shell has acted on a `?c=<id>` deep link. Clear it from the URL AND from
+  // our own state: replaceState fires no hashchange, so the hashchange listener
+  // above will never observe the removal, and leaving `loc.commentId` set both
+  // blocked a repeat click on the same alert link and kept isDefaultLoc false
+  // for the rest of the session.
+  const handleCommentConsumed = useCallback(() => {
+    setLoc((prev) => (prev.commentId == null ? prev : { ...prev, commentId: undefined }));
+    if (location.hash.includes("c=")) {
+      history.replaceState(null, "", stripCommentParam(location.hash));
+    }
+  }, []);
 
   const navigate = (book: string, chapter: number, verse?: number) => {
     location.hash =
@@ -351,15 +352,29 @@ export function App() {
               {a.linkUrl && (
                 <>
                   {" — "}
-                  <Link
-                    href={a.linkUrl}
-                    target="_blank"
-                    rel="noopener"
-                    color="inherit"
-                    underline="always"
-                  >
-                    view run
-                  </Link>
+                  {a.linkUrl.startsWith("/#/") ? (
+                    <Link
+                      href={a.linkUrl}
+                      onClick={(e) => {
+                        e.preventDefault();
+                        location.hash = a.linkUrl!.slice(2);
+                      }}
+                      color="inherit"
+                      underline="always"
+                    >
+                      go to comment
+                    </Link>
+                  ) : (
+                    <Link
+                      href={a.linkUrl}
+                      target="_blank"
+                      rel="noopener"
+                      color="inherit"
+                      underline="always"
+                    >
+                      view run
+                    </Link>
+                  )}
                 </>
               )}
             </Alert>
@@ -382,6 +397,8 @@ export function App() {
           bookHook={bookHook}
           onLogout={handleSignOut}
           meUserId={auth.kind === "ready" ? auth.me?.userId ?? null : null}
+          initialCommentId={loc.commentId}
+          onCommentConsumed={handleCommentConsumed}
         />
       </Box>
       <Snackbar

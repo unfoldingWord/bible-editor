@@ -23,8 +23,13 @@ import { useAiDrafts } from "../hooks/useAiDrafts";
 import { useTwlFilters } from "../hooks/useTwlFilters";
 import { useUnsavedGuard } from "../hooks/useUnsavedGuard";
 import { outbox } from "../sync/outbox";
-import { api, CHECK_LANES } from "../sync/api";
-import type { BookLintIssue, ChapterPayload, CheckLane, TnRow, TqRow, TwlRow, VerseDto, TwlSuggestion } from "../sync/api";
+import { api, CHECK_LANES, isReadOnly } from "../sync/api";
+import type { BookLintIssue, ChapterPayload, CheckLane, TnRow, TqRow, TwlRow, VerseDto, TwlSuggestion, CommentRowKind, MentionUser } from "../sync/api";
+import { useComments } from "../hooks/useComments";
+import { countThreads, rowKey, type CommentThread } from "../lib/commentsIndex";
+import { CommentsPopover } from "./CommentsPopover";
+import type { CommentTarget, NewCommentDraft, OpenCommentsFn } from "./commentsTarget";
+import { targetKey, targetsMatch } from "./commentsTarget";
 import {
   indexLaneChecks,
   laneKey,
@@ -159,6 +164,10 @@ function saveToStorage<T>(key: string, value: T) {
 // consume so a later same-location mount doesn't re-grab a stale note.
 let pendingNoteJump: { book: string; chapter: number; noteId: string } | null = null;
 
+// Stable empty list so the popover's `threads` prop doesn't churn identity while
+// a target has no threads yet.
+const EMPTY_COMMENT_THREADS: CommentThread[] = [];
+
 interface Props {
   book: string;
   chapter: number;
@@ -168,9 +177,16 @@ interface Props {
   onLogout?: () => void;
   // Current signed-in user id, for the checkoff lane shading (you vs others).
   meUserId?: number | null;
+  // Comment id from a `?c=<id>` deep link (e.g. a mention alert). Consumed once
+  // that chapter's comments have loaded — see the consumer effect below.
+  initialCommentId?: number;
+  // Called once Shell has acted on `initialCommentId`. App owns the URL, so it
+  // clears both the `?c=` param and its own location state — Shell rewriting
+  // the hash itself fired no hashchange, leaving App's state stale.
+  onCommentConsumed?: () => void;
 }
 
-export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, onLogout, meUserId = null }: Props) {
+export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, onLogout, meUserId = null, initialCommentId, onCommentConsumed }: Props) {
   // tw_link → article title, for canonical (headword-anchored) TWL ordering.
   // handleAddTwlSuggestion below places a NEW link at its canonical slot and
   // persists a matching sort_order, so it must order with the SAME inputs the
@@ -241,6 +257,25 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     [book, chapter, applyLocalTwlOrderLock],
   );
 
+  // ── Internal comments ──
+  // Gated on !isReadOnly(): the whole comments module is requireEditor
+  // server-side, so a viewer would take a 403 on every chapter change. Viewers
+  // therefore see no comment badges at all, which is the intended behaviour.
+  // Declared above useChapterRoom because that hook's handler object wires
+  // applyWsComment straight through.
+  const commentsEnabled = !isReadOnly();
+  const {
+    index: commentsIndex,
+    loading: commentsLoading,
+    loadedKey: commentsLoadedKey,
+    error: commentsError,
+    addComment,
+    editComment,
+    setResolved: setCommentResolved,
+    removeComment,
+    applyWsComment,
+  } = useComments(book, chapter, commentsEnabled);
+
   // Live cross-tab updates. The server broadcasts row writes via the
   // ChapterRoom DO; we dedupe by version so the originating user's tab
   // (whose state was already updated by the PATCH response) is a no-op.
@@ -297,6 +332,9 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     onTwlOrderLockUpdate: (verse, lock) => {
       applyLocalTwlOrderLock(verse, lock);
     },
+    // applyWsComment is a stable useCallback, so passing it straight through is
+    // safe even though this handlers object isn't memoized.
+    onCommentUpdate: applyWsComment,
     onPipelineApplied: (_book, _chapter, pipelineType) => {
       // This socket only carries events for the chapter in view, so any hint
       // that arrives is for the open chapter — offer a refresh. Covers
@@ -304,6 +342,163 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       promptRefreshRef.current(pipelineType);
     },
   });
+  // Which verse / row the popover is showing, and the element it hangs off.
+  // One object: the popover's anchor element and what it's anchored to always
+  // change together, and splitting them meant one updater had to set the other.
+  const [commentPanel, setCommentPanel] = useState<{
+    anchor: HTMLElement | null;
+    target: CommentTarget | null;
+  }>({ anchor: null, target: null });
+  const commentTarget = commentPanel.target;
+  const commentAnchor = commentPanel.anchor;
+  const [highlightCommentId, setHighlightCommentId] = useState<number | null>(null);
+  // A deep-linked comment arrives with no clicked element to hang off, and a
+  // Popper with a null anchorEl renders in the top-left corner. This zero-size
+  // fixed element (always mounted, below) is the fallback anchor, so the panel
+  // lands centred-right instead.
+  const [commentFallbackAnchor, setCommentFallbackAnchor] = useState<HTMLElement | null>(null);
+
+  // Toggle-close when the incoming click targets the same anchor that's
+  // already open (a second click on the same badge), otherwise re-anchor to
+  // the new target. This — combined with CommentsPopover's click-away
+  // ignoring clicks on badge buttons — is what lets clicking a DIFFERENT
+  // badge move the popover there in a single click instead of just closing it.
+  // Anchor and target move together, so they live in one state object: setting
+  // one from inside the other's updater made the updater impure, and React is
+  // free to run an updater twice (StrictMode, a discarded concurrent render).
+  const openComments: OpenCommentsFn = useCallback((anchorEl, target) => {
+    setCommentPanel((prev) =>
+      // Only toggle-close when the existing panel already has a real anchor
+      // AND targets match. A deep-link arrival opens with anchor: null (the
+      // centred fallback) — without the anchor check, clicking that same
+      // verse's badge afterward read as "close" instead of re-anchoring the
+      // panel to the badge, since targetsMatch alone was already true.
+      prev.target && prev.anchor && targetsMatch(prev.target, target)
+        ? { anchor: null, target: null } // clicking the same badge toggles closed
+        : { anchor: anchorEl, target },
+    );
+  }, []);
+
+  const closeComments = useCallback(() => {
+    setCommentPanel({ anchor: null, target: null });
+    setHighlightCommentId(null);
+  }, []);
+
+  // Unposted composer text survives the popover closing. Shell rerenders
+  // `{commentTarget && <CommentsPopover key={targetKey(...)} …>}`, so closing
+  // UNMOUNTS the popover and every composer's local `body` state with it — an
+  // editor who types a few sentences then clicks the verse text to re-read it
+  // would otherwise lose the draft outright. A ref (not state): it must
+  // survive the popover unmounting on close, but doesn't need to survive a
+  // page reload. Keyed by book/chapter/target so drafts for different verses
+  // or rows never bleed into each other.
+  const composerDraftsRef = useRef<Map<string, string>>(new Map());
+  const commentDraftKey = commentTarget ? `${book}/${chapter}/${targetKey(commentTarget)}` : null;
+  const handleComposerBodyChange = useCallback((body: string) => {
+    if (!commentDraftKey) return;
+    if (body) composerDraftsRef.current.set(commentDraftKey, body);
+    else composerDraftsRef.current.delete(commentDraftKey);
+  }, [commentDraftKey]);
+  const handleReplyBodyChange = useCallback(
+    (parentId: number, body: string) => {
+      if (!commentDraftKey) return;
+      const key = `${commentDraftKey}/reply/${parentId}`;
+      if (body) composerDraftsRef.current.set(key, body);
+      else composerDraftsRef.current.delete(key);
+    },
+    [commentDraftKey],
+  );
+  const getReplyDraft = useCallback(
+    (parentId: number) => {
+      if (!commentDraftKey) return "";
+      return composerDraftsRef.current.get(`${commentDraftKey}/reply/${parentId}`) ?? "";
+    },
+    [commentDraftKey],
+  );
+
+  // Mention list, fetched lazily the FIRST time a popover opens (not per
+  // chapter load) and then cached for the session. A failure degrades to an
+  // empty list: the popover simply offers no mention picker.
+  const [mentionUsers, setMentionUsers] = useState<MentionUser[]>([]);
+  const mentionUsersRequested = useRef(false);
+  useEffect(() => {
+    if (!commentTarget || mentionUsersRequested.current || !commentsEnabled) return;
+    mentionUsersRequested.current = true;
+    void api
+      .getMentionUsers()
+      .then((res) => setMentionUsers(res.users))
+      .catch((e) => {
+        console.warn("mention users unavailable", e);
+        // Reset so a later popover open retries. Without this, one transient
+        // failure permanently disabled the @ picker for the whole session —
+        // and worse, left mentionUsers empty, which made splitMentions render
+        // every existing @mention in every comment as plain text.
+        mentionUsersRequested.current = false;
+      });
+  }, [commentTarget, commentsEnabled]);
+
+  // Threads for whatever the popover is currently pointed at.
+  const commentThreads = useMemo(() => {
+    if (!commentTarget) return EMPTY_COMMENT_THREADS;
+    const list =
+      commentTarget.rowKind == null
+        ? commentsIndex.threadsByVerse.get(commentTarget.verse)
+        : commentsIndex.threadsByRow.get(rowKey(commentTarget.rowKind, commentTarget.rowId));
+    return list ?? EMPTY_COMMENT_THREADS;
+  }, [commentTarget, commentsIndex]);
+
+  // Memoized on the index so ScriptureColumn's comparator sees a NEW identity
+  // exactly when comments changed (and a stable one otherwise — a fresh arrow
+  // each render would defeat that memo entirely).
+  const verseCommentCounts = useMemo(
+    () =>
+      commentsEnabled
+        ? (verse: number) => countThreads(commentsIndex.threadsByVerse.get(verse))
+        : undefined,
+    [commentsIndex, commentsEnabled],
+  );
+  const commentCountsForRow = useMemo(
+    () =>
+      commentsEnabled
+        ? (kind: CommentRowKind, rowId: string) =>
+            countThreads(commentsIndex.threadsByRow.get(rowKey(kind, rowId)))
+        : undefined,
+    [commentsIndex, commentsEnabled],
+  );
+
+  const onOpenVerseComments = useMemo(
+    () =>
+      commentsEnabled
+        ? (anchorEl: HTMLElement, verse: number) => openComments(anchorEl, { verse })
+        : undefined,
+    [commentsEnabled, openComments],
+  );
+  const onOpenRowComments = useMemo(
+    () =>
+      commentsEnabled
+        ? (anchorEl: HTMLElement, rowKind: CommentRowKind, rowId: string, verse: number) =>
+            openComments(anchorEl, { verse, rowKind, rowId })
+        : undefined,
+    [commentsEnabled, openComments],
+  );
+
+  // Rejections propagate to the popover, which renders them — deliberately no
+  // try/catch here, since a swallowed failure is indistinguishable from success.
+  const handleCreateComment = useCallback(
+    async (draft: NewCommentDraft) => {
+      if (!commentTarget) return;
+      await addComment({
+        book,
+        chapter,
+        verse: commentTarget.verse,
+        rowKind: commentTarget.rowKind,
+        rowId: commentTarget.rowId,
+        ...draft,
+      });
+    },
+    [addComment, book, chapter, commentTarget],
+  );
+
   // Book-level DCS-validation summary for the topbar "issues to clean up"
   // indicator. Keyed on book, so it fetches once per book change — never on
   // chapter/verse navigation within a book.
@@ -369,6 +564,24 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   const [activeVerse, setActiveVerse] = useState(initialVerse);
   const [activeNoteId, setActiveNoteId] = useState<string | null>(null);
   const [activeWordId, setActiveWordId] = useState<string | null>(null);
+
+  // Close the comments panel when its target stops being valid, so it doesn't
+  // stay open floating at its last position (still accepting new comments
+  // against a possibly-gone anchor). Two ways a target goes stale: the active
+  // verse moves off the verse it's anchored to (its badge may not even render
+  // for an inactive zero-thread verse), or — for a row-anchored target — the
+  // row itself is no longer in the loaded rows (e.g. the tn row was deleted).
+  useEffect(() => {
+    if (!commentTarget) return;
+    if (commentTarget.verse !== activeVerse) {
+      closeComments();
+      return;
+    }
+    if (commentTarget.rowKind != null && commentTarget.rowId != null) {
+      const rows = data?.[commentTarget.rowKind] as Array<{ id: string }> | undefined;
+      if (!rows?.some((r) => r.id === commentTarget.rowId)) closeComments();
+    }
+  }, [activeVerse, commentTarget, data, closeComments]);
   const [mode, setMode] = useState<ScriptureMode>(() =>
     loadFromStorage<ScriptureMode>(SCRIPTURE_MODE_KEY, "stacked"),
   );
@@ -1650,7 +1863,12 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     setDualRightReadingDirty(false);
     setPendingNav(null);
     setPendingDualAction(null);
-  }, [chapter, initialVerse]);
+    // A popover left open across a chapter change would be pointed at the old
+    // chapter's verse (and hanging off an element that just unmounted). The
+    // comment-deep-link consumer below runs after this effect, so it can still
+    // open a popover on the chapter we're arriving at.
+    closeComments();
+  }, [chapter, initialVerse, closeComments]);
 
   // A front-matter / intro chapter (chapter 0) has only the intro tile (verse 0)
   // and no real verses. Navigation defaults activeVerse to 1, which doesn't
@@ -1682,6 +1900,73 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     setActiveNoteId(jump.noteId);
     setScrollNonce((n) => n + 1);
   }, [data, book, chapter]);
+
+  // Consume a comment deep link — `?c=<id>` in the hash (initialCommentId).
+  // Waits for this chapter's comments to load and for that id to actually be
+  // present, then selects the comment's verse, opens the popover on its
+  // anchor and highlights it. Runs AFTER the per-chapter reset effect above in
+  // source order, so the reset's setActiveVerse(initialVerse) can't clobber
+  // the jump on the same navigation. The consumed key is remembered (keyed by
+  // book/chapter, not just id) so dismissing the popover doesn't re-open it.
+  const consumedCommentKeyRef = useRef<string | null>(null);
+
+  // Clearing the marker when the URL stops carrying `?c=` is what lets the SAME
+  // alert link be clicked twice. Keying the marker alone isn't enough: leaving
+  // the chapter and coming back rebuilds the identical key, so the second
+  // arrival was silently dropped and `?c=` was left stranded in the URL
+  // (verified). Since we strip the param immediately after consuming, its
+  // absence is exactly the signal that the previous jump is finished; the
+  // marker still guards the window before the hash actually updates, where a
+  // commentsIndex change could otherwise re-run the effect.
+  useEffect(() => {
+    if (initialCommentId == null) consumedCommentKeyRef.current = null;
+  }, [initialCommentId]);
+
+  useEffect(() => {
+    if (initialCommentId == null) return;
+    const key = `${book}/${chapter}/${initialCommentId}`;
+    if (consumedCommentKeyRef.current === key) return;
+    const comment = commentsIndex.byId.get(initialCommentId);
+    if (!comment) {
+      // Not found YET could mean three different things, and only one of them
+      // justifies telling the user the comment is gone:
+      //   1. this chapter's comments haven't been fetched yet — say nothing;
+      //   2. the fetch failed — say nothing, the errorText banner covers it and
+      //      a later load may succeed (claiming "deleted" here would be a lie);
+      //   3. the fetch settled for THIS chapter and the id genuinely isn't in
+      //      it — consume the link so `?c=` stops stranding, and say so.
+      // `commentsLoading` alone cannot distinguish (1): on a chapter change it
+      // is still false from the previous chapter while the index is already
+      // empty, so a perfectly valid cross-chapter deep link was being reported
+      // as deleted. Gate on the loaded set actually belonging to this chapter.
+      const settledForThisChapter = commentsLoadedKey === `${book}/${chapter}`;
+      if (commentsLoading || !settledForThisChapter || commentsError) return;
+      consumedCommentKeyRef.current = key;
+      onCommentConsumed?.();
+      pushPipelineToast("That comment is no longer available.", "info");
+      return;
+    }
+    consumedCommentKeyRef.current = key;
+    setActiveVerse(comment.verse);
+    setActiveNoteId(comment.rowKind === "tn" ? comment.rowId : null);
+    // No clicked element on a deep-link arrival, so anchor stays null and the
+    // popover falls back to the centred anchor.
+    setCommentPanel({
+      anchor: null,
+      target:
+        comment.rowKind != null && comment.rowId != null
+          ? { verse: comment.verse, rowKind: comment.rowKind, rowId: comment.rowId }
+          : { verse: comment.verse },
+    });
+    setHighlightCommentId(comment.id);
+    setScrollNonce((n) => n + 1);
+    // Hand the consumption back to App, which drops the `?c=` from both the URL
+    // and its location state. Doing the rewrite here used replaceState, which
+    // fires no hashchange, so App never learned the param was gone: the prop
+    // stayed set, this effect's deps never changed, and clicking the SAME alert
+    // again was silently ignored (verified).
+    onCommentConsumed?.();
+  }, [commentsIndex, commentsLoading, commentsLoadedKey, commentsError, book, chapter, initialCommentId, onCommentConsumed, pushPipelineToast]);
 
   // Keep the alignment target's verse in step with the active verse while
   // we're in alignment mode. Bible version is sticky — only LinkIcon clicks
@@ -2509,6 +2794,8 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           book={book}
           chapter={chapter}
           textCheck={textLaneCheck}
+          verseCommentCounts={verseCommentCounts}
+          onOpenVerseComments={onOpenVerseComments}
           versesByVersion={data.verses}
           verseNumbers={verseNumbers}
           activeVerse={activeVerse}
@@ -2654,6 +2941,8 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           tq={data.tq}
           twl={data.twl}
           ultVerseObjectsFor={ultVerseObjectsFor}
+          commentCountsForRow={commentCountsForRow}
+          onOpenRowComments={onOpenRowComments}
           activeNoteId={activeNoteId}
           activeWordId={activeWordId}
           findNoteQuery={findNoteQuery}
@@ -3183,6 +3472,39 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           onSelectKeys={selectQuoteBuildWords}
           onCancel={cancelQuoteBuild}
           onCommit={commitQuoteBuild}
+        />
+      )}
+      {/* Fallback popover anchor for deep links, where there is no clicked
+          element. Zero-size and fixed at the centre-right of the viewport, so
+          the (left-start placed) panel lands centred rather than in the corner. */}
+      <Box
+        ref={setCommentFallbackAnchor}
+        sx={{ position: "fixed", top: "50%", left: "70%", width: 0, height: 0, pointerEvents: "none" }}
+      />
+      {commentTarget && (
+        <CommentsPopover
+          key={targetKey(commentTarget)}
+          open
+          anchorEl={commentAnchor ?? commentFallbackAnchor}
+          target={commentTarget}
+          threads={commentThreads}
+          mentionUsers={mentionUsers}
+          meUserId={meUserId}
+          canWrite={commentsEnabled}
+          highlightCommentId={highlightCommentId}
+          loading={commentsLoading}
+          errorText={
+            commentsError ? "Comments unavailable — could not load them for this chapter." : null
+          }
+          initialBody={commentDraftKey ? (composerDraftsRef.current.get(commentDraftKey) ?? "") : ""}
+          onBodyChange={handleComposerBodyChange}
+          replyInitialBody={getReplyDraft}
+          onReplyBodyChange={handleReplyBodyChange}
+          onClose={closeComments}
+          onCreate={handleCreateComment}
+          onEdit={editComment}
+          onResolve={setCommentResolved}
+          onDelete={removeComment}
         />
       )}
     </Box>

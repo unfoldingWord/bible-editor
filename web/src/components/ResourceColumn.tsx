@@ -3,7 +3,8 @@ import { Box, Stack, Typography, Chip, Button, IconButton, Tooltip, Link } from 
 import AddIcon from "@mui/icons-material/Add";
 import PushPinIcon from "@mui/icons-material/PushPin";
 import PushPinOutlinedIcon from "@mui/icons-material/PushPinOutlined";
-import type { TnRow, TqRow, TwlRow, VerseDto, TwlSuggestion, TwlOrderLock } from "../sync/api";
+import type { TnRow, TqRow, TwlRow, VerseDto, TwlSuggestion, TwlOrderLock, CommentRowKind } from "../sync/api";
+import type { CommentCounts } from "../lib/commentsIndex";
 import { NoteCard, type DropPosition } from "./NoteCard";
 import { WordsTable, type WordDropPosition } from "./WordsTable";
 import { TwlSuggestions } from "./TwlSuggestions";
@@ -217,6 +218,19 @@ interface Props {
   // "automatic order differs" hint stays quiet until automatic ordering
   // proposes something ELSE.
   onTwlOrderDismiss?: (verse: number, dismissedOrder: string) => void | Promise<void>;
+  // Internal comments on individual resource rows. Passed as getters rather
+  // than the whole index so this column doesn't have to know how comments are
+  // keyed, and so the diff stays inside the note-card call site. Both are
+  // absent for viewers (the comments API is editor-gated), in which case
+  // NoteCard renders no badge. Only tn rows are wired for now — tq/twl tables
+  // are a deliberate follow-up.
+  commentCountsForRow?: (rowKind: CommentRowKind, rowId: string) => CommentCounts;
+  onOpenRowComments?: (
+    anchorEl: HTMLElement,
+    rowKind: CommentRowKind,
+    rowId: string,
+    verse: number,
+  ) => void;
 }
 
 type PinKey = "notes" | "words" | "questions";
@@ -350,6 +364,8 @@ export function ResourceColumn({
   twlOrderLocks = EMPTY_TWL_ORDER_LOCKS,
   onTwlOrderUnlock,
   onTwlOrderDismiss,
+  commentCountsForRow,
+  onOpenRowComments,
 }: Props) {
   const [pinned, setPinned] = useState<Pinned>(() => loadPinned());
   const togglePinned = (k: PinKey) => {
@@ -1119,6 +1135,15 @@ export function ResourceColumn({
           verseOptions={verseOptions}
           onChangeVerse={(v, vEnd) => onNoteChangeVerse(r.id, v, vEnd)}
           onFocus={() => onNoteFocus(r)}
+          // r.verse is the row's START verse (a bridged row spans r.verse →
+          // r.verse_end), which is what the rest of this file keys reordering
+          // and peer lookup on — so the comment anchor uses it too.
+          commentCounts={commentCountsForRow ? commentCountsForRow("tn", r.id) : undefined}
+          onOpenComments={
+            onOpenRowComments
+              ? (anchorEl) => onOpenRowComments(anchorEl, "tn", r.id, r.verse)
+              : undefined
+          }
           onGripDragStart={() => setDragId(r.id)}
           onMoveUp={
             prevNote

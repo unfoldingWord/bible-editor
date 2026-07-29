@@ -45,12 +45,18 @@ import { shortSupport } from "../lib/supportReference";
 import { TCM, buildSH } from "../lib/noteTemplates";
 import { wouldBlankExistingNote } from "../lib/noteGuard";
 import { drafts, rowKey, draftDirtyBorderSx } from "../sync/drafts";
+import { CommentBadge } from "./CommentBadge";
+import type { CommentCounts } from "../lib/commentsIndex";
 
 const NoteHistoryDialog = lazy(() =>
   import("./NoteHistoryDialog").then((m) => ({ default: m.NoteHistoryDialog })),
 );
 
 export type DropPosition = "before" | "after";
+
+// Stable zero-counts so an unthreaded note doesn't hand CommentBadge a fresh
+// object every render (and so the memo comparator below can compare by value).
+const EMPTY_COMMENT_COUNTS: CommentCounts = { openQuestions: 0, notes: 0, total: 0 };
 
 // Transient ring on the arrow a note was just reordered with — mouse clicks
 // don't show a :focus-visible ring, so this signals "the note moved, press
@@ -154,6 +160,11 @@ interface Props {
   // quote in the box. Shell applies the quote to row optimistically before
   // bumping this, so the effect just reads the now-current row.quote.
   quoteBuildAppliedAt?: number | null;
+  // Internal-comment thread counts for THIS note row, plus the opener. Both are
+  // absent for viewers (the comments API is editor-gated), and the badge is
+  // simply not rendered then — a viewer sees no comment affordance at all.
+  commentCounts?: CommentCounts;
+  onOpenComments?: (anchorEl: HTMLElement) => void;
 }
 
 // Notes coming from TSV imports use literal "\n" (two characters) as the
@@ -324,6 +335,8 @@ function NoteCardInner({
   quoteBuildMode = false,
   quoteBuildSelectionCount = 0,
   onStartQuoteBuild,
+  commentCounts,
+  onOpenComments,
   quoteBuildAppliedAt = null,
 }: Props) {
   // Two explicit bits drive lock-time behavior now:
@@ -1059,6 +1072,13 @@ function NoteCardInner({
             dirty (editing injects the Undo button here, eating the row's slack):
             the group either fits on line 1 or drops to line 2 as a stable unit. */}
         <Stack direction="row" spacing={1} alignItems="center" sx={{ flexShrink: 0 }}>
+        {onOpenComments && (
+          <CommentBadge
+            counts={commentCounts ?? EMPTY_COMMENT_COUNTS}
+            onOpen={onOpenComments}
+            titleWhenEmpty="Add an internal comment on this note"
+          />
+        )}
         <Tooltip
           title={
             row.restored_from_version != null
@@ -1702,8 +1722,20 @@ function areNotePropsEqual(a: Props, b: Props): boolean {
     a.locked === b.locked &&
     a.quoteBuildMode === b.quoteBuildMode &&
     a.quoteBuildSelectionCount === b.quoteBuildSelectionCount &&
-    (a.flashArrow ?? null) === (b.flashArrow ?? null)
+    (a.flashArrow ?? null) === (b.flashArrow ?? null) &&
+    // Compared BY VALUE: ResourceColumn derives these from the comments index
+    // per render, so a fresh object arrives every time and a reference check
+    // would re-render every card on every keystroke — while omitting the check
+    // entirely would leave the badge permanently stale.
+    sameCommentCounts(a.commentCounts, b.commentCounts) &&
+    !!a.onOpenComments === !!b.onOpenComments
   );
+}
+
+function sameCommentCounts(a?: CommentCounts, b?: CommentCounts): boolean {
+  const x = a ?? EMPTY_COMMENT_COUNTS;
+  const y = b ?? EMPTY_COMMENT_COUNTS;
+  return x.openQuestions === y.openQuestions && x.notes === y.notes && x.total === y.total;
 }
 
 export const NoteCard = memo(NoteCardInner, areNotePropsEqual);
