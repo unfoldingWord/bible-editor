@@ -6,7 +6,7 @@ import CheckIcon from "@mui/icons-material/Check";
 import type { TwlRow, VerseDto } from "../sync/api";
 import { CopyChapterButton } from "./CopyChapterButton";
 import { LANE_FILL, type TextLaneCheck } from "../lib/laneChecks";
-import { highlightsFor, paragraphClass, renderEditableHTML, renderHighlightedHTML, type HighlightKey, type ReorderHighlight } from "../lib/highlight";
+import { highlightsFor, leadingBreakClass, renderEditableHTML, renderHighlightedHTML, type HighlightKey, type ReorderHighlight } from "../lib/highlight";
 import { markHighlightSx } from "../lib/highlightStyles";
 import { extractTrailingMarkers, stripTrailingMarkers, splitSectionHeaders, type SectionHeader } from "../lib/usfm";
 import { SectionHeaderBand } from "./SectionHeaderBand";
@@ -319,35 +319,6 @@ function findPreviousVerse(
     if ((dto.verse_end ?? dto.verse) < verse) return dto;
   }
   return null;
-}
-
-// The active/editable verse renders its OWN verseObjects (so the
-// contentEditable text matches the save diff), which drops the paragraph
-// marker drifted from the previous verse — and with it the visual line break
-// that introduces the verse. Map that drifted marker to the same wrapper class
-// the inactive (display) path uses, so we can put it directly on the editable
-// span and get the break/indent back from CSS without touching the text. Use
-// the marker closest to the verse (last in document order). `\ts\*` is a flex
-// divider block (`be-ts`) that would relayout the content span, so it never
-// supplies the class — but if it's the ONLY drifted marker we still fall back
-// to a plain block break so the verse keeps its own line.
-function leadingBreakClass(markers: unknown[] | null | undefined): string {
-  if (!Array.isArray(markers)) return "";
-  let sawDivider = false;
-  for (let i = markers.length - 1; i >= 0; i--) {
-    const tag = (markers[i] as { tag?: unknown } | null)?.tag;
-    if (typeof tag !== "string") continue;
-    if (tag === "ts") {
-      sawDivider = true;
-      continue;
-    }
-    const { wrapper, isBlank } = paragraphClass(tag);
-    return isBlank ? "be-line" : wrapper;
-  }
-  // Only a `\ts\*` chunk divider drifted (no paragraph/poetry marker): the
-  // inactive path renders a divider block here, so keep the active verse on
-  // its own line with a plain block break rather than letting it run inline.
-  return sawDivider ? "be-line" : "";
 }
 
 function VerseSpan({

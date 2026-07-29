@@ -6,7 +6,8 @@
 // quoting the whole second sentence left "the meat of" and "their hooves" dark
 // in the UST and the 2nd/4th "not" dark in the ULT.
 
-import { findTargetHighlights } from "./highlight.ts";
+import { findTargetHighlights, leadingBreakClass } from "./highlight.ts";
+import { extractTrailingMarkers } from "./usfm.ts";
 
 let failed = 0;
 function assert(cond, msg) {
@@ -141,6 +142,58 @@ const lit = (vo, quote, occurrence, source) =>
   assert(
     JSON.stringify(got) === JSON.stringify([]),
     `unaligned 2nd instance lights nothing, not the 1st, got ${JSON.stringify(got)}`,
+  );
+}
+
+// --- 3. leadingBreakClass and `\ts\*` chunk dividers.
+//
+// The old implementation tested `tag === "ts"`, which cannot match usfm-js
+// 3.5.0's real shape `{tag:"ts\\*"}` (the Micah 4 bug class). These cases pin
+// both the marker-shape handling and — more importantly — the upstream contract
+// that keeps the divider branch unreachable in the first place.
+{
+  // Every `\ts\*` shape usfm-js has produced.
+  const shapes = [
+    ["usfm-js 3.5.0", { tag: "ts\\*" }],
+    ["editor-written", { tag: "ts*" }],
+    ["legacy", { tag: "ts", content: "\\*" }],
+  ];
+
+  for (const [label, ts] of shapes) {
+    assert(
+      leadingBreakClass([ts]) === "be-line",
+      `${label} \\ts\\* alone → plain block break, not be-ts / be-para (got ${JSON.stringify(leadingBreakClass([ts]))})`,
+    );
+    // A real line marker behind the divider still wins: it is the marker that
+    // determines the verse's indent, and be-ts must never reach the span.
+    assert(
+      leadingBreakClass([{ type: "quote", tag: "q1" }, ts]) === "be-q be-q-1",
+      `${label}: \\q1 then \\ts\\* → q1 indent wins`,
+    );
+  }
+
+  // The contract that makes the divider branch dead code from DocColumn's one
+  // call site: `\ts\*` marks a boundary AT the point it sits, so it never drifts
+  // onto the next verse. This is the prod Micah 4 tail shape (`\q1` `\ts\*`).
+  const drift = extractTrailingMarkers([
+    { type: "text", text: "word" },
+    { type: "quote", tag: "q1" },
+    { tag: "ts\\*" },
+  ]);
+  assert(
+    JSON.stringify(drift) === JSON.stringify([{ type: "quote", tag: "q1" }]),
+    `extractTrailingMarkers drifts the \\q1 behind a \\ts\\* but not the divider (got ${JSON.stringify(drift)})`,
+  );
+  assert(
+    leadingBreakClass(drift) === "be-q be-q-1",
+    "Micah 4 tail: active verse keeps its \\q1 poetry indent",
+  );
+
+  assert(leadingBreakClass([]) === "", "no drifted markers → no class");
+  assert(leadingBreakClass(null) === "", "null markers → no class");
+  assert(
+    leadingBreakClass([{ type: "paragraph", tag: "b" }]) === "be-line",
+    "\\b blank marker → be-line, not be-blank",
   );
 }
 
