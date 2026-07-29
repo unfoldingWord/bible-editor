@@ -17,6 +17,59 @@
 // the draft it is offering to save).
 
 import type { VerseDto } from "../sync/api";
+import { isInFlowMarker, isTsMilestone, PARAGRAPH_TAGS } from "./usfm.ts";
+
+// Tags that count as opening a chapter. PARAGRAPH_TAGS minus `b`: a `\b` is a
+// blank line, not a paragraph opener. `\ts\*` is excluded by isInFlowMarker's
+// companion check below — a chunk divider is not a line-layout marker either.
+const OPENING_TAGS: ReadonlySet<string> = new Set(
+  [...PARAGRAPH_TAGS].filter((t) => t !== "b"),
+);
+
+function isOpeningMarker(node: unknown): boolean {
+  if (!isInFlowMarker(node) || isTsMilestone(node)) return false;
+  const tag = (node as Record<string, unknown>)["tag"];
+  return typeof tag === "string" && OPENING_TAGS.has(tag);
+}
+
+// Transparent to the edge scans: whitespace-only text (including the editor's
+// U+200B placeholder) and `\ts\*` dividers. Mirrors trailingMarkerRunStart.
+function isTransparent(node: unknown): boolean {
+  const t = (node as Record<string, unknown> | null)?.["text"];
+  if (typeof t === "string" && /^[\s​]*$/.test(t)) return true;
+  return isTsMilestone(node);
+}
+
+// True when nothing introduces verse 1 — i.e. the chapter opens bare.
+//
+// CLIENT-SIDE TWIN of lintChapterOpeningMarkers in api/src/lint.ts; keep the two
+// in sync. The server owns the authoritative flag, but the chapter rail needs the
+// same answer locally to decide whether to offer an intro slot at all: when NO
+// version has a verse-0 row and no note sits on the intro, there is otherwise no
+// intro tile, and the server's flag would point at something the user cannot open.
+//
+// Position matters, exactly as it does server-side: the marker must TRAIL the
+// front matter or LEAD verse 1. A mid-verse `\q1` (every poetry verse has them)
+// must not count, or this silently answers "fine" for every poetic chapter.
+export function chapterOpensWithoutMarker(
+  frontVerseObjects: unknown[] | null | undefined,
+  firstVerseObjects: unknown[] | null | undefined,
+): boolean {
+  if (!Array.isArray(firstVerseObjects)) return false; // no verse 1 → nothing to judge
+  if (Array.isArray(frontVerseObjects)) {
+    for (let i = frontVerseObjects.length - 1; i >= 0; i--) {
+      if (isOpeningMarker(frontVerseObjects[i])) return false;
+      if (isTransparent(frontVerseObjects[i])) continue;
+      break;
+    }
+  }
+  for (const node of firstVerseObjects) {
+    if (isOpeningMarker(node)) return false;
+    if (isTransparent(node)) continue;
+    break;
+  }
+  return true;
+}
 
 export function introEditBase(
   dto: VerseDto | undefined,

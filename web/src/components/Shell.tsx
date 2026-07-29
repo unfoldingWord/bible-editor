@@ -44,7 +44,7 @@ import { ChapterBoard } from "./ChapterBoard";
 import { drafts, verseKey } from "../sync/drafts";
 import { smartEditVerse } from "../lib/replace";
 import { extractEditableText, extractPlainText, normalizeEditable, SECTION_HEADER_TAGS } from "../lib/usfm";
-import { introEditBase } from "../lib/verseIntro";
+import { chapterOpensWithoutMarker, introEditBase } from "../lib/verseIntro";
 import { verseHasUnalignedWork, countUnalignedTargetWords } from "../lib/alignment";
 import {
   analyzeAlignmentDelta,
@@ -973,8 +973,23 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     // Chapter-front USFM content (Psalm \d superscriptions, leading \p before \v 1)
     // is stored as verse 0 in the verses table. Surface the intro tile when any of
     // those exist even if no TN/TQ/TWL row is attached to verse 0.
+    //
+    // ...and ALSO when the chapter opens with no paragraph / poetry marker at all
+    // (#378). That case has, by definition, no verse-0 row to detect — and if
+    // neither translation has one and no note sits on the intro, none of the
+    // conditions above fire, so there would be no intro tile, no editable intro
+    // cell, and therefore no way to add the marker the lint is flagging. The flag
+    // would be permanently unresolvable in the app. Offering the slot exactly when
+    // something needs fixing keeps this from adding a tile to every chapter.
+    const introMarkerMissing = (["ULT", "UST"] as const).some((bv) => {
+      const byVerse = versesForTiles[bv];
+      if (!byVerse) return false;
+      return chapterOpensWithoutMarker(getVO(byVerse[0]), getVO(byVerse[1]));
+    });
     const tiles: VerseTile[] = [];
-    if (introHasResource || introHasScripture) tiles.push({ verse: 0, has: false, lanes: buildLanes(0) });
+    if (introHasResource || introHasScripture || introMarkerMissing) {
+      tiles.push({ verse: 0, has: false, lanes: buildLanes(0) });
+    }
     const verseNums = [...versesWithSomething].filter((v) => v > 0).sort((a, b) => a - b);
     for (const v of verseNums) tiles.push({ verse: v, has: hasUnalignedFor(v), lanes: buildLanes(v) });
     return tiles;
