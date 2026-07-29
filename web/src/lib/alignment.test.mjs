@@ -1249,24 +1249,27 @@ function roundtripVerseUsfm(rawUsfm, sourceVO = null) {
     );
   }
 
-  // (e***) \ts\* chunk markers surface in editable text and round-trip
-  // through tokenizeEditableText to the original `{tag:"ts", content:"\\*"}`
-  // shape (no `type` field — matches what usfm-js produces on import).
-  {
+  // (e***) \ts\* chunk markers surface in editable text and round-trip through
+  // tokenizeEditableText to `{tag:"ts\\*"}` — the shape usfm-js 3.5.0 actually
+  // parses, and the only one it re-renders as a valid standalone `\ts\*`. The
+  // legacy `{tag:"ts", content:"\\*"}` shape this used to assert renders as
+  // `\ts \*` (with a space), which is invalid USFM and slips past both repair
+  // rules in api/src/usfmFormat.ts. Both input shapes must surface identically.
+  for (const tsNode of [{ tag: "ts\\*" }, { tag: "ts", content: "\\*" }]) {
     const vo = [
-      { tag: "ts", content: "\\*" },
+      tsNode,
       { type: "word", tag: "w", text: "Then", occurrence: "1", occurrences: "1" },
     ];
     const editable = extractEditableText(vo);
     assert(
       editable === "\\ts\\* Then",
-      `\\ts\\* surfaced inline in editable text (got ${JSON.stringify(editable)})`,
+      `\\ts\\* surfaced inline in editable text from ${JSON.stringify(tsNode)} (got ${JSON.stringify(editable)})`,
     );
     const nodes = tokenizeEditableText(editable);
-    const ts = nodes.find((n) => n.tag === "ts");
+    const ts = nodes.find((n) => typeof n.tag === "string" && n.tag.startsWith("ts"));
     assert(
-      ts !== undefined && ts.content === "\\*" && ts.type === undefined,
-      `\\ts\\* round-trips as {tag:"ts", content:"\\\\*"} with no type (got ${JSON.stringify(ts)})`,
+      ts !== undefined && ts.tag === "ts\\*" && ts.content === undefined && ts.type === undefined,
+      `\\ts\\* round-trips as {tag:"ts\\\\*"} (got ${JSON.stringify(ts)})`,
     );
   }
 

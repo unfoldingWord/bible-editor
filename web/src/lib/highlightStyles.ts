@@ -130,6 +130,65 @@ function paragraphLayoutSx(mode: Mode) {
   };
 }
 
+// Book mode: run the chunk-divider rule STRAIGHT ACROSS. The shared style
+// splits the line either side of a centered `\ts\*` label, which reads as ragged
+// once the book scroll stacks many of them down a narrow column. Here the dashed
+// rule is the div's own full-width border and the label is hidden — book mode is
+// a reading/scanning view, and the divider is still labelled (and editable) in
+// rows mode, which is where markers are actually worked on. Hiding the label with
+// `display:none` keeps its text in `textContent`, so the contentEditable save
+// baseline (extractEditableText) still lines up and the divider round-trips.
+export const bookTsDividerSx = {
+  "& div.be-ts": {
+    display: "block",
+    height: 0,
+    borderTop: "1px dashed",
+    // A single, definite line colour rather than a faint one behind an opacity
+    // multiplier — the rule has to stay comfortably visible when it's the only
+    // thing marking the chunk boundary in this view.
+    borderColor: "text.disabled",
+    margin: "0.75em 0",
+    "&::before, &::after": { content: "none", border: "none", flex: "none" },
+    "& span.be-tok-ts": { display: "none" },
+  },
+} as const;
+
+// Columns mode: same divider, far quieter. The parallel-column doc view is dense
+// continuous prose, where a full-strength dashed rule plus a monospace label
+// competes with the text for attention. Keep both — they still mark the chunk
+// boundary — but drop them close to the background.
+// Deliberately NOT dimmed by stacking a container opacity on top of a muted
+// text colour — that compounds to near-invisible and makes people squint. One
+// dimming step only: a real (readable) secondary text colour for the label, and
+// the rule itself lightened via its own opacity.
+// NOTE: this is a COMPLETE restatement of `div.be-ts`, not a patch. Spreading it
+// after markHighlightSx replaces that key's object wholesale, so any base
+// property omitted here (display:flex, the ::before/::after `content`, their
+// flex:1) is simply lost — which silently deleted the rule lines the first time.
+export const columnsTsDividerSx = {
+  "& div.be-ts": {
+    display: "flex",
+    alignItems: "center",
+    gap: "6px",
+    margin: "0.4em 0",
+    "&::before, &::after": {
+      content: '""',
+      flex: 1,
+      borderTop: "1px dotted",
+      borderColor: "text.disabled",
+      opacity: 0.7,
+    },
+    "& span.be-tok-ts": {
+      flex: "0 0 auto",
+      fontSize: "0.68rem",
+      border: "none",
+      background: "none",
+      padding: 0,
+      color: "text.secondary",
+    },
+  },
+} as const;
+
 // `& mark.be-*` selectors used inside <Box>/<Paper> sx blocks for the
 // scripture columns and book/doc views.
 export function markHighlightSx(mode: Mode) {

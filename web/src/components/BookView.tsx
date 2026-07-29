@@ -20,7 +20,7 @@ import { CopyChapterButton } from "./CopyChapterButton";
 import { LANE_FILL, type TextLaneCheck } from "../lib/laneChecks";
 import type { ChapterState } from "../hooks/useBook";
 import { highlightsFor, renderEditableHTML, renderHighlightedHTML, type HighlightKey, type ReorderHighlight } from "../lib/highlight";
-import { markHighlightSx } from "../lib/highlightStyles";
+import { markHighlightSx, bookTsDividerSx } from "../lib/highlightStyles";
 import { extractTrailingMarkers, stripTrailingMarkers, splitSectionHeaders, type SectionHeader } from "../lib/usfm";
 import { SectionHeaderBand } from "./SectionHeaderBand";
 import { DriftedMarkerBand, driftedMarkerTags } from "./DriftedMarkerBand";
@@ -265,6 +265,7 @@ export function BookView({
           flex: 1,
           overflowY: "auto",
           ...markHighlightSx(theme.palette.mode),
+          ...bookTsDividerSx,
           ...draftDirtyBorderSx(),
           // Each verse is its own grid cell led by an inline reference label.
           // When a verse's content opens with a paragraph / poetry block (its

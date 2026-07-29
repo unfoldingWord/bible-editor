@@ -162,7 +162,15 @@ const MARKER_TOKEN_RE =
 // form.
 function nodeForMarker(tag: string): unknown {
   if (tag === "ts\\*") {
-    return { tag: "ts", content: "\\*" };
+    // Emit the shape usfm-js 3.5.0 ITSELF parses `\ts\*` into — the whole marker
+    // in the tag. Do NOT "restore" the legacy `{tag:"ts", content:"\\*"}` here:
+    // usfm-js renders that as `\ts \*` (with a space), which is invalid USFM, and
+    // neither repairTsMarker nor STANDALONE_MARKER_RE in api/src/usfmFormat.ts
+    // matches it — so it is neither repaired nor put on its own line, and the
+    // broken form ships to DCS on the next nightly export. This became reachable
+    // when isInFlowMarker started matching real `\ts\*` nodes: reconcileMarkers
+    // now drops and re-mints them, where before it left them untouched.
+    return { tag: "ts\\*" };
   }
   const type =
     tag === "q" || /^q[1-4]$/.test(tag) || /^qm[1-3]?$/.test(tag) ? "quote" : "paragraph";
@@ -591,8 +599,11 @@ function relayoutUnchangedWords(
   // at both edges of HOS 9:17, which is dense with \q1/\q2) to localizedRewrite,
   // which flattens every \zaln. Character wrappers (`\qs Selah\qs*`) hold aligned
   // CONTENT, not a line break, and are tricky to re-lay around — bail on them
-  // outright. (The imported `\ts\*` node — tag `ts\*`, not `ts` — is NOT an
-  // in-flow marker, so prose verses still qualify.)
+  // outright. (An imported `\ts\*` node IS an in-flow marker as of the chunk-
+  // divider fix, so a prose verse carrying an interior divider now takes the
+  // reconcile path on a punctuation-only edit. That is safe — nodeForMarker
+  // re-mints the divider in its own parsed shape — but it is why nodeForMarker's
+  // emitted shape has to be exactly right.)
   const order: ("w" | "m")[] = [];
   let wrapperPresent = false;
   const scan = (nodes: unknown[]): void => {
