@@ -133,7 +133,11 @@ interface StatusResponse {
     chapter: number;
     skill: string;
     status: string;
-    startedAt: string;
+    // OPTIONAL, verified against the real bot: serializeCheckpoint
+    // (bp-assistant/src/api/pipeline.js) only spreads startedAt when the
+    // checkpoint carries one, so a run that parked before its first timing
+    // stamp omits the key entirely.
+    startedAt?: string;
     errorKind?: string;
     error?: string;
   };
@@ -144,7 +148,11 @@ interface StatusResponse {
   // resume-contract release onwards, so every read must tolerate undefined.
   // resume: what a resume would pick back up (chapter + skill). pausedAt: when
   // the bot parked the run, used to time-box auto-resume.
-  resume?: { chapter: number; skill: string } | null;
+  //
+  // `skill` is NULLABLE, verified against the real bot: it serializes
+  // `skill: cp.resume.skill ?? null`, so a checkpoint that knows the chapter to
+  // resume but not the step reports an explicit null.
+  resume?: { chapter: number; skill: string | null } | null;
   pausedAt?: string;
   output?: Array<{
     type: string;

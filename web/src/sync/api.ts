@@ -927,8 +927,15 @@ export interface PipelineStatusResponse {
   current?: {
     chapter: number;
     skill: string;
-    status: "running" | "succeeded" | "failed" | "skipped_complete";
-    startedAt: string;
+    // Free-form on purpose. Verified against the real bot: it passes the
+    // checkpoint's own value through untouched, and that includes at least
+    // 'pending', 'chapter_succeeded', 'skipped', 'done' and
+    // 'paused_before_at_generation' — none of which a closed union listed. The
+    // value is only ever displayed / stored as text, so widen rather than
+    // pretend.
+    status: string;
+    // Optional: the bot omits it on a checkpoint with no timing stamp.
+    startedAt?: string;
     errorKind?: PipelineErrorKind;
     error?: string;
   };
