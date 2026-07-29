@@ -1,7 +1,7 @@
 // Internal comments/notes — human-to-human, never exported to DCS. See
 // migrations/0037_comments.sql for the schema rationale. Follows the alerts.ts
-// conventions: Hono sub-app, requireAuth module-wide, requireEditor on
-// writes, zod bodies, 200 JSON always (never 204 — request<T> parses JSON
+// conventions: Hono sub-app, requireEditor module-wide (see below), zod
+// bodies, 200 JSON always (never 204 — request<T> parses JSON
 // unconditionally), CSRF handled globally.
 //
 // Hard rule: this module writes NOTHING to edit_log. The comments table's own
@@ -10,7 +10,7 @@
 import { Hono } from "hono";
 import { z } from "zod";
 import type { Env } from "./index";
-import { requireAuth, requireEditor, currentUserId, currentUserRole } from "./auth";
+import { requireEditor, currentUserId, currentUserRole } from "./auth";
 import { broadcastChapter } from "./wsEvents";
 import type { CommentDto } from "./types";
 import { resolveMentions } from "./mentions";
@@ -22,7 +22,12 @@ export const comments = new Hono<{
   Variables: { userId?: number; username?: string };
 }>();
 
-comments.use("*", requireAuth);
+// Editors-only for the whole module, reads included. These are internal
+// editor-to-editor notes; a read-only viewer can't write one and can't be
+// mentioned in one, so they have no business reading the discussion either.
+// Gating at the module level (rather than per route) keeps this default-closed
+// if another route is added later.
+comments.use("*", requireEditor);
 
 interface CommentRow {
   id: number;
@@ -87,7 +92,7 @@ async function loadComment(db: D1Database, id: number): Promise<CommentDto | nul
 
 // Every user we could mention. Small trusted roster (the users table only holds
 // role-allowlisted accounts), so no filtering or pagination.
-comments.get("/mention-users", requireEditor, async (c) => {
+comments.get("/mention-users", async (c) => {
   const rs = await c.env.DB.prepare(
     `SELECT id, dcs_username, dcs_full_name FROM users ORDER BY COALESCE(dcs_full_name, dcs_username)`,
   ).all<{ id: number; dcs_username: string; dcs_full_name: string | null }>();
@@ -131,7 +136,7 @@ async function allUsernames(db: D1Database): Promise<string[]> {
   return (rs.results ?? []).map((r) => r.dcs_username);
 }
 
-comments.post("/", requireEditor, async (c) => {
+comments.post("/", async (c) => {
   let body: unknown;
   try {
     body = await c.req.json();
@@ -220,7 +225,7 @@ comments.post("/", requireEditor, async (c) => {
 
 const UpdateBody = z.object({ body: z.string().trim().min(1).max(5000) });
 
-comments.patch("/:id", requireEditor, async (c) => {
+comments.patch("/:id", async (c) => {
   const id = parseInt(c.req.param("id"), 10);
   if (!Number.isFinite(id)) return c.json({ error: "invalid_params" }, 400);
 
@@ -281,7 +286,7 @@ comments.patch("/:id", requireEditor, async (c) => {
 
 const ResolveBody = z.object({ resolved: z.boolean() });
 
-comments.post("/:id/resolve", requireEditor, async (c) => {
+comments.post("/:id/resolve", async (c) => {
   const id = parseInt(c.req.param("id"), 10);
   if (!Number.isFinite(id)) return c.json({ error: "invalid_params" }, 400);
 
@@ -326,7 +331,7 @@ comments.post("/:id/resolve", requireEditor, async (c) => {
   return c.json(comment);
 });
 
-comments.delete("/:id", requireEditor, async (c) => {
+comments.delete("/:id", async (c) => {
   const id = parseInt(c.req.param("id"), 10);
   if (!Number.isFinite(id)) return c.json({ error: "invalid_params" }, 400);
 
