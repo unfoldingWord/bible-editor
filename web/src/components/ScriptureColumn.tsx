@@ -21,6 +21,8 @@ import { highlightsFor, renderEditableHTML, renderHighlightedHTML, type Highligh
 import { markHighlightSx } from "../lib/highlightStyles";
 import { extractEditableText, extractTrailingMarkers, stripTrailingMarkers, splitSectionHeaders, type SectionHeader } from "../lib/usfm";
 import { SectionHeaderBand } from "./SectionHeaderBand";
+import { CommentBadge } from "./CommentBadge";
+import type { CommentCounts } from "../lib/commentsIndex";
 import { buildVerseIndex, formatVerseLabel, isFirstOfRange, isRangeRow } from "../lib/verseRange";
 import {
   classifySourceQuery,
@@ -147,6 +149,16 @@ interface Props {
   locked?: boolean;
   // Per-verse Text-lane checkoff, forwarded to the column/book scripture views.
   textCheck?: TextLaneCheck;
+  // Internal comments anchored to a verse (not to a tn/tq/twl row). Rendered as
+  // a small badge beside the {chapter}:{verse} caption in STACKED mode only —
+  // columns mode (DocColumn) and book mode are deliberately out of scope. Both
+  // props are absent for viewers (the comments API is editor-gated), so a
+  // viewer sees no badge. `verseCommentCounts` must be a MEMOIZED identity
+  // derived from the comments index: the memo comparator below compares it by
+  // reference, so a new identity is exactly the signal "comments changed,
+  // re-render", and a fresh arrow every Shell render would defeat the memo.
+  verseCommentCounts?: (verse: number) => CommentCounts;
+  onOpenVerseComments?: (anchorEl: HTMLElement, verse: number) => void;
 }
 
 const VERSION_LABEL: Record<string, string> = {
@@ -161,6 +173,9 @@ const READ_ONLY_VERSIONS = new Set(["UHB", "UGNT"]);
 // Stable empty column so a missing version (`indexByVersion["ULT"] ?? …`)
 // doesn't hand InactiveVerseRow a fresh `{}` each render and defeat its memo.
 const EMPTY_COLUMN: Record<number, VerseDto> = {};
+
+// Stable zero-counts for a verse with no threads (see NoteCard for the twin).
+const EMPTY_COMMENT_COUNTS: CommentCounts = { openQuestions: 0, notes: 0, total: 0 };
 
 const INTRO_TOOLTIP =
   "Chapter intro — chapter-level translation notes, Psalm superscriptions (\\d), and the paragraph / poetry markers that introduce verse 1.";
@@ -215,6 +230,8 @@ function ScriptureColumnInner({
   onEditBookSection,
   locked = false,
   textCheck,
+  verseCommentCounts,
+  onOpenVerseComments,
 }: Props) {
   const activeRef = useRef<HTMLDivElement | null>(null);
   const bodyRef = useRef<HTMLDivElement | null>(null);
@@ -517,6 +534,8 @@ function ScriptureColumnInner({
             onEditVerse={onEditVerse}
             onSaveVerse={onSaveVerse}
             onRestoreVerse={onRestoreVerse}
+            verseCommentCounts={verseCommentCounts}
+            onOpenVerseComments={onOpenVerseComments}
             onEditSection={onEditSection}
             locked={locked}
           />
@@ -627,7 +646,13 @@ function areScriptureColumnPropsEqual(a: Props, b: Props): boolean {
     // so only the active UHB line actually re-renders).
     a.twl === b.twl &&
     a.locked === b.locked &&
-    a.textCheck === b.textCheck
+    a.textCheck === b.textCheck &&
+    // Shell memoizes verseCommentCounts on the comments index, so a new
+    // reference here means "a comment was added/edited/resolved/deleted" and
+    // the verse badges must repaint. Omitting this check would leave them
+    // permanently stale — the badges would never update.
+    a.verseCommentCounts === b.verseCommentCounts &&
+    a.onOpenVerseComments === b.onOpenVerseComments
   );
 }
 
@@ -668,6 +693,8 @@ function StackedBody({
   onEditVerse,
   onSaveVerse,
   onRestoreVerse,
+  verseCommentCounts,
+  onOpenVerseComments,
   onEditSection,
   locked,
 }: {
@@ -696,6 +723,8 @@ function StackedBody({
     plainText: string | null,
     base: VerseDto,
   ) => void;
+  verseCommentCounts?: (verse: number) => CommentCounts;
+  onOpenVerseComments?: (anchorEl: HTMLElement, verse: number) => void;
   onEditSection?: (
     verseNum: number,
     bibleVersion: string,
@@ -784,6 +813,13 @@ function StackedBody({
                 >
                   {`${chapter}:${v}`}
                 </Typography>
+              )}
+              {onOpenVerseComments && (
+                <CommentBadge
+                  counts={verseCommentCounts?.(v) ?? EMPTY_COMMENT_COUNTS}
+                  onOpen={(el) => onOpenVerseComments(el, v)}
+                  titleWhenEmpty="Add an internal comment on this verse"
+                />
               )}
               <ActiveLine
                 book={book}
@@ -892,6 +928,8 @@ function StackedBody({
             search={search}
             findActiveMatch={findActiveMatch}
             onSelectVerse={onSelectVerse}
+            commentCounts={verseCommentCounts?.(v)}
+            onOpenComments={onOpenVerseComments}
           />
         );
       })}
@@ -914,6 +952,8 @@ const InactiveVerseRow = memo(
     search,
     findActiveMatch,
     onSelectVerse,
+    commentCounts,
+    onOpenComments,
   }: {
     v: number;
     chapter: number;
@@ -922,6 +962,8 @@ const InactiveVerseRow = memo(
     search: SearchState | null;
     findActiveMatch: FindMatch | null;
     onSelectVerse: (v: number) => void;
+    commentCounts?: CommentCounts;
+    onOpenComments?: (anchorEl: HTMLElement, verse: number) => void;
   }) {
     const ultV = ult[v];
     const ustV = ust[v];
@@ -992,6 +1034,19 @@ const InactiveVerseRow = memo(
           >
             {`${chapter}:${v}`}
           </Typography>
+        )}
+        {/* Inactive rows are dense, so the badge appears ONLY when this verse
+            actually has open threads — the "add a comment" affordance lives on
+            the active card. stopPropagation keeps the click from selecting the
+            verse: that would swap this row for the active Paper and detach the
+            popover's anchor element mid-open. */}
+        {onOpenComments && commentCounts && commentCounts.total > 0 && (
+          <Box
+            onClick={(e) => e.stopPropagation()}
+            sx={{ gridColumn: "1 / -1", gridRow: 1, justifySelf: "end", fontSize: 12, lineHeight: 1 }}
+          >
+            <CommentBadge counts={commentCounts} onOpen={(el) => onOpenComments(el, v)} />
+          </Box>
         )}
         {showUlt && (
           <>
@@ -1088,7 +1143,12 @@ const InactiveVerseRow = memo(
     a.ult === b.ult &&
     a.ust === b.ust &&
     a.search === b.search &&
-    a.findActiveMatch === b.findActiveMatch,
+    a.findActiveMatch === b.findActiveMatch &&
+    // By value — StackedBody calls verseCommentCounts(v) per render, so the
+    // object identity always differs even when nothing changed.
+    (a.commentCounts?.openQuestions ?? 0) === (b.commentCounts?.openQuestions ?? 0) &&
+    (a.commentCounts?.notes ?? 0) === (b.commentCounts?.notes ?? 0) &&
+    a.onOpenComments === b.onOpenComments,
 );
 
 function ActiveLine({

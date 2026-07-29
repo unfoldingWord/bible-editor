@@ -14,12 +14,7 @@ import {
   type Role,
 } from "./sync/api";
 import { setPipelineUser } from "./sync/pipelineStore";
-
-interface Location {
-  book: string;
-  chapter: number;
-  verse: number;
-}
+import { parseHashString, type Location } from "./lib/parseHash";
 
 // OBA (Obadiah) is the shortest book in the canon — one chapter, 21 verses.
 // Loads faster than ZEC on a cold cache and keeps the default landing page
@@ -34,13 +29,7 @@ const DEFAULT_BOOK = "OBA";
 const SIGNED_OUT_KEY = "bible-editor.signed_out";
 
 function parseHash(): Location {
-  const m = location.hash.match(/^#\/?([A-Za-z0-9]+)(?:\/(\d+))?(?:\/(\d+))?/);
-  if (!m) return { book: DEFAULT_BOOK, chapter: 1, verse: 1 };
-  return {
-    book: m[1].toUpperCase(),
-    chapter: m[2] ? parseInt(m[2], 10) : 1,
-    verse: m[3] ? parseInt(m[3], 10) : 1,
-  };
+  return parseHashString(location.hash, DEFAULT_BOOK);
 }
 
 function isDefaultLoc(l: Location): boolean {
@@ -351,15 +340,29 @@ export function App() {
               {a.linkUrl && (
                 <>
                   {" — "}
-                  <Link
-                    href={a.linkUrl}
-                    target="_blank"
-                    rel="noopener"
-                    color="inherit"
-                    underline="always"
-                  >
-                    view run
-                  </Link>
+                  {a.linkUrl.startsWith("/#/") ? (
+                    <Link
+                      href={a.linkUrl}
+                      onClick={(e) => {
+                        e.preventDefault();
+                        location.hash = a.linkUrl!.slice(2);
+                      }}
+                      color="inherit"
+                      underline="always"
+                    >
+                      go to comment
+                    </Link>
+                  ) : (
+                    <Link
+                      href={a.linkUrl}
+                      target="_blank"
+                      rel="noopener"
+                      color="inherit"
+                      underline="always"
+                    >
+                      view run
+                    </Link>
+                  )}
                 </>
               )}
             </Alert>
@@ -382,6 +385,7 @@ export function App() {
           bookHook={bookHook}
           onLogout={handleSignOut}
           meUserId={auth.kind === "ready" ? auth.me?.userId ?? null : null}
+          initialCommentId={loc.commentId}
         />
       </Box>
       <Snackbar
