@@ -77,6 +77,25 @@ function hasUnsafeMarkerTag(nodes: unknown[]): boolean {
   return false;
 }
 
+// One verse row by its full primary key. The same SELECT is open-coded at several
+// points in this file; new code should call this so the column list and key stay
+// in one place. (The pre-existing call sites are deliberately left alone — folding
+// them in is a separate, wider change.)
+function loadVerseRow(
+  db: D1Database,
+  book: string,
+  chapter: number,
+  verse: number,
+  bibleVersion: string,
+): Promise<VerseRow | null> {
+  return db
+    .prepare(
+      `SELECT * FROM verses WHERE book = ?1 AND chapter = ?2 AND verse = ?3 AND bible_version = ?4`,
+    )
+    .bind(book, chapter, verse, bibleVersion)
+    .first<VerseRow>();
+}
+
 function parseIfMatch(header: string | undefined): number | null {
   if (!header) return null;
   const trimmed = header.trim();
@@ -241,7 +260,102 @@ verses.patch("/:book/:chapter/:verse/:bibleVersion", requireEditor, async (c) =>
   )
     .bind(book, chapter, verse, bibleVersion)
     .first<VerseRow>();
-  if (!existing) return c.json({ error: "not_found" }, 404);
+
+  // Create the chapter-intro row on first write (#379). A chapter's opening
+  // paragraph marker lives BEFORE `\v 1`, so it is stored on the chapter-front
+  // pseudo-verse (verse 0) — and a chapter whose source USFM had no such marker
+  // has no verse-0 row at all. See lintChapterOpeningMarkers in lint.ts for the
+  // full background. Without this branch there is nothing to PATCH, so the flag
+  // that lint raises would be unfixable in-app.
+  //
+  // Deliberately narrow. Creation is allowed ONLY for verse 0, and only with
+  // `If-Match: 0` — an explicit "I expect no row here" assertion, so a create
+  // racing another create loses on the primary key instead of silently
+  // overwriting. Real verses still 404: inventing scripture verses that the
+  // source doesn't have would feed fabricated rows into the nightly export.
+  // Every guard above still applies (UHB/UGNT rejected, empty verseObjects
+  // legal for verse 0 only, unsafe marker tags rejected, pipeline lock honoured).
+  if (!existing) {
+    if (verse !== 0 || expected !== 0) return c.json({ error: "not_found" }, 404);
+    // The chapter must already exist in this resource. On the UPDATE path "the row
+    // is there" implicitly proved the reference was real; a create has no such
+    // proof, and book/chapter come straight off the URL. Without this probe an
+    // editor could PATCH /api/verses/MIC/999/0/ULT and mint a row that the nightly
+    // export renders as a genuine `\c 999` in the DCS commit (exportWorkflow reads
+    // every verse row for the book, in chapter order). Requiring a sibling verse in
+    // the same (book, chapter, bible_version) closes both the bogus-chapter and
+    // bogus-book cases without a canon table.
+    const sibling = await c.env.DB.prepare(
+      `SELECT 1 AS ok FROM verses
+         WHERE book = ?1 AND chapter = ?2 AND bible_version = ?3 AND verse > 0
+         LIMIT 1`,
+    )
+      .bind(book, chapter, bibleVersion)
+      .first<{ ok: number }>();
+    if (!sibling) return c.json({ error: "not_found", reason: "unknown_chapter" }, 404);
+    const userId = currentUserId(c);
+    const now = Math.floor(Date.now() / 1000);
+    const rowKey = `${book}/${chapter}/${verse}/${bibleVersion}`;
+    const contentJson = JSON.stringify(parsed.data.content);
+    let insertRes;
+    try {
+      [insertRes] = await c.env.DB.batch([
+        c.env.DB
+          .prepare(
+            `INSERT INTO verses (book, chapter, verse, bible_version, content_json, plain_text,
+                                 version, updated_at, updated_by)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7, ?8)`,
+          )
+          .bind(book, chapter, verse, bibleVersion, contentJson, parsed.data.plain_text ?? null, now, userId),
+        c.env.DB
+          .prepare(
+            `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, payload_json)
+             VALUES ('verse', ?1, ?2, ?3, NULL, 1, 'create', ?4)`,
+          )
+          .bind(rowKey, book, userId, JSON.stringify(parsed.data)),
+      ]);
+    } catch (err) {
+      // A concurrent create landed first, so the primary key rejected ours. Report
+      // it as a version conflict against the row that won, which sends the client
+      // through the same re-read-and-retry path a normal verse 409 uses (the
+      // outbox's silent auto-heal is row-only, so this surfaces the merge prompt).
+      //
+      // Re-probe rather than pattern-match the driver's error string: if the row is
+      // now there, a racing create is the only thing that could have put it there,
+      // and if it is NOT there the failure was something else (transient D1 error)
+      // and must keep propagating as a 5xx instead of being reported as a conflict.
+      const fresh = await loadVerseRow(c.env.DB, book, chapter, verse, bibleVersion);
+      if (!fresh) throw err;
+      let freshParsed: unknown;
+      try {
+        freshParsed = parseVerseContentJson(fresh);
+      } catch (err) {
+        if (err instanceof CorruptContentJsonError) {
+          logCorruptContentJson(err);
+          return c.json(corruptContentJsonBody(err), 500);
+        }
+        throw err;
+      }
+      return c.json({ error: "version_mismatch", current: { ...fresh, content: freshParsed } }, 409);
+    }
+    if (!insertRes.meta.changes) return c.json({ error: "verse_create_failed" }, 500);
+    // Re-read rather than synthesizing the response from the INSERT binds. It costs
+    // one query on a rare, human-triggered write, and in exchange the created row
+    // is returned by exactly the same shape as the UPDATE path below — including
+    // any column a hand-built literal would silently start getting wrong.
+    const created = await loadVerseRow(c.env.DB, book, chapter, verse, bibleVersion);
+    if (!created) return c.json({ error: "verse_create_failed" }, 500);
+    const createdDto = { ...created, content: parsed.data.content };
+    c.executionCtx.waitUntil(
+      broadcastChapter(c.env, created.book, created.chapter, {
+        type: "verse.updated",
+        verse: createdDto,
+      }),
+    );
+    // No lane reopen: verse 0 carries no checkoff lanes of its own, and the
+    // marker it now holds introduces verse 1 without changing verse 1's words.
+    return c.json(createdDto);
+  }
   if (existing.version !== expected) {
     let freshParsed: unknown;
     try {

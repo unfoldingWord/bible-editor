@@ -21,7 +21,7 @@ import {
 import { requireAuth, requireEditor, currentUserId } from "./auth";
 import { BOOK_NUMBERS, dcsUrls, dcsResourceFile, fileCommitSha, fetchText } from "./dcsSources";
 import { reimportBookFromDcs, recordResourceSync, type Resource } from "./bookReimport";
-import { lintTnRows, lintTqRows, lintTwlRows, lintUsfmVerses } from "./lint";
+import { lintChapterOpeningMarkers, lintTnRows, lintTqRows, lintTwlRows, lintUsfmVerses } from "./lint";
 import type { TnRow, TqRow, TwlRow, VerseRow } from "./types";
 
 export const books = new Hono<{ Bindings: Env; Variables: { userId?: number } }>();
@@ -77,6 +77,8 @@ books.get("/:book/lint", requireAuth, async (c) => {
     ...lintTwlRows(twl.results ?? []).map((i) => ({ ...i, resource: "twl" })),
     ...lintUsfmVerses(ult.results ?? []).map((i) => ({ ...i, resource: "ult" })),
     ...lintUsfmVerses(ust.results ?? []).map((i) => ({ ...i, resource: "ust" })),
+    ...lintChapterOpeningMarkers(ult.results ?? []).map((i) => ({ ...i, resource: "ult" })),
+    ...lintChapterOpeningMarkers(ust.results ?? []).map((i) => ({ ...i, resource: "ust" })),
   ];
   const flagCount = issues.filter((i) => i.bucket === "flag").length;
   const escalateCount = issues.filter((i) => i.bucket === "escalate").length;

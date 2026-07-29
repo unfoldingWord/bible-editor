@@ -3,7 +3,7 @@
 
 import assert from "node:assert/strict";
 import usfm from "usfm-js";
-import { lintTnRows, lintTqRows, lintTwlRows, lintUsfmVerses, blankRequiredRefs } from "./lint.ts";
+import { lintChapterOpeningMarkers, lintTnRows, lintTqRows, lintTwlRows, lintUsfmVerses, blankRequiredRefs } from "./lint.ts";
 
 let passed = 0;
 function t(name, fn) {
@@ -176,6 +176,138 @@ t("empty twl TWLink flagged", () => {
 });
 t("twl with both fields present passes", () => {
   assert.equal(lintTwlRows([twl({})]).length, 0);
+});
+
+// Chapter-opening paragraph marker (#378). Built from real usfm-js output so the
+// tests exercise the actual node placement: a `\p` before `\v 1` lands on the
+// chapter-FRONT pseudo-verse (stored as verse 0), not on verse 1.
+const chapterRows = (usfmText, { dropFront = false } = {}) => {
+  const j = usfm.toJSON(usfmText);
+  const ch = j.chapters["1"];
+  const base = { book: "MIC", verse_end: null, bible_version: "ULT", version: 1 };
+  const rows = [];
+  for (const [key, val] of Object.entries(ch)) {
+    const verse = key === "front" ? 0 : parseInt(key, 10);
+    if (!Number.isFinite(verse)) continue;
+    if (dropFront && verse === 0) continue;
+    rows.push({ ...base, chapter: 1, verse, content_json: JSON.stringify({ verseObjects: val.verseObjects }) });
+  }
+  return rows;
+};
+
+t("chapter opened by \\p passes", () => {
+  assert.equal(lintChapterOpeningMarkers(chapterRows("\\c 1\n\\p\n\\v 1 word\n")).length, 0);
+});
+t("chapter opened by \\q1 passes", () => {
+  assert.equal(lintChapterOpeningMarkers(chapterRows("\\c 1\n\\q1\n\\v 1 word\n")).length, 0);
+});
+t("chapter with NO intro row flagged (the MIC 5 ULT case)", () => {
+  const i = lintChapterOpeningMarkers(chapterRows("\\c 1\n\\p\n\\v 1 word\n", { dropFront: true }));
+  assert.equal(i.length, 1);
+  assert.equal(i[0].check, "Chapter opening marker");
+  assert.equal(i[0].bucket, "flag");
+  assert.equal(i[0].ref, "1:0");
+  assert.match(i[0].message, /no chapter-intro row/);
+});
+t("intro row present but carrying no opening marker flagged", () => {
+  // \d (Psalm superscription) is chapter-front content but is NOT a paragraph
+  // marker, so the chapter still opens unmarked.
+  const i = lintChapterOpeningMarkers(chapterRows("\\c 1\n\\d a title\n\\v 1 word\n"));
+  assert.equal(i.length, 1);
+  assert.equal(i[0].ref, "1:0");
+  assert.doesNotMatch(i[0].message, /no chapter-intro row/);
+});
+t("\\ts\\* alone does not count as an opening marker", () => {
+  const i = lintChapterOpeningMarkers(chapterRows("\\c 1\n\\ts\\*\n\\v 1 word\n"));
+  assert.equal(i.length, 1);
+});
+t("a front row ending in \\b still flags (blank line is not a paragraph opener)", () => {
+  const rows = [
+    { book: "MIC", chapter: 1, verse: 0, verse_end: null, bible_version: "ULT", version: 1,
+      content_json: JSON.stringify({ verseObjects: [{ type: "paragraph", tag: "b" }] }) },
+    { book: "MIC", chapter: 1, verse: 1, verse_end: null, bible_version: "ULT", version: 1,
+      content_json: JSON.stringify({ verseObjects: [{ type: "text", text: "word" }] }) },
+  ];
+  assert.equal(lintChapterOpeningMarkers(rows).length, 1);
+});
+t("chapter with no verse 1 is not judged", () => {
+  const rows = chapterRows("\\c 1\n\\p\n\\v 1 word\n").filter((r) => r.verse !== 1);
+  assert.equal(lintChapterOpeningMarkers(rows).length, 0);
+});
+t("mid-verse \\q1 in verse 1 does NOT count as an opening marker", () => {
+  // Regression: an Array.some() over verse 1 passed every poetic chapter, because
+  // poetry verses carry their own mid-verse line breaks. Real case: MIC 2:1 UST,
+  // which has no intro row and whose verse 1 is poetry — it must still flag.
+  const rows = [
+    { book: "MIC", chapter: 2, verse: 1, verse_end: null, bible_version: "UST", version: 1,
+      content_json: JSON.stringify({ verseObjects: [
+        { type: "milestone", tag: "zaln", content: "ה֧וֹי" },
+        { type: "text", text: "Woe" },
+        { type: "quote", tag: "q1" },
+        { type: "text", text: "to those" },
+      ] }) },
+  ];
+  const i = lintChapterOpeningMarkers(rows);
+  assert.equal(i.length, 1);
+  assert.equal(i[0].ref, "2:0");
+});
+t("marker only counts on verse 0 when it TRAILS the front matter", () => {
+  // A \d Psalm title AFTER the marker means the marker no longer introduces
+  // verse 1, so the chapter opens unmarked.
+  const rows = [
+    { book: "PSA", chapter: 3, verse: 0, verse_end: null, bible_version: "ULT", version: 1,
+      content_json: JSON.stringify({ verseObjects: [
+        { type: "quote", tag: "q1" },
+        { type: "section", tag: "d", text: "A psalm of David." },
+      ] }) },
+    { book: "PSA", chapter: 3, verse: 1, verse_end: null, bible_version: "ULT", version: 1,
+      content_json: JSON.stringify({ verseObjects: [{ type: "text", text: "word" }] }) },
+  ];
+  assert.equal(lintChapterOpeningMarkers(rows).length, 1);
+});
+t("a \\ts\\* after the marker does not hide it (Micah 4 shape)", () => {
+  // Prod stores trailing runs as `\q1` then `\ts\*`. A scan that stopped at the
+  // divider would report a correctly-marked chapter as bare. All three usfm-js
+  // shapes of the divider must be transparent.
+  for (const ts of [{ tag: "ts\\*" }, { tag: "ts*" }, { tag: "ts", content: "\\*" }]) {
+    const rows = [
+      { book: "MIC", chapter: 4, verse: 0, verse_end: null, bible_version: "ULT", version: 1,
+        content_json: JSON.stringify({ verseObjects: [{ type: "quote", tag: "q1" }, ts] }) },
+      { book: "MIC", chapter: 4, verse: 1, verse_end: null, bible_version: "ULT", version: 1,
+        content_json: JSON.stringify({ verseObjects: [{ type: "text", text: "word" }] }) },
+    ];
+    assert.equal(lintChapterOpeningMarkers(rows).length, 0, `divider shape ${JSON.stringify(ts)} should be transparent`);
+  }
+});
+t("whitespace between the marker and the verse edge does not hide it", () => {
+  const rows = [
+    { book: "MIC", chapter: 4, verse: 0, verse_end: null, bible_version: "ULT", version: 1,
+      content_json: JSON.stringify({ verseObjects: [{ type: "quote", tag: "q1" }, { type: "text", text: "\n" }] }) },
+    { book: "MIC", chapter: 4, verse: 1, verse_end: null, bible_version: "ULT", version: 1,
+      content_json: JSON.stringify({ verseObjects: [{ type: "text", text: "word" }] }) },
+  ];
+  assert.equal(lintChapterOpeningMarkers(rows).length, 0);
+});
+t("marker parked on verse 1 itself is accepted (no false positive)", () => {
+  const rows = [
+    { book: "MIC", chapter: 1, verse: 1, verse_end: null, bible_version: "ULT", version: 1,
+      content_json: JSON.stringify({ verseObjects: [{ type: "paragraph", tag: "p" }, { type: "text", text: "word" }] }) },
+  ];
+  assert.equal(lintChapterOpeningMarkers(rows).length, 0);
+});
+t("each unmarked chapter reported once, in chapter order", () => {
+  const mk = (chapter) => ({ book: "MIC", chapter, verse: 1, verse_end: null, bible_version: "ULT", version: 1,
+    content_json: JSON.stringify({ verseObjects: [{ type: "text", text: "word" }] }) });
+  const i = lintChapterOpeningMarkers([mk(5), mk(2)]);
+  assert.deepEqual(i.map((x) => x.ref), ["2:0", "5:0"]);
+});
+t("corrupt intro content_json does not throw and still flags", () => {
+  const rows = [
+    { book: "MIC", chapter: 1, verse: 0, verse_end: null, bible_version: "ULT", version: 1, content_json: "{not json" },
+    { book: "MIC", chapter: 1, verse: 1, verse_end: null, bible_version: "ULT", version: 1,
+      content_json: JSON.stringify({ verseObjects: [{ type: "text", text: "word" }] }) },
+  ];
+  assert.equal(lintChapterOpeningMarkers(rows).length, 1);
 });
 
 t("blankRequiredRefs returns deduped refs per kind", () => {
