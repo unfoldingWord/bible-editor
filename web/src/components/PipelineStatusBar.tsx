@@ -317,9 +317,14 @@ export function PipelineStatusBar({ toast, onToastClear }: Props = {}) {
           text: `This run paused ${describeAge(res.pausedAgeSeconds)} ago. Resuming will publish text generated before any edits made since. Resume anyway?`,
         });
       } else if (!res.ok) {
+        // Prefer the bot's own explanation when it sent one — for a
+        // session-mismatch refusal it names the actual next step ("resume it
+        // from Zulip instead"), which the bare state never conveys.
         setResumeError({
           jobId: job.job_id,
-          text: `Could not resume — the run is now ${res.state ?? "in another state"}.`,
+          text: res.detail
+            ? `Could not resume — ${res.detail}`
+            : `Could not resume — the run is now ${res.state ?? "in another state"}.`,
         });
       }
     } catch {

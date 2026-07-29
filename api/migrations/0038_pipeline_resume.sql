@@ -10,7 +10,7 @@
 -- The */5 poller now calls the bot's new POST /api/pipeline/{id}/resume, time-
 -- boxed (pause younger than 90 minutes) and capped, and fails the job fast when
 -- resume isn't possible so the queue drains in minutes. These two columns are
--- the per-job budget for that.
+-- the per-job budget for that; 0039 adds a third, resume_accepted_at.
 --
 -- The budget is per PAUSE CYCLE, not per job: one job row can span a
 -- multi-chapter run and pause more than once, so a poll that observes any
@@ -32,16 +32,5 @@
 --                        top. The increment is written conditionally on this
 --                        column (see attemptOutageResume) so two concurrent
 --                        pollers cannot both pass the window.
--- resume_accepted_at   : epoch seconds when the bot ACCEPTED a resume (HTTP 202,
---                        or 200 {status:'already_running'}), NULL otherwise.
---                        While this is set and within
---                        RESUME_ACCEPTED_GRACE_SECONDS (15m) the job is left
---                        strictly alone: the bot keeps reporting
---                        'paused_for_outage' until the resumed run reaches its
---                        first checkpoint write, and failing the job in that
---                        gap would free the bot slot and the chapter lock while
---                        the resumed run is still writing D1 and Door43 — the
---                        exact double-write this queue exists to prevent.
 ALTER TABLE pipeline_jobs ADD COLUMN resume_attempt_count INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE pipeline_jobs ADD COLUMN last_resume_at INTEGER;
-ALTER TABLE pipeline_jobs ADD COLUMN resume_accepted_at INTEGER;

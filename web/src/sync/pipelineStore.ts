@@ -433,7 +433,10 @@ export const pipelineStore = {
   ): Promise<{
     ok: boolean;
     state?: PipelineState;
+    /** Bare machine code — compare this ('stale_pause'), never `detail`. */
     reason?: string;
+    /** Human-readable explanation, including the bot's own message. */
+    detail?: string;
     pausedAgeSeconds?: number;
   }> {
     try {
@@ -443,13 +446,22 @@ export const pipelineStore = {
     } catch (e) {
       if (e instanceof ApiError && e.status === 409) {
         const body = e.body as
-          | { state?: PipelineState; message?: string; pausedAgeSeconds?: number }
+          | {
+              state?: PipelineState;
+              code?: string;
+              message?: string;
+              pausedAgeSeconds?: number;
+            }
           | undefined;
         await pollOne(jobId);
         return {
           ok: false,
           state: body?.state,
-          reason: body?.message,
+          // `code` is the bare machine code the caller branches on
+          // ('stale_pause'). `message` is prose that carries the bot's own
+          // explanation appended, so it must NOT be compared for equality.
+          reason: body?.code,
+          detail: body?.message,
           pausedAgeSeconds: body?.pausedAgeSeconds,
         };
       }
