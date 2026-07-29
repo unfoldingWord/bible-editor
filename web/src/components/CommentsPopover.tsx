@@ -736,9 +736,10 @@ function NewCommentComposer({
 }
 
 // ── Shared mention-aware text field ────────────────────────────────────
-// Typing "@" opens a small filtered picker anchored to the field; selecting
-// a user inserts "@username " at the caret and closes the list. Escape
-// closes it too. Deliberately simple — no arrow-key navigation, per spec.
+// Typing "@" plus at least one character opens a small filtered picker
+// anchored to the field. ArrowUp/ArrowDown move the highlight; Enter, Tab or a
+// click accept it, replacing the typed "@token" with "@username "; Escape
+// closes the list without touching the text.
 
 function MentionTextField({
   value,
@@ -764,6 +765,9 @@ function MentionTextField({
   // Which suggestion Enter/Tab will accept. Reset whenever the query changes,
   // so the highlight never points past the end of a freshly filtered list.
   const [activeIndex, setActiveIndex] = useState(0);
+  // Set while a pointer is down on a suggestion, so a stray blur mid-tap
+  // can't close the picker before the tap is delivered (see handleBlur).
+  const pickerPointerDownRef = useRef(false);
 
   const filtered = useMemo(() => {
     const q = pickerQuery.toLowerCase();
@@ -786,7 +790,11 @@ function MentionTextField({
     // word char) so typing "foo@bar" doesn't pop the picker for a mention the
     // server would never resolve anyway.
     const upToCaret = next.slice(0, caret);
-    const match = /(?:^|\s)@([A-Za-z0-9._-]*)$/.exec(upToCaret);
+    // At least one character after the "@": a bare "@" would otherwise match
+    // every user (`includes("")` is always true) and open a full list, so Enter
+    // would insert a name instead of a newline and Tab could not leave the
+    // field — after typing something as ordinary as "compare with 1:3 @".
+    const match = /(?:^|\s)@([A-Za-z0-9._-]+)$/.exec(upToCaret);
     if (match) {
       // match[0] may include a leading whitespace char (the `(?:^|\s)`
       // branch) — measure back from the "@" itself (1 char) plus the
@@ -803,12 +811,18 @@ function MentionTextField({
   }
 
   function handleKeyDown(e: React.KeyboardEvent) {
-    if (!pickerOpen || filtered.length === 0) return;
+    if (!pickerOpen) return;
+    // Escape is handled whenever the picker is OPEN, even with no matches to
+    // show. Gating it on `filtered.length` let Escape bubble to the panel's
+    // document listener and close the whole panel — which silently discarded
+    // an in-progress comment edit, whose draft (unlike the composers') isn't
+    // cached anywhere.
     if (e.key === "Escape") {
       setPickerOpen(false);
       e.stopPropagation();
       return;
     }
+    if (filtered.length === 0) return;
     if (e.key === "ArrowDown") {
       e.preventDefault();
       setActiveIndex((i) => (i + 1) % filtered.length);
@@ -831,19 +845,34 @@ function MentionTextField({
   }
 
   function handleBlur() {
-    // Close when focus genuinely leaves. A click on a suggestion does NOT get
-    // here: those items preventDefault on mousedown so the field never blurs.
-    // The earlier requestAnimationFrame version lost the click outright — the
-    // frame fired between mousedown and click, unmounting the item before its
-    // onClick could run, so clicking a suggestion did nothing at all.
+    // Close when focus genuinely leaves. A mouse click on a suggestion does not
+    // reach here (the items preventDefault on mousedown, so the field never
+    // blurs), but touch environments don't all behave that way — and if a blur
+    // does slip through mid-tap, closing synchronously would unmount the item
+    // and swallow the tap, which is exactly the bug this PR fixes. The pointer
+    // flag keeps that from regressing without reintroducing the
+    // requestAnimationFrame that lost the click in the first place.
+    if (pickerPointerDownRef.current) return;
     setPickerOpen(false);
   }
 
   function selectUser(user: MentionUser) {
-    if (mentionStart == null || !fieldRef.current) return;
-    const caret = fieldRef.current.selectionStart ?? value.length;
+    if (mentionStart == null) return;
+    // Replace exactly the "@query" token we opened the picker on — do NOT use
+    // the live caret as the end of the replaced range. The caret can move
+    // without any input event (ArrowLeft/Right, Home/End, Ctrl+Arrow), which
+    // left `mentionStart` pointing at the token while the caret pointed
+    // somewhere else, so accepting a suggestion spliced across unrelated text:
+    // "hello @chri" + ArrowLeft ArrowLeft + Enter produced
+    // "hello @christina ri", and Home duplicated the whole body.
+    const token = `@${pickerQuery}`;
+    if (value.slice(mentionStart, mentionStart + token.length) !== token) {
+      // The text moved under us — bail rather than corrupt it.
+      setPickerOpen(false);
+      return;
+    }
     const before = value.slice(0, mentionStart);
-    const after = value.slice(caret);
+    const after = value.slice(mentionStart + token.length);
     const next = `${before}@${user.username} ${after}`;
     onChange(next);
     setPickerOpen(false);
@@ -879,16 +908,27 @@ function MentionTextField({
         >
           <ClickAwayListener onClickAway={() => setPickerOpen(false)}>
             <Paper elevation={4}>
-              <List dense disablePadding>
+              <List dense disablePadding role="listbox">
                 {filtered.map((u, i) => (
                   <ListItemButton
                     key={u.id}
                     selected={i === activeIndex}
+                    role="option"
+                    aria-selected={i === activeIndex}
                     // Keep focus (and therefore the caret) in the field: without
                     // this the mousedown blurs it, which closes the picker and
                     // unmounts this item before the click lands.
-                    onMouseDown={(e) => e.preventDefault()}
-                    onClick={() => selectUser(u)}
+                    onMouseDown={(e) => {
+                      pickerPointerDownRef.current = true;
+                      e.preventDefault();
+                    }}
+                    onTouchStart={() => {
+                      pickerPointerDownRef.current = true;
+                    }}
+                    onClick={() => {
+                      pickerPointerDownRef.current = false;
+                      selectUser(u);
+                    }}
                   >
                     <ListItemText primary={u.fullName} secondary={`@${u.username}`} />
                   </ListItemButton>
