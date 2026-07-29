@@ -761,6 +761,9 @@ function MentionTextField({
   const [pickerOpen, setPickerOpen] = useState(false);
   const [pickerQuery, setPickerQuery] = useState("");
   const [mentionStart, setMentionStart] = useState<number | null>(null);
+  // Which suggestion Enter/Tab will accept. Reset whenever the query changes,
+  // so the highlight never points past the end of a freshly filtered list.
+  const [activeIndex, setActiveIndex] = useState(0);
 
   const filtered = useMemo(() => {
     const q = pickerQuery.toLowerCase();
@@ -793,24 +796,47 @@ function MentionTextField({
       setMentionStart(caret - match[1].length - 1);
       setPickerQuery(match[1]);
       setPickerOpen(true);
+      setActiveIndex(0);
     } else {
       setPickerOpen(false);
     }
   }
 
   function handleKeyDown(e: React.KeyboardEvent) {
-    if (e.key === "Escape" && pickerOpen) {
+    if (!pickerOpen || filtered.length === 0) return;
+    if (e.key === "Escape") {
       setPickerOpen(false);
       e.stopPropagation();
+      return;
+    }
+    if (e.key === "ArrowDown") {
+      e.preventDefault();
+      setActiveIndex((i) => (i + 1) % filtered.length);
+      return;
+    }
+    if (e.key === "ArrowUp") {
+      e.preventDefault();
+      setActiveIndex((i) => (i - 1 + filtered.length) % filtered.length);
+      return;
+    }
+    // Enter and Tab both accept the highlighted suggestion. preventDefault so
+    // Enter doesn't insert a newline in the multiline field and Tab doesn't
+    // move focus out of the composer; stopPropagation so the panel's own
+    // handlers don't also react.
+    if (e.key === "Enter" || e.key === "Tab") {
+      e.preventDefault();
+      e.stopPropagation();
+      selectUser(filtered[activeIndex] ?? filtered[0]);
     }
   }
 
   function handleBlur() {
-    // Without this the picker stays open after focus moves away (tab, click
-    // elsewhere in the panel) — close it. requestAnimationFrame so a click on
-    // a picker list item (which blurs the field first) still registers before
-    // the list unmounts.
-    requestAnimationFrame(() => setPickerOpen(false));
+    // Close when focus genuinely leaves. A click on a suggestion does NOT get
+    // here: those items preventDefault on mousedown so the field never blurs.
+    // The earlier requestAnimationFrame version lost the click outright — the
+    // frame fired between mousedown and click, unmounting the item before its
+    // onClick could run, so clicking a suggestion did nothing at all.
+    setPickerOpen(false);
   }
 
   function selectUser(user: MentionUser) {
@@ -854,8 +880,16 @@ function MentionTextField({
           <ClickAwayListener onClickAway={() => setPickerOpen(false)}>
             <Paper elevation={4}>
               <List dense disablePadding>
-                {filtered.map((u) => (
-                  <ListItemButton key={u.id} onClick={() => selectUser(u)}>
+                {filtered.map((u, i) => (
+                  <ListItemButton
+                    key={u.id}
+                    selected={i === activeIndex}
+                    // Keep focus (and therefore the caret) in the field: without
+                    // this the mousedown blurs it, which closes the picker and
+                    // unmounts this item before the click lands.
+                    onMouseDown={(e) => e.preventDefault()}
+                    onClick={() => selectUser(u)}
+                  >
                     <ListItemText primary={u.fullName} secondary={`@${u.username}`} />
                   </ListItemButton>
                 ))}
