@@ -418,6 +418,24 @@ export const pipelineStore = {
     }
   },
 
+  // Ask the server to resume a paused job. Always re-polls afterwards (success
+  // or 409) so the row shows whatever the bot actually did rather than an
+  // optimistic guess — resume is a request, not a state change we own.
+  async resume(jobId: string): Promise<{ ok: boolean; state?: PipelineState }> {
+    try {
+      await api.pipelineResume(jobId);
+      await pollOne(jobId);
+      return { ok: true };
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 409) {
+        const body = e.body as { state?: PipelineState } | undefined;
+        await pollOne(jobId);
+        return { ok: false, state: body?.state };
+      }
+      throw e;
+    }
+  },
+
   getQueueSummary(): PipelineQueueSummary | null {
     return queueSummary;
   },

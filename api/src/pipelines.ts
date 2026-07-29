@@ -140,6 +140,12 @@ interface StatusResponse {
   updatedAt: string;
   createdAt: string;
   interrupted?: boolean;
+  // Both additive, and both may be absent — the bot ships them only from the
+  // resume-contract release onwards, so every read must tolerate undefined.
+  // resume: what a resume would pick back up (chapter + skill). pausedAt: when
+  // the bot parked the run, used to time-box auto-resume.
+  resume?: { chapter: number; skill: string } | null;
+  pausedAt?: string;
   output?: Array<{
     type: string;
     repo: string;
@@ -190,6 +196,11 @@ interface PolledJob {
   // Prior poll's error_kind. Lets us detect a *repeated* import failure so a
   // deterministically-bad apply force-fails instead of holding the slot/lock.
   error_kind: string | null;
+  // Auto-resume budget for 'paused_for_outage' (migration 0038). updated_at is
+  // the fallback pause clock when the bot doesn't report pausedAt.
+  updated_at: number;
+  resume_attempt_count: number;
+  last_resume_at: number | null;
 }
 
 interface ChainStepValue {
@@ -383,6 +394,150 @@ export async function dispatchNext(env: Env): Promise<void> {
     .run();
 }
 
+// ── Resume (transient-outage recovery) ─────────────────────────────────────
+
+// Outcome of one upstream resume call. 'accepted' = the bot took it (202) and
+// the job stays non-terminal. 'refused' = the bot says this pause can't be
+// resumed (404 / 409) — non-retryable, so the caller should stop rather than
+// burn the remaining attempts. 'retryable' = transport/429/5xx; try again later.
+type ResumeCall =
+  | { kind: "accepted"; body: unknown }
+  | { kind: "refused"; status: number; reason: string }
+  | { kind: "retryable"; reason: string };
+
+// Calls the bot's POST /api/pipeline/{id}/resume. Shared by the automatic
+// poller path and the manual route so both classify responses identically.
+//
+// `force` bypasses the bot's OWN 90-minute pause time-box. The bot enforces that
+// box independently of ours (belt and braces: it owns the checkpoint timestamp,
+// we only see what it reports), so without force a human clicking Resume on an
+// old pause would be refused with 'stale_pause' no matter how permissive this
+// side is. Only the manual, human-initiated route may set it — the automatic
+// poller must never force, because the time-box is what keeps auto-resume from
+// re-pushing content generated before a proofreader's edits (see
+// bp-bot/STALE-SOURCE-DIAGNOSIS.md).
+async function callUpstreamResume(
+  env: Env,
+  upstreamJobId: string,
+  opts: { force: boolean },
+): Promise<ResumeCall> {
+  let upstream: Response;
+  try {
+    upstream = await fetch(
+      `${upstreamBase(env)}/api/pipeline/${encodeURIComponent(upstreamJobId)}/resume`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${env.BT_API_TOKEN}`,
+        },
+        body: JSON.stringify({ force: opts.force }),
+      },
+    );
+  } catch {
+    return { kind: "retryable", reason: "upstream_unreachable" };
+  }
+  const text = await upstream.text();
+  let body: unknown = null;
+  try {
+    body = JSON.parse(text);
+  } catch {
+    /* non-JSON body — keep the raw text in the reason instead */
+  }
+  const err =
+    body && typeof body === "object" && typeof (body as { error?: unknown }).error === "string"
+      ? (body as { error: string }).error
+      : null;
+
+  if (upstream.status === 202) return { kind: "accepted", body };
+  // 404 (no checkpoint) and 409 (not_resumable / stale_pause) are the bot's
+  // definitive "this will never work" answers — treat as non-retryable.
+  if (upstream.status === 404 || upstream.status === 409) {
+    return {
+      kind: "refused",
+      status: upstream.status,
+      reason: err ?? `upstream ${upstream.status}: ${text.slice(0, 120)}`,
+    };
+  }
+  return {
+    kind: "retryable",
+    reason: err ?? `upstream ${upstream.status}: ${text.slice(0, 120)}`,
+  };
+}
+
+// Auto-resume a job the bot parked on a transient Claude outage. Returns a
+// reason string when the job is NOT resumable and must be failed fast (so the
+// bot slot frees and the queue drains), or null to leave it non-terminal —
+// either because a resume was accepted, because we're spacing attempts out, or
+// because the failure was transient and a later poll can retry.
+//
+// Deliberately scoped to 'paused_for_outage'. 'paused_for_usage_limit' means the
+// daily budget is spent; resuming would re-fail immediately, so that state keeps
+// its existing behavior untouched.
+async function attemptOutageResume(
+  env: Env,
+  job: PolledJob,
+  data: StatusResponse,
+): Promise<string | null> {
+  if (!job.upstream_job_id) return null;
+  const now = Math.floor(Date.now() / 1000);
+
+  // Pause clock: prefer the bot's own pausedAt. The fallback to our row's
+  // updated_at is WEAKER, not merely approximate: the poller refreshes
+  // updated_at on every */5 poll, so the computed age is a lower bound and this
+  // check can let through a pause far older than 90 minutes. That is the unsafe
+  // direction for content freshness, not a conservative one.
+  //
+  // It is nonetheless safe overall, because the bot enforces the same 90-minute
+  // box against its checkpoint's real timestamp and refuses with 'stale_pause'
+  // (we never send force from this path). The bot is the authority; this check
+  // is an optimization that saves a round trip. Do not "simplify" by dropping
+  // the bot-side box on the grounds that the app already checks — it doesn't,
+  // reliably.
+  let pausedAtSec = job.updated_at;
+  if (data.pausedAt) {
+    const parsed = Date.parse(data.pausedAt);
+    if (Number.isFinite(parsed)) pausedAtSec = Math.floor(parsed / 1000);
+  }
+  const ageSeconds = Math.max(0, now - pausedAtSec);
+  if (ageSeconds > RESUME_MAX_PAUSE_AGE_SECONDS) {
+    return `paused ${Math.floor(ageSeconds / 60)}m ago — too old to auto-resume safely (limit ${
+      RESUME_MAX_PAUSE_AGE_SECONDS / 60
+    }m)`;
+  }
+  if (job.resume_attempt_count >= MAX_RESUME_ATTEMPTS) {
+    return `auto-resume exhausted after ${job.resume_attempt_count} attempts`;
+  }
+  // Spacing. The poll cron is */5 and the spacing window is 5m, so in practice
+  // this allows one attempt per poll and guards against a second poller (an
+  // open tab's GET) doubling up in the same window.
+  if (job.last_resume_at !== null && now - job.last_resume_at < RESUME_RETRY_SPACING_SECONDS) {
+    return null;
+  }
+
+  // Count the attempt BEFORE the call so a Worker crash mid-flight can't give
+  // us unlimited retries — same reasoning as attempt_count in pollAllNonTerminal.
+  await env.DB.prepare(
+    `UPDATE pipeline_jobs
+        SET resume_attempt_count = resume_attempt_count + 1,
+            last_resume_at = unixepoch()
+      WHERE job_id = ?1`,
+  )
+    .bind(job.job_id)
+    .run();
+
+  // Never force from the automatic path — the bot's time-box is a safety gate here.
+  const call = await callUpstreamResume(env, job.upstream_job_id, { force: false });
+  if (call.kind === "accepted") return null;
+  if (call.kind === "refused") {
+    return `auto-resume refused by bot: ${call.reason}`;
+  }
+  // Retryable: the attempt is spent but the job stays paused. A later poll
+  // retries until the cap or the time-box catches it.
+  console.error(`[pipelineResume] job=${job.job_id} retryable: ${call.reason}`);
+  return null;
+}
+
 // Shared "fetch upstream, run import, update DB, fire follow-up" body used
 // by both the GET handler and the scheduled cron poller. Returns the raw
 // upstream response so callers that need to pass it through can do so;
@@ -490,24 +645,42 @@ async function pollPipelineJob(
     data.state !== "failed" &&
     data.state !== "cancelled";
 
+  // Transient-outage pause: try to resume it automatically (time-boxed and
+  // capped — see attemptOutageResume). If it can't be resumed, we get a reason
+  // back and fail the job now so the single bot slot frees and everything queued
+  // behind it dispatches within minutes instead of waiting ~8h for the blunt
+  // MAX_POLL_ATTEMPTS backstop.
+  let unresumableReason: string | null = null;
+  if (!importFailed && !upstreamInterrupted && data.state === "paused_for_outage") {
+    try {
+      unresumableReason = await attemptOutageResume(env, job, data);
+    } catch (err) {
+      console.error(`[pipelineResume] job=${job.job_id} threw:`, err);
+    }
+  }
+
   const importFailedAgain = importFailed && job.error_kind === "import_failed";
   const effectiveState = importFailed
     ? importFailedAgain
       ? "failed"
       : "running"
-    : upstreamInterrupted
+    : upstreamInterrupted || unresumableReason
       ? "failed"
       : (data.state ?? "running");
   const effectiveErrorKind = importFailed
     ? "import_failed"
     : upstreamInterrupted
       ? "interrupted"
-      : (data.current?.errorKind ?? null);
+      : unresumableReason
+        ? "paused_unresumable"
+        : (data.current?.errorKind ?? null);
   const effectiveErrorMessage = importFailed
     ? importErrMessage
     : upstreamInterrupted
       ? (data.current?.error ?? "upstream reported interrupted")
-      : (data.current?.error ?? null);
+      : unresumableReason
+        ? `paused for outage and not resumable: ${unresumableReason}`
+        : (data.current?.error ?? null);
 
   await env.DB.prepare(
     `UPDATE pipeline_jobs SET
@@ -625,6 +798,19 @@ async function pollPipelineJob(
         error: data.current?.error ?? "upstream reported interrupted",
       },
     });
+  } else if (unresumableReason) {
+    // Same reasoning as the interrupted branch: upstream still reports
+    // 'paused_for_outage', we stored 'failed'. Rewrite so a tab polling this
+    // job by id sees terminal and stops.
+    responseText = JSON.stringify({
+      ...data,
+      state: "failed",
+      current: {
+        ...(data.current ?? { chapter: 0, skill: "", status: "", startedAt: "" }),
+        errorKind: "paused_unresumable",
+        error: `paused for outage and not resumable: ${unresumableReason}`,
+      },
+    });
   }
 
   return { kind: "ok", text: responseText, status: upstream.status, state: effectiveState };
@@ -646,6 +832,19 @@ const MAX_POLL_ATTEMPTS = 100;
 // slot and recording the result — fail it (don't auto-re-dispatch) so we never
 // risk launching a second concurrent run, and free the slot for the queue.
 const STUCK_DISPATCH_THRESHOLD_SECONDS = 120;
+
+// Auto-resume time-box. A pause older than this is not resumed automatically:
+// the bot's checkpoint may no longer match the repo state, and a stale resume is
+// worse than a clean re-run. A human can still resume an old pause explicitly
+// via POST /api/pipelines/:jobId/resume, which skips this and the attempt cap.
+const RESUME_MAX_PAUSE_AGE_SECONDS = 90 * 60;
+
+// How many automatic resume attempts one job gets before we fail it.
+const MAX_RESUME_ATTEMPTS = 3;
+
+// Minimum gap between automatic resume attempts, so a bot that is still down
+// isn't hammered (and two concurrent pollers can't double-attempt).
+const RESUME_RETRY_SPACING_SECONDS = 5 * 60;
 
 // Polls every non-terminal pipeline_job. Designed for the scheduled
 // handler — runs in parallel with per-job error isolation so one stuck
@@ -693,7 +892,8 @@ export async function pollAllNonTerminal(env: Env): Promise<void> {
   const rs = await env.DB.prepare(
     `SELECT job_id, upstream_job_id, user_id, pipeline_type, book, start_chapter,
             end_chapter, session_key, follow_up_options, follow_up_chain,
-            follow_up_job_id, error_kind, (output_json IS NULL) AS no_output_yet
+            follow_up_job_id, error_kind, updated_at, resume_attempt_count,
+            last_resume_at, (output_json IS NULL) AS no_output_yet
        FROM pipeline_jobs
       WHERE state IN ('running', 'paused_for_outage', 'paused_for_usage_limit')
       ORDER BY updated_at ASC
@@ -936,7 +1136,8 @@ pipelines.get("/:jobId", requireEditor, async (c) => {
     `SELECT job_id, upstream_job_id, user_id, pipeline_type, book, start_chapter,
             end_chapter, session_key, follow_up_options, follow_up_chain,
             follow_up_job_id, error_kind, state, current_skill, current_status,
-            created_at, updated_at, (output_json IS NULL) AS no_output_yet
+            created_at, updated_at, resume_attempt_count, last_resume_at,
+            (output_json IS NULL) AS no_output_yet
        FROM pipeline_jobs WHERE job_id = ?1`,
   )
     .bind(jobId)
@@ -1280,10 +1481,13 @@ interface PipelineRowSelect {
 }
 
 // POST /api/pipelines/:jobId/cancel  — withdraw a job that hasn't reached the
-// front of the line yet. Only 'queued' jobs are cancellable (they never
-// touched the bot); a job that's already 'dispatching'/'running' or terminal
-// returns 409. Sets notified_user_at so the cancelled row doesn't resurface as
-// a "while you were away" item on the next reload.
+// front of the line yet, or abandon one the bot has parked. Cancellable states:
+// 'queued' (never touched the bot) and the two paused states — a paused job
+// holds the single bot slot and isn't progressing, so the owner must be able to
+// give up on it instead of waiting for the 48h backstop. 'dispatching' /
+// 'running' and terminal states still return 409. Sets notified_user_at so the
+// cancelled row doesn't resurface as a "while you were away" item on the next
+// reload.
 pipelines.post("/:jobId/cancel", requireEditor, async (c) => {
   const userId = currentUserId(c);
   if (!userId) return c.json({ error: "unauthorized" }, 401);
@@ -1297,19 +1501,20 @@ pipelines.post("/:jobId/cancel", requireEditor, async (c) => {
     .first<{ user_id: number; state: string }>();
   if (!owned) return c.json({ error: "not_found" }, 404);
   if (owned.user_id !== userId) return c.json({ error: "forbidden" }, 403);
-  if (owned.state !== "queued") {
+  const CANCELLABLE = ["queued", "paused_for_outage", "paused_for_usage_limit"];
+  if (!CANCELLABLE.includes(owned.state)) {
     return c.json({ error: "cannot_cancel", state: owned.state }, 409);
   }
 
-  // Guard on state='queued' again in the UPDATE so a concurrent dispatch that
-  // just claimed this row (queued -> dispatching) can't be cancelled out from
-  // under the bot.
+  // Guard on the cancellable set again in the UPDATE so a concurrent dispatch
+  // that just claimed this row (queued -> dispatching), or a poll that just
+  // resumed a paused one, can't be cancelled out from under the bot.
   const res = await c.env.DB.prepare(
     `UPDATE pipeline_jobs
         SET state = 'cancelled', notified_user_at = unixepoch(), updated_at = unixepoch()
-      WHERE job_id = ?1 AND state = 'queued'`,
+      WHERE job_id = ?1 AND state IN (?2, ?3, ?4)`,
   )
-    .bind(jobId)
+    .bind(jobId, ...CANCELLABLE)
     .run();
   if ((res.meta?.changes ?? 0) === 0) {
     const now = await c.env.DB.prepare(
@@ -1319,7 +1524,73 @@ pipelines.post("/:jobId/cancel", requireEditor, async (c) => {
       .first<{ state: string }>();
     return c.json({ error: "cannot_cancel", state: now?.state ?? "unknown" }, 409);
   }
+  // Cancelling a paused job frees the single bot slot it was holding — pull the
+  // next queued job right away rather than waiting for the */5 cron.
+  if (owned.state !== "queued") {
+    try {
+      await dispatchNext(c.env);
+    } catch (err) {
+      console.error(`[cancel.dispatchNext] job=${jobId}:`, err);
+    }
+  }
   return c.json({ ok: true, jobId, state: "cancelled" });
+});
+
+// POST /api/pipelines/:jobId/resume  — ask the bot to pick a paused run back
+// up. Deliberately more permissive than the automatic path in
+// attemptOutageResume: no 90-minute time-box and no attempt cap, because a
+// human explicitly asking to resume an old pause is allowed to. Also covers
+// 'paused_for_usage_limit', which auto-resume never touches (the daily budget
+// resets, so a manual resume the next day is exactly the right move).
+// Same auth + ownership shape as /cancel above.
+pipelines.post("/:jobId/resume", requireEditor, async (c) => {
+  if (!c.env.BT_API_TOKEN) {
+    return c.json({ error: "pipeline_api_disabled" }, 503);
+  }
+  const userId = currentUserId(c);
+  if (!userId) return c.json({ error: "unauthorized" }, 401);
+  const jobId = c.req.param("jobId");
+  if (!jobId) return c.json({ error: "missing_job_id" }, 400);
+
+  const owned = await c.env.DB.prepare(
+    `SELECT user_id, state, upstream_job_id FROM pipeline_jobs WHERE job_id = ?1`,
+  )
+    .bind(jobId)
+    .first<{ user_id: number; state: string; upstream_job_id: string | null }>();
+  if (!owned) return c.json({ error: "not_found" }, 404);
+  if (owned.user_id !== userId) return c.json({ error: "forbidden" }, 403);
+  if (owned.state !== "paused_for_outage" && owned.state !== "paused_for_usage_limit") {
+    return c.json({ error: "cannot_resume", state: owned.state }, 409);
+  }
+  if (!owned.upstream_job_id) {
+    // Paused implies it reached the bot, so this shouldn't happen; be explicit
+    // rather than calling the bot with an empty id.
+    return c.json({ error: "cannot_resume", state: owned.state }, 409);
+  }
+
+  // A human asked explicitly, so bypass the bot's time-box as well as ours.
+  const call = await callUpstreamResume(c.env, owned.upstream_job_id, { force: true });
+  if (call.kind === "accepted") {
+    // Record the attempt for observability and reset the poller's spacing
+    // window; leave the state alone — the next poll observes real progress.
+    await c.env.DB.prepare(
+      `UPDATE pipeline_jobs
+          SET resume_attempt_count = resume_attempt_count + 1,
+              last_resume_at = unixepoch(),
+              updated_at = unixepoch()
+        WHERE job_id = ?1`,
+    )
+      .bind(jobId)
+      .run();
+    return c.json({ ok: true, jobId, state: "resumed", upstream: call.body });
+  }
+  if (call.kind === "refused") {
+    return c.json(
+      { error: "resume_refused", state: owned.state, message: call.reason },
+      409,
+    );
+  }
+  return c.json({ error: "upstream_error", message: call.reason }, 502);
 });
 
 // POST /api/pipelines/:jobId/notified  — mark a terminal job as having
@@ -1347,3 +1618,4 @@ pipelines.post("/:jobId/notified", requireEditor, async (c) => {
   // doesn't care.
   return c.json({ ok: true, changed: res.meta?.changes ?? 0 });
 });
+

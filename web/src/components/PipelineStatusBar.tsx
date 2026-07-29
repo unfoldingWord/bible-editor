@@ -2,7 +2,7 @@
 // status cluster (via the `pipelineStatus` prop) so it sits in normal flow
 // instead of floating over the resource-column tab strip; the popover opens
 // downward from the chip. Click expands to list each job with its state,
-// current skill, and (for resumable failures) a Retry button. The transient
+// current skill, and (for paused runs) Resume / Cancel buttons. The transient
 // start/complete toast rides a bottom-center Snackbar, matching the import
 // toasts in TopBar.
 
@@ -199,6 +199,11 @@ export function PipelineStatusBar({ toast, onToastClear }: Props = {}) {
   const [jobs, setJobs] = useState<PipelineJobRow[]>([]);
   const [anchorEl, setAnchorEl] = useState<HTMLElement | null>(null);
   const [cancelling, setCancelling] = useState<string | null>(null);
+  const [resuming, setResuming] = useState<string | null>(null);
+  // Per-job resume failure text. The row already renders job.error_message from
+  // the server; this covers the request itself failing (the row's own state
+  // doesn't change on a refused resume).
+  const [resumeError, setResumeError] = useState<{ jobId: string; text: string } | null>(null);
   const [refreshing, setRefreshing] = useState(false);
   // When pipelineStore.requestFocus(jobId) fires (e.g. on already_running),
   // we stash the request and let the next render — once hasAnything flips
@@ -277,6 +282,24 @@ export function PipelineStatusBar({ toast, onToastClear }: Props = {}) {
       // real state; other failures are transient — leave the row as-is.
     } finally {
       setCancelling(null);
+    }
+  };
+
+  const resume = async (job: PipelineJobRow) => {
+    setResuming(job.job_id);
+    setResumeError(null);
+    try {
+      const res = await pipelineStore.resume(job.job_id);
+      if (!res.ok) {
+        setResumeError({
+          jobId: job.job_id,
+          text: `Could not resume — the run is now ${res.state ?? "in another state"}.`,
+        });
+      }
+    } catch {
+      setResumeError({ jobId: job.job_id, text: "Resume failed — try again." });
+    } finally {
+      setResuming(null);
     }
   };
 
@@ -390,6 +413,12 @@ export function PipelineStatusBar({ toast, onToastClear }: Props = {}) {
             {jobs.map((job, i) => {
               const parentId = parentByChildId.get(job.job_id);
               const childId = job.follow_up_job_id;
+              // A paused run holds the single bot slot without progressing, so
+              // its owner gets both escapes: ask the bot to pick it back up, or
+              // give up on it and let the queue move.
+              const isPaused =
+                job.state === "paused_for_outage" || job.state === "paused_for_usage_limit";
+              const canAct = (job.state === "queued" || isPaused) && !isForeign(job);
               return (
               <Box key={job.job_id}>
                 {i > 0 && <Divider sx={{ my: 1 }} />}
@@ -432,15 +461,47 @@ export function PipelineStatusBar({ toast, onToastClear }: Props = {}) {
                         {job.error_message}
                       </Typography>
                     )}
+                    {resumeError?.jobId === job.job_id && (
+                      <Typography variant="caption" color="error" display="block">
+                        {resumeError.text}
+                      </Typography>
+                    )}
                   </Box>
-                  {job.state === "queued" && !isForeign(job) && (
-                    <Tooltip title="Remove from the queue (only possible before it starts)">
+                  {isPaused && !isForeign(job) && (
+                    <Tooltip
+                      title={
+                        job.state === "paused_for_usage_limit"
+                          ? "Ask the bot to pick this run back up (the daily AI budget must have reset)"
+                          : "Ask the bot to pick this run back up from where the outage stopped it"
+                      }
+                    >
+                      <span>
+                        <Button
+                          size="small"
+                          color="inherit"
+                          onClick={() => void resume(job)}
+                          disabled={resuming === job.job_id || cancelling === job.job_id}
+                          startIcon={resuming === job.job_id ? <CircularProgress size={12} /> : undefined}
+                        >
+                          Resume
+                        </Button>
+                      </span>
+                    </Tooltip>
+                  )}
+                  {canAct && (
+                    <Tooltip
+                      title={
+                        isPaused
+                          ? "Give up on this paused run and free the queue"
+                          : "Remove from the queue (only possible before it starts)"
+                      }
+                    >
                       <span>
                         <Button
                           size="small"
                           color="inherit"
                           onClick={() => void cancel(job)}
-                          disabled={cancelling === job.job_id}
+                          disabled={cancelling === job.job_id || resuming === job.job_id}
                           startIcon={cancelling === job.job_id ? <CircularProgress size={12} /> : undefined}
                         >
                           Cancel
@@ -508,3 +569,4 @@ export function PipelineStatusBar({ toast, onToastClear }: Props = {}) {
     </>
   );
 }
+

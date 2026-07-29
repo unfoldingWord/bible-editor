@@ -1,0 +1,24 @@
+-- Auto-resume for pipelines the bot parked on a transient Claude outage.
+--
+-- When bp-assistant hits a transient Claude outage mid-run it parks the job in
+-- state 'paused_for_outage'. Nothing ever resumed it, and because a paused job
+-- still occupies the single bot slot (see ACTIVE_STATES in api/src/pipelines.ts)
+-- every queued job behind it stalled until the blunt MAX_POLL_ATTEMPTS backstop
+-- failed it ~8h later. Real incident: DAN 7 notes paused, three jobs stuck
+-- behind it.
+--
+-- The */5 poller now calls the bot's new POST /api/pipeline/{id}/resume, time-
+-- boxed (pause younger than 90 minutes) and capped, and fails the job fast when
+-- resume isn't possible so the queue drains in minutes. These two columns are
+-- the per-job budget for that.
+--
+-- resume_attempt_count : how many automatic resume attempts we have made for
+--                        this job. Capped by MAX_RESUME_ATTEMPTS (3); manual
+--                        resume via POST /api/pipelines/:jobId/resume does not
+--                        consume it (a human asking is always allowed).
+-- last_resume_at       : epoch seconds of the most recent automatic attempt,
+--                        NULL if never attempted. Enforces spacing
+--                        (RESUME_RETRY_SPACING_SECONDS) so we don't hammer the
+--                        bot while it is still down.
+ALTER TABLE pipeline_jobs ADD COLUMN resume_attempt_count INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE pipeline_jobs ADD COLUMN last_resume_at INTEGER;

@@ -1340,6 +1340,15 @@ export const api = {
       { method: "POST", signal },
     ),
 
+  // Ask the bot to pick a paused run back up. Server returns 409
+  // {error:"cannot_resume"|"resume_refused", state, message?} when the job isn't
+  // in a paused state or the bot won't take it, 502 on an upstream failure.
+  pipelineResume: (jobId: string, signal?: AbortSignal) =>
+    request<{ ok: boolean; jobId: string; state: "resumed" }>(
+      `/api/pipelines/${encodeURIComponent(jobId)}/resume`,
+      { method: "POST", signal },
+    ),
+
   // Acknowledge a "completed-while-away" toast so the server clears its
   // unnotified flag. Fire-and-forget — if it fails the user just sees the
   // toast again on the next reload, which is harmless.
