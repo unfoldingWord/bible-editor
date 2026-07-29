@@ -1,7 +1,7 @@
 // Smoke test for parseHash.ts. Run from web/:
 //   node --experimental-strip-types --no-warnings src/lib/parseHash.test.mjs
 
-import { parseHashString } from "./parseHash.ts";
+import { parseHashString, stripCommentParam } from "./parseHash.ts";
 
 let failed = 0;
 function assert(cond, msg) {
@@ -63,6 +63,22 @@ const DEFAULT_BOOK = "OBA";
   assert(loc.book === "ZEC" && loc.chapter === 5, "chapter-only + ?c= parses book/chapter");
   assert(loc.verse === 1, "chapter-only + ?c= defaults verse to 1");
   assert(loc.commentId === 7, "chapter-only + ?c= extracts commentId");
+}
+
+// ── stripCommentParam ──────────────────────────────────────────────────────
+// Removing the deep-link param must never damage the path or other params.
+assert(stripCommentParam("#/ZEC/5/3") === "#/ZEC/5/3", "no query: unchanged");
+assert(stripCommentParam("#/ZEC/5/3?c=12") === "#/ZEC/5/3", "only c: query dropped entirely");
+assert(stripCommentParam("#/ZEC/5/3?c=12&x=1") === "#/ZEC/5/3?x=1", "c first: separator repaired");
+assert(stripCommentParam("#/ZEC/5/3?x=1&c=12") === "#/ZEC/5/3?x=1", "c last: other param kept");
+assert(stripCommentParam("#/ZEC/5/3?x=1") === "#/ZEC/5/3?x=1", "no c: other params untouched");
+assert(stripCommentParam("") === "", "empty hash: unchanged");
+{
+  // The round trip that matters: strip, then reparse — commentId must be gone
+  // while the location survives. This is what lets the same alert be clicked twice.
+  const loc = parseHashString(stripCommentParam("#/ZEC/5/3?c=12"), DEFAULT_BOOK);
+  assert(loc.commentId === undefined, "round trip: commentId cleared");
+  assert(loc.book === "ZEC" && loc.chapter === 5 && loc.verse === 3, "round trip: location preserved");
 }
 
 if (failed) {

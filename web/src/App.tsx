@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Alert, Box, Button, CircularProgress, Link, Snackbar, Stack, Typography } from "@mui/material";
 import { Shell } from "./components/Shell";
 import { useBook } from "./hooks/useBook";
@@ -14,7 +14,7 @@ import {
   type Role,
 } from "./sync/api";
 import { setPipelineUser } from "./sync/pipelineStore";
-import { parseHashString, type Location } from "./lib/parseHash";
+import { parseHashString, stripCommentParam, type Location } from "./lib/parseHash";
 
 // OBA (Obadiah) is the shortest book in the canon — one chapter, 21 verses.
 // Loads faster than ZEC on a cold cache and keeps the default landing page
@@ -164,6 +164,18 @@ export function App() {
   }, []);
 
   useEffect(() => onAuthError(() => setSessionExpired(true)), []);
+
+  // Shell has acted on a `?c=<id>` deep link. Clear it from the URL AND from
+  // our own state: replaceState fires no hashchange, so the hashchange listener
+  // above will never observe the removal, and leaving `loc.commentId` set both
+  // blocked a repeat click on the same alert link and kept isDefaultLoc false
+  // for the rest of the session.
+  const handleCommentConsumed = useCallback(() => {
+    setLoc((prev) => (prev.commentId == null ? prev : { ...prev, commentId: undefined }));
+    if (location.hash.includes("c=")) {
+      history.replaceState(null, "", stripCommentParam(location.hash));
+    }
+  }, []);
 
   const navigate = (book: string, chapter: number, verse?: number) => {
     location.hash =
@@ -386,6 +398,7 @@ export function App() {
           onLogout={handleSignOut}
           meUserId={auth.kind === "ready" ? auth.me?.userId ?? null : null}
           initialCommentId={loc.commentId}
+          onCommentConsumed={handleCommentConsumed}
         />
       </Box>
       <Snackbar

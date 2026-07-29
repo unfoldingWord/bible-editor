@@ -10,6 +10,19 @@ export interface Location {
   commentId?: number;
 }
 
+// Strip only the `c=<id>` query param from a hash, preserving any other params
+// and repairing the `?`/`&` separator — so `#/X/1/2?c=1&y=2` becomes
+// `#/X/1/2?y=2` rather than leaving a dangling `&y=2`.
+export function stripCommentParam(hash: string): string {
+  const qIdx = hash.indexOf("?");
+  if (qIdx === -1) return hash;
+  const base = hash.slice(0, qIdx);
+  const params = new URLSearchParams(hash.slice(qIdx + 1));
+  params.delete("c");
+  const rest = params.toString();
+  return rest ? `${base}?${rest}` : base;
+}
+
 export function parseHashString(hash: string, defaultBook: string): Location {
   const m = hash.match(/^#\/?([A-Za-z0-9]+)(?:\/(\d+))?(?:\/(\d+))?/);
   const cm = hash.match(/[?&]c=(\d+)/);

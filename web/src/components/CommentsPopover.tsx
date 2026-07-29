@@ -94,7 +94,14 @@ export function CommentsPopover({
   useEffect(() => {
     if (!open) return;
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
+      if (e.key !== "Escape") return;
+      // Don't steal an Escape that another overlay already acted on. The find
+      // bar, the section-header editor and the top bar all handle Escape with
+      // preventDefault (without stopping propagation), so dismissing one of
+      // those would otherwise close this panel too and silently drop an
+      // unposted draft.
+      if (e.defaultPrevented) return;
+      onClose();
     };
     document.addEventListener("keydown", onKey);
     return () => document.removeEventListener("keydown", onKey);
@@ -129,9 +136,6 @@ export function CommentsPopover({
           elevation={8}
           role="dialog"
           aria-label={title}
-          onKeyDown={(e) => {
-            if (e.key === "Escape") onClose();
-          }}
           sx={{
             width: 440,
             maxHeight: "70vh",

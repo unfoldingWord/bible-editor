@@ -164,19 +164,6 @@ function saveToStorage<T>(key: string, value: T) {
 // consume so a later same-location mount doesn't re-grab a stale note.
 let pendingNoteJump: { book: string; chapter: number; noteId: string } | null = null;
 
-// Strip only the `c=<id>` query param from a hash, preserving any other
-// params and repairing the `?`/`&` separator — so `#/X/1/2?c=1&y=2` becomes
-// `#/X/1/2?y=2` rather than leaving a dangling `&y=2`.
-function stripCommentParam(hash: string): string {
-  const qIdx = hash.indexOf("?");
-  if (qIdx === -1) return hash;
-  const base = hash.slice(0, qIdx);
-  const params = new URLSearchParams(hash.slice(qIdx + 1));
-  params.delete("c");
-  const rest = params.toString();
-  return rest ? `${base}?${rest}` : base;
-}
-
 // Stable empty list so the popover's `threads` prop doesn't churn identity while
 // a target has no threads yet.
 const EMPTY_COMMENT_THREADS: CommentThread[] = [];
@@ -193,9 +180,13 @@ interface Props {
   // Comment id from a `?c=<id>` deep link (e.g. a mention alert). Consumed once
   // that chapter's comments have loaded — see the consumer effect below.
   initialCommentId?: number;
+  // Called once Shell has acted on `initialCommentId`. App owns the URL, so it
+  // clears both the `?c=` param and its own location state — Shell rewriting
+  // the hash itself fired no hashchange, leaving App's state stale.
+  onCommentConsumed?: () => void;
 }
 
-export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, onLogout, meUserId = null, initialCommentId }: Props) {
+export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, onLogout, meUserId = null, initialCommentId, onCommentConsumed }: Props) {
   // tw_link → article title, for canonical (headword-anchored) TWL ordering.
   // handleAddTwlSuggestion below places a NEW link at its canonical slot and
   // persists a matching sort_order, so it must order with the SAME inputs the
@@ -351,8 +342,14 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     },
   });
   // Which verse / row the popover is showing, and the element it hangs off.
-  const [commentTarget, setCommentTarget] = useState<CommentTarget | null>(null);
-  const [commentAnchor, setCommentAnchor] = useState<HTMLElement | null>(null);
+  // One object: the popover's anchor element and what it's anchored to always
+  // change together, and splitting them meant one updater had to set the other.
+  const [commentPanel, setCommentPanel] = useState<{
+    anchor: HTMLElement | null;
+    target: CommentTarget | null;
+  }>({ anchor: null, target: null });
+  const commentTarget = commentPanel.target;
+  const commentAnchor = commentPanel.anchor;
   const [highlightCommentId, setHighlightCommentId] = useState<number | null>(null);
   // A deep-linked comment arrives with no clicked element to hang off, and a
   // Popper with a null anchorEl renders in the top-left corner. This zero-size
@@ -365,20 +362,19 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // the new target. This — combined with CommentsPopover's click-away
   // ignoring clicks on badge buttons — is what lets clicking a DIFFERENT
   // badge move the popover there in a single click instead of just closing it.
+  // Anchor and target move together, so they live in one state object: setting
+  // one from inside the other's updater made the updater impure, and React is
+  // free to run an updater twice (StrictMode, a discarded concurrent render).
   const openComments: OpenCommentsFn = useCallback((anchorEl, target) => {
-    setCommentTarget((prevTarget) => {
-      if (prevTarget && targetsMatch(prevTarget, target)) {
-        setCommentAnchor(null);
-        return null;
-      }
-      setCommentAnchor(anchorEl);
-      return target;
-    });
+    setCommentPanel((prev) =>
+      prev.target && targetsMatch(prev.target, target)
+        ? { anchor: null, target: null } // clicking the same badge toggles closed
+        : { anchor: anchorEl, target },
+    );
   }, []);
 
   const closeComments = useCallback(() => {
-    setCommentAnchor(null);
-    setCommentTarget(null);
+    setCommentPanel({ anchor: null, target: null });
     setHighlightCommentId(null);
   }, []);
 
@@ -1874,20 +1870,24 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     consumedCommentKeyRef.current = key;
     setActiveVerse(comment.verse);
     setActiveNoteId(comment.rowKind === "tn" ? comment.rowId : null);
-    setCommentAnchor(null); // no clicked element — falls back to the centred anchor
-    setCommentTarget(
-      comment.rowKind != null && comment.rowId != null
-        ? { verse: comment.verse, rowKind: comment.rowKind, rowId: comment.rowId }
-        : { verse: comment.verse },
-    );
+    // No clicked element on a deep-link arrival, so anchor stays null and the
+    // popover falls back to the centred anchor.
+    setCommentPanel({
+      anchor: null,
+      target:
+        comment.rowKind != null && comment.rowId != null
+          ? { verse: comment.verse, rowKind: comment.rowKind, rowId: comment.rowId }
+          : { verse: comment.verse },
+    });
     setHighlightCommentId(comment.id);
     setScrollNonce((n) => n + 1);
-    // Drop the `?c=` so a refresh (or a later navigation back here) doesn't
-    // re-jump. replaceState, so it doesn't add a history entry.
-    if (location.hash.includes("c=")) {
-      history.replaceState(null, "", stripCommentParam(location.hash));
-    }
-  }, [commentsIndex, book, chapter, initialCommentId]);
+    // Hand the consumption back to App, which drops the `?c=` from both the URL
+    // and its location state. Doing the rewrite here used replaceState, which
+    // fires no hashchange, so App never learned the param was gone: the prop
+    // stayed set, this effect's deps never changed, and clicking the SAME alert
+    // again was silently ignored (verified).
+    onCommentConsumed?.();
+  }, [commentsIndex, book, chapter, initialCommentId, onCommentConsumed]);
 
   // Keep the alignment target's verse in step with the active verse while
   // we're in alignment mode. Bible version is sticky — only LinkIcon clicks
