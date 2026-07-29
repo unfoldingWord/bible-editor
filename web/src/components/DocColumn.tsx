@@ -327,7 +327,7 @@ function findPreviousVerse(
 // that introduces the verse. Map that drifted marker to the same wrapper class
 // the inactive (display) path uses, so we can put it directly on the editable
 // span and get the break/indent back from CSS without touching the text. Use
-// the marker closest to the verse (last in document order). `\ts\*` is a flex
+// the marker closest to the verse (last in document order). `\ts\*` is its own
 // divider block (`be-ts`) that would relayout the content span, so it never
 // supplies the class — but if it's the ONLY drifted marker we still fall back
 // to a plain block break so the verse keeps its own line.

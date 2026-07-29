@@ -20,6 +20,7 @@ import type { ChapterState } from "../hooks/useBook";
 import { highlightsFor, renderEditableHTML, renderHighlightedHTML, type HighlightKey, type ReorderHighlight } from "../lib/highlight";
 import { markHighlightSx } from "../lib/highlightStyles";
 import { extractEditableText, extractTrailingMarkers, stripTrailingMarkers, splitSectionHeaders, type SectionHeader } from "../lib/usfm";
+import { introEditBase } from "../lib/verseIntro";
 import { SectionHeaderBand } from "./SectionHeaderBand";
 import { CommentBadge } from "./CommentBadge";
 import type { CommentCounts } from "../lib/commentsIndex";
@@ -783,6 +784,12 @@ function StackedBody({
           const ultPrev = findPrevRowInColumn(ult, ultStart);
           const ustPrev = findPrevRowInColumn(ust, ustStart);
           const uhbPrev = findPrevRowInColumn(uhb, uhbStart);
+          // Edit/save base. Falls back to a create-on-save placeholder for a
+          // chapter intro that has no row yet, so the missing opening marker can
+          // be added (#379). History / restore / align stay bound to the REAL
+          // dto below — there is nothing to show a version chip or align for.
+          const ultEditBase = introEditBase(ultV, book, chapter, v, "ULT");
+          const ustEditBase = introEditBase(ustV, book, chapter, v, "UST");
           return (
             <Paper
               ref={activeRef}
@@ -840,10 +847,10 @@ function StackedBody({
                 editable={!locked}
                 onOpenAligner={() => onOpenAligner(ultStart, "ULT")}
                 onEditPlain={
-                  ultV ? (plain) => onEditVerse(ultStart, "ULT", plain, ultV) : undefined
+                  ultEditBase ? (plain) => onEditVerse(ultStart, "ULT", plain, ultEditBase) : undefined
                 }
                 onSave={
-                  ultV ? (plain) => onSaveVerse(ultStart, "ULT", plain, ultV) : undefined
+                  ultEditBase ? (plain) => onSaveVerse(ultStart, "ULT", plain, ultEditBase) : undefined
                 }
                 version={ultV?.version}
                 onRestoreVersion={
@@ -875,10 +882,10 @@ function StackedBody({
                 editable={!locked}
                 onOpenAligner={() => onOpenAligner(ustStart, "UST")}
                 onEditPlain={
-                  ustV ? (plain) => onEditVerse(ustStart, "UST", plain, ustV) : undefined
+                  ustEditBase ? (plain) => onEditVerse(ustStart, "UST", plain, ustEditBase) : undefined
                 }
                 onSave={
-                  ustV ? (plain) => onSaveVerse(ustStart, "UST", plain, ustV) : undefined
+                  ustEditBase ? (plain) => onSaveVerse(ustStart, "UST", plain, ustEditBase) : undefined
                 }
                 version={ustV?.version}
                 onRestoreVersion={
@@ -1235,8 +1242,15 @@ function ActiveLine({
   const [historyOpen, setHistoryOpen] = useState(false);
   // The version chip + history are editable-ULT/UST only — read-only source
   // lines and any line without a known version/restore handler get nothing.
+  //
+  // `version >= 1`, not `!= null`: a chapter-intro row that does not exist yet is
+  // saved through a synthetic base carrying `version: 0` (see lib/verseIntro.ts),
+  // and the optimistic local apply seeds the chapter cache with that 0 before the
+  // server's real row (version 1) comes back. Gating on `!= null` showed a `v0`
+  // chip in that window, opening a history dialog for a row the server has never
+  // held. Server versions start at 1, so this only ever excludes the placeholder.
   const showHistory =
-    !!book && !!editable && !readOnly && !isSource && version != null && !!onRestoreVersion;
+    !!book && !!editable && !readOnly && !isSource && (version ?? 0) >= 1 && !!onRestoreVersion;
   const draftKey = useMemo(
     () =>
       book && bibleVersion ? verseKey(book, chapter, verseNum, bibleVersion) : null,

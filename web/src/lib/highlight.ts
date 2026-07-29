@@ -794,11 +794,20 @@ function segmentsToHtml(segments: Segment[], emitChips: boolean): string {
       continue;
     }
     if (seg.tag === "ts") {
-      // \ts\* renders as a horizontal divider regardless of edit mode.
+      // \ts\* renders as a chunk-boundary block regardless of edit mode.
       // The chip carries the literal marker text so editing it still
       // round-trips through tokenizeEditableText.
+      //
+      // `be-ts-quiet` marks the READ-ONLY emission (a verse you are not editing).
+      // Every other marker is invisible outside the active verse — `\p` / `\q1`
+      // become pure layout — so a `\ts\*` that kept printing its literal label
+      // everywhere read as louder than the markers it sits among. The class lets
+      // the stylesheet hide just the label there while keeping the block (and so
+      // the line break) intact. Book mode restates `div.be-ts` wholesale and
+      // therefore keeps its label: it draws the divider at the top of the verse
+      // the marker introduces, which is the whole point of that treatment.
       const chip = emitChips ? chipForTag("ts") : `<span class="be-tok be-tok-ts">\\ts\\*</span>`;
-      out.push(`<div class="${cls}">${chip}</div>`);
+      out.push(`<div class="${cls}${emitChips ? "" : " be-ts-quiet"}">${chip}</div>`);
       continue;
     }
     const chip = emitChips && seg.tag ? chipForTag(seg.tag) + " " : "";

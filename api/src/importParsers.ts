@@ -903,7 +903,7 @@ function collapseRedundantParagraphs(verseObjects: unknown[]): unknown[] {
 // editor's malformed `\ts*` is {tag:"ts*"}. Older shapes stored it as
 // {tag:"ts", content:"\\*"|"*"} — matched defensively so a version bump can't
 // silently un-detect it.
-function isTsMilestone(vo: unknown): boolean {
+export function isTsMilestone(vo: unknown): boolean {
   if (!vo || typeof vo !== "object") return false;
   const v = vo as { tag?: unknown; content?: unknown };
   if (v.tag === "ts\\*" || v.tag === "ts*") return true;

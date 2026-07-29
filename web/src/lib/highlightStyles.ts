@@ -117,8 +117,9 @@ function paragraphLayoutSx(mode: Mode) {
     // rule across them interrupts the reading line far more than the boundary
     // warrants; the small marker alone is enough to place the chunk. Kept at a
     // real secondary text colour rather than a disabled grey — "quiet" must not
-    // mean "makes people squint". Book mode overrides this (bookTsDividerSx):
-    // there the verses are grid rows, so a line straight across earns its keep.
+    // mean "makes people squint". Book mode inherits this block as-is and only
+    // un-hides the `.be-ts-quiet` label below (bookTsDividerSx), because there the
+    // divider is drawn on a verse you are not editing by design.
     "& div.be-ts": {
       display: "block",
       margin: "0.5em 0 0.35em",
@@ -130,36 +131,40 @@ function paragraphLayoutSx(mode: Mode) {
         color: "text.secondary",
         opacity: 0.85,
       },
+      // Read-only render: show the chunk BREAK but not the marker text. Outside
+      // the verse being edited every other marker is invisible (`\p` / `\q1` are
+      // pure layout), so printing `\ts\*` in every verse made the least important
+      // marker the most visible one. Margin collapses to 0 as well — a labelled
+      // gap is a divider, an unlabelled one is just odd spacing.
+      "&.be-ts-quiet": {
+        margin: 0,
+        "& span.be-tok-ts": { display: "none" },
+      },
     },
   };
 }
 
-// Book mode only: the divider as a dashed rule straight across with the `\ts\*`
-// chip centered in it. Book mode aligns verses into grid rows across versions, so
-// the rule reads as a real chunk boundary spanning the row — and BookView draws it
-// at the TOP of the verse it introduces so both columns' rules land on one line.
+// Book mode only. The divider looks exactly like it does in rows and columns —
+// the same quiet inline label, inherited from paragraphLayoutSx, no dashed rule
+// straight across the row any more. That rule was the loudest thing on the page,
+// louder than any other marker and louder than the chunk boundary warrants.
 //
-// NOTE: this is a COMPLETE restatement of `div.be-ts`, not a patch. Spreading it
-// after markHighlightSx replaces that key's object wholesale, so anything omitted
-// here is simply lost — including the label resets in the default above, which is
-// why the chip styling comes back on its own.
-export function bookTsDividerSx(mode: Mode) {
-  const tokenBorder = mode === "dark" ? "rgba(49, 173, 227, 0.55)" : "rgba(1, 66, 99, 0.45)";
+// What book mode still does differently is WHERE: BookView draws the divider at
+// the TOP of the verse the marker introduces (see extractTrailingDividers) so it
+// lands on one grid row across every column. That drawn copy is a READ-ONLY
+// render, so the default stylesheet would hide its label as `.be-ts-quiet` — and
+// hiding it is wrong here, because in book mode that copy IS the divider.
+//
+// So this un-hides it ADDITIVELY, by out-specifying the default rule rather than
+// restating `div.be-ts` wholesale. Spreading a duplicate `div.be-ts` key would
+// REPLACE the default's object, making book mode silently diverge from every
+// future edit to it — this file has been bitten by exactly that before. Adding a
+// narrower selector instead keeps one source of truth for how the divider looks.
+export function bookTsDividerSx() {
   return {
-    "& div.be-ts": {
-      display: "flex",
-      alignItems: "center",
-      gap: "8px",
-      margin: "0.6em 0",
-      "&::before, &::after": {
-        content: '""',
-        flex: 1,
-        borderTop: `1px dashed ${tokenBorder}`,
-        opacity: 0.6,
-      },
-      "& span.be-tok-ts": {
-        flex: "0 0 auto",
-      },
+    "& div.be-ts.be-ts-quiet": {
+      margin: "0.5em 0 0.35em",
+      "& span.be-tok-ts": { display: "inline-block" },
     },
     // The ACTIVE verse's editable render still holds its own trailing divider, and
     // has to: its textContent is diffed against extractEditableText on save, so
