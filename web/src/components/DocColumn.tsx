@@ -10,6 +10,7 @@ import { highlightsFor, paragraphClass, renderEditableHTML, renderHighlightedHTM
 import { markHighlightSx } from "../lib/highlightStyles";
 import { extractTrailingMarkers, stripTrailingMarkers, splitSectionHeaders, type SectionHeader } from "../lib/usfm";
 import { SectionHeaderBand } from "./SectionHeaderBand";
+import { DriftedMarkerBand, driftedMarkerTags } from "./DriftedMarkerBand";
 import { AlignLinkButton } from "./AlignLinkButton";
 import { drafts, verseKey, draftDirtyBorderSx } from "../sync/drafts";
 import { HebrewLine } from "./HebrewLine";
@@ -712,6 +713,13 @@ function VerseSpan({
           </IconButton>
         </Tooltip>
       )}{" "}
+      {/* Lookback chips for the markers that drifted from the previous verse.
+          The active-editable render drops them from the span itself (the save
+          diff must match the verse's own objects), so without this the columns
+          view showed no sign of them at all — only leadingClass's CSS break. */}
+      {isActive && !readOnly && !rtl && (
+        <DriftedMarkerBand markers={driftedMarkerTags(precedingMarkers ?? [])} inline />
+      )}
       {rtl && lexiconMap ? (
         <span
           style={{

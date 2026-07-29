@@ -24,7 +24,7 @@
 // matches raw with no further work.
 
 import { nfc } from "./hebrew.ts";
-import { isInFlowMarker, liftMarkerText, SECTION_HEADER_TAGS } from "./usfm.ts";
+import { isInFlowMarker, isTsMilestone, liftMarkerText, SECTION_HEADER_TAGS } from "./usfm.ts";
 
 // U+2060 WORD JOINER glues UHB clitic morphemes to their host word
 // (הָ⁠אֶ֧בֶן); U+200D ZERO WIDTH JOINER plays the same role in some corpora.
@@ -699,7 +699,12 @@ function segmentByParagraphs(
       const o = node as Record<string, unknown> | null;
       if (!o) continue;
       if (isInFlowMarker(o)) {
-        const tag = o["tag"] as string;
+        // Collapse every `\ts\*` node shape to the canonical "ts" tag before it
+        // reaches the segment logic. usfm-js 3.5.0 parks the marker in the tag
+        // (`{tag:"ts\\*"}`), so the `tag === "ts"` tests below — and the
+        // `be-ts` / `be-tok-ts` classes they pick — silently missed every real
+        // chunk divider, which is why `\ts\*` rendered nowhere in Micah 4.
+        const tag = isTsMilestone(o) ? "ts" : (o["tag"] as string);
         const { wrapper, isBlank } = paragraphClass(tag);
         const seg: Segment = { wrapper, tag, html: "", isBlank };
         segments.push(seg);
