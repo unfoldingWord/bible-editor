@@ -274,6 +274,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     setResolved: setCommentResolved,
     removeComment,
     applyWsComment,
+    reload: reloadComments,
   } = useComments(book, chapter, commentsEnabled);
 
   // Live cross-tab updates. The server broadcasts row writes via the
@@ -3496,6 +3497,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           errorText={
             commentsError ? "Comments unavailable — could not load them for this chapter." : null
           }
+          onRetryLoad={reloadComments}
           initialBody={commentDraftKey ? (composerDraftsRef.current.get(commentDraftKey) ?? "") : ""}
           onBodyChange={handleComposerBodyChange}
           replyInitialBody={getReplyDraft}

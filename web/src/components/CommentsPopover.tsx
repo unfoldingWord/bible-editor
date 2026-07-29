@@ -42,6 +42,10 @@ export interface CommentsPopoverProps {
   highlightCommentId: number | null;
   loading?: boolean;
   errorText?: string | null;
+  // Retry the chapter's comments load. Offered in the error banner, because
+  // while the load is broken we also block posting — so the user needs a way
+  // out that isn't "reload the whole app".
+  onRetryLoad?: () => void;
   // Seeds the new-comment composer's body on mount, and reports back as the
   // user types — lets Shell stash unposted text across a close/reopen of this
   // (unmounting) popover, keyed by target. See the composer-persistence note
@@ -75,6 +79,7 @@ export function CommentsPopover({
   highlightCommentId,
   loading = false,
   errorText = null,
+  onRetryLoad,
   initialBody,
   onBodyChange,
   replyInitialBody,
@@ -184,7 +189,17 @@ export function CommentsPopover({
           </Stack>
 
           {errorText && (
-            <Alert severity="warning" sx={{ m: 1.5 }}>
+            <Alert
+              severity="warning"
+              sx={{ m: 1.5 }}
+              action={
+                onRetryLoad ? (
+                  <Button size="small" color="inherit" onClick={onRetryLoad}>
+                    Retry
+                  </Button>
+                ) : undefined
+              }
+            >
               {errorText}
             </Alert>
           )}
@@ -218,6 +233,9 @@ export function CommentsPopover({
                 <ThreadView
                   key={thread.root.id}
                   thread={thread}
+                  blockedReason={
+                    errorText ? "Comments couldn't be loaded for this chapter — retry above before posting." : null
+                  }
                   mentionUsers={mentionUsers}
                   meUserId={meUserId}
                   canWrite={canWrite}
@@ -239,6 +257,9 @@ export function CommentsPopover({
               <Divider />
               <NewCommentComposer
                 mentionUsers={mentionUsers}
+                blockedReason={
+                  errorText ? "Comments couldn't be loaded for this chapter — retry above before posting." : null
+                }
                 onCreate={onCreate}
                 onError={setActionError}
                 initialBody={initialBody}
@@ -256,6 +277,7 @@ export function CommentsPopover({
 
 function ThreadView({
   thread,
+  blockedReason,
   mentionUsers,
   meUserId,
   canWrite,
@@ -269,6 +291,7 @@ function ThreadView({
   onReplyBodyChange,
 }: {
   thread: CommentThread;
+  blockedReason: string | null;
   mentionUsers: MentionUser[];
   meUserId: number | null;
   canWrite: boolean;
@@ -332,6 +355,7 @@ function ThreadView({
             onCreate={onCreate}
             onError={onError}
             onDone={() => setReplying(false)}
+            blockedReason={blockedReason}
             initialBody={replyInitialBody?.(root.id) ?? ""}
             onBodyChange={(body) => onReplyBodyChange?.(root.id, body)}
           />
@@ -588,10 +612,12 @@ function ReplyComposer({
   onCreate,
   onError,
   onDone,
+  blockedReason,
   initialBody = "",
   onBodyChange,
 }: {
   parentId: number;
+  blockedReason: string | null;
   mentionUsers: MentionUser[];
   onCreate: (draft: NewCommentDraft) => Promise<void>;
   onError: (msg: string | null) => void;
@@ -642,7 +668,13 @@ function ReplyComposer({
         placeholder="Write a reply…"
       />
       <Stack direction="row" spacing={1}>
-        <Button size="small" variant="contained" onClick={handleSend} disabled={!body.trim() || pending}>
+        <Button
+          size="small"
+          variant="contained"
+          onClick={handleSend}
+          disabled={!body.trim() || pending || blockedReason != null}
+          title={blockedReason ?? undefined}
+        >
           Send
         </Button>
         <Button size="small" onClick={onDone}>
@@ -659,10 +691,12 @@ function NewCommentComposer({
   mentionUsers,
   onCreate,
   onError,
+  blockedReason,
   initialBody = "",
   onBodyChange,
 }: {
   mentionUsers: MentionUser[];
+  blockedReason: string | null;
   onCreate: (draft: NewCommentDraft) => Promise<void>;
   onError: (msg: string | null) => void;
   initialBody?: string;
@@ -722,11 +756,17 @@ function NewCommentComposer({
         size="small"
         placeholder="Ask a question or leave a note for the team…"
       />
+      {/* Blocked while the chapter's comments couldn't be loaded: the panel was
+          otherwise happy to take a post that then failed, so the user saw an
+          "unavailable" banner and a "failed to post" error side by side and had
+          no idea which to believe. Their text is kept either way; the banner's
+          Retry is the way forward. */}
       <Button
         size="small"
         variant="contained"
         onClick={handlePost}
-        disabled={!body.trim() || pending}
+        disabled={!body.trim() || pending || blockedReason != null}
+        title={blockedReason ?? undefined}
         sx={{ alignSelf: "flex-start" }}
       >
         Post
@@ -736,9 +776,10 @@ function NewCommentComposer({
 }
 
 // ── Shared mention-aware text field ────────────────────────────────────
-// Typing "@" opens a small filtered picker anchored to the field; selecting
-// a user inserts "@username " at the caret and closes the list. Escape
-// closes it too. Deliberately simple — no arrow-key navigation, per spec.
+// Typing "@" plus at least one character opens a small filtered picker
+// anchored to the field. ArrowUp/ArrowDown move the highlight; Enter, Tab or a
+// click accept it, replacing the typed "@token" with "@username "; Escape
+// closes the list without touching the text.
 
 function MentionTextField({
   value,
@@ -761,6 +802,12 @@ function MentionTextField({
   const [pickerOpen, setPickerOpen] = useState(false);
   const [pickerQuery, setPickerQuery] = useState("");
   const [mentionStart, setMentionStart] = useState<number | null>(null);
+  // Which suggestion Enter/Tab will accept. Reset whenever the query changes,
+  // so the highlight never points past the end of a freshly filtered list.
+  const [activeIndex, setActiveIndex] = useState(0);
+  // Set while a pointer is down on a suggestion, so a stray blur mid-tap
+  // can't close the picker before the tap is delivered (see handleBlur).
+  const pickerPointerDownRef = useRef(false);
 
   const filtered = useMemo(() => {
     const q = pickerQuery.toLowerCase();
@@ -783,7 +830,11 @@ function MentionTextField({
     // word char) so typing "foo@bar" doesn't pop the picker for a mention the
     // server would never resolve anyway.
     const upToCaret = next.slice(0, caret);
-    const match = /(?:^|\s)@([A-Za-z0-9._-]*)$/.exec(upToCaret);
+    // At least one character after the "@": a bare "@" would otherwise match
+    // every user (`includes("")` is always true) and open a full list, so Enter
+    // would insert a name instead of a newline and Tab could not leave the
+    // field — after typing something as ordinary as "compare with 1:3 @".
+    const match = /(?:^|\s)@([A-Za-z0-9._-]+)$/.exec(upToCaret);
     if (match) {
       // match[0] may include a leading whitespace char (the `(?:^|\s)`
       // branch) — measure back from the "@" itself (1 char) plus the
@@ -793,31 +844,75 @@ function MentionTextField({
       setMentionStart(caret - match[1].length - 1);
       setPickerQuery(match[1]);
       setPickerOpen(true);
+      setActiveIndex(0);
     } else {
       setPickerOpen(false);
     }
   }
 
   function handleKeyDown(e: React.KeyboardEvent) {
-    if (e.key === "Escape" && pickerOpen) {
+    if (!pickerOpen) return;
+    // Escape is handled whenever the picker is OPEN, even with no matches to
+    // show. Gating it on `filtered.length` let Escape bubble to the panel's
+    // document listener and close the whole panel — which silently discarded
+    // an in-progress comment edit, whose draft (unlike the composers') isn't
+    // cached anywhere.
+    if (e.key === "Escape") {
       setPickerOpen(false);
       e.stopPropagation();
+      return;
+    }
+    if (filtered.length === 0) return;
+    if (e.key === "ArrowDown") {
+      e.preventDefault();
+      setActiveIndex((i) => (i + 1) % filtered.length);
+      return;
+    }
+    if (e.key === "ArrowUp") {
+      e.preventDefault();
+      setActiveIndex((i) => (i - 1 + filtered.length) % filtered.length);
+      return;
+    }
+    // Enter and Tab both accept the highlighted suggestion. preventDefault so
+    // Enter doesn't insert a newline in the multiline field and Tab doesn't
+    // move focus out of the composer; stopPropagation so the panel's own
+    // handlers don't also react.
+    if (e.key === "Enter" || e.key === "Tab") {
+      e.preventDefault();
+      e.stopPropagation();
+      selectUser(filtered[activeIndex] ?? filtered[0]);
     }
   }
 
   function handleBlur() {
-    // Without this the picker stays open after focus moves away (tab, click
-    // elsewhere in the panel) — close it. requestAnimationFrame so a click on
-    // a picker list item (which blurs the field first) still registers before
-    // the list unmounts.
-    requestAnimationFrame(() => setPickerOpen(false));
+    // Close when focus genuinely leaves. A mouse click on a suggestion does not
+    // reach here (the items preventDefault on mousedown, so the field never
+    // blurs), but touch environments don't all behave that way — and if a blur
+    // does slip through mid-tap, closing synchronously would unmount the item
+    // and swallow the tap, which is exactly the bug this PR fixes. The pointer
+    // flag keeps that from regressing without reintroducing the
+    // requestAnimationFrame that lost the click in the first place.
+    if (pickerPointerDownRef.current) return;
+    setPickerOpen(false);
   }
 
   function selectUser(user: MentionUser) {
-    if (mentionStart == null || !fieldRef.current) return;
-    const caret = fieldRef.current.selectionStart ?? value.length;
+    if (mentionStart == null) return;
+    // Replace exactly the "@query" token we opened the picker on — do NOT use
+    // the live caret as the end of the replaced range. The caret can move
+    // without any input event (ArrowLeft/Right, Home/End, Ctrl+Arrow), which
+    // left `mentionStart` pointing at the token while the caret pointed
+    // somewhere else, so accepting a suggestion spliced across unrelated text:
+    // "hello @chri" + ArrowLeft ArrowLeft + Enter produced
+    // "hello @christina ri", and Home duplicated the whole body.
+    const token = `@${pickerQuery}`;
+    if (value.slice(mentionStart, mentionStart + token.length) !== token) {
+      // The text moved under us — bail rather than corrupt it.
+      setPickerOpen(false);
+      return;
+    }
     const before = value.slice(0, mentionStart);
-    const after = value.slice(caret);
+    const after = value.slice(mentionStart + token.length);
     const next = `${before}@${user.username} ${after}`;
     onChange(next);
     setPickerOpen(false);
@@ -853,9 +948,28 @@ function MentionTextField({
         >
           <ClickAwayListener onClickAway={() => setPickerOpen(false)}>
             <Paper elevation={4}>
-              <List dense disablePadding>
-                {filtered.map((u) => (
-                  <ListItemButton key={u.id} onClick={() => selectUser(u)}>
+              <List dense disablePadding role="listbox">
+                {filtered.map((u, i) => (
+                  <ListItemButton
+                    key={u.id}
+                    selected={i === activeIndex}
+                    role="option"
+                    aria-selected={i === activeIndex}
+                    // Keep focus (and therefore the caret) in the field: without
+                    // this the mousedown blurs it, which closes the picker and
+                    // unmounts this item before the click lands.
+                    onMouseDown={(e) => {
+                      pickerPointerDownRef.current = true;
+                      e.preventDefault();
+                    }}
+                    onTouchStart={() => {
+                      pickerPointerDownRef.current = true;
+                    }}
+                    onClick={() => {
+                      pickerPointerDownRef.current = false;
+                      selectUser(u);
+                    }}
+                  >
                     <ListItemText primary={u.fullName} secondary={`@${u.username}`} />
                   </ListItemButton>
                 ))}
