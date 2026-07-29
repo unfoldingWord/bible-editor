@@ -161,6 +161,16 @@ export function bookTsDividerSx(mode: Mode) {
         flex: "0 0 auto",
       },
     },
+    // The ACTIVE verse's editable render still holds its own trailing divider, and
+    // has to: its textContent is diffed against extractEditableText on save, so
+    // removing the node would break the save. But BookView also draws that same
+    // divider at the top of the NEXT verse's row, so this copy is redundant — and
+    // being at the bottom of a cell, it is the one that sat out of line with the
+    // other column. Hide it: `display:none` still leaves the text in
+    // `textContent` (unlike `innerText`), which is what the baseline reads, so the
+    // save diff is untouched. `:last-child` scopes this to a TRAILING divider —
+    // an interior one is not drawn by the next row, so it must stay visible.
+    '& span[contenteditable="true"] > div.be-ts:last-child': { display: "none" },
   };
 }
 

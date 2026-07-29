@@ -501,20 +501,11 @@ const ChapterBlock = memo(function ChapterBlock({
           />
         )}
       </Box>
-      {verseNums.map((v, vIdx) => {
+      {verseNums.map((v) => {
         const isActive = chapter === activeChapter && v === activeVerse;
-        // Is the row immediately above this one the active (editable) verse? Book
-        // mode draws a `	s\*` divider at the top of the verse it introduces, but
-        // must not while the owning verse is active — that verse's editable render
-        // still shows the divider, and drawing it here too would double it.
-        // Deliberately a narrow boolean rather than passing activeVerse down: it
-        // is false for every row but one, so the shallow memo still skips the rest.
-        const prevIsActive =
-          chapter === activeChapter && vIdx > 0 && verseNums[vIdx - 1] === activeVerse;
         return (
           <VerseRow
             key={`${chapter}-${v}`}
-            prevIsActive={prevIsActive}
             book={book}
             chapter={chapter}
             verseNum={v}
@@ -553,7 +544,6 @@ const VerseRow = memo(function VerseRow({
   enabledVersions,
   versesByVersion,
   isActive,
-  prevIsActive,
   activeNoteQuote,
   activeNoteOccurrence,
   reorderHighlight,
@@ -577,7 +567,6 @@ const VerseRow = memo(function VerseRow({
   enabledVersions: string[];
   versesByVersion: Record<string, Record<number, VerseDto>>;
   isActive: boolean;
-  prevIsActive: boolean;
   activeNoteQuote: string | null;
   activeNoteOccurrence: number | null;
   reorderHighlight: ReorderHighlight | null;
@@ -640,8 +629,7 @@ const VerseRow = memo(function VerseRow({
               bibleVersion={bv}
               dto={dto}
               prevDto={prevDto}
-              prevIsActive={prevIsActive}
-              sourceContent={
+                sourceContent={
                 versesByVersion["UHB"]?.[verseNum]?.content ??
                 versesByVersion["UGNT"]?.[verseNum]?.content
               }
@@ -675,7 +663,6 @@ const VerseCell = memo(function VerseCell({
   bibleVersion,
   dto,
   prevDto,
-  prevIsActive,
   sourceContent,
   isActive,
   activeNoteQuote,
@@ -702,9 +689,6 @@ const VerseCell = memo(function VerseCell({
   // Its trailing markers (`\q1`, `\p`) drift down to lead this verse
   // visually, matching USFM convention. Storage stays untouched.
   prevDto: VerseDto | undefined;
-  // True when the PREVIOUS verse is the active one — book mode then leaves that
-  // verse's `	s\*` divider to its own editable render instead of drawing it here.
-  prevIsActive: boolean;
   // The matching UHB/UGNT verse content_json so the align button flags a
   // broken link when a source word lacks a target. Absent on source columns.
   sourceContent?: unknown;
@@ -879,11 +863,16 @@ const VerseCell = memo(function VerseCell({
     // the bottom of verse N's cell — and since ULT and UST verse N are different
     // lengths, the two dividers land at different heights and the line stops
     // running straight across the row. Drawing it at the top of the verse it
-    // introduces puts it on one grid row in every column. Suppressed while the
-    // previous verse is active: its own editable render still shows the divider
-    // (it is part of that verse's editable text), so drawing it here too would
-    // show one divider twice.
-    const leadingDividers = prevIsActive && !readOnly ? [] : extractTrailingDividers(prevVo);
+    // introduces puts it on one grid row in every column.
+    //
+    // Done unconditionally, INCLUDING when the previous verse is the active one.
+    // The active verse's editable render still holds its own trailing divider — it
+    // is part of that verse's editable text and has to stay there for the save diff
+    // to line up — so bookTsDividerSx hides that copy with `display:none`, which
+    // keeps it in `textContent` where the baseline comparison reads it. Suppressing
+    // the drawn copy here instead was the first attempt, and it left the active
+    // row's two dividers visibly out of line, which is the whole bug.
+    const leadingDividers = extractTrailingDividers(prevVo);
     // Strip THIS verse's own trailing markers — they drift to the next verse,
     // so rendering them here too would double a text-bearing `\qa` acrostic.
     // Its trailing dividers go too: the next verse's cell draws them.
@@ -893,7 +882,7 @@ const VerseCell = memo(function VerseCell({
     // Render unconditionally so paragraph / poetry markers turn into
     // visual breaks / indents in book view even without active highlights.
     return renderHighlightedHTML(composed, highlights ?? new Set(), roles);
-  }, [findHTML, dto?.content, highlights, prevDto?.content, isActive, prevIsActive, readOnly, roles]);
+  }, [findHTML, dto?.content, highlights, prevDto?.content, isActive, readOnly, roles]);
 
   // Markers that drifted from the previous verse, for the lookback band. The
   // active-editable render above deliberately drops them from the verse body (its
