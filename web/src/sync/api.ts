@@ -1030,6 +1030,51 @@ export interface PipelineQueueSummary {
   queuedCount: number;
 }
 
+// ── Internal comments & notes (see api/migrations/0037_comments.sql) ──
+// D1-only, never exported. GET is a separate fetch (not part of ChapterPayload)
+// so a comments failure degrades gracefully without breaking chapter load.
+
+export type CommentKind = "question" | "note";
+export type CommentRowKind = "tn" | "tq" | "twl";
+
+export interface CommentDto {
+  id: number;
+  book: string;
+  chapter: number;
+  verse: number;
+  rowKind: CommentRowKind | null; // null => anchored to the verse itself
+  rowId: string | null;
+  parentId: number | null; // null => top-level; else a flat reply
+  kind: CommentKind;
+  body: string;
+  mentions: string[]; // canonical dcs_usernames
+  authorId: number;
+  authorName: string;
+  createdAt: number; // unix seconds
+  updatedAt: number;
+  resolvedAt: number | null;
+  resolvedBy: number | null;
+  resolvedByName: string | null;
+  deletedAt: number | null;
+}
+
+export interface MentionUser {
+  id: number;
+  username: string;
+  fullName: string;
+}
+
+export interface NewCommentInput {
+  book: string;
+  chapter: number;
+  verse: number;
+  rowKind?: CommentRowKind;
+  rowId?: string;
+  parentId?: number;
+  kind: CommentKind;
+  body: string;
+}
+
 export const api = {
   getBookSummary: (book: string, signal?: AbortSignal) =>
     request<BookSummary>(`/api/chapters/${encodeURIComponent(book)}`, { signal }),
@@ -1309,4 +1354,35 @@ export const api = {
       `/api/pending-imports?book=${encodeURIComponent(book)}&chapter=${chapter}`,
       { signal },
     ),
+
+  // ── Comments ──
+  getMentionUsers: (signal?: AbortSignal) =>
+    request<{ users: MentionUser[] }>(`/api/comments/mention-users`, { signal }),
+
+  getComments: (book: string, chapter: number, signal?: AbortSignal) =>
+    request<{ comments: CommentDto[] }>(
+      `/api/comments/${encodeURIComponent(book)}/${chapter}`,
+      { signal },
+    ),
+
+  createComment: (body: NewCommentInput) =>
+    request<CommentDto>(`/api/comments`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+
+  updateComment: (id: number, body: string) =>
+    request<CommentDto>(`/api/comments/${id}`, {
+      method: "PATCH",
+      body: JSON.stringify({ body }),
+    }),
+
+  resolveComment: (id: number, resolved: boolean) =>
+    request<CommentDto>(`/api/comments/${id}/resolve`, {
+      method: "POST",
+      body: JSON.stringify({ resolved }),
+    }),
+
+  deleteComment: (id: number) =>
+    request<{ ok: true }>(`/api/comments/${id}`, { method: "DELETE" }),
 };

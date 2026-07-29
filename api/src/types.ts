@@ -143,6 +143,31 @@ export interface TwlOrderLock {
   dismissed_order: string | null;
 }
 
+// An internal, human-to-human comment/note (never exported to DCS — see
+// migrations/0037_comments.sql). Fetched separately from ChapterPayload so a
+// comments-fetch failure can't break the core chapter load. camelCase DTO
+// shape mirrored from the `comments` table row by comments.ts's mapRow.
+export interface CommentDto {
+  id: number;
+  book: string;
+  chapter: number;
+  verse: number;
+  rowKind: RowKind | null;
+  rowId: string | null;
+  parentId: number | null;
+  kind: "question" | "note";
+  body: string;
+  mentions: string[];
+  authorId: number;
+  authorName: string;
+  createdAt: number;
+  updatedAt: number;
+  resolvedAt: number | null;
+  resolvedBy: number | null;
+  resolvedByName: string | null;
+  deletedAt: number | null;
+}
+
 export interface ChapterPayload {
   book: string;
   chapter: number;
