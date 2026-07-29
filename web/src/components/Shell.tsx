@@ -367,7 +367,12 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // free to run an updater twice (StrictMode, a discarded concurrent render).
   const openComments: OpenCommentsFn = useCallback((anchorEl, target) => {
     setCommentPanel((prev) =>
-      prev.target && targetsMatch(prev.target, target)
+      // Only toggle-close when the existing panel already has a real anchor
+      // AND targets match. A deep-link arrival opens with anchor: null (the
+      // centred fallback) — without the anchor check, clicking that same
+      // verse's badge afterward read as "close" instead of re-anchoring the
+      // panel to the badge, since targetsMatch alone was already true.
+      prev.target && prev.anchor && targetsMatch(prev.target, target)
         ? { anchor: null, target: null } // clicking the same badge toggles closed
         : { anchor: anchorEl, target },
     );
@@ -377,6 +382,38 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     setCommentPanel({ anchor: null, target: null });
     setHighlightCommentId(null);
   }, []);
+
+  // Unposted composer text survives the popover closing. Shell rerenders
+  // `{commentTarget && <CommentsPopover key={targetKey(...)} …>}`, so closing
+  // UNMOUNTS the popover and every composer's local `body` state with it — an
+  // editor who types a few sentences then clicks the verse text to re-read it
+  // would otherwise lose the draft outright. A ref (not state): it must
+  // survive the popover unmounting on close, but doesn't need to survive a
+  // page reload. Keyed by book/chapter/target so drafts for different verses
+  // or rows never bleed into each other.
+  const composerDraftsRef = useRef<Map<string, string>>(new Map());
+  const commentDraftKey = commentTarget ? `${book}/${chapter}/${targetKey(commentTarget)}` : null;
+  const handleComposerBodyChange = useCallback((body: string) => {
+    if (!commentDraftKey) return;
+    if (body) composerDraftsRef.current.set(commentDraftKey, body);
+    else composerDraftsRef.current.delete(commentDraftKey);
+  }, [commentDraftKey]);
+  const handleReplyBodyChange = useCallback(
+    (parentId: number, body: string) => {
+      if (!commentDraftKey) return;
+      const key = `${commentDraftKey}/reply/${parentId}`;
+      if (body) composerDraftsRef.current.set(key, body);
+      else composerDraftsRef.current.delete(key);
+    },
+    [commentDraftKey],
+  );
+  const getReplyDraft = useCallback(
+    (parentId: number) => {
+      if (!commentDraftKey) return "";
+      return composerDraftsRef.current.get(`${commentDraftKey}/reply/${parentId}`) ?? "";
+    },
+    [commentDraftKey],
+  );
 
   // Mention list, fetched lazily the FIRST time a popover opens (not per
   // chapter load) and then cached for the session. A failure degrades to an
@@ -391,6 +428,11 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       .then((res) => setMentionUsers(res.users))
       .catch((e) => {
         console.warn("mention users unavailable", e);
+        // Reset so a later popover open retries. Without this, one transient
+        // failure permanently disabled the @ picker for the whole session —
+        // and worse, left mentionUsers empty, which made splitMentions render
+        // every existing @mention in every comment as plain text.
+        mentionUsersRequested.current = false;
       });
   }, [commentTarget, commentsEnabled]);
 
@@ -521,6 +563,24 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   const [activeVerse, setActiveVerse] = useState(initialVerse);
   const [activeNoteId, setActiveNoteId] = useState<string | null>(null);
   const [activeWordId, setActiveWordId] = useState<string | null>(null);
+
+  // Close the comments panel when its target stops being valid, so it doesn't
+  // stay open floating at its last position (still accepting new comments
+  // against a possibly-gone anchor). Two ways a target goes stale: the active
+  // verse moves off the verse it's anchored to (its badge may not even render
+  // for an inactive zero-thread verse), or — for a row-anchored target — the
+  // row itself is no longer in the loaded rows (e.g. the tn row was deleted).
+  useEffect(() => {
+    if (!commentTarget) return;
+    if (commentTarget.verse !== activeVerse) {
+      closeComments();
+      return;
+    }
+    if (commentTarget.rowKind != null && commentTarget.rowId != null) {
+      const rows = data?.[commentTarget.rowKind] as Array<{ id: string }> | undefined;
+      if (!rows?.some((r) => r.id === commentTarget.rowId)) closeComments();
+    }
+  }, [activeVerse, commentTarget, data, closeComments]);
   const [mode, setMode] = useState<ScriptureMode>(() =>
     loadFromStorage<ScriptureMode>(SCRIPTURE_MODE_KEY, "stacked"),
   );
@@ -1866,7 +1926,17 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     const key = `${book}/${chapter}/${initialCommentId}`;
     if (consumedCommentKeyRef.current === key) return;
     const comment = commentsIndex.byId.get(initialCommentId);
-    if (!comment) return; // still loading, or belongs to another chapter
+    if (!comment) {
+      // Not found yet — could just be mid-fetch (don't act) or genuinely
+      // gone (deleted, or the fetch failed). Only decide once the load has
+      // SETTLED: acting while commentsLoading is true would consume a link
+      // that's about to resolve just fine one render later.
+      if (commentsLoading) return;
+      consumedCommentKeyRef.current = key;
+      onCommentConsumed?.();
+      pushPipelineToast("That comment is no longer available.", "info");
+      return;
+    }
     consumedCommentKeyRef.current = key;
     setActiveVerse(comment.verse);
     setActiveNoteId(comment.rowKind === "tn" ? comment.rowId : null);
@@ -1887,7 +1957,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     // stayed set, this effect's deps never changed, and clicking the SAME alert
     // again was silently ignored (verified).
     onCommentConsumed?.();
-  }, [commentsIndex, book, chapter, initialCommentId, onCommentConsumed]);
+  }, [commentsIndex, commentsLoading, book, chapter, initialCommentId, onCommentConsumed, pushPipelineToast]);
 
   // Keep the alignment target's verse in step with the active verse while
   // we're in alignment mode. Bible version is sticky — only LinkIcon clicks
@@ -3417,6 +3487,10 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           errorText={
             commentsError ? "Comments unavailable — could not load them for this chapter." : null
           }
+          initialBody={commentDraftKey ? (composerDraftsRef.current.get(commentDraftKey) ?? "") : ""}
+          onBodyChange={handleComposerBodyChange}
+          replyInitialBody={getReplyDraft}
+          onReplyBodyChange={handleReplyBodyChange}
           onClose={closeComments}
           onCreate={handleCreateComment}
           onEdit={editComment}

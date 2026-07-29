@@ -8,7 +8,7 @@ export function relativeTime(unixSeconds: number, nowMs: number = Date.now()): s
   const diffMs = nowMs - unixSeconds * 1000;
   const diffSec = Math.floor(diffMs / 1000);
 
-  if (diffSec < 45) return "just now";
+  if (diffSec < 60) return "just now";
 
   const diffMin = Math.floor(diffSec / 60);
   if (diffMin < 60) return `${diffMin}m ago`;

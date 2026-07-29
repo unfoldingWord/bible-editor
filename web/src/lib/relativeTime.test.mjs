@@ -16,12 +16,14 @@ function assert(cond, msg) {
 const NOW_MS = 1700000000000;
 const NOW_SEC = NOW_MS / 1000;
 
-// --- "just now" bucket (< 45s) ---
+// --- "just now" bucket (< 60s) ---
 assert(relativeTime(NOW_SEC, NOW_MS) === "just now", "0s ago is just now");
 assert(relativeTime(NOW_SEC - 44, NOW_MS) === "just now", "44s ago is just now");
+assert(relativeTime(NOW_SEC - 45, NOW_MS) === "just now", "45s ago is just now");
+assert(relativeTime(NOW_SEC - 59, NOW_MS) === "just now", "59s ago is just now");
 
-// --- minutes bucket (45s <= diff < 60min) ---
-assert(relativeTime(NOW_SEC - 45, NOW_MS) === "0m ago", "45s ago rounds to 0m ago");
+// --- minutes bucket (60s <= diff < 60min) ---
+assert(relativeTime(NOW_SEC - 60, NOW_MS) === "1m ago", "60s ago rolls to 1m ago");
 assert(relativeTime(NOW_SEC - 5 * 60, NOW_MS) === "5m ago", "5 minutes ago");
 assert(relativeTime(NOW_SEC - 59 * 60, NOW_MS) === "59m ago", "59 minutes ago stays in minutes bucket");
 

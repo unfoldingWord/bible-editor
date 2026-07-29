@@ -12,14 +12,12 @@ import type { CommentCounts } from "../lib/commentsIndex";
 export interface CommentBadgeProps {
   counts: CommentCounts;
   onOpen: (anchorEl: HTMLElement) => void;
-  disabled?: boolean;
   titleWhenEmpty?: string;
 }
 
 export function CommentBadge({
   counts,
   onOpen,
-  disabled = false,
   titleWhenEmpty = "Add an internal comment",
 }: CommentBadgeProps) {
   const { openQuestions, notes } = counts;
@@ -47,9 +45,9 @@ export function CommentBadge({
   const button = (
     <IconButton
       size="small"
-      disabled={disabled}
       onClick={(e) => onOpen(e.currentTarget)}
       data-comments-badge="1"
+      aria-label={tooltip}
       sx={{ p: 0.25, color, opacity, gap: 0.25 }}
     >
       {icon}
@@ -64,9 +62,5 @@ export function CommentBadge({
     </IconButton>
   );
 
-  return (
-    <Tooltip title={tooltip}>
-      {disabled ? <span>{button}</span> : button}
-    </Tooltip>
-  );
+  return <Tooltip title={tooltip}>{button}</Tooltip>;
 }

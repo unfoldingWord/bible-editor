@@ -42,6 +42,15 @@ export interface CommentsPopoverProps {
   highlightCommentId: number | null;
   loading?: boolean;
   errorText?: string | null;
+  // Seeds the new-comment composer's body on mount, and reports back as the
+  // user types — lets Shell stash unposted text across a close/reopen of this
+  // (unmounting) popover, keyed by target. See the composer-persistence note
+  // in Shell.tsx.
+  initialBody?: string;
+  onBodyChange?: (body: string) => void;
+  // Same idea for a reply composer, keyed by which thread it's replying to.
+  replyInitialBody?: (parentId: number) => string;
+  onReplyBodyChange?: (parentId: number, body: string) => void;
   onClose: () => void;
   onCreate: (draft: NewCommentDraft) => Promise<void>;
   onEdit: (id: number, body: string) => Promise<void>;
@@ -66,6 +75,10 @@ export function CommentsPopover({
   highlightCommentId,
   loading = false,
   errorText = null,
+  initialBody,
+  onBodyChange,
+  replyInitialBody,
+  onReplyBodyChange,
   onClose,
   onCreate,
   onEdit,
@@ -214,6 +227,8 @@ export function CommentsPopover({
                   onDelete={onDelete}
                   onCreate={onCreate}
                   onError={setActionError}
+                  replyInitialBody={replyInitialBody}
+                  onReplyBodyChange={onReplyBodyChange}
                 />
               ))
             )}
@@ -226,6 +241,8 @@ export function CommentsPopover({
                 mentionUsers={mentionUsers}
                 onCreate={onCreate}
                 onError={setActionError}
+                initialBody={initialBody}
+                onBodyChange={onBodyChange}
               />
             </>
           )}
@@ -248,6 +265,8 @@ function ThreadView({
   onDelete,
   onCreate,
   onError,
+  replyInitialBody,
+  onReplyBodyChange,
 }: {
   thread: CommentThread;
   mentionUsers: MentionUser[];
@@ -259,6 +278,8 @@ function ThreadView({
   onDelete: (id: number) => Promise<void>;
   onCreate: (draft: NewCommentDraft) => Promise<void>;
   onError: (msg: string | null) => void;
+  replyInitialBody?: (parentId: number) => string;
+  onReplyBodyChange?: (parentId: number, body: string) => void;
 }) {
   const [replying, setReplying] = useState(false);
   const { root, replies } = thread;
@@ -311,6 +332,8 @@ function ThreadView({
             onCreate={onCreate}
             onError={onError}
             onDone={() => setReplying(false)}
+            initialBody={replyInitialBody?.(root.id) ?? ""}
+            onBodyChange={(body) => onReplyBodyChange?.(root.id, body)}
           />
         </Box>
       )}
@@ -565,17 +588,26 @@ function ReplyComposer({
   onCreate,
   onError,
   onDone,
+  initialBody = "",
+  onBodyChange,
 }: {
   parentId: number;
   mentionUsers: MentionUser[];
   onCreate: (draft: NewCommentDraft) => Promise<void>;
   onError: (msg: string | null) => void;
   onDone: () => void;
+  initialBody?: string;
+  onBodyChange?: (body: string) => void;
 }) {
-  const [body, setBody] = useState("");
+  const [body, setBody] = useState(initialBody);
   // Local in-flight guard — see the identical comment on CommentCard.
   const [pending, setPending] = useState(false);
   const inFlight = useRef(false);
+
+  function updateBody(next: string) {
+    setBody(next);
+    onBodyChange?.(next);
+  }
 
   async function handleSend() {
     if (inFlight.current) return;
@@ -588,6 +620,7 @@ function ReplyComposer({
       await onCreate({ kind: "note", body: trimmed, parentId });
       onError(null);
       setBody("");
+      onBodyChange?.("");
       onDone();
     } catch {
       onError("Failed to post the reply. Your text is still here — try again.");
@@ -601,7 +634,7 @@ function ReplyComposer({
     <Stack spacing={0.5}>
       <MentionTextField
         value={body}
-        onChange={setBody}
+        onChange={updateBody}
         mentionUsers={mentionUsers}
         multiline
         size="small"
@@ -626,16 +659,25 @@ function NewCommentComposer({
   mentionUsers,
   onCreate,
   onError,
+  initialBody = "",
+  onBodyChange,
 }: {
   mentionUsers: MentionUser[];
   onCreate: (draft: NewCommentDraft) => Promise<void>;
   onError: (msg: string | null) => void;
+  initialBody?: string;
+  onBodyChange?: (body: string) => void;
 }) {
   const [kind, setKind] = useState<CommentKind>("question");
-  const [body, setBody] = useState("");
+  const [body, setBody] = useState(initialBody);
   // Local in-flight guard — see the identical comment on CommentCard.
   const [pending, setPending] = useState(false);
   const inFlight = useRef(false);
+
+  function updateBody(next: string) {
+    setBody(next);
+    onBodyChange?.(next);
+  }
 
   async function handlePost() {
     // The ref, not the state, is what actually prevents a double post: several
@@ -652,6 +694,7 @@ function NewCommentComposer({
       await onCreate({ kind, body: trimmed });
       onError(null);
       setBody("");
+      onBodyChange?.("");
     } catch {
       onError("Failed to post the comment. Your text is still here — try again.");
     } finally {
@@ -673,7 +716,7 @@ function NewCommentComposer({
       </ToggleButtonGroup>
       <MentionTextField
         value={body}
-        onChange={setBody}
+        onChange={updateBody}
         mentionUsers={mentionUsers}
         multiline
         size="small"
@@ -734,11 +777,20 @@ function MentionTextField({
     const caret = e.target.selectionStart ?? next.length;
     onChange(next);
 
-    // Look backwards from the caret for an unterminated "@token".
+    // Look backwards from the caret for an unterminated "@token". The `@`
+    // must sit at the start of the value or be preceded by whitespace —
+    // matches the server's rule (api/src/mentions.ts: `@` not preceded by a
+    // word char) so typing "foo@bar" doesn't pop the picker for a mention the
+    // server would never resolve anyway.
     const upToCaret = next.slice(0, caret);
-    const match = /@([A-Za-z0-9._-]*)$/.exec(upToCaret);
+    const match = /(?:^|\s)@([A-Za-z0-9._-]*)$/.exec(upToCaret);
     if (match) {
-      setMentionStart(caret - match[0].length);
+      // match[0] may include a leading whitespace char (the `(?:^|\s)`
+      // branch) — measure back from the "@" itself (1 char) plus the
+      // captured username query, not match[0].length, or mentionStart would
+      // land one character early (on the whitespace) whenever the mention
+      // isn't at the very start of the field.
+      setMentionStart(caret - match[1].length - 1);
       setPickerQuery(match[1]);
       setPickerOpen(true);
     } else {
@@ -751,6 +803,14 @@ function MentionTextField({
       setPickerOpen(false);
       e.stopPropagation();
     }
+  }
+
+  function handleBlur() {
+    // Without this the picker stays open after focus moves away (tab, click
+    // elsewhere in the panel) — close it. requestAnimationFrame so a click on
+    // a picker list item (which blurs the field first) still registers before
+    // the list unmounts.
+    requestAnimationFrame(() => setPickerOpen(false));
   }
 
   function selectUser(user: MentionUser) {
@@ -776,6 +836,7 @@ function MentionTextField({
         value={value}
         onChange={handleChange}
         onKeyDown={handleKeyDown}
+        onBlur={handleBlur}
         multiline={multiline}
         size={size}
         autoFocus={autoFocus}
