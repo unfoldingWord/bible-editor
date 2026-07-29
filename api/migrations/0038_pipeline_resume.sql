@@ -12,13 +12,36 @@
 -- resume isn't possible so the queue drains in minutes. These two columns are
 -- the per-job budget for that.
 --
+-- The budget is per PAUSE CYCLE, not per job: one job row can span a
+-- multi-chapter run and pause more than once, so a poll that observes any
+-- non-paused upstream state resets all three columns. Without that, a job that
+-- burned its three attempts on an early pause would be failed on the first poll
+-- of a later pause, discarding every completed chapter.
+--
 -- resume_attempt_count : how many automatic resume attempts we have made for
---                        this job. Capped by MAX_RESUME_ATTEMPTS (3); manual
---                        resume via POST /api/pipelines/:jobId/resume does not
---                        consume it (a human asking is always allowed).
--- last_resume_at       : epoch seconds of the most recent automatic attempt,
---                        NULL if never attempted. Enforces spacing
+--                        the current pause cycle. Capped by
+--                        MAX_RESUME_ATTEMPTS (3). Manual resume via
+--                        POST /api/pipelines/:jobId/resume does NOT increment
+--                        it (a human asking is always allowed, and three human
+--                        clicks must not exhaust the automatic budget).
+-- last_resume_at       : epoch seconds of the most recent attempt, automatic or
+--                        manual, NULL if never attempted. Enforces spacing
 --                        (RESUME_RETRY_SPACING_SECONDS) so we don't hammer the
---                        bot while it is still down.
+--                        bot while it is still down, and so a poll landing just
+--                        after a human click doesn't pile a second attempt on
+--                        top. The increment is written conditionally on this
+--                        column (see attemptOutageResume) so two concurrent
+--                        pollers cannot both pass the window.
+-- resume_accepted_at   : epoch seconds when the bot ACCEPTED a resume (HTTP 202,
+--                        or 200 {status:'already_running'}), NULL otherwise.
+--                        While this is set and within
+--                        RESUME_ACCEPTED_GRACE_SECONDS (15m) the job is left
+--                        strictly alone: the bot keeps reporting
+--                        'paused_for_outage' until the resumed run reaches its
+--                        first checkpoint write, and failing the job in that
+--                        gap would free the bot slot and the chapter lock while
+--                        the resumed run is still writing D1 and Door43 — the
+--                        exact double-write this queue exists to prevent.
 ALTER TABLE pipeline_jobs ADD COLUMN resume_attempt_count INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE pipeline_jobs ADD COLUMN last_resume_at INTEGER;
+ALTER TABLE pipeline_jobs ADD COLUMN resume_accepted_at INTEGER;

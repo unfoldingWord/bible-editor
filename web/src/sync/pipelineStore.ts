@@ -421,16 +421,37 @@ export const pipelineStore = {
   // Ask the server to resume a paused job. Always re-polls afterwards (success
   // or 409) so the row shows whatever the bot actually did rather than an
   // optimistic guess — resume is a request, not a state change we own.
-  async resume(jobId: string): Promise<{ ok: boolean; state?: PipelineState }> {
+  //
+  // `force` defaults to false. A first click must not force: the bot refuses a
+  // pause older than 90 minutes with 409 'stale_pause', which is the caller's cue
+  // to confirm with the user (a forced resume republishes text generated before
+  // any edits made since) and only then call again with force=true. The refusal
+  // reason and pause age are returned so the caller can say how old it is.
+  async resume(
+    jobId: string,
+    force = false,
+  ): Promise<{
+    ok: boolean;
+    state?: PipelineState;
+    reason?: string;
+    pausedAgeSeconds?: number;
+  }> {
     try {
-      await api.pipelineResume(jobId);
+      await api.pipelineResume(jobId, force);
       await pollOne(jobId);
       return { ok: true };
     } catch (e) {
       if (e instanceof ApiError && e.status === 409) {
-        const body = e.body as { state?: PipelineState } | undefined;
+        const body = e.body as
+          | { state?: PipelineState; message?: string; pausedAgeSeconds?: number }
+          | undefined;
         await pollOne(jobId);
-        return { ok: false, state: body?.state };
+        return {
+          ok: false,
+          state: body?.state,
+          reason: body?.message,
+          pausedAgeSeconds: body?.pausedAgeSeconds,
+        };
       }
       throw e;
     }

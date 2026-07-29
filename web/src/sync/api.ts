@@ -1341,12 +1341,18 @@ export const api = {
     ),
 
   // Ask the bot to pick a paused run back up. Server returns 409
-  // {error:"cannot_resume"|"resume_refused", state, message?} when the job isn't
-  // in a paused state or the bot won't take it, 502 on an upstream failure.
-  pipelineResume: (jobId: string, signal?: AbortSignal) =>
+  // {error:"cannot_resume"|"resume_refused", state, message?, pausedAgeSeconds?}
+  // when the job isn't in a paused state or the bot won't take it, 502 on an
+  // upstream failure.
+  //
+  // `force` bypasses the bot's 90-minute pause box and is DEFAULT FALSE on
+  // purpose: a forced resume republishes cached output generated before any
+  // later edits. Only send force after the user has been shown the pause age and
+  // confirmed (the bot's 409 'stale_pause' is the expected first answer).
+  pipelineResume: (jobId: string, force = false, signal?: AbortSignal) =>
     request<{ ok: boolean; jobId: string; state: "resumed" }>(
       `/api/pipelines/${encodeURIComponent(jobId)}/resume`,
-      { method: "POST", signal },
+      { method: "POST", body: JSON.stringify({ force }), signal },
     ),
 
   // Acknowledge a "completed-while-away" toast so the server clears its

@@ -180,6 +180,18 @@ function StateIcon({ state }: { state: PipelineState }) {
   return <PauseCircleOutlineIcon fontSize="small" color="warning" />;
 }
 
+// Human age for the stale-pause confirmation. The bot reports pausedAgeSeconds
+// with its 409; if it ever doesn't, say so plainly rather than showing "0m" —
+// the whole point of the prompt is that the user knows how old the content is.
+function describeAge(seconds?: number): string {
+  if (typeof seconds !== "number" || !Number.isFinite(seconds)) return "an unknown time";
+  const mins = Math.floor(seconds / 60);
+  if (mins < 60) return `${mins}m`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 48) return `${hours}h`;
+  return `${Math.floor(hours / 24)} days`;
+}
+
 interface ToastMsg {
   id: number;
   text: string;
@@ -204,6 +216,11 @@ export function PipelineStatusBar({ toast, onToastClear }: Props = {}) {
   // the server; this covers the request itself failing (the row's own state
   // doesn't change on a refused resume).
   const [resumeError, setResumeError] = useState<{ jobId: string; text: string } | null>(null);
+  // Second step of the two-step force-resume. The bot refuses a pause older than
+  // its 90-minute box with 409 'stale_pause'; we never force on the first click,
+  // because a forced resume republishes output generated before any edits made
+  // since. So we surface the age here and only force once the user confirms.
+  const [staleConfirm, setStaleConfirm] = useState<{ jobId: string; text: string } | null>(null);
   const [refreshing, setRefreshing] = useState(false);
   // When pipelineStore.requestFocus(jobId) fires (e.g. on already_running),
   // we stash the request and let the next render — once hasAnything flips
@@ -285,12 +302,21 @@ export function PipelineStatusBar({ toast, onToastClear }: Props = {}) {
     }
   };
 
-  const resume = async (job: PipelineJobRow) => {
+  // force=false on every first click. A 'stale_pause' refusal is expected, not an
+  // error: it means the pause is old enough that resuming would republish
+  // pre-edit content, so we ask before calling again with force=true.
+  const resume = async (job: PipelineJobRow, force = false) => {
     setResuming(job.job_id);
     setResumeError(null);
+    setStaleConfirm(null);
     try {
-      const res = await pipelineStore.resume(job.job_id);
-      if (!res.ok) {
+      const res = await pipelineStore.resume(job.job_id, force);
+      if (!res.ok && res.reason === "stale_pause") {
+        setStaleConfirm({
+          jobId: job.job_id,
+          text: `This run paused ${describeAge(res.pausedAgeSeconds)} ago. Resuming will publish text generated before any edits made since. Resume anyway?`,
+        });
+      } else if (!res.ok) {
         setResumeError({
           jobId: job.job_id,
           text: `Could not resume — the run is now ${res.state ?? "in another state"}.`,
@@ -466,13 +492,34 @@ export function PipelineStatusBar({ toast, onToastClear }: Props = {}) {
                         {resumeError.text}
                       </Typography>
                     )}
+                    {staleConfirm?.jobId === job.job_id && (
+                      <>
+                        <Typography variant="caption" color="warning.main" display="block">
+                          {staleConfirm.text}
+                        </Typography>
+                        <Button
+                          size="small"
+                          color="warning"
+                          onClick={() => void resume(job, true)}
+                          disabled={resuming === job.job_id}
+                          startIcon={
+                            resuming === job.job_id ? <CircularProgress size={12} /> : undefined
+                          }
+                        >
+                          Resume anyway
+                        </Button>
+                        <Button size="small" color="inherit" onClick={() => setStaleConfirm(null)}>
+                          Cancel
+                        </Button>
+                      </>
+                    )}
                   </Box>
                   {isPaused && !isForeign(job) && (
                     <Tooltip
                       title={
                         job.state === "paused_for_usage_limit"
                           ? "Ask the bot to pick this run back up (the daily AI budget must have reset)"
-                          : "Ask the bot to pick this run back up from where the outage stopped it"
+                          : "Ask the bot to pick this run back up from where the outage stopped it. If the pause is old you'll be asked to confirm first, because resuming republishes the text it had already generated."
                       }
                     >
                       <span>
