@@ -582,16 +582,49 @@ async function callUpstreamResume(
 //
 // Always set it BEFORE calling upstream. Setting it after the answer leaves a
 // window in which the bot has launched the run but our row looks abandonable.
-async function markResumeInFlight(env: Env, jobId: string): Promise<void> {
-  await env.DB.prepare(
-    `UPDATE pipeline_jobs SET resume_accepted_at = unixepoch() WHERE job_id = ?1`,
+//
+// This is a CLAIM, not a blind write, and the return value is load-bearing: it
+// is true only when this caller actually acquired the marker (it was unset, or
+// an expired leftover). A caller that finds a live marker gets false and must
+// NOT clear it later — that marker belongs to another in-flight-or-accepted
+// resume. Two resumes on one job are reachable without any exotic timing: the
+// */5 poller auto-resumes and the translator clicks Resume in a tab, or two tabs
+// both click. Without this, the SECOND call being refused clears the FIRST
+// call's acceptance and re-opens the cancel door underneath a live run. The
+// mutual exclusion is the WHERE clause — D1 serializes the UPDATE, so exactly
+// one concurrent caller can match.
+async function markResumeInFlight(env: Env, jobId: string): Promise<boolean> {
+  const res = await env.DB.prepare(
+    `UPDATE pipeline_jobs
+        SET resume_accepted_at = unixepoch()
+      WHERE job_id = ?1
+        AND (resume_accepted_at IS NULL
+             OR resume_accepted_at < unixepoch() - ?2)`,
   )
-    .bind(jobId)
+    .bind(jobId, RESUME_ACCEPTED_GRACE_SECONDS)
     .run();
+  return (res.meta?.changes ?? 0) > 0;
 }
 
 // Clear it when the bot definitively did NOT take the resume, so the job is
 // cancellable again and GATE 0 doesn't sit on it for the full grace window.
+// Only ever call this when the matching markResumeInFlight returned true.
+//
+// KNOWN RESIDUAL, deliberately not closed here. The claim makes the marker
+// single-owner, which covers same-instant collisions (the WHERE cannot match
+// twice) and covers a second caller clearing a first caller's marker. What it
+// does not cover: the OWNER's call being refused while a concurrent non-owner
+// call was accepted — the owner then legitimately clears a marker that now
+// stands over a live run. It needs the bot to answer one caller 'accepted' and
+// the other a refusal in the same window, which is why it is narrow.
+//
+// Closing it properly needs an ownership token (a per-attempt id compared on
+// clear), i.e. a new column and a migration. That is a schema decision, and the
+// alternative — never clearing on refusal and letting the 15-minute grace expire
+// — would delay cancel and fail-fast on the MOST COMMON refusal path (a stale
+// pause), trading the queue-drain guarantee this whole change exists to provide
+// against a much narrower race. Left as-is on purpose; revisit with the token if
+// concurrent resumes on one job ever stop being rare.
 async function clearResumeInFlight(env: Env, jobId: string): Promise<void> {
   await env.DB.prepare(
     `UPDATE pipeline_jobs SET resume_accepted_at = NULL WHERE job_id = ?1`,
@@ -721,7 +754,10 @@ async function attemptOutageResume(
   // the cancel guard, release the chapter lock, and dispatch a second job
   // against a live run. Setting the marker first closes the window; a refusal
   // clears it below, so a genuinely unresumable job stays cancellable.
-  await markResumeInFlight(env, job.job_id);
+  //
+  // `owned` gates the clears: if some other resume already holds a live marker,
+  // this call must not wipe it on its own refusal (see markResumeInFlight).
+  const owned = await markResumeInFlight(env, job.job_id);
 
   // Never force from the automatic path — the bot's time-box is a safety gate here.
   const call = await callUpstreamResume(env, job.upstream_job_id, {
@@ -736,14 +772,14 @@ async function attemptOutageResume(
     return null;
   }
   if (call.kind === "refused") {
-    await clearResumeInFlight(env, job.job_id);
+    if (owned) await clearResumeInFlight(env, job.job_id);
     return `auto-resume refused by bot: ${call.reason}`;
   }
   // Retryable: the attempt is spent but the job stays paused. A later poll
   // retries until the cap or the time-box catches it. Clear the in-flight marker
   // so this job is cancellable again and GATE 0 doesn't sit on it for 15 minutes
   // over a transport blip.
-  await clearResumeInFlight(env, job.job_id);
+  if (owned) await clearResumeInFlight(env, job.job_id);
   console.error(`[pipelineResume] job=${job.job_id} retryable: ${call.reason}`);
   return null;
 }
@@ -1914,8 +1950,10 @@ pipelines.post("/:jobId/resume", requireEditor, async (c) => {
 
   // In flight from here — set before the call, same reasoning as the automatic
   // path: the bot may launch the run before we learn it accepted, and a cancel
-  // landing in that window would abandon a live run.
-  await markResumeInFlight(c.env, jobId);
+  // landing in that window would abandon a live run. `owned` is false when the
+  // poller (or another tab) already holds a live marker — then this call must not
+  // clear it on its own refusal (see markResumeInFlight).
+  const ownedMarker = await markResumeInFlight(c.env, jobId);
 
   const call = await callUpstreamResume(c.env, owned.upstream_job_id, {
     force,
@@ -1936,7 +1974,7 @@ pipelines.post("/:jobId/resume", requireEditor, async (c) => {
   // not blocked on a resume that never happened. Must precede both returns
   // below — a refused stale_pause is the expected first half of the two-step,
   // and leaving the marker set there would block the Cancel button as well.
-  await clearResumeInFlight(c.env, jobId);
+  if (ownedMarker) await clearResumeInFlight(c.env, jobId);
   if (call.kind === "refused") {
     // pausedAgeSeconds accompanies the bot's 'stale_pause' refusal; the client
     // needs it to name the age in the "resume anyway?" confirmation.
