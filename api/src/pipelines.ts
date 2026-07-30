@@ -574,6 +574,32 @@ async function callUpstreamResume(
   };
 }
 
+// `resume_accepted_at` marks a resume that is IN FLIGHT OR ACCEPTED — those two
+// states are deliberately not distinguished, because they need identical
+// treatment: in both, the bot may be running the chapter while our row still
+// reads `paused_for_outage`. Anything that would free the bot slot or the chapter
+// lock (a fail-fast verdict, a cancel) must refuse while it is set.
+//
+// Always set it BEFORE calling upstream. Setting it after the answer leaves a
+// window in which the bot has launched the run but our row looks abandonable.
+async function markResumeInFlight(env: Env, jobId: string): Promise<void> {
+  await env.DB.prepare(
+    `UPDATE pipeline_jobs SET resume_accepted_at = unixepoch() WHERE job_id = ?1`,
+  )
+    .bind(jobId)
+    .run();
+}
+
+// Clear it when the bot definitively did NOT take the resume, so the job is
+// cancellable again and GATE 0 doesn't sit on it for the full grace window.
+async function clearResumeInFlight(env: Env, jobId: string): Promise<void> {
+  await env.DB.prepare(
+    `UPDATE pipeline_jobs SET resume_accepted_at = NULL WHERE job_id = ?1`,
+  )
+    .bind(jobId)
+    .run();
+}
+
 // Auto-resume a job the bot parked on a transient Claude outage. Returns a
 // reason string when the job is NOT resumable and must be failed fast (so the
 // bot slot frees and the queue drains), or null to leave it non-terminal —
@@ -688,6 +714,15 @@ async function attemptOutageResume(
   const username = await resolveUsernameFromDb(env, job.user_id);
   const options = resumeOptionsFromJson(job.options_json, job.job_id);
 
+  // Mark IN FLIGHT before the call, not after the answer. The window between
+  // issuing a resume and learning it was accepted is real: during it the bot may
+  // already have launched the run, while our row still reads paused_for_outage
+  // with no acceptance marker — so a cancel arriving in that window would pass
+  // the cancel guard, release the chapter lock, and dispatch a second job
+  // against a live run. Setting the marker first closes the window; a refusal
+  // clears it below, so a genuinely unresumable job stays cancellable.
+  await markResumeInFlight(env, job.job_id);
+
   // Never force from the automatic path — the bot's time-box is a safety gate here.
   const call = await callUpstreamResume(env, job.upstream_job_id, {
     force: false,
@@ -695,21 +730,20 @@ async function attemptOutageResume(
     ...(options ? { options } : {}),
   });
   if (call.kind === "accepted") {
-    // Stamp acceptance so GATE 0 above suppresses every fail-fast verdict while
-    // the resumed run is starting up. Without this the next poll past the
-    // spacing window fails a job the bot is actively running.
-    await env.DB.prepare(
-      `UPDATE pipeline_jobs SET resume_accepted_at = unixepoch() WHERE job_id = ?1`,
-    )
-      .bind(job.job_id)
-      .run();
+    // Keep the marker: GATE 0 above now suppresses every fail-fast verdict while
+    // the resumed run starts up. Without it the next poll past the spacing
+    // window fails a job the bot is actively running.
     return null;
   }
   if (call.kind === "refused") {
+    await clearResumeInFlight(env, job.job_id);
     return `auto-resume refused by bot: ${call.reason}`;
   }
   // Retryable: the attempt is spent but the job stays paused. A later poll
-  // retries until the cap or the time-box catches it.
+  // retries until the cap or the time-box catches it. Clear the in-flight marker
+  // so this job is cancellable again and GATE 0 doesn't sit on it for 15 minutes
+  // over a transport blip.
+  await clearResumeInFlight(env, job.job_id);
   console.error(`[pipelineResume] job=${job.job_id} retryable: ${call.reason}`);
   return null;
 }
@@ -1878,24 +1912,31 @@ pipelines.post("/:jobId/resume", requireEditor, async (c) => {
     .bind(jobId, RESUME_RETRY_SPACING_SECONDS)
     .run();
 
+  // In flight from here — set before the call, same reasoning as the automatic
+  // path: the bot may launch the run before we learn it accepted, and a cancel
+  // landing in that window would abandon a live run.
+  await markResumeInFlight(c.env, jobId);
+
   const call = await callUpstreamResume(c.env, owned.upstream_job_id, {
     force,
     ...(username ? { username } : {}),
     ...(options ? { options } : {}),
   });
   if (call.kind === "accepted") {
-    // Mark the acceptance so the next poll's GATE 0 leaves the starting run
-    // alone. Leave the state alone too; the next poll observes real progress.
+    // Marker already set; refresh updated_at so the panel reflects the action.
+    // Leave `state` alone — the next poll observes real progress.
     await c.env.DB.prepare(
-      `UPDATE pipeline_jobs
-          SET resume_accepted_at = unixepoch(),
-              updated_at = unixepoch()
-        WHERE job_id = ?1`,
+      `UPDATE pipeline_jobs SET updated_at = unixepoch() WHERE job_id = ?1`,
     )
       .bind(jobId)
       .run();
     return c.json({ ok: true, jobId, state: "resumed", upstream: call.body });
   }
+  // Not taken: clear the marker so the job stays cancellable and the poller is
+  // not blocked on a resume that never happened. Must precede both returns
+  // below — a refused stale_pause is the expected first half of the two-step,
+  // and leaving the marker set there would block the Cancel button as well.
+  await clearResumeInFlight(c.env, jobId);
   if (call.kind === "refused") {
     // pausedAgeSeconds accompanies the bot's 'stale_pause' refusal; the client
     // needs it to name the age in the "resume anyway?" confirmation.
