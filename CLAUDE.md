@@ -102,6 +102,8 @@ node scripts/import-lexicon.mjs       # UHAL + UGL → scripts/out/import-lexico
 
 Inspect worktrees with `scripts/worktrees.ps1` (read-only; `-Json` for scripting, `-NoPr` to skip the `gh` call). Fresh git worktree: run `scripts/worktree-init.ps1` from the worktree root — it runs a real (cache-fast) `npm install` so the worktree is self-contained. **Teardown: always use `scripts/worktree-cleanup.ps1` (dry-run by default; `-Remove '<path>'` to delete one). Never `rm -rf` / `Remove-Item -Recurse` a worktree by hand.** The init script no longer junctions `node_modules` from main: junctions were a Windows footgun — a recursive delete of a worktree followed the junction and wiped main's `node_modules` and (via npm's `@bible-editor` workspace links) main's `web/`+`api/` source. `worktree-cleanup.ps1` safely unlinks any leftover junctions (link only, never the target) before deleting.
 
+`scripts/worktrees.ps1` and `scripts/worktree-cleanup.ps1` are now thin forwarders — the real implementations live once in `C:\GH\dotfiles\windows\` and take `-RepoPath`, so every repo on the machine shares one copy. Keeping per-repo copies had let them drift, and the drift hid a bug in which a *failed* `git status` was read as a clean working tree, so a worktree holding uncommitted work could classify SAFE and be deleted. Commands above are unchanged. To see every repo's worktrees at once rather than just this one, run `C:\GH\dotfiles\windows\Sweep-Worktrees.ps1` (read-only; it never deletes).
+
 ## Architecture
 
 ### Save protocol — the single reliability claim
