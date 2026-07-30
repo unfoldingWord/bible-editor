@@ -1,0 +1,36 @@
+-- Auto-resume for pipelines the bot parked on a transient Claude outage.
+--
+-- When bp-assistant hits a transient Claude outage mid-run it parks the job in
+-- state 'paused_for_outage'. Nothing ever resumed it, and because a paused job
+-- still occupies the single bot slot (see ACTIVE_STATES in api/src/pipelines.ts)
+-- every queued job behind it stalled until the blunt MAX_POLL_ATTEMPTS backstop
+-- failed it ~8h later. Real incident: DAN 7 notes paused, three jobs stuck
+-- behind it.
+--
+-- The */5 poller now calls the bot's new POST /api/pipeline/{id}/resume, time-
+-- boxed (pause younger than 90 minutes) and capped, and fails the job fast when
+-- resume isn't possible so the queue drains in minutes. These two columns are
+-- the per-job budget for that; 0039 adds a third, resume_accepted_at.
+--
+-- The budget is per PAUSE CYCLE, not per job: one job row can span a
+-- multi-chapter run and pause more than once, so a poll that observes any
+-- non-paused upstream state resets all three columns. Without that, a job that
+-- burned its three attempts on an early pause would be failed on the first poll
+-- of a later pause, discarding every completed chapter.
+--
+-- resume_attempt_count : how many automatic resume attempts we have made for
+--                        the current pause cycle. Capped by
+--                        MAX_RESUME_ATTEMPTS (3). Manual resume via
+--                        POST /api/pipelines/:jobId/resume does NOT increment
+--                        it (a human asking is always allowed, and three human
+--                        clicks must not exhaust the automatic budget).
+-- last_resume_at       : epoch seconds of the most recent attempt, automatic or
+--                        manual, NULL if never attempted. Enforces spacing
+--                        (RESUME_RETRY_SPACING_SECONDS) so we don't hammer the
+--                        bot while it is still down, and so a poll landing just
+--                        after a human click doesn't pile a second attempt on
+--                        top. The increment is written conditionally on this
+--                        column (see attemptOutageResume) so two concurrent
+--                        pollers cannot both pass the window.
+ALTER TABLE pipeline_jobs ADD COLUMN resume_attempt_count INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE pipeline_jobs ADD COLUMN last_resume_at INTEGER;

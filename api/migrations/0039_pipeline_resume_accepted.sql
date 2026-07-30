@@ -1,0 +1,31 @@
+-- Acceptance marker for pipeline auto-resume. Split from 0038 deliberately —
+-- read the note at the bottom before merging the two back together.
+--
+-- resume_accepted_at : epoch seconds when the bot ACCEPTED a resume (HTTP 202,
+--                      or 200 {status:'already_running'}), NULL otherwise.
+--                      While it is set and within RESUME_ACCEPTED_GRACE_SECONDS
+--                      (15m) the job is left strictly alone — not resumed again,
+--                      and crucially not failed.
+--
+-- Why that matters: the bot answers 202 and launches the run, but its checkpoint
+-- keeps reporting 'paused_for_outage' until that run reaches its first checkpoint
+-- write. A fail-fast verdict landing in the gap marks our row 'failed', releases
+-- the chapter lock, and hands the single-slot bot a second job while the resumed
+-- run is still writing D1 and Door43 — the exact double-write this queue exists
+-- to prevent. Reachable with no human involved: accepted at pause age 88m, killed
+-- by the next poll at 94m.
+--
+-- Reset with the rest of the resume budget (see 0038) whenever a poll observes a
+-- non-paused upstream state, because the budget is per pause cycle, not per job.
+--
+-- WHY THIS IS NOT PART OF 0038: this column was first added by amending 0038 in
+-- place, after 0038 had already been applied to a local D1. d1_migrations records
+-- a filename, not its contents, so a database that applied the two-column 0038
+-- would never receive this column — and every pipeline poll SELECT would then
+-- 500, silently, in that environment only. Same shape as the 0036_twl_order_locks
+-- prod incident. Splitting converts a silent per-environment failure into a loud
+-- duplicate-column error on any machine that applied the three-column 0038, which
+-- is the failure mode you actually want. Fix there by resetting the local dev DB.
+--
+-- Never amend a migration that may already have been applied. Add a new one.
+ALTER TABLE pipeline_jobs ADD COLUMN resume_accepted_at INTEGER;

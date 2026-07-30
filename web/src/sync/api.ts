@@ -927,8 +927,15 @@ export interface PipelineStatusResponse {
   current?: {
     chapter: number;
     skill: string;
-    status: "running" | "succeeded" | "failed" | "skipped_complete";
-    startedAt: string;
+    // Free-form on purpose. Verified against the real bot: it passes the
+    // checkpoint's own value through untouched, and that includes at least
+    // 'pending', 'chapter_succeeded', 'skipped', 'done' and
+    // 'paused_before_at_generation' — none of which a closed union listed. The
+    // value is only ever displayed / stored as text, so widen rather than
+    // pretend.
+    status: string;
+    // Optional: the bot omits it on a checkpoint with no timing stamp.
+    startedAt?: string;
     errorKind?: PipelineErrorKind;
     error?: string;
   };
@@ -1338,6 +1345,21 @@ export const api = {
     request<{ ok: boolean; jobId: string; state: "cancelled" }>(
       `/api/pipelines/${encodeURIComponent(jobId)}/cancel`,
       { method: "POST", signal },
+    ),
+
+  // Ask the bot to pick a paused run back up. Server returns 409
+  // {error:"cannot_resume"|"resume_refused", state, message?, pausedAgeSeconds?}
+  // when the job isn't in a paused state or the bot won't take it, 502 on an
+  // upstream failure.
+  //
+  // `force` bypasses the bot's 90-minute pause box and is DEFAULT FALSE on
+  // purpose: a forced resume republishes cached output generated before any
+  // later edits. Only send force after the user has been shown the pause age and
+  // confirmed (the bot's 409 'stale_pause' is the expected first answer).
+  pipelineResume: (jobId: string, force = false, signal?: AbortSignal) =>
+    request<{ ok: boolean; jobId: string; state: "resumed" }>(
+      `/api/pipelines/${encodeURIComponent(jobId)}/resume`,
+      { method: "POST", body: JSON.stringify({ force }), signal },
     ),
 
   // Acknowledge a "completed-while-away" toast so the server clears its

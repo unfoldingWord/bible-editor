@@ -2,7 +2,7 @@
 // status cluster (via the `pipelineStatus` prop) so it sits in normal flow
 // instead of floating over the resource-column tab strip; the popover opens
 // downward from the chip. Click expands to list each job with its state,
-// current skill, and (for resumable failures) a Retry button. The transient
+// current skill, and (for paused runs) Resume / Cancel buttons. The transient
 // start/complete toast rides a bottom-center Snackbar, matching the import
 // toasts in TopBar.
 
@@ -180,6 +180,18 @@ function StateIcon({ state }: { state: PipelineState }) {
   return <PauseCircleOutlineIcon fontSize="small" color="warning" />;
 }
 
+// Human age for the stale-pause confirmation. The bot reports pausedAgeSeconds
+// with its 409; if it ever doesn't, say so plainly rather than showing "0m" —
+// the whole point of the prompt is that the user knows how old the content is.
+function describeAge(seconds?: number): string {
+  if (typeof seconds !== "number" || !Number.isFinite(seconds)) return "an unknown time";
+  const mins = Math.floor(seconds / 60);
+  if (mins < 60) return `${mins}m`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 48) return `${hours}h`;
+  return `${Math.floor(hours / 24)} days`;
+}
+
 interface ToastMsg {
   id: number;
   text: string;
@@ -199,6 +211,16 @@ export function PipelineStatusBar({ toast, onToastClear }: Props = {}) {
   const [jobs, setJobs] = useState<PipelineJobRow[]>([]);
   const [anchorEl, setAnchorEl] = useState<HTMLElement | null>(null);
   const [cancelling, setCancelling] = useState<string | null>(null);
+  const [resuming, setResuming] = useState<string | null>(null);
+  // Per-job resume failure text. The row already renders job.error_message from
+  // the server; this covers the request itself failing (the row's own state
+  // doesn't change on a refused resume).
+  const [resumeError, setResumeError] = useState<{ jobId: string; text: string } | null>(null);
+  // Second step of the two-step force-resume. The bot refuses a pause older than
+  // its 90-minute box with 409 'stale_pause'; we never force on the first click,
+  // because a forced resume republishes output generated before any edits made
+  // since. So we surface the age here and only force once the user confirms.
+  const [staleConfirm, setStaleConfirm] = useState<{ jobId: string; text: string } | null>(null);
   const [refreshing, setRefreshing] = useState(false);
   // When pipelineStore.requestFocus(jobId) fires (e.g. on already_running),
   // we stash the request and let the next render — once hasAnything flips
@@ -277,6 +299,38 @@ export function PipelineStatusBar({ toast, onToastClear }: Props = {}) {
       // real state; other failures are transient — leave the row as-is.
     } finally {
       setCancelling(null);
+    }
+  };
+
+  // force=false on every first click. A 'stale_pause' refusal is expected, not an
+  // error: it means the pause is old enough that resuming would republish
+  // pre-edit content, so we ask before calling again with force=true.
+  const resume = async (job: PipelineJobRow, force = false) => {
+    setResuming(job.job_id);
+    setResumeError(null);
+    setStaleConfirm(null);
+    try {
+      const res = await pipelineStore.resume(job.job_id, force);
+      if (!res.ok && res.reason === "stale_pause") {
+        setStaleConfirm({
+          jobId: job.job_id,
+          text: `This run paused ${describeAge(res.pausedAgeSeconds)} ago. Resuming will publish text generated before any edits made since. Resume anyway?`,
+        });
+      } else if (!res.ok) {
+        // Prefer the bot's own explanation when it sent one — for a
+        // session-mismatch refusal it names the actual next step ("resume it
+        // from Zulip instead"), which the bare state never conveys.
+        setResumeError({
+          jobId: job.job_id,
+          text: res.detail
+            ? `Could not resume — ${res.detail}`
+            : `Could not resume — the run is now ${res.state ?? "in another state"}.`,
+        });
+      }
+    } catch {
+      setResumeError({ jobId: job.job_id, text: "Resume failed — try again." });
+    } finally {
+      setResuming(null);
     }
   };
 
@@ -390,6 +444,12 @@ export function PipelineStatusBar({ toast, onToastClear }: Props = {}) {
             {jobs.map((job, i) => {
               const parentId = parentByChildId.get(job.job_id);
               const childId = job.follow_up_job_id;
+              // A paused run holds the single bot slot without progressing, so
+              // its owner gets both escapes: ask the bot to pick it back up, or
+              // give up on it and let the queue move.
+              const isPaused =
+                job.state === "paused_for_outage" || job.state === "paused_for_usage_limit";
+              const canAct = (job.state === "queued" || isPaused) && !isForeign(job);
               return (
               <Box key={job.job_id}>
                 {i > 0 && <Divider sx={{ my: 1 }} />}
@@ -432,15 +492,68 @@ export function PipelineStatusBar({ toast, onToastClear }: Props = {}) {
                         {job.error_message}
                       </Typography>
                     )}
+                    {resumeError?.jobId === job.job_id && (
+                      <Typography variant="caption" color="error" display="block">
+                        {resumeError.text}
+                      </Typography>
+                    )}
+                    {staleConfirm?.jobId === job.job_id && (
+                      <>
+                        <Typography variant="caption" color="warning.main" display="block">
+                          {staleConfirm.text}
+                        </Typography>
+                        <Button
+                          size="small"
+                          color="warning"
+                          onClick={() => void resume(job, true)}
+                          disabled={resuming === job.job_id}
+                          startIcon={
+                            resuming === job.job_id ? <CircularProgress size={12} /> : undefined
+                          }
+                        >
+                          Resume anyway
+                        </Button>
+                        <Button size="small" color="inherit" onClick={() => setStaleConfirm(null)}>
+                          Cancel
+                        </Button>
+                      </>
+                    )}
                   </Box>
-                  {job.state === "queued" && !isForeign(job) && (
-                    <Tooltip title="Remove from the queue (only possible before it starts)">
+                  {isPaused && !isForeign(job) && (
+                    <Tooltip
+                      title={
+                        job.state === "paused_for_usage_limit"
+                          ? "Ask the bot to pick this run back up (the daily AI budget must have reset)"
+                          : "Ask the bot to pick this run back up from where the outage stopped it. If the pause is old you'll be asked to confirm first, because resuming republishes the text it had already generated."
+                      }
+                    >
+                      <span>
+                        <Button
+                          size="small"
+                          color="inherit"
+                          onClick={() => void resume(job)}
+                          disabled={resuming === job.job_id || cancelling === job.job_id}
+                          startIcon={resuming === job.job_id ? <CircularProgress size={12} /> : undefined}
+                        >
+                          Resume
+                        </Button>
+                      </span>
+                    </Tooltip>
+                  )}
+                  {canAct && (
+                    <Tooltip
+                      title={
+                        isPaused
+                          ? "Give up on this paused run and free the queue"
+                          : "Remove from the queue (only possible before it starts)"
+                      }
+                    >
                       <span>
                         <Button
                           size="small"
                           color="inherit"
                           onClick={() => void cancel(job)}
-                          disabled={cancelling === job.job_id}
+                          disabled={cancelling === job.job_id || resuming === job.job_id}
                           startIcon={cancelling === job.job_id ? <CircularProgress size={12} /> : undefined}
                         >
                           Cancel

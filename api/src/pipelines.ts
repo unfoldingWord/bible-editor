@@ -133,13 +133,27 @@ interface StatusResponse {
     chapter: number;
     skill: string;
     status: string;
-    startedAt: string;
+    // OPTIONAL, verified against the real bot: serializeCheckpoint
+    // (bp-assistant/src/api/pipeline.js) only spreads startedAt when the
+    // checkpoint carries one, so a run that parked before its first timing
+    // stamp omits the key entirely.
+    startedAt?: string;
     errorKind?: string;
     error?: string;
   };
   updatedAt: string;
   createdAt: string;
   interrupted?: boolean;
+  // Both additive, and both may be absent — the bot ships them only from the
+  // resume-contract release onwards, so every read must tolerate undefined.
+  // resume: what a resume would pick back up (chapter + skill). pausedAt: when
+  // the bot parked the run, used to time-box auto-resume.
+  //
+  // `skill` is NULLABLE, verified against the real bot: it serializes
+  // `skill: cp.resume.skill ?? null`, so a checkpoint that knows the chapter to
+  // resume but not the step reports an explicit null.
+  resume?: { chapter: number; skill: string | null } | null;
+  pausedAt?: string;
   output?: Array<{
     type: string;
     repo: string;
@@ -190,6 +204,56 @@ interface PolledJob {
   // Prior poll's error_kind. Lets us detect a *repeated* import failure so a
   // deterministically-bad apply force-fails instead of holding the slot/lock.
   error_kind: string | null;
+  // Auto-resume budget for 'paused_for_outage' (migration 0038). updated_at is
+  // the fallback pause clock when the bot doesn't report pausedAt.
+  updated_at: number;
+  resume_attempt_count: number;
+  last_resume_at: number | null;
+  // Set when the bot ACCEPTED a resume. Suppresses every fail-fast verdict for
+  // RESUME_ACCEPTED_GRACE_SECONDS — see attemptOutageResume.
+  resume_accepted_at: number | null;
+  // The original /start options, replayed on resume so a resumed run keeps the
+  // flags the translator actually asked for. TEXT column: may be NULL or (in
+  // principle) malformed, so every read goes through resumeOptionsFromJson.
+  options_json: string | null;
+}
+
+// Options to replay on a resume call, parsed from pipeline_jobs.options_json.
+//
+// The distinction between "this run had no options" and "we don't know what its
+// options were" is load-bearing, so this returns `{}` for the former and
+// `undefined` for the latter. The bot cannot recover options from its own
+// checkpoint, so a resume that sends nothing runs with DEFAULTS — silently
+// re-enabling intros or dropping the editor's hints, producing output that
+// differs from what was originally asked for. The bot therefore refuses a resume
+// whose options are unknown, and we must not disguise "unknown" as "empty".
+//
+// `fresh` is stripped: it is a valid /start option (and so legitimately lives in
+// options_json), but the bot's resume schema omits it AND rejects unknown keys,
+// because on the resume path `fresh` would destroy the very checkpoint being
+// resumed. Sending it would 400 the whole resume.
+function resumeOptionsFromJson(
+  optionsJson: string | null,
+  jobId: string,
+): Record<string, unknown> | undefined {
+  // No stored options at all is authoritative: the run genuinely had none.
+  if (!optionsJson) return {};
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(optionsJson);
+  } catch {
+    // Genuinely unknown — let the bot refuse rather than resume on defaults.
+    console.error(
+      `[pipelineResume] job=${jobId} options_json unparseable — cannot replay options`,
+    );
+    return undefined;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    console.error(`[pipelineResume] job=${jobId} options_json is not an object — cannot replay`);
+    return undefined;
+  }
+  const { fresh: _fresh, ...rest } = parsed as Record<string, unknown>;
+  return rest;
 }
 
 interface ChainStepValue {
@@ -383,6 +447,343 @@ export async function dispatchNext(env: Env): Promise<void> {
     .run();
 }
 
+// ── Resume (transient-outage recovery) ─────────────────────────────────────
+
+// Outcome of one upstream resume call.
+//
+// 'accepted' = the bot took it and the job stays non-terminal. TWO upstream
+// answers mean accepted, not one: HTTP 202 (resume launched) and HTTP 200
+// {status:'already_running'} (the bot refused to double-start because the run is
+// already alive — see bp-assistant/src/api/pipeline.js). The 200 is the
+// strongest possible evidence the run is fine; classifying it as 'retryable'
+// burned an attempt on it and, after three, failed a healthy job (and surfaced
+// on the manual route as a 502 "Resume failed" for a resume that succeeded).
+//
+// 'refused' = the bot says this pause can't be resumed (404 / 409) —
+// non-retryable, so the caller should stop rather than burn the remaining
+// attempts. 'retryable' = transport/429/5xx, or a 200 with a body we don't
+// recognise; try again later.
+type ResumeCall =
+  | { kind: "accepted"; body: unknown }
+  // `reason` is human-facing (error code plus the bot's message); `code` is the
+  // bare machine code, for callers that branch on it (e.g. stale_pause).
+  | { kind: "refused"; status: number; reason: string; code?: string; pausedAgeSeconds?: number }
+  | { kind: "retryable"; reason: string };
+
+// Calls the bot's POST /api/pipeline/{id}/resume. Shared by the automatic
+// poller path and the manual route so both classify responses identically.
+//
+// `force` bypasses the bot's OWN 90-minute pause time-box. The bot enforces that
+// box independently of ours (belt and braces: it owns the checkpoint timestamp,
+// we only see what it reports), so without force a human clicking Resume on an
+// old pause would be refused with 'stale_pause' no matter how permissive this
+// side is. Only the manual, human-initiated route may set it — the automatic
+// poller must never force, because the time-box is what keeps auto-resume from
+// re-pushing content generated before a proofreader's edits (see
+// bp-bot/STALE-SOURCE-DIAGNOSIS.md).
+//
+// `username` and `options` are things the bot cannot recover from its own
+// checkpoint, so we are the authority for both: without a username it credits
+// Door43 commits to a literal 'bible-editor' instead of the translator, and
+// without the original options a resumed run silently reverts to default flags
+// (dropping e.g. noIntro / contentTypes) — doing something other than what was
+// asked. Both keys are OMITTED entirely when we don't have them, never sent as
+// null: the bot's resume schema is `.strict()`.
+async function callUpstreamResume(
+  env: Env,
+  upstreamJobId: string,
+  opts: { force: boolean; username?: string; options?: unknown },
+): Promise<ResumeCall> {
+  const payload: Record<string, unknown> = { force: opts.force };
+  if (opts.username) payload.username = opts.username;
+  if (opts.options !== undefined && opts.options !== null) payload.options = opts.options;
+  let upstream: Response;
+  try {
+    upstream = await fetch(
+      `${upstreamBase(env)}/api/pipeline/${encodeURIComponent(upstreamJobId)}/resume`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${env.BT_API_TOKEN}`,
+        },
+        body: JSON.stringify(payload),
+      },
+    );
+  } catch {
+    return { kind: "retryable", reason: "upstream_unreachable" };
+  }
+  const text = await upstream.text();
+  let body: unknown = null;
+  try {
+    body = JSON.parse(text);
+  } catch {
+    /* non-JSON body — keep the raw text in the reason instead */
+  }
+  const err =
+    body && typeof body === "object" && typeof (body as { error?: unknown }).error === "string"
+      ? (body as { error: string }).error
+      : null;
+  // The bot sends a human-readable `message` alongside the error code, and it is
+  // often the only actionable part — "checkpoint belongs to a different session
+  // … resume it from Zulip instead" tells the user exactly what to do, whereas
+  // the bare code 'not_resumable' actively misleads. Carry both.
+  const msg =
+    body && typeof body === "object" && typeof (body as { message?: unknown }).message === "string"
+      ? (body as { message: string }).message
+      : null;
+  const detail = msg ? `${err ?? "refused"}: ${msg}` : err;
+
+  if (upstream.status === 202) return { kind: "accepted", body };
+  // 200 {status:'already_running'} — the bot won't double-start a live run. That
+  // is acceptance, not failure (see the ResumeCall comment). A 200 with any
+  // other body is unexpected; fall through to 'retryable'.
+  const upstreamStatusField =
+    body && typeof body === "object" && typeof (body as { status?: unknown }).status === "string"
+      ? (body as { status: string }).status
+      : null;
+  if (upstream.status === 200 && upstreamStatusField === "already_running") {
+    return { kind: "accepted", body };
+  }
+  // 400 (validation_failed), 404 (no checkpoint) and 409 (not_resumable /
+  // stale_pause / options_unknown) are the bot's definitive "this will never
+  // work" answers — non-retryable. 400 belongs here because the bot's resume
+  // body and options schemas are both strict: a rejected payload is rejected
+  // deterministically, so retrying it burns all three attempts and ~15 minutes
+  // of spacing before the job fails, and shows the user "try again" for a
+  // request that cannot ever succeed.
+  if (upstream.status === 400 || upstream.status === 404 || upstream.status === 409) {
+    // The bot reports the real pause age alongside 'stale_pause'. Pass it
+    // through so the manual route can name it in the confirmation prompt.
+    const age =
+      body && typeof body === "object" &&
+      typeof (body as { pausedAgeSeconds?: unknown }).pausedAgeSeconds === "number"
+        ? (body as { pausedAgeSeconds: number }).pausedAgeSeconds
+        : undefined;
+    return {
+      kind: "refused",
+      status: upstream.status,
+      reason: detail ?? `upstream ${upstream.status}: ${text.slice(0, 120)}`,
+      code: err ?? undefined,
+      ...(age !== undefined ? { pausedAgeSeconds: age } : {}),
+    };
+  }
+  return {
+    kind: "retryable",
+    reason: detail ?? `upstream ${upstream.status}: ${text.slice(0, 120)}`,
+  };
+}
+
+// `resume_accepted_at` marks a resume that is IN FLIGHT OR ACCEPTED — those two
+// states are deliberately not distinguished, because they need identical
+// treatment: in both, the bot may be running the chapter while our row still
+// reads `paused_for_outage`. Anything that would free the bot slot or the chapter
+// lock (a fail-fast verdict, a cancel) must refuse while it is set.
+//
+// Always set it BEFORE calling upstream. Setting it after the answer leaves a
+// window in which the bot has launched the run but our row looks abandonable.
+//
+// This is a CLAIM, not a blind write, and the return value is load-bearing: it
+// is true only when this caller actually acquired the marker (it was unset, or
+// an expired leftover). A caller that finds a live marker gets false and must
+// NOT clear it later — that marker belongs to another in-flight-or-accepted
+// resume. Two resumes on one job are reachable without any exotic timing: the
+// */5 poller auto-resumes and the translator clicks Resume in a tab, or two tabs
+// both click. Without this, the SECOND call being refused clears the FIRST
+// call's acceptance and re-opens the cancel door underneath a live run. The
+// mutual exclusion is the WHERE clause — D1 serializes the UPDATE, so exactly
+// one concurrent caller can match.
+async function markResumeInFlight(env: Env, jobId: string): Promise<boolean> {
+  const res = await env.DB.prepare(
+    `UPDATE pipeline_jobs
+        SET resume_accepted_at = unixepoch()
+      WHERE job_id = ?1
+        AND (resume_accepted_at IS NULL
+             OR resume_accepted_at < unixepoch() - ?2)`,
+  )
+    .bind(jobId, RESUME_ACCEPTED_GRACE_SECONDS)
+    .run();
+  return (res.meta?.changes ?? 0) > 0;
+}
+
+// Clear it when the bot definitively did NOT take the resume, so the job is
+// cancellable again and GATE 0 doesn't sit on it for the full grace window.
+// Only ever call this when the matching markResumeInFlight returned true.
+//
+// KNOWN RESIDUAL, deliberately not closed here. The claim makes the marker
+// single-owner, which covers same-instant collisions (the WHERE cannot match
+// twice) and covers a second caller clearing a first caller's marker. What it
+// does not cover: the OWNER's call being refused while a concurrent non-owner
+// call was accepted — the owner then legitimately clears a marker that now
+// stands over a live run. It needs the bot to answer one caller 'accepted' and
+// the other a refusal in the same window, which is why it is narrow.
+//
+// Closing it properly needs an ownership token (a per-attempt id compared on
+// clear), i.e. a new column and a migration. That is a schema decision, and the
+// alternative — never clearing on refusal and letting the 15-minute grace expire
+// — would delay cancel and fail-fast on the MOST COMMON refusal path (a stale
+// pause), trading the queue-drain guarantee this whole change exists to provide
+// against a much narrower race. Left as-is on purpose; revisit with the token if
+// concurrent resumes on one job ever stop being rare.
+async function clearResumeInFlight(env: Env, jobId: string): Promise<void> {
+  await env.DB.prepare(
+    `UPDATE pipeline_jobs SET resume_accepted_at = NULL WHERE job_id = ?1`,
+  )
+    .bind(jobId)
+    .run();
+}
+
+// Auto-resume a job the bot parked on a transient Claude outage. Returns a
+// reason string when the job is NOT resumable and must be failed fast (so the
+// bot slot frees and the queue drains), or null to leave it non-terminal —
+// either because a resume was accepted, because we're spacing attempts out, or
+// because the failure was transient and a later poll can retry.
+//
+// Deliberately scoped to 'paused_for_outage'. 'paused_for_usage_limit' means the
+// daily budget is spent; resuming would re-fail immediately, so that state keeps
+// its existing behavior untouched.
+async function attemptOutageResume(
+  env: Env,
+  job: PolledJob,
+  data: StatusResponse,
+): Promise<string | null> {
+  if (!job.upstream_job_id) return null;
+  const now = Math.floor(Date.now() / 1000);
+
+  // GATE 0 — an accepted resume is still starting. This runs BEFORE every other
+  // gate, and the ordering is the whole point: returning a fail-fast reason here
+  // would free the bot slot and the chapter lock underneath a run that is
+  // actively writing (see RESUME_ACCEPTED_GRACE_SECONDS). Leave it strictly
+  // alone: don't fail it, don't resume it again.
+  if (job.resume_accepted_at !== null) {
+    if (now - job.resume_accepted_at < RESUME_ACCEPTED_GRACE_SECONDS) return null;
+    // Past the grace window and the bot still says 'paused_for_outage' — the
+    // resume was accepted but never actually started. Clear the marker so the
+    // normal gates below apply and this eventually fails fast, rather than
+    // hanging paused forever behind a stale acceptance.
+    await env.DB.prepare(
+      `UPDATE pipeline_jobs SET resume_accepted_at = NULL WHERE job_id = ?1`,
+    )
+      .bind(job.job_id)
+      .run();
+  }
+
+  // Pause clock. `pausedAt` is AUTHORITATIVE when present: it is the bot's
+  // write-once `pauseAnchorAt`, stamped on the first pause and never refreshed,
+  // so our 90-minute box genuinely binds. (It used to be a resetting timestamp,
+  // which is why the fallback below carried the whole safety argument; the bot
+  // was fixed to report the anchor.)
+  //
+  // The `updated_at` fallback is a LOWER BOUND, not an approximation: our poller
+  // refreshes updated_at on every */5 poll, so a computed age can understate a
+  // pause that is in fact far older than 90 minutes — the unsafe direction for
+  // content freshness. It is tolerable only because the bot independently
+  // enforces the same box against its own anchor and refuses with 'stale_pause'
+  // (we never send force from this path). The fallback is therefore not
+  // load-bearing; don't drop the bot-side box on the grounds that we check here.
+  let pausedAtSec: number = job.updated_at;
+  if (data.pausedAt) {
+    const parsed = Date.parse(data.pausedAt);
+    if (Number.isFinite(parsed)) pausedAtSec = Math.floor(parsed / 1000);
+  }
+  // Spacing comes FIRST, ahead of the age and cap gates, and that ordering is
+  // load-bearing. A resume attempt inside the spacing window means this job is
+  // already being retried — by an earlier poll, or by a human who just clicked
+  // Resume. The manual route deliberately ignores the time-box, but the bot
+  // keeps reporting `paused_for_outage` until the resumed run actually starts,
+  // so a poll landing in that gap would see "3 hours old" and fail the job the
+  // translator just rescued. Checking spacing first leaves it alone.
+  //
+  // This costs nothing in the auto case: a genuinely too-old pause is failed on
+  // the next poll instead of this one, and it can never be *resumed* meanwhile,
+  // because the age gate below still guards every actual resume call.
+  //
+  // (The original reason for spacing still holds: the poll cron is */5 and the
+  // window is 5m, so one attempt per poll. This read is only a cheap early exit
+  // — the actual mutual exclusion between two concurrent pollers is the
+  // conditional UPDATE below, not this check.)
+  if (job.last_resume_at !== null && now - job.last_resume_at < RESUME_RETRY_SPACING_SECONDS) {
+    return null;
+  }
+  // Fail closed on an unknown pause time. If neither source gave us a finite
+  // number (a future PolledJob producer omitting updated_at would do it), every
+  // `age > limit` comparison against NaN is false and the age gate silently
+  // stops existing. Treat an unknown pause time as too old instead.
+  if (!Number.isFinite(pausedAtSec)) {
+    return "pause timestamp unknown — refusing to auto-resume without a verifiable age";
+  }
+  const ageSeconds = Math.max(0, now - pausedAtSec);
+  if (ageSeconds > RESUME_MAX_PAUSE_AGE_SECONDS) {
+    return `paused ${Math.floor(ageSeconds / 60)}m ago — too old to auto-resume safely (limit ${
+      RESUME_MAX_PAUSE_AGE_SECONDS / 60
+    }m)`;
+  }
+  if (job.resume_attempt_count >= MAX_RESUME_ATTEMPTS) {
+    return `auto-resume exhausted after ${job.resume_attempt_count} attempts`;
+  }
+
+  // Count the attempt BEFORE the call so a Worker crash mid-flight can't give
+  // us unlimited retries — same reasoning as attempt_count in pollAllNonTerminal.
+  //
+  // The WHERE clause re-checks the spacing window inside the write, making this
+  // the real concurrency guard: the cron poller and an open tab's GET can both
+  // read the same stale last_resume_at and both pass the check above, but only
+  // one UPDATE can match. 0 changes means the other poller won — return null and
+  // do NOT call upstream, rather than double-attempting a resume.
+  const claim = await env.DB.prepare(
+    `UPDATE pipeline_jobs
+        SET resume_attempt_count = resume_attempt_count + 1,
+            last_resume_at = unixepoch()
+      WHERE job_id = ?1
+        AND (last_resume_at IS NULL OR last_resume_at < unixepoch() - ?2)`,
+  )
+    .bind(job.job_id, RESUME_RETRY_SPACING_SECONDS)
+    .run();
+  if ((claim.meta?.changes ?? 0) === 0) return null;
+
+  // The bot can't recover either of these from its checkpoint, so we supply
+  // them (see callUpstreamResume). A missing username is not fatal — better a
+  // mis-attributed commit than a job stuck paused — so we just omit it.
+  const username = await resolveUsernameFromDb(env, job.user_id);
+  const options = resumeOptionsFromJson(job.options_json, job.job_id);
+
+  // Mark IN FLIGHT before the call, not after the answer. The window between
+  // issuing a resume and learning it was accepted is real: during it the bot may
+  // already have launched the run, while our row still reads paused_for_outage
+  // with no acceptance marker — so a cancel arriving in that window would pass
+  // the cancel guard, release the chapter lock, and dispatch a second job
+  // against a live run. Setting the marker first closes the window; a refusal
+  // clears it below, so a genuinely unresumable job stays cancellable.
+  //
+  // `owned` gates the clears: if some other resume already holds a live marker,
+  // this call must not wipe it on its own refusal (see markResumeInFlight).
+  const owned = await markResumeInFlight(env, job.job_id);
+
+  // Never force from the automatic path — the bot's time-box is a safety gate here.
+  const call = await callUpstreamResume(env, job.upstream_job_id, {
+    force: false,
+    ...(username ? { username } : {}),
+    ...(options ? { options } : {}),
+  });
+  if (call.kind === "accepted") {
+    // Keep the marker: GATE 0 above now suppresses every fail-fast verdict while
+    // the resumed run starts up. Without it the next poll past the spacing
+    // window fails a job the bot is actively running.
+    return null;
+  }
+  if (call.kind === "refused") {
+    if (owned) await clearResumeInFlight(env, job.job_id);
+    return `auto-resume refused by bot: ${call.reason}`;
+  }
+  // Retryable: the attempt is spent but the job stays paused. A later poll
+  // retries until the cap or the time-box catches it. Clear the in-flight marker
+  // so this job is cancellable again and GATE 0 doesn't sit on it for 15 minutes
+  // over a transport blip.
+  if (owned) await clearResumeInFlight(env, job.job_id);
+  console.error(`[pipelineResume] job=${job.job_id} retryable: ${call.reason}`);
+  return null;
+}
+
 // Shared "fetch upstream, run import, update DB, fire follow-up" body used
 // by both the GET handler and the scheduled cron poller. Returns the raw
 // upstream response so callers that need to pass it through can do so;
@@ -490,24 +891,67 @@ async function pollPipelineJob(
     data.state !== "failed" &&
     data.state !== "cancelled";
 
+  // Transient-outage pause: try to resume it automatically (time-boxed and
+  // capped — see attemptOutageResume). If it can't be resumed, we get a reason
+  // back and fail the job now so the single bot slot frees and everything queued
+  // behind it dispatches within minutes instead of waiting ~8h for the blunt
+  // MAX_POLL_ATTEMPTS backstop.
+  let unresumableReason: string | null = null;
+  if (!importFailed && !upstreamInterrupted && data.state === "paused_for_outage") {
+    try {
+      unresumableReason = await attemptOutageResume(env, job, data);
+    } catch (err) {
+      console.error(`[pipelineResume] job=${job.job_id} threw:`, err);
+    }
+  } else if (
+    data.state &&
+    data.state !== "paused_for_outage" &&
+    data.state !== "paused_for_usage_limit" &&
+    (job.resume_attempt_count > 0 || job.last_resume_at !== null || job.resume_accepted_at !== null)
+  ) {
+    // The resume budget is per PAUSE CYCLE, not per job. One job row can span a
+    // multi-chapter run and pause several times; observing any non-paused
+    // upstream state means the previous cycle is over (the run is moving again,
+    // or finished). Without this reset, a job that spent its three attempts on
+    // an early pause is failed on the FIRST poll of a later pause — no resume
+    // attempted at all — throwing away every already-completed chapter.
+    try {
+      await env.DB.prepare(
+        `UPDATE pipeline_jobs
+            SET resume_attempt_count = 0,
+                last_resume_at = NULL,
+                resume_accepted_at = NULL
+          WHERE job_id = ?1`,
+      )
+        .bind(job.job_id)
+        .run();
+    } catch (err) {
+      console.error(`[pipelineResume] job=${job.job_id} budget reset failed:`, err);
+    }
+  }
+
   const importFailedAgain = importFailed && job.error_kind === "import_failed";
   const effectiveState = importFailed
     ? importFailedAgain
       ? "failed"
       : "running"
-    : upstreamInterrupted
+    : upstreamInterrupted || unresumableReason
       ? "failed"
       : (data.state ?? "running");
   const effectiveErrorKind = importFailed
     ? "import_failed"
     : upstreamInterrupted
       ? "interrupted"
-      : (data.current?.errorKind ?? null);
+      : unresumableReason
+        ? "paused_unresumable"
+        : (data.current?.errorKind ?? null);
   const effectiveErrorMessage = importFailed
     ? importErrMessage
     : upstreamInterrupted
       ? (data.current?.error ?? "upstream reported interrupted")
-      : (data.current?.error ?? null);
+      : unresumableReason
+        ? `paused for outage and not resumable: ${unresumableReason}`
+        : (data.current?.error ?? null);
 
   await env.DB.prepare(
     `UPDATE pipeline_jobs SET
@@ -625,6 +1069,19 @@ async function pollPipelineJob(
         error: data.current?.error ?? "upstream reported interrupted",
       },
     });
+  } else if (unresumableReason) {
+    // Same reasoning as the interrupted branch: upstream still reports
+    // 'paused_for_outage', we stored 'failed'. Rewrite so a tab polling this
+    // job by id sees terminal and stops.
+    responseText = JSON.stringify({
+      ...data,
+      state: "failed",
+      current: {
+        ...(data.current ?? { chapter: 0, skill: "", status: "", startedAt: "" }),
+        errorKind: "paused_unresumable",
+        error: `paused for outage and not resumable: ${unresumableReason}`,
+      },
+    });
   }
 
   return { kind: "ok", text: responseText, status: upstream.status, state: effectiveState };
@@ -647,6 +1104,31 @@ const MAX_POLL_ATTEMPTS = 100;
 // risk launching a second concurrent run, and free the slot for the queue.
 const STUCK_DISPATCH_THRESHOLD_SECONDS = 120;
 
+// Auto-resume time-box. A pause older than this is not resumed automatically:
+// the bot's checkpoint may no longer match the repo state, and a stale resume is
+// worse than a clean re-run. A human can still resume an old pause explicitly
+// via POST /api/pipelines/:jobId/resume, which skips this and the attempt cap.
+const RESUME_MAX_PAUSE_AGE_SECONDS = 90 * 60;
+
+// How many automatic resume attempts one job gets before we fail it.
+const MAX_RESUME_ATTEMPTS = 3;
+
+// Minimum gap between resume attempts, so a bot that is still down isn't
+// hammered. Enforced by a conditional UPDATE (not a read-then-write), so two
+// concurrent pollers genuinely cannot both attempt inside one window.
+const RESUME_RETRY_SPACING_SECONDS = 5 * 60;
+
+// How long after the bot accepts a resume we leave the job completely alone.
+//
+// THIS IS A SAFETY GATE, NOT A CONVENIENCE. The bot's checkpoint keeps reporting
+// 'paused_for_outage' until the resumed run reaches its first checkpoint write,
+// which can be minutes. If a poll inside that gap applied the age gate or the
+// attempt cap it would mark the job 'failed' and call dispatchNext() — handing a
+// second job to the single-slot bot AND releasing the chapter write-lock while
+// the resumed run is still writing D1 and Door43. That is the double-write class
+// this whole queue exists to prevent, and it is reachable with no human
+// involved: a resume accepted at pause age 88m, next */5 poll at 94m.
+const RESUME_ACCEPTED_GRACE_SECONDS = 15 * 60;
 // Polls every non-terminal pipeline_job. Designed for the scheduled
 // handler — runs in parallel with per-job error isolation so one stuck
 // upstream call doesn't drag the batch down.
@@ -693,7 +1175,9 @@ export async function pollAllNonTerminal(env: Env): Promise<void> {
   const rs = await env.DB.prepare(
     `SELECT job_id, upstream_job_id, user_id, pipeline_type, book, start_chapter,
             end_chapter, session_key, follow_up_options, follow_up_chain,
-            follow_up_job_id, error_kind, (output_json IS NULL) AS no_output_yet
+            follow_up_job_id, error_kind, updated_at, resume_attempt_count,
+            last_resume_at, resume_accepted_at, options_json,
+            (output_json IS NULL) AS no_output_yet
        FROM pipeline_jobs
       WHERE state IN ('running', 'paused_for_outage', 'paused_for_usage_limit')
       ORDER BY updated_at ASC
@@ -936,7 +1420,8 @@ pipelines.get("/:jobId", requireEditor, async (c) => {
     `SELECT job_id, upstream_job_id, user_id, pipeline_type, book, start_chapter,
             end_chapter, session_key, follow_up_options, follow_up_chain,
             follow_up_job_id, error_kind, state, current_skill, current_status,
-            created_at, updated_at, (output_json IS NULL) AS no_output_yet
+            created_at, updated_at, resume_attempt_count, last_resume_at,
+            resume_accepted_at, options_json, (output_json IS NULL) AS no_output_yet
        FROM pipeline_jobs WHERE job_id = ?1`,
   )
     .bind(jobId)
@@ -1280,10 +1765,13 @@ interface PipelineRowSelect {
 }
 
 // POST /api/pipelines/:jobId/cancel  — withdraw a job that hasn't reached the
-// front of the line yet. Only 'queued' jobs are cancellable (they never
-// touched the bot); a job that's already 'dispatching'/'running' or terminal
-// returns 409. Sets notified_user_at so the cancelled row doesn't resurface as
-// a "while you were away" item on the next reload.
+// front of the line yet, or abandon one the bot has parked. Cancellable states:
+// 'queued' (never touched the bot) and the two paused states — a paused job
+// holds the single bot slot and isn't progressing, so the owner must be able to
+// give up on it instead of waiting for the 48h backstop. 'dispatching' /
+// 'running' and terminal states still return 409. Sets notified_user_at so the
+// cancelled row doesn't resurface as a "while you were away" item on the next
+// reload.
 pipelines.post("/:jobId/cancel", requireEditor, async (c) => {
   const userId = currentUserId(c);
   if (!userId) return c.json({ error: "unauthorized" }, 401);
@@ -1291,25 +1779,55 @@ pipelines.post("/:jobId/cancel", requireEditor, async (c) => {
   if (!jobId) return c.json({ error: "missing_job_id" }, 400);
 
   const owned = await c.env.DB.prepare(
-    `SELECT user_id, state FROM pipeline_jobs WHERE job_id = ?1`,
+    `SELECT user_id, state, resume_accepted_at FROM pipeline_jobs WHERE job_id = ?1`,
   )
     .bind(jobId)
-    .first<{ user_id: number; state: string }>();
+    .first<{ user_id: number; state: string; resume_accepted_at: number | null }>();
   if (!owned) return c.json({ error: "not_found" }, 404);
   if (owned.user_id !== userId) return c.json({ error: "forbidden" }, 403);
-  if (owned.state !== "queued") {
+  const CANCELLABLE = ["queued", "paused_for_outage", "paused_for_usage_limit"];
+  if (!CANCELLABLE.includes(owned.state)) {
     return c.json({ error: "cannot_cancel", state: owned.state }, 409);
   }
 
-  // Guard on state='queued' again in the UPDATE so a concurrent dispatch that
-  // just claimed this row (queued -> dispatching) can't be cancelled out from
-  // under the bot.
+  // Refuse while an accepted resume is still starting up. This is the same
+  // hazard GATE 0 closes in attemptOutageResume, reached through the cancel door
+  // instead of the poll door: after the bot accepts, our row keeps displaying
+  // 'paused_for_outage' for up to the grace window (the bot reports that state
+  // until the resumed run writes its first checkpoint), so the Cancel button
+  // stays enabled. Cancelling then releases the chapter lock and dispatches a
+  // second job to the single-slot bot while the resumed run is actively writing
+  // D1 and Door43. There is no upstream cancel to call — cancel here is purely
+  // local bookkeeping — so refusing is the only correct answer.
+  if (
+    owned.state !== "queued" &&
+    owned.resume_accepted_at !== null &&
+    Math.floor(Date.now() / 1000) - owned.resume_accepted_at < RESUME_ACCEPTED_GRACE_SECONDS
+  ) {
+    return c.json(
+      {
+        error: "resume_in_progress",
+        state: owned.state,
+        message:
+          "the bot accepted a resume for this run and it is still starting — " +
+          "cancelling now would run a second job against it",
+      },
+      409,
+    );
+  }
+
+  // Guard on the cancellable set again in the UPDATE so a concurrent dispatch
+  // that just claimed this row (queued -> dispatching) can't be cancelled out
+  // from under the bot. NOTE: this does NOT protect against cancelling a job
+  // whose resume was just accepted — a successful resume deliberately leaves the
+  // state at 'paused_for_outage' (that is GATE 0's premise), so such a row stays
+  // inside CANCELLABLE. The resume_accepted_at check above is what covers that.
   const res = await c.env.DB.prepare(
     `UPDATE pipeline_jobs
         SET state = 'cancelled', notified_user_at = unixepoch(), updated_at = unixepoch()
-      WHERE job_id = ?1 AND state = 'queued'`,
+      WHERE job_id = ?1 AND state IN (?2, ?3, ?4)`,
   )
-    .bind(jobId)
+    .bind(jobId, ...CANCELLABLE)
     .run();
   if ((res.meta?.changes ?? 0) === 0) {
     const now = await c.env.DB.prepare(
@@ -1319,7 +1837,167 @@ pipelines.post("/:jobId/cancel", requireEditor, async (c) => {
       .first<{ state: string }>();
     return c.json({ error: "cannot_cancel", state: now?.state ?? "unknown" }, 409);
   }
+  // Cancelling a paused job frees the single bot slot it was holding — pull the
+  // next queued job right away rather than waiting for the */5 cron.
+  if (owned.state !== "queued") {
+    try {
+      await dispatchNext(c.env);
+    } catch (err) {
+      console.error(`[cancel.dispatchNext] job=${jobId}:`, err);
+    }
+  }
   return c.json({ ok: true, jobId, state: "cancelled" });
+});
+
+// POST /api/pipelines/:jobId/resume  — ask the bot to pick a paused run back
+// up. Body: optional {force?: boolean}, DEFAULT FALSE.
+//
+// Two-step, but ENFORCED BY THE UI ONLY — be precise about this, because the
+// step is load-bearing. `force` bypasses the bot's 90-minute pause box, which is
+// the only real containment we have against republishing stale content: a
+// resumed run reuses its cached artifacts and skips the live-ULT freshness check
+// (bp-bot/STALE-SOURCE-DIAGNOSIS.md §3.1). So a one-click force would let an
+// editor silently republish text generated before three days of edits. The UI's
+// first click sends force=false and is allowed to be refused with 409
+// 'stale_pause'; only after it has shown the pause age and the user has confirmed
+// does a second call arrive with force=true.
+//
+// Nothing here records that step one happened, so any other client — a script,
+// curl, a second frontend — can send force=true on its first call and skip the
+// confirmation entirely. That is a deliberate limit, not an oversight: this is an
+// authenticated editor-only route and the caller is the job's own owner, so the
+// exposure is "an editor bypasses a warning about their own run", not privilege
+// escalation. If a non-UI client ever calls this route, enforce the step
+// server-side (e.g. honor force only when this job has a recent recorded
+// refusal) rather than trusting the comment.
+//
+// Otherwise deliberately more permissive than the automatic path in
+// attemptOutageResume: no time-box of our own and no attempt cap, and it does
+// NOT increment resume_attempt_count — three human clicks must not exhaust the
+// automatic budget. It does set last_resume_at, so spacing still applies and a
+// */5 poll landing right after a click doesn't stack a second attempt. Also covers
+// 'paused_for_usage_limit', which auto-resume never touches (the daily budget
+// resets, so a manual resume the next day is exactly the right move).
+// Same auth + ownership shape as /cancel above.
+pipelines.post("/:jobId/resume", requireEditor, async (c) => {
+  if (!c.env.BT_API_TOKEN) {
+    return c.json({ error: "pipeline_api_disabled" }, 503);
+  }
+  const userId = currentUserId(c);
+  if (!userId) return c.json({ error: "unauthorized" }, 401);
+  const jobId = c.req.param("jobId");
+  if (!jobId) return c.json({ error: "missing_job_id" }, 400);
+
+  const owned = await c.env.DB.prepare(
+    `SELECT user_id, state, upstream_job_id, options_json
+       FROM pipeline_jobs WHERE job_id = ?1`,
+  )
+    .bind(jobId)
+    .first<{
+      user_id: number;
+      state: string;
+      upstream_job_id: string | null;
+      options_json: string | null;
+    }>();
+  if (!owned) return c.json({ error: "not_found" }, 404);
+  if (owned.user_id !== userId) return c.json({ error: "forbidden" }, 403);
+  if (owned.state !== "paused_for_outage" && owned.state !== "paused_for_usage_limit") {
+    return c.json({ error: "cannot_resume", state: owned.state }, 409);
+  }
+  if (!owned.upstream_job_id) {
+    // Paused implies it reached the bot, so this shouldn't happen; be explicit
+    // rather than calling the bot with an empty id.
+    return c.json({ error: "cannot_resume", state: owned.state }, 409);
+  }
+
+  // Same as the automatic path: the bot can't recover the requesting username or
+  // the original options from its checkpoint, so send both (see callUpstreamResume).
+  const username = await resolveUsername(c, owned.user_id);
+  const options = resumeOptionsFromJson(owned.options_json, jobId);
+
+  // Opt-in force only. An absent, empty or non-JSON body means force=false —
+  // the safe default (see the route comment).
+  let force = false;
+  try {
+    const body = (await c.req.json()) as { force?: unknown } | null;
+    force = body?.force === true;
+  } catch {
+    /* no body / not JSON — force stays false */
+  }
+
+  // Open the spacing window BEFORE the call, and regardless of outcome. This is
+  // what keeps the two-step usable: the client re-polls immediately after a 409
+  // 'stale_pause', and without this the automatic path would see an untouched
+  // last_resume_at, apply the age gate, and fail the job — leaving the user
+  // staring at a "Resume anyway?" prompt for a job that is already failed. A
+  // human is mid-decision on this job; the poller must leave it alone.
+  // Deliberately does NOT touch resume_attempt_count — see the route comment.
+  //
+  // It does NOT extend an already-open window, and that bound matters: the
+  // automatic path checks spacing ahead of the age gate and the fail-fast
+  // verdicts, so a client clicking Resume more often than the spacing interval
+  // could otherwise suppress automatic recovery AND automatic fail-fast
+  // indefinitely — re-creating the ~8h queue wedge this whole change exists to
+  // remove. Refreshing only a closed window caps the suppression at one interval.
+  await c.env.DB.prepare(
+    `UPDATE pipeline_jobs
+        SET last_resume_at = unixepoch()
+      WHERE job_id = ?1
+        AND (last_resume_at IS NULL OR last_resume_at < unixepoch() - ?2)`,
+  )
+    .bind(jobId, RESUME_RETRY_SPACING_SECONDS)
+    .run();
+
+  // In flight from here — set before the call, same reasoning as the automatic
+  // path: the bot may launch the run before we learn it accepted, and a cancel
+  // landing in that window would abandon a live run. `owned` is false when the
+  // poller (or another tab) already holds a live marker — then this call must not
+  // clear it on its own refusal (see markResumeInFlight).
+  const ownedMarker = await markResumeInFlight(c.env, jobId);
+
+  const call = await callUpstreamResume(c.env, owned.upstream_job_id, {
+    force,
+    ...(username ? { username } : {}),
+    ...(options ? { options } : {}),
+  });
+  if (call.kind === "accepted") {
+    // Marker already set; refresh updated_at so the panel reflects the action.
+    // Leave `state` alone — the next poll observes real progress.
+    await c.env.DB.prepare(
+      `UPDATE pipeline_jobs SET updated_at = unixepoch() WHERE job_id = ?1`,
+    )
+      .bind(jobId)
+      .run();
+    return c.json({ ok: true, jobId, state: "resumed", upstream: call.body });
+  }
+  // Not taken: clear the marker so the job stays cancellable and the poller is
+  // not blocked on a resume that never happened. Must precede both returns
+  // below — a refused stale_pause is the expected first half of the two-step,
+  // and leaving the marker set there would block the Cancel button as well.
+  if (ownedMarker) await clearResumeInFlight(c.env, jobId);
+  if (call.kind === "refused") {
+    // pausedAgeSeconds accompanies the bot's 'stale_pause' refusal; the client
+    // needs it to name the age in the "resume anyway?" confirmation.
+    return c.json(
+      {
+        error: "resume_refused",
+        state: owned.state,
+        // `code` is the bare machine code — the client branches on this to
+        // decide whether to offer "resume anyway" (it looks for 'stale_pause').
+        // `message` is prose and includes the bot's own explanation appended, so
+        // it must never be compared for equality. Keeping them separate is what
+        // lets us surface the bot's actually-useful text (e.g. "resume it from
+        // Zulip instead") without breaking that branch.
+        code: call.code,
+        message: call.reason,
+        ...(call.pausedAgeSeconds !== undefined
+          ? { pausedAgeSeconds: call.pausedAgeSeconds }
+          : {}),
+      },
+      409,
+    );
+  }
+  return c.json({ error: "upstream_error", message: call.reason }, 502);
 });
 
 // POST /api/pipelines/:jobId/notified  — mark a terminal job as having
@@ -1347,3 +2025,4 @@ pipelines.post("/:jobId/notified", requireEditor, async (c) => {
   // doesn't care.
   return c.json({ ok: true, changed: res.meta?.changes ?? 0 });
 });
+
