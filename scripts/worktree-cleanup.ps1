@@ -49,5 +49,12 @@ C:\GH\dotfiles and its checkout includes windows/ (added 2026-07):
 
 # $PSScriptRoot is inside this repo -- or inside whichever worktree this was
 # invoked from -- which is all `git -C` needs to resolve the right repository.
+# No `exit $LASTEXITCODE` here. $LASTEXITCODE is set only by NATIVE commands, and
+# the canonical script is PowerShell -- so after this call it holds the result of
+# whichever `git` subcommand happened to run last anywhere in the call graph, not
+# whether the operation succeeded. Exiting on that would make the exit code
+# meaningless (and reorderings inside the canonical script could flip it).
+# Letting the script end naturally yields 0, and a genuine failure still
+# propagates: the canonical script runs with $ErrorActionPreference = 'Stop' and
+# throws, which surfaces as a nonzero process exit on its own.
 & $canonical -RepoPath $PSScriptRoot @PSBoundParameters
-exit $LASTEXITCODE
