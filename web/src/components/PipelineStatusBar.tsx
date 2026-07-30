@@ -621,4 +621,3 @@ export function PipelineStatusBar({ toast, onToastClear }: Props = {}) {
     </>
   );
 }
-
