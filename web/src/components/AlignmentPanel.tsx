@@ -2281,7 +2281,7 @@ function buildSourceIndexMap(sourceVerse: VerseDto | null): Map<string, number> 
         o["type"] === "milestone" ||
         // \d (Psalm superscription) is type:"section" but its content IS
         // alignable verse body — descend so its \w tokens get walk positions
-        // matching SourceVerseTokens / collectSourceWords. Mirrors
+        // matching SourceVerseTokens / collectAlignerSourceWords. Mirrors
         // collectMilestoneRuns in highlight.ts.
         (o["type"] === "section" && o["tag"] === "d")
       ) {
