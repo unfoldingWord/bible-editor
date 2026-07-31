@@ -2185,7 +2185,7 @@ function roundtripVerseUsfm(rawUsfm, sourceVO = null) {
 
 // ─── Case 31: withSourceCoverage totals keyed by NFC (textKey) ────────────
 //
-// collectSourceWords counts textOccurrence per NFC textKey, but the
+// collectAlignerSourceWords counts textOccurrence per NFC textKey, but the
 // placeholder builder totalled occurrences by RAW sw.text — so two
 // raw-different / NFC-equal tokens (UHB legacy combining-mark order vs
 // NFC) produced occurrence="2" with occurrences="1", the same impossible

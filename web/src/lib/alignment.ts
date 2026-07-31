@@ -579,7 +579,17 @@ interface CollectedSourceWord {
   textOccurrence: number;
 }
 
-function collectSourceWords(verseObjects: unknown[]): CollectedSourceWord[] {
+// The ALIGNER's source-word walk. Deliberately NOT highlight.ts's
+// collectSourceWords, despite walking the same tree with the same descend rule:
+// this one counts `textOccurrence` per `nfc()` key, which PRESERVES a word
+// joiner (U+2060), while the quote/highlight side counts per `matchNorm()`,
+// which STRIPS it. Both folds are load-bearing in their own domain — TN quotes
+// routinely omit the joiner, so the quote side must fold it away to match at
+// all, whereas the aligner must keep two joiner-distinct source tokens
+// distinguishable in order to drag them independently. Unifying them would
+// change aligner behavior, so the duplication here is intentional; the name
+// says which fold you are getting.
+function collectAlignerSourceWords(verseObjects: unknown[]): CollectedSourceWord[] {
   const out: CollectedSourceWord[] = [];
   const textCounts = new Map<string, number>();
   let pos = 0;
@@ -742,7 +752,7 @@ function contentHasGlueJoiner(s: string): boolean {
 //   - On a unique run of N words, replace the one milestone with N nested
 //     `\zaln-s` milestones (innermost wraps the original target `\w` children),
 //     each carrying that UHB word's strong/lemma/morph/content and a per-exact-
-//     surface occurrence (`collectSourceWords` textOccurrence). Every target word
+//     surface occurrence (`collectAlignerSourceWords` textOccurrence). Every target word
 //     stays under a `\zaln`, so a later export sees `changed_source`, not `lost`.
 //
 // Returns the SAME array reference when nothing reformed (clean verses round-trip
@@ -756,7 +766,7 @@ export function reformGluedMilestones(
   if (!Array.isArray(targetVerseObjects) || !Array.isArray(sourceVerseObjects)) {
     return targetVerseObjects;
   }
-  const sourceWords = collectSourceWords(sourceVerseObjects);
+  const sourceWords = collectAlignerSourceWords(sourceVerseObjects);
   if (sourceWords.length === 0) return targetVerseObjects;
   const folds = sourceWords.map((sw) => sourceFold(sw.text));
   const totals = new Map<string, number>();
@@ -846,7 +856,7 @@ export function reformGluedMilestones(
 // well-formed card covers a UNIQUE CONTIGUOUS run of UHB words in document
 // order, so two source words landing on the SAME position (`duplicate`) — or a
 // gap between them (`noncontiguous`) — means the card doesn't correspond to any
-// real UHB span. This reuses `collectSourceWords` + `findSourcePosition` (the
+// real UHB span. This reuses `collectAlignerSourceWords` + `findSourcePosition` (the
 // same resolver `coveredPositions`/`withSourceCoverage` use), so the detector
 // can't drift from what the aligner actually renders.
 //
@@ -942,7 +952,7 @@ export function detectDoubledSourceMilestones(
   sourceVerseObjects: unknown[],
 ): DoubledSourceIssue[] {
   if (!Array.isArray(targetVerseObjects) || !Array.isArray(sourceVerseObjects)) return [];
-  const sourceWords = collectSourceWords(sourceVerseObjects);
+  const sourceWords = collectAlignerSourceWords(sourceVerseObjects);
   if (sourceWords.length === 0) return [];
   const issues: DoubledSourceIssue[] = [];
   for (const card of collectAlignmentCards(targetVerseObjects)) {
@@ -1203,7 +1213,7 @@ function withSourceCoverage(
   base: Omit<AlignmentState, "groups" | "unaligned">,
   sourceVerseObjects: unknown[],
 ): Omit<AlignmentState, "groups" | "unaligned"> {
-  const sourceWords = collectSourceWords(sourceVerseObjects);
+  const sourceWords = collectAlignerSourceWords(sourceVerseObjects);
   if (sourceWords.length === 0) return base;
   // Re-derive impossible/stale x-occurrence numbers FIRST: everything below
   // (position resolution, the canonical sort, coverage) reads occurrence to
@@ -1234,7 +1244,7 @@ function withSourceCoverage(
     }
   }
   // Keyed by textKey (NFC) — textOccurrence was counted per textKey in
-  // collectSourceWords, so totals must use the same key or two raw-different
+  // collectAlignerSourceWords, so totals must use the same key or two raw-different
   // / NFC-equal tokens get occurrence=2 with occurrences=1 (malformed).
   const textTotals = new Map<string, number>();
   for (const sw of sourceWords) {

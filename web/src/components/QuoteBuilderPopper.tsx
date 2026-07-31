@@ -31,7 +31,7 @@ import {
 import CloseIcon from "@mui/icons-material/Close";
 import { collectTargetTokens, buildQuoteFromSelection, tokenKey } from "../lib/quoteBuilder";
 import type { HighlightKey } from "../lib/highlight";
-import { matchNorm } from "../lib/highlight";
+import { collectSourceWords } from "../lib/highlight";
 import type { SourceAncestor, TargetToken } from "../lib/quoteBuilder";
 import type { LexiconEntry } from "../hooks/useLexicon";
 import type { SourceWord } from "../lib/alignment";
@@ -79,7 +79,7 @@ export function QuoteBuilderPopper({
   onCancel,
   onCommit,
 }: Props) {
-  const uhbTokens = useMemo(() => collectUhbWords(uhbVerseObjects), [uhbVerseObjects]);
+  const uhbTokens = useMemo(() => collectUhbChips(uhbVerseObjects), [uhbVerseObjects]);
   const ultTokens = useMemo(
     () => collectTargetTokens(ultVerseObjects, uhbVerseObjects),
     [ultVerseObjects, uhbVerseObjects],
@@ -96,7 +96,7 @@ export function QuoteBuilderPopper({
   const sourceLabel = sourceIsHebrew ? "UHB" : "UGNT";
 
   // Preview of the would-be quote string. Re-runs cheaply on every toggle
-  // since collectUhbWords / matchGroupsAt scan an in-memory tree.
+  // since collectUhbChips / matchGroupsAt scan an in-memory tree.
   const preview = useMemo(
     () => buildQuoteFromSelection(uhbVerseObjects, selectedKeys),
     [uhbVerseObjects, selectedKeys],
@@ -503,22 +503,19 @@ function chainSelected(
   return sources.every((a) => selectedKeys.has(a.key));
 }
 
-// Helper analogue of collectUhbWords (which is private in quoteBuilder).
-// We need the same shape here so the picker's UHB row mirrors what the
-// quote builder operates on, plus the per-word strong/lemma/morph so the
-// chip can render a SourceTooltipBody-driven lexicon hovercard. Kept
-// inline rather than exporting the internal helper.
-//
-// `occurrence` MUST be COUNTED here exactly as lib/quoteBuilder.ts's
-// collectUhbWords counts it (per matchNorm-folded surface), never read off
-// the node: imported UHB \w carry no x-occurrence, so the attribute reads 1
-// for every token. This row mints the keys the chips are PAINTED by, so any
-// divergence from the builder shows up as chips whose selected state
-// disagrees with the actual selection. DAN 6:3 is the case — כָּ⁠ל (U+2060
-// WORD JOINER) then bare כָּל, folded together by matchNorm. Reading the
-// attribute keyed both as `כָּל|1` and lit FOUR chips for a three-word
-// selection, and clicking the phantom 4th to clear it would have dropped the
-// real first כָּל from the quote.
+// The picker's UHB row, decorated from the SHARED source-word walk
+// (collectSourceWords in lib/highlight.ts) rather than re-walking the tree.
+// This component used to keep its own private copy of the walk, purely because
+// it needs per-word strong/lemma/morph for the chip's SourceTooltipBody lexicon
+// hovercard and the library walker did not carry them. That copy is what PR
+// #389 fixed last: with only the library walkers counting occurrence, this row
+// still keyed by the (always-1) `x-occurrence` attribute, so on DAN 6:3 —
+// כָּ⁠ל (U+2060 WORD JOINER) then bare כָּל, folded together by matchNorm — both
+// tokens keyed `כָּל|1`, FOUR chips lit for a three-word selection, and clicking
+// the phantom 4th to clear it would have dropped the real first כָּל from the
+// quote. This row mints the keys the chips are PAINTED by, so any divergence
+// from the builder shows up as chips whose selected state disagrees with the
+// actual selection. Sharing the walk is what keeps them from diverging again.
 interface UhbChip {
   text: string;
   occurrence: number;
@@ -529,40 +526,17 @@ interface UhbChip {
   morph: string;
 }
 
-function collectUhbWords(verseObjects: unknown[] | null): UhbChip[] {
+function collectUhbChips(verseObjects: unknown[] | null): UhbChip[] {
   if (!Array.isArray(verseObjects)) return [];
-  const out: UhbChip[] = [];
-  const seen = new Map<string, number>();
-  function walk(nodes: unknown[]) {
-    for (const node of nodes ?? []) {
-      const o = node as Record<string, unknown> | null;
-      if (!o) continue;
-      if (o["type"] === "word" && o["tag"] === "w") {
-        const text = String(o["text"] ?? "");
-        const norm = matchNorm(text);
-        const occurrence = (seen.get(norm) ?? 0) + 1;
-        seen.set(norm, occurrence);
-        const occurrences = parseInt(String(o["occurrences"] ?? "1"), 10) || 1;
-        out.push({
-          text,
-          occurrence,
-          occurrences,
-          position: out.length,
-          strong: String(o["strong"] ?? ""),
-          lemma: String(o["lemma"] ?? ""),
-          morph: String(o["morph"] ?? ""),
-        });
-      } else if (
-        o["type"] === "milestone" ||
-        // \d (Psalm superscription) is `type:"section"` but its content IS
-        // alignable verse body — descend like the highlight matchers do.
-        (o["type"] === "section" && o["tag"] === "d")
-      ) {
-        const children = (o["children"] as unknown[] | undefined) ?? [];
-        walk(children);
-      }
-    }
-  }
-  walk(verseObjects);
-  return out;
+  return collectSourceWords(verseObjects).map((w) => ({
+    text: w.text,
+    // The COUNTED value, matching what buildQuoteFromSelection keys by.
+    occurrence: w.surfaceOccurrence,
+    // Display-only, straight off the node — the hovercard shows "n of m".
+    occurrences: parseInt(String(w.node["occurrences"] ?? "1"), 10) || 1,
+    position: w.position,
+    strong: String(w.node["strong"] ?? ""),
+    lemma: String(w.node["lemma"] ?? ""),
+    morph: String(w.node["morph"] ?? ""),
+  }));
 }

@@ -10,11 +10,12 @@
 // (the picked tokens are the only instance in the verse), the result is
 // always 1, matching how new TNs are typically written.
 
-import type { HighlightKey, WordToken } from "./highlight";
+import type { HighlightKey, WordToken, SourceWordToken } from "./highlight";
 import {
   matchNorm,
   matchSourceTokens,
   collectBareWords,
+  collectSourceWords,
   surfaceTotalsFromTokens,
   pinSourceOccurrences,
 } from "./highlight.ts";
@@ -34,63 +35,29 @@ export function tokenKey(text: string, occurrence: number): HighlightKey {
   return `${matchNorm(text)}|${occurrence}`;
 }
 
-interface UhbWord {
-  text: string;       // raw text, preserved for quote string rendering
-  key: HighlightKey;  // matchNorm-normalized lookup key (see tokenKey)
-  occurrence: number;
-  // 0-based document position among all \w tokens in this verse. Stable
-  // across re-render because the verseObjects tree is immutable while
-  // the user is selecting.
-  position: number;
-  // Text node(s) sitting between this \w and the next one — usually a
-  // single space, but a Hebrew maqqef (־) for joined words like
-  // כָל־הַגֹּנֵב. Used to rejoin a consecutive run with the ORIGINAL
-  // separator instead of a flat space, so a built quote reads כָל־הַגֹּנֵב
-  // (matching how TN quotes are written) and not כָל הַגֹּנֵב.
-  trailing: string;
+// A source word plus the selection key the picker toggles it by. The walk
+// itself lives in highlight.ts (collectSourceWords) — the ONE source-word
+// walker; this only decorates its result with `key`.
+//
+// `occurrence` is collectSourceWords' COUNTED `surfaceOccurrence`, never the
+// node's own `x-occurrence` attribute: imported UHB/UGNT `\w` tokens carry no
+// x-occurrence at all (hbo_uhb master has none), so the attribute reads 1 for
+// every token — even the 2nd instance of a repeated surface. DAN 6:3 has כָּל
+// twice: the first is כָּ⁠ל (with U+2060 WORD JOINER), the second is bare כָּל,
+// and matchNorm folds the joiner away so both collapse to the same string.
+// Reading the (always-1) attribute keyed both tokens as `כָּל|1`, so selecting
+// the first also selected the second — a click produced the phantom quote
+// "כָּ⁠ל־קֳבֵ֗ל דִּ֣י & כָּל".
+interface UhbWord extends SourceWordToken {
+  key: HighlightKey; // matchNorm-normalized lookup key (see tokenKey)
 }
 
-// `occurrence` here is COUNTED, not read off the node's `x-occurrence`
-// attribute: imported UHB/UGNT `\w` tokens carry no x-occurrence at all
-// (hbo_uhb master has none), so the attribute reads 1 for every token — even
-// the 2nd instance of a repeated surface. DAN 6:3 has כָּל twice: the first
-// is כָּ⁠ל (with U+2060 WORD JOINER), the second is bare כָּל, and matchNorm
-// folds the joiner away so both collapse to the same string. Reading the
-// (always-1) attribute keyed both tokens as `כָּל|1`, so selecting the first
-// also selected the second — a click produced the phantom quote
-// "כָּ⁠ל־קֳבֵ֗ל דִּ֣י & כָּל". Counting (mirrors collectBareWords in
-// highlight.ts) is the only way to name "the 2nd כָּל".
-function collectUhbWords(verseObjects: unknown[]): UhbWord[] {
-  const out: UhbWord[] = [];
-  const seen = new Map<string, number>();
-  function walk(nodes: unknown[]) {
-    for (const node of nodes ?? []) {
-      const o = node as Record<string, unknown> | null;
-      if (!o) continue;
-      if (o["type"] === "word" && o["tag"] === "w") {
-        const text = String(o["text"] ?? "");
-        const norm = matchNorm(text);
-        const occurrence = (seen.get(norm) ?? 0) + 1;
-        seen.set(norm, occurrence);
-        out.push({ text, key: tokenKey(text, occurrence), occurrence, position: out.length, trailing: "" });
-      } else if (o["type"] === "text") {
-        // Attach to the most recent word as its separator. usfm-js emits the
-        // maqqef / inter-word space as a bare text sibling of the \w tokens.
-        const prev = out[out.length - 1];
-        if (prev) prev.trailing += String(o["text"] ?? "");
-      } else if (
-        o["type"] === "milestone" ||
-        // \d (Psalm superscription) is `type:"section"` but its content IS
-        // alignable verse body — descend like the highlight matchers do.
-        (o["type"] === "section" && o["tag"] === "d")
-      ) {
-        const children = (o["children"] as unknown[] | undefined) ?? [];
-        walk(children);
-      }
-    }
-  }
-  walk(verseObjects);
-  return out;
+function uhbWords(verseObjects: unknown[]): UhbWord[] {
+  return collectSourceWords(verseObjects).map((w) => ({
+    ...w,
+    occurrence: w.surfaceOccurrence,
+    key: tokenKey(w.text, w.surfaceOccurrence),
+  }));
 }
 
 export interface BuiltQuote {
@@ -108,12 +75,12 @@ export interface BuiltQuote {
 // and never converted to source), so the picker simply starts fresh.
 //
 // Keys go through tokenKey (matchNorm) so they match what
-// buildQuoteFromSelection / collectUhbWords look up — matchSourceTokens
+// buildQuoteFromSelection / uhbWords look up — matchSourceTokens
 // returns the same per-word (text, occurrence) the builder keys by.
 //
 // Key by `surfaceOccurrence` (matchSourceTokens' COUNTED value), not
 // `occurrence` (the node's own, always-1, x-occurrence attribute) — same
-// reasoning as collectUhbWords above. Using the raw attribute would key
+// reasoning as uhbWords above. Using the raw attribute would key
 // DAN 6:3's two כָּל tokens identically and pre-select both when the picker
 // opens on a quote resolving to only the first.
 export function selectionFromQuote(
@@ -141,11 +108,11 @@ export function buildQuoteFromSelection(
   selectedKeys: Set<HighlightKey>,
 ): BuiltQuote | null {
   if (!Array.isArray(verseObjects) || selectedKeys.size === 0) return null;
-  const all = collectUhbWords(verseObjects);
+  const all = uhbWords(verseObjects);
   const selected = all.filter((w) => selectedKeys.has(w.key));
   if (selected.length === 0) return null;
 
-  // selected is already in document order — collectUhbWords walks in order
+  // selected is already in document order — collectSourceWords walks in order
   // and selected preserves that. Group runs of consecutive positions.
   const groups: UhbWord[][] = [];
   let current: UhbWord[] = [selected[0]];
@@ -209,30 +176,19 @@ export interface TargetToken {
   sources: SourceAncestor[];
 }
 
-// Walk a milestone tree collecting just each \zaln-s node's raw `content`,
-// in the exact traversal order collectTargetTokens's real walk (below) visits
-// them — parent before its nested children, document order otherwise. Used
-// ONLY to feed pinSourceOccurrences (which needs every milestone's content up
-// front, before deciding any single one's occurrence); the real walk below
-// re-derives the same sequence of milestone visits and consumes the pins by
-// matching index, so the two walks MUST stay structurally identical (same
-// branches, same recursion) to each other.
-function collectMilestoneContents(nodes: unknown[]): string[] {
-  const out: string[] = [];
-  function walk(ns: unknown[]) {
-    for (const node of ns ?? []) {
-      const o = node as Record<string, unknown> | null;
-      if (!o) continue;
-      if (o["type"] === "milestone" && o["tag"] === "zaln") {
-        out.push(String(o["content"] ?? ""));
-        walk((o["children"] as unknown[] | undefined) ?? []);
-      } else if (o["type"] === "section" && o["tag"] === "d") {
-        walk((o["children"] as unknown[] | undefined) ?? []);
-      }
-    }
-  }
-  walk(nodes);
-  return out;
+// One \zaln-s milestone, as visited by the single walk below. `occurrence` is
+// filled in AFTER the walk, once every milestone's content is known (pinning
+// needs the whole list up front before it can decide any one of them). Tokens
+// hold these by REFERENCE, which is what makes the pin/token association
+// structurally correct: there is one walk, one array, and no index to keep in
+// sync. A previous version derived the content list in a separate pre-pass and
+// matched pins back by position, relying on a comment telling future editors to
+// keep two walks byte-identical — exactly the coupling that let PR #389's fix
+// land in one walker and miss another.
+interface MilestoneRecord {
+  content: string;
+  clamped: number;
+  occurrence: number;
 }
 
 // Walk a ULT/UST verseObjects tree. For each \w token, capture its
@@ -273,12 +229,14 @@ export function collectTargetTokens(
       : [];
   const sourceTotals: Map<string, number> | null =
     sourceTokens.length > 0 ? surfaceTotalsFromTokens(sourceTokens) : null;
-  const pins: Map<number, number> = sourceTotals
-    ? pinSourceOccurrences(collectMilestoneContents(verseObjects), sourceTotals, sourceTokens)
-    : new Map();
-  let milestoneIndex = 0;
-  const out: TargetToken[] = [];
-  function walk(nodes: unknown[], stack: SourceAncestor[]) {
+
+  // ONE walk. It collects the milestone records and the tokens together, with
+  // each token holding its ancestor milestones by reference, so no index has to
+  // be kept aligned between two traversals.
+  const milestones: MilestoneRecord[] = [];
+  const raw: { text: string; occurrence: number; position: number; ancestors: MilestoneRecord[] }[] =
+    [];
+  function walk(nodes: unknown[], stack: MilestoneRecord[]) {
     for (const node of nodes ?? []) {
       const o = node as Record<string, unknown> | null;
       if (!o) continue;
@@ -297,45 +255,67 @@ export function collectTargetTokens(
         const rawOcc = parseInt(String(o["occurrence"] ?? "1"), 10) || 1;
         const total = parseInt(String(o["occurrences"] ?? "1"), 10) || 1;
         const clamped = Math.min(Math.max(rawOcc, 1), Math.max(total, 1));
-        const idx = milestoneIndex++;
-        const pinned = pins.get(idx);
-        // Appears-once collapse — same expression as collectMilestoneRuns'
-        // Pass 3 in highlight.ts: when the source holds this surface exactly
-        // once, every milestone for it must mean that one token regardless of
-        // what occurrence/occurrences it was (mis)stamped with (ZEC 11:16-
-        // class: source ובשר once, UST stamps 1/2 AND 2/2). When the source
-        // holds it 2+ times, an over-claiming milestone is genuinely
-        // ambiguous, so it falls through to the [1, occurrences] clamp.
-        const trueTotal = content ? sourceTotals?.get(matchNorm(content)) : undefined;
-        const collapsed = trueTotal === 1 ? 1 : clamped;
-        const occurrence = pinned !== undefined ? pinned : collapsed;
-        const children = (o["children"] as unknown[] | undefined) ?? [];
+        // `occurrence` is a placeholder until the resolve pass below.
+        const record: MilestoneRecord = { content, clamped, occurrence: clamped };
+        milestones.push(record);
         // Skip ancestors with no content — defensive: a malformed milestone
-        // without x-content would otherwise insert empty selection keys.
-        const nextStack = content
-          ? [...stack, { content, occurrence, key: tokenKey(content, occurrence) }]
-          : stack;
-        walk(children, nextStack);
+        // without x-content would otherwise insert empty selection keys. It
+        // still gets a record, so pin indices continue to line up.
+        walk((o["children"] as unknown[] | undefined) ?? [], content ? [...stack, record] : stack);
       } else if (o["type"] === "section" && o["tag"] === "d") {
         // \d (Psalm superscription) is type:"section" but its content IS
         // alignable verse body — descend, carrying the current ancestor
         // stack unchanged (it contributes no source of its own). Mirrors
-        // collectMilestoneRuns / collectUhbWords.
+        // collectMilestoneRuns / collectSourceWords.
         walk((o["children"] as unknown[] | undefined) ?? [], stack);
       } else if (o["type"] === "word" && o["tag"] === "w") {
-        const text = String(o["text"] ?? "");
-        const occurrence = parseInt(String(o["occurrence"] ?? "1"), 10) || 1;
-        out.push({
-          text,
-          occurrence,
-          position: out.length,
-          sources: stack.slice(),
+        raw.push({
+          text: String(o["text"] ?? ""),
+          occurrence: parseInt(String(o["occurrence"] ?? "1"), 10) || 1,
+          position: raw.length,
+          ancestors: stack.slice(),
         });
       }
     }
   }
   walk(verseObjects, []);
-  return out;
+
+  // Resolve each milestone's true occurrence, in precedence order: pin, then
+  // appears-once collapse, then the clamp already computed during the walk.
+  const pins: Map<number, number> = sourceTotals
+    ? pinSourceOccurrences(
+        milestones.map((m) => m.content),
+        sourceTotals,
+        sourceTokens,
+      )
+    : new Map();
+  milestones.forEach((m, idx) => {
+    const pinned = pins.get(idx);
+    if (pinned !== undefined) {
+      m.occurrence = pinned;
+      return;
+    }
+    // Appears-once collapse — same expression as collectMilestoneRuns' Pass 3
+    // in highlight.ts: when the source holds this surface exactly once, every
+    // milestone for it must mean that one token regardless of what
+    // occurrence/occurrences it was (mis)stamped with (ZEC 11:16-class: source
+    // ובשר once, UST stamps 1/2 AND 2/2). When the source holds it 2+ times, an
+    // over-claiming milestone is genuinely ambiguous, so it falls through to
+    // the [1, occurrences] clamp.
+    const trueTotal = m.content ? sourceTotals?.get(matchNorm(m.content)) : undefined;
+    m.occurrence = trueTotal === 1 ? 1 : m.clamped;
+  });
+
+  return raw.map((t) => ({
+    text: t.text,
+    occurrence: t.occurrence,
+    position: t.position,
+    sources: t.ancestors.map((m) => ({
+      content: m.content,
+      occurrence: m.occurrence,
+      key: tokenKey(m.content, m.occurrence),
+    })),
+  }));
 }
 
 function matchGroupsAt(

@@ -384,8 +384,48 @@ function collectMilestoneRuns(
   return out;
 }
 
-// Flatten the verse tree into one bare \w token per entry, in document
-// order. Used for UHB/UGNT highlighting where the verse IS the source.
+// One `\w` token of a SOURCE (UHB/UGNT) verse, with every field any consumer
+// of the source word list needs. See collectSourceWords for why this is a
+// single shape rather than three similar ones.
+export interface SourceWordToken {
+  // Raw `\w` text, untouched — needed for rendering and for quote strings.
+  text: string;
+  // The token's own `x-occurrence` attribute, defaulting to 1. Effectively
+  // always 1 on imported UHB/UGNT (they carry no such attribute); kept because
+  // WordToken consumers expect the field.
+  occurrence: number;
+  // 1-based index among tokens sharing this matchNorm-folded surface. COUNTED,
+  // not read — see the note on WordToken and collectSourceWords below.
+  surfaceOccurrence: number;
+  // 0-based document position among all `\w` tokens in this verse. Stable
+  // across re-render because the verseObjects tree is immutable while the
+  // user is selecting.
+  position: number;
+  // Text node(s) sitting between this `\w` and the next — usually a single
+  // space, but a Hebrew maqqef (־) for joined words like כָל־הַגֹּנֵב. Lets a
+  // consecutive run be rejoined with its ORIGINAL separator instead of a flat
+  // space, so a built quote reads כָל־הַגֹּנֵב (matching how TN quotes are
+  // written) and not כָל הַגֹּנֵב.
+  trailing: string;
+  // The raw usfm-js node, so a caller needing attributes this shape does not
+  // carry (strong / lemma / morph for the picker's lexicon hovercard) can read
+  // them itself instead of forking the walk to add a field.
+  node: Record<string, unknown>;
+}
+
+// THE source-word walker. Flatten a SOURCE (UHB/UGNT) verse tree into one
+// `\w` token per entry, in document order.
+//
+// This is deliberately the ONLY walk of a source verse tree in the codebase.
+// There were three near-identical copies (here, quoteBuilder's collectUhbWords,
+// QuoteBuilderPopper's collectUhbWords), differing only in which fields they
+// bothered to capture. PR #389 had to fix the same occurrence-counting bug in
+// each one separately and missed a copy twice: once leaving the picker painting
+// its chips from a colliding key (four chips lit for a three-word selection,
+// and clicking the phantom fourth would have dropped a real word from the
+// quote), and once leaving the TWL span resolver keying on the old numbering.
+// Callers now DECORATE this result rather than re-walking, so the next change
+// to this logic cannot land in one place and silently miss the others.
 //
 // `surfaceOccurrence` is COUNTED here, not read off the node: imported UHB/UGNT
 // `\w` tokens carry no `x-occurrence` attribute at all (hbo_uhb master has
@@ -394,31 +434,69 @@ function collectMilestoneRuns(
 // compares against DOES number them, so without counting, every source word
 // past its first appearance fails to join and its GL words never highlight
 // (ZEC 11:16 ULT: the 2nd and 4th "not"). Counting is keyed on matchNorm so it
-// uses the same canonical surface form as the join.
-export function collectBareWords(verseObjects: unknown[]): WordToken[] {
-  const out: WordToken[] = [];
+// uses the same canonical surface form as the join. It is also the only way to
+// name "the 2nd כָּל" in DAN 6:3, where the first is כָּ⁠ל (carrying U+2060
+// WORD JOINER) and the second is bare כָּל — matchNorm folds the joiner away,
+// so a read (always-1) attribute keys both tokens identically.
+//
+// Descend rule: ANY milestone, plus `\d`. The three former copies disagreed
+// here — this file's descended only `zaln` milestones while the other two
+// descended any milestone — so the difference had to be reconciled rather than
+// preserved. Measured across all 66 books of UHB and UGNT, neither resource
+// contains a single milestone node of ANY tag, so the rule is currently moot
+// and either choice is behavior-preserving. The looser rule wins on merits:
+// the domain here is exclusively source verses, which by construction hold no
+// ALIGNMENT milestones, so the only milestone that could ever appear is a
+// non-alignment one. Skipping it would silently drop its `\w` children, and
+// because `position` and `surfaceOccurrence` are counted, a dropped word
+// shifts the index of every word after it — corrupting quotes that don't
+// contain the missing word at all. Descending an unexpected milestone costs
+// nothing by comparison, so prefer recovery over silent loss.
+export function collectSourceWords(verseObjects: unknown[]): SourceWordToken[] {
+  const out: SourceWordToken[] = [];
   const seen = new Map<string, number>();
   function walk(nodes: unknown[]) {
     for (const node of nodes ?? []) {
-      if (nodeIsWord(node)) {
-        const text = String((node as Record<string, unknown>)["text"] ?? "");
+      const o = node as Record<string, unknown> | null;
+      if (!o) continue;
+      if (nodeIsWord(o)) {
+        const text = String(o["text"] ?? "");
         const norm = matchNorm(text);
         const surfaceOccurrence = (seen.get(norm) ?? 0) + 1;
         seen.set(norm, surfaceOccurrence);
         out.push({
           text,
-          occurrence:
-            parseInt(String((node as Record<string, unknown>)["occurrence"] ?? "1"), 10) || 1,
+          occurrence: parseInt(String(o["occurrence"] ?? "1"), 10) || 1,
           surfaceOccurrence,
+          position: out.length,
+          trailing: "",
+          node: o,
         });
-      } else if (nodeIsMilestone(node) || nodeIsPsalmTitle(node)) {
-        const children = ((node as Record<string, unknown>)["children"] as unknown[] | undefined) ?? [];
-        walk(children);
+      } else if (o["type"] === "text") {
+        // Attach to the most recent word as its separator. usfm-js emits the
+        // maqqef / inter-word space as a bare text sibling of the \w tokens.
+        const prev = out[out.length - 1];
+        if (prev) prev.trailing += String(o["text"] ?? "");
+      } else if (o["type"] === "milestone" || nodeIsPsalmTitle(o)) {
+        // \d (Psalm superscription) is `type:"section"` but its content IS
+        // alignable verse body — descend it like the highlight matchers do.
+        walk((o["children"] as unknown[] | undefined) ?? []);
       }
     }
   }
   walk(verseObjects);
   return out;
+}
+
+// WordToken projection of collectSourceWords, for the OL-anchored highlight
+// join and quote matchers that want only the comparison fields. A projection,
+// not a second walk.
+export function collectBareWords(verseObjects: unknown[]): WordToken[] {
+  return collectSourceWords(verseObjects).map((w) => ({
+    text: w.text,
+    occurrence: w.occurrence,
+    surfaceOccurrence: w.surfaceOccurrence,
+  }));
 }
 
 export type HighlightKey = string; // `${text}|${occurrence}`
