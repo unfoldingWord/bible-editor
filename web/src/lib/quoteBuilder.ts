@@ -242,30 +242,40 @@ function collectMilestoneContents(nodes: unknown[]): string[] {
 // click on "first" inside zaln(בַחֹדֶשׁ) > zaln(הָרִאשׁוֹן) > w(first)
 // can toggle both Hebrew words at their correct occurrence indices.
 //
-// `sourceVerseObjects` (optional — the UHB/UGNT verse) enables the same
-// word-joiner pinning highlight.ts's collectMilestoneRuns applies: DAN 6:3
-// has כָּל twice (כָּ⁠ל with U+2060 WORD JOINER, then bare כָּל), both
-// milestones legitimately stamped occurrence="1"/occurrences="1" before
-// matchNorm folds the joiner away, so without pinning both would key
-// identically and clicking the FIRST chip ("all") would select the SECOND
-// (bare כָּל)'s Hebrew token too. Reuses highlight.ts's pinSourceOccurrences
-// rather than reimplementing the decision — see that function for the full
-// pin-eligibility rules (split glosses are deliberately excluded).
+// `sourceVerseObjects` (optional — the UHB/UGNT verse) enables the same two
+// corrections highlight.ts's collectMilestoneRuns (Pass 3) applies, in the
+// same precedence order (pin, then appears-once collapse, then clamp):
+//
+//   - Pinning: DAN 6:3 has כָּל twice (כָּ⁠ל with U+2060 WORD JOINER, then
+//     bare כָּל), both milestones legitimately stamped
+//     occurrence="1"/occurrences="1" before matchNorm folds the joiner away,
+//     so without pinning both would key identically and clicking the FIRST
+//     chip ("all") would select the SECOND (bare כָּל)'s Hebrew token too.
+//     Reuses highlight.ts's pinSourceOccurrences rather than reimplementing
+//     the decision — see that function for the full pin-eligibility rules
+//     (split glosses are deliberately excluded).
+//   - Appears-once collapse: ZEC 11:16-class verses where the source holds a
+//     word exactly once but the GL stamps two milestones for it (e.g.
+//     occurrence="1"/occurrences="2" and "2"/"2" — both occurrence AND
+//     occurrences inflated). The highlighter merges these into one run keyed
+//     `word|1`; without the same collapse here, the picker mints `word|2` for
+//     the second, which no source token can ever own, so clicking it selects
+//     nothing and the picker visibly disagrees with the highlight it sits
+//     beside.
 export function collectTargetTokens(
   verseObjects: unknown[] | undefined | null,
   sourceVerseObjects?: unknown[] | undefined | null,
 ): TargetToken[] {
   if (!Array.isArray(verseObjects)) return [];
-  const pins: Map<number, number> = (() => {
-    if (!Array.isArray(sourceVerseObjects) || sourceVerseObjects.length === 0) {
-      return new Map();
-    }
-    const sourceTokens: WordToken[] = collectBareWords(sourceVerseObjects);
-    if (sourceTokens.length === 0) return new Map();
-    const sourceTotals = surfaceTotalsFromTokens(sourceTokens);
-    const contents = collectMilestoneContents(verseObjects);
-    return pinSourceOccurrences(contents, sourceTotals, sourceTokens);
-  })();
+  const sourceTokens: WordToken[] =
+    Array.isArray(sourceVerseObjects) && sourceVerseObjects.length > 0
+      ? collectBareWords(sourceVerseObjects)
+      : [];
+  const sourceTotals: Map<string, number> | null =
+    sourceTokens.length > 0 ? surfaceTotalsFromTokens(sourceTokens) : null;
+  const pins: Map<number, number> = sourceTotals
+    ? pinSourceOccurrences(collectMilestoneContents(verseObjects), sourceTotals, sourceTokens)
+    : new Map();
   let milestoneIndex = 0;
   const out: TargetToken[] = [];
   function walk(nodes: unknown[], stack: SourceAncestor[]) {
@@ -289,7 +299,16 @@ export function collectTargetTokens(
         const clamped = Math.min(Math.max(rawOcc, 1), Math.max(total, 1));
         const idx = milestoneIndex++;
         const pinned = pins.get(idx);
-        const occurrence = pinned !== undefined ? pinned : clamped;
+        // Appears-once collapse — same expression as collectMilestoneRuns'
+        // Pass 3 in highlight.ts: when the source holds this surface exactly
+        // once, every milestone for it must mean that one token regardless of
+        // what occurrence/occurrences it was (mis)stamped with (ZEC 11:16-
+        // class: source ובשר once, UST stamps 1/2 AND 2/2). When the source
+        // holds it 2+ times, an over-claiming milestone is genuinely
+        // ambiguous, so it falls through to the [1, occurrences] clamp.
+        const trueTotal = content ? sourceTotals?.get(matchNorm(content)) : undefined;
+        const collapsed = trueTotal === 1 ? 1 : clamped;
+        const occurrence = pinned !== undefined ? pinned : collapsed;
         const children = (o["children"] as unknown[] | undefined) ?? [];
         // Skip ancestors with no content — defensive: a malformed milestone
         // without x-content would otherwise insert empty selection keys.

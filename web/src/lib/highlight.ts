@@ -264,6 +264,17 @@ function collectRawRuns(verseObjects: unknown[]): RawRun[] {
 // COUNTED `surfaceOccurrence` (source \w carries no real x-occurrence — see
 // collectBareWords).
 //
+// Corroboration requirement: a group must have 2+ entries to be eligible for
+// pinning at all. A single milestone's raw x-content is an UNVERIFIED claim —
+// AI-generated content has a documented mangling class where a word's joiner
+// gets dropped (e.g. כ⁠ל written bare as כל), so one milestone's nfc match
+// against an ambiguous (2+ occurrence) source surface may be naming the WRONG
+// token. Two competing milestones for the same matchNorm surface corroborate
+// each other: each nfc-matches a DIFFERENT source token, so both matches are
+// mutually load-bearing rather than a lone unverifiable guess. A single entry
+// falls through to the existing [1, occurrences] clamp in Pass 3, exactly as
+// before pinning existed.
+//
 // Exported so quoteBuilder.ts's collectTargetTokens (picker's English chips —
 // same collision, same fix) can reuse this decision instead of
 // reimplementing it. Takes the milestones' raw `content` strings, in the same
@@ -285,6 +296,7 @@ export function pinSourceOccurrences(
   });
   for (const [norm, idxs] of groups) {
     if ((sourceTotals.get(norm) ?? 0) <= 1) continue;
+    if (idxs.length < 2) continue; // lone milestone — no corroboration, fall through to clamp
     const nfcs = idxs.map((i) => nfc(sources[i]));
     if (new Set(nfcs).size !== nfcs.length) continue; // split gloss — must merge
     const candidates = sourceTokens.filter((t) => matchNorm(t.text) === norm);

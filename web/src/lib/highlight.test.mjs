@@ -6,9 +6,14 @@
 // quoting the whole second sentence left "the meat of" and "their hooves" dark
 // in the UST and the 2nd/4th "not" dark in the ULT.
 
-import { findTargetHighlights, leadingBreakClass } from "./highlight.ts";
+import {
+  findTargetHighlights,
+  leadingBreakClass,
+  pinSourceOccurrences,
+  surfaceTotalsFromTokens,
+} from "./highlight.ts";
 import { extractTrailingMarkers } from "./usfm.ts";
-import { buildQuoteFromSelection, selectionFromQuote, tokenKey } from "./quoteBuilder.ts";
+import { buildQuoteFromSelection, selectionFromQuote, tokenKey, collectTargetTokens } from "./quoteBuilder.ts";
 
 let failed = 0;
 function assert(cond, msg) {
@@ -277,12 +282,68 @@ const JOIN = "⁠";
     );
     assert(!built?.quote.includes("&"), `built quote has no gap marker, got ${JSON.stringify(built?.quote)}`);
 
-    // --- 11. selectionFromQuote on that stored quote pre-seeds exactly 3
-    // keys, not 4 (the old bug: the picker opening on this quote would
-    // pre-select both כל tokens).
+    // --- 11. selectionFromQuote on that stored quote pre-seeds exactly the
+    // 3 ORIGINAL keys, not 4 (the old bug: the picker opening on this quote
+    // would pre-select both כל tokens) — and not merely 3 of ANY keys, which
+    // would still pass if the WRONG כל (the bare one, "ב"'s neighbour "כל")
+    // were seeded instead of the joined כ⁠ל.
     const reseeded = selectionFromQuote(verseObjects, built.quote, built.occurrence);
-    assert(reseeded.size === 3, `selectionFromQuote pre-seeds exactly 3 keys, got ${reseeded.size}`);
+    const expectedKeys = new Set([tokenKey("א", 1), tokenKey(`כ${JOIN}ל`, 1), tokenKey("ב", 1)]);
+    assert(
+      reseeded.size === expectedKeys.size &&
+        [...expectedKeys].every((k) => reseeded.has(k)),
+      `selectionFromQuote pre-seeds exactly {${[...expectedKeys].join(", ")}}, got {${[...reseeded].join(", ")}}`,
+    );
   }
+}
+
+// --- 12. pinSourceOccurrences corroboration guard: a LONE milestone for an
+// ambiguous (2-occurrence) source surface must NOT be pinned — one raw
+// x-content match is an unverified claim (AI mangling can drop a word's
+// joiner, e.g. writing כ⁠ל bare as כל, which would then nfc-match the WRONG
+// token). Two competing milestones for the same surface corroborate each
+// other (each nfc-matches a distinct token) and still pin, exactly as before
+// this guard existed.
+{
+  const sourceTokens = [
+    { text: `כ${JOIN}ל`, occurrence: 1, surfaceOccurrence: 1 },
+    { text: "כל", occurrence: 1, surfaceOccurrence: 2 },
+  ];
+  const sourceTotals = surfaceTotalsFromTokens(sourceTokens);
+
+  const lonePins = pinSourceOccurrences(["כל"], sourceTotals, sourceTokens);
+  assert(
+    lonePins.size === 0,
+    `lone milestone for an ambiguous surface is not pinned, got ${JSON.stringify([...lonePins])}`,
+  );
+
+  const corroboratedPins = pinSourceOccurrences([`כ${JOIN}ל`, "כל"], sourceTotals, sourceTokens);
+  assert(
+    corroboratedPins.get(0) === 1 && corroboratedPins.get(1) === 2,
+    `two corroborating milestones still pin to their distinct tokens, got ${JSON.stringify([...corroboratedPins])}`,
+  );
+}
+
+// --- 13. collectTargetTokens (picker) applies the SAME appears-once
+// collapse as collectMilestoneRuns' Pass 3 (ZEC 11:16 shape): the source
+// holds וּ⁠בְשַׂר exactly once, but the UST stamps two milestones for it
+// (occurrence="1"/occurrences="2" and "2"/"2" — both fields inflated). Both
+// picker tokens must key to `…|1`, matching what the highlighter lights, so
+// clicking either English word in the picker selects the one real UHB token.
+{
+  const sourceVerseObjects = [src("וּ⁠בְשַׂ֤ר")];
+  const verseObjects = [
+    zaln("וּ⁠בְשַׂ֤ר", 1, 2, [tgt("Instead")]),
+    zaln("וּ⁠בְשַׂ֤ר", 2, 2, [tgt("meat")]),
+  ];
+  const tokens = collectTargetTokens(verseObjects, sourceVerseObjects);
+  const expectedKey = tokenKey("וּ⁠בְשַׂ֤ר", 1);
+  assert(
+    tokens.length === 2 && tokens.every((t) => t.sources[0]?.key === expectedKey),
+    `picker keys both split-gloss words to the same appears-once collapsed key, got ${JSON.stringify(
+      tokens.map((t) => t.sources[0]?.key),
+    )}`,
+  );
 }
 
 if (failed) {
