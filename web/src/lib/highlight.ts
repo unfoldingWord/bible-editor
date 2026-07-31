@@ -269,11 +269,18 @@ function collectRawRuns(verseObjects: unknown[]): RawRun[] {
 // AI-generated content has a documented mangling class where a word's joiner
 // gets dropped (e.g. כ⁠ל written bare as כל), so one milestone's nfc match
 // against an ambiguous (2+ occurrence) source surface may be naming the WRONG
-// token. Two competing milestones for the same matchNorm surface corroborate
-// each other: each nfc-matches a DIFFERENT source token, so both matches are
-// mutually load-bearing rather than a lone unverifiable guess. A single entry
+// token. Requiring two competing milestones raises the bar: each must
+// nfc-match a DIFFERENT source token, so the pins account for the surface's
+// instances rather than resting on one unverifiable guess. A single entry
 // falls through to the existing [1, occurrences] clamp in Pass 3, exactly as
 // before pinning existed.
+//
+// This is a bar, NOT a proof. Two entries that nfc-match distinct tokens still
+// pin even if one is really a mangled continuation of the OTHER's token (its
+// joiner dropped), which would split a pair that ought to merge. No such verse
+// exists in the corpus — measured, 0 emptied and 0 changed across 33,522
+// quote×resource cases — and the pre-pinning clamp got that shape wrong too,
+// so this is a narrowed risk rather than an eliminated one.
 //
 // Exported so quoteBuilder.ts's collectTargetTokens (picker's English chips —
 // same collision, same fix) can reuse this decision instead of

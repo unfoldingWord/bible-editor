@@ -97,4 +97,42 @@ const ult = [
   check(resolveSpanToSource(ult, null, "Yahweh", 1) === null, "missing UHB -> null");
 }
 
+// DAN 6:3 shape — two source twins that differ ONLY by a U+2060 WORD JOINER.
+// matchNorm folds the joiner away, so both \zaln-s (each legitimately stamped
+// 1/1, since before folding they WERE distinct strings) would key identically
+// unless collectTargetTokens is given the UHB verse to pin them apart. When it
+// wasn't, the SECOND English "all" resolved to the FIRST Hebrew word and
+// reported confident:true — silently writing the wrong orig_words onto a TWL
+// row. (Pre-fix it returned the malformed two-word "כָּ⁠ל & כָּל".)
+{
+  const uhbTwins = [
+    w("כָּ⁠ל", 1, 1),
+    t(" "),
+    w("קֳבֵל", 1, 1),
+    t(" "),
+    w("כָּל", 1, 1),
+  ];
+  const ultTwins = [
+    zaln("כָּ⁠ל", 1, 1, [w("all", 1, 2)]),
+    t(" "),
+    zaln("קֳבֵל", 1, 1, [w("before", 1)]),
+    t(" "),
+    zaln("כָּל", 1, 1, [w("all", 2, 2)]),
+  ];
+  const first = resolveSpanToSource(ultTwins, uhbTwins, "all", 1);
+  check(
+    first && first.orig_words === "כָּ⁠ל" && first.occurrence === 1,
+    `1st "all" -> the joiner-carrying כָּ⁠ל occ1 (got ${JSON.stringify(first)})`,
+  );
+  const second = resolveSpanToSource(ultTwins, uhbTwins, "all", 2);
+  check(
+    second && second.orig_words === "כָּל" && second.occurrence === 2,
+    `2nd "all" -> the BARE כָּל occ2, not the first twin (got ${JSON.stringify(second)})`,
+  );
+  check(
+    first.orig_words !== second.orig_words || first.occurrence !== second.occurrence,
+    "the two twins resolve to DIFFERENT source words",
+  );
+}
+
 console.log(`twlResolve: ${passed} assertions passed`);
