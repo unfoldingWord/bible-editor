@@ -6,8 +6,14 @@
 // quoting the whole second sentence left "the meat of" and "their hooves" dark
 // in the UST and the 2nd/4th "not" dark in the ULT.
 
-import { findTargetHighlights, leadingBreakClass } from "./highlight.ts";
+import {
+  findTargetHighlights,
+  leadingBreakClass,
+  pinSourceOccurrences,
+  surfaceTotalsFromTokens,
+} from "./highlight.ts";
 import { extractTrailingMarkers } from "./usfm.ts";
+import { buildQuoteFromSelection, selectionFromQuote, tokenKey, collectTargetTokens } from "./quoteBuilder.ts";
 
 let failed = 0;
 function assert(cond, msg) {
@@ -194,6 +200,149 @@ const lit = (vo, quote, occurrence, source) =>
   assert(
     leadingBreakClass([{ type: "paragraph", tag: "b" }]) === "be-line",
     "\\b blank marker → be-line, not be-blank",
+  );
+}
+
+// --- 7-11. DAN 6:3 (issue: note `fhez`). כָּל appears twice: כָּ⁠ל (with
+// U+2060 WORD JOINER) then bare כָּל. matchNorm strips the joiner, so both
+// UHB tokens — and both ULT `\zaln-s` milestones, each legitimately stamped
+// occurrence="1"/occurrences="1" before folding — collapse to the same
+// (content, occurrence) key. Without pinning, quoting the FIRST instance lit
+// BOTH milestones' targets ("all before that" AND "all of"); picking the
+// first three source words phantom-selected the second כָּל too, producing
+// "כָּ⁠ל־קֳבֵ֗ל דִּ֣י & כָּל". nfc() (which preserves the joiner, unlike
+// matchNorm) tells the two apart.
+const JOIN = "⁠";
+{
+  const source = [
+    src("א"),
+    src(`כ${JOIN}ל`), // 1st כל — WITH word joiner
+    src("ב"),
+    src("כל"), // 2nd כל — WITHOUT word joiner
+    src("ג"),
+  ];
+  const target = [
+    zaln(`כ${JOIN}ל`, 1, 1, [tgt("all")]),
+    zaln("כל", 1, 1, [tgt("every")]),
+  ];
+
+  // --- 7. Quote resolving to the FIRST instance highlights only the first
+  // milestone's target words.
+  {
+    const got = lit(target, "כל", 1, source);
+    assert(JSON.stringify(got) === JSON.stringify(["all"]), `1st כל lights only "all", got ${JSON.stringify(got)}`);
+  }
+
+  // --- 8. Quote resolving to the SECOND instance highlights only the
+  // second's.
+  {
+    const got = lit(target, "כל", 2, source);
+    assert(
+      JSON.stringify(got) === JSON.stringify(["every"]),
+      `2nd כל lights only "every", got ${JSON.stringify(got)}`,
+    );
+  }
+
+  // --- 9. Guard: a genuine split gloss (two milestones with IDENTICAL raw
+  // content for one source token) must still MERGE and light both fragments
+  // — pinning must not fire when the milestones' nfc(content) aren't
+  // pairwise distinct, even though the source holds the surface twice.
+  {
+    const splitTarget = [zaln("כל", 1, 1, [tgt("partA")]), zaln("כל", 1, 1, [tgt("partB")])];
+    const got = lit(splitTarget, "כל", 1, source);
+    assert(
+      JSON.stringify(got) === JSON.stringify(["partA", "partB"]),
+      `identical-content split gloss still merges, got ${JSON.stringify(got)}`,
+    );
+  }
+
+  // --- 10. collectUhbWords / buildQuoteFromSelection: selecting the first
+  // three words yields a quote with occurrence 1 and NO "& כל" tail (the old
+  // bug: reading the always-1 x-occurrence attribute keyed both כל tokens
+  // identically, so the phantom 2nd instance always tagged along).
+  {
+    const wordSep = (t) => ({ type: "text", text: t });
+    const verseObjects = [
+      src("א"),
+      wordSep(" "),
+      src(`כ${JOIN}ל`),
+      wordSep(" "),
+      src("ב"),
+      wordSep(" "),
+      src("כל"),
+      wordSep(" "),
+      src("ג"),
+    ];
+    const selectedKeys = new Set([tokenKey("א", 1), tokenKey(`כ${JOIN}ל`, 1), tokenKey("ב", 1)]);
+    const built = buildQuoteFromSelection(verseObjects, selectedKeys);
+    assert(built?.occurrence === 1, `built occurrence is 1, got ${JSON.stringify(built)}`);
+    assert(
+      built?.quote === `א ${`כ${JOIN}ל`} ב`,
+      `built quote has no phantom "& כל" tail, got ${JSON.stringify(built?.quote)}`,
+    );
+    assert(!built?.quote.includes("&"), `built quote has no gap marker, got ${JSON.stringify(built?.quote)}`);
+
+    // --- 11. selectionFromQuote on that stored quote pre-seeds exactly the
+    // 3 ORIGINAL keys, not 4 (the old bug: the picker opening on this quote
+    // would pre-select both כל tokens) — and not merely 3 of ANY keys, which
+    // would still pass if the WRONG כל (the bare one, "ב"'s neighbour "כל")
+    // were seeded instead of the joined כ⁠ל.
+    const reseeded = selectionFromQuote(verseObjects, built.quote, built.occurrence);
+    const expectedKeys = new Set([tokenKey("א", 1), tokenKey(`כ${JOIN}ל`, 1), tokenKey("ב", 1)]);
+    assert(
+      reseeded.size === expectedKeys.size &&
+        [...expectedKeys].every((k) => reseeded.has(k)),
+      `selectionFromQuote pre-seeds exactly {${[...expectedKeys].join(", ")}}, got {${[...reseeded].join(", ")}}`,
+    );
+  }
+}
+
+// --- 12. pinSourceOccurrences corroboration guard: a LONE milestone for an
+// ambiguous (2-occurrence) source surface must NOT be pinned — one raw
+// x-content match is an unverified claim (AI mangling can drop a word's
+// joiner, e.g. writing כ⁠ל bare as כל, which would then nfc-match the WRONG
+// token). Two competing milestones for the same surface corroborate each
+// other (each nfc-matches a distinct token) and still pin, exactly as before
+// this guard existed.
+{
+  const sourceTokens = [
+    { text: `כ${JOIN}ל`, occurrence: 1, surfaceOccurrence: 1 },
+    { text: "כל", occurrence: 1, surfaceOccurrence: 2 },
+  ];
+  const sourceTotals = surfaceTotalsFromTokens(sourceTokens);
+
+  const lonePins = pinSourceOccurrences(["כל"], sourceTotals, sourceTokens);
+  assert(
+    lonePins.size === 0,
+    `lone milestone for an ambiguous surface is not pinned, got ${JSON.stringify([...lonePins])}`,
+  );
+
+  const corroboratedPins = pinSourceOccurrences([`כ${JOIN}ל`, "כל"], sourceTotals, sourceTokens);
+  assert(
+    corroboratedPins.get(0) === 1 && corroboratedPins.get(1) === 2,
+    `two corroborating milestones still pin to their distinct tokens, got ${JSON.stringify([...corroboratedPins])}`,
+  );
+}
+
+// --- 13. collectTargetTokens (picker) applies the SAME appears-once
+// collapse as collectMilestoneRuns' Pass 3 (ZEC 11:16 shape): the source
+// holds וּ⁠בְשַׂר exactly once, but the UST stamps two milestones for it
+// (occurrence="1"/occurrences="2" and "2"/"2" — both fields inflated). Both
+// picker tokens must key to `…|1`, matching what the highlighter lights, so
+// clicking either English word in the picker selects the one real UHB token.
+{
+  const sourceVerseObjects = [src("וּ⁠בְשַׂ֤ר")];
+  const verseObjects = [
+    zaln("וּ⁠בְשַׂ֤ר", 1, 2, [tgt("Instead")]),
+    zaln("וּ⁠בְשַׂ֤ר", 2, 2, [tgt("meat")]),
+  ];
+  const tokens = collectTargetTokens(verseObjects, sourceVerseObjects);
+  const expectedKey = tokenKey("וּ⁠בְשַׂ֤ר", 1);
+  assert(
+    tokens.length === 2 && tokens.every((t) => t.sources[0]?.key === expectedKey),
+    `picker keys both split-gloss words to the same appears-once collapsed key, got ${JSON.stringify(
+      tokens.map((t) => t.sources[0]?.key),
+    )}`,
   );
 }
 

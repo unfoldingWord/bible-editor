@@ -50,7 +50,13 @@ export function resolveSpanToSource(
   const want = spanWords(englishSpan);
   if (want.length === 0) return null;
 
-  const tokens = collectTargetTokens(ultVerseObjects);
+  // Pass the UHB verse: collectTargetTokens needs it to pin joiner-variant
+  // source twins and to apply the appears-once collapse. Without it, DAN 6:3's
+  // two כָּל milestones (כָּ⁠ל with U+2060, then bare כָּל) both mint `כָּל|1`,
+  // while buildQuoteFromSelection below keys the UHB tokens 1 and 2 — so the
+  // SECOND English "all" resolved to the FIRST Hebrew word and returned it as
+  // confident, writing the wrong orig_words onto a TWL row.
+  const tokens = collectTargetTokens(ultVerseObjects, uhbVerseObjects);
   if (tokens.length === 0) return null;
   const normTokens = tokens.map((t) => normWord(t.text));
 
