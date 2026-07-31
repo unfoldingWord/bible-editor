@@ -31,6 +31,7 @@ import {
 import CloseIcon from "@mui/icons-material/Close";
 import { collectTargetTokens, buildQuoteFromSelection, tokenKey } from "../lib/quoteBuilder";
 import type { HighlightKey } from "../lib/highlight";
+import { matchNorm } from "../lib/highlight";
 import type { SourceAncestor, TargetToken } from "../lib/quoteBuilder";
 import type { LexiconEntry } from "../hooks/useLexicon";
 import type { SourceWord } from "../lib/alignment";
@@ -79,8 +80,14 @@ export function QuoteBuilderPopper({
   onCommit,
 }: Props) {
   const uhbTokens = useMemo(() => collectUhbWords(uhbVerseObjects), [uhbVerseObjects]);
-  const ultTokens = useMemo(() => collectTargetTokens(ultVerseObjects), [ultVerseObjects]);
-  const ustTokens = useMemo(() => collectTargetTokens(ustVerseObjects), [ustVerseObjects]);
+  const ultTokens = useMemo(
+    () => collectTargetTokens(ultVerseObjects, uhbVerseObjects),
+    [ultVerseObjects, uhbVerseObjects],
+  );
+  const ustTokens = useMemo(
+    () => collectTargetTokens(ustVerseObjects, uhbVerseObjects),
+    [ustVerseObjects, uhbVerseObjects],
+  );
 
   // OT books read their source from UHB (Hebrew, RTL); NT books from UGNT
   // (Greek, LTR). Shell hands us whichever exists, so label and direction
@@ -501,6 +508,17 @@ function chainSelected(
 // quote builder operates on, plus the per-word strong/lemma/morph so the
 // chip can render a SourceTooltipBody-driven lexicon hovercard. Kept
 // inline rather than exporting the internal helper.
+//
+// `occurrence` MUST be COUNTED here exactly as lib/quoteBuilder.ts's
+// collectUhbWords counts it (per matchNorm-folded surface), never read off
+// the node: imported UHB \w carry no x-occurrence, so the attribute reads 1
+// for every token. This row mints the keys the chips are PAINTED by, so any
+// divergence from the builder shows up as chips whose selected state
+// disagrees with the actual selection. DAN 6:3 is the case — כָּ⁠ל (U+2060
+// WORD JOINER) then bare כָּל, folded together by matchNorm. Reading the
+// attribute keyed both as `כָּל|1` and lit FOUR chips for a three-word
+// selection, and clicking the phantom 4th to clear it would have dropped the
+// real first כָּל from the quote.
 interface UhbChip {
   text: string;
   occurrence: number;
@@ -514,13 +532,16 @@ interface UhbChip {
 function collectUhbWords(verseObjects: unknown[] | null): UhbChip[] {
   if (!Array.isArray(verseObjects)) return [];
   const out: UhbChip[] = [];
+  const seen = new Map<string, number>();
   function walk(nodes: unknown[]) {
     for (const node of nodes ?? []) {
       const o = node as Record<string, unknown> | null;
       if (!o) continue;
       if (o["type"] === "word" && o["tag"] === "w") {
         const text = String(o["text"] ?? "");
-        const occurrence = parseInt(String(o["occurrence"] ?? "1"), 10) || 1;
+        const norm = matchNorm(text);
+        const occurrence = (seen.get(norm) ?? 0) + 1;
+        seen.set(norm, occurrence);
         const occurrences = parseInt(String(o["occurrences"] ?? "1"), 10) || 1;
         out.push({
           text,

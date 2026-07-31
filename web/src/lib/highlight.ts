@@ -43,7 +43,7 @@ export function matchNorm(s: string): string {
 // here rather than read. They agree on well-formed data, but imported UHB/UGNT
 // `\w` tokens carry NO x-occurrence at all, so only the counted value can name
 // "the 2nd לֹא" — which is exactly what a GL `\zaln-s` x-occurrence refers to.
-type WordToken = { text: string; occurrence: number; surfaceOccurrence?: number };
+export type WordToken = { text: string; occurrence: number; surfaceOccurrence?: number };
 type Run = { source: string; occurrence: number; targets: WordToken[] };
 
 const GAP = /[&…]+|\.{3}/g;
@@ -196,8 +196,23 @@ function collectSubtreeWords(children: unknown[]): WordToken[] {
 // lib/sourceOccurrences.ts applies as a data fix, and it is equally
 // conservative: a token that genuinely appears 2+ times is left alone, because
 // which physical token an over-claiming milestone meant is unknowable.
-function collectMilestoneRuns(verseObjects: unknown[], sourceTotals?: Map<string, number>): Run[] {
-  const out: Run[] = [];
+//
+// Raw (unmerged) milestone entry, document order — Pass 1 of
+// collectMilestoneRuns below.
+interface RawRun {
+  source: string;
+  occurrence: number;
+  occurrences: number;
+  targets: WordToken[];
+}
+
+// Pass 1: walk the tree exactly as the old single-pass implementation did
+// (same recursion into nested milestones, same \d handling), but WITHOUT
+// merging — just record every milestone's raw (content, occurrence,
+// occurrences, targets) in document order. Pass 2/3 below operate on this
+// flat list.
+function collectRawRuns(verseObjects: unknown[]): RawRun[] {
+  const out: RawRun[] = [];
   function walk(nodes: unknown[]) {
     for (const node of nodes ?? []) {
       if (nodeIsPsalmTitle(node)) {
@@ -210,32 +225,7 @@ function collectMilestoneRuns(verseObjects: unknown[], sourceTotals?: Map<string
       const occurrences = parseInt(String(node["occurrences"] ?? "1"), 10) || 1;
       const children = (node["children"] as unknown[] | undefined) ?? [];
       const targets = collectSubtreeWords(children);
-      // Split continuation healing (both prod shapes — see comment above): fold
-      // a run into the nearest preceding run with the SAME content AND the same
-      // EFFECTIVE occurrence (clamped into [1, occurrences]) so the matcher sees
-      // ONE token carrying ALL its target words. A genuinely repeated word
-      // carries a distinct effective occurrence and never false-merges.
-      const want = source ? matchNorm(source) : "";
-      const trueTotal = source ? sourceTotals?.get(want) : undefined;
-      // Appears-once ONLY. When the OL verse holds the word exactly once, every
-      // milestone for it must mean that one token, so any occurrence collapses
-      // to 1. When it holds the word 2+ times, an over-claiming milestone
-      // ("the 3rd of 3" over a source with two) is genuinely ambiguous — which
-      // physical token? — so it is left to the [1, occurrences] clamp rather
-      // than dragged onto a neighbour it may have nothing to do with.
-      const effOcc =
-        trueTotal === 1 ? 1 : Math.min(Math.max(occurrence, 1), Math.max(occurrences, 1));
-      let merged = false;
-      if (source) {
-        for (let i = out.length - 1; i >= 0; i--) {
-          if (out[i].occurrence === effOcc && matchNorm(out[i].source) === want) {
-            out[i].targets.push(...targets);
-            merged = true;
-            break;
-          }
-        }
-      }
-      if (!merged) out.push({ source, occurrence: effOcc, targets });
+      out.push({ source, occurrence, occurrences, targets });
       // Recurse into nested milestones as their own runs.
       for (const c of children) {
         if (nodeIsMilestone(c)) walk([c]);
@@ -243,6 +233,135 @@ function collectMilestoneRuns(verseObjects: unknown[], sourceTotals?: Map<string
     }
   }
   walk(verseObjects);
+  return out;
+}
+
+// Pass 2: PIN a milestone entry to a specific source TOKEN by raw (joiner-
+// preserving) surface, disambiguating same-`matchNorm` source words that
+// differ only by a word joiner. DAN 6:3 has כָּל twice: the first is כָּ⁠ל
+// (U+2060 WORD JOINER), the second bare כָּל. matchNorm strips the joiner for
+// comparison (by design — TN/TQ quotes often omit it), so both milestones'
+// x-content fold to the same string and — being legitimately stamped 1/1
+// each, since before folding they WERE distinct — both get effOcc 1 and
+// merge into one run, lighting the second instance's English words too
+// (issue: note `fhez` lighting "all before that" AND "all of").
+//
+// nfc() (NFC only — does NOT strip the joiner, see lib/hebrew.ts) is the
+// tie-breaker: it tells the two apart. It is used ONLY when ALL of the
+// following hold for a same-matchNorm group of entries, so a genuine split
+// gloss (two milestones sharing identical raw content for ONE source token,
+// e.g. ZEC 6:5 וַ⁠יַּעַן) is never pinned apart and still merges via the
+// existing effOcc logic in Pass 3:
+//   - the OL verse holds the surface more than once (single-occurrence
+//     surfaces need no disambiguation — trueTotal === 1 already forces
+//     effOcc 1 in Pass 3);
+//   - the entries' nfc(source) values are pairwise DISTINCT (identical raw
+//     content across entries IS the split-gloss shape — must still merge);
+//   - each distinct nfc(source) matches exactly ONE source token by
+//     nfc(token.text);
+//   - those matched source tokens are distinct from each other.
+// When pinned, the entry's effective occurrence becomes the matched token's
+// COUNTED `surfaceOccurrence` (source \w carries no real x-occurrence — see
+// collectBareWords).
+//
+// Exported so quoteBuilder.ts's collectTargetTokens (picker's English chips —
+// same collision, same fix) can reuse this decision instead of
+// reimplementing it. Takes the milestones' raw `content` strings, in the same
+// traversal order the caller will re-walk in, rather than a highlight.ts-
+// internal entry shape — the only thing the decision needs.
+export function pinSourceOccurrences(
+  sources: string[],
+  sourceTotals: Map<string, number>,
+  sourceTokens: WordToken[],
+): Map<number, number> {
+  const pins = new Map<number, number>();
+  const groups = new Map<string, number[]>();
+  sources.forEach((source, i) => {
+    if (!source) return;
+    const norm = matchNorm(source);
+    const list = groups.get(norm);
+    if (list) list.push(i);
+    else groups.set(norm, [i]);
+  });
+  for (const [norm, idxs] of groups) {
+    if ((sourceTotals.get(norm) ?? 0) <= 1) continue;
+    const nfcs = idxs.map((i) => nfc(sources[i]));
+    if (new Set(nfcs).size !== nfcs.length) continue; // split gloss — must merge
+    const candidates = sourceTokens.filter((t) => matchNorm(t.text) === norm);
+    const usedTokens = new Set<number>();
+    const matchedTokenForEntry = new Map<number, number>();
+    let ok = true;
+    for (let k = 0; k < idxs.length; k++) {
+      const matches = candidates
+        .map((t, ti) => ({ ti, t }))
+        .filter(({ t }) => nfc(t.text) === nfcs[k]);
+      if (matches.length !== 1 || usedTokens.has(matches[0].ti)) {
+        ok = false;
+        break;
+      }
+      usedTokens.add(matches[0].ti);
+      matchedTokenForEntry.set(idxs[k], matches[0].ti);
+    }
+    if (!ok) continue;
+    for (const [entryIdx, ti] of matchedTokenForEntry) {
+      const tok = candidates[ti];
+      pins.set(entryIdx, tok.surfaceOccurrence ?? tok.occurrence);
+    }
+  }
+  return pins;
+}
+
+// Pass 3 + entry point: apply pins where computed, otherwise the EXISTING
+// effOcc logic (unchanged), then run the existing merge loop (same
+// content-norm + same effOcc folds together). Pinned entries participate in
+// the same merge loop; because their effOccs are distinct source-token
+// positions they naturally stay separate rather than needing a separate
+// code path.
+function collectMilestoneRuns(
+  verseObjects: unknown[],
+  sourceTotals?: Map<string, number>,
+  sourceTokens?: WordToken[],
+): Run[] {
+  const entries = collectRawRuns(verseObjects);
+  const pins =
+    sourceTotals && sourceTokens && sourceTokens.length > 0
+      ? pinSourceOccurrences(
+          entries.map((e) => e.source),
+          sourceTotals,
+          sourceTokens,
+        )
+      : new Map<number, number>();
+  const out: Run[] = [];
+  entries.forEach((e, i) => {
+    const { source, occurrence, occurrences, targets } = e;
+    const want = source ? matchNorm(source) : "";
+    const pinned = pins.get(i);
+    let effOcc: number;
+    if (pinned !== undefined) {
+      effOcc = pinned;
+    } else {
+      const trueTotal = source ? sourceTotals?.get(want) : undefined;
+      // Appears-once ONLY. When the OL verse holds the word exactly once,
+      // every milestone for it must mean that one token, so any occurrence
+      // collapses to 1. When it holds the word 2+ times, an over-claiming
+      // milestone ("the 3rd of 3" over a source with two) is genuinely
+      // ambiguous — which physical token? — so it is left to the
+      // [1, occurrences] clamp rather than dragged onto a neighbour it may
+      // have nothing to do with.
+      effOcc = trueTotal === 1 ? 1 : Math.min(Math.max(occurrence, 1), Math.max(occurrences, 1));
+    }
+    let merged = false;
+    if (source) {
+      for (let j = out.length - 1; j >= 0; j--) {
+        if (out[j].occurrence === effOcc && matchNorm(out[j].source) === want) {
+          out[j].targets.push(...targets);
+          merged = true;
+          break;
+        }
+      }
+    }
+    if (!merged) out.push({ source, occurrence: effOcc, targets });
+  });
   return out;
 }
 
@@ -257,7 +376,7 @@ function collectMilestoneRuns(verseObjects: unknown[], sourceTotals?: Map<string
 // past its first appearance fails to join and its GL words never highlight
 // (ZEC 11:16 ULT: the 2nd and 4th "not"). Counting is keyed on matchNorm so it
 // uses the same canonical surface form as the join.
-function collectBareWords(verseObjects: unknown[]): WordToken[] {
+export function collectBareWords(verseObjects: unknown[]): WordToken[] {
   const out: WordToken[] = [];
   const seen = new Map<string, number>();
   function walk(nodes: unknown[]) {
@@ -358,10 +477,11 @@ export function findTargetHighlights(
   occurrence: number,
   sourceVerseObjects?: unknown[],
 ): Set<HighlightKey> {
-  const sourceTotals = Array.isArray(sourceVerseObjects)
-    ? sourceSurfaceTotals(sourceVerseObjects)
+  const sourceTokens = Array.isArray(sourceVerseObjects)
+    ? collectBareWords(sourceVerseObjects)
     : undefined;
-  const runs = collectMilestoneRuns(verseObjects, sourceTotals);
+  const sourceTotals = sourceTokens ? surfaceTotalsFromTokens(sourceTokens) : undefined;
+  const runs = collectMilestoneRuns(verseObjects, sourceTotals, sourceTokens);
   const out = new Set<HighlightKey>();
   if (runs.length === 0) return out;
   // `occurrence: -1` means "every occurrence of the quote" (TSV spec).
@@ -619,9 +739,9 @@ export function findSourceHighlights(
 // How many times each source surface form appears in the OL verse, keyed by
 // matchNorm. Lets the GL side tell an IMPOSSIBLE `\zaln-s` x-occurrence
 // ("the 2nd וּבְשַׂר" in a verse that has exactly one) from a genuine repeat.
-function sourceSurfaceTotals(verseObjects: unknown[]): Map<string, number> {
+export function surfaceTotalsFromTokens(tokens: WordToken[]): Map<string, number> {
   const totals = new Map<string, number>();
-  for (const t of collectBareWords(verseObjects)) {
+  for (const t of tokens) {
     const key = matchNorm(t.text);
     totals.set(key, (totals.get(key) ?? 0) + 1);
   }

@@ -8,6 +8,7 @@
 
 import { findTargetHighlights, leadingBreakClass } from "./highlight.ts";
 import { extractTrailingMarkers } from "./usfm.ts";
+import { buildQuoteFromSelection, selectionFromQuote, tokenKey } from "./quoteBuilder.ts";
 
 let failed = 0;
 function assert(cond, msg) {
@@ -195,6 +196,93 @@ const lit = (vo, quote, occurrence, source) =>
     leadingBreakClass([{ type: "paragraph", tag: "b" }]) === "be-line",
     "\\b blank marker → be-line, not be-blank",
   );
+}
+
+// --- 7-11. DAN 6:3 (issue: note `fhez`). כָּל appears twice: כָּ⁠ל (with
+// U+2060 WORD JOINER) then bare כָּל. matchNorm strips the joiner, so both
+// UHB tokens — and both ULT `\zaln-s` milestones, each legitimately stamped
+// occurrence="1"/occurrences="1" before folding — collapse to the same
+// (content, occurrence) key. Without pinning, quoting the FIRST instance lit
+// BOTH milestones' targets ("all before that" AND "all of"); picking the
+// first three source words phantom-selected the second כָּל too, producing
+// "כָּ⁠ל־קֳבֵ֗ל דִּ֣י & כָּל". nfc() (which preserves the joiner, unlike
+// matchNorm) tells the two apart.
+const JOIN = "⁠";
+{
+  const source = [
+    src("א"),
+    src(`כ${JOIN}ל`), // 1st כל — WITH word joiner
+    src("ב"),
+    src("כל"), // 2nd כל — WITHOUT word joiner
+    src("ג"),
+  ];
+  const target = [
+    zaln(`כ${JOIN}ל`, 1, 1, [tgt("all")]),
+    zaln("כל", 1, 1, [tgt("every")]),
+  ];
+
+  // --- 7. Quote resolving to the FIRST instance highlights only the first
+  // milestone's target words.
+  {
+    const got = lit(target, "כל", 1, source);
+    assert(JSON.stringify(got) === JSON.stringify(["all"]), `1st כל lights only "all", got ${JSON.stringify(got)}`);
+  }
+
+  // --- 8. Quote resolving to the SECOND instance highlights only the
+  // second's.
+  {
+    const got = lit(target, "כל", 2, source);
+    assert(
+      JSON.stringify(got) === JSON.stringify(["every"]),
+      `2nd כל lights only "every", got ${JSON.stringify(got)}`,
+    );
+  }
+
+  // --- 9. Guard: a genuine split gloss (two milestones with IDENTICAL raw
+  // content for one source token) must still MERGE and light both fragments
+  // — pinning must not fire when the milestones' nfc(content) aren't
+  // pairwise distinct, even though the source holds the surface twice.
+  {
+    const splitTarget = [zaln("כל", 1, 1, [tgt("partA")]), zaln("כל", 1, 1, [tgt("partB")])];
+    const got = lit(splitTarget, "כל", 1, source);
+    assert(
+      JSON.stringify(got) === JSON.stringify(["partA", "partB"]),
+      `identical-content split gloss still merges, got ${JSON.stringify(got)}`,
+    );
+  }
+
+  // --- 10. collectUhbWords / buildQuoteFromSelection: selecting the first
+  // three words yields a quote with occurrence 1 and NO "& כל" tail (the old
+  // bug: reading the always-1 x-occurrence attribute keyed both כל tokens
+  // identically, so the phantom 2nd instance always tagged along).
+  {
+    const wordSep = (t) => ({ type: "text", text: t });
+    const verseObjects = [
+      src("א"),
+      wordSep(" "),
+      src(`כ${JOIN}ל`),
+      wordSep(" "),
+      src("ב"),
+      wordSep(" "),
+      src("כל"),
+      wordSep(" "),
+      src("ג"),
+    ];
+    const selectedKeys = new Set([tokenKey("א", 1), tokenKey(`כ${JOIN}ל`, 1), tokenKey("ב", 1)]);
+    const built = buildQuoteFromSelection(verseObjects, selectedKeys);
+    assert(built?.occurrence === 1, `built occurrence is 1, got ${JSON.stringify(built)}`);
+    assert(
+      built?.quote === `א ${`כ${JOIN}ל`} ב`,
+      `built quote has no phantom "& כל" tail, got ${JSON.stringify(built?.quote)}`,
+    );
+    assert(!built?.quote.includes("&"), `built quote has no gap marker, got ${JSON.stringify(built?.quote)}`);
+
+    // --- 11. selectionFromQuote on that stored quote pre-seeds exactly 3
+    // keys, not 4 (the old bug: the picker opening on this quote would
+    // pre-select both כל tokens).
+    const reseeded = selectionFromQuote(verseObjects, built.quote, built.occurrence);
+    assert(reseeded.size === 3, `selectionFromQuote pre-seeds exactly 3 keys, got ${reseeded.size}`);
+  }
 }
 
 if (failed) {
