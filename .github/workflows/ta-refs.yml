@@ -10,14 +10,20 @@ name: TA support-reference check
 # commit here to hang a check on. Also runnable on demand from the Actions tab.
 on:
   schedule:
-    # 04:30 UTC — an hour before the 05:30 export cron, so a dead id shows up
-    # before the night's notes ship to Door43.
+    # Nightly. Note this gates nothing: the 05:30 UTC export runs on Cloudflare
+    # and does not consult this workflow, and GitHub cron is best-effort (often
+    # delayed well past the half hour). It is a drift detector, not a guard.
     - cron: "30 4 * * *"
   workflow_dispatch:
+
+# Only talks to an external host; needs nothing from the repo but a checkout.
+permissions:
+  contents: read
 
 jobs:
   check:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
 
