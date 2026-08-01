@@ -8,7 +8,9 @@
 // shortens these to the bare id for display via shortSupport(). Curated list
 // (source: the uW TA translate manual); update TA_SUPPORT_REFERENCE_IDS below
 // when the canonical set changes.
-const TA_SUPPORT_REFERENCE_IDS: string[] = [
+// Exported so `taSupportReferences.check.mjs` can assert every id still
+// resolves to a real `translate/<id>/01.md` article in unfoldingWord/en_ta.
+export const TA_SUPPORT_REFERENCE_IDS: string[] = [
   "figs-123person",
   "figs-abstractnouns",
   "figs-activepassive",
@@ -66,7 +68,12 @@ const TA_SUPPORT_REFERENCE_IDS: string[] = [
   "grammar-connect-exceptions",
   "grammar-connect-logic-contrast",
   "grammar-connect-logic-goal",
-  "grammar-connect-logic-reason",
+  // NOTE: there is no `grammar-connect-logic-reason` article in en_ta — the
+  // single article `grammar-connect-logic-result` ("Connect — Reason-and-Result
+  // Relationship") covers BOTH sides of the relationship. The bad id used to
+  // sit here and shipped to translators for selection; removed 2026-07-31.
+  // `taSupportReferences.check.mjs` now fails if it (or any other dead id)
+  // comes back.
   "grammar-connect-logic-result",
   "grammar-connect-time-background",
   "grammar-connect-time-sequential",
