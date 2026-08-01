@@ -13,48 +13,30 @@
 //
 //   npm --workspace api run check:ta-refs
 //
-// Exit codes: 0 pass, 1 a genuinely dead id, 2 "could not get a trustworthy
-// answer" (network failure, bad response, truncated listing). GitHub Actions
-// treats every non-zero the same, so the code is for humans and for anything
-// that later wraps this script — the point is that an outage must never read
-// as "your ids are wrong" and get a valid id deleted from the picker.
+// It reads the repo's git tree recursively in ONE request and checks for the
+// article file itself, `translate/<id>/01.md`. Two earlier shapes were worse:
+// per-id requests cost 94 round-trips, and listing `translate/` and comparing
+// directory names passes a retired article whose directory lingers without its
+// 01.md. The tree gives exact file paths, so neither trade-off is needed.
 //
-// Two passes on purpose. The cheap pass lists the `translate/` tree once, so a
-// slow or rate-limited Door43 can't turn a clean run into 94 round-trips. But a
-// *partially* truncated listing would then report valid ids as dead — and the
-// script's own advice is to delete them, which would silently strip legitimate
-// TA references from every translator's dropdown. So anything the first pass
-// flags is re-probed individually against the actual `01.md`, and only a real
-// 404 is reported.
+// Exit codes: 0 pass, 1 a genuinely dead id, 2 "could not get a trustworthy
+// answer" (network failure, bad response, truncated tree). GitHub Actions
+// treats every non-zero the same, so the code is for humans and for anything
+// that later wraps this script — the point is that an outage must never read as
+// "your ids are wrong". That matters because the failure message tells you to
+// remove the id, and removing a *valid* one silently strips a legitimate TA
+// reference from every translator's dropdown.
 
 import { TA_SUPPORT_REFERENCE_IDS } from "./taSupportReferences.ts";
 
-const REPO = "https://git.door43.org/api/v1/repos/unfoldingWord/en_ta/contents";
+const TREE_URL =
+  "https://git.door43.org/api/v1/repos/unfoldingWord/en_ta/git/trees/master?recursive=1&per_page=100000";
 const TIMEOUT_MS = 30_000;
 
-/** Fetch JSON, or exit 2 — a transport failure is never an id verdict. */
-async function getJson(url) {
-  let res;
-  try {
-    res = await fetch(url, {
-      headers: { accept: "application/json" },
-      signal: AbortSignal.timeout(TIMEOUT_MS),
-    });
-  } catch (err) {
-    console.error(`FETCH FAILED: ${url} -> ${err?.message ?? err}`);
-    process.exit(2);
-  }
-  if (!res.ok) {
-    console.error(`FETCH FAILED: ${url} -> HTTP ${res.status}`);
-    process.exit(2);
-  }
-  try {
-    return await res.json();
-  } catch (err) {
-    // A captive portal or HTML error page served with 200 lands here.
-    console.error(`BAD RESPONSE: ${url} -> not JSON (${err?.message ?? err})`);
-    process.exit(2);
-  }
+/** Exit 2 rather than let a transport problem masquerade as an id verdict. */
+function bail(message) {
+  console.error(message);
+  process.exit(2);
 }
 
 // Free check, no network: a duplicate id doubles the dropdown entry.
@@ -66,50 +48,56 @@ if (dupes.length > 0) {
   process.exit(1);
 }
 
-// Pass 1 — one request for the whole tree.
-const entries = await getJson(`${REPO}/translate`);
-if (!Array.isArray(entries)) {
-  console.error("BAD RESPONSE: en_ta translate/ listing is not an array");
-  process.exit(2);
+let res;
+try {
+  res = await fetch(TREE_URL, {
+    headers: { accept: "application/json" },
+    signal: AbortSignal.timeout(TIMEOUT_MS),
+  });
+} catch (err) {
+  bail(`FETCH FAILED: ${TREE_URL} -> ${err?.message ?? err}`);
 }
-const articles = new Set(entries.filter((e) => e.type === "dir").map((e) => e.name));
+if (!res.ok) bail(`FETCH FAILED: ${TREE_URL} -> HTTP ${res.status}`);
 
-// Gross truncation: don't even try to draw conclusions from it.
-if (articles.size < 100) {
-  console.error(
-    `UNTRUSTWORTHY LISTING: en_ta translate/ returned only ${articles.size} dirs — refusing to validate against it`,
+let tree;
+try {
+  // A captive portal or HTML error page served with 200 lands in the catch.
+  tree = await res.json();
+} catch (err) {
+  bail(`BAD RESPONSE: not JSON (${err?.message ?? err})`);
+}
+
+if (!Array.isArray(tree?.tree)) bail("BAD RESPONSE: en_ta tree has no `tree` array");
+// Gitea sets `truncated` when the tree exceeded what it will return, and
+// `total_count` when it paginated. Either means we are looking at part of the
+// repo, and a partial tree would condemn valid ids.
+if (tree.truncated === true) bail("UNTRUSTWORTHY TREE: en_ta tree came back truncated");
+if (typeof tree.total_count === "number" && tree.total_count !== tree.tree.length) {
+  bail(
+    `UNTRUSTWORTHY TREE: got ${tree.tree.length} of ${tree.total_count} entries — refusing to validate against a partial tree`,
   );
-  process.exit(2);
 }
 
-const suspects = TA_SUPPORT_REFERENCE_IDS.filter((id) => !articles.has(id));
-
-// Pass 2 — confirm each suspect individually against the article itself, so a
-// partially truncated listing can't condemn a valid id. This is also what makes
-// the check an *article* check rather than a directory check: a retired article
-// whose dir lingers without 01.md is still caught.
-const dead = [];
-for (const id of suspects) {
-  const url = `${REPO}/translate/${id}/01.md`;
-  let res;
-  try {
-    res = await fetch(url, { signal: AbortSignal.timeout(TIMEOUT_MS) });
-  } catch (err) {
-    console.error(`FETCH FAILED: ${url} -> ${err?.message ?? err}`);
-    process.exit(2);
-  }
-  if (res.status === 404) dead.push(id);
-  else if (!res.ok) {
-    console.error(`FETCH FAILED: ${url} -> HTTP ${res.status}`);
-    process.exit(2);
-  } else {
-    console.warn(`  note - ${id} missing from the tree listing but 01.md exists; listing may be incomplete`);
-  }
+const ARTICLE_RE = /^translate\/([^/]+)\/01\.md$/;
+const articles = new Set();
+for (const entry of tree.tree) {
+  if (entry.type !== "blob") continue;
+  const m = ARTICLE_RE.exec(entry.path);
+  if (m) articles.add(m[1]);
 }
+
+// Last backstop: a shape change that matched nothing would report every id dead.
+if (articles.size < 100) {
+  bail(
+    `UNTRUSTWORTHY TREE: only ${articles.size} translate/*/01.md articles found — refusing to validate against it`,
+  );
+}
+
+const dead = TA_SUPPORT_REFERENCE_IDS.filter((id) => !articles.has(id));
 
 if (dead.length > 0) {
   console.error(
-    `\n${dead.length} support-reference id(s) do not exist in unfoldingWord/en_ta translate/:\n`,
+    `\n${dead.length} support-reference id(s) have no translate/<id>/01.md in unfoldingWord/en_ta:\n`,
   );
   for (const id of dead) console.error(`  - ${id}`);
   console.error(
