@@ -1,0 +1,39 @@
+name: TA support-reference check
+
+# Asserts every id in api/src/taSupportReferences.ts still resolves to a real
+# article in unfoldingWord/en_ta. Deliberately NOT part of CI: it calls
+# git.door43.org, and CI in this repo is offline/deterministic by design — a
+# Door43 outage must never redden an unrelated PR.
+#
+# It runs nightly instead, because the failure mode is upstream drift (en_ta
+# renames or retires an article) as much as our own typos, and drift has no
+# commit here to hang a check on. Also runnable on demand from the Actions tab.
+on:
+  schedule:
+    # Nightly. Note this gates nothing: the 05:30 UTC export runs on Cloudflare
+    # and does not consult this workflow, and GitHub cron is best-effort (often
+    # delayed well past the half hour). It is a drift detector, not a guard.
+    - cron: "30 4 * * *"
+  workflow_dispatch:
+
+# Only talks to an external host; needs nothing from the repo but a checkout.
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version-file: .node-version
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Validate support-reference ids against en_ta
+        run: npm --workspace api run check:ta-refs
