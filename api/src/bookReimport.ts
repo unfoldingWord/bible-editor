@@ -58,6 +58,7 @@ import { coerceRowId } from "./rowId";
 import { planTnContentDedup } from "./tnDedup";
 import { isCatastrophicTsvShrink } from "./shrinkGuard";
 import { classifyReimportRow, isReimportableRow } from "./reimportClassify";
+import { shouldRecordResourceSync } from "./reimportSyncGate";
 import { computeTwlSortOrderUpdates } from "./twlCanonicalOrder";
 import { applyTwlSortOrderUpdates } from "./twlSortOrderApply";
 import { loadTwTitles } from "./twTitles";
@@ -97,6 +98,12 @@ export interface ReimportCounts {
   deleted: number;
   skipped_edited: number;
   skipped_locked: number;
+  // Chapters skipped this run because an active AI pipeline job held the
+  // chapter lock — DISTINCT from skipped_locked, which also counts row-level
+  // prune skips (softDeleteRemovedTsvRows) that are not a sync-freshness
+  // concern. Only this counter gates the (book, resource) watermark stamp —
+  // see shouldRecordResourceSync / the EZK 40 incident at the sync step.
+  chapters_locked: number;
   skipped_noop: number;
   // Incoming row not inserted because an identical-content row already exists
   // (Guard 2, content-dedup). Tracked separately from skipped_noop so the guard
@@ -142,6 +149,7 @@ function zeroCounts(): ReimportCounts {
     deleted: 0,
     skipped_edited: 0,
     skipped_locked: 0,
+    chapters_locked: 0,
     skipped_noop: 0,
     skipped_dup: 0,
     resurrected: 0,
@@ -160,6 +168,7 @@ function addCounts(into: ReimportCounts, from: ReimportCounts): void {
   into.deleted += from.deleted;
   into.skipped_edited += from.skipped_edited;
   into.skipped_locked += from.skipped_locked;
+  into.chapters_locked += from.chapters_locked;
   into.skipped_noop += from.skipped_noop;
   into.skipped_dup += from.skipped_dup;
   into.resurrected += from.resurrected;
@@ -318,7 +327,10 @@ async function runReimport(
   for (const chapter of chapters) {
     const lock = await activePipelineForChapter(env, book, chapter);
     if (lock) {
-      for (const r of resources) perResource[r].skipped_locked++;
+      for (const r of resources) {
+        perResource[r].skipped_locked++;
+        perResource[r].chapters_locked++;
+      }
       continue;
     }
 
@@ -1929,7 +1941,11 @@ async function reimportStagedChunk(
   for (let chapter = startChapter; chapter <= endChapter; chapter++) {
     const lock = await activePipelineForChapter(env, book, chapter);
     if (lock) {
-      for (const e of staged) if (e.changed) perResource[e.resource].skipped_locked++;
+      for (const e of staged) {
+        if (!e.changed) continue;
+        perResource[e.resource].skipped_locked++;
+        perResource[e.resource].chapters_locked++;
+      }
       continue;
     }
     for (const kind of ["tn", "tq", "twl"] as TsvKind[]) {
@@ -2027,13 +2043,44 @@ export async function runChunkedReimport(
     perResource.twl.twl_reordered += r.reordered;
   }
 
-  // Record fetch-time SHAs for resources that ran (so a later night can skip).
+  // Record fetch-time SHAs for resources that ran (so a later night can skip)
+  // — EXCEPT for a resource with chapters_locked > 0. A watermark must not
+  // certify data it didn't apply (the same principle as the truncated-fetch
+  // completeness gate in planAndStageBookResources above, for the HAB tn
+  // incident): if a chapter was skipped this run because a pipeline job held
+  // its lock, that resource's D1 rows for that chapter are stale even though
+  // the rest of the book is current. Stamping the watermark anyway is exactly
+  // what happened to EZK 40 UST — D1 stayed on a 2026-06-10 revision while
+  // the watermark certified the book "in sync at master's SHA" after
+  // bp-assistant pushed an entirely new chapter 40 on 2026-08-01. The nightly
+  // export's freshness gate (checkMasterFreshness) trusted that stamp and
+  // rendered the stale chapter over master's new one; only the alignment-
+  // shrink backstop caught it, and it reported a misleading word-level
+  // "align_loss" alert instead of the real "different revision" problem.
+  //
+  // Withholding the stamp here means the next export's freshness gate sees
+  // `master_ahead` and skips the export with an honest `export_stale` alert
+  // naming the book, instead of exporting stale data. If a chapter stayed
+  // locked forever the book would never export — that is fail-safe (better
+  // than reverting master), and it stays visible via the export_stale alert
+  // rather than silently certifying stale data. (The stuck-lock root cause is
+  // separately fixed in PR #393.)
   await step.do(`reimport-sync-${book}`, async () => {
     let recorded = 0;
+    const withheld: string[] = [];
     for (const e of changed) {
-      if (e.masterSha) { await recordResourceSync(env, book, e.resource, e.masterSha, "reimport"); recorded++; }
+      if (!e.masterSha) continue;
+      if (!shouldRecordResourceSync(perResource[e.resource])) {
+        withheld.push(e.resource);
+        continue;
+      }
+      await recordResourceSync(env, book, e.resource, e.masterSha, "reimport");
+      recorded++;
     }
-    return { recorded };
+    if (withheld.length) {
+      console.log("reimport withheld sync watermark (chapter lock held)", { book, withheld });
+    }
+    return { recorded, withheld };
   });
 
   // Best-effort cleanup of staged R2 objects.

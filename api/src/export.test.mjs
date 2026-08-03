@@ -1167,6 +1167,33 @@ function utf8Base64(s) {
   // master actually having aligned verses.
   const r8freshboth = usfmAlignmentShrinkRefused("", "");
   assert(r8freshboth.refused === false, `empty render + empty master never refuses`);
+
+  // (9) `sequenceUnchanged` per-offender flag — distinguishes true collateral
+  // de-alignment on untouched text (JER 36:11 shape: same word sequence, one
+  // word bare) from D1/master holding different revisions of the verse (EZK
+  // 40 shape: word sequence differs entirely, and the "lost" word is just a
+  // coincidental surface match between two unrelated sentences). This is
+  // wording-only — both cases must still set refused:true (see the CRITICAL
+  // constraint: the refusal decision itself must never change).
+  assert(
+    r1b.offenders[0].sequenceUnchanged === true,
+    `pure collateral loss on unchanged text (JER 36:11 shape) is flagged sequenceUnchanged:true`,
+  );
+  assert(r1b.refused === true, `regression guard: sequence-unchanged case still refuses`);
+
+  const revA = verse("EZK", 40, 6, ["the", "gate", "facing", "east", "steps"]);
+  const revB = verse("EZK", 40, 6, ["through", "the", "narrow", "steps"], 3);
+  const r9 = usfmAlignmentShrinkRefused(revB, revA);
+  assert(r9.refused === true, `regression guard: different-revision verse (EZK 40 shape) still refuses`);
+  assert(r9.offenders.length === 1, `different-revision mismatch produces one offender`);
+  assert(
+    r9.offenders[0].sequenceUnchanged === false,
+    `a verse whose word sequence differs entirely (different revision) is flagged sequenceUnchanged:false`,
+  );
+  assert(
+    JSON.stringify(r9.offenders[0].lostWords) === JSON.stringify(["steps"]),
+    `names the coincidentally-shared word "steps" as the (misleading) lost word`,
+  );
 }
 
 // --- recreateExportBranchFromMaster: delete + recreate off master ---

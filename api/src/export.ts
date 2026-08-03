@@ -584,7 +584,17 @@ export interface AlignmentShrinkResult {
   // alert is actionable (which word to re-align), not just a whole-verse aligned
   // count that reads oddly when a verse simultaneously loses one word's source
   // and gains another's (e.g. 3<3, or even 4>3).
-  offenders: Array<{ ref: string; lostWords: string[] }>;
+  //
+  // `sequenceUnchanged` mirrors analyzeAlignmentDelta's own discriminator
+  // (index-matched comparison vs the LCS fallback) so the alert can tell
+  // apart two very different situations that both surface as "lost words":
+  // true collateral de-alignment on text nobody touched (sequence unchanged
+  // — the JER 36:11 shape) vs. D1 and master holding two different revisions
+  // of the verse, where the named "lost" words are coincidental surface
+  // matches between unrelated sentences (sequence changed — the EZK 40
+  // shape). This does NOT change the refusal decision above, only what the
+  // alert says.
+  offenders: Array<{ ref: string; lostWords: string[]; sequenceUnchanged: boolean }>;
 }
 
 // Compare a rendered ULT/UST USFM against the current master USFM. For each
@@ -614,7 +624,7 @@ export function usfmAlignmentShrinkRefused(
   // comparison data every master verse would be skipped and the guard would
   // fail OPEN. A corrupt render is exactly the case we must refuse. Fail closed.
   if (rendered === null) {
-    return { refused: true, offenders: [{ ref: "*", lostWords: ["unparseable_render"] }] };
+    return { refused: true, offenders: [{ ref: "*", lostWords: ["unparseable_render"], sequenceUnchanged: true }] };
   }
   // An unparseable MASTER (but a parseable render) leaves us with no baseline to
   // compare against — lower risk (we can't prove loss), so we don't refuse on it,
@@ -632,7 +642,7 @@ export function usfmAlignmentShrinkRefused(
   if (rendered.size === 0) {
     const masterHasAligned = [...master.values()].some((s) => s.alignedWords > 0);
     if (masterHasAligned) {
-      return { refused: true, offenders: [{ ref: "*", lostWords: ["empty_render"] }] };
+      return { refused: true, offenders: [{ ref: "*", lostWords: ["empty_render"], sequenceUnchanged: true }] };
     }
   }
   const offenders: AlignmentShrinkResult["offenders"] = [];
@@ -650,7 +660,7 @@ export function usfmAlignmentShrinkRefused(
       .filter((l) => l.reason === "lost")
       .map((l) => l.text);
     if (lostWords.length === 0) continue;
-    offenders.push({ ref, lostWords });
+    offenders.push({ ref, lostWords, sequenceUnchanged: delta.wordSequenceUnchanged });
   }
   return { refused: offenders.length > 0, offenders };
 }

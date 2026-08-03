@@ -37,6 +37,7 @@ import {
   updateDcsPrBranch,
   usfmAlignmentShrinkRefused,
   RESOURCE_TARGETS,
+  type AlignmentShrinkResult,
   type Resource,
 } from "./export";
 
@@ -552,7 +553,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     if (dcsAllowed && (resource === "ult" || resource === "ust")) {
       const guard = await this.checkUsfmAlignmentShrink(book, resource, built.content);
       if (!guard.ok) {
-        await this.recordAlignmentShrinkSkipAlert(book, resource, guard.detail);
+        await this.recordAlignmentShrinkSkipAlert(book, resource, guard.detail, guard.offenders ?? []);
         const reason = `align_shrink_guard:${guard.detail}`;
         await this.recordSnapshot(book, resource, null, null, built.rowCount, reason);
         return {
@@ -1243,7 +1244,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     book: string,
     resource: Resource,
     renderedUsfm: string,
-  ): Promise<{ ok: boolean; detail: string }> {
+  ): Promise<{ ok: boolean; detail: string; offenders?: AlignmentShrinkResult["offenders"] }> {
     const file = dcsResourceFile(book, resource as ReimportResource);
     if (!file) return { ok: true, detail: "no_file" };
     const masterUsfm = await fetchText(dcsRawUrl(this.env, file.repo, file.path));
@@ -1259,7 +1260,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
           return `${o.ref}: lost alignment on ${shown}${more}`;
         })
         .join("; ");
-      return { ok: false, detail: `align_loss_${result.offenders.length}:${sample}` };
+      return { ok: false, detail: `align_loss_${result.offenders.length}:${sample}`, offenders: result.offenders };
     }
     return { ok: true, detail: "ok" };
   }
@@ -1271,12 +1272,41 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     book: string,
     resource: Resource,
     detail: string,
+    offenders: AlignmentShrinkResult["offenders"],
   ): Promise<void> {
     const source = `export_align_shrink:${book}:${resource}`;
-    const message =
-      `Benjamin fix this — nightly export BLOCKED ${book} ${resource.toUpperCase()}: the render would drop \\zaln ` +
-      `word alignment on verses whose text is UNCHANGED (${detail}). This is the 1CH 4:21 / NUM 24 collateral ` +
-      `de-alignment signature — refusing to ship it to master. Re-align the affected verse(s) in the editor, then re-export.`;
+    // Split offenders by whether the verse's word SEQUENCE was unchanged
+    // (analyzeAlignmentDelta's own index-matched-vs-LCS discriminator — see
+    // export.ts). These are two different failure modes that both surface as
+    // "lost alignment" if worded generically, and conflating them sent an
+    // operator to re-align a word for the EZK 40 incident when the real
+    // problem was D1 and master holding different revisions of the chapter
+    // (fixed separately by withholding the sync watermark on locked chapters
+    // — see bookReimport.ts's reimport-sync step). This changes only the
+    // wording below, never the refusal decision above.
+    const unchanged = offenders.filter((o) => o.sequenceUnchanged);
+    const changed = offenders.filter((o) => !o.sequenceUnchanged);
+
+    const collateralMsg =
+      `${unchanged.length} verse(s) lost \\zaln word alignment on text that is UNCHANGED ` +
+      `(${detail}). This is the 1CH 4:21 / NUM 24 / JER 36:11 collateral de-alignment ` +
+      `signature — refusing to ship it to master. Re-align the affected verse(s) in the editor, then re-export.`;
+    const revisionMsg =
+      `${changed.length} verse(s) show apparent alignment loss, but their word SEQUENCE also changed — D1 and ` +
+      `master hold DIFFERENT REVISIONS of these verses, and the named words are coincidental surface matches ` +
+      `between two different sentences, not a translator's mistake (the EZK 40 signature). The remedy is to fix ` +
+      `the sync / re-sync ${book} ${resource.toUpperCase()} from master, NOT to re-align words.`;
+
+    let message: string;
+    if (changed.length === 0) {
+      message = `Benjamin fix this — nightly export BLOCKED ${book} ${resource.toUpperCase()}: ${collateralMsg}`;
+    } else if (unchanged.length === 0) {
+      message = `Benjamin fix this — nightly export BLOCKED ${book} ${resource.toUpperCase()}: ${revisionMsg}`;
+    } else {
+      message =
+        `Benjamin fix this — nightly export BLOCKED ${book} ${resource.toUpperCase()}: mixed causes. ` +
+        `${collateralMsg} SEPARATELY, ${revisionMsg}`;
+    }
     await this.writeAlert(source, message, `${this.env.DCS_BASE_URL}/unfoldingWord`);
   }
 
