@@ -5,7 +5,7 @@
 // instead of getting silently flattened to `\v 6`. Not a test framework;
 // failures exit non-zero.
 
-import { attributeTsvShrink, buildExportBranch, buildTnTsv, buildTqTsv, buildTwlTsv, buildUsfm, commitToDcs, countDuplicateMasterIds, describeShrinkRefusal, ensureDcsPr, exportTsvShrinkRefused, parseTsvIds, recreateExportBranchFromMaster, updateDcsPrBranch, usfmAlignmentShrinkRefused } from "./export.ts";
+import { attributeTsvShrink, buildExportBranch, buildTnTsv, buildTqTsv, buildTwlTsv, buildUsfm, classifyAlignmentShrinkOffenders, commitToDcs, countDuplicateMasterIds, describeShrinkRefusal, ensureDcsPr, exportTsvShrinkRefused, parseTsvIds, recreateExportBranchFromMaster, updateDcsPrBranch, usfmAlignmentShrinkRefused } from "./export.ts";
 import { CorruptContentJsonError } from "./contentJson.ts";
 
 function assert(cond, msg) {
@@ -1167,6 +1167,86 @@ function utf8Base64(s) {
   // master actually having aligned verses.
   const r8freshboth = usfmAlignmentShrinkRefused("", "");
   assert(r8freshboth.refused === false, `empty render + empty master never refuses`);
+
+  // (9) `sequenceUnchanged` per-offender flag — distinguishes true collateral
+  // de-alignment on untouched text (JER 36:11 shape: same word sequence, one
+  // word bare) from D1/master holding different revisions of the verse (EZK
+  // 40 shape: word sequence differs entirely, and the "lost" word is just a
+  // coincidental surface match between two unrelated sentences). This is
+  // wording-only — both cases must still set refused:true (see the CRITICAL
+  // constraint: the refusal decision itself must never change).
+  assert(
+    r1b.offenders[0].sequenceUnchanged === true,
+    `pure collateral loss on unchanged text (JER 36:11 shape) is flagged sequenceUnchanged:true`,
+  );
+  assert(r1b.refused === true, `regression guard: sequence-unchanged case still refuses`);
+
+  const revA = verse("EZK", 40, 6, ["the", "gate", "facing", "east", "steps"]);
+  const revB = verse("EZK", 40, 6, ["through", "the", "narrow", "steps"], 3);
+  const r9 = usfmAlignmentShrinkRefused(revB, revA);
+  assert(r9.refused === true, `regression guard: different-revision verse (EZK 40 shape) still refuses`);
+  assert(r9.offenders.length === 1, `different-revision mismatch produces one offender`);
+  assert(
+    r9.offenders[0].sequenceUnchanged === false,
+    `a verse whose word sequence differs entirely (different revision) is flagged sequenceUnchanged:false`,
+  );
+  assert(
+    JSON.stringify(r9.offenders[0].lostWords) === JSON.stringify(["steps"]),
+    `names the coincidentally-shared word "steps" as the (misleading) lost word`,
+  );
+}
+
+// --- classifyAlignmentShrinkOffenders: alert-wording partition ---
+// Extracted pure classification for recordAlignmentShrinkSkipAlert
+// (exportWorkflow.ts, untestable by the strip-types runner). Three cases the
+// nightly alert must word differently — see export.ts for the full rationale:
+//   - "none": no offenders at all (master_unreadable — a DCS fetch failure).
+//   - "sentinel": the synthetic ref:"*" offender for an unparseable/empty
+//     RENDER (our own rendering bug).
+//   - "genuine": real per-verse offenders, split by sequenceUnchanged.
+{
+  const none = classifyAlignmentShrinkOffenders([]);
+  assert(none.kind === "none", `no offenders at all → classified "none" (master_unreadable case)`);
+
+  const unparseable = classifyAlignmentShrinkOffenders([
+    { ref: "*", lostWords: ["unparseable_render"], sequenceUnchanged: true },
+  ]);
+  assert(unparseable.kind === "sentinel", `the "*" unparseable_render sentinel → classified "sentinel"`);
+  assert(unparseable.which === "unparseable_render", `sentinel classification names which sentinel fired`);
+
+  const empty = classifyAlignmentShrinkOffenders([
+    { ref: "*", lostWords: ["empty_render"], sequenceUnchanged: true },
+  ]);
+  assert(empty.kind === "sentinel", `the "*" empty_render sentinel → classified "sentinel"`);
+  assert(empty.which === "empty_render", `sentinel classification names empty_render specifically`);
+
+  const genuineUnchanged = classifyAlignmentShrinkOffenders([
+    { ref: "1CH 4:21", lostWords: ["Shelah"], sequenceUnchanged: true },
+  ]);
+  assert(genuineUnchanged.kind === "genuine", `a real per-verse offender → classified "genuine"`);
+  assert(
+    genuineUnchanged.unchanged.length === 1 && genuineUnchanged.changed.length === 0,
+    `genuine + sequenceUnchanged:true sorts into the "unchanged" (collateral de-alignment) bucket`,
+  );
+
+  const genuineChanged = classifyAlignmentShrinkOffenders([
+    { ref: "EZK 40:6", lostWords: ["steps"], sequenceUnchanged: false },
+  ]);
+  assert(genuineChanged.kind === "genuine", `a real per-verse revision-mismatch offender → classified "genuine"`);
+  assert(
+    genuineChanged.unchanged.length === 0 && genuineChanged.changed.length === 1,
+    `genuine + sequenceUnchanged:false sorts into the "changed" (different-revision) bucket`,
+  );
+
+  const mixed = classifyAlignmentShrinkOffenders([
+    { ref: "1CH 4:21", lostWords: ["Shelah"], sequenceUnchanged: true },
+    { ref: "EZK 40:6", lostWords: ["steps"], sequenceUnchanged: false },
+  ]);
+  assert(mixed.kind === "genuine", `mixed unchanged+changed offenders → still classified "genuine"`);
+  assert(
+    mixed.unchanged.length === 1 && mixed.changed.length === 1,
+    `mixed case splits correctly into both buckets`,
+  );
 }
 
 // --- recreateExportBranchFromMaster: delete + recreate off master ---
