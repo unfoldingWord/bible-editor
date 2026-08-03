@@ -39,6 +39,11 @@
   (memory: tn-ai-duplication-roundtrip)
 - **Dangling `-be-` export refs** — `DCS_SERVICE_TOKEN` can't delete branches; drifted branches must be
   cleared by hand with a maintainer PAT. (memory: export-service-token-no-delete, export-branch-no-rebase-drift)
+- **`JER 36:11` ULT needs a manual re-align** — the word "the" is bare in D1 but aligned to `הַ⁠סֵּֽפֶר`
+  ("the book") on master, so the alignment backstop has blocked JER ULT's export since 2026-07-31.
+  Not a code bug: on 2026-07-30 a human cleared the verse in the aligner panel and rebuilt it word-by-word
+  in ~100s (un-fusing master's 6-word compound card) and left the article off that card. Word sequence is
+  identical both sides, so index 16 is unambiguous. Fix = drag "the" onto the `הַ⁠סֵּֽפֶר` card, then re-export.
 
 ## Lessons learned (write durable, cross-session facts here — not in chat)
 
@@ -81,6 +86,29 @@ Highlights that bite repeatedly:
   ever *removes* a duplicate `\p` — never invents one, never touches poetry or a chapter that opens without `\p`.
   Our export normalizer is a line-*formatter*, not a semantic validator: only DCS-side CI caught the stack — hence
   the separate task to adopt DCS's USFM validation into our write path.
+
+- **A watermark must not certify data it didn't apply — and the check must sit where the laundering can't
+  reach it.** The nightly reimport skips chapters held by a pipeline lock, then stamped
+  `book_resource_syncs` for the whole `(book, resource)` anyway; the export's freshness gate trusts that
+  stamp, so EZK 40 UST (stale in D1 since 2026-06-10) nearly reverted a whole new chapter bp-assistant had
+  pushed to master. Three traps found while fixing it, each worth remembering as a *class*: (1) `skipped_locked`
+  is **overloaded** — apply-phase chapter skips *and* prune-phase row skips — so gating on it is far too broad;
+  gate on purpose-built counters. (2) The prune runs in a **later Workflow step** than the chunks, so it re-reads
+  lock state — a job starting between them was invisible to a chunk-only gate. (3) A fail-safe that treats an
+  absent field as "withhold" is defeated if an aggregation step upstream coerces absent → `0`: the check then sees
+  a *present* zero. Put the taint in the aggregation, not just the predicate. Also: `checkMasterFreshness` returns
+  `no_watermark` as **ok**, so "withhold the stamp" is a no-op for a book that never had a row — withholding must
+  write something that cannot match a real SHA. (PRs #394/#395)
+- **A guard's alert wording is not cosmetic — a wrong cause sends the operator at the wrong fix.** The alignment
+  backstop reported EZK 40 as `lost alignment on "steps"` when D1 and master held entirely *different revisions*
+  of the verse; those words were coincidental surface matches, and the alert told a human to re-align a word when
+  the real fix was the sync. Same shape in the TSV shrink guard, which asserted "truncated fetch, not a real
+  deletion" unconditionally and recommended a re-sync that would have **resurrected 62 deliberately deleted**
+  1CH TQ questions. Rule: an alert may only state a cause the code actually measured; when it can't tell, say so
+  and name the detail. Use `analyzeAlignmentDelta`'s `wordSequenceUnchanged` to separate genuine collateral
+  de-alignment from a revision mismatch — **for wording only.** Never let it narrow the refusal *decision*:
+  that exemption is exactly what let the 1CH 4:21 collateral loss ship (see the warning comment in
+  `alignmentDelta.ts`).
 
 ## Stop conditions / goals
 
