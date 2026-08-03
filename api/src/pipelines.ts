@@ -18,10 +18,10 @@
 import { Hono } from "hono";
 import { z } from "zod";
 import type { Env } from "./index";
-import { currentUserId, requireEditor } from "./auth";
-import { importJobOutput } from "./pipelineImport";
-import { resourcesLockedByJob } from "./chapterLock";
-import { broadcastChapter } from "./wsEvents";
+import { currentUserId, requireEditor } from "./auth.ts";
+import { importJobOutput } from "./pipelineImport.ts";
+import { resourcesLockedByJob } from "./chapterLock.ts";
+import { broadcastChapter } from "./wsEvents.ts";
 
 export const pipelines = new Hono<{
   Bindings: Env;
@@ -1872,6 +1872,199 @@ pipelines.post("/:jobId/cancel", requireEditor, async (c) => {
     }
   }
   return c.json({ ok: true, jobId, state: "cancelled" });
+});
+
+// States a force-fail will act on — deliberately the mirror image of /cancel's
+// CANCELLABLE set above. /cancel refuses 'running' and 'dispatching' because
+// there is nothing to cancel: the bot already has the work, so "cancel" would
+// just orphan our row while the bot keeps grinding. Force-fail exists for
+// exactly the opposite reason: those two states are the ONLY ones that can
+// wedge (see issue #398 / NUM 27) — a queued job has never touched the bot,
+// and every other state is already terminal or already has its own recovery
+// path (resume). 'dispatching' is included because the single bot slot is
+// already claimed the moment we flip to it (before the upstream POST even
+// lands), so a wedge in that narrow window would otherwise have no exit
+// either.
+const FORCE_FAILABLE = ["running", "dispatching"];
+
+// Derives the typed confirmation phrase from the job's own book/chapter
+// range. Exported so it's unit-testable and so the frontend can mirror the
+// exact formula (see the comment at its web/src/sync/api.ts call site) — the
+// server is always the source of truth; the client only recomputes it so the
+// dialog can show it and gate its own confirm button without a round trip.
+export function forceStopPhrase(
+  book: string,
+  startChapter: number,
+  endChapter: number,
+): string {
+  const range =
+    startChapter === endChapter ? `${startChapter}` : `${startChapter}-${endChapter}`;
+  return `STOP THE AI FOR ${book} ${range}`;
+}
+
+const ForceFailBody = z.object({ confirm: z.string() }).strict();
+
+export type ForceFailResult =
+  | { kind: "not_found" }
+  | { kind: "forbidden" }
+  | { kind: "cannot_force_fail"; state: string }
+  | { kind: "confirm_mismatch" }
+  | { kind: "ok"; jobId: string };
+
+// Core force-fail logic, split out from the route below so it's testable
+// without spinning up Hono (mirrors how pollPipelineJob/dispatchNext are
+// standalone functions the routes call into). Does everything except turn
+// the result into an HTTP response.
+export async function forceFailJob(
+  env: Env,
+  params: { jobId: string; userId: number; confirm: string },
+): Promise<ForceFailResult> {
+  const { jobId, userId, confirm } = params;
+
+  const owned = await env.DB.prepare(
+    `SELECT user_id, state, upstream_job_id, book, start_chapter, end_chapter
+       FROM pipeline_jobs WHERE job_id = ?1`,
+  )
+    .bind(jobId)
+    .first<{
+      user_id: number;
+      state: string;
+      upstream_job_id: string | null;
+      book: string;
+      start_chapter: number;
+      end_chapter: number;
+    }>();
+  if (!owned) return { kind: "not_found" };
+  if (owned.user_id !== userId) return { kind: "forbidden" };
+  if (!FORCE_FAILABLE.includes(owned.state)) {
+    return { kind: "cannot_force_fail", state: owned.state };
+  }
+
+  const expected = forceStopPhrase(owned.book, owned.start_chapter, owned.end_chapter);
+  if (confirm.trim() !== expected) {
+    return { kind: "confirm_mismatch" };
+  }
+
+  // Best-effort upstream stop, BEFORE the local UPDATE, and explicitly
+  // non-fatal: the bot-side `/api/pipeline/:jobId/stop` contract (issue #398
+  // §2) does not exist yet — this route must fully work with it absent, since
+  // that is the current production reality and the primary case this code
+  // will hit for a while. Any failure (network, non-2xx, or the endpoint
+  // simply 404ing) is swallowed and folded into the error_message as an
+  // audit trail, never thrown — a translator watching a wedged, locked
+  // chapter must be able to get unstuck locally even if the bot can't be
+  // reached at all.
+  let upstreamOutcome = "upstream stop: not attempted (no upstream_job_id)";
+  if (owned.upstream_job_id && env.BT_API_TOKEN) {
+    try {
+      const res = await fetch(
+        `${upstreamBase(env)}/api/pipeline/${encodeURIComponent(owned.upstream_job_id)}/stop`,
+        {
+          method: "POST",
+          headers: { Authorization: `Bearer ${env.BT_API_TOKEN}` },
+        },
+      );
+      upstreamOutcome = res.ok
+        ? "upstream stop: ok"
+        : `upstream stop: ${res.status}`;
+    } catch {
+      upstreamOutcome = "upstream stop: unreachable";
+    }
+  } else if (owned.upstream_job_id) {
+    upstreamOutcome = "upstream stop: not attempted (pipeline API disabled)";
+  }
+
+  // Prefer the DCS username over the bare id: this message is read by a human
+  // debugging "why did this run die?", and `force-stopped by user 1` makes them
+  // go do a second lookup. Fall back to the id if the users row is missing.
+  const actor = (await resolveUsernameFromDb(env, userId)) ?? `user ${userId}`;
+  const errorMessage = `force-stopped by ${actor}; ${upstreamOutcome}`;
+
+  // CAS-guarded local UPDATE so a concurrent transition (e.g. the bot finally
+  // reporting 'done'/'failed' via a poll landing at the same moment) can't be
+  // clobbered by this write. notified_user_at is set for the same reason
+  // /cancel sets it: the acting user just did this themselves, so it must
+  // never resurface as a "while you were away" item.
+  const res = await env.DB.prepare(
+    `UPDATE pipeline_jobs
+        SET state = 'failed',
+            error_kind = 'force_stopped',
+            error_message = ?2,
+            notified_user_at = unixepoch(),
+            updated_at = unixepoch()
+      WHERE job_id = ?1 AND state IN ('running', 'dispatching')`,
+  )
+    .bind(jobId, errorMessage)
+    .run();
+  if ((res.meta?.changes ?? 0) === 0) {
+    const now = await env.DB.prepare(`SELECT state FROM pipeline_jobs WHERE job_id = ?1`)
+      .bind(jobId)
+      .first<{ state: string }>();
+    return { kind: "cannot_force_fail", state: now?.state ?? "unknown" };
+  }
+
+  // Freeing the single bot slot right away is the whole point (see issue
+  // #398 — two tqs jobs sat starved behind a wedged 'running' row for ~3
+  // hours). Mirrors /cancel's dispatchNext call.
+  try {
+    await dispatchNext(env);
+  } catch (err) {
+    console.error(`[force-fail.dispatchNext] job=${jobId}:`, err);
+  }
+
+  return { kind: "ok", jobId };
+}
+
+// POST /api/pipelines/:jobId/force-fail  — the manual escape hatch /cancel
+// deliberately doesn't provide: it accepts 'running' and 'dispatching', the
+// exact two states /cancel refuses, because those are the only states that
+// can actually wedge (see FORCE_FAILABLE's comment above and issue #398 for
+// the NUM 27 incident this was built from — a fly.io restart orphaned a
+// checkpoint mid-run, and the only exits were automatic backstops 6-10 hours
+// out, during which the job held both the chapter lock and the single bot
+// dispatch slot).
+//
+// The typed confirmation (`{confirm: string}`, matched exactly against a
+// phrase the SERVER derives from the job's own book/chapter — never trust a
+// client-supplied phrase) is a deliberate speed bump, not a security control,
+// same reasoning as the force-resume comment above: this is an authenticated
+// editor-only route already gated on the job's own owner, so the exposure
+// being defended against is "this editor clicks through their own destructive
+// action without reading it," not privilege escalation. Making the phrase
+// name the book and chapter range means the blast radius is legible in the
+// same box the user types into, rather than trusting a generic "are you
+// sure?" to have been read.
+//
+// The upstream stop call is best-effort (see forceFailJob above) because the
+// bot-side kill contract is a follow-up landing in a separate repo/PR — this
+// route must degrade gracefully to "local-only" until that ships.
+pipelines.post("/:jobId/force-fail", requireEditor, async (c) => {
+  const userId = currentUserId(c);
+  if (!userId) return c.json({ error: "unauthorized" }, 401);
+  const jobId = c.req.param("jobId");
+  if (!jobId) return c.json({ error: "missing_job_id" }, 400);
+
+  let confirm: string;
+  try {
+    const body = ForceFailBody.parse(await c.req.json());
+    confirm = body.confirm;
+  } catch {
+    return c.json({ error: "invalid_body" }, 400);
+  }
+
+  const result = await forceFailJob(c.env, { jobId, userId, confirm });
+  switch (result.kind) {
+    case "not_found":
+      return c.json({ error: "not_found" }, 404);
+    case "forbidden":
+      return c.json({ error: "forbidden" }, 403);
+    case "cannot_force_fail":
+      return c.json({ error: "cannot_force_fail", state: result.state }, 409);
+    case "confirm_mismatch":
+      return c.json({ error: "confirm_mismatch" }, 400);
+    case "ok":
+      return c.json({ ok: true, jobId: result.jobId, state: "failed" });
+  }
 });
 
 // POST /api/pipelines/:jobId/resume  — ask the bot to pick a paused run back

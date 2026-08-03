@@ -19,6 +19,12 @@ import {
   CircularProgress,
   Snackbar,
   Alert,
+  Dialog,
+  DialogTitle,
+  DialogContent,
+  DialogContentText,
+  DialogActions,
+  TextField,
 } from "@mui/material";
 import AutoAwesomeIcon from "@mui/icons-material/AutoAwesome";
 import CheckCircleOutlineIcon from "@mui/icons-material/CheckCircleOutline";
@@ -192,6 +198,21 @@ function describeAge(seconds?: number): string {
   return `${Math.floor(hours / 24)} days`;
 }
 
+// Client-side mirror of `forceStopPhrase` in api/src/pipelines.ts. This copy
+// exists ONLY to render the phrase in the dialog and gate the confirm button
+// without a round trip — the server independently derives and checks its own
+// copy from the job row, and that server check is the one that actually
+// matters. The two formulas MUST change in lockstep: if they drift, this
+// dialog shows a phrase the server will reject, and every force-stop attempt
+// 400s with confirm_mismatch.
+function forceStopPhrase(job: PipelineJobRow): string {
+  const range =
+    job.start_chapter === job.end_chapter
+      ? `${job.start_chapter}`
+      : `${job.start_chapter}-${job.end_chapter}`;
+  return `STOP THE AI FOR ${job.book} ${range}`;
+}
+
 interface ToastMsg {
   id: number;
   text: string;
@@ -221,6 +242,14 @@ export function PipelineStatusBar({ toast, onToastClear }: Props = {}) {
   // because a forced resume republishes output generated before any edits made
   // since. So we surface the age here and only force once the user confirms.
   const [staleConfirm, setStaleConfirm] = useState<{ jobId: string; text: string } | null>(null);
+  // Force-stop dialog: the job being targeted (null = closed), the user's
+  // typed text, whether a request is in flight, and a failure message from
+  // the request itself (the row's own error_message covers the successful
+  // "force-stopped by user N" case once it re-polls).
+  const [forceFailTarget, setForceFailTarget] = useState<PipelineJobRow | null>(null);
+  const [forceFailText, setForceFailText] = useState("");
+  const [forceFailing, setForceFailing] = useState(false);
+  const [forceFailError, setForceFailError] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
   // When pipelineStore.requestFocus(jobId) fires (e.g. on already_running),
   // we stash the request and let the next render — once hasAnything flips
@@ -331,6 +360,42 @@ export function PipelineStatusBar({ toast, onToastClear }: Props = {}) {
       setResumeError({ jobId: job.job_id, text: "Resume failed — try again." });
     } finally {
       setResuming(null);
+    }
+  };
+
+  const openForceFail = (job: PipelineJobRow) => {
+    setForceFailTarget(job);
+    setForceFailText("");
+    setForceFailError(null);
+  };
+
+  const closeForceFail = () => {
+    if (forceFailing) return; // don't yank the dialog out from under an in-flight request
+    setForceFailTarget(null);
+    setForceFailText("");
+    setForceFailError(null);
+  };
+
+  const confirmForceFail = async () => {
+    if (!forceFailTarget) return;
+    setForceFailing(true);
+    setForceFailError(null);
+    try {
+      const res = await pipelineStore.forceFail(forceFailTarget.job_id, forceFailText);
+      if (!res.ok) {
+        setForceFailError(
+          res.reason === "confirm_mismatch"
+            ? "That doesn't match the phrase above — check for typos and try again."
+            : `Could not force-stop — the run is now ${res.state ?? "in another state"}.`,
+        );
+        return;
+      }
+      setForceFailTarget(null);
+      setForceFailText("");
+    } catch {
+      setForceFailError("Force-stop failed — try again.");
+    } finally {
+      setForceFailing(false);
     }
   };
 
@@ -561,6 +626,20 @@ export function PipelineStatusBar({ toast, onToastClear }: Props = {}) {
                       </span>
                     </Tooltip>
                   )}
+                  {(job.state === "running" || job.state === "dispatching") &&
+                    !isForeign(job) && (
+                      <Tooltip title="Stop this run immediately and discard its in-flight AI work — for a wedged run that isn't making progress">
+                        <span>
+                          <Button
+                            size="small"
+                            color="error"
+                            onClick={() => openForceFail(job)}
+                          >
+                            Force stop
+                          </Button>
+                        </span>
+                      </Tooltip>
+                    )}
                   {(job.state === "failed" || job.state === "cancelled") && (
                     <Tooltip title="Mark as seen — hides this run from the list">
                       <Button size="small" color="inherit" onClick={() => pipelineStore.dismiss(job.job_id)}>
@@ -618,6 +697,83 @@ export function PipelineStatusBar({ toast, onToastClear }: Props = {}) {
           </Stack>
         </Box>
       </Popover>
+      {/* Force-stop confirmation. Deliberately heavier than the inline
+          force-resume confirm above (a plain inline warning + button): this
+          discards in-flight AI work rather than just re-trying an already-
+          paused run, so it gets a modal, a typed phrase, and an explicit list
+          of consequences instead of one line of text. */}
+      <Dialog open={Boolean(forceFailTarget)} onClose={closeForceFail} maxWidth="xs" fullWidth>
+        {forceFailTarget && (
+          <>
+            <DialogTitle sx={{ color: "error.main" }}>Force stop this run?</DialogTitle>
+            <DialogContent>
+              <DialogContentText component="div">
+                <Typography variant="body2" sx={{ mb: 1 }}>
+                  {TYPE_LABEL[forceFailTarget.pipeline_type]} — {forceFailTarget.book}{" "}
+                  {forceFailTarget.start_chapter}
+                  {forceFailTarget.end_chapter !== forceFailTarget.start_chapter
+                    ? `–${forceFailTarget.end_chapter}`
+                    : ""}
+                </Typography>
+                <Typography variant="body2" component="div" sx={{ mb: 1 }}>
+                  This will:
+                  <ul style={{ margin: "4px 0 0 0", paddingLeft: 20 }}>
+                    <li>stop the run immediately</li>
+                    <li>discard whatever AI work is in flight — it cannot be recovered</li>
+                    <li>unlock the chapter for editing again</li>
+                    <li>let the next queued run start right away</li>
+                  </ul>
+                </Typography>
+                <Typography variant="body2" sx={{ mb: 1 }}>
+                  Type the phrase below exactly to confirm:
+                </Typography>
+                <Typography
+                  variant="body2"
+                  sx={{
+                    fontFamily: "monospace",
+                    fontWeight: 700,
+                    bgcolor: "action.hover",
+                    p: 1,
+                    borderRadius: 1,
+                    mb: 1,
+                    userSelect: "all",
+                  }}
+                >
+                  {forceStopPhrase(forceFailTarget)}
+                </Typography>
+                <TextField
+                  autoFocus
+                  fullWidth
+                  size="small"
+                  value={forceFailText}
+                  onChange={(e) => setForceFailText(e.target.value)}
+                  placeholder={forceStopPhrase(forceFailTarget)}
+                  disabled={forceFailing}
+                />
+                {forceFailError && (
+                  <Typography variant="caption" color="error" display="block" sx={{ mt: 1 }}>
+                    {forceFailError}
+                  </Typography>
+                )}
+              </DialogContentText>
+            </DialogContent>
+            <DialogActions>
+              <Button onClick={closeForceFail} disabled={forceFailing} color="inherit">
+                Cancel
+              </Button>
+              <Button
+                onClick={() => void confirmForceFail()}
+                color="error"
+                variant="contained"
+                disabled={forceFailing || forceFailText !== forceStopPhrase(forceFailTarget)}
+                startIcon={forceFailing ? <CircularProgress size={14} color="inherit" /> : undefined}
+              >
+                Force stop
+              </Button>
+            </DialogActions>
+          </>
+        )}
+      </Dialog>
     </>
   );
 }

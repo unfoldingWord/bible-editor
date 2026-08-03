@@ -469,6 +469,33 @@ export const pipelineStore = {
     }
   },
 
+  // Force-stop a wedged running/dispatching job. Always re-polls afterwards —
+  // success moves it to 'failed' locally, and a 409/400 means the row didn't
+  // change, so either way the real server state is what should render, not an
+  // optimistic guess (same reasoning as resume()).
+  async forceFail(
+    jobId: string,
+    confirm: string,
+  ): Promise<{
+    ok: boolean;
+    /** Bare machine code: 'confirm_mismatch' | 'cannot_force_fail'. */
+    reason?: string;
+    state?: PipelineState;
+  }> {
+    try {
+      await api.pipelineForceFail(jobId, confirm);
+      await pollOne(jobId);
+      return { ok: true };
+    } catch (e) {
+      if (e instanceof ApiError && (e.status === 409 || e.status === 400)) {
+        const body = e.body as { error?: string; state?: PipelineState } | undefined;
+        await pollOne(jobId);
+        return { ok: false, reason: body?.error, state: body?.state };
+      }
+      throw e;
+    }
+  },
+
   getQueueSummary(): PipelineQueueSummary | null {
     return queueSummary;
   },
