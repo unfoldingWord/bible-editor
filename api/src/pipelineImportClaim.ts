@@ -47,14 +47,42 @@ export function mayClaimImport(
 // ever proposed for (1-45) and deleted 121 already-applied notes, leaving
 // only the 39 the resumed pass itself re-applied. See the DAN 11 regression
 // test in pipelineImport.test.mjs.
+//
+// `resolvedPairs` (required, not optional — a future caller must not be able
+// to silently skip this) closes a second, narrower gap Codex review flagged
+// against the fix above: a verse this job already has ACCEPTED proposals for
+// must be excluded from the scope entirely, even though it may still also
+// carry unresolved proposals in `proposals`. The sweep runs once, before any
+// inserts in this apply pass; if a verse already has an accepted proposal,
+// some EARLIER pass already ran delete-then-insert for that verse and
+// completed at least part of the insert side. Re-sweeping it now can only
+// destroy that already-accepted work. Traced against both crash shapes:
+//   - Pass 1 died BEFORE sweeping verse V: V has no accepted proposals yet ->
+//     stays in scope -> sweep + insert all of V. Unchanged, correct.
+//   - Pass 1 swept V and accepted 2 of its 3 proposals, then died: V now has
+//     an accepted proposal -> excluded from scope -> pass 2 leaves V's rows
+//     alone and inserts only the 3rd, unresolved proposal. V ends with all 3
+//     notes instead of losing the 2 already-accepted ones. This is the case
+//     Codex flagged against the original fix (which scoped by unresolved
+//     proposals alone and would still have re-swept V).
+// Trade-off, deliberate: for an excluded verse, any prior-run or pristine note
+// the first pass had not yet gotten to deleting survives (mildly stale)
+// instead of being deleted. That's the same trade-off this module already
+// makes elsewhere — a verse missing from the result "keeps its existing notes
+// (mildly stale) instead of being emptied" — and mild staleness is strictly
+// better than deleting accepted notes. The content-dedup claim set
+// (`claimedTnKeys` in applyJobOutput) already prevents the remainder inserts
+// from duplicating whatever survives on an excluded verse.
 export function tnSweepScope(
   proposals: Array<{ chapter: number; verse: number }>,
+  resolvedPairs: Array<{ chapter: number; verse: number }>,
 ): Array<{ chapter: number; verse: number }> {
+  const resolvedKeys = new Set(resolvedPairs.map((p) => `${p.chapter}/${p.verse}`));
   const seen = new Set<string>();
   const pairs: Array<{ chapter: number; verse: number }> = [];
   for (const p of proposals) {
     const key = `${p.chapter}/${p.verse}`;
-    if (seen.has(key)) continue;
+    if (seen.has(key) || resolvedKeys.has(key)) continue;
     seen.add(key);
     pairs.push({ chapter: p.chapter, verse: p.verse });
   }

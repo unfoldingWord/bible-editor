@@ -91,7 +91,7 @@ assert(
   // include 1-31 and delete the first pass's already-applied notes.
   const resumedUnresolved = [];
   for (let v = 32; v <= 45; v++) resumedUnresolved.push({ chapter: 11, verse: v });
-  const scope = tnSweepScope(resumedUnresolved);
+  const scope = tnSweepScope(resumedUnresolved, []);
   const verses = new Set(scope.map((p) => `${p.chapter}/${p.verse}`));
   assert(
     scope.length === 14,
@@ -108,17 +108,20 @@ assert(
 
 // --- dedupes multiple proposals sharing one verse ---
 assert(
-  tnSweepScope([
-    { chapter: 3, verse: 5 },
-    { chapter: 3, verse: 5 },
-    { chapter: 3, verse: 5 },
-  ]).length === 1,
+  tnSweepScope(
+    [
+      { chapter: 3, verse: 5 },
+      { chapter: 3, verse: 5 },
+      { chapter: 3, verse: 5 },
+    ],
+    [],
+  ).length === 1,
   "tnSweepScope dedupes multiple proposals for the same verse",
 );
 
 // --- keeps (chapter, verse) pairs distinct across chapters ---
 {
-  const scope = tnSweepScope([{ chapter: 2, verse: 1 }]);
+  const scope = tnSweepScope([{ chapter: 2, verse: 1 }], []);
   assert(
     scope.length === 1 && scope[0].chapter === 2 && scope[0].verse === 1,
     "tnSweepScope: a proposal for ch2 v1 does not also put ch1 v1 in scope",
@@ -126,7 +129,62 @@ assert(
 }
 
 // --- empty input → empty scope ---
-assert(tnSweepScope([]).length === 0, "tnSweepScope([]) → empty scope");
+assert(tnSweepScope([], []).length === 0, "tnSweepScope([], []) → empty scope");
+
+// ── tnSweepScope: exclude verses that already have accepted proposals ────
+// Codex review flagged the straddled-verse gap: scoping by unresolved
+// proposals alone still re-sweeps a verse a PRIOR pass already accepted some
+// proposals for, destroying that pass's already-applied work. A verse with an
+// accepted proposal for this job must be excluded entirely, regardless of
+// whether it also still has unresolved proposals.
+{
+  const proposals = [
+    { chapter: 11, verse: 5 },
+    { chapter: 11, verse: 6 },
+    { chapter: 11, verse: 7 },
+  ];
+  const resolvedPairs = [{ chapter: 11, verse: 5 }];
+  const scope = tnSweepScope(proposals, resolvedPairs);
+  const verses = new Set(scope.map((p) => `${p.chapter}/${p.verse}`));
+  assert(
+    !verses.has("11/5"),
+    "tnSweepScope: a verse with an accepted proposal is excluded from scope even though it also has unresolved proposals",
+  );
+  assert(
+    verses.has("11/6") && verses.has("11/7"),
+    "tnSweepScope: verses without accepted proposals remain in scope",
+  );
+  assert(scope.length === 2, "tnSweepScope: excluded verse is the only one dropped");
+}
+
+// --- exclusion matches (chapter, verse) exactly — a same-numbered verse in a
+//     different chapter must NOT be excluded ---
+{
+  const proposals = [
+    { chapter: 1, verse: 5 },
+    { chapter: 2, verse: 5 },
+  ];
+  const resolvedPairs = [{ chapter: 1, verse: 5 }];
+  const scope = tnSweepScope(proposals, resolvedPairs);
+  const verses = new Set(scope.map((p) => `${p.chapter}/${p.verse}`));
+  assert(
+    !verses.has("1/5") && verses.has("2/5"),
+    "tnSweepScope: exclusion matches (chapter, verse) exactly, not verse number alone",
+  );
+}
+
+// --- empty resolved set behaves exactly as before (no exclusion) ---
+{
+  const proposals = [
+    { chapter: 11, verse: 6 },
+    { chapter: 11, verse: 7 },
+  ];
+  const scope = tnSweepScope(proposals, []);
+  assert(
+    scope.length === 2,
+    "tnSweepScope: an empty resolved set excludes nothing (unchanged behavior)",
+  );
+}
 
 // ── shouldTouchClaim: heartbeat rate limit ──────────────────────────────
 assert(
@@ -169,11 +227,15 @@ assert(
 // the generated query stops matching what we intend.
 //
 // Fake DB: prepare(sql).bind(...args) records the call and returns an object
-// whose .all()/.run() answer with empty result shapes. deleteUnkeptTns's
-// SELECT loop always sees zero live rows back, so it returns 0 without ever
-// reaching the delete-execution phase (env.DB.batch is never called) — exactly
-// the surface these tests need: the SELECT's SQL and bindings.
-function fakeDeleteDb() {
+// whose .all()/.run() answer with empty result shapes, EXCEPT the
+// `pending_imports` resolved-pairs lookup deleteUnkeptTns issues first (see
+// its `SELECT DISTINCT chapter, verse FROM pending_imports ... accepted_at IS
+// NOT NULL` query) — that one answers with `resolvedRows` so tests can
+// exercise the accepted-proposal exclusion. The tn_rows target SELECT always
+// sees zero live rows back, so deleteUnkeptTns returns 0 without ever
+// reaching the delete-execution phase (env.DB.batch is never called) —
+// exactly the surface these tests need: the SELECT's SQL and bindings.
+function fakeDeleteDb(resolvedRows = []) {
   const calls = [];
   return {
     calls,
@@ -185,6 +247,9 @@ function fakeDeleteDb() {
               calls.push({ sql, args });
               return {
                 async all() {
+                  if (/FROM pending_imports/.test(sql)) {
+                    return { results: resolvedRows };
+                  }
                   return { results: [] };
                 },
                 async run() {
@@ -299,6 +364,41 @@ await (async () => {
     /FROM edit_log/.test(sql) && /action IN \('create', 'update'\)/.test(sql),
     "guard-preservation: generated SQL retains the edit_log latest-content-source subquery",
   );
+})();
+
+// --- Test 2b: Codex finding — a verse with an accepted proposal must be
+//     excluded from the sweep scope entirely, even though the job also has
+//     unresolved proposals for other verses. Against the REAL deleteUnkeptTns
+//     + the real pending_imports resolved-pairs query, not just the pure
+//     tnSweepScope helper. ---
+await (async () => {
+  // The straddled-verse shape this closes: ch11 v5 had 3 proposals, one of
+  // which got accepted before the process died, leaving a 2nd unresolved
+  // proposal for the SAME verse still in tnProposals (that's what
+  // applyJobOutput's accepted_at IS NULL SELECT hands to deleteUnkeptTns) —
+  // v5 must still be excluded even though it also has an unresolved proposal
+  // here. v6/v7 have no accepted proposals at all, so they stay in scope.
+  const proposals = [tnProposal(11, 5), tnProposal(11, 6), tnProposal(11, 7)];
+  const resolvedRows = [{ chapter: 11, verse: 5 }];
+  const { calls, env } = fakeDeleteDb(resolvedRows);
+  await deleteUnkeptTns(env, job11, 1, proposals, newHeartbeat());
+
+  const sels = selectCalls(calls);
+  assert(sels.length > 0, "Codex straddled-verse fix: at least one target SELECT issued");
+
+  const boundPairs = new Set();
+  for (const c of sels) {
+    for (const p of pairsFromArgs(c.args)) boundPairs.add(`${p.chapter}/${p.verse}`);
+  }
+  assert(
+    !boundPairs.has("11/5"),
+    "Codex straddled-verse fix: ch11 v5 (has an accepted proposal) is ABSENT from bound pairs",
+  );
+  assert(
+    boundPairs.has("11/6") && boundPairs.has("11/7"),
+    "Codex straddled-verse fix: ch11 v6 and v7 (unresolved, no accepted proposal) are bound",
+  );
+  assert(boundPairs.size === 2, `Codex straddled-verse fix: exactly 2 verses bound (got ${boundPairs.size})`);
 })();
 
 // --- Test 3: binding integrity across multiple chunks ---

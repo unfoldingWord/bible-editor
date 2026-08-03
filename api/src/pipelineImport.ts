@@ -696,11 +696,12 @@ export async function deleteUnkeptTns(
   // verse the job ever proposed for, deleted 121 of the first pass's
   // already-applied notes, and only re-inserted the 39 still-unresolved
   // proposals — the chapter went from 131 live notes to 39, with verses 1-31
-  // emptied entirely. Scoping to tnSweepScope(tnProposals) instead means a
-  // verse this pass isn't touching is left alone, whatever a PRIOR pass did to
-  // it. Match on BOTH chapter and verse: a job may span multiple chapters
-  // (endChapter > startChapter is a valid range), and scoping by verse number
-  // alone would let a proposal for ch2:v1 make ch1:v1 eligible for deletion.
+  // emptied entirely. Scoping to tnSweepScope(tnProposals, resolvedPairs)
+  // instead means a verse this pass isn't touching is left alone, whatever a
+  // PRIOR pass did to it. Match on BOTH chapter and verse: a job may span
+  // multiple chapters (endChapter > startChapter is a valid range), and
+  // scoping by verse number alone would let a proposal for ch2:v1 make
+  // ch1:v1 eligible for deletion.
   // Defense-in-depth alongside the single-applier claim in importJobOutput
   // (Fix 2 in this same PR) — that claim now also gets heartbeated so a live
   // apply pass is never re-claimed mid-flight in the first place; this sweep
@@ -708,20 +709,40 @@ export async function deleteUnkeptTns(
   // DAN 11 regression test for tnSweepScope in pipelineImport.test.mjs — do
   // NOT widen this back to a job-wide scope.
   //
-  // Known, accepted residual (not fully closed by this fix): applyTnInsert
-  // resolves each proposal atomically (its own D1 batch), and tnProposals is
-  // processed in `ORDER BY kind, chapter, verse, id` order (see the SELECT in
+  // CLOSED: the straddled-verse class flagged by Codex review against the
+  // first version of this fix. applyTnInsert resolves each proposal
+  // atomically (its own D1 batch), and tnProposals is processed in
+  // `ORDER BY kind, chapter, verse, id` order (see the SELECT in
   // applyJobOutput), so a mid-run death can leave ONE verse straddled — some
   // of its proposals already inserted+resolved, the rest still unresolved.
-  // Because that straddled verse's remaining proposals are still unresolved,
-  // it's still in tnSweepScope(tnProposals) for the resumed pass, so the sweep
-  // deletes what the first pass already inserted THERE before re-inserting
-  // only the leftovers — a single verse can still see a delete/reinsert cycle
-  // on resume. This is bounded to roughly one verse (the one mid-flight when
-  // the process died), not the whole job, unlike the bug this PR fixes.
-  // Closing it fully would need per-proposal (not per-verse) resolution
-  // tracking in the sweep scope; left as a known gap.
-  const pairs = tnSweepScope(tnProposals);
+  // Scoping the sweep by unresolved proposals alone would still re-cover that
+  // straddled verse (its remaining proposals are still unresolved) and delete
+  // what the first pass already inserted there. Fixed by excluding any verse
+  // that ALREADY has an accepted proposal for this job from the sweep scope
+  // entirely — see tnSweepScope's `resolvedPairs` parameter. The sweep runs
+  // once, before any inserts in this pass; if a verse already has an accepted
+  // proposal, an earlier pass already completed delete-then-insert work there,
+  // and re-sweeping it now can only destroy that work. Traced against both
+  // crash shapes:
+  //   - Pass 1 died BEFORE sweeping verse V: no accepted proposals for V yet
+  //     -> V stays in scope -> sweep + insert all of V. Unchanged, correct.
+  //   - Pass 1 swept V and accepted 2 of 3 proposals, then died: V now has an
+  //     accepted proposal -> V excluded from scope -> pass 2 leaves V's rows
+  //     alone and inserts only the 3rd. V ends with all 3 notes instead of
+  //     losing the 2 already-accepted ones. This is the case Codex flagged.
+  // Trade-off, deliberate (see tnSweepScope for the full rationale): an
+  // excluded verse's not-yet-deleted prior-run/pristine notes survive (mildly
+  // stale) instead of being deleted — consistent with this module's existing
+  // philosophy, and strictly better than deleting accepted notes. Content-
+  // dedup (`claimedTnKeys` in applyJobOutput) prevents the remainder inserts
+  // from duplicating whatever survives.
+  const resolved = await env.DB.prepare(
+    `SELECT DISTINCT chapter, verse FROM pending_imports
+      WHERE job_id = ?1 AND kind = 'tn' AND accepted_at IS NOT NULL`,
+  )
+    .bind(job.jobId)
+    .all<{ chapter: number; verse: number }>();
+  const pairs = tnSweepScope(tnProposals, resolved.results ?? []);
   if (pairs.length === 0) return 0;
 
   // D1 caps bound parameters at 100 per statement. This query already binds 4
