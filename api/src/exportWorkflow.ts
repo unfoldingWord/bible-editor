@@ -57,7 +57,7 @@ import { runPostExport, VALIDATORS } from "./postExport";
 import { runChunkedReimport, storedResourceSha, ALL_RESOURCES as REIMPORT_RESOURCES } from "./bookReimport";
 import { dcsRawUrl, dcsResourceFile, fetchText, fileCommitSha, type ReimportResource } from "./dcsSources";
 import type { TnRow, TqRow, TwlRow, VerseRow } from "./types";
-import { blankRequiredRefs, lintUsfmVerses } from "./lint";
+import { lintUsfmVerses } from "./lint";
 import { validateUsfm, summarizeUsfmIssues } from "./usfmValidate";
 import { shrinkOverrideAllowed } from "./shrinkGuard";
 
@@ -325,6 +325,35 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     dcsAllowed: boolean,
     allowShrink: boolean,
   ): Promise<StepResult> {
+    // Clear any undismissed banner the removed blank-field HOLD gate left behind
+    // (see the long note further down for why that gate is gone). Its text says
+    // this export was BLOCKED and tells the operator to fix the rows and
+    // re-export, which is no longer true and would mislead about why a book is
+    // or is not on master.
+    //
+    // Deliberately FIRST, before every early return below. The books carrying
+    // such a banner are exactly the ones withheld for many nights, which makes
+    // them the likeliest to bail out early on a stale watermark, the shrink
+    // guard, or no_rows — and a purely corrective delete has no dependency on
+    // any of those outcomes. Also not gated on `dcsAllowed`: the banner is false
+    // now regardless of whether anything pushes tonight.
+    //
+    // Best-effort, matching writeAlert's doctrine that an alert-write failure
+    // must never fail the step. This runs for every tn/tq/twl book on every run,
+    // so letting a cosmetic DELETE throw out of exportOne could withhold a book
+    // from Door43 — precisely the failure this commit exists to remove.
+    if (resource === "tn" || resource === "tq" || resource === "twl") {
+      try {
+        await this.env.DB.prepare(
+          `DELETE FROM system_alerts WHERE username = ?1 AND source = ?2 AND dismissed_at IS NULL`,
+        )
+          .bind(EXPORT_ALERT_USERNAME, `export_blank:${book}:${resource}`)
+          .run();
+      } catch (err) {
+        console.error(`export_blank banner clear failed for ${book} ${resource}:`, err);
+      }
+    }
+
     const built = await this.buildResource(book, resource);
 
     if (built.content === "") {
@@ -483,8 +512,8 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
           .run();
         // Worded for what is true HERE, same discipline as the allowShrink
         // alert: the guard was cleared. The export can still be stopped
-        // further down by the blank-field gate, USFM validation, or a failed
-        // DCS commit, so this must not claim the push happened.
+        // further down by the alignment-shrink backstop, USFM validation, or a
+        // failed DCS commit, so this must not claim the push happened.
         await this.writeAlert(
           `export_shrink_credited:${book}:${resource}`,
           `${book} ${resource.toUpperCase()}: shrink guard auto-credited ${guard.explained ?? "?"} human ` +
@@ -514,33 +543,35 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       }
     }
 
-    // Blank required-field HOLD gate — defense in depth for the TSV resources.
-    // A tn with an empty note (or tq empty question/response, twl empty
-    // OrigWords/TWLink) is REJECTED by DCS's whole-repo validator, so shipping
-    // it just produces an unmergeable PR. Refuse to commit the render and raise
-    // a banner listing the offending refs; the edits stay safe in D1 and the
-    // next night catches up once the row is filled in or deleted. Same skip +
-    // alert + snapshot-reason shape as the shrink guards above. This is the same
-    // set the in-app "issues to clean up" chip flags (lint.ts), so a translator
-    // sees the exact rows this gate is holding on.
-    if (dcsAllowed && (resource === "tn" || resource === "tq" || resource === "twl") && built.blankRefs.length > 0) {
-      await this.recordBlankSkipAlert(book, resource, built.blankRefs);
-      const reason = `blank_field_guard:${built.blankRefs.length}`;
-      await this.recordSnapshot(book, resource, null, null, built.rowCount, reason);
-      return {
-        book,
-        resource,
-        rowCount: built.rowCount,
-        bytes: built.content.length,
-        r2Key,
-        branch: null,
-        dcsCommitSha: null,
-        dcsChanged: false,
-        dcsSkippedReason: reason,
-        prNumber: null,
-        prReason: null,
-      };
-    }
+    // There is deliberately NO blank required-field HOLD gate here any more.
+    //
+    // The `blank_field_guard` gate this replaces held an entire book+resource
+    // whenever one row had a blank tn note / tq question-response / twl
+    // OrigWords-TWLink, on the stated grounds that "DCS's whole-repo validator
+    // rejects blank rows, so this render can't merge". That was asserted in five
+    // places and never measured, and it is false. In DCS's live validators, all
+    // five blank-field checks are raised at severity="warning":
+    // `validate_tn_files.py` "Note column cannot be blank", `validate_tq_files.py`
+    // Question/Response, `validate_twl_files.py` OrigWords/TWLink. All three
+    // share an ErrorCollector whose `has_failures()` reads "Only hard errors
+    // decide the exit code. Warnings are advisory: they are printed and
+    // annotated, but must not stop a book from merging", and `emit_results`
+    // returns `1 if failed else 0`. `merge-be-pr.yaml` then merges on
+    // `workflow_run.conclusion == 'success'`, which follows that exit code.
+    // Confirming it end to end: en_tn master carries 19 blank-Note rows right
+    // now (2CH 5, ECC 8, JER 6) and its push validation is green.
+    //
+    // So the gate was blocking every other edit in JER/ECC/2CH from reaching
+    // Door43 indefinitely to avoid a rejection that does not happen. A blank row
+    // is still bad content, and it is still flagged in-app by the blank-field
+    // lint (lint.ts) plus the save-path guards (rows.ts 422 blank_note,
+    // NoteCard.flushPending) — those are the right place to catch it, before it
+    // is ever written. Withholding a whole book afterwards is not.
+    //
+    // No replacement alert is written — nothing is being withheld, so there is
+    // no unattended action to record; the in-app lint chip already carries it.
+    // The stale `export_blank:*` banner the old gate left behind is cleared at
+    // the top of exportOne, ahead of every early return.
 
     // Alignment-shrink backstop for the scripture (verse) resources. The TSV
     // shrink guard above protects row counts; this protects \zaln word
@@ -741,7 +772,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
   private async buildResource(
     book: string,
     resource: Resource,
-  ): Promise<{ content: string; rowCount: number; sortOrderUpdates: Array<{ id: string; sort_order: number }>; blankRefs: string[] }> {
+  ): Promise<{ content: string; rowCount: number; sortOrderUpdates: Array<{ id: string; sort_order: number }> }> {
     const db = this.env.DB;
     if (resource === "tn") {
       // trashed_at IS NULL excludes notes pending deletion. The nightly cron
@@ -755,7 +786,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
         )
         .bind(book)
         .all<TnRow>();
-      return { content: rs.results.length === 0 ? "" : buildTnTsv(rs.results), rowCount: rs.results.length, sortOrderUpdates: [], blankRefs: blankRequiredRefs("tn", rs.results) };
+      return { content: rs.results.length === 0 ? "" : buildTnTsv(rs.results), rowCount: rs.results.length, sortOrderUpdates: [] };
     }
     if (resource === "tq") {
       const rs = await db
@@ -765,7 +796,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
         )
         .bind(book)
         .all<TqRow>();
-      return { content: rs.results.length === 0 ? "" : buildTqTsv(rs.results), rowCount: rs.results.length, sortOrderUpdates: [], blankRefs: blankRequiredRefs("tq", rs.results) };
+      return { content: rs.results.length === 0 ? "" : buildTqTsv(rs.results), rowCount: rs.results.length, sortOrderUpdates: [] };
     }
     if (resource === "twl") {
       const rs = await db
@@ -783,7 +814,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
         .bind(book, "ULT")
         .all<VerseRow>();
       if (rs.results.length === 0) {
-        return { content: "", rowCount: 0, sortOrderUpdates: [], blankRefs: [] };
+        return { content: "", rowCount: 0, sortOrderUpdates: [] };
       }
       // Independent reads; object-literal properties evaluate in order, so
       // awaiting them inline would serialize two D1 round-trips per book.
@@ -803,7 +834,6 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
         content: result.tsv,
         rowCount: rs.results.length,
         sortOrderUpdates: result.sortOrderUpdates,
-        blankRefs: blankRequiredRefs("twl", rs.results),
       };
     }
     // ult / ust
@@ -815,7 +845,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       )
       .bind(book, bibleVersion)
       .all<VerseRow>();
-    if (rs.results.length === 0) return { content: "", rowCount: 0, sortOrderUpdates: [], blankRefs: [] };
+    if (rs.results.length === 0) return { content: "", rowCount: 0, sortOrderUpdates: [] };
     const headersRow = await db
       .prepare(`SELECT headers_json FROM book_usfm_meta WHERE book = ?1 AND bible_version = ?2`)
       .bind(book, bibleVersion)
@@ -833,7 +863,6 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       content: buildUsfm({ book, bibleVersion, headers, verses: rs.results }),
       rowCount: rs.results.length,
       sortOrderUpdates: [],
-      blankRefs: [],
     };
   }
 
@@ -1366,7 +1395,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
 
     // FIX 3: clear a stale "credited" banner from an earlier night. If night N
     // credited the shrink (unexplained === 0, ships without a human) but the
-    // export was then stopped further down (blank-field gate, USFM
+    // export was then stopped further down (the alignment-shrink backstop, USFM
     // validation, a failed DCS commit) so master still holds the rows, and
     // night N+1's attribution changes and the guard now blocks, an operator
     // would otherwise see two contradicting undismissed banners at once: an
@@ -1396,26 +1425,6 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     const message =
       `Benjamin — nightly export BLOCKED ${book} ${resource.toUpperCase()}: the render has ${renderedRows} rows ` +
       `but master has ${masterRows ?? "?"} (${detail}). ${signature} Refusing to shrink master. ${remedy}`;
-    await this.writeAlert(source, message, `${this.env.DCS_BASE_URL}/unfoldingWord`);
-  }
-
-  // Banner alert when the blank required-field gate blocks an export to avoid
-  // shipping a row DCS's validator will reject (empty tn note, tq question/
-  // response, twl OrigWords/TWLink). Same replace-undismissed shape as
-  // recordShrinkSkipAlert.
-  private async recordBlankSkipAlert(
-    book: string,
-    resource: Resource,
-    blankRefs: string[],
-  ): Promise<void> {
-    const source = `export_blank:${book}:${resource}`;
-    const shown = blankRefs.slice(0, 8).join(", ");
-    const more = blankRefs.length > 8 ? `, +${blankRefs.length - 8} more` : "";
-    const message =
-      `Benjamin — nightly export BLOCKED ${book} ${resource.toUpperCase()}: ${blankRefs.length} row(s) have a blank ` +
-      `required field (${shown}${more}). DCS's whole-repo validator rejects blank rows, so this render can't merge. ` +
-      `Open ${book} in the editor, use "issues to clean up" to jump to each row, then add the missing text or delete ` +
-      `the row and re-export.`;
     await this.writeAlert(source, message, `${this.env.DCS_BASE_URL}/unfoldingWord`);
   }
 

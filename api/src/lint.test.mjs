@@ -3,7 +3,7 @@
 
 import assert from "node:assert/strict";
 import usfm from "usfm-js";
-import { lintChapterOpeningMarkers, lintTnRows, lintTqRows, lintTwlRows, lintUsfmVerses, blankRequiredRefs } from "./lint.ts";
+import { lintChapterOpeningMarkers, lintTnRows, lintTqRows, lintTwlRows, lintUsfmVerses } from "./lint.ts";
 
 let passed = 0;
 function t(name, fn) {
@@ -310,15 +310,38 @@ t("corrupt intro content_json does not throw and still flags", () => {
   assert.equal(lintChapterOpeningMarkers(rows).length, 1);
 });
 
-t("blankRequiredRefs returns deduped refs per kind", () => {
-  // Two blank fields on the same tq row → one ref, not two.
-  assert.deepEqual(blankRequiredRefs("tq", [tq({ chapter: 2, verse: 5, question: "", response: "" })]), ["2:5"]);
-  // A clean row contributes nothing.
-  assert.deepEqual(blankRequiredRefs("twl", [twl({})]), []);
-  assert.deepEqual(
-    blankRequiredRefs("tn", [tn({ chapter: 1, verse: 1, note: "" }), tn({ chapter: 1, verse: 2, note: "ok" })]),
-    ["1:1"],
+// The export no longer HOLDs a book for a blank required field (DCS raises all
+// five at severity="warning" and merges anyway), so this in-app lint is the ONLY
+// thing that tells an editor the row is broken. Assert every kind still flags,
+// and that no message claims a validation failure that does not happen.
+t("blank required fields stay flagged in-app for every kind", () => {
+  const flagged = (issues, check) => issues.filter((x) => x.check === check);
+  assert.equal(flagged(lintTnRows([tn({ chapter: 1, verse: 1, note: "" })]), "Empty note").length, 1);
+  const tqIssues = lintTqRows([tq({ chapter: 2, verse: 5, question: "", response: "" })]);
+  assert.equal(flagged(tqIssues, "Empty question").length, 1);
+  assert.equal(flagged(tqIssues, "Empty response").length, 1);
+  const twlIssues = lintTwlRows([twl({ chapter: 3, verse: 7, orig_words: "", tw_link: "" })]);
+  assert.equal(flagged(twlIssues, "Empty OrigWords").length, 1);
+  assert.equal(flagged(twlIssues, "Empty TWLink").length, 1);
+  // Every blank-field message must be actionable and must NOT assert that DCS
+  // rejects/blocks the row — the wrong claim the removed export gate was built
+  // on. Match the CLAIM, not one phrasing of it, and only over the blank-field
+  // issues (a row can carry unrelated issues whose bucket is not "flag").
+  const BLANK_CHECKS = new Set(["Empty note", "Empty question", "Empty response", "Empty OrigWords", "Empty TWLink"]);
+  const blankIssues = [...tqIssues, ...twlIssues, ...lintTnRows([tn({ note: "" })])].filter((x) =>
+    BLANK_CHECKS.has(x.check),
   );
+  assert.equal(blankIssues.length, 5);
+  for (const i of blankIssues) {
+    assert.ok(
+      !/reject|fail\w* (DCS|whole-repo|validation)|can'?t merge|unmergeable|block\w* the merge/i.test(i.message),
+      `stale DCS-rejection claim in: ${i.message}`,
+    );
+    // Actionable: says what reaches Door43, and what the editor should do.
+    assert.ok(/Door43/.test(i.message), `no publish consequence stated in: ${i.message}`);
+    assert.ok(/delete the row/.test(i.message), `no remedy offered in: ${i.message}`);
+    assert.equal(i.bucket, "flag");
+  }
 });
 
 console.log(`\n${passed} lint tests passed`);
