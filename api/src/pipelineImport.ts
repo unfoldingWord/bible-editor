@@ -278,6 +278,22 @@ export async function importJobOutput(
   try {
     const stageResult = await stageJobOutput(env, job, outputs, heartbeat);
     const applyResult = await applyJobOutput(env, job, heartbeat);
+    // Lease lost MID-FLIGHT (heartbeat CAS failed): another poll legitimately
+    // re-claimed and may still be applying. Report it as claimLost so the caller
+    // does NOT finalize — writing output_json / state='done' here would mark the
+    // import complete while the new owner is still mid-apply, and would enqueue
+    // the follow-up chain early. The caller already handles claimLost exactly
+    // this way (pollPipelineJob), so this reuses that path rather than adding a
+    // second one. Note the work this pass DID do is already committed and
+    // per-row idempotent, so the owning poll resumes rather than duplicating.
+    if (heartbeat.lost) {
+      return {
+        ...stageResult,
+        applied: applyResult,
+        claimLost: true,
+        skipped: [...stageResult.skipped, "import lease lost mid-apply; a concurrent poll owns this import"],
+      };
+    }
     return { ...stageResult, applied: applyResult };
   } catch (err) {
     // Release the slot so the caller's one-retry path (pollPipelineJob holds
