@@ -459,9 +459,17 @@ export function describeShrinkRefusal(
       remedy: `Re-sync from master, verify the row count, then re-export.`,
     };
   }
-  if (typeof unexplained === "number" && lost != null) {
+  if (detail.includes("_unexplained_") && typeof unexplained === "number" && lost != null) {
     // IDs parsed and attribution ran: some (or all) of the loss traces to a
     // human deletion tombstone in D1, but `unexplained` residual remains.
+    //
+    // Gated on the DETAIL string, not just on `unexplained` being a number.
+    // Keying only on the context would hand this attribution wording to any
+    // future refusal kind that happens to carry counts, asserting a
+    // truncated-load signature nobody measured — the same "state a cause you
+    // didn't check" defect this whole function exists to remove. An
+    // unrecognized detail must reach the neutral fallback below even when the
+    // counts are present.
     const explainedNote =
       explained && explained > 0
         ? ` (${explained} of the ${lost} were human deletions in D1 and were credited)`

@@ -998,6 +998,38 @@ function utf8Base64(s) {
     !/ID column couldn't be parsed/.test(unrecognized.signature),
     `unrecognized detail: does NOT fall back to the master-parse-failure wording`,
   );
+
+  // An unrecognized detail that HAPPENS to carry attribution counts must still
+  // reach the neutral fallback. Keying the attribution branch on the context
+  // alone (rather than on the detail string) would hand a future refusal kind
+  // the "that's the truncated-load signature" wording for a signature nobody
+  // measured — the same invent-a-cause defect, one layer down.
+  const unrecognizedWithCounts = describeShrinkRefusal("some_future_refusal_kind", {
+    renderedRows: 402,
+    masterRows: 464,
+    explained: 62,
+    unexplained: 0,
+  });
+  assert(
+    /not recognized/.test(unrecognizedWithCounts.signature),
+    `unrecognized detail WITH counts: still gets the neutral fallback`,
+  );
+  assert(
+    !/truncated-load signature/.test(unrecognizedWithCounts.signature),
+    `unrecognized detail WITH counts: does NOT claim a truncated-load signature`,
+  );
+
+  // The genuine attribution refusal still gets the attribution wording.
+  const attributed = describeShrinkRefusal("shrink_62_of_464_unexplained_20", {
+    renderedRows: 402,
+    masterRows: 464,
+    explained: 42,
+    unexplained: 20,
+  });
+  assert(
+    /truncated-load signature/.test(attributed.signature) && /20 of the 62/.test(attributed.signature),
+    `attribution refusal: reports the unexplained/missing split`,
+  );
 }
 
 // --- usfmAlignmentShrinkRefused: ULT/UST verse alignment backstop ---
