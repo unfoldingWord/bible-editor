@@ -17,7 +17,7 @@ import {
   shouldTouchClaim,
   CLAIM_TOUCH_INTERVAL_SECONDS,
 } from "./pipelineImportClaim.ts";
-import { deleteUnkeptTns, maybeTouchClaim } from "./pipelineImport.ts";
+import { deleteUnkeptTns, importJobOutput, maybeTouchClaim } from "./pipelineImport.ts";
 
 function assert(cond, msg) {
   if (!cond) {
@@ -584,5 +584,71 @@ await (async () => {
     "binding integrity: union of bound pairs across all statements equals the input pairs exactly",
   );
 });
+
+// --- error-path release is CAS'd too: a pass that already lost the lease must
+//     NOT null out the new owner's claim when it later throws ---
+// Same class as the heartbeat bug: the heartbeat was made a compare-and-swap
+// lease, but the catch-path release in importJobOutput was still blind. A pass
+// whose lease was stolen and which then throws for any unrelated reason would
+// clear the NEW owner's claim mid-apply, letting a third poller claim and
+// interleave. Driven end-to-end through importJobOutput by making the first
+// staging read throw.
+await (async () => {
+  const calls = [];
+  const row = { import_claimed_at: null };
+  const env = {
+    DB: {
+      prepare(sql) {
+        return {
+          bind(...args) {
+            calls.push({ sql, args });
+            const fail = () => {
+              // stageJobOutput's first read — throw so we land in the catch.
+              if (/SELECT staged_at/.test(sql)) throw new Error("simulated staging failure");
+            };
+            return {
+              async first() {
+                fail();
+                return null;
+              },
+              async all() {
+                fail();
+                return { results: [] };
+              },
+              async run() {
+                fail();
+                // The initial claim: CAS on the staleness window, not on a value.
+                if (/import_claimed_at\s*=\s*unixepoch\(\)/.test(sql) && /IS NULL OR/.test(sql)) {
+                  row.import_claimed_at = 5000;
+                  return { meta: { changes: 1 }, results: [{ import_claimed_at: 5000 }] };
+                }
+                return { meta: { changes: 0 }, results: [] };
+              },
+            };
+          },
+        };
+      },
+    },
+  };
+
+  let threw = false;
+  try {
+    await importJobOutput(env, { jobId: "job-release", book: "DAN", startChapter: 11, endChapter: 11, userId: 2 }, []);
+  } catch {
+    threw = true;
+  }
+  assert(threw, "error-path release: the underlying failure still propagates to the caller");
+
+  const release = calls.find((c) => /import_claimed_at\s*=\s*NULL/.test(c.sql));
+  assert(release !== undefined, "error-path release: a release UPDATE is issued on failure");
+  assert(
+    /AND import_claimed_at\s*=\s*\?2/.test(release.sql),
+    "error-path release: the release is CAS'd on the owned claim, not a blind job_id-only NULL",
+  );
+  assert(
+    release.args[0] === "job-release" && release.args[1] === 5000,
+    "error-path release: binds the job id AND the exact claim value this pass owned (from RETURNING)",
+  );
+})();
 
 console.log("pipelineImport (claim guard): all assertions passed");

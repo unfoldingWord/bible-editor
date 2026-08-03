@@ -284,10 +284,19 @@ export async function importJobOutput(
     // state at 'running' on the first failure) can re-import. Staging keys its
     // own idempotency on staged_at and apply is per-row idempotent, so the
     // retry resumes rather than duplicating.
+    //
+    // CAS'd on the claim we own, for the same reason the heartbeat is: if this
+    // pass already lost the lease to a legitimate new owner (heartbeat.lost) and
+    // THEN threw for any unrelated reason, a blind `SET import_claimed_at = NULL
+    // WHERE job_id = ?1` would clear the NEW owner's claim mid-apply, letting a
+    // third poller claim and interleave — the exact corruption the single-applier
+    // guard exists to prevent. Matching on the owned value means a stolen lease
+    // leaves the release a no-op (0 changes) and the new owner keeps its claim.
     await env.DB.prepare(
-      `UPDATE pipeline_jobs SET import_claimed_at = NULL WHERE job_id = ?1`,
+      `UPDATE pipeline_jobs SET import_claimed_at = NULL
+        WHERE job_id = ?1 AND import_claimed_at = ?2`,
     )
-      .bind(job.jobId)
+      .bind(job.jobId, heartbeat.ownedClaimedAt)
       .run();
     throw err;
   }
