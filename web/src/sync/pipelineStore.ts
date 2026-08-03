@@ -157,8 +157,14 @@ function mergeAndNotify(jobId: string, next: PipelineJob) {
   jobs.set(jobId, next);
   let firedCompletion = false;
   // Toast on transitions to done/failed only. 'cancelled' is terminal too but
-  // user-initiated, so it gets no completion toast.
-  if (prev && prev.state !== next.state && (next.state === "done" || next.state === "failed")) {
+  // user-initiated, so it gets no completion toast. A force-stopped job is
+  // the same story wearing 'failed': the user just did this themselves via
+  // the force-stop dialog, so it shouldn't surface as a red error toast either.
+  if (
+    prev &&
+    prev.state !== next.state &&
+    (next.state === "done" || (next.state === "failed" && next.error_kind !== "force_stopped"))
+  ) {
     emitCompletion(next, prev.state);
     firedCompletion = true;
   }

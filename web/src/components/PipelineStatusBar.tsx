@@ -718,11 +718,12 @@ export function PipelineStatusBar({ toast, onToastClear }: Props = {}) {
                 <Typography variant="body2" component="div" sx={{ mb: 1 }}>
                   This will:
                   <ul style={{ margin: "4px 0 0 0", paddingLeft: 20 }}>
-                    <li>stop the run immediately</li>
-                    <li>discard whatever AI work is in flight — it cannot be recovered</li>
+                    <li>stop tracking this run here</li>
                     <li>unlock the chapter for editing again</li>
                     <li>let the next queued run start right away</li>
                   </ul>
+                  The AI may keep working on its side for a while after this — don't assume
+                  it stops right away.
                 </Typography>
                 <Typography variant="body2" sx={{ mb: 1 }}>
                   Type the phrase below exactly to confirm:
@@ -765,7 +766,7 @@ export function PipelineStatusBar({ toast, onToastClear }: Props = {}) {
                 onClick={() => void confirmForceFail()}
                 color="error"
                 variant="contained"
-                disabled={forceFailing || forceFailText !== forceStopPhrase(forceFailTarget)}
+                disabled={forceFailing || forceFailText.trim() !== forceStopPhrase(forceFailTarget)}
                 startIcon={forceFailing ? <CircularProgress size={14} color="inherit" /> : undefined}
               >
                 Force stop

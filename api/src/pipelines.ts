@@ -788,7 +788,10 @@ async function attemptOutageResume(
 // by both the GET handler and the scheduled cron poller. Returns the raw
 // upstream response so callers that need to pass it through can do so;
 // scheduled callers discard.
-async function pollPipelineJob(
+// Exported so pipelinesForceFail.test.mjs can drive FIX 1(b) directly (the
+// poll-side guard against clobbering a force-stopped job) without spinning up
+// the Hono route — same rationale as forceFailJob being split out below.
+export async function pollPipelineJob(
   env: Env,
   job: PolledJob,
 ): Promise<
@@ -953,6 +956,11 @@ async function pollPipelineJob(
         ? `paused for outage and not resumable: ${unresumableReason}`
         : (data.current?.error ?? null);
 
+  // Defense in depth against a deliberate force-stop (see forceFailJob):
+  // even though the GET handler already short-circuits force-stopped jobs
+  // before calling this function, no caller of pollPipelineJob should be
+  // able to clobber that terminal state back to 'running' — the bot can
+  // still be reporting 'running' honestly for a while after force-fail.
   await env.DB.prepare(
     `UPDATE pipeline_jobs SET
        state = ?2,
@@ -964,7 +972,8 @@ async function pollPipelineJob(
        raw_status_json = ?8,
        updated_at = unixepoch(),
        last_polled_at = unixepoch()
-     WHERE job_id = ?1`,
+     WHERE job_id = ?1
+       AND NOT (state = 'failed' AND error_kind = 'force_stopped')`,
   )
     .bind(
       job.job_id,
@@ -1486,7 +1495,21 @@ pipelines.get("/:jobId", requireEditor, async (c) => {
   // clobber the terminal state back to 'running' on every poll — an open tab
   // polling this job_id by id resurrects a just-cancelled job each tick. Return
   // the stored state so the client sees terminal and stops polling.
-  if (owned.state === "cancelled" || owned.state === "done") {
+  //
+  // A force-stopped job (state='failed', error_kind='force_stopped') joins
+  // this short-circuit too: it's the one 'failed' outcome that can CONTRADICT
+  // a bot that is still honestly reporting 'running' (its stop endpoint is a
+  // no-op today — see forceFailJob's comment), so falling through to
+  // pollPipelineJob would resurrect it. Every other 'failed' producer
+  // (interrupted, import_failed) is self-stable on re-poll because the bot
+  // reports the same terminal thing back, so this check must stay narrow to
+  // force_stopped and not swallow ordinarily-failed jobs, which may
+  // legitimately be re-polled/retried.
+  if (
+    owned.state === "cancelled" ||
+    owned.state === "done" ||
+    (owned.state === "failed" && owned.error_kind === "force_stopped")
+  ) {
     return c.json({
       jobId: owned.job_id,
       pipelineType: owned.pipeline_type,
@@ -1953,7 +1976,10 @@ export async function forceFailJob(
   // simply 404ing) is swallowed and folded into the error_message as an
   // audit trail, never thrown — a translator watching a wedged, locked
   // chapter must be able to get unstuck locally even if the bot can't be
-  // reached at all.
+  // reached at all. Time-boxed to 5s: a hung/black-holed bot is exactly the
+  // "wedged" case this feature exists for, and an un-timeboxed fetch here
+  // would stall this whole request (and thus the force-stop itself) until
+  // the Workers wall-clock limit.
   let upstreamOutcome = "upstream stop: not attempted (no upstream_job_id)";
   if (owned.upstream_job_id && env.BT_API_TOKEN) {
     try {
@@ -1962,13 +1988,17 @@ export async function forceFailJob(
         {
           method: "POST",
           headers: { Authorization: `Bearer ${env.BT_API_TOKEN}` },
+          signal: AbortSignal.timeout(5000),
         },
       );
       upstreamOutcome = res.ok
         ? "upstream stop: ok"
         : `upstream stop: ${res.status}`;
-    } catch {
-      upstreamOutcome = "upstream stop: unreachable";
+    } catch (err) {
+      upstreamOutcome =
+        (err as { name?: string } | undefined)?.name === "TimeoutError"
+          ? "upstream stop: timed out"
+          : "upstream stop: unreachable";
     }
   } else if (owned.upstream_job_id) {
     upstreamOutcome = "upstream stop: not attempted (pipeline API disabled)";
@@ -1992,9 +2022,9 @@ export async function forceFailJob(
             error_message = ?2,
             notified_user_at = unixepoch(),
             updated_at = unixepoch()
-      WHERE job_id = ?1 AND state IN ('running', 'dispatching')`,
+      WHERE job_id = ?1 AND state IN (?3, ?4)`,
   )
-    .bind(jobId, errorMessage)
+    .bind(jobId, errorMessage, ...FORCE_FAILABLE)
     .run();
   if ((res.meta?.changes ?? 0) === 0) {
     const now = await env.DB.prepare(`SELECT state FROM pipeline_jobs WHERE job_id = ?1`)
