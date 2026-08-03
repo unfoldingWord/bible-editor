@@ -478,7 +478,7 @@ async function applyJobOutput(
   // TN delete phase: only fires when this job produced TN proposals AND
   // there are unkept TNs in scope. Idempotent — re-running finds none left.
   if (tnProposals.length > 0) {
-    result.tnDeleted = await deleteUnkeptTns(env, job, userId, tnProposals);
+    result.tnDeleted = await deleteUnkeptTns(env, job, userId, tnProposals, heartbeat);
     // A delete mutates whatever chapters this job re-proposed TN for; those are
     // exactly the chapters carried by tnProposals.
     if (result.tnDeleted > 0) for (const p of tnProposals) affected.add(p.chapter);
@@ -638,6 +638,7 @@ async function deleteUnkeptTns(
   job: ImportContext,
   userId: number,
   tnProposals: PendingImportRow[],
+  heartbeat: ClaimHeartbeat,
 ): Promise<number> {
   // Identify which rows we're about to delete so the audit row can carry
   // the right pre-deletion version. A bulk UPDATE would lose that fidelity.
@@ -696,7 +697,11 @@ async function deleteUnkeptTns(
   const pairs = tnSweepScope(tnProposals);
   if (pairs.length === 0) return 0;
 
-  const CHUNK_PAIRS = 50; // keep each SELECT's bound-parameter count small
+  // D1 caps bound parameters at 100 per statement. This query already binds 4
+  // fixed params (book, startChapter, endChapter, AI_SOURCE) before the pair
+  // params, so the chunk size must leave room: 4 + 2*CHUNK_PAIRS <= 100.
+  // 40 pairs -> 84 total, comfortable headroom below the cap.
+  const CHUNK_PAIRS = 40;
   const list: { id: string; version: number }[] = [];
   for (let i = 0; i < pairs.length; i += CHUNK_PAIRS) {
     const slice = pairs.slice(i, i + CHUNK_PAIRS);
@@ -724,6 +729,7 @@ async function deleteUnkeptTns(
       .bind(job.book, job.startChapter, job.endChapter, AI_SOURCE, ...pairParams)
       .all<{ id: string; version: number }>();
     list.push(...(rs.results ?? []));
+    await maybeTouchClaim(env, job.jobId, heartbeat);
   }
   if (list.length === 0) return 0;
 
@@ -780,6 +786,7 @@ async function deleteUnkeptTns(
     for (let j = 0; j < res.length; j += 2) {
       deleted += res[j]?.meta?.changes ?? 0;
     }
+    await maybeTouchClaim(env, job.jobId, heartbeat);
   }
   return deleted;
 }
