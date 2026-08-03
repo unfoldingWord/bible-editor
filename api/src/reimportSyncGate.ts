@@ -36,10 +36,24 @@
 // withhold is safe (worst case, a delayed export retry); stamp is not (it can
 // certify stale data as current). See reimportSyncGate.test.mjs.
 //
+// Incompleteness reaches this gate by two distinct routes, and both must
+// withhold:
+//   1. Raw absence — the direct `undefined` check above/below, for a counts
+//      object read straight off a single Workflow step result.
+//   2. Aggregated-and-coerced — `perResource[resource]` is the running total
+//      across every chunk this run (see mergePerResource/addCounts in
+//      bookReimport.ts). Once a legacy/replayed chunk missing these fields is
+//      folded in via `?? 0`, the absence itself is gone from the aggregate —
+//      it reads as a present zero. addCounts records that loss separately on
+//      `counts_incomplete`, which is checked here so the aggregate can still
+//      withhold even though its own chapters_locked/prune_locked fields are
+//      individually present and zero.
+//
 // Deliberately NOT gated on `skipped_locked`: that counter is overloaded —
 // besides the chapter-lock skip, it is ALSO incremented by the row-level prune
 // path, a different and much less severe situation that must NOT withhold the
-// watermark on its own. Only `chapters_locked` and `prune_locked` gate this
+// watermark on its own. Only `chapters_locked` and `prune_locked` (plus the
+// `counts_incomplete` taint they can leave behind after aggregation) gate this
 // decision.
 //
 // Pure (no D1) so it's regression-testable without a Workflow context — see
@@ -47,7 +61,9 @@
 export function shouldRecordResourceSync(counts: {
   chapters_locked?: number;
   prune_locked?: number;
+  counts_incomplete?: boolean;
 }): boolean {
   if (counts.chapters_locked === undefined || counts.prune_locked === undefined) return false;
+  if (counts.counts_incomplete === true) return false;
   return counts.chapters_locked === 0 && counts.prune_locked === 0;
 }

@@ -47,6 +47,7 @@ function counts(overrides = {}) {
     twl_reordered: 0,
     dcs_404: 0,
     errors: [],
+    counts_incomplete: false,
     ...overrides,
   };
 }
@@ -128,6 +129,26 @@ eq(
   shouldRecordResourceSync({ prune_locked: 0 }),
   false,
   "counts object missing chapters_locked only → withhold (fail-safe)",
+);
+
+// FINDING 2 regression: an AGGREGATE counts object (perResource[resource]
+// after addCounts folded a legacy/replayed chunk in) can have
+// chapters_locked/prune_locked PRESENT and zero — the `?? 0` coercion in
+// addCounts erases the absence — while addCounts's separate
+// `counts_incomplete` flag records that the aggregate is missing evidence.
+// Without checking that flag here, this case stamps; it must withhold.
+eq(
+  shouldRecordResourceSync(counts({ chapters_locked: 0, prune_locked: 0, counts_incomplete: true })),
+  false,
+  "counts_incomplete true, both counters present and zero → withhold (Finding 2 regression)",
+);
+
+// The flag must not block the ordinary path when nothing is actually
+// incomplete.
+eq(
+  shouldRecordResourceSync(counts({ chapters_locked: 0, prune_locked: 0, counts_incomplete: false })),
+  true,
+  "counts_incomplete false, both zero → stamp",
 );
 
 if (failed > 0) {

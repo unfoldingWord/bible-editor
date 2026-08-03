@@ -142,6 +142,16 @@ export interface ReimportCounts {
   twl_reordered: number;
   dcs_404: number;
   errors: string[];
+  // Set when this object (or an object folded into it via addCounts) was
+  // missing `chapters_locked`/`prune_locked` — the legacy/malformed-object
+  // case described on shouldRecordResourceSync. addCounts's `?? 0` numeric
+  // coercion keeps the running totals sane for logging, but it also erases
+  // the "field was absent" signal the gate needs — a replayed pre-fix chunk
+  // result would otherwise launder into a PRESENT zero at the aggregate
+  // level and stamp the watermark for data we have no evidence is current.
+  // This flag survives that coercion so shouldRecordResourceSync can still
+  // withhold on the aggregate, not just on a raw, un-aggregated counts object.
+  counts_incomplete?: boolean;
 }
 
 export interface ReimportResult {
@@ -170,6 +180,7 @@ function zeroCounts(): ReimportCounts {
     twl_reordered: 0,
     dcs_404: 0,
     errors: [],
+    counts_incomplete: false,
   };
 }
 
@@ -185,10 +196,19 @@ function addCounts(into: ReimportCounts, from: ReimportCounts): void {
   // verbatim on resume, so an in-flight instance can hand addCounts an object
   // with `chapters_locked`/`prune_locked` simply absent (not 0). Without the
   // coercion, `into.x += undefined` poisons the running total to NaN for the
-  // rest of this merge chain. shouldRecordResourceSync treats a legacy/
-  // malformed object as fail-safe (withhold) regardless — see its comment —
-  // so this coercion is about keeping the aggregate counters sane for
-  // logging, not about the gate decision itself.
+  // rest of this merge chain. That said, the coercion itself launders "field
+  // absent" into "field present and zero" for the AGGREGATE object — exactly
+  // the "no-evidence into a green light" mistake shouldRecordResourceSync's
+  // own comment warns about, one layer up. A raw, un-aggregated counts object
+  // still shows the absence directly (shouldRecordResourceSync's undefined
+  // check catches that route), but once addCounts folds a legacy/replayed
+  // chunk into `into`, the absence is gone and the gate would see a present
+  // zero and stamp. So the incompleteness is recorded separately, on
+  // `counts_incomplete`, which survives the coercion below and is checked by
+  // the gate in addition to its direct-absence check.
+  const incomplete =
+    from.chapters_locked === undefined || from.prune_locked === undefined;
+  into.counts_incomplete = Boolean(into.counts_incomplete || from.counts_incomplete || incomplete);
   into.chapters_locked += from.chapters_locked ?? 0;
   into.prune_locked += from.prune_locked ?? 0;
   into.skipped_noop += from.skipped_noop;
@@ -2152,7 +2172,19 @@ export async function runChunkedReimport(
     let recorded = 0;
     const withheld: string[] = [];
     for (const e of changed) {
-      if (!e.masterSha) continue;
+      // FINDING 1: consult the gate BEFORE the masterSha check, not after. A
+      // resource can be staged `changed: true` with `masterSha: null`
+      // (planAndStageBookResources: fetchText() succeeded but fileCommitSha()
+      // returned null) even when work for it was skipped this run for a held
+      // chapter lock. The old order did `if (!e.masterSha) continue;` first,
+      // so that case fell through this loop entirely — no stamp (fine), but
+      // also no withheld sentinel written. For a (book, resource) with no
+      // existing watermark row, checkMasterFreshness then returns
+      // `{ ok: true, detail: "no_watermark" }` and the export proceeds,
+      // pushing the stale locked-chapter data over master. An unknown
+      // masterSha must never be allowed to skip past the withholding — only
+      // a resource that both PASSES the gate and has a real masterSha may be
+      // recorded as synced.
       if (!shouldRecordResourceSync(perResource[e.resource])) {
         withheld.push(e.resource);
         // FIX B: a book whose (book, resource) has NO existing watermark row
@@ -2166,6 +2198,7 @@ export async function runChunkedReimport(
         await recordWithheldSyncIfAbsent(env, book, e.resource);
         continue;
       }
+      if (!e.masterSha) continue;
       await recordResourceSync(env, book, e.resource, e.masterSha, "reimport");
       recorded++;
     }
