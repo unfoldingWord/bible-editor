@@ -24,7 +24,11 @@ import { canonizeAlignmentSource } from "./canonizeHebrew";
 import { NT_BOOKS } from "./dcsSources";
 import { newRowId, isValidRowId } from "./rowId";
 import { tnContentKey } from "./tnDedup";
-import { IMPORT_CLAIM_STALE_SECONDS } from "./pipelineImportClaim";
+import {
+  IMPORT_CLAIM_STALE_SECONDS,
+  shouldTouchClaim,
+  tnSweepScope,
+} from "./pipelineImportClaim";
 
 interface OutputEntry {
   type?: string;
@@ -247,9 +251,15 @@ export async function importJobOutput(
       claimLost: true,
     };
   }
+  // Heartbeat state shared across staging + apply so one long apply pass
+  // (DAN 11 ran ~12 minutes) keeps its claim fresh and is never re-claimed by
+  // a concurrent poller mid-flight. lastTouchedAt starts at the claim UPDATE
+  // above (this instant), so the first heartbeat fires ~CLAIM_TOUCH_INTERVAL_
+  // SECONDS later rather than immediately.
+  const heartbeat: ClaimHeartbeat = { lastTouchedAt: Math.floor(Date.now() / 1000) };
   try {
-    const stageResult = await stageJobOutput(env, job, outputs);
-    const applyResult = await applyJobOutput(env, job);
+    const stageResult = await stageJobOutput(env, job, outputs, heartbeat);
+    const applyResult = await applyJobOutput(env, job, heartbeat);
     return { ...stageResult, applied: applyResult };
   } catch (err) {
     // Release the slot so the caller's one-retry path (pollPipelineJob holds
@@ -265,10 +275,42 @@ export async function importJobOutput(
   }
 }
 
+// Mutable heartbeat clock threaded through staging + apply. Both phases of one
+// apply pass share it so the pass touches the claim at most once per
+// CLAIM_TOUCH_INTERVAL_SECONDS combined, not once per phase.
+interface ClaimHeartbeat {
+  lastTouchedAt: number;
+}
+
+// Re-stamp pipeline_jobs.import_claimed_at unconditionally — this call already
+// owns the claim (it won the CAS in importJobOutput), so this is a plain
+// keep-alive, not another compare-and-swap. Deliberately has no effect on
+// IMPORT_CLAIM_STALE_SECONDS: if the worker dies, no further heartbeat fires,
+// and the claim goes stale on schedule for crash recovery. See
+// pipelineImportClaim.ts.
+async function touchImportClaim(env: Env, jobId: string): Promise<void> {
+  await env.DB.prepare(
+    `UPDATE pipeline_jobs SET import_claimed_at = unixepoch() WHERE job_id = ?1`,
+  )
+    .bind(jobId)
+    .run();
+}
+
+// Rate-limited wrapper: only issues the D1 write when shouldTouchClaim says
+// enough time has passed since the last touch, so a chunked loop costs at most
+// one extra write per CLAIM_TOUCH_INTERVAL_SECONDS, not one per chunk.
+async function maybeTouchClaim(env: Env, jobId: string, hb: ClaimHeartbeat): Promise<void> {
+  const now = Math.floor(Date.now() / 1000);
+  if (!shouldTouchClaim(hb.lastTouchedAt, now)) return;
+  await touchImportClaim(env, jobId);
+  hb.lastTouchedAt = now;
+}
+
 async function stageJobOutput(
   env: Env,
   job: ImportContext,
   outputs: OutputEntry[],
+  heartbeat: ClaimHeartbeat,
 ): Promise<ImportResult> {
   // Idempotency guard: staged_at is written ONLY after the final chunk below
   // commits, so it — not the mere existence of a pending_imports row — is the
@@ -334,6 +376,7 @@ async function stageJobOutput(
     );
     inserted += chunk.length;
     for (const s of chunk) byKind[s.kind] += 1;
+    await maybeTouchClaim(env, job.jobId, heartbeat);
   }
 
   // Mark staging complete only after the last chunk committed (also covers the
@@ -384,7 +427,11 @@ const AI_SOURCE = "ai_pipeline";
 // master; preserving it keeps D1 and master ids in lockstep. Only a malformed id
 // (the occasional incomplete emit) is replaced with a freshly minted one below.
 
-async function applyJobOutput(env: Env, job: ImportContext): Promise<ApplyResult> {
+async function applyJobOutput(
+  env: Env,
+  job: ImportContext,
+  heartbeat: ClaimHeartbeat,
+): Promise<ApplyResult> {
   // Look up the pipeline-starter's user id — every audit and updated_by
   // write is attributed to them, matching the contract that says the run
   // was triggered on their behalf.
@@ -431,7 +478,7 @@ async function applyJobOutput(env: Env, job: ImportContext): Promise<ApplyResult
   // TN delete phase: only fires when this job produced TN proposals AND
   // there are unkept TNs in scope. Idempotent — re-running finds none left.
   if (tnProposals.length > 0) {
-    result.tnDeleted = await deleteUnkeptTns(env, job, userId);
+    result.tnDeleted = await deleteUnkeptTns(env, job, userId, tnProposals);
     // A delete mutates whatever chapters this job re-proposed TN for; those are
     // exactly the chapters carried by tnProposals.
     if (result.tnDeleted > 0) for (const p of tnProposals) affected.add(p.chapter);
@@ -530,6 +577,7 @@ async function applyJobOutput(env: Env, job: ImportContext): Promise<ApplyResult
     await applyTnInsert(env, p, userId, sortOrder);
     affected.add(p.chapter);
     result.tnCreated += 1;
+    await maybeTouchClaim(env, job.jobId, heartbeat);
   }
 
   for (const p of tqProposals) {
@@ -540,6 +588,7 @@ async function applyJobOutput(env: Env, job: ImportContext): Promise<ApplyResult
     affected.add(p.chapter);
     if (action === "created") result.tqCreated += 1;
     else result.tqUpdated += 1;
+    await maybeTouchClaim(env, job.jobId, heartbeat);
   }
 
   // Preload the book's UHB/UGNT source words once (a single query — cap-safe)
@@ -555,6 +604,7 @@ async function applyJobOutput(env: Env, job: ImportContext): Promise<ApplyResult
     await applyVerseUpdate(env, p, userId, uhbWordsByVerse);
     affected.add(p.chapter);
     result.verseUpdated += 1;
+    await maybeTouchClaim(env, job.jobId, heartbeat);
   }
 
   result.affectedChapters = [...affected].sort((a, b) => a - b);
@@ -587,6 +637,7 @@ async function deleteUnkeptTns(
   env: Env,
   job: ImportContext,
   userId: number,
+  tnProposals: PendingImportRow[],
 ): Promise<number> {
   // Identify which rows we're about to delete so the audit row can carry
   // the right pre-deletion version. A bulk UPDATE would lose that fidelity.
@@ -617,42 +668,63 @@ async function deleteUnkeptTns(
   // trashed) suppresses the AI's re-proposal of it, so it stays trashed.
   // Sweeping it instead would delete it and let the re-insert RESURRECT it
   // un-trashed against the user's intent.
-  // Scope the sweep to the (chapter, verse) pairs this job actually produced
-  // proposals for (`pending_imports` for the job). The chapter-wide sweep
-  // assumed the result covers every verse it requested; when it doesn't — a
-  // partial result, or a concurrent apply that already consumed some proposals
-  // — deleting across the whole chapter wipes notes for verses the new run
-  // never re-supplies. Bounding the delete to supplied verses means a verse
-  // missing from the result keeps its existing notes (mildly stale) instead of
-  // being emptied. Match on BOTH chapter and verse: a job may span multiple
-  // chapters (endChapter > startChapter is a valid range), and scoping by verse
-  // number alone would let a proposal for ch2:v1 make ch1:v1 eligible for
-  // deletion. Defense-in-depth alongside the single-applier claim in
-  // importJobOutput.
-  const targets = await env.DB.prepare(
-    `SELECT id, version FROM tn_rows t
-      WHERE book = ?1 AND chapter BETWEEN ?2 AND ?3
-        AND deleted_at IS NULL AND trashed_at IS NULL
-        AND preserve = 0 AND hint = 0
-        AND EXISTS (
-          SELECT 1 FROM pending_imports pi
-            WHERE pi.job_id = ?5 AND pi.kind = 'tn'
-              AND pi.chapter = t.chapter AND pi.verse = t.verse
-        )
-        AND (
-          updated_by IS NULL
-          OR (
-            SELECT source FROM edit_log
-              WHERE kind = 'tn' AND row_key = t.id
-                AND (book = t.book OR book IS NULL)
-                AND action IN ('create', 'update')
-              ORDER BY id DESC LIMIT 1
-          ) = ?4
-        )`,
-  )
-    .bind(job.book, job.startChapter, job.endChapter, AI_SOURCE, job.jobId)
-    .all<{ id: string; version: number }>();
-  const list = targets.results ?? [];
+  // Scope the sweep to the (chapter, verse) pairs THIS PASS is actually about
+  // to apply — the unresolved tnProposals it was just handed — NOT every verse
+  // the job has ever produced a proposal for. A resumed apply's `pending_imports`
+  // SELECT (in applyJobOutput) is already filtered to accepted_at IS NULL AND
+  // rejected_at IS NULL, i.e. only what's left to apply; scoping the sweep to
+  // the job-wide EXISTS-against-pending_imports (any row ever staged for this
+  // job, resolved or not) let a resumed pass's sweep re-cover verses the FIRST
+  // pass already applied and resolved, deleting that pass's just-inserted
+  // notes. DAN 11 tn, en_tn, 2026-08-03: 160 proposals; the first apply pass
+  // inserted rows across the full verse range and died mid-run before
+  // resolving every proposal; the resumed pass's job-wide sweep matched every
+  // verse the job ever proposed for, deleted 121 of the first pass's
+  // already-applied notes, and only re-inserted the 39 still-unresolved
+  // proposals — the chapter went from 131 live notes to 39, with verses 1-31
+  // emptied entirely. Scoping to tnSweepScope(tnProposals) instead means a
+  // verse this pass isn't touching is left alone, whatever a PRIOR pass did to
+  // it. Match on BOTH chapter and verse: a job may span multiple chapters
+  // (endChapter > startChapter is a valid range), and scoping by verse number
+  // alone would let a proposal for ch2:v1 make ch1:v1 eligible for deletion.
+  // Defense-in-depth alongside the single-applier claim in importJobOutput
+  // (Fix 2 in this same PR) — that claim now also gets heartbeated so a live
+  // apply pass is never re-claimed mid-flight in the first place; this sweep
+  // scoping is what limits the blast radius if that ever regresses. See the
+  // DAN 11 regression test for tnSweepScope in pipelineImport.test.mjs — do
+  // NOT widen this back to a job-wide scope.
+  const pairs = tnSweepScope(tnProposals);
+  if (pairs.length === 0) return 0;
+
+  const CHUNK_PAIRS = 50; // keep each SELECT's bound-parameter count small
+  const list: { id: string; version: number }[] = [];
+  for (let i = 0; i < pairs.length; i += CHUNK_PAIRS) {
+    const slice = pairs.slice(i, i + CHUNK_PAIRS);
+    const pairClauses = slice
+      .map((_, idx) => `(t.chapter = ?${5 + idx * 2} AND t.verse = ?${6 + idx * 2})`)
+      .join(" OR ");
+    const pairParams = slice.flatMap((pair) => [pair.chapter, pair.verse]);
+    const rs = await env.DB.prepare(
+      `SELECT id, version FROM tn_rows t
+        WHERE book = ?1 AND chapter BETWEEN ?2 AND ?3
+          AND deleted_at IS NULL AND trashed_at IS NULL
+          AND preserve = 0 AND hint = 0
+          AND (${pairClauses})
+          AND (
+            updated_by IS NULL
+            OR (
+              SELECT source FROM edit_log
+                WHERE kind = 'tn' AND row_key = t.id
+                  AND (book = t.book OR book IS NULL)
+                  AND action IN ('create', 'update')
+                ORDER BY id DESC LIMIT 1
+            ) = ?4
+          )`,
+    )
+      .bind(job.book, job.startChapter, job.endChapter, AI_SOURCE, ...pairParams)
+      .all<{ id: string; version: number }>();
+    list.push(...(rs.results ?? []));
+  }
   if (list.length === 0) return 0;
 
   const now = Math.floor(Date.now() / 1000);

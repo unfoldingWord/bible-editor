@@ -10,7 +10,13 @@
 //
 // Not a test framework; a failed assert exits non-zero.
 
-import { mayClaimImport, IMPORT_CLAIM_STALE_SECONDS } from "./pipelineImportClaim.ts";
+import {
+  mayClaimImport,
+  IMPORT_CLAIM_STALE_SECONDS,
+  tnSweepScope,
+  shouldTouchClaim,
+  CLAIM_TOUCH_INTERVAL_SECONDS,
+} from "./pipelineImportClaim.ts";
 
 function assert(cond, msg) {
   if (!cond) {
@@ -57,11 +63,94 @@ assert(
   "released claim (NULL) → immediately reclaimable for the retry",
 );
 
-// --- The stale window must comfortably exceed a real apply (~1 min) so a
-//     still-running apply is never reclaimed out from under itself ---
+// --- The stale window is a lease bound for CRASH RECOVERY, not a promise that
+//     it exceeds any real apply. DAN 11's apply ran ~12 minutes — longer than
+//     IMPORT_CLAIM_STALE_SECONDS (600s) — so a long-but-alive apply is only
+//     protected because it heartbeats its claim (see shouldTouchClaim below),
+//     not because the window is bigger than any apply could be. ---
 assert(
-  IMPORT_CLAIM_STALE_SECONDS >= 300,
-  `stale window (${IMPORT_CLAIM_STALE_SECONDS}s) is well beyond a real apply`,
+  IMPORT_CLAIM_STALE_SECONDS > 0,
+  `stale window (${IMPORT_CLAIM_STALE_SECONDS}s) is a positive lease bound for crash recovery`,
 );
+
+// ── tnSweepScope: the DAN 11 regression ──────────────────────────────────
+// A resumed apply only re-selects UNRESOLVED proposals. Scoping the TN delete
+// sweep to those proposals' (chapter, verse) pairs (rather than to every verse
+// the job ever proposed for) means a verse the FIRST pass already applied and
+// resolved must NOT reappear in the sweep scope for the resumed pass.
+{
+  // DAN 11 tn, en_tn, 2026-08-03: first pass proposed/applied verses 1-31 (and
+  // more), died before resolving verses 32-45; the resumed pass's unresolved
+  // proposals are ONLY verses 32-45. The regression: a job-wide scope would
+  // include 1-31 and delete the first pass's already-applied notes.
+  const resumedUnresolved = [];
+  for (let v = 32; v <= 45; v++) resumedUnresolved.push({ chapter: 11, verse: v });
+  const scope = tnSweepScope(resumedUnresolved);
+  const verses = new Set(scope.map((p) => `${p.chapter}/${p.verse}`));
+  assert(
+    scope.length === 14,
+    "DAN 11 regression: resumed-pass scope has exactly the 14 unresolved verses",
+  );
+  for (let v = 1; v <= 31; v++) {
+    assert(
+      !verses.has(`11/${v}`),
+      `DAN 11 regression: ch11 v${v} (first pass's already-applied verse) absent from resumed scope`,
+    );
+  }
+  assert(verses.has("11/32") && verses.has("11/45"), "DAN 11 regression: unresolved verses present");
+}
+
+// --- dedupes multiple proposals sharing one verse ---
+assert(
+  tnSweepScope([
+    { chapter: 3, verse: 5 },
+    { chapter: 3, verse: 5 },
+    { chapter: 3, verse: 5 },
+  ]).length === 1,
+  "tnSweepScope dedupes multiple proposals for the same verse",
+);
+
+// --- keeps (chapter, verse) pairs distinct across chapters ---
+{
+  const scope = tnSweepScope([{ chapter: 2, verse: 1 }]);
+  assert(
+    scope.length === 1 && scope[0].chapter === 2 && scope[0].verse === 1,
+    "tnSweepScope: a proposal for ch2 v1 does not also put ch1 v1 in scope",
+  );
+}
+
+// --- empty input → empty scope ---
+assert(tnSweepScope([]).length === 0, "tnSweepScope([]) → empty scope");
+
+// ── shouldTouchClaim: heartbeat rate limit ──────────────────────────────
+assert(
+  !shouldTouchClaim(NOW, NOW + CLAIM_TOUCH_INTERVAL_SECONDS - 1),
+  "shouldTouchClaim: below the interval → false",
+);
+assert(
+  shouldTouchClaim(NOW, NOW + CLAIM_TOUCH_INTERVAL_SECONDS),
+  "shouldTouchClaim: exactly at the interval → true",
+);
+assert(
+  shouldTouchClaim(NOW, NOW + CLAIM_TOUCH_INTERVAL_SECONDS + 1),
+  "shouldTouchClaim: after the interval → true",
+);
+{
+  // A long apply (DAN 11: ~12 minutes) gets its claim refreshed repeatedly,
+  // not just once, as long as the caller re-checks each time it last touched.
+  let lastTouchedAt = NOW;
+  let touches = 0;
+  for (let elapsed = 0; elapsed <= 12 * 60; elapsed += 5) {
+    const now = NOW + elapsed;
+    if (shouldTouchClaim(lastTouchedAt, now)) {
+      touches += 1;
+      lastTouchedAt = now;
+    }
+  }
+  assert(
+    touches >= 10,
+    `shouldTouchClaim: a 12-minute apply refreshes its claim repeatedly (${touches} touches)`,
+  );
+}
 
 console.log("pipelineImport (claim guard): all assertions passed");
