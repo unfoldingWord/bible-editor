@@ -231,13 +231,18 @@ export async function importJobOutput(
   // Atomic single-applier claim. The predicate mirrors mayClaimImport, but is
   // enforced in one CAS UPDATE so a concurrent racer that read the same
   // pre-apply state can't also win: exactly one UPDATE reports changes=1.
+  // RETURNING echoes back the EXACT value this UPDATE just wrote, so the
+  // heartbeat below can seed its "last-known owned value" from the row
+  // itself rather than assuming it matches Math.floor(Date.now()/1000) (worker
+  // clock vs D1's unixepoch() could in principle skew).
   const claim = await env.DB.prepare(
     `UPDATE pipeline_jobs SET import_claimed_at = unixepoch()
       WHERE job_id = ?1
-        AND (import_claimed_at IS NULL OR import_claimed_at < unixepoch() - ?2)`,
+        AND (import_claimed_at IS NULL OR import_claimed_at < unixepoch() - ?2)
+      RETURNING import_claimed_at`,
   )
     .bind(job.jobId, IMPORT_CLAIM_STALE_SECONDS)
-    .run();
+    .run<{ import_claimed_at: number }>();
   if ((claim.meta.changes ?? 0) === 0) {
     // Another poll already owns the import — do nothing rather than run a
     // second, interleaving delete/insert pass. Flag claimLost so the caller
@@ -255,8 +260,21 @@ export async function importJobOutput(
   // (DAN 11 ran ~12 minutes) keeps its claim fresh and is never re-claimed by
   // a concurrent poller mid-flight. lastTouchedAt starts at the claim UPDATE
   // above (this instant), so the first heartbeat fires ~CLAIM_TOUCH_INTERVAL_
-  // SECONDS later rather than immediately.
-  const heartbeat: ClaimHeartbeat = { lastTouchedAt: Math.floor(Date.now() / 1000) };
+  // SECONDS later rather than immediately. ownedClaimedAt is the exact value
+  // this pass just wrote (read back via RETURNING, not assumed) — every
+  // heartbeat CASes against it so a heartbeat can never silently steal the
+  // claim back from a legitimate new owner (see maybeTouchClaim).
+  const ownedClaimedAt = claim.results?.[0]?.import_claimed_at;
+  const heartbeat: ClaimHeartbeat = {
+    lastTouchedAt: Math.floor(Date.now() / 1000),
+    // Falling back to "now" would only ever be exercised if RETURNING somehow
+    // echoed no row despite meta.changes > 0 — not expected under D1/SQLite
+    // semantics, but a hard failure here would abort an apply that in fact
+    // holds the claim, so this stays a soft (documented) fallback rather than
+    // a thrown error.
+    ownedClaimedAt: ownedClaimedAt ?? Math.floor(Date.now() / 1000),
+    lost: false,
+  };
   try {
     const stageResult = await stageJobOutput(env, job, outputs, heartbeat);
     const applyResult = await applyJobOutput(env, job, heartbeat);
@@ -278,32 +296,97 @@ export async function importJobOutput(
 // Mutable heartbeat clock threaded through staging + apply. Both phases of one
 // apply pass share it so the pass touches the claim at most once per
 // CLAIM_TOUCH_INTERVAL_SECONDS combined, not once per phase.
+//
+// ownedClaimedAt / lost make the heartbeat a real compare-and-swap lease
+// rather than a blind re-stamp. Three independent reviews (a first-pass code
+// review, this PR's own honesty ledger, and a Codex review) all flagged the
+// original unconditional `UPDATE ... SET import_claimed_at = unixepoch()
+// WHERE job_id = ?1`: if this pass stalled long enough for its claim to go
+// stale, another poller legitimately re-claims, and THEN this pass wakes and
+// heartbeats, the unconditional write would silently stamp over the new
+// owner's lease. That doesn't itself create the double-apply (two applies are
+// already running by that point), but it masks and prolongs it and defeats
+// the staleness detection that would otherwise expose it. See
+// touchImportClaim / maybeTouchClaim below for the fix.
 export interface ClaimHeartbeat {
   lastTouchedAt: number;
+  // The import_claimed_at value this pass last confirmed it owns. Seeded from
+  // the RETURNING clause of the initial CAS claim in importJobOutput (the
+  // exact row value, not assumed), and updated from RETURNING again on every
+  // successful heartbeat — never computed independently, so it can't drift
+  // from what's actually in the row.
+  ownedClaimedAt: number;
+  // Set once a heartbeat's CAS fails (another poller took the lease). Once
+  // true, maybeTouchClaim stops issuing further heartbeat writes for the rest
+  // of this pass — see the comment there for why it must NOT throw/abort.
+  lost: boolean;
 }
 
-// Re-stamp pipeline_jobs.import_claimed_at unconditionally — this call already
-// owns the claim (it won the CAS in importJobOutput), so this is a plain
-// keep-alive, not another compare-and-swap. Deliberately has no effect on
-// IMPORT_CLAIM_STALE_SECONDS: if the worker dies, no further heartbeat fires,
-// and the claim goes stale on schedule for crash recovery. See
-// pipelineImportClaim.ts.
-async function touchImportClaim(env: Env, jobId: string): Promise<void> {
-  await env.DB.prepare(
-    `UPDATE pipeline_jobs SET import_claimed_at = unixepoch() WHERE job_id = ?1`,
-  )
-    .bind(jobId)
-    .run();
+// CAS re-stamp of pipeline_jobs.import_claimed_at: only succeeds if the row
+// still holds the value this pass last confirmed it owns
+// (`expectedClaimedAt`). RETURNING echoes the exact new value on success, so
+// the caller's stored "owned" value never drifts from the row. Deliberately
+// has no effect on IMPORT_CLAIM_STALE_SECONDS: if the worker dies, no further
+// heartbeat fires, and the claim goes stale on schedule for crash recovery.
+// See pipelineImportClaim.ts.
+async function touchImportClaim(
+  env: Env,
+  jobId: string,
+  expectedClaimedAt: number,
+): Promise<{ changes: number; newClaimedAt: number | null }> {
+  const res = await env.DB
+    .prepare(
+      `UPDATE pipeline_jobs SET import_claimed_at = unixepoch()
+        WHERE job_id = ?1 AND import_claimed_at = ?2
+        RETURNING import_claimed_at`,
+    )
+    .bind(jobId, expectedClaimedAt)
+    .run<{ import_claimed_at: number }>();
+  return {
+    changes: res.meta.changes ?? 0,
+    newClaimedAt: res.results?.[0]?.import_claimed_at ?? null,
+  };
 }
 
 // Rate-limited wrapper: only issues the D1 write when shouldTouchClaim says
 // enough time has passed since the last touch, so a chunked loop costs at most
 // one extra write per CLAIM_TOUCH_INTERVAL_SECONDS, not one per chunk.
-async function maybeTouchClaim(env: Env, jobId: string, hb: ClaimHeartbeat): Promise<void> {
+// Exported for the fake-DB regression tests in pipelineImport.test.mjs, which
+// drive the lease-takeover path directly — same rationale as deleteUnkeptTns.
+export async function maybeTouchClaim(
+  env: Env,
+  jobId: string,
+  hb: ClaimHeartbeat,
+): Promise<void> {
+  if (hb.lost) return; // Already lost the lease; stop hammering D1 for it.
   const now = Math.floor(Date.now() / 1000);
   if (!shouldTouchClaim(hb.lastTouchedAt, now)) return;
-  await touchImportClaim(env, jobId);
+  const { changes, newClaimedAt } = await touchImportClaim(env, jobId, hb.ownedClaimedAt);
+  if (changes === 0) {
+    // The CAS failed: the row's import_claimed_at no longer matches what this
+    // pass last confirmed it owns, meaning the claim went stale and another
+    // poller has ALREADY legitimately re-claimed it. Mark lost and stop
+    // heartbeating — but deliberately do NOT throw or abort the apply here.
+    // A throw would propagate out of applyJobOutput/stageJobOutput into
+    // importJobOutput's catch, whose cleanup runs
+    // `UPDATE pipeline_jobs SET import_claimed_at = NULL WHERE job_id = ?1`
+    // unconditionally — that would erase the NEW owner's claim, handing the
+    // slot back to nobody (or a third racer) and making the corruption this
+    // whole claim mechanism exists to prevent worse, not better. Letting this
+    // pass's remaining writes finish is the safer failure mode; the resolved-
+    // pairs exclusion in tnSweepScope is what actually protects data once two
+    // applies are concurrently live, not this heartbeat.
+    hb.lost = true;
+    console.error("pipeline apply: import claim lease lost to another poller mid-flight", {
+      jobId,
+    });
+    return;
+  }
   hb.lastTouchedAt = now;
+  // Track the row's actual new value, not `now` — they're expected to match,
+  // but reading it back keeps this pass's belief pinned to reality rather
+  // than a locally-computed guess that could quietly diverge from the row.
+  hb.ownedClaimedAt = newClaimedAt ?? hb.ownedClaimedAt;
 }
 
 async function stageJobOutput(

@@ -17,7 +17,7 @@ import {
   shouldTouchClaim,
   CLAIM_TOUCH_INTERVAL_SECONDS,
 } from "./pipelineImportClaim.ts";
-import { deleteUnkeptTns } from "./pipelineImport.ts";
+import { deleteUnkeptTns, maybeTouchClaim } from "./pipelineImport.ts";
 
 function assert(cond, msg) {
   if (!cond) {
@@ -217,6 +217,140 @@ assert(
   );
 }
 
+// ── maybeTouchClaim / touchImportClaim: the heartbeat as a real CAS lease ──
+// Three independent reviews flagged the original heartbeat: it re-stamped
+// import_claimed_at unconditionally, so if this pass's claim went stale and
+// another poller legitimately re-claimed, a late heartbeat from the original
+// pass would silently steal the lease back. These tests drive the REAL
+// maybeTouchClaim/touchImportClaim against a fake DB that models a single
+// pipeline_jobs row's import_claimed_at in memory and evaluates the WHERE
+// clause the way D1 actually would: if the generated SQL still carries the
+// CAS condition (`import_claimed_at = ?2`), the UPDATE only succeeds when the
+// bound expected value matches the row's CURRENT value. If the SQL doesn't
+// carry that condition (the regression: an unconditional heartbeat), the fake
+// honors that too — unconditionally — which is exactly the bad behavior this
+// test exists to catch when someone removes the condition.
+function fakeLeaseDb(initialClaimedAt) {
+  const calls = [];
+  const row = { import_claimed_at: initialClaimedAt };
+  return {
+    calls,
+    setRowClaimedAt(v) {
+      // Simulates another poller's CAS UPDATE succeeding in between this
+      // pass's heartbeats — the row now holds a value this pass never wrote.
+      row.import_claimed_at = v;
+    },
+    env: {
+      DB: {
+        prepare(sql) {
+          return {
+            bind(...args) {
+              calls.push({ sql, args });
+              return {
+                async run() {
+                  const hasCasCondition = /import_claimed_at\s*=\s*\?2/.test(sql);
+                  const expected = args[1];
+                  const matches = !hasCasCondition || row.import_claimed_at === expected;
+                  if (!matches) {
+                    return { meta: { changes: 0 }, results: [] };
+                  }
+                  row.import_claimed_at += 1; // simulate unixepoch() advancing
+                  return {
+                    meta: { changes: 1 },
+                    results: [{ import_claimed_at: row.import_claimed_at }],
+                  };
+                },
+              };
+            },
+          };
+        },
+      },
+    },
+  };
+}
+
+// --- heartbeat succeeds while still owned, and continues on later touches ---
+await (async () => {
+  const { calls, env } = fakeLeaseDb(1000);
+  // lastTouchedAt = 0 forces shouldTouchClaim to fire regardless of real wall
+  // clock time (now - 0 is always >= CLAIM_TOUCH_INTERVAL_SECONDS).
+  const hb = { lastTouchedAt: 0, ownedClaimedAt: 1000, lost: false };
+
+  await maybeTouchClaim(env, "job-lease-ok", hb);
+  assert(calls.length === 1, "lease CAS: a due heartbeat issues exactly one UPDATE");
+  assert(
+    calls[0].args[0] === "job-lease-ok" && calls[0].args[1] === 1000,
+    "lease CAS: binds the job id AND the last-known owned value",
+  );
+  assert(hb.ownedClaimedAt === 1001, "lease CAS: stored owned value advances to the row's new value");
+  assert(hb.lost === false, "lease CAS: not marked lost on success");
+
+  hb.lastTouchedAt = 0; // simulate the interval elapsing again
+  await maybeTouchClaim(env, "job-lease-ok", hb);
+  assert(calls.length === 2, "lease CAS: a second due heartbeat issues another UPDATE");
+  assert(
+    calls[1].args[1] === 1001,
+    "lease CAS: the second heartbeat CASes against the UPDATED owned value, not the original",
+  );
+  assert(hb.ownedClaimedAt === 1002, "lease CAS: stored owned value advances again");
+})();
+
+// --- lease takeover: another poller re-claims between heartbeats ---
+await (async () => {
+  const { calls, env, setRowClaimedAt } = fakeLeaseDb(2000);
+  const hb = { lastTouchedAt: 0, ownedClaimedAt: 2000, lost: false };
+  // Another poller's claim won the CAS in importJobOutput while this pass was
+  // stalled — the row no longer holds what this pass believes it owns.
+  setRowClaimedAt(9999);
+
+  const originalConsoleError = console.error;
+  let loggedArgs = null;
+  console.error = (...args) => {
+    loggedArgs = args;
+  };
+  try {
+    await maybeTouchClaim(env, "job-lease-stolen", hb);
+  } finally {
+    console.error = originalConsoleError;
+  }
+  assert(calls.length === 1, "lease takeover: the failed CAS still issues exactly one UPDATE attempt");
+  assert(hb.lost === true, "lease takeover: hb.lost is set once the CAS fails");
+  assert(
+    loggedArgs != null && /lease lost/i.test(String(loggedArgs[0])),
+    "lease takeover: logs the loss via console.error",
+  );
+
+  // The regression that matters: no further heartbeat UPDATEs after the lease
+  // is lost, however much time passes.
+  hb.lastTouchedAt = 0;
+  await maybeTouchClaim(env, "job-lease-stolen", hb);
+  assert(
+    calls.length === 1,
+    "lease takeover: no further heartbeat UPDATEs are issued once the lease is lost",
+  );
+})();
+
+// --- binding integrity: the conditional UPDATE binds the last-known value,
+//     not just the job id, and the generated SQL retains the CAS condition ---
+await (async () => {
+  const { calls, env } = fakeLeaseDb(500);
+  const hb = { lastTouchedAt: 0, ownedClaimedAt: 500, lost: false };
+  await maybeTouchClaim(env, "job-lease-bind", hb);
+  assert(calls.length === 1, "lease CAS binding: one UPDATE issued");
+  assert(
+    calls[0].args.length === 2,
+    "lease CAS binding: exactly 2 args bound (job id + expected owned value)",
+  );
+  assert(
+    calls[0].args[1] === 500,
+    "lease CAS binding: the second bound arg is the last-known owned value",
+  );
+  assert(
+    /AND\s+import_claimed_at\s*=\s*\?2/.test(calls[0].sql),
+    "lease CAS binding: generated SQL retains the CAS condition (AND import_claimed_at = ?2)",
+  );
+})();
+
 // ── deleteUnkeptTns: the SQL it actually generates (fake-DB) ─────────────
 // tnSweepScope alone only proves a pure helper doesn't invent inputs — the
 // real DAN 11 regression lived in the SQL deleteUnkeptTns builds. Reverting
@@ -305,7 +439,11 @@ const job11 = {
   startChapter: 11,
   endChapter: 11,
 };
-const newHeartbeat = () => ({ lastTouchedAt: Math.floor(Date.now() / 1000) });
+const newHeartbeat = () => ({
+  lastTouchedAt: Math.floor(Date.now() / 1000),
+  ownedClaimedAt: Math.floor(Date.now() / 1000),
+  lost: false,
+});
 
 // --- Test 1: the DAN 11 regression, against the REAL generated SQL ---
 await (async () => {
