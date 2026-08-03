@@ -1134,74 +1134,99 @@ const RESUME_ACCEPTED_GRACE_SECONDS = 15 * 60;
 // upstream call doesn't drag the batch down.
 export async function pollAllNonTerminal(env: Env): Promise<void> {
   if (!env.BT_API_TOKEN) return;
-  await env.DB.prepare(
-    `UPDATE pipeline_jobs
-        SET state = 'failed',
-            error_kind = 'interrupted',
-            error_message = 'auto-failed: no progress for 48h',
-            updated_at = unixepoch()
-      WHERE state IN ('running', 'paused_for_outage', 'paused_for_usage_limit')
-        AND updated_at < unixepoch() - ?1`,
-  )
-    .bind(STUCK_JOB_THRESHOLD_SECONDS)
-    .run();
-  // Auto-fail anything that has been polled more than MAX_POLL_ATTEMPTS times
-  // without reaching a terminal state. Independent backstop from the time-
-  // based one above — catches the "fresh updated_at but never done" case.
-  await env.DB.prepare(
-    `UPDATE pipeline_jobs
-        SET state = 'failed',
-            error_kind = 'interrupted',
-            error_message = 'auto-failed: poll attempts exhausted',
-            updated_at = unixepoch()
-      WHERE state IN ('running', 'paused_for_outage', 'paused_for_usage_limit')
-        AND attempt_count > ?1`,
-  )
-    .bind(MAX_POLL_ATTEMPTS)
-    .run();
-  // Recover wedged dispatches so a dead-mid-POST Worker can't hold the slot
-  // forever.
-  await env.DB.prepare(
-    `UPDATE pipeline_jobs
-        SET state = 'failed',
-            error_kind = 'interrupted',
-            error_message = 'auto-failed: dispatch did not complete',
-            updated_at = unixepoch()
-      WHERE state = 'dispatching'
-        AND updated_at < unixepoch() - ?1`,
-  )
-    .bind(STUCK_DISPATCH_THRESHOLD_SECONDS)
-    .run();
-  const rs = await env.DB.prepare(
-    `SELECT job_id, upstream_job_id, user_id, pipeline_type, book, start_chapter,
-            end_chapter, session_key, follow_up_options, follow_up_chain,
-            follow_up_job_id, error_kind, updated_at, resume_attempt_count,
-            last_resume_at, resume_accepted_at, options_json,
-            (output_json IS NULL) AS no_output_yet
-       FROM pipeline_jobs
-      WHERE state IN ('running', 'paused_for_outage', 'paused_for_usage_limit')
-      ORDER BY updated_at ASC
-      LIMIT 50`,
-  ).all<PolledJob>();
-  const jobs = rs.results ?? [];
-  if (jobs.length > 0) {
-    // Bump attempt_count for everything we're about to poll, in one batch. We
-    // do this BEFORE the upstream calls so a Worker crash doesn't undo the
-    // increment — the cap is the whole point of this column.
+  // The backstop sweeps are isolated for the same reason as the poll batch
+  // below: nothing in this function may prevent dispatchNext from running. They
+  // touch only long-standing columns today, but that was equally true of the
+  // poll SELECT until migrations 0038/0039 added three to it — and an unguarded
+  // throw HERE reproduces the EZK 40 freeze exactly, sweeps and poll and
+  // dispatch all skipped together. Guarding both is what makes
+  // pollAllNonTerminal non-throwing, which also protects the stale-lock and
+  // edit_log sweeps that run after it in index.ts's POLL_CRON branch.
+  try {
     await env.DB.prepare(
       `UPDATE pipeline_jobs
-          SET attempt_count = attempt_count + 1
-        WHERE job_id IN (${jobs.map((_, i) => `?${i + 1}`).join(",")})`,
+          SET state = 'failed',
+              error_kind = 'interrupted',
+              error_message = 'auto-failed: no progress for 48h',
+              updated_at = unixepoch()
+        WHERE state IN ('running', 'paused_for_outage', 'paused_for_usage_limit')
+          AND updated_at < unixepoch() - ?1`,
     )
-      .bind(...jobs.map((j) => j.job_id))
+      .bind(STUCK_JOB_THRESHOLD_SECONDS)
       .run();
-    await Promise.allSettled(
-      jobs.map((j) =>
-        pollPipelineJob(env, j).catch((err) => {
-          console.error(`[scheduled.pipelinePoll] job=${j.job_id}:`, err);
-        }),
-      ),
-    );
+    // Auto-fail anything that has been polled more than MAX_POLL_ATTEMPTS times
+    // without reaching a terminal state. Independent backstop from the time-
+    // based one above — catches the "fresh updated_at but never done" case.
+    await env.DB.prepare(
+      `UPDATE pipeline_jobs
+          SET state = 'failed',
+              error_kind = 'interrupted',
+              error_message = 'auto-failed: poll attempts exhausted',
+              updated_at = unixepoch()
+        WHERE state IN ('running', 'paused_for_outage', 'paused_for_usage_limit')
+          AND attempt_count > ?1`,
+    )
+      .bind(MAX_POLL_ATTEMPTS)
+      .run();
+    // Recover wedged dispatches so a dead-mid-POST Worker can't hold the slot
+    // forever.
+    await env.DB.prepare(
+      `UPDATE pipeline_jobs
+          SET state = 'failed',
+              error_kind = 'interrupted',
+              error_message = 'auto-failed: dispatch did not complete',
+              updated_at = unixepoch()
+        WHERE state = 'dispatching'
+          AND updated_at < unixepoch() - ?1`,
+    )
+      .bind(STUCK_DISPATCH_THRESHOLD_SECONDS)
+      .run();
+  } catch (err) {
+    console.error("[scheduled.pipelinePoll] backstop sweeps failed:", err);
+  }
+  // The whole poll batch is isolated from the dispatchNext below. A throw here
+  // is not hypothetical: a deploy that ships code referencing a column whose
+  // migration hasn't been applied to prod makes this SELECT throw on EVERY */5
+  // tick, and an unguarded throw took dispatchNext down with it — so the running
+  // job never advanced AND nothing queued behind it ever dispatched. (EZK 40
+  // generate, 2026-08-01: migrations 0038/0039 unapplied in prod, job frozen at
+  // attempt_count=0 with a queue behind it for the whole weekend.) The migration
+  // gap is fixed at its source in api/package.json's deploy script; this keeps
+  // the queue draining even when some future poll path is broken.
+  try {
+    const rs = await env.DB.prepare(
+      `SELECT job_id, upstream_job_id, user_id, pipeline_type, book, start_chapter,
+              end_chapter, session_key, follow_up_options, follow_up_chain,
+              follow_up_job_id, error_kind, updated_at, resume_attempt_count,
+              last_resume_at, resume_accepted_at, options_json,
+              (output_json IS NULL) AS no_output_yet
+         FROM pipeline_jobs
+        WHERE state IN ('running', 'paused_for_outage', 'paused_for_usage_limit')
+        ORDER BY updated_at ASC
+        LIMIT 50`,
+    ).all<PolledJob>();
+    const jobs = rs.results ?? [];
+    if (jobs.length > 0) {
+      // Bump attempt_count for everything we're about to poll, in one batch. We
+      // do this BEFORE the upstream calls so a Worker crash doesn't undo the
+      // increment — the cap is the whole point of this column.
+      await env.DB.prepare(
+        `UPDATE pipeline_jobs
+            SET attempt_count = attempt_count + 1
+          WHERE job_id IN (${jobs.map((_, i) => `?${i + 1}`).join(",")})`,
+      )
+        .bind(...jobs.map((j) => j.job_id))
+        .run();
+      await Promise.allSettled(
+        jobs.map((j) =>
+          pollPipelineJob(env, j).catch((err) => {
+            console.error(`[scheduled.pipelinePoll] job=${j.job_id}:`, err);
+          }),
+        ),
+      );
+    }
+  } catch (err) {
+    console.error("[scheduled.pipelinePoll] batch failed:", err);
   }
 
   // Safety net: if the slot is free and something is queued, dispatch it. This

@@ -30,10 +30,33 @@ jobs:
       - name: Build
         run: npm run build
 
+      # Schema BEFORE code, always. This is the step whose absence caused the
+      # EZK 40 incident (2026-08-01): migrations 0038/0039 were never applied to
+      # prod, so the deployed poller's SELECT asked for three columns that did
+      # not exist and threw on every */5 tick — the running job never advanced
+      # and nothing queued behind it dispatched, for a weekend. `npm run deploy`
+      # now chains the same command, but this workflow is the manual "Run
+      # workflow" path and bypassed it entirely.
+      #
+      # Placed after Build on purpose: a build failure must not leave the schema
+      # ahead of the code. If the CLOUDFLARE_API_TOKEN lacks D1 write scope this
+      # step fails and the deploy does not run — the safe direction, and a loud
+      # failure rather than the silent one this replaces.
+      - name: Apply D1 migrations
+        working-directory: api
+        run: npm run db:migrate:remote
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
       # Uses the wrangler pinned in api/devDependencies (not a separate action)
       # so CI matches `npm run deploy` locally. --env production activates the
       # [env.production.*] blocks in wrangler.toml. Worker secrets (JWT key, DCS
       # OAuth, etc.) already live in Cloudflare and are not touched here.
+      #
+      # Deliberately `wrangler deploy` and not `npm run deploy`: the migrate step
+      # above already covers what that script chains, and calling the script here
+      # would apply migrations twice per run.
       - name: Deploy Worker + SPA
         working-directory: api
         run: npx wrangler deploy --env production
