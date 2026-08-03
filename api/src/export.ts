@@ -900,11 +900,27 @@ function dcsPrHeaders(token: string): Record<string, string> {
   };
 }
 
-// Exact lookup: GET /repos/{owner}/{repo}/pulls/{base}/{head}. (Replaces
-// paging /pulls?state=open — DCS caps the page at 50, so an existing PR could
-// fall off page 1, after which the create 409s every night.) 404 = no PR for
-// this base/head. A 200 can be a closed or merged PR — the endpoint doesn't
-// filter by state — so only an "open" one counts.
+// Exact lookup: GET /repos/{owner}/{repo}/pulls/{base}/{head}. Fast path for
+// the common case, but door43 has a confirmed quirk: this endpoint returns
+// the OLDEST PR ever opened for a given base/head pair, regardless of state —
+// not the open one. A branch that has had multiple PRs over its life (closed,
+// reopened under a new PR, etc.) makes the exact lookup return a closed PR
+// while a real open PR exists further back in history. Live evidence:
+// DAN-be-justplainjane47 had 6 PRs (7347, 7351, 7357, 7365, 7375, 7382); the
+// exact lookup returned #7347 (closed, oldest) while #7382 was open. When
+// that happens, ensureDcsPr's create 409s/422s ("already exists"), the
+// re-lookup hits the same stale result, and the export silently treats the
+// branch as having no PR (never rebasing it, never running conflict
+// recovery) with no alert ever written.
+//
+// So: use the exact lookup as the fast path, and only fall back to a paged
+// scan of /pulls?state=open (matching on head ref) when the exact lookup
+// 404s or returns a non-open PR. The paged scan is intentionally NOT the
+// default path — it was the original approach and got replaced because DCS
+// caps each page at 50, so an existing PR could fall off page 1 and the
+// create would 409 every night; paging bounded to 20 pages (1000 open PRs,
+// far beyond real usage) plus running it only as a fallback keeps that
+// subrequest cost negligible.
 export async function findDcsOpenPr(config: DcsPrConfig): Promise<number | null> {
   const base = config.base ?? "master";
   const apiBase = `${config.baseUrl}/api/v1/repos/${encodeURIComponent(config.owner)}/${encodeURIComponent(config.repo)}`;
@@ -912,10 +928,63 @@ export async function findDcsOpenPr(config: DcsPrConfig): Promise<number | null>
     `${apiBase}/pulls/${encodeURIComponent(base)}/${encodeURIComponent(config.branch)}`,
     { method: "GET", headers: dcsPrHeaders(config.token) },
   );
-  if (res.status === 404) return null;
-  if (!res.ok) throw new Error(`dcs_pull_lookup_failed: ${res.status} ${await res.text()}`);
-  const pr = (await res.json()) as { number?: number; state?: string };
-  return pr.state === "open" && typeof pr.number === "number" ? pr.number : null;
+  if (res.ok) {
+    const pr = (await res.json()) as { number?: number; state?: string };
+    if (pr.state === "open" && typeof pr.number === "number") return pr.number;
+  } else if (res.status !== 404) {
+    throw new Error(`dcs_pull_lookup_failed: ${res.status} ${await res.text()}`);
+  }
+
+  // Fallback: paged scan of open PRs, matching on head ref, base ref, and
+  // same-repo head (see below). Gitea clamps the requested `limit` to an
+  // instance-configurable MaxResponseItems, so a page is NOT guaranteed to
+  // come back with exactly `limit` items even when more pages remain —
+  // measured against door43 2026-08-03: `?state=all&limit=10/50/100`
+  // returned 10/50/100 respectively, i.e. its clamp is at least 100 today,
+  // but we don't rely on that holding. Terminate only on a genuinely empty
+  // page; `maxPages` is the real backstop against an unbounded loop.
+  const limit = 50;
+  const maxPages = 20;
+  const sameRepo = `${config.owner}/${config.repo}`;
+  for (let page = 1; page <= maxPages; page++) {
+    const listRes = await fetch(
+      `${apiBase}/pulls?state=open&limit=${limit}&page=${page}`,
+      { method: "GET", headers: dcsPrHeaders(config.token) },
+    );
+    if (!listRes.ok) {
+      throw new Error(`dcs_pull_list_failed: ${listRes.status} ${await listRes.text()}`);
+    }
+    let items: Array<{
+      number?: number;
+      head?: { ref?: string; repo?: { full_name?: string } };
+      base?: { ref?: string };
+    }>;
+    try {
+      items = await listRes.json();
+    } catch {
+      throw new Error(`dcs_pull_list_failed: non_array_body (JSON parse error)`);
+    }
+    if (!Array.isArray(items)) {
+      throw new Error(`dcs_pull_list_failed: non_array_body`);
+    }
+    // Same-repo guard: `?state=open` on this repo's /pulls endpoint also
+    // returns PRs opened FROM forks, whose `head.ref` is the bare branch
+    // name — the exact lookup could never do this (Gitea requires a
+    // `user:branch` head for cross-repo PRs there), so this is a new
+    // exposure introduced by the fallback. Without this guard, a
+    // same-named branch in any contributor's fork would match and we'd
+    // return a stranger's PR number, then run writes (close/update/rebase)
+    // against it. A missing/undefined head.repo is NOT a match (fail closed).
+    const match = items.find(
+      (pr) =>
+        pr.head?.ref === config.branch &&
+        pr.base?.ref === base &&
+        pr.head?.repo?.full_name === sameRepo,
+    );
+    if (match && typeof match.number === "number") return match.number;
+    if (items.length === 0) break;
+  }
+  return null;
 }
 
 export async function ensureDcsPr(

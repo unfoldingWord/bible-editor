@@ -5,7 +5,7 @@
 // instead of getting silently flattened to `\v 6`. Not a test framework;
 // failures exit non-zero.
 
-import { buildExportBranch, buildTnTsv, buildTwlTsv, buildUsfm, commitToDcs, ensureDcsPr, exportTsvShrinkRefused, recreateExportBranchFromMaster, updateDcsPrBranch, usfmAlignmentShrinkRefused } from "./export.ts";
+import { buildExportBranch, buildTnTsv, buildTwlTsv, buildUsfm, commitToDcs, ensureDcsPr, exportTsvShrinkRefused, findDcsOpenPr, recreateExportBranchFromMaster, updateDcsPrBranch, usfmAlignmentShrinkRefused } from "./export.ts";
 import { CorruptContentJsonError } from "./contentJson.ts";
 
 function assert(cond, msg) {
@@ -476,25 +476,29 @@ function utf8Base64(s) {
     const r1 = await ensureDcsPr(cfg, "t", "b");
     assert(r1.number === 42 && !r1.created && r1.reason === "existing", `ensureDcsPr reuses an open PR via exact lookup`);
 
-    // Lookup returns a CLOSED PR (the endpoint doesn't filter by state) →
-    // not reusable → create a fresh one.
+    // Lookup returns a CLOSED PR (the endpoint doesn't filter by state) and
+    // the paged fallback finds no open PR for this head either → create a
+    // fresh one.
     let posted = false;
+    const isList = (u, m) => u.includes("/pulls?state=open") && m === "GET";
     globalThis.fetch = async (url, init = {}) => {
       const u = String(url);
       const m = init.method ?? "GET";
       if (isLookup(u, m)) return okJson({ number: 41, state: "closed" });
+      if (isList(u, m)) return okJson([]);
       if (u.endsWith("/pulls") && m === "POST") { posted = true; return okJson({ number: 99 }, 201); }
       throw new Error(`unexpected ${m} ${u}`);
     };
     const r2 = await ensureDcsPr(cfg, "t", "b");
-    assert(posted && r2.number === 99 && r2.created && r2.reason === "created", `closed PR is not reused; a new one is created`);
+    assert(posted && r2.number === 99 && r2.created && r2.reason === "created", `closed PR with no open match anywhere is not reused; a new one is created`);
 
-    // No PR at all (404) → create one.
+    // No PR at all (404) and no open PR in the paged fallback → create one.
     posted = false;
     globalThis.fetch = async (url, init = {}) => {
       const u = String(url);
       const m = init.method ?? "GET";
       if (isLookup(u, m)) return okJson({ message: "Not Found" }, 404);
+      if (isList(u, m)) return okJson([]);
       if (u.endsWith("/pulls") && m === "POST") { posted = true; return okJson({ number: 100 }, 201); }
       throw new Error(`unexpected ${m} ${u}`);
     };
@@ -511,6 +515,7 @@ function utf8Base64(s) {
         lookups++;
         return lookups === 1 ? okJson({ message: "Not Found" }, 404) : okJson({ number: 7, state: "open" });
       }
+      if (isList(u, m)) return okJson([]);
       if (u.endsWith("/pulls") && m === "POST") return okJson({ message: "pull request already exists" }, 409);
       throw new Error(`unexpected ${m} ${u}`);
     };
@@ -522,6 +527,7 @@ function utf8Base64(s) {
       const u = String(url);
       const m = init.method ?? "GET";
       if (isLookup(u, m)) return okJson({ message: "Not Found" }, 404);
+      if (isList(u, m)) return okJson([]);
       if (u.endsWith("/pulls") && m === "POST") return okJson({ message: "no commits between" }, 422);
       throw new Error(`unexpected ${m} ${u}`);
     };
@@ -531,6 +537,176 @@ function utf8Base64(s) {
     // Head == base is a guarded no-op (no network at all).
     const r6 = await ensureDcsPr({ ...cfg, branch: "master" }, "t", "b");
     assert(!r6.created && r6.reason === "head_equals_base", `ensureDcsPr skips when head == base`);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+}
+
+// --- findDcsOpenPr: paged fallback when the exact lookup misses an open PR ---
+// Regression coverage for the DAN-be-justplainjane47 bug: the exact lookup
+// returns the OLDEST PR for a base/head pair regardless of state, so a closed
+// PR can shadow a real open one. door43 had 6 PRs for that head (7347, 7351,
+// 7357, 7365, 7375, 7382); the exact lookup returned closed #7347 while #7382
+// was open.
+{
+  const originalFetch = globalThis.fetch;
+  const cfg = { baseUrl: "https://dcs.example", token: "t", owner: "o", repo: "r", branch: "DAN-be-justplainjane47" };
+  const okJson = (obj, status = 200) =>
+    new Response(JSON.stringify(obj), { status, headers: { "Content-Type": "application/json" } });
+  const isLookup = (u, m) => u.includes("/pulls/master/DAN-be-justplainjane47") && m === "GET";
+  const isList = (u, m) => u.includes("/pulls?state=open") && m === "GET";
+  const pageOf = (u) => Number(new URL(u).searchParams.get("page"));
+  try {
+    // Exact lookup returns an OPEN PR → its number is returned, and the
+    // paged fallback is never called.
+    let listCalled = false;
+    globalThis.fetch = async (url, init = {}) => {
+      const u = String(url);
+      const m = init.method ?? "GET";
+      if (isLookup(u, m)) return okJson({ number: 42, state: "open" });
+      if (isList(u, m)) { listCalled = true; return okJson([]); }
+      throw new Error(`unexpected ${m} ${u}`);
+    };
+    const found1 = await findDcsOpenPr(cfg);
+    assert(found1 === 42 && !listCalled, `open PR from the exact lookup is returned without ever calling the paged fallback`);
+
+    // DAN regression: exact lookup returns a CLOSED PR (the oldest for this
+    // head), but an open PR for the same head exists in the paged fallback.
+    globalThis.fetch = async (url, init = {}) => {
+      const u = String(url);
+      const m = init.method ?? "GET";
+      if (isLookup(u, m)) return okJson({ number: 7347, state: "closed" });
+      if (isList(u, m)) {
+        // The list endpoint is itself queried with ?state=open, so every
+        // item it returns is already open — the only filtering left to do
+        // client-side is matching the head/base refs (and same-repo head).
+        return okJson([
+          { number: 6501, head: { ref: "OTHER-be-someone", repo: { full_name: "o/r" } }, base: { ref: "master" } },
+          { number: 7382, head: { ref: "DAN-be-justplainjane47", repo: { full_name: "o/r" } }, base: { ref: "master" } },
+        ]);
+      }
+      throw new Error(`unexpected ${m} ${u}`);
+    };
+    const found2 = await findDcsOpenPr(cfg);
+    assert(found2 === 7382, `DAN regression: a closed PR from the exact lookup no longer shadows the real open PR found via paged fallback`);
+
+    // Exact lookup 404s and no open PR matches anywhere → null.
+    globalThis.fetch = async (url, init = {}) => {
+      const u = String(url);
+      const m = init.method ?? "GET";
+      if (isLookup(u, m)) return okJson({ message: "Not Found" }, 404);
+      if (isList(u, m)) return okJson([]);
+      throw new Error(`unexpected ${m} ${u}`);
+    };
+    const found3 = await findDcsOpenPr(cfg);
+    assert(found3 === null, `404 exact lookup with no open PR anywhere returns null`);
+
+    // Open PR for this head sits on page 2 of the paged fallback.
+    globalThis.fetch = async (url, init = {}) => {
+      const u = String(url);
+      const m = init.method ?? "GET";
+      if (isLookup(u, m)) return okJson({ message: "Not Found" }, 404);
+      if (isList(u, m)) {
+        const page = pageOf(u);
+        if (page === 1) {
+          const items = Array.from({ length: 50 }, (_, i) => ({
+            number: i + 1,
+            head: { ref: `other-branch-${i}`, repo: { full_name: "o/r" } },
+            base: { ref: "master" },
+          }));
+          return okJson(items);
+        }
+        if (page === 2) {
+          return okJson([{ number: 999, head: { ref: "DAN-be-justplainjane47", repo: { full_name: "o/r" } }, base: { ref: "master" } }]);
+        }
+        return okJson([]);
+      }
+      throw new Error(`unexpected ${m} ${u}`);
+    };
+    const found4 = await findDcsOpenPr(cfg);
+    assert(found4 === 999, `an open PR on page 2 of the paged fallback is still found`);
+
+    // Server clamps the page size below the requested `limit` (Gitea's
+    // MaxResponseItems) — page 1 returns only 30 of the requested 50, well
+    // short of `limit`, yet an open PR still exists on page 2. This is the
+    // finding-1 regression case: it fails against `if (items.length < limit)
+    // break`, which would have stopped after page 1 and never found it.
+    globalThis.fetch = async (url, init = {}) => {
+      const u = String(url);
+      const m = init.method ?? "GET";
+      if (isLookup(u, m)) return okJson({ message: "Not Found" }, 404);
+      if (isList(u, m)) {
+        const page = pageOf(u);
+        if (page === 1) {
+          const items = Array.from({ length: 30 }, (_, i) => ({
+            number: i + 1,
+            head: { ref: `other-branch-${i}`, repo: { full_name: "o/r" } },
+            base: { ref: "master" },
+          }));
+          return okJson(items);
+        }
+        if (page === 2) {
+          return okJson([{ number: 4242, head: { ref: "DAN-be-justplainjane47", repo: { full_name: "o/r" } }, base: { ref: "master" } }]);
+        }
+        return okJson([]);
+      }
+      throw new Error(`unexpected ${m} ${u}`);
+    };
+    const found5 = await findDcsOpenPr(cfg);
+    assert(found5 === 4242, `a clamped page 1 (fewer items than the requested limit) still continues to page 2 and finds the open PR`);
+
+    // Fork-head guard: a PR with the same head.ref and base.ref, but whose
+    // head repo is a contributor's fork (not this repo), must NOT match —
+    // matching it would return a stranger's PR number and cause writes
+    // (close/update/rebase) against someone else's pull request.
+    globalThis.fetch = async (url, init = {}) => {
+      const u = String(url);
+      const m = init.method ?? "GET";
+      if (isLookup(u, m)) return okJson({ message: "Not Found" }, 404);
+      if (isList(u, m)) {
+        return okJson([
+          { number: 5555, head: { ref: "DAN-be-justplainjane47", repo: { full_name: "someforker/r" } }, base: { ref: "master" } },
+        ]);
+      }
+      throw new Error(`unexpected ${m} ${u}`);
+    };
+    const found6 = await findDcsOpenPr(cfg);
+    assert(found6 === null, `same-repo guard: a fork-head PR with a matching head.ref/base.ref is not matched`);
+
+    // A non-OK list response throws rather than silently returning null —
+    // a silent null is exactly what hid the DAN bug for a week.
+    globalThis.fetch = async (url, init = {}) => {
+      const u = String(url);
+      const m = init.method ?? "GET";
+      if (isLookup(u, m)) return okJson({ message: "Not Found" }, 404);
+      if (isList(u, m)) return new Response("server error", { status: 500 });
+      throw new Error(`unexpected ${m} ${u}`);
+    };
+    let threw = false;
+    try {
+      await findDcsOpenPr(cfg);
+    } catch (e) {
+      threw = /dcs_pull_list_failed/.test(String(e.message));
+    }
+    assert(threw, `a non-OK paged list response throws dcs_pull_list_failed instead of returning null`);
+
+    // A 200 list response whose body is not an array (e.g. a Gitea error
+    // object shaped like the pulls list, or a gateway page) throws a labeled
+    // error rather than a bare TypeError from items.find(...).
+    globalThis.fetch = async (url, init = {}) => {
+      const u = String(url);
+      const m = init.method ?? "GET";
+      if (isLookup(u, m)) return okJson({ message: "Not Found" }, 404);
+      if (isList(u, m)) return okJson({ message: "not actually a list" });
+      throw new Error(`unexpected ${m} ${u}`);
+    };
+    let threwNonArray = false;
+    try {
+      await findDcsOpenPr(cfg);
+    } catch (e) {
+      threwNonArray = /dcs_pull_list_failed/.test(String(e.message));
+    }
+    assert(threwNonArray, `a non-array 200 list body throws a labeled dcs_pull_list_failed error`);
   } finally {
     globalThis.fetch = originalFetch;
   }
