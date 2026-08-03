@@ -723,7 +723,8 @@ export function PipelineStatusBar({ toast, onToastClear }: Props = {}) {
                     <li>let the next queued run start right away</li>
                   </ul>
                   The AI may keep working on its side for a while after this — don't assume
-                  it stops right away.
+                  it stops right away. Because the next queued run starts immediately, the
+                  two may briefly overlap.
                 </Typography>
                 <Typography variant="body2" sx={{ mb: 1 }}>
                   Type the phrase below exactly to confirm:
