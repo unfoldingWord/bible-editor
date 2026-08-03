@@ -956,6 +956,7 @@ export async function findDcsOpenPr(config: DcsPrConfig): Promise<number | null>
     }
     let items: Array<{
       number?: number;
+      state?: string;
       head?: { ref?: string; repo?: { full_name?: string } };
       base?: { ref?: string };
     }>;
@@ -975,8 +976,12 @@ export async function findDcsOpenPr(config: DcsPrConfig): Promise<number | null>
     // same-named branch in any contributor's fork would match and we'd
     // return a stranger's PR number, then run writes (close/update/rebase)
     // against it. A missing/undefined head.repo is NOT a match (fail closed).
+    // Parity with the fast path above, which requires state === "open" before
+    // trusting a number — not a demonstrated door43 defect, just matching the
+    // same guard here since `?state=open` is a request filter, not a promise.
     const match = items.find(
       (pr) =>
+        pr.state === "open" &&
         pr.head?.ref === config.branch &&
         pr.base?.ref === base &&
         pr.head?.repo?.full_name === sameRepo,

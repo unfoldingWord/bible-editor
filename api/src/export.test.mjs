@@ -581,8 +581,8 @@ function utf8Base64(s) {
         // item it returns is already open — the only filtering left to do
         // client-side is matching the head/base refs (and same-repo head).
         return okJson([
-          { number: 6501, head: { ref: "OTHER-be-someone", repo: { full_name: "o/r" } }, base: { ref: "master" } },
-          { number: 7382, head: { ref: "DAN-be-justplainjane47", repo: { full_name: "o/r" } }, base: { ref: "master" } },
+          { number: 6501, state: "open", head: { ref: "OTHER-be-someone", repo: { full_name: "o/r" } }, base: { ref: "master" } },
+          { number: 7382, state: "open", head: { ref: "DAN-be-justplainjane47", repo: { full_name: "o/r" } }, base: { ref: "master" } },
         ]);
       }
       throw new Error(`unexpected ${m} ${u}`);
@@ -611,13 +611,14 @@ function utf8Base64(s) {
         if (page === 1) {
           const items = Array.from({ length: 50 }, (_, i) => ({
             number: i + 1,
+            state: "open",
             head: { ref: `other-branch-${i}`, repo: { full_name: "o/r" } },
             base: { ref: "master" },
           }));
           return okJson(items);
         }
         if (page === 2) {
-          return okJson([{ number: 999, head: { ref: "DAN-be-justplainjane47", repo: { full_name: "o/r" } }, base: { ref: "master" } }]);
+          return okJson([{ number: 999, state: "open", head: { ref: "DAN-be-justplainjane47", repo: { full_name: "o/r" } }, base: { ref: "master" } }]);
         }
         return okJson([]);
       }
@@ -640,13 +641,14 @@ function utf8Base64(s) {
         if (page === 1) {
           const items = Array.from({ length: 30 }, (_, i) => ({
             number: i + 1,
+            state: "open",
             head: { ref: `other-branch-${i}`, repo: { full_name: "o/r" } },
             base: { ref: "master" },
           }));
           return okJson(items);
         }
         if (page === 2) {
-          return okJson([{ number: 4242, head: { ref: "DAN-be-justplainjane47", repo: { full_name: "o/r" } }, base: { ref: "master" } }]);
+          return okJson([{ number: 4242, state: "open", head: { ref: "DAN-be-justplainjane47", repo: { full_name: "o/r" } }, base: { ref: "master" } }]);
         }
         return okJson([]);
       }
@@ -654,6 +656,24 @@ function utf8Base64(s) {
     };
     const found5 = await findDcsOpenPr(cfg);
     assert(found5 === 4242, `a clamped page 1 (fewer items than the requested limit) still continues to page 2 and finds the open PR`);
+
+    // State guard (parity with the fast path): the list endpoint is queried
+    // with `?state=open`, so this should never happen in practice, but a
+    // matching head/base/repo item whose own `state` field isn't "open"
+    // (e.g. a stale/inconsistent server response) must NOT be matched.
+    globalThis.fetch = async (url, init = {}) => {
+      const u = String(url);
+      const m = init.method ?? "GET";
+      if (isLookup(u, m)) return okJson({ message: "Not Found" }, 404);
+      if (isList(u, m)) {
+        return okJson([
+          { number: 8888, state: "closed", head: { ref: "DAN-be-justplainjane47", repo: { full_name: "o/r" } }, base: { ref: "master" } },
+        ]);
+      }
+      throw new Error(`unexpected ${m} ${u}`);
+    };
+    const foundStateGuard = await findDcsOpenPr(cfg);
+    assert(foundStateGuard === null, `state guard: a matching head/base/repo item whose own state isn't "open" is not matched`);
 
     // Fork-head guard: a PR with the same head.ref and base.ref, but whose
     // head repo is a contributor's fork (not this repo), must NOT match —
@@ -665,7 +685,7 @@ function utf8Base64(s) {
       if (isLookup(u, m)) return okJson({ message: "Not Found" }, 404);
       if (isList(u, m)) {
         return okJson([
-          { number: 5555, head: { ref: "DAN-be-justplainjane47", repo: { full_name: "someforker/r" } }, base: { ref: "master" } },
+          { number: 5555, state: "open", head: { ref: "DAN-be-justplainjane47", repo: { full_name: "someforker/r" } }, base: { ref: "master" } },
         ]);
       }
       throw new Error(`unexpected ${m} ${u}`);
@@ -707,6 +727,40 @@ function utf8Base64(s) {
       threwNonArray = /dcs_pull_list_failed/.test(String(e.message));
     }
     assert(threwNonArray, `a non-array 200 list body throws a labeled dcs_pull_list_failed error`);
+
+    // Empty first page terminates the scan immediately — the `if
+    // (items.length === 0) break` line has the same return value with or
+    // without the break (both paths fall through to `return null`), so only
+    // a request-count assertion can pin that it actually breaks rather than
+    // looping to maxPages.
+    let listCalls1 = 0;
+    globalThis.fetch = async (url, init = {}) => {
+      const u = String(url);
+      const m = init.method ?? "GET";
+      if (isLookup(u, m)) return okJson({ message: "Not Found" }, 404);
+      if (isList(u, m)) { listCalls1++; return okJson([]); }
+      throw new Error(`unexpected ${m} ${u}`);
+    };
+    const found7 = await findDcsOpenPr(cfg);
+    assert(found7 === null && listCalls1 === 1, `an empty first page terminates the scan after exactly one list call`);
+
+    // maxPages backstop: every page is non-empty but never matches, so the
+    // loop must run all 20 pages (not loop forever, not stop early).
+    let listCalls2 = 0;
+    globalThis.fetch = async (url, init = {}) => {
+      const u = String(url);
+      const m = init.method ?? "GET";
+      if (isLookup(u, m)) return okJson({ message: "Not Found" }, 404);
+      if (isList(u, m)) {
+        listCalls2++;
+        return okJson([
+          { number: 1, state: "open", head: { ref: "never-matches", repo: { full_name: "o/r" } }, base: { ref: "master" } },
+        ]);
+      }
+      throw new Error(`unexpected ${m} ${u}`);
+    };
+    const found8 = await findDcsOpenPr(cfg);
+    assert(found8 === null && listCalls2 === 20, `a never-matching, never-empty page set runs all 20 pages before giving up`);
   } finally {
     globalThis.fetch = originalFetch;
   }
