@@ -1134,44 +1134,56 @@ const RESUME_ACCEPTED_GRACE_SECONDS = 15 * 60;
 // upstream call doesn't drag the batch down.
 export async function pollAllNonTerminal(env: Env): Promise<void> {
   if (!env.BT_API_TOKEN) return;
-  await env.DB.prepare(
-    `UPDATE pipeline_jobs
-        SET state = 'failed',
-            error_kind = 'interrupted',
-            error_message = 'auto-failed: no progress for 48h',
-            updated_at = unixepoch()
-      WHERE state IN ('running', 'paused_for_outage', 'paused_for_usage_limit')
-        AND updated_at < unixepoch() - ?1`,
-  )
-    .bind(STUCK_JOB_THRESHOLD_SECONDS)
-    .run();
-  // Auto-fail anything that has been polled more than MAX_POLL_ATTEMPTS times
-  // without reaching a terminal state. Independent backstop from the time-
-  // based one above — catches the "fresh updated_at but never done" case.
-  await env.DB.prepare(
-    `UPDATE pipeline_jobs
-        SET state = 'failed',
-            error_kind = 'interrupted',
-            error_message = 'auto-failed: poll attempts exhausted',
-            updated_at = unixepoch()
-      WHERE state IN ('running', 'paused_for_outage', 'paused_for_usage_limit')
-        AND attempt_count > ?1`,
-  )
-    .bind(MAX_POLL_ATTEMPTS)
-    .run();
-  // Recover wedged dispatches so a dead-mid-POST Worker can't hold the slot
-  // forever.
-  await env.DB.prepare(
-    `UPDATE pipeline_jobs
-        SET state = 'failed',
-            error_kind = 'interrupted',
-            error_message = 'auto-failed: dispatch did not complete',
-            updated_at = unixepoch()
-      WHERE state = 'dispatching'
-        AND updated_at < unixepoch() - ?1`,
-  )
-    .bind(STUCK_DISPATCH_THRESHOLD_SECONDS)
-    .run();
+  // The backstop sweeps are isolated for the same reason as the poll batch
+  // below: nothing in this function may prevent dispatchNext from running. They
+  // touch only long-standing columns today, but that was equally true of the
+  // poll SELECT until migrations 0038/0039 added three to it — and an unguarded
+  // throw HERE reproduces the EZK 40 freeze exactly, sweeps and poll and
+  // dispatch all skipped together. Guarding both is what makes
+  // pollAllNonTerminal non-throwing, which also protects the stale-lock and
+  // edit_log sweeps that run after it in index.ts's POLL_CRON branch.
+  try {
+    await env.DB.prepare(
+      `UPDATE pipeline_jobs
+          SET state = 'failed',
+              error_kind = 'interrupted',
+              error_message = 'auto-failed: no progress for 48h',
+              updated_at = unixepoch()
+        WHERE state IN ('running', 'paused_for_outage', 'paused_for_usage_limit')
+          AND updated_at < unixepoch() - ?1`,
+    )
+      .bind(STUCK_JOB_THRESHOLD_SECONDS)
+      .run();
+    // Auto-fail anything that has been polled more than MAX_POLL_ATTEMPTS times
+    // without reaching a terminal state. Independent backstop from the time-
+    // based one above — catches the "fresh updated_at but never done" case.
+    await env.DB.prepare(
+      `UPDATE pipeline_jobs
+          SET state = 'failed',
+              error_kind = 'interrupted',
+              error_message = 'auto-failed: poll attempts exhausted',
+              updated_at = unixepoch()
+        WHERE state IN ('running', 'paused_for_outage', 'paused_for_usage_limit')
+          AND attempt_count > ?1`,
+    )
+      .bind(MAX_POLL_ATTEMPTS)
+      .run();
+    // Recover wedged dispatches so a dead-mid-POST Worker can't hold the slot
+    // forever.
+    await env.DB.prepare(
+      `UPDATE pipeline_jobs
+          SET state = 'failed',
+              error_kind = 'interrupted',
+              error_message = 'auto-failed: dispatch did not complete',
+              updated_at = unixepoch()
+        WHERE state = 'dispatching'
+          AND updated_at < unixepoch() - ?1`,
+    )
+      .bind(STUCK_DISPATCH_THRESHOLD_SECONDS)
+      .run();
+  } catch (err) {
+    console.error("[scheduled.pipelinePoll] backstop sweeps failed:", err);
+  }
   // The whole poll batch is isolated from the dispatchNext below. A throw here
   // is not hypothetical: a deploy that ships code referencing a column whose
   // migration hasn't been applied to prod makes this SELECT throw on EVERY */5
