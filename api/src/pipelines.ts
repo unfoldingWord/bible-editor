@@ -1172,36 +1172,49 @@ export async function pollAllNonTerminal(env: Env): Promise<void> {
   )
     .bind(STUCK_DISPATCH_THRESHOLD_SECONDS)
     .run();
-  const rs = await env.DB.prepare(
-    `SELECT job_id, upstream_job_id, user_id, pipeline_type, book, start_chapter,
-            end_chapter, session_key, follow_up_options, follow_up_chain,
-            follow_up_job_id, error_kind, updated_at, resume_attempt_count,
-            last_resume_at, resume_accepted_at, options_json,
-            (output_json IS NULL) AS no_output_yet
-       FROM pipeline_jobs
-      WHERE state IN ('running', 'paused_for_outage', 'paused_for_usage_limit')
-      ORDER BY updated_at ASC
-      LIMIT 50`,
-  ).all<PolledJob>();
-  const jobs = rs.results ?? [];
-  if (jobs.length > 0) {
-    // Bump attempt_count for everything we're about to poll, in one batch. We
-    // do this BEFORE the upstream calls so a Worker crash doesn't undo the
-    // increment — the cap is the whole point of this column.
-    await env.DB.prepare(
-      `UPDATE pipeline_jobs
-          SET attempt_count = attempt_count + 1
-        WHERE job_id IN (${jobs.map((_, i) => `?${i + 1}`).join(",")})`,
-    )
-      .bind(...jobs.map((j) => j.job_id))
-      .run();
-    await Promise.allSettled(
-      jobs.map((j) =>
-        pollPipelineJob(env, j).catch((err) => {
-          console.error(`[scheduled.pipelinePoll] job=${j.job_id}:`, err);
-        }),
-      ),
-    );
+  // The whole poll batch is isolated from the dispatchNext below. A throw here
+  // is not hypothetical: a deploy that ships code referencing a column whose
+  // migration hasn't been applied to prod makes this SELECT throw on EVERY */5
+  // tick, and an unguarded throw took dispatchNext down with it — so the running
+  // job never advanced AND nothing queued behind it ever dispatched. (EZK 40
+  // generate, 2026-08-01: migrations 0038/0039 unapplied in prod, job frozen at
+  // attempt_count=0 with a queue behind it for the whole weekend.) The migration
+  // gap is fixed at its source in api/package.json's deploy script; this keeps
+  // the queue draining even when some future poll path is broken.
+  try {
+    const rs = await env.DB.prepare(
+      `SELECT job_id, upstream_job_id, user_id, pipeline_type, book, start_chapter,
+              end_chapter, session_key, follow_up_options, follow_up_chain,
+              follow_up_job_id, error_kind, updated_at, resume_attempt_count,
+              last_resume_at, resume_accepted_at, options_json,
+              (output_json IS NULL) AS no_output_yet
+         FROM pipeline_jobs
+        WHERE state IN ('running', 'paused_for_outage', 'paused_for_usage_limit')
+        ORDER BY updated_at ASC
+        LIMIT 50`,
+    ).all<PolledJob>();
+    const jobs = rs.results ?? [];
+    if (jobs.length > 0) {
+      // Bump attempt_count for everything we're about to poll, in one batch. We
+      // do this BEFORE the upstream calls so a Worker crash doesn't undo the
+      // increment — the cap is the whole point of this column.
+      await env.DB.prepare(
+        `UPDATE pipeline_jobs
+            SET attempt_count = attempt_count + 1
+          WHERE job_id IN (${jobs.map((_, i) => `?${i + 1}`).join(",")})`,
+      )
+        .bind(...jobs.map((j) => j.job_id))
+        .run();
+      await Promise.allSettled(
+        jobs.map((j) =>
+          pollPipelineJob(env, j).catch((err) => {
+            console.error(`[scheduled.pipelinePoll] job=${j.job_id}:`, err);
+          }),
+        ),
+      );
+    }
+  } catch (err) {
+    console.error("[scheduled.pipelinePoll] batch failed:", err);
   }
 
   // Safety net: if the slot is free and something is queued, dispatch it. This
