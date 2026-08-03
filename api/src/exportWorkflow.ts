@@ -36,6 +36,7 @@ import {
   recreateExportBranchFromMaster,
   updateDcsPrBranch,
   usfmAlignmentShrinkRefused,
+  classifyAlignmentShrinkOffenders,
   RESOURCE_TARGETS,
   type AlignmentShrinkResult,
   type Resource,
@@ -1275,37 +1276,61 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     offenders: AlignmentShrinkResult["offenders"],
   ): Promise<void> {
     const source = `export_align_shrink:${book}:${resource}`;
-    // Split offenders by whether the verse's word SEQUENCE was unchanged
-    // (analyzeAlignmentDelta's own index-matched-vs-LCS discriminator — see
-    // export.ts). These are two different failure modes that both surface as
-    // "lost alignment" if worded generically, and conflating them sent an
-    // operator to re-align a word for the EZK 40 incident when the real
-    // problem was D1 and master holding different revisions of the chapter
-    // (fixed separately by withholding the sync watermark on locked chapters
-    // — see bookReimport.ts's reimport-sync step). This changes only the
-    // wording below, never the refusal decision above.
-    const unchanged = offenders.filter((o) => o.sequenceUnchanged);
-    const changed = offenders.filter((o) => !o.sequenceUnchanged);
-
-    const collateralMsg =
-      `${unchanged.length} verse(s) lost \\zaln word alignment on text that is UNCHANGED ` +
-      `(${detail}). This is the 1CH 4:21 / NUM 24 / JER 36:11 collateral de-alignment ` +
-      `signature — refusing to ship it to master. Re-align the affected verse(s) in the editor, then re-export.`;
-    const revisionMsg =
-      `${changed.length} verse(s) show apparent alignment loss, but their word SEQUENCE also changed — D1 and ` +
-      `master hold DIFFERENT REVISIONS of these verses, and the named words are coincidental surface matches ` +
-      `between two different sentences, not a translator's mistake (the EZK 40 signature). The remedy is to fix ` +
-      `the sync / re-sync ${book} ${resource.toUpperCase()} from master, NOT to re-align words.`;
+    const label = `${book} ${resource.toUpperCase()}`;
+    // classifyAlignmentShrinkOffenders (export.ts) splits offenders into three
+    // cases that must NOT share generic "lost alignment, re-align it" wording:
+    //
+    //   "none" — no offenders at all. Reached via checkUsfmAlignmentShrink's
+    //   `master_unreadable` path: a DCS fetch failure, not any translator
+    //   mistake. The old generic wording read as "0 verse(s) lost \zaln word
+    //   alignment on text that is UNCHANGED (master_unreadable) ... Re-align
+    //   the affected verse(s)" — describing a network failure as an
+    //   alignment bug and pointing at the wrong remedy entirely.
+    //
+    //   "sentinel" — the synthetic `ref: "*"` offender usfmAlignmentShrinkRefused
+    //   emits for an unparseable or empty RENDER (our own rendering bug, not
+    //   a translator's), which the old wording also reported as collateral
+    //   de-alignment needing re-alignment.
+    //
+    //   "genuine" — real per-verse offenders, split by sequenceUnchanged:
+    //   collateral de-alignment on UNCHANGED text (1CH 4:21 / JER 36:11
+    //   signature) vs. D1/master holding DIFFERENT REVISIONS of the verse
+    //   (the EZK 40 signature, fixed separately by withholding the sync
+    //   watermark on locked chapters — see bookReimport.ts's reimport-sync
+    //   step). None of this changes the refusal decision above, only wording.
+    const classification = classifyAlignmentShrinkOffenders(offenders);
 
     let message: string;
-    if (changed.length === 0) {
-      message = `Benjamin fix this — nightly export BLOCKED ${book} ${resource.toUpperCase()}: ${collateralMsg}`;
-    } else if (unchanged.length === 0) {
-      message = `Benjamin fix this — nightly export BLOCKED ${book} ${resource.toUpperCase()}: ${revisionMsg}`;
-    } else {
+    if (classification.kind === "none") {
       message =
-        `Benjamin fix this — nightly export BLOCKED ${book} ${resource.toUpperCase()}: mixed causes. ` +
-        `${collateralMsg} SEPARATELY, ${revisionMsg}`;
+        `Benjamin fix this — nightly export BLOCKED ${label}: could not verify the render against master ` +
+        `(${detail}) — this is a DCS connectivity / fetch problem, not an alignment mistake. Inspect the export ` +
+        `run (wrangler tail / DCS status), then re-export once master is readable again. No verse needs re-aligning.`;
+    } else if (classification.kind === "sentinel") {
+      message =
+        `Benjamin fix this — nightly export BLOCKED ${label}: the render itself was ${classification.which === "empty_render" ? "EMPTY" : "UNPARSEABLE"} ` +
+        `(${detail}). This points at a bug in OUR render, not at anything a translator needs to re-align. ` +
+        `Inspect the export run's output for ${book} ${resource.toUpperCase()} before re-exporting.`;
+    } else {
+      const { unchanged, changed } = classification;
+      const collateralMsg =
+        `${unchanged.length} verse(s) lost \\zaln word alignment on text that is UNCHANGED ` +
+        `(${detail}). This is the 1CH 4:21 / NUM 24 / JER 36:11 collateral de-alignment ` +
+        `signature — refusing to ship it to master. Re-align the affected verse(s) in the editor, then re-export.`;
+      const revisionMsg =
+        `${changed.length} verse(s) show apparent alignment loss, but their word SEQUENCE also changed — D1 and ` +
+        `master hold DIFFERENT REVISIONS of these verses, and the named words are coincidental surface matches ` +
+        `between two different sentences, not a translator's mistake (the EZK 40 signature). The remedy is to fix ` +
+        `the sync / re-sync ${label} from master, NOT to re-align words.`;
+      if (changed.length === 0) {
+        message = `Benjamin fix this — nightly export BLOCKED ${label}: ${collateralMsg}`;
+      } else if (unchanged.length === 0) {
+        message = `Benjamin fix this — nightly export BLOCKED ${label}: ${revisionMsg}`;
+      } else {
+        message =
+          `Benjamin fix this — nightly export BLOCKED ${label}: mixed causes. ` +
+          `${collateralMsg} SEPARATELY, ${revisionMsg}`;
+      }
     }
     await this.writeAlert(source, message, `${this.env.DCS_BASE_URL}/unfoldingWord`);
   }

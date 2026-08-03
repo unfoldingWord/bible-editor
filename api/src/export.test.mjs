@@ -5,7 +5,7 @@
 // instead of getting silently flattened to `\v 6`. Not a test framework;
 // failures exit non-zero.
 
-import { attributeTsvShrink, buildExportBranch, buildTnTsv, buildTqTsv, buildTwlTsv, buildUsfm, commitToDcs, countDuplicateMasterIds, describeShrinkRefusal, ensureDcsPr, exportTsvShrinkRefused, parseTsvIds, recreateExportBranchFromMaster, updateDcsPrBranch, usfmAlignmentShrinkRefused } from "./export.ts";
+import { attributeTsvShrink, buildExportBranch, buildTnTsv, buildTqTsv, buildTwlTsv, buildUsfm, classifyAlignmentShrinkOffenders, commitToDcs, countDuplicateMasterIds, describeShrinkRefusal, ensureDcsPr, exportTsvShrinkRefused, parseTsvIds, recreateExportBranchFromMaster, updateDcsPrBranch, usfmAlignmentShrinkRefused } from "./export.ts";
 import { CorruptContentJsonError } from "./contentJson.ts";
 
 function assert(cond, msg) {
@@ -1193,6 +1193,59 @@ function utf8Base64(s) {
   assert(
     JSON.stringify(r9.offenders[0].lostWords) === JSON.stringify(["steps"]),
     `names the coincidentally-shared word "steps" as the (misleading) lost word`,
+  );
+}
+
+// --- classifyAlignmentShrinkOffenders: alert-wording partition ---
+// Extracted pure classification for recordAlignmentShrinkSkipAlert
+// (exportWorkflow.ts, untestable by the strip-types runner). Three cases the
+// nightly alert must word differently — see export.ts for the full rationale:
+//   - "none": no offenders at all (master_unreadable — a DCS fetch failure).
+//   - "sentinel": the synthetic ref:"*" offender for an unparseable/empty
+//     RENDER (our own rendering bug).
+//   - "genuine": real per-verse offenders, split by sequenceUnchanged.
+{
+  const none = classifyAlignmentShrinkOffenders([]);
+  assert(none.kind === "none", `no offenders at all → classified "none" (master_unreadable case)`);
+
+  const unparseable = classifyAlignmentShrinkOffenders([
+    { ref: "*", lostWords: ["unparseable_render"], sequenceUnchanged: true },
+  ]);
+  assert(unparseable.kind === "sentinel", `the "*" unparseable_render sentinel → classified "sentinel"`);
+  assert(unparseable.which === "unparseable_render", `sentinel classification names which sentinel fired`);
+
+  const empty = classifyAlignmentShrinkOffenders([
+    { ref: "*", lostWords: ["empty_render"], sequenceUnchanged: true },
+  ]);
+  assert(empty.kind === "sentinel", `the "*" empty_render sentinel → classified "sentinel"`);
+  assert(empty.which === "empty_render", `sentinel classification names empty_render specifically`);
+
+  const genuineUnchanged = classifyAlignmentShrinkOffenders([
+    { ref: "1CH 4:21", lostWords: ["Shelah"], sequenceUnchanged: true },
+  ]);
+  assert(genuineUnchanged.kind === "genuine", `a real per-verse offender → classified "genuine"`);
+  assert(
+    genuineUnchanged.unchanged.length === 1 && genuineUnchanged.changed.length === 0,
+    `genuine + sequenceUnchanged:true sorts into the "unchanged" (collateral de-alignment) bucket`,
+  );
+
+  const genuineChanged = classifyAlignmentShrinkOffenders([
+    { ref: "EZK 40:6", lostWords: ["steps"], sequenceUnchanged: false },
+  ]);
+  assert(genuineChanged.kind === "genuine", `a real per-verse revision-mismatch offender → classified "genuine"`);
+  assert(
+    genuineChanged.unchanged.length === 0 && genuineChanged.changed.length === 1,
+    `genuine + sequenceUnchanged:false sorts into the "changed" (different-revision) bucket`,
+  );
+
+  const mixed = classifyAlignmentShrinkOffenders([
+    { ref: "1CH 4:21", lostWords: ["Shelah"], sequenceUnchanged: true },
+    { ref: "EZK 40:6", lostWords: ["steps"], sequenceUnchanged: false },
+  ]);
+  assert(mixed.kind === "genuine", `mixed unchanged+changed offenders → still classified "genuine"`);
+  assert(
+    mixed.unchanged.length === 1 && mixed.changed.length === 1,
+    `mixed case splits correctly into both buckets`,
   );
 }
 

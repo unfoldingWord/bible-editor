@@ -13,7 +13,9 @@
 // on 2026-08-01) got rendered as current. shouldRecordResourceSync is the
 // pure decision the reimport-sync step (bookReimport.ts) now gates on:
 // withhold the stamp iff this run's counts show a locked chapter for that
-// resource. A watermark must not certify data it didn't apply.
+// resource — EITHER at the chunk-apply phase (chapters_locked) or the LATER
+// prune phase (prune_locked), which can see a lock the apply phase missed.
+// A watermark must not certify data it didn't apply.
 
 import { shouldRecordResourceSync } from "./reimportSyncGate.ts";
 
@@ -36,6 +38,7 @@ function counts(overrides = {}) {
     skipped_edited: 0,
     skipped_locked: 0,
     chapters_locked: 0,
+    prune_locked: 0,
     skipped_noop: 0,
     skipped_dup: 0,
     resurrected: 0,
@@ -68,12 +71,63 @@ eq(
 // THE OVERLOADING HAZARD: skipped_locked is ALSO incremented by the
 // row-level prune path (softDeleteRemovedTsvRows skipping a locked row), a
 // different and much less severe situation that must NOT withhold the
-// watermark. Only chapters_locked (the chapter-lock-skip counter) gates the
-// decision.
+// watermark on its own. Only chapters_locked / prune_locked gate the decision.
 eq(
-  shouldRecordResourceSync(counts({ skipped_locked: 3, chapters_locked: 0 })),
+  shouldRecordResourceSync(counts({ skipped_locked: 3, chapters_locked: 0, prune_locked: 0 })),
   true,
-  "skipped_locked > 0 from prune-row skips alone (chapters_locked === 0) → still stamp",
+  "skipped_locked > 0 alone, both new fields zero → still stamp (the existing overloading regression)",
+);
+
+// FIX A: prune_locked alone (a lock held during the LATER prune step, missed
+// by the earlier chunk-apply step) must withhold just like chapters_locked.
+eq(
+  shouldRecordResourceSync(counts({ prune_locked: 1, chapters_locked: 0 })),
+  false,
+  "prune_locked > 0 with chapters_locked === 0 → withhold the watermark",
+);
+
+// Both zero → stamp.
+eq(
+  shouldRecordResourceSync(counts({ chapters_locked: 0, prune_locked: 0 })),
+  true,
+  "both chapters_locked and prune_locked zero → stamp",
+);
+
+// Either non-zero → withhold.
+eq(
+  shouldRecordResourceSync(counts({ chapters_locked: 1, prune_locked: 0 })),
+  false,
+  "chapters_locked non-zero, prune_locked zero → withhold",
+);
+eq(
+  shouldRecordResourceSync(counts({ chapters_locked: 0, prune_locked: 1 })),
+  false,
+  "chapters_locked zero, prune_locked non-zero → withhold",
+);
+eq(
+  shouldRecordResourceSync(counts({ chapters_locked: 1, prune_locked: 1 })),
+  false,
+  "both non-zero → withhold",
+);
+
+// FIX F: a counts object from a Workflow instance that began BEFORE this fix
+// shipped replays memoized step.do results that simply lack these two fields.
+// That must be treated as fail-safe (withhold), never as "absent means zero,
+// so stamp" — the malformed/legacy-object direction is always withhold.
+eq(
+  shouldRecordResourceSync({}),
+  false,
+  "counts object missing chapters_locked AND prune_locked entirely → withhold (fail-safe, not zero-and-stamp)",
+);
+eq(
+  shouldRecordResourceSync({ chapters_locked: 0 }),
+  false,
+  "counts object missing prune_locked only → withhold (fail-safe)",
+);
+eq(
+  shouldRecordResourceSync({ prune_locked: 0 }),
+  false,
+  "counts object missing chapters_locked only → withhold (fail-safe)",
 );
 
 if (failed > 0) {

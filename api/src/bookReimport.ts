@@ -101,9 +101,20 @@ export interface ReimportCounts {
   // Chapters skipped this run because an active AI pipeline job held the
   // chapter lock — DISTINCT from skipped_locked, which also counts row-level
   // prune skips (softDeleteRemovedTsvRows) that are not a sync-freshness
-  // concern. Only this counter gates the (book, resource) watermark stamp —
-  // see shouldRecordResourceSync / the EZK 40 incident at the sync step.
+  // concern. Together with prune_locked below, this gates the (book,
+  // resource) watermark stamp — see shouldRecordResourceSync / the EZK 40
+  // incident at the sync step.
   chapters_locked: number;
+  // Row-level prune skips this run because an active AI pipeline job held
+  // the chapter lock during softDeleteRemovedTsvRows (the reimport-prune-*
+  // Workflow step, a LATER step than the chunk-apply steps that populate
+  // chapters_locked above). A lock that starts after the chunk step finishes
+  // but is still held during the prune step leaves chapters_locked === 0 —
+  // the apply phase never saw it — yet the prune for that chapter never ran,
+  // so the row-deletion side of this resource's sync is still stale. Gate on
+  // BOTH counters, not just chapters_locked, or the watermark can still be
+  // stamped for a resource whose prune phase was incomplete.
+  prune_locked: number;
   skipped_noop: number;
   // Incoming row not inserted because an identical-content row already exists
   // (Guard 2, content-dedup). Tracked separately from skipped_noop so the guard
@@ -150,6 +161,7 @@ function zeroCounts(): ReimportCounts {
     skipped_edited: 0,
     skipped_locked: 0,
     chapters_locked: 0,
+    prune_locked: 0,
     skipped_noop: 0,
     skipped_dup: 0,
     resurrected: 0,
@@ -168,7 +180,17 @@ function addCounts(into: ReimportCounts, from: ReimportCounts): void {
   into.deleted += from.deleted;
   into.skipped_edited += from.skipped_edited;
   into.skipped_locked += from.skipped_locked;
-  into.chapters_locked += from.chapters_locked;
+  // `?? 0` guards a `from` object memoized by a Workflow instance that began
+  // before these two fields existed — `step.do` replays its stored result
+  // verbatim on resume, so an in-flight instance can hand addCounts an object
+  // with `chapters_locked`/`prune_locked` simply absent (not 0). Without the
+  // coercion, `into.x += undefined` poisons the running total to NaN for the
+  // rest of this merge chain. shouldRecordResourceSync treats a legacy/
+  // malformed object as fail-safe (withhold) regardless — see its comment —
+  // so this coercion is about keeping the aggregate counters sane for
+  // logging, not about the gate decision itself.
+  into.chapters_locked += from.chapters_locked ?? 0;
+  into.prune_locked += from.prune_locked ?? 0;
   into.skipped_noop += from.skipped_noop;
   into.skipped_dup += from.skipped_dup;
   into.resurrected += from.resurrected;
@@ -1600,7 +1622,7 @@ export async function recordResourceSync(
   book: string,
   resource: Resource,
   sha: string,
-  origin: "import" | "reimport" | "export",
+  origin: "import" | "reimport" | "export" | "reimport_withheld",
 ): Promise<void> {
   await env.DB.prepare(
     `INSERT INTO book_resource_syncs (book, resource, source_sha, synced_at, origin)
@@ -1621,6 +1643,42 @@ export async function storedResourceSha(env: Env, book: string, resource: Resour
     .bind(book, resource)
     .first<{ source_sha: string | null }>();
   return row?.source_sha ?? null;
+}
+
+// Sentinel SHA that can never equal a real git commit SHA. Written by
+// recordWithheldSyncIfAbsent below when a (book, resource) has NO existing
+// watermark row and this run is withholding the stamp (a locked chapter —
+// see shouldRecordResourceSync). Consequences, both intentional:
+//   - checkMasterFreshness (exportWorkflow.ts) compares this sentinel against
+//     master's real SHA, which never matches → returns `master_ahead` instead
+//     of the current `no_watermark` (which returns ok:true and bypasses the
+//     freshness gate entirely) → the export honestly skips with `export_stale`.
+//   - planAndStageBookResources's SHA skip-gate (`fileCommitSha === stored`)
+//     also never matches this sentinel → the file is re-fetched and staged
+//     again next night, which is the desired retry.
+// A real SHA recorded later via recordResourceSync's normal upsert overwrites
+// this sentinel with no special handling — same UPSERT, no code path cares
+// which sha was there before.
+const WITHHELD_SYNC_SENTINEL_SHA = "withheld";
+
+// Guarantee the freshness gate has SOMETHING to compare against for a
+// (book, resource) whose watermark stamp we're withholding this run. Without
+// this, a book with no `book_resource_syncs` row at all (seeded imports whose
+// fetch-time SHA came back null — see bookImport.ts; or scripts/import-book.mjs,
+// which never writes one) sees withholding change nothing: checkMasterFreshness
+// reports `no_watermark` (ok:true) either way, and the export proceeds on
+// stale D1 data indefinitely — the EZK 40 outcome this branch exists to
+// prevent, just reached from "no watermark" instead of "stale watermark".
+//
+// Deliberately a no-op when a row already exists (real OR previously
+// withheld) — see storedResourceSha's contract: an older real SHA already
+// yields `master_ahead` on its own, which is correct and prints a genuine
+// "synced" SHA in the alert; overwriting it here would throw that useful
+// information away for no benefit.
+export async function recordWithheldSyncIfAbsent(env: Env, book: string, resource: Resource): Promise<void> {
+  const existing = await storedResourceSha(env, book, resource);
+  if (existing) return;
+  await recordResourceSync(env, book, resource, WITHHELD_SYNC_SENTINEL_SHA, "reimport_withheld");
 }
 
 // Comparable-field signature for a normalized TSV row. MUST cover exactly the
@@ -1944,7 +2002,27 @@ async function reimportStagedChunk(
       for (const e of staged) {
         if (!e.changed) continue;
         perResource[e.resource].skipped_locked++;
-        perResource[e.resource].chapters_locked++;
+        // chapters_locked gates the sync watermark (shouldRecordResourceSync)
+        // — it must be truthful, or a lock on a chapter with no real work for
+        // a given resource would stall that resource's watermark for nothing
+        // (over-withholding: up to 5 export_stale alerts/night for 1 locked
+        // chapter). For the TSV kinds we can check EXACTLY what the row loop
+        // below would have done: it skips a chapter when `changedSets[kind]`
+        // exists and doesn't contain the chapter (line ~1968's `continue`).
+        // Mirror that condition here — increment only when this kind actually
+        // had work in the locked chapter.
+        //
+        // ult/ust are deliberately left unconditional (fail-safe): unlike a
+        // TSV kind's precomputed changed-chapter set, "did this chapter have
+        // any verses to write" isn't available here as an equally exact
+        // check, and the safe direction on uncertainty is to withhold, not
+        // to stamp.
+        if (e.resource === "ult" || e.resource === "ust") {
+          perResource[e.resource].chapters_locked++;
+          continue;
+        }
+        const set = changedSets[e.resource as TsvKind];
+        if (!set || set.has(chapter)) perResource[e.resource].chapters_locked++;
       }
       continue;
     }
@@ -2019,7 +2097,7 @@ export async function runChunkedReimport(
     const chs = changedTsv[kind];
     if (!chs || chs.length === 0) continue;
     const r2Key = e.r2Key;
-    await step.do(`reimport-prune-${book}-${kind}`, async () => {
+    const res = await step.do(`reimport-prune-${book}-${kind}`, async () => {
       const raw = await readStaged(env, r2Key);
       if (raw == null) return { deleted: 0, skippedLocked: 0 };
       const res = await softDeleteRemovedTsvRows(env, book, kind, raw, chs);
@@ -2028,6 +2106,11 @@ export async function runChunkedReimport(
       }
       return res;
     });
+    // Feed the prune's own lock skips into the watermark gate (FIX A / the
+    // prune-phase half of shouldRecordResourceSync) — this step runs LATER
+    // than the chunk-apply steps above, so a lock that starts after those
+    // steps finish but is still held here is invisible to chapters_locked.
+    if (res.skippedLocked > 0) perResource[kind].prune_locked += res.skippedLocked;
   }
 
   // Canonical TWL order: recompute the ULT-position ordering for the book now
@@ -2072,6 +2155,15 @@ export async function runChunkedReimport(
       if (!e.masterSha) continue;
       if (!shouldRecordResourceSync(perResource[e.resource])) {
         withheld.push(e.resource);
+        // FIX B: a book whose (book, resource) has NO existing watermark row
+        // (e.g. seeded by scripts/import-book.mjs, or whose import-time SHA
+        // fetch returned null — bookImport.ts) would otherwise have withholding
+        // change nothing — checkMasterFreshness still reports `no_watermark`
+        // (ok:true) and the export proceeds on stale data indefinitely. Write a
+        // sentinel that can never match a real master SHA so the freshness gate
+        // has something to refuse against. No-op when a real (or previously
+        // withheld) row already exists — see recordWithheldSyncIfAbsent.
+        await recordWithheldSyncIfAbsent(env, book, e.resource);
         continue;
       }
       await recordResourceSync(env, book, e.resource, e.masterSha, "reimport");

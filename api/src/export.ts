@@ -665,6 +665,45 @@ export function usfmAlignmentShrinkRefused(
   return { refused: offenders.length > 0, offenders };
 }
 
+// Pure classification of `usfmAlignmentShrinkRefused`'s offenders, extracted
+// so the nightly alert's wording (exportWorkflow.ts's
+// recordAlignmentShrinkSkipAlert) can be tested by the strip-types runner —
+// exportWorkflow.ts itself isn't. Three cases the alert must word differently:
+//
+//   - "none": no offenders at all. Reached from checkUsfmAlignmentShrink's
+//     `master_unreadable` path (a fetch failure, not a de-alignment) — with
+//     no offenders, generic wording read as "0 verse(s) lost alignment...
+//     re-align the affected verse(s)", describing a fetch failure as a
+//     translator's mistake with the wrong remedy.
+//   - "sentinel": the single `ref: "*"` synthetic offender that
+//     usfmAlignmentShrinkRefused emits for `unparseable_render` / `empty_render`
+//     — a corrupt or empty RENDER, i.e. a bug in OUR rendering, not anything a
+//     translator did. Naming which sentinel it was lets the alert say so.
+//   - "genuine": real per-verse offenders, split by `sequenceUnchanged` — the
+//     existing collateral-de-alignment vs different-revision distinction.
+export type AlignmentShrinkAlertClassification =
+  | { kind: "none" }
+  | { kind: "sentinel"; which: string }
+  | {
+      kind: "genuine";
+      unchanged: AlignmentShrinkResult["offenders"];
+      changed: AlignmentShrinkResult["offenders"];
+    };
+
+export function classifyAlignmentShrinkOffenders(
+  offenders: AlignmentShrinkResult["offenders"],
+): AlignmentShrinkAlertClassification {
+  if (offenders.length === 0) return { kind: "none" };
+  if (offenders.length === 1 && offenders[0].ref === "*") {
+    return { kind: "sentinel", which: offenders[0].lostWords[0] ?? "unknown" };
+  }
+  return {
+    kind: "genuine",
+    unchanged: offenders.filter((o) => o.sequenceUnchanged),
+    changed: offenders.filter((o) => !o.sequenceUnchanged),
+  };
+}
+
 // ── USFM rebuilder ───────────────────────────────────────────────────────────
 
 export interface UsfmInputs {
