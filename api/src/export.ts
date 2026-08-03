@@ -206,6 +206,171 @@ export function exportTsvShrinkRefused(renderedRows: number, masterRows: number)
   return lost / masterRows > 0.05;
 }
 
+// ── Shrink attribution (which of master's rows we can account for) ──────────
+// The guard above rightly refuses ANY render that would drop a large share of
+// master's rows — but its alert used to unconditionally claim "this looks like
+// an incomplete D1 load (truncated fetch), not a real deletion", which was
+// wrong for 1CH TQ, where an ID-set diff against production proved all 62 of
+// the missing rows carry HUMAN deletion tombstones in D1 (zero unexplained
+// residual) — a real, deliberate cleanup of unhelpful genealogy questions,
+// not truncation. parseTsvIds pulls master's row IDs out of its raw TSV body
+// so the caller (checkTsvShrink) can split "missing" into "D1 deliberately
+// removed" vs "D1 simply doesn't have", and judge only the latter half.
+//
+// Column index 1 is `ID` in all three TSV schemas (see TN_HEADERS/TQ_HEADERS/
+// TWL_HEADERS above). Returns null — "unparseable" — when the header or any
+// data row doesn't look like what we expect; the caller MUST fall back to the
+// count-only guard in that case. Failing closed matters here: a body we can't
+// parse must never be allowed to "explain" missing rows.
+export function parseTsvIds(raw: string): string[] | null {
+  const lines = raw.split(/\r?\n/).filter((l) => l.length > 0);
+  if (lines.length === 0) return null;
+  const header = lines[0].split("\t");
+  if (header[1] !== "ID") return null;
+  const ids: string[] = [];
+  for (const line of lines.slice(1)) {
+    const id = line.split("\t")[1]?.trim();
+    if (!id) return null;
+    ids.push(id);
+  }
+  return ids;
+}
+
+// Defect 5: a duplicated ID within master's own TSV means attribution can't
+// tell which physical row owns that ID — collapsing to a Set (as
+// attributeTsvShrink does for its own "how many distinct rows are missing"
+// bookkeeping) silently treats N duplicate lines as one row, understating the
+// real loss. This repo has real history of duplicate/colliding IDs (the ISA 48
+// delete+duplicate incident; the digit-first row-id collision bug), so the
+// caller (checkTsvShrink) must fail closed on any duplicate BEFORE attempting
+// attribution, rather than let attributeTsvShrink's Set quietly dedupe them
+// into an explainable loss. Pure so it can be tested directly.
+export function countDuplicateMasterIds(masterIds: string[]): number {
+  const seen = new Set<string>();
+  let duplicates = 0;
+  for (const id of masterIds) {
+    if (seen.has(id)) duplicates++;
+    else seen.add(id);
+  }
+  return duplicates;
+}
+
+// A removal entry's `source` counts as human-authored intent to remove the
+// row. `null` is the in-app human delete (rows.ts:861-865) and trash
+// (rows.ts:973-980) — both omit the column. `nightly_finalize` (index.ts:262)
+// is machine-EXECUTED but human-AUTHORED: it's the nightly promotion of a
+// human's trash to a deleted_at tombstone, so it counts too. Every other
+// source is a machine decision (`dcs_reimport` — bookReimport.ts:1810,
+// truncated-fetch reimport prune; `ai_pipeline` — pipelineImport.ts:695, AI
+// auto-apply) and must NOT be credited.
+//
+// Deliberately NOT listed, though a human directed them: the one-off repair
+// sources in prod's edit_log (`dedup_repair`, `data_repair_isa48`). A shrink
+// that traces to one of those will still block, and a human clears it with the
+// existing allowShrink override. That's the conservative side of the trade —
+// this set only grows on evidence that a source is routinely human-authored,
+// because every addition widens what can delete rows from master unattended.
+export const HUMAN_INTENT_REMOVAL_SOURCES: ReadonlySet<string | null> = new Set<string | null>([
+  null,
+  "nightly_finalize",
+]);
+
+// Splits master's row loss into "explained" (D1's newest removal entry for
+// the row is human-authored, per HUMAN_INTENT_REMOVAL_SOURCES) vs
+// "unexplained" (D1 has no record of the row at all, or its newest removal
+// entry is machine-authored) — the truncated-fetch signature, e.g. the
+// twl_PSA clobber: 2,896 missing rows with zero tombstones.
+//
+// Three incidents this must resolve:
+//   - 1CH TQ:  62 missing rows, all 62 human tombstones (source NULL), 0
+//              unexplained — a real, deliberate cleanup. Must SHIP. (Stated as
+//              the invariant, not absolute counts: both master and D1 keep
+//              growing, so a "master N / render M" snapshot decays. Validated
+//              against prod at 464 master / 402 live, where the 62/62/0 split
+//              held exactly.)
+//   - twl_PSA: master 7,776 / render 4,880 / 2,896 rows absent from D1
+//              entirely, zero tombstones — truncated load. Must BLOCK.
+//   - HAB (stale trash): a translator trashes a tn row (source NULL), then
+//     untrashes it — the 'trash' edit_log entry stays forever, 'untrash' is a
+//     separate entry and does not delete it. Weeks later a truncated-fetch
+//     reimport prune tombstones the same row with source='dcs_reimport'. The
+//     row is now both currently-removed AND has a human removal entry
+//     somewhere in its history — crediting on "any historical human entry"
+//     wrongly ships this. Keying on the NEWEST removal entry per row (via
+//     `removals`, which the caller MUST pass ordered oldest -> newest so
+//     last-write-wins) fixes it: newest is 'dcs_reimport' -> unexplained.
+//     (The mirror case — trash(NULL) then nightly_finalize(delete) — has
+//     newest 'nightly_finalize', which IS human intent, so it's explained.)
+//
+// Pure — the caller resolves `rowStates` / `removals` from D1.
+export function attributeTsvShrink(args: {
+  masterIds: string[];
+  // Every row for this book+kind, exactly as SELECTed from <kind>_rows.
+  rowStates: Array<{ id: string; deleted_at: number | null; trashed_at?: number | null }>;
+  // edit_log removal entries for this book+kind, action IN ('delete','trash').
+  // `id` is edit_log's own autoincrement PK — attributeTsvShrink picks each
+  // row_key's newest entry itself (by MAX id), so the caller's query order no
+  // longer matters (Defect 6: deleting an `ORDER BY` used to be able to
+  // silently break the HAB fix below with every test still green, because the
+  // tests hand-built already-sorted arrays. The SQL still orders by id ASC —
+  // harmless, and it keeps the intent legible — but correctness doesn't lean
+  // on it anymore).
+  removals: Array<{ row_key: string; source: string | null; id: number }>;
+  resource: "tn" | "tq" | "twl";
+}): { liveCount: number; missing: number; explained: number; unexplained: number } {
+  const { masterIds, rowStates, removals, resource } = args;
+
+  // Mirrors buildResource's three render queries exactly: tn additionally
+  // excludes trashed_at (pending-deletion notes), tq/twl only exclude
+  // deleted_at.
+  const liveIds = new Set<string>();
+  // Defect 1: a row may be credited only when D1 actually holds it in a
+  // removed state right now — NOT merely because edit_log has some removal
+  // entry for the id. An id absent from `rowStates` entirely is the twl_PSA
+  // truncated-fetch signature ("D1 has no row at all"), and that is never
+  // explainable by an audit entry: a translator can trash(NULL) a tn row and
+  // then untrash it, leaving a permanent stale removal entry on a row that is
+  // once again live (untrash is a separate action, not itself a removal
+  // entry) — or a human delete+restore (rows.ts) leaves the same shape. If
+  // that row's id later vanishes from D1 altogether via a truncated load, it
+  // must still read as unexplained, whatever edit_log says about its past.
+  const removedIds = new Set<string>();
+  let liveCount = 0;
+  for (const row of rowStates) {
+    const isLive = row.deleted_at == null && (resource !== "tn" || row.trashed_at == null);
+    if (isLive) {
+      liveIds.add(row.id);
+      liveCount++;
+    } else {
+      removedIds.add(row.id);
+    }
+  }
+
+  // Last-write-wins over `removals`, keyed by each entry's own `id` (not
+  // arrival order) so out-of-order input can't invert the HAB stale-trash
+  // case.
+  const newestRemoval = new Map<string, { source: string | null; id: number }>();
+  for (const r of removals) {
+    const cur = newestRemoval.get(r.row_key);
+    if (!cur || r.id > cur.id) newestRemoval.set(r.row_key, { source: r.source, id: r.id });
+  }
+
+  const uniqueMasterIds = new Set(masterIds);
+  let explained = 0;
+  let unexplained = 0;
+  for (const id of uniqueMasterIds) {
+    if (liveIds.has(id)) continue;
+    // Both conditions required: D1 must currently hold the row removed, AND
+    // its newest removal entry must be human-authored. Either alone is not
+    // enough — see the Defect 1 comment above.
+    const newest = removedIds.has(id) ? newestRemoval.get(id) : undefined;
+    const isHumanIntent = newest !== undefined && HUMAN_INTENT_REMOVAL_SOURCES.has(newest.source ?? null);
+    if (isHumanIntent) explained++;
+    else unexplained++;
+  }
+  return { liveCount, missing: explained + unexplained, explained, unexplained };
+}
+
 // ── Export alignment-shrink guard (ULT/UST verse backstop) ───────────────────
 // The TSV shrink guard above protects row counts; this protects \zaln word
 // alignment on the scripture (verse) resources, where the row==line model

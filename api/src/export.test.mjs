@@ -5,7 +5,7 @@
 // instead of getting silently flattened to `\v 6`. Not a test framework;
 // failures exit non-zero.
 
-import { buildExportBranch, buildTnTsv, buildTwlTsv, buildUsfm, commitToDcs, ensureDcsPr, exportTsvShrinkRefused, recreateExportBranchFromMaster, updateDcsPrBranch, usfmAlignmentShrinkRefused } from "./export.ts";
+import { attributeTsvShrink, buildExportBranch, buildTnTsv, buildTwlTsv, buildUsfm, commitToDcs, countDuplicateMasterIds, ensureDcsPr, exportTsvShrinkRefused, parseTsvIds, recreateExportBranchFromMaster, updateDcsPrBranch, usfmAlignmentShrinkRefused } from "./export.ts";
 import { CorruptContentJsonError } from "./contentJson.ts";
 
 function assert(cond, msg) {
@@ -578,6 +578,282 @@ function utf8Base64(s) {
   assert(exportTsvShrinkRefused(0, 0) === false, `empty master never refuses`);
   // A render to zero rows against a populated master is the strongest signal.
   assert(exportTsvShrinkRefused(0, 4000) === true, `render-to-empty against populated master refused`);
+}
+
+// --- parseTsvIds: pull master's ID column out of a raw TSV body ---
+{
+  const tqTsv = [
+    ["Reference", "ID", "Tags", "Quote", "Occurrence", "Question", "Response"].join("\t"),
+    ["1:1", "abcd", "", "", "1", "Q1?", "A1"].join("\t"),
+    ["1:2", "efgh", "", "", "1", "Q2?", "A2"].join("\t"),
+  ].join("\n");
+  const ids = parseTsvIds(tqTsv);
+  assert(Array.isArray(ids), `happy-path TQ TSV parses`);
+  assert(ids.length === 2 && ids[0] === "abcd" && ids[1] === "efgh", `happy-path IDs extracted in order`);
+
+  const badHeader = ["Reference\tNotID\tTags", "1:1\tabcd\t"].join("\n");
+  assert(parseTsvIds(badHeader) === null, `header whose column 1 isn't ID returns null`);
+
+  const blankId = ["Reference\tID\tTags", "1:1\t\t"].join("\n");
+  assert(parseTsvIds(blankId) === null, `data line with an empty ID returns null`);
+
+  assert(parseTsvIds("") === null, `empty input returns null`);
+}
+
+// --- attributeTsvShrink: split missing rows into explained vs unexplained ---
+
+// 1CH TQ: master 436 rows, D1 renders 374 (62 missing), and every missing row
+// carries a human deletion tombstone (source NULL). Must ship: unexplained 0.
+{
+  const masterIds = Array.from({ length: 436 }, (_, i) => `id${i}`);
+  const liveIds = masterIds.slice(0, 374);
+  const removedIds = masterIds.slice(374); // the 62 "missing" ids
+  const rowStates = [
+    ...liveIds.map((id) => ({ id, deleted_at: null })),
+    ...removedIds.map((id) => ({ id, deleted_at: 1000 })),
+  ];
+  const removals = removedIds.map((id, i) => ({ row_key: id, source: null, id: i + 1 }));
+  const result = attributeTsvShrink({ masterIds, rowStates, removals, resource: "tq" });
+  assert(result.liveCount === 374, `1CH TQ: liveCount matches the render`);
+  assert(result.explained === 62 && result.unexplained === 0, `1CH TQ: all 62 missing rows explained`);
+}
+
+// twl_PSA: master 7776, D1 renders 4880 (2896 missing) — and those 2896 are
+// absent from D1 ENTIRELY (no rowStates entry at all), which is what a
+// truncated load looks like, not a tombstone. Must block.
+{
+  const masterIds = Array.from({ length: 7776 }, (_, i) => `id${i}`);
+  const liveIds = masterIds.slice(0, 4880);
+  const rowStates = liveIds.map((id) => ({ id, deleted_at: null }));
+  const result = attributeTsvShrink({ masterIds, rowStates, removals: [], resource: "twl" });
+  assert(result.liveCount === 4880, `twl_PSA: liveCount matches the render`);
+  assert(result.unexplained === 2896, `twl_PSA: all 2896 missing rows unexplained`);
+}
+
+// HAB: a truncated-fetch reimport prune tombstones rows with
+// source='dcs_reimport'. Machine-authored, must NOT be credited.
+{
+  const masterIds = ["a", "b", "c"];
+  const rowStates = [
+    { id: "a", deleted_at: null },
+    { id: "b", deleted_at: 500 },
+    { id: "c", deleted_at: 500 },
+  ];
+  const removals = [
+    { row_key: "b", source: "dcs_reimport", id: 1 },
+    { row_key: "c", source: "dcs_reimport", id: 2 },
+  ];
+  const result = attributeTsvShrink({ masterIds, rowStates, removals, resource: "tq" });
+  assert(result.explained === 0 && result.unexplained === 2, `HAB reimport prune: not credited`);
+}
+
+// Defect 2 (now Defect 1's "stale trash" case) regression: a stale human
+// trash must not permanently credit a later machine prune. Row "x": human
+// trash (source NULL), later untrashed (no removal entry for that), then a
+// truncated-fetch reimport prune tombstones it (source 'dcs_reimport') — the
+// NEWEST removal entry wins, so it must be unexplained. Sibling row "y":
+// human trash (source NULL), then the nightly finalize promotes it to a real
+// delete (source 'nightly_finalize', still human-authored intent) — must be
+// credited.
+{
+  const masterIds = ["x", "y"];
+  const rowStates = [
+    { id: "x", deleted_at: 900 },
+    { id: "y", deleted_at: 900 },
+  ];
+  const removals = [
+    { row_key: "x", source: null, id: 1 }, // human trash (older)
+    { row_key: "y", source: null, id: 2 }, // human trash (older)
+    { row_key: "x", source: "dcs_reimport", id: 3 }, // newer: reimport prune
+    { row_key: "y", source: "nightly_finalize", id: 4 }, // newer: nightly finalize
+  ];
+  const result = attributeTsvShrink({ masterIds, rowStates, removals, resource: "tn" });
+  assert(
+    result.explained === 1 && result.unexplained === 1,
+    `stale-trash regression: x (newest=dcs_reimport) unexplained, y (newest=nightly_finalize) explained`,
+  );
+}
+
+// ai_pipeline delete is machine-authored — not credited.
+{
+  const masterIds = ["z"];
+  const rowStates = [{ id: "z", deleted_at: 500 }];
+  const removals = [{ row_key: "z", source: "ai_pipeline", id: 1 }];
+  const result = attributeTsvShrink({ masterIds, rowStates, removals, resource: "tq" });
+  assert(result.explained === 0 && result.unexplained === 1, `ai_pipeline delete: not credited`);
+}
+
+// tn trashed_at: a trashed-but-not-deleted row is NOT live (mirrors
+// buildResource's tn query, which excludes trashed_at IS NOT NULL too), and
+// is credited when its newest removal entry's source is null (the trash
+// itself).
+{
+  const masterIds = ["t1"];
+  const rowStates = [{ id: "t1", deleted_at: null, trashed_at: 800 }];
+  const removals = [{ row_key: "t1", source: null, id: 1 }];
+  const result = attributeTsvShrink({ masterIds, rowStates, removals, resource: "tn" });
+  assert(result.liveCount === 0, `tn row with trashed_at set is not counted live`);
+  assert(result.explained === 1 && result.unexplained === 0, `tn trashed row credited via null source`);
+}
+
+// Duplicate master IDs are counted once by attributeTsvShrink's own
+// bookkeeping (its Set-based masterIds dedup is unrelated to the Defect 5
+// fail-closed check, which lives one layer up in checkTsvShrink — see below).
+{
+  const masterIds = ["a", "a", "c"];
+  const rowStates = [{ id: "a", deleted_at: null }];
+  const result = attributeTsvShrink({ masterIds, rowStates, removals: [], resource: "tq" });
+  assert(result.missing === 1 && result.unexplained === 1, `duplicate master IDs counted once`);
+}
+
+// No loss at all — every master ID is live.
+{
+  const masterIds = ["a", "b"];
+  const rowStates = [
+    { id: "a", deleted_at: null },
+    { id: "b", deleted_at: null },
+  ];
+  const result = attributeTsvShrink({ masterIds, rowStates, removals: [], resource: "tq" });
+  assert(
+    result.liveCount === 2 && result.missing === 0 && result.explained === 0 && result.unexplained === 0,
+    `no loss at all`,
+  );
+}
+
+// --- Defect 1: crediting requires D1 to ACTUALLY hold the row removed ------
+// A removal entry in edit_log is not, by itself, proof the row is gone. The
+// twl_PSA truncated-fetch signature is an id ABSENT from D1 entirely — no
+// rowStates entry at all — and that must never be "explained" by some
+// historical edit_log entry, however human-authored its source looks.
+
+// Named incident: a translator trashes a tn row (source NULL, rows.ts:975),
+// then untrashes it. 'untrash' is a separate action and does not delete the
+// stale 'trash' removal entry, so edit_log keeps claiming a human removal
+// forever even though the row is live again. Weeks later a truncated fetch
+// loads the book WITHOUT this row at all (absent from tn_rows entirely — the
+// twl_PSA signature). The row must be unexplained: D1 holds no removed-row
+// record for it, only a stale historical entry.
+{
+  const masterIds = ["abcd"];
+  const rowStates = []; // absent from D1 entirely — the truncated-load shape
+  const removals = [{ row_key: "abcd", source: null, id: 1 }]; // stale trash, pre-untrash
+  const result = attributeTsvShrink({ masterIds, rowStates, removals, resource: "tn" });
+  assert(
+    result.explained === 0 && result.unexplained === 1,
+    `trash->untrash->truncated-load: a stale removal entry on a row absent from D1 must NOT credit`,
+  );
+}
+
+// General form of the same gap: any id with a null-source removal entry but
+// NO rowStates entry at all is unexplained, regardless of resource.
+{
+  const masterIds = ["p"];
+  const rowStates = [];
+  const removals = [{ row_key: "p", source: null, id: 1 }];
+  const result = attributeTsvShrink({ masterIds, rowStates, removals, resource: "tq" });
+  assert(
+    result.explained === 0 && result.unexplained === 1,
+    `defect 1: removal entry with no matching rowStates entry is unexplained`,
+  );
+}
+
+// Sibling (the normal case keeps working): an id present in rowStates WITH
+// deleted_at set, AND a null-source removal entry, IS credited.
+{
+  const masterIds = ["q"];
+  const rowStates = [{ id: "q", deleted_at: 500 }];
+  const removals = [{ row_key: "q", source: null, id: 1 }];
+  const result = attributeTsvShrink({ masterIds, rowStates, removals, resource: "tq" });
+  assert(
+    result.explained === 1 && result.unexplained === 0,
+    `defect 1 sibling: a row D1 actually holds removed, with a human removal entry, is still credited`,
+  );
+}
+
+// --- Defect 1 property (real assertion, replacing a tautological one) ------
+// A genuine truncation residual UNDER the count-only floor (20 of 300: both
+// <=25 rows AND <5%) must still surface as unexplained via real attribution
+// — the ship decision (unexplained === 0) never re-applies the floor to
+// what's left over, unlike the old code, which re-judged
+// exportTsvShrinkRefused(masterRows - unexplained, masterRows) and would have
+// shipped this residual silently.
+{
+  const masterIds = Array.from({ length: 300 }, (_, i) => `id${i}`);
+  const liveIds = masterIds.slice(0, 280); // 20 missing, absent from D1 entirely
+  const rowStates = liveIds.map((id) => ({ id, deleted_at: null }));
+  const result = attributeTsvShrink({ masterIds, rowStates, removals: [], resource: "tq" });
+  assert(result.unexplained === 20, `defect 1 property: 20 rows absent from D1 entirely are unexplained`);
+  assert(
+    exportTsvShrinkRefused(masterIds.length - result.unexplained, masterIds.length) === false,
+    `defect 1 property: the count-only floor alone would NOT have blocked this 20-row residual — ` +
+      `only requiring unexplained === 0 catches it`,
+  );
+}
+
+// --- Defect 5: duplicate IDs within master's own TSV ------------------------
+// attributeTsvShrink's masterIds Set-collapse is a "how many distinct rows
+// are missing" bookkeeping detail, unrelated to Defect 5's fix (which fails
+// CLOSED one layer up, in checkTsvShrink, before attribution ever runs — see
+// exportWorkflow.ts). Test the pure duplicate-detector directly.
+{
+  assert(countDuplicateMasterIds([]) === 0, `countDuplicateMasterIds: empty input has no duplicates`);
+  assert(countDuplicateMasterIds(["a", "b", "c"]) === 0, `countDuplicateMasterIds: all-unique input has no duplicates`);
+  assert(countDuplicateMasterIds(["a", "a", "c"]) === 1, `countDuplicateMasterIds: one repeated id counts once`);
+  assert(
+    countDuplicateMasterIds(["a", "a", "a", "b", "b"]) === 3,
+    `countDuplicateMasterIds: every id beyond the first occurrence counts (2 extra "a" + 1 extra "b")`,
+  );
+}
+
+// --- Defect 6: last-write-wins must not depend on `removals` arrival order --
+// attributeTsvShrink now picks each row_key's newest entry by its own `id`
+// field (edit_log's PK), so shuffling the input must not change the result.
+// Sorted-order control, then the SAME data shuffled/newest-first.
+{
+  const masterIds = ["x", "y"];
+  const rowStates = [
+    { id: "x", deleted_at: 900 },
+    { id: "y", deleted_at: 900 },
+  ];
+  const sorted = [
+    { row_key: "x", source: null, id: 1 },
+    { row_key: "y", source: null, id: 2 },
+    { row_key: "x", source: "dcs_reimport", id: 3 },
+    { row_key: "y", source: "nightly_finalize", id: 4 },
+  ];
+  const shuffledNewestFirst = [sorted[3], sorted[2], sorted[1], sorted[0]];
+  const resultSorted = attributeTsvShrink({ masterIds, rowStates, removals: sorted, resource: "tn" });
+  const resultShuffled = attributeTsvShrink({ masterIds, rowStates, removals: shuffledNewestFirst, resource: "tn" });
+  assert(
+    resultSorted.explained === 1 && resultSorted.unexplained === 1,
+    `defect 6 control: sorted stale-trash case still resolves x unexplained, y explained`,
+  );
+  assert(
+    resultShuffled.explained === resultSorted.explained && resultShuffled.unexplained === resultSorted.unexplained,
+    `defect 6: shuffled/newest-first input produces the IDENTICAL result to sorted input`,
+  );
+}
+
+// Second shuffle case with a plain (non-stale-trash) dataset, arrival order
+// scrambled arbitrarily, to further decouple the guarantee from any one
+// hand-ordered fixture.
+{
+  const masterIds = ["m", "n"];
+  const rowStates = [
+    { id: "m", deleted_at: 500 },
+    { id: "n", deleted_at: 500 },
+  ];
+  const removalsScrambled = [
+    { row_key: "n", source: "ai_pipeline", id: 5 },
+    { row_key: "m", source: "nightly_finalize", id: 2 },
+    { row_key: "n", source: null, id: 1 }, // older than id 5 — must lose
+    { row_key: "m", source: "dcs_reimport", id: 8 }, // newest for m — must win over id 2
+  ];
+  const result = attributeTsvShrink({ masterIds, rowStates, removals: removalsScrambled, resource: "tq" });
+  assert(
+    result.explained === 0 && result.unexplained === 2,
+    `defect 6: scrambled input — m's newest (id 8, dcs_reimport) unexplained, n's newest (id 5, ai_pipeline) unexplained`,
+  );
 }
 
 // --- usfmAlignmentShrinkRefused: ULT/UST verse alignment backstop ---

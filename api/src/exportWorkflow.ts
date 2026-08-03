@@ -18,6 +18,7 @@ import { WorkflowEntrypoint, type WorkflowEvent, type WorkflowStep } from "cloud
 import type { Env } from "./index";
 import {
   ALL_RESOURCES,
+  attributeTsvShrink,
   buildExportBranch,
   buildTnTsv,
   buildTqTsv,
@@ -25,10 +26,12 @@ import {
   buildUsfm,
   closeDcsPr,
   commitToDcs,
+  countDuplicateMasterIds,
   deleteDcsBranch,
   ensureDcsPr,
   exportTsvShrinkRefused,
   findDcsOpenPr,
+  parseTsvIds,
   recreateExportBranchFromMaster,
   updateDcsPrBranch,
   usfmAlignmentShrinkRefused,
@@ -442,8 +445,50 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
           `${this.env.DCS_BASE_URL}/unfoldingWord`,
           "info",
         );
+      } else if (guard.ok && guard.detail.startsWith("shrink_")) {
+        // Auto-credit path: checkTsvShrink's own unexplained===0 case ships
+        // without any human in the loop (every missing row traced to a human
+        // deletion tombstone in D1 — the 1CH TQ shape). Two gaps that mirror
+        // the allowShrink branch above, both left open before this fix:
+        //
+        // Defect 2: neither branch of this if/else-if ran for this outcome
+        // (guard.ok was true, so the `!guard.ok` arm never fired), which meant
+        // a night that had previously BLOCKED (raising the
+        // `export_shrink:{book}:{resource}` banner below) and later
+        // auto-credits ships silently while that stale banner stays up
+        // forever — its text tells the operator to "Re-sync from master,
+        // verify the row count, then re-export", which for the now-shipped
+        // deliberate deletion would RESURRECT every one of those rows. Clear
+        // it, same as the allowShrink branch clears it for its own case.
+        //
+        // Defect 3: the allowShrink branch reasons that "a console.log lives
+        // only as long as a wrangler tail session … that decision needs to
+        // outlive the terminal it was typed in" and writes a durable alert
+        // for its (human-authorized) bypass. This path is strictly less
+        // supervised — no human authorized anything, a night's rows were
+        // deleted on the strength of an automatic count-and-tombstone
+        // check — yet it used to get only a console.log. Give it the same
+        // durable, non-error (severity "info") record.
+        await this.env.DB.prepare(
+          `DELETE FROM system_alerts WHERE username = ?1 AND source = ?2 AND dismissed_at IS NULL`,
+        )
+          .bind(EXPORT_ALERT_USERNAME, `export_shrink:${book}:${resource}`)
+          .run();
+        // Worded for what is true HERE, same discipline as the allowShrink
+        // alert: the guard was cleared. The export can still be stopped
+        // further down by the blank-field gate, USFM validation, or a failed
+        // DCS commit, so this must not claim the push happened.
+        await this.writeAlert(
+          `export_shrink_credited:${book}:${resource}`,
+          `${book} ${resource.toUpperCase()}: shrink guard auto-credited ${guard.explained ?? "?"} human ` +
+            `deletion(s) in D1 (${guard.detail}) — a render of ${built.rowCount} rows was allowed past ` +
+            `master's ${guard.masterRows ?? "?"}, with 0 rows unexplained. No human reviewed this; ` +
+            `check the export snapshot for whether the push itself then succeeded.`,
+          `${this.env.DCS_BASE_URL}/unfoldingWord`,
+          "info",
+        );
       } else if (!guard.ok) {
-        await this.recordShrinkSkipAlert(book, resource, built.rowCount, guard.masterRows, guard.detail);
+        await this.recordShrinkSkipAlert(book, resource, built.rowCount, guard.masterRows, guard.detail, guard.explained, guard.unexplained);
         const reason = `shrink_guard:${guard.detail}`;
         await this.recordSnapshot(book, resource, null, null, built.rowCount, reason);
         return {
@@ -1029,17 +1074,139 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     book: string,
     resource: Resource,
     renderedRows: number,
-  ): Promise<{ ok: boolean; detail: string; masterRows: number | null }> {
+  ): Promise<{ ok: boolean; detail: string; masterRows: number | null; explained?: number; unexplained?: number }> {
     const file = dcsResourceFile(book, resource as ReimportResource);
     if (!file) return { ok: true, detail: "no_file", masterRows: null };
     const raw = await fetchText(dcsRawUrl(this.env, file.repo, file.path));
     if (raw == null) return { ok: false, detail: "master_unreadable", masterRows: null };
     // Data rows = non-empty lines minus the header (mirrors parseTsv's model).
     const masterRows = Math.max(0, raw.split(/\r?\n/).filter((l) => l.length > 0).length - 1);
-    if (exportTsvShrinkRefused(renderedRows, masterRows)) {
-      return { ok: false, detail: `shrink_${masterRows - renderedRows}_of_${masterRows}`, masterRows };
+    if (!exportTsvShrinkRefused(renderedRows, masterRows)) {
+      return { ok: true, detail: "ok", masterRows };
     }
-    return { ok: true, detail: "ok", masterRows };
+
+    // Shrink path (rare): don't just refuse on the raw count — attribute the
+    // loss. The 1CH TQ incident proved the old unconditional alert wrong:
+    // every one of its 62 missing rows carried a HUMAN deletion tombstone in
+    // D1 (zero unexplained residual) — a real cleanup of unhelpful genealogy
+    // questions, not the twl_PSA truncated-fetch signature
+    // (2,896 missing, no tombstones at all). Split "missing" into "D1
+    // deliberately removed" (explained) vs "D1 simply doesn't have"
+    // (unexplained) via attributeTsvShrink (export.ts).
+    const lost = masterRows - renderedRows;
+    const masterIds = parseTsvIds(raw);
+    if (masterIds == null) {
+      // Can't parse master's ID column — never let an unreadable body
+      // "explain" a shrink. Fall back to the original count-only refusal.
+      return { ok: false, detail: `shrink_${lost}_of_${masterRows}_ids_unreadable`, masterRows };
+    }
+
+    // Defect 5: fail closed on a master file that itself contains duplicate
+    // row IDs (this repo has real history of it — the ISA 48 delete+duplicate
+    // incident, the digit-first row-id collision bug). attributeTsvShrink's
+    // own bookkeeping collapses masterIds to a Set, so a duplicated id would
+    // otherwise be silently counted once — e.g. 464 lines / 402 unique ids,
+    // all 402 live, reads as "62 missing, 0 unexplained" and ships, deleting
+    // 62 lines unattended. If those duplicate lines carry DIFFERENT content
+    // under a colliding id, that's a silent loss of real notes. Attribution
+    // is only meaningful when master's IDs are unique in the first place, and
+    // a duplicate-id master is itself a defect a human should look at — so
+    // refuse before ever calling attributeTsvShrink. Keep the `shrink_` prefix
+    // so the allowShrink override gate still recognizes this as a shrink.
+    const dupCount = countDuplicateMasterIds(masterIds);
+    if (dupCount > 0) {
+      return {
+        ok: false,
+        detail: `shrink_${lost}_of_${masterRows}_master_duplicate_ids_${dupCount}`,
+        masterRows,
+      };
+    }
+
+    const table = resource === "tn" ? "tn_rows" : resource === "tq" ? "tq_rows" : "twl_rows";
+    const selectTrashed = resource === "tn" ? ", trashed_at" : "";
+    const stateRows = await this.env.DB.prepare(
+      `SELECT id, deleted_at${selectTrashed} FROM ${table} WHERE book = ?1`,
+    )
+      .bind(book)
+      .all<{ id: string; deleted_at: number | null; trashed_at?: number | null }>();
+
+    // book = ?2 only — no `OR book IS NULL`. The 4-char row ids are unique
+    // per book, not globally (migration 0015_composite_row_id.sql), so a
+    // pre-0017 book-IS-NULL entry for a delete in one book could credit a
+    // same-id row in a different book. This fails closed instead: an
+    // uncredited pre-0017 entry just leaves that row unexplained, and
+    // pre-0017 entries are purged anyway by the 180-day edit_log retention
+    // sweep (index.ts:332-334).
+    //
+    // `id` (edit_log's own autoincrement PK) is selected so attributeTsvShrink
+    // can pick each row_key's newest entry itself (Defect 6) — correctness no
+    // longer depends on this query's ordering. ORDER BY id ASC is kept anyway
+    // (harmless, and it keeps the intent legible).
+    const removalsRs = await this.env.DB.prepare(
+      `SELECT row_key, source, id FROM edit_log
+        WHERE kind = ?1 AND book = ?2 AND action IN ('delete', 'trash')
+        ORDER BY id ASC`,
+    )
+      .bind(resource, book)
+      .all<{ row_key: string; source: string | null; id: number }>();
+
+    const { liveCount, explained, unexplained } = attributeTsvShrink({
+      masterIds,
+      rowStates: stateRows.results,
+      removals: removalsRs.results,
+      resource: resource as "tn" | "tq" | "twl",
+    });
+
+    // Defense-in-depth: cross-check this guard's own D1 read against the
+    // render's. buildResource's three SELECT * queries use the exact same
+    // WHERE clauses as the liveCount predicate above, so the two counts MUST
+    // agree. If the render's read were ever partial while this guard's easier
+    // `SELECT id, deleted_at` succeeded, every master id would appear live in
+    // THIS query, unexplained would read 0, and the truncated render would
+    // ship. Catching a mismatch here is what the old count-only guard caught
+    // for free by construction; attribution reintroduces the gap, so it's
+    // closed explicitly instead.
+    if (liveCount !== renderedRows) {
+      return {
+        ok: false,
+        detail: `shrink_${lost}_of_${masterRows}_read_mismatch_${liveCount}_vs_${renderedRows}`,
+        masterRows,
+      };
+    }
+
+    // Ship ONLY when unexplained === 0 — never re-judge exportTsvShrinkRefused
+    // a second time here. We are already inside the branch where the count
+    // guard refused, so gating on unexplained === 0 can only ever RELAX that
+    // refusal, never newly block an export that ships today: "we can account
+    // for every single missing row" is the only bar that justifies deleting
+    // rows from master. (The old code re-judged
+    // exportTsvShrinkRefused(masterRows - unexplained, masterRows), which
+    // inherited the 25-row/5% floor onto unexplained rows and let up to 25
+    // UNEXPLAINED rows — the truncation signature itself — ship silently.)
+    if (unexplained === 0) {
+      // A durable notice this run auto-credited deletions belongs in
+      // wrangler tail, in the same spirit as the allowShrink override log
+      // above — a night where the guard let a real shrink through should be
+      // visible, even though nothing here needed a human.
+      console.log(
+        `export: shrink guard auto-credited ${explained} human deletion(s) for ${book} ${resource} ` +
+          `(${lost} of ${masterRows} missing) — proceeding`,
+      );
+      return {
+        ok: true,
+        detail: `shrink_${lost}_of_${masterRows}_explained_${explained}`,
+        masterRows,
+        explained,
+        unexplained,
+      };
+    }
+    return {
+      ok: false,
+      detail: `shrink_${lost}_of_${masterRows}_unexplained_${unexplained}`,
+      masterRows,
+      explained,
+      unexplained,
+    };
   }
 
   // Fetch master's current USFM and decide whether this ULT/UST render would
@@ -1114,13 +1281,67 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     renderedRows: number,
     masterRows: number | null,
     detail: string,
+    explained?: number,
+    unexplained?: number,
   ): Promise<void> {
     const source = `export_shrink:${book}:${resource}`;
+    // The old wording unconditionally claimed "this looks like an incomplete
+    // D1 load (truncated fetch), not a real deletion" — which was wrong for
+    // 1CH TQ (all 62 of its missing rows carried human deletion tombstones in
+    // D1). Say what the numbers actually show instead.
+    //
+    // Defect 4: this used to fall to the generic "ID column couldn't be
+    // parsed" text whenever `unexplained` was undefined — which is WRONG for
+    // two of the four refusal kinds this function is called for. Derive the
+    // signature/remedy from `detail` itself so each refusal kind gets an
+    // accurate diagnosis:
+    const lost = masterRows != null ? masterRows - renderedRows : null;
+    let signature: string;
+    let remedy: string;
+    if (detail === "master_unreadable") {
+      // Master couldn't be FETCHED at all — nothing was parsed, nothing was
+      // compared. Distinct from "parsed but the ID column looked wrong".
+      signature = `Master itself couldn't be fetched from DCS, so nothing could be compared at all.`;
+      remedy = `Check DCS connectivity/rate limits, then re-export ${book} ${resource.toUpperCase()}.`;
+    } else if (detail.includes("_read_mismatch_")) {
+      // IDs parsed fine; the finding is that THIS guard's own D1 read
+      // disagrees with the render's — the strongest truncation evidence the
+      // system can produce (buildResource's render query and this guard's
+      // `SELECT id, deleted_at` use identical WHERE clauses and must agree).
+      signature =
+        `The export guard's own read of D1 disagrees with the render's row count for this book/resource — ` +
+        `the strongest signal this run saw a partial or racing D1 read, not a simple parse failure.`;
+      remedy = `Investigate why the render and the guard's D1 read diverged for ${book} ${resource.toUpperCase()} ` +
+        `(a partial fetch or a write racing the export) before re-exporting.`;
+    } else if (detail.includes("_master_duplicate_ids_")) {
+      // Defect 5's fail-closed case: master's own ID column has duplicates.
+      signature = `Master's ${book} ${resource.toUpperCase()} file contains duplicate row IDs, so attribution ` +
+        `can't tell which physical row owns which ID.`;
+      remedy = `Find and resolve the duplicate IDs in master's file, then re-export.`;
+    } else if (detail.includes("_ids_unreadable")) {
+      // IDs genuinely couldn't be parsed (bad header / blank ID cell).
+      signature = `Master's ID column couldn't be parsed, so the loss couldn't be attributed.`;
+      remedy = `Re-sync ${book} ${resource.toUpperCase()} from master, verify the row count, then re-export.`;
+    } else if (typeof unexplained === "number" && lost != null) {
+      // IDs parsed and attribution ran: some (or all) of the loss traces to a
+      // human deletion tombstone in D1, but `unexplained` residual remains.
+      const explainedNote =
+        explained && explained > 0
+          ? ` (${explained} of the ${lost} were human deletions in D1 and were credited)`
+          : "";
+      signature =
+        `${unexplained} of the ${lost} missing rows aren't accounted for by any deliberate deletion in D1${explainedNote} — ` +
+        `that's the truncated-load signature.`;
+      remedy = `Re-sync ${book} ${resource.toUpperCase()} from master, verify the row count, then re-export.`;
+    } else {
+      // Unrecognized detail shape — fall back to the conservative parse-
+      // failure wording rather than guess.
+      signature = `Master's ID column couldn't be parsed, so the loss couldn't be attributed.`;
+      remedy = `Re-sync ${book} ${resource.toUpperCase()} from master, verify the row count, then re-export.`;
+    }
     const message =
       `Benjamin — nightly export BLOCKED ${book} ${resource.toUpperCase()}: the render has ${renderedRows} rows ` +
-      `but master has ${masterRows ?? "?"} (${detail}). This looks like an incomplete D1 load (truncated fetch), ` +
-      `not a real deletion — refusing to shrink master. Re-sync ${book} ${resource.toUpperCase()} from master, ` +
-      `verify the row count, then re-export.`;
+      `but master has ${masterRows ?? "?"} (${detail}). ${signature} Refusing to shrink master. ${remedy}`;
     await this.writeAlert(source, message, `${this.env.DCS_BASE_URL}/unfoldingWord`);
   }
 
