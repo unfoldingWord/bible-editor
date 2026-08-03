@@ -626,16 +626,14 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
         // edits". We can't delete the branch (the service token lacks
         // branch-delete), but closing the PR is enough; the branch gets a fresh
         // PR the next time this (book, resource) actually diverges from master.
-        const lingering = await findDcsOpenPr(dcsCfg);
-        if (lingering != null) {
-          try {
-            await closeDcsPr(dcsCfg, lingering);
-          } catch (e) {
-            console.error("export close-stale-PR failed", {
-              book, resource, repo: target.repo, pr: lingering,
-              error: e instanceof Error ? e.message : String(e),
-            });
-          }
+        try {
+          const lingering = await findDcsOpenPr(dcsCfg);
+          if (lingering != null) await closeDcsPr(dcsCfg, lingering);
+        } catch (e) {
+          console.error("export close-stale-PR failed", {
+            book, resource, repo: target.repo,
+            error: e instanceof Error ? e.message : String(e),
+          });
         }
       }
       dcsCommitSha = commit.commitSha || null;
