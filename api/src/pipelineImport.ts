@@ -19,12 +19,16 @@ import {
   stripOrphanAlignmentMarkers,
   type SourceWord,
   type VerseExtract,
-} from "./importParsers";
-import { canonizeAlignmentSource } from "./canonizeHebrew";
-import { NT_BOOKS } from "./dcsSources";
-import { newRowId, isValidRowId } from "./rowId";
-import { tnContentKey } from "./tnDedup";
-import { IMPORT_CLAIM_STALE_SECONDS } from "./pipelineImportClaim";
+} from "./importParsers.ts";
+import { canonizeAlignmentSource } from "./canonizeHebrew.ts";
+import { NT_BOOKS } from "./dcsSources.ts";
+import { newRowId, isValidRowId } from "./rowId.ts";
+import { tnContentKey } from "./tnDedup.ts";
+import {
+  IMPORT_CLAIM_STALE_SECONDS,
+  shouldTouchClaim,
+  tnSweepScope,
+} from "./pipelineImportClaim.ts";
 
 interface OutputEntry {
   type?: string;
@@ -37,7 +41,7 @@ interface OutputEntry {
   commitSha?: string;
 }
 
-interface ImportContext {
+export interface ImportContext {
   jobId: string;
   pipelineType: "generate" | "notes" | "tqs" | string;
   book: string;
@@ -227,13 +231,18 @@ export async function importJobOutput(
   // Atomic single-applier claim. The predicate mirrors mayClaimImport, but is
   // enforced in one CAS UPDATE so a concurrent racer that read the same
   // pre-apply state can't also win: exactly one UPDATE reports changes=1.
+  // RETURNING echoes back the EXACT value this UPDATE just wrote, so the
+  // heartbeat below can seed its "last-known owned value" from the row
+  // itself rather than assuming it matches Math.floor(Date.now()/1000) (worker
+  // clock vs D1's unixepoch() could in principle skew).
   const claim = await env.DB.prepare(
     `UPDATE pipeline_jobs SET import_claimed_at = unixepoch()
       WHERE job_id = ?1
-        AND (import_claimed_at IS NULL OR import_claimed_at < unixepoch() - ?2)`,
+        AND (import_claimed_at IS NULL OR import_claimed_at < unixepoch() - ?2)
+      RETURNING import_claimed_at`,
   )
     .bind(job.jobId, IMPORT_CLAIM_STALE_SECONDS)
-    .run();
+    .run<{ import_claimed_at: number }>();
   if ((claim.meta.changes ?? 0) === 0) {
     // Another poll already owns the import — do nothing rather than run a
     // second, interleaving delete/insert pass. Flag claimLost so the caller
@@ -247,28 +256,169 @@ export async function importJobOutput(
       claimLost: true,
     };
   }
+  // Heartbeat state shared across staging + apply so one long apply pass
+  // (DAN 11 ran ~12 minutes) keeps its claim fresh and is never re-claimed by
+  // a concurrent poller mid-flight. lastTouchedAt starts at the claim UPDATE
+  // above (this instant), so the first heartbeat fires ~CLAIM_TOUCH_INTERVAL_
+  // SECONDS later rather than immediately. ownedClaimedAt is the exact value
+  // this pass just wrote (read back via RETURNING, not assumed) — every
+  // heartbeat CASes against it so a heartbeat can never silently steal the
+  // claim back from a legitimate new owner (see maybeTouchClaim).
+  const ownedClaimedAt = claim.results?.[0]?.import_claimed_at;
+  const heartbeat: ClaimHeartbeat = {
+    lastTouchedAt: Math.floor(Date.now() / 1000),
+    // Falling back to "now" would only ever be exercised if RETURNING somehow
+    // echoed no row despite meta.changes > 0 — not expected under D1/SQLite
+    // semantics, but a hard failure here would abort an apply that in fact
+    // holds the claim, so this stays a soft (documented) fallback rather than
+    // a thrown error.
+    ownedClaimedAt: ownedClaimedAt ?? Math.floor(Date.now() / 1000),
+    lost: false,
+  };
   try {
-    const stageResult = await stageJobOutput(env, job, outputs);
-    const applyResult = await applyJobOutput(env, job);
+    const stageResult = await stageJobOutput(env, job, outputs, heartbeat);
+    const applyResult = await applyJobOutput(env, job, heartbeat);
+    // Lease lost MID-FLIGHT (heartbeat CAS failed): another poll legitimately
+    // re-claimed and may still be applying. Report it as claimLost so the caller
+    // does NOT finalize — writing output_json / state='done' here would mark the
+    // import complete while the new owner is still mid-apply, and would enqueue
+    // the follow-up chain early. The caller already handles claimLost exactly
+    // this way (pollPipelineJob), so this reuses that path rather than adding a
+    // second one. Note the work this pass DID do is already committed and
+    // per-row idempotent, so the owning poll resumes rather than duplicating.
+    if (heartbeat.lost) {
+      return {
+        ...stageResult,
+        applied: applyResult,
+        claimLost: true,
+        skipped: [...stageResult.skipped, "import lease lost mid-apply; a concurrent poll owns this import"],
+      };
+    }
     return { ...stageResult, applied: applyResult };
   } catch (err) {
     // Release the slot so the caller's one-retry path (pollPipelineJob holds
     // state at 'running' on the first failure) can re-import. Staging keys its
     // own idempotency on staged_at and apply is per-row idempotent, so the
     // retry resumes rather than duplicating.
+    //
+    // CAS'd on the claim we own, for the same reason the heartbeat is: if this
+    // pass already lost the lease to a legitimate new owner (heartbeat.lost) and
+    // THEN threw for any unrelated reason, a blind `SET import_claimed_at = NULL
+    // WHERE job_id = ?1` would clear the NEW owner's claim mid-apply, letting a
+    // third poller claim and interleave — the exact corruption the single-applier
+    // guard exists to prevent. Matching on the owned value means a stolen lease
+    // leaves the release a no-op (0 changes) and the new owner keeps its claim.
     await env.DB.prepare(
-      `UPDATE pipeline_jobs SET import_claimed_at = NULL WHERE job_id = ?1`,
+      `UPDATE pipeline_jobs SET import_claimed_at = NULL
+        WHERE job_id = ?1 AND import_claimed_at = ?2`,
     )
-      .bind(job.jobId)
+      .bind(job.jobId, heartbeat.ownedClaimedAt)
       .run();
     throw err;
   }
+}
+
+// Mutable heartbeat clock threaded through staging + apply. Both phases of one
+// apply pass share it so the pass touches the claim at most once per
+// CLAIM_TOUCH_INTERVAL_SECONDS combined, not once per phase.
+//
+// ownedClaimedAt / lost make the heartbeat a real compare-and-swap lease
+// rather than a blind re-stamp. Three independent reviews (a first-pass code
+// review, this PR's own honesty ledger, and a Codex review) all flagged the
+// original unconditional `UPDATE ... SET import_claimed_at = unixepoch()
+// WHERE job_id = ?1`: if this pass stalled long enough for its claim to go
+// stale, another poller legitimately re-claims, and THEN this pass wakes and
+// heartbeats, the unconditional write would silently stamp over the new
+// owner's lease. That doesn't itself create the double-apply (two applies are
+// already running by that point), but it masks and prolongs it and defeats
+// the staleness detection that would otherwise expose it. See
+// touchImportClaim / maybeTouchClaim below for the fix.
+export interface ClaimHeartbeat {
+  lastTouchedAt: number;
+  // The import_claimed_at value this pass last confirmed it owns. Seeded from
+  // the RETURNING clause of the initial CAS claim in importJobOutput (the
+  // exact row value, not assumed), and updated from RETURNING again on every
+  // successful heartbeat — never computed independently, so it can't drift
+  // from what's actually in the row.
+  ownedClaimedAt: number;
+  // Set once a heartbeat's CAS fails (another poller took the lease). Once
+  // true, maybeTouchClaim stops issuing further heartbeat writes for the rest
+  // of this pass — see the comment there for why it must NOT throw/abort.
+  lost: boolean;
+}
+
+// CAS re-stamp of pipeline_jobs.import_claimed_at: only succeeds if the row
+// still holds the value this pass last confirmed it owns
+// (`expectedClaimedAt`). RETURNING echoes the exact new value on success, so
+// the caller's stored "owned" value never drifts from the row. Deliberately
+// has no effect on IMPORT_CLAIM_STALE_SECONDS: if the worker dies, no further
+// heartbeat fires, and the claim goes stale on schedule for crash recovery.
+// See pipelineImportClaim.ts.
+async function touchImportClaim(
+  env: Env,
+  jobId: string,
+  expectedClaimedAt: number,
+): Promise<{ changes: number; newClaimedAt: number | null }> {
+  const res = await env.DB
+    .prepare(
+      `UPDATE pipeline_jobs SET import_claimed_at = unixepoch()
+        WHERE job_id = ?1 AND import_claimed_at = ?2
+        RETURNING import_claimed_at`,
+    )
+    .bind(jobId, expectedClaimedAt)
+    .run<{ import_claimed_at: number }>();
+  return {
+    changes: res.meta.changes ?? 0,
+    newClaimedAt: res.results?.[0]?.import_claimed_at ?? null,
+  };
+}
+
+// Rate-limited wrapper: only issues the D1 write when shouldTouchClaim says
+// enough time has passed since the last touch, so a chunked loop costs at most
+// one extra write per CLAIM_TOUCH_INTERVAL_SECONDS, not one per chunk.
+// Exported for the fake-DB regression tests in pipelineImport.test.mjs, which
+// drive the lease-takeover path directly — same rationale as deleteUnkeptTns.
+export async function maybeTouchClaim(
+  env: Env,
+  jobId: string,
+  hb: ClaimHeartbeat,
+): Promise<void> {
+  if (hb.lost) return; // Already lost the lease; stop hammering D1 for it.
+  const now = Math.floor(Date.now() / 1000);
+  if (!shouldTouchClaim(hb.lastTouchedAt, now)) return;
+  const { changes, newClaimedAt } = await touchImportClaim(env, jobId, hb.ownedClaimedAt);
+  if (changes === 0) {
+    // The CAS failed: the row's import_claimed_at no longer matches what this
+    // pass last confirmed it owns, meaning the claim went stale and another
+    // poller has ALREADY legitimately re-claimed it. Mark lost and stop
+    // heartbeating — but deliberately do NOT throw or abort the apply here.
+    // A throw would propagate out of applyJobOutput/stageJobOutput into
+    // importJobOutput's catch, whose cleanup runs
+    // `UPDATE pipeline_jobs SET import_claimed_at = NULL WHERE job_id = ?1`
+    // unconditionally — that would erase the NEW owner's claim, handing the
+    // slot back to nobody (or a third racer) and making the corruption this
+    // whole claim mechanism exists to prevent worse, not better. Letting this
+    // pass's remaining writes finish is the safer failure mode; the resolved-
+    // pairs exclusion in tnSweepScope is what actually protects data once two
+    // applies are concurrently live, not this heartbeat.
+    hb.lost = true;
+    console.error("pipeline apply: import claim lease lost to another poller mid-flight", {
+      jobId,
+    });
+    return;
+  }
+  hb.lastTouchedAt = now;
+  // Track the row's actual new value, not `now` — they're expected to match,
+  // but reading it back keeps this pass's belief pinned to reality rather
+  // than a locally-computed guess that could quietly diverge from the row.
+  hb.ownedClaimedAt = newClaimedAt ?? hb.ownedClaimedAt;
 }
 
 async function stageJobOutput(
   env: Env,
   job: ImportContext,
   outputs: OutputEntry[],
+  heartbeat: ClaimHeartbeat,
 ): Promise<ImportResult> {
   // Idempotency guard: staged_at is written ONLY after the final chunk below
   // commits, so it — not the mere existence of a pending_imports row — is the
@@ -334,6 +484,7 @@ async function stageJobOutput(
     );
     inserted += chunk.length;
     for (const s of chunk) byKind[s.kind] += 1;
+    await maybeTouchClaim(env, job.jobId, heartbeat);
   }
 
   // Mark staging complete only after the last chunk committed (also covers the
@@ -366,7 +517,7 @@ export interface ApplyResult {
   affectedChapters: number[];
 }
 
-interface PendingImportRow {
+export interface PendingImportRow {
   id: number;
   kind: "tn" | "tq" | "verse";
   book: string;
@@ -384,7 +535,11 @@ const AI_SOURCE = "ai_pipeline";
 // master; preserving it keeps D1 and master ids in lockstep. Only a malformed id
 // (the occasional incomplete emit) is replaced with a freshly minted one below.
 
-async function applyJobOutput(env: Env, job: ImportContext): Promise<ApplyResult> {
+async function applyJobOutput(
+  env: Env,
+  job: ImportContext,
+  heartbeat: ClaimHeartbeat,
+): Promise<ApplyResult> {
   // Look up the pipeline-starter's user id — every audit and updated_by
   // write is attributed to them, matching the contract that says the run
   // was triggered on their behalf.
@@ -431,7 +586,7 @@ async function applyJobOutput(env: Env, job: ImportContext): Promise<ApplyResult
   // TN delete phase: only fires when this job produced TN proposals AND
   // there are unkept TNs in scope. Idempotent — re-running finds none left.
   if (tnProposals.length > 0) {
-    result.tnDeleted = await deleteUnkeptTns(env, job, userId);
+    result.tnDeleted = await deleteUnkeptTns(env, job, userId, tnProposals, heartbeat);
     // A delete mutates whatever chapters this job re-proposed TN for; those are
     // exactly the chapters carried by tnProposals.
     if (result.tnDeleted > 0) for (const p of tnProposals) affected.add(p.chapter);
@@ -480,6 +635,17 @@ async function applyJobOutput(env: Env, job: ImportContext): Promise<ApplyResult
   const verseKey = (p: PendingImportRow) => p.chapter * 100000 + p.verse;
 
   for (const p of tnProposals) {
+    // Heartbeat FIRST, before any per-proposal work or `continue` path. Both
+    // the hint-expansion and content-dedup-skip branches below `continue`
+    // before reaching the touch call that used to sit at the bottom of this
+    // loop — a run dominated by skip-path proposals (DAN 11-scale: ~150
+    // proposals x ~4.5s/proposal ~= 11 minutes) would then heartbeat ZERO
+    // times, blowing past IMPORT_CLAIM_STALE_SECONDS (600s) and letting a
+    // concurrent poller win the CAS mid-flight — reopening the interleaved-
+    // applier corruption the single-applier claim exists to prevent. Placing
+    // it first means every iteration heartbeats regardless of which path it
+    // takes.
+    await maybeTouchClaim(env, job.jobId, heartbeat);
     // Hint expansion: if the AI's proposed id matches a queued hint stub in
     // this job's scope, UPDATE that row in place instead of minting a new
     // one. The hint's rowId round-trips through bp-assistant as the TSV ID
@@ -540,6 +706,7 @@ async function applyJobOutput(env: Env, job: ImportContext): Promise<ApplyResult
     affected.add(p.chapter);
     if (action === "created") result.tqCreated += 1;
     else result.tqUpdated += 1;
+    await maybeTouchClaim(env, job.jobId, heartbeat);
   }
 
   // Preload the book's UHB/UGNT source words once (a single query — cap-safe)
@@ -555,6 +722,7 @@ async function applyJobOutput(env: Env, job: ImportContext): Promise<ApplyResult
     await applyVerseUpdate(env, p, userId, uhbWordsByVerse);
     affected.add(p.chapter);
     result.verseUpdated += 1;
+    await maybeTouchClaim(env, job.jobId, heartbeat);
   }
 
   result.affectedChapters = [...affected].sort((a, b) => a - b);
@@ -583,10 +751,15 @@ async function maxSortOrderPerVerse(
   return m;
 }
 
-async function deleteUnkeptTns(
+// Exported for the fake-DB regression test in pipelineImport.test.mjs, which
+// asserts on the SQL/binding this function actually generates — see the DAN
+// 11 tests there. Not intended as a public API beyond that.
+export async function deleteUnkeptTns(
   env: Env,
   job: ImportContext,
   userId: number,
+  tnProposals: PendingImportRow[],
+  heartbeat: ClaimHeartbeat,
 ): Promise<number> {
   // Identify which rows we're about to delete so the audit row can carry
   // the right pre-deletion version. A bulk UPDATE would lose that fidelity.
@@ -617,42 +790,103 @@ async function deleteUnkeptTns(
   // trashed) suppresses the AI's re-proposal of it, so it stays trashed.
   // Sweeping it instead would delete it and let the re-insert RESURRECT it
   // un-trashed against the user's intent.
-  // Scope the sweep to the (chapter, verse) pairs this job actually produced
-  // proposals for (`pending_imports` for the job). The chapter-wide sweep
-  // assumed the result covers every verse it requested; when it doesn't — a
-  // partial result, or a concurrent apply that already consumed some proposals
-  // — deleting across the whole chapter wipes notes for verses the new run
-  // never re-supplies. Bounding the delete to supplied verses means a verse
-  // missing from the result keeps its existing notes (mildly stale) instead of
-  // being emptied. Match on BOTH chapter and verse: a job may span multiple
-  // chapters (endChapter > startChapter is a valid range), and scoping by verse
-  // number alone would let a proposal for ch2:v1 make ch1:v1 eligible for
-  // deletion. Defense-in-depth alongside the single-applier claim in
-  // importJobOutput.
-  const targets = await env.DB.prepare(
-    `SELECT id, version FROM tn_rows t
-      WHERE book = ?1 AND chapter BETWEEN ?2 AND ?3
-        AND deleted_at IS NULL AND trashed_at IS NULL
-        AND preserve = 0 AND hint = 0
-        AND EXISTS (
-          SELECT 1 FROM pending_imports pi
-            WHERE pi.job_id = ?5 AND pi.kind = 'tn'
-              AND pi.chapter = t.chapter AND pi.verse = t.verse
-        )
-        AND (
-          updated_by IS NULL
-          OR (
-            SELECT source FROM edit_log
-              WHERE kind = 'tn' AND row_key = t.id
-                AND (book = t.book OR book IS NULL)
-                AND action IN ('create', 'update')
-              ORDER BY id DESC LIMIT 1
-          ) = ?4
-        )`,
+  // Scope the sweep to the (chapter, verse) pairs THIS PASS is actually about
+  // to apply — the unresolved tnProposals it was just handed — NOT every verse
+  // the job has ever produced a proposal for. A resumed apply's `pending_imports`
+  // SELECT (in applyJobOutput) is already filtered to accepted_at IS NULL AND
+  // rejected_at IS NULL, i.e. only what's left to apply; scoping the sweep to
+  // the job-wide EXISTS-against-pending_imports (any row ever staged for this
+  // job, resolved or not) let a resumed pass's sweep re-cover verses the FIRST
+  // pass already applied and resolved, deleting that pass's just-inserted
+  // notes. DAN 11 tn, en_tn, 2026-08-03: 160 proposals; the first apply pass
+  // inserted rows across the full verse range and died mid-run before
+  // resolving every proposal; the resumed pass's job-wide sweep matched every
+  // verse the job ever proposed for, deleted 121 of the first pass's
+  // already-applied notes, and only re-inserted the 39 still-unresolved
+  // proposals — the chapter went from 131 live notes to 39, with verses 1-31
+  // emptied entirely. Scoping to tnSweepScope(tnProposals, resolvedPairs)
+  // instead means a verse this pass isn't touching is left alone, whatever a
+  // PRIOR pass did to it. Match on BOTH chapter and verse: a job may span
+  // multiple chapters (endChapter > startChapter is a valid range), and
+  // scoping by verse number alone would let a proposal for ch2:v1 make
+  // ch1:v1 eligible for deletion.
+  // Defense-in-depth alongside the single-applier claim in importJobOutput
+  // (Fix 2 in this same PR) — that claim now also gets heartbeated so a live
+  // apply pass is never re-claimed mid-flight in the first place; this sweep
+  // scoping is what limits the blast radius if that ever regresses. See the
+  // DAN 11 regression test for tnSweepScope in pipelineImport.test.mjs — do
+  // NOT widen this back to a job-wide scope.
+  //
+  // CLOSED: the straddled-verse class flagged by Codex review against the
+  // first version of this fix. applyTnInsert resolves each proposal
+  // atomically (its own D1 batch), and tnProposals is processed in
+  // `ORDER BY kind, chapter, verse, id` order (see the SELECT in
+  // applyJobOutput), so a mid-run death can leave ONE verse straddled — some
+  // of its proposals already inserted+resolved, the rest still unresolved.
+  // Scoping the sweep by unresolved proposals alone would still re-cover that
+  // straddled verse (its remaining proposals are still unresolved) and delete
+  // what the first pass already inserted there. Fixed by excluding any verse
+  // that ALREADY has an accepted proposal for this job from the sweep scope
+  // entirely — see tnSweepScope's `resolvedPairs` parameter. The sweep runs
+  // once, before any inserts in this pass; if a verse already has an accepted
+  // proposal, an earlier pass already completed delete-then-insert work there,
+  // and re-sweeping it now can only destroy that work. Traced against both
+  // crash shapes:
+  //   - Pass 1 died BEFORE sweeping verse V: no accepted proposals for V yet
+  //     -> V stays in scope -> sweep + insert all of V. Unchanged, correct.
+  //   - Pass 1 swept V and accepted 2 of 3 proposals, then died: V now has an
+  //     accepted proposal -> V excluded from scope -> pass 2 leaves V's rows
+  //     alone and inserts only the 3rd. V ends with all 3 notes instead of
+  //     losing the 2 already-accepted ones. This is the case Codex flagged.
+  // Trade-off, deliberate (see tnSweepScope for the full rationale): an
+  // excluded verse's not-yet-deleted prior-run/pristine notes survive (mildly
+  // stale) instead of being deleted — consistent with this module's existing
+  // philosophy, and strictly better than deleting accepted notes. Content-
+  // dedup (`claimedTnKeys` in applyJobOutput) prevents the remainder inserts
+  // from duplicating whatever survives.
+  const resolved = await env.DB.prepare(
+    `SELECT DISTINCT chapter, verse FROM pending_imports
+      WHERE job_id = ?1 AND kind = 'tn' AND accepted_at IS NOT NULL`,
   )
-    .bind(job.book, job.startChapter, job.endChapter, AI_SOURCE, job.jobId)
-    .all<{ id: string; version: number }>();
-  const list = targets.results ?? [];
+    .bind(job.jobId)
+    .all<{ chapter: number; verse: number }>();
+  const pairs = tnSweepScope(tnProposals, resolved.results ?? []);
+  if (pairs.length === 0) return 0;
+
+  // D1 caps bound parameters at 100 per statement. This query already binds 4
+  // fixed params (book, startChapter, endChapter, AI_SOURCE) before the pair
+  // params, so the chunk size must leave room: 4 + 2*CHUNK_PAIRS <= 100.
+  // 40 pairs -> 84 total, comfortable headroom below the cap.
+  const CHUNK_PAIRS = 40;
+  const list: { id: string; version: number }[] = [];
+  for (let i = 0; i < pairs.length; i += CHUNK_PAIRS) {
+    const slice = pairs.slice(i, i + CHUNK_PAIRS);
+    const pairClauses = slice
+      .map((_, idx) => `(t.chapter = ?${5 + idx * 2} AND t.verse = ?${6 + idx * 2})`)
+      .join(" OR ");
+    const pairParams = slice.flatMap((pair) => [pair.chapter, pair.verse]);
+    const rs = await env.DB.prepare(
+      `SELECT id, version FROM tn_rows t
+        WHERE book = ?1 AND chapter BETWEEN ?2 AND ?3
+          AND deleted_at IS NULL AND trashed_at IS NULL
+          AND preserve = 0 AND hint = 0
+          AND (${pairClauses})
+          AND (
+            updated_by IS NULL
+            OR (
+              SELECT source FROM edit_log
+                WHERE kind = 'tn' AND row_key = t.id
+                  AND (book = t.book OR book IS NULL)
+                  AND action IN ('create', 'update')
+                ORDER BY id DESC LIMIT 1
+            ) = ?4
+          )`,
+    )
+      .bind(job.book, job.startChapter, job.endChapter, AI_SOURCE, ...pairParams)
+      .all<{ id: string; version: number }>();
+    list.push(...(rs.results ?? []));
+    await maybeTouchClaim(env, job.jobId, heartbeat);
+  }
   if (list.length === 0) return 0;
 
   const now = Math.floor(Date.now() / 1000);
@@ -708,6 +942,7 @@ async function deleteUnkeptTns(
     for (let j = 0; j < res.length; j += 2) {
       deleted += res[j]?.meta?.changes ?? 0;
     }
+    await maybeTouchClaim(env, job.jobId, heartbeat);
   }
   return deleted;
 }
