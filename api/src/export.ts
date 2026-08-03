@@ -302,10 +302,34 @@ export const HUMAN_INTENT_REMOVAL_SOURCES: ReadonlySet<string | null> = new Set<
 //     (The mirror case — trash(NULL) then nightly_finalize(delete) — has
 //     newest 'nightly_finalize', which IS human intent, so it's explained.)
 //
-// Pure — the caller resolves `rowStates` / `removals` from D1.
+// Pure — the caller resolves `rowStates` / `removals` from D1, and
+// `renderedIds` from the rendered TSV itself (parseTsvIds).
 export function attributeTsvShrink(args: {
   masterIds: string[];
-  // Every row for this book+kind, exactly as SELECTed from <kind>_rows.
+  // IDs parsed (via parseTsvIds) from the RENDERED TSV that is about to be
+  // committed. This — not a second D1 read — is the authoritative answer to
+  // "is this master row in what we're about to ship": the render is captured
+  // once, at one point in time, by buildResource; a fresh D1 query taken
+  // later (after the R2 put, contributor lookup, freshness fetch, master
+  // fetch) is a DIFFERENT point in time and can disagree with what's actually
+  // about to be shipped. Concretely: master holds {A,B}; the render includes
+  // A because B was tombstoned by a human. Between render and a later D1
+  // read, a translator restores B and deletes A. A re-query would see A
+  // removed (credited, since a human entry exists) and B live (skipped) and
+  // ship — deleting B, the very row the human just restored. Deriving
+  // liveness from the render instead makes this race benign either
+  // direction: a row restored after the render was captured is simply absent
+  // from the render (and not removed in D1 either) → unexplained → blocks
+  // (fail-safe, not silently wrong). A row deleted from D1 after the render
+  // was captured is still present in the render → still treated as live →
+  // shipping does not delete it (correct, since the render is what's actually
+  // being committed).
+  renderedIds: string[];
+  // Every row for this book+kind, exactly as SELECTed from <kind>_rows. Used
+  // ONLY to corroborate that a master row missing from the render was a
+  // DELIBERATE removal (D1 currently holds it deleted/trashed) — never to
+  // determine liveness; the render alone is the source of truth for that
+  // (see `renderedIds` above).
   rowStates: Array<{ id: string; deleted_at: number | null; trashed_at?: number | null }>;
   // edit_log removal entries for this book+kind, action IN ('delete','trash').
   // `id` is edit_log's own autoincrement PK — attributeTsvShrink picks each
@@ -318,12 +342,12 @@ export function attributeTsvShrink(args: {
   removals: Array<{ row_key: string; source: string | null; id: number }>;
   resource: "tn" | "tq" | "twl";
 }): { liveCount: number; missing: number; explained: number; unexplained: number } {
-  const { masterIds, rowStates, removals, resource } = args;
+  const { masterIds, renderedIds, rowStates, removals, resource } = args;
 
-  // Mirrors buildResource's three render queries exactly: tn additionally
-  // excludes trashed_at (pending-deletion notes), tq/twl only exclude
-  // deleted_at.
-  const liveIds = new Set<string>();
+  // The render is the sole source of "live" — see `renderedIds` doc above.
+  const liveIds = new Set(renderedIds);
+  const liveCount = liveIds.size;
+
   // Defect 1: a row may be credited only when D1 actually holds it in a
   // removed state right now — NOT merely because edit_log has some removal
   // entry for the id. An id absent from `rowStates` entirely is the twl_PSA
@@ -335,15 +359,9 @@ export function attributeTsvShrink(args: {
   // that row's id later vanishes from D1 altogether via a truncated load, it
   // must still read as unexplained, whatever edit_log says about its past.
   const removedIds = new Set<string>();
-  let liveCount = 0;
   for (const row of rowStates) {
-    const isLive = row.deleted_at == null && (resource !== "tn" || row.trashed_at == null);
-    if (isLive) {
-      liveIds.add(row.id);
-      liveCount++;
-    } else {
-      removedIds.add(row.id);
-    }
+    const isRemoved = row.deleted_at != null || (resource === "tn" && row.trashed_at != null);
+    if (isRemoved) removedIds.add(row.id);
   }
 
   // Last-write-wins over `removals`, keyed by each entry's own `id` (not
@@ -369,6 +387,97 @@ export function attributeTsvShrink(args: {
     else unexplained++;
   }
   return { liveCount, missing: explained + unexplained, explained, unexplained };
+}
+
+// Fix 4: maps a checkTsvShrink refusal `detail` string to the operator-facing
+// explanation of what happened and what to do about it. Pulled out as a pure,
+// exported function so every refusal kind checkTsvShrink can produce is
+// unit-testable directly, rather than only reachable through
+// recordShrinkSkipAlert's D1-touching caller (exportWorkflow.ts). The
+// previous inline version's fallback branch asserted "Master's ID column
+// couldn't be parsed" for ANY unrecognized detail shape — exactly the
+// truncated-fetch misdiagnosis this file exists to fix, silently reopened for
+// any future refusal kind added to checkTsvShrink without a matching branch
+// here. The fallback below is neutral instead: it names the problem as
+// "unrecognized" rather than inventing a specific (and possibly wrong) cause.
+//
+// Note: `render_ids_unreadable` / `render_inconsistent_*` (added alongside
+// this function, see FIX 1/2) are deliberately checked for exact/prefix match
+// BEFORE the `_ids_unreadable` substring check below — "render_ids_unreadable"
+// itself contains the substring "_ids_unreadable", so the more specific check
+// must run first or it would be misreported as a MASTER parse failure.
+export function describeShrinkRefusal(
+  detail: string,
+  ctx: { renderedRows: number; masterRows: number | null; explained?: number; unexplained?: number },
+): { signature: string; remedy: string } {
+  const { masterRows, explained, unexplained } = ctx;
+  const lost = masterRows != null ? masterRows - ctx.renderedRows : null;
+
+  if (detail === "master_unreadable") {
+    // Master couldn't be FETCHED at all — nothing was parsed, nothing was
+    // compared. Distinct from "parsed but the ID column looked wrong".
+    return {
+      signature: `Master itself couldn't be fetched from DCS, so nothing could be compared at all.`,
+      remedy: `Check DCS connectivity/rate limits, then re-export.`,
+    };
+  }
+  if (detail === "render_ids_unreadable") {
+    // FIX 2: deliberately NOT `shrink_`-prefixed, so allowShrink's override
+    // gate (which only recognizes the `shrink_` prefix as overridable) can
+    // never bypass this — same reasoning as `master_unreadable`: a human
+    // authorizing "yes, I meant to delete those rows" cannot also be taken as
+    // authorizing "and ship a render whose own ID column can't be parsed".
+    return {
+      signature: `Our own rendered TSV's ID column couldn't be parsed, so the render can't be checked against master at all.`,
+      remedy: `Inspect the export snapshot for this book/resource for a malformed render, then re-export.`,
+    };
+  }
+  if (detail.startsWith("render_inconsistent_")) {
+    // FIX 2: also NOT `shrink_`-prefixed — an operator's shrink override
+    // cannot speak to "our own render disagrees with its own row count",
+    // which is a bug in the render, not a deletion needing sign-off.
+    return {
+      signature:
+        `Our own rendered TSV's parsed row count disagrees with the row count captured earlier in the ` +
+        `same export run — an inconsistency in OUR render, not a comparison against master.`,
+      remedy: `Inspect the export snapshot for this book/resource before re-exporting; this points at a bug in the render itself.`,
+    };
+  }
+  if (detail.includes("_master_duplicate_ids_")) {
+    // Defect 5's fail-closed case: master's own ID column has duplicates.
+    return {
+      signature:
+        `Master's file for this book/resource contains duplicate row IDs, so attribution can't tell ` +
+        `which physical row owns which ID.`,
+      remedy: `Find and resolve the duplicate IDs in master's file, then re-export.`,
+    };
+  }
+  if (detail.includes("_ids_unreadable")) {
+    // Master's IDs genuinely couldn't be parsed (bad header / blank ID cell).
+    return {
+      signature: `Master's ID column couldn't be parsed, so the loss couldn't be attributed.`,
+      remedy: `Re-sync from master, verify the row count, then re-export.`,
+    };
+  }
+  if (typeof unexplained === "number" && lost != null) {
+    // IDs parsed and attribution ran: some (or all) of the loss traces to a
+    // human deletion tombstone in D1, but `unexplained` residual remains.
+    const explainedNote =
+      explained && explained > 0
+        ? ` (${explained} of the ${lost} were human deletions in D1 and were credited)`
+        : "";
+    return {
+      signature:
+        `${unexplained} of the ${lost} missing rows aren't accounted for by any deliberate deletion in ` +
+        `D1${explainedNote} — that's the truncated-load signature.`,
+      remedy: `Re-sync from master, verify the row count, then re-export.`,
+    };
+  }
+  // Unrecognized detail shape — neutral fallback, never guess a cause.
+  return {
+    signature: `Refusal reason not recognized (${detail}); inspect the export snapshot.`,
+    remedy: `Inspect the export snapshot, then decide whether to re-export.`,
+  };
 }
 
 // ── Export alignment-shrink guard (ULT/UST verse backstop) ───────────────────
