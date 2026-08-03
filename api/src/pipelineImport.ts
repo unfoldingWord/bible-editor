@@ -19,16 +19,16 @@ import {
   stripOrphanAlignmentMarkers,
   type SourceWord,
   type VerseExtract,
-} from "./importParsers";
-import { canonizeAlignmentSource } from "./canonizeHebrew";
-import { NT_BOOKS } from "./dcsSources";
-import { newRowId, isValidRowId } from "./rowId";
-import { tnContentKey } from "./tnDedup";
+} from "./importParsers.ts";
+import { canonizeAlignmentSource } from "./canonizeHebrew.ts";
+import { NT_BOOKS } from "./dcsSources.ts";
+import { newRowId, isValidRowId } from "./rowId.ts";
+import { tnContentKey } from "./tnDedup.ts";
 import {
   IMPORT_CLAIM_STALE_SECONDS,
   shouldTouchClaim,
   tnSweepScope,
-} from "./pipelineImportClaim";
+} from "./pipelineImportClaim.ts";
 
 interface OutputEntry {
   type?: string;
@@ -41,7 +41,7 @@ interface OutputEntry {
   commitSha?: string;
 }
 
-interface ImportContext {
+export interface ImportContext {
   jobId: string;
   pipelineType: "generate" | "notes" | "tqs" | string;
   book: string;
@@ -278,7 +278,7 @@ export async function importJobOutput(
 // Mutable heartbeat clock threaded through staging + apply. Both phases of one
 // apply pass share it so the pass touches the claim at most once per
 // CLAIM_TOUCH_INTERVAL_SECONDS combined, not once per phase.
-interface ClaimHeartbeat {
+export interface ClaimHeartbeat {
   lastTouchedAt: number;
 }
 
@@ -409,7 +409,7 @@ export interface ApplyResult {
   affectedChapters: number[];
 }
 
-interface PendingImportRow {
+export interface PendingImportRow {
   id: number;
   kind: "tn" | "tq" | "verse";
   book: string;
@@ -527,6 +527,17 @@ async function applyJobOutput(
   const verseKey = (p: PendingImportRow) => p.chapter * 100000 + p.verse;
 
   for (const p of tnProposals) {
+    // Heartbeat FIRST, before any per-proposal work or `continue` path. Both
+    // the hint-expansion and content-dedup-skip branches below `continue`
+    // before reaching the touch call that used to sit at the bottom of this
+    // loop — a run dominated by skip-path proposals (DAN 11-scale: ~150
+    // proposals x ~4.5s/proposal ~= 11 minutes) would then heartbeat ZERO
+    // times, blowing past IMPORT_CLAIM_STALE_SECONDS (600s) and letting a
+    // concurrent poller win the CAS mid-flight — reopening the interleaved-
+    // applier corruption the single-applier claim exists to prevent. Placing
+    // it first means every iteration heartbeats regardless of which path it
+    // takes.
+    await maybeTouchClaim(env, job.jobId, heartbeat);
     // Hint expansion: if the AI's proposed id matches a queued hint stub in
     // this job's scope, UPDATE that row in place instead of minting a new
     // one. The hint's rowId round-trips through bp-assistant as the TSV ID
@@ -577,7 +588,6 @@ async function applyJobOutput(
     await applyTnInsert(env, p, userId, sortOrder);
     affected.add(p.chapter);
     result.tnCreated += 1;
-    await maybeTouchClaim(env, job.jobId, heartbeat);
   }
 
   for (const p of tqProposals) {
@@ -633,7 +643,10 @@ async function maxSortOrderPerVerse(
   return m;
 }
 
-async function deleteUnkeptTns(
+// Exported for the fake-DB regression test in pipelineImport.test.mjs, which
+// asserts on the SQL/binding this function actually generates — see the DAN
+// 11 tests there. Not intended as a public API beyond that.
+export async function deleteUnkeptTns(
   env: Env,
   job: ImportContext,
   userId: number,
@@ -694,6 +707,20 @@ async function deleteUnkeptTns(
   // scoping is what limits the blast radius if that ever regresses. See the
   // DAN 11 regression test for tnSweepScope in pipelineImport.test.mjs — do
   // NOT widen this back to a job-wide scope.
+  //
+  // Known, accepted residual (not fully closed by this fix): applyTnInsert
+  // resolves each proposal atomically (its own D1 batch), and tnProposals is
+  // processed in `ORDER BY kind, chapter, verse, id` order (see the SELECT in
+  // applyJobOutput), so a mid-run death can leave ONE verse straddled — some
+  // of its proposals already inserted+resolved, the rest still unresolved.
+  // Because that straddled verse's remaining proposals are still unresolved,
+  // it's still in tnSweepScope(tnProposals) for the resumed pass, so the sweep
+  // deletes what the first pass already inserted THERE before re-inserting
+  // only the leftovers — a single verse can still see a delete/reinsert cycle
+  // on resume. This is bounded to roughly one verse (the one mid-flight when
+  // the process died), not the whole job, unlike the bug this PR fixes.
+  // Closing it fully would need per-proposal (not per-verse) resolution
+  // tracking in the sweep scope; left as a known gap.
   const pairs = tnSweepScope(tnProposals);
   if (pairs.length === 0) return 0;
 

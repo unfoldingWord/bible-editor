@@ -17,6 +17,7 @@ import {
   shouldTouchClaim,
   CLAIM_TOUCH_INTERVAL_SECONDS,
 } from "./pipelineImportClaim.ts";
+import { deleteUnkeptTns } from "./pipelineImport.ts";
 
 function assert(cond, msg) {
   if (!cond) {
@@ -66,11 +67,16 @@ assert(
 // --- The stale window is a lease bound for CRASH RECOVERY, not a promise that
 //     it exceeds any real apply. DAN 11's apply ran ~12 minutes — longer than
 //     IMPORT_CLAIM_STALE_SECONDS (600s) — so a long-but-alive apply is only
-//     protected because it heartbeats its claim (see shouldTouchClaim below),
-//     not because the window is bigger than any apply could be. ---
+//     protected because it heartbeats its claim (see shouldTouchClaim below).
+//     The invariant that actually matters is the RELATIONSHIP between the two
+//     constants: the heartbeat must fire often enough, relative to the lease,
+//     to keep it alive comfortably — a heartbeat slower than (or even close
+//     to) the lease window cannot reliably keep a live claim from going stale
+//     between touches. ---
 assert(
-  IMPORT_CLAIM_STALE_SECONDS > 0,
-  `stale window (${IMPORT_CLAIM_STALE_SECONDS}s) is a positive lease bound for crash recovery`,
+  CLAIM_TOUCH_INTERVAL_SECONDS * 2 <= IMPORT_CLAIM_STALE_SECONDS,
+  `heartbeat interval (${CLAIM_TOUCH_INTERVAL_SECONDS}s) must be comfortably under the stale window ` +
+    `(${IMPORT_CLAIM_STALE_SECONDS}s, at least 2x margin) — a heartbeat slower than the lease cannot keep it alive`,
 );
 
 // ── tnSweepScope: the DAN 11 regression ──────────────────────────────────
@@ -152,5 +158,193 @@ assert(
     `shouldTouchClaim: a 12-minute apply refreshes its claim repeatedly (${touches} touches)`,
   );
 }
+
+// ── deleteUnkeptTns: the SQL it actually generates (fake-DB) ─────────────
+// tnSweepScope alone only proves a pure helper doesn't invent inputs — the
+// real DAN 11 regression lived in the SQL deleteUnkeptTns builds. Reverting
+// that SQL to the old job-wide `EXISTS (... pending_imports ...)` while
+// leaving tnSweepScope exported-but-unused would pass every assertion above.
+// These tests call the REAL deleteUnkeptTns against a fake env.DB that
+// records every prepared statement's SQL text and bound args, so they fail if
+// the generated query stops matching what we intend.
+//
+// Fake DB: prepare(sql).bind(...args) records the call and returns an object
+// whose .all()/.run() answer with empty result shapes. deleteUnkeptTns's
+// SELECT loop always sees zero live rows back, so it returns 0 without ever
+// reaching the delete-execution phase (env.DB.batch is never called) — exactly
+// the surface these tests need: the SELECT's SQL and bindings.
+function fakeDeleteDb() {
+  const calls = [];
+  return {
+    calls,
+    env: {
+      DB: {
+        prepare(sql) {
+          return {
+            bind(...args) {
+              calls.push({ sql, args });
+              return {
+                async all() {
+                  return { results: [] };
+                },
+                async run() {
+                  return { meta: { changes: 0 } };
+                },
+              };
+            },
+          };
+        },
+        async batch(stmts) {
+          throw new Error(
+            `unexpected env.DB.batch call with ${stmts.length} statements — ` +
+              "the fake SELECT always returns zero rows, so deleteUnkeptTns should " +
+              "return before ever building a delete batch",
+          );
+        },
+      },
+    },
+  };
+}
+
+// tnProposals only needs (chapter, verse) for tnSweepScope's purposes here;
+// the rest of PendingImportRow is irrelevant to deleteUnkeptTns.
+function tnProposal(chapter, verse) {
+  return {
+    id: chapter * 100000 + verse,
+    kind: "tn",
+    book: "DAN",
+    chapter,
+    verse,
+    bible_version: null,
+    payload_json: "{}",
+  };
+}
+
+function selectCalls(calls) {
+  return calls.filter((c) => /SELECT id, version FROM tn_rows/.test(c.sql));
+}
+
+function pairsFromArgs(args) {
+  // args = [book, startChapter, endChapter, AI_SOURCE, ch1, v1, ch2, v2, ...]
+  const pairs = [];
+  for (let i = 4; i < args.length; i += 2) {
+    pairs.push({ chapter: args[i], verse: args[i + 1] });
+  }
+  return pairs;
+}
+
+const job11 = {
+  jobId: "job-dan11",
+  pipelineType: "notes",
+  book: "DAN",
+  startChapter: 11,
+  endChapter: 11,
+};
+const newHeartbeat = () => ({ lastTouchedAt: Math.floor(Date.now() / 1000) });
+
+// --- Test 1: the DAN 11 regression, against the REAL generated SQL ---
+await (async () => {
+  const proposals = [];
+  for (let v = 32; v <= 45; v++) proposals.push(tnProposal(11, v));
+  const { calls, env } = fakeDeleteDb();
+  await deleteUnkeptTns(env, job11, 1, proposals, newHeartbeat());
+
+  const sels = selectCalls(calls);
+  assert(sels.length > 0, "DAN 11 SQL regression: deleteUnkeptTns issued at least one SELECT");
+
+  for (const c of sels) {
+    assert(
+      !/pending_imports/.test(c.sql),
+      "DAN 11 SQL regression: generated SQL does NOT reference pending_imports " +
+        "(the job-wide EXISTS subquery is exactly what deleted the first pass's notes)",
+    );
+  }
+
+  const coveredPairs = new Set();
+  for (const c of sels) {
+    for (const p of pairsFromArgs(c.args)) coveredPairs.add(`${p.chapter}/${p.verse}`);
+  }
+  for (let v = 32; v <= 45; v++) {
+    assert(
+      coveredPairs.has(`11/${v}`),
+      `DAN 11 SQL regression: bound pair for ch11 v${v} present in generated SQL`,
+    );
+  }
+  assert(
+    coveredPairs.size === 14,
+    `DAN 11 SQL regression: exactly 14 bound pairs generated (got ${coveredPairs.size})`,
+  );
+})();
+
+// --- Test 2: every existing safety guard still appears in the generated SQL ---
+await (async () => {
+  const proposals = [tnProposal(11, 32)];
+  const { calls, env } = fakeDeleteDb();
+  await deleteUnkeptTns(env, job11, 1, proposals, newHeartbeat());
+
+  const sels = selectCalls(calls);
+  assert(sels.length > 0, "guard-preservation: at least one SELECT issued");
+  const sql = sels[0].sql;
+  for (const guard of [
+    "deleted_at IS NULL",
+    "trashed_at IS NULL",
+    "preserve = 0",
+    "hint = 0",
+    "chapter BETWEEN",
+    "updated_by IS NULL",
+  ]) {
+    assert(sql.includes(guard), `guard-preservation: generated SQL retains "${guard}"`);
+  }
+  assert(
+    /FROM edit_log/.test(sql) && /action IN \('create', 'update'\)/.test(sql),
+    "guard-preservation: generated SQL retains the edit_log latest-content-source subquery",
+  );
+})();
+
+// --- Test 3: binding integrity across multiple chunks ---
+await (async () => {
+  // 95 unresolved verses forces 3 chunks at CHUNK_PAIRS=40 (40 + 40 + 15).
+  const inputPairs = [];
+  for (let v = 1; v <= 95; v++) inputPairs.push({ chapter: 11, verse: v });
+  const proposals = inputPairs.map((p) => tnProposal(p.chapter, p.verse));
+  const { calls, env } = fakeDeleteDb();
+  await deleteUnkeptTns(env, job11, 1, proposals, newHeartbeat());
+
+  const sels = selectCalls(calls);
+  assert(
+    sels.length >= 3,
+    `binding integrity: 95 verses forces multiple chunked statements (got ${sels.length})`,
+  );
+
+  const seenPairKeys = [];
+  for (const c of sels) {
+    // Every ?N placeholder in the SQL must have a bound argument at that
+    // position, and the statement must never exceed D1's ~100-param cap.
+    const placeholderNumbers = [...c.sql.matchAll(/\?(\d+)/g)].map((m) => Number(m[1]));
+    const maxPlaceholder = Math.max(...placeholderNumbers);
+    assert(
+      maxPlaceholder === c.args.length,
+      `binding integrity: highest placeholder ?${maxPlaceholder} has a bound arg ` +
+        `(${c.args.length} args bound)`,
+    );
+    assert(
+      c.args.length <= 100,
+      `binding integrity: statement binds ${c.args.length} params, within D1's 100-param cap`,
+    );
+    for (const p of pairsFromArgs(c.args)) seenPairKeys.push(`${p.chapter}/${p.verse}`);
+  }
+
+  const inputKeys = inputPairs.map((p) => `${p.chapter}/${p.verse}`);
+  assert(
+    seenPairKeys.length === inputKeys.length,
+    `binding integrity: no duplicate/omitted pairs across chunks ` +
+      `(expected ${inputKeys.length}, got ${seenPairKeys.length})`,
+  );
+  const seenSet = new Set(seenPairKeys);
+  assert(
+    inputKeys.every((k) => seenSet.has(k)),
+    "binding integrity: union of bound pairs across all statements equals the input pairs exactly",
+  );
+});
 
 console.log("pipelineImport (claim guard): all assertions passed");
