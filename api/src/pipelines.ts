@@ -2049,7 +2049,6 @@ const ForceFailBody = z.object({ confirm: z.string() }).strict();
 
 export type ForceFailResult =
   | { kind: "not_found" }
-  | { kind: "forbidden" }
   | { kind: "cannot_force_fail"; state: string }
   | { kind: "confirm_mismatch" }
   | { kind: "ok"; jobId: string };
@@ -2078,7 +2077,6 @@ export async function forceFailJob(
       end_chapter: number;
     }>();
   if (!owned) return { kind: "not_found" };
-  if (owned.user_id !== userId) return { kind: "forbidden" };
   if (!FORCE_FAILABLE.includes(owned.state)) {
     return { kind: "cannot_force_fail", state: owned.state };
   }
@@ -2092,6 +2090,13 @@ export async function forceFailJob(
   // debugging "why did this run die?", and `force-stopped by user 1` makes them
   // go do a second lookup. Fall back to the id if the users row is missing.
   const actor = (await resolveUsernameFromDb(env, userId)) ?? `user ${userId}`;
+  // Any editor can force-stop now (see the route comment below), so the actor
+  // is frequently NOT the job's owner. Resolve the owner's username too, so
+  // the audit trail names both — omitted only when actor === owner.
+  const isOwner = owned.user_id === userId;
+  const ownerName = isOwner
+    ? null
+    : ((await resolveUsernameFromDb(env, owned.user_id)) ?? `user ${owned.user_id}`);
 
   // FIX (F6): the CAS UPDATE now runs FIRST, with a placeholder outcome, and
   // the upstream /stop call happens only after it lands. The original order
@@ -2103,7 +2108,9 @@ export async function forceFailJob(
   // stop failed, and the run was killed anyway" — able to kill a run that was
   // legitimately finishing. Doing the CAS first means we only ever call
   // upstream once we've genuinely won the local state transition.
-  const placeholderMessage = `force-stopped by ${actor}; upstream stop: pending`;
+  const placeholderMessage = ownerName
+    ? `force-stopped by ${actor} (owner: ${ownerName}); upstream stop: pending`
+    : `force-stopped by ${actor}; upstream stop: pending`;
 
   // CAS-guarded local UPDATE so a concurrent transition (e.g. the bot finally
   // reporting 'done'/'failed' via a poll landing at the same moment) can't be
@@ -2163,7 +2170,9 @@ export async function forceFailJob(
     upstreamOutcome = "upstream stop: not attempted (pipeline API disabled)";
   }
 
-  const errorMessage = `force-stopped by ${actor}; ${upstreamOutcome}`;
+  const errorMessage = ownerName
+    ? `force-stopped by ${actor} (owner: ${ownerName}); ${upstreamOutcome}`
+    : `force-stopped by ${actor}; ${upstreamOutcome}`;
 
   // Second, small UPDATE to record the real upstream outcome now that we know
   // it — guarded so it only ever touches the row this call itself just force-
@@ -2201,16 +2210,27 @@ export async function forceFailJob(
 // out, during which the job held both the chapter lock and the single bot
 // dispatch slot).
 //
+// Any authenticated editor may force-stop, not just the job's owner: the
+// resource being freed (the chapter lock + the single bot dispatch slot) is
+// shared across every translator, not owned by whoever happened to start the
+// run, and GET /api/pipelines already shows every user's active/queued jobs
+// (queueVisible/ACTIVE_STATES) — so another editor's running job is already
+// visible in the client before they'd ever reach for this button. Restricting
+// the escape hatch to the owner was exactly the NUM 27 failure mode: the
+// owner was asleep, the job was wedged holding the only bot slot, and nobody
+// else could clear it (issue #398).
+//
 // The typed confirmation (`{confirm: string}`, matched exactly against a
 // phrase the SERVER derives from the job's own book/chapter — never trust a
 // client-supplied phrase) is a deliberate speed bump, not a security control,
-// same reasoning as the force-resume comment above: this is an authenticated
-// editor-only route already gated on the job's own owner, so the exposure
-// being defended against is "this editor clicks through their own destructive
-// action without reading it," not privilege escalation. Making the phrase
-// name the book and chapter range means the blast radius is legible in the
-// same box the user types into, rather than trusting a generic "are you
-// sure?" to have been read.
+// same reasoning as the force-resume comment above: the exposure being
+// defended against is "an editor clicks through a destructive action without
+// reading it," not privilege escalation — every force-stop is attributed in
+// the job's error_message (actor, and the owner too when the actor isn't the
+// owner), so misuse is traceable after the fact. Making the phrase name the
+// book and chapter range means the blast radius is legible in the same box
+// the user types into, rather than trusting a generic "are you sure?" to have
+// been read.
 //
 // The upstream stop call is best-effort (see forceFailJob above) because the
 // bot-side kill contract is a follow-up landing in a separate repo/PR — this
@@ -2233,8 +2253,6 @@ pipelines.post("/:jobId/force-fail", requireEditor, async (c) => {
   switch (result.kind) {
     case "not_found":
       return c.json({ error: "not_found" }, 404);
-    case "forbidden":
-      return c.json({ error: "forbidden" }, 403);
     case "cannot_force_fail":
       return c.json({ error: "cannot_force_fail", state: result.state }, 409);
     case "confirm_mismatch":

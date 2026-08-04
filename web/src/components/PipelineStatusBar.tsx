@@ -626,8 +626,7 @@ export function PipelineStatusBar({ toast, onToastClear }: Props = {}) {
                       </span>
                     </Tooltip>
                   )}
-                  {(job.state === "running" || job.state === "dispatching") &&
-                    !isForeign(job) && (
+                  {(job.state === "running" || job.state === "dispatching") && (
                       <Tooltip title="Stop this run immediately and discard its in-flight AI work — for a wedged run that isn't making progress">
                         <span>
                           <Button
@@ -715,6 +714,11 @@ export function PipelineStatusBar({ toast, onToastClear }: Props = {}) {
                     ? `–${forceFailTarget.end_chapter}`
                     : ""}
                 </Typography>
+                {isForeign(forceFailTarget) && (
+                  <Typography variant="body2" color="text.secondary" sx={{ mb: 1, fontStyle: "italic" }}>
+                    This run was started by {forceFailTarget.started_by_username ?? "another user"}.
+                  </Typography>
+                )}
                 <Typography variant="body2" component="div" sx={{ mb: 1 }}>
                   This will:
                   <ul style={{ margin: "4px 0 0 0", paddingLeft: 20 }}>

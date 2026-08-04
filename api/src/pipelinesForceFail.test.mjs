@@ -74,6 +74,7 @@ function fakeEnv({
   rereadState = "done",
   btApiToken,
   username = null,
+  usernames = null,
 }) {
   const env = {
     BT_API_TOKEN: btApiToken,
@@ -90,9 +91,24 @@ function fakeEnv({
         env.queries.push(sql);
         // resolveUsernameFromDb's lookup for the audit trail. Default null so
         // the other cases exercise the "users row missing" fallback.
+        //
+        // forceFailJob now looks up TWO usernames when actor !== owner (the
+        // acting editor, and the job's owner for the audit message) — both
+        // hit this same query text, distinguished only by the bound user id.
+        // `usernames` (keyed by user id) lets a test answer them differently;
+        // `username` remains a flat fallback for single-actor tests that
+        // don't care about the distinction.
         if (/SELECT dcs_username FROM users/.test(sql)) {
           return {
-            bind: () => ({ first: async () => (username ? { dcs_username: username } : null) }),
+            bind: (id) => ({
+              first: async () => {
+                if (usernames) {
+                  const name = usernames[id];
+                  return name ? { dcs_username: name } : null;
+                }
+                return username ? { dcs_username: username } : null;
+              },
+            }),
           };
         }
         if (/SELECT user_id, state, upstream_job_id, book, start_chapter, end_chapter/.test(sql)) {
@@ -320,9 +336,9 @@ async function withFetch(impl, fn, trace) {
   assert(result.state === "queued", "reports the actual state");
 }
 
-// ─── not found / forbidden ──────────────────────────────────────────────────
+// ─── not found ──────────────────────────────────────────────────────────────
 {
-  console.log("\n[not found / forbidden]");
+  console.log("\n[not found]");
   const notFoundEnv = fakeEnv({ row: null });
   const nf = await forceFailJob(notFoundEnv, {
     jobId: "missing",
@@ -330,14 +346,53 @@ async function withFetch(impl, fn, trace) {
     confirm: "anything",
   });
   assert(nf.kind === "not_found", "missing row -> not_found");
+}
 
-  const forbiddenEnv = fakeEnv({ row: { ...baseJob, user_id: 99 } });
-  const fb = await forceFailJob(forbiddenEnv, {
+// ─── any editor (not just the owner) can force-stop ────────────────────────
+// This is the point of the change: a wedged run holds a GLOBAL chapter lock
+// and the single bot dispatch slot, so if only the owner could clear it and
+// the owner is unreachable (asleep, gone), nobody can unwedge it — exactly
+// the NUM 27 incident. The route stays behind requireEditor (authenticated
+// editors only), but ownership of the job is no longer checked.
+{
+  console.log("\n[non-owner editor can force-stop]");
+  // job owned by user 1 ("benjamin"); acting user is 99 ("translator99").
+  const env = fakeEnv({
+    row: { ...baseJob, user_id: 1, upstream_job_id: null },
+    usernames: { 1: "benjamin", 99: "translator99" },
+  });
+  const result = await forceFailJob(env, {
     jobId: "job-3",
+    userId: 99,
+    confirm: "STOP THE AI FOR NUM 27",
+  });
+  assert(result.kind === "ok", "non-owner editor's force-stop succeeds");
+  assert(
+    env.lastErrorMessage ===
+      "force-stopped by translator99 (owner: benjamin); upstream stop: not attempted (no upstream_job_id)",
+    `audit message names both the acting editor and the owner (got: ${env.lastErrorMessage})`,
+  );
+}
+
+// ─── the owner force-stopping their own job keeps the plain (no owner-suffix)
+// message shape ──────────────────────────────────────────────────────────────
+{
+  console.log("\n[owner force-stopping their own job]");
+  const env = fakeEnv({
+    row: { ...baseJob, user_id: 1, upstream_job_id: null },
+    username: "benjamin",
+  });
+  const result = await forceFailJob(env, {
+    jobId: "job-3b",
     userId: 1,
     confirm: "STOP THE AI FOR NUM 27",
   });
-  assert(fb.kind === "forbidden", "not the owner -> forbidden");
+  assert(result.kind === "ok", "owner's force-stop succeeds");
+  assert(
+    env.lastErrorMessage ===
+      "force-stopped by benjamin; upstream stop: not attempted (no upstream_job_id)",
+    `audit message has no owner-suffix when actor is the owner (got: ${env.lastErrorMessage})`,
+  );
 }
 
 // ─── happy path: running -> failed, upstream stop succeeds ────────────────
