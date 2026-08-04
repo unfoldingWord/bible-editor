@@ -693,19 +693,32 @@ export function classifyAlignmentShrinkOffenders(
 // exactly the kind this whole change exists to stop.
 export type OffenderProvenance = "human_edit" | "sync_write" | "ai_write" | "unknown" | "not_checked";
 
+// Ownership first, last-writer second — deliberately, because the last writer
+// alone lies. The reimport's "source-attr reconcile" step rewrites verses a
+// TRANSLATOR owns (bookReimport.ts leaves `updated_by` set on purpose) and logs
+// them through logEditStmt, which hardcodes source=dcs_reimport. Reading only
+// the newest edit_log row would therefore call a translator's verse a sync
+// write and tell Benjamin to re-sync it from master — destroying the very
+// revision the guard stopped to protect. `verses.updated_by` is the codebase's
+// own ownership signal (it is what isReimportableRow gates on), so it decides,
+// and the edit_log source only distinguishes the AI from a person.
 export function offenderProvenanceFromLog(row: {
-  source: string | null;
-  user_id: number | null;
+  updated_by: number | null;
+  latest_source: string | null;
 } | null | undefined): OffenderProvenance {
   if (!row) return "unknown";
-  if (row.source == null || row.source === "") return row.user_id == null ? "unknown" : "human_edit";
-  // The AI pipeline is not the sync: D1 DOES hold a revision master lacks, so
-  // "re-sync from master" would discard the AI's work — and AI-written verses
-  // are the known home of real alignment corruption (U+FFFD in \zaln-s, MIC
-  // 6:10 orphan \zaln-e, maqqef fusion), the last place to advise against
-  // re-aligning. It gets its own bucket rather than borrowing the sync's.
-  if (row.source === "ai_pipeline") return "ai_write";
-  return "sync_write";
+  // The AI pipeline is neither the sync nor a translator: D1 DOES hold a
+  // revision master lacks, so "re-sync from master" would discard the AI's
+  // work — and AI-written verses are the known home of real alignment
+  // corruption (U+FFFD in \zaln-s, MIC 6:10 orphan \zaln-e, maqqef fusion),
+  // the last place to advise against re-aligning.
+  if (row.latest_source === "ai_pipeline") return "ai_write";
+  if (row.updated_by != null) return "human_edit";
+  // Master-owned. Only the reimport's own marker earns the "the sync wrote it,
+  // so master is authoritative" claim; anything else is an unrecognised writer
+  // and must not be asserted as the sync (an allowlist, not a catch-all).
+  if (row.latest_source === "dcs_reimport") return "sync_write";
+  return "unknown";
 }
 
 function describeOffenders(offenders: AlignmentShrinkResult["offenders"], limit = 5): string {
@@ -819,9 +832,9 @@ export function buildAlignmentShrinkAlertMessage(args: {
   }
   if (notChecked.length > 0) {
     parts.push(
-      `a further ${notChecked.length} verse(s) also lost \\zaln word alignment and were NOT looked up ` +
-        `(the provenance query is capped) — ${describeOffenders(notChecked, 3)}. Treat the causes above as ` +
-        `covering only the verses they name.`,
+      `a further ${notChecked.length} verse(s) also lost \\zaln word alignment and were NOT attributed — ` +
+        `${describeOffenders(notChecked, 3)}. Nothing was measured for these (the lookup is capped, and it ` +
+        `skips or gives up rather than guess), so treat the causes above as covering only the verses they name.`,
     );
   }
   return `${head}${parts.join(" SEPARATELY, ")}`;

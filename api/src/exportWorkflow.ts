@@ -1356,55 +1356,75 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     await this.writeAlert(source, message, `${this.env.DCS_BASE_URL}/unfoldingWord`);
   }
 
-  // Who last wrote each offending verse in D1, keyed by the offender's
-  // `chapter:verse` ref. Mirrors bookReimport.ts's `latest_source` sub-select:
-  // a human editor edit logs no `source` (and a `user_id`), the nightly sync
-  // logs `dcs_reimport`, the AI pipeline logs `ai_pipeline`. Best-effort — any
-  // failure or missing row degrades to "unknown", which the alert reports
-  // honestly rather than guessing a cause.
+  // Who owns each offending verse in D1, keyed by the offender's ref. Reads
+  // `verses.updated_by` (ownership) alongside bookReimport.ts's `latest_source`
+  // sub-select (which of the sync / the AI / a person wrote it last) — see
+  // offenderProvenanceFromLog for why ownership has to win over last-writer.
+  //
+  // Every path that does NOT produce a measurement records `not_checked`
+  // rather than leaving the ref to default to `unknown`: a query failure, an
+  // unparseable ref, a verse past the cap. "We never looked" and "the edit_log
+  // has nothing" are different sentences in the alert, and only the second is
+  // a finding.
   private async readOffenderProvenance(
     book: string,
     resource: Resource,
     offenders: AlignmentShrinkResult["offenders"],
   ): Promise<Map<string, OffenderProvenance>> {
     const out = new Map<string, OffenderProvenance>();
+    // Only sequence-CHANGED offenders are ever bucketed by provenance, so spend
+    // the cap on them — a book-wide collateral de-alignment would otherwise
+    // burn all 25 lookups on verses whose wording never consults the result.
+    const candidates = offenders.filter((o) => !o.sequenceUnchanged).map((o) => o.ref);
     // A verse-bridge offender's ref is `chapter:start-end` (verseAlignStats
     // keeps the USFM verse key verbatim), but D1 keys the row by the START
     // verse alone — so match the bridge and take its start rather than
-    // dropping every bridged verse into "unknown".
-    const refs = offenders.map((o) => o.ref).filter((ref) => /^\d+:\d+(-\d+)?$/.test(ref));
+    // dropping every bridged verse. Anything else (e.g. a `6a` verse key) is
+    // un-lookupable, not un-attributed.
+    const refs: string[] = [];
+    for (const ref of candidates) {
+      if (/^\d+:\d+(-\d+)?$/.test(ref)) refs.push(ref);
+      else out.set(ref, "not_checked");
+    }
     if (refs.length === 0) return out;
-    // Cap the IN list so a book-wide de-alignment can't build a huge statement.
-    // Offenders past the cap are marked `not_checked`, NOT `unknown`: we never
-    // looked, and an alert must not turn our own cap into a finding.
     const LOOKUP_CAP = 25;
     const version = resource.toUpperCase();
     for (const ref of refs.slice(LOOKUP_CAP)) out.set(ref, "not_checked");
-    const byRowKey = new Map(refs.slice(0, LOOKUP_CAP).map((ref) => {
+    const looked = refs.slice(0, LOOKUP_CAP);
+    // Key by `chapter:startVerse` so a bridge and its start verse can't be
+    // told apart — if master somehow yields both, neither gets a guess.
+    const byKey = new Map<string, string[]>();
+    for (const ref of looked) {
       const [ch, v] = ref.split(":");
-      return [`${book}/${ch}/${v.split("-")[0]}/${version}`, ref];
-    }));
-    const keys = [...byRowKey.keys()];
-    // One pass: GROUP BY picks each verse's latest create/update id, and the
-    // outer query reads only those rows. (A correlated MAX(id) subquery
-    // re-probed per matching row, so a long-lived verse paid history-length ×
-    // cap row reads.) `book` is bound so edit_log_row_by_book applies.
-    const placeholders = keys.map((_, i) => `?${i + 2}`).join(", ");
+      const key = `${ch}:${v.split("-")[0]}`;
+      byKey.set(key, [...(byKey.get(key) ?? []), ref]);
+    }
+    for (const ref of looked) out.set(ref, "not_checked");
+    const keys = [...byKey.keys()];
+    const placeholders = keys.map((_, i) => `?${i + 3}`).join(", ");
     try {
       const rs = await this.env.DB.prepare(
-        `SELECT row_key, source, user_id FROM edit_log
-          WHERE id IN (SELECT MAX(id) FROM edit_log
-                        WHERE kind = 'verse' AND (book = ?1 OR book IS NULL) AND row_key IN (${placeholders})
-                          AND action IN ('create', 'update')
-                        GROUP BY row_key)`,
+        `SELECT chapter, verse, updated_by,
+                (SELECT source FROM edit_log
+                  WHERE kind = 'verse'
+                    AND row_key = ?1 || '/' || chapter || '/' || verse || '/' || ?2
+                    AND (book = ?1 OR book IS NULL)
+                    AND action IN ('create', 'update')
+                  ORDER BY id DESC LIMIT 1) AS latest_source
+           FROM verses
+          WHERE book = ?1 AND bible_version = ?2
+            AND chapter || ':' || verse IN (${placeholders})`,
       )
-        .bind(book, ...keys)
-        .all<{ row_key: string; source: string | null; user_id: number | null }>();
+        .bind(book, version, ...keys)
+        .all<{ chapter: number; verse: number; updated_by: number | null; latest_source: string | null }>();
       for (const row of rs.results) {
-        const ref = byRowKey.get(row.row_key);
-        if (ref) out.set(ref, offenderProvenanceFromLog(row));
+        const refsForRow = byKey.get(`${row.chapter}:${row.verse}`);
+        if (!refsForRow || refsForRow.length !== 1) continue;
+        out.set(refsForRow[0], offenderProvenanceFromLog(row));
       }
     } catch (err) {
+      // Leave the looked-at refs on `not_checked` — a failed query measured
+      // nothing, and must not be reported as "the edit_log does not say".
       console.log(`export: offender provenance lookup failed for ${book} ${version}: ${String(err)}`);
     }
     return out;

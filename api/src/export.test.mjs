@@ -1541,7 +1541,7 @@ function utf8Base64(s) {
     provenance: new Map([["40:6", "human_edit"], ["41:2", "not_checked"]]),
   });
   assert(
-    /NOT looked up/.test(notChecked) && !/does not say who last wrote/.test(notChecked),
+    /NOT attributed/.test(notChecked) && !/does not say who last wrote/.test(notChecked),
     `an offender past the lookup cap is reported as un-checked, never as a measured "unknown"`,
   );
 
@@ -1587,21 +1587,33 @@ function utf8Base64(s) {
 // --- offenderProvenanceFromLog: edit_log row → who last wrote the verse ---
 {
   assert(
-    offenderProvenanceFromLog({ source: null, user_id: 7 }) === "human_edit",
-    `no source + a user_id = an editor edit (verses.ts logs no source column)`,
+    offenderProvenanceFromLog({ updated_by: 7, latest_source: null }) === "human_edit",
+    `updated_by set = translator-owned (verses.ts logs no source column)`,
   );
   assert(
-    offenderProvenanceFromLog({ source: "dcs_reimport", user_id: null }) === "sync_write",
-    `source=dcs_reimport = the nightly sync wrote it`,
+    offenderProvenanceFromLog({ updated_by: null, latest_source: "dcs_reimport" }) === "sync_write",
+    `master-owned + source=dcs_reimport = the nightly sync wrote it`,
+  );
+  // The regression this ordering exists for: bookReimport's source-attr
+  // reconcile rewrites a TRANSLATOR-owned verse and logs it as dcs_reimport.
+  // Reading the last writer alone would call it a sync write and advise
+  // re-syncing from master — discarding the translator's revision.
+  assert(
+    offenderProvenanceFromLog({ updated_by: 7, latest_source: "dcs_reimport" }) === "human_edit",
+    `a sync RECONCILE on a translator-owned verse stays human_edit — ownership beats last-writer`,
   );
   assert(
-    offenderProvenanceFromLog({ source: "ai_pipeline", user_id: 1 }) === "ai_write",
+    offenderProvenanceFromLog({ updated_by: 1, latest_source: "ai_pipeline" }) === "ai_write",
     `source=ai_pipeline gets its OWN bucket — it is not the sync, and master does not hold that revision`,
   );
-  assert(offenderProvenanceFromLog(null) === "unknown", `no edit_log row at all → unknown, never guessed`);
+  assert(offenderProvenanceFromLog(null) === "unknown", `no verses row at all → unknown, never guessed`);
   assert(
-    offenderProvenanceFromLog({ source: null, user_id: null }) === "unknown",
-    `no source AND no user_id → unknown rather than assumed human`,
+    offenderProvenanceFromLog({ updated_by: null, latest_source: null }) === "unknown",
+    `master-owned with no edit_log source → unknown rather than assumed sync`,
+  );
+  assert(
+    offenderProvenanceFromLog({ updated_by: null, latest_source: "some_future_writer" }) === "unknown",
+    `an unrecognised source is unknown — the sync bucket is an allowlist, not a catch-all`,
   );
 }
 
