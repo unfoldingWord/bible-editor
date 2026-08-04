@@ -6,7 +6,7 @@ import { currentUserId, requireEditor } from "./auth";
 import { activePipelineForChapter, lockedResponseBody } from "./chapterLock";
 import { broadcastChapter } from "./wsEvents";
 import { newRowId } from "./rowId";
-import { BLANK_STUB_CLAUSE } from "./blankStub";
+import { blankStubClause } from "./blankStub";
 import { reopenLaneChecks } from "./laneReopen";
 import { refParts, coveredVersesFromRef } from "./importParsers";
 
@@ -987,17 +987,20 @@ async function setTnTrashed(
   // no-ops: both statements always run. So the audit SELECT is gated on
   // `trashed_at = ?5` — the value the UPDATE just wrote. Statements run in
   // order, so that matches only if the UPDATE actually applied, and never on a
-  // refusal (BLANK_STUB_CLAUSE requires trashed_at IS NULL going in, so a row
+  // refusal (the clause requires trashed_at IS NULL going in, so a row
   // that was already trashed carries some earlier timestamp).
   if (onlyIfBlankStub) {
+    // No caller identity means no ownership proof, so there is nothing this can
+    // safely discard. requireEditor should make this unreachable; fail closed.
+    if (userId == null) return null;
     const [guardedUpdate] = await env.DB.batch([
       env.DB
         .prepare(
           `UPDATE tn_rows
              SET trashed_at = ?1, updated_at = ?2
-           WHERE id = ?3 AND deleted_at IS NULL${bookClause(4)}${BLANK_STUB_CLAUSE}`,
+           WHERE id = ?3 AND deleted_at IS NULL${bookClause(4)}${blankStubClause(5)}`,
         )
-        .bind(now, now, id, book),
+        .bind(now, now, id, book, userId),
       env.DB
         .prepare(
           `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action)
@@ -1124,7 +1127,7 @@ rows.post("/tn/:id/trash", requireEditor, async (c) => {
   const userId = currentUserId(c);
   // `onlyIfBlankStub=1` is the auto-discard of an abandoned blank note stub,
   // not a user pressing delete. The client decides from a cached row, so make
-  // the server re-assert the predicate atomically (BLANK_STUB_CLAUSE) and
+  // the server re-assert the predicate atomically (blankStubClause) and
   // refuse if the row gained content under us — otherwise a collaborator
   // filling the stub mid-flight would get their note binned, and the nightly
   // job would promote that to a permanent tombstone. Distinguish it from

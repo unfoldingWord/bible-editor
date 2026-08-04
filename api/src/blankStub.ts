@@ -41,9 +41,23 @@
 const isBlank = (col: string) => `TRIM(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(
     COALESCE(${col}, ''), '\\n', ''), char(9), ''), char(10), ''), char(13), ''), char(160), '')) = ''`;
 
-export const BLANK_STUB_CLAUSE = `
+// `userParam` is the bind position holding the CALLER's user id, and the
+// ownership check it feeds is a data-loss guard, not bookkeeping.
+//
+// `updated_by IS NOT NULL` alone only proves "some editor created this", which
+// is enough to protect the 11 genuine upstream empties but NOT enough to stop a
+// cross-user delete: editor A creates a stub and starts typing without saving,
+// so the row is still blank in D1 while A's text sits in A's local state and
+// A's own IndexedDB draft. If editor B then activates that card and clicks
+// away, B's client asks to discard it and every other clause here passes — the
+// row really is blank. Requiring `updated_by = <caller>` means B's request
+// no-ops into a 409 instead of binning A's note (which the nightly job would
+// then promote to a permanent tombstone). Only the row's own author can discard
+// their abandoned stub.
+export const blankStubClause = (userParam: number) => `
   AND version = 1
   AND updated_by IS NOT NULL
+  AND updated_by = ?${userParam}
   AND trashed_at IS NULL
   AND preserve = 0
   AND hint = 0

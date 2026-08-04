@@ -15,12 +15,12 @@
 // The client discards such a stub on deactivation, but it decides from a CACHED
 // row. If a collaborator fills the stub in between, an unconditional trash would
 // bin a now-substantive note and the nightly job would promote that to a
-// permanent tombstone. So the UPDATE carries BLANK_STUB_CLAUSE and D1 re-asserts
+// permanent tombstone. So the UPDATE carries blankStubClause() and D1 re-asserts
 // the predicate atomically. This test runs that exact clause against real SQLite
 // — asserting the string would prove nothing about what SQLite does with it.
 
 import { DatabaseSync } from "node:sqlite";
-import { BLANK_STUB_CLAUSE } from "./blankStub.ts";
+import { blankStubClause } from "./blankStub.ts";
 
 let failed = 0;
 function assert(cond, msg) {
@@ -62,13 +62,13 @@ function db(row = {}) {
 
 // Run the guarded UPDATE exactly as setTnTrashed builds it (bookClause(4) is
 // `AND book = ?4` when a book is supplied). Returns true if the trash landed.
-function tryDiscard(d) {
+function tryDiscard(d, callerId = 30) {
   const res = d
     .prepare(
       `UPDATE tn_rows SET trashed_at = ?1, updated_at = ?2
-        WHERE id = ?3 AND deleted_at IS NULL AND book = ?4${BLANK_STUB_CLAUSE}`,
+        WHERE id = ?3 AND deleted_at IS NULL AND book = ?4${blankStubClause(5)}`,
     )
-    .run(1785801457, 1785801457, "fa9t", "JER");
+    .run(1785801457, 1785801457, "fa9t", "JER", callerId);
   return res.changes === 1;
 }
 
@@ -142,6 +142,25 @@ assert(
 assert(!tryDiscard(db({ note: "a\tb" })), "text containing a tab is still substantive → refused");
 assert(!tryDiscard(db({ note: "n" })), "a bare 'n' is not a stripped newline → refused");
 
+// ── ownership: only the row's own author may auto-discard it ──
+// `updated_by IS NOT NULL` alone proves "an editor made this", which protects
+// the upstream empties but NOT against a cross-user delete. Editor A creates a
+// stub and types without saving, so D1 still holds a blank row while A's text
+// sits in A's local state + A's own IndexedDB draft. If editor B activates that
+// card and clicks away, every other clause passes — the row really is blank.
+assert(
+  !tryDiscard(db({ updated_by: 30 }), 45),
+  "CROSS-USER: editor B cannot discard editor A's blank stub",
+);
+assert(
+  tryDiscard(db({ updated_by: 45 }), 45),
+  "the author can still discard their own stub",
+);
+assert(
+  !tryDiscard(db({ updated_by: null }), 45),
+  "upstream empty is refused no matter who asks",
+);
+
 // ── the audit row must land with the trash, and only with it ──
 // A trashed row with no action='trash' edit_log entry is what the export
 // shrink-guard treats as an unexplained removal, which fails the nightly export
@@ -151,9 +170,9 @@ function auditRun(d, book = "JER") {
   const res = d
     .prepare(
       `UPDATE tn_rows SET trashed_at = ?1, updated_at = ?2
-        WHERE id = ?3 AND deleted_at IS NULL AND book = ?4${BLANK_STUB_CLAUSE}`,
+        WHERE id = ?3 AND deleted_at IS NULL AND book = ?4${blankStubClause(5)}`,
     )
-    .run(now, now, "fa9t", book);
+    .run(now, now, "fa9t", book, 30);
   d.prepare(
     `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action)
      SELECT 'tn', ?1, book, ?2, version, version, ?3
@@ -192,9 +211,9 @@ function dbWithLog(row) {
   const res = d
     .prepare(
       `UPDATE tn_rows SET trashed_at = ?1, updated_at = ?2
-        WHERE id = ?3 AND deleted_at IS NULL AND book = ?4${BLANK_STUB_CLAUSE}`,
+        WHERE id = ?3 AND deleted_at IS NULL AND book = ?4${blankStubClause(5)}`,
     )
-    .run(1, 1, "fa9t", "ECC");
+    .run(1, 1, "fa9t", "ECC", 30);
   assert(res.changes === 0, "book mismatch → refused");
 }
 
