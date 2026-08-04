@@ -58,6 +58,7 @@ import { runChunkedReimport, storedResourceSha, ALL_RESOURCES as REIMPORT_RESOUR
 import { dcsRawUrl, dcsResourceFile, fetchText, fileCommitSha, type ReimportResource } from "./dcsSources";
 import type { TnRow, TqRow, TwlRow, VerseRow } from "./types";
 import { lintUsfmVerses } from "./lint";
+import { hardRejectRows } from "./hardRejectGuard";
 import { validateUsfm, summarizeUsfmIssues } from "./usfmValidate";
 import { shrinkOverrideAllowed } from "./shrinkGuard";
 
@@ -568,10 +569,42 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     // NoteCard.flushPending) — those are the right place to catch it, before it
     // is ever written. Withholding a whole book afterwards is not.
     //
-    // No replacement alert is written — nothing is being withheld, so there is
-    // no unattended action to record; the in-app lint chip already carries it.
     // The stale `export_blank:*` banner the old gate left behind is cleared at
     // the top of exportOne, ahead of every early return.
+    //
+    // What DOES still hold a book is the Occurrence column — see
+    // hardRejectGuard.ts. In the same validator files those checks carry no
+    // `severity` kwarg, so they default to "error", fail the run, and the merge
+    // bot never merges the PR. Two independent reviewers converged on the gap
+    // that made this necessary: the "add word" button in Shell.tsx creates a twl
+    // stub with blank OrigWords/TWLink and NO occurrence, which D1 stores as
+    // NULL. The old blank-field gate caught that row incidentally (via its blank
+    // OrigWords); removing the gate without this would let it ship and hard-fail
+    // the whole en_twl book's validation — withholding the book anyway, but with
+    // no banner naming the row. Prod carries 1 such row today (twl DAN 3:5
+    // `xf8f`, OrigWords "fall down", Occurrence NULL) and 0 rows with blank
+    // OrigWords, so the gate below is narrow by measurement, not by hope.
+    if (dcsAllowed && (resource === "tn" || resource === "twl")) {
+      const rejects = hardRejectRows(resource, built.content);
+      if (rejects.length > 0) {
+        await this.recordHardRejectAlert(book, resource, rejects);
+        const reason = `hard_reject_guard:${rejects.length}`;
+        await this.recordSnapshot(book, resource, null, null, built.rowCount, reason);
+        return {
+          book,
+          resource,
+          rowCount: built.rowCount,
+          bytes: built.content.length,
+          r2Key,
+          branch: null,
+          dcsCommitSha: null,
+          dcsChanged: false,
+          dcsSkippedReason: reason,
+          prNumber: null,
+          prReason: null,
+        };
+      }
+    }
 
     // Alignment-shrink backstop for the scripture (verse) resources. The TSV
     // shrink guard above protects row counts; this protects \zaln word
@@ -1425,6 +1458,32 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     const message =
       `Benjamin — nightly export BLOCKED ${book} ${resource.toUpperCase()}: the render has ${renderedRows} rows ` +
       `but master has ${masterRows ?? "?"} (${detail}). ${signature} Refusing to shrink master. ${remedy}`;
+    await this.writeAlert(source, message, `${this.env.DCS_BASE_URL}/unfoldingWord`);
+  }
+
+  // Banner alert when the hard-reject gate holds an export because the render
+  // contains a row DCS's validator counts as a real error (a blank or malformed
+  // Occurrence). Unlike the blank-field banner this replaces, this one states a
+  // cause the code measured: it names the offending refs and the validator's own
+  // reason for each. Wording claims only that WE refused — the DCS run has not
+  // happened, so it must not say DCS rejected anything yet.
+  private async recordHardRejectAlert(
+    book: string,
+    resource: Resource,
+    rejects: Array<{ ref: string; rowId: string; reason: string }>,
+  ): Promise<void> {
+    const source = `export_hard_reject:${book}:${resource}`;
+    const shown = rejects
+      .slice(0, 6)
+      .map((r) => `${r.ref} (${r.rowId}): ${r.reason}`)
+      .join("; ");
+    const more = rejects.length > 6 ? `; +${rejects.length - 6} more` : "";
+    const message =
+      `Benjamin — nightly export HELD ${book} ${resource.toUpperCase()}: ${rejects.length} row(s) would fail DCS ` +
+      `validation as a hard error, so the -be- PR's check would go red and the merge bot would never merge it. ` +
+      `${shown}${more}. Fix the Occurrence on those rows (or delete them) in the editor and re-export; every other ` +
+      `edit in ${book} ${resource.toUpperCase()} is waiting on it. Blank notes/questions/OrigWords/TWLink do NOT ` +
+      `cause this — those are validator warnings and ship normally.`;
     await this.writeAlert(source, message, `${this.env.DCS_BASE_URL}/unfoldingWord`);
   }
 

@@ -67,6 +67,19 @@ Highlights that bite repeatedly:
   Corollary: nothing downstream catches a blank field, so the in-app lint and the save-path
   guards (`rows.ts` 422 `blank_note`, `NoteCard.flushPending`) are the only protection.
 
+- **`Occurrence` is the column DCS actually hard-rejects — and it must be judged on the
+  RENDERED TSV, never on the D1 rows.** In the same validator files, the Occurrence checks carry
+  no `severity` kwarg, so they default to `"error"`: twl rejects a blank Occurrence
+  unconditionally, tn only when Quote is non-blank, tq not at all. `api/src/hardRejectGuard.ts`
+  holds the export for these. It reads the rendered bytes because `origLangOccurrence`
+  (`export.ts`) coerces null/0 → 1 whenever the Quote contains Hebrew/Greek: 10,708 prod tn rows
+  look offending in D1 but only **one** renders offending. Gating on rows would hold nearly every
+  tn book — the same over-broad mistake as the blank-field gate, in the other direction.
+  Live offenders as of 2026-08-03: `tn JER 37:5` `bfyt` (English quote, Occurrence NULL — holds
+  JER TN; fix is one field in the editor) and `twl DAN 3:5` `xf8f` (OrigWords "fall down",
+  Occurrence NULL — DAN TWL has been silently failing DCS validation). Root cause is a create
+  path: `Shell.tsx` "add word" posts no `occurrence` and `CreateTwl` has no default.
+
 - **A green typecheck can mean "checked nothing".** If `node_modules` is damaged, an
   unresolvable entry in tsconfig `types` (here `vite/client`) makes `tsc` emit one TS2688
   and silently skip the entire program — it reports success while checking zero files.
