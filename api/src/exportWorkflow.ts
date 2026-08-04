@@ -37,6 +37,7 @@ import {
   updateDcsPrBranch,
   usfmAlignmentShrinkRefused,
   buildAlignmentShrinkAlertMessage,
+  classifyAlignmentLossSeverity,
   offenderProvenanceFromLog,
   RESOURCE_TARGETS,
   type AlignmentShrinkResult,
@@ -617,25 +618,50 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     // the guard, or via an ingress path it doesn't cover) would still ship.
     // Conservative: only blocks a verse whose aligned-word count shrank while
     // its plain text is unchanged — a real text rewrite is always allowed.
+    //
+    // Detecting loss and REFUSING to ship are now separate decisions
+    // (classifyAlignmentLossSeverity). A word or two left undragged is worth
+    // knowing about, not worth withholding a translator's finished book from
+    // Door43 — so that ships with a warning banner and the editor's existing
+    // broken-link icon. Only bug-shaped loss (a flattened verse, a gutted
+    // verse, systemic scale, a broken render, an unverifiable master) still
+    // holds the book back.
     if (dcsAllowed && (resource === "ult" || resource === "ust")) {
       const guard = await this.checkUsfmAlignmentShrink(book, resource, built.content);
       if (!guard.ok) {
-        await this.recordAlignmentShrinkSkipAlert(book, resource, guard.detail, guard.offenders ?? []);
-        const reason = `align_shrink_guard:${guard.detail}`;
-        await this.recordSnapshot(book, resource, null, null, built.rowCount, reason);
-        return {
+        const severity = classifyAlignmentLossSeverity(guard.offenders ?? []);
+        await this.recordAlignmentShrinkSkipAlert(
           book,
           resource,
-          rowCount: built.rowCount,
-          bytes: built.content.length,
-          r2Key,
-          branch: null,
-          dcsCommitSha: null,
-          dcsChanged: false,
-          dcsSkippedReason: reason,
-          prNumber: null,
-          prReason: null,
-        };
+          guard.detail,
+          guard.offenders ?? [],
+          severity.block,
+        );
+        if (!severity.block) {
+          // A night where the guard found loss and shipped anyway should be
+          // visible in the log, not only in a dismissible banner.
+          console.log(
+            `export: shipping ${book} ${resource} despite translator-scale alignment loss ` +
+              `(${severity.reason}; ${guard.detail}) — alerted, not blocked`,
+          );
+        }
+        if (severity.block) {
+          const reason = `align_shrink_guard:${severity.reason}:${guard.detail}`;
+          await this.recordSnapshot(book, resource, null, null, built.rowCount, reason);
+          return {
+            book,
+            resource,
+            rowCount: built.rowCount,
+            bytes: built.content.length,
+            r2Key,
+            branch: null,
+            dcsCommitSha: null,
+            dcsChanged: false,
+            dcsSkippedReason: reason,
+            prNumber: null,
+            prReason: null,
+          };
+        }
       }
     }
 
@@ -1328,14 +1354,18 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     return { ok: true, detail: "ok" };
   }
 
-  // Banner alert when the alignment-shrink backstop blocks an ULT/UST export to
-  // avoid shipping a silent de-alignment to master. Same replace-undismissed
-  // shape as recordShrinkSkipAlert.
+  // Banner alert when the alignment-shrink backstop finds an ULT/UST verse that
+  // lost \zaln alignment. Same replace-undismissed shape as
+  // recordShrinkSkipAlert. `blocking` says whether the export was actually
+  // withheld — translator-scale loss ships and gets a `warning` banner, so it
+  // must not claim the book was blocked, and it must not shout `error` at
+  // Benjamin for a word somebody forgot to drag.
   private async recordAlignmentShrinkSkipAlert(
     book: string,
     resource: Resource,
     detail: string,
     offenders: AlignmentShrinkResult["offenders"],
+    blocking: boolean,
   ): Promise<void> {
     const source = `export_align_shrink:${book}:${resource}`;
     const label = `${book} ${resource.toUpperCase()}`;
@@ -1352,8 +1382,14 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       detail,
       offenders,
       provenance,
+      blocking,
     });
-    await this.writeAlert(source, message, `${this.env.DCS_BASE_URL}/unfoldingWord`);
+    await this.writeAlert(
+      source,
+      message,
+      `${this.env.DCS_BASE_URL}/unfoldingWord`,
+      blocking ? "error" : "warning",
+    );
   }
 
   // Who owns each offending verse in D1, keyed by the offender's ref. Reads

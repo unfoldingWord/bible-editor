@@ -572,9 +572,25 @@ export interface AlignmentShrinkResult {
   // matches between unrelated sentences (sequence changed — the EZK 40
   // shape). This does NOT change the refusal decision above, only what the
   // alert says.
-  offenders: Array<{ ref: string; lostWords: string[]; sequenceUnchanged: boolean }>;
+  offenders: Array<{
+    ref: string;
+    lostWords: string[];
+    sequenceUnchanged: boolean;
+    // Master's and the render's aligned-word counts for the verse. Carried so
+    // classifyAlignmentLossSeverity can tell "a translator didn't drag one
+    // word" from "the verse got flattened" — a couple of loose words is not a
+    // reason to hold up everyone else's work, a wiped verse is.
+    beforeAligned: number;
+    afterAligned: number;
+  }>;
 }
 
+// NOTE ON THE NAME: `refused` now means "alignment loss detected", not "the
+// export is off". Whether loss actually withholds the book from Door43 is
+// classifyAlignmentLossSeverity's call, and for translator-scale loss the
+// answer is no — see its comment. Detection stayed exactly as strict as it was;
+// only the consequence moved.
+//
 // Compare a rendered ULT/UST USFM against the current master USFM. For each
 // verse present in BOTH (added/removed verses are skipped — genuine content
 // change, not collateral loss), run `analyzeAlignmentDelta(masterVos,
@@ -602,7 +618,7 @@ export function usfmAlignmentShrinkRefused(
   // comparison data every master verse would be skipped and the guard would
   // fail OPEN. A corrupt render is exactly the case we must refuse. Fail closed.
   if (rendered === null) {
-    return { refused: true, offenders: [{ ref: "*", lostWords: ["unparseable_render"], sequenceUnchanged: true }] };
+    return { refused: true, offenders: [{ ref: "*", lostWords: ["unparseable_render"], sequenceUnchanged: true, beforeAligned: 0, afterAligned: 0 }] };
   }
   // An unparseable MASTER (but a parseable render) leaves us with no baseline to
   // compare against — lower risk (we can't prove loss), so we don't refuse on it,
@@ -620,7 +636,7 @@ export function usfmAlignmentShrinkRefused(
   if (rendered.size === 0) {
     const masterHasAligned = [...master.values()].some((s) => s.alignedWords > 0);
     if (masterHasAligned) {
-      return { refused: true, offenders: [{ ref: "*", lostWords: ["empty_render"], sequenceUnchanged: true }] };
+      return { refused: true, offenders: [{ ref: "*", lostWords: ["empty_render"], sequenceUnchanged: true, beforeAligned: 0, afterAligned: 0 }] };
     }
   }
   const offenders: AlignmentShrinkResult["offenders"] = [];
@@ -638,9 +654,68 @@ export function usfmAlignmentShrinkRefused(
       .filter((l) => l.reason === "lost")
       .map((l) => l.text);
     if (lostWords.length === 0) continue;
-    offenders.push({ ref, lostWords, sequenceUnchanged: delta.wordSequenceUnchanged });
+    offenders.push({
+      ref,
+      lostWords,
+      sequenceUnchanged: delta.wordSequenceUnchanged,
+      beforeAligned: delta.beforeAligned,
+      afterAligned: delta.afterAligned,
+    });
   }
   return { refused: offenders.length > 0, offenders };
+}
+
+// Does this alignment loss justify withholding the whole book from Door43?
+//
+// Policy (Benjamin, 2026-08-04): mostly NO. "An unaligned word or two here or
+// there is no reason not to sync to Door43 ... don't hold somebody's work back
+// because he didn't drag 'and' to the right spot." The app already flags
+// unaligned verses (AlignLinkButton's broken-chain icon) and the nightly alert
+// now names the verses, so a translator-scale slip is a thing to KNOW, not a
+// thing to embargo a book over. What still blocks is loss that looks like a
+// BUG on our side — where shipping means writing damage to master that no
+// human chose:
+//
+//   - a flattened verse: master had real alignment and the render has NONE.
+//     That is the whole-verse collapse signature (1CH 4:21 / NUM 24), never
+//     something a translator does by hand.
+//   - a gutted verse: at least half of a verse's aligned words vanished, and
+//     at least FLATTEN_MIN_WORDS of them. Dragging is done one word at a time;
+//     losing half a verse at once is not dragging.
+//   - systemic scale: more verses or more words than any hand-editing session
+//     plausibly produced.
+//
+// Everything else ships, with a warning alert naming the verses.
+const FLATTEN_MIN_WORDS = 5;
+const SYSTEMIC_VERSES = 20;
+const SYSTEMIC_WORDS = 100;
+
+export function classifyAlignmentLossSeverity(
+  offenders: AlignmentShrinkResult["offenders"],
+): { block: boolean; reason: string } {
+  // No offenders means the caller refused for a non-offender reason (master
+  // unreadable) — unverifiable, so it keeps blocking. Same for the synthetic
+  // sentinels: a broken render is our bug by definition.
+  if (offenders.length === 0) return { block: true, reason: "unverifiable" };
+  if (offenders.some((o) => o.ref === "*")) return { block: true, reason: "render_broken" };
+
+  const flattened = offenders.filter(
+    (o) => o.afterAligned === 0 && o.beforeAligned >= FLATTEN_MIN_WORDS,
+  );
+  if (flattened.length > 0) {
+    return { block: true, reason: `flattened_${flattened.length}:${flattened.map((o) => o.ref).join(",")}` };
+  }
+  const gutted = offenders.filter(
+    (o) => o.lostWords.length >= FLATTEN_MIN_WORDS && o.lostWords.length * 2 >= o.beforeAligned,
+  );
+  if (gutted.length > 0) {
+    return { block: true, reason: `gutted_${gutted.length}:${gutted.map((o) => o.ref).join(",")}` };
+  }
+  const totalWords = offenders.reduce((n, o) => n + o.lostWords.length, 0);
+  if (offenders.length > SYSTEMIC_VERSES || totalWords > SYSTEMIC_WORDS) {
+    return { block: true, reason: `systemic_${offenders.length}v_${totalWords}w` };
+  }
+  return { block: false, reason: `minor_${offenders.length}v_${totalWords}w` };
 }
 
 // Pure classification of `usfmAlignmentShrinkRefused`'s offenders, extracted
@@ -760,10 +835,17 @@ export function buildAlignmentShrinkAlertMessage(args: {
   detail: string;
   offenders: AlignmentShrinkResult["offenders"];
   provenance: Map<string, OffenderProvenance>;
+  // False when the export SHIPPED anyway (the loss was translator-scale). The
+  // alert then reports a thing to fix, not a thing that stopped the world —
+  // wording it as "BLOCKED" when nothing was blocked would be its own
+  // unmeasured claim.
+  blocking: boolean;
 }): string {
-  const { label, book, resource, detail, offenders, provenance } = args;
+  const { label, book, resource, detail, offenders, provenance, blocking } = args;
   const classification = classifyAlignmentShrinkOffenders(offenders);
-  const head = `Benjamin fix this — nightly export BLOCKED ${label}: `;
+  const head = blocking
+    ? `Benjamin fix this — nightly export BLOCKED ${label}: `
+    : `${label} shipped to Door43, but with alignment to fix: `;
 
   if (classification.kind === "none") {
     return (
@@ -837,7 +919,10 @@ export function buildAlignmentShrinkAlertMessage(args: {
         `skips or gives up rather than guess), so treat the causes above as covering only the verses they name.`,
     );
   }
-  return `${head}${parts.join(" SEPARATELY, ")}`;
+  const tail = blocking
+    ? ""
+    : ` Nothing is held up — the book is on Door43 and the affected verses show the broken-link icon in the editor.`;
+  return `${head}${parts.join(" SEPARATELY, ")}${tail}`;
 }
 
 // ── USFM rebuilder ───────────────────────────────────────────────────────────

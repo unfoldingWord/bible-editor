@@ -62,6 +62,16 @@ For the full corpus, see the memory index at
 `C:\Users\benja\.claude\projects\C--Users-benja-Documents-GitHub-bible-editor\memory\MEMORY.md`.
 Highlights that bite repeatedly:
 
+- **A guard that CAN detect something is not automatically entitled to block on it.**
+  Benjamin's ruling (2026-08-04) on the alignment-shrink backstop: "an unaligned word or
+  two here or there is no reason not to sync to Door43 ... don't hold somebody's work back
+  cause he didn't drag 'and' to the right spot." Detection and embargo are now separate
+  decisions (`classifyAlignmentLossSeverity` in `export.ts`): translator-scale loss ships
+  with a `warning` banner, and only bug-shaped loss — a flattened verse, a gutted verse,
+  systemic scale, a broken render, an unverifiable master — still withholds the book. When
+  adding any future export gate, ask who is harmed by the block, not just whether the
+  condition is detectable.
+
 - **DCS's blank-required-field checks are WARNINGS, not errors — measure the validator
   before gating on it.** All five (`validate_tn_files.py` "Note column cannot be blank",
   `validate_tq_files.py` Question/Response, `validate_twl_files.py` OrigWords/TWLink) are
