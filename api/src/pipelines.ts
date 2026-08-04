@@ -911,9 +911,9 @@ export async function pollPipelineJob(
         data.output,
       );
       if (importResult.aborted) {
-        // #402: the job was deliberately stopped (force-stop or cancel, or
-        // another poll finalized it) while this apply was in flight, and the
-        // apply stopped at a batch boundary per the keep-and-record policy —
+        // #402: the job was deliberately stopped (force-stop or cancel) while
+        // this apply was in flight, and the apply stopped at a batch boundary
+        // per the keep-and-record policy —
         // everything already applied stays, nothing here rolls it back.
         // Return the upstream status unchanged, same as claimLost below: do
         // NOT finalize, broadcast, or enqueue the follow-up chain for a job
@@ -1303,7 +1303,10 @@ export async function pollAllNonTerminal(env: Env): Promise<void> {
       .bind(MAX_POLL_ATTEMPTS, IMPORT_CLAIM_STALE_SECONDS)
       .run();
     // Recover wedged dispatches so a dead-mid-POST Worker can't hold the slot
-    // forever.
+    // forever. No import-claim exclusion here (unlike the two sweeps above):
+    // a row in 'dispatching' hasn't been polled to 'done' yet, so it can never
+    // hold a live import claim — that exclusion only matters for the two
+    // sweeps that can actually catch a job with an in-flight apply.
     await env.DB.prepare(
       `UPDATE pipeline_jobs
           SET state = 'failed',
@@ -1311,10 +1314,9 @@ export async function pollAllNonTerminal(env: Env): Promise<void> {
               error_message = 'auto-failed: dispatch did not complete',
               updated_at = unixepoch()
         WHERE state = 'dispatching'
-          AND updated_at < unixepoch() - ?1
-          AND (import_claimed_at IS NULL OR import_claimed_at < unixepoch() - ?2)`,
+          AND updated_at < unixepoch() - ?1`,
     )
-      .bind(STUCK_DISPATCH_THRESHOLD_SECONDS, IMPORT_CLAIM_STALE_SECONDS)
+      .bind(STUCK_DISPATCH_THRESHOLD_SECONDS)
       .run();
   } catch (err) {
     console.error("[scheduled.pipelinePoll] backstop sweeps failed:", err);

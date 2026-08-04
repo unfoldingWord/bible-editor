@@ -846,6 +846,165 @@ await withFetch(
   },
 );
 
+// ─── #402/FIX (I.8): pollPipelineJob's `importResult.aborted` branch must NOT
+// finalize, broadcast, or dispatch ──────────────────────────────────────────
+// When importJobOutput reports aborted:true (the job went terminal mid-apply
+// — see FIX B/maybeCheckCancelled's forced pre-delete checkpoint), the
+// keep-and-record policy says nothing already applied is undone, but nothing
+// past that point may run either: the poll's own guarded state UPDATE, the
+// per-chapter broadcastChapter hint, the follow-up chain enqueue, and
+// dispatchNext all assume a completed, landed poll. Drives the REAL
+// pollPipelineJob -> importJobOutput -> stageJobOutput/applyJobOutput chain
+// against a dedicated fake D1 (not the shared fakePollEnv, which has no way
+// to make the SAME "SELECT state, error_kind" query answer differently on
+// its two call sites — the outer pre-import re-read and the inner forced
+// pre-delete checkpoint both need to be reachable and to answer differently).
+// The output entry's repo is deliberately unrecognized (classify() ->
+// "unknown") so parseOutputEntry never calls fetchText — that would route
+// through this SAME mocked fetch and try to parse the upstream JSON body as a
+// TSV, which is unrelated to what this test is proving.
+const abortedMidApplyOutput = JSON.stringify({
+  state: "done",
+  output: [{ type: "unknown", repo: "unfoldingWord/en_unrecognized", rawUrl: "https://example/raw" }],
+});
+await withFetch(
+  async () => new Response(abortedMidApplyOutput, { status: 200 }),
+  async () => {
+    console.log("\n[#402: pollPipelineJob's aborted branch skips finalize/broadcast/dispatch]");
+    const queries = [];
+    const batchCalls = [];
+    const dbState = { claimedAt: 1000 };
+    let stateReadCount = 0;
+
+    function dispatch(sql, args) {
+      if (/SELECT dcs_username FROM users/.test(sql)) {
+        return { changes: 0, rows: [], single: { dcs_username: "translator" } };
+      }
+      if (/UPDATE pipeline_jobs SET import_claimed_at = unixepoch\(\)/.test(sql) && /IS NULL OR/.test(sql)) {
+        return { changes: 1, rows: [{ import_claimed_at: dbState.claimedAt }], single: { import_claimed_at: dbState.claimedAt } };
+      }
+      if (/UPDATE pipeline_jobs SET import_claimed_at = unixepoch\(\)/.test(sql) && /import_claimed_at\s*=\s*\?2/.test(sql)) {
+        const expected = args[1];
+        if (dbState.claimedAt !== expected) return { changes: 0, rows: [], single: null };
+        dbState.claimedAt += 1;
+        return { changes: 1, rows: [{ import_claimed_at: dbState.claimedAt }], single: { import_claimed_at: dbState.claimedAt } };
+      }
+      if (/SELECT state, error_kind FROM pipeline_jobs WHERE job_id = \?1/.test(sql)) {
+        stateReadCount += 1;
+        // Call #1 is pollPipelineJob's OWN pre-import mid-poll re-read — must
+        // be healthy, or shouldImport would be false and importJobOutput
+        // would never even be entered (that's the #398 guard, tested above,
+        // not this one). Call #2+ is the forced pre-delete checkpoint INSIDE
+        // applyJobOutput — the job has gone terminal by the time it reads.
+        return stateReadCount === 1
+          ? { changes: 0, rows: [], single: { state: "running", error_kind: null } }
+          : { changes: 0, rows: [], single: { state: "failed", error_kind: "force_stopped" } };
+      }
+      if (/SELECT staged_at FROM pipeline_jobs/.test(sql)) {
+        return { changes: 0, rows: [], single: { staged_at: null } }; // fresh stage
+      }
+      if (/DELETE FROM pending_imports/.test(sql)) {
+        return { changes: 0, rows: [], single: null };
+      }
+      if (/UPDATE pipeline_jobs SET staged_at = unixepoch\(\)/.test(sql)) {
+        return { changes: 1, rows: [], single: null };
+      }
+      if (/SELECT user_id FROM pipeline_jobs/.test(sql)) {
+        return { changes: 0, rows: [], single: { user_id: 1 } };
+      }
+      if (/ORDER BY kind, chapter, verse, id/.test(sql)) {
+        return { changes: 0, rows: [], single: null }; // nothing staged (both outputs unrecognized)
+      }
+      if (/UPDATE pipeline_jobs SET import_aborted_at/.test(sql)) {
+        return { changes: 1, rows: [], single: null };
+      }
+      if (/UPDATE pipeline_jobs SET import_claimed_at = NULL/.test(sql)) {
+        return { changes: 1, rows: [], single: null };
+      }
+      // Anything else (dispatchNext's claim query, the poll's own guarded
+      // UPDATE, follow-up enqueue INSERT, etc.) — inert, but its SQL is still
+      // recorded in `queries` above by prepare(), which is what the
+      // assertions below check for absence.
+      return { changes: 0, rows: [], single: null };
+    }
+
+    const env = {
+      BT_API_TOKEN: "tok",
+      queries,
+      DB: {
+        prepare(sql) {
+          queries.push(sql);
+          return {
+            bind(...args) {
+              return {
+                sql,
+                args,
+                async run() {
+                  const res = dispatch(sql, args);
+                  return { meta: { changes: res.changes }, results: res.rows };
+                },
+                async first() {
+                  return dispatch(sql, args).single;
+                },
+                async all() {
+                  return { results: dispatch(sql, args).rows };
+                },
+              };
+            },
+          };
+        },
+        async batch(stmts) {
+          const results = [];
+          for (const s of stmts) {
+            const res = dispatch(s.sql, s.args);
+            results.push({ meta: { changes: res.changes }, results: res.rows });
+          }
+          batchCalls.push(stmts.map((s) => s.sql));
+          return results;
+        },
+      },
+    };
+
+    const originalWarn = console.warn;
+    const warnings = [];
+    console.warn = (...args) => warnings.push(args.join(" "));
+    let result;
+    try {
+      result = await pollPipelineJob(env, {
+        ...forceStoppedMidPollJob,
+        job_id: "job-aborted-mid-apply",
+        follow_up_job_id: null,
+        follow_up_options: '{"noIntro":true}',
+      });
+    } finally {
+      console.warn = originalWarn;
+    }
+
+    assert(result.kind === "ok", "poll completes without throwing");
+    assert(stateReadCount >= 2, `both the outer and inner state reads happened (got ${stateReadCount})`);
+    assert(
+      batchCalls.some((sqls) => sqls.some((s) => /UPDATE pipeline_jobs SET import_aborted_at/.test(s))),
+      "the abort was recorded (import_aborted_at batch UPDATE issued) even though nothing else finalized",
+    );
+    assert(
+      !queries.some((q) => /SET state = \?2,[\s\S]*last_polled_at = unixepoch\(\)/.test(q)),
+      "the poll's own guarded state UPDATE was NEVER issued — aborted branch returned before it",
+    );
+    assert(
+      !queries.some((q) => /INSERT INTO pipeline_jobs/.test(q)),
+      "the follow-up job was NEVER enqueued",
+    );
+    assert(
+      !queries.some((q) => /SET state = 'dispatching', updated_at = unixepoch\(\)/.test(q)),
+      "dispatchNext's claim query was NEVER issued",
+    );
+    assert(
+      warnings.some((w) => w.includes("job-aborted-mid-apply") && w.includes("aborted")),
+      `logs a warning naming the job and that the import aborted (got: ${JSON.stringify(warnings)})`,
+    );
+  },
+);
+
 // ─── F6: the CAS UPDATE runs before the upstream stop call, and the final
 // error_message UPDATE runs after it ─────────────────────────────────────
 // Order matters: the old code called upstream /stop BEFORE the CAS, so a CAS
@@ -953,17 +1112,49 @@ await (async () => {
     sweepCalls.length === 3,
     `pollAllNonTerminal issues exactly 3 backstop sweep UPDATEs (got ${sweepCalls.length})`,
   );
-  for (const c of sweepCalls) {
+
+  // Sweeps 1 and 2 (48h-no-progress, poll-attempts-exhausted) target
+  // state IN ('running', 'paused_for_outage', ...) — a state that CAN hold a
+  // live import claim — so both must exclude it. Bind order and arity are
+  // checked against the SQL's own placeholders, not just "the value appears
+  // somewhere in args" (a swapped bind order would still pass an `includes`
+  // check but bind the wrong value to the wrong placeholder).
+  const liveClaimSweeps = sweepCalls.filter((c) => /state IN \(/.test(c.sql));
+  assert(liveClaimSweeps.length === 2, `exactly 2 sweeps target state IN (...) rows (got ${liveClaimSweeps.length})`);
+  for (const c of liveClaimSweeps) {
     const label = c.sql.match(/error_message = '([^']+)'/)?.[1] ?? c.sql.slice(0, 40);
     assert(
-      /AND\s*\(\s*import_claimed_at IS NULL OR import_claimed_at < unixepoch\(\)\s*-\s*\?\d+\s*\)/.test(c.sql),
-      `backstop sweep "${label}" excludes jobs with a live import claim (import_claimed_at IS NULL OR stale)`,
+      /AND\s*\(\s*import_claimed_at IS NULL OR import_claimed_at < unixepoch\(\)\s*-\s*\?2\s*\)/.test(c.sql),
+      `backstop sweep "${label}" excludes jobs with a live import claim, bound to placeholder ?2`,
     );
     assert(
-      c.args.includes(IMPORT_CLAIM_STALE_SECONDS),
-      `backstop sweep "${label}" binds IMPORT_CLAIM_STALE_SECONDS as a parameter, not a hardcoded literal`,
+      c.args.length === 2,
+      `backstop sweep "${label}" binds exactly 2 args, matching its 2 placeholders (got ${c.args.length})`,
+    );
+    assert(
+      c.args[1] === IMPORT_CLAIM_STALE_SECONDS,
+      `backstop sweep "${label}" binds IMPORT_CLAIM_STALE_SECONDS at position 2 (?2), matching the SQL placeholder order`,
     );
   }
+
+  // FIX H: sweep 3 (dispatch did not complete) targets state = 'dispatching',
+  // which can NEVER hold an import claim (a row only gets polled to 'done'
+  // after leaving 'dispatching') — the exclusion clause is dead weight there
+  // and has been removed, along with its bind param.
+  const dispatchSweep = sweepCalls.find((c) => /state = 'dispatching'/.test(c.sql));
+  assert(dispatchSweep, "one backstop sweep targets state = 'dispatching'");
+  assert(
+    !/import_claimed_at/.test(dispatchSweep.sql),
+    "FIX H: the dispatching-sweep SQL no longer references import_claimed_at at all",
+  );
+  assert(
+    dispatchSweep.args.length === 1,
+    `FIX H: the dispatching-sweep binds exactly 1 arg (its own threshold only), not the removed IMPORT_CLAIM_STALE_SECONDS param (got ${dispatchSweep.args.length})`,
+  );
+  assert(
+    !dispatchSweep.args.includes(IMPORT_CLAIM_STALE_SECONDS),
+    "FIX H: the dispatching-sweep no longer binds IMPORT_CLAIM_STALE_SECONDS at all",
+  );
 })();
 
 if (failed > 0) {

@@ -113,9 +113,9 @@ export function shouldTouchClaim(
   return now - lastTouchedAt >= intervalSeconds;
 }
 
-// True only when the job has been DELIBERATELY stopped — a human force-stop,
-// a user cancel, or another poll having already finalized this import — i.e.
-// the apply must stop at its next checkpoint.
+// True ONLY when a human or user has DELIBERATELY stopped this run — i.e. the
+// apply must stop at its next checkpoint. Nothing else — no inferred state,
+// no "another poll must have finished it" reasoning — returns true here.
 //
 // This is deliberately narrower than "any non-live state". The original
 // version aborted on ANY state outside a fixed allowlist of "live" states,
@@ -140,6 +140,18 @@ export function shouldTouchClaim(
 // 'failed'/'import_failed' only after a second). Aborting on it would make
 // the retry impossible.
 //
+// `state === "done"` is ALSO excluded, and used to be treated as an abort
+// signal on the theory that "another poll already finalized this import."
+// That inference is wrong and the check is unnecessary: the CAS import claim
+// (mayClaimImport above) already prevents two concurrent applies, so no
+// legitimate scenario needs 'done' to mean "stop." Worse, it is reachable
+// spuriously — a second poll whose upstream reports 'done' with an empty
+// output[] array skips the import entirely and writes state='done' on its
+// own, which would abort a healthy, still-writing apply and strand its
+// remaining proposals with no retry path (a terminal job never re-enters
+// importJobOutput, per the same reasoning as the interrupted-sentinel case
+// above).
+//
 // A null/undefined/empty state (a failed or missing pipeline_jobs read)
 // ALWAYS returns false — a failed read is not evidence the job went
 // terminal, and treating it as such would abort a perfectly healthy
@@ -151,7 +163,6 @@ export function shouldAbortApply(
   if (state == null || state === "") return false;
   if (state === "cancelled") return true;
   if (state === "failed" && errorKind === "force_stopped") return true;
-  if (state === "done") return true;
   return false;
 }
 
