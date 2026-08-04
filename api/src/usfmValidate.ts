@@ -40,9 +40,11 @@ const PARAGRAPH_MARKERS = new Set(["\\p", "\\m", "\\pi", "\\mi", "\\nb", "\\cls"
 const CHAPTER_LINE_RE = /^\\c\s+\d+\s*$/;
 // A `\c N` appearing anywhere in the line (DCS: `re.search(r"\\c\s+\d+")`).
 const CHAPTER_ANY_RE = /\\c\s+\d+/;
-// A `\p` not immediately followed by a letter/digit — so `\pi`/`\pc` don't match
-// (DCS: `re.search(r"\\p(?!\w)", stripped)`).
-const PARAGRAPH_P_RE = /\\p(?![A-Za-z0-9])/;
+// A `\p` not immediately followed by a word char — so `\pi`/`\pc` don't match
+// (DCS: `re.search(r"\\p(?!\w)", stripped)`). The class spells out Python's `\w`,
+// which includes `_`; omitting it would make us flag `\p_` where DCS does not,
+// and a rule stricter than DCS withholds a book DCS would have merged.
+const PARAGRAPH_P_RE = /\\p(?![A-Za-z0-9_])/;
 // The `\ts\*` section-chunk milestone, matched literally (DCS: `"\\ts\\*" in stripped`).
 const TS_MARKER = "\\ts\\*";
 // A `\b` not immediately followed by a word char (DCS: `re.search(r"\\b(?!\w)")`).

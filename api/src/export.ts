@@ -934,9 +934,15 @@ export function buildAlignmentShrinkAlertMessage(args: {
 // Benjamin looking for a marker stack that isn't there — the same
 // unmeasured-cause failure the alignment alert above was rewritten to stop.
 const USFM_RULE_GUIDANCE: Record<UsfmValidationRule, string> = {
+  // "the shape seen in", not "this is": what was measured is two adjacent
+  // paragraph markers. Adjacency does not establish the front-\p PUMP as the
+  // cause — an AI import or a verse whose content was deleted produces the same
+  // adjacency — and asserting it would be the very unmeasured-cause defect this
+  // builder was written to remove, just narrowed to one rule.
   "consecutive-paragraph-markers":
     "two paragraph markers (\\p/\\m/\\pi/\\mi/\\nb/\\cls) back to back with no content between them — " +
-    "the EZK 8/11 front-\\p pump signature. Open the chapter and delete the duplicate marker",
+    "the shape seen in the EZK 8/11 front-\\p pump, though adjacency alone does not prove that cause. " +
+    "Open the chapter and delete the duplicate marker",
   "chapter-marker-not-isolated": "a \\c chapter marker sharing its line with other content",
   "paragraph-marker-not-isolated": "a \\p marker sharing its line with other content",
   "ts-marker-not-isolated":
@@ -1122,6 +1128,24 @@ function synthesizeHeaders(book: string, bibleVersion: string): unknown[] {
     { tag: "toc2", content: book },
     { tag: "toc3", content: book.toLowerCase() },
     { tag: "mt1", content: book },
+    // BLANK LINE after the header — structural, not cosmetic. Real en_ult/en_ust
+    // master files all carry one here (line 9, right before the first `\ts\*`;
+    // verified across 34 books), and usfm-js round-trips it as this empty text
+    // node. Two things key off it, and BOTH fail open without it:
+    //
+    //   - DCS's `validate_usfm_formatting` (Check 8) skips every line until the
+    //     first blank one and never re-enters header mode. No blank line means
+    //     Check 8 inspects ZERO lines — so neither DCS nor our ported HOLD gate
+    //     validates the body at all, while the gate still looks alive because
+    //     Check 7 keeps running.
+    //   - `blankLinePass` (usfmFormat.ts) has the same `inHeader` latch, so it
+    //     never reflows the body to DCS's line layout either.
+    //
+    // This path is reached whenever `book_usfm_meta.headers_json` is missing or
+    // unparseable (exportWorkflow.ts swallows the parse error and passes null),
+    // which an interrupted book import can leave behind — bookImport.ts DELETEs
+    // the meta rows before re-inserting them.
+    { type: "text", text: "" },
   ];
 }
 

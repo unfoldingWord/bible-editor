@@ -7,6 +7,7 @@
 
 import { attributeTsvShrink, buildAlignmentShrinkAlertMessage, buildUsfmInvalidAlertMessage, classifyAlignmentLossSeverity, offenderProvenanceFromLog, buildExportBranch, buildTnTsv, buildTqTsv, buildTwlTsv, buildUsfm, classifyAlignmentShrinkOffenders, commitToDcs, countDuplicateMasterIds, describeShrinkRefusal, ensureDcsPr, exportTsvShrinkRefused, findDcsOpenPr, parseTsvIds, recreateExportBranchFromMaster, updateDcsPrBranch, usfmAlignmentShrinkRefused } from "./export.ts";
 import { CorruptContentJsonError } from "./contentJson.ts";
+import { validateUsfm } from "./usfmValidate.ts";
 
 function assert(cond, msg) {
   if (!cond) {
@@ -1785,7 +1786,12 @@ function utf8Base64(s) {
   });
   assert(
     /front-\\p pump/.test(pump),
-    `the \\p pump SHOULD still be named as such — when that is the rule that fired`,
+    `the \\p pump SHOULD still be referenced — when that is the rule that fired`,
+  );
+  assert(
+    /does not prove that cause/.test(pump),
+    `...but named as a SHAPE, not asserted as the cause: adjacency alone does not ` +
+      `establish the pump (an AI import or a deleted verse body produces it too)`,
   );
 
   const leaked = buildUsfmInvalidAlertMessage({
@@ -1828,6 +1834,52 @@ function utf8Base64(s) {
   assert(
     !/\\p/.test(none) && !/marker/.test(none),
     `with nothing measured the alert must not name a marker defect at all`,
+  );
+}
+
+// --- synthesizeHeaders must emit the header BLANK LINE, or Check 8 goes inert ---
+// The USFM HOLD gate is a port of DCS's validate_usfm_formatting, which skips
+// every line until the first blank one and never re-enters header mode. A render
+// with no blank line anywhere therefore gets ZERO lines of Check 8 — from DCS and
+// from us — while the gate still looks alive because Check 7 keeps running.
+// synthesizeHeaders used to emit no blank line, so the fallback path taken when
+// book_usfm_meta.headers_json is missing or unparseable silently validated
+// nothing. blankLinePass has the same inHeader latch, so it was inert too.
+{
+  const verses = [
+    {
+      book: "EZK", chapter: 1, verse: 1, verse_end: null,
+      content_json: JSON.stringify({ verseObjects: [{ type: "text", text: "word one" }] }),
+    },
+    {
+      book: "EZK", chapter: 2, verse: 1, verse_end: null,
+      content_json: JSON.stringify({ verseObjects: [{ type: "text", text: "word two" }] }),
+    },
+  ];
+  // headers: null is the synthesizeHeaders fallback path.
+  const rendered = buildUsfm({ book: "EZK", bibleVersion: "ULT", headers: null, verses });
+  const lines = rendered.split("\n");
+  const firstBlank = lines.findIndex((l) => l.trim() === "");
+  assert(
+    firstBlank !== -1,
+    `a synthesized-header render MUST contain a blank line — without one DCS's Check 8 inspects nothing`,
+  );
+  assert(
+    /^\\mt1\b/.test(lines[firstBlank - 1]),
+    `the blank line belongs right after \\mt1, matching real en_ult/en_ust masters (line 9)`,
+  );
+
+  // Canary: the gate must actually fire on a body defect in this render. Asserting
+  // "0 issues" here would pass just as happily with Check 8 switched off, which is
+  // exactly how this bug hid.
+  assert(validateUsfm(rendered).length === 0, `the clean synthesized render is valid`);
+  const withDefect = lines.slice();
+  withDefect.splice(lines.length - 1, 0, "\\p trailing text");
+  assert(
+    validateUsfm(withDefect.join("\n"))
+      .map((i) => i.rule)
+      .includes("paragraph-marker-not-isolated"),
+    `Check 8 must be ACTIVE on a synthesized-header render, not silently skipped`,
   );
 }
 
