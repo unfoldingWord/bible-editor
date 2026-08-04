@@ -37,6 +37,7 @@ import {
   updateDcsPrBranch,
   usfmAlignmentShrinkRefused,
   buildAlignmentShrinkAlertMessage,
+  buildUsfmInvalidAlertMessage,
   classifyAlignmentLossSeverity,
   offenderProvenanceFromLog,
   RESOURCE_TARGETS,
@@ -63,6 +64,7 @@ import type { TnRow, TqRow, TwlRow, VerseRow } from "./types";
 import { lintUsfmVerses } from "./lint";
 import { hardRejectRows } from "./hardRejectGuard";
 import { validateUsfm, summarizeUsfmIssues } from "./usfmValidate";
+import type { UsfmValidationIssue } from "./usfmValidate";
 import { shrinkOverrideAllowed } from "./shrinkGuard";
 
 export interface ExportParams {
@@ -678,7 +680,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       const issues = validateUsfm(built.content);
       if (issues.length > 0) {
         const summary = summarizeUsfmIssues(issues);
-        await this.recordUsfmInvalidSkipAlert(book, resource, summary);
+        await this.recordUsfmInvalidSkipAlert(book, resource, issues);
         const reason = `usfm_invalid_guard:${issues.length}:${summary}`;
         await this.recordSnapshot(book, resource, null, null, built.rowCount, reason);
         return {
@@ -915,7 +917,17 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     if (headersRow) {
       try {
         const parsed = JSON.parse(headersRow.headers_json);
-        if (Array.isArray(parsed)) headers = parsed;
+        // `length > 0` matters: an EMPTY array is not nullish, so it would skip
+        // buildUsfm's `?? synthesizeHeaders(...)` fallback and render a file with
+        // no header block and therefore no blank line anywhere. DCS's Check 8
+        // (and our port) skip every line until the first blank one, so that file
+        // gets ZERO lines of structural validation while the gate still looks
+        // alive because Check 7 keeps running — the same fail-open that the
+        // synthesizeHeaders blank line closes. `extractUsfmHeaders` returns null
+        // rather than [] so bookImport can't store one, but the seeding scripts
+        // (scripts/import-book.mjs, scripts/reimport-ust-from-dcs.mjs) persist
+        // `JSON.stringify(json.headers)` unfiltered, so [] is reachable.
+        if (Array.isArray(parsed) && parsed.length > 0) headers = parsed;
       } catch {
         headers = null;
       }
@@ -1473,13 +1485,16 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
   private async recordUsfmInvalidSkipAlert(
     book: string,
     resource: Resource,
-    summary: string,
+    issues: UsfmValidationIssue[],
   ): Promise<void> {
     const source = `export_usfm_invalid:${book}:${resource}`;
-    const message =
-      `Benjamin fix this — nightly export BLOCKED ${book} ${resource.toUpperCase()}: the rendered USFM would fail ` +
-      `DCS's validate-usfm-files (${summary}). This is the EZK front-\\p stacked-marker signature — refusing to ship ` +
-      `invalid USFM to master. Inspect the chapter for stacked \\p/\\m markers or malformed lines, fix in the editor, then re-export.`;
+    // Wording lives in export.ts so it is unit-testable, and so the alert names
+    // the rules the validator actually reported instead of asserting the front-\p
+    // stack for every outcome. See buildUsfmInvalidAlertMessage.
+    const message = buildUsfmInvalidAlertMessage({
+      label: `${book} ${resource.toUpperCase()}`,
+      issues,
+    });
     await this.writeAlert(source, message, `${this.env.DCS_BASE_URL}/unfoldingWord`);
   }
 

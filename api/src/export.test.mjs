@@ -5,8 +5,9 @@
 // instead of getting silently flattened to `\v 6`. Not a test framework;
 // failures exit non-zero.
 
-import { attributeTsvShrink, buildAlignmentShrinkAlertMessage, classifyAlignmentLossSeverity, offenderProvenanceFromLog, buildExportBranch, buildTnTsv, buildTqTsv, buildTwlTsv, buildUsfm, classifyAlignmentShrinkOffenders, commitToDcs, countDuplicateMasterIds, describeShrinkRefusal, ensureDcsPr, exportTsvShrinkRefused, findDcsOpenPr, parseTsvIds, recreateExportBranchFromMaster, updateDcsPrBranch, usfmAlignmentShrinkRefused } from "./export.ts";
+import { attributeTsvShrink, buildAlignmentShrinkAlertMessage, buildUsfmInvalidAlertMessage, classifyAlignmentLossSeverity, offenderProvenanceFromLog, buildExportBranch, buildTnTsv, buildTqTsv, buildTwlTsv, buildUsfm, classifyAlignmentShrinkOffenders, commitToDcs, countDuplicateMasterIds, describeShrinkRefusal, ensureDcsPr, exportTsvShrinkRefused, findDcsOpenPr, parseTsvIds, recreateExportBranchFromMaster, updateDcsPrBranch, usfmAlignmentShrinkRefused } from "./export.ts";
 import { CorruptContentJsonError } from "./contentJson.ts";
+import { validateUsfm } from "./usfmValidate.ts";
 
 function assert(cond, msg) {
   if (!cond) {
@@ -1755,6 +1756,135 @@ function utf8Base64(s) {
   } finally {
     globalThis.fetch = originalFetch;
   }
+}
+
+// --- buildUsfmInvalidAlertMessage: only ever state a cause we measured ---
+// The wording this replaces asserted ONE cause for every outcome ("This is the
+// EZK front-\p stacked-marker signature ... inspect the chapter for stacked \p/\m
+// markers"). For any other rule that named the wrong defect and pointed Benjamin
+// at a marker stack that was not there.
+{
+  const issue = (rule, line, ref) => ({ rule, line, ref, message: "m" });
+
+  const verses = buildUsfmInvalidAlertMessage({
+    label: "EZK ULT",
+    issues: [issue("multiple-verses-per-line", 120, "8:3")],
+  });
+  assert(
+    /multiple-verses-per-line/.test(verses) && /more than one \\v marker/.test(verses),
+    `the alert names the rule that actually fired`,
+  );
+  assert(
+    !/front-\\p/.test(verses) && !/stacked/.test(verses),
+    `a two-\\v-on-a-line issue must NOT be described as the front-\\p stacked-marker signature`,
+  );
+  assert(/line 120/.test(verses) && /8:3/.test(verses), `the alert locates the issue`);
+
+  const pump = buildUsfmInvalidAlertMessage({
+    label: "EZK ULT",
+    issues: [issue("consecutive-paragraph-markers", 11, "8")],
+  });
+  // By the time this gate runs, collapseConsecutiveParagraphMarkers has already
+  // dropped every run of IDENTICAL markers, so the front-\p pump and any
+  // "duplicate marker" are unreachable here — only a MIXED adjacency survives.
+  // Naming either would point Benjamin at a pair that cannot occur.
+  assert(
+    !/front-\\p/.test(pump) && !/duplicate/.test(pump),
+    `the alert must not blame the front-\\p pump or a duplicate marker — neither can ` +
+      `reach this gate, they are auto-collapsed before validation`,
+  );
+  assert(
+    /DIFFERENT paragraph markers/.test(pump) && /auto-collapsed/.test(pump),
+    `it must say what actually survives to be reported: a mixed adjacency`,
+  );
+
+  const leaked = buildUsfmInvalidAlertMessage({
+    label: "EZK ULT",
+    issues: [issue("invalid-content-before-verse", 55, "8:2")],
+  });
+  assert(
+    /not a marker problem/.test(leaked),
+    `leaked text before \\v is called what it is, not a marker stack`,
+  );
+
+  // Multiple distinct rules: each gets its own named remedy, none is asserted
+  // as the cause of the others.
+  const mixed = buildUsfmInvalidAlertMessage({
+    label: "LAM UST",
+    issues: [
+      issue("ts-marker-not-isolated", 9, "1"),
+      issue("b-marker-after-ts", 10, "1"),
+    ],
+  });
+  assert(
+    /ts-marker-not-isolated/.test(mixed) && /b-marker-after-ts/.test(mixed) && /ALSO/.test(mixed),
+    `every rule that fired is reported, joined rather than collapsed to one cause`,
+  );
+
+  // Why the gate still blocks is itself a measured fact and worth stating: DCS's
+  // validate_usfm_files.py has NO warning tier, so shipping cannot publish.
+  assert(
+    /no warning tier/.test(mixed) && /would not publish/.test(mixed),
+    `the alert explains that shipping would not have published the book anyway`,
+  );
+
+  // Empty issues: the gate fired with nothing measured. Say that, do not invent
+  // a defect.
+  const none = buildUsfmInvalidAlertMessage({ label: "EZK ULT", issues: [] });
+  assert(
+    /no specific issue/.test(none) && /bug in the export gate/.test(none),
+    `zero issues is reported as a gate bug, not as a book defect`,
+  );
+  assert(
+    !/\\p/.test(none) && !/marker/.test(none),
+    `with nothing measured the alert must not name a marker defect at all`,
+  );
+}
+
+// --- synthesizeHeaders must emit the header BLANK LINE, or Check 8 goes inert ---
+// The USFM HOLD gate is a port of DCS's validate_usfm_formatting, which skips
+// every line until the first blank one and never re-enters header mode. A render
+// with no blank line anywhere therefore gets ZERO lines of Check 8 — from DCS and
+// from us — while the gate still looks alive because Check 7 keeps running.
+// synthesizeHeaders used to emit no blank line, so the fallback path taken when
+// book_usfm_meta.headers_json is missing or unparseable silently validated
+// nothing. blankLinePass has the same inHeader latch, so it was inert too.
+{
+  const verses = [
+    {
+      book: "EZK", chapter: 1, verse: 1, verse_end: null,
+      content_json: JSON.stringify({ verseObjects: [{ type: "text", text: "word one" }] }),
+    },
+    {
+      book: "EZK", chapter: 2, verse: 1, verse_end: null,
+      content_json: JSON.stringify({ verseObjects: [{ type: "text", text: "word two" }] }),
+    },
+  ];
+  // headers: null is the synthesizeHeaders fallback path.
+  const rendered = buildUsfm({ book: "EZK", bibleVersion: "ULT", headers: null, verses });
+  const lines = rendered.split("\n");
+  const firstBlank = lines.findIndex((l) => l.trim() === "");
+  assert(
+    firstBlank !== -1,
+    `a synthesized-header render MUST contain a blank line — without one DCS's Check 8 inspects nothing`,
+  );
+  assert(
+    /^\\mt1\b/.test(lines[firstBlank - 1]),
+    `the blank line belongs right after \\mt1, matching real en_ult/en_ust masters (line 9)`,
+  );
+
+  // Canary: the gate must actually fire on a body defect in this render. Asserting
+  // "0 issues" here would pass just as happily with Check 8 switched off, which is
+  // exactly how this bug hid.
+  assert(validateUsfm(rendered).length === 0, `the clean synthesized render is valid`);
+  const withDefect = lines.slice();
+  withDefect.splice(lines.length - 1, 0, "\\p trailing text");
+  assert(
+    validateUsfm(withDefect.join("\n"))
+      .map((i) => i.rule)
+      .includes("paragraph-marker-not-isolated"),
+    `Check 8 must be ACTIVE on a synthesized-header render, not silently skipped`,
+  );
 }
 
 console.log("\nAll export smoke checks passed.");

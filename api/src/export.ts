@@ -10,6 +10,7 @@ import { normalizeUsfmFormatting } from "./usfmFormat.ts";
 import { normalizeNoteText, sortRowsByReference } from "./tsvFormat.ts";
 import { orderTwlRows } from "./twlCanonicalOrder.ts";
 import { origLangOccurrence } from "./occurrenceRule.ts";
+import type { UsfmValidationIssue, UsfmValidationRule } from "./usfmValidate.ts";
 
 export type Resource = "tn" | "tq" | "twl" | "ult" | "ust";
 
@@ -925,6 +926,99 @@ export function buildAlignmentShrinkAlertMessage(args: {
   return `${head}${parts.join(" SEPARATELY, ")}${tail}`;
 }
 
+// Per-RULE remedy for the USFM structural HOLD gate. Keyed by the rule the
+// validator actually reported, because the wording this replaces asserted ONE
+// cause for every outcome: "This is the EZK front-\p stacked-marker signature …
+// Inspect the chapter for stacked \p/\m markers". For a `multiple-verses-per-line`
+// or `invalid-content-before-verse` issue that named the wrong defect AND sent
+// Benjamin looking for a marker stack that isn't there — the same
+// unmeasured-cause failure the alignment alert above was rewritten to stop.
+const USFM_RULE_GUIDANCE: Record<UsfmValidationRule, string> = {
+  // Deliberately does NOT mention the EZK front-\p pump or a "duplicate marker",
+  // because by the time this gate runs neither is reachable: validateUsfm sees the
+  // output of normalizeUsfmFormatting, and collapseConsecutiveParagraphMarkers has
+  // already dropped every run of IDENTICAL markers (`if (prevParagraph === s)
+  // continue`), blank-separated runs included. What survives to be reported is
+  // only a MIXED adjacency, which usfmFormat.ts leaves alone on purpose ("a
+  // genuinely mixed \p/\m adjacency is left intact for the validator to HOLD on"
+  // — it will not guess which marker to drop). Telling Benjamin to delete a
+  // duplicate would point him at a marker pair that cannot occur and hide the one
+  // that did.
+  "consecutive-paragraph-markers":
+    "two DIFFERENT paragraph markers (\\p/\\m/\\pi/\\mi/\\nb/\\cls) back to back with no content " +
+    "between them — identical ones are auto-collapsed before this check, so this is a mixed " +
+    "adjacency the renderer deliberately would not guess at. Open the chapter and decide which " +
+    "of the two markers belongs",
+  "chapter-marker-not-isolated": "a \\c chapter marker sharing its line with other content",
+  "paragraph-marker-not-isolated": "a \\p marker sharing its line with other content",
+  "ts-marker-not-isolated":
+    "a \\ts\\* section-chunk milestone fused onto a content line — the LAM \\ts\\* pump shape",
+  "b-marker-not-isolated": "a \\b marker sharing its line with other content",
+  "b-marker-after-ts": "a \\b marker placed immediately after \\ts\\* instead of before it",
+  "multiple-verses-per-line": "more than one \\v marker on a single line",
+  "invalid-content-before-verse":
+    "text before a \\v marker on its line — usually a stray quote or leftover prose from the " +
+    "previous verse parked on the marker (the usfm-js leading-text shape), not a marker problem",
+};
+
+// Build the nightly USFM-structural-HOLD alert text.
+//
+// Same rule as buildAlignmentShrinkAlertMessage: **state only a cause we
+// measured.** Here that means naming the rules the validator actually returned
+// and giving each one its own remedy, instead of asserting the \p stack every
+// time.
+//
+// It also says plainly WHY this gate still blocks, which is itself a measured
+// fact rather than an assumption: unlike the tn/tq/twl validators (whose
+// blank-field checks are severity="warning", which is why that gate was removed),
+// DCS's validate_usfm_files.py has no warning tier at all — its ValidationError
+// carries no severity field, so every Check 7/8 issue counts toward the exit code.
+// `merge-be-pr.yaml` merges only on `workflow_run.conclusion == 'success'`, so
+// shipping this render would NOT publish the book; it would produce a red `-be-`
+// PR that never merges. Blocking withholds nothing that shipping would have
+// delivered — it just names the reason.
+export function buildUsfmInvalidAlertMessage(args: {
+  label: string;
+  issues: UsfmValidationIssue[];
+}): string {
+  const { label, issues } = args;
+  // No issues means the caller invoked this without a finding. Say exactly that
+  // rather than describe a defect we did not measure.
+  if (issues.length === 0) {
+    return (
+      `Benjamin fix this — nightly export BLOCKED ${label}: the USFM structural check reported no ` +
+      `specific issue, so there is nothing here to name. This is a bug in the export gate itself, not ` +
+      `in the book. Inspect the export run (wrangler tail) for ${label}.`
+    );
+  }
+
+  const byRule = new Map<UsfmValidationRule, UsfmValidationIssue[]>();
+  for (const it of issues) {
+    const bucket = byRule.get(it.rule);
+    if (bucket) bucket.push(it);
+    else byRule.set(it.rule, [it]);
+  }
+
+  const parts = [...byRule.entries()].map(([rule, found]) => {
+    const where = found
+      .slice(0, 3)
+      .map((i) => `line ${i.line}${i.ref ? ` (${i.ref})` : ""}`)
+      .join(", ");
+    const more = found.length - 3;
+    return (
+      `${found.length}× ${rule} — ${USFM_RULE_GUIDANCE[rule]}. ` +
+      `At ${where}${more > 0 ? ` +${more} more` : ""}`
+    );
+  });
+
+  return (
+    `Benjamin fix this — nightly export BLOCKED ${label}: the rendered USFM would fail DCS's ` +
+    `validate-usfm-files, which has no warning tier — every issue below is a hard error, so the ` +
+    `\`-be-\` PR check would go red and the merge bot would never merge it. Shipping would not publish ` +
+    `the book. ${parts.join(" ALSO, ")}. Fix in the editor, then re-export.`
+  );
+}
+
 // ── USFM rebuilder ───────────────────────────────────────────────────────────
 
 export interface UsfmInputs {
@@ -1040,6 +1134,24 @@ function synthesizeHeaders(book: string, bibleVersion: string): unknown[] {
     { tag: "toc2", content: book },
     { tag: "toc3", content: book.toLowerCase() },
     { tag: "mt1", content: book },
+    // BLANK LINE after the header — structural, not cosmetic. Real en_ult/en_ust
+    // master files all carry one here (line 9, right before the first `\ts\*`;
+    // verified across 34 books), and usfm-js round-trips it as this empty text
+    // node. Two things key off it, and BOTH fail open without it:
+    //
+    //   - DCS's `validate_usfm_formatting` (Check 8) skips every line until the
+    //     first blank one and never re-enters header mode. No blank line means
+    //     Check 8 inspects ZERO lines — so neither DCS nor our ported HOLD gate
+    //     validates the body at all, while the gate still looks alive because
+    //     Check 7 keeps running.
+    //   - `blankLinePass` (usfmFormat.ts) has the same `inHeader` latch, so it
+    //     never reflows the body to DCS's line layout either.
+    //
+    // This path is reached whenever `book_usfm_meta.headers_json` is missing or
+    // unparseable (exportWorkflow.ts swallows the parse error and passes null),
+    // which an interrupted book import can leave behind — bookImport.ts DELETEs
+    // the meta rows before re-inserting them.
+    { type: "text", text: "" },
   ];
 }
 
