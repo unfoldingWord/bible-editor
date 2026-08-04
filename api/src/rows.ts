@@ -243,12 +243,16 @@ rows.post("/:kind", requireEditor, async (c) => {
   // blank Occurrence cell that its validator hard-rejects. The "add word"
   // action posts no occurrence at all, which is how prod twl DAN 3:5 `xf8f` came
   // to sit blank and quietly fail DAN TWL's validation. Defaulting here rather
-  // than in the client is deliberate: this POST is the ONLY writer that can
-  // leave the column absent (bookImport, bookReimport and pipelineImport all
-  // bind an explicit value parsed from the TSV, and must keep round-tripping
-  // master's genuine blanks rather than healing them), so one server-side
-  // default covers every current and future caller, and unlike a DB `DEFAULT 1`
-  // it can express tn's quote-conditional rule and stays visible in review.
+  // than in the client is deliberate: this POST is the only writer that can
+  // leave the column ABSENT, so one server-side default covers every current
+  // and future caller of it, and unlike a DB `DEFAULT 1` it can express tn's
+  // quote-conditional rule and stays visible in review.
+  //
+  // The other writers bind an explicit value and are handled per their source:
+  // bookImport and bookReimport round-trip DCS master and must preserve its
+  // blanks verbatim (the export-time `hardRejectGuard` is what catches those),
+  // while pipelineImport carries freshly generated AI content and so applies
+  // `requiredOccurrence` at ingest the same way this handler does.
   const seedOcc = requiredOccurrence(kind, data[QUOTE_FIELD[kind]], data.occurrence);
   if (seedOcc != null) data.occurrence = seedOcc;
 

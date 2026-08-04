@@ -132,6 +132,18 @@ const GL = "the Chaldeans, the ones laying siege";
   eq(requiredOccurrence("twl", HEB, "2"), 1,
      "a STRING '2' is not a number -> treated as absent and forced to 1 (never stored as text)");
   eq(requiredOccurrence("twl", HEB, NaN), 1, "NaN is not a valid occurrence -> 1");
+  eq(requiredOccurrence("twl", HEB, 1.5), 1, "a non-integer is not a valid occurrence -> 1");
+
+  // Out-of-range integers are about RENDERING, not size: String(1e21) is
+  // "1e+21", which matches neither kind's digits-only regex.
+  console.log("\n[range] values that would render in exponential notation");
+  assert(String(1e21) === "1e+21", "precondition: String(1e21) really is '1e+21'");
+  eq(requiredOccurrence("twl", HEB, 1e21), 1, "twl 1e21 would render '1e+21' -> forced to 1");
+  eq(requiredOccurrence("tn", "some quote", 1e21), 1, "tn 1e21 -> forced to 1");
+  eq(requiredOccurrence("tq", "some quote", 1e21), 1, "tq 1e21 -> forced to 1");
+  eq(requiredOccurrence("tn", "some quote", Number.MAX_SAFE_INTEGER), null,
+     "a large but SAFE integer still renders as plain digits -> left alone");
+  eq(requiredOccurrence("tn", "some quote", Infinity), 1, "Infinity -> 1");
 }
 
 // ─── origLangOccurrence: the render-time net stays deliberately narrow ───

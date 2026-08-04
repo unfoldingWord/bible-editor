@@ -75,8 +75,15 @@ export function hardRejectRows(kind: HardRejectKind, tsv: string): HardRejectRow
   for (const line of lines.slice(1)) {
     if (line === "") continue; // trailing newline
     const cells = line.split("\t");
-    const occ = (cells[occIdx] ?? "").trim();
-    const quote = (cells[quoteIdx] ?? "").trim();
+    // Compare the cells RAW, exactly as the validators do. Trimming the Quote
+    // was too lax: the validator's test is `_quote == ""` on the unmodified
+    // cell, so a Quote of "   " is NOT blank to it and does NOT license a blank
+    // Occurrence — yet a trimming guard saw "" and let the row through, which is
+    // precisely the silent withhold this module exists to prevent. Verified by
+    // running validate_tn_files.py on a "   " Quote with a blank Occurrence: it
+    // errors. Same reasoning for Occurrence — " 1 " fails the digits-only regex.
+    const occ = cells[occIdx] ?? "";
+    const quote = cells[quoteIdx] ?? "";
     const ref = cells[refIdx] ?? "";
     const rowId = cells[idIdx] ?? "";
     if (kind === "twl") {

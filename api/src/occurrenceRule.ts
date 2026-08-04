@@ -63,7 +63,18 @@ export function requiredOccurrence(
   // path, but `typeof NaN === "number"` would otherwise sail past the null/0
   // checks and store a NaN that renders as a blank cell — the exact failure
   // this module exists to prevent.
-  const occ = Number.isInteger(occurrence) ? (occurrence as number) : null;
+  // A value was supplied but is not a usable integer — NaN, Infinity, 1.5, the
+  // string "2", or anything >= 1e21. None of these can render legally for ANY
+  // kind, so force a 1 rather than fall through to the blank rules below. That
+  // distinction matters: "absent" is legal for tn (with a blank Quote) and
+  // always legal for tq, so treating an ILLEGAL value as merely absent would
+  // leave it in place and ship it. The bound is about rendering, not size —
+  // `tsvCell` stringifies and `String(1e21) === "1e+21"`, which matches neither
+  // kind's digits-only regex; `Number.isSafeInteger` is exactly the test for
+  // "will stringify as plain digits".
+  if (occurrence != null && !Number.isSafeInteger(occurrence)) return 1;
+  // Past this point null means genuinely absent (`null` or `undefined`).
+  const occ = Number.isSafeInteger(occurrence) ? (occurrence as number) : null;
   // The RAW quote cell, deliberately not trimmed: the validators compare
   // `_quote == ""`, so a whitespace-only Quote is NOT blank to them and does
   // NOT license a blank Occurrence.

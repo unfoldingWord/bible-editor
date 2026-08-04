@@ -95,8 +95,21 @@ t("multiple offenders are all reported, in row order", () => {
   );
   assert.deepEqual(rows.map((r) => r.rowId), ["aaaa", "cccc"]);
 });
-t("whitespace-only Occurrence counts as blank, not as a value", () => {
+t("whitespace-only Occurrence is rejected (it fails the digits-only regex)", () => {
   assert.equal(hardRejectRows("twl", twlTsv(["1:1", "abcd", "", "x", "   ", "rc://x"])).length, 1);
+});
+// The cells are compared RAW, exactly as the validators do. Trimming the Quote
+// was too lax: validate_tn_files.py tests `_quote == ""` on the unmodified cell,
+// so "   " is not blank to it and does not license a blank Occurrence. Confirmed
+// by running the real validator on this row — it errors, so we must HOLD.
+t("a whitespace-only tn Quote does NOT license a blank Occurrence", () => {
+  const rows = hardRejectRows("tn", tnTsv(["1:1", "abcd", "", "", "   ", "", "a note"]));
+  assert.equal(rows.length, 1);
+  assert.match(rows[0].reason, /Occurrence is blank but Quote is not/);
+});
+t("a whitespace-only twl OrigWords is still judged only on Occurrence", () => {
+  // OrigWords blankness is only a validator WARNING, so it never drives a HOLD.
+  assert.deepEqual(hardRejectRows("twl", twlTsv(["1:1", "abcd", "", "   ", "1", "rc://x"])), []);
 });
 
 console.log(`\n${passed} hardRejectGuard tests passed`);
