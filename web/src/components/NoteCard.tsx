@@ -43,7 +43,7 @@ import { useNoteTemplates } from "../hooks/useNoteTemplates";
 import { CatalogPicker } from "./CatalogPicker";
 import { shortSupport } from "../lib/supportReference";
 import { TCM, buildSH } from "../lib/noteTemplates";
-import { wouldBlankExistingNote } from "../lib/noteGuard";
+import { isAbandonedBlankStub, wouldBlankExistingNote } from "../lib/noteGuard";
 import { drafts, rowKey, draftDirtyBorderSx } from "../sync/drafts";
 import { CommentBadge } from "./CommentBadge";
 import type { CommentCounts } from "../lib/commentsIndex";
@@ -671,6 +671,30 @@ function NoteCardInner({
     void drafts.clear(rowKey("tn", row.book, row.id));
     onDelete();
   };
+
+  // Discard an abandoned blank stub. "Add note" mints a row with note:"" so the
+  // user has something to type into, and neither blank-note guard covers it (see
+  // isAbandonedBlankStub) — so clicking Add note and then clicking away used to
+  // leave a permanently empty row in D1 that exports to DCS as a blank tn line.
+  // On deactivation, if the row is still wholly empty and untouched, trash it.
+  // onDelete routes to Shell's handleTrashNote, a reversible soft-delete that
+  // stays visible in the trash UI, so an accidental discard is recoverable and
+  // the user can just click Add note again. discardedRef keeps it to one call.
+  //
+  // Deliberately NOT wired to unmount: unmount also fires on scroll
+  // virtualization and chapter navigation, and the extra mirrored refs a
+  // teardown handler would need are not worth it for the rarer path. A stub
+  // abandoned by navigating straight out of the chapter therefore still
+  // persists — see the PR description.
+  const discardedRef = useRef(false);
+  useEffect(() => {
+    if (active) return;
+    if (discardedRef.current) return;
+    if (!isAbandonedBlankStub(row, { note, quote, supportRef, hydrated })) return;
+    discardedRef.current = true;
+    handleDelete();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [active, hydrated]);
 
   // Apply a historical snapshot. The patch goes through the normal save
   // pipe so it lands as v(current+1) — every older entry stays in
