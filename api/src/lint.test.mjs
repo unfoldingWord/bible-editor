@@ -332,15 +332,45 @@ t("blank required fields stay flagged in-app for every kind", () => {
     BLANK_CHECKS.has(x.check),
   );
   assert.equal(blankIssues.length, 5);
+  // Anchored on DCS/validator/merge as the SUBJECT of the rejection, so a
+  // legitimate future message that merely uses the word "reject" about something
+  // else ("the TWL matcher rejects a blank source string") does not false-fail,
+  // while every phrasing of the stale claim is caught.
+  const STALE_CLAIM =
+    /(?:DCS|validator|validation|whole-repo)[^.]{0,30}\b(?:reject|refus|fail|block)|\b(?:reject|refus|fail|block)\w*[^.]{0,30}(?:DCS|validator|validation|whole-repo)|(?:can'?t|cannot|won'?t|will not)\s+merge|unmergeable|block\w*\s+(?:the\s+)?merg/i;
   for (const i of blankIssues) {
-    assert.ok(
-      !/reject|fail\w* (DCS|whole-repo|validation)|can'?t merge|unmergeable|block\w* the merge/i.test(i.message),
-      `stale DCS-rejection claim in: ${i.message}`,
-    );
-    // Actionable: says what reaches Door43, and what the editor should do.
-    assert.ok(/Door43/.test(i.message), `no publish consequence stated in: ${i.message}`);
+    assert.ok(!STALE_CLAIM.test(i.message), `stale DCS-rejection claim in: ${i.message}`);
+    // Actionable: states the publish consequence, and what the editor should do.
+    assert.ok(/publishes/.test(i.message), `no publish consequence stated in: ${i.message}`);
     assert.ok(/delete the row/.test(i.message), `no remedy offered in: ${i.message}`);
     assert.equal(i.bucket, "flag");
+  }
+});
+
+// The negative regex above is only worth having if it actually bites. Pin the
+// phrasings that must fail it and the innocent ones that must not, so a future
+// loosening of the pattern is caught here rather than by a wrong banner.
+t("stale-DCS-claim detector catches every phrasing, spares innocent ones", () => {
+  const STALE_CLAIM =
+    /(?:DCS|validator|validation|whole-repo)[^.]{0,30}\b(?:reject|refus|fail|block)|\b(?:reject|refus|fail|block)\w*[^.]{0,30}(?:DCS|validator|validation|whole-repo)|(?:can'?t|cannot|won'?t|will not)\s+merge|unmergeable|block\w*\s+(?:the\s+)?merg/i;
+  for (const bad of [
+    "Empty note — this row will fail DCS validation. Add a note.",
+    "Empty note — will fail the DCS validator.",
+    "Empty note — DCS refuses this row.",
+    "Empty note — rejected by DCS's whole-repo validator.",
+    "Empty note — this render won't merge.",
+    "Empty note — produces an unmergeable PR.",
+    "Empty note — blocks merging.",
+    "Empty note — blocks the merge.",
+  ]) {
+    assert.ok(STALE_CLAIM.test(bad), `should have been caught: ${bad}`);
+  }
+  for (const ok of [
+    "Empty note — DCS only warns, so this row publishes blank on the next export. Add a note or delete the row.",
+    "Empty OrigWords — the TWL matcher rejects a blank source string. Add the word(s) or delete the row.",
+    "Empty note — the row publishes blank; delete the row if it is not needed.",
+  ]) {
+    assert.ok(!STALE_CLAIM.test(ok), `false positive on: ${ok}`);
   }
 });
 

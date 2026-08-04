@@ -118,7 +118,7 @@ export function lintTnRows(rows: TnRow[]): LintIssue[] {
         bucket: "flag",
         ref: `${r.chapter}:${r.verse}`,
         rowId: r.id,
-        message: "Empty note — DCS warns but still publishes this row, so it reaches Door43 blank. Add a note or delete the row.",
+        message: "Empty note — DCS only warns, so this row publishes blank on the next export. Add a note or delete the row.",
       });
     }
     const note = r.note ?? "";
@@ -155,10 +155,10 @@ export function lintTqRows(rows: TqRow[]): LintIssue[] {
   for (const r of rows) {
     const ref = `${r.chapter}:${r.verse}`;
     if (isBlankRequired(r.question)) {
-      issues.push({ check: "Empty question", bucket: "flag", ref, rowId: r.id, message: "Empty question — DCS warns but still publishes this row, so it reaches Door43 blank. Add a question or delete the row." });
+      issues.push({ check: "Empty question", bucket: "flag", ref, rowId: r.id, message: "Empty question — DCS only warns, so this row publishes blank on the next export. Add a question or delete the row." });
     }
     if (isBlankRequired(r.response)) {
-      issues.push({ check: "Empty response", bucket: "flag", ref, rowId: r.id, message: "Empty response — DCS warns but still publishes this row, so it reaches Door43 blank. Add a response or delete the row." });
+      issues.push({ check: "Empty response", bucket: "flag", ref, rowId: r.id, message: "Empty response — DCS only warns, so this row publishes blank on the next export. Add a response or delete the row." });
     }
   }
   return issues;
@@ -172,10 +172,10 @@ export function lintTwlRows(rows: TwlRow[]): LintIssue[] {
   for (const r of rows) {
     const ref = `${r.chapter}:${r.verse}`;
     if (isBlankRequired(r.orig_words)) {
-      issues.push({ check: "Empty OrigWords", bucket: "flag", ref, rowId: r.id, message: "Empty OrigWords — DCS warns but still publishes this row, so it reaches Door43 blank. Add the original-language word(s) or delete the row." });
+      issues.push({ check: "Empty OrigWords", bucket: "flag", ref, rowId: r.id, message: "Empty OrigWords — DCS only warns, so this row publishes blank on the next export. Add the original-language word(s) or delete the row." });
     }
     if (isBlankRequired(r.tw_link)) {
-      issues.push({ check: "Empty TWLink", bucket: "flag", ref, rowId: r.id, message: "Empty TWLink — DCS warns but still publishes this row, so it reaches Door43 with no link. Add a translationWords link or delete the row." });
+      issues.push({ check: "Empty TWLink", bucket: "flag", ref, rowId: r.id, message: "Empty TWLink — DCS only warns, so this row publishes with no link on the next export. Add a translationWords link or delete the row." });
     }
   }
   return issues;

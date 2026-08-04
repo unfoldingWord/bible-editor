@@ -468,7 +468,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
         // problem, so it must not read as a failure in the alert banner.
         //
         // Worded for what is true HERE: the guard was cleared. The export can
-        // still be stopped further down by the blank-field gate, USFM
+        // still be stopped further down by the alignment-shrink backstop, USFM
         // validation, or a failed DCS commit, so this must not claim the push
         // happened — a durable record that lies about a destructive action is
         // worse than none.
