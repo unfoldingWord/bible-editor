@@ -630,6 +630,14 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     // holds the book back.
     if (dcsAllowed && (resource === "ult" || resource === "ust")) {
       const guard = await this.checkUsfmAlignmentShrink(book, resource, built.content);
+      if (guard.ok && guard.detail === "ok") {
+        // Checked this book+resource against master and found no alignment
+        // loss — clear any stale rows a PAST export's loss left behind so the
+        // app's sticky indicator goes away. `detail === "ok"` (not just
+        // `guard.ok`) excludes "no_file" (the book has no ult/ust file at
+        // all, so nothing was actually checked) from counting as clean.
+        await this.clearAlignmentAttention(book, resource);
+      }
       if (!guard.ok) {
         const severity = classifyAlignmentLossSeverity(guard.offenders ?? []);
         await this.recordAlignmentShrinkSkipAlert(
@@ -1402,6 +1410,88 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       `${this.env.DCS_BASE_URL}/unfoldingWord`,
       blocking ? "error" : "warning",
     );
+    await this.recordAlignmentAttention(book, resource, offenders, provenance);
+  }
+
+  // Persist this export's alignment-shrink offenders so the app can render a
+  // sticky per-book indicator that survives page reloads (system_alerts above
+  // is dismissible and per-user; this isn't). Replace-all per (book,resource):
+  // delete then re-insert, same pattern as writeAlert's undismissed-replace,
+  // so a book that stops offending goes quiet the next time this fires. Best
+  // effort — like writeAlert, a telemetry write must never fail or retry the
+  // export, so this is try/catch + console.error, not awaited-critical.
+  private async recordAlignmentAttention(
+    book: string,
+    resource: Resource,
+    offenders: AlignmentShrinkResult["offenders"],
+    provenance: Map<string, OffenderProvenance>,
+  ): Promise<void> {
+    // Drop the synthetic `ref: "*"` sentinels (export.ts's unparseable_render /
+    // empty_render). They mean OUR OWN render was broken, so no verse was ever
+    // compared against master — they are not per-verse evidence, they aren't
+    // navigable, and the read endpoint filters them out anyway. Treating them
+    // as a snapshot would replace real findings with a row nobody can act on,
+    // which is the same erasure the empty-list guard below prevents.
+    const perVerse = offenders.filter((o) => o.ref !== "*");
+    // An EMPTY offender list here never means "measured and clean" — the clean
+    // case is handled by clearAlignmentAttention on the `detail === "ok"` path.
+    // It means the guard failed without per-verse detail (master_unreadable:
+    // DCS wouldn't give us a readable master), so nothing was compared. Writing
+    // the snapshot anyway would DELETE yesterday's real findings and insert
+    // nothing, erasing known-broken verses on a night we learned nothing —
+    // the export blocks, but the sticky indicator would go quiet, which is
+    // exactly the "unmeasured outcome presented as evidence" failure this
+    // file's alert wording was already fixed for. Keep the prior evidence.
+    if (perVerse.length === 0) return;
+    try {
+      const statements = [
+        this.env.DB.prepare(`DELETE FROM alignment_attention WHERE book = ?1 AND resource = ?2`).bind(
+          book,
+          resource,
+        ),
+        ...perVerse.map((o) =>
+          this.env.DB.prepare(
+            // OR REPLACE, not plain INSERT: the batch is one transaction, so a
+            // single duplicate ref in `offenders` would violate the unique
+            // index, roll the whole snapshot back, and leave the indicator
+            // silently serving the PREVIOUS export's rows with nothing but a
+            // console.error. A repeated ref should cost us that one row, not
+            // the whole book's findings.
+            `INSERT OR REPLACE INTO alignment_attention (book, resource, ref, lost_words, provenance)
+             VALUES (?1, ?2, ?3, ?4, ?5)`,
+          ).bind(book, resource, o.ref, JSON.stringify(o.lostWords), provenance.get(o.ref) ?? null),
+        ),
+      ];
+      // Batched (not one .run() per offender) — this file has already hit
+      // Cloudflare's ~1000-subrequest cap once (see the pre-export sync
+      // comment above); a book with many offenders must not repeat that.
+      await this.env.DB.batch(statements);
+    } catch (e) {
+      console.error("export alignment attention write failed", {
+        book,
+        resource,
+        error: e instanceof Error ? e.message : String(e),
+      });
+    }
+  }
+
+  // Clear stale alignment_attention rows for a book+resource that was
+  // re-checked against master and found clean. This is the only place rows
+  // disappear outside of a fresh offender list replacing them — without it,
+  // a translator who fixes every flagged verse would never see the sticky
+  // indicator go away. Best-effort, same rationale as recordAlignmentAttention.
+  private async clearAlignmentAttention(book: string, resource: Resource): Promise<void> {
+    try {
+      await this.env.DB.prepare(`DELETE FROM alignment_attention WHERE book = ?1 AND resource = ?2`)
+        .bind(book, resource)
+        .run();
+    } catch (e) {
+      console.error("export alignment attention clear failed", {
+        book,
+        resource,
+        error: e instanceof Error ? e.message : String(e),
+      });
+    }
   }
 
   // Who owns each offending verse in D1, keyed by the offender's ref. Reads

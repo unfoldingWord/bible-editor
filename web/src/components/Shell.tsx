@@ -18,6 +18,7 @@ import { useChapter } from "../hooks/useChapter";
 import { useChapterRoom } from "../hooks/useChapterRoom";
 import type { UseBookReturn } from "../hooks/useBook";
 import { useBookLint } from "../hooks/useBookLint";
+import { useAlignmentAttention } from "../hooks/useAlignmentAttention";
 import { useLexicon } from "../hooks/useLexicon";
 import { useAiDrafts } from "../hooks/useAiDrafts";
 import { useTwlFilters } from "../hooks/useTwlFilters";
@@ -71,6 +72,7 @@ import {
 import { TopBar } from "./TopBar";
 import { ExportUsfmButton } from "./ExportUsfmButton";
 import { BookLintIndicator } from "./BookLintIndicator";
+import { AlignAttentionIndicator } from "./AlignAttentionIndicator";
 import { LogosSyncToggle } from "./LogosSyncToggle";
 import { PipelineMenu } from "./PipelineMenu";
 import { PipelineStatusBar } from "./PipelineStatusBar";
@@ -505,6 +507,10 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // indicator. Keyed on book, so it fetches once per book change — never on
   // chapter/verse navigation within a book.
   const bookLint = useBookLint(book, true);
+  // Sticky "alignment needs attention" badge — the nightly export's evidence
+  // of ULT/UST verses that lost word alignment, surviving banner dismissal
+  // and reload. Book-level, fetched once per book change.
+  const alignAttention = useAlignmentAttention(book, true);
   // TWL suggestion deny-lists (unlinked word+article pairs + this book's deleted
   // reference+quotes). Keyed on book, fetched once per book change. Drives the
   // deleted-here exclusion + unlinked article-pruning for per-verse suggestions.
@@ -999,6 +1005,37 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     for (const v of verseNums) tiles.push({ verse: v, has: hasUnalignedFor(v), lanes: buildLanes(v) });
     return tiles;
   }, [versesForTiles, laneIndex, versesWithTn, versesWithTq, meUserId, introHasResource, introHasTwl]);
+
+  // Which alignment-attention refs (from the last nightly export) are already
+  // fixed in the currently loaded chapter — re-parsed against live verse
+  // content so the topbar badge stops nagging about verses the translator
+  // has since re-aligned. Only evaluates refs for the loaded chapter; refs in
+  // other chapters of the book stay in the badge until that chapter loads.
+  // Keyed on versesForTiles (not `data`) for the same reason as tileSet above:
+  // a note/TQ/TWL edit must not re-trigger this alignment parse.
+  const alignAttentionResolvedKeys = useMemo(() => {
+    const keys = new Set<string>();
+    if (!versesForTiles || data?.chapter == null) return keys;
+    const getVO = (dto: VerseDto | undefined) => {
+      const vo = (dto?.content as { verseObjects?: unknown[] } | null)?.verseObjects;
+      return Array.isArray(vo) ? vo : null;
+    };
+    const sourceByVerse = versesForTiles.UHB ?? versesForTiles.UGNT ?? {};
+    const targetsByResource: Record<"ult" | "ust", Record<number, VerseDto>> = {
+      ult: versesForTiles.ULT ?? {},
+      ust: versesForTiles.UST ?? {},
+    };
+    for (const ref of alignAttention.refs) {
+      if (ref.chapter !== data.chapter) continue;
+      const targetVO = getVO(targetsByResource[ref.resource]?.[ref.verse]);
+      if (!targetVO) continue;
+      const sourceVO = getVO(sourceByVerse[ref.verse]);
+      if (!verseHasUnalignedWork(targetVO, sourceVO)) {
+        keys.add(`${ref.resource}:${ref.ref}`);
+      }
+    }
+    return keys;
+  }, [versesForTiles, data?.chapter, alignAttention.refs]);
 
   // Toggle MY checkoff stamp on a (verse, lane): optimistic + outbox (offline-safe).
   const toggleLane = useCallback(
@@ -2728,6 +2765,21 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
             flagCount={bookLint.flagCount}
             escalateCount={bookLint.escalateCount}
             onGoToIssue={goToLintIssue}
+          />
+        }
+        alignIndicator={
+          <AlignAttentionIndicator
+            book={book}
+            refs={alignAttention.refs}
+            resolvedKeys={alignAttentionResolvedKeys}
+            onNavigate={(b, c, v) => {
+              runWithDirtyGate(() => {
+                setActiveVerse(v ?? 1);
+                setActiveNoteId(null);
+                setActiveWordId(null);
+                onNavigate?.(b, c, v);
+              });
+            }}
           />
         }
         exportMenu={

@@ -580,6 +580,35 @@ export async function dismissAlert(id: number): Promise<void> {
   });
 }
 
+// One ULT/UST verse the last nightly export found with lost word alignment.
+// `ref` is the display form ("8:4" or "3:5-7" for a verse bridge); `chapter`/
+// `verse` are its navigable parse (verse is the bridge's leading verse).
+export interface AlignAttentionRef {
+  resource: "ult" | "ust";
+  ref: string;
+  chapter: number;
+  verse: number;
+  lostWords: string[];
+  provenance: string | null;
+}
+
+// GET /api/alignment-attention/:book — verses the last nightly export flagged
+// as having lost word alignment. This is a point-in-time snapshot from that
+// run, not live truth: a translator who has since fixed the verse still shows
+// up here until the badge's caller re-derives that locally (see
+// useAlignmentAttention / AlignAttentionIndicator's resolvedKeys filtering).
+export async function fetchAlignmentAttention(book: string): Promise<AlignAttentionRef[]> {
+  try {
+    const res = await request<{ refs: AlignAttentionRef[] }>(
+      `/api/alignment-attention/${encodeURIComponent(book)}`,
+    );
+    return res.refs;
+  } catch (err) {
+    if (err instanceof ApiError && err.status === 401) return [];
+    throw err;
+  }
+}
+
 // GET /api/auth/me — confirms the current cookie session's identity + role.
 // Returns null on 401 (no cookie / expired) so callers can show the sign-in
 // flow. Throws ApiError on other 4xx/5xx.

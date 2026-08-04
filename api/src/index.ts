@@ -14,6 +14,7 @@ import { tnQuick } from "./tnQuick";
 import { pipelines, pollAllNonTerminal } from "./pipelines";
 import { pendingImports } from "./pendingImports";
 import { alerts } from "./alerts";
+import { alignmentAttention } from "./alignmentAttention";
 import { comments } from "./comments";
 import { books } from "./bookImport";
 import { attachAuth, requireAuth, requireCsrf, mintDevToken, startDcsAuth, callbackDcsAuth, authMe, authLogout, refreshToken, updateLastLocation, currentUserId, verifyToken } from "./auth";
@@ -187,6 +188,7 @@ app.route("/api/tn-quick", tnQuick);
 app.route("/api/pipelines", pipelines);
 app.route("/api/pending-imports", pendingImports);
 app.route("/api/alerts", alerts);
+app.route("/api/alignment-attention", alignmentAttention);
 app.route("/api/comments", comments);
 
 // WebSocket upgrade into the ChapterRoom DO. WS handshakes are normal HTTP
