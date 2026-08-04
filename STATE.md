@@ -62,6 +62,18 @@ For the full corpus, see the memory index at
 `C:\Users\benja\.claude\projects\C--Users-benja-Documents-GitHub-bible-editor\memory\MEMORY.md`.
 Highlights that bite repeatedly:
 
+- **An absent measurement is not a clean measurement — and it must never overwrite
+  evidence.** Third instance of this class (after the alert-wording fix and the reimport
+  watermark certifying skipped chapters). `alignment_attention` is a replace-all snapshot,
+  so any code path that writes it on a night nothing was compared DELETES real prior
+  findings and leaves the indicator silently empty. Two doors had to be closed, not one:
+  `master_unreadable` yields an EMPTY offender list, and `unparseable_render` /
+  `empty_render` yield a NON-empty list holding only the synthetic `ref: "*"` sentinel —
+  so a plain `length === 0` guard is insufficient. Rule for any future evidence table:
+  the write path must prove it measured something per-verse before it is allowed to
+  replace what is already stored, and "clean" must arrive by its own explicit path
+  (here `detail === "ok"` → `clearAlignmentAttention`), never inferred from emptiness.
+
 - **A guard that CAN detect something is not automatically entitled to block on it.**
   Benjamin's ruling (2026-08-04) on the alignment-shrink backstop: "an unaligned word or
   two here or there is no reason not to sync to Door43 ... don't hold somebody's work back
