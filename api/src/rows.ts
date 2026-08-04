@@ -6,6 +6,7 @@ import { currentUserId, requireEditor } from "./auth";
 import { activePipelineForChapter, lockedResponseBody } from "./chapterLock";
 import { broadcastChapter } from "./wsEvents";
 import { newRowId } from "./rowId";
+import { BLANK_STUB_CLAUSE } from "./blankStub";
 import { reopenLaneChecks } from "./laneReopen";
 import { refParts, coveredVersesFromRef } from "./importParsers";
 
@@ -959,9 +960,40 @@ async function setTnTrashed(
   book: string,
   userId: number | null,
   trashed: boolean,
+  // When true, the UPDATE only lands if the row is still an abandoned blank
+  // stub. A no-op result means the row changed under us; the caller turns that
+  // into a 409 rather than silently reporting success.
+  onlyIfBlankStub = false,
 ): Promise<TnRow | null> {
   const now = Math.floor(Date.now() / 1000);
   const action = trashed ? "trash" : "untrash";
+  const auditStmt = env.DB
+    .prepare(
+      `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action)
+       SELECT 'tn', ?1, book, ?2, version, version, ?3
+         FROM tn_rows
+        WHERE id = ?1 AND deleted_at IS NULL${bookClause(4)}`,
+    )
+    .bind(id, userId ?? null, action, book);
+
+  // The guarded path can't share the batch: the batch runs sequentially, so by
+  // the time the audit INSERT's SELECT ran, the UPDATE would already have set
+  // trashed_at and the predicate's own `trashed_at IS NULL` clause would no
+  // longer hold. Run the UPDATE alone, and only log the audit row if it landed.
+  if (onlyIfBlankStub) {
+    const res = await env.DB
+      .prepare(
+        `UPDATE tn_rows
+           SET trashed_at = ?1, updated_at = ?2
+         WHERE id = ?3 AND deleted_at IS NULL${bookClause(4)}${BLANK_STUB_CLAUSE}`,
+      )
+      .bind(trashed ? now : null, now, id, book)
+      .run();
+    if (!res.meta.changes) return null;
+    await auditStmt.run();
+    return env.DB.prepare(`SELECT * FROM tn_rows WHERE id = ?1${bookClause(2)}`).bind(id, book).first<TnRow>();
+  }
+
   const [updateRes] = await env.DB.batch([
     env.DB
       .prepare(
@@ -970,14 +1002,7 @@ async function setTnTrashed(
          WHERE id = ?3 AND deleted_at IS NULL${bookClause(4)}`,
       )
       .bind(trashed ? now : null, now, id, book),
-    env.DB
-      .prepare(
-        `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action)
-         SELECT 'tn', ?1, book, ?2, version, version, ?3
-           FROM tn_rows
-          WHERE id = ?1 AND deleted_at IS NULL${bookClause(4)}`,
-      )
-      .bind(id, userId ?? null, action, book),
+    auditStmt,
   ]);
   if (!updateRes.meta.changes) return null;
   return env.DB.prepare(`SELECT * FROM tn_rows WHERE id = ?1${bookClause(2)}`).bind(id, book).first<TnRow>();
@@ -1080,7 +1105,31 @@ rows.post("/tn/:id/trash", requireEditor, async (c) => {
   const book = c.req.query("book");
   if (!book) return c.json({ error: "book_required" }, 400);
   const userId = currentUserId(c);
-  const updated = await setTnTrashed(c.env, id, book, userId, true);
+  // `onlyIfBlankStub=1` is the auto-discard of an abandoned blank note stub,
+  // not a user pressing delete. The client decides from a cached row, so make
+  // the server re-assert the predicate atomically (BLANK_STUB_CLAUSE) and
+  // refuse if the row gained content under us — otherwise a collaborator
+  // filling the stub mid-flight would get their note binned, and the nightly
+  // job would promote that to a permanent tombstone. Distinguish it from
+  // not_found: the row exists, it simply is no longer discardable.
+  const onlyIfBlankStub = c.req.query("onlyIfBlankStub") === "1";
+  const updated = await setTnTrashed(c.env, id, book, userId, true, onlyIfBlankStub);
+  if (!updated && onlyIfBlankStub) {
+    const exists = await c.env.DB.prepare(
+      `SELECT id FROM tn_rows WHERE id = ?1 AND deleted_at IS NULL${bookClause(2)}`,
+    )
+      .bind(id, book)
+      .first<{ id: string }>();
+    if (exists) {
+      return c.json(
+        {
+          error: "not_blank_stub",
+          message: "Note is no longer an empty stub — leaving it alone.",
+        },
+        409,
+      );
+    }
+  }
   if (!updated) return c.json({ error: "not_found" }, 404);
   c.executionCtx.waitUntil(
     broadcastChapter(c.env, updated.book, updated.chapter, { type: "row.upserted", kind: "tn", row: updated }),

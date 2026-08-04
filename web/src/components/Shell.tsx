@@ -23,7 +23,7 @@ import { useAiDrafts } from "../hooks/useAiDrafts";
 import { useTwlFilters } from "../hooks/useTwlFilters";
 import { useUnsavedGuard } from "../hooks/useUnsavedGuard";
 import { outbox } from "../sync/outbox";
-import { api, CHECK_LANES, isReadOnly } from "../sync/api";
+import { api, ApiError, CHECK_LANES, isReadOnly } from "../sync/api";
 import type { BookLintIssue, ChapterPayload, CheckLane, TnRow, TqRow, TwlRow, VerseDto, TwlSuggestion, CommentRowKind, MentionUser } from "../sync/api";
 import { useComments } from "../hooks/useComments";
 import { countThreads, rowKey, type CommentThread } from "../lib/commentsIndex";
@@ -836,17 +836,22 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // error. Clearing the active note (functional update, no dep on activeNoteId)
   // drops the active highlight off the now-trashed card.
   const handleTrashNote = useCallback(
-    async (id: string) => {
+    async (id: string, opts?: { blankStub?: boolean }) => {
       applyLocalRowPatch("tn", id, { trashed_at: Math.floor(Date.now() / 1000) });
       setActiveNoteId((cur) => (cur === id ? null : cur));
       try {
-        const updated = await api.trashNote(id, book);
+        const updated = await api.trashNote(id, book, { onlyIfBlankStub: opts?.blankStub });
         applyLocalRowReplacement("tn", updated);
         // Trash bypasses the outbox, so refresh the lint chip directly — a
         // trashed note leaves the lint set (trashed_at IS NULL filter).
         scheduleLintRefetch();
       } catch (e) {
         applyLocalRowPatch("tn", id, { trashed_at: null });
+        // The blank-stub auto-discard losing its race is the guard doing its
+        // job, not a failure: the row gained content between our decision and
+        // the request, so the server refused and we roll the local trash back.
+        // The user never asked for this delete, so don't toast at them.
+        if (opts?.blankStub && e instanceof ApiError && e.status === 409) return;
         const msg = e instanceof Error ? e.message : "unknown error";
         pushPipelineToast(`Couldn't delete note: ${msg}`, "error");
       }

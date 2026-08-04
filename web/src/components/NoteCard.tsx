@@ -87,7 +87,7 @@ interface Props {
   // origin version so the server can mark the new edit_log entry + row
   // column for chip-label purposes.
   onSave: (patch: Partial<TnRow>, opts?: { restoredFromVersion?: number }) => void;
-  onDelete: () => void;
+  onDelete: (opts?: { blankStub?: boolean }) => void;
   onRestore: () => void;
   onInsertAfter: () => void;
   onFocus?: () => void;
@@ -509,12 +509,21 @@ function NoteCardInner({
   // card — whose state hasn't rehydrated yet — can't wipe the very draft we're
   // about to read.
   const [hydrated, setHydrated] = useState(false);
+  // Distinct from `hydrated`, which means only "the draft lookup was attempted"
+  // — it is deliberately set true on IndexedDB failure too, so the draft-write
+  // effect's clear branch can still fire. That is fine for a write, but it must
+  // never authorize a DELETE: if the read threw, empty local state is not
+  // evidence that no draft exists, and the blank-stub auto-discard would bin a
+  // row whose unsaved typing we simply failed to load. Only the success path
+  // sets this, so a transient IndexedDB error just leaves the stub in place.
+  const [draftReadOk, setDraftReadOk] = useState(false);
   const hydratedFromDraftRef = useRef(false);
   useEffect(() => {
     if (hydratedFromDraftRef.current) return;
     void drafts.get(rowKey("tn", row.book, row.id)).then((rec) => {
       if (hydratedFromDraftRef.current) return;
       hydratedFromDraftRef.current = true;
+      setDraftReadOk(true);
       const payload = rec?.payload as
         | {
             patch?: Partial<TnRow>;
@@ -663,13 +672,13 @@ function NoteCardInner({
     });
   };
 
-  const handleDelete = () => {
+  const handleDelete = (opts?: { blankStub?: boolean }) => {
     pendingRef.current = {};
     setSessionSnapshot(null);
     // Drop any draft so the delete doesn't get followed by a phantom save
     // from a still-dirty buffer.
     void drafts.clear(rowKey("tn", row.book, row.id));
-    onDelete();
+    onDelete(opts);
   };
 
   // Discard an abandoned blank stub. "Add note" mints a row with note:"" so the
@@ -686,15 +695,20 @@ function NoteCardInner({
   // teardown handler would need are not worth it for the rarer path. A stub
   // abandoned by navigating straight out of the chapter therefore still
   // persists — see the PR description.
+  // Cards are keyed by row id in ResourceColumn (`<Fragment key={r.id}>`), so
+  // React never reuses this instance for a different row and one ref per mount
+  // is exactly one ref per row.
   const discardedRef = useRef(false);
   useEffect(() => {
     if (active) return;
     if (discardedRef.current) return;
-    if (!isAbandonedBlankStub(row, { note, quote, supportRef, hydrated })) return;
+    // draftReadOk, not hydrated — see its declaration. A failed IndexedDB read
+    // must not be read as "the card is empty".
+    if (!isAbandonedBlankStub(row, { note, quote, supportRef, hydrated: draftReadOk })) return;
     discardedRef.current = true;
-    handleDelete();
+    handleDelete({ blankStub: true });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [active, hydrated]);
+  }, [active, draftReadOk]);
 
   // Apply a historical snapshot. The patch goes through the normal save
   // pipe so it lands as v(current+1) — every older entry stays in
@@ -1211,7 +1225,11 @@ function NoteCardInner({
               </IconButton>
             </Tooltip>
             <Tooltip title="delete this note">
-              <IconButton size="small" onClick={handleDelete} color="error" sx={{ p: 0.25 }}>
+              {/* Wrapped, not passed by reference: handleDelete now takes an
+                  opts object, and a bare handler would hand it the click event.
+                  The manual delete must never set blankStub — it has to be able
+                  to trash a note that has text. */}
+              <IconButton size="small" onClick={() => handleDelete()} color="error" sx={{ p: 0.25 }}>
                 <DeleteOutlineIcon fontSize="inherit" />
               </IconButton>
             </Tooltip>

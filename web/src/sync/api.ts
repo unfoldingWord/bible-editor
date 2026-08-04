@@ -1267,10 +1267,16 @@ export const api = {
   // Move a note to the visible "trash" state (the delete button). Returns the
   // updated row with trashed_at set. Reversible via restoreNote; finalized to a
   // deleted_at tombstone by the nightly job. Lock-exempt, no If-Match.
-  trashNote: (id: string, book: string) =>
-    request<TnRow>(`/api/rows/tn/${encodeURIComponent(id)}/trash?book=${encodeURIComponent(book)}`, {
-      method: "POST",
-    }),
+  // opts.onlyIfBlankStub marks the auto-discard of an abandoned blank stub (as
+  // opposed to the user pressing delete). The server re-checks the predicate
+  // atomically and 409s `not_blank_stub` if the row gained content since the
+  // client decided, so a stale cached row can't bin a collaborator's note.
+  trashNote: (id: string, book: string, opts?: { onlyIfBlankStub?: boolean }) =>
+    request<TnRow>(
+      `/api/rows/tn/${encodeURIComponent(id)}/trash?book=${encodeURIComponent(book)}` +
+        (opts?.onlyIfBlankStub ? "&onlyIfBlankStub=1" : ""),
+      { method: "POST" },
+    ),
 
   // Bring a trashed note back to the live set (trashed_at cleared).
   restoreNote: (id: string, book: string) =>
