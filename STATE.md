@@ -44,6 +44,17 @@
   Not a code bug: on 2026-07-30 a human cleared the verse in the aligner panel and rebuilt it word-by-word
   in ~100s (un-fusing master's 6-word compound card) and left the article off that card. Word sequence is
   identical both sides, so index 16 is unambiguous. Fix = drag "the" onto the `הַ⁠סֵּֽפֶר` card, then re-export.
+- **Two rows carry a blank Occurrence that DCS hard-rejects** — each silently blocks its whole book+resource,
+  because the Occurrence checks in `validate_{twl,tn}_files.py` pass no `severity` kwarg and so default to
+  `"error"`, failing the run that `merge-be-pr.yaml` gates the `-be-` merge on. Fix both by setting
+  **Occurrence = 1 in the editor** (preferred over prod SQL):
+  - twl `DAN 3:5` id `xf8f` — OrigWords "fall down", Occurrence NULL. Its OrigWords is Gateway-Language
+    rather than Hebrew, which is worth a look but is only a validator *warning* and does not block the merge.
+  - tn `JER 37:5` id `bfyt` — quote "the Chaldeans, the ones laying siege", Occurrence NULL.
+  A corpus scan on 2026-08-03 found no others: `xf8f` is the only twl row with a blank/zero Occurrence, and of
+  nine tn rows with a quote and no Occurrence the other eight have Hebrew quotes that `origLangOccurrence`
+  already renders as 1. The create/patch paths can no longer mint such rows (PR #403), but that fix is
+  insert-time only and does not remediate these two.
 
 ## Lessons learned (write durable, cross-session facts here — not in chat)
 
