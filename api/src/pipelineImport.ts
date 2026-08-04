@@ -28,6 +28,9 @@ import {
   IMPORT_CLAIM_STALE_SECONDS,
   shouldTouchClaim,
   tnSweepScope,
+  shouldAbortApply,
+  shouldCheckCancel,
+  CANCEL_CHECK_INTERVAL_SECONDS,
 } from "./pipelineImportClaim.ts";
 
 interface OutputEntry {
@@ -58,6 +61,15 @@ export interface ImportResult {
   // lost). The caller MUST NOT finalize the job on this result — the owning
   // poll writes output_json when it completes. See pollPipelineJob.
   claimLost?: boolean;
+  // True when a terminal transition (force stop, cancel, or the no-progress
+  // 'interrupted' sentinel) landed while this apply was in flight and the
+  // apply stopped at a batch boundary. Distinct from claimLost: no other
+  // poll owns this import, the work simply must not continue. The caller
+  // MUST NOT finalize, must not enqueue the follow-up chain, and must not
+  // broadcast a completion. Issue #402.
+  aborted?: boolean;
+  abortState?: string | null;
+  abortErrorKind?: string | null;
 }
 
 // Classify a single output[] entry into the resource kind we know how to
@@ -275,9 +287,68 @@ export async function importJobOutput(
     ownedClaimedAt: ownedClaimedAt ?? Math.floor(Date.now() / 1000),
     lost: false,
   };
+  // Cancellation watch shared across staging + apply, mirroring the heartbeat
+  // above but checking pipeline_jobs.state/error_kind instead of re-stamping
+  // import_claimed_at. Seeded ONE FULL INTERVAL IN THE PAST (unlike the
+  // heartbeat, which deliberately waits a full interval before its first
+  // touch) so the FIRST checkpoint actually reads: a job that was already
+  // force-stopped before this pass even started its apply must be caught on
+  // the very first check, not CANCEL_CHECK_INTERVAL_SECONDS into the run. See
+  // maybeCheckCancelled below.
+  const cancel: CancelWatch = {
+    lastCheckedAt: Math.floor(Date.now() / 1000) - CANCEL_CHECK_INTERVAL_SECONDS,
+    aborted: false,
+    abortState: null,
+    abortErrorKind: null,
+  };
   try {
-    const stageResult = await stageJobOutput(env, job, outputs, heartbeat);
-    const applyResult = await applyJobOutput(env, job, heartbeat);
+    const stageResult = await stageJobOutput(env, job, outputs, heartbeat, cancel);
+    // Staging itself can abort (see the CHUNK loop in stageJobOutput) — when it
+    // does, skip apply entirely rather than running it against a possibly
+    // incomplete pending_imports set.
+    const applyResult = cancel.aborted ? undefined : await applyJobOutput(env, job, heartbeat, cancel);
+
+    // Deliberate stop wins over an incidental lease loss below: it is the more
+    // specific AND the more actionable outcome (keep-and-record + stamp the
+    // job), whereas claimLost just means "some other poll owns this now."
+    if (cancel.aborted) {
+      // Record what was applied so the partial state is inspectable, and
+      // release the claim in the same batch — CAS'd on the owned claim for the
+      // identical reason the catch-path release below is (see that comment):
+      // if this pass already lost its lease to a legitimate new owner, this
+      // write must be a no-op rather than clobbering the new owner's claim or
+      // stamping a summary the new owner's own apply will contradict.
+      const summary = JSON.stringify({
+        stage: { inserted: stageResult.inserted, byKind: stageResult.byKind },
+        applied: applyResult ?? null,
+        state: cancel.abortState,
+        errorKind: cancel.abortErrorKind,
+      });
+      await env.DB.batch([
+        env.DB
+          .prepare(
+            `UPDATE pipeline_jobs SET import_aborted_at = unixepoch(), import_abort_summary = ?2
+              WHERE job_id = ?1 AND import_claimed_at = ?3`,
+          )
+          .bind(job.jobId, summary, heartbeat.ownedClaimedAt),
+        env.DB
+          .prepare(
+            `UPDATE pipeline_jobs SET import_claimed_at = NULL WHERE job_id = ?1 AND import_claimed_at = ?2`,
+          )
+          .bind(job.jobId, heartbeat.ownedClaimedAt),
+      ]);
+      return {
+        ...stageResult,
+        applied: applyResult,
+        aborted: true,
+        abortState: cancel.abortState,
+        abortErrorKind: cancel.abortErrorKind,
+        skipped: [
+          ...stageResult.skipped,
+          `import aborted mid-apply: job went terminal (${cancel.abortState}${cancel.abortErrorKind ? "/" + cancel.abortErrorKind : ""})`,
+        ],
+      };
+    }
     // Lease lost MID-FLIGHT (heartbeat CAS failed): another poll legitimately
     // re-claimed and may still be applying. Report it as claimLost so the caller
     // does NOT finalize — writing output_json / state='done' here would mark the
@@ -414,11 +485,72 @@ export async function maybeTouchClaim(
   hb.ownedClaimedAt = newClaimedAt ?? hb.ownedClaimedAt;
 }
 
+// Mutable cancellation state threaded through staging + apply, mirroring
+// ClaimHeartbeat's shape but answering a different question: not "is our
+// claim still fresh" but "has the job itself gone terminal out from under us."
+// See maybeCheckCancelled.
+export interface CancelWatch {
+  lastCheckedAt: number;
+  aborted: boolean;
+  abortState: string | null;
+  abortErrorKind: string | null;
+}
+
+// Cooperative cancellation check called at batch boundaries throughout the
+// stage/apply loops. Answers: has this job left every state under which an
+// apply is legitimate (shouldAbortApply)? If so, every subsequent checkpoint
+// in this pass returns true immediately (no further DB reads) and the calling
+// loop stops issuing new writes — see the `break`/early-return call sites
+// below. Policy is keep-and-record (#402): nothing already written is undone;
+// this only prevents NEW writes past the point of detection, and
+// importJobOutput stamps the job with what was applied so the partial result
+// is inspectable.
+//
+// Rate-limited via shouldCheckCancel/CANCEL_CHECK_INTERVAL_SECONDS so a
+// chunked loop pays for one cheap SELECT every ~15s, not one per proposal.
+// Exported for the fake-DB regression tests in pipelineImport.test.mjs, which
+// drive it directly — same rationale as maybeTouchClaim.
+export async function maybeCheckCancelled(
+  env: Env,
+  jobId: string,
+  cw: CancelWatch,
+): Promise<boolean> {
+  if (cw.aborted) return true; // Already known — no DB read needed.
+  const now = Math.floor(Date.now() / 1000);
+  if (!shouldCheckCancel(cw.lastCheckedAt, now)) return false;
+  // Set BEFORE the read, same reasoning as the heartbeat's ownedClaimedAt
+  // bookkeeping: a throwing or slow read must not produce a hot retry loop —
+  // the next check still waits a full interval regardless of what this one did.
+  cw.lastCheckedAt = now;
+  const row = await env.DB.prepare(
+    `SELECT state, error_kind FROM pipeline_jobs WHERE job_id = ?1`,
+  )
+    .bind(jobId)
+    .first<{ state: string | null; error_kind: string | null }>();
+  // A missing row is not a terminal signal — applyJobOutput's own lookup
+  // throws on a missing pipeline_jobs row elsewhere; this check simply no-ops
+  // rather than inventing a second, weaker way to detect that case.
+  if (!row) return false;
+  if (shouldAbortApply(row.state)) {
+    cw.aborted = true;
+    cw.abortState = row.state;
+    cw.abortErrorKind = row.error_kind ?? null;
+    console.error("pipeline apply: job went terminal mid-apply; stopping at batch boundary", {
+      jobId,
+      state: row.state,
+      errorKind: row.error_kind,
+    });
+    return true;
+  }
+  return false;
+}
+
 async function stageJobOutput(
   env: Env,
   job: ImportContext,
   outputs: OutputEntry[],
   heartbeat: ClaimHeartbeat,
+  cancel: CancelWatch,
 ): Promise<ImportResult> {
   // Idempotency guard: staged_at is written ONLY after the final chunk below
   // commits, so it — not the mere existence of a pending_imports row — is the
@@ -485,17 +617,26 @@ async function stageJobOutput(
     inserted += chunk.length;
     for (const s of chunk) byKind[s.kind] += 1;
     await maybeTouchClaim(env, job.jobId, heartbeat);
+    // #402: stop staging further chunks once the job has gone terminal
+    // out from under us. cancel.aborted below gates the staged_at UPDATE, so
+    // an aborted stage never gets marked complete — a resumed pass restages
+    // from scratch rather than treating a partial set as the full one.
+    if (await maybeCheckCancelled(env, job.jobId, cancel)) break;
   }
 
   // Mark staging complete only after the last chunk committed (also covers the
   // zero-row case — staging is then vacuously complete). Any throw above leaves
   // staged_at NULL; importJobOutput's caller leaves output_json NULL on throw,
-  // so the next poll re-enters here and restages cleanly.
-  await env.DB.prepare(
-    `UPDATE pipeline_jobs SET staged_at = unixepoch() WHERE job_id = ?1`,
-  )
-    .bind(job.jobId)
-    .run();
+  // so the next poll re-enters here and restages cleanly. Same reasoning now
+  // covers an abort: staging is incomplete, so it must not be marked complete
+  // (#402).
+  if (!cancel.aborted) {
+    await env.DB.prepare(
+      `UPDATE pipeline_jobs SET staged_at = unixepoch() WHERE job_id = ?1`,
+    )
+      .bind(job.jobId)
+      .run();
+  }
 
   return { inserted, byKind, skipped };
 }
@@ -539,6 +680,7 @@ async function applyJobOutput(
   env: Env,
   job: ImportContext,
   heartbeat: ClaimHeartbeat,
+  cancel: CancelWatch,
 ): Promise<ApplyResult> {
   // Look up the pipeline-starter's user id — every audit and updated_by
   // write is attributed to them, matching the contract that says the run
@@ -582,6 +724,18 @@ async function applyJobOutput(
   // Chapters that saw an actual write — populated at each mutation point below
   // and returned so the caller can hint open tabs once per changed chapter.
   const affected = new Set<number>();
+
+  // #402 checkpoint, placed immediately BEFORE the delete phase rather than
+  // inside it: deleteUnkeptTns's deletes are immediately followed by the
+  // inserts that replace what they deleted, so stopping BETWEEN delete chunks
+  // is the single worst outcome available here — notes gone, replacements
+  // never written. Once this checkpoint passes, the delete phase (and the
+  // sort_order/dedup setup that follows it) runs to completion; the next
+  // opportunity to stop is the top of the TN insert loop below.
+  if (await maybeCheckCancelled(env, job.jobId, cancel)) {
+    result.affectedChapters = [...affected].sort((a, b) => a - b);
+    return result;
+  }
 
   // TN delete phase: only fires when this job produced TN proposals AND
   // there are unkept TNs in scope. Idempotent — re-running finds none left.
@@ -646,6 +800,10 @@ async function applyJobOutput(
     // it first means every iteration heartbeats regardless of which path it
     // takes.
     await maybeTouchClaim(env, job.jobId, heartbeat);
+    // #402: stop before starting a new TN proposal once the job has gone
+    // terminal. Each proposal's insert/expand/skip below is its own atomic
+    // D1 batch, so breaking here never leaves a half-written proposal.
+    if (await maybeCheckCancelled(env, job.jobId, cancel)) break;
     // Hint expansion: if the AI's proposed id matches a queued hint stub in
     // this job's scope, UPDATE that row in place instead of minting a new
     // one. The hint's rowId round-trips through bp-assistant as the TSV ID
@@ -699,6 +857,9 @@ async function applyJobOutput(
   }
 
   for (const p of tqProposals) {
+    // #402: checked at the TOP, not the bottom — the bottom is after the
+    // write, which would let one more proposal land after detecting the abort.
+    if (await maybeCheckCancelled(env, job.jobId, cancel)) break;
     const k = verseKey(p);
     const sortOrder = (tqCounters.get(k) ?? 0) + 100;
     tqCounters.set(k, sortOrder);
@@ -719,6 +880,8 @@ async function applyJobOutput(
       : new Map<number, SourceWord[]>();
 
   for (const p of verseProposals) {
+    // #402: same top-of-loop placement as the TQ loop above.
+    if (await maybeCheckCancelled(env, job.jobId, cancel)) break;
     await applyVerseUpdate(env, p, userId, uhbWordsByVerse);
     affected.add(p.chapter);
     result.verseUpdated += 1;

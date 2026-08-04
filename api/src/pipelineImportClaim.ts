@@ -112,3 +112,53 @@ export function shouldTouchClaim(
 ): boolean {
   return now - lastTouchedAt >= intervalSeconds;
 }
+
+// States an apply is legitimately still running under. Anything else means the
+// job has left the "an apply may be in flight" window — a human force-stop, a
+// cron-issued cancel, or the no-progress sentinel in pollAllNonTerminal that
+// flips state='failed', error_kind='interrupted' via a WHERE clause that knows
+// nothing about an in-flight apply. That sentinel is the pre-existing proof
+// this gap was real: it can fire while importJobOutput is mid-apply, and until
+// #402 the apply had no cancellation point and simply ran to completion
+// regardless (see the RESIDUAL GAP comment this closes in pipelines.ts).
+export const APPLY_LIVE_STATES = [
+  "queued",
+  "dispatching",
+  "running",
+  "paused_for_outage",
+  "paused_for_usage_limit",
+] as const;
+
+// True when the job has left every state under which an apply is legitimate,
+// i.e. the apply must stop at its next checkpoint.
+//
+// A null/undefined/empty state ALWAYS returns false. This mirrors the
+// soft-fallback reasoning already used elsewhere in this module (see
+// importJobOutput's ownedClaimedAt fallback comment): a failed or missing read
+// of `state` is not evidence the job went terminal, and treating it as such
+// would abort a perfectly healthy in-flight apply on a transient read glitch.
+// Only a real, non-empty, non-live state value aborts.
+export function shouldAbortApply(state: string | null | undefined): boolean {
+  if (state == null || state === "") return false;
+  return !(APPLY_LIVE_STATES as readonly string[]).includes(state);
+}
+
+// How often the apply loops re-check pipeline_jobs.state/error_kind for a
+// terminal transition mid-flight. Deliberately shorter than
+// CLAIM_TOUCH_INTERVAL_SECONDS (60s): this is a responsiveness bound on how
+// long an apply keeps writing after a human force-stops it, not a lease-
+// staleness window — a translator watching the UI expects a stop to actually
+// stop within a few seconds, not a minute. It's also cheap to check often: one
+// SELECT, not a write, so there's no reason to tie it to the heartbeat's
+// interval.
+export const CANCEL_CHECK_INTERVAL_SECONDS = 15;
+
+// Pure rate-limit predicate for the cancellation check, same shape as
+// shouldTouchClaim.
+export function shouldCheckCancel(
+  lastCheckedAt: number,
+  now: number,
+  intervalSeconds: number = CANCEL_CHECK_INTERVAL_SECONDS,
+): boolean {
+  return now - lastCheckedAt >= intervalSeconds;
+}

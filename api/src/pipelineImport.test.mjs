@@ -16,8 +16,17 @@ import {
   tnSweepScope,
   shouldTouchClaim,
   CLAIM_TOUCH_INTERVAL_SECONDS,
+  shouldAbortApply,
+  APPLY_LIVE_STATES,
+  shouldCheckCancel,
+  CANCEL_CHECK_INTERVAL_SECONDS,
 } from "./pipelineImportClaim.ts";
-import { deleteUnkeptTns, importJobOutput, maybeTouchClaim } from "./pipelineImport.ts";
+import {
+  deleteUnkeptTns,
+  importJobOutput,
+  maybeTouchClaim,
+  maybeCheckCancelled,
+} from "./pipelineImport.ts";
 
 function assert(cond, msg) {
   if (!cond) {
@@ -650,5 +659,380 @@ await (async () => {
     "error-path release: binds the job id AND the exact claim value this pass owned (from RETURNING)",
   );
 })();
+
+// ── #402: mid-apply cancellation ─────────────────────────────────────────
+// A terminal transition (force-stop, cancel, or the no-progress 'interrupted'
+// sentinel) landing WHILE importJobOutput is mid-apply used to have no
+// cancellation point at all — the apply just ran to completion regardless.
+// These tests cover the pure predicate (shouldAbortApply), the rate-limited
+// checker (maybeCheckCancelled), and the real end-to-end apply loop stopping
+// at a batch boundary with keep-and-record semantics.
+
+// --- shouldAbortApply: every live state is NOT an abort signal ---
+for (const s of APPLY_LIVE_STATES) {
+  assert(!shouldAbortApply(s), `shouldAbortApply(${JSON.stringify(s)}) -> false (still a live apply state)`);
+}
+
+// --- shouldAbortApply: real terminal states ARE an abort signal ---
+for (const s of ["failed", "cancelled", "done"]) {
+  assert(shouldAbortApply(s), `shouldAbortApply(${JSON.stringify(s)}) -> true (terminal — apply must stop)`);
+}
+
+// --- shouldAbortApply: the load-bearing invariant — a failed/missing read
+//     must NEVER be mistaken for "abort". Getting this backwards would abort
+//     a perfectly healthy in-flight apply on a transient read glitch. ---
+assert(
+  shouldAbortApply(null) === false,
+  "shouldAbortApply(null) -> false — a failed/missing state read must NOT be treated as an abort signal",
+);
+assert(
+  shouldAbortApply(undefined) === false,
+  "shouldAbortApply(undefined) -> false — same invariant as null",
+);
+assert(
+  shouldAbortApply("") === false,
+  "shouldAbortApply('') -> false — same invariant as null/undefined",
+);
+
+// ── shouldCheckCancel: rate limit, mirroring shouldTouchClaim's tests ────
+assert(
+  !shouldCheckCancel(NOW, NOW + CANCEL_CHECK_INTERVAL_SECONDS - 1),
+  "shouldCheckCancel: below the interval → false",
+);
+assert(
+  shouldCheckCancel(NOW, NOW + CANCEL_CHECK_INTERVAL_SECONDS),
+  "shouldCheckCancel: exactly at the interval → true",
+);
+assert(
+  shouldCheckCancel(NOW, NOW + CANCEL_CHECK_INTERVAL_SECONDS + 1),
+  "shouldCheckCancel: after the interval → true",
+);
+assert(
+  CANCEL_CHECK_INTERVAL_SECONDS < CLAIM_TOUCH_INTERVAL_SECONDS,
+  `cancel check interval (${CANCEL_CHECK_INTERVAL_SECONDS}s) must be tighter than the heartbeat interval ` +
+    `(${CLAIM_TOUCH_INTERVAL_SECONDS}s) — this is a responsiveness bound on how long an apply keeps writing ` +
+    "after a human force-stops it, not a lease-staleness window",
+);
+
+// ── maybeCheckCancelled: direct fake-DB harness ──────────────────────────
+// Drives the real maybeCheckCancelled against a fake pipeline_jobs SELECT that
+// answers with a queue of rows (or a missing row when the queue is empty).
+function fakeCancelDb(rowsQueue) {
+  const calls = [];
+  const queue = [...rowsQueue];
+  return {
+    calls,
+    env: {
+      DB: {
+        prepare(sql) {
+          return {
+            bind(...args) {
+              calls.push({ sql, args });
+              return {
+                async first() {
+                  return queue.length > 0 ? queue.shift() : null;
+                },
+              };
+            },
+          };
+        },
+      },
+    },
+  };
+}
+
+// --- (a) does NOT read when inside the check interval ---
+await (async () => {
+  const { calls, env } = fakeCancelDb([{ state: "running", error_kind: null }]);
+  const cw = {
+    lastCheckedAt: Math.floor(Date.now() / 1000),
+    aborted: false,
+    abortState: null,
+    abortErrorKind: null,
+  };
+  const result = await maybeCheckCancelled(env, "job-cancel-a", cw);
+  assert(result === false, "maybeCheckCancelled: false when not yet aborted and inside the check interval");
+  assert(calls.length === 0, "maybeCheckCancelled: no DB read issued while inside the check interval");
+})();
+
+// --- (b) aborts on a failed/force_stopped row, (c) short-circuits after ---
+await (async () => {
+  const { calls, env } = fakeCancelDb([{ state: "failed", error_kind: "force_stopped" }]);
+  const cw = { lastCheckedAt: 0, aborted: false, abortState: null, abortErrorKind: null };
+  const originalConsoleError = console.error;
+  console.error = () => {};
+  let result;
+  try {
+    result = await maybeCheckCancelled(env, "job-cancel-b", cw);
+  } finally {
+    console.error = originalConsoleError;
+  }
+  assert(result === true, "maybeCheckCancelled: true on a terminal (failed/force_stopped) row");
+  assert(calls.length === 1, "maybeCheckCancelled: exactly one SELECT issued when due");
+  assert(cw.aborted === true, "maybeCheckCancelled: cw.aborted set on a terminal row");
+  assert(cw.abortState === "failed", "maybeCheckCancelled: cw.abortState captured from the row");
+  assert(cw.abortErrorKind === "force_stopped", "maybeCheckCancelled: cw.abortErrorKind captured from the row");
+
+  // (c) once aborted, later calls return true WITHOUT re-reading — even if
+  // the rate limit would otherwise allow another read.
+  cw.lastCheckedAt = 0;
+  const result2 = await maybeCheckCancelled(env, "job-cancel-b", cw);
+  assert(result2 === true, "maybeCheckCancelled: still true once already aborted");
+  assert(calls.length === 1, "maybeCheckCancelled: no additional DB read once aborted (no re-check needed)");
+})();
+
+// --- (d) a missing pipeline_jobs row does not abort ---
+await (async () => {
+  const { env } = fakeCancelDb([]); // empty queue → first() returns null
+  const cw = { lastCheckedAt: 0, aborted: false, abortState: null, abortErrorKind: null };
+  const result = await maybeCheckCancelled(env, "job-cancel-d", cw);
+  assert(result === false, "maybeCheckCancelled: a missing pipeline_jobs row does not abort");
+  assert(cw.aborted === false, "maybeCheckCancelled: cw.aborted stays false on a missing row");
+})();
+
+// ── End-to-end: importJobOutput stops an in-flight apply at a batch
+//    boundary, keep-and-record (#402) ────────────────────────────────────
+//
+// Drives the REAL importJobOutput → stageJobOutput/applyJobOutput against a
+// fake env.DB that: (1) reports the job as already-staged (so staging
+// short-circuits and the test exercises the apply loop's checkpoints), (2)
+// hands back 3 unresolved TN proposals, (3) flips pipeline_jobs.state to
+// 'failed'/'force_stopped' after the Nth proposal's pending_imports accept
+// commits (or never, for the not-over-eager test).
+//
+// maybeCheckCancelled/maybeTouchClaim are both rate-limited against the real
+// wall clock (Date.now()), so the test mocks Date.now() to advance by 16s on
+// every call — comfortably past both CANCEL_CHECK_INTERVAL_SECONDS (15s) and
+// CLAIM_TOUCH_INTERVAL_SECONDS (60s after a few calls) — so every checkpoint
+// in the loop actually reads instead of being rate-limited away within the
+// same real-world millisecond the test runs in.
+async function withMockedClock(fn) {
+  const originalNow = Date.now;
+  let t = 1_700_000_000_000;
+  Date.now = () => {
+    t += 16_000;
+    return t;
+  };
+  try {
+    return await fn();
+  } finally {
+    Date.now = originalNow;
+  }
+}
+
+function buildFakeAbortDb(flipAfterProposals) {
+  const calls = [];
+  const batches = [];
+  const pipelineState = { state: "running", errorKind: null };
+  const dbState = { claimedAt: 1000 };
+  let appliedProposalCount = 0;
+  let tnInsertCount = 0;
+  const abortSummaryCalls = [];
+  const releaseCalls = [];
+
+  const unresolvedProposals = [
+    { id: 1, kind: "tn", book: "GEN", chapter: 1, verse: 1, bible_version: null, payload_json: "{}" },
+    { id: 2, kind: "tn", book: "GEN", chapter: 1, verse: 2, bible_version: null, payload_json: "{}" },
+    { id: 3, kind: "tn", book: "GEN", chapter: 1, verse: 3, bible_version: null, payload_json: "{}" },
+  ];
+
+  function dispatch(sql, args) {
+    if (/UPDATE pipeline_jobs SET import_claimed_at = unixepoch\(\)/.test(sql) && /IS NULL OR/.test(sql)) {
+      // Initial single-applier claim.
+      return {
+        changes: 1,
+        rows: [{ import_claimed_at: dbState.claimedAt }],
+        single: { import_claimed_at: dbState.claimedAt },
+      };
+    }
+    if (/UPDATE pipeline_jobs SET import_claimed_at = unixepoch\(\)/.test(sql) && /import_claimed_at\s*=\s*\?2/.test(sql)) {
+      // Heartbeat CAS re-stamp.
+      const expected = args[1];
+      if (dbState.claimedAt !== expected) return { changes: 0, rows: [], single: null };
+      dbState.claimedAt += 1;
+      return {
+        changes: 1,
+        rows: [{ import_claimed_at: dbState.claimedAt }],
+        single: { import_claimed_at: dbState.claimedAt },
+      };
+    }
+    if (/SELECT staged_at FROM pipeline_jobs/.test(sql)) {
+      // Already staged — stageJobOutput short-circuits so the test exercises
+      // the apply loop's checkpoints specifically.
+      return { changes: 0, rows: [], single: { staged_at: 999999 } };
+    }
+    if (/SELECT state, error_kind FROM pipeline_jobs/.test(sql)) {
+      return {
+        changes: 0,
+        rows: [],
+        single: { state: pipelineState.state, error_kind: pipelineState.errorKind },
+      };
+    }
+    if (/SELECT user_id FROM pipeline_jobs/.test(sql)) {
+      return { changes: 0, rows: [], single: { user_id: 1 } };
+    }
+    if (/ORDER BY kind, chapter, verse, id/.test(sql)) {
+      return { changes: 0, rows: unresolvedProposals, single: null };
+    }
+    if (/SELECT DISTINCT chapter, verse FROM pending_imports/.test(sql)) {
+      return { changes: 0, rows: [], single: null }; // no accepted TN proposals yet
+    }
+    if (/SELECT id, version FROM tn_rows t/.test(sql)) {
+      return { changes: 0, rows: [], single: null }; // nothing live to sweep
+    }
+    if (/MAX\(sort_order\)/.test(sql)) {
+      return { changes: 0, rows: [], single: null };
+    }
+    if (/occurrence, support_reference, quote, note/.test(sql)) {
+      return { changes: 0, rows: [], single: null }; // content-dedup claim set: empty
+    }
+    if (/INSERT INTO tn_rows/.test(sql)) {
+      tnInsertCount += 1;
+      return { changes: 1, rows: [], single: null };
+    }
+    if (/INSERT INTO edit_log/.test(sql)) {
+      return { changes: 1, rows: [], single: null };
+    }
+    if (/SET accepted_at = unixepoch\(\), accepted_by = \?2/.test(sql) && !sql.includes("EXISTS")) {
+      appliedProposalCount += 1;
+      if (flipAfterProposals != null && appliedProposalCount === flipAfterProposals) {
+        pipelineState.state = "failed";
+        pipelineState.errorKind = "force_stopped";
+      }
+      return { changes: 1, rows: [], single: null };
+    }
+    if (/UPDATE pipeline_jobs SET import_aborted_at/.test(sql)) {
+      abortSummaryCalls.push({ sql, args });
+      return { changes: 1, rows: [], single: null };
+    }
+    if (/UPDATE pipeline_jobs SET import_claimed_at = NULL/.test(sql)) {
+      releaseCalls.push({ sql, args });
+      return { changes: 1, rows: [], single: null };
+    }
+    throw new Error(`fakeAbortDb: unhandled SQL: ${sql}`);
+  }
+
+  const env = {
+    DB: {
+      prepare(sql) {
+        return {
+          bind(...args) {
+            calls.push({ sql, args });
+            return {
+              sql,
+              args,
+              async run() {
+                const res = dispatch(sql, args);
+                return { meta: { changes: res.changes }, results: res.rows };
+              },
+              async first() {
+                return dispatch(sql, args).single;
+              },
+              async all() {
+                return { results: dispatch(sql, args).rows };
+              },
+            };
+          },
+        };
+      },
+      async batch(stmts) {
+        const results = [];
+        const batchSqls = [];
+        for (const s of stmts) {
+          const res = dispatch(s.sql, s.args);
+          batchSqls.push({ sql: s.sql, args: s.args });
+          results.push({ meta: { changes: res.changes }, results: res.rows });
+        }
+        batches.push(batchSqls);
+        return results;
+      },
+    },
+  };
+
+  return {
+    env,
+    calls,
+    batches,
+    abortSummaryCalls,
+    releaseCalls,
+    get tnInsertCount() {
+      return tnInsertCount;
+    },
+  };
+}
+
+// --- The mid-flight abort test: state flips to failed/force_stopped right
+//     after the FIRST proposal's accept commits. ---
+await withMockedClock(async () => {
+  const { env, batches, abortSummaryCalls } = buildFakeAbortDb(1);
+  const originalConsoleError = console.error;
+  console.error = () => {};
+  let result;
+  try {
+    result = await importJobOutput(
+      env,
+      { jobId: "job-abort", pipelineType: "notes", book: "GEN", startChapter: 1, endChapter: 1 },
+      [],
+    );
+  } finally {
+    console.error = originalConsoleError;
+  }
+
+  const tnInsertBatches = batches.filter((b) => b.some((s) => /INSERT INTO tn_rows/.test(s.sql)));
+
+  // (1) the apply stopped early — strictly fewer per-proposal write batches
+  //     than proposals (3 proposals were staged; only 1 should have applied).
+  assert(
+    tnInsertBatches.length < 3,
+    `mid-flight abort: fewer per-proposal batches than proposals (got ${tnInsertBatches.length} of 3)`,
+  );
+  assert(
+    tnInsertBatches.length === 1,
+    `mid-flight abort: exactly 1 proposal applied before the abort was detected (got ${tnInsertBatches.length})`,
+  );
+
+  // (2) result.aborted with state/errorKind populated.
+  assert(result.aborted === true, "mid-flight abort: result.aborted is true");
+  assert(result.abortState === "failed", "mid-flight abort: result.abortState captured");
+  assert(result.abortErrorKind === "force_stopped", "mid-flight abort: result.abortErrorKind captured");
+
+  // (3) the import_aborted_at UPDATE was issued, CAS'd on the owned claim.
+  assert(abortSummaryCalls.length === 1, "mid-flight abort: exactly one import_aborted_at UPDATE issued");
+  assert(
+    /AND import_claimed_at\s*=\s*\?3/.test(abortSummaryCalls[0].sql),
+    "mid-flight abort: import_aborted_at UPDATE is CAS'd on the owned claim (AND import_claimed_at = ?3)",
+  );
+
+  // (4) no half-written proposal: every batch that inserted a tn_rows row also
+  //     carries that proposal's pending_imports accept, in the SAME batch.
+  for (const b of tnInsertBatches) {
+    const hasAccept = b.some(
+      (s) => /SET accepted_at = unixepoch\(\), accepted_by = \?2/.test(s.sql) && !s.sql.includes("EXISTS"),
+    );
+    assert(hasAccept, "mid-flight abort: the applied proposal's batch also carries its pending_imports accept");
+  }
+});
+
+// --- The not-over-eager test: the job stays 'running' throughout — the
+//     apply must NOT abort and must apply every proposal. ---
+await withMockedClock(async () => {
+  const { env, batches } = buildFakeAbortDb(null); // never flips
+  const result = await importJobOutput(
+    env,
+    { jobId: "job-not-aborted", pipelineType: "notes", book: "GEN", startChapter: 1, endChapter: 1 },
+    [],
+  );
+
+  const tnInsertBatches = batches.filter((b) => b.some((s) => /INSERT INTO tn_rows/.test(s.sql)));
+  assert(!result.aborted, "not-over-eager: result.aborted is falsy when the job stays running throughout");
+  assert(
+    tnInsertBatches.length === 3,
+    `not-over-eager: all 3 proposals applied when the job never goes terminal (got ${tnInsertBatches.length})`,
+  );
+  const abortUpdateIssued = batches.some((b) =>
+    b.some((s) => /UPDATE pipeline_jobs SET import_aborted_at/.test(s.sql)),
+  );
+  assert(!abortUpdateIssued, "not-over-eager: no import_aborted_at UPDATE issued");
+});
 
 console.log("pipelineImport (claim guard): all assertions passed");

@@ -864,10 +864,13 @@ export async function pollPipelineJob(
   // to prevent it. Narrow but real — this is exactly the window a merge review
   // flagged as High severity.
   //
-  // RESIDUAL GAP, deliberately not closed here: a force-stop landing *during*
-  // importJobOutput still applies, because the apply has no cancellation point.
-  // Closing that means threading a check through the apply loop; out of scope
-  // for #398 and called out in the PR.
+  // GAP CLOSED (#402): a force-stop (or any terminal transition) landing
+  // *during* importJobOutput now stops the apply at the next batch boundary —
+  // see maybeCheckCancelled / CancelWatch in pipelineImport.ts, threaded
+  // through the stage and apply loops. The re-read here remains worthwhile as
+  // the cheap fast path: it catches a stop that already landed BEFORE this
+  // point and skips starting an apply at all, which is strictly cheaper than
+  // starting one only to have it stop a few batches in.
   const liveState = await env.DB.prepare(
     `SELECT state, error_kind FROM pipeline_jobs WHERE job_id = ?1`,
   )
@@ -906,6 +909,22 @@ export async function pollPipelineJob(
         },
         data.output,
       );
+      if (importResult.aborted) {
+        // #402: the job went terminal (force-stop, cancel, or the no-progress
+        // 'interrupted' sentinel) while this apply was in flight, and the
+        // apply stopped at a batch boundary per the keep-and-record policy —
+        // everything already applied stays, nothing here rolls it back.
+        // Return the upstream status unchanged, same as claimLost below: do
+        // NOT finalize, broadcast, or enqueue the follow-up chain for a job
+        // that just went terminal mid-apply.
+        console.warn(`[pollPipelineJob] job=${job.job_id} import aborted mid-apply`, {
+          jobId: job.job_id,
+          abortState: importResult.abortState,
+          abortErrorKind: importResult.abortErrorKind,
+          affectedChapters: importResult.applied?.affectedChapters,
+        });
+        return { kind: "ok", text, status: upstream.status, state: data.state ?? "running" };
+      }
       if (importResult.claimLost) {
         // A concurrent poll (the other of cron / open-tab) owns this import and
         // may still be mid-apply. Do NOT fall through to the finalize+follow-up
@@ -1064,9 +1083,11 @@ export async function pollPipelineJob(
   // force-stop landing mid-apply must not have the poll that started it turn
   // around and broadcast the chapter as updated, enqueue the next stage of a
   // follow-up chain, or hand the freed slot to a new job on this job's
-  // behalf. (Full prevention of a mid-flight importJobOutput write itself —
-  // i.e. cancelling the apply once it has started — is out of scope here;
-  // this only stops what happens AFTER that write, once we reach this point.)
+  // behalf. (Mid-flight cancellation of an apply already in progress is
+  // handled separately — see maybeCheckCancelled / CancelWatch in
+  // pipelineImport.ts, #402 — which stops the apply itself at the next batch
+  // boundary. This guard only stops what happens AFTER a write that DID land,
+  // once we reach this point.)
   const pollWriteLanded = (guardedUpdate.meta?.changes ?? 0) > 0;
   if (!pollWriteLanded) {
     console.warn(
