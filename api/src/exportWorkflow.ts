@@ -1340,32 +1340,11 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     const source = `export_align_shrink:${book}:${resource}`;
     const label = `${book} ${resource.toUpperCase()}`;
     const provenance = await this.readOffenderProvenance(book, resource, offenders);
-    // classifyAlignmentShrinkOffenders (export.ts) splits offenders into three
-    // cases that must NOT share generic "lost alignment, re-align it" wording:
-    //
-    //   "none" — no offenders at all. Reached via checkUsfmAlignmentShrink's
-    //   `master_unreadable` path: a DCS fetch failure, not any translator
-    //   mistake. The old generic wording read as "0 verse(s) lost \zaln word
-    //   alignment on text that is UNCHANGED (master_unreadable) ... Re-align
-    //   the affected verse(s)" — describing a network failure as an
-    //   alignment bug and pointing at the wrong remedy entirely.
-    //
-    //   "sentinel" — the synthetic `ref: "*"` offender usfmAlignmentShrinkRefused
-    //   emits for an unparseable or empty RENDER (our own rendering bug, not
-    //   a translator's), which the old wording also reported as collateral
-    //   de-alignment needing re-alignment.
-    //
-    //   "genuine" — real per-verse offenders. A changed word SEQUENCE used to
-    //   be reported, on its own, as proof that D1 and master hold different
-    //   REVISIONS ("not a translator's mistake ... re-sync, NOT re-align").
-    //   That asserted a cause we never measured: a translator editing a verse
-    //   changes the sequence too, and an edit PLUS collateral de-alignment is
-    //   exactly the 1CH 4:21 / NUM 24 incident this guard exists to catch — so
-    //   the old wording told Benjamin to go fix the sync for a verse that
-    //   genuinely needed re-aligning. buildAlignmentShrinkAlertMessage now
-    //   splits that group by a measured signal instead: who last wrote the
-    //   verse in D1, per the `kind='verse'` edit_log. None of this changes the
-    //   refusal decision above, only what the alert says.
+    // Every case that must NOT share generic "lost alignment, re-align it"
+    // wording — fetch failure, our own broken render, collateral de-alignment,
+    // out-of-sync D1 — is enumerated once, with its rationale, above
+    // buildAlignmentShrinkAlertMessage in export.ts. None of it changes the
+    // refusal decision above, only what the alert says.
     const message = buildAlignmentShrinkAlertMessage({
       label,
       book,
@@ -1389,28 +1368,37 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     offenders: AlignmentShrinkResult["offenders"],
   ): Promise<Map<string, OffenderProvenance>> {
     const out = new Map<string, OffenderProvenance>();
-    const refs = offenders.map((o) => o.ref).filter((ref) => /^\d+:\d+$/.test(ref));
+    // A verse-bridge offender's ref is `chapter:start-end` (verseAlignStats
+    // keeps the USFM verse key verbatim), but D1 keys the row by the START
+    // verse alone — so match the bridge and take its start rather than
+    // dropping every bridged verse into "unknown".
+    const refs = offenders.map((o) => o.ref).filter((ref) => /^\d+:\d+(-\d+)?$/.test(ref));
     if (refs.length === 0) return out;
-    // Cap the IN list so a book-wide de-alignment can't build a huge statement;
-    // the alert only names the first handful of offenders anyway.
-    const capped = refs.slice(0, 25);
+    // Cap the IN list so a book-wide de-alignment can't build a huge statement.
+    // Offenders past the cap are marked `not_checked`, NOT `unknown`: we never
+    // looked, and an alert must not turn our own cap into a finding.
+    const LOOKUP_CAP = 25;
     const version = resource.toUpperCase();
-    const byRowKey = new Map(capped.map((ref) => {
+    for (const ref of refs.slice(LOOKUP_CAP)) out.set(ref, "not_checked");
+    const byRowKey = new Map(refs.slice(0, LOOKUP_CAP).map((ref) => {
       const [ch, v] = ref.split(":");
-      return [`${book}/${ch}/${v}/${version}`, ref];
+      return [`${book}/${ch}/${v.split("-")[0]}/${version}`, ref];
     }));
     const keys = [...byRowKey.keys()];
-    const placeholders = keys.map((_, i) => `?${i + 1}`).join(", ");
+    // One pass: GROUP BY picks each verse's latest create/update id, and the
+    // outer query reads only those rows. (A correlated MAX(id) subquery
+    // re-probed per matching row, so a long-lived verse paid history-length ×
+    // cap row reads.) `book` is bound so edit_log_row_by_book applies.
+    const placeholders = keys.map((_, i) => `?${i + 2}`).join(", ");
     try {
       const rs = await this.env.DB.prepare(
         `SELECT row_key, source, user_id FROM edit_log
-          WHERE kind = 'verse' AND row_key IN (${placeholders})
-            AND action IN ('create', 'update')
-            AND id = (SELECT MAX(id) FROM edit_log e2
-                       WHERE e2.kind = 'verse' AND e2.row_key = edit_log.row_key
-                         AND e2.action IN ('create', 'update'))`,
+          WHERE id IN (SELECT MAX(id) FROM edit_log
+                        WHERE kind = 'verse' AND (book = ?1 OR book IS NULL) AND row_key IN (${placeholders})
+                          AND action IN ('create', 'update')
+                        GROUP BY row_key)`,
       )
-        .bind(...keys)
+        .bind(book, ...keys)
         .all<{ row_key: string; source: string | null; user_id: number | null }>();
       for (const row of rs.results) {
         const ref = byRowKey.get(row.row_key);

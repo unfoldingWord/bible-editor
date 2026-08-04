@@ -1513,6 +1513,37 @@ function utf8Base64(s) {
     /out of sync \(the EZK 40 signature\)/.test(syncWritten) && /Re-sync EZK UST/.test(syncWritten),
     `sequence changed + edit_log says the SYNC last wrote it → EZK 40 signature, remedy is re-sync`,
   );
+  assert(
+    /coincidental surface matches/.test(syncWritten),
+    `the sync branch keeps the sentence explaining WHY the named words are noise`,
+  );
+
+  const aiWritten = buildAlignmentShrinkAlertMessage({
+    ...base,
+    offenders: [{ ref: "40:6", lostWords: ["steps"], sequenceUnchanged: false }],
+    provenance: new Map([["40:6", "ai_write"]]),
+  });
+  assert(
+    /AI pipeline last wrote them/.test(aiWritten) && /do not re-sync from master/.test(aiWritten),
+    `an AI-written verse is NOT the sync: D1 holds a revision master lacks, so re-syncing would discard it`,
+  );
+  assert(
+    !/the nightly DCS sync/.test(aiWritten),
+    `the AI bucket never claims the nightly sync wrote the verse`,
+  );
+
+  const notChecked = buildAlignmentShrinkAlertMessage({
+    ...base,
+    offenders: [
+      { ref: "40:6", lostWords: ["steps"], sequenceUnchanged: false },
+      { ref: "41:2", lostWords: ["wall"], sequenceUnchanged: false },
+    ],
+    provenance: new Map([["40:6", "human_edit"], ["41:2", "not_checked"]]),
+  });
+  assert(
+    /NOT looked up/.test(notChecked) && !/does not say who last wrote/.test(notChecked),
+    `an offender past the lookup cap is reported as un-checked, never as a measured "unknown"`,
+  );
 
   const unknown = buildAlignmentShrinkAlertMessage({
     ...base,
@@ -1564,8 +1595,8 @@ function utf8Base64(s) {
     `source=dcs_reimport = the nightly sync wrote it`,
   );
   assert(
-    offenderProvenanceFromLog({ source: "ai_pipeline", user_id: 1 }) === "sync_write",
-    `source=ai_pipeline is likewise not a translator revision`,
+    offenderProvenanceFromLog({ source: "ai_pipeline", user_id: 1 }) === "ai_write",
+    `source=ai_pipeline gets its OWN bucket — it is not the sync, and master does not hold that revision`,
   );
   assert(offenderProvenanceFromLog(null) === "unknown", `no edit_log row at all → unknown, never guessed`);
   assert(

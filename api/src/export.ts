@@ -687,7 +687,11 @@ export function classifyAlignmentShrinkOffenders(
 // `latest_source` sub-select uses): a human edit in the editor logs no
 // `source`, the nightly DCS sync logs `dcs_reimport`, the AI pipeline logs
 // `ai_pipeline`.
-export type OffenderProvenance = "human_edit" | "sync_write" | "unknown";
+// `not_checked` is NOT a measurement: it marks an offender the caller never
+// looked up (past its IN-list cap). Reporting those as `unknown` would let our
+// own cap manufacture a finding — "edit_log does not say who wrote them" — of
+// exactly the kind this whole change exists to stop.
+export type OffenderProvenance = "human_edit" | "sync_write" | "ai_write" | "unknown" | "not_checked";
 
 export function offenderProvenanceFromLog(row: {
   source: string | null;
@@ -695,6 +699,12 @@ export function offenderProvenanceFromLog(row: {
 } | null | undefined): OffenderProvenance {
   if (!row) return "unknown";
   if (row.source == null || row.source === "") return row.user_id == null ? "unknown" : "human_edit";
+  // The AI pipeline is not the sync: D1 DOES hold a revision master lacks, so
+  // "re-sync from master" would discard the AI's work — and AI-written verses
+  // are the known home of real alignment corruption (U+FFFD in \zaln-s, MIC
+  // 6:10 orphan \zaln-e, maqqef fusion), the last place to advise against
+  // re-aligning. It gets its own bucket rather than borrowing the sync's.
+  if (row.source === "ai_pipeline") return "ai_write";
   return "sync_write";
 }
 
@@ -758,9 +768,13 @@ export function buildAlignmentShrinkAlertMessage(args: {
   }
 
   const { unchanged, changed } = classification;
-  const humanEdited = changed.filter((o) => provenance.get(o.ref) === "human_edit");
-  const syncWritten = changed.filter((o) => provenance.get(o.ref) === "sync_write");
-  const unknown = changed.filter((o) => (provenance.get(o.ref) ?? "unknown") === "unknown");
+  const bucket = (kind: OffenderProvenance) =>
+    changed.filter((o) => (provenance.get(o.ref) ?? "unknown") === kind);
+  const humanEdited = bucket("human_edit");
+  const syncWritten = bucket("sync_write");
+  const aiWritten = bucket("ai_write");
+  const unknown = bucket("unknown");
+  const notChecked = bucket("not_checked");
 
   const parts: string[] = [];
   if (unchanged.length > 0) {
@@ -782,8 +796,17 @@ export function buildAlignmentShrinkAlertMessage(args: {
     parts.push(
       `${syncWritten.length} verse(s) lost \\zaln word alignment on text that ALSO changed, but D1's ` +
         `edit_log says the nightly DCS sync — not a person — last wrote them, so D1 holds no translator ` +
-        `revision of them: D1 and master are out of sync (the EZK 40 signature) — ${describeOffenders(syncWritten)}. ` +
-        `Re-sync ${label} from master rather than re-aligning.`,
+        `revision of them: D1 and master are out of sync (the EZK 40 signature), and the named words are ` +
+        `coincidental surface matches between two different sentences rather than words anyone de-aligned — ` +
+        `${describeOffenders(syncWritten)}. Re-sync ${label} from master rather than re-aligning.`,
+    );
+  }
+  if (aiWritten.length > 0) {
+    parts.push(
+      `${aiWritten.length} verse(s) lost \\zaln word alignment on text that ALSO changed, and D1's edit_log ` +
+        `says the AI pipeline last wrote them — ${describeOffenders(aiWritten)}. D1 holds a revision master ` +
+        `does NOT, so do not re-sync from master (that would discard the AI's work). Inspect the AI output ` +
+        `for alignment damage and re-align, then re-export.`,
     );
   }
   if (unknown.length > 0) {
@@ -794,7 +817,14 @@ export function buildAlignmentShrinkAlertMessage(args: {
         `verse(s) and compare against master before choosing.`,
     );
   }
-  return `${head}${parts.join(" SEPARATELY, ")} (${detail})`;
+  if (notChecked.length > 0) {
+    parts.push(
+      `a further ${notChecked.length} verse(s) also lost \\zaln word alignment and were NOT looked up ` +
+        `(the provenance query is capped) — ${describeOffenders(notChecked, 3)}. Treat the causes above as ` +
+        `covering only the verses they name.`,
+    );
+  }
+  return `${head}${parts.join(" SEPARATELY, ")}`;
 }
 
 // ── USFM rebuilder ───────────────────────────────────────────────────────────
