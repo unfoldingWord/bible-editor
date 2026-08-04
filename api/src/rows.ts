@@ -562,7 +562,9 @@ rows.patch("/:kind/:id", requireEditor, async (c) => {
   // (NoteCard.flushPending) already blocks this with a confirm dialog, but any
   // other writer of a tn `note` PATCH — a future bug, a stale tab, a direct API
   // call — must not be allowed to overwrite a substantive note with "": that
-  // exports to DCS and fails whole-repo validation. Scoped strictly to the
+  // exports to DCS and PUBLISHES, because the validator raises a blank Note at
+  // severity="warning" and exits 0. Nothing downstream catches it, so this
+  // backstop is the last line of defense. Scoped strictly to the
   // non-empty→empty transition, so already-blank rows and legitimate deletes
   // (which go through the /trash route, not a note-blanking PATCH) are
   // untouched. 422 is a non-retryable client error the outbox drops with a
