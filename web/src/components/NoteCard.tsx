@@ -607,9 +607,10 @@ function NoteCardInner({
     pendingRef.current = {};
     if (Object.keys(patch).length === 0) return;
     // Refuse to silently persist a note whose substantive body was blanked.
-    // An empty note exports to DCS and fails whole-repo validation (blank rows
-    // rejected for en_tn), and blanking is almost always an accidental
-    // select-all+delete rather than an intent to erase — see NUM 22:10 v4→v5.
+    // An empty note exports to DCS and PUBLISHES — the validator warns on a
+    // blank Note but exits 0, so nothing downstream catches it — and blanking is
+    // almost always an accidental select-all+delete rather than an intent to
+    // erase. See NUM 22:10 v4→v5.
     // Surface it instead: the edit stays dirty (draft-backed, orange chip) and
     // the dialog routes the user to the correct action (delete the note, or
     // restore its text). We block the whole flush, not just the note field, so
@@ -1605,10 +1606,10 @@ function NoteCardInner({
         <DialogTitle>This note is empty</DialogTitle>
         <DialogContent>
           <DialogContentText>
-            The note text has been cleared. An empty note can't be saved — blank
-            notes are rejected when the repository is exported. Restore the text
-            and save again, or delete the note if you no longer need it. Your
-            edit is kept locally in the meantime.
+            The note text has been cleared. An empty note can't be saved — it
+            would publish to Door43 as a blank note, and nothing downstream
+            catches it. Restore the text and save again, or delete the note if
+            you no longer need it. Your edit is kept locally in the meantime.
           </DialogContentText>
         </DialogContent>
         <DialogActions>

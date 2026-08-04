@@ -157,8 +157,14 @@ function mergeAndNotify(jobId: string, next: PipelineJob) {
   jobs.set(jobId, next);
   let firedCompletion = false;
   // Toast on transitions to done/failed only. 'cancelled' is terminal too but
-  // user-initiated, so it gets no completion toast.
-  if (prev && prev.state !== next.state && (next.state === "done" || next.state === "failed")) {
+  // user-initiated, so it gets no completion toast. A force-stopped job is
+  // the same story wearing 'failed': the user just did this themselves via
+  // the force-stop dialog, so it shouldn't surface as a red error toast either.
+  if (
+    prev &&
+    prev.state !== next.state &&
+    (next.state === "done" || (next.state === "failed" && next.error_kind !== "force_stopped"))
+  ) {
     emitCompletion(next, prev.state);
     firedCompletion = true;
   }
@@ -464,6 +470,33 @@ export const pipelineStore = {
           detail: body?.message,
           pausedAgeSeconds: body?.pausedAgeSeconds,
         };
+      }
+      throw e;
+    }
+  },
+
+  // Force-stop a wedged running/dispatching job. Always re-polls afterwards —
+  // success moves it to 'failed' locally, and a 409/400 means the row didn't
+  // change, so either way the real server state is what should render, not an
+  // optimistic guess (same reasoning as resume()).
+  async forceFail(
+    jobId: string,
+    confirm: string,
+  ): Promise<{
+    ok: boolean;
+    /** Bare machine code: 'confirm_mismatch' | 'cannot_force_fail'. */
+    reason?: string;
+    state?: PipelineState;
+  }> {
+    try {
+      await api.pipelineForceFail(jobId, confirm);
+      await pollOne(jobId);
+      return { ok: true };
+    } catch (e) {
+      if (e instanceof ApiError && (e.status === 409 || e.status === 400)) {
+        const body = e.body as { error?: string; state?: PipelineState } | undefined;
+        await pollOne(jobId);
+        return { ok: false, reason: body?.error, state: body?.state };
       }
       throw e;
     }

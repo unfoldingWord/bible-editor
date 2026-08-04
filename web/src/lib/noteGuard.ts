@@ -4,10 +4,11 @@
 // diffs local state against the last-saved row and sends `note` whenever it
 // changed. Nothing stopped an empty value from winning that diff, so a stray
 // select-all+delete (or any keystroke that clears the field) followed by a
-// save would overwrite a substantive note with "". That "" then exports to
-// DCS and fails whole-repo validation — blank rows are rejected for
-// en_tn/en_tq/en_twl. See NUM 22:10 (tn id `iuqz`): a full v4 was blanked to
-// v5 seventeen seconds later.
+// save would overwrite a substantive note with "". That "" then exports to DCS
+// and PUBLISHES: the validator warns ("Note column cannot be blank" at
+// severity="warning") but exits 0, so nothing downstream stops it. That is why
+// this guard is the real protection — the loss is silent and permanent. See
+// NUM 22:10 (tn id `iuqz`): a full v4 was blanked to v5 seventeen seconds later.
 //
 // The check lives here as a pure function so it can be unit-tested and shared
 // by the client guard (NoteCard) and, in spirit, the API backstop.
@@ -15,7 +16,7 @@
 // A note body is "blank" for save/export purposes if — after converting the
 // TSV line-break escape (literal backslash-n, two chars) to a real newline —
 // it trims to nothing: empty, whitespace-only, or only line breaks. All of
-// those are rejected by DCS whole-repo validation.
+// those publish to Door43 as an empty Note column (DCS warns, does not block).
 export function isBlankNoteText(note: string | null | undefined): boolean {
   return (note ?? "").replace(/\\n/g, "\n").trim() === "";
 }

@@ -844,7 +844,8 @@ export type PipelineErrorKind =
   | "missing_output"
   | "stale_output"
   | "interrupted"
-  | "import_failed";
+  | "import_failed"
+  | "force_stopped";
 
 // Mirrors the bp-assistant contract (docs/ai-pipeline-integration.md §3).
 // Server validates with .strict(); unknown keys are rejected. Per-pipeline-type
@@ -1366,6 +1367,23 @@ export const api = {
     request<{ ok: boolean; jobId: string; state: "resumed" }>(
       `/api/pipelines/${encodeURIComponent(jobId)}/resume`,
       { method: "POST", body: JSON.stringify({ force }), signal },
+    ),
+
+  // Force-stop a wedged `running`/`dispatching` job — the escape hatch
+  // `pipelineCancel` deliberately doesn't cover (see issue #398). Requires the
+  // typed confirmation phrase the server derives from the job's own book +
+  // chapter range (`forceStopPhrase` in api/src/pipelines.ts). The dialog in
+  // PipelineStatusBar.tsx mirrors that formula client-side purely to display
+  // the phrase and gate its own confirm button — the two copies MUST change
+  // in lockstep, or the dialog will show the wrong phrase and the server will
+  // reject every attempt with confirm_mismatch. Server returns 400
+  // {error:"confirm_mismatch"} on a wrong phrase, 409
+  // {error:"cannot_force_fail", state} if the job left running/dispatching
+  // before this lands.
+  pipelineForceFail: (jobId: string, confirm: string, signal?: AbortSignal) =>
+    request<{ ok: boolean; jobId: string; state: "failed" }>(
+      `/api/pipelines/${encodeURIComponent(jobId)}/force-fail`,
+      { method: "POST", body: JSON.stringify({ confirm }), signal },
     ),
 
   // Acknowledge a "completed-while-away" toast so the server clears its
