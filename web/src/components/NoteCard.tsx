@@ -38,6 +38,7 @@ import AutoAwesomeIcon from "@mui/icons-material/AutoAwesome";
 import DescriptionOutlinedIcon from "@mui/icons-material/DescriptionOutlined";
 import ArrowDropDownIcon from "@mui/icons-material/ArrowDropDown";
 import type { TnRow } from "../sync/api";
+import { isReadOnly } from "../sync/api";
 import { useCatalogs } from "../hooks/useCatalogs";
 import { useNoteTemplates } from "../hooks/useNoteTemplates";
 import { CatalogPicker } from "./CatalogPicker";
@@ -695,13 +696,35 @@ function NoteCardInner({
   // teardown handler would need are not worth it for the rarer path. A stub
   // abandoned by navigating straight out of the chapter therefore still
   // persists — see the PR description.
+  //
   // Cards are keyed by row id in ResourceColumn (`<Fragment key={r.id}>`), so
   // React never reuses this instance for a different row and one ref per mount
   // is exactly one ref per row.
+  //
+  // wasActiveRef is load-bearing, not a micro-optimisation. `active` is
+  // `r.id === activeNoteId`, so it is false for EVERY card on first render —
+  // without this latch the trigger is "a blank stub mounted", not "the user
+  // abandoned one", and merely opening a chapter trashes every blank stub in
+  // it. Measured: with the latch removed, navigating to a chapter fired the
+  // trash request with no user action at all. The dangerous case is a stub
+  // another translator is typing into right now: their text lives only in
+  // their local state + their own IndexedDB draft, so the row really is blank
+  // in D1 and BLANK_STUB_CLAUSE cannot save it — a second viewer would bin the
+  // note mid-sentence. Only discard a card this user activated and then left.
+  // Written during render, like savedRef above.
+  const wasActiveRef = useRef(false);
+  if (active) wasActiveRef.current = true;
   const discardedRef = useRef(false);
   useEffect(() => {
     if (active) return;
+    if (!wasActiveRef.current) return;
     if (discardedRef.current) return;
+    // Don't fight a pipeline that is about to fill this row, and don't fire a
+    // write a viewer isn't allowed to make (that 403 would surface as an error
+    // toast for a delete the user never asked for). `readOnly` covers the
+    // chapter lock; isReadOnly() covers the viewer role, which api.trashNote
+    // does not check for itself the way the outbox does.
+    if (readOnly || isReadOnly()) return;
     // draftReadOk, not hydrated — see its declaration. A failed IndexedDB read
     // must not be read as "the card is empty".
     if (!isAbandonedBlankStub(row, { note, quote, supportRef, hydrated: draftReadOk })) return;

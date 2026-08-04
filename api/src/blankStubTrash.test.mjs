@@ -127,6 +127,65 @@ assert(!tryDiscard(db({ occurrence: 1 })), "occurrence present → refused");
 assert(!tryDiscard(db({ trashed_at: 1785000000 })), "already trashed → refused");
 assert(!tryDiscard(db({ deleted_at: 1785000000 })), "already tombstoned → refused");
 
+// ── SQLite TRIM() strips only spaces, JS .trim() strips more ──
+// Without the extra REPLACEs these read substantive to SQL but blank to the
+// client, so the discard would 409 forever and the stub would never go away.
+assert(tryDiscard(db({ note: "\t" })), "tab-only note → discarded (SQL TRIM alone would refuse)");
+assert(tryDiscard(db({ note: "\n" })), "real-newline-only note → discarded");
+assert(tryDiscard(db({ note: "\r\n" })), "CRLF-only note → discarded");
+assert(tryDiscard(db({ note: " " })), "NBSP-only note → discarded");
+assert(
+  tryDiscard(db({ note: " \t\\n\r\n  " })),
+  "mixed whitespace + TSV escape → discarded",
+);
+// Sanity: the extra REPLACEs must not swallow real content.
+assert(!tryDiscard(db({ note: "a\tb" })), "text containing a tab is still substantive → refused");
+assert(!tryDiscard(db({ note: "n" })), "a bare 'n' is not a stripped newline → refused");
+
+// ── the audit row must land with the trash, and only with it ──
+// A trashed row with no action='trash' edit_log entry is what the export
+// shrink-guard treats as an unexplained removal, which fails the nightly export
+// closed for that book+resource. And a refusal must not log a phantom trash.
+function auditRun(d, book = "JER") {
+  const now = 1785801457;
+  const res = d
+    .prepare(
+      `UPDATE tn_rows SET trashed_at = ?1, updated_at = ?2
+        WHERE id = ?3 AND deleted_at IS NULL AND book = ?4${BLANK_STUB_CLAUSE}`,
+    )
+    .run(now, now, "fa9t", book);
+  d.prepare(
+    `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action)
+     SELECT 'tn', ?1, book, ?2, version, version, ?3
+       FROM tn_rows
+      WHERE id = ?1 AND deleted_at IS NULL AND book = ?4 AND trashed_at = ?5`,
+  ).run("fa9t", 30, "trash", book, now);
+  const logged = d.prepare(`SELECT COUNT(*) c FROM edit_log WHERE row_key = 'fa9t'`).get().c;
+  return { applied: res.changes === 1, logged };
+}
+function dbWithLog(row) {
+  const d = db(row);
+  d.exec(`CREATE TABLE edit_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT, row_key TEXT, book TEXT,
+    user_id INTEGER, prev_version INTEGER, new_version INTEGER, action TEXT
+  )`);
+  return d;
+}
+{
+  const r = auditRun(dbWithLog({}));
+  assert(r.applied && r.logged === 1, "discard applied → exactly one audit row");
+}
+{
+  // Refused (already filled): no trash, and critically no phantom audit row.
+  const r = auditRun(dbWithLog({ note: "filled", version: 2 }));
+  assert(!r.applied && r.logged === 0, "discard refused → no trash AND no audit row");
+}
+{
+  // Refused because already trashed: the old timestamp must not match ?5.
+  const r = auditRun(dbWithLog({ trashed_at: 1700000000 }));
+  assert(!r.applied && r.logged === 0, "already trashed → no audit row (old timestamp ≠ now)");
+}
+
 // ── the clause must not match a different row or book ──
 {
   const d = db();

@@ -976,21 +976,38 @@ async function setTnTrashed(
     )
     .bind(id, userId ?? null, action, book);
 
-  // The guarded path can't share the batch: the batch runs sequentially, so by
-  // the time the audit INSERT's SELECT ran, the UPDATE would already have set
-  // trashed_at and the predicate's own `trashed_at IS NULL` clause would no
-  // longer hold. Run the UPDATE alone, and only log the audit row if it landed.
+  // The guarded path keeps the batch — it is an implicit transaction, so the
+  // trashed_at UPDATE and its audit row land together or not at all. A trashed
+  // row with no `action='trash'` edit_log entry is exactly the shape the export
+  // shrink-guard treats as an UNEXPLAINED removal, which fails the nightly
+  // export closed for that book+resource; splitting the two writes across
+  // separate awaits could produce it.
+  //
+  // What the batch can't do is skip the audit insert when the guarded UPDATE
+  // no-ops: both statements always run. So the audit SELECT is gated on
+  // `trashed_at = ?5` — the value the UPDATE just wrote. Statements run in
+  // order, so that matches only if the UPDATE actually applied, and never on a
+  // refusal (BLANK_STUB_CLAUSE requires trashed_at IS NULL going in, so a row
+  // that was already trashed carries some earlier timestamp).
   if (onlyIfBlankStub) {
-    const res = await env.DB
-      .prepare(
-        `UPDATE tn_rows
-           SET trashed_at = ?1, updated_at = ?2
-         WHERE id = ?3 AND deleted_at IS NULL${bookClause(4)}${BLANK_STUB_CLAUSE}`,
-      )
-      .bind(trashed ? now : null, now, id, book)
-      .run();
-    if (!res.meta.changes) return null;
-    await auditStmt.run();
+    const [guardedUpdate] = await env.DB.batch([
+      env.DB
+        .prepare(
+          `UPDATE tn_rows
+             SET trashed_at = ?1, updated_at = ?2
+           WHERE id = ?3 AND deleted_at IS NULL${bookClause(4)}${BLANK_STUB_CLAUSE}`,
+        )
+        .bind(now, now, id, book),
+      env.DB
+        .prepare(
+          `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action)
+           SELECT 'tn', ?1, book, ?2, version, version, ?3
+             FROM tn_rows
+            WHERE id = ?1 AND deleted_at IS NULL${bookClause(4)} AND trashed_at = ?5`,
+        )
+        .bind(id, userId ?? null, action, book, now),
+    ]);
+    if (!guardedUpdate.meta.changes) return null;
     return env.DB.prepare(`SELECT * FROM tn_rows WHERE id = ?1${bookClause(2)}`).bind(id, book).first<TnRow>();
   }
 
