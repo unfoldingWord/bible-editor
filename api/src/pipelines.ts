@@ -20,6 +20,7 @@ import { z } from "zod";
 import type { Env } from "./index";
 import { currentUserId, requireEditor } from "./auth.ts";
 import { importJobOutput } from "./pipelineImport.ts";
+import { IMPORT_CLAIM_STALE_SECONDS } from "./pipelineImportClaim.ts";
 import { resourcesLockedByJob } from "./chapterLock.ts";
 import { broadcastChapter } from "./wsEvents.ts";
 
@@ -910,8 +911,8 @@ export async function pollPipelineJob(
         data.output,
       );
       if (importResult.aborted) {
-        // #402: the job went terminal (force-stop, cancel, or the no-progress
-        // 'interrupted' sentinel) while this apply was in flight, and the
+        // #402: the job was deliberately stopped (force-stop or cancel, or
+        // another poll finalized it) while this apply was in flight, and the
         // apply stopped at a batch boundary per the keep-and-record policy —
         // everything already applied stays, nothing here rolls it back.
         // Return the upstream status unchanged, same as claimLost below: do
@@ -1260,6 +1261,20 @@ export async function pollAllNonTerminal(env: Env): Promise<void> {
   // pollAllNonTerminal non-throwing, which also protects the stale-lock and
   // edit_log sweeps that run after it in index.ts's POLL_CRON branch.
   try {
+    // Each sweep below excludes jobs with a LIVE import claim
+    // (import_claimed_at newer than IMPORT_CLAIM_STALE_SECONDS). A live,
+    // heartbeating import claim is positive evidence an apply is in flight
+    // right now — these sweeps exist to catch jobs where NOTHING is
+    // happening, and a DAN-11-scale apply (~12 minutes) outlives the */5 tick
+    // that runs this function, so without this exclusion a healthy, actively-
+    // progressing apply gets auto-failed out from under itself. That is also
+    // why shouldAbortApply (pipelineImportClaim.ts) deliberately does NOT
+    // treat error_kind='interrupted' as a stop signal: fixing the sentinel's
+    // blindness here is the right layer, and honouring it there would have
+    // permanently discarded a completed run's output. The stale
+    // window is the same one the claim mechanism itself uses for crash
+    // recovery, so a genuinely dead claim (the importer's Worker died with no
+    // further heartbeat) is still swept on schedule.
     await env.DB.prepare(
       `UPDATE pipeline_jobs
           SET state = 'failed',
@@ -1267,9 +1282,10 @@ export async function pollAllNonTerminal(env: Env): Promise<void> {
               error_message = 'auto-failed: no progress for 48h',
               updated_at = unixepoch()
         WHERE state IN ('running', 'paused_for_outage', 'paused_for_usage_limit')
-          AND updated_at < unixepoch() - ?1`,
+          AND updated_at < unixepoch() - ?1
+          AND (import_claimed_at IS NULL OR import_claimed_at < unixepoch() - ?2)`,
     )
-      .bind(STUCK_JOB_THRESHOLD_SECONDS)
+      .bind(STUCK_JOB_THRESHOLD_SECONDS, IMPORT_CLAIM_STALE_SECONDS)
       .run();
     // Auto-fail anything that has been polled more than MAX_POLL_ATTEMPTS times
     // without reaching a terminal state. Independent backstop from the time-
@@ -1281,9 +1297,10 @@ export async function pollAllNonTerminal(env: Env): Promise<void> {
               error_message = 'auto-failed: poll attempts exhausted',
               updated_at = unixepoch()
         WHERE state IN ('running', 'paused_for_outage', 'paused_for_usage_limit')
-          AND attempt_count > ?1`,
+          AND attempt_count > ?1
+          AND (import_claimed_at IS NULL OR import_claimed_at < unixepoch() - ?2)`,
     )
-      .bind(MAX_POLL_ATTEMPTS)
+      .bind(MAX_POLL_ATTEMPTS, IMPORT_CLAIM_STALE_SECONDS)
       .run();
     // Recover wedged dispatches so a dead-mid-POST Worker can't hold the slot
     // forever.
@@ -1294,9 +1311,10 @@ export async function pollAllNonTerminal(env: Env): Promise<void> {
               error_message = 'auto-failed: dispatch did not complete',
               updated_at = unixepoch()
         WHERE state = 'dispatching'
-          AND updated_at < unixepoch() - ?1`,
+          AND updated_at < unixepoch() - ?1
+          AND (import_claimed_at IS NULL OR import_claimed_at < unixepoch() - ?2)`,
     )
-      .bind(STUCK_DISPATCH_THRESHOLD_SECONDS)
+      .bind(STUCK_DISPATCH_THRESHOLD_SECONDS, IMPORT_CLAIM_STALE_SECONDS)
       .run();
   } catch (err) {
     console.error("[scheduled.pipelinePoll] backstop sweeps failed:", err);

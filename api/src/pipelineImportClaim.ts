@@ -113,34 +113,46 @@ export function shouldTouchClaim(
   return now - lastTouchedAt >= intervalSeconds;
 }
 
-// States an apply is legitimately still running under. Anything else means the
-// job has left the "an apply may be in flight" window — a human force-stop, a
-// cron-issued cancel, or the no-progress sentinel in pollAllNonTerminal that
-// flips state='failed', error_kind='interrupted' via a WHERE clause that knows
-// nothing about an in-flight apply. That sentinel is the pre-existing proof
-// this gap was real: it can fire while importJobOutput is mid-apply, and until
-// #402 the apply had no cancellation point and simply ran to completion
-// regardless (see the RESIDUAL GAP comment this closes in pipelines.ts).
-export const APPLY_LIVE_STATES = [
-  "queued",
-  "dispatching",
-  "running",
-  "paused_for_outage",
-  "paused_for_usage_limit",
-] as const;
-
-// True when the job has left every state under which an apply is legitimate,
-// i.e. the apply must stop at its next checkpoint.
+// True only when the job has been DELIBERATELY stopped — a human force-stop,
+// a user cancel, or another poll having already finalized this import — i.e.
+// the apply must stop at its next checkpoint.
 //
-// A null/undefined/empty state ALWAYS returns false. This mirrors the
-// soft-fallback reasoning already used elsewhere in this module (see
-// importJobOutput's ownedClaimedAt fallback comment): a failed or missing read
-// of `state` is not evidence the job went terminal, and treating it as such
-// would abort a perfectly healthy in-flight apply on a transient read glitch.
-// Only a real, non-empty, non-live state value aborts.
-export function shouldAbortApply(state: string | null | undefined): boolean {
+// This is deliberately narrower than "any non-live state". The original
+// version aborted on ANY state outside a fixed allowlist of "live" states,
+// which silently included state='failed', error_kind='interrupted' — the
+// blunt timer sentinel pollAllNonTerminal stamps on any job that hasn't
+// progressed in a while (48h no-progress, poll-attempt exhaustion, or a stuck
+// dispatch). That sentinel is KNOWN to fire on healthy, still-running jobs —
+// it is a timer, not a decision, and it knows nothing about an apply in
+// flight. Aborting on it would PERMANENTLY discard a completed AI run's
+// output: an aborted job is terminal, and nothing ever re-enters
+// importJobOutput for a terminal job (pollAllNonTerminal only selects
+// running/paused_*, the GET route short-circuits terminal jobs, and the
+// nightly cleanup drops unresolved pending_imports within 24h). Treating a
+// blind timer as a stop signal is strictly worse than the bug being fixed
+// here. The sentinel's blindness to in-flight applies is fixed at its own
+// source instead — pollAllNonTerminal (pipelines.ts) now excludes jobs with a
+// live import claim from all three of its backstop sweeps.
+//
+// `error_kind === "import_failed"` is likewise excluded even though state is
+// 'failed': that is THIS VERY IMPORT's own one-retry path (pollPipelineJob
+// holds state at 'running' on the first import failure, then marks
+// 'failed'/'import_failed' only after a second). Aborting on it would make
+// the retry impossible.
+//
+// A null/undefined/empty state (a failed or missing pipeline_jobs read)
+// ALWAYS returns false — a failed read is not evidence the job went
+// terminal, and treating it as such would abort a perfectly healthy
+// in-flight apply on a transient glitch.
+export function shouldAbortApply(
+  state: string | null | undefined,
+  errorKind: string | null | undefined,
+): boolean {
   if (state == null || state === "") return false;
-  return !(APPLY_LIVE_STATES as readonly string[]).includes(state);
+  if (state === "cancelled") return true;
+  if (state === "failed" && errorKind === "force_stopped") return true;
+  if (state === "done") return true;
+  return false;
 }
 
 // How often the apply loops re-check pipeline_jobs.state/error_kind for a

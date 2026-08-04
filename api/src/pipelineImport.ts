@@ -61,8 +61,8 @@ export interface ImportResult {
   // lost). The caller MUST NOT finalize the job on this result — the owning
   // poll writes output_json when it completes. See pollPipelineJob.
   claimLost?: boolean;
-  // True when a terminal transition (force stop, cancel, or the no-progress
-  // 'interrupted' sentinel) landed while this apply was in flight and the
+  // True when a deliberate stop (force stop or cancel, or another poll
+  // finalizing this import) landed while this apply was in flight and the
   // apply stopped at a batch boundary. Distinct from claimLost: no other
   // poll owns this import, the work simply must not continue. The caller
   // MUST NOT finalize, must not enqueue the follow-up chain, and must not
@@ -324,7 +324,7 @@ export async function importJobOutput(
         state: cancel.abortState,
         errorKind: cancel.abortErrorKind,
       });
-      await env.DB.batch([
+      const abortBatchRes = await env.DB.batch([
         env.DB
           .prepare(
             `UPDATE pipeline_jobs SET import_aborted_at = unixepoch(), import_abort_summary = ?2
@@ -337,6 +337,21 @@ export async function importJobOutput(
           )
           .bind(job.jobId, heartbeat.ownedClaimedAt),
       ]);
+      // The CAS above is correct to keep (see the comment above it) — but if
+      // the lease was already lost, both statements match zero rows and the
+      // abort would otherwise be recorded nowhere while this function still
+      // returns aborted: true. Surface that loudly rather than silently.
+      if ((abortBatchRes[0]?.meta?.changes ?? 0) === 0) {
+        console.error(
+          "pipeline apply: abort record not written — lease no longer owned by this pass",
+          {
+            jobId: job.jobId,
+            abortState: cancel.abortState,
+            abortErrorKind: cancel.abortErrorKind,
+            heartbeatLost: heartbeat.lost,
+          },
+        );
+      }
       return {
         ...stageResult,
         applied: applyResult,
@@ -531,7 +546,7 @@ export async function maybeCheckCancelled(
   // throws on a missing pipeline_jobs row elsewhere; this check simply no-ops
   // rather than inventing a second, weaker way to detect that case.
   if (!row) return false;
-  if (shouldAbortApply(row.state)) {
+  if (shouldAbortApply(row.state, row.error_kind)) {
     cw.aborted = true;
     cw.abortState = row.state;
     cw.abortErrorKind = row.error_kind ?? null;
@@ -731,7 +746,9 @@ async function applyJobOutput(
   // is the single worst outcome available here — notes gone, replacements
   // never written. Once this checkpoint passes, the delete phase (and the
   // sort_order/dedup setup that follows it) runs to completion; the next
-  // opportunity to stop is the top of the TN insert loop below.
+  // opportunity to stop is the top of the TN insert loop below, and even that
+  // one only takes effect if the delete phase destroyed nothing — see
+  // tnInsertsCancellable below.
   if (await maybeCheckCancelled(env, job.jobId, cancel)) {
     result.affectedChapters = [...affected].sort((a, b) => a - b);
     return result;
@@ -788,6 +805,19 @@ async function applyJobOutput(
   const tqCounters = new Map<number, number>();
   const verseKey = (p: PendingImportRow) => p.chapter * 100000 + p.verse;
 
+  // The TN delete phase and this insert loop are two halves of ONE replace: the
+  // deletes above soft-deleted live notes and these inserts write their
+  // replacements. Stopping between them leaves notes gone and replacements never
+  // written — the DAN 11 shape — and unlike a crash it is PERMANENT, because an
+  // aborted job is terminal and no later poll re-enters (pollAllNonTerminal
+  // selects only running/paused_*, the GET route short-circuits terminal jobs,
+  // and the nightly cleanup drops the unresolved pending_imports within 24h).
+  // So the TN inserts are cancellable ONLY when the delete phase destroyed
+  // nothing; once it has, this loop runs to completion no matter what. Deletes
+  // are the whole reason: without them, stopping early merely writes fewer new
+  // notes, which is keep-and-record working as intended.
+  const tnInsertsCancellable = result.tnDeleted === 0;
+
   for (const p of tnProposals) {
     // Heartbeat FIRST, before any per-proposal work or `continue` path. Both
     // the hint-expansion and content-dedup-skip branches below `continue`
@@ -801,9 +831,12 @@ async function applyJobOutput(
     // takes.
     await maybeTouchClaim(env, job.jobId, heartbeat);
     // #402: stop before starting a new TN proposal once the job has gone
-    // terminal. Each proposal's insert/expand/skip below is its own atomic
-    // D1 batch, so breaking here never leaves a half-written proposal.
-    if (await maybeCheckCancelled(env, job.jobId, cancel)) break;
+    // terminal — but ONLY when the delete phase above destroyed nothing (see
+    // tnInsertsCancellable). Each proposal's insert/expand/skip below is its
+    // own atomic D1 batch, so breaking here never leaves a half-written
+    // proposal, but it CAN leave a half-written replace if the delete phase
+    // already ran — which is why this checkpoint is gated.
+    if (tnInsertsCancellable && (await maybeCheckCancelled(env, job.jobId, cancel))) break;
     // Hint expansion: if the AI's proposed id matches a queued hint stub in
     // this job's scope, UPDATE that row in place instead of minting a new
     // one. The hint's rowId round-trips through bp-assistant as the TSV ID

@@ -1,7 +1,6 @@
 -- #402: cooperative cancellation for the AI-pipeline apply path.
 --
--- A terminal transition (a human force-stop, a cron-issued cancel, or the
--- no-progress 'interrupted' sentinel in pollAllNonTerminal) can land WHILE
+-- A deliberate stop (a human force-stop or a user cancel) can land WHILE
 -- importJobOutput is mid-apply. Before this, the apply had no cancellation
 -- point and ran to completion regardless. It now checks pipeline_jobs.state/
 -- error_kind at batch boundaries (see maybeCheckCancelled in

@@ -31,7 +31,8 @@
 // SQLite engine (see the `wrangler d1 execute --local` verification run
 // alongside this PR), not this stub.
 
-import { forceStopPhrase, forceFailJob, pollPipelineJob, dispatchNext } from "./pipelines.ts";
+import { forceStopPhrase, forceFailJob, pollPipelineJob, dispatchNext, pollAllNonTerminal } from "./pipelines.ts";
+import { IMPORT_CLAIM_STALE_SECONDS } from "./pipelineImportClaim.ts";
 
 let failed = 0;
 function assert(cond, msg) {
@@ -897,6 +898,73 @@ await (async () => {
 // attempt (see the file-header comment). Saying so here rather than faking
 // a fetch-shaped stub around a chunk of inline route code that was never
 // designed to be called directly.
+
+// ─── FIX 2b (#402): pollAllNonTerminal's backstop sweeps must exclude jobs
+// with a LIVE import claim ──────────────────────────────────────────────────
+// A live, heartbeating import claim (import_claimed_at fresher than
+// IMPORT_CLAIM_STALE_SECONDS) is positive evidence an apply is in flight
+// right now. Without excluding those jobs, a DAN-11-scale apply (~12
+// minutes) outlives the */5 tick this function runs on and gets auto-failed
+// by the very sweeps that exist to catch jobs where NOTHING is happening —
+// and per FIX 2a, shouldAbortApply no longer treats that auto-fail as a stop
+// signal, but the sweep itself must still not fire against a live apply.
+// This test drives the REAL pollAllNonTerminal against a fake D1 that
+// records every prepared SQL string and its bound args, generically no-oping
+// everything (so the SELECT-jobs / dispatchNext paths that follow the sweeps
+// don't need their own fixtures) — the assertions are purely about the three
+// sweep UPDATEs' generated SQL and bindings, same pattern as
+// pipelineImport.test.mjs's deleteUnkeptTns SQL-text tests.
+function fakeSweepEnv() {
+  const calls = [];
+  const env = {
+    BT_API_TOKEN: "tok",
+    DB: {
+      prepare(sql) {
+        return {
+          bind(...args) {
+            calls.push({ sql, args });
+            return {
+              run: async () => ({ meta: { changes: 0 } }),
+              first: async () => null,
+              all: async () => ({ results: [] }),
+            };
+          },
+          // A couple of pollAllNonTerminal/dispatchNext queries have no
+          // placeholders and call .first()/.all()/.run() directly on the
+          // prepared statement without an intervening .bind() — expose all
+          // three shapes at the top level too.
+          first: async () => null,
+          all: async () => ({ results: [] }),
+          run: async () => ({ meta: { changes: 0 } }),
+        };
+      },
+    },
+  };
+  return { env, calls };
+}
+
+await (async () => {
+  console.log("\n[FIX 2b: backstop sweeps exclude jobs with a live import claim]");
+  const { env, calls } = fakeSweepEnv();
+  await pollAllNonTerminal(env);
+
+  const sweepCalls = calls.filter((c) => /error_kind = 'interrupted'/.test(c.sql));
+  assert(
+    sweepCalls.length === 3,
+    `pollAllNonTerminal issues exactly 3 backstop sweep UPDATEs (got ${sweepCalls.length})`,
+  );
+  for (const c of sweepCalls) {
+    const label = c.sql.match(/error_message = '([^']+)'/)?.[1] ?? c.sql.slice(0, 40);
+    assert(
+      /AND\s*\(\s*import_claimed_at IS NULL OR import_claimed_at < unixepoch\(\)\s*-\s*\?\d+\s*\)/.test(c.sql),
+      `backstop sweep "${label}" excludes jobs with a live import claim (import_claimed_at IS NULL OR stale)`,
+    );
+    assert(
+      c.args.includes(IMPORT_CLAIM_STALE_SECONDS),
+      `backstop sweep "${label}" binds IMPORT_CLAIM_STALE_SECONDS as a parameter, not a hardcoded literal`,
+    );
+  }
+})();
 
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed`);
