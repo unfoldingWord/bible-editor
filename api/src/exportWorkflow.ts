@@ -1414,6 +1414,16 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     offenders: AlignmentShrinkResult["offenders"],
     provenance: Map<string, OffenderProvenance>,
   ): Promise<void> {
+    // An EMPTY offender list here never means "measured and clean" — the clean
+    // case is handled by clearAlignmentAttention on the `detail === "ok"` path.
+    // It means the guard failed without per-verse detail (master_unreadable:
+    // DCS wouldn't give us a readable master), so nothing was compared. Writing
+    // the snapshot anyway would DELETE yesterday's real findings and insert
+    // nothing, erasing known-broken verses on a night we learned nothing —
+    // the export blocks, but the sticky indicator would go quiet, which is
+    // exactly the "unmeasured outcome presented as evidence" failure this
+    // file's alert wording was already fixed for. Keep the prior evidence.
+    if (offenders.length === 0) return;
     try {
       const statements = [
         this.env.DB.prepare(`DELETE FROM alignment_attention WHERE book = ?1 AND resource = ?2`).bind(
