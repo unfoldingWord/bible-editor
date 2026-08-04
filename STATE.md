@@ -51,6 +51,35 @@ For the full corpus, see the memory index at
 `C:\Users\benja\.claude\projects\C--Users-benja-Documents-GitHub-bible-editor\memory\MEMORY.md`.
 Highlights that bite repeatedly:
 
+- **DCS's blank-required-field checks are WARNINGS, not errors — measure the validator
+  before gating on it.** All five (`validate_tn_files.py` "Note column cannot be blank",
+  `validate_tq_files.py` Question/Response, `validate_twl_files.py` OrigWords/TWLink) are
+  raised at `severity="warning"`. All three validators share an `ErrorCollector` whose
+  `has_failures()` says "Only hard errors decide the exit code. Warnings are advisory …
+  must not stop a book from merging", `emit_results` returns `1 if failed else 0`, and
+  `merge-be-pr.yaml` merges on `workflow_run.conclusion == 'success'`. So a blank row
+  PUBLISHES: en_tn master carried 19 blank-Note rows (2CH 5, ECC 8, JER 6) with green push
+  validation. The `blank_field_guard` export HOLD gate was built on the opposite assumption,
+  asserted in five comments and never measured, and it withheld all of JER/ECC/2CH from
+  Door43 indefinitely. Removed 2026-08-03. **The validators are not in this repo — fetch
+  them from `https://git.door43.org/unfoldingWord/en_<res>/raw/branch/master/.gitea/workflows/`
+  and read the severity before building anything that assumes DCS will reject content.**
+  Corollary: nothing downstream catches a blank field, so the in-app lint and the save-path
+  guards (`rows.ts` 422 `blank_note`, `NoteCard.flushPending`) are the only protection.
+
+- **`Occurrence` is the column DCS actually hard-rejects — and it must be judged on the
+  RENDERED TSV, never on the D1 rows.** In the same validator files, the Occurrence checks carry
+  no `severity` kwarg, so they default to `"error"`: twl rejects a blank Occurrence
+  unconditionally, tn only when Quote is non-blank, tq not at all. `api/src/hardRejectGuard.ts`
+  holds the export for these. It reads the rendered bytes because `origLangOccurrence`
+  (`export.ts`) coerces null/0 → 1 whenever the Quote contains Hebrew/Greek: 10,708 prod tn rows
+  look offending in D1 but only **one** renders offending. Gating on rows would hold nearly every
+  tn book — the same over-broad mistake as the blank-field gate, in the other direction.
+  Live offenders as of 2026-08-03: `tn JER 37:5` `bfyt` (English quote, Occurrence NULL — holds
+  JER TN; fix is one field in the editor) and `twl DAN 3:5` `xf8f` (OrigWords "fall down",
+  Occurrence NULL — DAN TWL has been silently failing DCS validation). Root cause is a create
+  path: `Shell.tsx` "add word" posts no `occurrence` and `CreateTwl` has no default.
+
 - **A green typecheck can mean "checked nothing".** If `node_modules` is damaged, an
   unresolvable entry in tsconfig `types` (here `vite/client`) makes `tsc` emit one TS2688
   and silently skip the entire program — it reports success while checking zero files.
