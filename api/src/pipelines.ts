@@ -856,7 +856,34 @@ export async function pollPipelineJob(
     return { kind: "malformed", text };
   }
 
+  // `job` is a snapshot taken when this poll started, and the upstream fetch
+  // above can take a while — long enough for the owner to force-stop the run in
+  // between. Re-read the live state before importing: applying AI output into a
+  // chapter we have just told everyone is unlocked is the one irreversible
+  // thing this function does, and the guarded UPDATE further down is too late
+  // to prevent it. Narrow but real — this is exactly the window a merge review
+  // flagged as High severity.
+  //
+  // RESIDUAL GAP, deliberately not closed here: a force-stop landing *during*
+  // importJobOutput still applies, because the apply has no cancellation point.
+  // Closing that means threading a check through the apply loop; out of scope
+  // for #398 and called out in the PR.
+  const liveState = await env.DB.prepare(
+    `SELECT state, error_kind FROM pipeline_jobs WHERE job_id = ?1`,
+  )
+    .bind(job.job_id)
+    .first<{ state: string; error_kind: string | null }>();
+  const forceStopped =
+    liveState?.state === "failed" && liveState?.error_kind === "force_stopped";
+  if (forceStopped) {
+    console.warn(
+      `[pollPipelineJob] job=${job.job_id} was force-stopped while this poll was in flight; ` +
+        `skipping import of upstream output`,
+    );
+  }
+
   const shouldImport =
+    !forceStopped &&
     job.no_output_yet === 1 &&
     data.state === "done" &&
     Array.isArray(data.output) &&

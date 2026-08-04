@@ -208,7 +208,14 @@ function fakeDispatchEnv({ promoteChanges = 1, username = "translator" } = {}) {
 
 // Fake D1 for pollPipelineJob's F3 test: the guarded final UPDATE's
 // meta.changes gates the follow-up enqueue and dispatchNext calls.
-function fakePollEnv({ pollChanges = 1, username = "translator" } = {}) {
+//
+// `liveState`, when passed, also answers the mid-poll re-read guard added for
+// #398's "force-stop lands while the upstream fetch is in flight" case (the
+// `SELECT state, error_kind FROM pipeline_jobs WHERE job_id = ?1` query in
+// pollPipelineJob, just above `shouldImport`). Left undefined by default so
+// the F3 tests below (which don't care about it) get the harmless `null`
+// fallback from the catch-all branch, same as before this param existed.
+function fakePollEnv({ pollChanges = 1, username = "translator", liveState } = {}) {
   const env = {
     BT_API_TOKEN: "tok",
     queries: [],
@@ -220,11 +227,25 @@ function fakePollEnv({ pollChanges = 1, username = "translator" } = {}) {
             bind: () => ({ first: async () => (username ? { dcs_username: username } : null) }),
           };
         }
+        // The mid-poll live-state re-read (#398). Distinguished from the
+        // pre-existing forceFailJob re-read query (`SELECT state FROM
+        // pipeline_jobs WHERE job_id = ?1`, no `error_kind` column) by
+        // requiring both columns in the SELECT list — the two query strings
+        // never overlap, so this can't accidentally answer the other query.
+        if (/SELECT state, error_kind FROM pipeline_jobs WHERE job_id = \?1/.test(sql)) {
+          return { bind: () => ({ first: async () => liveState ?? null }) };
+        }
         // The poll's own guarded UPDATE under test (F3's changes-check).
         if (/UPDATE pipeline_jobs SET\s*\n\s*state = \?2,[\s\S]*last_polled_at = unixepoch\(\)/.test(sql)) {
           return { bind: () => ({ run: async () => ({ meta: { changes: pollChanges } }) }) };
         }
-        // dispatchNext's claim query and everything else — inert.
+        // dispatchNext's claim query and everything else — inert. This also
+        // covers importJobOutput's claim UPDATE (`SET import_claimed_at =
+        // unixepoch()... RETURNING import_claimed_at`): its meta.changes
+        // comes back 0, so if the guard test below fails to skip the import,
+        // importJobOutput reports claimLost rather than throwing — the query
+        // still gets recorded in env.queries either way, which is what the
+        // guard tests assert on.
         return {
           bind: () => ({
             run: async () => ({ meta: { changes: 0 } }),
@@ -653,6 +674,119 @@ await withFetch(
     } finally {
       console.warn = originalWarn;
     }
+  },
+);
+
+// ─── #398 mid-poll re-read: a force-stop landing WHILE the upstream fetch was
+// in flight must suppress the import even though `job` (the pre-fetch
+// snapshot) still says the run is eligible ────────────────────────────────
+// This is distinct from the existing "pollPipelineJob does not clobber a
+// force-stopped job" case above, which drives the job's OWN error_kind ==
+// 'force_stopped' snapshot through the guarded final UPDATE. This test
+// instead exercises the NEW mid-poll re-read: `job.error_kind` is null (a
+// perfectly healthy snapshot) and only the live D1 row — read fresh, after
+// the upstream fetch resolves — reports the force-stop. Without the guard
+// this poll would import upstream output into a chapter the force-stop just
+// unlocked.
+//
+// Proving "the import did not happen": importJobOutput cannot be swapped out
+// from this plain-node test (no module-mocking harness here — see the file
+// header), so this asserts the OBSERVABLE CONSEQUENCE instead: importJobOutput's
+// very first D1 statement is a distinctively-shaped claim UPDATE
+// (`SET import_claimed_at = unixepoch() ... RETURNING import_claimed_at`) that
+// exists nowhere else in this module. Its absence from env.queries proves
+// importJobOutput was never entered. This is as strong a proof as this stub
+// can offer; it does not exercise stageJobOutput/applyJobOutput themselves.
+const forceStoppedMidPollJob = {
+  job_id: "job-midpoll-stop",
+  upstream_job_id: "stream_midpoll_upstream",
+  user_id: 1,
+  pipeline_type: "notes",
+  book: "NUM",
+  start_chapter: 27,
+  end_chapter: 27,
+  session_key: "sess-midpoll",
+  follow_up_options: null,
+  follow_up_chain: null,
+  follow_up_job_id: "already-set", // keep this test scoped to the import guard
+  no_output_yet: 1, // WOULD normally fire the import below
+  error_kind: null, // the pre-fetch snapshot is healthy — only the live re-read says otherwise
+  updated_at: Math.floor(Date.now() / 1000),
+  resume_attempt_count: 0,
+  last_resume_at: null,
+  resume_accepted_at: null,
+  options_json: null,
+};
+
+const doneWithOutput = JSON.stringify({
+  state: "done",
+  output: [
+    {
+      type: "tn",
+      repo: "en_tn",
+      branch: "live-snapshot",
+      path: "tn_NUM.tsv",
+      rawUrl: "https://example/raw",
+      prNumber: 1,
+      mergedAt: "2026-08-01T00:00:00Z",
+      commitSha: "abc123",
+    },
+  ],
+});
+
+await withFetch(
+  async () => new Response(doneWithOutput, { status: 200 }),
+  async () => {
+    console.log("\n[#398: live-state force-stop mid-poll skips the import]");
+    const originalWarn = console.warn;
+    const warnings = [];
+    console.warn = (...args) => warnings.push(args.join(" "));
+    try {
+      const env = fakePollEnv({
+        pollChanges: 1,
+        liveState: { state: "failed", error_kind: "force_stopped" },
+      });
+      const result = await pollPipelineJob(env, forceStoppedMidPollJob);
+      assert(result.kind === "ok", "poll completes");
+      assert(
+        !env.queries.some((q) => /import_claimed_at = unixepoch\(\)/.test(q)),
+        "importJobOutput's claim UPDATE was NEVER prepared — the import was skipped",
+      );
+      assert(
+        warnings.some(
+          (w) => w.includes("job-midpoll-stop") && w.includes("force-stopped"),
+        ),
+        `logs a warning naming the job and the reason (got: ${JSON.stringify(warnings)})`,
+      );
+    } finally {
+      console.warn = originalWarn;
+    }
+  },
+);
+
+// ─── #398 companion: the guard must NOT be over-eager — an ordinary live
+// state (not force-stopped) still lets the import proceed ──────────────────
+// Without this half, a guard that always skips the import (e.g. a stray
+// `!forceStopped` that always evaluates false, or `shouldImport` accidentally
+// hardcoded to false) would pass the test above too. This is the case that
+// actually exercises the "should import" branch.
+await withFetch(
+  async () => new Response(doneWithOutput, { status: 200 }),
+  async () => {
+    console.log("\n[#398 companion: live-state running does not block the import]");
+    const env = fakePollEnv({
+      pollChanges: 1,
+      liveState: { state: "running", error_kind: null },
+    });
+    const result = await pollPipelineJob(env, {
+      ...forceStoppedMidPollJob,
+      job_id: "job-midpoll-running",
+    });
+    assert(result.kind === "ok", "poll completes");
+    assert(
+      env.queries.some((q) => /import_claimed_at = unixepoch\(\)/.test(q)),
+      "importJobOutput's claim UPDATE WAS prepared — the import path was taken",
+    );
   },
 );
 
