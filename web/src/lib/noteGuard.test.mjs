@@ -5,7 +5,11 @@
 // saved as v5. wouldBlankExistingNote must flag that transition so NoteCard can
 // block the silent overwrite.
 
-import { isBlankNoteText, wouldBlankExistingNote } from "./noteGuard.ts";
+import {
+  isAbandonedBlankStub,
+  isBlankNoteText,
+  wouldBlankExistingNote,
+} from "./noteGuard.ts";
 
 let failed = 0;
 function assert(cond, msg) {
@@ -69,6 +73,101 @@ assert(
 assert(
   !wouldBlankExistingNote("", fullNote),
   "blank → substantive (first authoring) is allowed",
+);
+
+// ── isAbandonedBlankStub — the create-path gap ──
+//
+// Pins the second prod bug: JER 36:21 `fa9t` / 36:24 `c3u7`, created 2026-07-27/28
+// with note:"" by "Add note" and never filled. wouldBlankExistingNote above
+// structurally cannot catch these (blank→blank returns false), and the API create
+// route accepts note:"" by design, so the stub has to be discarded on the way out.
+
+// A freshly-created, still-untouched stub as Shell's onNoteCreate leaves it.
+function stub(over = {}) {
+  return {
+    version: 1,
+    updated_by: 30,
+    note: "",
+    quote: null,
+    support_reference: null,
+    tags: null,
+    occurrence: null,
+    trashed_at: null,
+    preserve: 0,
+    hint: 0,
+    ...over,
+  };
+}
+const emptyLocal = { note: "", quote: "", supportRef: null, hydrated: true };
+
+assert(
+  isAbandonedBlankStub(stub(), emptyLocal),
+  "JER fa9t case: app-created v1 stub, nothing typed → discard",
+);
+assert(
+  isAbandonedBlankStub(stub({ note: "   " }), { ...emptyLocal, note: "  \\n " }),
+  "whitespace/TSV-escape-only stub → discard",
+);
+
+// The 11 genuine upstream empties (2CH 13:4 ai78, JER 52:28 l6dd, …) are
+// version 1 with updated_by NULL and DO exist on en_tn master. Touching them
+// would delete real upstream rows.
+assert(
+  !isAbandonedBlankStub(stub({ updated_by: null }), emptyLocal),
+  "upstream empty (updated_by NULL) is left alone",
+);
+
+// Anything the user could lose must block the discard.
+assert(
+  !isAbandonedBlankStub(stub(), { ...emptyLocal, note: "typed but unsaved" }),
+  "unsaved draft body in local state blocks discard",
+);
+assert(
+  !isAbandonedBlankStub(stub(), { ...emptyLocal, quote: "בְּרֵאשִׁית" }),
+  "quote picked but body not yet typed blocks discard",
+);
+assert(
+  !isAbandonedBlankStub(stub(), {
+    ...emptyLocal,
+    supportRef: "rc://*/ta/man/translate/figs-metaphor",
+  }),
+  "support reference chosen but body not yet typed blocks discard",
+);
+assert(
+  !isAbandonedBlankStub(stub(), { ...emptyLocal, hydrated: false }),
+  "pre-hydration local state is not evidence of emptiness → no discard",
+);
+assert(
+  !isAbandonedBlankStub(stub({ version: 2 }), emptyLocal),
+  "a row edited at least once is not a stub",
+);
+assert(
+  !isAbandonedBlankStub(stub({ hint: 1 }), emptyLocal),
+  "hint stub is intentionally empty (queued for the AI pipeline) → keep",
+);
+assert(
+  !isAbandonedBlankStub(stub({ preserve: 1 }), emptyLocal),
+  "explicit preserve bit → keep",
+);
+assert(
+  !isAbandonedBlankStub(stub({ trashed_at: 1750000000 }), emptyLocal),
+  "already trashed → nothing to discard",
+);
+assert(
+  !isAbandonedBlankStub(stub({ quote: "בְּרֵאשִׁית" }), emptyLocal),
+  "row already carries a saved quote → keep",
+);
+assert(
+  !isAbandonedBlankStub(stub({ occurrence: 1 }), emptyLocal),
+  "row carries an occurrence → keep",
+);
+assert(
+  !isAbandonedBlankStub(stub({ tags: "figs-metaphor" }), emptyLocal),
+  "row carries tags → keep",
+);
+assert(
+  !isAbandonedBlankStub(stub({ note: fullNote }), { ...emptyLocal, note: fullNote }),
+  "a real note is never a stub",
 );
 
 if (failed) {

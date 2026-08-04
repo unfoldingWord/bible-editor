@@ -99,7 +99,7 @@ interface Props {
     patch: Partial<TnRow>,
     opts?: { restoredFromVersion?: number },
   ) => void;
-  onNoteDelete: (id: string) => void;
+  onNoteDelete: (id: string, opts?: { blankStub?: boolean }) => void;
   onNoteRestore: (id: string) => void;
   onNoteInsertAfter: (refId: string) => void;
   onNoteReorder: (draggedId: string, refId: string, position: DropPosition) => void;
@@ -1129,7 +1129,7 @@ export function ResourceColumn({
           isDropTarget={dragId !== null && dragId !== r.id}
           onChange={(p) => onNoteChange(r.id, p)}
           onSave={(p, opts) => onNoteSave(r.id, p, opts)}
-          onDelete={() => onNoteDelete(r.id)}
+          onDelete={(opts) => onNoteDelete(r.id, opts)}
           onRestore={() => onNoteRestore(r.id)}
           onInsertAfter={() => onNoteInsertAfter(r.id)}
           verseOptions={verseOptions}
