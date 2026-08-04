@@ -48,8 +48,12 @@ export function AlignAttentionIndicator({ refs, resolvedKeys, onNavigate, book }
   // Nothing left to fix — stay out of the way.
   if (pending.length === 0) return null;
 
-  const tooltip = `${pending.length} verse${pending.length === 1 ? "" : "s"} in ${book} need${
-    pending.length === 1 ? "s" : ""
+  // Count VERSES, not rows: a verse that lost alignment in both ULT and UST is
+  // two rows but one verse, and the badge must not claim two. The list below
+  // still shows every row, since each resource needs fixing separately.
+  const verseCount = new Set(pending.map((r) => r.ref)).size;
+  const tooltip = `${verseCount} verse${verseCount === 1 ? "" : "s"} in ${book} need${
+    verseCount === 1 ? "s" : ""
   } alignment attention`;
 
   return (
@@ -61,7 +65,7 @@ export function AlignAttentionIndicator({ refs, resolvedKeys, onNavigate, book }
           onClick={() => setOpen(true)}
           aria-label={tooltip}
         >
-          <Badge badgeContent={pending.length} color="warning">
+          <Badge badgeContent={verseCount} color="warning">
             <LinkOffIcon fontSize="small" sx={{ color: "warning.main" }} />
           </Badge>
         </IconButton>
@@ -80,7 +84,7 @@ export function AlignAttentionIndicator({ refs, resolvedKeys, onNavigate, book }
         <Box sx={{ px: 2, py: 1 }}>
           <Typography variant="subtitle2">{book} — alignment needs attention</Typography>
           <Typography variant="caption" color="text.secondary">
-            {pending.length} verse{pending.length === 1 ? "" : "s"} lost word alignment
+            {verseCount} verse{verseCount === 1 ? "" : "s"} lost word alignment
           </Typography>
         </Box>
         <Divider />

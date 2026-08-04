@@ -1422,7 +1422,13 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
         ),
         ...offenders.map((o) =>
           this.env.DB.prepare(
-            `INSERT INTO alignment_attention (book, resource, ref, lost_words, provenance)
+            // OR REPLACE, not plain INSERT: the batch is one transaction, so a
+            // single duplicate ref in `offenders` would violate the unique
+            // index, roll the whole snapshot back, and leave the indicator
+            // silently serving the PREVIOUS export's rows with nothing but a
+            // console.error. A repeated ref should cost us that one row, not
+            // the whole book's findings.
+            `INSERT OR REPLACE INTO alignment_attention (book, resource, ref, lost_words, provenance)
              VALUES (?1, ?2, ?3, ?4, ?5)`,
           ).bind(book, resource, o.ref, JSON.stringify(o.lostWords), provenance.get(o.ref) ?? null),
         ),

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useEffect, useState } from "react";
 import { fetchAlignmentAttention, type AlignAttentionRef } from "../sync/api";
 
 // Sticky "alignment needs attention" state for the top bar. Fetches once per
@@ -8,28 +8,27 @@ import { fetchAlignmentAttention, type AlignAttentionRef } from "../sync/api";
 //
 // A failed fetch must never break the top bar, so errors swallow to an empty
 // list rather than surfacing.
-export function useAlignmentAttention(
-  book: string,
-  authReady: boolean,
-): {
-  refs: AlignAttentionRef[];
-  refresh: () => void;
-} {
+export function useAlignmentAttention(book: string, authReady: boolean): { refs: AlignAttentionRef[] } {
   const [refs, setRefs] = useState<AlignAttentionRef[]>([]);
-
-  const refresh = useCallback(() => {
-    void fetchAlignmentAttention(book)
-      .then(setRefs)
-      .catch(() => {
-        // Non-critical — swallow rather than blocking the app.
-      });
-  }, [book]);
 
   useEffect(() => {
     if (!authReady) return;
+    let live = true;
     setRefs([]);
-    refresh();
-  }, [authReady, book, refresh]);
+    void fetchAlignmentAttention(book)
+      .then((r) => {
+        // Guard against a slow response for a PREVIOUS book landing after the
+        // user has already navigated on — that would show one book's refs
+        // under another book's name.
+        if (live) setRefs(r);
+      })
+      .catch(() => {
+        // Non-critical — swallow rather than blocking the app.
+      });
+    return () => {
+      live = false;
+    };
+  }, [authReady, book]);
 
-  return { refs, refresh };
+  return { refs };
 }

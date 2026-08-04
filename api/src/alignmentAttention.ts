@@ -55,6 +55,10 @@ alignmentAttention.get("/:book", async (c) => {
         provenance: r.provenance,
       };
     })
+    // A ref we can't parse into a chapter/verse is not navigable, and shipping
+    // it would put NaN in the client's location hash. Same tolerance rule as
+    // lost_words above: drop the bad row, keep the rest of the book's findings.
+    .filter((r) => Number.isFinite(r.chapter) && Number.isFinite(r.verse))
     .sort((a, b) => a.chapter - b.chapter || a.verse - b.verse || a.resource.localeCompare(b.resource));
   return c.json({ refs });
 });
