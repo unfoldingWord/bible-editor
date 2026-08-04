@@ -129,6 +129,7 @@ interface Props {
   pipelineStatus?: ReactNode;
   logosSyncToggle?: ReactNode;
   lintIndicator?: ReactNode;
+  alignIndicator?: ReactNode;
   exportMenu?: ReactNode;
   railCollapsed?: boolean;
   onToggleRail?: () => void;
@@ -144,6 +145,7 @@ export function TopBar({
   pipelineStatus,
   logosSyncToggle,
   lintIndicator,
+  alignIndicator,
   exportMenu,
   railCollapsed,
   onToggleRail,
@@ -447,6 +449,7 @@ export function TopBar({
         </Box>
       )}
       {lintIndicator}
+      {alignIndicator}
       <VersionIndicator onRequestReload={onRequestReload} />
       <SyncStatusBar onNavigate={onNavigate} />
       {exportMenu}
