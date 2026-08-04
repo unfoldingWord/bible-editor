@@ -10,6 +10,7 @@ import { normalizeUsfmFormatting } from "./usfmFormat.ts";
 import { normalizeNoteText, sortRowsByReference } from "./tsvFormat.ts";
 import { orderTwlRows } from "./twlCanonicalOrder.ts";
 import { origLangOccurrence } from "./occurrenceRule.ts";
+import type { UsfmValidationIssue, UsfmValidationRule } from "./usfmValidate.ts";
 
 export type Resource = "tn" | "tq" | "twl" | "ult" | "ust";
 
@@ -923,6 +924,87 @@ export function buildAlignmentShrinkAlertMessage(args: {
     ? ""
     : ` Nothing is held up — the book is on Door43 and the affected verses show the broken-link icon in the editor.`;
   return `${head}${parts.join(" SEPARATELY, ")}${tail}`;
+}
+
+// Per-RULE remedy for the USFM structural HOLD gate. Keyed by the rule the
+// validator actually reported, because the wording this replaces asserted ONE
+// cause for every outcome: "This is the EZK front-\p stacked-marker signature …
+// Inspect the chapter for stacked \p/\m markers". For a `multiple-verses-per-line`
+// or `invalid-content-before-verse` issue that named the wrong defect AND sent
+// Benjamin looking for a marker stack that isn't there — the same
+// unmeasured-cause failure the alignment alert above was rewritten to stop.
+const USFM_RULE_GUIDANCE: Record<UsfmValidationRule, string> = {
+  "consecutive-paragraph-markers":
+    "two paragraph markers (\\p/\\m/\\pi/\\mi/\\nb/\\cls) back to back with no content between them — " +
+    "the EZK 8/11 front-\\p pump signature. Open the chapter and delete the duplicate marker",
+  "chapter-marker-not-isolated": "a \\c chapter marker sharing its line with other content",
+  "paragraph-marker-not-isolated": "a \\p marker sharing its line with other content",
+  "ts-marker-not-isolated":
+    "a \\ts\\* section-chunk milestone fused onto a content line — the LAM \\ts\\* pump shape",
+  "b-marker-not-isolated": "a \\b marker sharing its line with other content",
+  "b-marker-after-ts": "a \\b marker placed immediately after \\ts\\* instead of before it",
+  "multiple-verses-per-line": "more than one \\v marker on a single line",
+  "invalid-content-before-verse":
+    "text before a \\v marker on its line — usually a stray quote or leftover prose from the " +
+    "previous verse parked on the marker (the usfm-js leading-text shape), not a marker problem",
+};
+
+// Build the nightly USFM-structural-HOLD alert text.
+//
+// Same rule as buildAlignmentShrinkAlertMessage: **state only a cause we
+// measured.** Here that means naming the rules the validator actually returned
+// and giving each one its own remedy, instead of asserting the \p stack every
+// time.
+//
+// It also says plainly WHY this gate still blocks, which is itself a measured
+// fact rather than an assumption: unlike the tn/tq/twl validators (whose
+// blank-field checks are severity="warning", which is why that gate was removed),
+// DCS's validate_usfm_files.py has no warning tier at all — its ValidationError
+// carries no severity field, so every Check 7/8 issue counts toward the exit code.
+// `merge-be-pr.yaml` merges only on `workflow_run.conclusion == 'success'`, so
+// shipping this render would NOT publish the book; it would produce a red `-be-`
+// PR that never merges. Blocking withholds nothing that shipping would have
+// delivered — it just names the reason.
+export function buildUsfmInvalidAlertMessage(args: {
+  label: string;
+  issues: UsfmValidationIssue[];
+}): string {
+  const { label, issues } = args;
+  // No issues means the caller invoked this without a finding. Say exactly that
+  // rather than describe a defect we did not measure.
+  if (issues.length === 0) {
+    return (
+      `Benjamin fix this — nightly export BLOCKED ${label}: the USFM structural check reported no ` +
+      `specific issue, so there is nothing here to name. This is a bug in the export gate itself, not ` +
+      `in the book. Inspect the export run (wrangler tail) for ${label}.`
+    );
+  }
+
+  const byRule = new Map<UsfmValidationRule, UsfmValidationIssue[]>();
+  for (const it of issues) {
+    const bucket = byRule.get(it.rule);
+    if (bucket) bucket.push(it);
+    else byRule.set(it.rule, [it]);
+  }
+
+  const parts = [...byRule.entries()].map(([rule, found]) => {
+    const where = found
+      .slice(0, 3)
+      .map((i) => `line ${i.line}${i.ref ? ` (${i.ref})` : ""}`)
+      .join(", ");
+    const more = found.length - 3;
+    return (
+      `${found.length}× ${rule} — ${USFM_RULE_GUIDANCE[rule]}. ` +
+      `At ${where}${more > 0 ? ` +${more} more` : ""}`
+    );
+  });
+
+  return (
+    `Benjamin fix this — nightly export BLOCKED ${label}: the rendered USFM would fail DCS's ` +
+    `validate-usfm-files, which has no warning tier — every issue below is a hard error, so the ` +
+    `\`-be-\` PR check would go red and the merge bot would never merge it. Shipping would not publish ` +
+    `the book. ${parts.join(" ALSO, ")}. Fix in the editor, then re-export.`
+  );
 }
 
 // ── USFM rebuilder ───────────────────────────────────────────────────────────

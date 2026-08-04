@@ -37,6 +37,7 @@ import {
   updateDcsPrBranch,
   usfmAlignmentShrinkRefused,
   buildAlignmentShrinkAlertMessage,
+  buildUsfmInvalidAlertMessage,
   classifyAlignmentLossSeverity,
   offenderProvenanceFromLog,
   RESOURCE_TARGETS,
@@ -63,6 +64,7 @@ import type { TnRow, TqRow, TwlRow, VerseRow } from "./types";
 import { lintUsfmVerses } from "./lint";
 import { hardRejectRows } from "./hardRejectGuard";
 import { validateUsfm, summarizeUsfmIssues } from "./usfmValidate";
+import type { UsfmValidationIssue } from "./usfmValidate";
 import { shrinkOverrideAllowed } from "./shrinkGuard";
 
 export interface ExportParams {
@@ -678,7 +680,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       const issues = validateUsfm(built.content);
       if (issues.length > 0) {
         const summary = summarizeUsfmIssues(issues);
-        await this.recordUsfmInvalidSkipAlert(book, resource, summary);
+        await this.recordUsfmInvalidSkipAlert(book, resource, issues);
         const reason = `usfm_invalid_guard:${issues.length}:${summary}`;
         await this.recordSnapshot(book, resource, null, null, built.rowCount, reason);
         return {
@@ -1473,13 +1475,16 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
   private async recordUsfmInvalidSkipAlert(
     book: string,
     resource: Resource,
-    summary: string,
+    issues: UsfmValidationIssue[],
   ): Promise<void> {
     const source = `export_usfm_invalid:${book}:${resource}`;
-    const message =
-      `Benjamin fix this — nightly export BLOCKED ${book} ${resource.toUpperCase()}: the rendered USFM would fail ` +
-      `DCS's validate-usfm-files (${summary}). This is the EZK front-\\p stacked-marker signature — refusing to ship ` +
-      `invalid USFM to master. Inspect the chapter for stacked \\p/\\m markers or malformed lines, fix in the editor, then re-export.`;
+    // Wording lives in export.ts so it is unit-testable, and so the alert names
+    // the rules the validator actually reported instead of asserting the front-\p
+    // stack for every outcome. See buildUsfmInvalidAlertMessage.
+    const message = buildUsfmInvalidAlertMessage({
+      label: `${book} ${resource.toUpperCase()}`,
+      issues,
+    });
     await this.writeAlert(source, message, `${this.env.DCS_BASE_URL}/unfoldingWord`);
   }
 

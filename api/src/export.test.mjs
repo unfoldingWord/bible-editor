@@ -5,7 +5,7 @@
 // instead of getting silently flattened to `\v 6`. Not a test framework;
 // failures exit non-zero.
 
-import { attributeTsvShrink, buildAlignmentShrinkAlertMessage, classifyAlignmentLossSeverity, offenderProvenanceFromLog, buildExportBranch, buildTnTsv, buildTqTsv, buildTwlTsv, buildUsfm, classifyAlignmentShrinkOffenders, commitToDcs, countDuplicateMasterIds, describeShrinkRefusal, ensureDcsPr, exportTsvShrinkRefused, findDcsOpenPr, parseTsvIds, recreateExportBranchFromMaster, updateDcsPrBranch, usfmAlignmentShrinkRefused } from "./export.ts";
+import { attributeTsvShrink, buildAlignmentShrinkAlertMessage, buildUsfmInvalidAlertMessage, classifyAlignmentLossSeverity, offenderProvenanceFromLog, buildExportBranch, buildTnTsv, buildTqTsv, buildTwlTsv, buildUsfm, classifyAlignmentShrinkOffenders, commitToDcs, countDuplicateMasterIds, describeShrinkRefusal, ensureDcsPr, exportTsvShrinkRefused, findDcsOpenPr, parseTsvIds, recreateExportBranchFromMaster, updateDcsPrBranch, usfmAlignmentShrinkRefused } from "./export.ts";
 import { CorruptContentJsonError } from "./contentJson.ts";
 
 function assert(cond, msg) {
@@ -1755,6 +1755,80 @@ function utf8Base64(s) {
   } finally {
     globalThis.fetch = originalFetch;
   }
+}
+
+// --- buildUsfmInvalidAlertMessage: only ever state a cause we measured ---
+// The wording this replaces asserted ONE cause for every outcome ("This is the
+// EZK front-\p stacked-marker signature ... inspect the chapter for stacked \p/\m
+// markers"). For any other rule that named the wrong defect and pointed Benjamin
+// at a marker stack that was not there.
+{
+  const issue = (rule, line, ref) => ({ rule, line, ref, message: "m" });
+
+  const verses = buildUsfmInvalidAlertMessage({
+    label: "EZK ULT",
+    issues: [issue("multiple-verses-per-line", 120, "8:3")],
+  });
+  assert(
+    /multiple-verses-per-line/.test(verses) && /more than one \\v marker/.test(verses),
+    `the alert names the rule that actually fired`,
+  );
+  assert(
+    !/front-\\p/.test(verses) && !/stacked/.test(verses),
+    `a two-\\v-on-a-line issue must NOT be described as the front-\\p stacked-marker signature`,
+  );
+  assert(/line 120/.test(verses) && /8:3/.test(verses), `the alert locates the issue`);
+
+  const pump = buildUsfmInvalidAlertMessage({
+    label: "EZK ULT",
+    issues: [issue("consecutive-paragraph-markers", 11, "8")],
+  });
+  assert(
+    /front-\\p pump/.test(pump),
+    `the \\p pump SHOULD still be named as such — when that is the rule that fired`,
+  );
+
+  const leaked = buildUsfmInvalidAlertMessage({
+    label: "EZK ULT",
+    issues: [issue("invalid-content-before-verse", 55, "8:2")],
+  });
+  assert(
+    /not a marker problem/.test(leaked),
+    `leaked text before \\v is called what it is, not a marker stack`,
+  );
+
+  // Multiple distinct rules: each gets its own named remedy, none is asserted
+  // as the cause of the others.
+  const mixed = buildUsfmInvalidAlertMessage({
+    label: "LAM UST",
+    issues: [
+      issue("ts-marker-not-isolated", 9, "1"),
+      issue("b-marker-after-ts", 10, "1"),
+    ],
+  });
+  assert(
+    /ts-marker-not-isolated/.test(mixed) && /b-marker-after-ts/.test(mixed) && /ALSO/.test(mixed),
+    `every rule that fired is reported, joined rather than collapsed to one cause`,
+  );
+
+  // Why the gate still blocks is itself a measured fact and worth stating: DCS's
+  // validate_usfm_files.py has NO warning tier, so shipping cannot publish.
+  assert(
+    /no warning tier/.test(mixed) && /would not publish/.test(mixed),
+    `the alert explains that shipping would not have published the book anyway`,
+  );
+
+  // Empty issues: the gate fired with nothing measured. Say that, do not invent
+  // a defect.
+  const none = buildUsfmInvalidAlertMessage({ label: "EZK ULT", issues: [] });
+  assert(
+    /no specific issue/.test(none) && /bug in the export gate/.test(none),
+    `zero issues is reported as a gate bug, not as a book defect`,
+  );
+  assert(
+    !/\\p/.test(none) && !/marker/.test(none),
+    `with nothing measured the alert must not name a marker defect at all`,
+  );
 }
 
 console.log("\nAll export smoke checks passed.");

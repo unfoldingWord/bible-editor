@@ -19,6 +19,9 @@ export type UsfmValidationRule =
   | "consecutive-paragraph-markers" // DCS Check 7
   | "chapter-marker-not-isolated" // DCS Check 8: `\c N` must be alone on its line
   | "paragraph-marker-not-isolated" // DCS Check 8: `\p` must be alone on its line
+  | "ts-marker-not-isolated" // DCS Check 8: `\ts\*` must be alone on its line
+  | "b-marker-not-isolated" // DCS Check 8: `\b` must be alone on its line
+  | "b-marker-after-ts" // DCS Check 8: `\b` must precede `\ts\*`, not follow it
   | "multiple-verses-per-line" // DCS Check 8: at most one `\v` per line
   | "invalid-content-before-verse"; // DCS Check 8: only a paragraph/poetry marker may precede `\v`
 
@@ -40,16 +43,34 @@ const CHAPTER_ANY_RE = /\\c\s+\d+/;
 // A `\p` not immediately followed by a letter/digit — so `\pi`/`\pc` don't match
 // (DCS: `re.search(r"\\p(?!\w)", stripped)`).
 const PARAGRAPH_P_RE = /\\p(?![A-Za-z0-9])/;
+// The `\ts\*` section-chunk milestone, matched literally (DCS: `"\\ts\\*" in stripped`).
+const TS_MARKER = "\\ts\\*";
+// A `\b` not immediately followed by a word char (DCS: `re.search(r"\\b(?!\w)")`).
+// The class spells out Python's `\w`, which includes `_`, so `\b_` is not a match
+// there and must not be one here either.
+const B_MARKER_RE = /\\b(?![A-Za-z0-9_])/;
 // Every `\v N` occurrence on the line (DCS: `re.findall(r"\\v\s+\d+")`).
 const VERSE_G_RE = /\\v\s+\d+/g;
 const VERSE_NUM_RE = /\\v\s+(\d+)/;
 
 // Markers permitted before a `\v` on the same line — mirrors DCS's
-// `_VERSE_PREFIX_RE`. A poetry/paragraph marker token (optionally the sole token
-// before the verse) is allowed; anything else before `\v` is leaked prior-verse
-// content DCS flags.
+// `_VERSE_PREFIX_RE` exactly, and the two ways it is easy to get wrong both make
+// us ship USFM that DCS then hard-rejects:
+//
+//   - It is `$`-ANCHORED, and DCS applies it with `re.match` to the WHOLE trimmed
+//     text before the `\v`. A word-boundary anchor instead of `$` passes
+//     `\p “And he said\v 5` — the marker matches and the leaked text after it is
+//     never examined. That is precisely the usfm-js shape this codebase already
+//     knows about (an opening quote parked on a marker node's `text`), so the
+//     permissive form silently waves through the one defect most likely to occur.
+//   - `b` is NOT in DCS's alternation. `\b\v 5` is an error there, so it must be
+//     one here too.
+//
+// Getting either wrong does not "let a book through" — DCS still rejects it, the
+// `-be-` PR check goes red, and `merge-be-pr.yaml` never merges. The only thing
+// a permissive port buys is that the book is withheld with no banner naming why.
 const VERSE_PREFIX_RE =
-  /^\\(q[0-9]?|qm[0-9]?|qr|qc|qa|qd|li[0-9]?|pi[0-9]?|ph[0-9]?|m|mi|nb|pc|cls|p|b)\b/;
+  /^\\(q[0-9]?|qm[0-9]?|qr|qc|qa|qd|li[0-9]?|pi[0-9]?|ph[0-9]?|p|m|mi|nb|pc|cls)$/;
 
 /**
  * Validate rendered USFM against the ported DCS structural checks. Returns every
@@ -63,6 +84,21 @@ export function validateUsfm(usfmText: string): UsfmValidationIssue[] {
   let currentVerse: number | null = null;
   let prevWasParagraph = false;
   let prevParagraphLine = 0;
+  // Check 8 only. In DCS these are two SEPARATE functions with different header
+  // handling: Check 7 (`validate_usfm_content`) walks every line from line 1,
+  // while Check 8 (`validate_usfm_formatting`) skips the header — "everything
+  // before the first blank line" — and never re-enters header mode afterwards.
+  // Running Check 8 over the header too (as this port used to) is the one
+  // divergence that could withhold a book DCS would have merged, so the skip is
+  // placed below Check 7, not above it.
+  let inHeader = true;
+  // Previous line's trimmed text, for the `\b`-after-`\ts\*` ordering rule.
+  // Faithful to DCS's own `prev_non_blank`, which — despite the name — is
+  // reassigned on EVERY iteration including blank lines, so a blank line between
+  // `\ts\*` and `\b` clears it and the pair is not flagged. Our renderer's
+  // blankLinePass inserts exactly such a blank line, so replicate the behaviour
+  // rather than the name.
+  let prevNonBlank = "";
 
   const refOf = (): string | null => {
     if (currentChapter == null) return null;
@@ -100,9 +136,16 @@ export function validateUsfm(usfmText: string): UsfmValidationIssue[] {
       prevWasParagraph = false;
     }
 
-    if (stripped === "") continue;
-
     // ── Check 8: USFM formatting ────────────────────────────────────────────
+    // Header skip (DCS: `if in_header: if not stripped: in_header = False; continue`).
+    // Blank lines past the header are deliberately NOT skipped: DCS has no
+    // blank-line `continue` here, and letting them fall through is what clears
+    // `prevNonBlank` below.
+    if (inHeader) {
+      if (stripped === "") inHeader = false;
+      continue;
+    }
+
     // `\c N` must be alone on its line.
     if (CHAPTER_ANY_RE.test(stripped) && !CHAPTER_LINE_RE.test(stripped)) {
       issues.push({
@@ -120,6 +163,38 @@ export function validateUsfm(usfmText: string): UsfmValidationIssue[] {
         line: lineNumber,
         ref: refOf(),
         message: `Paragraph marker \\p must be alone on its line: "${stripped}".`,
+      });
+    }
+
+    // `\ts\*` must be alone on its line. Ported because the LAM `\ts\*` pump is
+    // a live shape in this repo (collapseConsecutiveTsMarkers exists for it), and
+    // a `\ts\*` fused onto a content line is a DCS hard error we were not seeing.
+    if (stripped.includes(TS_MARKER) && stripped !== TS_MARKER) {
+      issues.push({
+        rule: "ts-marker-not-isolated",
+        line: lineNumber,
+        ref: refOf(),
+        message: `\\ts\\* must be alone on its line: "${stripped}".`,
+      });
+    }
+
+    // `\b` must be alone on its line.
+    if (B_MARKER_RE.test(stripped) && stripped !== "\\b") {
+      issues.push({
+        rule: "b-marker-not-isolated",
+        line: lineNumber,
+        ref: refOf(),
+        message: `\\b must be alone on its line: "${stripped}".`,
+      });
+    }
+
+    // `\b` must come before `\ts\*`, not after it.
+    if (stripped === "\\b" && prevNonBlank === TS_MARKER) {
+      issues.push({
+        rule: "b-marker-after-ts",
+        line: lineNumber,
+        ref: refOf(),
+        message: `\\b appears immediately after \\ts\\* (line ${lineNumber}); \\b must come before it.`,
       });
     }
 
@@ -147,6 +222,8 @@ export function validateUsfm(usfmText: string): UsfmValidationIssue[] {
         });
       }
     }
+
+    prevNonBlank = stripped;
   }
 
   return issues;

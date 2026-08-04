@@ -72,6 +72,41 @@ Highlights that bite repeatedly:
   adding any future export gate, ask who is harmed by the block, not just whether the
   condition is detectable.
 
+- **…but that policy has a measurable BOUNDARY: does DCS itself hard-reject the condition?**
+  Applying it to the three remaining export gates (2026-08-04) found that none of them
+  should be split, for one reason: shipping past them would not publish the book anyway.
+  The test to run before relaxing any gate is "if we ship this, does it MERGE?"
+  - `validate_usfm_files.py` (Checks 7/8, the USFM HOLD gate) has **no severity tier at
+    all** — its `ValidationError` has no `severity` field, so every issue counts toward the
+    exit code. That is the opposite of `validate_tn/tq/twl_files.py`, whose blank-field
+    checks are `severity="warning"` (the reason that gate was rightly deleted). Same for
+    the Occurrence checks behind `hardRejectGuard.ts`: no `severity` kwarg → default
+    `"error"`. `merge-be-pr.yaml` merges only on `workflow_run.conclusion == 'success'`,
+    so a hard error means the `-be-` PR goes red and never merges.
+  - So for those gates, blocking withholds **nothing that shipping would have delivered**;
+    it only adds a banner naming the row/line. Alignment loss was different precisely
+    because DCS has *no* alignment check anywhere (verified: zero hits for `zaln`,
+    `occurrence`, `\w` across all 8 checks), so shipping it really did publish the work.
+  - The TSV shrink guard already had this split done right (`attributeTsvShrink`:
+    `unexplained === 0` ships, plus the `allowShrink` override). Every remaining block is
+    data loss, an unreadable master, or our own render disagreeing with itself. Leave it.
+  - Validation is **per-book** (`--book` from the `-be-` branch name), so one bad book
+    cannot block another's PR. The whole-repo behaviour noted elsewhere applies to the
+    push-to-master workflow, which gates nothing.
+
+- **A ported validator's FIDELITY is the gate's whole justification — diff it against the
+  real source, don't eyeball it.** `usfmValidate.ts` had drifted from DCS in six places,
+  five of which made it *under*-block (it accepted `\p “And he said\v 5`, `\b\v 5`, and had
+  no `\ts\*`/`\b` own-line or `\b`-after-`\ts\*` rules at all): DCS's `_VERSE_PREFIX_RE` is
+  `$`-anchored and has no `b` branch, where ours used a word boundary and allowed `b`. The
+  sixth made it *over*-block: DCS's Check 8 skips the header (everything before the first
+  blank line) and ours did not — and Check 7 lives in a different DCS function with **no**
+  header skip, so the two checks must be gated differently in our single loop. Note the
+  blank line after `\mt1` is load-bearing: without one, DCS's Check 8 never activates at
+  all, so a test fixture lacking it passes vacuously. Measured impact of the fix: 0 issues
+  across 34 real `en_ult`/`en_ust` master files, verified by injecting each violation into a
+  real file to prove the rules actually fire.
+
 - **DCS's blank-required-field checks are WARNINGS, not errors — measure the validator
   before gating on it.** All five (`validate_tn_files.py` "Note column cannot be blank",
   `validate_tq_files.py` Question/Response, `validate_twl_files.py` OrigWords/TWLink) are
