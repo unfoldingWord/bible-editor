@@ -9,6 +9,7 @@ import { analyzeAlignmentDelta } from "./alignmentDelta.ts";
 import { normalizeUsfmFormatting } from "./usfmFormat.ts";
 import { normalizeNoteText, sortRowsByReference } from "./tsvFormat.ts";
 import { orderTwlRows } from "./twlCanonicalOrder.ts";
+import { origLangOccurrence } from "./occurrenceRule.ts";
 
 export type Resource = "tn" | "tq" | "twl" | "ult" | "ust";
 
@@ -86,33 +87,10 @@ function tsvLine(cells: unknown[]): string {
   return cells.map(tsvCell).join("\t");
 }
 
-// uW TSV invariant: a Quote / OrigWords cell holding original-language
-// (Hebrew or Greek) text must carry Occurrence >= 1. Occurrence 0/empty is
-// only valid for Gateway-Language quotes or general notes. Upstream rows and
-// in-app quote edits (a GL snippet rewritten to OL words) can leave occurrence
-// null/0, which would ship invalid TSV to DCS. Coerce null/0 -> 1 when the
-// quote is OL; an existing >= 1 (a real second-occurrence target) is left
-// untouched. Mirrored in rows.ts (save path) — keep the two in sync.
-// Original-language Unicode blocks: Hebrew (0590-05FF), Hebrew presentation
-// forms (FB1D-FB4F), Greek and Coptic (0370-03FF), Greek Extended (1F00-1FFF).
-function hasOrigLang(s: string): boolean {
-  for (let i = 0; i < s.length; i++) {
-    const c = s.charCodeAt(i);
-    if (
-      (c >= 0x0590 && c <= 0x05ff) ||
-      (c >= 0xfb1d && c <= 0xfb4f) ||
-      (c >= 0x0370 && c <= 0x03ff) ||
-      (c >= 0x1f00 && c <= 0x1fff)
-    )
-      return true;
-  }
-  return false;
-}
-
-function origLangOccurrence(quote: string | null, occurrence: number | null): number | null {
-  if (quote && hasOrigLang(quote) && (occurrence == null || occurrence === 0)) return 1;
-  return occurrence;
-}
+// The Occurrence invariant lives in occurrenceRule.ts (pure leaf, shared with
+// rows.ts's save path so render-time and save-time cannot drift apart).
+// origLangOccurrence is the render-time coercion; see that module for why it
+// is deliberately narrower than the save-path rule.
 
 // TWL canonical ordering (normalizeWordText / buildUltSequenceMap /
 // twlSortPosition / the per-verse sequencing) moved to twlCanonicalOrder.ts so

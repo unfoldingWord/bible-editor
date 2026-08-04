@@ -9,6 +9,7 @@ import { newRowId } from "./rowId";
 import { blankStubClause } from "./blankStub";
 import { reopenLaneChecks } from "./laneReopen";
 import { refParts, coveredVersesFromRef } from "./importParsers";
+import { requiredOccurrence } from "./occurrenceRule";
 
 export const rows = new Hono<{ Bindings: Env; Variables: { userId?: number } }>();
 
@@ -29,34 +30,19 @@ const KIND_TO_REOPEN_LANE: Record<RowKind, CheckLane | null> = {
   twl: null,
 };
 
-// The original-language field per kind — the cell whose Hebrew/Greek content
-// forces Occurrence >= 1 (see origLangOccurrence below).
+// The quote field per kind — the cell whose content decides whether a blank
+// Occurrence is legal (see requiredOccurrence in occurrenceRule.ts).
 const QUOTE_FIELD: Record<RowKind, "quote" | "orig_words"> = {
   tn: "quote",
   tq: "quote",
   twl: "orig_words",
 };
 
-// uW TSV invariant: an original-language (Hebrew/Greek) quote must carry
-// Occurrence >= 1. The editor / AI quote-builder can rewrite a Gateway-Language
-// snippet to OL words without touching occurrence, leaving it null/0, which
-// exports as invalid TSV. Mirrors export.ts's guard (the export side is the
-// last-resort net; this fixes the stored row at the source). Keep the two in
-// sync. Unicode blocks: Hebrew (0590-05FF), Hebrew presentation forms
-// (FB1D-FB4F), Greek and Coptic (0370-03FF), Greek Extended (1F00-1FFF).
-function hasOrigLang(s: string): boolean {
-  for (let i = 0; i < s.length; i++) {
-    const c = s.charCodeAt(i);
-    if (
-      (c >= 0x0590 && c <= 0x05ff) ||
-      (c >= 0xfb1d && c <= 0xfb4f) ||
-      (c >= 0x0370 && c <= 0x03ff) ||
-      (c >= 0x1f00 && c <= 0x1fff)
-    )
-      return true;
-  }
-  return false;
-}
+// The Occurrence invariant (which occurrence a saved row must carry, and why
+// each kind's rule differs) lives in occurrenceRule.ts — a pure leaf shared
+// with export.ts's renderer so save-time and render-time cannot drift apart.
+// Its `requiredOccurrence` is applied in BOTH handlers below: the create POST
+// and the patch.
 
 // Adds a book filter to a WHERE clause. After the composite-(book, id) PK
 // migration (0015), every row lookup MUST be scoped by book — the same 4-char
@@ -251,6 +237,20 @@ rows.post("/:kind", requireEditor, async (c) => {
       .first<{ m: number | null }>();
     data.sort_order = (maxRow?.m ?? 0) + 100;
   }
+
+  // Same idea for occurrence: `CreateTwl`/`CreateTn` make it optional and the
+  // column has no DB default, so an omitted occurrence lands NULL and renders a
+  // blank Occurrence cell that its validator hard-rejects. The "add word"
+  // action posts no occurrence at all, which is how prod twl DAN 3:5 `xf8f` came
+  // to sit blank and quietly fail DAN TWL's validation. Defaulting here rather
+  // than in the client is deliberate: this POST is the ONLY writer that can
+  // leave the column absent (bookImport, bookReimport and pipelineImport all
+  // bind an explicit value parsed from the TSV, and must keep round-tripping
+  // master's genuine blanks rather than healing them), so one server-side
+  // default covers every current and future caller, and unlike a DB `DEFAULT 1`
+  // it can express tn's quote-conditional rule and stays visible in review.
+  const seedOcc = requiredOccurrence(kind, data[QUOTE_FIELD[kind]], data.occurrence);
+  if (seedOcc != null) data.occurrence = seedOcc;
 
   // Retry around PK collision: insert under a fresh id and let the DB be the
   // source of truth instead of SELECT-then-INSERT (which races between two
@@ -586,20 +586,22 @@ rows.patch("/:kind/:id", requireEditor, async (c) => {
     }
   }
 
-  // Enforce the OL-quote occurrence invariant at the source. Only fires when
-  // this patch actually touches the quote or occurrence — a reorder, note-only
-  // edit, or tag toggle must never trigger a retroactive heal (and the version
-  // bump it carries). Look at the post-patch values: if the resulting quote is
-  // original-language and the resulting occurrence is null/0, force it to 1 so
-  // the stored row (and every export from it) satisfies the invariant. An
-  // existing occurrence >= 1 — a real second-occurrence target — is untouched.
+  // Enforce the occurrence invariant at the source (see requiredOccurrence).
+  // Only fires when this patch actually touches the quote or occurrence — a
+  // reorder, note-only edit, or tag toggle must never trigger a retroactive
+  // heal (and the version bump it carries). The check runs on the values as
+  // they will be AFTER this patch applies, so setting a quote and clearing an
+  // occurrence in one request is judged on the result, not on the inputs.
   const p = patch as Record<string, unknown>;
   const quoteField = QUOTE_FIELD[kind];
   if (quoteField in p || "occurrence" in p) {
-    const effQuote = quoteField in p ? p[quoteField] : current[quoteField];
-    const effOcc = "occurrence" in p ? p.occurrence : current.occurrence;
-    if (typeof effQuote === "string" && hasOrigLang(effQuote) && (effOcc == null || effOcc === 0)) {
-      p.occurrence = 1;
+    const forced = requiredOccurrence(
+      kind,
+      quoteField in p ? p[quoteField] : current[quoteField],
+      "occurrence" in p ? p.occurrence : current.occurrence,
+    );
+    if (forced != null) {
+      p.occurrence = forced;
       fields = Object.keys(patch);
     }
   }
