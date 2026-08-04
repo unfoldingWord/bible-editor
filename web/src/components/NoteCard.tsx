@@ -381,7 +381,11 @@ function NoteCardInner({
   const [aiConfirmOpen, setAiConfirmOpen] = useState(false);
   // Open when a save would blank out a previously-substantive note; see the
   // guard in flushPending. Routes the user to delete-or-restore rather than
-  // shipping an export-invalid empty note.
+  // letting the blank note through. It is not "export-invalid": DCS's validator
+  // reports a blank Note column at severity="warning" and exits 0, so the row
+  // publishes to Door43 and nothing downstream catches it — which is precisely
+  // why this dialog is the real protection. Matches the copy it presents (below)
+  // and the header note in web/src/lib/noteGuard.ts.
   const [blankNoteConfirmOpen, setBlankNoteConfirmOpen] = useState(false);
   // Template dropdown anchor (only used when a support ref has >1 variant) and
   // the body staged for the "replace existing note?" confirm dialog.
