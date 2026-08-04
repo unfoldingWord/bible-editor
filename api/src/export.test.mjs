@@ -1784,14 +1784,18 @@ function utf8Base64(s) {
     label: "EZK ULT",
     issues: [issue("consecutive-paragraph-markers", 11, "8")],
   });
+  // By the time this gate runs, collapseConsecutiveParagraphMarkers has already
+  // dropped every run of IDENTICAL markers, so the front-\p pump and any
+  // "duplicate marker" are unreachable here — only a MIXED adjacency survives.
+  // Naming either would point Benjamin at a pair that cannot occur.
   assert(
-    /front-\\p pump/.test(pump),
-    `the \\p pump SHOULD still be referenced — when that is the rule that fired`,
+    !/front-\\p/.test(pump) && !/duplicate/.test(pump),
+    `the alert must not blame the front-\\p pump or a duplicate marker — neither can ` +
+      `reach this gate, they are auto-collapsed before validation`,
   );
   assert(
-    /does not prove that cause/.test(pump),
-    `...but named as a SHAPE, not asserted as the cause: adjacency alone does not ` +
-      `establish the pump (an AI import or a deleted verse body produces it too)`,
+    /DIFFERENT paragraph markers/.test(pump) && /auto-collapsed/.test(pump),
+    `it must say what actually survives to be reported: a mixed adjacency`,
   );
 
   const leaked = buildUsfmInvalidAlertMessage({

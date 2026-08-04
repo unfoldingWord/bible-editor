@@ -165,6 +165,25 @@ t("\\b before \\ts\\* is the correct order and is NOT flagged", () => {
   assert.ok(!rules(u).includes("b-marker-after-ts"));
 });
 
+t("non-ASCII after \\p is NOT flagged — Python's \\w is Unicode-aware", () => {
+  // DCS's `re.search(r"\\p(?!\w)")` uses Python's str `\w`, which matches letters
+  // and digits of ANY script. An ASCII-only lookahead would treat `\pאב` as a bare
+  // `\p` on a shared line and withhold a book DCS would have merged — a false
+  // positive is the worst failure mode this gate has.
+  for (const s of ["\\pאב text", "\\p_ text", "\\pπ text"]) {
+    const u = `${HDR}\\c 1\n${s}\n\\v 1 word\n`;
+    assert.ok(
+      !rules(u).includes("paragraph-marker-not-isolated"),
+      `${s} is not a bare \\p in DCS, so it must not be flagged here`,
+    );
+  }
+});
+
+t("a bare \\p sharing its line IS still flagged (the Unicode class did not defang it)", () => {
+  const u = `${HDR}\\c 1\n\\p “And he said\n\\v 1 word\n`;
+  assert.ok(rules(u).includes("paragraph-marker-not-isolated"));
+});
+
 // ── Port fidelity: the one divergence that made us OVER-block ───────────────
 
 t("Check 8 does NOT run on header lines (DCS skips to the first blank line)", () => {

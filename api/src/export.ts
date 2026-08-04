@@ -934,15 +934,21 @@ export function buildAlignmentShrinkAlertMessage(args: {
 // Benjamin looking for a marker stack that isn't there — the same
 // unmeasured-cause failure the alignment alert above was rewritten to stop.
 const USFM_RULE_GUIDANCE: Record<UsfmValidationRule, string> = {
-  // "the shape seen in", not "this is": what was measured is two adjacent
-  // paragraph markers. Adjacency does not establish the front-\p PUMP as the
-  // cause — an AI import or a verse whose content was deleted produces the same
-  // adjacency — and asserting it would be the very unmeasured-cause defect this
-  // builder was written to remove, just narrowed to one rule.
+  // Deliberately does NOT mention the EZK front-\p pump or a "duplicate marker",
+  // because by the time this gate runs neither is reachable: validateUsfm sees the
+  // output of normalizeUsfmFormatting, and collapseConsecutiveParagraphMarkers has
+  // already dropped every run of IDENTICAL markers (`if (prevParagraph === s)
+  // continue`), blank-separated runs included. What survives to be reported is
+  // only a MIXED adjacency, which usfmFormat.ts leaves alone on purpose ("a
+  // genuinely mixed \p/\m adjacency is left intact for the validator to HOLD on"
+  // — it will not guess which marker to drop). Telling Benjamin to delete a
+  // duplicate would point him at a marker pair that cannot occur and hide the one
+  // that did.
   "consecutive-paragraph-markers":
-    "two paragraph markers (\\p/\\m/\\pi/\\mi/\\nb/\\cls) back to back with no content between them — " +
-    "the shape seen in the EZK 8/11 front-\\p pump, though adjacency alone does not prove that cause. " +
-    "Open the chapter and delete the duplicate marker",
+    "two DIFFERENT paragraph markers (\\p/\\m/\\pi/\\mi/\\nb/\\cls) back to back with no content " +
+    "between them — identical ones are auto-collapsed before this check, so this is a mixed " +
+    "adjacency the renderer deliberately would not guess at. Open the chapter and decide which " +
+    "of the two markers belongs",
   "chapter-marker-not-isolated": "a \\c chapter marker sharing its line with other content",
   "paragraph-marker-not-isolated": "a \\p marker sharing its line with other content",
   "ts-marker-not-isolated":

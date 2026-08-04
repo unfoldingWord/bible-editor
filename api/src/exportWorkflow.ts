@@ -917,7 +917,17 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     if (headersRow) {
       try {
         const parsed = JSON.parse(headersRow.headers_json);
-        if (Array.isArray(parsed)) headers = parsed;
+        // `length > 0` matters: an EMPTY array is not nullish, so it would skip
+        // buildUsfm's `?? synthesizeHeaders(...)` fallback and render a file with
+        // no header block and therefore no blank line anywhere. DCS's Check 8
+        // (and our port) skip every line until the first blank one, so that file
+        // gets ZERO lines of structural validation while the gate still looks
+        // alive because Check 7 keeps running — the same fail-open that the
+        // synthesizeHeaders blank line closes. `extractUsfmHeaders` returns null
+        // rather than [] so bookImport can't store one, but the seeding scripts
+        // (scripts/import-book.mjs, scripts/reimport-ust-from-dcs.mjs) persist
+        // `JSON.stringify(json.headers)` unfiltered, so [] is reachable.
+        if (Array.isArray(parsed) && parsed.length > 0) headers = parsed;
       } catch {
         headers = null;
       }

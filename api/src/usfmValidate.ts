@@ -41,16 +41,18 @@ const CHAPTER_LINE_RE = /^\\c\s+\d+\s*$/;
 // A `\c N` appearing anywhere in the line (DCS: `re.search(r"\\c\s+\d+")`).
 const CHAPTER_ANY_RE = /\\c\s+\d+/;
 // A `\p` not immediately followed by a word char — so `\pi`/`\pc` don't match
-// (DCS: `re.search(r"\\p(?!\w)", stripped)`). The class spells out Python's `\w`,
-// which includes `_`; omitting it would make us flag `\p_` where DCS does not,
-// and a rule stricter than DCS withholds a book DCS would have merged.
-const PARAGRAPH_P_RE = /\\p(?![A-Za-z0-9_])/;
+// (DCS: `re.search(r"\\p(?!\w)", stripped)`). The class spells out Python's `\w`
+// for `str`, which is UNICODE-AWARE and includes `_`: letters and digits of any
+// script, not just ASCII. An ASCII-only class would flag `\p_` and `\pאב` where
+// DCS does not, and a rule stricter than DCS withholds a book DCS would have
+// merged — the worst failure mode this gate has.
+const PARAGRAPH_P_RE = /\\p(?![\p{L}\p{N}_])/u;
 // The `\ts\*` section-chunk milestone, matched literally (DCS: `"\\ts\\*" in stripped`).
 const TS_MARKER = "\\ts\\*";
 // A `\b` not immediately followed by a word char (DCS: `re.search(r"\\b(?!\w)")`).
-// The class spells out Python's `\w`, which includes `_`, so `\b_` is not a match
-// there and must not be one here either.
-const B_MARKER_RE = /\\b(?![A-Za-z0-9_])/;
+// Same Unicode-aware `\w` as PARAGRAPH_P_RE above — see that comment for why an
+// ASCII-only class is the dangerous direction to get wrong.
+const B_MARKER_RE = /\\b(?![\p{L}\p{N}_])/u;
 // Every `\v N` occurrence on the line (DCS: `re.findall(r"\\v\s+\d+")`).
 const VERSE_G_RE = /\\v\s+\d+/g;
 const VERSE_NUM_RE = /\\v\s+(\d+)/;
