@@ -36,9 +36,12 @@ import {
   recreateExportBranchFromMaster,
   updateDcsPrBranch,
   usfmAlignmentShrinkRefused,
-  classifyAlignmentShrinkOffenders,
+  buildAlignmentShrinkAlertMessage,
+  classifyAlignmentLossSeverity,
+  offenderProvenanceFromLog,
   RESOURCE_TARGETS,
   type AlignmentShrinkResult,
+  type OffenderProvenance,
   type Resource,
 } from "./export";
 
@@ -615,25 +618,50 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     // the guard, or via an ingress path it doesn't cover) would still ship.
     // Conservative: only blocks a verse whose aligned-word count shrank while
     // its plain text is unchanged — a real text rewrite is always allowed.
+    //
+    // Detecting loss and REFUSING to ship are now separate decisions
+    // (classifyAlignmentLossSeverity). A word or two left undragged is worth
+    // knowing about, not worth withholding a translator's finished book from
+    // Door43 — so that ships with a warning banner and the editor's existing
+    // broken-link icon. Only bug-shaped loss (a flattened verse, a gutted
+    // verse, systemic scale, a broken render, an unverifiable master) still
+    // holds the book back.
     if (dcsAllowed && (resource === "ult" || resource === "ust")) {
       const guard = await this.checkUsfmAlignmentShrink(book, resource, built.content);
       if (!guard.ok) {
-        await this.recordAlignmentShrinkSkipAlert(book, resource, guard.detail, guard.offenders ?? []);
-        const reason = `align_shrink_guard:${guard.detail}`;
-        await this.recordSnapshot(book, resource, null, null, built.rowCount, reason);
-        return {
+        const severity = classifyAlignmentLossSeverity(guard.offenders ?? []);
+        await this.recordAlignmentShrinkSkipAlert(
           book,
           resource,
-          rowCount: built.rowCount,
-          bytes: built.content.length,
-          r2Key,
-          branch: null,
-          dcsCommitSha: null,
-          dcsChanged: false,
-          dcsSkippedReason: reason,
-          prNumber: null,
-          prReason: null,
-        };
+          guard.detail,
+          guard.offenders ?? [],
+          severity.block,
+        );
+        if (!severity.block) {
+          // A night where the guard found loss and shipped anyway should be
+          // visible in the log, not only in a dismissible banner.
+          console.log(
+            `export: shipping ${book} ${resource} despite translator-scale alignment loss ` +
+              `(${severity.reason}; ${guard.detail}) — alerted, not blocked`,
+          );
+        }
+        if (severity.block) {
+          const reason = `align_shrink_guard:${severity.reason}:${guard.detail}`;
+          await this.recordSnapshot(book, resource, null, null, built.rowCount, reason);
+          return {
+            book,
+            resource,
+            rowCount: built.rowCount,
+            bytes: built.content.length,
+            r2Key,
+            branch: null,
+            dcsCommitSha: null,
+            dcsChanged: false,
+            dcsSkippedReason: reason,
+            prNumber: null,
+            prReason: null,
+          };
+        }
       }
     }
 
@@ -1326,73 +1354,116 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     return { ok: true, detail: "ok" };
   }
 
-  // Banner alert when the alignment-shrink backstop blocks an ULT/UST export to
-  // avoid shipping a silent de-alignment to master. Same replace-undismissed
-  // shape as recordShrinkSkipAlert.
+  // Banner alert when the alignment-shrink backstop finds an ULT/UST verse that
+  // lost \zaln alignment. Same replace-undismissed shape as
+  // recordShrinkSkipAlert. `blocking` says whether the export was actually
+  // withheld — translator-scale loss ships and gets a `warning` banner, so it
+  // must not claim the book was blocked, and it must not shout `error` at
+  // Benjamin for a word somebody forgot to drag.
   private async recordAlignmentShrinkSkipAlert(
     book: string,
     resource: Resource,
     detail: string,
     offenders: AlignmentShrinkResult["offenders"],
+    blocking: boolean,
   ): Promise<void> {
     const source = `export_align_shrink:${book}:${resource}`;
     const label = `${book} ${resource.toUpperCase()}`;
-    // classifyAlignmentShrinkOffenders (export.ts) splits offenders into three
-    // cases that must NOT share generic "lost alignment, re-align it" wording:
-    //
-    //   "none" — no offenders at all. Reached via checkUsfmAlignmentShrink's
-    //   `master_unreadable` path: a DCS fetch failure, not any translator
-    //   mistake. The old generic wording read as "0 verse(s) lost \zaln word
-    //   alignment on text that is UNCHANGED (master_unreadable) ... Re-align
-    //   the affected verse(s)" — describing a network failure as an
-    //   alignment bug and pointing at the wrong remedy entirely.
-    //
-    //   "sentinel" — the synthetic `ref: "*"` offender usfmAlignmentShrinkRefused
-    //   emits for an unparseable or empty RENDER (our own rendering bug, not
-    //   a translator's), which the old wording also reported as collateral
-    //   de-alignment needing re-alignment.
-    //
-    //   "genuine" — real per-verse offenders, split by sequenceUnchanged:
-    //   collateral de-alignment on UNCHANGED text (1CH 4:21 / JER 36:11
-    //   signature) vs. D1/master holding DIFFERENT REVISIONS of the verse
-    //   (the EZK 40 signature, fixed separately by withholding the sync
-    //   watermark on locked chapters — see bookReimport.ts's reimport-sync
-    //   step). None of this changes the refusal decision above, only wording.
-    const classification = classifyAlignmentShrinkOffenders(offenders);
+    const provenance = await this.readOffenderProvenance(book, resource, offenders);
+    // Every case that must NOT share generic "lost alignment, re-align it"
+    // wording — fetch failure, our own broken render, collateral de-alignment,
+    // out-of-sync D1 — is enumerated once, with its rationale, above
+    // buildAlignmentShrinkAlertMessage in export.ts. None of it changes the
+    // refusal decision above, only what the alert says.
+    const message = buildAlignmentShrinkAlertMessage({
+      label,
+      book,
+      resource,
+      detail,
+      offenders,
+      provenance,
+      blocking,
+    });
+    await this.writeAlert(
+      source,
+      message,
+      `${this.env.DCS_BASE_URL}/unfoldingWord`,
+      blocking ? "error" : "warning",
+    );
+  }
 
-    let message: string;
-    if (classification.kind === "none") {
-      message =
-        `Benjamin fix this — nightly export BLOCKED ${label}: could not verify the render against master ` +
-        `(${detail}) — this is a DCS connectivity / fetch problem, not an alignment mistake. Inspect the export ` +
-        `run (wrangler tail / DCS status), then re-export once master is readable again. No verse needs re-aligning.`;
-    } else if (classification.kind === "sentinel") {
-      message =
-        `Benjamin fix this — nightly export BLOCKED ${label}: the render itself was ${classification.which === "empty_render" ? "EMPTY" : "UNPARSEABLE"} ` +
-        `(${detail}). This points at a bug in OUR render, not at anything a translator needs to re-align. ` +
-        `Inspect the export run's output for ${book} ${resource.toUpperCase()} before re-exporting.`;
-    } else {
-      const { unchanged, changed } = classification;
-      const collateralMsg =
-        `${unchanged.length} verse(s) lost \\zaln word alignment on text that is UNCHANGED ` +
-        `(${detail}). This is the 1CH 4:21 / NUM 24 / JER 36:11 collateral de-alignment ` +
-        `signature — refusing to ship it to master. Re-align the affected verse(s) in the editor, then re-export.`;
-      const revisionMsg =
-        `${changed.length} verse(s) show apparent alignment loss, but their word SEQUENCE also changed — D1 and ` +
-        `master hold DIFFERENT REVISIONS of these verses, and the named words are coincidental surface matches ` +
-        `between two different sentences, not a translator's mistake (the EZK 40 signature). The remedy is to fix ` +
-        `the sync / re-sync ${label} from master, NOT to re-align words.`;
-      if (changed.length === 0) {
-        message = `Benjamin fix this — nightly export BLOCKED ${label}: ${collateralMsg}`;
-      } else if (unchanged.length === 0) {
-        message = `Benjamin fix this — nightly export BLOCKED ${label}: ${revisionMsg}`;
-      } else {
-        message =
-          `Benjamin fix this — nightly export BLOCKED ${label}: mixed causes. ` +
-          `${collateralMsg} SEPARATELY, ${revisionMsg}`;
-      }
+  // Who owns each offending verse in D1, keyed by the offender's ref. Reads
+  // `verses.updated_by` (ownership) alongside bookReimport.ts's `latest_source`
+  // sub-select (which of the sync / the AI / a person wrote it last) — see
+  // offenderProvenanceFromLog for why ownership has to win over last-writer.
+  //
+  // Every path that does NOT produce a measurement records `not_checked`
+  // rather than leaving the ref to default to `unknown`: a query failure, an
+  // unparseable ref, a verse past the cap. "We never looked" and "the edit_log
+  // has nothing" are different sentences in the alert, and only the second is
+  // a finding.
+  private async readOffenderProvenance(
+    book: string,
+    resource: Resource,
+    offenders: AlignmentShrinkResult["offenders"],
+  ): Promise<Map<string, OffenderProvenance>> {
+    const out = new Map<string, OffenderProvenance>();
+    // Only sequence-CHANGED offenders are ever bucketed by provenance, so spend
+    // the cap on them — a book-wide collateral de-alignment would otherwise
+    // burn all 25 lookups on verses whose wording never consults the result.
+    const candidates = offenders.filter((o) => !o.sequenceUnchanged).map((o) => o.ref);
+    // A verse-bridge offender's ref is `chapter:start-end` (verseAlignStats
+    // keeps the USFM verse key verbatim), but D1 keys the row by the START
+    // verse alone — so match the bridge and take its start rather than
+    // dropping every bridged verse. Anything else (e.g. a `6a` verse key) is
+    // un-lookupable, not un-attributed.
+    const refs: string[] = [];
+    for (const ref of candidates) {
+      if (/^\d+:\d+(-\d+)?$/.test(ref)) refs.push(ref);
+      else out.set(ref, "not_checked");
     }
-    await this.writeAlert(source, message, `${this.env.DCS_BASE_URL}/unfoldingWord`);
+    if (refs.length === 0) return out;
+    const LOOKUP_CAP = 25;
+    const version = resource.toUpperCase();
+    for (const ref of refs.slice(LOOKUP_CAP)) out.set(ref, "not_checked");
+    const looked = refs.slice(0, LOOKUP_CAP);
+    // Key by `chapter:startVerse` so a bridge and its start verse can't be
+    // told apart — if master somehow yields both, neither gets a guess.
+    const byKey = new Map<string, string[]>();
+    for (const ref of looked) {
+      const [ch, v] = ref.split(":");
+      const key = `${ch}:${v.split("-")[0]}`;
+      byKey.set(key, [...(byKey.get(key) ?? []), ref]);
+    }
+    for (const ref of looked) out.set(ref, "not_checked");
+    const keys = [...byKey.keys()];
+    const placeholders = keys.map((_, i) => `?${i + 3}`).join(", ");
+    try {
+      const rs = await this.env.DB.prepare(
+        `SELECT chapter, verse, updated_by,
+                (SELECT source FROM edit_log
+                  WHERE kind = 'verse'
+                    AND row_key = ?1 || '/' || chapter || '/' || verse || '/' || ?2
+                    AND (book = ?1 OR book IS NULL)
+                    AND action IN ('create', 'update')
+                  ORDER BY id DESC LIMIT 1) AS latest_source
+           FROM verses
+          WHERE book = ?1 AND bible_version = ?2
+            AND chapter || ':' || verse IN (${placeholders})`,
+      )
+        .bind(book, version, ...keys)
+        .all<{ chapter: number; verse: number; updated_by: number | null; latest_source: string | null }>();
+      for (const row of rs.results) {
+        const refsForRow = byKey.get(`${row.chapter}:${row.verse}`);
+        if (!refsForRow || refsForRow.length !== 1) continue;
+        out.set(refsForRow[0], offenderProvenanceFromLog(row));
+      }
+    } catch (err) {
+      // Leave the looked-at refs on `not_checked` — a failed query measured
+      // nothing, and must not be reported as "the edit_log does not say".
+      console.log(`export: offender provenance lookup failed for ${book} ${version}: ${String(err)}`);
+    }
+    return out;
   }
 
   // Banner alert when the USFM structural validator blocks an ULT/UST export

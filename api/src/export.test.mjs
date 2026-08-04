@@ -5,7 +5,7 @@
 // instead of getting silently flattened to `\v 6`. Not a test framework;
 // failures exit non-zero.
 
-import { attributeTsvShrink, buildExportBranch, buildTnTsv, buildTqTsv, buildTwlTsv, buildUsfm, classifyAlignmentShrinkOffenders, commitToDcs, countDuplicateMasterIds, describeShrinkRefusal, ensureDcsPr, exportTsvShrinkRefused, findDcsOpenPr, parseTsvIds, recreateExportBranchFromMaster, updateDcsPrBranch, usfmAlignmentShrinkRefused } from "./export.ts";
+import { attributeTsvShrink, buildAlignmentShrinkAlertMessage, classifyAlignmentLossSeverity, offenderProvenanceFromLog, buildExportBranch, buildTnTsv, buildTqTsv, buildTwlTsv, buildUsfm, classifyAlignmentShrinkOffenders, commitToDcs, countDuplicateMasterIds, describeShrinkRefusal, ensureDcsPr, exportTsvShrinkRefused, findDcsOpenPr, parseTsvIds, recreateExportBranchFromMaster, updateDcsPrBranch, usfmAlignmentShrinkRefused } from "./export.ts";
 import { CorruptContentJsonError } from "./contentJson.ts";
 
 function assert(cond, msg) {
@@ -1439,19 +1439,19 @@ function utf8Base64(s) {
   assert(none.kind === "none", `no offenders at all → classified "none" (master_unreadable case)`);
 
   const unparseable = classifyAlignmentShrinkOffenders([
-    { ref: "*", lostWords: ["unparseable_render"], sequenceUnchanged: true },
+    { ref: "*", lostWords: ["unparseable_render"], sequenceUnchanged: true, beforeAligned: 8, afterAligned: 7 },
   ]);
   assert(unparseable.kind === "sentinel", `the "*" unparseable_render sentinel → classified "sentinel"`);
   assert(unparseable.which === "unparseable_render", `sentinel classification names which sentinel fired`);
 
   const empty = classifyAlignmentShrinkOffenders([
-    { ref: "*", lostWords: ["empty_render"], sequenceUnchanged: true },
+    { ref: "*", lostWords: ["empty_render"], sequenceUnchanged: true, beforeAligned: 8, afterAligned: 7 },
   ]);
   assert(empty.kind === "sentinel", `the "*" empty_render sentinel → classified "sentinel"`);
   assert(empty.which === "empty_render", `sentinel classification names empty_render specifically`);
 
   const genuineUnchanged = classifyAlignmentShrinkOffenders([
-    { ref: "1CH 4:21", lostWords: ["Shelah"], sequenceUnchanged: true },
+    { ref: "1CH 4:21", lostWords: ["Shelah"], sequenceUnchanged: true, beforeAligned: 8, afterAligned: 7 },
   ]);
   assert(genuineUnchanged.kind === "genuine", `a real per-verse offender → classified "genuine"`);
   assert(
@@ -1460,7 +1460,7 @@ function utf8Base64(s) {
   );
 
   const genuineChanged = classifyAlignmentShrinkOffenders([
-    { ref: "EZK 40:6", lostWords: ["steps"], sequenceUnchanged: false },
+    { ref: "EZK 40:6", lostWords: ["steps"], sequenceUnchanged: false, beforeAligned: 8, afterAligned: 7 },
   ]);
   assert(genuineChanged.kind === "genuine", `a real per-verse revision-mismatch offender → classified "genuine"`);
   assert(
@@ -1469,13 +1469,219 @@ function utf8Base64(s) {
   );
 
   const mixed = classifyAlignmentShrinkOffenders([
-    { ref: "1CH 4:21", lostWords: ["Shelah"], sequenceUnchanged: true },
-    { ref: "EZK 40:6", lostWords: ["steps"], sequenceUnchanged: false },
+    { ref: "1CH 4:21", lostWords: ["Shelah"], sequenceUnchanged: true, beforeAligned: 8, afterAligned: 7 },
+    { ref: "EZK 40:6", lostWords: ["steps"], sequenceUnchanged: false, beforeAligned: 8, afterAligned: 7 },
   ]);
   assert(mixed.kind === "genuine", `mixed unchanged+changed offenders → still classified "genuine"`);
   assert(
     mixed.unchanged.length === 1 && mixed.changed.length === 1,
     `mixed case splits correctly into both buckets`,
+  );
+}
+
+// --- buildAlignmentShrinkAlertMessage: only state a MEASURED cause ---
+// The regression: for every sequence-changed offender the alert asserted "D1
+// and master hold DIFFERENT REVISIONS ... not a translator's mistake ...
+// re-sync, NOT re-align". A changed sequence never proved that — a translator's
+// own edit changes the sequence too, and edit + collateral de-alignment is the
+// 1CH 4:21 / NUM 24 case this guard exists to catch. So a real de-alignment on
+// an edited verse was reported as a sync problem needing no re-alignment.
+{
+  const base = { label: "EZK UST", book: "EZK", resource: "ust", detail: "align_loss_1:40:6", blocking: true };
+
+  const humanEdited = buildAlignmentShrinkAlertMessage({
+    ...base,
+    offenders: [{ ref: "40:6", lostWords: ["steps"], sequenceUnchanged: false, beforeAligned: 8, afterAligned: 7 }],
+    provenance: new Map([["40:6", "human_edit"]]),
+  });
+  assert(
+    /person last edited them/.test(humanEdited) && /Re-align/.test(humanEdited),
+    `sequence changed + edit_log says a HUMAN last wrote it → real de-alignment, remedy is re-align`,
+  );
+  assert(
+    !/DIFFERENT REVISIONS|not a translator's mistake/.test(humanEdited),
+    `a human-edited offender is never described as a different-revision sync problem`,
+  );
+  assert(humanEdited.includes("40:6") && humanEdited.includes('"steps"'), `alert names the verse and the lost word`);
+
+  const syncWritten = buildAlignmentShrinkAlertMessage({
+    ...base,
+    offenders: [{ ref: "40:6", lostWords: ["steps"], sequenceUnchanged: false, beforeAligned: 8, afterAligned: 7 }],
+    provenance: new Map([["40:6", "sync_write"]]),
+  });
+  assert(
+    /out of sync \(the EZK 40 signature\)/.test(syncWritten) && /Re-sync EZK UST/.test(syncWritten),
+    `sequence changed + edit_log says the SYNC last wrote it → EZK 40 signature, remedy is re-sync`,
+  );
+  assert(
+    /coincidental surface matches/.test(syncWritten),
+    `the sync branch keeps the sentence explaining WHY the named words are noise`,
+  );
+
+  const aiWritten = buildAlignmentShrinkAlertMessage({
+    ...base,
+    offenders: [{ ref: "40:6", lostWords: ["steps"], sequenceUnchanged: false, beforeAligned: 8, afterAligned: 7 }],
+    provenance: new Map([["40:6", "ai_write"]]),
+  });
+  assert(
+    /AI pipeline last wrote them/.test(aiWritten) && /do not re-sync from master/.test(aiWritten),
+    `an AI-written verse is NOT the sync: D1 holds a revision master lacks, so re-syncing would discard it`,
+  );
+  assert(
+    !/the nightly DCS sync/.test(aiWritten),
+    `the AI bucket never claims the nightly sync wrote the verse`,
+  );
+
+  const notChecked = buildAlignmentShrinkAlertMessage({
+    ...base,
+    offenders: [
+      { ref: "40:6", lostWords: ["steps"], sequenceUnchanged: false, beforeAligned: 8, afterAligned: 7 },
+      { ref: "41:2", lostWords: ["wall"], sequenceUnchanged: false, beforeAligned: 8, afterAligned: 7 },
+    ],
+    provenance: new Map([["40:6", "human_edit"], ["41:2", "not_checked"]]),
+  });
+  assert(
+    /NOT attributed/.test(notChecked) && !/does not say who last wrote/.test(notChecked),
+    `an offender past the lookup cap is reported as un-checked, never as a measured "unknown"`,
+  );
+
+  const unknown = buildAlignmentShrinkAlertMessage({
+    ...base,
+    offenders: [{ ref: "40:6", lostWords: ["steps"], sequenceUnchanged: false, beforeAligned: 8, afterAligned: 7 }],
+    provenance: new Map(),
+  });
+  assert(
+    /EITHER real de-alignment/.test(unknown) && /OR D1 drifting out of sync/.test(unknown),
+    `no provenance measured → the alert names both possibilities instead of asserting one`,
+  );
+
+  const mixedMsg = buildAlignmentShrinkAlertMessage({
+    ...base,
+    offenders: [
+      { ref: "40:5", lostWords: ["gate"], sequenceUnchanged: true, beforeAligned: 8, afterAligned: 7 },
+      { ref: "40:6", lostWords: ["steps"], sequenceUnchanged: false, beforeAligned: 8, afterAligned: 7 },
+    ],
+    provenance: new Map([["40:6", "sync_write"]]),
+  });
+  assert(
+    /collateral\s+de-alignment signature/.test(mixedMsg) && /Re-sync EZK UST/.test(mixedMsg),
+    `mixed causes report both remedies, each attached to its own verses`,
+  );
+
+  // The non-genuine branches keep their existing wording.
+  const fetchFail = buildAlignmentShrinkAlertMessage({
+    ...base,
+    detail: "master_unreadable",
+    offenders: [],
+    provenance: new Map(),
+  });
+  assert(/connectivity/.test(fetchFail), `no offenders → still reported as a DCS fetch problem`);
+  const sentinel = buildAlignmentShrinkAlertMessage({
+    ...base,
+    offenders: [{ ref: "*", lostWords: ["empty_render"], sequenceUnchanged: true, beforeAligned: 8, afterAligned: 7 }],
+    provenance: new Map(),
+  });
+  assert(/EMPTY/.test(sentinel), `the empty_render sentinel → still reported as our own render bug`);
+}
+
+// --- classifyAlignmentLossSeverity: ship unless it looks like OUR bug ---
+// Policy (Benjamin, 2026-08-04): "an unaligned word or two here or there is no
+// reason not to sync to Door43 ... don't hold somebody's work back cause he
+// didn't drag 'and' to the right spot." Detection stays; the embargo narrows to
+// loss no translator could have produced by hand.
+{
+  const verse = (ref, lost, before, after) => ({
+    ref,
+    lostWords: Array.from({ length: lost }, (_, i) => `w${i}`),
+    sequenceUnchanged: true,
+    beforeAligned: before,
+    afterAligned: after,
+  });
+
+  assert(
+    classifyAlignmentLossSeverity([verse("40:6", 1, 12, 11)]).block === false,
+    `one undragged word in one verse SHIPS — that is what the broken-link icon is for`,
+  );
+  assert(
+    classifyAlignmentLossSeverity([verse("40:6", 2, 12, 10), verse("41:2", 1, 9, 8)]).block === false,
+    `a couple of words across two verses still ships`,
+  );
+  assert(
+    classifyAlignmentLossSeverity([verse("40:6", 9, 9, 0)]).block === true,
+    `a FLATTENED verse (master aligned, render has none) still blocks — nobody does that by hand`,
+  );
+  assert(
+    classifyAlignmentLossSeverity([verse("40:6", 6, 12, 6)]).block === true,
+    `losing half a verse's aligned words at once blocks — dragging happens one word at a time`,
+  );
+  assert(
+    classifyAlignmentLossSeverity([verse("40:6", 4, 40, 36)]).block === false,
+    `four words out of forty is translator-scale, not a flatten`,
+  );
+  assert(
+    classifyAlignmentLossSeverity(
+      Array.from({ length: 21 }, (_, i) => verse(`40:${i + 1}`, 1, 12, 11)),
+    ).block === true,
+    `21 verses each losing a word is systemic — that is a bug, not a person`,
+  );
+  assert(
+    classifyAlignmentLossSeverity([]).block === true,
+    `no offenders means master was unverifiable — still blocks`,
+  );
+  assert(
+    classifyAlignmentLossSeverity([
+      { ref: "*", lostWords: ["empty_render"], sequenceUnchanged: true, beforeAligned: 0, afterAligned: 0 },
+    ]).block === true,
+    `a broken render is our bug by definition — still blocks`,
+  );
+
+  // A shipped-anyway alert must not claim the export was blocked.
+  const shipped = buildAlignmentShrinkAlertMessage({
+    label: "EZK UST",
+    book: "EZK",
+    resource: "ust",
+    detail: "align_loss_1:40:6",
+    offenders: [verse("40:6", 1, 12, 11)],
+    provenance: new Map([["40:6", "human_edit"]]),
+    blocking: false,
+  });
+  assert(
+    /shipped to Door43/.test(shipped) && !/BLOCKED/.test(shipped),
+    `the ship-anyway alert says the book went out, never that it was blocked`,
+  );
+  assert(/Nothing is held up/.test(shipped), `and says plainly that nobody's work is waiting on it`);
+}
+
+// --- offenderProvenanceFromLog: edit_log row → who last wrote the verse ---
+{
+  assert(
+    offenderProvenanceFromLog({ updated_by: 7, latest_source: null }) === "human_edit",
+    `updated_by set = translator-owned (verses.ts logs no source column)`,
+  );
+  assert(
+    offenderProvenanceFromLog({ updated_by: null, latest_source: "dcs_reimport" }) === "sync_write",
+    `master-owned + source=dcs_reimport = the nightly sync wrote it`,
+  );
+  // The regression this ordering exists for: bookReimport's source-attr
+  // reconcile rewrites a TRANSLATOR-owned verse and logs it as dcs_reimport.
+  // Reading the last writer alone would call it a sync write and advise
+  // re-syncing from master — discarding the translator's revision.
+  assert(
+    offenderProvenanceFromLog({ updated_by: 7, latest_source: "dcs_reimport" }) === "human_edit",
+    `a sync RECONCILE on a translator-owned verse stays human_edit — ownership beats last-writer`,
+  );
+  assert(
+    offenderProvenanceFromLog({ updated_by: 1, latest_source: "ai_pipeline" }) === "ai_write",
+    `source=ai_pipeline gets its OWN bucket — it is not the sync, and master does not hold that revision`,
+  );
+  assert(offenderProvenanceFromLog(null) === "unknown", `no verses row at all → unknown, never guessed`);
+  assert(
+    offenderProvenanceFromLog({ updated_by: null, latest_source: null }) === "unknown",
+    `master-owned with no edit_log source → unknown rather than assumed sync`,
+  );
+  assert(
+    offenderProvenanceFromLog({ updated_by: null, latest_source: "some_future_writer" }) === "unknown",
+    `an unrecognised source is unknown — the sync bucket is an allowlist, not a catch-all`,
   );
 }
 
