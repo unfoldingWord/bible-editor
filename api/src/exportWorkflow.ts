@@ -1414,6 +1414,13 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     offenders: AlignmentShrinkResult["offenders"],
     provenance: Map<string, OffenderProvenance>,
   ): Promise<void> {
+    // Drop the synthetic `ref: "*"` sentinels (export.ts's unparseable_render /
+    // empty_render). They mean OUR OWN render was broken, so no verse was ever
+    // compared against master — they are not per-verse evidence, they aren't
+    // navigable, and the read endpoint filters them out anyway. Treating them
+    // as a snapshot would replace real findings with a row nobody can act on,
+    // which is the same erasure the empty-list guard below prevents.
+    const perVerse = offenders.filter((o) => o.ref !== "*");
     // An EMPTY offender list here never means "measured and clean" — the clean
     // case is handled by clearAlignmentAttention on the `detail === "ok"` path.
     // It means the guard failed without per-verse detail (master_unreadable:
@@ -1423,14 +1430,14 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     // the export blocks, but the sticky indicator would go quiet, which is
     // exactly the "unmeasured outcome presented as evidence" failure this
     // file's alert wording was already fixed for. Keep the prior evidence.
-    if (offenders.length === 0) return;
+    if (perVerse.length === 0) return;
     try {
       const statements = [
         this.env.DB.prepare(`DELETE FROM alignment_attention WHERE book = ?1 AND resource = ?2`).bind(
           book,
           resource,
         ),
-        ...offenders.map((o) =>
+        ...perVerse.map((o) =>
           this.env.DB.prepare(
             // OR REPLACE, not plain INSERT: the batch is one transaction, so a
             // single duplicate ref in `offenders` would violate the unique
