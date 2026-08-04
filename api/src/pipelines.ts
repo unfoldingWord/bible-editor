@@ -20,6 +20,7 @@ import { z } from "zod";
 import type { Env } from "./index";
 import { currentUserId, requireEditor } from "./auth.ts";
 import { importJobOutput } from "./pipelineImport.ts";
+import { IMPORT_CLAIM_STALE_SECONDS } from "./pipelineImportClaim.ts";
 import { resourcesLockedByJob } from "./chapterLock.ts";
 import { broadcastChapter } from "./wsEvents.ts";
 
@@ -864,10 +865,13 @@ export async function pollPipelineJob(
   // to prevent it. Narrow but real — this is exactly the window a merge review
   // flagged as High severity.
   //
-  // RESIDUAL GAP, deliberately not closed here: a force-stop landing *during*
-  // importJobOutput still applies, because the apply has no cancellation point.
-  // Closing that means threading a check through the apply loop; out of scope
-  // for #398 and called out in the PR.
+  // GAP CLOSED (#402): a force-stop (or any terminal transition) landing
+  // *during* importJobOutput now stops the apply at the next batch boundary —
+  // see maybeCheckCancelled / CancelWatch in pipelineImport.ts, threaded
+  // through the stage and apply loops. The re-read here remains worthwhile as
+  // the cheap fast path: it catches a stop that already landed BEFORE this
+  // point and skips starting an apply at all, which is strictly cheaper than
+  // starting one only to have it stop a few batches in.
   const liveState = await env.DB.prepare(
     `SELECT state, error_kind FROM pipeline_jobs WHERE job_id = ?1`,
   )
@@ -906,6 +910,22 @@ export async function pollPipelineJob(
         },
         data.output,
       );
+      if (importResult.aborted) {
+        // #402: the job was deliberately stopped (force-stop or cancel) while
+        // this apply was in flight, and the apply stopped at a batch boundary
+        // per the keep-and-record policy —
+        // everything already applied stays, nothing here rolls it back.
+        // Return the upstream status unchanged, same as claimLost below: do
+        // NOT finalize, broadcast, or enqueue the follow-up chain for a job
+        // that just went terminal mid-apply.
+        console.warn(`[pollPipelineJob] job=${job.job_id} import aborted mid-apply`, {
+          jobId: job.job_id,
+          abortState: importResult.abortState,
+          abortErrorKind: importResult.abortErrorKind,
+          affectedChapters: importResult.applied?.affectedChapters,
+        });
+        return { kind: "ok", text, status: upstream.status, state: data.state ?? "running" };
+      }
       if (importResult.claimLost) {
         // A concurrent poll (the other of cron / open-tab) owns this import and
         // may still be mid-apply. Do NOT fall through to the finalize+follow-up
@@ -1064,9 +1084,11 @@ export async function pollPipelineJob(
   // force-stop landing mid-apply must not have the poll that started it turn
   // around and broadcast the chapter as updated, enqueue the next stage of a
   // follow-up chain, or hand the freed slot to a new job on this job's
-  // behalf. (Full prevention of a mid-flight importJobOutput write itself —
-  // i.e. cancelling the apply once it has started — is out of scope here;
-  // this only stops what happens AFTER that write, once we reach this point.)
+  // behalf. (Mid-flight cancellation of an apply already in progress is
+  // handled separately — see maybeCheckCancelled / CancelWatch in
+  // pipelineImport.ts, #402 — which stops the apply itself at the next batch
+  // boundary. This guard only stops what happens AFTER a write that DID land,
+  // once we reach this point.)
   const pollWriteLanded = (guardedUpdate.meta?.changes ?? 0) > 0;
   if (!pollWriteLanded) {
     console.warn(
@@ -1239,6 +1261,20 @@ export async function pollAllNonTerminal(env: Env): Promise<void> {
   // pollAllNonTerminal non-throwing, which also protects the stale-lock and
   // edit_log sweeps that run after it in index.ts's POLL_CRON branch.
   try {
+    // Each sweep below excludes jobs with a LIVE import claim
+    // (import_claimed_at newer than IMPORT_CLAIM_STALE_SECONDS). A live,
+    // heartbeating import claim is positive evidence an apply is in flight
+    // right now — these sweeps exist to catch jobs where NOTHING is
+    // happening, and a DAN-11-scale apply (~12 minutes) outlives the */5 tick
+    // that runs this function, so without this exclusion a healthy, actively-
+    // progressing apply gets auto-failed out from under itself. That is also
+    // why shouldAbortApply (pipelineImportClaim.ts) deliberately does NOT
+    // treat error_kind='interrupted' as a stop signal: fixing the sentinel's
+    // blindness here is the right layer, and honouring it there would have
+    // permanently discarded a completed run's output. The stale
+    // window is the same one the claim mechanism itself uses for crash
+    // recovery, so a genuinely dead claim (the importer's Worker died with no
+    // further heartbeat) is still swept on schedule.
     await env.DB.prepare(
       `UPDATE pipeline_jobs
           SET state = 'failed',
@@ -1246,9 +1282,10 @@ export async function pollAllNonTerminal(env: Env): Promise<void> {
               error_message = 'auto-failed: no progress for 48h',
               updated_at = unixepoch()
         WHERE state IN ('running', 'paused_for_outage', 'paused_for_usage_limit')
-          AND updated_at < unixepoch() - ?1`,
+          AND updated_at < unixepoch() - ?1
+          AND (import_claimed_at IS NULL OR import_claimed_at < unixepoch() - ?2)`,
     )
-      .bind(STUCK_JOB_THRESHOLD_SECONDS)
+      .bind(STUCK_JOB_THRESHOLD_SECONDS, IMPORT_CLAIM_STALE_SECONDS)
       .run();
     // Auto-fail anything that has been polled more than MAX_POLL_ATTEMPTS times
     // without reaching a terminal state. Independent backstop from the time-
@@ -1260,12 +1297,16 @@ export async function pollAllNonTerminal(env: Env): Promise<void> {
               error_message = 'auto-failed: poll attempts exhausted',
               updated_at = unixepoch()
         WHERE state IN ('running', 'paused_for_outage', 'paused_for_usage_limit')
-          AND attempt_count > ?1`,
+          AND attempt_count > ?1
+          AND (import_claimed_at IS NULL OR import_claimed_at < unixepoch() - ?2)`,
     )
-      .bind(MAX_POLL_ATTEMPTS)
+      .bind(MAX_POLL_ATTEMPTS, IMPORT_CLAIM_STALE_SECONDS)
       .run();
     // Recover wedged dispatches so a dead-mid-POST Worker can't hold the slot
-    // forever.
+    // forever. No import-claim exclusion here (unlike the two sweeps above):
+    // a row in 'dispatching' hasn't been polled to 'done' yet, so it can never
+    // hold a live import claim — that exclusion only matters for the two
+    // sweeps that can actually catch a job with an in-flight apply.
     await env.DB.prepare(
       `UPDATE pipeline_jobs
           SET state = 'failed',

@@ -112,3 +112,76 @@ export function shouldTouchClaim(
 ): boolean {
   return now - lastTouchedAt >= intervalSeconds;
 }
+
+// True ONLY when a human or user has DELIBERATELY stopped this run — i.e. the
+// apply must stop at its next checkpoint. Nothing else — no inferred state,
+// no "another poll must have finished it" reasoning — returns true here.
+//
+// This is deliberately narrower than "any non-live state". The original
+// version aborted on ANY state outside a fixed allowlist of "live" states,
+// which silently included state='failed', error_kind='interrupted' — the
+// blunt timer sentinel pollAllNonTerminal stamps on any job that hasn't
+// progressed in a while (48h no-progress, poll-attempt exhaustion, or a stuck
+// dispatch). That sentinel is KNOWN to fire on healthy, still-running jobs —
+// it is a timer, not a decision, and it knows nothing about an apply in
+// flight. Aborting on it would PERMANENTLY discard a completed AI run's
+// output: an aborted job is terminal, and nothing ever re-enters
+// importJobOutput for a terminal job (pollAllNonTerminal only selects
+// running/paused_*, the GET route short-circuits terminal jobs, and the
+// nightly cleanup drops unresolved pending_imports within 24h). Treating a
+// blind timer as a stop signal is strictly worse than the bug being fixed
+// here. The sentinel's blindness to in-flight applies is fixed at its own
+// source instead — pollAllNonTerminal (pipelines.ts) now excludes jobs with a
+// live import claim from all three of its backstop sweeps.
+//
+// `error_kind === "import_failed"` is likewise excluded even though state is
+// 'failed': that is THIS VERY IMPORT's own one-retry path (pollPipelineJob
+// holds state at 'running' on the first import failure, then marks
+// 'failed'/'import_failed' only after a second). Aborting on it would make
+// the retry impossible.
+//
+// `state === "done"` is ALSO excluded, and used to be treated as an abort
+// signal on the theory that "another poll already finalized this import."
+// That inference is wrong and the check is unnecessary: the CAS import claim
+// (mayClaimImport above) already prevents two concurrent applies, so no
+// legitimate scenario needs 'done' to mean "stop." Worse, it is reachable
+// spuriously — a second poll whose upstream reports 'done' with an empty
+// output[] array skips the import entirely and writes state='done' on its
+// own, which would abort a healthy, still-writing apply and strand its
+// remaining proposals with no retry path (a terminal job never re-enters
+// importJobOutput, per the same reasoning as the interrupted-sentinel case
+// above).
+//
+// A null/undefined/empty state (a failed or missing pipeline_jobs read)
+// ALWAYS returns false — a failed read is not evidence the job went
+// terminal, and treating it as such would abort a perfectly healthy
+// in-flight apply on a transient glitch.
+export function shouldAbortApply(
+  state: string | null | undefined,
+  errorKind: string | null | undefined,
+): boolean {
+  if (state == null || state === "") return false;
+  if (state === "cancelled") return true;
+  if (state === "failed" && errorKind === "force_stopped") return true;
+  return false;
+}
+
+// How often the apply loops re-check pipeline_jobs.state/error_kind for a
+// terminal transition mid-flight. Deliberately shorter than
+// CLAIM_TOUCH_INTERVAL_SECONDS (60s): this is a responsiveness bound on how
+// long an apply keeps writing after a human force-stops it, not a lease-
+// staleness window — a translator watching the UI expects a stop to actually
+// stop within a few seconds, not a minute. It's also cheap to check often: one
+// SELECT, not a write, so there's no reason to tie it to the heartbeat's
+// interval.
+export const CANCEL_CHECK_INTERVAL_SECONDS = 15;
+
+// Pure rate-limit predicate for the cancellation check, same shape as
+// shouldTouchClaim.
+export function shouldCheckCancel(
+  lastCheckedAt: number,
+  now: number,
+  intervalSeconds: number = CANCEL_CHECK_INTERVAL_SECONDS,
+): boolean {
+  return now - lastCheckedAt >= intervalSeconds;
+}
