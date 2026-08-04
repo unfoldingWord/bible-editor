@@ -24,6 +24,7 @@ import { canonizeAlignmentSource } from "./canonizeHebrew.ts";
 import { NT_BOOKS } from "./dcsSources.ts";
 import { newRowId, isValidRowId } from "./rowId.ts";
 import { tnContentKey } from "./tnDedup.ts";
+import { requiredOccurrence } from "./occurrenceRule.ts";
 import {
   IMPORT_CLAIM_STALE_SECONDS,
   shouldTouchClaim,
@@ -100,7 +101,16 @@ interface StagedRow {
 function tnPayload(book: string, refRaw: string, row: Record<string, string>) {
   const [ch, v] = refParts(refRaw);
   const occRaw = row["Occurrence"];
-  const occurrence = occRaw === "" || occRaw == null ? null : parseInt(occRaw, 10) || 0;
+  const parsedOcc = occRaw === "" || occRaw == null ? null : parseInt(occRaw, 10) || 0;
+  const quote = row["Quote"] || null;
+  // Hold the AI to the same Occurrence invariant as the editor. Unlike
+  // bookImport/bookReimport — which round-trip DCS master and must preserve its
+  // blanks verbatim — this payload is freshly generated content, so a blank or
+  // illegal Occurrence here is a defect to fix at ingest, not history to keep.
+  // Without this, a proposed note carrying a Gateway-Language quote and no
+  // Occurrence lands exactly the row shape prod tn JER 37:5 `bfyt` has been
+  // holding all of JER TN's export with. See occurrenceRule.ts.
+  const occurrence = requiredOccurrence("tn", quote, parsedOcc) ?? parsedOcc;
   return {
     chapter: ch,
     verse: v,
@@ -112,7 +122,7 @@ function tnPayload(book: string, refRaw: string, row: Record<string, string>) {
       ref_raw: refRaw,
       tags: row["Tags"] || null,
       support_reference: row["SupportReference"] || null,
-      quote: row["Quote"] || null,
+      quote,
       occurrence,
       // Collapse bp-assistant's double-space-after-punctuation artifact so the
       // stored note matches DCS master's normalized form (see
@@ -126,7 +136,12 @@ function tnPayload(book: string, refRaw: string, row: Record<string, string>) {
 function tqPayload(book: string, refRaw: string, row: Record<string, string>) {
   const [ch, v] = refParts(refRaw);
   const occRaw = row["Occurrence"];
-  const occurrence = occRaw === "" || occRaw == null ? null : parseInt(occRaw, 10) || 0;
+  const parsedOcc = occRaw === "" || occRaw == null ? null : parseInt(occRaw, 10) || 0;
+  const quote = row["Quote"] || null;
+  // Same invariant as tnPayload above — see occurrenceRule.ts. tq's validator
+  // permits a blank Occurrence, so in practice this only heals an
+  // original-language quote or an out-of-range integer.
+  const occurrence = requiredOccurrence("tq", quote, parsedOcc) ?? parsedOcc;
   return {
     chapter: ch,
     verse: v,
@@ -137,7 +152,7 @@ function tqPayload(book: string, refRaw: string, row: Record<string, string>) {
       verse: v,
       ref_raw: refRaw,
       tags: row["Tags"] || null,
-      quote: row["Quote"] || null,
+      quote,
       occurrence,
       question: row["Question"] || null,
       response: row["Response"] || null,
