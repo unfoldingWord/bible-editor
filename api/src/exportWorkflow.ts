@@ -36,9 +36,11 @@ import {
   recreateExportBranchFromMaster,
   updateDcsPrBranch,
   usfmAlignmentShrinkRefused,
-  classifyAlignmentShrinkOffenders,
+  buildAlignmentShrinkAlertMessage,
+  offenderProvenanceFromLog,
   RESOURCE_TARGETS,
   type AlignmentShrinkResult,
+  type OffenderProvenance,
   type Resource,
 } from "./export";
 
@@ -1337,6 +1339,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
   ): Promise<void> {
     const source = `export_align_shrink:${book}:${resource}`;
     const label = `${book} ${resource.toUpperCase()}`;
+    const provenance = await this.readOffenderProvenance(book, resource, offenders);
     // classifyAlignmentShrinkOffenders (export.ts) splits offenders into three
     // cases that must NOT share generic "lost alignment, re-align it" wording:
     //
@@ -1352,47 +1355,71 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     //   a translator's), which the old wording also reported as collateral
     //   de-alignment needing re-alignment.
     //
-    //   "genuine" — real per-verse offenders, split by sequenceUnchanged:
-    //   collateral de-alignment on UNCHANGED text (1CH 4:21 / JER 36:11
-    //   signature) vs. D1/master holding DIFFERENT REVISIONS of the verse
-    //   (the EZK 40 signature, fixed separately by withholding the sync
-    //   watermark on locked chapters — see bookReimport.ts's reimport-sync
-    //   step). None of this changes the refusal decision above, only wording.
-    const classification = classifyAlignmentShrinkOffenders(offenders);
-
-    let message: string;
-    if (classification.kind === "none") {
-      message =
-        `Benjamin fix this — nightly export BLOCKED ${label}: could not verify the render against master ` +
-        `(${detail}) — this is a DCS connectivity / fetch problem, not an alignment mistake. Inspect the export ` +
-        `run (wrangler tail / DCS status), then re-export once master is readable again. No verse needs re-aligning.`;
-    } else if (classification.kind === "sentinel") {
-      message =
-        `Benjamin fix this — nightly export BLOCKED ${label}: the render itself was ${classification.which === "empty_render" ? "EMPTY" : "UNPARSEABLE"} ` +
-        `(${detail}). This points at a bug in OUR render, not at anything a translator needs to re-align. ` +
-        `Inspect the export run's output for ${book} ${resource.toUpperCase()} before re-exporting.`;
-    } else {
-      const { unchanged, changed } = classification;
-      const collateralMsg =
-        `${unchanged.length} verse(s) lost \\zaln word alignment on text that is UNCHANGED ` +
-        `(${detail}). This is the 1CH 4:21 / NUM 24 / JER 36:11 collateral de-alignment ` +
-        `signature — refusing to ship it to master. Re-align the affected verse(s) in the editor, then re-export.`;
-      const revisionMsg =
-        `${changed.length} verse(s) show apparent alignment loss, but their word SEQUENCE also changed — D1 and ` +
-        `master hold DIFFERENT REVISIONS of these verses, and the named words are coincidental surface matches ` +
-        `between two different sentences, not a translator's mistake (the EZK 40 signature). The remedy is to fix ` +
-        `the sync / re-sync ${label} from master, NOT to re-align words.`;
-      if (changed.length === 0) {
-        message = `Benjamin fix this — nightly export BLOCKED ${label}: ${collateralMsg}`;
-      } else if (unchanged.length === 0) {
-        message = `Benjamin fix this — nightly export BLOCKED ${label}: ${revisionMsg}`;
-      } else {
-        message =
-          `Benjamin fix this — nightly export BLOCKED ${label}: mixed causes. ` +
-          `${collateralMsg} SEPARATELY, ${revisionMsg}`;
-      }
-    }
+    //   "genuine" — real per-verse offenders. A changed word SEQUENCE used to
+    //   be reported, on its own, as proof that D1 and master hold different
+    //   REVISIONS ("not a translator's mistake ... re-sync, NOT re-align").
+    //   That asserted a cause we never measured: a translator editing a verse
+    //   changes the sequence too, and an edit PLUS collateral de-alignment is
+    //   exactly the 1CH 4:21 / NUM 24 incident this guard exists to catch — so
+    //   the old wording told Benjamin to go fix the sync for a verse that
+    //   genuinely needed re-aligning. buildAlignmentShrinkAlertMessage now
+    //   splits that group by a measured signal instead: who last wrote the
+    //   verse in D1, per the `kind='verse'` edit_log. None of this changes the
+    //   refusal decision above, only what the alert says.
+    const message = buildAlignmentShrinkAlertMessage({
+      label,
+      book,
+      resource,
+      detail,
+      offenders,
+      provenance,
+    });
     await this.writeAlert(source, message, `${this.env.DCS_BASE_URL}/unfoldingWord`);
+  }
+
+  // Who last wrote each offending verse in D1, keyed by the offender's
+  // `chapter:verse` ref. Mirrors bookReimport.ts's `latest_source` sub-select:
+  // a human editor edit logs no `source` (and a `user_id`), the nightly sync
+  // logs `dcs_reimport`, the AI pipeline logs `ai_pipeline`. Best-effort — any
+  // failure or missing row degrades to "unknown", which the alert reports
+  // honestly rather than guessing a cause.
+  private async readOffenderProvenance(
+    book: string,
+    resource: Resource,
+    offenders: AlignmentShrinkResult["offenders"],
+  ): Promise<Map<string, OffenderProvenance>> {
+    const out = new Map<string, OffenderProvenance>();
+    const refs = offenders.map((o) => o.ref).filter((ref) => /^\d+:\d+$/.test(ref));
+    if (refs.length === 0) return out;
+    // Cap the IN list so a book-wide de-alignment can't build a huge statement;
+    // the alert only names the first handful of offenders anyway.
+    const capped = refs.slice(0, 25);
+    const version = resource.toUpperCase();
+    const byRowKey = new Map(capped.map((ref) => {
+      const [ch, v] = ref.split(":");
+      return [`${book}/${ch}/${v}/${version}`, ref];
+    }));
+    const keys = [...byRowKey.keys()];
+    const placeholders = keys.map((_, i) => `?${i + 1}`).join(", ");
+    try {
+      const rs = await this.env.DB.prepare(
+        `SELECT row_key, source, user_id FROM edit_log
+          WHERE kind = 'verse' AND row_key IN (${placeholders})
+            AND action IN ('create', 'update')
+            AND id = (SELECT MAX(id) FROM edit_log e2
+                       WHERE e2.kind = 'verse' AND e2.row_key = edit_log.row_key
+                         AND e2.action IN ('create', 'update'))`,
+      )
+        .bind(...keys)
+        .all<{ row_key: string; source: string | null; user_id: number | null }>();
+      for (const row of rs.results) {
+        const ref = byRowKey.get(row.row_key);
+        if (ref) out.set(ref, offenderProvenanceFromLog(row));
+      }
+    } catch (err) {
+      console.log(`export: offender provenance lookup failed for ${book} ${version}: ${String(err)}`);
+    }
+    return out;
   }
 
   // Banner alert when the USFM structural validator blocks an ULT/UST export

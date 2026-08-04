@@ -682,6 +682,121 @@ export function classifyAlignmentShrinkOffenders(
   };
 }
 
+// What D1 last recorded as the writer of an offending verse, read from the
+// `kind='verse'` edit_log (the same provenance signal bookReimport.ts's
+// `latest_source` sub-select uses): a human edit in the editor logs no
+// `source`, the nightly DCS sync logs `dcs_reimport`, the AI pipeline logs
+// `ai_pipeline`.
+export type OffenderProvenance = "human_edit" | "sync_write" | "unknown";
+
+export function offenderProvenanceFromLog(row: {
+  source: string | null;
+  user_id: number | null;
+} | null | undefined): OffenderProvenance {
+  if (!row) return "unknown";
+  if (row.source == null || row.source === "") return row.user_id == null ? "unknown" : "human_edit";
+  return "sync_write";
+}
+
+function describeOffenders(offenders: AlignmentShrinkResult["offenders"], limit = 5): string {
+  const shown = offenders
+    .slice(0, limit)
+    .map((o) => {
+      const words = o.lostWords.slice(0, 3).map((w) => `"${w}"`).join(", ");
+      const extra = o.lostWords.length - 3;
+      return `${o.ref} (${words}${extra > 0 ? ` +${extra} more` : ""})`;
+    })
+    .join("; ");
+  const rest = offenders.length - limit;
+  return rest > 0 ? `${shown}; +${rest} more verse(s)` : shown;
+}
+
+// Build the nightly alignment-shrink alert text.
+//
+// The rule this function exists to enforce: **the alert may only state a cause
+// it actually measured.** The previous wording asserted, for every offender
+// whose word SEQUENCE differed from master, that "D1 and master hold DIFFERENT
+// REVISIONS ... not a translator's mistake ... re-sync, NOT re-align". A
+// changed sequence does not establish that. A translator editing a verse in the
+// editor changes the sequence too — and that case (a genuine text edit PLUS
+// collateral de-alignment) is precisely the 1CH 4:21 / NUM 24 incident this
+// whole guard was built for. Telling Benjamin "not a translator's mistake" and
+// pointing him at the sync made the alert a false negative for real alignment
+// loss on an edited verse.
+//
+// So the sequence-changed group is now split by a signal we DO measure: who
+// last wrote the verse in D1, per the edit_log. Last written by the sync →
+// D1 never carried a translator revision, so a sequence difference against
+// master really is a stale/skipped sync. Last written by a human → the
+// revision is ours and the lost \zaln sources are real. Unknown → say so and
+// name both, rather than pick one.
+export function buildAlignmentShrinkAlertMessage(args: {
+  label: string;
+  book: string;
+  resource: string;
+  detail: string;
+  offenders: AlignmentShrinkResult["offenders"];
+  provenance: Map<string, OffenderProvenance>;
+}): string {
+  const { label, book, resource, detail, offenders, provenance } = args;
+  const classification = classifyAlignmentShrinkOffenders(offenders);
+  const head = `Benjamin fix this — nightly export BLOCKED ${label}: `;
+
+  if (classification.kind === "none") {
+    return (
+      `${head}could not verify the render against master (${detail}) — this is a DCS connectivity / ` +
+      `fetch problem, not an alignment mistake. Inspect the export run (wrangler tail / DCS status), ` +
+      `then re-export once master is readable again. No verse needs re-aligning.`
+    );
+  }
+  if (classification.kind === "sentinel") {
+    return (
+      `${head}the render itself was ${classification.which === "empty_render" ? "EMPTY" : "UNPARSEABLE"} ` +
+      `(${detail}). This points at a bug in OUR render, not at anything a translator needs to re-align. ` +
+      `Inspect the export run's output for ${book} ${resource.toUpperCase()} before re-exporting.`
+    );
+  }
+
+  const { unchanged, changed } = classification;
+  const humanEdited = changed.filter((o) => provenance.get(o.ref) === "human_edit");
+  const syncWritten = changed.filter((o) => provenance.get(o.ref) === "sync_write");
+  const unknown = changed.filter((o) => (provenance.get(o.ref) ?? "unknown") === "unknown");
+
+  const parts: string[] = [];
+  if (unchanged.length > 0) {
+    parts.push(
+      `${unchanged.length} verse(s) lost \\zaln word alignment on text that is UNCHANGED — ` +
+        `${describeOffenders(unchanged)}. This is the 1CH 4:21 / NUM 24 / JER 36:11 collateral ` +
+        `de-alignment signature. Re-align those verse(s) in the editor, then re-export.`,
+    );
+  }
+  if (humanEdited.length > 0) {
+    parts.push(
+      `${humanEdited.length} verse(s) lost \\zaln word alignment on text that ALSO changed, and D1's ` +
+        `edit_log says a person last edited them in the editor — ${describeOffenders(humanEdited)}. ` +
+        `The revision is ours, so this is real collateral de-alignment from that edit. Re-align those ` +
+        `verse(s), then re-export.`,
+    );
+  }
+  if (syncWritten.length > 0) {
+    parts.push(
+      `${syncWritten.length} verse(s) lost \\zaln word alignment on text that ALSO changed, but D1's ` +
+        `edit_log says the nightly DCS sync — not a person — last wrote them, so D1 holds no translator ` +
+        `revision of them: D1 and master are out of sync (the EZK 40 signature) — ${describeOffenders(syncWritten)}. ` +
+        `Re-sync ${label} from master rather than re-aligning.`,
+    );
+  }
+  if (unknown.length > 0) {
+    parts.push(
+      `${unknown.length} verse(s) lost \\zaln word alignment on text that ALSO changed, and D1's edit_log ` +
+        `does not say who last wrote them — ${describeOffenders(unknown)}. This is EITHER real ` +
+        `de-alignment from an edit (re-align) OR D1 drifting out of sync with master (re-sync); open the ` +
+        `verse(s) and compare against master before choosing.`,
+    );
+  }
+  return `${head}${parts.join(" SEPARATELY, ")} (${detail})`;
+}
+
 // ── USFM rebuilder ───────────────────────────────────────────────────────────
 
 export interface UsfmInputs {

@@ -5,7 +5,7 @@
 // instead of getting silently flattened to `\v 6`. Not a test framework;
 // failures exit non-zero.
 
-import { attributeTsvShrink, buildExportBranch, buildTnTsv, buildTqTsv, buildTwlTsv, buildUsfm, classifyAlignmentShrinkOffenders, commitToDcs, countDuplicateMasterIds, describeShrinkRefusal, ensureDcsPr, exportTsvShrinkRefused, findDcsOpenPr, parseTsvIds, recreateExportBranchFromMaster, updateDcsPrBranch, usfmAlignmentShrinkRefused } from "./export.ts";
+import { attributeTsvShrink, buildAlignmentShrinkAlertMessage, offenderProvenanceFromLog, buildExportBranch, buildTnTsv, buildTqTsv, buildTwlTsv, buildUsfm, classifyAlignmentShrinkOffenders, commitToDcs, countDuplicateMasterIds, describeShrinkRefusal, ensureDcsPr, exportTsvShrinkRefused, findDcsOpenPr, parseTsvIds, recreateExportBranchFromMaster, updateDcsPrBranch, usfmAlignmentShrinkRefused } from "./export.ts";
 import { CorruptContentJsonError } from "./contentJson.ts";
 
 function assert(cond, msg) {
@@ -1476,6 +1476,101 @@ function utf8Base64(s) {
   assert(
     mixed.unchanged.length === 1 && mixed.changed.length === 1,
     `mixed case splits correctly into both buckets`,
+  );
+}
+
+// --- buildAlignmentShrinkAlertMessage: only state a MEASURED cause ---
+// The regression: for every sequence-changed offender the alert asserted "D1
+// and master hold DIFFERENT REVISIONS ... not a translator's mistake ...
+// re-sync, NOT re-align". A changed sequence never proved that — a translator's
+// own edit changes the sequence too, and edit + collateral de-alignment is the
+// 1CH 4:21 / NUM 24 case this guard exists to catch. So a real de-alignment on
+// an edited verse was reported as a sync problem needing no re-alignment.
+{
+  const base = { label: "EZK UST", book: "EZK", resource: "ust", detail: "align_loss_1:40:6" };
+
+  const humanEdited = buildAlignmentShrinkAlertMessage({
+    ...base,
+    offenders: [{ ref: "40:6", lostWords: ["steps"], sequenceUnchanged: false }],
+    provenance: new Map([["40:6", "human_edit"]]),
+  });
+  assert(
+    /person last edited them/.test(humanEdited) && /Re-align/.test(humanEdited),
+    `sequence changed + edit_log says a HUMAN last wrote it → real de-alignment, remedy is re-align`,
+  );
+  assert(
+    !/DIFFERENT REVISIONS|not a translator's mistake/.test(humanEdited),
+    `a human-edited offender is never described as a different-revision sync problem`,
+  );
+  assert(humanEdited.includes("40:6") && humanEdited.includes('"steps"'), `alert names the verse and the lost word`);
+
+  const syncWritten = buildAlignmentShrinkAlertMessage({
+    ...base,
+    offenders: [{ ref: "40:6", lostWords: ["steps"], sequenceUnchanged: false }],
+    provenance: new Map([["40:6", "sync_write"]]),
+  });
+  assert(
+    /out of sync \(the EZK 40 signature\)/.test(syncWritten) && /Re-sync EZK UST/.test(syncWritten),
+    `sequence changed + edit_log says the SYNC last wrote it → EZK 40 signature, remedy is re-sync`,
+  );
+
+  const unknown = buildAlignmentShrinkAlertMessage({
+    ...base,
+    offenders: [{ ref: "40:6", lostWords: ["steps"], sequenceUnchanged: false }],
+    provenance: new Map(),
+  });
+  assert(
+    /EITHER real de-alignment/.test(unknown) && /OR D1 drifting out of sync/.test(unknown),
+    `no provenance measured → the alert names both possibilities instead of asserting one`,
+  );
+
+  const mixedMsg = buildAlignmentShrinkAlertMessage({
+    ...base,
+    offenders: [
+      { ref: "40:5", lostWords: ["gate"], sequenceUnchanged: true },
+      { ref: "40:6", lostWords: ["steps"], sequenceUnchanged: false },
+    ],
+    provenance: new Map([["40:6", "sync_write"]]),
+  });
+  assert(
+    /collateral\s+de-alignment signature/.test(mixedMsg) && /Re-sync EZK UST/.test(mixedMsg),
+    `mixed causes report both remedies, each attached to its own verses`,
+  );
+
+  // The non-genuine branches keep their existing wording.
+  const fetchFail = buildAlignmentShrinkAlertMessage({
+    ...base,
+    detail: "master_unreadable",
+    offenders: [],
+    provenance: new Map(),
+  });
+  assert(/connectivity/.test(fetchFail), `no offenders → still reported as a DCS fetch problem`);
+  const sentinel = buildAlignmentShrinkAlertMessage({
+    ...base,
+    offenders: [{ ref: "*", lostWords: ["empty_render"], sequenceUnchanged: true }],
+    provenance: new Map(),
+  });
+  assert(/EMPTY/.test(sentinel), `the empty_render sentinel → still reported as our own render bug`);
+}
+
+// --- offenderProvenanceFromLog: edit_log row → who last wrote the verse ---
+{
+  assert(
+    offenderProvenanceFromLog({ source: null, user_id: 7 }) === "human_edit",
+    `no source + a user_id = an editor edit (verses.ts logs no source column)`,
+  );
+  assert(
+    offenderProvenanceFromLog({ source: "dcs_reimport", user_id: null }) === "sync_write",
+    `source=dcs_reimport = the nightly sync wrote it`,
+  );
+  assert(
+    offenderProvenanceFromLog({ source: "ai_pipeline", user_id: 1 }) === "sync_write",
+    `source=ai_pipeline is likewise not a translator revision`,
+  );
+  assert(offenderProvenanceFromLog(null) === "unknown", `no edit_log row at all → unknown, never guessed`);
+  assert(
+    offenderProvenanceFromLog({ source: null, user_id: null }) === "unknown",
+    `no source AND no user_id → unknown rather than assumed human`,
   );
 }
 
