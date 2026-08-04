@@ -18,10 +18,10 @@
 import { Hono } from "hono";
 import { z } from "zod";
 import type { Env } from "./index";
-import { currentUserId, requireEditor } from "./auth";
-import { importJobOutput } from "./pipelineImport";
-import { resourcesLockedByJob } from "./chapterLock";
-import { broadcastChapter } from "./wsEvents";
+import { currentUserId, requireEditor } from "./auth.ts";
+import { importJobOutput } from "./pipelineImport.ts";
+import { resourcesLockedByJob } from "./chapterLock.ts";
+import { broadcastChapter } from "./wsEvents.ts";
 
 export const pipelines = new Hono<{
   Bindings: Env;
@@ -438,13 +438,42 @@ export async function dispatchNext(env: Env): Promise<void> {
   }
 
   // Slot is ours and upstream accepted — record the bot's id and go running.
-  await env.DB.prepare(
+  //
+  // FIX (F2): guard on `state = 'dispatching'`. This upstream POST has no
+  // timeout, so a force-fail can land on this same row WHILE the POST is
+  // still in flight: force-fail accepts 'dispatching', flips this row to
+  // failed/force_stopped, frees the slot, and its own dispatchNext claims a
+  // different job. If this UPDATE then ran unconditionally, the original
+  // POST finally returning would flip THIS row back to 'running' with a live
+  // upstream_job_id — resurrecting a force-stopped job alongside the new
+  // claim and permanently wedging the single-slot invariant (two rows both
+  // "active" forever after). `state = 'dispatching'` is the narrowest guard
+  // that closes this: it is also sufficient for the force_stopped case
+  // specifically, because force-fail always moves the row OUT of
+  // 'dispatching' (to 'failed') before this UPDATE could run again — there is
+  // no path back to 'dispatching' for a row once force-failed. No other
+  // caller transitions a row out of 'dispatching' except this function
+  // (to 'running') and forceFailJob (to 'failed'), so a non-'dispatching'
+  // state reaching here is always someone else having already resolved it.
+  const promote = await env.DB.prepare(
     `UPDATE pipeline_jobs
         SET state = 'running', upstream_job_id = ?2, updated_at = unixepoch()
-      WHERE job_id = ?1`,
+      WHERE job_id = ?1 AND state = 'dispatching'`,
   )
     .bind(job.job_id, parsed.jobId)
     .run();
+  if ((promote.meta?.changes ?? 0) === 0) {
+    // The claim was revoked underneath us (most likely: force-failed while
+    // the upstream POST was in flight). The bot already has a live run under
+    // parsed.jobId with no local row tracking it — that is an orphaned
+    // upstream run, not a bug to paper over here, so just log it for
+    // traceability and stop. Do not write any further state for this job_id.
+    console.warn(
+      `[dispatchNext] job=${job.job_id} lost its 'dispatching' claim before the upstream POST returned; ` +
+        `upstream job ${parsed.jobId} is now orphaned (no local row will track it)`,
+    );
+    return;
+  }
 }
 
 // ── Resume (transient-outage recovery) ─────────────────────────────────────
@@ -788,7 +817,10 @@ async function attemptOutageResume(
 // by both the GET handler and the scheduled cron poller. Returns the raw
 // upstream response so callers that need to pass it through can do so;
 // scheduled callers discard.
-async function pollPipelineJob(
+// Exported so pipelinesForceFail.test.mjs can drive FIX 1(b) directly (the
+// poll-side guard against clobbering a force-stopped job) without spinning up
+// the Hono route — same rationale as forceFailJob being split out below.
+export async function pollPipelineJob(
   env: Env,
   job: PolledJob,
 ): Promise<
@@ -824,7 +856,34 @@ async function pollPipelineJob(
     return { kind: "malformed", text };
   }
 
+  // `job` is a snapshot taken when this poll started, and the upstream fetch
+  // above can take a while — long enough for the owner to force-stop the run in
+  // between. Re-read the live state before importing: applying AI output into a
+  // chapter we have just told everyone is unlocked is the one irreversible
+  // thing this function does, and the guarded UPDATE further down is too late
+  // to prevent it. Narrow but real — this is exactly the window a merge review
+  // flagged as High severity.
+  //
+  // RESIDUAL GAP, deliberately not closed here: a force-stop landing *during*
+  // importJobOutput still applies, because the apply has no cancellation point.
+  // Closing that means threading a check through the apply loop; out of scope
+  // for #398 and called out in the PR.
+  const liveState = await env.DB.prepare(
+    `SELECT state, error_kind FROM pipeline_jobs WHERE job_id = ?1`,
+  )
+    .bind(job.job_id)
+    .first<{ state: string; error_kind: string | null }>();
+  const forceStopped =
+    liveState?.state === "failed" && liveState?.error_kind === "force_stopped";
+  if (forceStopped) {
+    console.warn(
+      `[pollPipelineJob] job=${job.job_id} was force-stopped while this poll was in flight; ` +
+        `skipping import of upstream output`,
+    );
+  }
+
   const shouldImport =
+    !forceStopped &&
     job.no_output_yet === 1 &&
     data.state === "done" &&
     Array.isArray(data.output) &&
@@ -953,7 +1012,25 @@ async function pollPipelineJob(
         ? `paused for outage and not resumable: ${unresumableReason}`
         : (data.current?.error ?? null);
 
-  await env.DB.prepare(
+  // Defense in depth against a deliberate force-stop (see forceFailJob):
+  // even though the GET handler already short-circuits force-stopped jobs
+  // before calling this function, no caller of pollPipelineJob should be
+  // able to clobber that terminal state back to 'running' — the bot can
+  // still be reporting 'running' honestly for a while after force-fail.
+  //
+  // NULL-SAFETY IS LOAD-BEARING HERE. `error_kind` is nullable (an ordinary
+  // failure can reach this row with state='failed' and error_kind IS NULL —
+  // see effectiveErrorKind's `data.current?.errorKind ?? null` fallback
+  // above), and SQLite's three-valued logic makes `NOT (a AND NULL)`
+  // evaluate to NULL rather than TRUE, which reads as "don't update" as far
+  // as the WHERE clause is concerned. A `state = 'failed' AND error_kind =
+  // 'force_stopped'` guard written the "obvious" way therefore silently
+  // no-ops the UPDATE for EVERY ordinary failed/NULL row, not just the
+  // force-stopped one — the opposite of this comment's intent. Do not
+  // "simplify" this back to `NOT (state = 'failed' AND error_kind =
+  // 'force_stopped')`; the COALESCE below is what makes the comparison
+  // NULL-safe.
+  const guardedUpdate = await env.DB.prepare(
     `UPDATE pipeline_jobs SET
        state = ?2,
        current_skill = ?3,
@@ -964,7 +1041,8 @@ async function pollPipelineJob(
        raw_status_json = ?8,
        updated_at = unixepoch(),
        last_polled_at = unixepoch()
-     WHERE job_id = ?1`,
+     WHERE job_id = ?1
+       AND (state <> 'failed' OR COALESCE(error_kind, '') <> 'force_stopped')`,
   )
     .bind(
       job.job_id,
@@ -978,13 +1056,31 @@ async function pollPipelineJob(
     )
     .run();
 
+  // FIX (F3): if the guarded UPDATE above matched 0 rows, this row was force-
+  // stopped underneath us (the only reason the WHERE clause can refuse a
+  // match — see the NULL-safety comment above it) between when we read `job`
+  // and when we wrote. Every side effect below assumes the write actually
+  // landed, so none of them may run: importJobOutput can take minutes, and a
+  // force-stop landing mid-apply must not have the poll that started it turn
+  // around and broadcast the chapter as updated, enqueue the next stage of a
+  // follow-up chain, or hand the freed slot to a new job on this job's
+  // behalf. (Full prevention of a mid-flight importJobOutput write itself —
+  // i.e. cancelling the apply once it has started — is out of scope here;
+  // this only stops what happens AFTER that write, once we reach this point.)
+  const pollWriteLanded = (guardedUpdate.meta?.changes ?? 0) > 0;
+  if (!pollWriteLanded) {
+    console.warn(
+      `[pollPipelineJob] job=${job.job_id} force-stopped concurrently — skipping broadcast/follow-up/dispatch`,
+    );
+  }
+
   // The apply wrote rows outside the HTTP path, so no per-row row.upserted
   // events fired — open tabs on these chapters are now silently stale. Send one
   // coalesced hint per changed chapter (not per row) so a whole-book apply stays
   // cheap against the subrequest budget. The client shows a "save & refresh"
   // prompt rather than refetching silently, so an in-progress edit is never
   // clobbered. Best-effort: broadcastChapter swallows its own errors.
-  if (!importFailed) {
+  if (!importFailed && pollWriteLanded) {
     for (const ch of appliedChapters) {
       await broadcastChapter(env, job.book, ch, {
         type: "chapter.pipeline_applied",
@@ -999,7 +1095,7 @@ async function pollPipelineJob(
   // are in D1 (e.g. the next step's prompt builder reads them). Without
   // this, an upstream-done-but-import-failed run would still trigger
   // notes -> tqs against an unimported parent.
-  if (data.state === "done" && !importFailed && !job.follow_up_job_id) {
+  if (data.state === "done" && !importFailed && !job.follow_up_job_id && pollWriteLanded) {
     try {
       const username = await resolveUsernameFromDb(env, job.user_id);
       if (username && job.follow_up_chain) {
@@ -1033,7 +1129,7 @@ async function pollPipelineJob(
   // (the priority=1 follow-up just enqueued, if any, wins). A first import
   // failure holds the job at 'running' (one retry) so it won't free the slot
   // here; a repeated one force-fails above and falls into this branch.
-  if (effectiveState === "done" || effectiveState === "failed") {
+  if ((effectiveState === "done" || effectiveState === "failed") && pollWriteLanded) {
     try {
       await dispatchNext(env);
     } catch (err) {
@@ -1444,9 +1540,10 @@ pipelines.get("/:jobId", requireEditor, async (c) => {
   const owned = await c.env.DB.prepare(
     `SELECT job_id, upstream_job_id, user_id, pipeline_type, book, start_chapter,
             end_chapter, session_key, follow_up_options, follow_up_chain,
-            follow_up_job_id, error_kind, state, current_skill, current_status,
-            created_at, updated_at, resume_attempt_count, last_resume_at,
-            resume_accepted_at, options_json, (output_json IS NULL) AS no_output_yet
+            follow_up_job_id, error_kind, error_message, state, current_skill,
+            current_status, created_at, updated_at, resume_attempt_count,
+            last_resume_at, resume_accepted_at, options_json,
+            (output_json IS NULL) AS no_output_yet
        FROM pipeline_jobs WHERE job_id = ?1`,
   )
     .bind(jobId)
@@ -1454,6 +1551,7 @@ pipelines.get("/:jobId", requireEditor, async (c) => {
       state: string;
       current_skill: string | null;
       current_status: string | null;
+      error_message: string | null;
       created_at: number;
       updated_at: number;
     }>();
@@ -1486,7 +1584,36 @@ pipelines.get("/:jobId", requireEditor, async (c) => {
   // clobber the terminal state back to 'running' on every poll — an open tab
   // polling this job_id by id resurrects a just-cancelled job each tick. Return
   // the stored state so the client sees terminal and stops polling.
-  if (owned.state === "cancelled" || owned.state === "done") {
+  //
+  // A force-stopped job (state='failed', error_kind='force_stopped') joins
+  // this short-circuit too: it's the one 'failed' outcome that can CONTRADICT
+  // a bot that is still honestly reporting 'running' (its stop endpoint is a
+  // no-op today — see forceFailJob's comment), so falling through to
+  // pollPipelineJob would resurrect it. Every other 'failed' producer
+  // (interrupted, import_failed) is self-stable on re-poll because the bot
+  // reports the same terminal thing back, so this check must stay narrow to
+  // force_stopped and not swallow ordinarily-failed jobs, which may
+  // legitimately be re-polled/retried.
+  if (
+    owned.state === "cancelled" ||
+    owned.state === "done" ||
+    (owned.state === "failed" && owned.error_kind === "force_stopped")
+  ) {
+    // FIX (F1): the force_stopped branch of this short-circuit must include a
+    // `current` object carrying errorKind/error (plus skill/status, which the
+    // non-short-circuited response also carries — see rowFromStatus in
+    // web/src/sync/pipelineStore.ts, which reads current?.skill/.status/
+    // .errorKind/.error). Without it, the client's merged row gets
+    // error_kind: null, its "don't toast the user's own force-stop" predicate
+    // (`next.error_kind !== "force_stopped"`) passes, and the user gets a red
+    // "failed" toast for the stop they just requested. It also blanked the
+    // "force-stopped by <actor>" audit message on every subsequent per-job
+    // poll (a later loadFromServer happened to restore it, masking the gap).
+    // `chapter` is required by PipelineStatusResponse's `current` type but
+    // pipeline_jobs has no per-poll chapter column to report here — 0 is the
+    // same placeholder pollPipelineJob's own synthesized-response branches use
+    // (see the importFailed/upstreamInterrupted/unresumableReason rewrites
+    // above) for exactly this reason, and the client never reads .chapter.
     return c.json({
       jobId: owned.job_id,
       pipelineType: owned.pipeline_type,
@@ -1496,6 +1623,16 @@ pipelines.get("/:jobId", requireEditor, async (c) => {
         endChapter: owned.end_chapter,
       },
       state: owned.state,
+      current:
+        owned.state === "failed" && owned.error_kind === "force_stopped"
+          ? {
+              chapter: 0,
+              skill: owned.current_skill ?? "",
+              status: owned.current_status ?? "",
+              errorKind: owned.error_kind,
+              error: owned.error_message ?? undefined,
+            }
+          : undefined,
       updatedAt: new Date(owned.updated_at * 1000).toISOString(),
       createdAt: new Date(owned.created_at * 1000).toISOString(),
     });
@@ -1872,6 +2009,257 @@ pipelines.post("/:jobId/cancel", requireEditor, async (c) => {
     }
   }
   return c.json({ ok: true, jobId, state: "cancelled" });
+});
+
+// States a force-fail will act on — deliberately the mirror image of /cancel's
+// CANCELLABLE set above. /cancel refuses 'running' and 'dispatching' because
+// there is nothing to cancel: the bot already has the work, so "cancel" would
+// just orphan our row while the bot keeps grinding. Force-fail exists for
+// exactly the opposite reason: those two states are the ONLY ones that can
+// wedge (see issue #398 / NUM 27) — a queued job has never touched the bot,
+// and every other state is already terminal or already has its own recovery
+// path (resume). 'dispatching' is included because the single bot slot is
+// already claimed the moment we flip to it (before the upstream POST even
+// lands), so a wedge in that narrow window would otherwise have no exit
+// either.
+const FORCE_FAILABLE = ["running", "dispatching"];
+// Generated from FORCE_FAILABLE.length rather than hand-written ("?3, ?4")
+// so a future third state can't silently desync the CAS UPDATE's bind list
+// from its placeholder count (a D1 bind-count mismatch is a runtime error,
+// not a type error, so this class of bug is otherwise invisible until it
+// ships). Placeholders start at ?3 because ?1/?2 are jobId/errorMessage.
+const FORCE_FAILABLE_PLACEHOLDERS = FORCE_FAILABLE.map((_, i) => `?${i + 3}`).join(", ");
+
+// Derives the typed confirmation phrase from the job's own book/chapter
+// range. Exported so it's unit-testable and so the frontend can mirror the
+// exact formula (see the comment at its web/src/sync/api.ts call site) — the
+// server is always the source of truth; the client only recomputes it so the
+// dialog can show it and gate its own confirm button without a round trip.
+export function forceStopPhrase(
+  book: string,
+  startChapter: number,
+  endChapter: number,
+): string {
+  const range =
+    startChapter === endChapter ? `${startChapter}` : `${startChapter}-${endChapter}`;
+  return `STOP THE AI FOR ${book} ${range}`;
+}
+
+const ForceFailBody = z.object({ confirm: z.string() }).strict();
+
+export type ForceFailResult =
+  | { kind: "not_found" }
+  | { kind: "cannot_force_fail"; state: string }
+  | { kind: "confirm_mismatch" }
+  | { kind: "ok"; jobId: string };
+
+// Core force-fail logic, split out from the route below so it's testable
+// without spinning up Hono (mirrors how pollPipelineJob/dispatchNext are
+// standalone functions the routes call into). Does everything except turn
+// the result into an HTTP response.
+export async function forceFailJob(
+  env: Env,
+  params: { jobId: string; userId: number; confirm: string },
+): Promise<ForceFailResult> {
+  const { jobId, userId, confirm } = params;
+
+  const owned = await env.DB.prepare(
+    `SELECT user_id, state, upstream_job_id, book, start_chapter, end_chapter
+       FROM pipeline_jobs WHERE job_id = ?1`,
+  )
+    .bind(jobId)
+    .first<{
+      user_id: number;
+      state: string;
+      upstream_job_id: string | null;
+      book: string;
+      start_chapter: number;
+      end_chapter: number;
+    }>();
+  if (!owned) return { kind: "not_found" };
+  if (!FORCE_FAILABLE.includes(owned.state)) {
+    return { kind: "cannot_force_fail", state: owned.state };
+  }
+
+  const expected = forceStopPhrase(owned.book, owned.start_chapter, owned.end_chapter);
+  if (confirm.trim() !== expected) {
+    return { kind: "confirm_mismatch" };
+  }
+
+  // Prefer the DCS username over the bare id: this message is read by a human
+  // debugging "why did this run die?", and `force-stopped by user 1` makes them
+  // go do a second lookup. Fall back to the id if the users row is missing.
+  const actor = (await resolveUsernameFromDb(env, userId)) ?? `user ${userId}`;
+  // Any editor can force-stop now (see the route comment below), so the actor
+  // is frequently NOT the job's owner. Resolve the owner's username too, so
+  // the audit trail names both — omitted only when actor === owner.
+  const isOwner = owned.user_id === userId;
+  const ownerName = isOwner
+    ? null
+    : ((await resolveUsernameFromDb(env, owned.user_id)) ?? `user ${owned.user_id}`);
+
+  // FIX (F6): the CAS UPDATE now runs FIRST, with a placeholder outcome, and
+  // the upstream /stop call happens only after it lands. The original order
+  // (upstream call, then CAS) meant that if the CAS matched 0 rows — the job
+  // had just gone 'done' via a concurrent poll, or another tab's force-fail
+  // already won — the caller was told "cannot_force_fail" even though the bot
+  // had already been told to stop. That's harmless while the bot's /stop
+  // contract is a no-op, but the moment it ships it becomes "the UI said the
+  // stop failed, and the run was killed anyway" — able to kill a run that was
+  // legitimately finishing. Doing the CAS first means we only ever call
+  // upstream once we've genuinely won the local state transition.
+  const placeholderMessage = ownerName
+    ? `force-stopped by ${actor} (owner: ${ownerName}); upstream stop: pending`
+    : `force-stopped by ${actor}; upstream stop: pending`;
+
+  // CAS-guarded local UPDATE so a concurrent transition (e.g. the bot finally
+  // reporting 'done'/'failed' via a poll landing at the same moment) can't be
+  // clobbered by this write. notified_user_at is set for the same reason
+  // /cancel sets it: the acting user just did this themselves, so it must
+  // never resurface as a "while you were away" item.
+  const res = await env.DB.prepare(
+    `UPDATE pipeline_jobs
+        SET state = 'failed',
+            error_kind = 'force_stopped',
+            error_message = ?2,
+            notified_user_at = unixepoch(),
+            updated_at = unixepoch()
+      WHERE job_id = ?1 AND state IN (${FORCE_FAILABLE_PLACEHOLDERS})`,
+  )
+    .bind(jobId, placeholderMessage, ...FORCE_FAILABLE)
+    .run();
+  if ((res.meta?.changes ?? 0) === 0) {
+    const now = await env.DB.prepare(`SELECT state FROM pipeline_jobs WHERE job_id = ?1`)
+      .bind(jobId)
+      .first<{ state: string }>();
+    return { kind: "cannot_force_fail", state: now?.state ?? "unknown" };
+  }
+
+  // Best-effort upstream stop, explicitly non-fatal: the bot-side
+  // `/api/pipeline/:jobId/stop` contract (issue #398 §2) does not exist yet —
+  // this route must fully work with it absent, since that is the current
+  // production reality and the primary case this code will hit for a while.
+  // Any failure (network, non-2xx, or the endpoint simply 404ing) is
+  // swallowed and folded into the error_message as an audit trail, never
+  // thrown — a translator watching a wedged, locked chapter must be able to
+  // get unstuck locally even if the bot can't be reached at all. Time-boxed
+  // to 5s: a hung/black-holed bot is exactly the "wedged" case this feature
+  // exists for, and an un-timeboxed fetch here would stall this whole
+  // request until the Workers wall-clock limit.
+  let upstreamOutcome = "upstream stop: not attempted (no upstream_job_id)";
+  if (owned.upstream_job_id && env.BT_API_TOKEN) {
+    try {
+      const stopRes = await fetch(
+        `${upstreamBase(env)}/api/pipeline/${encodeURIComponent(owned.upstream_job_id)}/stop`,
+        {
+          method: "POST",
+          headers: { Authorization: `Bearer ${env.BT_API_TOKEN}` },
+          signal: AbortSignal.timeout(5000),
+        },
+      );
+      upstreamOutcome = stopRes.ok
+        ? "upstream stop: ok"
+        : `upstream stop: ${stopRes.status}`;
+    } catch (err) {
+      upstreamOutcome =
+        (err as { name?: string } | undefined)?.name === "TimeoutError"
+          ? "upstream stop: timed out"
+          : "upstream stop: unreachable";
+    }
+  } else if (owned.upstream_job_id) {
+    upstreamOutcome = "upstream stop: not attempted (pipeline API disabled)";
+  }
+
+  const errorMessage = ownerName
+    ? `force-stopped by ${actor} (owner: ${ownerName}); ${upstreamOutcome}`
+    : `force-stopped by ${actor}; ${upstreamOutcome}`;
+
+  // Second, small UPDATE to record the real upstream outcome now that we know
+  // it — guarded so it only ever touches the row this call itself just force-
+  // stopped (never some other terminal transition that happened to land in
+  // between).
+  await env.DB.prepare(
+    `UPDATE pipeline_jobs
+        SET error_message = ?2
+      WHERE job_id = ?1 AND error_kind = 'force_stopped'`,
+  )
+    .bind(jobId, errorMessage)
+    .run();
+
+  // Freeing the single bot slot is the whole point (see issue #398 — two tqs
+  // jobs sat starved behind a wedged 'running' row for ~3 hours). Mirrors
+  // /cancel's dispatchNext call, but deliberately LAST: handing the bot a new
+  // job before asking it to stop the old one would, once the stop contract
+  // ships, mean two runs briefly overlap on a single-slot bot for no reason.
+  // The stop call above is time-boxed to 5s, so the queue never waits long.
+  try {
+    await dispatchNext(env);
+  } catch (err) {
+    console.error(`[force-fail.dispatchNext] job=${jobId}:`, err);
+  }
+
+  return { kind: "ok", jobId };
+}
+
+// POST /api/pipelines/:jobId/force-fail  — the manual escape hatch /cancel
+// deliberately doesn't provide: it accepts 'running' and 'dispatching', the
+// exact two states /cancel refuses, because those are the only states that
+// can actually wedge (see FORCE_FAILABLE's comment above and issue #398 for
+// the NUM 27 incident this was built from — a fly.io restart orphaned a
+// checkpoint mid-run, and the only exits were automatic backstops 6-10 hours
+// out, during which the job held both the chapter lock and the single bot
+// dispatch slot).
+//
+// Any authenticated editor may force-stop, not just the job's owner: the
+// resource being freed (the chapter lock + the single bot dispatch slot) is
+// shared across every translator, not owned by whoever happened to start the
+// run, and GET /api/pipelines already shows every user's active/queued jobs
+// (queueVisible/ACTIVE_STATES) — so another editor's running job is already
+// visible in the client before they'd ever reach for this button. Restricting
+// the escape hatch to the owner was exactly the NUM 27 failure mode: the
+// owner was asleep, the job was wedged holding the only bot slot, and nobody
+// else could clear it (issue #398).
+//
+// The typed confirmation (`{confirm: string}`, matched exactly against a
+// phrase the SERVER derives from the job's own book/chapter — never trust a
+// client-supplied phrase) is a deliberate speed bump, not a security control,
+// same reasoning as the force-resume comment above: the exposure being
+// defended against is "an editor clicks through a destructive action without
+// reading it," not privilege escalation — every force-stop is attributed in
+// the job's error_message (actor, and the owner too when the actor isn't the
+// owner), so misuse is traceable after the fact. Making the phrase name the
+// book and chapter range means the blast radius is legible in the same box
+// the user types into, rather than trusting a generic "are you sure?" to have
+// been read.
+//
+// The upstream stop call is best-effort (see forceFailJob above) because the
+// bot-side kill contract is a follow-up landing in a separate repo/PR — this
+// route must degrade gracefully to "local-only" until that ships.
+pipelines.post("/:jobId/force-fail", requireEditor, async (c) => {
+  const userId = currentUserId(c);
+  if (!userId) return c.json({ error: "unauthorized" }, 401);
+  const jobId = c.req.param("jobId");
+  if (!jobId) return c.json({ error: "missing_job_id" }, 400);
+
+  let confirm: string;
+  try {
+    const body = ForceFailBody.parse(await c.req.json());
+    confirm = body.confirm;
+  } catch {
+    return c.json({ error: "invalid_body" }, 400);
+  }
+
+  const result = await forceFailJob(c.env, { jobId, userId, confirm });
+  switch (result.kind) {
+    case "not_found":
+      return c.json({ error: "not_found" }, 404);
+    case "cannot_force_fail":
+      return c.json({ error: "cannot_force_fail", state: result.state }, 409);
+    case "confirm_mismatch":
+      return c.json({ error: "confirm_mismatch" }, 400);
+    case "ok":
+      return c.json({ ok: true, jobId: result.jobId, state: "failed" });
+  }
 });
 
 // POST /api/pipelines/:jobId/resume  — ask the bot to pick a paused run back
