@@ -62,6 +62,19 @@ For the full corpus, see the memory index at
 `C:\Users\benja\.claude\projects\C--Users-benja-Documents-GitHub-bible-editor\memory\MEMORY.md`.
 Highlights that bite repeatedly:
 
+- **"Where is the user?" has no single source in this app — and both available sources
+  are blind in a different direction.** `activeVerse` is Shell-LOCAL state
+  (`useState(initialVerse)`), so clicking a verse does not necessarily rewrite the URL
+  hash: measured live, the app sat on verse 4 while the hash still read `#/ZEC/1/2`.
+  Meanwhile `App` renders `<Shell key={loc.book}>`, so a BOOK change destroys the whole
+  subtree and any ref inside it still holds the old book when its teardown runs. So
+  in-tree state is authoritative for verse/chapter and useless for book; the hash is
+  authoritative for book and can lag on verse. Any feature that fires on "the user
+  navigated away" must take each dimension from the source that can actually see it —
+  reading verse from the hash reintroduces the bug it was meant to fix (PR #411).
+  Related: a component memoized with a custom comparator (`areNotePropsEqual`) will
+  swallow the render an effect needs unless the new prop is added to the comparator.
+
 - **An absent measurement is not a clean measurement — and it must never overwrite
   evidence.** Third instance of this class (after the alert-wording fix and the reimport
   watermark certifying skipped chapters). `alignment_attention` is a replace-all snapshot,

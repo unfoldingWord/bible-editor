@@ -13,6 +13,9 @@
 // The check lives here as a pure function so it can be unit-tested and shared
 // by the client guard (NoteCard) and, in spirit, the API backstop.
 
+import { noteCoveredVerses } from "./verseRange.ts";
+import { parseHashString } from "./parseHash.ts";
+
 // A note body is "blank" for save/export purposes if — after converting the
 // TSV line-break escape (literal backslash-n, two chars) to a real newline —
 // it trims to nothing: empty, whitespace-only, or only line breaks. All of
@@ -109,4 +112,57 @@ export function isAbandonedBlankStub(
     isBlankNoteText(local.quote) &&
     isBlankNoteText(local.supportRef);
   return rowEmpty && localEmpty;
+}
+
+// ---------- "did the user leave the verse?" ----------
+//
+// The discard above is scoped to leaving the verse, not to the card losing
+// focus. Focus loss alone was the original trigger and it was wrong: clicking
+// anywhere else on the page — including elsewhere on the SAME verse, to copy
+// some text — trashed the stub out from under the user.
+
+// Where the user's focus currently is. `book` is load-bearing: App renders
+// `<Shell key={loc.book}>`, so a book change destroys the whole subtree, and
+// "same chapter, same verse, different book" is a real navigation (1:1 → 1:1
+// is a common landing pair).
+export interface ActiveLocation {
+  book: string;
+  chapter: number;
+  verse: number;
+}
+
+// True when `loc` is outside the verse(s) a tn/tq row covers — i.e. the user
+// has navigated off this note's verse, chapter, or book.
+//
+// Unlike scripture rows, tn/tq rows have no verse_end column — a bridge (e.g.
+// "1:6-9") lives only in `ref_raw`, so coverage is resolved via
+// noteCoveredVerses (the same helper noteOverlapsRange uses for display).
+export function hasLeftNoteVerse(
+  row: { book: string; chapter: number; verse: number; ref_raw?: string | null },
+  loc: ActiveLocation,
+): boolean {
+  if (loc.book !== row.book) return true;
+  if (loc.chapter !== row.chapter) return true;
+  return !noteCoveredVerses(row).includes(loc.verse);
+}
+
+// The location the URL hash currently points at, or null when the hash does
+// not carry at least a book and a chapter (nothing can be concluded from a
+// bare `#/` and guessing would risk a discard the user never asked for).
+//
+// The verse segment is optional on purpose: App.navigate writes `#/BOOK/CH`
+// with no verse for verse 1, so requiring three segments would return "no
+// opinion" for every verse-1 route — which is exactly where a book change
+// commonly lands.
+//
+// This exists because a ref inside the component tree cannot see a book
+// change: `<Shell key={loc.book}>` means the dying instance's ref still holds
+// the OLD book, so it reports "you never left". The hash lives outside React
+// and is already updated by the time the teardown runs, so it is the only
+// signal that survives the remount. Used ALONGSIDE the in-tree ref, never
+// instead of it — see NoteCard's unmount cleanup.
+export function locationFromHash(hash: string): ActiveLocation | null {
+  if (!/^#\/?[A-Za-z0-9]+\/\d+/.test(hash)) return null;
+  const { book, chapter, verse } = parseHashString(hash, "");
+  return { book, chapter, verse };
 }

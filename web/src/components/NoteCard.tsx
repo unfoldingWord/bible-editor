@@ -44,7 +44,13 @@ import { useNoteTemplates } from "../hooks/useNoteTemplates";
 import { CatalogPicker } from "./CatalogPicker";
 import { shortSupport } from "../lib/supportReference";
 import { TCM, buildSH } from "../lib/noteTemplates";
-import { isAbandonedBlankStub, wouldBlankExistingNote } from "../lib/noteGuard";
+import {
+  hasLeftNoteVerse,
+  isAbandonedBlankStub,
+  locationFromHash,
+  wouldBlankExistingNote,
+  type ActiveLocation,
+} from "../lib/noteGuard";
 import { drafts, rowKey, draftDirtyBorderSx } from "../sync/drafts";
 import { CommentBadge } from "./CommentBadge";
 import type { CommentCounts } from "../lib/commentsIndex";
@@ -71,6 +77,16 @@ const reorderFlashSx = {
 interface Props {
   row: TnRow;
   active: boolean;
+  // Where the user's focus currently is (chapter/verse), mirrored by
+  // ResourceColumn during its own render. Used only by the abandoned-blank-
+  // stub discard below to tell "left the verse" apart from "lost focus of
+  // the note" — see hasLeftNoteVerse in noteGuard.ts.
+  activeLocRef: React.MutableRefObject<ActiveLocation>;
+  // Reactive companion to activeLocRef: true while the active location is
+  // still within this row's verse. A plain prop (not read from the ref)
+  // purely so the mounted-path discard effect below re-fires when the
+  // displayed verse changes even in cases where `active` itself doesn't.
+  verseActive: boolean;
   // Find-in-notes highlight: when set, every match of the query in the note
   // body is marked (yellow); the `activeMatchOccurrence`-th match is emphasized
   // (orange) and scrolled into view. Null when find is closed / TN scope off.
@@ -304,6 +320,8 @@ function NoteBodyReadView({
 function NoteCardInner({
   row,
   active,
+  activeLocRef,
+  verseActive,
   findQuery = null,
   activeMatchOccurrence = null,
   dragging,
@@ -691,16 +709,22 @@ function NoteCardInner({
   // user has something to type into, and neither blank-note guard covers it (see
   // isAbandonedBlankStub) — so clicking Add note and then clicking away used to
   // leave a permanently empty row in D1 that exports to DCS as a blank tn line.
-  // On deactivation, if the row is still wholly empty and untouched, trash it.
   // onDelete routes to Shell's handleTrashNote, a reversible soft-delete that
   // stays visible in the trash UI, so an accidental discard is recoverable and
   // the user can just click Add note again. discardedRef keeps it to one call.
   //
-  // Deliberately NOT wired to unmount: unmount also fires on scroll
-  // virtualization and chapter navigation, and the extra mirrored refs a
-  // teardown handler would need are not worth it for the rarer path. A stub
-  // abandoned by navigating straight out of the chapter therefore still
-  // persists — see the PR description.
+  // Scoped to LEAVING THE VERSE (or chapter), not to merely losing focus of the
+  // note. Losing focus alone used to be the trigger, which trashed a stub the
+  // instant the user clicked anywhere else on the page — including clicking
+  // elsewhere on the SAME verse to copy some text. hasLeftNoteVerse (see
+  // noteGuard.ts) reads activeLocRef, which ResourceColumn keeps pointed at the
+  // user's current chapter/verse, and gates the discard on that instead. One
+  // known gap remains by design: a remount that leaves activeLocRef unchanged
+  // (e.g. toggling the "pin" layout, which reshapes the resource column without
+  // moving the user's focus) must NOT discard — the two effects below both
+  // check hasLeftNoteVerse for exactly that reason. Navigating to the SAME
+  // verse NUMBER in a different chapter still counts as leaving (chapter is
+  // compared too).
   //
   // Cards are keyed by row id in ResourceColumn (`<Fragment key={r.id}>`), so
   // React never reuses this instance for a different row and one ref per mount
@@ -720,23 +744,100 @@ function NoteCardInner({
   const wasActiveRef = useRef(false);
   if (active) wasActiveRef.current = true;
   const discardedRef = useRef(false);
-  useEffect(() => {
-    if (active) return;
-    if (!wasActiveRef.current) return;
+
+  // Mirrored refs for the unmount cleanup below, which fires after the
+  // component is gone and can't read live state/props from closure — only
+  // whatever was captured at effect-creation time (mount, since its deps are
+  // []). Written during render, same pattern as savedRef above, so the
+  // cleanup always sees the last values this instance actually held.
+  const noteAtUnmountRef = useRef(note);
+  noteAtUnmountRef.current = note;
+  const supportRefAtUnmountRef = useRef(supportRef);
+  supportRefAtUnmountRef.current = supportRef;
+  const draftReadOkAtUnmountRef = useRef(draftReadOk);
+  draftReadOkAtUnmountRef.current = draftReadOk;
+  const rowAtUnmountRef = useRef(row);
+  rowAtUnmountRef.current = row;
+  const readOnlyAtUnmountRef = useRef(readOnly);
+  readOnlyAtUnmountRef.current = readOnly;
+
+  // Runs every guard, then discards. Kept in a ref (rather than a plain
+  // function) and updated every render so the unmount effect's cleanup —
+  // frozen at mount — always invokes the LATEST closure, not a stale one
+  // that captured mount-time handleDelete/onDelete.
+  const discardIfAbandonedStubRef = useRef<() => void>(() => {});
+  discardIfAbandonedStubRef.current = () => {
     if (discardedRef.current) return;
     // Don't fight a pipeline that is about to fill this row, and don't fire a
     // write a viewer isn't allowed to make (that 403 would surface as an error
     // toast for a delete the user never asked for). `readOnly` covers the
     // chapter lock; isReadOnly() covers the viewer role, which api.trashNote
     // does not check for itself the way the outbox does.
-    if (readOnly || isReadOnly()) return;
+    if (readOnlyAtUnmountRef.current || isReadOnly()) return;
     // draftReadOk, not hydrated — see its declaration. A failed IndexedDB read
     // must not be read as "the card is empty".
-    if (!isAbandonedBlankStub(row, { note, quote, supportRef, hydrated: draftReadOk })) return;
+    if (
+      !isAbandonedBlankStub(rowAtUnmountRef.current, {
+        note: noteAtUnmountRef.current,
+        quote: quoteRef.current,
+        supportRef: supportRefAtUnmountRef.current,
+        hydrated: draftReadOkAtUnmountRef.current,
+      })
+    ) {
+      return;
+    }
     discardedRef.current = true;
     handleDelete({ blankStub: true });
+  };
+
+  // "Has the user left this note?" — the union of two conservative signals,
+  // because neither one alone sees every navigation:
+  //  - activeLocRef: accurate for every move WITHIN a book (verse, chapter),
+  //    including the per-verse-mode unmount, but blind to a book change —
+  //    App renders `<Shell key={loc.book}>`, so a book change destroys this
+  //    whole subtree and the dying instance's ref still holds the OLD book.
+  //  - the URL hash, consulted for the BOOK ONLY: it lives outside React and
+  //    is already the new route by the time teardown runs, so it is what
+  //    catches the book change. Its verse must NOT be trusted — activeVerse is
+  //    Shell-local state (`useState(initialVerse)`), so clicking a verse does
+  //    not necessarily rewrite the hash, and reading a lagging hash verse here
+  //    would trash a stub on the very same-verse click this fix is about.
+  //    The book is safe because loc.book only ever changes via the hash.
+  // Both must say "still here" to skip the discard, so a remount that moves
+  // nothing — toggling the pin layout — still leaves the stub alone.
+  const hasLeftNoteTarget = (row_: TnRow, loc: ActiveLocation) => {
+    if (hasLeftNoteVerse(row_, loc)) return true;
+    const fromHash = locationFromHash(window.location.hash);
+    return fromHash !== null && fromHash.book !== row_.book;
+  };
+
+  // MOUNTED path: book mode keeps every chapter note mounted regardless of
+  // scroll, so a verse change never unmounts this card — it only deactivates
+  // (or, rarely, leaves `active` untouched; verseActive is the reactive
+  // trigger for that case). Fires the discard once the location has actually
+  // left this row's verse.
+  useEffect(() => {
+    if (active) return;
+    if (!wasActiveRef.current) return;
+    if (!hasLeftNoteTarget(row, activeLocRef.current)) return;
+    discardIfAbandonedStubRef.current();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [active, draftReadOk]);
+  }, [active, verseActive, draftReadOk]);
+
+  // UNMOUNT path: per-verse mode unmounts the old verse's cards on verse
+  // navigation, and chapter navigation remounts the whole column — neither
+  // fires the effect above. The hasLeftNoteVerse check (read from the ref,
+  // which ResourceColumn updates during ITS render before this cleanup can
+  // run) is what stops a same-location remount — e.g. toggling the pin
+  // layout — from discarding a stub the user never actually left.
+  useEffect(() => {
+    return () => {
+      if (!wasActiveRef.current) return;
+      if (!hasLeftNoteTarget(rowAtUnmountRef.current, activeLocRef.current)) return;
+      discardIfAbandonedStubRef.current();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // Apply a historical snapshot. The patch goes through the normal save
   // pipe so it lands as v(current+1) — every older entry stays in
@@ -1783,6 +1884,12 @@ function areNotePropsEqual(a: Props, b: Props): boolean {
   return (
     a.row === b.row &&
     a.active === b.active &&
+    // Load-bearing: the abandoned-blank-stub discard runs from an effect keyed
+    // on verseActive. In pinned/book mode the card stays mounted across a verse
+    // change and `active` is already false, so omitting this comparison would
+    // suppress the only render that can fire that effect — and the stub would
+    // survive.
+    a.verseActive === b.verseActive &&
     sameQuery &&
     (a.activeMatchOccurrence ?? null) === (b.activeMatchOccurrence ?? null) &&
     a.dragging === b.dragging &&
