@@ -542,34 +542,66 @@ export function mergeSamePositionGroups(
 // overlapping word from a compound of 3+, which would erase the evidence for a
 // [A,B,C] + [A] verse and leave the aligner silent on a verse the api-side lint
 // (hasReusedSourceToken) still flags — a translator would click through from
-// the lint feed to a verse with nothing highlighted. The two detectors are
-// deliberately the same rule: shared token, differing chain.
+// the lint feed to a verse with nothing highlighted.
+//
+// Identity is supplied by `keyOf`, and it MUST NOT come from
+// resolveSourcePos's strong-based fallback chain. That fallback maps an
+// unresolvable word onto `strong|1`, so two DISTINCT tokens that merely share a
+// Strong's number collapse onto one identity and a perfectly good verse wears a
+// red "data defect" outline. Measured on prod D1, the fallback invented reuse in
+// 4 ZEC verses and 2 in 1SA that exact resolution finds nothing wrong with.
+//
+// The panel supplies `p{position}` when the word resolves EXACTLY against the
+// UHB/UGNT (NFC x-content + occurrence), and falls back to the word's own
+// `c{content}|{occurrence}` — never its Strong's — when it does not. That
+// second case is not a nicety: a word claiming an occurrence the source verse
+// does not have (JER 36:30 UST aligns מֻשְׁלֶכֶת occurrences 2 and 3 of a token
+// the UHB contains once) would otherwise drop out, collapsing two distinct
+// chains to the same sequence and silencing the marker on a verse api-side lint
+// still flags. With this key space the two detectors agree on every verse
+// measured across seven books.
+//
+// Sequence order is DOCUMENT order, matching the api-side join — sorting would
+// exempt the reversed-nesting defect ([A,B] plus [B,A] over the same tokens,
+// HAB 1:3 UST) by making the two chains look identical.
+//
+// Returns the IDS of the offending source words, not positions, so the caller
+// marks chips by identity and can't mismatch position spaces (chips resolve
+// their own `pos` through the fallback chain for hover).
 //
 // Display/report only; nothing is fixed here.
-export function findReusedSourcePositions(
+export function findReusedSourceWordIds(
   groups: AlignmentGroup[],
-  posOf: (s: SourceWord) => number,
-): Set<number> {
-  const sequencesByPosition = new Map<number, Set<string>>();
+  keyOf: (s: SourceWord) => string | null,
+): Set<string> {
+  const sequencesByToken = new Map<string, Set<string>>();
   for (const g of groups) {
-    const positions = new Set<number>();
+    const tokens: string[] = [];
     for (const s of g.source) {
-      const p = posOf(s);
-      if (p >= 0) positions.add(p);
+      const k = keyOf(s);
+      if (k !== null && !tokens.includes(k)) tokens.push(k);
     }
-    if (positions.size === 0) continue;
-    const seqKey = [...positions].sort((a, b) => a - b).join(",");
-    for (const p of positions) {
-      const seen = sequencesByPosition.get(p) ?? new Set<string>();
+    if (tokens.length === 0) continue;
+    const seqKey = tokens.join(",");
+    for (const k of tokens) {
+      const seen = sequencesByToken.get(k) ?? new Set<string>();
       seen.add(seqKey);
-      sequencesByPosition.set(p, seen);
+      sequencesByToken.set(k, seen);
     }
   }
-  const reused = new Set<number>();
-  for (const [p, seqs] of sequencesByPosition) {
-    if (seqs.size >= 2) reused.add(p);
+  const reusedTokens = new Set<string>();
+  for (const [k, seqs] of sequencesByToken) {
+    if (seqs.size >= 2) reusedTokens.add(k);
   }
-  return reused;
+  const ids = new Set<string>();
+  if (reusedTokens.size === 0) return ids;
+  for (const g of groups) {
+    for (const s of g.source) {
+      const k = keyOf(s);
+      if (k !== null && reusedTokens.has(k)) ids.add(s.id);
+    }
+  }
+  return ids;
 }
 
 export function parseAlignment(

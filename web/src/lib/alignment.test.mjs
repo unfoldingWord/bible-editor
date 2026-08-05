@@ -28,7 +28,7 @@ import {
   reformGluedMilestones,
   detectDoubledSourceMilestones,
   dropDuplicateSourceMilestones,
-  findReusedSourcePositions,
+  findReusedSourceWordIds,
 } from "./alignment.ts";
 import { extractPlainText } from "./usfm.ts";
 import { findTargetHighlights, findSourceHighlights } from "./highlight.ts";
@@ -3281,29 +3281,37 @@ const srcWordContents = (st) => st.groups.flatMap((g) => g.source).map((s) => ({
   assert(dropDuplicateSourceMilestones(tvo2) === tvo2, `genuine repetition is left untouched (same ref)`);
 }
 
-// ─── findReusedSourcePositions (ZEC 14:8 UST doubled-Hebrew display flag) ──
+// ─── findReusedSourceWordIds (ZEC 14:8 UST doubled-Hebrew display flag) ──
+// NOTE: `posOf` here stands in for the panel's EXACT resolver
+// (resolveSourcePosExact). The helper trusts it — feeding it
+// resolveSourcePos's strong|1 fallback is what invents reuse on clean verses,
+// which is why the panel passes the exact one.
 // A source token claimed by two or more DISPLAY groups is a data defect: one
 // physical Hebrew word cannot belong to several alignment groups. Real case:
 // ZEC 14:8 UST aligns בַּקַּיִץ (pos 7) and וּבָחֹרֶף (pos 8) as a compound card
 // AND as two separate single-source cards.
 {
-  console.log("\n[Case] findReusedSourcePositions flags the ZEC 14:8 shape (compound + two singles)");
+  console.log("\n[Case] findReusedSourceWordIds flags the ZEC 14:8 shape (compound + two singles)");
   const mk = (id, pos) => ({ id, strong: "H0000", occurrence: "1", occurrences: "1", content: "x" });
-  const posOf = (s) => ({ "s-kayits": 7, "s-choref": 8, "s-kayits-solo": 7, "s-choref-solo": 8 })[s.id] ?? -1;
+  const posOf = (s) => { const p = ({ "s-kayits": 7, "s-choref": 8, "s-kayits-solo": 7, "s-choref-solo": 8 })[s.id]; return p === undefined ? null : `p${p}`; };
   const gCompound = { id: "g-compound", source: [mk("s-kayits"), mk("s-choref")], targets: [] };
   const gKayitsSolo = { id: "g-kayits", source: [mk("s-kayits-solo")], targets: [] };
   const gChorefSolo = { id: "g-choref", source: [mk("s-choref-solo")], targets: [] };
-  const reused = findReusedSourcePositions([gCompound, gKayitsSolo, gChorefSolo], posOf);
-  assert(reused.size === 2 && reused.has(7) && reused.has(8), `positions 7 and 8 flagged as reused (got ${[...reused]})`);
+  const reused = findReusedSourceWordIds([gCompound, gKayitsSolo, gChorefSolo], posOf);
+  assert(
+    reused.size === 4 &&
+      ["s-kayits", "s-choref", "s-kayits-solo", "s-choref-solo"].every((id) => reused.has(id)),
+    `all four source words at the two reused positions are flagged (got ${[...reused]})`,
+  );
 }
 
 {
-  console.log("\n[Case] findReusedSourcePositions is empty on a clean verse");
+  console.log("\n[Case] findReusedSourceWordIds is empty on a clean verse");
   const mk = (id) => ({ id, strong: "H0000", occurrence: "1", occurrences: "1", content: "x" });
-  const posOf = (s) => ({ "s-a": 1, "s-b": 2 })[s.id] ?? -1;
+  const posOf = (s) => { const p = ({ "s-a": 1, "s-b": 2 })[s.id]; return p === undefined ? null : `p${p}`; };
   const gA = { id: "g-a", source: [mk("s-a")], targets: [] };
   const gB = { id: "g-b", source: [mk("s-b")], targets: [] };
-  const reused = findReusedSourcePositions([gA, gB], posOf);
+  const reused = findReusedSourceWordIds([gA, gB], posOf);
   assert(reused.size === 0, `clean verse yields no reused positions`);
 }
 
@@ -3313,12 +3321,12 @@ const srcWordContents = (st) => st.groups.flatMap((g) => g.source).map((s) => ({
   // אָמַר to two separate target phrases). Identity is the whole sequence, and
   // a position counts once per DISTINCT sequence, so this must not flag —
   // otherwise every split-aligned verse wears a red "data defect" outline.
-  console.log("\n[Case] findReusedSourcePositions exempts the JER 28:1 identical-sequence split");
+  console.log("\n[Case] findReusedSourceWordIds exempts the JER 28:1 identical-sequence split");
   const mk = (id) => ({ id, strong: "H0000", occurrence: "1", occurrences: "1", content: "x" });
-  const posOf = (s) => ({ "s-x1": 7, "s-x2": 7 })[s.id] ?? -1;
+  const posOf = (s) => { const p = ({ "s-x1": 7, "s-x2": 7 })[s.id]; return p === undefined ? null : `p${p}`; };
   const gX1 = { id: "g-x1", source: [mk("s-x1")], targets: [] };
   const gX2 = { id: "g-x2", source: [mk("s-x2")], targets: [] };
-  const reused = findReusedSourcePositions([gX1, gX2], posOf);
+  const reused = findReusedSourceWordIds([gX1, gX2], posOf);
   assert(reused.size === 0, `identical position sequence [7]+[7] is a legitimate split, not reuse (got ${[...reused]})`);
 }
 
@@ -3330,13 +3338,16 @@ const srcWordContents = (st) => st.groups.flatMap((g) => g.source).map((s) => ({
   // state.groups is what keeps this visible — if the panel is ever changed to
   // pass displayGroups, the aligner goes silent on a verse api-side lint still
   // flags, and the translator clicks through to a verse with nothing marked.
-  console.log("\n[Case] findReusedSourcePositions flags a 3-word compound overlapping a standalone");
+  console.log("\n[Case] findReusedSourceWordIds flags a 3-word compound overlapping a standalone");
   const mk = (id) => ({ id, strong: "H0000", occurrence: "1", occurrences: "1", content: "x" });
-  const posOf = (s) => ({ "s-a": 7, "s-b": 8, "s-c": 9, "s-a-solo": 7 })[s.id] ?? -1;
+  const posOf = (s) => { const p = ({ "s-a": 7, "s-b": 8, "s-c": 9, "s-a-solo": 7 })[s.id]; return p === undefined ? null : `p${p}`; };
   const gCompound = { id: "g-abc", source: [mk("s-a"), mk("s-b"), mk("s-c")], targets: [] };
   const gSolo = { id: "g-a", source: [mk("s-a-solo")], targets: [] };
-  const reused = findReusedSourcePositions([gCompound, gSolo], posOf);
-  assert(reused.size === 1 && reused.has(7), `only the shared position 7 flags (got ${[...reused]})`);
+  const reused = findReusedSourceWordIds([gCompound, gSolo], posOf);
+  assert(
+    reused.size === 2 && reused.has("s-a") && reused.has("s-a-solo"),
+    `only the words at the shared position 7 flag, not s-b/s-c (got ${[...reused]})`,
+  );
 }
 
 {
@@ -3344,33 +3355,51 @@ const srcWordContents = (st) => st.groups.flatMap((g) => g.source).map((s) => ({
   // JER 28:1 split through the REAL displayGroups chain and assert the raw
   // state.groups the panel feeds the helper still yield no reuse. A future
   // reorder of that chain cannot silently start red-outlining clean verses.
-  console.log("\n[Case] findReusedSourcePositions on raw groups agrees with the display pipeline");
+  console.log("\n[Case] findReusedSourceWordIds on raw groups agrees with the display pipeline");
   const mk = (id) => ({ id, strong: "H0000", occurrence: "1", occurrences: "1", content: "x" });
-  const posOf = (s) => ({ "s-x1": 7, "s-x2": 7 })[s.id] ?? -1;
+  const posOf = (s) => { const p = ({ "s-x1": 7, "s-x2": 7 })[s.id]; return p === undefined ? null : `p${p}`; };
   const raw = [
     { id: "g-x1", source: [mk("s-x1")], targets: [{ id: "t1", text: "spoke" }] },
     { id: "g-x2", source: [mk("s-x2")], targets: [{ id: "t2", text: "to me" }] },
   ];
   const positionKey = (g) => {
     const ps = g.source.map(posOf);
-    return ps.some((p) => p < 0) ? null : ps.join(",");
+    return ps.some((p) => p === null) ? null : ps.join(",");
   };
   const display = mergeSamePositionGroups(
     mergeAdjacentSameSource(stripCompoundOverlaps(raw)),
     positionKey,
   );
   assert(display.length === 1, `the split fuses to one display card (got ${display.length})`);
-  assert(findReusedSourcePositions(raw, posOf).size === 0, `and raw groups report no reuse`);
+  assert(findReusedSourceWordIds(raw, posOf).size === 0, `and raw groups report no reuse`);
 }
 
 {
-  console.log("\n[Case] findReusedSourcePositions ignores unresolved (-1) positions");
+  // JER 36:30 UST: chains claim mushlekhet occurrences 2 and 3 of a token the
+  // UHB contains ONCE, so those words have no exact position. They must still
+  // count as evidence via their content|occurrence key - dropping them
+  // collapses ["p16"] and ["p16", unresolvable] to the same sequence and
+  // silences the marker on a verse the api-side lint flags.
+  console.log("[Case] findReusedSourceWordIds keeps an unresolvable occurrence as evidence");
+  {
+    const mkj = (id) => ({ id, strong: "H1961", occurrence: "1", occurrences: "1", content: "x" });
+    const keyOf = (s) =>
+      ({ "s-hyh-solo": "p16", "s-hyh": "p16", "s-mush": "cmush|2" })[s.id] ?? null;
+    const gSolo = { id: "g-solo", source: [mkj("s-hyh-solo")], targets: [] };
+    const gPair = { id: "g-pair", source: [mkj("s-hyh"), mkj("s-mush")], targets: [] };
+    const r = findReusedSourceWordIds([gSolo, gPair], keyOf);
+    assert(
+      r.size === 2 && r.has("s-hyh-solo") && r.has("s-hyh"),
+      `the shared resolvable token flags in both chains (got ${[...r]})`,
+    );
+  }
+  console.log("\n[Case] findReusedSourceWordIds ignores unkeyable source words");
   const mk = (id) => ({ id, strong: "H0000", occurrence: "1", occurrences: "1", content: "x" });
-  const posOf = () => -1;
+  const posOf = () => null;
   const gA = { id: "g-a", source: [mk("s-a")], targets: [] };
   const gB = { id: "g-b", source: [mk("s-b")], targets: [] };
-  const reused = findReusedSourcePositions([gA, gB], posOf);
-  assert(reused.size === 0, `unresolved positions never count as reuse`);
+  const reused = findReusedSourceWordIds([gA, gB], posOf);
+  assert(reused.size === 0, `unkeyable source words never count as reuse`);
 }
 
 // ─── Case: crash-draft round-trip (Fix C persistence) ──────────────────

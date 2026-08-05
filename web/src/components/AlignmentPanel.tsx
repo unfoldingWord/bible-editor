@@ -39,7 +39,7 @@ import {
   stripCompoundOverlaps,
   mergeAdjacentSameSource,
   mergeSamePositionGroups,
-  findReusedSourcePositions,
+  findReusedSourceWordIds,
   type AlignmentGroup,
   type AlignmentState,
   type SourceWord,
@@ -581,7 +581,7 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
       const posToGroupId = new Map<number, string>();
       const sourcePosById = new Map<string, number>();
       const groupPositions = new Map<string, number[]>();
-      if (!state) return { posToGroupId, sourcePosById, groupPositions, reusedPositions: new Set<number>() };
+      if (!state) return { posToGroupId, sourcePosById, groupPositions, reusedSourceIds: new Set<string>() };
       // sourcePosById + groupPositions cover EVERY state.groups source word so
       // any rendered token (and any word whose `alignedTo` points at a group
       // mergeAdjacentSameSource later folds away) still resolves its position.
@@ -608,17 +608,19 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
           if (!posToGroupId.has(pos)) posToGroupId.set(pos, g.id);
         }
       }
-      // A source position claimed by 2+ DISTINCT groups is a data defect (one
+      // A source token claimed by 2+ DISTINCT groups is a data defect (one
       // physical Hebrew word can't belong to several alignment groups) — see
-      // findReusedSourcePositions. Computed from state.groups, NOT
-      // displayGroups: stripCompoundOverlaps would have already erased the
-      // overlap on a compound of 3+, silencing the marker on a verse the
-      // api-side lint still flags. Display only; nothing is fixed.
-      const reusedPositions = findReusedSourcePositions(
-        state.groups,
-        (s) => sourcePosById.get(s.id) ?? -1,
+      // findReusedSourceWordIds. Two deliberate choices there: computed from
+      // state.groups, NOT displayGroups (stripCompoundOverlaps would already
+      // have erased the overlap on a compound of 3+, silencing the marker on a
+      // verse api-side lint still flags), and keyed via reusedTokenKey rather
+      // than resolveSourcePos — that function's strong|1 fallback collapses
+      // distinct same-Strong tokens onto one position and invents reuse on
+      // clean verses. Display only; nothing is fixed.
+      const reusedSourceIds = findReusedSourceWordIds(state.groups, (s) =>
+        reusedTokenKey(s, sourceIndexMap),
       );
-      return { posToGroupId, sourcePosById, groupPositions, reusedPositions };
+      return { posToGroupId, sourcePosById, groupPositions, reusedSourceIds };
     }, [state, displayGroups, sourceIndexMap]);
 
     // Highlight resolution. `hover` may name an English or Hebrew word; we
@@ -973,7 +975,7 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
                 hctx={hctx}
                 sourcePos={posMaps.sourcePosById}
                 posOffset={posOffset}
-                reusedPositions={posMaps.reusedPositions}
+                reusedSourceIds={posMaps.reusedSourceIds}
               />
             </Box>
             <ActionBar
@@ -1494,7 +1496,7 @@ function AlignmentCards({
   hctx,
   sourcePos,
   posOffset,
-  reusedPositions,
+  reusedSourceIds,
 }: {
   groups: AlignmentGroup[];
   ghostByGroup: Map<string, Ghost>;
@@ -1516,9 +1518,10 @@ function AlignmentCards({
   // union offset — for card keys and the position-keyed hover identity.
   sourcePos: Map<string, number>;
   posOffset: number;
-  // Own-relative positions claimed by 2+ display cards — a data defect (see
-  // findReusedSourcePositions in ../lib/alignment).
-  reusedPositions: Set<number>;
+  // Ids of source words claimed by 2+ distinct groups — a data defect (see
+  // findReusedSourceWordIds in ../lib/alignment). Keyed by id, not position,
+  // because chips resolve their own `pos` through the fallback chain.
+  reusedSourceIds: Set<string>;
 }) {
   // Precompute the per-verse TWL hint lookup once (see buildTwHintMap) so each
   // hover re-render isn't O(sourceWords × twlRows) of re-split + re-nfc work.
@@ -1583,7 +1586,7 @@ function AlignmentCards({
                   canExtract={g.source.length > 1}
                   onExtract={() => onExtractSource(s.id)}
                   hctx={hctx}
-                  reused={own >= 0 && reusedPositions.has(own)}
+                  reused={reusedSourceIds.has(s.id)}
                 />
               );
             })}
@@ -2305,6 +2308,21 @@ function resolveSourcePos(s: SourceWord, indexMap: Map<string, number>): number 
     indexMap.get(`s:${s.strong}|1`) ??
     -1
   );
+}
+
+// Token identity for the reused-source-token marker: the EXACT source position
+// (NFC x-content + occurrence, no fallback) when the word resolves, otherwise
+// the word's own content+occurrence. Never Strong's — resolveSourcePos's
+// strong|1 fallback collapses distinct same-Strong tokens onto one position and
+// would accuse a clean verse. The second branch keeps a word whose claimed
+// occurrence doesn't exist in the source verse (JER 36:30 UST) as evidence
+// instead of dropping it. Null only when there is nothing to key on at all.
+// See findReusedSourceWordIds.
+function reusedTokenKey(s: SourceWord, indexMap: Map<string, number>): string | null {
+  const content = nfc(s.content ?? "");
+  const pos = indexMap.get(`t:${content}|${s.occurrence}`);
+  if (pos !== undefined) return `p${pos}`;
+  return content === "" ? null : `c${content}|${s.occurrence}`;
 }
 
 // Position-sequence identity for a group: a stable key from its resolved source
