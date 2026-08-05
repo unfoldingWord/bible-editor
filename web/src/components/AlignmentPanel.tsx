@@ -608,11 +608,14 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
           if (!posToGroupId.has(pos)) posToGroupId.set(pos, g.id);
         }
       }
-      // A source position claimed by 2+ display cards is a data defect (one
+      // A source position claimed by 2+ DISTINCT groups is a data defect (one
       // physical Hebrew word can't belong to several alignment groups) — see
-      // findReusedSourcePositions. Flagged for display only; nothing is fixed.
+      // findReusedSourcePositions. Computed from state.groups, NOT
+      // displayGroups: stripCompoundOverlaps would have already erased the
+      // overlap on a compound of 3+, silencing the marker on a verse the
+      // api-side lint still flags. Display only; nothing is fixed.
       const reusedPositions = findReusedSourcePositions(
-        displayGroups,
+        state.groups,
         (s) => sourcePosById.get(s.id) ?? -1,
       );
       return { posToGroupId, sourcePosById, groupPositions, reusedPositions };
@@ -1873,7 +1876,10 @@ function SourceWordTypography({
           alignItems: "baseline",
           py: 0.25,
           px: 0.75,
-          pr: sourceShowsOccurrence(source) ? 2 : 0.75,
+          // Reserve the right gutter for EITHER superscript — without this a
+          // reused token with no occurrence badge gets ~6px and the warning
+          // glyph clips the rightmost (RTL) Hebrew letter.
+          pr: sourceShowsOccurrence(source) || reused ? 2 : 0.75,
           bgcolor: hover ? "grey.100" : "transparent",
           borderRadius: 0.5,
           fontFamily: '"Frank Ruhl Libre", "Times New Roman", "SBL Hebrew", "Cardo", serif',
@@ -1921,6 +1927,10 @@ function SourceWordTypography({
           <Box
             component="sup"
             dir="ltr"
+            role="img"
+            // The outline is pure colour and the glyph takes no pointer, so
+            // this label is the only signal a screen reader gets.
+            aria-label={REUSED_SOURCE_TOOLTIP}
             sx={{
               position: "absolute",
               bottom: -2,

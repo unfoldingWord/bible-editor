@@ -3308,19 +3308,59 @@ const srcWordContents = (st) => st.groups.flatMap((g) => g.source).map((s) => ({
 }
 
 {
-  // NOTE: two groups with an IDENTICAL position sequence ([7] and [7]) is the
-  // legitimate one-token-to-N-target-runs split (JER 28:1 shape). The helper
-  // itself still reports it as reused — it has no notion of "identical chain"
-  // — because the panel's caller is responsible for running
-  // mergeSamePositionGroups FIRST, which fuses identical-sequence groups into
-  // one card before findReusedSourcePositions ever sees them.
-  console.log("\n[Case] findReusedSourcePositions flags identical-sequence groups too (caller must pre-merge)");
+  // Two groups with an IDENTICAL position sequence ([7] and [7]) is the
+  // LEGITIMATE one-token-to-N-target-runs split (JER 28:1 aligns the single
+  // אָמַר to two separate target phrases). Identity is the whole sequence, and
+  // a position counts once per DISTINCT sequence, so this must not flag —
+  // otherwise every split-aligned verse wears a red "data defect" outline.
+  console.log("\n[Case] findReusedSourcePositions exempts the JER 28:1 identical-sequence split");
   const mk = (id) => ({ id, strong: "H0000", occurrence: "1", occurrences: "1", content: "x" });
   const posOf = (s) => ({ "s-x1": 7, "s-x2": 7 })[s.id] ?? -1;
   const gX1 = { id: "g-x1", source: [mk("s-x1")], targets: [] };
   const gX2 = { id: "g-x2", source: [mk("s-x2")], targets: [] };
   const reused = findReusedSourcePositions([gX1, gX2], posOf);
-  assert(reused.size === 1 && reused.has(7), `identical position sequence [7]+[7] is reported reused at the helper level (got ${[...reused]})`);
+  assert(reused.size === 0, `identical position sequence [7]+[7] is a legitimate split, not reuse (got ${[...reused]})`);
+}
+
+{
+  // Regression for the gap review found: a compound of THREE overlapping a
+  // standalone. stripCompoundOverlaps removes the overlapping word from a
+  // 3-word compound (kept.length is neither 0 nor the original length, so
+  // neither bail-out fires), which erases the evidence. Computing from raw
+  // state.groups is what keeps this visible — if the panel is ever changed to
+  // pass displayGroups, the aligner goes silent on a verse api-side lint still
+  // flags, and the translator clicks through to a verse with nothing marked.
+  console.log("\n[Case] findReusedSourcePositions flags a 3-word compound overlapping a standalone");
+  const mk = (id) => ({ id, strong: "H0000", occurrence: "1", occurrences: "1", content: "x" });
+  const posOf = (s) => ({ "s-a": 7, "s-b": 8, "s-c": 9, "s-a-solo": 7 })[s.id] ?? -1;
+  const gCompound = { id: "g-abc", source: [mk("s-a"), mk("s-b"), mk("s-c")], targets: [] };
+  const gSolo = { id: "g-a", source: [mk("s-a-solo")], targets: [] };
+  const reused = findReusedSourcePositions([gCompound, gSolo], posOf);
+  assert(reused.size === 1 && reused.has(7), `only the shared position 7 flags (got ${[...reused]})`);
+}
+
+{
+  // The invariant the panel actually depends on, pinned end-to-end: run the
+  // JER 28:1 split through the REAL displayGroups chain and assert the raw
+  // state.groups the panel feeds the helper still yield no reuse. A future
+  // reorder of that chain cannot silently start red-outlining clean verses.
+  console.log("\n[Case] findReusedSourcePositions on raw groups agrees with the display pipeline");
+  const mk = (id) => ({ id, strong: "H0000", occurrence: "1", occurrences: "1", content: "x" });
+  const posOf = (s) => ({ "s-x1": 7, "s-x2": 7 })[s.id] ?? -1;
+  const raw = [
+    { id: "g-x1", source: [mk("s-x1")], targets: [{ id: "t1", text: "spoke" }] },
+    { id: "g-x2", source: [mk("s-x2")], targets: [{ id: "t2", text: "to me" }] },
+  ];
+  const positionKey = (g) => {
+    const ps = g.source.map(posOf);
+    return ps.some((p) => p < 0) ? null : ps.join(",");
+  };
+  const display = mergeSamePositionGroups(
+    mergeAdjacentSameSource(stripCompoundOverlaps(raw)),
+    positionKey,
+  );
+  assert(display.length === 1, `the split fuses to one display card (got ${display.length})`);
+  assert(findReusedSourcePositions(raw, posOf).size === 0, `and raw groups report no reuse`);
 }
 
 {

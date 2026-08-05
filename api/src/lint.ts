@@ -240,7 +240,7 @@ function hasGluedMilestone(nodes: unknown[]): boolean {
 }
 
 // True when the verse's alignment data has one physical source token claimed by
-// two or more DISTINCT alignment groups — a data defect that renders as
+// two or more DISTINCT top-level chains — a data defect that renders as
 // "doubled" Hebrew in the aligner (see web/src/lib/alignment.ts
 // findReusedSourcePositions and the ZEC 14:8 UST case it documents: a compound
 // milestone chain wraps בַּקַּיִץ+וּבָחֹרֶף as "throughout the whole year" AND two
@@ -254,11 +254,19 @@ function hasGluedMilestone(nodes: unknown[]): boolean {
 // legitimate one-token-to-N-target-runs split (JER 28:1) — not flagged, since
 // that is exactly what the aligner panel's mergeSamePositionGroups fuses into
 // one card. Only a key shared across chains with DIFFERING full chain keys is a
-// real defect.
+// real defect. Scope: this is the ACROSS-chain defect only. A single chain that
+// wraps the same token twice (the JER 31:33 shape) dedupes to one key here and
+// is not reported — detectDoubledSourceMilestones in web/src/lib/alignment.ts
+// owns that one.
 function zalnLintKey(node: Record<string, unknown>): string | null {
   const content = node["content"];
   if (typeof content !== "string" || content === "") return null;
-  return `${content.normalize("NFC")}|${String(node["occurrence"] ?? "1")}`;
+  // A MISSING occurrence is unknown, not 1. Defaulting it would key two
+  // genuinely distinct occurrences of a repeated word identically and flag a
+  // correctly aligned verse. Unkeyable milestones are simply not evidence.
+  const occurrence = node["occurrence"];
+  if (occurrence === undefined || occurrence === null || occurrence === "") return null;
+  return `${content.normalize("NFC")}|${String(occurrence)}`;
 }
 function isZalnMilestone(n: unknown): n is Record<string, unknown> {
   return !!n && typeof n === "object" && (n as Record<string, unknown>)["type"] === "milestone" &&

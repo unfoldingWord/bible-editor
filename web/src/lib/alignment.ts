@@ -526,32 +526,48 @@ export function mergeSamePositionGroups(
   return out;
 }
 
-// A source token claimed by two or more DISPLAY groups is a data defect: one
-// physical Hebrew word cannot belong to several alignment groups. It renders as
-// "doubled" Hebrew (ZEC 14:8 UST aligns בַּקַּיִץ/וּבָחֹרֶף both as a compound
+// A source token claimed by two or more DISTINCT alignment groups is a data
+// defect: one physical Hebrew word cannot belong to several groups. It renders
+// as "doubled" Hebrew (ZEC 14:8 UST aligns בַּקַּיִץ/וּבָחֹרֶף both as a compound
 // "throughout the whole year" and again as two singles "in the hot season"/"and
-// in the cold season"). Callers pass DISPLAY groups, after
-// mergeSamePositionGroups has already fused groups with an IDENTICAL position
-// sequence — so the legitimate one-token-to-N-target-runs split (JER 28:1) is
-// already one card and never lands here. Display/report only; nothing is fixed.
+// in the cold season").
+//
+// Identity is the group's whole POSITION SEQUENCE, and a position counts once
+// per DISTINCT sequence. That exempts the legitimate one-token-to-N-target-runs
+// split (JER 28:1 aligns the single אָמַר to two separate target phrases) —
+// those groups share an identical sequence, so they count once — while still
+// catching a compound that overlaps a standalone.
+//
+// Pass RAW state.groups, NOT display groups: stripCompoundOverlaps removes an
+// overlapping word from a compound of 3+, which would erase the evidence for a
+// [A,B,C] + [A] verse and leave the aligner silent on a verse the api-side lint
+// (hasReusedSourceToken) still flags — a translator would click through from
+// the lint feed to a verse with nothing highlighted. The two detectors are
+// deliberately the same rule: shared token, differing chain.
+//
+// Display/report only; nothing is fixed here.
 export function findReusedSourcePositions(
   groups: AlignmentGroup[],
   posOf: (s: SourceWord) => number,
 ): Set<number> {
-  const groupCountByPosition = new Map<number, number>();
+  const sequencesByPosition = new Map<number, Set<string>>();
   for (const g of groups) {
     const positions = new Set<number>();
     for (const s of g.source) {
       const p = posOf(s);
       if (p >= 0) positions.add(p);
     }
+    if (positions.size === 0) continue;
+    const seqKey = [...positions].sort((a, b) => a - b).join(",");
     for (const p of positions) {
-      groupCountByPosition.set(p, (groupCountByPosition.get(p) ?? 0) + 1);
+      const seen = sequencesByPosition.get(p) ?? new Set<string>();
+      seen.add(seqKey);
+      sequencesByPosition.set(p, seen);
     }
   }
   const reused = new Set<number>();
-  for (const [p, count] of groupCountByPosition) {
-    if (count >= 2) reused.add(p);
+  for (const [p, seqs] of sequencesByPosition) {
+    if (seqs.size >= 2) reused.add(p);
   }
   return reused;
 }
