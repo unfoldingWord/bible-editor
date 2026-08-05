@@ -40,6 +40,8 @@ import {
   mergeAdjacentSameSource,
   mergeSamePositionGroups,
   buildPositionOwners,
+  positionOwnedBy,
+  positionsShareOwner,
   type AlignmentGroup,
   type AlignmentState,
   type SourceWord,
@@ -626,12 +628,15 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
       return { posOwners, sourcePosById, groupPositions };
     }, [state, displayGroups, sourceIndexMap]);
 
-    // "Is `groupId` one of the cards rendering the source token at `pos`?" —
-    // the membership test that replaced the old `posToGroupId.get(pos) === id`
+    // Bind the two pure hover rules (tested in alignment.test.mjs) to this
+    // panel's owner map. They replaced the old `posToGroupId.get(pos) === id`
     // equality at every hover comparison site.
     const posOwnedBy = useCallback(
-      (pos: number, groupId: string | null) =>
-        groupId !== null && (posMaps.posOwners.get(pos)?.has(groupId) ?? false),
+      (pos: number, groupId: string | null) => positionOwnedBy(posMaps.posOwners, pos, groupId),
+      [posMaps],
+    );
+    const posSharesCard = useCallback(
+      (a: number, b: number) => positionsShareOwner(posMaps.posOwners, a, b),
       [posMaps],
     );
 
@@ -717,33 +722,37 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
       (pos: number, groupIdOverride?: string): "exact" | "linked" | null => {
         if (!hoverLink || !hover) return null;
         if (pos >= 0 && hover.kind === "hebrew" && hover.pos === pos) return "exact";
-        // A card's own Hebrew names its card outright; a shared-strip token
-        // names EVERY card that renders it (a token can belong to a standalone
-        // card and a compound card at once), so the strip lights when any one
-        // of them is the hovered word's card. Consequence, and intended: two
-        // strip tokens that share ANY card light each other, so hovering strip
-        // `אֶל` also lights strip `עֲבָדָיו` when a compound card holds both —
-        // the same pair the compound card itself lights.
-        const myGroupIds = groupIdOverride
-          ? [groupIdOverride]
-          : pos >= 0
-            ? [...(posMaps.posOwners.get(pos - posOffset) ?? [])]
-            : [];
-        if (myGroupIds.length === 0) return null;
+        // A card's own Hebrew names its card outright (groupIdOverride). A
+        // shared-strip token names no card — it is the verse's single entry for
+        // a physical token, which can sit on a standalone card AND a compound
+        // card at once — so it asks the weaker question: do these two positions
+        // share a card? Two consequences, both intended: strip tokens that share
+        // any card light each other (hovering strip `אֶל` lights strip
+        // `עֲבָדָיו` when a compound holds both — the same pair the compound
+        // card lights), and the strip entry can be lit while the STANDALONE card
+        // for that same token stays dark. That is not a contradiction: the strip
+        // says "this token is involved", the card says "this card is not".
         if (hover.kind === "hebrew") {
           // Whole-group: the rest of the hovered word's group lights, resolved
           // to THIS panel's grouping — a compound card shows its siblings even
           // when the other side keeps them separate.
-          return myGroupIds.some((id) => posOwnedBy(hover.pos - posOffset, id)) ? "linked" : null;
+          if (groupIdOverride) {
+            return posOwnedBy(hover.pos - posOffset, groupIdOverride) ? "linked" : null;
+          }
+          return pos >= 0 && posSharesCard(pos - posOffset, hover.pos - posOffset)
+            ? "linked"
+            : null;
         }
         // English hover: its group's union positions name the Hebrew directly
-        // (works on the shared strip and across panels); the groupId equality
-        // covers this panel's own card words that failed position resolution.
-        return hover.positions.includes(pos) || myGroupIds.some((id) => hover.groupId === id)
-          ? "linked"
-          : null;
+        // (works on the shared strip and across panels). The groupId fallback
+        // covers words those union positions miss — a card word whose source
+        // pos failed to resolve, and a strip token belonging to a card whose
+        // `groupPositions` only carry the surviving state group's positions.
+        if (hover.positions.includes(pos)) return "linked";
+        if (groupIdOverride) return hover.groupId === groupIdOverride ? "linked" : null;
+        return pos >= 0 && posOwnedBy(pos - posOffset, hover.groupId) ? "linked" : null;
       },
-      [hoverLink, hover, posMaps, posOwnedBy, posOffset],
+      [hoverLink, hover, posOwnedBy, posSharesCard, posOffset],
     );
 
     const hctx: HighlightCtx = useMemo(

@@ -29,6 +29,8 @@ import {
   detectDoubledSourceMilestones,
   dropDuplicateSourceMilestones,
   buildPositionOwners,
+  positionOwnedBy,
+  positionsShareOwner,
 } from "./alignment.ts";
 import { extractPlainText } from "./usfm.ts";
 import { findTargetHighlights, findSourceHighlights } from "./highlight.ts";
@@ -3513,19 +3515,25 @@ const srcWordContents = (st) => st.groups.flatMap((g) => g.source).map((s) => ({
     owners.get(11).has("g-serv") && owners.get(11).has("g-both"),
     "pos 11 is owned by BOTH the standalone and the compound card",
   );
-  // The bug: first-wins gave pos 10 to the standalone only, so the compound
-  // card's chip failed the `owner === myGroupId` test and stayed dark.
+  // The rules the panel's hover comparisons call — the real exported functions,
+  // not a copy. The bug: first-wins gave pos 10 to the standalone card only, so
+  // the compound card failed the `owner === myGroupId` equality and stayed dark.
   assert(
-    [...owners.get(10)][0] === "g-el",
-    "insertion order still yields the old first-wins owner as the representative",
+    positionOwnedBy(owners, 10, "g-both"),
+    "hovering pos 10 links the compound card (the reported bug)",
   );
-  // The comparison the panel makes at each hover site: "does THIS card own the
-  // hovered position?" Hovering the standalone `אֶל` (pos 10) must light the
-  // compound card's English — the equality test it replaced returned false.
-  const ownedBy = (pos, gid) => owners.get(pos)?.has(gid) ?? false;
-  assert(ownedBy(10, "g-both"), "hovering pos 10 links the compound card (the reported bug)");
-  assert(ownedBy(10, "g-el"), "hovering pos 10 still links the standalone card");
-  assert(!ownedBy(10, "g-serv"), "a card that does NOT render pos 10 stays dark");
+  assert(positionOwnedBy(owners, 10, "g-el"), "hovering pos 10 still links the standalone card");
+  assert(
+    !positionOwnedBy(owners, 10, "g-serv"),
+    "a card that does NOT render pos 10 stays dark",
+  );
+  assert(!positionOwnedBy(owners, 10, null), "a token with no card links nothing");
+  // Shared-strip rule: two positions light each other when any ONE card holds
+  // both. Position 10 and 11 share the compound card, so hovering strip `אֶל`
+  // lights strip `עֲבָדָיו`; an unrelated position shares nothing.
+  assert(positionsShareOwner(owners, 10, 11), "pos 10 and 11 share the compound card");
+  assert(positionsShareOwner(owners, 10, 10), "a position always shares a card with itself");
+  assert(!positionsShareOwner(owners, 10, 99), "an unowned position shares nothing");
   // Unresolved positions (-1) are never owned by anyone.
   const unresolved = buildPositionOwners(
     [{ id: "g-x", source: [sw("s-x", 99)], targets: [] }],

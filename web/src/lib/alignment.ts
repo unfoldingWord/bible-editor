@@ -555,6 +555,35 @@ export function buildPositionOwners(
   return owners;
 }
 
+// The two hover rules the panel resolves highlighting with, kept here as pure
+// functions so the suite tests the real thing rather than a copy of it.
+
+// "Does this card render the source token at `pos`?" — the membership test that
+// replaced a first-wins `owners.get(pos) === groupId` equality.
+export function positionOwnedBy(
+  owners: Map<number, Set<string>>,
+  pos: number,
+  groupId: string | null,
+): boolean {
+  return groupId !== null && (owners.get(pos)?.has(groupId) ?? false);
+}
+
+// "Do these two source positions sit on a card together?" — used for the shared
+// Hebrew strip, whose tokens name no card of their own. With one owner apiece
+// this is the old first-wins comparison; with two it is what makes a token
+// owned by both a standalone and a compound card light for either.
+export function positionsShareOwner(
+  owners: Map<number, Set<string>>,
+  a: number,
+  b: number,
+): boolean {
+  const ownersA = owners.get(a);
+  const ownersB = owners.get(b);
+  if (!ownersA || !ownersB) return false;
+  for (const id of ownersA) if (ownersB.has(id)) return true;
+  return false;
+}
+
 export function parseAlignment(
   verseObjects: unknown[],
   sourceVerseObjects?: unknown[] | null,
