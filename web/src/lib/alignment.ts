@@ -526,6 +526,36 @@ export function mergeSamePositionGroups(
   return out;
 }
 
+// A source token claimed by two or more DISPLAY groups is a data defect: one
+// physical Hebrew word cannot belong to several alignment groups. It renders as
+// "doubled" Hebrew (ZEC 14:8 UST aligns בַּקַּיִץ/וּבָחֹרֶף both as a compound
+// "throughout the whole year" and again as two singles "in the hot season"/"and
+// in the cold season"). Callers pass DISPLAY groups, after
+// mergeSamePositionGroups has already fused groups with an IDENTICAL position
+// sequence — so the legitimate one-token-to-N-target-runs split (JER 28:1) is
+// already one card and never lands here. Display/report only; nothing is fixed.
+export function findReusedSourcePositions(
+  groups: AlignmentGroup[],
+  posOf: (s: SourceWord) => number,
+): Set<number> {
+  const groupCountByPosition = new Map<number, number>();
+  for (const g of groups) {
+    const positions = new Set<number>();
+    for (const s of g.source) {
+      const p = posOf(s);
+      if (p >= 0) positions.add(p);
+    }
+    for (const p of positions) {
+      groupCountByPosition.set(p, (groupCountByPosition.get(p) ?? 0) + 1);
+    }
+  }
+  const reused = new Set<number>();
+  for (const [p, count] of groupCountByPosition) {
+    if (count >= 2) reused.add(p);
+  }
+  return reused;
+}
+
 export function parseAlignment(
   verseObjects: unknown[],
   sourceVerseObjects?: unknown[] | null,

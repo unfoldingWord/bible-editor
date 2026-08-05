@@ -39,6 +39,7 @@ import {
   stripCompoundOverlaps,
   mergeAdjacentSameSource,
   mergeSamePositionGroups,
+  findReusedSourcePositions,
   type AlignmentGroup,
   type AlignmentState,
   type SourceWord,
@@ -580,7 +581,7 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
       const posToGroupId = new Map<number, string>();
       const sourcePosById = new Map<string, number>();
       const groupPositions = new Map<string, number[]>();
-      if (!state) return { posToGroupId, sourcePosById, groupPositions };
+      if (!state) return { posToGroupId, sourcePosById, groupPositions, reusedPositions: new Set<number>() };
       // sourcePosById + groupPositions cover EVERY state.groups source word so
       // any rendered token (and any word whose `alignedTo` points at a group
       // mergeAdjacentSameSource later folds away) still resolves its position.
@@ -607,7 +608,14 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
           if (!posToGroupId.has(pos)) posToGroupId.set(pos, g.id);
         }
       }
-      return { posToGroupId, sourcePosById, groupPositions };
+      // A source position claimed by 2+ display cards is a data defect (one
+      // physical Hebrew word can't belong to several alignment groups) — see
+      // findReusedSourcePositions. Flagged for display only; nothing is fixed.
+      const reusedPositions = findReusedSourcePositions(
+        displayGroups,
+        (s) => sourcePosById.get(s.id) ?? -1,
+      );
+      return { posToGroupId, sourcePosById, groupPositions, reusedPositions };
     }, [state, displayGroups, sourceIndexMap]);
 
     // Highlight resolution. `hover` may name an English or Hebrew word; we
@@ -962,6 +970,7 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
                 hctx={hctx}
                 sourcePos={posMaps.sourcePosById}
                 posOffset={posOffset}
+                reusedPositions={posMaps.reusedPositions}
               />
             </Box>
             <ActionBar
@@ -1482,6 +1491,7 @@ function AlignmentCards({
   hctx,
   sourcePos,
   posOffset,
+  reusedPositions,
 }: {
   groups: AlignmentGroup[];
   ghostByGroup: Map<string, Ghost>;
@@ -1503,6 +1513,9 @@ function AlignmentCards({
   // union offset — for card keys and the position-keyed hover identity.
   sourcePos: Map<string, number>;
   posOffset: number;
+  // Own-relative positions claimed by 2+ display cards — a data defect (see
+  // findReusedSourcePositions in ../lib/alignment).
+  reusedPositions: Set<number>;
 }) {
   // Precompute the per-verse TWL hint lookup once (see buildTwHintMap) so each
   // hover re-render isn't O(sourceWords × twlRows) of re-split + re-nfc work.
@@ -1567,6 +1580,7 @@ function AlignmentCards({
                   canExtract={g.source.length > 1}
                   onExtract={() => onExtractSource(s.id)}
                   hctx={hctx}
+                  reused={own >= 0 && reusedPositions.has(own)}
                 />
               );
             })}
@@ -1773,6 +1787,9 @@ function DropTargetCard({
 }
 
 // ─── Hebrew source word as typography (no inverted block) ──────────────
+const REUSED_SOURCE_TOOLTIP =
+  "This Hebrew word is aligned in more than one group — that is a data defect. A human must re-align this verse.";
+
 function SourceWordTypography({
   source,
   pos,
@@ -1782,6 +1799,7 @@ function SourceWordTypography({
   canExtract,
   onExtract,
   hctx,
+  reused,
 }: {
   source: SourceWord;
   // Union-relative source position (-1 when unresolved — hover identity then
@@ -1793,6 +1811,10 @@ function SourceWordTypography({
   canExtract: boolean;
   onExtract: () => void;
   hctx: HighlightCtx;
+  // True when this source token's own-relative position is claimed by 2+
+  // display cards (see findReusedSourcePositions) — a data defect, not a
+  // hover/link state. Must not be confusable with hoverShadow's blue/amber.
+  reused: boolean;
 }) {
   const [hover, setHover] = useState(false);
   const tone = hctx.hebrewHighlight(pos, groupId);
@@ -1802,10 +1824,17 @@ function SourceWordTypography({
       enterDelay={0}
       enterNextDelay={0}
       title={
-        showInfo ? (
+        showInfo || reused ? (
           <Box>
-            <SourceTooltipBody source={source} lex={lex} twHint={twHint} />
-            {canExtract && (
+            {/* The defect notice leads — a native `title` attribute would lose
+                the hover to this popper and never be read. */}
+            {reused && (
+              <Box sx={{ fontSize: 11, fontWeight: 700, color: "error.light", mb: showInfo ? 0.5 : 0 }}>
+                {REUSED_SOURCE_TOOLTIP}
+              </Box>
+            )}
+            {showInfo && <SourceTooltipBody source={source} lex={lex} twHint={twHint} />}
+            {showInfo && canExtract && (
               <Box sx={{ mt: 0.5, fontSize: 11, opacity: 0.85 }}>
                 double-click to split out of compound
               </Box>
@@ -1815,9 +1844,9 @@ function SourceWordTypography({
           ""
         )
       }
-      disableHoverListener={!showInfo}
-      disableFocusListener={!showInfo}
-      disableTouchListener={!showInfo}
+      disableHoverListener={!showInfo && !reused}
+      disableFocusListener={!showInfo && !reused}
+      disableTouchListener={!showInfo && !reused}
       slotProps={{ popper: { sx: { pointerEvents: "none" } } }}
     >
       <Box
@@ -1856,6 +1885,15 @@ function SourceWordTypography({
           transition: "background-color 0.12s, box-shadow 0.12s",
           userSelect: "none",
           boxShadow: hoverShadow(tone, hctx.themeMode),
+          // Data-defect marker: a standing flag, not a transient hover state.
+          // MUST be `error.main` — hoverShadow's "linked" tone is the SAME
+          // amber as warning.main (highlightTypes.ts), so an amber outline
+          // read as a hover ring. Red is used by neither hover tone (exact is
+          // blue), and it stacks with them rather than replacing them
+          // (outline vs box-shadow).
+          outline: reused ? "2px solid" : "none",
+          outlineColor: "error.main",
+          outlineOffset: 1,
           "&:active": { cursor: "grabbing" },
         }}
       >
@@ -1877,6 +1915,25 @@ function SourceWordTypography({
             }}
           >
             {source.occurrence}
+          </Box>
+        )}
+        {reused && (
+          <Box
+            component="sup"
+            dir="ltr"
+            sx={{
+              position: "absolute",
+              bottom: -2,
+              right: 2,
+              fontFamily: "monospace",
+              fontSize: 11,
+              fontWeight: 900,
+              lineHeight: 1,
+              color: "error.main",
+              pointerEvents: "none",
+            }}
+          >
+            ⚠
           </Box>
         )}
       </Box>

@@ -28,6 +28,7 @@ import {
   reformGluedMilestones,
   detectDoubledSourceMilestones,
   dropDuplicateSourceMilestones,
+  findReusedSourcePositions,
 } from "./alignment.ts";
 import { extractPlainText } from "./usfm.ts";
 import { findTargetHighlights, findSourceHighlights } from "./highlight.ts";
@@ -3278,6 +3279,58 @@ const srcWordContents = (st) => st.groups.flatMap((g) => g.source).map((s) => ({
   const tvo2 = usfm.toJSON(tgt2).chapters["1"]["1"].verseObjects;
   assert(detectDoubledSourceMilestones(tvo2, svo2).length === 0, `genuine שלום שלום is not flagged`);
   assert(dropDuplicateSourceMilestones(tvo2) === tvo2, `genuine repetition is left untouched (same ref)`);
+}
+
+// ─── findReusedSourcePositions (ZEC 14:8 UST doubled-Hebrew display flag) ──
+// A source token claimed by two or more DISPLAY groups is a data defect: one
+// physical Hebrew word cannot belong to several alignment groups. Real case:
+// ZEC 14:8 UST aligns בַּקַּיִץ (pos 7) and וּבָחֹרֶף (pos 8) as a compound card
+// AND as two separate single-source cards.
+{
+  console.log("\n[Case] findReusedSourcePositions flags the ZEC 14:8 shape (compound + two singles)");
+  const mk = (id, pos) => ({ id, strong: "H0000", occurrence: "1", occurrences: "1", content: "x" });
+  const posOf = (s) => ({ "s-kayits": 7, "s-choref": 8, "s-kayits-solo": 7, "s-choref-solo": 8 })[s.id] ?? -1;
+  const gCompound = { id: "g-compound", source: [mk("s-kayits"), mk("s-choref")], targets: [] };
+  const gKayitsSolo = { id: "g-kayits", source: [mk("s-kayits-solo")], targets: [] };
+  const gChorefSolo = { id: "g-choref", source: [mk("s-choref-solo")], targets: [] };
+  const reused = findReusedSourcePositions([gCompound, gKayitsSolo, gChorefSolo], posOf);
+  assert(reused.size === 2 && reused.has(7) && reused.has(8), `positions 7 and 8 flagged as reused (got ${[...reused]})`);
+}
+
+{
+  console.log("\n[Case] findReusedSourcePositions is empty on a clean verse");
+  const mk = (id) => ({ id, strong: "H0000", occurrence: "1", occurrences: "1", content: "x" });
+  const posOf = (s) => ({ "s-a": 1, "s-b": 2 })[s.id] ?? -1;
+  const gA = { id: "g-a", source: [mk("s-a")], targets: [] };
+  const gB = { id: "g-b", source: [mk("s-b")], targets: [] };
+  const reused = findReusedSourcePositions([gA, gB], posOf);
+  assert(reused.size === 0, `clean verse yields no reused positions`);
+}
+
+{
+  // NOTE: two groups with an IDENTICAL position sequence ([7] and [7]) is the
+  // legitimate one-token-to-N-target-runs split (JER 28:1 shape). The helper
+  // itself still reports it as reused — it has no notion of "identical chain"
+  // — because the panel's caller is responsible for running
+  // mergeSamePositionGroups FIRST, which fuses identical-sequence groups into
+  // one card before findReusedSourcePositions ever sees them.
+  console.log("\n[Case] findReusedSourcePositions flags identical-sequence groups too (caller must pre-merge)");
+  const mk = (id) => ({ id, strong: "H0000", occurrence: "1", occurrences: "1", content: "x" });
+  const posOf = (s) => ({ "s-x1": 7, "s-x2": 7 })[s.id] ?? -1;
+  const gX1 = { id: "g-x1", source: [mk("s-x1")], targets: [] };
+  const gX2 = { id: "g-x2", source: [mk("s-x2")], targets: [] };
+  const reused = findReusedSourcePositions([gX1, gX2], posOf);
+  assert(reused.size === 1 && reused.has(7), `identical position sequence [7]+[7] is reported reused at the helper level (got ${[...reused]})`);
+}
+
+{
+  console.log("\n[Case] findReusedSourcePositions ignores unresolved (-1) positions");
+  const mk = (id) => ({ id, strong: "H0000", occurrence: "1", occurrences: "1", content: "x" });
+  const posOf = () => -1;
+  const gA = { id: "g-a", source: [mk("s-a")], targets: [] };
+  const gB = { id: "g-b", source: [mk("s-b")], targets: [] };
+  const reused = findReusedSourcePositions([gA, gB], posOf);
+  assert(reused.size === 0, `unresolved positions never count as reuse`);
 }
 
 // ─── Case: crash-draft round-trip (Fix C persistence) ──────────────────
