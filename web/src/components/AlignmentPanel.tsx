@@ -608,20 +608,21 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
       // card already owns that content, so mapping off state.groups let the
       // stripped token's position win by parse order and light the wrong card
       // on a strip-token hover.
-      // Same for a display group's union positions: recompute from the source
-      // chain the CARD renders, so onEnglishHover's positions agree with
-      // posToGroupId (stripCompoundOverlaps can drop a source word the
-      // survivor's state group still carries).
+      // groupPositions deliberately stays STATE-derived (the loop above): a
+      // source word stripCompoundOverlaps removes from a compound's rendered
+      // chain is still bound to it, and hover must still bridge it (see the
+      // sourceWordKey comment in alignment.ts). Recomputing the union from the
+      // card's narrowed chain would drop that word's position and take the
+      // stripped token dark on hover. Safe for the merge paths too: both
+      // mergeAdjacentSameSource (identical sourceKey) and
+      // mergeSamePositionGroups (identical resolved-position key) fuse only
+      // groups whose positions already match the survivor's.
       for (const g of displayGroups) {
-        const positions: number[] = [];
         for (const s of g.source) {
-          const pos = sourcePosById.get(s.id) ?? resolveSourcePos(s, sourceIndexMap);
-          sourcePosById.set(s.id, pos);
+          const pos = sourcePosById.get(s.id) ?? -1;
           if (pos < 0) continue;
-          positions.push(pos);
           if (!posToGroupId.has(pos)) posToGroupId.set(pos, g.id);
         }
-        groupPositions.set(g.id, positions);
       }
       return { posToGroupId, sourcePosById, groupPositions };
     }, [state, displayGroups, sourceIndexMap]);
