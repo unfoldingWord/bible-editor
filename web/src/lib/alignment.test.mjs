@@ -28,6 +28,10 @@ import {
   reformGluedMilestones,
   detectDoubledSourceMilestones,
   dropDuplicateSourceMilestones,
+  buildPositionOwners,
+  positionOwnedBy,
+  positionsShareOwner,
+  findReusedSourceWordIds,
 } from "./alignment.ts";
 import { extractPlainText } from "./usfm.ts";
 import { findTargetHighlights, findSourceHighlights } from "./highlight.ts";
@@ -3280,6 +3284,127 @@ const srcWordContents = (st) => st.groups.flatMap((g) => g.source).map((s) => ({
   assert(dropDuplicateSourceMilestones(tvo2) === tvo2, `genuine repetition is left untouched (same ref)`);
 }
 
+// ─── findReusedSourceWordIds (ZEC 14:8 UST doubled-Hebrew display flag) ──
+// NOTE: `posOf` here stands in for the panel's EXACT resolver
+// (resolveSourcePosExact). The helper trusts it — feeding it
+// resolveSourcePos's strong|1 fallback is what invents reuse on clean verses,
+// which is why the panel passes the exact one.
+// A source token claimed by two or more DISPLAY groups is a data defect: one
+// physical Hebrew word cannot belong to several alignment groups. Real case:
+// ZEC 14:8 UST aligns בַּקַּיִץ (pos 7) and וּבָחֹרֶף (pos 8) as a compound card
+// AND as two separate single-source cards.
+{
+  console.log("\n[Case] findReusedSourceWordIds flags the ZEC 14:8 shape (compound + two singles)");
+  const mk = (id, pos) => ({ id, strong: "H0000", occurrence: "1", occurrences: "1", content: "x" });
+  const posOf = (s) => { const p = ({ "s-kayits": 7, "s-choref": 8, "s-kayits-solo": 7, "s-choref-solo": 8 })[s.id]; return p === undefined ? null : `p${p}`; };
+  const gCompound = { id: "g-compound", source: [mk("s-kayits"), mk("s-choref")], targets: [] };
+  const gKayitsSolo = { id: "g-kayits", source: [mk("s-kayits-solo")], targets: [] };
+  const gChorefSolo = { id: "g-choref", source: [mk("s-choref-solo")], targets: [] };
+  const reused = findReusedSourceWordIds([gCompound, gKayitsSolo, gChorefSolo], posOf);
+  assert(
+    reused.size === 4 &&
+      ["s-kayits", "s-choref", "s-kayits-solo", "s-choref-solo"].every((id) => reused.has(id)),
+    `all four source words at the two reused positions are flagged (got ${[...reused]})`,
+  );
+}
+
+{
+  console.log("\n[Case] findReusedSourceWordIds is empty on a clean verse");
+  const mk = (id) => ({ id, strong: "H0000", occurrence: "1", occurrences: "1", content: "x" });
+  const posOf = (s) => { const p = ({ "s-a": 1, "s-b": 2 })[s.id]; return p === undefined ? null : `p${p}`; };
+  const gA = { id: "g-a", source: [mk("s-a")], targets: [] };
+  const gB = { id: "g-b", source: [mk("s-b")], targets: [] };
+  const reused = findReusedSourceWordIds([gA, gB], posOf);
+  assert(reused.size === 0, `clean verse yields no reused positions`);
+}
+
+{
+  // Two groups with an IDENTICAL position sequence ([7] and [7]) is the
+  // LEGITIMATE one-token-to-N-target-runs split (JER 28:1 aligns the single
+  // אָמַר to two separate target phrases). Identity is the whole sequence, and
+  // a position counts once per DISTINCT sequence, so this must not flag —
+  // otherwise every split-aligned verse wears a red "data defect" outline.
+  console.log("\n[Case] findReusedSourceWordIds exempts the JER 28:1 identical-sequence split");
+  const mk = (id) => ({ id, strong: "H0000", occurrence: "1", occurrences: "1", content: "x" });
+  const posOf = (s) => { const p = ({ "s-x1": 7, "s-x2": 7 })[s.id]; return p === undefined ? null : `p${p}`; };
+  const gX1 = { id: "g-x1", source: [mk("s-x1")], targets: [] };
+  const gX2 = { id: "g-x2", source: [mk("s-x2")], targets: [] };
+  const reused = findReusedSourceWordIds([gX1, gX2], posOf);
+  assert(reused.size === 0, `identical position sequence [7]+[7] is a legitimate split, not reuse (got ${[...reused]})`);
+}
+
+{
+  // Regression for the gap review found: a compound of THREE overlapping a
+  // standalone. stripCompoundOverlaps removes the overlapping word from a
+  // 3-word compound (kept.length is neither 0 nor the original length, so
+  // neither bail-out fires), which erases the evidence. Computing from raw
+  // state.groups is what keeps this visible — if the panel is ever changed to
+  // pass displayGroups, the aligner goes silent on a verse api-side lint still
+  // flags, and the translator clicks through to a verse with nothing marked.
+  console.log("\n[Case] findReusedSourceWordIds flags a 3-word compound overlapping a standalone");
+  const mk = (id) => ({ id, strong: "H0000", occurrence: "1", occurrences: "1", content: "x" });
+  const posOf = (s) => { const p = ({ "s-a": 7, "s-b": 8, "s-c": 9, "s-a-solo": 7 })[s.id]; return p === undefined ? null : `p${p}`; };
+  const gCompound = { id: "g-abc", source: [mk("s-a"), mk("s-b"), mk("s-c")], targets: [] };
+  const gSolo = { id: "g-a", source: [mk("s-a-solo")], targets: [] };
+  const reused = findReusedSourceWordIds([gCompound, gSolo], posOf);
+  assert(
+    reused.size === 2 && reused.has("s-a") && reused.has("s-a-solo"),
+    `only the words at the shared position 7 flag, not s-b/s-c (got ${[...reused]})`,
+  );
+}
+
+{
+  // The invariant the panel actually depends on, pinned end-to-end: run the
+  // JER 28:1 split through the REAL displayGroups chain and assert the raw
+  // state.groups the panel feeds the helper still yield no reuse. A future
+  // reorder of that chain cannot silently start red-outlining clean verses.
+  console.log("\n[Case] findReusedSourceWordIds on raw groups agrees with the display pipeline");
+  const mk = (id) => ({ id, strong: "H0000", occurrence: "1", occurrences: "1", content: "x" });
+  const posOf = (s) => { const p = ({ "s-x1": 7, "s-x2": 7 })[s.id]; return p === undefined ? null : `p${p}`; };
+  const raw = [
+    { id: "g-x1", source: [mk("s-x1")], targets: [{ id: "t1", text: "spoke" }] },
+    { id: "g-x2", source: [mk("s-x2")], targets: [{ id: "t2", text: "to me" }] },
+  ];
+  const positionKey = (g) => {
+    const ps = g.source.map(posOf);
+    return ps.some((p) => p === null) ? null : ps.join(",");
+  };
+  const display = mergeSamePositionGroups(
+    mergeAdjacentSameSource(stripCompoundOverlaps(raw)),
+    positionKey,
+  );
+  assert(display.length === 1, `the split fuses to one display card (got ${display.length})`);
+  assert(findReusedSourceWordIds(raw, posOf).size === 0, `and raw groups report no reuse`);
+}
+
+{
+  // JER 36:30 UST: chains claim mushlekhet occurrences 2 and 3 of a token the
+  // UHB contains ONCE, so those words have no exact position. They must still
+  // count as evidence via their content|occurrence key - dropping them
+  // collapses ["p16"] and ["p16", unresolvable] to the same sequence and
+  // silences the marker on a verse the api-side lint flags.
+  console.log("[Case] findReusedSourceWordIds keeps an unresolvable occurrence as evidence");
+  {
+    const mkj = (id) => ({ id, strong: "H1961", occurrence: "1", occurrences: "1", content: "x" });
+    const keyOf = (s) =>
+      ({ "s-hyh-solo": "p16", "s-hyh": "p16", "s-mush": "cmush|2" })[s.id] ?? null;
+    const gSolo = { id: "g-solo", source: [mkj("s-hyh-solo")], targets: [] };
+    const gPair = { id: "g-pair", source: [mkj("s-hyh"), mkj("s-mush")], targets: [] };
+    const r = findReusedSourceWordIds([gSolo, gPair], keyOf);
+    assert(
+      r.size === 2 && r.has("s-hyh-solo") && r.has("s-hyh"),
+      `the shared resolvable token flags in both chains (got ${[...r]})`,
+    );
+  }
+  console.log("\n[Case] findReusedSourceWordIds ignores unkeyable source words");
+  const mk = (id) => ({ id, strong: "H0000", occurrence: "1", occurrences: "1", content: "x" });
+  const posOf = () => null;
+  const gA = { id: "g-a", source: [mk("s-a")], targets: [] };
+  const gB = { id: "g-b", source: [mk("s-b")], targets: [] };
+  const reused = findReusedSourceWordIds([gA, gB], posOf);
+  assert(reused.size === 0, `unkeyable source words never count as reuse`);
+}
+
 // ─── Case: crash-draft round-trip (Fix C persistence) ──────────────────
 // AlignmentPanel persists in-progress drags to IndexedDB by storing
 // serializeAlignment(state) as `{ verseObjects }`, then hydrates by
@@ -3455,6 +3580,88 @@ const srcWordContents = (st) => st.groups.flatMap((g) => g.source).map((s) => ({
     `${alone.occurrence}/${alone.occurrences}` === "1/1",
     `עַל is counted per exact surface, not per Strong (got ${alone.occurrence}/${alone.occurrences})`,
   );
+}
+
+// ─── AMO 3:7 — one source token owned by TWO display cards ────────────────────
+// Reproduced in the browser (UST AMO 3:7): three cards render as `אֶל`→"to",
+// `עֲבָדָיו`→"his servants", and a compound `אֶל + עֲבָדָיו`→"his". Their position
+// SEQUENCES differ ("10", "11", "10.11"), so mergeSamePositionGroups correctly
+// declines to fuse them — leaving two legitimate owners for each of positions 10
+// and 11. The panel's old first-wins `posToGroupId` handed each position to one
+// card only, so hovering the standalone `אֶל` lit the compound card's Hebrew
+// (a by-position comparison) while its English chip "his" stayed dark: one card
+// contradicting itself. buildPositionOwners keeps EVERY owner so the hover
+// comparisons can ask about membership.
+{
+  console.log("\n[Case] a source position owned by two display cards keeps both owners");
+  const sw = (id, pos) => ({ id, strong: "H0413", occurrence: "1", occurrences: "1", content: `w${pos}` });
+  const standaloneEl = { id: "g-el", source: [sw("s-el", 10)], targets: [{ id: "t1", text: "to", occurrence: "1", occurrences: "1" }] };
+  const compound = {
+    id: "g-both",
+    source: [sw("s-el2", 10), sw("s-serv2", 11)],
+    targets: [{ id: "t2", text: "his", occurrence: "2", occurrences: "2" }],
+  };
+  const standaloneServ = { id: "g-serv", source: [sw("s-serv", 11)], targets: [{ id: "t3", text: "servants", occurrence: "1", occurrences: "1" }] };
+  const sourcePosById = new Map([
+    ["s-el", 10], ["s-el2", 10], ["s-serv", 11], ["s-serv2", 11],
+  ]);
+  // Run the REAL display pipeline first, so this guards the case the panel can
+  // actually produce — not a hand-built shape the transforms would dissolve.
+  // Every milestone in the live verse carries occurrence 1/1, so the compound's
+  // words share a sourceWordKey with both standalones; stripCompoundOverlaps
+  // survives it only because stripping ALL of a group's source words is the
+  // no-op escape hatch (alignment.ts: `kept.length === 0` returns g untouched).
+  const positionKey = (g) => {
+    const ps = g.source.map((s) => sourcePosById.get(s.id) ?? -1);
+    return ps.length === 0 || ps.some((p) => p < 0) ? null : ps.join(".");
+  };
+  const displayGroups = mergeSamePositionGroups(
+    mergeAdjacentSameSource(stripCompoundOverlaps([standaloneEl, compound, standaloneServ])),
+    positionKey,
+  );
+  assert(
+    displayGroups.length === 3,
+    `all three cards survive the display pipeline (got ${displayGroups.length})`,
+  );
+  assert(
+    displayGroups.find((g) => g.id === "g-both").source.length === 2,
+    "the compound card keeps BOTH source words — stripCompoundOverlaps no-ops when it would strip them all",
+  );
+  const owners = buildPositionOwners(displayGroups, sourcePosById);
+  assert(owners.get(10).size === 2, `pos 10 has two owners (got ${owners.get(10).size})`);
+  assert(
+    owners.get(10).has("g-el") && owners.get(10).has("g-both"),
+    "pos 10 is owned by BOTH the standalone and the compound card",
+  );
+  assert(
+    owners.get(11).has("g-serv") && owners.get(11).has("g-both"),
+    "pos 11 is owned by BOTH the standalone and the compound card",
+  );
+  // The rules the panel's hover comparisons call — the real exported functions,
+  // not a copy. The bug: first-wins gave pos 10 to the standalone card only, so
+  // the compound card failed the `owner === myGroupId` equality and stayed dark.
+  assert(
+    positionOwnedBy(owners, 10, "g-both"),
+    "hovering pos 10 links the compound card (the reported bug)",
+  );
+  assert(positionOwnedBy(owners, 10, "g-el"), "hovering pos 10 still links the standalone card");
+  assert(
+    !positionOwnedBy(owners, 10, "g-serv"),
+    "a card that does NOT render pos 10 stays dark",
+  );
+  assert(!positionOwnedBy(owners, 10, null), "a token with no card links nothing");
+  // Shared-strip rule: two positions light each other when any ONE card holds
+  // both. Position 10 and 11 share the compound card, so hovering strip `אֶל`
+  // lights strip `עֲבָדָיו`; an unrelated position shares nothing.
+  assert(positionsShareOwner(owners, 10, 11), "pos 10 and 11 share the compound card");
+  assert(positionsShareOwner(owners, 10, 10), "a position always shares a card with itself");
+  assert(!positionsShareOwner(owners, 10, 99), "an unowned position shares nothing");
+  // Unresolved positions (-1) are never owned by anyone.
+  const unresolved = buildPositionOwners(
+    [{ id: "g-x", source: [sw("s-x", 99)], targets: [] }],
+    new Map([["s-x", -1]]),
+  );
+  assert(unresolved.size === 0, "unresolved source positions produce no owners");
 }
 
 if (failed > 0) {

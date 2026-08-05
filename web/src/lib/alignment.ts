@@ -526,6 +526,158 @@ export function mergeSamePositionGroups(
   return out;
 }
 
+// Source position → EVERY display card that renders a source word at that
+// position. A position can legitimately have more than one owner: a standalone
+// card and a compound card can both name the same physical source token when
+// mergeSamePositionGroups declines to fuse them, which it does whenever their
+// position SEQUENCES differ (AMO 3:7 UST: `אֶל` alone, `עֲבָדָיו` alone, and a
+// compound `אֶל + עֲבָדָיו` — keys "10", "11" and "10.11"). A first-wins
+// position→id map made the non-owning card a stranger to its own token:
+// hovering the standalone `אֶל` lit the compound card's Hebrew (that comparison
+// goes by position) while leaving its English chip dark, so one card
+// contradicted itself. Callers ask "does THIS card own the hovered position?"
+// by set membership; insertion order is display order, so the first entry of a
+// set is still the old first-wins owner where a single representative is needed.
+export function buildPositionOwners(
+  displayGroups: AlignmentGroup[],
+  sourcePosById: Map<string, number>,
+): Map<number, Set<string>> {
+  const owners = new Map<number, Set<string>>();
+  for (const g of displayGroups) {
+    for (const s of g.source) {
+      const pos = sourcePosById.get(s.id) ?? -1;
+      if (pos < 0) continue;
+      let set = owners.get(pos);
+      if (!set) owners.set(pos, (set = new Set<string>()));
+      set.add(g.id);
+    }
+  }
+  return owners;
+}
+
+// The two hover rules the panel resolves highlighting with, kept here as pure
+// functions so the suite tests the real thing rather than a copy of it.
+
+// "Does this card render the source token at `pos`?" — the membership test that
+// replaced a first-wins `owners.get(pos) === groupId` equality.
+export function positionOwnedBy(
+  owners: Map<number, Set<string>>,
+  pos: number,
+  groupId: string | null,
+): boolean {
+  return groupId !== null && (owners.get(pos)?.has(groupId) ?? false);
+}
+
+// "Do these two source positions sit on a card together?" — used for the shared
+// Hebrew strip, whose tokens name no card of their own. With one owner apiece
+// this is the old first-wins comparison; with two it is what makes a token
+// owned by both a standalone and a compound card light for either.
+export function positionsShareOwner(
+  owners: Map<number, Set<string>>,
+  a: number,
+  b: number,
+): boolean {
+  const ownersA = owners.get(a);
+  const ownersB = owners.get(b);
+  if (!ownersA || !ownersB) return false;
+  for (const id of ownersA) if (ownersB.has(id)) return true;
+  return false;
+}
+
+// A source token claimed by two or more DISTINCT alignment groups is a data
+// defect: one physical Hebrew word cannot belong to several groups. It renders
+// as "doubled" Hebrew (ZEC 14:8 UST aligns בַּקַּיִץ/וּבָחֹרֶף both as a compound
+// "throughout the whole year" and again as two singles "in the hot season"/"and
+// in the cold season").
+//
+// Identity is the group's whole POSITION SEQUENCE, and a position counts once
+// per DISTINCT sequence. That exempts the legitimate one-token-to-N-target-runs
+// split (JER 28:1 aligns the single אָמַר to two separate target phrases) —
+// those groups share an identical sequence, so they count once — while still
+// catching a compound that overlaps a standalone.
+//
+// Pass RAW state.groups, NOT display groups: stripCompoundOverlaps removes an
+// overlapping word from a compound of 3+, which would erase the evidence for a
+// [A,B,C] + [A] verse and leave the aligner silent on a verse the api-side lint
+// (hasReusedSourceToken) still flags — a translator would click through from
+// the lint feed to a verse with nothing highlighted.
+//
+// Identity is supplied by `keyOf`, and it MUST NOT come from
+// resolveSourcePos's strong-based fallback chain. That fallback maps an
+// unresolvable word onto `strong|1`, so two DISTINCT tokens that merely share a
+// Strong's number collapse onto one identity and a perfectly good verse wears a
+// red "data defect" outline. Measured on prod D1, the fallback invented reuse in
+// 4 ZEC verses and 2 in 1SA that exact resolution finds nothing wrong with.
+//
+// The panel supplies `p{position}` when the word resolves EXACTLY against the
+// UHB/UGNT (NFC x-content + occurrence), and falls back to the word's own
+// `c{content}|{occurrence}` — never its Strong's — when it does not. That
+// second case is not a nicety: a word claiming an occurrence the source verse
+// does not have (JER 36:30 UST aligns מֻשְׁלֶכֶת occurrences 2 and 3 of a token
+// the UHB contains once) would otherwise drop out, collapsing two distinct
+// chains to the same sequence and silencing the marker on a verse api-side lint
+// still flags.
+//
+// The two detectors do NOT fully agree, and the disagreement is one-directional:
+// this one can flag a verse api-side lint stays silent on, never the reverse.
+// Measured over the five sample ULT/UST books (1877 verses) against their UHB:
+// {both: 0, lintOnly: 0, uiOnly: 1} — ZEC 2:8, where אָמַר is written
+// occurrence 1/2 inside one chain and 2 standalone while the UHB contains it
+// once. This detector runs AFTER parseAlignment has reformed occurrences against
+// the real source, so both chains key to p16 and it flags; lint has no source
+// rows (by design) and keys raw x-occurrence, so "1" and "2" stay distinct and
+// it reports nothing. Two other mechanisms push the same direction: lint treats
+// an outermost `\zaln-s` plus everything nested in it as ONE chain while
+// parseAlignment makes a group per word-bearing chain (so a merged shared prefix
+// hides reuse from lint), and lint drops a milestone with no x-occurrence where
+// parseAlignment defaults it to 1. Closing any of these needs the source verse
+// on the api side — a bigger change than this key space. Until then: a red
+// marker with no lint entry is expected and the marker is the more reliable of
+// the two; do not "fix" the marker to match the feed.
+//
+// Sequence order is DOCUMENT order, matching the api-side join — sorting would
+// exempt the reversed-nesting defect ([A,B] plus [B,A] over the same tokens,
+// HAB 1:3 UST) by making the two chains look identical.
+//
+// Returns the IDS of the offending source words, not positions, so the caller
+// marks chips by identity and can't mismatch position spaces (chips resolve
+// their own `pos` through the fallback chain for hover).
+//
+// Display/report only; nothing is fixed here.
+export function findReusedSourceWordIds(
+  groups: AlignmentGroup[],
+  keyOf: (s: SourceWord) => string | null,
+): Set<string> {
+  const sequencesByToken = new Map<string, Set<string>>();
+  for (const g of groups) {
+    const tokens: string[] = [];
+    for (const s of g.source) {
+      const k = keyOf(s);
+      if (k !== null && !tokens.includes(k)) tokens.push(k);
+    }
+    if (tokens.length === 0) continue;
+    const seqKey = tokens.join(",");
+    for (const k of tokens) {
+      const seen = sequencesByToken.get(k) ?? new Set<string>();
+      seen.add(seqKey);
+      sequencesByToken.set(k, seen);
+    }
+  }
+  const reusedTokens = new Set<string>();
+  for (const [k, seqs] of sequencesByToken) {
+    if (seqs.size >= 2) reusedTokens.add(k);
+  }
+  const ids = new Set<string>();
+  if (reusedTokens.size === 0) return ids;
+  for (const g of groups) {
+    for (const s of g.source) {
+      const k = keyOf(s);
+      if (k !== null && reusedTokens.has(k)) ids.add(s.id);
+    }
+  }
+  return ids;
+}
+
 export function parseAlignment(
   verseObjects: unknown[],
   sourceVerseObjects?: unknown[] | null,

@@ -125,6 +125,54 @@ t("intra-word U+2060 joiner is NOT flagged as glued", () => {
   assert.equal(i.filter((x) => x.check === "Glued alignment").length, 0);
 });
 
+// Reused-source-token detector (ZEC 14:8 UST doubled-Hebrew defect): a single
+// physical source token claimed by 2+ alignment chains with DIFFERING chain
+// identity. UHB-free — keyed on x-content|x-occurrence, not resolved position.
+t("ZEC 14:8 shape (compound + two singles reusing the same tokens) flags once", () => {
+  const usfmText =
+    `\\c 1\n\\p\n\\v 1 ` +
+    `\\zaln-s |x-strong="H1" x-occurrence="1" x-occurrences="1" x-content="קיץ"\\*` +
+    `\\zaln-s |x-strong="H2" x-occurrence="1" x-occurrences="1" x-content="חרף"\\*` +
+    `\\w whole\\w* \\w year\\w*\\zaln-e\\*\\zaln-e\\* ` +
+    `\\zaln-s |x-strong="H1" x-occurrence="1" x-occurrences="1" x-content="קיץ"\\*\\w hot\\w*\\zaln-e\\* ` +
+    `\\zaln-s |x-strong="H2" x-occurrence="1" x-occurrences="1" x-content="חרף"\\*\\w cold\\w*\\zaln-e\\*\n`;
+  const i = lintUsfmVerses([verseFromUsfm(usfmText)]);
+  const reused = i.filter((x) => x.check === "Reused source token");
+  assert.equal(reused.length, 1);
+  assert.equal(reused[0].bucket, "flag");
+});
+t("identical-chain pair (legitimate one-token-to-N-target-runs split) is NOT flagged", () => {
+  const usfmText =
+    `\\c 1\n\\p\n\\v 1 ` +
+    `\\zaln-s |x-strong="H1" x-occurrence="1" x-occurrences="1" x-content="אמר"\\*\\w spoke1\\w*\\zaln-e\\* ` +
+    `\\zaln-s |x-strong="H1" x-occurrence="1" x-occurrences="1" x-content="אמר"\\*\\w spoke2\\w*\\zaln-e\\*\n`;
+  const i = lintUsfmVerses([verseFromUsfm(usfmText)]);
+  assert.equal(i.filter((x) => x.check === "Reused source token").length, 0);
+});
+t("clean verse with distinct source tokens is NOT flagged as reused", () => {
+  const i = lintUsfmVerses([
+    verseFromUsfm(
+      `\\c 1\n\\p\n\\v 1 \\zaln-s |x-strong="H1" x-occurrence="1" x-occurrences="1" x-content="קיץ"\\*\\w summer\\w*\\zaln-e\\* \\zaln-s |x-strong="H2" x-occurrence="1" x-occurrences="1" x-content="חרף"\\*\\w winter\\w*\\zaln-e\\*\n`,
+    ),
+  ]);
+  assert.equal(i.filter((x) => x.check === "Reused source token").length, 0);
+});
+// A chain that wraps the SAME token twice (the JER 31:33 doubled-milestone
+// shape) plus a standalone claiming that token. Chain identity must de-duplicate
+// within the chain, or this keys as "A,A" vs "A" and lint flags a verse the
+// aligner's findReusedSourceWordIds reports nothing on (its group collapses to
+// the single key "A") — a translator clicking through from the lint feed would
+// find nothing marked. Measured before the fix: LINT 1, UI 0.
+t("within-chain doubling + a standalone is NOT flagged (agrees with the aligner)", () => {
+  const z = (c) => `\\zaln-s |x-strong="H1" x-occurrence="1" x-occurrences="1" x-content="${c}"\\*`;
+  const usfmText =
+    `\\c 1\n\\p\n\\v 1 ` +
+    z("קיץ") + z("קיץ") + `\\w whole\\w*\\zaln-e\\*\\zaln-e\\* ` +
+    z("קיץ") + `\\w hot\\w*\\zaln-e\\*\n`;
+  const i = lintUsfmVerses([verseFromUsfm(usfmText)]);
+  assert.equal(i.filter((x) => x.check === "Reused source token").length, 0);
+});
+
 // ── Blank required-field checks (the manual review_kind='blank-note' stamps,
 // now computed dynamically). tn note, tq question/response, twl OrigWords/TWLink.
 t("empty tn note flagged with chapter:verse ref + rowId", () => {
