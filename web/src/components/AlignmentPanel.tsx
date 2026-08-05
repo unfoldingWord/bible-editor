@@ -122,6 +122,10 @@ export interface AlignmentPanelHandle {
   save: (afterCommit?: () => void) => boolean;
   reset: () => void;
   discard: () => void;
+  // Union-relative positions of the group that owns `unionPos` in THIS panel's
+  // grouping (empty when the position isn't aligned here). Lets a shared source
+  // strip, which has no grouping, ask each panel which Hebrew belongs together.
+  sourceGroupPositions: (unionPos: number) => number[];
 }
 
 interface Props {
@@ -881,6 +885,20 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
       return true;
     }, [state, verse, onSave, onConfirmUnalign, book, chapter, verseNum, bibleVersion]);
 
+    // Same two maps hebrewHighlight/onEnglishHover use, in the same roles:
+    // posToGroupId (display-derived) says which CARD owns the position, and
+    // groupPositions (state-derived) gives that group's full union — including a
+    // source word stripCompoundOverlaps removed from the rendered chain, which
+    // must still bridge on hover. Positions travel union-relative.
+    const sourceGroupPositions = useCallback(
+      (unionPos: number): number[] => {
+        const gid = posMaps.posToGroupId.get(unionPos - posOffset);
+        if (!gid) return [];
+        return (posMaps.groupPositions.get(gid) ?? []).map((p) => p + posOffset);
+      },
+      [posMaps, posOffset],
+    );
+
     useImperativeHandle(
       ref,
       () => ({
@@ -888,8 +906,9 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
         save: handleSave,
         reset: handleReset,
         discard: handleReset,
+        sourceGroupPositions,
       }),
-      [dirty, handleSave, handleReset],
+      [dirty, handleSave, handleReset, sourceGroupPositions],
     );
 
 

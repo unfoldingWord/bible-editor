@@ -14,9 +14,16 @@
 // English hover carries `positions`: the union positions of the hovered
 // word's group's source words, so the shared strip and the opposite panel can
 // light their counterparts without sharing group ids (ids are per-panel).
+// Hebrew hover carries OPTIONAL `positions`: the union positions of the hovered
+// token's group(s), seeded only by the side-by-side shared strip (which has no
+// grouping of its own and asks both panels — see SharedUhbStrip). It exists so
+// the shared strip can light a compound group's Hebrew siblings the way the
+// panels' own cards already do. Consumers that resolve the hovered position
+// against their own grouping (AlignmentPanel) ignore it; absent ⇒ hovered token
+// only, the prior behavior.
 export type HoverHighlight =
   | { kind: "english"; key: string; groupId: string | null; positions: number[] }
-  | { kind: "hebrew"; pos: number; groupId: string | null }
+  | { kind: "hebrew"; pos: number; groupId: string | null; positions?: number[] }
   | null;
 
 export type HighlightTone = "exact" | "linked" | null;
