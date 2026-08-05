@@ -39,6 +39,7 @@ import {
   stripCompoundOverlaps,
   mergeAdjacentSameSource,
   mergeSamePositionGroups,
+  buildPositionOwners,
   type AlignmentGroup,
   type AlignmentState,
   type SourceWord,
@@ -570,7 +571,7 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
     // from the stream's `alignedTo`: mergeAdjacentSameSource and
     // mergeSamePositionGroups fold several state groups into one card and keep
     // only the survivor's id, so a word whose `alignedTo` names an eaten group
-    // had a group id that appears nowhere in posToGroupId (which is
+    // had a group id that appears nowhere in posOwners (which is
     // display-derived) — hovering the Hebrew lit the card's chips but not that
     // word's chip in the top inventory strip. Large split/discontiguous UST
     // alignments are exactly the merged case, so the bigger the card the more
@@ -585,10 +586,10 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
     }, [displayGroups]);
 
     const posMaps = useMemo(() => {
-      const posToGroupId = new Map<number, string>();
       const sourcePosById = new Map<string, number>();
       const groupPositions = new Map<string, number[]>();
-      if (!state) return { posToGroupId, sourcePosById, groupPositions };
+      if (!state)
+        return { posOwners: new Map<number, Set<string>>(), sourcePosById, groupPositions };
       // sourcePosById + groupPositions cover EVERY state.groups source word so
       // any rendered token (and any word whose `alignedTo` points at a group
       // mergeAdjacentSameSource later folds away) still resolves its position.
@@ -602,7 +603,7 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
         }
         groupPositions.set(g.id, positions);
       }
-      // posToGroupId — position → which CARD owns it — must come from the
+      // posOwners — position → which CARD(s) own it — must come from the
       // groups the cards actually render (displayGroups), not state.groups:
       // stripCompoundOverlaps drops a compound's source word when a standalone
       // card already owns that content, so mapping off state.groups let the
@@ -617,15 +618,22 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
       // mergeAdjacentSameSource (identical sourceKey) and
       // mergeSamePositionGroups (identical resolved-position key) fuse only
       // groups whose positions already match the survivor's.
-      for (const g of displayGroups) {
-        for (const s of g.source) {
-          const pos = sourcePosById.get(s.id) ?? -1;
-          if (pos < 0) continue;
-          if (!posToGroupId.has(pos)) posToGroupId.set(pos, g.id);
-        }
-      }
-      return { posToGroupId, sourcePosById, groupPositions };
+      // A position can have MORE THAN ONE owner (see buildPositionOwners): a
+      // standalone card and a compound card that both name the same physical
+      // token. Keeping only the first left the other card unable to recognise
+      // its own token on hover.
+      const posOwners = buildPositionOwners(displayGroups, sourcePosById);
+      return { posOwners, sourcePosById, groupPositions };
     }, [state, displayGroups, sourceIndexMap]);
+
+    // "Is `groupId` one of the cards rendering the source token at `pos`?" —
+    // the membership test that replaced the old `posToGroupId.get(pos) === id`
+    // equality at every hover comparison site.
+    const posOwnedBy = useCallback(
+      (pos: number, groupId: string | null) =>
+        groupId !== null && (posMaps.posOwners.get(pos)?.has(groupId) ?? false),
+      [posMaps],
+    );
 
     // Highlight resolution. `hover` may name an English or Hebrew word; we
     // mark same-language matches as "exact" and aligned cross-language
@@ -661,7 +669,13 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
         setHover({
           kind: "hebrew",
           pos,
-          groupId: groupIdOverride ?? posMaps.posToGroupId.get(pos - posOffset) ?? null,
+          // hover.groupId is a single representative (it only has to name a
+          // group for the fallbacks below); the authoritative "who owns this
+          // position" question is answered by posOwners at each comparison.
+          groupId:
+            groupIdOverride ??
+            posMaps.posOwners.get(pos - posOffset)?.values().next().value ??
+            null,
         });
       },
       [hoverLink, posMaps, posOffset, setHover],
@@ -687,37 +701,49 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
           // groupId equality covers this panel's own card words whose source
           // pos failed to resolve (mirrors hebrewHighlight's fallback; group
           // ids are per-panel UUIDs, so no cross-panel false match).
-          if (posMaps.posToGroupId.get(hover.pos - posOffset) === myGroupId) return "linked";
+          if (posOwnedBy(hover.pos - posOffset, myGroupId)) return "linked";
           if (hover.groupId === myGroupId) return "linked";
           return null;
         }
         // English hovered (possibly in the other panel): its group's union
         // Hebrew positions resolve here to the group that shares the Hebrew.
-        return hover.positions.some((p) => posMaps.posToGroupId.get(p - posOffset) === myGroupId)
+        return hover.positions.some((p) => posOwnedBy(p - posOffset, myGroupId))
           ? "linked"
           : null;
       },
-      [hoverLink, hover, bibleVersion, targetIdToGroupId, posMaps, posOffset],
+      [hoverLink, hover, bibleVersion, targetIdToGroupId, posOwnedBy, posOffset],
     );
     const hebrewHighlight = useCallback(
       (pos: number, groupIdOverride?: string): "exact" | "linked" | null => {
         if (!hoverLink || !hover) return null;
         if (pos >= 0 && hover.kind === "hebrew" && hover.pos === pos) return "exact";
-        const myGroupId =
-          groupIdOverride ?? (pos >= 0 ? posMaps.posToGroupId.get(pos - posOffset) ?? null : null);
-        if (!myGroupId) return null;
+        // A card's own Hebrew names its card outright; a shared-strip token
+        // names EVERY card that renders it (a token can belong to a standalone
+        // card and a compound card at once), so the strip lights when any one
+        // of them is the hovered word's card. Consequence, and intended: two
+        // strip tokens that share ANY card light each other, so hovering strip
+        // `אֶל` also lights strip `עֲבָדָיו` when a compound card holds both —
+        // the same pair the compound card itself lights.
+        const myGroupIds = groupIdOverride
+          ? [groupIdOverride]
+          : pos >= 0
+            ? [...(posMaps.posOwners.get(pos - posOffset) ?? [])]
+            : [];
+        if (myGroupIds.length === 0) return null;
         if (hover.kind === "hebrew") {
           // Whole-group: the rest of the hovered word's group lights, resolved
           // to THIS panel's grouping — a compound card shows its siblings even
           // when the other side keeps them separate.
-          return posMaps.posToGroupId.get(hover.pos - posOffset) === myGroupId ? "linked" : null;
+          return myGroupIds.some((id) => posOwnedBy(hover.pos - posOffset, id)) ? "linked" : null;
         }
         // English hover: its group's union positions name the Hebrew directly
         // (works on the shared strip and across panels); the groupId equality
         // covers this panel's own card words that failed position resolution.
-        return hover.positions.includes(pos) || hover.groupId === myGroupId ? "linked" : null;
+        return hover.positions.includes(pos) || myGroupIds.some((id) => hover.groupId === id)
+          ? "linked"
+          : null;
       },
-      [hoverLink, hover, posMaps, posOffset],
+      [hoverLink, hover, posMaps, posOwnedBy, posOffset],
     );
 
     const hctx: HighlightCtx = useMemo(

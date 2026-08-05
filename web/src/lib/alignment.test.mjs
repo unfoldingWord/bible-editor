@@ -28,6 +28,7 @@ import {
   reformGluedMilestones,
   detectDoubledSourceMilestones,
   dropDuplicateSourceMilestones,
+  buildPositionOwners,
 } from "./alignment.ts";
 import { extractPlainText } from "./usfm.ts";
 import { findTargetHighlights, findSourceHighlights } from "./highlight.ts";
@@ -3455,6 +3456,82 @@ const srcWordContents = (st) => st.groups.flatMap((g) => g.source).map((s) => ({
     `${alone.occurrence}/${alone.occurrences}` === "1/1",
     `עַל is counted per exact surface, not per Strong (got ${alone.occurrence}/${alone.occurrences})`,
   );
+}
+
+// ─── AMO 3:7 — one source token owned by TWO display cards ────────────────────
+// Reproduced in the browser (UST AMO 3:7): three cards render as `אֶל`→"to",
+// `עֲבָדָיו`→"his servants", and a compound `אֶל + עֲבָדָיו`→"his". Their position
+// SEQUENCES differ ("10", "11", "10.11"), so mergeSamePositionGroups correctly
+// declines to fuse them — leaving two legitimate owners for each of positions 10
+// and 11. The panel's old first-wins `posToGroupId` handed each position to one
+// card only, so hovering the standalone `אֶל` lit the compound card's Hebrew
+// (a by-position comparison) while its English chip "his" stayed dark: one card
+// contradicting itself. buildPositionOwners keeps EVERY owner so the hover
+// comparisons can ask about membership.
+{
+  console.log("\n[Case] a source position owned by two display cards keeps both owners");
+  const sw = (id, pos) => ({ id, strong: "H0413", occurrence: "1", occurrences: "1", content: `w${pos}` });
+  const standaloneEl = { id: "g-el", source: [sw("s-el", 10)], targets: [{ id: "t1", text: "to", occurrence: "1", occurrences: "1" }] };
+  const compound = {
+    id: "g-both",
+    source: [sw("s-el2", 10), sw("s-serv2", 11)],
+    targets: [{ id: "t2", text: "his", occurrence: "2", occurrences: "2" }],
+  };
+  const standaloneServ = { id: "g-serv", source: [sw("s-serv", 11)], targets: [{ id: "t3", text: "servants", occurrence: "1", occurrences: "1" }] };
+  const sourcePosById = new Map([
+    ["s-el", 10], ["s-el2", 10], ["s-serv", 11], ["s-serv2", 11],
+  ]);
+  // Run the REAL display pipeline first, so this guards the case the panel can
+  // actually produce — not a hand-built shape the transforms would dissolve.
+  // Every milestone in the live verse carries occurrence 1/1, so the compound's
+  // words share a sourceWordKey with both standalones; stripCompoundOverlaps
+  // survives it only because stripping ALL of a group's source words is the
+  // no-op escape hatch (alignment.ts: `kept.length === 0` returns g untouched).
+  const positionKey = (g) => {
+    const ps = g.source.map((s) => sourcePosById.get(s.id) ?? -1);
+    return ps.length === 0 || ps.some((p) => p < 0) ? null : ps.join(".");
+  };
+  const displayGroups = mergeSamePositionGroups(
+    mergeAdjacentSameSource(stripCompoundOverlaps([standaloneEl, compound, standaloneServ])),
+    positionKey,
+  );
+  assert(
+    displayGroups.length === 3,
+    `all three cards survive the display pipeline (got ${displayGroups.length})`,
+  );
+  assert(
+    displayGroups.find((g) => g.id === "g-both").source.length === 2,
+    "the compound card keeps BOTH source words — stripCompoundOverlaps no-ops when it would strip them all",
+  );
+  const owners = buildPositionOwners(displayGroups, sourcePosById);
+  assert(owners.get(10).size === 2, `pos 10 has two owners (got ${owners.get(10).size})`);
+  assert(
+    owners.get(10).has("g-el") && owners.get(10).has("g-both"),
+    "pos 10 is owned by BOTH the standalone and the compound card",
+  );
+  assert(
+    owners.get(11).has("g-serv") && owners.get(11).has("g-both"),
+    "pos 11 is owned by BOTH the standalone and the compound card",
+  );
+  // The bug: first-wins gave pos 10 to the standalone only, so the compound
+  // card's chip failed the `owner === myGroupId` test and stayed dark.
+  assert(
+    [...owners.get(10)][0] === "g-el",
+    "insertion order still yields the old first-wins owner as the representative",
+  );
+  // The comparison the panel makes at each hover site: "does THIS card own the
+  // hovered position?" Hovering the standalone `אֶל` (pos 10) must light the
+  // compound card's English — the equality test it replaced returned false.
+  const ownedBy = (pos, gid) => owners.get(pos)?.has(gid) ?? false;
+  assert(ownedBy(10, "g-both"), "hovering pos 10 links the compound card (the reported bug)");
+  assert(ownedBy(10, "g-el"), "hovering pos 10 still links the standalone card");
+  assert(!ownedBy(10, "g-serv"), "a card that does NOT render pos 10 stays dark");
+  // Unresolved positions (-1) are never owned by anyone.
+  const unresolved = buildPositionOwners(
+    [{ id: "g-x", source: [sw("s-x", 99)], targets: [] }],
+    new Map([["s-x", -1]]),
+  );
+  assert(unresolved.size === 0, "unresolved source positions produce no owners");
 }
 
 if (failed > 0) {
