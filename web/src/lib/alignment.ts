@@ -526,6 +526,64 @@ export function mergeSamePositionGroups(
   return out;
 }
 
+// Source position → EVERY display card that renders a source word at that
+// position. A position can legitimately have more than one owner: a standalone
+// card and a compound card can both name the same physical source token when
+// mergeSamePositionGroups declines to fuse them, which it does whenever their
+// position SEQUENCES differ (AMO 3:7 UST: `אֶל` alone, `עֲבָדָיו` alone, and a
+// compound `אֶל + עֲבָדָיו` — keys "10", "11" and "10.11"). A first-wins
+// position→id map made the non-owning card a stranger to its own token:
+// hovering the standalone `אֶל` lit the compound card's Hebrew (that comparison
+// goes by position) while leaving its English chip dark, so one card
+// contradicted itself. Callers ask "does THIS card own the hovered position?"
+// by set membership; insertion order is display order, so the first entry of a
+// set is still the old first-wins owner where a single representative is needed.
+export function buildPositionOwners(
+  displayGroups: AlignmentGroup[],
+  sourcePosById: Map<string, number>,
+): Map<number, Set<string>> {
+  const owners = new Map<number, Set<string>>();
+  for (const g of displayGroups) {
+    for (const s of g.source) {
+      const pos = sourcePosById.get(s.id) ?? -1;
+      if (pos < 0) continue;
+      let set = owners.get(pos);
+      if (!set) owners.set(pos, (set = new Set<string>()));
+      set.add(g.id);
+    }
+  }
+  return owners;
+}
+
+// The two hover rules the panel resolves highlighting with, kept here as pure
+// functions so the suite tests the real thing rather than a copy of it.
+
+// "Does this card render the source token at `pos`?" — the membership test that
+// replaced a first-wins `owners.get(pos) === groupId` equality.
+export function positionOwnedBy(
+  owners: Map<number, Set<string>>,
+  pos: number,
+  groupId: string | null,
+): boolean {
+  return groupId !== null && (owners.get(pos)?.has(groupId) ?? false);
+}
+
+// "Do these two source positions sit on a card together?" — used for the shared
+// Hebrew strip, whose tokens name no card of their own. With one owner apiece
+// this is the old first-wins comparison; with two it is what makes a token
+// owned by both a standalone and a compound card light for either.
+export function positionsShareOwner(
+  owners: Map<number, Set<string>>,
+  a: number,
+  b: number,
+): boolean {
+  const ownersA = owners.get(a);
+  const ownersB = owners.get(b);
+  if (!ownersA || !ownersB) return false;
+  for (const id of ownersA) if (ownersB.has(id)) return true;
+  return false;
+}
+
 export function parseAlignment(
   verseObjects: unknown[],
   sourceVerseObjects?: unknown[] | null,
