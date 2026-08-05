@@ -14,11 +14,11 @@
 //     "Occurrence column cannot be blank." (no severity kwarg => error).
 //   tn  JER 37:5 `bfyt` — quote "the Chaldeans, the ones laying siege" with a
 //     NULL occurrence. Gateway-Language, so the old hasOrigLang-only rule never
-//     fired and origLangOccurrence passed the null straight through to a blank
+//     fired and the render passed the null straight through to a blank
 //     cell. validate_tn_files.py allows a blank Occurrence only when Quote is
 //     ALSO blank, so this was an error too.
 
-import { requiredOccurrence, origLangOccurrence, hasOrigLang } from "./occurrenceRule.ts";
+import { requiredOccurrence, renderOccurrence, hasOrigLang } from "./occurrenceRule.ts";
 
 let failed = 0;
 function assert(cond, msg) {
@@ -146,18 +146,34 @@ const GL = "the Chaldeans, the ones laying siege";
   eq(requiredOccurrence("tn", "some quote", Infinity), 1, "Infinity -> 1");
 }
 
-// ─── origLangOccurrence: the render-time net stays deliberately narrow ───
-// It must NOT become a second copy of requiredOccurrence: hardRejectGuard.ts
-// relies on a genuinely invalid row still rendering invalid so it can HOLD.
+// ─── renderOccurrence: the render heals every hard-reject case ───────────
+// Occurrence is not editable in the UI, so an invalid cell is pre-existing
+// damage from master that no translator can fix. The render therefore applies
+// the same per-kind rule as the save path rather than letting the export HOLD.
+// What it must NOT do is fill a blank that is already legal (quote-less tn) —
+// that would churn the nightly diff for thousands of rows.
 {
-  console.log("\n[origLangOccurrence] render-time coercion is narrower on purpose");
-  eq(origLangOccurrence(HEB, null), 1, "OL quote + null renders as 1");
-  eq(origLangOccurrence(HEB, 0), 1, "OL quote + 0 renders as 1");
-  eq(origLangOccurrence(GL, null), null,
-     "GL quote + null still renders BLANK — hardRejectGuard must be able to see it");
-  eq(origLangOccurrence("", null), null, "blank quote + null renders blank (legal for tn)");
-  eq(origLangOccurrence(null, null), null, "null quote + null renders blank");
-  eq(origLangOccurrence(HEB, 2), 2, "existing target passes through");
+  console.log("\n[renderOccurrence] render-time coercion heals what the guard would reject");
+  eq(renderOccurrence("tn", HEB, null), 1, "OL quote + null renders as 1");
+  eq(renderOccurrence("tn", HEB, 0), 1, "OL quote + 0 renders as 1");
+  eq(renderOccurrence("tn", GL, null), 1,
+     "GL quote + null now renders 1 (prod JER 37:5 bfyt — used to HOLD all of JER TN)");
+  eq(renderOccurrence("tn", "", null), null,
+     "quote-less tn renders blank — legal, and filling it would churn the diff");
+  eq(renderOccurrence("tn", null, null), null, "null quote + null renders blank");
+  eq(renderOccurrence("tn", HEB, 2), 2, "existing target passes through");
+  eq(renderOccurrence("tn", "some quote", -5), 1, "tn occurrence below -1 heals to 1");
+  eq(renderOccurrence("tn", "some quote", -1), -1, "tn -1 ('all occurrences') passes through");
+
+  // twl demands a positive integer whatever OrigWords holds — so blank and 0
+  // both heal to 1, never 0. This is prod twl DAN 3:5 xf8f.
+  eq(renderOccurrence("twl", "", null), 1,
+     "blank OrigWords + blank occurrence renders 1 (DAN 3:5 xf8f — used to HOLD all of DAN TWL)");
+  eq(renderOccurrence("twl", GL, 0), 1, "twl 0 heals to 1 (0 is never legal for twl)");
+  eq(renderOccurrence("twl", HEB, 3), 3, "existing twl target passes through");
+
+  // tq's validator allows a blank unconditionally, so nothing to force there.
+  eq(renderOccurrence("tq", GL, null), null, "tq GL quote + blank stays blank (always legal)");
 }
 
 // ─── The end-to-end claim: a fresh row from either create path renders OK ─
@@ -171,7 +187,7 @@ const GL = "the Chaldeans, the ones laying siege";
   function createThenRender(kind, quote, occurrence) {
     const seeded = requiredOccurrence(kind, quote, occurrence);
     const stored = seeded != null ? seeded : (typeof occurrence === "number" ? occurrence : null);
-    const rendered = origLangOccurrence(typeof quote === "string" ? quote : null, stored);
+    const rendered = renderOccurrence(kind, typeof quote === "string" ? quote : null, stored);
     return rendered == null ? "" : String(rendered);
   }
 

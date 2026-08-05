@@ -109,16 +109,31 @@ export function requiredOccurrence(
   return null;
 }
 
-// RENDER path (export.ts). Last-resort coercion at TSV-render time for rows
-// stored before the save-path rule above existed. Deliberately narrower than
-// `requiredOccurrence`: it only fills in an OL quote's missing occurrence and
-// otherwise passes the stored value through untouched, so the render stays a
-// faithful picture of D1 and `hardRejectGuard.ts` can still see — and HOLD on —
-// a row that is genuinely invalid.
-export function origLangOccurrence(
+// RENDER path (export.ts). Coercion at TSV-render time for rows stored before
+// the save-path rule above existed — and, more to the point, for rows that were
+// never saved through this app at all. Occurrence is not editable in the Bible
+// Editor UI, so a blank/invalid Occurrence is almost always pre-existing damage
+// that arrived from master on Door43; a translator has no way to fix it and the
+// export HOLD leaves every other edit in that book+resource stranded.
+//
+// This used to be `origLangOccurrence`, deliberately narrower than the save-path
+// rule (OL quotes only) so `hardRejectGuard.ts` could still see and HOLD an
+// invalid row. That trade is no longer worth it: holding an entire book to
+// surface a defect nobody can act on costs more than rendering the one legal
+// value the validators demand. The render now applies the SAME per-kind rule as
+// the save path, so a hard-reject-worthy cell cannot reach the TSV. The guard
+// stays in place as a backstop and should now find nothing.
+//
+// Note what this does NOT change: a tn row with a blank Quote AND a blank
+// Occurrence is already legal (validate_tn_files.py's
+// `occurrence_is_allowed_blank`), so it still renders blank rather than 0 — the
+// vast majority of general tn notes are that shape, and filling them would churn
+// the nightly DCS diff for no validator gain. Every case the guard actually
+// rejects heals to 1.
+export function renderOccurrence(
+  kind: OccurrenceKind,
   quote: string | null,
   occurrence: number | null,
 ): number | null {
-  if (quote && hasOrigLang(quote) && (occurrence == null || occurrence === 0)) return 1;
-  return occurrence;
+  return requiredOccurrence(kind, quote, occurrence) ?? occurrence;
 }

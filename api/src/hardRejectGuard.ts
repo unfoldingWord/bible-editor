@@ -28,13 +28,20 @@
 //        deliberately absent below.
 //
 // This operates on the RENDERED TSV, not on the D1 rows, and that is load-bearing.
-// `origLangOccurrence` (occurrenceRule.ts, called by export.ts) coerces a null/0
-// Occurrence to 1 whenever the
-// Quote actually contains Hebrew/Greek, so ~10.7k tn rows that look offending in
-// D1 render perfectly valid Occurrence values. Judging the rows instead of the
-// bytes we are about to commit would hold nearly every tn book for nothing —
-// exactly the over-broad-gate mistake this module exists to correct. Judge the
-// bytes.
+// `renderOccurrence` (occurrenceRule.ts, called by export.ts) heals an invalid
+// Occurrence at render time, so rows that look offending in D1 render perfectly
+// valid Occurrence values. (The old text here claimed "~10.7k tn rows"; that
+// number described the narrower OL-only coercion and was never re-measured for
+// the wider rule, so it is not repeated.) Judging the rows
+// instead of the bytes we are about to commit would hold nearly every tn book
+// for nothing — exactly the over-broad-gate mistake this module exists to
+// correct. Judge the bytes.
+//
+// Since renderOccurrence applies the same per-kind rule this guard tests,
+// it should now find NOTHING: Occurrence is not editable in the UI, so holding a
+// book for a defect no translator can fix was never actionable. The guard stays
+// as a backstop — a hit here means the render and this module have drifted apart,
+// which is worth a HOLD.
 //
 // Pure and import-free so it is directly testable by the --experimental-strip-types
 // runner, same shape as shrinkGuard.ts / reimportSyncGate.ts.
