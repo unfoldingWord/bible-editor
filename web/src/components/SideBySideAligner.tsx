@@ -402,19 +402,27 @@ function SharedUhbStrip({
   //      hover. The panel lights the rest of the hovered token's group
   //      (posToGroupId.get(hover.pos) === myGroupId → "linked"); here only the
   //      hovered token itself lights. Sibling Hebrew in a compound group stays
-  //      dark. Fixing that needs POSITIONS, not a group id — e.g. having
-  //      onHebrewEnter carry the hovered group's union positions the way the
-  //      English hover already does. It is a real design option, deliberately
-  //      not taken here; each panel still lights its own cards. Observable on
-  //      ISA 7:8: hovering strip שִׁשִּׁים (pos 8) lights its card sibling
-  //      וְחָמֵשׁ in both panels, but strip pos 9 stays dark.
+  //      dark. Fixing that needs POSITIONS, not a group id — but it is NOT a
+  //      one-line mirror of the English path: this component has no alignment
+  //      state (no groupPositions), and HoverHighlight's `hebrew` variant has no
+  //      `positions` field at all. It would take lifting the grouping to the
+  //      parent (or resolving the hovered strip pos per panel) plus a hover-type
+  //      change. A real design option, deliberately not taken here; each panel
+  //      still lights its own cards. Observed in the running app on ISA 7:8:
+  //      hovering strip שִׁשִּׁים (pos 8) lights its card sibling וְחָמֵשׁ in
+  //      both panels (both group the pair onto "65"), but strip pos 9 stays dark.
+  //      Confirm the grouping before reusing this as a repro — a version that
+  //      split the pair would light neither.
   //   2. A group whose positions don't resolve stays dark here, and it is not
   //      provable that no token OUGHT to light — only that none is
   //      IDENTIFIABLE. Each panel resolves against its own slice's source
   //      (single-verse for a ULT row) while this strip renders the union span,
-  //      so a group referencing Hebrew outside its own slice yields pos = -1
-  //      even though the strip does render that token. The fix belongs upstream
-  //      in position resolution / the source span passed in, not in this map.
+  //      so a group referencing Hebrew outside its own slice can yield pos = -1
+  //      even though the strip does render that token. Worse, -1 is not the only
+  //      outcome: resolveSourcePos's fallback chain can MIS-resolve such a word
+  //      onto a same-content/same-Strong token that is inside the slice, lighting
+  //      the wrong token rather than none. Either way the fix belongs upstream in
+  //      position resolution / the source span passed in, not in this map.
   // On (2): buildAlignerSlice (Shell.tsx) expands a target row to its full UHB
   // range only when the row DECLARES the bridge via verse_end — that is what
   // makes a UST bridge referencing the next verse's Hebrew resolve. A
