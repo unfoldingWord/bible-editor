@@ -616,8 +616,24 @@ export function positionsShareOwner(
 // does not have (JER 36:30 UST aligns מֻשְׁלֶכֶת occurrences 2 and 3 of a token
 // the UHB contains once) would otherwise drop out, collapsing two distinct
 // chains to the same sequence and silencing the marker on a verse api-side lint
-// still flags. With this key space the two detectors agree on every verse
-// measured across seven books.
+// still flags.
+//
+// The two detectors do NOT fully agree, and the disagreement is one-directional:
+// this one can flag a verse api-side lint stays silent on, never the reverse.
+// Measured over the five sample ULT/UST books (1877 verses) against their UHB:
+// {both: 0, lintOnly: 0, uiOnly: 1} — ZEC 2:8, where אָמַר is written
+// occurrence 1/2 inside one chain and 2 standalone while the UHB contains it
+// once. This detector runs AFTER parseAlignment has reformed occurrences against
+// the real source, so both chains key to p16 and it flags; lint has no source
+// rows (by design) and keys raw x-occurrence, so "1" and "2" stay distinct and
+// it reports nothing. Two other mechanisms push the same direction: lint treats
+// an outermost `\zaln-s` plus everything nested in it as ONE chain while
+// parseAlignment makes a group per word-bearing chain (so a merged shared prefix
+// hides reuse from lint), and lint drops a milestone with no x-occurrence where
+// parseAlignment defaults it to 1. Closing any of these needs the source verse
+// on the api side — a bigger change than this key space. Until then: a red
+// marker with no lint entry is expected and the marker is the more reliable of
+// the two; do not "fix" the marker to match the feed.
 //
 // Sequence order is DOCUMENT order, matching the api-side join — sorting would
 // exempt the reversed-nesting defect ([A,B] plus [B,A] over the same tokens,
