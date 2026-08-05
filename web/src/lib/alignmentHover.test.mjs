@@ -256,6 +256,59 @@ function ctxFor(st, { bibleVersion = "ult", posOffset = 0, hoverLink = true } = 
   );
 }
 
+// ─── 5. AMO 3:7 — a source token owned by TWO cards, through the resolvers ──
+// The #413 fix, asserted at the level the panel actually calls. alignment.test.mjs
+// covers buildPositionOwners / positionOwnedBy in isolation; this pins that the
+// RESOLVERS honour multi-ownership, which is the part the #414 extraction could
+// have silently reverted. Shape: `אֶל` alone, `יְהוָה` alone, and a compound over
+// both — position sequences "1", "2", "1.2", so mergeSamePositionGroups declines
+// to fuse, and stripCompoundOverlaps no-ops on the compound because stripping ALL
+// of a group's source words is its escape hatch.
+{
+  const standaloneA = group("g-a", [src("sa", 1)], [tgt("t-a", "to")]);
+  const compound = group("g-both", [src("sc1", 1), src("sc2", 2)], [tgt("t-both", "his")]);
+  const standaloneB = group("g-b", [src("sb", 2)], [tgt("t-b", "Yahweh")]);
+  const st = state([standaloneA, compound, standaloneB]);
+  const { displayGroups, ctx } = ctxFor(st);
+  assert(displayGroups.length === 3, `all three cards survive the display pipeline (got ${displayGroups.length})`);
+  assert(
+    ctx.posMaps.posOwners.get(1)?.size === 2,
+    `position 1 keeps BOTH owners (got ${ctx.posMaps.posOwners.get(1)?.size})`,
+  );
+  // Hovering the STANDALONE's Hebrew must light the compound card's English too.
+  // With first-wins ownership the compound failed the equality and stayed dark
+  // while its Hebrew lit — one card contradicting itself.
+  const hover = makeHebrewHover(ctx, 1, "g-a");
+  assert(
+    resolveEnglishHighlight(ctx, hover, "t-both", "his", "1") === "linked",
+    "hovering the standalone's Hebrew links the compound card's English (the #413 bug)",
+  );
+  assert(
+    resolveEnglishHighlight(ctx, hover, "t-a", "to", "1") === "linked",
+    "...and still links the standalone's own English",
+  );
+  assert(
+    resolveEnglishHighlight(ctx, hover, "t-b", "Yahweh", "1") === null,
+    "a card that does not render position 1 stays dark",
+  );
+  // Card-side Hebrew: the compound card's own token answers to the hover.
+  assert(
+    resolveHebrewHighlight(ctx, hover, 2, "g-both") === "linked",
+    "the compound card's other Hebrew token lights as a group sibling",
+  );
+  assert(
+    resolveHebrewHighlight(ctx, hover, 2, "g-b") === null,
+    "the unrelated standalone card's Hebrew stays dark",
+  );
+  // Strip-side Hebrew (no groupIdOverride): two positions sharing any card light
+  // each other — the intended widening documented in resolveHebrewHighlight.
+  const stripHover = makeHebrewHover(ctx, 1);
+  assert(
+    resolveHebrewHighlight(ctx, stripHover, 2) === "linked",
+    "on the strip, a token sharing the compound card with the hovered one lights",
+  );
+}
+
 // ─── posOffset: hover positions travel union-relative ──────────────────────
 {
   const st = state([group("g-a", [src("sa", 1)], [tgt("t1", "to")])]);

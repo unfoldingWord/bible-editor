@@ -312,8 +312,18 @@ function hasReusedSourceToken(nodes: unknown[]): boolean {
   const chains = findTopLevelZalns(nodes).map(collectZalnChainKeys);
   const chainKeysByToken = new Map<string, Set<string>>();
   for (const keys of chains) {
-    const chainKey = keys.join(",");
-    for (const key of new Set(keys)) {
+    // De-duplicate WITHIN the chain before taking its identity, exactly as
+    // findReusedSourceWordIds does per group (`!tokens.includes(k)`). Without
+    // this, a chain that wraps one token twice (the JER 31:33 shape) keyed as
+    // "A,A" while a standalone claiming that token keyed as "A" — two distinct
+    // sequences, so lint flagged a verse the aligner marks nothing on, because
+    // the aligner's group had already collapsed to the single key "A". A
+    // translator would click through from the lint feed to a clean-looking
+    // verse. The within-chain doubling is real but belongs to
+    // detectDoubledSourceMilestones (see the scope note above), not here.
+    const uniqueKeys = [...new Set(keys)];
+    const chainKey = uniqueKeys.join(",");
+    for (const key of uniqueKeys) {
       const set = chainKeysByToken.get(key) ?? new Set<string>();
       set.add(chainKey);
       chainKeysByToken.set(key, set);
