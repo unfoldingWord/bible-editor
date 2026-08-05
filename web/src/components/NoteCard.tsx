@@ -796,15 +796,19 @@ function NoteCardInner({
   //    including the per-verse-mode unmount, but blind to a book change —
   //    App renders `<Shell key={loc.book}>`, so a book change destroys this
   //    whole subtree and the dying instance's ref still holds the OLD book.
-  //  - the URL hash: lives outside React and is already the new route by the
-  //    time teardown runs, so it is what catches the book change. Returns null
-  //    (no opinion) for a hash that isn't a full book/chapter/verse route.
+  //  - the URL hash, consulted for the BOOK ONLY: it lives outside React and
+  //    is already the new route by the time teardown runs, so it is what
+  //    catches the book change. Its verse must NOT be trusted — activeVerse is
+  //    Shell-local state (`useState(initialVerse)`), so clicking a verse does
+  //    not necessarily rewrite the hash, and reading a lagging hash verse here
+  //    would trash a stub on the very same-verse click this fix is about.
+  //    The book is safe because loc.book only ever changes via the hash.
   // Both must say "still here" to skip the discard, so a remount that moves
   // nothing — toggling the pin layout — still leaves the stub alone.
   const hasLeftNoteTarget = (row_: TnRow, loc: ActiveLocation) => {
     if (hasLeftNoteVerse(row_, loc)) return true;
     const fromHash = locationFromHash(window.location.hash);
-    return fromHash !== null && hasLeftNoteVerse(row_, fromHash);
+    return fromHash !== null && fromHash.book !== row_.book;
   };
 
   // MOUNTED path: book mode keeps every chapter note mounted regardless of
@@ -1880,6 +1884,12 @@ function areNotePropsEqual(a: Props, b: Props): boolean {
   return (
     a.row === b.row &&
     a.active === b.active &&
+    // Load-bearing: the abandoned-blank-stub discard runs from an effect keyed
+    // on verseActive. In pinned/book mode the card stays mounted across a verse
+    // change and `active` is already false, so omitting this comparison would
+    // suppress the only render that can fire that effect — and the stub would
+    // survive.
+    a.verseActive === b.verseActive &&
     sameQuery &&
     (a.activeMatchOccurrence ?? null) === (b.activeMatchOccurrence ?? null) &&
     a.dragging === b.dragging &&

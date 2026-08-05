@@ -216,7 +216,12 @@ assert(
     JSON.stringify({ book: "ZEC", chapter: 3, verse: 4 }),
   "a comment deep-link suffix does not disturb the location",
 );
-assert(locationFromHash("#/ZEC/3") === null, "a partial hash yields no opinion (null)");
+assert(
+  JSON.stringify(locationFromHash("#/ZEC/3")) ===
+    JSON.stringify({ book: "ZEC", chapter: 3, verse: 1 }),
+  "a verse-less route (App.navigate omits verse 1) still yields a location",
+);
+assert(locationFromHash("#/") === null, "a bare hash yields no opinion (null)");
 assert(locationFromHash("") === null, "an empty hash yields no opinion (null)");
 
 if (failed) {

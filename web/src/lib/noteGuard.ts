@@ -146,9 +146,14 @@ export function hasLeftNoteVerse(
   return !noteCoveredVerses(row).includes(loc.verse);
 }
 
-// The location the URL hash currently points at, or null when the hash is not
-// a complete book/chapter/verse route (nothing can be concluded from a partial
-// hash, and guessing would risk a discard the user never asked for).
+// The location the URL hash currently points at, or null when the hash does
+// not carry at least a book and a chapter (nothing can be concluded from a
+// bare `#/` and guessing would risk a discard the user never asked for).
+//
+// The verse segment is optional on purpose: App.navigate writes `#/BOOK/CH`
+// with no verse for verse 1, so requiring three segments would return "no
+// opinion" for every verse-1 route — which is exactly where a book change
+// commonly lands.
 //
 // This exists because a ref inside the component tree cannot see a book
 // change: `<Shell key={loc.book}>` means the dying instance's ref still holds
@@ -157,7 +162,7 @@ export function hasLeftNoteVerse(
 // signal that survives the remount. Used ALONGSIDE the in-tree ref, never
 // instead of it — see NoteCard's unmount cleanup.
 export function locationFromHash(hash: string): ActiveLocation | null {
-  if (!/^#\/?[A-Za-z0-9]+\/\d+\/\d+/.test(hash)) return null;
+  if (!/^#\/?[A-Za-z0-9]+\/\d+/.test(hash)) return null;
   const { book, chapter, verse } = parseHashString(hash, "");
   return { book, chapter, verse };
 }
