@@ -239,6 +239,92 @@ function hasGluedMilestone(nodes: unknown[]): boolean {
   return walk(nodes);
 }
 
+// True when the verse's alignment data has one physical source token claimed by
+// two or more DISTINCT top-level chains — a data defect that renders as
+// "doubled" Hebrew in the aligner (see web/src/lib/alignment.ts
+// findReusedSourcePositions and the ZEC 14:8 UST case it documents: a compound
+// milestone chain wraps בַּקַּיִץ+וּבָחֹרֶף as "throughout the whole year" AND two
+// separate single-word chains wrap the same two tokens again as "in the hot
+// season" / "and in the cold season"). Lint has no UHB/UGNT rows, so identity is
+// keyed on `nfc(x-content)|x-occurrence` rather than resolved source position —
+// each TOP-LEVEL `\zaln-s` is a "chain": itself plus every zaln nested inside it,
+// in document order (mirrors how hasGluedMilestone/dropDuplicateSourceMilestones
+// treat nested zalns as belonging to their outer chain). A key that appears in
+// two chains sharing the SAME full chain key (the joined key sequence) is the
+// legitimate one-token-to-N-target-runs split (JER 28:1) — not flagged, since
+// that is exactly what the aligner panel's mergeSamePositionGroups fuses into
+// one card. Only a key shared across chains with DIFFERING full chain keys is a
+// real defect. Scope: this is the ACROSS-chain defect only. A single chain that
+// wraps the same token twice (the JER 31:33 shape) dedupes to one key here and
+// is not reported — detectDoubledSourceMilestones in web/src/lib/alignment.ts
+// owns that one.
+function zalnLintKey(node: Record<string, unknown>): string | null {
+  const content = node["content"];
+  if (typeof content !== "string" || content === "") return null;
+  // A MISSING occurrence is unknown, not 1. Defaulting it would key two
+  // genuinely distinct occurrences of a repeated word identically and flag a
+  // correctly aligned verse. Unkeyable milestones are simply not evidence.
+  const occurrence = node["occurrence"];
+  if (occurrence === undefined || occurrence === null || occurrence === "") return null;
+  return `${content.normalize("NFC")}|${String(occurrence)}`;
+}
+function isZalnMilestone(n: unknown): n is Record<string, unknown> {
+  return !!n && typeof n === "object" && (n as Record<string, unknown>)["type"] === "milestone" &&
+    (n as Record<string, unknown>)["tag"] === "zaln";
+}
+// Depth-first keys of every zaln in this chain (the node itself, then nested
+// zalns reached through it or through non-zaln wrapper children).
+function collectZalnChainKeys(node: Record<string, unknown>): string[] {
+  const out: string[] = [];
+  const key = zalnLintKey(node);
+  if (key !== null) out.push(key);
+  const children = node["children"];
+  if (Array.isArray(children)) out.push(...collectZalnChainKeysFromList(children));
+  return out;
+}
+function collectZalnChainKeysFromList(nodes: unknown[]): string[] {
+  const out: string[] = [];
+  for (const n of nodes) {
+    if (isZalnMilestone(n)) {
+      out.push(...collectZalnChainKeys(n));
+      continue;
+    }
+    const children = (n as Record<string, unknown> | null)?.["children"];
+    if (Array.isArray(children)) out.push(...collectZalnChainKeysFromList(children));
+  }
+  return out;
+}
+// Top-level zaln nodes: the first zaln found on any path is a chain root — its
+// own nested zalns are NOT separately collected here (they belong to its chain).
+function findTopLevelZalns(nodes: unknown[]): Record<string, unknown>[] {
+  const out: Record<string, unknown>[] = [];
+  for (const n of nodes) {
+    if (isZalnMilestone(n)) {
+      out.push(n);
+      continue;
+    }
+    const children = (n as Record<string, unknown> | null)?.["children"];
+    if (Array.isArray(children)) out.push(...findTopLevelZalns(children));
+  }
+  return out;
+}
+function hasReusedSourceToken(nodes: unknown[]): boolean {
+  const chains = findTopLevelZalns(nodes).map(collectZalnChainKeys);
+  const chainKeysByToken = new Map<string, Set<string>>();
+  for (const keys of chains) {
+    const chainKey = keys.join(",");
+    for (const key of new Set(keys)) {
+      const set = chainKeysByToken.get(key) ?? new Set<string>();
+      set.add(chainKey);
+      chainKeysByToken.set(key, set);
+    }
+  }
+  for (const set of chainKeysByToken.values()) {
+    if (set.size >= 2) return true;
+  }
+  return false;
+}
+
 // Paragraph / poetry tags that legitimately open a chapter. Mirror of
 // PARAGRAPH_TAGS in web/src/lib/usfm.ts — keep in sync.
 //
@@ -405,6 +491,14 @@ export function lintUsfmVerses(verses: VerseRow[]): LintIssue[] {
         bucket: "escalate",
         ref,
         message: "alignment milestone x-content spans a maqqef/minus (two source words glued into one).",
+      });
+    }
+    if (hasReusedSourceToken(vos)) {
+      issues.push({
+        check: "Reused source token",
+        bucket: "flag",
+        ref,
+        message: "the same source word is aligned in more than one group (renders as doubled Hebrew); re-align the verse.",
       });
     }
   }

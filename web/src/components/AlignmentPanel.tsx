@@ -42,6 +42,7 @@ import {
   buildPositionOwners,
   positionOwnedBy,
   positionsShareOwner,
+  findReusedSourceWordIds,
   type AlignmentGroup,
   type AlignmentState,
   type SourceWord,
@@ -595,7 +596,12 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
       const sourcePosById = new Map<string, number>();
       const groupPositions = new Map<string, number[]>();
       if (!state)
-        return { posOwners: new Map<number, Set<string>>(), sourcePosById, groupPositions };
+        return {
+          posOwners: new Map<number, Set<string>>(),
+          sourcePosById,
+          groupPositions,
+          reusedSourceIds: new Set<string>(),
+        };
       // sourcePosById + groupPositions cover EVERY state.groups source word so
       // any rendered token (and any word whose `alignedTo` points at a group
       // mergeAdjacentSameSource later folds away) still resolves its position.
@@ -629,7 +635,19 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
       // token. Keeping only the first left the other card unable to recognise
       // its own token on hover.
       const posOwners = buildPositionOwners(displayGroups, sourcePosById);
-      return { posOwners, sourcePosById, groupPositions };
+      // A source token claimed by 2+ DISTINCT groups is a data defect (one
+      // physical Hebrew word can't belong to several alignment groups) — see
+      // findReusedSourceWordIds. Two deliberate choices there: computed from
+      // state.groups, NOT displayGroups (stripCompoundOverlaps would already
+      // have erased the overlap on a compound of 3+, silencing the marker on a
+      // verse api-side lint still flags), and keyed via reusedTokenKey rather
+      // than resolveSourcePos — that function's strong|1 fallback collapses
+      // distinct same-Strong tokens onto one position and invents reuse on
+      // clean verses. Display only; nothing is fixed.
+      const reusedSourceIds = findReusedSourceWordIds(state.groups, (s) =>
+        reusedTokenKey(s, sourceIndexMap),
+      );
+      return { posOwners, sourcePosById, groupPositions, reusedSourceIds };
     }, [state, displayGroups, sourceIndexMap]);
 
     // Bind the two pure hover rules (tested in alignment.test.mjs) to this
@@ -921,15 +939,25 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
     }, [state, verse, onSave, onConfirmUnalign, book, chapter, verseNum, bibleVersion]);
 
     // Same two maps hebrewHighlight/onEnglishHover use, in the same roles:
-    // posToGroupId (display-derived) says which CARD owns the position, and
-    // groupPositions (state-derived) gives that group's full union — including a
-    // source word stripCompoundOverlaps removed from the rendered chain, which
-    // must still bridge on hover. Positions travel union-relative.
+    // posOwners (display-derived) says which CARD(s) own the position, and
+    // groupPositions (state-derived) gives each of those groups' full union —
+    // including a source word stripCompoundOverlaps removed from the rendered
+    // chain, which must still bridge on hover. Positions travel union-relative.
+    //
+    // EVERY owner contributes, not just the first: a reused source token sits on
+    // a standalone card AND a compound card at once (see buildPositionOwners /
+    // AMO 3:7), and answering with only the first owner's union would reproduce
+    // on the shared strip exactly the first-wins blindness the cards no longer
+    // have — the strip would light one card's siblings and not the other's.
     const sourceGroupPositions = useCallback(
       (unionPos: number): number[] => {
-        const gid = posMaps.posToGroupId.get(unionPos - posOffset);
-        if (!gid) return [];
-        return (posMaps.groupPositions.get(gid) ?? []).map((p) => p + posOffset);
+        const gids = posMaps.posOwners.get(unionPos - posOffset);
+        if (!gids || gids.size === 0) return [];
+        const out = new Set<number>();
+        for (const gid of gids) {
+          for (const p of posMaps.groupPositions.get(gid) ?? []) out.add(p + posOffset);
+        }
+        return [...out];
       },
       [posMaps, posOffset],
     );
@@ -1033,6 +1061,7 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
                 hctx={hctx}
                 sourcePos={posMaps.sourcePosById}
                 posOffset={posOffset}
+                reusedSourceIds={posMaps.reusedSourceIds}
               />
             </Box>
             <ActionBar
@@ -1553,6 +1582,7 @@ function AlignmentCards({
   hctx,
   sourcePos,
   posOffset,
+  reusedSourceIds,
 }: {
   groups: AlignmentGroup[];
   ghostByGroup: Map<string, Ghost>;
@@ -1574,6 +1604,10 @@ function AlignmentCards({
   // union offset — for card keys and the position-keyed hover identity.
   sourcePos: Map<string, number>;
   posOffset: number;
+  // Ids of source words claimed by 2+ distinct groups — a data defect (see
+  // findReusedSourceWordIds in ../lib/alignment). Keyed by id, not position,
+  // because chips resolve their own `pos` through the fallback chain.
+  reusedSourceIds: Set<string>;
 }) {
   // Precompute the per-verse TWL hint lookup once (see buildTwHintMap) so each
   // hover re-render isn't O(sourceWords × twlRows) of re-split + re-nfc work.
@@ -1638,6 +1672,7 @@ function AlignmentCards({
                   canExtract={g.source.length > 1}
                   onExtract={() => onExtractSource(s.id)}
                   hctx={hctx}
+                  reused={reusedSourceIds.has(s.id)}
                 />
               );
             })}
@@ -1844,6 +1879,9 @@ function DropTargetCard({
 }
 
 // ─── Hebrew source word as typography (no inverted block) ──────────────
+const REUSED_SOURCE_TOOLTIP =
+  "This Hebrew word is aligned in more than one group — that is a data defect. A human must re-align this verse.";
+
 function SourceWordTypography({
   source,
   pos,
@@ -1853,6 +1891,7 @@ function SourceWordTypography({
   canExtract,
   onExtract,
   hctx,
+  reused,
 }: {
   source: SourceWord;
   // Union-relative source position (-1 when unresolved — hover identity then
@@ -1864,6 +1903,10 @@ function SourceWordTypography({
   canExtract: boolean;
   onExtract: () => void;
   hctx: HighlightCtx;
+  // True when this source token's own-relative position is claimed by 2+
+  // display cards (see findReusedSourcePositions) — a data defect, not a
+  // hover/link state. Must not be confusable with hoverShadow's blue/amber.
+  reused: boolean;
 }) {
   const [hover, setHover] = useState(false);
   const tone = hctx.hebrewHighlight(pos, groupId);
@@ -1873,10 +1916,17 @@ function SourceWordTypography({
       enterDelay={0}
       enterNextDelay={0}
       title={
-        showInfo ? (
+        showInfo || reused ? (
           <Box>
-            <SourceTooltipBody source={source} lex={lex} twHint={twHint} />
-            {canExtract && (
+            {/* The defect notice leads — a native `title` attribute would lose
+                the hover to this popper and never be read. */}
+            {reused && (
+              <Box sx={{ fontSize: 11, fontWeight: 700, color: "error.light", mb: showInfo ? 0.5 : 0 }}>
+                {REUSED_SOURCE_TOOLTIP}
+              </Box>
+            )}
+            {showInfo && <SourceTooltipBody source={source} lex={lex} twHint={twHint} />}
+            {showInfo && canExtract && (
               <Box sx={{ mt: 0.5, fontSize: 11, opacity: 0.85 }}>
                 double-click to split out of compound
               </Box>
@@ -1886,9 +1936,9 @@ function SourceWordTypography({
           ""
         )
       }
-      disableHoverListener={!showInfo}
-      disableFocusListener={!showInfo}
-      disableTouchListener={!showInfo}
+      disableHoverListener={!showInfo && !reused}
+      disableFocusListener={!showInfo && !reused}
+      disableTouchListener={!showInfo && !reused}
       slotProps={{ popper: { sx: { pointerEvents: "none" } } }}
     >
       <Box
@@ -1915,7 +1965,10 @@ function SourceWordTypography({
           alignItems: "baseline",
           py: 0.25,
           px: 0.75,
-          pr: sourceShowsOccurrence(source) ? 2 : 0.75,
+          // Reserve the right gutter for EITHER superscript — without this a
+          // reused token with no occurrence badge gets ~6px and the warning
+          // glyph clips the rightmost (RTL) Hebrew letter.
+          pr: sourceShowsOccurrence(source) || reused ? 2 : 0.75,
           bgcolor: hover ? "grey.100" : "transparent",
           borderRadius: 0.5,
           fontFamily: '"Frank Ruhl Libre", "Times New Roman", "SBL Hebrew", "Cardo", serif',
@@ -1927,6 +1980,15 @@ function SourceWordTypography({
           transition: "background-color 0.12s, box-shadow 0.12s",
           userSelect: "none",
           boxShadow: hoverShadow(tone, hctx.themeMode),
+          // Data-defect marker: a standing flag, not a transient hover state.
+          // MUST be `error.main` — hoverShadow's "linked" tone is the SAME
+          // amber as warning.main (highlightTypes.ts), so an amber outline
+          // read as a hover ring. Red is used by neither hover tone (exact is
+          // blue), and it stacks with them rather than replacing them
+          // (outline vs box-shadow).
+          outline: reused ? "2px solid" : "none",
+          outlineColor: "error.main",
+          outlineOffset: 1,
           "&:active": { cursor: "grabbing" },
         }}
       >
@@ -1948,6 +2010,29 @@ function SourceWordTypography({
             }}
           >
             {source.occurrence}
+          </Box>
+        )}
+        {reused && (
+          <Box
+            component="sup"
+            dir="ltr"
+            role="img"
+            // The outline is pure colour and the glyph takes no pointer, so
+            // this label is the only signal a screen reader gets.
+            aria-label={REUSED_SOURCE_TOOLTIP}
+            sx={{
+              position: "absolute",
+              bottom: -2,
+              right: 2,
+              fontFamily: "monospace",
+              fontSize: 11,
+              fontWeight: 900,
+              lineHeight: 1,
+              color: "error.main",
+              pointerEvents: "none",
+            }}
+          >
+            ⚠
           </Box>
         )}
       </Box>
@@ -2309,6 +2394,21 @@ function resolveSourcePos(s: SourceWord, indexMap: Map<string, number>): number 
     indexMap.get(`s:${s.strong}|1`) ??
     -1
   );
+}
+
+// Token identity for the reused-source-token marker: the EXACT source position
+// (NFC x-content + occurrence, no fallback) when the word resolves, otherwise
+// the word's own content+occurrence. Never Strong's — resolveSourcePos's
+// strong|1 fallback collapses distinct same-Strong tokens onto one position and
+// would accuse a clean verse. The second branch keeps a word whose claimed
+// occurrence doesn't exist in the source verse (JER 36:30 UST) as evidence
+// instead of dropping it. Null only when there is nothing to key on at all.
+// See findReusedSourceWordIds.
+function reusedTokenKey(s: SourceWord, indexMap: Map<string, number>): string | null {
+  const content = nfc(s.content ?? "");
+  const pos = indexMap.get(`t:${content}|${s.occurrence}`);
+  if (pos !== undefined) return `p${pos}`;
+  return content === "" ? null : `c${content}|${s.occurrence}`;
 }
 
 // Position-sequence identity for a group: a stable key from its resolved source
