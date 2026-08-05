@@ -9,7 +9,7 @@ import { analyzeAlignmentDelta } from "./alignmentDelta.ts";
 import { normalizeUsfmFormatting } from "./usfmFormat.ts";
 import { normalizeNoteText, sortRowsByReference } from "./tsvFormat.ts";
 import { orderTwlRows } from "./twlCanonicalOrder.ts";
-import { origLangOccurrence } from "./occurrenceRule.ts";
+import { renderOccurrence } from "./occurrenceRule.ts";
 import type { UsfmValidationIssue, UsfmValidationRule } from "./usfmValidate.ts";
 
 export type Resource = "tn" | "tq" | "twl" | "ult" | "ust";
@@ -90,8 +90,8 @@ function tsvLine(cells: unknown[]): string {
 
 // The Occurrence invariant lives in occurrenceRule.ts (pure leaf, shared with
 // rows.ts's save path so render-time and save-time cannot drift apart).
-// origLangOccurrence is the render-time coercion; see that module for why it
-// is deliberately narrower than the save-path rule.
+// renderOccurrence is the render-time coercion; it applies the same per-kind
+// rule as the save path, because Occurrence is not editable in the UI.
 
 // TWL canonical ordering (normalizeWordText / buildUltSequenceMap /
 // twlSortPosition / the per-verse sequencing) moved to twlCanonicalOrder.ts so
@@ -100,14 +100,14 @@ function tsvLine(cells: unknown[]): string {
 
 export function buildTnTsv(rows: TnRow[]): string {
   const body = sortRowsByReference(rows).map((r) =>
-    tsvLine([r.ref_raw, r.id, r.tags, r.support_reference, r.quote, origLangOccurrence(r.quote, r.occurrence), normalizeNoteText(r.note)]),
+    tsvLine([r.ref_raw, r.id, r.tags, r.support_reference, r.quote, renderOccurrence("tn", r.quote, r.occurrence), normalizeNoteText(r.note)]),
   );
   return [TN_HEADERS.join("\t"), ...body].join("\n") + "\n";
 }
 
 export function buildTqTsv(rows: TqRow[]): string {
   const body = sortRowsByReference(rows).map((r) =>
-    tsvLine([r.ref_raw, r.id, r.tags, r.quote, origLangOccurrence(r.quote, r.occurrence), normalizeNoteText(r.question), normalizeNoteText(r.response)]),
+    tsvLine([r.ref_raw, r.id, r.tags, r.quote, renderOccurrence("tq", r.quote, r.occurrence), normalizeNoteText(r.question), normalizeNoteText(r.response)]),
   );
   return [TQ_HEADERS.join("\t"), ...body].join("\n") + "\n";
 }
@@ -153,7 +153,7 @@ export function buildTwlTsv(rows: TwlRow[], input?: UsfmInputs): TwlTsvResult {
         row.id,
         row.tags,
         row.orig_words,
-        origLangOccurrence(row.orig_words, row.occurrence),
+        renderOccurrence("twl", row.orig_words, row.occurrence),
         row.tw_link,
       ]),
     );

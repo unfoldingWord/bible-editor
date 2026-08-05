@@ -577,18 +577,25 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     // The stale `export_blank:*` banner the old gate left behind is cleared at
     // the top of exportOne, ahead of every early return.
     //
-    // What DOES still hold a book is the Occurrence column — see
-    // hardRejectGuard.ts. In the same validator files those checks carry no
-    // `severity` kwarg, so they default to "error", fail the run, and the merge
-    // bot never merges the PR. Two independent reviewers converged on the gap
-    // that made this necessary: the "add word" button in Shell.tsx creates a twl
-    // stub with blank OrigWords/TWLink and NO occurrence, which D1 stores as
-    // NULL. The old blank-field gate caught that row incidentally (via its blank
-    // OrigWords); removing the gate without this would let it ship and hard-fail
-    // the whole en_twl book's validation — withholding the book anyway, but with
-    // no banner naming the row. Prod carries 1 such row today (twl DAN 3:5
-    // `xf8f`, OrigWords "fall down", Occurrence NULL) and 0 rows with blank
-    // OrigWords, so the gate below is narrow by measurement, not by hope.
+    // The Occurrence column no longer holds a book either, and for the same
+    // reason one step further on: Occurrence is not editable anywhere in the UI.
+    // Its checks really are hard errors (no `severity` kwarg in the validator
+    // files, so they default to "error", fail the run, and the merge bot never
+    // merges the PR) — but the alert told translators to "fix the Occurrence on
+    // those rows", which they cannot do. Prod held all of DAN TWL on one row
+    // (`xf8f`, Occurrence NULL) and all of JER TN on one more (`bfyt`), both
+    // arrived-from-master defects. `renderOccurrence` (occurrenceRule.ts) now
+    // heals the cell at render time to the one value each validator will accept,
+    // so the render is legal by construction and the guard below finds nothing.
+    //
+    // The guard stays as a drift backstop: a hit here means the renderer and the
+    // guard's transcription of the validators have diverged, which IS worth a
+    // hold. Note what this shifts — the twl "add word" stub (blank
+    // OrigWords/TWLink, NULL occurrence) used to be caught incidentally by its
+    // Occurrence and will now ship. That is deliberate and consistent with the
+    // paragraphs above: blank OrigWords/TWLink are severity="warning", they merge
+    // fine, and lint.ts plus the save-path guards are where a blank row gets
+    // caught. Prod carries 0 blank-OrigWords rows today.
     if (dcsAllowed && (resource === "tn" || resource === "twl")) {
       const rejects = hardRejectRows(resource, built.content);
       if (rejects.length > 0) {
