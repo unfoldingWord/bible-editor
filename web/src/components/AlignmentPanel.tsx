@@ -788,6 +788,21 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
     // AMO 3:7), and answering with only the first owner's union would reproduce
     // on the shared strip exactly the first-wins blindness the cards no longer
     // have — the strip would light one card's siblings and not the other's.
+    //
+    // KNOWN AND DELIBERATE: mixing the two derivations means the strip can light
+    // a token no card lights. On a stripped-compound verse (ZEC 2:8: state group
+    // כִּי+כֹה+אָמַר, with אָמַר stripped because a standalone card owns it) a
+    // strip Hebrew hover rings all three on the strip while the cards render a
+    // two-token card and a separate one — measured in-browser. Do NOT "fix" this
+    // by making the union display-derived. Two reasons: it would sever the
+    // #410 bridge (a source word stripped from a rendered chain is still bound to
+    // its group and must still light), and the shared strip's ENGLISH-hover path
+    // already lights this same state-derived union on these same tokens
+    // (makeEnglishHover reads groupPositions), so a display-derived Hebrew path
+    // would make the strip disagree with itself depending on hover direction.
+    // The strip reports "these tokens are bound together in the data"; the cards
+    // report "this is what I render". On a flagged verse those genuinely differ,
+    // and that difference IS the defect the red marker is pointing at.
     const sourceGroupPositions = useCallback(
       (unionPos: number): number[] => {
         const gids = posMaps.posOwners.get(unionPos - posOffset);
