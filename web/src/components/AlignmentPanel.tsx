@@ -36,17 +36,23 @@ import {
   parseAlignment,
   serializeAlignment,
   sourceKey,
-  stripCompoundOverlaps,
-  mergeAdjacentSameSource,
-  mergeSamePositionGroups,
-  buildPositionOwners,
-  positionOwnedBy,
-  positionsShareOwner,
-  findReusedSourceWordIds,
   type AlignmentGroup,
   type AlignmentState,
   type SourceWord,
 } from "../lib/alignment";
+import {
+  buildDisplayGroups,
+  buildPosMaps,
+  buildSourceIndexMap,
+  buildTargetIdToGroupId,
+  groupPositionKey,
+  makeEnglishHover,
+  makeHebrewHover,
+  resolveEnglishHighlight,
+  resolveHebrewHighlight,
+  resolveSourcePos,
+  type HoverCtx,
+} from "../lib/alignmentHover";
 import type { TwlRow, VerseDto } from "../sync/api";
 import { alignmentDrafts, alignmentDraftKey } from "../sync/alignmentDrafts";
 import { lostAlignedWords } from "../lib/alignmentDelta";
@@ -60,7 +66,6 @@ import {
   type Ghost,
   type StreamWord,
 } from "../lib/alignmentSuggest";
-import { nfc } from "../lib/hebrew";
 import { SourceTooltipBody } from "./SourceTooltipBody";
 import { UhbStrip, buildTwHintMap, twHintFromMap } from "./UhbStrip";
 import {
@@ -558,223 +563,57 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
     // translate via posOffset at the comparison sites.
     const sourceIndexMap = useMemo(() => buildSourceIndexMap(sourceVerse), [sourceVerse]);
 
-    const displayGroups = useMemo(() => {
-      if (!state) return [];
-      const sortKey = (g: (typeof state.groups)[number]) => {
-        if (g.source.length === 0) return Number.MAX_SAFE_INTEGER;
-        const pos = resolveSourcePos(g.source[0], sourceIndexMap);
-        return pos >= 0 ? pos : Number.MAX_SAFE_INTEGER;
-      };
-      const sorted = [...state.groups].sort((a, b) => sortKey(a) - sortKey(b));
-      const stripped = stripCompoundOverlaps(sorted);
-      const merged = mergeAdjacentSameSource(stripped);
-      // Collapse same-position duplicates (one physical Hebrew token the AI
-      // stamped with occurrences>actual — see mergeSamePositionGroups).
-      return mergeSamePositionGroups(merged, (g) => groupPositionKey(g, sourceIndexMap));
-    }, [state, sourceIndexMap]);
-
-    // Cross-language hover linking needs to know which alignment group each
-    // chip / Hebrew word belongs to. Built from displayGroups' targets, NOT
-    // from the stream's `alignedTo`: mergeAdjacentSameSource and
-    // mergeSamePositionGroups fold several state groups into one card and keep
-    // only the survivor's id, so a word whose `alignedTo` names an eaten group
-    // had a group id that appears nowhere in posOwners (which is
-    // display-derived) — hovering the Hebrew lit the card's chips but not that
-    // word's chip in the top inventory strip. Large split/discontiguous UST
-    // alignments are exactly the merged case, so the bigger the card the more
-    // of its inventory chips went dark. Keying off the rendered card's targets
-    // gives every aligned word the same canonical (display) id the cards use.
-    const targetIdToGroupId = useMemo(() => {
-      const map = new Map<string, string>();
-      for (const g of displayGroups) {
-        for (const t of g.targets) map.set(t.id, g.id);
-      }
-      return map;
-    }, [displayGroups]);
-
-    const posMaps = useMemo(() => {
-      const sourcePosById = new Map<string, number>();
-      const groupPositions = new Map<string, number[]>();
-      if (!state)
-        return {
-          posOwners: new Map<number, Set<string>>(),
-          sourcePosById,
-          groupPositions,
-          reusedSourceIds: new Set<string>(),
-        };
-      // sourcePosById + groupPositions cover EVERY state.groups source word so
-      // any rendered token (and any word whose `alignedTo` points at a group
-      // mergeAdjacentSameSource later folds away) still resolves its position.
-      for (const g of state.groups) {
-        const positions: number[] = [];
-        for (const s of g.source) {
-          const pos = resolveSourcePos(s, sourceIndexMap);
-          sourcePosById.set(s.id, pos);
-          if (pos < 0) continue;
-          positions.push(pos);
-        }
-        groupPositions.set(g.id, positions);
-      }
-      // posOwners — position → which CARD(s) own it — must come from the
-      // groups the cards actually render (displayGroups), not state.groups:
-      // stripCompoundOverlaps drops a compound's source word when a standalone
-      // card already owns that content, so mapping off state.groups let the
-      // stripped token's position win by parse order and light the wrong card
-      // on a strip-token hover.
-      // groupPositions deliberately stays STATE-derived (the loop above): a
-      // source word stripCompoundOverlaps removes from a compound's rendered
-      // chain is still bound to it, and hover must still bridge it (see the
-      // sourceWordKey comment in alignment.ts). Recomputing the union from the
-      // card's narrowed chain would drop that word's position and take the
-      // stripped token dark on hover. Safe for the merge paths too: both
-      // mergeAdjacentSameSource (identical sourceKey) and
-      // mergeSamePositionGroups (identical resolved-position key) fuse only
-      // groups whose positions already match the survivor's.
-      // A position can have MORE THAN ONE owner (see buildPositionOwners): a
-      // standalone card and a compound card that both name the same physical
-      // token. Keeping only the first left the other card unable to recognise
-      // its own token on hover.
-      const posOwners = buildPositionOwners(displayGroups, sourcePosById);
-      // A source token claimed by 2+ DISTINCT groups is a data defect (one
-      // physical Hebrew word can't belong to several alignment groups) — see
-      // findReusedSourceWordIds. Two deliberate choices there: computed from
-      // state.groups, NOT displayGroups (stripCompoundOverlaps would already
-      // have erased the overlap on a compound of 3+, silencing the marker on a
-      // verse api-side lint still flags), and keyed via reusedTokenKey rather
-      // than resolveSourcePos — that function's strong|1 fallback collapses
-      // distinct same-Strong tokens onto one position and invents reuse on
-      // clean verses. Display only; nothing is fixed.
-      const reusedSourceIds = findReusedSourceWordIds(state.groups, (s) =>
-        reusedTokenKey(s, sourceIndexMap),
-      );
-      return { posOwners, sourcePosById, groupPositions, reusedSourceIds };
-    }, [state, displayGroups, sourceIndexMap]);
-
-    // Bind the two pure hover rules (tested in alignment.test.mjs) to this
-    // panel's owner map. They replaced the old `posToGroupId.get(pos) === id`
-    // equality at every hover comparison site.
-    const posOwnedBy = useCallback(
-      (pos: number, groupId: string | null) => positionOwnedBy(posMaps.posOwners, pos, groupId),
-      [posMaps],
-    );
-    const posSharesCard = useCallback(
-      (a: number, b: number) => positionsShareOwner(posMaps.posOwners, a, b),
-      [posMaps],
+    // Display groups, the id/position hover maps, and the two highlight
+    // resolvers all live in ../lib/alignmentHover — pure, and unit-tested there
+    // (alignmentHover.test.mjs). The comments explaining WHY each map is derived
+    // the way it is live with the code, not here.
+    const displayGroups = useMemo(
+      () => buildDisplayGroups(state, sourceIndexMap),
+      [state, sourceIndexMap],
     );
 
-    // Highlight resolution. `hover` may name an English or Hebrew word; we
-    // mark same-language matches as "exact" and aligned cross-language
-    // partners as "linked". The handlers no-op when hoverLink is off so the
-    // chips can fire them unconditionally.
+    const targetIdToGroupId = useMemo(() => buildTargetIdToGroupId(displayGroups), [displayGroups]);
+
+    const posMaps = useMemo(
+      () => buildPosMaps(state, displayGroups, sourceIndexMap),
+      [state, displayGroups, sourceIndexMap],
+    );
+
+    const hoverCtx = useMemo<HoverCtx>(
+      () => ({ hoverLink, bibleVersion, targetIdToGroupId, posMaps, posOffset }),
+      [hoverLink, bibleVersion, targetIdToGroupId, posMaps, posOffset],
+    );
+
+    // Hover handlers. They no-op when hoverLink is off so the chips can fire
+    // them unconditionally; the payloads themselves are built in alignmentHover.
     const onEnglishHover = useCallback(
       (wordId: string, text: string, occurrence: string, groupIdOverride?: string) => {
         if (!hoverLink) return;
-        const groupId = groupIdOverride ?? targetIdToGroupId.get(wordId) ?? null;
-        // Union positions of the group's Hebrew — lets the shared strip and
-        // the opposite panel light their counterparts without sharing group
-        // ids (ids are regenerated per panel parse).
-        const positions = (groupId ? posMaps.groupPositions.get(groupId) ?? [] : []).map(
-          (p) => p + posOffset,
-        );
-        // Scope the english key by bibleVersion: `hover` is shared across both
-        // side-by-side panels, so an un-scoped `${text}|${occurrence}` key
-        // would give the OTHER panel's same-text/occurrence chip a false
-        // "exact" ring (hover ULT "and"(3) → UST "and"(3) lights too).
-        setHover({
-          kind: "english",
-          key: `${bibleVersion}:${text}|${occurrence}`,
-          groupId,
-          positions,
-        });
+        setHover(makeEnglishHover(hoverCtx, wordId, text, occurrence, groupIdOverride));
       },
-      [hoverLink, bibleVersion, targetIdToGroupId, posMaps, posOffset, setHover],
+      [hoverLink, hoverCtx, setHover],
     );
     const onHebrewHover = useCallback(
       (pos: number, groupIdOverride?: string) => {
         if (!hoverLink) return;
         if (pos < 0 && !groupIdOverride) return;
-        setHover({
-          kind: "hebrew",
-          pos,
-          // hover.groupId is a single representative (it only has to name a
-          // group for the fallbacks below); the authoritative "who owns this
-          // position" question is answered by posOwners at each comparison.
-          groupId:
-            groupIdOverride ??
-            posMaps.posOwners.get(pos - posOffset)?.values().next().value ??
-            null,
-        });
+        setHover(makeHebrewHover(hoverCtx, pos, groupIdOverride));
       },
-      [hoverLink, posMaps, posOffset, setHover],
+      [hoverLink, hoverCtx, setHover],
     );
     const onHoverLeave = useCallback(() => {
       setHover(null);
     }, [setHover]);
 
     const englishHighlight = useCallback(
-      (wordId: string, text: string, occurrence: string, groupIdOverride?: string): "exact" | "linked" | null => {
-        if (!hoverLink || !hover) return null;
-        // Match the bibleVersion-scoped key set in onEnglishHover so the
-        // opposite panel's same-text chip doesn't ring "exact".
-        const myKey = `${bibleVersion}:${text}|${occurrence}`;
-        if (hover.kind === "english" && hover.key === myKey) return "exact";
-        const myGroupId = groupIdOverride ?? targetIdToGroupId.get(wordId) ?? null;
-        if (!myGroupId) return null;
-        if (hover.kind === "hebrew") {
-          // Resolve the hovered Hebrew position to THIS panel's own group.
-          // The carried hover.groupId belongs to whichever panel the cursor
-          // is in, so cross-panel linking resolves locally — each side lights
-          // its own English (ULT "And I answered" ↔ UST "I asked"). The
-          // groupId equality covers this panel's own card words whose source
-          // pos failed to resolve (mirrors hebrewHighlight's fallback; group
-          // ids are per-panel UUIDs, so no cross-panel false match).
-          if (posOwnedBy(hover.pos - posOffset, myGroupId)) return "linked";
-          if (hover.groupId === myGroupId) return "linked";
-          return null;
-        }
-        // English hovered (possibly in the other panel): its group's union
-        // Hebrew positions resolve here to the group that shares the Hebrew.
-        return hover.positions.some((p) => posOwnedBy(p - posOffset, myGroupId))
-          ? "linked"
-          : null;
-      },
-      [hoverLink, hover, bibleVersion, targetIdToGroupId, posOwnedBy, posOffset],
+      (wordId: string, text: string, occurrence: string, groupIdOverride?: string) =>
+        resolveEnglishHighlight(hoverCtx, hover, wordId, text, occurrence, groupIdOverride),
+      [hoverCtx, hover],
     );
     const hebrewHighlight = useCallback(
-      (pos: number, groupIdOverride?: string): "exact" | "linked" | null => {
-        if (!hoverLink || !hover) return null;
-        if (pos >= 0 && hover.kind === "hebrew" && hover.pos === pos) return "exact";
-        // A card's own Hebrew names its card outright (groupIdOverride). A
-        // shared-strip token names no card — it is the verse's single entry for
-        // a physical token, which can sit on a standalone card AND a compound
-        // card at once — so it asks the weaker question: do these two positions
-        // share a card? Two consequences, both intended: strip tokens that share
-        // any card light each other (hovering strip `אֶל` lights strip
-        // `עֲבָדָיו` when a compound holds both — the same pair the compound
-        // card lights), and the strip entry can be lit while the STANDALONE card
-        // for that same token stays dark. That is not a contradiction: the strip
-        // says "this token is involved", the card says "this card is not".
-        if (hover.kind === "hebrew") {
-          // Whole-group: the rest of the hovered word's group lights, resolved
-          // to THIS panel's grouping — a compound card shows its siblings even
-          // when the other side keeps them separate.
-          if (groupIdOverride) {
-            return posOwnedBy(hover.pos - posOffset, groupIdOverride) ? "linked" : null;
-          }
-          return pos >= 0 && posSharesCard(pos - posOffset, hover.pos - posOffset)
-            ? "linked"
-            : null;
-        }
-        // English hover: its group's union positions name the Hebrew directly
-        // (works on the shared strip and across panels). The groupId fallback
-        // covers words those union positions miss — a card word whose source
-        // pos failed to resolve, and a strip token belonging to a card whose
-        // `groupPositions` only carry the surviving state group's positions.
-        if (hover.positions.includes(pos)) return "linked";
-        if (groupIdOverride) return hover.groupId === groupIdOverride ? "linked" : null;
-        return pos >= 0 && posOwnedBy(pos - posOffset, hover.groupId) ? "linked" : null;
-      },
-      [hoverLink, hover, posOwnedBy, posSharesCard, posOffset],
+      (pos: number, groupIdOverride?: string) =>
+        resolveHebrewHighlight(hoverCtx, hover, pos, groupIdOverride),
+      [hoverCtx, hover],
     );
 
     const hctx: HighlightCtx = useMemo(
@@ -2380,86 +2219,3 @@ function readWordIds(dt: DataTransfer): string[] {
   return single ? [single] : [];
 }
 
-// Resolve a group source word to its token position in the panel's source
-// verse: NFC content + occurrence first (exact), then content first-instance,
-// then strong + occurrence, then strong first-instance. The fallback chain
-// absorbs malformed occurrence data and cantillation drift between milestone
-// x-content and the UHB \w text. -1 when nothing matches.
-function resolveSourcePos(s: SourceWord, indexMap: Map<string, number>): number {
-  const c = nfc(s.content ?? "");
-  return (
-    indexMap.get(`t:${c}|${s.occurrence}`) ??
-    indexMap.get(`t:${c}|1`) ??
-    indexMap.get(`s:${s.strong}|${s.occurrence}`) ??
-    indexMap.get(`s:${s.strong}|1`) ??
-    -1
-  );
-}
-
-// Token identity for the reused-source-token marker: the EXACT source position
-// (NFC x-content + occurrence, no fallback) when the word resolves, otherwise
-// the word's own content+occurrence. Never Strong's — resolveSourcePos's
-// strong|1 fallback collapses distinct same-Strong tokens onto one position and
-// would accuse a clean verse. The second branch keeps a word whose claimed
-// occurrence doesn't exist in the source verse (JER 36:30 UST) as evidence
-// instead of dropping it. Null only when there is nothing to key on at all.
-// See findReusedSourceWordIds.
-function reusedTokenKey(s: SourceWord, indexMap: Map<string, number>): string | null {
-  const content = nfc(s.content ?? "");
-  const pos = indexMap.get(`t:${content}|${s.occurrence}`);
-  if (pos !== undefined) return `p${pos}`;
-  return content === "" ? null : `c${content}|${s.occurrence}`;
-}
-
-// Position-sequence identity for a group: a stable key from its resolved source
-// positions, or null when any source word is unresolved (then callers must not
-// treat it as a duplicate — we can't prove it). Shared by displayGroups (which
-// collapses same-position duplicate cards via mergeSamePositionGroups) and the
-// card-clear handler, which must unalign EVERY underlying group the card
-// collapsed — not just the one whose id the card carries — so the two agree on
-// what a single card owns.
-function groupPositionKey(g: AlignmentGroup, indexMap: Map<string, number>): string | null {
-  if (g.source.length === 0) return null;
-  const positions = g.source.map((s) => resolveSourcePos(s, indexMap));
-  return positions.some((p) => p < 0) ? null : positions.join(".");
-}
-
-function buildSourceIndexMap(sourceVerse: VerseDto | null): Map<string, number> {
-  const map = new Map<string, number>();
-  if (!sourceVerse?.content) return map;
-  const verseObjects = (sourceVerse.content as { verseObjects?: unknown[] }).verseObjects;
-  if (!Array.isArray(verseObjects)) return map;
-  let idx = 0;
-  const textCount = new Map<string, number>();
-  const strongCount = new Map<string, number>();
-  const walk = (nodes: unknown[]) => {
-    for (const n of nodes ?? []) {
-      const o = n as Record<string, unknown> | null;
-      if (!o) continue;
-      if (o["type"] === "word" && o["tag"] === "w") {
-        const text = nfc(String(o["text"] ?? ""));
-        const strong = String(o["strong"] ?? "");
-        const tOcc = (textCount.get(text) ?? 0) + 1;
-        const sOcc = (strongCount.get(strong) ?? 0) + 1;
-        textCount.set(text, tOcc);
-        strongCount.set(strong, sOcc);
-        const textKey = `t:${text}|${tOcc}`;
-        const strongKey = `s:${strong}|${sOcc}`;
-        if (!map.has(textKey)) map.set(textKey, idx);
-        if (!map.has(strongKey)) map.set(strongKey, idx);
-        idx++;
-      } else if (
-        o["type"] === "milestone" ||
-        // \d (Psalm superscription) is type:"section" but its content IS
-        // alignable verse body — descend so its \w tokens get walk positions
-        // matching SourceVerseTokens / collectAlignerSourceWords. Mirrors
-        // collectMilestoneRuns in highlight.ts.
-        (o["type"] === "section" && o["tag"] === "d")
-      ) {
-        walk((o["children"] as unknown[] | undefined) ?? []);
-      }
-    }
-  };
-  walk(verseObjects);
-  return map;
-}
