@@ -1,6 +1,8 @@
 import {
   forwardRef,
   type Ref,
+  type MutableRefObject,
+  useCallback,
   useEffect,
   useImperativeHandle,
   useMemo,
@@ -59,7 +61,10 @@ export interface PanelSlot {
   // Confirm-before-save when this side's edit would unalign a previously aligned
   // word (forwarded to AlignmentPanel; see its onConfirmUnalign prop).
   onConfirmUnalign?: (lostWords: string[], commit: () => void) => void;
-  panelRef: Ref<AlignmentPanelHandle>;
+  // A ref OBJECT, not the wider Ref (which allows callbacks): this component
+  // reads the handle itself — the shared strip asks each panel which Hebrew
+  // groups together, and a callback ref exposes nothing to read.
+  panelRef: MutableRefObject<AlignmentPanelHandle | null>;
   // Reading-line dirty mirror + imperative save/discard, so the close/verse-nav
   // gate can prompt before silently dropping an unsaved reading-text edit
   // (parallels onDirtyChange/panelRef for the alignment panel below).
@@ -142,6 +147,23 @@ export function SideBySideAligner({
       if (!next) setHover(null);
       return next;
     });
+
+  // Which Hebrew belongs together, asked of BOTH panels and unioned. The shared
+  // strip has no grouping of its own, and the two panels' groupings can differ
+  // for the same Hebrew (ULT may split what UST fuses), so "the group" is
+  // ambiguous there — we light the union, which is the only answer consistent
+  // with the cards, since on a Hebrew hover each panel already lights its own
+  // group's siblings. Read from the refs at hover time (an event, not render),
+  // so no panel grouping has to be mirrored into parent state.
+  const groupPositionsFor = useCallback(
+    (unionPos: number): number[] => {
+      const out = new Set<number>([unionPos]);
+      for (const p of left.panelRef.current?.sourceGroupPositions(unionPos) ?? []) out.add(p);
+      for (const p of right.panelRef.current?.sourceGroupPositions(unionPos) ?? []) out.add(p);
+      return [...out];
+    },
+    [left.panelRef, right.panelRef],
+  );
 
   const renderPanel = (slot: PanelSlot, setLocalDirty: (dirty: boolean) => void) => (
     <AlignmentPanel
@@ -309,6 +331,7 @@ export function SideBySideAligner({
           onHover={setHover}
           hoverLink={hoverLink}
           showSourceInfo={lexInfo}
+          groupPositionsFor={groupPositionsFor}
         />
 
         {/* the two aligners */}
@@ -354,6 +377,7 @@ function SharedUhbStrip({
   onHover,
   hoverLink,
   showSourceInfo,
+  groupPositionsFor,
 }: {
   sourceVerse: VerseDto | null;
   sourceLabel: string;
@@ -364,6 +388,9 @@ function SharedUhbStrip({
   onHover: (h: HoverHighlight) => void;
   hoverLink: boolean;
   showSourceInfo: boolean;
+  // Union positions of the hovered token's group(s), across BOTH panels. The
+  // strip cannot compute this (no grouping of its own) — see the parent.
+  groupPositionsFor: (unionPos: number) => number[];
 }) {
   const themeMode = useTheme().palette.mode;
   const [hidden, setHidden] = useState(false);
@@ -371,7 +398,13 @@ function SharedUhbStrip({
   // union-relative hover identity. It has no grouping of its own — hovering a
   // token seeds the lifted hover, which each panel resolves to its own groups.
   // It lights: exact (its own token hovered anywhere) and linked (a panel's
-  // English hovered → that group's Hebrew positions ring here too).
+  // English hovered → that group's Hebrew positions ring here too; a strip
+  // Hebrew hovered → its group's Hebrew siblings, unioned across both panels).
+  // Resolution here is POSITION-ONLY, deliberately: this strip holds no group
+  // ids and seeds `groupId: null`, and ids are per-parse UUIDs (uid() in
+  // alignment.ts) while the strip is shared by both panels — so a groupId
+  // comparison could only ever match nothing. Positions are the shared
+  // identity, which is why both hover kinds carry `positions`.
   const hctx: HighlightCtx = useMemo(
     () => ({
       colorize: false,
@@ -382,18 +415,24 @@ function SharedUhbStrip({
       onEnglishEnter: () => {},
       onHebrewEnter: (pos: number) => {
         if (!hoverLink) return;
-        onHover({ kind: "hebrew", pos, groupId: null });
+        // Carry the group's union positions (both panels) so the strip can light
+        // the hovered token's Hebrew siblings — still positions, not group ids.
+        onHover({ kind: "hebrew", pos, groupId: null, positions: groupPositionsFor(pos) });
       },
       onLeave: () => onHover(null),
       englishHighlight: () => null,
       hebrewHighlight: (pos: number) => {
         if (!hoverLink || !hover) return null;
         if (hover.kind === "hebrew" && hover.pos === pos) return "exact";
+        // `positions` is absent on a hover seeded by a panel (card/chip), where
+        // each panel resolves its own grouping; then only the exact token lights
+        // here, as before.
+        if (hover.kind === "hebrew") return hover.positions?.includes(pos) ? "linked" : null;
         if (hover.kind === "english" && hover.positions.includes(pos)) return "linked";
         return null;
       },
     }),
-    [hoverLink, showSourceInfo, themeMode, hover, onHover],
+    [hoverLink, showSourceInfo, themeMode, hover, onHover, groupPositionsFor],
   );
   return (
     <UhbStrip
