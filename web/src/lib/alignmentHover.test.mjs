@@ -309,6 +309,36 @@ function ctxFor(st, { bibleVersion = "ult", posOffset = 0, hoverLink = true } = 
   );
 }
 
+// ─── 6. buildPosMaps surfaces the reused-source-token flag (#408 wiring) ────
+// The red "data defect" marker the cards draw comes from posMaps.reusedSourceIds.
+// The detector itself is tested in alignment.test.mjs; this pins that buildPosMaps
+// actually calls it, with reusedTokenKey (exact position, never Strong's) — the
+// wiring the #414 extraction moved. Shape: the ZEC 14:8 UST defect, a compound
+// over both tokens PLUS a standalone for each.
+{
+  const compound = group("g-both", [src("sc1", 1), src("sc2", 2)], [tgt("t-both", "whole year")]);
+  const soloA = group("g-a", [src("sa", 1)], [tgt("t-a", "hot season")]);
+  const soloB = group("g-b", [src("sb", 2)], [tgt("t-b", "cold season")]);
+  const { ctx } = ctxFor(state([compound, soloA, soloB]));
+  const flagged = ctx.posMaps.reusedSourceIds;
+  assert(
+    flagged.size === 4 && ["sc1", "sc2", "sa", "sb"].every((id) => flagged.has(id)),
+    `every source word at a reused position is flagged (got [${[...flagged]}])`,
+  );
+  // And a clean verse stays unflagged — the marker must not become wallpaper.
+  const { ctx: clean } = ctxFor(
+    state([group("g-x", [src("sx", 0)], [tgt("t-x", "said")]), group("g-y", [src("sy", 3)], [tgt("t-y", "word")])]),
+  );
+  assert(clean.posMaps.reusedSourceIds.size === 0, "a clean verse flags nothing");
+  // Two groups sharing an IDENTICAL position sequence are the legitimate
+  // one-token-to-N-target-runs split (JER 28:1), not reuse. They also fuse into
+  // one card, so nothing would be marked anyway — assert the detector agrees.
+  const { ctx: split } = ctxFor(
+    state([group("g-s1", [src("s1", 2)], [tgt("t-s1", "spoke")]), group("g-s2", [src("s2", 2)], [tgt("t-s2", "to me")])]),
+  );
+  assert(split.posMaps.reusedSourceIds.size === 0, "an identical-sequence split is not reuse");
+}
+
 // ─── posOffset: hover positions travel union-relative ──────────────────────
 {
   const st = state([group("g-a", [src("sa", 1)], [tgt("t1", "to")])]);
