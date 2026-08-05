@@ -158,8 +158,11 @@ export function SideBySideAligner({
   const groupPositionsFor = useCallback(
     (unionPos: number): number[] => {
       const out = new Set<number>([unionPos]);
-      for (const p of left.panelRef.current?.sourceGroupPositions(unionPos) ?? []) out.add(p);
-      for (const p of right.panelRef.current?.sourceGroupPositions(unionPos) ?? []) out.add(p);
+      // Optional-CALL, not just optional ref: a stale bundle mid-HMR can leave a
+      // mounted panel whose handle predates this method, and this runs inside a
+      // mouse handler where a TypeError would kill hovering outright.
+      for (const p of left.panelRef.current?.sourceGroupPositions?.(unionPos) ?? []) out.add(p);
+      for (const p of right.panelRef.current?.sourceGroupPositions?.(unionPos) ?? []) out.add(p);
       return [...out];
     },
     [left.panelRef, right.panelRef],
