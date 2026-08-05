@@ -538,17 +538,6 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
       return assignChipHues(items);
     }, [state]);
 
-    // Cross-language hover linking needs to know which alignment group each
-    // chip / Hebrew word belongs to.
-    const targetIdToGroupId = useMemo(() => {
-      const map = new Map<string, string>();
-      if (!state) return map;
-      for (const item of state.stream) {
-        if (item.kind !== "word") continue;
-        if (item.alignedTo) map.set(item.word.id, item.alignedTo);
-      }
-      return map;
-    }, [state]);
     // Map Hebrew tokens to alignment groups by source-token POSITION.
     // `strong|occurrence` is NOT unique: occurrence numbers the exact surface
     // text (cantillation included), so same-Strong words with different
@@ -576,6 +565,25 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
       return mergeSamePositionGroups(merged, (g) => groupPositionKey(g, sourceIndexMap));
     }, [state, sourceIndexMap]);
 
+    // Cross-language hover linking needs to know which alignment group each
+    // chip / Hebrew word belongs to. Built from displayGroups' targets, NOT
+    // from the stream's `alignedTo`: mergeAdjacentSameSource and
+    // mergeSamePositionGroups fold several state groups into one card and keep
+    // only the survivor's id, so a word whose `alignedTo` names an eaten group
+    // had a group id that appears nowhere in posToGroupId (which is
+    // display-derived) — hovering the Hebrew lit the card's chips but not that
+    // word's chip in the top inventory strip. Large split/discontiguous UST
+    // alignments are exactly the merged case, so the bigger the card the more
+    // of its inventory chips went dark. Keying off the rendered card's targets
+    // gives every aligned word the same canonical (display) id the cards use.
+    const targetIdToGroupId = useMemo(() => {
+      const map = new Map<string, string>();
+      for (const g of displayGroups) {
+        for (const t of g.targets) map.set(t.id, g.id);
+      }
+      return map;
+    }, [displayGroups]);
+
     const posMaps = useMemo(() => {
       const posToGroupId = new Map<number, string>();
       const sourcePosById = new Map<string, number>();
@@ -600,12 +608,20 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
       // card already owns that content, so mapping off state.groups let the
       // stripped token's position win by parse order and light the wrong card
       // on a strip-token hover.
+      // Same for a display group's union positions: recompute from the source
+      // chain the CARD renders, so onEnglishHover's positions agree with
+      // posToGroupId (stripCompoundOverlaps can drop a source word the
+      // survivor's state group still carries).
       for (const g of displayGroups) {
+        const positions: number[] = [];
         for (const s of g.source) {
-          const pos = sourcePosById.get(s.id) ?? -1;
+          const pos = sourcePosById.get(s.id) ?? resolveSourcePos(s, sourceIndexMap);
+          sourcePosById.set(s.id, pos);
           if (pos < 0) continue;
+          positions.push(pos);
           if (!posToGroupId.has(pos)) posToGroupId.set(pos, g.id);
         }
+        groupPositions.set(g.id, positions);
       }
       return { posToGroupId, sourcePosById, groupPositions };
     }, [state, displayGroups, sourceIndexMap]);
