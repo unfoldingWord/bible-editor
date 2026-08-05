@@ -372,6 +372,56 @@ function SharedUhbStrip({
   // token seeds the lifted hover, which each panel resolves to its own groups.
   // It lights: exact (its own token hovered anywhere) and linked (a panel's
   // English hovered → that group's Hebrew positions ring here too).
+  //
+  // Resolution here is POSITION-ONLY. That is deliberate, and adding a
+  // `hover.groupId === myGroupId` term like AlignmentPanel's hebrewHighlight has
+  // would accomplish nothing — it would be inert, not merely redundant:
+  //   - That term serves the panel's CARD call site, which passes an explicit
+  //     groupId override (SourceWordTypography → hebrewHighlight(pos, groupId),
+  //     with pos = -1 when the source word didn't resolve) and can therefore
+  //     still name its group. UhbStrip never passes an override — it calls
+  //     hebrewHighlight(pos) — so the panel's own strip resolves by position
+  //     too. Same position-only IDENTITY there; not the same behavior (below).
+  //   - This strip holds no group ids of its own and seeds the lifted hover with
+  //     `groupId: null`, so a strip-side comparison could only ever match
+  //     nothing. Group ids are per-parse UUIDs (uid() in alignment.ts) and this
+  //     strip is shared by BOTH panels, so they are not a shared identity even
+  //     in principle. The union position is the shared identity on purpose —
+  //     that is why the lifted hover carries `positions`.
+  // In AlignmentPanel the term is also redundant on its strip path: myGroupId
+  // there is position-derived, and posToGroupId.get(pos) === G implies pos is in
+  // groupPositions.get(G) (display groups only ever narrow a state group's
+  // source and keep its id), which for the English-hover branch is what
+  // hover.positions holds, modulo posOffset. That last step relies on the
+  // panel's own strip only ever rendering at posOffset 0 — posOffset defaults to
+  // 0 and is passed only by this component, which sets renderUhbStrip={false}.
+  // Re-check the arithmetic before relying on it if that ever changes.
+  //
+  // Two honest limits on the above, neither an argument for a groupId term:
+  //   1. This strip is genuinely WEAKER than the panel's strip on a HEBREW
+  //      hover. The panel lights the rest of the hovered token's group
+  //      (posToGroupId.get(hover.pos) === myGroupId → "linked"); here only the
+  //      hovered token itself lights. Sibling Hebrew in a compound group stays
+  //      dark. Fixing that needs POSITIONS, not a group id — e.g. having
+  //      onHebrewEnter carry the hovered group's union positions the way the
+  //      English hover already does. It is a real design option, deliberately
+  //      not taken here; each panel still lights its own cards. Observable on
+  //      ISA 7:8: hovering strip שִׁשִּׁים (pos 8) lights its card sibling
+  //      וְחָמֵשׁ in both panels, but strip pos 9 stays dark.
+  //   2. A group whose positions don't resolve stays dark here, and it is not
+  //      provable that no token OUGHT to light — only that none is
+  //      IDENTIFIABLE. Each panel resolves against its own slice's source
+  //      (single-verse for a ULT row) while this strip renders the union span,
+  //      so a group referencing Hebrew outside its own slice yields pos = -1
+  //      even though the strip does render that token. The fix belongs upstream
+  //      in position resolution / the source span passed in, not in this map.
+  // On (2): buildAlignerSlice (Shell.tsx) expands a target row to its full UHB
+  // range only when the row DECLARES the bridge via verse_end — that is what
+  // makes a UST bridge referencing the next verse's Hebrew resolve. A
+  // single-verse row whose milestones happen to point at the next verse is not
+  // expanded and will still fail. Corollary for anyone auditing this: pairing a
+  // bridge row with only its start verse's UHB manufactures unresolved
+  // positions that the app itself never sees.
   const hctx: HighlightCtx = useMemo(
     () => ({
       colorize: false,
