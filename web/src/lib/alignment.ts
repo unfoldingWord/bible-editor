@@ -582,6 +582,8 @@ export function positionsShareOwner(
   if (!ownersA || !ownersB) return false;
   for (const id of ownersA) if (ownersB.has(id)) return true;
   return false;
+}
+
 // A source token claimed by two or more DISTINCT alignment groups is a data
 // defect: one physical Hebrew word cannot belong to several groups. It renders
 // as "doubled" Hebrew (ZEC 14:8 UST aligns בַּקַּיִץ/וּבָחֹרֶף both as a compound
