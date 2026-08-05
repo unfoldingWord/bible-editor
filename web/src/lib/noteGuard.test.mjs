@@ -8,6 +8,7 @@
 import {
   hasLeftNoteVerse,
   isAbandonedBlankStub,
+  locationFromHash,
   isBlankNoteText,
   wouldBlankExistingNote,
 } from "./noteGuard.ts";
@@ -176,25 +177,47 @@ assert(
 // while still on the same verse used to trash the stub).
 
 assert(
-  !hasLeftNoteVerse({ chapter: 1, verse: 5, ref_raw: "1:5" }, { chapter: 1, verse: 5 }),
+  !hasLeftNoteVerse({ book: "ZEC", chapter: 1, verse: 5, ref_raw: "1:5" }, { book: "ZEC", chapter: 1, verse: 5 }),
   "same verse → has not left",
 );
 assert(
-  hasLeftNoteVerse({ chapter: 1, verse: 5, ref_raw: "1:5" }, { chapter: 1, verse: 6 }),
+  hasLeftNoteVerse({ book: "ZEC", chapter: 1, verse: 5, ref_raw: "1:5" }, { book: "ZEC", chapter: 1, verse: 6 }),
   "different verse, same chapter → has left",
 );
 assert(
-  !hasLeftNoteVerse({ chapter: 1, verse: 6, ref_raw: "1:6-9" }, { chapter: 1, verse: 8 }),
+  !hasLeftNoteVerse({ book: "ZEC", chapter: 1, verse: 6, ref_raw: "1:6-9" }, { book: "ZEC", chapter: 1, verse: 8 }),
   "verse inside a bridged span (6-9) → has not left",
 );
 assert(
-  hasLeftNoteVerse({ chapter: 1, verse: 6, ref_raw: "1:6-9" }, { chapter: 1, verse: 10 }),
+  hasLeftNoteVerse({ book: "ZEC", chapter: 1, verse: 6, ref_raw: "1:6-9" }, { book: "ZEC", chapter: 1, verse: 10 }),
   "verse just outside a bridged span (6-9) → has left",
 );
 assert(
-  hasLeftNoteVerse({ chapter: 1, verse: 5, ref_raw: "1:5" }, { chapter: 2, verse: 5 }),
+  hasLeftNoteVerse({ book: "ZEC", chapter: 1, verse: 5, ref_raw: "1:5" }, { book: "ZEC", chapter: 2, verse: 5 }),
   "same verse number, different chapter → has left",
 );
+
+assert(
+  hasLeftNoteVerse(
+    { book: "ZEC", chapter: 1, verse: 1, ref_raw: "1:1" },
+    { book: "HAG", chapter: 1, verse: 1 },
+  ),
+  "same chapter:verse in a DIFFERENT book → has left (App keys Shell by book, so 1:1 → 1:1 is a real move)",
+);
+
+// locationFromHash — the only signal that survives the book-change remount.
+assert(
+  JSON.stringify(locationFromHash("#/ZEC/3/4")) ===
+    JSON.stringify({ book: "ZEC", chapter: 3, verse: 4 }),
+  "a full route hash parses to a location",
+);
+assert(
+  JSON.stringify(locationFromHash("#/ZEC/3/4?c=12")) ===
+    JSON.stringify({ book: "ZEC", chapter: 3, verse: 4 }),
+  "a comment deep-link suffix does not disturb the location",
+);
+assert(locationFromHash("#/ZEC/3") === null, "a partial hash yields no opinion (null)");
+assert(locationFromHash("") === null, "an empty hash yields no opinion (null)");
 
 if (failed) {
   console.error(`\n${failed} assertion(s) failed`);

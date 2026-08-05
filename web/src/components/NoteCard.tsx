@@ -47,6 +47,7 @@ import { TCM, buildSH } from "../lib/noteTemplates";
 import {
   hasLeftNoteVerse,
   isAbandonedBlankStub,
+  locationFromHash,
   wouldBlankExistingNote,
   type ActiveLocation,
 } from "../lib/noteGuard";
@@ -789,6 +790,23 @@ function NoteCardInner({
     handleDelete({ blankStub: true });
   };
 
+  // "Has the user left this note?" — the union of two conservative signals,
+  // because neither one alone sees every navigation:
+  //  - activeLocRef: accurate for every move WITHIN a book (verse, chapter),
+  //    including the per-verse-mode unmount, but blind to a book change —
+  //    App renders `<Shell key={loc.book}>`, so a book change destroys this
+  //    whole subtree and the dying instance's ref still holds the OLD book.
+  //  - the URL hash: lives outside React and is already the new route by the
+  //    time teardown runs, so it is what catches the book change. Returns null
+  //    (no opinion) for a hash that isn't a full book/chapter/verse route.
+  // Both must say "still here" to skip the discard, so a remount that moves
+  // nothing — toggling the pin layout — still leaves the stub alone.
+  const hasLeftNoteTarget = (row_: TnRow, loc: ActiveLocation) => {
+    if (hasLeftNoteVerse(row_, loc)) return true;
+    const fromHash = locationFromHash(window.location.hash);
+    return fromHash !== null && hasLeftNoteVerse(row_, fromHash);
+  };
+
   // MOUNTED path: book mode keeps every chapter note mounted regardless of
   // scroll, so a verse change never unmounts this card — it only deactivates
   // (or, rarely, leaves `active` untouched; verseActive is the reactive
@@ -797,7 +815,7 @@ function NoteCardInner({
   useEffect(() => {
     if (active) return;
     if (!wasActiveRef.current) return;
-    if (!hasLeftNoteVerse(row, activeLocRef.current)) return;
+    if (!hasLeftNoteTarget(row, activeLocRef.current)) return;
     discardIfAbandonedStubRef.current();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [active, verseActive, draftReadOk]);
@@ -811,7 +829,7 @@ function NoteCardInner({
   useEffect(() => {
     return () => {
       if (!wasActiveRef.current) return;
-      if (!hasLeftNoteVerse(rowAtUnmountRef.current, activeLocRef.current)) return;
+      if (!hasLeftNoteTarget(rowAtUnmountRef.current, activeLocRef.current)) return;
       discardIfAbandonedStubRef.current();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps

@@ -375,8 +375,8 @@ export function ResourceColumn({
   // its own props are stale by the time its unmount cleanup runs — reading a
   // parent ref that was already updated during the parent's render is the
   // only way that cleanup can see the NEW location.
-  const activeLocRef = useRef<ActiveLocation>({ chapter, verse: activeVerse });
-  activeLocRef.current = { chapter, verse: activeVerse };
+  const activeLocRef = useRef<ActiveLocation>({ book, chapter, verse: activeVerse });
+  activeLocRef.current = { book, chapter, verse: activeVerse };
 
   const [pinned, setPinned] = useState<Pinned>(() => loadPinned());
   const togglePinned = (k: PinKey) => {
@@ -1135,7 +1135,7 @@ export function ResourceColumn({
           // the displayed verse moves even in the rare case `active` itself
           // doesn't change. The authoritative leave-check inside NoteCard
           // still reads activeLocRef.current, not this value directly.
-          verseActive={!hasLeftNoteVerse(r, { chapter, verse: activeVerse })}
+          verseActive={!hasLeftNoteVerse(r, { book, chapter, verse: activeVerse })}
           // Only the active-match note needs the query (it's the only one that
           // renders the highlight read view) — scoping it here keeps a find
           // keystroke from re-rendering every note card.
