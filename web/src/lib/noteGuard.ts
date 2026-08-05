@@ -13,6 +13,8 @@
 // The check lives here as a pure function so it can be unit-tested and shared
 // by the client guard (NoteCard) and, in spirit, the API backstop.
 
+import { noteCoveredVerses } from "./verseRange.ts";
+
 // A note body is "blank" for save/export purposes if — after converting the
 // TSV line-break escape (literal backslash-n, two chars) to a real newline —
 // it trims to nothing: empty, whitespace-only, or only line breaks. All of
@@ -109,4 +111,31 @@ export function isAbandonedBlankStub(
     isBlankNoteText(local.quote) &&
     isBlankNoteText(local.supportRef);
   return rowEmpty && localEmpty;
+}
+
+// ---------- "did the user leave the verse?" ----------
+//
+// The discard above is scoped to leaving the verse, not to the card losing
+// focus. Focus loss alone was the original trigger and it was wrong: clicking
+// anywhere else on the page — including elsewhere on the SAME verse, to copy
+// some text — trashed the stub out from under the user.
+
+// Where the user's focus currently is.
+export interface ActiveLocation {
+  chapter: number;
+  verse: number;
+}
+
+// True when `loc` is outside the verse(s) a tn/tq row covers — i.e. the user
+// has navigated off this note's verse, or off the chapter entirely.
+//
+// Unlike scripture rows, tn/tq rows have no verse_end column — a bridge (e.g.
+// "1:6-9") lives only in `ref_raw`, so coverage is resolved via
+// noteCoveredVerses (the same helper noteOverlapsRange uses for display).
+export function hasLeftNoteVerse(
+  row: { chapter: number; verse: number; ref_raw?: string | null },
+  loc: ActiveLocation,
+): boolean {
+  if (loc.chapter !== row.chapter) return true;
+  return !noteCoveredVerses(row).includes(loc.verse);
 }

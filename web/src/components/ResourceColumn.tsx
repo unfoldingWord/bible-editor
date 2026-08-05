@@ -11,6 +11,7 @@ import { TwlSuggestions } from "./TwlSuggestions";
 import { QuestionsTable } from "./QuestionsTable";
 import { AlignmentPanel, type AlignmentPanelHandle } from "./AlignmentPanel";
 import { noteOverlapsRange } from "../lib/verseRange";
+import { hasLeftNoteVerse, type ActiveLocation } from "../lib/noteGuard";
 import { canonicalTwlOrder, twlDisplayOrder } from "../lib/twlCanonicalOrder";
 import { useCatalogs } from "../hooks/useCatalogs";
 import CheckIcon from "@mui/icons-material/Check";
@@ -367,6 +368,16 @@ export function ResourceColumn({
   commentCountsForRow,
   onOpenRowComments,
 }: Props) {
+  // Where the user's focus currently is, mirrored into a ref for NoteCard's
+  // abandoned-blank-stub discard (see hasLeftNoteVerse in noteGuard.ts).
+  // Written during render, not in an effect: in per-verse mode the card for
+  // the OLD verse unmounts in the same commit that changes activeVerse, so
+  // its own props are stale by the time its unmount cleanup runs — reading a
+  // parent ref that was already updated during the parent's render is the
+  // only way that cleanup can see the NEW location.
+  const activeLocRef = useRef<ActiveLocation>({ chapter, verse: activeVerse });
+  activeLocRef.current = { chapter, verse: activeVerse };
+
   const [pinned, setPinned] = useState<Pinned>(() => loadPinned());
   const togglePinned = (k: PinKey) => {
     const next = { ...pinned, [k]: !pinned[k] };
@@ -1118,6 +1129,13 @@ export function ResourceColumn({
         <NoteCard
           row={r}
           active={r.id === activeNoteId}
+          activeLocRef={activeLocRef}
+          // Reactive trigger for the mounted-path discard effect: recomputed
+          // every render from chapter/activeVerse, so the effect re-fires when
+          // the displayed verse moves even in the rare case `active` itself
+          // doesn't change. The authoritative leave-check inside NoteCard
+          // still reads activeLocRef.current, not this value directly.
+          verseActive={!hasLeftNoteVerse(r, { chapter, verse: activeVerse })}
           // Only the active-match note needs the query (it's the only one that
           // renders the highlight read view) — scoping it here keeps a find
           // keystroke from re-rendering every note card.

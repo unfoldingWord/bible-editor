@@ -6,6 +6,7 @@
 // block the silent overwrite.
 
 import {
+  hasLeftNoteVerse,
   isAbandonedBlankStub,
   isBlankNoteText,
   wouldBlankExistingNote,
@@ -168,6 +169,31 @@ assert(
 assert(
   !isAbandonedBlankStub(stub({ note: fullNote }), { ...emptyLocal, note: fullNote }),
   "a real note is never a stub",
+);
+
+// ── hasLeftNoteVerse — scopes the discard to "left the verse", not "lost
+// focus of the note" (the bug this PR fixes: clicking elsewhere on the page
+// while still on the same verse used to trash the stub).
+
+assert(
+  !hasLeftNoteVerse({ chapter: 1, verse: 5, ref_raw: "1:5" }, { chapter: 1, verse: 5 }),
+  "same verse → has not left",
+);
+assert(
+  hasLeftNoteVerse({ chapter: 1, verse: 5, ref_raw: "1:5" }, { chapter: 1, verse: 6 }),
+  "different verse, same chapter → has left",
+);
+assert(
+  !hasLeftNoteVerse({ chapter: 1, verse: 6, ref_raw: "1:6-9" }, { chapter: 1, verse: 8 }),
+  "verse inside a bridged span (6-9) → has not left",
+);
+assert(
+  hasLeftNoteVerse({ chapter: 1, verse: 6, ref_raw: "1:6-9" }, { chapter: 1, verse: 10 }),
+  "verse just outside a bridged span (6-9) → has left",
+);
+assert(
+  hasLeftNoteVerse({ chapter: 1, verse: 5, ref_raw: "1:5" }, { chapter: 2, verse: 5 }),
+  "same verse number, different chapter → has left",
 );
 
 if (failed) {
