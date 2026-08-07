@@ -97,7 +97,13 @@ t("\\ts\\* after \\b reordered to \\b before \\ts\\*", () => {
 });
 
 t("idempotent", () => {
-  const src = `${HDR}\\v 14 \\w x\\w*.\n\\p \\ts\\*\n\\v 15 \\w y\\w*. \\v 16 \\w z\\w*\n\\ts\\*\n\\b\n\\q1 \\v 17 \\w q\\w*\n`;
+  // Includes a \c and a dangling \v immediately followed by \ts\* — exactly
+  // the shapes that were non-idempotent before the conservative-walk fix
+  // (defects 1-3): a dangling \v next to \c/\ts\* must abort untouched on
+  // every pass, not just the first.
+  const src =
+    `${HDR}\\c 1\n\\v 14 \\w x\\w*.\n\\p \\ts\\*\n\\v 15 \\w y\\w*. \\v 16 \\w z\\w*\n` +
+    `\\ts\\*\n\\b\n\\q1 \\v 17 \\w q\\w*\n\\v 18\n\\ts\\*\n\\c 2\n\\q1 \\v 1 \\w n\\w*\n`;
   const once = norm(src);
   assert.equal(norm(once), once);
 });
@@ -252,10 +258,13 @@ t("marker glued directly to \\zaln-s gets a space inserted", () => {
 });
 
 t("\\ts\\* and \\qs\\* are not corrupted by the glued-marker space fix", () => {
-  const out = norm(`${HDR}\\v 1 \\w a\\w*.\n\\ts\\*\n\\c 2\n\\q1 \\v 1 \\w b\\w*\n`);
+  const out = norm(
+    `${HDR}\\v 1 \\w a\\w*.\n\\ts\\*\n\\c 2\n\\q1 \\v 1 \\w b\\w*\\qs Selah\\qs\\*\n`,
+  );
   assert.ok(out.includes("\\ts\\*"), "\\ts\\* remains intact");
   assert.ok(!out.includes("\\ts \\*"), "no space was inserted inside \\ts\\*'s star");
-  assert.ok(!out.includes("\\qs \\*"), "no space would be inserted inside a \\qs\\* either");
+  assert.ok(out.includes("\\qs Selah\\qs\\*"), "\\qs\\* remains intact");
+  assert.ok(!out.includes("\\qs \\*"), "no space was inserted inside \\qs\\*'s star");
 });
 
 // ── Change 2: doubled leading marker on one line collapses ─────────────────
@@ -276,6 +285,42 @@ t("doubled leading marker on one line collapses instead of splitting", () => {
   );
 });
 
+// ── Defect 5: collapseDuplicateLeadingMarker narrowed ──────────────────────
+// A naive "any marker family, any following content" collapse also mangled
+// `\s1 \s1 Heading` -> `\s1 Heading` (deletes a heading!) and `\q1 \q1 text`
+// -> `\q1 text` (deletes a legitimately blank poetry line before real text),
+// and only handled exactly 2 repeats, not 3+. Narrowed to: attachable poetry
+// family only, and only when a \v follows the doubled marker.
+
+t("triple-doubled leading marker (3 repeats) collapses to one", () => {
+  const ls = lines(`${HDR}\\q1 \\q1 \\q1 \\v 1 \\w a\\w*\n`);
+  assert.ok(
+    ls.some((l) => l.trim() === "\\q1 \\v 1 \\w a\\w*"),
+    "collapses all the way down to a single \\q1 \\v 1 line",
+  );
+  assert.equal(ls.filter((l) => l.trim() === "\\q1").length, 0);
+});
+
+t("\\s1 \\s1 Heading is left alone (not a poetry marker, no collapse)", () => {
+  const out = norm(`${HDR}\\c 1\n\\s1 \\s1 Heading\n\\p\n\\v 1 \\w a\\w*\n`);
+  assert.ok(out.includes("\\s1 \\s1 Heading"), "doubled \\s1 heading left completely intact");
+});
+
+t("\\q1 \\q1 text (no \\v) is left alone — a real blank poetry line, not doubling", () => {
+  // collapseDuplicateLeadingMarker must NOT touch this (no \v follows the
+  // doubled marker), so splitMidlinePoetryMarkers runs its normal job on it:
+  // an empty \q1 poetry line, then a second \q1 poetry line carrying the
+  // text — two rendered lines, not one collapsed line.
+  const ls = lines(`${HDR}\\q1 \\q1 text\n`);
+  assert.ok(ls.some((l) => l.trim() === "\\q1"), "the empty leading \\q1 line is preserved");
+  assert.ok(ls.some((l) => l.trim() === "\\q1 text"), "the second \\q1 line keeps its text");
+  assert.equal(
+    ls.filter((l) => l.trim() === "\\q1" || l.trim() === "\\q1 text").length,
+    2,
+    "both \\q1 lines present — nothing collapsed",
+  );
+});
+
 // ── Change 3: a dangling \v N line joins forward to its content ────────────
 // The biggest rule: Rich fixed 680 of these on 2026-08-07 (659 in NUM alone);
 // we currently produce 14 on en_ust master. joinDanglingVerses runs after
@@ -291,7 +336,7 @@ t("dangling \\v: the \\v line's own marker wins over a different marker on the t
   assert.ok(ls.some((l) => l.trim() === "\\q1 \\v 11 \\w a\\w*"));
 });
 
-t("dangling \\v: no marker on either side merges to just \\v N + text", () => {
+t("dangling \\v: target line has no marker, the \\v line's marker is used", () => {
   const ls = lines(`${HDR}\\q1 \\v 3\n“text”\n`);
   assert.ok(ls.some((l) => l.trim() === "\\q1 \\v 3 “text”"));
 });
@@ -323,6 +368,47 @@ t("dangling \\v: a marker-only line (\\p) between \\v and its text is kept on it
     ls.slice(pIdx + 1).some((l) => l.trim() === "\\v 11 “text”"),
     "\\v 11 joined to its text after \\p",
   );
+});
+
+// ── Defects 1-4: the forward walk must be conservative and bounded ────────
+// Each of these was demonstrated with an executed counter-example against the
+// pre-fix code: the walk merged a verse into the WRONG verse (defect 1),
+// crossed a chapter boundary (defect 2), absorbed a heading/psalm-title with
+// zero validator complaint (defect 3), and had no header guard so a \v in the
+// header could be hoisted and could swallow the header-terminating blank
+// line (defect 4).
+
+t("defect 1: an empty verse followed by the next chapter is NOT merged into it", () => {
+  const out = norm(
+    `${HDR}\\c 1\n\\p\n\\v 9 t\n\\v 10\n\\c 2\n\\p\n\\v 1 next\n`,
+  );
+  assert.ok(
+    !out.split("\n").some((l) => (l.match(/\\v\s+\d/g) || []).length > 1),
+    "no output line contains two \\v markers",
+  );
+  assert.match(out, /\\v 10\n/, "verse 1:10 stays dangling, not merged into chapter 2");
+  assert.match(out, /\\c 2\n\\p\n\\v 1 next/, "chapter 2's \\v 1 is untouched");
+});
+
+t("defect 2: a \\v at the end of a chapter followed by \\ts\\*/\\c is NOT merged", () => {
+  const out = norm(`${HDR}\\c 1\n\\p\n\\v 20\n\\ts\\*\n\\c 2\n\\p\n\\v 1 t\n`);
+  assert.match(out, /\\v 20\n/, "\\v 20 stays dangling, untouched");
+  assert.match(out, /\\ts\\\*\n\\c 2\n\\p\n\\v 1 t/, "\\ts\\*/\\c 2/\\p stay exactly where they were");
+});
+
+t("defect 3: a \\v followed by \\s1 is NOT merged; same for \\d", () => {
+  const outS1 = norm(`${HDR}\\v 5\n\\s1 A Section Heading\n\\p\n\\v 6 t\n`);
+  assert.match(outS1, /\\v 5\n\\s1 A Section Heading\n/, "\\v 5 stays dangling, heading untouched");
+
+  const outD = norm(`${HDR}\\c 1\n\\v 5\n\\d A Psalm Title\n\\v 6 t\n`);
+  assert.match(outD, /\\v 5\n\\d A Psalm Title\n/, "\\v 5 stays dangling, psalm title untouched");
+});
+
+t("defect 4: a \\v in the header region is untouched, and the header-terminating blank line survives", () => {
+  const src = "\\id 1CH\n\\usfm 3.0\n\\v 1\n\\h x\n\n\\c 1\n\\p\n\\v 1 \\w a\\w*\n";
+  const out = norm(src);
+  assert.ok(out.startsWith("\\id 1CH\n\\usfm 3.0\n\\v 1\n\\h x\n\n"), "header region, including the stray \\v, is untouched verbatim");
+  assert.match(out, /\\h x\n\n\\c 1\n\\p\n/, "the header-terminating blank line survives, so \\c still gets its own blank-line treatment");
 });
 
 // ── Change 4: runs of 2+ blank lines collapse to one ────────────────────────
@@ -364,12 +450,59 @@ t("regression guard: consecutive \\p still collapses to one", () => {
 
 t("idempotent across all five new rules together", () => {
   const src =
-    `${HDR}\\q2\\zaln-s |x-strong="H0001"\\*\\w A\\w*\\zaln-e\\*\n` +
+    `${HDR}\\c 1\n` +
+    `\\q2\\zaln-s |x-strong="H0001"\\*\\w A\\w*\\zaln-e\\*\n` +
     `\\q1 \\q1 \\v 1 \\w a\\w*\n` +
     `\\b\n\\v 2\n\n\\p\n\\w b\\w*\n` +
-    `\n\n\n\\q1 \\v 3\n\\q1 \\w c\\w*`;
+    `\n\n\n\\q1 \\v 3\n\\q1 \\w c\\w*\n` +
+    // dangling \v abutting \ts\*/\c — the defect-1/2 shape — folded into the
+    // same composite so idempotence is proven for it too.
+    `\\v 4\n\\ts\\*\n\\c 2\n\\q1 \\v 1 \\w d\\w*`;
   const once = norm(src);
   assert.equal(norm(once), once, "second normalization pass is a no-op");
+});
+
+// ── Invariant: a merge must never produce a line with two \v markers ───────
+// Runs the "no output line contains two \v" check over every non-trivial
+// input used elsewhere in this file, not just the defect-1 case that
+// motivated it.
+const INVARIANT_INPUTS = [
+  `${HDR}\\c 1\n\\p\n\\v 9 t\n\\v 10\n\\c 2\n\\p\n\\v 1 next\n`,
+  `${HDR}\\c 1\n\\p\n\\v 20\n\\ts\\*\n\\c 2\n\\p\n\\v 1 t\n`,
+  `${HDR}\\v 5\n\\s1 A Section Heading\n\\p\n\\v 6 t\n`,
+  `${HDR}\\c 1\n\\v 5\n\\d A Psalm Title\n\\v 6 t\n`,
+  "\\id 1CH\n\\usfm 3.0\n\\v 1\n\\h x\n\n\\c 1\n\\p\n\\v 1 \\w a\\w*\n",
+  `${HDR}\\q1 \\v 3\n\\q1 \\w a\\w*\n`,
+  `${HDR}\\q1 \\v 11\n\\q2 \\w a\\w*\n`,
+  `${HDR}\\b\n\\v 10\n\\q1 \\w a\\w*\n`,
+  `${HDR}\\v 11\n\n\\p\n“text”\n`,
+  `${HDR}\\v 28 \\w Ishmael\\w*. \\v 29 \\w These\\w*\n`,
+  `${HDR}\\q1 \\v 1 \\w a\\w* \\q2 \\v 2 \\w b\\w*\n`,
+  `${HDR}\\c 1\n\\q2\\zaln-s |x-strong="H0001"\\*\\w A\\w*\\zaln-e\\*\n\\q1 \\q1 \\v 1 \\w a\\w*\n\\b\n\\v 2\n\n\\p\n\\w b\\w*\n\n\n\n\\q1 \\v 3\n\\q1 \\w c\\w*\n\\v 4\n\\ts\\*\n\\c 2\n\\q1 \\v 1 \\w d\\w*`,
+  `${HDR}\\p\n\\v 1\n\n\\q1 \\v 2 \\w x\\w*\n`,
+];
+
+// A verse line normally carries its paragraph marker FIRST (`\q1 \v 2 …`), so
+// the abort test for "another \v" has to be unanchored. An anchored `^\\v`
+// check misses this shape entirely and the join emits `\q1 \v 1 \v 2 …` — two
+// verses on one line, which validateUsfm rejects, withholding the whole book
+// from export. Caught only after the earlier fix, because every other
+// two-verse case in this file puts the second `\v` at the start of its line.
+t("a dangling \\v does not merge into a MARKER-PREFIXED verse line", () => {
+  const out = norm(`${HDR}\\p\n\\v 1\n\n\\q1 \\v 2 \\w x\\w*\n`);
+  assert.ok(!/\\v 1 \\v 2/.test(out), `verses merged onto one line: ${JSON.stringify(out)}`);
+  assert.ok(out.includes("\\v 1"), "the dangling \\v 1 must survive untouched");
+  assert.ok(out.includes("\\q1 \\v 2 \\w x\\w*"), "the target verse line must be unchanged");
+});
+
+t("invariant: no output line ever contains two \\v markers", () => {
+  for (const src of INVARIANT_INPUTS) {
+    const out = norm(src);
+    for (const l of out.split("\n")) {
+      const vCount = (l.match(/\\v\s+\d/g) || []).length;
+      assert.ok(vCount <= 1, `line has ${vCount} \\v markers: ${JSON.stringify(l)}`);
+    }
+  }
 });
 
 console.log(`\n${passed} usfmFormat tests passed`);
