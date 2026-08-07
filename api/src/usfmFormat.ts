@@ -305,7 +305,9 @@ function isCrossableMarkerLine(line: string): boolean {
 // letters (`\qa`) and speaker/major-section headings do exist in the corpus, so
 // this is guarded rather than left to chance.
 const ABORT_LEADING_RE =
-  /^(?:\\sr|\\s[1-5]?|\\r|\\ms[1-3]?|\\ms\\\*|\\mr|\\d|\\qa|\\qc|\\qr|\\qd|\\sp|\\cl)(?![A-Za-z0-9])/;
+  // `\ms\*` needs no branch of its own: `\\ms[1-3]?` already matches the `\ms`
+  // with the digit absent, and the lookahead is satisfied by the following `\`.
+  /^(?:\\sr|\\s[1-5]?|\\r|\\ms[1-3]?|\\mr|\\d|\\qa|\\qc|\\qr|\\qd|\\sp|\\cl)(?![A-Za-z0-9])/;
 
 function isAbortLine(line: string): boolean {
   const s = line.trim();
@@ -319,7 +321,9 @@ function isAbortLine(line: string): boolean {
   if (CHAPTER_RE.test(s)) return true;
   if (s === "\\ts\\*") return true;
   if (s === "\\b") return true;
-  return ABORT_LEADING_RE.test(s); // \s / \s1-\s5 / \sr / \r / \ms\* / \mr / \d
+  // headings and titles: \s / \s1-\s5 / \sr / \r / \ms / \ms1-3 / \ms\* / \mr /
+  // \d / \qa / \qc / \qr / \qd / \sp / \cl
+  return ABORT_LEADING_RE.test(s);
 }
 
 // usfm-js sometimes emits a `\v N` with no verse text on its own line, the
