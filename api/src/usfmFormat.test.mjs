@@ -488,6 +488,31 @@ const INVARIANT_INPUTS = [
 // verses on one line, which validateUsfm rejects, withholding the whole book
 // from export. Caught only after the earlier fix, because every other
 // two-verse case in this file puts the second `\v` at the start of its line.
+// `\qa` (acrostic letter) and friends live in POETRY_MARKER_ALTERNATION, so
+// without an explicit abort the join peels the marker off and hoists the verse
+// number INTO the heading — `\qa \v 1 Aleph` makes "Aleph" verse 1's first word,
+// and no validator complains. Unreachable in today's data, guarded anyway.
+for (const [marker, text] of [
+  ["\\qa", "Aleph"],
+  ["\\sp", "David"],
+  ["\\ms1", "Book One"],
+  ["\\cl", "Chapter"],
+]) {
+  t(`a dangling \\v never merges into a ${marker} heading`, () => {
+    const out = norm(`${HDR}\\p\n\\v 1\n${marker} ${text}\n\\q1 \\w one\\w*\n`);
+    assert.ok(
+      !new RegExp(`\\${marker}\\s+\\\\v 1`).test(out),
+      `verse hoisted into the ${marker} heading: ${JSON.stringify(out)}`,
+    );
+    assert.ok(out.includes(`${marker} ${text}`), `${marker} heading must be left intact`);
+  });
+}
+
+t("a body opening with a 3-blank run keeps exactly one blank", () => {
+  const out = norm(`${HDR}\n\n\\p\n\\v 1 \\w a\\w*\n`);
+  assert.ok(!/\n\n\n/.test(out), `more than one consecutive blank survived: ${JSON.stringify(out)}`);
+});
+
 t("a dangling \\v does not merge into a MARKER-PREFIXED verse line", () => {
   const out = norm(`${HDR}\\p\n\\v 1\n\n\\q1 \\v 2 \\w x\\w*\n`);
   assert.ok(!/\\v 1 \\v 2/.test(out), `verses merged onto one line: ${JSON.stringify(out)}`);

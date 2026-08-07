@@ -298,7 +298,17 @@ function isCrossableMarkerLine(line: string): boolean {
 // matched by leading marker instead, whatever text follows them. Another `\v`
 // line (dangling or not) always aborts too — a join must never swallow a
 // second verse.
-const ABORT_LEADING_RE = /^(?:\\sr|\\s[1-5]?|\\r|\\ms\\\*|\\mr|\\d)(?![A-Za-z0-9])/;
+// `\qa`/`\qc`/`\qr`/`\qd` are in POETRY_MARKER_ALTERNATION, so without an
+// explicit abort they are worse than merely crossable: stripLeadingAttachableMarker
+// peels them off and the join hoists the verse number INTO the heading —
+// `\v 1` + `\qa Aleph` becomes `\qa \v 1 Aleph`, making "Aleph" the first word of
+// verse 1. Same silent-corruption class as the `\s1`/`\d` case (no validator
+// complains). Not reachable in today's data — a sweep of all 144 corpus books
+// through the real render path found zero such adjacencies — but the acrostic
+// letters (`\qa`) and speaker/major-section headings do exist in the corpus, so
+// this is guarded rather than left to chance.
+const ABORT_LEADING_RE =
+  /^(?:\\sr|\\s[1-5]?|\\r|\\ms[1-3]?|\\ms\\\*|\\mr|\\d|\\qa|\\qc|\\qr|\\qd|\\sp|\\cl)(?![A-Za-z0-9])/;
 
 function isAbortLine(line: string): boolean {
   const s = line.trim();
@@ -578,7 +588,13 @@ function collapseBlankRuns(lines: string[]): string[] {
   for (const line of lines) {
     if (inHeader) {
       out.push(line);
-      if (line.trim() === "") inHeader = false;
+      // The header-terminating blank IS a blank line: seed prevBlank from it, or
+      // a body that opens with more blanks keeps one too many (a 3-blank run
+      // after the header collapsed to 2, not 1).
+      if (line.trim() === "") {
+        inHeader = false;
+        prevBlank = true;
+      }
       continue;
     }
     const isBlank = line.trim() === "";
