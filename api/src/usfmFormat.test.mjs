@@ -118,8 +118,8 @@ t("mid-line \\q2 (no preceding newline, no following \\v) breaks onto its own li
   const ls = lines(
     `${HDR}\\q1 \\v 15 \\w Even\\w*\n\\q2 \\w text\\w*\\zaln-e\\*\\w wealth\\w*\\zaln-e\\*,\\q2\\zaln-s |x-strong="H1931"\\*\\w and\\w*\n`,
   );
-  const q2Idx = ls.findIndex((l) => l.startsWith("\\q2\\zaln-s"));
-  assert.ok(q2Idx > 0, "second \\q2 starts its own line");
+  const q2Idx = ls.findIndex((l) => l.startsWith("\\q2 \\zaln-s"));
+  assert.ok(q2Idx > 0, "second \\q2 starts its own line, with a space before \\zaln-s");
   assert.ok(ls[q2Idx - 1].endsWith(","), "preceding line keeps its own content, ending at the comma");
 });
 
@@ -235,6 +235,141 @@ t("malformed \\ts* pile collapses too (repaired then deduped)", () => {
   // Editor emits the malformed `\ts*`; repairTsStar normalizes each to `\ts\*`
   // before the collapse, so a malformed pile heals identically to a well-formed one.
   assert.equal(tsCount(`${HDR}\\c 1\n\\v 1 \\w a\\w*.\n\\ts*\n\\ts*\n\\ts*\n\\c 2\n\\v 1 \\w b\\w*\n`), 1);
+});
+
+// ── Change 1: marker glued to the following marker gets a space ────────────
+// usfm-js's own line-builder omits the space before a `w`/`k`/`zaln` tag
+// (jsonToUsfm.js:244-247), e.g. `\q2\zaln-s |x-strong=...`. Verified at scale:
+// 748 occurrences on en_ust master (`\q2` x461, `\q1` x287). Rich fixed the
+// en_ult analog in commit 543e3ee9 (2026-08-05); our export re-broke it.
+
+t("marker glued directly to \\zaln-s gets a space inserted", () => {
+  const ls = lines(`${HDR}\\q2\\zaln-s |x-strong="H0001"\\*\\w A\\w*\\zaln-e\\*\n`);
+  assert.ok(
+    ls.some((l) => l.startsWith('\\q2 \\zaln-s |x-strong="H0001"')),
+    "space restored between \\q2 and \\zaln-s",
+  );
+});
+
+t("\\ts\\* and \\qs\\* are not corrupted by the glued-marker space fix", () => {
+  const out = norm(`${HDR}\\v 1 \\w a\\w*.\n\\ts\\*\n\\c 2\n\\q1 \\v 1 \\w b\\w*\n`);
+  assert.ok(out.includes("\\ts\\*"), "\\ts\\* remains intact");
+  assert.ok(!out.includes("\\ts \\*"), "no space was inserted inside \\ts\\*'s star");
+  assert.ok(!out.includes("\\qs \\*"), "no space would be inserted inside a \\qs\\* either");
+});
+
+// ── Change 2: doubled leading marker on one line collapses ─────────────────
+// `\q1 \q1 \v 1 …` must collapse to `\q1 \v 1 …` BEFORE splitMidlinePoetry
+// Markers runs, or it gets split into two lines (`\q1` alone, then
+// `\q1 \v 1 …`) — worse than the original doubling.
+
+t("doubled leading marker on one line collapses instead of splitting", () => {
+  const ls = lines(`${HDR}\\q1 \\q1 \\v 1 \\w a\\w*\n`);
+  assert.ok(
+    ls.some((l) => l.trim() === "\\q1 \\v 1 \\w a\\w*"),
+    "single \\q1 \\v 1 line, not split",
+  );
+  assert.equal(
+    ls.filter((l) => l.trim() === "\\q1").length,
+    0,
+    "no standalone duplicate \\q1 line left behind",
+  );
+});
+
+// ── Change 3: a dangling \v N line joins forward to its content ────────────
+// The biggest rule: Rich fixed 680 of these on 2026-08-07 (659 in NUM alone);
+// we currently produce 14 on en_ust master. joinDanglingVerses runs after
+// reorderMarkerRuns and before collapseConsecutiveParagraphMarkers.
+
+t("dangling \\v: duplicate marker on the target line is dropped for the \\v line's own marker", () => {
+  const ls = lines(`${HDR}\\q1 \\v 3\n\\q1 \\w a\\w*\n`);
+  assert.ok(ls.some((l) => l.trim() === "\\q1 \\v 3 \\w a\\w*"), "merged, no duplicate \\q1");
+});
+
+t("dangling \\v: the \\v line's own marker wins over a different marker on the target", () => {
+  const ls = lines(`${HDR}\\q1 \\v 11\n\\q2 \\w a\\w*\n`);
+  assert.ok(ls.some((l) => l.trim() === "\\q1 \\v 11 \\w a\\w*"));
+});
+
+t("dangling \\v: no marker on either side merges to just \\v N + text", () => {
+  const ls = lines(`${HDR}\\q1 \\v 3\n“text”\n`);
+  assert.ok(ls.some((l) => l.trim() === "\\q1 \\v 3 “text”"));
+});
+
+t("dangling \\v: target's own marker moves above the verse when the \\v line has none", () => {
+  const ls = lines(`${HDR}\\b\n\\v 10\n\\q1 \\w a\\w*\n`);
+  assert.ok(ls.some((l) => l.trim() === "\\b"), "\\b kept on its own line");
+  assert.ok(
+    ls.some((l) => l.trim() === "\\q1 \\v 10 \\w a\\w*"),
+    "\\q1 moved above the verse number",
+  );
+});
+
+t("dangling \\v: neither side has a marker", () => {
+  const ls = lines(`${HDR}\\v 3\n“text”\n`);
+  assert.ok(ls.some((l) => l.trim() === "\\v 3 “text”"));
+});
+
+t("dangling \\v: blank lines before the target are deleted", () => {
+  const out = norm(`${HDR}\\v 2 \n\n\n“text”\n`);
+  assert.equal(out, `${HDR}\\v 2 “text”\n`, "pending blanks before the target are gone, not just skipped over");
+});
+
+t("dangling \\v: a marker-only line (\\p) between \\v and its text is kept on its own line", () => {
+  const ls = lines(`${HDR}\\v 11\n\n\\p\n“text”\n`);
+  const pIdx = ls.indexOf("\\p");
+  assert.ok(pIdx > 0, "\\p kept on its own line");
+  assert.ok(
+    ls.slice(pIdx + 1).some((l) => l.trim() === "\\v 11 “text”"),
+    "\\v 11 joined to its text after \\p",
+  );
+});
+
+// ── Change 4: runs of 2+ blank lines collapse to one ────────────────────────
+
+t("a run of consecutive blank lines collapses to exactly one", () => {
+  const out = norm(`${HDR}\\v 1 \\w a\\w*.\n\n\n\n\\p\n\\v 2 \\w b\\w*\n`);
+  assert.ok(!/\n\n\n/.test(out), "no run of 2+ blank lines remains");
+  assert.match(out, /\\w a\\w\*\.\n\n\\p\n/);
+});
+
+// ── Change 5: exactly one trailing newline, always ──────────────────────────
+
+t("output always ends with exactly one trailing newline, even with no input newline", () => {
+  const out = norm(`${HDR}\\v 1 \\w a\\w*`);
+  assert.ok(out.endsWith("\n") && !out.endsWith("\n\n"), "exactly one trailing newline");
+});
+
+t("output collapses multiple trailing input newlines to exactly one", () => {
+  const out = norm(`${HDR}\\v 1 \\w a\\w*\n\n\n`);
+  assert.ok(out.endsWith("\n") && !out.endsWith("\n\n"), "exactly one trailing newline");
+});
+
+// ── Regression guards: pre-existing logic left unchanged by this pass ──────
+
+t("regression guard: \\ts\\* after \\b still reorders to \\b before \\ts\\*", () => {
+  const ls = lines(`${HDR}\\v 4 \\w x\\w*.\n\\ts\\*\n\\b\n\\q1 \\v 5 \\w y\\w*\n`);
+  const bIdx = ls.indexOf("\\b");
+  const tsIdx = ls.indexOf("\\ts\\*");
+  assert.ok(bIdx < tsIdx, "\\b still comes before \\ts\\*");
+});
+
+t("regression guard: consecutive \\p still collapses to one", () => {
+  const out = norm(`${HDR}\\c 8\n\\p\n\\p\n\\v 1 \\w a\\w*\n`);
+  assert.equal((out.match(/^\\p$/gm) || []).length, 1, "still collapses to a single \\p");
+});
+
+// ── Idempotence across all five new rules together ──────────────────────────
+// This matters — the function runs on every nightly export.
+
+t("idempotent across all five new rules together", () => {
+  const src =
+    `${HDR}\\q2\\zaln-s |x-strong="H0001"\\*\\w A\\w*\\zaln-e\\*\n` +
+    `\\q1 \\q1 \\v 1 \\w a\\w*\n` +
+    `\\b\n\\v 2\n\n\\p\n\\w b\\w*\n` +
+    `\n\n\n\\q1 \\v 3\n\\q1 \\w c\\w*`;
+  const once = norm(src);
+  assert.equal(norm(once), once, "second normalization pass is a no-op");
 });
 
 console.log(`\n${passed} usfmFormat tests passed`);

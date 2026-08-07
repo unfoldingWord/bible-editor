@@ -54,6 +54,35 @@ const POETRY_PREFIX_RE = new RegExp(
   "g",
 );
 
+// usfm-js's own line-builder (jsonToUsfm.js) deliberately omits the space
+// between a marker and an immediately-following `w`/`k`/`zaln` tag, e.g.
+// `\q2\zaln-s |x-strong="H1"\*…`. DCS Check 8 requires the space. Matches a
+// leading poetry/paragraph marker (same family as ATTACHABLE_PREFIX_RE) glued
+// directly to a following backslash, so we can re-insert the missing space.
+// The `(?!\\\*)` guard keeps this from firing on a legitimate closing-star
+// form (`\ts\*`, `\qs\*`) — those markers aren't even in this alternation, but
+// the guard is kept general rather than relying on that alone. Verified scale:
+// 748 occurrences on en_ust master (`\q2` x461, `\q1` x287, all before
+// `\zaln-s`); Rich fixed the en_ult analog in commit 543e3ee9 (2026-08-05).
+const MARKER_GLUED_TO_NEXT_RE = new RegExp(
+  String.raw`^\\(${POETRY_MARKER_ALTERNATION})(?![A-Za-z0-9])(?=\\)(?!\\\*)`,
+);
+
+function insertSpaceAfterGluedMarker(line: string): string {
+  const m = line.match(MARKER_GLUED_TO_NEXT_RE);
+  if (!m) return line;
+  return `${m[0]} ${line.slice(m[0].length)}`;
+}
+
+// `splitMidlinePoetryMarkers` treats every mid-line poetry-marker occurrence as
+// a split point, so a line already carrying a doubled leading marker (e.g. the
+// usfm-js shape `\q1 \q1 \v 1 …`) gets split into two lines — `\q1` alone, then
+// `\q1 \v 1 …` — which is worse than the original doubling. Collapse an
+// immediately-repeated identical leading marker before that split runs.
+function collapseDuplicateLeadingMarker(seg: string): string {
+  return seg.replace(/^(\\[A-Za-z0-9]+)(\s+)\1(?=\s|$)/, "$1");
+}
+
 const VERSE_RE = /\\v\s+\d+/;
 
 // DCS `validate_usfm_files.py` Check 7 ("Consecutive Paragraph Markers") flags
@@ -144,8 +173,9 @@ function splitStructuralLine(raw: string): string[] {
   if (s === "") return [""];
   const out: string[] = [];
   for (const seg of extractStandaloneMarkers(s)) {
-    for (const sub of splitMidlinePoetryMarkers(seg)) {
-      out.push(...splitAtVerses(sub));
+    const deduped = collapseDuplicateLeadingMarker(seg);
+    for (const sub of splitMidlinePoetryMarkers(deduped)) {
+      out.push(...splitAtVerses(sub).map(insertSpaceAfterGluedMarker));
     }
   }
   return out.length ? out : [""];
@@ -202,6 +232,104 @@ function reorderMarkerRuns(lines: string[]): string[] {
     // blank-separated runs — so we don't dedupe here.
     out.push(...run);
     i = j;
+  }
+  return out;
+}
+
+// A line whose ENTIRE content is `\v N` (optionally with a `-M` bridge and/or
+// a single leading marker) and nothing else. Matched against a trimmed line.
+const DANGLING_VERSE_RE = /^(?:(\\[A-Za-z0-9]+)\s+)?(\\v\s+\d+(?:-\d+)?)\s*$/;
+
+// A leading attachable marker on a content line, e.g. `\q2 <text>` -> marker
+// `\q2`, rest `<text>`. Only strips markers from the same attachable family as
+// ATTACHABLE_PREFIX_RE — this is the marker that may end up displaced onto the
+// merged `\v` line, never an arbitrary backslash token.
+const LEADING_CONTENT_MARKER_RE = /^(\\[A-Za-z0-9]+)\s+(\S.*)$/;
+
+function stripLeadingAttachableMarker(line: string): { marker: string | null; rest: string } {
+  const s = line.trim();
+  const m = s.match(LEADING_CONTENT_MARKER_RE);
+  if (m && ATTACHABLE_PREFIX_RE.test(m[1])) return { marker: m[1], rest: m[2] };
+  return { marker: null, rest: s };
+}
+
+// A line that carries nothing but a standalone structural marker (`\p`, `\b`,
+// `\ts\*`, `\c N`) or a bare attachable poetry/paragraph marker (`\q1`, etc,
+// with nothing following it on the line).
+function isMarkerOnlyLine(line: string): boolean {
+  const s = line.trim();
+  if (s === "") return false;
+  return markerPriority(s) >= 0 || ATTACHABLE_PREFIX_RE.test(s);
+}
+
+// usfm-js sometimes emits a `\v N` with no verse text on its own line, the
+// text instead landing on the next physical line (occasionally after one or
+// more structural marker lines and/or blank lines). DCS requires the verse
+// number to lead its actual content. Verified against all 680 of Rich Mahn's
+// 2026-08-07 hand-fixes (659 in NUM alone) — this single rule explains 679 of
+// them; the 680th (27-DAN.usfm 1:1) is a one-off editorial deletion of a stray
+// `\q2` and is deliberately NOT special-cased here.
+//
+// For each dangling `\v` line, walk forward: blank lines are held as pending
+// (deleted unless a kept marker line follows); a marker-only line is kept,
+// along with any blanks pending before it, and the walk continues; the first
+// line with real text is the merge target and ends the walk. Running off the
+// end leaves the `\v` line untouched. The marker already on the `\v` line
+// always wins over one stripped from the target; if only the target has a
+// leading marker, that marker moves above the verse number.
+function joinDanglingVerses(lines: string[]): string[] {
+  const out: string[] = [];
+  const consumed = new Set<number>();
+  for (let i = 0; i < lines.length; i++) {
+    if (consumed.has(i)) continue;
+    const dv = lines[i].trim().match(DANGLING_VERSE_RE);
+    if (!dv) {
+      out.push(lines[i]);
+      continue;
+    }
+    const dvMarker = dv[1] ?? null;
+    const dvVerse = dv[2];
+
+    let pending: number[] = [];
+    const keep: number[] = [];
+    let targetIdx = -1;
+    let j = i + 1;
+    while (j < lines.length) {
+      if (lines[j].trim() === "") {
+        pending.push(j);
+        j++;
+        continue;
+      }
+      if (isMarkerOnlyLine(lines[j])) {
+        keep.push(...pending, j);
+        pending = [];
+        j++;
+        continue;
+      }
+      targetIdx = j;
+      break;
+    }
+
+    if (targetIdx === -1) {
+      out.push(lines[i]); // ran off the end — leave untouched
+      continue;
+    }
+
+    const { marker: targetMarker, rest: targetRest } = stripLeadingAttachableMarker(
+      lines[targetIdx],
+    );
+    const winningMarker = dvMarker ?? targetMarker;
+    const merged = winningMarker
+      ? `${winningMarker} ${dvVerse} ${targetRest}`
+      : `${dvVerse} ${targetRest}`;
+
+    for (const idx of keep) out.push(lines[idx]);
+    out.push(merged);
+    // Everything between the dangling \v line and its target is spoken for now
+    // — either re-emitted above (kept marker lines) or deliberately dropped
+    // (pending blanks that never preceded a kept marker) — so mark the WHOLE
+    // span consumed, not just the indices we re-pushed.
+    for (let idx = i + 1; idx <= targetIdx; idx++) consumed.add(idx);
   }
   return out;
 }
@@ -345,21 +473,44 @@ function blankLinePass(lines: string[]): string[] {
   return result;
 }
 
-// Normalize a rendered USFM blob to DCS's line layout. Trailing newline is
-// preserved (usfm-js emits one).
+// Collapse any run of 2+ consecutive blank lines to exactly one. Mirrors
+// blankLinePass's header handling: everything up to and including the first
+// blank line (the header/ID block) is passed through untouched, since that
+// region's blank-line layout is not this normalizer's concern.
+function collapseBlankRuns(lines: string[]): string[] {
+  const out: string[] = [];
+  let inHeader = true;
+  let prevBlank = false;
+  for (const line of lines) {
+    if (inHeader) {
+      out.push(line);
+      if (line.trim() === "") inHeader = false;
+      continue;
+    }
+    const isBlank = line.trim() === "";
+    if (isBlank && prevBlank) continue; // drop the extra blank
+    out.push(line);
+    prevBlank = isBlank;
+  }
+  return out;
+}
+
+// Normalize a rendered USFM blob to DCS's line layout. Output always ends
+// with exactly one trailing newline, regardless of the input's.
 export function normalizeUsfmFormatting(usfmText: string): string {
-  const hadTrailingNewline = usfmText.endsWith("\n");
   const normalizedEols = usfmText.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
   const rawLines = normalizedEols.split("\n");
 
   let lines: string[] = [];
   for (const raw of rawLines) lines.push(...splitStructuralLine(raw));
   lines = reorderMarkerRuns(lines);
+  lines = joinDanglingVerses(lines);
   lines = collapseConsecutiveParagraphMarkers(lines);
   lines = collapseConsecutiveTsMarkers(lines);
   lines = blankLinePass(lines);
+  lines = collapseBlankRuns(lines);
 
   let out = lines.join("\n");
-  if (hadTrailingNewline && !out.endsWith("\n")) out += "\n";
+  out = out.replace(/\n*$/, "\n");
   return out;
 }
