@@ -51,6 +51,59 @@ const POETRY_PREFIX_RE = new RegExp(
   "g",
 );
 
+// usfm-js's own line-builder (jsonToUsfm.js) deliberately omits the space
+// between a marker and an immediately-following `w`/`k`/`zaln` tag, e.g.
+// `\q2\zaln-s |x-strong="H1"\*…`. DCS Check 8 requires the space. Matches a
+// leading poetry/paragraph marker (same family as ATTACHABLE_PREFIX_RE) glued
+// directly to a following backslash, so we can re-insert the missing space.
+// The `(?!\\\*)` guard keeps this from firing on a legitimate closing-star
+// form (`\ts\*`, `\qs\*`) — those markers aren't even in this alternation, but
+// the guard is kept general rather than relying on that alone. Verified scale:
+// 748 occurrences on en_ust master (`\q2` x461, `\q1` x287, all before
+// `\zaln-s`); Rich fixed the en_ult analog in commit 543e3ee9 (2026-08-05).
+const MARKER_GLUED_TO_NEXT_RE = new RegExp(
+  String.raw`^\\(${POETRY_MARKER_ALTERNATION})(?![A-Za-z0-9])(?=\\)(?!\\\*)`,
+);
+
+function insertSpaceAfterGluedMarker(line: string): string {
+  const m = line.match(MARKER_GLUED_TO_NEXT_RE);
+  if (!m) return line;
+  return `${m[0]} ${line.slice(m[0].length)}`;
+}
+
+// `splitMidlinePoetryMarkers` treats every mid-line poetry-marker occurrence as
+// a split point, so a line already carrying a doubled leading marker (e.g. the
+// usfm-js shape `\q1 \q1 \v 1 …`) gets split into two lines — `\q1` alone, then
+// `\q1 \v 1 …` — which is worse than the original doubling. Collapse a run of
+// 2+ immediately-repeated identical leading markers before that split runs.
+//
+// Narrowed to exactly the observed defect: a naive "any marker family, any
+// following content" version also turned `\s1 \s1 Heading` into `\s1 Heading`
+// and `\q1 \q1 text` into `\q1 text` — but in USFM `\q1 \q1 text` legitimately
+// means "an empty poetry line, then a poetry line with text", so collapsing it
+// deletes a rendered line. So this only fires when (a) the repeated marker is
+// from the attachable poetry family (ATTACHABLE_PREFIX_RE's set — `\s1` is
+// not in it) AND (b) a `\v` follows the doubled marker — the only two real
+// instances found were both `\q1 \q1 \v 1 …` in `30-AMO.usfm` (lines 1334,
+// 2393), each immediately after a `\c N`.
+function collapseDuplicateLeadingMarker(seg: string): string {
+  const lead = seg.match(/^(\\[A-Za-z0-9]+)(?=\s|$)/);
+  if (!lead || !ATTACHABLE_PREFIX_RE.test(lead[1])) return seg;
+  const marker = lead[1];
+  let rest = seg;
+  let repeats = 0;
+  while (rest.startsWith(marker)) {
+    const after = rest.slice(marker.length);
+    const ws = after.match(/^\s+/);
+    if (!ws) break; // marker not followed by whitespace — not a bare repeat
+    rest = after.slice(ws[0].length);
+    repeats++;
+  }
+  if (repeats < 2) return seg; // nothing doubled
+  if (!/^\\v\s+\d+(?:\s|$)/.test(rest)) return seg; // only collapse before a \v
+  return `${marker} ${rest}`;
+}
+
 const VERSE_RE = /\\v\s+\d+/;
 
 // DCS `validate_usfm_files.py` Check 7 ("Consecutive Paragraph Markers") flags
@@ -141,8 +194,9 @@ function splitStructuralLine(raw: string): string[] {
   if (s === "") return [""];
   const out: string[] = [];
   for (const seg of extractStandaloneMarkers(s)) {
-    for (const sub of splitMidlinePoetryMarkers(seg)) {
-      out.push(...splitAtVerses(sub));
+    const deduped = collapseDuplicateLeadingMarker(seg);
+    for (const sub of splitMidlinePoetryMarkers(deduped)) {
+      out.push(...splitAtVerses(sub).map(insertSpaceAfterGluedMarker));
     }
   }
   return out.length ? out : [""];
@@ -199,6 +253,188 @@ function reorderMarkerRuns(lines: string[]): string[] {
     // blank-separated runs — so we don't dedupe here.
     out.push(...run);
     i = j;
+  }
+  return out;
+}
+
+// A line whose ENTIRE content is `\v N` (optionally with a `-M` bridge and/or
+// a single leading marker) and nothing else. Matched against a trimmed line.
+const DANGLING_VERSE_RE = /^(?:(\\[A-Za-z0-9]+)\s+)?(\\v\s+\d+(?:-\d+)?)\s*$/;
+
+// A leading attachable marker on a content line, e.g. `\q2 <text>` -> marker
+// `\q2`, rest `<text>`. Only strips markers from the same attachable family as
+// ATTACHABLE_PREFIX_RE — this is the marker that may end up displaced onto the
+// merged `\v` line, never an arbitrary backslash token.
+const LEADING_CONTENT_MARKER_RE = /^(\\[A-Za-z0-9]+)\s+(\S.*)$/;
+
+function stripLeadingAttachableMarker(line: string): { marker: string | null; rest: string } {
+  const s = line.trim();
+  const m = s.match(LEADING_CONTENT_MARKER_RE);
+  if (m && ATTACHABLE_PREFIX_RE.test(m[1])) return { marker: m[1], rest: m[2] };
+  return { marker: null, rest: s };
+}
+
+// A line that joinDanglingVerses's forward walk may cross AND KEEP in place:
+// a bare `\p`, or a bare attachable poetry/paragraph marker (`\q1`, etc) with
+// nothing following it on the line. Deliberately narrow — `\b`/`\ts\*`/`\c`
+// used to be crossable here too, which is exactly what let the walk merge a
+// verse into the wrong chapter (see isAbortLine and the doc comment on
+// joinDanglingVerses below).
+function isCrossableMarkerLine(line: string): boolean {
+  const s = line.trim();
+  if (s === "\\p") return true;
+  return ATTACHABLE_PREFIX_RE.test(s);
+}
+
+// Markers/lines that ABORT a dangling-`\v` join outright: the forward walk
+// stops immediately and the original dangling `\v` line is emitted completely
+// untouched (nothing is consumed). `\c`/`\ts\*`/`\b` are always alone on their
+// own line by the time this runs (extractStandaloneMarkers guarantees it), so
+// an exact-equality check suffices for those; the `\s`-family headings/`\d`
+// are NOT extracted onto their own line by anything upstream, so they're
+// matched by leading marker instead, whatever text follows them. Another `\v`
+// line (dangling or not) always aborts too — a join must never swallow a
+// second verse.
+// `\qa`/`\qc`/`\qr`/`\qd` are in POETRY_MARKER_ALTERNATION, so without an
+// explicit abort they are worse than merely crossable: stripLeadingAttachableMarker
+// peels them off and the join hoists the verse number INTO the heading —
+// `\v 1` + `\qa Aleph` becomes `\qa \v 1 Aleph`, making "Aleph" the first word of
+// verse 1. Same silent-corruption class as the `\s1`/`\d` case (no validator
+// complains). Not reachable in today's data — a sweep of all 144 corpus books
+// through the real render path found zero such adjacencies — but the acrostic
+// letters (`\qa`) and speaker/major-section headings do exist in the corpus, so
+// this is guarded rather than left to chance.
+const ABORT_LEADING_RE =
+  // `\ms\*` needs no branch of its own: `\\ms[1-3]?` already matches the `\ms`
+  // with the digit absent, and the lookahead is satisfied by the following `\`.
+  /^(?:\\sr|\\s[1-5]?|\\r|\\ms[1-3]?|\\mr|\\d|\\qa|\\qc|\\qr|\\qd|\\sp|\\cl)(?![A-Za-z0-9])/;
+
+function isAbortLine(line: string): boolean {
+  const s = line.trim();
+  if (s === "") return false; // blank lines are handled by the caller, not here
+  // Another `\v` ANYWHERE in the line — never cross or swallow it. This must be
+  // the unanchored test: a verse line normally carries its paragraph marker
+  // first (`\q1 \v 2 …`), so an anchored `^\\v` check misses it and the join
+  // merrily produces `\q1 \v 1 \v 2 …` — two verses on one line, which
+  // validateUsfm rejects and which withholds the whole book from export.
+  if (VERSE_RE.test(s)) return true;
+  if (CHAPTER_RE.test(s)) return true;
+  if (s === "\\ts\\*") return true;
+  if (s === "\\b") return true;
+  // headings and titles: \s / \s1-\s5 / \sr / \r / \ms / \ms1-3 / \ms\* / \mr /
+  // \d / \qa / \qc / \qr / \qd / \sp / \cl
+  return ABORT_LEADING_RE.test(s);
+}
+
+// usfm-js sometimes emits a `\v N` with no verse text on its own line, the
+// text instead landing on the next physical line (occasionally after one or
+// more structural marker lines and/or blank lines). DCS requires the verse
+// number to lead its actual content. Verified against all 680 of Rich Mahn's
+// 2026-08-07 hand-fixes (659 in NUM alone) — this single rule explains 679 of
+// them; the 680th (27-DAN.usfm 1:1) is a one-off editorial deletion of a stray
+// `\q2` and is deliberately NOT special-cased here.
+//
+// The walk is deliberately conservative and bounded: across all 680 of those
+// real cases, it only ever needed to cross blank lines (50 cases) and exactly
+// one bare `\p` — it never needed to cross a `\c`, `\ts\*`, `\b`, a heading, or
+// another `\v`. So those five now ABORT the join rather than being crossed: an
+// earlier version treated `\c N`/`\ts\*`/`\b` as markers safe to hop over (via
+// isMarkerOnlyLine's use of markerPriority), which let the walk sail across a
+// chapter boundary and merge a verse into the WRONG chapter (e.g.
+// `\v 10 / \c 2 / \p / \v 1 next` merging 1:10 into chapter 2), and treated
+// `\s`-family headings/`\d` as ordinary text, silently absorbing a section
+// heading into the previous verse with zero validator complaint.
+//
+// For each dangling `\v` line, walk forward: blank lines are held as pending
+// (deleted unless a kept marker line follows); a crossable marker-only line
+// (bare `\p` or bare attachable poetry marker) is kept, along with any blanks
+// pending before it, and the walk continues; an abort line stops the walk
+// immediately with the dangling `\v` line emitted untouched and nothing
+// consumed; otherwise the first line with real text is the merge target and
+// ends the walk. Running off the end also leaves the `\v` line untouched. The
+// marker already on the `\v` line always wins over one stripped from the
+// target; if only the target has a leading marker, that marker moves above
+// the verse number.
+//
+// Header guard: mirrors blankLinePass/collapseBlankRuns exactly — everything
+// up to and including the first blank line is passed through untouched, with
+// no dangling-`\v` check ever attempted inside that region. This keeps a `\v`
+// in the header from being hoisted, and — just as importantly — keeps a join
+// from ever consuming the header-terminating blank line itself, which would
+// otherwise leave blankLinePass thinking the whole rest of the file is still
+// header and stop inserting required blank lines before every `\c`/`\p`.
+function joinDanglingVerses(lines: string[]): string[] {
+  const out: string[] = [];
+  const consumed = new Set<number>();
+  let inHeader = true;
+  for (let i = 0; i < lines.length; i++) {
+    if (consumed.has(i)) continue;
+
+    if (inHeader) {
+      out.push(lines[i]);
+      if (lines[i].trim() === "") inHeader = false;
+      continue;
+    }
+
+    const dv = lines[i].trim().match(DANGLING_VERSE_RE);
+    if (!dv) {
+      out.push(lines[i]);
+      continue;
+    }
+    const dvMarker = dv[1] ?? null;
+    const dvVerse = dv[2];
+
+    let pending: number[] = [];
+    const keep: number[] = [];
+    let targetIdx = -1;
+    let aborted = false;
+    let j = i + 1;
+    while (j < lines.length) {
+      if (lines[j].trim() === "") {
+        pending.push(j);
+        j++;
+        continue;
+      }
+      if (isAbortLine(lines[j])) {
+        aborted = true;
+        break;
+      }
+      if (isCrossableMarkerLine(lines[j])) {
+        keep.push(...pending, j);
+        pending = [];
+        j++;
+        continue;
+      }
+      targetIdx = j;
+      break;
+    }
+
+    if (aborted || targetIdx === -1) {
+      out.push(lines[i]); // abort, or ran off the end — leave untouched, consume nothing
+      continue;
+    }
+
+    const { marker: targetMarker, rest: targetRest } = stripLeadingAttachableMarker(
+      lines[targetIdx],
+    );
+    // When BOTH the \v line and the target carry a leading poetry marker
+    // (e.g. \v line has \q1, target has \q2), the target's marker is dropped
+    // in favor of the \v line's own — this is intentional, not a bug. It
+    // reproduces Rich's own edit in 28-HOS.usfm: `\q1 \v 11` + `\q2 <text>`
+    // merges to `\q1 \v 11 <text>`, and HOS's whole-file \q2 census drops by
+    // exactly 2 after his hand-fixes, confirming he deleted the \q2 himself.
+    const winningMarker = dvMarker ?? targetMarker;
+    const merged = winningMarker
+      ? `${winningMarker} ${dvVerse} ${targetRest}`
+      : `${dvVerse} ${targetRest}`;
+
+    for (const idx of keep) out.push(lines[idx]);
+    out.push(merged);
+    // Everything between the dangling \v line and its target is spoken for now
+    // — either re-emitted above (kept marker lines) or deliberately dropped
+    // (pending blanks that never preceded a kept marker) — so mark the WHOLE
+    // span consumed, not just the indices we re-pushed.
+    for (let idx = i + 1; idx <= targetIdx; idx++) consumed.add(idx);
   }
   return out;
 }
@@ -342,21 +578,50 @@ function blankLinePass(lines: string[]): string[] {
   return result;
 }
 
-// Normalize a rendered USFM blob to DCS's line layout. Trailing newline is
-// preserved (usfm-js emits one).
+// Collapse any run of 2+ consecutive blank lines to exactly one. Mirrors
+// blankLinePass's header handling: everything up to and including the first
+// blank line (the header/ID block) is passed through untouched, since that
+// region's blank-line layout is not this normalizer's concern.
+function collapseBlankRuns(lines: string[]): string[] {
+  const out: string[] = [];
+  let inHeader = true;
+  let prevBlank = false;
+  for (const line of lines) {
+    if (inHeader) {
+      out.push(line);
+      // The header-terminating blank IS a blank line: seed prevBlank from it, or
+      // a body that opens with more blanks keeps one too many (a 3-blank run
+      // after the header collapsed to 2, not 1).
+      if (line.trim() === "") {
+        inHeader = false;
+        prevBlank = true;
+      }
+      continue;
+    }
+    const isBlank = line.trim() === "";
+    if (isBlank && prevBlank) continue; // drop the extra blank
+    out.push(line);
+    prevBlank = isBlank;
+  }
+  return out;
+}
+
+// Normalize a rendered USFM blob to DCS's line layout. Output always ends
+// with exactly one trailing newline, regardless of the input's.
 export function normalizeUsfmFormatting(usfmText: string): string {
-  const hadTrailingNewline = usfmText.endsWith("\n");
   const normalizedEols = usfmText.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
   const rawLines = normalizedEols.split("\n");
 
   let lines: string[] = [];
   for (const raw of rawLines) lines.push(...splitStructuralLine(raw));
   lines = reorderMarkerRuns(lines);
+  lines = joinDanglingVerses(lines);
   lines = collapseConsecutiveParagraphMarkers(lines);
   lines = collapseConsecutiveTsMarkers(lines);
   lines = blankLinePass(lines);
+  lines = collapseBlankRuns(lines);
 
   let out = lines.join("\n");
-  if (hadTrailingNewline && !out.endsWith("\n")) out += "\n";
+  out = out.replace(/\n*$/, "\n");
   return out;
 }
