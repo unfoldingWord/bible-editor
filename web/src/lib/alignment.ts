@@ -431,7 +431,36 @@ export function sourceKey(g: AlignmentGroup): string {
 // Drop a compound's source word when an identical (content + occurrence)
 // standalone group already owns it, so the token isn't double-represented.
 // Occurrence-aware: a standalone occ-1 never strips a genuine occ-2 sibling.
-export function stripCompoundOverlaps(groups: AlignmentGroup[]): AlignmentGroup[] {
+//
+// `protectedIds` — source-word ids that must NEVER be stripped, because the
+// caller is going to FLAG them. Pass the reused-source-token ids
+// (findReusedSourceWordIds, via reusedSourceIdsOf in alignmentHover.ts).
+//
+// Why: a compound overlapping a standalone IS the reused-source-token defect,
+// and stripping silently repairs it on screen. Whether the repair happened
+// depended on compound arity, because the `kept.length === 0` escape hatch below
+// only fires when EVERY word overlaps:
+//   - AMO 3:7 UST — compound [אֶל, עֲבָדָיו], both overlapped → kept.length 0 →
+//     no-op → compound survives → the defect renders as doubled Hebrew.
+//   - AMO 3:2 UST — compound [עַל, כֵּן, אֶפְקֹד], only אֶפְקֹד overlapped →
+//     kept.length 2 → stripped → AlignmentPanel maps chips off the DISPLAY
+//     group, so the flagged chip was never drawn. The api-side lint feed
+//     ("Reused source token") still listed the verse, and a translator clicked
+//     through to a card that looked clean.
+// Same defect class, arbitrary visibility. Policy since PR #413 is to display
+// an upstream defect HONESTLY and let a human repair the data, so a flagged
+// word stays on its card.
+//
+// A strip that is not also a flagged reuse is only reachable for a source word
+// with EMPTY x-content: sourceWordKey keys `nfc(content)|occurrence` while
+// reusedTokenKey returns null for empty content, so such a word can match a
+// standalone here yet never be flagged. That is the only path left through the
+// filter on today's corpus — do not read the remaining strip as load-bearing
+// for ordinary alignments.
+export function stripCompoundOverlaps(
+  groups: AlignmentGroup[],
+  protectedIds?: ReadonlySet<string>,
+): AlignmentGroup[] {
   const standaloneKeys = new Set<string>();
   for (const g of groups) {
     if (g.source.length === 1) standaloneKeys.add(sourceWordKey(g.source[0]));
@@ -439,7 +468,9 @@ export function stripCompoundOverlaps(groups: AlignmentGroup[]): AlignmentGroup[
   if (standaloneKeys.size === 0) return groups;
   return groups.map((g) => {
     if (g.source.length <= 1) return g;
-    const kept = g.source.filter((s) => !standaloneKeys.has(sourceWordKey(s)));
+    const kept = g.source.filter(
+      (s) => protectedIds?.has(s.id) || !standaloneKeys.has(sourceWordKey(s)),
+    );
     if (kept.length === g.source.length || kept.length === 0) return g;
     return { ...g, source: kept };
   });
@@ -505,6 +536,15 @@ export function mergeAdjacentSameSource(groups: AlignmentGroup[]): AlignmentGrou
 // or null when any position is unresolved (then the group never merges — we
 // can't prove it's a duplicate). Display-only: callers pass display groups, so
 // state.sourceGroups (and therefore serialize/export) is untouched.
+//
+// KNOWN RESIDUAL, one verse corpus-wide (EZK 4:4 UST): this fusion keys on
+// resolveSourcePos, which carries a strong-based fallback, while the
+// reused-source-token marker keys on reusedTokenKey, which deliberately does
+// not. The two key spaces can therefore disagree, and here a fused card
+// swallowed a FLAGGED standalone group — so one of the two red chips still has
+// nowhere to draw even with the strip exemption in place. Reconciling the key
+// spaces (or exempting flagged groups from fusion) would change how legitimate
+// one-token-to-N-runs splits collapse, so it is deliberately not done here.
 export function mergeSamePositionGroups(
   groups: AlignmentGroup[],
   positionKey: (g: AlignmentGroup) => string | null,
@@ -618,22 +658,28 @@ export function positionsShareOwner(
 // chains to the same sequence and silencing the marker on a verse api-side lint
 // still flags.
 //
-// The two detectors do NOT fully agree, and the disagreement is one-directional:
-// this one can flag a verse api-side lint stays silent on, never the reverse.
-// Measured over the five sample ULT/UST books (1877 verses) against their UHB:
-// {both: 0, lintOnly: 0, uiOnly: 1} — ZEC 2:8, where אָמַר is written
-// occurrence 1/2 inside one chain and 2 standalone while the UHB contains it
-// once. This detector runs AFTER parseAlignment has reformed occurrences against
-// the real source, so both chains key to p16 and it flags; lint has no source
-// rows (by design) and keys raw x-occurrence, so "1" and "2" stay distinct and
-// it reports nothing. Two other mechanisms push the same direction: lint treats
-// an outermost `\zaln-s` plus everything nested in it as ONE chain while
-// parseAlignment makes a group per word-bearing chain (so a merged shared prefix
-// hides reuse from lint), and lint drops a milestone with no x-occurrence where
-// parseAlignment defaults it to 1. Closing any of these needs the source verse
-// on the api side — a bigger change than this key space. Until then: a red
-// marker with no lint entry is expected and the marker is the more reliable of
-// the two; do not "fix" the marker to match the feed.
+// The two detectors do NOT fully agree, and the disagreement runs BOTH ways —
+// an earlier version of this comment claimed it was one-directional on the
+// strength of a five-book sample. Measured against the whole of prod D1 (37
+// books, 51,848 ULT/UST verses with a source verse, via
+// scripts/scan-reused-token-visibility.mjs): 63 verses flagged by either
+// detector — 26 by both, 25 by this detector only, 12 by api-side lint only.
+//
+// This detector is still the more reliable of the two. The 25 it flags alone are
+// real (lint has no source rows, so a merged shared `\zaln-s` prefix or a
+// missing x-occurrence hides reuse from it), and the 12 lint flags alone are
+// false positives from lint keying RAW x-occurrence: eight are the legitimate
+// one-token-to-two-target-runs split written with divergent occurrence numbers
+// (JER 33:7 et al.), two conflate genuinely distinct tokens that both carry
+// x-occurrence="1" (1CH 22:19, PSA 71:9), REV 4:9 has both, and HAB 1:3 is
+// reversed nesting that this detector sees in one canonical order. See the scope
+// comment on hasReusedSourceToken in api/src/lint.ts for the per-verse breakdown.
+// Do not "fix" this detector to match the feed.
+//
+// A flagged word must also RENDER: buildDisplayGroups passes these ids to
+// stripCompoundOverlaps as protectedIds, because the strip would otherwise
+// delete a flagged chip from a partly-overlapping compound and leave the marker
+// invisible on the very verse lint flags (AMO 3:2 UST — see that function).
 //
 // Sequence order is DOCUMENT order, matching the api-side join — sorting would
 // exempt the reversed-nesting defect ([A,B] plus [B,A] over the same tokens,

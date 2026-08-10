@@ -144,38 +144,66 @@ function ctxFor(st, { bibleVersion = "ult", posOffset = 0, hoverLink = true } = 
   );
 }
 
-// ─── 2. stripped compounds: the removed word's position stays in the union ──
-// The regression PR #410's review caught and reverted. stripCompoundOverlaps
-// narrows the compound's RENDERED chain, but the source word is still bound to
-// it, so groupPositions must stay STATE-derived — recomputing the union from the
-// card's narrowed chain takes the stripped token dark on hover.
+// ─── 2. a PARTLY-overlapping compound keeps its flagged word (AMO 3:2 UST) ──
+// The reused-source-token marker has to be VISIBLE. stripCompoundOverlaps used
+// to narrow a compound's rendered chain whenever only SOME of its words
+// overlapped a standalone (`kept.length` neither 0 nor the full length), and
+// AlignmentPanel maps chips off the DISPLAY group — so the flagged chip was
+// never drawn. AMO 3:2 UST (compound [עַל, כֵּן, אֶפְקֹד] plus a standalone
+// אֶפְקֹד) sat in the api-side "Reused source token" feed while the card looked
+// clean, whereas AMO 3:7 UST (compound [אֶל, עֲבָדָיו], BOTH overlapped, so the
+// `kept.length === 0` escape hatch fired) rendered the same defect plainly.
+// Visibility must not depend on compound arity: flagged words are exempt from
+// the strip. The fixture below is the 2-word version of the 3:2 shape — one of
+// two words overlaps, so the old code stripped it.
+//
+// This case also still pins what PR #410's review caught and reverted:
+// groupPositions must stay STATE-derived, so a word the strip DOES remove (the
+// empty-x-content path that survives the exemption) keeps its position in the
+// compound's union and does not go dark on hover.
 {
   const standalone = group("g-std", [src("s-std", 1)], [tgt("t-std", "to")]);
-  // Compound over the same אֶל plus יְהוָה — strip drops אֶל from its chain.
+  // Compound over the same אֶל plus יְהוָה — only אֶל overlaps the standalone.
   const compound = group("g-cmp", [src("s-c1", 1), src("s-c2", 2)], [tgt("t-cmp", "to Yahweh")]);
   const st = state([standalone, compound]);
   const { displayGroups, ctx } = ctxFor(st);
   const rendered = displayGroups.find((g) => g.id === "g-cmp");
   assert(
-    rendered.source.length === 1 && rendered.source[0].id === "s-c2",
-    "stripCompoundOverlaps narrows the compound's rendered chain to the non-overlapping word",
+    rendered.source.length === 2 &&
+      rendered.source.some((s) => s.id === "s-c1") &&
+      rendered.source.some((s) => s.id === "s-c2"),
+    "the compound card RENDERS the reused word rather than having it stripped away",
+  );
+  assert(
+    ctx.posMaps.reusedSourceIds.has("s-c1") && ctx.posMaps.reusedSourceIds.has("s-std"),
+    "both copies of the reused token are flagged",
+  );
+  // The whole point: every flagged word has a chip to wear the red marker on.
+  const renderedFlagged = new Set();
+  for (const g of displayGroups)
+    for (const s of g.source) if (ctx.posMaps.reusedSourceIds.has(s.id)) renderedFlagged.add(s.id);
+  assert(
+    renderedFlagged.size === ctx.posMaps.reusedSourceIds.size,
+    `every flagged source word renders (${renderedFlagged.size}/${ctx.posMaps.reusedSourceIds.size})`,
   );
   const union = ctx.posMaps.groupPositions.get("g-cmp") ?? [];
   assert(
     union.includes(1) && union.includes(2),
-    `the compound's union positions still include the STRIPPED word's position (got [${union}])`,
+    `the compound's union positions cover both its words (got [${union}])`,
   );
-  // Position 1 is owned by the standalone card ONLY (posOwners is
-  // display-derived, so the stripped token cannot steal the card).
+  // Position 1 now has TWO owners — the standalone card and the compound card
+  // both honestly name that physical token (buildPositionOwners, PR #413).
   assert(
-    ctx.posMaps.posOwners.get(1)?.size === 1 && ctx.posMaps.posOwners.get(1).has("g-std"),
-    "the stripped position is owned by the standalone card, not the compound",
+    ctx.posMaps.posOwners.get(1)?.size === 2 &&
+      ctx.posMaps.posOwners.get(1).has("g-std") &&
+      ctx.posMaps.posOwners.get(1).has("g-cmp"),
+    "the reused position is owned by BOTH cards, so neither contradicts itself on hover",
   );
-  // ...and hovering the compound's English still bridges to that Hebrew token.
+  // ...and hovering the compound's English still bridges to both Hebrew tokens.
   const hover = makeEnglishHover(ctx, "t-cmp", "to Yahweh", "1");
   assert(
     resolveHebrewHighlight(ctx, hover, 1) === "linked",
-    "hovering the compound's English still lights the stripped Hebrew token",
+    "hovering the compound's English lights the reused Hebrew token",
   );
   assert(
     resolveHebrewHighlight(ctx, hover, 2) === "linked",

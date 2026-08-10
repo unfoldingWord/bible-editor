@@ -259,28 +259,47 @@ function hasGluedMilestone(nodes: unknown[]): boolean {
 // is not reported — detectDoubledSourceMilestones in web/src/lib/alignment.ts
 // owns that one.
 //
-// This check UNDER-reports relative to the aligner's marker, always in that
-// direction (it never flags a verse the aligner shows clean — the within-chain
-// dedup below is what closed the one case where it did). Three known
-// mechanisms, all rooted in lint having no source rows:
-//   1. Identity is RAW x-occurrence. findReusedSourceWordIds runs after
-//      parseAlignment has reformed occurrences against the real UHB/UGNT, so a
-//      token written 1-of-2 in one chain and 2 standalone, present once in the
-//      source, collapses to one key there and flags — while "1" and "2" stay
-//      distinct here. Measured over the five sample ULT/UST books (1877
-//      verses): exactly one such verse, ZEC 2:8 (אָמַר).
-//   2. A merged shared prefix hides reuse. findTopLevelZalns treats an outermost
+// This check DISAGREES with the aligner's marker in BOTH directions, and an
+// earlier version of this comment claimed otherwise ("never flags a verse the
+// aligner shows clean") on the strength of a five-book sample. Measured against
+// the whole of prod D1 — 37 books, 51,848 ULT/UST verses with a source verse,
+// via scripts/scan-reused-token-visibility.mjs: 63 verses flagged by either
+// detector, of which BOTH agree on 26, only this check flags 12, and only the
+// marker flags 25.
+//
+// The 12 this check flags alone are FALSE POSITIVES, and all 12 come from one
+// root cause — identity here is RAW x-occurrence, while findReusedSourceWordIds
+// runs after parseAlignment has reformed occurrences against the real UHB/UGNT:
+//   - 8 verses (JER 33:7, 33:11, 35:3, 35:11, 37:9, 37:10, MAT 9:20, ZEC 11:11)
+//     — two chains over the SAME tokens differ only in a raw x-occurrence the
+//     reform normalizes away (JER 33:7 writes וַהֲשִׁבֹתִי as occurrence 1 in one
+//     chain and 2 in the other, of a token the UHB contains once). They are the
+//     legitimate one-token-to-two-target-runs split, which the joined chain key
+//     below is meant to exempt and fails to.
+//   - 2 verses (1CH 22:19, PSA 71:9) — the opposite conflation: two DISTINCT
+//     physical tokens both written x-occurrence="1", which reform separates by
+//     position (1CH 22:19 has הָאֱלֹהִים twice) but this key space merges.
+//   - REV 4:9 shows both shapes.
+// The 12th, HAB 1:3, is not an occurrence artefact: the chains carry the same
+// keys in REVERSED nesting order, so this check sees two sequences while the
+// marker sees one canonical order and exempts it as a split. That one is a real
+// encoding oddity — whether it should be repaired in the data is not this
+// check's call.
+//
+// Two further mechanisms push the other way (marker flags, this check silent),
+// both also rooted in having no source rows:
+//   1. A merged shared prefix hides reuse. findTopLevelZalns treats an outermost
 //      `\zaln-s` plus all nesting as one chain; parseAlignment makes a group per
 //      word-bearing chain. So `\zaln-s A\*\zaln-s B\*\w x\w*\zaln-e\*\zaln-s
 //      C\*\w y\w*\zaln-e\*\zaln-e\*` reports nothing here and flags A there,
 //      while the un-merged encoding of the SAME alignment reports it — whether
 //      the defect is seen depends on how the writer nested it.
-//   3. A milestone with x-content but no x-occurrence is dropped here (see
+//   2. A milestone with x-content but no x-occurrence is dropped here (see
 //      zalnLintKey) where parseAlignment defaults it to 1, which can collapse
 //      two differing chain keys into one and silence a real reuse.
-// Closing any of these means giving lint the source verse. Until then the feed
-// is a floor, not a census, and the aligner's marker is the more reliable of the
-// two — do not reconcile by weakening the marker.
+// Closing any of these means giving lint the source verse. Until then this feed
+// is neither a floor nor a census, and the aligner's marker is the more reliable
+// of the two — do not reconcile by weakening the marker.
 function zalnLintKey(node: Record<string, unknown>): string | null {
   const content = node["content"];
   if (typeof content !== "string" || content === "") return null;
