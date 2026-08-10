@@ -311,9 +311,17 @@ function hasGluedMilestone(nodes: unknown[]): boolean {
 // (LEV 24:10 / 1CH 6:78 shapes) pin the LINT behaviour for those shapes, which
 // is stable either way — but the LEV one is NOT evidence of a real defect.
 // The occurrence-insensitive signature has a KNOWN HOLE, and it is accepted
-// deliberately: two chains `[A|1, B|1]` and `[A|1, B|2]` both sign as "A,B", so
-// a genuinely reused A goes unreported whenever the source really does hold two
-// B tokens. That shape is STRUCTURALLY IDENTICAL to the JER 33:7 split this fix
+// deliberately, as a CLASS: any two chains whose unique-key lists agree on
+// content sequence but differ in one or more occurrence numbers now sign
+// identically, so a token they share is not reported. Instances of the class:
+//   - `[A|1, B|1]` + `[A|1, B|2]` both sign as "A,B" (the original case below).
+//   - `[A|1, A|2]` + `[A|2, A|3]` both sign as "A,A" (share the A|2 token).
+//   - `[A|1, A|2]` + `[A|2, A|1]` both sign as "A,A" (same-content reversal —
+//     see the HAB 1:3 note below for why this differs from DIFFERENT-content
+//     reversal, which still flags).
+//   - `[A|1, B|1, C|1]` + `[A|1, B|2, C|1]` both sign as "A,B,C" (the differing
+//     occurrence sits in the middle, not at an edge).
+// That shape is STRUCTURALLY IDENTICAL to the JER 33:7 split this fix
 // exists to stop flagging — chains differing only in one token's occurrence,
 // with the shared tokens being the ones at issue. What separates "one alignment
 // written twice" from "two alignments both claiming A" is solely whether the
@@ -325,11 +333,16 @@ function hasGluedMilestone(nodes: unknown[]): boolean {
 // positives) and ONE, JER 37:5 UST, where the marker still flags and renders
 // the defect in red. Do not "close" this hole by restoring the full-key
 // signature without re-measuring both directions.
-//   - HAB 1:3 — NOT an occurrence artefact at all: the chains carry the same
-//     keys in REVERSED nesting order, so this check sees two distinct chain
-//     signatures while the aligner's marker resolves both to one canonical
-//     source order and exempts it as a split. A real encoding oddity, not a
-//     false positive — do not weaken either detector to reconcile it.
+//   - HAB 1:3 — NOT an occurrence artefact at all, and NOT an instance of the
+//     class above: the two chains carry the SAME keys but with DIFFERENT
+//     x-content (אָוֶן vs וְעָמָל) in REVERSED nesting order, so their signatures
+//     genuinely differ and this check still flags. Reversed nesting is only
+//     absorbed into the hole above when the reversed tokens share the SAME
+//     content (see the same-content-reversal instance above) — in that case
+//     the signature collapses just like any other occurrence-only difference.
+//     The aligner's marker resolves the HAB 1:3 case to one canonical source
+//     order and exempts it as a split. A real encoding oddity, not a false
+//     positive — do not weaken either detector to reconcile it.
 //
 // The single verse this fix stops flagging that the
 // right reason: its real reuse (שִׁמְעָם claimed by a compound and a standalone)
@@ -423,6 +436,15 @@ function hasReusedSourceToken(nodes: unknown[]): boolean {
     // translator would click through from the lint feed to a clean-looking
     // verse. The within-chain doubling is real but belongs to
     // detectDoubledSourceMilestones (see the scope note above), not here.
+    // RESIDUAL: this dedup is occurrence-SENSITIVE (Set(keys) compares full
+    // keys, occurrence included), so it only closes the shape where the
+    // repeat is numbered IDENTICALLY: [A|1, A|1, B|1] + [A|1, B|1] silences,
+    // but [A|1, A|2, B|1] + [A|1, B|1] still flags (1 issue) — verified. That
+    // is the AI doubled-source-milestone defect: the source holds A once, the
+    // marker dedups it to one position and stays silent, and lint flags a
+    // false positive in a class this check explicitly disclaims owning. Not
+    // fixed here; some of the 10 remaining lint-only verses may be this shape
+    // (not verified per-verse).
     const uniqueKeys = [...new Set(keys)];
     // The chain SIGNATURE strips occurrence before joining (deliberately NOT
     // deduped again — positional multiplicity must survive, so [A|1, A|2]
@@ -430,7 +452,11 @@ function hasReusedSourceToken(nodes: unknown[]): boolean {
     // tokens that differ only by a raw, un-reformed occurrence number collapse
     // into the same signature instead of registering as two distinct chains
     // (see the scope comment above).
-    const signature = uniqueKeys.map(stripOccurrenceSuffix).join(",");
+    // Joined with U+0001, not a comma: x-content can itself legally contain a
+    // comma (e.g. a source token "A,B"), and joining with "," would let
+    // [X|1, "A,B"|1] and [X|1, A|1, B|1] both sign as "X,A,B", silencing a
+    // reused X. U+0001 cannot occur in USFM x-content, so it can't collide.
+    const signature = uniqueKeys.map(stripOccurrenceSuffix).join("");
     for (const key of uniqueKeys) {
       const set = chainKeysByToken.get(key) ?? new Set<string>();
       set.add(signature);

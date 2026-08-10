@@ -285,6 +285,24 @@ t("KNOWN GAP: [A|1,B|1] + [A|1,B|2] is not reported (occurrence-insensitive sign
   assert.equal(reusedChecks(i).length, 0);
 });
 
+// Another instance of the SAME accepted hole above, not the HAB 1:3 shape:
+// `[A|1,A|2]` and `[A|2,A|1]` are a same-content reversal — the two chains'
+// unique-key lists agree on content sequence ("A,A") and differ only in
+// occurrence order, so they sign identically and collapse. HAB 1:3 still
+// flags because its two chains carry DIFFERENT x-content (אָוֶן vs וְעָמָל) in
+// reversed order, which keeps the signatures genuinely distinct — reversed
+// nesting alone is not what falls into this hole, only reversed nesting of
+// the SAME content.
+t("KNOWN GAP: same-content reversal [A|1,A|2] + [A|2,A|1] is not reported", () => {
+  const zA = (occ) => `\\zaln-s |x-strong="H1" x-occurrence="${occ}" x-occurrences="2" x-content="A"\\*`;
+  const usfmText =
+    `\\c 1\n\\p\n\\v 1 ` +
+    zA(1) + zA(2) + `\\w x1\\w* \\w x2\\w*\\zaln-e\\*\\zaln-e\\* ` +
+    zA(2) + zA(1) + `\\w x3\\w* \\w x4\\w*\\zaln-e\\*\\zaln-e\\*\n`;
+  const i = lintUsfmVerses([verseFromUsfm(usfmText)]);
+  assert.equal(reusedChecks(i).length, 0);
+});
+
 t("1CH 6:78 shape (differing x-occurrences on the shared token) still flags", () => {
   const zEt = (occ, occs) => `\\zaln-s |x-strong="H1" x-occurrence="${occ}" x-occurrences="${occs}" x-content="וְאֶת"\\*`;
   const zQedemoth = () => `\\zaln-s |x-strong="H2" x-occurrence="1" x-occurrences="1" x-content="קְדֵמוֹת"\\*`;

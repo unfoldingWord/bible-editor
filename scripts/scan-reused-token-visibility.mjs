@@ -28,8 +28,25 @@
 //   node --experimental-strip-types scripts/scan-reused-token-visibility.mjs --remote --json
 //
 // Exit code is ALWAYS 0 — this is a census, not a gate. The verses it lists are
-// upstream data defects for a human to repair; the counts are the regression
-// signal for a display fix (`invisible` should go to 0 while `total` holds).
+// upstream data defects for a human to repair.
+//
+// Visibility buckets, and which one is the display-fix regression signal:
+//   - A row only gets a `visible` / `one-chip` / `no-chip` visibility bucket
+//     when the MARKER actually flagged something (flagged.size > 0). These
+//     three answer "of the rows the marker flagged, how many chips rendered?"
+//   - Rows where the marker flagged nothing but lint did (a lint-only false
+//     positive — the marker never had anything to render) land in a separate
+//     `lint-only` bucket, not `no-chip`. Mixing them into `no-chip` would make
+//     that bucket unable to reach 0 while ANY lint false positive exists, and
+//     "flagged but nothing rendered" would then be true only by subtraction
+//     from a header that never said so.
+//   - `flaggedButUnrendered` (flagged.size > 0 && rendered.size < flagged.size)
+//     is THE regression signal for a display fix: it counts only rows where
+//     the marker found a real defect but some of it failed to render. It can
+//     be 0 even while lint-only false positives persist.
+// Verse 0 (chapter-front, no real verse content) is excluded from the target
+// scan, mirroring lintUsfmVerses's own skip of verse===0 — otherwise a verse-0
+// row could only ever land as marker-only and would inflate versesScanned.
 
 import { execSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -91,6 +108,17 @@ let versesScanned = 0;
 // census used as an acceptance gate must never let a silent exclusion read as
 // "covered everything."
 let versesSkipped = 0;
+// SOURCE (UHB/UGNT) rows that failed to parse and were dropped from the
+// per-chapter index. Behaviour is unchanged (still dropped) — this just makes
+// the drop attributable instead of silent. 0 expected.
+let sourceRowsUnparseable = 0;
+// Bridged target rows where concatSourceRange returned a DTO built from an
+// INCOMPLETE verse range — some interior/trailing source verse was missing,
+// so the row was still scanned but against a truncated source. Distinct from
+// versesSkipped (no source at all): this is a partial-source row that looks
+// covered but isn't.
+let truncatedSourceRanges = 0;
+const truncatedRefs = [];
 
 for (const bk of books) {
   const rows = query(
@@ -106,7 +134,7 @@ for (const bk of books) {
     let content;
     try {
       content = { verseObjects: JSON.parse(r.content_json).verseObjects ?? [] };
-    } catch { continue; } // unparseable source row → verse can't be anchored
+    } catch { sourceRowsUnparseable++; continue; } // unparseable source row → verse can't be anchored
     const byStart = sourceByChapter.get(r.chapter) ?? {};
     byStart[r.verse] = { ...r, content };
     sourceByChapter.set(r.chapter, byStart);
@@ -114,6 +142,10 @@ for (const bk of books) {
   let bookHits = 0;
   for (const r of rows) {
     if (r.bible_version !== "ULT" && r.bible_version !== "UST") continue;
+    // Skip verse 0 (chapter-front, no real verse content) for symmetry with
+    // lintUsfmVerses, which skips it too — otherwise a verse-0 row can only
+    // ever appear as marker-only and inflates versesScanned.
+    if (r.verse === 0) continue;
     // A verse-BRIDGE target row (`\v 6-9` → verse=6, verse_end=9) must be paired
     // with the source for its FULL range, exactly as the app does: Shell.tsx
     // feeds AlignmentPanel a synthetic DTO from concatSourceRange, joining UHB
@@ -124,15 +156,30 @@ for (const bk of books) {
     // pairing trap. 86 ULT/UST rows in prod are bridged, and 14 of them land in
     // this census, so getting this wrong silently corrupts the very counts the
     // acceptance criteria in issues #419 / #421 are written against.
-    const srcDto = concatSourceRange(
-      sourceByChapter.get(r.chapter),
-      r.verse,
-      r.verse_end ?? r.verse,
-    );
+    // Guard verse_end the same way api/src/pipelineImport.ts's
+    // sourceWordsForRange does: an anomalous verse_end < verse must not be
+    // treated as the range end (concatSourceRange would then see start > end
+    // and return null, silently dropping the verse from the census).
+    const rangeEnd = r.verse_end != null && r.verse_end >= r.verse ? r.verse_end : r.verse;
+    const srcDto = concatSourceRange(sourceByChapter.get(r.chapter), r.verse, rangeEnd);
     const src = srcDto?.content?.verseObjects;
     if (!src) { versesSkipped++; continue; } // no source verse → nothing to anchor against
+    // concatSourceRange returns a DTO as soon as the START verse exists, but
+    // silently skips any missing interior/trailing verse in [verse, rangeEnd]
+    // — so a bridged row can pass the `!src` check above while still carrying
+    // a TRUNCATED source. Detect that here rather than counting it as covered.
+    if (rangeEnd > r.verse) {
+      const chapterSource = sourceByChapter.get(r.chapter);
+      for (let v = r.verse; v <= rangeEnd; v++) {
+        if (!chapterSource?.[v]) {
+          truncatedSourceRanges++;
+          if (truncatedRefs.length < 10) truncatedRefs.push(`${bk} ${r.chapter}:${r.verse}-${rangeEnd} (missing v${v})`);
+          break;
+        }
+      }
+    }
     let vos;
-    try { vos = JSON.parse(r.content_json).verseObjects ?? []; } catch { continue; }
+    try { vos = JSON.parse(r.content_json).verseObjects ?? []; } catch { versesSkipped++; continue; }
     versesScanned++;
 
     // api-side lint feed (the chip a translator clicks through from).
@@ -163,8 +210,18 @@ for (const bk of books) {
 
     // A defect is only legible as "doubled Hebrew" when at least TWO flagged
     // chips actually draw — one lone red marker has no partner to compare to.
+    // These three buckets only apply when the MARKER flagged something; a
+    // lint-only false positive (flagged.size === 0) has nothing to render and
+    // gets its own `lint-only` bucket below, so it can't masquerade as a
+    // display-fix regression.
     const visibility =
-      rendered.size >= 2 ? "visible" : rendered.size === 1 ? "one-chip" : "no-chip";
+      flagged.size === 0
+        ? "lint-only"
+        : rendered.size >= 2
+          ? "visible"
+          : rendered.size === 1
+            ? "one-chip"
+            : "no-chip";
     findings.push({
       ref: `${bk} ${r.chapter}:${r.verse}`,
       resource: r.bible_version,
@@ -180,27 +237,66 @@ for (const bk of books) {
   if (!asJson) console.error(`  ${bk}: ${bookHits} verse(s)`);
 }
 
-const counts = { visible: 0, "one-chip": 0, "no-chip": 0 };
+const counts = { visible: 0, "one-chip": 0, "no-chip": 0, "lint-only": 0 };
 for (const f of findings) counts[f.visibility]++;
 const lintOnly = findings.filter((f) => f.lint && f.flagged === 0).length;
 const uiOnly = findings.filter((f) => !f.lint && f.flagged > 0).length;
+// THE regression signal for a display fix: rows where the marker flagged a
+// real defect but some (or all) of it failed to render. Unlike `no-chip`,
+// this can be 0 while lint-only false positives persist.
+const flaggedButUnrendered = findings.filter((f) => f.flagged > 0 && f.rendered < f.flagged).length;
 
 if (asJson) {
   console.log(
-    JSON.stringify({ versesScanned, versesSkipped, counts, lintOnly, uiOnly, findings }, null, 2),
+    JSON.stringify(
+      {
+        versesScanned,
+        versesSkipped,
+        sourceRowsUnparseable,
+        truncatedSourceRanges,
+        truncatedRefs,
+        counts,
+        lintOnly,
+        uiOnly,
+        flaggedButUnrendered,
+        findings,
+      },
+      null,
+      2,
+    ),
   );
 } else {
   for (const f of findings) {
     console.log(
       `${f.ref.padEnd(14)} ${f.resource}  lint=${f.lint ? "Y" : "n"}  ` +
         `flagged=${f.flagged} rendered=${f.rendered}  ${f.visibility.toUpperCase()}` +
-        (f.visibility === "visible" ? "" : "  <-- flagged but nothing doubled on screen"),
+        // Two DIFFERENT problems, so two different notes. A row can be `visible`
+        // (>=2 flagged chips draw, so the doubling reads) and STILL have a
+        // flagged word with no chip — JER 36:30 UST is exactly that: 3 flagged,
+        // 2 rendered. Printing "nothing doubled on screen" there would be false.
+        (f.flagged > 0 && f.rendered < f.flagged
+          ? f.visibility === "visible"
+            ? `  <-- visible, but ${f.flagged - f.rendered} flagged chip(s) do not render`
+            : "  <-- flagged but nothing doubled on screen"
+          : ""),
     );
   }
   console.log(
     `\n${findings.length} flagged verse(s) over ${versesScanned} scanned: ` +
-      `${counts.visible} visible, ${counts["one-chip"]} one-chip-only, ${counts["no-chip"]} no-chip.`,
+      `${counts.visible} visible, ${counts["one-chip"]} one-chip-only, ${counts["no-chip"]} no-chip, ` +
+      `${counts["lint-only"]} lint-only.`,
   );
   console.log(`detector disagreement: lintOnly=${lintOnly}, uiOnly=${uiOnly}`);
-  console.log(`verses skipped (no resolvable source): ${versesSkipped}`);
+  console.log(`flaggedButUnrendered (THE display-fix regression signal): ${flaggedButUnrendered}`);
+  console.log(`verses skipped (no resolvable source / unparseable content): ${versesSkipped}`);
+  console.log(`source rows unparseable (UHB/UGNT dropped from index): ${sourceRowsUnparseable}`);
+  console.log(
+    `truncated source ranges (bridged row missing an interior/trailing verse): ${truncatedSourceRanges}` +
+      (truncatedRefs.length > 0
+        ? `\n  ${truncatedRefs.join("\n  ")}` +
+          (truncatedSourceRanges > truncatedRefs.length
+            ? `\n  ...and ${truncatedSourceRanges - truncatedRefs.length} more`
+            : "")
+        : ""),
+  );
 }

@@ -549,8 +549,15 @@ export function mergeAdjacentSameSource(groups: AlignmentGroup[]): AlignmentGrou
 // case. It is NOT — that reading came from a census script that paired
 // verse-bridge rows (EZK 4:4-5) with only their FIRST source verse, so the marker
 // ran against a truncated source. With the full range paired, EZK 4:4 is not
-// flagged at all, and the corpus-wide count of flagged-but-unrenderable verses is
-// ZERO. Do not "fix" this on the strength of a verse that is fine; if you ever do
+// flagged at all. Do not "fix" this on the strength of a verse that is fine.
+//
+// ONE verse corpus-wide does have a flagged word that never gets a chip:
+// JER 36:30 UST, 3 flagged / 2 rendered (`flaggedButUnrendered` in
+// scripts/scan-reused-token-visibility.mjs). It still reads as doubled — two
+// chips draw — so it is a partial-render, not an invisible defect, and it is NOT
+// established that this fusion is the cause: JER 36:30 is also the verse whose
+// chains claim occurrences the source does not have (see findReusedSourceWordIds),
+// which is a separate mechanism. Diagnose before attributing. If you ever do
 // reconcile the key spaces, note it would change how legitimate
 // one-token-to-N-runs splits collapse, so it needs its own before/after sweep.
 export function mergeSamePositionGroups(
