@@ -40,6 +40,7 @@ import {
   buildPosMaps,
   buildSourceIndexMap,
 } from "../web/src/lib/alignmentHover.ts";
+import { concatSourceRange } from "../web/src/lib/verseRange.ts";
 import { lintUsfmVerses } from "../api/src/lint.ts";
 
 const argv = process.argv.slice(2);
@@ -64,7 +65,10 @@ function query(sql) {
       );
     } catch (e) {
       lastErr = e;
-      const out = String(e?.stdout ?? "");
+      // Check BOTH streams: wrangler writes its errors to stderr, so matching
+      // only stdout meant the retry never fired and a transient CF auth blip
+      // aborted the whole (~15 minute) census run.
+      const out = String(e?.stdout ?? "") + String(e?.stderr ?? "");
       if (out.includes("10000") || out.includes("Authentication")) continue;
       throw e;
     }
@@ -83,6 +87,10 @@ const books = onlyBook
 
 const findings = [];
 let versesScanned = 0;
+// Verses excluded because no source could be resolved. Reported explicitly: a
+// census used as an acceptance gate must never let a silent exclusion read as
+// "covered everything."
+let versesSkipped = 0;
 
 for (const bk of books) {
   const rows = query(
@@ -90,19 +98,39 @@ for (const bk of books) {
       `WHERE book='${bk.replace(/'/g, "''")}' AND bible_version IN ('ULT','UST','UHB','UGNT') ` +
       `ORDER BY chapter, verse, bible_version`,
   );
-  // Index the source (UHB for OT, UGNT for NT) by chapter:verse.
-  const source = new Map();
+  // Index the source (UHB for OT, UGNT for NT) per chapter, keyed by verse
+  // START, as VerseDtos — the shape concatSourceRange expects.
+  const sourceByChapter = new Map();
   for (const r of rows) {
     if (r.bible_version !== "UHB" && r.bible_version !== "UGNT") continue;
+    let content;
     try {
-      source.set(`${r.chapter}:${r.verse}`, JSON.parse(r.content_json).verseObjects ?? []);
-    } catch { /* unparseable source row → verse simply can't be anchored */ }
+      content = { verseObjects: JSON.parse(r.content_json).verseObjects ?? [] };
+    } catch { continue; } // unparseable source row → verse can't be anchored
+    const byStart = sourceByChapter.get(r.chapter) ?? {};
+    byStart[r.verse] = { ...r, content };
+    sourceByChapter.set(r.chapter, byStart);
   }
   let bookHits = 0;
   for (const r of rows) {
     if (r.bible_version !== "ULT" && r.bible_version !== "UST") continue;
-    const src = source.get(`${r.chapter}:${r.verse}`);
-    if (!src) continue; // no source verse → neither detector can resolve positions
+    // A verse-BRIDGE target row (`\v 6-9` → verse=6, verse_end=9) must be paired
+    // with the source for its FULL range, exactly as the app does: Shell.tsx
+    // feeds AlignmentPanel a synthetic DTO from concatSourceRange, joining UHB
+    // 6,7,8,9 into one token stream. Pairing a bridged row with only its first
+    // source verse leaves every token from verses 7-9 unresolvable, so
+    // reusedTokenKey falls back to content|occurrence and both the reform and
+    // the marker run against a truncated source — the documented bridge-row
+    // pairing trap. 86 ULT/UST rows in prod are bridged, and 14 of them land in
+    // this census, so getting this wrong silently corrupts the very counts the
+    // acceptance criteria in issues #419 / #421 are written against.
+    const srcDto = concatSourceRange(
+      sourceByChapter.get(r.chapter),
+      r.verse,
+      r.verse_end ?? r.verse,
+    );
+    const src = srcDto?.content?.verseObjects;
+    if (!src) { versesSkipped++; continue; } // no source verse → nothing to anchor against
     let vos;
     try { vos = JSON.parse(r.content_json).verseObjects ?? []; } catch { continue; }
     versesScanned++;
@@ -125,7 +153,7 @@ for (const bk of books) {
 
     // Panel side: the detector's verdict, and how much of it survives to render.
     const state = parseAlignment(vos, src);
-    const indexMap = buildSourceIndexMap({ content: { verseObjects: src } });
+    const indexMap = buildSourceIndexMap(srcDto);
     const display = buildDisplayGroups(state, indexMap);
     const flagged = buildPosMaps(state, display, indexMap).reusedSourceIds;
     if (!lint && flagged.size === 0) continue;
@@ -158,7 +186,9 @@ const lintOnly = findings.filter((f) => f.lint && f.flagged === 0).length;
 const uiOnly = findings.filter((f) => !f.lint && f.flagged > 0).length;
 
 if (asJson) {
-  console.log(JSON.stringify({ versesScanned, counts, lintOnly, uiOnly, findings }, null, 2));
+  console.log(
+    JSON.stringify({ versesScanned, versesSkipped, counts, lintOnly, uiOnly, findings }, null, 2),
+  );
 } else {
   for (const f of findings) {
     console.log(
@@ -172,4 +202,5 @@ if (asJson) {
       `${counts.visible} visible, ${counts["one-chip"]} one-chip-only, ${counts["no-chip"]} no-chip.`,
   );
   console.log(`detector disagreement: lintOnly=${lintOnly}, uiOnly=${uiOnly}`);
+  console.log(`verses skipped (no resolvable source): ${versesSkipped}`);
 }

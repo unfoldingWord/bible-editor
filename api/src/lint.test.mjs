@@ -244,12 +244,18 @@ t("legal compound [A|1,B|1] + standalone [A|2] is NOT flagged (token identity ke
 });
 
 // Regression pins for a source-token-count suppression that was tried and
-// reverted: measured against the full corpus, it silenced lint on these two
-// real defects (among others) by treating "source has >= N physical tokens
-// of this content" as proof the N chains claiming it were merely
-// mis-numbered rather than genuinely reused. See the scope comment on
-// hasReusedSourceToken — do not re-add a suppressor that would flip these.
-t("LEV 24:10 shape (standalone + compound both resolving to the same token) still flags", () => {
+// reverted: it treated "source has >= N physical tokens of this content" as
+// proof the N chains claiming it were merely mis-numbered rather than genuinely
+// reused, and so would flip both of these to unflagged.
+//
+// These pin LINT's behaviour for the two shapes, which is what the suppressor
+// would change. They are NOT both evidence of real alignment defects — that
+// claim was measured with a census script that mis-paired verse-bridge rows:
+// 1CH 6:78 UST is a genuine defect (marker flags 4 words), but LEV 24:10 UST is
+// NOT (marker flags 0; it is a lint false positive). See the scope comment on
+// hasReusedSourceToken. Keep both pins — a suppressor flipping them is still the
+// signal worth catching — but do not cite the LEV one as proof of corruption.
+t("LEV 24:10 shape (standalone + compound sharing one key) still flags", () => {
   const zBen = (occ) => `\\zaln-s |x-strong="H1" x-occurrence="${occ}" x-occurrences="2" x-content="בֶּן"\\*`;
   const zWoman = () => `\\zaln-s |x-strong="H2" x-occurrence="1" x-occurrences="1" x-content="הָאִשָּׁה"\\*`;
   const zIsraelite = () => `\\zaln-s |x-strong="H3" x-occurrence="1" x-occurrences="1" x-content="הַיִּשְׂרְאֵלִית"\\*`;

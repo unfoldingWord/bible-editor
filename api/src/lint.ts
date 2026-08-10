@@ -261,41 +261,55 @@ function hasGluedMilestone(nodes: unknown[]): boolean {
 //
 // This check DISAGREES with the aligner's marker in BOTH directions. Measured
 // against the whole of prod D1 — 37 books, 51,848 ULT/UST verses with a source
-// verse, via scripts/scan-reused-token-visibility.mjs: 63 verses flagged by
-// either detector, of which BOTH agreed on 26, only this check flagged 12, and
-// only the marker flagged 25. (These are the PRE-fix figures; see below.)
+// verse, via scripts/scan-reused-token-visibility.mjs, before and after the
+// chain-signature fix below:
 //
-// The 12 lint-only flags were FALSE POSITIVES, all traced to identity here
-// being keyed on RAW x-occurrence while findReusedSourceWordIds runs after
-// parseAlignment has reformed occurrences against the real UHB/UGNT. The
-// CHAIN SIGNATURE fix below closes 8 of the 12 (JER 33:7, 33:11, 35:3, 35:11,
-// 37:9, 37:10, MAT 9:20, ZEC 11:11) — two chains over the SAME tokens used to
-// differ only in a raw x-occurrence the reform normalizes away (JER 33:7
-// writes וַהֲשִׁבֹתִי as occurrence 1 in one chain and 2 in the other, of a
-// token the UHB contains once). The chain signature now strips the occurrence
-// suffix before comparing chains, so this legitimate one-token-to-two-
-// target-runs split no longer looks like two distinct chains.
+//              flagged  both  lint-only  marker-only
+//   before        58     20      18          20
+//   after         50     19      10          21
 //
-// The remaining 4 are DELIBERATELY still flagged — a source-token-count
-// suppression (count real source `\w` tokens per NFC content, suppress when
-// the source holds at least as many as there are chains claiming it) was
-// tried and reverted, because measured against the whole corpus it silenced
-// lint on 3 verses the aligner's marker still flags as real defects, 2 of
-// which are genuine data corruption: LEV 24:10 UST (source has בֶּן twice, so
-// the count-2/chains-2 proxy suppressed it, but both chains resolve to the
-// SAME token — real reuse) and 1CH 6:78 UST (source has וְאֶת three times,
-// count-3/chains-2 suppressed it, but the target stamps FOUR וְאֶת
-// milestones — real defect). Losing those two real detections to remove three
-// false alarms was the wrong trade, and no cheaper proxy for the full
-// occurrence reform avoids it. See the "reverted source-token-count
-// suppression" regression tests below (LEV 24:10 / 1CH 6:78 shapes) — they
-// pin this so nobody re-adds that suppressor without re-discovering why it
-// left:
-//   - 1CH 22:19 and PSA 71:9 — two genuinely distinct source tokens both
-//     stamped x-occurrence="1"; separating them needs the real occurrence
-//     reform. Lint keeps crying wolf on these two BY CHOICE, because the only
-//     cheap proxy available also silences real defects.
-//   - REV 4:9 — same shape as 1CH 22:19 / PSA 71:9.
+// The lint-only column is this check's false positives. All of them trace to
+// identity here being keyed on RAW x-occurrence while findReusedSourceWordIds
+// runs after parseAlignment has reformed occurrences against the real UHB/UGNT.
+// The CHAIN SIGNATURE fix closes 8 (JER 33:7, 33:11, 35:3, 35:11, 37:9, 37:10,
+// MAT 9:20, ZEC 11:11) — two chains over the SAME tokens used to differ only in
+// a raw x-occurrence the reform normalizes away (JER 33:7 writes וַהֲשִׁבֹתִי as
+// occurrence 1 in one chain and 2 in the other, of a token the UHB contains
+// once). The signature now strips the occurrence suffix before comparing chains,
+// so that legitimate one-token-to-two-target-runs split no longer looks like two
+// distinct chains.
+//
+// TRUST THE NUMBERS ABOVE, NOT EARLIER ONES. An earlier revision of this comment
+// claimed 63 flagged / 12 lint-only / 4 remaining. Those came from a census
+// script that paired verse-BRIDGE target rows (`\v 6-9`) with only their FIRST
+// source verse, so the marker ran against a truncated source and spuriously
+// "flagged" six verses that are in fact lint-only (1CH 8:8, 1CH 8:12, ACT 1:24,
+// JOS 14:3, LEV 24:10, MAT 7:13). The script now pairs the full range via the
+// app's own concatSourceRange. Any future figure quoted here must come from that
+// fixed script.
+//
+// The 10 that remain are DELIBERATELY still flagged: 1CH 8:8, 1CH 8:12,
+// 1CH 22:19, ACT 1:24, JOS 14:3, LEV 24:10, MAT 7:13, PSA 71:9, REV 4:9 all
+// stamp two genuinely distinct source tokens with the same x-occurrence, so
+// telling them apart needs the real occurrence reform this check cannot run;
+// and HAB 1:3 is the reversed-nesting case below. Lint cries wolf on these BY
+// CHOICE — see the reverted-suppression note next for what the cheap
+// alternative cost.
+//
+// A source-token-count suppression (count real source `\w` tokens per NFC
+// content, suppress when the source holds at least as many as there are chains
+// claiming it) was tried and REVERTED, because it silenced lint on verses the
+// marker still flags as real. **Its evidence is only partly re-verified.** With
+// the fixed script, 1CH 6:78 UST is still a genuine defect it would suppress
+// (source has וְאֶת three times, the target stamps FOUR milestones, marker
+// flags 4 words) — but LEV 24:10 UST, the other verse originally cited, is
+// NOT a real defect at all (marker flags 0; it is one of the 10 lint-only
+// false positives above). So the revert rests on 1CH 6:78 alone and has not
+// been re-measured end to end against the fixed script. Do not treat "the
+// suppressor is definitively wrong" as settled: re-measure both directions
+// before either restoring or re-rejecting it. The two regression tests below
+// (LEV 24:10 / 1CH 6:78 shapes) pin the LINT behaviour for those shapes, which
+// is stable either way — but the LEV one is NOT evidence of a real defect.
 // The occurrence-insensitive signature has a KNOWN HOLE, and it is accepted
 // deliberately: two chains `[A|1, B|1]` and `[A|1, B|2]` both sign as "A,B", so
 // a genuinely reused A goes unreported whenever the source really does hold two
@@ -317,12 +331,7 @@ function hasGluedMilestone(nodes: unknown[]): boolean {
 //     source order and exempts it as a split. A real encoding oddity, not a
 //     false positive — do not weaken either detector to reconcile it.
 //
-// Measured on prod D1 after this fix (37 books, 51,848 ULT/UST verses with a
-// source verse, via scripts/scan-reused-token-visibility.mjs): 55 flagged
-// verses — 25 agreed by both detectors, 4 by this check alone (the four named
-// above), 26 by the aligner's marker alone. Before the fix: 63 verses,
-// lintOnly=12, uiOnly=25. The single verse this fix stops flagging that the
-// marker still calls a defect is JER 37:5, and it was never flagging for the
+// The single verse this fix stops flagging that the
 // right reason: its real reuse (שִׁמְעָם claimed by a compound and a standalone)
 // is invisible to a check with no source rows in BOTH the old and new logic —
 // the old lint=Y came from an unrelated occurrence artefact in the same verse.

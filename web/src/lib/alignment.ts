@@ -537,14 +537,22 @@ export function mergeAdjacentSameSource(groups: AlignmentGroup[]): AlignmentGrou
 // can't prove it's a duplicate). Display-only: callers pass display groups, so
 // state.sourceGroups (and therefore serialize/export) is untouched.
 //
-// KNOWN RESIDUAL, one verse corpus-wide (EZK 4:4 UST): this fusion keys on
-// resolveSourcePos, which carries a strong-based fallback, while the
+// LATENT KEY-SPACE MISMATCH, currently mis-rendering nothing: this fusion keys
+// on resolveSourcePos, which carries a strong-based fallback, while the
 // reused-source-token marker keys on reusedTokenKey, which deliberately does
-// not. The two key spaces can therefore disagree, and here a fused card
-// swallowed a FLAGGED standalone group — so one of the two red chips still has
-// nowhere to draw even with the strip exemption in place. Reconciling the key
-// spaces (or exempting flagged groups from fusion) would change how legitimate
-// one-token-to-N-runs splits collapse, so it is deliberately not done here.
+// not (that fallback collapses distinct same-Strong tokens and invents reuse).
+// The two key spaces can therefore disagree in principle, and a fused card could
+// swallow a group whose word the marker flags, leaving a red chip nowhere to
+// draw.
+//
+// An earlier revision of this comment asserted that EZK 4:4 UST was exactly that
+// case. It is NOT — that reading came from a census script that paired
+// verse-bridge rows (EZK 4:4-5) with only their FIRST source verse, so the marker
+// ran against a truncated source. With the full range paired, EZK 4:4 is not
+// flagged at all, and the corpus-wide count of flagged-but-unrenderable verses is
+// ZERO. Do not "fix" this on the strength of a verse that is fine; if you ever do
+// reconcile the key spaces, note it would change how legitimate
+// one-token-to-N-runs splits collapse, so it needs its own before/after sweep.
 export function mergeSamePositionGroups(
   groups: AlignmentGroup[],
   positionKey: (g: AlignmentGroup) => string | null,
@@ -660,18 +668,11 @@ export function positionsShareOwner(
 //
 // The two detectors do NOT fully agree, and the disagreement runs BOTH ways —
 // an earlier version of this comment claimed it was one-directional on the
-// strength of a five-book sample. A whole-prod-D1 measurement (37 books, 51,848
-// ULT/UST verses with a source verse, via scripts/scan-reused-token-visibility.mjs)
-// found 63 verses flagged by either detector — 26 by both, 25 by this detector
-// only, 12 by api-side lint only.
-//
-// Those figures are PRE-FIX and the lintOnly one is now stale: hasReusedSourceToken
-// has since had a chain-signature fix that closes 8 of the 12, leaving 4 (three
-// that need the occurrence reform lint cannot run, plus HAB 1:3 — reversed
-// nesting that THIS detector resolves to one canonical order and exempts, an
-// intentional disagreement). Do not restate a lintOnly number here — the
-// current, authoritative figures and the per-verse breakdown live in ONE place,
-// the scope comment on hasReusedSourceToken in api/src/lint.ts. This detector remains the
+// strength of a five-book sample, and a later one quoted counts from a census
+// script that mis-paired verse-bridge rows. Do not restate any count here: the
+// authoritative figures and the per-verse breakdown live in ONE place, the scope
+// comment on hasReusedSourceToken in api/src/lint.ts, measured by
+// scripts/scan-reused-token-visibility.mjs. This detector remains the
 // more reliable of the two for the mechanisms lint has no source rows for (a
 // merged shared `\zaln-s` prefix, or a missing x-occurrence) — do not "fix"
 // this detector to match the feed.
