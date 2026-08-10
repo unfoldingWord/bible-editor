@@ -57,23 +57,30 @@ import { activePipelineForChapter } from "./chapterLock";
 import { coerceRowId } from "./rowId";
 import { planTnContentDedup } from "./tnDedup";
 import { isCatastrophicTsvShrink } from "./shrinkGuard";
-import { classifyReimportRow, isReimportableRow } from "./reimportClassify";
+import {
+  classifyReimportRow,
+  isReimportableRow,
+  computeEditedFieldMerge,
+  type EditedFieldMerge,
+} from "./reimportClassify";
 import { shouldRecordResourceSync } from "./reimportSyncGate";
 import { computeTwlSortOrderUpdates } from "./twlCanonicalOrder";
 import { applyTwlSortOrderUpdates } from "./twlSortOrderApply";
 import { loadTwTitles } from "./twTitles";
 import { loadTwlOrderLocks } from "./twlOrderLocks";
 import type { TwlRow, VerseRow } from "./types";
+// REIMPORT_CHAPTER_CHUNK / reimportChunkBoundaries live in their own
+// zero-dependency module (reimportChunkPlan.ts) so the chunk-boundary math —
+// including the chapter-0 handling — is unit-testable directly under plain
+// node; re-exported below so every existing internal/external reference keeps
+// working unchanged.
+import { REIMPORT_CHAPTER_CHUNK, reimportChunkBoundaries } from "./reimportChunkPlan";
 
 export type Resource = "ult" | "ust" | "tn" | "tq" | "twl";
 
 export const ALL_RESOURCES: readonly Resource[] = ["ult", "ust", "tn", "tq", "twl"];
 
-// Chapters per Workflow step in the chunked reimport. Sized so even the largest
-// book (Psalms, 150 ch) stays well under Cloudflare's 600 000 ms per-step limit
-// that the old whole-book reimport blew on Isaiah. In steady state the
-// per-resource SHA gate skips unchanged files entirely, so this rarely bites.
-export const REIMPORT_CHAPTER_CHUNK = 8;
+export { REIMPORT_CHAPTER_CHUNK, reimportChunkBoundaries };
 
 // Max statements per env.DB.batch() write. D1 caps a batch at 100 statements and
 // 100 bound params per statement; 90 stays safely under both. The batched
@@ -96,6 +103,13 @@ export interface ReimportCounts {
   // Pristine rows soft-deleted because master no longer carries their id. Only
   // the TSV resources populate this (verses are never row-deleted on reimport).
   deleted: number;
+  // TSV rows that stayed human-owned (updated_by untouched) but had one or
+  // more never-human-owned or whitespace-only fields (tags; note/question/
+  // response when the only difference is incidental whitespace) synced in
+  // from master. See computeEditedFieldMerge in reimportClassify.ts. Distinct
+  // from skipped_edited/reimported_ai — the row is neither a no-op skip nor
+  // reclaimed to master ownership.
+  merged_fields: number;
   skipped_edited: number;
   skipped_locked: number;
   // Chapters skipped this run because an active AI pipeline job held the
@@ -168,6 +182,7 @@ function zeroCounts(): ReimportCounts {
     reimported_ai: 0,
     inserted: 0,
     deleted: 0,
+    merged_fields: 0,
     skipped_edited: 0,
     skipped_locked: 0,
     chapters_locked: 0,
@@ -189,6 +204,7 @@ function addCounts(into: ReimportCounts, from: ReimportCounts): void {
   into.reimported_ai += from.reimported_ai;
   into.inserted += from.inserted;
   into.deleted += from.deleted;
+  into.merged_fields += from.merged_fields ?? 0;
   into.skipped_edited += from.skipped_edited;
   into.skipped_locked += from.skipped_locked;
   // `?? 0` guards a `from` object memoized by a Workflow instance that began
@@ -616,6 +632,11 @@ async function applyTsvRows(
   // untouched. Counted `reimported_ai`.
   const aiReseeds: Array<{ row: ParsedTsvRow; sortOrder: number; oldVersion: number }> = [];
   const resurrects: Array<{ row: ParsedTsvRow; sortOrder: number; oldVersion: number }> = [];
+  // Rows classified "edited" (human-owned) that still have master-owned or
+  // whitespace-only fields to sync in — see computeEditedFieldMerge. Written
+  // in their own batch below WITHOUT touching updated_by; the row stays
+  // human-owned. `id` is carried separately from `merge` for the write.
+  const fieldMerges: Array<{ id: string; oldVersion: number; merge: EditedFieldMerge }> = [];
   for (let i = 0; i < incoming.length; i++) {
     const row = incoming[i];
     const sortOrder = nextSort(row.chapter, row.verse);
@@ -705,7 +726,37 @@ async function applyTsvRows(
       continue;
     }
     if (fate === "edited") {
-      counts.skipped_edited++;
+      // The row is human-owned, but some columns never are (or aren't on this
+      // kind) — see computeEditedFieldMerge. Compare D1's current values
+      // against master's incoming ones; only tags/note/question/response can
+      // ever qualify, and protections (deleted_at/trashed_at/preserve/hint)
+      // block it outright regardless of field.
+      const merge = computeEditedFieldMerge(
+        kind,
+        {
+          tags: (cur.tags as string | null) ?? null,
+          note: kind === "tn" ? ((cur.note as string | null) ?? null) : undefined,
+          question: kind === "tq" ? ((cur.question as string | null) ?? null) : undefined,
+          response: kind === "tq" ? ((cur.response as string | null) ?? null) : undefined,
+        },
+        {
+          tags: row.tags,
+          note: kind === "tn" ? (row.note ?? null) : undefined,
+          question: kind === "tq" ? (row.question ?? null) : undefined,
+          response: kind === "tq" ? (row.response ?? null) : undefined,
+        },
+        {
+          deleted_at: cur.deleted_at as number | null,
+          trashed_at: cur.trashed_at as number | null,
+          preserve: cur.preserve as number | null,
+          hint: cur.hint as number | null,
+        },
+      );
+      if (merge) {
+        fieldMerges.push({ id: row.id, oldVersion: Number(cur.version), merge });
+      } else {
+        counts.skipped_edited++;
+      }
       continue;
     }
     if (fate === "update_ai") {
@@ -801,7 +852,80 @@ async function applyTsvRows(
     }
   }
 
+  // Batch the field-only merges on human-edited rows. Modeled directly on the
+  // verse source-attr reconcile above (applyVerseRows step 4): version-CAS
+  // UPDATE (`AND version = oldVersion`), the SAME protections isReimportableRow
+  // checks re-asserted at write time (deleted_at/trashed_at/preserve/hint for
+  // tn; deleted_at only for tq/twl), and updated_by is NEVER touched — the row
+  // stays human-owned. A human PATCH landing between the read and this batch
+  // bumps version → 0 rows changed → counted skipped_edited (no clobber, no
+  // lost update). Audited as 'update' with only the merged fields as payload.
+  for (let i = 0; i < fieldMerges.length; i += WRITE_BATCH) {
+    const slice = fieldMerges.slice(i, i + WRITE_BATCH);
+    try {
+      const results = await env.DB.batch(
+        slice.map((u) => buildTsvFieldMergeStmt(env, book, kind, u.id, u.merge, u.oldVersion, now)),
+      );
+      const logs: D1PreparedStatement[] = [];
+      slice.forEach((u, j) => {
+        if ((results[j]?.meta.changes ?? 0) > 0) {
+          counts.merged_fields++;
+          logs.push(logEditStmt(env, kind, u.id, book, userId, u.oldVersion, u.oldVersion + 1, "update", u.merge));
+        } else {
+          counts.skipped_edited++;
+        }
+      });
+      if (logs.length) await env.DB.batch(logs);
+    } catch (e) {
+      counts.errors.push(`${kind} field-merge batch: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+
   return counts;
+}
+
+// Build (don't run) the field-only merge UPDATE for one edited TSV row, for
+// env.DB.batch(). Only the columns present in `merge` are written (tags and/or
+// note/question/response — see computeEditedFieldMerge); every other column,
+// including sort_order, is left exactly as the human left it. version-CAS
+// (`AND version = oldVersion`) is the concurrency guard — NOT `updated_by IS
+// NULL` (the row IS human-owned) — and updated_by is never included in the
+// SET, so the row stays attributed to that human. The same protections
+// isReimportableRow checks are re-asserted in the WHERE clause so a delete/
+// trash/preserve/hint change landing between the read and this batch also
+// blocks the write rather than racing it.
+function buildTsvFieldMergeStmt(
+  env: Env,
+  book: string,
+  kind: TsvKind,
+  id: string,
+  merge: EditedFieldMerge,
+  oldVersion: number,
+  now: number,
+): D1PreparedStatement {
+  const cols = Object.keys(merge) as Array<keyof EditedFieldMerge>;
+  const binds: unknown[] = [];
+  let p = 1;
+  const setClauses = cols.map((c) => {
+    binds.push(merge[c] ?? null);
+    return `${c} = ?${p++}`;
+  });
+  setClauses.push(`version = version + 1`, `updated_at = ?${p}`);
+  binds.push(now);
+  p++;
+  const protection =
+    kind === "tn"
+      ? `deleted_at IS NULL AND trashed_at IS NULL AND preserve = 0 AND hint = 0`
+      : `deleted_at IS NULL`;
+  const idParam = p++;
+  const bookParam = p++;
+  const versionParam = p++;
+  binds.push(id, book, oldVersion);
+  return env.DB.prepare(
+    `UPDATE ${kind}_rows
+        SET ${setClauses.join(", ")}
+      WHERE id = ?${idParam} AND book = ?${bookParam} AND ${protection} AND version = ?${versionParam}`,
+  ).bind(...binds);
 }
 
 // Returns true if the row was inserted (was new), false if it already existed
@@ -1764,10 +1888,20 @@ export async function changedTsvChapters(
       ? `updated_by IS NULL AND deleted_at IS NULL AND trashed_at IS NULL AND preserve = 0 AND hint = 0`
       : `updated_by IS NULL AND deleted_at IS NULL`;
 
+  // Chapter 0 (refParts("front:intro") in importParsers.ts) is a real,
+  // syncable chapter — a book-level intro TN/TQ/TWL row — NOT a sentinel to
+  // exclude. The old `< 1` guard here excluded it from both maps, so a
+  // chapter-0 row could never be seen as "changed" and this diff gate never
+  // planned it for reimport: the export pushes D1's chapter-0 rows to master
+  // every night, but a hand-edit made directly on master never came back,
+  // reverted forever (a DCS maintainer's front:intro edits survived 0/2
+  // nights). `< 0` keeps the defensive floor (parseTsvRow/refParts never
+  // actually yields negative, but a malformed ref still shouldn't crash this)
+  // while letting chapter 0 flow through like any other chapter.
   const incoming = new Map<number, Map<string, string>>();
   for (const r of parseTsv(rawTsv).rows) {
     const p = parseTsvRow(r, kind);
-    if (!p || p.chapter < 1) continue;
+    if (!p || p.chapter < 0) continue;
     let m = incoming.get(p.chapter);
     if (!m) incoming.set(p.chapter, (m = new Map()));
     m.set(p.id, tsvRowSignature(kind, p));
@@ -1781,7 +1915,7 @@ export async function changedTsvChapters(
     .all<Record<string, unknown>>();
   for (const row of res.results) {
     const p = storedTsvRowToParsed(kind, row);
-    if (p.chapter < 1) continue;
+    if (p.chapter < 0) continue;
     let m = stored.get(p.chapter);
     if (!m) stored.set(p.chapter, (m = new Map()));
     m.set(p.id, tsvRowSignature(kind, p));
@@ -1831,7 +1965,10 @@ async function softDeleteRemovedTsvRows(
     const p = parseTsvRow(r, kind);
     if (!p) continue;
     incomingIds.add(p.id);
-    if (p.chapter >= 1) coveredChapters.add(p.chapter);
+    // >= 0, not >= 1: chapter 0 (refParts("front:intro")) is a real chapter
+    // whose deletions must prune too — see changedTsvChapters above for the
+    // one-way-sync bug this is the delete-side half of.
+    if (p.chapter >= 0) coveredChapters.add(p.chapter);
   }
   // Defensive: an empty or garbled file must never sweep a book clean.
   if (incomingIds.size === 0) return { deleted: 0, skippedLocked: 0 };
@@ -1996,6 +2133,11 @@ async function reimportStagedChunk(
   }
 
   // TSV: one parse per kind, grouped by chapter (within the chunk range).
+  // No chapter-0 special case needed here: this range filter is generic on
+  // whatever [startChapter, endChapter] the caller passes, and
+  // runChunkedReimport's first chunk now passes startChapter=0 (see
+  // reimportChunkBoundaries) so a front:intro row (chapter 0) already falls
+  // inside the range without touching this comparison.
   const rowsByChapter: Partial<Record<TsvKind, Map<number, ParsedTsvRow[]>>> = {};
   for (const kind of ["tn", "tq", "twl"] as TsvKind[]) {
     const raw = rawByResource[kind];
@@ -2097,8 +2239,7 @@ export async function runChunkedReimport(
   });
 
   const perResource = freshPerResource();
-  for (let start = 1; start <= plan.maxChapter; start += chunkSize) {
-    const end = Math.min(start + chunkSize - 1, plan.maxChapter);
+  for (const { start, end } of reimportChunkBoundaries(plan.maxChapter, chunkSize)) {
     const counts = await step.do(
       `reimport-${book}-ch${start}-${end}`,
       { retries: { limit: 2, delay: "10 seconds", backoff: "exponential" } },

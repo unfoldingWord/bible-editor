@@ -41,9 +41,15 @@ import {
   classifyAlignmentLossSeverity,
   offenderProvenanceFromLog,
   RESOURCE_TARGETS,
+  usfmRevertReport,
+  tsvRevertReport,
+  shouldRecordRevertReport,
+  classifyRevertSeverity,
   type AlignmentShrinkResult,
   type OffenderProvenance,
   type Resource,
+  type UsfmRevertEntry,
+  type TsvRevertEntry,
 } from "./export";
 
 // Banner target for export PR failures — same maintainer the post-export
@@ -54,6 +60,12 @@ const EXPORT_ALERT_USERNAME = "deferredreward";
 // Pruned best-effort on each export so it doesn't linger; safe to delete since
 // the live-snapshot flow is no longer used (its post-export path is dormant).
 const LEGACY_EXPORT_BRANCH = "live-snapshot";
+
+// D1 statement-per-batch chunk size for recordExportReverts. Matches the
+// WRITE_BATCH convention already used for bulk D1 writes in bookReimport.ts —
+// a book's revert report (one row per differing verse/note row) can exceed a
+// batch's safe statement count for a big book, where this feature matters most.
+const REVERT_WRITE_BATCH = 90;
 import { applyTwlSortOrderUpdates } from "./twlSortOrderApply";
 import { loadTwTitles } from "./twTitles";
 import { loadTwlOrderLocks } from "./twlOrderLocks";
@@ -441,8 +453,10 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     // Only when we'd actually commit (dcsAllowed) and only for TSV resources,
     // whose row==line model makes the count exact. This is what would have
     // stopped the twl_PSA clobber (4880 rows shipped over master's 7776).
+    let tsvMasterContentForRevertReport: string | null = null;
     if (dcsAllowed && (resource === "tn" || resource === "tq" || resource === "twl")) {
       const guard = await this.checkTsvShrink(book, resource, built.rowCount, built.content);
+      tsvMasterContentForRevertReport = guard.masterContent;
       if (!guard.ok && allowShrink && guard.detail.startsWith("shrink_")) {
         // Explicit human override for a verified-intentional deletion. Scoped to
         // a real shrink only — "master_unreadable" still fails closed, since an
@@ -549,6 +563,14 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       }
     }
 
+    // Export-revert report for tn/tq/twl is recorded further down, after
+    // commitToDcs actually runs — see the comment there for why. (It used to
+    // run right here, right after tsvMasterContentForRevertReport was
+    // captured, on the false premise that reaching this line meant the
+    // export would ship; the hard-reject guard below and the DCS commit
+    // itself can still stop it. tsvMasterContentForRevertReport itself is
+    // still captured above by checkTsvShrink — only the recording moved.)
+
     // There is deliberately NO blank required-field HOLD gate here any more.
     //
     // The `blank_field_guard` gate this replaces held an entire book+resource
@@ -635,8 +657,10 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     // broken-link icon. Only bug-shaped loss (a flattened verse, a gutted
     // verse, systemic scale, a broken render, an unverifiable master) still
     // holds the book back.
+    let usfmMasterContentForRevertReport: string | null = null;
     if (dcsAllowed && (resource === "ult" || resource === "ust")) {
       const guard = await this.checkUsfmAlignmentShrink(book, resource, built.content);
+      usfmMasterContentForRevertReport = guard.masterContent;
       if (guard.ok && guard.detail === "ok") {
         // Checked this book+resource against master and found no alignment
         // loss — clear any stale rows a PAST export's loss left behind so the
@@ -681,6 +705,14 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
         }
       }
     }
+
+    // Export-revert report for ult/ust is recorded further down, after
+    // commitToDcs actually runs — see the comment there for why. (It used to
+    // run right here, on the false premise that reaching this line meant the
+    // export would ship; the USFM validation HOLD gate immediately below, and
+    // the DCS commit itself, can still stop it. usfmMasterContentForRevertReport
+    // itself is still captured above by checkUsfmAlignmentShrink — only the
+    // recording moved.)
 
     // USFM structural validation HOLD gate for the scripture resources. Ports
     // DCS's own validate_usfm_files.py Check 7 (consecutive paragraph markers)
@@ -747,6 +779,46 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       }
       dcsCommitSha = commit.commitSha || null;
       dcsChanged = commit.changed;
+
+      // Export-revert report (observational only — see the "Export-revert
+      // report" section in export.ts). Recorded HERE, immediately after the
+      // commit itself, not near the shrink/alignment guards that captured
+      // master's content earlier in this method: whether this export
+      // actually overwrites anything on master is only knowable once
+      // commitToDcs has run. The hard-reject guard, the alignment-shrink
+      // backstop, and the USFM validation HOLD gate all sit between those
+      // guards and here and can still return early with nothing committed —
+      // recording used to happen right after the master content was
+      // captured, so a book that failed validateUsfm still got an "overwrote
+      // master" alert despite pushing nothing.
+      //
+      // Gated on `dcsChanged`, not merely on reaching this line: dcsChanged
+      // is `commit.changed` from the commitToDcs call just above, true only
+      // when THIS run pushed new content. A content match
+      // (`branchTouched:false`) or a branch that already carried an earlier
+      // run's identical commit (`branchTouched:true, changed:false`) means
+      // nothing was freshly overwritten tonight — reporting either would be
+      // false (nothing changed) or a duplicate of a night that already
+      // recorded it. Still no second fetch: usfmMasterContentForRevertReport
+      // / tsvMasterContentForRevertReport are the same raw content the
+      // shrink/alignment guards captured earlier in this method.
+      if (
+        (resource === "ult" || resource === "ust") &&
+        shouldRecordRevertReport(dcsChanged, usfmMasterContentForRevertReport)
+      ) {
+        const report = usfmRevertReport(built.content, usfmMasterContentForRevertReport as string);
+        await this.recordExportRevertReport(book, resource, "usfm", report.entries);
+      } else if (
+        (resource === "tn" || resource === "tq" || resource === "twl") &&
+        shouldRecordRevertReport(dcsChanged, tsvMasterContentForRevertReport)
+      ) {
+        const report = tsvRevertReport(
+          built.content,
+          tsvMasterContentForRevertReport as string,
+          resource as "tn" | "tq" | "twl",
+        );
+        await this.recordExportRevertReport(book, resource, "tsv", report.entries);
+      }
 
       if (!commit.branchTouched) {
         dcsSkippedReason = "unchanged";
@@ -1197,15 +1269,26 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     resource: Resource,
     renderedRows: number,
     renderedContent: string,
-  ): Promise<{ ok: boolean; detail: string; masterRows: number | null; explained?: number; unexplained?: number }> {
+  ): Promise<{
+    ok: boolean;
+    detail: string;
+    masterRows: number | null;
+    explained?: number;
+    unexplained?: number;
+    // Master's raw TSV, exactly as fetched above — carried out so the caller
+    // (exportOne) can build the export-revert report (export.ts's
+    // tsvRevertReport) WITHOUT a second fetch. null whenever master was never
+    // actually read (no_file / master_unreadable).
+    masterContent: string | null;
+  }> {
     const file = dcsResourceFile(book, resource as ReimportResource);
-    if (!file) return { ok: true, detail: "no_file", masterRows: null };
+    if (!file) return { ok: true, detail: "no_file", masterRows: null, masterContent: null };
     const raw = await fetchText(dcsRawUrl(this.env, file.repo, file.path));
-    if (raw == null) return { ok: false, detail: "master_unreadable", masterRows: null };
+    if (raw == null) return { ok: false, detail: "master_unreadable", masterRows: null, masterContent: null };
     // Data rows = non-empty lines minus the header (mirrors parseTsv's model).
     const masterRows = Math.max(0, raw.split(/\r?\n/).filter((l) => l.length > 0).length - 1);
     if (!exportTsvShrinkRefused(renderedRows, masterRows)) {
-      return { ok: true, detail: "ok", masterRows };
+      return { ok: true, detail: "ok", masterRows, masterContent: raw };
     }
 
     // Shrink path (rare): don't just refuse on the raw count — attribute the
@@ -1221,7 +1304,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     if (masterIds == null) {
       // Can't parse master's ID column — never let an unreadable body
       // "explain" a shrink. Fall back to the original count-only refusal.
-      return { ok: false, detail: `shrink_${lost}_of_${masterRows}_ids_unreadable`, masterRows };
+      return { ok: false, detail: `shrink_${lost}_of_${masterRows}_ids_unreadable`, masterRows, masterContent: raw };
     }
 
     // Defect 5: fail closed on a master file that itself contains duplicate
@@ -1242,6 +1325,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
         ok: false,
         detail: `shrink_${lost}_of_${masterRows}_master_duplicate_ids_${dupCount}`,
         masterRows,
+        masterContent: raw,
       };
     }
 
@@ -1263,13 +1347,14 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     // itself.
     const renderedIds = parseTsvIds(renderedContent);
     if (renderedIds == null) {
-      return { ok: false, detail: "render_ids_unreadable", masterRows };
+      return { ok: false, detail: "render_ids_unreadable", masterRows, masterContent: raw };
     }
     if (renderedIds.length !== renderedRows) {
       return {
         ok: false,
         detail: `render_inconsistent_${renderedIds.length}_vs_${renderedRows}`,
         masterRows,
+        masterContent: raw,
       };
     }
 
@@ -1340,6 +1425,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
         masterRows,
         explained,
         unexplained,
+        masterContent: raw,
       };
     }
     return {
@@ -1348,6 +1434,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       masterRows,
       explained,
       unexplained,
+      masterContent: raw,
     };
   }
 
@@ -1360,11 +1447,20 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     book: string,
     resource: Resource,
     renderedUsfm: string,
-  ): Promise<{ ok: boolean; detail: string; offenders?: AlignmentShrinkResult["offenders"] }> {
+  ): Promise<{
+    ok: boolean;
+    detail: string;
+    offenders?: AlignmentShrinkResult["offenders"];
+    // Master's raw USFM, exactly as fetched above — carried out so the caller
+    // (exportOne) can build the export-revert report (export.ts's
+    // usfmRevertReport) WITHOUT a second fetch. null whenever master was
+    // never actually read (no_file / master_unreadable).
+    masterContent: string | null;
+  }> {
     const file = dcsResourceFile(book, resource as ReimportResource);
-    if (!file) return { ok: true, detail: "no_file" };
+    if (!file) return { ok: true, detail: "no_file", masterContent: null };
     const masterUsfm = await fetchText(dcsRawUrl(this.env, file.repo, file.path));
-    if (masterUsfm == null) return { ok: false, detail: "master_unreadable" };
+    if (masterUsfm == null) return { ok: false, detail: "master_unreadable", masterContent: null };
     const result = usfmAlignmentShrinkRefused(renderedUsfm, masterUsfm);
     if (result.refused) {
       const sample = result.offenders
@@ -1376,9 +1472,14 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
           return `${o.ref}: lost alignment on ${shown}${more}`;
         })
         .join("; ");
-      return { ok: false, detail: `align_loss_${result.offenders.length}:${sample}`, offenders: result.offenders };
+      return {
+        ok: false,
+        detail: `align_loss_${result.offenders.length}:${sample}`,
+        offenders: result.offenders,
+        masterContent: masterUsfm,
+      };
     }
-    return { ok: true, detail: "ok" };
+    return { ok: true, detail: "ok", masterContent: masterUsfm };
   }
 
   // Banner alert when the alignment-shrink backstop finds an ULT/UST verse that
@@ -1499,6 +1600,155 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
         error: e instanceof Error ? e.message : String(e),
       });
     }
+  }
+
+  // Persist this export's "we overwrote something on master" findings
+  // (export.ts's usfmRevertReport / tsvRevertReport) so a maintainer's
+  // hand-edit that our render just superseded is visible without waiting for
+  // a complaint (see PR #417). Replace-all per (book,resource): DELETE first,
+  // then re-insert in REVERT_WRITE_BATCH-sized chunks (same convention as
+  // bookReimport.ts's WRITE_BATCH). Called ONLY when there is at least one
+  // entry to record — an empty list here never means "measured and clean"
+  // (that's clearExportReverts's job on the genuinely-zero-diff path); see
+  // recordAlignmentAttention's own comment for why an empty-list write would
+  // erase real prior findings.
+  //
+  // Returns whether the table now reflects `entries` in full, so the caller
+  // can decide what the operator-facing alert is allowed to claim. This used
+  // to be one `this.env.DB.batch([DELETE, ...INSERTs])` call — one statement
+  // per entry plus the DELETE, all in a single transaction — which is exactly
+  // what the comment above the old INSERT (this file's OR-REPLACE-avoids-
+  // rollback idiom) assumed: one atomic unit, so any oversized report would
+  // throw and the `catch` below would silently log it while the alert still
+  // told the operator the report was recorded. There is no single-transaction
+  // way to keep that atomicity AND stay under D1's per-batch statement cap, so
+  // this now chunks: the DELETE runs alone first (it must land before any
+  // INSERT — a stale delete-less write would leave last night's rows mixed
+  // with tonight's), then each chunk of inserts is its own `.batch()` call. A
+  // chunk failing partway leaves the table holding only the entries from
+  // chunks that already committed — a real partial write, not a silently
+  // truncated one, because the caller is told `false` and must say so.
+  private async recordExportReverts(
+    book: string,
+    resource: Resource,
+    entries: Array<UsfmRevertEntry | TsvRevertEntry>,
+  ): Promise<boolean> {
+    if (entries.length === 0) return true;
+    try {
+      await this.env.DB.prepare(`DELETE FROM export_reverts WHERE book = ?1 AND resource = ?2`)
+        .bind(book, resource)
+        .run();
+    } catch (e) {
+      console.error("export revert report delete failed", {
+        book,
+        resource,
+        error: e instanceof Error ? e.message : String(e),
+      });
+      // Old rows (if any) are left standing — stale, but not silently wrong:
+      // the caller must not claim this run's findings were recorded.
+      return false;
+    }
+    for (let i = 0; i < entries.length; i += REVERT_WRITE_BATCH) {
+      const slice = entries.slice(i, i + REVERT_WRITE_BATCH);
+      try {
+        await this.env.DB.batch(
+          slice.map((e) =>
+            this.env.DB.prepare(
+              // OR REPLACE: each chunk's `.batch()` is still one transaction,
+              // so a duplicate ref within THIS chunk would otherwise violate
+              // the unique index and roll back the rest of the chunk — same
+              // rationale as recordAlignmentAttention's INSERT.
+              `INSERT OR REPLACE INTO export_reverts (book, resource, ref, class, fields)
+               VALUES (?1, ?2, ?3, ?4, ?5)`,
+            ).bind(book, resource, e.ref, e.class, "fields" in e && e.fields ? JSON.stringify(e.fields) : null),
+          ),
+        );
+      } catch (e) {
+        console.error("export revert report insert batch failed", {
+          book,
+          resource,
+          chunkStart: i,
+          chunkSize: slice.length,
+          error: e instanceof Error ? e.message : String(e),
+        });
+        return false;
+      }
+    }
+    return true;
+  }
+
+  // Clear stale export_reverts rows for a book+resource that was actually
+  // compared against master this run and found to have zero reverts — the
+  // genuinely-clean case, distinct from "we never compared" (master
+  // unreadable), which must NOT clear yesterday's real findings. Callers are
+  // responsible for only invoking this when master was readable AND the
+  // report came back with 0 entries.
+  private async clearExportReverts(book: string, resource: Resource): Promise<void> {
+    try {
+      await this.env.DB.prepare(`DELETE FROM export_reverts WHERE book = ?1 AND resource = ?2`)
+        .bind(book, resource)
+        .run();
+    } catch (e) {
+      console.error("export revert report clear failed", {
+        book,
+        resource,
+        error: e instanceof Error ? e.message : String(e),
+      });
+    }
+  }
+
+  // Build and record the export-revert report for one (book,resource), then
+  // write a non-blocking, observational alert naming only what was measured
+  // (class breakdown + refs) — never a cause, per this file's established
+  // "state only a cause you measured" discipline (see the comment above
+  // buildAlignmentShrinkAlertMessage). severity is always "warning": this
+  // never blocks the export, so it must never read as "error".
+  private async recordExportRevertReport(
+    book: string,
+    resource: Resource,
+    kind: "usfm" | "tsv",
+    entries: Array<UsfmRevertEntry | TsvRevertEntry>,
+  ): Promise<void> {
+    if (entries.length === 0) {
+      await this.clearExportReverts(book, resource);
+      return;
+    }
+    const recorded = await this.recordExportReverts(book, resource, entries);
+    const label = `${book} ${resource.toUpperCase()}`;
+    if (!recorded) {
+      // recordExportReverts already logged the underlying error; the alert
+      // must not go on to claim these findings were recorded (see its own
+      // comment on why a failed/partial write must not read as success).
+      await this.writeAlert(
+        `export_revert:${book}:${resource}`,
+        `${label}: computed ${entries.length} export-revert finding(s) but failed to fully write them to ` +
+          `export_reverts (see worker logs for the D1 error) — this book+resource's revert report may now be ` +
+          `missing rows or stale. This does not block the export.`,
+        `${this.env.DCS_BASE_URL}/unfoldingWord`,
+        "warning",
+      );
+      return;
+    }
+    const byClass = new Map<string, number>();
+    for (const e of entries) byClass.set(e.class, (byClass.get(e.class) ?? 0) + 1);
+    const breakdown = [...byClass.entries()].map(([cls, n]) => `${n} ${cls}`).join(", ");
+    const sampleRefs = entries.slice(0, 10).map((e) => e.ref).join(", ");
+    const extra = entries.length - 10;
+    const severity =
+      kind === "usfm"
+        ? classifyRevertSeverity(entries as UsfmRevertEntry[], [])
+        : classifyRevertSeverity([], entries as TsvRevertEntry[]);
+    const escalateNote = severity.escalate
+      ? ` This is a larger-than-usual number of reverts for one export (${severity.reason}).`
+      : "";
+    await this.writeAlert(
+      `export_revert:${book}:${resource}`,
+      `${label} shipped to Door43 and overwrote master's current content on ${entries.length} row(s)/verse(s) ` +
+        `(${breakdown}): ${sampleRefs}${extra > 0 ? ` (+${extra} more)` : ""}.${escalateNote} This does not block ` +
+        `the export; it is a record of what changed on master, in case a hand-edit there was lost.`,
+      `${this.env.DCS_BASE_URL}/unfoldingWord`,
+      "warning",
+    );
   }
 
   // Who owns each offending verse in D1, keyed by the offender's ref. Reads

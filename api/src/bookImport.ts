@@ -194,10 +194,14 @@ books.post("/:book/reimport", requireEditor, async (c) => {
   } catch {
     return c.json({ error: "invalid_body" }, 422);
   }
+  // >= 0, not >= 1: chapter 0 (refParts("front:intro") in importParsers.ts)
+  // is a real, syncable chapter — the book-level intro TN/TQ/TWL row — so a
+  // maintainer must be able to ask this route to pull it back from master too.
+  // NaN/negative are still rejected (malformed input, not a valid chapter).
   const chapters = Array.isArray(body.chapters)
     ? body.chapters
         .map((n) => (typeof n === "number" ? Math.floor(n) : NaN))
-        .filter((n) => Number.isFinite(n) && n >= 1)
+        .filter((n) => Number.isFinite(n) && n >= 0)
     : [];
   const resources = Array.isArray(body.resources)
     ? body.resources.filter((r): r is Resource =>
@@ -205,7 +209,7 @@ books.post("/:book/reimport", requireEditor, async (c) => {
       )
     : [];
   if (chapters.length === 0) {
-    return c.json({ error: "invalid_body", detail: "chapters must be a non-empty list of positive integers" }, 422);
+    return c.json({ error: "invalid_body", detail: "chapters must be a non-empty list of non-negative integers" }, 422);
   }
   if (resources.length === 0) {
     return c.json({ error: "invalid_body", detail: "resources must include at least one of ult/ust/tn/tq/twl" }, 422);

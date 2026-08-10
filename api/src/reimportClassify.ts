@@ -33,7 +33,12 @@
 // + re-asserted protections) and counts it as `reimported_ai` rather than the
 // misleading `skipped_edited`. `aiOnly` distinguishes that case so the caller
 // picks the right write guard + counter.
-export type ReimportFate = "noop" | "edited" | "update" | "update_ai";
+// "merge_fields" is not returned by classifyReimportRow itself (verses have no
+// concept of it) — it's the TSV-specific refinement the caller applies when
+// classifyReimportRow says "edited" but computeEditedFieldMerge below finds
+// master-owned fields to adopt anyway. Named here so callers/tests share one
+// vocabulary for "edited, but partially merged" vs plain "edited".
+export type ReimportFate = "noop" | "edited" | "update" | "update_ai" | "merge_fields";
 
 export function classifyReimportRow(
   contentMatches: boolean,
@@ -103,4 +108,100 @@ export function isReimportableRow(r: ReimportableRow): boolean {
   }
   if (r.updated_by == null) return true; // pristine
   return r.latestSource === AI_SOURCE; // AI-only, never human-edited
+}
+
+// ── Per-field ownership merge on human-edited rows ──────────────────────────
+//
+// A row classified "edited" is not all-or-nothing owned by the human who
+// touched it. Some columns are never human-settable (or only conditionally
+// so), and a purely cosmetic whitespace difference in a note is never a
+// deliberate edit. Reverting a DCS maintainer's release-prep cleanup on those
+// columns every night — 130 of 209 hand-edits reverted in one measured run —
+// is the bug this closes. Fields NOT covered here (quote, occurrence,
+// support_reference, orig_words, tw_link, and any substantive note
+// difference) stay D1's forever once a human has edited the row; ref_raw/
+// chapter/verse are identity and are never touched by either path.
+
+// TSV kind this merge applies to. Redeclared rather than imported from
+// bookReimport.ts's TsvKind: this module is intentionally free of any
+// bookReimport dependency (D1-free, unit-testable without a database) — see
+// the file header. Keep in sync if a new TSV kind is ever added.
+export type TsvRowKind = "tn" | "tq" | "twl";
+
+// The subset of a TSV row's columns eligible for the merge. `tags` is common
+// to all three kinds; the free-text field(s) vary — tn has `note`, tq has
+// `question` + `response`, twl has neither (its only free-text-ish column,
+// `tw_link`, is never merged).
+export interface MergeableTsvFields {
+  tags: string | null;
+  note?: string | null;
+  question?: string | null;
+  response?: string | null;
+}
+
+export type EditedFieldMerge = Partial<Pick<MergeableTsvFields, "tags" | "note" | "question" | "response">>;
+
+// The same human-owned protections isReimportableRow checks, re-declared here
+// so this function stays pure/self-contained for its own unit tests without a
+// ReimportableRow. Any of these set means "protections win" — never merge,
+// even if a field would otherwise qualify.
+export interface MergeProtections {
+  deleted_at?: number | null;
+  trashed_at?: number | null;
+  preserve?: number | null;
+  hint?: number | null;
+}
+
+// Collapse a TSV note's literal two-char "\n" escape (its encoded line break)
+// to a space, then every whitespace run to a single space, then trim. Two
+// notes differing ONLY by this kind of incidental whitespace — a stray double
+// space, a space that landed next to an encoded line break — read as the same
+// note to a human, so they're eligible to adopt master's exact bytes without
+// being treated as a substantive translator edit.
+function collapseForCompare(s: string | null | undefined): string {
+  return (s ?? "").replace(/\\n/g, " ").replace(/\s+/g, " ").trim();
+}
+
+// Fields a reimport may still adopt from master on a row classifyReimportRow
+// has already called "edited" (i.e. `isReimportableRow` is false — a human
+// owns it). Returns null when nothing qualifies, meaning the row stays a
+// plain "edited" skip exactly as before this change.
+//
+//   - tags (tn/tq): there is no UI to set it on these kinds — no human can
+//     ever have deliberately owned this field — so always adopt master's
+//     value, including a blank one.
+//   - tags (twl): TWL creation DOES have a tags control (Shell.tsx), so a
+//     human CAN own it — adopt master's value only when it's non-empty, so a
+//     blank incoming value never wipes a deliberately-set tag.
+//   - note / question / response: adopt master's value only when the two
+//     differ by nothing but incidental whitespace (collapseForCompare).
+export function computeEditedFieldMerge(
+  kind: TsvRowKind,
+  d1: MergeableTsvFields,
+  master: MergeableTsvFields,
+  protections: MergeProtections,
+): EditedFieldMerge | null {
+  if (protections.deleted_at != null) return null;
+  if (protections.trashed_at != null) return null;
+  if (Number(protections.preserve ?? 0) !== 0) return null;
+  if (Number(protections.hint ?? 0) !== 0) return null;
+
+  const merge: EditedFieldMerge = {};
+
+  if (kind === "twl") {
+    if ((master.tags ?? "") !== "" && master.tags !== d1.tags) merge.tags = master.tags;
+  } else if (master.tags !== d1.tags) {
+    merge.tags = master.tags;
+  }
+
+  const noteFields: Array<"note" | "question" | "response"> =
+    kind === "tn" ? ["note"] : kind === "tq" ? ["question", "response"] : [];
+  for (const f of noteFields) {
+    const dVal = d1[f] ?? null;
+    const mVal = master[f] ?? null;
+    if (dVal === mVal) continue; // already equal, nothing to adopt
+    if (collapseForCompare(dVal) === collapseForCompare(mVal)) merge[f] = mVal;
+  }
+
+  return Object.keys(merge).length > 0 ? merge : null;
 }

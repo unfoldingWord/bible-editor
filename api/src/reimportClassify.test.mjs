@@ -13,7 +13,7 @@
 // master. But the preservation is SCOPED: tq (no in-app reorder) and NULL-sort
 // rows must still adopt master file order.
 
-import { classifyReimportRow, isReimportableRow, AI_SOURCE } from "./reimportClassify.ts";
+import { classifyReimportRow, isReimportableRow, computeEditedFieldMerge, AI_SOURCE } from "./reimportClassify.ts";
 
 let failed = 0;
 function eq(actual, expected, msg) {
@@ -154,6 +154,179 @@ eq(
   isReimportableRow({ updated_by: null, latestSource: null, deleted_at: 123, kind: "twl" }),
   false,
   "pristine tombstone → NOT reimportable (resurrection handled elsewhere)",
+);
+
+function eqDeep(actual, expected, msg) {
+  const a = JSON.stringify(actual);
+  const b = JSON.stringify(expected);
+  if (a !== b) {
+    console.error(`FAIL: ${msg}\n    expected ${b}\n    got      ${a}`);
+    failed++;
+  } else {
+    console.log(`  ok: ${msg}`);
+  }
+}
+
+const noProtections = { deleted_at: null, trashed_at: null, preserve: null, hint: null };
+
+console.log("\n[computeEditedFieldMerge]");
+
+// tn: master blanked tags → merges tags, keeps note untouched (note unchanged).
+eqDeep(
+  computeEditedFieldMerge(
+    "tn",
+    { tags: "keyword", note: "a note" },
+    { tags: null, note: "a note" },
+    noProtections,
+  ),
+  { tags: null },
+  "tn: master blanked tags → merges tags only",
+);
+
+// tq: same rule — tags always adopted from master, including blank.
+eqDeep(
+  computeEditedFieldMerge(
+    "tq",
+    { tags: "keyword", question: "q?", response: "r." },
+    { tags: "", question: "q?", response: "r." },
+    noProtections,
+  ),
+  { tags: "" },
+  "tq: master blanked tags → merges tags only",
+);
+
+// twl: master tags empty → does NOT merge (would wipe a human-set tag).
+eqDeep(
+  computeEditedFieldMerge("twl", { tags: "keyword" }, { tags: "" }, noProtections),
+  null,
+  "twl: master tags empty → does not merge",
+);
+// twl: master tags non-empty and different → merges.
+eqDeep(
+  computeEditedFieldMerge("twl", { tags: "old" }, { tags: "new" }, noProtections),
+  { tags: "new" },
+  "twl: master tags non-empty and different → merges",
+);
+
+// Note differing only by a double space → merges.
+eqDeep(
+  computeEditedFieldMerge(
+    "tn",
+    { tags: "x", note: "hello  world" },
+    { tags: "x", note: "hello world" },
+    noProtections,
+  ),
+  { note: "hello world" },
+  "tn: note differs only by double space → merges",
+);
+
+// Note differing only by a space before a literal \n (two-char backslash-n) → merges.
+eqDeep(
+  computeEditedFieldMerge(
+    "tn",
+    { tags: "x", note: "line one \\nline two" },
+    { tags: "x", note: "line one\\nline two" },
+    noProtections,
+  ),
+  { note: "line one\\nline two" },
+  "tn: note differs only by space before literal \\n → merges",
+);
+
+// Note differing substantively → does NOT merge, stays "edited".
+eqDeep(
+  computeEditedFieldMerge(
+    "tn",
+    { tags: "x", note: "the original note" },
+    { tags: "x", note: "a completely different note" },
+    noProtections,
+  ),
+  null,
+  "tn: substantive note difference → does not merge",
+);
+
+// tq: question differs substantively, response matches → merges response only,
+// leaves question (and the fate) as edited.
+eqDeep(
+  computeEditedFieldMerge(
+    "tq",
+    { tags: "x", question: "human question", response: "answer  here" },
+    { tags: "x", question: "master question", response: "answer here" },
+    noProtections,
+  ),
+  { response: "answer here" },
+  "tq: only whitespace-only response merges, substantive question does not",
+);
+
+// quote/occurrence/support_reference are not part of MergeableTsvFields at
+// all — computeEditedFieldMerge has no way to touch them; confirm nothing
+// merges when only tags/note are checked and they already match (i.e. a
+// row differing solely in a non-mergeable column never produces a merge).
+eqDeep(
+  computeEditedFieldMerge("tn", { tags: "x", note: "same" }, { tags: "x", note: "same" }, noProtections),
+  null,
+  "tn: nothing to merge (all mergeable fields already match) → null",
+);
+
+// Protections win: deleted_at/trashed_at/preserve/hint each block the merge
+// outright even though tags would otherwise qualify.
+eqDeep(
+  computeEditedFieldMerge(
+    "tn",
+    { tags: "old" },
+    { tags: "new" },
+    { deleted_at: 123, trashed_at: null, preserve: null, hint: null },
+  ),
+  null,
+  "tn: deleted_at set → never merges",
+);
+eqDeep(
+  computeEditedFieldMerge(
+    "tn",
+    { tags: "old" },
+    { tags: "new" },
+    { deleted_at: null, trashed_at: 123, preserve: null, hint: null },
+  ),
+  null,
+  "tn: trashed_at set → never merges",
+);
+eqDeep(
+  computeEditedFieldMerge(
+    "tn",
+    { tags: "old" },
+    { tags: "new" },
+    { deleted_at: null, trashed_at: null, preserve: 1, hint: null },
+  ),
+  null,
+  "tn: preserve=1 → never merges",
+);
+eqDeep(
+  computeEditedFieldMerge(
+    "tn",
+    { tags: "old" },
+    { tags: "new" },
+    { deleted_at: null, trashed_at: null, preserve: null, hint: 1 },
+  ),
+  null,
+  "tn: hint=1 → never merges",
+);
+
+// Pristine-row analogue: computeEditedFieldMerge is only ever consulted by the
+// caller when classifyReimportRow already said "edited" — a pristine row
+// takes the normal "update" fate and never reaches this function. Sanity
+// check that classifyReimportRow itself is unaffected by this change.
+eq(classifyReimportRow(false, false, true, false), "update", "pristine + content differs → still plain update");
+
+// Nothing to merge → stays a plain "edited" skip (the caller falls back to
+// skipped_edited when computeEditedFieldMerge returns null).
+eqDeep(
+  computeEditedFieldMerge(
+    "twl",
+    { tags: "same" },
+    { tags: "same" },
+    noProtections,
+  ),
+  null,
+  "twl: nothing differs → null (fate stays edited)",
 );
 
 if (failed > 0) {

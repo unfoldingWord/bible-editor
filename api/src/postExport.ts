@@ -97,7 +97,12 @@ async function reimportOneBook(env: Env, resource: Resource, book: string): Prom
     .first<{ m: number | null }>();
   const maxCh = maxRow?.m ?? 0;
   if (maxCh < 1) return; // book not seeded enough to reimport
-  const chapters = Array.from({ length: maxCh }, (_, i) => i + 1);
+  // Include chapter 0 (refParts("front:intro") in importParsers.ts, a
+  // book-level intro TN/TQ/TWL row) alongside 1..maxCh — otherwise a
+  // front:intro hand-edit on master is reverted by the very next export,
+  // since the export side has no chapter filter. See bookReimport.ts's
+  // reimportChunkBoundaries for the same fix in the nightly chunked path.
+  const chapters = Array.from({ length: maxCh + 1 }, (_, i) => i);
   await reimportBookFromDcs(env, book, chapters, [resource], null, { source: "cron" });
 }
 
