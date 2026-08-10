@@ -790,10 +790,13 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
     // have — the strip would light one card's siblings and not the other's.
     //
     // KNOWN AND DELIBERATE: mixing the two derivations means the strip can light
-    // a token no card lights. On a stripped-compound verse (ZEC 2:8: state group
-    // כִּי+כֹה+אָמַר, with אָמַר stripped because a standalone card owns it) a
-    // strip Hebrew hover rings all three on the strip while the cards render a
-    // two-token card and a separate one — measured in-browser. Do NOT "fix" this
+    // a token no card lights. ZEC 2:8 UST (state group כִּי+כֹה+אָמַר) was the
+    // measured example of this until stripCompoundOverlaps started exempting
+    // flagged reused tokens from the strip via `protectedIds` — אָמַר there is a
+    // flagged reused token, so it is now protected and is NOT stripped, and the
+    // cards and strip agree on that verse. The mechanism itself (a stripped
+    // compound's strip-vs-card disagreement) is unchanged for any UNFLAGGED
+    // overlap; only the specific example moved. Do NOT "fix" this
     // by making the union display-derived. Two reasons: it would sever the
     // #410 bridge (a source word stripped from a rendered chain is still bound to
     // its group and must still light), and the shared strip's ENGLISH-hover path
