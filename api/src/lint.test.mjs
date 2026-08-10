@@ -260,6 +260,25 @@ t("LEV 24:10 shape (standalone + compound both resolving to the same token) stil
   const i = lintUsfmVerses([verseFromUsfm(usfmText)]);
   assert.equal(reusedChecks(i).length, 1);
 });
+// The accepted hole in the occurrence-insensitive signature, pinned so it is a
+// documented decision rather than a surprise. `[A|1, B|1]` and `[A|1, B|2]` both
+// sign as "A,B", so a reused A is NOT reported here when the source genuinely
+// holds two B tokens. Indistinguishable from the JER 33:7 split above without
+// running the occurrence reform (see the scope comment on hasReusedSourceToken):
+// the old full-key signature reported this shape but cost 8 false positives
+// corpus-wide, versus 1 verse for this one. The aligner's marker still catches
+// it. If this assertion ever needs to change, re-measure BOTH directions first.
+t("KNOWN GAP: [A|1,B|1] + [A|1,B|2] is not reported (occurrence-insensitive signature)", () => {
+  const zA = () => `\\zaln-s |x-strong="H1" x-occurrence="1" x-occurrences="1" x-content="A"\\*`;
+  const zB = (occ) => `\\zaln-s |x-strong="H2" x-occurrence="${occ}" x-occurrences="2" x-content="B"\\*`;
+  const usfmText =
+    `\\c 1\n\\p\n\\v 1 ` +
+    zA() + zB(1) + `\\w x1\\w* \\w x2\\w*\\zaln-e\\*\\zaln-e\\* ` +
+    zA() + zB(2) + `\\w x3\\w* \\w x4\\w*\\zaln-e\\*\\zaln-e\\*\n`;
+  const i = lintUsfmVerses([verseFromUsfm(usfmText)]);
+  assert.equal(reusedChecks(i).length, 0);
+});
+
 t("1CH 6:78 shape (differing x-occurrences on the shared token) still flags", () => {
   const zEt = (occ, occs) => `\\zaln-s |x-strong="H1" x-occurrence="${occ}" x-occurrences="${occs}" x-content="וְאֶת"\\*`;
   const zQedemoth = () => `\\zaln-s |x-strong="H2" x-occurrence="1" x-occurrences="1" x-content="קְדֵמוֹת"\\*`;

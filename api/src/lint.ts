@@ -296,6 +296,21 @@ function hasGluedMilestone(nodes: unknown[]): boolean {
 //     reform. Lint keeps crying wolf on these two BY CHOICE, because the only
 //     cheap proxy available also silences real defects.
 //   - REV 4:9 — same shape as 1CH 22:19 / PSA 71:9.
+// The occurrence-insensitive signature has a KNOWN HOLE, and it is accepted
+// deliberately: two chains `[A|1, B|1]` and `[A|1, B|2]` both sign as "A,B", so
+// a genuinely reused A goes unreported whenever the source really does hold two
+// B tokens. That shape is STRUCTURALLY IDENTICAL to the JER 33:7 split this fix
+// exists to stop flagging — chains differing only in one token's occurrence,
+// with the shared tokens being the ones at issue. What separates "one alignment
+// written twice" from "two alignments both claiming A" is solely whether the
+// source contains the differing word once or twice, which is exactly the
+// judgement this check cannot make without running the reform. So the choice is
+// only WHICH WAY to be wrong, and it was made on measurement: keeping the old
+// behaviour costs 8 false positives, this one costs 1 verse. Corpus-wide,
+// exactly 9 verses lost their flag here — 8 with the marker clean (real false
+// positives) and ONE, JER 37:5 UST, where the marker still flags and renders
+// the defect in red. Do not "close" this hole by restoring the full-key
+// signature without re-measuring both directions.
 //   - HAB 1:3 — NOT an occurrence artefact at all: the chains carry the same
 //     keys in REVERSED nesting order, so this check sees two distinct chain
 //     signatures while the aligner's marker resolves both to one canonical
