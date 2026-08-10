@@ -2655,4 +2655,92 @@ await withMockedClock(async () => {
   );
 });
 
+// ── SAME-verse twin of the guard above: the chapter+verse check alone cannot
+//    separate two proposals that land in the SAME verse — which is normal,
+//    since a verse routinely has several questions. Seeds "aa8a" and "abr4"
+//    both hash (deriveAltRowId(seed, 1)) to the same alternate id "fdvf"; both
+//    are tombstoned so both proposals step to attempt 1 and reach that id.
+//    Proposal A inserts at "fdvf" first. Without claimedIds, proposal B would
+//    then find "fdvf" live at the SAME chapter AND SAME verse as itself,
+//    read that as "my row from a previous run", and UPDATE over it —
+//    destroying A's question while marking B accepted. claimedIds (populated
+//    on every UPDATE/INSERT success within this pass) is what tells B that
+//    "fdvf" was just claimed by A this run, so B steps to attempt 2 instead. ──
+await withMockedClock(async () => {
+  const s1 = "aa8a";
+  const s2 = "abr4";
+  const sharedAlt = deriveAltRowId(s1, 1);
+  assert(
+    sharedAlt === deriveAltRowId(s2, 1),
+    `TQ same-verse claim guard: test setup sanity check — deriveAltRowId("${s1}",1) and ` +
+      `deriveAltRowId("${s2}",1) must actually collide (got ${sharedAlt} vs ${deriveAltRowId(s2, 1)})`,
+  );
+
+  const { env, insertedIds, updatedIds, setProposals } = buildFakeTqDb({
+    tombstonedIds: new Set([s1, s2]),
+  });
+
+  setProposals([
+    {
+      id: 1,
+      kind: "tq",
+      book: "GEN",
+      chapter: 1,
+      verse: 1,
+      bible_version: null,
+      payload_json: JSON.stringify({ id: s1, book: "GEN", chapter: 1, verse: 1, question: "q-same-verse-1" }),
+    },
+    {
+      id: 2,
+      kind: "tq",
+      book: "GEN",
+      chapter: 1,
+      verse: 1,
+      bible_version: null,
+      payload_json: JSON.stringify({ id: s2, book: "GEN", chapter: 1, verse: 1, question: "q-same-verse-2" }),
+    },
+  ]);
+
+  const originalConsoleError = console.error;
+  console.error = () => {};
+  let result;
+  try {
+    result = await importJobOutput(
+      env,
+      { jobId: "job-tq-same-verse-claim", pipelineType: "tqs", book: "GEN", startChapter: 1, endChapter: 1 },
+      [],
+    );
+  } finally {
+    console.error = originalConsoleError;
+  }
+
+  assert(result.aborted !== true, `TQ same-verse claim guard: the job completes (aborted=${result.aborted})`);
+  assert(
+    insertedIds.length === 2 && new Set(insertedIds).size === 2,
+    `TQ same-verse claim guard (SILENT DATA LOSS if this fails): two questions in the same verse whose ids hash ` +
+      `to the same alternate id must not collapse into one row — both proposals must reach INSERT at two ` +
+      `DISTINCT ids (got insertedIds=${insertedIds.join(",")})`,
+  );
+  assert(
+    insertedIds[0] === sharedAlt,
+    `TQ same-verse claim guard: the first proposal lands on the shared derived id ("${sharedAlt}") ` +
+      `(got insertedIds[0]="${insertedIds[0]}")`,
+  );
+  assert(
+    insertedIds[1] !== sharedAlt,
+    `TQ same-verse claim guard (SILENT DATA LOSS if this fails): the second proposal must step past the ` +
+      `just-claimed id ("${sharedAlt}") to a further candidate instead of colliding with it ` +
+      `(got insertedIds=${insertedIds.join(",")})`,
+  );
+  assert(
+    !updatedIds.includes(sharedAlt),
+    `TQ same-verse claim guard (SILENT DATA LOSS if this fails): the second proposal must not UPDATE over the ` +
+      `first proposal's freshly-inserted row at "${sharedAlt}" (got updatedIds=${updatedIds.join(",")})`,
+  );
+  assert(
+    result.applied?.tqCreated === 2,
+    `TQ same-verse claim guard: both questions survive as separate created rows (got tqCreated=${result.applied?.tqCreated})`,
+  );
+});
+
 console.log("pipelineImport (claim guard): all assertions passed");

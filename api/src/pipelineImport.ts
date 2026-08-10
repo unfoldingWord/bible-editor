@@ -973,13 +973,22 @@ async function applyJobOutput(
   // the (chapter, verse) group changes means every verse ends up either
   // fully reordered or entirely untouched.
   let tqPrevKey: number | null = null;
+  // Ids this pass has already written. Two distinct proposed ids can hash to
+  // the same alternate (~1 in 786k per pair); without this, the second
+  // proposal would find the first's brand-new row at the same chapter+verse,
+  // read it as "mine from a previous run", and UPDATE over it — losing a
+  // question silently. Proposal order is stable (ORDER BY kind, chapter, verse,
+  // id), so which proposal wins the shared id is deterministic across re-runs
+  // and each keeps landing on the same row. TN has the same idea in
+  // claimedTnKeys, keyed on content rather than id.
+  const claimedTqIds = new Set<string>();
   for (const p of tqProposals) {
     const k = verseKey(p);
     if (k !== tqPrevKey && (await maybeCheckCancelled(env, job.jobId, cancel))) break;
     tqPrevKey = k;
     const sortOrder = (tqCounters.get(k) ?? 0) + 100;
     tqCounters.set(k, sortOrder);
-    const action = await applyTqUpsert(env, p, userId, sortOrder);
+    const action = await applyTqUpsert(env, p, userId, sortOrder, claimedTqIds);
     affected.add(p.chapter);
     if (action === "created") result.tqCreated += 1;
     else result.tqUpdated += 1;
@@ -1449,6 +1458,7 @@ async function applyTqUpsert(
   p: PendingImportRow,
   userId: number,
   sortOrder: number,
+  claimedIds: Set<string>,
 ): Promise<"created" | "updated"> {
   const payload = JSON.parse(p.payload_json) as Record<string, unknown>;
   const rawId = typeof payload.id === "string" && payload.id.length > 0 ? payload.id : null;
@@ -1493,10 +1503,16 @@ async function applyTqUpsert(
       //   no seed (random mint) — the candidate asserts nothing at all, so a
       //     live row is never ours. Step on. Without this, a random id that
       //     happens to hit a live row in this chapter silently overwrites it.
+      //   ...and never a row THIS pass already wrote (claimedIds): that row
+      //     belongs to an earlier proposal in this same run, not to a previous
+      //     run of our chain, so adopting it would overwrite a question we just
+      //     created. This is the same-verse case the chapter/verse check alone
+      //     cannot separate.
       const isOurs =
         seedId !== null &&
         existing.chapter === p.chapter &&
-        (attempt === 0 || existing.verse === p.verse);
+        (attempt === 0 || existing.verse === p.verse) &&
+        !claimedIds.has(id);
       if (!isOurs) continue;
       const newVersion = existing.version + 1;
       const now = Math.floor(Date.now() / 1000);
@@ -1549,6 +1565,7 @@ async function applyTqUpsert(
           )
           .bind(p.id, userId),
       ]);
+      claimedIds.add(id);
       return "updated";
     }
 
@@ -1566,6 +1583,7 @@ async function applyTqUpsert(
     // whole job, twice, terminally.)
     try {
       await insertTqAtId(env, p, payload, id, userId, sortOrder);
+      claimedIds.add(id);
       return "created";
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
