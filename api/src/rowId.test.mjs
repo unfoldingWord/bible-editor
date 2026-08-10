@@ -95,4 +95,28 @@ assert(coerceRowId("1abc") === "w6w6", `coerce("1abc") is stable === w6w6 (got $
   );
 }
 
+// --- deriveAltRowId: entropy regression guard ---
+// The reachable-output space is 24*32^3 = 786432. The old broken
+// implementation collapsed to only 96 reachable ids because the low 5 bits of
+// the FNV recurrence formed a closed cycle — dense enough that two colliding
+// proposals in one chapter could derive the SAME alternate id, at which point
+// the second silently UPDATEs over the first instead of getting its own row.
+// This test asserts the fixed implementation's spread is nowhere near that
+// collapsed pool: 200k draws from a 786432-id space should yield ~176560
+// distinct values under ideal uniform hashing (birthday-paradox expectation);
+// 150000 is set well below that so ordinary hash variance can't flake it,
+// while still being far above the 96-id collapse this guards against.
+{
+  const seen = new Set();
+  for (let i = 0; i < 200_000; i++) {
+    seen.add(deriveAltRowId(`seed${i}`, 1));
+  }
+  assert(
+    seen.size >= 150_000,
+    `deriveAltRowId spreads across at least 150000 distinct ids out of 200000 draws (got ${seen.size}) — ` +
+      `a collapsed output pool (the old bug reached only 96) lets two colliding proposals in one chapter ` +
+      `derive the same alternate id, at which point the second silently UPDATEs over the first`,
+  );
+}
+
 console.log("rowId.test.mjs: all assertions passed");

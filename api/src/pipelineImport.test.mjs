@@ -1983,7 +1983,9 @@ function buildFakeTqDb({ tombstonedIds = new Set(), hardErrorIds = new Set(), li
   const batches = [];
   const insertedIds = [];
   const updatedIds = [];
+  const updatedVerses = [];
   const insertAttempts = [];
+  const insertArgs = [];
   const pipelineState = { state: "running", errorKind: null };
   const dbState = { claimedAt: 4000 };
 
@@ -2030,15 +2032,19 @@ function buildFakeTqDb({ tombstonedIds = new Set(), hardErrorIds = new Set(), li
       return { changes: 0, rows: row ? [row] : [], single: row };
     }
     if (/UPDATE tq_rows\s+SET/.test(sql)) {
-      // bind order per applyTqUpsert's UPDATE: id is ?11 (0-indexed args[10]).
+      // bind order per applyTqUpsert's UPDATE: ref_raw(0), tags(1), quote(2),
+      // occurrence(3), question(4), response(5), sort_order(6), verse(7),
+      // updated_at(8), updated_by(9), id(10), book(11).
       const id = args[10];
       updatedIds.push(id);
+      updatedVerses.push(args[7]);
       return { changes: 1, rows: [], single: null };
     }
     if (/INSERT INTO tq_rows/.test(sql)) {
       const id = args[0];
       const chapter = args[2];
       insertAttempts.push(id);
+      insertArgs.push(args);
       if (hardErrorIds.has(id)) {
         throw new Error("D1_ERROR: NOT NULL constraint failed: tq_rows.question: SQLITE_CONSTRAINT_NOTNULL");
       }
@@ -2102,7 +2108,7 @@ function buildFakeTqDb({ tombstonedIds = new Set(), hardErrorIds = new Set(), li
     },
   };
 
-  return { env, batches, insertedIds, updatedIds, insertAttempts, liveRows, setProposals };
+  return { env, batches, insertedIds, updatedIds, updatedVerses, insertAttempts, insertArgs, liveRows, setProposals };
 }
 
 await withMockedClock(async () => {
@@ -2304,6 +2310,153 @@ await withMockedClock(async () => {
   assert(
     insertAttempts.length === 1,
     `TQ non-UNIQUE error: the chain stops after the first insert attempt instead of retrying all 8 candidates (got ${insertAttempts.length} attempts: ${insertAttempts.join(",")})`,
+  );
+});
+
+// ── Same-chapter alt-id merge cannot happen silently: two proposals in the
+//    SAME chapter whose seed ids are BOTH tombstoned must land on two
+//    DIFFERENT alternate ids and both reach INSERT — this is exactly the
+//    scenario the deriveAltRowId entropy fix protects (a collapsed output
+//    pool could make two colliding proposals derive the same alternate id,
+//    at which point the second silently UPDATEs over the first) ──
+await withMockedClock(async () => {
+  const { env, insertedIds, updatedIds, setProposals } = buildFakeTqDb({
+    tombstonedIds: new Set(["hoig", "zorp"]),
+  });
+
+  setProposals([
+    {
+      id: 1,
+      kind: "tq",
+      book: "GEN",
+      chapter: 1,
+      verse: 1,
+      bible_version: null,
+      payload_json: JSON.stringify({ id: "hoig", book: "GEN", chapter: 1, verse: 1, question: "q-tombstone-1" }),
+    },
+    {
+      id: 2,
+      kind: "tq",
+      book: "GEN",
+      chapter: 1,
+      verse: 2,
+      bible_version: null,
+      payload_json: JSON.stringify({ id: "zorp", book: "GEN", chapter: 1, verse: 2, question: "q-tombstone-2" }),
+    },
+  ]);
+
+  const originalConsoleError = console.error;
+  console.error = () => {};
+  let result;
+  try {
+    result = await importJobOutput(
+      env,
+      { jobId: "job-tq-same-chapter-collision", pipelineType: "tqs", book: "GEN", startChapter: 1, endChapter: 1 },
+      [],
+    );
+  } finally {
+    console.error = originalConsoleError;
+  }
+
+  assert(result.aborted !== true, `TQ same-chapter alt-id merge guard: the job completes (aborted=${result.aborted})`);
+  assert(
+    insertedIds.length === 2 && updatedIds.length === 0,
+    `TQ same-chapter alt-id merge guard: two proposals with distinct tombstoned seeds in the same chapter both ` +
+      `reach INSERT and none silently merge into an UPDATE (insertedIds=${insertedIds.join(",")}, updatedIds=${updatedIds.join(",")})`,
+  );
+  assert(
+    insertedIds[0] !== insertedIds[1],
+    `TQ same-chapter alt-id merge guard: the two proposals land on DIFFERENT alternate ids ` +
+      `(deriveAltRowId("hoig",1)=${deriveAltRowId("hoig", 1)}, deriveAltRowId("zorp",1)=${deriveAltRowId("zorp", 1)}) ` +
+      `— a collapsed id pool would let them collide and the second would silently overwrite the first (got ${insertedIds.join(",")})`,
+  );
+});
+
+// ── The UPDATE branch writes `verse`: a question moved to another verse of
+//    the same chapter must not stay filed under its old verse ──
+await withMockedClock(async () => {
+  const { env, updatedVerses, setProposals } = buildFakeTqDb({
+    liveRows: new Map([["abc1", { version: 1, chapter: 1 }]]),
+  });
+
+  setProposals([
+    {
+      id: 1,
+      kind: "tq",
+      book: "GEN",
+      chapter: 1,
+      verse: 5,
+      bible_version: null,
+      payload_json: JSON.stringify({ id: "abc1", book: "GEN", chapter: 1, verse: 5, question: "q-moved-verse" }),
+    },
+  ]);
+
+  const originalConsoleError = console.error;
+  console.error = () => {};
+  let result;
+  try {
+    result = await importJobOutput(
+      env,
+      { jobId: "job-tq-verse-move", pipelineType: "tqs", book: "GEN", startChapter: 1, endChapter: 1 },
+      [],
+    );
+  } finally {
+    console.error = originalConsoleError;
+  }
+
+  assert(result.aborted !== true, `TQ verse-move: the job completes (aborted=${result.aborted})`);
+  assert(
+    updatedVerses.length === 1 && updatedVerses[0] === 5,
+    `TQ verse-move: a live row at verse 1 updated by a proposal for verse 5 must have its UPDATE bind verse=5, ` +
+      `not stay filed under its old verse (got updatedVerses=${updatedVerses.join(",")})`,
+  );
+});
+
+// ── insertTqAtId binds the pending_imports book/chapter/verse, not the
+//    payload's — a stray TSV cell in the payload must not divert the row
+//    into a different (book, id) space than the one the caller checked ──
+await withMockedClock(async () => {
+  const { env, insertArgs, setProposals } = buildFakeTqDb();
+
+  setProposals([
+    {
+      id: 1,
+      kind: "tq",
+      book: "GEN",
+      chapter: 1,
+      verse: 1,
+      bible_version: null,
+      payload_json: JSON.stringify({
+        id: "abc1",
+        book: "EXO",
+        chapter: 9,
+        verse: 9,
+        question: "q-payload-mismatch",
+      }),
+    },
+  ]);
+
+  const originalConsoleError = console.error;
+  console.error = () => {};
+  let result;
+  try {
+    result = await importJobOutput(
+      env,
+      { jobId: "job-tq-payload-mismatch", pipelineType: "tqs", book: "GEN", startChapter: 1, endChapter: 1 },
+      [],
+    );
+  } finally {
+    console.error = originalConsoleError;
+  }
+
+  assert(result.aborted !== true, `TQ payload book/chapter/verse guard: the job completes (aborted=${result.aborted})`);
+  assert(insertArgs.length === 1, `TQ payload book/chapter/verse guard: exactly one INSERT was attempted (got ${insertArgs.length})`);
+  // cols = ["id", "book", "chapter", "verse", ...] so args[1]=book, args[2]=chapter, args[3]=verse.
+  const [, insertedBook, insertedChapter, insertedVerse] = insertArgs[0];
+  assert(
+    insertedBook === "GEN" && insertedChapter === 1 && insertedVerse === 1,
+    `TQ payload book/chapter/verse guard: the INSERT binds the pending_imports row's book/chapter/verse ` +
+      `(GEN/1/1), not the payload's mismatched EXO/9/9 (got ${insertedBook}/${insertedChapter}/${insertedVerse})`,
   );
 });
 
