@@ -660,21 +660,21 @@ export function positionsShareOwner(
 //
 // The two detectors do NOT fully agree, and the disagreement runs BOTH ways —
 // an earlier version of this comment claimed it was one-directional on the
-// strength of a five-book sample. Measured against the whole of prod D1 (37
-// books, 51,848 ULT/UST verses with a source verse, via
-// scripts/scan-reused-token-visibility.mjs): 63 verses flagged by either
-// detector — 26 by both, 25 by this detector only, 12 by api-side lint only.
+// strength of a five-book sample. A whole-prod-D1 measurement (37 books, 51,848
+// ULT/UST verses with a source verse, via scripts/scan-reused-token-visibility.mjs)
+// found 63 verses flagged by either detector — 26 by both, 25 by this detector
+// only, 12 by api-side lint only.
 //
-// This detector is still the more reliable of the two. The 25 it flags alone are
-// real (lint has no source rows, so a merged shared `\zaln-s` prefix or a
-// missing x-occurrence hides reuse from it), and the 12 lint flags alone are
-// false positives from lint keying RAW x-occurrence: eight are the legitimate
-// one-token-to-two-target-runs split written with divergent occurrence numbers
-// (JER 33:7 et al.), two conflate genuinely distinct tokens that both carry
-// x-occurrence="1" (1CH 22:19, PSA 71:9), REV 4:9 has both, and HAB 1:3 is
-// reversed nesting that this detector sees in one canonical order. See the scope
-// comment on hasReusedSourceToken in api/src/lint.ts for the per-verse breakdown.
-// Do not "fix" this detector to match the feed.
+// Those figures are PRE-FIX and the lintOnly one is now stale: hasReusedSourceToken
+// has since had a chain-signature fix that closes 8 of the 12, leaving 4 (three
+// that need the occurrence reform lint cannot run, plus HAB 1:3 — reversed
+// nesting that THIS detector resolves to one canonical order and exempts, an
+// intentional disagreement). Do not restate a lintOnly number here — the
+// current, authoritative figures and the per-verse breakdown live in ONE place,
+// the scope comment on hasReusedSourceToken in api/src/lint.ts. This detector remains the
+// more reliable of the two for the mechanisms lint has no source rows for (a
+// merged shared `\zaln-s` prefix, or a missing x-occurrence) — do not "fix"
+// this detector to match the feed.
 //
 // A flagged word must also RENDER: buildDisplayGroups passes these ids to
 // stripCompoundOverlaps as protectedIds, because the strip would otherwise

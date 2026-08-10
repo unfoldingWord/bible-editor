@@ -259,35 +259,62 @@ function hasGluedMilestone(nodes: unknown[]): boolean {
 // is not reported — detectDoubledSourceMilestones in web/src/lib/alignment.ts
 // owns that one.
 //
-// This check DISAGREES with the aligner's marker in BOTH directions, and an
-// earlier version of this comment claimed otherwise ("never flags a verse the
-// aligner shows clean") on the strength of a five-book sample. Measured against
-// the whole of prod D1 — 37 books, 51,848 ULT/UST verses with a source verse,
-// via scripts/scan-reused-token-visibility.mjs: 63 verses flagged by either
-// detector, of which BOTH agree on 26, only this check flags 12, and only the
-// marker flags 25.
+// This check DISAGREES with the aligner's marker in BOTH directions. Measured
+// against the whole of prod D1 — 37 books, 51,848 ULT/UST verses with a source
+// verse, via scripts/scan-reused-token-visibility.mjs: 63 verses flagged by
+// either detector, of which BOTH agreed on 26, only this check flagged 12, and
+// only the marker flagged 25. (These are the PRE-fix figures; see below.)
 //
-// The 12 this check flags alone are FALSE POSITIVES, and all 12 come from one
-// root cause — identity here is RAW x-occurrence, while findReusedSourceWordIds
-// runs after parseAlignment has reformed occurrences against the real UHB/UGNT:
-//   - 8 verses (JER 33:7, 33:11, 35:3, 35:11, 37:9, 37:10, MAT 9:20, ZEC 11:11)
-//     — two chains over the SAME tokens differ only in a raw x-occurrence the
-//     reform normalizes away (JER 33:7 writes וַהֲשִׁבֹתִי as occurrence 1 in one
-//     chain and 2 in the other, of a token the UHB contains once). They are the
-//     legitimate one-token-to-two-target-runs split, which the joined chain key
-//     below is meant to exempt and fails to.
-//   - 2 verses (1CH 22:19, PSA 71:9) — the opposite conflation: two DISTINCT
-//     physical tokens both written x-occurrence="1", which reform separates by
-//     position (1CH 22:19 has הָאֱלֹהִים twice) but this key space merges.
-//   - REV 4:9 shows both shapes.
-// The 12th, HAB 1:3, is not an occurrence artefact: the chains carry the same
-// keys in REVERSED nesting order, so this check sees two sequences while the
-// marker sees one canonical order and exempts it as a split. That one is a real
-// encoding oddity — whether it should be repaired in the data is not this
-// check's call.
+// The 12 lint-only flags were FALSE POSITIVES, all traced to identity here
+// being keyed on RAW x-occurrence while findReusedSourceWordIds runs after
+// parseAlignment has reformed occurrences against the real UHB/UGNT. The
+// CHAIN SIGNATURE fix below closes 8 of the 12 (JER 33:7, 33:11, 35:3, 35:11,
+// 37:9, 37:10, MAT 9:20, ZEC 11:11) — two chains over the SAME tokens used to
+// differ only in a raw x-occurrence the reform normalizes away (JER 33:7
+// writes וַהֲשִׁבֹתִי as occurrence 1 in one chain and 2 in the other, of a
+// token the UHB contains once). The chain signature now strips the occurrence
+// suffix before comparing chains, so this legitimate one-token-to-two-
+// target-runs split no longer looks like two distinct chains.
 //
-// Two further mechanisms push the other way (marker flags, this check silent),
-// both also rooted in having no source rows:
+// The remaining 4 are DELIBERATELY still flagged — a source-token-count
+// suppression (count real source `\w` tokens per NFC content, suppress when
+// the source holds at least as many as there are chains claiming it) was
+// tried and reverted, because measured against the whole corpus it silenced
+// lint on 3 verses the aligner's marker still flags as real defects, 2 of
+// which are genuine data corruption: LEV 24:10 UST (source has בֶּן twice, so
+// the count-2/chains-2 proxy suppressed it, but both chains resolve to the
+// SAME token — real reuse) and 1CH 6:78 UST (source has וְאֶת three times,
+// count-3/chains-2 suppressed it, but the target stamps FOUR וְאֶת
+// milestones — real defect). Losing those two real detections to remove three
+// false alarms was the wrong trade, and no cheaper proxy for the full
+// occurrence reform avoids it. See the "reverted source-token-count
+// suppression" regression tests below (LEV 24:10 / 1CH 6:78 shapes) — they
+// pin this so nobody re-adds that suppressor without re-discovering why it
+// left:
+//   - 1CH 22:19 and PSA 71:9 — two genuinely distinct source tokens both
+//     stamped x-occurrence="1"; separating them needs the real occurrence
+//     reform. Lint keeps crying wolf on these two BY CHOICE, because the only
+//     cheap proxy available also silences real defects.
+//   - REV 4:9 — same shape as 1CH 22:19 / PSA 71:9.
+//   - HAB 1:3 — NOT an occurrence artefact at all: the chains carry the same
+//     keys in REVERSED nesting order, so this check sees two distinct chain
+//     signatures while the aligner's marker resolves both to one canonical
+//     source order and exempts it as a split. A real encoding oddity, not a
+//     false positive — do not weaken either detector to reconcile it.
+//
+// Measured on prod D1 after this fix (37 books, 51,848 ULT/UST verses with a
+// source verse, via scripts/scan-reused-token-visibility.mjs): 55 flagged
+// verses — 25 agreed by both detectors, 4 by this check alone (the four named
+// above), 26 by the aligner's marker alone. Before the fix: 63 verses,
+// lintOnly=12, uiOnly=25. The single verse this fix stops flagging that the
+// marker still calls a defect is JER 37:5, and it was never flagging for the
+// right reason: its real reuse (שִׁמְעָם claimed by a compound and a standalone)
+// is invisible to a check with no source rows in BOTH the old and new logic —
+// the old lint=Y came from an unrelated occurrence artefact in the same verse.
+//
+// Two further mechanisms still push the other way (marker flags, this check
+// silent), both rooted in lint never resolving actual source POSITIONS (only
+// content+occurrence identity):
 //   1. A merged shared prefix hides reuse. findTopLevelZalns treats an outermost
 //      `\zaln-s` plus all nesting as one chain; parseAlignment makes a group per
 //      word-bearing chain. So `\zaln-s A\*\zaln-s B\*\w x\w*\zaln-e\*\zaln-s
@@ -297,9 +324,10 @@ function hasGluedMilestone(nodes: unknown[]): boolean {
 //   2. A milestone with x-content but no x-occurrence is dropped here (see
 //      zalnLintKey) where parseAlignment defaults it to 1, which can collapse
 //      two differing chain keys into one and silence a real reuse.
-// Closing any of these means giving lint the source verse. Until then this feed
-// is neither a floor nor a census, and the aligner's marker is the more reliable
-// of the two — do not reconcile by weakening the marker.
+// The aligner's marker remains the more reliable of the two for those two
+// mechanisms — do not reconcile by weakening the marker. See
+// web/src/lib/alignment.ts's comment on findReusedSourceWordIds, which points
+// back here rather than restating counts.
 function zalnLintKey(node: Record<string, unknown>): string | null {
   const content = node["content"];
   if (typeof content !== "string" || content === "") return null;
@@ -350,6 +378,14 @@ function findTopLevelZalns(nodes: unknown[]): Record<string, unknown>[] {
   }
   return out;
 }
+// Strip the trailing `|<occurrence>` off a zalnLintKey, leaving just the NFC
+// content. Used to build the chain SIGNATURE (see below) — token IDENTITY
+// (chainKeysByToken's map key) keeps the full key including occurrence.
+function stripOccurrenceSuffix(key: string): string {
+  const i = key.lastIndexOf("|");
+  return i === -1 ? key : key.slice(0, i);
+}
+
 function hasReusedSourceToken(nodes: unknown[]): boolean {
   const chains = findTopLevelZalns(nodes).map(collectZalnChainKeys);
   const chainKeysByToken = new Map<string, Set<string>>();
@@ -364,10 +400,16 @@ function hasReusedSourceToken(nodes: unknown[]): boolean {
     // verse. The within-chain doubling is real but belongs to
     // detectDoubledSourceMilestones (see the scope note above), not here.
     const uniqueKeys = [...new Set(keys)];
-    const chainKey = uniqueKeys.join(",");
+    // The chain SIGNATURE strips occurrence before joining (deliberately NOT
+    // deduped again — positional multiplicity must survive, so [A|1, A|2]
+    // signs as "A,A" not "A"). This is what lets two chains over the SAME
+    // tokens that differ only by a raw, un-reformed occurrence number collapse
+    // into the same signature instead of registering as two distinct chains
+    // (see the scope comment above).
+    const signature = uniqueKeys.map(stripOccurrenceSuffix).join(",");
     for (const key of uniqueKeys) {
       const set = chainKeysByToken.get(key) ?? new Set<string>();
-      set.add(chainKey);
+      set.add(signature);
       chainKeysByToken.set(key, set);
     }
   }

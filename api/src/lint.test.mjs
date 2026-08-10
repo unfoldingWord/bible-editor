@@ -173,6 +173,104 @@ t("within-chain doubling + a standalone is NOT flagged (agrees with the aligner)
   assert.equal(i.filter((x) => x.check === "Reused source token").length, 0);
 });
 
+const reusedChecks = (issues) => issues.filter((x) => x.check === "Reused source token");
+
+// Chain-signature fix (Change 1): two chains claim the SAME token sequence,
+// differing only in one raw x-occurrence — the JER 33:7 false-positive shape.
+// Stripping occurrence before joining the chain signature collapses both
+// chains to the same signature, so this is no longer seen as two distinct
+// chains at all.
+t("(A) same sequence differing by one raw occurrence is NOT flagged", () => {
+  const z = (c, occ) => `\\zaln-s |x-strong="H1" x-occurrence="${occ}" x-occurrences="2" x-content="${c}"\\*`;
+  const usfmText =
+    `\\c 1\n\\p\n\\v 1 ` +
+    z("קיץ", 1) + z("חרף", 1) + `\\w x1\\w* \\w x2\\w*\\zaln-e\\*\\zaln-e\\* ` +
+    z("קיץ", 2) + z("חרף", 1) + `\\w x3\\w* \\w x4\\w*\\zaln-e\\*\\zaln-e\\*\n`;
+  const i = lintUsfmVerses([verseFromUsfm(usfmText)]);
+  assert.equal(reusedChecks(i).length, 0);
+});
+
+// AMO 3:2 shape: a real one, stays flagged. Compound
+// [עַל|1, כֵּן|1, אֶפְקֹד|1] plus standalone [אֶפְקֹד|1] — no chain-signature
+// collapse applies here (the signatures genuinely differ), so this is
+// unaffected by Change 1 and remains flagged.
+t("AMO 3:2 shape (compound triple + standalone reusing one key) still flags", () => {
+  const z = (c, occ) => `\\zaln-s |x-strong="H1" x-occurrence="${occ}" x-occurrences="1" x-content="${c}"\\*`;
+  const usfmText =
+    `\\c 1\n\\p\n\\v 1 ` +
+    z("עַל", 1) + z("כֵּן", 1) + z("אֶפְקֹד", 1) + `\\w on\\w* \\w that\\w* \\w account\\w*\\zaln-e\\*\\zaln-e\\*\\zaln-e\\* ` +
+    z("אֶפְקֹד", 1) + `\\w visit\\w*\\zaln-e\\*\n`;
+  const i = lintUsfmVerses([verseFromUsfm(usfmText)]);
+  assert.equal(reusedChecks(i).length, 1);
+});
+
+// HAB 1:3 shape: chains carry the SAME keys in REVERSED nesting order — a real,
+// intentional disagreement with the aligner's marker (see the scope comment on
+// hasReusedSourceToken). The signature is order-sensitive, so this still flags.
+t("HAB 1:3 shape (reversed nesting) still flags", () => {
+  const zA = (occ) => `\\zaln-s |x-strong="H1" x-occurrence="${occ}" x-occurrences="1" x-content="A"\\*`;
+  const zB = (occ) => `\\zaln-s |x-strong="H2" x-occurrence="${occ}" x-occurrences="1" x-content="B"\\*`;
+  const usfmText =
+    `\\c 1\n\\p\n\\v 1 ` +
+    zA(1) + zB(1) + `\\w x1\\w* \\w x2\\w*\\zaln-e\\*\\zaln-e\\* ` +
+    zB(1) + zA(1) + `\\w x3\\w* \\w x4\\w*\\zaln-e\\*\\zaln-e\\*\n`;
+  const i = lintUsfmVerses([verseFromUsfm(usfmText)]);
+  assert.equal(reusedChecks(i).length, 1);
+});
+
+// Genuine repeat: two chains claim DIFFERENT occurrences of a word — not a
+// defect, so NOT flagged (occurrence keeps them as distinct tokens; the two
+// keys never share a signature set in the first place).
+t("genuine two-occurrence repeat is NOT flagged", () => {
+  const z = (occ) => `\\zaln-s |x-strong="H1" x-occurrence="${occ}" x-occurrences="2" x-content="A"\\*`;
+  const usfmText = `\\c 1\n\\p\n\\v 1 ` + z(1) + `\\w x1\\w*\\zaln-e\\* ` + z(2) + `\\w x2\\w*\\zaln-e\\*\n`;
+  const i = lintUsfmVerses([verseFromUsfm(usfmText)]);
+  assert.equal(reusedChecks(i).length, 0);
+});
+
+// Guard against Change 1 weakening token IDENTITY: a legal compound [A|1, B|1]
+// plus a standalone claiming a DIFFERENT occurrence of A ([A|2]) must stay
+// unflagged — occurrence must still distinguish the two A tokens even though
+// the chain SIGNATURE now strips it for comparison purposes.
+t("legal compound [A|1,B|1] + standalone [A|2] is NOT flagged (token identity keeps occurrence)", () => {
+  const zA = (occ) => `\\zaln-s |x-strong="H1" x-occurrence="${occ}" x-occurrences="2" x-content="A"\\*`;
+  const zB = () => `\\zaln-s |x-strong="H2" x-occurrence="1" x-occurrences="1" x-content="B"\\*`;
+  const usfmText =
+    `\\c 1\n\\p\n\\v 1 ` +
+    zA(1) + zB() + `\\w x1\\w* \\w x2\\w*\\zaln-e\\*\\zaln-e\\* ` +
+    zA(2) + `\\w x3\\w*\\zaln-e\\*\n`;
+  const i = lintUsfmVerses([verseFromUsfm(usfmText)]);
+  assert.equal(reusedChecks(i).length, 0);
+});
+
+// Regression pins for a source-token-count suppression that was tried and
+// reverted: measured against the full corpus, it silenced lint on these two
+// real defects (among others) by treating "source has >= N physical tokens
+// of this content" as proof the N chains claiming it were merely
+// mis-numbered rather than genuinely reused. See the scope comment on
+// hasReusedSourceToken — do not re-add a suppressor that would flip these.
+t("LEV 24:10 shape (standalone + compound both resolving to the same token) still flags", () => {
+  const zBen = (occ) => `\\zaln-s |x-strong="H1" x-occurrence="${occ}" x-occurrences="2" x-content="בֶּן"\\*`;
+  const zWoman = () => `\\zaln-s |x-strong="H2" x-occurrence="1" x-occurrences="1" x-content="הָאִשָּׁה"\\*`;
+  const zIsraelite = () => `\\zaln-s |x-strong="H3" x-occurrence="1" x-occurrences="1" x-content="הַיִּשְׂרְאֵלִית"\\*`;
+  const usfmText =
+    `\\c 1\n\\p\n\\v 1 ` +
+    zBen(1) + `\\w son\\w*\\zaln-e\\* ` +
+    zBen(1) + zWoman() + zIsraelite() + `\\w son2\\w* \\w woman\\w* \\w israelite\\w*\\zaln-e\\*\\zaln-e\\*\\zaln-e\\*\n`;
+  const i = lintUsfmVerses([verseFromUsfm(usfmText)]);
+  assert.equal(reusedChecks(i).length, 1);
+});
+t("1CH 6:78 shape (differing x-occurrences on the shared token) still flags", () => {
+  const zEt = (occ, occs) => `\\zaln-s |x-strong="H1" x-occurrence="${occ}" x-occurrences="${occs}" x-content="וְאֶת"\\*`;
+  const zQedemoth = () => `\\zaln-s |x-strong="H2" x-occurrence="1" x-occurrences="1" x-content="קְדֵמוֹת"\\*`;
+  const usfmText =
+    `\\c 1\n\\p\n\\v 1 ` +
+    zEt(1, 3) + `\\w and1\\w*\\zaln-e\\* ` +
+    zEt(1, 4) + zQedemoth() + `\\w and2\\w* \\w qedemoth\\w*\\zaln-e\\*\\zaln-e\\*\n`;
+  const i = lintUsfmVerses([verseFromUsfm(usfmText)]);
+  assert.equal(reusedChecks(i).length, 1);
+});
+
 // ── Blank required-field checks (the manual review_kind='blank-note' stamps,
 // now computed dynamically). tn note, tq question/response, twl OrigWords/TWLink.
 t("empty tn note flagged with chapter:verse ref + rowId", () => {
