@@ -36,6 +36,35 @@ export function newRowId(): string {
 // copy. Derived from an FNV-1a hash of the original id over the id alphabet. A
 // collision with an existing id just means the insert's ON CONFLICT DO NOTHING
 // fires (the row isn't inserted this cycle) — never corruption or a duplicate.
+// Derive the Nth alternate id for a row whose preferred id is unavailable —
+// held by a tombstone (soft-deleted rows keep their `(book, id)` PK slot
+// forever) or by a live row belonging to a different chapter.
+//
+// Like coerceRowId and for the same reason, this MUST be pure + stable. When a
+// preferred id is unavailable it stays unavailable, so a re-run of the same
+// import walks the identical candidate chain, finds the row the previous run
+// created, and UPDATEs it. A random mint would instead insert a *second* copy
+// of the same row on every re-run — the AI-content duplication failure this
+// codebase has repeatedly had to clean up by hand.
+//
+// Same FNV-1a construction as coerceRowId, with the attempt folded into the
+// hash so successive attempts diverge. Unlike coerceRowId this is NOT a no-op
+// for a well-formed id: the caller has already established that the input id
+// cannot be used.
+export function deriveAltRowId(id: string, attempt: number): string {
+  let h = 2166136261 >>> 0;
+  for (let i = 0; i < id.length; i++) {
+    h = Math.imul(h ^ id.charCodeAt(i), 16777619) >>> 0;
+  }
+  h = Math.imul(h ^ (attempt + 1), 16777619) >>> 0;
+  let out = ID_LETTERS[h % ID_LETTERS.length];
+  for (let i = 0; i < 3; i++) {
+    h = Math.imul(h, 16777619) >>> 0;
+    out += ID_CHARS[h % ID_CHARS.length];
+  }
+  return out;
+}
+
 export function coerceRowId(id: string): string {
   if (isValidRowId(id)) return id;
   let h = 2166136261 >>> 0;

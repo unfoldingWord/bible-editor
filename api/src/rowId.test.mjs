@@ -4,7 +4,7 @@
 //
 // Not a test framework; a failed assert exits non-zero.
 
-import { ROW_ID_RE, isValidRowId, coerceRowId, newRowId } from "./rowId.ts";
+import { ROW_ID_RE, isValidRowId, coerceRowId, newRowId, deriveAltRowId } from "./rowId.ts";
 
 function assert(cond, msg) {
   if (!cond) {
@@ -62,6 +62,37 @@ assert(coerceRowId("1abc") === "w6w6", `coerce("1abc") is stable === w6w6 (got $
     if (!isValidRowId(id)) { allValid = false; bad = id; break; }
   }
   assert(allValid, `newRowId() matches the grammar across 2000 samples${bad ? ` (offender: ${bad})` : ""}`);
+}
+
+// --- deriveAltRowId: deterministic, distinct per attempt, always valid, not a no-op ---
+{
+  assert(
+    deriveAltRowId("hoig", 1) === deriveAltRowId("hoig", 1),
+    "deriveAltRowId is deterministic across repeated calls for the same (seed, attempt)",
+  );
+
+  const perAttempt = [];
+  for (let attempt = 1; attempt <= 7; attempt++) perAttempt.push(deriveAltRowId("hoig", attempt));
+  const distinct = new Set(perAttempt);
+  assert(
+    distinct.size === 7,
+    `deriveAltRowId produces 7 distinct ids across attempts 1..7 for one seed (got ${distinct.size}: ${perAttempt.join(",")})`,
+  );
+
+  for (const attempt of [0, 1, 2, 7]) {
+    const good = deriveAltRowId("abcd", attempt);
+    assert(ROW_ID_RE.test(good), `deriveAltRowId("abcd", ${attempt}) = ${good} satisfies ROW_ID_RE`);
+    const fromBadSeed = deriveAltRowId("9BAD", attempt);
+    assert(
+      ROW_ID_RE.test(fromBadSeed),
+      `deriveAltRowId("9BAD", ${attempt}) = ${fromBadSeed} satisfies ROW_ID_RE even for a malformed input seed`,
+    );
+  }
+
+  assert(
+    deriveAltRowId("abcd", 1) !== "abcd",
+    `deriveAltRowId is not a no-op: deriveAltRowId("abcd", 1) (${deriveAltRowId("abcd", 1)}) differs from the seed`,
+  );
 }
 
 console.log("rowId.test.mjs: all assertions passed");

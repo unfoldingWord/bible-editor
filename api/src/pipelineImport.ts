@@ -22,7 +22,7 @@ import {
 } from "./importParsers.ts";
 import { canonizeAlignmentSource } from "./canonizeHebrew.ts";
 import { NT_BOOKS } from "./dcsSources.ts";
-import { newRowId, isValidRowId } from "./rowId.ts";
+import { newRowId, isValidRowId, coerceRowId, deriveAltRowId } from "./rowId.ts";
 import { tnContentKey } from "./tnDedup.ts";
 import { requiredOccurrence } from "./occurrenceRule.ts";
 import {
@@ -1451,17 +1451,35 @@ async function applyTqUpsert(
   sortOrder: number,
 ): Promise<"created" | "updated"> {
   const payload = JSON.parse(p.payload_json) as Record<string, unknown>;
-  const proposedId = typeof payload.id === "string" && payload.id.length > 0 ? payload.id : null;
+  const rawId = typeof payload.id === "string" && payload.id.length > 0 ? payload.id : null;
 
-  if (proposedId) {
-    // Try update first. Book-scoped to match the composite PK — a colliding
-    // proposed id in another book is a "not found here", not a stale match.
+  // Candidate-id chain. Attempt 0 is bp-assistant's proposed id (coerced if it
+  // violates the 4-char grammar); later attempts are DETERMINISTIC derivations
+  // of it. Determinism is the point: when the preferred id can't be used it
+  // stays unusable, so a re-run of this chapter walks the identical chain,
+  // finds the row the previous run created, and updates it. Minting randomly
+  // instead would insert a second copy of the same question on every re-run.
+  const seedId = rawId ? coerceRowId(rawId) : null;
+
+  for (let attempt = 0; attempt < 8; attempt++) {
+    const id = seedId ? (attempt === 0 ? seedId : deriveAltRowId(seedId, attempt)) : newRowId();
+
+    // Book-scoped to match the composite PK — a colliding id in another book is
+    // a "not found here", not a stale match.
     const existing = await env.DB.prepare(
-      `SELECT version FROM tq_rows WHERE id = ?1 AND book = ?2 AND deleted_at IS NULL`,
+      `SELECT version, chapter FROM tq_rows WHERE id = ?1 AND book = ?2 AND deleted_at IS NULL`,
     )
-      .bind(proposedId, p.book)
-      .first<{ version: number }>();
+      .bind(id, p.book)
+      .first<{ version: number; chapter: number }>();
     if (existing) {
+      // The id is live. Adopt it only if it sits in the chapter this proposal
+      // belongs to. TQ rows don't migrate between chapters, so a live match in
+      // a DIFFERENT chapter means the id is stale/reused, not ours — and the
+      // update below would overwrite that unrelated question's text while
+      // leaving it filed under its own chapter. Step to the next candidate
+      // rather than destroy it. (Within a chapter, adopting is right, and the
+      // update rewrites verse/ref_raw so a moved question stays consistent.)
+      if (existing.chapter !== p.chapter) continue;
       const newVersion = existing.version + 1;
       const now = Math.floor(Date.now() / 1000);
       const patch = {
@@ -1477,11 +1495,14 @@ async function applyTqUpsert(
           .prepare(
             // sort_order is refreshed too: TQ has no preserve/keep semantics —
             // each run fully reorders the verse to match the incoming file.
+            // `verse` is rewritten alongside ref_raw so a question the run
+            // moved to another verse of this chapter can't end up filed under
+            // its old verse while displaying the new reference.
             `UPDATE tq_rows
                 SET ref_raw = ?1, tags = ?2, quote = ?3, occurrence = ?4,
-                    question = ?5, response = ?6, sort_order = ?7,
-                    version = version + 1, updated_at = ?8, updated_by = ?9
-              WHERE id = ?10 AND book = ?11 AND deleted_at IS NULL`,
+                    question = ?5, response = ?6, sort_order = ?7, verse = ?8,
+                    version = version + 1, updated_at = ?9, updated_by = ?10
+              WHERE id = ?11 AND book = ?12 AND deleted_at IS NULL`,
           )
           .bind(
             patch.ref_raw,
@@ -1491,9 +1512,10 @@ async function applyTqUpsert(
             patch.question,
             patch.response,
             sortOrder,
+            p.verse,
             now,
             userId,
-            proposedId,
+            id,
             p.book,
           ),
         env.DB
@@ -1502,7 +1524,7 @@ async function applyTqUpsert(
                (kind, row_key, book, user_id, prev_version, new_version, action, payload_json, source)
              VALUES ('tq', ?1, ?2, ?3, ?4, ?5, 'update', ?6, ?7)`,
           )
-          .bind(proposedId, p.book, userId, existing.version, newVersion, JSON.stringify(patch), AI_SOURCE),
+          .bind(id, p.book, userId, existing.version, newVersion, JSON.stringify(patch), AI_SOURCE),
         env.DB
           .prepare(
             `UPDATE pending_imports SET accepted_at = unixepoch(), accepted_by = ?2 WHERE id = ?1`,
@@ -1511,30 +1533,30 @@ async function applyTqUpsert(
       ]);
       return "updated";
     }
-  }
 
-  // New row — proposedId either absent or not in tq_rows. Use it as the
-  // sticky id when present (preserves AI-side correlation); otherwise mint
-  // a fresh id with the same retry pattern as TN insert.
-  if (proposedId) {
-    await insertTqAtId(env, p, payload, proposedId, userId, sortOrder);
-  } else {
-    let lastErr: unknown = null;
-    for (let attempt = 0; attempt < 8; attempt++) {
-      const fresh = newRowId();
-      try {
-        await insertTqAtId(env, p, payload, fresh, userId, sortOrder);
-        lastErr = null;
-        break;
-      } catch (e) {
-        lastErr = e;
-        const msg = e instanceof Error ? e.message : String(e);
-        if (!/UNIQUE|PRIMARY KEY/i.test(msg)) throw e;
-      }
+    // No LIVE row at this id. It's either free, or held by a TOMBSTONE: the
+    // lookup above filters `deleted_at IS NULL` while the constraint the insert
+    // must satisfy is `PRIMARY KEY (book, id)`, which has no deleted_at
+    // component — so a soft-deleted row is invisible here yet owns its slot
+    // forever. Let the INSERT be the arbiter and step to the next candidate on
+    // collision. Stepping (rather than reusing the slot) is deliberate:
+    // overwriting a tombstone would silently resurrect a row a translator
+    // deleted, into whatever verse the new proposal belongs to.
+    //
+    // (1CH 23:7 proposed `hoig`, held by a hand-deleted 1CH 5:4 question. The
+    // previously unguarded insert threw out of applyJobOutput and killed the
+    // whole job, twice, terminally.)
+    try {
+      await insertTqAtId(env, p, payload, id, userId, sortOrder);
+      return "created";
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      if (!/UNIQUE|PRIMARY KEY/i.test(msg)) throw e;
     }
-    if (lastErr) throw new Error(`tq id collision exhausted after 8 attempts`);
   }
-  return "created";
+  throw new Error(
+    `tq id collision exhausted after 8 attempts (book ${p.book}, ref ${p.chapter}:${p.verse}, proposed id ${rawId ?? "none"})`,
+  );
 }
 
 async function insertTqAtId(
@@ -1546,11 +1568,17 @@ async function insertTqAtId(
   sortOrder: number,
 ): Promise<void> {
   const cols = ["id", "book", "chapter", "verse", "ref_raw", "tags", "quote", "occurrence", "question", "response", "updated_by", "sort_order"];
+  // book/chapter/verse come from the pending_imports row, NOT the payload.
+  // `p.book` is the job's book and is what the caller's liveness lookup, the
+  // (book, id) collision guard, and the edit_log row below all key on; taking
+  // them from the payload instead would let a stray TSV cell insert the row
+  // into a different (book, id) space than the one just checked, leaving the
+  // audit row pointing at a row that doesn't exist there.
   const values = [
     id,
-    payload.book ?? null,
-    payload.chapter ?? null,
-    payload.verse ?? null,
+    p.book,
+    p.chapter,
+    p.verse,
     payload.ref_raw ?? null,
     payload.tags ?? null,
     payload.quote ?? null,

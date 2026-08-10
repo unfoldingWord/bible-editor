@@ -26,6 +26,7 @@ import {
   maybeTouchClaim,
   maybeCheckCancelled,
 } from "./pipelineImport.ts";
+import { ROW_ID_RE, coerceRowId, deriveAltRowId } from "./rowId.ts";
 
 function assert(cond, msg) {
   if (!cond) {
@@ -1720,6 +1721,11 @@ function buildFakeTqBoundaryDb(flipAfterProposals) {
     if (/MAX\(sort_order\)/.test(sql)) {
       return { changes: 0, rows: [], single: null };
     }
+    if (/SELECT version, chapter FROM tq_rows/.test(sql)) {
+      // These proposals carry no proposed id (payload_json: "{}"), so every
+      // candidate is a freshly minted random id — never a live row.
+      return { changes: 0, rows: [], single: null };
+    }
     if (/INSERT INTO tq_rows/.test(sql)) {
       tqInsertCount += 1;
       return { changes: 1, rows: [], single: null };
@@ -1949,6 +1955,355 @@ await withMockedClock(async () => {
   assert(
     result.applied?.verseUpdated === 2,
     `verse boundary: exactly 2 verse rows updated (v1 ULT + v1 UST), v2 untouched (got ${result.applied?.verseUpdated})`,
+  );
+});
+
+// ── TQ candidate-id chain: an 8-long DETERMINISTIC chain (seedId, then
+//    deriveAltRowId(seedId, 1..7)) walked per proposal. Live-in-same-chapter
+//    -> UPDATE; live-in-different-chapter -> step past it; no live row ->
+//    INSERT, stepping past a tombstoned PK slot (UNIQUE/PRIMARY KEY) rather
+//    than throwing; any other insert error rethrows immediately. The
+//    load-bearing property is RE-RUN IDEMPOTENCY: because the chain is
+//    deterministic, a second job proposing the same chapter walks the same
+//    candidates, finds the row the first run created, and UPDATEs it instead
+//    of inserting a duplicate. (1CH 23:7 proposed `hoig`, held by a
+//    hand-deleted 1CH 5:4 question — the original incident this guard traces
+//    to; the re-run-doubling failure mode is the reason the fix was redesigned
+//    away from random re-minting.)
+
+// Configurable fake tq_rows + pipeline_jobs backing store. `liveRows` is a
+// mutable Map<id, {version, chapter}> so callers can pre-seed a live row (the
+// cross-chapter test) and so the map persists across multiple importJobOutput
+// calls against the same env (the re-run-idempotency test). `tombstonedIds`
+// simulates a soft-deleted row that still owns its (book, id) PK slot (the
+// live-row SELECT filters deleted_at IS NULL, but the INSERT constraint has no
+// such filter). `hardErrorIds` simulates a non-UNIQUE insert failure that must
+// propagate rather than being retried down the chain.
+function buildFakeTqDb({ tombstonedIds = new Set(), hardErrorIds = new Set(), liveRows = new Map() } = {}) {
+  const batches = [];
+  const insertedIds = [];
+  const updatedIds = [];
+  const insertAttempts = [];
+  const pipelineState = { state: "running", errorKind: null };
+  const dbState = { claimedAt: 4000 };
+
+  // Each importJobOutput call issues exactly one pending_imports SELECT (in
+  // applyJobOutput); proposalsQueue hands out one array per call, in order, so
+  // a caller simulating "a new job re-proposes the same content" pushes a
+  // fresh array for each run rather than reusing object identity.
+  const proposalsQueue = [];
+  let proposalsCallIndex = 0;
+  function setProposals(rows) {
+    proposalsQueue.push(rows);
+  }
+
+  function dispatch(sql, args) {
+    if (/UPDATE pipeline_jobs SET import_claimed_at = unixepoch\(\)/.test(sql) && /IS NULL OR/.test(sql)) {
+      return { changes: 1, rows: [{ import_claimed_at: dbState.claimedAt }], single: { import_claimed_at: dbState.claimedAt } };
+    }
+    if (/UPDATE pipeline_jobs SET import_claimed_at = unixepoch\(\)/.test(sql) && /import_claimed_at\s*=\s*\?2/.test(sql)) {
+      const expected = args[1];
+      if (dbState.claimedAt !== expected) return { changes: 0, rows: [], single: null };
+      dbState.claimedAt += 1;
+      return { changes: 1, rows: [{ import_claimed_at: dbState.claimedAt }], single: { import_claimed_at: dbState.claimedAt } };
+    }
+    if (/SELECT staged_at FROM pipeline_jobs/.test(sql)) {
+      return { changes: 0, rows: [], single: { staged_at: 999999 } }; // already staged
+    }
+    if (/SELECT state, error_kind FROM pipeline_jobs/.test(sql)) {
+      return { changes: 0, rows: [], single: { state: pipelineState.state, error_kind: pipelineState.errorKind } };
+    }
+    if (/SELECT user_id FROM pipeline_jobs/.test(sql)) {
+      return { changes: 0, rows: [], single: { user_id: 1 } };
+    }
+    if (/ORDER BY kind, chapter, verse, id/.test(sql)) {
+      const rows = proposalsQueue[proposalsCallIndex] ?? [];
+      proposalsCallIndex += 1;
+      return { changes: 0, rows, single: null };
+    }
+    if (/MAX\(sort_order\)/.test(sql)) {
+      return { changes: 0, rows: [], single: null };
+    }
+    if (/SELECT version, chapter FROM tq_rows/.test(sql)) {
+      const id = args[0];
+      const row = liveRows.get(id) ?? null;
+      return { changes: 0, rows: row ? [row] : [], single: row };
+    }
+    if (/UPDATE tq_rows\s+SET/.test(sql)) {
+      // bind order per applyTqUpsert's UPDATE: id is ?11 (0-indexed args[10]).
+      const id = args[10];
+      updatedIds.push(id);
+      return { changes: 1, rows: [], single: null };
+    }
+    if (/INSERT INTO tq_rows/.test(sql)) {
+      const id = args[0];
+      const chapter = args[2];
+      insertAttempts.push(id);
+      if (hardErrorIds.has(id)) {
+        throw new Error("D1_ERROR: NOT NULL constraint failed: tq_rows.question: SQLITE_CONSTRAINT_NOTNULL");
+      }
+      if (tombstonedIds.has(id)) {
+        throw new Error(
+          "D1_ERROR: UNIQUE constraint failed: tq_rows.book, tq_rows.id: SQLITE_CONSTRAINT (extended: SQLITE_CONSTRAINT_PRIMARYKEY)",
+        );
+      }
+      insertedIds.push(id);
+      liveRows.set(id, { version: 1, chapter });
+      return { changes: 1, rows: [], single: null };
+    }
+    if (/INSERT INTO edit_log/.test(sql)) {
+      return { changes: 1, rows: [], single: null };
+    }
+    if (/SET accepted_at = unixepoch\(\), accepted_by = \?2/.test(sql)) {
+      return { changes: 1, rows: [], single: null };
+    }
+    if (/UPDATE pipeline_jobs SET import_aborted_at/.test(sql)) {
+      return { changes: 1, rows: [], single: null };
+    }
+    if (/UPDATE pipeline_jobs SET import_claimed_at = NULL/.test(sql)) {
+      return { changes: 1, rows: [], single: null };
+    }
+    throw new Error(`fakeTqDb: unhandled SQL: ${sql}`);
+  }
+
+  const env = {
+    DB: {
+      prepare(sql) {
+        return {
+          bind(...args) {
+            return {
+              sql,
+              args,
+              async run() {
+                const res = dispatch(sql, args);
+                return { meta: { changes: res.changes }, results: res.rows };
+              },
+              async first() {
+                return dispatch(sql, args).single;
+              },
+              async all() {
+                return { results: dispatch(sql, args).rows };
+              },
+            };
+          },
+        };
+      },
+      async batch(stmts) {
+        const results = [];
+        const batchSqls = [];
+        for (const s of stmts) {
+          const res = dispatch(s.sql, s.args);
+          batchSqls.push({ sql: s.sql, args: s.args });
+          results.push({ meta: { changes: res.changes }, results: res.rows });
+        }
+        batches.push(batchSqls);
+        return results;
+      },
+    },
+  };
+
+  return { env, batches, insertedIds, updatedIds, insertAttempts, liveRows, setProposals };
+}
+
+await withMockedClock(async () => {
+  const { env, batches, insertedIds, updatedIds, setProposals } = buildFakeTqDb({
+    tombstonedIds: new Set(["hoig"]),
+  });
+
+  const tqProposals = () => [
+    {
+      id: 1,
+      kind: "tq",
+      book: "GEN",
+      chapter: 1,
+      verse: 1,
+      bible_version: null,
+      payload_json: JSON.stringify({ id: "hoig", book: "GEN", chapter: 1, verse: 1, question: "q-tombstone" }),
+    },
+    {
+      id: 2,
+      kind: "tq",
+      book: "GEN",
+      chapter: 1,
+      verse: 2,
+      bible_version: null,
+      payload_json: JSON.stringify({ id: "abc1", book: "GEN", chapter: 1, verse: 2, question: "q-clean" }),
+    },
+    {
+      id: 3,
+      kind: "tq",
+      book: "GEN",
+      chapter: 1,
+      verse: 3,
+      bible_version: null,
+      payload_json: JSON.stringify({ id: "9BAD", book: "GEN", chapter: 1, verse: 3, question: "q-malformed" }),
+    },
+  ];
+
+  const originalConsoleError = console.error;
+  console.error = () => {};
+  let result;
+  try {
+    setProposals(tqProposals());
+    result = await importJobOutput(
+      env,
+      { jobId: "job-tq-chain", pipelineType: "tqs", book: "GEN", startChapter: 1, endChapter: 1 },
+      [],
+    );
+  } finally {
+    console.error = originalConsoleError;
+  }
+
+  assert(
+    result.aborted !== true && result.applied?.tqCreated === 3,
+    `TQ candidate chain: the job completes with all 3 rows created instead of throwing on the tombstoned PK slot (aborted=${result.aborted}, tqCreated=${result.applied?.tqCreated})`,
+  );
+  assert(insertedIds.length === 3, `TQ candidate chain: all 3 proposals reached an INSERT (got ${insertedIds.length})`);
+  assert(
+    insertedIds[0] === deriveAltRowId("hoig", 1),
+    `TQ candidate chain: the proposal colliding with tombstoned "hoig" lands on the exact deterministic next candidate deriveAltRowId("hoig", 1) (${deriveAltRowId("hoig", 1)}), not just "some other id" (got "${insertedIds[0]}")`,
+  );
+  assert(
+    insertedIds[1] === "abc1",
+    `TQ candidate chain: a clean, free proposed id ("abc1") is preserved verbatim, not over-corrected into always minting (got "${insertedIds[1]}")`,
+  );
+  assert(
+    insertedIds[2] === coerceRowId("9BAD"),
+    `TQ candidate chain: a malformed proposed id ("9BAD") is inserted as its coerced form coerceRowId("9BAD") (${coerceRowId("9BAD")}), never as "9BAD" itself (got "${insertedIds[2]}")`,
+  );
+  assert(insertedIds[2] !== "9BAD", `TQ candidate chain: the malformed id "9BAD" itself is never inserted (got "${insertedIds[2]}")`);
+
+  const tombstoneInsertBatch = batches.find(
+    (b) => b.some((s) => /INSERT INTO tq_rows/.test(s.sql) && s.args[0] === insertedIds[0]),
+  );
+  const tombstoneEditLog = tombstoneInsertBatch?.find((s) => /INSERT INTO edit_log/.test(s.sql));
+  assert(
+    tombstoneEditLog?.args[0] === insertedIds[0],
+    `TQ candidate chain: the edit_log row for the tombstone case carries the id that was ACTUALLY inserted (${insertedIds[0]}), not the proposed "hoig" (got "${tombstoneEditLog?.args[0]}")`,
+  );
+
+  // ── RE-RUN IDEMPOTENCY (the key property this redesign exists for) ──
+  // A second job re-proposes the exact same three notes for the same chapter,
+  // against the SAME env (so the live-rows map created by run 1 persists).
+  // Because the candidate chain is deterministic, every proposal must walk the
+  // identical chain, land on the row run 1 created, and UPDATE it — never
+  // insert a second copy.
+  setProposals(tqProposals());
+  console.error = () => {};
+  let rerunResult;
+  try {
+    rerunResult = await importJobOutput(
+      env,
+      { jobId: "job-tq-chain", pipelineType: "tqs", book: "GEN", startChapter: 1, endChapter: 1 },
+      [],
+    );
+  } finally {
+    console.error = originalConsoleError;
+  }
+
+  assert(
+    rerunResult.aborted !== true,
+    `TQ re-run idempotency: the second run completes without aborting (aborted=${rerunResult.aborted})`,
+  );
+  assert(
+    insertedIds.length === 3,
+    `TQ re-run idempotency: a re-run for the same chapter must UPDATE the rows the first run created, never insert duplicate copies — insertedIds stayed at 3 (got ${insertedIds.length})`,
+  );
+  assert(
+    updatedIds.length === 3 &&
+      updatedIds.includes(insertedIds[0]) &&
+      updatedIds.includes(insertedIds[1]) &&
+      updatedIds.includes(insertedIds[2]),
+    `TQ re-run idempotency: all 3 of run 1's inserted ids (${insertedIds.join(",")}) took the UPDATE branch on re-run (got updatedIds=${updatedIds.join(",")})`,
+  );
+});
+
+// ── Cross-chapter live id is not trampled: a live row at the candidate id in
+//    a DIFFERENT chapter must be stepped past, never overwritten ──
+await withMockedClock(async () => {
+  const { env, insertedIds, updatedIds, setProposals } = buildFakeTqDb({
+    liveRows: new Map([["xyz1", { version: 1, chapter: 1 }]]),
+  });
+
+  setProposals([
+    {
+      id: 1,
+      kind: "tq",
+      book: "GEN",
+      chapter: 2,
+      verse: 1,
+      bible_version: null,
+      payload_json: JSON.stringify({ id: "xyz1", book: "GEN", chapter: 2, verse: 1, question: "q-cross-chapter" }),
+    },
+  ]);
+
+  const originalConsoleError = console.error;
+  console.error = () => {};
+  let result;
+  try {
+    result = await importJobOutput(
+      env,
+      { jobId: "job-tq-cross-chapter", pipelineType: "tqs", book: "GEN", startChapter: 2, endChapter: 2 },
+      [],
+    );
+  } finally {
+    console.error = originalConsoleError;
+  }
+
+  assert(result.aborted !== true, `TQ cross-chapter guard: the job completes (aborted=${result.aborted})`);
+  assert(
+    !updatedIds.includes("xyz1"),
+    `TQ cross-chapter guard: the chapter-1 live row at "xyz1" is left alone, not trampled by a chapter-2 proposal (updatedIds=${updatedIds.join(",")})`,
+  );
+  assert(
+    insertedIds.includes(deriveAltRowId("xyz1", 1)),
+    `TQ cross-chapter guard: the chapter-2 proposal steps to the next deterministic candidate deriveAltRowId("xyz1", 1) (${deriveAltRowId("xyz1", 1)}) instead of overwriting the chapter-1 row (insertedIds=${insertedIds.join(",")})`,
+  );
+});
+
+// ── Non-UNIQUE insert errors are not retried down the chain — they rethrow
+//    immediately, so the caller sees the real failure instead of a job that
+//    silently exhausts all 8 candidates and reports a misleading "collision
+//    exhausted" error ──
+await withMockedClock(async () => {
+  const { env, insertAttempts, setProposals } = buildFakeTqDb({
+    hardErrorIds: new Set(["errd"]),
+  });
+
+  setProposals([
+    {
+      id: 1,
+      kind: "tq",
+      book: "GEN",
+      chapter: 1,
+      verse: 1,
+      bible_version: null,
+      payload_json: JSON.stringify({ id: "errd", book: "GEN", chapter: 1, verse: 1, question: "q-hard-error" }),
+    },
+  ]);
+
+  const originalConsoleError = console.error;
+  console.error = () => {};
+  let threw = null;
+  try {
+    await importJobOutput(
+      env,
+      { jobId: "job-tq-hard-error", pipelineType: "tqs", book: "GEN", startChapter: 1, endChapter: 1 },
+      [],
+    );
+  } catch (e) {
+    threw = e;
+  } finally {
+    console.error = originalConsoleError;
+  }
+
+  assert(
+    threw != null && /NOT NULL/.test(threw.message),
+    `TQ non-UNIQUE error: importJobOutput rejects with the underlying NOT NULL failure instead of swallowing it (got ${threw?.message ?? "no throw"})`,
+  );
+  assert(
+    insertAttempts.length === 1,
+    `TQ non-UNIQUE error: the chain stops after the first insert attempt instead of retrying all 8 candidates (got ${insertAttempts.length} attempts: ${insertAttempts.join(",")})`,
   );
 });
 
