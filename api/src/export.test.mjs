@@ -5,7 +5,7 @@
 // instead of getting silently flattened to `\v 6`. Not a test framework;
 // failures exit non-zero.
 
-import { attributeTsvShrink, buildAlignmentShrinkAlertMessage, buildUsfmInvalidAlertMessage, classifyAlignmentLossSeverity, offenderProvenanceFromLog, buildExportBranch, buildTnTsv, buildTqTsv, buildTwlTsv, buildUsfm, classifyAlignmentShrinkOffenders, classifyRevertSeverity, commitToDcs, countDuplicateMasterIds, describeShrinkRefusal, ensureDcsPr, exportTags, exportTsvShrinkRefused, findDcsOpenPr, parseTsvIds, recreateExportBranchFromMaster, tsvRevertReport, updateDcsPrBranch, usfmAlignmentShrinkRefused, usfmRevertReport } from "./export.ts";
+import { attributeTsvShrink, buildAlignmentShrinkAlertMessage, buildUsfmInvalidAlertMessage, classifyAlignmentLossSeverity, offenderProvenanceFromLog, buildExportBranch, buildTnTsv, buildTqTsv, buildTwlTsv, buildUsfm, classifyAlignmentShrinkOffenders, classifyRevertSeverity, commitToDcs, countDuplicateMasterIds, describeShrinkRefusal, ensureDcsPr, exportTags, exportTsvShrinkRefused, findDcsOpenPr, parseTsvIds, recreateExportBranchFromMaster, shouldRecordRevertReport, tsvRevertReport, updateDcsPrBranch, usfmAlignmentShrinkRefused, usfmRevertReport } from "./export.ts";
 import { CorruptContentJsonError } from "./contentJson.ts";
 import { validateUsfm } from "./usfmValidate.ts";
 
@@ -2014,6 +2014,39 @@ function utf8Base64(s) {
   assert(
     rMissing.entries.length === 0,
     `a row present in only one side (master-only ab05 here) is not reported`,
+  );
+}
+
+// --- shouldRecordRevertReport: gate on the real ship signal, not "reached
+// the code that would ship" ---
+// exportWorkflow.ts used to build+record the revert report right after the
+// shrink/alignment guards captured master's content, on the false premise
+// that reaching that line meant the export would ship — the hard-reject
+// guard, the alignment-shrink backstop, and the USFM validation HOLD gate all
+// sit between that point and the actual DCS commit and can still return early
+// with nothing pushed. This helper is the fix: it's what exportOne now
+// consults AFTER commitToDcs, so a book that gets held by one of those gates
+// (which never reaches this call at all) can't record a false "overwrote
+// master" finding, and a run that reaches here but pushed nothing new can't
+// either.
+{
+  assert(
+    shouldRecordRevertReport(true, "master content") === true,
+    `pushed new content (dcsChanged:true) + a readable master snapshot -> record`,
+  );
+  assert(
+    shouldRecordRevertReport(false, "master content") === false,
+    `dcsChanged:false (content already matched master, or the branch already carried an earlier run's ` +
+      `identical commit) -> do not record, even though master WAS readable`,
+  );
+  assert(
+    shouldRecordRevertReport(true, null) === false,
+    `dcsChanged:true but master was unreadable when the shrink/alignment guards ran (masterContent:null) -> ` +
+      `decline, same as usfmRevertReport/tsvRevertReport's own null-parse contract`,
+  );
+  assert(
+    shouldRecordRevertReport(false, null) === false,
+    `neither signal present -> do not record`,
   );
 }
 

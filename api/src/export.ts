@@ -980,6 +980,28 @@ export function tsvRevertReport(
   return { entries, totalRows: master.size };
 }
 
+// Whether exportWorkflow.ts's exportOne should build and record an export-
+// revert report for this (book, resource) THIS run. Pulled out as a pure,
+// testable decision because the two inputs are easy to get backwards:
+//
+// - `dcsChanged` must be `commit.changed` from THIS run's `commitToDcs` call,
+//   not merely "we reached the code that calls commitToDcs". A content match
+//   (`branchTouched:false`) or a branch that already carried an earlier run's
+//   identical commit (`branchTouched:true, changed:false`) means nothing was
+//   freshly overwritten tonight — recording anyway would either be false
+//   (nothing changed) or a duplicate of a night that already recorded it.
+// - `masterContent` must be the SAME raw master content the shrink/alignment
+//   guards captured earlier in exportOne (no second fetch) — `null` means
+//   master was unreadable when they ran, so there is nothing to diff against.
+//
+// Both conditions must hold: a `dcsChanged:true` run with `masterContent:null`
+// means we shipped but never got a trustworthy master snapshot to compare
+// against (declines to report rather than guess, same as usfmRevertReport /
+// tsvRevertReport's own null-parse contract).
+export function shouldRecordRevertReport(dcsChanged: boolean, masterContent: string | null): boolean {
+  return dcsChanged && masterContent != null;
+}
+
 // Does the number of substantive reverts this export is about to make justify
 // escalating the alert's wording beyond routine? This NEVER blocks the export
 // — there is no `block` field, only `escalate` — because a revert report is

@@ -43,6 +43,7 @@ import {
   RESOURCE_TARGETS,
   usfmRevertReport,
   tsvRevertReport,
+  shouldRecordRevertReport,
   classifyRevertSeverity,
   type AlignmentShrinkResult,
   type OffenderProvenance,
@@ -59,6 +60,12 @@ const EXPORT_ALERT_USERNAME = "deferredreward";
 // Pruned best-effort on each export so it doesn't linger; safe to delete since
 // the live-snapshot flow is no longer used (its post-export path is dormant).
 const LEGACY_EXPORT_BRANCH = "live-snapshot";
+
+// D1 statement-per-batch chunk size for recordExportReverts. Matches the
+// WRITE_BATCH convention already used for bulk D1 writes in bookReimport.ts —
+// a book's revert report (one row per differing verse/note row) can exceed a
+// batch's safe statement count for a big book, where this feature matters most.
+const REVERT_WRITE_BATCH = 90;
 import { applyTwlSortOrderUpdates } from "./twlSortOrderApply";
 import { loadTwTitles } from "./twTitles";
 import { loadTwlOrderLocks } from "./twlOrderLocks";
@@ -556,24 +563,13 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       }
     }
 
-    // Export-revert report (observational only — see the "Export-revert
-    // report" section in export.ts). Runs ONLY here, after the shrink guard
-    // above has already decided to ship (an early return above this point
-    // means nothing was committed, so there is nothing to report), and ONLY
-    // when master was actually readable (tsvMasterContentForRevertReport is
-    // the SAME raw TSV checkTsvShrink already fetched — no second fetch).
-    if (
-      dcsAllowed &&
-      (resource === "tn" || resource === "tq" || resource === "twl") &&
-      tsvMasterContentForRevertReport != null
-    ) {
-      const report = tsvRevertReport(
-        built.content,
-        tsvMasterContentForRevertReport,
-        resource as "tn" | "tq" | "twl",
-      );
-      await this.recordExportRevertReport(book, resource, "tsv", report.entries);
-    }
+    // Export-revert report for tn/tq/twl is recorded further down, after
+    // commitToDcs actually runs — see the comment there for why. (It used to
+    // run right here, right after tsvMasterContentForRevertReport was
+    // captured, on the false premise that reaching this line meant the
+    // export would ship; the hard-reject guard below and the DCS commit
+    // itself can still stop it. tsvMasterContentForRevertReport itself is
+    // still captured above by checkTsvShrink — only the recording moved.)
 
     // There is deliberately NO blank required-field HOLD gate here any more.
     //
@@ -710,16 +706,13 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       }
     }
 
-    // Export-revert report (observational only — see the "Export-revert
-    // report" section in export.ts). Runs ONLY here, after the alignment-shrink
-    // backstop above has already decided to ship (an early return above this
-    // point means nothing was committed), and ONLY when master was actually
-    // readable (usfmMasterContentForRevertReport is the SAME raw USFM
-    // checkUsfmAlignmentShrink already fetched — no second fetch).
-    if (dcsAllowed && (resource === "ult" || resource === "ust") && usfmMasterContentForRevertReport != null) {
-      const report = usfmRevertReport(built.content, usfmMasterContentForRevertReport);
-      await this.recordExportRevertReport(book, resource, "usfm", report.entries);
-    }
+    // Export-revert report for ult/ust is recorded further down, after
+    // commitToDcs actually runs — see the comment there for why. (It used to
+    // run right here, on the false premise that reaching this line meant the
+    // export would ship; the USFM validation HOLD gate immediately below, and
+    // the DCS commit itself, can still stop it. usfmMasterContentForRevertReport
+    // itself is still captured above by checkUsfmAlignmentShrink — only the
+    // recording moved.)
 
     // USFM structural validation HOLD gate for the scripture resources. Ports
     // DCS's own validate_usfm_files.py Check 7 (consecutive paragraph markers)
@@ -786,6 +779,46 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       }
       dcsCommitSha = commit.commitSha || null;
       dcsChanged = commit.changed;
+
+      // Export-revert report (observational only — see the "Export-revert
+      // report" section in export.ts). Recorded HERE, immediately after the
+      // commit itself, not near the shrink/alignment guards that captured
+      // master's content earlier in this method: whether this export
+      // actually overwrites anything on master is only knowable once
+      // commitToDcs has run. The hard-reject guard, the alignment-shrink
+      // backstop, and the USFM validation HOLD gate all sit between those
+      // guards and here and can still return early with nothing committed —
+      // recording used to happen right after the master content was
+      // captured, so a book that failed validateUsfm still got an "overwrote
+      // master" alert despite pushing nothing.
+      //
+      // Gated on `dcsChanged`, not merely on reaching this line: dcsChanged
+      // is `commit.changed` from the commitToDcs call just above, true only
+      // when THIS run pushed new content. A content match
+      // (`branchTouched:false`) or a branch that already carried an earlier
+      // run's identical commit (`branchTouched:true, changed:false`) means
+      // nothing was freshly overwritten tonight — reporting either would be
+      // false (nothing changed) or a duplicate of a night that already
+      // recorded it. Still no second fetch: usfmMasterContentForRevertReport
+      // / tsvMasterContentForRevertReport are the same raw content the
+      // shrink/alignment guards captured earlier in this method.
+      if (
+        (resource === "ult" || resource === "ust") &&
+        shouldRecordRevertReport(dcsChanged, usfmMasterContentForRevertReport)
+      ) {
+        const report = usfmRevertReport(built.content, usfmMasterContentForRevertReport as string);
+        await this.recordExportRevertReport(book, resource, "usfm", report.entries);
+      } else if (
+        (resource === "tn" || resource === "tq" || resource === "twl") &&
+        shouldRecordRevertReport(dcsChanged, tsvMasterContentForRevertReport)
+      ) {
+        const report = tsvRevertReport(
+          built.content,
+          tsvMasterContentForRevertReport as string,
+          resource as "tn" | "tq" | "twl",
+        );
+        await this.recordExportRevertReport(book, resource, "tsv", report.entries);
+      }
 
       if (!commit.branchTouched) {
         dcsSkippedReason = "unchanged";
@@ -1572,41 +1605,76 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
   // Persist this export's "we overwrote something on master" findings
   // (export.ts's usfmRevertReport / tsvRevertReport) so a maintainer's
   // hand-edit that our render just superseded is visible without waiting for
-  // a complaint (see PR #417). Replace-all per (book,resource), same shape as
-  // recordAlignmentAttention: delete then re-insert, batched into one D1.batch
-  // call (this file has already hit Cloudflare's ~1000-subrequest cap once).
-  // Called ONLY when there is at least one entry to record — an empty list
-  // here never means "measured and clean" (that's clearExportReverts's job
-  // on the genuinely-zero-diff path); see recordAlignmentAttention's own
-  // comment for why an empty-list write would erase real prior findings.
+  // a complaint (see PR #417). Replace-all per (book,resource): DELETE first,
+  // then re-insert in REVERT_WRITE_BATCH-sized chunks (same convention as
+  // bookReimport.ts's WRITE_BATCH). Called ONLY when there is at least one
+  // entry to record — an empty list here never means "measured and clean"
+  // (that's clearExportReverts's job on the genuinely-zero-diff path); see
+  // recordAlignmentAttention's own comment for why an empty-list write would
+  // erase real prior findings.
+  //
+  // Returns whether the table now reflects `entries` in full, so the caller
+  // can decide what the operator-facing alert is allowed to claim. This used
+  // to be one `this.env.DB.batch([DELETE, ...INSERTs])` call — one statement
+  // per entry plus the DELETE, all in a single transaction — which is exactly
+  // what the comment above the old INSERT (this file's OR-REPLACE-avoids-
+  // rollback idiom) assumed: one atomic unit, so any oversized report would
+  // throw and the `catch` below would silently log it while the alert still
+  // told the operator the report was recorded. There is no single-transaction
+  // way to keep that atomicity AND stay under D1's per-batch statement cap, so
+  // this now chunks: the DELETE runs alone first (it must land before any
+  // INSERT — a stale delete-less write would leave last night's rows mixed
+  // with tonight's), then each chunk of inserts is its own `.batch()` call. A
+  // chunk failing partway leaves the table holding only the entries from
+  // chunks that already committed — a real partial write, not a silently
+  // truncated one, because the caller is told `false` and must say so.
   private async recordExportReverts(
     book: string,
     resource: Resource,
     entries: Array<UsfmRevertEntry | TsvRevertEntry>,
-  ): Promise<void> {
-    if (entries.length === 0) return;
+  ): Promise<boolean> {
+    if (entries.length === 0) return true;
     try {
-      const statements = [
-        this.env.DB.prepare(`DELETE FROM export_reverts WHERE book = ?1 AND resource = ?2`).bind(book, resource),
-        ...entries.map((e) =>
-          this.env.DB.prepare(
-            // OR REPLACE: the batch is one transaction, so a duplicate ref
-            // would otherwise violate the unique index and roll back every
-            // other finding for this book+resource — see the identical
-            // rationale on recordAlignmentAttention's INSERT.
-            `INSERT OR REPLACE INTO export_reverts (book, resource, ref, class, fields)
-             VALUES (?1, ?2, ?3, ?4, ?5)`,
-          ).bind(book, resource, e.ref, e.class, "fields" in e && e.fields ? JSON.stringify(e.fields) : null),
-        ),
-      ];
-      await this.env.DB.batch(statements);
+      await this.env.DB.prepare(`DELETE FROM export_reverts WHERE book = ?1 AND resource = ?2`)
+        .bind(book, resource)
+        .run();
     } catch (e) {
-      console.error("export revert report write failed", {
+      console.error("export revert report delete failed", {
         book,
         resource,
         error: e instanceof Error ? e.message : String(e),
       });
+      // Old rows (if any) are left standing — stale, but not silently wrong:
+      // the caller must not claim this run's findings were recorded.
+      return false;
     }
+    for (let i = 0; i < entries.length; i += REVERT_WRITE_BATCH) {
+      const slice = entries.slice(i, i + REVERT_WRITE_BATCH);
+      try {
+        await this.env.DB.batch(
+          slice.map((e) =>
+            this.env.DB.prepare(
+              // OR REPLACE: each chunk's `.batch()` is still one transaction,
+              // so a duplicate ref within THIS chunk would otherwise violate
+              // the unique index and roll back the rest of the chunk — same
+              // rationale as recordAlignmentAttention's INSERT.
+              `INSERT OR REPLACE INTO export_reverts (book, resource, ref, class, fields)
+               VALUES (?1, ?2, ?3, ?4, ?5)`,
+            ).bind(book, resource, e.ref, e.class, "fields" in e && e.fields ? JSON.stringify(e.fields) : null),
+          ),
+        );
+      } catch (e) {
+        console.error("export revert report insert batch failed", {
+          book,
+          resource,
+          chunkStart: i,
+          chunkSize: slice.length,
+          error: e instanceof Error ? e.message : String(e),
+        });
+        return false;
+      }
+    }
+    return true;
   }
 
   // Clear stale export_reverts rows for a book+resource that was actually
@@ -1645,8 +1713,22 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       await this.clearExportReverts(book, resource);
       return;
     }
-    await this.recordExportReverts(book, resource, entries);
+    const recorded = await this.recordExportReverts(book, resource, entries);
     const label = `${book} ${resource.toUpperCase()}`;
+    if (!recorded) {
+      // recordExportReverts already logged the underlying error; the alert
+      // must not go on to claim these findings were recorded (see its own
+      // comment on why a failed/partial write must not read as success).
+      await this.writeAlert(
+        `export_revert:${book}:${resource}`,
+        `${label}: computed ${entries.length} export-revert finding(s) but failed to fully write them to ` +
+          `export_reverts (see worker logs for the D1 error) — this book+resource's revert report may now be ` +
+          `missing rows or stale. This does not block the export.`,
+        `${this.env.DCS_BASE_URL}/unfoldingWord`,
+        "warning",
+      );
+      return;
+    }
     const byClass = new Map<string, number>();
     for (const e of entries) byClass.set(e.class, (byClass.get(e.class) ?? 0) + 1);
     const breakdown = [...byClass.entries()].map(([cls, n]) => `${n} ${cls}`).join(", ");
