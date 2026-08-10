@@ -5,7 +5,7 @@
 // instead of getting silently flattened to `\v 6`. Not a test framework;
 // failures exit non-zero.
 
-import { attributeTsvShrink, buildAlignmentShrinkAlertMessage, buildUsfmInvalidAlertMessage, classifyAlignmentLossSeverity, offenderProvenanceFromLog, buildExportBranch, buildTnTsv, buildTqTsv, buildTwlTsv, buildUsfm, classifyAlignmentShrinkOffenders, commitToDcs, countDuplicateMasterIds, describeShrinkRefusal, ensureDcsPr, exportTsvShrinkRefused, findDcsOpenPr, parseTsvIds, recreateExportBranchFromMaster, updateDcsPrBranch, usfmAlignmentShrinkRefused } from "./export.ts";
+import { attributeTsvShrink, buildAlignmentShrinkAlertMessage, buildUsfmInvalidAlertMessage, classifyAlignmentLossSeverity, offenderProvenanceFromLog, buildExportBranch, buildTnTsv, buildTqTsv, buildTwlTsv, buildUsfm, classifyAlignmentShrinkOffenders, classifyRevertSeverity, commitToDcs, countDuplicateMasterIds, describeShrinkRefusal, ensureDcsPr, exportTags, exportTsvShrinkRefused, findDcsOpenPr, parseTsvIds, recreateExportBranchFromMaster, tsvRevertReport, updateDcsPrBranch, usfmAlignmentShrinkRefused, usfmRevertReport } from "./export.ts";
 import { CorruptContentJsonError } from "./contentJson.ts";
 import { validateUsfm } from "./usfmValidate.ts";
 
@@ -175,6 +175,47 @@ function utf8Base64(s) {
   assert(!out.includes("\r"), `no raw carriage returns in TSV output`);
   assert(out.includes("alpha\\nbeta"), `bare \\r escapes to the literal \\n`);
   assert(out.includes("gamma\\ndelta"), `CRLF collapses to one literal \\n`);
+}
+
+// --- exportTags: tn/tq always blank the Tags column, twl keeps it ---
+{
+  assert(exportTags("tn", "ISSUE:MATCH_FAIL") === "", `tn strips ISSUE:MATCH_FAIL`);
+  assert(exportTags("tq", "at-fit, ISSUE:MATCH_FAIL") === "", `tq strips combined tag`);
+  assert(exportTags("tn", null) === "", `tn null tag stays empty (no literal "null")`);
+  assert(exportTags("twl", "keep") === "keep", `twl tag is preserved`);
+}
+
+// --- buildTnTsv / buildTqTsv always emit an empty Tags column; buildTwlTsv doesn't ---
+{
+  const tnRow = {
+    ref_raw: "1:1", id: "ab12", tags: "ISSUE:MATCH_FAIL", support_reference: null,
+    quote: null, occurrence: 1, note: "n",
+  };
+  const tnOut = buildTnTsv([tnRow]).split("\n");
+  const tnCells = tnOut[1].split("\t");
+  assert(tnCells[2] === "", `tn row with ISSUE:MATCH_FAIL tag exports empty Tags`);
+  assert(tnCells.length === 7, `tn row keeps 7 columns (Reference/ID/Tags/SupportReference/Quote/Occurrence/Note)`);
+
+  const tnRow2 = { ...tnRow, tags: "at-fit, ISSUE:MATCH_FAIL" };
+  assert(buildTnTsv([tnRow2]).split("\n")[1].split("\t")[2] === "", `tn row with combined tag exports empty Tags`);
+
+  const tnRow3 = { ...tnRow, tags: null };
+  assert(buildTnTsv([tnRow3]).split("\n")[1].split("\t")[2] === "", `tn row with null tag exports empty Tags (unchanged behavior)`);
+
+  const tqRow = {
+    ref_raw: "1:1", id: "cd34", tags: "at-fit", quote: null,
+    occurrence: 1, question: "q", response: "r",
+  };
+  const tqOut = buildTqTsv([tqRow]).split("\n");
+  const tqCells = tqOut[1].split("\t");
+  assert(tqCells[2] === "", `tq row with at-fit tag exports empty Tags`);
+  assert(tqCells.length === 7, `tq row keeps 7 columns (Reference/ID/Tags/Quote/Occurrence/Question/Response)`);
+
+  const twlRow = { ref_raw: "1:1", id: "ef56", tags: "keep", orig_words: "אֵת", occurrence: 1, tw_link: "rc://x" };
+  const twlOut = buildTwlTsv([twlRow]).tsv.split("\n");
+  const twlCells = twlOut[1].split("\t");
+  assert(twlCells[2] === "keep", `twl row's tag is preserved (key asymmetry vs tn/tq)`);
+  assert(twlCells.length === 6, `twl row keeps 6 columns (Reference/ID/Tags/OrigWords/Occurrence/TWLink)`);
 }
 
 // --- every export branch carries `-be-` so the DCS gates don't skip it ---
@@ -1885,6 +1926,126 @@ function utf8Base64(s) {
       .includes("paragraph-marker-not-isolated"),
     `Check 8 must be ACTIVE on a synthesized-header render, not silently skipped`,
   );
+}
+
+// --- usfmRevertReport: export-time "we overwrote something" report ---
+// Purely observational — never blocks, never reachable from the shrink/
+// alignment guards' refusal decisions. Compares a rendered ULT/UST USFM
+// against master's current USFM and reports every verse present in BOTH that
+// actually differs.
+{
+  const verseUsfm = (book, ch, v, text) => `\\id ${book}\n\\c ${ch}\n\\p\n\\v ${v} ${text}\n`;
+
+  // Identical input → empty report.
+  const identical = verseUsfm("ISA", 1, 1, "the word of the LORD");
+  const rIdentical = usfmRevertReport(identical, identical);
+  assert(rIdentical.entries.length === 0, `identical usfm render vs master → empty revert report`);
+  assert(rIdentical.totalVerses === 1, `totalVerses counts master's verses`);
+
+  // Differs only by line-break/whitespace placement → "formatting".
+  const master1 = verseUsfm("ISA", 1, 2, "hear, O heavens, and give ear, O earth");
+  const rendered1 = `\\id ISA\n\\c 1\n\\p\n\\v 2 hear,   O heavens,\nand give ear, O earth\n`;
+  const rFormatting = usfmRevertReport(rendered1, master1);
+  assert(
+    rFormatting.entries.length === 1 && rFormatting.entries[0].class === "formatting",
+    `whitespace-only difference (line-break placement / run of spaces) classifies as "formatting"`,
+  );
+  assert(rFormatting.entries[0].ref === "1:2", `formatting entry names the verse ref`);
+
+  // A changed word → "substantive".
+  const master2 = verseUsfm("ISA", 1, 3, "the ox knows its owner");
+  const rendered2 = verseUsfm("ISA", 1, 3, "the ox knows its master");
+  const rSubstantive = usfmRevertReport(rendered2, master2);
+  assert(
+    rSubstantive.entries.length === 1 && rSubstantive.entries[0].class === "substantive",
+    `a changed word classifies as "substantive"`,
+  );
+
+  // A verse present on only one side is never reported.
+  const masterOnly = master1 + verseUsfm("ISA", 1, 9, "unless the LORD had left us a remnant");
+  const rOneSided = usfmRevertReport(master1, masterOnly);
+  assert(
+    rOneSided.entries.length === 0,
+    `a verse present in only one side (master-only 1:9 here) is not reported`,
+  );
+}
+
+// --- tsvRevertReport: export-time "we overwrote something" report (TSV) ---
+{
+  const TN_HEADER = "Reference\tID\tTags\tSupportReference\tQuote\tOccurrence\tNote";
+  const tnRow = (ref, id, tags, quote, note) => `${ref}\t${id}\t${tags}\t\t${quote}\t1\t${note}`;
+
+  // Only Tags differs → "tags_only".
+  const masterTags = `${TN_HEADER}\n${tnRow("1:1", "ab01", "", "word", "a note")}\n`;
+  const renderedTags = `${TN_HEADER}\n${tnRow("1:1", "ab01", "keyword", "word", "a note")}\n`;
+  const rTags = tsvRevertReport(renderedTags, masterTags, "tn");
+  assert(
+    rTags.entries.length === 1 && rTags.entries[0].class === "tags_only",
+    `only the Tags column differing classifies as "tags_only"`,
+  );
+  assert(rTags.totalRows === 1, `totalRows counts master's rows`);
+
+  // Only a double-space-vs-single-space difference in a text field → "whitespace_only".
+  const masterWs = `${TN_HEADER}\n${tnRow("1:2", "ab02", "", "word", "a  note about the word")}\n`;
+  const renderedWs = `${TN_HEADER}\n${tnRow("1:2", "ab02", "", "word", "a note about the word")}\n`;
+  const rWs = tsvRevertReport(renderedWs, masterWs, "tn");
+  assert(
+    rWs.entries.length === 1 && rWs.entries[0].class === "whitespace_only",
+    `a double-space-vs-single-space difference in Note classifies as "whitespace_only"`,
+  );
+
+  // A changed Quote → "substantive", with fields including "Quote".
+  const masterQuote = `${TN_HEADER}\n${tnRow("1:3", "ab03", "", "old word", "a note")}\n`;
+  const renderedQuote = `${TN_HEADER}\n${tnRow("1:3", "ab03", "", "new word", "a note")}\n`;
+  const rQuote = tsvRevertReport(renderedQuote, masterQuote, "tn");
+  assert(
+    rQuote.entries.length === 1 && rQuote.entries[0].class === "substantive",
+    `a changed Quote classifies as "substantive"`,
+  );
+  assert(
+    Array.isArray(rQuote.entries[0].fields) && rQuote.entries[0].fields.includes("Quote"),
+    `substantive entry's fields list includes "Quote"`,
+  );
+
+  // A row present in only one side is never reported.
+  const masterOnlyRow = `${TN_HEADER}\n${tnRow("1:4", "ab04", "", "word", "note")}\n${tnRow("1:5", "ab05", "", "other", "note2")}\n`;
+  const renderedMissing = `${TN_HEADER}\n${tnRow("1:4", "ab04", "", "word", "note")}\n`;
+  const rMissing = tsvRevertReport(renderedMissing, masterOnlyRow, "tn");
+  assert(
+    rMissing.entries.length === 0,
+    `a row present in only one side (master-only ab05 here) is not reported`,
+  );
+}
+
+// --- classifyRevertSeverity: escalation threshold ---
+// SYSTEMIC_REVERTS = 15 (see export.ts comment above classifyRevertSeverity):
+// more than 15 substantive entries across usfm+tsv escalates the wording;
+// this NEVER changes whether the export ships (no `block` field — only
+// `escalate`).
+{
+  const mkSubstantive = (n) => Array.from({ length: n }, (_, i) => ({ ref: `1:${i + 1}`, class: "substantive" }));
+
+  const small = classifyRevertSeverity(mkSubstantive(3), []);
+  assert(small.escalate === false, `a small number (3) of substantive entries is not escalated`);
+
+  const large = classifyRevertSeverity(mkSubstantive(10), mkSubstantive(10));
+  assert(
+    large.escalate === true,
+    `20 substantive entries (10 usfm + 10 tsv), crossing the 15 threshold, is escalated`,
+  );
+
+  const exactlyAtThreshold = classifyRevertSeverity(mkSubstantive(15), []);
+  assert(exactlyAtThreshold.escalate === false, `exactly 15 substantive entries is NOT escalated (threshold is > 15)`);
+
+  const oneOverThreshold = classifyRevertSeverity(mkSubstantive(16), []);
+  assert(oneOverThreshold.escalate === true, `16 substantive entries (one over threshold) is escalated`);
+
+  // Non-substantive classes never count toward the threshold.
+  const allFormatting = classifyRevertSeverity(
+    Array.from({ length: 50 }, (_, i) => ({ ref: `1:${i + 1}`, class: "formatting" })),
+    [],
+  );
+  assert(allFormatting.escalate === false, `formatting-only entries, however many, never escalate`);
 }
 
 console.log("\nAll export smoke checks passed.");

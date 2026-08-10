@@ -188,8 +188,15 @@ t("chapter opening with poetry keeps no \\p (none is ever invented)", () => {
 });
 
 t("consecutive \\q1 are NOT collapsed (DCS allows repeated poetry markers)", () => {
+  // Assertion reworded: joinPoetryMarkerToVerse now joins the SECOND \q1 onto
+  // the following \v (its own new rule, unrelated to Check-7 collapsing), so
+  // the output is `\q1` then `\q1 \v 1 …` — no bare-`\q1`-line count of 2
+  // survives. What this test actually guards (DCS allows repeated poetry
+  // markers, so neither is ever dropped) still holds: count surviving \q1
+  // markers wherever they appear on a line, not just bare lines.
   const ls = lines(`${HDR}\\q1\n\\q1\n\\v 1 \\w a\\w*\n`);
-  assert.equal(ls.filter((l) => l.trim() === "\\q1").length, 2);
+  const q1Count = ls.filter((l) => /^\\q1\b/.test(l.trim())).length;
+  assert.equal(q1Count, 2, "both \\q1 markers survive — one bare, one leading the \\v line");
 });
 
 t("mixed \\p then \\m adjacency is left intact (validator's job, not auto-fix)", () => {
@@ -443,6 +450,117 @@ t("regression guard: \\ts\\* after \\b still reorders to \\b before \\ts\\*", ()
 t("regression guard: consecutive \\p still collapses to one", () => {
   const out = norm(`${HDR}\\c 8\n\\p\n\\p\n\\v 1 \\w a\\w*\n`);
   assert.equal((out.match(/^\\p$/gm) || []).length, 1, "still collapses to a single \\p");
+});
+
+// ── Change 6: a lone poetry marker joins forward onto its \v ───────────────
+// The DCS maintainer hand-fixes `\q1` (alone on its line) followed by
+// `\v 7 …` into a single `\q1 \v 7 …` line — 620 occurrences across the ULT
+// and UST books we export (302+308), vs. essentially none (1+10) in the
+// books we don't. joinPoetryMarkerToVerse reproduces that shape directly, and
+// runs BEFORE joinDanglingVerses so the two compose correctly (see the
+// ordering test below).
+
+t("lone \\q1 joins forward onto \\v 7", () => {
+  const ls = lines(`${HDR}\\q1\n\\v 7 \\w a\\w*\n`);
+  assert.ok(ls.some((l) => l.trim() === "\\q1 \\v 7 \\w a\\w*"), "joined onto one line");
+  assert.ok(!ls.some((l) => l.trim() === "\\q1"), "no bare \\q1 line left behind");
+});
+
+for (const marker of ["\\q", "\\q1", "\\q2", "\\q3", "\\q4"]) {
+  t(`lone ${marker} joins forward onto its \\v (whole family)`, () => {
+    const ls = lines(`${HDR}${marker}\n\\v 9 \\w a\\w*\n`);
+    assert.ok(
+      ls.some((l) => l.trim() === `${marker} \\v 9 \\w a\\w*`),
+      `${marker} joined onto the \\v line`,
+    );
+  });
+}
+
+for (const marker of ["\\m", "\\pi1", "\\li1", "\\mi", "\\qa", "\\qc", "\\qr", "\\qm1"]) {
+  t(`lone ${marker} is NOT joined onto its \\v (only \\q/\\q1-4 join)`, () => {
+    const ls = lines(`${HDR}${marker}\n\\v 9 \\w a\\w*\n`);
+    assert.ok(ls.some((l) => l.trim() === marker), `${marker} stays on its own line`);
+    assert.ok(ls.some((l) => l.trim() === "\\v 9 \\w a\\w*"), "\\v 9 stays on its own line");
+  });
+}
+
+t("lone \\q1 does NOT join across a blank line", () => {
+  const ls = lines(`${HDR}\\q1\n\n\\v 7 \\w a\\w*\n`);
+  assert.ok(ls.some((l) => l.trim() === "\\q1"), "\\q1 stays bare");
+  assert.ok(ls.some((l) => l.trim() === "\\v 7 \\w a\\w*"), "\\v 7 stays on its own line");
+});
+
+t("lone \\q1 does NOT join across \\ts\\*", () => {
+  const ls = lines(`${HDR}\\q1\n\\ts\\*\n\\v 7 \\w a\\w*\n`);
+  assert.ok(ls.some((l) => l.trim() === "\\q1"));
+  assert.ok(ls.some((l) => l.trim() === "\\ts\\*"));
+});
+
+t("lone \\q1 does NOT join across \\b", () => {
+  const ls = lines(`${HDR}\\q1\n\\b\n\\v 7 \\w a\\w*\n`);
+  assert.ok(ls.some((l) => l.trim() === "\\q1"));
+  assert.ok(ls.some((l) => l.trim() === "\\b"));
+});
+
+t("lone \\q1 does NOT join across \\c 2", () => {
+  const ls = lines(`${HDR}\\q1\n\\c 2\n\\v 7 \\w a\\w*\n`);
+  assert.ok(ls.some((l) => l.trim() === "\\q1"));
+  assert.ok(ls.some((l) => l.trim() === "\\c 2"));
+});
+
+t("lone \\q1 does NOT join across an \\s1 heading", () => {
+  const ls = lines(`${HDR}\\q1\n\\s1 A Heading\n\\v 7 \\w a\\w*\n`);
+  assert.ok(ls.some((l) => l.trim() === "\\q1"));
+  assert.ok(ls.some((l) => l.trim() === "\\s1 A Heading"));
+});
+
+t("lone \\q1 does NOT join across a \\d heading", () => {
+  const ls = lines(`${HDR}\\c 1\n\\q1\n\\d A Psalm Title\n\\v 7 \\w a\\w*\n`);
+  assert.ok(ls.some((l) => l.trim() === "\\q1"));
+  assert.ok(ls.some((l) => l.trim() === "\\d A Psalm Title"));
+});
+
+t("\\q1 / bare \\v 2 / <content> joins all the way (interaction with joinDanglingVerses)", () => {
+  const out = norm(`${HDR}\\q1\n\\v 2\n\\w a\\w*\n`);
+  assert.match(out, /\\q1 \\v 2 \\w a\\w\*\n/);
+});
+
+t("\\q1 / \\v 11 / \\q2 <text> merges to \\q1 \\v 11 <text> (ordering case)", () => {
+  // The case that proves the ordering: without joinPoetryMarkerToVerse running
+  // FIRST, joinDanglingVerses would merge \v 11 forward into \q2 <text>,
+  // producing \q2 \v 11 <text> and stranding \q1 — the wrong marker winning.
+  const out = norm(`${HDR}\\q1\n\\v 11\n\\q2 \\w a\\w*\n`);
+  assert.match(out, /\\q1 \\v 11 \\w a\\w\*\n/);
+  assert.ok(!out.includes("\\q2"), "\\q2 does not survive — \\q1 wins per joinDanglingVerses rules");
+});
+
+t("two consecutive \\q1 before a \\v: only the second joins", () => {
+  const ls = lines(`${HDR}\\q1\n\\q1\n\\v 5 \\w a\\w*\n`);
+  assert.ok(ls.some((l) => l.trim() === "\\q1"), "first \\q1 stays bare");
+  assert.ok(ls.some((l) => l.trim() === "\\q1 \\v 5 \\w a\\w*"), "second \\q1 joins onto \\v 5");
+});
+
+t("lone \\q1 joins onto a verse bridge \\v 6-9", () => {
+  const ls = lines(`${HDR}\\q1\n\\v 6-9 \\w a\\w*\n`);
+  assert.ok(ls.some((l) => l.trim() === "\\q1 \\v 6-9 \\w a\\w*"));
+});
+
+t("a lone poetry marker at end of file (no following line) is left untouched", () => {
+  const out = norm(`${HDR}\\v 1 \\w a\\w*\n\\q1`);
+  assert.match(out, /\\q1\n?$/, "trailing bare \\q1 survives");
+});
+
+t("lone-poetry-marker join is idempotent", () => {
+  const once = norm(`${HDR}\\q1\n\\v 7 \\w a\\w*\n\\q1\n\\q1\n\\v 8 \\w b\\w*\n`);
+  assert.equal(norm(once), once);
+});
+
+t("lone-poetry-marker join never produces a line with two \\v markers", () => {
+  const out = norm(`${HDR}\\q1\n\\v 11\n\\q2 \\w a\\w*\n\\q1\n\\v 12 \\w b\\w*\n`);
+  for (const l of out.split("\n")) {
+    const vCount = (l.match(/\\v\s+\d/g) || []).length;
+    assert.ok(vCount <= 1, `line has ${vCount} \\v markers: ${JSON.stringify(l)}`);
+  }
 });
 
 // ── Idempotence across all five new rules together ──────────────────────────

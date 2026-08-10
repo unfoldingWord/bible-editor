@@ -104,6 +104,78 @@ function collapseDuplicateLeadingMarker(seg: string): string {
   return `${marker} ${rest}`;
 }
 
+// A line whose ENTIRE trimmed content is a plain poetry marker — `\q`,
+// `\q1`-`\q4` — and nothing else. Deliberately its OWN regex rather than a
+// reuse of ATTACHABLE_PREFIX_RE: that alternation also covers `\m`, `\mi`,
+// `\nb`, `\pc`, `\cls`, `\li[0-9]?`, `\pi[0-9]?`, `\ph[0-9]?`, `\qm[0-9]?`,
+// `\qa`, `\qc`, `\qr`, `\qd`, and a corpus census of the DCS master books we
+// export found the maintainer NEVER joins those onto the following `\v`
+// (`\m` 0/187, `\pi1` 0/81, `\mi` 0/3) — only the plain `\q`/`\qN` family gets
+// this treatment. Widening to the full attachable set would be a regression.
+const LONE_POETRY_MARKER_RE = /^\\q[1-4]?$/;
+
+function isVerseLineStart(line: string): boolean {
+  return /^\\v\s+\d/.test(line.trim());
+}
+
+// Join a lone poetry-marker line (`\q1` by itself) onto the very next line
+// when that next line starts a verse (`\v N …`), producing the maintainer's
+// hand-fixed shape `\q1 \v N …` instead of two separate lines. No blank line
+// and no other line may sit between them — only an immediate marker→verse
+// adjacency joins.
+//
+// Corpus evidence (the exported ULT/UST books only, i.e. the ones this
+// normalizer actually runs on): 302 occurrences of this exact lone-`\q*`-
+// then-`\v` shape on ULT master vs. just 1 in the 39 non-exported books;
+// 308 vs. 10 for UST. The DCS maintainer hand-fixes every one of them to the
+// joined form shown above (see the CLAUDE.md task that introduced this pass),
+// so emitting it pre-joined removes 620 nightly-recreated diffs.
+//
+// This is NOT the same shape as collapseDuplicateLeadingMarker's target
+// (`\q1 \q1 text` on one line, a doubled marker with no `\v` involved) —
+// that pass is untouched, and this one only ever sees the marker alone on
+// its own physical line.
+//
+// No empty-poetry-line hazard: USFM already has a dedicated marker for a
+// stanza break (`\b` — "Blank line. Use for stanza breaks in poetry"), so a
+// lone `\q*` line directly above a `\v` carries no meaning of its own that
+// joining it destroys.
+//
+// MUST run before joinDanglingVerses (see that function's ordering note and
+// the header guard below, which mirrors it exactly): joinDanglingVerses's
+// forward walk treats a bare attachable marker as crossable and prefers the
+// dangling `\v` line's OWN marker over one found later on the target line.
+// So `\q1` / `\v 11` / `\q2 <text>` must become `\q1 \v 11` FIRST (this pass)
+// so that joinDanglingVerses then merges it forward into
+// `\q1 \v 11 <text>` — the maintainer's actual shape. Running this pass
+// after joinDanglingVerses instead would let joinDanglingVerses merge
+// `\v 11`+`\q2 <text>` into `\q2 \v 11 <text>` first, stranding the `\q1`
+// alone and leaving the wrong marker attached to the verse.
+//
+// Header guard: mirrors joinDanglingVerses/blankLinePass/collapseBlankRuns —
+// everything up to and including the first blank line (the header/ID block)
+// is passed through untouched.
+function joinPoetryMarkerToVerse(lines: string[]): string[] {
+  const out: string[] = [];
+  let inHeader = true;
+  for (let i = 0; i < lines.length; i++) {
+    if (inHeader) {
+      out.push(lines[i]);
+      if (lines[i].trim() === "") inHeader = false;
+      continue;
+    }
+    const isLoneMarker = LONE_POETRY_MARKER_RE.test(lines[i].trim());
+    const next = lines[i + 1];
+    if (isLoneMarker && next !== undefined && isVerseLineStart(next)) {
+      out.push(`${lines[i].trim()} ${next.trim()}`);
+      i++; // consume the verse line too
+      continue;
+    }
+    out.push(lines[i]);
+  }
+  return out;
+}
+
 const VERSE_RE = /\\v\s+\d+/;
 
 // DCS `validate_usfm_files.py` Check 7 ("Consecutive Paragraph Markers") flags
@@ -615,6 +687,7 @@ export function normalizeUsfmFormatting(usfmText: string): string {
   let lines: string[] = [];
   for (const raw of rawLines) lines.push(...splitStructuralLine(raw));
   lines = reorderMarkerRuns(lines);
+  lines = joinPoetryMarkerToVerse(lines);
   lines = joinDanglingVerses(lines);
   lines = collapseConsecutiveParagraphMarkers(lines);
   lines = collapseConsecutiveTsMarkers(lines);

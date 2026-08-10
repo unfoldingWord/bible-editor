@@ -9,8 +9,41 @@
 // (13), a missing sentence terminator before a label (12), malformed references
 // (6), broken rc:// links (7) — are NOT touched here; they surface in the in-app
 // per-book issues flag (see docs/export-validation-cleanup.md).
+//
+// Also mirrors whitespace cleanups the DCS maintainer keeps hand-applying to
+// notes on master, so nightly export stops reintroducing what he just removed:
+// interior double spaces (normalizeNoteWhitespace, reused from the AI-ingest
+// path), whitespace-only lines between two literal `\n`, and a space
+// immediately BEFORE a literal `\n`. Space AFTER a literal `\n` is deliberately
+// never touched — that is markdown list indentation and is overwhelmingly
+// legitimate (3,410 occurrences measured on en_tn master vs. 39 for the
+// before-`\n` case this file fixes).
+
+import { normalizeNoteWhitespace } from "./importParsers.ts";
 
 // ── Note text normalizers ────────────────────────────────────────────────────
+
+// Remove a run of spaces/tabs that immediately PRECEDES a literal `\n` escape
+// (the two-char backslash-n sequence, never a real newline — a TSV cell can't
+// hold one). Mirrors a maintainer cleanup measured on en_tn master (25 notes,
+// 39 occurrences). Does NOT touch space that follows a literal `\n` — that is
+// markdown list indentation and must survive untouched.
+export function stripSpaceBeforeLiteralN(s: string): string {
+  return s.replace(/[ \t]+\\n/g, "\\n");
+}
+
+// Where the text between two literal `\n` escapes is only spaces/tabs, drop
+// that whitespace so the two `\n` become adjacent. Mirrors a maintainer
+// cleanup measured on en_tn master (10 notes). Splitting on the literal `\n`
+// escape (not a real newline) keeps every other line untouched, including any
+// leading indentation on the lines before/after.
+export function dropWhitespaceOnlyLines(s: string): string {
+  if (!s.includes("\\n")) return s;
+  return s
+    .split("\\n")
+    .map((line) => (/^[ \t]+$/.test(line) ? "" : line))
+    .join("\\n");
+}
 
 // Strip a trailing run of literal `\n` (the two-char escape TN uses for line
 // breaks) plus any trailing whitespace. Check 10: "Note must not end with \n".
@@ -50,9 +83,18 @@ export function normalizeAltLabel(s: string): string {
 }
 
 // Compose the prose-cell normalizers. Idempotent and a no-op on clean text.
+// Order matters: collapse interior double spaces first (normalizeNoteWhitespace
+// deliberately preserves a whitespace-only line and a trailing double space
+// before `\n`, so those exemptions are resolved by the two steps that follow),
+// then drop whitespace-only lines, then strip any space left immediately before
+// a literal `\n`, then the pre-existing quote/label/trailing-`\n` rules.
 export function normalizeNoteText(s: string | null): string | null {
   if (s == null) return s;
-  return trimTrailingLiteralN(normalizeAltLabel(educateQuotes(s)));
+  return trimTrailingLiteralN(
+    normalizeAltLabel(
+      educateQuotes(stripSpaceBeforeLiteralN(dropWhitespaceOnlyLines(normalizeNoteWhitespace(s)))),
+    ),
+  );
 }
 
 // ── Reference ordering (Check 11) ─────────────────────────────────────────────

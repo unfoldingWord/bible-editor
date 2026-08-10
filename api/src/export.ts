@@ -98,16 +98,44 @@ function tsvLine(cells: unknown[]): string {
 // the reimport post-pass shares the exact same ordering code path as this
 // export. buildTwlTsv below consumes it via orderTwlRows.
 
+// Tags column filter for tn/tq — measured on DCS master 2026-08-10:
+// ISSUE:MATCH_FAIL (1,568), at-fit (214), both together (14), keep (1), and
+// one garbage "I" (1) — 1,797 rows across ISA, NUM, ECC, DAN, ZEC, HOS, MIC.
+// These are stale AI-pipeline diagnostics; no code writes them anymore (grep
+// across api/src, web/src, scripts, migrations turns up zero hits outside a
+// test fixture) and no editor surface displays them. The DCS maintainer
+// hand-blanks this column before every release ("tags that mean nothing to
+// GL/OL translators") and our export puts them back the next night — he's
+// done the manual blank at least twice (2026-06-18, 2026-08-07). So tn/tq
+// always export an empty Tags column; the stored D1 value is untouched.
+//
+// This is NOT the translator "keep this note through an AI run" flag — that's
+// the `preserve` column (see pipelineImport.ts ~line 1053), not `tags`.
+// Blanking `tags` on export cannot affect preserve-gated behavior.
+//
+// twl keeps its `tags` as-is: Shell.tsx can set a real tag on TWL creation,
+// so that column is human-ownable and not part of this stale-diagnostic mess.
+//
+// Side effect (intended, benign): computeEditedFieldMerge (reimportClassify.ts)
+// always adopts master's tags for tn/tq on a per-field merge. Once master's
+// tags are blank, that merge will gradually pull blanks back into D1 on
+// subsequent syncs — self-healing the stored data over time with no explicit
+// sweep needed.
+export function exportTags(kind: "tn" | "tq" | "twl", value: string | null | undefined): string {
+  if (kind === "twl") return value ?? "";
+  return "";
+}
+
 export function buildTnTsv(rows: TnRow[]): string {
   const body = sortRowsByReference(rows).map((r) =>
-    tsvLine([r.ref_raw, r.id, r.tags, r.support_reference, r.quote, renderOccurrence("tn", r.quote, r.occurrence), normalizeNoteText(r.note)]),
+    tsvLine([r.ref_raw, r.id, exportTags("tn", r.tags), r.support_reference, r.quote, renderOccurrence("tn", r.quote, r.occurrence), normalizeNoteText(r.note)]),
   );
   return [TN_HEADERS.join("\t"), ...body].join("\n") + "\n";
 }
 
 export function buildTqTsv(rows: TqRow[]): string {
   const body = sortRowsByReference(rows).map((r) =>
-    tsvLine([r.ref_raw, r.id, r.tags, r.quote, renderOccurrence("tq", r.quote, r.occurrence), normalizeNoteText(r.question), normalizeNoteText(r.response)]),
+    tsvLine([r.ref_raw, r.id, exportTags("tq", r.tags), r.quote, renderOccurrence("tq", r.quote, r.occurrence), normalizeNoteText(r.question), normalizeNoteText(r.response)]),
   );
   return [TQ_HEADERS.join("\t"), ...body].join("\n") + "\n";
 }
@@ -756,6 +784,229 @@ export function classifyAlignmentShrinkOffenders(
     unchanged: offenders.filter((o) => o.sequenceUnchanged),
     changed: offenders.filter((o) => !o.sequenceUnchanged),
   };
+}
+
+// ── Export-revert report ────────────────────────────────────────────────────
+//
+// The shrink/alignment guards above answer "is it SAFE to commit this render
+// over master" and either block or ship. Neither one records WHAT actually
+// changed when we do ship — so a maintainer's hand-edit on master (a DCS-side
+// USFM cleanup, a manual TSV tweak) that our render legitimately overwrites is
+// currently invisible until the maintainer notices and complains (see the
+// PR #417 "stop reverting Rich's USFM cleanups" incident). This section is
+// purely OBSERVATIONAL: it never blocks, never changes what ships, and reuses
+// the master content the guards already fetched — no new network fetch.
+//
+// Canonicalization used by both report builders below: collapse any run of
+// whitespace (spaces, tabs, and the run straddling a line break) to a single
+// space, then trim. This mirrors the coarse-grained "is this just reflowing,
+// not a content change" test normalizeUsfmFormatting-style passes already use
+// elsewhere in this file, without importing that (sensitive, off-limits this
+// session) module.
+// The revert-report comparison string for USFM is `JSON.stringify(verseObjects)`
+// (see verseTextByRef below), and JSON.stringify escapes a real newline/tab/CR
+// inside a text field as the two literal characters `\n`/`\t`/`\r`, not an
+// actual whitespace character — so a bare `\s+` collapse alone would treat a
+// real line-break difference as a NON-whitespace difference and misclassify
+// pure reflowing as "substantive". Un-escape those sequences to a space FIRST,
+// then collapse the resulting whitespace runs, so "a\nb" (from a real
+// line-break) and "a b" (from a real space) canonicalize identically.
+//
+// This is shared with the TSV report below, where a Note/Question/Response
+// cell can ALSO legitimately contain a literal two-character "\n" (the
+// unfoldingWord convention for a real newline inside a TSV cell — see
+// tsvCell/normalizeNoteText). Sharing means a TSV cell that differs only by
+// "\n" vs a literal space would canonicalize as equal too (classified
+// whitespace_only rather than substantive). Accepted as a narrow, rare edge
+// case for a purely observational report — not worth a second, TSV-specific
+// canonicalizer.
+function canonicalizeForRevertCompare(s: string): string {
+  return s.replace(/\\[nrt]/g, " ").replace(/\s+/g, " ").trim();
+}
+
+// Per-verse text extractor for usfmRevertReport. Deliberately a SEPARATE,
+// smaller walk from verseAlignStats above (not a refactor of it): verseAlignStats
+// is alignment-sensitive code this session must not touch, and this walk only
+// needs "what did this verse serialize to", not aligned-word counts. Returns
+// null on a parse failure (mirrors verseAlignStats' contract) so the caller
+// can decline to report rather than guess.
+//
+// The comparison string is `JSON.stringify(verseObjects)` — the verse's full
+// parsed structure (text nodes AND \zaln/\w milestones), not just plain text.
+// Plain text alone would miss a revert that only changes alignment (a \zaln
+// source restored/dropped with the surface text untouched), which is exactly
+// the kind of "we silently overwrote a hand-fix" case this report exists to
+// surface. Chosen over a raw substring of the original USFM because usfm-js
+// round-trips whitespace/line-break placement inconsistently between two
+// otherwise-equivalent inputs — comparing the PARSED structure is what lets
+// the formatting/substantive split below be meaningful instead of noisy.
+function verseTextByRef(usfmText: string): Map<string, string> | null {
+  let json: { chapters?: Record<string, Record<string, unknown>> };
+  try {
+    json = usfm.toJSON(usfmText);
+  } catch {
+    return null;
+  }
+  const out = new Map<string, string>();
+  const chapters = json.chapters ?? {};
+  for (const chapterKey of Object.keys(chapters)) {
+    const chapterObj = chapters[chapterKey] as Record<string, unknown>;
+    for (const verseKey of Object.keys(chapterObj)) {
+      if (verseKey === "front") continue; // chapter-front (\d titles) — not a verse
+      const verseObj = chapterObj[verseKey] as { verseObjects?: unknown[] };
+      const vos = Array.isArray(verseObj?.verseObjects) ? verseObj.verseObjects : [];
+      out.set(`${chapterKey}:${verseKey}`, JSON.stringify(vos));
+    }
+  }
+  return out;
+}
+
+export interface UsfmRevertEntry {
+  ref: string;
+  class: "formatting" | "substantive";
+}
+
+export interface UsfmRevertReport {
+  entries: UsfmRevertEntry[];
+  totalVerses: number;
+}
+
+// Compare a rendered ULT/UST USFM against master's CURRENT USFM (the same
+// string `checkUsfmAlignmentShrink` already fetched — see exportWorkflow.ts)
+// and report every verse we are about to overwrite that actually differs from
+// what master holds right now. A verse present on only one side is NOT
+// reported — that is new/removed content, the shrink guard's territory, not a
+// "we overwrote something" finding. This NEVER decides whether to ship; it
+// runs only after the shrink/alignment guards have already allowed the commit.
+export function usfmRevertReport(renderedUsfm: string, masterUsfm: string): UsfmRevertReport {
+  const rendered = verseTextByRef(renderedUsfm);
+  const master = verseTextByRef(masterUsfm);
+  // Either side failing to parse leaves us with no reliable comparison — this
+  // report is observational only, so decline to report rather than guess.
+  if (rendered === null || master === null) return { entries: [], totalVerses: 0 };
+  const entries: UsfmRevertEntry[] = [];
+  for (const [ref, masterText] of master) {
+    const renderedText = rendered.get(ref);
+    if (renderedText === undefined) continue; // verse absent from render — not our concern here
+    if (renderedText === masterText) continue; // byte-identical, nothing overwritten
+    const same = canonicalizeForRevertCompare(masterText) === canonicalizeForRevertCompare(renderedText);
+    entries.push({ ref, class: same ? "formatting" : "substantive" });
+  }
+  return { entries, totalVerses: master.size };
+}
+
+export interface TsvRevertEntry {
+  ref: string;
+  class: "tags_only" | "whitespace_only" | "substantive";
+  fields?: string[];
+}
+
+export interface TsvRevertReport {
+  entries: TsvRevertEntry[];
+  totalRows: number;
+}
+
+// Parse a TSV body into a Map from ID (column 1, same convention as
+// parseTsvIds) to its full cell array. Returns null on the same "unparseable"
+// conditions parseTsvIds fails closed on (bad header, blank ID cell) — this
+// report declines to run on data it can't trust rather than guess. Unlike
+// parseTsvIds this keeps every cell, not just the ID, since the revert report
+// needs the full row to diff field-by-field. A duplicate ID overwrites the
+// earlier entry in the Map; duplicate-ID detection is checkTsvShrink's job
+// (countDuplicateMasterIds), not this purely-observational report's.
+function parseTsvRowsById(raw: string): Map<string, string[]> | null {
+  const lines = raw.split(/\r?\n/).filter((l) => l.length > 0);
+  if (lines.length === 0) return new Map();
+  const header = lines[0].split("\t");
+  if (header[1] !== "ID") return null;
+  const out = new Map<string, string[]>();
+  for (const line of lines.slice(1)) {
+    const cells = line.split("\t");
+    const id = cells[1]?.trim();
+    if (!id) return null;
+    out.set(id, cells);
+  }
+  return out;
+}
+
+// Compare a rendered tn/tq/twl TSV against master's CURRENT TSV (the same raw
+// string checkTsvShrink already fetched — see exportWorkflow.ts) and report
+// every row we are about to overwrite that actually differs from what master
+// holds right now, keyed by ID so a row's position doesn't matter. A row
+// present on only one side is NOT reported (that's the shrink guard's
+// territory). The Reference and ID columns are never treated as a "differing
+// field" for classification purposes — Reference just supplies the ref for
+// the report (master's own Reference value for that ID), and ID is the join
+// key, not content.
+export function tsvRevertReport(
+  renderedTsv: string,
+  masterTsv: string,
+  kind: "tn" | "tq" | "twl",
+): TsvRevertReport {
+  const headers = kind === "tn" ? TN_HEADERS : kind === "tq" ? TQ_HEADERS : TWL_HEADERS;
+  const refIdx = headers.indexOf("Reference");
+  const idIdx = headers.indexOf("ID");
+  const rendered = parseTsvRowsById(renderedTsv);
+  const master = parseTsvRowsById(masterTsv);
+  if (rendered === null || master === null) return { entries: [], totalRows: 0 };
+  const entries: TsvRevertEntry[] = [];
+  for (const [id, masterCells] of master) {
+    const renderedCells = rendered.get(id);
+    if (!renderedCells) continue; // row absent from render — not our concern here
+    const diffFields: string[] = [];
+    for (let i = 0; i < headers.length; i++) {
+      if (i === refIdx || i === idIdx) continue;
+      if ((masterCells[i] ?? "") !== (renderedCells[i] ?? "")) diffFields.push(headers[i]);
+    }
+    if (diffFields.length === 0) continue; // identical row, nothing overwritten
+    const ref = masterCells[refIdx] ?? "";
+    if (diffFields.length === 1 && diffFields[0] === "Tags") {
+      entries.push({ ref, class: "tags_only" });
+      continue;
+    }
+    const allWhitespaceOnly = diffFields.every((field) => {
+      const i = headers.indexOf(field);
+      return (
+        canonicalizeForRevertCompare(masterCells[i] ?? "") ===
+        canonicalizeForRevertCompare(renderedCells[i] ?? "")
+      );
+    });
+    if (allWhitespaceOnly) {
+      entries.push({ ref, class: "whitespace_only" });
+      continue;
+    }
+    entries.push({ ref, class: "substantive", fields: diffFields });
+  }
+  return { entries, totalRows: master.size };
+}
+
+// Does the number of substantive reverts this export is about to make justify
+// escalating the alert's wording beyond routine? This NEVER blocks the export
+// — there is no `block` field, only `escalate` — because a revert report is
+// evidence about what happened, not a safety guard; classifyAlignmentLossSeverity
+// and the shrink guards already own the ship/no-ship decision and this must
+// not second-guess them.
+//
+// Threshold: more than 15 substantive entries (usfm + tsv combined) across one
+// (book,resource) export. Chosen the same way SYSTEMIC_VERSES/SYSTEMIC_WORDS
+// were above: a handful of substantive reverts is plausibly a maintainer's
+// hand-edit or two that our render legitimately supersedes (normal churn); a
+// double-digit pile in one run reads more like our render systematically
+// clobbering content nobody meant to lose, which is worth Benjamin's attention
+// even though it still ships.
+const SYSTEMIC_REVERTS = 15;
+
+export function classifyRevertSeverity(
+  usfmEntries: UsfmRevertEntry[],
+  tsvEntries: TsvRevertEntry[],
+): { escalate: boolean; reason: string } {
+  const substantive =
+    usfmEntries.filter((e) => e.class === "substantive").length +
+    tsvEntries.filter((e) => e.class === "substantive").length;
+  if (substantive > SYSTEMIC_REVERTS) {
+    return { escalate: true, reason: `systemic_${substantive}_substantive_reverts` };
+  }
+  return { escalate: false, reason: `routine_${substantive}_substantive_reverts` };
 }
 
 // What D1 last recorded as the writer of an offending verse, read from the
