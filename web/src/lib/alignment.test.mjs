@@ -2760,6 +2760,14 @@ function roundtripVerseUsfm(rawUsfm, sourceVO = null) {
   };
   // Mirror AlignmentPanel.displayGroups: sort by first source position, then the
   // three display collapses.
+  // Mirror of reusedTokenKey (alignmentHover.ts): exact position, else the
+  // word's own content+occurrence, never Strong's.
+  const reusedKeyOf = (s) => {
+    const p = sourcePos(s);
+    if (p >= 0) return `p${p}`;
+    const c = (s.content ?? "").normalize("NFC");
+    return c === "" ? null : `c${c}|${s.occurrence}`;
+  };
   const displayOf = (st) => {
     const sortPos = (g) => {
       if (g.source.length === 0) return Number.MAX_SAFE_INTEGER;
@@ -2767,8 +2775,13 @@ function roundtripVerseUsfm(rawUsfm, sourceVO = null) {
       return p >= 0 ? p : Number.MAX_SAFE_INTEGER;
     };
     const sorted = [...st.groups].sort((a, b) => sortPos(a) - sortPos(b));
+    // Flagged reused words are exempt from the strip, exactly as
+    // buildDisplayGroups passes reusedSourceIdsOf — otherwise this mirror would
+    // stop matching the real pipeline it exists to guard.
     return mergeSamePositionGroups(
-      mergeAdjacentSameSource(stripCompoundOverlaps(sorted)),
+      mergeAdjacentSameSource(
+        stripCompoundOverlaps(sorted, findReusedSourceWordIds(st.groups, reusedKeyOf)),
+      ),
       posKey,
     );
   };
@@ -2798,19 +2811,29 @@ function roundtripVerseUsfm(rawUsfm, sourceVO = null) {
   ];
   assert(destGroupIds.length === 2, `card collapses two state groups (got ${destGroupIds.length})`);
 
-  // The over-count encoding (occ 1/2 + 2/2 over a once-occurring token) is now
-  // normalized to 1/1 + 1/1 at parse (renumberSourceOccurrences), and `walk`
-  // then folds two single-word groups with identical numbering into ONE group,
-  // so the single-group path can no longer split this card. The fused-card
-  // machinery below is still exercised by COMPOUND chains, which `walk` keeps
-  // separate — see the ZEC 11:14 case at the end of this file.
+  // The over-count encoding (occ 1/2 + 2/2 over a once-occurring token) is
+  // normalized to 1/1 + 1/1 at parse (renumberSourceOccurrences), but `walk`
+  // still emits TWO groups — mergeSamePositionGroups is what fuses them for
+  // display (see the precondition above, which counts 2 state groups). So the
+  // single-group path DOES still split this card: adding כִּי to only one of the
+  // fused groups gives it the sequence [teraphim, כִּי] while its twin keeps
+  // [teraphim], the position keys diverge, and a second teraphim card pops out
+  // carrying "that people consult" — the originally reported bug.
+  //
+  // That split used to be INVISIBLE, and this assertion used to read as "stays
+  // one card" for that reason: stripCompoundOverlaps deleted teraphim from the
+  // compound because a standalone teraphim card owned it, so the filter below
+  // matched only one card. teraphim is a FLAGGED reused token in that shape and
+  // flagged words are now exempt from the strip, so the split renders honestly —
+  // two teraphim cards, both wearing the red marker. moveSourceToGroups, checked
+  // immediately below, is the actual fix; this pins what the wrong path costs.
   const oldWay = moveSource(state, kiId, card.id, sourcePos);
   const oldTeraphimCards = displayOf(oldWay).filter((g) =>
     g.source.some((s) => s.strong === "d:H8655"),
   );
   assert(
-    oldTeraphimCards.length === 1,
-    `renumbered over-count groups stay one card even via the single-group path (got ${oldTeraphimCards.length})`,
+    oldTeraphimCards.length === 2,
+    `the single-group path splits the fused card, and the split is visible (got ${oldTeraphimCards.length})`,
   );
 
   // Fix: add כִּי to every fused group; the card stays fused.
@@ -2877,6 +2900,14 @@ function roundtripVerseUsfm(rawUsfm, sourceVO = null) {
     const ps = g.source.map(sourcePos);
     return ps.some((p) => p < 0) ? null : ps.join(".");
   };
+  // Mirror of reusedTokenKey (alignmentHover.ts): exact position, else the
+  // word's own content+occurrence, never Strong's.
+  const reusedKeyOf = (s) => {
+    const p = sourcePos(s);
+    if (p >= 0) return `p${p}`;
+    const c = (s.content ?? "").normalize("NFC");
+    return c === "" ? null : `c${c}|${s.occurrence}`;
+  };
   const displayOf = (st) => {
     const sortPos = (g) => {
       if (g.source.length === 0) return Number.MAX_SAFE_INTEGER;
@@ -2884,8 +2915,13 @@ function roundtripVerseUsfm(rawUsfm, sourceVO = null) {
       return p >= 0 ? p : Number.MAX_SAFE_INTEGER;
     };
     const sorted = [...st.groups].sort((a, b) => sortPos(a) - sortPos(b));
+    // Flagged reused words are exempt from the strip, exactly as
+    // buildDisplayGroups passes reusedSourceIdsOf — otherwise this mirror would
+    // stop matching the real pipeline it exists to guard.
     return mergeSamePositionGroups(
-      mergeAdjacentSameSource(stripCompoundOverlaps(sorted)),
+      mergeAdjacentSameSource(
+        stripCompoundOverlaps(sorted, findReusedSourceWordIds(st.groups, reusedKeyOf)),
+      ),
       posKey,
     );
   };
@@ -2921,11 +2957,13 @@ function roundtripVerseUsfm(rawUsfm, sourceVO = null) {
   assert(kiIds.length === 1, `כִּי card is a single state group (got ${kiIds.length})`);
 
   // ── Direction A: SURVIVOR is the fused card (merge כִּי → teraphim). ──
-  // As above: renumbering + `walk` fold the over-count pair into one group, so
-  // the single-id merge can no longer split the survivor.
+  // As above: the fused card stands for TWO state groups, so a single-id merge
+  // reaches only one of them and the survivor splits. Previously invisible
+  // because stripCompoundOverlaps deleted teraphim from the widened group;
+  // flagged reused words are now exempt, so the split shows.
   const oldA = mergeGroups(state, teraphimCard.id, kiCard.id, sourcePos);
   const oldACards = displayOf(oldA).filter((g) => g.source.some((s) => s.strong === "d:H8655"));
-  assert(oldACards.length === 1, `renumbered fused survivor stays one card (got ${oldACards.length})`);
+  assert(oldACards.length === 2, `the single-id merge splits the fused survivor visibly (got ${oldACards.length})`);
 
   const fixedA = mergeGroupsToGroups(state, teraphimIds, kiIds, sourcePos);
   const aCards = displayOf(fixedA).filter((g) => g.source.some((s) => s.strong === "d:H8655"));
@@ -3335,21 +3373,43 @@ const srcWordContents = (st) => st.groups.flatMap((g) => g.source).map((s) => ({
 
 {
   // Regression for the gap review found: a compound of THREE overlapping a
-  // standalone. stripCompoundOverlaps removes the overlapping word from a
-  // 3-word compound (kept.length is neither 0 nor the original length, so
-  // neither bail-out fires), which erases the evidence. Computing from raw
-  // state.groups is what keeps this visible — if the panel is ever changed to
-  // pass displayGroups, the aligner goes silent on a verse api-side lint still
-  // flags, and the translator clicks through to a verse with nothing marked.
+  // standalone. Neither stripCompoundOverlaps bail-out fires here (kept.length
+  // is neither 0 nor the original length), so the strip used to remove the
+  // overlapping word and erase the evidence. Computing from raw state.groups is
+  // what keeps the DETECTOR honest — if the panel is ever changed to pass
+  // displayGroups, the aligner goes silent on a verse api-side lint still flags,
+  // and the translator clicks through to a verse with nothing marked.
   console.log("\n[Case] findReusedSourceWordIds flags a 3-word compound overlapping a standalone");
-  const mk = (id) => ({ id, strong: "H0000", occurrence: "1", occurrences: "1", content: "x" });
+  // Distinct content per position: stripCompoundOverlaps keys on
+  // `content|occurrence`, so a fixture that gave every word the same content
+  // could only ever hit the strip's kept.length===0 escape hatch and would never
+  // exercise the partial-overlap path this case is about.
+  const mk = (id, content) => ({ id, strong: "H0000", occurrence: "1", occurrences: "1", content });
   const posOf = (s) => { const p = ({ "s-a": 7, "s-b": 8, "s-c": 9, "s-a-solo": 7 })[s.id]; return p === undefined ? null : `p${p}`; };
-  const gCompound = { id: "g-abc", source: [mk("s-a"), mk("s-b"), mk("s-c")], targets: [] };
-  const gSolo = { id: "g-a", source: [mk("s-a-solo")], targets: [] };
+  const gCompound = { id: "g-abc", source: [mk("s-a", "a"), mk("s-b", "b"), mk("s-c", "c")], targets: [] };
+  const gSolo = { id: "g-a", source: [mk("s-a-solo", "a")], targets: [] };
   const reused = findReusedSourceWordIds([gCompound, gSolo], posOf);
   assert(
     reused.size === 2 && reused.has("s-a") && reused.has("s-a-solo"),
     `only the words at the shared position 7 flag, not s-b/s-c (got ${[...reused]})`,
+  );
+  // ...and the flag must reach a chip. AMO 3:2 UST is exactly this arity: the
+  // detector flagged both copies while the strip deleted one from the card, so
+  // the lint feed listed a verse whose card looked clean. Passing the flagged
+  // ids as protectedIds is what closes that.
+  const strippedBlind = stripCompoundOverlaps([gCompound, gSolo]);
+  assert(
+    strippedBlind.find((g) => g.id === "g-abc").source.length === 2,
+    "without protectedIds the strip still narrows the 3-word compound (the old behaviour)",
+  );
+  const strippedProtected = stripCompoundOverlaps([gCompound, gSolo], reused);
+  assert(
+    strippedProtected.find((g) => g.id === "g-abc").source.length === 3,
+    "with the flagged ids protected the compound keeps all three words, so the marker renders",
+  );
+  assert(
+    strippedProtected.find((g) => g.id === "g-a").source.length === 1,
+    "the standalone card is untouched either way",
   );
 }
 
@@ -3370,7 +3430,7 @@ const srcWordContents = (st) => st.groups.flatMap((g) => g.source).map((s) => ({
     return ps.some((p) => p === null) ? null : ps.join(",");
   };
   const display = mergeSamePositionGroups(
-    mergeAdjacentSameSource(stripCompoundOverlaps(raw)),
+    mergeAdjacentSameSource(stripCompoundOverlaps(raw, findReusedSourceWordIds(raw, posOf))),
     positionKey,
   );
   assert(display.length === 1, `the split fuses to one display card (got ${display.length})`);
@@ -3608,15 +3668,23 @@ const srcWordContents = (st) => st.groups.flatMap((g) => g.source).map((s) => ({
   // Run the REAL display pipeline first, so this guards the case the panel can
   // actually produce — not a hand-built shape the transforms would dissolve.
   // Every milestone in the live verse carries occurrence 1/1, so the compound's
-  // words share a sourceWordKey with both standalones; stripCompoundOverlaps
-  // survives it only because stripping ALL of a group's source words is the
+  // words share a sourceWordKey with both standalones. Two independent reasons
+  // the compound survives: its words are FLAGGED reused, so they are exempt from
+  // the strip, and stripping ALL of a group's source words is in any case the
   // no-op escape hatch (alignment.ts: `kept.length === 0` returns g untouched).
+  // The exemption is what generalises this to the partly-overlapping AMO 3:2
+  // shape, where the escape hatch does not fire.
   const positionKey = (g) => {
     const ps = g.source.map((s) => sourcePosById.get(s.id) ?? -1);
     return ps.length === 0 || ps.some((p) => p < 0) ? null : ps.join(".");
   };
+  const keyOf = (s) => {
+    const p = sourcePosById.get(s.id);
+    return p === undefined ? null : `p${p}`;
+  };
+  const raw = [standaloneEl, compound, standaloneServ];
   const displayGroups = mergeSamePositionGroups(
-    mergeAdjacentSameSource(stripCompoundOverlaps([standaloneEl, compound, standaloneServ])),
+    mergeAdjacentSameSource(stripCompoundOverlaps(raw, findReusedSourceWordIds(raw, keyOf))),
     positionKey,
   );
   assert(
@@ -3625,7 +3693,7 @@ const srcWordContents = (st) => st.groups.flatMap((g) => g.source).map((s) => ({
   );
   assert(
     displayGroups.find((g) => g.id === "g-both").source.length === 2,
-    "the compound card keeps BOTH source words — stripCompoundOverlaps no-ops when it would strip them all",
+    "the compound card keeps BOTH source words",
   );
   const owners = buildPositionOwners(displayGroups, sourcePosById);
   assert(owners.get(10).size === 2, `pos 10 has two owners (got ${owners.get(10).size})`);

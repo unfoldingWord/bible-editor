@@ -104,10 +104,33 @@ export function buildSourceIndexMap(sourceVerse: VerseDto | null): Map<string, n
   return map;
 }
 
+// Ids of source words claimed by 2+ distinct alignment groups — the
+// reused-source-token defect the cards mark red rather than repair.
+//
+// ONE definition, called from both buildDisplayGroups and buildPosMaps: the
+// display pipeline must not strip a word the marker is about to flag, so the two
+// have to agree by construction. If they drift, a flagged chip stops rendering
+// and the marker goes invisible again.
+//
+// Computed from `state.groups`, NOT display groups — stripCompoundOverlaps would
+// already have erased the overlap, which is the circularity this helper exists
+// to break. Keyed via reusedTokenKey, never resolveSourcePos (see both).
+export function reusedSourceIdsOf(
+  state: AlignmentState | null,
+  sourceIndexMap: Map<string, number>,
+): Set<string> {
+  if (!state) return new Set<string>();
+  return findReusedSourceWordIds(state.groups, (s) => reusedTokenKey(s, sourceIndexMap));
+}
+
 // The groups the cards actually render: source-position order, compound
 // overlaps stripped, adjacent same-source groups fused, and same-position
 // duplicates collapsed (one physical Hebrew token the AI stamped with
 // occurrences > actual — see mergeSamePositionGroups).
+//
+// Flagged reused source words are exempt from the strip so the defect stays on
+// screen — see stripCompoundOverlaps for the AMO 3:2 / 3:7 asymmetry that
+// exemption fixes.
 export function buildDisplayGroups(
   state: AlignmentState | null,
   sourceIndexMap: Map<string, number>,
@@ -119,7 +142,7 @@ export function buildDisplayGroups(
     return pos >= 0 ? pos : Number.MAX_SAFE_INTEGER;
   };
   const sorted = [...state.groups].sort((a, b) => sortKey(a) - sortKey(b));
-  const stripped = stripCompoundOverlaps(sorted);
+  const stripped = stripCompoundOverlaps(sorted, reusedSourceIdsOf(state, sourceIndexMap));
   const merged = mergeAdjacentSameSource(stripped);
   return mergeSamePositionGroups(merged, (g) => groupPositionKey(g, sourceIndexMap));
 }
@@ -221,17 +244,12 @@ export function buildPosMaps(
   // token on hover (AMO 3:7 UST).
   const posOwners = buildPositionOwners(displayGroups, sourcePosById);
   // A source token claimed by 2+ DISTINCT groups is a data defect (one physical
-  // Hebrew word can't belong to several alignment groups) — see
-  // findReusedSourceWordIds. Two deliberate choices there: computed from
-  // state.groups, NOT displayGroups (stripCompoundOverlaps would already have
-  // erased the overlap on a compound of 3+, silencing the marker on a verse
-  // api-side lint still flags), and keyed via reusedTokenKey rather than
-  // resolveSourcePos — that function's strong|1 fallback collapses distinct
-  // same-Strong tokens onto one position and invents reuse on clean verses.
+  // Hebrew word can't belong to several alignment groups). Shared with
+  // buildDisplayGroups through reusedSourceIdsOf so the strip can exempt exactly
+  // the words this marks — see that helper for why the two must agree, and
+  // findReusedSourceWordIds for the state.groups / reusedTokenKey choices.
   // Display only; nothing is fixed.
-  const reusedSourceIds = findReusedSourceWordIds(state.groups, (s) =>
-    reusedTokenKey(s, sourceIndexMap),
-  );
+  const reusedSourceIds = reusedSourceIdsOf(state, sourceIndexMap);
   return { posOwners, sourcePosById, groupPositions, reusedSourceIds };
 }
 
