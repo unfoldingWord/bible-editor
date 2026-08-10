@@ -1721,7 +1721,7 @@ function buildFakeTqBoundaryDb(flipAfterProposals) {
     if (/MAX\(sort_order\)/.test(sql)) {
       return { changes: 0, rows: [], single: null };
     }
-    if (/SELECT version, chapter FROM tq_rows/.test(sql)) {
+    if (/SELECT version, chapter, verse FROM tq_rows/.test(sql)) {
       // These proposals carry no proposed id (payload_json: "{}"), so every
       // candidate is a freshly minted random id — never a live row.
       return { changes: 0, rows: [], single: null };
@@ -1972,7 +1972,7 @@ await withMockedClock(async () => {
 //    away from random re-minting.)
 
 // Configurable fake tq_rows + pipeline_jobs backing store. `liveRows` is a
-// mutable Map<id, {version, chapter}> so callers can pre-seed a live row (the
+// mutable Map<id, {version, chapter, verse}> so callers can pre-seed a live row (the
 // cross-chapter test) and so the map persists across multiple importJobOutput
 // calls against the same env (the re-run-idempotency test). `tombstonedIds`
 // simulates a soft-deleted row that still owns its (book, id) PK slot (the
@@ -2026,7 +2026,7 @@ function buildFakeTqDb({ tombstonedIds = new Set(), hardErrorIds = new Set(), li
     if (/MAX\(sort_order\)/.test(sql)) {
       return { changes: 0, rows: [], single: null };
     }
-    if (/SELECT version, chapter FROM tq_rows/.test(sql)) {
+    if (/SELECT version, chapter, verse FROM tq_rows/.test(sql)) {
       const id = args[0];
       const row = liveRows.get(id) ?? null;
       return { changes: 0, rows: row ? [row] : [], single: row };
@@ -2043,6 +2043,7 @@ function buildFakeTqDb({ tombstonedIds = new Set(), hardErrorIds = new Set(), li
     if (/INSERT INTO tq_rows/.test(sql)) {
       const id = args[0];
       const chapter = args[2];
+      const verse = args[3];
       insertAttempts.push(id);
       insertArgs.push(args);
       if (hardErrorIds.has(id)) {
@@ -2054,7 +2055,7 @@ function buildFakeTqDb({ tombstonedIds = new Set(), hardErrorIds = new Set(), li
         );
       }
       insertedIds.push(id);
-      liveRows.set(id, { version: 1, chapter });
+      liveRows.set(id, { version: 1, chapter, verse });
       return { changes: 1, rows: [], single: null };
     }
     if (/INSERT INTO edit_log/.test(sql)) {
@@ -2457,6 +2458,200 @@ await withMockedClock(async () => {
     insertedBook === "GEN" && insertedChapter === 1 && insertedVerse === 1,
     `TQ payload book/chapter/verse guard: the INSERT binds the pending_imports row's book/chapter/verse ` +
       `(GEN/1/1), not the payload's mismatched EXO/9/9 (got ${insertedBook}/${insertedChapter}/${insertedVerse})`,
+  );
+});
+
+// ── A randomly minted candidate must never adopt a live row: a tq proposal
+//    with NO id at all (payload_json has no "id", so seedId is null and
+//    every candidate id is a fresh newRowId()) must never overwrite a live
+//    row it happens to land on — a random candidate asserts no identity, so a
+//    live row there belongs to some OTHER question, and updating it would
+//    silently destroy it while marking this unrelated proposal "accepted".
+//    This is a SILENT DATA LOSS scenario. ──
+await withMockedClock(async () => {
+  // Math.random is stubbed so newRowId()'s first draw is deterministic
+  // ("aaaa": newRowId makes 4 calls per id — 1 for ID_LETTERS[floor(r*24)]
+  // then 3 for ID_CHARS[floor(r*32)] — all four Math.random()=0 draws map to
+  // index 0, i.e. 'a' each time) and its second draw is a different,
+  // also-deterministic id ("nsss": four Math.random()=0.5 draws). Verified
+  // directly against rowId.ts's newRowId before writing this test.
+  const firstDrawnId = "aaaa";
+  const secondDrawnId = "nsss";
+
+  const { env, insertedIds, updatedIds, setProposals } = buildFakeTqDb({
+    liveRows: new Map([[firstDrawnId, { version: 1, chapter: 1, verse: 9 }]]),
+  });
+
+  setProposals([
+    {
+      id: 1,
+      kind: "tq",
+      book: "GEN",
+      chapter: 1,
+      verse: 1,
+      bible_version: null,
+      // No "id" field at all -> seedId is null -> every candidate is a random newRowId().
+      payload_json: JSON.stringify({ book: "GEN", chapter: 1, verse: 1, question: "q-random-mint" }),
+    },
+  ]);
+
+  let callCount = 0;
+  const originalRandom = Math.random;
+  Math.random = () => {
+    callCount++;
+    return callCount <= 4 ? 0 : 0.5;
+  };
+  const originalConsoleError = console.error;
+  console.error = () => {};
+  let result;
+  try {
+    result = await importJobOutput(
+      env,
+      { jobId: "job-tq-random-mint", pipelineType: "tqs", book: "GEN", startChapter: 1, endChapter: 1 },
+      [],
+    );
+  } finally {
+    Math.random = originalRandom;
+    console.error = originalConsoleError;
+  }
+
+  assert(result.aborted !== true, `TQ random-mint guard: the job completes (aborted=${result.aborted})`);
+  assert(
+    updatedIds.length === 0,
+    `TQ random-mint guard (SILENT DATA LOSS if this fails): a proposal with no seed id must never adopt (UPDATE) ` +
+      `a live row it randomly lands on — the live row at "${firstDrawnId}" belongs to some other question, and ` +
+      `updating it would silently overwrite that question while marking this unrelated proposal accepted ` +
+      `(got updatedIds=${updatedIds.join(",")})`,
+  );
+  assert(
+    insertedIds.length === 1 && insertedIds[0] === secondDrawnId,
+    `TQ random-mint guard: the proposal steps past the live "${firstDrawnId}" and INSERTs at the next random draw ` +
+      `"${secondDrawnId}" instead (got insertedIds=${insertedIds.join(",")})`,
+  );
+});
+
+// ── A derived candidate must not adopt a live row at a DIFFERENT verse: two
+//    seeds — "aa8a" and "abr4" — were found by brute force (iterating every
+//    valid 4-char id and comparing deriveAltRowId(id, 1)) to hash to the SAME
+//    alternate id. This is a genuine ~1-in-786k-per-pair coincidence, not a
+//    contrived input, but the consequence (one proposal's INSERT silently
+//    turning into an UPDATE that overwrites an unrelated live question) is
+//    SILENT DATA LOSS, so it is worth hardcoding as a regression test. Both
+//    seeds are tombstoned so both proposals step to attempt 1 and land on the
+//    shared derived id; the two proposals are filed at DIFFERENT verses (1
+//    and 2) of the same chapter, so the second must not treat the first's
+//    freshly-inserted row as its own. ──
+await withMockedClock(async () => {
+  const s1 = "aa8a";
+  const s2 = "abr4";
+  const sharedAlt = deriveAltRowId(s1, 1);
+  assert(
+    sharedAlt === deriveAltRowId(s2, 1),
+    `TQ derived-candidate verse guard: test setup sanity check — deriveAltRowId("${s1}",1) and ` +
+      `deriveAltRowId("${s2}",1) must actually collide (got ${sharedAlt} vs ${deriveAltRowId(s2, 1)})`,
+  );
+
+  const { env, insertedIds, updatedIds, setProposals } = buildFakeTqDb({
+    tombstonedIds: new Set([s1, s2]),
+  });
+
+  setProposals([
+    {
+      id: 1,
+      kind: "tq",
+      book: "GEN",
+      chapter: 1,
+      verse: 1,
+      bible_version: null,
+      payload_json: JSON.stringify({ id: s1, book: "GEN", chapter: 1, verse: 1, question: "q-derived-1" }),
+    },
+    {
+      id: 2,
+      kind: "tq",
+      book: "GEN",
+      chapter: 1,
+      verse: 2,
+      bible_version: null,
+      payload_json: JSON.stringify({ id: s2, book: "GEN", chapter: 1, verse: 2, question: "q-derived-2" }),
+    },
+  ]);
+
+  const originalConsoleError = console.error;
+  console.error = () => {};
+  let result;
+  try {
+    result = await importJobOutput(
+      env,
+      { jobId: "job-tq-derived-verse-mismatch", pipelineType: "tqs", book: "GEN", startChapter: 1, endChapter: 1 },
+      [],
+    );
+  } finally {
+    console.error = originalConsoleError;
+  }
+
+  assert(result.aborted !== true, `TQ derived-candidate verse guard: the job completes (aborted=${result.aborted})`);
+  assert(
+    !updatedIds.includes(sharedAlt),
+    `TQ derived-candidate verse guard (SILENT DATA LOSS if this fails): two seeds hashing to the same alternate ` +
+      `id ("${sharedAlt}") at DIFFERENT verses (1 vs 2) must not let the second proposal silently UPDATE over ` +
+      `(overwrite) the first proposal's question (got updatedIds=${updatedIds.join(",")})`,
+  );
+  assert(
+    insertedIds.length === 2 && new Set(insertedIds).size === 2,
+    `TQ derived-candidate verse guard: both proposals reach INSERT at two DISTINCT ids instead of the second ` +
+      `merging into an UPDATE of the first (got insertedIds=${insertedIds.join(",")})`,
+  );
+});
+
+// ── Companion: the intended-adoption case still works — a derived candidate
+//    whose live row is the SAME chapter AND SAME verse IS adopted (UPDATE,
+//    not a duplicate insert). This is the re-run idempotency path for a
+//    tombstoned seed and must not regress from the two guards above. ──
+await withMockedClock(async () => {
+  const seed = "hoig"; // tombstoned, so attempt 1 is the first live candidate checked
+  const derivedId = deriveAltRowId(seed, 1);
+
+  const { env, insertedIds, updatedIds, setProposals } = buildFakeTqDb({
+    tombstonedIds: new Set([seed]),
+    liveRows: new Map([[derivedId, { version: 1, chapter: 1, verse: 3 }]]),
+  });
+
+  setProposals([
+    {
+      id: 1,
+      kind: "tq",
+      book: "GEN",
+      chapter: 1,
+      verse: 3,
+      bible_version: null,
+      payload_json: JSON.stringify({ id: seed, book: "GEN", chapter: 1, verse: 3, question: "q-rerun-derived" }),
+    },
+  ]);
+
+  const originalConsoleError = console.error;
+  console.error = () => {};
+  let result;
+  try {
+    result = await importJobOutput(
+      env,
+      { jobId: "job-tq-derived-samechapter-verse", pipelineType: "tqs", book: "GEN", startChapter: 1, endChapter: 1 },
+      [],
+    );
+  } finally {
+    console.error = originalConsoleError;
+  }
+
+  assert(result.aborted !== true, `TQ derived-candidate adoption: the job completes (aborted=${result.aborted})`);
+  assert(
+    updatedIds.length === 1 && updatedIds[0] === derivedId,
+    `TQ derived-candidate adoption: a derived candidate whose live row is the SAME chapter AND verse IS adopted ` +
+      `(UPDATE), not duplicated as a new insert — this is the re-run idempotency path and must not regress ` +
+      `(got updatedIds=${updatedIds.join(",")}, insertedIds=${insertedIds.join(",")})`,
+  );
+  assert(
+    insertedIds.length === 0,
+    `TQ derived-candidate adoption: no new INSERT happens when the derived candidate's live row is legitimately ` +
+      `ours (got insertedIds=${insertedIds.join(",")})`,
   );
 });
 

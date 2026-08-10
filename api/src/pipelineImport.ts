@@ -1467,19 +1467,37 @@ async function applyTqUpsert(
     // Book-scoped to match the composite PK — a colliding id in another book is
     // a "not found here", not a stale match.
     const existing = await env.DB.prepare(
-      `SELECT version, chapter FROM tq_rows WHERE id = ?1 AND book = ?2 AND deleted_at IS NULL`,
+      `SELECT version, chapter, verse FROM tq_rows WHERE id = ?1 AND book = ?2 AND deleted_at IS NULL`,
     )
       .bind(id, p.book)
-      .first<{ version: number; chapter: number }>();
+      .first<{ version: number; chapter: number; verse: number }>();
     if (existing) {
-      // The id is live. Adopt it only if it sits in the chapter this proposal
-      // belongs to. TQ rows don't migrate between chapters, so a live match in
-      // a DIFFERENT chapter means the id is stale/reused, not ours — and the
-      // update below would overwrite that unrelated question's text while
-      // leaving it filed under its own chapter. Step to the next candidate
-      // rather than destroy it. (Within a chapter, adopting is right, and the
-      // update rewrites verse/ref_raw so a moved question stays consistent.)
-      if (existing.chapter !== p.chapter) continue;
+      // The id is live. Whether that row is OURS depends on where the candidate
+      // came from, and guessing wrong overwrites someone else's question with
+      // this one — silent loss, since the proposal is then marked accepted.
+      //
+      //   attempt 0 with a seed — the id bp-assistant asserts owns this row.
+      //     Adopt it anywhere in this chapter; the update rewrites verse/ref_raw
+      //     so a question moved within the chapter stays consistent. A match in
+      //     a DIFFERENT chapter is a stale/reused id, not ours: TQ rows don't
+      //     migrate between chapters, and adopting would rewrite an unrelated
+      //     question while leaving it filed under its own chapter.
+      //
+      //   derived candidate (attempt >= 1) — not claimed by anyone; it's just
+      //     the next free slot in this seed's deterministic chain. A live row
+      //     here is ours ONLY if it's the row a previous run of this same chain
+      //     created, which sits at this same chapter AND verse. Two different
+      //     seeds can hash to the same alternate (~1 in 786k per pair); without
+      //     the verse check the second proposal would UPDATE over the first.
+      //
+      //   no seed (random mint) — the candidate asserts nothing at all, so a
+      //     live row is never ours. Step on. Without this, a random id that
+      //     happens to hit a live row in this chapter silently overwrites it.
+      const isOurs =
+        seedId !== null &&
+        existing.chapter === p.chapter &&
+        (attempt === 0 || existing.verse === p.verse);
+      if (!isOurs) continue;
       const newVersion = existing.version + 1;
       const now = Math.floor(Date.now() / 1000);
       const patch = {
