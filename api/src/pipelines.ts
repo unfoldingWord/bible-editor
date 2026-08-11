@@ -22,6 +22,7 @@ import { currentUserId, requireEditor } from "./auth.ts";
 import { importJobOutput } from "./pipelineImport.ts";
 import { IMPORT_CLAIM_STALE_SECONDS } from "./pipelineImportClaim.ts";
 import { resourcesLockedByJob } from "./chapterLock.ts";
+import { effectiveBookLock, bookLockedResponseBody, BOOK_LOCKED_STATUS } from "./bookLock.ts";
 import { broadcastChapter } from "./wsEvents.ts";
 
 export const pipelines = new Hono<{
@@ -370,6 +371,28 @@ export async function dispatchNext(env: Env): Promise<void> {
     options_json: string | null;
   }>();
   if (!job) return;
+
+  // The book may have been locked (published, or explicitly frozen) after
+  // this job was queued but before it reached the front. Leave it 'queued'
+  // rather than dispatching or failing it — this frees the slot for other
+  // books' jobs and lets a lock/unlock resolve it later. Trade-off: a job
+  // queued against a book that stays locked forever sits in the queue
+  // forever too. That is visible (the queue position never advances) and
+  // recoverable (unlocking the book lets it dispatch on the next tick), which
+  // is the deliberate choice versus silently writing AI output into a frozen
+  // book.
+  const bookLock = await effectiveBookLock(env, job.book);
+  if (bookLock) {
+    console.log(
+      `[dispatchNext] job=${job.job_id} skipped: book ${job.book} is locked (${bookLock.source}); leaving queued`,
+    );
+    await env.DB.prepare(
+      `UPDATE pipeline_jobs SET state = 'queued', updated_at = unixepoch() WHERE job_id = ?1`,
+    )
+      .bind(job.job_id)
+      .run();
+    return;
+  }
 
   const fail = async (kind: string, message: string) => {
     await env.DB.prepare(
@@ -899,6 +922,14 @@ export async function pollPipelineJob(
   let appliedChapters: number[] = [];
   if (shouldImport && data.output) {
     try {
+      // Deliberately NOT gated by effectiveBookLock: this is the auto-apply
+      // for a job already in flight when the lock landed (the /start and
+      // /resume entry points and dispatchNext's queued-dispatch above are
+      // what refuse a NEW or restarted run into a locked book). Blocking
+      // here would stop mid-apply, and a cancellation between a delete and
+      // its inserts inside importJobOutput has previously corrupted data
+      // (see the DAN 11 incident) — so an in-flight import is exempt by
+      // design, not by oversight.
       const importResult = await importJobOutput(
         env,
         {
@@ -1401,6 +1432,13 @@ pipelines.post("/start", requireEditor, async (c) => {
   const startChapter = parsed.data.startChapter;
   const endChapter = parsed.data.endChapter ?? startChapter;
   const book = parsed.data.book.toUpperCase();
+
+  // A locked book (published, or explicitly frozen) must not accept a new AI
+  // run — the run's auto-apply step would write straight into a book that's
+  // supposed to be frozen. This is a full stop, not the chapter-lock's
+  // resource-scoped exemption logic above/below.
+  const bookLock = await effectiveBookLock(c.env, book);
+  if (bookLock) return c.json(bookLockedResponseBody(bookLock), BOOK_LOCKED_STATUS);
 
   // De-dup against our own queue/active set before enqueueing (replaces
   // relying on the bot's same-scope 409, which can't see our queue). Same
@@ -2343,7 +2381,7 @@ pipelines.post("/:jobId/resume", requireEditor, async (c) => {
   if (!jobId) return c.json({ error: "missing_job_id" }, 400);
 
   const owned = await c.env.DB.prepare(
-    `SELECT user_id, state, upstream_job_id, options_json
+    `SELECT user_id, state, upstream_job_id, options_json, book
        FROM pipeline_jobs WHERE job_id = ?1`,
   )
     .bind(jobId)
@@ -2352,6 +2390,7 @@ pipelines.post("/:jobId/resume", requireEditor, async (c) => {
       state: string;
       upstream_job_id: string | null;
       options_json: string | null;
+      book: string;
     }>();
   if (!owned) return c.json({ error: "not_found" }, 404);
   if (owned.user_id !== userId) return c.json({ error: "forbidden" }, 403);
@@ -2363,6 +2402,13 @@ pipelines.post("/:jobId/resume", requireEditor, async (c) => {
     // rather than calling the bot with an empty id.
     return c.json({ error: "cannot_resume", state: owned.state }, 409);
   }
+
+  // A resume is a fresh, deliberate action, not an already-in-flight apply —
+  // if the book has since been locked (published, or explicitly frozen), it
+  // must be refused just like a new /start, not waved through because the
+  // job predates the lock.
+  const bookLock = await effectiveBookLock(c.env, owned.book);
+  if (bookLock) return c.json(bookLockedResponseBody(bookLock), BOOK_LOCKED_STATUS);
 
   // Same as the automatic path: the bot can't recover the requesting username or
   // the original options from its checkpoint, so send both (see callUpstreamResume).

@@ -12,19 +12,22 @@ import {
   Button,
   Tooltip,
   Snackbar,
+  IconButton,
 } from "@mui/material";
 import GridViewIcon from "@mui/icons-material/GridView";
+import LockIcon from "@mui/icons-material/Lock";
 import { useChapter } from "../hooks/useChapter";
 import { useChapterRoom } from "../hooks/useChapterRoom";
 import type { UseBookReturn } from "../hooks/useBook";
 import { useBookLint } from "../hooks/useBookLint";
+import { useBookLocks } from "../hooks/useBookLocks";
 import { useAlignmentAttention } from "../hooks/useAlignmentAttention";
 import { useLexicon } from "../hooks/useLexicon";
 import { useAiDrafts } from "../hooks/useAiDrafts";
 import { useTwlFilters } from "../hooks/useTwlFilters";
 import { useUnsavedGuard } from "../hooks/useUnsavedGuard";
 import { outbox } from "../sync/outbox";
-import { api, ApiError, CHECK_LANES, isReadOnly } from "../sync/api";
+import { api, ApiError, CHECK_LANES, setReadOnlyReason } from "../sync/api";
 import type { BookLintIssue, ChapterPayload, CheckLane, TnRow, TqRow, TwlRow, VerseDto, TwlSuggestion, CommentRowKind, MentionUser } from "../sync/api";
 import { useComments } from "../hooks/useComments";
 import { countThreads, rowKey, type CommentThread } from "../lib/commentsIndex";
@@ -42,6 +45,7 @@ import {
   type TextLaneCheck,
 } from "../lib/laneChecks";
 import { ChapterBoard } from "./ChapterBoard";
+import { BookLocksDialog } from "./BookLocksDialog";
 import { drafts, verseKey } from "../sync/drafts";
 import { smartEditVerse } from "../lib/replace";
 import { extractEditableText, extractPlainText, normalizeEditable, SECTION_HEADER_TAGS } from "../lib/usfm";
@@ -180,6 +184,11 @@ interface Props {
   onLogout?: () => void;
   // Current signed-in user id, for the checkoff lane shading (you vs others).
   meUserId?: number | null;
+  // True when the signed-in user's role is 'viewer' (global read-only).
+  // Passed down instead of read from isReadOnly() so comments-gating isn't
+  // re-derived from a module-level global (see commentsEnabled below) — App
+  // already computes this from auth.role for its own banner.
+  isViewer?: boolean;
   // Comment id from a `?c=<id>` deep link (e.g. a mention alert). Consumed once
   // that chapter's comments have loaded — see the consumer effect below.
   initialCommentId?: number;
@@ -189,7 +198,7 @@ interface Props {
   onCommentConsumed?: () => void;
 }
 
-export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, onLogout, meUserId = null, initialCommentId, onCommentConsumed }: Props) {
+export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, onLogout, meUserId = null, isViewer = false, initialCommentId, onCommentConsumed }: Props) {
   // tw_link → article title, for canonical (headword-anchored) TWL ordering.
   // handleAddTwlSuggestion below places a NEW link at its canonical slot and
   // persists a matching sort_order, so it must order with the SAME inputs the
@@ -261,12 +270,17 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   );
 
   // ── Internal comments ──
-  // Gated on !isReadOnly(): the whole comments module is requireEditor
+  // Gated on the viewer role only: the whole comments module is requireEditor
   // server-side, so a viewer would take a 403 on every chapter change. Viewers
   // therefore see no comment badges at all, which is the intended behaviour.
+  // Deliberately NOT isReadOnly() — comments stay open on a locked book (see
+  // docs/book-locks.md and api/src/bookLockGuard.ts), and isReadOnly() would
+  // also fold in bookLocked and hide them. Reads the `isViewer` prop (a React
+  // value threaded from App's auth state) rather than isReadOnly()'s module
+  // global, which is set in an effect and was stale on first render.
   // Declared above useChapterRoom because that hook's handler object wires
   // applyWsComment straight through.
-  const commentsEnabled = !isReadOnly();
+  const commentsEnabled = !isViewer;
   const {
     index: commentsIndex,
     loading: commentsLoading,
@@ -1037,16 +1051,44 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     return keys;
   }, [versesForTiles, data?.chapter, alignAttention.refs]);
 
+  // Book locks: fetched once here (not per-chapter) so the read-only switch
+  // below and the admin dialog both see the same list. Declared ahead of
+  // toggleLane/confirmBulk below (both close over `bookLocked`), and ahead of
+  // the JSX render further down (both scripture/resource columns need it).
+  const bookLocks = useBookLocks();
+  const [bookLocksDialogOpen, setBookLocksDialogOpen] = useState(false);
+  const currentBookLock = bookLocks.books.find((b) => b.book === book) ?? null;
+
+  // Module-level flag that blocks the actual write (api.ts throws on
+  // request(), so every outbox.enqueue* short-circuits). That alone doesn't
+  // remove the editing AFFORDANCE — a translator could still type, watch it
+  // render, and have it silently discarded. `bookLocked` below is threaded
+  // into every prop that already disables editing (ScriptureColumn,
+  // ResourceColumn → NoteCard/QuestionsTable/WordsTable, find/replace, the
+  // lane toggles) so the UI matches what the server will actually accept.
+  // Cleared on unmount so leaving Shell (e.g. during sign-out) doesn't
+  // strand the app read-only.
+  const bookLocked = bookLocks.lockedSet.has(book);
+  useEffect(() => {
+    setReadOnlyReason("bookLocked", bookLocked);
+    return () => setReadOnlyReason("bookLocked", false);
+  }, [bookLocked]);
+
   // Toggle MY checkoff stamp on a (verse, lane): optimistic + outbox (offline-safe).
   const toggleLane = useCallback(
     (verse: number, lane: CheckLane) => {
       if (meUserId == null) return;
+      // The server rejects this write on a locked book (bookLocked also
+      // blocks it at the outbox layer via setReadOnlyReason above), so
+      // bail before the optimistic apply — otherwise the checkbox flips
+      // and then silently reverts once the write is dropped.
+      if (bookLocked) return;
       const checkers = laneIndex.get(laneKey(verse, lane));
       const next = !(checkers?.includes(meUserId));
       applyLocalLaneCheck(verse, lane, meUserId, next);
       void outbox.enqueueLaneCheck(book, chapter, verse, lane, next);
     },
-    [book, chapter, meUserId, laneIndex, applyLocalLaneCheck],
+    [book, chapter, meUserId, laneIndex, applyLocalLaneCheck, bookLocked],
   );
 
   // Bulk "all this chapter" for a lane. A fat-finger guard: clicking "all" only
@@ -1072,6 +1114,10 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     const p = pendingBulk;
     setPendingBulk(null);
     if (!p || meUserId == null) return;
+    // Same reasoning as toggleLane: the bulk PATCH will 423 on a locked
+    // book, so skip the optimistic apply rather than flip every checkbox
+    // in the chapter and then silently revert them.
+    if (bookLocked) return;
     for (const v of p.verses) applyLocalLaneCheck(v, p.lane, meUserId, p.checked);
     void api
       .setLaneCheckBulk(book, chapter, p.lane, p.checked, p.verses)
@@ -1079,7 +1125,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       .catch(() => {
         /* leave optimistic state; a later load reconciles */
       });
-  }, [pendingBulk, book, chapter, meUserId, applyLocalLaneCheck, replaceLaneChecksForLane]);
+  }, [pendingBulk, book, chapter, meUserId, applyLocalLaneCheck, replaceLaneChecksForLane, bookLocked]);
 
   // In-context checkoff for the resource panels, scoped to the active verse.
   const resourceCheckoff = useMemo<ResourceCheckoff>(() => {
@@ -2041,6 +2087,13 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
 
   const openAligner = useCallback(
     (chapterNum: number, v: number, bv: string) => {
+      // A locked book must not let a translator into the aligner at all —
+      // HTML5 drag-and-drop there is invisible to any contenteditable/input
+      // read-only check, so a drag+save would silently discard the work (the
+      // draft is dropped while the outbox returns a synthetic no-op). Block
+      // entry rather than trying to make the aligner itself partially
+      // read-only.
+      if (bookLocked) return;
       runWithDirtyGate(() => {
         setAlignerTarget({ chapter: chapterNum, verse: v, bibleVersion: bv });
         setActiveVerse(v);
@@ -2049,7 +2102,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         setPanelMode("alignment");
       });
     },
-    [runWithDirtyGate],
+    [runWithDirtyGate, bookLocked],
   );
 
   // Open the side-by-side ULT/UST aligner on a verse. Layered over the UI as a
@@ -2057,12 +2110,15 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // unsaved drags before opening.
   const openDualAligner = useCallback(
     (chapterNum: number, v: number) => {
+      // See the matching guard in openAligner above: a locked book must not
+      // allow entry to any aligner, dual or single.
+      if (bookLocked) return;
       runWithDirtyGate(() => {
         setActiveVerse(v);
         setDualTarget({ chapter: chapterNum, verse: v });
       });
     },
-    [runWithDirtyGate],
+    [runWithDirtyGate, bookLocked],
   );
   // Any action that leaves or re-targets the dual aligner gates on unsaved work
   // — alignment drags OR reading-text edits in either panel (save/discard
@@ -2153,6 +2209,9 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       // silently unmounting AlignmentPanel and dropping the edits. The gate is
       // a no-op unless we're currently in dirty alignment, so entering
       // alignment and all clean switches still apply immediately.
+      // See the matching guard in openAligner above: a locked book must not
+      // allow entry to the aligner via the Alignment tab either.
+      if (mode === "alignment" && bookLocked) return;
       runWithDirtyGate(() => {
         if (mode === "alignment" && !alignerTarget) {
           setAlignerTarget({ chapter, verse: activeVerse, bibleVersion: "ULT" });
@@ -2160,7 +2219,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         setPanelMode(mode);
       });
     },
-    [runWithDirtyGate, alignerTarget, chapter, activeVerse],
+    [runWithDirtyGate, alignerTarget, chapter, activeVerse, bookLocked],
   );
 
   const dismissPendingNav = useCallback(() => setPendingNav(null), []);
@@ -2793,10 +2852,46 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
             }
           />
         }
+        bookLocksButton={
+          <Tooltip title="Book locks">
+            <IconButton
+              size="small"
+              onClick={() => setBookLocksDialogOpen(true)}
+              aria-label="book locks"
+            >
+              <LockIcon fontSize="small" />
+            </IconButton>
+          </Tooltip>
+        }
         railCollapsed={railCollapsed}
         onToggleRail={toggleRail}
         onLogout={onLogout}
       />
+      <BookLocksDialog
+        open={bookLocksDialogOpen}
+        onClose={() => setBookLocksDialogOpen(false)}
+        onChanged={bookLocks.refresh}
+      />
+      {currentBookLock?.locked && (
+        <Alert
+          severity="warning"
+          sx={{
+            borderRadius: 0,
+            borderBottom: "1px solid",
+            borderColor: "divider",
+            py: 0.5,
+          }}
+        >
+          {book} is locked
+          {currentBookLock.lockSource === "published"
+            ? " because it has been published"
+            : currentBookLock.lockReason
+              ? ` (${currentBookLock.lockReason})`
+              : " by hand"}
+          . Edits and Door43 exports are frozen until it's unlocked. Benjamin,
+          Rich, or Perry can unlock it.
+        </Alert>
+      )}
       {lockBanners.map((b) => (
         <Alert
           key={b.jobId}
@@ -2974,6 +3069,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           lexiconMap={lexiconMap}
           twl={data.twl}
           locked={Boolean(chapterLocks.verse)}
+          bookLocked={bookLocked}
         />
         </Box>
         <Box
@@ -3347,6 +3443,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           }}
           lockedTn={Boolean(chapterLocks.tn)}
           lockedTq={Boolean(chapterLocks.tq)}
+          bookLocked={bookLocked}
           onSetNotePreserve={handleSetNotePreserve}
           onSetNoteHint={handleSetNoteHint}
           quoteBuildActiveNoteId={quoteBuildTarget?.kind === "tn" ? quoteBuildTarget.id : null}

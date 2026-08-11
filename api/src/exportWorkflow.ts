@@ -81,6 +81,20 @@ import { validateUsfm, summarizeUsfmIssues } from "./usfmValidate";
 import type { UsfmValidationIssue } from "./usfmValidate";
 import { shrinkOverrideAllowed } from "./shrinkGuard";
 import { mergeRefusalOverrideAllowed } from "./reimportSyncGate";
+import { lockedBooksIn } from "./bookLock";
+import {
+  PUBLISHED_RELEASE_TAG,
+  PUBLISHED_BOOKS,
+  isPublishedBook,
+  pickLatestStableRelease,
+  masterTargetedStableRelease,
+  publishedBooksFromEntries,
+  releaseSetUsable,
+  describePublishedDrift,
+  lockOverrideAllowed,
+  type DcsRelease,
+} from "./publishedGuard";
+import { BOOK_NUMBERS } from "./dcsSources";
 
 export interface ExportParams {
   // Restrict the run to one book. Useful for manual /api/exports/run.
@@ -116,6 +130,13 @@ export interface ExportParams {
   // Same narrow gating as allowShrink: only honored for a single explicitly-
   // named book AND resource, via mergeRefusalOverrideAllowed.
   allowMergeRefusal?: boolean;
+  // Human override for the book-lock gate. A locked book (published, or
+  // explicitly frozen via book_locks) is withheld from Door43 by the gate in
+  // exportOne; this is the escape hatch for pushing a deliberate fix to a
+  // frozen book anyway. Only honored for a single explicitly-named book AND
+  // resource — same narrow shape as allowShrink above — so no cron path can
+  // ever carry it and unfreeze every locked book at once.
+  allowLocked?: boolean;
 }
 
 export interface StepResult {
@@ -183,6 +204,13 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     if (params.allowMergeRefusal === true && !mergeRefusalOverride) {
       console.log("export: allowMergeRefusal ignored — requires an explicit single book + resource");
     }
+    // Book-lock override, same narrow shape as shrinkOverride above: only a run
+    // naming exactly ONE book and ONE resource can carry it, so every cron path
+    // (which omits both) keeps the lock gate no matter what params get passed.
+    const lockOverride = lockOverrideAllowed(params, books.length, resources.length);
+    if (params.allowLocked === true && !lockOverride) {
+      console.log("export: allowLocked ignored — requires an explicit single book + resource");
+    }
 
     // 1b. Sync D1 from current master before rendering. Pulls out-of-band master
     //     edits (other tooling, manual USFM cleanup, the bp-assistant bot) into
@@ -230,6 +258,36 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       return { instanceId, totalSteps: 0, results: [] };
     }
 
+    // 1c. Resolve which books are currently locked (published, or explicitly
+    //     frozen via book_locks), once per run, in one batched query — not one
+    //     query per (book, resource), which would blow the subrequest budget.
+    //     Step results are JSON-serialized: a Set would round-trip as `{}`, so
+    //     this returns a plain sorted array and is converted back to a Set
+    //     below, outside the step.
+    const lockedBooksArr = await step.do("locked-books", async () => {
+      const locked = await lockedBooksIn(this.env, books);
+      return [...locked].sort();
+    });
+    const lockedBooks = new Set(lockedBooksArr);
+
+    // 1d. Non-blocking published-release drift detector. Compares DCS's live
+    // "latest stable release" listing across all five resource repos against
+    // the hardcoded PUBLISHED_BOOKS snapshot the lock gate actually reads (see
+    // publishedGuard.ts's header). Deliberately NEVER touches the gate itself —
+    // this step only raises/clears an alert so a new unfoldingWord release
+    // becomes a reviewed human event (bump PUBLISHED_BOOKS + PUBLISHED_RELEASE_TAG)
+    // rather than a silent change in which books export. Gated on dcsAllowed
+    // (no service token → no point hitting DCS) and wrapped in try/catch both
+    // here and inside the step body, since a step that exhausts its retries
+    // fails the whole Workflow instance — this check must never do that.
+    if (dcsAllowed) {
+      try {
+        await step.do("published-drift-check", async () => this.checkPublishedDrift());
+      } catch (e) {
+        console.error("export published-drift-check failed", { error: e instanceof Error ? e.message : String(e) });
+      }
+    }
+
     // 2. One step per (book, resource). step.do persists, so a single flaky
     //    step retries without re-rendering the entire run.
     //
@@ -245,7 +303,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
           const result = await step.do(
             stepName,
             { retries: { limit: 3, delay: "5 seconds", backoff: "exponential" } },
-            async () => this.exportOne(book, resource, instanceId, dcsAllowed, shrinkOverride),
+            async () => this.exportOne(book, resource, instanceId, dcsAllowed, shrinkOverride, lockedBooks, lockOverride),
           );
           results.push(result);
         } catch (e) {
@@ -366,6 +424,8 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     instanceId: string,
     dcsAllowed: boolean,
     allowShrink: boolean,
+    lockedBooks: Set<string>,
+    allowLocked: boolean,
   ): Promise<StepResult> {
     // Clear any undismissed banner the removed blank-field HOLD gate left behind
     // (see the long note further down for why that gate is gone). Its text says
@@ -394,6 +454,56 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       } catch (err) {
         console.error(`export_blank banner clear failed for ${book} ${resource}:`, err);
       }
+    }
+
+    // Book-lock gate. A locked book (published in PUBLISHED_RELEASE_TAG, or
+    // explicitly frozen via book_locks) is withheld from Door43 entirely —
+    // this is the export-side half of the app's book-lock feature (bookLock.ts
+    // also blocks in-app edits). Only meaningful when we'd actually commit
+    // (dcsAllowed); a dry run renders to R2 only and can't push anything live,
+    // so there's nothing for the lock to protect. `allowLocked` is the human
+    // escape hatch for a deliberate fix to a frozen book, resolved above and
+    // already scoped to exactly one named (book, resource).
+    if (dcsAllowed && !allowLocked && lockedBooks.has(book)) {
+      // rowCount: 0 here means "never rendered" (we bail before buildResource),
+      // NOT "no rows" — the skip reason below carries the actual truth.
+      //
+      // The reason is derived from the published list rather than from the
+      // lock's true `source`, because lockedBooksIn returns a bare Set (one
+      // batched query, no per-book source). That makes the reason accurate but
+      // not maximally specific: a published book that ALSO has an explicit
+      // book_locks row reports `published`, since it genuinely is published.
+      // Only the unpublished case is unambiguous, and it is reported exactly.
+      const reason = isPublishedBook(book)
+        ? `book_locked:published:${PUBLISHED_RELEASE_TAG}`
+        : "book_locked:explicit";
+      await this.recordLockedSkipSnapshot(book, resource, reason);
+      return {
+        book,
+        resource,
+        rowCount: 0,
+        bytes: 0,
+        r2Key: null,
+        branch: null,
+        dcsCommitSha: null,
+        dcsChanged: false,
+        dcsSkippedReason: reason,
+        prNumber: null,
+        prReason: null,
+      };
+    }
+    if (dcsAllowed && allowLocked && lockedBooks.has(book)) {
+      // A human explicitly cleared the lock guard for this exact (book,
+      // resource) — durable record of the bypass, mirroring the shrink-guard
+      // override alert above (writeAlert, severity "info": a notice, not a
+      // problem).
+      await this.writeAlert(
+        `export_lock_override:${book}:${resource}`,
+        `${book} ${resource.toUpperCase()}: book-lock guard bypassed by explicit request — ` +
+          `a human cleared the lock so this export could proceed.`,
+        `${this.env.DCS_BASE_URL}/unfoldingWord`,
+        "info",
+      );
     }
 
     const built = await this.buildResource(book, resource);
@@ -1271,6 +1381,32 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       .run();
   }
 
+  // Records a `book_locked:*` skip, but only when it would change the last
+  // recorded outcome for this (book, resource). GET /api/exports returns only
+  // the last 50 snapshot rows (exports.ts), and a locked book repeats the same
+  // skip every single night — 54 books × 5 resources of book_locked would bury
+  // every real, actionable skip reason (stale_master:, shrink_guard:, …) within
+  // a night or two. Read failure fails TOWARD recording (never silently drops a
+  // state change) rather than toward staying quiet.
+  private async recordLockedSkipSnapshot(book: string, resource: Resource, reason: string): Promise<void> {
+    let alreadyRecorded = false;
+    try {
+      const last = await this.env.DB.prepare(
+        `SELECT error FROM export_snapshots WHERE book = ?1 AND resource = ?2 ORDER BY id DESC LIMIT 1`,
+      )
+        .bind(book, resource)
+        .first<{ error: string | null }>();
+      alreadyRecorded = last?.error === reason;
+    } catch (e) {
+      console.error("export locked-skip snapshot read failed; recording anyway", {
+        book, resource, error: e instanceof Error ? e.message : String(e),
+      });
+      alreadyRecorded = false;
+    }
+    if (alreadyRecorded) return;
+    await this.recordSnapshot(book, resource, null, null, 0, reason);
+  }
+
   // Is D1 for this (book, resource) current with master? Compares master's
   // latest file-commit SHA to the book_resource_syncs watermark (what the last
   // successful sync recorded). Returns ok only when we can POSITIVELY confirm
@@ -2077,6 +2213,129 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       `Benjamin — nightly pre-export sync failed for ${book}: ${detail.slice(0, 160)}. ` +
       `Any book left behind master is skipped by the freshness gate (not reverted); re-sync ${book} and re-export.`;
     await this.writeAlert(source, message, `${this.env.DCS_BASE_URL}/unfoldingWord`);
+  }
+
+  // Non-blocking published-release drift detector. Fetches the latest STABLE
+  // release (pickLatestStableRelease) in each of the five resource repos, reads
+  // that release's book listing, and unions the per-resource published sets
+  // into one book-level set (a book published in any one resource blocks all
+  // five in the lock gate, so drift is measured at the union). Compares that
+  // union against the hardcoded PUBLISHED_BOOKS snapshot.
+  //
+  // THIS NEVER INFLUENCES THE GATE. exportOne's book-lock gate reads only the
+  // hardcoded PUBLISHED_BOOKS / PUBLISHED_RELEASE_TAG constants in
+  // publishedGuard.ts — never this method's live result. The whole point of
+  // keeping it non-blocking is the reasoning in publishedGuard.ts's header: a
+  // failed live lookup can't know which books are actually published, so it
+  // would have to either halt every export or silently unblock all of them,
+  // both wrong. This step exists purely so a new unfoldingWord release becomes
+  // a reviewed human event (bump the two constants, run the tests) rather than
+  // a silent change in which books export.
+  private async checkPublishedDrift(): Promise<{ status: string }> {
+    const owner = this.env.DCS_EXPORT_OWNER ?? "unfoldingWord";
+    const candidateBooks = Object.keys(BOOK_NUMBERS);
+    const union = new Set<string>();
+    // Reportable, not gating: a stable release targeting `master` — see
+    // masterTargetedStableRelease's header. pickLatestStableRelease rejects
+    // these unconditionally, so without this separate check a future stable
+    // master-targeted release would go completely unnoticed while the
+    // hardcoded PUBLISHED_BOOKS constant quietly went stale.
+    const masterStableFindings: string[] = [];
+    for (const resource of ALL_RESOURCES) {
+      const repo = RESOURCE_TARGETS[resource].repo;
+      const releases = await this.fetchDcsReleases(owner, repo);
+      if (!releases) continue; // failed read — not evidence of anything, just skip this repo
+      const masterStable = masterTargetedStableRelease(releases);
+      if (masterStable?.tag_name) {
+        masterStableFindings.push(`${repo}@${masterStable.tag_name}`);
+      }
+      const latest = pickLatestStableRelease(releases);
+      if (!latest?.tag_name) continue;
+      const names = await this.fetchDcsContentsNames(owner, repo, latest.tag_name);
+      if (!names) continue;
+      for (const b of publishedBooksFromEntries(names, candidateBooks, resource)) union.add(b);
+    }
+    if (masterStableFindings.length > 0) {
+      await this.writeAlert(
+        "export_published_master_stable",
+        `Benjamin — found a STABLE (non-draft, non-prerelease) release targeting ` +
+          `\`master\` in: ${masterStableFindings.join(", ")}. pickLatestStableRelease ` +
+          `never picks these, so it's not driving the export gate, but a real stable ` +
+          `release cut against master is unusual and PUBLISHED_BOOKS may need human review.`,
+        `${this.env.DCS_BASE_URL}/unfoldingWord`,
+        "warning",
+      );
+    } else {
+      await this.env.DB.prepare(
+        `DELETE FROM system_alerts WHERE username = ?1 AND source = ?2 AND dismissed_at IS NULL`,
+      )
+        .bind(EXPORT_ALERT_USERNAME, "export_published_master_stable")
+        .run();
+    }
+    if (!releaseSetUsable(union)) {
+      // A short listing is a failed/partial read, not evidence of "few books
+      // published" — same principle as shrinkGuard's truncated-fetch policy.
+      // console.log only; no alert, since we have nothing trustworthy to say.
+      console.log("export: published-drift-check inconclusive — live release set too small to trust", {
+        size: union.size,
+      });
+      return { status: "inconclusive" };
+    }
+    const drift = describePublishedDrift(PUBLISHED_BOOKS, union);
+    if (drift == null) {
+      await this.env.DB.prepare(
+        `DELETE FROM system_alerts WHERE username = ?1 AND source = ?2 AND dismissed_at IS NULL`,
+      )
+        .bind(EXPORT_ALERT_USERNAME, "export_published_drift")
+        .run();
+      return { status: "no_drift" };
+    }
+    // writeAlert replaces any existing undismissed alert for this source, so no
+    // separate DELETE is needed on the drift-found path.
+    await this.writeAlert(
+      "export_published_drift",
+      drift.message,
+      `${this.env.DCS_BASE_URL}/unfoldingWord`,
+      "warning",
+    );
+    return { status: "drift" };
+  }
+
+  // GET .../releases?draft=false&pre-release=false, newest 5. null on any
+  // fetch/parse failure — same authenticated-GET idiom as dcsSources.ts's
+  // fileCommitSha (Accept: application/json, service token when present).
+  private async fetchDcsReleases(owner: string, repo: string): Promise<DcsRelease[] | null> {
+    try {
+      const url =
+        `${this.env.DCS_BASE_URL}/api/v1/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}` +
+        `/releases?draft=false&pre-release=false&limit=5`;
+      const headers: Record<string, string> = { Accept: "application/json" };
+      if (this.env.DCS_SERVICE_TOKEN) headers.Authorization = `token ${this.env.DCS_SERVICE_TOKEN}`;
+      const r = await fetch(url, { headers });
+      if (!r.ok) return null;
+      return (await r.json()) as DcsRelease[];
+    } catch {
+      return null;
+    }
+  }
+
+  // GET .../contents?ref=<tag> — top-level directory listing for one release
+  // tag. Returns just the entry names (what publishedBooksFromEntries wants);
+  // null on any fetch/parse failure.
+  private async fetchDcsContentsNames(owner: string, repo: string, ref: string): Promise<string[] | null> {
+    try {
+      const url =
+        `${this.env.DCS_BASE_URL}/api/v1/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}` +
+        `/contents?ref=${encodeURIComponent(ref)}`;
+      const headers: Record<string, string> = { Accept: "application/json" };
+      if (this.env.DCS_SERVICE_TOKEN) headers.Authorization = `token ${this.env.DCS_SERVICE_TOKEN}`;
+      const r = await fetch(url, { headers });
+      if (!r.ok) return null;
+      const entries = (await r.json()) as Array<{ name?: string }>;
+      return entries.map((e) => e.name).filter((n): n is string => typeof n === "string");
+    } catch {
+      return null;
+    }
   }
 
   // Replace-undismissed alert writer shared by the export-side alerts. Best

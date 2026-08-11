@@ -150,6 +150,11 @@ interface Props {
   // and the row is neither preserved nor a hint, the card is read-only.
   // Preserved or hinted rows stay editable even during a run.
   locked?: boolean;
+  // The whole BOOK is locked (server-enforced, no carve-outs). Unlike
+  // `locked` above, preserve/hint never override this — those toggles hit
+  // POST /api/rows/tn/:id/preserve|/hint, which the server 423s on a locked
+  // book, so leaving them enabled would just manufacture failed ops.
+  bookLocked?: boolean;
   // Toggle the row's "survive future AI pipeline sweeps" bit. Always
   // available — these are pre-run intent signals, not in-run claims.
   // Fires POST /api/rows/tn/:id/preserve upstream.
@@ -348,6 +353,7 @@ function NoteCardInner({
   onStartAi,
   onVisibilityChange,
   locked = false,
+  bookLocked = false,
   onSetPreserve,
   onSetHint,
   onTranslateQuote,
@@ -371,7 +377,11 @@ function NoteCardInner({
   // Folding it into readOnly makes every body input non-interactive and hides
   // the add/delete buttons for free (they already gate on !readOnly).
   const trashed = row.trashed_at != null;
-  const readOnly = trashed || (locked && !isPreserved && !isHint);
+  // A book lock is a hard freeze with no carve-outs — bookLocked short-
+  // circuits ahead of the preserve/hint check so a Preserved/Hinted row
+  // doesn't stay editable during a book lock the way it does during a
+  // chapter lock.
+  const readOnly = trashed || bookLocked || (locked && !isPreserved && !isHint);
   const [quote, setQuote] = useState(tsvToDisplay(row.quote));
   const [note, setNote] = useState(tsvToDisplay(row.note));
   // Find-highlight: the active match note shows a read view (with the match
@@ -1599,7 +1609,7 @@ function NoteCardInner({
           bgcolor: "grey.50",
         }}
       >
-        {onSetPreserve && (
+        {onSetPreserve && !readOnly && (
           <Tooltip title="Mark this note to survive future AI pipeline runs.">
             <Chip
               size="small"
@@ -1897,6 +1907,7 @@ function areNotePropsEqual(a: Props, b: Props): boolean {
     a.isAiPending === b.isAiPending &&
     a.aiRecentlyCompletedAt === b.aiRecentlyCompletedAt &&
     a.locked === b.locked &&
+    a.bookLocked === b.bookLocked &&
     a.quoteBuildMode === b.quoteBuildMode &&
     a.quoteBuildSelectionCount === b.quoteBuildSelectionCount &&
     (a.flashArrow ?? null) === (b.flashArrow ?? null) &&
