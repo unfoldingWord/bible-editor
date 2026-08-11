@@ -37,12 +37,35 @@ export function lanesToReopenOnVerseEdit(
   return ["text"];
 }
 
+// FIX C: bound on how many verses in ONE reopenLaneChecks bulk run may fire
+// their broadcastChapter Durable-Object fetch. reopenLaneChecks itself issues
+// one DELETE + up to one DO fetch PER LANE per verse (a ULT adoption that
+// changed a word reopens two lanes: "text" and "tw"), and nothing upstream
+// caps how many adoptions land in one bookReimport.ts run — Cloudflare's
+// ~1000-subrequest cap has bitten this codebase twice already (see
+// STATE.md's nightly-sync-subrequest-cap lesson). Past this many landed
+// adoptions in one call, the DELETE (which reopens the checkoff — the
+// correctness-bearing half) still runs for every verse, but the broadcast
+// (the live-tab notification — best-effort, a stale checkoff self-heals on
+// the next page load) is skipped for the excess and the drop is logged
+// rather than silently truncated.
+export const LANE_REOPEN_BROADCAST_CAP = 200;
+
 export async function reopenLaneChecks(
   env: Env,
   book: string,
   chapter: number,
   verse: number,
   lanes: CheckLane[],
+  // Whether to fire the per-lane broadcastChapter Durable-Object fetch after
+  // the DELETE lands. Defaults true (every existing call site is a single
+  // request-scoped save, where the live-tab notification matters). A bulk
+  // caller processing hundreds of verses in one run (bookReimport.ts's
+  // master-adoption reopen) passes false past its own subrequest cap — see
+  // LANE_REOPEN_BROADCAST_CAP — so the DELETE (the correctness-bearing half:
+  // the checkoff itself reopens) still runs for every verse, and only the
+  // best-effort live-notification half is dropped for the excess.
+  broadcast: boolean = true,
 ): Promise<void> {
   if (lanes.length === 0) return;
   try {
@@ -55,7 +78,7 @@ export async function reopenLaneChecks(
       .bind(book, chapter, verse, ...lanes)
       .run();
     // Nothing was checked here → nothing reopened → no need to notify anyone.
-    if (!res.meta.changes) return;
+    if (!res.meta.changes || !broadcast) return;
     for (const lane of lanes) {
       await broadcastChapter(env, book, chapter, {
         type: "lane_check.updated",

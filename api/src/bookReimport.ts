@@ -69,7 +69,7 @@ import { applyTwlSortOrderUpdates } from "./twlSortOrderApply";
 import { loadTwTitles } from "./twTitles";
 import { loadTwlOrderLocks } from "./twlOrderLocks";
 import type { TwlRow, VerseRow } from "./types";
-import { computeVerseMerge, type VerseMergeResult } from "./verseMerge.ts";
+import { computeVerseMerge, collapseWhitespaceForCompare, type VerseMergeResult } from "./verseMerge.ts";
 import { verseContentJsonFromPayload } from "./verseHistory.ts";
 import { canonizeAlignmentSource } from "./canonizeHebrew.ts";
 import {
@@ -78,7 +78,7 @@ import {
   raiseVerseMergeConflictAlert,
 } from "./verseMergeConflicts.ts";
 import { analyzeAlignmentDelta } from "./alignmentDelta.ts";
-import { lanesToReopenOnVerseEdit, reopenLaneChecks } from "./laneReopen.ts";
+import { lanesToReopenOnVerseEdit, reopenLaneChecks, LANE_REOPEN_BROADCAST_CAP } from "./laneReopen.ts";
 // REIMPORT_CHAPTER_CHUNK / reimportChunkBoundaries live in their own
 // zero-dependency module (reimportChunkPlan.ts) so the chunk-boundary math —
 // including the chapter-0 handling — is unit-testable directly under plain
@@ -486,11 +486,13 @@ async function runReimport(
   if (want.has("ult")) {
     await raiseVerseMergeConflictAlert(env, book, "ult", {
       recordingFailed: perResource.ult.merge_record_failed === true,
+      noBaseCount: perResource.ult.merge_no_base,
     });
   }
   if (want.has("ust")) {
     await raiseVerseMergeConflictAlert(env, book, "ust", {
       recordingFailed: perResource.ust.merge_record_failed === true,
+      noBaseCount: perResource.ust.merge_no_base,
     });
   }
 
@@ -1513,6 +1515,13 @@ async function applyVerseRows(
     // (lanesToReopenOnVerseEdit) can tell whether the adoption actually
     // changed a word, same as verses.ts's PATCH route does for a normal save.
     beforeContentJson: string;
+    // FIX A / Task 3: D1's plain_text before this adoption, so the reopen
+    // step can additionally skip when the ADOPTED text is identical to what
+    // was already there (a spurious "adopt" purely from render→reparse
+    // churn — e.g. the occurrence/nextChar artifacts FIX A closes at the
+    // content_json level — must not delete a checker's text sign-off for a
+    // change that never touched the verse's actual text).
+    beforePlainText: string | null;
   }> = [];
   // Verses needing a durable record after this run's merge — EVERY landed
   // adoption ("adopt" | "adopt_conflict") plus every alignment refusal
@@ -1620,7 +1629,14 @@ async function applyVerseRows(
           });
         }
         if (merge.adopt) {
-          masterAdoptions.push({ v, oldVersion: ex.version, merge, plainText: v.plainText, beforeContentJson: ex.content_json });
+          masterAdoptions.push({
+            v,
+            oldVersion: ex.version,
+            merge,
+            plainText: v.plainText,
+            beforeContentJson: ex.content_json,
+            beforePlainText: ex.plain_text,
+          });
           continue;
         }
       }
@@ -1879,44 +1895,62 @@ async function applyVerseRows(
   // verse between our read and our write, so nothing of theirs was replaced
   // and there is nothing yet to review. The next sync re-evaluates that verse
   // from scratch.
+  //
+  // FIX B: an overwrite must never land without its recovery pointer. If
+  // step 6b's recordVerseMergeConflicts write just failed (recordFailed),
+  // some or all of these adoptions have no durable verse_merge_conflicts row
+  // — writing the CAS batch anyway would overwrite human-owned text with
+  // nothing but a vague book-level banner pointing a reviewer nowhere. Fail
+  // closed: skip the whole adoption write batch for this call. Nothing is
+  // lost by skipping — masterAdoptions is recomputed fresh from D1 + master
+  // on the next sync, so a retry adopts the same content once recording
+  // succeeds. counts.merge_adopted and adoptionsApplied simply stay at
+  // whatever they already were (0 / empty here), which is honest: nothing
+  // was written this call.
   const adoptionsApplied = new Set<string>();
-  for (let i = 0; i < masterAdoptions.length; i += WRITE_BATCH) {
-    const slice = masterAdoptions.slice(i, i + WRITE_BATCH);
-    try {
-      const results = await env.DB.batch(
-        slice.map((a) =>
-          env.DB.prepare(
-            `UPDATE verses
-                SET content_json = ?1, plain_text = ?2, verse_end = ?3,
-                    version = version + 1, updated_at = ?4
-              WHERE book = ?5 AND chapter = ?6 AND verse = ?7 AND bible_version = ?8
-                AND version = ?9`,
-          ).bind(a.v.contentJson, a.plainText, a.v.verseEnd, now, book, a.v.chapter, a.v.verse, bibleVersion, a.oldVersion),
-        ),
-      );
-      const logs: D1PreparedStatement[] = [];
-      slice.forEach((a, j) => {
-        if ((results[j]?.meta.changes ?? 0) > 0) {
-          counts.merge_adopted++;
-          adoptionsApplied.add(`${a.v.chapter}:${a.v.verse}`);
-          console.warn("reimport: adopted master's out-of-band correction over D1 (verseMerge)", {
-            book, bibleVersion, chapter: a.v.chapter, verse: a.v.verse, action: a.merge.action, reason: a.merge.reason,
-          });
-          logs.push(
-            logEditStmt(
-              env, "verse",
-              `${book}/${a.v.chapter}/${a.v.verse}/${bibleVersion}`,
-              book, userId, a.oldVersion, a.oldVersion + 1, "update",
-              { plain_text: a.plainText, content: a.v.contentJson },
-            ),
-          );
-        } else {
-          counts.skipped_edited++;
-        }
-      });
-      if (logs.length) await env.DB.batch(logs);
-    } catch (e) {
-      counts.errors.push(`verse master-adoption batch: ${e instanceof Error ? e.message : String(e)}`);
+  if (recordFailed && masterAdoptions.length > 0) {
+    console.error("reimport: skipping master-adoption write batch — merge-conflict recording failed this run", {
+      book, bibleVersion, skipped: masterAdoptions.length,
+    });
+  } else {
+    for (let i = 0; i < masterAdoptions.length; i += WRITE_BATCH) {
+      const slice = masterAdoptions.slice(i, i + WRITE_BATCH);
+      try {
+        const results = await env.DB.batch(
+          slice.map((a) =>
+            env.DB.prepare(
+              `UPDATE verses
+                  SET content_json = ?1, plain_text = ?2, verse_end = ?3,
+                      version = version + 1, updated_at = ?4
+                WHERE book = ?5 AND chapter = ?6 AND verse = ?7 AND bible_version = ?8
+                  AND version = ?9`,
+            ).bind(a.v.contentJson, a.plainText, a.v.verseEnd, now, book, a.v.chapter, a.v.verse, bibleVersion, a.oldVersion),
+          ),
+        );
+        const logs: D1PreparedStatement[] = [];
+        slice.forEach((a, j) => {
+          if ((results[j]?.meta.changes ?? 0) > 0) {
+            counts.merge_adopted++;
+            adoptionsApplied.add(`${a.v.chapter}:${a.v.verse}`);
+            console.warn("reimport: adopted master's out-of-band correction over D1 (verseMerge)", {
+              book, bibleVersion, chapter: a.v.chapter, verse: a.v.verse, action: a.merge.action, reason: a.merge.reason,
+            });
+            logs.push(
+              logEditStmt(
+                env, "verse",
+                `${book}/${a.v.chapter}/${a.v.verse}/${bibleVersion}`,
+                book, userId, a.oldVersion, a.oldVersion + 1, "update",
+                { plain_text: a.plainText, content: a.v.contentJson },
+              ),
+            );
+          } else {
+            counts.skipped_edited++;
+          }
+        });
+        if (logs.length) await env.DB.batch(logs);
+      } catch (e) {
+        counts.errors.push(`verse master-adoption batch: ${e instanceof Error ? e.message : String(e)}`);
+      }
     }
   }
 
@@ -1925,15 +1959,49 @@ async function applyVerseRows(
   // reopen logic a normal save triggers (lanesToReopenOnVerseEdit /
   // reopenLaneChecks) never runs for it. Run it here for every LANDED
   // adoption (bounded by adoptionsApplied — a lost CAS race changed nothing,
-  // so there's nothing to reopen), batched by WRITE_BATCH. A parse failure on
-  // either side is treated as "assume the words changed" (the safe
-  // direction — a stale check surviving an edit is the failure mode this
-  // exists to close) rather than thrown.
+  // so there's nothing to reopen). A parse failure on either side is treated
+  // as "assume the words changed" (the safe direction — a stale check
+  // surviving an edit is the failure mode this exists to close) rather than
+  // thrown.
+  //
+  // FIX C: the WRITE_BATCH chunking below only bounds how many verses run
+  // CONCURRENTLY in one Promise.all — it does not bound the TOTAL number of
+  // subrequests this step issues. reopenLaneChecks fires one DELETE plus up
+  // to one broadcastChapter Durable-Object fetch PER LANE per verse (a ULT
+  // word-changing adoption reopens two lanes), and nothing above caps how
+  // many verses can be adopted in a single run — Cloudflare's ~1000-
+  // subrequest cap has already broken this codebase's nightly sync twice.
+  // Past LANE_REOPEN_BROADCAST_CAP landed adoptions, keep reopening the
+  // checkoff itself (the DELETE — correctness-bearing) for every verse, but
+  // stop firing the broadcast (best-effort live-tab notification; a stale
+  // check self-heals on the next page load) for the excess, and log how many
+  // were dropped rather than truncating silently.
   const landedAdoptions = masterAdoptions.filter((a) => adoptionsApplied.has(`${a.v.chapter}:${a.v.verse}`));
+  if (landedAdoptions.length > LANE_REOPEN_BROADCAST_CAP) {
+    console.error("reimport: lane-reopen broadcast truncated — too many landed adoptions in one run", {
+      book, bibleVersion, landed: landedAdoptions.length, cap: LANE_REOPEN_BROADCAST_CAP,
+    });
+  }
   for (let i = 0; i < landedAdoptions.length; i += WRITE_BATCH) {
     const slice = landedAdoptions.slice(i, i + WRITE_BATCH);
     await Promise.all(
-      slice.map((a) => {
+      slice.map((a, j) => {
+        // Task 3: don't delete a checker's 'text' sign-off for an adoption
+        // that didn't actually change the verse's plain text — the exact
+        // damaging consequence of a spurious "adopt" (render→reparse churn
+        // that FIX A's content_json normalization mostly, but not entirely,
+        // catches upstream: see verseMerge.ts's collapseWhitespaceForCompare
+        // and its residual-cause comment). Compared with the SAME
+        // whitespace-collapse rule FIX A uses, so a whitespace-only delta in
+        // plain_text doesn't count as a change either.
+        const beforeText = collapseWhitespaceForCompare(a.beforePlainText);
+        const afterText = collapseWhitespaceForCompare(a.plainText);
+        if (beforeText === afterText) {
+          console.log("reimport: skipped lane reopen — adoption did not change plain_text", {
+            book, bibleVersion, chapter: a.v.chapter, verse: a.v.verse,
+          });
+          return Promise.resolve();
+        }
         let wordSequenceUnchanged = false;
         try {
           const delta = analyzeAlignmentDelta(JSON.parse(a.beforeContentJson), JSON.parse(a.v.contentJson));
@@ -1942,7 +2010,8 @@ async function applyVerseRows(
           /* unparseable either side — fail toward "changed" (reopen), never toward a stale check */
         }
         const lanes = lanesToReopenOnVerseEdit(bibleVersion, wordSequenceUnchanged);
-        return reopenLaneChecks(env, book, a.v.chapter, a.v.verse, lanes);
+        const broadcast = i + j < LANE_REOPEN_BROADCAST_CAP;
+        return reopenLaneChecks(env, book, a.v.chapter, a.v.verse, lanes, broadcast);
       }),
     );
   }
@@ -1952,9 +2021,17 @@ async function applyVerseRows(
   // written speculatively in step 6b before we knew that — delete it now so
   // it never misdirects a reviewer to a version that still holds their
   // current text. Refused verses (never attempted a write) are untouched.
-  const lostAdoptionRefs = mergeConflicts
-    .filter((mc) => mc.adopted && !adoptionsApplied.has(`${mc.chapter}:${mc.verse}`))
-    .map((mc) => ({ chapter: mc.chapter, verse: mc.verse }));
+  // FIX B: skipped entirely when recordFailed — the write batch above never
+  // ran, so adoptionsApplied being empty here means "we didn't attempt these
+  // adoptions", not "we tried and lost the race." Running this cleanup
+  // anyway would delete whatever verse_merge_conflicts rows DID land before
+  // step 6b's failure, erasing the only evidence recordFailed's own banner
+  // note (merge_record_failed) points a reviewer at.
+  const lostAdoptionRefs = recordFailed
+    ? []
+    : mergeConflicts
+        .filter((mc) => mc.adopted && !adoptionsApplied.has(`${mc.chapter}:${mc.verse}`))
+        .map((mc) => ({ chapter: mc.chapter, verse: mc.verse }));
   if (lostAdoptionRefs.length > 0) {
     await deleteLostAdoptionConflicts(env, book, resource, lostAdoptionRefs);
   }
@@ -2655,7 +2732,13 @@ export async function runChunkedReimport(
   book: string,
   instanceId: string,
   resources: Resource[],
-  opts: { chunk?: number } = {},
+  // FIX H: `mergeRefusalOverrideResource` — when set, isSystemicMergeRefusal
+  // is forced open for exactly this ONE resource (never wholesale — see
+  // reimportSyncGate.ts's mergeRefusalOverrideAllowed, which the caller
+  // (exportWorkflow.ts) uses to compute this, gated on the run naming
+  // exactly one book AND one resource). Undefined/omitted preserves the
+  // pre-existing behavior for every cron path.
+  opts: { chunk?: number; mergeRefusalOverrideResource?: Resource } = {},
 ): Promise<ReimportResult> {
   const chunkSize = opts.chunk ?? REIMPORT_CHAPTER_CHUNK;
 
@@ -2701,6 +2784,7 @@ export async function runChunkedReimport(
       if (e.resource !== "ult" && e.resource !== "ust") continue;
       await raiseVerseMergeConflictAlert(env, book, e.resource, {
         recordingFailed: perResource[e.resource].merge_record_failed === true,
+        noBaseCount: perResource[e.resource].merge_no_base,
       });
     }
   });
@@ -2789,7 +2873,15 @@ export async function runChunkedReimport(
       // prune_locked gates — a maintainer's work is being reverted at scale,
       // so tonight's export must not run against it. Consulted alongside the
       // existing gate (either firing withholds), never instead of it.
-      const systemicRefusals = isSystemicMergeRefusal(perResource[e.resource].merge_refused ?? 0);
+      // FIX H: the override, when the caller granted it for exactly this
+      // resource, forces isSystemicMergeRefusal open for this run only — see
+      // opts.mergeRefusalOverrideResource's doc above.
+      const refusalOverride = opts.mergeRefusalOverrideResource === e.resource;
+      const systemicRefusals = isSystemicMergeRefusal(
+        perResource[e.resource].merge_refused ?? 0,
+        undefined,
+        refusalOverride,
+      );
       if (!shouldRecordResourceSync(perResource[e.resource]) || systemicRefusals) {
         withheld.push(e.resource);
         // FIX B: a book whose (book, resource) has NO existing watermark row

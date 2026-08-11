@@ -183,17 +183,38 @@ export async function raiseVerseMergeConflictAlert(
   env: Env,
   book: string,
   resource: string,
-  opts: { recordingFailed?: boolean } = {},
+  // FIX G: `noBaseCount` — this run's tally of `keep_no_base` verses (the
+  // ancestor aged past edit_log's 180-day sweep, so attribution was
+  // impossible and D1 was kept, same as before verseMerge.ts existed).
+  // Threaded through the same way `recordingFailed` is: the caller reads it
+  // off perResource[resource].merge_no_base (bookReimport.ts) and passes it
+  // here so the ONE place a human sees this table's story can say so.
+  opts: { recordingFailed?: boolean; noBaseCount?: number } = {},
 ): Promise<void> {
   const source = `verse_merge_conflict:${book}:${resource}`;
-  const rs = await env.DB.prepare(
-    `SELECT chapter, verse, action, reason, overwritten_version, alignment
-       FROM verse_merge_conflicts
-      WHERE book = ?1 AND resource = ?2 AND action IN ('adopt_conflict', 'keep_alignment_refused')
-      ORDER BY chapter ASC, verse ASC`,
-  )
-    .bind(book, resource)
-    .all<StoredConflictRow>();
+  // FIX E: this read must not be able to fail the whole reimport. It used to
+  // sit outside any try/catch, so a table-missing error (e.g. an unmigrated
+  // deploy) would propagate out of this best-effort alert helper and fail a
+  // user-triggered re-import after real work had already landed. Log and
+  // return — same fail-open discipline as every other D1 call in this file.
+  let rs: { results?: StoredConflictRow[] };
+  try {
+    rs = await env.DB.prepare(
+      `SELECT chapter, verse, action, reason, overwritten_version, alignment
+         FROM verse_merge_conflicts
+        WHERE book = ?1 AND resource = ?2 AND action IN ('adopt_conflict', 'keep_alignment_refused')
+        ORDER BY chapter ASC, verse ASC`,
+    )
+      .bind(book, resource)
+      .all<StoredConflictRow>();
+  } catch (e) {
+    console.error("verseMergeConflicts: alert read failed", {
+      book,
+      resource,
+      error: e instanceof Error ? e.message : String(e),
+    });
+    return;
+  }
   const rows: VerseMergeConflictRow[] = (rs.results ?? []).map((r) => {
     let alignment: VerseMergeConflictRow["alignment"] = null;
     if (r.alignment) {
@@ -218,7 +239,12 @@ export async function raiseVerseMergeConflictAlert(
   // treating "recording failed" the same as "nothing to report". Still write
   // the alert even when rows.length is 0 in this case: an undercounted 0 is
   // not the same claim as a genuinely clean run.
-  if (rows.length === 0 && !opts.recordingFailed) {
+  // FIX G: same reasoning for `noBaseCount` — a `keep_no_base` verse is
+  // counted but lives in no table row (nothing WAS adjudicated, so there is
+  // nothing to record) and appeared in no alert before this fix. Clearing
+  // the banner on a "0 conflict rows" run would erase the one place a human
+  // could learn that tonight's export will still overwrite those verses.
+  if (rows.length === 0 && !opts.recordingFailed && !opts.noBaseCount) {
     try {
       await env.DB.prepare(`DELETE FROM system_alerts WHERE username = ?1 AND source = ?2 AND dismissed_at IS NULL`)
         .bind(ALERT_USERNAME, source)
@@ -261,13 +287,33 @@ export async function raiseVerseMergeConflictAlert(
       ? "NOTE: at least one merge-conflict recording failed to write to verse_merge_conflicts this run " +
         "(see worker logs) — this table and count may be missing rows from tonight's sync."
       : "",
+    // FIX G: keep_no_base verses could not be adjudicated at all (their
+    // edit_log history aged past the 180-day retention sweep, so no ancestor
+    // is recoverable) — they behave exactly like the original 1CH bug: a
+    // Door43-side change to them is silently overwritten by tonight's
+    // export, with no per-verse row to point at because nothing was ever
+    // attributable.
+    opts.noBaseCount
+      ? `${opts.noBaseCount} verse(s) could not be adjudicated because their edit history has aged out (no ` +
+        `recoverable ancestor) — a Door43-side change to them will still be overwritten by tonight's export.`
+      : "",
   ]
     .filter(Boolean)
     .join(" ");
   const refsClause = rows.length > 0 ? ` Refs: ${refs}${more}.` : "";
+  // FIX I: this fires from both the nightly cron and the user-triggered
+  // POST /:book/reimport route (runReimport calls this too), so "Nightly
+  // sync" overclaimed the trigger on the latter — say "sync" without a
+  // schedule. It also used to assert "Door43 and the editor both changed"
+  // unconditionally, which is only true for the `both_changed` reason; a
+  // `keep_alignment_refused` row can carry reason `unparseable` (one side
+  // simply failed to parse — we don't know whether both sides changed) or
+  // `alignment_shrink` (master changed, D1 didn't). Drop the blanket claim;
+  // reasonBreakdown plus the per-outcome `guidance` below already say what
+  // was actually measured for each row.
   const message =
-    `Nightly sync flagged ${rows.length} verse(s) in ${book} ${resource.toUpperCase()} for review ` +
-    `(${reasonBreakdown}): Door43 and the editor both changed since our last export.${refsClause} ${guidance}`;
+    `Sync flagged ${rows.length} verse(s) in ${book} ${resource.toUpperCase()} for review ` +
+    `(${reasonBreakdown}).${refsClause} ${guidance}`;
   try {
     await env.DB.prepare(`DELETE FROM system_alerts WHERE username = ?1 AND source = ?2 AND dismissed_at IS NULL`)
       .bind(ALERT_USERNAME, source)

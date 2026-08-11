@@ -31,12 +31,19 @@
 // When no ancestor is recoverable at all, attribution is impossible and we
 // must keep D1 — the pre-existing, safe default.
 //
-// Refusing to adopt when doing so would cost alignment is comparatively cheap
-// here: the fallback on refusal is "flag this one verse for a human to look
-// at," never "freeze an entire book," unlike the export-time shrink guard at
-// export.ts:640 (usfmAlignmentShrinkRefused), which has held JER ULT out of
-// every nightly export since 2026-07-31 over a single word. A per-verse
-// refusal here costs one verse; it does not block anything else in the book.
+// FIX H: a per-verse refusal ("keep_alignment_refused") is NOT contained to
+// one verse — this comment previously claimed it "does not block anything
+// else in the book," which stopped being true once reimportSyncGate.ts's
+// SYSTEMIC_MERGE_REFUSAL_THRESHOLD (5) shipped. Once a (book, resource)
+// accumulates that many refusals in one run, bookReimport.ts withholds the
+// sync watermark for the WHOLE (book, resource), which makes
+// checkMasterFreshness (exportWorkflow.ts) report `master_ahead` and skip
+// that (book, resource) from every nightly export until a human resolves the
+// refusals — not just the flagged verses. See reimportSyncGate.ts's
+// "Systemic alignment-refusal gate" section for the full mechanism, and its
+// isSystemicMergeRefusal for the (now overridable — see below) threshold
+// check. Below that threshold, a refusal is still cheap: the fallback is
+// "flag this one verse for a human to look at," not "freeze the book."
 //
 // Pure (no D1) so it's regression-testable without a Workflow context — see
 // shrinkGuard.ts and reimportSyncGate.ts for the same pattern.
@@ -75,15 +82,138 @@ export interface VerseMergeResult {
 
 // Recursively sorts object keys so two content_json strings that differ only
 // by writer-dependent key order compare equal. Arrays keep their order —
-// order is semantic in verseObjects. Returns null when the input does not
-// parse; callers must treat null as never equal to anything, including
-// another null (two unparseable inputs are not "the same unparseable thing").
+// order is semantic in verseObjects. Also collapses whitespace runs in any
+// `text` property value (and trims it) — this is FOR COMPARISON ONLY; it never
+// touches the bytes we actually write on an adoption (buildVerseMerge's
+// callers pass the untouched `theirs` string through to storage).
+//
+// Why: `extract(render(x)) !== x` for a large fraction of real verses —
+// buildUsfm -> normalizeUsfmFormatting (export.ts) rewrites blank-line layout,
+// and re-parsing absorbs the changed blank lines into the verse's trailing
+// text node (e.g. `".”\n"` round-trips to `".”\n\n"`). Comparing `ours`
+// (D1's stored content_json) against `theirs` (master re-parsed) byte-for-byte
+// therefore reports "master moved" on ~17% of verses that never actually
+// changed — measured on docs/samples/en_ult_38-ZEC.usfm (37/225) and
+// en_ust_38-ZEC.usfm (42/225) — which silently rewrites the verse, bumps
+// `version`, and reopens the checkoff lanes (see laneReopen.ts), deleting a
+// checker's sign-off for a purely cosmetic non-change.
+//
+// This normalization is safe in every direction it feeds computeVerseMerge:
+// collapsing whitespace can only ever make two sides look MORE equal, never
+// less equal, so it can only ever move a comparison FROM "different" TOWARD
+// "equal" — it cannot manufacture a false match out of a genuine difference.
+// Walking through every comparison that reads stableKey's output:
+//   - step 1 (ours == theirs): a false positive here would silently keep D1
+//     when master actually changed — but the only way this comparison flips
+//     is a difference the ORIGINAL bytes carry that a whitespace-collapse
+//     erases, i.e. genuinely a whitespace-only difference, which is exactly
+//     the class this fix intends to treat as "no change".
+//   - step 3 (theirs == base): same reasoning — flips only on a
+//     whitespace-only difference between master and the ancestor, which
+//     means master didn't really move.
+//   - step 5 (ours == base), the `adopt` gate: this branch is only reached
+//     once step 3 has ALREADY established theirs != base (master genuinely
+//     changed). Normalizing can only make ours look MORE like base, so it can
+//     only REDUCE how often this branch is reached, never manufacture a new
+//     adoption that wasn't already eligible.
+// Net effect: adoptions caused purely by round-trip whitespace noise drop to
+// zero; nothing that was a real content change stops being adopted. The one
+// cost is that a genuinely whitespace-only edit on master is no longer
+// adopted — that is the pre-existing status quo (this module didn't exist
+// before), not a regression, and export.ts's normalizeUsfmFormatting already
+// emits the maintainer's preferred shape on our own renders (see PR
+// #417/#422), so formatting divergence is handled on the export side, not
+// here.
+function normalizeForCompare(value: unknown): unknown {
+  if (typeof value === "string") return value.replace(/\s+/g, " ").trim();
+  return value;
+}
+
+// Exported so callers outside this module's own comparison (e.g.
+// bookReimport.ts's Task 3 lane-reopen guard: don't delete a checker's
+// 'text' sign-off for an adoption that didn't actually change the verse's
+// plain text) can apply the IDENTICAL whitespace-insensitive rule this
+// module uses for content_json comparison, rather than maintaining a second
+// copy of the regex that could drift out of sync.
+export function collapseWhitespaceForCompare(value: string | null): string {
+  return value == null ? "" : value.replace(/\s+/g, " ").trim();
+}
+
+// FIX A follow-up (residual after the whitespace fix): export.ts's
+// recomputeTargetOccurrences renumbers a TARGET `\w` node's `occurrence` /
+// `occurrences` from document position every time buildUsfm runs. Measured on
+// a second render→reparse pass (5-pass convergence check, docs/samples ZEC):
+// this renumbering is one-shot churn, not oscillating — every affected verse
+// converges by pass 2 and stays converged. It still costs one spurious
+// `adopt` per affected verse (8/225 on the UST sample = ~3.6% of edited
+// verses): a real version bump, a real edit_log row, and (before FIX
+// Task 3) a real checkoff reopen, none of which reflect an actual change to
+// the verse. The root cause looks like a scope mismatch between two
+// occurrence-counting passes (extraction-time vs buildUsfm's per-verse
+// recompute) rather than an added/removed word — e.g. observed "the" going
+// occurrence 1/4 -> 1/5 with the exact same word nodes otherwise.
+//
+// Fix: for comparison ONLY, drop `occurrence` and `occurrences` from any
+// node shaped exactly like the TARGET word nodes recomputeTargetOccurrences
+// itself selects (`type === "word" && tag === "w"`) — the identical
+// selector, so this can never touch a `\zaln` milestone's own
+// occurrence/occurrences (the SOURCE-side instance identifier, which this
+// renumbering bug never touches and which must stay compared exactly).
+//
+// Why this is safe, same shape as the whitespace argument above: dropping a
+// field from the compared form can only make two sides look MORE equal,
+// never less — it can only REDUCE how often steps 1/3/5 conclude "different"
+// or "adopt", never manufacture a new match out of a genuine difference.
+// Concretely: if theirs actually added, removed, or reordered a word, the
+// node ARRAY differs (a node is missing/extra/moved), which this drop does
+// nothing to hide — JSON.stringify still sees a different array shape/length
+// regardless of what's inside each surviving node. The only way dropping
+// occurrence/occurrences can flip a comparison from "different" to "equal"
+// is when every node's type/tag/text/children (and every other node in the
+// tree) already matched and ONLY the numeric occurrence label differed —
+// which is exactly the renumbering artifact, never a real edit. (A
+// genuinely meaningful alignment change — e.g. re-pointing which occurrence
+// of a repeated word a `\zaln` milestone wraps — changes the MILESTONE's
+// own occurrence/occurrences, or its children, not the bare `\w` leaf this
+// drop is scoped to; that milestone-level data is untouched here.)
+//
+// IMPORTANT: this is scoped to the merge ATTRIBUTION decision only.
+// occurrence/occurrences remain semantically load-bearing everywhere else in
+// this codebase (they identify which instance of a repeated word an
+// alignment or a TWL/TN Occurrence column means, and Occurrence is a
+// hard-reject column on export — see occurrenceRule.ts) — an adoption's
+// WRITTEN bytes are still master's real `theirs` string, occurrence values
+// included, verbatim. Nothing here changes what gets stored, only whether a
+// pure renumbering artifact gets treated as "master moved."
+function dropOccurrenceForWordNodes(obj: Record<string, unknown>): Record<string, unknown> {
+  if (obj["type"] !== "word" || obj["tag"] !== "w") return obj;
+  const { occurrence: _occ, occurrences: _occs, ...rest } = obj;
+  return rest;
+}
+
+// Investigating Task 2's expected "adopt: 0 on both samples" turned up a
+// SECOND, distinct residual on the UST sample that is NOT the occurrence-
+// renumbering bug: a trailing marker's `nextChar` property (the whitespace
+// character usfm-js records as following a marker tag, e.g. a `\q1` right
+// before the next verse) round-trips as `"\n"` in one pass and `" "` in the
+// next — same "buildUsfm's blank-line reflow gets absorbed differently on
+// re-parse" root cause as FIX A's `text`-property fix, just landing on a
+// different key. Confirmed by a full node-by-node diff of UST 1:4: the ONLY
+// differing array element between ours/theirs is
+// `{"tag":"q1","nextChar":"\n"}` vs `{"tag":"q1","nextChar":" "}` — no
+// occurrence/occurrences involved at all. Folded in here under the exact
+// same whitespace-collapse treatment (and the exact same safety argument
+// above `normalizeForCompare`) rather than left unfixed, since leaving it
+// would contradict the "no remaining spurious adopts" goal for a cause that
+// is mechanically identical to the already-approved `text` fix.
 function sortKeysDeep(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(sortKeysDeep);
   if (value !== null && typeof value === "object") {
+    const obj = dropOccurrenceForWordNodes(value as Record<string, unknown>);
     const sorted: Record<string, unknown> = {};
-    for (const key of Object.keys(value as Record<string, unknown>).sort()) {
-      sorted[key] = sortKeysDeep((value as Record<string, unknown>)[key]);
+    for (const key of Object.keys(obj).sort()) {
+      sorted[key] =
+        key === "text" || key === "nextChar" ? normalizeForCompare(sortKeysDeep(obj[key])) : sortKeysDeep(obj[key]);
     }
     return sorted;
   }
@@ -152,9 +282,19 @@ export function computeVerseMerge(input: VerseMergeInput): VerseMergeResult {
   }
 
   // 5. Byte equality with the base is the strong proof our side did not move.
-  // humanEditedSinceExport is an independent belt closing a seconds-wide race
-  // between the export's D1 read and its commit: bytes can match the base
-  // while a human edit_log row still landed in that window.
+  // FIX D: humanEditedSinceExport does NOT close "a seconds-wide race between
+  // the export's D1 read and its commit" — that race is now closed by WHICH
+  // timestamp gets stamped as the watermark: exportWorkflow.ts's
+  // stampMasterConfirmed stamps buildResource's D1-read time, not the later
+  // commit time, so an edit landing in that gap is already dated after the
+  // watermark and is caught by the humanEditedSinceExport query itself
+  // (bookReimport.ts's `human_edit_after_export` sub-select, created_at >=
+  // the watermark). What this flag actually guards against is narrower: a
+  // human edit landing AFTER the watermark that happens to reconstruct
+  // byte-identical content to `base` (e.g. undo-then-redo, or two edits that
+  // cancel out) — byte equality alone would read that as "ours never moved"
+  // and adopt cleanly, when in fact a human touched this verse after the
+  // export and that touch deserves review, not a silent overwrite.
   if (keysEqual(oursKey, baseKey) && !humanEditedSinceExport) {
     return { action: "adopt", adopt: true, conflict: false, reason: "master_only" };
   }

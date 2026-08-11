@@ -2163,11 +2163,14 @@ function utf8Base64(s) {
 }
 
 // --- mechanicalOverwriteAlert: mechanical export overwriting master ---
-// "mechanical" means no human on our side edited this book+resource since
-// the last export. If such an export ALSO overwrites substantive content on
-// master, that content is necessarily someone else's out-of-band work (the
-// 2026-08-10 1CH incident this exists to catch). Purely observational — no
-// `block` field, never gates shipping.
+// "mechanical" means no HUMAN contributor was recorded for this book+resource
+// since the last export (contributorsFor filters e.source IS NULL) — but our
+// own AI-pipeline and reimport writes also carry no contributor, so this does
+// NOT by itself prove the overwrite is someone else's out-of-band work (see
+// FIX F / "Alert must only state a measured cause"). The reason string must
+// therefore state only what was measured (no human contributor + N
+// substantive diffs), not assert a cause. Purely observational — no `block`
+// field, never gates shipping.
 {
   const mkUsfm = (n, cls) => Array.from({ length: n }, (_, i) => ({ ref: `1:${i + 1}`, class: cls }));
   const mkTsv = (n, cls) => Array.from({ length: n }, (_, i) => ({ ref: `1:${i + 1}`, class: cls }));
@@ -2178,6 +2181,18 @@ function utf8Base64(s) {
     `mechanical export + substantive usfm entries -> alert fires`,
   );
   assert(mechanicalSubstantive.substantive === 3, `substantive count reflects the 3 substantive usfm entries`);
+  // FIX F: the reason must state only what was measured (no human
+  // contributor, N substantive diffs) — never assert a cause ("overwrites
+  // out-of-band work") that an AI-pipeline or reimport write could equally
+  // produce.
+  assert(
+    !mechanicalSubstantive.reason.includes("overwrite") && !mechanicalSubstantive.reason.includes("out-of-band"),
+    `reason does not assert an unmeasured cause`,
+  );
+  assert(
+    mechanicalSubstantive.reason.includes("undetermined"),
+    `reason states the cause is undetermined`,
+  );
 
   const mechanicalFormattingOnly = mechanicalOverwriteAlert(true, mkUsfm(5, "formatting"), []);
   assert(

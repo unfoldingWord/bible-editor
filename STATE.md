@@ -62,6 +62,28 @@ For the full corpus, see the memory index at
 `C:\Users\benja\.claude\projects\C--Users-benja-Documents-GitHub-bible-editor\memory\MEMORY.md`.
 Highlights that bite repeatedly:
 
+- **Our own USFM render does not round-trip, so "D1 differs from master" does NOT mean a
+  human changed anything.** Measured 2026-08-11 by running the real
+  `extractVersesForRange` → `buildUsfm` → `extractVersesForRange` over the checked-in ZEC
+  samples: **37 of 225 ULT verses and 42 of 225 UST (16–19%)** come back with a different
+  tree. Three causes, all ours: `normalizeUsfmFormatting` rewrites blank lines and
+  re-parsing absorbs them into the verse's trailing text node (`".”\n"` → `".”\n\n"`, and
+  the same on `nextChar`); `recomputeTargetOccurrences` renumbers word occurrences on the
+  second pass for verses with nested `\zaln` (a word going `1/4` → `1/5`); and text-node
+  tree shape shifts (a newline-only node appears before a trailing `\p`/`\q`; two adjacent
+  text nodes merge, `", "` + `"‘"` → `", ‘"`). Round trips are **convergent, not
+  oscillating** — a verse differs once and then stabilizes (verified over 5 passes).
+  **Any feature that compares stored content against a render — or against master, which is
+  a render we published — must normalize for this or it will act on phantom changes.** The
+  verse merge nearly shipped rewriting ~17% of edited verses nightly and deleting their
+  `text`-lane sign-offs on that basis. Its workaround is comparison-level only
+  (`sortKeysDeep` / `collapseWhitespaceForCompare` / `dropOccurrenceForWordNodes` in
+  `verseMerge.ts`) and is safe by construction: dropping a field from the compared form can
+  only make two sides look MORE equal, so it can only ever reduce writes, never manufacture
+  one — the bytes written stay verbatim. **That is a mask, not a fix**; the underlying
+  instability is still there, is probably implicated in the recurring export churn, and
+  those masks must not be removed until a round-trip-stability test passes.
+
 - **A two-way compare cannot tell you who moved, and guessing is how the nightly sync
   lost data for months.** D1-vs-master alone is symmetric: a difference proves *something*
   changed, never *which side*. The old sync resolved that ambiguity by assuming D1 was the

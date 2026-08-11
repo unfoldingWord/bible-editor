@@ -21,6 +21,7 @@ import {
   shouldRecordResourceSync,
   isSystemicMergeRefusal,
   SYSTEMIC_MERGE_REFUSAL_THRESHOLD,
+  mergeRefusalOverrideAllowed,
 } from "./reimportSyncGate.ts";
 
 let failed = 0;
@@ -214,6 +215,80 @@ eq(
   !shouldRecordResourceSync(counts({ chapters_locked: 1 })) || isSystemicMergeRefusal(SYSTEMIC_MERGE_REFUSAL_THRESHOLD),
   true,
   "both gates firing at once → still withhold (not double-negated into a stamp)",
+);
+
+console.log("\n[FIX H: isSystemicMergeRefusal override]");
+
+// The override, when true, forces the gate open regardless of count.
+eq(
+  isSystemicMergeRefusal(SYSTEMIC_MERGE_REFUSAL_THRESHOLD + 10, undefined, true),
+  false,
+  "override true → never systemic, even far past threshold",
+);
+eq(
+  isSystemicMergeRefusal(0, undefined, true),
+  false,
+  "override true with zero refusals → still not systemic (no-op override)",
+);
+// Absent/false override must never be coerced into a bypass.
+eq(
+  isSystemicMergeRefusal(SYSTEMIC_MERGE_REFUSAL_THRESHOLD),
+  true,
+  "no override arg at all → gate still fires at threshold",
+);
+eq(
+  isSystemicMergeRefusal(SYSTEMIC_MERGE_REFUSAL_THRESHOLD, undefined, false),
+  true,
+  "override explicitly false → gate still fires at threshold",
+);
+// A custom threshold and an override compose (override wins).
+eq(
+  isSystemicMergeRefusal(3, 3, true),
+  false,
+  "override wins over a custom threshold too",
+);
+
+console.log("\n[FIX H: mergeRefusalOverrideAllowed]");
+
+eq(
+  mergeRefusalOverrideAllowed({ allowMergeRefusal: true, book: "1CH", resource: "ult" }, 1, 1, "ult"),
+  true,
+  "1CH ult: explicit single book + resource + allowMergeRefusal → override permitted",
+);
+eq(
+  mergeRefusalOverrideAllowed({ allowMergeRefusal: true }, 66, 5, "ult"),
+  false,
+  "allowMergeRefusal with NO book/resource → refused (cannot blanket-disable the gate)",
+);
+eq(
+  mergeRefusalOverrideAllowed({ allowMergeRefusal: true, resource: "ult" }, 66, 1, "ult"),
+  false,
+  "allowMergeRefusal + resource but no book → refused",
+);
+eq(
+  mergeRefusalOverrideAllowed({ allowMergeRefusal: true, book: "1CH" }, 1, 5, "ult"),
+  false,
+  "allowMergeRefusal + book but no resource → refused (would cover every resource)",
+);
+eq(
+  mergeRefusalOverrideAllowed({ allowMergeRefusal: true, book: "1CH", resource: "ult" }, 1, 1, "ust"),
+  false,
+  "override for a DIFFERENT resource than the one being checked → refused, never leaks across resources",
+);
+eq(
+  mergeRefusalOverrideAllowed({ allowMergeRefusal: true, book: "1CH", resource: "ult" }, 2, 1, "ult"),
+  false,
+  "resolved book count > 1 → refused (widened resource/book must fail safe)",
+);
+eq(
+  mergeRefusalOverrideAllowed({ book: "1CH", resource: "ult" }, 1, 1, "ult"),
+  false,
+  "no allowMergeRefusal flag → refused (override is strictly opt-in)",
+);
+eq(
+  mergeRefusalOverrideAllowed({ allowMergeRefusal: false, book: "1CH", resource: "ult" }, 1, 1, "ult"),
+  false,
+  "allowMergeRefusal: false → refused",
 );
 
 if (failed > 0) {

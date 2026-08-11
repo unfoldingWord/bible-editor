@@ -8,7 +8,7 @@
 //
 // Not a test framework; failures are counted and reported, non-zero exit.
 
-import { computeVerseMerge } from "./verseMerge.ts";
+import { computeVerseMerge, collapseWhitespaceForCompare } from "./verseMerge.ts";
 
 let failed = 0;
 function eq(actual, expected, msg) {
@@ -203,6 +203,79 @@ console.log("\n[humanEditedSinceExport race belt]");
   eq(r.action, "adopt_conflict", "humanEditedSinceExport true, ours===base → adopt_conflict (race belt)");
   eq(r.conflict, true, "race belt: conflict true");
 }
+
+console.log("\n[whitespace-only text differences do not manufacture a false adopt]");
+
+// Regression for the FIX A defect: buildUsfm -> normalizeUsfmFormatting
+// rewrites blank-line layout, and re-parsing absorbs the change into the
+// verse's trailing text node (e.g. `".” "` round-trips to `".”\n\n"`). Before
+// the fix, `ours == base` (both untouched D1 content) but `theirs` (master
+// re-parsed) differed only by this trailing whitespace, so the merge wrongly
+// concluded "master moved" and produced `adopt` — silently rewriting the
+// verse and reopening its checkoff lanes for a purely cosmetic non-change.
+{
+  const ours = text(".” ");
+  const theirs = text(".”\n\n");
+  const r = computeVerseMerge({ base: ours, ours, theirs, humanEditedSinceExport: false });
+  eq(r.action, "keep_converged", "trailing-newline-only difference → keep_converged, not adopt");
+  eq(r.adopt, false, "whitespace-only difference must never adopt");
+}
+
+console.log("\n[occurrence/occurrences-only drift does not manufacture a false adopt]");
+
+// Regression for the residual FIX A found on the second render→reparse pass:
+// export.ts's recomputeTargetOccurrences renumbers a target `\w` node's
+// occurrence/occurrences from document position every time buildUsfm runs,
+// so the SAME words can carry different occurrence labels between D1's
+// stored content and a fresh render+reparse of it, with no real change to
+// the verse. Same words, same text, same order — only the numeric label
+// differs.
+{
+  const ours = content([w("the"), { type: "text", text: " " }, w("the")]);
+  // Same two "the" word nodes, but relabeled as if counted with one more
+  // instance somewhere else in the (simulated) larger scope.
+  const theirsRelabeled = JSON.stringify({
+    verseObjects: [
+      { type: "word", tag: "w", text: "the", occurrence: "2", occurrences: "5" },
+      { type: "text", text: " " },
+      { type: "word", tag: "w", text: "the", occurrence: "3", occurrences: "5" },
+    ],
+  });
+  const r = computeVerseMerge({ base: ours, ours, theirs: theirsRelabeled, humanEditedSinceExport: false });
+  eq(r.action, "keep_converged", "occurrence/occurrences-only relabeling → keep_converged, not adopt");
+  eq(r.adopt, false, "occurrence-only drift must never adopt");
+}
+
+// A genuine word-count change must still be caught: adding an extra "the"
+// changes the node ARRAY (an extra element), which occurrence-dropping does
+// nothing to hide — this must still register as a real difference.
+{
+  const ours = content([w("the")]);
+  const theirsExtraWord = content([w("the"), { type: "text", text: " " }, w("the")]);
+  const r = computeVerseMerge({ base: ours, ours, theirs: theirsExtraWord, humanEditedSinceExport: false });
+  eq(r.action, "adopt", "a genuinely added word is still a real difference → adopt, not converged");
+}
+
+console.log("\n[collapseWhitespaceForCompare — Task 3's lane-reopen guard input]");
+
+// bookReimport.ts's Task 3 guard (skip reopening the 'text' lane when an
+// adoption didn't actually change plain_text) compares beforePlainText vs
+// afterPlainText through this exact function — these cases are the direct
+// evidence backing that guard, since applyVerseRows itself has no D1-mock
+// test harness to exercise end-to-end.
+eq(collapseWhitespaceForCompare("hello  world"), "hello world", "collapses internal whitespace runs");
+eq(collapseWhitespaceForCompare("  hello world\n"), "hello world", "trims leading/trailing whitespace");
+eq(collapseWhitespaceForCompare(null), "", "null -> empty string (never crashes, never a fluke non-match)");
+eq(
+  collapseWhitespaceForCompare("Sword, awake\n") === collapseWhitespaceForCompare("Sword, awake "),
+  true,
+  "a trailing-newline-vs-trailing-space plain_text pair (the FIX A shape) compares EQUAL — the reopen guard must skip",
+);
+eq(
+  collapseWhitespaceForCompare("Sword, awake") === collapseWhitespaceForCompare("Sword awake"),
+  false,
+  "a genuine word-boundary change (comma removed) compares UNEQUAL — the reopen guard must still fire",
+);
 
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed`);

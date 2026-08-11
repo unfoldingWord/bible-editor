@@ -1034,7 +1034,7 @@ export function classifyRevertSeverity(
 // Whether THIS commitToDcs result is positive, freshly-measured proof that
 // Door43 master already holds our rendered content for this (book,
 // resource) — the trustworthy "last published to master" ancestor cutoff
-// verseMerge.ts's three-way merge needs (see migration 0044's
+// verseMerge.ts's three-way merge needs (see migration 0045's
 // master_confirmed_at header for the full rationale).
 //
 // `branchTouched === false` fires from exactly ONE place in commitToDcs:
@@ -1065,15 +1065,23 @@ export function isMasterConfirmed(commit: Pick<DcsCommitResult, "branchTouched">
   return commit.branchTouched === false;
 }
 
-// "mechanical" means nobody on OUR side edited this book+resource since the
-// last export (see MECHANICAL_CONTRIBUTOR above). So if a mechanical export
-// is ALSO overwriting substantive content on master (per usfmRevertReport /
-// tsvRevertReport), everything it overwrites is necessarily somebody else's
-// out-of-band work — there is no "our own hand-edit superseded" explanation
-// available the way there is on a human-contributed export. That is the
-// 2026-08-10 1CH incident: a maintainer's translationCore re-export landed on
-// master, and our mechanical export pushed 2,436 lines over it on a branch
-// whose own name asserted no human was involved.
+// "mechanical" means no HUMAN on our side edited this book+resource since the
+// last export (see MECHANICAL_CONTRIBUTOR above and contributorsFor's
+// `e.source IS NULL` filter). That does NOT mean nobody on our side wrote to
+// it — the AI pipeline (source='ai_pipeline') and the nightly reimport itself
+// (source='dcs_reimport') both write verses with no contributor recorded, so
+// a mechanical export pushing our OWN AI-authored or reimport-reconciled
+// content is indistinguishable from one pushing over a stranger's hand-edit.
+// This alert can therefore only state what it actually measured: no human
+// contributor was recorded, and N rows differ substantively from master. It
+// must NOT assert the cause — this repo has a standing lesson (see
+// "Absent measurement ≠ evidence" / "Alert must only state a measured
+// cause") that a self-inflicted defect (this file's own class of finding)
+// is exactly a claim manufactured from what was NOT checked. The
+// 2026-08-10 1CH incident that first motivated this alert is a real example
+// of the "somebody else's out-of-band work" case, but it is not the only
+// explanation this predicate's inputs can produce, so it must not be stated
+// as settled.
 //
 // This is purely observational, same as classifyRevertSeverity: no `block`
 // field, and it must never be used to gate shipping. Formatting/tags_only/
@@ -1089,8 +1097,10 @@ export function mechanicalOverwriteAlert(
     tsvEntries.filter((e) => e.class === "substantive").length;
   const alert = mechanical && substantive > 0;
   const reason = alert
-    ? `${substantive} verse${substantive === 1 ? "" : "s"} changed on a mechanical export (no human edited this ` +
-      `book+resource since the last export), so those changes overwrite out-of-band work on master.`
+    ? `${substantive} verse${substantive === 1 ? "" : "s"} changed on a mechanical export (no HUMAN contributor was ` +
+      `recorded for this book+resource since the last export) and differ substantively from master. The cause is ` +
+      `undetermined: our own AI-pipeline or reimport writes would also present this way (zero recorded ` +
+      `contributors), so this is not necessarily somebody else's edit on master.`
     : `not_alerting_mechanical_${mechanical}_substantive_${substantive}`;
   return { alert, substantive, reason };
 }

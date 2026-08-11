@@ -80,6 +80,7 @@ import { hardRejectRows } from "./hardRejectGuard";
 import { validateUsfm, summarizeUsfmIssues } from "./usfmValidate";
 import type { UsfmValidationIssue } from "./usfmValidate";
 import { shrinkOverrideAllowed } from "./shrinkGuard";
+import { mergeRefusalOverrideAllowed } from "./reimportSyncGate";
 
 export interface ExportParams {
   // Restrict the run to one book. Useful for manual /api/exports/run.
@@ -107,6 +108,14 @@ export interface ExportParams {
   // honored for a single explicitly-named book AND resource — a run that omits
   // either (every cron path) can never disable the guard wholesale.
   allowShrink?: boolean;
+  // FIX H: human override for the systemic-merge-refusal gate
+  // (reimportSyncGate.ts's isSystemicMergeRefusal). A refusal is otherwise
+  // unresolvable through the app: saving the flagged verse doesn't make D1
+  // equal master, so the next sync recomputes the same refusal and the
+  // withheld watermark (and the export skip it causes) persists forever.
+  // Same narrow gating as allowShrink: only honored for a single explicitly-
+  // named book AND resource, via mergeRefusalOverrideAllowed.
+  allowMergeRefusal?: boolean;
 }
 
 export interface StepResult {
@@ -164,6 +173,17 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       console.log("export: allowShrink ignored — requires an explicit single book + resource");
     }
 
+    // FIX H: same narrow gating for the systemic-merge-refusal override —
+    // only a run naming exactly one book and one resource may bypass it, and
+    // only for that named resource (mergeRefusalOverrideAllowed checks
+    // params.resource itself, not just the count).
+    const mergeRefusalOverride = params.resource
+      ? mergeRefusalOverrideAllowed(params, books.length, resources.length, params.resource)
+      : false;
+    if (params.allowMergeRefusal === true && !mergeRefusalOverride) {
+      console.log("export: allowMergeRefusal ignored — requires an explicit single book + resource");
+    }
+
     // 1b. Sync D1 from current master before rendering. Pulls out-of-band master
     //     edits (other tooling, manual USFM cleanup, the bp-assistant bot) into
     //     D1's *pristine* rows so the export doesn't silently revert them on the
@@ -181,7 +201,9 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
           // Chunked + SHA-gated + diff-aware reimport — steps through chapters so
           // a large book can't blow the 10-min step limit, and skips files whose
           // DCS commit SHA is unchanged. See bookReimport.ts:runChunkedReimport.
-          await runChunkedReimport(this.env, step, book, instanceId, [...REIMPORT_RESOURCES], {});
+          await runChunkedReimport(this.env, step, book, instanceId, [...REIMPORT_RESOURCES], {
+            mergeRefusalOverrideResource: mergeRefusalOverride ? (params.resource as Resource) : undefined,
+          });
         } catch (e) {
           // Lock contention / transient DCS failure / Cloudflare subrequest cap:
           // this book's D1 is now possibly stale relative to master. The
@@ -786,11 +808,14 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       dcsCommitSha = commit.commitSha || null;
       dcsChanged = commit.changed;
 
-      // Stamp the master-confirmed watermark (0044's master_confirmed_at) —
+      // Stamp the master-confirmed watermark (0045's master_confirmed_at) —
       // see export.ts's isMasterConfirmed for exactly which commitToDcs
       // outcome this is and why the other one must not qualify.
       if (isMasterConfirmed(commit)) {
-        await this.stampMasterConfirmed(book, resource);
+        // FIX D: stamp the timestamp D1 was actually READ (built.readAt),
+        // not "now" — see buildResource's readAt comment for the race this
+        // closes.
+        await this.stampMasterConfirmed(book, resource, built.readAt);
       }
 
       // Export-revert report (observational only — see the "Export-revert
@@ -935,7 +960,22 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
   private async buildResource(
     book: string,
     resource: Resource,
-  ): Promise<{ content: string; rowCount: number; sortOrderUpdates: Array<{ id: string; sort_order: number }> }> {
+  ): Promise<{
+    content: string;
+    rowCount: number;
+    sortOrderUpdates: Array<{ id: string; sort_order: number }>;
+    // FIX D: the instant D1 was actually read for this render, captured
+    // BEFORE any of the awaits below. This is the timestamp that must be
+    // stamped as book_resource_syncs.master_confirmed_at — see exportOne's
+    // stampMasterConfirmed call — not the time of the eventual DCS commit,
+    // several network round trips later. An edit landing in that gap is
+    // dated AFTER this readAt, so verseMerge.ts's humanEditedSinceExport
+    // check correctly sees it as having happened since this export, instead
+    // of (with the old commit-time stamp) falsely predating it and becoming
+    // tomorrow's ancestor — the race this fix closes.
+    readAt: number;
+  }> {
+    const readAt = Math.floor(Date.now() / 1000);
     const db = this.env.DB;
     if (resource === "tn") {
       // trashed_at IS NULL excludes notes pending deletion. The nightly cron
@@ -949,7 +989,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
         )
         .bind(book)
         .all<TnRow>();
-      return { content: rs.results.length === 0 ? "" : buildTnTsv(rs.results), rowCount: rs.results.length, sortOrderUpdates: [] };
+      return { content: rs.results.length === 0 ? "" : buildTnTsv(rs.results), rowCount: rs.results.length, sortOrderUpdates: [], readAt };
     }
     if (resource === "tq") {
       const rs = await db
@@ -959,7 +999,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
         )
         .bind(book)
         .all<TqRow>();
-      return { content: rs.results.length === 0 ? "" : buildTqTsv(rs.results), rowCount: rs.results.length, sortOrderUpdates: [] };
+      return { content: rs.results.length === 0 ? "" : buildTqTsv(rs.results), rowCount: rs.results.length, sortOrderUpdates: [], readAt };
     }
     if (resource === "twl") {
       const rs = await db
@@ -977,7 +1017,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
         .bind(book, "ULT")
         .all<VerseRow>();
       if (rs.results.length === 0) {
-        return { content: "", rowCount: 0, sortOrderUpdates: [] };
+        return { content: "", rowCount: 0, sortOrderUpdates: [], readAt };
       }
       // Independent reads; object-literal properties evaluate in order, so
       // awaiting them inline would serialize two D1 round-trips per book.
@@ -997,6 +1037,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
         content: result.tsv,
         rowCount: rs.results.length,
         sortOrderUpdates: result.sortOrderUpdates,
+        readAt,
       };
     }
     // ult / ust
@@ -1008,7 +1049,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       )
       .bind(book, bibleVersion)
       .all<VerseRow>();
-    if (rs.results.length === 0) return { content: "", rowCount: 0, sortOrderUpdates: [] };
+    if (rs.results.length === 0) return { content: "", rowCount: 0, sortOrderUpdates: [], readAt };
     const headersRow = await db
       .prepare(`SELECT headers_json FROM book_usfm_meta WHERE book = ?1 AND bible_version = ?2`)
       .bind(book, bibleVersion)
@@ -1036,6 +1077,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       content: buildUsfm({ book, bibleVersion, headers, verses: rs.results }),
       rowCount: rs.results.length,
       sortOrderUpdates: [],
+      readAt,
     };
   }
 
@@ -1696,7 +1738,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
   // unreadable), which must NOT clear yesterday's real findings. Callers are
   // responsible for only invoking this when master was readable AND the
   // report came back with 0 entries.
-  // Stamp book_resource_syncs.master_confirmed_at (migration 0044) for a
+  // Stamp book_resource_syncs.master_confirmed_at (migration 0045) for a
   // (book, resource) that isMasterConfirmed just certified. UPDATE-only,
   // deliberately never INSERT: a brand-new row would need an `origin` value
   // (book_resource_syncs.origin is NOT NULL with no default — see 0028) and
@@ -1710,13 +1752,24 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
   // the same fail-closed default this table already relies on elsewhere
   // ("a missing row means never skip"). Best-effort: never let a failure or
   // no-op here fail the export.
-  private async stampMasterConfirmed(book: string, resource: Resource): Promise<void> {
+  //
+  // FIX D: `readAt` is the timestamp buildResource actually read D1 at
+  // (captured before its first query), NOT the time this method runs. The
+  // old code stamped `unixepoch()` here — several network round trips (the
+  // DCS commit itself) after the read — so a human edit landing in that gap
+  // was dated BEFORE the watermark it should have been dated after, making
+  // it look like part of the ancestor and silently reverting it on a later
+  // night. Stamping the read-time timestamp instead closes that race at its
+  // source, rather than relying solely on the humanEditedSinceExport belt in
+  // verseMerge.ts (see that file's corrected comment on what the belt
+  // actually covers now).
+  private async stampMasterConfirmed(book: string, resource: Resource, readAt: number): Promise<void> {
     try {
       const result = await this.env.DB.prepare(
-        `UPDATE book_resource_syncs SET master_confirmed_at = unixepoch()
+        `UPDATE book_resource_syncs SET master_confirmed_at = ?3
          WHERE book = ?1 AND resource = ?2`,
       )
-        .bind(book, resource)
+        .bind(book, resource, readAt)
         .run();
       if ((result.meta?.changes ?? 0) === 0) {
         console.log(
@@ -1801,14 +1854,17 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       "warning",
     );
 
-    // Second, distinct alert: "mechanical" means nobody on our side edited
-    // this book+resource since the last export, so any substantive revert it
-    // makes is necessarily out-of-band work by someone else (e.g. a
-    // maintainer's hand-edit or a translationCore re-export on master) — see
-    // mechanicalOverwriteAlert's comment in export.ts for the 2026-08-10 1CH
-    // incident this exists to catch. Distinct `source` so it never collides
-    // with or overwrites the export_revert alert above. Best-effort, same as
-    // every other alert in this file — never allowed to fail the export.
+    // Second, distinct alert: "mechanical" means no HUMAN contributor was
+    // recorded for this book+resource since the last export (contributorsFor
+    // filters to `source IS NULL`) — but our own AI pipeline and reimport
+    // writes also carry no contributor, so this does NOT by itself mean the
+    // revert is someone else's out-of-band work; see mechanicalOverwriteAlert's
+    // comment in export.ts for the measured-vs-asserted distinction and the
+    // 2026-08-10 1CH incident that first motivated this alert (one real
+    // example of the out-of-band case, not proof every mechanical revert is
+    // one). Distinct `source` so it never collides with or overwrites the
+    // export_revert alert above. Best-effort, same as every other alert in
+    // this file — never allowed to fail the export.
     try {
       const mechAlert =
         kind === "usfm"
