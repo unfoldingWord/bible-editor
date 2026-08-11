@@ -459,12 +459,17 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     // Book-lock gate. A locked book (published in PUBLISHED_RELEASE_TAG, or
     // explicitly frozen via book_locks) is withheld from Door43 entirely —
     // this is the export-side half of the app's book-lock feature (bookLock.ts
-    // also blocks in-app edits). Only meaningful when we'd actually commit
-    // (dcsAllowed); a dry run renders to R2 only and can't push anything live,
-    // so there's nothing for the lock to protect. `allowLocked` is the human
-    // escape hatch for a deliberate fix to a frozen book, resolved above and
-    // already scoped to exactly one named (book, resource).
-    if (dcsAllowed && !allowLocked && lockedBooks.has(book)) {
+    // also blocks in-app edits). NOT gated on `dcsAllowed`: below this point,
+    // buildResource for a twl book can call applyTwlSortOrderUpdates, which
+    // writes `twl_rows.sort_order` straight to D1 regardless of whether DCS
+    // push is enabled. "Frozen" must mean no D1 write either, not just no
+    // Door43 push, so a dry run (dryDcs / no service token) still has to skip
+    // a locked book here — it is not true that "a dry run renders to R2 only
+    // and can't push anything live," because it can still mutate D1 before it
+    // ever gets to the R2/DCS steps. `allowLocked` is the human escape hatch
+    // for a deliberate fix to a frozen book, resolved above and already
+    // scoped to exactly one named (book, resource).
+    if (!allowLocked && lockedBooks.has(book)) {
       // rowCount: 0 here means "never rendered" (we bail before buildResource),
       // NOT "no rows" — the skip reason below carries the actual truth.
       //
@@ -2241,10 +2246,12 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     // master-targeted release would go completely unnoticed while the
     // hardcoded PUBLISHED_BOOKS constant quietly went stale.
     const masterStableFindings: string[] = [];
+    let reposRead = 0; // count of repos whose /releases fetch actually succeeded
     for (const resource of ALL_RESOURCES) {
       const repo = RESOURCE_TARGETS[resource].repo;
       const releases = await this.fetchDcsReleases(owner, repo);
       if (!releases) continue; // failed read — not evidence of anything, just skip this repo
+      reposRead++;
       const masterStable = masterTargetedStableRelease(releases);
       if (masterStable?.tag_name) {
         masterStableFindings.push(`${repo}@${masterStable.tag_name}`);
@@ -2254,6 +2261,28 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       const names = await this.fetchDcsContentsNames(owner, repo, latest.tag_name);
       if (!names) continue;
       for (const b of publishedBooksFromEntries(names, candidateBooks, resource)) union.add(b);
+    }
+    if (!releaseSetUsable(union)) {
+      // A short listing is a failed/partial read, not evidence of "few books
+      // published" — same principle as shrinkGuard's truncated-fetch policy.
+      // console.log only; no alert, since we have nothing trustworthy to say.
+      //
+      // Bail out here, BEFORE touching either alert. This method previously
+      // raised/cleared export_published_master_stable unconditionally, ahead
+      // of this gate — so an outage that failed every /releases fetch (all
+      // `continue`d, masterStableFindings stays empty) would DELETE a real,
+      // undismissed master-stable alert on the strength of zero measurement.
+      // Per this repo's "absent measurement must not overwrite evidence"
+      // rule, an inconclusive run must leave both export_published_* alerts
+      // exactly as it found them. reposRead (successful /releases fetches)
+      // is threaded through for the same reason even though releaseSetUsable
+      // already gates this: it is the more precise signal if this method is
+      // ever restructured to raise/clear per-alert instead of bailing whole.
+      console.log("export: published-drift-check inconclusive — live release set too small to trust", {
+        size: union.size,
+        reposRead,
+      });
+      return { status: "inconclusive" };
     }
     if (masterStableFindings.length > 0) {
       await this.writeAlert(
@@ -2271,15 +2300,6 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       )
         .bind(EXPORT_ALERT_USERNAME, "export_published_master_stable")
         .run();
-    }
-    if (!releaseSetUsable(union)) {
-      // A short listing is a failed/partial read, not evidence of "few books
-      // published" — same principle as shrinkGuard's truncated-fetch policy.
-      // console.log only; no alert, since we have nothing trustworthy to say.
-      console.log("export: published-drift-check inconclusive — live release set too small to trust", {
-        size: union.size,
-      });
-      return { status: "inconclusive" };
     }
     const drift = describePublishedDrift(PUBLISHED_BOOKS, union);
     if (drift == null) {

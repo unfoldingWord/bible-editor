@@ -1,7 +1,11 @@
 # Book locks
 
 A **locked** book is frozen. Nobody can edit it in bible-editor, and the nightly
-export never pushes it to Door43. Two things can lock a book:
+export never *starts a new push* to Door43. That does not, by itself, stop a
+push already in flight: locking a book does not close or stop the merge of a
+`-be-` PR that a previous night's export already opened, and Door43's merge
+bot lands open PRs on its own schedule regardless of the lock (see "What a
+lock does and does not stop" and Known gaps below). Two things can lock a book:
 
 - **Published** — the book is part of unfoldingWord's newest release. Locked
   automatically, no database row needed.
@@ -19,7 +23,7 @@ Only three people may lock or unlock: `deferredreward` (Benjamin), `richmahn`
 | The done / lane QA checkboxes | Review comment threads — a finished book can still be discussed |
 | Starting a new AI pipeline run, resuming a paused one, and dispatching a run that was still queued when the lock landed | The nightly DCS→D1 reimport (Door43 → local only; keeps the local copy honest) |
 | Book import and reimport from Door43 | An AI job's auto-apply while it is already in flight when the lock lands |
-| The nightly Door43 export, all five resources | |
+| The nightly Door43 export starting a NEW push, all five resources | A `-be-` PR that was already open before the lock landed — the lock stops new pushes, not Door43's own merge bot, which keeps landing already-open PRs on its own schedule |
 
 Deliberate omission: **review comments stay open.** Freezing a book should stop
 people changing it, not stop them talking about it.
@@ -28,9 +32,11 @@ Enforcement is server-side. Any blocked write returns **HTTP 423** with
 `{"error":"book_locked", "book", "reason", "source"}` — but only once the request
 reaches the route's own auth check. The lock-guard middleware itself runs before
 route auth and defers to it for an unauthenticated caller, so an anonymous
-request still gets the normal 401, not a 423 that would leak lock state before
-proving who's asking. The client also flips into read-only mode for a locked
-book, but that is a courtesy — the API is the authority.
+write request still gets the normal 401, not a 423. This is a layering choice,
+not secrecy: lock state is not confidential — `GET /api/books` has no auth
+middleware at all and already returns `locked`/`lockReason`/`lockSource` for
+every book to anyone who asks. The client also flips into read-only mode for a
+locked book, but that is a courtesy — the API is the authority.
 
 ## Why 423 and not 409
 
@@ -154,6 +160,21 @@ isLocked(book) = row exists ? row.locked === 1 : PUBLISHED_BOOKS.has(book)
 
 ## Known gaps
 
+- **Locking a book does not stop a `-be-` PR that is already open.** The gate
+  stops the export from *opening a new* push; it has no power over a branch +
+  PR a previous export already pushed. Door43's merge bot lands open PRs on
+  its own schedule, independent of book_locks. So a lock landing after last
+  night's export, but before that PR merges, does not prevent the merge. (As
+  of 2026-08-10 there were zero open PRs in all five resource repos, so this
+  is currently latent — see the release runbook above for the same caveat in
+  the "new release ships" context.)
+- If a lock lands while a translator already has the alignment panel open,
+  in-progress drag-and-drop work can be lost silently: a drag has no
+  failed-op row the way a text-edit op does, so there is nothing in the sync
+  panel to show the user their change didn't land. The client-side fix
+  (detecting the lock and disabling/warning the open aligner) is being
+  addressed separately on the web side; this doc is noting the gap honestly
+  rather than claiming it's covered.
 - An edit **queued before** the client knows the book is locked parks in the
   failed-ops drawer showing the raw text `http 423` rather than a friendly
   message. Once the client *does* know (read-only mode has kicked in), the
@@ -169,10 +190,14 @@ isLocked(book) = row exists ? row.locked === 1 : PUBLISHED_BOOKS.has(book)
   refused for a locked book. A job's auto-apply while it is **already in
   flight** (`pollPipelineJob` → `importJobOutput`) is a deliberate exemption,
   not a gap — stopping mid-apply risks stranding a job or interacting badly
-  with the delete-then-insert sequence inside `importJobOutput`. A job that
-  stays queued because its book never unlocks sits in the queue indefinitely;
-  that is visible (its queue position never advances) and recoverable
-  (unlocking dispatches it on the next tick).
+  with the delete-then-insert sequence inside `importJobOutput`. `dispatchNext`
+  excludes a locked book's queued job from the claim SELECT itself (rather
+  than claiming it and requeuing), specifically so this only stalls that
+  job's own progress and never wedges the global single-slot queue for other
+  books — a job that stays queued because its book never unlocks sits in the
+  queue indefinitely, which is visible (its queue position never advances)
+  and recoverable (unlocking dispatches it on the next tick), but every other
+  book's queued job keeps dispatching normally in the meantime.
 - `alignment_attention` and `export_reverts` rows for a locked book freeze at
   their last measured values. They are deliberately **not** cleared: an empty
   result would read as "measured and clean", which would be a false claim.

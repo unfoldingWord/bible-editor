@@ -150,10 +150,15 @@ function fakeEnv({
         if (/SELECT state FROM pipeline_jobs WHERE job_id = \?1/.test(sql)) {
           return { bind: () => ({ first: async () => ({ state: rereadState }) }) };
         }
-        // Anything else (dispatchNext's claim/select/fail queries, the poll
-        // path's resume-budget reset, etc.) — inert, but still logged above so
-        // callers can assert on *which* queries were prepared.
+        // Anything else (dispatchNext's locked-books lookup/claim/select/fail
+        // queries, the poll path's resume-budget reset, etc.) — inert, but
+        // still logged above so callers can assert on *which* queries were
+        // prepared. `.all` is exposed at both the top level (dispatchNext's
+        // queued-books lookup has no placeholders, so it calls `.all()` with
+        // no `.bind()` in between) and after `.bind()` (every other no-op
+        // caller).
         return {
+          all: async () => ({ results: [] }),
           bind: () => ({
             run: async () => ({ meta: { changes: 0 } }),
             first: async () => null,
@@ -180,6 +185,15 @@ function fakeDispatchEnv({ promoteChanges = 1, username = "translator" } = {}) {
           return {
             bind: () => ({ first: async () => (username ? { dcs_username: username } : null) }),
           };
+        }
+        // dispatchNext's pre-claim lookup of currently-queued books (FIX 1:
+        // excludes locked books' jobs from the claim SELECT). No placeholders
+        // — dispatchNext calls `.all()` directly, no `.bind()` in between —
+        // so `.all` must be exposed at the top level, same shape as the
+        // no-bind `.first()` case below. Empty queue is fine for these
+        // dispatch tests: none of them exercise book-lock exclusion.
+        if (/SELECT DISTINCT book FROM pipeline_jobs WHERE state = 'queued'/.test(sql)) {
+          return { all: async () => ({ results: [] }) };
         }
         // dispatchNext's claim UPDATE — always "succeeds" so the function
         // proceeds to the SELECT below.
@@ -256,14 +270,18 @@ function fakePollEnv({ pollChanges = 1, username = "translator", liveState } = {
         if (/UPDATE pipeline_jobs SET\s*\n\s*state = \?2,[\s\S]*last_polled_at = unixepoch\(\)/.test(sql)) {
           return { bind: () => ({ run: async () => ({ meta: { changes: pollChanges } }) }) };
         }
-        // dispatchNext's claim query and everything else — inert. This also
-        // covers importJobOutput's claim UPDATE (`SET import_claimed_at =
-        // unixepoch()... RETURNING import_claimed_at`): its meta.changes
-        // comes back 0, so if the guard test below fails to skip the import,
-        // importJobOutput reports claimLost rather than throwing — the query
-        // still gets recorded in env.queries either way, which is what the
-        // guard tests assert on.
+        // dispatchNext's pre-claim locked-books lookup (FIX 1) and everything
+        // else — inert. This also covers importJobOutput's claim UPDATE (`SET
+        // import_claimed_at = unixepoch()... RETURNING import_claimed_at`):
+        // its meta.changes comes back 0, so if the guard test below fails to
+        // skip the import, importJobOutput reports claimLost rather than
+        // throwing — the query still gets recorded in env.queries either
+        // way, which is what the guard tests assert on. `.all` is exposed at
+        // both the top level (dispatchNext's queued-books lookup has no
+        // placeholders, so it calls `.all()` with no `.bind()` in between)
+        // and after `.bind()` (every other no-op caller).
         return {
+          all: async () => ({ results: [] }),
           bind: () => ({
             run: async () => ({ meta: { changes: 0 } }),
             first: async () => null,

@@ -64,14 +64,17 @@ export const bookLockGuard: MiddlewareHandler = async (c, next) => {
   // tell us which book it's writing, we must not break it — let it through.
   if (!book) return next();
 
-  // This guard runs before route-level auth (requireAuth / requireEditor), so
-  // an unauthenticated caller must not learn lock state or trigger a D1 read
-  // here — that belongs to the route's own auth check, which will produce
-  // the correct 401/403. Skipping the lock check for an anonymous caller
-  // cannot open a hole: every book-scoped write route already requires an
-  // editor, so an anonymous request still ends in a rejection — just the
-  // right one, from the right layer, instead of a 423 that leaks lock state
-  // to someone who was never going to be allowed to write anyway.
+  // This guard runs before route-level auth (requireAuth / requireEditor).
+  // Skipping the lock check for an anonymous caller here is not about
+  // secrecy — lock state is not a secret; `GET /api/books` returns
+  // `locked`/`lockReason`/`lockSource` for every book with no auth
+  // middleware at all (see bookImport.ts), so it is already anonymously
+  // readable. The real reason is layering: this guard has no way to know
+  // whether the route ahead of it would even authorize the caller, so
+  // answering here (423, or anything else) would preempt the route's own
+  // auth check. Deferring lets every book-scoped write route's existing
+  // requireEditor produce the correct 401/403 for an anonymous caller — this
+  // guard only needs to run at all once we know a caller is authenticated.
   if (!currentUserId(c)) return next();
 
   const lock = await effectiveBookLock(c.env as Env, book.toUpperCase());

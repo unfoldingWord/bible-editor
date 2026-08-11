@@ -400,6 +400,7 @@ export function App() {
           isViewer={isViewer}
           initialCommentId={loc.commentId}
           onCommentConsumed={handleCommentConsumed}
+          authReady={auth.kind === "ready"}
         />
       </Box>
       <Snackbar

@@ -23,20 +23,26 @@ import {
 } from "@mui/material";
 import LockIcon from "@mui/icons-material/Lock";
 import LockOpenIcon from "@mui/icons-material/LockOpen";
-import { ApiError, api } from "../sync/api";
+import HelpOutlineIcon from "@mui/icons-material/HelpOutline";
+import { ApiError, api, type BookListEntry } from "../sync/api";
 import { BOOKS } from "../lib/bookNames";
-import { useBookLocks } from "../hooks/useBookLocks";
 
 interface Props {
   open: boolean;
   onClose: () => void;
   onChanged?: () => void;
+  // Book list + admin flag now come from Shell's single `useBookLocks`
+  // instance instead of a second one here — two live instances each
+  // refetching on window focus meant every focus fired GET /api/books
+  // twice. `refresh` still re-pulls after a lock/unlock mutation.
+  books: BookListEntry[];
+  canManageLocks: boolean;
+  refresh: () => void;
 }
 
 const NOT_ADMIN_MESSAGE = "Only Benjamin, Rich, or Perry can change book locks.";
 
-export function BookLocksDialog({ open, onClose, onChanged }: Props) {
-  const { books, canManageLocks, refresh } = useBookLocks();
+export function BookLocksDialog({ open, onClose, onChanged, books, canManageLocks, refresh }: Props) {
   const [pending, setPending] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -97,8 +103,21 @@ export function BookLocksDialog({ open, onClose, onChanged }: Props) {
         <List dense sx={{ maxHeight: 420, overflowY: "auto" }}>
           {BOOKS.map(({ code, name }) => {
             const entry = byCode.get(code);
+            // GET /api/books only lists IMPORTED books (see bookImport.ts),
+            // so a book with no `entry` has never been imported. The server
+            // still enforces a lock on it if it's on the published list
+            // (bookLock.ts checks isPublishedBook regardless of import
+            // status), but that published-books list is server-side only —
+            // duplicating it here would risk drifting out of sync. Rather
+            // than guess "unlocked" (false — a published-but-unimported book
+            // would show an open padlock while the server 423s it) or guess
+            // "locked" (also potentially false, for an unpublished book),
+            // render "not imported" as its own state: honest about what we
+            // don't know, and the toggle is disabled so nobody can write a
+            // redundant explicit lock row on unverified information.
+            const notImported = !entry;
             const locked = entry?.locked ?? false;
-            const disabled = !canManageLocks || pending === code;
+            const disabled = notImported || !canManageLocks || pending === code;
             const control = (
               <IconButton
                 edge="end"
@@ -107,17 +126,26 @@ export function BookLocksDialog({ open, onClose, onChanged }: Props) {
                 onClick={() => toggle(code, locked)}
                 aria-label={locked ? `unlock ${name}` : `lock ${name}`}
               >
-                {locked ? <LockIcon fontSize="small" /> : <LockOpenIcon fontSize="small" />}
+                {notImported ? (
+                  <HelpOutlineIcon fontSize="small" />
+                ) : locked ? (
+                  <LockIcon fontSize="small" />
+                ) : (
+                  <LockOpenIcon fontSize="small" />
+                )}
               </IconButton>
             );
+            const tooltipTitle = notImported
+              ? "Not imported yet — lock state unknown here"
+              : NOT_ADMIN_MESSAGE;
             return (
               <ListItem
                 key={code}
                 secondaryAction={
-                  canManageLocks ? (
+                  canManageLocks && !notImported ? (
                     control
                   ) : (
-                    <Tooltip title={NOT_ADMIN_MESSAGE}>
+                    <Tooltip title={tooltipTitle}>
                       <span>{control}</span>
                     </Tooltip>
                   )
@@ -126,18 +154,27 @@ export function BookLocksDialog({ open, onClose, onChanged }: Props) {
                 <ListItemText
                   primary={
                     <Box sx={{ display: "flex", alignItems: "center", gap: 1 }}>
-                      <Typography variant="body2">{name}</Typography>
-                      {locked && (
-                        <Chip
-                          size="small"
-                          label={entry?.lockSource === "published" ? "published" : "locked"}
-                          color={entry?.lockSource === "published" ? "primary" : "default"}
-                          variant="outlined"
-                        />
+                      <Typography
+                        variant="body2"
+                        color={notImported ? "text.disabled" : "text.primary"}
+                      >
+                        {name}
+                      </Typography>
+                      {notImported ? (
+                        <Chip size="small" label="not imported" variant="outlined" />
+                      ) : (
+                        locked && (
+                          <Chip
+                            size="small"
+                            label={entry?.lockSource === "published" ? "published" : "locked"}
+                            color={entry?.lockSource === "published" ? "primary" : "default"}
+                            variant="outlined"
+                          />
+                        )
                       )}
                     </Box>
                   }
-                  secondary={locked ? entry?.lockReason ?? undefined : undefined}
+                  secondary={notImported ? undefined : locked ? entry?.lockReason ?? undefined : undefined}
                 />
               </ListItem>
             );

@@ -29,6 +29,10 @@ export interface ChapterBoardProps {
   // lane so a hidden one can be turned back on here.
   enabledLanes: CheckLane[];
   onToggleLaneVisible: (lane: CheckLane) => void;
+  // Book is locked: disable every checkoff cell and the per-lane "all"
+  // bulk action instead of letting them silently no-op (the server 423s
+  // the write anyway).
+  bookLocked?: boolean;
 }
 
 // Column layout shared by header / body / footer so the grid stays aligned.
@@ -38,10 +42,12 @@ function BoardCell({
   lane,
   canCheck,
   onToggle,
+  bookLocked,
 }: {
   lane: VerseTileLane;
   canCheck: boolean;
   onToggle: () => void;
+  bookLocked?: boolean;
 }) {
   if (!lane.applicable) {
     return (
@@ -67,7 +73,7 @@ function BoardCell({
   const filled = lane.shade !== "open";
   const fill = filled ? LANE_FILL[lane.shade as Exclude<LaneShade, "open">] : null;
   return (
-    <Tooltip title={lane.title}>
+    <Tooltip title={bookLocked ? "Book is locked — checkoff is disabled" : lane.title}>
       <Box
         role="checkbox"
         aria-checked={filled}
@@ -107,7 +113,9 @@ export function ChapterBoard({
   onBulkToggle,
   enabledLanes,
   onToggleLaneVisible,
+  bookLocked = false,
 }: ChapterBoardProps) {
+  const canCheckEffective = canCheck && !bookLocked;
   // Per-lane tally: applicable = cells where the lane applies; done = those with
   // a non-"open" shade (checked by me / others / both). Percent rounds done/applicable.
   const tallies = CHECK_LANES.map((laneKind) => {
@@ -196,23 +204,26 @@ export function ChapterBoard({
                   </Box>
                 </Tooltip>
                 {canCheck && (
-                  <Box
-                    role="button"
-                    aria-label={`Check all ${LANE_LABELS[laneKind]}`}
-                    onClick={() => onBulkToggle(laneKind)}
-                    sx={{
-                      display: "inline-flex",
-                      alignItems: "center",
-                      gap: 0.25,
-                      cursor: "pointer",
-                      color: "primary.main",
-                      fontSize: 13,
-                      "&:hover": { textDecoration: "underline" },
-                    }}
-                  >
-                    <DoneAllIcon sx={{ fontSize: 14 }} />
-                    all
-                  </Box>
+                  <Tooltip title={bookLocked ? "Book is locked — checkoff is disabled" : ""}>
+                    <Box
+                      role="button"
+                      aria-label={`Check all ${LANE_LABELS[laneKind]}`}
+                      aria-disabled={bookLocked}
+                      onClick={bookLocked ? undefined : () => onBulkToggle(laneKind)}
+                      sx={{
+                        display: "inline-flex",
+                        alignItems: "center",
+                        gap: 0.25,
+                        cursor: bookLocked ? "not-allowed" : "pointer",
+                        color: bookLocked ? "text.disabled" : "primary.main",
+                        fontSize: 13,
+                        "&:hover": bookLocked ? {} : { textDecoration: "underline" },
+                      }}
+                    >
+                      <DoneAllIcon sx={{ fontSize: 14 }} />
+                      all
+                    </Box>
+                  </Tooltip>
                 )}
               </Box>
               );
@@ -257,7 +268,8 @@ export function ChapterBoard({
                       {lane ? (
                         <BoardCell
                           lane={lane}
-                          canCheck={canCheck}
+                          canCheck={canCheckEffective}
+                          bookLocked={bookLocked}
                           onToggle={() => onToggle(tile.verse, laneKind)}
                         />
                       ) : (

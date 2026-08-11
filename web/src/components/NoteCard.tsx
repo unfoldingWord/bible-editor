@@ -1609,7 +1609,7 @@ function NoteCardInner({
           bgcolor: "grey.50",
         }}
       >
-        {onSetPreserve && !readOnly && (
+        {onSetPreserve && !bookLocked && (
           <Tooltip title="Mark this note to survive future AI pipeline runs.">
             <Chip
               size="small"

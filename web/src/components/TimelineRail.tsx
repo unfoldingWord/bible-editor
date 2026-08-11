@@ -24,9 +24,11 @@ const LANE_GLYPH: Record<CheckLane, string> = { text: "T", tn: "N", tw: "W", tq:
 function LaneCell({
   lane,
   onToggle,
+  disabled,
 }: {
   lane: VerseTileLane;
   onToggle: () => void;
+  disabled?: boolean;
 }) {
   if (!lane.applicable) {
     // N/A: nothing to check — no tooltip, just the muted dash.
@@ -54,16 +56,18 @@ function LaneCell({
     <Box
       role="checkbox"
       aria-checked={filled}
+      aria-disabled={disabled || undefined}
       aria-label={lane.title}
       onClick={(e) => {
         e.stopPropagation();
+        if (disabled) return;
         onToggle();
       }}
       sx={{
         width: 18,
         height: 18,
         borderRadius: "4px",
-        cursor: "pointer",
+        cursor: disabled ? "not-allowed" : "pointer",
         display: "flex",
         alignItems: "center",
         justifyContent: "center",
@@ -71,13 +75,23 @@ function LaneCell({
         color: fill ? fill.fg : "transparent",
         border: fill ? "none" : "1.5px solid",
         borderColor: fill ? "transparent" : "action.disabled",
+        opacity: disabled ? 0.5 : 1,
         transition: "background-color 120ms",
-        "&:hover": { borderColor: fill ? "transparent" : "text.secondary" },
+        "&:hover": disabled ? {} : { borderColor: fill ? "transparent" : "text.secondary" },
       }}
     >
       {filled && <CheckIcon sx={{ fontSize: 13 }} />}
     </Box>
   );
+  // Book-locked overrides the normal checked-attribution tooltip: explain
+  // why the checkbox can't be toggled instead of who checked it.
+  if (disabled) {
+    return (
+      <Tooltip title="Book is locked — checkoff is disabled" placement="top">
+        {box}
+      </Tooltip>
+    );
+  }
   // Tooltip only on a CHECKED cell — the attribution of who checked it. Unchecked
   // cells show no tooltip. Slow to appear (>1s), instant to dismiss.
   if (!filled) return box;
@@ -110,9 +124,12 @@ interface Props {
   onToggleLane: (verse: number, lane: CheckLane) => void;
   // Click a lane header to hide that lane (re-enable from the Board dialog).
   onHideLane: (lane: CheckLane) => void;
+  // Book is locked: disable every checkoff cell (server 423s the write
+  // anyway) rather than silently no-op the click.
+  bookLocked?: boolean;
 }
 
-export function TimelineRail({ book, chapter, tiles, activeVerse, showChapter = false, enabledLanes, onSelect, onToggleLane, onHideLane }: Props) {
+export function TimelineRail({ book, chapter, tiles, activeVerse, showChapter = false, enabledLanes, onSelect, onToggleLane, onHideLane, bookLocked = false }: Props) {
   const laneOrder = enabledLanes;
   const gridTemplate = `30px repeat(${laneOrder.length}, 1fr)`;
   return (
@@ -239,7 +256,11 @@ export function TimelineRail({ book, chapter, tiles, activeVerse, showChapter = 
               return (
                 <Box key={laneKind} sx={{ display: "flex", justifyContent: "center" }}>
                   {lane ? (
-                    <LaneCell lane={lane} onToggle={() => onToggleLane(t.verse, laneKind)} />
+                    <LaneCell
+                      lane={lane}
+                      onToggle={() => onToggleLane(t.verse, laneKind)}
+                      disabled={bookLocked}
+                    />
                   ) : (
                     <span />
                   )}

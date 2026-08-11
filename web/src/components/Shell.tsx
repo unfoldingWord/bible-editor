@@ -196,9 +196,12 @@ interface Props {
   // clears both the `?c=` param and its own location state — Shell rewriting
   // the hash itself fired no hashchange, leaving App's state stale.
   onCommentConsumed?: () => void;
+  // True once auth is confirmed ready (App's auth gate has minted/refreshed
+  // the token). Gates the book-locks fetch — see useBookLocks.
+  authReady?: boolean;
 }
 
-export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, onLogout, meUserId = null, isViewer = false, initialCommentId, onCommentConsumed }: Props) {
+export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, onLogout, meUserId = null, isViewer = false, initialCommentId, onCommentConsumed, authReady = false }: Props) {
   // tw_link → article title, for canonical (headword-anchored) TWL ordering.
   // handleAddTwlSuggestion below places a NEW link at its canonical slot and
   // persists a matching sort_order, so it must order with the SAME inputs the
@@ -1055,7 +1058,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // below and the admin dialog both see the same list. Declared ahead of
   // toggleLane/confirmBulk below (both close over `bookLocked`), and ahead of
   // the JSX render further down (both scripture/resource columns need it).
-  const bookLocks = useBookLocks();
+  const bookLocks = useBookLocks(authReady);
   const [bookLocksDialogOpen, setBookLocksDialogOpen] = useState(false);
   const currentBookLock = bookLocks.books.find((b) => b.book === book) ?? null;
 
@@ -2871,6 +2874,9 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         open={bookLocksDialogOpen}
         onClose={() => setBookLocksDialogOpen(false)}
         onChanged={bookLocks.refresh}
+        books={bookLocks.books}
+        canManageLocks={bookLocks.canManageLocks}
+        refresh={bookLocks.refresh}
       />
       {currentBookLock?.locked && (
         <Alert
@@ -2948,6 +2954,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
               onSelect={requestSelectVerse}
               onToggleLane={toggleLane}
               onHideLane={toggleLaneVisible}
+              bookLocked={bookLocked}
             />
           </Box>
         )}
@@ -3476,6 +3483,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         canCheck={meUserId != null}
         onToggle={toggleLane}
         onBulkToggle={bulkLaneToggle}
+        bookLocked={bookLocked}
       />
       <Dialog open={!!pendingBulk} onClose={() => setPendingBulk(null)}>
         <DialogTitle>

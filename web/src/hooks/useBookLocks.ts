@@ -14,7 +14,7 @@ export interface UseBookLocksReturn {
   loading: boolean;
 }
 
-export function useBookLocks(): UseBookLocksReturn {
+export function useBookLocks(authReady: boolean): UseBookLocksReturn {
   const [books, setBooks] = useState<BookListEntry[]>([]);
   const [canManageLocks, setCanManageLocks] = useState(false);
   const [loading, setLoading] = useState(true);
@@ -39,24 +39,39 @@ export function useBookLocks(): UseBookLocksReturn {
       .finally(() => setLoading(false));
   }, []);
 
+  // Gated on authReady, same reasoning as useAlerts: GET /api/books has no
+  // auth middleware, so firing it before the auth cookie/token is actually
+  // set succeeds with canManageLocks: false (no error, so .catch never sees
+  // it) instead of failing loudly. That latched a real lock admin into
+  // "Only Benjamin, Rich, or Perry can change book locks" until the next
+  // focus/reload. Waiting for authReady and refetching when it flips true
+  // (e.g. after a silent token refresh) fixes both the dev first-load race
+  // and the prod expired-cookie case.
   useEffect(() => {
+    if (!authReady) return;
     load();
-  }, [load]);
+  }, [authReady, load]);
 
   // Re-pull when the tab regains focus. Without this, a lock set by SOMEONE
-  // ELSE never reaches an already-open session: the mount fetch covers every
-  // book at once (so ordinary book navigation needs no re-fetch), but a lock
-  // applied after mount stays invisible until a reload — the editor keeps
-  // offering edits that the server then refuses with 423. Verified in a
-  // browser: locking via the API with the tab open left the verse editable
-  // until reload. Focus is the cheap 90% fix (lock, switch tab, come back);
-  // the remaining gap is a lock landing while the translator is actively
-  // typing in the same tab, where the 423 + failed-op drawer is the backstop.
+  // ELSE never reaches an already-open session: a lock applied after mount
+  // stays invisible until the next fetch, and the editor keeps offering edits
+  // that the server then refuses with 423. Verified in a browser: locking via
+  // the API with the tab open left the verse editable until reload.
+  //
+  // (Book navigation happens to re-fetch anyway — App renders <Shell
+  // key={book}>, so changing book remounts Shell and this hook with it. That
+  // is incidental, not something to rely on: the fetch returns every book's
+  // lock state, so correctness here doesn't depend on remounting.)
+  //
+  // Focus is the cheap 90% fix (lock, switch tab, come back). The remaining
+  // gap is a lock landing while the translator is actively working in the same
+  // tab, where the server's 423 is the backstop.
   useEffect(() => {
+    if (!authReady) return;
     const onFocus = () => load();
     window.addEventListener("focus", onFocus);
     return () => window.removeEventListener("focus", onFocus);
-  }, [load]);
+  }, [authReady, load]);
 
   // Empty when the list is unknown (see the catch above) — never assume a
   // book is locked just because we don't know.

@@ -22,7 +22,12 @@ import { currentUserId, requireEditor } from "./auth.ts";
 import { importJobOutput } from "./pipelineImport.ts";
 import { IMPORT_CLAIM_STALE_SECONDS } from "./pipelineImportClaim.ts";
 import { resourcesLockedByJob } from "./chapterLock.ts";
-import { effectiveBookLock, bookLockedResponseBody, BOOK_LOCKED_STATUS } from "./bookLock.ts";
+import {
+  effectiveBookLock,
+  bookLockedResponseBody,
+  BOOK_LOCKED_STATUS,
+  lockedBooksIn,
+} from "./bookLock.ts";
 import { broadcastChapter } from "./wsEvents.ts";
 
 export const pipelines = new Hono<{
@@ -336,23 +341,43 @@ async function queueSnapshot(env: Env): Promise<{
 export async function dispatchNext(env: Env): Promise<void> {
   if (!env.BT_API_TOKEN) return;
 
-  // Claim: promote the head queued row to 'dispatching' iff nothing is active.
+  // Books whose queued jobs must not be claimed right now. Computed up front
+  // (rather than after claiming the head row) because a locked book's job
+  // must never win the head-of-queue selection in the first place: if it
+  // were claimed and then requeued, it would keep the SAME priority/
+  // created_at ordering keys, so the next tick would just claim it again —
+  // an infinite requeue that wedges every other book's queued job behind it
+  // forever. Excluding locked books from the SELECT itself lets the claim
+  // fall through to the next eligible job instead.
+  const queuedBooksRs = await env.DB.prepare(
+    `SELECT DISTINCT book FROM pipeline_jobs WHERE state = 'queued'`,
+  ).all<{ book: string }>();
+  const queuedBooks = (queuedBooksRs.results ?? []).map((r) => r.book);
+  const lockedQueuedBooks = [...(await lockedBooksIn(env, queuedBooks))];
+
+  const lockedPlaceholders = lockedQueuedBooks.map((_, i) => `?${i + 1}`).join(", ");
+  const activeOffset = lockedQueuedBooks.length;
+  const activePlaceholders = ACTIVE_STATES.map((_, i) => `?${activeOffset + i + 1}`).join(",");
+
+  // Claim: promote the head eligible queued row to 'dispatching' iff nothing
+  // is active. "Eligible" excludes queued jobs for currently-locked books.
   const claim = await env.DB.prepare(
     `UPDATE pipeline_jobs
         SET state = 'dispatching', updated_at = unixepoch()
       WHERE job_id = (
               SELECT job_id FROM pipeline_jobs
                WHERE state = 'queued'
+               ${lockedQueuedBooks.length > 0 ? `AND book NOT IN (${lockedPlaceholders})` : ""}
                ORDER BY priority DESC, created_at ASC
                LIMIT 1
             )
         AND NOT EXISTS (
-              SELECT 1 FROM pipeline_jobs WHERE state IN (${ACTIVE_PLACEHOLDERS})
+              SELECT 1 FROM pipeline_jobs WHERE state IN (${activePlaceholders})
             )`,
   )
-    .bind(...ACTIVE_STATES)
+    .bind(...lockedQueuedBooks, ...ACTIVE_STATES)
     .run();
-  if ((claim.meta?.changes ?? 0) === 0) return; // nothing to dispatch / slot busy
+  if ((claim.meta?.changes ?? 0) === 0) return; // nothing eligible to dispatch / slot busy
 
   // By invariant there is now exactly one 'dispatching' row — the one we just
   // claimed (the NOT EXISTS guard above prevents a second).
@@ -372,15 +397,17 @@ export async function dispatchNext(env: Env): Promise<void> {
   }>();
   if (!job) return;
 
-  // The book may have been locked (published, or explicitly frozen) after
-  // this job was queued but before it reached the front. Leave it 'queued'
-  // rather than dispatching or failing it — this frees the slot for other
-  // books' jobs and lets a lock/unlock resolve it later. Trade-off: a job
-  // queued against a book that stays locked forever sits in the queue
-  // forever too. That is visible (the queue position never advances) and
-  // recoverable (unlocking the book lets it dispatch on the next tick), which
-  // is the deliberate choice versus silently writing AI output into a frozen
-  // book.
+  // Narrow-race backstop only: the claim SQL above already excludes queued
+  // jobs for books locked at the time `lockedQueuedBooks` was computed, so
+  // this should rarely fire. It can still fire if a lock is added in the
+  // window between that computation and the claim UPDATE. Leaving it
+  // 'queued' is safe here (not a spin risk) because the exclusion query is
+  // re-run from scratch on every tick — the very next invocation of
+  // dispatchNext will see the lock and exclude this book's job from the
+  // claim SELECT, letting other books' queued jobs dispatch in the
+  // meantime. A job queued against a book that stays locked forever sits in
+  // the queue forever too; that is visible (its position never advances)
+  // and recoverable (unlocking the book lets it dispatch on the next tick).
   const bookLock = await effectiveBookLock(env, job.book);
   if (bookLock) {
     console.log(
