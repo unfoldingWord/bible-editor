@@ -447,6 +447,36 @@ verses.patch("/:book/:chapter/:verse/:bibleVersion", requireEditor, async (c) =>
         newVersion,
         JSON.stringify({ ...parsed.data, alignment_delta: delta }),
       ),
+    // A human saving this verse clears any merge conflict the nightly sync
+    // flagged for it (see verseMergeConflicts.ts / verseMerge.ts) — in the
+    // same batch so it costs no extra subrequest. Mirrors rows.ts's
+    // review-flag auto-clear precedent (line ~666). NOTE this is honestly
+    // "touched", not "reviewed": ANY save of this verse clears the flag, even
+    // an unrelated typo fix that never looked at the flagged collision, so a
+    // refusal/conflict can read as "resolved" without anyone having reviewed
+    // it. The book-level system_alerts banner is NOT cleared by this DELETE —
+    // it is derived fresh from verse_merge_conflicts on the next sync (see
+    // raiseVerseMergeConflictAlert), so a stale banner entry for THIS verse
+    // simply won't reappear next time, but nothing here proactively clears an
+    // already-posted banner mid-run.
+    //
+    // Guarded on the UPDATE above having actually landed. Batch statements run
+    // in order, so by now the version-CAS UPDATE has either bumped this row to
+    // newVersion or changed nothing; only in the former case did a human
+    // really resolve anything. Clearing unconditionally would discard a live
+    // flag on a request that then 409s — and losing the pointer to the
+    // overwritten text is the exact failure this table exists to prevent.
+    c.env.DB
+      .prepare(
+        `DELETE FROM verse_merge_conflicts
+          WHERE book = ?1 AND resource = ?2 AND chapter = ?3 AND verse = ?4
+            AND EXISTS (
+              SELECT 1 FROM verses
+               WHERE book = ?1 AND chapter = ?3 AND verse = ?4
+                 AND bible_version = ?5 AND version = ?6
+            )`,
+      )
+      .bind(book, bibleVersion.toLowerCase(), chapter, verse, bibleVersion, newVersion),
   ]);
 
   if (!updateRes.meta.changes) {

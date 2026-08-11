@@ -75,6 +75,26 @@ function normalizeContent(raw: unknown): unknown | null {
   return null;
 }
 
+// The verse content_json recorded in an edit_log payload, or null if
+// absent/unparseable. Reuses normalizeContent so the two writer shapes
+// (bookReimport/pipelineImport store payload.content as a JSON STRING;
+// verses.ts PATCH stores it as an OBJECT via JSON.stringify(parsed.data),
+// which also carries plain_text/alignment_intent alongside content) are
+// absorbed identically here as they are for the version-history timeline.
+// Used by the nightly sync's verseMerge ancestor recovery (bookReimport.ts) —
+// see verseMerge.ts's header for why the ancestor comes from edit_log at all.
+export function verseContentJsonFromPayload(payloadJson: string | null): string | null {
+  if (!payloadJson) return null;
+  let payload: Record<string, unknown>;
+  try {
+    payload = JSON.parse(payloadJson) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+  const content = normalizeContent(payload["content"]);
+  return content != null ? JSON.stringify(content) : null;
+}
+
 export function buildVerseHistory(
   rows: VerseHistoryLogRow[],
   current: VerseCurrent,

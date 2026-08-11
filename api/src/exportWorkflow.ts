@@ -45,6 +45,8 @@ import {
   tsvRevertReport,
   shouldRecordRevertReport,
   classifyRevertSeverity,
+  mechanicalOverwriteAlert,
+  isMasterConfirmed,
   type AlignmentShrinkResult,
   type OffenderProvenance,
   type Resource,
@@ -400,6 +402,10 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     // Book-specific branch named for this resource's human contributors.
     const contributors = await this.contributorsFor(book, resource);
     const branch = buildExportBranch(book, contributors);
+    // Derived from the contributor list itself, NOT by string-matching the
+    // branch name — a real DCS user named "mechanical" would make that
+    // unreliable (see export.ts's comment above MECHANICAL_CONTRIBUTOR).
+    const mechanical = contributors.length === 0;
 
     // R2 is the local-only backup. Writing here first means a failed DCS
     // commit still leaves a recoverable artifact.
@@ -780,6 +786,13 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       dcsCommitSha = commit.commitSha || null;
       dcsChanged = commit.changed;
 
+      // Stamp the master-confirmed watermark (0044's master_confirmed_at) —
+      // see export.ts's isMasterConfirmed for exactly which commitToDcs
+      // outcome this is and why the other one must not qualify.
+      if (isMasterConfirmed(commit)) {
+        await this.stampMasterConfirmed(book, resource);
+      }
+
       // Export-revert report (observational only — see the "Export-revert
       // report" section in export.ts). Recorded HERE, immediately after the
       // commit itself, not near the shrink/alignment guards that captured
@@ -807,7 +820,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
         shouldRecordRevertReport(dcsChanged, usfmMasterContentForRevertReport)
       ) {
         const report = usfmRevertReport(built.content, usfmMasterContentForRevertReport as string);
-        await this.recordExportRevertReport(book, resource, "usfm", report.entries);
+        await this.recordExportRevertReport(book, resource, "usfm", report.entries, mechanical, branch);
       } else if (
         (resource === "tn" || resource === "tq" || resource === "twl") &&
         shouldRecordRevertReport(dcsChanged, tsvMasterContentForRevertReport)
@@ -817,7 +830,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
           tsvMasterContentForRevertReport as string,
           resource as "tn" | "tq" | "twl",
         );
-        await this.recordExportRevertReport(book, resource, "tsv", report.entries);
+        await this.recordExportRevertReport(book, resource, "tsv", report.entries, mechanical, branch);
       }
 
       if (!commit.branchTouched) {
@@ -1683,6 +1696,42 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
   // unreadable), which must NOT clear yesterday's real findings. Callers are
   // responsible for only invoking this when master was readable AND the
   // report came back with 0 entries.
+  // Stamp book_resource_syncs.master_confirmed_at (migration 0044) for a
+  // (book, resource) that isMasterConfirmed just certified. UPDATE-only,
+  // deliberately never INSERT: a brand-new row would need an `origin` value
+  // (book_resource_syncs.origin is NOT NULL with no default — see 0028) and
+  // this call is neither an import, reimport, nor export-render event; it's
+  // a separate "we read master and it matched" observation layered onto
+  // whatever row recordResourceSync (bookReimport.ts) already established.
+  // In practice a (book, resource) reaching this line has always been
+  // imported already (nothing exports before it's imported), so a missing
+  // row here is not expected — but if it ever happens, skipping the insert
+  // just leaves that pair without a watermark until a later run succeeds,
+  // the same fail-closed default this table already relies on elsewhere
+  // ("a missing row means never skip"). Best-effort: never let a failure or
+  // no-op here fail the export.
+  private async stampMasterConfirmed(book: string, resource: Resource): Promise<void> {
+    try {
+      const result = await this.env.DB.prepare(
+        `UPDATE book_resource_syncs SET master_confirmed_at = unixepoch()
+         WHERE book = ?1 AND resource = ?2`,
+      )
+        .bind(book, resource)
+        .run();
+      if ((result.meta?.changes ?? 0) === 0) {
+        console.log(
+          `export: master-confirmed watermark skipped, no existing book_resource_syncs row for ${book} ${resource}`,
+        );
+      }
+    } catch (e) {
+      console.error("export master-confirmed watermark failed", {
+        book,
+        resource,
+        error: e instanceof Error ? e.message : String(e),
+      });
+    }
+  }
+
   private async clearExportReverts(book: string, resource: Resource): Promise<void> {
     try {
       await this.env.DB.prepare(`DELETE FROM export_reverts WHERE book = ?1 AND resource = ?2`)
@@ -1708,6 +1757,8 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     resource: Resource,
     kind: "usfm" | "tsv",
     entries: Array<UsfmRevertEntry | TsvRevertEntry>,
+    mechanical: boolean,
+    branch: string,
   ): Promise<void> {
     if (entries.length === 0) {
       await this.clearExportReverts(book, resource);
@@ -1749,6 +1800,35 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       `${this.env.DCS_BASE_URL}/unfoldingWord`,
       "warning",
     );
+
+    // Second, distinct alert: "mechanical" means nobody on our side edited
+    // this book+resource since the last export, so any substantive revert it
+    // makes is necessarily out-of-band work by someone else (e.g. a
+    // maintainer's hand-edit or a translationCore re-export on master) — see
+    // mechanicalOverwriteAlert's comment in export.ts for the 2026-08-10 1CH
+    // incident this exists to catch. Distinct `source` so it never collides
+    // with or overwrites the export_revert alert above. Best-effort, same as
+    // every other alert in this file — never allowed to fail the export.
+    try {
+      const mechAlert =
+        kind === "usfm"
+          ? mechanicalOverwriteAlert(mechanical, entries as UsfmRevertEntry[], [])
+          : mechanicalOverwriteAlert(mechanical, [], entries as TsvRevertEntry[]);
+      if (mechAlert.alert) {
+        await this.writeAlert(
+          `mechanical_overwrite:${book}:${resource}`,
+          `${label}: ${mechAlert.reason} Branch \`${branch}\`, first refs: ${sampleRefs}${extra > 0 ? ` (+${extra} more)` : ""}. This does not block the export.`,
+          `${this.env.DCS_BASE_URL}/unfoldingWord`,
+          "warning",
+        );
+      }
+    } catch (e) {
+      console.error("mechanical overwrite alert failed", {
+        book,
+        resource,
+        error: e instanceof Error ? e.message : String(e),
+      });
+    }
   }
 
   // Who owns each offending verse in D1, keyed by the offender's ref. Reads

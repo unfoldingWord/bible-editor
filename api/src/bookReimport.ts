@@ -63,12 +63,22 @@ import {
   computeEditedFieldMerge,
   type EditedFieldMerge,
 } from "./reimportClassify";
-import { shouldRecordResourceSync } from "./reimportSyncGate";
+import { shouldRecordResourceSync, isSystemicMergeRefusal } from "./reimportSyncGate";
 import { computeTwlSortOrderUpdates } from "./twlCanonicalOrder";
 import { applyTwlSortOrderUpdates } from "./twlSortOrderApply";
 import { loadTwTitles } from "./twTitles";
 import { loadTwlOrderLocks } from "./twlOrderLocks";
 import type { TwlRow, VerseRow } from "./types";
+import { computeVerseMerge, type VerseMergeResult } from "./verseMerge.ts";
+import { verseContentJsonFromPayload } from "./verseHistory.ts";
+import { canonizeAlignmentSource } from "./canonizeHebrew.ts";
+import {
+  recordVerseMergeConflicts,
+  deleteLostAdoptionConflicts,
+  raiseVerseMergeConflictAlert,
+} from "./verseMergeConflicts.ts";
+import { analyzeAlignmentDelta } from "./alignmentDelta.ts";
+import { lanesToReopenOnVerseEdit, reopenLaneChecks } from "./laneReopen.ts";
 // REIMPORT_CHAPTER_CHUNK / reimportChunkBoundaries live in their own
 // zero-dependency module (reimportChunkPlan.ts) so the chunk-boundary math —
 // including the chapter-0 handling — is unit-testable directly under plain
@@ -154,6 +164,42 @@ export interface ReimportCounts {
   // that classifyReimportRow otherwise preserves as a local reorder. Book-level
   // pass, tallied onto perResource.twl.
   twl_reordered: number;
+  // Verse whose content was adopted from master via computeVerseMerge — either
+  // action "adopt" (master moved, we didn't) or "adopt_conflict" (both moved;
+  // master won, flagged for review — see merge_conflicts). Incremented only
+  // when the version-CAS write actually landed (see the master-adoption batch).
+  // verses only. See verseMerge.ts / the 1CH incident this fixes.
+  merge_adopted: number;
+  // Verse flagged for human review after a merge: action "adopt_conflict"
+  // (both D1 and master moved since the ancestor) or "keep_alignment_refused"
+  // (adopting master would lose alignment). Deliberately EXCLUDES a clean
+  // "adopt" (master moved, we didn't) — that case needs no human judgment, so
+  // it is recorded in verse_merge_conflicts as an audit trail only (see
+  // recordVerseMergeConflicts) but never counted here or in the banner alert.
+  // Recording is best-effort — see merge_record_failed for when it fails. An
+  // "adopt_conflict" whose version-CAS write was LOST is not counted or
+  // recorded: nothing was overwritten, so there is nothing yet for a human to
+  // recover. verses only.
+  merge_conflicts: number;
+  // Verse where computeVerseMerge returned "keep_alignment_refused" — master's
+  // edit was NOT adopted because doing so would lose alignment on words
+  // neither side touched. A subset of merge_conflicts (every refusal needs a
+  // human) tracked separately so the reason breakdown is visible. verses only.
+  merge_refused: number;
+  // Verse where computeVerseMerge returned "keep_no_base" — no ancestor was
+  // recoverable for this specific verse (edit_log aged past the 180-day
+  // retention, or the verse has no edit_log row before book_resource_syncs.
+  // master_confirmed_at). D1 is kept, matching the pre-existing safe default.
+  // Only counted when this book+resource HAS a master_confirmed_at watermark
+  // at all; a book/resource never positively confirmed in master skips the
+  // merge entirely and counts nothing here. verses only.
+  merge_no_base: number;
+  // Set true when recordVerseMergeConflicts (verseMergeConflicts.ts) failed to
+  // durably write one or more of this run's merge_conflicts rows — see its
+  // boolean return. The book-level alert (raiseVerseMergeConflictAlert) reads
+  // this so it can say the table may be missing rows instead of silently
+  // treating a write failure as "nothing to report". verses only.
+  merge_record_failed?: boolean;
   dcs_404: number;
   errors: string[];
   // Set when this object (or an object folded into it via addCounts) was
@@ -193,6 +239,11 @@ function zeroCounts(): ReimportCounts {
     source_attr_reconciled: 0,
     source_attr_divergent: 0,
     twl_reordered: 0,
+    merge_adopted: 0,
+    merge_conflicts: 0,
+    merge_refused: 0,
+    merge_no_base: 0,
+    merge_record_failed: false,
     dcs_404: 0,
     errors: [],
     counts_incomplete: false,
@@ -233,6 +284,11 @@ function addCounts(into: ReimportCounts, from: ReimportCounts): void {
   into.source_attr_reconciled += from.source_attr_reconciled;
   into.source_attr_divergent += from.source_attr_divergent;
   into.twl_reordered += from.twl_reordered;
+  into.merge_adopted += from.merge_adopted ?? 0;
+  into.merge_conflicts += from.merge_conflicts ?? 0;
+  into.merge_refused += from.merge_refused ?? 0;
+  into.merge_no_base += from.merge_no_base ?? 0;
+  into.merge_record_failed = Boolean(into.merge_record_failed || from.merge_record_failed);
   into.dcs_404 += from.dcs_404;
   if (from.errors.length) into.errors.push(...from.errors);
 }
@@ -382,6 +438,13 @@ async function runReimport(
   if (want.has("tq") && !tqRaw) perResource.tq.dcs_404++;
   if (want.has("twl") && !twlRaw) perResource.twl.dcs_404++;
 
+  // FIX 1 (hoist): read the verse-merge ancestor cutoff ONCE per (book,
+  // resource) for this whole run, not once per chapter — see
+  // getMasterConfirmedAt. 2 reads total for this run (ult + ust), down from
+  // one per chapter.
+  const masterConfirmedAtUlt = want.has("ult") && ultRaw ? await getMasterConfirmedAt(env, book, "ult") : null;
+  const masterConfirmedAtUst = want.has("ust") && ustRaw ? await getMasterConfirmedAt(env, book, "ust") : null;
+
   for (const chapter of chapters) {
     const lock = await activePipelineForChapter(env, book, chapter);
     if (lock) {
@@ -405,13 +468,30 @@ async function runReimport(
       addCounts(perResource.twl, c);
     }
     if (want.has("ult") && ultRaw) {
-      const c = await reimportVersesForChapter(env, book, chapter, ultRaw, "ULT", userId);
+      const c = await reimportVersesForChapter(env, book, chapter, ultRaw, "ULT", userId, masterConfirmedAtUlt);
       addCounts(perResource.ult, c);
     }
     if (want.has("ust") && ustRaw) {
-      const c = await reimportVersesForChapter(env, book, chapter, ustRaw, "UST", userId);
+      const c = await reimportVersesForChapter(env, book, chapter, ustRaw, "UST", userId, masterConfirmedAtUst);
       addCounts(perResource.ust, c);
     }
+  }
+
+  // FIX 4: fire the verse-merge-conflict banner once per (book, resource) for
+  // this whole run, not once per chapter (a per-chapter DELETE-then-INSERT
+  // alert would have chapter N's alert erase chapter N-1's — see
+  // raiseVerseMergeConflictAlert's own comment). It derives its content by
+  // reading verse_merge_conflicts directly, so it also reports conflicts that
+  // survived from an earlier run.
+  if (want.has("ult")) {
+    await raiseVerseMergeConflictAlert(env, book, "ult", {
+      recordingFailed: perResource.ult.merge_record_failed === true,
+    });
+  }
+  if (want.has("ust")) {
+    await raiseVerseMergeConflictAlert(env, book, "ust", {
+      recordingFailed: perResource.ust.merge_record_failed === true,
+    });
   }
 
   // Soft-delete pristine rows whose ids master no longer carries — for the
@@ -1165,8 +1245,58 @@ async function reimportVersesForChapter(
   rawUsfm: string,
   bibleVersion: "ULT" | "UST",
   userId: number | null,
+  masterConfirmedAt: number | null,
 ): Promise<ReimportCounts> {
-  return applyVerseRows(env, book, bibleVersion, extractVersesForRange(rawUsfm, chapter, chapter), userId);
+  return applyVerseRows(
+    env,
+    book,
+    bibleVersion,
+    extractVersesForRange(rawUsfm, chapter, chapter),
+    userId,
+    masterConfirmedAt,
+  );
+}
+
+// The verse-merge ancestor cutoff for one (book, resource): the watermark the
+// export stamps ONLY when it has positively measured that our rendered output
+// matches what master currently holds (book_resource_syncs.master_confirmed_at
+// — a column the export half of this fix adds). This is NOT when we last
+// pushed to a `-be-` branch: an unmerged branch push is routine here and is
+// not proof master moved, and attributing against it was the root cause of
+// the 1CH incident (see verseMerge.ts's header). NULL means "never positively
+// confirmed" and callers MUST skip the merge entirely for that case — never
+// treat "not yet confirmed" as "nothing changed" (identical in effect to a
+// missing watermark row before this fix). Constant per (book, resource) for
+// an entire reimport run, so callers read it ONCE per run/step rather than
+// once per chapter — see the call sites in runReimport and
+// reimportStagedChunk for where the hoisting lands.
+// FIX 9: source words for a target verse, unioned across a verse bridge
+// (verseEnd) so a bridged adopted verse matches source words from every verse
+// it spans — mirrors pipelineImport.ts's sourceWordsForRange, adapted to this
+// module's `${chapter}:${verse}` string-keyed map.
+function sourceWordsForVerseRange(
+  map: Map<string, SourceWord[]>,
+  chapter: number,
+  verse: number,
+  verseEnd: number | null,
+): SourceWord[] {
+  const end = verseEnd != null && verseEnd >= verse ? verseEnd : verse;
+  if (end === verse) return map.get(`${chapter}:${verse}`) ?? [];
+  const out: SourceWord[] = [];
+  for (let v = verse; v <= end; v++) {
+    const ws = map.get(`${chapter}:${v}`);
+    if (ws) out.push(...ws);
+  }
+  return out;
+}
+
+async function getMasterConfirmedAt(env: Env, book: string, resource: string): Promise<number | null> {
+  const row = await env.DB.prepare(
+    `SELECT master_confirmed_at FROM book_resource_syncs WHERE book = ?1 AND resource = ?2`,
+  )
+    .bind(book, resource)
+    .first<{ master_confirmed_at: number | null }>();
+  return row?.master_confirmed_at ?? null;
 }
 
 // Heal AI-mangled U+FFFD in `\zaln-s` source attributes (x-content / x-lemma /
@@ -1277,6 +1407,7 @@ async function applyVerseRows(
   bibleVersion: "ULT" | "UST",
   verses: VerseExtract[],
   userId: number | null,
+  masterConfirmedAt: number | null,
 ): Promise<ReimportCounts> {
   const counts = zeroCounts();
   if (verses.length === 0) return counts;
@@ -1292,6 +1423,41 @@ async function applyVerseRows(
   //    (callers pass a single chapter's verses, so the IN list is tiny).
   const chapters = [...new Set(verses.map((v) => v.chapter))];
   const chPlaceholders = chapters.map((_, i) => `?${i + 3}`).join(", ");
+
+  // 1a. FIX 1: the verse-merge ancestor cutoff for this (book, resource) —
+  // passed in by the caller (getMasterConfirmedAt), which reads it ONCE per
+  // run/step rather than once per chapter (see runReimport / reimportStagedChunk).
+  // NULL means never positively confirmed in master: skip the merge entirely
+  // below and leave today's edited-verse handling
+  // (reconcileEditedVerseSourceAttrs) exactly as it was — identical to the
+  // pre-fix "no watermark row" behavior, never treated as "nothing changed".
+  const resource = bibleVersion.toLowerCase();
+  const lastExportAt = masterConfirmedAt;
+
+  // The two merge-ancestor sub-selects are appended only when a watermark
+  // exists, so a book/resource with no successful export ever pays no extra
+  // read and behaves identically to before this change.
+  const mergeCols =
+    lastExportAt != null
+      ? `,
+            (SELECT payload_json FROM edit_log
+               WHERE kind = 'verse'
+                 AND row_key = ?1 || '/' || chapter || '/' || verse || '/' || ?2
+                 AND (book = ?1 OR book IS NULL)
+                 AND action IN ('create', 'update')
+                 AND created_at < ?${chapters.length + 3}
+               ORDER BY id DESC LIMIT 1) AS base_payload,
+            EXISTS (
+              SELECT 1 FROM edit_log
+               WHERE kind = 'verse'
+                 AND row_key = ?1 || '/' || chapter || '/' || verse || '/' || ?2
+                 AND (book = ?1 OR book IS NULL)
+                 AND source IS NULL
+                 AND created_at >= ?${chapters.length + 3}
+            ) AS human_edit_after_export`
+      : "";
+  const existingBind: unknown[] =
+    lastExportAt != null ? [book, bibleVersion, ...chapters, lastExportAt] : [book, bibleVersion, ...chapters];
   const existingRs = await env.DB.prepare(
     `SELECT chapter, verse, content_json, plain_text, verse_end, version, updated_by,
             (SELECT source FROM edit_log
@@ -1299,11 +1465,11 @@ async function applyVerseRows(
                  AND row_key = ?1 || '/' || chapter || '/' || verse || '/' || ?2
                  AND (book = ?1 OR book IS NULL)
                  AND action IN ('create', 'update')
-               ORDER BY id DESC LIMIT 1) AS latest_source
+               ORDER BY id DESC LIMIT 1) AS latest_source${mergeCols}
        FROM verses
       WHERE book = ?1 AND bible_version = ?2 AND chapter IN (${chPlaceholders})`,
   )
-    .bind(book, bibleVersion, ...chapters)
+    .bind(...existingBind)
     .all<{
       chapter: number;
       verse: number;
@@ -1313,6 +1479,8 @@ async function applyVerseRows(
       version: number;
       updated_by: number | null;
       latest_source: string | null;
+      base_payload?: string | null;
+      human_edit_after_export?: number | null;
     }>();
   const existing = new Map<string, (typeof existingRs.results)[number]>();
   for (const r of existingRs.results) existing.set(`${r.chapter}:${r.verse}`, r);
@@ -1331,6 +1499,45 @@ async function applyVerseRows(
   // in a version-CAS batch below (the main batch's UPDATE guards on
   // `updated_by IS NULL`, which an AI-only verse fails). Counted `reimported_ai`.
   const aiReseeds: Array<{ v: VerseExtract; oldVersion: number }> = [];
+  // Edited verses whose content is being ADOPTED from master via
+  // computeVerseMerge (master moved out-of-band on Door43, D1 did not — or
+  // both moved and master wins with a flagged conflict). Written in a
+  // separate version-CAS batch below; updated_by is deliberately left set
+  // (see the write batch's comment). See verseMerge.ts / the 1CH incident.
+  const masterAdoptions: Array<{
+    v: VerseExtract;
+    oldVersion: number;
+    merge: VerseMergeResult;
+    plainText: string | null;
+    // FIX 8: D1's content before this adoption, so the lane-reopen decision
+    // (lanesToReopenOnVerseEdit) can tell whether the adoption actually
+    // changed a word, same as verses.ts's PATCH route does for a normal save.
+    beforeContentJson: string;
+  }> = [];
+  // Verses needing a durable record after this run's merge — EVERY landed
+  // adoption ("adopt" | "adopt_conflict") plus every alignment refusal
+  // ("keep_alignment_refused"). FIX 2: a clean "adopt" is included here too
+  // (not just the two that need human judgment) so every overwrite of
+  // human-owned text has a recovery pointer — see recordVerseMergeConflicts.
+  // The human-facing banner (raiseVerseMergeConflictAlert) still filters this
+  // down to only "adopt_conflict"/"keep_alignment_refused" so it stays
+  // actionable; see the book-level call sites.
+  // `overwrittenVersion` is the version a human can find the replaced text at
+  // in that verse's history — so it is only meaningful when we actually
+  // overwrote something. It stays null on a refusal (we kept D1; nothing was
+  // replaced), and an adopted row is only PERSISTED once its version-CAS write
+  // is confirmed to have landed (FIX 3: the tentative row written before the
+  // batch is deleted again if the CAS is lost) — claiming we overwrote a
+  // version we did not would point a reviewer at the wrong text.
+  const mergeConflicts: Array<{
+    chapter: number;
+    verse: number;
+    action: string;
+    reason: string;
+    overwrittenVersion: number | null;
+    alignment: VerseMergeResult["alignment"] | null;
+    adopted: boolean;
+  }> = [];
   let inserted = 0;
   let updated = 0;
   for (const v of verses) {
@@ -1380,10 +1587,47 @@ async function applyVerseRows(
         }
         continue;
       }
-      // Genuinely human-edited verse: the translator owns the target text +
-      // grouping, so we never overwrite the verse. BUT the original-language
-      // source attributes on its `\zaln-s` milestones (x-content/x-lemma/x-morph)
-      // are SOURCE-owned, not translator-owned — reconcile just those from master
+      // Genuinely human-edited verse — but "edited in the app" and "master
+      // never moved" are independent facts. computeVerseMerge attributes a
+      // D1/master difference using the recovered ancestor: if master moved
+      // out-of-band on Door43 (a maintainer's direct correction) and D1 did
+      // not, that correction must be adopted instead of silently reverted by
+      // the next export (the 1CH incident, 2026-08-11). Only attempted when
+      // this book+resource has a master_confirmed_at watermark at all — see
+      // 1a above.
+      if (lastExportAt != null) {
+        const merge = computeVerseMerge({
+          base: verseContentJsonFromPayload(ex.base_payload ?? null),
+          ours: ex.content_json,
+          theirs: v.contentJson,
+          humanEditedSinceExport: Number(ex.human_edit_after_export ?? 0) !== 0,
+        });
+        if (merge.action === "keep_no_base") counts.merge_no_base++;
+        if (merge.action === "keep_alignment_refused") counts.merge_refused++;
+        // FIX 2: record EVERY landed adoption ("adopt" | "adopt_conflict"),
+        // not just the conflicted ones — see mergeConflicts's declaration
+        // above for why. merge.conflict alone would miss the clean "adopt"
+        // case (master moved, we didn't); merge.adopt covers it.
+        if (merge.conflict || merge.adopt) {
+          mergeConflicts.push({
+            chapter: v.chapter,
+            verse: v.verse,
+            action: merge.action,
+            reason: merge.reason,
+            overwrittenVersion: merge.adopt ? ex.version : null,
+            alignment: merge.alignment ?? null,
+            adopted: merge.adopt,
+          });
+        }
+        if (merge.adopt) {
+          masterAdoptions.push({ v, oldVersion: ex.version, merge, plainText: v.plainText, beforeContentJson: ex.content_json });
+          continue;
+        }
+      }
+      // Otherwise the translator owns the target text + grouping, so we never
+      // overwrite the verse wholesale. BUT the original-language source
+      // attributes on its `\zaln-s` milestones (x-content/x-lemma/x-morph) are
+      // SOURCE-owned, not translator-owned — reconcile just those from master
       // so a curated source fix (e.g. the NUM 20–22 combining-mark correction)
       // isn't reverted when the nightly export re-renders this verse. Staged into
       // a separate version-CAS batch below; if nothing reconciled it stays a plain
@@ -1544,6 +1788,191 @@ async function applyVerseRows(
       counts.errors.push(`verse ai-reseed batch: ${e instanceof Error ? e.message : String(e)}`);
     }
   }
+
+  // 6. Canonize Hebrew/Greek alignment source attrs on adopted master content
+  // BEFORE writing it. Adopted bytes come straight from master and may carry
+  // legacy (non-UHB) combining-mark order in `\zaln-s` x-content/x-lemma — the
+  // same corruption class as the NUM 20–22 incident. Gated on
+  // masterAdoptions.length so a normal night with nothing to adopt pays zero
+  // extra reads. Restricted to the chapters actually present in
+  // masterAdoptions. A verse whose source words aren't available is left
+  // as-is rather than guessed — canonizeAlignmentSource is itself fail-closed
+  // on ambiguity, but skipping here also avoids the query when nothing needs
+  // it. Mutates each adoption's v.contentJson in place, same convention as
+  // healIncomingReplacementChars above.
+  if (masterAdoptions.length > 0) {
+    const adoptChapters = [...new Set(masterAdoptions.map((a) => a.v.chapter))];
+    const srcVersion = NT_BOOKS.has(book) ? "UGNT" : "UHB";
+    const srcPh = adoptChapters.map((_c, i) => `?${i + 3}`).join(", ");
+    const srcRs = await env.DB.prepare(
+      `SELECT chapter, verse, content_json FROM verses
+        WHERE book = ?1 AND bible_version = ?2 AND chapter IN (${srcPh})`,
+    )
+      .bind(book, srcVersion, ...adoptChapters)
+      .all<{ chapter: number; verse: number; content_json: string }>();
+    const srcByKey = new Map<string, SourceWord[]>();
+    for (const r of srcRs.results ?? []) {
+      try {
+        const vo = (JSON.parse(r.content_json) as { verseObjects?: unknown[] }).verseObjects ?? [];
+        srcByKey.set(`${r.chapter}:${r.verse}`, collectSourceWords(vo));
+      } catch {
+        /* unparseable source row — leave this verse's adopted content uncanonized */
+      }
+    }
+    for (const a of masterAdoptions) {
+      // FIX 9: union source words across the verse's FULL bridge range
+      // (v.verseEnd), mirroring pipelineImport.ts's sourceWordsForRange — a
+      // bridged adopted verse otherwise only ever matched its FIRST verse's
+      // source words, leaving the rest of the bridge uncanonized (fail-open,
+      // not corrupting).
+      const words = sourceWordsForVerseRange(srcByKey, a.v.chapter, a.v.verse, a.v.verseEnd);
+      if (words.length === 0) continue; // source words unavailable — don't guess
+      try {
+        const parsed = JSON.parse(a.v.contentJson) as { verseObjects?: unknown[] };
+        if (Array.isArray(parsed.verseObjects)) {
+          canonizeAlignmentSource(parsed.verseObjects, words);
+          a.v.contentJson = JSON.stringify(parsed);
+        }
+      } catch {
+        /* unparseable adopted content — leave as-is */
+      }
+    }
+  }
+
+  // 6b. FIX 3: write EVERY merge-conflict row (including tentative "adopt"
+  // rows whose CAS hasn't run yet) BEFORE the adoption batch below, not
+  // after. `applyVerseRows` runs inside a Workflow `step.do` that retries on
+  // failure — if the write batch below lands but the isolate dies before the
+  // OLD post-write recording ran, a retry re-reads D1 (now equal to master),
+  // computes `keep_converged`, and nothing is ever recorded even though the
+  // overwrite already happened. Writing first means the failure mode inverts
+  // to "a spurious flag for a write that turns out lost" (harmless — cleaned
+  // up just below) instead of "a lost write with no recovery pointer at all".
+  // recordVerseMergeConflicts's INSERT is idempotent (ON CONFLICT DO UPDATE),
+  // so writing here and again if this call retries is safe.
+  let recordFailed = false;
+  if (mergeConflicts.length > 0) {
+    const allConflictRows = mergeConflicts.map((mc) => ({
+      chapter: mc.chapter,
+      verse: mc.verse,
+      action: mc.action,
+      reason: mc.reason,
+      overwrittenVersion: mc.overwrittenVersion,
+      alignment: mc.alignment,
+    }));
+    const recorded = await recordVerseMergeConflicts(env, book, resource, allConflictRows);
+    if (!recorded) recordFailed = true;
+  }
+
+  // 7. Write master adoptions — a human's out-of-band correction on Door43
+  // master (or master's side of a both-sides-moved conflict), adopted into
+  // D1. Mirrors the source-attr reconcile batch above exactly: version-CAS
+  // guard, changes()-gated counter + audit, logs flushed in a separate batch.
+  // merge_adopted counts only writes that actually landed; a lost CAS race
+  // falls to skipped_edited, same as every other batch here. updated_by is
+  // deliberately LEFT SET — we are not erasing the fact a human once owned
+  // this verse, and leaving it set means the NEXT sync still routes through
+  // computeVerseMerge (which will see D1 now equals master and return
+  // keep_converged, writing nothing).
+  // Which adoptions actually landed, so the cleanup below only keeps rows for
+  // verses we really overwrote — a lost CAS race means a human wrote the
+  // verse between our read and our write, so nothing of theirs was replaced
+  // and there is nothing yet to review. The next sync re-evaluates that verse
+  // from scratch.
+  const adoptionsApplied = new Set<string>();
+  for (let i = 0; i < masterAdoptions.length; i += WRITE_BATCH) {
+    const slice = masterAdoptions.slice(i, i + WRITE_BATCH);
+    try {
+      const results = await env.DB.batch(
+        slice.map((a) =>
+          env.DB.prepare(
+            `UPDATE verses
+                SET content_json = ?1, plain_text = ?2, verse_end = ?3,
+                    version = version + 1, updated_at = ?4
+              WHERE book = ?5 AND chapter = ?6 AND verse = ?7 AND bible_version = ?8
+                AND version = ?9`,
+          ).bind(a.v.contentJson, a.plainText, a.v.verseEnd, now, book, a.v.chapter, a.v.verse, bibleVersion, a.oldVersion),
+        ),
+      );
+      const logs: D1PreparedStatement[] = [];
+      slice.forEach((a, j) => {
+        if ((results[j]?.meta.changes ?? 0) > 0) {
+          counts.merge_adopted++;
+          adoptionsApplied.add(`${a.v.chapter}:${a.v.verse}`);
+          console.warn("reimport: adopted master's out-of-band correction over D1 (verseMerge)", {
+            book, bibleVersion, chapter: a.v.chapter, verse: a.v.verse, action: a.merge.action, reason: a.merge.reason,
+          });
+          logs.push(
+            logEditStmt(
+              env, "verse",
+              `${book}/${a.v.chapter}/${a.v.verse}/${bibleVersion}`,
+              book, userId, a.oldVersion, a.oldVersion + 1, "update",
+              { plain_text: a.plainText, content: a.v.contentJson },
+            ),
+          );
+        } else {
+          counts.skipped_edited++;
+        }
+      });
+      if (logs.length) await env.DB.batch(logs);
+    } catch (e) {
+      counts.errors.push(`verse master-adoption batch: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+
+  // 7a. FIX 8: adopting master's edit changes words, but it happens on the
+  // Workflow's write path, not verses.ts's PATCH route — so the checkoff-
+  // reopen logic a normal save triggers (lanesToReopenOnVerseEdit /
+  // reopenLaneChecks) never runs for it. Run it here for every LANDED
+  // adoption (bounded by adoptionsApplied — a lost CAS race changed nothing,
+  // so there's nothing to reopen), batched by WRITE_BATCH. A parse failure on
+  // either side is treated as "assume the words changed" (the safe
+  // direction — a stale check surviving an edit is the failure mode this
+  // exists to close) rather than thrown.
+  const landedAdoptions = masterAdoptions.filter((a) => adoptionsApplied.has(`${a.v.chapter}:${a.v.verse}`));
+  for (let i = 0; i < landedAdoptions.length; i += WRITE_BATCH) {
+    const slice = landedAdoptions.slice(i, i + WRITE_BATCH);
+    await Promise.all(
+      slice.map((a) => {
+        let wordSequenceUnchanged = false;
+        try {
+          const delta = analyzeAlignmentDelta(JSON.parse(a.beforeContentJson), JSON.parse(a.v.contentJson));
+          wordSequenceUnchanged = delta.wordSequenceUnchanged;
+        } catch {
+          /* unparseable either side — fail toward "changed" (reopen), never toward a stale check */
+        }
+        const lanes = lanesToReopenOnVerseEdit(bibleVersion, wordSequenceUnchanged);
+        return reopenLaneChecks(env, book, a.v.chapter, a.v.verse, lanes);
+      }),
+    );
+  }
+
+  // 7b. FIX 3 (cleanup half): the CAS batch above may have lost the race on
+  // some adoptions (a human wrote the verse first). Their conflict row was
+  // written speculatively in step 6b before we knew that — delete it now so
+  // it never misdirects a reviewer to a version that still holds their
+  // current text. Refused verses (never attempted a write) are untouched.
+  const lostAdoptionRefs = mergeConflicts
+    .filter((mc) => mc.adopted && !adoptionsApplied.has(`${mc.chapter}:${mc.verse}`))
+    .map((mc) => ({ chapter: mc.chapter, verse: mc.verse }));
+  if (lostAdoptionRefs.length > 0) {
+    await deleteLostAdoptionConflicts(env, book, resource, lostAdoptionRefs);
+  }
+
+  // 8. Tally this run's landed merge conflicts. FIX 2: excludes a clean
+  // "adopt" (master moved, we didn't) — that case needs no human judgment, so
+  // it is durably recorded (step 6b, for the audit trail) but not counted
+  // here, matching the banner alert's filter (see the book-level call sites
+  // in runReimport / runChunkedReimport, which read verse_merge_conflicts
+  // directly rather than the rows this call staged). FIX 5: this run's
+  // recording failure (if any) is surfaced via merge_record_failed so the
+  // caller can fold it into the book-level alert instead of silently letting
+  // the "Recorded durably" claim go unverified.
+  const liveConflicts = mergeConflicts.filter(
+    (mc) => (!mc.adopted || adoptionsApplied.has(`${mc.chapter}:${mc.verse}`)) && mc.action !== "adopt",
+  );
+  counts.merge_conflicts += liveConflicts.length;
+  if (recordFailed) counts.merge_record_failed = true;
 
   return counts;
 }
@@ -2158,6 +2587,13 @@ async function reimportStagedChunk(
     if (changedTsv[k]) changedSets[k] = new Set(changedTsv[k]);
   }
 
+  // FIX 1 (hoist): read the verse-merge ancestor cutoff ONCE per resource for
+  // this whole chunk step, not once per chapter — see getMasterConfirmedAt.
+  // Up to 2 reads per step (ult + ust), down from up to ~18 (REIMPORT_CHAPTER_
+  // CHUNK=8 chapters, +1 for chapter 0 on the first chunk, × 2 resources).
+  const masterConfirmedAtUlt = versesByChapter.ult ? await getMasterConfirmedAt(env, book, "ult") : null;
+  const masterConfirmedAtUst = versesByChapter.ust ? await getMasterConfirmedAt(env, book, "ust") : null;
+
   for (let chapter = startChapter; chapter <= endChapter; chapter++) {
     const lock = await activePipelineForChapter(env, book, chapter);
     if (lock) {
@@ -2196,10 +2632,16 @@ async function reimportStagedChunk(
       addCounts(perResource[kind], await applyTsvRows(env, book, kind, byCh.get(chapter) ?? [], userId));
     }
     if (versesByChapter.ult) {
-      addCounts(perResource.ult, await applyVerseRows(env, book, "ULT", versesByChapter.ult.get(chapter) ?? [], userId));
+      addCounts(
+        perResource.ult,
+        await applyVerseRows(env, book, "ULT", versesByChapter.ult.get(chapter) ?? [], userId, masterConfirmedAtUlt),
+      );
     }
     if (versesByChapter.ust) {
-      addCounts(perResource.ust, await applyVerseRows(env, book, "UST", versesByChapter.ust.get(chapter) ?? [], userId));
+      addCounts(
+        perResource.ust,
+        await applyVerseRows(env, book, "UST", versesByChapter.ust.get(chapter) ?? [], userId, masterConfirmedAtUst),
+      );
     }
   }
   return perResource;
@@ -2247,6 +2689,21 @@ export async function runChunkedReimport(
     );
     mergePerResource(perResource, counts);
   }
+
+  // FIX 4: fire the verse-merge-conflict banner once per (book, resource) for
+  // this whole run, not once per chunk — a per-chunk DELETE-then-INSERT alert
+  // would have the last chunk's alert erase every earlier chunk's (see
+  // raiseVerseMergeConflictAlert's own comment). It derives its content by
+  // reading verse_merge_conflicts directly, so it also reports conflicts that
+  // survived from an earlier run.
+  await step.do(`reimport-mergealert-${book}`, async () => {
+    for (const e of changed) {
+      if (e.resource !== "ult" && e.resource !== "ust") continue;
+      await raiseVerseMergeConflictAlert(env, book, e.resource, {
+        recordingFailed: perResource[e.resource].merge_record_failed === true,
+      });
+    }
+  });
 
   // After applying each changed TSV file, soft-delete pristine rows whose ids
   // master no longer carries — otherwise the next export branch resurrects
@@ -2326,7 +2783,14 @@ export async function runChunkedReimport(
       // masterSha must never be allowed to skip past the withholding — only
       // a resource that both PASSES the gate and has a real masterSha may be
       // recorded as synced.
-      if (!shouldRecordResourceSync(perResource[e.resource])) {
+      // FIX 7: withhold the watermark once this run's alignment-refused
+      // verses for this resource look systemic (>= SYSTEMIC_MERGE_REFUSAL_
+      // THRESHOLD), same direction as the existing chapters_locked/
+      // prune_locked gates — a maintainer's work is being reverted at scale,
+      // so tonight's export must not run against it. Consulted alongside the
+      // existing gate (either firing withholds), never instead of it.
+      const systemicRefusals = isSystemicMergeRefusal(perResource[e.resource].merge_refused ?? 0);
+      if (!shouldRecordResourceSync(perResource[e.resource]) || systemicRefusals) {
         withheld.push(e.resource);
         // FIX B: a book whose (book, resource) has NO existing watermark row
         // (e.g. seeded by scripts/import-book.mjs, or whose import-time SHA

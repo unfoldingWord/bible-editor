@@ -1,0 +1,23 @@
+
+-- Watermark on book_resource_syncs (0028): the last time the nightly export
+-- actually MEASURED — via a live GET against Door43 master inside
+-- commitToDcs — that our rendered output for this (book, resource) is
+-- byte-identical to what master holds right now. This is positive,
+-- freshly-observed proof our publish landed, which is what verseMerge.ts's
+-- three-way merge needs as its ancestor cutoff: "what we last published to
+-- master."
+--
+-- This is deliberately NOT the same as two columns that look similar but
+-- measure something else:
+--   - book_resource_syncs.source_sha is master's commit SHA at our last
+--     READ of master (a reimport/import watermark for skipping unchanged
+--     resources) — it says nothing about whether OUR content ever reached
+--     master.
+--   - export_snapshots.committed_at (commit_sha IS NOT NULL) is when we
+--     pushed to a `-be-` export BRANCH, not when that branch merged into
+--     master. Merging is done by an external DCS Actions job with no
+--     merged_at anywhere in this codebase, and unmerged `-be-` branches are
+--     routine (see STATE.md) — treating a branch push as "published" can
+--     make the merge conclude "we didn't move, master did" and revert a
+--     translator's edit that master simply never received.
+ALTER TABLE book_resource_syncs ADD COLUMN master_confirmed_at INTEGER;

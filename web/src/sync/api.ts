@@ -803,6 +803,20 @@ export interface ReimportCounts {
   // were reconciled from master (translator's target text + grouping preserved).
   // Optional: the server always sends it, but an older/cached response may omit it.
   source_attr_reconciled?: number;
+  // Verse whose content was adopted from master via computeVerseMerge (master
+  // moved out-of-band on Door43 since our last export). See bookReimport.ts /
+  // verseMerge.ts. Optional: older/cached responses may omit it.
+  merge_adopted?: number;
+  // Verse flagged for human review after a merge (both D1 and master moved,
+  // or adopting would have lost alignment). Optional, same reason as above.
+  merge_conflicts?: number;
+  // Merge refused to adopt master's edit specifically because it would have
+  // lost alignment — a subset of merge_conflicts. Optional, diagnostic.
+  merge_refused?: number;
+  // Merge attempted but no ancestor was recoverable for this verse (edit_log
+  // aged past retention). D1 was kept, the pre-existing safe default.
+  // Optional, diagnostic.
+  merge_no_base?: number;
   dcs_404: number;
   errors: string[];
 }

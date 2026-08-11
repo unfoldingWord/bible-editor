@@ -62,6 +62,38 @@ For the full corpus, see the memory index at
 `C:\Users\benja\.claude\projects\C--Users-benja-Documents-GitHub-bible-editor\memory\MEMORY.md`.
 Highlights that bite repeatedly:
 
+- **A two-way compare cannot tell you who moved, and guessing is how the nightly sync
+  lost data for months.** D1-vs-master alone is symmetric: a difference proves *something*
+  changed, never *which side*. The old sync resolved that ambiguity by assuming D1 was the
+  newer side (skip any verse with `updated_by` set), so every out-of-band correction made
+  directly on Door43 master was skipped on the way in and then reverted on the way out by
+  the export rendering stale D1 over it. The 2026-08-11 1CH incident is the measured case:
+  192 verses reverted, 185 of them with `updated_by` set, 174 with their last app edit
+  *older* than the master content they destroyed. **The fix is an ancestor, not a
+  preference.** The content is recoverable for free from `edit_log` — every `kind='verse'`
+  payload is a FULL snapshot (`verseHistory.ts`'s `normalizeContent` absorbs the two writer
+  shapes) — but **the cutoff that bounds it is the part that is easy to get catastrophically
+  wrong.** `export_snapshots.committed_at` is NOT it, and reaching for it is the trap: that
+  is when we pushed to a `-be-` BRANCH, and merging is done by an external DCS Actions job
+  with no `merged_at` recorded anywhere in this codebase. Unmerged `-be-` branches are
+  routine (JER ULT blocked since 2026-07-31; dangling refs need a manual PAT). Use a branch
+  push as "published" and a translator's edit that master never received looks like "we
+  didn't move, master did" — so the merge reverts the translator to master's older text,
+  silently, in the exact situation the fix targets (an out-of-band master edit is *what
+  makes* the branch unmergeable). The only trustworthy signal is a **live, freshly-measured
+  byte comparison against master**, which `commitToDcs` already performs: it GETs master and
+  returns `branchTouched: false` only when our render is byte-identical to it. That stamps
+  `book_resource_syncs.master_confirmed_at` (migration 0045), and *that* is the cutoff.
+  Note `changed: false` alone is NOT sufficient — it also fires when our render matches the
+  unmerged `-be-` branch, which proves nothing about master. Two further load-bearing
+  properties: `edit_log` is swept at 180 days (`index.ts` ~329), and a book+resource never
+  confirmed on master has no ancestor at all — so "no ancestor → keep D1" must stay a
+  first-class outcome, never an error path and never read as "nothing changed".
+  Note also that `computeEditedFieldMerge` (PR #422) is **not** a three-way merge despite
+  being cited as one — it compares only D1 and master, and adopts on ancestor-free
+  predicates (a field no human can own, or a whitespace-only difference).
+  See `verseMerge.ts`, `verse_merge_conflicts` (migration 0044).
+
 - **"Where is the user?" has no single source in this app — and both available sources
   are blind in a different direction.** `activeVerse` is Shell-LOCAL state
   (`useState(initialVerse)`), so clicking a verse does not necessarily rewrite the URL
