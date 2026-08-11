@@ -9,12 +9,14 @@ import {
   fetchAuthMe,
   onAuthError,
   setReadOnly,
+  setRole,
   updateLastLocation,
   type MeResponse,
   type Role,
 } from "./sync/api";
 import { setPipelineUser } from "./sync/pipelineStore";
 import { parseHashString, stripCommentParam, type Location } from "./lib/parseHash";
+import { AdminPanel } from "./components/AdminPanel";
 
 // OBA (Obadiah) is the shortest book in the canon — one chapter, 21 verses.
 // Loads faster than ZEC on a cold cache and keeps the default landing page
@@ -98,6 +100,7 @@ function useAuthGate(): [AuthState, (s: AuthState) => void] {
         if (me && (me.role === "admin" || me.role === "editor" || me.role === "viewer")) {
           clearSignedOutFlag();
           setReadOnly(me.role === "viewer");
+          setRole(me.role);
           setState({ kind: "ready", me, role: me.role });
           return;
         }
@@ -120,6 +123,7 @@ function useAuthGate(): [AuthState, (s: AuthState) => void] {
           }
           clearSignedOutFlag();
           setReadOnly(devMe.role === "viewer");
+          setRole(devMe.role);
           setState({ kind: "ready", me: devMe, role: devMe.role });
         } catch (err: unknown) {
           if (cancelled) return;
@@ -320,6 +324,38 @@ export function App() {
   };
 
   const isViewer = auth.kind === "ready" && auth.role === "viewer";
+
+  // #/admin is a separate full-page panel, not part of Shell's book/chapter
+  // view. Only admins get it; anyone else who types the URL sees a plain
+  // "admins only" message instead of the panel.
+  if (loc.admin) {
+    // loc.book/chapter/verse are just the parser's defaults while on the
+    // admin route (it never carries a real deep link) — prefer the user's
+    // persisted last-visited location if we have one.
+    const me = auth.kind === "ready" ? auth.me : null;
+    const backToApp = () =>
+      me?.lastBook && me.lastChapter != null && me.lastVerse != null
+        ? navigate(me.lastBook, me.lastChapter, me.lastVerse)
+        : navigate(loc.book, loc.chapter, loc.verse);
+    if (auth.role !== "admin") {
+      return (
+        <Stack alignItems="center" justifyContent="center" sx={{ height: "100vh" }} spacing={2}>
+          <Typography variant="h6">Admins only</Typography>
+          <Typography variant="body2" color="text.secondary">
+            This page is restricted to admins.
+          </Typography>
+          <Link
+            component="button"
+            onClick={backToApp}
+            underline="always"
+          >
+            Back to the editor
+          </Link>
+        </Stack>
+      );
+    }
+    return <AdminPanel onClose={backToApp} />;
+  }
 
   return (
     <Box sx={{ height: "100vh", display: "flex", flexDirection: "column" }}>

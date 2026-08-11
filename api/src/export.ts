@@ -2012,17 +2012,49 @@ export async function findDcsOpenPr(config: DcsPrConfig): Promise<number | null>
     throw new Error(`dcs_pull_lookup_failed: ${res.status} ${await res.text()}`);
   }
 
-  // Fallback: paged scan of open PRs, matching on head ref, base ref, and
-  // same-repo head (see below). Gitea clamps the requested `limit` to an
-  // instance-configurable MaxResponseItems, so a page is NOT guaranteed to
-  // come back with exactly `limit` items even when more pages remain —
-  // measured against door43 2026-08-03: `?state=all&limit=10/50/100`
-  // returned 10/50/100 respectively, i.e. its clamp is at least 100 today,
-  // but we don't rely on that holding. Terminate only on a genuinely empty
-  // page; `maxPages` is the real backstop against an unbounded loop.
+  // Fallback: paged scan of open PRs (via listOpenPrs), matching on head ref
+  // and base ref. listOpenPrs already applies the same-repo guard and the
+  // state==="open" check documented there. Parity with the fast path above,
+  // which requires state === "open" before trusting a number — not a
+  // demonstrated door43 defect, just matching the same guard here since
+  // `?state=open` is a request filter, not a promise.
+  const openPrs = await listOpenPrs(config);
+  const match = openPrs.find((pr) => pr.headRef === config.branch && pr.baseRef === base);
+  return match ? match.number : null;
+}
+
+export interface DcsOpenPr {
+  number: number;
+  title: string;
+  headRef: string;
+  headSha: string;
+  baseRef: string;
+  htmlUrl: string;
+  mergeable: boolean | null;
+  updatedAt: string | null;
+}
+
+// Pages GET /pulls?state=open for one repo, returning every open PR whose head
+// lives in the SAME repo (see same-repo guard below) — no branch filtering;
+// callers (findDcsOpenPr, the admin PR list) filter the result themselves.
+// Gitea clamps the requested `limit` to an instance-configurable
+// MaxResponseItems, so a page is NOT guaranteed to come back with exactly
+// `limit` items even when more pages remain — measured against door43
+// 2026-08-03: `?state=all&limit=10/50/100` returned 10/50/100 respectively,
+// i.e. its clamp is at least 100 today, but we don't rely on that holding.
+// Terminate only on a genuinely empty page; `maxPages` is the real backstop
+// against an unbounded loop.
+export async function listOpenPrs(config: {
+  baseUrl: string;
+  token: string;
+  owner: string;
+  repo: string;
+}): Promise<DcsOpenPr[]> {
+  const apiBase = `${config.baseUrl}/api/v1/repos/${encodeURIComponent(config.owner)}/${encodeURIComponent(config.repo)}`;
   const limit = 50;
   const maxPages = 20;
   const sameRepo = `${config.owner}/${config.repo}`;
+  const out: DcsOpenPr[] = [];
   for (let page = 1; page <= maxPages; page++) {
     const listRes = await fetch(
       `${apiBase}/pulls?state=open&limit=${limit}&page=${page}`,
@@ -2033,9 +2065,13 @@ export async function findDcsOpenPr(config: DcsPrConfig): Promise<number | null>
     }
     let items: Array<{
       number?: number;
+      title?: string;
       state?: string;
-      head?: { ref?: string; repo?: { full_name?: string } };
+      head?: { ref?: string; sha?: string; repo?: { full_name?: string } };
       base?: { ref?: string };
+      html_url?: string;
+      mergeable?: boolean | null;
+      updated_at?: string;
     }>;
     try {
       items = await listRes.json();
@@ -2053,20 +2089,51 @@ export async function findDcsOpenPr(config: DcsPrConfig): Promise<number | null>
     // same-named branch in any contributor's fork would match and we'd
     // return a stranger's PR number, then run writes (close/update/rebase)
     // against it. A missing/undefined head.repo is NOT a match (fail closed).
-    // Parity with the fast path above, which requires state === "open" before
-    // trusting a number — not a demonstrated door43 defect, just matching the
-    // same guard here since `?state=open` is a request filter, not a promise.
-    const match = items.find(
-      (pr) =>
+    for (const pr of items) {
+      if (
         pr.state === "open" &&
-        pr.head?.ref === config.branch &&
-        pr.base?.ref === base &&
-        pr.head?.repo?.full_name === sameRepo,
-    );
-    if (match && typeof match.number === "number") return match.number;
+        typeof pr.number === "number" &&
+        pr.head?.repo?.full_name === sameRepo &&
+        pr.head?.ref &&
+        pr.base?.ref
+      ) {
+        out.push({
+          number: pr.number,
+          title: pr.title ?? "",
+          headRef: pr.head.ref,
+          headSha: pr.head.sha ?? "",
+          baseRef: pr.base.ref,
+          htmlUrl: pr.html_url ?? "",
+          mergeable: pr.mergeable ?? null,
+          updatedAt: pr.updated_at ?? null,
+        });
+      }
+    }
     if (items.length === 0) break;
   }
-  return null;
+  return out;
+}
+
+// GET /commits/{sha}/status — the combined check status for a commit (used by
+// the admin PR list to show CI state without the caller having to know Gitea's
+// status shapes). Never throws: any non-200 or unparseable body returns null
+// so one flaky repo can't take down the whole /api/admin/prs response.
+export async function getCommitStatus(
+  config: { baseUrl: string; token: string; owner: string; repo: string },
+  sha: string,
+): Promise<string | null> {
+  const apiBase = `${config.baseUrl}/api/v1/repos/${encodeURIComponent(config.owner)}/${encodeURIComponent(config.repo)}`;
+  try {
+    const res = await fetch(`${apiBase}/commits/${encodeURIComponent(sha)}/status`, {
+      method: "GET",
+      headers: dcsPrHeaders(config.token),
+    });
+    if (!res.ok) return null;
+    const data = (await res.json()) as { state?: string };
+    return typeof data.state === "string" ? data.state : null;
+  } catch {
+    return null;
+  }
 }
 
 export async function ensureDcsPr(

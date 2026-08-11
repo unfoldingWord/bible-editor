@@ -65,6 +65,31 @@ const DEFAULT_BOOK = "OBA";
   assert(loc.commentId === 7, "chapter-only + ?c= extracts commentId");
 }
 
+// --- admin route ---
+{
+  const loc = parseHashString("#/admin", DEFAULT_BOOK);
+  assert(loc.admin === true, "#/admin sets admin:true");
+}
+{
+  const loc = parseHashString("#/admin/", DEFAULT_BOOK);
+  assert(loc.admin === true, "#/admin/ sets admin:true");
+}
+{
+  const loc = parseHashString("#/ADMIN", DEFAULT_BOOK);
+  assert(loc.admin === true, "#/ADMIN (case-insensitive) sets admin:true");
+}
+{
+  const loc = parseHashString("#/ZEC/5/3", DEFAULT_BOOK);
+  assert(loc.admin === undefined, "#/ZEC/5/3 does not set admin");
+}
+{
+  // A book code that merely starts with admin-ish text must still parse as
+  // a book — the admin check only matches the whole "admin" segment.
+  const loc = parseHashString("#/ADM/2", DEFAULT_BOOK);
+  assert(loc.book === "ADM" && loc.chapter === 2, "#/ADM/2 parses as book ADM");
+  assert(loc.admin === undefined, "#/ADM/2 does not set admin");
+}
+
 // ── stripCommentParam ──────────────────────────────────────────────────────
 // Removing the deep-link param must never damage the path or other params.
 assert(stripCommentParam("#/ZEC/5/3") === "#/ZEC/5/3", "no query: unchanged");

@@ -8,6 +8,10 @@ export interface Location {
   // Present when the hash carries a `?c=<id>` suffix, e.g. from a mention
   // alert deep link (`#/ZEC/5/3?c=12`). Undefined when absent or non-numeric.
   commentId?: number;
+  // True when the hash is the admin route (`#/admin`), as opposed to a
+  // book/chapter/verse deep link. book/chapter/verse are still populated
+  // with defaults so callers that ignore this flag keep working.
+  admin?: true;
 }
 
 // Strip only the `c=<id>` query param from a hash, preserving any other params
@@ -24,6 +28,13 @@ export function stripCommentParam(hash: string): string {
 }
 
 export function parseHashString(hash: string, defaultBook: string): Location {
+  // Admin route: #/admin, #/admin/, #/ADMIN, optionally followed by a query
+  // string. Checked before the book regex below so "admin" is never mistaken
+  // for a (nonexistent) book code — the book regex's `[A-Za-z0-9]+` would
+  // otherwise happily match it.
+  if (/^#\/?admin\/?(\?|$)/i.test(hash)) {
+    return { book: defaultBook, chapter: 1, verse: 1, admin: true };
+  }
   const m = hash.match(/^#\/?([A-Za-z0-9]+)(?:\/(\d+))?(?:\/(\d+))?/);
   const cm = hash.match(/[?&]c=(\d+)/);
   const commentId = cm ? parseInt(cm[1], 10) : undefined;

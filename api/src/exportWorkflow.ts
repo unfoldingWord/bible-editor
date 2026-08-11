@@ -116,6 +116,13 @@ export interface ExportParams {
   // Same narrow gating as allowShrink: only honored for a single explicitly-
   // named book AND resource, via mergeRefusalOverrideAllowed.
   allowMergeRefusal?: boolean;
+  // Scope the pre-export DCS→D1 reimport step to specific resources. Unlike
+  // the singular `resource` above (which scopes the export/render step),
+  // `resources` is plural and ONLY affects the reimport step — it exists
+  // because the admin "Pull from Door43" control lets a user pick several
+  // resources for one book in one go, and firing one Workflow instance per
+  // resource would race on the same book's D1 rows.
+  resources?: Resource[];
 }
 
 export interface StepResult {
@@ -196,12 +203,25 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     //     export instance — same shape as the post-export reimport loop. Gated
     //     on dcsAllowed: a dry run / no-token run shouldn't mutate D1.
     if (dcsAllowed || params.reimportOnly) {
+      // Scope the reimport to `resources` when the caller named specific ones
+      // (the admin "Pull from Door43" control), else fall back to the
+      // export/render step's singular `resource`, else every resource. Filter
+      // through isResource so a bad string can't widen the set — mirroring
+      // the resource-resolution hazard above (unrecognized entries there
+      // silently widen to ALL_RESOURCES), an explicit `resources` request
+      // that filters down to nothing stays empty rather than falling back to
+      // everything.
+      const reimportResources: Resource[] = params.resources?.length
+        ? params.resources.filter(isResource)
+        : params.resource && isResource(params.resource)
+          ? [params.resource]
+          : [...REIMPORT_RESOURCES];
       for (const book of books) {
         try {
           // Chunked + SHA-gated + diff-aware reimport — steps through chapters so
           // a large book can't blow the 10-min step limit, and skips files whose
           // DCS commit SHA is unchanged. See bookReimport.ts:runChunkedReimport.
-          await runChunkedReimport(this.env, step, book, instanceId, [...REIMPORT_RESOURCES], {
+          await runChunkedReimport(this.env, step, book, instanceId, reimportResources, {
             mergeRefusalOverrideResource: mergeRefusalOverride ? (params.resource as Resource) : undefined,
           });
         } catch (e) {
