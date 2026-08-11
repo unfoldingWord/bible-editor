@@ -709,6 +709,40 @@ t("FIX A: \\p behaviour unchanged (still standalone, still crossable in joinDang
   assert.match(ls[pIdx + 1], /^\\w he/);
 });
 
+// Regression (caught in pre-merge review 2026-08-11): FIX A's own-line
+// extraction of the paragraph family (isolating `\m` from `\m \w text\w*`)
+// combined with an over-broad isAbortLine branch to make a bare `\m` line
+// ABORT the dangling-\v join instead of being crossed like `\p`. Input
+// `\v 8` / `\m \w text\w*` (usfm-js's fused shape) went from main's correct
+// `\m` / `\v 8 \w text\w*` to a stranded bare `\v 8` line sitting above `\m`
+// above `\w text\w*` — exactly the defect joinDanglingVerses exists to fix.
+t("dangling \\v: a bare \\m between \\v and its text is crossed, not aborted (regression against main)", () => {
+  const ls = lines(`${HDR}\\v 8\n\\m \\w text\\w*\n`);
+  const mIdx = ls.indexOf("\\m");
+  assert.ok(mIdx > 0, "\\m kept, isolated onto its own line");
+  assert.ok(
+    ls.slice(mIdx + 1).some((l) => l.trim() === "\\v 8 \\w text\\w*"),
+    "\\v 8 crosses the bare \\m and joins its text",
+  );
+  assert.ok(
+    !ls.some((l) => /^\\v\s+\d+\s*$/.test(l.trim())),
+    "no line is left as a bare, stranded \\v",
+  );
+});
+
+t("dangling \\v: crossing a bare \\m never fuses \\m onto the \\v line", () => {
+  const ls = lines(`${HDR}\\v 8\n\\m \\w text\\w*\n`);
+  assert.ok(
+    !ls.some((l) => /^\\m\s+\\v/.test(l.trim())),
+    "\\m is not prefixed onto the merged \\v line",
+  );
+  assert.ok(
+    !ls.some((l) => /^\\v\s+\d+\s+\\m\b/.test(l.trim())),
+    "\\m does not trail the \\v line either",
+  );
+  assert.ok(ls.some((l) => l.trim() === "\\m"), "\\m still lands on its own line");
+});
+
 // ── FIX B (2026-08-11): a lone \q* joins across a \ts\* run ────────────────
 // Measured: 9 occurrences of a lone \q* stranded above \ts\* in current
 // master (en_ust/28-HOS.usfm x4, en_ult/33-MIC.usfm x5) vs 0 in Rich Mahn's

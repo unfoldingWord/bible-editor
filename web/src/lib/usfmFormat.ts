@@ -462,15 +462,31 @@ function stripLeadingAttachableMarker(line: string): { marker: string | null; re
   return { marker: null, rest: s };
 }
 
+// A bare paragraph-family marker line (`\m`, `\pi1`, `\mi`, `\nb`, `\cls`, …
+// — same family as `\p`). These are extracted onto their own line by
+// STANDALONE_MARKER_RE (FIX A) and, unlike the poetry markers in
+// POETRY_MARKER_ALTERNATION, must never be attached to a `\v` line (so they
+// are deliberately absent from ATTACHABLE_PREFIX_RE). But a bare one must
+// still be CROSSABLE in joinDanglingVerses's forward walk — see
+// isCrossableMarkerLine below — exactly like `\p`: the walk steps over it,
+// keeps it on its own line, and keeps looking for the actual verse content.
+// Treating it as an abort instead (an earlier version of this pass did) left
+// a `\v` stranded alone on its own line whenever a bare `\m`/`\pi1`/etc. sat
+// between it and its text — regression against main, caught in pre-merge
+// review 2026-08-11.
+const PARAGRAPH_FAMILY_BARE_RE = new RegExp(String.raw`^\\(${PARAGRAPH_FAMILY_ALTERNATION})$`);
+
 // A line that joinDanglingVerses's forward walk may cross AND KEEP in place:
-// a bare `\p`, or a bare attachable poetry/paragraph marker (`\q1`, etc) with
-// nothing following it on the line. Deliberately narrow — `\b`/`\ts\*`/`\c`
-// used to be crossable here too, which is exactly what let the walk merge a
-// verse into the wrong chapter (see isAbortLine and the doc comment on
-// joinDanglingVerses below).
+// a bare `\p`, a bare paragraph-family marker (`\m`, `\pi1`, etc — see
+// PARAGRAPH_FAMILY_BARE_RE above), or a bare attachable poetry marker (`\q1`,
+// etc) with nothing following it on the line. Deliberately narrow —
+// `\b`/`\ts\*`/`\c` used to be crossable here too, which is exactly what let
+// the walk merge a verse into the wrong chapter (see isAbortLine and the doc
+// comment on joinDanglingVerses below).
 function isCrossableMarkerLine(line: string): boolean {
   const s = line.trim();
   if (s === "\\p") return true;
+  if (PARAGRAPH_FAMILY_BARE_RE.test(s)) return true;
   return ATTACHABLE_PREFIX_RE.test(s);
 }
 
@@ -482,7 +498,8 @@ function isCrossableMarkerLine(line: string): boolean {
 // are NOT extracted onto their own line by anything upstream, so they're
 // matched by leading marker instead, whatever text follows them. Another `\v`
 // line (dangling or not) always aborts too — a join must never swallow a
-// second verse.
+// second verse. Bare paragraph-family markers (`\m`, `\pi1`, etc) are NOT an
+// abort — they're crossable instead, per isCrossableMarkerLine above.
 // `\qa`/`\qc`/`\qr`/`\qd` are in POETRY_MARKER_ALTERNATION, so without an
 // explicit abort they are worse than merely crossable: stripLeadingAttachableMarker
 // peels them off and the join hoists the verse number INTO the heading —
@@ -497,17 +514,6 @@ const ABORT_LEADING_RE =
   // with the digit absent, and the lookahead is satisfied by the following `\`.
   /^(?:\\sr|\\s[1-5]?|\\r|\\ms[1-3]?|\\mr|\\d|\\qa|\\qc|\\qr|\\qd|\\sp|\\cl)(?![A-Za-z0-9])/;
 
-// A bare paragraph-family marker line (`\m`, `\pi1`, `\mi`, `\nb`, `\cls`, …
-// — NOT `\p`, which stays crossable per isCrossableMarkerLine above). These
-// are now extracted onto their own line by STANDALONE_MARKER_RE (FIX A), so
-// without an explicit abort here the forward walk would fall through to
-// "target = this line", strip nothing (the line has no trailing content to
-// strip), and merge the dangling `\v` directly onto the bare marker text —
-// e.g. `\v 8` + `\m` -> `\v 8 \m`, re-fusing the exact shape FIX A just split
-// apart. Aborting instead leaves the dangling `\v` untouched, same treatment
-// as `\c`/`\ts\*`/`\b`.
-const PARAGRAPH_FAMILY_BARE_RE = new RegExp(String.raw`^\\(${PARAGRAPH_FAMILY_ALTERNATION})$`);
-
 function isAbortLine(line: string): boolean {
   const s = line.trim();
   if (s === "") return false; // blank lines are handled by the caller, not here
@@ -520,7 +526,6 @@ function isAbortLine(line: string): boolean {
   if (CHAPTER_RE.test(s)) return true;
   if (s === "\\ts\\*") return true;
   if (s === "\\b") return true;
-  if (PARAGRAPH_FAMILY_BARE_RE.test(s)) return true;
   // headings and titles: \s / \s1-\s5 / \sr / \r / \ms / \ms1-3 / \ms\* / \mr /
   // \d / \qa / \qc / \qr / \qd / \sp / \cl
   return ABORT_LEADING_RE.test(s);
