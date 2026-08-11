@@ -19,6 +19,7 @@ import { alignmentAttention } from "./alignmentAttention";
 import { verseMergeConflicts } from "./verseMergeConflicts";
 import { comments } from "./comments";
 import { books } from "./bookImport";
+import { bookLockGuard } from "./bookLockGuard";
 import { attachAuth, requireAuth, requireCsrf, mintDevToken, startDcsAuth, callbackDcsAuth, authMe, authLogout, refreshToken, updateLastLocation, currentUserId, verifyToken } from "./auth";
 
 export interface Env {
@@ -111,6 +112,17 @@ app.use("*", (c, next) => {
 
 app.use("*", attachAuth);
 app.use("*", requireCsrf);
+
+// Book-lock enforcement — refuses writes (POST/PATCH/PUT/DELETE) to a book
+// that is published or explicitly locked. Mounted with `:book` path patterns
+// so bookLockGuard's `c.req.param("book")` resolves for the three route
+// groups that carry the book in the URL; rows.ts carries it in the query
+// string instead (`?book=`), which the guard also checks. See
+// bookLockGuard.ts for the full precedence/exemption rules.
+app.use("/api/verses/:book/*", bookLockGuard);
+app.use("/api/chapters/:book/*", bookLockGuard);
+app.use("/api/books/:book/*", bookLockGuard);
+app.use("/api/rows/*", bookLockGuard);
 
 // Defense-in-depth response headers. CSP locks the SPA to its own bundle
 // (no third-party scripts/styles aside from inline styles emotion/MUI need).

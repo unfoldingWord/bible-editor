@@ -35,6 +35,7 @@ import {
 } from "@mui/material";
 import ArrowBackIcon from "@mui/icons-material/ArrowBack";
 import RefreshIcon from "@mui/icons-material/Refresh";
+import LockIcon from "@mui/icons-material/Lock";
 import DeleteIcon from "@mui/icons-material/Delete";
 import {
   api,
@@ -300,6 +301,16 @@ function SyncStatusTab() {
                     <Typography variant="caption" color="text.secondary">
                       {bookName(b.book)}
                     </Typography>
+                    {b.locked && (
+                      <Tooltip title="This book is frozen: published or explicitly locked. It won't push to Door43 and can't be edited or pulled into until it's unlocked.">
+                        <Chip
+                          size="small"
+                          icon={<LockIcon sx={{ fontSize: 12 }} />}
+                          label="locked"
+                          sx={{ mt: 0.5, height: 18, "& .MuiChip-label": { px: 0.75, fontSize: 11 } }}
+                        />
+                      </Tooltip>
+                    )}
                   </TableCell>
                   {RESOURCES.map((r) => (
                     <TableCell key={r}>
@@ -552,7 +563,11 @@ function PushCard({ bookOptions }: { bookOptions: string[] }) {
   );
 }
 
-function parseChapters(text: string): number[] | undefined {
+// Returns the parsed chapter list, `undefined` for a genuinely empty field
+// (= whole book), or the literal "invalid" for text that parsed to nothing.
+// The caller MUST distinguish the last two — see the comment at the bail-out
+// below.
+function parseChapters(text: string): number[] | undefined | "invalid" {
   const t = text.trim();
   if (!t) return undefined;
   const out = new Set<number>();
@@ -566,9 +581,31 @@ function parseChapters(text: string): number[] | undefined {
       for (let i = Math.min(lo, hi); i <= Math.max(lo, hi); i++) out.add(i);
     } else if (/^\d+$/.test(p)) {
       out.add(parseInt(p, 10));
+    } else {
+      // Unparseable fragment. Reporting this as "invalid" rather than
+      // silently dropping it is the whole point: an empty field means
+      // "whole book", so a typo that parsed to nothing used to be
+      // indistinguishable from an empty field and quietly widened a
+      // 3-chapter pull into all 66. The realistic trigger is mundane —
+      // "1–3" with an en dash (Word/Windows autocorrect rewrites the
+      // hyphen) matches neither branch above.
+      return "invalid";
     }
   }
-  return out.size > 0 ? [...out].sort((a, b) => a - b) : undefined;
+  return out.size > 0 ? [...out].sort((a, b) => a - b) : "invalid";
+}
+
+// The pull route's failure modes are all actionable by the person reading
+// them, so none of them should surface as a bare "HTTP 423".
+function pullErrorMessage(e: unknown, book: string): string {
+  const status = (e as { status?: number })?.status;
+  if (status === 423) {
+    return `${book} is locked (published or explicitly frozen), so it can't be pulled into. Unlock it first if this is deliberate.`;
+  }
+  if (status === 409) return `An import is already running for ${book}. Wait for it to finish.`;
+  if (status === 404) return `${book} hasn't been imported into bible-editor yet.`;
+  if (status === 400) return `${book} isn't a book code we recognise.`;
+  return String(e);
 }
 
 function PullCard({ bookOptions }: { bookOptions: string[] }) {
@@ -583,12 +620,20 @@ function PullCard({ bookOptions }: { bookOptions: string[] }) {
 
   const doPull = useCallback(() => {
     if (!canPull) return;
+    const chapters = parseChapters(chaptersText);
+    if (chapters === "invalid") {
+      setError(
+        `Couldn't read "${chaptersText.trim()}" as chapters. Use numbers, commas and plain hyphens — e.g. 1,3,5-7. Leave it empty to pull the whole book.`,
+      );
+      setResult(null);
+      return;
+    }
     setError(null);
     setResult(null);
     api
-      .adminImport({ book, resources, chapters: parseChapters(chaptersText) })
+      .adminImport({ book, resources, chapters })
       .then((res) => setResult(res))
-      .catch((e) => setError(String(e)));
+      .catch((e) => setError(pullErrorMessage(e, book)));
   }, [book, resources, chaptersText, canPull]);
 
   return (

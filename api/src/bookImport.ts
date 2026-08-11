@@ -10,6 +10,7 @@
 // on first selection instead of asking the operator to run a CLI.
 
 import { Hono } from "hono";
+import { z } from "zod";
 import type { Env } from "./index";
 import {
   extractUsfmHeaders,
@@ -22,15 +23,145 @@ import { requireAuth, requireEditor, currentUserId } from "./auth";
 import { BOOK_NUMBERS, dcsUrls, dcsResourceFile, fileCommitSha, fetchText } from "./dcsSources";
 import { reimportBookFromDcs, recordResourceSync, type Resource } from "./bookReimport";
 import { lintChapterOpeningMarkers, lintTnRows, lintTqRows, lintTwlRows, lintUsfmVerses } from "./lint";
+import { effectiveBookLock, canManageLocks, type BookLock } from "./bookLock";
+import { isPublishedBook } from "./publishedGuard";
 import type { TnRow, TqRow, TwlRow, VerseRow } from "./types";
 
-export const books = new Hono<{ Bindings: Env; Variables: { userId?: number } }>();
+export const books = new Hono<{ Bindings: Env; Variables: { userId?: number; username?: string } }>();
 
+// GET /api/books also reports each book's lock state (published-default or
+// explicit override — see bookLock.ts) so the book picker can render a lock
+// badge without a second request per book, plus whether the current user can
+// change locks at all (used to show/hide the lock/unlock control).
 books.get("/", async (c) => {
   const rs = await c.env.DB.prepare(
     `SELECT book, imported_at FROM book_imports ORDER BY book`,
   ).all<{ book: string; imported_at: number }>();
-  return c.json({ books: rs.results });
+
+  // One query for every book's explicit lock row, not one per book (D1
+  // subrequest budget — same discipline as lockedBooksIn in bookLock.ts).
+  const lockRows = await c.env.DB.prepare(
+    `SELECT book, locked, reason FROM book_locks`,
+  ).all<{ book: string; locked: number; reason: string | null }>();
+  const explicit = new Map<string, { locked: number; reason: string | null }>();
+  for (const row of lockRows.results ?? []) explicit.set(row.book, row);
+
+  const booksOut = (rs.results ?? []).map((b) => {
+    const override = explicit.get(b.book);
+    let locked: boolean;
+    let lockReason: string | null;
+    let lockSource: "published" | "explicit" | null;
+    if (override) {
+      // An explicit row always wins, including locked=0 (a deliberate
+      // unlock of an otherwise-published book).
+      locked = override.locked === 1;
+      lockReason = locked ? override.reason : null;
+      lockSource = locked ? "explicit" : null;
+    } else if (isPublishedBook(b.book)) {
+      locked = true;
+      lockReason = null;
+      lockSource = "published";
+    } else {
+      locked = false;
+      lockReason = null;
+      lockSource = null;
+    }
+    return { ...b, locked, lockReason, lockSource };
+  });
+
+  const username = c.get("username");
+  const canManage = await canManageLocks(c.env, username);
+  return c.json({ books: booksOut, canManageLocks: canManage });
+});
+
+const LockBody = z.object({
+  reason: z.string().max(200).optional(),
+});
+
+// Shared response shape for PUT/DELETE .../lock — the resulting lock state,
+// in the same shape effectiveBookLock returns (null when unlocked).
+function lockStateResponse(book: string, lock: BookLock | null) {
+  return {
+    book,
+    locked: lock !== null,
+    lockReason: lock?.reason ?? null,
+    lockSource: lock?.source ?? null,
+  };
+}
+
+// Who last changed a book's lock, and when, is recorded by `book_locks.set_by`
+// / `set_at` — that upsert IS the audit record. Deliberately no system_alerts
+// row: those render as persistent top-of-app banners addressed to a username
+// (see alerts.ts), so auditing there would hand the acting maintainer a banner
+// to dismiss after every lock — noise for a user-initiated action that already
+// has immediate UI feedback. If a full lock/unlock *history* is ever needed,
+// that wants its own append-only table, not the banner channel.
+
+// PUT /api/books/:book/lock — explicitly lock a book (freezes app edits and
+// export, independent of whether it's published). requireEditor gates any
+// write at all; the narrower canManageLocks check below gates this
+// particular write to the small admin allowlist in book_lock_admins.
+books.put("/:book/lock", requireEditor, async (c) => {
+  const userId = currentUserId(c);
+  if (!userId) return c.json({ error: "unauthorized" }, 401);
+  const username = c.get("username");
+  if (!(await canManageLocks(c.env, username))) {
+    return c.json({ error: "forbidden", reason: "not_a_lock_admin" }, 403);
+  }
+
+  const book = c.req.param("book").toUpperCase();
+  if (!BOOK_NUMBERS[book]) return c.json({ error: "unknown_book", book }, 400);
+
+  let body: unknown = {};
+  try {
+    body = await c.req.json();
+  } catch {
+    /* empty body is fine — reason is optional */
+  }
+  const parsed = LockBody.safeParse(body);
+  if (!parsed.success) return c.json({ error: "invalid_body", details: parsed.error.format() }, 400);
+  const reason = parsed.data.reason ?? null;
+
+  await c.env.DB.prepare(
+    `INSERT INTO book_locks (book, locked, reason, set_at, set_by)
+     VALUES (?1, 1, ?2, unixepoch(), ?3)
+     ON CONFLICT (book) DO UPDATE SET
+       locked = 1, reason = ?2, set_at = unixepoch(), set_by = ?3`,
+  )
+    .bind(book, reason, userId)
+    .run();
+
+  const lock = await effectiveBookLock(c.env, book);
+  return c.json(lockStateResponse(book, lock));
+});
+
+// DELETE /api/books/:book/lock — explicitly unlock a book. Writes an
+// explicit locked=0 row rather than deleting any existing row: a delete
+// would let a published book fall straight back to locked via the default,
+// which defeats the whole point of unlocking a published book for a
+// maintainer cleanup pass.
+books.delete("/:book/lock", requireEditor, async (c) => {
+  const userId = currentUserId(c);
+  if (!userId) return c.json({ error: "unauthorized" }, 401);
+  const username = c.get("username");
+  if (!(await canManageLocks(c.env, username))) {
+    return c.json({ error: "forbidden", reason: "not_a_lock_admin" }, 403);
+  }
+
+  const book = c.req.param("book").toUpperCase();
+  if (!BOOK_NUMBERS[book]) return c.json({ error: "unknown_book", book }, 400);
+
+  await c.env.DB.prepare(
+    `INSERT INTO book_locks (book, locked, reason, set_at, set_by)
+     VALUES (?1, 0, NULL, unixepoch(), ?2)
+     ON CONFLICT (book) DO UPDATE SET
+       locked = 0, reason = NULL, set_at = unixepoch(), set_by = ?2`,
+  )
+    .bind(book, userId)
+    .run();
+
+  const lock = await effectiveBookLock(c.env, book);
+  return c.json(lockStateResponse(book, lock));
 });
 
 // GET /api/books/:book/lint — the in-app "issues to clean up" feed for a book.

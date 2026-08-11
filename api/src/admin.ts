@@ -22,6 +22,8 @@ import {
   type Resource as ReimportResource,
 } from "./bookReimport";
 import { BOOK_NUMBERS } from "./dcsSources";
+import { bookLockGuard } from "./bookLockGuard";
+import { lockedBooksIn } from "./bookLock";
 
 export const admin = new Hono<{
   Bindings: Env;
@@ -97,6 +99,16 @@ admin.get("/sync-status", async (c) => {
     exportsByKey.set(`${row.book}/${row.resource}`, row);
   }
 
+  // A locked book (published, or explicitly frozen) is withheld from Door43
+  // by the export's own gate, so without this the grid shows "not exported"
+  // or a stale "blocked" forever with no visible cause — exactly the
+  // unexplained-silence this board exists to remove. One bulk query, not
+  // per-book.
+  const lockedBooks = await lockedBooksIn(
+    c.env,
+    (booksRs.results ?? []).map((b) => b.book),
+  );
+
   const books = (booksRs.results ?? []).map((b) => {
     const resources: Record<Resource, ResourceSyncStatus | null> = {} as Record<
       Resource,
@@ -126,7 +138,12 @@ admin.get("/sync-status", async (c) => {
         prNumber: exp?.pr_number ?? null,
       };
     }
-    return { book: b.book, importedAt: b.imported_at, resources };
+    return {
+      book: b.book,
+      importedAt: b.imported_at,
+      locked: lockedBooks.has(b.book),
+      resources,
+    };
   });
 
   return c.json({ books });
@@ -259,12 +276,24 @@ admin.post("/users", async (c) => {
   }
 
   const addedBy = c.get("userId") ?? null;
-  await c.env.DB.prepare(
+  // The count-then-write check above races: two admins demoting each other at
+  // the same moment both read `admins = 2`, both writes land, and nobody can
+  // administer the app again without hand-editing D1. With exactly two admins
+  // configured (deferredreward + richmahn) that is the live shape, not a
+  // theoretical one. So the demotion is ALSO guarded inside the statement —
+  // the WHERE re-counts admins as part of the same write, and `changes === 0`
+  // means we lost the race. The pre-check stays because it produces the
+  // friendly error on the common, uncontended path.
+  const res = await c.env.DB.prepare(
     `INSERT INTO user_roles (dcs_username, role, added_by) VALUES (?1, ?2, ?3)
-     ON CONFLICT(dcs_username) DO UPDATE SET role = excluded.role, added_by = excluded.added_by`,
+     ON CONFLICT(dcs_username) DO UPDATE SET role = excluded.role, added_by = excluded.added_by
+     WHERE excluded.role = 'admin'
+        OR user_roles.role <> 'admin'
+        OR (SELECT COUNT(*) FROM user_roles ur WHERE ur.role = 'admin') > 1`,
   )
     .bind(username, role, addedBy)
     .run();
+  if (!res.meta.changes) return c.json({ error: "last_admin" }, 409);
 
   const row = await c.env.DB.prepare(
     `SELECT dcs_username, role, added_at, added_by FROM user_roles WHERE dcs_username = ?1`,
@@ -292,7 +321,19 @@ admin.delete("/users/:username", async (c) => {
     if (admins <= 1) return c.json({ error: "last_admin" }, 409);
   }
 
-  await c.env.DB.prepare(`DELETE FROM user_roles WHERE dcs_username = ?1`).bind(username).run();
+  // Same race as the demotion path above — re-assert "more than one admin
+  // survives" inside the DELETE so two concurrent mutual removals can't both
+  // land and leave zero admins. `changes === 0` means we lost the race (the
+  // row still exists; the other request got there first).
+  const res = await c.env.DB.prepare(
+    `DELETE FROM user_roles
+      WHERE dcs_username = ?1
+        AND (role <> 'admin'
+             OR (SELECT COUNT(*) FROM user_roles ur WHERE ur.role = 'admin') > 1)`,
+  )
+    .bind(username)
+    .run();
+  if (!res.meta.changes) return c.json({ error: "last_admin" }, 409);
   return c.json({ ok: true });
 });
 
@@ -308,7 +349,19 @@ const ImportBody = z.object({
 
 // No force flag here (deliberately out of scope for this PR) — normal
 // pristine-row protections apply same as POST /api/books/:book/reimport.
-admin.post("/import", async (c) => {
+//
+// bookLockGuard is mounted per-route rather than on the whole /api/admin
+// sub-app: this is the only admin route that WRITES book content, and the
+// guard must not block the read-only status/PR/user routes. It resolves the
+// book from the JSON body (Hono caches the parsed body, so the handler's own
+// c.req.json() below still resolves). Gating this is not optional — the
+// equivalent manual route POST /api/books/:book/reimport is already covered
+// by the guard mounted on /api/books/:book/*, so leaving this one open would
+// mean the same user action is frozen on one route and permitted on the
+// other. Note the nightly Workflow reimport is deliberately NOT gated (see
+// bookLockGuard.ts); that exemption is about the unattended cron keeping a
+// frozen book matching master, not about hand-triggered pulls.
+admin.post("/import", bookLockGuard, async (c) => {
   let body: unknown;
   try {
     body = await c.req.json();

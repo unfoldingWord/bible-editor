@@ -115,6 +115,28 @@ Highlights that bite repeatedly:
   being cited as one — it compares only D1 and master, and adopts on ancestor-free
   predicates (a field no human can own, or a whitespace-only difference).
   See `verseMerge.ts`, `verse_merge_conflicts` (migration 0044).
+- **To count what bible-editor pushed to Door43, match `bible-editor: {BOOK} {resource} →
+  master (#PR)`.** The merge bot squashes our `-be-` PRs, so the message on `master` is
+  NOT the branch commit's `bible-editor export: …` text and does NOT contain `-be-`.
+  Searching for either of those returns zero hits and reads as "we never pushed that
+  book" — a false negative I published before being corrected: the true count was 125
+  pushes to 25 already-published books over ~300 commits per repo. Note the arrow is
+  U+2192, and Windows consoles need `sys.stdout.reconfigure(encoding="utf-8")` or the
+  script dies mid-scan. Same class as the measurement-harness lesson: when a scan
+  reports zero, verify the pattern against one known-true example (e.g. en_tn commit
+  `58ea381e`) before believing it.
+
+- **`isReadOnly()` in `web/src/sync/api.ts` suppresses the SAVE, not the INPUT.** It
+  short-circuits the outbox and drafts, but nothing it does sets `contentEditable=false`
+  or disables a button — so a "read-only" surface can still be typed into, look like it
+  worked, and silently discard the work. The **viewer role has this same latent gap
+  today.** Any new read-only mode must ALSO thread a flag into the props that actually
+  disable editing (the chapter-lock plumbing in `docs/ai-pipeline-handoff.md` is the
+  pattern). Two corollaries found while building book locks: drag-and-drop surfaces (the
+  aligner) are invisible to a `contenteditable` audit, so check them separately; and a
+  blanket write-block in `request()` also kills writes the server deliberately still
+  allows — it made comments vanish and made unlocking impossible from the UI. Split
+  read-only into named reasons rather than one global boolean.
 
 - **"Where is the user?" has no single source in this app — and both available sources
   are blind in a different direction.** `activeVerse` is Shell-LOCAL state
