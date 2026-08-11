@@ -817,6 +817,12 @@ export interface ReimportCounts {
   // aged past retention). D1 was kept, the pre-existing safe default.
   // Optional, diagnostic.
   merge_no_base?: number;
+  merge_unavailable?: number;
+  // A "keep_converged" verse whose RAW content_json actually differed — a
+  // genuine, cosmetic-only Door43 edit that verseMerge.ts's whitespace-
+  // insensitive comparison treats as "no change" (and every nightly export
+  // then reverts). Optional, diagnostic — see bookReimport.ts's field doc.
+  merge_cosmetic_ignored?: number;
   dcs_404: number;
   errors: string[];
 }

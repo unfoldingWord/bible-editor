@@ -45,8 +45,8 @@ CREATE TABLE verse_merge_conflicts (
   resource TEXT NOT NULL,            -- 'ult' | 'ust'
   chapter INTEGER NOT NULL,
   verse INTEGER NOT NULL,
-  action TEXT NOT NULL,              -- 'adopt_conflict' | 'keep_alignment_refused'
-  reason TEXT NOT NULL,              -- 'both_changed' | 'alignment_shrink' | 'unparseable'
+  action TEXT NOT NULL,              -- 'adopt' | 'adopt_conflict' | 'keep_alignment_refused'
+  reason TEXT NOT NULL,              -- 'master_only' | 'both_changed' | 'alignment_shrink' | 'unparseable'
   overwritten_version INTEGER,       -- the D1 version replaced; the old text is at this version in verse history
   alignment TEXT,                    -- JSON {beforeAligned, afterAligned, lostWords} or NULL
   detected_at INTEGER NOT NULL DEFAULT (unixepoch())

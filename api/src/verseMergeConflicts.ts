@@ -7,9 +7,11 @@
 // Cleared by verses.ts's PATCH route when a human next saves the conflicting
 // verse.
 //
-// Three action values land here (the migration's own comment only documents
-// two — it predates the "adopt" case below, and per this task's ownership
-// split that comment/CHECK can't be widened from here; report it instead):
+// Three action values land here (the migration's header comment,
+// 0044_verse_merge_conflicts.sql, already documents all three — only its
+// inline `action`/`reason` COLUMN comments lagged behind and are fixed
+// alongside this pass. There is no CHECK constraint on `action`, so a
+// future merge outcome doesn't need a migration to become recordable):
 //   'adopt'                  — master moved, we didn't. No human judgment
 //                              needed; recorded purely as an audit trail so
 //                              every overwrite of human-owned text has a
@@ -24,10 +26,13 @@
 // two — a clean 'adopt' needs nobody's attention, so it stays in the table
 // (audit trail) but never in the count a human sees.
 //
-// overwritten_version is the D1 `verses.version` that was replaced (or, for
-// keep_alignment_refused, the version that was NOT overwritten but is flagged
-// for review) — the old text is recoverable from that verse's version
-// history (GET /api/verses/.../history) at that version.
+// overwritten_version is the D1 `verses.version` that was replaced — the old
+// text is recoverable from that verse's version history
+// (GET /api/verses/.../history) at that version. It is **NULL for
+// keep_alignment_refused**, because a refusal replaced nothing; presenting a
+// pointer there would send a reviewer to text that was never overwritten.
+// The upsert below enforces that invariant even when a row changes action
+// between nights.
 
 import { Hono } from "hono";
 import type { Env } from "./index";
@@ -64,8 +69,10 @@ const WRITE_BATCH = 90;
 // `detected_at` on every re-detection of the SAME still-unresolved conflict —
 // making "how long has this been sitting unresolved" unrecoverable. The
 // DO UPDATE preserves the original `detected_at` (it's simply not in the SET
-// list) while still refreshing action/reason/overwritten_version/alignment to
-// this run's values.
+// list). It does NOT blindly refresh the other columns to this run's values —
+// see the CASE expressions below, which refuse to downgrade a row still
+// awaiting human judgement and keep `overwritten_version` consistent with the
+// surviving action.
 //
 // Returns false (and logs) when the write fails, so a caller can fold that
 // into a counter (see bookReimport.ts's ReimportCounts.merge_record_failed)
@@ -89,10 +96,51 @@ export async function recordVerseMergeConflicts(
                (book, resource, chapter, verse, action, reason, overwritten_version, alignment, detected_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, unixepoch())
              ON CONFLICT (book, resource, chapter, verse) DO UPDATE SET
-               action = excluded.action,
-               reason = excluded.reason,
-               overwritten_version = excluded.overwritten_version,
-               alignment = excluded.alignment`,
+               -- A row needing human judgement must never be DOWNGRADED by a
+               -- later routine adoption. Night 1 records 'adopt_conflict'
+               -- pointing at overwritten human version v2; before anyone
+               -- reviews it, master changes again and night 2's merge is a
+               -- clean 'adopt'. Overwriting action would flip the row to
+               -- 'adopt' — which the banner deliberately filters out — so the
+               -- unreviewed collision would vanish from the one surface a
+               -- human watches, and the v2 pointer would be replaced by v3.
+               -- Anti-downgrade, scoped to ADOPTIONS ONLY. Night 1 records
+               -- 'adopt_conflict' pointing at overwritten human version v2;
+               -- before anyone reviews it, master changes again and night 2 is
+               -- a clean 'adopt'. Flipping to 'adopt' would drop the row from
+               -- the banner (which filters clean adoptions out), so the
+               -- unreviewed collision would vanish from the one surface a human
+               -- watches.
+               --
+               -- A 'keep_alignment_refused' row is deliberately NOT protected
+               -- here: a refusal means we kept D1 and wrote nothing, so a later
+               -- adoption that actually LANDED supersedes it as a statement of
+               -- fact. Pinning the row to 'refused' after a real write would
+               -- make action and overwritten_version tell two different nights'
+               -- stories — which is exactly how a refusal ended up carrying a
+               -- recovery pointer to text that was never replaced, silently
+               -- deleting the refusal guidance from the banner.
+               action = CASE
+                 WHEN excluded.action = 'adopt' AND verse_merge_conflicts.action = 'adopt_conflict'
+                 THEN verse_merge_conflicts.action
+                 ELSE excluded.action
+               END,
+               reason = CASE
+                 WHEN excluded.action = 'adopt' AND verse_merge_conflicts.action = 'adopt_conflict'
+                 THEN verse_merge_conflicts.reason
+                 ELSE excluded.reason
+               END,
+               -- The pointer must follow the SURVIVING action, or the column
+               -- stops meaning "the version we replaced". A refusal replaced
+               -- nothing, so it carries NULL. Otherwise keep the EARLIEST
+               -- pointer: it names the oldest human text that was overwritten
+               -- and never reviewed; the newer version is still reachable in
+               -- verse history, but nothing else records where the first went.
+               overwritten_version = CASE
+                 WHEN excluded.action = 'keep_alignment_refused' THEN NULL
+                 ELSE COALESCE(verse_merge_conflicts.overwritten_version, excluded.overwritten_version)
+               END,
+               alignment = COALESCE(excluded.alignment, verse_merge_conflicts.alignment)`,
           ).bind(
             book,
             resource,
@@ -272,7 +320,14 @@ export async function raiseVerseMergeConflictAlert(
   const more = rows.length > 10 ? `; +${rows.length - 10} more` : "";
   // The two outcomes need different instructions, so say which is which rather
   // than emitting one hint that is wrong for half the rows.
-  const overwritten = rows.filter((r) => r.overwrittenVersion != null).length;
+  // Split on ACTION, not on `overwrittenVersion != null`. The pointer is a
+  // recovery aid; the action is the fact. Deriving "did we take Door43's
+  // version?" from the pointer couples this wording to a nullable column, and
+  // when a refusal row once acquired a pointer it silently reported the
+  // refusal as an overwrite AND dropped the refusal guidance entirely — the
+  // one sentence warning that Door43's change was NOT taken and tonight's
+  // export will write over it. Keyed on action, that cannot recur.
+  const overwritten = rows.filter((r) => r.action !== "keep_alignment_refused").length;
   const kept = rows.length - overwritten;
   const guidance = [
     overwritten > 0
@@ -311,9 +366,19 @@ export async function raiseVerseMergeConflictAlert(
   // `alignment_shrink` (master changed, D1 didn't). Drop the blanket claim;
   // reasonBreakdown plus the per-outcome `guidance` below already say what
   // was actually measured for each row.
+  // FIX 8: when there are zero adjudicated rows but noBaseCount > 0, the old
+  // wording read "Sync flagged 0 verse(s) ... for review (none)." immediately
+  // followed by guidance's "N verse(s) could not be adjudicated..." — the
+  // lead sentence's "(none)" directly contradicted the sentence right after
+  // it. Drop the now-meaningless reason breakdown when there's nothing to
+  // break down, so the lead sentence says only what's true (0 adjudicated
+  // conflicts) and lets `guidance` carry the noBaseCount story without
+  // sounding like it's disagreeing with the sentence before it.
   const message =
-    `Sync flagged ${rows.length} verse(s) in ${book} ${resource.toUpperCase()} for review ` +
-    `(${reasonBreakdown}).${refsClause} ${guidance}`;
+    rows.length === 0
+      ? `Sync flagged 0 verse(s) in ${book} ${resource.toUpperCase()} for adjudicated review.${guidance ? ` ${guidance}` : ""}`
+      : `Sync flagged ${rows.length} verse(s) in ${book} ${resource.toUpperCase()} for review ` +
+        `(${reasonBreakdown}).${refsClause} ${guidance}`;
   try {
     await env.DB.prepare(`DELETE FROM system_alerts WHERE username = ?1 AND source = ?2 AND dismissed_at IS NULL`)
       .bind(ALERT_USERNAME, source)

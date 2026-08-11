@@ -460,23 +460,27 @@ verses.patch("/:book/:chapter/:verse/:bibleVersion", requireEditor, async (c) =>
     // simply won't reappear next time, but nothing here proactively clears an
     // already-posted banner mid-run.
     //
-    // Guarded on the UPDATE above having actually landed. Batch statements run
-    // in order, so by now the version-CAS UPDATE has either bumped this row to
-    // newVersion or changed nothing; only in the former case did a human
-    // really resolve anything. Clearing unconditionally would discard a live
-    // flag on a request that then 409s — and losing the pointer to the
-    // overwritten text is the exact failure this table exists to prevent.
+    // Guarded on THIS request's UPDATE having actually landed, via the same
+    // `changes() > 0` chain the edit_log statement above uses. The guard
+    // chains correctly because that INSERT itself only fires when the UPDATE
+    // fired: UPDATE changes 1 → INSERT inserts 1 → changes() is 1 here;
+    // UPDATE changes 0 → INSERT inserts 0 → changes() is 0 here.
+    //
+    // It deliberately does NOT test `verses.version = newVersion`. That looks
+    // equivalent and is not: if the nightly sync's own adoption wins the CAS
+    // race and bumps this verse to newVersion first, our UPDATE changes
+    // nothing and the request 409s — yet the row would already sit at
+    // newVersion, so a version test would fire and DELETE the conflict row
+    // that very sync just created. That erases the pointer to the overwritten
+    // text on a save that never landed, which is the exact failure this table
+    // exists to prevent.
     c.env.DB
       .prepare(
         `DELETE FROM verse_merge_conflicts
           WHERE book = ?1 AND resource = ?2 AND chapter = ?3 AND verse = ?4
-            AND EXISTS (
-              SELECT 1 FROM verses
-               WHERE book = ?1 AND chapter = ?3 AND verse = ?4
-                 AND bible_version = ?5 AND version = ?6
-            )`,
+            AND changes() > 0`,
       )
-      .bind(book, bibleVersion.toLowerCase(), chapter, verse, bibleVersion, newVersion),
+      .bind(book, bibleVersion.toLowerCase(), chapter, verse),
   ]);
 
   if (!updateRes.meta.changes) {

@@ -113,17 +113,49 @@ export interface VerseMergeResult {
 //     means master didn't really move.
 //   - step 5 (ours == base), the `adopt` gate: this branch is only reached
 //     once step 3 has ALREADY established theirs != base (master genuinely
-//     changed). Normalizing can only make ours look MORE like base, so it can
-//     only REDUCE how often this branch is reached, never manufacture a new
-//     adoption that wasn't already eligible.
+//     changed). FIX 6 CORRECTION — this bullet previously claimed
+//     "normalizing can only make ours look MORE like base, so it can only
+//     REDUCE how often this branch is reached." That is backwards: making
+//     ours look MORE like base makes `keysEqual(oursKey, baseKey)` true
+//     MORE often, so this branch (and the `adopt` return) fires MORE often,
+//     not less — and correspondingly `adopt_conflict` fires less. What
+//     stays true is the claim on WRITE COUNT: every verse that reaches this
+//     gate already had theirs != base (a real, landed difference), so
+//     normalization never manufactures an adoption that wasn't already
+//     going to write something — it only reclassifies some `adopt_conflict`
+//     writes (flagged for human review) into unflagged `adopt` writes. The
+//     mitigation: every landed adoption, `adopt` included, gets a durable
+//     `verse_merge_conflicts` row with its `overwritten_version` (see
+//     applyVerseRows step 6b / recordVerseMergeConflicts) — the banner
+//     alert filters `adopt` out, but the text is still recoverable via
+//     GET /api/verse-merge-conflicts/:book and the verse's own version
+//     history. One reachable path to this shape: the ancestor sub-select in
+//     applyVerseRows has no `source` filter (an `ai_pipeline` write is an
+//     eligible ancestor), while `human_edit_after_export` requires
+//     `source IS NULL` — so an AI whitespace-churn write landing after the
+//     watermark can itself become the `base`, and a later human edit that
+//     normalizes back toward it reads as `adopt` instead of
+//     `adopt_conflict`.
 // Net effect: adoptions caused purely by round-trip whitespace noise drop to
-// zero; nothing that was a real content change stops being adopted. The one
-// cost is that a genuinely whitespace-only edit on master is no longer
-// adopted — that is the pre-existing status quo (this module didn't exist
-// before), not a regression, and export.ts's normalizeUsfmFormatting already
-// emits the maintainer's preferred shape on our own renders (see PR
-// #417/#422), so formatting divergence is handled on the export side, not
-// here.
+// zero; nothing that was a real content change stops being adopted (in the
+// sense that a write still happens — see the correction above for how it can
+// be classified differently). The one cost is that a genuinely
+// whitespace-only edit on master is no longer adopted at all — that is the
+// pre-existing status quo (this module didn't exist before), not a
+// regression. FIX 5 CORRECTION — this comment previously claimed
+// export.ts's normalizeUsfmFormatting "already emits the maintainer's
+// preferred shape on our own renders... so formatting divergence is handled
+// on the export side, not here." That is false: normalizeUsfmFormatting
+// (usfmFormat.ts) is entirely LINE-level (marker run order, blank-line
+// layout, poetry joins) — there is no intra-text whitespace collapsing
+// anywhere in the render path. The real trade-off: a maintainer genuinely
+// adding a missing space after a comma on Door43 is classified
+// `keep_converged` here, recorded nowhere, and silently reverted by every
+// nightly export — there is no side of this codebase that "handles" it.
+// What this fix DOES do about that: when the comparison says converged but
+// the raw content_json strings actually differed, applyVerseRows increments
+// `counts.merge_cosmetic_ignored` so the class is visible in the reimport
+// counts rather than invisible.
 function normalizeForCompare(value: unknown): unknown {
   if (typeof value === "string") return value.replace(/\s+/g, " ").trim();
   return value;

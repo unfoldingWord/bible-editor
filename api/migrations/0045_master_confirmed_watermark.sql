@@ -1,11 +1,16 @@
 
--- Watermark on book_resource_syncs (0028): the last time the nightly export
--- actually MEASURED — via a live GET against Door43 master inside
+-- Watermark on book_resource_syncs (0028): stamped when the nightly export
+-- has actually MEASURED — via a live GET against Door43 master inside
 -- commitToDcs — that our rendered output for this (book, resource) is
--- byte-identical to what master holds right now. This is positive,
--- freshly-observed proof our publish landed, which is what verseMerge.ts's
--- three-way merge needs as its ancestor cutoff: "what we last published to
--- master."
+-- byte-identical to what master holds right now. That measurement is
+-- still a live GET; only the STAMPED VALUE's meaning has since changed
+-- (bookReimport.ts's FIX D): it is `readAt`, the earlier time buildResource
+-- read D1, not the time of the GET/measurement itself — closing a race
+-- where a human edit landing between the D1 read and the measurement would
+-- otherwise be dated before the watermark and misread as part of the
+-- ancestor. This is positive, freshly-observed proof our publish landed
+-- (as of that read time), which is what verseMerge.ts's three-way merge
+-- needs as its ancestor cutoff: "what we last published to master."
 --
 -- This is deliberately NOT the same as two columns that look similar but
 -- measure something else:

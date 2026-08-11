@@ -1765,9 +1765,21 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
   // actually covers now).
   private async stampMasterConfirmed(book: string, resource: Resource, readAt: number): Promise<void> {
     try {
+      // FIX 7: monotonic, not unconditional. `readAt` is an earlier D1-read
+      // timestamp (see FIX D above), not unixepoch() at write time, so two
+      // overlapping export instances can call this out of order — a slower
+      // instance with an OLDER readAt could otherwise overwrite a faster
+      // instance's newer stamp and move the watermark BACKWARDS. A watermark
+      // older than it should be can make an ancestor that's actually stale
+      // look current, or (the sharper failure) turn a master that never
+      // moved since the real, newer watermark into an `adopt_conflict` in
+      // verseMerge.ts — master overwriting a D1 edit that landed after the
+      // true last-confirmed time. MAX(existing, new) makes this call safe in
+      // any arrival order.
       const result = await this.env.DB.prepare(
-        `UPDATE book_resource_syncs SET master_confirmed_at = ?3
-         WHERE book = ?1 AND resource = ?2`,
+        `UPDATE book_resource_syncs
+            SET master_confirmed_at = MAX(COALESCE(master_confirmed_at, 0), ?3)
+          WHERE book = ?1 AND resource = ?2`,
       )
         .bind(book, resource, readAt)
         .run();
