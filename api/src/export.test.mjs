@@ -5,7 +5,7 @@
 // instead of getting silently flattened to `\v 6`. Not a test framework;
 // failures exit non-zero.
 
-import { attributeTsvShrink, buildAlignmentShrinkAlertMessage, buildUsfmInvalidAlertMessage, classifyAlignmentLossSeverity, offenderProvenanceFromLog, buildExportBranch, buildTnTsv, buildTqTsv, buildTwlTsv, buildUsfm, classifyAlignmentShrinkOffenders, classifyRevertSeverity, commitToDcs, countDuplicateMasterIds, describeShrinkRefusal, ensureDcsPr, exportTags, exportTsvShrinkRefused, findDcsOpenPr, parseTsvIds, recreateExportBranchFromMaster, shouldRecordRevertReport, tsvRevertReport, updateDcsPrBranch, usfmAlignmentShrinkRefused, usfmRevertReport } from "./export.ts";
+import { attributeTsvShrink, buildAlignmentShrinkAlertMessage, buildUsfmInvalidAlertMessage, classifyAlignmentLossSeverity, offenderProvenanceFromLog, buildExportBranch, buildTnTsv, buildTqTsv, buildTwlTsv, buildUsfm, classifyAlignmentShrinkOffenders, classifyRevertSeverity, commitToDcs, countDuplicateMasterIds, describeShrinkRefusal, ensureDcsPr, exportTags, exportTsvShrinkRefused, findDcsOpenPr, isMasterConfirmed, mechanicalOverwriteAlert, parseTsvIds, recreateExportBranchFromMaster, shouldRecordRevertReport, tsvRevertReport, updateDcsPrBranch, usfmAlignmentShrinkRefused, usfmRevertReport } from "./export.ts";
 import { CorruptContentJsonError } from "./contentJson.ts";
 import { validateUsfm } from "./usfmValidate.ts";
 
@@ -2096,6 +2096,41 @@ function utf8Base64(s) {
   );
 }
 
+// --- isMasterConfirmed: the ONLY commitToDcs outcome that proves master
+// holds our content ---
+// branchTouched:false fires from exactly one place in commitToDcs — its own
+// pre-check comparing the render directly against a live GET of master. Any
+// branchTouched:true result means master itself was never re-read as
+// matching this run, whether because we just pushed new content (real
+// divergence) or because only the export branch's own (possibly-unmerged)
+// last commit matched. Both must be NOT confirmed — a `-be-` branch merging
+// is an external DCS Actions job this codebase doesn't observe.
+{
+  const cleanMeasuredMatch = isMasterConfirmed({ branchTouched: false });
+  assert(
+    cleanMeasuredMatch === true,
+    `branchTouched:false (this run's live GET against master matched our render byte-for-byte) -> confirmed`,
+  );
+
+  const substantiveDivergence = isMasterConfirmed({ branchTouched: true });
+  assert(
+    substantiveDivergence === false,
+    `branchTouched:true from a fresh push (content differed from master, so we committed to the branch) -> NOT confirmed`,
+  );
+
+  // Same branchTouched:true value, different (unmeasurable from this shape
+  // alone) cause: content matched the BRANCH's last commit, not master's —
+  // an open, possibly-unmerged PR. isMasterConfirmed can't and must not tell
+  // these apart in the predicate's own terms; both are branchTouched:true and
+  // both must return false, which is exactly why the predicate does not
+  // examine `changed` at all.
+  const unmergedBranchMatch = isMasterConfirmed({ branchTouched: true });
+  assert(
+    unmergedBranchMatch === false,
+    `branchTouched:true from matching the export branch's own last commit (master unread/unconfirmed this run) -> NOT confirmed (the fail-closed case)`,
+  );
+}
+
 // --- classifyRevertSeverity: escalation threshold ---
 // SYSTEMIC_REVERTS = 15 (see export.ts comment above classifyRevertSeverity):
 // more than 15 substantive entries across usfm+tsv escalates the wording;
@@ -2125,6 +2160,79 @@ function utf8Base64(s) {
     [],
   );
   assert(allFormatting.escalate === false, `formatting-only entries, however many, never escalate`);
+}
+
+// --- mechanicalOverwriteAlert: mechanical export overwriting master ---
+// "mechanical" means no HUMAN contributor was recorded for this book+resource
+// since the last export (contributorsFor filters e.source IS NULL) — but our
+// own AI-pipeline and reimport writes also carry no contributor, so this does
+// NOT by itself prove the overwrite is someone else's out-of-band work (see
+// FIX F / "Alert must only state a measured cause"). The reason string must
+// therefore state only what was measured (no human contributor + N
+// substantive diffs), not assert a cause. Purely observational — no `block`
+// field, never gates shipping.
+{
+  const mkUsfm = (n, cls) => Array.from({ length: n }, (_, i) => ({ ref: `1:${i + 1}`, class: cls }));
+  const mkTsv = (n, cls) => Array.from({ length: n }, (_, i) => ({ ref: `1:${i + 1}`, class: cls }));
+
+  const mechanicalSubstantive = mechanicalOverwriteAlert(true, mkUsfm(3, "substantive"), []);
+  assert(
+    mechanicalSubstantive.alert === true,
+    `mechanical export + substantive usfm entries -> alert fires`,
+  );
+  assert(mechanicalSubstantive.substantive === 3, `substantive count reflects the 3 substantive usfm entries`);
+  // FIX F: the reason must state only what was measured (no human
+  // contributor, N substantive diffs) — never assert a cause ("overwrites
+  // out-of-band work") that an AI-pipeline or reimport write could equally
+  // produce.
+  assert(
+    !mechanicalSubstantive.reason.includes("overwrite") && !mechanicalSubstantive.reason.includes("out-of-band"),
+    `reason does not assert an unmeasured cause`,
+  );
+  assert(
+    mechanicalSubstantive.reason.includes("undetermined"),
+    `reason states the cause is undetermined`,
+  );
+
+  const mechanicalFormattingOnly = mechanicalOverwriteAlert(true, mkUsfm(5, "formatting"), []);
+  assert(
+    mechanicalFormattingOnly.alert === false,
+    `mechanical export + formatting-only usfm entries -> no alert (cosmetic normalization, not an overwrite)`,
+  );
+
+  const mechanicalTagsOnly = mechanicalOverwriteAlert(true, [], mkTsv(5, "tags_only"));
+  assert(
+    mechanicalTagsOnly.alert === false,
+    `mechanical export + tags_only tsv entries -> no alert`,
+  );
+
+  const mechanicalWhitespaceOnly = mechanicalOverwriteAlert(true, [], mkTsv(5, "whitespace_only"));
+  assert(
+    mechanicalWhitespaceOnly.alert === false,
+    `mechanical export + whitespace_only tsv entries -> no alert`,
+  );
+
+  const nonMechanicalSubstantive = mechanicalOverwriteAlert(false, mkUsfm(3, "substantive"), []);
+  assert(
+    nonMechanicalSubstantive.alert === false,
+    `non-mechanical export (a human contributed) + substantive entries -> no alert; a human on our side ` +
+      `plausibly explains the overwrite`,
+  );
+
+  const emptyBoth = mechanicalOverwriteAlert(true, [], []);
+  assert(emptyBoth.alert === false, `mechanical export with no entries at all -> no alert`);
+  assert(emptyBoth.substantive === 0, `substantive count is 0 when both entry lists are empty`);
+
+  // Substantive count is the SUM across usfm and tsv entries, not just one side.
+  const mixedKinds = mechanicalOverwriteAlert(true, mkUsfm(2, "substantive"), mkTsv(4, "substantive"));
+  assert(
+    mixedKinds.alert === true,
+    `mechanical export + substantive entries split across usfm and tsv -> alert fires`,
+  );
+  assert(
+    mixedKinds.substantive === 6,
+    `substantive count is the sum of usfm (2) and tsv (4) substantive entries, not just one side`,
+  );
 }
 
 console.log("\nAll export smoke checks passed.");

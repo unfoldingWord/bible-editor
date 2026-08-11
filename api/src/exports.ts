@@ -22,6 +22,10 @@ const RunBody = z.object({
   // Override the TSV shrink guard for a verified-intentional bulk deletion.
   // Requires book + resource to be set; the workflow ignores it otherwise.
   allowShrink: z.boolean().optional(),
+  // FIX H: override reimportSyncGate.ts's systemic-merge-refusal gate for a
+  // book+resource a human has verified by hand — same requirement as
+  // allowShrink (book + resource both set); the workflow ignores it otherwise.
+  allowMergeRefusal: z.boolean().optional(),
 });
 
 exports.post("/run", requireAdmin, async (c) => {
@@ -44,12 +48,16 @@ exports.post("/run", requireAdmin, async (c) => {
   if (parsed.data.allowShrink && !(parsed.data.book && parsed.data.resource)) {
     return c.json({ error: "allow_shrink_requires_book_and_resource" }, 400);
   }
+  if (parsed.data.allowMergeRefusal && !(parsed.data.book && parsed.data.resource)) {
+    return c.json({ error: "allow_merge_refusal_requires_book_and_resource" }, 400);
+  }
   const params = {
     book: parsed.data.book?.toUpperCase(),
     resource: parsed.data.resource as Resource | undefined,
     dryDcs: parsed.data.dryDcs,
     validateAndMerge: parsed.data.validateAndMerge,
     allowShrink: parsed.data.allowShrink,
+    allowMergeRefusal: parsed.data.allowMergeRefusal,
   };
   // Deterministic id (second precision) so a double-submitted manual run
   // rejects on the duplicate instead of racing the first. The nightly cron

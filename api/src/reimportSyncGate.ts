@@ -67,3 +67,72 @@ export function shouldRecordResourceSync(counts: {
   if (counts.counts_incomplete === true) return false;
   return counts.chapters_locked === 0 && counts.prune_locked === 0;
 }
+
+// ── Systemic alignment-refusal gate (verseMerge.ts's "keep_alignment_refused") ──
+//
+// A `keep_alignment_refused` verse means the nightly Door43->D1 merge
+// declined to adopt master's out-of-band edit because doing so would have
+// lost alignment on words neither side touched (see verseMerge.ts). Refusing
+// is per-verse and cheap — but declining to adopt does NOT stop tonight's
+// export from rendering D1's (unchanged) content back over master, which is
+// the exact revert the 1CH incident was about, just now with a banner
+// instead of silence.
+//
+// Decision (owner's call, not re-litigated here): a SMALL number of refusals
+// for one (book, resource) is fine — the per-verse verse_merge_conflicts
+// alert (see verseMergeConflicts.ts) gives a human what they need, and the
+// export proceeds normally. Once the count looks SYSTEMIC, a maintainer's
+// work is being reverted at scale — the same shape as the original bug, just
+// caught instead of silent — so the export must be held back entirely for
+// that resource: the caller withholds the (book, resource) watermark, which
+// makes checkMasterFreshness (exportWorkflow.ts) report `master_ahead` and
+// skip tonight's export with an honest `export_stale` alert, instead of
+// re-triggering the same refusals night after night.
+//
+// Pure (no D1) so it's regression-testable without a Workflow context — see
+// shouldRecordResourceSync above for the same convention. Deliberately a
+// SIBLING to shouldRecordResourceSync rather than a parameter folded into it:
+// the two gates test independent conditions (lock-held vs refusal-scale) and
+// either firing must withhold — see reimportSyncGate.test.mjs's interaction
+// cases and the call site in bookReimport.ts's `reimport-sync-${book}` step.
+export const SYSTEMIC_MERGE_REFUSAL_THRESHOLD = 5;
+
+// FIX H: a refusal is currently unresolvable through the app — saving the
+// flagged verse clears its verse_lane_checks/verse_merge_conflicts row but
+// does not make D1 equal master, so the NEXT sync recomputes the identical
+// refusal and the freeze persists indefinitely. `override` is the escape
+// hatch, in the spirit of the export shrink guard's `allowShrink`
+// (shrinkGuard.ts's shrinkOverrideAllowed): a human who has verified the
+// refused verses by hand can force this gate open for one run. Plumbed from
+// POST /api/exports/run's `allowMergeRefusal` param (exports.ts) through
+// ExportParams (exportWorkflow.ts) into runChunkedReimport's opts, gated the
+// same narrow way allowShrink is — only when the run names exactly one book
+// AND one resource, so no cron path can ever disable this wholesale. See
+// mergeRefusalOverrideAllowed below.
+export function isSystemicMergeRefusal(
+  refusedCount: number,
+  threshold: number = SYSTEMIC_MERGE_REFUSAL_THRESHOLD,
+  override: boolean = false,
+): boolean {
+  if (override) return false;
+  return refusedCount >= threshold;
+}
+
+// Whether an `allowMergeRefusal` request may override the systemic-refusal
+// gate above, for THIS specific resource. Mirrors shrinkOverrideAllowed's
+// shape and rationale exactly (shrinkGuard.ts): deliberately narrow — only a
+// run naming exactly ONE book and ONE resource qualifies, and the override
+// only applies to that named resource (never silently to a resource the
+// caller didn't ask to unblock). Every cron path omits book/resource, so the
+// nightly can never disable this gate wholesale.
+export function mergeRefusalOverrideAllowed(
+  params: { allowMergeRefusal?: boolean; book?: string; resource?: string },
+  resolvedBookCount: number,
+  resolvedResourceCount: number,
+  resourceBeingChecked: string,
+): boolean {
+  if (params.allowMergeRefusal !== true) return false;
+  if (!params.book || !params.resource) return false;
+  if (params.resource !== resourceBeingChecked) return false;
+  return resolvedBookCount === 1 && resolvedResourceCount === 1;
+}

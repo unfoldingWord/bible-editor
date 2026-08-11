@@ -85,6 +85,8 @@ function summarize(res: ReimportResponse): string {
   if (t.skipped_locked) parts.push(`${t.skipped_locked} skipped (AI pipeline running)`);
   if (t.skipped_noop) parts.push(`${t.skipped_noop} unchanged`);
   if (t.source_attr_reconciled) parts.push(`${t.source_attr_reconciled} source-attr fix(es) synced from master`);
+  if (t.merge_adopted) parts.push(`${t.merge_adopted} adopted from master (out-of-band correction)`);
+  if (t.merge_conflicts) parts.push(`${t.merge_conflicts} flagged for review (merge conflict)`);
   if (t.dcs_404) parts.push(`${t.dcs_404} resource(s) not on DCS`);
   if (parts.length === 0) return `Imported ${res.book} — no changes.`;
   return `Imported ${res.book}: ${parts.join(", ")}.`;

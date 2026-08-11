@@ -1031,6 +1031,80 @@ export function classifyRevertSeverity(
   return { escalate: false, reason: `routine_${substantive}_substantive_reverts` };
 }
 
+// Whether THIS commitToDcs result is positive, freshly-measured proof that
+// Door43 master already holds our rendered content for this (book,
+// resource) — the trustworthy "last published to master" ancestor cutoff
+// verseMerge.ts's three-way merge needs (see migration 0045's
+// master_confirmed_at header for the full rationale).
+//
+// `branchTouched === false` fires from exactly ONE place in commitToDcs:
+// its own pre-check ("First compare the rendered content against MASTER...
+// return changed=false WITHOUT creating/resetting the branch"). That is a
+// live GET against master, done THIS run, whose result was byte-identical
+// to our render — the one case that actually proves master holds this
+// content.
+//
+// `branchTouched === true` covers both directions of "not proven" and both
+// must return false here:
+//   - `changed: true` — we just pushed NEW content to the export branch
+//     because it differed from master. Substantive divergence; master does
+//     NOT hold this content (yet, and maybe never — the branch may not
+//     merge).
+//   - `changed: false` — content already matched the BRANCH's last commit
+//     (an open, possibly-unmerged `-be-` PR), not master itself. This is
+//     the trap the task spec warned about: it looks like "nothing to do"
+//     but master was never re-read this run, so it must not be read as
+//     confirmation.
+//
+// There is no "comparison not performed" flag on DcsCommitResult because an
+// unreadable master makes commitToDcs itself throw (dcs_lookup_failed)
+// before any result exists — exportWorkflow.ts's caller never reaches the
+// stamp call on that path, which is the fail-closed behavior by
+// construction, not something this predicate needs to encode.
+export function isMasterConfirmed(commit: Pick<DcsCommitResult, "branchTouched">): boolean {
+  return commit.branchTouched === false;
+}
+
+// "mechanical" means no HUMAN on our side edited this book+resource since the
+// last export (see MECHANICAL_CONTRIBUTOR above and contributorsFor's
+// `e.source IS NULL` filter). That does NOT mean nobody on our side wrote to
+// it — the AI pipeline (source='ai_pipeline') and the nightly reimport itself
+// (source='dcs_reimport') both write verses with no contributor recorded, so
+// a mechanical export pushing our OWN AI-authored or reimport-reconciled
+// content is indistinguishable from one pushing over a stranger's hand-edit.
+// This alert can therefore only state what it actually measured: no human
+// contributor was recorded, and N rows differ substantively from master. It
+// must NOT assert the cause — this repo has a standing lesson (see
+// "Absent measurement ≠ evidence" / "Alert must only state a measured
+// cause") that a self-inflicted defect (this file's own class of finding)
+// is exactly a claim manufactured from what was NOT checked. The
+// 2026-08-10 1CH incident that first motivated this alert is a real example
+// of the "somebody else's out-of-band work" case, but it is not the only
+// explanation this predicate's inputs can produce, so it must not be stated
+// as settled.
+//
+// This is purely observational, same as classifyRevertSeverity: no `block`
+// field, and it must never be used to gate shipping. Formatting/tags_only/
+// whitespace_only reverts are excluded on purpose — those are cosmetic
+// normalization we'd expect to win regardless of who last touched the row.
+export function mechanicalOverwriteAlert(
+  mechanical: boolean,
+  usfmEntries: UsfmRevertEntry[],
+  tsvEntries: TsvRevertEntry[],
+): { alert: boolean; substantive: number; reason: string } {
+  const substantive =
+    usfmEntries.filter((e) => e.class === "substantive").length +
+    tsvEntries.filter((e) => e.class === "substantive").length;
+  const alert = mechanical && substantive > 0;
+  const reason = alert
+    ? `${substantive} verse${substantive === 1 ? "" : "s"} changed on a mechanical export (no HUMAN contributor was ` +
+      `recorded for this book+resource since the last export) and differ substantively from master. The cause is ` +
+      `undetermined: our own AI-pipeline or reimport writes would also present this way (zero recorded ` +
+      `contributors), so this is not necessarily somebody else's edit on master.`
+    : `not_alerting_mechanical_${mechanical}_substantive_${substantive}`;
+  return { alert, substantive, reason };
+}
+
 // What D1 last recorded as the writer of an offending verse, read from the
 // `kind='verse'` edit_log (the same provenance signal bookReimport.ts's
 // `latest_source` sub-select uses): a human edit in the editor logs no

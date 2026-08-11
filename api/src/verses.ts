@@ -447,6 +447,40 @@ verses.patch("/:book/:chapter/:verse/:bibleVersion", requireEditor, async (c) =>
         newVersion,
         JSON.stringify({ ...parsed.data, alignment_delta: delta }),
       ),
+    // A human saving this verse clears any merge conflict the nightly sync
+    // flagged for it (see verseMergeConflicts.ts / verseMerge.ts) — in the
+    // same batch so it costs no extra subrequest. Mirrors rows.ts's
+    // review-flag auto-clear precedent (line ~666). NOTE this is honestly
+    // "touched", not "reviewed": ANY save of this verse clears the flag, even
+    // an unrelated typo fix that never looked at the flagged collision, so a
+    // refusal/conflict can read as "resolved" without anyone having reviewed
+    // it. The book-level system_alerts banner is NOT cleared by this DELETE —
+    // it is derived fresh from verse_merge_conflicts on the next sync (see
+    // raiseVerseMergeConflictAlert), so a stale banner entry for THIS verse
+    // simply won't reappear next time, but nothing here proactively clears an
+    // already-posted banner mid-run.
+    //
+    // Guarded on THIS request's UPDATE having actually landed, via the same
+    // `changes() > 0` chain the edit_log statement above uses. The guard
+    // chains correctly because that INSERT itself only fires when the UPDATE
+    // fired: UPDATE changes 1 → INSERT inserts 1 → changes() is 1 here;
+    // UPDATE changes 0 → INSERT inserts 0 → changes() is 0 here.
+    //
+    // It deliberately does NOT test `verses.version = newVersion`. That looks
+    // equivalent and is not: if the nightly sync's own adoption wins the CAS
+    // race and bumps this verse to newVersion first, our UPDATE changes
+    // nothing and the request 409s — yet the row would already sit at
+    // newVersion, so a version test would fire and DELETE the conflict row
+    // that very sync just created. That erases the pointer to the overwritten
+    // text on a save that never landed, which is the exact failure this table
+    // exists to prevent.
+    c.env.DB
+      .prepare(
+        `DELETE FROM verse_merge_conflicts
+          WHERE book = ?1 AND resource = ?2 AND chapter = ?3 AND verse = ?4
+            AND changes() > 0`,
+      )
+      .bind(book, bibleVersion.toLowerCase(), chapter, verse),
   ]);
 
   if (!updateRes.meta.changes) {
