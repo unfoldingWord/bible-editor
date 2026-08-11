@@ -165,6 +165,52 @@ function utf8Base64(s) {
   assert(uhb.includes('x-occurrence="2" x-occurrences="1"'), `UHB export leaves source occurrence verbatim`);
 }
 
+// --- export ensures every \zaln-s milestone carries x-lemma (issue: absent
+// attribute trips uw-content-validation priority 834+806; en_ult/33-MIC.usfm:419) ---
+{
+  const verseRow = (bibleVersion, vos) => ({
+    book: "MIC", chapter: 1, verse: 15, verse_end: null, bible_version: bibleVersion,
+    content_json: JSON.stringify({ verseObjects: vos }),
+    plain_text: "text", version: 1, updated_by: null, updated_at: 0,
+  });
+  const w = (text) => ({ type: "word", tag: "w", text, occurrence: "1", occurrences: "1" });
+  const zaln = (attrs, children) => ({
+    type: "milestone", tag: "zaln", strong: "H1", occurrence: "1", occurrences: "1",
+    ...attrs, children, endTag: "zaln-e\\*",
+  });
+
+  // Milestone with no `lemma` key at all → gains x-lemma="" in CANONICAL
+  // position, immediately after x-strong (not appended at the end). Position
+  // is load-bearing, not cosmetic: verified against the real
+  // uw-content-validation library that appending x-lemma="" at the end of
+  // the attribute list (after x-content) does NOT reliably clear priority
+  // 834/806 and instead trips five new "Unexpected Nth \zaln-s attribute"
+  // notices (825-829), because the library's attribute parser is itself
+  // positional. Only inserting right after x-strong clears both notices.
+  const missingLemma = [zaln({}, [w("to")])];
+  const outMissing = buildUsfm({ book: "MIC", bibleVersion: "ULT", headers: null, verses: [verseRow("ULT", missingLemma)] });
+  assert(outMissing.includes('x-strong="H1" x-lemma=""'), `absent lemma is inserted immediately after x-strong (canonical position)`);
+  assert(!outMissing.includes('x-occurrences="1" x-lemma=""'), `absent lemma is NOT appended at the end of the attribute list`);
+
+  // Milestone with lemma: "" already set → unchanged (still empty, not
+  // touched/duplicated, and NOT relocated to canonical position — only
+  // nodes that were actually missing lemma get their key order rebuilt).
+  const emptyLemma = [zaln({ lemma: "" }, [w("to")])];
+  const outEmpty = buildUsfm({ book: "MIC", bibleVersion: "ULT", headers: null, verses: [verseRow("ULT", emptyLemma)] });
+  assert(outEmpty.includes('x-occurrences="1" x-lemma=""'), `existing empty lemma stays exactly where it was, unmoved`);
+  assert((outEmpty.match(/x-lemma=/g) || []).length === 1, `existing empty lemma not duplicated`);
+
+  // Milestone with a real lemma value → left verbatim, not overwritten, not relocated.
+  const realLemma = [zaln({ lemma: "מִדְבָּר" }, [w("wilderness")])];
+  const outReal = buildUsfm({ book: "MIC", bibleVersion: "ULT", headers: null, verses: [verseRow("ULT", realLemma)] });
+  assert(outReal.includes('x-occurrences="1" x-lemma="מִדְבָּר"'), `existing real lemma preserved verbatim in its original position`);
+
+  // Non-milestone node (plain word, no lemma concept) → untouched, no x-lemma anywhere.
+  const noMilestone = [w("plain")];
+  const outNone = buildUsfm({ book: "MIC", bibleVersion: "ULT", headers: null, verses: [verseRow("ULT", noMilestone)] });
+  assert(!outNone.includes("x-lemma"), `non-milestone node gets no x-lemma attribute`);
+}
+
 // --- tsvCell escapes bare \r (and \r\n) instead of leaking it into the TSV ---
 {
   const row = (note) => ({
