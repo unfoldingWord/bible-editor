@@ -3174,8 +3174,8 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
             const created = (await api.createRow<TnRow>("tn", {
               book,
               chapter,
-              verse: ref.verse,
-              ref_raw: ref.ref_raw,
+              verse: chapter === 0 ? 0 : ref.verse,
+              ref_raw: chapter === 0 ? "front:intro" : ref.ref_raw,
               note: "",
               sort_order,
             }));
@@ -3225,8 +3225,11 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
             enqueueRow("tn", row, { verse: effectiveVerse, ref_raw, sort_order });
             // Follow the note to its new verse: the resource column only renders
             // notes in displayVerseRange, so without this the moved card vanishes
-            // from view. Navigating there confirms the move landed.
-            setActiveVerse(verse);
+            // from view. Navigating there confirms the move landed. Must match
+            // the stored verse (effectiveVerse), not the raw `verse` — at
+            // chapter 0 the note is stored at verse 0, so navigating to the raw
+            // verse would jump to a verse where it never renders.
+            setActiveVerse(effectiveVerse);
             setActiveNoteId(id);
           }}
           onReorderPreview={handleReorderPreview}

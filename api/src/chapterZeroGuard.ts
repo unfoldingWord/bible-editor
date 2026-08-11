@@ -1,15 +1,17 @@
-// A row at chapter 0 (the book-level intro) is legal ONLY as ref_raw
-// "front:intro", and only for tn (see importParsers.ts refParts and
+// A row at chapter 0 (the book-level intro) is legal ONLY as verse 0 with
+// ref_raw "front:intro", and only for tn (see importParsers.ts refParts and
 // REFERENCE_RE in lint.ts — chapter 0 is not a real chapter with verses, so
-// "0:1", "0:intro", "0:front" etc. have no valid rendering). The "Add note"
-// create path used to derive ref_raw as `${chapter}:${activeVerse}` with a
-// special case only for activeVerse === 0 (web/src/components/Shell.tsx
-// onNoteCreate), so viewing the chapter-0 pseudo-chapter with a nonzero
-// active verse minted an illegal "0:N" reference. DCS's validator only warns
-// on a malformed Reference (see lint.ts), so the row silently published —
-// this is exactly the shape of the ISA ee2w row (STATE.md). Reject it at
-// create/patch time rather than trust every future caller to derive ref_raw
-// correctly.
+// "0:1", "0:intro", "0:front" etc. have no valid rendering, and every
+// imported front:intro row is stored at verse 0). The "Add note" create path
+// used to derive ref_raw as `${chapter}:${activeVerse}` with a special case
+// only for activeVerse === 0 (web/src/components/Shell.tsx onNoteCreate), so
+// viewing the chapter-0 pseudo-chapter with a nonzero active verse minted an
+// illegal "0:N" reference — and a raw TSV paste could set verse to a nonzero
+// value directly while still carrying ref_raw "front:intro". DCS's validator
+// only warns on a malformed Reference (see lint.ts), so the row silently
+// published — this is exactly the shape of the ISA ee2w row (STATE.md).
+// Reject it at create/patch time rather than trust every future caller to
+// derive ref_raw (or verse) correctly.
 //
 // tq and twl differ from tn: a production census (2026-08-11) found ZERO
 // chapter-0 rows for either kind (tn has 37 legitimate "front:intro" rows
@@ -21,8 +23,9 @@
 export function isValidChapterZeroRef(
   kind: "tn" | "tq" | "twl",
   chapter: number,
+  verse: number,
   ref_raw: string,
 ): boolean {
   if (chapter !== 0) return true;
-  return kind === "tn" && ref_raw === "front:intro";
+  return kind === "tn" && verse === 0 && ref_raw === "front:intro";
 }

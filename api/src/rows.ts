@@ -223,10 +223,10 @@ rows.post("/:kind", requireEditor, async (c) => {
     );
   }
 
-  // Chapter 0 is only ever legal as ref_raw "front:intro", and only for tn
-  // (see chapterZeroGuard.ts — this is the ISA ee2w "0:1" incident; tq/twl
-  // have no legal chapter-0 shape at all).
-  if (!isValidChapterZeroRef(kind, data.chapter as number, data.ref_raw as string)) {
+  // Chapter 0 is only ever legal as verse 0 with ref_raw "front:intro", and
+  // only for tn (see chapterZeroGuard.ts — this is the ISA ee2w "0:1"
+  // incident; tq/twl have no legal chapter-0 shape at all).
+  if (!isValidChapterZeroRef(kind, data.chapter as number, data.verse as number, data.ref_raw as string)) {
     return c.json(
       {
         error: "invalid_body",
@@ -603,22 +603,28 @@ rows.patch("/:kind/:id", requireEditor, async (c) => {
   if (!current || current.deleted_at) return c.json({ error: "not_found" }, 404);
 
   // Same chapter-0 guard as the create path (see chapterZeroGuard.ts), applied
-  // here because the "change reference" PATCH can retarget ref_raw to an
-  // illegal "0:N" just as easily as a create can mint one. Chapter itself is
-  // never patched (same-chapter moves only — see the ref_raw comment below),
-  // so current.chapter is the row's real chapter for this check. Only runs
-  // when the patch actually touches ref_raw — a patch that doesn't touch the
-  // reference can't introduce this defect.
+  // here because the "change reference" PATCH can retarget ref_raw (or verse)
+  // to an illegal shape just as easily as a create can mint one. Chapter
+  // itself is never patched (same-chapter moves only — see the ref_raw
+  // comment below), so current.chapter is the row's real chapter for this
+  // check. Only runs when the patch actually touches verse or ref_raw — a
+  // patch that touches neither can't introduce this defect, so it falls back
+  // to the row's current (already-valid) verse/ref_raw untouched.
   if (
-    "ref_raw" in patch &&
-    !isValidChapterZeroRef(kind, current.chapter, patch.ref_raw as string)
+    ("verse" in patch || "ref_raw" in patch) &&
+    !isValidChapterZeroRef(
+      kind,
+      current.chapter,
+      ("verse" in patch ? (patch as { verse?: number }).verse : current.verse) as number,
+      ("ref_raw" in patch ? patch.ref_raw : (current.ref_raw as string)) as string,
+    )
   ) {
     return c.json(
       {
         error: "invalid_body",
         message:
           kind === "tn"
-            ? `Chapter 0 rows must use ref_raw "front:intro" (got ${JSON.stringify(patch.ref_raw)}).`
+            ? `Chapter 0 rows must use verse 0 and ref_raw "front:intro" (got verse=${JSON.stringify("verse" in patch ? patch.verse : current.verse)}, ref_raw=${JSON.stringify("ref_raw" in patch ? patch.ref_raw : current.ref_raw)}).`
             : `Chapter 0 is not valid for ${kind} rows.`,
       },
       400,
