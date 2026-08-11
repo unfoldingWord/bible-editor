@@ -1136,25 +1136,32 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       laneApplicable(lane, versesWithTn.has(activeVerse), versesWithTq.has(activeVerse));
     const checkersOf = (lane: ResourceLane) => laneIndex.get(laneKey(activeVerse, lane));
     return {
-      canCheck: meUserId != null,
+      // A locked book freezes QA checkoff too. Gating `canCheck` here rather
+      // than in each consumer is what actually removes the affordance: the
+      // resource panel's `done` and `all` controls render off this flag alone,
+      // so disabling only TimelineRail/ChapterBoard left a third live surface
+      // whose clicks hit the handler's early return and silently did nothing.
+      canCheck: meUserId != null && !bookLocked,
       applicable: applic,
       shade: (lane) => (applic(lane) ? shadeFromCheckers(checkersOf(lane), meUserId) : "open"),
       attribution: (lane) => laneAttribution(checkersOf(lane), meUserId),
       onToggle: (lane) => toggleLane(activeVerse, lane),
       onBulkToggle: (lane) => bulkLaneToggle(lane),
     };
-  }, [activeVerse, laneIndex, versesWithTn, versesWithTq, meUserId, toggleLane, bulkLaneToggle]);
+  }, [activeVerse, laneIndex, versesWithTn, versesWithTq, meUserId, bookLocked, toggleLane, bulkLaneToggle]);
 
   // Text-lane checkoff for the column/book scripture views (per verse). Text is
   // always applicable. Memoized so BookView's memoized verse subtree is stable.
   const textLaneCheck = useMemo<TextLaneCheck>(
     () => ({
-      canCheck: meUserId != null,
+      // Same reasoning as resourceCheckoff above — a locked book must not
+      // offer the Text-lane checkbox either.
+      canCheck: meUserId != null && !bookLocked,
       shade: (verse) => shadeFromCheckers(laneIndex.get(laneKey(verse, "text")), meUserId),
       attribution: (verse) => laneAttribution(laneIndex.get(laneKey(verse, "text")), meUserId),
       onToggle: (verse) => toggleLane(verse, "text"),
     }),
-    [laneIndex, meUserId, toggleLane],
+    [laneIndex, meUserId, bookLocked, toggleLane],
   );
 
   // Chapter board (verses × lanes overview) dialog.
