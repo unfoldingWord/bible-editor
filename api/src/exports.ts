@@ -67,10 +67,11 @@ exports.post("/run", requireAdmin, async (c) => {
     allowMergeRefusal: parsed.data.allowMergeRefusal,
     allowLocked: parsed.data.allowLocked,
   };
-  // Deterministic id (second precision) so a double-submitted manual run
-  // rejects on the duplicate instead of racing the first. The nightly cron
-  // uses `nightly-${day}` ids — see scheduled() in index.ts.
-  const id = `manual-${new Date().toISOString().slice(0, 19).replace(/:/g, "-")}`;
+  // Deterministic id (millisecond precision) so a double-submitted manual run
+  // rejects on the duplicate instead of racing the first. Second precision
+  // used to collide when two admin runs landed in the same second; the
+  // nightly cron uses `nightly-${day}` ids — see scheduled() in index.ts.
+  const id = `manual-${new Date().toISOString().replace(/[:.]/g, "-")}`;
   try {
     const instance = await c.env.EXPORT_WORKFLOW.create({ id, params });
     return c.json({ id: instance.id, status: "queued" }, 202);

@@ -28,7 +28,8 @@ import Brightness4Icon from "@mui/icons-material/Brightness4";
 import Brightness7Icon from "@mui/icons-material/Brightness7";
 import CloudDownloadIcon from "@mui/icons-material/CloudDownload";
 import LogoutIcon from "@mui/icons-material/Logout";
-import { api, type BookListEntry, type BookSummary } from "../sync/api";
+import AdminPanelSettingsIcon from "@mui/icons-material/AdminPanelSettings";
+import { api, getRole, type BookListEntry, type BookSummary } from "../sync/api";
 import { SyncStatusBar } from "./SyncStatusBar";
 import { VersionIndicator } from "./VersionIndicator";
 import { BOOKS, bookName, resolveBook } from "../lib/bookNames";
@@ -465,6 +466,17 @@ export function TopBar({
       {pipelineMenu}
       {pipelineStatus}
       {bookLocksButton}
+      {getRole() === "admin" && (
+        <Tooltip title="Admin">
+          <IconButton
+            size="small"
+            onClick={() => { window.location.hash = "#/admin"; }}
+            aria-label="Admin"
+          >
+            <AdminPanelSettingsIcon fontSize="small" />
+          </IconButton>
+        </Tooltip>
+      )}
       {onLogout && (
         <>
           <Divider orientation="vertical" flexItem sx={{ my: 0.5 }} />

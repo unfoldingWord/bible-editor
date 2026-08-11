@@ -248,6 +248,24 @@ export const requireAdmin: MiddlewareHandler = async (c, next) => {
   if (role !== "admin") {
     return c.json({ error: "forbidden", reason: "not_an_admin" }, 403);
   }
+  // Re-check the role against user_roles rather than trusting the token alone.
+  // The access JWT carries `role` and lives for ACCESS_COOKIE_TTL_SECONDS
+  // (1h), and the role is otherwise only re-evaluated on refresh — so a
+  // demoted admin kept full admin power for up to an hour, including the
+  // ability to re-add themselves via POST /api/admin/users. That window was
+  // tolerable while roles changed only by hand-written SQL; the admin panel
+  // makes removing an admin a routine click, so the revocation has to be
+  // immediate. Costs one indexed lookup on a low-traffic surface (admin
+  // routes only) — requireEditor is deliberately left alone, since demoting
+  // an editor is not a privilege boundary anyone races.
+  const username = (c as AppContext).get("username");
+  if (!username) {
+    return c.json({ error: "forbidden", reason: "not_an_admin" }, 403);
+  }
+  const current = await lookupUserRole(c.env as Env, username);
+  if (current !== "admin") {
+    return c.json({ error: "forbidden", reason: "not_an_admin" }, 403);
+  }
   await next();
 };
 

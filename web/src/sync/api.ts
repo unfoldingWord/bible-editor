@@ -307,6 +307,19 @@ export function setReadOnlyReason(reason: ReadOnlyReason, active: boolean) {
   else readOnlyReasons.delete(reason);
 }
 
+// Current user's role — set alongside readOnly, right after /api/auth/me
+// resolves. The JWT is HttpOnly so the client can never decode it directly;
+// this module-level flag is the only place a role lives client-side.
+// Components (e.g. TopBar's admin button) read this directly rather than
+// having the role threaded down as a prop through Shell.
+let currentRole: Role | null = null;
+export function getRole(): Role | null {
+  return currentRole;
+}
+export function setRole(v: Role | null) {
+  currentRole = v;
+}
+
 // Surface to the UI that we tried to silently refresh a 401 and it failed.
 // App.tsx subscribes to render a "Session expired — sign in again" banner;
 // the outbox keeps queuing edits in the meantime so nothing is lost.
@@ -1158,6 +1171,167 @@ export interface NewCommentInput {
   body: string;
 }
 
+// ── Admin panel (see web/src/components/AdminPanel.tsx) ────────────────────
+// Types mirror the backend contract in AdminPanel's task spec; the two sides
+// are being built together against that shared contract.
+
+export type Resource = "ult" | "ust" | "tn" | "tq" | "twl";
+
+// Per-book, per-resource sync snapshot: what we last pulled from Door43 vs.
+// what we last exported to it. null when the book has never touched that
+// resource at all.
+export interface AdminResourceSyncStatus {
+  pulledSha: string | null;
+  pulledAt: number | null;
+  pullOrigin: string | null;
+  lastExportAt: number | null;
+  lastExportSha: string | null;
+  lastExportError: string | null;
+  lastExportRows: number | null;
+  branch: string | null;
+  prNumber: number | null;
+}
+
+export interface AdminBookSyncStatus {
+  book: string;
+  importedAt: number | null;
+  // Frozen from editing AND export (published, or explicitly locked). A
+  // locked book will never push to Door43, so the grid has to say so or its
+  // export cells look mysteriously stuck.
+  locked: boolean;
+  resources: Record<Resource, AdminResourceSyncStatus | null>;
+}
+
+export interface AdminSyncStatusResponse {
+  books: AdminBookSyncStatus[];
+}
+
+export type AdminCheckState = "success" | "failure" | "pending" | null;
+
+export interface AdminPr {
+  resource: Resource;
+  repo: string;
+  book: string;
+  number: number;
+  title: string;
+  branch: string;
+  headSha: string;
+  baseRef: string;
+  mergeable: boolean | null;
+  url: string;
+  checkState: AdminCheckState;
+  updatedAt: number;
+}
+
+export interface AdminPrsResponse {
+  prs: AdminPr[];
+  errors: { repo: string; message: string }[];
+}
+
+export interface AdminUser {
+  username: string;
+  role: "admin" | "editor";
+  addedAt: number;
+  addedBy: string | null;
+}
+
+export interface AdminUsersResponse {
+  users: AdminUser[];
+}
+
+// Mirrors the inline import `result` shape from the task spec. Every field
+// is a plain counter except `errors` (message list) and `counts_incomplete`
+// (best-effort flag the server sets when it had to bail early).
+export interface AdminImportCounts {
+  updated: number;
+  reimported_ai: number;
+  inserted: number;
+  deleted: number;
+  merged_fields: number;
+  skipped_edited: number;
+  skipped_locked: number;
+  chapters_locked: number;
+  prune_locked: number;
+  skipped_noop: number;
+  skipped_dup: number;
+  resurrected: number;
+  source_attr_reconciled: number;
+  source_attr_divergent: number;
+  twl_reordered: number;
+  dcs_404: number;
+  errors: string[];
+  counts_incomplete?: boolean;
+}
+
+export interface AdminImportResult {
+  book: string;
+  perResource: Record<Resource, AdminImportCounts>;
+  totals: AdminImportCounts;
+}
+
+// POST /api/admin/import responds 200 with mode:"inline" when `chapters` was
+// given (the result is ready immediately), or 202 with mode:"workflow" for a
+// whole-book import (poll the Workflow instance endpoint instead).
+export type AdminImportResponse =
+  | { mode: "inline"; result: AdminImportResult }
+  | { mode: "workflow"; id: string };
+
+// POST /api/exports/run — reuses the existing export pipeline. `book`/
+// `resource` omitted means "everything"; `dryDcs` renders without writing to
+// Door43; `allowShrink` overrides the row-deletion guard.
+export interface RunExportRequest {
+  book?: string;
+  resource?: Resource;
+  dryDcs?: boolean;
+  validateAndMerge?: boolean;
+  allowShrink?: boolean;
+}
+
+export interface RunExportResponse {
+  id: string;
+  status: string;
+}
+
+// GET /api/exports?book=&limit= — snapshot rows from past export runs.
+// This route predates the admin panel and returns `export_snapshots` rows
+// verbatim, so the field names are the D1 column names (snake_case) and the
+// array key is `snapshots`. Mirror the server exactly rather than inventing a
+// camelCase shape — there is no mapping layer between them.
+export interface ExportSnapshotRow {
+  id: number;
+  book: string;
+  resource: Resource;
+  branch: string | null;
+  commit_sha: string | null;
+  committed_at: number;
+  rows_exported: number | null;
+  // Doubles as the skip-reason channel: `unchanged`, `no_rows`, `dry_run` and
+  // the various `*_guard:` prefixes all arrive here, not just real failures.
+  error: string | null;
+  pr_number: number | null;
+  pr_error: string | null;
+}
+
+export interface ExportsListResponse {
+  snapshots: ExportSnapshotRow[];
+}
+
+// GET /api/exports/instance/:id — Workflow status for a run started via
+// either /api/exports/run or the whole-book admin import.
+// The route returns the Cloudflare Workflow instance's own status object
+// verbatim under `status`, so this is NESTED: `status.status` is the state
+// string ("queued" | "running" | "complete" | "errored" | …). There is no
+// per-step list — Workflows expose only the aggregate state plus the final
+// `output`, so the panel reports the state and the output, not a step trace.
+export interface ExportInstanceStatus {
+  id: string;
+  status: {
+    status: string;
+    output?: unknown;
+    error?: unknown;
+  };
+}
+
 export const api = {
   getBookSummary: (book: string, signal?: AbortSignal) =>
     request<BookSummary>(`/api/chapters/${encodeURIComponent(book)}`, { signal }),
@@ -1521,4 +1695,71 @@ export const api = {
 
   deleteComment: (id: number) =>
     request<{ ok: true }>(`/api/comments/${id}`, { method: "DELETE" }),
+
+  // ── Admin panel ──
+  getAdminSyncStatus: (book?: string, signal?: AbortSignal) =>
+    request<AdminSyncStatusResponse>(
+      `/api/admin/sync-status${book ? `?book=${encodeURIComponent(book)}` : ""}`,
+      { signal },
+    ),
+
+  // `checks` defaults true server-side; the panel's "skip check status
+  // (faster)" toggle passes checks=0 to skip the per-PR Gitea status calls.
+  getAdminPrs: (opts?: { checks?: boolean }, signal?: AbortSignal) =>
+    request<AdminPrsResponse>(
+      `/api/admin/prs${opts?.checks === false ? "?checks=0" : ""}`,
+      { signal },
+    ),
+
+  getAdminUsers: (signal?: AbortSignal) =>
+    request<AdminUsersResponse>(`/api/admin/users`, { signal }),
+
+  addAdminUser: (username: string, role: "admin" | "editor") =>
+    request<AdminUser>(`/api/admin/users`, {
+      method: "POST",
+      body: JSON.stringify({ username, role }),
+    }),
+
+  removeAdminUser: (username: string) =>
+    request<{ ok: true }>(`/api/admin/users/${encodeURIComponent(username)}`, {
+      method: "DELETE",
+    }),
+
+  // 200 {mode:"inline"} when `chapters` is given, 202 {mode:"workflow"} for a
+  // whole-book pull. Whole-book imports can run long, so use a wide timeout
+  // like importBook above.
+  adminImport: (body: {
+    book: string;
+    resources: Resource[];
+    chapters?: number[];
+  }) =>
+    request<AdminImportResponse>(`/api/admin/import`, {
+      method: "POST",
+      body: JSON.stringify(body),
+      timeoutMs: 120_000,
+    }),
+
+  // ── Exports (existing pipeline, reused by the admin Run tab) ──
+  runExport: (body: RunExportRequest) =>
+    request<RunExportResponse>(`/api/exports/run`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+
+  getExports: (book?: string, limit?: number, signal?: AbortSignal) => {
+    const params = new URLSearchParams();
+    if (book) params.set("book", book);
+    if (limit != null) params.set("limit", String(limit));
+    const qs = params.toString();
+    return request<ExportsListResponse>(
+      `/api/exports${qs ? `?${qs}` : ""}`,
+      { signal },
+    );
+  },
+
+  getExportInstance: (id: string, signal?: AbortSignal) =>
+    request<ExportInstanceStatus>(
+      `/api/exports/instance/${encodeURIComponent(id)}`,
+      { signal },
+    ),
 };
