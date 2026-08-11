@@ -484,16 +484,33 @@ for (const marker of ["\\m", "\\pi1", "\\li1", "\\mi", "\\qa", "\\qc", "\\qr", "
   });
 }
 
+// Corrected 2026-08-11: an earlier version of this test asserted a JOIN here,
+// reasoning that Rich's 33 lone-`\q*` lines (all in NUM) never survive
+// unjoined. That reasoning was wrong — a lone `\q*` line and a joined
+// `\q<n> \v N` line are mutually exclusive shapes, so those 33 lines ARE
+// cases where Rich left a lone `\q*` unjoined (he also has hundreds of the
+// joined form elsewhere). Separately, 0 of those 33 are followed by a blank
+// before their `\v`, so there is no corpus evidence either way for the
+// blank-only case. Rich asked specifically for the `\ts\*` shape below and
+// said nothing about blanks, so a pure-blank run (no `\ts\*` in it) is left
+// exactly as it always was: NOT joined.
 t("lone \\q1 does NOT join across a blank line", () => {
   const ls = lines(`${HDR}\\q1\n\n\\v 7 \\w a\\w*\n`);
   assert.ok(ls.some((l) => l.trim() === "\\q1"), "\\q1 stays bare");
   assert.ok(ls.some((l) => l.trim() === "\\v 7 \\w a\\w*"), "\\v 7 stays on its own line");
 });
 
-t("lone \\q1 does NOT join across \\ts\\*", () => {
+// INVERTED 2026-08-11 per Rich Mahn: a lone `\q1` stranded above a `\ts\*`
+// (with the `\v` after it left unjoined) was measured 9 times in current
+// master (en_ust/28-HOS.usfm x4, en_ult/33-MIC.usfm x5) and 0 times in his
+// hand-cleaned files. Wanted shape: the `\ts\*` line first, then the `\q1`
+// joined onto the following `\v` (MIC, en_ult/33-MIC.usfm:1222).
+t("lone \\q1 DOES join across \\ts\\* (\\ts\\* is emitted first, then the join)", () => {
   const ls = lines(`${HDR}\\q1\n\\ts\\*\n\\v 7 \\w a\\w*\n`);
-  assert.ok(ls.some((l) => l.trim() === "\\q1"));
-  assert.ok(ls.some((l) => l.trim() === "\\ts\\*"));
+  const tsIdx = ls.indexOf("\\ts\\*");
+  assert.ok(tsIdx >= 0, "\\ts\\* survives");
+  assert.equal(ls[tsIdx + 1].trim(), "\\q1 \\v 7 \\w a\\w*", "\\ts\\* precedes the joined line");
+  assert.ok(!ls.some((l) => l.trim() === "\\q1"), "no bare \\q1 line left behind");
 });
 
 t("lone \\q1 does NOT join across \\b", () => {
@@ -502,10 +519,13 @@ t("lone \\q1 does NOT join across \\b", () => {
   assert.ok(ls.some((l) => l.trim() === "\\b"));
 });
 
-t("lone \\q1 does NOT join across \\c 2", () => {
+// CHANGED 2026-08-11 (FIX D): a lone \q1 immediately before a chapter break
+// has nothing to join to and is now DROPPED rather than left bare — see
+// joinPoetryMarkerToVerse's doc comment. The \c 2 line itself is untouched.
+t("lone \\q1 before \\c 2 is dropped (nothing to join to)", () => {
   const ls = lines(`${HDR}\\q1\n\\c 2\n\\v 7 \\w a\\w*\n`);
-  assert.ok(ls.some((l) => l.trim() === "\\q1"));
-  assert.ok(ls.some((l) => l.trim() === "\\c 2"));
+  assert.ok(!ls.some((l) => l.trim() === "\\q1"), "\\q1 is dropped");
+  assert.ok(ls.some((l) => l.trim() === "\\c 2"), "\\c 2 is untouched");
 });
 
 t("lone \\q1 does NOT join across an \\s1 heading", () => {
@@ -545,9 +565,12 @@ t("lone \\q1 joins onto a verse bridge \\v 6-9", () => {
   assert.ok(ls.some((l) => l.trim() === "\\q1 \\v 6-9 \\w a\\w*"));
 });
 
-t("a lone poetry marker at end of file (no following line) is left untouched", () => {
+// CHANGED 2026-08-11 (FIX D): a lone poetry marker at end of file has nothing
+// to join to and is now DROPPED, not left stranded — see joinPoetryMarkerToVerse's
+// doc comment (en_ust/28-HOS.usfm:4759 master vs absent in Rich's cleanup).
+t("a lone poetry marker at end of file (no following line) is dropped", () => {
   const out = norm(`${HDR}\\v 1 \\w a\\w*\n\\q1`);
-  assert.match(out, /\\q1\n?$/, "trailing bare \\q1 survives");
+  assert.ok(!out.includes("\\q1"), "trailing bare \\q1 is dropped, not left stranded");
 });
 
 t("lone-poetry-marker join is idempotent", () => {
@@ -646,6 +669,157 @@ t("invariant: no output line ever contains two \\v markers", () => {
       assert.ok(vCount <= 1, `line has ${vCount} \\v markers: ${JSON.stringify(l)}`);
     }
   }
+});
+
+// ── FIX A (2026-08-11): paragraph-family markers never fuse to content ─────
+// Measured: `\m` fused mid-line to a following `\zaln-s` in current master
+// (en_ult/04-NUM.usfm:19540 and en_ust/04-NUM.usfm:22162, both NUM 20:1),
+// while Rich Mahn's cleaned files have `\m` own-line 4/4 (joined 0 times).
+
+t("FIX A: \\m fused mid-line with following \\zaln-s ends up own-line (NUM 20:1, en_ult/04-NUM.usfm:19540)", () => {
+  const ls = lines(
+    `${HDR}\\v 20 \\w x\\w*.\\m \\zaln-s |x-strong="H1"\\*\\w y\\w*\\zaln-e\\*\n`,
+  );
+  assert.ok(ls.some((l) => l.trim() === "\\m"), "\\m isolated onto its own line");
+  assert.ok(
+    !ls.some((l) => /^\\m\s+\S/.test(l.trim())),
+    "\\m never carries following content on the same line",
+  );
+});
+
+t("FIX A: \\m already own-line is unchanged", () => {
+  const ls = lines(`${HDR}\\c 1\n\\m\n\\v 1 \\w a\\w*\n`);
+  assert.ok(ls.some((l) => l.trim() === "\\m"), "\\m stays on its own line");
+  assert.ok(ls.some((l) => l.trim() === "\\v 1 \\w a\\w*"), "\\v 1 stays on its own line");
+});
+
+t("FIX A: \\m is never prefixed onto a \\v line", () => {
+  const ls = lines(`${HDR}\\m\n\\v 1 \\w a\\w*\n`);
+  assert.ok(
+    !ls.some((l) => /^\\m\s+\\v/.test(l.trim())),
+    "\\m is never joined ahead of \\v (only \\q/\\q1-4 join)",
+  );
+  assert.ok(ls.some((l) => l.trim() === "\\v 1 \\w a\\w*"), "\\v 1 stays bare");
+});
+
+t("FIX A: \\p behaviour unchanged (still standalone, still crossable in joinDanglingVerses)", () => {
+  const ls = lines(`${HDR}\\v 30 \\w you\\w*?”\\p\\w he\\w*\n`);
+  const pIdx = ls.indexOf("\\p");
+  assert.ok(pIdx > 0, "\\p still isolated onto its own line");
+  assert.match(ls[pIdx + 1], /^\\w he/);
+});
+
+// Regression (caught in pre-merge review 2026-08-11): FIX A's own-line
+// extraction of the paragraph family (isolating `\m` from `\m \w text\w*`)
+// combined with an over-broad isAbortLine branch to make a bare `\m` line
+// ABORT the dangling-\v join instead of being crossed like `\p`. Input
+// `\v 8` / `\m \w text\w*` (usfm-js's fused shape) went from main's correct
+// `\m` / `\v 8 \w text\w*` to a stranded bare `\v 8` line sitting above `\m`
+// above `\w text\w*` — exactly the defect joinDanglingVerses exists to fix.
+t("dangling \\v: a bare \\m between \\v and its text is crossed, not aborted (regression against main)", () => {
+  const ls = lines(`${HDR}\\v 8\n\\m \\w text\\w*\n`);
+  const mIdx = ls.indexOf("\\m");
+  assert.ok(mIdx > 0, "\\m kept, isolated onto its own line");
+  assert.ok(
+    ls.slice(mIdx + 1).some((l) => l.trim() === "\\v 8 \\w text\\w*"),
+    "\\v 8 crosses the bare \\m and joins its text",
+  );
+  assert.ok(
+    !ls.some((l) => /^\\v\s+\d+\s*$/.test(l.trim())),
+    "no line is left as a bare, stranded \\v",
+  );
+});
+
+t("dangling \\v: crossing a bare \\m never fuses \\m onto the \\v line", () => {
+  const ls = lines(`${HDR}\\v 8\n\\m \\w text\\w*\n`);
+  assert.ok(
+    !ls.some((l) => /^\\m\s+\\v/.test(l.trim())),
+    "\\m is not prefixed onto the merged \\v line",
+  );
+  assert.ok(
+    !ls.some((l) => /^\\v\s+\d+\s+\\m\b/.test(l.trim())),
+    "\\m does not trail the \\v line either",
+  );
+  assert.ok(ls.some((l) => l.trim() === "\\m"), "\\m still lands on its own line");
+});
+
+// ── FIX B (2026-08-11): a lone \q* joins across a \ts\* run ────────────────
+// Measured: 9 occurrences of a lone \q* stranded above \ts\* in current
+// master (en_ust/28-HOS.usfm x4, en_ult/33-MIC.usfm x5) vs 0 in Rich Mahn's
+// cleaned files. Wanted shape per Rich Mahn's 2026-08-11 request: \ts\* first,
+// then the \q* joined onto its \v.
+
+t("FIX B: lone \\q1 + \\ts\\* + \\v produces \\ts\\* then \\q1 \\v N (MIC, en_ult/33-MIC.usfm:1222)", () => {
+  const ls = lines(`${HDR}\\v 1 \\w it\\w*\n\\q1\n\\ts\\*\n\\v 2 \\w Aaron\\w*\n`);
+  const tsIdx = ls.indexOf("\\ts\\*");
+  assert.ok(tsIdx >= 0, "\\ts\\* present");
+  assert.equal(ls[tsIdx + 1].trim(), "\\q1 \\v 2 \\w Aaron\\w*", "\\ts\\* precedes the joined line");
+  assert.ok(!ls.some((l) => l.trim() === "\\q1"), "no bare \\q1 line left behind");
+});
+
+// ── FIX C (2026-08-11): a lone \q* joins to non-\v content too ─────────────
+// Measured: 32 occurrences in current master (en_ult/38-ZEC.usfm — 24x \q2,
+// 8x \q1) of a lone \q* stranded above a \zaln-s/\w continuation of the same
+// verse, vs 0 in Rich Mahn's cleaned files.
+
+t("FIX C: lone \\q2 + \\zaln-s content line joins (ZEC, en_ult/38-ZEC.usfm:3508)", () => {
+  const ls = lines(
+    `${HDR}\\q2\n\\zaln-s |x-strong="c:H6651"\\*\\w heaped\\w*\\zaln-e\\*\n`,
+  );
+  assert.ok(
+    ls.some((l) => l.trim() === '\\q2 \\zaln-s |x-strong="c:H6651"\\*\\w heaped\\w*\\zaln-e\\*'),
+    "joined onto one line",
+  );
+  assert.ok(!ls.some((l) => l.trim() === "\\q2"), "no bare \\q2 line left behind");
+});
+
+// Note: `\c 2` is deliberately excluded from this loop — per FIX D below, a
+// lone `\q1` immediately before a chapter break is now DROPPED, not left
+// bare (see the dedicated FIX D test). The `\ts\*` case here is followed by
+// `\b` (not EOF/`\c`) specifically so it stays a "stays bare, no join"
+// case rather than tripping FIX D's own drop rule.
+for (const [marker, content] of [
+  ["\\ts\\*", "\\ts\\*\n\\b"],
+  ["\\b", "\\b"],
+  ["\\s1", "\\s1 A Heading"],
+  ["another \\q*", "\\q2 \\w a\\w*"],
+]) {
+  t(`FIX C: lone \\q1 followed by ${marker} does NOT join to it`, () => {
+    const ls = lines(`${HDR}\\q1\n${content}\n`);
+    assert.ok(ls.some((l) => l.trim() === "\\q1"), "\\q1 stays bare");
+  });
+}
+
+// ── FIX D (2026-08-11): a content-less lone \q* is dropped, not stranded ──
+// Measured: en_ust/28-HOS.usfm master line 4759 — a lone `\q1` immediately
+// before `\c 10` at the end of Hosea 9 — absent in Rich Mahn's cleanup.
+
+t("FIX D: lone \\q1 followed by \\c 2 is dropped (nothing to join to)", () => {
+  const ls = lines(`${HDR}\\q1\n\\c 2\n\\v 1 \\w a\\w*\n`);
+  assert.ok(!ls.some((l) => l.trim() === "\\q1"), "\\q1 is dropped");
+  assert.ok(ls.some((l) => l.trim() === "\\c 2"), "\\c 2 is untouched");
+});
+
+t("FIX D: lone \\q1 at end of file is dropped", () => {
+  const out = norm(`${HDR}\\v 1 \\w a\\w*\n\\q1`);
+  assert.ok(!out.includes("\\q1"), "\\q1 is dropped");
+});
+
+t("FIX D: dropping a \\q1 before \\c keeps any \\ts\\* in the skipped run", () => {
+  const ls = lines(`${HDR}\\q1\n\\ts\\*\n\\c 2\n\\v 1 \\w a\\w*\n`);
+  assert.ok(!ls.some((l) => l.trim() === "\\q1"), "\\q1 is dropped");
+  assert.ok(ls.some((l) => l.trim() === "\\ts\\*"), "\\ts\\* survives");
+  assert.ok(ls.some((l) => l.trim() === "\\c 2"), "\\c 2 is untouched");
+});
+
+t("FIX D: lone \\q1 followed by \\b is NOT dropped (no evidence, still stranded)", () => {
+  const ls = lines(`${HDR}\\q1\n\\b\n`);
+  assert.ok(ls.some((l) => l.trim() === "\\q1"), "\\q1 is left in place");
+});
+
+t("FIX D: lone \\q1 followed by \\s1 is NOT dropped (no evidence, still stranded)", () => {
+  const ls = lines(`${HDR}\\q1\n\\s1 A Heading\n`);
+  assert.ok(ls.some((l) => l.trim() === "\\q1"), "\\q1 is left in place");
 });
 
 console.log(`\n${passed} usfmFormat tests passed`);

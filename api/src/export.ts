@@ -1347,6 +1347,69 @@ function recomputeTargetOccurrences(verseObjects: unknown[]): void {
   }
 }
 
+// Ensure every `\zaln-s` alignment milestone carries an `x-lemma` attribute,
+// defaulting to "" when the stored node has no `lemma` key at all. Fixes a
+// real defect: web/src/lib/alignment.ts's buildMilestone deliberately skips
+// the `lemma` key when it was absent on the source word (so usfm-js doesn't
+// invent spurious `x-foo=""` attrs for every key) — but for Hebrew clitic
+// preposition+suffix tokens whose UHB entry legitimately carries `lemma=""`,
+// an ABSENT attribute is invalid, not merely empty. Measured against
+// unfoldingWord's uw-content-validation on the real instance at
+// en_ult/33-MIC.usfm:419 (MIC 1:15): with `x-lemma` absent, both priority 834
+// ("Seems too few translation \zaln-s attributes") and priority 806
+// ("Aligned x-lemma doesn't match original") fire (>= the 800 severe
+// threshold); inserting `x-lemma=""` in canonical position (immediately after
+// `x-strong`) clears BOTH, down to 0 notices on that line. Inserting a
+// fabricated value in canonical position clears only 834 (806 still fires,
+// since UHB's lemma there is legitimately empty). Position is NOT cosmetic —
+// re-run against the real library confirmed appending `x-lemma=""` at the
+// END of the attribute list (after x-content) is actively worse than doing
+// nothing: it doesn't reliably clear 834/806 and it trips FIVE new priority
+// 825-829 "Unexpected Nth \zaln-s attribute" notices, because the library's
+// attribute parser is itself positional. So the fix must insert in the
+// attribute's normal (`strong`, `lemma`, `morph`, `occurrence`, `occurrences`,
+// `content`) position, with an empty value, never an invented one and never
+// appended at the end.
+// Detects milestones the same way web/src/lib/alignment.ts's nodeIsZaln does
+// (type "milestone", tag "zaln"). Only touches `lemma`; never overwrites an
+// existing value (including an existing ""). Rebuilds key order ONLY on the
+// nodes actually missing `lemma` — a milestone that already carries a lemma
+// (the overwhelming majority) is left as the exact same object, so this can
+// never produce a corpus-wide attribute-order diff. Mutates `verseObjects`
+// in place (replacing fixed nodes by array index; children arrays keep their
+// own identity so nested milestones are still found).
+function ensureZalnLemmaAttr(verseObjects: unknown[]): void {
+  if (!Array.isArray(verseObjects)) return;
+  const walk = (nodes: unknown[]): void => {
+    for (let i = 0; i < nodes.length; i++) {
+      const node = nodes[i];
+      if (!node || typeof node !== "object") continue;
+      const o = node as Record<string, unknown>;
+      if (o["type"] === "milestone" && o["tag"] === "zaln" && o["lemma"] === undefined) {
+        // Rebuild with the same keys in the same relative order, splicing
+        // `lemma` in right after `strong` (falling back to appending it if
+        // the milestone has no `strong` key at all — degenerate, but still
+        // better than shipping without `x-lemma`).
+        const rebuilt: Record<string, unknown> = {};
+        let insertedLemma = false;
+        for (const [k, v] of Object.entries(o)) {
+          rebuilt[k] = v;
+          if (k === "strong") {
+            rebuilt["lemma"] = "";
+            insertedLemma = true;
+          }
+        }
+        if (!insertedLemma) rebuilt["lemma"] = "";
+        nodes[i] = rebuilt;
+        if (Array.isArray(rebuilt["children"])) walk(rebuilt["children"] as unknown[]);
+        continue;
+      }
+      if (Array.isArray(o["children"])) walk(o["children"] as unknown[]);
+    }
+  };
+  walk(verseObjects);
+}
+
 export function buildUsfm(input: UsfmInputs): string {
   // Group verses by chapter, parsing the stored JSON. Corrupt content fails
   // the export; a partial book is worse than no nightly snapshot.
@@ -1362,7 +1425,10 @@ export function buildUsfm(input: UsfmInputs): string {
     const bv = input.bibleVersion.toUpperCase();
     if ((bv === "ULT" || bv === "UST") && parsed && typeof parsed === "object") {
       const vos = (parsed as { verseObjects?: unknown[] }).verseObjects;
-      if (Array.isArray(vos)) recomputeTargetOccurrences(vos);
+      if (Array.isArray(vos)) {
+        recomputeTargetOccurrences(vos);
+        ensureZalnLemmaAttr(vos);
+      }
     }
     const ch = String(v.chapter);
     if (!chapters[ch]) chapters[ch] = {};
