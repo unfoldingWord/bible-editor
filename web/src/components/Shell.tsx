@@ -3150,7 +3150,12 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
               book,
               chapter,
               verse: activeVerse,
-              ref_raw: activeVerse === 0 ? `${chapter}:intro` : `${chapter}:${activeVerse}`,
+              ref_raw:
+                chapter === 0
+                  ? "front:intro"
+                  : activeVerse === 0
+                    ? `${chapter}:intro`
+                    : `${chapter}:${activeVerse}`,
               note: "",
               sort_order,
             }));
@@ -3206,11 +3211,13 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
             if (!row) return;
             const isRange = verseEnd != null && verseEnd > verse;
             const ref_raw =
-              verse === 0
-                ? `${chapter}:intro`
-                : isRange
-                  ? `${chapter}:${verse}-${verseEnd}`
-                  : `${chapter}:${verse}`;
+              chapter === 0
+                ? "front:intro"
+                : verse === 0
+                  ? `${chapter}:intro`
+                  : isRange
+                    ? `${chapter}:${verse}-${verseEnd}`
+                    : `${chapter}:${verse}`;
             if (row.verse === verse && row.ref_raw === ref_raw) return;
             const sort_order = pickSortOrder(sortedForVerse(tn, verse), null, "after");
             enqueueRow("tn", row, { verse, ref_raw, sort_order });
@@ -3231,7 +3238,12 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
               book,
               chapter,
               verse: activeVerse,
-              ref_raw: activeVerse === 0 ? `${chapter}:intro` : `${chapter}:${activeVerse}`,
+              ref_raw:
+                chapter === 0
+                  ? "front:intro"
+                  : activeVerse === 0
+                    ? `${chapter}:intro`
+                    : `${chapter}:${activeVerse}`,
               orig_words: "",
               tw_link: "",
               sort_order,
@@ -3294,7 +3306,12 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
               book,
               chapter,
               verse: activeVerse,
-              ref_raw: activeVerse === 0 ? `${chapter}:intro` : `${chapter}:${activeVerse}`,
+              ref_raw:
+                chapter === 0
+                  ? "front:intro"
+                  : activeVerse === 0
+                    ? `${chapter}:intro`
+                    : `${chapter}:${activeVerse}`,
               question: "",
               response: "",
             }));

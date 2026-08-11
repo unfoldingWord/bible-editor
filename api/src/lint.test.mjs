@@ -49,6 +49,25 @@ t("malformed reference flagged", () => {
   const i = lintTnRows([tn({ ref_raw: "garbage" })]);
   assert.ok(i.some((x) => x.check === "6. Reference"));
 });
+t("chapter 0 with a numeric verse is rejected (the ISA ee2w shape)", () => {
+  const i = lintTnRows([tn({ ref_raw: "0:1" })]);
+  assert.ok(i.some((x) => x.check === "6. Reference"));
+});
+t("front:intro still passes", () => {
+  assert.equal(lintTnRows([tn({ ref_raw: "front:intro" })]).filter((x) => x.check === "6. Reference").length, 0);
+});
+t("1:1 still passes", () => {
+  assert.equal(lintTnRows([tn({ ref_raw: "1:1" })]).filter((x) => x.check === "6. Reference").length, 0);
+});
+t("12:intro still passes", () => {
+  assert.equal(lintTnRows([tn({ ref_raw: "12:intro" })]).filter((x) => x.check === "6. Reference").length, 0);
+});
+t("3:front still passes", () => {
+  assert.equal(lintTnRows([tn({ ref_raw: "3:front" })]).filter((x) => x.check === "6. Reference").length, 0);
+});
+t("1:1-3 bridge still passes", () => {
+  assert.equal(lintTnRows([tn({ ref_raw: "1:1-3" })]).filter((x) => x.check === "6. Reference").length, 0);
+});
 t("malformed rc:// flagged", () => {
   const i = lintTnRows([tn({ support_reference: "not-a-link" })]);
   assert.ok(i.some((x) => x.check === "7. SupportReference"));
