@@ -26,6 +26,10 @@ const RunBody = z.object({
   // book+resource a human has verified by hand — same requirement as
   // allowShrink (book + resource both set); the workflow ignores it otherwise.
   allowMergeRefusal: z.boolean().optional(),
+  // Override the book-lock gate for a deliberate fix to a frozen (published or
+  // explicitly locked) book. Requires book + resource to be set; the workflow
+  // ignores it otherwise.
+  allowLocked: z.boolean().optional(),
 });
 
 exports.post("/run", requireAdmin, async (c) => {
@@ -51,6 +55,9 @@ exports.post("/run", requireAdmin, async (c) => {
   if (parsed.data.allowMergeRefusal && !(parsed.data.book && parsed.data.resource)) {
     return c.json({ error: "allow_merge_refusal_requires_book_and_resource" }, 400);
   }
+  if (parsed.data.allowLocked && !(parsed.data.book && parsed.data.resource)) {
+    return c.json({ error: "allow_locked_requires_book_and_resource" }, 400);
+  }
   const params = {
     book: parsed.data.book?.toUpperCase(),
     resource: parsed.data.resource as Resource | undefined,
@@ -58,6 +65,7 @@ exports.post("/run", requireAdmin, async (c) => {
     validateAndMerge: parsed.data.validateAndMerge,
     allowShrink: parsed.data.allowShrink,
     allowMergeRefusal: parsed.data.allowMergeRefusal,
+    allowLocked: parsed.data.allowLocked,
   };
   // Deterministic id (second precision) so a double-submitted manual run
   // rejects on the duplicate instead of racing the first. The nightly cron

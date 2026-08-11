@@ -146,6 +146,13 @@ interface Props {
   // propagates read-only to that tab's children.
   lockedTn?: boolean;
   lockedTq?: boolean;
+  // The whole BOOK is locked (server-enforced, hard freeze, no carve-outs —
+  // unlike lockedTn/lockedTq above, which are per-resource chapter-pipeline
+  // locks with a preserve/hint carve-out on NoteCard). ORed into every
+  // affordance below, including Words/TWL — TWL is deliberately never
+  // chapter-locked (see api/src/chapterLock.ts), but a book lock must still
+  // freeze it because the server refuses those writes too.
+  bookLocked?: boolean;
   // Toggle the TN's preserve bit ("survive future AI pipeline sweeps").
   // Threaded through to NoteCard. Always available, regardless of lock.
   onSetNotePreserve?: (id: string, value: boolean) => void;
@@ -339,6 +346,7 @@ export function ResourceColumn({
   onQuestionCreate,
   lockedTn = false,
   lockedTq = false,
+  bookLocked = false,
   onSetNotePreserve,
   onSetNoteHint,
   onNoteTranslateQuote,
@@ -785,6 +793,8 @@ export function ResourceColumn({
           active={panelMode === "alignment"}
           accent
           onClick={() => onSetPanelMode?.("alignment")}
+          disabled={bookLocked}
+          disabledTitle="This book is locked — alignment is disabled."
         />
         <PanelTab
           label="Search"
@@ -848,7 +858,7 @@ export function ResourceColumn({
               onTogglePin={() => togglePinned("notes")}
               onAdd={onNoteCreate}
               sticky
-              hideAdd={lockedTn}
+              hideAdd={lockedTn || bookLocked}
               lane="tn"
               checkoff={checkoff}
             />
@@ -886,7 +896,11 @@ export function ResourceColumn({
               onTogglePin={() => togglePinned("words")}
               onAdd={onWordCreate}
               sticky
-              hideAdd={chapter === 0}
+              // TWL is deliberately never chapter-locked (no pipeline writes
+              // twl_rows — see api/src/chapterLock.ts), so there's no lockedTw
+              // to check here. A book lock is different: it's a hard freeze
+              // with no carve-outs, and the server refuses TWL writes too.
+              hideAdd={chapter === 0 || bookLocked}
               lane="tw"
               checkoff={checkoff}
             />
@@ -959,7 +973,7 @@ export function ResourceColumn({
               onTogglePin={() => togglePinned("questions")}
               onAdd={onQuestionCreate}
               sticky
-              hideAdd={lockedTq || chapter === 0}
+              hideAdd={lockedTq || chapter === 0 || bookLocked}
               lane="tq"
               checkoff={checkoff}
             />
@@ -972,12 +986,12 @@ export function ResourceColumn({
                 tqGroups.map(([verse, rows]) => (
                   <Fragment key={`tq-${verse}`}>
                     <VerseGroupHead verse={verse} active={verse === activeVerse} section="questions" />
-                    <QuestionsTable rows={rows} onSave={onQuestionSave} onDelete={onQuestionDelete} locked={lockedTq} />
+                    <QuestionsTable rows={rows} onSave={onQuestionSave} onDelete={onQuestionDelete} locked={lockedTq || bookLocked} />
                   </Fragment>
                 ))
               )
             ) : (
-              <QuestionsTable rows={tqForVerse} onSave={onQuestionSave} onDelete={onQuestionDelete} locked={lockedTq} />
+              <QuestionsTable rows={tqForVerse} onSave={onQuestionSave} onDelete={onQuestionDelete} locked={lockedTq || bookLocked} />
             )}
           </>
         )}
@@ -1105,7 +1119,11 @@ export function ResourceColumn({
             onFocus={onWordFocus}
             onReorder={onWordReorder}
             onReorderPreview={onReorderPreview}
-            readOnly={previewing}
+            // TWL is deliberately never chapter-locked (see the hideAdd
+            // comment above and api/src/chapterLock.ts) — `previewing` is the
+            // only other source of readOnly here. A book lock is a hard
+            // freeze with no such carve-out, so it's ORed in unconditionally.
+            readOnly={previewing || bookLocked}
             onTranslateQuote={onWordTranslateQuote}
             onWordGloss={onWordGloss}
             suggestionAlternatives={twlRowAlternatives}
@@ -1228,6 +1246,7 @@ export function ResourceColumn({
           aiRecentlyCompletedAt={noteAiRecentlyCompletedAt?.(r.id) ?? null}
           onVisibilityChange={onNoteVisibilityChange}
           locked={lockedTn}
+          bookLocked={bookLocked}
           onSetPreserve={
             onSetNotePreserve ? (value) => onSetNotePreserve(r.id, value) : undefined
           }
@@ -1431,6 +1450,8 @@ function PanelTab({
   active,
   accent,
   onClick,
+  disabled,
+  disabledTitle,
 }: {
   label: string;
   count?: number;
@@ -1439,13 +1460,16 @@ function PanelTab({
   active: boolean;
   accent: boolean;
   onClick: () => void;
+  disabled?: boolean;
+  disabledTitle?: string;
 }) {
   const showCount =
     countLabel !== undefined ? countLabel : count !== undefined ? `${count}${countSuffix ?? ""}` : null;
-  return (
+  const tab = (
     <Box
       component="button"
-      onClick={onClick}
+      disabled={disabled}
+      onClick={disabled ? undefined : onClick}
       sx={{
         position: "relative",
         display: "inline-flex",
@@ -1456,7 +1480,8 @@ function PanelTab({
         pb: 1,
         border: 0,
         background: "transparent",
-        cursor: "pointer",
+        cursor: disabled ? "default" : "pointer",
+        opacity: disabled ? 0.5 : 1,
         fontFamily: "inherit",
         fontSize: 12.5,
         fontWeight: active ? 600 : 500,
@@ -1464,7 +1489,7 @@ function PanelTab({
         borderBottom: "2px solid",
         borderColor: active ? (accent ? "primary.main" : "text.primary") : "transparent",
         marginBottom: "-1px",
-        "&:hover": { color: accent ? "primary.main" : "text.primary" },
+        "&:hover": disabled ? undefined : { color: accent ? "primary.main" : "text.primary" },
       }}
     >
       {label}
@@ -1493,4 +1518,14 @@ function PanelTab({
       )}
     </Box>
   );
+  if (disabled && disabledTitle) {
+    return (
+      <Tooltip title={disabledTitle}>
+        {/* span wrapper: Tooltip needs a child that accepts a ref/listeners
+            even when the inner button is disabled. */}
+        <span>{tab}</span>
+      </Tooltip>
+    );
+  }
+  return tab;
 }

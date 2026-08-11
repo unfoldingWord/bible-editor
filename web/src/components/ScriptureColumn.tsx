@@ -149,6 +149,11 @@ interface Props {
   // (ULT/UST) as read-only too — UHB/UGNT already are by virtue of
   // READ_ONLY_VERSIONS. The banner above the column tells the user why.
   locked?: boolean;
+  // The whole BOOK is locked (server-enforced, hard freeze, no carve-outs).
+  // ORed with `locked` into one effective value below — unlike NoteCard,
+  // scripture editing has no preserve/hint carve-out to keep separate, so a
+  // single combined flag is enough here.
+  bookLocked?: boolean;
   // Per-verse Text-lane checkoff, forwarded to the column/book scripture views.
   textCheck?: TextLaneCheck;
   // Internal comments anchored to a verse (not to a tn/tq/twl row). Rendered as
@@ -231,16 +236,28 @@ function ScriptureColumnInner({
   onEditSection,
   onEditBookSection,
   locked = false,
+  bookLocked = false,
   textCheck,
   verseCommentCounts,
   onOpenVerseComments,
 }: Props) {
+  // A book lock is a hard freeze — fold it into the same effective value the
+  // chapter lock already drives readOnly/editable off of below. Scripture
+  // editing has no preserve/hint carve-out (unlike NoteCard), so a single
+  // combined flag is sufficient here.
+  const effectiveLocked = locked || bookLocked;
   const activeRef = useRef<HTMLDivElement | null>(null);
   const bodyRef = useRef<HTMLDivElement | null>(null);
   const [findOpen, setFindOpen] = useState(false);
+  // A book lock is a hard freeze — a replace-all here would appear to work
+  // and then fail (423) for every match, since the server rejects the
+  // writes. Simplest fix: never let the overlay open on a locked book. Guard
+  // once here so both the toolbar button and the Ctrl+F shortcut below stay
+  // inert without duplicating the check.
   const openFind = useCallback(() => {
+    if (bookLocked) return;
     setFindOpen(true);
-  }, []);
+  }, [bookLocked]);
   const [findQuery, setFindQuery] = useState<FindQuery | null>(null);
   // Set only when the overlay reports a user-initiated scroll target; the
   // BookView's scroll effect (book mode) and the bodyRef scroll effect
@@ -441,23 +458,28 @@ function ScriptureColumnInner({
         </Tooltip>
         <Tooltip
           title={
-            mode === "book"
-              ? "find / replace across loaded chapters (Ctrl+F)"
-              : "find / replace in this chapter (Ctrl+F)"
+            bookLocked
+              ? "find / replace is unavailable while this book is locked"
+              : mode === "book"
+                ? "find / replace across loaded chapters (Ctrl+F)"
+                : "find / replace in this chapter (Ctrl+F)"
           }
         >
-          <Button
-            size="small"
-            variant={findOpen ? "contained" : "outlined"}
-            startIcon={<SearchIcon fontSize="small" />}
-            onClick={() => {
-              if (findOpen) closeFind();
-              else openFind();
-            }}
-            sx={{ textTransform: "none" }}
-          >
-            find
-          </Button>
+          <span>
+            <Button
+              size="small"
+              disabled={bookLocked}
+              variant={findOpen ? "contained" : "outlined"}
+              startIcon={<SearchIcon fontSize="small" />}
+              onClick={() => {
+                if (findOpen) closeFind();
+                else openFind();
+              }}
+              sx={{ textTransform: "none" }}
+            >
+              find
+            </Button>
+          </span>
         </Tooltip>
         {(mode === "columns" || mode === "book") && (
           <ToggleButtonGroup
@@ -539,7 +561,7 @@ function ScriptureColumnInner({
             verseCommentCounts={verseCommentCounts}
             onOpenVerseComments={onOpenVerseComments}
             onEditSection={onEditSection}
-            locked={locked}
+            locked={effectiveLocked}
           />
         ) : mode === "book" && bookChapterList && bookChapters && onLoadBookChapter && onSelectBookVerse && onEditBookVerse && onSaveBookVerse && onOpenBookAligner ? (
           <Suspense fallback={null}>
@@ -568,7 +590,7 @@ function ScriptureColumnInner({
               }}
               onOpenAligner={onOpenBookAligner}
               onEditSection={onEditBookSection}
-              locked={locked}
+              locked={effectiveLocked}
               textCheck={textCheck}
             />
           </Suspense>
@@ -584,7 +606,7 @@ function ScriptureColumnInner({
                 verseNumbers={verseNumbers}
                 chapter={chapter}
                 activeVerse={activeVerse}
-                readOnly={READ_ONLY_VERSIONS.has(v) || locked}
+                readOnly={READ_ONLY_VERSIONS.has(v) || effectiveLocked}
                 textCheck={READ_ONLY_VERSIONS.has(v) ? undefined : textCheck}
                 rtl={v === "UHB"}
                 activeNoteQuote={activeNoteQuote}
@@ -648,6 +670,7 @@ function areScriptureColumnPropsEqual(a: Props, b: Props): boolean {
     // so only the active UHB line actually re-renders).
     a.twl === b.twl &&
     a.locked === b.locked &&
+    a.bookLocked === b.bookLocked &&
     a.textCheck === b.textCheck &&
     // Shell memoizes verseCommentCounts on the comments index, so a new
     // reference here means "a comment was added/edited/resolved/deleted" and

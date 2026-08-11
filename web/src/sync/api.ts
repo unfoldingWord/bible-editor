@@ -278,16 +278,33 @@ function getCsrfToken(): string | null {
   return readCookie(CSRF_COOKIE_NAME);
 }
 
-// Read-only flag — set when the current JWT carries role='viewer'. The
-// outbox checks this before enqueueing a write so editor UI components that
-// haven't been individually gated still can't trigger 403s. UI components
-// that want to disable inputs can read this directly.
-let readOnly = false;
+// Read-only flags — two independent reasons the app can be read-only, kept
+// as separate named switches so they never clobber each other: "viewer" is
+// set when the current JWT carries role='viewer', "bookLocked" is set when
+// the currently-open book is locked (published, or locked by hand). The
+// outbox checks isReadOnly() before enqueueing a write so editor UI
+// components that haven't been individually gated still can't trigger 403s.
+// UI components that want to disable inputs can read isReadOnly() directly.
+export type ReadOnlyReason = "viewer" | "bookLocked";
+const readOnlyReasons = new Set<ReadOnlyReason>();
 export function isReadOnly(): boolean {
-  return readOnly;
+  return readOnlyReasons.size > 0;
 }
-export function setReadOnly(v: boolean) {
-  readOnly = v;
+// Narrower than isReadOnly(): true only for the global viewer role, never for
+// a locked book. request()'s write short-circuit must use this, not
+// isReadOnly() — a locked book still allows two things server-side: comment
+// writes and lock/unlock calls themselves. Blanket-blocking every non-GET on
+// isReadOnly() broke both (a lock admin couldn't unlock, since lockBook/
+// unlockBook went through request() and got thrown client-side as a fake 403
+// before ever reaching the server). isReadOnly() itself keeps gating the
+// outbox/draft stores below — those only carry content edits, which must
+// stay frozen for a locked book.
+export function isViewerReadOnly(): boolean {
+  return readOnlyReasons.has("viewer");
+}
+export function setReadOnlyReason(reason: ReadOnlyReason, active: boolean) {
+  if (active) readOnlyReasons.add(reason);
+  else readOnlyReasons.delete(reason);
 }
 
 // Surface to the UI that we tried to silently refresh a 401 and it failed.
@@ -408,12 +425,18 @@ async function request<T>(
   init?: RequestInitWithTimeout,
   _retriedAfterRefresh = false,
 ): Promise<T> {
-  // Viewer (read-only) accounts: short-circuit anything that isn't a GET so
-  // the server never sees a write attempt. ApiError(403, "read_only") is a
-  // distinct sentinel callers can detect; the outbox already treats 403 as
-  // fatal so it won't loop.
+  // Viewer accounts: short-circuit anything that isn't a GET so the server
+  // never sees a write attempt. ApiError(403, "read_only") is a distinct
+  // sentinel callers can detect; the outbox already treats 403 as fatal so
+  // it won't loop. Deliberately isViewerReadOnly(), NOT isReadOnly(): a
+  // locked book must still reach the server for comment writes and for
+  // lock/unlock itself (lockBook/unlockBook are how a lock admin unlocks a
+  // book at all) — the server, not this client-side guard, is the authority
+  // there and returns 423 for actual content writes to a locked book. A
+  // blanket isReadOnly() check here previously threw a fake 403 on those
+  // calls before they ever left the browser, which made unlocking impossible.
   const method = (init?.method ?? "GET").toUpperCase();
-  if (readOnly && method !== "GET" && method !== "HEAD") {
+  if (isViewerReadOnly() && method !== "GET" && method !== "HEAD") {
     throw new ApiError(403, "read_only");
   }
 
@@ -782,6 +805,9 @@ export interface NoteTemplatesResponse {
 export interface BookListEntry {
   book: string;
   imported_at: number;
+  locked: boolean;
+  lockReason: string | null;
+  lockSource: "published" | "explicit" | null;
 }
 
 // Mirrors api/src/bookReimport.ts. Counts of rows/verses touched per
@@ -1166,7 +1192,22 @@ export const api = {
 
   getNoteTemplates: () => request<NoteTemplatesResponse>(`/api/note-templates`),
 
-  getBooks: () => request<{ books: BookListEntry[] }>(`/api/books`),
+  getBooks: () => request<{ books: BookListEntry[]; canManageLocks: boolean }>(`/api/books`),
+
+  // Lock/unlock a book. Only the three lock admins can call these — the
+  // server 403s with { error: "forbidden", reason: "not_a_lock_admin" }
+  // otherwise. Any write to a locked book (including this one, for a
+  // book locked by a different admin's reason) 423s server-side.
+  lockBook: (book: string, reason?: string) =>
+    request<{ ok: true }>(`/api/books/${encodeURIComponent(book)}/lock`, {
+      method: "PUT",
+      body: JSON.stringify(reason !== undefined ? { reason } : {}),
+    }),
+
+  unlockBook: (book: string) =>
+    request<{ ok: true }>(`/api/books/${encodeURIComponent(book)}/lock`, {
+      method: "DELETE",
+    }),
 
   // Trigger a server-side import of a book from DCS. Long-running: ~5-60s
   // depending on book size, so the caller gets a wider timeout.

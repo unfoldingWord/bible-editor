@@ -8,7 +8,7 @@ import {
   devSignIn,
   fetchAuthMe,
   onAuthError,
-  setReadOnly,
+  setReadOnlyReason,
   updateLastLocation,
   type MeResponse,
   type Role,
@@ -97,7 +97,7 @@ function useAuthGate(): [AuthState, (s: AuthState) => void] {
         if (cancelled) return;
         if (me && (me.role === "admin" || me.role === "editor" || me.role === "viewer")) {
           clearSignedOutFlag();
-          setReadOnly(me.role === "viewer");
+          setReadOnlyReason("viewer", me.role === "viewer");
           setState({ kind: "ready", me, role: me.role });
           return;
         }
@@ -119,7 +119,7 @@ function useAuthGate(): [AuthState, (s: AuthState) => void] {
             return;
           }
           clearSignedOutFlag();
-          setReadOnly(devMe.role === "viewer");
+          setReadOnlyReason("viewer", devMe.role === "viewer");
           setState({ kind: "ready", me: devMe, role: devMe.role });
         } catch (err: unknown) {
           if (cancelled) return;
@@ -397,8 +397,10 @@ export function App() {
           bookHook={bookHook}
           onLogout={handleSignOut}
           meUserId={auth.kind === "ready" ? auth.me?.userId ?? null : null}
+          isViewer={isViewer}
           initialCommentId={loc.commentId}
           onCommentConsumed={handleCommentConsumed}
+          authReady={auth.kind === "ready"}
         />
       </Box>
       <Snackbar

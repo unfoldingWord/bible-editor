@@ -131,6 +131,7 @@ interface Props {
   lintIndicator?: ReactNode;
   alignIndicator?: ReactNode;
   exportMenu?: ReactNode;
+  bookLocksButton?: ReactNode;
   railCollapsed?: boolean;
   onToggleRail?: () => void;
   onRequestReload?: () => void;
@@ -147,6 +148,7 @@ export function TopBar({
   lintIndicator,
   alignIndicator,
   exportMenu,
+  bookLocksButton,
   railCollapsed,
   onToggleRail,
   onRequestReload,
@@ -462,6 +464,7 @@ export function TopBar({
       <Divider orientation="vertical" flexItem sx={{ my: 0.5 }} />
       {pipelineMenu}
       {pipelineStatus}
+      {bookLocksButton}
       {onLogout && (
         <>
           <Divider orientation="vertical" flexItem sx={{ my: 0.5 }} />
