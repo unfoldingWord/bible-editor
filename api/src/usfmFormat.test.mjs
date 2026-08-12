@@ -338,9 +338,10 @@ t("dangling \\v: duplicate marker on the target line is dropped for the \\v line
   assert.ok(ls.some((l) => l.trim() === "\\q1 \\v 3 \\w a\\w*"), "merged, no duplicate \\q1");
 });
 
-t("dangling \\v: the \\v line's own marker wins over a different marker on the target", () => {
+t("dangling \\v: a different marker on the target is preserved", () => {
   const ls = lines(`${HDR}\\q1 \\v 11\n\\q2 \\w a\\w*\n`);
-  assert.ok(ls.some((l) => l.trim() === "\\q1 \\v 11 \\w a\\w*"));
+  assert.ok(ls.some((l) => l.trim() === "\\q1 \\v 11"));
+  assert.ok(ls.some((l) => l.trim() === "\\q2 \\w a\\w*"));
 });
 
 t("dangling \\v: target line has no marker, the \\v line's marker is used", () => {
@@ -525,13 +526,12 @@ t("\\q1 / bare \\v 2 / <content> joins all the way (interaction with joinDanglin
   assert.match(out, /\\q1 \\v 2 \\w a\\w\*\n/);
 });
 
-t("\\q1 / \\v 11 / \\q2 <text> merges to \\q1 \\v 11 <text> (ordering case)", () => {
-  // The case that proves the ordering: without joinPoetryMarkerToVerse running
-  // FIRST, joinDanglingVerses would merge \v 11 forward into \q2 <text>,
-  // producing \q2 \v 11 <text> and stranding \q1 — the wrong marker winning.
+t("\\q1 / \\v 11 / \\q2 <text> preserves both conflicting poetry markers", () => {
+  // A different target marker may be a new poetry line, not a duplicate. Keep
+  // the malformed layout for validation instead of deleting \q2 to make it fit.
   const out = norm(`${HDR}\\q1\n\\v 11\n\\q2 \\w a\\w*\n`);
-  assert.match(out, /\\q1 \\v 11 \\w a\\w\*\n/);
-  assert.ok(!out.includes("\\q2"), "\\q2 does not survive — \\q1 wins per joinDanglingVerses rules");
+  assert.match(out, /\\q1 \\v 11\n/);
+  assert.match(out, /\\q2 \\w a\\w\*\n/);
 });
 
 t("two consecutive \\q1 before a \\v: only the second joins", () => {

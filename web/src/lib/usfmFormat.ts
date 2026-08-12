@@ -492,6 +492,13 @@ function joinDanglingVerses(lines: string[]): string[] {
     const { marker: targetMarker, rest: targetRest } = stripLeadingAttachableMarker(
       lines[targetIdx],
     );
+    // A leading poetry marker is content, not disposable formatting. We cannot
+    // prove a different target marker duplicates the one on the dangling verse,
+    // so preserve both for validation and human review rather than delete one.
+    if (dvMarker && targetMarker && dvMarker !== targetMarker) {
+      out.push(lines[i]);
+      continue;
+    }
     // When BOTH the \v line and the target carry a leading poetry marker
     // (e.g. \v line has \q1, target has \q2), the target's marker is dropped
     // in favor of the \v line's own — this is intentional, not a bug. It
