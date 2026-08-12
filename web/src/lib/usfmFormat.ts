@@ -197,22 +197,9 @@ function isJoinableContentLine(line: string): boolean {
 // SAME verse rather than a following `\v`. isJoinableContentLine's whitelist
 // covers this target shape directly.
 //
-// Dropping a content-less `\q*` (FIX D, 2026-08-11): when, after skipping any
-// run of blank and/or `\ts\*` lines, the next line is a chapter marker
-// (`\c N`) or there IS no next line (end of file), the `\q*` has nothing to
-// join to and is DROPPED rather than left stranded. Measured on
-// en_ust/28-HOS.usfm master line 4759 — a lone `\q1` immediately before
-// `\c 10` at the end of Hosea 9 — which Rich Mahn's hand-cleaned version
-// simply does not have. An empty poetry line opens nothing meaningful here
-// (uW uses `\b` for a deliberate blank line), so the maintainer deletes it
-// outright rather than leaving it. Unlike the join skip above, this drop
-// check does NOT require a `\ts\*` in the skipped run — a pure-blank run
-// leading to `\c`/EOF is dropped too, since there is no "leave it stranded
-// but reachable later" option once the chapter ends. Any `\ts\*` line(s) in
-// the skipped run are still emitted; only the `\q*` itself is dropped. Every
-// OTHER stranding shape (`\b`, `\s1`/`\s2`/`\s3`, `\d`, a paragraph marker,
-// or another `\q*`) is left exactly as-is — there is no corpus evidence the
-// maintainer drops those, so this pass doesn't guess.
+// A lone `\q*` that cannot be joined is always preserved. Its absence from a
+// later corpus revision is not enough evidence that the editor intended to
+// delete it; export formatting must not discard authored structure.
 //
 // This is NOT the same shape as collapseDuplicateLeadingMarker's target
 // (`\q1 \q1 text` on one line, a doubled marker with no `\v` involved) —
@@ -226,14 +213,9 @@ function isJoinableContentLine(line: string): boolean {
 //
 // MUST run before joinDanglingVerses (see that function's ordering note and
 // the header guard below, which mirrors it exactly): joinDanglingVerses's
-// forward walk treats a bare attachable marker as crossable and prefers the
-// dangling `\v` line's OWN marker over one found later on the target line.
-// So `\q1` / `\v 11` / `\q2 <text>` must become `\q1 \v 11` FIRST (this pass)
-// so that joinDanglingVerses then merges it forward into
-// `\q1 \v 11 <text>` — the maintainer's actual shape. Running this pass
-// after joinDanglingVerses instead would let joinDanglingVerses merge
-// `\v 11`+`\q2 <text>` into `\q2 \v 11 <text>` first, stranding the `\q1`
-// alone and leaving the wrong marker attached to the verse.
+// forward walk treats a bare attachable marker as crossable. Joining first
+// keeps the original marker attached to its verse; joinDanglingVerses then
+// preserves both lines if the following content has a different marker.
 //
 // Header guard: mirrors joinDanglingVerses/blankLinePass/collapseBlankRuns —
 // everything up to and including the first blank line (the header/ID block)
@@ -274,16 +256,6 @@ function joinPoetryMarkerToVerse(lines: string[]): string[] {
         out.push(...skippedTsLines);
         out.push(`${lines[i].trim()} ${lines[j].trim()}`);
         i = j; // consume through the target line
-        continue;
-      }
-      // FIX D: nothing to join to at all — a chapter break or end of file
-      // right after the skip run means this \q* is content-less. Drop it
-      // (keeping any \ts\* lines that were in the run), rather than leaving
-      // it stranded. See the doc comment above for the corpus evidence.
-      const nextIsChapterOrEof = j >= lines.length || CHAPTER_RE.test(lines[j].trim());
-      if (nextIsChapterOrEof) {
-        out.push(...skippedTsLines);
-        i = j - 1; // consume the marker + skip run; \c (or EOF) is untouched
         continue;
       }
     }
@@ -622,12 +594,17 @@ function joinDanglingVerses(lines: string[]): string[] {
     const { marker: targetMarker, rest: targetRest } = stripLeadingAttachableMarker(
       lines[targetIdx],
     );
-    // When BOTH the \v line and the target carry a leading poetry marker
-    // (e.g. \v line has \q1, target has \q2), the target's marker is dropped
-    // in favor of the \v line's own — this is intentional, not a bug. It
-    // reproduces Rich's own edit in 28-HOS.usfm: `\q1 \v 11` + `\q2 <text>`
-    // merges to `\q1 \v 11 <text>`, and HOS's whole-file \q2 census drops by
-    // exactly 2 after his hand-fixes, confirming he deleted the \q2 himself.
+    // Different poetry levels are distinct editor-authored structure, not
+    // duplicates. There is no lossless way to merge this shape, so preserve
+    // both source lines instead of silently choosing one marker and deleting
+    // the other.
+    if (dvMarker && targetMarker && dvMarker !== targetMarker) {
+      out.push(lines[i]);
+      continue;
+    }
+
+    // Identical markers are redundant around the same dangling verse and can
+    // still be safely collapsed while joining the verse to its content.
     const winningMarker = dvMarker ?? targetMarker;
     const merged = winningMarker
       ? `${winningMarker} ${dvVerse} ${targetRest}`

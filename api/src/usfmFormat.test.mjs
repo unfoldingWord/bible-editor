@@ -338,9 +338,9 @@ t("dangling \\v: duplicate marker on the target line is dropped for the \\v line
   assert.ok(ls.some((l) => l.trim() === "\\q1 \\v 3 \\w a\\w*"), "merged, no duplicate \\q1");
 });
 
-t("dangling \\v: the \\v line's own marker wins over a different marker on the target", () => {
-  const ls = lines(`${HDR}\\q1 \\v 11\n\\q2 \\w a\\w*\n`);
-  assert.ok(ls.some((l) => l.trim() === "\\q1 \\v 11 \\w a\\w*"));
+t("dangling \\v: different poetry markers are preserved instead of choosing a winner", () => {
+  const out = norm(`${HDR}\\q1 \\v 11\n\\q2 \\w a\\w*\n`);
+  assert.match(out, /\\q1 \\v 11\n\\q2 \\w a\\w\*\n/);
 });
 
 t("dangling \\v: target line has no marker, the \\v line's marker is used", () => {
@@ -519,12 +519,11 @@ t("lone \\q1 does NOT join across \\b", () => {
   assert.ok(ls.some((l) => l.trim() === "\\b"));
 });
 
-// CHANGED 2026-08-11 (FIX D): a lone \q1 immediately before a chapter break
-// has nothing to join to and is now DROPPED rather than left bare — see
-// joinPoetryMarkerToVerse's doc comment. The \c 2 line itself is untouched.
-t("lone \\q1 before \\c 2 is dropped (nothing to join to)", () => {
+// Export formatting may reposition a marker when the target is unambiguous,
+// but must preserve it when there is no lossless join available.
+t("lone \\q1 before \\c 2 is preserved", () => {
   const ls = lines(`${HDR}\\q1\n\\c 2\n\\v 7 \\w a\\w*\n`);
-  assert.ok(!ls.some((l) => l.trim() === "\\q1"), "\\q1 is dropped");
+  assert.ok(ls.some((l) => l.trim() === "\\q1"), "\\q1 survives");
   assert.ok(ls.some((l) => l.trim() === "\\c 2"), "\\c 2 is untouched");
 });
 
@@ -545,13 +544,12 @@ t("\\q1 / bare \\v 2 / <content> joins all the way (interaction with joinDanglin
   assert.match(out, /\\q1 \\v 2 \\w a\\w\*\n/);
 });
 
-t("\\q1 / \\v 11 / \\q2 <text> merges to \\q1 \\v 11 <text> (ordering case)", () => {
-  // The case that proves the ordering: without joinPoetryMarkerToVerse running
-  // FIRST, joinDanglingVerses would merge \v 11 forward into \q2 <text>,
-  // producing \q2 \v 11 <text> and stranding \q1 — the wrong marker winning.
+t("\\q1 / \\v 11 / \\q2 <text> preserves both poetry levels", () => {
+  // joinPoetryMarkerToVerse first attaches \\q1 to the verse. The subsequent
+  // dangling-verse repair must not resolve the conflict by deleting \\q2.
   const out = norm(`${HDR}\\q1\n\\v 11\n\\q2 \\w a\\w*\n`);
-  assert.match(out, /\\q1 \\v 11 \\w a\\w\*\n/);
-  assert.ok(!out.includes("\\q2"), "\\q2 does not survive — \\q1 wins per joinDanglingVerses rules");
+  assert.match(out, /\\q1 \\v 11\n\\q2 \\w a\\w\*\n/);
+  assert.equal((out.match(/\\q1|\\q2/g) || []).length, 2, "neither poetry marker is deleted");
 });
 
 t("two consecutive \\q1 before a \\v: only the second joins", () => {
@@ -565,12 +563,11 @@ t("lone \\q1 joins onto a verse bridge \\v 6-9", () => {
   assert.ok(ls.some((l) => l.trim() === "\\q1 \\v 6-9 \\w a\\w*"));
 });
 
-// CHANGED 2026-08-11 (FIX D): a lone poetry marker at end of file has nothing
-// to join to and is now DROPPED, not left stranded — see joinPoetryMarkerToVerse's
-// doc comment (en_ust/28-HOS.usfm:4759 master vs absent in Rich's cleanup).
-t("a lone poetry marker at end of file (no following line) is dropped", () => {
+// This is the Hosea 9 shape that PR 430 treated as inferred cleanup. Absence
+// from another revision is not proof that deleting editor-authored USFM is safe.
+t("a lone poetry marker at end of file is preserved", () => {
   const out = norm(`${HDR}\\v 1 \\w a\\w*\n\\q1`);
-  assert.ok(!out.includes("\\q1"), "trailing bare \\q1 is dropped, not left stranded");
+  assert.match(out, /\\q1\n$/, "trailing bare \\q1 survives");
 });
 
 t("lone-poetry-marker join is idempotent", () => {
@@ -773,11 +770,8 @@ t("FIX C: lone \\q2 + \\zaln-s content line joins (ZEC, en_ult/38-ZEC.usfm:3508)
   assert.ok(!ls.some((l) => l.trim() === "\\q2"), "no bare \\q2 line left behind");
 });
 
-// Note: `\c 2` is deliberately excluded from this loop — per FIX D below, a
-// lone `\q1` immediately before a chapter break is now DROPPED, not left
-// bare (see the dedicated FIX D test). The `\ts\*` case here is followed by
-// `\b` (not EOF/`\c`) specifically so it stays a "stays bare, no join"
-// case rather than tripping FIX D's own drop rule.
+// `\c 2` has its own preservation case below. The `\ts\*` case is followed
+// by `\b` so this loop continues to exercise a non-joinable skipped run.
 for (const [marker, content] of [
   ["\\ts\\*", "\\ts\\*\n\\b"],
   ["\\b", "\\b"],
@@ -790,34 +784,32 @@ for (const [marker, content] of [
   });
 }
 
-// ── FIX D (2026-08-11): a content-less lone \q* is dropped, not stranded ──
-// Measured: en_ust/28-HOS.usfm master line 4759 — a lone `\q1` immediately
-// before `\c 10` at the end of Hosea 9 — absent in Rich Mahn's cleanup.
+// ── Lossless guard: an unjoinable lone \q* is preserved ────────────────────
 
-t("FIX D: lone \\q1 followed by \\c 2 is dropped (nothing to join to)", () => {
+t("lossless: lone \\q1 followed by \\c 2 is preserved", () => {
   const ls = lines(`${HDR}\\q1\n\\c 2\n\\v 1 \\w a\\w*\n`);
-  assert.ok(!ls.some((l) => l.trim() === "\\q1"), "\\q1 is dropped");
+  assert.ok(ls.some((l) => l.trim() === "\\q1"), "\\q1 survives");
   assert.ok(ls.some((l) => l.trim() === "\\c 2"), "\\c 2 is untouched");
 });
 
-t("FIX D: lone \\q1 at end of file is dropped", () => {
+t("lossless: lone \\q1 at end of file is preserved", () => {
   const out = norm(`${HDR}\\v 1 \\w a\\w*\n\\q1`);
-  assert.ok(!out.includes("\\q1"), "\\q1 is dropped");
+  assert.match(out, /\\q1\n$/, "\\q1 survives");
 });
 
-t("FIX D: dropping a \\q1 before \\c keeps any \\ts\\* in the skipped run", () => {
+t("lossless: preserving a \\q1 before \\c also preserves skipped \\ts\\*", () => {
   const ls = lines(`${HDR}\\q1\n\\ts\\*\n\\c 2\n\\v 1 \\w a\\w*\n`);
-  assert.ok(!ls.some((l) => l.trim() === "\\q1"), "\\q1 is dropped");
+  assert.ok(ls.some((l) => l.trim() === "\\q1"), "\\q1 survives");
   assert.ok(ls.some((l) => l.trim() === "\\ts\\*"), "\\ts\\* survives");
   assert.ok(ls.some((l) => l.trim() === "\\c 2"), "\\c 2 is untouched");
 });
 
-t("FIX D: lone \\q1 followed by \\b is NOT dropped (no evidence, still stranded)", () => {
+t("lossless: lone \\q1 followed by \\b remains preserved", () => {
   const ls = lines(`${HDR}\\q1\n\\b\n`);
   assert.ok(ls.some((l) => l.trim() === "\\q1"), "\\q1 is left in place");
 });
 
-t("FIX D: lone \\q1 followed by \\s1 is NOT dropped (no evidence, still stranded)", () => {
+t("lossless: lone \\q1 followed by \\s1 remains preserved", () => {
   const ls = lines(`${HDR}\\q1\n\\s1 A Heading\n`);
   assert.ok(ls.some((l) => l.trim() === "\\q1"), "\\q1 is left in place");
 });
