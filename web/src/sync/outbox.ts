@@ -123,6 +123,9 @@ export interface OutboxOp {
   // genuine one (the server changed a field we're also editing). Only set for
   // row patches; absent for verse/status/lane ops and pre-baseline records.
   baseline?: Record<string, unknown>;
+  // Exact local text-draft generation captured by this save. Used only for
+  // generation-safe cleanup after a successful verse PATCH.
+  draftGeneration?: string;
 }
 
 type Subscriber = (ops: OutboxOp[]) => void;
@@ -300,6 +303,7 @@ export const outbox = {
     bibleVersion: string,
     expectedVersion: number,
     patch: { content: unknown; plain_text?: string | null; alignment_intent?: AlignmentIntent },
+    opts: { draftGeneration?: string } = {},
   ): Promise<OutboxOp> {
     if (isReadOnly()) {
       return noopOp(
@@ -318,6 +322,7 @@ export const outbox = {
       seq: nextSeq(),
       attempts: 0,
       status: "pending",
+      ...(opts.draftGeneration ? { draftGeneration: opts.draftGeneration } : {}),
     };
     await (await db()).put(STORE, op);
     void notify();
