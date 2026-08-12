@@ -1662,8 +1662,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         book,
         chapter,
         verse,
-        ref_raw:
-          chapter === 0 ? "front:intro" : verse === 0 ? `${chapter}:intro` : `${chapter}:${verse}`,
+        ref_raw: verse === 0 ? `${chapter}:intro` : `${chapter}:${verse}`,
         orig_words: resolved?.orig_words ?? "",
         occurrence: resolved?.occurrence ?? 1,
         tw_link: twLink,
@@ -3260,13 +3259,8 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
             const created = (await api.createRow<TnRow>("tn", {
               book,
               chapter,
-              verse: chapter === 0 ? 0 : activeVerse,
-              ref_raw:
-                chapter === 0
-                  ? "front:intro"
-                  : activeVerse === 0
-                    ? `${chapter}:intro`
-                    : `${chapter}:${activeVerse}`,
+              verse: activeVerse,
+              ref_raw: activeVerse === 0 ? `${chapter}:intro` : `${chapter}:${activeVerse}`,
               note: "",
               sort_order,
             }));
@@ -3284,8 +3278,8 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
             const created = (await api.createRow<TnRow>("tn", {
               book,
               chapter,
-              verse: chapter === 0 ? 0 : ref.verse,
-              ref_raw: chapter === 0 ? "front:intro" : ref.ref_raw,
+              verse: ref.verse,
+              ref_raw: ref.ref_raw,
               note: "",
               sort_order,
             }));
@@ -3322,24 +3316,18 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
             if (!row) return;
             const isRange = verseEnd != null && verseEnd > verse;
             const ref_raw =
-              chapter === 0
-                ? "front:intro"
-                : verse === 0
-                  ? `${chapter}:intro`
-                  : isRange
-                    ? `${chapter}:${verse}-${verseEnd}`
-                    : `${chapter}:${verse}`;
-            const effectiveVerse = chapter === 0 ? 0 : verse;
-            if (row.verse === effectiveVerse && row.ref_raw === ref_raw) return;
-            const sort_order = pickSortOrder(sortedForVerse(tn, effectiveVerse), null, "after");
-            enqueueRow("tn", row, { verse: effectiveVerse, ref_raw, sort_order });
+              verse === 0
+                ? `${chapter}:intro`
+                : isRange
+                  ? `${chapter}:${verse}-${verseEnd}`
+                  : `${chapter}:${verse}`;
+            if (row.verse === verse && row.ref_raw === ref_raw) return;
+            const sort_order = pickSortOrder(sortedForVerse(tn, verse), null, "after");
+            enqueueRow("tn", row, { verse, ref_raw, sort_order });
             // Follow the note to its new verse: the resource column only renders
             // notes in displayVerseRange, so without this the moved card vanishes
-            // from view. Navigating there confirms the move landed. Must match
-            // the stored verse (effectiveVerse), not the raw `verse` — at
-            // chapter 0 the note is stored at verse 0, so navigating to the raw
-            // verse would jump to a verse where it never renders.
-            setActiveVerse(effectiveVerse);
+            // from view. Navigating there confirms the move landed.
+            setActiveVerse(verse);
             setActiveNoteId(id);
           }}
           onReorderPreview={handleReorderPreview}
@@ -3353,12 +3341,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
               book,
               chapter,
               verse: activeVerse,
-              ref_raw:
-                chapter === 0
-                  ? "front:intro"
-                  : activeVerse === 0
-                    ? `${chapter}:intro`
-                    : `${chapter}:${activeVerse}`,
+              ref_raw: activeVerse === 0 ? `${chapter}:intro` : `${chapter}:${activeVerse}`,
               orig_words: "",
               tw_link: "",
               sort_order,
@@ -3421,12 +3404,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
               book,
               chapter,
               verse: activeVerse,
-              ref_raw:
-                chapter === 0
-                  ? "front:intro"
-                  : activeVerse === 0
-                    ? `${chapter}:intro`
-                    : `${chapter}:${activeVerse}`,
+              ref_raw: activeVerse === 0 ? `${chapter}:intro` : `${chapter}:${activeVerse}`,
               question: "",
               response: "",
             }));

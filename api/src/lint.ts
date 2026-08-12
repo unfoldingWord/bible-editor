@@ -36,13 +36,7 @@ function isBlankRequired(s: string | null | undefined): boolean {
   return !s || s.trim() === "";
 }
 
-// Chapter 0 is ONLY ever legal as the literal "front:intro" (see
-// chapterZeroGuard.ts) — a book has no chapter numbered 0 with real verses,
-// so "0:1", "0:intro", "0:front" etc. have no valid rendering. The negative
-// lookahead excludes a leading "0:" from the three numeric-chapter branches
-// while leaving "front:intro" itself untouched (see the ISA ee2w "0:1"
-// incident, STATE.md).
-const REFERENCE_RE = /^(?:front:intro|(?!0:)\d+:intro|(?!0:)\d+:front|(?!0:)\d+:\d+(?:[,-][\d,:-]*\d+)*)$/;
+const REFERENCE_RE = /^(?:front:intro|\d+:intro|\d+:front|\d+:\d+(?:[,-][\d,:-]*\d+)*)$/;
 const SUPPORT_REFERENCE_RE = /^rc:\/\/[^/]+\/[^/]+\/[^/]+\/[^ \\]+$/;
 const ALT_LABEL_RE = /Alternat(?:e|ive)( *)([Tt])ranslation/g;
 

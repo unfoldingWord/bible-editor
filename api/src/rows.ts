@@ -10,8 +10,6 @@ import { blankStubClause } from "./blankStub";
 import { reopenLaneChecks } from "./laneReopen";
 import { refParts, coveredVersesFromRef } from "./importParsers";
 import { requiredOccurrence } from "./occurrenceRule";
-import { findRawTabField } from "./rawTabGuard";
-import { isValidChapterZeroRef } from "./chapterZeroGuard";
 
 export const rows = new Hono<{ Bindings: Env; Variables: { userId?: number } }>();
 
@@ -212,33 +210,6 @@ rows.post("/:kind", requireEditor, async (c) => {
   const parsed = CREATE_SCHEMA[kind].safeParse(body);
   if (!parsed.success) return c.json({ error: "invalid_body", details: parsed.error.format() }, 400);
   const data = parsed.data as Record<string, unknown>;
-
-  // A raw TAB in any text field is structural corruption (see rawTabGuard.ts)
-  // — reject it before it ever reaches D1.
-  const tabField = findRawTabField(data);
-  if (tabField) {
-    return c.json(
-      { error: "invalid_body", message: `Field '${tabField}' contains a raw TAB character, which is not allowed.` },
-      400,
-    );
-  }
-
-  // Chapter 0 is only ever legal as verse 0 with ref_raw "front:intro", and
-  // only for tn (see chapterZeroGuard.ts — this is the ISA ee2w "0:1"
-  // incident; tq/twl have no legal chapter-0 shape at all).
-  if (!isValidChapterZeroRef(kind, data.chapter as number, data.verse as number, data.ref_raw as string)) {
-    return c.json(
-      {
-        error: "invalid_body",
-        message:
-          kind === "tn"
-            ? `Chapter 0 rows must use ref_raw "front:intro" (got ${JSON.stringify(data.ref_raw)}).`
-            : `Chapter 0 is not valid for ${kind} rows.`,
-      },
-      400,
-    );
-  }
-
   const userId = currentUserId(c);
 
   // Block new rows while an AI pipeline that writes THIS kind is running for
@@ -571,16 +542,6 @@ rows.patch("/:kind/:id", requireEditor, async (c) => {
   }
   const patch = parsed.data;
 
-  // A raw TAB in any text field is structural corruption (see rawTabGuard.ts)
-  // — reject it before it ever reaches D1.
-  const tabField = findRawTabField(patch as Record<string, unknown>);
-  if (tabField) {
-    return c.json(
-      { error: "invalid_body", message: `Field '${tabField}' contains a raw TAB character, which is not allowed.` },
-      400,
-    );
-  }
-
   let fields = Object.keys(patch);
   if (fields.length === 0) {
     return c.json({ error: "empty_patch" }, 400);
@@ -601,35 +562,6 @@ rows.patch("/:kind/:id", requireEditor, async (c) => {
       })
     | null;
   if (!current || current.deleted_at) return c.json({ error: "not_found" }, 404);
-
-  // Same chapter-0 guard as the create path (see chapterZeroGuard.ts), applied
-  // here because the "change reference" PATCH can retarget ref_raw (or verse)
-  // to an illegal shape just as easily as a create can mint one. Chapter
-  // itself is never patched (same-chapter moves only — see the ref_raw
-  // comment below), so current.chapter is the row's real chapter for this
-  // check. Only runs when the patch actually touches verse or ref_raw — a
-  // patch that touches neither can't introduce this defect, so it falls back
-  // to the row's current (already-valid) verse/ref_raw untouched.
-  if (
-    ("verse" in patch || "ref_raw" in patch) &&
-    !isValidChapterZeroRef(
-      kind,
-      current.chapter,
-      ("verse" in patch ? (patch as { verse?: number }).verse : current.verse) as number,
-      ("ref_raw" in patch ? patch.ref_raw : (current.ref_raw as string)) as string,
-    )
-  ) {
-    return c.json(
-      {
-        error: "invalid_body",
-        message:
-          kind === "tn"
-            ? `Chapter 0 rows must use verse 0 and ref_raw "front:intro" (got verse=${JSON.stringify("verse" in patch ? patch.verse : current.verse)}, ref_raw=${JSON.stringify("ref_raw" in patch ? patch.ref_raw : current.ref_raw)}).`
-            : `Chapter 0 is not valid for ${kind} rows.`,
-      },
-      400,
-    );
-  }
 
   // Backstop for the blank-note data-loss bug (NUM 22:10 v4→v5). The client
   // (NoteCard.flushPending) already blocks this with a confirm dialog, but any

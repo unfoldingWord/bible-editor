@@ -25,39 +25,25 @@
 
 const CHAPTER_RE = /^\\c\s+\d+\s*$/;
 
-// Paragraph-family markers that DCS requires to sit ALONE on their own line
-// and NEVER attached to following content or a `\v` line — same requirement
-// as `\p`, extended to the rest of PARAGRAPH_MARKERS (declared below) plus
-// numbered variants (`\pi1`, `\pi2`, `\mi1`...). Measured directly: in Rich
-// Mahn's hand-cleaned files, `\m` is own-line 4/4 (joined 0 times), `\p`
-// own-line 452/452, `\pi1` own-line 13/13 — never once fused to following
-// content. `\mi`/`\nb`/`\cls` have zero occurrences in the sampled corpus, so
-// their inclusion here is an EXTRAPOLATION from the same paragraph-marker
-// principle, not direct measurement.
-const PARAGRAPH_FAMILY_ALTERNATION = "m|pi[0-9]?|mi[0-9]?|nb|cls";
-
 // Standalone structural markers DCS requires to sit ALONE on their own line,
 // matched WHEREVER they appear in a line (leading, trailing, or embedded —
 // usfm-js does all three). The `(?![A-Za-z0-9])` / `(?![A-Za-z])` guards keep
-// `\p` from matching `\pi`/`\pn`/`\fp`, `\b` from matching `\bd`/`\bk`, and
-// `\m` from matching `\mi`/`\mt`/`\ms`; `\c` requires a following integer so
-// `\ca`/`\cls` don't match. `\ts\*` only (the malformed `\ts*` is repaired to
-// `\ts\*` before this runs).
-const STANDALONE_MARKER_RE = new RegExp(
-  String.raw`\\ts\\\*|\\b(?![A-Za-z])|\\p(?![A-Za-z0-9])|\\c\s+\d+|\\(${PARAGRAPH_FAMILY_ALTERNATION})(?![A-Za-z0-9])`,
-);
+// `\p` from matching `\pi`/`\pn`/`\fp` and `\b` from matching `\bd`/`\bk`; `\c`
+// requires a following integer so `\ca`/`\cls` don't match. `\ts\*` only (the
+// malformed `\ts*` is repaired to `\ts\*` before this runs).
+const STANDALONE_MARKER_RE = /\\ts\\\*|\\b(?![A-Za-z])|\\p(?![A-Za-z0-9])|\\c\s+\d+/;
 
-// Poetry markers that MAY precede `\v` on the same line (mirrors
-// `_VERSE_PREFIX_RE` in validate_usfm_files.py) — EXCLUDING `\p` and the
-// PARAGRAPH_FAMILY_ALTERNATION markers, which are standalone (extracted
-// above) and must always be on their own line, never attached to a `\v`.
+// Paragraph/poetry markers that MAY precede `\v` on the same line (mirrors
+// `_VERSE_PREFIX_RE` in validate_usfm_files.py) — EXCLUDING `\p`, which is a
+// standalone marker (extracted above) and must always be on its own line.
 // Shared by ATTACHABLE_PREFIX_RE (whole-string test) and POETRY_PREFIX_RE
 // (matched anywhere in a line) so the marker set can't drift between the two.
 // Alternative order doesn't matter for correctness: the `(?![A-Za-z0-9])`
 // lookahead in POETRY_PREFIX_RE rejects a too-short alternative (e.g. `q`
 // matching inside `qm2`) and regex backtracking then tries the next
 // alternative at the same position until one satisfies the lookahead.
-const POETRY_MARKER_ALTERNATION = "q[0-9]?|qm[0-9]?|qr|qc|qa|qd|li[0-9]?|ph[0-9]?|pc";
+const POETRY_MARKER_ALTERNATION =
+  "q[0-9]?|qm[0-9]?|qr|qc|qa|qd|li[0-9]?|pi[0-9]?|ph[0-9]?|m|mi|nb|pc|cls";
 
 const ATTACHABLE_PREFIX_RE = new RegExp(String.raw`^\\(${POETRY_MARKER_ALTERNATION})$`);
 
@@ -131,35 +117,15 @@ function collapseDuplicateLeadingMarker(seg: string): string {
 // this treatment. Widening to the full attachable set would be a regression.
 const LONE_POETRY_MARKER_RE = /^\\q[1-4]?$/;
 
-// A line the join target may be: the next verse (`\v N …`, including a
-// bridge like `\v 6-9`), or content that continues the CURRENT verse across a
-// physical line break — inline alignment/word/footnote/figure markup, or bare
-// text/punctuation carrying no marker at all. Deliberately a WHITELIST, not a
-// blacklist, so an unrecognized backslash marker never silently becomes a
-// join target: `\ts\*`, `\b`, `\c`, the whole paragraph family, `\s1`-`\s3`,
-// `\d`, `\qs`, and another `\q*` are all excluded by omission, not by name.
-function isJoinableContentLine(line: string): boolean {
-  const s = line.trim();
-  if (s === "") return false;
-  if (/^\\v\s+\d/.test(s)) return true;
-  if (/^\\zaln-s\b/.test(s)) return true;
-  if (/^\\w[ *]/.test(s)) return true;
-  if (/^\\f\b/.test(s)) return true;
-  if (/^\\fig\b/.test(s)) return true;
-  if (!s.startsWith("\\")) return true; // bare text/punctuation continuation
-  return false;
+function isVerseLineStart(line: string): boolean {
+  return /^\\v\s+\d/.test(line.trim());
 }
 
-// Join a lone poetry-marker line (`\q1` by itself) forward onto the next
-// joinable content line, producing the maintainer's hand-fixed shape
-// `\q1 \v N …` (or `\q2 \zaln-s …` — see below) instead of two separate
-// lines. A run of blank and/or `\ts\*` lines between the marker and its
-// target is skipped OVER — but ONLY when that run contains at least one
-// `\ts\*` line (blanks dropped, `\ts\*` line(s) re-emitted first, in order).
-// A run made of blanks ALONE (no `\ts\*` in it) does NOT get crossed — see
-// "Skipping a `\ts\*` run" below for why the two cases are treated
-// differently despite looking similar. Any other line in between aborts the
-// join outright.
+// Join a lone poetry-marker line (`\q1` by itself) onto the very next line
+// when that next line starts a verse (`\v N …`), producing the maintainer's
+// hand-fixed shape `\q1 \v N …` instead of two separate lines. No blank line
+// and no other line may sit between them — only an immediate marker→verse
+// adjacency joins.
 //
 // Corpus evidence (the exported ULT/UST books only, i.e. the ones this
 // normalizer actually runs on): 302 occurrences of this exact lone-`\q*`-
@@ -167,52 +133,6 @@ function isJoinableContentLine(line: string): boolean {
 // 308 vs. 10 for UST. The DCS maintainer hand-fixes every one of them to the
 // joined form shown above (see the CLAUDE.md task that introduced this pass),
 // so emitting it pre-joined removes 620 nightly-recreated diffs.
-//
-// Skipping a `\ts\*` run: Rich Mahn requested this shape on 2026-08-11 —
-// measured 9 occurrences of a lone `\q*` stranded above a `\ts\*` (with the
-// following `\v` never joined) in current master (en_ust/28-HOS.usfm x4,
-// en_ult/33-MIC.usfm x5) vs. 0 in his hand-cleaned files. A blank line may
-// still appear WITHIN such a run (blankLinePass can have placed one there on
-// an earlier pass — this pass itself never sees one at first-pass join time,
-// since the three lines are physically adjacent before blankLinePass runs;
-// see the pipeline order in normalizeUsfmFormatting), so blanks are tolerated
-// inside a `\ts\*`-containing run without being what triggers the skip.
-//
-// NOT skipping a pure-blank run (corrected 2026-08-11): an earlier version of
-// this comment argued that all 33 lone-`\q*` lines in Rich's 8 hand-cleaned
-// files get immediately joined, so a lone `\q*` "never survives" and a blank
-// run should be crossed too. That was wrong — those 33 lines ARE the
-// surviving, un-joined shape (a lone `\q*` line and a joined `\q<n> \v N`
-// line are mutually exclusive; Rich's files also contain hundreds of the
-// joined form). So his files DO contain lone `\q*` markers he deliberately
-// left unjoined, and separately, 0 of those 33 are followed by a blank line
-// before their `\v` — meaning there is no corpus evidence either way for the
-// blank-only case. Rich asked specifically for the `\ts\*` shape and said
-// nothing about blanks, so this pass changes only that: a bare blank-then-`\v`
-// with no `\ts\*` in between is left exactly as before, unjoined.
-//
-// Widening the target to non-`\v` content (FIX C): 0 occurrences in Rich's
-// files vs. 32 in current master (en_ult/38-ZEC.usfm — 24x `\q2`, 8x `\q1`),
-// all a lone `\q*` immediately above a `\zaln-s`/`\w` continuation of the
-// SAME verse rather than a following `\v`. isJoinableContentLine's whitelist
-// covers this target shape directly.
-//
-// Dropping a content-less `\q*` (FIX D, 2026-08-11): when, after skipping any
-// run of blank and/or `\ts\*` lines, the next line is a chapter marker
-// (`\c N`) or there IS no next line (end of file), the `\q*` has nothing to
-// join to and is DROPPED rather than left stranded. Measured on
-// en_ust/28-HOS.usfm master line 4759 — a lone `\q1` immediately before
-// `\c 10` at the end of Hosea 9 — which Rich Mahn's hand-cleaned version
-// simply does not have. An empty poetry line opens nothing meaningful here
-// (uW uses `\b` for a deliberate blank line), so the maintainer deletes it
-// outright rather than leaving it. Unlike the join skip above, this drop
-// check does NOT require a `\ts\*` in the skipped run — a pure-blank run
-// leading to `\c`/EOF is dropped too, since there is no "leave it stranded
-// but reachable later" option once the chapter ends. Any `\ts\*` line(s) in
-// the skipped run are still emitted; only the `\q*` itself is dropped. Every
-// OTHER stranding shape (`\b`, `\s1`/`\s2`/`\s3`, `\d`, a paragraph marker,
-// or another `\q*`) is left exactly as-is — there is no corpus evidence the
-// maintainer drops those, so this pass doesn't guess.
 //
 // This is NOT the same shape as collapseDuplicateLeadingMarker's target
 // (`\q1 \q1 text` on one line, a doubled marker with no `\v` involved) —
@@ -248,44 +168,11 @@ function joinPoetryMarkerToVerse(lines: string[]): string[] {
       continue;
     }
     const isLoneMarker = LONE_POETRY_MARKER_RE.test(lines[i].trim());
-    if (isLoneMarker) {
-      const skippedTsLines: string[] = [];
-      let sawTs = false;
-      let j = i + 1;
-      while (j < lines.length) {
-        const s = lines[j].trim();
-        if (s === "") {
-          j++;
-          continue;
-        }
-        if (s === "\\ts\\*") {
-          skippedTsLines.push(lines[j]);
-          sawTs = true;
-          j++;
-          continue;
-        }
-        break;
-      }
-      // A run crossed via blanks alone (no \ts\* in it) does NOT license the
-      // join — only immediate adjacency (j === i + 1) or a run containing at
-      // least one \ts\* does. See the doc comment above for why.
-      const blockedByBlankOnlyRun = j > i + 1 && !sawTs;
-      if (!blockedByBlankOnlyRun && j < lines.length && isJoinableContentLine(lines[j])) {
-        out.push(...skippedTsLines);
-        out.push(`${lines[i].trim()} ${lines[j].trim()}`);
-        i = j; // consume through the target line
-        continue;
-      }
-      // FIX D: nothing to join to at all — a chapter break or end of file
-      // right after the skip run means this \q* is content-less. Drop it
-      // (keeping any \ts\* lines that were in the run), rather than leaving
-      // it stranded. See the doc comment above for the corpus evidence.
-      const nextIsChapterOrEof = j >= lines.length || CHAPTER_RE.test(lines[j].trim());
-      if (nextIsChapterOrEof) {
-        out.push(...skippedTsLines);
-        i = j - 1; // consume the marker + skip run; \c (or EOF) is untouched
-        continue;
-      }
+    const next = lines[i + 1];
+    if (isLoneMarker && next !== undefined && isVerseLineStart(next)) {
+      out.push(`${lines[i].trim()} ${next.trim()}`);
+      i++; // consume the verse line too
+      continue;
     }
     out.push(lines[i]);
   }
@@ -462,31 +349,15 @@ function stripLeadingAttachableMarker(line: string): { marker: string | null; re
   return { marker: null, rest: s };
 }
 
-// A bare paragraph-family marker line (`\m`, `\pi1`, `\mi`, `\nb`, `\cls`, …
-// — same family as `\p`). These are extracted onto their own line by
-// STANDALONE_MARKER_RE (FIX A) and, unlike the poetry markers in
-// POETRY_MARKER_ALTERNATION, must never be attached to a `\v` line (so they
-// are deliberately absent from ATTACHABLE_PREFIX_RE). But a bare one must
-// still be CROSSABLE in joinDanglingVerses's forward walk — see
-// isCrossableMarkerLine below — exactly like `\p`: the walk steps over it,
-// keeps it on its own line, and keeps looking for the actual verse content.
-// Treating it as an abort instead (an earlier version of this pass did) left
-// a `\v` stranded alone on its own line whenever a bare `\m`/`\pi1`/etc. sat
-// between it and its text — regression against main, caught in pre-merge
-// review 2026-08-11.
-const PARAGRAPH_FAMILY_BARE_RE = new RegExp(String.raw`^\\(${PARAGRAPH_FAMILY_ALTERNATION})$`);
-
 // A line that joinDanglingVerses's forward walk may cross AND KEEP in place:
-// a bare `\p`, a bare paragraph-family marker (`\m`, `\pi1`, etc — see
-// PARAGRAPH_FAMILY_BARE_RE above), or a bare attachable poetry marker (`\q1`,
-// etc) with nothing following it on the line. Deliberately narrow —
-// `\b`/`\ts\*`/`\c` used to be crossable here too, which is exactly what let
-// the walk merge a verse into the wrong chapter (see isAbortLine and the doc
-// comment on joinDanglingVerses below).
+// a bare `\p`, or a bare attachable poetry/paragraph marker (`\q1`, etc) with
+// nothing following it on the line. Deliberately narrow — `\b`/`\ts\*`/`\c`
+// used to be crossable here too, which is exactly what let the walk merge a
+// verse into the wrong chapter (see isAbortLine and the doc comment on
+// joinDanglingVerses below).
 function isCrossableMarkerLine(line: string): boolean {
   const s = line.trim();
   if (s === "\\p") return true;
-  if (PARAGRAPH_FAMILY_BARE_RE.test(s)) return true;
   return ATTACHABLE_PREFIX_RE.test(s);
 }
 
@@ -498,8 +369,7 @@ function isCrossableMarkerLine(line: string): boolean {
 // are NOT extracted onto their own line by anything upstream, so they're
 // matched by leading marker instead, whatever text follows them. Another `\v`
 // line (dangling or not) always aborts too — a join must never swallow a
-// second verse. Bare paragraph-family markers (`\m`, `\pi1`, etc) are NOT an
-// abort — they're crossable instead, per isCrossableMarkerLine above.
+// second verse.
 // `\qa`/`\qc`/`\qr`/`\qd` are in POETRY_MARKER_ALTERNATION, so without an
 // explicit abort they are worse than merely crossable: stripLeadingAttachableMarker
 // peels them off and the join hoists the verse number INTO the heading —

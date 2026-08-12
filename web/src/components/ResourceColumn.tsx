@@ -900,7 +900,7 @@ export function ResourceColumn({
               // twl_rows — see api/src/chapterLock.ts), so there's no lockedTw
               // to check here. A book lock is different: it's a hard freeze
               // with no carve-outs, and the server refuses TWL writes too.
-              hideAdd={chapter === 0 || bookLocked}
+              hideAdd={bookLocked}
               lane="tw"
               checkoff={checkoff}
             />
@@ -922,13 +922,8 @@ export function ResourceColumn({
             )}
             {/* Per-verse suggestions — only in the active-verse (unpinned) view.
                 refreshKey is the verse's current link set so adding/removing a
-                link re-scans and drops/recovers it.
-                Hidden at chapter 0 for the same reason the add button above is:
-                the API rejects any chapter-0 twl row, so promoting a suggestion
-                there could only ever 400, and this path calls createRow directly
-                rather than going through the outbox — so it has no failed-op chip
-                and the click would look like a dead button. */}
-            {!twlGroups && chapter !== 0 && onAddTwlSuggestion && (
+                link re-scans and drops/recovers it. */}
+            {!twlGroups && onAddTwlSuggestion && (
               // Pin the suggestions to the bottom of the scroll viewport: mt:auto
               // pushes it to the bottom of the flex column (so it stays there even
               // when the Words list is short), and sticky bottom:-8 keeps it pinned
@@ -973,7 +968,7 @@ export function ResourceColumn({
               onTogglePin={() => togglePinned("questions")}
               onAdd={onQuestionCreate}
               sticky
-              hideAdd={lockedTq || chapter === 0 || bookLocked}
+              hideAdd={lockedTq || bookLocked}
               lane="tq"
               checkoff={checkoff}
             />
