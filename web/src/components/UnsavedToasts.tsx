@@ -11,6 +11,8 @@ import { useEffect, useMemo, useState } from "react";
 import { Alert, IconButton, Stack, Button, Box, Typography } from "@mui/material";
 import CloseIcon from "@mui/icons-material/Close";
 import { drafts, type DraftRecord } from "../sync/drafts";
+import { outbox, type OutboxOp } from "../sync/outbox";
+import { verseDraftHasActiveSave } from "../sync/draftSaveState";
 
 const AGGREGATE_THRESHOLD = 3;
 
@@ -33,11 +35,13 @@ interface Props {
 
 export function UnsavedToasts({ book, onSaveVerseDraft, onJumpTo }: Props) {
   const [draftList, setDraftList] = useState<DraftRecord[]>([]);
+  const [ops, setOps] = useState<OutboxOp[]>([]);
   const [visibleKeys, setVisibleKeys] = useState<Set<string>>(new Set());
   const [dismissed, setDismissed] = useState<Set<string>>(new Set());
   const [expanded, setExpanded] = useState(false);
 
   useEffect(() => drafts.subscribe(setDraftList), []);
+  useEffect(() => outbox.subscribe(setOps), []);
 
   // Re-arm IntersectionObservers whenever the draft set changes. Drafts
   // whose corresponding cell isn't in the DOM are treated as off-screen
@@ -78,10 +82,11 @@ export function UnsavedToasts({ book, onSaveVerseDraft, onJumpTo }: Props) {
       (d) =>
         d.meta.kind === "verse" &&
         d.meta.book === book &&
+        !verseDraftHasActiveSave(d, ops) &&
         !visibleKeys.has(d.key) &&
         !dismissed.has(d.key),
     );
-  }, [draftList, visibleKeys, dismissed, book]);
+  }, [draftList, ops, visibleKeys, dismissed, book]);
 
   if (offscreenDrafts.length === 0) return null;
 

@@ -10,6 +10,7 @@
 import { openDB, type IDBPDatabase } from "idb";
 import { isReadOnly, type RowKind } from "./api";
 import { onOutboxResult } from "./outbox";
+import { generationForSuccessfulOp } from "./draftSaveState";
 
 const DB_NAME = "bible-editor-drafts";
 const DB_VERSION = 1;
@@ -27,6 +28,12 @@ export interface DraftRecord {
   payload: DraftPayload;
   expectedVersion: number;
   updatedAt: number;
+  // Opaque identity for this exact draft write. A save carries the generation
+  // it captured into the outbox so its eventual 200 only clears that draft,
+  // never newer typing on the same verse that arrived while the request was in
+  // flight. Optional for records persisted before this field was introduced;
+  // those use a stable legacy identity derived from updatedAt.
+  generation?: string;
   // Denormalized so subscribers (UnsavedToasts, SyncStatusBar) can render
   // "Save Num 20:1 ULT?" without parsing the key. Verse drafts carry
   // book/chapter/verse/bibleVersion; row drafts carry kind/id/book.
@@ -78,6 +85,14 @@ const subscribers = new Set<Subscriber>();
 // subscription (and survive the reload regardless, so a missed prompt there is
 // not data loss).
 const pendingKeys = new Set<string>();
+const latestGenerationByKey = new Map<string, string>();
+let generationSeq = 0;
+
+function nextGeneration(): string {
+  generationSeq += 1;
+  return `${Date.now()}:${generationSeq}:${Math.random().toString(36).slice(2)}`;
+}
+
 export function hasUnsavedDrafts(): boolean {
   return pendingKeys.size > 0;
 }
@@ -128,11 +143,14 @@ export const drafts = {
     // Mark dirty synchronously — before the async put — so the unload guard
     // sees it during the commit window (see pendingKeys).
     pendingKeys.add(key);
+    const generation = nextGeneration();
+    latestGenerationByKey.set(key, generation);
     const rec: DraftRecord = {
       key,
       payload,
       expectedVersion,
       updatedAt: Date.now(),
+      generation,
       meta,
     };
     await (await db()).put(STORE, rec);
@@ -167,8 +185,32 @@ export const drafts = {
 
   async clear(key: string): Promise<void> {
     pendingKeys.delete(key);
+    latestGenerationByKey.delete(key);
     await (await db()).delete(STORE, key);
     void notify();
+  },
+
+  // Delete only the exact draft generation that produced a successful save.
+  // The read + conditional delete share one transaction so another committed
+  // write cannot slip between them. latestGenerationByKey also covers a newer
+  // set() that has started synchronously but has not committed to IndexedDB yet.
+  async clearGeneration(key: string, generation: string): Promise<boolean> {
+    const idb = await db();
+    const tx = idb.transaction(STORE, "readwrite");
+    const rec = (await tx.store.get(key)) as DraftRecord | undefined;
+    const currentGeneration = rec?.generation ?? (rec ? `legacy:${rec.updatedAt}` : undefined);
+    if (!rec || currentGeneration !== generation) {
+      await tx.done;
+      return false;
+    }
+    await tx.store.delete(key);
+    await tx.done;
+    if (latestGenerationByKey.get(key) === generation) {
+      latestGenerationByKey.delete(key);
+      pendingKeys.delete(key);
+    }
+    void notify();
+    return true;
   },
 
   async list(): Promise<DraftRecord[]> {
@@ -197,9 +239,11 @@ export function draftDirtyBorderSx() {
 onOutboxResult((op, result) => {
   if (result.kind !== "ok") return;
   if (op.target.kind === "verse") {
-    void drafts.clear(
-      verseKey(op.target.book, op.target.chapter, op.target.verse, op.target.bibleVersion),
-    );
+    const key = verseKey(op.target.book, op.target.chapter, op.target.verse, op.target.bibleVersion);
+    void drafts.get(key).then((draft) => {
+      const generation = generationForSuccessfulOp(draft, op);
+      if (generation) void drafts.clearGeneration(key, generation);
+    });
   } else if (op.target.kind === "row") {
     void drafts.clear(rowKey(op.target.rowKind, op.target.book, op.target.id));
   }

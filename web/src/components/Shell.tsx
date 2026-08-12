@@ -47,6 +47,7 @@ import {
 import { ChapterBoard } from "./ChapterBoard";
 import { BookLocksDialog } from "./BookLocksDialog";
 import { drafts, verseKey } from "../sync/drafts";
+import { generationForSavedPlain } from "../sync/draftSaveState";
 import { smartEditVerse } from "../lib/replace";
 import { extractEditableText, extractPlainText, normalizeEditable, SECTION_HEADER_TAGS } from "../lib/usfm";
 import { chapterOpensWithoutMarker, introEditBase } from "../lib/verseIntro";
@@ -2268,6 +2269,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     // confirm-commit below (text_edit) so a deferred "Save anyway" updates the
     // cache too.
     onConfirmedApply?: () => void,
+    draftGeneration?: string,
   ): boolean => {
     const delta = analyzeAlignmentDelta(base.content, content);
     // Block any save that collaterally de-aligns untouched words. The enforced
@@ -2299,6 +2301,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
               bibleVersion,
               expectedVersion,
               { content, plain_text: plainText, alignment_intent: "alignment_edit" },
+              { draftGeneration },
             );
             onConfirmedApply?.();
           },
@@ -2322,6 +2325,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       bibleVersion,
       expectedVersion,
       { content, plain_text: plainText, alignment_intent: intent },
+      { draftGeneration },
     );
     return true;
   }, [book, pushPipelineToast]);
@@ -2656,7 +2660,16 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     // leaves an orphaned draft (dirty border + SyncStatusBar entry + "unsaved
     // edits" toast whose Save button re-hits this guard and never resolves).
     if (oldEditable === normalizeEditable(plain)) {
-      void drafts.clear(verseKey(book, chapterNum, verseNum, bibleVersion));
+      const key = verseKey(book, chapterNum, verseNum, bibleVersion);
+      void drafts
+        .get(key)
+        .then((draft) => {
+          const generation = generationForSavedPlain(draft, plain);
+          if (generation) void drafts.clearGeneration(key, generation);
+        })
+        .catch(() => {
+          /* conservative: leave an unreadable draft in place */
+        });
       return;
     }
     const result = smartEditVerse(base.content, oldEditable, plain);
@@ -2696,10 +2709,24 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       bookHook?.applyLocalVerse(newDto);
       if (chapterNum === chapter) applyLocalVerse(newDto);
     };
-    if (!enqueueVerseSafely(chapterNum, verseNum, bibleVersion, base, result.content, newPlainText, "text_edit", base.version, applyLocal)) {
-      return;
-    }
-    applyLocal();
+    const key = verseKey(book, chapterNum, verseNum, bibleVersion);
+    // Resolve the durable draft before queueing so the outbox records the exact
+    // generation represented by `plain`. If the user typed again after clicking
+    // Save, generationForSavedPlain refuses to associate that newer draft with
+    // this older payload, so the eventual 200 cannot clear the new work.
+    const enqueueCapturedSave = (draftGeneration?: string) => {
+      if (!enqueueVerseSafely(chapterNum, verseNum, bibleVersion, base, result.content, newPlainText, "text_edit", base.version, applyLocal, draftGeneration)) {
+        return;
+      }
+      applyLocal();
+    };
+    void drafts
+      .get(key)
+      .then((draft) => enqueueCapturedSave(generationForSavedPlain(draft, plain)))
+      // Draft lookup is cleanup metadata, not a prerequisite for durability.
+      // If IndexedDB is temporarily unreadable, still queue the user's save;
+      // the draft simply remains available for a conservative manual cleanup.
+      .catch(() => enqueueCapturedSave());
   };
 
   // Restore a previously-saved verse version (from the history dialog). Unlike
