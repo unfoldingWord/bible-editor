@@ -1960,6 +1960,146 @@ await withMockedClock(async () => {
   );
 });
 
+// ── plain_text staleness on the verse-curl self-heal path (independent review
+//    finding) ────────────────────────────────────────────────────────────────
+// applyVerseUpdate captures payload.plain_text UP FRONT, before the ULT/UST
+// self-heal block (which now includes curlifyVerseObjects) mutates the tree.
+// Without re-deriving it from the FINAL tree, a curled verse would be stored
+// with STALE plain_text — FindReplaceOverlay/source search (both match on
+// plain_text) then miss it, and the next nightly bookReimport, comparing
+// master's freshly-extracted text against this stale value, would see a false
+// diff and spuriously re-seed the verse (resetting updated_by) every night.
+// Drives a real verse proposal (straight quote in content_json, a
+// deliberately STALE straight-quote plain_text in the payload matching the
+// pre-curl text — what the AI would actually have supplied) through the real
+// importJobOutput -> applyVerseUpdate path and asserts the INSERT captures
+// the RE-DERIVED (curly) plain_text, not the stale payload value.
+await (async () => {
+  const contentJson = JSON.stringify({
+    verseObjects: [
+      { type: "text", text: '"' },
+      { type: "word", tag: "w", text: "Thus", occurrence: "1", occurrences: "1" },
+      { type: "text", text: " says." },
+    ],
+  });
+  const stalePlainText = '"Thus says.'; // what the AI originally supplied — pre-curl
+
+  const dbState = { claimedAt: 6000 };
+  let insertedArgs = null;
+
+  function dispatch(sql, args) {
+    if (/UPDATE pipeline_jobs SET import_claimed_at = unixepoch\(\)/.test(sql) && /IS NULL OR/.test(sql)) {
+      return { changes: 1, rows: [{ import_claimed_at: dbState.claimedAt }], single: { import_claimed_at: dbState.claimedAt } };
+    }
+    if (/UPDATE pipeline_jobs SET import_claimed_at = unixepoch\(\)/.test(sql) && /import_claimed_at\s*=\s*\?2/.test(sql)) {
+      dbState.claimedAt += 1;
+      return { changes: 1, rows: [{ import_claimed_at: dbState.claimedAt }], single: { import_claimed_at: dbState.claimedAt } };
+    }
+    if (/SELECT staged_at FROM pipeline_jobs/.test(sql)) {
+      return { changes: 0, rows: [], single: { staged_at: 999999 } }; // already staged
+    }
+    if (/SELECT state, error_kind FROM pipeline_jobs/.test(sql)) {
+      return { changes: 0, rows: [], single: { state: "running", error_kind: null } };
+    }
+    if (/SELECT user_id FROM pipeline_jobs/.test(sql)) {
+      return { changes: 0, rows: [], single: { user_id: 1 } };
+    }
+    if (/ORDER BY kind, chapter, verse, id/.test(sql)) {
+      return {
+        changes: 0,
+        rows: [
+          {
+            id: 1,
+            kind: "verse",
+            book: "GEN",
+            chapter: 1,
+            verse: 1,
+            bible_version: "ULT",
+            payload_json: JSON.stringify({ content_json: contentJson, plain_text: stalePlainText }),
+          },
+        ],
+        single: null,
+      };
+    }
+    if (/SELECT chapter, verse, content_json FROM verses/.test(sql)) {
+      return { changes: 0, rows: [], single: null }; // no UHB/UGNT source rows loaded
+    }
+    if (/SELECT version, content_json, plain_text, updated_at FROM verses/.test(sql)) {
+      return { changes: 0, rows: [], single: null }; // no existing verse row — insert branch
+    }
+    if (/INSERT INTO verses/.test(sql)) {
+      insertedArgs = args;
+      return { changes: 1, rows: [], single: null };
+    }
+    if (/INSERT INTO edit_log/.test(sql)) {
+      return { changes: 1, rows: [], single: null };
+    }
+    if (/SET accepted_at = unixepoch\(\), accepted_by = \?2/.test(sql)) {
+      return { changes: 1, rows: [], single: null };
+    }
+    if (/MAX\(sort_order\)/.test(sql)) {
+      return { changes: 0, rows: [], single: null }; // maxSortOrderPerVerse runs unconditionally
+    }
+    if (/UPDATE pipeline_jobs SET import_claimed_at = NULL/.test(sql)) {
+      return { changes: 1, rows: [], single: null }; // error-path claim release, if ever reached
+    }
+    throw new Error(`fakePlainTextStalenessDb: unhandled SQL: ${sql}`);
+  }
+
+  const env = {
+    DB: {
+      prepare(sql) {
+        return {
+          bind(...args) {
+            return {
+              sql,
+              args,
+              async run() {
+                const res = dispatch(sql, args);
+                return { meta: { changes: res.changes }, results: res.rows };
+              },
+              async first() {
+                return dispatch(sql, args).single;
+              },
+              async all() {
+                return { results: dispatch(sql, args).rows };
+              },
+            };
+          },
+        };
+      },
+      async batch(stmts) {
+        const results = [];
+        for (const s of stmts) {
+          const res = dispatch(s.sql, s.args);
+          results.push({ meta: { changes: res.changes }, results: res.rows });
+        }
+        return results;
+      },
+    },
+  };
+
+  const result = await importJobOutput(
+    env,
+    { jobId: "job-plaintext-staleness", pipelineType: "generate", book: "GEN", startChapter: 1, endChapter: 1 },
+    [],
+  );
+
+  assert(insertedArgs !== null, "plain_text staleness: verse INSERT fired");
+  // INSERT INTO verses (book, chapter, verse, verse_end, bible_version, content_json, plain_text, updated_by)
+  const insertedContentJson = insertedArgs[5];
+  const insertedPlainText = insertedArgs[6];
+  assert(
+    insertedContentJson.includes("“"),
+    `plain_text staleness: content_json was curled (got ${insertedContentJson})`,
+  );
+  assert(
+    insertedPlainText === "“Thus says.",
+    `plain_text staleness: plain_text is RE-DERIVED from the curled tree, not the stale straight-quote payload value (got ${JSON.stringify(insertedPlainText)})`,
+  );
+  assert(result.applied?.verseUpdated === 1, "plain_text staleness: the job completes with 1 verse written");
+})();
+
 // ── TQ candidate-id chain: an 8-long DETERMINISTIC chain (seedId, then
 //    deriveAltRowId(seedId, 1..7)) walked per proposal. Live-in-same-chapter
 //    -> UPDATE; live-in-different-chapter -> step past it; no live row ->
@@ -2748,8 +2888,10 @@ await withMockedClock(async () => {
 // ─── tnPayload / tqPayload quote curling (AI-pipeline note/question/response) ──
 // JER 32/33 / NUM 26:53 prod forensics found straight quotes only in VERSE
 // content — this covers the sibling fix for note/question/response PROSE,
-// reusing tsvFormat.ts's educateQuotes (same rules the TSV export already
-// applies) so an AI-drafted note is never inconsistent with a human-typed one.
+// using the SAME shared curlifyText (importParsers.ts) that curls verse text,
+// not tsvFormat.ts's educateQuotes — the two note-vs-verse ingest paths must
+// agree on how a given straight quote curls (see the module comment above
+// curlifyVerseObjects in importParsers.ts).
 
 {
   const built = tnPayload("GEN", "1:1", {
@@ -2820,5 +2962,184 @@ await withMockedClock(async () => {
     "tnPayload: already-curly Note is a no-op",
   );
 }
+
+{
+  // '/' as opener context — unified with verse-text curling
+  // (curlifyVerseObjects / isOpeningQuoteContext both treat '/' as an
+  // opener), no longer diverging from tsvFormat.ts's educateQuotes (whose
+  // opener class omits '/'). Both ingest paths now go through curlifyText.
+  const built = tnPayload("GEN", "1:1", {
+    Reference: "1:1",
+    ID: "aaaa",
+    Tags: "",
+    SupportReference: "",
+    Quote: "",
+    Occurrence: "",
+    Note: 'word/"quoted" text',
+  });
+  assert(
+    built.payload.note === "word/“quoted” text",
+    `tnPayload treats '/' as opener context, matching verse-text curling (got ${JSON.stringify(built.payload.note)})`,
+  );
+}
+
+// ─── TN dedup key drift (independent review finding) ────────────────────────
+// claimedTnKeys is seeded from LIVE tn_rows.note (RAW, as stored) while an
+// incoming proposal's contentKey is built from payload.note, which is now
+// curlifyText'd at staging time (tnPayload). A pre-fix row written with
+// straight quotes — kept alive because deleteUnkeptTns deliberately skips
+// preserve=1/hint=1/human-edited rows — would key from its STALE straight
+// quotes while an identical-content re-run proposal keys from its NOW-curled
+// text: the two keys never match, content-dedup silently fails to recognize
+// the duplicate, and a second copy gets inserted. Fix: normalize the live
+// row's note with the same curlifyText before keying it (quote field left
+// alone, matching tnPayload). This drives the REAL importJobOutput ->
+// applyJobOutput path (not a hand-rolled call to the dedup helpers) so the
+// fix is proven in its actual call site, not just in isolation.
+await (async () => {
+  const dbState = { claimedAt: 5000 };
+  let tnInsertCount = 0;
+  let skippedDupAcceptCount = 0;
+
+  // The pending_imports row apply-phase would read back after staging — built
+  // with the REAL exported tnPayload so its payload_json is byte-identical to
+  // what production staging produces from this TSV row (curly Note).
+  const staged = tnPayload("GEN", "1:1", {
+    Reference: "1:1",
+    ID: "aaaa",
+    Tags: "",
+    SupportReference: "",
+    Quote: "",
+    Occurrence: "",
+    Note: 'The word "beginning" means the start.', // straight — curls at staging
+  });
+
+  function dispatch(sql, args) {
+    if (/UPDATE pipeline_jobs SET import_claimed_at = unixepoch\(\)/.test(sql) && /IS NULL OR/.test(sql)) {
+      return { changes: 1, rows: [{ import_claimed_at: dbState.claimedAt }], single: { import_claimed_at: dbState.claimedAt } };
+    }
+    if (/UPDATE pipeline_jobs SET import_claimed_at = unixepoch\(\)/.test(sql) && /import_claimed_at\s*=\s*\?2/.test(sql)) {
+      const expected = args[1];
+      if (dbState.claimedAt !== expected) return { changes: 0, rows: [], single: null };
+      dbState.claimedAt += 1;
+      return { changes: 1, rows: [{ import_claimed_at: dbState.claimedAt }], single: { import_claimed_at: dbState.claimedAt } };
+    }
+    if (/SELECT staged_at FROM pipeline_jobs/.test(sql)) {
+      return { changes: 0, rows: [], single: { staged_at: 999999 } }; // already staged
+    }
+    if (/SELECT state, error_kind FROM pipeline_jobs/.test(sql)) {
+      return { changes: 0, rows: [], single: { state: "running", error_kind: null } };
+    }
+    if (/SELECT user_id FROM pipeline_jobs/.test(sql)) {
+      return { changes: 0, rows: [], single: { user_id: 1 } };
+    }
+    if (/ORDER BY kind, chapter, verse, id/.test(sql)) {
+      return {
+        changes: 0,
+        rows: [
+          {
+            id: 1,
+            kind: "tn",
+            book: "GEN",
+            chapter: 1,
+            verse: 1,
+            bible_version: null,
+            payload_json: JSON.stringify(staged.payload),
+          },
+        ],
+        single: null,
+      };
+    }
+    if (/SELECT DISTINCT chapter, verse FROM pending_imports/.test(sql)) {
+      return { changes: 0, rows: [], single: null }; // no accepted TN proposals yet
+    }
+    if (/SELECT id, version FROM tn_rows t\b/.test(sql)) {
+      return { changes: 0, rows: [], single: null }; // nothing UNKEPT — the live row is preserved
+    }
+    if (/SELECT id, version FROM tn_rows\s+WHERE id = \?1/.test(sql)) {
+      return { changes: 0, rows: [], single: null }; // no hint stub matches
+    }
+    if (/SELECT chapter, verse, occurrence, support_reference, quote, note\s+FROM tn_rows/.test(sql)) {
+      // The LIVE, pre-fix row: same content, but STORED with straight quotes
+      // (as a pre-fix AI run, or a translator who typed straight quotes,
+      // would have left it) — preserved and un-swept, so it's still here.
+      return {
+        changes: 0,
+        rows: [
+          {
+            chapter: 1,
+            verse: 1,
+            occurrence: null,
+            support_reference: null,
+            quote: null,
+            note: 'The word "beginning" means the start.', // RAW straight quotes
+          },
+        ],
+        single: null,
+      };
+    }
+    if (/MAX\(sort_order\)/.test(sql)) {
+      return { changes: 0, rows: [], single: null };
+    }
+    if (/INSERT INTO tn_rows/.test(sql)) {
+      tnInsertCount += 1;
+      return { changes: 1, rows: [], single: null };
+    }
+    if (/INSERT INTO edit_log/.test(sql)) {
+      return { changes: 1, rows: [], single: null };
+    }
+    if (/SET accepted_at = unixepoch\(\), accepted_by = \?2/.test(sql)) {
+      skippedDupAcceptCount += 1;
+      return { changes: 1, rows: [], single: null };
+    }
+    throw new Error(`fakeTnDedupDriftDb: unhandled SQL: ${sql}`);
+  }
+
+  const env = {
+    DB: {
+      prepare(sql) {
+        return {
+          bind(...args) {
+            return {
+              sql,
+              args,
+              async run() {
+                const res = dispatch(sql, args);
+                return { meta: { changes: res.changes }, results: res.rows };
+              },
+              async first() {
+                return dispatch(sql, args).single;
+              },
+              async all() {
+                return { results: dispatch(sql, args).rows };
+              },
+            };
+          },
+        };
+      },
+      async batch(stmts) {
+        const results = [];
+        for (const s of stmts) {
+          const res = dispatch(s.sql, s.args);
+          results.push({ meta: { changes: res.changes }, results: res.rows });
+        }
+        return results;
+      },
+    },
+  };
+
+  const result = await importJobOutput(
+    env,
+    { jobId: "job-tn-dedup-drift", pipelineType: "notes", book: "GEN", startChapter: 1, endChapter: 1 },
+    [],
+  );
+
+  assert(tnInsertCount === 0, `TN dedup key drift: no duplicate INSERT fired (got ${tnInsertCount})`);
+  assert(
+    result.applied?.tnSkippedDup === 1,
+    `TN dedup key drift: the curled proposal is recognized as a duplicate of the (stale, straight-quote) live row (got tnSkippedDup=${result.applied?.tnSkippedDup})`,
+  );
+  assert(skippedDupAcceptCount === 1, "TN dedup key drift: the duplicate proposal is still marked accepted (not left unreviewed)");
+})();
 
 console.log("pipelineImport (claim guard): all assertions passed");

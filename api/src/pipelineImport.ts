@@ -9,7 +9,9 @@
 import type { Env } from "./index";
 import {
   collectSourceWords,
+  curlifyText,
   curlifyVerseObjects,
+  extractPlainText,
   extractVersesForRange,
   dropDuplicateSourceMilestones,
   healReplacementChars,
@@ -22,7 +24,6 @@ import {
   type VerseExtract,
 } from "./importParsers.ts";
 import { canonizeAlignmentSource } from "./canonizeHebrew.ts";
-import { educateQuotes } from "./tsvFormat.ts";
 import { NT_BOOKS } from "./dcsSources.ts";
 import { newRowId, isValidRowId, coerceRowId, deriveAltRowId } from "./rowId.ts";
 import { tnContentKey } from "./tnDedup.ts";
@@ -114,9 +115,9 @@ interface StagedRow {
 
 // tnPayload / tqPayload are exported for the direct regression tests in
 // pipelineImport.test.mjs, which assert on the quote-curling below (JER 32/33,
-// NUM 26:53 prod forensics — straight quotes in AI-generated note prose,
-// mirroring tsvFormat.ts's own export-side educateQuotes). Not intended as a
-// public API beyond that — same rationale as deleteUnkeptTns / maybeTouchClaim.
+// NUM 26:53 prod forensics — straight quotes in AI-generated note prose).
+// Not intended as a public API beyond that — same rationale as
+// deleteUnkeptTns / maybeTouchClaim.
 export function tnPayload(book: string, refRaw: string, row: Record<string, string>) {
   const [ch, v] = refParts(refRaw);
   const occRaw = row["Occurrence"];
@@ -147,10 +148,13 @@ export function tnPayload(book: string, refRaw: string, row: Record<string, stri
       // stored note matches DCS master's normalized form (see
       // normalizeNoteWhitespace) — both apply paths (applyTnInsert and the hint
       // expansion) and the edit_log audit read this same staged note. Curl
-      // straight quotes the same way the TSV export does (educateQuotes) so an
-      // AI-authored note never lands with straight ' / " (see the module
-      // comment above tnPayload).
-      note: row["Note"] ? educateQuotes(normalizeNoteWhitespace(row["Note"])) : null,
+      // straight quotes with the SAME contextual rule verse text ingest uses
+      // (curlifyText, not tsvFormat.ts's educateQuotes — see the module
+      // comment above curlifyVerseObjects in importParsers.ts for why the two
+      // ingest paths must share one rule) so an AI-authored note never lands
+      // with straight ' / " and never disagrees with an AI-authored verse
+      // curled in the same run.
+      note: row["Note"] ? curlifyText(normalizeNoteWhitespace(row["Note"])) : null,
     },
   };
 }
@@ -177,9 +181,9 @@ export function tqPayload(book: string, refRaw: string, row: Record<string, stri
       quote,
       occurrence,
       // Curl straight quotes in AI-generated question/response prose — same
-      // rationale as tnPayload's note above.
-      question: row["Question"] ? educateQuotes(row["Question"]) : null,
-      response: row["Response"] ? educateQuotes(row["Response"]) : null,
+      // rationale (and same shared function) as tnPayload's note above.
+      question: row["Question"] ? curlifyText(row["Question"]) : null,
+      response: row["Response"] ? curlifyText(row["Response"]) : null,
     },
   };
 }
@@ -865,7 +869,19 @@ async function applyJobOutput(
         quote: string | null;
         note: string | null;
       }>();
-    for (const r of live.results ?? []) claimedTnKeys.add(tnContentKey(r));
+    // Normalize the LIVE row's note the same way tnPayload normalizes an
+    // incoming proposal's note (curlifyText) before keying it. Without this,
+    // a pre-fix straight-quote note that deleteUnkeptTns deliberately skips
+    // (preserve=1 / hint=1) keeps a RAW key built from its stored straight
+    // quotes, while a re-run's identical-content proposal is keyed from its
+    // NOW-curled `payload.note` (see the contentKey build below) — the two
+    // keys never match, so content-dedup silently fails to recognize the
+    // duplicate and a second copy gets inserted. `quote` is deliberately left
+    // untouched here, matching tnPayload — it must stay byte-exact for
+    // occurrence matching.
+    for (const r of live.results ?? []) {
+      claimedTnKeys.add(tnContentKey({ ...r, note: r.note ? curlifyText(r.note) : r.note }));
+    }
   }
 
   // sort_order assignment. Proposals arrive ordered (chapter, verse, id) where
@@ -1718,7 +1734,10 @@ async function applyVerseUpdate(
   const uhbWords = sourceWordsForRange(uhbWordsByVerse, chapter, verse, verseEnd);
   const bibleVersion = String(payload.bible_version ?? p.bible_version ?? "");
   let contentJson = String(payload.content_json ?? "");
-  const plainText = (payload.plain_text as string | null) ?? null;
+  // Mutable: the AI-supplied value is the starting point, but every mutation
+  // pass below that can change `.text` or drop/rewrite a node makes it stale
+  // the moment it fires — see the re-derive after the ULT/UST self-heal block.
+  let plainText = (payload.plain_text as string | null) ?? null;
   const rowKey = `${book}/${chapter}/${verse}/${bibleVersion}`;
 
   // Self-heal target `\w` occurrence numbering before the AI-applied alignment
@@ -1759,9 +1778,22 @@ async function applyVerseUpdate(
         curlifyVerseObjects(parsed.verseObjects);
         recomputeTargetOccurrences(parsed.verseObjects);
         contentJson = JSON.stringify(parsed);
+        // Re-derive plain_text from the FINAL corrected tree. Every pass
+        // above can change what plain_text should read — curlifyVerseObjects
+        // rewrites `.text`, stripOrphanAlignmentMarkers strips junk text,
+        // dropDuplicateSourceMilestones can drop a duplicated wrapper — so
+        // trusting the AI-supplied payload.plain_text past this point would
+        // store it stale. A stale plain_text breaks FindReplaceOverlay /
+        // source search (both match against plain_text) and, worse, makes
+        // the next nightly bookReimport compare master's freshly-extracted
+        // text against THIS stale value, see a false diff, and spuriously
+        // re-seed the verse (resetting updated_by) every night. Cheap and
+        // always correct to recompute unconditionally here rather than
+        // tracking a changed-flag across five differently-shaped healers.
+        plainText = extractPlainText(parsed);
       }
     } catch {
-      /* leave contentJson as-is if it isn't parseable JSON */
+      /* leave contentJson/plainText as-is if it isn't parseable JSON */
     }
   }
 
@@ -1769,7 +1801,10 @@ async function applyVerseUpdate(
   // garbled multi-byte Hebrew, e.g. וּזְה❖❖בָם for "gold") before it lands in D1
   // — otherwise it shows as a broken aligner card and exports the garble to DCS.
   // Reconstruct from the parallel UHB/UGNT row; gated on the rare defect, and
-  // structure-preserving so no word unaligns. See healReplacementChars.
+  // structure-preserving so no word unaligns. See healReplacementChars. Does
+  // NOT re-derive plainText: it only ever reassigns a milestone's source
+  // attribute string (x-content/x-lemma/x-morph), never a node's `.text`, so
+  // plain_text (which concatenates `.text` only) cannot change here.
   if ((bibleVersion === "ULT" || bibleVersion === "UST") && contentJson.includes("�")) {
     try {
       const parsed = JSON.parse(contentJson) as { verseObjects?: unknown[] };

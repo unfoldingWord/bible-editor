@@ -27,6 +27,8 @@ import {
   sanitizeMarkerSpacing,
   dropDuplicateSourceMilestones,
   curlifyVerseObjects,
+  curlifyText,
+  extractPlainText,
 } from "./importParsers.ts";
 import usfm from "usfm-js";
 
@@ -1313,6 +1315,84 @@ function countNodes(nodes) {
     verseObjects[0].occurrences === "2" && verseObjects[2].occurrences === "2",
     `ordering regression: both words recognize there are 2 total occurrences (got ${verseObjects[0].occurrences}, ${verseObjects[2].occurrences})`,
   );
+}
+
+// ─── Adjacent same-type quote alternation (independent review finding) ──────
+// Two of the SAME straight quote character sitting directly back-to-back
+// (nothing between them) must alternate open/close rather than both resolving
+// to the same side via the plain context rule. Verified against curlifyText
+// (the standalone-string entry point note/question/response prose uses) since
+// it's simpler to assert on than a verseObjects tree, but the underlying rule
+// (curlifyChar) is shared with curlifyVerseObjects — see the module comment.
+{
+  assert(curlifyText('""') === "“”", `adjacent double quotes curl to an open+close pair, not two opens (got ${JSON.stringify(curlifyText('""'))})`);
+  assert(curlifyText("''") === "‘’", `adjacent single quotes curl to an open+close pair, not two opens (got ${JSON.stringify(curlifyText("''"))})`);
+  assert(
+    curlifyText('he said ""') === "he said “”",
+    `'he said ""' — an empty quoted phrase after a space still alternates (got ${JSON.stringify(curlifyText('he said ""'))})`,
+  );
+  assert(
+    curlifyText('"a""b"') === "“a”“b”",
+    `'"a""b"' — two back-to-back quoted words, not open+close+close+close (got ${JSON.stringify(curlifyText('"a""b"'))})`,
+  );
+  assert(
+    curlifyText('"""') === "“”“",
+    `three adjacent quotes alternate open/close/open (got ${JSON.stringify(curlifyText('"""'))})`,
+  );
+  // Apostrophe/open-single (no prev -> opens), then " with prev=‘ (opener-class char) -> opens too — the
+  // adjacency override is per-type and does not fire across DIFFERENT quote characters.
+  assert(
+    curlifyText(`'"`) === "‘“",
+    `adjacency override is per-type: a double quote right after a single quote is unaffected (got ${JSON.stringify(curlifyText(`'"`))})`,
+  );
+}
+
+// ─── curlifyText (standalone string entry point) ────────────────────────────
+{
+  assert(curlifyText("plain prose") === "plain prose", "curlifyText: no-op on text with no straight quotes");
+  assert(curlifyText("“already” curly") === "“already” curly", "curlifyText: no-op on already-curly text");
+  assert(curlifyText("") === "", "curlifyText: no-op on empty string");
+  assert(curlifyText('say "hi" now') === "say “hi” now", `curlifyText: curls a simple quoted phrase (got ${JSON.stringify(curlifyText('say "hi" now'))})`);
+  assert(curlifyText("LORD's house") === "LORD’s house", `curlifyText: curls a possessive apostrophe (got ${JSON.stringify(curlifyText("LORD's house"))})`);
+}
+
+// ─── extractPlainText (exported for pipelineImport.ts's plain_text re-derive) ─
+{
+  assert(
+    extractPlainText({
+      verseObjects: [
+        { type: "text", text: "In the beginning " },
+        { type: "word", tag: "w", text: "God", occurrence: "1", occurrences: "1" },
+        { type: "text", text: " created." },
+      ],
+    }) === "In the beginning God created.",
+    "extractPlainText: concatenates text/word nodes",
+  );
+  assert(
+    extractPlainText({
+      verseObjects: [
+        {
+          type: "milestone",
+          tag: "zaln",
+          content: "אָמַר",
+          children: [{ type: "word", tag: "w", text: "said", occurrence: "1", occurrences: "1" }],
+        },
+      ],
+    }) === "said",
+    "extractPlainText: descends into milestone children",
+  );
+}
+{
+  // Drives the plain_text re-derive fix directly: extractPlainText on the
+  // FINAL curled tree must reflect the curled character, not the original.
+  const verseObjects = [
+    { type: "text", text: '"' },
+    { type: "word", tag: "w", text: "Thus", occurrence: "1", occurrences: "1" },
+    { type: "text", text: " says." },
+  ];
+  curlifyVerseObjects(verseObjects);
+  const plain = extractPlainText({ verseObjects });
+  assert(plain === "“Thus says.", `extractPlainText reflects a curled tree (got ${JSON.stringify(plain)})`);
 }
 
 console.log("\nAll parser smoke checks passed.");
