@@ -4,8 +4,10 @@
 // CONFLICT DO UPDATE — deliberately NOT the replace-all-per-(book,resource)
 // pattern alignment_attention/export_reverts use, because a conflict must
 // survive until a human resolves it, not just until the next export runs.
-// Cleared by verses.ts's PATCH route when a human next saves the conflicting
-// verse.
+// Marked resolved (resolved_at/resolved_by, migration 0047) by verses.ts's
+// PATCH route when a human next saves the conflicting verse — the row itself
+// is kept for the audit trail; "active" readers filter WHERE resolved_at IS
+// NULL.
 //
 // Three action values land here (the migration's header comment,
 // 0044_verse_merge_conflicts.sql, already documents all three — only its
@@ -37,6 +39,11 @@
 import { Hono } from "hono";
 import type { Env } from "./index";
 import { requireAuth } from "./auth";
+import {
+  editLogKey,
+  groupOverwrittenVersesByEditor,
+  type OverwrittenVerseRef,
+} from "./verseMergeEditorAlerts.ts";
 
 // Same maintainer the export alerts target (exportWorkflow.ts's
 // EXPORT_ALERT_USERNAME) — that file is owned by a concurrent change, so this
@@ -214,6 +221,54 @@ interface StoredConflictRow {
   alignment: string | null;
 }
 
+// ---------------------------------------------------------------------------
+// Editor fan-out (2026-08-14 prod audit fix). Until now the banner alert only
+// ever reached ALERT_USERNAME (the admin) — all 19 live conflict alerts
+// landed there and none reached the editors whose work was actually
+// overwritten (bethoakes, pjoakes, Carolyn1970, Grant_Ailie…). An
+// 'adopt_conflict' row means Door43's version replaced a human edit; this
+// attributes the overwrite to the human who made that edit — the edit_log
+// row that produced `overwritten_version` — and gives them their own alert,
+// in addition to (not instead of) the admin's. The pure grouping logic lives
+// in verseMergeEditorAlerts.ts (unit-tested there without D1); this is just
+// the D1 orchestration around it.
+// ---------------------------------------------------------------------------
+
+// D1 orchestration: ONE JOIN query for the whole run's overwrites (never
+// N+1, regardless of how many verses or editors are involved), returning a
+// (key -> username) map for the pure grouping above. Best-effort: a failure
+// here must not affect the admin alert or the caller's control flow (mirrors
+// every other read in this file).
+async function lookupEditorUsernames(
+  env: Env,
+  book: string,
+  resource: string,
+  overwritten: OverwrittenVerseRef[],
+): Promise<Map<string, string>> {
+  const usernameByKey = new Map<string, string>();
+  if (overwritten.length === 0) return usernameByKey;
+  const keys = overwritten.map((r) => editLogKey(book, resource, r));
+  try {
+    const rs = await env.DB.prepare(
+      `SELECT (el.row_key || ':' || el.new_version) AS key, u.dcs_username AS username
+         FROM edit_log el
+         JOIN users u ON u.id = el.user_id
+        WHERE el.kind = 'verse' AND el.book = ?1
+          AND (el.row_key || ':' || el.new_version) IN (${keys.map((_, i) => `?${i + 2}`).join(",")})`,
+    )
+      .bind(book, ...keys)
+      .all<{ key: string; username: string }>();
+    for (const r of rs.results ?? []) usernameByKey.set(r.key, r.username);
+  } catch (e) {
+    console.error("verseMergeConflicts: editor lookup failed", {
+      book,
+      resource,
+      error: e instanceof Error ? e.message : String(e),
+    });
+  }
+  return usernameByKey;
+}
+
 // Banner alert (system_alerts) naming the count, the reason breakdown, and
 // the first 10 refs, plus the plain-English recovery hint. Same shape as
 // ExportWorkflow.writeAlert (delete-undismissed-then-insert), best-effort.
@@ -251,6 +306,7 @@ export async function raiseVerseMergeConflictAlert(
       `SELECT chapter, verse, action, reason, overwritten_version, alignment
          FROM verse_merge_conflicts
         WHERE book = ?1 AND resource = ?2 AND action IN ('adopt_conflict', 'keep_alignment_refused')
+          AND resolved_at IS NULL
         ORDER BY chapter ASC, verse ASC`,
     )
       .bind(book, resource)
@@ -294,8 +350,12 @@ export async function raiseVerseMergeConflictAlert(
   // could learn that tonight's export will still overwrite those verses.
   if (rows.length === 0 && !opts.recordingFailed && !opts.noBaseCount) {
     try {
-      await env.DB.prepare(`DELETE FROM system_alerts WHERE username = ?1 AND source = ?2 AND dismissed_at IS NULL`)
-        .bind(ALERT_USERNAME, source)
+      // Clear by SOURCE, not just the admin's username: a still-undismissed
+      // editor alert from an earlier run (see raiseEditorAlerts below) named
+      // by this same source must also disappear once this book+resource has
+      // nothing left to report, or it would sit stale forever.
+      await env.DB.prepare(`DELETE FROM system_alerts WHERE source = ?1 AND dismissed_at IS NULL`)
+        .bind(source)
         .run();
     } catch (e) {
       console.error("verseMergeConflicts: alert clear failed", {
@@ -379,16 +439,45 @@ export async function raiseVerseMergeConflictAlert(
       ? `Sync flagged 0 verse(s) in ${book} ${resource.toUpperCase()} for adjudicated review.${guidance ? ` ${guidance}` : ""}`
       : `Sync flagged ${rows.length} verse(s) in ${book} ${resource.toUpperCase()} for review ` +
         `(${reasonBreakdown}).${refsClause} ${guidance}`;
-  try {
-    await env.DB.prepare(`DELETE FROM system_alerts WHERE username = ?1 AND source = ?2 AND dismissed_at IS NULL`)
-      .bind(ALERT_USERNAME, source)
-      .run();
-    await env.DB.prepare(
-      `INSERT INTO system_alerts (username, severity, source, message, link_url)
-       VALUES (?1, ?2, ?3, ?4, ?5)`,
+
+  // Editor fan-out: attribute each 'adopt_conflict' overwrite to the human
+  // whose edit it replaced (see this file's header block above) and give
+  // them their own alert. `keep_alignment_refused` is excluded — a refusal
+  // overwrote nothing, so there is no editor to notify.
+  const overwrittenRefs: OverwrittenVerseRef[] = rows
+    .filter(
+      (r): r is VerseMergeConflictRow & { overwrittenVersion: number } =>
+        r.action === "adopt_conflict" && r.overwrittenVersion != null,
     )
-      .bind(ALERT_USERNAME, "warning", source, message, null)
+    .map((r) => ({ chapter: r.chapter, verse: r.verse, overwrittenVersion: r.overwrittenVersion }));
+  const usernameByKey = await lookupEditorUsernames(env, book, resource, overwrittenRefs);
+  const perEditor = groupOverwrittenVersesByEditor(book, resource, overwrittenRefs, usernameByKey);
+
+  try {
+    // Delete by SOURCE (not just the admin's username), so a previously
+    // alerted editor who no longer has an overwritten verse this run (e.g.
+    // it converged, or a human already re-saved it) has their stale alert
+    // cleared here rather than left to rot.
+    await env.DB.prepare(`DELETE FROM system_alerts WHERE source = ?1 AND dismissed_at IS NULL`)
+      .bind(source)
       .run();
+    const inserts = [
+      env.DB
+        .prepare(
+          `INSERT INTO system_alerts (username, severity, source, message, link_url)
+           VALUES (?1, ?2, ?3, ?4, ?5)`,
+        )
+        .bind(ALERT_USERNAME, "warning", source, message, null),
+      ...[...perEditor.entries()].map(([username, editor]) =>
+        env.DB
+          .prepare(
+            `INSERT INTO system_alerts (username, severity, source, message, link_url)
+             VALUES (?1, ?2, ?3, ?4, ?5)`,
+          )
+          .bind(username, "warning", source, editor.message, null),
+      ),
+    ];
+    await env.DB.batch(inserts);
   } catch (e) {
     console.error("verseMergeConflicts: alert write failed", {
       book,
@@ -421,10 +510,14 @@ verseMergeConflicts.get("/:book", async (c) => {
   const book = c.req.param("book");
   // resource is part of the key — a book carries independent ULT and UST
   // conflicts, and omitting it would make the two indistinguishable.
+  // resolved_at IS NULL: a verse a human has already re-saved (see verses.ts's
+  // PATCH route) is no longer an ACTIVE conflict needing review — it stays in
+  // the table for the audit trail (see the resolved_at column comment in
+  // migration 0047) but must not keep showing up here as outstanding.
   const rs = await c.env.DB.prepare(
     `SELECT resource, chapter, verse, action, reason, overwritten_version, alignment
        FROM verse_merge_conflicts
-      WHERE book = ?1
+      WHERE book = ?1 AND resolved_at IS NULL
       ORDER BY chapter ASC, verse ASC, resource ASC`,
   )
     .bind(book)
