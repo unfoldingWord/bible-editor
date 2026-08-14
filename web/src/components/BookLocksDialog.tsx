@@ -79,10 +79,16 @@ export function BookLocksDialog({ open, onClose, onChanged, books, canManageLock
         await api.lockBook(code);
         // Just locked it (was unlocked a moment ago) — offer to push now
         // rather than leaving the fix stranded until the nightly export.
-        setPushPrompt(code);
-        setPushState("idle");
-        setPushResult(null);
-        setPushError(null);
+        // Only takes the slot if no prompt is already showing (or pushing)
+        // for a DIFFERENT book — e.g. lock A, then lock B before A's request
+        // resolves; A's completion must not yank away B's still-open prompt.
+        // The functional form reads live state, not this closure's possibly
+        // stale `pushPrompt`. pushState/pushResult/pushError need no reset
+        // here: they only move off idle/null while pushPrompt is non-null
+        // (see doPushNow), and closePushPrompt always resets all four
+        // together — so whenever pushPrompt is null, the other three
+        // already are too.
+        setPushPrompt((prev) => prev ?? code);
       }
       refresh();
       onChanged?.();
@@ -115,7 +121,23 @@ export function BookLocksDialog({ open, onClose, onChanged, books, canManageLock
       setPushResult(res);
       setPushState("done");
     } catch (e) {
-      setPushError(e instanceof Error ? e.message : String(e));
+      // Mirror toggle()'s pattern: surface the server's specific reason
+      // (e.g. someone else unlocked the book in the meantime) instead of a
+      // bare "HTTP 400".
+      if (e instanceof ApiError) {
+        const body = e.body as { error?: string; reason?: string } | undefined;
+        const msg =
+          body?.reason === "not_a_lock_admin"
+            ? NOT_ADMIN_MESSAGE
+            : body?.error === "book_not_locked"
+              ? "This book isn't locked anymore — someone may have unlocked it."
+              : body?.error === "book_not_imported"
+                ? "This book has never been imported, so there's nothing to push."
+                : e.message;
+        setPushError(msg);
+      } else {
+        setPushError(e instanceof Error ? e.message : String(e));
+      }
       setPushState("error");
     }
   };

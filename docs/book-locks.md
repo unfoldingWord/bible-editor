@@ -221,6 +221,16 @@ isLocked(book) = row exists ? row.locked === 1 : PUBLISHED_BOOKS.has(book)
   same way a nightly export can. The dialog shows "queued" per resource, not
   a final outcome; check the admin panel's sync-status / recent-runs view for
   the real result.
+- Neither the "Push to Door43 now?" prompt nor the pre-existing admin-panel
+  manual push (`POST /api/exports/run`) has any mutual-exclusion against a
+  second concurrent trigger for the same (book, resource) — including the
+  05:30 UTC nightly cron itself. Two `ExportWorkflow` instances racing the
+  same DCS branch is a narrow, low-probability window (the cron fires once a
+  day at a fixed time), and this is not a new risk the lock-push route
+  introduces — the underlying `EXPORT_WORKFLOW.create()` mechanism has never
+  had cross-run locking. Noted here rather than fixed because building real
+  mutual exclusion (a KV/D1 lock keyed on book+resource) is a bigger change
+  than this narrow window justifies on its own.
 - `postExport.runPostExport` (dormant, `VALIDATORS = []`) has no per-book gate.
   Do not re-enable it without adding one.
 - The published-release drift detector (`published-drift-check`) rejects any

@@ -214,21 +214,23 @@ books.post("/:book/lock/push", requireEditor, async (c) => {
     .first();
   if (!imported) return c.json({ error: "book_not_imported", book }, 400);
 
+  // Each resource lives in its own DCS repo (RESOURCE_TARGETS in export.ts —
+  // en_tn/en_tq/en_twl/en_ult/en_ust), so the 5 creates below share no
+  // mutable state and can safely run concurrently rather than one at a time.
   const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-  const pushed: Array<
-    { resource: Resource; instanceId: string } | { resource: Resource; error: string }
-  > = [];
-  for (const resource of ALL_RESOURCES) {
-    try {
-      const instance = await c.env.EXPORT_WORKFLOW.create({
-        id: `lock-push-${book}-${resource}-${stamp}`,
-        params: { book, resource, allowLocked: true, validateAndMerge: true },
-      });
-      pushed.push({ resource, instanceId: instance.id });
-    } catch (e) {
-      pushed.push({ resource, error: e instanceof Error ? e.message : String(e) });
-    }
-  }
+  const pushed = await Promise.all(
+    ALL_RESOURCES.map(async (resource) => {
+      try {
+        const instance = await c.env.EXPORT_WORKFLOW.create({
+          id: `lock-push-${book}-${resource}-${stamp}`,
+          params: { book, resource, allowLocked: true, validateAndMerge: true },
+        });
+        return { resource, instanceId: instance.id };
+      } catch (e) {
+        return { resource, error: e instanceof Error ? e.message : String(e) };
+      }
+    }),
+  );
 
   return c.json({ book, pushed });
 });
