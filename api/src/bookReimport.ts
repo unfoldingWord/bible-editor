@@ -742,7 +742,7 @@ async function applyTsvRows(
     // can tell an AI-only row (updated_by set, latest source = ai_pipeline) apart
     // from a human edit. Mirrors the deleteUnkeptTns correlated subquery.
     const rs = await env.DB.prepare(
-      `SELECT id, ${TSV_STORED_COLS[kind]}, sort_order, ${pristineCols},
+      `SELECT id, ${TSV_STORED_COLS[kind]}, sort_order, ${pristineCols}, review_kind,
               (SELECT source FROM edit_log
                  WHERE kind = ?2 AND row_key = ${kind}_rows.id
                    AND (book = ?1 OR book IS NULL)
@@ -999,6 +999,32 @@ async function applyTsvRows(
       // wins (it is the stronger signal), so only add heuristic keys not present.
       let heuristic = false;
       if (heur) for (const [k, v] of Object.entries(heur)) if (!(k in fields)) { fields[k] = v; heuristic = true; }
+
+      // A Door43 maintainer re-anchored this row to a different Reference on
+      // master (same id, different chapter/verse/ref_raw). The field merge can't
+      // safely MOVE a row — a chapter change relocates it out of the chapter this
+      // reimport is processing and needs the quote re-anchored to the new verse's
+      // source (a validated move, tracked as a follow-up) — so it is NOT
+      // auto-adopted. But it must NOT be silently reverted either (the old, and
+      // still-open, revert path this PR exists to close): WITHHOLD the resource
+      // watermark (apply_incomplete) so the export holds instead of writing D1's
+      // old location back over master, and flag the row ONCE (guarded on the
+      // existing review_kind to avoid nightly version churn) so a human can move
+      // it in-app to match — which clears the flag and releases the hold.
+      const refMoved =
+        !protectedRow &&
+        (Number(cur.chapter) !== row.chapter ||
+          Number(cur.verse) !== row.verse ||
+          (((cur.ref_raw as string | null) ?? "") !== (row.refRaw ?? "")));
+      if (refMoved) {
+        counts.apply_incomplete = true;
+        if (cur.review_kind !== "ref_moved") {
+          fields.review_kind = "ref_moved";
+          fields.review_reason =
+            "A Door43 editor moved this row to a different verse/reference. " +
+            "Move it here in the app to match, then it will sync.";
+        }
+      }
 
       if (Object.keys(fields).length === 0) {
         counts.skipped_edited++;

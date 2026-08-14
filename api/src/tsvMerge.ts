@@ -86,16 +86,15 @@ export type TsvMergeField = keyof TsvMergeSide;
 //     this field-level merge, so it is left to D1 exactly as today. A genuine
 //     occurrence-only master edit on an English quote is therefore not
 //     auto-adopted (unchanged from pre-fix behavior) — a documented limitation.
-//   - identity (id, ref/chapter/verse): never merged. KNOWN LIMITATION (Codex
-//     P1.4), PRE-EXISTING (the old computeEditedFieldMerge path never merged
-//     these either, so this is not a regression): a maintainer RE-ANCHORING a
-//     row to a different Reference on master (same id, new ref/chapter/verse) is
-//     not adopted, so the export re-writes D1's old location and the move is
-//     reverted. Auto-merging a location move is genuinely risky (a chapter change
-//     moves the row out of the chapter this reimport is processing, and touches
-//     sort_order/ordering), so it is deferred to a dedicated follow-up rather
-//     than handled here — where the safe options are an explicit conflict flag or
-//     a validated move, neither of which is a field-content merge.
+//   - identity (id, ref/chapter/verse): never merged. A maintainer RE-ANCHORING
+//     a row to a different Reference on master (same id, new ref/chapter/verse)
+//     is NOT auto-adopted here — a validated move (re-anchoring the quote to the
+//     new verse's source, handling the cross-chapter relocation) is a dedicated
+//     follow-up. But it is NO LONGER silently reverted: the caller
+//     (bookReimport.ts's edited-candidate resolution) detects the ref difference,
+//     WITHHOLDS the resource watermark (apply_incomplete) so the export holds
+//     instead of writing D1's old location over master, and flags the row for a
+//     human to move it in-app. See the refMoved handling there.
 const FIELDS_BY_KIND: Record<TsvMergeKind, TsvMergeField[]> = {
   tn: ["quote", "note", "support_reference"],
   tq: ["quote", "question", "response"],
