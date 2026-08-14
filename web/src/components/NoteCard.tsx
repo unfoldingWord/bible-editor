@@ -1058,13 +1058,12 @@ function NoteCardInner({
           verse: row.verse,
         },
       );
-    } else if (hydrated && Object.keys(pendingRef.current).length === 0) {
-      // Only clear after the on-mount draft lookup has run — before that,
-      // hasRowDiff is measured against an unhydrated baseline and would
-      // spuriously wipe a draft we haven't had the chance to restore.
-      // Also gate on pendingRef being empty: if the user has un-flushed
-      // edits, a transient hasRowDiff=false (e.g. from a re-sync revert
-      // that slipped past the guard) must not destroy the IndexedDB draft.
+    } else if (hydrated) {
+      // hasRowDiff false ⇒ local state matches the saved baseline.
+      // Prune any stale pendingRef keys left by typing that was undone
+      // (Ctrl+Z / manual re-entry) so the re-sync guard doesn't block
+      // future server updates needlessly.
+      pendingRef.current = {};
       void drafts.clear(draftKey);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
