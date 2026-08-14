@@ -1031,6 +1031,7 @@ function NoteCardInner({
   if (supportRef !== savedRef.current.support_reference) rowDiff.support_reference = supportRef;
   const hasRowDiff = Object.keys(rowDiff).length > 0;
   const draftKey = rowKey("tn", row.book, row.id);
+  const pendingAtRender = pendingRef.current;
   useEffect(() => {
     if (readOnly) return;
     if (hasRowDiff) {
@@ -1058,11 +1059,13 @@ function NoteCardInner({
           verse: row.verse,
         },
       );
-    } else if (hydrated) {
+    } else if (hydrated && pendingRef.current === pendingAtRender) {
       // hasRowDiff false ⇒ local state matches the saved baseline.
       // Prune any stale pendingRef keys left by typing that was undone
       // (Ctrl+Z / manual re-entry) so the re-sync guard doesn't block
-      // future server updates needlessly.
+      // future server updates needlessly. The identity check prevents a
+      // stale effect from clearing a newer pendingRef that an onChange
+      // handler replaced between the render and this effect firing.
       pendingRef.current = {};
       void drafts.clear(draftKey);
     }
