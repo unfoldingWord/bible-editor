@@ -417,6 +417,111 @@ export function healReplacementChars(
   return report;
 }
 
+// ─── Curl straight quotes in AI-generated verse text (AI-pipeline ingest only) ──
+//
+// bp-assistant's ULT/UST verse drafts have written STRAIGHT ' and " into
+// content_json (JER 32/33, NUM 26:53, en_ult + en_ust, 2026 June–July prod
+// forensics) — DCS master's USFM ends up with straight quotes, and the export
+// path never fixes them because tsvFormat.ts's educateQuotes only runs over
+// tn/tq TSV cells, not verse USFM. Every other entry point curls at ingest —
+// client-side keystroke/paste interception (web/src/lib/curlyQuotes.ts) and the
+// tn/tq TSV export (tsvFormat.ts educateQuotes) — this is the third and closes
+// the gap. Deliberately called from pipelineImport.ts's applyVerseUpdate, NOT
+// wired into extractVersesForRange above: that function also serves the
+// nightly DCS reimport (bookReimport.ts) and the bootstrap import
+// (bookImport.ts), and this fix must stay scoped to the AI-pipeline write path
+// only — existing D1 data and the master reimport are out of scope here.
+//
+// Mirrors curlyFor/isOpeningContext in web/src/lib/curlyQuotes.ts (duplicated
+// for the same cross-bundle reason as extractPlainText above — keep in sync): a
+// quote is "opening" when the preceding character is missing, whitespace, or
+// another opener-ish punctuation mark; otherwise it's closing, which is also
+// how ' doubles as a contextual apostrophe (don't → don't).
+//
+// Touches ONLY a node's own `.text` string, walked in document order across
+// the whole tree (target `\w` words, plain text, and a marker's own parked
+// leading text — see "usfm-js parks leading punctuation on the marker's
+// `text`" in STATE.md) — EXCEPT `\zaln-s` milestone nodes, whose own
+// attributes (content/lemma/morph/strong — the Hebrew/Greek surface form) are
+// source-owned and never touched, even defensively if one ever carried a
+// `.text` key. Milestone CHILDREN (the aligned target words) are walked
+// normally. No node is added, removed, reordered, or re-nested, no `\w`
+// occurrence changes, and no attribute is ever assigned — so this can never
+// unalign a word, alter a word count, or touch Hebrew/Greek. No-op (identity)
+// on a verse with no straight quotes, the common case.
+const CURLY_LDQUO = "“"; // “
+const CURLY_RDQUO = "”"; // ”
+const CURLY_LSQUO = "‘"; // ‘
+const CURLY_RSQUO = "’"; // ’
+
+function isOpeningQuoteContext(prev: string | undefined): boolean {
+  if (!prev) return true;
+  if (/\s/.test(prev)) return true;
+  return /[(\[{<\-–—/“‘]/.test(prev);
+}
+
+function curlyQuoteFor(ch: '"' | "'", prev: string | undefined): string {
+  if (ch === '"') return isOpeningQuoteContext(prev) ? CURLY_LDQUO : CURLY_RDQUO;
+  return isOpeningQuoteContext(prev) ? CURLY_LSQUO : CURLY_RSQUO;
+}
+
+// Curl straight quotes in one text string, threading in the last character
+// emitted before it (from a preceding sibling/ancestor node) so a quote right
+// after a milestone boundary still sees real context. Returns the (possibly
+// unchanged) text plus whether anything changed, so the caller can skip a
+// write on a clean string.
+function curlifyTextWithContext(
+  text: string,
+  prevChar: string | undefined,
+): { text: string; changed: boolean } {
+  let out = "";
+  let changed = false;
+  let prev = prevChar;
+  for (const ch of text) {
+    if (ch === '"' || ch === "'") {
+      const curly = curlyQuoteFor(ch, prev);
+      out += curly;
+      if (curly !== ch) changed = true;
+      prev = curly;
+    } else {
+      out += ch;
+      prev = ch;
+    }
+  }
+  return { text: out, changed };
+}
+
+// Mutates `verseObjects` in place (like healReplacementChars /
+// canonizeAlignmentSource); returns whether anything changed.
+export function curlifyVerseObjects(verseObjects: unknown[]): boolean {
+  if (!Array.isArray(verseObjects)) return false;
+  let changed = false;
+  let prevChar: string | undefined;
+  const walk = (nodes: unknown[]): void => {
+    for (const node of nodes) {
+      if (!node || typeof node !== "object") continue;
+      const o = node as Record<string, unknown>;
+      const isMilestone = o["type"] === "milestone";
+      const text = o["text"];
+      if (!isMilestone && typeof text === "string" && text.length > 0) {
+        if (/['"]/.test(text)) {
+          const result = curlifyTextWithContext(text, prevChar);
+          if (result.changed) {
+            o["text"] = result.text;
+            changed = true;
+          }
+          prevChar = result.text[result.text.length - 1];
+        } else {
+          prevChar = text[text.length - 1];
+        }
+      }
+      if (Array.isArray(o["children"])) walk(o["children"] as unknown[]);
+    }
+  };
+  walk(verseObjects);
+  return changed;
+}
+
 // ─── Reconcile source-owned `\zaln-s` attributes from master ─────────────────
 //
 // The `\zaln-s` milestone carries original-language (UHB/UGNT) attributes —

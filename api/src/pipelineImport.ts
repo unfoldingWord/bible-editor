@@ -9,6 +9,7 @@
 import type { Env } from "./index";
 import {
   collectSourceWords,
+  curlifyVerseObjects,
   extractVersesForRange,
   dropDuplicateSourceMilestones,
   healReplacementChars,
@@ -21,6 +22,7 @@ import {
   type VerseExtract,
 } from "./importParsers.ts";
 import { canonizeAlignmentSource } from "./canonizeHebrew.ts";
+import { educateQuotes } from "./tsvFormat.ts";
 import { NT_BOOKS } from "./dcsSources.ts";
 import { newRowId, isValidRowId, coerceRowId, deriveAltRowId } from "./rowId.ts";
 import { tnContentKey } from "./tnDedup.ts";
@@ -110,7 +112,12 @@ interface StagedRow {
   payload: Record<string, unknown>;
 }
 
-function tnPayload(book: string, refRaw: string, row: Record<string, string>) {
+// tnPayload / tqPayload are exported for the direct regression tests in
+// pipelineImport.test.mjs, which assert on the quote-curling below (JER 32/33,
+// NUM 26:53 prod forensics — straight quotes in AI-generated note prose,
+// mirroring tsvFormat.ts's own export-side educateQuotes). Not intended as a
+// public API beyond that — same rationale as deleteUnkeptTns / maybeTouchClaim.
+export function tnPayload(book: string, refRaw: string, row: Record<string, string>) {
   const [ch, v] = refParts(refRaw);
   const occRaw = row["Occurrence"];
   const parsedOcc = occRaw === "" || occRaw == null ? null : parseInt(occRaw, 10) || 0;
@@ -139,13 +146,16 @@ function tnPayload(book: string, refRaw: string, row: Record<string, string>) {
       // Collapse bp-assistant's double-space-after-punctuation artifact so the
       // stored note matches DCS master's normalized form (see
       // normalizeNoteWhitespace) — both apply paths (applyTnInsert and the hint
-      // expansion) and the edit_log audit read this same staged note.
-      note: row["Note"] ? normalizeNoteWhitespace(row["Note"]) : null,
+      // expansion) and the edit_log audit read this same staged note. Curl
+      // straight quotes the same way the TSV export does (educateQuotes) so an
+      // AI-authored note never lands with straight ' / " (see the module
+      // comment above tnPayload).
+      note: row["Note"] ? educateQuotes(normalizeNoteWhitespace(row["Note"])) : null,
     },
   };
 }
 
-function tqPayload(book: string, refRaw: string, row: Record<string, string>) {
+export function tqPayload(book: string, refRaw: string, row: Record<string, string>) {
   const [ch, v] = refParts(refRaw);
   const occRaw = row["Occurrence"];
   const parsedOcc = occRaw === "" || occRaw == null ? null : parseInt(occRaw, 10) || 0;
@@ -166,8 +176,10 @@ function tqPayload(book: string, refRaw: string, row: Record<string, string>) {
       tags: row["Tags"] || null,
       quote,
       occurrence,
-      question: row["Question"] || null,
-      response: row["Response"] || null,
+      // Curl straight quotes in AI-generated question/response prose — same
+      // rationale as tnPayload's note above.
+      question: row["Question"] ? educateQuotes(row["Question"]) : null,
+      response: row["Response"] ? educateQuotes(row["Response"]) : null,
     },
   };
 }
@@ -1732,6 +1744,13 @@ async function applyVerseUpdate(
         // matches or the source verse wasn't loaded. See canonizeHebrew.ts.
         canonizeAlignmentSource(parsed.verseObjects, uhbWords);
         recomputeTargetOccurrences(parsed.verseObjects);
+        // Curl straight quotes bp-assistant wrote into verse text (JER 32/33,
+        // NUM 26:53 prod forensics) before it lands in D1 / exports to master.
+        // Structure-preserving — see curlifyVerseObjects: it only ever
+        // reassigns a `.text` string, never a `\zaln-s` source attribute, so
+        // this can't unalign a word or touch Hebrew/Greek. No-op on clean
+        // output.
+        curlifyVerseObjects(parsed.verseObjects);
         contentJson = JSON.stringify(parsed);
       }
     } catch {

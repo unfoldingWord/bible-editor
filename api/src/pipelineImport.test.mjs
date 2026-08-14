@@ -25,6 +25,8 @@ import {
   importJobOutput,
   maybeTouchClaim,
   maybeCheckCancelled,
+  tnPayload,
+  tqPayload,
 } from "./pipelineImport.ts";
 import { ROW_ID_RE, coerceRowId, deriveAltRowId } from "./rowId.ts";
 
@@ -2742,5 +2744,81 @@ await withMockedClock(async () => {
     `TQ same-verse claim guard: both questions survive as separate created rows (got tqCreated=${result.applied?.tqCreated})`,
   );
 });
+
+// ─── tnPayload / tqPayload quote curling (AI-pipeline note/question/response) ──
+// JER 32/33 / NUM 26:53 prod forensics found straight quotes only in VERSE
+// content — this covers the sibling fix for note/question/response PROSE,
+// reusing tsvFormat.ts's educateQuotes (same rules the TSV export already
+// applies) so an AI-drafted note is never inconsistent with a human-typed one.
+
+{
+  const built = tnPayload("GEN", "1:1", {
+    Reference: "1:1",
+    ID: "aaaa",
+    Tags: "",
+    SupportReference: "",
+    Quote: "",
+    Occurrence: "",
+    Note: 'The word "beginning" means the start.',
+  });
+  assert(
+    built.payload.note === "The word “beginning” means the start.",
+    `tnPayload curls straight quotes in Note prose (got ${JSON.stringify(built.payload.note)})`,
+  );
+}
+
+{
+  // Quote field is deliberately left untouched — it must match the exact
+  // target-language surface text for occurrence resolution (occurrenceRule.ts),
+  // and can carry Hebrew/Greek (origLangOccurrence). Scope is note/question/
+  // response prose only.
+  const built = tnPayload("GEN", "1:1", {
+    Reference: "1:1",
+    ID: "aaaa",
+    Tags: "",
+    SupportReference: "",
+    Quote: 'the "beginning"',
+    Occurrence: "1",
+    Note: "no straight quotes here",
+  });
+  assert(built.payload.quote === 'the "beginning"', "tnPayload leaves the Quote field untouched");
+}
+
+{
+  const built = tqPayload("GEN", "1:1", {
+    Reference: "1:1",
+    ID: "aaaa",
+    Tags: "",
+    Quote: "",
+    Occurrence: "",
+    Question: 'What does "beginning" mean?',
+    Response: "It's the start of everything.",
+  });
+  assert(
+    built.payload.question === "What does “beginning” mean?",
+    `tqPayload curls straight quotes in Question prose (got ${JSON.stringify(built.payload.question)})`,
+  );
+  assert(
+    built.payload.response === "It’s the start of everything.",
+    `tqPayload curls a straight apostrophe in Response prose (got ${JSON.stringify(built.payload.response)})`,
+  );
+}
+
+{
+  // No-op on prose that already carries no straight quotes.
+  const built = tnPayload("GEN", "1:1", {
+    Reference: "1:1",
+    ID: "aaaa",
+    Tags: "",
+    SupportReference: "",
+    Quote: "",
+    Occurrence: "",
+    Note: "already curly — “beginning” means the start.",
+  });
+  assert(
+    built.payload.note === "already curly — “beginning” means the start.",
+    "tnPayload: already-curly Note is a no-op",
+  );
+}
 
 console.log("pipelineImport (claim guard): all assertions passed");

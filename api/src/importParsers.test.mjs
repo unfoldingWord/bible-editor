@@ -26,6 +26,7 @@ import {
   findSuspiciousDoubleSpaces,
   sanitizeMarkerSpacing,
   dropDuplicateSourceMilestones,
+  curlifyVerseObjects,
 } from "./importParsers.ts";
 import usfm from "usfm-js";
 
@@ -1151,6 +1152,135 @@ const zalnMs = (attrs, targetText) => ({
     0,
   );
   assert(totalTs === 2, `\\ts\\* around real verses are both preserved (got ${totalTs})`);
+}
+
+// ─── curlifyVerseObjects (AI-pipeline verse-ingest quote curling) ───────────
+// Regression coverage for the JER 32/33 / NUM 26:53 prod incident: bp-assistant
+// wrote straight ' / " into ULT/UST verse content_json. See the module comment
+// above curlifyVerseObjects in importParsers.ts.
+
+function countNodes(nodes) {
+  let n = 0;
+  for (const node of nodes ?? []) {
+    if (!node || typeof node !== "object") continue;
+    n += 1;
+    if (Array.isArray(node.children)) n += countNodes(node.children);
+  }
+  return n;
+}
+
+// A JER 33:20-shaped verse: a straight opening quote before a `\zaln-s`-wrapped
+// "Thus", then "says", then a second `\zaln-s`-wrapped "Yahweh". Mirrors the
+// real defect — the AI wrote the straight `"` as a bare leading text node, not
+// inside the `\w` itself (normalizeWordPunctuation already strips outer
+// punctuation off `\w` tokens by the time this stage runs).
+{
+  const verseObjects = [
+    { type: "text", text: '"' },
+    {
+      type: "milestone",
+      tag: "zaln",
+      strong: "H0559",
+      content: "אָמַר",
+      lemma: "אָמַר",
+      morph: "He,Vqp3ms",
+      occurrence: "1",
+      occurrences: "1",
+      children: [{ type: "word", tag: "w", text: "Thus", occurrence: "1", occurrences: "1" }],
+    },
+    { type: "text", text: " says " },
+    {
+      type: "milestone",
+      tag: "zaln",
+      strong: "H3068",
+      content: "יְהוָה",
+      lemma: "יְהוָה",
+      morph: "Np",
+      occurrence: "1",
+      occurrences: "1",
+      children: [{ type: "word", tag: "w", text: "Yahweh", occurrence: "1", occurrences: "1" }],
+    },
+    { type: "text", text: "," },
+  ];
+  const before = JSON.parse(JSON.stringify(verseObjects));
+  const nodeCountBefore = countNodes(verseObjects);
+
+  const changed = curlifyVerseObjects(verseObjects);
+
+  assert(changed === true, "JER 33:20-shaped verse: reports a change");
+  assert(verseObjects[0].text === "“", `leading straight quote curls to an opening “ (got ${JSON.stringify(verseObjects[0].text)})`);
+  assert(verseObjects[2].text === " says ", "unrelated text node untouched");
+  assert(verseObjects[4].text === ",", "trailing punctuation text node untouched");
+
+  // x-content / x-lemma / x-morph / x-strong / occurrence(s) are byte-identical —
+  // the hard constraint: source-language attributes are never touched.
+  for (const key of ["content", "lemma", "morph", "strong", "occurrence", "occurrences"]) {
+    assert(
+      verseObjects[1][key] === before[1][key] && verseObjects[3][key] === before[3][key],
+      `milestone attribute "${key}" is byte-identical before/after`,
+    );
+  }
+  // Target `\w` word text/occurrence untouched (no quotes in them).
+  assert(verseObjects[1].children[0].text === "Thus", "target word text untouched when it holds no quotes");
+  assert(verseObjects[3].children[0].text === "Yahweh", "target word text untouched when it holds no quotes");
+  assert(
+    verseObjects[1].children[0].occurrence === before[1].children[0].occurrence &&
+      verseObjects[3].children[0].occurrence === before[3].children[0].occurrence,
+    "target word occurrence untouched",
+  );
+  // Structure-preserving: same node count (no node added/removed/reordered).
+  assert(countNodes(verseObjects) === nodeCountBefore, "node count unchanged (no split/merge/reorder)");
+}
+
+// Apostrophe / possessive: a straight `'` inside a target `\w` word, flanked by
+// letters, curls to the closing/apostrophe curly quote (’), never the opener.
+{
+  const verseObjects = [
+    { type: "text", text: "the " },
+    { type: "word", tag: "w", text: "LORD's", occurrence: "1", occurrences: "1" },
+    { type: "text", text: " temple" },
+  ];
+  const changed = curlifyVerseObjects(verseObjects);
+  assert(changed === true, "possessive apostrophe: reports a change");
+  assert(verseObjects[1].text === "LORD’s", `possessive apostrophe curls (got ${JSON.stringify(verseObjects[1].text)})`);
+}
+
+// Already-curly verse: a no-op. Byte-identical JSON before/after, reports no
+// change, and mutates nothing (the hard "no-op on clean output" requirement).
+{
+  const verseObjects = [
+    { type: "text", text: "“Thus says " },
+    {
+      type: "milestone",
+      tag: "zaln",
+      strong: "H3068",
+      content: "יְהוָה",
+      lemma: "יְהוָה",
+      morph: "Np",
+      occurrence: "1",
+      occurrences: "1",
+      children: [{ type: "word", tag: "w", text: "Yahweh’s", occurrence: "1", occurrences: "1" }],
+    },
+    { type: "text", text: ",” he said." },
+  ];
+  const before = JSON.stringify(verseObjects);
+  const changed = curlifyVerseObjects(verseObjects);
+  assert(changed === false, "already-curly verse: reports no change");
+  assert(JSON.stringify(verseObjects) === before, "already-curly verse: byte-identical after the pass");
+}
+
+// A verse with no straight quotes at all — a no-op on non-quote content too
+// (plain prose, no ' or " anywhere).
+{
+  const verseObjects = [
+    { type: "text", text: "In the beginning " },
+    { type: "word", tag: "w", text: "God", occurrence: "1", occurrences: "1" },
+    { type: "text", text: " created the heavens." },
+  ];
+  const before = JSON.stringify(verseObjects);
+  const changed = curlifyVerseObjects(verseObjects);
+  assert(changed === false, "no-quote verse: reports no change");
+  assert(JSON.stringify(verseObjects) === before, "no-quote verse: byte-identical after the pass");
 }
 
 console.log("\nAll parser smoke checks passed.");
