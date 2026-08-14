@@ -1058,10 +1058,13 @@ function NoteCardInner({
           verse: row.verse,
         },
       );
-    } else if (hydrated) {
+    } else if (hydrated && Object.keys(pendingRef.current).length === 0) {
       // Only clear after the on-mount draft lookup has run — before that,
       // hasRowDiff is measured against an unhydrated baseline and would
       // spuriously wipe a draft we haven't had the chance to restore.
+      // Also gate on pendingRef being empty: if the user has un-flushed
+      // edits, a transient hasRowDiff=false (e.g. from a re-sync revert
+      // that slipped past the guard) must not destroy the IndexedDB draft.
       void drafts.clear(draftKey);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1436,8 +1439,7 @@ function NoteCardInner({
           value={quote}
           onChange={(e) => {
             setQuote(e.target.value);
-            // Debounced parent propagation for the live highlight; no longer
-            // a whole-app re-render per keystroke (see scheduleQuotePropagate).
+            pendingRef.current = { ...pendingRef.current, quote: e.target.value };
             scheduleQuotePropagate();
           }}
           multiline
@@ -1567,10 +1569,8 @@ function NoteCardInner({
             value={note}
             inputRef={noteTextareaRef}
             onChange={(e) => {
-              // Body text is consumed only by this card — keep it purely local
-              // (persisted via the draft store, saved through flushPending). No
-              // applyLocalRowPatch, so a keystroke doesn't re-render the app.
               setNote(e.target.value);
+              pendingRef.current = { ...pendingRef.current, note: e.target.value };
             }}
             multiline
             fullWidth
