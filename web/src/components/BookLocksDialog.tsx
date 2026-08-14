@@ -224,7 +224,17 @@ export function BookLocksDialog({ open, onClose, onChanged, books, canManageLock
           <Button onClick={onClose}>Close</Button>
         </DialogActions>
       </Dialog>
-      <Dialog open={pushPrompt !== null} onClose={closePushPrompt} maxWidth="xs" fullWidth>
+      <Dialog
+        open={pushPrompt !== null}
+        // While the push request is in flight, ignore Escape/backdrop
+        // dismissal — closing here only hides the dialog, it doesn't cancel
+        // the request, so dismissing early would silently drop the
+        // queued/error result onto a dialog nobody can see anymore.
+        onClose={pushState === "pushing" ? undefined : closePushPrompt}
+        disableEscapeKeyDown={pushState === "pushing"}
+        maxWidth="xs"
+        fullWidth
+      >
         <DialogTitle>Push to Door43?</DialogTitle>
         <DialogContent>
           {pushState === "idle" && pushPrompt && (

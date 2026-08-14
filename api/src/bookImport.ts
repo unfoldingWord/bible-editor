@@ -175,8 +175,18 @@ books.delete("/:book/lock", requireEditor, async (c) => {
 // a *narrower* allowlist than requireAdmin — he's a book_lock_admin but only
 // an `editor` in user_roles, so he can't reach POST /api/exports/run (the
 // admin panel's manual push). Requires the book to actually be locked right
-// now — this exists to push a book you just froze, not as a generic bypass
-// of the lock guard.
+// now (no recency check beyond that — a lock admin could call this on any
+// currently-locked book, not only one they just re-locked; that is an
+// intentional widening of what the 3-person book_lock_admins allowlist can
+// trigger on Door43, accepted because they already hold the power to
+// unlock+relock any book at will, so a recency gate would not add a real
+// barrier, only complexity).
+//
+// Also requires the book to have actually been imported — effectiveBookLock
+// doesn't check that (a book can be locked purely via the PUBLISHED_BOOKS
+// default without a book_imports row), and without this check the Workflow's
+// own book resolution would find zero books, silently do nothing, and still
+// report every resource as "queued".
 //
 // Fires one Workflow instance per resource, each explicitly naming book +
 // resource, because lockOverrideAllowed only honors `allowLocked` for an
@@ -198,6 +208,11 @@ books.post("/:book/lock/push", requireEditor, async (c) => {
 
   const lock = await effectiveBookLock(c.env, book);
   if (!lock) return c.json({ error: "book_not_locked", book }, 400);
+
+  const imported = await c.env.DB.prepare(`SELECT 1 FROM book_imports WHERE book = ?1`)
+    .bind(book)
+    .first();
+  if (!imported) return c.json({ error: "book_not_imported", book }, 400);
 
   const stamp = new Date().toISOString().replace(/[:.]/g, "-");
   const pushed: Array<

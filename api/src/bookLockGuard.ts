@@ -36,14 +36,18 @@ export const bookLockGuard: MiddlewareHandler = async (c, next) => {
     return next();
   }
 
-  // The lock/unlock endpoints themselves (PUT/DELETE /api/books/:book/lock)
-  // must never be blocked by the guard they configure — otherwise a locked
-  // book could never be unlocked again. Matched precisely rather than with
-  // endsWith("/lock"): a loose suffix test would silently exempt any future
-  // route ending in "/lock" from lock enforcement, which is the kind of hole
-  // nobody would notice. (Note `/twl-order-lock` ends in "-lock", not
-  // "/lock", so it was never exempt — but that is luck, not design.)
-  if (/^\/api\/books\/[^/]+\/lock$/.test(c.req.path)) {
+  // The lock/unlock endpoints themselves (PUT/DELETE /api/books/:book/lock),
+  // plus the "push this locked book to Door43 now" action
+  // (POST /api/books/:book/lock/push), must never be blocked by the guard
+  // they configure or act on — otherwise a locked book could never be
+  // unlocked, and the push route (whose only precondition is that the book
+  // IS locked) would 423 on every call before its own handler ever ran.
+  // Matched precisely rather than with endsWith("/lock"): a loose suffix test
+  // would silently exempt any future route ending in "/lock" from lock
+  // enforcement, which is the kind of hole nobody would notice. (Note
+  // `/twl-order-lock` ends in "-lock", not "/lock", so it was never exempt —
+  // but that is luck, not design.)
+  if (/^\/api\/books\/[^/]+\/lock(\/push)?$/.test(c.req.path)) {
     return next();
   }
 
