@@ -928,10 +928,23 @@ async function applyTsvRows(
       let conflictFields: string[] = [];
       let adopted = false;
 
-      // (a) Substantive three-way merge (quote/note/occurrence/support_reference
-      //     /orig_words/tw_link/question/response), attributed against the
+      // A human-protected tn row (preserve/hint/trashed — deleted_at is already
+      // handled at the tombstone branch) must NEVER be overwritten from master,
+      // exactly as computeEditedFieldMerge enforces for the heuristic path. The
+      // three-way merge has no protection gate of its own, and buildTsvEditedWrite
+      // Stmt's WHERE re-asserts these — so if we let a protected row become an
+      // adopt, the write correctly 0-changes, but the lost-CAS branch below would
+      // then read that as a race and set apply_incomplete FOREVER (re-staging the
+      // whole resource nightly). Skip the three-way merge for a protected row so
+      // it stays a clean skipped_edited, no watermark impact (cold-review #1).
+      const protectedRow =
+        kind === "tn" &&
+        (cur.trashed_at != null || Number(cur.preserve ?? 0) !== 0 || Number(cur.hint ?? 0) !== 0);
+
+      // (a) Substantive three-way merge (quote/note/support_reference /
+      //     orig_words/tw_link/question/response), attributed against the
       //     reconstructed ancestor. Only when a watermark exists for this run.
-      if (masterConfirmedAt != null) {
+      if (masterConfirmedAt != null && !protectedRow) {
         const merge = computeTsvMerge(
           kind,
           bases.get(row.id) ?? null,
@@ -942,6 +955,14 @@ async function applyTsvRows(
         if (merge.adopt) {
           adopted = true;
           Object.assign(fields, merge.writeFields);
+          // Occurrence is excluded from the field merge (renderOccurrence
+          // coercion), but adopting a NEW quote/orig_words surface while keeping
+          // D1's occurrence — chosen for the OLD surface — can synthesize an
+          // invalid (surface, occurrence) pair that hard-rejects on export
+          // (cold-review #2). When the surface is adopted, co-adopt master's
+          // rendered occurrence: it is the matched pair DCS itself accepted.
+          const surfaceField = kind === "twl" ? "orig_words" : "quote";
+          if (surfaceField in fields) fields.occurrence = row.occurrence ?? null;
           if (merge.conflict) {
             conflict = true;
             conflictFields = merge.conflictFields;
@@ -984,14 +1005,16 @@ async function applyTsvRows(
         continue;
       }
       // A both-sides-changed conflict flags the row for in-app review (the
-      // cleanup chip, lint.ts) — atomic with the content write, so the recovery
-      // pointer can never be lost separately from the overwrite. The overwritten
-      // value stays recoverable from this row's edit_log version history.
+      // cleanup chip, lint.ts) — atomic with the content write, so the flag can
+      // never be lost separately from the overwrite. The overwritten value is
+      // retained in edit_log (recoverable by an admin) — worded without promising
+      // a per-row history UI or naming internal columns (cold-review #5).
       if (conflict) {
+        const labels = conflictFields.map((f) => TSV_FIELD_LABELS[f] ?? f);
         fields.review_kind = "merge_conflict";
         fields.review_reason =
-          `Adopted a Door43 edit that conflicts with your change to ${conflictFields.join(", ")}. ` +
-          `Your prior value is in this row's history.`;
+          `A Door43 edit to this row's ${labels.join(" and ")} was merged over your app-side change. ` +
+          `Please double-check it.`;
       }
       editedWrites.push({
         id: row.id,
@@ -1157,6 +1180,18 @@ async function applyTsvRows(
 // Object.keys of caller input) so a stray/injected key can never reach the SQL.
 // Common to all kinds: tags, occurrence, and the review flags. `sort_order`,
 // identity, and updated_by are deliberately absent (never merged from master).
+// Human-friendly names for the merge fields, for the conflict review_reason
+// (never expose a raw DB column name to a translator).
+const TSV_FIELD_LABELS: Record<string, string> = {
+  quote: "quote",
+  note: "note",
+  support_reference: "support reference",
+  question: "question",
+  response: "response",
+  orig_words: "original words",
+  tw_link: "translationWords link",
+};
+
 const TSV_MERGE_WRITE_COLS: Record<TsvKind, Set<string>> = {
   tn: new Set(["quote", "note", "occurrence", "support_reference", "tags", "review_kind", "review_reason"]),
   tq: new Set(["quote", "question", "response", "occurrence", "tags", "review_kind", "review_reason"]),
