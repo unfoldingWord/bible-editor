@@ -70,6 +70,11 @@ export interface TqRow {
   updated_by: number | null;
   updated_at: number;
   deleted_at: number | null;
+  /** Workflow-only review flag (migration 0047), mirroring TnRow — set when the
+   *  nightly Door43->D1 three-way merge adopted a maintainer edit that
+   *  conflicted with an app-side edit. Never exported. */
+  review_kind: string | null;
+  review_reason: string | null;
   /** See TnRow.latest_source. */
   latest_source?: string | null;
 }
@@ -90,6 +95,11 @@ export interface TwlRow {
   updated_by: number | null;
   updated_at: number;
   deleted_at: number | null;
+  /** Workflow-only review flag (migration 0047), mirroring TnRow — set when the
+   *  nightly Door43->D1 three-way merge adopted a maintainer edit that
+   *  conflicted with an app-side edit. Never exported. */
+  review_kind: string | null;
+  review_reason: string | null;
 }
 
 export interface VerseRow {

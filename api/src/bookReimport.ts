@@ -61,8 +61,13 @@ import {
   classifyReimportRow,
   isReimportableRow,
   computeEditedFieldMerge,
-  type EditedFieldMerge,
 } from "./reimportClassify";
+import {
+  computeTsvMerge,
+  foldTsvBase,
+  type TsvMergeSide,
+  type TsvEditLogEntry,
+} from "./tsvMerge.ts";
 import { shouldRecordResourceSync, isSystemicMergeRefusal } from "./reimportSyncGate";
 import { computeTwlSortOrderUpdates } from "./twlCanonicalOrder";
 import { applyTwlSortOrderUpdates } from "./twlSortOrderApply";
@@ -163,11 +168,12 @@ export interface ReimportCounts {
   // that classifyReimportRow otherwise preserves as a local reorder. Book-level
   // pass, tallied onto perResource.twl.
   twl_reordered: number;
-  // Verse whose content was adopted from master via computeVerseMerge — either
-  // action "adopt" (master moved, we didn't) or "adopt_conflict" (both moved;
-  // master won, flagged for review — see merge_conflicts). Incremented only
-  // when the version-CAS write actually landed (see the master-adoption batch).
-  // verses only. See verseMerge.ts / the 1CH incident this fixes.
+  // Verse OR TSV row whose content was adopted from master via a three-way
+  // merge — either action "adopt" (master moved, we didn't) or "adopt_conflict"
+  // (both moved; master won, flagged for review — see merge_conflicts).
+  // Incremented only when the version-CAS write actually landed. verses use
+  // computeVerseMerge (verseMerge.ts); tn/tq/twl use computeTsvMerge
+  // (tsvMerge.ts). See the 1CH incident this class of fix addresses.
   merge_adopted: number;
   // Verse flagged for human review after a merge: action "adopt_conflict"
   // (both D1 and master moved since the ancestor) or "keep_alignment_refused"
@@ -178,7 +184,9 @@ export interface ReimportCounts {
   // Recording is best-effort — see merge_record_failed for when it fails. An
   // "adopt_conflict" whose version-CAS write was LOST is not counted or
   // recorded: nothing was overwritten, so there is nothing yet for a human to
-  // recover. verses only.
+  // recover. verses AND tsv — for tn/tq/twl an adopt_conflict sets the row's
+  // review_kind/review_reason (migration 0047), surfaced by the cleanup chip
+  // (lint.ts) rather than the verse banner.
   merge_conflicts: number;
   // Verse where computeVerseMerge returned "keep_alignment_refused" — master's
   // edit was NOT adopted because doing so would lose alignment on words
@@ -191,7 +199,13 @@ export interface ReimportCounts {
   // master_confirmed_at). D1 is kept, matching the pre-existing safe default.
   // Only counted when this book+resource HAS a master_confirmed_at watermark
   // at all; a book/resource never positively confirmed in master skips the
-  // merge entirely and counts nothing here. verses only.
+  // merge entirely and counts nothing here. verses AND tsv (computeTsvMerge
+  // returns keep_no_base for a whole-row ancestor that couldn't be
+  // reconstructed, e.g. edit_log aged out). NOTE (known residual, deliberately
+  // NOT gated on): merge_no_base does not withhold the watermark, so a genuinely
+  // unattributable differing row is still kept-and-reverted — the pre-existing
+  // warm-up tradeoff, left as a flagged follow-up (see the failed-adoption-write
+  // gate, apply_incomplete, which IS gated).
   merge_no_base: number;
   // Human-edited verse that DIFFERS from master but could not be adjudicated
   // at all, because this book+resource has no `master_confirmed_at` watermark
@@ -229,6 +243,20 @@ export interface ReimportCounts {
   // This flag survives that coercion so shouldRecordResourceSync can still
   // withhold on the aggregate, not just on a raw, un-aggregated counts object.
   counts_incomplete?: boolean;
+  // Set true when a CORRECTNESS-BEARING adoption write batch THREW (a D1
+  // batch() error, not a lost CAS race) — the verse master-adoption batch, the
+  // verse source-attr reconcile batch, or the TSV three-way merge batch. Those
+  // batches adopt a maintainer's out-of-band Door43 correction into D1; if the
+  // write throws, D1 stays stale but the rest of the run continues, and without
+  // this taint the (book, resource) watermark would still be stamped — so
+  // tonight's export renders stale D1 over master (reverting the correction)
+  // and the SHA match makes planAndStageBookResources skip this resource on the
+  // NEXT run, so it never retries. Gated on at the reimport-sync step alongside
+  // chapters_locked / prune_locked / merge_record_failed / systemic refusals
+  // (the failed-adoption-write hole Codex flagged in the shipped verse merge).
+  // A lost CAS race is NOT this — that's an honest skipped_edited (a human wrote
+  // first; nothing of theirs was clobbered). Only a thrown batch sets it.
+  apply_incomplete?: boolean;
 }
 
 export interface ReimportResult {
@@ -266,6 +294,7 @@ function zeroCounts(): ReimportCounts {
     dcs_404: 0,
     errors: [],
     counts_incomplete: false,
+    apply_incomplete: false,
   };
 }
 
@@ -310,6 +339,7 @@ function addCounts(into: ReimportCounts, from: ReimportCounts): void {
   into.merge_unavailable += from.merge_unavailable ?? 0;
   into.merge_cosmetic_ignored += from.merge_cosmetic_ignored ?? 0;
   into.merge_record_failed = Boolean(into.merge_record_failed || from.merge_record_failed);
+  into.apply_incomplete = Boolean(into.apply_incomplete || from.apply_incomplete);
   into.dcs_404 += from.dcs_404;
   if (from.errors.length) into.errors.push(...from.errors);
 }
@@ -465,6 +495,13 @@ async function runReimport(
   // one per chapter.
   const masterConfirmedAtUlt = want.has("ult") && ultRaw ? await getMasterConfirmedAt(env, book, "ult") : null;
   const masterConfirmedAtUst = want.has("ust") && ustRaw ? await getMasterConfirmedAt(env, book, "ust") : null;
+  // TSV merge ancestor cutoffs — same once-per-run hoist as ult/ust above (the
+  // three-way merge for edited tn/tq/twl rows reads this in applyTsvRows). NULL
+  // means this (book, resource) has never been positively confirmed on master,
+  // so the merge stays inert and edited rows behave exactly as before.
+  const masterConfirmedAtTn = want.has("tn") && tnRaw ? await getMasterConfirmedAt(env, book, "tn") : null;
+  const masterConfirmedAtTq = want.has("tq") && tqRaw ? await getMasterConfirmedAt(env, book, "tq") : null;
+  const masterConfirmedAtTwl = want.has("twl") && twlRaw ? await getMasterConfirmedAt(env, book, "twl") : null;
 
   for (const chapter of chapters) {
     const lock = await activePipelineForChapter(env, book, chapter);
@@ -477,15 +514,15 @@ async function runReimport(
     }
 
     if (want.has("tn") && tnRaw) {
-      const c = await reimportTsvForChapter(env, book, chapter, tnRaw, "tn", userId);
+      const c = await reimportTsvForChapter(env, book, chapter, tnRaw, "tn", userId, masterConfirmedAtTn);
       addCounts(perResource.tn, c);
     }
     if (want.has("tq") && tqRaw) {
-      const c = await reimportTsvForChapter(env, book, chapter, tqRaw, "tq", userId);
+      const c = await reimportTsvForChapter(env, book, chapter, tqRaw, "tq", userId, masterConfirmedAtTq);
       addCounts(perResource.tq, c);
     }
     if (want.has("twl") && twlRaw) {
-      const c = await reimportTsvForChapter(env, book, chapter, twlRaw, "twl", userId);
+      const c = await reimportTsvForChapter(env, book, chapter, twlRaw, "twl", userId, masterConfirmedAtTwl);
       addCounts(perResource.twl, c);
     }
     if (want.has("ult") && ultRaw) {
@@ -653,8 +690,9 @@ async function reimportTsvForChapter(
   raw: string,
   kind: TsvKind,
   userId: number | null,
+  masterConfirmedAt: number | null,
 ): Promise<ReimportCounts> {
-  return applyTsvRows(env, book, kind, rowsForChapter(raw, kind, chapter), userId);
+  return applyTsvRows(env, book, kind, rowsForChapter(raw, kind, chapter), userId, masterConfirmedAt);
 }
 
 // Upsert already-parsed TSV rows (any chapters). Batched to stay under the
@@ -677,6 +715,12 @@ async function applyTsvRows(
   kind: TsvKind,
   incoming: ParsedTsvRow[],
   userId: number | null,
+  // Three-way merge ancestor cutoff for this (book, resource) —
+  // book_resource_syncs.master_confirmed_at, hoisted once per run by the caller
+  // (getMasterConfirmedAt). NULL means never positively confirmed on master:
+  // the three-way merge for edited rows stays inert and they fall back to the
+  // pre-existing ancestor-free computeEditedFieldMerge, exactly as before.
+  masterConfirmedAt: number | null = null,
 ): Promise<ReimportCounts> {
   const counts = zeroCounts();
   if (incoming.length === 0) return counts;
@@ -735,11 +779,33 @@ async function applyTsvRows(
   // untouched. Counted `reimported_ai`.
   const aiReseeds: Array<{ row: ParsedTsvRow; sortOrder: number; oldVersion: number }> = [];
   const resurrects: Array<{ row: ParsedTsvRow; sortOrder: number; oldVersion: number }> = [];
-  // Rows classified "edited" (human-owned) that still have master-owned or
-  // whitespace-only fields to sync in — see computeEditedFieldMerge. Written
-  // in their own batch below WITHOUT touching updated_by; the row stays
-  // human-owned. `id` is carried separately from `merge` for the write.
-  const fieldMerges: Array<{ id: string; oldVersion: number; merge: EditedFieldMerge }> = [];
+  // Rows classified "edited" (human-owned) that diverge from master. Deferred
+  // and resolved AFTER this loop so the three-way-merge ancestor can be
+  // reconstructed for all of them in ONE batched edit_log read
+  // (reconstructTsvBases), not one read per row — the subrequest-budget
+  // discipline this whole function exists for. Each resolves to either a merge
+  // write (adopt master's field(s)) or a plain skipped_edited.
+  const editedCandidates: Array<{ row: ParsedTsvRow; cur: Record<string, unknown> }> = [];
+  // Combined writes for edited rows: the union of the three-way merge's adopted
+  // SUBSTANTIVE fields (tsvMerge.ts) and the ancestor-free computeEditedFieldMerge
+  // fields (tags / whitespace-only note), plus review_kind/review_reason on a
+  // both-sides-changed conflict. One write per row so two writers never race the
+  // same version. version-CAS + re-asserted protections; updated_by untouched
+  // (the row stays human-owned — the next sync then sees D1==master and no-ops).
+  const editedWrites: Array<{
+    id: string;
+    oldVersion: number;
+    chapter: number;
+    verse: number;
+    fields: Record<string, unknown>;
+    conflict: boolean;
+    // A substantive three-way adoption landed in this write (drives merge_adopted
+    // + the lost-CAS watermark withhold).
+    adopted: boolean;
+    // The ancestor-free field merge (tags / whitespace note) contributed fields
+    // to this write — tallied as merged_fields INDEPENDENTLY of adopted.
+    heuristic: boolean;
+  }> = [];
   for (let i = 0; i < incoming.length; i++) {
     const row = incoming[i];
     const sortOrder = nextSort(row.chapter, row.verse);
@@ -829,12 +895,64 @@ async function applyTsvRows(
       continue;
     }
     if (fate === "edited") {
-      // The row is human-owned, but some columns never are (or aren't on this
-      // kind) — see computeEditedFieldMerge. Compare D1's current values
-      // against master's incoming ones; only tags/note/question/response can
-      // ever qualify, and protections (deleted_at/trashed_at/preserve/hint)
-      // block it outright regardless of field.
-      const merge = computeEditedFieldMerge(
+      // Human-owned and divergent. Defer — the three-way merge against the
+      // reconstructed ancestor + the ancestor-free field merge both run after
+      // the loop (resolveEditedCandidates), so the ancestor read is batched.
+      editedCandidates.push({ row, cur });
+      continue;
+    }
+    if (fate === "update_ai") {
+      aiReseeds.push({ row, sortOrder, oldVersion: Number(cur.version) });
+      continue;
+    }
+    updates.push({ row, sortOrder, oldVersion: Number(cur.version) });
+  }
+
+  // Resolve the deferred edited candidates (the whole point of this fix — an
+  // out-of-band Door43 edit to an app-edited tn/tq/twl row must be ADOPTED or
+  // flagged, never silently kept-and-reverted). Reconstruct the three-way-merge
+  // ancestor for ALL of them in ONE batched edit_log read, then per row combine
+  // the substantive three-way merge with the ancestor-free tags/whitespace merge
+  // into a single write (so two writers never race one row's version).
+  if (editedCandidates.length > 0) {
+    // Ancestor is only recoverable once this (book, resource) has been
+    // positively confirmed on master. Until then the three-way merge is inert
+    // and rows fall back to computeEditedFieldMerge exactly as before this fix.
+    const bases =
+      masterConfirmedAt != null
+        ? await reconstructTsvBases(env, book, kind, editedCandidates.map((c) => c.row.id), masterConfirmedAt)
+        : new Map<string, TsvMergeSide | null>();
+    for (const { row, cur } of editedCandidates) {
+      const fields: Record<string, unknown> = {};
+      let conflict = false;
+      let conflictFields: string[] = [];
+      let adopted = false;
+
+      // (a) Substantive three-way merge (quote/note/occurrence/support_reference
+      //     /orig_words/tw_link/question/response), attributed against the
+      //     reconstructed ancestor. Only when a watermark exists for this run.
+      if (masterConfirmedAt != null) {
+        const merge = computeTsvMerge(
+          kind,
+          bases.get(row.id) ?? null,
+          parsedRowToMergeSide(kind, storedTsvRowToParsed(kind, cur)),
+          parsedRowToMergeSide(kind, row),
+        );
+        if (merge.action === "keep_no_base") counts.merge_no_base++;
+        if (merge.adopt) {
+          adopted = true;
+          Object.assign(fields, merge.writeFields);
+          if (merge.conflict) {
+            conflict = true;
+            conflictFields = merge.conflictFields;
+          }
+        }
+      }
+
+      // (b) Ancestor-free field merge — tags (kind-specific rules) and
+      //     whitespace-only note/question/response churn. Owns fields the
+      //     three-way merge deliberately does not (tsvMerge.ts FIELDS_BY_KIND).
+      const heur = computeEditedFieldMerge(
         kind,
         {
           tags: (cur.tags as string | null) ?? null,
@@ -855,18 +973,37 @@ async function applyTsvRows(
           hint: cur.hint as number | null,
         },
       );
-      if (merge) {
-        fieldMerges.push({ id: row.id, oldVersion: Number(cur.version), merge });
-      } else {
+      // The two mergers own DISJOINT fields, so a key can't come from both — but
+      // if a future field ever overlaps, the ancestor-attributed three-way value
+      // wins (it is the stronger signal), so only add heuristic keys not present.
+      let heuristic = false;
+      if (heur) for (const [k, v] of Object.entries(heur)) if (!(k in fields)) { fields[k] = v; heuristic = true; }
+
+      if (Object.keys(fields).length === 0) {
         counts.skipped_edited++;
+        continue;
       }
-      continue;
+      // A both-sides-changed conflict flags the row for in-app review (the
+      // cleanup chip, lint.ts) — atomic with the content write, so the recovery
+      // pointer can never be lost separately from the overwrite. The overwritten
+      // value stays recoverable from this row's edit_log version history.
+      if (conflict) {
+        fields.review_kind = "merge_conflict";
+        fields.review_reason =
+          `Adopted a Door43 edit that conflicts with your change to ${conflictFields.join(", ")}. ` +
+          `Your prior value is in this row's history.`;
+      }
+      editedWrites.push({
+        id: row.id,
+        oldVersion: Number(cur.version),
+        chapter: row.chapter,
+        verse: row.verse,
+        fields,
+        conflict,
+        adopted,
+        heuristic,
+      });
     }
-    if (fate === "update_ai") {
-      aiReseeds.push({ row, sortOrder, oldVersion: Number(cur.version) });
-      continue;
-    }
-    updates.push({ row, sortOrder, oldVersion: Number(cur.version) });
   }
 
   // Batch the pristine UPDATEs, then audit only the ones that actually applied
@@ -955,62 +1092,102 @@ async function applyTsvRows(
     }
   }
 
-  // Batch the field-only merges on human-edited rows. Modeled directly on the
-  // verse source-attr reconcile above (applyVerseRows step 4): version-CAS
-  // UPDATE (`AND version = oldVersion`), the SAME protections isReimportableRow
-  // checks re-asserted at write time (deleted_at/trashed_at/preserve/hint for
-  // tn; deleted_at only for tq/twl), and updated_by is NEVER touched — the row
-  // stays human-owned. A human PATCH landing between the read and this batch
-  // bumps version → 0 rows changed → counted skipped_edited (no clobber, no
-  // lost update). Audited as 'update' with only the merged fields as payload.
-  for (let i = 0; i < fieldMerges.length; i += WRITE_BATCH) {
-    const slice = fieldMerges.slice(i, i + WRITE_BATCH);
+  // Batch the combined edited-row merges (three-way adoptions unioned with the
+  // ancestor-free tags/whitespace field merge). Modeled on the verse
+  // master-adoption batch (applyVerseRows step 7): version-CAS UPDATE (`AND
+  // version = oldVersion`), the SAME protections isReimportableRow checks
+  // re-asserted at write time, and updated_by is NEVER touched — the row stays
+  // human-owned (so the NEXT sync sees D1==master and no-ops). A human PATCH
+  // landing between the read and this batch bumps version → 0 rows changed →
+  // counted skipped_edited (no clobber). Counters: merge_adopted for a landed
+  // three-way adoption (merge_conflicts for its both-changed subset),
+  // merged_fields for a heuristic-only write. A THROWN batch taints
+  // apply_incomplete so the reimport-sync step withholds this resource's
+  // watermark — the failed-adoption-write gate (Codex): without it, a stale D1
+  // would be certified in-sync and the export would revert master, un-retried.
+  for (let i = 0; i < editedWrites.length; i += WRITE_BATCH) {
+    const slice = editedWrites.slice(i, i + WRITE_BATCH);
     try {
       const results = await env.DB.batch(
-        slice.map((u) => buildTsvFieldMergeStmt(env, book, kind, u.id, u.merge, u.oldVersion, now)),
+        slice.map((u) => buildTsvEditedWriteStmt(env, book, kind, u.id, u.fields, u.oldVersion, now)),
       );
       const logs: D1PreparedStatement[] = [];
       slice.forEach((u, j) => {
         if ((results[j]?.meta.changes ?? 0) > 0) {
-          counts.merged_fields++;
-          logs.push(logEditStmt(env, kind, u.id, book, userId, u.oldVersion, u.oldVersion + 1, "update", u.merge));
+          if (u.adopted) {
+            counts.merge_adopted++;
+            if (u.conflict) counts.merge_conflicts++;
+            console.warn("reimport: adopted master's out-of-band TSV correction over D1 (tsvMerge)", {
+              book, kind, id: u.id, chapter: u.chapter, verse: u.verse, conflict: u.conflict,
+            });
+          }
+          // merged_fields is INDEPENDENT of merge_adopted: a row can both adopt a
+          // substantive master edit AND fold in a tags/whitespace field-merge, and
+          // the pre-existing heuristic-merge tally must not be lost to the adoption
+          // branch (Codex P3.7).
+          if (u.heuristic) counts.merged_fields++;
+          logs.push(logEditStmt(env, kind, u.id, book, userId, u.oldVersion, u.oldVersion + 1, "update", u.fields));
         } else {
+          // Lost the version-CAS race — a human PATCH landed between the read and
+          // this batch. Nothing of theirs was clobbered (skipped_edited). BUT if
+          // this was an ADOPTION, master's correction did NOT land in D1 and the
+          // field is still stale, so the watermark must be withheld or the export
+          // reverts master with no retry (Codex P1.2 — the CAS-race twin of the
+          // thrown-batch gate). A lost heuristic-only write is not data loss.
           counts.skipped_edited++;
+          if (u.adopted) {
+            counts.apply_incomplete = true;
+            console.warn("reimport: TSV master-adoption lost the version-CAS race; withholding watermark for retry", {
+              book, kind, id: u.id, chapter: u.chapter, verse: u.verse,
+            });
+          }
         }
       });
       if (logs.length) await env.DB.batch(logs);
     } catch (e) {
-      counts.errors.push(`${kind} field-merge batch: ${e instanceof Error ? e.message : String(e)}`);
+      counts.apply_incomplete = true;
+      counts.errors.push(`${kind} edited-merge batch: ${e instanceof Error ? e.message : String(e)}`);
     }
   }
 
   return counts;
 }
 
-// Build (don't run) the field-only merge UPDATE for one edited TSV row, for
-// env.DB.batch(). Only the columns present in `merge` are written (tags and/or
-// note/question/response — see computeEditedFieldMerge); every other column,
-// including sort_order, is left exactly as the human left it. version-CAS
-// (`AND version = oldVersion`) is the concurrency guard — NOT `updated_by IS
-// NULL` (the row IS human-owned) — and updated_by is never included in the
-// SET, so the row stays attributed to that human. The same protections
-// isReimportableRow checks are re-asserted in the WHERE clause so a delete/
-// trash/preserve/hint change landing between the read and this batch also
-// blocks the write rather than racing it.
-function buildTsvFieldMergeStmt(
+// Columns buildTsvEditedWriteStmt may write per kind. An allowlist (not
+// Object.keys of caller input) so a stray/injected key can never reach the SQL.
+// Common to all kinds: tags, occurrence, and the review flags. `sort_order`,
+// identity, and updated_by are deliberately absent (never merged from master).
+const TSV_MERGE_WRITE_COLS: Record<TsvKind, Set<string>> = {
+  tn: new Set(["quote", "note", "occurrence", "support_reference", "tags", "review_kind", "review_reason"]),
+  tq: new Set(["quote", "question", "response", "occurrence", "tags", "review_kind", "review_reason"]),
+  twl: new Set(["orig_words", "tw_link", "occurrence", "tags", "review_kind", "review_reason"]),
+};
+
+// Build (don't run) the combined merge UPDATE for one edited TSV row, for
+// env.DB.batch(). Writes only the allowlisted columns present in `fields` (the
+// union of the three-way merge's adopted fields, the ancestor-free field merge,
+// and review_kind/review_reason on a conflict); every other column, including
+// sort_order, is left exactly as the human left it. version-CAS (`AND version =
+// oldVersion`) is the concurrency guard — NOT `updated_by IS NULL` (the row IS
+// human-owned) — and updated_by is never in the SET, so the row stays
+// attributed to that human. The same protections isReimportableRow checks are
+// re-asserted in the WHERE clause so a delete/trash/preserve/hint change landing
+// between the read and this batch blocks the write rather than racing it.
+function buildTsvEditedWriteStmt(
   env: Env,
   book: string,
   kind: TsvKind,
   id: string,
-  merge: EditedFieldMerge,
+  fields: Record<string, unknown>,
   oldVersion: number,
   now: number,
 ): D1PreparedStatement {
-  const cols = Object.keys(merge) as Array<keyof EditedFieldMerge>;
+  const allowed = TSV_MERGE_WRITE_COLS[kind];
+  const cols = Object.keys(fields).filter((c) => allowed.has(c));
   const binds: unknown[] = [];
   let p = 1;
   const setClauses = cols.map((c) => {
-    binds.push(merge[c] ?? null);
+    binds.push(fields[c] ?? null);
     return `${c} = ?${p++}`;
   });
   setClauses.push(`version = version + 1`, `updated_at = ?${p}`);
@@ -1029,6 +1206,93 @@ function buildTsvFieldMergeStmt(
         SET ${setClauses.join(", ")}
       WHERE id = ?${idParam} AND book = ?${bookParam} AND ${protection} AND version = ?${versionParam}`,
   ).bind(...binds);
+}
+
+// Map a ParsedTsvRow to the TsvMergeSide subset this kind merges (substantive
+// content only — tags is owned by computeEditedFieldMerge, sort_order/identity
+// are never merged). Used for both `ours` (via storedTsvRowToParsed) and
+// `theirs` (the incoming master row).
+function parsedRowToMergeSide(kind: TsvKind, row: ParsedTsvRow): TsvMergeSide {
+  if (kind === "tn") {
+    return { quote: row.quote ?? null, note: row.note ?? null, occurrence: row.occurrence, support_reference: row.support_reference ?? null };
+  }
+  if (kind === "tq") {
+    return { quote: row.quote ?? null, question: row.question ?? null, response: row.response ?? null, occurrence: row.occurrence };
+  }
+  return { orig_words: row.orig_words ?? null, occurrence: row.occurrence, tw_link: row.tw_link ?? null };
+}
+
+// Reconstruct the three-way-merge ancestor for a set of edited TSV rows: the row
+// content D1 held as of the master-confirmed watermark (`cutoff`), which is what
+// the export rendered to master. Because a human TSV edit logs only the CHANGED
+// fields (rows.ts PATCH) while a create/reimport/restore logs the full row, the
+// ancestor is FOLDED from the row's edit_log history up to the cutoff (see
+// foldTsvBase). Batched under the bound-param limit; one read per WRITE_BATCH ids
+// regardless of how long each row's history is. A row with no content-bearing
+// history before the cutoff maps to null (caller keeps D1 as keep_no_base).
+//
+// KNOWN LIMITATION (Codex P1.3), shared with the verse merge's identical
+// `created_at < cutoff` sub-select: `cutoff` (master_confirmed_at) is the
+// export's D1-read time at 1-SECOND granularity (Math.floor). An edit committed
+// in the SAME second as that read is excluded here, so the ancestor can be one
+// edit too old — and a later D1 edit then reads as a false both-changed conflict
+// (master wins, the app value is flagged + recoverable from history, NOT silently
+// lost). Rare (needs a same-second coincidence) and non-destructive. The precise
+// fix is an edit_log-id/version boundary captured at export-read time rather than
+// a second-granularity timestamp — an export-side change tracked as a follow-up.
+//
+// SUBREQUEST BUDGET (Codex P2.5): this adds ONE batched read per chapter that has
+// edited candidates, and only when a watermark exists. The nightly path is
+// chunked (reimportStagedChunk, 8 chapters/step) so it is safely bounded. The
+// UNCHUNKED full-book paths — user-triggered runReimport and the post-export
+// reimport (postExport.ts submits every chapter to reimportBookFromDcs) — were
+// already near the ~1000-subrequest cap for the largest books (PSA ~151 ch)
+// before this change; the conditional read here adds to that worst case. Left as
+// a follow-up: hoist ancestor reconstruction to the book level (collect all
+// edited-candidate ids across chapters, one batched read) so the full-book paths
+// pay a fixed, not per-chapter, cost.
+async function reconstructTsvBases(
+  env: Env,
+  book: string,
+  kind: TsvKind,
+  ids: string[],
+  cutoff: number,
+): Promise<Map<string, TsvMergeSide | null>> {
+  const out = new Map<string, TsvMergeSide | null>();
+  const entriesById = new Map<string, TsvEditLogEntry[]>();
+  for (let i = 0; i < ids.length; i += WRITE_BATCH) {
+    const slice = ids.slice(i, i + WRITE_BATCH);
+    // ?1 book, ?2 kind, ?3 cutoff, ids from ?4. Ordered by (row_key, id) so each
+    // group folds oldest→newest. `id` is monotonic per row, so it is a valid
+    // chronological tiebreak within a row_key even at identical created_at.
+    const inClause = slice.map((_, j) => `?${j + 4}`).join(", ");
+    const rs = await env.DB.prepare(
+      `SELECT row_key, action, payload_json FROM edit_log
+        WHERE kind = ?2 AND (book = ?1 OR book IS NULL)
+          AND action IN ('create', 'update', 'restore')
+          AND created_at < ?3
+          AND row_key IN (${inClause})
+        ORDER BY row_key ASC, id ASC`,
+    )
+      .bind(book, kind, cutoff, ...slice)
+      .all<{ row_key: string; action: string; payload_json: string | null }>();
+    for (const r of rs.results) {
+      let payload: Record<string, unknown> | null = null;
+      if (r.payload_json) {
+        try {
+          const p = JSON.parse(r.payload_json);
+          if (p && typeof p === "object" && !Array.isArray(p)) payload = p as Record<string, unknown>;
+        } catch {
+          /* unparseable payload — treat as no content for this entry */
+        }
+      }
+      const list = entriesById.get(r.row_key) ?? [];
+      list.push({ action: r.action, payload });
+      entriesById.set(r.row_key, list);
+    }
+  }
+  for (const id of ids) out.set(id, foldTsvBase(kind, entriesById.get(id) ?? []));
+  return out;
 }
 
 // Returns true if the row was inserted (was new), false if it already existed
@@ -1817,6 +2081,10 @@ async function applyVerseRows(
       });
       if (logs.length) await env.DB.batch(logs);
     } catch (e) {
+      // Correctness-bearing: this batch syncs a curated source fix onto an
+      // edited verse. A thrown batch leaves D1 stale — taint so the watermark
+      // is withheld and the export doesn't revert master un-retried.
+      counts.apply_incomplete = true;
       counts.errors.push(`verse source-attr reconcile batch: ${e instanceof Error ? e.message : String(e)}`);
     }
   }
@@ -2030,11 +2298,26 @@ async function applyVerseRows(
               ),
             );
           } else {
+            // Lost the version-CAS race — a human wrote this verse between our
+            // read and this batch. Master's correction did NOT land, so D1 is
+            // still stale for it: withhold the watermark or the export reverts
+            // master with no retry (Codex P1.2 — the CAS-race twin of the thrown-
+            // batch gate; previously only skipped_edited, which does not gate).
             counts.skipped_edited++;
+            counts.apply_incomplete = true;
+            console.warn("reimport: verse master-adoption lost the version-CAS race; withholding watermark for retry", {
+              book, bibleVersion, chapter: a.v.chapter, verse: a.v.verse,
+            });
           }
         });
         if (logs.length) await env.DB.batch(logs);
       } catch (e) {
+        // Correctness-bearing: this batch adopts a maintainer's out-of-band
+        // Door43 correction into D1. A thrown batch leaves D1 stale — taint so
+        // the reimport-sync step withholds this resource's watermark (Codex's
+        // failed-adoption-write gate), instead of certifying stale D1 in-sync
+        // and letting the export revert master with no retry.
+        counts.apply_incomplete = true;
         counts.errors.push(`verse master-adoption batch: ${e instanceof Error ? e.message : String(e)}`);
       }
     }
@@ -2760,6 +3043,13 @@ async function reimportStagedChunk(
   // CHUNK=8 chapters, +1 for chapter 0 on the first chunk, × 2 resources).
   const masterConfirmedAtUlt = versesByChapter.ult ? await getMasterConfirmedAt(env, book, "ult") : null;
   const masterConfirmedAtUst = versesByChapter.ust ? await getMasterConfirmedAt(env, book, "ust") : null;
+  // Same hoist for the TSV three-way merge ancestor cutoffs — once per chunk
+  // step, read only for a kind that actually has rows staged this chunk.
+  const masterConfirmedAtTsv: Record<TsvKind, number | null> = {
+    tn: rowsByChapter.tn ? await getMasterConfirmedAt(env, book, "tn") : null,
+    tq: rowsByChapter.tq ? await getMasterConfirmedAt(env, book, "tq") : null,
+    twl: rowsByChapter.twl ? await getMasterConfirmedAt(env, book, "twl") : null,
+  };
 
   for (let chapter = startChapter; chapter <= endChapter; chapter++) {
     const lock = await activePipelineForChapter(env, book, chapter);
@@ -2796,7 +3086,7 @@ async function reimportStagedChunk(
       if (!byCh) continue;
       const set = changedSets[kind];
       if (set && !set.has(chapter)) continue;  // chapter unchanged — skip the row loop
-      addCounts(perResource[kind], await applyTsvRows(env, book, kind, byCh.get(chapter) ?? [], userId));
+      addCounts(perResource[kind], await applyTsvRows(env, book, kind, byCh.get(chapter) ?? [], userId, masterConfirmedAtTsv[kind]));
     }
     // broadcastLaneReopens: false — this is the nightly chunked path
     // (reimportStagedChunk). WS messages are hints (CLAUDE.md) and nobody
@@ -2994,7 +3284,13 @@ export async function runChunkedReimport(
       // retry. See applyVerseRows's FIX 1 comment at the `masterAdoptions`
       // skip site for the other half of this fix.
       const mergeRecordFailed = perResource[e.resource].merge_record_failed === true;
-      if (!shouldRecordResourceSync(perResource[e.resource]) || systemicRefusals || mergeRecordFailed) {
+      // Withhold when a correctness-bearing adoption WRITE threw this run
+      // (apply_incomplete) — verse master-adoption / source-attr reconcile /
+      // TSV three-way merge. D1 is stale for those rows; stamping would certify
+      // it in-sync and the export would revert master with no retry (Codex's
+      // failed-adoption-write gate). Sibling to the other withhold conditions.
+      const applyIncomplete = perResource[e.resource].apply_incomplete === true;
+      if (!shouldRecordResourceSync(perResource[e.resource]) || systemicRefusals || mergeRecordFailed || applyIncomplete) {
         withheld.push(e.resource);
         // FIX B: a book whose (book, resource) has NO existing watermark row
         // (e.g. seeded by scripts/import-book.mjs, or whose import-time SHA
