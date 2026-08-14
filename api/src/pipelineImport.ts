@@ -1743,14 +1743,21 @@ async function applyVerseUpdate(
         // nfc() compares become no-ops. Structure-preserving; no-op when nothing
         // matches or the source verse wasn't loaded. See canonizeHebrew.ts.
         canonizeAlignmentSource(parsed.verseObjects, uhbWords);
-        recomputeTargetOccurrences(parsed.verseObjects);
         // Curl straight quotes bp-assistant wrote into verse text (JER 32/33,
         // NUM 26:53 prod forensics) before it lands in D1 / exports to master.
         // Structure-preserving — see curlifyVerseObjects: it only ever
         // reassigns a `.text` string, never a `\zaln-s` source attribute, so
         // this can't unalign a word or touch Hebrew/Greek. No-op on clean
-        // output.
+        // output. MUST run BEFORE recomputeTargetOccurrences: curling can make
+        // two `\w` nodes' text byte-identical (an already-curly "LORD’s" and an
+        // AI-written straight "LORD's" both become "LORD’s"), and occurrence
+        // numbering is keyed on exact text equality — recomputing first would
+        // stamp the two as distinct occurrences of what are now the same word,
+        // recreating the very `${text}|${occurrence}` collision that recompute
+        // exists to prevent. Curling first means the recompute below always
+        // sees the FINAL text.
         curlifyVerseObjects(parsed.verseObjects);
+        recomputeTargetOccurrences(parsed.verseObjects);
         contentJson = JSON.stringify(parsed);
       }
     } catch {

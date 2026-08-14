@@ -1283,4 +1283,36 @@ function countNodes(nodes) {
   assert(JSON.stringify(verseObjects) === before, "no-quote verse: byte-identical after the pass");
 }
 
+// Ordering regression (found in independent review): curling can make two
+// `\w` nodes' text byte-identical — one already curly ("LORD’s"), one
+// AI-written straight ("LORD's") — and recomputeTargetOccurrences keys
+// uniqueness on exact text. pipelineImport.ts's applyVerseUpdate MUST run
+// curlifyVerseObjects BEFORE recomputeTargetOccurrences, or the two words
+// would keep the DISTINCT occurrence numbers stamped while their text still
+// differed, colliding once curling unifies the text (both "LORD’s" at,
+// wrongly, occurrence 1 of 1 — the exact `${text}|${occurrence}` collision
+// recomputeTargetOccurrences exists to prevent). This test locks in the
+// correct order.
+{
+  const verseObjects = [
+    { type: "word", tag: "w", text: "LORD’s", occurrence: "0", occurrences: "0" }, // already curly
+    { type: "text", text: " house and " },
+    { type: "word", tag: "w", text: "LORD's", occurrence: "0", occurrences: "0" }, // AI-written straight
+  ];
+  curlifyVerseObjects(verseObjects); // must run first
+  recomputeTargetOccurrences(verseObjects);
+
+  assert(verseObjects[0].text === "LORD’s", "ordering regression: first word curls/stays curly");
+  assert(verseObjects[2].text === "LORD’s", "ordering regression: second word curls to match");
+  assert(
+    verseObjects[0].occurrence !== verseObjects[2].occurrence,
+    `ordering regression: two now-identical words get DISTINCT occurrence numbers, not a collision ` +
+      `(got ${verseObjects[0].occurrence} and ${verseObjects[2].occurrence})`,
+  );
+  assert(
+    verseObjects[0].occurrences === "2" && verseObjects[2].occurrences === "2",
+    `ordering regression: both words recognize there are 2 total occurrences (got ${verseObjects[0].occurrences}, ${verseObjects[2].occurrences})`,
+  );
+}
+
 console.log("\nAll parser smoke checks passed.");
