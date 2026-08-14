@@ -21,7 +21,7 @@ import {
 } from "./importParsers";
 import { requireAuth, requireEditor, currentUserId } from "./auth";
 import { BOOK_NUMBERS, dcsUrls, dcsResourceFile, fileCommitSha, fetchText } from "./dcsSources";
-import { reimportBookFromDcs, recordResourceSync, type Resource } from "./bookReimport";
+import { reimportBookFromDcs, recordResourceSync, ALL_RESOURCES, type Resource } from "./bookReimport";
 import { lintChapterOpeningMarkers, lintTnRows, lintTqRows, lintTwlRows, lintUsfmVerses } from "./lint";
 import { effectiveBookLock, canManageLocks, type BookLock } from "./bookLock";
 import { isPublishedBook } from "./publishedGuard";
@@ -162,6 +162,77 @@ books.delete("/:book/lock", requireEditor, async (c) => {
 
   const lock = await effectiveBookLock(c.env, book);
   return c.json(lockStateResponse(book, lock));
+});
+
+// POST /api/books/:book/lock/push — push a just-locked book to Door43 right
+// now, across every resource, instead of waiting for the nightly export.
+// Scenario this exists for: a book is unlocked for an editor to fix
+// something, then re-locked — without this, those edits sit in D1 until the
+// next 05:30 UTC cron, or someone remembers to trigger a manual export.
+//
+// Gated on canManageLocks (the book_lock_admins allowlist), NOT requireAdmin:
+// the caller is whoever just locked the book, and for Perry (pjoakes) that's
+// a *narrower* allowlist than requireAdmin — he's a book_lock_admin but only
+// an `editor` in user_roles, so he can't reach POST /api/exports/run (the
+// admin panel's manual push). Requires the book to actually be locked right
+// now (no recency check beyond that — a lock admin could call this on any
+// currently-locked book, not only one they just re-locked; that is an
+// intentional widening of what the 3-person book_lock_admins allowlist can
+// trigger on Door43, accepted because they already hold the power to
+// unlock+relock any book at will, so a recency gate would not add a real
+// barrier, only complexity).
+//
+// Also requires the book to have actually been imported — effectiveBookLock
+// doesn't check that (a book can be locked purely via the PUBLISHED_BOOKS
+// default without a book_imports row), and without this check the Workflow's
+// own book resolution would find zero books, silently do nothing, and still
+// report every resource as "queued".
+//
+// Fires one Workflow instance per resource, each explicitly naming book +
+// resource, because lockOverrideAllowed only honors `allowLocked` for an
+// exactly-one-book-one-resource run (see publishedGuard.ts) — a single
+// instance with resource omitted would resolve to all 5 resources and the
+// override would be silently ignored, leaving every resource skipped as
+// book_locked. validateAndMerge mirrors the nightly cron so this actually
+// lands on master rather than leaving a PR for someone to merge by hand.
+books.post("/:book/lock/push", requireEditor, async (c) => {
+  const userId = currentUserId(c);
+  if (!userId) return c.json({ error: "unauthorized" }, 401);
+  const username = c.get("username");
+  if (!(await canManageLocks(c.env, username))) {
+    return c.json({ error: "forbidden", reason: "not_a_lock_admin" }, 403);
+  }
+
+  const book = c.req.param("book").toUpperCase();
+  if (!BOOK_NUMBERS[book]) return c.json({ error: "unknown_book", book }, 400);
+
+  const lock = await effectiveBookLock(c.env, book);
+  if (!lock) return c.json({ error: "book_not_locked", book }, 400);
+
+  const imported = await c.env.DB.prepare(`SELECT 1 FROM book_imports WHERE book = ?1`)
+    .bind(book)
+    .first();
+  if (!imported) return c.json({ error: "book_not_imported", book }, 400);
+
+  // Each resource lives in its own DCS repo (RESOURCE_TARGETS in export.ts —
+  // en_tn/en_tq/en_twl/en_ult/en_ust), so the 5 creates below share no
+  // mutable state and can safely run concurrently rather than one at a time.
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const pushed = await Promise.all(
+    ALL_RESOURCES.map(async (resource) => {
+      try {
+        const instance = await c.env.EXPORT_WORKFLOW.create({
+          id: `lock-push-${book}-${resource}-${stamp}`,
+          params: { book, resource, allowLocked: true, validateAndMerge: true },
+        });
+        return { resource, instanceId: instance.id };
+      } catch (e) {
+        return { resource, error: e instanceof Error ? e.message : String(e) };
+      }
+    }),
+  );
+
+  return c.json({ book, pushed });
 });
 
 // GET /api/books/:book/lint — the in-app "issues to clean up" feed for a book.
