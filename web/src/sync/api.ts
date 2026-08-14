@@ -1292,6 +1292,18 @@ export interface RunExportResponse {
   status: string;
 }
 
+// POST /api/books/:book/lock/push — one Workflow instance per resource, since
+// the server only honors `allowLocked` for an exactly-one-book-one-resource
+// run. Each entry is either the created instance id or a create failure.
+export type PushLockedBookResult =
+  | { resource: Resource; instanceId: string }
+  | { resource: Resource; error: string };
+
+export interface PushLockedBookResponse {
+  book: string;
+  pushed: PushLockedBookResult[];
+}
+
 // GET /api/exports?book=&limit= — snapshot rows from past export runs.
 // This route predates the admin panel and returns `export_snapshots` rows
 // verbatim, so the field names are the D1 column names (snake_case) and the
@@ -1381,6 +1393,15 @@ export const api = {
   unlockBook: (book: string) =>
     request<{ ok: true }>(`/api/books/${encodeURIComponent(book)}/lock`, {
       method: "DELETE",
+    }),
+
+  // Push a currently-locked book to Door43 right now, across every resource,
+  // instead of waiting for the nightly export. Same lock-admin gate as
+  // lockBook/unlockBook above (not requireAdmin) — server 400s with
+  // { error: "book_not_locked" } if called on an unlocked book.
+  pushLockedBookToDoor43: (book: string) =>
+    request<PushLockedBookResponse>(`/api/books/${encodeURIComponent(book)}/lock/push`, {
+      method: "POST",
     }),
 
   // Trigger a server-side import of a book from DCS. Long-running: ~5-60s

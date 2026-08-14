@@ -172,6 +172,10 @@ interface Props {
   // occurrence ("here I am") and scroll it into view. Null when the active
   // result isn't a replaceable note body hit.
   onActiveNoteMatchChange: (match: { noteId: string; occurrence: number } | null) => void;
+  // The whole book is locked (server-enforced hard freeze). Search itself
+  // stays available so translators can compare past work, but every replace
+  // control is disabled — the writes would 423 on the server anyway.
+  bookLocked?: boolean;
 }
 
 export function FindReplaceOverlay({
@@ -191,6 +195,7 @@ export function FindReplaceOverlay({
   onScrollToNoteMatch,
   onNoteQueryChange,
   onActiveNoteMatchChange,
+  bookLocked = false,
 }: Props) {
   const [find, setFind] = useState("");
   const [replace, setReplace] = useState("");
@@ -469,7 +474,7 @@ export function FindReplaceOverlay({
   >(null);
 
   const doReplaceMatch = (m: FindMatch) => {
-    if (READ_ONLY_VERSIONS.has(m.bibleVersion)) return;
+    if (bookLocked || READ_ONLY_VERSIONS.has(m.bibleVersion)) return;
     const state = chapters.get(m.chapter);
     if (!state || state.kind !== "ready") return;
     const verse = state.data.verses[m.bibleVersion]?.[m.verse];
@@ -498,7 +503,7 @@ export function FindReplaceOverlay({
   };
 
   const doReplaceAllBible = () => {
-    if (!compiled.re || bibleMatches.length === 0) return;
+    if (bookLocked || !compiled.re || bibleMatches.length === 0) return;
     // Scripture replace-all. Group matches by verse. Re-derive matches in
     // the *current* plain text for each iteration instead of trusting
     // `startIndex` from the original collection — normalize() inside
@@ -566,7 +571,7 @@ export function FindReplaceOverlay({
   // that instance and the clamp effect advances to the next one. The override
   // map makes the list recompute immediately so positions stay correct.
   const doReplaceNoteMatch = (m: NoteMatch) => {
-    if (!compiled.re || replaceBlockedByChars || m.field !== "note") return;
+    if (bookLocked || !compiled.re || replaceBlockedByChars || m.field !== "note") return;
     const row = searchNotes().find(
       (r) => r.id === m.noteId && r.trashed_at == null && r.deleted_at == null,
     );
@@ -602,7 +607,7 @@ export function FindReplaceOverlay({
   };
 
   const doReplaceAllNotes = () => {
-    if (!compiled.re || replaceBlockedByChars) return;
+    if (bookLocked || !compiled.re || replaceBlockedByChars) return;
     let matchesReplaced = 0;
     let notesReplaced = 0;
     let emptySkipped = 0;
@@ -634,6 +639,7 @@ export function FindReplaceOverlay({
   // verses / notes so the dialog states the blast radius; bail without a dialog
   // when nothing would actually change.
   const requestReplaceAll = () => {
+    if (bookLocked) return;
     if (replaceScope === "bible") {
       const verses = new Set<string>();
       for (const m of bibleMatches) {
@@ -669,19 +675,22 @@ export function FindReplaceOverlay({
   };
 
   // Single-replace and replace-all enablement, factoring in the single-scope
-  // rule and the note control-char block.
-  const replaceOneEnabled = replaceBlockedByChars
-    ? false
-    : replaceScope === "bible"
-      ? !!activeBibleMatch
-      : activeNoteReplaceable;
-  const replaceAllEnabled = replaceBlockedByChars
-    ? false
-    : replaceScope === "bible"
-      ? bibleMatches.length > 0
-      : replaceScope === "tn"
-        ? noteMatches.length > 0
-        : false;
+  // rule, the note control-char block, and the book lock (a hard freeze —
+  // replace would appear to work and then fail (423) for every match).
+  const replaceOneEnabled =
+    bookLocked || replaceBlockedByChars
+      ? false
+      : replaceScope === "bible"
+        ? !!activeBibleMatch
+        : activeNoteReplaceable;
+  const replaceAllEnabled =
+    bookLocked || replaceBlockedByChars
+      ? false
+      : replaceScope === "bible"
+        ? bibleMatches.length > 0
+        : replaceScope === "tn"
+          ? noteMatches.length > 0
+          : false;
 
   if (!open) return null;
 
@@ -910,7 +919,7 @@ export function FindReplaceOverlay({
           }}
           size="small"
           placeholder="replace"
-          disabled={replaceScope === null}
+          disabled={replaceScope === null || bookLocked}
           error={replaceBlockedByChars}
           helperText={replaceBlockedByChars ? "no tabs or line breaks in notes" : undefined}
           sx={{
@@ -921,9 +930,11 @@ export function FindReplaceOverlay({
         />
         <Tooltip
           title={
-            replaceScope === "tn"
-              ? "replace this match in the note body (id & support reference are never changed)"
-              : "replace the active match (scripture only, this verse, overwrites alignment for it)"
+            bookLocked
+              ? "replace is unavailable while this book is locked"
+              : replaceScope === "tn"
+                ? "replace this match in the note body (id & support reference are never changed)"
+                : "replace the active match (scripture only, this verse, overwrites alignment for it)"
           }
         >
           <span>
@@ -947,9 +958,11 @@ export function FindReplaceOverlay({
         </Tooltip>
         <Tooltip
           title={
-            replaceScope === "tn"
-              ? "replace across every matching note body in all loaded chapters (id & support reference are never changed)"
-              : "replace every scripture match in every loaded chapter (one PATCH per affected verse; alignment is overwritten where it lands)"
+            bookLocked
+              ? "replace is unavailable while this book is locked"
+              : replaceScope === "tn"
+                ? "replace across every matching note body in all loaded chapters (id & support reference are never changed)"
+                : "replace every scripture match in every loaded chapter (one PATCH per affected verse; alignment is overwritten where it lands)"
           }
         >
           <span>
@@ -965,7 +978,16 @@ export function FindReplaceOverlay({
             </Button>
           </span>
         </Tooltip>
-        {replaceScope === null && (
+        {bookLocked && (
+          <Typography
+            variant="caption"
+            sx={{ display: "flex", alignItems: "center", gap: 0.5, color: "warning.dark", fontSize: 12 }}
+          >
+            <InfoOutlinedIcon sx={{ fontSize: 15 }} />
+            book is locked — replace is disabled
+          </Typography>
+        )}
+        {!bookLocked && replaceScope === null && (
           <Typography
             variant="caption"
             sx={{ display: "flex", alignItems: "center", gap: 0.5, color: "warning.dark", fontSize: 12 }}
@@ -974,7 +996,7 @@ export function FindReplaceOverlay({
             select a single scope to replace
           </Typography>
         )}
-        {replaceScope === "tn" && !replaceBlockedByChars && (
+        {!bookLocked && replaceScope === "tn" && !replaceBlockedByChars && (
           <Typography variant="caption" sx={{ color: "text.secondary", fontSize: 12 }}>
             note text only · id &amp; SR untouched
           </Typography>

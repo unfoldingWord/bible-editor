@@ -21,7 +21,7 @@ import {
 } from "./importParsers";
 import { requireAuth, requireEditor, currentUserId } from "./auth";
 import { BOOK_NUMBERS, dcsUrls, dcsResourceFile, fileCommitSha, fetchText } from "./dcsSources";
-import { reimportBookFromDcs, recordResourceSync, type Resource } from "./bookReimport";
+import { reimportBookFromDcs, recordResourceSync, ALL_RESOURCES, type Resource } from "./bookReimport";
 import { lintChapterOpeningMarkers, lintTnRows, lintTqRows, lintTwlRows, lintUsfmVerses } from "./lint";
 import { effectiveBookLock, canManageLocks, type BookLock } from "./bookLock";
 import { isPublishedBook } from "./publishedGuard";
@@ -162,6 +162,60 @@ books.delete("/:book/lock", requireEditor, async (c) => {
 
   const lock = await effectiveBookLock(c.env, book);
   return c.json(lockStateResponse(book, lock));
+});
+
+// POST /api/books/:book/lock/push — push a just-locked book to Door43 right
+// now, across every resource, instead of waiting for the nightly export.
+// Scenario this exists for: a book is unlocked for an editor to fix
+// something, then re-locked — without this, those edits sit in D1 until the
+// next 05:30 UTC cron, or someone remembers to trigger a manual export.
+//
+// Gated on canManageLocks (the book_lock_admins allowlist), NOT requireAdmin:
+// the caller is whoever just locked the book, and for Perry (pjoakes) that's
+// a *narrower* allowlist than requireAdmin — he's a book_lock_admin but only
+// an `editor` in user_roles, so he can't reach POST /api/exports/run (the
+// admin panel's manual push). Requires the book to actually be locked right
+// now — this exists to push a book you just froze, not as a generic bypass
+// of the lock guard.
+//
+// Fires one Workflow instance per resource, each explicitly naming book +
+// resource, because lockOverrideAllowed only honors `allowLocked` for an
+// exactly-one-book-one-resource run (see publishedGuard.ts) — a single
+// instance with resource omitted would resolve to all 5 resources and the
+// override would be silently ignored, leaving every resource skipped as
+// book_locked. validateAndMerge mirrors the nightly cron so this actually
+// lands on master rather than leaving a PR for someone to merge by hand.
+books.post("/:book/lock/push", requireEditor, async (c) => {
+  const userId = currentUserId(c);
+  if (!userId) return c.json({ error: "unauthorized" }, 401);
+  const username = c.get("username");
+  if (!(await canManageLocks(c.env, username))) {
+    return c.json({ error: "forbidden", reason: "not_a_lock_admin" }, 403);
+  }
+
+  const book = c.req.param("book").toUpperCase();
+  if (!BOOK_NUMBERS[book]) return c.json({ error: "unknown_book", book }, 400);
+
+  const lock = await effectiveBookLock(c.env, book);
+  if (!lock) return c.json({ error: "book_not_locked", book }, 400);
+
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const pushed: Array<
+    { resource: Resource; instanceId: string } | { resource: Resource; error: string }
+  > = [];
+  for (const resource of ALL_RESOURCES) {
+    try {
+      const instance = await c.env.EXPORT_WORKFLOW.create({
+        id: `lock-push-${book}-${resource}-${stamp}`,
+        params: { book, resource, allowLocked: true, validateAndMerge: true },
+      });
+      pushed.push({ resource, instanceId: instance.id });
+    } catch (e) {
+      pushed.push({ resource, error: e instanceof Error ? e.message : String(e) });
+    }
+  }
+
+  return c.json({ book, pushed });
 });
 
 // GET /api/books/:book/lint — the in-app "issues to clean up" feed for a book.

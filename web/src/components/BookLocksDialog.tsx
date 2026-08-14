@@ -18,14 +18,15 @@ import {
   List,
   ListItem,
   ListItemText,
+  Stack,
   Tooltip,
   Typography,
 } from "@mui/material";
 import LockIcon from "@mui/icons-material/Lock";
 import LockOpenIcon from "@mui/icons-material/LockOpen";
 import HelpOutlineIcon from "@mui/icons-material/HelpOutline";
-import { ApiError, api, type BookListEntry } from "../sync/api";
-import { BOOKS } from "../lib/bookNames";
+import { ApiError, api, type BookListEntry, type PushLockedBookResponse } from "../sync/api";
+import { BOOKS, bookName } from "../lib/bookNames";
 
 interface Props {
   open: boolean;
@@ -45,6 +46,16 @@ const NOT_ADMIN_MESSAGE = "Only Benjamin, Rich, or Perry can change book locks."
 export function BookLocksDialog({ open, onClose, onChanged, books, canManageLocks, refresh }: Props) {
   const [pending, setPending] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+
+  // Follow-up prompt after a book is *locked* (not unlocked) — a re-lock
+  // typically means an editor's fix just landed in D1 while the book was
+  // briefly open, and that fix otherwise sits unpushed until the next
+  // nightly export. Holds the just-locked book code; null when no prompt is
+  // showing. `pushState` tracks the push-now action itself.
+  const [pushPrompt, setPushPrompt] = useState<string | null>(null);
+  const [pushState, setPushState] = useState<"idle" | "pushing" | "done" | "error">("idle");
+  const [pushResult, setPushResult] = useState<PushLockedBookResponse | null>(null);
+  const [pushError, setPushError] = useState<string | null>(null);
 
   // Reset transient error state each time the dialog opens, and pick up
   // whatever lock state changed while it was closed.
@@ -66,6 +77,12 @@ export function BookLocksDialog({ open, onClose, onChanged, books, canManageLock
         await api.unlockBook(code);
       } else {
         await api.lockBook(code);
+        // Just locked it (was unlocked a moment ago) — offer to push now
+        // rather than leaving the fix stranded until the nightly export.
+        setPushPrompt(code);
+        setPushState("idle");
+        setPushResult(null);
+        setPushError(null);
       }
       refresh();
       onChanged?.();
@@ -82,108 +99,178 @@ export function BookLocksDialog({ open, onClose, onChanged, books, canManageLock
     }
   };
 
+  const closePushPrompt = () => {
+    setPushPrompt(null);
+    setPushState("idle");
+    setPushResult(null);
+    setPushError(null);
+  };
+
+  const doPushNow = async () => {
+    if (!pushPrompt) return;
+    setPushState("pushing");
+    setPushError(null);
+    try {
+      const res = await api.pushLockedBookToDoor43(pushPrompt);
+      setPushResult(res);
+      setPushState("done");
+    } catch (e) {
+      setPushError(e instanceof Error ? e.message : String(e));
+      setPushState("error");
+    }
+  };
+
   return (
-    <Dialog open={open} onClose={onClose} maxWidth="sm" fullWidth>
-      <DialogTitle>Book locks</DialogTitle>
-      <DialogContent>
-        <Typography variant="body2" color="text.secondary" sx={{ mb: 1.5 }}>
-          A locked book cannot be edited and is frozen out of the nightly
-          Door43 export. Published books are locked automatically.
-        </Typography>
-        {error && (
-          <Alert severity="error" sx={{ mb: 1.5 }} onClose={() => setError(null)}>
-            {error}
-          </Alert>
-        )}
-        {!canManageLocks && (
-          <Alert severity="info" sx={{ mb: 1.5 }}>
-            {NOT_ADMIN_MESSAGE}
-          </Alert>
-        )}
-        <List dense sx={{ maxHeight: 420, overflowY: "auto" }}>
-          {BOOKS.map(({ code, name }) => {
-            const entry = byCode.get(code);
-            // GET /api/books only lists IMPORTED books (see bookImport.ts),
-            // so a book with no `entry` has never been imported. The server
-            // still enforces a lock on it if it's on the published list
-            // (bookLock.ts checks isPublishedBook regardless of import
-            // status), but that published-books list is server-side only —
-            // duplicating it here would risk drifting out of sync. Rather
-            // than guess "unlocked" (false — a published-but-unimported book
-            // would show an open padlock while the server 423s it) or guess
-            // "locked" (also potentially false, for an unpublished book),
-            // render "not imported" as its own state: honest about what we
-            // don't know, and the toggle is disabled so nobody can write a
-            // redundant explicit lock row on unverified information.
-            const notImported = !entry;
-            const locked = entry?.locked ?? false;
-            const disabled = notImported || !canManageLocks || pending === code;
-            const control = (
-              <IconButton
-                edge="end"
-                size="small"
-                disabled={disabled}
-                onClick={() => toggle(code, locked)}
-                aria-label={locked ? `unlock ${name}` : `lock ${name}`}
-              >
-                {notImported ? (
-                  <HelpOutlineIcon fontSize="small" />
-                ) : locked ? (
-                  <LockIcon fontSize="small" />
-                ) : (
-                  <LockOpenIcon fontSize="small" />
-                )}
-              </IconButton>
-            );
-            const tooltipTitle = notImported
-              ? "Not imported yet — lock state unknown here"
-              : NOT_ADMIN_MESSAGE;
-            return (
-              <ListItem
-                key={code}
-                secondaryAction={
-                  canManageLocks && !notImported ? (
-                    control
+    <>
+      <Dialog open={open} onClose={onClose} maxWidth="sm" fullWidth>
+        <DialogTitle>Book locks</DialogTitle>
+        <DialogContent>
+          <Typography variant="body2" color="text.secondary" sx={{ mb: 1.5 }}>
+            A locked book cannot be edited and is frozen out of the nightly
+            Door43 export. Published books are locked automatically.
+          </Typography>
+          {error && (
+            <Alert severity="error" sx={{ mb: 1.5 }} onClose={() => setError(null)}>
+              {error}
+            </Alert>
+          )}
+          {!canManageLocks && (
+            <Alert severity="info" sx={{ mb: 1.5 }}>
+              {NOT_ADMIN_MESSAGE}
+            </Alert>
+          )}
+          <List dense sx={{ maxHeight: 420, overflowY: "auto" }}>
+            {BOOKS.map(({ code, name }) => {
+              const entry = byCode.get(code);
+              // GET /api/books only lists IMPORTED books (see bookImport.ts),
+              // so a book with no `entry` has never been imported. The server
+              // still enforces a lock on it if it's on the published list
+              // (bookLock.ts checks isPublishedBook regardless of import
+              // status), but that published-books list is server-side only —
+              // duplicating it here would risk drifting out of sync. Rather
+              // than guess "unlocked" (false — a published-but-unimported book
+              // would show an open padlock while the server 423s it) or guess
+              // "locked" (also potentially false, for an unpublished book),
+              // render "not imported" as its own state: honest about what we
+              // don't know, and the toggle is disabled so nobody can write a
+              // redundant explicit lock row on unverified information.
+              const notImported = !entry;
+              const locked = entry?.locked ?? false;
+              const disabled = notImported || !canManageLocks || pending === code;
+              const control = (
+                <IconButton
+                  edge="end"
+                  size="small"
+                  disabled={disabled}
+                  onClick={() => toggle(code, locked)}
+                  aria-label={locked ? `unlock ${name}` : `lock ${name}`}
+                >
+                  {notImported ? (
+                    <HelpOutlineIcon fontSize="small" />
+                  ) : locked ? (
+                    <LockIcon fontSize="small" />
                   ) : (
-                    <Tooltip title={tooltipTitle}>
-                      <span>{control}</span>
-                    </Tooltip>
-                  )
-                }
-              >
-                <ListItemText
-                  primary={
-                    <Box sx={{ display: "flex", alignItems: "center", gap: 1 }}>
-                      <Typography
-                        variant="body2"
-                        color={notImported ? "text.disabled" : "text.primary"}
-                      >
-                        {name}
-                      </Typography>
-                      {notImported ? (
-                        <Chip size="small" label="not imported" variant="outlined" />
-                      ) : (
-                        locked && (
-                          <Chip
-                            size="small"
-                            label={entry?.lockSource === "published" ? "published" : "locked"}
-                            color={entry?.lockSource === "published" ? "primary" : "default"}
-                            variant="outlined"
-                          />
-                        )
-                      )}
-                    </Box>
+                    <LockOpenIcon fontSize="small" />
+                  )}
+                </IconButton>
+              );
+              const tooltipTitle = notImported
+                ? "Not imported yet — lock state unknown here"
+                : NOT_ADMIN_MESSAGE;
+              return (
+                <ListItem
+                  key={code}
+                  secondaryAction={
+                    canManageLocks && !notImported ? (
+                      control
+                    ) : (
+                      <Tooltip title={tooltipTitle}>
+                        <span>{control}</span>
+                      </Tooltip>
+                    )
                   }
-                  secondary={notImported ? undefined : locked ? entry?.lockReason ?? undefined : undefined}
-                />
-              </ListItem>
-            );
-          })}
-        </List>
-      </DialogContent>
-      <DialogActions>
-        <Button onClick={onClose}>Close</Button>
-      </DialogActions>
-    </Dialog>
+                >
+                  <ListItemText
+                    primary={
+                      <Box sx={{ display: "flex", alignItems: "center", gap: 1 }}>
+                        <Typography
+                          variant="body2"
+                          color={notImported ? "text.disabled" : "text.primary"}
+                        >
+                          {name}
+                        </Typography>
+                        {notImported ? (
+                          <Chip size="small" label="not imported" variant="outlined" />
+                        ) : (
+                          locked && (
+                            <Chip
+                              size="small"
+                              label={entry?.lockSource === "published" ? "published" : "locked"}
+                              color={entry?.lockSource === "published" ? "primary" : "default"}
+                              variant="outlined"
+                            />
+                          )
+                        )}
+                      </Box>
+                    }
+                    secondary={notImported ? undefined : locked ? entry?.lockReason ?? undefined : undefined}
+                  />
+                </ListItem>
+              );
+            })}
+          </List>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={onClose}>Close</Button>
+        </DialogActions>
+      </Dialog>
+      <Dialog open={pushPrompt !== null} onClose={closePushPrompt} maxWidth="xs" fullWidth>
+        <DialogTitle>Push to Door43?</DialogTitle>
+        <DialogContent>
+          {pushState === "idle" && pushPrompt && (
+            <Typography variant="body2">
+              {bookName(pushPrompt)} is now locked. Push it to Door43 now
+              instead of waiting for the nightly export? This sends every
+              resource (ULT, UST, tN, tQ, tWL) and merges directly, bypassing
+              the lock just for this push.
+            </Typography>
+          )}
+          {pushState === "pushing" && <Typography variant="body2">Pushing…</Typography>}
+          {pushState === "done" && pushResult && (
+            <Stack spacing={0.5}>
+              {pushResult.pushed.map((p) =>
+                "instanceId" in p ? (
+                  <Typography key={p.resource} variant="body2">
+                    {p.resource.toUpperCase()}: queued
+                  </Typography>
+                ) : (
+                  <Typography key={p.resource} variant="body2" color="error">
+                    {p.resource.toUpperCase()}: {p.error}
+                  </Typography>
+                ),
+              )}
+            </Stack>
+          )}
+          {pushState === "error" && (
+            <Alert severity="error">
+              Couldn't push {bookName(pushPrompt ?? "")}: {pushError}
+            </Alert>
+          )}
+        </DialogContent>
+        <DialogActions>
+          {pushState === "idle" && (
+            <>
+              <Button onClick={closePushPrompt}>Not now</Button>
+              <Button onClick={doPushNow} variant="contained">
+                Push now
+              </Button>
+            </>
+          )}
+          {pushState !== "idle" && pushState !== "pushing" && (
+            <Button onClick={closePushPrompt}>Close</Button>
+          )}
+        </DialogActions>
+      </Dialog>
+    </>
   );
 }

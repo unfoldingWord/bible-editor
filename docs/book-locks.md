@@ -112,9 +112,20 @@ must never be mistaken for evidence.
 
 ## Pushing a deliberate fix to a locked book
 
-Two ways, both restricted to the three lock admins.
+Three ways, all restricted to the three lock admins.
 
-**Unlock, fix, re-lock** — the normal path. Use the Book locks panel in the app.
+**Unlock, fix, re-lock, push now** — the normal path. Use the Book locks panel
+in the app. Re-locking a book (going from unlocked to locked) offers a "Push
+to Door43 now?" prompt, so a fix made during the unlocked window doesn't sit
+in D1 until the next nightly export. Confirming calls
+`POST /api/books/:book/lock/push`, which fires one Workflow instance per
+resource (ult/ust/tn/tq/twl), each carrying `allowLocked: true` and
+`validateAndMerge: true` — see `books.post("/:book/lock/push", ...)` in
+`api/src/bookImport.ts`. This route is gated on `canManageLocks` (the
+`book_lock_admins` allowlist), not `requireAdmin`: Perry (`pjoakes`) is a lock
+admin but only an `editor` in `user_roles`, so he can't reach
+`POST /api/exports/run` (the admin panel's manual push) — the prompt has to
+use the narrower gate to work for him too.
 
 **One-off export override** — for pushing a fix without opening the app:
 
@@ -125,7 +136,9 @@ curl -X POST .../api/exports/run -d '{"book":"PSA","resource":"tn","allowLocked"
 `allowLocked` is honored **only** when the run resolves to exactly one book and
 one resource, so no cron path can ever carry it — the same doctrine as
 `allowShrink` (see `api/src/shrinkGuard.ts` for why the check is on the resolved
-counts and not the raw parameters). Using it writes an audit alert.
+counts and not the raw parameters). Using it writes an audit alert. This route
+requires `requireAdmin` (a `user_roles` admin), a stricter gate than the
+in-app prompt above.
 
 ## Data model
 
@@ -201,6 +214,13 @@ isLocked(book) = row exists ? row.locked === 1 : PUBLISHED_BOOKS.has(book)
 - `alignment_attention` and `export_reverts` rows for a locked book freeze at
   their last measured values. They are deliberately **not** cleared: an empty
   result would read as "measured and clean", which would be a false claim.
+- The "Push to Door43 now?" prompt (`POST /api/books/:book/lock/push`) only
+  confirms that each resource's Workflow instance was *created*, not that it
+  finished or actually pushed — a resource can still no-op (`no_rows`,
+  `unchanged`) or fail downstream (stale master, shrink guard, DCS error) the
+  same way a nightly export can. The dialog shows "queued" per resource, not
+  a final outcome; check the admin panel's sync-status / recent-runs view for
+  the real result.
 - `postExport.runPostExport` (dormant, `VALIDATORS = []`) has no per-book gate.
   Do not re-enable it without adding one.
 - The published-release drift detector (`published-drift-check`) rejects any

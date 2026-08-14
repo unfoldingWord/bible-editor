@@ -249,15 +249,13 @@ function ScriptureColumnInner({
   const activeRef = useRef<HTMLDivElement | null>(null);
   const bodyRef = useRef<HTMLDivElement | null>(null);
   const [findOpen, setFindOpen] = useState(false);
-  // A book lock is a hard freeze — a replace-all here would appear to work
-  // and then fail (423) for every match, since the server rejects the
-  // writes. Simplest fix: never let the overlay open on a locked book. Guard
-  // once here so both the toolbar button and the Ctrl+F shortcut below stay
-  // inert without duplicating the check.
+  // A book lock still lets translators search a locked book (to compare past
+  // work) — only replace is a hard freeze, since the writes would appear to
+  // work and then fail (423) for every match. FindReplaceOverlay itself
+  // disables its replace controls when `bookLocked` is set; find stays open.
   const openFind = useCallback(() => {
-    if (bookLocked) return;
     setFindOpen(true);
-  }, [bookLocked]);
+  }, []);
   const [findQuery, setFindQuery] = useState<FindQuery | null>(null);
   // Set only when the overlay reports a user-initiated scroll target; the
   // BookView's scroll effect (book mode) and the bodyRef scroll effect
@@ -459,7 +457,7 @@ function ScriptureColumnInner({
         <Tooltip
           title={
             bookLocked
-              ? "find / replace is unavailable while this book is locked"
+              ? "find is available on locked books; replace is disabled"
               : mode === "book"
                 ? "find / replace across loaded chapters (Ctrl+F)"
                 : "find / replace in this chapter (Ctrl+F)"
@@ -468,7 +466,6 @@ function ScriptureColumnInner({
           <span>
             <Button
               size="small"
-              disabled={bookLocked}
               variant={findOpen ? "contained" : "outlined"}
               startIcon={<SearchIcon fontSize="small" />}
               onClick={() => {
@@ -534,6 +531,7 @@ function ScriptureColumnInner({
               onScrollToNoteMatch={onScrollToNoteMatch}
               onNoteQueryChange={onNoteQueryChange}
               onActiveNoteMatchChange={onActiveNoteMatchChange}
+              bookLocked={bookLocked}
             />
           </Suspense>
         )}
