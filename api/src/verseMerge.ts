@@ -11,10 +11,23 @@
 // published to master. It is NOT kept alongside the verse row — it is
 // recovered from edit_log, as the newest kind='verse' payload for this verse
 // dated before book_resource_syncs.master_confirmed_at for this (book,
-// resource) — the watermark the export stamps only when it has POSITIVELY
-// measured that our rendered output matches what master holds, NOT merely
-// when we last pushed to a `-be-` branch (an unmerged branch push is routine
-// here and is not proof master moved) (see bookReimport.ts's applyVerseRows).
+// resource) — the watermark stamped only on a POSITIVE measurement that master
+// holds our rendered output, NOT merely when we last pushed to a `-be-` branch
+// (an unmerged branch push is routine here and is not proof master moved) (see
+// bookReimport.ts's applyVerseRows).
+//
+// AMOS CORRECTION (2026-08-14): for a long time there was only ONE such
+// measurement — the export's own commitToDcs pre-check (isMasterConfirmed),
+// which by construction can only fire on a night the export pushed NOTHING. So
+// every night the export ACTUALLY pushed a branch that later merged, master
+// moved and the watermark did not, and this module's step 6 then read our own
+// merged export as a foreign edit and let `adopt_conflict` overwrite the app
+// edits made since. AMO ch2 lost a translator's 2026-08-13 work that way.
+// A second measurement now closes it: the sync hashes master's bytes and
+// recognizes the render we recorded at push time (ownPublish.ts /
+// markOwnPublishConverged), which both advances the watermark and skips this
+// merge for that resource entirely. Nothing in this module's decision table
+// changed — it was correct given a correct ancestor; the ancestor was wrong.
 // edit_log has a 180-day
 // retention sweep (index.ts), so once a verse's pre-export history ages out
 // the ancestor becomes unrecoverable — keep_no_base must stay a first-class,
