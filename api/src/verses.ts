@@ -20,6 +20,7 @@ import {
 } from "./alignmentDelta.ts";
 import { buildVerseHistory, type VerseHistoryLogRow } from "./verseHistory.ts";
 import { lanesToReopenOnVerseEdit, reopenLaneChecks } from "./laneReopen.ts";
+import { RESOLVE_VERSE_MERGE_CONFLICT_SQL } from "./verseMergeConflictResolve.ts";
 
 // Verse content can carry malformed/missing `\w` occurrence data — colliding
 // `(text, occurrence)` pairs from a bad import or AI alignment (ULT/UST), or no
@@ -488,13 +489,7 @@ verses.patch("/:book/:chapter/:verse/:bibleVersion", requireEditor, async (c) =>
     // re-stamping (and reassigning resolved_by on) a conflict a previous save
     // already resolved.
     c.env.DB
-      .prepare(
-        `UPDATE verse_merge_conflicts
-            SET resolved_at = ?1, resolved_by = ?2
-          WHERE book = ?3 AND resource = ?4 AND chapter = ?5 AND verse = ?6
-            AND resolved_at IS NULL
-            AND changes() > 0`,
-      )
+      .prepare(RESOLVE_VERSE_MERGE_CONFLICT_SQL)
       .bind(now, userId, book, bibleVersion.toLowerCase(), chapter, verse),
   ]);
 

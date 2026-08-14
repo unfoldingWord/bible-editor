@@ -33,6 +33,34 @@ export function editLogKey(book: string, resource: string, ref: OverwrittenVerse
   return `${book}/${ref.chapter}/${ref.verse}/${resource.toUpperCase()}:${ref.overwrittenVersion}`;
 }
 
+// D1 caps prepared statements at 100 bind variables (see align.ts's
+// STRONG_CHUNK for the same limit hit by a different query). This query binds
+// `book` plus one key per overwritten verse, so callers MUST chunk `refs` to
+// at most this many before calling buildEditorLookupQuery — a "1CH-scale"
+// event (174 verses in one run, per this codebase's own history) would
+// otherwise silently exceed the limit and throw.
+export const EDITOR_LOOKUP_CHUNK = 90;
+
+// The exact SQL text for the editor-attribution JOIN, exported (not just used
+// inline in verseMergeConflicts.ts) so verseMergeConflicts.test.mjs can run
+// this literal query against real SQLite instead of hand-duplicating it — a
+// duplicated copy could silently drift from the production query while still
+// passing its own tests. Caller (verseMergeConflicts.ts's lookupEditorUsernames)
+// is responsible for chunking `refs` to at most EDITOR_LOOKUP_CHUNK first.
+export function buildEditorLookupQuery(
+  book: string,
+  resource: string,
+  refs: OverwrittenVerseRef[],
+): { sql: string; keys: string[] } {
+  const keys = refs.map((r) => editLogKey(book, resource, r));
+  const sql = `SELECT (el.row_key || ':' || el.new_version) AS key, u.dcs_username AS username
+     FROM edit_log el
+     JOIN users u ON u.id = el.user_id
+    WHERE el.kind = 'verse' AND el.book = ?1
+      AND (el.row_key || ':' || el.new_version) IN (${keys.map((_, i) => `?${i + 2}`).join(",")})`;
+  return { sql, keys };
+}
+
 // Given the verses that were overwritten this run and the (key -> username)
 // lookup already fetched from D1, produce one message per affected editor. A
 // verse whose edit_log row has no user_id (an AI-pipeline edit with no human

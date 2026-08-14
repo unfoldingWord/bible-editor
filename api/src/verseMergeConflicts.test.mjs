@@ -23,7 +23,13 @@
 // split as chapterLock.test.mjs.
 
 import { DatabaseSync } from "node:sqlite";
-import { editLogKey, groupOverwrittenVersesByEditor } from "./verseMergeEditorAlerts.ts";
+import {
+  buildEditorLookupQuery,
+  EDITOR_LOOKUP_CHUNK,
+  editLogKey,
+  groupOverwrittenVersesByEditor,
+} from "./verseMergeEditorAlerts.ts";
+import { RESOLVE_VERSE_MERGE_CONFLICT_SQL } from "./verseMergeConflictResolve.ts";
 
 let failed = 0;
 function assert(cond, msg) {
@@ -94,22 +100,15 @@ function assert(cond, msg) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// Part 2: the composite-key JOIN query, against real SQLite. The concatenated
-// `row_key || ':' || new_version` match is a tuple-IN() workaround — if it
-// were done as two separate `row_key IN (...)` / `new_version IN (...)`
-// clauses instead, a same-book verse at a DIFFERENT version would falsely
-// match. This proves the real query text doesn't regress to that.
+// Part 2: the ACTUAL production query (buildEditorLookupQuery, imported
+// above — not a hand-duplicated copy, so this can't silently drift from what
+// verseMergeConflicts.ts's lookupEditorUsernames really sends to D1), run
+// against real SQLite. The concatenated `row_key || ':' || new_version` match
+// is a tuple-IN() workaround — if it were done as two separate
+// `row_key IN (...)` / `new_version IN (...)` clauses instead, a same-verse
+// row at a DIFFERENT version would falsely match. This proves the real query
+// doesn't regress to that.
 // ─────────────────────────────────────────────────────────────────────────
-
-function editLogLookupQuery(keys) {
-  return (
-    `SELECT (el.row_key || ':' || el.new_version) AS key, u.dcs_username AS username
-       FROM edit_log el
-       JOIN users u ON u.id = el.user_id
-      WHERE el.kind = 'verse' AND el.book = ?1
-        AND (el.row_key || ':' || el.new_version) IN (${keys.map((_, i) => `?${i + 2}`).join(",")})`
-  );
-}
 
 function setupDb() {
   const d = new DatabaseSync(":memory:");
@@ -132,14 +131,19 @@ function setupDb() {
        ('verse', 'ZEC/1/2/ULT', 'ZEC', 2, 4, 'update')`,
   ).run();
 
-  const key = editLogKey("ZEC", "ult", { chapter: 1, verse: 2, overwrittenVersion: 3 });
-  const rows = d.prepare(editLogLookupQuery([key])).all("ZEC", key);
-  assert(rows.length === 1, "exact (verse, version) match returns exactly one row");
-  assert(rows[0].username === "bethoakes", "matches the author of v3, not the author of v4");
-
-  const key4 = editLogKey("ZEC", "ult", { chapter: 1, verse: 2, overwrittenVersion: 4 });
-  const rows4 = d.prepare(editLogLookupQuery([key4])).all("ZEC", key4);
-  assert(rows4.length === 1 && rows4[0].username === "pjoakes", "the other version resolves to the other author");
+  {
+    const ref = { chapter: 1, verse: 2, overwrittenVersion: 3 };
+    const { sql, keys } = buildEditorLookupQuery("ZEC", "ult", [ref]);
+    const rows = d.prepare(sql).all("ZEC", ...keys);
+    assert(rows.length === 1, "exact (verse, version) match returns exactly one row");
+    assert(rows[0].username === "bethoakes", "matches the author of v3, not the author of v4");
+  }
+  {
+    const ref4 = { chapter: 1, verse: 2, overwrittenVersion: 4 };
+    const { sql, keys } = buildEditorLookupQuery("ZEC", "ult", [ref4]);
+    const rows4 = d.prepare(sql).all("ZEC", ...keys);
+    assert(rows4.length === 1 && rows4[0].username === "pjoakes", "the other version resolves to the other author");
+  }
 }
 
 {
@@ -151,8 +155,9 @@ function setupDb() {
     `INSERT INTO edit_log (kind, row_key, book, user_id, new_version, action)
      VALUES ('verse', 'ZEC/1/3/ULT', 'ZEC', NULL, 1, 'create')`,
   ).run();
-  const key = editLogKey("ZEC", "ult", { chapter: 1, verse: 3, overwrittenVersion: 1 });
-  const rows = d.prepare(editLogLookupQuery([key])).all("ZEC", key);
+  const ref = { chapter: 1, verse: 3, overwrittenVersion: 1 };
+  const { sql, keys } = buildEditorLookupQuery("ZEC", "ult", [ref]);
+  const rows = d.prepare(sql).all("ZEC", ...keys);
   assert(rows.length === 0, "NULL user_id (no human author) -> no editor alert row, not a crash");
 }
 
@@ -170,17 +175,36 @@ function setupDb() {
     { chapter: 1, verse: 2, overwrittenVersion: 3 },
     { chapter: 2, verse: 5, overwrittenVersion: 6 },
   ];
-  const keys = refs.map((r) => editLogKey("ZEC", "ult", r));
-  const rows = d.prepare(editLogLookupQuery(keys)).all("ZEC", ...keys);
+  const { sql, keys } = buildEditorLookupQuery("ZEC", "ult", refs);
+  const rows = d.prepare(sql).all("ZEC", ...keys);
   const byKey = new Map(rows.map((r) => [r.key, r.username]));
   assert(byKey.get(keys[0]) === "bethoakes", "first verse -> its own author");
   assert(byKey.get(keys[1]) === "Grant_Ailie", "second verse -> its own author");
 }
 
+{
+  // The bind-parameter budget itself: D1 caps a prepared statement at 100
+  // bind vars, and this query binds `book` + one key per ref. At
+  // EDITOR_LOOKUP_CHUNK refs (90), total binds must stay comfortably under
+  // that cap — this is the guard that lookupEditorUsernames's chunking loop
+  // exists to enforce (a "1CH-scale" run has hit 174 verses in one night in
+  // this codebase's own history, well past the un-chunked limit).
+  const refs = Array.from({ length: EDITOR_LOOKUP_CHUNK }, (_, i) => ({
+    chapter: 1,
+    verse: i + 1,
+    overwrittenVersion: 1,
+  }));
+  const { keys } = buildEditorLookupQuery("ZEC", "ult", refs);
+  assert(keys.length === EDITOR_LOOKUP_CHUNK, "one key per ref");
+  assert(1 + keys.length <= 100, "book + one chunk of keys stays under D1's 100 bind-variable cap");
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // Part 3: verses.ts's PATCH route resolve-not-delete clause, against real
-// SQLite. Mirrors blankStubTrash.test.mjs's approach of running the actual
-// SQL text rather than asserting the string.
+// SQLite. Uses the ACTUAL production SQL text (RESOLVE_VERSE_MERGE_CONFLICT_SQL,
+// imported above from verseMergeConflictResolve.ts — the same pure-module
+// split blankStub.ts uses for blankStubTrash.test.mjs) so this can't silently
+// drift from what verses.ts really runs.
 // ─────────────────────────────────────────────────────────────────────────
 
 function verseDb() {
@@ -197,9 +221,13 @@ function verseDb() {
   return d;
 }
 
-// Runs the two statements exactly as verses.ts's PATCH batch does: the
-// verses UPDATE first (so changes() reflects it), then the resolve UPDATE
-// gated on `changes() > 0 AND resolved_at IS NULL`.
+// Runs the verses UPDATE first (so changes() reflects it), then the REAL
+// resolve-clause SQL gated on `changes() > 0 AND resolved_at IS NULL`. The
+// real batch has an edit_log INSERT in between (also gated on
+// `changes() > 0` from the verses UPDATE) that this omits — safe to omit
+// because that INSERT's own row count exactly mirrors the verses UPDATE's
+// (`SELECT ... WHERE changes() > 0`, 0-or-1 either way), so `changes()` as
+// seen by the resolve statement is identical whether or not the INSERT ran.
 function saveVerse(d, { book, resource, chapter, verse, matchVersion, userId, now }) {
   const verseRes = d
     .prepare(
@@ -208,13 +236,7 @@ function saveVerse(d, { book, resource, chapter, verse, matchVersion, userId, no
     )
     .run(now, userId, book, chapter, verse, resource.toUpperCase(), matchVersion);
   const resolveRes = d
-    .prepare(
-      `UPDATE verse_merge_conflicts
-          SET resolved_at = ?1, resolved_by = ?2
-        WHERE book = ?3 AND resource = ?4 AND chapter = ?5 AND verse = ?6
-          AND resolved_at IS NULL
-          AND changes() > 0`,
-    )
+    .prepare(RESOLVE_VERSE_MERGE_CONFLICT_SQL)
     .run(now, userId, book, resource, chapter, verse);
   return { verseChanged: verseRes.changes, conflictResolved: resolveRes.changes };
 }

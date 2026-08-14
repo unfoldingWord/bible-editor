@@ -40,7 +40,8 @@ import { Hono } from "hono";
 import type { Env } from "./index";
 import { requireAuth } from "./auth";
 import {
-  editLogKey,
+  buildEditorLookupQuery,
+  EDITOR_LOOKUP_CHUNK,
   groupOverwrittenVersesByEditor,
   type OverwrittenVerseRef,
 } from "./verseMergeEditorAlerts.ts";
@@ -234,11 +235,13 @@ interface StoredConflictRow {
 // the D1 orchestration around it.
 // ---------------------------------------------------------------------------
 
-// D1 orchestration: ONE JOIN query for the whole run's overwrites (never
-// N+1, regardless of how many verses or editors are involved), returning a
-// (key -> username) map for the pure grouping above. Best-effort: a failure
-// here must not affect the admin alert or the caller's control flow (mirrors
-// every other read in this file).
+// D1 orchestration: one JOIN query PER CHUNK of the run's overwrites — never
+// N+1 per verse, but chunked at EDITOR_LOOKUP_CHUNK because D1 caps a
+// prepared statement at 100 bind variables and this query binds `book` plus
+// one key per verse. A "1CH-scale" run (this codebase's own history has one
+// at 174 verses) would otherwise throw on the very run this fix exists for.
+// Best-effort per chunk: a failure here must not affect the admin alert or
+// the caller's control flow (mirrors every other read in this file).
 async function lookupEditorUsernames(
   env: Env,
   book: string,
@@ -246,25 +249,21 @@ async function lookupEditorUsernames(
   overwritten: OverwrittenVerseRef[],
 ): Promise<Map<string, string>> {
   const usernameByKey = new Map<string, string>();
-  if (overwritten.length === 0) return usernameByKey;
-  const keys = overwritten.map((r) => editLogKey(book, resource, r));
-  try {
-    const rs = await env.DB.prepare(
-      `SELECT (el.row_key || ':' || el.new_version) AS key, u.dcs_username AS username
-         FROM edit_log el
-         JOIN users u ON u.id = el.user_id
-        WHERE el.kind = 'verse' AND el.book = ?1
-          AND (el.row_key || ':' || el.new_version) IN (${keys.map((_, i) => `?${i + 2}`).join(",")})`,
-    )
-      .bind(book, ...keys)
-      .all<{ key: string; username: string }>();
-    for (const r of rs.results ?? []) usernameByKey.set(r.key, r.username);
-  } catch (e) {
-    console.error("verseMergeConflicts: editor lookup failed", {
-      book,
-      resource,
-      error: e instanceof Error ? e.message : String(e),
-    });
+  for (let i = 0; i < overwritten.length; i += EDITOR_LOOKUP_CHUNK) {
+    const chunk = overwritten.slice(i, i + EDITOR_LOOKUP_CHUNK);
+    const { sql, keys } = buildEditorLookupQuery(book, resource, chunk);
+    try {
+      const rs = await env.DB.prepare(sql)
+        .bind(book, ...keys)
+        .all<{ key: string; username: string }>();
+      for (const r of rs.results ?? []) usernameByKey.set(r.key, r.username);
+    } catch (e) {
+      console.error("verseMergeConflicts: editor lookup failed", {
+        book,
+        resource,
+        error: e instanceof Error ? e.message : String(e),
+      });
+    }
   }
   return usernameByKey;
 }
