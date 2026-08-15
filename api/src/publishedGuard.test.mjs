@@ -26,13 +26,13 @@ function assert(cond, msg) {
 }
 
 // --- PUBLISHED_BOOKS composition ---
-const UNPUBLISHED = ["NUM", "1CH", "2CH", "ECC", "ISA", "JER", "EZK", "DAN", "HOS", "AMO", "MIC", "ZEC"];
+const UNPUBLISHED = ["NUM", "1CH", "2CH", "ECC", "ISA", "JER", "EZK", "DAN", "AMO", "ZEC"];
 
-assert(PUBLISHED_BOOKS.size === 54, `PUBLISHED_BOOKS has 54 books (got ${PUBLISHED_BOOKS.size})`);
+assert(PUBLISHED_BOOKS.size === 56, `PUBLISHED_BOOKS has 56 books (got ${PUBLISHED_BOOKS.size})`);
 for (const book of UNPUBLISHED) {
   assert(!PUBLISHED_BOOKS.has(book), `${book} is absent from PUBLISHED_BOOKS (unpublished)`);
 }
-assert(PUBLISHED_BOOKS.size + UNPUBLISHED.length === 66, "54 published + 12 unpublished === 66");
+assert(PUBLISHED_BOOKS.size + UNPUBLISHED.length === 66, "56 published + 10 unpublished === 66");
 
 // --- isPublishedBook ---
 assert(isPublishedBook("gen"), "isPublishedBook is case-insensitive (lowercase)");
@@ -186,7 +186,7 @@ assert(
     drift.noLongerPublished.length === 1 && drift.noLongerPublished[0] === "EXO",
     "reports the no-longer-published book",
   );
-  assert(drift.message.includes("v89"), "message names the release tag");
+  assert(drift.message.includes("v90"), "message names the release tag");
   assert(drift.message.includes("ISA") && drift.message.includes("EXO"), "message names the differing books");
 }
 
