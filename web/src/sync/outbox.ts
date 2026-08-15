@@ -478,7 +478,9 @@ export const outbox = {
     void drain();
   },
 
-  async drop(opId: string) {
+  // onlyIfStatus excludes "in_flight": the unconditional in_flight guard below
+  // returns first, so that value could never match — don't promise it.
+  async drop(opId: string, opts?: { onlyIfStatus?: Exclude<OpStatus, "in_flight"> }) {
     // Guard against dropping an op the drain just flipped to in_flight (same
     // race the drain itself guards at the listAll → fresh re-read). A request
     // is already on the wire; deleting the record here would race the 200
@@ -491,6 +493,19 @@ export const outbox = {
     const op = (await tx.store.get(opId)) as OutboxOp | undefined;
     if (op && op.status === "in_flight") {
       await tx.done;
+      return;
+    }
+    // A caller acting on a snapshot (the unresolvable-conflict dialog) may be
+    // stale: another tab can re-arm a conflict to pending between snapshot and
+    // click, and deleting it then destroys an edit that's about to save.
+    // onlyIfStatus makes the check-and-delete atomic inside this tx.
+    if (op && opts?.onlyIfStatus && op.status !== opts.onlyIfStatus) {
+      await tx.done;
+      // The mismatch means this tab just observed state it may not know about
+      // (cross-tab writes never reach this tab's notify) — broadcast so the
+      // UI catches up, and drain in case the op is now pending.
+      void notify();
+      void drain();
       return;
     }
     await tx.store.delete(opId);
