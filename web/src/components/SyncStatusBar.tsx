@@ -104,6 +104,9 @@ export function SyncStatusBar({ onNavigate }: Props = {}) {
   const liveDropOp = confirmDropOp && failed.some((f) => f.id === confirmDropOp.id)
     ? confirmDropOp
     : null;
+  useEffect(() => {
+    if (confirmDropOp && !liveDropOp) setConfirmDropOp(null);
+  }, [confirmDropOp, liveDropOp]);
 
   // Conflicts whose 409 body carried no current row/version: resolve can't
   // re-arm them, and dropping deletes the edit — same one-misclick data-loss
