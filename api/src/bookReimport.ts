@@ -3240,11 +3240,18 @@ async function markOwnPublishConverged(
       `UPDATE book_resource_syncs
           SET master_confirmed_at = MAX(COALESCE(master_confirmed_at, 0), ?3),
               -- P1.3: shadow master_confirmed_at with the precise id boundary of
-              -- the SAME recognized render. Non-null guard so a null never
-              -- coerces this to a bogus 0 (which would starve the ancestor to
-              -- id<=0 instead of leaving the timestamp fallback in place).
+              -- the SAME recognized render — but ONLY when this render is the
+              -- newest (?3 >= the stored master_confirmed_at). Without that gate a
+              -- delayed OLDER recognition arriving while master_confirmed_edit_id
+              -- is still NULL (warm-up) would advance the id to the old render's
+              -- boundary while the timestamp keeps the newer render's value, so the
+              -- two would describe DIFFERENT renders and reconstruction (which
+              -- prefers the id) would fold too old an ancestor. The non-null guard
+              -- also stops a null from coercing this to a bogus 0.
               master_confirmed_edit_id =
-                CASE WHEN ?5 IS NOT NULL THEN MAX(COALESCE(master_confirmed_edit_id, 0), ?5) ELSE master_confirmed_edit_id END,
+                CASE WHEN ?5 IS NOT NULL AND ?3 >= COALESCE(master_confirmed_at, 0)
+                     THEN MAX(COALESCE(master_confirmed_edit_id, 0), ?5)
+                     ELSE master_confirmed_edit_id END,
               source_sha = COALESCE(?4, source_sha),
               synced_at = unixepoch(),
               -- Claim authorship of the watermark only when this call actually

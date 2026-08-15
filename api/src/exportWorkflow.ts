@@ -2013,12 +2013,23 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
                   CASE WHEN pushed_read_at IS NULL OR pushed_read_at <= ?4 THEN ?6 ELSE pushed_edit_id END,
                 master_confirmed_at =
                   CASE WHEN ?5 = 1 THEN MAX(COALESCE(master_confirmed_at, 0), ?4) ELSE master_confirmed_at END,
-                -- Shadow master_confirmed_at on the same confirmMaster gate, with
-                -- an extra non-null guard so an empty edit_log (?6 NULL) never
-                -- coerces this to a bogus 0 boundary (which would starve the
-                -- ancestor to id<=0 instead of falling back to the timestamp).
+                -- Shadow master_confirmed_at, but ONLY when this render is the
+                -- newest confirmed one (?4 >= the stored master_confirmed_at).
+                -- Without that gate the two columns are MAX'd independently, and a
+                -- delayed OLDER render arriving while master_confirmed_edit_id is
+                -- still NULL (warm-up) would advance the id to the old render's
+                -- boundary (MAX(0, old) = old) while the timestamp stays at the
+                -- newer render (MAX keeps it) — the two would then describe
+                -- DIFFERENT renders and reconstruction (which prefers the id) would
+                -- fold too old an ancestor, reintroducing the false-conflict this
+                -- migration removes. The non-null guard additionally stops an empty
+                -- edit_log (?6 NULL) from coercing this to a bogus 0. When the gate
+                -- passes, ?6 >= the stored id (readAt and MAX(id) move together per
+                -- build), so MAX here equals a direct assign but also can't regress.
                 master_confirmed_edit_id =
-                  CASE WHEN ?5 = 1 AND ?6 IS NOT NULL THEN MAX(COALESCE(master_confirmed_edit_id, 0), ?6) ELSE master_confirmed_edit_id END
+                  CASE WHEN ?5 = 1 AND ?6 IS NOT NULL AND ?4 >= COALESCE(master_confirmed_at, 0)
+                       THEN MAX(COALESCE(master_confirmed_edit_id, 0), ?6)
+                       ELSE master_confirmed_edit_id END
           WHERE book = ?1 AND resource = ?2`,
       )
         .bind(book, resource, blobSha, readAt, confirmMaster ? 1 : 0, editBoundary)
