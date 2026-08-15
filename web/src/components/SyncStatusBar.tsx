@@ -41,6 +41,13 @@ function formatTarget(t: OpTarget): string {
   return `${t.bibleVersion} ${t.book} ${t.chapter}:${t.verse}`;
 }
 
+// Label for the unresolvable-conflict dialog and its clipboard copy — one
+// definition so what the user reads on screen always matches what they paste.
+// A delete op carries no content (patch is {}), so say what the intent was.
+function formatOpLabel(op: OutboxOp): string {
+  return `${formatTarget(op.target)}${op.action === "delete" ? " (delete)" : ""}`;
+}
+
 function formatDraftMeta(m: DraftMeta): string {
   if (m.kind === "verse") return `${m.bibleVersion} ${m.book} ${m.chapter}:${m.verse}`;
   return `${m.rowKind.toUpperCase()} ${m.book} ${m.chapter}:${m.verse}`;
@@ -91,14 +98,23 @@ export function SyncStatusBar({ onNavigate }: Props = {}) {
   // Conflicts whose 409 body carried no current row/version: resolve can't
   // re-arm them, and dropping deletes the edit — same one-misclick data-loss
   // stakes as "discard all", so they get the same confirm gate. Snapshot of
-  // the ops at resolve-click time; discard by id is safe if one has since
-  // resolved elsewhere.
+  // the ops at resolve-click time.
   const [unresolvableOps, setUnresolvableOps] = useState<OutboxOp[]>([]);
   const [copiedUnresolvable, setCopiedUnresolvable] = useState(false);
   const closeUnresolvable = () => {
     setUnresolvableOps([]);
     setCopiedUnresolvable(false);
   };
+
+  // Live view of that snapshot: an op that has since left conflict status in
+  // this tab (a same-target resolve re-armed it, or it was dropped elsewhere)
+  // falls out of the dialog's count/list/copy/discard, so the user only ever
+  // confirms what will actually be deleted. Cross-tab changes never reach
+  // this tab's subscription — outbox.drop's onlyIfStatus guard is the
+  // backstop there.
+  const conflictIds = new Set(conflicts.map((c) => c.id));
+  const liveUnresolvable = unresolvableOps.filter((op) => conflictIds.has(op.id));
+  const oneUnresolvable = liveUnresolvable.length === 1;
 
   // Anchor for the "N unsaved" jump menu (only used when onNavigate is wired).
   const [draftMenuEl, setDraftMenuEl] = useState<null | HTMLElement>(null);
@@ -135,23 +151,26 @@ export function SyncStatusBar({ onNavigate }: Props = {}) {
     // surface the dialog BEFORE any awaits: if a resolveConflict below throws,
     // the unresolvable ops must still get their dialog rather than vanish
     // until the next click.
-    const unresolvable = conflicts.filter((op) => !isFreshRow(op.conflictCurrent));
-    if (unresolvable.length > 0) setUnresolvableOps(unresolvable);
+    const unresolvable: OutboxOp[] = [];
+    const fresh: Array<{ id: string; version: number }> = [];
     for (const op of conflicts) {
       if (isFreshRow(op.conflictCurrent)) {
-        await outbox.resolveConflict(op.id, op.conflictCurrent.version);
+        fresh.push({ id: op.id, version: op.conflictCurrent.version });
+      } else {
+        unresolvable.push(op);
       }
+    }
+    // Set unconditionally — an empty result must also clear any stale
+    // snapshot left from an earlier click.
+    setUnresolvableOps(unresolvable);
+    for (const f of fresh) {
+      await outbox.resolveConflict(f.id, f.version);
     }
   };
 
   const copyUnresolvable = async () => {
-    // A delete op carries no content (patch is {}) — mark it so the copied
-    // record says what the discarded intent was.
-    const text = unresolvableOps
-      .map(
-        (op) =>
-          `${formatTarget(op.target)}${op.action === "delete" ? " (delete)" : ""}\n${JSON.stringify(op.patch, null, 2)}`,
-      )
+    const text = liveUnresolvable
+      .map((op) => `${formatOpLabel(op)}\n${JSON.stringify(op.patch, null, 2)}`)
       .join("\n\n");
     // This is the user's last copy of the edit — never flip to "copied" unless
     // the write actually landed. Clipboard API needs a focused document; fall
@@ -178,11 +197,11 @@ export function SyncStatusBar({ onNavigate }: Props = {}) {
   };
 
   const discardUnresolvable = async () => {
-    // onlyIfStatus: another tab may have re-armed one of these snapshotted
-    // ops to pending (about to save) since the dialog opened — a plain drop
-    // would delete that live edit. Only ops still in conflict are dropped;
-    // anything else stays queued and remains visible via the normal chips.
-    for (const op of unresolvableOps) {
+    // onlyIfStatus: another tab may have re-armed one of these ops to pending
+    // (about to save) since the dialog opened — a plain drop would delete
+    // that live edit. Only ops still in conflict are dropped; anything else
+    // stays queued and remains visible via the normal chips.
+    for (const op of liveUnresolvable) {
       await outbox.drop(op.id, { onlyIfStatus: "conflict" });
     }
     closeUnresolvable();
@@ -491,6 +510,10 @@ export function SyncStatusBar({ onNavigate }: Props = {}) {
         // auto-revival) — nothing left to discard.
         open={confirmDiscardAll && failed.length > 0}
         onClose={() => setConfirmDiscardAll(false)}
+        // Same layering problem as the unresolvable dialog below: the floating
+        // panel (zIndex.snackbar) stays mounted while this is open and would
+        // otherwise sit above the modal layer.
+        sx={{ zIndex: (t) => t.zIndex.snackbar + 1 }}
       >
         <DialogTitle>
           Discard {failed.length} failed edit{failed.length === 1 ? "" : "s"}?
@@ -516,11 +539,10 @@ export function SyncStatusBar({ onNavigate }: Props = {}) {
         </DialogActions>
       </Dialog>
       <Dialog
-        // Auto-closes if every snapshotted op has left conflict status (this
-        // tab resolved or dropped them) — mirrors the discard-all dialog
-        // above. Cross-tab changes don't reach this tab's subscription, so
-        // discardUnresolvable's onlyIfStatus guard is the real safety net.
-        open={unresolvableOps.some((snap) => conflicts.some((c) => c.id === snap.id))}
+        // liveUnresolvable already filters the snapshot against current
+        // conflicts, so this auto-closes when every op has left conflict
+        // status in this tab — mirrors the discard-all dialog above.
+        open={liveUnresolvable.length > 0}
         onClose={closeUnresolvable}
         // The floating action panel sits at zIndex.snackbar and stays mounted
         // while this dialog is open (its ops are still conflicts) — lift the
@@ -528,25 +550,21 @@ export function SyncStatusBar({ onNavigate }: Props = {}) {
         sx={{ zIndex: (t) => t.zIndex.snackbar + 1 }}
       >
         <DialogTitle>
-          Discard {unresolvableOps.length} unresolvable conflict
-          {unresolvableOps.length === 1 ? "" : "s"}?
+          Discard {liveUnresolvable.length} unresolvable conflict
+          {oneUnresolvable ? "" : "s"}?
         </DialogTitle>
         <DialogContent>
           <DialogContentText>
-            {(() => {
-              const one = unresolvableOps.length === 1;
-              return `The server did not send back its current version for ${one ? "this edit" : "these edits"}, so ${one ? "it" : "they"} cannot be retried automatically. Discarding deletes ${one ? "it" : "them"} from this device permanently — copy ${one ? "it" : "them"} first if you want to keep the text.`;
-            })()}
+            {`The server did not send back its current version for ${oneUnresolvable ? "this edit" : "these edits"}, so ${oneUnresolvable ? "it" : "they"} cannot be retried automatically. Discarding deletes ${oneUnresolvable ? "it" : "them"} from this device permanently — copy ${oneUnresolvable ? "it" : "them"} first if you want to keep the text.`}
           </DialogContentText>
           <Stack spacing={0.25} sx={{ mt: 1 }}>
-            {unresolvableOps.map((op) => (
+            {liveUnresolvable.map((op) => (
               <Typography
                 key={op.id}
                 variant="caption"
                 sx={{ fontFamily: "monospace", display: "block" }}
               >
-                {formatTarget(op.target)}
-                {op.action === "delete" ? " (delete)" : ""}
+                {formatOpLabel(op)}
               </Typography>
             ))}
           </Stack>
