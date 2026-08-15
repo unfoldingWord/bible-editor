@@ -234,11 +234,22 @@ for (const bk of books) {
           const g = state.groups.find((sg) => sg.id === gid);
           if (!g) continue;
           for (const s of g.source) {
-            if (flagged.has(s.id)) flaggedPositions.add(resolveSourcePos(s, indexMap));
+            if (!flagged.has(s.id)) continue;
+            const pos = resolveSourcePos(s, indexMap);
+            // -1 means unresolved (reusedSourceIdsOf can flag a word whose
+            // claimed occurrence doesn't exist in the source verse — see
+            // reusedTokenKey). An unresolved position can't be reliably
+            // compared against another word's unresolved position (both
+            // collapse to -1, a false match), so skip it here rather than
+            // risk a false "rendered" the way groupPositionKey's null guard
+            // does for the same reason.
+            if (pos >= 0) flaggedPositions.add(pos);
           }
         }
         if (flaggedPositions.size === 0) continue;
-        const renderedPositions = new Set(d.source.map((s) => resolveSourcePos(s, indexMap)));
+        const renderedPositions = new Set(
+          d.source.map((s) => resolveSourcePos(s, indexMap)).filter((p) => p >= 0),
+        );
         for (const p of flaggedPositions) {
           if (!renderedPositions.has(p)) {
             cardTokenUnrendered = true;
