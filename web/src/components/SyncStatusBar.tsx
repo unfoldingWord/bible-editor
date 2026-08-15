@@ -126,26 +126,32 @@ export function SyncStatusBar({ onNavigate }: Props = {}) {
   const effectivelyOffline = !online || staleProgress;
 
   const resolveAllConflicts = async () => {
-    const unresolvable: OutboxOp[] = [];
+    // The 409 response includes the server's current row in op.conflictCurrent —
+    // re-queue against its version so the next dispatch sails through. The
+    // user's local patch overwrites the upstream change (last-edit-wins).
+    // If the server didn't return a current row we can't re-arm, and dropping
+    // deletes the user's edit — never do that silently; route it through the
+    // confirm dialog below (with copy-to-clipboard) instead. Partition and
+    // surface the dialog BEFORE any awaits: if a resolveConflict below throws,
+    // the unresolvable ops must still get their dialog rather than vanish
+    // until the next click.
+    const unresolvable = conflicts.filter((op) => !isFreshRow(op.conflictCurrent));
+    if (unresolvable.length > 0) setUnresolvableOps(unresolvable);
     for (const op of conflicts) {
-      // The 409 response includes the server's current row in op.conflictCurrent —
-      // re-queue against its version so the next dispatch sails through. The
-      // user's local patch overwrites the upstream change (last-edit-wins).
-      // If the server didn't return a current row we can't re-arm, and dropping
-      // deletes the user's edit — never do that silently; route it through the
-      // confirm dialog below (with copy-to-clipboard) instead.
       if (isFreshRow(op.conflictCurrent)) {
         await outbox.resolveConflict(op.id, op.conflictCurrent.version);
-      } else {
-        unresolvable.push(op);
       }
     }
-    if (unresolvable.length > 0) setUnresolvableOps(unresolvable);
   };
 
   const copyUnresolvable = async () => {
+    // A delete op carries no content (patch is {}) — mark it so the copied
+    // record says what the discarded intent was.
     const text = unresolvableOps
-      .map((op) => `${formatTarget(op.target)}\n${JSON.stringify(op.patch, null, 2)}`)
+      .map(
+        (op) =>
+          `${formatTarget(op.target)}${op.action === "delete" ? " (delete)" : ""}\n${JSON.stringify(op.patch, null, 2)}`,
+      )
       .join("\n\n");
     // This is the user's last copy of the edit — never flip to "copied" unless
     // the write actually landed. Clipboard API needs a focused document; fall
@@ -154,20 +160,31 @@ export function SyncStatusBar({ onNavigate }: Props = {}) {
       await navigator.clipboard.writeText(text);
       setCopiedUnresolvable(true);
     } catch {
-      const ta = document.createElement("textarea");
-      ta.value = text;
-      ta.style.position = "fixed";
-      ta.style.opacity = "0";
-      document.body.appendChild(ta);
-      ta.select();
-      const ok = document.execCommand("copy");
-      ta.remove();
-      if (ok) setCopiedUnresolvable(true);
+      try {
+        const ta = document.createElement("textarea");
+        ta.value = text;
+        ta.style.position = "fixed";
+        ta.style.opacity = "0";
+        document.body.appendChild(ta);
+        ta.select();
+        const ok = document.execCommand("copy");
+        ta.remove();
+        if (ok) setCopiedUnresolvable(true);
+      } catch {
+        /* both copy paths failed — keep the label "copy edits" rather than
+           claim a copy that never landed */
+      }
     }
   };
 
   const discardUnresolvable = async () => {
-    for (const op of unresolvableOps) await outbox.drop(op.id);
+    // onlyIfStatus: another tab may have re-armed one of these snapshotted
+    // ops to pending (about to save) since the dialog opened — a plain drop
+    // would delete that live edit. Only ops still in conflict are dropped;
+    // anything else stays queued and remains visible via the normal chips.
+    for (const op of unresolvableOps) {
+      await outbox.drop(op.id, { onlyIfStatus: "conflict" });
+    }
     closeUnresolvable();
   };
 
@@ -498,16 +515,28 @@ export function SyncStatusBar({ onNavigate }: Props = {}) {
           </Button>
         </DialogActions>
       </Dialog>
-      <Dialog open={unresolvableOps.length > 0} onClose={closeUnresolvable}>
+      <Dialog
+        // Auto-closes if every snapshotted op has left conflict status (this
+        // tab resolved or dropped them) — mirrors the discard-all dialog
+        // above. Cross-tab changes don't reach this tab's subscription, so
+        // discardUnresolvable's onlyIfStatus guard is the real safety net.
+        open={unresolvableOps.some((snap) => conflicts.some((c) => c.id === snap.id))}
+        onClose={closeUnresolvable}
+        // The floating action panel sits at zIndex.snackbar and stays mounted
+        // while this dialog is open (its ops are still conflicts) — lift the
+        // dialog above it so the panel can't cover the buttons.
+        sx={{ zIndex: (t) => t.zIndex.snackbar + 1 }}
+      >
         <DialogTitle>
           Discard {unresolvableOps.length} unresolvable conflict
           {unresolvableOps.length === 1 ? "" : "s"}?
         </DialogTitle>
         <DialogContent>
           <DialogContentText>
-            {unresolvableOps.length === 1
-              ? "The server did not send back its current version for this edit, so it cannot be retried automatically. Discarding deletes it from this device permanently — copy it first if you want to keep the text."
-              : "The server did not send back its current version for these edits, so they cannot be retried automatically. Discarding deletes them from this device permanently — copy them first if you want to keep the text."}
+            {(() => {
+              const one = unresolvableOps.length === 1;
+              return `The server did not send back its current version for ${one ? "this edit" : "these edits"}, so ${one ? "it" : "they"} cannot be retried automatically. Discarding deletes ${one ? "it" : "them"} from this device permanently — copy ${one ? "it" : "them"} first if you want to keep the text.`;
+            })()}
           </DialogContentText>
           <Stack spacing={0.25} sx={{ mt: 1 }}>
             {unresolvableOps.map((op) => (
@@ -517,6 +546,7 @@ export function SyncStatusBar({ onNavigate }: Props = {}) {
                 sx={{ fontFamily: "monospace", display: "block" }}
               >
                 {formatTarget(op.target)}
+                {op.action === "delete" ? " (delete)" : ""}
               </Typography>
             ))}
           </Stack>

@@ -478,7 +478,7 @@ export const outbox = {
     void drain();
   },
 
-  async drop(opId: string) {
+  async drop(opId: string, opts?: { onlyIfStatus?: OpStatus }) {
     // Guard against dropping an op the drain just flipped to in_flight (same
     // race the drain itself guards at the listAll → fresh re-read). A request
     // is already on the wire; deleting the record here would race the 200
@@ -490,6 +490,14 @@ export const outbox = {
     const tx = idb.transaction(STORE, "readwrite");
     const op = (await tx.store.get(opId)) as OutboxOp | undefined;
     if (op && op.status === "in_flight") {
+      await tx.done;
+      return;
+    }
+    // A caller acting on a snapshot (the unresolvable-conflict dialog) may be
+    // stale: another tab can re-arm a conflict to pending between snapshot and
+    // click, and deleting it then destroys an edit that's about to save.
+    // onlyIfStatus makes the check-and-delete atomic inside this tx.
+    if (op && opts?.onlyIfStatus && op.status !== opts.onlyIfStatus) {
       await tx.done;
       return;
     }
