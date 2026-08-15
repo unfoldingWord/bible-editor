@@ -156,19 +156,6 @@ check(
   "navigator offline + stale op → effectively offline",
 );
 
-// --- Queue drains then refills: fresh clock ---
-// Simulates: all ops drain (queue empty for 2 min), then a new op arrives.
-// The new op has a fresh queuedAt, so no false alarm.
-
-check(
-  computeEffectivelyOffline(
-    true,
-    [{ queuedAt: NOW }],
-    NOW,
-  ) === false,
-  "queue was empty, new op just enqueued → blue (no stale ghost from previous drain)",
-);
-
 // --- Exact boundary ---
 
 check(

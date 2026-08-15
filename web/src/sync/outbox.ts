@@ -457,12 +457,15 @@ export const outbox = {
       return;
     }
     const key = targetKey(op.target);
+    const resolvedAt = Date.now();
     const all = (await tx.store.getAll()) as OutboxOp[];
     for (const o of all) {
       if (targetKey(o.target) !== key) continue;
       if (o.status === "conflict" || o.status === "pending") {
         o.expectedVersion = newExpectedVersion;
         o.status = "pending";
+        o.queuedAt = resolvedAt;
+        o.seq = nextSeq();
         o.conflictCurrent = undefined;
         await tx.store.put(o);
       }
@@ -514,6 +517,8 @@ export const outbox = {
     op.attempts = 0;
     op.hardAttempts = 0;
     op.lastError = undefined;
+    op.queuedAt = Date.now();
+    op.seq = nextSeq();
     await tx.store.put(op);
     await tx.done;
     void notify();
