@@ -862,6 +862,12 @@ export interface ReimportCounts {
   // insensitive comparison treats as "no change" (and every nightly export
   // then reverts). Optional, diagnostic — see bookReimport.ts's field doc.
   merge_cosmetic_ignored?: number;
+  // Door43 master held EXACTLY the file our last export pushed, so master moved
+  // because our own `-be-` branch merged, not because anyone edited master — and
+  // the merge ancestor was corrected accordingly. Before this was recognized,
+  // that situation is what made the sync overwrite app edits (see
+  // api/src/ownPublish.ts). Optional, diagnostic.
+  own_publish_converged?: number;
   dcs_404: number;
   errors: string[];
 }

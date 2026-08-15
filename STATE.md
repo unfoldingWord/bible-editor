@@ -55,6 +55,15 @@
   nine tn rows with a quote and no Occurrence the other eight have Hebrew quotes that `origLangOccurrence`
   already renders as 1. The create/patch paths can no longer mint such rows (PR #403), but that fix is
   insert-time only and does not remediate these two.
+- **15 prod VERSE rows carry straight quotes that reached master** — JER 32/33 and NUM 26:53, ULT and UST,
+  written by the AI pipeline in June-July 2026 (root-caused via prod forensics 2026-08-14: `pipelineImport.ts`
+  had no quote normalization on the verse-ingest path, unlike the client keystroke interceptor
+  (`web/src/lib/curlyQuotes.ts`) and the tn/tq TSV export (`tsvFormat.ts` `educateQuotes`)). The gap is closed
+  going forward (`curlifyVerseObjects` in `importParsers.ts`, wired into `applyVerseUpdate`), but the fix is
+  insert-time only, same shape as the Occurrence rows above — these 15 already-written rows still need a
+  one-time repair (re-run `curlifyVerseObjects` over them + bump version + `edit_log` row, the prod
+  verse-data-repair pattern) before the next export re-ships the straight quotes to Door43. Not yet located
+  by book+chapter+verse+bible_version — that inventory is the first step of the repair.
 
 ## Lessons learned (write durable, cross-session facts here — not in chat)
 

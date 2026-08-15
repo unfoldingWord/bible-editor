@@ -20,8 +20,9 @@ import {
   TextField,
   Typography,
 } from "@mui/material";
-import { ApiError, api, type ReimportResource, type ReimportResponse } from "../sync/api";
+import { ApiError, api, type ReimportResource } from "../sync/api";
 import { parseChapterRange } from "../lib/refParser";
+import { summarizeReimport } from "../lib/reimportSummary";
 
 interface Props {
   open: boolean;
@@ -75,23 +76,6 @@ function saveOpts(opts: ResourceState) {
   }
 }
 
-function summarize(res: ReimportResponse): string {
-  const t = res.totals;
-  const parts: string[] = [];
-  if (t.updated) parts.push(`${t.updated} updated`);
-  if (t.reimported_ai) parts.push(`${t.reimported_ai} refreshed (AI-generated)`);
-  if (t.inserted) parts.push(`${t.inserted} inserted`);
-  if (t.skipped_edited) parts.push(`${t.skipped_edited} skipped (already edited)`);
-  if (t.skipped_locked) parts.push(`${t.skipped_locked} skipped (AI pipeline running)`);
-  if (t.skipped_noop) parts.push(`${t.skipped_noop} unchanged`);
-  if (t.source_attr_reconciled) parts.push(`${t.source_attr_reconciled} source-attr fix(es) synced from master`);
-  if (t.merge_adopted) parts.push(`${t.merge_adopted} adopted from master (out-of-band correction)`);
-  if (t.merge_conflicts) parts.push(`${t.merge_conflicts} flagged for review (merge conflict)`);
-  if (t.dcs_404) parts.push(`${t.dcs_404} resource(s) not on DCS`);
-  if (parts.length === 0) return `Imported ${res.book} — no changes.`;
-  return `Imported ${res.book}: ${parts.join(", ")}.`;
-}
-
 export function ImportFromDoor43Dialog({
   open,
   onClose,
@@ -135,7 +119,7 @@ export function ImportFromDoor43Dialog({
     try {
       const res = await api.reimportFromDoor43(refParsed.range.book, { chapters, resources });
       saveOpts(opts);
-      onMessage?.(summarize(res));
+      onMessage?.(summarizeReimport(res));
       onImported?.();
       onClose();
     } catch (e) {
