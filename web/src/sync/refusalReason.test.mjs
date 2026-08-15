@@ -11,6 +11,7 @@
 import assert from "node:assert/strict";
 import {
   MAX_ATTEMPTS_SENTINEL,
+  dropGuardAllows,
   explainRefusal,
   reasonForOp,
   serverRefusalReason,
@@ -192,5 +193,67 @@ check(
   "an alignment-loss refusal is permanent",
 );
 check(willRetryOnItsOwn(undefined) === false, "no sentinel → treated as a refusal");
+
+// --- dropGuardAllows: the destructive guard, re-judged at delete time ---
+//
+// THE REGRESSION THIS EXISTS FOR. Tab A opens "discard N refused changes".
+// Tab B retries one of those ops; it exhausts the cap and re-parks as failed
+// with the max-attempts sentinel — i.e. it is now in the will-retry class that
+// this panel labels "not saved yet, it will try again". Cross-tab writes never
+// reach Tab A's subscription, so Tab A still believes it is a refusal. If the
+// delete only checked `status === "failed"` it would destroy that edit, because
+// BOTH classes are `failed`. The guard must re-read and re-judge.
+
+const refusedRecord = { status: "failed", lastError: "http 400" };
+const willRetryRecord = { status: "failed", lastError: MAX_ATTEMPTS_SENTINEL };
+
+check(
+  dropGuardAllows(refusedRecord, { onlyIfStatus: "failed", onlyIfRefused: true }) === true,
+  "a still-refused op is discarded by the refused-discard flow",
+);
+check(
+  dropGuardAllows(willRetryRecord, { onlyIfStatus: "failed", onlyIfRefused: true }) === false,
+  "REGRESSION: an op that became will-retry since the dialog opened SURVIVES the refused-discard",
+);
+check(
+  dropGuardAllows(willRetryRecord, { onlyIfStatus: "failed", onlyIfRefused: false }) === true,
+  "a will-retry op is still discardable when that is the class the user was shown",
+);
+check(
+  dropGuardAllows(refusedRecord, { onlyIfStatus: "failed", onlyIfRefused: false }) === false,
+  "the mirror case: an op that became a refusal survives a will-retry discard",
+);
+
+// The pre-existing guarantees must survive the new option.
+check(
+  dropGuardAllows({ status: "in_flight", lastError: "http 400" }, undefined) === false,
+  "an in-flight op is never dropped — a request is already on the wire",
+);
+check(
+  dropGuardAllows(
+    { status: "in_flight", lastError: "http 400" },
+    { onlyIfStatus: "failed", onlyIfRefused: true },
+  ) === false,
+  "in_flight outranks every other option",
+);
+check(
+  dropGuardAllows({ status: "pending" }, { onlyIfStatus: "conflict" }) === false,
+  "a conflict re-armed to pending by another tab is not dropped",
+);
+check(
+  dropGuardAllows({ status: "conflict" }, { onlyIfStatus: "conflict" }) === true,
+  "a still-conflicted op is dropped by the unresolvable-conflict flow",
+);
+check(
+  dropGuardAllows({ status: "failed", lastError: "http 400" }, undefined) === true,
+  "with no options the guard allows the drop (unconditional callers unchanged)",
+);
+// A record predating lastErrorReason/sentinel bookkeeping: undefined lastError
+// classifies as a refusal, so it is reachable by the refused-discard flow
+// rather than becoming undeletable.
+check(
+  dropGuardAllows({ status: "failed" }, { onlyIfStatus: "failed", onlyIfRefused: true }) === true,
+  "a legacy failed record with no lastError is still discardable as a refusal",
+);
 
 console.log(`\nrefusalReason: ${passed} checks passed`);

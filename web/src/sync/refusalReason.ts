@@ -165,3 +165,51 @@ export function willRetryOnItsOwn(lastError: string | undefined): boolean {
 
 /** `lastError` stamped on an op that ran out of retries. */
 export const MAX_ATTEMPTS_SENTINEL = "max_attempts_exceeded";
+
+/** The subset of a stored op that a drop guard is allowed to judge. */
+export interface DropGuardRecord {
+  status: string;
+  lastError?: string;
+}
+
+export interface DropGuardOpts {
+  /** Only delete when the stored record still has this status. */
+  onlyIfStatus?: string;
+  /**
+   * Only delete when the stored record's refused-ness still matches. `true`
+   * means "must currently be a refusal"; `false` means "must currently be a
+   * will-retry op". Omit for no constraint.
+   */
+  onlyIfRefused?: boolean;
+}
+
+/**
+ * May a drop delete the CURRENT stored record?
+ *
+ * The dangerous case this exists for: the failed-ops panel builds its discard
+ * list from one tab's snapshot, but cross-tab writes never reach that tab's
+ * subscription. Another tab can retry an op between the dialog opening and the
+ * user confirming, so by delete time the record can have moved from "refused"
+ * to "ran out of retries, will revive on its own" — an op the UI now promises
+ * is coming back. Checking only `status === "failed"` would delete it anyway,
+ * because both classes are `failed`. So the refused-ness is re-checked here,
+ * against the freshly-read record, inside the same transaction as the delete.
+ *
+ * Pure and exported so the rule is testable without IndexedDB.
+ */
+export function dropGuardAllows(
+  current: DropGuardRecord,
+  opts?: DropGuardOpts,
+): boolean {
+  // A request is already on the wire — deleting underneath it would race the
+  // 200 handler's own delete.
+  if (current.status === "in_flight") return false;
+  if (opts?.onlyIfStatus !== undefined && current.status !== opts.onlyIfStatus) return false;
+  if (
+    opts?.onlyIfRefused !== undefined &&
+    willRetryOnItsOwn(current.lastError) === opts.onlyIfRefused
+  ) {
+    return false;
+  }
+  return true;
+}

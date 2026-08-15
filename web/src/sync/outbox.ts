@@ -22,6 +22,7 @@ import { backoffMs } from "./backoff";
 import { classifyRowPatchConflict } from "./rowConflict";
 import {
   MAX_ATTEMPTS_SENTINEL,
+  dropGuardAllows,
   reasonForOp,
   serverRefusalReason,
   willRetryOnItsOwn,
@@ -494,7 +495,17 @@ export const outbox = {
 
   // onlyIfStatus excludes "in_flight": the unconditional in_flight guard below
   // returns first, so that value could never match — don't promise it.
-  async drop(opId: string, opts?: { onlyIfStatus?: Exclude<OpStatus, "in_flight"> }) {
+  async drop(
+    opId: string,
+    opts?: {
+      onlyIfStatus?: Exclude<OpStatus, "in_flight">;
+      // Re-check refused-ness against the stored record at delete time. `failed`
+      // covers two classes — a server refusal and a retry-cap timeout that
+      // revives itself — and only the first is safe to discard from the
+      // "discard refused" flow. See dropGuardAllows.
+      onlyIfRefused?: boolean;
+    },
+  ) {
     // Guard against dropping an op the drain just flipped to in_flight (same
     // race the drain itself guards at the listAll → fresh re-read). A request
     // is already on the wire; deleting the record here would race the 200
@@ -509,11 +520,13 @@ export const outbox = {
       await tx.done;
       return;
     }
-    // A caller acting on a snapshot (the unresolvable-conflict dialog) may be
-    // stale: another tab can re-arm a conflict to pending between snapshot and
-    // click, and deleting it then destroys an edit that's about to save.
-    // onlyIfStatus makes the check-and-delete atomic inside this tx.
-    if (op && opts?.onlyIfStatus && op.status !== opts.onlyIfStatus) {
+    // A caller acting on a snapshot (either discard dialog, the unresolvable-
+    // conflict dialog) may be stale: another tab can re-arm a conflict to
+    // pending, or retry a refused op so it re-parks as a will-retry one,
+    // between the snapshot and the click. Deleting then destroys an edit that
+    // is about to save or is expected back. dropGuardAllows re-judges the
+    // freshly-read record, making the check-and-delete atomic inside this tx.
+    if (op && !dropGuardAllows(op, opts)) {
       await tx.done;
       // The mismatch means this tab just observed state it may not know about
       // (cross-tab writes never reach this tab's notify) — broadcast so the

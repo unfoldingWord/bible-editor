@@ -624,7 +624,14 @@ export function SyncStatusBar({ onNavigate }: Props = {}) {
         confirmLabel="discard all"
         onCancel={() => { setConfirmDiscardAll(false); setCopiedDiscardAll(false); }}
         onConfirm={async () => {
-          for (const op of refused) await outbox.drop(op.id, { onlyIfStatus: "failed" });
+          // onlyIfRefused, not just onlyIfStatus: another tab may have retried
+          // one of these since the dialog opened, so by now it can be a
+          // will-retry op — which both classes report as `failed`. Discarding
+          // it here would silently drop an edit this very panel promises is
+          // coming back. The guard re-checks the stored record at delete time.
+          for (const op of refused) {
+            await outbox.drop(op.id, { onlyIfStatus: "failed", onlyIfRefused: true });
+          }
           setConfirmDiscardAll(false);
           setCopiedDiscardAll(false);
         }}
@@ -682,7 +689,14 @@ export function SyncStatusBar({ onNavigate }: Props = {}) {
         onCancel={closeDropOp}
         onConfirm={async () => {
           if (!liveDropOp) return;
-          await outbox.drop(liveDropOp.id, { onlyIfStatus: "failed" });
+          // Pin the class the user was actually shown. The dialog's wording
+          // differs for a refusal ("the verse still holds its previous text")
+          // and a will-retry op ("it will try again"), so if another tab moved
+          // this op between classes, the confirm no longer means what they read.
+          await outbox.drop(liveDropOp.id, {
+            onlyIfStatus: "failed",
+            onlyIfRefused: !willRetryOnItsOwn(liveDropOp.lastError),
+          });
           closeDropOp();
         }}
         extraAction={
