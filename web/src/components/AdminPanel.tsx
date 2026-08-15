@@ -10,11 +10,6 @@ import {
   Checkbox,
   Chip,
   CircularProgress,
-  Dialog,
-  DialogActions,
-  DialogContent,
-  DialogContentText,
-  DialogTitle,
   FormControlLabel,
   IconButton,
   MenuItem,
@@ -51,6 +46,7 @@ import {
   type Resource,
 } from "../sync/api";
 import { bookName } from "../lib/bookNames";
+import { ConfirmDialog } from "./ConfirmDialog";
 
 const RESOURCES: Resource[] = ["ult", "ust", "tn", "tq", "twl"];
 const RESOURCE_LABELS: Record<Resource, string> = {
@@ -122,37 +118,6 @@ function shortSha(sha: string | null): string {
   return sha ? sha.slice(0, 8) : "—";
 }
 
-// Small reusable "are you sure" gate for destructive/outward-facing actions.
-function ConfirmDialog({
-  open,
-  title,
-  description,
-  confirmLabel = "Confirm",
-  onCancel,
-  onConfirm,
-}: {
-  open: boolean;
-  title: string;
-  description: string;
-  confirmLabel?: string;
-  onCancel: () => void;
-  onConfirm: () => void;
-}) {
-  return (
-    <Dialog open={open} onClose={onCancel} maxWidth="sm" fullWidth>
-      <DialogTitle>{title}</DialogTitle>
-      <DialogContent>
-        <DialogContentText>{description}</DialogContentText>
-      </DialogContent>
-      <DialogActions>
-        <Button onClick={onCancel}>Cancel</Button>
-        <Button variant="contained" color="warning" onClick={onConfirm}>
-          {confirmLabel}
-        </Button>
-      </DialogActions>
-    </Dialog>
-  );
-}
 
 // ── Tab 1: Sync status ───────────────────────────────────────────────────
 
@@ -553,6 +518,10 @@ function PushCard({ bookOptions }: { bookOptions: string[] }) {
               : `This will render (but not push) with the row-deletion guard overridden for ${book || "all books"} / ${resource ? RESOURCE_LABELS[resource] : "all resources"}.`
         }
         confirmLabel="Push"
+        confirmColor="warning"
+        cancelLabel="Cancel"
+        maxWidth="sm"
+        fullWidth
         onCancel={() => setConfirmOpen(false)}
         onConfirm={() => {
           setConfirmOpen(false);
@@ -988,6 +957,10 @@ function UsersTab() {
         title="Remove user?"
         description={`This removes ${pendingDelete} from the admin/editor list. They'll drop to read-only (or no access, if they're not an unfoldingWord DCS org member).`}
         confirmLabel="Remove"
+        confirmColor="warning"
+        cancelLabel="Cancel"
+        maxWidth="sm"
+        fullWidth
         onCancel={() => setPendingDelete(null)}
         onConfirm={() => pendingDelete && doDelete(pendingDelete)}
       />
