@@ -388,6 +388,18 @@ function zeroCounts(): ReimportCounts {
   };
 }
 
+// Test-only aliases (reimportJourney.test.mjs). The aggregation step is where an
+// absent counter could be laundered into a present zero, so the journey test has
+// to fold through the REAL addCounts rather than re-implement it.
+export const zeroCountsForTest = (): ReimportCounts => zeroCounts();
+export const addCountsForTest = (into: ReimportCounts, from: ReimportCounts): void => addCounts(into, from);
+export const raiseTombstoneBlockAlertForTest = (
+  env: Env,
+  book: string,
+  resource: Resource,
+  counts: ReimportCounts,
+): Promise<void> => raiseTombstoneBlockAlert(env, book, resource, counts);
+
 function addCounts(into: ReimportCounts, from: ReimportCounts): void {
   into.updated += from.updated;
   into.reimported_ai += from.reimported_ai;
@@ -795,6 +807,17 @@ type TsvKind = "tn" | "tq" | "twl";
 
 interface ParsedTsvRow {
   id: string;
+  // True when `id` is NOT master's literal ID — parseTsvRow rewrote a malformed
+  // one through coerceRowId (rowId.ts). Issue #427: this must suppress the
+  // tombstone/conflict *blocked* counters. coerceRowId hashes into a 96-ID
+  // space, so two different malformed master IDs can legitimately land on the
+  // same coerced value, and a coerced ID can land on an unrelated tombstone.
+  // Neither is "master reissued this ID to a different row" — the coerced ID was
+  // never the row's identity in the first place, so the reissue inference is
+  // meaningless for it. Counting those as blocked would withhold the watermark,
+  // and that withhold has no automatic release (see raiseTombstoneBlockAlert),
+  // so a documented-benign coercion no-op would freeze the book's export.
+  idCoerced?: boolean;
   refRaw: string;
   chapter: number;
   verse: number;
@@ -838,6 +861,10 @@ function parseTsvRow(r: Record<string, string>, kind: TsvKind): ParsedTsvRow | n
   const occurrence = occRaw === "" || occRaw == null ? null : parseInt(occRaw, 10) || 0;
   const base: ParsedTsvRow = {
     id,
+    // Record that the id is ours, not master's — see ParsedTsvRow.idCoerced.
+    // coerceRowId is a strict no-op for a well-formed id, so this is false for
+    // essentially every real row.
+    idCoerced: id !== rawId,
     refRaw,
     chapter: ch,
     verse: v,
@@ -874,7 +901,14 @@ function parseTsvRow(r: Record<string, string>, kind: TsvKind): ParsedTsvRow | n
 // file order, so the ordinal tracks source order exactly. The pristine guard +
 // version-CAS stay ON each UPDATE, so a translator edit landing between the read
 // and the batch matches 0 rows (no clobber) and is counted skipped_edited.
-async function applyTsvRows(
+// Exported for the integration test ONLY (reimportJourney.test.mjs). Issue #427:
+// the tombstone-collision claims were previously asserted by a test that
+// hand-copied this function's SQL, which proves nothing if the real SQL later
+// drifts — notably the `existing` read's deliberate absence of a
+// `deleted_at IS NULL` filter, which is the whole reason a tombstoned id reaches
+// the tombstone branch instead of the insert. Driving the real function is what
+// makes that claim drift-detecting. Not part of the module's public API.
+export async function applyTsvRows(
   env: Env,
   book: string,
   kind: TsvKind,
@@ -1013,10 +1047,37 @@ async function applyTsvRows(
         continue;
       }
       try {
-        if (await tryInsertTsvRow(env, book, kind, row, sortOrder)) {
+        const outcome = await tryInsertTsvRow(env, book, kind, row, sortOrder);
+        if (outcome === "inserted") {
           counts.inserted++;
           insertedThisPass.add(row.id);
           await logEdit(env, kind, row.id, book, userId, null, 1, "create", row);
+        } else if (outcome === "unknown") {
+          // D1 reported no row count, so we do not know whether this row landed.
+          // Do NOT call that a conflict: `conflict_skipped` withholds the
+          // watermark and a mis-read here would freeze the book's export on a
+          // run where nothing was wrong. Taint the run instead — same "absent
+          // measurement must not be laundered into a value" rule the rest of
+          // this file follows, applied in the red direction as well as the green.
+          counts.counts_incomplete = true;
+          console.warn("reimport: insert returned no row count — treating as unknown, not as a conflict", {
+            book,
+            resource: kind,
+            id: row.id,
+          });
+        } else if (row.idCoerced) {
+          // The (book, id) slot is taken, but this id is OURS — coerceRowId
+          // rewrote a malformed master id into a 96-id space, so a collision
+          // here says nothing about master reissuing anything. Documented-benign
+          // no-op (see ParsedTsvRow.idCoerced); count it as a duplicate, never as
+          // a blocked drop, or a coercion collision would freeze the export.
+          counts.skipped_dup++;
+          console.warn("reimport: coerced id collided — benign, not counted as blocked", {
+            book,
+            resource: kind,
+            coercedId: row.id,
+            ref: row.refRaw,
+          });
         } else {
           // 0 rows written by `ON CONFLICT(id, book) DO NOTHING` on a row the
           // diff said to insert, and NOT a duplicate id within master's own file
@@ -1058,7 +1119,14 @@ async function applyTsvRows(
         // Count that case separately so the sync report shows it and the
         // (book, resource) watermark is withheld — see isReissuedTombstone and
         // the reimport-sync step. Reclaiming the slot is option 1, not this.
+        // `!row.idCoerced` first: for a coerced id the "master reissued this id
+        // to a different row" inference is meaningless — the id is ours, hashed
+        // into a 96-id space, so landing on an unrelated tombstone at a
+        // different reference is an expected collision, not evidence master
+        // moved anything. Counting it would withhold the watermark and freeze
+        // the export over a documented-benign no-op. See ParsedTsvRow.idCoerced.
         if (
+          !row.idCoerced &&
           isReissuedTombstone(
             { refRaw: (cur.ref_raw as string | null) ?? null, chapter: Number(cur.chapter), verse: Number(cur.verse) },
             { refRaw: row.refRaw, chapter: row.chapter, verse: row.verse },
@@ -1580,15 +1648,45 @@ async function reconstructTsvBases(
   return out;
 }
 
-// Returns true if the row was inserted (was new), false if it already existed
-// (caller falls through to the pristine UPDATE branch).
+// Outcome of one `INSERT ... ON CONFLICT(id, book) DO NOTHING`.
+//
+// Deliberately TRI-state rather than a boolean (issue #427). The signal is
+// D1's `meta.changes`, and the old `(r.meta.changes ?? 0) > 0` collapsed two
+// very different situations into "not inserted": a real 0 (the primary key was
+// taken — a measured conflict) and `undefined` (D1 did not report a row count
+// at all). Since these counters now WITHHOLD the sync watermark, and that
+// withhold has no automatic release, treating an unreported count as a measured
+// conflict would recount every successful insert as a drop and freeze the book's
+// export on a run where nothing was actually wrong.
+//
+// So: "unknown" is reported separately and taints the run (counts_incomplete)
+// instead of asserting a conflict. That is the same direction the rest of this
+// file takes — an absent measurement must never be laundered into a value, in
+// EITHER direction (not into a green "0", and not into a red "conflict").
+//
+// NOTE the node:sqlite integration tests prove SQLite's semantics here, not
+// D1's. They are strong evidence for the ON CONFLICT behavior but they cannot
+// prove what D1 puts in `meta.changes`, which is exactly why this branch exists.
+type TsvInsertOutcome = "inserted" | "conflict" | "unknown";
+
+// The one place `meta.changes` is interpreted, so the undefined case cannot be
+// re-collapsed at one of the three call sites and not the others.
+function insertOutcome(r: { meta?: { changes?: number } }): TsvInsertOutcome {
+  const changes = r.meta?.changes;
+  if (changes === undefined || changes === null || !Number.isFinite(changes)) return "unknown";
+  return changes > 0 ? "inserted" : "conflict";
+}
+
+// Returns "inserted" if the row was written, "conflict" if the (book, id) slot
+// was already taken, "unknown" if D1 reported no row count (caller must not
+// treat that as either).
 async function tryInsertTsvRow(
   env: Env,
   book: string,
   kind: TsvKind,
   row: ParsedTsvRow,
   sortOrder: number,
-): Promise<boolean> {
+): Promise<TsvInsertOutcome> {
   if (kind === "tn") {
     const r = await env.DB.prepare(
       `INSERT INTO tn_rows
@@ -1602,7 +1700,7 @@ async function tryInsertTsvRow(
         row.occurrence, row.note ?? null, sortOrder,
       )
       .run();
-    return (r.meta.changes ?? 0) > 0;
+    return insertOutcome(r);
   }
   if (kind === "tq") {
     const r = await env.DB.prepare(
@@ -1617,7 +1715,7 @@ async function tryInsertTsvRow(
         row.question ?? null, row.response ?? null, sortOrder,
       )
       .run();
-    return (r.meta.changes ?? 0) > 0;
+    return insertOutcome(r);
   }
   const r = await env.DB.prepare(
     `INSERT INTO twl_rows
@@ -1630,7 +1728,7 @@ async function tryInsertTsvRow(
       row.tags, row.orig_words ?? null, row.occurrence, row.tw_link ?? null, sortOrder,
     )
     .run();
-  return (r.meta.changes ?? 0) > 0;
+  return insertOutcome(r);
 }
 
 // True iff this stored row has never been touched by a human and isn't pending

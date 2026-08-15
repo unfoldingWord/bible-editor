@@ -51,7 +51,10 @@ db.exec(`
     book TEXT NOT NULL,
     chapter INTEGER NOT NULL,
     verse INTEGER NOT NULL,
-    ref_raw TEXT,
+    -- NOT NULL, matching every real migration (0001_init.sql,
+    -- 0015_composite_row_id.sql). A looser test schema would let the tests
+    -- assert states the production schema forbids.
+    ref_raw TEXT NOT NULL,
     tags TEXT,
     quote TEXT,
     occurrence INTEGER,

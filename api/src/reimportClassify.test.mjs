@@ -389,16 +389,30 @@ eq(
   "whitespace-only ref_raw difference → same reference, not a reissue",
 );
 
-// Fallback when a stored row has no ref_raw: compare chapter/verse.
+// Fallback when a row carries no usable ref_raw: compare chapter/verse.
+//
+// Scope note (review finding): every migration declares `ref_raw TEXT NOT NULL`
+// (api/migrations/0001_init.sql, 0015_composite_row_id.sql), so a STORED row can
+// never be null here — the `?? null` at the call site and the `| null` in the
+// type are defensive only, and a test asserting the null case would be asserting
+// an unreachable state. The EMPTY STRING is the reachable one: NOT NULL still
+// permits "", and an incoming row gets `r["Reference"] ?? ""` from parseTsvRow,
+// so a master row with a blank Reference column arrives as "". These cases cover
+// that reachable path.
 eq(
-  isReissuedTombstone({ refRaw: null, chapter: 5, verse: 4 }, { refRaw: "5:4", chapter: 5, verse: 4 }),
+  isReissuedTombstone({ refRaw: "", chapter: 5, verse: 4 }, { refRaw: "", chapter: 5, verse: 4 }),
   false,
-  "stored ref_raw missing but chapter/verse match master's ref_raw → same reference",
+  "both ref_raw blank, same chapter/verse → same reference via the fallback",
+);
+eq(
+  isReissuedTombstone({ refRaw: "", chapter: 5, verse: 4 }, { refRaw: "5:4", chapter: 5, verse: 4 }),
+  false,
+  "stored ref_raw blank, master populated, chapter/verse agree → same reference",
 );
 eq(
   isReissuedTombstone({ refRaw: "", chapter: 5, verse: 4 }, { refRaw: "", chapter: 23, verse: 7 }),
   true,
-  "both ref_raw empty, chapter/verse differ → reissued via the fallback",
+  "both ref_raw blank, chapter/verse differ → reissued via the fallback",
 );
 
 if (failed > 0) {
