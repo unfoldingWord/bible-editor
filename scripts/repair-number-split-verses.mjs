@@ -70,6 +70,13 @@
 //   No other shape occurs. Anything that does not match is REFUSED, never
 //   guessed at.
 //
+//   (203 vs the 205 this script reports is not a discrepancy: the survey
+//   counted matches in ONE global regex pass, which under-counts chained
+//   groups — a single pass over "1, 100, 000" consumes the "100" the second
+//   site needs as its left digit and so sees one match where there are two
+//   spaces to delete. The script iterates to a fixed point and therefore
+//   counts both. 1CH 21:5 and REV UST 9:16 are the two verses affected.)
+//
 // ── GUARDS (a failing verse is refused, never silently written) ────────────
 //   Per defect site:
 //     • the character being deleted must be exactly U+0020;
