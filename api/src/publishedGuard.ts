@@ -3,15 +3,16 @@
 // `node --experimental-strip-types` in the unit test runner, same as
 // shrinkGuard.ts.
 //
-// Measured evidence (2026-06-23, checked directly against DCS):
+// Measured evidence (2026-08-15, checked directly against DCS):
 //   - The latest release in all five resource repos (en_ult, en_ust, en_tn,
-//     en_tq, en_twl) is tag `v89`, target branch `release_v89`, published
-//     2026-06-23.
-//   - Listing repo contents at `?ref=v89` returns exactly 54 books, and that
-//     54-book set is IDENTICAL across all five repos. `master` has 66 books.
-//   - The 12 books NOT yet published: NUM 1CH 2CH ECC ISA JER EZK DAN HOS AMO
-//     MIC ZEC. These are exactly the books under active work in this app.
-//   - Releases happen ~3x/year (v84 shipped 2024-08, v89 shipped 2026-06).
+//     en_tq, en_twl) is tag `v90`, target branch `release_v90`, published
+//     2026-08-14/15 (prerelease=false, draft=false).
+//   - Listing repo contents at `?ref=v90` returns exactly 56 books (v89 had
+//     54; HOS and MIC were added). `master` has 66 books.
+//   - The 10 books NOT yet published: NUM 1CH 2CH ECC ISA JER EZK DAN AMO ZEC.
+//     These are exactly the books under active work in this app.
+//   - Releases happen ~3x/year (v84 shipped 2024-08, v89 shipped 2026-06,
+//     v90 shipped 2026-08).
 //
 // Why PUBLISHED_BOOKS is a hardcoded constant and not a live lookup: a failed
 // live lookup at request time cannot know WHICH books are published, so it
@@ -36,12 +37,12 @@
 
 import { RESOURCE_TARGETS, type Resource } from "./export.ts";
 
-export const PUBLISHED_RELEASE_TAG = "v89";
+export const PUBLISHED_RELEASE_TAG = "v90";
 
 export const PUBLISHED_BOOKS: ReadonlySet<string> = new Set([
   "GEN", "EXO", "LEV", "DEU", "JOS", "JDG", "RUT", "1SA", "2SA", "1KI", "2KI",
-  "EZR", "NEH", "EST", "JOB", "PSA", "PRO", "SNG", "LAM", "JOL", "OBA", "JON",
-  "NAM", "HAB", "ZEP", "HAG", "MAL",
+  "EZR", "NEH", "EST", "JOB", "PSA", "PRO", "SNG", "LAM", "HOS", "JOL", "OBA",
+  "JON", "MIC", "NAM", "HAB", "ZEP", "HAG", "MAL",
   "MAT", "MRK", "LUK", "JHN", "ACT", "ROM", "1CO", "2CO", "GAL", "EPH", "PHP",
   "COL", "1TH", "2TH", "1TI", "2TI", "TIT", "PHM", "HEB", "JAS", "1PE", "2PE",
   "1JN", "2JN", "3JN", "JUD", "REV",
