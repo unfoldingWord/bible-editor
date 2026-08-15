@@ -236,9 +236,28 @@ export function computeEditedFieldMerge(
 // whole book. `ref_raw` is the authoritative comparison (it is what the master
 // TSV's Reference column literally holds, including verse bridges like "1:2-3"
 // and "front:intro"); (chapter, verse) is the fallback when a row's ref_raw is
-// empty. On ambiguity this errs toward reporting a block — the caller's response
-// is to withhold a watermark, whose worst case is a delayed export, versus
-// certifying a book as in-sync while rows are missing.
+// empty.
+//
+// KNOWN FALSE POSITIVE, and its cost is not small — read before touching this.
+// The reference test cannot separate "the id was re-minted for a different row"
+// (real loss) from "the SAME row, deleted in-app, whose Reference a Door43
+// maintainer then corrected" — a re-anchor to 1:3, or a bridge widened to
+// "1:2-3". The second loses nothing; the row is deleted and the delete is merely
+// pending export. This function reports both as blocked.
+//
+// Do NOT reason about that as "worst case, a delayed export." The caller's
+// withhold has NO automatic release (unlike a chapter lock, a tombstone never
+// expires), so a false positive stops that book+resource exporting until a human
+// intervenes — see raiseTombstoneBlockAlert in bookReimport.ts, which exists
+// precisely so the freeze is visible and actionable rather than silent. The
+// direction is still deliberate: the alternative to withholding is exporting a
+// D1 that is short of master, which DELETES those rows from Door43. But the
+// tradeoff is "a loud freeze vs. silent deletion on Door43", not "slow vs.
+// fast", and any change here should be weighed on those terms.
+//
+// The 2026-08-10 production sweep found 0 blocked across 10,645 tombstones,
+// which bounds how often this fires today — but it is a point-in-time shape,
+// not a bound on the false-positive rate going forward.
 //
 // This function does NOT decide whether master's row should be applied — that
 // would be issue #427's option 1 (id reclaim), deliberately out of scope. It

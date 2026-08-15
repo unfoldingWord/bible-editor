@@ -92,10 +92,18 @@ export function shouldRecordResourceSync(counts: {
   counts_incomplete?: boolean;
 }): boolean {
   if (counts.chapters_locked === undefined || counts.prune_locked === undefined) return false;
-  // Same fail-safe presence check as the two above, for the same reason: a
-  // pre-#427 chunk result replayed by an in-flight Workflow simply has no
-  // conflict_skipped/tombstone_blocked field, and "not measured" must never
-  // read as "measured zero".
+  // Same fail-safe presence check as the two above, for the same reason: "not
+  // measured" must never read as "measured zero".
+  //
+  // Honest scope note: unlike the chapters_locked/prune_locked checks, this one
+  // is NOT the mechanism that catches a pre-#427 chunk result replayed by an
+  // in-flight Workflow. The only production caller passes `perResource[...]`,
+  // an aggregate always seeded by zeroCounts() and always `+=`-ed, so these two
+  // fields are never literally undefined there. The replay case is caught one
+  // layer up, by the `counts_incomplete` taint addCounts sets when a folded-in
+  // object lacked them. This check is defence-in-depth for any future caller
+  // that hands the gate a raw, un-aggregated object — do not rely on it as the
+  // replay guard.
   if (counts.conflict_skipped === undefined || counts.tombstone_blocked === undefined) return false;
   if (counts.counts_incomplete === true) return false;
   return (

@@ -157,6 +157,33 @@ eq(
   "tombstone and master row at the SAME ref → NOT counted (a delete awaiting export; skipping it is correct)",
 );
 
+console.log("\n[the OTHER way ON CONFLICT fires: a duplicate id in master's own file]");
+
+// Review finding: applyTsvRows reads `existing` ONCE, before the loop, and never
+// updates it after a successful insert. So if master's TSV carries the same id
+// twice, the second occurrence still misses `existing`, reaches the insert, and
+// is refused with 0 changes — identical to a tombstone collision from the
+// insert's point of view. That must NOT be counted as conflict_skipped:
+// conflict_skipped withholds the watermark, and a duplicate id on master never
+// clears by itself, so mislabelling it would freeze the book's export forever
+// over a condition the old code treated as harmless. This repo has shipped
+// duplicated master rows before (the ISA 48 delete+dup repair). applyTsvRows now
+// tracks ids inserted this pass and classifies the second one skipped_dup BEFORE
+// reaching the insert; this proves the underlying DB behavior that makes the
+// guard necessary.
+const DUP = "dup1";
+const first = Number(insert.run(DUP, BOOK, 2, 1, "2:1", null, null, null, "first", null, 40).changes);
+const second = Number(insert.run(DUP, BOOK, 9, 9, "9:9", null, null, null, "second", null, 41).changes);
+eq(first, 1, "first occurrence of a duplicated master id inserts normally");
+eq(
+  second,
+  0,
+  "second occurrence writes 0 changes — INDISTINGUISHABLE from a tombstone collision at the insert, hence the pre-insert guard",
+);
+// And note it is NOT a tombstone at all: the blocking row is live.
+const dupRow = db.prepare(`SELECT deleted_at FROM tq_rows WHERE book = ? AND id = ?`).all(BOOK, DUP)[0];
+eq(dupRow.deleted_at, null, "the row holding the slot here is LIVE, not a tombstone — a different cause entirely");
+
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed`);
   process.exit(1);
