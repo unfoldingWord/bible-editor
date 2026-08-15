@@ -1,0 +1,189 @@
+// INDEPENDENT verification of the SQL produced by repair-number-split-verses.mjs
+// (GitHub issue #452).
+//
+// WHY THIS EXISTS, SEPARATELY FROM THE GENERATOR
+//   The generator checks its own work, which is necessary but not sufficient:
+//   a bug shared between the transform and its self-check is invisible. This
+//   harness shares NO code with the generator. It seeds a real SQLite database
+//   with the ORIGINAL prod rows, executes the generated .sql file exactly as
+//   `wrangler d1 execute --file` would, and then re-derives every claim from
+//   scratch with independently written tree walkers.
+//
+//   That independence has already paid for itself: it caught the generated
+//   file's audit INSERT double-logging on a re-run (38 verses → 76 edit_log
+//   rows), because `WHERE version = v+1 AND content_json = <new>` stays true
+//   forever once the repair lands. The generator now emits a NOT EXISTS guard
+//   and this harness proves the file is a total no-op on re-run.
+//
+// WHAT IT ASSERTS, PER VERSE
+//   • version bumped by exactly 1, and `updated_by` untouched;
+//   • `\zaln` milestone count, `\w` count, node count and the concatenated `\w`
+//     surface forms are all IDENTICAL before and after;
+//   • the new raw text equals the old raw text with the thousands separators
+//     independently re-joined — character for character;
+//   • no `digit, space + 3 digits` site survives in content_json or plain_text;
+//   • plain_text equals the independently re-joined old plain_text;
+//   • exactly one `source='data_repair'` edit_log row exists, with
+//     action='repair_number_split', user_id NULL, and the right book and
+//     prev/new versions.
+//   Then it applies the whole file a SECOND time and asserts nothing moves —
+//   proving the version-CAS and the audit guard make a re-run safe.
+//
+// USAGE (from repo root)
+//   node scripts/verify-number-split-repair.mjs <dump.json> <repair.sql>
+//   node scripts/verify-number-split-repair.mjs \
+//     scripts/out/number-split-dump.json scripts/out/repair-number-split.sql
+//
+//   Both arguments must be the SAME pair the generator ran on. Exit 0 = every
+//   verse verified; exit 1 = at least one failed (details on stdout).
+//
+// Touches no network and no real database — everything happens in an in-memory
+// SQLite instance.
+
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
+import { DatabaseSync } from "node:sqlite";
+
+const [dumpArg, sqlArg] = process.argv.slice(2);
+if (!dumpArg || !sqlArg) {
+  console.error("usage: node scripts/verify-number-split-repair.mjs <dump.json> <repair.sql>");
+  process.exit(1);
+}
+const dumpPath = resolve(process.cwd(), dumpArg);
+const sqlPath = resolve(process.cwd(), sqlArg);
+
+const dumpText = readFileSync(dumpPath, "utf8");
+const i = dumpText.indexOf("[");
+const j = dumpText.indexOf("{");
+const start = i < 0 ? j : j < 0 ? i : Math.min(i, j);
+const parsed = JSON.parse(dumpText.slice(start));
+const wrapped = Array.isArray(parsed) ? parsed : [parsed];
+const rows =
+  wrapped.length && wrapped[0] && Array.isArray(wrapped[0].results)
+    ? wrapped.flatMap((x) => x.results || [])
+    : wrapped;
+const sql = readFileSync(sqlPath, "utf8");
+
+// Schema mirrors api/migrations (0001_init + 0007/0010/0017 edit_log columns).
+const db = new DatabaseSync(":memory:");
+db.exec(`
+CREATE TABLE verses (
+  book TEXT NOT NULL, chapter INTEGER NOT NULL, verse INTEGER NOT NULL,
+  verse_end INTEGER, bible_version TEXT NOT NULL, content_json TEXT NOT NULL,
+  plain_text TEXT, version INTEGER NOT NULL DEFAULT 1, updated_by INTEGER,
+  updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
+  PRIMARY KEY (book, chapter, verse, bible_version));
+CREATE TABLE edit_log (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, row_key TEXT NOT NULL,
+  user_id INTEGER, prev_version INTEGER, new_version INTEGER, action TEXT NOT NULL,
+  payload_json TEXT, created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+  restored_from_version INTEGER, source TEXT, book TEXT);
+`);
+
+const ins = db.prepare(
+  `INSERT INTO verses (book,chapter,verse,verse_end,bible_version,content_json,plain_text,version,updated_by,updated_at)
+   VALUES (?,?,?,?,?,?,?,?,?,?)`,
+);
+for (const r of rows) {
+  ins.run(r.book, r.chapter, r.verse, r.verse_end ?? null, r.bible_version, r.content_json,
+    r.plain_text ?? null, r.version, r.updated_by ?? null, r.updated_at ?? 0);
+}
+
+db.exec(sql);
+
+// ── independent re-derivation (deliberately not the generator's helpers) ────
+const DEFECT = /(\d), (\d{3})(?!\d)/;
+const rawOf = (cj) => {
+  const acc = [];
+  const rec = (n) => {
+    if (Array.isArray(n)) return n.forEach(rec);
+    if (!n || typeof n !== "object") return;
+    if (typeof n.text === "string") acc.push(n.text);
+    if (n.children) rec(n.children);
+  };
+  rec(JSON.parse(cj).verseObjects);
+  return acc.join("");
+};
+const tally = (cj) => {
+  let zaln = 0, w = 0, nodes = 0;
+  const surfaces = [];
+  const rec = (n) => {
+    if (Array.isArray(n)) return n.forEach(rec);
+    if (!n || typeof n !== "object") return;
+    nodes++;
+    if (n.type === "milestone" && n.tag === "zaln") zaln++;
+    if (n.type === "word" && n.tag === "w") { w++; surfaces.push(String(n.text ?? "")); }
+    if (n.children) rec(n.children);
+  };
+  rec(JSON.parse(cj).verseObjects);
+  return { zaln, w, nodes, surfaces: surfaces.join("") };
+};
+const joinAll = (s) => {
+  let o = s, p;
+  do { p = o; o = o.replace(DEFECT, (_a, x, y) => x + "," + y); } while (o !== p);
+  return o;
+};
+
+const fail = [];
+const ok = [];
+for (const r of rows) {
+  const ref = `${r.book} ${r.bible_version} ${r.chapter}:${r.verse}`;
+  const now = db.prepare(
+    `SELECT content_json, plain_text, version, updated_by FROM verses
+     WHERE book=? AND chapter=? AND verse=? AND bible_version=?`,
+  ).get(r.book, r.chapter, r.verse, r.bible_version);
+
+  const problems = [];
+  if (now.version !== r.version + 1) problems.push(`version ${r.version} → ${now.version} (expected ${r.version + 1})`);
+
+  const before = tally(r.content_json), after = tally(now.content_json);
+  if (before.zaln !== after.zaln) problems.push(`zaln ${before.zaln} → ${after.zaln}`);
+  if (before.w !== after.w) problems.push(`\\w ${before.w} → ${after.w}`);
+  if (before.nodes !== after.nodes) problems.push(`nodes ${before.nodes} → ${after.nodes}`);
+  if (before.surfaces !== after.surfaces) problems.push("\\w surface forms changed");
+
+  const rawBefore = rawOf(r.content_json), rawAfter = rawOf(now.content_json);
+  if (rawAfter !== joinAll(rawBefore)) problems.push("new raw text != independently joined old raw text");
+  if (DEFECT.test(rawAfter)) problems.push("defect site REMAINS in content_json");
+  if (DEFECT.test(now.plain_text ?? "")) problems.push("defect site REMAINS in plain_text");
+  if ((now.plain_text ?? "") !== joinAll(r.plain_text ?? "")) problems.push("plain_text != independently joined old plain_text");
+  if ((now.updated_by ?? null) !== (r.updated_by ?? null)) problems.push("updated_by was modified");
+
+  const joined = (rawAfter.match(/\d[\d,]*,\d{3}/g) || []).join(" ");
+  if (!joined) problems.push("no joined thousands number found in the result");
+
+  const log = db.prepare(
+    `SELECT * FROM edit_log WHERE kind='verse' AND row_key=? AND source='data_repair'`,
+  ).all(`${r.book}/${r.chapter}/${r.verse}/${r.bible_version}`);
+  if (log.length !== 1) problems.push(`expected 1 data_repair edit_log row, got ${log.length}`);
+  else {
+    const L = log[0];
+    if (L.action !== "repair_number_split") problems.push(`edit_log.action=${L.action}`);
+    if (L.user_id !== null) problems.push(`edit_log.user_id=${L.user_id} (expected NULL)`);
+    if (L.prev_version !== r.version || L.new_version !== r.version + 1)
+      problems.push(`edit_log versions ${L.prev_version}→${L.new_version}`);
+    if (L.book !== r.book) problems.push(`edit_log.book=${L.book}`);
+  }
+
+  if (problems.length) fail.push(`${ref}: ${problems.join("; ")}`);
+  else ok.push(`${ref}  ${joined}`);
+}
+
+console.log(`dump : ${dumpPath}`);
+console.log(`sql  : ${sqlPath}`);
+console.log(`verses seeded        : ${rows.length}`);
+console.log(`edit_log rows written: ${db.prepare("SELECT COUNT(*) c FROM edit_log").get().c}`);
+console.log(`PASS: ${ok.length}   FAIL: ${fail.length}`);
+for (const l of ok) console.log("  ok   " + l);
+for (const l of fail) console.log("  FAIL " + l);
+
+// ── re-run must be a total no-op (version-CAS + audit guard) ───────────────
+const logBefore = db.prepare("SELECT COUNT(*) c FROM edit_log").get().c;
+const snap = db.prepare("SELECT book,chapter,verse,bible_version,content_json,version FROM verses ORDER BY book,bible_version,chapter,verse").all();
+db.exec(sql);
+const logAfter = db.prepare("SELECT COUNT(*) c FROM edit_log").get().c;
+const snap2 = db.prepare("SELECT book,chapter,verse,bible_version,content_json,version FROM verses ORDER BY book,bible_version,chapter,verse").all();
+const noop = logBefore === logAfter && JSON.stringify(snap) === JSON.stringify(snap2);
+console.log(`\nRE-RUN IS A NO-OP: ${noop}  (edit_log ${logBefore} → ${logAfter}; verse rows identical: ${JSON.stringify(snap) === JSON.stringify(snap2)})`);
+
+process.exit(fail.length || !noop ? 1 : 0);
