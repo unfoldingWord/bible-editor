@@ -105,6 +105,37 @@ export function tsvMergeFields(kind: TsvMergeKind): TsvMergeField[] {
   return FIELDS_BY_KIND[kind];
 }
 
+// Did a Door43 maintainer re-anchor this row to a different Reference on master
+// (same id, new chapter / verse / ref_raw)? Identity/reference columns are
+// deliberately EXCLUDED from computeTsvMerge (see FIELDS_BY_KIND above), so a
+// pure move is INVISIBLE to the field merge and would otherwise be silently
+// reverted by the next export (D1's old location rendered back over master).
+// This is the detector the caller (bookReimport.ts's edited-candidate
+// resolution) uses to instead WITHHOLD the resource watermark (apply_incomplete)
+// and flag the row (review_kind='ref_moved') for a human to move it in-app.
+//
+// A `protectedRow` (tn deleted/trashed/preserve/hint) is never treated as moved:
+// such a row is left untouched from master regardless, so the caller keeps it a
+// clean skipped_edited and this must return false so it does not withhold the
+// watermark for a row it will not (and must not) touch.
+//
+// Pure (no D1) so the detection has a direct regression test independent of the
+// DB-bound apply path — the field merge excludes identity columns, so nothing
+// else guards against this class silently coming back.
+export function tsvRefMoved(
+  cur: Record<string, unknown>,
+  incoming: { chapter: number; verse: number; refRaw: string | null },
+  protectedRow: boolean,
+): boolean {
+  if (protectedRow) return false;
+  const curRef = (cur.ref_raw as string | null) ?? "";
+  return (
+    Number(cur.chapter) !== incoming.chapter ||
+    Number(cur.verse) !== incoming.verse ||
+    curRef !== (incoming.refRaw ?? "")
+  );
+}
+
 export interface TsvMergeResult {
   action: TsvMergeAction;
   /** action is "adopt" | "adopt_conflict" */

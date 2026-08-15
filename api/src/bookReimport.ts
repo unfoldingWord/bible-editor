@@ -66,6 +66,7 @@ import {
 import {
   computeTsvMerge,
   foldTsvBase,
+  tsvRefMoved,
   type TsvMergeSide,
   type TsvEditLogEntry,
 } from "./tsvMerge.ts";
@@ -1087,11 +1088,7 @@ async function applyTsvRows(
       // old location back over master, and flag the row ONCE (guarded on the
       // existing review_kind to avoid nightly version churn) so a human can move
       // it in-app to match — which clears the flag and releases the hold.
-      const refMoved =
-        !protectedRow &&
-        (Number(cur.chapter) !== row.chapter ||
-          Number(cur.verse) !== row.verse ||
-          (((cur.ref_raw as string | null) ?? "") !== (row.refRaw ?? "")));
+      const refMoved = tsvRefMoved(cur, row, protectedRow);
       if (refMoved) {
         counts.apply_incomplete = true;
         if (cur.review_kind !== "ref_moved") {
