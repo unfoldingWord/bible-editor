@@ -4,8 +4,13 @@
 // CONFLICT DO UPDATE — deliberately NOT the replace-all-per-(book,resource)
 // pattern alignment_attention/export_reverts use, because a conflict must
 // survive until a human resolves it, not just until the next export runs.
-// Cleared by verses.ts's PATCH route when a human next saves the conflicting
-// verse.
+// Marked resolved (resolved_at/resolved_by, migration 0049) by verses.ts's
+// PATCH route when a human next saves the conflicting verse — the row itself
+// is kept for the audit trail; "active" readers filter WHERE resolved_at IS
+// NULL. A SERVER-SIDE re-detection can also reactivate a resolved row, but
+// only via the two-phase protocol in recordVerseMergeConflicts /
+// confirmAdoptedConflicts below — see UPSERT_VERSE_MERGE_CONFLICT_SQL's doc
+// comment in verseMergeConflictSql.ts for why a single eager clear is unsafe.
 //
 // Three action values land here (the migration's header comment,
 // 0044_verse_merge_conflicts.sql, already documents all three — only its
@@ -37,6 +42,18 @@
 import { Hono } from "hono";
 import type { Env } from "./index";
 import { requireAuth } from "./auth";
+import {
+  buildEditorLookupQuery,
+  EDITOR_LOOKUP_CHUNK,
+  groupOverwrittenVersesByEditor,
+  planSystemAlertWrites,
+  type OverwrittenVerseRef,
+} from "./verseMergeEditorAlerts.ts";
+import {
+  CONFIRM_ADOPTED_CONFLICT_SQL,
+  DELETE_LOST_ADOPTION_CONFLICT_SQL,
+  UPSERT_VERSE_MERGE_CONFLICT_SQL,
+} from "./verseMergeConflictSql.ts";
 
 // Same maintainer the export alerts target (exportWorkflow.ts's
 // EXPORT_ALERT_USERNAME) — that file is owned by a concurrent change, so this
@@ -79,11 +96,26 @@ const WRITE_BATCH = 90;
 // instead of an unconditional counter claiming "recorded durably" when it
 // wasn't — the honest-return precedent this follows is exportWorkflow.ts's
 // recordExportReverts.
+//
+// SPECULATIVE half of two-phase reactivation (see
+// UPSERT_VERSE_MERGE_CONFLICT_SQL's doc comment for the full "why" — this
+// upsert runs BEFORE the master-adoption CAS batch even attempts its write,
+// so it must never assume the write will land). It does NOT clear
+// resolved_at/resolved_by — only confirmAdoptedConflicts (below), called
+// after the CAS batch confirms which adoptions actually landed, does that.
+//
+// `now` is the caller's own Date.now()-derived timestamp (bookReimport.ts
+// already computes one per applyVerseRows call) — bound as detected_at's
+// value on INSERT and as last_recorded_at's value on every write, so
+// deleteLostAdoptionConflicts (called later in the same run) can match rows
+// touched by THIS run's speculative write by exact equality on
+// last_recorded_at.
 export async function recordVerseMergeConflicts(
   env: Env,
   book: string,
   resource: string,
   rows: VerseMergeConflictRow[],
+  now: number,
 ): Promise<boolean> {
   if (rows.length === 0) return true;
   try {
@@ -91,57 +123,7 @@ export async function recordVerseMergeConflicts(
       const slice = rows.slice(i, i + WRITE_BATCH);
       await env.DB.batch(
         slice.map((r) =>
-          env.DB.prepare(
-            `INSERT INTO verse_merge_conflicts
-               (book, resource, chapter, verse, action, reason, overwritten_version, alignment, detected_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, unixepoch())
-             ON CONFLICT (book, resource, chapter, verse) DO UPDATE SET
-               -- A row needing human judgement must never be DOWNGRADED by a
-               -- later routine adoption. Night 1 records 'adopt_conflict'
-               -- pointing at overwritten human version v2; before anyone
-               -- reviews it, master changes again and night 2's merge is a
-               -- clean 'adopt'. Overwriting action would flip the row to
-               -- 'adopt' — which the banner deliberately filters out — so the
-               -- unreviewed collision would vanish from the one surface a
-               -- human watches, and the v2 pointer would be replaced by v3.
-               -- Anti-downgrade, scoped to ADOPTIONS ONLY. Night 1 records
-               -- 'adopt_conflict' pointing at overwritten human version v2;
-               -- before anyone reviews it, master changes again and night 2 is
-               -- a clean 'adopt'. Flipping to 'adopt' would drop the row from
-               -- the banner (which filters clean adoptions out), so the
-               -- unreviewed collision would vanish from the one surface a human
-               -- watches.
-               --
-               -- A 'keep_alignment_refused' row is deliberately NOT protected
-               -- here: a refusal means we kept D1 and wrote nothing, so a later
-               -- adoption that actually LANDED supersedes it as a statement of
-               -- fact. Pinning the row to 'refused' after a real write would
-               -- make action and overwritten_version tell two different nights'
-               -- stories — which is exactly how a refusal ended up carrying a
-               -- recovery pointer to text that was never replaced, silently
-               -- deleting the refusal guidance from the banner.
-               action = CASE
-                 WHEN excluded.action = 'adopt' AND verse_merge_conflicts.action = 'adopt_conflict'
-                 THEN verse_merge_conflicts.action
-                 ELSE excluded.action
-               END,
-               reason = CASE
-                 WHEN excluded.action = 'adopt' AND verse_merge_conflicts.action = 'adopt_conflict'
-                 THEN verse_merge_conflicts.reason
-                 ELSE excluded.reason
-               END,
-               -- The pointer must follow the SURVIVING action, or the column
-               -- stops meaning "the version we replaced". A refusal replaced
-               -- nothing, so it carries NULL. Otherwise keep the EARLIEST
-               -- pointer: it names the oldest human text that was overwritten
-               -- and never reviewed; the newer version is still reachable in
-               -- verse history, but nothing else records where the first went.
-               overwritten_version = CASE
-                 WHEN excluded.action = 'keep_alignment_refused' THEN NULL
-                 ELSE COALESCE(verse_merge_conflicts.overwritten_version, excluded.overwritten_version)
-               END,
-               alignment = COALESCE(excluded.alignment, verse_merge_conflicts.alignment)`,
-          ).bind(
+          env.DB.prepare(UPSERT_VERSE_MERGE_CONFLICT_SQL).bind(
             book,
             resource,
             r.chapter,
@@ -150,6 +132,7 @@ export async function recordVerseMergeConflicts(
             r.reason,
             r.overwrittenVersion,
             r.alignment ? JSON.stringify(r.alignment) : null,
+            now,
           ),
         ),
       );
@@ -165,18 +148,17 @@ export async function recordVerseMergeConflicts(
   }
 }
 
-// Delete conflict rows for adoptions whose version-CAS write did NOT land
-// (see bookReimport.ts's applyVerseRows step 6b/7b): the row was written
-// speculatively BEFORE the CAS batch so a mid-batch failure can't erase
-// evidence of an overwrite that DID happen, but once the write is confirmed
-// lost (a human wrote the verse first), nothing was overwritten and the row
-// would misdirect a reviewer to a version that still holds their current
-// text. Scoped to action IN ('adopt', 'adopt_conflict') — a
-// 'keep_alignment_refused' row never attempts a write, so it is never a
-// candidate for this cleanup. Best-effort: a delete failure just leaves a
-// spurious flag (the documented failure-mode inversion this whole ordering
-// exists to produce), never a silently lost one.
-export async function deleteLostAdoptionConflicts(
+// CONFIRMING half of two-phase reactivation. Call this ONLY with refs whose
+// master-adoption CAS write actually LANDED (bookReimport.ts's
+// `landedAdoptions` / `adoptionsApplied`, computed after the CAS batch) —
+// this is the ONLY place resolved_at/resolved_by are cleared for an
+// adoption, and it is deliberately a SEPARATE step from the speculative
+// upsert above so a lost CAS race never reactivates anything (see
+// CONFIRM_ADOPTED_CONFLICT_SQL's doc comment). Best-effort: a failure here
+// just leaves a row that stays resolved/dormant one run longer than it
+// should — never a false-positive reactivation, which is the failure mode
+// this two-phase split exists to prevent.
+export async function confirmAdoptedConflicts(
   env: Env,
   book: string,
   resource: string,
@@ -187,12 +169,51 @@ export async function deleteLostAdoptionConflicts(
     for (let i = 0; i < refs.length; i += WRITE_BATCH) {
       const slice = refs.slice(i, i + WRITE_BATCH);
       await env.DB.batch(
+        slice.map((r) => env.DB.prepare(CONFIRM_ADOPTED_CONFLICT_SQL).bind(book, resource, r.chapter, r.verse)),
+      );
+    }
+  } catch (e) {
+    console.error("verseMergeConflicts: confirm-adopted failed", {
+      book,
+      resource,
+      error: e instanceof Error ? e.message : String(e),
+    });
+  }
+}
+
+// Delete conflict rows for adoptions whose version-CAS write did NOT land
+// (see bookReimport.ts's applyVerseRows step 6b/7b): the row was written
+// speculatively BEFORE the CAS batch so a mid-batch failure can't erase
+// evidence of an overwrite that DID happen, but once the write is confirmed
+// lost (a human wrote the verse first), nothing was overwritten and the row
+// would misdirect a reviewer to a version that still holds their current
+// text. Best-effort: a delete failure just leaves a spurious flag (the
+// documented failure-mode inversion this whole ordering exists to produce),
+// never a silently lost one.
+//
+// `now` MUST be the exact same timestamp passed to this run's
+// recordVerseMergeConflicts call (bookReimport.ts already computes one `now`
+// per applyVerseRows invocation and reuses it for both) — see
+// DELETE_LOST_ADOPTION_CONFLICT_SQL's doc comment for why this scoping
+// (on last_recorded_at, not detected_at) exists: it protects a row's prior
+// resolution (from an earlier night) from being wholesale deleted just
+// because THIS run's separate speculative write happened to lose its CAS
+// race, while still deleting a row that is provably this run's own
+// speculative write and nothing else.
+export async function deleteLostAdoptionConflicts(
+  env: Env,
+  book: string,
+  resource: string,
+  refs: Array<{ chapter: number; verse: number }>,
+  now: number,
+): Promise<void> {
+  if (refs.length === 0) return;
+  try {
+    for (let i = 0; i < refs.length; i += WRITE_BATCH) {
+      const slice = refs.slice(i, i + WRITE_BATCH);
+      await env.DB.batch(
         slice.map((r) =>
-          env.DB.prepare(
-            `DELETE FROM verse_merge_conflicts
-              WHERE book = ?1 AND resource = ?2 AND chapter = ?3 AND verse = ?4
-                AND action IN ('adopt', 'adopt_conflict')`,
-          ).bind(book, resource, r.chapter, r.verse),
+          env.DB.prepare(DELETE_LOST_ADOPTION_CONFLICT_SQL).bind(book, resource, r.chapter, r.verse, now),
         ),
       );
     }
@@ -212,6 +233,69 @@ interface StoredConflictRow {
   reason: string;
   overwritten_version: number | null;
   alignment: string | null;
+}
+
+// ---------------------------------------------------------------------------
+// Editor fan-out (2026-08-14 prod audit fix). Until now the banner alert only
+// ever reached ALERT_USERNAME (the admin) — all 19 live conflict alerts
+// landed there and none reached the editors whose work was actually
+// overwritten (bethoakes, pjoakes, Carolyn1970, Grant_Ailie…). An
+// 'adopt_conflict' row means Door43's version replaced a human edit; this
+// attributes the overwrite to the human who made that edit — the edit_log
+// row that produced `overwritten_version` — and gives them their own alert,
+// in addition to (not instead of) the admin's. The pure grouping logic lives
+// in verseMergeEditorAlerts.ts (unit-tested there without D1); this is just
+// the D1 orchestration around it.
+// ---------------------------------------------------------------------------
+
+// D1 orchestration: one JOIN query PER CHUNK of the run's overwrites — never
+// N+1 per verse, but chunked at EDITOR_LOOKUP_CHUNK because D1 caps a
+// prepared statement at 100 bind variables and this query binds `book` plus
+// one key per verse. A "1CH-scale" run (this codebase's own history has one
+// at 174 verses) would otherwise throw on the very run this fix exists for.
+// Best-effort per chunk: a failure here must not affect the admin alert or
+// the caller's control flow (mirrors every other read in this file).
+async function lookupEditorUsernames(
+  env: Env,
+  book: string,
+  resource: string,
+  overwritten: OverwrittenVerseRef[],
+): Promise<Map<string, string>> {
+  const usernameByKey = new Map<string, string>();
+  for (let i = 0; i < overwritten.length; i += EDITOR_LOOKUP_CHUNK) {
+    const chunk = overwritten.slice(i, i + EDITOR_LOOKUP_CHUNK);
+    const { sql, keys } = buildEditorLookupQuery(book, resource, chunk);
+    try {
+      const rs = await env.DB.prepare(sql)
+        .bind(book, ...keys)
+        .all<{ key: string; username: string }>();
+      for (const r of rs.results ?? []) usernameByKey.set(r.key, r.username);
+    } catch (e) {
+      console.error("verseMergeConflicts: editor lookup failed", {
+        book,
+        resource,
+        error: e instanceof Error ? e.message : String(e),
+      });
+    }
+  }
+  return usernameByKey;
+}
+
+// Shared statement builder for "clear an UNDISMISSED alert" — the one
+// invariant every clear in this function must respect: a dismissed row is
+// never touched, or dismissing would be pointless (it would just come back
+// undismissed on the next run). Parameterized by an optional `username` so
+// the same helper covers both shapes this function needs: clearing every
+// username at once for this source (nothing left to report — see the
+// early-return branch below) and clearing one specific username (the
+// per-user replan below, via planSystemAlertWrites).
+function clearUndismissedAlertsStmt(env: Env, source: string, username?: string): D1PreparedStatement {
+  if (username != null) {
+    return env.DB.prepare(
+      `DELETE FROM system_alerts WHERE username = ?1 AND source = ?2 AND dismissed_at IS NULL`,
+    ).bind(username, source);
+  }
+  return env.DB.prepare(`DELETE FROM system_alerts WHERE source = ?1 AND dismissed_at IS NULL`).bind(source);
 }
 
 // Banner alert (system_alerts) naming the count, the reason breakdown, and
@@ -251,6 +335,7 @@ export async function raiseVerseMergeConflictAlert(
       `SELECT chapter, verse, action, reason, overwritten_version, alignment
          FROM verse_merge_conflicts
         WHERE book = ?1 AND resource = ?2 AND action IN ('adopt_conflict', 'keep_alignment_refused')
+          AND resolved_at IS NULL
         ORDER BY chapter ASC, verse ASC`,
     )
       .bind(book, resource)
@@ -294,9 +379,11 @@ export async function raiseVerseMergeConflictAlert(
   // could learn that tonight's export will still overwrite those verses.
   if (rows.length === 0 && !opts.recordingFailed && !opts.noBaseCount) {
     try {
-      await env.DB.prepare(`DELETE FROM system_alerts WHERE username = ?1 AND source = ?2 AND dismissed_at IS NULL`)
-        .bind(ALERT_USERNAME, source)
-        .run();
+      // Clear by SOURCE, not just the admin's username: a still-undismissed
+      // editor alert from an earlier run (see the editor fan-out below) named
+      // by this same source must also disappear once this book+resource has
+      // nothing left to report, or it would sit stale forever.
+      await clearUndismissedAlertsStmt(env, source).run();
     } catch (e) {
       console.error("verseMergeConflicts: alert clear failed", {
         book,
@@ -379,16 +466,63 @@ export async function raiseVerseMergeConflictAlert(
       ? `Sync flagged 0 verse(s) in ${book} ${resource.toUpperCase()} for adjudicated review.${guidance ? ` ${guidance}` : ""}`
       : `Sync flagged ${rows.length} verse(s) in ${book} ${resource.toUpperCase()} for review ` +
         `(${reasonBreakdown}).${refsClause} ${guidance}`;
-  try {
-    await env.DB.prepare(`DELETE FROM system_alerts WHERE username = ?1 AND source = ?2 AND dismissed_at IS NULL`)
-      .bind(ALERT_USERNAME, source)
-      .run();
-    await env.DB.prepare(
-      `INSERT INTO system_alerts (username, severity, source, message, link_url)
-       VALUES (?1, ?2, ?3, ?4, ?5)`,
+
+  // Editor fan-out: attribute each 'adopt_conflict' overwrite to the human
+  // whose edit it replaced (see this file's header block above) and give
+  // them their own alert. `keep_alignment_refused` is excluded — a refusal
+  // overwrote nothing, so there is no editor to notify.
+  const overwrittenRefs: OverwrittenVerseRef[] = rows
+    .filter(
+      (r): r is VerseMergeConflictRow & { overwrittenVersion: number } =>
+        r.action === "adopt_conflict" && r.overwrittenVersion != null,
     )
-      .bind(ALERT_USERNAME, "warning", source, message, null)
-      .run();
+    .map((r) => ({ chapter: r.chapter, verse: r.verse, overwrittenVersion: r.overwrittenVersion }));
+  const usernameByKey = await lookupEditorUsernames(env, book, resource, overwrittenRefs);
+  const perEditor = groupOverwrittenVersesByEditor(book, resource, overwrittenRefs, usernameByKey);
+
+  // The full desired state for this source: the admin's summary plus one
+  // entry per affected editor.
+  const desired = new Map<string, string>([
+    [ALERT_USERNAME, message],
+    ...[...perEditor.entries()].map(([username, editor]) => [username, editor.message] as const),
+  ]);
+
+  try {
+    // Read the CURRENT state for this exact source (every username, any
+    // dismissal state) so planSystemAlertWrites can tell "identical content
+    // already dismissed — leave it" apart from "stale or changed — rewrite
+    // it". Without this read, every run unconditionally deletes+reinserts,
+    // which is exactly what made a dismissed alert reappear the very next
+    // run (six-angle review DEFECT: "dismissal stickiness").
+    const existingRs = await env.DB.prepare(
+      `SELECT username, message, dismissed_at FROM system_alerts WHERE source = ?1`,
+    )
+      .bind(source)
+      .all<{ username: string; message: string; dismissed_at: number | null }>();
+    const existing = new Map(
+      (existingRs.results ?? []).map((r) => [r.username, { message: r.message, dismissedAt: r.dismissed_at }]),
+    );
+    const { toDelete, toInsert } = planSystemAlertWrites(existing, desired);
+
+    // FIX (six-angle review, item 5): fold every delete and insert this run
+    // needs into ONE batch (chunked at WRITE_BATCH, same as every other
+    // multi-row write in this file) instead of one bare DELETE followed by a
+    // separate INSERT batch — the old two-call shape meant a transient
+    // failure between them could delete an alert and never replace it.
+    const stmts = [
+      ...toDelete.map((username) => clearUndismissedAlertsStmt(env, source, username)),
+      ...toInsert.map(({ username, message: msg }) =>
+        env.DB
+          .prepare(
+            `INSERT INTO system_alerts (username, severity, source, message, link_url)
+             VALUES (?1, ?2, ?3, ?4, ?5)`,
+          )
+          .bind(username, "warning", source, msg, null),
+      ),
+    ];
+    for (let i = 0; i < stmts.length; i += WRITE_BATCH) {
+      await env.DB.batch(stmts.slice(i, i + WRITE_BATCH));
+    }
   } catch (e) {
     console.error("verseMergeConflicts: alert write failed", {
       book,
@@ -421,10 +555,14 @@ verseMergeConflicts.get("/:book", async (c) => {
   const book = c.req.param("book");
   // resource is part of the key — a book carries independent ULT and UST
   // conflicts, and omitting it would make the two indistinguishable.
+  // resolved_at IS NULL: a verse a human has already re-saved (see verses.ts's
+  // PATCH route) is no longer an ACTIVE conflict needing review — it stays in
+  // the table for the audit trail (see the resolved_at column comment in
+  // migration 0049) but must not keep showing up here as outstanding.
   const rs = await c.env.DB.prepare(
     `SELECT resource, chapter, verse, action, reason, overwritten_version, alignment
        FROM verse_merge_conflicts
-      WHERE book = ?1
+      WHERE book = ?1 AND resolved_at IS NULL
       ORDER BY chapter ASC, verse ASC, resource ASC`,
   )
     .bind(book)

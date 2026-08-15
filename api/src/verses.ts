@@ -20,6 +20,7 @@ import {
 } from "./alignmentDelta.ts";
 import { buildVerseHistory, type VerseHistoryLogRow } from "./verseHistory.ts";
 import { lanesToReopenOnVerseEdit, reopenLaneChecks } from "./laneReopen.ts";
+import { RESOLVE_VERSE_MERGE_CONFLICT_SQL, VERSE_PATCH_UPDATE_SQL } from "./verseMergeConflictSql.ts";
 
 // Verse content can carry malformed/missing `\w` occurrence data — colliding
 // `(text, occurrence)` pairs from a bad import or AI alignment (ULT/UST), or no
@@ -415,13 +416,7 @@ verses.patch("/:book/:chapter/:verse/:bibleVersion", requireEditor, async (c) =>
   // callers always send it).
   const [updateRes] = await c.env.DB.batch([
     c.env.DB
-      .prepare(
-        `UPDATE verses
-           SET content_json = ?1, plain_text = COALESCE(?2, plain_text), version = version + 1,
-               updated_at = ?3, updated_by = ?4
-         WHERE book = ?5 AND chapter = ?6 AND verse = ?7 AND bible_version = ?8
-           AND version = ?9`,
-      )
+      .prepare(VERSE_PATCH_UPDATE_SQL)
       .bind(
         JSON.stringify(parsed.data.content),
         parsed.data.plain_text ?? null,
@@ -447,18 +442,27 @@ verses.patch("/:book/:chapter/:verse/:bibleVersion", requireEditor, async (c) =>
         newVersion,
         JSON.stringify({ ...parsed.data, alignment_delta: delta }),
       ),
-    // A human saving this verse clears any merge conflict the nightly sync
-    // flagged for it (see verseMergeConflicts.ts / verseMerge.ts) — in the
-    // same batch so it costs no extra subrequest. Mirrors rows.ts's
+    // A human saving this verse RESOLVES (not deletes) any merge conflict the
+    // nightly sync flagged for it (see verseMergeConflicts.ts / verseMerge.ts)
+    // — in the same batch so it costs no extra subrequest. Mirrors rows.ts's
     // review-flag auto-clear precedent (line ~666). NOTE this is honestly
-    // "touched", not "reviewed": ANY save of this verse clears the flag, even
-    // an unrelated typo fix that never looked at the flagged collision, so a
-    // refusal/conflict can read as "resolved" without anyone having reviewed
-    // it. The book-level system_alerts banner is NOT cleared by this DELETE —
-    // it is derived fresh from verse_merge_conflicts on the next sync (see
-    // raiseVerseMergeConflictAlert), so a stale banner entry for THIS verse
-    // simply won't reappear next time, but nothing here proactively clears an
+    // "touched", not "reviewed": ANY save of this verse resolves the flag,
+    // even an unrelated typo fix that never looked at the flagged collision,
+    // so a refusal/conflict can read as "resolved" without anyone having
+    // reviewed it. The book-level system_alerts banner is NOT cleared by this
+    // UPDATE — it is derived fresh from verse_merge_conflicts on the next
+    // sync (see raiseVerseMergeConflictAlert, which now also filters on
+    // resolved_at IS NULL), so a stale banner entry for THIS verse simply
+    // won't reappear next time, but nothing here proactively clears an
     // already-posted banner mid-run.
+    //
+    // This used to be a DELETE, which erased the row — and with it the
+    // overwritten_version recovery pointer and the whole audit trail — the
+    // instant a human re-saved their own overwritten work. Measured on prod
+    // 2026-08-14: at least 14 rows already gone this way. Marking instead of
+    // deleting (migration 0049) keeps the row (and the pointer) for the
+    // audit trail while still removing it from every "active conflicts" view
+    // (this file's GET route, the banner query) via `resolved_at IS NULL`.
     //
     // Guarded on THIS request's UPDATE having actually landed, via the same
     // `changes() > 0` chain the edit_log statement above uses. The guard
@@ -470,17 +474,17 @@ verses.patch("/:book/:chapter/:verse/:bibleVersion", requireEditor, async (c) =>
     // equivalent and is not: if the nightly sync's own adoption wins the CAS
     // race and bumps this verse to newVersion first, our UPDATE changes
     // nothing and the request 409s — yet the row would already sit at
-    // newVersion, so a version test would fire and DELETE the conflict row
-    // that very sync just created. That erases the pointer to the overwritten
-    // text on a save that never landed, which is the exact failure this table
-    // exists to prevent.
+    // newVersion, so a version test would fire and mark-resolve the conflict
+    // row that very sync just created. That would erase the pointer to the
+    // overwritten text on a save that never landed, which is the exact
+    // failure this table exists to prevent.
+    //
+    // `resolved_at IS NULL` in the WHERE keeps a later, unrelated save from
+    // re-stamping (and reassigning resolved_by on) a conflict a previous save
+    // already resolved.
     c.env.DB
-      .prepare(
-        `DELETE FROM verse_merge_conflicts
-          WHERE book = ?1 AND resource = ?2 AND chapter = ?3 AND verse = ?4
-            AND changes() > 0`,
-      )
-      .bind(book, bibleVersion.toLowerCase(), chapter, verse),
+      .prepare(RESOLVE_VERSE_MERGE_CONFLICT_SQL)
+      .bind(now, userId, book, bibleVersion.toLowerCase(), chapter, verse),
   ]);
 
   if (!updateRes.meta.changes) {

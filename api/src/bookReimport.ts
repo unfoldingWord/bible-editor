@@ -80,6 +80,7 @@ import { verseContentJsonFromPayload } from "./verseHistory.ts";
 import { canonizeAlignmentSource } from "./canonizeHebrew.ts";
 import {
   recordVerseMergeConflicts,
+  confirmAdoptedConflicts,
   deleteLostAdoptionConflicts,
   raiseVerseMergeConflictAlert,
 } from "./verseMergeConflicts.ts";
@@ -2348,7 +2349,7 @@ async function applyVerseRows(
       overwrittenVersion: mc.overwrittenVersion,
       alignment: mc.alignment,
     }));
-    const recorded = await recordVerseMergeConflicts(env, book, resource, allConflictRows);
+    const recorded = await recordVerseMergeConflicts(env, book, resource, allConflictRows, now);
     if (!recorded) recordFailed = true;
   }
 
@@ -2508,6 +2509,26 @@ async function applyVerseRows(
   // broadcast half fires at all — see its own doc for which caller passes
   // which value and why.
   const landedAdoptions = masterAdoptions.filter((a) => adoptionsApplied.has(`${a.v.chapter}:${a.v.verse}`));
+
+  // 7a-confirm. Two-phase reactivation, CONFIRMING half (2026-08-15 Codex
+  // second-opinion review fix): step 6b's recordVerseMergeConflicts upsert
+  // above runs SPECULATIVELY, before this CAS batch, and deliberately does
+  // NOT clear resolved_at/resolved_by — only a LANDED adoption may do that,
+  // so a verse whose adoption LOSES its CAS race never falsely reactivates a
+  // conflict that was never actually overwritten. Scoped to `landedAdoptions`
+  // only (never the lost ones, which deleteLostAdoptionConflicts below
+  // handles on its own, disjoint ref set). See confirmAdoptedConflicts's and
+  // verseMergeConflictSql.ts's UPSERT_VERSE_MERGE_CONFLICT_SQL doc comments
+  // for the full incident this closes.
+  if (landedAdoptions.length > 0) {
+    await confirmAdoptedConflicts(
+      env,
+      book,
+      resource,
+      landedAdoptions.map((a) => ({ chapter: a.v.chapter, verse: a.v.verse })),
+    );
+  }
+
   const reopenEntries: Array<{ chapter: number; verse: number; lanes: CheckLane[] }> = [];
   for (const a of landedAdoptions) {
     const lanes = lanesForAdoption(bibleVersion, a.beforePlainText, a.plainText, a.beforeContentJson, a.v.contentJson);
@@ -2552,7 +2573,11 @@ async function applyVerseRows(
     .filter((mc) => mc.adopted && !adoptionsApplied.has(`${mc.chapter}:${mc.verse}`))
     .map((mc) => ({ chapter: mc.chapter, verse: mc.verse }));
   if (lostAdoptionRefs.length > 0) {
-    await deleteLostAdoptionConflicts(env, book, resource, lostAdoptionRefs);
+    // Same `now` passed to step 6b's recordVerseMergeConflicts call above —
+    // required for deleteLostAdoptionConflicts's detected_at-based scoping to
+    // correctly identify only THIS run's own speculative rows (see that
+    // function's doc comment).
+    await deleteLostAdoptionConflicts(env, book, resource, lostAdoptionRefs, now);
   }
 
   // 8. Tally this run's landed merge conflicts. FIX 2: excludes a clean
