@@ -580,6 +580,19 @@ async function runReimport(
   const masterConfirmedAtTq = want.has("tq") && tqRaw ? await getMasterConfirmedAt(env, book, "tq") : null;
   const masterConfirmedAtTwl = want.has("twl") && twlRaw ? await getMasterConfirmedAt(env, book, "twl") : null;
 
+  // P2.5 (subrequest budget): apply the TSV resources at the BOOK level, not per
+  // chapter. The three-way merge for edited tn/tq/twl rows does one batched
+  // edit_log read (reconstructTsvBases) per applyTsvRows call; calling it once per
+  // chapter meant one such read per chapter with edited candidates, and this
+  // (unchunked) full-book path — the user "Pull from Door43" route AND the
+  // post-export reimport (postExport.ts submits every chapter) — was already near
+  // the ~1000-subrequest cap on the largest books (PSA ~151 ch). applyTsvRows is
+  // chapter-independent (makeVerseSortOrder is a per-verse ordinal; tnContentKey
+  // includes chapter/verse so book-scope dedup is identical to per-chapter), so
+  // one call over all non-locked chapters' rows yields the same result at a fixed
+  // read cost. Verses stay per-chapter: applyVerseRows folds its ancestor via a
+  // sub-select in the row read (no separate reconstruction read to hoist).
+  const nonLockedChapters = new Set<number>();
   for (const chapter of chapters) {
     const lock = await activePipelineForChapter(env, book, chapter);
     if (lock) {
@@ -589,19 +602,8 @@ async function runReimport(
       }
       continue;
     }
+    nonLockedChapters.add(chapter);
 
-    if (want.has("tn") && tnRaw) {
-      const c = await reimportTsvForChapter(env, book, chapter, tnRaw, "tn", userId, masterConfirmedAtTn);
-      addCounts(perResource.tn, c);
-    }
-    if (want.has("tq") && tqRaw) {
-      const c = await reimportTsvForChapter(env, book, chapter, tqRaw, "tq", userId, masterConfirmedAtTq);
-      addCounts(perResource.tq, c);
-    }
-    if (want.has("twl") && twlRaw) {
-      const c = await reimportTsvForChapter(env, book, chapter, twlRaw, "twl", userId, masterConfirmedAtTwl);
-      addCounts(perResource.twl, c);
-    }
     if (want.has("ult") && ultRaw) {
       const c = await reimportVersesForChapter(env, book, chapter, ultRaw, "ULT", userId, masterConfirmedAtUlt);
       addCounts(perResource.ult, c);
@@ -610,6 +612,28 @@ async function runReimport(
       const c = await reimportVersesForChapter(env, book, chapter, ustRaw, "UST", userId, masterConfirmedAtUst);
       addCounts(perResource.ust, c);
     }
+  }
+
+  // Parse each TSV file ONCE and collect the rows for the non-locked requested
+  // chapters, then a single applyTsvRows per kind. Parsing once (not once per
+  // chapter, as the old rowsForChapter loop did) also drops the repeated
+  // whole-file parseTsv the chunked path already avoids for the same CPU reason.
+  const collectTsvRows = (raw: string, kind: TsvKind): ParsedTsvRow[] => {
+    const rows: ParsedTsvRow[] = [];
+    for (const r of parseTsv(raw).rows) {
+      const p = parseTsvRow(r, kind);
+      if (p && nonLockedChapters.has(p.chapter)) rows.push(p);
+    }
+    return rows;
+  };
+  if (want.has("tn") && tnRaw) {
+    addCounts(perResource.tn, await applyTsvRows(env, book, "tn", collectTsvRows(tnRaw, "tn"), userId, masterConfirmedAtTn));
+  }
+  if (want.has("tq") && tqRaw) {
+    addCounts(perResource.tq, await applyTsvRows(env, book, "tq", collectTsvRows(tqRaw, "tq"), userId, masterConfirmedAtTq));
+  }
+  if (want.has("twl") && twlRaw) {
+    addCounts(perResource.twl, await applyTsvRows(env, book, "twl", collectTsvRows(twlRaw, "twl"), userId, masterConfirmedAtTwl));
   }
 
   // FIX 4: fire the verse-merge-conflict banner once per (book, resource) for
@@ -699,9 +723,10 @@ interface ParsedTsvRow {
 }
 
 // Normalize one raw TSV record into a ParsedTsvRow (no chapter filter). Shared
-// by rowsForChapter (the reimport row loop) and changedTsvChapters (the diff
-// gate) so the two agree exactly on field normalization — otherwise the gate
-// could mis-classify a chapter as unchanged. Returns null for a row with no ID.
+// by the reimport row loops (runReimport's collectTsvRows + reimportStagedChunk)
+// and changedTsvChapters (the diff gate) so they agree exactly on field
+// normalization — otherwise the gate could mis-classify a chapter as unchanged.
+// Returns null for a row with no ID.
 function parseTsvRow(r: Record<string, string>, kind: TsvKind): ParsedTsvRow | null {
   const rawId = r["ID"];
   if (!rawId) return null;
@@ -744,33 +769,6 @@ function parseTsvRow(r: Record<string, string>, kind: TsvKind): ParsedTsvRow | n
   return base;
 }
 
-function rowsForChapter(raw: string, kind: TsvKind, chapter: number): ParsedTsvRow[] {
-  const { rows } = parseTsv(raw);
-  const out: ParsedTsvRow[] = [];
-  for (const r of rows) {
-    const parsed = parseTsvRow(r, kind);
-    if (!parsed || parsed.chapter !== chapter) continue;
-    out.push(parsed);
-  }
-  return out;
-}
-
-// One UPDATE per pristine row, plus one INSERT-OR-IGNORE per row to seed
-// any DCS-new entries. We don't batch into env.DB.batch() because the per-
-// row "did anything change?" signal comes from meta.changes, and batch()
-// reports aggregate counts only. Throughput is fine — a chapter's worth of
-// tn rows is dozens, not thousands.
-async function reimportTsvForChapter(
-  env: Env,
-  book: string,
-  chapter: number,
-  raw: string,
-  kind: TsvKind,
-  userId: number | null,
-  cutoff: MergeCutoff | null,
-): Promise<ReimportCounts> {
-  return applyTsvRows(env, book, kind, rowsForChapter(raw, kind, chapter), userId, cutoff);
-}
 
 // Upsert already-parsed TSV rows (any chapters). Batched to stay under the
 // per-invocation subrequest cap: ONE chunked read of the current rows, an
