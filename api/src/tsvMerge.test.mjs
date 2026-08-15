@@ -10,7 +10,7 @@
 // silently kept-and-reverted — attributed per field against the reconstructed
 // ancestor. See tsvMerge.ts's header and the edited-row-skips-master-edit memory.
 
-import { computeTsvMerge, foldTsvBase, tsvMergeFields } from "./tsvMerge.ts";
+import { computeTsvMerge, foldTsvBase, tsvMergeFields, tsvRefMoved } from "./tsvMerge.ts";
 
 let failed = 0;
 function eq(actual, expected, msg) {
@@ -219,6 +219,72 @@ deep(tsvMergeFields("tq"), ["quote", "question", "response"], "tq field list");
     { action: "update", payload: { support_reference: null } },
   ]);
   eq(base.support_reference, null, "fold present-null overlays to null");
+}
+
+// ── tsvRefMoved (P1.4 reference-move detection) ─────────────────────────────
+// The reimport must detect a Door43 maintainer re-anchoring an app-edited row
+// to a different Reference (same id, new chapter/verse/ref_raw) — identity
+// columns are excluded from computeTsvMerge, so nothing else catches this class,
+// and missing it silently reverts the maintainer's move. These lock the
+// detection (bookReimport.ts calls this exact helper; a regression here fails
+// the suite). The two effects a true triggers in the caller — apply_incomplete
+// (withhold the resource watermark so the export can't revert master) and
+// review_kind='ref_moved' (flag the row for a human) — are wired in
+// applyTsvRows off this boolean; this covers the decision that drives them.
+
+// A moved row's identity change is invisible to the field merge: computeTsvMerge
+// only sees content fields, so a same-content move yields no writeFields. This is
+// exactly WHY the separate tsvRefMoved detection + watermark withhold is needed.
+{
+  const side = { quote: "q", note: "n", occurrence: 1, support_reference: null };
+  const r = computeTsvMerge("tn", side, side, side);
+  eq(r.action, "keep_converged", "moved-but-same-content row: field merge sees no change");
+  deep(r.writeFields, {}, "moved-but-same-content row: field merge writes nothing (identity excluded)");
+}
+
+// Cross-chapter move (the case the row won't even appear in the old chapter's
+// incoming set — caught when master's NEW chapter is processed via the id lookup).
+{
+  const cur = { chapter: 3, verse: 4, ref_raw: "3:4" };
+  const incoming = { chapter: 5, verse: 1, refRaw: "5:1" };
+  eq(tsvRefMoved(cur, incoming, false), true, "cross-chapter move detected");
+}
+
+// Same-chapter verse move.
+{
+  eq(tsvRefMoved({ chapter: 1, verse: 2, ref_raw: "1:2" }, { chapter: 1, verse: 6, refRaw: "1:6" }, false), true, "same-chapter verse move detected");
+}
+
+// ref_raw-only change (chapter/verse identical — e.g. a verse-bridge reshape
+// like "1:2" -> "1:2-3" that refParts still reduces to chapter 1 verse 2).
+{
+  eq(tsvRefMoved({ chapter: 1, verse: 2, ref_raw: "1:2" }, { chapter: 1, verse: 2, refRaw: "1:2-3" }, false), true, "ref_raw-only change detected as a move");
+}
+
+// Not a move: identical location -> false (must not withhold the watermark for a
+// normal edited row whose reference never changed).
+{
+  eq(tsvRefMoved({ chapter: 1, verse: 2, ref_raw: "1:2" }, { chapter: 1, verse: 2, refRaw: "1:2" }, false), false, "identical location is not a move");
+}
+
+// D1's chapter/verse arrive as strings from the stored row (Record<string,
+// unknown>); Number() coercion must not read "1" !== 1 as a move.
+{
+  eq(tsvRefMoved({ chapter: "1", verse: "2", ref_raw: "1:2" }, { chapter: 1, verse: 2, refRaw: "1:2" }, false), false, "string chapter/verse coerce and compare equal");
+}
+
+// A null stored ref_raw normalizes to "" and matches an incoming "" (never a
+// spurious move on a blank-ref row).
+{
+  eq(tsvRefMoved({ chapter: 1, verse: 2, ref_raw: null }, { chapter: 1, verse: 2, refRaw: "" }, false), false, "null stored ref_raw vs empty incoming -> not a move");
+}
+
+// Protected row (tn deleted/trashed/preserve/hint) is NEVER a move, even when the
+// reference genuinely differs — it is left untouched and kept skipped_edited, so
+// returning true would wrongly withhold the watermark forever (see the caller's
+// cold-review #1 note in bookReimport.ts).
+{
+  eq(tsvRefMoved({ chapter: 3, verse: 4, ref_raw: "3:4" }, { chapter: 5, verse: 1, refRaw: "5:1" }, true), false, "protected row is never treated as moved");
 }
 
 if (failed) {
