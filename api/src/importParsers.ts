@@ -417,6 +417,159 @@ export function healReplacementChars(
   return report;
 }
 
+// ─── Curl straight quotes on the AI-pipeline ingest path (verse text AND ──────
+// ─── note/question/response prose) ───────────────────────────────────────────
+//
+// bp-assistant's ULT/UST verse drafts have written STRAIGHT ' and " into
+// content_json (JER 32/33, NUM 26:53, en_ult + en_ust, 2026 June–July prod
+// forensics) — DCS master's USFM ends up with straight quotes, and the export
+// path never fixes them because tsvFormat.ts's educateQuotes only runs over
+// tn/tq TSV cells, not verse USFM. Every other entry point curls at ingest —
+// client-side keystroke/paste interception (web/src/lib/curlyQuotes.ts) and
+// the tn/tq TSV export (tsvFormat.ts educateQuotes, left untouched — it stays
+// the export-time normalizer for human-typed content) — this closes the gap
+// for the AI-pipeline's OWN ingest of both verse text (curlifyVerseObjects,
+// called from pipelineImport.ts's applyVerseUpdate) and note/question/response
+// prose (curlifyText, called from tnPayload/tqPayload). The two calls share
+// this exact same contextual rule (curlifyChar/isOpeningQuoteContext) so an
+// AI-drafted note is never curled differently than AI-drafted verse text in
+// the same run — a real divergence existed here when note prose went through
+// tsvFormat.ts's educateQuotes instead (that function's opening-context class
+// omits `/`, curlifyChar's includes it, matching web/src/lib/curlyQuotes.ts).
+//
+// Deliberately NOT wired into extractVersesForRange above: that function also
+// serves the nightly DCS reimport (bookReimport.ts) and the bootstrap import
+// (bookImport.ts), and this fix must stay scoped to the AI-pipeline write path
+// only — existing D1 data and the master reimport are out of scope here.
+//
+// Mirrors curlyFor/isOpeningContext in web/src/lib/curlyQuotes.ts (duplicated
+// for the same cross-bundle reason as extractPlainText above — keep in sync): a
+// quote is "opening" when the preceding character is missing, whitespace, or
+// another opener-ish punctuation mark; otherwise it's closing, which is also
+// how ' doubles as a contextual apostrophe (don't → don't).
+const CURLY_LDQUO = "“"; // “
+const CURLY_RDQUO = "”"; // ”
+const CURLY_LSQUO = "‘"; // ‘
+const CURLY_RSQUO = "’"; // ’
+
+function isOpeningQuoteContext(prev: string | undefined): boolean {
+  if (!prev) return true;
+  if (/\s/.test(prev)) return true;
+  return /[(\[{<\-–—/“‘]/.test(prev);
+}
+
+// Curl one straight quote character. `prevCurled` is the last CURLED
+// character emitted before it (drives the opening/closing context rule).
+// `prevRaw` is the last RAW (pre-curl) character (drives the adjacency
+// override below). Two of the SAME straight quote character sitting directly
+// back-to-back — nothing else between them — can never both resolve to the
+// same side via the plain context rule alone: `""` naively curls to `““`
+// (the second quote sees the just-emitted “ as an "opener-ish" prev char and
+// opens again), and `"a""b"` naively curls to `“a””b”` (the 3rd quote sees
+// the just-emitted ” as ordinary, non-opener context and closes again
+// instead of opening the next quoted word). When `prevRaw` is the identical
+// straight quote, force strict alternation instead of consulting context:
+// `""` → `“”` (an empty quoted phrase), `"a""b"` → `“a”“b”` (two
+// back-to-back quoted words).
+function curlifyChar(ch: '"' | "'", prevRaw: string | undefined, prevCurled: string | undefined): string {
+  if (prevRaw === ch) {
+    if (ch === '"') return prevCurled === CURLY_LDQUO ? CURLY_RDQUO : CURLY_LDQUO;
+    return prevCurled === CURLY_LSQUO ? CURLY_RSQUO : CURLY_LSQUO;
+  }
+  if (ch === '"') return isOpeningQuoteContext(prevCurled) ? CURLY_LDQUO : CURLY_RDQUO;
+  return isOpeningQuoteContext(prevCurled) ? CURLY_LSQUO : CURLY_RSQUO;
+}
+
+// Curl every straight quote in one text string, threading in the last
+// character emitted (curled) and seen (raw) before it — from a preceding
+// sibling/ancestor node in a verse tree walk, or `undefined`/`undefined` for a
+// standalone string (see curlifyText below) — so a quote right at a node
+// boundary still sees real context in both senses curlifyChar needs. Returns
+// the (possibly unchanged) text plus whether anything changed, so the caller
+// can skip a write on a clean string.
+function curlifyTextWithContext(
+  text: string,
+  prevCurled: string | undefined,
+  prevRaw: string | undefined,
+): { text: string; changed: boolean } {
+  let out = "";
+  let changed = false;
+  let curled = prevCurled;
+  let raw = prevRaw;
+  for (const ch of text) {
+    if (ch === '"' || ch === "'") {
+      const curly = curlifyChar(ch, raw, curled);
+      out += curly;
+      if (curly !== ch) changed = true;
+      curled = curly;
+    } else {
+      out += ch;
+      curled = ch;
+    }
+    raw = ch;
+  }
+  return { text: out, changed };
+}
+
+// Curl straight quotes in a standalone string with no surrounding tree — the
+// entry point for AI-drafted note/question/response PROSE (pipelineImport.ts
+// tnPayload/tqPayload). Starts with no incoming context (a note is its own
+// document, unlike a verse's tree walk), and shares curlifyChar/
+// isOpeningQuoteContext with curlifyVerseObjects below so the two ingest
+// paths can never disagree on how a given straight quote curls. No-op
+// (identity) on text with no straight quotes.
+export function curlifyText(text: string): string {
+  if (!text || !/['"]/.test(text)) return text;
+  return curlifyTextWithContext(text, undefined, undefined).text;
+}
+
+// Mutates `verseObjects` in place (like healReplacementChars /
+// canonizeAlignmentSource); returns whether anything changed.
+//
+// Touches ONLY a node's own `.text` string, walked in document order across
+// the whole tree (target `\w` words, plain text, and a marker's own parked
+// leading text — see "usfm-js parks leading punctuation on the marker's
+// `text`" in STATE.md) — EXCEPT `\zaln-s` milestone nodes (type "milestone",
+// tag "zaln" — the file's standard test elsewhere, e.g. isZalnNode /
+// nodeIsMilestone in highlight.ts), whose own attributes (content/lemma/
+// morph/strong — the Hebrew/Greek surface form) are source-owned and never
+// touched, even defensively if one ever carried a `.text` key. Milestone
+// CHILDREN (the aligned target words) are walked normally. No node is added,
+// removed, reordered, or re-nested, no `\w` occurrence changes, and no
+// attribute is ever assigned — so this can never unalign a word, alter a word
+// count, or touch Hebrew/Greek. No-op (identity) on a verse with no straight
+// quotes, the common case.
+export function curlifyVerseObjects(verseObjects: unknown[]): boolean {
+  if (!Array.isArray(verseObjects)) return false;
+  let changed = false;
+  let prevCurled: string | undefined;
+  let prevRaw: string | undefined;
+  const walk = (nodes: unknown[]): void => {
+    for (const node of nodes) {
+      if (!node || typeof node !== "object") continue;
+      const o = node as Record<string, unknown>;
+      const isSourceMilestone = o["type"] === "milestone" && o["tag"] === "zaln";
+      const text = o["text"];
+      if (!isSourceMilestone && typeof text === "string" && text.length > 0) {
+        if (/['"]/.test(text)) {
+          const result = curlifyTextWithContext(text, prevCurled, prevRaw);
+          if (result.changed) {
+            o["text"] = result.text;
+            changed = true;
+          }
+          prevCurled = result.text[result.text.length - 1];
+        } else {
+          prevCurled = text[text.length - 1];
+        }
+        prevRaw = text[text.length - 1];
+      }
+      if (Array.isArray(o["children"])) walk(o["children"] as unknown[]);
+    }
+  };
+  walk(verseObjects);
+  return changed;
+}
+
 // ─── Reconcile source-owned `\zaln-s` attributes from master ─────────────────
 //
 // The `\zaln-s` milestone carries original-language (UHB/UGNT) attributes —
@@ -955,7 +1108,17 @@ function collapseRedundantTsMilestones(verseObjects: unknown[]): unknown[] {
 //   { type: 'word', text: '...', occurrence, ... }
 //   { type: 'milestone', tag: 'zaln-s', children: [...] }
 //   { type: 'paragraph', tag: 'p' }
-function extractPlainText(verseObj: unknown): string {
+//
+// Exported so pipelineImport.ts's applyVerseUpdate can RE-derive plain_text
+// from the FINAL, self-healed verseObjects tree (after curlifyVerseObjects
+// and the other AI-ingest heals run) instead of trusting the AI-supplied
+// payload.plain_text verbatim — a mutation pass that rewrites `.text` (or
+// drops/rewrites a node) makes any UN-recomputed plain_text stale, which
+// breaks FindReplaceOverlay / source search (both match on plain_text) and,
+// worse, makes the next nightly bookReimport compare master's freshly-
+// extracted text against this stale value, see a false diff, and spuriously
+// re-seed the verse (resetting updated_by) every night.
+export function extractPlainText(verseObj: unknown): string {
   const parts: string[] = [];
   const walk = (vos: unknown[]): void => {
     for (const vo of vos || []) {
