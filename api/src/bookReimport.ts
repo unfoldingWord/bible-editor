@@ -554,7 +554,7 @@ async function runReimport(
     const state = await resourceSyncState(env, book, resource);
     const own = await recognizePushedRender(env, book, resource, raw, state);
     if (!own.recognized) continue;
-    const stamped = await markOwnPublishConverged(env, book, resource, own.readAt, null);
+    const stamped = await markOwnPublishConverged(env, book, resource, own.readAt, state.pushedEditId, null);
     if (stamped) perResource[resource].own_publish_converged++;
     console.log("reimport recognized master's movement as our own publish", {
       book,
@@ -766,9 +766,9 @@ async function reimportTsvForChapter(
   raw: string,
   kind: TsvKind,
   userId: number | null,
-  masterConfirmedAt: number | null,
+  cutoff: MergeCutoff | null,
 ): Promise<ReimportCounts> {
-  return applyTsvRows(env, book, kind, rowsForChapter(raw, kind, chapter), userId, masterConfirmedAt);
+  return applyTsvRows(env, book, kind, rowsForChapter(raw, kind, chapter), userId, cutoff);
 }
 
 // Upsert already-parsed TSV rows (any chapters). Batched to stay under the
@@ -791,16 +791,19 @@ async function applyTsvRows(
   kind: TsvKind,
   incoming: ParsedTsvRow[],
   userId: number | null,
-  // Three-way merge ancestor cutoff for this (book, resource) —
-  // book_resource_syncs.master_confirmed_at, hoisted once per run by the caller
-  // (getMasterConfirmedAt). NULL means never positively confirmed on master:
-  // the three-way merge for edited rows stays inert and they fall back to the
-  // pre-existing ancestor-free computeEditedFieldMerge, exactly as before.
-  masterConfirmedAt: number | null = null,
+  // Three-way merge ancestor cutoff for this (book, resource), hoisted once per
+  // run by the caller (getMasterConfirmedAt). `confirmedAt` NULL — or the whole
+  // object null (resource not present this run) — means never positively
+  // confirmed on master: the three-way merge for edited rows stays inert and
+  // they fall back to the pre-existing ancestor-free computeEditedFieldMerge,
+  // exactly as before. `editId` (P1.3) is the precise id boundary when present.
+  cutoff: MergeCutoff | null = null,
 ): Promise<ReimportCounts> {
   const counts = zeroCounts();
   if (incoming.length === 0) return counts;
   const now = Math.floor(Date.now() / 1000);
+  const masterConfirmedAt = cutoff?.confirmedAt ?? null;
+  const masterEditId = cutoff?.editId ?? null;
 
   // One read of the comparable + pristine-predicate columns for the incoming
   // ids (chunked under the 100 bound-param limit) so classification is in memory.
@@ -996,7 +999,7 @@ async function applyTsvRows(
     // and rows fall back to computeEditedFieldMerge exactly as before this fix.
     const bases =
       masterConfirmedAt != null
-        ? await reconstructTsvBases(env, book, kind, editedCandidates.map((c) => c.row.id), masterConfirmedAt)
+        ? await reconstructTsvBases(env, book, kind, editedCandidates.map((c) => c.row.id), masterConfirmedAt, masterEditId)
         : new Map<string, TsvMergeSide | null>();
     for (const { row, cur } of editedCandidates) {
       const fields: Record<string, unknown> = {};
@@ -1368,15 +1371,15 @@ function parsedRowToMergeSide(kind: TsvKind, row: ParsedTsvRow): TsvMergeSide {
 // regardless of how long each row's history is. A row with no content-bearing
 // history before the cutoff maps to null (caller keeps D1 as keep_no_base).
 //
-// KNOWN LIMITATION (Codex P1.3), shared with the verse merge's identical
-// `created_at < cutoff` sub-select: `cutoff` (master_confirmed_at) is the
-// export's D1-read time at 1-SECOND granularity (Math.floor). An edit committed
-// in the SAME second as that read is excluded here, so the ancestor can be one
-// edit too old — and a later D1 edit then reads as a false both-changed conflict
-// (master wins, the app value is flagged + recoverable from history, NOT silently
-// lost). Rare (needs a same-second coincidence) and non-destructive. The precise
-// fix is an edit_log-id/version boundary captured at export-read time rather than
-// a second-granularity timestamp — an export-side change tracked as a follow-up.
+// PRECISE BOUNDARY (Codex P1.3, fixed). When `boundaryId` is non-null the fold
+// cuts at `id <= boundaryId` — the MAX(edit_log.id) the export captured at its D1
+// read (0050's master_confirmed_edit_id) — instead of `created_at < cutoff`.
+// edit_log.id is a monotonic AUTOINCREMENT, so an edit committed in the SAME
+// second as the export read (which `created_at < cutoff` wrongly excluded, making
+// the ancestor one edit too old and a later D1 edit read as a false both-changed
+// conflict) now lands on the correct side of the boundary. `boundaryId` is null
+// only during warm-up (a row confirmed before 0050 was stamped); then it falls
+// back to the pre-P1.3 `created_at < cutoff` timestamp, unchanged.
 //
 // SUBREQUEST BUDGET (Codex P2.5): this adds ONE batched read per chapter that has
 // edited candidates, and only when a watermark exists. The nightly path is
@@ -1394,24 +1397,30 @@ async function reconstructTsvBases(
   kind: TsvKind,
   ids: string[],
   cutoff: number,
+  boundaryId: number | null,
 ): Promise<Map<string, TsvMergeSide | null>> {
   const out = new Map<string, TsvMergeSide | null>();
   const entriesById = new Map<string, TsvEditLogEntry[]>();
+  // P1.3: cut at the precise id boundary when we have one, else the timestamp.
+  // Either way ?3 carries the single bound value; only the column/operator swaps.
+  const boundaryClause = boundaryId != null ? `id <= ?3` : `created_at < ?3`;
+  const boundaryBind = boundaryId != null ? boundaryId : cutoff;
   for (let i = 0; i < ids.length; i += WRITE_BATCH) {
     const slice = ids.slice(i, i + WRITE_BATCH);
-    // ?1 book, ?2 kind, ?3 cutoff, ids from ?4. Ordered by (row_key, id) so each
-    // group folds oldest→newest. `id` is monotonic per row, so it is a valid
-    // chronological tiebreak within a row_key even at identical created_at.
+    // ?1 book, ?2 kind, ?3 boundary (id or created_at), ids from ?4. Ordered by
+    // (row_key, id) so each group folds oldest→newest. `id` is monotonic per row,
+    // so it is a valid chronological tiebreak within a row_key even at identical
+    // created_at.
     const inClause = slice.map((_, j) => `?${j + 4}`).join(", ");
     const rs = await env.DB.prepare(
       `SELECT row_key, action, payload_json FROM edit_log
         WHERE kind = ?2 AND (book = ?1 OR book IS NULL)
           AND action IN ('create', 'update', 'restore')
-          AND created_at < ?3
+          AND ${boundaryClause}
           AND row_key IN (${inClause})
         ORDER BY row_key ASC, id ASC`,
     )
-      .bind(book, kind, cutoff, ...slice)
+      .bind(book, kind, boundaryBind, ...slice)
       .all<{ row_key: string; action: string; payload_json: string | null }>();
     for (const r of rs.results) {
       let payload: Record<string, unknown> | null = null;
@@ -1669,7 +1678,7 @@ async function reimportVersesForChapter(
   rawUsfm: string,
   bibleVersion: "ULT" | "UST",
   userId: number | null,
-  masterConfirmedAt: number | null,
+  cutoff: MergeCutoff | null,
 ): Promise<ReimportCounts> {
   // broadcastLaneReopens: true — this is the user-triggered runReimport path
   // (POST /:book/reimport), where a human is watching this request. See
@@ -1680,7 +1689,7 @@ async function reimportVersesForChapter(
     bibleVersion,
     extractVersesForRange(rawUsfm, chapter, chapter),
     userId,
-    masterConfirmedAt,
+    cutoff,
     true,
   );
 }
@@ -1721,20 +1730,52 @@ function sourceWordsForVerseRange(
 // push is routine here and is not proof master moved, and attributing against it
 // was the root cause of the 1CH incident (see verseMerge.ts's header).
 //
-// NULL means "never positively
+// `confirmedAt` NULL means "never positively
 // confirmed" and callers MUST skip the merge entirely for that case — never
 // treat "not yet confirmed" as "nothing changed" (identical in effect to a
 // missing watermark row before this fix). Constant per (book, resource) for
 // an entire reimport run, so callers read it ONCE per run/step rather than
 // once per chapter — see the call sites in runReimport and
 // reimportStagedChunk for where the hoisting lands.
-async function getMasterConfirmedAt(env: Env, book: string, resource: string): Promise<number | null> {
-  const row = await env.DB.prepare(
-    `SELECT master_confirmed_at FROM book_resource_syncs WHERE book = ?1 AND resource = ?2`,
-  )
-    .bind(book, resource)
-    .first<{ master_confirmed_at: number | null }>();
-  return row?.master_confirmed_at ?? null;
+//
+// P1.3: also returns `editId` — 0050's master_confirmed_edit_id, the PRECISE
+// edit_log id boundary of the confirmed render. When non-null the reconstruction
+// folds `id <= editId` (immune to the 1-second `created_at` granularity that let
+// a same-second-as-the-export-read edit fall out of the ancestor); when null
+// (warm-up: an existing row confirmed before 0050, not yet re-stamped) the
+// reconstruction falls back to `created_at < confirmedAt`, the pre-P1.3 behavior.
+interface MergeCutoff {
+  confirmedAt: number | null;
+  editId: number | null;
+}
+
+async function getMasterConfirmedAt(env: Env, book: string, resource: string): Promise<MergeCutoff> {
+  try {
+    const row = await env.DB.prepare(
+      `SELECT master_confirmed_at, master_confirmed_edit_id FROM book_resource_syncs WHERE book = ?1 AND resource = ?2`,
+    )
+      .bind(book, resource)
+      .first<{ master_confirmed_at: number | null; master_confirmed_edit_id: number | null }>();
+    return { confirmedAt: row?.master_confirmed_at ?? null, editId: row?.master_confirmed_edit_id ?? null };
+  } catch (e) {
+    // 0050 not applied yet (deploy raced its migration — the "missing migration
+    // = prod 500s" class). Degrade to the timestamp cutoff rather than fail the
+    // whole reimport: fall back to master_confirmed_at alone with editId null, so
+    // the merge keeps running on the pre-P1.3 `created_at` boundary until 0050
+    // lands. Logged loudly — a silently-disabled precision is how the original
+    // watermark bug hid for months.
+    console.error("reimport: master_confirmed_edit_id read failed (migration 0050 unapplied?) — merge boundary degraded to the second-granularity timestamp", {
+      book,
+      resource,
+      error: e instanceof Error ? e.message : String(e),
+    });
+    const row = await env.DB.prepare(
+      `SELECT master_confirmed_at FROM book_resource_syncs WHERE book = ?1 AND resource = ?2`,
+    )
+      .bind(book, resource)
+      .first<{ master_confirmed_at: number | null }>();
+    return { confirmedAt: row?.master_confirmed_at ?? null, editId: null };
+  }
 }
 
 // Heal AI-mangled U+FFFD in `\zaln-s` source attributes (x-content / x-lemma /
@@ -1845,7 +1886,7 @@ async function applyVerseRows(
   bibleVersion: "ULT" | "UST",
   verses: VerseExtract[],
   userId: number | null,
-  masterConfirmedAt: number | null,
+  cutoff: MergeCutoff | null,
   // FIX 3: whether the master-adoption lane-reopen step (7a below) should
   // fire the best-effort broadcastChapter live-tab notification. The DELETE
   // that actually reopens the checkoff (the correctness-bearing half) always
@@ -1882,11 +1923,21 @@ async function applyVerseRows(
   // (reconcileEditedVerseSourceAttrs) exactly as it was — identical to the
   // pre-fix "no watermark row" behavior, never treated as "nothing changed".
   const resource = bibleVersion.toLowerCase();
-  const lastExportAt = masterConfirmedAt;
+  const lastExportAt = cutoff?.confirmedAt ?? null;
+  // P1.3: precise id boundary when present; both sub-selects swap to it together.
+  const masterEditId = cutoff?.editId ?? null;
 
   // The two merge-ancestor sub-selects are appended only when a watermark
   // exists, so a book/resource with no successful export ever pays no extra
-  // read and behaves identically to before this change.
+  // read and behaves identically to before this change. When a precise id
+  // boundary exists (P1.3) both sub-selects cut on `id <= / > ?N` instead of
+  // `created_at < / >= ?N`, so a same-second-as-the-export-read edit is
+  // attributed correctly; ?N carries either value. `base_payload` still
+  // ORDER BY id DESC LIMIT 1 (newest surviving edit at/before the boundary).
+  const boundaryParam = chapters.length + 3;
+  const baseBoundary = masterEditId != null ? `id <= ?${boundaryParam}` : `created_at < ?${boundaryParam}`;
+  const sinceBoundary = masterEditId != null ? `id > ?${boundaryParam}` : `created_at >= ?${boundaryParam}`;
+  const boundaryBind = masterEditId != null ? masterEditId : lastExportAt;
   const mergeCols =
     lastExportAt != null
       ? `,
@@ -1895,7 +1946,7 @@ async function applyVerseRows(
                  AND row_key = ?1 || '/' || chapter || '/' || verse || '/' || ?2
                  AND (book = ?1 OR book IS NULL)
                  AND action IN ('create', 'update')
-                 AND created_at < ?${chapters.length + 3}
+                 AND ${baseBoundary}
                ORDER BY id DESC LIMIT 1) AS base_payload,
             EXISTS (
               SELECT 1 FROM edit_log
@@ -1903,11 +1954,11 @@ async function applyVerseRows(
                  AND row_key = ?1 || '/' || chapter || '/' || verse || '/' || ?2
                  AND (book = ?1 OR book IS NULL)
                  AND source IS NULL
-                 AND created_at >= ?${chapters.length + 3}
+                 AND ${sinceBoundary}
             ) AS human_edit_after_export`
       : "";
   const existingBind: unknown[] =
-    lastExportAt != null ? [book, bibleVersion, ...chapters, lastExportAt] : [book, bibleVersion, ...chapters];
+    lastExportAt != null ? [book, bibleVersion, ...chapters, boundaryBind] : [book, bibleVersion, ...chapters];
   const existingRs = await env.DB.prepare(
     `SELECT chapter, verse, content_json, plain_text, verse_end, version, updated_by,
             (SELECT source FROM edit_log
@@ -2881,6 +2932,12 @@ interface ResourceSyncState {
   sourceSha: string | null;
   pushedBlobSha: string | null;
   pushedReadAt: number | null;
+  // P1.3: the edit_log id boundary (0050's pushed_edit_id) of the render
+  // pushedBlobSha/pushedReadAt describe. Read from the SAME row snapshot as
+  // pushedReadAt so, on recognition, markOwnPublishConverged can stamp
+  // master_confirmed_edit_id from the same render pushedReadAt stamps
+  // master_confirmed_at — the two can never drift to different renders.
+  pushedEditId: number | null;
   /** Consecutive byte-comparison declines — see migration 0048's column doc. */
   declines: number;
 }
@@ -2915,7 +2972,7 @@ interface ResourceSyncState {
 async function resourceSyncState(env: Env, book: string, resource: Resource): Promise<ResourceSyncState> {
   try {
     const row = await env.DB.prepare(
-      `SELECT source_sha, pushed_blob_sha, pushed_read_at, own_publish_declines
+      `SELECT source_sha, pushed_blob_sha, pushed_read_at, pushed_edit_id, own_publish_declines
          FROM book_resource_syncs WHERE book = ?1 AND resource = ?2`,
     )
       .bind(book, resource)
@@ -2923,16 +2980,18 @@ async function resourceSyncState(env: Env, book: string, resource: Resource): Pr
         source_sha: string | null;
         pushed_blob_sha: string | null;
         pushed_read_at: number | null;
+        pushed_edit_id: number | null;
         own_publish_declines: number | null;
       }>();
     return {
       sourceSha: row?.source_sha ?? null,
       pushedBlobSha: row?.pushed_blob_sha ?? null,
       pushedReadAt: row?.pushed_read_at ?? null,
+      pushedEditId: row?.pushed_edit_id ?? null,
       declines: row?.own_publish_declines ?? 0,
     };
   } catch (e) {
-    console.error("reimport sync-state read failed; retrying without the 0048 columns", {
+    console.error("reimport sync-state read failed; retrying without the 0048/0050 columns", {
       book,
       resource,
       error: e instanceof Error ? e.message : String(e),
@@ -2941,11 +3000,11 @@ async function resourceSyncState(env: Env, book: string, resource: Resource): Pr
     // columns, and it must reach the caller (step.do retry / failed request)
     // rather than degrade into a fleet-wide full reimport.
     const sourceSha = await storedResourceSha(env, book, resource);
-    console.error("reimport: migration 0048 appears unapplied — own-publish recognition is OFF, SHA gate intact", {
+    console.error("reimport: migration 0048/0050 appears unapplied — own-publish recognition is OFF, SHA gate intact", {
       book,
       resource,
     });
-    return { sourceSha, pushedBlobSha: null, pushedReadAt: null, declines: 0 };
+    return { sourceSha, pushedBlobSha: null, pushedReadAt: null, pushedEditId: null, declines: 0 };
   }
 }
 
@@ -3131,12 +3190,23 @@ async function markOwnPublishConverged(
   book: string,
   resource: Resource,
   readAt: number,
+  // P1.3: 0050's pushed_edit_id from the SAME sync snapshot readAt (=
+  // pushed_read_at) came from, so master_confirmed_edit_id is advanced from the
+  // identical render master_confirmed_at is. null (warm-up / empty edit_log)
+  // leaves the boundary untouched -> reconstruction falls back to the timestamp.
+  pushedEditId: number | null,
   masterSha: string | null,
 ): Promise<boolean> {
   try {
     const result = await env.DB.prepare(
       `UPDATE book_resource_syncs
           SET master_confirmed_at = MAX(COALESCE(master_confirmed_at, 0), ?3),
+              -- P1.3: shadow master_confirmed_at with the precise id boundary of
+              -- the SAME recognized render. Non-null guard so a null never
+              -- coerces this to a bogus 0 (which would starve the ancestor to
+              -- id<=0 instead of leaving the timestamp fallback in place).
+              master_confirmed_edit_id =
+                CASE WHEN ?5 IS NOT NULL THEN MAX(COALESCE(master_confirmed_edit_id, 0), ?5) ELSE master_confirmed_edit_id END,
               source_sha = COALESCE(?4, source_sha),
               synced_at = unixepoch(),
               -- Claim authorship of the watermark only when this call actually
@@ -3150,7 +3220,7 @@ async function markOwnPublishConverged(
               own_publish_declines = 0
         WHERE book = ?1 AND resource = ?2`,
     )
-      .bind(book, resource, readAt, masterSha)
+      .bind(book, resource, readAt, masterSha, pushedEditId)
       .run();
     if ((result.meta?.changes ?? 0) === 0) {
       console.error("reimport own-publish stamp changed no rows; watermark NOT advanced", {
@@ -3504,7 +3574,7 @@ async function planAndStageBookResources(
     // saves its D1 count query on a converged resource.
     const own = await recognizePushedRender(env, book, resource, raw, sync);
     if (own.recognized) {
-      const stamped = await markOwnPublishConverged(env, book, resource, own.readAt, masterSha);
+      const stamped = await markOwnPublishConverged(env, book, resource, own.readAt, sync.pushedEditId, masterSha);
       console.log("reimport recognized master's movement as our own publish", {
         book,
         resource,
@@ -3628,7 +3698,7 @@ async function reimportStagedChunk(
   const masterConfirmedAtUst = versesByChapter.ust ? await getMasterConfirmedAt(env, book, "ust") : null;
   // Same hoist for the TSV three-way merge ancestor cutoffs — once per chunk
   // step, read only for a kind that actually has rows staged this chunk.
-  const masterConfirmedAtTsv: Record<TsvKind, number | null> = {
+  const masterConfirmedAtTsv: Record<TsvKind, MergeCutoff | null> = {
     tn: rowsByChapter.tn ? await getMasterConfirmedAt(env, book, "tn") : null,
     tq: rowsByChapter.tq ? await getMasterConfirmedAt(env, book, "tq") : null,
     twl: rowsByChapter.twl ? await getMasterConfirmedAt(env, book, "twl") : null,

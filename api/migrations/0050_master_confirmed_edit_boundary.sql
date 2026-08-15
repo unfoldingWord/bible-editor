@@ -1,0 +1,55 @@
+-- Precise merge-ancestor boundary for the Door43->D1 three-way merges.
+--
+-- THE LIMITATION THIS CLOSES (Codex P1.3). The verse merge (verseMerge.ts) and
+-- the TSV merge (tsvMerge.ts) both reconstruct their ancestor — "the content we
+-- last published to master" — from edit_log, cut off at
+-- book_resource_syncs.master_confirmed_at (0045). That watermark is an integer
+-- SECOND (buildResource stamps Math.floor(Date.now()/1000) as `readAt`). The
+-- reconstruction excludes edits with `created_at < cutoff` (verse) /
+-- `created_at < cutoff` (reconstructTsvBases). An edit committed in the SAME
+-- second as the export's D1 read has `created_at === cutoff` and is therefore
+-- EXCLUDED, so the ancestor can be one edit too old. A later D1 edit then reads
+-- as a false both-changed conflict (master wins, the app value is flagged and
+-- recoverable from history — recoverable, never silent loss), but it is still a
+-- spurious conflict a human has to clear. edit_log.id is a monotonic
+-- AUTOINCREMENT integer, so an id high-water-mark captured at the export's D1
+-- read has none of this second-granularity ambiguity.
+--
+-- master_confirmed_edit_id — the MAX(edit_log.id) that existed at the instant
+-- buildResource read D1 to produce the render master now holds. The
+-- reconstruction folds `id <= master_confirmed_edit_id` instead of
+-- `created_at < master_confirmed_at` whenever this column is non-null, so a
+-- same-second edit lands on the correct side of the boundary. Captured BEFORE
+-- the row read (alongside `readAt`), so the safe error direction is preserved:
+-- an edit landing in the microsecond window between the boundary capture and the
+-- row read is reflected in the rendered rows but excluded from the ancestor
+-- (ancestor one edit too old -> at worst a recoverable false conflict), never
+-- the reverse (ancestor one edit too NEW -> a silent revert of an app edit
+-- master never received).
+--
+-- pushed_edit_id — the same MAX(edit_log.id) boundary for the render the export
+-- last PUSHED (migration 0048's pushed_blob_sha / pushed_read_at pair). It is
+-- promoted into master_confirmed_edit_id by bookReimport.ts's
+-- markOwnPublishConverged the moment a later sync recognizes master's bytes as
+-- that pushed render — exactly as pushed_read_at is promoted into
+-- master_confirmed_at. This is load-bearing, not belt-and-suspenders: in steady
+-- state the export PUSHES a `-be-` branch (isMasterConfirmed false, so
+-- recordPushedRender does NOT stamp master_confirmed_edit_id that run) and the
+-- watermark only advances later, when the merged branch is recognized as our own
+-- publish. Without carrying the boundary through that recognition, the precise
+-- cutoff would almost never take effect and master_confirmed_at /
+-- master_confirmed_edit_id would drift apart (the timestamp advanced by
+-- own-publish, the id left at an older export's value -> ancestor too old again).
+--
+-- Both columns are stamped from the SAME render's boundary at every writer, so
+-- master_confirmed_edit_id and master_confirmed_at always describe one render.
+--
+-- No backfill, the same warm-up contract 0045 / 0048 chose and for the same
+-- reason: only an export can measure the boundary of what it published. Existing
+-- rows keep NULL master_confirmed_edit_id until the next export+recognition
+-- cycle stamps it; while NULL, the reconstruction falls back to the pre-existing
+-- `created_at < master_confirmed_at` timestamp cutoff (the current behavior), so
+-- the fix is inert-but-safe during warm-up rather than switching to a bogus
+-- `id <= 0` boundary that would starve the ancestor.
+ALTER TABLE book_resource_syncs ADD COLUMN master_confirmed_edit_id INTEGER;
+ALTER TABLE book_resource_syncs ADD COLUMN pushed_edit_id INTEGER;

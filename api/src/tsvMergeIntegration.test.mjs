@@ -50,19 +50,23 @@ ins.run(KIND, "other", BOOK, "create", JSON.stringify({ quote: "x", note: "y" })
 ins.run(KIND, ID, BOOK, "delete", null, 250);
 
 // The EXACT query reconstructTsvBases runs, with anonymous params in appearance
-// order (bind: kind, book, cutoff, ...ids). Logic identical to bookReimport.ts.
-function reconstructBase(ids) {
+// order (bind: kind, book, boundary, ...ids). Logic identical to bookReimport.ts:
+// when `boundaryId` is given (P1.3), the fold cuts at `id <= boundaryId`; else it
+// falls back to the second-granularity `created_at < CUTOFF` timestamp.
+function reconstructBase(ids, boundaryId = null) {
   const inClause = ids.map(() => "?").join(", ");
+  const boundaryClause = boundaryId != null ? "id <= ?" : "created_at < ?";
+  const boundaryBind = boundaryId != null ? boundaryId : CUTOFF;
   const rows = db
     .prepare(
       `SELECT row_key, action, payload_json FROM edit_log
         WHERE kind = ? AND (book = ? OR book IS NULL)
           AND action IN ('create', 'update', 'restore')
-          AND created_at < ?
+          AND ${boundaryClause}
           AND row_key IN (${inClause})
         ORDER BY row_key ASC, id ASC`,
     )
-    .all(KIND, BOOK, CUTOFF, ...ids);
+    .all(KIND, BOOK, boundaryBind, ...ids);
   const byId = new Map();
   for (const r of rows) {
     let payload = null;
@@ -103,15 +107,38 @@ eq(merge.action, "adopt", "merge adopts (master moved note only)");
 eq(merge.conflict, false, "merge has no conflict");
 eq(merge.writeFields, { note: "n_master" }, "merge writes only master's note; our quote is preserved");
 
-// Boundary case (Codex P1.3): an edit committed in the SAME second as the cutoff
-// (created_at === cutoff) is EXCLUDED by `created_at < cutoff`. This documents the
-// known 1-second-granularity limitation — the edit at t=CUTOFF does not fold in.
+// Boundary case (Codex P1.3, fixed). An edit committed in the SAME second as the
+// export's D1 read (created_at === CUTOFF) but that was reflected in the render —
+// i.e. its edit_log id is at/below the captured boundary — must fold INTO the
+// ancestor. The old `created_at < cutoff` timestamp cut excluded it (the ancestor
+// was then one edit too old, producing a false both-changed conflict later); the
+// precise `id <= boundaryId` cut includes it.
 {
   const ID2 = "cd34";
-  ins.run(KIND, ID2, BOOK, "create", JSON.stringify({ quote: "qA", note: "nA" }), 100);
-  ins.run(KIND, ID2, BOOK, "update", JSON.stringify({ note: "n_at_cutoff" }), CUTOFF); // == cutoff → excluded
-  const base2 = reconstructBase([ID2]).get(ID2);
-  eq(base2.note, "nA", "boundary: an edit AT the cutoff second is excluded (created_at < cutoff)");
+  const createInfo = ins.run(KIND, ID2, BOOK, "create", JSON.stringify({ quote: "qA", note: "nA" }), 100);
+  // A pre-read edit whose created_at is EXACTLY the cutoff second. It was part of
+  // what the export rendered, so the export's id boundary captured at read time is
+  // at or above this row's id.
+  const atCutoffInfo = ins.run(KIND, ID2, BOOK, "update", JSON.stringify({ note: "n_at_cutoff" }), CUTOFF);
+  const boundaryId = Number(atCutoffInfo.lastInsertRowid); // MAX(edit_log.id) at read
+
+  // Old timestamp behavior (regression guard): the same-second edit falls out.
+  const baseTs = reconstructBase([ID2]).get(ID2);
+  eq(baseTs.note, "nA", "timestamp fallback: an edit AT the cutoff second is excluded (created_at < cutoff)");
+
+  // P1.3 precise boundary: the same-second edit is now INCLUDED.
+  const basePrecise = reconstructBase([ID2], boundaryId).get(ID2);
+  eq(basePrecise.note, "n_at_cutoff", "precise boundary: a same-second pre-read edit (id <= boundary) folds into the ancestor");
+  eq(basePrecise.quote, "qA", "precise boundary: the create still folds in (id below the boundary)");
+
+  // An edit committed AFTER the read (id > boundary) is still excluded, even
+  // though its created_at (also === CUTOFF) ties the boundary second — the id cut
+  // is what makes this unambiguous.
+  ins.run(KIND, ID2, BOOK, "update", JSON.stringify({ note: "n_after_read" }), CUTOFF);
+  const basePost = reconstructBase([ID2], boundaryId).get(ID2);
+  eq(basePost.note, "n_at_cutoff", "precise boundary: a post-read edit (id > boundary) is excluded");
+  // (Referenced so an unused-var lint can't hide a copy-paste of the wrong id.)
+  eq(Number(createInfo.lastInsertRowid) < boundaryId, true, "sanity: create id is below the captured boundary");
 }
 
 if (failed) {
