@@ -1031,6 +1031,7 @@ function NoteCardInner({
   if (supportRef !== savedRef.current.support_reference) rowDiff.support_reference = supportRef;
   const hasRowDiff = Object.keys(rowDiff).length > 0;
   const draftKey = rowKey("tn", row.book, row.id);
+  const pendingAtRender = pendingRef.current;
   useEffect(() => {
     if (readOnly) return;
     if (hasRowDiff) {
@@ -1058,10 +1059,14 @@ function NoteCardInner({
           verse: row.verse,
         },
       );
-    } else if (hydrated) {
-      // Only clear after the on-mount draft lookup has run — before that,
-      // hasRowDiff is measured against an unhydrated baseline and would
-      // spuriously wipe a draft we haven't had the chance to restore.
+    } else if (hydrated && pendingRef.current === pendingAtRender) {
+      // hasRowDiff false ⇒ local state matches the saved baseline.
+      // Prune any stale pendingRef keys left by typing that was undone
+      // (Ctrl+Z / manual re-entry) so the re-sync guard doesn't block
+      // future server updates needlessly. The identity check prevents a
+      // stale effect from clearing a newer pendingRef that an onChange
+      // handler replaced between the render and this effect firing.
+      pendingRef.current = {};
       void drafts.clear(draftKey);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1436,8 +1441,7 @@ function NoteCardInner({
           value={quote}
           onChange={(e) => {
             setQuote(e.target.value);
-            // Debounced parent propagation for the live highlight; no longer
-            // a whole-app re-render per keystroke (see scheduleQuotePropagate).
+            pendingRef.current = { ...pendingRef.current, quote: e.target.value };
             scheduleQuotePropagate();
           }}
           multiline
@@ -1567,10 +1571,8 @@ function NoteCardInner({
             value={note}
             inputRef={noteTextareaRef}
             onChange={(e) => {
-              // Body text is consumed only by this card — keep it purely local
-              // (persisted via the draft store, saved through flushPending). No
-              // applyLocalRowPatch, so a keystroke doesn't re-render the app.
               setNote(e.target.value);
+              pendingRef.current = { ...pendingRef.current, note: e.target.value };
             }}
             multiline
             fullWidth

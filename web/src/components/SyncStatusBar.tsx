@@ -14,14 +14,13 @@ import RefreshIcon from "@mui/icons-material/Refresh";
 import DeleteOutlineIcon from "@mui/icons-material/DeleteOutline";
 import WarningAmberIcon from "@mui/icons-material/WarningAmber";
 import EditNoteIcon from "@mui/icons-material/EditNote";
-import { onOutboxResult, outbox, type OutboxOp, type OpTarget } from "../sync/outbox";
+import { outbox, type OutboxOp, type OpTarget } from "../sync/outbox";
 import { drafts, type DraftRecord, type DraftMeta } from "../sync/drafts";
 
-// If we believe we're online but haven't seen a successful save in this
-// long while pending ops exist, treat it as effectively offline —
-// navigator.onLine returns true on any LAN even with no real internet.
-// Picked 30s because outbox backoff caps there: by then at least one full
-// retry has been attempted and failed.
+// If the oldest pending/in-flight op has been queued longer than this, treat
+// it as effectively offline — navigator.onLine returns true on any LAN even
+// with no real internet. Picked 30s because outbox backoff caps there: by
+// then at least one full retry has been attempted and failed.
 const STALE_PROGRESS_MS = 30_000;
 
 interface FreshRow {
@@ -64,14 +63,11 @@ export function SyncStatusBar({ onNavigate }: Props = {}) {
   useEffect(() => drafts.subscribe(setDraftList), []);
   const draftCount = draftList.length;
 
-  // Track navigator.onLine + last successful drain so we can distinguish
-  // "actively saving" from "queueing because we have no internet". A separate
-  // "stale-progress" check guards against navigator.onLine lying (it goes
-  // true on any LAN regardless of actual reachability).
+  // Track navigator.onLine so we can distinguish "actively saving" from
+  // "queueing because we have no internet".
   const [online, setOnline] = useState<boolean>(
     typeof navigator === "undefined" ? true : navigator.onLine,
   );
-  const [lastSuccessAt, setLastSuccessAt] = useState<number>(() => Date.now());
   useEffect(() => {
     const onOnline = () => setOnline(true);
     const onOffline = () => setOnline(false);
@@ -82,13 +78,9 @@ export function SyncStatusBar({ onNavigate }: Props = {}) {
       window.removeEventListener("offline", onOffline);
     };
   }, []);
-  useEffect(() =>
-    onOutboxResult((_op, result) => {
-      if (result.kind === "ok") setLastSuccessAt(Date.now());
-    }),
-  []);
 
-  const pending = ops.filter((o) => o.status === "pending" || o.status === "in_flight").length;
+  const pendingOps = ops.filter((o) => o.status === "pending" || o.status === "in_flight");
+  const pending = pendingOps.length;
   const conflicts = ops.filter((o) => o.status === "conflict");
   const failed = ops.filter((o) => o.status === "failed");
 
@@ -108,7 +100,18 @@ export function SyncStatusBar({ onNavigate }: Props = {}) {
     const t = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(t);
   }, [pending]);
-  const effectivelyOffline = !online || (pending > 0 && now - lastSuccessAt > STALE_PROGRESS_MS);
+
+  // Stale-progress: treat as effectively offline when the oldest pending or
+  // in-flight op has been queued for longer than STALE_PROGRESS_MS. Each op
+  // carries queuedAt from enqueue time, so this naturally resets when the
+  // queue drains and a fresh op arrives — unlike the old lastSuccessAt clock
+  // which was mount-seeded and never reset on new enqueues, causing false
+  // alarms for translators who save less often than every 30s.
+  const oldestQueuedAt = pendingOps.length > 0
+    ? Math.min(...pendingOps.map((o) => o.queuedAt))
+    : 0;
+  const staleProgress = pendingOps.length > 0 && now - oldestQueuedAt > STALE_PROGRESS_MS;
+  const effectivelyOffline = !online || staleProgress;
 
   const resolveAllConflicts = async () => {
     for (const op of conflicts) {
