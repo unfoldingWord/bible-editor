@@ -527,10 +527,26 @@ for (const row of rows) {
   // plain_text: apply the same join to the STORED string. Report (never
   // silently absorb) a row whose stored plain_text had already drifted from
   // its own tree — the drift predates this repair and is not ours to fix.
-  const storedPlain = row.plain_text ?? "";
+  //
+  // A NULL plain_text is refused rather than defaulted to "": writing '' would
+  // turn a NULL into an empty string, a change this repair never intended to
+  // make, and re-deriving the column from the tree would risk extraction churn
+  // unrelated to the defect. Deciding what such a row should hold is a separate
+  // question from joining a number.
+  if (row.plain_text == null) {
+    refuse("plain_text is NULL — refusing rather than inventing a value for it");
+    continue;
+  }
+  const storedPlain = row.plain_text;
   const derivedBefore = beforeFlat.raw.replace(/\s+/g, " ").trim();
   if (storedPlain !== derivedBefore) plainTextDrift.push({ ref, storedPlain, derivedBefore });
   const newPlain = joinString(storedPlain);
+  // joinString gives up after 64 iterations rather than looping forever. That
+  // bail-out must not become a silent half-repair: assert the result is clean.
+  if (DEFECT_RE.test(newPlain)) {
+    refuse("plain_text still contains a split number after the join — refusing");
+    continue;
+  }
 
   repaired.push({
     ref,
