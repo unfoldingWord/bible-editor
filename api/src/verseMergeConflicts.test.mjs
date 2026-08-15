@@ -739,6 +739,42 @@ function confirmAdopted(d, { book, resource, chapter, verse }) {
 }
 
 {
+  // REACTIVATION (issue #457): 'keep_alignment_refused' shares the same
+  // no-CAS-race safety as 'source_attr_divergent', so it gets the same
+  // carve-out — a refusal a human resolved with an UNRELATED save, while the
+  // alignment conflict PERSISTS, must re-surface on the next night's
+  // re-detection instead of going silent forever.
+  const d = verseDb();
+  // Night 1: flagged, then resolved by an unrelated save.
+  d.prepare(
+    `INSERT INTO verse_merge_conflicts (book, resource, chapter, verse, action, reason, overwritten_version, detected_at, resolved_at, resolved_by, last_recorded_at)
+     VALUES ('EZK','ult',40,21,'keep_alignment_refused','alignment_loss',NULL,100,150,30,100)`,
+  ).run();
+  // Night 2: re-detected (refusal still holds) → speculative re-upsert.
+  d.prepare(UPSERT_VERSE_MERGE_CONFLICT_SQL).run(
+    "EZK", "ult", 40, 21, "keep_alignment_refused", "alignment_loss", null, null, 2000,
+  );
+  const row = d.prepare(`SELECT * FROM verse_merge_conflicts WHERE book='EZK' AND chapter=40 AND verse=21`).get();
+  assert(row.resolved_at === null && row.resolved_by === null,
+    "re-detecting a resolved keep_alignment_refused reactivates it (no CAS race → safe to clear in the upsert)");
+  assert(row.detected_at === 100, "detected_at (age of the streak) is preserved across reactivation");
+
+  // CONTROL: an adoption re-upserted alongside is still untouched — the
+  // widened carve-out must not leak into 'adopt' / 'adopt_conflict'.
+  const d2 = verseDb();
+  d2.prepare(
+    `INSERT INTO verse_merge_conflicts (book, resource, chapter, verse, action, reason, overwritten_version, detected_at, resolved_at, resolved_by, last_recorded_at)
+     VALUES ('EZK','ult',40,22,'adopt_conflict','both_changed',7,100,150,30,100)`,
+  ).run();
+  d2.prepare(UPSERT_VERSE_MERGE_CONFLICT_SQL).run(
+    "EZK", "ult", 40, 22, "adopt_conflict", "both_changed", 7, null, 2000,
+  );
+  const row2 = d2.prepare(`SELECT * FROM verse_merge_conflicts WHERE book='EZK' AND chapter=40 AND verse=22`).get();
+  assert(row2.resolved_at === 150 && row2.resolved_by === 30,
+    "an adoption's speculative re-upsert still leaves resolved_at/resolved_by untouched (widened carve-out does not leak)");
+}
+
+{
   // buildMergeConflictGuidance classifies by ACTION: a source_attr_divergent
   // row is a KEPT-D1 outcome — it must say "kept D1" / "NOT been taken" and
   // must NEVER claim "took Door43's version" (the misdirection bug the
