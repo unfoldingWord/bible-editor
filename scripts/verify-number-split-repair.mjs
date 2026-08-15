@@ -16,6 +16,16 @@
 //   and this harness proves the file is a total no-op on re-run.
 //
 // WHAT IT ASSERTS, PER VERSE
+//   The dump is selected by a `plain_text` GLOB, so it routinely holds rows the
+//   generator legitimately did NOT write — verses it refused, and verses whose
+//   tree was already clean. The harness reads which verses the SQL actually
+//   repairs out of the file itself and applies the right expectation to each:
+//   a repaired row must move by exactly one version, and every other row must
+//   be byte-for-byte untouched with no audit row. (Asserting "version bumped"
+//   for every dump row made this report FAIL for healthy skipped verses, which
+//   would have trained the operator to ignore the check that matters.)
+//
+//   For a repaired verse:
 //   • version bumped by exactly 1, and `updated_by` untouched;
 //   • `\zaln` milestone count, `\w` count, node count and the concatenated `\w`
 //     surface forms are all IDENTICAL before and after;
@@ -84,9 +94,20 @@ const ins = db.prepare(
   `INSERT INTO verses (book,chapter,verse,verse_end,bible_version,content_json,plain_text,version,updated_by,updated_at)
    VALUES (?,?,?,?,?,?,?,?,?,?)`,
 );
+// A dump row can be malformed (a missing column, a non-integer chapter). Such a
+// row is one the generator refuses, so it is not this harness's job to judge —
+// but it must not take the whole run down with a bind-error stack trace either.
+// Skip it, name it, and carry on verifying the rest.
+const seeded = [];
+const unseedable = [];
 for (const r of rows) {
-  ins.run(r.book, r.chapter, r.verse, r.verse_end ?? null, r.bible_version, r.content_json,
-    r.plain_text ?? null, r.version, r.updated_by ?? null, r.updated_at ?? 0);
+  try {
+    ins.run(r.book, r.chapter, r.verse, r.verse_end ?? null, r.bible_version, r.content_json,
+      r.plain_text ?? null, r.version, r.updated_by ?? null, r.updated_at ?? 0);
+    seeded.push(r);
+  } catch (e) {
+    unseedable.push({ r, why: e.message });
+  }
 }
 
 db.exec(sql);
@@ -124,14 +145,61 @@ const joinAll = (s) => {
   return o;
 };
 
+// WHICH rows the generator actually repaired, read out of the SQL file itself.
+//
+// The dump is selected by a `plain_text` GLOB and therefore routinely contains
+// rows the generator legitimately did NOT write: verses it refused, and verses
+// whose tree was already clean. Asserting "version bumped" for every dump row
+// made the harness report FAIL for healthy, correctly-skipped verses — which
+// would have trained the operator to ignore the one check that matters. So the
+// expectation is derived per row: repaired rows must move by exactly one
+// version, everything else must be byte-for-byte untouched.
+const repairedKeys = new Set();
+for (const m of sql.matchAll(
+  /^--\s+(\S+)\s+(\S+)\s+(\d+):(\d+)\s+v\d+\s*→/gmu,
+)) {
+  repairedKeys.add(`${m[1]}|${m[2]}|${m[3]}|${m[4]}`);
+}
+const keyOf = (r) => `${r.book}|${r.bible_version}|${r.chapter}|${r.verse}`;
+
+// This is the one place the harness depends on the generator's output FORMAT.
+// If that comment header ever changes, every repaired row would silently be
+// treated as "should be untouched" and the run would fail confusingly rather
+// than wrongly-pass — but say so plainly instead.
+const updateCount = (sql.match(/^UPDATE verses SET/gm) || []).length;
+if (updateCount !== repairedKeys.size) {
+  console.error(
+    `cannot map the SQL to verses: found ${updateCount} UPDATE statement(s) but parsed` +
+      ` ${repairedKeys.size} verse header comment(s). The generator's comment format and this` +
+      ` parser have diverged — fix the parser rather than trusting this run.`,
+  );
+  process.exit(1);
+}
+
 const fail = [];
 const ok = [];
-for (const r of rows) {
+const untouched = [];
+for (const r of seeded) {
   const ref = `${r.book} ${r.bible_version} ${r.chapter}:${r.verse}`;
   const now = db.prepare(
     `SELECT content_json, plain_text, version, updated_by FROM verses
      WHERE book=? AND chapter=? AND verse=? AND bible_version=?`,
   ).get(r.book, r.chapter, r.verse, r.bible_version);
+
+  // Not repaired by this file — assert it was left completely alone.
+  if (!repairedKeys.has(keyOf(r))) {
+    const untouchedProblems = [];
+    if (now.version !== r.version) untouchedProblems.push(`version moved ${r.version} → ${now.version}`);
+    if (now.content_json !== r.content_json) untouchedProblems.push("content_json changed");
+    if ((now.plain_text ?? null) !== (r.plain_text ?? null)) untouchedProblems.push("plain_text changed");
+    const strayLog = db.prepare(
+      `SELECT COUNT(*) c FROM edit_log WHERE kind='verse' AND row_key=?`,
+    ).get(`${r.book}/${r.chapter}/${r.verse}/${r.bible_version}`).c;
+    if (strayLog !== 0) untouchedProblems.push(`${strayLog} edit_log row(s) written for a verse this file does not repair`);
+    if (untouchedProblems.length) fail.push(`${ref} (not in SQL): ${untouchedProblems.join("; ")}`);
+    else untouched.push(ref);
+    continue;
+  }
 
   const problems = [];
   if (now.version !== r.version + 1) problems.push(`version ${r.version} → ${now.version} (expected ${r.version + 1})`);
@@ -171,10 +239,19 @@ for (const r of rows) {
 
 console.log(`dump : ${dumpPath}`);
 console.log(`sql  : ${sqlPath}`);
-console.log(`verses seeded        : ${rows.length}`);
+console.log(`rows in dump         : ${rows.length}`);
+console.log(`verses seeded        : ${seeded.length}`);
+if (unseedable.length) {
+  console.log(`UNSEEDABLE dump rows : ${unseedable.length}  (malformed — the generator refuses these too)`);
+  for (const u of unseedable) {
+    console.log(`  --   ${u.r.book} ${u.r.bible_version} ${u.r.chapter}:${u.r.verse} — ${u.why}`);
+  }
+}
+console.log(`verses the SQL repairs: ${repairedKeys.size}`);
 console.log(`edit_log rows written: ${db.prepare("SELECT COUNT(*) c FROM edit_log").get().c}`);
-console.log(`PASS: ${ok.length}   FAIL: ${fail.length}`);
+console.log(`PASS: ${ok.length}   UNTOUCHED (correctly not in the SQL): ${untouched.length}   FAIL: ${fail.length}`);
 for (const l of ok) console.log("  ok   " + l);
+for (const l of untouched) console.log("  --   " + l + "  (skipped by the generator; verified unchanged)");
 for (const l of fail) console.log("  FAIL " + l);
 
 // ── re-run must be a total no-op (version-CAS + audit guard) ───────────────

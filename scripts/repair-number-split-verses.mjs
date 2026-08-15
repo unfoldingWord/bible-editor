@@ -167,7 +167,7 @@
 // no defect sites and emits no SQL.
 
 import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
-import { resolve, dirname } from "node:path";
+import { resolve, dirname, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -175,36 +175,54 @@ const repoRoot = resolve(here, "..");
 
 // ── args ───────────────────────────────────────────────────────────────────
 
-const argv = process.argv.slice(2);
-const argVal = (flag) => {
-  const i = argv.indexOf(flag);
-  return i >= 0 ? argv[i + 1] : null;
-};
-const listArg = (flag) => {
-  const raw = argVal(flag);
-  if (!raw) return null;
-  return new Set(raw.split(",").map((s) => s.trim().toUpperCase()).filter(Boolean));
+// Every flag is STRICTLY parsed. An unrecognized flag, a misspelled one, or a
+// value-taking flag with no value is a hard error rather than a silent
+// fallback: this script's output is applied to production, and the failure
+// mode of lenient parsing is a silent scope escape. `--book=1CH` (the equals
+// form) used to be swallowed as an unknown flag, so a run intended for one
+// book quietly generated SQL for every book in the dump — both spellings are
+// now accepted, and anything else stops the run.
+const USAGE =
+  "usage: node scripts/repair-number-split-verses.mjs <dump.json>\n" +
+  "         [--book 1CH[,NUM]] [--bible-version ULT[,UST]] [--out <sql>] [--json <report>]\n" +
+  "  exit 0 = every defect repaired and verified · 2 = at least one verse REFUSED\n" +
+  "  exit 1 = bad arguments or an unusable dump";
+const die = (msg) => {
+  console.error(`${msg}\n\n${USAGE}`);
+  process.exit(1);
 };
 
-// Positional = anything that is neither a flag nor the value consumed by one.
+const argv = process.argv.slice(2);
 const VALUE_FLAGS = new Set(["--out", "--json", "--book", "--bible-version"]);
+const flags = new Map();
 const positionals = [];
 for (let i = 0; i < argv.length; i++) {
-  if (argv[i].startsWith("--")) {
-    if (VALUE_FLAGS.has(argv[i])) i++;
+  const a = argv[i];
+  if (!a.startsWith("--")) {
+    positionals.push(a);
     continue;
   }
-  positionals.push(argv[i]);
+  const eq = a.indexOf("=");
+  const name = eq >= 0 ? a.slice(0, eq) : a;
+  if (!VALUE_FLAGS.has(name)) die(`unknown flag: ${a}`);
+  const value = eq >= 0 ? a.slice(eq + 1) : argv[++i];
+  if (value === undefined || value.startsWith("--")) die(`${name} needs a value`);
+  if (flags.has(name)) die(`${name} given more than once`);
+  flags.set(name, value);
 }
-const dumpArg = positionals[0];
-if (!dumpArg) {
-  console.error(
-    "usage: node scripts/repair-number-split-verses.mjs <dump.json>" +
-      " [--book 1CH] [--bible-version ULT] [--out <sql>] [--json <report>]",
-  );
-  process.exit(1);
-}
-const dumpPath = resolve(process.cwd(), dumpArg);
+if (positionals.length === 0) die("missing the <dump.json> argument");
+if (positionals.length > 1) die(`unexpected extra argument: ${positionals[1]}`);
+
+const argVal = (flag) => (flags.has(flag) ? flags.get(flag) : null);
+const listArg = (flag) => {
+  const raw = argVal(flag);
+  if (raw == null) return null;
+  const set = new Set(raw.split(",").map((s) => s.trim().toUpperCase()).filter(Boolean));
+  if (!set.size) die(`${flag} parsed to an empty list`);
+  return set;
+};
+
+const dumpPath = resolve(process.cwd(), positionals[0]);
 const bookFilter = listArg("--book");
 const versionFilter = listArg("--bible-version");
 const outDir = resolve(repoRoot, "scripts", "out");
@@ -349,17 +367,29 @@ function repairTree(verseObjects) {
     if (isWordToken(spaceNode)) {
       return { sites, error: `the space sits inside a \\w word token ("${spaceNode.text}") — refusing` };
     }
-    // No zero-width structural node (marker, milestone boundary) may sit
-    // between the two digit-bearing nodes: that would mean the number spans a
-    // genuine structural break rather than a stray space.
-    for (let k = leftIdx + 1; k < rightIdx; k++) {
-      if (flat[k].end === flat[k].start) {
-        const n = flat[k].node;
+    // Every node the defect site touches — the one holding the left digits,
+    // the one holding the separator, the one holding the right digits, and
+    // anything in between — must be an ordinary text node or a `\w` word
+    // token. Nothing else.
+    //
+    // An earlier version only refused ZERO-WIDTH nodes between the digits,
+    // which is not enough: usfm-js parks the text that follows a marker on the
+    // MARKER node itself (`{tag:"q1", type:"paragraph", text:"000 men."}` —
+    // see CLAUDE.md and liftMarkerText in web/src/lib/usfm.ts). Such a node is
+    // not zero-width, so it slipped through as `rightIdx` and the "space"
+    // being deleted was really the space immediately before a `\q1`. Deleting
+    // that is the documented marker-fusion hazard (no space before `\q` fuses
+    // tokens on export), and the number stays split across the poetry line
+    // anyway. Refuse instead.
+    const okNode = (n) => n && (n.type === "text" || n.tag === "w");
+    for (let k = leftIdx; k <= rightIdx; k++) {
+      const n = flat[k].node;
+      if (!okNode(n)) {
         return {
           sites,
           error:
-            `a structural node (${JSON.stringify({ tag: n.tag, type: n.type })}) sits between the` +
-            ` digits at raw offset ${iSpace} — refusing`,
+            `a non-text node (${JSON.stringify({ tag: n.tag, type: n.type })}) is part of the` +
+            ` defect site at raw offset ${iSpace} — refusing`,
         };
       }
     }
@@ -403,14 +433,47 @@ function joinString(s) {
 // tolerate a bare array or a single object too, and tolerate wrangler's
 // leading human-readable banner lines before the JSON.
 function loadRows(text) {
-  const i = text.indexOf("[");
-  const j = text.indexOf("{");
-  const start = i < 0 ? j : j < 0 ? i : Math.min(i, j);
-  if (start < 0) throw new Error(`no JSON found in ${dumpPath}`);
-  const parsed = JSON.parse(text.slice(start));
+  // Wrangler prefixes its output with human-readable banner lines that can
+  // themselves contain brackets — e.g.
+  //   "▲ [WARNING] Processing wrangler.toml configuration:"
+  // so "the first [ in the file" is not a safe start marker (it lands inside
+  // the banner and JSON.parse throws a bare stack trace). Drop whole leading
+  // LINES until one actually begins the JSON document.
+  const lines = text.split(/\r?\n/);
+  let start = -1;
+  for (let i = 0; i < lines.length; i++) {
+    const t = lines[i].trimStart();
+    if (t.startsWith("[") || t.startsWith("{")) { start = i; break; }
+  }
+  if (start < 0) die(`no JSON document found in ${dumpPath}`);
+  let parsed;
+  try {
+    parsed = JSON.parse(lines.slice(start).join("\n"));
+  } catch (e) {
+    die(`${dumpPath} is not valid JSON: ${e.message}`);
+  }
   const arr = Array.isArray(parsed) ? parsed : [parsed];
   if (arr.length && arr[0] && Array.isArray(arr[0].results)) return arr.flatMap((x) => x.results || []);
   return arr;
+}
+
+// A dump missing a column would otherwise produce `WHERE book = NULL`, which
+// is never true in SQL: the UPDATE would silently match nothing while the
+// console cheerfully reported the verse as repaired. Every column that appears
+// in a WHERE clause is validated up front so a malformed dump fails loudly.
+function rowIdentityProblem(row) {
+  for (const col of ["book", "bible_version"]) {
+    if (typeof row[col] !== "string" || row[col].trim() === "") {
+      return `${col} is missing or not a non-empty string (got ${JSON.stringify(row[col])})`;
+    }
+  }
+  for (const col of ["chapter", "verse", "version"]) {
+    const n = Number(row[col]);
+    if (row[col] == null || !Number.isInteger(n)) {
+      return `${col} is missing or not an integer (got ${JSON.stringify(row[col])})`;
+    }
+  }
+  return null;
 }
 
 const allRows = loadRows(readFileSync(dumpPath, "utf8"));
@@ -430,12 +493,20 @@ if (!rows.length) {
 const repaired = [];
 const refused = [];
 const clean = [];
+// Tree already repaired but the denormalized plain_text still carries the
+// defect. Reported, never silently written — see the branch that fills it.
+const plainTextOnly = [];
 const plainTextDrift = [];
 
 for (const row of rows) {
   const ref = `${row.book} ${row.bible_version} ${row.chapter}:${row.verse}`;
   const refuse = (why) => refused.push({ ref, row, why });
 
+  const identityProblem = rowIdentityProblem(row);
+  if (identityProblem) {
+    refuse(`row identity unusable — ${identityProblem}`);
+    continue;
+  }
   if (row.content_json == null) {
     refuse("content_json is NULL");
     continue;
@@ -458,7 +529,17 @@ for (const row of rows) {
 
   const beforeFlat = flatten(original.verseObjects);
   if (!DEFECT_RE.test(beforeFlat.raw)) {
-    clean.push(ref);
+    // The tree is clean. But the dump is SELECTed on a `plain_text` GLOB, and
+    // the two can disagree: a row whose tree was already repaired while its
+    // denormalized plain_text still holds "1, 000" is NOT "already clean" — it
+    // will match the GLOB on every future dump, forever, and be reported clean
+    // every time. Call that out as its own category so the loop terminates in
+    // the operator's head instead of silently never converging.
+    if (DEFECT_RE.test(row.plain_text ?? "")) {
+      plainTextOnly.push({ ref, row, newPlain: joinString(row.plain_text) });
+    } else {
+      clean.push(ref);
+    }
     continue;
   }
 
@@ -572,6 +653,12 @@ for (const row of rows) {
 const sqlStr = (v) => (v == null ? "NULL" : `'${String(v).replace(/'/g, "''")}'`);
 const nowTs = Math.floor(Date.now() / 1000);
 
+// The apply command runs from api/, so the header's --file path must be
+// relative to THAT directory — and it must point at the file we are actually
+// writing. Hard-coding the default path meant a run with --out printed an
+// apply line for a different (possibly stale) file.
+const sqlApplyPath = relative(resolve(repoRoot, "api"), sqlPath).split("\\").join("/");
+
 function statementsFor(r) {
   const { row } = r;
   const rowKey = `${row.book}/${row.chapter}/${row.verse}/${row.bible_version}`;
@@ -625,12 +712,31 @@ const header = [
   "-- verse, and its edit_log row is not written either. Re-dump and re-run for any skipped",
   "-- row; never force-apply.",
   "--",
-  "-- No BEGIN/COMMIT: remote D1 rejects explicit transactions and `wrangler d1 execute",
-  "-- --file` already applies the batch atomically.",
+  "-- No BEGIN/COMMIT: remote D1 rejects explicit transactions.",
+  "--",
+  "-- DO NOT ASSUME THIS FILE APPLIES ATOMICALLY. Against --remote, wrangler drives",
+  "-- the D1 import API rather than a single batch, and this repo has already been bitten",
+  "-- by it: a --file execute once ran 3 of 19 statements and still reported success.",
+  "-- Every statement here is individually version-guarded and re-runnable, so a partial",
+  "-- apply is recoverable — but it is only DETECTABLE if you run the post-apply checks.",
   "--",
   "-- Apply (human-approved step, from api/):",
   "--   npx wrangler d1 execute bible_editor --remote --env production \\",
-  "--     --file=../scripts/out/repair-number-split.sql",
+  `--     --file=${sqlApplyPath}`,
+  "--",
+  "-- POST-APPLY CHECKS — run BOTH; a partial apply is silent without them.",
+  `--   Expect ${repaired.length} audit row(s):`,
+  "--     SELECT COUNT(*) FROM edit_log",
+  "--      WHERE action='repair_number_split' AND source='data_repair'",
+  `--        AND created_at >= ${nowTs};`,
+  "--   Expect 0 survivors. Scoped to the book(s) this file actually touches — derived",
+  "--   from the repaired rows themselves, not from whatever --book was passed:",
+  "--     SELECT book, bible_version, COUNT(*) FROM verses",
+  "--      WHERE plain_text GLOB '*[0-9], [0-9][0-9][0-9]*'",
+  `--        AND book IN (${[...new Set(repaired.map((r) => r.row.book))].sort().map((b) => `'${b}'`).join(", ")})`,
+  `--        AND bible_version IN (${[...new Set(repaired.map((r) => r.row.bible_version))].sort().map((b) => `'${b}'`).join(", ")})`,
+  "--      GROUP BY book, bible_version;",
+  "--   If either number is wrong, re-dump and re-run this script; re-applying is safe.",
   "",
 ];
 
@@ -655,26 +761,53 @@ console.log(`  rows in dump   : ${allRows.length}${rows.length !== allRows.lengt
 console.log(`  repaired       : ${repaired.length}`);
 console.log(`  defect sites   : ${repaired.reduce((n, r) => n + r.sites.length, 0)}`);
 console.log(`  already clean  : ${clean.length}`);
+console.log(`  plain_text only: ${plainTextOnly.length}`);
 console.log(`  REFUSED        : ${refused.length}`);
 console.log("");
 
 console.log("PER-VERSE VERIFICATION");
 console.log("─".repeat(96));
-console.log(`  ${pad("verse", 20)}${pad("zaln", 7)}${pad("\\w", 6)}${pad("nodes", 7)}${pad("sites", 6)}joined`);
+console.log(`  ${pad("verse", 20)}${pad("zaln", 7)}${pad("\\w", 6)}${pad("nodes", 7)}sites`);
 for (const r of repaired) {
   console.log(
-    `  ${pad(r.ref, 20)}${pad(`${r.zaln}=${r.zaln}`, 7)}${pad(`${r.words}`, 6)}${pad(`${r.nodes}`, 7)}` +
-      `${pad(r.sites.length, 6)}${r.sites.map((s) => s.joined).join(", ")}`,
+    `  ${pad(r.ref, 20)}${pad(`${r.zaln}=${r.zaln}`, 7)}${pad(`${r.words}`, 6)}${pad(`${r.nodes}`, 7)}${r.sites.length}`,
   );
+  // Print the SURROUNDING TEXT of each site, not just the joined number.
+  //
+  // This is the human decision surface, and it is the only place the one error
+  // this tool cannot detect by itself can be caught. The pattern
+  // "digit + comma-space + three digits" is a heuristic: it also matches a
+  // legitimate enumeration ("...of ages 5, 300, and 900 years"), and such a
+  // match is structurally PERFECT to repair — every count check passes, the
+  // structural signature is unchanged — so no assertion anywhere in this
+  // script or its verifier can distinguish it from a real defect. Only reading
+  // the sentence can. Printing only "5,300" hid exactly that.
+  for (const s of r.sites) {
+    console.log(`        ${JSON.stringify(s.was)}  →  ${s.joined}`);
+  }
 }
 console.log("");
 console.log("  (zaln / \\w / nodes columns are before=after — a verse whose counts moved is REFUSED, not listed here)");
+console.log("  READ THE CONTEXT LINES. The defect pattern also matches a legitimate list such as");
+console.log("  \"of ages 5, 300, and 900 years\", which this script would 'repair' into \"5,300\" with");
+console.log("  every structural check passing. No automated check can catch that — only your eyes.");
 
 if (refused.length) {
   console.log("");
   console.log("REFUSED — NEEDS MANUAL REPAIR");
   console.log("─".repeat(96));
   for (const f of refused) console.log(`  ${pad(f.ref, 20)} ${f.why}`);
+}
+
+if (plainTextOnly.length) {
+  console.log("");
+  console.log(`plain_text-ONLY DEFECT (${plainTextOnly.length}) — the verse tree is already repaired,`);
+  console.log("but the denormalized plain_text column still holds the split number. These rows will keep");
+  console.log("matching the dump's GLOB on every future run and keep reporting 'clean', so the scan never");
+  console.log("converges. NOT repaired here — this script only rewrites plain_text alongside a real tree");
+  console.log("change. Decide deliberately whether to re-derive the column for these.");
+  console.log("─".repeat(96));
+  for (const d of plainTextOnly) console.log(`  ${pad(d.ref, 20)} would become: ${d.newPlain.slice(0, 60)}`);
 }
 
 if (plainTextDrift.length) {
@@ -714,6 +847,7 @@ if (jsonPath) {
         })),
         refused: refused.map((f) => ({ ref: f.ref, why: f.why })),
         clean,
+        plainTextOnly: plainTextOnly.map((d) => ({ ref: d.ref, newPlainText: d.newPlain })),
         plainTextDrift,
       },
       null,
