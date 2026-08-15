@@ -2991,20 +2991,58 @@ async function resourceSyncState(env: Env, book: string, resource: Resource): Pr
       declines: row?.own_publish_declines ?? 0,
     };
   } catch (e) {
-    console.error("reimport sync-state read failed; retrying without the 0048/0050 columns", {
+    console.error("reimport sync-state read failed; retrying without 0050's pushed_edit_id", {
       book,
       resource,
       error: e instanceof Error ? e.message : String(e),
     });
-    // Deliberately NOT wrapped — a failure here means the fault is not the new
-    // columns, and it must reach the caller (step.do retry / failed request)
-    // rather than degrade into a fleet-wide full reimport.
-    const sourceSha = await storedResourceSha(env, book, resource);
-    console.error("reimport: migration 0048/0050 appears unapplied — own-publish recognition is OFF, SHA gate intact", {
-      book,
-      resource,
-    });
-    return { sourceSha, pushedBlobSha: null, pushedReadAt: null, pushedEditId: null, declines: 0 };
+    // 0050 may lag 0048 (deploy raced its migration). Retry the 0048-era read so
+    // own-publish recognition stays ON — only the PRECISE boundary degrades to
+    // null (reconstruction falls back to the timestamp). A missing 0050 column
+    // must NOT disable the AMOS-revert fix 0048 provides: turning recognition off
+    // fleet-wide is exactly the failure this whole area exists to prevent, so it
+    // is reserved for the case where even the 0048 columns are absent.
+    try {
+      const row = await env.DB.prepare(
+        `SELECT source_sha, pushed_blob_sha, pushed_read_at, own_publish_declines
+           FROM book_resource_syncs WHERE book = ?1 AND resource = ?2`,
+      )
+        .bind(book, resource)
+        .first<{
+          source_sha: string | null;
+          pushed_blob_sha: string | null;
+          pushed_read_at: number | null;
+          own_publish_declines: number | null;
+        }>();
+      console.error("reimport: migration 0050 appears unapplied — precise merge boundary OFF (timestamp fallback), own-publish recognition intact", {
+        book,
+        resource,
+      });
+      return {
+        sourceSha: row?.source_sha ?? null,
+        pushedBlobSha: row?.pushed_blob_sha ?? null,
+        pushedReadAt: row?.pushed_read_at ?? null,
+        pushedEditId: null,
+        declines: row?.own_publish_declines ?? 0,
+      };
+    } catch (e2) {
+      console.error("reimport sync-state 0048 read also failed; retrying source_sha only", {
+        book,
+        resource,
+        error: e2 instanceof Error ? e2.message : String(e2),
+      });
+      // Even the 0048 columns are gone — a genuinely behind schema (or a real D1
+      // fault, in which case storedResourceSha throws and propagates to the
+      // step.do retry / failed request, NOT a fleet-wide full reimport). SHA gate
+      // stays intact; only own-publish recognition goes off until the migration
+      // lands.
+      const sourceSha = await storedResourceSha(env, book, resource);
+      console.error("reimport: migration 0048/0050 appears unapplied — own-publish recognition is OFF, SHA gate intact", {
+        book,
+        resource,
+      });
+      return { sourceSha, pushedBlobSha: null, pushedReadAt: null, pushedEditId: null, declines: 0 };
+    }
   }
 }
 
