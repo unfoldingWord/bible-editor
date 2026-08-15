@@ -457,15 +457,21 @@ export const outbox = {
       return;
     }
     const key = targetKey(op.target);
+    const resolvedAt = Date.now();
     const all = (await tx.store.getAll()) as OutboxOp[];
-    for (const o of all) {
-      if (targetKey(o.target) !== key) continue;
-      if (o.status === "conflict" || o.status === "pending") {
-        o.expectedVersion = newExpectedVersion;
-        o.status = "pending";
-        o.conflictCurrent = undefined;
-        await tx.store.put(o);
-      }
+    // Sort siblings by original chronological order before assigning new seq
+    // values — getAll() returns by primary key (random UUID), and since all
+    // siblings share the same resolvedAt, seq is the drain-order tiebreaker.
+    const siblings = all
+      .filter((o) => targetKey(o.target) === key && (o.status === "conflict" || o.status === "pending"))
+      .sort((a, b) => a.queuedAt - b.queuedAt || (a.seq ?? 0) - (b.seq ?? 0));
+    for (const o of siblings) {
+      o.expectedVersion = newExpectedVersion;
+      o.status = "pending";
+      o.queuedAt = resolvedAt;
+      o.seq = nextSeq();
+      o.conflictCurrent = undefined;
+      await tx.store.put(o);
     }
     await tx.done;
     void notify();
@@ -514,6 +520,8 @@ export const outbox = {
     op.attempts = 0;
     op.hardAttempts = 0;
     op.lastError = undefined;
+    op.queuedAt = Date.now();
+    op.seq = nextSeq();
     await tx.store.put(op);
     await tx.done;
     void notify();
