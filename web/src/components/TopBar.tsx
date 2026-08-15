@@ -129,6 +129,7 @@ interface Props {
   pipelineMenu?: ReactNode;
   pipelineStatus?: ReactNode;
   logosSyncToggle?: ReactNode;
+  syncWarnings?: ReactNode;
   lintIndicator?: ReactNode;
   alignIndicator?: ReactNode;
   notesIndicator?: ReactNode;
@@ -148,6 +149,7 @@ export function TopBar({
   pipelineMenu,
   pipelineStatus,
   logosSyncToggle,
+  syncWarnings,
   lintIndicator,
   alignIndicator,
   notesIndicator,
@@ -455,6 +457,7 @@ export function TopBar({
           <Divider orientation="vertical" flexItem sx={{ my: 0.5 }} />
         </Box>
       )}
+      {syncWarnings}
       {lintIndicator}
       {alignIndicator}
       {notesIndicator}

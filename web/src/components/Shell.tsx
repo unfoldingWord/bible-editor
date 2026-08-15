@@ -204,9 +204,13 @@ interface Props {
   // Top-right notifications bell (comment mentions/replies). Owned by App
   // (which holds the alerts) and rendered here inside the TopBar.
   notificationsMenu?: ReactNode;
+  // Collapsed "sync warnings" badge (door43/export state alerts). Also owned
+  // by App and rendered in the TopBar next to the other indicators — replaces
+  // the old full-width banner so these warnings never block navigation (#458).
+  syncWarnings?: ReactNode;
 }
 
-export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, onLogout, meUserId = null, isViewer = false, initialCommentId, onCommentConsumed, authReady = false, notificationsMenu }: Props) {
+export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, onLogout, meUserId = null, isViewer = false, initialCommentId, onCommentConsumed, authReady = false, notificationsMenu, syncWarnings }: Props) {
   // tw_link → article title, for canonical (headword-anchored) TWL ordering.
   // handleAddTwlSuggestion below places a NEW link at its canonical slot and
   // persists a matching sort_order, so it must order with the SAME inputs the
@@ -2559,7 +2563,9 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // only mount in the data branch, so runWithDirtyGate would soft-lock.
   if (!data) {
     return (
-      <Box sx={{ display: "flex", flexDirection: "column", height: "100vh" }}>
+      // height:100% (not 100vh) so an in-flow app banner above this Shell can
+      // reserve space and push it down instead of being overlaid (issue #458).
+      <Box sx={{ display: "flex", flexDirection: "column", height: "100%" }}>
         <TopBar
           book={book}
           chapter={chapter}
@@ -2571,6 +2577,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           }}
           onLogout={onLogout}
           notificationsMenu={notificationsMenu}
+          syncWarnings={syncWarnings}
         />
         <Box sx={{ p: 4, display: "flex", alignItems: "center", gap: 2 }}>
           {status === "error" ? (
@@ -2830,7 +2837,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   };
 
   return (
-    <Box sx={{ height: "100vh", display: "flex", flexDirection: "column", overflow: "hidden" }}>
+    <Box sx={{ height: "100%", display: "flex", flexDirection: "column", overflow: "hidden" }}>
       <TopBar
         book={book}
         chapter={chapter}
@@ -2898,6 +2905,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           />
         }
         notificationsMenu={notificationsMenu}
+        syncWarnings={syncWarnings}
         exportMenu={
           <ExportUsfmButton
             book={book}

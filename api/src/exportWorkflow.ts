@@ -2486,11 +2486,29 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     severity: "error" | "warning" | "info" = "error",
   ): Promise<void> {
     try {
+      // Respect a prior dismissal of the *same* condition. Each nightly export
+      // re-runs this for still-failing books; if we blindly re-inserted, an
+      // alert the user already dismissed would reappear every morning and read
+      // as "can't be hidden" (issue #458). So: if the most recent alert for
+      // this source was dismissed and carries an identical message, leave it
+      // dismissed and skip the insert. A genuinely new condition changes the
+      // message (row counts / sample refs / watermarks all vary), which falls
+      // through and re-alerts as expected.
+      const latest = await this.env.DB.prepare(
+        `SELECT message, dismissed_at FROM system_alerts
+          WHERE username = ?1 AND source = ?2
+          ORDER BY created_at DESC LIMIT 1`,
+      )
+        .bind(EXPORT_ALERT_USERNAME, source)
+        .first<{ message: string; dismissed_at: number | null }>();
       await this.env.DB.prepare(
         `DELETE FROM system_alerts WHERE username = ?1 AND source = ?2 AND dismissed_at IS NULL`,
       )
         .bind(EXPORT_ALERT_USERNAME, source)
         .run();
+      if (latest && latest.dismissed_at !== null && latest.message === message) {
+        return;
+      }
       await this.env.DB.prepare(
         `INSERT INTO system_alerts (username, severity, source, message, link_url)
          VALUES (?1, ?5, ?2, ?3, ?4)`,

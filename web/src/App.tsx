@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { Alert, Box, Button, CircularProgress, Link, Snackbar, Stack, Typography } from "@mui/material";
 import { Shell } from "./components/Shell";
 import { NotificationsMenu } from "./components/NotificationsMenu";
+import { SyncWarningsIndicator } from "./components/SyncWarningsIndicator";
 import { useBook } from "./hooks/useBook";
 import { useAlerts } from "./hooks/useAlerts";
 import {
@@ -218,12 +219,16 @@ export function App() {
   // hook), which violates Rules of Hooks. The hook itself no-ops while
   // auth is not "ready".
   const { alerts, dismiss } = useAlerts(auth.kind === "ready");
-  // Comment mentions/replies are per-user nudges — they belong in the small
-  // top-right notifications menu, not the full-width "Benjamin fix this" banner
-  // (issues #385/#441). Everything else (export-failure alerts) stays in the
-  // banner. Split by source; `comment_mention` / `comment_reply` both start
-  // with "comment".
-  const bannerAlerts = alerts.filter((a) => !a.source.startsWith("comment"));
+  // Two collapsed homes in the TopBar, no full-width banner (issues #385/#441
+  // for comments, #458 for the rest):
+  //   • comment mentions/replies  → the top-right notifications bell.
+  //   • everything else (door43 sync / export state warnings) → the collapsed
+  //     "sync warnings" indicator. This used to be a fixed banner floated over
+  //     the TopBar; for a "Door43 overwrote your edits" message the editor
+  //     couldn't clear, it read as an un-dismissable barrier to navigation.
+  // Split by source; `comment_mention` / `comment_reply` both start with
+  // "comment".
+  const warningAlerts = alerts.filter((a) => !a.source.startsWith("comment"));
   const notificationAlerts = alerts.filter((a) => a.source.startsWith("comment"));
 
   useEffect(() => {
@@ -367,64 +372,6 @@ export function App() {
 
   return (
     <Box sx={{ height: "100vh", display: "flex", flexDirection: "column" }}>
-      {bannerAlerts.length > 0 && (
-        // Float the alert stack so it doesn't push Shell down — the outer
-        // flex column's children can't actually shrink (Shell's internal
-        // box rejects flex:1 minHeight:0 sizing), and any added in-flow
-        // height makes <html> scroll the banner above the viewport.
-        // Fixed positioning keeps the banner visible regardless of scroll
-        // state and accepts the tradeoff of obscuring the top 44px of the
-        // TopBar — appropriate UX for a "Benjamin fix this" alert.
-        <Box
-          sx={{
-            position: "fixed",
-            top: 0,
-            left: 0,
-            right: 0,
-            zIndex: (theme) => theme.zIndex.appBar + 2,
-          }}
-        >
-          {bannerAlerts.map((a) => (
-            <Alert
-              key={a.id}
-              severity={a.severity}
-              variant="filled"
-              onClose={() => void dismiss(a.id)}
-              sx={{ borderRadius: 0, py: 0.5 }}
-            >
-              {a.message}
-              {a.linkUrl && (
-                <>
-                  {" — "}
-                  {a.linkUrl.startsWith("/#/") ? (
-                    <Link
-                      href={a.linkUrl}
-                      onClick={(e) => {
-                        e.preventDefault();
-                        location.hash = a.linkUrl!.slice(2);
-                      }}
-                      color="inherit"
-                      underline="always"
-                    >
-                      go to comment
-                    </Link>
-                  ) : (
-                    <Link
-                      href={a.linkUrl}
-                      target="_blank"
-                      rel="noopener"
-                      color="inherit"
-                      underline="always"
-                    >
-                      view run
-                    </Link>
-                  )}
-                </>
-              )}
-            </Alert>
-          ))}
-        </Box>
-      )}
       {isViewer && (
         <Alert severity="info" variant="filled" sx={{ borderRadius: 0, py: 0.5 }}>
           You're signed in as an <strong>unfoldingWord</strong> member — read-only access.
@@ -447,6 +394,9 @@ export function App() {
           authReady={auth.kind === "ready"}
           notificationsMenu={
             <NotificationsMenu alerts={notificationAlerts} onDismiss={dismiss} />
+          }
+          syncWarnings={
+            <SyncWarningsIndicator alerts={warningAlerts} onDismiss={dismiss} />
           }
         />
       </Box>
