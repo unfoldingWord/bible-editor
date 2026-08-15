@@ -183,6 +183,20 @@ async function allUsernames(db: D1Database): Promise<string[]> {
   return (rs.results ?? []).map((r) => r.dcs_username);
 }
 
+// mentions_json is always written by this module as JSON.stringify(string[]),
+// but the reply-notify parse runs AFTER the reply row is inserted: a single
+// corrupted row would 500 the request, and a client retry would then create a
+// duplicate comment. Swallow a bad parse rather than risk that.
+function parseMentionsJson(raw: string | null): string[] {
+  if (!raw) return [];
+  try {
+    const v = JSON.parse(raw);
+    return Array.isArray(v) ? (v as string[]) : [];
+  } catch {
+    return [];
+  }
+}
+
 comments.post("/", async (c) => {
   let body: unknown;
   try {
@@ -287,10 +301,8 @@ comments.post("/", async (c) => {
     const recipients = new Map<string, string>(); // lower → canonical
     for (const r of rows.results ?? []) {
       if (r.username) recipients.set(r.username.toLowerCase(), r.username);
-      if (r.mentions_json) {
-        for (const m of JSON.parse(r.mentions_json) as string[]) {
-          recipients.set(m.toLowerCase(), m);
-        }
+      for (const m of parseMentionsJson(r.mentions_json)) {
+        recipients.set(m.toLowerCase(), m);
       }
     }
     recipients.delete(selfLower);
