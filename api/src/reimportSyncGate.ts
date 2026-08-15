@@ -49,6 +49,32 @@
 //      withhold even though its own chapters_locked/prune_locked fields are
 //      individually present and zero.
 //
+// ── Third and fourth withhold conditions (issue #427, option 2) ─────────────
+//
+//   3. `conflict_skipped` — a master row this run meant to INSERT was refused
+//      by `ON CONFLICT(id, book) DO NOTHING` (0 rows written). Its (book, id)
+//      slot is held by a row the reimport's in-memory diff never saw.
+//
+//   4. `tombstone_blocked` — a master row was dropped because a soft-deleted
+//      row holds its id, and master carries that id at a DIFFERENT reference,
+//      so the id has been reissued to a genuinely different row (see
+//      isReissuedTombstone in reimportClassify.ts). A SAME-reference tombstone
+//      is deliberately excluded: skipping there is what preserves a deletion
+//      that hasn't been exported yet, and reclaiming it would resurrect every
+//      pending delete nightly.
+//
+// Both mean the same thing as the two above — master content this run was
+// supposed to apply is NOT in D1 — so both must withhold. This is the 1CH 23
+// tQ case: six tQ rows vanished into tombstoned ids and (1CH, tq) was stamped
+// `origin='reimport'` anyway, certifying a book that was six rows short of
+// master. Nothing retries it either: the next run's SHA gate sees an unchanged
+// `source_sha` and skips the file, so the stamp is the only thing standing
+// between the drop and a permanent silent divergence.
+//
+// This gate does NOT fix the drop — reclaiming a reissued id is issue #427's
+// option 1, and sweeping obsolete tombstones is option 3. It makes the drop
+// visible and stops the run from claiming the resource is current.
+//
 // Deliberately NOT gated on `skipped_locked`: that counter is overloaded —
 // besides the chapter-lock skip, it is ALSO incremented by the row-level prune
 // path, a different and much less severe situation that must NOT withhold the
@@ -61,11 +87,23 @@
 export function shouldRecordResourceSync(counts: {
   chapters_locked?: number;
   prune_locked?: number;
+  conflict_skipped?: number;
+  tombstone_blocked?: number;
   counts_incomplete?: boolean;
 }): boolean {
   if (counts.chapters_locked === undefined || counts.prune_locked === undefined) return false;
+  // Same fail-safe presence check as the two above, for the same reason: a
+  // pre-#427 chunk result replayed by an in-flight Workflow simply has no
+  // conflict_skipped/tombstone_blocked field, and "not measured" must never
+  // read as "measured zero".
+  if (counts.conflict_skipped === undefined || counts.tombstone_blocked === undefined) return false;
   if (counts.counts_incomplete === true) return false;
-  return counts.chapters_locked === 0 && counts.prune_locked === 0;
+  return (
+    counts.chapters_locked === 0 &&
+    counts.prune_locked === 0 &&
+    counts.conflict_skipped === 0 &&
+    counts.tombstone_blocked === 0
+  );
 }
 
 // ── Systemic alignment-refusal gate (verseMerge.ts's "keep_alignment_refused") ──

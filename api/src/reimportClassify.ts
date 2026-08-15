@@ -205,3 +205,59 @@ export function computeEditedFieldMerge(
 
   return Object.keys(merge).length > 0 ? merge : null;
 }
+
+// ── Reissued-tombstone discriminator (issue #427, option 2) ─────────────────
+//
+// A soft-deleted tn/tq/twl row keeps its `(book, id)` PRIMARY KEY slot forever
+// — the row stays, only `deleted_at` is stamped. So when master's TSV carries
+// that same id, the reimport's tombstone branch (bookReimport.ts's applyTsvRows)
+// declines to apply master's row, and its `INSERT ... ON CONFLICT(id, book) DO
+// NOTHING` would refuse it too. Both outcomes are silent: master's row simply
+// never lands in D1.
+//
+// That silence is CORRECT for one of the two cases and WRONG for the other, and
+// this function is the discriminator (the same one the 2026-08-10 production
+// sweep used to classify all 10,645 live tombstones):
+//
+//   - master carries the id at the SAME reference → the row is a delete that
+//     hasn't been exported to Door43 yet. Skipping is exactly what preserves
+//     that pending deletion; reapplying master's copy would resurrect it on
+//     every nightly run. Returns false. (4 AMO rows were in this state during
+//     the sweep.)
+//   - master carries the id at a DIFFERENT reference → the id has been reissued
+//     to a genuinely different row (bp-assistant mints ids from a repeating
+//     sequence, so collisions recur — see the tq-tombstone-PK-collision note).
+//     Master's row is real, new, and being dropped. Returns true. This is the
+//     1CH 23 tQ case: six ids tombstoned at 1CH 5:x were reissued at 1CH 23:x
+//     and vanished, and the book's watermark was stamped in-sync anyway.
+//
+// Deliberately compares the REFERENCE, not the content: a reissued id points at
+// different scripture, which is the only signal available without reading the
+// whole book. `ref_raw` is the authoritative comparison (it is what the master
+// TSV's Reference column literally holds, including verse bridges like "1:2-3"
+// and "front:intro"); (chapter, verse) is the fallback when a row's ref_raw is
+// empty. On ambiguity this errs toward reporting a block — the caller's response
+// is to withhold a watermark, whose worst case is a delayed export, versus
+// certifying a book as in-sync while rows are missing.
+//
+// This function does NOT decide whether master's row should be applied — that
+// would be issue #427's option 1 (id reclaim), deliberately out of scope. It
+// only decides whether the skip is worth REPORTING and worth withholding the
+// (book, resource) watermark for.
+//
+// Pure (no D1) so it is regression-testable — see reimportClassify.test.mjs.
+export interface TombstoneRef {
+  refRaw?: string | null;
+  chapter: number;
+  verse: number;
+}
+
+function normalizeRef(r: TombstoneRef): string {
+  const raw = (r.refRaw ?? "").trim().replace(/\s+/g, "");
+  if (raw !== "") return raw;
+  return `${r.chapter}:${r.verse}`;
+}
+
+export function isReissuedTombstone(stored: TombstoneRef, incoming: TombstoneRef): boolean {
+  return normalizeRef(stored) !== normalizeRef(incoming);
+}

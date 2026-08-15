@@ -13,7 +13,13 @@
 // master. But the preservation is SCOPED: tq (no in-app reorder) and NULL-sort
 // rows must still adopt master file order.
 
-import { classifyReimportRow, isReimportableRow, computeEditedFieldMerge, AI_SOURCE } from "./reimportClassify.ts";
+import {
+  classifyReimportRow,
+  isReimportableRow,
+  computeEditedFieldMerge,
+  isReissuedTombstone,
+  AI_SOURCE,
+} from "./reimportClassify.ts";
 
 let failed = 0;
 function eq(actual, expected, msg) {
@@ -327,6 +333,72 @@ eqDeep(
   ),
   null,
   "twl: nothing differs → null (fate stays edited)",
+);
+
+// ── isReissuedTombstone (issue #427, option 2) ─────────────────────────────
+// A soft-deleted row keeps its (book, id) primary key forever, so master's row
+// bearing that id cannot land. Which of the two meanings that has is decided
+// purely by the reference, and the production sweep of 10,645 tombstones
+// (2026-08-10) is the calibration: 0 reissued, 4 same-reference deletes pending
+// export, and replaying the six repaired 1CH tQ rows through the classifier
+// reports exactly 6 — so a zero here means "measured none", not "broken".
+console.log("\n[isReissuedTombstone]");
+
+// THE BUG. Six 1CH tQ ids tombstoned at 1CH 5:x were reissued by bp-assistant
+// at 1CH 23:x; master's new rows were dropped silently.
+eq(
+  isReissuedTombstone({ refRaw: "5:4", chapter: 5, verse: 4 }, { refRaw: "23:7", chapter: 23, verse: 7 }),
+  true,
+  "tombstone at 5:4, master carries the id at 23:7 → reissued (the 1CH 23 tQ case)",
+);
+
+// NOT the bug, and must never be treated as one: master still carrying the id
+// at the SAME reference means the row is deleted and the deletion has not been
+// exported yet. Skipping is what preserves it — the 4 AMO rows in the sweep.
+eq(
+  isReissuedTombstone({ refRaw: "1:2", chapter: 1, verse: 2 }, { refRaw: "1:2", chapter: 1, verse: 2 }),
+  false,
+  "same reference → an ordinary delete awaiting export, not a reissue",
+);
+
+// Same chapter, different verse is still a different row.
+eq(
+  isReissuedTombstone({ refRaw: "3:1", chapter: 3, verse: 1 }, { refRaw: "3:9", chapter: 3, verse: 9 }),
+  true,
+  "same chapter, different verse → reissued",
+);
+
+// ref_raw is the authoritative comparison, so a verse bridge is honored as
+// written rather than collapsed to its first verse.
+eq(
+  isReissuedTombstone({ refRaw: "2:3", chapter: 2, verse: 3 }, { refRaw: "2:3-5", chapter: 2, verse: 3 }),
+  true,
+  "bridge on master vs single verse in D1 → different reference",
+);
+eq(
+  isReissuedTombstone({ refRaw: "front:intro", chapter: 0, verse: 0 }, { refRaw: "front:intro", chapter: 0, verse: 0 }),
+  false,
+  "front:intro on both sides → same reference",
+);
+
+// Cosmetic whitespace must not manufacture a block (a false positive here
+// freezes a book's export).
+eq(
+  isReissuedTombstone({ refRaw: " 4:6 ", chapter: 4, verse: 6 }, { refRaw: "4:6", chapter: 4, verse: 6 }),
+  false,
+  "whitespace-only ref_raw difference → same reference, not a reissue",
+);
+
+// Fallback when a stored row has no ref_raw: compare chapter/verse.
+eq(
+  isReissuedTombstone({ refRaw: null, chapter: 5, verse: 4 }, { refRaw: "5:4", chapter: 5, verse: 4 }),
+  false,
+  "stored ref_raw missing but chapter/verse match master's ref_raw → same reference",
+);
+eq(
+  isReissuedTombstone({ refRaw: "", chapter: 5, verse: 4 }, { refRaw: "", chapter: 23, verse: 7 }),
+  true,
+  "both ref_raw empty, chapter/verse differ → reissued via the fallback",
 );
 
 if (failed > 0) {

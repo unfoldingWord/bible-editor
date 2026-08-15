@@ -62,6 +62,7 @@ import {
   classifyReimportRow,
   isReimportableRow,
   computeEditedFieldMerge,
+  isReissuedTombstone,
 } from "./reimportClassify";
 import {
   computeTsvMerge,
@@ -151,6 +152,34 @@ export interface ReimportCounts {
   // (Guard 2, content-dedup). Tracked separately from skipped_noop so the guard
   // firing is visible in the reimport summary / logs.
   skipped_dup: number;
+  // ── Issue #427, option 2: the silent tombstone-PK drop, made visible ──────
+  //
+  // A master row this run intended to INSERT whose `INSERT ... ON CONFLICT(id,
+  // book) DO NOTHING` wrote 0 rows — the (book, id) slot was already taken by a
+  // row the in-memory diff didn't see (in practice a tombstone; soft deletes
+  // keep their primary key forever). Previously folded into `skipped_noop` with
+  // a "raced" comment, which asserted a cause the code had not measured. The
+  // narrower of the two drop routes: applyTsvRows' `existing` read does NOT
+  // filter `deleted_at IS NULL`, so a known tombstone reaches the tombstone
+  // branch below and never gets here — this counter is the backstop for a slot
+  // taken between the read and the insert.
+  conflict_skipped: number;
+  // A master row dropped by the TOMBSTONE branch of applyTsvRows where master
+  // carries that id at a DIFFERENT reference than the tombstone holds — i.e.
+  // the id has been reissued to a genuinely different row, so master's row is
+  // real and is being silently lost. This is the route the 1CH 23 tQ incident
+  // actually took (six ids tombstoned at 1CH 5:x, reissued by bp-assistant at
+  // 1CH 23:x, dropped with no error and no counter while the watermark
+  // certified the book in sync). See isReissuedTombstone in reimportClassify.ts
+  // for the discriminator and why a SAME-reference tombstone is deliberately
+  // NOT counted (that skip is what preserves a delete pending export).
+  //
+  // These rows are ALSO counted in `skipped_edited`, which is left untouched so
+  // no existing reader changes meaning; this is the specific, gating subset of
+  // it. Fixing the drop itself (reclaiming the id) is issue #427's option 1 and
+  // is deliberately not done here — this run still loses the row, it just says
+  // so and refuses to certify the resource as synced.
+  tombstone_blocked: number;
   // Pristine tombstone that master still carries, brought back to life because
   // an earlier reimport prune had erroneously soft-deleted it (the HAB tn
   // truncated-fetch incident). Human-deleted/trashed rows are never resurrected.
@@ -301,6 +330,8 @@ function zeroCounts(): ReimportCounts {
     prune_locked: 0,
     skipped_noop: 0,
     skipped_dup: 0,
+    conflict_skipped: 0,
+    tombstone_blocked: 0,
     resurrected: 0,
     source_attr_reconciled: 0,
     source_attr_divergent: 0,
@@ -343,13 +374,26 @@ function addCounts(into: ReimportCounts, from: ReimportCounts): void {
   // zero and stamp. So the incompleteness is recorded separately, on
   // `counts_incomplete`, which survives the coercion below and is checked by
   // the gate in addition to its direct-absence check.
+  //
+  // `conflict_skipped` / `tombstone_blocked` (issue #427) join that list for
+  // exactly the same reason, and it matters more for them than for the two
+  // above: those two fields did not exist before this change, so EVERY chunk
+  // result memoized by a Workflow instance that started pre-deploy is missing
+  // them. If their absence only coerced to zero, a run that dropped rows to a
+  // tombstone collision mid-deploy would aggregate to a clean present-zero and
+  // stamp the watermark — the precise laundering this taint flag exists to stop.
   const incomplete =
-    from.chapters_locked === undefined || from.prune_locked === undefined;
+    from.chapters_locked === undefined ||
+    from.prune_locked === undefined ||
+    from.conflict_skipped === undefined ||
+    from.tombstone_blocked === undefined;
   into.counts_incomplete = Boolean(into.counts_incomplete || from.counts_incomplete || incomplete);
   into.chapters_locked += from.chapters_locked ?? 0;
   into.prune_locked += from.prune_locked ?? 0;
   into.skipped_noop += from.skipped_noop;
   into.skipped_dup += from.skipped_dup;
+  into.conflict_skipped += from.conflict_skipped ?? 0;
+  into.tombstone_blocked += from.tombstone_blocked ?? 0;
   into.resurrected += from.resurrected;
   into.source_attr_reconciled += from.source_attr_reconciled;
   into.source_attr_divergent += from.source_attr_divergent;
@@ -904,7 +948,19 @@ async function applyTsvRows(
           counts.inserted++;
           await logEdit(env, kind, row.id, book, userId, null, 1, "create", row);
         } else {
-          counts.skipped_noop++; // raced — appeared concurrently
+          // 0 rows written by `ON CONFLICT(id, book) DO NOTHING` on a row the
+          // diff said to insert: the (book, id) slot is held by something the
+          // `existing` read didn't return. Issue #427 — count it as a conflict
+          // skip and let it withhold the watermark. The old code called this
+          // "raced" and folded it into skipped_noop, which both asserted an
+          // unmeasured cause and hid a real drop inside a benign counter.
+          counts.conflict_skipped++;
+          console.warn("reimport: master row dropped on PK conflict", {
+            book,
+            resource: kind,
+            id: row.id,
+            ref: row.refRaw,
+          });
         }
       } catch (e) {
         counts.errors.push(`${kind} ${row.id}: ${e instanceof Error ? e.message : String(e)}`);
@@ -926,6 +982,30 @@ async function applyTsvRows(
         resurrects.push({ row, sortOrder, oldVersion: Number(cur.version) });
       } else {
         counts.skipped_edited++;
+        // Issue #427. The tombstone keeps its (book, id) primary key forever,
+        // so master's row for that id cannot land — and that is CORRECT when
+        // master still carries it at the same reference (a delete awaiting
+        // export). When master carries it at a DIFFERENT reference the id has
+        // been reissued to a genuinely different row, and we have just dropped
+        // real master content with no error and no distinguishable counter.
+        // Count that case separately so the sync report shows it and the
+        // (book, resource) watermark is withheld — see isReissuedTombstone and
+        // the reimport-sync step. Reclaiming the slot is option 1, not this.
+        if (
+          isReissuedTombstone(
+            { refRaw: (cur.ref_raw as string | null) ?? null, chapter: Number(cur.chapter), verse: Number(cur.verse) },
+            { refRaw: row.refRaw, chapter: row.chapter, verse: row.verse },
+          )
+        ) {
+          counts.tombstone_blocked++;
+          console.warn("reimport: master row blocked by a reissued-id tombstone", {
+            book,
+            resource: kind,
+            id: row.id,
+            tombstoneRef: cur.ref_raw ?? `${cur.chapter}:${cur.verse}`,
+            masterRef: row.refRaw,
+          });
+        }
       }
       continue;
     }
@@ -3998,8 +4078,23 @@ export async function runChunkedReimport(
       // it in-sync and the export would revert master with no retry (Codex's
       // failed-adoption-write gate). Sibling to the other withhold conditions.
       const applyIncomplete = perResource[e.resource].apply_incomplete === true;
+      // Issue #427: master rows this run dropped because a tombstone (or any
+      // other holder) already owns their (book, id) primary key. Folded into
+      // shouldRecordResourceSync rather than checked separately here, so the
+      // aggregation-laundering guard (counts_incomplete) covers them too.
       if (!shouldRecordResourceSync(perResource[e.resource]) || systemicRefusals || mergeRecordFailed || applyIncomplete) {
         withheld.push(e.resource);
+        const dropped =
+          (perResource[e.resource].conflict_skipped ?? 0) +
+          (perResource[e.resource].tombstone_blocked ?? 0);
+        if (dropped > 0) {
+          console.warn("reimport withheld sync watermark: master rows dropped on id collision", {
+            book,
+            resource: e.resource,
+            conflict_skipped: perResource[e.resource].conflict_skipped,
+            tombstone_blocked: perResource[e.resource].tombstone_blocked,
+          });
+        }
         // FIX B: a book whose (book, resource) has NO existing watermark row
         // (e.g. seeded by scripts/import-book.mjs, or whose import-time SHA
         // fetch returned null — bookImport.ts) would otherwise have withholding

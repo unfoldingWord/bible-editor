@@ -46,6 +46,8 @@ function counts(overrides = {}) {
     prune_locked: 0,
     skipped_noop: 0,
     skipped_dup: 0,
+    conflict_skipped: 0,
+    tombstone_blocked: 0,
     resurrected: 0,
     source_attr_reconciled: 0,
     source_attr_divergent: 0,
@@ -154,6 +156,68 @@ eq(
   shouldRecordResourceSync(counts({ chapters_locked: 0, prune_locked: 0, counts_incomplete: false })),
   true,
   "counts_incomplete false, both zero → stamp",
+);
+
+// ── Issue #427, option 2: tombstone-blocked / PK-conflict drops ─────────────
+// THE 1CH 23 tQ SHAPE. Six tQ rows whose ids were held by tombstones from
+// 1CH 5:x never landed; (1CH, tq) was stamped `origin='reimport'` anyway, so
+// the book was certified in sync while master carried six rows D1 did not.
+// Nothing retries it — the next run's SHA gate sees an unchanged source_sha
+// and skips the file — so the stamp is the whole difference between a
+// one-night gap and a permanent silent divergence.
+eq(
+  shouldRecordResourceSync(counts({ tombstone_blocked: 6 })),
+  false,
+  "tombstone_blocked > 0 (the 1CH 23 tQ shape) → withhold the watermark",
+);
+eq(
+  shouldRecordResourceSync(counts({ conflict_skipped: 1 })),
+  false,
+  "conflict_skipped > 0 (ON CONFLICT DO NOTHING wrote 0 rows) → withhold the watermark",
+);
+eq(
+  shouldRecordResourceSync(counts({ conflict_skipped: 0, tombstone_blocked: 0 })),
+  true,
+  "both drop counters present and zero → stamp",
+);
+// The gate must not be reachable via the OTHER counters alone: a run that
+// dropped rows still withholds even when every lock counter is clean, which is
+// exactly the 1CH case (no locks were held that night).
+eq(
+  shouldRecordResourceSync(counts({ chapters_locked: 0, prune_locked: 0, tombstone_blocked: 1 })),
+  false,
+  "no locks at all but a blocked row → still withhold",
+);
+// Fail-safe presence, same rule as chapters_locked/prune_locked: a chunk result
+// memoized by a Workflow instance that started before this change simply has no
+// such field, and "not measured" must not read as "measured zero". Note both
+// legacy fields are present here, so ONLY the new presence check can catch it.
+eq(
+  shouldRecordResourceSync({ chapters_locked: 0, prune_locked: 0 }),
+  false,
+  "legacy counts object missing conflict_skipped/tombstone_blocked → withhold (fail-safe, not zero-and-stamp)",
+);
+eq(
+  shouldRecordResourceSync({ chapters_locked: 0, prune_locked: 0, conflict_skipped: 0 }),
+  false,
+  "counts object missing tombstone_blocked only → withhold (fail-safe)",
+);
+eq(
+  shouldRecordResourceSync({ chapters_locked: 0, prune_locked: 0, tombstone_blocked: 0 }),
+  false,
+  "counts object missing conflict_skipped only → withhold (fail-safe)",
+);
+// The aggregation-laundering route (Finding 2, applied to the new fields):
+// addCounts coerces an absent field to 0 to keep the running totals numeric, so
+// by the time the gate sees perResource[resource] the absence is gone. The
+// separate counts_incomplete taint is what survives that, and it must still
+// withhold even though all four counters read present-and-zero.
+eq(
+  shouldRecordResourceSync(
+    counts({ conflict_skipped: 0, tombstone_blocked: 0, counts_incomplete: true }),
+  ),
+  false,
+  "aggregate laundered a legacy chunk's absent drop counters to zero → counts_incomplete still withholds",
 );
 
 console.log("\n[isSystemicMergeRefusal]");

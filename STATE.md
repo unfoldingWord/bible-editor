@@ -71,6 +71,17 @@ For the full corpus, see the memory index at
 `C:\Users\benja\.claude\projects\C--Users-benja-Documents-GitHub-bible-editor\memory\MEMORY.md`.
 Highlights that bite repeatedly:
 
+- **A master row lost to a tombstoned id is dropped by the reimport's TOMBSTONE branch,
+  not by its `ON CONFLICT DO NOTHING` insert.** `applyTsvRows`' `existing` read does not
+  filter `deleted_at IS NULL`, so a tombstoned id is always found and never reaches the
+  insert at all; the drop happens where the tombstone is declined, and it was counted as
+  an ordinary `skipped_edited`. Anyone "fixing the ON CONFLICT insert" for issue #427 will
+  ship a change that provably could not have caught the 1CH 23 tQ incident. The
+  discriminator that separates a real drop from a correct one is the REFERENCE: master
+  carrying the id at the same ref = a delete awaiting export (skip is right); at a
+  different ref = the id was reissued to a different row (real loss). See
+  `isReissuedTombstone` in `api/src/reimportClassify.ts`.
+
 - **Our own USFM render does not round-trip, so "D1 differs from master" does NOT mean a
   human changed anything.** Measured 2026-08-11 by running the real
   `extractVersesForRange` → `buildUsfm` → `extractVersesForRange` over the checked-in ZEC

@@ -27,6 +27,13 @@ export function summarizeReimport(res: ReimportResponse): string {
   // (see api/src/ownPublish.ts).
   if (t.own_publish_converged)
     parts.push(`${t.own_publish_converged} resource(s) confirmed as holding our last export`);
+  // Master rows that could NOT be imported because their id is already taken in
+  // D1 by a soft-deleted row (ids are never released). Worth saying out loud
+  // rather than burying in "skipped": the rows are genuinely missing from D1,
+  // and this run therefore did NOT certify the book as in sync with Door43.
+  // See api/src/reimportClassify.ts / GitHub issue #427.
+  const blocked = (t.tombstone_blocked ?? 0) + (t.conflict_skipped ?? 0);
+  if (blocked) parts.push(`${blocked} NOT imported (id already used by a deleted row) — book left marked out of sync`);
   if (t.dcs_404) parts.push(`${t.dcs_404} resource(s) not on DCS`);
   if (parts.length === 0) return `Imported ${res.book} — no changes.`;
   return `Imported ${res.book}: ${parts.join(", ")}.`;
