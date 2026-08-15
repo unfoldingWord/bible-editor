@@ -130,6 +130,57 @@ export interface ExistingAlertState {
   dismissedAt: number | null;
 }
 
+// The per-outcome guidance sentences in the ADMIN banner (raiseVerseMergeConflictAlert).
+// Pure so verseMergeConflicts.test.mjs can prove the classification without a
+// D1/Env harness — the same split every other helper in this file uses.
+//
+// Classified by ACTION, never by `overwritten_version`: the pointer is a
+// nullable recovery aid, the action is the fact. Deriving "did we take Door43's
+// version?" from a nullable column is exactly what once let a refusal row that
+// acquired a pointer report itself as an overwrite (see this table's history);
+// keyed on action, that cannot recur, and a THIRD kept-D1 action
+// ('source_attr_divergent') can be added without the two-action `!==` shortcut
+// silently miscounting it as an overwrite.
+//   - 'adopt_conflict'         -> Door43's version was taken OVER the editor's.
+//   - 'keep_alignment_refused' -> kept D1; adopting would have cost alignment.
+//   - 'source_attr_divergent'  -> kept D1; master's original-language source fix
+//                                 couldn't be placed (repeated source word).
+// Both kept-D1 outcomes carry the same warning: nothing was taken, so tonight's
+// export will still write D1 back over master until a human resolves it.
+export function buildMergeConflictGuidance(
+  rows: Array<{ action: string }>,
+  opts: { recordingFailed?: boolean; noBaseCount?: number } = {},
+): string {
+  const overwritten = rows.filter((r) => r.action === "adopt_conflict").length;
+  const keptAlignment = rows.filter((r) => r.action === "keep_alignment_refused").length;
+  const keptSourceAttr = rows.filter((r) => r.action === "source_attr_divergent").length;
+  return [
+    overwritten > 0
+      ? `${overwritten} took Door43's version over the editor's — the replaced text is still in that verse's ` +
+        `version history, at the version number given after @v in its ref above.`
+      : "",
+    keptAlignment > 0
+      ? `${keptAlignment} kept the editor's version because adopting Door43's would have cost alignment — Door43's ` +
+        `change has NOT been taken, so tonight's export will still write over it until someone resolves it.`
+      : "",
+    keptSourceAttr > 0
+      ? `${keptSourceAttr} kept D1 because Door43's original-language source fix (the spelling/pointing/morphology ` +
+        `on \\zaln-s) could not be placed unambiguously — the same source word repeats in the verse — so Door43's ` +
+        `change has NOT been taken, and tonight's export will write over it until someone resolves it by hand.`
+      : "",
+    opts.recordingFailed
+      ? "NOTE: at least one merge-conflict recording failed to write to verse_merge_conflicts this run " +
+        "(see worker logs) — this table and count may be missing rows from tonight's sync."
+      : "",
+    opts.noBaseCount
+      ? `${opts.noBaseCount} verse(s) could not be adjudicated because their edit history has aged out (no ` +
+        `recoverable ancestor) — a Door43-side change to them will still be overwritten by tonight's export.`
+      : "",
+  ]
+    .filter(Boolean)
+    .join(" ");
+}
+
 export function planSystemAlertWrites(
   existing: Map<string, ExistingAlertState>,
   desired: Map<string, string>,
