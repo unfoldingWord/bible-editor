@@ -975,6 +975,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
         resource,
         built.content,
         built.readAt,
+        built.editBoundary,
         commit.contentSha,
         isMasterConfirmed(commit),
       );
@@ -1135,9 +1136,22 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     // of (with the old commit-time stamp) falsely predating it and becoming
     // tomorrow's ancestor — the race this fix closes.
     readAt: number;
+    // P1.3: the MAX(edit_log.id) high-water-mark at this same D1 read, the
+    // PRECISE merge-ancestor boundary (0050's master_confirmed_edit_id) that
+    // replaces the 1-second `readAt` cutoff for reconstruction. Captured BEFORE
+    // the row reads below, so an edit landing in that tiny window is reflected
+    // in the rendered rows but excluded from the ancestor (one edit too old ->
+    // at worst a recoverable false conflict), never the reverse. null only when
+    // edit_log is empty (a fresh DB) — then the reconstruction keeps the
+    // timestamp fallback, which is correct because there is no ancestor to fold.
+    editBoundary: number | null;
   }> {
     const readAt = Math.floor(Date.now() / 1000);
     const db = this.env.DB;
+    // Capture the edit_log id boundary FIRST, before any row read, so it can
+    // only ever exclude (never include) an edit that landed after this instant.
+    const boundaryRow = await db.prepare(`SELECT MAX(id) AS m FROM edit_log`).first<{ m: number | null }>();
+    const editBoundary = boundaryRow?.m ?? null;
     if (resource === "tn") {
       // trashed_at IS NULL excludes notes pending deletion. The nightly cron
       // promotes trash -> deleted_at before this Workflow's steps read, but
@@ -1150,7 +1164,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
         )
         .bind(book)
         .all<TnRow>();
-      return { content: rs.results.length === 0 ? "" : buildTnTsv(rs.results), rowCount: rs.results.length, sortOrderUpdates: [], readAt };
+      return { content: rs.results.length === 0 ? "" : buildTnTsv(rs.results), rowCount: rs.results.length, sortOrderUpdates: [], readAt, editBoundary };
     }
     if (resource === "tq") {
       const rs = await db
@@ -1160,7 +1174,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
         )
         .bind(book)
         .all<TqRow>();
-      return { content: rs.results.length === 0 ? "" : buildTqTsv(rs.results), rowCount: rs.results.length, sortOrderUpdates: [], readAt };
+      return { content: rs.results.length === 0 ? "" : buildTqTsv(rs.results), rowCount: rs.results.length, sortOrderUpdates: [], readAt, editBoundary };
     }
     if (resource === "twl") {
       const rs = await db
@@ -1178,7 +1192,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
         .bind(book, "ULT")
         .all<VerseRow>();
       if (rs.results.length === 0) {
-        return { content: "", rowCount: 0, sortOrderUpdates: [], readAt };
+        return { content: "", rowCount: 0, sortOrderUpdates: [], readAt, editBoundary };
       }
       // Independent reads; object-literal properties evaluate in order, so
       // awaiting them inline would serialize two D1 round-trips per book.
@@ -1199,6 +1213,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
         rowCount: rs.results.length,
         sortOrderUpdates: result.sortOrderUpdates,
         readAt,
+        editBoundary,
       };
     }
     // ult / ust
@@ -1210,7 +1225,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       )
       .bind(book, bibleVersion)
       .all<VerseRow>();
-    if (rs.results.length === 0) return { content: "", rowCount: 0, sortOrderUpdates: [], readAt };
+    if (rs.results.length === 0) return { content: "", rowCount: 0, sortOrderUpdates: [], readAt, editBoundary };
     const headersRow = await db
       .prepare(`SELECT headers_json FROM book_usfm_meta WHERE book = ?1 AND bible_version = ?2`)
       .bind(book, bibleVersion)
@@ -1239,6 +1254,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       rowCount: rs.results.length,
       sortOrderUpdates: [],
       readAt,
+      editBoundary,
     };
   }
 
@@ -1957,6 +1973,11 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     resource: Resource,
     content: string,
     readAt: number,
+    // P1.3: MAX(edit_log.id) at this render's D1 read (built.editBoundary). Stored
+    // as pushed_edit_id alongside pushed_read_at (the same render) and stamped as
+    // master_confirmed_edit_id on the same confirmMaster gate as
+    // master_confirmed_at. null only when edit_log is empty.
+    editBoundary: number | null,
     giteaBlobSha: string,
     confirmMaster: boolean,
   ): Promise<void> {
@@ -1983,11 +2004,35 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
             SET pushed_blob_sha =
                   CASE WHEN pushed_read_at IS NULL OR pushed_read_at <= ?4 THEN ?3 ELSE pushed_blob_sha END,
                 pushed_read_at = MAX(COALESCE(pushed_read_at, 0), ?4),
+                -- P1.3: store this render's edit_log id boundary next to its
+                -- blob/read-time, guarded IDENTICALLY to pushed_blob_sha so the
+                -- trio always describes ONE render. markOwnPublishConverged
+                -- promotes it into master_confirmed_edit_id when a later sync
+                -- recognizes this render on master (the steady-state path).
+                pushed_edit_id =
+                  CASE WHEN pushed_read_at IS NULL OR pushed_read_at <= ?4 THEN ?6 ELSE pushed_edit_id END,
                 master_confirmed_at =
-                  CASE WHEN ?5 = 1 THEN MAX(COALESCE(master_confirmed_at, 0), ?4) ELSE master_confirmed_at END
+                  CASE WHEN ?5 = 1 THEN MAX(COALESCE(master_confirmed_at, 0), ?4) ELSE master_confirmed_at END,
+                -- Shadow master_confirmed_at, but ONLY when this render is the
+                -- newest confirmed one (?4 >= the stored master_confirmed_at).
+                -- Without that gate the two columns are MAX'd independently, and a
+                -- delayed OLDER render arriving while master_confirmed_edit_id is
+                -- still NULL (warm-up) would advance the id to the old render's
+                -- boundary (MAX(0, old) = old) while the timestamp stays at the
+                -- newer render (MAX keeps it) — the two would then describe
+                -- DIFFERENT renders and reconstruction (which prefers the id) would
+                -- fold too old an ancestor, reintroducing the false-conflict this
+                -- migration removes. The non-null guard additionally stops an empty
+                -- edit_log (?6 NULL) from coercing this to a bogus 0. When the gate
+                -- passes, ?6 >= the stored id (readAt and MAX(id) move together per
+                -- build), so MAX here equals a direct assign but also can't regress.
+                master_confirmed_edit_id =
+                  CASE WHEN ?5 = 1 AND ?6 IS NOT NULL AND ?4 >= COALESCE(master_confirmed_at, 0)
+                       THEN MAX(COALESCE(master_confirmed_edit_id, 0), ?6)
+                       ELSE master_confirmed_edit_id END
           WHERE book = ?1 AND resource = ?2`,
       )
-        .bind(book, resource, blobSha, readAt, confirmMaster ? 1 : 0)
+        .bind(book, resource, blobSha, readAt, confirmMaster ? 1 : 0, editBoundary)
         .run();
       if ((result.meta?.changes ?? 0) === 0) {
         // No book_resource_syncs row yet. UPDATE-only is deliberate (origin is NOT
