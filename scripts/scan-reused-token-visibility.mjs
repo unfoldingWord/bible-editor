@@ -63,8 +63,7 @@ import {
   buildDisplayGroups,
   buildPosMaps,
   buildSourceIndexMap,
-  groupsForCard,
-  resolveSourcePos,
+  unrenderedFlaggedTokenKeys,
 } from "../web/src/lib/alignmentHover.ts";
 import { concatSourceRange } from "../web/src/lib/verseRange.ts";
 import { lintUsfmVerses } from "../api/src/lint.ts";
@@ -217,47 +216,15 @@ for (const bk of books) {
     const rendered = new Set();
     for (const g of display) for (const s of g.source) if (flagged.has(s.id)) rendered.add(s.id);
 
-    // Card/token check for `flaggedButUnrendered` (see header comment): walk
-    // each DISPLAY card back to every state group it fused via groupsForCard
-    // — the same resolution AlignmentPanel uses for merge/clear — and ask
-    // whether the card renders a chip at the same source POSITION as each
-    // flagged token those groups own. Position, not raw id, because a fused
-    // card keeps only its survivor group's ids; the eaten group's flagged id
-    // is gone from `display` entirely even though its physical token still
-    // draws a chip on the survivor card.
-    let cardTokenUnrendered = false;
-    if (flagged.size > 0) {
-      cardTokenLoop: for (const d of display) {
-        const underlyingIds = groupsForCard(state.groups, d.id, indexMap);
-        const flaggedPositions = new Set();
-        for (const gid of underlyingIds) {
-          const g = state.groups.find((sg) => sg.id === gid);
-          if (!g) continue;
-          for (const s of g.source) {
-            if (!flagged.has(s.id)) continue;
-            const pos = resolveSourcePos(s, indexMap);
-            // -1 means unresolved (reusedSourceIdsOf can flag a word whose
-            // claimed occurrence doesn't exist in the source verse — see
-            // reusedTokenKey). An unresolved position can't be reliably
-            // compared against another word's unresolved position (both
-            // collapse to -1, a false match), so skip it here rather than
-            // risk a false "rendered" the way groupPositionKey's null guard
-            // does for the same reason.
-            if (pos >= 0) flaggedPositions.add(pos);
-          }
-        }
-        if (flaggedPositions.size === 0) continue;
-        const renderedPositions = new Set(
-          d.source.map((s) => resolveSourcePos(s, indexMap)).filter((p) => p >= 0),
-        );
-        for (const p of flaggedPositions) {
-          if (!renderedPositions.has(p)) {
-            cardTokenUnrendered = true;
-            break cardTokenLoop;
-          }
-        }
-      }
-    }
+    // Card/token check for `flaggedButUnrendered` (see header comment):
+    // unrenderedFlaggedTokenKeys (web/src/lib/alignmentHover.ts) walks each
+    // DISPLAY card back to every state group it fused via groupsForCard — the
+    // same resolution AlignmentPanel uses for merge/clear — and returns the
+    // reusedTokenKey of every flagged token that never draws a chip on any
+    // card. Shared (not reimplemented here) so the committed regression test
+    // in alignmentHover.test.mjs proves the exact function this census runs.
+    const unrenderedTokens = unrenderedFlaggedTokenKeys(state, display, indexMap, flagged);
+    const cardTokenUnrendered = unrenderedTokens.length > 0;
 
     // A defect is only legible as "doubled Hebrew" when at least TWO flagged
     // chips actually draw — one lone red marker has no partner to compare to.
@@ -283,6 +250,7 @@ for (const bk of books) {
       rendered: rendered.size,
       visibility,
       cardTokenUnrendered,
+      unrenderedTokens,
     });
     bookHits++;
   }
@@ -324,14 +292,25 @@ if (asJson) {
     console.log(
       `${f.ref.padEnd(14)} ${f.resource}  lint=${f.lint ? "Y" : "n"}  ` +
         `flagged=${f.flagged} rendered=${f.rendered}  ${f.visibility.toUpperCase()}` +
-        // Two DIFFERENT problems, so two different notes. A row can be `visible`
-        // (>=2 flagged chips draw, so the doubling reads) and STILL have a
-        // flagged word with no chip — JER 36:30 UST is exactly that: 3 flagged,
-        // 2 rendered. Printing "nothing doubled on screen" there would be false.
+        // Two DIFFERENT problems, so two different notes, and neither is the
+        // flaggedButUnrendered GATE metric below (which is the (card, token)
+        // check, not this raw-id ratio). A row can be `visible` (>=2 flagged
+        // ids literally survive into display, so the doubling reads) and
+        // STILL have a flagged id that doesn't literally survive — JER 36:30
+        // UST is exactly that: 3 flagged, 2 rendered by id, yet
+        // flaggedButUnrendered is 0 for it because the token still draws (a
+        // legitimately fused card keeps only its survivor's id). Printing
+        // "nothing doubled on screen" there would be false.
         (f.flagged > 0 && f.rendered < f.flagged
           ? f.visibility === "visible"
-            ? `  <-- visible, but ${f.flagged - f.rendered} flagged chip(s) do not render`
-            : "  <-- flagged but nothing doubled on screen"
+            ? `  <-- visible, but ${f.flagged - f.rendered} flagged id(s) don't literally survive into display (raw-id ratio, NOT the flaggedButUnrendered gate)`
+            : "  <-- flagged but no raw id renders (raw-id ratio, NOT the flaggedButUnrendered gate)"
+          : "") +
+        // THE gate metric's own per-row attribution: which token(s) actually
+        // never draw a chip on any card, so a nonzero reading doesn't force a
+        // second full census run just to find the offending verse.
+        (f.cardTokenUnrendered
+          ? `  <-- flaggedButUnrendered: [${f.unrenderedTokens.join(", ")}] never render on any card`
           : ""),
     );
   }
