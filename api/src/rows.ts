@@ -731,10 +731,10 @@ rows.patch("/:kind/:id", requireEditor, async (c) => {
       // edit/delete in the SELECT→UPDATE window still yields 409/404, not a
       // false 200 no-op.
       const reorderOnly = fields.length === 1 && fields[0] === "sort_order";
-      if (kind === "tn" && !reorderOnly && (current as unknown as TnRow).review_kind != null) {
+      if (!reorderOnly && (current as Record<string, unknown>).review_kind != null) {
         const now = Math.floor(Date.now() / 1000);
         const res = await c.env.DB.prepare(
-          `UPDATE tn_rows SET review_kind = NULL, review_reason = NULL, updated_at = ?1
+          `UPDATE ${KIND_TO_TABLE[kind]} SET review_kind = NULL, review_reason = NULL, updated_at = ?1
              WHERE id = ?2 AND version = ?3 AND deleted_at IS NULL${bookClause(4)}`,
         )
           .bind(now, id, expected, book)
@@ -746,7 +746,7 @@ rows.patch("/:kind/:id", requireEditor, async (c) => {
         // Row moved or was deleted between the SELECT and this UPDATE — surface
         // the normal concurrency response instead of a stale 200.
         const fresh = await c.env.DB.prepare(
-          `SELECT * FROM tn_rows WHERE id = ?1${bookClause(2)}`,
+          `SELECT * FROM ${KIND_TO_TABLE[kind]} WHERE id = ?1${bookClause(2)}`,
         )
           .bind(id, book)
           .first<{ version: number; deleted_at: number | null }>();
@@ -801,14 +801,13 @@ rows.patch("/:kind/:id", requireEditor, async (c) => {
   const userId = currentUserId(c);
   const now = Math.floor(Date.now() / 1000);
   const setClauses = fields.map((f, i) => `${f} = ?${i + 1}`);
-  // Any TN content edit clears a pending review flag (the adapted-note verify
-  // queue). Literal NULLs — no bind params, so positional indices below are
-  // unaffected. The reorder-only fast path above returns before here, so a
-  // drag never clears a flag.
-  if (kind === "tn") {
-    setClauses.push("review_kind = NULL");
-    setClauses.push("review_reason = NULL");
-  }
+  // Any content edit clears a pending review flag (the adapted-note verify
+  // queue for tn; the merged-Door43-edit conflict flag for all three kinds —
+  // migration 0047). Literal NULLs — no bind params, so positional indices
+  // below are unaffected. The reorder-only fast path above returns before here,
+  // so a drag never clears a flag. All three tables carry the columns.
+  setClauses.push("review_kind = NULL");
+  setClauses.push("review_reason = NULL");
   const baseParams = fields.length;
   // version bump and metadata go after the patch fields, then the WHERE
   // params (id + expected version + book) tail the bindings.

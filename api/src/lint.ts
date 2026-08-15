@@ -166,6 +166,19 @@ export function lintTqRows(rows: TqRow[]): LintIssue[] {
     if (isBlankRequired(r.response)) {
       issues.push({ check: "Empty response", bucket: "flag", ref, rowId: r.id, message: "Empty response — DCS only warns, so this row publishes blank on the next export. Add a response or delete the row." });
     }
+    // Workflow-only review flag (mirror lintTnRows): set when the nightly
+    // Door43->D1 three-way merge adopted a maintainer's edit that conflicted
+    // with an app-side edit (tsvMerge.ts). Surfaces in the cleanup chip; the
+    // overwritten value is recoverable from row history.
+    if (r.review_kind) {
+      issues.push({
+        check: "Merged Door43 edit — verify",
+        bucket: "flag",
+        ref,
+        rowId: r.id,
+        message: r.review_reason ?? "A Door43 edit was merged over your change — verify it.",
+      });
+    }
   }
   return issues;
 }
@@ -182,6 +195,17 @@ export function lintTwlRows(rows: TwlRow[]): LintIssue[] {
     }
     if (isBlankRequired(r.tw_link)) {
       issues.push({ check: "Empty TWLink", bucket: "flag", ref, rowId: r.id, message: "Empty TWLink — DCS only warns, so this row publishes with no link on the next export. Add a translationWords link or delete the row." });
+    }
+    // Workflow-only review flag (mirror lintTnRows) — a merged Door43 edit that
+    // conflicted with an app-side edit (tsvMerge.ts).
+    if (r.review_kind) {
+      issues.push({
+        check: "Merged Door43 edit — verify",
+        bucket: "flag",
+        ref,
+        rowId: r.id,
+        message: r.review_reason ?? "A Door43 edit was merged over your change — verify it.",
+      });
     }
   }
   return issues;
