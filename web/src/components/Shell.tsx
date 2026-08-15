@@ -204,9 +204,13 @@ interface Props {
   // Top-right notifications bell (comment mentions/replies). Owned by App
   // (which holds the alerts) and rendered here inside the TopBar.
   notificationsMenu?: ReactNode;
+  // Collapsed "sync warnings" badge (door43/export state alerts). Also owned
+  // by App and rendered in the TopBar next to the other indicators — replaces
+  // the old full-width banner so these warnings never block navigation (#458).
+  syncWarnings?: ReactNode;
 }
 
-export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, onLogout, meUserId = null, isViewer = false, initialCommentId, onCommentConsumed, authReady = false, notificationsMenu }: Props) {
+export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, onLogout, meUserId = null, isViewer = false, initialCommentId, onCommentConsumed, authReady = false, notificationsMenu, syncWarnings }: Props) {
   // tw_link → article title, for canonical (headword-anchored) TWL ordering.
   // handleAddTwlSuggestion below places a NEW link at its canonical slot and
   // persists a matching sort_order, so it must order with the SAME inputs the
@@ -2573,6 +2577,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           }}
           onLogout={onLogout}
           notificationsMenu={notificationsMenu}
+          syncWarnings={syncWarnings}
         />
         <Box sx={{ p: 4, display: "flex", alignItems: "center", gap: 2 }}>
           {status === "error" ? (
@@ -2900,6 +2905,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           />
         }
         notificationsMenu={notificationsMenu}
+        syncWarnings={syncWarnings}
         exportMenu={
           <ExportUsfmButton
             book={book}
