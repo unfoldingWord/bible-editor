@@ -6,7 +6,8 @@
 // A proper diff/merge UI is docs/plan.md territory and out of scope here.
 
 import { useEffect, useState, type ReactNode } from "react";
-import { Box, Button, Chip, Dialog, DialogActions, DialogContent, DialogContentText, DialogTitle, Divider, IconButton, ListItemText, Menu, MenuItem, Stack, Tooltip, Typography } from "@mui/material";
+import { Box, Button, Chip, Divider, IconButton, ListItemText, Menu, MenuItem, Stack, Tooltip, Typography } from "@mui/material";
+import { ConfirmDialog } from "./ConfirmDialog";
 import CloudDoneIcon from "@mui/icons-material/CloudDone";
 import CloudQueueIcon from "@mui/icons-material/CloudQueue";
 import ErrorOutlineIcon from "@mui/icons-material/ErrorOutline";
@@ -518,139 +519,96 @@ export function SyncStatusBar({ onNavigate }: Props = {}) {
           </Stack>
         </Box>
       )}
-      <Dialog
-        // Auto-closes if the failed list empties out from under it (retry /
-        // auto-revival) — nothing left to discard.
+      {/* Auto-closes if the failed list empties out from under it (retry /
+          auto-revival) — nothing left to discard. */}
+      <ConfirmDialog
         open={confirmDiscardAll && failed.length > 0}
-        onClose={() => setConfirmDiscardAll(false)}
-        // Same layering problem as the unresolvable dialog below: the floating
-        // panel (zIndex.snackbar) stays mounted while this is open and would
-        // otherwise sit above the modal layer.
+        title={`Discard ${failed.length} failed edit${failed.length === 1 ? "" : "s"}?`}
+        description="These edits never reached the server. Discarding deletes them from this device permanently — they cannot be recovered."
+        confirmLabel="discard all"
+        onCancel={() => setConfirmDiscardAll(false)}
+        onConfirm={async () => {
+          for (const op of failed) await outbox.drop(op.id, { onlyIfStatus: "failed" });
+          setConfirmDiscardAll(false);
+        }}
         sx={{ zIndex: (t) => t.zIndex.snackbar + 1 }}
-      >
-        <DialogTitle>
-          Discard {failed.length} failed edit{failed.length === 1 ? "" : "s"}?
-        </DialogTitle>
-        <DialogContent>
-          <DialogContentText>
-            These edits never reached the server. Discarding deletes them from
-            this device permanently — they cannot be recovered.
-          </DialogContentText>
-        </DialogContent>
-        <DialogActions>
-          <Button onClick={() => setConfirmDiscardAll(false)}>cancel</Button>
-          <Button
-            color="error"
-            variant="contained"
-            onClick={async () => {
-              for (const op of failed) await outbox.drop(op.id, { onlyIfStatus: "failed" });
-              setConfirmDiscardAll(false);
-            }}
-          >
-            discard all
-          </Button>
-        </DialogActions>
-      </Dialog>
-      <Dialog
-        // liveUnresolvable already filters the snapshot against current
-        // conflicts, so this auto-closes when every op has left conflict
-        // status in this tab — mirrors the discard-all dialog above.
+      />
+      {/* Auto-closes when every unresolvable op leaves conflict status. */}
+      <ConfirmDialog
         open={liveUnresolvable.length > 0}
-        onClose={closeUnresolvable}
-        // The floating action panel sits at zIndex.snackbar and stays mounted
-        // while this dialog is open (its ops are still conflicts) — lift the
-        // dialog above it so the panel can't cover the buttons.
-        sx={{ zIndex: (t) => t.zIndex.snackbar + 1 }}
-      >
-        <DialogTitle>
-          Discard {liveUnresolvable.length} unresolvable conflict
-          {oneUnresolvable ? "" : "s"}?
-        </DialogTitle>
-        <DialogContent>
-          <DialogContentText>
-            {`The server did not send back its current version for ${oneUnresolvable ? "this edit" : "these edits"}, so ${oneUnresolvable ? "it" : "they"} cannot be retried automatically. Discarding deletes ${oneUnresolvable ? "it" : "them"} from this device permanently — copy ${oneUnresolvable ? "it" : "them"} first if you want to keep the text.`}
-          </DialogContentText>
-          <Stack spacing={0.25} sx={{ mt: 1 }}>
-            {liveUnresolvable.map((op) => (
-              <Typography
-                key={op.id}
-                variant="caption"
-                sx={{ fontFamily: "monospace", display: "block" }}
-              >
-                {formatOpLabel(op)}
-              </Typography>
-            ))}
-          </Stack>
-        </DialogContent>
-        <DialogActions>
+        title={`Discard ${liveUnresolvable.length} unresolvable conflict${oneUnresolvable ? "" : "s"}?`}
+        description={`The server did not send back its current version for ${oneUnresolvable ? "this edit" : "these edits"}, so ${oneUnresolvable ? "it" : "they"} cannot be retried automatically. Discarding deletes ${oneUnresolvable ? "it" : "them"} from this device permanently — copy ${oneUnresolvable ? "it" : "them"} first if you want to keep the text.`}
+        confirmLabel="discard"
+        onCancel={closeUnresolvable}
+        onConfirm={() => void discardUnresolvable()}
+        extraAction={
           <Button onClick={() => void copyUnresolvable()}>
             {copiedUnresolvable ? "copied" : "copy edits"}
           </Button>
-          <Button onClick={closeUnresolvable}>cancel</Button>
-          <Button color="error" variant="contained" onClick={() => void discardUnresolvable()}>
-            discard
-          </Button>
-        </DialogActions>
-      </Dialog>
-      <Dialog
+        }
+        sx={{ zIndex: (t) => t.zIndex.snackbar + 1 }}
+      >
+        <Stack spacing={0.25} sx={{ mt: 1 }}>
+          {liveUnresolvable.map((op) => (
+            <Typography
+              key={op.id}
+              variant="caption"
+              sx={{ fontFamily: "monospace", display: "block" }}
+            >
+              {formatOpLabel(op)}
+            </Typography>
+          ))}
+        </Stack>
+      </ConfirmDialog>
+      {/* Single-op discard — auto-closes when the op leaves failed status. */}
+      <ConfirmDialog
         open={liveDropOp !== null}
-        onClose={closeDropOp}
+        title="Discard this edit?"
+        description="This edit never reached the server. Discarding deletes it from this device permanently — copy it first if you want to keep the text."
+        confirmLabel="discard"
+        onCancel={closeDropOp}
+        onConfirm={async () => {
+          if (!liveDropOp) return;
+          await outbox.drop(liveDropOp.id, { onlyIfStatus: "failed" });
+          closeDropOp();
+        }}
+        extraAction={
+          <Button
+            onClick={async () => {
+              if (!liveDropOp) return;
+              const text = `${formatOpLabel(liveDropOp)}\n${JSON.stringify(liveDropOp.patch, null, 2)}`;
+              try {
+                await navigator.clipboard.writeText(text);
+                setCopiedDropOp(true);
+              } catch {
+                try {
+                  const ta = document.createElement("textarea");
+                  ta.value = text;
+                  ta.style.position = "fixed";
+                  ta.style.opacity = "0";
+                  document.body.appendChild(ta);
+                  ta.select();
+                  const ok = document.execCommand("copy");
+                  ta.remove();
+                  if (ok) setCopiedDropOp(true);
+                } catch { /* keep button label as-is */ }
+              }
+            }}
+          >
+            {copiedDropOp ? "copied" : "copy edit"}
+          </Button>
+        }
         sx={{ zIndex: (t) => t.zIndex.snackbar + 1 }}
       >
         {liveDropOp && (
-          <>
-            <DialogTitle>Discard this edit?</DialogTitle>
-            <DialogContent>
-              <DialogContentText>
-                This edit never reached the server. Discarding deletes it from
-                this device permanently — copy it first if you want to keep the text.
-              </DialogContentText>
-              <Typography
-                variant="caption"
-                sx={{ fontFamily: "monospace", display: "block", mt: 1 }}
-              >
-                {formatOpLabel(liveDropOp)}
-              </Typography>
-            </DialogContent>
-            <DialogActions>
-              <Button
-                onClick={async () => {
-                  const text = `${formatOpLabel(liveDropOp)}\n${JSON.stringify(liveDropOp.patch, null, 2)}`;
-                  try {
-                    await navigator.clipboard.writeText(text);
-                    setCopiedDropOp(true);
-                  } catch {
-                    try {
-                      const ta = document.createElement("textarea");
-                      ta.value = text;
-                      ta.style.position = "fixed";
-                      ta.style.opacity = "0";
-                      document.body.appendChild(ta);
-                      ta.select();
-                      const ok = document.execCommand("copy");
-                      ta.remove();
-                      if (ok) setCopiedDropOp(true);
-                    } catch { /* keep button label as-is */ }
-                  }
-                }}
-              >
-                {copiedDropOp ? "copied" : "copy edit"}
-              </Button>
-              <Button onClick={closeDropOp}>cancel</Button>
-              <Button
-                color="error"
-                variant="contained"
-                onClick={async () => {
-                  await outbox.drop(liveDropOp.id, { onlyIfStatus: "failed" });
-                  closeDropOp();
-                }}
-              >
-                discard
-              </Button>
-            </DialogActions>
-          </>
+          <Typography
+            variant="caption"
+            sx={{ fontFamily: "monospace", display: "block", mt: 1 }}
+          >
+            {formatOpLabel(liveDropOp)}
+          </Typography>
         )}
-      </Dialog>
+      </ConfirmDialog>
     </>
   );
 }
