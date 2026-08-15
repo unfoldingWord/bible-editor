@@ -1,0 +1,87 @@
+-- Record WHAT we last published for a (book, resource), so a later sync can
+-- recognize master's own movement as ours instead of as somebody else's edit.
+--
+-- THE BUG THIS CLOSES (prod forensics, 2026-08-14). The nightly Door43->D1
+-- verse sync runs a three-way merge (verseMerge.ts) whose ancestor cutoff is
+-- book_resource_syncs.master_confirmed_at (0045). That watermark is stamped in
+-- exactly one place — exportWorkflow.ts's stampMasterConfirmed, gated on
+-- export.ts's isMasterConfirmed, which is true ONLY when the export's render
+-- was already byte-identical to master (commitToDcs's `branchTouched:false`
+-- pre-check). So on any night the export ACTUALLY PUSHES a `-be-` branch that
+-- later merges, master moves and the watermark does not. The next sync then
+-- sees `theirs != base` — a condition that is supposed to mean "a FOREIGN
+-- commit touched master" — for what is in fact OUR OWN merged export, and any
+-- verse a translator edited in the app since falls to computeVerseMerge step 6
+-- `adopt_conflict`, where master wins and the app edit is overwritten.
+-- Measured: AMO ch2 edits made 2026-08-13 were reverted 2026-08-14 01:07 UTC
+-- (AMO/2/16/ULT went back byte-identically to the previously published text),
+-- with 168 adopt_conflicts across the fleet in two days.
+--
+-- THE FIX these two columns enable: identify "master's movement is our own
+-- publish" by EXACT BYTES.
+-- Named "pushed", not "published", on purpose: this repo already uses
+-- "published" for the release-lock feature (publishedGuard.ts, PUBLISHED_BOOKS,
+-- checkPublishedDrift), so `published_read_at` would read as "when this
+-- published-locked book was read." "Pushed" is also the more accurate word — we
+-- pushed these bytes to a `-be-` branch, and whether they were ever published to
+-- master is precisely the open question these columns exist to answer later.
+--   - pushed_blob_sha — the git blob SHA (sha1 of "blob <len>\0" + the UTF-8
+--     bytes) of the rendered file the export last handed to Door43 for this
+--     (book, resource). Written by exportWorkflow.ts's recordPublishedRender
+--     after commitToDcs returns; computed locally by ownPublish.ts's
+--     gitBlobSha, NOT taken from Gitea's response, so both sides of the later
+--     comparison are produced by the same function (Gitea's own reported blob
+--     sha is still cross-checked and logged on mismatch).
+--   - pushed_read_at — the timestamp buildResource READ D1 to produce that
+--     render (`built.readAt`). This is the value that becomes
+--     master_confirmed_at once master is observed to hold the render, and it is
+--     the read time rather than the commit time for the same race-closing
+--     reason 0045's header gives: an app edit landing between the D1 read and
+--     the commit must be dated AFTER the watermark, not swallowed into the
+--     merge ancestor.
+--
+-- At sync time (bookReimport.ts's planAndStageBookResources / runReimport),
+-- master's fetched bytes are hashed the same way and compared. On a match the
+-- resource is treated as CONVERGED: master_confirmed_at is advanced to
+-- pushed_read_at, source_sha is recorded so the export's freshness gate
+-- still passes, and the per-verse foreign-edit merge is skipped entirely.
+--
+-- Why bytes and not the commit author/message: a merged `-be-` PR's commit on
+-- master is authored by DCS's validate-and-merge bot and squashed, so its
+-- metadata is not a reliable identity for OUR content; the bytes are. On any
+-- mismatch (a foreign commit layered on top of ours, a partial merge, a
+-- maintainer's hand edit) recognition simply declines and the normal merge
+-- runs — the fallback is the pre-existing behavior, so this can only ever
+-- remove false "foreign edit" verdicts, never manufacture one.
+--
+-- Deliberately NOT a history: only the LATEST push per (book, resource) is
+-- kept. commitToDcs force-resets the export branch onto master and re-commits
+-- every night, so the branch head — and therefore whatever a later merge can
+-- land on master — is always the most recent render we pushed. An older render
+-- reaching master (e.g. a superseded, differently-named `-be-` branch whose
+-- prune failed) hashes to no stored value, declines recognition, and falls
+-- back to the normal merge.
+--
+-- No backfill. Both columns start NULL for all 270 (book, resource) pairs;
+-- recognition is inert until one export cycle records a render. That is the
+-- same warm-up contract 0045 chose, for the same reason: only the export can
+-- measure what it actually published.
+-- own_publish_declines — consecutive nights the byte comparison ran with a real
+-- pushed_blob_sha to compare against and came back DIFFERENT. Reset to 0 the
+-- moment a comparison matches (folded into the same UPDATE that advances the
+-- watermark, so it costs nothing).
+--
+-- This exists because the whole fix has one silent failure mode: if Door43's
+-- validate-and-merge Action ever rewrites the file it merges — reformatting,
+-- re-encoding, changing line endings — then master's bytes never equal ours, the
+-- comparison declines forever, and the nightly reverts continue with no symptom
+-- at all. A log line only helps someone who remembers to go looking. A rising
+-- counter can raise a banner on its own.
+--
+-- It cannot distinguish that from a book genuinely edited on Door43 every night,
+-- and the alert must not pretend otherwise (standing rule: state only what was
+-- measured) — see raiseOwnPublishInertAlert, which names both explanations and
+-- says which check separates them.
+ALTER TABLE book_resource_syncs ADD COLUMN pushed_blob_sha TEXT;
+ALTER TABLE book_resource_syncs ADD COLUMN pushed_read_at INTEGER;
+ALTER TABLE book_resource_syncs ADD COLUMN own_publish_declines INTEGER NOT NULL DEFAULT 0;

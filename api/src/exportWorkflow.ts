@@ -74,6 +74,7 @@ import { loadTwlOrderLocks } from "./twlOrderLocks";
 import { runPostExport, VALIDATORS } from "./postExport";
 import { runChunkedReimport, storedResourceSha, ALL_RESOURCES as REIMPORT_RESOURCES } from "./bookReimport";
 import { dcsRawUrl, dcsResourceFile, fetchText, fileCommitSha, type ReimportResource } from "./dcsSources";
+import { gitBlobSha } from "./ownPublish";
 import type { TnRow, TqRow, TwlRow, VerseRow } from "./types";
 import { lintUsfmVerses } from "./lint";
 import { hardRejectRows } from "./hardRejectGuard";
@@ -943,15 +944,40 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       dcsCommitSha = commit.commitSha || null;
       dcsChanged = commit.changed;
 
-      // Stamp the master-confirmed watermark (0045's master_confirmed_at) —
-      // see export.ts's isMasterConfirmed for exactly which commitToDcs
-      // outcome this is and why the other one must not qualify.
-      if (isMasterConfirmed(commit)) {
-        // FIX D: stamp the timestamp D1 was actually READ (built.readAt),
-        // not "now" — see buildResource's readAt comment for the race this
-        // closes.
-        await this.stampMasterConfirmed(book, resource, built.readAt);
-      }
+      // ONE write for two facts about this (book, resource), because both are
+      // established by the same commitToDcs call and land on the same row:
+      //
+      //   1. WHAT we just handed Door43 (migration 0048's pushed_blob_sha /
+      //      pushed_read_at), so a LATER sync can recognize master's own movement
+      //      as ours rather than as a foreign edit — the AMOS revert this fixes.
+      //      Always recorded: whichever outcome commitToDcs returned, these exact
+      //      bytes are now either already on master (`branchTouched:false`) or on
+      //      the `-be-` branch a merge will put there, so "master's bytes equal
+      //      this render" always means "master moved by our own publish".
+      //   2. Whether master is confirmed to hold it ALREADY (0045's
+      //      master_confirmed_at) — see export.ts's isMasterConfirmed for exactly
+      //      which commitToDcs outcome qualifies and why the other must not. This
+      //      is still the only SAME-RUN confirmation; fact 1 is what lets a later
+      //      run confirm a push that merged in between.
+      //
+      // Merged into a single statement rather than two sequential UPDATEs: this
+      // runs once per (book × resource) across the whole fleet on a workflow that
+      // is already subrequest-constrained, and the two writes were touching the
+      // identical row. Their monotonic guards stay INDEPENDENT inside it (see
+      // recordPushedRender) — collapsing them into one shared WHERE clause would
+      // have let a stale pushed_read_at suppress a legitimate watermark stamp.
+      //
+      // `built.readAt` for both, not "now": FIX D — the time D1 was actually READ,
+      // so an edit landing between the read and this commit is dated after the
+      // watermark instead of being swallowed into the merge ancestor.
+      await this.recordPushedRender(
+        book,
+        resource,
+        built.content,
+        built.readAt,
+        commit.contentSha,
+        isMasterConfirmed(commit),
+      );
 
       // Export-revert report (observational only — see the "Export-revert
       // report" section in export.ts). Recorded HERE, immediately after the
@@ -1893,64 +1919,86 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     return true;
   }
 
-  // Clear stale export_reverts rows for a book+resource that was actually
-  // compared against master this run and found to have zero reverts — the
-  // genuinely-clean case, distinct from "we never compared" (master
-  // unreadable), which must NOT clear yesterday's real findings. Callers are
-  // responsible for only invoking this when master was readable AND the
-  // report came back with 0 entries.
-  // Stamp book_resource_syncs.master_confirmed_at (migration 0045) for a
-  // (book, resource) that isMasterConfirmed just certified. UPDATE-only,
-  // deliberately never INSERT: a brand-new row would need an `origin` value
-  // (book_resource_syncs.origin is NOT NULL with no default — see 0028) and
-  // this call is neither an import, reimport, nor export-render event; it's
-  // a separate "we read master and it matched" observation layered onto
-  // whatever row recordResourceSync (bookReimport.ts) already established.
-  // In practice a (book, resource) reaching this line has always been
-  // imported already (nothing exports before it's imported), so a missing
-  // row here is not expected — but if it ever happens, skipping the insert
-  // just leaves that pair without a watermark until a later run succeeds,
-  // the same fail-closed default this table already relies on elsewhere
-  // ("a missing row means never skip"). Best-effort: never let a failure or
-  // no-op here fail the export.
+  // Record the render we just handed to Door43 for this (book, resource)
+  // (migration 0048's pushed_blob_sha / pushed_read_at) so a LATER sync
+  // can recognize master's movement as our own merged publish instead of as a
+  // foreign edit. This is the export half of the AMOS revert fix; the sync half
+  // is bookReimport.ts's own-publish recognition. See ownPublish.ts for why
+  // bytes (a git blob SHA) and not commit authorship/message.
   //
-  // FIX D: `readAt` is the timestamp buildResource actually read D1 at
-  // (captured before its first query), NOT the time this method runs. The
-  // old code stamped `unixepoch()` here — several network round trips (the
-  // DCS commit itself) after the read — so a human edit landing in that gap
-  // was dated BEFORE the watermark it should have been dated after, making
-  // it look like part of the ancestor and silently reverting it on a later
-  // night. Stamping the read-time timestamp instead closes that race at its
-  // source, rather than relying solely on the humanEditedSinceExport belt in
-  // verseMerge.ts (see that file's corrected comment on what the belt
-  // actually covers now).
-  private async stampMasterConfirmed(book: string, resource: Resource, readAt: number): Promise<void> {
+  // `giteaBlobSha` is Gitea's own reported blob sha for the same file
+  // (DcsCommitResult.contentSha). We deliberately store OUR locally computed
+  // hash, not Gitea's, so both sides of the later comparison come from the same
+  // function and the recognition can't be broken by a provider quirk — but we
+  // compare the two and log any disagreement, because that disagreement would
+  // silently make recognition never fire, and a silent never-fires is precisely
+  // how the original watermark bug hid for months.
+  //
+  // `confirmMaster` also stamps 0045's master_confirmed_at in the SAME statement —
+  // see the merged-write rationale at the call site. Both facts come from one
+  // commitToDcs result and land on one row, so they cost one write, not two.
+  //
+  // MONOTONICITY, and why the two guards must stay independent. Both columns move
+  // forward only, for the reason stampMasterConfirmed's FIX 7 gives: `readAt` is an
+  // earlier D1-read timestamp, not write-time, so two overlapping export instances
+  // can arrive here out of order and a slower one must not drag either value
+  // backwards. But they are guarded SEPARATELY, via CASE/MAX expressions rather
+  // than a shared WHERE clause. A shared clause was the tempting shape and it is
+  // wrong: a stale pushed_read_at would then also suppress a perfectly legitimate
+  // master_confirmed_at stamp, quietly reintroducing the missed-watermark bug this
+  // whole change exists to fix. The CASE on pushed_blob_sha uses the same condition
+  // as the MAX on pushed_read_at, so those two never disagree about which render
+  // they describe.
+  //
+  // Best-effort throughout: a failure here costs the next sync its recognition (it
+  // falls back to the pre-existing merge), which must never fail the export itself.
+  private async recordPushedRender(
+    book: string,
+    resource: Resource,
+    content: string,
+    readAt: number,
+    giteaBlobSha: string,
+    confirmMaster: boolean,
+  ): Promise<void> {
     try {
-      // FIX 7: monotonic, not unconditional. `readAt` is an earlier D1-read
-      // timestamp (see FIX D above), not unixepoch() at write time, so two
-      // overlapping export instances can call this out of order — a slower
-      // instance with an OLDER readAt could otherwise overwrite a faster
-      // instance's newer stamp and move the watermark BACKWARDS. A watermark
-      // older than it should be can make an ancestor that's actually stale
-      // look current, or (the sharper failure) turn a master that never
-      // moved since the real, newer watermark into an `adopt_conflict` in
-      // verseMerge.ts — master overwriting a D1 edit that landed after the
-      // true last-confirmed time. MAX(existing, new) makes this call safe in
-      // any arrival order.
+      const blobSha = await gitBlobSha(content);
+      // Cross-check our locally computed blob sha against Gitea's own, since a
+      // silent disagreement would make recognition never fire — the exact shape of
+      // failure that let the original bug hide. `contentSha` is legitimately "" for
+      // some commitToDcs outcomes (a branch that already held identical content
+      // returns `existingSha ?? ""`), which is an ABSENT check, not a passing one;
+      // log that distinctly so nobody reads silence as agreement.
+      if (!giteaBlobSha) {
+        console.log(`export: no Door43 blob sha to cross-check for ${book} ${resource} (storing ours unverified)`);
+      } else if (giteaBlobSha !== blobSha) {
+        console.warn("export pushed-render blob sha disagrees with Door43's", {
+          book,
+          resource,
+          ours: blobSha,
+          dcs: giteaBlobSha,
+        });
+      }
       const result = await this.env.DB.prepare(
         `UPDATE book_resource_syncs
-            SET master_confirmed_at = MAX(COALESCE(master_confirmed_at, 0), ?3)
+            SET pushed_blob_sha =
+                  CASE WHEN pushed_read_at IS NULL OR pushed_read_at <= ?4 THEN ?3 ELSE pushed_blob_sha END,
+                pushed_read_at = MAX(COALESCE(pushed_read_at, 0), ?4),
+                master_confirmed_at =
+                  CASE WHEN ?5 = 1 THEN MAX(COALESCE(master_confirmed_at, 0), ?4) ELSE master_confirmed_at END
           WHERE book = ?1 AND resource = ?2`,
       )
-        .bind(book, resource, readAt)
+        .bind(book, resource, blobSha, readAt, confirmMaster ? 1 : 0)
         .run();
       if ((result.meta?.changes ?? 0) === 0) {
-        console.log(
-          `export: master-confirmed watermark skipped, no existing book_resource_syncs row for ${book} ${resource}`,
-        );
+        // No book_resource_syncs row yet. UPDATE-only is deliberate (origin is NOT
+        // NULL with no default — migration 0028), and nothing exports before it is
+        // imported, so this is not expected; it just leaves this pair without a
+        // record until a later run, the same fail-closed default this table relies
+        // on elsewhere ("a missing row means never skip").
+        console.log(`export: pushed-render record skipped, no book_resource_syncs row for ${book} ${resource}`);
       }
     } catch (e) {
-      console.error("export master-confirmed watermark failed", {
+      console.error("export pushed-render record failed", {
         book,
         resource,
         error: e instanceof Error ? e.message : String(e),
@@ -1958,6 +2006,12 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     }
   }
 
+  // Clear stale export_reverts rows for a book+resource that was actually
+  // compared against master this run and found to have zero reverts — the
+  // genuinely-clean case, distinct from "we never compared" (master
+  // unreadable), which must NOT clear yesterday's real findings. Callers are
+  // responsible for only invoking this when master was readable AND the
+  // report came back with 0 entries.
   private async clearExportReverts(book: string, resource: Resource): Promise<void> {
     try {
       await this.env.DB.prepare(`DELETE FROM export_reverts WHERE book = ?1 AND resource = ?2`)

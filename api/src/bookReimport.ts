@@ -42,6 +42,7 @@
 import type { Env } from "./index";
 import type { WorkflowStep } from "cloudflare:workers";
 import { dcsUrls, dcsResourceFile, dcsRawUrl, fileCommitSha, fetchText, NT_BOOKS } from "./dcsSources";
+import { gitBlobShaOrNull, recognizeOwnPublish, type OwnPublishResult } from "./ownPublish";
 import {
   collectSourceWords,
   extractVersesForRange,
@@ -225,6 +226,24 @@ export interface ReimportCounts {
   // this class exists and can't be "handled on the export side" as an
   // earlier, false comment claimed. verses only.
   merge_cosmetic_ignored: number;
+  // Master's bytes for this (book, resource) were EXACTLY the render the export
+  // last pushed, so master moved because our own `-be-` branch merged and the
+  // merge ancestor cutoff (master_confirmed_at) was advanced to that render's
+  // D1-read time. 0 or 1 per resource per run, and counted ONLY when the stamp
+  // actually landed (see markOwnPublishConverged).
+  //
+  // What follows the recognition differs by path, deliberately: the nightly cron
+  // ALSO skips the resource's row work entirely, while the user/admin "Pull from
+  // Door43" route only advances the watermark and then imports as usual (see the
+  // comment at that call site for why a human's explicit pull must not be
+  // silently skipped).
+  //
+  // Counted so "converged with our own publish" is distinguishable in the
+  // reimport summary from "master's SHA was unchanged" and from "nothing
+  // happened" — the pre-fix behavior for this exact case was an `adopt_conflict`
+  // storm that silently reverted app edits, so this class firing is the
+  // observable evidence the fix is working. See ownPublish.ts.
+  own_publish_converged: number;
   // Set true when recordVerseMergeConflicts (verseMergeConflicts.ts) failed to
   // durably write one or more of this run's merge_conflicts rows — see its
   // boolean return. The book-level alert (raiseVerseMergeConflictAlert) reads
@@ -290,6 +309,7 @@ function zeroCounts(): ReimportCounts {
     merge_no_base: 0,
     merge_unavailable: 0,
     merge_cosmetic_ignored: 0,
+    own_publish_converged: 0,
     merge_record_failed: false,
     dcs_404: 0,
     errors: [],
@@ -338,6 +358,7 @@ function addCounts(into: ReimportCounts, from: ReimportCounts): void {
   into.merge_no_base += from.merge_no_base ?? 0;
   into.merge_unavailable += from.merge_unavailable ?? 0;
   into.merge_cosmetic_ignored += from.merge_cosmetic_ignored ?? 0;
+  into.own_publish_converged += from.own_publish_converged ?? 0;
   into.merge_record_failed = Boolean(into.merge_record_failed || from.merge_record_failed);
   into.apply_incomplete = Boolean(into.apply_incomplete || from.apply_incomplete);
   into.dcs_404 += from.dcs_404;
@@ -488,6 +509,60 @@ async function runReimport(
   if (want.has("tn") && !tnRaw) perResource.tn.dcs_404++;
   if (want.has("tq") && !tqRaw) perResource.tq.dcs_404++;
   if (want.has("twl") && !twlRaw) perResource.twl.dcs_404++;
+
+  // Own-publish recognition on the user/admin "Pull from Door43" route (see
+  // ownPublish.ts / the AMOS revert this fixes). This path runs the identical
+  // per-verse merge as the nightly cron and could revert an app edit the same
+  // way, so it needs the same corrected merge ancestor.
+  //
+  // DELIBERATELY WEAKER THAN THE NIGHTLY PATH: this only advances the watermark,
+  // it does NOT skip the resource. A human explicitly asked to pull master, and
+  // "recognized, so we did nothing" both violates that request and removes a real
+  // capability — pulling master is how a bad D1 state gets restored from the last
+  // good published render, and pristine/AI-owned rows are refreshed from master by
+  // the normal row loop below. Skipping here would silently disable that repair
+  // route during the window before the next export push. Stamping alone is enough
+  // for the attribution the bug was about: with the ancestor corrected to the
+  // render master actually holds, an edited verse gets `keep_master_unchanged`
+  // instead of `adopt_conflict`, so the app edit survives while pristine rows
+  // still refresh. Every other guard in this system offers a human an override;
+  // this path IS the human, so it gets the correction without the veto.
+  //
+  // This now protects BOTH merges. PR #444 added the TSV three-way merge for
+  // edited tn/tq/twl rows (tsvMerge.ts), and it reads the SAME ancestor cutoff —
+  // reconstructTsvBases folds edit_log up to `created_at < master_confirmed_at`.
+  // So the stale watermark this PR fixes was silently breaking that merge in
+  // exactly the same way it broke the verse merge: our own merged export read as
+  // a foreign edit, and an app-edited note/question/link overwritten by
+  // `adopt_conflict`. The stamp below lands BEFORE the getMasterConfirmedAt reads
+  // for all five resources, which is why it must stay above them.
+  //
+  // Runs AFTER the dcs_404 tally above (recognition must not affect what is
+  // reported missing) and BEFORE the ancestor-cutoff reads below, which is the
+  // whole point — those reads must see the advanced watermark. `masterSha` is not
+  // available on this route (no SHA gate here), so source_sha is left untouched.
+  // Read-only view of this run's fetched files — recognition never rewrites them
+  // (that is the nightly path's behavior, deliberately not this one), so a plain
+  // snapshot is enough and the raw variables below stay the single source of truth.
+  const fetchedRaw: Record<Resource, string | null> = {
+    ult: ultRaw, ust: ustRaw, tn: tnRaw, tq: tqRaw, twl: twlRaw,
+  };
+  for (const resource of ALL_RESOURCES) {
+    const raw = fetchedRaw[resource];
+    if (!want.has(resource) || raw == null) continue;
+    const state = await resourceSyncState(env, book, resource);
+    const own = await recognizePushedRender(env, book, resource, raw, state);
+    if (!own.recognized) continue;
+    const stamped = await markOwnPublishConverged(env, book, resource, own.readAt, null);
+    if (stamped) perResource[resource].own_publish_converged++;
+    console.log("reimport recognized master's movement as our own publish", {
+      book,
+      resource,
+      confirmedAt: own.readAt,
+      stamped,
+      skipped: false,
+    });
+  }
 
   // FIX 1 (hoist): read the verse-merge ancestor cutoff ONCE per (book,
   // resource) for this whole run, not once per chapter — see
@@ -1629,13 +1704,23 @@ function sourceWordsForVerseRange(
   return out;
 }
 
-// The verse-merge ancestor cutoff for one (book, resource): the watermark the
-// export stamps ONLY when it has positively measured that our rendered output
-// matches what master currently holds (book_resource_syncs.master_confirmed_at
-// — a column the export half of this fix adds). This is NOT when we last
-// pushed to a `-be-` branch: an unmerged branch push is routine here and is
-// not proof master moved, and attributing against it was the root cause of
-// the 1CH incident (see verseMerge.ts's header). NULL means "never positively
+// The verse-merge ancestor cutoff for one (book, resource):
+// book_resource_syncs.master_confirmed_at, stamped ONLY on a positive
+// measurement that master holds our rendered output. There are now TWO such
+// measurements, and both are real GETs of master's bytes:
+//   1. exportWorkflow.ts's stampMasterConfirmed — commitToDcs's pre-check found
+//      master already byte-identical to tonight's render (isMasterConfirmed).
+//   2. markOwnPublishConverged (this file) — a LATER sync hashed master's bytes
+//      and got the git blob sha of the render we recorded at push time, so
+//      master moved by the merge of our own `-be-` branch. Measurement (1) alone
+//      is what caused the AMOS revert: it can only ever fire on a night we
+//      pushed NOTHING, so every night the export actually pushed left the
+//      watermark behind while master moved. See ownPublish.ts.
+// This is still NOT "when we last pushed to a `-be-` branch": an unmerged branch
+// push is routine here and is not proof master moved, and attributing against it
+// was the root cause of the 1CH incident (see verseMerge.ts's header).
+//
+// NULL means "never positively
 // confirmed" and callers MUST skip the merge entirely for that case — never
 // treat "not yet confirmed" as "nothing changed" (identical in effect to a
 // missing watermark row before this fix). Constant per (book, resource) for
@@ -2669,9 +2754,15 @@ async function logEdit(
 
 interface StagedResource {
   resource: Resource;
-  changed: boolean;        // false → SHA unchanged or DCS 404; skipped
+  changed: boolean;        // false → SHA unchanged, DCS 404, or own-publish
   masterSha: string | null;
   r2Key: string | null;    // staged file location when changed
+  // True when master's bytes were EXACTLY the render we last pushed, so
+  // master's movement was the merge of our own export and there is no foreign
+  // edit to merge — see ownPublish.ts and markOwnPublishConverged. Implies
+  // `changed: false`, but for a completely different reason than a SHA match or
+  // a 404, so it is reported separately (own_publish_converged).
+  ownPublish?: boolean;
 }
 
 interface ReimportPlan {
@@ -2690,10 +2781,6 @@ function mergePerResource(
   for (const r of ALL_RESOURCES) addCounts(into[r], from[r]);
 }
 
-function emptyResult(book: string): ReimportResult {
-  return { book, perResource: freshPerResource(), totals: zeroCounts() };
-}
-
 async function readStaged(env: Env, key: string): Promise<string | null> {
   const obj = await env.BLOBS.get(key);
   return obj ? await obj.text() : null;
@@ -2701,6 +2788,14 @@ async function readStaged(env: Env, key: string): Promise<string | null> {
 
 // Upsert the per-(book,resource) sync watermark. `origin` is provenance only;
 // only 'import'/'reimport' watermarks are written as skip gates.
+//
+// This union does NOT enumerate every value the column can hold:
+// markOwnPublishConverged writes 'own_publish' via its own direct UPDATE (it
+// must not touch source_sha's other fields the way this upsert does), and
+// migration 0028's schema comment predates both that and 'reimport_withheld'.
+// The column has no CHECK constraint and its only reader renders it as a raw
+// string (admin.ts → AdminPanel's `origin:` caption), so this is a
+// documentation gap rather than a correctness one.
 export async function recordResourceSync(
   env: Env,
   book: string,
@@ -2718,6 +2813,316 @@ export async function recordResourceSync(
   )
     .bind(book, resource, sha, origin)
     .run();
+}
+
+// One (book, resource) sync row, including migration 0048's record of what the
+// export last published. Read as ONE row rather than as separate
+// storedResourceSha + pushed-render queries: planAndStageBookResources runs
+// per resource inside the nightly Workflow step, and the whole reason that
+// method is shaped the way it is is the Cloudflare subrequest budget (see the
+// nightly-sync-subrequest-cap lesson in STATE.md) — this keeps the own-publish
+// recognition free of any extra D1 round trip.
+interface ResourceSyncState {
+  sourceSha: string | null;
+  pushedBlobSha: string | null;
+  pushedReadAt: number | null;
+  /** Consecutive byte-comparison declines — see migration 0048's column doc. */
+  declines: number;
+}
+
+// Reads columns added by migration 0048, so a failure is handled — but NARROWLY,
+// and this is the important part.
+//
+// The hazard: if the code ships before its migration is applied (`wrangler deploy
+// --env production` without `db:migrate:remote`, or a failed remote migration),
+// this SELECT throws `no such column`. This repo has been bitten by exactly that
+// shape before (0036 unapplied → /api/chapters/* 500s).
+//
+// The FIRST version of this guard returned an all-null state on any error, which
+// was a worse bug than the one it prevented: `sourceSha: null` also disables the
+// PRE-EXISTING SHA skip gate below, so during a migration lag every book would
+// fully re-fetch and re-import every night — straight into the Cloudflare
+// subrequest cap, which starves later books, leaves D1 stale, and lets the export
+// render stale data over master. That is the exact incident class this PR exists
+// to close, re-introduced through the back door.
+//
+// So: on failure, fall back to the pre-0048 single-column query. If THAT succeeds,
+// the schema is genuinely behind — the SHA gate keeps working at full strength and
+// only own-publish recognition goes inert until the migration lands. If it ALSO
+// fails, this is not a schema problem but a real D1 fault, and the throw is left
+// to propagate: on the nightly path that hands it to the wrapping `step.do` for
+// retry-with-backoff (a transient fault should be retried, not silently degraded),
+// and on the user path it surfaces as a failed pull, which is the pre-existing
+// behavior for a broken database.
+//
+// Logged loudly either way, because silently-disabled recognition is how the
+// original watermark bug survived for months.
+async function resourceSyncState(env: Env, book: string, resource: Resource): Promise<ResourceSyncState> {
+  try {
+    const row = await env.DB.prepare(
+      `SELECT source_sha, pushed_blob_sha, pushed_read_at, own_publish_declines
+         FROM book_resource_syncs WHERE book = ?1 AND resource = ?2`,
+    )
+      .bind(book, resource)
+      .first<{
+        source_sha: string | null;
+        pushed_blob_sha: string | null;
+        pushed_read_at: number | null;
+        own_publish_declines: number | null;
+      }>();
+    return {
+      sourceSha: row?.source_sha ?? null,
+      pushedBlobSha: row?.pushed_blob_sha ?? null,
+      pushedReadAt: row?.pushed_read_at ?? null,
+      declines: row?.own_publish_declines ?? 0,
+    };
+  } catch (e) {
+    console.error("reimport sync-state read failed; retrying without the 0048 columns", {
+      book,
+      resource,
+      error: e instanceof Error ? e.message : String(e),
+    });
+    // Deliberately NOT wrapped — a failure here means the fault is not the new
+    // columns, and it must reach the caller (step.do retry / failed request)
+    // rather than degrade into a fleet-wide full reimport.
+    const sourceSha = await storedResourceSha(env, book, resource);
+    console.error("reimport: migration 0048 appears unapplied — own-publish recognition is OFF, SHA gate intact", {
+      book,
+      resource,
+    });
+    return { sourceSha, pushedBlobSha: null, pushedReadAt: null, declines: 0 };
+  }
+}
+
+// Same maintainer the other reimport/export alerts target — see
+// verseMergeConflicts.ts's ALERT_USERNAME and exportWorkflow.ts's
+// EXPORT_ALERT_USERNAME, both local copies for the same reason. Keep in sync.
+const OWN_PUBLISH_ALERT_USERNAME = "deferredreward";
+
+// Consecutive declines before we raise a banner. Three, not one: a single decline
+// is the ordinary healthy case (a real Door43 edit, or our branch simply hasn't
+// merged yet), and even two in a row is unremarkable for an actively-edited book.
+// Three consecutive nights where the comparison had something real to compare
+// against and still differed is the point where "the merge is rewriting our bytes,
+// so this whole fix is inert" becomes worth a human's attention.
+const OWN_PUBLISH_INERT_THRESHOLD = 3;
+
+// The ONE place both entry paths run the byte comparison, so the nightly cron and
+// the admin "Pull from Door43" route cannot drift apart on how recognition is
+// decided or accounted for. What each does with the verdict still differs, and
+// deliberately (see the call sites) — this owns the decision, not the response.
+//
+// Also owns the decline bookkeeping that makes the fix's own inertness visible:
+// a `content_differs` verdict increments the counter and, at the threshold, raises
+// a banner. A recognition resets the counter for free, inside the watermark UPDATE.
+async function recognizePushedRender(
+  env: Env,
+  book: string,
+  resource: Resource,
+  raw: string,
+  sync: ResourceSyncState,
+): Promise<OwnPublishResult> {
+  // Warm-up short-circuit: with nothing recorded to compare against the verdict is
+  // fixed regardless of the bytes, so don't hash a whole book file to learn it.
+  if (!sync.pushedBlobSha) return { recognized: false, readAt: null, reason: "no_pushed_render" };
+
+  const own = recognizeOwnPublish({
+    masterBlobSha: await gitBlobShaOrNull(raw),
+    pushedBlobSha: sync.pushedBlobSha,
+    pushedReadAt: sync.pushedReadAt,
+  });
+
+  // Only `content_differs` counts. The other declines mean the comparison never
+  // really ran (unhashable master, half-written row), and counting "we couldn't
+  // measure" as "we measured a difference" is the absent-measurement-as-evidence
+  // mistake this codebase has a standing rule against.
+  if (own.reason === "content_differs") {
+    await noteOwnPublishDecline(env, book, resource, sync);
+  }
+  return own;
+}
+
+// Increment the consecutive-decline counter and, on crossing the threshold, raise
+// the banner. Best-effort throughout: this is observability, and it must never
+// fail a sync that is otherwise doing its job correctly.
+async function noteOwnPublishDecline(
+  env: Env,
+  book: string,
+  resource: Resource,
+  sync: ResourceSyncState,
+): Promise<void> {
+  const next = (sync.declines ?? 0) + 1;
+  try {
+    await env.DB.prepare(
+      `UPDATE book_resource_syncs SET own_publish_declines = ?3 WHERE book = ?1 AND resource = ?2`,
+    )
+      .bind(book, resource, next)
+      .run();
+  } catch (e) {
+    console.error("reimport own-publish decline counter failed", {
+      book,
+      resource,
+      error: e instanceof Error ? e.message : String(e),
+    });
+    return;
+  }
+  console.log("reimport own-publish declined: master differs from our last render", {
+    book,
+    resource,
+    consecutiveDeclines: next,
+  });
+  if (next === OWN_PUBLISH_INERT_THRESHOLD) await raiseOwnPublishInertAlert(env, book, resource, next, sync);
+}
+
+// Banner for "recognition keeps declining." Fires ONCE, on the run that crosses
+// the threshold (`next === THRESHOLD`, not `>=`), so a book that stays in this
+// state doesn't rewrite the alert every night; the counter keeps climbing and a
+// single match clears it.
+//
+// The wording states ONLY what was measured. Two explanations fit these
+// observations and this code cannot tell them apart: continuous out-of-band Door43
+// editing (benign, expected for an actively-worked file) or Door43's merge
+// rewriting the bytes we pushed (which makes this entire fix inert and lets the
+// nightly reverts continue silently). Asserting either would repeat the mistake
+// this repo has a standing lesson about, so the message names both and gives the
+// one comparison that separates them.
+async function raiseOwnPublishInertAlert(
+  env: Env,
+  book: string,
+  resource: Resource,
+  declines: number,
+  sync: ResourceSyncState,
+): Promise<void> {
+  const source = `own_publish_inert:${book}:${resource}`;
+  const message =
+    `Benjamin — for ${declines} syncs in a row, Door43's ${book} ${resource.toUpperCase()} file has differed from ` +
+    `the exact bytes our export last pushed (our blob ${(sync.pushedBlobSha ?? "none").slice(0, 12)}). ` +
+    `Two things produce this and the sync cannot tell them apart: someone is editing that file on Door43 ` +
+    `between every run (normal for an actively-edited book), or Door43's validate-and-merge job is rewriting ` +
+    `our file when it merges — the second would mean the fix that stops the nightly sync reverting editor ` +
+    `work is silently doing nothing for this file. To tell them apart, compare Door43's current file against ` +
+    `our last push: \`git hash-object\` the file from master and check it against that blob sha. ` +
+    `This clears itself the first time they match.`;
+  try {
+    await env.DB.prepare(`DELETE FROM system_alerts WHERE username = ?1 AND source = ?2 AND dismissed_at IS NULL`)
+      .bind(OWN_PUBLISH_ALERT_USERNAME, source)
+      .run();
+    await env.DB.prepare(
+      `INSERT INTO system_alerts (username, severity, source, message, link_url) VALUES (?1, ?2, ?3, ?4, ?5)`,
+    )
+      .bind(OWN_PUBLISH_ALERT_USERNAME, "warning", source, message, null)
+      .run();
+  } catch (e) {
+    console.error("reimport own-publish inert alert failed", {
+      book,
+      resource,
+      error: e instanceof Error ? e.message : String(e),
+    });
+  }
+}
+
+// Master's current bytes for this (book, resource) ARE the render we last
+// pushed: master moved only because our own `-be-` branch merged. Advance the
+// merge ancestor cutoff (0045's master_confirmed_at) to that render's D1-read
+// time, and record master's commit SHA as this resource's sync watermark.
+//
+// Both halves are load-bearing and must happen together:
+//   - master_confirmed_at is what makes the NEXT genuine foreign edit
+//     attributable (verseMerge.ts). Advanced with MAX(), never backwards, for
+//     the same reason exportWorkflow.ts's stampMasterConfirmed uses MAX (FIX 7
+//     there): overlapping runs can arrive out of order, and a watermark moved
+//     backwards turns a master that never moved into an `adopt_conflict`.
+//   - source_sha must be recorded even though we are SKIPPING this resource's
+//     row work, because the export's freshness gate (checkMasterFreshness)
+//     compares master's SHA against it. Leaving it behind would make tonight's
+//     export report `master_ahead` and skip the book with an `export_stale`
+//     alert — a converged resource would freeze its own export. `masterSha`
+//     null (the SHA lookup failed) leaves the stored value untouched via
+//     COALESCE rather than writing a null over a real watermark.
+//
+// This deliberately does NOT consult the watermark-withholding gates that the
+// reimport-sync step applies — shouldRecordResourceSync's locked-chapter check
+// (the EZK 40 lesson: "a watermark must not certify data it didn't apply") or
+// #444's `apply_incomplete` (an adoption batch that threw or lost its CAS race).
+// That is sound here rather than an oversight, and for one reason that covers
+// both: every one of those gates exists because SOME WRITE WE ATTEMPTED did not
+// land, leaving D1 behind master. This branch attempts no writes at all. Master's
+// whole-file bytes are our own render of the whole book, so master demonstrably
+// holds nothing D1 lacks — there is no chapter, locked or not, and no adoption,
+// failed or otherwise, whose content we failed to apply. D1 may be AHEAD of
+// master (app edits since pushed_read_at), which is the normal state and is what
+// tonight's export is for.
+//
+// UPDATE-only, never INSERT, for exactly the reason stampMasterConfirmed gives:
+// `origin` is NOT NULL with no default (migration 0028). A row is guaranteed to
+// exist here anyway — this path is only reachable when pushed_blob_sha is
+// non-null, and only the export writes that, onto an existing row.
+//
+// Returns whether the write actually landed. Callers MUST NOT report a stamp they
+// didn't get: a 0-row UPDATE (row deleted between the read and here, or the
+// statement failing) would otherwise leave master_confirmed_at stuck while the
+// run reported "converged" — the same invisible-failure shape as the bug this
+// fixes, repeating silently every night. The caller still skips the resource's
+// row work on a failed stamp (nothing on master needs importing either way, so
+// skipping cannot lose data); what it must not do is claim the watermark moved.
+//
+// Idempotent, which matters because the nightly caller sits inside a retried
+// Workflow step: MAX()/COALESCE() make a re-run a no-op, and if a retry declines
+// where the first attempt recognized (master moved in between), the
+// already-advanced watermark is still truthful — master did hold that render at
+// first-attempt time.
+async function markOwnPublishConverged(
+  env: Env,
+  book: string,
+  resource: Resource,
+  readAt: number,
+  masterSha: string | null,
+): Promise<boolean> {
+  try {
+    const result = await env.DB.prepare(
+      `UPDATE book_resource_syncs
+          SET master_confirmed_at = MAX(COALESCE(master_confirmed_at, 0), ?3),
+              source_sha = COALESCE(?4, source_sha),
+              synced_at = unixepoch(),
+              -- Claim authorship of the watermark only when this call actually
+              -- WROTE one. On the admin-pull path masterSha is null, so source_sha
+              -- is untouched and overwriting 'reimport' with 'own_publish' would
+              -- misreport which run established the watermark the admin panel
+              -- shows.
+              origin = CASE WHEN ?4 IS NOT NULL THEN 'own_publish' ELSE origin END,
+              -- Free reset of the inertness detector: a match is exactly the
+              -- evidence that recognition is working for this (book, resource).
+              own_publish_declines = 0
+        WHERE book = ?1 AND resource = ?2`,
+    )
+      .bind(book, resource, readAt, masterSha)
+      .run();
+    if ((result.meta?.changes ?? 0) === 0) {
+      console.error("reimport own-publish stamp changed no rows; watermark NOT advanced", {
+        book,
+        resource,
+        readAt,
+      });
+      return false;
+    }
+    // Clear any standing inertness banner — the counter is back to 0, so the
+    // banner's premise ("keeps differing") is no longer true. Best-effort.
+    try {
+      await env.DB.prepare(`DELETE FROM system_alerts WHERE username = ?1 AND source = ?2 AND dismissed_at IS NULL`)
+        .bind(OWN_PUBLISH_ALERT_USERNAME, `own_publish_inert:${book}:${resource}`)
+        .run();
+    } catch {
+      /* the banner is stale, not wrong-headed; never fail a good sync over it */
+    }
+    return true;
+  } catch (e) {
+    console.error("reimport own-publish stamp failed; watermark NOT advanced", {
+      book,
+      resource,
+      error: e instanceof Error ? e.message : String(e),
+    });
+    return false;
+  }
 }
 
 export async function storedResourceSha(env: Env, book: string, resource: Resource): Promise<string | null> {
@@ -3004,9 +3409,9 @@ async function planAndStageBookResources(
     if (!file) { entries.push({ resource, changed: false, masterSha: null, r2Key: null }); continue; }
 
     const masterSha = await fileCommitSha(env, file.repo, file.path);
-    const stored = await storedResourceSha(env, book, resource);
+    const sync = await resourceSyncState(env, book, resource);
     // Skip ONLY on a positive SHA match (fail-open: null/unknown → reimport).
-    if (masterSha && stored && masterSha === stored) {
+    if (masterSha && sync.sourceSha && masterSha === sync.sourceSha) {
       entries.push({ resource, changed: false, masterSha, r2Key: null });
       continue;
     }
@@ -3017,6 +3422,68 @@ async function planAndStageBookResources(
       entries.push({ resource, changed: false, masterSha: null, r2Key: null });
       continue;
     }
+
+    // Own-publish recognition — the AMOS revert fix. Master's file SHA moved,
+    // but if its BYTES are exactly the render we last pushed, master moved
+    // because OUR `-be-` branch merged, not because anyone edited master. There
+    // is then nothing foreign to merge: advance the merge ancestor cutoff to
+    // that render's D1-read time, record master's SHA so the export's freshness
+    // gate still passes, and skip this resource's row work entirely. Without
+    // this, the per-verse merge reads our own merged export as a foreign edit
+    // and `adopt_conflict` overwrites every app edit made since (verseMerge.ts
+    // step 6). See ownPublish.ts for the full incident and the fail-safe
+    // argument; recognition can only ever DECLINE into the pre-existing merge.
+    //
+    // Skipping is right for the TSV resources too, and for the same reason, not
+    // by accident: #444's three-way merge for edited tn/tq/twl rows exists to
+    // adopt FOREIGN Door43 edits into rows a translator has touched. When
+    // master's bytes are byte-for-byte our own last render, there is no foreign
+    // edit in that file to adopt — running the merge could only re-adjudicate our
+    // own content. The watermark stamped just below is what that merge reads as
+    // its ancestor, so this both skips tonight's no-op and repairs the
+    // attribution for the next night that DOES carry a real Door43 edit.
+    //
+    // Placed BEFORE the truncation gate below deliberately: an exact whole-file
+    // byte match against our own render is strictly stronger evidence of
+    // completeness than that gate's row-count heuristic, and running first
+    // saves its D1 count query on a converged resource.
+    const own = await recognizePushedRender(env, book, resource, raw, sync);
+    if (own.recognized) {
+      const stamped = await markOwnPublishConverged(env, book, resource, own.readAt, masterSha);
+      console.log("reimport recognized master's movement as our own publish", {
+        book,
+        resource,
+        masterSha,
+        confirmedAt: own.readAt,
+        stamped,
+      });
+      // `ownPublish` is reported only when the stamp actually landed — see
+      // markOwnPublishConverged's contract. The resource is skipped either way
+      // (master holds our own render, so there is nothing to import), but a run
+      // must not report a watermark advance it did not get.
+      entries.push({ resource, changed: false, masterSha, r2Key: null, ownPublish: stamped });
+      continue;
+    }
+    if (own.reason === "content_differs") {
+      // How we find out whether this fix is actually working in prod. A decline
+      // here is EITHER the correct answer (a genuine foreign commit on master,
+      // which is what the three-way merge is for) OR the one way this fix could
+      // be quietly inert: if the DCS validate-and-merge Action rewrites the file
+      // on merge — reformatting, re-encoding, normalizing line endings — master's
+      // bytes would never equal ours and recognition would never fire, with no
+      // symptom other than the AMOS reverts continuing. The two are
+      // indistinguishable from inside this function, so log the fact rather than
+      // assert a cause (standing rule: an alert may only state what it measured).
+      // `wrangler tail | grep own-publish` across a few nights separates them:
+      // all-declines on books nobody edits on Door43 means the bytes are being
+      // rewritten and the recognition needs to move to a normalized comparison.
+      console.log("reimport own-publish declined: master differs from our last render", {
+        book,
+        resource,
+        masterSha,
+      });
+    }
+
     // Completeness gate (TSV only). A truncated body must NOT be staged or get a
     // watermark — otherwise it prunes the book AND certifies it "in sync",
     // hiding the damage (the HAB tn incident). masterSha:null here is critical:
@@ -3198,8 +3665,24 @@ export async function runChunkedReimport(
     async () => planAndStageBookResources(env, book, resources, instanceId),
   );
 
+  // Own-publish recognition already ran inside planAndStageBookResources (it
+  // needs master's fetched bytes, which only exist there) and already advanced
+  // the watermark + source_sha for each converged resource. All that is left
+  // here is to REPORT it — and that has to happen before the early return
+  // below, because "every changed resource turned out to be our own publish" is
+  // the single most common shape of this fix firing: `changed` is then empty and
+  // an unadorned emptyResult would report the night as "nothing happened".
+  const perResource = freshPerResource();
+  for (const e of plan.entries) {
+    if (e.ownPublish) perResource[e.resource].own_publish_converged++;
+  }
+
   const changed = plan.entries.filter((e) => e.changed);
-  if (plan.maxChapter < 1 || changed.length === 0) return emptyResult(book);
+  if (plan.maxChapter < 1 || changed.length === 0) {
+    const totals = zeroCounts();
+    for (const r of ALL_RESOURCES) addCounts(totals, perResource[r]);
+    return { book, perResource, totals };
+  }
 
   // Per-changed-TSV: which chapters actually differ (so chunks skip the rest).
   const changedTsv = await step.do(`reimport-tsvgate-${book}`, async () => {
@@ -3213,7 +3696,6 @@ export async function runChunkedReimport(
     return out;
   });
 
-  const perResource = freshPerResource();
   for (const { start, end } of reimportChunkBoundaries(plan.maxChapter, chunkSize)) {
     const counts = await step.do(
       `reimport-${book}-ch${start}-${end}`,
