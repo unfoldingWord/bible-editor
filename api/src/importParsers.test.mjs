@@ -588,6 +588,30 @@ function quoteCount(extract, tag) {
     `expected per-verse stepping (${seqA.join(",")})`,
   );
 }
+{
+  // P2.5 (book-level TSV reimport): the counter keys on (chapter, verse) only, so
+  // numbering a whole book's rows in ONE pass must yield the SAME sort_orders as
+  // numbering each chapter with a fresh allocator — this is exactly what makes
+  // runReimport's book-level applyTsvRows equivalent to the old per-chapter calls.
+  const rows = [
+    [1, 1], [1, 1], [1, 2], // chapter 1
+    [2, 1], [2, 1],         // chapter 2
+    [3, 5],                 // chapter 3
+  ];
+  // Per-chapter: a fresh allocator per chapter, rows in that chapter's file order.
+  const perChapter = [];
+  for (const ch of [1, 2, 3]) {
+    const nextCh = makeVerseSortOrder();
+    for (const [c, v] of rows) if (c === ch) perChapter.push(nextCh(c, v));
+  }
+  // Book-level: one allocator over all rows in file order.
+  const nextBook = makeVerseSortOrder();
+  const bookLevel = rows.map(([c, v]) => nextBook(c, v));
+  assert(
+    JSON.stringify(perChapter) === JSON.stringify(bookLevel),
+    `book-level numbering == per-chapter numbering (${bookLevel.join(",")})`,
+  );
+}
 
 // --- healReplacementChars: AI-mangled U+FFFD in alignment source attrs --------
 //
