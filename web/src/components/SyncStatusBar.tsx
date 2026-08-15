@@ -543,7 +543,7 @@ export function SyncStatusBar({ onNavigate }: Props = {}) {
             color="error"
             variant="contained"
             onClick={async () => {
-              for (const op of failed) await outbox.drop(op.id);
+              for (const op of failed) await outbox.drop(op.id, { onlyIfStatus: "failed" });
               setConfirmDiscardAll(false);
             }}
           >
