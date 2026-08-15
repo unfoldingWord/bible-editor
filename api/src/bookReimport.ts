@@ -2138,7 +2138,12 @@ async function applyVerseRows(
         // per verse regardless of how many (key, attr) pairs diverged; adopted
         // is false, so it never enters the master-adoption CAS/cleanup dance and
         // it does NOT feed the systemic-refusal watermark gate (merge_refused) —
-        // keep D1, surface it, do not hold the book's export back.
+        // so divergences at scale never freeze the book's export. (A transient
+        // D1 failure while RECORDING these rows still withholds the watermark
+        // for one self-healing night via merge_record_failed — the fail-safe
+        // every conflict recording shares, protective, not a freeze.) Keep D1,
+        // surface it. Re-detection reactivates a flag a human resolved without
+        // fixing the source (see UPSERT_VERSE_MERGE_CONFLICT_SQL's carve-out).
         mergeConflicts.push({
           chapter: v.chapter,
           verse: v.verse,

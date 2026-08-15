@@ -86,7 +86,11 @@ export const SELECT_ACTIVE_ALERTABLE_CONFLICTS_SQL = `SELECT chapter, verse, act
 // still-unresolved conflict — making "how long has this been sitting
 // unresolved" unrecoverable).
 //
-// This statement does NOT touch resolved_at/resolved_by at all. The first
+// This statement does NOT touch resolved_at/resolved_by for any ADOPTION
+// action (adopt / adopt_conflict) or keep_alignment_refused — see the
+// 'source_attr_divergent' reactivation carve-out at the bottom of the SET
+// clause for the single, deliberately safe exception (that action has no CAS
+// write, so the failure mode below cannot arise for it). The first
 // version of this fix (2026-08-14) cleared them here unconditionally, on the
 // theory that any fresh conflict detection should make the row visible
 // again. Codex's second-opinion review found the real bug in that: this
@@ -157,7 +161,25 @@ export const UPSERT_VERSE_MERGE_CONFLICT_SQL = `INSERT INTO verse_merge_conflict
        ELSE COALESCE(verse_merge_conflicts.overwritten_version, excluded.overwritten_version)
      END,
      alignment = COALESCE(excluded.alignment, verse_merge_conflicts.alignment),
-     last_recorded_at = excluded.last_recorded_at`;
+     last_recorded_at = excluded.last_recorded_at,
+     -- REACTIVATION carve-out, 'source_attr_divergent' ONLY. Every other action
+     -- leaves resolved_at/resolved_by untouched (the ELSE), preserving the
+     -- two-phase adoption invariant documented above. This action is the one
+     -- exception because it is safe to be: it has NO CAS write that could lose
+     -- a race (it is an unconditional keep-D1 flag, recorded once per run and
+     -- never a candidate for deleteLostAdoptionConflicts), so re-detecting it is
+     -- itself proof the source divergence still exists. The reason the
+     -- speculative upsert must not clear resolved_at for ADOPTIONS — a lost CAS
+     -- would falsely reactivate a row nothing actually overwrote — simply cannot
+     -- arise here. Without this, a human who clears the flag with an UNRELATED
+     -- save (RESOLVE_VERSE_MERGE_CONFLICT_SQL is action-agnostic) while the
+     -- divergence persists would silence it forever, and tonight's export would
+     -- keep reverting master's source fix nightly with no banner — the exact
+     -- silent revert this row exists to surface. (keep_alignment_refused shares
+     -- this latent gap but is caught at scale by the merge_refused systemic
+     -- freeze; extending reactivation to it is a deliberate follow-up.)
+     resolved_at = CASE WHEN excluded.action = 'source_attr_divergent' THEN NULL ELSE verse_merge_conflicts.resolved_at END,
+     resolved_by = CASE WHEN excluded.action = 'source_attr_divergent' THEN NULL ELSE verse_merge_conflicts.resolved_by END`;
 
 // ---------------------------------------------------------------------------
 // verseMergeConflicts.ts's confirmAdoptedConflicts — the SECOND phase of
