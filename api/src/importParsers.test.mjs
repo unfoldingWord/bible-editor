@@ -611,6 +611,24 @@ function quoteCount(extract, tag) {
     JSON.stringify(perChapter) === JSON.stringify(bookLevel),
     `book-level numbering == per-chapter numbering (${bookLevel.join(",")})`,
   );
+  // Stronger: even if chapters are INTERLEAVED (not file-grouped), one allocator
+  // still matches per-chapter, because the counter keys per (chapter,verse). This
+  // guards the invariant against a future change to how runReimport collects rows.
+  const interleaved = [[1, 1], [2, 1], [1, 1], [2, 1], [1, 2], [3, 5]];
+  const nextInter = makeVerseSortOrder();
+  const interSeq = interleaved.map(([c, v]) => nextInter(c, v));
+  const byChapter = {};
+  for (const ch of [1, 2, 3]) {
+    const n = makeVerseSortOrder();
+    for (const [c, v] of interleaved) if (c === ch) byChapter[`${c}:${v}`] = (byChapter[`${c}:${v}`] ?? []).concat(n(c, v));
+  }
+  // Rebuild the interleaved expectation from the per-chapter runs, in file order.
+  const perVerseCursors = {};
+  const expected = interleaved.map(([c, v]) => byChapter[`${c}:${v}`][(perVerseCursors[`${c}:${v}`] = (perVerseCursors[`${c}:${v}`] ?? -1) + 1)]);
+  assert(
+    JSON.stringify(interSeq) === JSON.stringify(expected),
+    `interleaved chapters: one allocator == per-chapter (${interSeq.join(",")})`,
+  );
 }
 
 // --- healReplacementChars: AI-mangled U+FFFD in alignment source attrs --------
