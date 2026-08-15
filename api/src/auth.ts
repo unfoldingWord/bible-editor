@@ -501,7 +501,18 @@ export async function callbackDcsAuth(c: AppContext): Promise<Response> {
      ON CONFLICT(dcs_user_id) DO UPDATE SET
        dcs_username = ?2, dcs_full_name = ?3, dcs_access_token = ?4`,
   )
-    .bind(dcsUser.id, dcsUser.login, dcsUser.full_name ?? dcsUser.login, accessToken)
+    // DCS returns full_name: "" (empty string, not null) for accounts that
+    // never set a display name. `?? login` doesn't catch that — an empty
+    // string is not nullish — so an unnamed user would store dcs_full_name = ""
+    // and every "X mentioned you" alert / comment card would render blank
+    // (issue #385). Fall back to the username whenever full_name is missing
+    // or whitespace-only.
+    .bind(
+      dcsUser.id,
+      dcsUser.login,
+      dcsUser.full_name && dcsUser.full_name.trim() ? dcsUser.full_name : dcsUser.login,
+      accessToken,
+    )
     .run();
 
   const userRow = await c.env.DB.prepare(

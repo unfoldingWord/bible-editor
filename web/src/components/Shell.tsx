@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   Box,
   Typography,
@@ -78,6 +78,7 @@ import { TopBar } from "./TopBar";
 import { ExportUsfmButton } from "./ExportUsfmButton";
 import { BookLintIndicator } from "./BookLintIndicator";
 import { AlignAttentionIndicator } from "./AlignAttentionIndicator";
+import { BookNotesIndicator } from "./BookNotesIndicator";
 import { LogosSyncToggle } from "./LogosSyncToggle";
 import { PipelineMenu } from "./PipelineMenu";
 import { PipelineStatusBar } from "./PipelineStatusBar";
@@ -200,9 +201,12 @@ interface Props {
   // True once auth is confirmed ready (App's auth gate has minted/refreshed
   // the token). Gates the book-locks fetch — see useBookLocks.
   authReady?: boolean;
+  // Top-right notifications bell (comment mentions/replies). Owned by App
+  // (which holds the alerts) and rendered here inside the TopBar.
+  notificationsMenu?: ReactNode;
 }
 
-export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, onLogout, meUserId = null, isViewer = false, initialCommentId, onCommentConsumed, authReady = false }: Props) {
+export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, onLogout, meUserId = null, isViewer = false, initialCommentId, onCommentConsumed, authReady = false, notificationsMenu }: Props) {
   // tw_link → article title, for canonical (headword-anchored) TWL ordering.
   // handleAddTwlSuggestion below places a NEW link at its canonical slot and
   // persists a matching sort_order, so it must order with the SAME inputs the
@@ -2566,6 +2570,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
             onNavigate?.(b, c, v);
           }}
           onLogout={onLogout}
+          notificationsMenu={notificationsMenu}
         />
         <Box sx={{ p: 4, display: "flex", alignItems: "center", gap: 2 }}>
           {status === "error" ? (
@@ -2879,6 +2884,20 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
             }}
           />
         }
+        notesIndicator={
+          <BookNotesIndicator
+            book={book}
+            onNavigate={(b, c, v) => {
+              runWithDirtyGate(() => {
+                setActiveVerse(v ?? 1);
+                setActiveNoteId(null);
+                setActiveWordId(null);
+                onNavigate?.(b, c, v);
+              });
+            }}
+          />
+        }
+        notificationsMenu={notificationsMenu}
         exportMenu={
           <ExportUsfmButton
             book={book}

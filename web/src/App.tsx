@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Alert, Box, Button, CircularProgress, Link, Snackbar, Stack, Typography } from "@mui/material";
 import { Shell } from "./components/Shell";
+import { NotificationsMenu } from "./components/NotificationsMenu";
 import { useBook } from "./hooks/useBook";
 import { useAlerts } from "./hooks/useAlerts";
 import {
@@ -217,6 +218,13 @@ export function App() {
   // hook), which violates Rules of Hooks. The hook itself no-ops while
   // auth is not "ready".
   const { alerts, dismiss } = useAlerts(auth.kind === "ready");
+  // Comment mentions/replies are per-user nudges — they belong in the small
+  // top-right notifications menu, not the full-width "Benjamin fix this" banner
+  // (issues #385/#441). Everything else (export-failure alerts) stays in the
+  // banner. Split by source; `comment_mention` / `comment_reply` both start
+  // with "comment".
+  const bannerAlerts = alerts.filter((a) => !a.source.startsWith("comment"));
+  const notificationAlerts = alerts.filter((a) => a.source.startsWith("comment"));
 
   useEffect(() => {
     setPipelineUser(auth.kind === "ready" ? auth.me?.userId ?? null : null);
@@ -359,7 +367,7 @@ export function App() {
 
   return (
     <Box sx={{ height: "100vh", display: "flex", flexDirection: "column" }}>
-      {alerts.length > 0 && (
+      {bannerAlerts.length > 0 && (
         // Float the alert stack so it doesn't push Shell down — the outer
         // flex column's children can't actually shrink (Shell's internal
         // box rejects flex:1 minHeight:0 sizing), and any added in-flow
@@ -376,7 +384,7 @@ export function App() {
             zIndex: (theme) => theme.zIndex.appBar + 2,
           }}
         >
-          {alerts.map((a) => (
+          {bannerAlerts.map((a) => (
             <Alert
               key={a.id}
               severity={a.severity}
@@ -437,6 +445,9 @@ export function App() {
           initialCommentId={loc.commentId}
           onCommentConsumed={handleCommentConsumed}
           authReady={auth.kind === "ready"}
+          notificationsMenu={
+            <NotificationsMenu alerts={notificationAlerts} onDismiss={dismiss} />
+          }
         />
       </Box>
       <Snackbar

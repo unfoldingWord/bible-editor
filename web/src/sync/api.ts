@@ -589,6 +589,10 @@ export type AlertSeverity = "error" | "warning" | "info";
 export interface SystemAlert {
   id: number;
   severity: AlertSeverity;
+  // Origin of the alert, e.g. "comment_mention" / "comment_reply" (routed to
+  // the top-right notifications menu) vs export-failure sources (full-width
+  // banner). See App.tsx for the split.
+  source: string;
   message: string;
   linkUrl: string | null;
   createdAt: number;
@@ -1177,6 +1181,23 @@ export interface NewCommentInput {
   body: string;
 }
 
+// One location in a book that has open (unresolved) comment threads. Powers
+// the TopBar "notes in this book" indicator (issue #441).
+export interface BookCommentLocation {
+  chapter: number;
+  verse: number;
+  rowKind: CommentRowKind | null;
+  kind: CommentKind;
+  count: number;
+}
+
+export interface BookCommentSummary {
+  locations: BookCommentLocation[];
+  questions: number;
+  notes: number;
+  total: number;
+}
+
 // ── Admin panel (see web/src/components/AdminPanel.tsx) ────────────────────
 // Types mirror the backend contract in AdminPanel's task spec; the two sides
 // are being built together against that shared contract.
@@ -1699,6 +1720,12 @@ export const api = {
   getComments: (book: string, chapter: number, signal?: AbortSignal) =>
     request<{ comments: CommentDto[] }>(
       `/api/comments/${encodeURIComponent(book)}/${chapter}`,
+      { signal },
+    ),
+
+  getBookCommentSummary: (book: string, signal?: AbortSignal) =>
+    request<BookCommentSummary>(
+      `/api/comments/${encodeURIComponent(book)}/notes/summary`,
       { signal },
     ),
 

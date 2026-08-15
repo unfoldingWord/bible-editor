@@ -32,8 +32,11 @@ export function CommentBadge({
     color = "warning.main";
     tooltip = `${openQuestions} open question${openQuestions === 1 ? "" : "s"}`;
   } else if (notes > 0) {
+    // Green (not muted gray) so a note-only row reads as "has something here"
+    // instead of blending into the empty state — issue #387. Outline icon keeps
+    // it distinct from the filled orange question badge for colorblind users.
     icon = <ChatBubbleOutlineIcon fontSize="inherit" />;
-    color = "text.secondary";
+    color = "success.main";
     tooltip = `${notes} note${notes === 1 ? "" : "s"}`;
   } else {
     icon = <ChatBubbleOutlineIcon fontSize="inherit" />;

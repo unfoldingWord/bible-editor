@@ -131,6 +131,8 @@ interface Props {
   logosSyncToggle?: ReactNode;
   lintIndicator?: ReactNode;
   alignIndicator?: ReactNode;
+  notesIndicator?: ReactNode;
+  notificationsMenu?: ReactNode;
   exportMenu?: ReactNode;
   bookLocksButton?: ReactNode;
   railCollapsed?: boolean;
@@ -148,6 +150,8 @@ export function TopBar({
   logosSyncToggle,
   lintIndicator,
   alignIndicator,
+  notesIndicator,
+  notificationsMenu,
   exportMenu,
   bookLocksButton,
   railCollapsed,
@@ -453,6 +457,8 @@ export function TopBar({
       )}
       {lintIndicator}
       {alignIndicator}
+      {notesIndicator}
+      {notificationsMenu}
       <VersionIndicator onRequestReload={onRequestReload} />
       <SyncStatusBar onNavigate={onNavigate} />
       {exportMenu}
