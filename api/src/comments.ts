@@ -50,10 +50,14 @@ interface CommentRow {
   deleted_at: number | null;
 }
 
+// NULLIF(TRIM(...), '') so an empty-string dcs_full_name (DCS sends "" for
+// users with no display name) falls back to the username, not to blank. Plain
+// COALESCE only catches NULL, so pre-#385 rows stored a literal "" and rendered
+// a blank author. This makes the fallback robust for existing data on read.
 const SELECT_COMMENT = `
   SELECT c.*,
-         COALESCE(a.dcs_full_name, a.dcs_username) AS author_name,
-         COALESCE(r.dcs_full_name, r.dcs_username) AS resolved_by_name
+         COALESCE(NULLIF(TRIM(a.dcs_full_name), ''), a.dcs_username) AS author_name,
+         COALESCE(NULLIF(TRIM(r.dcs_full_name), ''), r.dcs_username) AS resolved_by_name
     FROM comments c
     JOIN users a ON a.id = c.author_id
     LEFT JOIN users r ON r.id = c.resolved_by
@@ -98,8 +102,9 @@ comments.get("/mention-users", async (c) => {
   ).all<{ id: number; dcs_username: string; dcs_full_name: string | null }>();
   const users = (rs.results ?? []).map((r) => ({
     id: r.id,
+    // Empty string, not just null — see SELECT_COMMENT (#385).
     username: r.dcs_username,
-    fullName: r.dcs_full_name ?? r.dcs_username,
+    fullName: r.dcs_full_name && r.dcs_full_name.trim() ? r.dcs_full_name : r.dcs_username,
   }));
   return c.json({ users });
 });
@@ -120,6 +125,48 @@ comments.get("/:book/:chapter", async (c) => {
   return c.json({ comments: list });
 });
 
+// Book-wide roll-up of open (unresolved) top-level threads, grouped by
+// location. Powers the TopBar "notes in this book" indicator (issue #441) so
+// editors can find and review comments across a whole book without opening
+// each chapter — including on published/locked books, where comments stay
+// writable. 3-segment path so it never collides with `/:book/:chapter`.
+comments.get("/:book/notes/summary", async (c) => {
+  const book = c.req.param("book").toUpperCase();
+  if (!book) return c.json({ error: "invalid_params" }, 400);
+  const rs = await c.env.DB.prepare(
+    `SELECT chapter, verse, row_kind, kind, COUNT(*) AS n
+       FROM comments
+      WHERE book = ?1
+        AND deleted_at IS NULL
+        AND parent_id IS NULL
+        AND resolved_at IS NULL
+      GROUP BY chapter, verse, row_kind, kind
+      ORDER BY chapter ASC, verse ASC`,
+  )
+    .bind(book)
+    .all<{
+      chapter: number;
+      verse: number;
+      row_kind: "tn" | "tq" | "twl" | null;
+      kind: "question" | "note";
+      n: number;
+    }>();
+  let questions = 0;
+  let notes = 0;
+  const locations = (rs.results ?? []).map((r) => {
+    if (r.kind === "question") questions += r.n;
+    else notes += r.n;
+    return {
+      chapter: r.chapter,
+      verse: r.verse,
+      rowKind: r.row_kind,
+      kind: r.kind,
+      count: r.n,
+    };
+  });
+  return c.json({ locations, questions, notes, total: questions + notes });
+});
+
 const CreateBody = z.object({
   book: z.string().min(1),
   chapter: z.number().int().min(0),
@@ -134,6 +181,20 @@ const CreateBody = z.object({
 async function allUsernames(db: D1Database): Promise<string[]> {
   const rs = await db.prepare(`SELECT dcs_username FROM users`).all<{ dcs_username: string }>();
   return (rs.results ?? []).map((r) => r.dcs_username);
+}
+
+// mentions_json is always written by this module as JSON.stringify(string[]),
+// but the reply-notify parse runs AFTER the reply row is inserted: a single
+// corrupted row would 500 the request, and a client retry would then create a
+// duplicate comment. Swallow a bad parse rather than risk that.
+function parseMentionsJson(raw: string | null): string[] {
+  if (!raw) return [];
+  try {
+    const v = JSON.parse(raw);
+    return Array.isArray(v) ? (v as string[]) : [];
+  } catch {
+    return [];
+  }
 }
 
 comments.post("/", async (c) => {
@@ -205,10 +266,11 @@ comments.post("/", async (c) => {
   const comment = await loadComment(c.env.DB, newId);
   if (!comment) return c.json({ error: "not_found" }, 404);
 
+  const linkUrl = `/#/${book}/${chapter}/${verse}?c=${parentId ?? newId}`;
+  const mentionedLower = new Set(mentions.map((u) => u.toLowerCase()));
+
   if (mentions.length > 0) {
-    const rootId = parentId ?? newId;
     const message = `${comment.authorName} mentioned you in ${book} ${chapter}:${verse}`;
-    const linkUrl = `/#/${book}/${chapter}/${verse}?c=${rootId}`;
     await c.env.DB.batch(
       mentions.map((mentionedUsername) =>
         c.env.DB.prepare(
@@ -217,6 +279,45 @@ comments.post("/", async (c) => {
         ).bind(mentionedUsername, message, linkUrl),
       ),
     );
+  }
+
+  // Reply → notify everyone already in the thread (issue #441: "people are not
+  // receiving notifications of responses"). Prior mentions only ever alerted
+  // the person @-tagged, so a plain reply reached nobody. Notify the root
+  // author + every prior participant + everyone previously @-mentioned in the
+  // thread, minus the replier themselves and minus anyone this reply already
+  // @-mentioned (they get the mention alert above, not a duplicate).
+  if (parentId != null) {
+    const rootId = parentId;
+    const rows = await c.env.DB.prepare(
+      `SELECT u.dcs_username AS username, c.mentions_json AS mentions_json
+         FROM comments c
+         JOIN users u ON u.id = c.author_id
+        WHERE (c.id = ?1 OR c.parent_id = ?1) AND c.deleted_at IS NULL`,
+    )
+      .bind(rootId)
+      .all<{ username: string; mentions_json: string | null }>();
+    const selfLower = (username ?? "").toLowerCase();
+    const recipients = new Map<string, string>(); // lower → canonical
+    for (const r of rows.results ?? []) {
+      if (r.username) recipients.set(r.username.toLowerCase(), r.username);
+      for (const m of parseMentionsJson(r.mentions_json)) {
+        recipients.set(m.toLowerCase(), m);
+      }
+    }
+    recipients.delete(selfLower);
+    for (const lower of mentionedLower) recipients.delete(lower);
+    if (recipients.size > 0) {
+      const message = `${comment.authorName} replied to a ${kind} in ${book} ${chapter}:${verse}`;
+      await c.env.DB.batch(
+        [...recipients.values()].map((recipient) =>
+          c.env.DB.prepare(
+            `INSERT INTO system_alerts (username, severity, source, message, link_url)
+             VALUES (?1, 'info', 'comment_reply', ?2, ?3)`,
+          ).bind(recipient, message, linkUrl),
+        ),
+      );
+    }
   }
 
   c.executionCtx.waitUntil(broadcastChapter(c.env, book, chapter, { type: "comment.updated", comment }));

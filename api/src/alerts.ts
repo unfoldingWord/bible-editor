@@ -16,6 +16,7 @@ alerts.use("*", requireAuth);
 interface AlertRow {
   id: number;
   severity: string;
+  source: string;
   message: string;
   link_url: string | null;
   created_at: number;
@@ -25,16 +26,19 @@ alerts.get("/me", async (c) => {
   const username = c.get("username");
   if (!username) return c.json({ alerts: [] });
   const rs = await c.env.DB.prepare(
-    `SELECT id, severity, message, link_url, created_at
+    `SELECT id, severity, source, message, link_url, created_at
        FROM system_alerts
       WHERE username = ?1 AND dismissed_at IS NULL
       ORDER BY created_at DESC`,
   )
     .bind(username)
     .all<AlertRow>();
+  // `source` lets the SPA route comment mentions/replies to the small top-right
+  // notifications menu instead of the full-width banner (issues #385/#441).
   const list = (rs.results ?? []).map((r) => ({
     id: r.id,
     severity: r.severity,
+    source: r.source,
     message: r.message,
     linkUrl: r.link_url,
     createdAt: r.created_at,

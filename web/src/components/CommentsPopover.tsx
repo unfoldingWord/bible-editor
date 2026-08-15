@@ -512,7 +512,7 @@ function CommentCard({
             label="Note"
             size="small"
             variant="outlined"
-            sx={{ height: 22, fontSize: 11, color: "text.secondary" }}
+            sx={{ height: 22, fontSize: 11, color: "success.main", borderColor: "success.main" }}
           />
         )}
       </Stack>
