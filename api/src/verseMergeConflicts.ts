@@ -27,8 +27,21 @@
 //   'keep_alignment_refused' — adopting master's edit would have lost
 //                              alignment on words neither side touched, so D1
 //                              was kept instead and a human should look.
+//   'source_attr_divergent'  — master carries a curated original-language
+//                              source fix (x-content/x-lemma/x-morph on a
+//                              `\zaln-s` milestone) for a verse a translator
+//                              edited, but the same source word repeats in the
+//                              verse (e.g. EZK 40's architectural terms) so the
+//                              fix can't be placed unambiguously. D1 was kept;
+//                              nothing was overwritten (overwritten_version
+//                              NULL, like keep_alignment_refused). Surfaced so a
+//                              human applies the source fix by hand before the
+//                              nightly export reverts it on master. Recorded
+//                              from bookReimport.ts's applyVerseRows edited-skip
+//                              branch (reconcileSourceAttrsFromMaster's
+//                              `divergent` report).
 // The banner alert (raiseVerseMergeConflictAlert) filters to only the latter
-// two — a clean 'adopt' needs nobody's attention, so it stays in the table
+// three — a clean 'adopt' needs nobody's attention, so it stays in the table
 // (audit trail) but never in the count a human sees.
 //
 // overwritten_version is the D1 `verses.version` that was replaced — the old
@@ -44,6 +57,7 @@ import type { Env } from "./index";
 import { requireAuth } from "./auth";
 import {
   buildEditorLookupQuery,
+  buildMergeConflictGuidance,
   EDITOR_LOOKUP_CHUNK,
   groupOverwrittenVersesByEditor,
   planSystemAlertWrites,
@@ -52,6 +66,7 @@ import {
 import {
   CONFIRM_ADOPTED_CONFLICT_SQL,
   DELETE_LOST_ADOPTION_CONFLICT_SQL,
+  SELECT_ACTIVE_ALERTABLE_CONFLICTS_SQL,
   UPSERT_VERSE_MERGE_CONFLICT_SQL,
 } from "./verseMergeConflictSql.ts";
 
@@ -331,13 +346,7 @@ export async function raiseVerseMergeConflictAlert(
   // return — same fail-open discipline as every other D1 call in this file.
   let rs: { results?: StoredConflictRow[] };
   try {
-    rs = await env.DB.prepare(
-      `SELECT chapter, verse, action, reason, overwritten_version, alignment
-         FROM verse_merge_conflicts
-        WHERE book = ?1 AND resource = ?2 AND action IN ('adopt_conflict', 'keep_alignment_refused')
-          AND resolved_at IS NULL
-        ORDER BY chapter ASC, verse ASC`,
-    )
+    rs = await env.DB.prepare(SELECT_ACTIVE_ALERTABLE_CONFLICTS_SQL)
       .bind(book, resource)
       .all<StoredConflictRow>();
   } catch (e) {
@@ -405,43 +414,15 @@ export async function raiseVerseMergeConflictAlert(
     .map((r) => `${r.chapter}:${r.verse}${r.overwrittenVersion != null ? `@v${r.overwrittenVersion}` : ""}`)
     .join(", ");
   const more = rows.length > 10 ? `; +${rows.length - 10} more` : "";
-  // The two outcomes need different instructions, so say which is which rather
-  // than emitting one hint that is wrong for half the rows.
-  // Split on ACTION, not on `overwrittenVersion != null`. The pointer is a
-  // recovery aid; the action is the fact. Deriving "did we take Door43's
-  // version?" from the pointer couples this wording to a nullable column, and
-  // when a refusal row once acquired a pointer it silently reported the
-  // refusal as an overwrite AND dropped the refusal guidance entirely — the
-  // one sentence warning that Door43's change was NOT taken and tonight's
-  // export will write over it. Keyed on action, that cannot recur.
-  const overwritten = rows.filter((r) => r.action !== "keep_alignment_refused").length;
-  const kept = rows.length - overwritten;
-  const guidance = [
-    overwritten > 0
-      ? `${overwritten} took Door43's version over the editor's — the replaced text is still in that verse's ` +
-        `version history, at the version number given after @v in its ref above.`
-      : "",
-    kept > 0
-      ? `${kept} kept the editor's version because adopting Door43's would have cost alignment — Door43's ` +
-        `change has NOT been taken, so tonight's export will still write over it until someone resolves it.`
-      : "",
-    opts.recordingFailed
-      ? "NOTE: at least one merge-conflict recording failed to write to verse_merge_conflicts this run " +
-        "(see worker logs) — this table and count may be missing rows from tonight's sync."
-      : "",
-    // FIX G: keep_no_base verses could not be adjudicated at all (their
-    // edit_log history aged past the 180-day retention sweep, so no ancestor
-    // is recoverable) — they behave exactly like the original 1CH bug: a
-    // Door43-side change to them is silently overwritten by tonight's
-    // export, with no per-verse row to point at because nothing was ever
-    // attributable.
-    opts.noBaseCount
-      ? `${opts.noBaseCount} verse(s) could not be adjudicated because their edit history has aged out (no ` +
-        `recoverable ancestor) — a Door43-side change to them will still be overwritten by tonight's export.`
-      : "",
-  ]
-    .filter(Boolean)
-    .join(" ");
+  // Per-outcome guidance, classified by ACTION (never by the nullable
+  // overwritten_version pointer) — see buildMergeConflictGuidance. Pulled into
+  // that pure helper so the three-way overwritten / kept-alignment /
+  // kept-source-attr split is unit-testable without an Env, and so a refusal or
+  // a source-attr divergence can never be miscounted as an overwrite.
+  const guidance = buildMergeConflictGuidance(rows, {
+    recordingFailed: opts.recordingFailed,
+    noBaseCount: opts.noBaseCount,
+  });
   const refsClause = rows.length > 0 ? ` Refs: ${refs}${more}.` : "";
   // FIX I: this fires from both the nightly cron and the user-triggered
   // POST /:book/reimport route (runReimport calls this too), so "Nightly

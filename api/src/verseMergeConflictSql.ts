@@ -45,6 +45,35 @@ export const RESOLVE_VERSE_MERGE_CONFLICT_SQL = `UPDATE verse_merge_conflicts
     AND changes() > 0`;
 
 // ---------------------------------------------------------------------------
+// verseMergeConflicts.ts's raiseVerseMergeConflictAlert — the active,
+// human-actionable conflict rows for one (book, resource). Exported (not
+// inline) so verseMergeConflicts.test.mjs can prove the exact `action IN (...)`
+// filter against real SQLite, the same anti-drift reason every other statement
+// here is a shared constant.
+//
+// The three alertable actions are the ones a human still needs to look at:
+//   'adopt_conflict'         — Door43's version replaced a human edit.
+//   'keep_alignment_refused' — kept D1 (nothing overwritten), export will
+//                              still revert master until resolved.
+//   'source_attr_divergent'  — kept D1 (nothing overwritten): master carries a
+//                              curated original-language source fix on a verse
+//                              whose repeated source words made the fix
+//                              impossible to place unambiguously (the EZK 40
+//                              repeated-architecture-terms case). Same
+//                              export-reverts-until-resolved shape as a refusal.
+// A clean 'adopt' (master moved, we didn't) is deliberately EXCLUDED — it needs
+// no judgement and stays in the table purely as an audit trail.
+//
+// Binds, in order: (book, resource).
+// ---------------------------------------------------------------------------
+export const SELECT_ACTIVE_ALERTABLE_CONFLICTS_SQL = `SELECT chapter, verse, action, reason, overwritten_version, alignment
+     FROM verse_merge_conflicts
+    WHERE book = ?1 AND resource = ?2
+      AND action IN ('adopt_conflict', 'keep_alignment_refused', 'source_attr_divergent')
+      AND resolved_at IS NULL
+    ORDER BY chapter ASC, verse ASC`;
+
+// ---------------------------------------------------------------------------
 // TWO-PHASE REACTIVATION (2026-08-15 Codex second-opinion review fix,
 // superseding the first six-angle review's "reset resolved_at
 // unconditionally" approach, which had a real bug — see below).
@@ -124,7 +153,7 @@ export const UPSERT_VERSE_MERGE_CONFLICT_SQL = `INSERT INTO verse_merge_conflict
      -- across a resolve -> new-conflict cycle on the SAME verse — worth a
      -- follow-up if that combination turns out to matter in practice.
      overwritten_version = CASE
-       WHEN excluded.action = 'keep_alignment_refused' THEN NULL
+       WHEN excluded.action IN ('keep_alignment_refused', 'source_attr_divergent') THEN NULL
        ELSE COALESCE(verse_merge_conflicts.overwritten_version, excluded.overwritten_version)
      END,
      alignment = COALESCE(excluded.alignment, verse_merge_conflicts.alignment),

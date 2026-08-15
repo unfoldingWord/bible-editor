@@ -59,6 +59,7 @@
 import { DatabaseSync } from "node:sqlite";
 import {
   buildEditorLookupQuery,
+  buildMergeConflictGuidance,
   EDITOR_LOOKUP_CHUNK,
   editLogKey,
   groupOverwrittenVersesByEditor,
@@ -68,6 +69,7 @@ import {
   CONFIRM_ADOPTED_CONFLICT_SQL,
   DELETE_LOST_ADOPTION_CONFLICT_SQL,
   RESOLVE_VERSE_MERGE_CONFLICT_SQL,
+  SELECT_ACTIVE_ALERTABLE_CONFLICTS_SQL,
   UPSERT_VERSE_MERGE_CONFLICT_SQL,
   VERSE_PATCH_UPDATE_SQL,
 } from "./verseMergeConflictSql.ts";
@@ -620,6 +622,108 @@ function confirmAdopted(d, { book, resource, chapter, verse }) {
   const { toDelete, toInsert } = planSystemAlertWrites(existing, new Map());
   assert(toDelete.length === 0, "a dismissed, now-irrelevant alert is left alone as history");
   assert(toInsert.length === 0, "nothing to insert for a dismissed, now-irrelevant alert");
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Part 7: 'source_attr_divergent' — surfacing the un-adopted master
+// original-language source fix on an edited verse (the EZK 40
+// repeated-architecture-terms case). The reconcile can't place master's
+// curated x-content/x-lemma/x-morph fix when the same source word repeats, so
+// it keeps D1 and (this change) records a keep-D1 conflict for review instead
+// of only a counter + log line. Nothing was overwritten, so it must behave
+// like keep_alignment_refused: NULL recovery pointer, surfaced in the banner,
+// classified as "kept D1" (never "took Door43's version"), cleared on re-save.
+// ─────────────────────────────────────────────────────────────────────────
+
+{
+  // The UPSERT stores a keep-D1 divergence with a NULL recovery pointer even
+  // if a null overwrittenVersion is bound — and the CASE forces NULL for this
+  // action, so a verse that carried an OLD adopt_conflict pointer can never
+  // report a stale @v recovery pointer once it becomes source_attr_divergent.
+  const d = verseDb();
+  d.prepare(UPSERT_VERSE_MERGE_CONFLICT_SQL).run(
+    "EZK", "ult", 40, 21, "source_attr_divergent", "source_attr_ambiguous", null, null, 1000,
+  );
+  let row = d.prepare(`SELECT * FROM verse_merge_conflicts WHERE book='EZK' AND chapter=40 AND verse=21`).get();
+  assert(row.action === "source_attr_divergent" && row.overwritten_version === null,
+    "source_attr_divergent stored with a NULL overwritten_version (nothing was replaced)");
+
+  // Re-upsert the SAME verse as if it had earlier been an adopt_conflict with a
+  // real pointer, then diverge again: the pointer must be forced back to NULL.
+  const d2 = verseDb();
+  d2.prepare(UPSERT_VERSE_MERGE_CONFLICT_SQL).run(
+    "EZK", "ult", 40, 21, "adopt_conflict", "both_changed", 7, null, 1000,
+  );
+  d2.prepare(UPSERT_VERSE_MERGE_CONFLICT_SQL).run(
+    "EZK", "ult", 40, 21, "source_attr_divergent", "source_attr_ambiguous", null, null, 2000,
+  );
+  row = d2.prepare(`SELECT * FROM verse_merge_conflicts WHERE book='EZK' AND chapter=40 AND verse=21`).get();
+  assert(row.action === "source_attr_divergent" && row.overwritten_version === null,
+    "a verse that becomes source_attr_divergent drops any prior overwritten_version pointer (never misdirects a reviewer)");
+}
+
+{
+  // The banner's active-conflict filter (the REAL production constant) surfaces
+  // a source_attr_divergent row, EXCLUDES a clean 'adopt' (audit-only), and
+  // EXCLUDES a resolved row.
+  const d = verseDb();
+  d.prepare(
+    `INSERT INTO verse_merge_conflicts (book, resource, chapter, verse, action, reason, overwritten_version, detected_at)
+     VALUES ('EZK','ult',40,21,'source_attr_divergent','source_attr_ambiguous',NULL,100)`,
+  ).run();
+  d.prepare(
+    `INSERT INTO verse_merge_conflicts (book, resource, chapter, verse, action, reason, overwritten_version, detected_at)
+     VALUES ('EZK','ult',40,22,'adopt','master_unchanged',5,100)`,
+  ).run();
+  d.prepare(
+    `INSERT INTO verse_merge_conflicts (book, resource, chapter, verse, action, reason, overwritten_version, detected_at, resolved_at, resolved_by)
+     VALUES ('EZK','ult',40,23,'source_attr_divergent','source_attr_ambiguous',NULL,100,150,30)`,
+  ).run();
+  const rows = d.prepare(SELECT_ACTIVE_ALERTABLE_CONFLICTS_SQL).all("EZK", "ult");
+  assert(rows.length === 1, "banner filter returns exactly the one active, alertable row");
+  assert(rows[0].verse === 21 && rows[0].action === "source_attr_divergent",
+    "…which is the unresolved source_attr_divergent row (not the audit-only 'adopt', not the resolved one)");
+}
+
+{
+  // Re-saving the flagged verse resolves it, via the SAME action-agnostic
+  // RESOLVE SQL every other conflict uses — no special path needed.
+  const d = verseDb();
+  d.prepare(`INSERT INTO verses (book, chapter, verse, bible_version, version) VALUES ('EZK', 40, 21, 'ULT', 4)`).run();
+  d.prepare(
+    `INSERT INTO verse_merge_conflicts (book, resource, chapter, verse, action, reason, overwritten_version, detected_at)
+     VALUES ('EZK','ult',40,21,'source_attr_divergent','source_attr_ambiguous',NULL,100)`,
+  ).run();
+  const res = saveVerse(d, { book: "EZK", resource: "ult", chapter: 40, verse: 21, matchVersion: 4, userId: 30, now: 200 });
+  assert(res.verseChanged === 1 && res.conflictResolved === 1, "saving the verse resolves the source_attr_divergent flag");
+  const active = d
+    .prepare(`SELECT COUNT(*) c FROM verse_merge_conflicts WHERE book='EZK' AND resolved_at IS NULL`)
+    .get().c;
+  assert(active === 0, "no active conflict remains after the human re-saves");
+}
+
+{
+  // buildMergeConflictGuidance classifies by ACTION: a source_attr_divergent
+  // row is a KEPT-D1 outcome — it must say "kept D1" / "NOT been taken" and
+  // must NEVER claim "took Door43's version" (the misdirection bug the
+  // action-keyed classification exists to prevent).
+  const g = buildMergeConflictGuidance([{ action: "source_attr_divergent" }]);
+  assert(g.includes("kept D1"), "source_attr_divergent guidance says the editor's D1 was kept");
+  assert(g.includes("NOT been taken"), "…and warns the export will still revert master until resolved");
+  assert(!g.includes("took Door43's version"), "…and never reports it as an overwrite");
+
+  // A mixed set is counted per-action, not lumped: one adopt_conflict is an
+  // overwrite, one source_attr_divergent is a kept-D1 divergence.
+  const mixed = buildMergeConflictGuidance([
+    { action: "adopt_conflict" },
+    { action: "source_attr_divergent" },
+    { action: "keep_alignment_refused" },
+  ]);
+  assert(mixed.includes("1 took Door43's version"), "adopt_conflict counted as an overwrite");
+  assert(mixed.includes("1 kept the editor's version because adopting Door43's would have cost alignment"),
+    "keep_alignment_refused counted as an alignment refusal");
+  assert(mixed.includes("1 kept D1 because Door43's original-language source fix"),
+    "source_attr_divergent counted as a source-attr divergence, separately from the alignment refusal");
 }
 
 if (failed) {

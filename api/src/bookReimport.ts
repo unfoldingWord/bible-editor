@@ -1972,8 +1972,11 @@ async function applyVerseRows(
     beforePlainText: string | null;
   }> = [];
   // Verses needing a durable record after this run's merge — EVERY landed
-  // adoption ("adopt" | "adopt_conflict") plus every alignment refusal
-  // ("keep_alignment_refused"). FIX 2: a clean "adopt" is included here too
+  // adoption ("adopt" | "adopt_conflict"), every alignment refusal
+  // ("keep_alignment_refused"), and every edited verse whose source-owned
+  // `\zaln-s` fix on master couldn't be uniquely reconciled
+  // ("source_attr_divergent" — kept D1, nothing overwritten, adopted:false).
+  // FIX 2: a clean "adopt" is included here too
   // (not just the two that need human judgment) so every overwrite of
   // human-owned text has a recovery pointer — see recordVerseMergeConflicts.
   // The human-facing banner (raiseVerseMergeConflictAlert) still filters this
@@ -2122,6 +2125,28 @@ async function applyVerseRows(
         counts.source_attr_divergent += rec.divergent;
         console.warn("reimport: source-attr divergence on edited verse couldn't be uniquely reconciled from master", {
           book, bibleVersion, chapter: v.chapter, verse: v.verse, divergent: rec.divergent,
+        });
+        // Make the un-adopted master source fix VISIBLE instead of only a
+        // counter + log line. The reconcile refused to adopt because the same
+        // source word repeats in this verse (EZK 40's architectural terms) — so
+        // master's curated original-language fix stays un-applied and tonight's
+        // export will render D1's stale source bytes back over master, silently
+        // reverting it (the [[project_edited_row_skips_master_edit]] class).
+        // Record a keep-D1 conflict — nothing was overwritten, so
+        // overwrittenVersion is null (same invariant as keep_alignment_refused)
+        // — so it lands in verse_merge_conflicts and the review banner. One row
+        // per verse regardless of how many (key, attr) pairs diverged; adopted
+        // is false, so it never enters the master-adoption CAS/cleanup dance and
+        // it does NOT feed the systemic-refusal watermark gate (merge_refused) —
+        // keep D1, surface it, do not hold the book's export back.
+        mergeConflicts.push({
+          chapter: v.chapter,
+          verse: v.verse,
+          action: "source_attr_divergent",
+          reason: "source_attr_ambiguous",
+          overwrittenVersion: null,
+          alignment: null,
+          adopted: false,
         });
       }
       if (rec.changed) {
