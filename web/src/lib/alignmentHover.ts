@@ -23,6 +23,7 @@ import {
   positionOwnedBy,
   positionsShareOwner,
   findReusedSourceWordIds,
+  sourceKey,
   type AlignmentGroup,
   type AlignmentState,
   type SourceWord,
@@ -58,6 +59,35 @@ export function groupPositionKey(g: AlignmentGroup, indexMap: Map<string, number
   if (g.source.length === 0) return null;
   const positions = g.source.map((s) => resolveSourcePos(s, indexMap));
   return positions.some((p) => p < 0) ? null : positions.join(".");
+}
+
+// Resolve a DISPLAY card id back to EVERY state group it collapsed — by
+// sourceKey OR source position, the same identity AlignmentPanel's
+// handleSourceDrop / handleClearGroup use. A card fuses groups by source
+// identity (mergeAdjacentSameSource) AND by position (mergeSamePositionGroups
+// → the occ 1/2 + 2/2 over-count), so the carried id alone under-counts it.
+// The carried id stays first so it leads the returned list. Shared with
+// scripts/scan-reused-token-visibility.mjs, which needs the same resolution
+// to count the (display card, flagged token) unit rather than raw ids.
+export function groupsForCard(
+  groups: AlignmentGroup[],
+  cardId: string,
+  indexMap: Map<string, number>,
+): string[] {
+  const target = groups.find((g) => g.id === cardId);
+  if (!target) return [cardId];
+  const key = sourceKey(target);
+  const posKey = groupPositionKey(target, indexMap);
+  return [
+    cardId,
+    ...groups
+      .filter(
+        (g) =>
+          g.id !== cardId &&
+          (sourceKey(g) === key || (posKey !== null && groupPositionKey(g, indexMap) === posKey)),
+      )
+      .map((g) => g.id),
+  ];
 }
 
 // Walk-order index of the source verse's \w tokens, keyed both by NFC text +

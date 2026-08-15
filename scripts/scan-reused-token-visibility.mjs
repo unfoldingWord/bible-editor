@@ -40,10 +40,17 @@
 //     that bucket unable to reach 0 while ANY lint false positive exists, and
 //     "flagged but nothing rendered" would then be true only by subtraction
 //     from a header that never said so.
-//   - `flaggedButUnrendered` (flagged.size > 0 && rendered.size < flagged.size)
-//     is THE regression signal for a display fix: it counts only rows where
-//     the marker found a real defect but some of it failed to render. It can
-//     be 0 even while lint-only false positives persist.
+//   - `flaggedButUnrendered` is THE regression signal for a display fix: it
+//     counts rows where some (display card, flagged token) pair never draws a
+//     chip for that token — i.e. a real defect the marker found but the UI
+//     failed to show. It can be 0 even while lint-only false positives
+//     persist. The unit is deliberately the (card, token) pair, not a raw
+//     flagged source-word id: a legitimately fused card (mergeSamePositionGroups
+//     collapsing a one-token-to-N-target-run split, e.g. JER 36:30 UST) drops
+//     the eaten group's id while still rendering a chip for the same physical
+//     token, and counting by id alone misreads that as unrendered. See
+//     groupsForCard usage below, which resolves a display card back to every
+//     state group it fused before asking whether the token renders.
 // Verse 0 (chapter-front, no real verse content) is excluded from the target
 // scan, mirroring lintUsfmVerses's own skip of verse===0 — otherwise a verse-0
 // row could only ever land as marker-only and would inflate versesScanned.
@@ -56,6 +63,8 @@ import {
   buildDisplayGroups,
   buildPosMaps,
   buildSourceIndexMap,
+  groupsForCard,
+  resolveSourcePos,
 } from "../web/src/lib/alignmentHover.ts";
 import { concatSourceRange } from "../web/src/lib/verseRange.ts";
 import { lintUsfmVerses } from "../api/src/lint.ts";
@@ -208,6 +217,37 @@ for (const bk of books) {
     const rendered = new Set();
     for (const g of display) for (const s of g.source) if (flagged.has(s.id)) rendered.add(s.id);
 
+    // Card/token check for `flaggedButUnrendered` (see header comment): walk
+    // each DISPLAY card back to every state group it fused via groupsForCard
+    // — the same resolution AlignmentPanel uses for merge/clear — and ask
+    // whether the card renders a chip at the same source POSITION as each
+    // flagged token those groups own. Position, not raw id, because a fused
+    // card keeps only its survivor group's ids; the eaten group's flagged id
+    // is gone from `display` entirely even though its physical token still
+    // draws a chip on the survivor card.
+    let cardTokenUnrendered = false;
+    if (flagged.size > 0) {
+      cardTokenLoop: for (const d of display) {
+        const underlyingIds = groupsForCard(state.groups, d.id, indexMap);
+        const flaggedPositions = new Set();
+        for (const gid of underlyingIds) {
+          const g = state.groups.find((sg) => sg.id === gid);
+          if (!g) continue;
+          for (const s of g.source) {
+            if (flagged.has(s.id)) flaggedPositions.add(resolveSourcePos(s, indexMap));
+          }
+        }
+        if (flaggedPositions.size === 0) continue;
+        const renderedPositions = new Set(d.source.map((s) => resolveSourcePos(s, indexMap)));
+        for (const p of flaggedPositions) {
+          if (!renderedPositions.has(p)) {
+            cardTokenUnrendered = true;
+            break cardTokenLoop;
+          }
+        }
+      }
+    }
+
     // A defect is only legible as "doubled Hebrew" when at least TWO flagged
     // chips actually draw — one lone red marker has no partner to compare to.
     // These three buckets only apply when the MARKER flagged something; a
@@ -231,6 +271,7 @@ for (const bk of books) {
       flagged: flagged.size,
       rendered: rendered.size,
       visibility,
+      cardTokenUnrendered,
     });
     bookHits++;
   }
@@ -241,10 +282,12 @@ const counts = { visible: 0, "one-chip": 0, "no-chip": 0, "lint-only": 0 };
 for (const f of findings) counts[f.visibility]++;
 const lintOnly = findings.filter((f) => f.lint && f.flagged === 0).length;
 const uiOnly = findings.filter((f) => !f.lint && f.flagged > 0).length;
-// THE regression signal for a display fix: rows where the marker flagged a
-// real defect but some (or all) of it failed to render. Unlike `no-chip`,
-// this can be 0 while lint-only false positives persist.
-const flaggedButUnrendered = findings.filter((f) => f.flagged > 0 && f.rendered < f.flagged).length;
+// THE regression signal for a display fix: rows where some (display card,
+// flagged token) pair never draws a chip for that token. Unlike `no-chip`,
+// this can be 0 while lint-only false positives persist. See the
+// `cardTokenUnrendered` computation above and the header comment for why the
+// unit is a (card, token) pair rather than a raw flagged source-word id.
+const flaggedButUnrendered = findings.filter((f) => f.cardTokenUnrendered).length;
 
 if (asJson) {
   console.log(

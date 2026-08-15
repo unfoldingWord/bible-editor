@@ -46,6 +46,7 @@ import {
   buildSourceIndexMap,
   buildTargetIdToGroupId,
   groupPositionKey,
+  groupsForCard as groupsForCardId,
   makeEnglishHover,
   makeHebrewHover,
   resolveEnglishHighlight,
@@ -426,25 +427,12 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
     // sourceKey OR source position, the same identity handleClearGroup /
     // handleSourceDrop use. A card fuses groups by source identity
     // (mergeAdjacentSameSource) AND by position (mergeSamePositionGroups → the
-    // occ 1/2 + 2/2 over-count), so the carried id alone under-counts it. The
-    // carried id stays first so it leads the returned list.
+    // occ 1/2 + 2/2 over-count), so the carried id alone under-counts it.
+    // Shared logic lives in alignmentHover.ts's groupsForCard so the census
+    // script (scripts/scan-reused-token-visibility.mjs) can reuse it.
     const groupsForCard = (cardId: string): string[] => {
       if (!state) return [cardId];
-      const target = state.groups.find((g) => g.id === cardId);
-      if (!target) return [cardId];
-      const key = sourceKey(target);
-      const posKey = groupPositionKey(target, sourceIndexMap);
-      return [
-        cardId,
-        ...state.groups
-          .filter(
-            (g) =>
-              g.id !== cardId &&
-              (sourceKey(g) === key ||
-                (posKey !== null && groupPositionKey(g, sourceIndexMap) === posKey)),
-          )
-          .map((g) => g.id),
-      ];
+      return groupsForCardId(state.groups, cardId, sourceIndexMap);
     };
     // Merge a whole card (the dragged group) into the card it was dropped on.
     // survivor = the earlier-positioned of the two, so the combined Hebrew
