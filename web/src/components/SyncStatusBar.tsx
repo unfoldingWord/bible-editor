@@ -95,6 +95,19 @@ export function SyncStatusBar({ onNavigate }: Props = {}) {
   // explicit confirm so it can't be a one-misclick data loss.
   const [confirmDiscardAll, setConfirmDiscardAll] = useState(false);
 
+  // Single-op "discard this edit" confirm — same one-misclick protection as
+  // "discard all". Snapshot of the op at click time; the dialog auto-closes
+  // if the op leaves the failed list (retry / auto-revival).
+  const [confirmDropOp, setConfirmDropOp] = useState<OutboxOp | null>(null);
+  const [copiedDropOp, setCopiedDropOp] = useState(false);
+  const closeDropOp = () => { setConfirmDropOp(null); setCopiedDropOp(false); };
+  const liveDropOp = confirmDropOp && failed.some((f) => f.id === confirmDropOp.id)
+    ? confirmDropOp
+    : null;
+  useEffect(() => {
+    if (confirmDropOp && !liveDropOp) setConfirmDropOp(null);
+  }, [confirmDropOp, liveDropOp]);
+
   // Conflicts whose 409 body carried no current row/version: resolve can't
   // re-arm them, and dropping deletes the edit — same one-misclick data-loss
   // stakes as "discard all", so they get the same confirm gate. Snapshot of
@@ -492,7 +505,7 @@ export function SyncStatusBar({ onNavigate }: Props = {}) {
                       <IconButton
                         size="small"
                         color="error"
-                        onClick={() => void outbox.drop(op.id)}
+                        onClick={() => { setConfirmDropOp(op); setCopiedDropOp(false); }}
                         sx={{ p: 0.25 }}
                       >
                         <DeleteOutlineIcon fontSize="inherit" />
@@ -578,6 +591,65 @@ export function SyncStatusBar({ onNavigate }: Props = {}) {
             discard
           </Button>
         </DialogActions>
+      </Dialog>
+      <Dialog
+        open={liveDropOp !== null}
+        onClose={closeDropOp}
+        sx={{ zIndex: (t) => t.zIndex.snackbar + 1 }}
+      >
+        {liveDropOp && (
+          <>
+            <DialogTitle>Discard this edit?</DialogTitle>
+            <DialogContent>
+              <DialogContentText>
+                This edit never reached the server. Discarding deletes it from
+                this device permanently — copy it first if you want to keep the text.
+              </DialogContentText>
+              <Typography
+                variant="caption"
+                sx={{ fontFamily: "monospace", display: "block", mt: 1 }}
+              >
+                {formatOpLabel(liveDropOp)}
+              </Typography>
+            </DialogContent>
+            <DialogActions>
+              <Button
+                onClick={async () => {
+                  const text = `${formatOpLabel(liveDropOp)}\n${JSON.stringify(liveDropOp.patch, null, 2)}`;
+                  try {
+                    await navigator.clipboard.writeText(text);
+                    setCopiedDropOp(true);
+                  } catch {
+                    try {
+                      const ta = document.createElement("textarea");
+                      ta.value = text;
+                      ta.style.position = "fixed";
+                      ta.style.opacity = "0";
+                      document.body.appendChild(ta);
+                      ta.select();
+                      const ok = document.execCommand("copy");
+                      ta.remove();
+                      if (ok) setCopiedDropOp(true);
+                    } catch { /* keep button label as-is */ }
+                  }
+                }}
+              >
+                {copiedDropOp ? "copied" : "copy edit"}
+              </Button>
+              <Button onClick={closeDropOp}>cancel</Button>
+              <Button
+                color="error"
+                variant="contained"
+                onClick={async () => {
+                  await outbox.drop(liveDropOp.id, { onlyIfStatus: "failed" });
+                  closeDropOp();
+                }}
+              >
+                discard
+              </Button>
+            </DialogActions>
+          </>
+        )}
       </Dialog>
     </>
   );
