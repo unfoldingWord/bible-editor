@@ -508,7 +508,13 @@ for (const row of rows) {
   // Character-exact: the new raw text must be the old raw text with exactly
   // the recorded space offsets removed, and nothing else.
   const dropped = new Set(sites.map((s) => s.originalOffset));
-  const expectedRaw = [...beforeFlat.raw].filter((_c, i) => !dropped.has(i)).join("");
+  // split("") and NOT [...raw] / Array.from: every offset in this script comes
+  // from String#length and String#slice, which count UTF-16 CODE UNITS, while
+  // the spread/Array.from iterators yield CODE POINTS. One astral character
+  // anywhere before a defect site would desynchronise the two and drop the
+  // wrong character here. That would fail this assertion and refuse the verse
+  // rather than corrupt it — fail-safe, but still wrong, so the units match.
+  const expectedRaw = beforeFlat.raw.split("").filter((_c, i) => !dropped.has(i)).join("");
   if (afterFlat.raw !== expectedRaw)
     problems.push("raw text is not the original with exactly the recorded spaces removed");
   if (DEFECT_RE.test(afterFlat.raw)) problems.push("a defect site remains after the repair");
