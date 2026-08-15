@@ -1,5 +1,6 @@
-// Regression tests for the two 2026-08-14 prod-audit fixes in
-// verseMergeConflicts.ts / verses.ts:
+// Regression tests for the 2026-08-14 prod-audit fixes in
+// verseMergeConflicts.ts / verses.ts, plus the follow-on fixes from the
+// independent six-angle review of the first version of this PR:
 //
 //   DEFECT 1 (wrong audience) — the merge-conflict banner alert only ever
 //   reached the admin (ALERT_USERNAME); the editors whose work was actually
@@ -11,8 +12,23 @@
 //   DELETE the verse_merge_conflicts row the instant a human re-saved the
 //   flagged verse, erasing the audit trail (and the overwritten_version
 //   recovery pointer) as people fixed their own overwritten work. Fixed by
-//   marking resolved_at/resolved_by (migration 0047) instead, and filtering
+//   marking resolved_at/resolved_by (migration 0049) instead, and filtering
 //   "active" reads on resolved_at IS NULL.
+//
+//   REVIEW FIX 1 (re-detection invisibility) — the upsert never reset
+//   resolved_at/resolved_by, so a verse that was resolved and then
+//   genuinely conflicted AGAIN stayed invisible to every "active" reader
+//   forever.
+//
+//   REVIEW FIX 3 (lost-adoption cleanup destroying audit rows) —
+//   deleteLostAdoptionConflicts used to hard-delete unconditionally; scoped
+//   to detected_at now, so it can't destroy a row's prior (possibly
+//   resolved) history just because a LATER, separate attempt on the same
+//   verse lost its CAS race.
+//
+//   REVIEW FIX 6 (dismissal stickiness) — the alert was unconditionally
+//   deleted-then-reinserted every run, so a dismissed alert reappeared the
+//   very next run even with nothing new to report.
 //
 // Run from api/:
 //   node --experimental-strip-types --no-warnings src/verseMergeConflicts.test.mjs
@@ -28,8 +44,14 @@ import {
   EDITOR_LOOKUP_CHUNK,
   editLogKey,
   groupOverwrittenVersesByEditor,
+  planSystemAlertWrites,
 } from "./verseMergeEditorAlerts.ts";
-import { RESOLVE_VERSE_MERGE_CONFLICT_SQL } from "./verseMergeConflictResolve.ts";
+import {
+  DELETE_LOST_ADOPTION_CONFLICT_SQL,
+  RESOLVE_VERSE_MERGE_CONFLICT_SQL,
+  UPSERT_VERSE_MERGE_CONFLICT_SQL,
+  VERSE_PATCH_UPDATE_SQL,
+} from "./verseMergeConflictSql.ts";
 
 let failed = 0;
 function assert(cond, msg) {
@@ -64,6 +86,12 @@ function assert(cond, msg) {
   assert(entry.message.includes("ZEC"), "message names the book");
   assert(entry.message.includes("ULT"), "message names the resource, uppercased");
   assert(entry.message.includes("2 verse(s)"), "message states the count");
+  // REVIEW FIX 4: this fires from both the 05:30 UTC cron AND the
+  // user-triggered POST /:book/reimport route — "nightly" overclaims the
+  // trigger on the latter, the same overclaim the admin message's own
+  // "FIX I" already corrected.
+  assert(!entry.message.includes("nightly"), "does not overclaim a nightly-only trigger");
+  assert(entry.message.includes("Door43's sync"), "says \"sync\", not \"nightly sync\"");
 }
 
 {
@@ -214,6 +242,12 @@ function verseDb() {
     verse INTEGER, action TEXT, reason TEXT, overwritten_version INTEGER, alignment TEXT,
     detected_at INTEGER, resolved_at INTEGER, resolved_by INTEGER
   )`);
+  // Required for UPSERT_VERSE_MERGE_CONFLICT_SQL's `ON CONFLICT (book,
+  // resource, chapter, verse)` clause to have anything to conflict against —
+  // mirrors migration 0044's real verse_merge_conflicts_unique index.
+  d.exec(
+    `CREATE UNIQUE INDEX verse_merge_conflicts_unique ON verse_merge_conflicts (book, resource, chapter, verse)`,
+  );
   d.exec(`CREATE TABLE verses (
     book TEXT, chapter INTEGER, verse INTEGER, bible_version TEXT, version INTEGER,
     content_json TEXT, plain_text TEXT, updated_at INTEGER, updated_by INTEGER
@@ -221,20 +255,18 @@ function verseDb() {
   return d;
 }
 
-// Runs the verses UPDATE first (so changes() reflects it), then the REAL
-// resolve-clause SQL gated on `changes() > 0 AND resolved_at IS NULL`. The
-// real batch has an edit_log INSERT in between (also gated on
-// `changes() > 0` from the verses UPDATE) that this omits — safe to omit
-// because that INSERT's own row count exactly mirrors the verses UPDATE's
-// (`SELECT ... WHERE changes() > 0`, 0-or-1 either way), so `changes()` as
-// seen by the resolve statement is identical whether or not the INSERT ran.
-function saveVerse(d, { book, resource, chapter, verse, matchVersion, userId, now }) {
+// Runs the REAL verses.ts PATCH-route UPDATE (VERSE_PATCH_UPDATE_SQL) first
+// (so changes() reflects it), then the REAL resolve-clause SQL gated on
+// `changes() > 0 AND resolved_at IS NULL`. The real batch has an edit_log
+// INSERT in between (also gated on `changes() > 0` from the verses UPDATE)
+// that this omits — safe to omit because that INSERT's own row count exactly
+// mirrors the verses UPDATE's (`SELECT ... WHERE changes() > 0`, 0-or-1
+// either way), so `changes()` as seen by the resolve statement is identical
+// whether or not the INSERT ran.
+function saveVerse(d, { book, resource, chapter, verse, matchVersion, userId, now, contentJson = "{}" }) {
   const verseRes = d
-    .prepare(
-      `UPDATE verses SET version = version + 1, updated_at = ?1, updated_by = ?2
-        WHERE book = ?3 AND chapter = ?4 AND verse = ?5 AND bible_version = ?6 AND version = ?7`,
-    )
-    .run(now, userId, book, chapter, verse, resource.toUpperCase(), matchVersion);
+    .prepare(VERSE_PATCH_UPDATE_SQL)
+    .run(contentJson, null, now, userId, book, chapter, verse, resource.toUpperCase(), matchVersion);
   const resolveRes = d
     .prepare(RESOLVE_VERSE_MERGE_CONFLICT_SQL)
     .run(now, userId, book, resource, chapter, verse);
@@ -308,23 +340,224 @@ function saveVerse(d, { book, resource, chapter, verse, matchVersion, userId, no
   assert(row.resolved_at === 200 && row.resolved_by === 30, "first resolver's stamp is preserved, not overwritten");
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// Part 4: REVIEW FIX 1 — re-detection invisibility. The upsert
+// (UPSERT_VERSE_MERGE_CONFLICT_SQL) must reset resolved_at/resolved_by when
+// recording a fresh conflict, or a resolved-then-reconflicted verse stays
+// permanently invisible to every "active" reader.
+// ─────────────────────────────────────────────────────────────────────────
+
+function upsertConflict(d, { book, resource, chapter, verse, action, reason, overwrittenVersion, now }) {
+  return d
+    .prepare(UPSERT_VERSE_MERGE_CONFLICT_SQL)
+    .run(book, resource, chapter, verse, action, reason, overwrittenVersion, null, now);
+}
+
 {
-  // deleteLostAdoptionConflicts stays a real DELETE — nothing was overwritten
-  // for a CAS write that never landed, so there is nothing to mark resolved.
-  // This just documents the boundary: the resolve-not-delete fix is scoped
-  // to the human re-save path only.
   const d = verseDb();
-  d.prepare(
-    `INSERT INTO verse_merge_conflicts (book, resource, chapter, verse, action, reason, overwritten_version, detected_at)
-     VALUES ('ZEC', 'ult', 1, 2, 'adopt_conflict', 'both_changed', 2, 100)`,
-  ).run();
-  d.prepare(
-    `DELETE FROM verse_merge_conflicts
-      WHERE book = 'ZEC' AND resource = 'ult' AND chapter = 1 AND verse = 2
-        AND action IN ('adopt', 'adopt_conflict')`,
-  ).run();
-  const row = d.prepare(`SELECT * FROM verse_merge_conflicts WHERE book = 'ZEC' AND chapter = 1 AND verse = 2`).get();
-  assert(!row, "lost-adoption cleanup still deletes — that path never overwrote anything to resolve");
+  // Night 1: a conflict is detected and recorded.
+  upsertConflict(d, {
+    book: "ZEC", resource: "ult", chapter: 3, verse: 4,
+    action: "adopt_conflict", reason: "both_changed", overwrittenVersion: 2, now: 100,
+  });
+  // A human resolves it (mirrors verses.ts's PATCH route).
+  d.prepare(RESOLVE_VERSE_MERGE_CONFLICT_SQL).run(150, 30, "ZEC", "ult", 3, 4);
+  {
+    const row = d.prepare(`SELECT * FROM verse_merge_conflicts WHERE book='ZEC' AND chapter=3 AND verse=4`).get();
+    assert(row.resolved_at === 150, "sanity: resolved before the re-detection");
+  }
+
+  // Night 30: a GENUINELY NEW, distinct conflict is detected on the SAME
+  // verse. Before this fix, the DO UPDATE never touched resolved_at, so this
+  // row would stay resolved_at=150 forever — invisible to both the banner
+  // query and GET /api/verse-merge-conflicts/:book, which both filter
+  // `resolved_at IS NULL`.
+  upsertConflict(d, {
+    book: "ZEC", resource: "ult", chapter: 3, verse: 4,
+    action: "adopt_conflict", reason: "both_changed", overwrittenVersion: 9, now: 5000,
+  });
+  const row = d.prepare(`SELECT * FROM verse_merge_conflicts WHERE book='ZEC' AND chapter=3 AND verse=4`).get();
+  assert(row.resolved_at === null, "re-detected conflict is ACTIVE again — resolved_at reset to NULL");
+  assert(row.resolved_by === null, "resolved_by reset alongside resolved_at");
+  const activeCount = d
+    .prepare(`SELECT COUNT(*) c FROM verse_merge_conflicts WHERE book='ZEC' AND resolved_at IS NULL`)
+    .get().c;
+  assert(activeCount === 1, "visible again to the same query the banner and GET route use");
+
+  // Documented, deliberately NOT fixed here (see UPSERT_VERSE_MERGE_CONFLICT_SQL's
+  // "KNOWN NARROWER FOLLOW-ON" comment): the pre-existing "keep the EARLIEST
+  // pointer" COALESCE means overwritten_version still shows the OLD (v2)
+  // pointer from the resolved episode, not night 30's real v9 overwrite.
+  // This assertion pins that DOCUMENTED behavior so a future change to the
+  // CASE logic is a deliberate decision, not a silent side effect.
+  assert(row.overwritten_version === 2, "documented limitation: overwritten_version still shows the OLD resolved pointer (v2), not v9");
+}
+
+{
+  // A verse that was NEVER resolved just continues normally — resolved_at
+  // stays NULL throughout (the common, everyday case), unaffected by the
+  // unconditional reset (it's a no-op when already NULL).
+  const d = verseDb();
+  upsertConflict(d, {
+    book: "HOS", resource: "ust", chapter: 2, verse: 1,
+    action: "keep_alignment_refused", reason: "alignment_shrink", overwrittenVersion: null, now: 100,
+  });
+  upsertConflict(d, {
+    book: "HOS", resource: "ust", chapter: 2, verse: 1,
+    action: "keep_alignment_refused", reason: "alignment_shrink", overwrittenVersion: null, now: 200,
+  });
+  const row = d.prepare(`SELECT * FROM verse_merge_conflicts WHERE book='HOS' AND chapter=2 AND verse=1`).get();
+  assert(row.resolved_at === null, "never-resolved row: reset is a no-op, stays active");
+  assert(row.detected_at === 100, "detected_at preserved across a still-unresolved re-detection (unchanged behavior)");
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Part 5: REVIEW FIX 3 — lost-adoption cleanup must not destroy a row's
+// prior history just because a LATER, unrelated CAS attempt on the same
+// verse lost its race. DELETE_LOST_ADOPTION_CONFLICT_SQL is scoped to
+// `detected_at = ?5 AND resolved_at IS NULL` for exactly this reason.
+// ─────────────────────────────────────────────────────────────────────────
+
+{
+  // Case A (the case this cleanup exists for): a BRAND NEW row this run,
+  // whose speculative adopt attempt then loses its CAS race. detected_at
+  // was set to THIS run's `now` on insert, so it matches and is deleted —
+  // identical to the pre-fix behavior for a genuinely fresh row.
+  const d = verseDb();
+  const now = 9999;
+  upsertConflict(d, {
+    book: "ZEC", resource: "ult", chapter: 5, verse: 5,
+    action: "adopt_conflict", reason: "both_changed", overwrittenVersion: 3, now,
+  });
+  d.prepare(DELETE_LOST_ADOPTION_CONFLICT_SQL).run("ZEC", "ult", 5, 5, now);
+  const row = d.prepare(`SELECT * FROM verse_merge_conflicts WHERE book='ZEC' AND chapter=5 AND verse=5`).get();
+  assert(!row, "brand-new-this-run speculative row: still deleted when its CAS is lost (matches old behavior)");
+}
+
+{
+  // Case B (the bug this fix closes): a row RESOLVED on an earlier night —
+  // real audit history, a real resolved_by and overwritten_version — gets
+  // speculatively touched by THIS run's upsert (reactivating it per Part 4),
+  // and THIS run's separate adopt attempt then loses its CAS race. The old
+  // unconditional DELETE would destroy the row outright, erasing the OLD
+  // resolved history for a reason that has nothing to do with it.
+  const d = verseDb();
+  upsertConflict(d, {
+    book: "ZEC", resource: "ult", chapter: 6, verse: 1,
+    action: "adopt_conflict", reason: "both_changed", overwrittenVersion: 2, now: 100,
+  });
+  d.prepare(RESOLVE_VERSE_MERGE_CONFLICT_SQL).run(150, 30, "ZEC", "ult", 6, 1);
+  // Night 30: reactivated by a fresh (different) conflict — detected_at
+  // stays 100 (unchanged; see Part 4's doc comment), only resolved_at/by
+  // reset.
+  const tonight = 5000;
+  upsertConflict(d, {
+    book: "ZEC", resource: "ult", chapter: 6, verse: 1,
+    action: "adopt_conflict", reason: "both_changed", overwrittenVersion: 9, now: tonight,
+  });
+  // Tonight's separate CAS attempt loses its race.
+  d.prepare(DELETE_LOST_ADOPTION_CONFLICT_SQL).run("ZEC", "ult", 6, 1, tonight);
+  const row = d.prepare(`SELECT * FROM verse_merge_conflicts WHERE book='ZEC' AND chapter=6 AND verse=1`).get();
+  assert(!!row, "row SURVIVES — old resolved history is not destroyed by tonight's unrelated lost race");
+  // NOTE: resolved_by is correctly NULL here already — Part 4's reactivating
+  // upsert (which ran BEFORE this delete, as it does in the real 6b-then-7b
+  // ordering) already reset it to NULL, and that reset is the FIX, not a
+  // side effect to guard against. What THIS test protects is the row's
+  // continued EXISTENCE and its overwritten_version pointer, which the old
+  // unconditional DELETE would have destroyed outright.
+  assert(row.overwritten_version === 2, "the surviving row still carries its (documented, pre-existing) pointer, not erased to NULL");
+}
+
+{
+  // Case C: a row still-active (never resolved) from a prior night, re-hit
+  // by a fresh event this run whose CAS attempt loses. detected_at is
+  // preserved from the ORIGINAL detection (a much earlier timestamp), so it
+  // does not match tonight's `now` either — the row survives, same
+  // protection as Case B.
+  const d = verseDb();
+  upsertConflict(d, {
+    book: "MIC", resource: "ult", chapter: 1, verse: 1,
+    action: "adopt_conflict", reason: "both_changed", overwrittenVersion: 4, now: 100,
+  });
+  const tonight = 5000;
+  upsertConflict(d, {
+    book: "MIC", resource: "ult", chapter: 1, verse: 1,
+    action: "adopt_conflict", reason: "both_changed", overwrittenVersion: 4, now: tonight,
+  });
+  d.prepare(DELETE_LOST_ADOPTION_CONFLICT_SQL).run("MIC", "ult", 1, 1, tonight);
+  const row = d.prepare(`SELECT * FROM verse_merge_conflicts WHERE book='MIC' AND chapter=1 AND verse=1`).get();
+  assert(!!row, "still-active row from a prior night survives an unrelated lost race tonight too");
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Part 6: REVIEW FIX 6 — dismissal stickiness. planSystemAlertWrites is
+// pure, no D1 needed.
+// ─────────────────────────────────────────────────────────────────────────
+
+{
+  // Nothing existed before: everything in `desired` must be inserted.
+  const desired = new Map([["deferredreward", "admin message"], ["bethoakes", "editor message"]]);
+  const { toDelete, toInsert } = planSystemAlertWrites(new Map(), desired);
+  assert(toDelete.length === 0, "nothing to delete on a clean slate");
+  assert(toInsert.length === 2, "both desired alerts get inserted");
+}
+
+{
+  // The exact bug: a dismissed alert with IDENTICAL content must NOT
+  // reappear just because this run re-derived the same conclusion again.
+  const existing = new Map([["deferredreward", { message: "same message", dismissedAt: 12345 }]]);
+  const desired = new Map([["deferredreward", "same message"]]);
+  const { toDelete, toInsert } = planSystemAlertWrites(existing, desired);
+  assert(toInsert.length === 0, "sticky: identical dismissed content is not resurrected");
+  assert(toDelete.length === 0, "a dismissed row is never deleted either (stays as history)");
+}
+
+{
+  // Content genuinely CHANGED since the dismissal (e.g. more verses now
+  // affected) — this is new information the user hasn't seen, so it must
+  // surface again despite the earlier dismissal.
+  const existing = new Map([["deferredreward", { message: "1 verse affected", dismissedAt: 12345 }]]);
+  const desired = new Map([["deferredreward", "3 verses affected"]]);
+  const { toDelete, toInsert } = planSystemAlertWrites(existing, desired);
+  assert(toInsert.length === 1 && toInsert[0].message === "3 verses affected", "changed content re-surfaces");
+  assert(toDelete.length === 0, "the OLD dismissed row is left alone, not deleted (it's history, not being replaced)");
+}
+
+{
+  // An UNDISMISSED alert with identical content: no-op, avoid pointless
+  // churn (no fresh created_at, no wasted write).
+  const existing = new Map([["deferredreward", { message: "same message", dismissedAt: null }]]);
+  const desired = new Map([["deferredreward", "same message"]]);
+  const { toDelete, toInsert } = planSystemAlertWrites(existing, desired);
+  assert(toDelete.length === 0 && toInsert.length === 0, "identical undismissed content: touch nothing");
+}
+
+{
+  // An UNDISMISSED alert whose content changed: replace it (delete then
+  // insert) — this is the ordinary "conditions changed" refresh path.
+  const existing = new Map([["deferredreward", { message: "1 verse affected", dismissedAt: null }]]);
+  const desired = new Map([["deferredreward", "2 verses affected"]]);
+  const { toDelete, toInsert } = planSystemAlertWrites(existing, desired);
+  assert(toDelete.length === 1 && toDelete[0] === "deferredreward", "stale undismissed content is cleared");
+  assert(toInsert.length === 1 && toInsert[0].message === "2 verses affected", "fresh content is inserted");
+}
+
+{
+  // A username no longer in `desired` at all (their conflicts all resolved
+  // or converged) with an UNDISMISSED row: must be cleared, not left stale.
+  const existing = new Map([["bethoakes", { message: "old message", dismissedAt: null }]]);
+  const { toDelete, toInsert } = planSystemAlertWrites(existing, new Map());
+  assert(toDelete.length === 1 && toDelete[0] === "bethoakes", "stale undismissed alert for a resolved user is cleared");
+  assert(toInsert.length === 0, "nothing to insert — they have no active conflicts anymore");
+}
+
+{
+  // Same, but the row was already DISMISSED: leave it as historical record,
+  // don't touch it either way.
+  const existing = new Map([["bethoakes", { message: "old message", dismissedAt: 999 }]]);
+  const { toDelete, toInsert } = planSystemAlertWrites(existing, new Map());
+  assert(toDelete.length === 0, "a dismissed, now-irrelevant alert is left alone as history");
+  assert(toInsert.length === 0, "nothing to insert for a dismissed, now-irrelevant alert");
 }
 
 if (failed) {

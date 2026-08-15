@@ -9,9 +9,12 @@
 -- speculative row whose write never actually landed) is unaffected — that
 -- path stays a real DELETE, because nothing was overwritten there at all.
 --
--- NOTE for anyone merging a sibling PR: this repo runs many parallel
--- worktrees, so another branch may also claim migration number 0047 — check
--- `wrangler d1 migrations list --remote` and renumber on conflict.
+-- Numbering note (2026-08-14): three sibling branches claimed adjacent
+-- migration numbers off the same main tip (0046) — PR #444
+-- (0047_tq_twl_review_flag.sql), the master-confirmed-watermark fix sibling
+-- (0048), and this one, renumbered to 0049 to land after both. Before
+-- merging, confirm the actual order applied with
+-- `wrangler d1 migrations list --remote` in case that ordering shifts.
 ALTER TABLE verse_merge_conflicts ADD COLUMN resolved_at INTEGER;
 ALTER TABLE verse_merge_conflicts ADD COLUMN resolved_by INTEGER REFERENCES users(id);
 

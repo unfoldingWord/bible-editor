@@ -1934,7 +1934,7 @@ async function applyVerseRows(
       overwrittenVersion: mc.overwrittenVersion,
       alignment: mc.alignment,
     }));
-    const recorded = await recordVerseMergeConflicts(env, book, resource, allConflictRows);
+    const recorded = await recordVerseMergeConflicts(env, book, resource, allConflictRows, now);
     if (!recorded) recordFailed = true;
   }
 
@@ -2123,7 +2123,11 @@ async function applyVerseRows(
     .filter((mc) => mc.adopted && !adoptionsApplied.has(`${mc.chapter}:${mc.verse}`))
     .map((mc) => ({ chapter: mc.chapter, verse: mc.verse }));
   if (lostAdoptionRefs.length > 0) {
-    await deleteLostAdoptionConflicts(env, book, resource, lostAdoptionRefs);
+    // Same `now` passed to step 6b's recordVerseMergeConflicts call above —
+    // required for deleteLostAdoptionConflicts's detected_at-based scoping to
+    // correctly identify only THIS run's own speculative rows (see that
+    // function's doc comment).
+    await deleteLostAdoptionConflicts(env, book, resource, lostAdoptionRefs, now);
   }
 
   // 8. Tally this run's landed merge conflicts. FIX 2: excludes a clean

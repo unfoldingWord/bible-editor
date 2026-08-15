@@ -20,7 +20,7 @@ import {
 } from "./alignmentDelta.ts";
 import { buildVerseHistory, type VerseHistoryLogRow } from "./verseHistory.ts";
 import { lanesToReopenOnVerseEdit, reopenLaneChecks } from "./laneReopen.ts";
-import { RESOLVE_VERSE_MERGE_CONFLICT_SQL } from "./verseMergeConflictResolve.ts";
+import { RESOLVE_VERSE_MERGE_CONFLICT_SQL, VERSE_PATCH_UPDATE_SQL } from "./verseMergeConflictSql.ts";
 
 // Verse content can carry malformed/missing `\w` occurrence data — colliding
 // `(text, occurrence)` pairs from a bad import or AI alignment (ULT/UST), or no
@@ -416,13 +416,7 @@ verses.patch("/:book/:chapter/:verse/:bibleVersion", requireEditor, async (c) =>
   // callers always send it).
   const [updateRes] = await c.env.DB.batch([
     c.env.DB
-      .prepare(
-        `UPDATE verses
-           SET content_json = ?1, plain_text = COALESCE(?2, plain_text), version = version + 1,
-               updated_at = ?3, updated_by = ?4
-         WHERE book = ?5 AND chapter = ?6 AND verse = ?7 AND bible_version = ?8
-           AND version = ?9`,
-      )
+      .prepare(VERSE_PATCH_UPDATE_SQL)
       .bind(
         JSON.stringify(parsed.data.content),
         parsed.data.plain_text ?? null,
@@ -466,7 +460,7 @@ verses.patch("/:book/:chapter/:verse/:bibleVersion", requireEditor, async (c) =>
     // overwritten_version recovery pointer and the whole audit trail — the
     // instant a human re-saved their own overwritten work. Measured on prod
     // 2026-08-14: at least 14 rows already gone this way. Marking instead of
-    // deleting (migration 0047) keeps the row (and the pointer) for the
+    // deleting (migration 0049) keeps the row (and the pointer) for the
     // audit trail while still removing it from every "active conflicts" view
     // (this file's GET route, the banner query) via `resolved_at IS NULL`.
     //

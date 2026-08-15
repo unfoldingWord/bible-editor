@@ -83,12 +83,67 @@ export function groupOverwrittenVersesByEditor(
   }
   const out = new Map<string, { refs: string[]; message: string }>();
   for (const [username, refs] of byUser) {
+    // "Door43's sync", not "Door43's nightly sync": this fan-out fires from
+    // raiseVerseMergeConflictAlert, which runs on both the 05:30 UTC cron AND
+    // the user-triggered POST /:book/reimport route — the admin message in
+    // verseMergeConflicts.ts already made this exact correction (its own
+    // "FIX I"), and this message must not reintroduce the same overclaim.
     const message =
-      `Door43's nightly sync overwrote your edit${refs.length === 1 ? "" : "s"} in ${book} ` +
+      `Door43's sync overwrote your edit${refs.length === 1 ? "" : "s"} in ${book} ` +
       `${resource.toUpperCase()} at ${refs.length} verse(s) with Door43's version: ${refs.join(", ")}. Your ` +
       `replaced text is still recoverable from each verse's version history, at the version number given ` +
       `after @v.`;
     out.set(username, { refs, message });
   }
   return out;
+}
+
+// ---------------------------------------------------------------------------
+// Dismissal stickiness (2026-08-14 six-angle review fix). raiseVerseMergeConflictAlert
+// re-derives its `desired` state (the admin message plus each affected
+// editor's message) FRESH from verse_merge_conflicts on every call — and it
+// is called on EVERY reimport run for a (book, resource), not just when
+// something changed tonight. Without this, a user who dismisses the alert
+// sees it reappear the very next run, because the old code unconditionally
+// deleted-then-reinserted every message regardless of whether an identical,
+// already-dismissed copy already existed.
+//
+// Pure so it's unit-testable without D1: given the CURRENT system_alerts
+// state for this exact `source` (one row per username, if any) and the
+// FRESH content this run computed, decide what actually needs to change.
+//   - A username with a DISMISSED row whose message is BYTE-IDENTICAL to the
+//     fresh content: leave it alone entirely (sticky — the user has seen and
+//     dismissed exactly this information; don't resurrect it).
+//   - A username with an UNDISMISSED row whose message is already identical:
+//     also leave it alone (avoids pointless churn / a fresh `created_at`
+//     with no new information).
+//   - Otherwise (no existing row, or existing content differs): delete any
+//     existing UNDISMISSED row for that username (a dismissed one is never
+//     touched — deleting it would silently un-dismiss it) and insert the
+//     fresh message.
+//   - A username that HAD a row for this source but is no longer in
+//     `desired` at all (their conflicts all resolved or converged) has their
+//     stale UNDISMISSED row cleared (a dismissed one is left as historical
+//     record — nothing to insert in its place).
+export interface ExistingAlertState {
+  message: string;
+  dismissedAt: number | null;
+}
+
+export function planSystemAlertWrites(
+  existing: Map<string, ExistingAlertState>,
+  desired: Map<string, string>,
+): { toDelete: string[]; toInsert: Array<{ username: string; message: string }> } {
+  const toDelete: string[] = [];
+  const toInsert: Array<{ username: string; message: string }> = [];
+  for (const [username, message] of desired) {
+    const ex = existing.get(username);
+    if (ex && ex.message === message) continue; // sticky/no-op — see header comment
+    if (ex && ex.dismissedAt == null) toDelete.push(username);
+    toInsert.push({ username, message });
+  }
+  for (const [username, ex] of existing) {
+    if (!desired.has(username) && ex.dismissedAt == null) toDelete.push(username);
+  }
+  return { toDelete, toInsert };
 }
