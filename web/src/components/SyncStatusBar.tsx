@@ -88,6 +88,18 @@ export function SyncStatusBar({ onNavigate }: Props = {}) {
   // explicit confirm so it can't be a one-misclick data loss.
   const [confirmDiscardAll, setConfirmDiscardAll] = useState(false);
 
+  // Conflicts whose 409 body carried no current row/version: resolve can't
+  // re-arm them, and dropping deletes the edit — same one-misclick data-loss
+  // stakes as "discard all", so they get the same confirm gate. Snapshot of
+  // the ops at resolve-click time; discard by id is safe if one has since
+  // resolved elsewhere.
+  const [unresolvableOps, setUnresolvableOps] = useState<OutboxOp[]>([]);
+  const [copiedUnresolvable, setCopiedUnresolvable] = useState(false);
+  const closeUnresolvable = () => {
+    setUnresolvableOps([]);
+    setCopiedUnresolvable(false);
+  };
+
   // Anchor for the "N unsaved" jump menu (only used when onNavigate is wired).
   const [draftMenuEl, setDraftMenuEl] = useState<null | HTMLElement>(null);
 
@@ -114,18 +126,49 @@ export function SyncStatusBar({ onNavigate }: Props = {}) {
   const effectivelyOffline = !online || staleProgress;
 
   const resolveAllConflicts = async () => {
+    const unresolvable: OutboxOp[] = [];
     for (const op of conflicts) {
       // The 409 response includes the server's current row in op.conflictCurrent —
       // re-queue against its version so the next dispatch sails through. The
       // user's local patch overwrites the upstream change (last-edit-wins).
-      // If the server didn't return a current row, drop the op rather than
-      // strand it forever.
+      // If the server didn't return a current row we can't re-arm, and dropping
+      // deletes the user's edit — never do that silently; route it through the
+      // confirm dialog below (with copy-to-clipboard) instead.
       if (isFreshRow(op.conflictCurrent)) {
         await outbox.resolveConflict(op.id, op.conflictCurrent.version);
       } else {
-        await outbox.drop(op.id);
+        unresolvable.push(op);
       }
     }
+    if (unresolvable.length > 0) setUnresolvableOps(unresolvable);
+  };
+
+  const copyUnresolvable = async () => {
+    const text = unresolvableOps
+      .map((op) => `${formatTarget(op.target)}\n${JSON.stringify(op.patch, null, 2)}`)
+      .join("\n\n");
+    // This is the user's last copy of the edit — never flip to "copied" unless
+    // the write actually landed. Clipboard API needs a focused document; fall
+    // back to the textarea trick when it rejects.
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopiedUnresolvable(true);
+    } catch {
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      ta.style.position = "fixed";
+      ta.style.opacity = "0";
+      document.body.appendChild(ta);
+      ta.select();
+      const ok = document.execCommand("copy");
+      ta.remove();
+      if (ok) setCopiedUnresolvable(true);
+    }
+  };
+
+  const discardUnresolvable = async () => {
+    for (const op of unresolvableOps) await outbox.drop(op.id);
+    closeUnresolvable();
   };
 
   // Priority: conflicts > failed > offline > saving > saved.
@@ -452,6 +495,39 @@ export function SyncStatusBar({ onNavigate }: Props = {}) {
             }}
           >
             discard all
+          </Button>
+        </DialogActions>
+      </Dialog>
+      <Dialog open={unresolvableOps.length > 0} onClose={closeUnresolvable}>
+        <DialogTitle>
+          Discard {unresolvableOps.length} unresolvable conflict
+          {unresolvableOps.length === 1 ? "" : "s"}?
+        </DialogTitle>
+        <DialogContent>
+          <DialogContentText>
+            {unresolvableOps.length === 1
+              ? "The server did not send back its current version for this edit, so it cannot be retried automatically. Discarding deletes it from this device permanently — copy it first if you want to keep the text."
+              : "The server did not send back its current version for these edits, so they cannot be retried automatically. Discarding deletes them from this device permanently — copy them first if you want to keep the text."}
+          </DialogContentText>
+          <Stack spacing={0.25} sx={{ mt: 1 }}>
+            {unresolvableOps.map((op) => (
+              <Typography
+                key={op.id}
+                variant="caption"
+                sx={{ fontFamily: "monospace", display: "block" }}
+              >
+                {formatTarget(op.target)}
+              </Typography>
+            ))}
+          </Stack>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => void copyUnresolvable()}>
+            {copiedUnresolvable ? "copied" : "copy edits"}
+          </Button>
+          <Button onClick={closeUnresolvable}>cancel</Button>
+          <Button color="error" variant="contained" onClick={() => void discardUnresolvable()}>
+            discard
           </Button>
         </DialogActions>
       </Dialog>
