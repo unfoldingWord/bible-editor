@@ -55,8 +55,49 @@ function formatOpLabel(op: OutboxOp): string {
 // nothing, so a correct refusal read as data loss). A retryable failure has no
 // server explanation to give, so it says what is actually happening instead.
 function failureLine(op: OutboxOp): string {
-  if (willRetryOnItsOwn(op.lastError)) return "still trying — the server is not responding";
-  return explainRefusal(op.lastErrorReason) ?? "The server would not accept this change.";
+  // The retry cap is consumed only by 408/425/429/5xx — the server answering,
+  // just not with a success — so "could not be reached" would be wrong here.
+  if (willRetryOnItsOwn(op.lastError)) return "not saved yet — several attempts did not complete";
+  const explained = explainRefusal(op.lastErrorReason);
+  if (explained) return explained;
+  // No parseable body (an HTML error page, an empty body, or the client-side
+  // bodyless read-only ApiError). Keep the bare status visible rather than
+  // replacing it with a generic sentence — `http 403` is where a support
+  // conversation starts, and dropping it is what issue #370 was about.
+  return op.lastError
+    ? `The server would not accept this change (${op.lastError}).`
+    : "The server would not accept this change.";
+}
+
+// Clipboard write with the textarea fallback (the Clipboard API needs a
+// focused document and rejects otherwise). Returns whether the copy actually
+// landed — callers must not flip a button to "copied" on a write that failed,
+// since this is the user's last copy of the edit.
+async function copyText(text: string): Promise<boolean> {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch {
+    try {
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      ta.style.position = "fixed";
+      ta.style.opacity = "0";
+      document.body.appendChild(ta);
+      ta.select();
+      const ok = document.execCommand("copy");
+      ta.remove();
+      return ok;
+    } catch {
+      return false;
+    }
+  }
+}
+
+// The text a discard dialog hands back to the user: what the edit targeted,
+// plus the payload itself.
+function opClipboardText(op: OutboxOp): string {
+  return `${formatOpLabel(op)}\n${JSON.stringify(op.patch, null, 2)}`;
 }
 
 function formatDraftMeta(m: DraftMeta): string {
@@ -111,6 +152,17 @@ export function SyncStatusBar({ onNavigate }: Props = {}) {
   // "Discard all" permanently deletes queued edits — gate it behind an
   // explicit confirm so it can't be a one-misclick data loss.
   const [confirmDiscardAll, setConfirmDiscardAll] = useState(false);
+  const [copiedDiscardAll, setCopiedDiscardAll] = useState(false);
+  // The dialog's open condition also depends on there being something to
+  // discard, so an empty refused list hides it — but left the flag raised,
+  // and the *next* refusal would then pop the confirm with no click behind
+  // it. Lower the flag when the list empties (retry / cross-tab revival).
+  useEffect(() => {
+    if (refused.length === 0) {
+      setConfirmDiscardAll(false);
+      setCopiedDiscardAll(false);
+    }
+  }, [refused.length]);
 
   // Single-op "discard this edit" confirm — same one-misclick protection as
   // "discard all". Snapshot of the op at click time; the dialog auto-closes
@@ -118,9 +170,12 @@ export function SyncStatusBar({ onNavigate }: Props = {}) {
   const [confirmDropOp, setConfirmDropOp] = useState<OutboxOp | null>(null);
   const [copiedDropOp, setCopiedDropOp] = useState(false);
   const closeDropOp = () => { setConfirmDropOp(null); setCopiedDropOp(false); };
-  const liveDropOp = confirmDropOp && failed.some((f) => f.id === confirmDropOp.id)
-    ? confirmDropOp
-    : null;
+  // Resolve against the LIVE failed list rather than reusing the click-time
+  // snapshot: a cross-tab retry can change why the op is failing, and the
+  // dialog's copy now depends on that (refused vs still-trying). Still null
+  // when the op leaves the failed list, so the auto-close below is unchanged,
+  // and the drop itself remains guarded by onlyIfStatus at click time.
+  const liveDropOp = (confirmDropOp && failed.find((f) => f.id === confirmDropOp.id)) || null;
   useEffect(() => {
     if (confirmDropOp && !liveDropOp) setConfirmDropOp(null);
   }, [confirmDropOp, liveDropOp]);
@@ -199,31 +254,10 @@ export function SyncStatusBar({ onNavigate }: Props = {}) {
   };
 
   const copyUnresolvable = async () => {
-    const text = liveUnresolvable
-      .map((op) => `${formatOpLabel(op)}\n${JSON.stringify(op.patch, null, 2)}`)
-      .join("\n\n");
+    const text = liveUnresolvable.map(opClipboardText).join("\n\n");
     // This is the user's last copy of the edit — never flip to "copied" unless
-    // the write actually landed. Clipboard API needs a focused document; fall
-    // back to the textarea trick when it rejects.
-    try {
-      await navigator.clipboard.writeText(text);
-      setCopiedUnresolvable(true);
-    } catch {
-      try {
-        const ta = document.createElement("textarea");
-        ta.value = text;
-        ta.style.position = "fixed";
-        ta.style.opacity = "0";
-        document.body.appendChild(ta);
-        ta.select();
-        const ok = document.execCommand("copy");
-        ta.remove();
-        if (ok) setCopiedUnresolvable(true);
-      } catch {
-        /* both copy paths failed — keep the label "copy edits" rather than
-           claim a copy that never landed */
-      }
-    }
+    // the write actually landed.
+    if (await copyText(text)) setCopiedUnresolvable(true);
   };
 
   const discardUnresolvable = async () => {
@@ -254,36 +288,41 @@ export function SyncStatusBar({ onNavigate }: Props = {}) {
         />
       </Tooltip>
     );
-  } else if (refused.length > 0) {
+  } else if (failed.length > 0) {
+    // Each group gets its OWN chip rather than one chip summing both. A single
+    // count either mislabels (red "4 not saved" when only 1 was refused) or
+    // hides (red "1 refused" while 3 more sit unsaved) — and the panel below
+    // splits them anyway, so the top bar has to agree with it. Amber for the
+    // still-trying group matches the offline chip: transient, not a failure.
     inline = (
-      <Tooltip title="the server refused some changes — see why below; your saved text is unchanged">
-        <Chip
-          icon={<ErrorOutlineIcon />}
-          label={`${failed.length} not saved`}
-          size="small"
-          variant="outlined"
-          color="error"
-        />
-      </Tooltip>
-    );
-  } else if (stalled.length > 0) {
-    // Nothing was refused — these are timed-out retries that revive by
-    // themselves. Same amber as the offline chip: a transient state, not a
-    // failure, so red would overstate it.
-    inline = (
-      <Tooltip title="these changes have not reached the server yet — they keep trying on their own">
-        <Chip
-          icon={<CloudQueueIcon />}
-          label={`${stalled.length} still trying`}
-          size="small"
-          variant="outlined"
-          sx={{
-            color: "#E59D33",
-            borderColor: "#E59D33",
-            "& .MuiChip-icon": { color: "#E59D33" },
-          }}
-        />
-      </Tooltip>
+      <>
+        {refused.length > 0 && (
+          <Tooltip title="the server refused these changes — see why below; your saved text is unchanged">
+            <Chip
+              icon={<ErrorOutlineIcon />}
+              label={`${refused.length} refused`}
+              size="small"
+              variant="outlined"
+              color="error"
+            />
+          </Tooltip>
+        )}
+        {stalled.length > 0 && (
+          <Tooltip title="these changes have not saved yet — they retry when you return to this tab or reconnect">
+            <Chip
+              icon={<CloudQueueIcon />}
+              label={`${stalled.length} not saved yet`}
+              size="small"
+              variant="outlined"
+              sx={{
+                color: "#E59D33",
+                borderColor: "#E59D33",
+                "& .MuiChip-icon": { color: "#E59D33" },
+              }}
+            />
+          </Tooltip>
+        )}
+      </>
     );
   } else if (effectivelyOffline) {
     const offlineLabel = pending > 0
@@ -562,8 +601,13 @@ export function SyncStatusBar({ onNavigate }: Props = {}) {
                 <Typography variant="caption" sx={{ fontWeight: 600, color: "#E59D33" }}>
                   {stalled.length} change{stalled.length === 1 ? "" : "s"} not saved yet
                 </Typography>
+                {/* Says when retrying happens rather than claiming it is
+                    continuous. Revival fires on focus, reconnect, or a session
+                    refresh (see reviveMaxAttemptsFailed) — not on a timer — and
+                    the row's Retry button is the manual route. */}
                 <Typography variant="caption" color="text.secondary" sx={{ fontSize: 10, lineHeight: 1.3 }}>
-                  The server could not be reached. These keep trying on their own.
+                  The server kept failing to save these. They try again when you come back to
+                  this tab or reconnect — or use Retry.
                 </Typography>
                 {stalled.map(renderFailedOp)}
               </Stack>
@@ -578,11 +622,24 @@ export function SyncStatusBar({ onNavigate }: Props = {}) {
         title={`Discard ${refused.length} refused change${refused.length === 1 ? "" : "s"}?`}
         description={`The server did not accept ${refused.length === 1 ? "this change" : "these changes"}, so ${refused.length === 1 ? "the verse or note it belongs to" : "the verses and notes they belong to"} still hold the text they had before. Discarding removes only the unsaved change from this device — copy it first if you want to keep it.`}
         confirmLabel="discard all"
-        onCancel={() => setConfirmDiscardAll(false)}
+        onCancel={() => { setConfirmDiscardAll(false); setCopiedDiscardAll(false); }}
         onConfirm={async () => {
           for (const op of refused) await outbox.drop(op.id, { onlyIfStatus: "failed" });
           setConfirmDiscardAll(false);
+          setCopiedDiscardAll(false);
         }}
+        // The copy tells the user to copy first, so it has to be possible here
+        // too — the single-op and unresolvable-conflict dialogs both offer it.
+        extraAction={
+          <Button
+            onClick={async () => {
+              const text = refused.map(opClipboardText).join("\n\n");
+              if (await copyText(text)) setCopiedDiscardAll(true);
+            }}
+          >
+            {copiedDiscardAll ? "copied" : "copy edits"}
+          </Button>
+        }
         sx={{ zIndex: (t) => t.zIndex.snackbar + 1 }}
       />
       {/* Auto-closes when every unresolvable op leaves conflict status. */}
@@ -618,7 +675,7 @@ export function SyncStatusBar({ onNavigate }: Props = {}) {
         title="Discard this change?"
         description={
           liveDropOp && willRetryOnItsOwn(liveDropOp.lastError)
-            ? "This change has not reached the server yet and is still trying. Discarding removes it from this device — copy it first if you want to keep it."
+            ? "This change has not saved yet — the server kept failing, and it will try again when you come back to this tab or reconnect. Discarding removes it from this device — copy it first if you want to keep it."
             : "The server did not accept this change, so the verse or note still holds the text it had before. Discarding removes only the unsaved change from this device — copy it first if you want to keep it."
         }
         confirmLabel="discard"
@@ -632,23 +689,7 @@ export function SyncStatusBar({ onNavigate }: Props = {}) {
           <Button
             onClick={async () => {
               if (!liveDropOp) return;
-              const text = `${formatOpLabel(liveDropOp)}\n${JSON.stringify(liveDropOp.patch, null, 2)}`;
-              try {
-                await navigator.clipboard.writeText(text);
-                setCopiedDropOp(true);
-              } catch {
-                try {
-                  const ta = document.createElement("textarea");
-                  ta.value = text;
-                  ta.style.position = "fixed";
-                  ta.style.opacity = "0";
-                  document.body.appendChild(ta);
-                  ta.select();
-                  const ok = document.execCommand("copy");
-                  ta.remove();
-                  if (ok) setCopiedDropOp(true);
-                } catch { /* keep button label as-is */ }
-              }
+              if (await copyText(opClipboardText(liveDropOp))) setCopiedDropOp(true);
             }}
           >
             {copiedDropOp ? "copied" : "copy edit"}

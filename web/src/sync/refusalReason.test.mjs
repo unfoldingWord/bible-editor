@@ -10,6 +10,7 @@
 
 import assert from "node:assert/strict";
 import {
+  MAX_ATTEMPTS_SENTINEL,
   explainRefusal,
   reasonForOp,
   serverRefusalReason,
@@ -89,6 +90,16 @@ check(serverRefusalReason({}) === undefined, "empty body → no reason");
 check(serverRefusalReason({ error: "   " }) === undefined, "whitespace-only code → no reason");
 check(serverRefusalReason({ error: 42 }) === undefined, "non-string code → no reason");
 
+// api/src/rows.ts chapter-0 guard echoes the caller's own unbounded `ref_raw`
+// into `message`. This string is persisted to IndexedDB and rendered in a
+// wrapping panel, so it must be capped rather than allowed to push the rest of
+// the failed list off screen.
+const huge = serverRefusalReason({ error: "invalid_body", message: "x".repeat(5000) });
+check(huge.length === 200, "an unbounded server message is capped at 200 chars");
+check(huge.endsWith("…"), "the capped message is visibly elided");
+const exact200 = serverRefusalReason({ error: "invalid_body", message: "y".repeat(200) });
+check(exact200 === "y".repeat(200), "a message exactly at the cap is left intact");
+
 // --- reasonForOp: what actually lands on the op record ---
 // This is the exact rule drainPass writes op.lastErrorReason from, so these
 // assertions are the "the reason survives to the op record" guarantee minus
@@ -163,6 +174,17 @@ check(explainRefusal("") === undefined, "empty reason → nothing to explain");
 check(
   willRetryOnItsOwn("max_attempts_exceeded") === true,
   "a retry-cap failure is presented as still trying",
+);
+// The sentinel is exported so outbox.ts stamps it and reviveMaxAttemptsFailed
+// filters on this same predicate. If they ever drift, the UI would promise a
+// retry for ops nothing revives — pin the literal here.
+check(
+  MAX_ATTEMPTS_SENTINEL === "max_attempts_exceeded",
+  "the exported sentinel is the literal the outbox stamps",
+);
+check(
+  willRetryOnItsOwn(MAX_ATTEMPTS_SENTINEL) === true,
+  "the predicate and the exported sentinel agree",
 );
 check(willRetryOnItsOwn("http 400") === false, "a refusal is presented as permanent");
 check(

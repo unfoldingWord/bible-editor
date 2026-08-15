@@ -20,7 +20,12 @@ import {
 } from "./api";
 import { backoffMs } from "./backoff";
 import { classifyRowPatchConflict } from "./rowConflict";
-import { reasonForOp, serverRefusalReason } from "./refusalReason";
+import {
+  MAX_ATTEMPTS_SENTINEL,
+  reasonForOp,
+  serverRefusalReason,
+  willRetryOnItsOwn,
+} from "./refusalReason";
 
 const DB_NAME = "bible-editor-outbox";
 const DB_VERSION = 1;
@@ -936,7 +941,7 @@ async function drainPass() {
           // it. `attempts` carries the count so the drawer can show how
           // long we tried before giving up.
           next.status = "failed";
-          next.lastError = "max_attempts_exceeded";
+          next.lastError = MAX_ATTEMPTS_SENTINEL;
           await (await db()).put(STORE, next);
         } else {
           next.status = "pending";
@@ -956,6 +961,10 @@ async function drainPass() {
       try {
         next.status = "pending";
         next.lastError = `persist_failed: ${String(persistErr)}`;
+        // The refusal reason belongs to the result we failed to persist — this
+        // op is going back on the queue, so it must not carry an explanation
+        // for an outcome that was never recorded.
+        next.lastErrorReason = undefined;
         await (await db()).put(STORE, next);
       } catch {
         /* nothing we can do; will be picked up by recoverInFlight on reload */
@@ -1016,9 +1025,9 @@ async function reviveMaxAttemptsFailed() {
     .transaction(STORE, "readonly")
     .store.index("status")
     .getAll("failed")) as OutboxOp[];
-  const revivable = failedOps.filter(
-    (o) => o.lastError === "max_attempts_exceeded",
-  );
+  // Same predicate the failed-ops panel uses to label an op "still trying" —
+  // imported, not re-tested, so the label can never outlive the behaviour.
+  const revivable = failedOps.filter((o) => willRetryOnItsOwn(o.lastError));
   if (revivable.length === 0) return;
   const tx = idb.transaction(STORE, "readwrite");
   for (const o of revivable) {
@@ -1043,7 +1052,13 @@ async function reviveAndDrain() {
 // stranded by a previous tab crash get re-armed at startup.
 if (typeof window !== "undefined") {
   window.addEventListener("online", () => void reviveAndDrain());
-  window.addEventListener("focus", () => void drain());
+  // Focus revives too, not just drains. A run of 5xx can exhaust the retry
+  // cap while the laptop never goes offline and the session never refreshes —
+  // and `online` / onAuthRefreshed were the only two revival triggers, so
+  // those ops sat as `failed` forever with nothing left to retry them. The
+  // failed-ops panel tells the user they "keep trying on their own", which
+  // has to be true: coming back to the tab is the moment to re-check.
+  window.addEventListener("focus", () => void reviveAndDrain());
   // A successful silent refresh means auth-stalled ops can move again.
   onAuthRefreshed(() => void reviveAndDrain());
   void drain();

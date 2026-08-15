@@ -16,6 +16,10 @@ interface ResultLike {
   serverReason?: string;
 }
 
+// Upper bound on a stored/rendered reason. One API `message` echoes unbounded
+// caller input back (see serverRefusalReason), and this string is persisted.
+const MAX_REASON_CHARS = 200;
+
 /**
  * Lift the server's explanation out of an error response body.
  *
@@ -44,7 +48,16 @@ export function serverRefusalReason(body: unknown): string | undefined {
     const note = str("reason");
     return note ? `book_locked: ${note}` : "book_locked";
   }
-  return str("message") ?? str("reason") ?? str("error");
+  const found = str("message") ?? str("reason") ?? str("error");
+  // One `message` (the chapter-0 ref guard in api/src/rows.ts) echoes the
+  // caller's own `ref_raw`, which has no length bound in its schema. This
+  // string is persisted to IndexedDB and rendered in a panel that wraps rather
+  // than ellipsing, so cap it here instead of letting one row push the rest of
+  // the list off screen.
+  if (found && found.length > MAX_REASON_CHARS) {
+    return `${found.slice(0, MAX_REASON_CHARS - 1).trimEnd()}…`;
+  }
+  return found;
 }
 
 /**
@@ -92,11 +105,17 @@ const PLAIN_REASONS: Record<string, string> = {
   unknown_chapter: "That chapter no longer exists on the server.",
 
   // --- permissions ---
-  read_only: "Your account has read-only access, so this change was not saved.",
   not_an_editor: "Your account does not have permission to edit, so this change was not saved.",
-  forbidden: "Your account does not have permission to make this change.",
   book_locked: "This book is locked for editing, so the change was not saved.",
+  // Defensive only — not reachable today, kept so a future routing change
+  // degrades to a sentence rather than a bare code. `read_only` is thrown
+  // client-side with no body (api.ts) and viewers are short-circuited at
+  // enqueue anyway; `chapter_locked` ops are deleted in drainPass, never
+  // failed; `forbidden` always ships `reason: "not_an_editor"`, which wins the
+  // preference order in serverRefusalReason.
+  read_only: "Your account has read-only access, so this change was not saved.",
   chapter_locked: "An AI run was working on this chapter, so the change was not applied.",
+  forbidden: "Your account does not have permission to make this change.",
 
   // --- protocol ---
   if_match_required: "This edit was sent without a version stamp, so the server would not apply it.",
@@ -130,10 +149,19 @@ export function explainRefusal(reason: string | undefined): string | undefined {
  *
  * Ops reach `failed` by exactly two routes (see drainPass): the retry-cap
  * branch, which always stamps `max_attempts_exceeded` and is auto-revived by
- * reviveMaxAttemptsFailed when connectivity or the session returns; and the
- * fatal branch, which is the server saying no and will never succeed on a
- * resend. So the sentinel alone separates "will try again" from "refused".
+ * reviveMaxAttemptsFailed when the tab is focused, connectivity returns, or
+ * the session refreshes; and the fatal branch, which is the server saying no
+ * and will never succeed on a resend. So the sentinel alone separates "will
+ * try again" from "refused".
+ *
+ * THIS IS THE ONLY DEFINITION of that predicate. reviveMaxAttemptsFailed
+ * imports it rather than re-testing the literal, so the set of ops the UI
+ * labels "still trying" and the set the outbox actually revives cannot drift
+ * apart — which is exactly the bug that would make the label a lie.
  */
 export function willRetryOnItsOwn(lastError: string | undefined): boolean {
-  return lastError === "max_attempts_exceeded";
+  return lastError === MAX_ATTEMPTS_SENTINEL;
 }
+
+/** `lastError` stamped on an op that ran out of retries. */
+export const MAX_ATTEMPTS_SENTINEL = "max_attempts_exceeded";
