@@ -16,6 +16,7 @@ import DeleteOutlineIcon from "@mui/icons-material/DeleteOutline";
 import WarningAmberIcon from "@mui/icons-material/WarningAmber";
 import EditNoteIcon from "@mui/icons-material/EditNote";
 import { outbox, type OutboxOp, type OpTarget } from "../sync/outbox";
+import { explainRefusal, willRetryOnItsOwn } from "../sync/refusalReason";
 import { drafts, type DraftRecord, type DraftMeta } from "../sync/drafts";
 
 // If the oldest pending/in-flight op has been queued longer than this, treat
@@ -47,6 +48,15 @@ function formatTarget(t: OpTarget): string {
 // A delete op carries no content (patch is {}), so say what the intent was.
 function formatOpLabel(op: OutboxOp): string {
   return `${formatTarget(op.target)}${op.action === "delete" ? " (delete)" : ""}`;
+}
+
+// What to print under a failed op's target line. A refusal shows the server's
+// own explanation in plain words (issue #370 — "http 400" told the translator
+// nothing, so a correct refusal read as data loss). A retryable failure has no
+// server explanation to give, so it says what is actually happening instead.
+function failureLine(op: OutboxOp): string {
+  if (willRetryOnItsOwn(op.lastError)) return "still trying — the server is not responding";
+  return explainRefusal(op.lastErrorReason) ?? "The server would not accept this change.";
 }
 
 function formatDraftMeta(m: DraftMeta): string {
@@ -91,6 +101,12 @@ export function SyncStatusBar({ onNavigate }: Props = {}) {
   const pending = pendingOps.length;
   const conflicts = ops.filter((o) => o.status === "conflict");
   const failed = ops.filter((o) => o.status === "failed");
+  // Two very different situations used to share one "N failed" list: a server
+  // refusal that will never succeed, and a retry-cap timeout that revives by
+  // itself the moment the connection or session comes back. Splitting them
+  // stops the second from reading as permanent loss (issue #370).
+  const refused = failed.filter((o) => !willRetryOnItsOwn(o.lastError));
+  const stalled = failed.filter((o) => willRetryOnItsOwn(o.lastError));
 
   // "Discard all" permanently deletes queued edits — gate it behind an
   // explicit confirm so it can't be a one-misclick data loss.
@@ -238,15 +254,34 @@ export function SyncStatusBar({ onNavigate }: Props = {}) {
         />
       </Tooltip>
     );
-  } else if (failed.length > 0) {
+  } else if (refused.length > 0) {
     inline = (
-      <Tooltip title="some edits failed permanently — discard below">
+      <Tooltip title="the server refused some changes — see why below; your saved text is unchanged">
         <Chip
           icon={<ErrorOutlineIcon />}
-          label={`${failed.length} failed`}
+          label={`${failed.length} not saved`}
           size="small"
           variant="outlined"
           color="error"
+        />
+      </Tooltip>
+    );
+  } else if (stalled.length > 0) {
+    // Nothing was refused — these are timed-out retries that revive by
+    // themselves. Same amber as the offline chip: a transient state, not a
+    // failure, so red would overstate it.
+    inline = (
+      <Tooltip title="these changes have not reached the server yet — they keep trying on their own">
+        <Chip
+          icon={<CloudQueueIcon />}
+          label={`${stalled.length} still trying`}
+          size="small"
+          variant="outlined"
+          sx={{
+            color: "#E59D33",
+            borderColor: "#E59D33",
+            "& .MuiChip-icon": { color: "#E59D33" },
+          }}
         />
       </Tooltip>
     );
@@ -317,6 +352,68 @@ export function SyncStatusBar({ onNavigate }: Props = {}) {
     borderColor: "#E59D33",
     "& .MuiChip-icon": { color: "#E59D33" },
   } as const;
+
+  // One row per failed edit: what it was, then why it didn't save. Shared by
+  // both groups so a refusal and a stalled retry look and behave the same
+  // apart from the sentence underneath.
+  const renderFailedOp = (op: OutboxOp) => (
+    <Stack
+      key={op.id}
+      direction="row"
+      alignItems="center"
+      spacing={0.5}
+      sx={{
+        bgcolor: "action.hover",
+        borderRadius: 0.5,
+        px: 0.75,
+        py: 0.25,
+      }}
+    >
+      <Box sx={{ flex: 1, minWidth: 0 }}>
+        <Typography
+          variant="caption"
+          sx={{
+            display: "block",
+            whiteSpace: "nowrap",
+            overflow: "hidden",
+            textOverflow: "ellipsis",
+            fontFamily: "monospace",
+          }}
+        >
+          {formatTarget(op.target)}
+        </Typography>
+        {/* The reason can be a full sentence, so let it wrap rather than
+            truncating the half that explains what to do about it. */}
+        <Typography
+          variant="caption"
+          color="text.secondary"
+          sx={{ display: "block", fontSize: 10, lineHeight: 1.3 }}
+        >
+          {failureLine(op)}
+        </Typography>
+      </Box>
+      <Tooltip title="try saving this change again">
+        <IconButton
+          size="small"
+          color="primary"
+          onClick={() => void outbox.retry(op.id)}
+          sx={{ p: 0.25 }}
+        >
+          <RefreshIcon fontSize="inherit" />
+        </IconButton>
+      </Tooltip>
+      <Tooltip title="discard this change">
+        <IconButton
+          size="small"
+          color="error"
+          onClick={() => { setConfirmDropOp(op); setCopiedDropOp(false); }}
+          sx={{ p: 0.25 }}
+        >
+          <DeleteOutlineIcon fontSize="inherit" />
+        </IconButton>
+      </Tooltip>
+    </Stack>
+  );
 
   const navigateToDraft = (m: DraftMeta) => {
     onNavigate?.(m.book, m.chapter, m.verse);
@@ -432,13 +529,13 @@ export function SyncStatusBar({ onNavigate }: Props = {}) {
               </Tooltip>
             )}
             {failed.length > 0 && conflicts.length > 0 && <Divider flexItem />}
-            {failed.length > 0 && (
+            {refused.length > 0 && (
               <Stack spacing={0.25}>
                 <Stack direction="row" alignItems="center" justifyContent="space-between">
                   <Typography variant="caption" color="error" sx={{ fontWeight: 600 }}>
-                    {failed.length} failed
+                    {refused.length} change{refused.length === 1 ? "" : "s"} refused
                   </Typography>
-                  <Tooltip title="discard all failed edits">
+                  <Tooltip title="discard every change the server refused">
                     <Button
                       size="small"
                       variant="text"
@@ -450,70 +547,25 @@ export function SyncStatusBar({ onNavigate }: Props = {}) {
                     </Button>
                   </Tooltip>
                 </Stack>
-                {failed.map((op) => (
-                  <Stack
-                    key={op.id}
-                    direction="row"
-                    alignItems="center"
-                    spacing={0.5}
-                    sx={{
-                      bgcolor: "action.hover",
-                      borderRadius: 0.5,
-                      px: 0.75,
-                      py: 0.25,
-                    }}
-                  >
-                    <Box sx={{ flex: 1, minWidth: 0 }}>
-                      <Typography
-                        variant="caption"
-                        sx={{
-                          display: "block",
-                          whiteSpace: "nowrap",
-                          overflow: "hidden",
-                          textOverflow: "ellipsis",
-                          fontFamily: "monospace",
-                        }}
-                      >
-                        {formatTarget(op.target)}
-                      </Typography>
-                      {op.lastError && (
-                        <Typography
-                          variant="caption"
-                          color="text.secondary"
-                          sx={{
-                            display: "block",
-                            fontSize: 10,
-                            whiteSpace: "nowrap",
-                            overflow: "hidden",
-                            textOverflow: "ellipsis",
-                          }}
-                        >
-                          {op.lastError}
-                        </Typography>
-                      )}
-                    </Box>
-                    <Tooltip title="retry this edit">
-                      <IconButton
-                        size="small"
-                        color="primary"
-                        onClick={() => void outbox.retry(op.id)}
-                        sx={{ p: 0.25 }}
-                      >
-                        <RefreshIcon fontSize="inherit" />
-                      </IconButton>
-                    </Tooltip>
-                    <Tooltip title="discard this edit">
-                      <IconButton
-                        size="small"
-                        color="error"
-                        onClick={() => { setConfirmDropOp(op); setCopiedDropOp(false); }}
-                        sx={{ p: 0.25 }}
-                      >
-                        <DeleteOutlineIcon fontSize="inherit" />
-                      </IconButton>
-                    </Tooltip>
-                  </Stack>
-                ))}
+                {/* Said once, above the list, rather than on every row: the
+                    reassurance is the whole point of issue #370, and the
+                    per-row line is already carrying the reason. */}
+                <Typography variant="caption" color="text.secondary" sx={{ fontSize: 10, lineHeight: 1.3 }}>
+                  Nothing was lost — each verse or note still holds the text it had before.
+                </Typography>
+                {refused.map(renderFailedOp)}
+              </Stack>
+            )}
+            {refused.length > 0 && stalled.length > 0 && <Divider flexItem />}
+            {stalled.length > 0 && (
+              <Stack spacing={0.25}>
+                <Typography variant="caption" sx={{ fontWeight: 600, color: "#E59D33" }}>
+                  {stalled.length} change{stalled.length === 1 ? "" : "s"} not saved yet
+                </Typography>
+                <Typography variant="caption" color="text.secondary" sx={{ fontSize: 10, lineHeight: 1.3 }}>
+                  The server could not be reached. These keep trying on their own.
+                </Typography>
+                {stalled.map(renderFailedOp)}
               </Stack>
             )}
           </Stack>
@@ -522,13 +574,13 @@ export function SyncStatusBar({ onNavigate }: Props = {}) {
       {/* Auto-closes if the failed list empties out from under it (retry /
           auto-revival) — nothing left to discard. */}
       <ConfirmDialog
-        open={confirmDiscardAll && failed.length > 0}
-        title={`Discard ${failed.length} failed edit${failed.length === 1 ? "" : "s"}?`}
-        description="These edits never reached the server. Discarding deletes them from this device permanently — they cannot be recovered."
+        open={confirmDiscardAll && refused.length > 0}
+        title={`Discard ${refused.length} refused change${refused.length === 1 ? "" : "s"}?`}
+        description={`The server did not accept ${refused.length === 1 ? "this change" : "these changes"}, so ${refused.length === 1 ? "the verse or note it belongs to" : "the verses and notes they belong to"} still hold the text they had before. Discarding removes only the unsaved change from this device — copy it first if you want to keep it.`}
         confirmLabel="discard all"
         onCancel={() => setConfirmDiscardAll(false)}
         onConfirm={async () => {
-          for (const op of failed) await outbox.drop(op.id, { onlyIfStatus: "failed" });
+          for (const op of refused) await outbox.drop(op.id, { onlyIfStatus: "failed" });
           setConfirmDiscardAll(false);
         }}
         sx={{ zIndex: (t) => t.zIndex.snackbar + 1 }}
@@ -563,8 +615,12 @@ export function SyncStatusBar({ onNavigate }: Props = {}) {
       {/* Single-op discard — auto-closes when the op leaves failed status. */}
       <ConfirmDialog
         open={liveDropOp !== null}
-        title="Discard this edit?"
-        description="This edit never reached the server. Discarding deletes it from this device permanently — copy it first if you want to keep the text."
+        title="Discard this change?"
+        description={
+          liveDropOp && willRetryOnItsOwn(liveDropOp.lastError)
+            ? "This change has not reached the server yet and is still trying. Discarding removes it from this device — copy it first if you want to keep it."
+            : "The server did not accept this change, so the verse or note still holds the text it had before. Discarding removes only the unsaved change from this device — copy it first if you want to keep it."
+        }
         confirmLabel="discard"
         onCancel={closeDropOp}
         onConfirm={async () => {
@@ -601,12 +657,14 @@ export function SyncStatusBar({ onNavigate }: Props = {}) {
         sx={{ zIndex: (t) => t.zIndex.snackbar + 1 }}
       >
         {liveDropOp && (
-          <Typography
-            variant="caption"
-            sx={{ fontFamily: "monospace", display: "block", mt: 1 }}
-          >
-            {formatOpLabel(liveDropOp)}
-          </Typography>
+          <Stack spacing={0.25} sx={{ mt: 1 }}>
+            <Typography variant="caption" sx={{ fontFamily: "monospace", display: "block" }}>
+              {formatOpLabel(liveDropOp)}
+            </Typography>
+            <Typography variant="caption" color="text.secondary" sx={{ display: "block" }}>
+              {failureLine(liveDropOp)}
+            </Typography>
+          </Stack>
         )}
       </ConfirmDialog>
     </>

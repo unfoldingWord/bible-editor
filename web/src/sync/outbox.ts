@@ -20,6 +20,7 @@ import {
 } from "./api";
 import { backoffMs } from "./backoff";
 import { classifyRowPatchConflict } from "./rowConflict";
+import { reasonForOp, serverRefusalReason } from "./refusalReason";
 
 const DB_NAME = "bible-editor-outbox";
 const DB_VERSION = 1;
@@ -109,6 +110,14 @@ export interface OutboxOp {
   dispatchedAt?: number;
   status: OpStatus;
   lastError?: string;
+  // The server's own explanation for a refusal, lifted from the `error` /
+  // `reason` fields of a non-retryable 4xx response body. Deliberately a
+  // SEPARATE field from `lastError`: that one carries control-flow sentinels
+  // ("max_attempts_exceeded" is matched by reviveMaxAttemptsFailed) and must
+  // stay machine-stable. This one is display-only — the failed-ops drawer
+  // turns it into a plain sentence so a refused save says *why* instead of
+  // looking like the app threw the edit away (issue #370).
+  lastErrorReason?: string;
   conflictCurrent?: unknown;
   // Count of silent re-arms after a sort_order-only 409 (see
   // MAX_CONFLICT_AUTOHEAL). Absent = 0.
@@ -535,6 +544,7 @@ export const outbox = {
     op.attempts = 0;
     op.hardAttempts = 0;
     op.lastError = undefined;
+    op.lastErrorReason = undefined;
     op.queuedAt = Date.now();
     op.seq = nextSeq();
     await tx.store.put(op);
@@ -557,7 +567,10 @@ type Result =
   | { kind: "ok"; updated: unknown }
   | { kind: "conflict"; current: unknown }
   | { kind: "retry"; reason: string }
-  | { kind: "fatal"; reason: string }
+  // `reason` is the machine sentinel stored on op.lastError; `serverReason`
+  // is the server's own explanation (body.error / body.reason), kept apart so
+  // the sentinel stays stable while the drawer can show a human sentence.
+  | { kind: "fatal"; reason: string; serverReason?: string }
   // Chapter is locked because an AI pipeline is mid-flight. The auto-apply
   // step will overwrite the row anyway, so retrying is pointless — the op
   // gets dropped and the listener can surface a toast.
@@ -644,7 +657,9 @@ async function dispatch(op: OutboxOp): Promise<Result> {
         }
         const alignmentLoss = unexpectedAlignmentLossReason(e.body);
         if (alignmentLoss) {
-          return { kind: "fatal", reason: alignmentLoss };
+          // Also carry it as the display reason so every refusal reaches the
+          // drawer through the same field, not just the plain-4xx ones.
+          return { kind: "fatal", reason: alignmentLoss, serverReason: alignmentLoss };
         }
         const body = e.body as { current?: unknown } | undefined;
         return { kind: "conflict", current: body?.current };
@@ -667,8 +682,9 @@ async function dispatch(op: OutboxOp): Promise<Result> {
       // A csrf_mismatch 403 is recoverable: the be_csrf cookie expired but the
       // session is still valid. api.ts already refreshes-and-retries inline; if
       // one still reaches here (refresh raced/failed), keep the op pending and
-      // retry rather than failing it permanently. read_only 403s carry no
-      // `error` body and fall through to fatal, as they must (they'd loop).
+      // retry rather than failing it permanently. The other 403s
+      // (source_text_is_read_only, forbidden/not_an_editor) fall through to
+      // fatal, as they must — retrying them would just loop.
       if (
         e.status === 403 &&
         (e.body as { error?: string } | undefined)?.error === "csrf_mismatch"
@@ -676,8 +692,15 @@ async function dispatch(op: OutboxOp): Promise<Result> {
         return { kind: "retry", reason: "csrf_mismatch" };
       }
       // 403, 404, 422, 428 etc. are non-retryable client errors — sending
-      // the same payload again won't change the outcome.
-      return { kind: "fatal", reason: `http ${e.status}` };
+      // the same payload again won't change the outcome. Carry the server's
+      // own explanation alongside the status so the drawer can tell the user
+      // *why* the save was refused instead of just "http 400" (issue #370).
+      const serverReason = serverRefusalReason(e.body);
+      return {
+        kind: "fatal",
+        reason: `http ${e.status}`,
+        ...(serverReason !== undefined ? { serverReason } : {}),
+      };
     }
     return { kind: "retry", reason: "network" };
   }
@@ -831,6 +854,11 @@ async function drainPass() {
     } catch (err) {
       result = { kind: "retry", reason: `dispatch_threw: ${String(err)}` };
     }
+
+    // Display-only server explanation for a refusal. Set on every result so a
+    // reason from an earlier attempt can't linger on an op that has since
+    // failed for a different cause (or is merely retrying).
+    next.lastErrorReason = reasonForOp(result);
 
     // Persist the new status *before* notifying listeners. If a put() or
     // delete() throws, the catch below resets the op to pending so it
@@ -998,6 +1026,7 @@ async function reviveMaxAttemptsFailed() {
     o.attempts = 0;
     o.hardAttempts = 0;
     o.lastError = undefined;
+    o.lastErrorReason = undefined;
     await tx.store.put(o);
   }
   await tx.done;
