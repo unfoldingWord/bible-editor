@@ -368,20 +368,21 @@ export function App() {
   return (
     <Box sx={{ height: "100vh", display: "flex", flexDirection: "column" }}>
       {bannerAlerts.length > 0 && (
-        // Float the alert stack so it doesn't push Shell down — the outer
-        // flex column's children can't actually shrink (Shell's internal
-        // box rejects flex:1 minHeight:0 sizing), and any added in-flow
-        // height makes <html> scroll the banner above the viewport.
-        // Fixed positioning keeps the banner visible regardless of scroll
-        // state and accepts the tradeoff of obscuring the top 44px of the
-        // TopBar — appropriate UX for a "Benjamin fix this" alert.
+        // In-flow banner stack (issue #458). It was previously position:fixed
+        // top:0, which floated it *over* the TopBar and covered the
+        // book/chapter/reference navigation behind it — a "door43 clobbered"
+        // revert alert is a tall, multi-line message (and several can stack),
+        // so it became a barrier the user couldn't navigate past. Keeping it
+        // in normal flow reserves its own height at the top of the column and
+        // pushes the TopBar + Shell down instead of overlaying them; Shell's
+        // root is height:100% (not 100vh) so the column reflows cleanly.
+        // Cap the stack and let it scroll so a burst of nightly export alerts
+        // can't swallow the viewport and re-create the barrier.
         <Box
           sx={{
-            position: "fixed",
-            top: 0,
-            left: 0,
-            right: 0,
-            zIndex: (theme) => theme.zIndex.appBar + 2,
+            flexShrink: 0,
+            maxHeight: "40vh",
+            overflowY: "auto",
           }}
         >
           {bannerAlerts.map((a) => (

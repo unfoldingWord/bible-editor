@@ -2559,7 +2559,9 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // only mount in the data branch, so runWithDirtyGate would soft-lock.
   if (!data) {
     return (
-      <Box sx={{ display: "flex", flexDirection: "column", height: "100vh" }}>
+      // height:100% (not 100vh) so an in-flow app banner above this Shell can
+      // reserve space and push it down instead of being overlaid (issue #458).
+      <Box sx={{ display: "flex", flexDirection: "column", height: "100%" }}>
         <TopBar
           book={book}
           chapter={chapter}
@@ -2830,7 +2832,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   };
 
   return (
-    <Box sx={{ height: "100vh", display: "flex", flexDirection: "column", overflow: "hidden" }}>
+    <Box sx={{ height: "100%", display: "flex", flexDirection: "column", overflow: "hidden" }}>
       <TopBar
         book={book}
         chapter={chapter}
