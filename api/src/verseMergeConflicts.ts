@@ -7,7 +7,10 @@
 // Marked resolved (resolved_at/resolved_by, migration 0049) by verses.ts's
 // PATCH route when a human next saves the conflicting verse — the row itself
 // is kept for the audit trail; "active" readers filter WHERE resolved_at IS
-// NULL.
+// NULL. A SERVER-SIDE re-detection can also reactivate a resolved row, but
+// only via the two-phase protocol in recordVerseMergeConflicts /
+// confirmAdoptedConflicts below — see UPSERT_VERSE_MERGE_CONFLICT_SQL's doc
+// comment in verseMergeConflictSql.ts for why a single eager clear is unsafe.
 //
 // Three action values land here (the migration's header comment,
 // 0044_verse_merge_conflicts.sql, already documents all three — only its
@@ -47,6 +50,7 @@ import {
   type OverwrittenVerseRef,
 } from "./verseMergeEditorAlerts.ts";
 import {
+  CONFIRM_ADOPTED_CONFLICT_SQL,
   DELETE_LOST_ADOPTION_CONFLICT_SQL,
   UPSERT_VERSE_MERGE_CONFLICT_SQL,
 } from "./verseMergeConflictSql.ts";
@@ -93,13 +97,19 @@ const WRITE_BATCH = 90;
 // wasn't — the honest-return precedent this follows is exportWorkflow.ts's
 // recordExportReverts.
 //
+// SPECULATIVE half of two-phase reactivation (see
+// UPSERT_VERSE_MERGE_CONFLICT_SQL's doc comment for the full "why" — this
+// upsert runs BEFORE the master-adoption CAS batch even attempts its write,
+// so it must never assume the write will land). It does NOT clear
+// resolved_at/resolved_by — only confirmAdoptedConflicts (below), called
+// after the CAS batch confirms which adoptions actually landed, does that.
+//
 // `now` is the caller's own Date.now()-derived timestamp (bookReimport.ts
 // already computes one per applyVerseRows call) — bound as detected_at's
-// value on INSERT instead of letting SQL evaluate `unixepoch()` itself, so
+// value on INSERT and as last_recorded_at's value on every write, so
 // deleteLostAdoptionConflicts (called later in the same run) can match rows
-// written THIS run by exact equality. See UPSERT_VERSE_MERGE_CONFLICT_SQL's
-// doc comment for the full reasoning, including the resolved_at/resolved_by
-// reset this SQL now performs unconditionally.
+// touched by THIS run's speculative write by exact equality on
+// last_recorded_at.
 export async function recordVerseMergeConflicts(
   env: Env,
   book: string,
@@ -138,6 +148,39 @@ export async function recordVerseMergeConflicts(
   }
 }
 
+// CONFIRMING half of two-phase reactivation. Call this ONLY with refs whose
+// master-adoption CAS write actually LANDED (bookReimport.ts's
+// `landedAdoptions` / `adoptionsApplied`, computed after the CAS batch) —
+// this is the ONLY place resolved_at/resolved_by are cleared for an
+// adoption, and it is deliberately a SEPARATE step from the speculative
+// upsert above so a lost CAS race never reactivates anything (see
+// CONFIRM_ADOPTED_CONFLICT_SQL's doc comment). Best-effort: a failure here
+// just leaves a row that stays resolved/dormant one run longer than it
+// should — never a false-positive reactivation, which is the failure mode
+// this two-phase split exists to prevent.
+export async function confirmAdoptedConflicts(
+  env: Env,
+  book: string,
+  resource: string,
+  refs: Array<{ chapter: number; verse: number }>,
+): Promise<void> {
+  if (refs.length === 0) return;
+  try {
+    for (let i = 0; i < refs.length; i += WRITE_BATCH) {
+      const slice = refs.slice(i, i + WRITE_BATCH);
+      await env.DB.batch(
+        slice.map((r) => env.DB.prepare(CONFIRM_ADOPTED_CONFLICT_SQL).bind(book, resource, r.chapter, r.verse)),
+      );
+    }
+  } catch (e) {
+    console.error("verseMergeConflicts: confirm-adopted failed", {
+      book,
+      resource,
+      error: e instanceof Error ? e.message : String(e),
+    });
+  }
+}
+
 // Delete conflict rows for adoptions whose version-CAS write did NOT land
 // (see bookReimport.ts's applyVerseRows step 6b/7b): the row was written
 // speculatively BEFORE the CAS batch so a mid-batch failure can't erase
@@ -152,9 +195,9 @@ export async function recordVerseMergeConflicts(
 // recordVerseMergeConflicts call (bookReimport.ts already computes one `now`
 // per applyVerseRows invocation and reuses it for both) — see
 // DELETE_LOST_ADOPTION_CONFLICT_SQL's doc comment for why this scoping
-// exists: it protects a row's prior history (a resolved conflict from an
-// earlier night, or a still-unresolved one) from being wholesale deleted
-// just because THIS run's separate, later CAS attempt happened to lose its
+// (on last_recorded_at, not detected_at) exists: it protects a row's prior
+// resolution (from an earlier night) from being wholesale deleted just
+// because THIS run's separate speculative write happened to lose its CAS
 // race, while still deleting a row that is provably this run's own
 // speculative write and nothing else.
 export async function deleteLostAdoptionConflicts(

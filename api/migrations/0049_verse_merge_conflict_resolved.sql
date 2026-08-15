@@ -15,8 +15,19 @@
 -- (0048), and this one, renumbered to 0049 to land after both. Before
 -- merging, confirm the actual order applied with
 -- `wrangler d1 migrations list --remote` in case that ordering shifts.
+--
+-- last_recorded_at (2026-08-15, Codex second-opinion review fix): a SEPARATE
+-- column from detected_at, refreshed unconditionally on every
+-- recordVerseMergeConflicts upsert (see verseMergeConflictSql.ts's
+-- UPSERT_VERSE_MERGE_CONFLICT_SQL). Its only job is letting
+-- deleteLostAdoptionConflicts recognize "this row was touched by THIS run's
+-- speculative write" — detected_at deliberately keeps its original meaning
+-- ("first detected, preserved across every re-detection while still
+-- unresolved") untouched, since conflating the two would silently reset the
+-- age of a long-unresolved conflict every time the upsert re-ran.
 ALTER TABLE verse_merge_conflicts ADD COLUMN resolved_at INTEGER;
 ALTER TABLE verse_merge_conflicts ADD COLUMN resolved_by INTEGER REFERENCES users(id);
+ALTER TABLE verse_merge_conflicts ADD COLUMN last_recorded_at INTEGER;
 
 CREATE INDEX verse_merge_conflicts_active
   ON verse_merge_conflicts (book, resource)

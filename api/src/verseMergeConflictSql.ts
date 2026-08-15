@@ -45,53 +45,66 @@ export const RESOLVE_VERSE_MERGE_CONFLICT_SQL = `UPDATE verse_merge_conflicts
     AND changes() > 0`;
 
 // ---------------------------------------------------------------------------
+// TWO-PHASE REACTIVATION (2026-08-15 Codex second-opinion review fix,
+// superseding the first six-angle review's "reset resolved_at
+// unconditionally" approach, which had a real bug — see below).
+//
 // verseMergeConflicts.ts's recordVerseMergeConflicts — the nightly-sync
-// upsert. ON CONFLICT DO UPDATE, NOT INSERT OR REPLACE (see that function's
-// doc comment for why REPLACE's delete-then-reinsert would break
-// `detected_at`'s "how long has this been unresolved" meaning).
+// SPECULATIVE upsert, written BEFORE the master-adoption CAS batch even
+// attempts its write (see bookReimport.ts step 6b). ON CONFLICT DO UPDATE,
+// NOT INSERT OR REPLACE (a REPLACE deletes-then-reinserts, minting a new
+// `id` and resetting `detected_at` on every re-detection of the SAME
+// still-unresolved conflict — making "how long has this been sitting
+// unresolved" unrecoverable).
 //
-// resolved_at/resolved_by are RESET TO NULL unconditionally on every DO
-// UPDATE (2026-08-14 six-angle review fix, DEFECT: "re-detection
-// invisibility"). Before this, a verse that was flagged, human-resolved, and
-// then genuinely conflicted AGAIN on a later night stayed `resolved_at`
-// non-null forever — both `raiseVerseMergeConflictAlert`'s banner query and
-// GET /api/verse-merge-conflicts/:book filter `resolved_at IS NULL`, so the
-// brand-new conflict was permanently invisible to every reader. Resetting
-// unconditionally is safe: for a row that was never resolved (the common
-// case), resolved_at is already NULL, so this is a no-op.
+// This statement does NOT touch resolved_at/resolved_by at all. The first
+// version of this fix (2026-08-14) cleared them here unconditionally, on the
+// theory that any fresh conflict detection should make the row visible
+// again. Codex's second-opinion review found the real bug in that: this
+// statement runs SPECULATIVELY, before we know whether the CAS write below
+// will actually land. If a verse carried an OLD, human-resolved conflict and
+// this run's speculative adopt_conflict upsert cleared resolved_at, but the
+// CAS then LOST its race (a human saved first — nothing was actually
+// overwritten), the row was left falsely reactivated: an active alert for an
+// overwrite that never happened, with the ORIGINAL resolution's audit trail
+// (resolved_by, and implicitly its resolved_at) destroyed — and
+// deleteLostAdoptionConflicts's `detected_at`-based cleanup (see below)
+// could not undo it, because detected_at is deliberately NOT refreshed here
+// (see the next paragraph), so it never matched "this run" for a
+// pre-existing row.
 //
-// detected_at is bound to an explicit caller-supplied timestamp (`now`, NOT
-// SQL's `unixepoch()`) precisely so deleteLostAdoptionConflicts — called
-// later in the SAME reimport run — can compare it for exact equality (two
-// separate `unixepoch()` evaluations could tick over a second apart if I/O
-// happens in between, which it does: the master-adoption CAS write batch
-// runs between this insert and that cleanup). detected_at is NOT reset on an
-// ordinary DO UPDATE (it's absent from the SET list, so SQLite leaves it at
-// its stored value) — that preserves "how long has this been sitting
-// unresolved" for a conflict that keeps re-detecting night after night
-// without ever landing or being resolved. See deleteLostAdoptionConflicts's
-// doc comment for how this interacts with its cleanup scoping.
+// Fix: resolved_at/resolved_by are only ever cleared by
+// CONFIRM_ADOPTED_CONFLICT_SQL below, called AFTER the CAS batch confirms
+// which adoptions actually landed. A lost CAS therefore leaves a
+// previously-resolved row exactly as it was (resolved_at/resolved_by
+// untouched) — nothing to undo, because nothing was speculatively cleared in
+// the first place.
 //
-// KNOWN NARROWER FOLLOW-ON (flagged, deliberately NOT fixed here — scope was
-// "make the reactivated row visible again", not "re-derive its pointer"):
-// `overwritten_version`'s CASE still applies the pre-existing "keep the
-// EARLIEST pointer" rule (COALESCE onto the stored value if non-null)
-// unconditionally, including across a resolved -> reactivated transition. So
-// a row resolved on night 1 (pointer -> v2) that gets a genuinely NEW,
-// distinct overwrite on night 30 will surface as active again (this fix) but
-// can still show the OLD v2 pointer rather than night 30's real overwrite,
-// if v2 was never cleared. Same caveat applies to `action`/`reason`'s
-// anti-downgrade CASE, which can keep a stale pre-resolution action label.
-// Only relevant across a resolve -> new-conflict cycle on the SAME verse —
-// worth a follow-up if that combination turns out to matter in practice.
+// `last_recorded_at` (a column separate from `detected_at`, added alongside
+// resolved_at/resolved_by in migration 0049) IS refreshed unconditionally on
+// every upsert — its only job is letting deleteLostAdoptionConflicts
+// recognize "this exact row was touched by THIS run's speculative write",
+// regardless of whether it's a brand-new row or a pre-existing one.
+// `detected_at` is deliberately NOT given the same treatment: it keeps its
+// original meaning ("first detected, preserved across every re-detection
+// while still unresolved") untouched by any of this — conflating the two
+// would have silently reset the age of a conflict that has been sitting
+// unresolved for weeks every time this upsert re-ran, which is a real
+// feature this table exists to support, not a bug to route around.
 //
 // Binds, in order: (book, resource, chapter, verse, action, reason,
-// overwrittenVersion, alignmentJson, detectedAt).
+// overwrittenVersion, alignmentJson, now). `now` fills BOTH the ?9 slots
+// (detected_at at INSERT time only, and last_recorded_at on every write) —
+// SQLite allows a single bound value to satisfy a repeated numbered
+// parameter.
 // ---------------------------------------------------------------------------
 export const UPSERT_VERSE_MERGE_CONFLICT_SQL = `INSERT INTO verse_merge_conflicts
-     (book, resource, chapter, verse, action, reason, overwritten_version, alignment, detected_at)
-   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+     (book, resource, chapter, verse, action, reason, overwritten_version, alignment, detected_at, last_recorded_at)
+   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)
    ON CONFLICT (book, resource, chapter, verse) DO UPDATE SET
+     -- A row needing human judgement must never be DOWNGRADED by a later
+     -- routine adoption — see recordVerseMergeConflicts's own doc comment for
+     -- the full Night-1/Night-2 walkthrough this anti-downgrade protects.
      action = CASE
        WHEN excluded.action = 'adopt' AND verse_merge_conflicts.action = 'adopt_conflict'
        THEN verse_merge_conflicts.action
@@ -102,13 +115,42 @@ export const UPSERT_VERSE_MERGE_CONFLICT_SQL = `INSERT INTO verse_merge_conflict
        THEN verse_merge_conflicts.reason
        ELSE excluded.reason
      END,
+     -- KNOWN NARROWER FOLLOW-ON (flagged, deliberately not fixed here): this
+     -- keeps the EARLIEST overwritten_version pointer, including across a
+     -- resolve -> new-conflict cycle on the SAME verse. So a row resolved on
+     -- night 1 (pointer -> v2) that gets a genuinely NEW, distinct overwrite
+     -- confirmed on night 30 can still show the OLD v2 pointer rather than
+     -- night 30's real overwrite, if v2 was never cleared. Only relevant
+     -- across a resolve -> new-conflict cycle on the SAME verse — worth a
+     -- follow-up if that combination turns out to matter in practice.
      overwritten_version = CASE
        WHEN excluded.action = 'keep_alignment_refused' THEN NULL
        ELSE COALESCE(verse_merge_conflicts.overwritten_version, excluded.overwritten_version)
      END,
      alignment = COALESCE(excluded.alignment, verse_merge_conflicts.alignment),
-     resolved_at = NULL,
-     resolved_by = NULL`;
+     last_recorded_at = excluded.last_recorded_at`;
+
+// ---------------------------------------------------------------------------
+// verseMergeConflicts.ts's confirmAdoptedConflicts — the SECOND phase of
+// two-phase reactivation. Called from bookReimport.ts AFTER the
+// master-adoption CAS batch runs, for exactly the refs whose write actually
+// LANDED (`adoptionsApplied` / `landedAdoptions`) — never for refs whose CAS
+// lost, and never for `keep_alignment_refused` (which never attempts a
+// write, hence the `action IN (...)` guard here as a second, independent
+// check on top of the caller only ever passing landed-adoption refs).
+//
+// This is the ONLY statement that clears resolved_at/resolved_by for an
+// adoption — see UPSERT_VERSE_MERGE_CONFLICT_SQL's doc comment for why the
+// speculative upsert must not do this eagerly. Confirming only after the
+// write is known to have landed means a lost CAS never reactivates anything:
+// nothing was cleared speculatively, so there is nothing to undo.
+//
+// Binds, in order: (book, resource, chapter, verse).
+// ---------------------------------------------------------------------------
+export const CONFIRM_ADOPTED_CONFLICT_SQL = `UPDATE verse_merge_conflicts
+    SET resolved_at = NULL, resolved_by = NULL
+  WHERE book = ?1 AND resource = ?2 AND chapter = ?3 AND verse = ?4
+    AND action IN ('adopt', 'adopt_conflict')`;
 
 // ---------------------------------------------------------------------------
 // verseMergeConflicts.ts's deleteLostAdoptionConflicts — cleanup for a
@@ -118,47 +160,26 @@ export const UPSERT_VERSE_MERGE_CONFLICT_SQL = `INSERT INTO verse_merge_conflict
 // — a 'keep_alignment_refused' row never attempts a write, so it's never a
 // candidate.
 //
-// `detected_at = ?5 AND resolved_at IS NULL` (2026-08-14 six-angle review
-// fix, DEFECT: "lost-adoption cleanup destroying audit rows"): the OLD
-// unconditional delete removed the row outright regardless of what history
-// it held. Combined with the upsert now RESETTING resolved_at/resolved_by
-// (see UPSERT_VERSE_MERGE_CONFLICT_SQL above), a row that already carried a
-// real, human-resolved conflict from a PRIOR night could get speculatively
-// touched by tonight's upsert and then wholesale deleted here — erasing that
-// old resolved_by/overwritten_version audit trail even though nothing about
-// it was actually false, just because THIS run's separate, later attempt
-// happened to lose its CAS race.
+// `last_recorded_at = ?5` (NOT `detected_at` — see UPSERT_VERSE_MERGE_CONFLICT_SQL's
+// doc comment for why the two are kept separate) narrows the delete to rows
+// PROVABLY touched by THIS run's speculative upsert: a brand-new row gets
+// last_recorded_at = now on INSERT, so deleting it here on a lost CAS is
+// exactly the old (correct, harmless) behavior — nothing valid existed
+// before it. A row that predates tonight and is CURRENTLY RESOLVED
+// (resolved_at non-null, from a real prior resolution) is excluded by
+// `resolved_at IS NULL` regardless of last_recorded_at — under two-phase
+// reactivation its resolved_at was never touched by tonight's speculative
+// upsert in the first place (see above), so this condition alone is what
+// protects it; last_recorded_at no longer needs to distinguish "old" from
+// "new" for that case. A row that predates tonight and is CURRENTLY ACTIVE
+// (never resolved) still gets deleted on a lost CAS — matching this
+// cleanup's ORIGINAL, pre-review behavior for that case (it was never
+// specially protected, and the two-phase design doesn't change that).
 //
-// `detected_at = ?5` (the same caller-supplied `now` passed to this run's
-// recordVerseMergeConflicts call) narrows the delete to rows that are
-// PROVABLY new-or-reactivated-tonight: a brand-new row gets detected_at = now
-// on INSERT, so deleting it here is exactly the old (correct, harmless)
-// behavior. A row that predates tonight — whether still-unresolved from a
-// prior night (detected_at preserved unchanged by the DO UPDATE) or resolved
-// from a prior night (also preserved, since resetting resolved_at does not
-// touch detected_at) — keeps its OLD detected_at, so it will NOT match `now`
-// and is left alone: its prior state (including any resolved_by /
-// overwritten_version) survives.
-//
-// RESIDUAL EDGE (documented, not fully closed — the "simplest acceptable"
-// fix per the review that requested this): a row that was genuinely resolved
-// on some earlier night, and then reactivated on THIS SAME night because a
-// fresh, distinct conflict was detected (a different divergence than the one
-// that was resolved), gets detected_at reset to... no — detected_at is NOT
-// reset on reactivation either (see UPSERT_VERSE_MERGE_CONFLICT_SQL), so this
-// specific row is NOT newly-detected-at-`now` and will correctly survive this
-// delete too. The one case this does NOT protect is a row that is
-// GENUINELY brand-new tonight (first-ever conflict for this verse) whose
-// speculative adopt attempt then loses its CAS race in the SAME run — that
-// row is correctly deleted (nothing valid existed before it), matching the
-// pre-fix behavior exactly, so there is no known remaining data-loss window
-// as of this comment. If future changes make detected_at mutable on
-// reactivation, re-examine this scoping.
-//
-// Binds, in order: (book, resource, chapter, verse, detectedAt).
+// Binds, in order: (book, resource, chapter, verse, lastRecordedAt).
 // ---------------------------------------------------------------------------
 export const DELETE_LOST_ADOPTION_CONFLICT_SQL = `DELETE FROM verse_merge_conflicts
     WHERE book = ?1 AND resource = ?2 AND chapter = ?3 AND verse = ?4
       AND action IN ('adopt', 'adopt_conflict')
       AND resolved_at IS NULL
-      AND detected_at = ?5`;
+      AND last_recorded_at = ?5`;
