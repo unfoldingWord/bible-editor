@@ -46,7 +46,7 @@ import {
 } from "../lib/laneChecks";
 import { ChapterBoard } from "./ChapterBoard";
 import { BookLocksDialog } from "./BookLocksDialog";
-import { drafts, verseKey } from "../sync/drafts";
+import { drafts, verseKey, pinVerseBase } from "../sync/drafts";
 import { generationForSavedPlain } from "../sync/draftSaveState";
 import { smartEditVerse } from "../lib/replace";
 import { extractEditableText, extractPlainText, normalizeEditable, SECTION_HEADER_TAGS } from "../lib/usfm";
@@ -2632,10 +2632,16 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     plain: string,
     base: VerseDto,
   ) => {
+    const key = verseKey(book, chapterNum, verseNum, bibleVersion);
+    // Pin the diff/save baseline to whatever `base` this edit session's FIRST
+    // keystroke saw. A version bump that lands mid-edit (WS verse.updated,
+    // nightly reconcile) must not rebase later keystrokes onto content the
+    // user never saw — see pinVerseBase's comment and issue #474.
+    const pinned = pinVerseBase(key, base);
     void drafts.set(
-      verseKey(book, chapterNum, verseNum, bibleVersion),
+      key,
       { plainText: plain },
-      base.version,
+      pinned.version,
       { kind: "verse", book, chapter: chapterNum, verse: verseNum, bibleVersion },
     );
   };
@@ -2657,7 +2663,21 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     plain: string,
     base: VerseDto,
   ) => {
-    const oldEditable = extractEditableText(base.content);
+    const key = verseKey(book, chapterNum, verseNum, bibleVersion);
+    // Diff and save against the SAME baseline this edit session's first
+    // keystroke pinned — never the live `base` this call happened to receive.
+    // `base` is recomputed from the chapter cache on every render, so a WS
+    // verse.updated (another tab's edit, or the nightly reconcile) that lands
+    // mid-edit would otherwise rebase the diff onto content the user never
+    // saw: their still-in-DOM stale text would read as "added back" against
+    // the new baseline, and get saved under ITS (valid) version — a
+    // stale-content/fresh-version save that can silently resurrect deleted
+    // text. Pinning both content and version together, and sending the
+    // pinned version as expected_version, means a real intervening change
+    // now surfaces as an ordinary 409 merge conflict instead. See #474.
+    const pinned = pinVerseBase(key, base);
+    const effectiveBase = { ...base, version: pinned.version, content: pinned.content } as VerseDto;
+    const oldEditable = extractEditableText(effectiveBase.content);
     // No-op guard: a focus/blur (or any save) with no actual text change must
     // not enqueue a PATCH — it would bump the verse version server-side for
     // nothing, adding noisy history and leaving a stale expected_version that a
@@ -2672,7 +2692,6 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     // leaves an orphaned draft (dirty border + SyncStatusBar entry + "unsaved
     // edits" toast whose Save button re-hits this guard and never resolves).
     if (oldEditable === normalizeEditable(plain)) {
-      const key = verseKey(book, chapterNum, verseNum, bibleVersion);
       void drafts
         .get(key)
         .then((draft) => {
@@ -2684,7 +2703,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         });
       return;
     }
-    const result = smartEditVerse(base.content, oldEditable, plain);
+    const result = smartEditVerse(effectiveBase.content, oldEditable, plain);
     // Heads-up when this save drops alignment. Editing a word's text or order
     // unaligns that word by design — the engine preserves only the words it
     // didn't have to touch — and the loss is otherwise easy to miss: the editor
@@ -2696,7 +2715,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     // INCREASED, so a pure punctuation / spacing edit — which keeps every \zaln —
     // stays silent.
     const beforeUnaligned = countUnalignedTargetWords(
-      (base.content as { verseObjects?: unknown[] } | null)?.verseObjects,
+      (effectiveBase.content as { verseObjects?: unknown[] } | null)?.verseObjects,
     );
     const afterUnaligned = countUnalignedTargetWords(
       (result.content as { verseObjects?: unknown[] } | null)?.verseObjects,
@@ -2710,7 +2729,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     }
     const newPlainText = extractPlainText(result.content);
     const newDto = {
-      ...base,
+      ...effectiveBase,
       chapter: chapterNum,
       verse: verseNum,
       bible_version: bibleVersion,
@@ -2721,13 +2740,12 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       bookHook?.applyLocalVerse(newDto);
       if (chapterNum === chapter) applyLocalVerse(newDto);
     };
-    const key = verseKey(book, chapterNum, verseNum, bibleVersion);
     // Resolve the durable draft before queueing so the outbox records the exact
     // generation represented by `plain`. If the user typed again after clicking
     // Save, generationForSavedPlain refuses to associate that newer draft with
     // this older payload, so the eventual 200 cannot clear the new work.
     const enqueueCapturedSave = (draftGeneration?: string) => {
-      if (!enqueueVerseSafely(chapterNum, verseNum, bibleVersion, base, result.content, newPlainText, "text_edit", base.version, applyLocal, draftGeneration)) {
+      if (!enqueueVerseSafely(chapterNum, verseNum, bibleVersion, effectiveBase, result.content, newPlainText, "text_edit", effectiveBase.version, applyLocal, draftGeneration)) {
         return;
       }
       applyLocal();
