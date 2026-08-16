@@ -8,14 +8,15 @@
 //   TN: unmatched/mismatched square brackets (13), an Alternate-translation label
 //       with no sentence terminator before it (12), a malformed Reference (6), a
 //       malformed rc:// SupportReference (7).
-//   USFM: unbalanced \f / \f* footnotes (6), missing verses (5).
+//   USFM: unbalanced \f / \f* footnotes (6), missing verses (5), unmatched
+//       curly quotation marks (“ ”).
 // The MECHANICAL checks (formatting, trailing \n, straight quotes, label spacing,
 // reference order, ids, occurrence) are auto-fixed at export and are NOT linted
 // here. See docs/export-validation-cleanup.md.
 
 import type { TnRow, TqRow, TwlRow, VerseRow } from "./types";
 import { parseVerseContentJson } from "./contentJson.ts";
-import { isTsMilestone } from "./importParsers.ts";
+import { extractPlainText, isTsMilestone } from "./importParsers.ts";
 import { parseRefOrderKey } from "./tsvFormat.ts";
 
 export type IssueBucket = "flag" | "escalate";
@@ -633,10 +634,40 @@ export function lintChapterOpeningMarkers(verses: VerseRow[]): LintIssue[] {
   return issues;
 }
 
-// USFM (ult/ust) integrity lint over the stored verse rows: unbalanced footnotes
-// and joiner-glued alignment milestones, per verse. (Verse-coverage / chapter-
-// count are guarded by the export shrink guard and validated whole-file
-// downstream; not duplicated here.)
+// Port of the "matched open/closed quotation marks" judgement call named in
+// #438 (the uw-content-validation check an editor "can easily fix" once
+// pointed at it) — stack-based pairing over the curly double quotes ULT/UST
+// actually use for direct discourse, same shape as bracketProblems above.
+// Deliberately narrow: straight `"` is auto-normalized to curly at export (see
+// docs/export-validation-cleanup.md) so it is not linted, and curly single
+// quotes (‘ ’) double as apostrophes inside words — a naive pairing check
+// cannot tell "don't" from a genuine unmatched single quote, so those are out
+// of scope rather than guessed at.
+function quoteProblems(text: string): string[] {
+  const out: string[] = [];
+  const stack: number[] = [];
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (ch === "“") {
+      stack.push(i);
+    } else if (ch === "”") {
+      if (stack.length === 0) {
+        out.push(`Closing quote '”' at character ${i + 1} has no matching opening quote.`);
+      } else {
+        stack.pop();
+      }
+    }
+  }
+  for (const pos of stack) {
+    out.push(`Opening quote '“' at character ${pos + 1} has no matching closing quote.`);
+  }
+  return out;
+}
+
+// USFM (ult/ust) integrity lint over the stored verse rows: unbalanced footnotes,
+// joiner-glued alignment milestones, and unmatched curly quotation marks, per
+// verse. (Verse-coverage / chapter-count are guarded by the export shrink guard
+// and validated whole-file downstream; not duplicated here.)
 export function lintUsfmVerses(verses: VerseRow[]): LintIssue[] {
   const issues: LintIssue[] = [];
   for (const v of verses) {
@@ -674,6 +705,9 @@ export function lintUsfmVerses(verses: VerseRow[]): LintIssue[] {
         ref,
         message: "the same source word is aligned in more than one group (renders as doubled Hebrew); re-align the verse.",
       });
+    }
+    for (const msg of quoteProblems(extractPlainText(parsed))) {
+      issues.push({ check: "Quotation Mark", bucket: "flag", ref, message: msg });
     }
   }
   return issues;

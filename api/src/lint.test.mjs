@@ -144,6 +144,32 @@ t("intra-word U+2060 joiner is NOT flagged as glued", () => {
   assert.equal(i.filter((x) => x.check === "Glued alignment").length, 0);
 });
 
+// Unmatched curly quotation mark detector (#438).
+const quoteChecks = (issues) => issues.filter((x) => x.check === "Quotation Mark");
+t("balanced curly quotes pass", () => {
+  const i = lintUsfmVerses([verseFromUsfm("\\c 1\n\\p\n\\v 1 he said, “hello.”\n")]);
+  assert.equal(quoteChecks(i).length, 0);
+});
+t("nested balanced curly quotes pass", () => {
+  const i = lintUsfmVerses([verseFromUsfm("\\c 1\n\\p\n\\v 1 “outer “inner” more”\n")]);
+  assert.equal(quoteChecks(i).length, 0);
+});
+t("unmatched opening curly quote flagged", () => {
+  const i = quoteChecks(lintUsfmVerses([verseFromUsfm("\\c 1\n\\p\n\\v 1 he said, “hello.\n")]));
+  assert.equal(i.length, 1);
+  assert.equal(i[0].bucket, "flag");
+  assert.match(i[0].message, /Opening quote/);
+});
+t("unmatched closing curly quote flagged", () => {
+  const i = quoteChecks(lintUsfmVerses([verseFromUsfm("\\c 1\n\\p\n\\v 1 he said hello.”\n")]));
+  assert.equal(i.length, 1);
+  assert.match(i[0].message, /Closing quote/);
+});
+t("straight quotes and apostrophes are NOT linted (out of scope)", () => {
+  const i = lintUsfmVerses([verseFromUsfm("\\c 1\n\\p\n\\v 1 don't say \"hello\n")]);
+  assert.equal(quoteChecks(i).length, 0);
+});
+
 // Reused-source-token detector (ZEC 14:8 UST doubled-Hebrew defect): a single
 // physical source token claimed by 2+ alignment chains with DIFFERING chain
 // identity. UHB-free — keyed on x-content|x-occurrence, not resolved position.
