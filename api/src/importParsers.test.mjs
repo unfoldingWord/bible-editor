@@ -1242,6 +1242,39 @@ const jWords = (ns, acc = []) => {
   assert(row.plainText.includes("Asherahs"), `plain_text re-derives as "…Asherahs…" (got ${JSON.stringify(row.plainText)})`);
   assert(!row.plainText.includes("Asherah s"), `the broken "Asherah s" is gone from plain_text`);
 }
+{
+  // (j) SCOPE BOUNDARY — a run of THREE identical chains (A·ws·B·ws·C) fuses only
+  // the FIRST adjacent pair per pass: after A+B merge the loop resumes past B, so
+  // the (A+B)·ws·C pair that is now adjacent is not reconsidered. No master case
+  // splits a word three ways; the test pins the behaviour as well-formed rather
+  // than complete — output stays a valid tree and C is left exactly as it was.
+  const tok = { strong: "H0842", content: "אֲשֵׁירֶ֖י⁠ךָ" };
+  const split = [jChain(tok, [jw("th")]), jsp(), jChain(tok, [jw("e")]), jsp(), jChain(tok, [jw("y")])];
+  const out = joinSplitSourceMilestones(split);
+  assert(jWords(out).join(" ") === "the y", `3-chain run fuses only the first pair (got "${jWords(out).join(" ")}")`);
+  assert(out.length === 3, `output is chain(A+B) · separator · chain(C) — 3 nodes (got ${out.length})`);
+  assert(out[0].children.length === 1 && out[0].children[0].text === "the", `A+B fused into ONE word node`);
+  assert(out[2] === split[4], `chain C is untouched (same reference)`);
+}
+{
+  // (k) SCOPE BOUNDARY — chain B's remaining children are spliced in verbatim, and
+  // the loop skips past the fused pair without descending, so a joinable pair that
+  // lives INSIDE those spliced children is not processed in the same pass. Again
+  // no master case nests one inside the other; pinned so a future change that does
+  // handle it is a deliberate one.
+  const outer = { strong: "H0842", content: "אֲשֵׁירֶ֖י⁠ךָ" };
+  const inner = { strong: "H1121", content: "בָּנֶ֑י⁠ךָ" };
+  const split = [
+    jChain(outer, [jw("Asherah")]),
+    jsp(),
+    jChain(outer, [jw("s"), jsp(), jChain(inner, [jw("child")]), jsp(), jChain(inner, [jw("s")])]),
+  ];
+  const out = joinSplitSourceMilestones(split);
+  assert(jWords(out).join(" ") === "Asherahs child s", `outer pair fuses, nested pair stays split (got "${jWords(out).join(" ")}")`);
+  assert(out.length === 1, `the outer chains collapse into one (got ${out.length})`);
+  const nested = out[0].children.filter((n) => n?.tag === "zaln");
+  assert(nested.length === 2, `both nested chains survive the splice unprocessed (got ${nested.length})`);
+}
 
 // Import-side collapse of a stacked chapter-front `\p` run to a single `\p`
 // (the EZK 8/11 pile-up). Verifies the D1-stored content_json heals — the piece

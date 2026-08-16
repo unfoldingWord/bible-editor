@@ -897,7 +897,11 @@ export function dropDuplicateSourceMilestones(verseObjects: unknown[]): unknown[
 // immediately REOPEN with an IDENTICAL nesting signature, splitting one English word
 // into two fragments across the boundary:
 //   MIC 5:14 ULT  `\w Asherah\w*\zaln-e\*` … `\zaln-s (same אֲשֵׁירֶ֖י⁠ךָ)\*\w s\w*`
+//     — the historical motivating case. en_ult PR #6737 removed the whitespace
+//     between the two chains on 2026-08-15, so the pass no longer fires there;
+//     the pre-fix shape is kept as the test fixture.
 //   JER 38:2 UST  the same shape four levels deep — `\w th\w*` … `\w ey\w*`
+//     — the one case still live on master as of 2026-08-15.
 // The verse renders "your Asherah s" / "th ey": a broken word in the editor, in
 // plain_text, and in every export. Nothing legitimate produces it — one source
 // token is already wrapped by one chain, so the reopen carries no new alignment
@@ -906,8 +910,8 @@ export function dropDuplicateSourceMilestones(verseObjects: unknown[]): unknown[
 // The rule is deliberately narrow, because adjacent chains on the SAME source token
 // are otherwise COMMON and legitimate (a source word aligned to two separated runs
 // of target words — HAB and PSA are thick with them). A sweep of every structural
-// candidate on master (1,892) fired on exactly the two true positives and nothing
-// else. All five conditions must hold:
+// candidate on master (1,892, run before the MIC fix landed) fired on exactly the
+// two true positives above and nothing else. All five conditions must hold:
 //   1. two chains are adjacent siblings separated by exactly one whitespace-only
 //      text node;
 //   2. their full nesting signatures are identical — same depth, and every level
@@ -938,7 +942,8 @@ export function dropDuplicateSourceMilestones(verseObjects: unknown[]): unknown[
 const REAL_SHORT_WORDS = new Set([
   "a", "i", "o", "am", "an", "as", "at", "be", "by", "do", "go", "he", "if", "in",
   "is", "it", "me", "my", "no", "of", "on", "or", "so", "to", "up", "us", "we",
-  "ah", "oh", "ho", "lo", "ye", "ox",
+  "ah", "oh", "ho", "lo", "ye", "ox", "ax", "aw", "eh", "ha", "hm", "id", "ex",
+  "ma", "pa", "um", "ok",
 ]);
 
 function isWordNode(n: unknown): n is Record<string, unknown> {
@@ -948,11 +953,23 @@ function isWordNode(n: unknown): n is Record<string, unknown> {
 
 // The chain of nested milestones under `node`, descending while a level holds
 // exactly one child and that child is itself a `\zaln`. Returns the per-level
-// identity signature plus the innermost node, whose children are the target words.
-function zalnChain(node: Record<string, unknown>): { sig: string; innermost: Record<string, unknown> } {
+// identity signature, the walked path (outermost → innermost) that rebuildChain
+// rebuilds over, and the innermost node, whose children are the target words.
+//
+// The signature DELIBERATELY diverges from sourcePart in api/src/alignmentDelta.ts:
+// that one defaults occurrence/occurrences to "1" and NFC-normalises every field,
+// this one defaults them to "" and normalises content only — here both sides come
+// from the same parse, so absent-vs-"1" must stay distinguishable. Not an oversight.
+function zalnChain(node: Record<string, unknown>): {
+  sig: string;
+  path: Record<string, unknown>[];
+  innermost: Record<string, unknown>;
+} {
   const parts: string[] = [];
+  const path: Record<string, unknown>[] = [];
   let cur = node;
   for (;;) {
+    path.push(cur);
     parts.push(
       [
         String(cur["strong"] ?? ""),
@@ -967,7 +984,7 @@ function zalnChain(node: Record<string, unknown>): { sig: string; innermost: Rec
     if (!isZalnNode(only)) break;
     cur = only!;
   }
-  return { sig: parts.join("»"), innermost: cur };
+  return { sig: parts.join("»"), path, innermost: cur };
 }
 
 function isWhitespaceTextNode(n: unknown): boolean {
@@ -1005,7 +1022,7 @@ export function joinSplitSourceMilestones(verseObjects: unknown[]): unknown[] {
           // after it, and drop both the separator and chain B.
           const fused = { ...aLast, text: (aLast["text"] as string) + (bFirst["text"] as string) };
           const mergedKids = [...aKids.slice(0, -1), fused, ...bKids.slice(1)];
-          out.push(rebuildChain(node!, a.innermost, mergedKids));
+          out.push(rebuildChain(a.path, mergedKids));
           i += 2;
           changed = true;
           continue;
@@ -1027,16 +1044,14 @@ export function joinSplitSourceMilestones(verseObjects: unknown[]): unknown[] {
   return transform(verseObjects);
 }
 
-// Copy `node`'s milestone chain down to `innermost`, replacing the innermost
-// child list. Never mutates the input nodes.
-function rebuildChain(
-  node: Record<string, unknown>,
-  innermost: Record<string, unknown>,
-  kids: unknown[],
-): Record<string, unknown> {
-  if (node === innermost) return { ...node, children: kids };
-  const only = (node["children"] as unknown[])[0] as Record<string, unknown>;
-  return { ...node, children: [rebuildChain(only, innermost, kids)] };
+// Copy a milestone chain — the outermost→innermost `path` zalnChain walked —
+// around a new innermost child list. Rebuilt bottom-up over that same path, so the
+// descent rule lives once in zalnChain instead of being re-derived here. Never
+// mutates the input nodes.
+function rebuildChain(path: Record<string, unknown>[], kids: unknown[]): Record<string, unknown> {
+  let node = { ...path[path.length - 1], children: kids };
+  for (let i = path.length - 2; i >= 0; i--) node = { ...path[i], children: [node] };
+  return node;
 }
 
 // ─── Collapse doubled leading poetry / paragraph markers ─────────────────────
