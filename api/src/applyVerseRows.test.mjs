@@ -1,0 +1,175 @@
+// Regression coverage for issue #486: applyVerseRows' pristine-write batch
+// must chunk at D1's 100-statement batch cap (mirroring every other write
+// site in bookReimport.ts, which all chunk at WRITE_BATCH = 90), and must
+// count inserted/updated only for statements that actually changed a row —
+// not blindly, the way the old unchunked implementation did.
+//
+// Run from api/ (needs the sqlite + strip-types flags, and the resolve hook
+// so applyVerseRowsForTest can pull in bookReimport.ts's own extensionless
+// application-module imports):
+//   node --experimental-sqlite --experimental-strip-types --no-warnings \
+//     --import ./src/tsResolveHook.mjs src/applyVerseRows.test.mjs
+
+import { DatabaseSync } from "node:sqlite";
+import { readdirSync, readFileSync } from "node:fs";
+import { join, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
+
+import { applyVerseRowsForTest } from "./bookReimport.ts";
+
+let failed = 0;
+function eq(actual, expected, msg) {
+  if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+    console.error(`FAIL: ${msg}\n    expected ${JSON.stringify(expected)}\n    got      ${JSON.stringify(actual)}`);
+    failed++;
+  } else {
+    console.log(`  ok: ${msg}`);
+  }
+}
+
+// ── Minimal D1 shim over node:sqlite, same shape as reimportJourney.test.mjs
+// (prepare().bind().all()/.first()/.run(), and batch()). Wrapped with a call
+// counter so the chunking assertions can see how many env.DB.batch() round
+// trips a call to applyVerseRowsForTest actually issued.
+function makeDb(sqlite) {
+  const mk = (sql, args) => ({
+    sql,
+    args,
+    bind: (...a) => mk(sql, a),
+    all() {
+      return { results: sqlite.prepare(sql).all(...args), success: true };
+    },
+    first() {
+      const r = sqlite.prepare(sql).all(...args);
+      return r.length ? r[0] : null;
+    },
+    run() {
+      const r = sqlite.prepare(sql).run(...args);
+      return { success: true, meta: { changes: Number(r.changes), last_row_id: Number(r.lastInsertRowid) } };
+    },
+  });
+  const batchCalls = { count: 0, sizes: [] };
+  return {
+    prepare: (sql) => mk(sql, []),
+    async batch(stmts) {
+      batchCalls.count++;
+      batchCalls.sizes.push(stmts.length);
+      const out = [];
+      for (const s of stmts) out.push(s.run());
+      return out;
+    },
+    _batchCalls: batchCalls,
+  };
+}
+
+function freshEnv() {
+  const sqlite = new DatabaseSync(":memory:");
+  const dir = join(dirname(fileURLToPath(import.meta.url)), "..", "migrations");
+  for (const f of readdirSync(dir).filter((f) => f.endsWith(".sql")).sort()) {
+    sqlite.exec(readFileSync(join(dir, f), "utf8"));
+  }
+  const db = makeDb(sqlite);
+  return { sqlite, db, env: { DB: db } };
+}
+
+const BOOK = "PSA";
+const VERSION = "ULT";
+
+function contentJson(text) {
+  return JSON.stringify({ verseObjects: [{ type: "text", text }] });
+}
+
+function verse(chapter, n, text) {
+  return { chapter, verse: n, verseEnd: null, contentJson: contentJson(text), plainText: text };
+}
+
+console.log("\n[applyVerseRows chunks its pristine write batch under the D1 100-statement cap]");
+{
+  // 176 brand-new verses (PSA 119's real verse count is the canonical example
+  // cited in #486) — unchunked, this is 2 statements/verse = 352 statements
+  // in one batch() call, well over D1's 100-statement cap. WRITE_BATCH is 90
+  // verses per slice, so 176 verses should take ceil(176/90) = 2 batch()
+  // calls for the writes, each followed by its own log batch.
+  const { env, sqlite } = freshEnv();
+  const verses = Array.from({ length: 176 }, (_, i) => verse(119, i + 1, `verse ${i + 1} text`));
+
+  const counts = await applyVerseRowsForTest(env, BOOK, VERSION, verses, null, null, false);
+
+  eq(counts.inserted, 176, "all 176 new verses counted inserted");
+  eq(counts.errors.length, 0, "no batch errors — the chunked path never hits the 100-statement cap");
+
+  const row = sqlite.prepare("SELECT COUNT(*) AS n FROM verses WHERE book = ? AND bible_version = ?").all(BOOK, VERSION);
+  eq(row[0].n, 176, "all 176 verses actually landed in D1");
+
+  // Two write-batch() calls (176 verses / 90 per slice), each ≤ 90 statements
+  // — never the single 352-statement call the pre-fix code would have issued.
+  const writeBatchSizes = env.DB._batchCalls.sizes.filter((n) => n > 0 && n <= 90);
+  eq(writeBatchSizes.every((n) => n <= 90), true, "every batch() call stayed at or under the WRITE_BATCH/D1 cap");
+  eq(env.DB._batchCalls.count >= 4, true, "writes were split into multiple batch() calls, not one giant batch (got " + env.DB._batchCalls.count + ")");
+}
+
+console.log("\n[a lost UPDATE race (updated_by set between read and write) is not miscounted]");
+{
+  // Reproduces the "related minor defect" from #486: a pristine verse is
+  // read as editable (updated_by IS NULL), but by the time the UPDATE runs
+  // a human has claimed it (updated_by now set) — the UPDATE's own guard
+  // matches 0 rows. The old code folded `updated` unconditionally once the
+  // batch() call succeeded, over-counting a race it never actually won.
+  const { env, sqlite } = freshEnv();
+  sqlite
+    .prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (1, 1, 'someone-else')`)
+    .run();
+  sqlite
+    .prepare(
+      `INSERT INTO verses (book, chapter, verse, verse_end, bible_version, content_json, plain_text, version, updated_by)
+       VALUES (?, ?, ?, NULL, ?, ?, ?, 1, NULL)`,
+    )
+    .run(BOOK, 23, 1, VERSION, contentJson("old text"), "old text");
+
+  // Simulate the interleaving human edit landing after applyVerseRows' own
+  // "existing" read but before its write batch runs, by claiming the row
+  // via a raw UPDATE the instant the shim's batch() is invoked for the
+  // first time (i.e. right before the pristine write batch executes).
+  const originalBatch = env.DB.batch.bind(env.DB);
+  let intercepted = false;
+  env.DB.batch = async (stmts) => {
+    if (!intercepted) {
+      intercepted = true;
+      sqlite.prepare(`UPDATE verses SET updated_by = 1 WHERE book = ? AND chapter = ? AND verse = ?`).run(BOOK, 23, 1);
+    }
+    return originalBatch(stmts);
+  };
+
+  const counts = await applyVerseRowsForTest(env, BOOK, VERSION, [verse(23, 1, "new master text")], null, null, false);
+
+  eq(counts.updated, 0, "the lost race is NOT counted as updated");
+  eq(counts.skipped_edited, 1, "the lost race is routed to skipped_edited, matching the file's existing pattern");
+
+  const row = sqlite
+    .prepare("SELECT content_json, version FROM verses WHERE book = ? AND chapter = ? AND verse = ?")
+    .all(BOOK, 23, 1)[0];
+  eq(JSON.parse(row.content_json).verseObjects[0].text, "old text", "the human-claimed verse's content was never overwritten");
+  eq(row.version, 1, "version was never bumped for a write that didn't land");
+
+  const logRow = sqlite
+    .prepare("SELECT COUNT(*) AS n FROM edit_log WHERE kind = 'verse' AND action = 'update' AND book = ?")
+    .all(BOOK)[0];
+  eq(logRow.n, 0, "no phantom restorable version was logged for the write that never landed");
+}
+
+console.log("\n[a plain no-op (nothing changed) is still counted skipped_noop, not inserted/updated]");
+{
+  const { env } = freshEnv();
+  const v = verse(5, 3, "unchanged");
+  await applyVerseRowsForTest(env, BOOK, VERSION, [v], null, null, false);
+  const counts = await applyVerseRowsForTest(env, BOOK, VERSION, [v], null, null, false);
+  eq(counts.inserted, 0, "second identical run inserts nothing");
+  eq(counts.updated, 0, "second identical run updates nothing");
+  eq(counts.skipped_noop, 1, "second identical run counts the no-op");
+}
+
+if (failed > 0) {
+  console.error(`\n${failed} assertion(s) failed`);
+  process.exit(1);
+}
+console.log("\nAll applyVerseRows chunking/counting assertions passed.");
