@@ -466,9 +466,21 @@ export async function dispatchNext(env: Env): Promise<void> {
         Authorization: `Bearer ${env.BT_API_TOKEN}`,
       },
       body: JSON.stringify(upstreamBody),
+      // See DISPATCH_POST_TIMEOUT_MS's doc comment — bounding this below
+      // STUCK_DISPATCH_THRESHOLD_SECONDS is what stops the stale-dispatch
+      // sweep from ever racing a still-live POST (issue #493). On abort we
+      // fail the row locally below, same as the pre-existing unreachable/
+      // non-OK paths — we do NOT know whether the upstream request actually
+      // landed, but leaving OUR row in 'dispatching' past our own timeout
+      // would just reopen the exact race this exists to close.
+      signal: AbortSignal.timeout(DISPATCH_POST_TIMEOUT_MS),
     });
-  } catch {
-    await fail("transient_outage", "upstream_unreachable");
+  } catch (e) {
+    if (e instanceof Error && e.name === "TimeoutError") {
+      await fail("transient_outage", "upstream_dispatch_timeout");
+    } else {
+      await fail("transient_outage", "upstream_unreachable");
+    }
     return;
   }
 
@@ -490,8 +502,9 @@ export async function dispatchNext(env: Env): Promise<void> {
 
   // Slot is ours and upstream accepted — record the bot's id and go running.
   //
-  // FIX (F2): guard on `state = 'dispatching'`. This upstream POST has no
-  // timeout, so a force-fail can land on this same row WHILE the POST is
+  // FIX (F2): guard on `state = 'dispatching'`. This upstream POST can still
+  // take up to DISPATCH_POST_TIMEOUT_MS to settle (bounded since #493, but
+  // not instant), so a force-fail can land on this same row WHILE the POST is
   // still in flight: force-fail accepts 'dispatching', flips this row to
   // failed/force_stopped, frees the slot, and its own dispatchNext claims a
   // different job. If this UPDATE then ran unconditionally, the original
@@ -1279,6 +1292,18 @@ const MAX_POLL_ATTEMPTS = 100;
 // slot and recording the result — fail it (don't auto-re-dispatch) so we never
 // risk launching a second concurrent run, and free the slot for the queue.
 const STUCK_DISPATCH_THRESHOLD_SECONDS = 120;
+
+// The dispatch POST itself (below, in dispatchNext) used to have no timeout
+// at all — the FIX (F2) comment there used to say so outright. That let a
+// slow POST (cold start / slow proxy) outlive
+// STUCK_DISPATCH_THRESHOLD_SECONDS: the */5 sweep would fail the row and free
+// the slot while the original POST was still in flight, and that same tick's
+// dispatchNext safety net could then claim and dispatch a SECOND job —
+// double-occupying the single-slot bot the instant the first POST eventually
+// succeeded upstream (issue #493). Bounding the POST comfortably below the
+// sweep's threshold means OUR OWN catch always fails the row first, so the
+// sweep can never find a 'dispatching' row to race against a still-live POST.
+const DISPATCH_POST_TIMEOUT_MS = (STUCK_DISPATCH_THRESHOLD_SECONDS - 30) * 1000;
 
 // Auto-resume time-box. A pause older than this is not resumed automatically:
 // the bot's checkpoint may no longer match the repo state, and a stale resume is
