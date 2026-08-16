@@ -814,4 +814,19 @@ t("lossless: lone \\q1 followed by \\s1 remains preserved", () => {
   assert.ok(ls.some((l) => l.trim() === "\\q1"), "\\q1 is left in place");
 });
 
+// ── Issue #431 regression: idempotence on a content-less \q* before \ts\* ──
+// across a chapter boundary. FIX D (dropping a content-less \q* before \c/
+// EOF) used to make a fresh \p/\ts\* adjacency for the SECOND pass that
+// reorderMarkerRuns had already run past on the first — losing a \p and
+// moving \ts\* across the chapter boundary. FIX D was removed by #435 (lone
+// \q* is now always preserved), which also removes the adjacency this
+// exploited, but the invariant is worth pinning directly.
+
+t("issue #431: idempotent on lone \\q1 before \\ts\\* at a chapter boundary", () => {
+  const src = `${HDR}\\c 9\n\\p\n\\q1\n\\ts\\*\n\\c 10\n\\p\n\\v 1 \\w text\\w*\n`;
+  const once = norm(src);
+  assert.equal(norm(once), once, "second normalization pass is a no-op");
+  assert.equal(pCount(once), 2, "both \\p markers survive");
+});
+
 console.log(`\n${passed} usfmFormat tests passed`);
