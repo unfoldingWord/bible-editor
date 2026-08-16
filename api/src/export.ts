@@ -1484,6 +1484,57 @@ function ensureZalnLemmaAttr(verseObjects: unknown[]): void {
   walk(verseObjects);
 }
 
+// Drop a junk marker node whose whole content is `\w` ATTRIBUTE RESIDUE.
+//
+// Second line of defence for issue #481. A `\w` on master whose attribute
+// section carries a stray backslash — `\w Judah.”|\x-occurrence="1"
+// x-occurrences="1"\w*` — used to parse (usfm-js reads the `\x` as a marker
+// opener) into a junk sibling `{tag:"x", content:"-occurrence=\"1\"
+// x-occurrences=\"1\""}` next to the word. Rendering that node back out emits
+// a REAL cross-reference (`\x -occurrence="1" x-occurrences="1"\x*`), which is
+// how four invalid `\x` markers reached en_ust/24-JER.usfm master.
+// importParsers.sanitizeWordAttributes now repairs the raw USFM before it is
+// ever parsed, so no new junk node can be created — but rows already stored in
+// D1 from an earlier ingest still hold one, and export is the last gate before
+// master. Drop them here too.
+//
+// Deliberately narrow: only a childless, text-less marker node whose ENTIRE
+// content is a `key="value"` attribute list. Real `\x` / `\f` content always
+// carries its own inner markers (`\xo`, `\xt`, `\ft`), and real character-style
+// content is prose — neither matches. Word, text and milestone nodes are never
+// candidates, so this cannot touch alignment: the surviving `\w` keeps its
+// occurrence numbers from recomputeTargetOccurrences, which runs first.
+const ATTR_RESIDUE_RE = /^[A-Za-z-]*=\s*"[^"]*"(?:\s+[A-Za-z][\w-]*\s*=\s*"[^"]*")*$/;
+
+function isWordAttrResidue(node: unknown): boolean {
+  if (!node || typeof node !== "object") return false;
+  const o = node as Record<string, unknown>;
+  if (typeof o["tag"] !== "string") return false;
+  if (o["type"] === "text" || o["type"] === "word" || o["type"] === "milestone") return false;
+  if (Array.isArray(o["children"]) || typeof o["text"] === "string") return false;
+  return typeof o["content"] === "string" && ATTR_RESIDUE_RE.test(o["content"]);
+}
+
+// Returns the number of residue nodes removed. Mutates `verseObjects` in place
+// (children arrays keep their identity, so nested milestones are still walked).
+function dropWordAttrResidue(verseObjects: unknown[]): number {
+  if (!Array.isArray(verseObjects)) return 0;
+  let dropped = 0;
+  for (let i = verseObjects.length - 1; i >= 0; i--) {
+    const node = verseObjects[i];
+    if (isWordAttrResidue(node)) {
+      verseObjects.splice(i, 1);
+      dropped++;
+      continue;
+    }
+    if (node && typeof node === "object") {
+      const children = (node as Record<string, unknown>)["children"];
+      if (Array.isArray(children)) dropped += dropWordAttrResidue(children);
+    }
+  }
+  return dropped;
+}
+
 export function buildUsfm(input: UsfmInputs): string {
   // Group verses by chapter, parsing the stored JSON. Corrupt content fails
   // the export; a partial book is worse than no nightly snapshot.
@@ -1502,6 +1553,9 @@ export function buildUsfm(input: UsfmInputs): string {
       if (Array.isArray(vos)) {
         recomputeTargetOccurrences(vos);
         ensureZalnLemmaAttr(vos);
+        // Never ship `\w` attribute residue back to master as a fake `\x`
+        // cross-reference (issue #481). No-op on clean verses.
+        dropWordAttrResidue(vos);
       }
     }
     const ch = String(v.chapter);
