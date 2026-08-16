@@ -883,6 +883,14 @@ export interface ReimportCounts {
   // older/cached response may omit them.
   conflict_skipped?: number;
   tombstone_blocked?: number;
+  // Tombstoned rows hard-deleted because their id no longer appears anywhere
+  // in master's current book-wide file — pure dead weight (issue #427, option
+  // 3). Distinct from, and can never overlap with, tombstone_blocked above:
+  // that counter only ever fires for an id master's file DOES still carry (at
+  // a different reference); this one only ever fires for an id master's file
+  // does NOT carry at all. See api/src/bookReimport.ts's sweepObsoleteTombstones.
+  // Optional: an older/cached response may omit it.
+  tombstones_swept?: number;
   dcs_404: number;
   errors: string[];
 }
@@ -1297,6 +1305,13 @@ export interface AdminImportCounts {
   // watermark. Optional: an older/cached response may omit them.
   conflict_skipped?: number;
   tombstone_blocked?: number;
+  // Issue #427, option 3 — see ReimportCounts.tombstones_swept above for the
+  // disjointness note (identical reasoning, same server object). tombstones_
+  // locked is diagnostic only (chapters this run's sweep deferred for an
+  // active pipeline lock); unlike prune_locked/chapters_locked it never gates
+  // the sync watermark. Optional: an older/cached response may omit them.
+  tombstones_swept?: number;
+  tombstones_locked?: number;
   resurrected: number;
   source_attr_reconciled: number;
   source_attr_divergent: number;

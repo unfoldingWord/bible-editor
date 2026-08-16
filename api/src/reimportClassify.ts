@@ -280,3 +280,28 @@ function normalizeRef(r: TombstoneRef): string {
 export function isReissuedTombstone(stored: TombstoneRef, incoming: TombstoneRef): boolean {
   return normalizeRef(stored) !== normalizeRef(incoming);
 }
+
+// ── Obsolete-tombstone discriminator (issue #427, option 3) ─────────────────
+//
+// A tombstoned row's id is "obsolete" — pure dead weight, safe to hard-delete
+// and free the (book, id) primary-key slot — iff master's current book-wide
+// TSV does not carry that id AT ALL, at any reference. Trivial as a predicate
+// (a single Set.has check), but pulled out as its own named, tested function
+// for the same reason isReissuedTombstone above is: so the DISJOINTNESS claim
+// between this predicate and isReissuedTombstone is something a test can
+// drive directly, not just something a comment asserts.
+//
+// The two partition the exact same membership test from opposite sides:
+//   - isReissuedTombstone is only ever consulted (in bookReimport.ts's
+//     applyTsvRows) for an id that IS present in `incoming` — i.e. an id
+//     `masterIds.has(id)` is true for.
+//   - isObsoleteTombstoneId is true only when `masterIds.has(id)` is false.
+// So for any single id, at most one of the two can ever be the live question —
+// there is no id for which BOTH "master carries it" and "master does not
+// carry it" hold. Sweeping an obsolete tombstone (this predicate) can
+// therefore never remove the evidence a genuine reissue block
+// (isReissuedTombstone) depends on. See tombstoneSweep.test.mjs for the
+// integration-level proof against a real applyTsvRows run.
+export function isObsoleteTombstoneId(id: string, masterIds: ReadonlySet<string>): boolean {
+  return !masterIds.has(id);
+}

@@ -63,6 +63,7 @@ import {
   isReimportableRow,
   computeEditedFieldMerge,
   isReissuedTombstone,
+  isObsoleteTombstoneId,
 } from "./reimportClassify";
 import {
   computeTsvMerge,
@@ -202,6 +203,38 @@ export interface ReimportCounts {
   // watermark with no automatic release (see the reimport-sync step) is only
   // actionable if a human is told WHICH rows to go fix.
   blocked_samples?: string[];
+  // ── Issue #427, option 3: sweep obsolete tombstones ────────────────────────
+  //
+  // A tombstoned row hard-DELETEd because its id no longer appears ANYWHERE in
+  // master's current book-wide TSV — not merely absent from the chapters this
+  // run touched, absent from the whole file, same book-wide comparison
+  // softDeleteRemovedTsvRows already makes for LIVE rows. Such a row is pure
+  // dead weight: master will never resurrect it (master doesn't have it), and
+  // the only thing its permanently-held (book, id) primary-key slot does is
+  // sit there waiting for some UNRELATED future id to collide with it — the
+  // exact mechanism behind the 1CH 23 tQ incident that motivated
+  // tombstone_blocked above. See sweepObsoleteTombstones for the guardrails
+  // (truncation gate, per-chapter lock deferral) and, importantly, the proof
+  // that this counter's target set can NEVER overlap with tombstone_blocked's:
+  // that counter only ever fires for an id master's file DOES carry; this one
+  // only ever fires for an id master's file does NOT carry. Sweeping a
+  // tombstone can therefore never delete the evidence behind a genuine
+  // reissue block out from under it. Reclaiming a REISSUED id (so master's new
+  // row actually lands) remains issue #427's option 1 and is NOT this.
+  tombstones_swept: number;
+  // Chapters this run's sweep DEFERRED because an active AI pipeline job held
+  // the chapter lock (same activePipelineForChapter check softDeleteRemovedTsvRows
+  // uses). Deliberately does NOT feed prune_locked and does NOT gate
+  // shouldRecordResourceSync/the sync watermark, unlike prune_locked's own
+  // lock-skip count — and that asymmetry is intentional, not an oversight: every
+  // row a deferred sweep would have removed is ALREADY a tombstone (deleted_at
+  // already set), so it already renders as deleted in every read and every
+  // export regardless of whether this run reclaimed its primary-key slot.
+  // Deferring the sweep costs nothing but a delayed reclaim — a later run over
+  // the same (now-unlocked) chapter catches up — so withholding a watermark
+  // over it would be over-cautious for a condition with zero effect on export
+  // correctness. Tracked separately purely for observability.
+  tombstones_locked: number;
   // Pristine tombstone that master still carries, brought back to life because
   // an earlier reimport prune had erroneously soft-deleted it (the HAB tn
   // truncated-fetch incident). Human-deleted/trashed rows are never resurrected.
@@ -369,6 +402,8 @@ function zeroCounts(): ReimportCounts {
     skipped_dup: 0,
     conflict_skipped: 0,
     tombstone_blocked: 0,
+    tombstones_swept: 0,
+    tombstones_locked: 0,
     resurrected: 0,
     source_attr_reconciled: 0,
     source_attr_divergent: 0,
@@ -443,6 +478,16 @@ function addCounts(into: ReimportCounts, from: ReimportCounts): void {
   into.skipped_dup += from.skipped_dup;
   into.conflict_skipped += from.conflict_skipped ?? 0;
   into.tombstone_blocked += from.tombstone_blocked ?? 0;
+  // tombstones_swept / tombstones_locked (issue #427, option 3) deliberately do
+  // NOT join the `incomplete` taint check above: unlike chapters_locked/
+  // prune_locked/conflict_skipped/tombstone_blocked, neither one ever gates
+  // shouldRecordResourceSync (see tombstones_locked's own doc for why a
+  // deferred sweep has no export-correctness consequence to protect), so there
+  // is no watermark decision here for an absent-vs-zero distinction to protect.
+  // Plain `?? 0` coercion is the right and sufficient handling for a legacy/
+  // replayed chunk result that predates this field.
+  into.tombstones_swept += from.tombstones_swept ?? 0;
+  into.tombstones_locked += from.tombstones_locked ?? 0;
   // Diagnostic list, merged under the same cap. Never gates anything, so a
   // truncation here cannot affect a watermark decision.
   if (from.blocked_samples?.length) {
@@ -775,6 +820,22 @@ async function runReimport(
       perResource[kind].skipped_locked += res.skippedLocked;
     } catch (e) {
       perResource[kind].errors.push(`${kind} prune: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    // Issue #427, option 3. Runs AFTER the soft-delete pass above (and after
+    // this run's tombstone_blocked count is already final — see
+    // sweepObsoleteTombstones' header). This route never touches
+    // book_resource_syncs (see summarizeReimport's comment on the manual
+    // "Pull from Door43" action), so there is no watermark to protect either
+    // way here; skippedLocked folds into skipped_locked, mirroring exactly how
+    // the soft-delete pass's own skippedLocked is handled two lines up — this
+    // path has no prune_locked/chapters_locked gate to keep separate from.
+    try {
+      const res = await sweepObsoleteTombstones(env, book, kind, raw, chapters);
+      perResource[kind].tombstones_swept += res.swept;
+      perResource[kind].tombstones_locked += res.skippedLocked;
+      perResource[kind].skipped_locked += res.skippedLocked;
+    } catch (e) {
+      perResource[kind].errors.push(`${kind} tombstone sweep: ${e instanceof Error ? e.message : String(e)}`);
     }
   }
 
@@ -3382,9 +3443,16 @@ async function noteOwnPublishDecline(
 // (book, id) slot forever, master keeps carrying that id, and every subsequent
 // night re-stages the file (the SHA gate cannot skip it — the watermark was
 // never advanced), re-drops the same rows, and re-withholds. **There is no
-// automatic release.** Until a human acts, or until issue #427's option 1
-// (reclaim a reissued id) or option 3 (sweep obsolete tombstones) ships, this
-// book+resource stops exporting to Door43 entirely.
+// automatic release.** Issue #427's option 3 (sweep obsolete tombstones) has
+// shipped (sweepObsoleteTombstones) — but it does NOT clear this specific
+// freeze, and that is by design, not a gap: this alert exists only for a
+// REISSUED tombstone, where master carries the id at a DIFFERENT reference
+// (isReissuedTombstone returning true). The sweep's target is the exact
+// complement — an id ABSENT from master's file entirely — so a tombstone this
+// alert is naming can never be one the sweep would have touched (see
+// sweepObsoleteTombstones' disjointness proof). Until a human acts, or until
+// issue #427's option 1 (reclaim a reissued id) ships, this book+resource
+// stops exporting to Door43 entirely.
 //
 // That is the correct fail-safe direction — exporting instead would render a D1
 // that is short of master back over master, deleting master's rows, which is the
@@ -3425,8 +3493,9 @@ async function raiseTombstoneBlockAlert(
     (conflicts > 0 ? `${conflicts} refused by the database as an ID already in use` : "") +
     `. Affected: ${shown.join(" | ")}${more > 0 ? ` (and ${more} more)` : ""}. ` +
     `This does NOT clear on its own — the next sync hits the same collision. To clear it, either give ` +
-    `the affected row(s) a different ID on Door43, or land the ID-reclaim / tombstone-sweep fix ` +
-    `(GitHub issue #427, options 1 and 3).`;
+    `the affected row(s) a different ID on Door43, or land the ID-reclaim fix (GitHub issue #427, ` +
+    `option 1 — the already-shipped option 3 tombstone sweep does not clear this, since it only removes ` +
+    `tombstones whose ID master has dropped entirely, which is never true for a reissue block).`;
   try {
     await env.DB.prepare(`DELETE FROM system_alerts WHERE username = ?1 AND source = ?2 AND dismissed_at IS NULL`)
       .bind(OWN_PUBLISH_ALERT_USERNAME, source)
@@ -3867,6 +3936,114 @@ async function softDeleteRemovedTsvRows(
   return { deleted, skippedLocked };
 }
 
+// Sweep obsolete tombstones (issue #427, option 3): free the (book, id)
+// primary-key slot a soft-deleted row occupies FOREVER once master's TSV no
+// longer carries that id ANYWHERE in the book. Complements
+// softDeleteRemovedTsvRows just above (which soft-deletes a LIVE row master
+// dropped) by finishing the other half of the same lifecycle: once a row is
+// already dead AND master has moved on from its id entirely, there is nothing
+// left to protect by keeping the slot occupied — the row will never come back
+// (master doesn't have it — that is the whole predicate), and holding the slot
+// only creates a landmine for some future, UNRELATED id to collide with (the
+// exact mechanism behind the 1CH 23 tQ incident that motivated
+// isReissuedTombstone/tombstone_blocked). This HARD-deletes — an actual
+// `DELETE FROM ...`, not another soft-delete — because the whole point is to
+// free the primary key, not to re-tombstone an already-tombstoned row.
+//
+// DISJOINT FROM tombstone_blocked BY CONSTRUCTION, not by observation. Read
+// this before touching either function. isReissuedTombstone (reimportClassify
+// .ts) is invoked ONLY from inside applyTsvRows' loop over `incoming` — i.e.
+// only for an id that master's file for THIS run DOES carry. This function's
+// target set is the exact complement: ids ABSENT from `incomingIds` entirely.
+// The two conditions partition the same "is this id in incomingIds?" test from
+// opposite sides, so no id can ever be evaluated by both predicates, let alone
+// satisfy both — sweeping a tombstone can never delete the evidence a genuine
+// reissue block depends on, in this run or the next (the id this sweep freed
+// is, by definition, one master no longer mentions at all, so it can't be
+// "reissued" on THIS run's file either). See tombstoneSweep.test.mjs for a
+// driven proof, not just this comment's reasoning.
+//
+// Same guardrails as softDeleteRemovedTsvRows, independently re-derived (each
+// function does its own whole-book TSV parse — see that function's own parse
+// for the established precedent of doing this more than once per run; TSV
+// parsing is cheap relative to the USFM/CPU concerns this file's batching
+// exists for): an empty/garbled file must never be read as "master has
+// nothing", which would make every tombstone in the book look obsolete and
+// sweep the whole book clean; only chapters this run's file actually COVERS;
+// never a chapter an active AI pipeline job currently holds (see
+// tombstones_locked on ReimportCounts for why that deferral does NOT gate the
+// sync watermark the way prune_locked does).
+//
+// Runs at the SAME call sites as softDeleteRemovedTsvRows, AFTER it — which is
+// itself after the apply/chunk phase that computes THIS run's tombstone_
+// blocked count — so a tombstone this sweep removes can never have been the
+// blocking row behind this run's own tombstone_blocked tally (that tally is
+// already final by the time this function is ever called).
+async function sweepObsoleteTombstones(
+  env: Env,
+  book: string,
+  kind: TsvKind,
+  rawTsv: string,
+  candidateChapters: number[],
+): Promise<{ swept: number; skippedLocked: number }> {
+  const incomingIds = new Set<string>();
+  const coveredChapters = new Set<number>();
+  for (const r of parseTsv(rawTsv).rows) {
+    const p = parseTsvRow(r, kind);
+    if (!p) continue;
+    incomingIds.add(p.id);
+    // >= 0, not >= 1: chapter 0 (refParts("front:intro")) is a real chapter —
+    // mirrors softDeleteRemovedTsvRows' identical comment.
+    if (p.chapter >= 0) coveredChapters.add(p.chapter);
+  }
+  // Defensive: an empty or garbled file must never be read as "master carries
+  // nothing", which would make every tombstone in the book look obsolete.
+  if (incomingIds.size === 0) return { swept: 0, skippedLocked: 0 };
+
+  let swept = 0;
+  let skippedLocked = 0;
+  for (const ch of candidateChapters) {
+    if (!coveredChapters.has(ch)) continue;
+    if (await activePipelineForChapter(env, book, ch)) {
+      skippedLocked++;
+      continue;
+    }
+    const rs = await env.DB.prepare(
+      `SELECT id FROM ${kind}_rows WHERE book = ?1 AND chapter = ?2 AND deleted_at IS NOT NULL`,
+    )
+      .bind(book, ch)
+      .all<{ id: string }>();
+    const targets = (rs.results ?? []).filter((r) => isObsoleteTombstoneId(r.id, incomingIds));
+    for (const t of targets) {
+      // Re-assert deleted_at IS NOT NULL at write time, mirroring the
+      // version-CAS re-assertion pattern used everywhere else in this file:
+      // the only path that can clear deleted_at (applyTsvRows' resurrect
+      // branch) runs earlier in this same run, so this is defense-in-depth
+      // against a hypothetical overlapping run rather than an expected race.
+      const del = await env.DB.prepare(
+        `DELETE FROM ${kind}_rows WHERE id = ?1 AND book = ?2 AND deleted_at IS NOT NULL`,
+      )
+        .bind(t.id, book)
+        .run();
+      if (del.meta.changes) swept++;
+    }
+  }
+  return { swept, skippedLocked };
+}
+
+// Exported for the integration test ONLY (tombstoneSweep.test.mjs), mirroring
+// applyTsvRows' own test-only export doc above: driving the REAL function is
+// what makes the disjointness proof drift-detecting rather than a claim about
+// a hand-copied SQL statement.
+export const sweepObsoleteTombstonesForTest = (
+  env: Env,
+  book: string,
+  kind: TsvKind,
+  rawTsv: string,
+  candidateChapters: number[],
+): Promise<{ swept: number; skippedLocked: number }> =>
+  sweepObsoleteTombstones(env, book, kind, rawTsv, candidateChapters);
+
 // SHA-gate each requested resource and stage the changed ones to R2. Returns
 // the book's chapter extent + a manifest the chunk steps read from.
 async function planAndStageBookResources(
@@ -4212,18 +4389,42 @@ export async function runChunkedReimport(
     const r2Key = e.r2Key;
     const res = await step.do(`reimport-prune-${book}-${kind}`, async () => {
       const raw = await readStaged(env, r2Key);
-      if (raw == null) return { deleted: 0, skippedLocked: 0 };
-      const res = await softDeleteRemovedTsvRows(env, book, kind, raw, chs);
-      if (res.deleted > 0 || res.skippedLocked > 0) {
-        console.log("reimport pruned rows removed on master", { book, resource: kind, ...res });
+      if (raw == null) return { deleted: 0, skippedLocked: 0, tombstonesSwept: 0, tombstonesLocked: 0 };
+      const pruneRes = await softDeleteRemovedTsvRows(env, book, kind, raw, chs);
+      if (pruneRes.deleted > 0 || pruneRes.skippedLocked > 0) {
+        console.log("reimport pruned rows removed on master", { book, resource: kind, ...pruneRes });
       }
-      return res;
+      // Issue #427, option 3. Runs in the SAME step, AFTER the soft-delete pass
+      // above and reusing the same staged `raw` (no extra R2 read) — and, more
+      // importantly, after every chunk-apply step for this book already ran, so
+      // this run's tombstone_blocked count is already final by the time any
+      // tombstone could be swept (see sweepObsoleteTombstones' header for why
+      // that ordering is what makes the two counters provably disjoint, not
+      // merely disjoint by luck this run).
+      const sweepRes = await sweepObsoleteTombstones(env, book, kind, raw, chs);
+      if (sweepRes.swept > 0 || sweepRes.skippedLocked > 0) {
+        console.log("reimport swept obsolete tombstones", { book, resource: kind, ...sweepRes });
+      }
+      return {
+        deleted: pruneRes.deleted,
+        skippedLocked: pruneRes.skippedLocked,
+        tombstonesSwept: sweepRes.swept,
+        tombstonesLocked: sweepRes.skippedLocked,
+      };
     });
     // Feed the prune's own lock skips into the watermark gate (FIX A / the
     // prune-phase half of shouldRecordResourceSync) — this step runs LATER
     // than the chunk-apply steps above, so a lock that starts after those
     // steps finish but is still held here is invisible to chapters_locked.
     if (res.skippedLocked > 0) perResource[kind].prune_locked += res.skippedLocked;
+    // The sweep's own lock-skips deliberately do NOT feed prune_locked (see
+    // tombstones_locked's doc on ReimportCounts for why a deferred sweep has no
+    // export-correctness consequence to gate on). `?? 0` guards a step result
+    // memoized by a Workflow instance that started before this field existed —
+    // step.do replays its stored result verbatim on resume, same as every other
+    // `?? 0` coercion in this file.
+    perResource[kind].tombstones_swept += res.tombstonesSwept ?? 0;
+    perResource[kind].tombstones_locked += res.tombstonesLocked ?? 0;
   }
 
   // Canonical TWL order: recompute the ULT-position ordering for the book now

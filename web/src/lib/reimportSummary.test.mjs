@@ -137,6 +137,35 @@ lacks(
 lacks(summarizeReimport(res({})), "NOT imported", "no blocked rows → no blocked phrase");
 lacks(summarizeReimport(res({})), "NaN", "absent counters never render as NaN");
 
+console.log("\n-- obsolete tombstones swept (issue #427, option 3) --");
+
+// 0 / absent must print nothing, matching every other optional counter here.
+lacks(summarizeReimport(res({ tombstones_swept: 0 })), "obsolete tombstone", "0 swept -> no line");
+lacks(summarizeReimport(res({})), "obsolete tombstone", "field absent -> no line");
+
+has(
+  summarizeReimport(res({ tombstones_swept: 3 })),
+  "3 obsolete tombstone(s) cleared",
+  "swept count is reported",
+);
+eq(
+  summarizeReimport(res({ tombstones_swept: 3 })),
+  "Imported AMO: 3 obsolete tombstone(s) cleared.",
+  "swept alone -> a complete sentence, not the plain no-changes message",
+);
+
+// Must coexist with (and sit after) the blocked-row line — sweeping and
+// blocking are disjoint by construction (see sweepObsoleteTombstones), so a
+// single run can legitimately report both at once.
+const sweptAndBlocked = summarizeReimport(res({ tombstone_blocked: 2, tombstones_swept: 5 }));
+has(sweptAndBlocked, "2 NOT imported (ID still held by a deleted row)", "blocked line still present");
+has(sweptAndBlocked, "5 obsolete tombstone(s) cleared", "swept line still present");
+eq(
+  sweptAndBlocked.indexOf("NOT imported") < sweptAndBlocked.indexOf("obsolete tombstone"),
+  true,
+  "the actionable blocked-row count comes BEFORE the informational swept line",
+);
+
 if (failed > 0) {
   console.error(`\n${failed} failure(s)`);
   process.exit(1);

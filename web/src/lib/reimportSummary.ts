@@ -39,6 +39,10 @@ export function summarizeReimport(res: ReimportResponse): string {
   // this run did not have. See api/src/reimportClassify.ts / GitHub issue #427.
   const blocked = (t.tombstone_blocked ?? 0) + (t.conflict_skipped ?? 0);
   if (blocked) parts.push(`${blocked} NOT imported (ID still held by a deleted row)`);
+  // Tombstones hard-deleted because master no longer carries their id anywhere
+  // (issue #427, option 3) — informational, not actionable, so it sits after
+  // the blocked-row line rather than competing with it for attention.
+  if (t.tombstones_swept) parts.push(`${t.tombstones_swept} obsolete tombstone(s) cleared`);
   if (t.dcs_404) parts.push(`${t.dcs_404} resource(s) not on DCS`);
   if (parts.length === 0) return `Imported ${res.book} — no changes.`;
   return `Imported ${res.book}: ${parts.join(", ")}.`;

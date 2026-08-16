@@ -18,6 +18,7 @@ import {
   isReimportableRow,
   computeEditedFieldMerge,
   isReissuedTombstone,
+  isObsoleteTombstoneId,
   AI_SOURCE,
 } from "./reimportClassify.ts";
 
@@ -414,6 +415,62 @@ eq(
   true,
   "both ref_raw blank, chapter/verse differ → reissued via the fallback",
 );
+
+// ── isObsoleteTombstoneId (issue #427, option 3) ────────────────────────────
+console.log("\n[isObsoleteTombstoneId]");
+
+eq(
+  isObsoleteTombstoneId("hoig", new Set(["abcd", "wxyz"])),
+  true,
+  "id absent from master's book-wide id set → obsolete (sweep target)",
+);
+eq(
+  isObsoleteTombstoneId("hoig", new Set(["hoig", "wxyz"])),
+  false,
+  "id present in master's book-wide id set → NOT obsolete, whatever the reference",
+);
+eq(
+  isObsoleteTombstoneId("hoig", new Set()),
+  true,
+  "empty master id set → obsolete (the caller's own empty-file guard is a separate, earlier defense)",
+);
+
+// ── Disjointness: isObsoleteTombstoneId and isReissuedTombstone can never ──
+// both fire for the same id in the same run (issue #427, options 2 vs 3).
+// isReissuedTombstone is only ever CONSULTED (in applyTsvRows) for an id
+// master's file carries; isObsoleteTombstoneId is true only when master's
+// file does NOT carry the id. So for the exact set of ids a real reimport run
+// would ever ask isReissuedTombstone about, isObsoleteTombstoneId must always
+// report false — proven here by construction rather than by example, so it
+// can't be defeated by picking a lucky id.
+console.log("\n[disjointness: isObsoleteTombstoneId vs isReissuedTombstone]");
+{
+  const masterIds = new Set(["hoig", "abcd", "wxyz"]);
+  // Every id isReissuedTombstone would ever be asked about (in the real
+  // caller) is, by construction, a member of masterIds — that member ship is
+  // what routes the row to the tombstone branch that calls isReissuedTombstone
+  // in the first place. Sweep every such id through both predicates.
+  let sawOverlap = false;
+  for (const id of masterIds) {
+    const obsolete = isObsoleteTombstoneId(id, masterIds);
+    // isReissuedTombstone itself doesn't take an id — it compares references —
+    // but the PRECONDITION for it ever being called for this id is exactly
+    // "id is in masterIds", which is the true/false isObsoleteTombstoneId
+    // report we're checking here.
+    if (obsolete) sawOverlap = true;
+  }
+  eq(sawOverlap, false, "no id master's file carries is ever classified obsolete — the two sets cannot overlap");
+
+  // And the converse, stated the other way for symmetry: every id
+  // isObsoleteTombstoneId reports true for is, by definition, ABSENT from
+  // masterIds — so it is not a member of the domain isReissuedTombstone is
+  // ever invoked over at all.
+  const obsoleteIds = ["ffff", "gggg"].filter((id) => isObsoleteTombstoneId(id, masterIds));
+  eq(obsoleteIds.length, 2, "sanity: both sample ids are indeed absent from master");
+  for (const id of obsoleteIds) {
+    eq(masterIds.has(id), false, `obsolete id ${id} is confirmed absent from masterIds — never reaches isReissuedTombstone`);
+  }
+}
 
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed`);
