@@ -26,6 +26,7 @@ import {
   findSuspiciousDoubleSpaces,
   sanitizeMarkerSpacing,
   dropDuplicateSourceMilestones,
+  joinSplitSourceMilestones,
   curlifyVerseObjects,
   curlifyText,
   extractPlainText,
@@ -1115,6 +1116,131 @@ const zalnMs = (attrs, targetText) => ({
     endTag: "zaln-e\\*",
   }];
   assert(dropDuplicateSourceMilestones(rep) === rep, `genuine שלום שלום (distinct occ) left untouched (identity)`);
+}
+
+// --- joinSplitSourceMilestones: one word split across two identical chains -----
+// Adjacent SIBLING duplicates (dropDuplicateSourceMilestones above handles nested
+// ones): a chain closes and immediately reopens with the same signature, splitting
+// an English word across the boundary.
+const jChain = (attrs, children) => ({
+  tag: "zaln", type: "milestone", occurrence: "1", occurrences: "1", endTag: "zaln-e\\*", ...attrs, children,
+});
+const jw = (text, extra = {}) => ({ text, tag: "w", type: "word", occurrence: "1", occurrences: "1", ...extra });
+const jsp = () => ({ type: "text", text: " " });
+const jWords = (ns, acc = []) => {
+  for (const n of ns ?? []) {
+    if (n?.type === "word") acc.push(n.text);
+    if (n?.children) jWords(n.children, acc);
+  }
+  return acc;
+};
+{
+  // (a) MIC 5:14 ULT: `\w Asherah\w*\zaln-e\*` + a reopened identical chain over `\w s\w*`.
+  const asherah = { strong: "H0842", lemma: "אֲשֵׁרָה", content: "אֲשֵׁירֶ֖י⁠ךָ" };
+  const split = [
+    jChain(asherah, [jw("your", { occurrences: "3" }), jsp(), jw("Asherah")]),
+    jsp(),
+    jChain(asherah, [jw("s")]),
+    jsp(),
+    jChain({ strong: "m:H7130", content: "מִ⁠קִּרְבֶּ֑⁠ךָ" }, [jw("from")]),
+  ];
+  const out = joinSplitSourceMilestones(split);
+  assert(jWords(out).join(" ") === "your Asherahs from", `MIC 5:14 "Asherah"+"s" fuses to one \\w Asherahs (got "${jWords(out).join(" ")}")`);
+  const chains = out.filter((n) => n?.tag === "zaln").length;
+  assert(chains === 2, `duplicate chain dropped — 2 chains remain, not 3 (got ${chains})`);
+  assert(out.length === 3, `whitespace separator between the fused chains removed (got ${out.length} top-level nodes)`);
+  assert(out[0].children.length === 3, `fused word is ONE node, not two (got ${out[0].children.length} children)`);
+}
+{
+  // (b) JER 38:2 UST: the same defect four levels deep — "th" + "ey".
+  const nest = (kids) =>
+    jChain({ strong: "c:H1961", content: "וְ⁠הָיְתָה" }, [
+      jChain({ strong: "l", content: "לּ֥⁠וֹ" }, [
+        jChain({ strong: "H5315", content: "נַפְשׁ֛⁠וֹ" }, [
+          jChain({ strong: "l:H7998", content: "לְ⁠שָׁלָ֖ל" }, kids),
+        ]),
+      ]),
+    ]);
+  const split = [nest([jw("that"), jsp(), jw("th")]), jsp(), nest([jw("ey"), jsp(), jw("will")])];
+  const out = joinSplitSourceMilestones(split);
+  assert(jWords(out).join(" ") === "that they will", `JER 38:2 "th"+"ey" fuses to "they" (got "${jWords(out).join(" ")}")`);
+  assert(out.length === 1, `both chains collapse into one (got ${out.length})`);
+  // The 4-deep nesting survives intact — this is alignment, not decoration.
+  let depth = 0;
+  for (let n = out[0]; n?.tag === "zaln"; n = n.children?.[0]) depth++;
+  assert(depth === 4, `4-level nesting preserved (got depth ${depth})`);
+}
+{
+  // (c) Two chains on ONE source token holding REAL words is the COMMON legitimate
+  // shape (one Hebrew word aligned to two separated target runs) — never joined.
+  const tok = { strong: "H4940", content: "מִשְׁפְּח֥וֹת" };
+  const real = [jChain(tok, [jw("the")]), jsp(), jChain(tok, [jw("clans")])];
+  assert(joinSplitSourceMilestones(real) === real, `identical chains holding real words ("the"+"clans") left untouched (identity)`);
+}
+{
+  // (d) A real 1–2 letter English word opening the second chain is a normal
+  // alignment, not a fragment.
+  const tok = { strong: "H0214", content: "אוֹצְר֖וֹת" };
+  const kept = [jChain(tok, [jw("treasuries")]), jsp(), jChain(tok, [jw("of")])];
+  assert(joinSplitSourceMilestones(kept) === kept, `allow-listed "of" is a real word, not a fragment (identity)`);
+}
+{
+  // (e) DELIBERATE LIMITATION — DAN 5:7 "fortune"+"tellers". A 3+ letter second
+  // fragment is indistinguishable from a legitimate two-run alignment without
+  // semantics, so it stays visible and needs a master-side fix instead.
+  const tok = { strong: "H1505", content: "וְ⁠גָזְרַיָּ֑⁠א" };
+  const kept = [jChain(tok, [jw("fortune")]), jsp(), jChain(tok, [jw("tellers")])];
+  assert(joinSplitSourceMilestones(kept) === kept, `3+ letter fragment ("fortune"+"tellers") NOT joined — documented limitation (identity)`);
+}
+{
+  // (f) ULT implied-word braces are never touched, whichever side carries them.
+  const tok = { strong: "H6833", content: "צִפּ֑וֹר" };
+  const open = [jChain(tok, [jw("{bird")]), jsp(), jChain(tok, [jw("s")])];
+  assert(joinSplitSourceMilestones(open) === open, `implied-word brace on chain A ("{bird") blocks the join (identity)`);
+  const closed = [jChain(tok, [jw("bird{s}")]), jsp(), jChain(tok, [jw("s")])];
+  assert(joinSplitSourceMilestones(closed) === closed, `implied-word brace shape "bird{s}" blocks the join (identity)`);
+}
+{
+  // (g) Different source token — two genuinely distinct alignments that happen to
+  // sit next to each other. The signature test is what separates them.
+  const a = [
+    jChain({ strong: "H0842", content: "אֲשֵׁירֶ֖י⁠ךָ" }, [jw("Asherah")]),
+    jsp(),
+    jChain({ strong: "H0842", content: "אֲשֵׁרָ֖ה" }, [jw("s")]),
+  ];
+  assert(joinSplitSourceMilestones(a) === a, `differing x-content between the chains blocks the join (identity)`);
+  // Same content, different occurrence — also distinct source tokens.
+  const b = [
+    jChain({ strong: "H0842", content: "אֲשֵׁירֶ֖י⁠ךָ", occurrence: "1", occurrences: "2" }, [jw("Asherah")]),
+    jsp(),
+    jChain({ strong: "H0842", content: "אֲשֵׁירֶ֖י⁠ךָ", occurrence: "2", occurrences: "2" }, [jw("s")]),
+  ];
+  assert(joinSplitSourceMilestones(b) === b, `differing x-occurrence between the chains blocks the join (identity)`);
+}
+{
+  // (h) A non-whitespace separator means the chains are not mid-word adjacent.
+  const tok = { strong: "H0842", content: "אֲשֵׁירֶ֖י⁠ךָ" };
+  const punct = [jChain(tok, [jw("Asherah")]), { type: "text", text: ", " }, jChain(tok, [jw("s")])];
+  assert(joinSplitSourceMilestones(punct) === punct, `punctuation separator blocks the join (identity)`);
+  // A clean verse with no adjacent duplicate at all.
+  const clean = [jChain(tok, [jw("Asherah")]), jsp(), jChain({ strong: "m:H7130", content: "מִ⁠קִּרְבֶּ֑⁠ךָ" }, [jw("from")])];
+  assert(joinSplitSourceMilestones(clean) === clean, `clean verse returns the same array reference (identity)`);
+}
+{
+  // (i) End to end through extractVersesForRange — the ingest path all three
+  // importers share — so plain_text re-derives from the FUSED tree.
+  const attrs = `x-strong="H0842" x-lemma="אֲשֵׁרָה" x-morph="He,Np:Sp2ms" x-occurrence="1" x-occurrences="1" x-content="אֲשֵׁירֶ֖י⁠ךָ"`;
+  const usfmBlob = [
+    "\\id MIC", "\\usfm 3.0", "\\h Micah", "\\c 5",
+    `\\q1 \\v 14 \\zaln-s |${attrs}\\*\\w your|x-occurrence="1" x-occurrences="1"\\w*`,
+    `\\w Asherah|x-occurrence="1" x-occurrences="1"\\w*\\zaln-e\\*`,
+    `\\zaln-s |${attrs}\\*\\w s|x-occurrence="1" x-occurrences="1"\\w*\\zaln-e\\*`,
+    "",
+  ].join("\n");
+  const row = extractVersesForRange(usfmBlob, 5, 5).find((r) => r.chapter === 5 && r.verse === 14);
+  assert(row, "MIC 5:14 row exists");
+  assert(row.plainText.includes("Asherahs"), `plain_text re-derives as "…Asherahs…" (got ${JSON.stringify(row.plainText)})`);
+  assert(!row.plainText.includes("Asherah s"), `the broken "Asherah s" is gone from plain_text`);
 }
 
 // Import-side collapse of a stacked chapter-front `\p` run to a single `\p`

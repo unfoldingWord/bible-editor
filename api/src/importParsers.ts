@@ -890,6 +890,155 @@ export function dropDuplicateSourceMilestones(verseObjects: unknown[]): unknown[
   return transform(verseObjects);
 }
 
+// ─── Rejoin one English word split across two identical milestone chains ─────
+//
+// A THIRD, distinct defect — sibling duplicates, where dropDuplicateSourceMilestones
+// above handles NESTED ones. Master carries alignment chains that close and then
+// immediately REOPEN with an IDENTICAL nesting signature, splitting one English word
+// into two fragments across the boundary:
+//   MIC 5:14 ULT  `\w Asherah\w*\zaln-e\*` … `\zaln-s (same אֲשֵׁירֶ֖י⁠ךָ)\*\w s\w*`
+//   JER 38:2 UST  the same shape four levels deep — `\w th\w*` … `\w ey\w*`
+// The verse renders "your Asherah s" / "th ey": a broken word in the editor, in
+// plain_text, and in every export. Nothing legitimate produces it — one source
+// token is already wrapped by one chain, so the reopen carries no new alignment
+// information; it is purely a serializer artifact.
+//
+// The rule is deliberately narrow, because adjacent chains on the SAME source token
+// are otherwise COMMON and legitimate (a source word aligned to two separated runs
+// of target words — HAB and PSA are thick with them). A sweep of every structural
+// candidate on master (1,892) fired on exactly the two true positives and nothing
+// else. All five conditions must hold:
+//   1. two chains are adjacent siblings separated by exactly one whitespace-only
+//      text node;
+//   2. their full nesting signatures are identical — same depth, and every level
+//      agrees on strong / occurrence / occurrences / NFC-normalised content;
+//   3. chain A's last word ends with a letter, and IS the last node of its chain
+//      (a chain closing on punctuation was never a mid-word split);
+//   4. chain B's first word is a 1–2 letter lowercase run that is not a real English
+//      word ("s", "ey" — never "of", "in", "we"); and it IS the first node of its chain;
+//   5. neither word carries `{`/`}` (ULT implied-word notation — never touch).
+//
+// DELIBERATELY NOT FIXED: fragments of 3+ letters (DAN 5:7 "fortune" + "tellers" —
+// indistinguishable from a legitimate two-run alignment without semantics, so it
+// needs a master-side fix), and chains separated by punctuation rather than
+// whitespace. Both stay visible rather than being guessed at.
+//
+// The fused word keeps chain A's occurrence/occurrences. That is right whenever the
+// joined surface is unique in the verse, which holds for both master cases (each
+// fragment was 1/1) — the pass only ever fires on fragments that are not real words,
+// so they carry no meaningful occurrence of their own.
+//
+// No-op (identity, same array reference) on clean verses, the overwhelming case, so
+// the nightly reimport churns nothing. Absorbed at ingest like splitGluedAlignmentWords
+// / stripOrphanAlignmentMarkers / dropDuplicateSourceMilestones, so a still-corrupt
+// master cannot re-inject the split on the next reimport.
+
+// Real 1–2 letter English words — a chain legitimately opening on one of these is
+// a normal alignment, not a fragment.
+const REAL_SHORT_WORDS = new Set([
+  "a", "i", "o", "am", "an", "as", "at", "be", "by", "do", "go", "he", "if", "in",
+  "is", "it", "me", "my", "no", "of", "on", "or", "so", "to", "up", "us", "we",
+  "ah", "oh", "ho", "lo", "ye", "ox",
+]);
+
+function isWordNode(n: unknown): n is Record<string, unknown> {
+  const o = n as Record<string, unknown> | null;
+  return !!o && o["type"] === "word" && typeof o["text"] === "string";
+}
+
+// The chain of nested milestones under `node`, descending while a level holds
+// exactly one child and that child is itself a `\zaln`. Returns the per-level
+// identity signature plus the innermost node, whose children are the target words.
+function zalnChain(node: Record<string, unknown>): { sig: string; innermost: Record<string, unknown> } {
+  const parts: string[] = [];
+  let cur = node;
+  for (;;) {
+    parts.push(
+      [
+        String(cur["strong"] ?? ""),
+        String(cur["occurrence"] ?? ""),
+        String(cur["occurrences"] ?? ""),
+        String(cur["content"] ?? "").normalize("NFC"),
+      ].join("|"),
+    );
+    const kids = cur["children"] as unknown[] | undefined;
+    if (!Array.isArray(kids) || kids.length !== 1) break;
+    const only = kids[0] as Record<string, unknown> | null;
+    if (!isZalnNode(only)) break;
+    cur = only!;
+  }
+  return { sig: parts.join("»"), innermost: cur };
+}
+
+function isWhitespaceTextNode(n: unknown): boolean {
+  const o = n as Record<string, unknown> | null;
+  return !!o && o["type"] === "text" && typeof o["text"] === "string" && /^\s+$/.test(o["text"] as string);
+}
+
+export function joinSplitSourceMilestones(verseObjects: unknown[]): unknown[] {
+  if (!Array.isArray(verseObjects)) return verseObjects;
+  const transform = (nodes: unknown[]): unknown[] => {
+    let changed = false;
+    const out: unknown[] = [];
+    for (let i = 0; i < (nodes?.length ?? 0); i++) {
+      const node = nodes[i] as Record<string, unknown> | null;
+
+      // A · B candidate: zaln, whitespace-only text, zaln.
+      const next = nodes[i + 2] as Record<string, unknown> | null;
+      if (isZalnNode(node) && isWhitespaceTextNode(nodes[i + 1]) && isZalnNode(next)) {
+        const a = zalnChain(node!);
+        const b = zalnChain(next!);
+        const aKids = (a.innermost["children"] as unknown[] | undefined) ?? [];
+        const bKids = (b.innermost["children"] as unknown[] | undefined) ?? [];
+        const aLast = aKids[aKids.length - 1];
+        const bFirst = bKids[0];
+        if (
+          a.sig === b.sig &&
+          isWordNode(aLast) &&
+          isWordNode(bFirst) &&
+          /[A-Za-z]$/.test(aLast["text"] as string) &&
+          /^[a-z]{1,2}$/.test(bFirst["text"] as string) &&
+          !REAL_SHORT_WORDS.has(bFirst["text"] as string) &&
+          !/[{}]/.test((aLast["text"] as string) + (bFirst["text"] as string))
+        ) {
+          // Fuse B's fragment onto A's last word, splice B's remaining children in
+          // after it, and drop both the separator and chain B.
+          const fused = { ...aLast, text: (aLast["text"] as string) + (bFirst["text"] as string) };
+          const mergedKids = [...aKids.slice(0, -1), fused, ...bKids.slice(1)];
+          out.push(rebuildChain(node!, a.innermost, mergedKids));
+          i += 2;
+          changed = true;
+          continue;
+        }
+      }
+
+      if (node && typeof node === "object" && Array.isArray(node["children"])) {
+        const kids = transform(node["children"] as unknown[]);
+        if (kids !== node["children"]) {
+          out.push({ ...node, children: kids });
+          changed = true;
+          continue;
+        }
+      }
+      out.push(nodes[i]);
+    }
+    return changed ? out : nodes;
+  };
+  return transform(verseObjects);
+}
+
+// Copy `node`'s milestone chain down to `innermost`, replacing the innermost
+// child list. Never mutates the input nodes.
+function rebuildChain(
+  node: Record<string, unknown>,
+  innermost: Record<string, unknown>,
+  kids: unknown[],
+): Record<string, unknown> {
+  if (node === innermost) return { ...node, children: kids };
+  const only = (node["children"] as unknown[])[0] as Record<string, unknown>;
+  return { ...node, children: [rebuildChain(only, innermost, kids)] };
+}
+
 // ─── Collapse doubled leading poetry / paragraph markers ─────────────────────
 //
 // unfoldingWord ULT/UST USFM puts a verse's leading in-flow marker BEFORE its
@@ -1223,10 +1372,14 @@ export function extractVersesForRange(
     let prevVerseObjects: unknown[] | null = null;
     for (const { vNum, vEnd, verseObj } of entries) {
       // Strip outer punctuation, de-glue any AI-introduced punctuation-spanning
-      // `\w` (the freed words fall out to unaligned), then drop any leading marker
-      // that merely doubles the previous verse's trailing one.
-      let verseObjects = stripOrphanAlignmentMarkers(
-        splitGluedAlignmentWords(normalizeWordPunctuation(verseObj.verseObjects ?? [])),
+      // `\w` (the freed words fall out to unaligned), rejoin any word split across
+      // two identical adjacent milestone chains (runs last, so it sees the settled
+      // word nodes), then drop any leading marker that merely doubles the previous
+      // verse's trailing one.
+      let verseObjects = joinSplitSourceMilestones(
+        stripOrphanAlignmentMarkers(
+          splitGluedAlignmentWords(normalizeWordPunctuation(verseObj.verseObjects ?? [])),
+        ),
       );
       verseObjects = dropDoubledLeadingMarkers(prevVerseObjects, verseObjects);
       verseObjects = collapseRedundantParagraphs(verseObjects);
