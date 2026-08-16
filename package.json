@@ -25,6 +25,7 @@
     "db:align:remote": "node scripts/apply-align-freq.mjs --remote",
     "db:align-morph:local": "node scripts/apply-align-freq.mjs --file scripts/out/align-freq-morph.sql",
     "db:align-morph:remote": "node scripts/apply-align-freq.mjs --remote --file scripts/out/align-freq-morph.sql",
+    "test:scripts": "node --experimental-strip-types --no-warnings scripts/lib/numberSplit.test.mjs",
     "test:e2e": "playwright test",
     "test:e2e:ui": "playwright test --ui"
   },
