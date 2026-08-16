@@ -477,14 +477,27 @@ export function describeShrinkRefusal(
     // didn't check" defect this whole function exists to remove. An
     // unrecognized detail must reach the neutral fallback below even when the
     // counts are present.
+    // Denominator: `missing` is what attribution actually measured — the SIZE
+    // of the master-ID set absent from the render (= explained + unexplained).
+    // `lost` is only the row-COUNT delta (masterRows - renderedRows); when the
+    // render also ADDS rows (routine), missing = lost + additions, and using
+    // `lost` here states impossible arithmetic ("40 of the 30 missing rows…").
+    // The block/ship decision (unexplained === 0) was always ID-based and is
+    // untouched — this is wording only.
+    const missing = (explained ?? 0) + unexplained;
+    const additions = missing - lost;
     const explainedNote =
       explained && explained > 0
-        ? ` (${explained} of the ${lost} were human deletions in D1 and were credited)`
+        ? ` (${explained} of the ${missing} were human deletions in D1 and were credited)`
+        : "";
+    const additionsNote =
+      additions > 0
+        ? ` The render also adds ${additions} new row(s), which is why the raw count only shrinks by ${lost}.`
         : "";
     return {
       signature:
-        `${unexplained} of the ${lost} missing rows aren't accounted for by any deliberate deletion in ` +
-        `D1${explainedNote} — that's the truncated-load signature.`,
+        `${unexplained} of the ${missing} missing rows aren't accounted for by any deliberate deletion in ` +
+        `D1${explainedNote} — that's the truncated-load signature.${additionsNote}`,
       remedy: `Re-sync from master, verify the row count, then re-export.`,
     };
   }
@@ -587,6 +600,14 @@ function verseAlignStats(usfmText: string): Map<string, VerseAlignStat> | null {
 
 export interface AlignmentShrinkResult {
   refused: boolean;
+  // Master was FETCHED but did not PARSE, so nothing was compared per-verse.
+  // The ship decision stays refused:false (we can't prove loss), but the
+  // caller must NOT treat this as a clean measurement — mapping it to
+  // `detail: "ok"` would clear alignment_attention and erase real prior
+  // findings ("an absent measurement must never overwrite evidence", see
+  // STATE.md). Latent today (usfm.toJSON doesn't throw on malformed strings),
+  // but the trap must stay closed for any future parser.
+  masterUnparseable?: boolean;
   // Each offending verse names the words that lost their \zaln source so the
   // alert is actionable (which word to re-align), not just a whole-verse aligned
   // count that reads oddly when a verse simultaneously loses one word's source
@@ -651,9 +672,11 @@ export function usfmAlignmentShrinkRefused(
   }
   // An unparseable MASTER (but a parseable render) leaves us with no baseline to
   // compare against — lower risk (we can't prove loss), so we don't refuse on it,
-  // but we must not crash. Treat as no comparison data.
+  // but we must not crash. Treat as no comparison data — and FLAG it, so the
+  // caller can't mistake "nothing was measured" for "measured clean" (the
+  // detail:"ok" → clearAlignmentAttention path must not fire).
   if (master === null) {
-    return { refused: false, offenders: [] };
+    return { refused: false, masterUnparseable: true, offenders: [] };
   }
   // The reachable fail-open: usfm.toJSON does NOT throw on a malformed USFM
   // *string* (only on non-string input), so an empty or garbled render surfaces

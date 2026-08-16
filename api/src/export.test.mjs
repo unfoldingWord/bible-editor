@@ -1415,6 +1415,36 @@ function utf8Base64(s) {
     /truncated-load signature/.test(attributed.signature) && /20 of the 62/.test(attributed.signature),
     `attribution refusal: reports the unexplained/missing split`,
   );
+
+  // ADDITIONS PRESENT (the routine case): master 430 rows, render 400 rows,
+  // and the render carries 40 NEW ids master doesn't have — so the ID-set
+  // measurement is missing = |master IDs ∉ render| = 70 (30 tombstoned +
+  // 40 unexplained), while the row-COUNT delta `lost` is only 30. The old
+  // wording used `lost` as the denominator and read "40 of the 30 missing
+  // rows" — impossible arithmetic that discredits the alert. The denominator
+  // must be explained + unexplained (70), and the additions deserve a mention.
+  const withAdditions = describeShrinkRefusal("shrink_30_of_430_unexplained_40", {
+    renderedRows: 400,
+    masterRows: 430,
+    explained: 30,
+    unexplained: 40,
+  });
+  assert(
+    /40 of the 70 missing rows/.test(withAdditions.signature),
+    `additions present: denominator is explained+unexplained (70), not the count delta (got: ${withAdditions.signature})`,
+  );
+  assert(
+    !/40 of the 30/.test(withAdditions.signature),
+    `additions present: never states impossible arithmetic ("40 of the 30")`,
+  );
+  assert(
+    /30 of the 70 were human deletions/.test(withAdditions.signature),
+    `additions present: explainedNote uses the same denominator`,
+  );
+  assert(
+    /adds 40 new row/.test(withAdditions.signature),
+    `additions present: mentions the 40 rows the render adds (got: ${withAdditions.signature})`,
+  );
 }
 
 // --- usfmAlignmentShrinkRefused: ULT/UST verse alignment backstop ---
@@ -1552,6 +1582,23 @@ function utf8Base64(s) {
   // master actually having aligned verses.
   const r8freshboth = usfmAlignmentShrinkRefused("", "");
   assert(r8freshboth.refused === false, `empty render + empty master never refuses`);
+
+  // (8c) Master fetched but UNPARSEABLE (usfm.toJSON throws — reachable today
+  // only via non-string input, but the trap must stay closed). The ship
+  // decision stays refused:false (loss unprovable), but the result must carry
+  // masterUnparseable so the workflow maps it to its own detail
+  // ("master_unparseable") instead of "ok" — detail:"ok" is what authorizes
+  // clearAlignmentAttention, and an absent measurement must never erase prior
+  // evidence (STATE.md class: alignment_attention replace-all snapshot).
+  const r8masterNull = usfmAlignmentShrinkRefused(master, null);
+  assert(r8masterNull.refused === false, `unparseable master: ship decision stays refused:false`);
+  assert(
+    r8masterNull.masterUnparseable === true,
+    `unparseable master: flagged masterUnparseable so it can never map to detail:"ok"`,
+  );
+  // A normally-compared clean run must NOT carry the flag — that is the only
+  // path allowed to clear alignment_attention.
+  assert(r2.masterUnparseable === undefined, `a real clean comparison carries no masterUnparseable flag`);
 
   // (9) `sequenceUnchanged` per-offender flag — distinguishes true collateral
   // de-alignment on untouched text (JER 36:11 shape: same word sequence, one

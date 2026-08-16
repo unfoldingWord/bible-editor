@@ -60,12 +60,15 @@ export function educateQuotes(s: string): string {
   return (
     s
       // opening double quote: at start, or after whitespace / open bracket /
-      // an existing opening curly quote / a dash
-      .replace(/(^|[\s([{<‘“—–-])"/gu, "$1“")
+      // an existing opening curly quote / a dash / the two-character literal
+      // `\n` escape (unfoldingWord's TSV line-break convention — a quote right
+      // after it starts a new line, so it opens; `\\n` in a regex literal
+      // matches backslash-then-n)
+      .replace(/(^|[\s([{<‘“—–-]|\\n)"/gu, "$1“")
       // any remaining double quote -> closing
       .replace(/"/gu, "”")
       // opening single quote: same leading contexts
-      .replace(/(^|[\s([{<“—–-])'/gu, "$1‘")
+      .replace(/(^|[\s([{<“—–-]|\\n)'/gu, "$1‘")
       // any remaining single quote -> apostrophe / closing
       .replace(/'/gu, "’")
   );
