@@ -23,6 +23,7 @@ import {
   positionOwnedBy,
   positionsShareOwner,
   findReusedSourceWordIds,
+  sourceKey,
   type AlignmentGroup,
   type AlignmentState,
   type SourceWord,
@@ -58,6 +59,84 @@ export function groupPositionKey(g: AlignmentGroup, indexMap: Map<string, number
   if (g.source.length === 0) return null;
   const positions = g.source.map((s) => resolveSourcePos(s, indexMap));
   return positions.some((p) => p < 0) ? null : positions.join(".");
+}
+
+// Resolve a DISPLAY card id back to EVERY state group it collapsed — by
+// sourceKey OR source position, the same identity AlignmentPanel's
+// handleSourceDrop / handleClearGroup use. A card fuses groups by source
+// identity (mergeAdjacentSameSource) AND by position (mergeSamePositionGroups
+// → the occ 1/2 + 2/2 over-count), so the carried id alone under-counts it.
+// The carried id stays first so it leads the returned list. Shared with
+// scripts/scan-reused-token-visibility.mjs, which needs the same resolution
+// to count the (display card, flagged token) unit rather than raw ids.
+export function groupsForCard(
+  groups: AlignmentGroup[],
+  cardId: string,
+  indexMap: Map<string, number>,
+): string[] {
+  const target = groups.find((g) => g.id === cardId);
+  if (!target) return [cardId];
+  const key = sourceKey(target);
+  const posKey = groupPositionKey(target, indexMap);
+  return [
+    cardId,
+    ...groups
+      .filter(
+        (g) =>
+          g.id !== cardId &&
+          (sourceKey(g) === key || (posKey !== null && groupPositionKey(g, indexMap) === posKey)),
+      )
+      .map((g) => g.id),
+  ];
+}
+
+// The (display card, flagged token) unit for the census's `flaggedButUnrendered`
+// signal (#424): for each DISPLAY card, resolve it back to every state group it
+// fused (groupsForCard) and ask whether the card renders a chip for each
+// flagged token those groups own. Returns the reusedTokenKey of every flagged
+// token that never draws anywhere — empty when nothing is unrendered.
+//
+// Exported (not left as a script-local reimplementation in
+// scripts/scan-reused-token-visibility.mjs) so a committed test proves the
+// EXACT function the census runs, not a copy that can drift from it.
+//
+// Keys tokens via reusedTokenKey — the SAME identity the reused-source-token
+// marker itself uses — not resolveSourcePos. reusedSourceIdsOf can flag a word
+// whose claimed occurrence doesn't exist in the source verse (reusedTokenKey's
+// content-fallback branch); resolveSourcePos resolves EVERY such word to -1,
+// so two unrelated unresolved words would collide on the same -1 key and a
+// genuinely-unrendered flagged token could misread as rendered by matching an
+// unrelated word's -1. reusedTokenKey's content-based fallback differentiates
+// by the word's own text, so this collision can't happen.
+export function unrenderedFlaggedTokenKeys(
+  state: AlignmentState,
+  display: AlignmentGroup[],
+  indexMap: Map<string, number>,
+  flagged: ReadonlySet<string>,
+): string[] {
+  if (flagged.size === 0) return [];
+  const unrendered = new Set<string>();
+  for (const d of display) {
+    const underlyingIds = groupsForCard(state.groups, d.id, indexMap);
+    const flaggedTokenKeys = new Set<string>();
+    for (const gid of underlyingIds) {
+      const g = state.groups.find((sg) => sg.id === gid);
+      if (!g) continue;
+      for (const s of g.source) {
+        if (!flagged.has(s.id)) continue;
+        const key = reusedTokenKey(s, indexMap);
+        if (key !== null) flaggedTokenKeys.add(key);
+      }
+    }
+    if (flaggedTokenKeys.size === 0) continue;
+    const renderedTokenKeys = new Set(
+      d.source.map((s) => reusedTokenKey(s, indexMap)).filter((k): k is string => k !== null),
+    );
+    for (const k of flaggedTokenKeys) {
+      if (!renderedTokenKeys.has(k)) unrendered.add(k);
+    }
+  }
+  return [...unrendered];
 }
 
 // Walk-order index of the source verse's \w tokens, keyed both by NFC text +

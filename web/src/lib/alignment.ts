@@ -551,15 +551,21 @@ export function mergeAdjacentSameSource(groups: AlignmentGroup[]): AlignmentGrou
 // ran against a truncated source. With the full range paired, EZK 4:4 is not
 // flagged at all. Do not "fix" this on the strength of a verse that is fine.
 //
-// ONE verse corpus-wide does have a flagged word that never gets a chip:
-// JER 36:30 UST, 3 flagged / 2 rendered (`flaggedButUnrendered` in
-// scripts/scan-reused-token-visibility.mjs). It still reads as doubled — two
-// chips draw — so it is a partial-render, not an invisible defect, and it is NOT
-// established that this fusion is the cause: JER 36:30 is also the verse whose
-// chains claim occurrences the source does not have (see findReusedSourceWordIds),
-// which is a separate mechanism. Diagnose before attributing. If you ever do
-// reconcile the key spaces, note it would change how legitimate
-// one-token-to-N-runs splits collapse, so it needs its own before/after sweep.
+// JER 36:30 UST is NOT a symptom of the key-space mismatch above, and it is
+// NOT a defect: three flagged ids all resolve to the same physical token
+// (position 16, תִּֽהְיֶ֣ה). This fusion correctly collapses two of those
+// groups (13 and 15 — identical position sequence "16.17") into one card,
+// keeping only the survivor's ids; group 15's flagged id is dropped from
+// `display` even though the survivor still draws a chip for that token. A
+// counter that keys on raw flagged-id membership (as
+// scripts/scan-reused-token-visibility.mjs originally did) misreads the
+// dropped id as "unrendered." The fix (#424) is to key the counter on the
+// (display card, flagged token) pair instead — resolve a card back to every
+// state group it fused (see AlignmentPanel's groupsForCard, now shared via
+// alignmentHover.ts) and ask whether the card renders a chip for the token,
+// not whether the original id survives. If you ever reconcile the key
+// spaces above, note it would change how legitimate one-token-to-N-runs
+// splits collapse, so it needs its own before/after sweep.
 export function mergeSamePositionGroups(
   groups: AlignmentGroup[],
   positionKey: (g: AlignmentGroup) => string | null,

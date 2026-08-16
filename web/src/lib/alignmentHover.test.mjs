@@ -10,17 +10,21 @@
 //
 // Not a test framework; failures exit non-zero. Mirrors alignment.test.mjs.
 
+import { mergeAdjacentSameSource, mergeSamePositionGroups, stripCompoundOverlaps } from "./alignment.ts";
 import {
   buildDisplayGroups,
   buildPosMaps,
   buildSourceIndexMap,
   buildTargetIdToGroupId,
   englishHoverKey,
+  groupPositionKey,
+  groupsForCard,
   makeEnglishHover,
   makeHebrewHover,
   resolveEnglishHighlight,
   resolveHebrewHighlight,
   resolveSourcePos,
+  unrenderedFlaggedTokenKeys,
 } from "./alignmentHover.ts";
 
 let failed = 0;
@@ -394,6 +398,171 @@ function ctxFor(st, { bibleVersion = "ult", posOffset = 0, hoverLink = true } = 
     resolveEnglishHighlight(off, hover, "t1", "said", "1") === null &&
       resolveHebrewHighlight(off, hover, 0) === null,
     "with hover-link off both resolvers return null",
+  );
+}
+
+// ─── groupsForCard: resolves a display card back to every fused state group ─
+// #424. Shared between AlignmentPanel (merge/clear) and the census script
+// (scripts/scan-reused-token-visibility.mjs), so its two matching paths —
+// sourceKey (mergeAdjacentSameSource's identity) and position (
+// mergeSamePositionGroups' identity) — each get a direct test here, not just
+// exercised incidentally through the fused-card tests above.
+{
+  const a = group("g-a", [src("sa", 1)], [tgt("t1", "to")]);
+  const b = group("g-b", [src("sb", 1)], [tgt("t2", "him")]);
+  const st = state([a, b]);
+  assert(
+    new Set(groupsForCard(st.groups, "g-a", indexMap)).size === 2 &&
+      groupsForCard(st.groups, "g-a", indexMap).includes("g-b"),
+    "groupsForCard resolves a same-sourceKey sibling (mergeAdjacentSameSource's identity)",
+  );
+  assert(
+    groupsForCard(st.groups, "g-a", indexMap)[0] === "g-a",
+    "groupsForCard leads with the queried card's own id",
+  );
+}
+{
+  const a = group("g-a", [src("sa", 2, "1")], [tgt("t1", "Yahweh")]);
+  const b = group("g-b", [src("sb", 2, "2")], [tgt("t2", "the")]);
+  const st = state([a, b]);
+  assert(
+    groupsForCard(st.groups, "g-a", indexMap).includes("g-b"),
+    "groupsForCard resolves a same-POSITION sibling with a different occurrence (mergeSamePositionGroups' identity)",
+  );
+}
+{
+  const a = group("g-a", [src("sa", 0)], [tgt("t1", "he said")]);
+  const unrelated = group("g-u", [src("su", 3)], [tgt("t2", "word")]);
+  const st = state([a, unrelated]);
+  assert(
+    groupsForCard(st.groups, "g-a", indexMap).length === 1,
+    "groupsForCard does not pull in an unrelated group sharing neither sourceKey nor position",
+  );
+  assert(
+    groupsForCard(st.groups, "no-such-id", indexMap).length === 1,
+    "groupsForCard degrades to [cardId] when the id isn't a real state group",
+  );
+}
+
+// ─── unrenderedFlaggedTokenKeys: the census's (card, token) unit (#424) ─────
+// scripts/scan-reused-token-visibility.mjs's flaggedButUnrendered signal calls
+// this function directly (not a reimplementation), so these tests prove the
+// EXACT logic the census runs.
+{
+  // Case A — JER 36:30 UST shape: a legitimately fused card. Three groups all
+  // claim occurrence 1 of the SAME physical token (position 2) — the actual
+  // reused-source-token shape (findReusedSourceWordIds flags a key reused
+  // across 2+ DISTINCT group sequences: "p2" alone (g12) vs "p2,p3" (g13/g15)
+  // are 2 distinct sequences sharing "p2"). g13/g15 additionally share an
+  // identical position sequence themselves and fuse into one card
+  // (mergeSamePositionGroups), dropping g15's id from `display` — but the
+  // survivor still renders a chip for the shared token. This must NOT be
+  // reported as unrendered: it is the exact false positive #424 fixed (the
+  // old raw-id-membership check misread it).
+  const g12 = group("g12", [src("s12", 2, "1")], [tgt("t12", "people will")]);
+  const g13 = group("g13", [src("s13", 2, "1"), src("s13b", 3, "1")], [tgt("t13", "throw out")]);
+  const g15 = group("g15", [src("s15", 2, "1"), src("s15b", 3, "1")], [tgt("t15", "on the ground")]);
+  const st = state([g12, g13, g15]);
+  const flagged = new Set(["s12", "s13", "s15"]);
+  const display = buildDisplayGroups(st, indexMap);
+  assert(display.length === 2, "fusion collapses 3 state groups into 2 display cards");
+  assert(
+    unrenderedFlaggedTokenKeys(st, display, indexMap, flagged).length === 0,
+    "a fused card (JER-36:30 shape) is NOT reported as unrendered — the token still draws on the survivor",
+  );
+}
+{
+  // Case B — AMO-3:2-pre-#418 shape: a genuine loss. A flagged word is
+  // stripped out of every card with NO protectedIds exemption (reproducing
+  // the pre-#418 bug on purpose, by calling stripCompoundOverlaps directly
+  // instead of going through buildDisplayGroups, which always protects
+  // flagged ids today). The flagged token then draws nowhere — THIS must be
+  // reported as unrendered, proving the counter can still catch the defect
+  // it exists for.
+  const standalone = group("g-std", [src("s-std", 1)], [tgt("t-std", "standalone")]);
+  const compound = group("g-cmp", [src("s-cmp0", 0), src("s-cmp1", 1)], [tgt("t-cmp", "compound")]);
+  const st = state([standalone, compound]);
+  const flagged = new Set(["s-std", "s-cmp1"]);
+  const stripped = stripCompoundOverlaps([standalone, compound]); // no protectedIds arg
+  assert(
+    stripped.find((g) => g.id === "g-cmp").source.length === 1,
+    "sanity: the overlapping word is stripped when no protectedIds exemption is passed",
+  );
+  const display = stripped; // no fusion needed for this two-card shape
+  assert(
+    unrenderedFlaggedTokenKeys(st, display, indexMap, flagged).length > 0,
+    "a token stripped from every card IS reported as unrendered (real AMO-3:2-shaped defect)",
+  );
+}
+{
+  // Case C — unresolved-position collision (review finding on PR #468). Two
+  // DIFFERENT words that both fail to resolve a source position (resolveSourcePos
+  // returns -1 for both) must NOT be treated as the same token. Keying on
+  // resolveSourcePos alone would collide two -1s and misread a genuinely
+  // unrendered flagged word as rendered; reusedTokenKey's content-based
+  // fallback differentiates them by their own text instead.
+  const flaggedWord = { id: "f1", strong: "H9001", content: "QQQ", occurrence: "1" };
+  const differentUnresolvedWord = { id: "other", strong: "H9002", content: "RRR", occurrence: "1" };
+  assert(
+    resolveSourcePos(flaggedWord, indexMap) === -1 && resolveSourcePos(differentUnresolvedWord, indexMap) === -1,
+    "sanity: both synthetic words are unresolved (-1) under resolveSourcePos",
+  );
+  const g1 = group("g1", [flaggedWord], [tgt("tf", "flagged-target")]);
+  const st = state([g1]);
+  const flagged = new Set(["f1"]);
+  // Manually construct a display where g1's card renders a DIFFERENT
+  // unresolved word than the one flagged — this can't arise from the real
+  // pipeline (it never swaps a card's own source), but it isolates the
+  // primitive's robustness against the -1 collision directly.
+  const display = [{ id: "g1", source: [differentUnresolvedWord], targets: [] }];
+  assert(
+    unrenderedFlaggedTokenKeys(st, display, indexMap, flagged).length > 0,
+    "two different unresolved words are NOT conflated via position -1 — the flagged one is still reported unrendered",
+  );
+}
+{
+  // Case D — key-space mismatch investigated (review finding on PR #468):
+  // groupsForCard resolves siblings using RAW (unstripped) state.groups keys,
+  // while the actual display fusion (mergeSamePositionGroups) runs on
+  // STRIPPED groups — so groupsForCard can fail to find a sibling that DID
+  // fuse into the same card. Concretely: compounds A=[X,Y] and B=[X,Z] share
+  // reused token X; Y and Z each have a matching standalone and get stripped
+  // (X is protected, flagged ids are never stripped); post-strip, A and B
+  // both become [X] and fuse into ONE card — but their RAW sourceKeys ("X~Y"
+  // vs "X~Z") differ, so groupsForCard(survivor) does not find the other.
+  //
+  // This is confirmed real (see the assertion below) but does NOT produce a
+  // wrong verdict: a reused flagged token is BY DEFINITION claimed by 2+
+  // groups at the exact same identity (same reusedTokenKey), so whichever
+  // raw group ends up as the display card's own id is trivially self-included
+  // by groupsForCard and already carries that same identity — the missed
+  // sibling contributes nothing unrenderedFlaggedTokenKeys didn't already
+  // learn from the one it found. No fix needed; documented here so a future
+  // change to groupsForCard's key space has a test pinning this invariant.
+  const X = { text: "X", strong: "H0001" };
+  const Y = { text: "Y", strong: "H0002" };
+  const Z = { text: "Z", strong: "H0003" };
+  const xyzVerse = { content: { verseObjects: [X, Y, Z].map((t) => ({ type: "word", tag: "w", text: t.text, strong: t.strong })) } };
+  const xyzIndexMap = buildSourceIndexMap(xyzVerse);
+  const w = (id, t, occurrence = "1") => ({ id, strong: t.strong, content: t.text, occurrence, occurrences: "1" });
+  const A = group("gA", [w("idAX", X, "1"), w("idAY", Y)], [tgt("tA", "compoundA")]);
+  const B = group("gB", [w("idBX", X, "1"), w("idBZ", Z)], [tgt("tB", "compoundB")]);
+  const SY = group("gSY", [w("idSY", Y)], [tgt("tSY", "standaloneY")]);
+  const SZ = group("gSZ", [w("idSZ", Z)], [tgt("tSZ", "standaloneZ")]);
+  const st = state([A, B, SY, SZ]);
+  const flagged = new Set(["idAX", "idBX"]);
+  const stripped = stripCompoundOverlaps([A, B, SY, SZ], flagged);
+  const merged = mergeAdjacentSameSource(stripped);
+  const display = mergeSamePositionGroups(merged, (g) => groupPositionKey(g, xyzIndexMap));
+  const fusedCard = display.find((d) => d.id === "gA" || d.id === "gB");
+  assert(!!fusedCard, "sanity: A and B fuse into one card post-strip");
+  assert(
+    groupsForCard(st.groups, fusedCard.id, xyzIndexMap).length === 1,
+    "sanity: groupsForCard, using RAW keys, does NOT find the fused sibling (confirms the mismatch is real)",
+  );
+  assert(
+    unrenderedFlaggedTokenKeys(st, display, xyzIndexMap, flagged).length === 0,
+    "the raw-vs-stripped key mismatch does not misreport the shared token as unrendered",
   );
 }
 
