@@ -20,6 +20,13 @@ import {
 } from "./api";
 import { backoffMs } from "./backoff";
 import { classifyRowPatchConflict } from "./rowConflict";
+import {
+  MAX_ATTEMPTS_SENTINEL,
+  dropGuardAllows,
+  reasonForOp,
+  serverRefusalReason,
+  willRetryOnItsOwn,
+} from "./refusalReason";
 
 const DB_NAME = "bible-editor-outbox";
 const DB_VERSION = 1;
@@ -109,6 +116,14 @@ export interface OutboxOp {
   dispatchedAt?: number;
   status: OpStatus;
   lastError?: string;
+  // The server's own explanation for a refusal, lifted from the `error` /
+  // `reason` fields of a non-retryable 4xx response body. Deliberately a
+  // SEPARATE field from `lastError`: that one carries control-flow sentinels
+  // ("max_attempts_exceeded" is matched by reviveMaxAttemptsFailed) and must
+  // stay machine-stable. This one is display-only — the failed-ops drawer
+  // turns it into a plain sentence so a refused save says *why* instead of
+  // looking like the app threw the edit away (issue #370).
+  lastErrorReason?: string;
   conflictCurrent?: unknown;
   // Count of silent re-arms after a sort_order-only 409 (see
   // MAX_CONFLICT_AUTOHEAL). Absent = 0.
@@ -480,7 +495,17 @@ export const outbox = {
 
   // onlyIfStatus excludes "in_flight": the unconditional in_flight guard below
   // returns first, so that value could never match — don't promise it.
-  async drop(opId: string, opts?: { onlyIfStatus?: Exclude<OpStatus, "in_flight"> }) {
+  async drop(
+    opId: string,
+    opts?: {
+      onlyIfStatus?: Exclude<OpStatus, "in_flight">;
+      // Re-check refused-ness against the stored record at delete time. `failed`
+      // covers two classes — a server refusal and a retry-cap timeout that
+      // revives itself — and only the first is safe to discard from the
+      // "discard refused" flow. See dropGuardAllows.
+      onlyIfRefused?: boolean;
+    },
+  ) {
     // Guard against dropping an op the drain just flipped to in_flight (same
     // race the drain itself guards at the listAll → fresh re-read). A request
     // is already on the wire; deleting the record here would race the 200
@@ -495,11 +520,13 @@ export const outbox = {
       await tx.done;
       return;
     }
-    // A caller acting on a snapshot (the unresolvable-conflict dialog) may be
-    // stale: another tab can re-arm a conflict to pending between snapshot and
-    // click, and deleting it then destroys an edit that's about to save.
-    // onlyIfStatus makes the check-and-delete atomic inside this tx.
-    if (op && opts?.onlyIfStatus && op.status !== opts.onlyIfStatus) {
+    // A caller acting on a snapshot (either discard dialog, the unresolvable-
+    // conflict dialog) may be stale: another tab can re-arm a conflict to
+    // pending, or retry a refused op so it re-parks as a will-retry one,
+    // between the snapshot and the click. Deleting then destroys an edit that
+    // is about to save or is expected back. dropGuardAllows re-judges the
+    // freshly-read record, making the check-and-delete atomic inside this tx.
+    if (op && !dropGuardAllows(op, opts)) {
       await tx.done;
       // The mismatch means this tab just observed state it may not know about
       // (cross-tab writes never reach this tab's notify) — broadcast so the
@@ -535,6 +562,7 @@ export const outbox = {
     op.attempts = 0;
     op.hardAttempts = 0;
     op.lastError = undefined;
+    op.lastErrorReason = undefined;
     op.queuedAt = Date.now();
     op.seq = nextSeq();
     await tx.store.put(op);
@@ -557,7 +585,10 @@ type Result =
   | { kind: "ok"; updated: unknown }
   | { kind: "conflict"; current: unknown }
   | { kind: "retry"; reason: string }
-  | { kind: "fatal"; reason: string }
+  // `reason` is the machine sentinel stored on op.lastError; `serverReason`
+  // is the server's own explanation (body.error / body.reason), kept apart so
+  // the sentinel stays stable while the drawer can show a human sentence.
+  | { kind: "fatal"; reason: string; serverReason?: string }
   // Chapter is locked because an AI pipeline is mid-flight. The auto-apply
   // step will overwrite the row anyway, so retrying is pointless — the op
   // gets dropped and the listener can surface a toast.
@@ -644,7 +675,9 @@ async function dispatch(op: OutboxOp): Promise<Result> {
         }
         const alignmentLoss = unexpectedAlignmentLossReason(e.body);
         if (alignmentLoss) {
-          return { kind: "fatal", reason: alignmentLoss };
+          // Also carry it as the display reason so every refusal reaches the
+          // drawer through the same field, not just the plain-4xx ones.
+          return { kind: "fatal", reason: alignmentLoss, serverReason: alignmentLoss };
         }
         const body = e.body as { current?: unknown } | undefined;
         return { kind: "conflict", current: body?.current };
@@ -667,8 +700,9 @@ async function dispatch(op: OutboxOp): Promise<Result> {
       // A csrf_mismatch 403 is recoverable: the be_csrf cookie expired but the
       // session is still valid. api.ts already refreshes-and-retries inline; if
       // one still reaches here (refresh raced/failed), keep the op pending and
-      // retry rather than failing it permanently. read_only 403s carry no
-      // `error` body and fall through to fatal, as they must (they'd loop).
+      // retry rather than failing it permanently. The other 403s
+      // (source_text_is_read_only, forbidden/not_an_editor) fall through to
+      // fatal, as they must — retrying them would just loop.
       if (
         e.status === 403 &&
         (e.body as { error?: string } | undefined)?.error === "csrf_mismatch"
@@ -676,8 +710,15 @@ async function dispatch(op: OutboxOp): Promise<Result> {
         return { kind: "retry", reason: "csrf_mismatch" };
       }
       // 403, 404, 422, 428 etc. are non-retryable client errors — sending
-      // the same payload again won't change the outcome.
-      return { kind: "fatal", reason: `http ${e.status}` };
+      // the same payload again won't change the outcome. Carry the server's
+      // own explanation alongside the status so the drawer can tell the user
+      // *why* the save was refused instead of just "http 400" (issue #370).
+      const serverReason = serverRefusalReason(e.body);
+      return {
+        kind: "fatal",
+        reason: `http ${e.status}`,
+        ...(serverReason !== undefined ? { serverReason } : {}),
+      };
     }
     return { kind: "retry", reason: "network" };
   }
@@ -832,6 +873,11 @@ async function drainPass() {
       result = { kind: "retry", reason: `dispatch_threw: ${String(err)}` };
     }
 
+    // Display-only server explanation for a refusal. Set on every result so a
+    // reason from an earlier attempt can't linger on an op that has since
+    // failed for a different cause (or is merely retrying).
+    next.lastErrorReason = reasonForOp(result);
+
     // Persist the new status *before* notifying listeners. If a put() or
     // delete() throws, the catch below resets the op to pending so it
     // doesn't strand at in_flight.
@@ -908,7 +954,7 @@ async function drainPass() {
           // it. `attempts` carries the count so the drawer can show how
           // long we tried before giving up.
           next.status = "failed";
-          next.lastError = "max_attempts_exceeded";
+          next.lastError = MAX_ATTEMPTS_SENTINEL;
           await (await db()).put(STORE, next);
         } else {
           next.status = "pending";
@@ -928,6 +974,10 @@ async function drainPass() {
       try {
         next.status = "pending";
         next.lastError = `persist_failed: ${String(persistErr)}`;
+        // The refusal reason belongs to the result we failed to persist — this
+        // op is going back on the queue, so it must not carry an explanation
+        // for an outcome that was never recorded.
+        next.lastErrorReason = undefined;
         await (await db()).put(STORE, next);
       } catch {
         /* nothing we can do; will be picked up by recoverInFlight on reload */
@@ -988,9 +1038,9 @@ async function reviveMaxAttemptsFailed() {
     .transaction(STORE, "readonly")
     .store.index("status")
     .getAll("failed")) as OutboxOp[];
-  const revivable = failedOps.filter(
-    (o) => o.lastError === "max_attempts_exceeded",
-  );
+  // Same predicate the failed-ops panel uses to label an op "still trying" —
+  // imported, not re-tested, so the label can never outlive the behaviour.
+  const revivable = failedOps.filter((o) => willRetryOnItsOwn(o.lastError));
   if (revivable.length === 0) return;
   const tx = idb.transaction(STORE, "readwrite");
   for (const o of revivable) {
@@ -998,6 +1048,7 @@ async function reviveMaxAttemptsFailed() {
     o.attempts = 0;
     o.hardAttempts = 0;
     o.lastError = undefined;
+    o.lastErrorReason = undefined;
     await tx.store.put(o);
   }
   await tx.done;
@@ -1014,7 +1065,13 @@ async function reviveAndDrain() {
 // stranded by a previous tab crash get re-armed at startup.
 if (typeof window !== "undefined") {
   window.addEventListener("online", () => void reviveAndDrain());
-  window.addEventListener("focus", () => void drain());
+  // Focus revives too, not just drains. A run of 5xx can exhaust the retry
+  // cap while the laptop never goes offline and the session never refreshes —
+  // and `online` / onAuthRefreshed were the only two revival triggers, so
+  // those ops sat as `failed` forever with nothing left to retry them. The
+  // failed-ops panel tells the user they "keep trying on their own", which
+  // has to be true: coming back to the tab is the moment to re-check.
+  window.addEventListener("focus", () => void reviveAndDrain());
   // A successful silent refresh means auth-stalled ops can move again.
   onAuthRefreshed(() => void reviveAndDrain());
   void drain();
