@@ -105,6 +105,38 @@ eq(
   "the whole line reads as one comma-joined sentence",
 );
 
+console.log("\n-- blocked ids (issue #427) --");
+
+// Both counters roll into one plain-English phrase.
+has(
+  summarizeReimport(res({ tombstone_blocked: 6 })),
+  "6 NOT imported (ID still held by a deleted row)",
+  "tombstone_blocked is reported in the snackbar",
+);
+has(
+  summarizeReimport(res({ conflict_skipped: 2 })),
+  "2 NOT imported (ID still held by a deleted row)",
+  "conflict_skipped is reported too",
+);
+has(
+  summarizeReimport(res({ tombstone_blocked: 6, conflict_skipped: 2 })),
+  "8 NOT imported (ID still held by a deleted row)",
+  "the two counters are summed, not listed twice",
+);
+
+// This snackbar belongs to the MANUAL "Pull from Door43" action, which runs
+// runReimport — a path that never touches book_resource_syncs. It must not
+// claim the watermark effect that only the nightly chunked path produces.
+lacks(
+  summarizeReimport(res({ tombstone_blocked: 6 })),
+  "out of sync",
+  "does NOT assert a watermark consequence the manual reimport path cannot have",
+);
+
+// Absent (older/cached response) must read as nothing to say, not as NaN.
+lacks(summarizeReimport(res({})), "NOT imported", "no blocked rows → no blocked phrase");
+lacks(summarizeReimport(res({})), "NaN", "absent counters never render as NaN");
+
 if (failed > 0) {
   console.error(`\n${failed} failure(s)`);
   process.exit(1);

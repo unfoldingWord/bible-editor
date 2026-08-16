@@ -27,6 +27,18 @@ export function summarizeReimport(res: ReimportResponse): string {
   // (see api/src/ownPublish.ts).
   if (t.own_publish_converged)
     parts.push(`${t.own_publish_converged} resource(s) confirmed as holding our last export`);
+  // Master rows that could NOT be imported because their id is already taken in
+  // D1 by a soft-deleted row (ids are never released). Worth saying out loud
+  // rather than burying in "skipped": the rows are genuinely missing from D1.
+  //
+  // Says ONLY that. It deliberately does NOT mention the sync watermark, even
+  // though these counters do withhold it on the nightly path: this string is the
+  // snackbar for the *manual* "Pull from Door43" action, which runs runReimport
+  // (api/src/bookReimport.ts) — a path that never touches book_resource_syncs at
+  // all. Claiming "book left marked out of sync" here would assert an effect
+  // this run did not have. See api/src/reimportClassify.ts / GitHub issue #427.
+  const blocked = (t.tombstone_blocked ?? 0) + (t.conflict_skipped ?? 0);
+  if (blocked) parts.push(`${blocked} NOT imported (ID still held by a deleted row)`);
   if (t.dcs_404) parts.push(`${t.dcs_404} resource(s) not on DCS`);
   if (parts.length === 0) return `Imported ${res.book} — no changes.`;
   return `Imported ${res.book}: ${parts.join(", ")}.`;

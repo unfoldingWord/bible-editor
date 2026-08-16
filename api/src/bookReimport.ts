@@ -62,6 +62,7 @@ import {
   classifyReimportRow,
   isReimportableRow,
   computeEditedFieldMerge,
+  isReissuedTombstone,
 } from "./reimportClassify";
 import {
   computeTsvMerge,
@@ -151,6 +152,56 @@ export interface ReimportCounts {
   // (Guard 2, content-dedup). Tracked separately from skipped_noop so the guard
   // firing is visible in the reimport summary / logs.
   skipped_dup: number;
+  // ── Issue #427, option 2: the silent tombstone-PK drop, made visible ──────
+  //
+  // A master row this run intended to INSERT whose `INSERT ... ON CONFLICT(id,
+  // book) DO NOTHING` wrote 0 rows — the (book, id) slot was already taken by a
+  // row the in-memory diff didn't see (in practice a tombstone; soft deletes
+  // keep their primary key forever). Previously folded into `skipped_noop` with
+  // a "raced" comment, which asserted a cause the code had not measured. The
+  // narrower of the two drop routes: applyTsvRows' `existing` read does NOT
+  // filter `deleted_at IS NULL`, so a known tombstone reaches the tombstone
+  // branch below and never gets here — this counter is the backstop for a slot
+  // taken between the read and the insert.
+  conflict_skipped: number;
+  // A master row dropped by the TOMBSTONE branch of applyTsvRows where master
+  // carries that id at a DIFFERENT reference than the tombstone holds — i.e.
+  // the id has been reissued to a genuinely different row, so master's row is
+  // real and is being silently lost. This is the route the 1CH 23 tQ incident
+  // actually took (six ids tombstoned at 1CH 5:x, reissued by bp-assistant at
+  // 1CH 23:x, dropped with no error and no counter while the watermark
+  // certified the book in sync). See isReissuedTombstone in reimportClassify.ts
+  // for the discriminator and why a SAME-reference tombstone is deliberately
+  // NOT counted (that skip is what preserves a delete pending export).
+  //
+  // These rows are ALSO counted in `skipped_edited`, which is left untouched so
+  // no existing reader changes meaning; this is the specific, gating subset of
+  // it. (`skipped_noop` DID change meaning: the PK-conflict case used to be
+  // folded into it and no longer is. Readers: reimportSummary.ts's "N unchanged"
+  // and AdminPanel's counter dump.) Fixing the drop itself (reclaiming the id)
+  // is issue #427's option 1 and is deliberately not done here — this run still
+  // loses the row, it just says so and refuses to certify the resource as
+  // synced.
+  //
+  // NOTE the asymmetry with tsvMerge.ts's `tsvRefMoved`, which answers a
+  // similar-sounding question for LIVE rows and also withholds (via
+  // apply_incomplete). The two deliberately differ: tsvRefMoved treats any
+  // ref_raw difference as a move, including whitespace and a null-vs-populated
+  // ref_raw, because for a live row the safe direction is to flag. Here the safe
+  // direction is the opposite — a false positive freezes the book's export with
+  // no automatic release — so isReissuedTombstone normalizes whitespace and
+  // falls back to chapter/verse. Keep them separate; do not "unify" one into the
+  // other without re-deciding which direction each should fail.
+  tombstone_blocked: number;
+  // Human-readable identification of the rows the two counters above dropped —
+  // resource, id, and both references. Capped at BLOCKED_SAMPLE_CAP because the
+  // failure mode is a whole book's ids being re-minted at once, and this rides
+  // in a Workflow step result and an alert message. Diagnostic ONLY: it is not
+  // consulted by any gate, so a truncated or absent list can never change a
+  // watermark decision — the counters do that. It exists because withholding a
+  // watermark with no automatic release (see the reimport-sync step) is only
+  // actionable if a human is told WHICH rows to go fix.
+  blocked_samples?: string[];
   // Pristine tombstone that master still carries, brought back to life because
   // an earlier reimport prune had erroneously soft-deleted it (the HAB tn
   // truncated-fetch incident). Human-deleted/trashed rows are never resurrected.
@@ -288,6 +339,21 @@ export interface ReimportResult {
 
 const REIMPORT_SOURCE = "dcs_reimport";
 
+// Cap on ReimportCounts.blocked_samples. Also caps the per-row console.warn at
+// each drop site: a mass id-reissue would otherwise emit one Workers log line
+// per row, and the per-resource summary at the reimport-sync step already
+// carries the total.
+const BLOCKED_SAMPLE_CAP = 20;
+
+// Record one dropped row's identification, and log it, both capped. Kept as one
+// helper so the cap can never be applied to the list but forgotten on the log.
+function noteBlockedSample(counts: ReimportCounts, sample: string): void {
+  const samples = (counts.blocked_samples ??= []);
+  if (samples.length >= BLOCKED_SAMPLE_CAP) return;
+  samples.push(sample);
+  console.warn("reimport: master row not imported — id already held in D1", { sample });
+}
+
 function zeroCounts(): ReimportCounts {
   return {
     updated: 0,
@@ -301,6 +367,8 @@ function zeroCounts(): ReimportCounts {
     prune_locked: 0,
     skipped_noop: 0,
     skipped_dup: 0,
+    conflict_skipped: 0,
+    tombstone_blocked: 0,
     resurrected: 0,
     source_attr_reconciled: 0,
     source_attr_divergent: 0,
@@ -319,6 +387,18 @@ function zeroCounts(): ReimportCounts {
     apply_incomplete: false,
   };
 }
+
+// Test-only aliases (reimportJourney.test.mjs). The aggregation step is where an
+// absent counter could be laundered into a present zero, so the journey test has
+// to fold through the REAL addCounts rather than re-implement it.
+export const zeroCountsForTest = (): ReimportCounts => zeroCounts();
+export const addCountsForTest = (into: ReimportCounts, from: ReimportCounts): void => addCounts(into, from);
+export const raiseTombstoneBlockAlertForTest = (
+  env: Env,
+  book: string,
+  resource: Resource,
+  counts: ReimportCounts,
+): Promise<void> => raiseTombstoneBlockAlert(env, book, resource, counts);
 
 function addCounts(into: ReimportCounts, from: ReimportCounts): void {
   into.updated += from.updated;
@@ -343,13 +423,35 @@ function addCounts(into: ReimportCounts, from: ReimportCounts): void {
   // zero and stamp. So the incompleteness is recorded separately, on
   // `counts_incomplete`, which survives the coercion below and is checked by
   // the gate in addition to its direct-absence check.
+  //
+  // `conflict_skipped` / `tombstone_blocked` (issue #427) join that list for
+  // exactly the same reason, and it matters more for them than for the two
+  // above: those two fields did not exist before this change, so EVERY chunk
+  // result memoized by a Workflow instance that started pre-deploy is missing
+  // them. If their absence only coerced to zero, a run that dropped rows to a
+  // tombstone collision mid-deploy would aggregate to a clean present-zero and
+  // stamp the watermark — the precise laundering this taint flag exists to stop.
   const incomplete =
-    from.chapters_locked === undefined || from.prune_locked === undefined;
+    from.chapters_locked === undefined ||
+    from.prune_locked === undefined ||
+    from.conflict_skipped === undefined ||
+    from.tombstone_blocked === undefined;
   into.counts_incomplete = Boolean(into.counts_incomplete || from.counts_incomplete || incomplete);
   into.chapters_locked += from.chapters_locked ?? 0;
   into.prune_locked += from.prune_locked ?? 0;
   into.skipped_noop += from.skipped_noop;
   into.skipped_dup += from.skipped_dup;
+  into.conflict_skipped += from.conflict_skipped ?? 0;
+  into.tombstone_blocked += from.tombstone_blocked ?? 0;
+  // Diagnostic list, merged under the same cap. Never gates anything, so a
+  // truncation here cannot affect a watermark decision.
+  if (from.blocked_samples?.length) {
+    const into_ = (into.blocked_samples ??= []);
+    for (const s of from.blocked_samples) {
+      if (into_.length >= BLOCKED_SAMPLE_CAP) break;
+      into_.push(s);
+    }
+  }
   into.resurrected += from.resurrected;
   into.source_attr_reconciled += from.source_attr_reconciled;
   into.source_attr_divergent += from.source_attr_divergent;
@@ -705,6 +807,17 @@ type TsvKind = "tn" | "tq" | "twl";
 
 interface ParsedTsvRow {
   id: string;
+  // True when `id` is NOT master's literal ID — parseTsvRow rewrote a malformed
+  // one through coerceRowId (rowId.ts). Issue #427: this must suppress the
+  // tombstone/conflict *blocked* counters. coerceRowId hashes into a 96-ID
+  // space, so two different malformed master IDs can legitimately land on the
+  // same coerced value, and a coerced ID can land on an unrelated tombstone.
+  // Neither is "master reissued this ID to a different row" — the coerced ID was
+  // never the row's identity in the first place, so the reissue inference is
+  // meaningless for it. Counting those as blocked would withhold the watermark,
+  // and that withhold has no automatic release (see raiseTombstoneBlockAlert),
+  // so a documented-benign coercion no-op would freeze the book's export.
+  idCoerced?: boolean;
   refRaw: string;
   chapter: number;
   verse: number;
@@ -748,6 +861,10 @@ function parseTsvRow(r: Record<string, string>, kind: TsvKind): ParsedTsvRow | n
   const occurrence = occRaw === "" || occRaw == null ? null : parseInt(occRaw, 10) || 0;
   const base: ParsedTsvRow = {
     id,
+    // Record that the id is ours, not master's — see ParsedTsvRow.idCoerced.
+    // coerceRowId is a strict no-op for a well-formed id, so this is false for
+    // essentially every real row.
+    idCoerced: id !== rawId,
     refRaw,
     chapter: ch,
     verse: v,
@@ -784,7 +901,14 @@ function parseTsvRow(r: Record<string, string>, kind: TsvKind): ParsedTsvRow | n
 // file order, so the ordinal tracks source order exactly. The pristine guard +
 // version-CAS stay ON each UPDATE, so a translator edit landing between the read
 // and the batch matches 0 rows (no clobber) and is counted skipped_edited.
-async function applyTsvRows(
+// Exported for the integration test ONLY (reimportJourney.test.mjs). Issue #427:
+// the tombstone-collision claims were previously asserted by a test that
+// hand-copied this function's SQL, which proves nothing if the real SQL later
+// drifts — notably the `existing` read's deliberate absence of a
+// `deleted_at IS NULL` filter, which is the whole reason a tombstoned id reaches
+// the tombstone branch instead of the insert. Driving the real function is what
+// makes that claim drift-detecting. Not part of the module's public API.
+export async function applyTsvRows(
   env: Env,
   book: string,
   kind: TsvKind,
@@ -884,11 +1008,34 @@ async function applyTsvRows(
     // to this write — tallied as merged_fields INDEPENDENTLY of adopted.
     heuristic: boolean;
   }> = [];
+  // Ids this pass has already INSERTED. `existing` is read once, before the
+  // loop, and is never updated afterwards — so if master's own file carries the
+  // same id twice, the second occurrence still finds nothing in `existing`,
+  // reaches the insert, and is refused by ON CONFLICT with 0 changes. That is a
+  // duplicate id ON MASTER, not a primary-key collision with a tombstone, and it
+  // must NOT be counted as conflict_skipped: conflict_skipped withholds the
+  // watermark, and a duplicate id never clears by itself, so mislabelling it
+  // would freeze that book's export indefinitely over a cosmetic condition the
+  // old code (rightly) treated as harmless. This repo has shipped duplicated
+  // master rows before (the ISA 48 delete+dup repair, the AI TN duplication
+  // round-trip), so the case is real, not theoretical. Caught BEFORE the insert
+  // so the two causes never share a counter.
+  const insertedThisPass = new Set<string>();
   for (let i = 0; i < incoming.length; i++) {
     const row = incoming[i];
     const sortOrder = nextSort(row.chapter, row.verse);
     const cur = existing.get(row.id);
     if (!cur) {
+      if (insertedThisPass.has(row.id)) {
+        counts.skipped_dup++;
+        console.warn("reimport: master file carries this id more than once", {
+          book,
+          resource: kind,
+          id: row.id,
+          ref: row.refRaw,
+        });
+        continue;
+      }
       if (skipDupIdx.has(i)) {
         counts.skipped_dup++;
         console.warn("reimport: skipped duplicate-content tn row", {
@@ -900,11 +1047,48 @@ async function applyTsvRows(
         continue;
       }
       try {
-        if (await tryInsertTsvRow(env, book, kind, row, sortOrder)) {
+        const outcome = await tryInsertTsvRow(env, book, kind, row, sortOrder);
+        if (outcome === "inserted") {
           counts.inserted++;
+          insertedThisPass.add(row.id);
           await logEdit(env, kind, row.id, book, userId, null, 1, "create", row);
+        } else if (outcome === "unknown") {
+          // D1 reported no row count, so we do not know whether this row landed.
+          // Do NOT call that a conflict: `conflict_skipped` withholds the
+          // watermark and a mis-read here would freeze the book's export on a
+          // run where nothing was wrong. Taint the run instead — same "absent
+          // measurement must not be laundered into a value" rule the rest of
+          // this file follows, applied in the red direction as well as the green.
+          counts.counts_incomplete = true;
+          console.warn("reimport: insert returned no row count — treating as unknown, not as a conflict", {
+            book,
+            resource: kind,
+            id: row.id,
+          });
+        } else if (row.idCoerced) {
+          // The (book, id) slot is taken, but this id is OURS — coerceRowId
+          // rewrote a malformed master id into a 96-id space, so a collision
+          // here says nothing about master reissuing anything. Documented-benign
+          // no-op (see ParsedTsvRow.idCoerced); count it as a duplicate, never as
+          // a blocked drop, or a coercion collision would freeze the export.
+          counts.skipped_dup++;
+          console.warn("reimport: coerced id collided — benign, not counted as blocked", {
+            book,
+            resource: kind,
+            coercedId: row.id,
+            ref: row.refRaw,
+          });
         } else {
-          counts.skipped_noop++; // raced — appeared concurrently
+          // 0 rows written by `ON CONFLICT(id, book) DO NOTHING` on a row the
+          // diff said to insert, and NOT a duplicate id within master's own file
+          // (that is caught above). The (book, id) slot is held by something the
+          // `existing` read didn't return — in practice a row created between
+          // the read and this insert. Issue #427 — count it as a conflict skip
+          // and let it withhold the watermark. The old code called this "raced"
+          // and folded it into skipped_noop, which both asserted an unmeasured
+          // cause and hid a real drop inside a benign counter.
+          counts.conflict_skipped++;
+          noteBlockedSample(counts, `${kind} ${row.id} @ ${row.refRaw} (id already taken)`);
         }
       } catch (e) {
         counts.errors.push(`${kind} ${row.id}: ${e instanceof Error ? e.message : String(e)}`);
@@ -926,6 +1110,34 @@ async function applyTsvRows(
         resurrects.push({ row, sortOrder, oldVersion: Number(cur.version) });
       } else {
         counts.skipped_edited++;
+        // Issue #427. The tombstone keeps its (book, id) primary key forever,
+        // so master's row for that id cannot land — and that is CORRECT when
+        // master still carries it at the same reference (a delete awaiting
+        // export). When master carries it at a DIFFERENT reference the id has
+        // been reissued to a genuinely different row, and we have just dropped
+        // real master content with no error and no distinguishable counter.
+        // Count that case separately so the sync report shows it and the
+        // (book, resource) watermark is withheld — see isReissuedTombstone and
+        // the reimport-sync step. Reclaiming the slot is option 1, not this.
+        // `!row.idCoerced` first: for a coerced id the "master reissued this id
+        // to a different row" inference is meaningless — the id is ours, hashed
+        // into a 96-id space, so landing on an unrelated tombstone at a
+        // different reference is an expected collision, not evidence master
+        // moved anything. Counting it would withhold the watermark and freeze
+        // the export over a documented-benign no-op. See ParsedTsvRow.idCoerced.
+        if (
+          !row.idCoerced &&
+          isReissuedTombstone(
+            { refRaw: (cur.ref_raw as string | null) ?? null, chapter: Number(cur.chapter), verse: Number(cur.verse) },
+            { refRaw: row.refRaw, chapter: row.chapter, verse: row.verse },
+          )
+        ) {
+          counts.tombstone_blocked++;
+          noteBlockedSample(
+            counts,
+            `${kind} ${row.id}: deleted row at ${cur.ref_raw ?? `${cur.chapter}:${cur.verse}`}, master now uses it at ${row.refRaw}`,
+          );
+        }
       }
       continue;
     }
@@ -1436,15 +1648,45 @@ async function reconstructTsvBases(
   return out;
 }
 
-// Returns true if the row was inserted (was new), false if it already existed
-// (caller falls through to the pristine UPDATE branch).
+// Outcome of one `INSERT ... ON CONFLICT(id, book) DO NOTHING`.
+//
+// Deliberately TRI-state rather than a boolean (issue #427). The signal is
+// D1's `meta.changes`, and the old `(r.meta.changes ?? 0) > 0` collapsed two
+// very different situations into "not inserted": a real 0 (the primary key was
+// taken — a measured conflict) and `undefined` (D1 did not report a row count
+// at all). Since these counters now WITHHOLD the sync watermark, and that
+// withhold has no automatic release, treating an unreported count as a measured
+// conflict would recount every successful insert as a drop and freeze the book's
+// export on a run where nothing was actually wrong.
+//
+// So: "unknown" is reported separately and taints the run (counts_incomplete)
+// instead of asserting a conflict. That is the same direction the rest of this
+// file takes — an absent measurement must never be laundered into a value, in
+// EITHER direction (not into a green "0", and not into a red "conflict").
+//
+// NOTE the node:sqlite integration tests prove SQLite's semantics here, not
+// D1's. They are strong evidence for the ON CONFLICT behavior but they cannot
+// prove what D1 puts in `meta.changes`, which is exactly why this branch exists.
+type TsvInsertOutcome = "inserted" | "conflict" | "unknown";
+
+// The one place `meta.changes` is interpreted, so the undefined case cannot be
+// re-collapsed at one of the three call sites and not the others.
+function insertOutcome(r: { meta?: { changes?: number } }): TsvInsertOutcome {
+  const changes = r.meta?.changes;
+  if (changes === undefined || changes === null || !Number.isFinite(changes)) return "unknown";
+  return changes > 0 ? "inserted" : "conflict";
+}
+
+// Returns "inserted" if the row was written, "conflict" if the (book, id) slot
+// was already taken, "unknown" if D1 reported no row count (caller must not
+// treat that as either).
 async function tryInsertTsvRow(
   env: Env,
   book: string,
   kind: TsvKind,
   row: ParsedTsvRow,
   sortOrder: number,
-): Promise<boolean> {
+): Promise<TsvInsertOutcome> {
   if (kind === "tn") {
     const r = await env.DB.prepare(
       `INSERT INTO tn_rows
@@ -1458,7 +1700,7 @@ async function tryInsertTsvRow(
         row.occurrence, row.note ?? null, sortOrder,
       )
       .run();
-    return (r.meta.changes ?? 0) > 0;
+    return insertOutcome(r);
   }
   if (kind === "tq") {
     const r = await env.DB.prepare(
@@ -1473,7 +1715,7 @@ async function tryInsertTsvRow(
         row.question ?? null, row.response ?? null, sortOrder,
       )
       .run();
-    return (r.meta.changes ?? 0) > 0;
+    return insertOutcome(r);
   }
   const r = await env.DB.prepare(
     `INSERT INTO twl_rows
@@ -1486,7 +1728,7 @@ async function tryInsertTsvRow(
       row.tags, row.orig_words ?? null, row.occurrence, row.tw_link ?? null, sortOrder,
     )
     .run();
-  return (r.meta.changes ?? 0) > 0;
+  return insertOutcome(r);
 }
 
 // True iff this stored row has never been touched by a human and isn't pending
@@ -3133,6 +3375,78 @@ async function noteOwnPublishDecline(
 // nightly reverts continue silently). Asserting either would repeat the mistake
 // this repo has a standing lesson about, so the message names both and gives the
 // one comparison that separates them.
+// Banner for issue #427's withhold. This one NEEDS an alert in a way the
+// lock-held withholds do not, and the difference is the whole reason it exists:
+// a chapter lock clears when the AI job finishes, so that withhold releases
+// itself overnight. A tombstone does not. The soft-deleted row keeps its
+// (book, id) slot forever, master keeps carrying that id, and every subsequent
+// night re-stages the file (the SHA gate cannot skip it — the watermark was
+// never advanced), re-drops the same rows, and re-withholds. **There is no
+// automatic release.** Until a human acts, or until issue #427's option 1
+// (reclaim a reissued id) or option 3 (sweep obsolete tombstones) ships, this
+// book+resource stops exporting to Door43 entirely.
+//
+// That is the correct fail-safe direction — exporting instead would render a D1
+// that is short of master back over master, deleting master's rows, which is the
+// original 1CH failure — but a freeze nobody is told about is not safe, it is
+// just quiet. The existing freshness-gate banner (exportWorkflow.ts's
+// recordStaleSkipAlert) fires too, and its advice — "re-run the sync, then
+// re-export" — cannot possibly work here, because re-running the sync
+// re-encounters the same collision. So this alert names the measured cause and
+// the rows, and gives a remedy that can actually clear it.
+//
+// The wording states only what the code measured: the counters, and the sampled
+// rows themselves. It does NOT claim which of the two situations produced any
+// given row (an id genuinely re-minted for a new row, versus a maintainer
+// re-anchoring the Reference of a row we had deleted) — the reference test
+// cannot separate those, and asserting either would repeat the mistake this
+// repo has a standing lesson about.
+async function raiseTombstoneBlockAlert(
+  env: Env,
+  book: string,
+  resource: Resource,
+  counts: ReimportCounts,
+): Promise<void> {
+  const blocked = counts.tombstone_blocked ?? 0;
+  const conflicts = counts.conflict_skipped ?? 0;
+  const samples = counts.blocked_samples ?? [];
+  const source = `reimport_id_blocked:${book}:${resource}`;
+  const shown = samples.slice(0, 10);
+  const more = blocked + conflicts - shown.length;
+  const message =
+    `Benjamin — tonight's Door43 sync could not import ${blocked + conflicts} ${book} ` +
+    `${resource.toUpperCase()} row(s) because their IDs are still held in our database by ` +
+    `soft-deleted rows (a deleted row keeps its ID for that book permanently). Those rows are ` +
+    `MISSING from the app, so ${book} ${resource.toUpperCase()} has been left marked out of sync and ` +
+    `will NOT export to Door43 until this is cleared — otherwise the export would delete those same ` +
+    `rows from Door43. ` +
+    (blocked > 0 ? `${blocked} blocked by a deleted row whose ID Door43 now uses at a different reference` : "") +
+    (blocked > 0 && conflicts > 0 ? "; " : "") +
+    (conflicts > 0 ? `${conflicts} refused by the database as an ID already in use` : "") +
+    `. Affected: ${shown.join(" | ")}${more > 0 ? ` (and ${more} more)` : ""}. ` +
+    `This does NOT clear on its own — the next sync hits the same collision. To clear it, either give ` +
+    `the affected row(s) a different ID on Door43, or land the ID-reclaim / tombstone-sweep fix ` +
+    `(GitHub issue #427, options 1 and 3).`;
+  try {
+    await env.DB.prepare(`DELETE FROM system_alerts WHERE username = ?1 AND source = ?2 AND dismissed_at IS NULL`)
+      .bind(OWN_PUBLISH_ALERT_USERNAME, source)
+      .run();
+    await env.DB.prepare(
+      `INSERT INTO system_alerts (username, severity, source, message, link_url) VALUES (?1, ?2, ?3, ?4, ?5)`,
+    )
+      .bind(OWN_PUBLISH_ALERT_USERNAME, "error", source, message, null)
+      .run();
+  } catch (e) {
+    // Best-effort, exactly like every other alert helper here: a failed banner
+    // must never fail the reimport. The withhold itself already happened.
+    console.error("reimport tombstone-block alert failed", {
+      book,
+      resource,
+      error: e instanceof Error ? e.message : String(e),
+    });
+  }
+}
+
 async function raiseOwnPublishInertAlert(
   env: Env,
   book: string,
@@ -3998,8 +4312,18 @@ export async function runChunkedReimport(
       // it in-sync and the export would revert master with no retry (Codex's
       // failed-adoption-write gate). Sibling to the other withhold conditions.
       const applyIncomplete = perResource[e.resource].apply_incomplete === true;
+      // Issue #427: master rows this run dropped because a tombstone (or any
+      // other holder) already owns their (book, id) primary key. Folded into
+      // shouldRecordResourceSync rather than checked separately here, so the
+      // aggregation-laundering guard (counts_incomplete) covers them too.
       if (!shouldRecordResourceSync(perResource[e.resource]) || systemicRefusals || mergeRecordFailed || applyIncomplete) {
         withheld.push(e.resource);
+        const dropped =
+          (perResource[e.resource].conflict_skipped ?? 0) +
+          (perResource[e.resource].tombstone_blocked ?? 0);
+        if (dropped > 0) {
+          await raiseTombstoneBlockAlert(env, book, e.resource, perResource[e.resource]);
+        }
         // FIX B: a book whose (book, resource) has NO existing watermark row
         // (e.g. seeded by scripts/import-book.mjs, or whose import-time SHA
         // fetch returned null — bookImport.ts) would otherwise have withholding

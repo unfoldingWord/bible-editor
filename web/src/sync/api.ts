@@ -872,6 +872,17 @@ export interface ReimportCounts {
   // that situation is what made the sync overwrite app edits (see
   // api/src/ownPublish.ts). Optional, diagnostic.
   own_publish_converged?: number;
+  // Master rows this run could NOT land because their (book, id) primary key is
+  // already held in D1 — soft-deleted rows keep their id forever. `conflict_
+  // skipped` is the INSERT ... ON CONFLICT DO NOTHING refusal; `tombstone_
+  // blocked` is a tombstone whose id master has reissued to a row at a
+  // DIFFERENT reference (a same-reference tombstone is an ordinary delete
+  // awaiting export and is not counted). Either being non-zero also withholds
+  // the (book, resource) sync watermark, so the book is not certified current.
+  // See api/src/reimportClassify.ts and GitHub issue #427. Optional: an
+  // older/cached response may omit them.
+  conflict_skipped?: number;
+  tombstone_blocked?: number;
   dcs_404: number;
   errors: string[];
 }
@@ -1281,6 +1292,11 @@ export interface AdminImportCounts {
   prune_locked: number;
   skipped_noop: number;
   skipped_dup: number;
+  // See ReimportCounts above — master rows dropped because their (book, id)
+  // primary key was already held (issue #427). Non-zero withholds the sync
+  // watermark. Optional: an older/cached response may omit them.
+  conflict_skipped?: number;
+  tombstone_blocked?: number;
   resurrected: number;
   source_attr_reconciled: number;
   source_attr_divergent: number;
