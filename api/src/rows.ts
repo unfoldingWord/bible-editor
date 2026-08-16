@@ -13,6 +13,7 @@ import { refParts, coveredVersesFromRef } from "./importParsers";
 import { requiredOccurrence } from "./occurrenceRule";
 import { findRawTabField } from "./rawTabGuard";
 import { isValidChapterZeroRef } from "./chapterZeroGuard";
+import { normalizeBookCode, CHAPTER_EXISTS_SQL } from "./rowsCreateGuard";
 
 export const rows = new Hono<{ Bindings: Env; Variables: { userId?: number } }>();
 
@@ -213,6 +214,14 @@ rows.post("/:kind", requireEditor, async (c) => {
   const parsed = CREATE_SCHEMA[kind].safeParse(body);
   if (!parsed.success) return c.json({ error: "invalid_body", details: parsed.error.format() }, 400);
   const data = parsed.data as Record<string, unknown>;
+
+  // See rowsCreateGuard.ts for why both of these are needed and what each
+  // one closes off (issue #491).
+  data.book = normalizeBookCode(data.book as string);
+  const chapterExists = await c.env.DB.prepare(CHAPTER_EXISTS_SQL)
+    .bind(data.book, data.chapter)
+    .first<{ ok: number }>();
+  if (!chapterExists) return c.json({ error: "not_found", reason: "unknown_chapter" }, 404);
 
   // A raw TAB in any text field is structural corruption (see rawTabGuard.ts)
   // — reject it before it ever reaches D1.
