@@ -115,6 +115,14 @@ interface Props {
   onCardDrop: (position: DropPosition) => void;
   onMoveUp?: () => void;
   onMoveDown?: () => void;
+  // Identity of the neighbor onMoveUp/onMoveDown would reorder against — data
+  // props purely so areNotePropsEqual can detect a stale closure below; never
+  // read inside this component. onMoveUp/onMoveDown themselves close over
+  // whichever neighbor was current when ResourceColumn last rendered THIS
+  // card, so a memo-skipped card (its own props otherwise unchanged) would
+  // otherwise keep pointing at a neighbor an arrow-reorder already moved.
+  prevNoteId?: string | null;
+  nextNoteId?: string | null;
   // The just-reordered arrow to flash a focus ring on ("up"/"down"), or null.
   // Mirrors WordsTable: a mouse reorder keeps focus on the moved card's arrow
   // (Enter/Space repeats) but shows no ring, so this makes that discoverable.
@@ -1906,6 +1914,14 @@ function areNotePropsEqual(a: Props, b: Props): boolean {
     (a.activeMatchOccurrence ?? null) === (b.activeMatchOccurrence ?? null) &&
     a.dragging === b.dragging &&
     a.isDropTarget === b.isDropTarget &&
+    // Load-bearing: onMoveUp/onMoveDown (and onReorderHover) close over
+    // whichever neighbor id was current at render time. Without this check a
+    // card whose own data is unchanged but whose NEIGHBOR moved (an
+    // arrow-reorder renumbers only the shifted rows, per reorderSequential)
+    // would memo-skip and keep a stale closure pointing at the old neighbor —
+    // see issue #489.
+    (a.prevNoteId ?? null) === (b.prevNoteId ?? null) &&
+    (a.nextNoteId ?? null) === (b.nextNoteId ?? null) &&
     a.isAiPending === b.isAiPending &&
     a.aiRecentlyCompletedAt === b.aiRecentlyCompletedAt &&
     a.locked === b.locked &&
