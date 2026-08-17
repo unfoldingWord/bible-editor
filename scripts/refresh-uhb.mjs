@@ -112,9 +112,34 @@ async function fetchUhbUsfm(book) {
   if (!res.ok) return { ok: false, reason: `HTTP ${res.status}`, url };
   const buf = await res.arrayBuffer();
   const cl = res.headers.get("content-length");
-  const expected = cl == null ? null : Number(cl);
-  if (expected != null && Number.isFinite(expected) && buf.byteLength < expected) {
-    return { ok: false, reason: `truncated fetch (got ${buf.byteLength}B, expected ${expected}B)`, url };
+  // Fail closed: a response we cannot verify byte-for-byte is not
+  // authoritative. This is the exact truncated-fetch failure class that has
+  // bitten this repo before (TWL PSA clobber, shrink guard) — a partial body
+  // must never be treated as the source of truth for UPDATEs applied to prod.
+  if (cl == null) {
+    return {
+      ok: false,
+      reason: `no Content-Length header — cannot verify fetch completeness (fail-closed)`,
+      url,
+      completenessFailure: true,
+    };
+  }
+  const expected = Number(cl);
+  if (!Number.isFinite(expected)) {
+    return {
+      ok: false,
+      reason: `unparseable Content-Length header: ${JSON.stringify(cl)} (fail-closed)`,
+      url,
+      completenessFailure: true,
+    };
+  }
+  if (buf.byteLength !== expected) {
+    return {
+      ok: false,
+      reason: `byte length mismatch (got ${buf.byteLength}B, expected ${expected}B) — truncated or corrupt fetch (fail-closed)`,
+      url,
+      completenessFailure: true,
+    };
   }
   const text = new TextDecoder("utf-8").decode(buf);
   if (text.length < MIN_USFM_BYTES) {
@@ -146,6 +171,7 @@ async function main() {
   const churnFlags = [];
   let grandTotal = 0;
   let grandChanged = 0;
+  let hadRejection = false; // fail-closed rejection (incomplete fetch, or D1 rows the fetch is missing) — forces a nonzero exit
 
   for (const book of books) {
     if (!/^[0-9A-Z]{2,3}$/.test(book)) {
@@ -156,7 +182,12 @@ async function main() {
 
     const fetched = await fetchUhbUsfm(book);
     if (!fetched.ok) {
-      console.warn(`  ! ${book}: SKIPPED — ${fetched.reason}`);
+      if (fetched.completenessFailure) {
+        console.error(`  !! ${book}: REJECTED (fail-closed) — ${fetched.reason}`);
+        hadRejection = true;
+      } else {
+        console.warn(`  ! ${book}: SKIPPED — ${fetched.reason}`);
+      }
       skippedBooks.push({ book, reason: fetched.reason });
       continue;
     }
@@ -181,9 +212,21 @@ async function main() {
     const d1ByKey = new Map(d1Rows.map((r) => [`${r.chapter}:${r.verse}`, r]));
     const freshKeys = new Set(fresh.map((v) => `${v.chapter}:${v.verse}`));
 
+    // Computed before we touch a single verse: if the fresh fetch is missing
+    // verses D1 already has, that's the same truncated-fetch failure class as
+    // the Content-Length gate above — a fetch/parse that appears to have lost
+    // verses must not be treated as authoritative for the verses it DID find.
+    const droppedFromD1 = [...d1ByKey.keys()].filter((k) => !freshKeys.has(k)).length;
+
     let changedCount = 0;
     let missingInD1 = 0; // verse exists upstream now but not in D1 (no INSERT emitted — non-destructive)
     const changedRefs = [];
+    // Buffered per-book, not pushed straight to sqlLines/manifest: if
+    // droppedFromD1 turns out nonzero we discard this book's UPDATEs
+    // entirely instead of shipping a partial set generated from an
+    // incomplete fetch.
+    const bookSqlLines = [];
+    const bookManifest = [];
 
     for (const v of fresh) {
       const key = `${v.chapter}:${v.verse}`;
@@ -217,10 +260,14 @@ async function main() {
 
       changedCount++;
       changedRefs.push(key);
-      sqlLines.push(
-        `UPDATE verses SET content_json=${q(v.contentJson)}, plain_text=${q(v.plainText)}, verse_end=${q(v.verseEnd)}, version=version+1, updated_at=${GENERATED_UPDATED_AT} WHERE book=${q(book)} AND chapter=${q(v.chapter)} AND verse=${q(v.verse)} AND bible_version='UHB';`,
+      // Version-CAS'd: the WHERE clause also requires the row still be at
+      // the version we observed it at, so a row edited between generation
+      // and apply no-ops instead of getting silently overwritten. See the
+      // expected-count comment block appended to the end of the file.
+      bookSqlLines.push(
+        `UPDATE verses SET content_json=${q(v.contentJson)}, plain_text=${q(v.plainText)}, verse_end=${q(v.verseEnd)}, version=version+1, updated_at=${GENERATED_UPDATED_AT} WHERE book=${q(book)} AND chapter=${q(v.chapter)} AND verse=${q(v.verse)} AND bible_version='UHB' AND version=${q(d1Row.version)};`,
       );
-      manifest.push({
+      bookManifest.push({
         book,
         chapter: v.chapter,
         verse: v.verse,
@@ -232,10 +279,7 @@ async function main() {
       });
     }
 
-    const droppedFromD1 = [...d1ByKey.keys()].filter((k) => !freshKeys.has(k)).length;
-
     grandTotal += fresh.length;
-    grandChanged += changedCount;
 
     const pct = fresh.length > 0 ? changedCount / fresh.length : 0;
     const churnLine = pct > CHURN_THRESHOLD;
@@ -243,10 +287,24 @@ async function main() {
       churnFlags.push({ book, changed: changedCount, total: fresh.length, pct });
     }
 
+    if (droppedFromD1 > 0) {
+      console.error(
+        `  !! ${book}: REJECTED (fail-closed) — ${droppedFromD1} verse(s) present in D1 are absent from the ` +
+          `freshly parsed fetch; suppressing all ${changedCount} would-be UPDATE(s) for this book rather than ` +
+          `emitting SQL generated from what may be a truncated/incomplete fetch.`,
+      );
+      skippedBooks.push({ book, reason: `suppressed: ${droppedFromD1} verse(s) in D1 missing from fresh fetch` });
+      hadRejection = true;
+    } else {
+      grandChanged += changedCount;
+      sqlLines.push(...bookSqlLines);
+      manifest.push(...bookManifest);
+    }
+
     console.log(
       `  ${book}: ${fresh.length} verses, ${changedCount} changed` +
         (missingInD1 ? `, ${missingInD1} new (not in D1, no INSERT emitted)` : "") +
-        (droppedFromD1 ? `, ${droppedFromD1} in D1 but absent upstream (not deleted)` : ""),
+        (droppedFromD1 ? `, ${droppedFromD1} in D1 but absent upstream (UPDATEs suppressed, fail-closed)` : ""),
     );
     if (changedCount > 0) {
       console.log(`      sample changed refs: ${changedRefs.slice(0, 8).join(", ")}`);
@@ -274,6 +332,20 @@ async function main() {
     }
   }
 
+  // Trailing comment block for whoever applies this file by hand: each
+  // UPDATE above is version-gated (AND version=<observed>), so a row edited
+  // between generation and apply no-ops instead of overwriting a newer edit.
+  // That makes the changed-row count returned by the apply step the thing to
+  // check — if it's short, some rows were stale and the manifest needs
+  // regenerating, not re-running as-is.
+  sqlLines.push("");
+  sqlLines.push(`-- Expected changed-row count: ${grandChanged}`);
+  sqlLines.push("-- Each UPDATE above is version-CAS'd (AND version=<observed>). After applying this");
+  sqlLines.push("-- file, verify the reported changed-row count equals the expected count on the line");
+  sqlLines.push("-- above. If it's lower, one or more rows changed since this file was generated (their");
+  sqlLines.push("-- UPDATE no-op'd rather than overwriting) — regenerate against current prod D1 before");
+  sqlLines.push("-- re-applying rather than assuming the shortfall is safe to ignore.");
+
   const outDir = resolve(repoRoot, "scripts/out");
   mkdirSync(outDir, { recursive: true });
   const sqlPath = resolve(outDir, "refresh-uhb.sql");
@@ -299,6 +371,13 @@ async function main() {
   console.log(`\nWrote ${sqlPath} (${grandChanged} UPDATE statements)`);
   console.log(`Wrote ${manifestPath} (${manifest.length} manifest entries)`);
   console.log("\nDRY RUN ONLY — nothing was applied to prod. Review the files above before ever running them.");
+
+  if (hadRejection) {
+    console.error(
+      "\nFAIL-CLOSED: one or more books were rejected (incomplete fetch, or D1 rows the fetch was missing) — see REJECTED lines above. Exiting nonzero.",
+    );
+    process.exitCode = 1;
+  }
 }
 
 main().catch((e) => {
