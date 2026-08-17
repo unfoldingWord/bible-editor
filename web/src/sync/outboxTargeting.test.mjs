@@ -176,4 +176,94 @@ check(
   "only the pending sibling (op2) would receive a threaded version — op1 keeps its own",
 );
 
+// --- Manual Retry must not reintroduce the leapfrog (PR #504 review, P1) ---
+//
+// The blocked-set/threading fix above covers *automatic* revival
+// (reviveMaxAttemptsFailed, on focus/online/auth-refresh), which never
+// touches queuedAt — the op keeps its original queue position, so once it
+// flips back to "pending" plain FIFO order alone keeps it ahead of op2.
+//
+// The user-driven Retry button is a separate code path (outbox.ts's
+// retry()) that also flips a failed op to "pending" — the same loss of
+// isMaxAttemptsBlocked's protection — but it used to ALSO refresh queuedAt
+// to "now". That refresh is what reopens the hole: op2 queued at 2000,
+// behind the then-failed op1; if op1's queuedAt jumps to "now" (e.g. 9000),
+// op2's untouched 2000 makes it look OLDER, so plain FIFO hands op2 the
+// target first. op2 lands, and being `eligibleForVersionThread` (pending),
+// its fresh version threads straight into the just-retried op1 — which then
+// drains and lands cleanly on top of op2's newer content. Same defect as
+// #487, reached via Retry instead of auto-revival.
+//
+// outbox.ts's retry() now leaves queuedAt/seq untouched for exactly this
+// class of op (isMaxAttemptsBlocked at the moment Retry is clicked), so it
+// keeps its original, earlier queue position. Model both the buggy
+// (queuedAt refreshed) and fixed (queuedAt preserved) shapes here to prove
+// the preserved-position rule is what closes the leapfrog.
+
+const op1RetriedPreservingQueue = {
+  ...op1FailedA,
+  status: "pending",
+  attempts: 0,
+  hardAttempts: 0,
+  lastError: undefined,
+  // queuedAt/seq intentionally NOT bumped — this is the fix.
+};
+const op1RetriedWithBumpedQueue = {
+  ...op1RetriedPreservingQueue,
+  queuedAt: 9000, // what the old retry() did: op.queuedAt = Date.now()
+};
+
+// Whichever shape, Retry always forfeits isMaxAttemptsBlocked's protection
+// (status is no longer "failed") — that part is unavoidable and expected.
+check(
+  isMaxAttemptsBlocked(op1RetriedPreservingQueue) === false,
+  "a just-retried op is no longer max-attempts-blocked (status is pending) — FIFO order alone must protect it now",
+);
+
+// REGRESSION (review P1): with the old bumped-queuedAt behavior, op2 —
+// still holding its original, now-earlier-looking queuedAt — sorts first
+// and leapfrogs the just-retried op1.
+const buggyOps = [op1RetriedWithBumpedQueue, op2PendingAB];
+const buggyBlocked = new Set();
+for (const o of buggyOps) {
+  if (o.status === "conflict" || isMaxAttemptsBlocked(o)) buggyBlocked.add(targetKey(o.target));
+}
+const buggyOrdered = [...buggyOps].sort(
+  (a, b) => a.queuedAt - b.queuedAt || (a.seq ?? 0) - (b.seq ?? 0),
+);
+const buggyNext = buggyOrdered.find(
+  (o) => o.status === "pending" && !buggyBlocked.has(targetKey(o.target)),
+);
+check(
+  buggyNext === op2PendingAB,
+  "demonstrates the bug this test guards against: bumping queuedAt on Retry lets op2 leapfrog the retried op1",
+);
+// ...and once op2 lands, the retried op1 (pending) is still
+// eligibleForVersionThread, so it would silently receive op2's fresh
+// version and overwrite it on its next drain — the exact revert reported
+// in review.
+check(
+  eligibleForVersionThread(op1RetriedWithBumpedQueue) === true,
+  "demonstrates the bug: a just-retried op is eligible for silent version-threading from a sibling that leapfrogged it",
+);
+
+// FIX: preserving queuedAt/seq keeps op1 sorted ahead of op2, so plain FIFO
+// order — not the (now-inapplicable) blocked set — drains op1 first, the
+// same as if it had never failed. op2 remains un-drained until op1 resolves.
+const fixedOps = [op1RetriedPreservingQueue, op2PendingAB];
+const fixedBlocked = new Set();
+for (const o of fixedOps) {
+  if (o.status === "conflict" || isMaxAttemptsBlocked(o)) fixedBlocked.add(targetKey(o.target));
+}
+const fixedOrdered = [...fixedOps].sort(
+  (a, b) => a.queuedAt - b.queuedAt || (a.seq ?? 0) - (b.seq ?? 0),
+);
+const fixedNext = fixedOrdered.find(
+  (o) => o.status === "pending" && !fixedBlocked.has(targetKey(o.target)),
+);
+check(
+  fixedNext === op1RetriedPreservingQueue,
+  "FIX (review P1): preserving queuedAt/seq on Retry keeps op1 ahead of op2 in FIFO order — no leapfrog, no silent overwrite of op2's landed edit",
+);
+
 console.log(`\noutboxTargeting: ${passed} checks passed`);

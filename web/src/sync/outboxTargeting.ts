@@ -16,6 +16,17 @@
 // version-threading (eligibleForVersionThread) so it re-arms through the
 // normal 409/autoheal path instead, where classifyRowPatchConflict can tell
 // a genuine conflict from a spurious one.
+//
+// The same predicate protects the manual path: outbox.ts's retry() flips a
+// max-attempts-failed op's status to "pending", which alone makes
+// isMaxAttemptsBlocked stop applying to it. If retry() also gave it a fresh
+// queuedAt (as it does for a plain fatal-refusal retry), it would sort
+// behind any sibling that queued while it sat failed — that sibling would
+// then drain first and, being `eligibleForVersionThread`, get threaded
+// straight into this now-pending op, which would land cleanly on top of it.
+// retry() avoids this by leaving queuedAt/seq untouched for that class of
+// op, so plain FIFO order (not the `blocked` set) keeps it draining first,
+// exactly as if it had never failed.
 
 import { willRetryOnItsOwn } from "./refusalReason.ts";
 import type { OpTarget, OutboxOp } from "./outbox.ts";

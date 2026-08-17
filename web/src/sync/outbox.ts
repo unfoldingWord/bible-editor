@@ -558,13 +558,34 @@ export const outbox = {
       await tx.done;
       return;
     }
+    // A max-attempts-blocked op (isMaxAttemptsBlocked) was holding its
+    // target's place in the FIFO: nothing queued behind it while it sat
+    // failed could leapfrog ahead and get threaded a version this op would
+    // later land on top of. Flipping status to "pending" already forfeits
+    // that protection (isMaxAttemptsBlocked only fires on `status ===
+    // "failed"`), so if we also bump queuedAt/seq to "now", this op sorts
+    // *behind* any sibling that queued while it was failed — that sibling
+    // then drains first, threadVersionToSiblings hands its fresh version to
+    // this now-pending op (eligibleForVersionThread allows any pending op),
+    // and this op lands cleanly on top of it, silently reverting the newer
+    // edit. Same bug as #487, reached through Retry instead of automatic
+    // revival. Keeping the original queuedAt/seq preserves this op's
+    // rightful place ahead of those siblings, so plain FIFO ordering (not
+    // the `blocked` set) keeps it draining — and re-threading — first, the
+    // same as if it had never failed. A fatal (non-blocking) failure never
+    // had this protection — it's threaded continuously while failed (see
+    // eligibleForVersionThread) — so it keeps getting a fresh queue
+    // position, as before.
+    const preserveQueuePosition = isMaxAttemptsBlocked(op);
     op.status = "pending";
     op.attempts = 0;
     op.hardAttempts = 0;
     op.lastError = undefined;
     op.lastErrorReason = undefined;
-    op.queuedAt = Date.now();
-    op.seq = nextSeq();
+    if (!preserveQueuePosition) {
+      op.queuedAt = Date.now();
+      op.seq = nextSeq();
+    }
     await tx.store.put(op);
     await tx.done;
     void notify();
