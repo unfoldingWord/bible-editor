@@ -1901,12 +1901,31 @@ async function lastTsvDeleteWasReimport(
 // is computed INSIDE the one function that performs the fetch and the check,
 // from the exact apiSize/buffer it used — no second, separately-timed probe,
 // so "verified" and "raw" can never desynchronize.
+//
+// THIRD P1 follow-up (round 4 codex re-review of bbb7b25): a same-function
+// probe still isn't a same-REVISION proof. `verifiedComplete` used to be
+// obtainable even when master's tip moved between fetchDcsMasterTextVerified's
+// internal size lookup and its raw fetch, because both of those defaulted to
+// the mutable "master" ref — describing "master's tip whenever each request
+// happened to land", not one fixed commit. `ref` (this book+resource's file
+// SHA, already resolved by planAndStageBookResources's SHA-gate check just
+// above this function's one call site — see masterSha there) pins BOTH the
+// size lookup and the raw fetch to that exact revision, so `verifiedComplete`
+// now means "this SHA's size and this SHA's bytes agreed", not just "some
+// size and some bytes agreed". Falls back to fetchDcsMasterTextVerified's own
+// unpinned default when the caller has no SHA yet (fileCommitSha failed
+// transiently) — verifiedComplete then stays honestly false, never true on an
+// unpinned ref (see isPinnedCommitSha in dcsSources.ts).
 async function fetchTsvMasterVerified(
   env: Env,
   repo: string,
   path: string,
+  ref?: string,
 ): Promise<{ raw: string | null; verifiedComplete: boolean }> {
-  const { text, verified } = await fetchDcsMasterTextVerified(env, repo, path);
+  // `ref` undefined falls through to fetchDcsMasterTextVerified's own default
+  // ("master", never verified) — a plain JS default-parameter substitution,
+  // not a branch worth writing out here.
+  const { text, verified } = await fetchDcsMasterTextVerified(env, repo, path, ref);
   return { raw: text, verifiedComplete: verified };
 }
 
@@ -4201,15 +4220,22 @@ async function planAndStageBookResources(
     // carried fetchDcsMasterText's independent completeness proof — see
     // fetchTsvMasterVerified and softDeleteRemovedTsvRows. ULT/UST stay on
     // plain fetchText: verses are never row-pruned by chapter absence.
+    // Both branches pin to `masterSha` — the exact commit SHA the SHA-gate
+    // check just above already resolved for this (book, resource) — rather
+    // than re-resolving "master"'s current tip independently inside the
+    // fetch. See fetchTsvMasterVerified's third-P1-follow-up comment and
+    // dcsRawUrl in dcsSources.ts. `masterSha` can be null (fileCommitSha
+    // failed transiently); both calls fall back to their unpinned defaults in
+    // that case, same as before this fix.
     const isTsv = resource === "tn" || resource === "tq" || resource === "twl";
     let raw: string | null;
     let verifiedComplete = false;
     if (isTsv) {
-      const fetched = await fetchTsvMasterVerified(env, file.repo, file.path);
+      const fetched = await fetchTsvMasterVerified(env, file.repo, file.path, masterSha ?? undefined);
       raw = fetched.raw;
       verifiedComplete = fetched.verifiedComplete;
     } else {
-      raw = await fetchText(dcsRawUrl(env, file.repo, file.path));
+      raw = await fetchText(dcsRawUrl(env, file.repo, file.path, masterSha ?? undefined));
     }
     if (raw == null) {
       // DCS 404 / fetch error → nothing to import, no watermark.

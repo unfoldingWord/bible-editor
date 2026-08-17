@@ -155,9 +155,33 @@ export function dcsResourceFile(
   }
 }
 
-// Raw master-branch content URL for a repo/path (same shape dcsUrls builds).
-export function dcsRawUrl(env: Env, repo: string, path: string): string {
+// Raw content URL for a repo/path. With no `ref`, resolves to git.door43.org's
+// web raw-branch route (unauthenticated) — "master's current tip" — which is
+// what dcsUrls() and the plain best-effort fetchText() import paths want: they
+// don't claim to have read any particular revision, just "whatever master
+// currently holds".
+//
+// When `ref` IS supplied, route through the api/v1 raw endpoint instead:
+// unlike the web raw/branch route (which only ever understands the literal
+// branch name "master" and ignores anything else you hand it), Gitea's API
+// raw endpoint accepts an arbitrary git ref via `?ref=` — a branch, a tag, or
+// a commit SHA. This is what makes it possible to pin a raw fetch to the EXACT
+// same immutable revision a caller already resolved a size for via
+// dcsFileSize(..., ref) — see fetchDcsMasterTextVerified, which is the reason
+// this parameter exists (round 4 codex review of PR #501 / issue #485: the
+// size check and the raw fetch were hitting two different endpoints — one
+// ref-aware, one hardcoded to "branch/master" and silently ignoring whatever
+// ref the caller thought it was pinning — so a master push landing between
+// the two calls could make a truncated NEWER-revision body still satisfy the
+// OLDER revision's size).
+export function dcsRawUrl(env: Env, repo: string, path: string, ref?: string): string {
   const base = (env.DCS_BASE_URL ?? "https://git.door43.org").replace(/\/$/, "");
+  if (ref) {
+    return (
+      `${base}/api/v1/repos/${DCS_OWNER}/${encodeURIComponent(repo)}/raw/${encodeURIComponent(path)}` +
+      `?ref=${encodeURIComponent(ref)}`
+    );
+  }
   return `${base}/${DCS_OWNER}/${repo}/raw/branch/master/${path}`;
 }
 
@@ -242,24 +266,55 @@ export async function dcsFileSize(
 // once here and checking both the header and the API size against the same
 // ArrayBuffer keeps the byte count exact.
 //
-// `verified` (issue #485's second/final P1 follow-up, PR #501): true only
-// when `apiSize` — the independent Gitea contents-API byte count — was
-// available for and used by THIS fetch's own check, computed from the exact
-// same `apiSize`/buffer the loop below already checked. Deliberately NOT
-// derived by having a caller make its own separate dcsFileSize() call before
-// or after calling this function: two separately-timed network calls to the
-// same "is it available right now" question can disagree (a transient
-// failure on one but not the other), so a caller-side "verified = my own
-// probe succeeded" can be true even though THIS fetch's own completeness
-// check never actually ran against a size. The verified flag has to be born
-// inside the one function that performs the check, from the value it used.
+// A caller-supplied `ref` earns `verified: true` only when it is provably an
+// immutable revision — a full git commit SHA — not a movable name like
+// "master"/"main". Pinning the size lookup AND the raw fetch to the SAME SHA
+// (see fetchDcsMasterTextVerified below) is what turns "the bytes we read ==
+// the byte count Gitea recorded" into a proof about ONE fixed revision rather
+// than two independently-timed reads of a branch that can move between them.
+// fileCommitSha — the only source of a real `ref` for a pinned call anywhere
+// in this codebase — returns Gitea's full 40-hex-char SHA-1, so that's the
+// shape checked for; a bare "master" (or any other branch/tag name) fails
+// this check and the fetch stays honestly unverified even if the sizes happen
+// to match by coincidence.
+function isPinnedCommitSha(ref: string): boolean {
+  return /^[0-9a-f]{40}$/i.test(ref);
+}
+
+// `verified` (issue #485's third P1 follow-up, PR #501 round 4 codex review):
+// true only when BOTH of these hold —
+//   (a) `apiSize` — the independent Gitea contents-API byte count — was
+//       available for and used by THIS fetch's own check, computed from the
+//       exact same apiSize/buffer the loop below already checked (closes the
+//       "two separately-timed probes can disagree" gap from the prior
+//       follow-up: the verified flag is born inside the one function that
+//       performs the check, from the value it used, never from a caller's own
+//       separate dcsFileSize() call before or after calling this function);
+//   (b) `ref` is a pinned commit SHA, not a movable branch name — closes THIS
+//       follow-up's gap: (a) alone only proves the size and the bytes agreed
+//       with each other, not that they describe the SAME revision. Without a
+//       SHA pin, `dcsFileSize(ref)` and the raw fetch are two independent
+//       HTTP calls against a MOVABLE ref — master can advance between them,
+//       so `apiSize` can describe a newer/bigger revision than the raw fetch
+//       actually returned, and a truncated read of the newer file can still
+//       satisfy `byteLength <= apiSize` (or even `===`, if unlucky) purely by
+//       coincidence. Pinning `ref` to an exact SHA — and threading that SAME
+//       ref into BOTH dcsFileSize() and the raw fetch's URL (dcsRawUrl(...,
+//       ref), which previously ignored whatever ref its caller passed and
+//       always hit the mutable "branch/master" route regardless) — makes
+//       "same byte count, same bytes" a statement about one fixed git blob,
+//       at which point exact equality is the correct comparison (a same-
+//       revision raw blob can only ever be short from network truncation, not
+//       long — see fetchText's gzip-decode note above, which is about the
+//       Content-Length header on THIS response, an orthogonal check).
 export async function fetchDcsMasterTextVerified(
   env: Env,
   repo: string,
   path: string,
   ref = "master",
 ): Promise<{ text: string | null; verified: boolean }> {
-  const url = dcsRawUrl(env, repo, path);
+  const pinned = isPinnedCommitSha(ref);
+  const url = dcsRawUrl(env, repo, path, ref);
   const apiSize = await dcsFileSize(env, repo, path, ref);
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
@@ -279,10 +334,15 @@ export async function fetchDcsMasterTextVerified(
       }
       // The independent check: fires whether or not Content-Length was even
       // present, so it is the part that actually covers the HAB-shaped case.
-      if (apiSize != null && buf.byteLength < apiSize) {
+      // Exact equality, not >=: both sides are now pinned to the same `ref`
+      // (see dcsRawUrl/dcsFileSize above), so once `ref` is a genuine commit
+      // SHA there is exactly one correct byte count for this blob — anything
+      // else, short OR long, means something is wrong (truncation, a proxy
+      // rewriting the body, etc.), not a legitimately-different revision.
+      if (apiSize != null && buf.byteLength !== apiSize) {
         console.error(
-          "fetchDcsMasterText: short read vs Gitea contents-API size; retrying",
-          { url, apiSize, gotBytes: buf.byteLength, attempt },
+          "fetchDcsMasterText: size mismatch vs Gitea contents-API size; retrying",
+          { url, ref, pinned, apiSize, gotBytes: buf.byteLength, attempt },
         );
         continue;
       }
@@ -296,12 +356,14 @@ export async function fetchDcsMasterTextVerified(
           gotBytes: buf.byteLength,
         });
       }
-      // verified: true only when apiSize (the independent Gitea size) was
-      // actually available and cross-checked above — a Content-Length-only
-      // pass, or the fully-unverifiable case just warned about, is NOT
-      // "verified" in the sense a caller can use to trust a body-absent
-      // chapter as genuinely emptied (see softDeleteRemovedTsvRows).
-      return { text: new TextDecoder("utf-8").decode(buf), verified: apiSize != null };
+      // verified: true only when apiSize was actually available AND checked
+      // above (matched exactly), AND ref was a pinned commit SHA rather than
+      // a movable branch name — see the comment above this function for why
+      // both are required. A Content-Length-only pass, an unpinned ref, or
+      // the fully-unverifiable case just warned about are NOT "verified" in
+      // the sense a caller can use to trust a body-absent chapter as
+      // genuinely emptied (see softDeleteRemovedTsvRows).
+      return { text: new TextDecoder("utf-8").decode(buf), verified: pinned && apiSize != null };
     } catch {
       // network error → retry once, then null
     }
@@ -312,7 +374,11 @@ export async function fetchDcsMasterTextVerified(
 // Plain-text convenience wrapper over fetchDcsMasterTextVerified for callers
 // (the export shrink guards) that only ever check `raw == null` and don't
 // need the verified flag — preserves the original fetchDcsMasterText call
-// shape those sites already use.
+// shape those sites already use. Pass a pinned commit SHA as `ref` whenever
+// the caller already has one (e.g. from fileCommitSha / checkMasterFreshness)
+// rather than leaving it defaulted to "master" — the default exists only for
+// callers with no SHA to offer, and stays honest about that (see
+// isPinnedCommitSha / fetchDcsMasterTextVerified above).
 export async function fetchDcsMasterText(
   env: Env,
   repo: string,

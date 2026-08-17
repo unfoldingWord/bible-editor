@@ -619,7 +619,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     // stopped the twl_PSA clobber (4880 rows shipped over master's 7776).
     let tsvMasterContentForRevertReport: string | null = null;
     if (dcsAllowed && (resource === "tn" || resource === "tq" || resource === "twl")) {
-      const guard = await this.checkTsvShrink(book, resource, built.rowCount, built.content);
+      const guard = await this.checkTsvShrink(book, resource, built.rowCount, built.content, fresh.masterSha);
       tsvMasterContentForRevertReport = guard.masterContent;
       if (!guard.ok && allowShrink && guard.detail.startsWith("shrink_")) {
         // Explicit human override for a verified-intentional deletion. Scoped to
@@ -823,7 +823,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     // holds the book back.
     let usfmMasterContentForRevertReport: string | null = null;
     if (dcsAllowed && (resource === "ult" || resource === "ust")) {
-      const guard = await this.checkUsfmAlignmentShrink(book, resource, built.content);
+      const guard = await this.checkUsfmAlignmentShrink(book, resource, built.content, fresh.masterSha);
       usfmMasterContentForRevertReport = guard.masterContent;
       if (guard.ok && guard.detail === "ok") {
         // Checked this book+resource against master and found no alignment
@@ -1527,11 +1527,26 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
   // SAME correlated truncation could then wave through as "no shrink"), so
   // "unreadable" rightly blocks rather than letting an unverified commit
   // through.
+  //
+  // `masterSha`: the caller (exportOne) already resolved master's file-commit
+  // SHA a moment earlier via checkMasterFreshness, to decide whether D1 is
+  // even caught up with master at all. Passing that SAME SHA through here
+  // pins fetchDcsMasterText's internal size lookup AND raw fetch to the exact
+  // revision the freshness gate just certified, instead of each
+  // independently re-resolving "master"'s current tip — which could have
+  // moved again in the moments since (round 4 codex review of PR #501 /
+  // issue #485: two unpinned reads of a moving ref can describe different
+  // revisions, so a truncated read of a newer, bigger file could pass a size
+  // check computed against the older, smaller one). null when the freshness
+  // gate had no SHA to offer (e.g. a fresh book with no watermark yet) —
+  // fetchDcsMasterText then falls back to its unpinned default, same as
+  // before this fix.
   private async checkTsvShrink(
     book: string,
     resource: Resource,
     renderedRows: number,
     renderedContent: string,
+    masterSha: string | null,
   ): Promise<{
     ok: boolean;
     detail: string;
@@ -1546,7 +1561,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
   }> {
     const file = dcsResourceFile(book, resource as ReimportResource);
     if (!file) return { ok: true, detail: "no_file", masterRows: null, masterContent: null };
-    const raw = await fetchDcsMasterText(this.env, file.repo, file.path);
+    const raw = await fetchDcsMasterText(this.env, file.repo, file.path, masterSha ?? undefined);
     if (raw == null) return { ok: false, detail: "master_unreadable", masterRows: null, masterContent: null };
     // Data rows = non-empty lines minus the header (mirrors parseTsv's model).
     const masterRows = Math.max(0, raw.split(/\r?\n/).filter((l) => l.length > 0).length - 1);
@@ -1708,10 +1723,15 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
   // Content-Length the same way checkTsvShrink's fetch is (see issue #494 and
   // fetchDcsMasterText in dcsSources.ts), and an unverifiable master must
   // block rather than let an unchecked render through.
+  //
+  // `masterSha`: same pinning rationale as checkTsvShrink above — pass the
+  // SHA the freshness gate already resolved for this (book, resource) rather
+  // than letting this fetch independently re-resolve "master" a second time.
   private async checkUsfmAlignmentShrink(
     book: string,
     resource: Resource,
     renderedUsfm: string,
+    masterSha: string | null,
   ): Promise<{
     ok: boolean;
     detail: string;
@@ -1724,7 +1744,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
   }> {
     const file = dcsResourceFile(book, resource as ReimportResource);
     if (!file) return { ok: true, detail: "no_file", masterContent: null };
-    const masterUsfm = await fetchDcsMasterText(this.env, file.repo, file.path);
+    const masterUsfm = await fetchDcsMasterText(this.env, file.repo, file.path, masterSha ?? undefined);
     if (masterUsfm == null) return { ok: false, detail: "master_unreadable", masterContent: null };
     const result = usfmAlignmentShrinkRefused(renderedUsfm, masterUsfm);
     if (result.refused) {

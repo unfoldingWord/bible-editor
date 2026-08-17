@@ -5,7 +5,13 @@
 //
 // Not a test framework; a failed assert exits non-zero.
 
-import { dcsFileSize, fetchDcsMasterText, fetchDcsMasterTextVerified, fetchText } from "./dcsSources.ts";
+import { dcsFileSize, dcsRawUrl, fetchDcsMasterText, fetchDcsMasterTextVerified, fetchText } from "./dcsSources.ts";
+
+// A realistic-shaped full commit SHA (40 hex chars) — the only kind of `ref`
+// isPinnedCommitSha() (dcsSources.ts) accepts as proof of a single immutable
+// revision. Used below to distinguish "pinned" calls from the "master"
+// default.
+const PINNED_SHA = "1234567890abcdef1234567890abcdef12345678";
 
 function assert(cond, msg) {
   if (!cond) {
@@ -137,13 +143,14 @@ async function run() {
 
   // 11. THE ISSUE #494 CASE: no Content-Length on the raw fetch (the HAB
   //     shape) + a body far shorter than the contents API's recorded size on
-  //     the first attempt, complete on the retry → retried, then returns the
-  //     complete body. Before this fix there was no way to detect this at
-  //     all; the short body would have been accepted outright.
+  //     the first attempt, complete (and EXACTLY matching apiSize — the round
+  //     4 fix compares by exact equality, not >=) on the retry → retried,
+  //     then returns the complete body. Before this fix there was no way to
+  //     detect this at all; the short body would have been accepted outright.
   queue = [
-    jsonRes({ body: { size: 20 } }), // contents API: file is 20 bytes on master
+    jsonRes({ body: { size: 24 } }), // contents API: file is 24 bytes on master
     res({ body: "short", contentLength: undefined }), // raw fetch #1: truncated, no Content-Length
-    res({ body: "the complete master body", contentLength: undefined }), // raw fetch #2: complete (25 bytes)
+    res({ body: "the complete master body", contentLength: undefined }), // raw fetch #2: complete, exactly 24 bytes
   ];
   calls = 0;
   assert(
@@ -223,19 +230,26 @@ async function run() {
   // ran. fetchDcsMasterTextVerified fixes this by computing `verified`
   // INSIDE the one function that performs both the fetch and the check, from
   // the exact apiSize/buffer it used — these cases pin that contract.
+  //
+  // All of 17/18/21 below now pass `PINNED_SHA` as `ref`: verified:true also
+  // requires a provably-pinned revision as of the round 4 fix (see 22-23
+  // below), so these must supply one to keep testing what they always tested
+  // (apiSize-was-checked-and-matched) rather than accidentally start testing
+  // the "no SHA" fallback instead.
 
   // 17. apiSize available and used to validate the returned bytes (after a
-  //     retry) → verified: true, paired with the complete body.
+  //     retry) → verified: true, paired with the complete body. Exact-equality
+  //     match: the "complete" body is EXACTLY apiSize bytes, not merely >=.
   queue = [
-    jsonRes({ body: { size: 20 } }),
+    jsonRes({ body: { size: 24 } }),
     res({ body: "short", contentLength: undefined }),
     res({ body: "the complete master body", contentLength: undefined }),
   ];
   calls = 0;
   {
-    const r = await fetchDcsMasterTextVerified(env, "en_twl", "twl_PSA.tsv");
+    const r = await fetchDcsMasterTextVerified(env, "en_twl", "twl_PSA.tsv", PINNED_SHA);
     assert(r.text === "the complete master body", "fetchDcsMasterTextVerified: retried body returned");
-    assert(r.verified === true, "fetchDcsMasterTextVerified: verified true — apiSize was available and checked");
+    assert(r.verified === true, "fetchDcsMasterTextVerified: verified true — apiSize was available, matched exactly, and ref was pinned");
   }
 
   // 18. Truncated on both attempts → text: null, verified: false (never claim
@@ -246,7 +260,7 @@ async function run() {
     res({ body: "short", contentLength: undefined }),
   ];
   {
-    const r = await fetchDcsMasterTextVerified(env, "en_twl", "twl_PSA.tsv");
+    const r = await fetchDcsMasterTextVerified(env, "en_twl", "twl_PSA.tsv", PINNED_SHA);
     assert(r.text === null, "fetchDcsMasterTextVerified: gives up after retry → text null");
     assert(r.verified === false, "fetchDcsMasterTextVerified: verified false alongside a null body");
   }
@@ -257,7 +271,7 @@ async function run() {
   //     independent positive proof this flag promises never actually ran.
   queue = [jsonRes({ ok: false, body: {} }), res({ body: "hello world", contentLength: "11" })];
   {
-    const r = await fetchDcsMasterTextVerified(env, "en_twl", "twl_PSA.tsv");
+    const r = await fetchDcsMasterTextVerified(env, "en_twl", "twl_PSA.tsv", PINNED_SHA);
     assert(r.text === "hello world", "fetchDcsMasterTextVerified: Content-Length-only pass still returns the body");
     assert(
       r.verified === false,
@@ -270,7 +284,7 @@ async function run() {
   //     verified is unambiguously false.
   queue = [jsonRes({ ok: false, body: {} }), res({ body: "unverifiable body", contentLength: undefined })];
   {
-    const r = await fetchDcsMasterTextVerified(env, "en_twl", "twl_PSA.tsv");
+    const r = await fetchDcsMasterTextVerified(env, "en_twl", "twl_PSA.tsv", PINNED_SHA);
     assert(r.text === "unverifiable body", "fetchDcsMasterTextVerified: wholly unverifiable body still returned");
     assert(r.verified === false, "fetchDcsMasterTextVerified: verified false — no independent signal existed at all");
   }
@@ -280,10 +294,81 @@ async function run() {
   //     retry to have happened — just that apiSize was checked at all.
   queue = [jsonRes({ body: { size: 11 } }), res({ body: "hello world", contentLength: undefined })];
   {
-    const r = await fetchDcsMasterTextVerified(env, "en_twl", "twl_PSA.tsv");
+    const r = await fetchDcsMasterTextVerified(env, "en_twl", "twl_PSA.tsv", PINNED_SHA);
     assert(r.text === "hello world", "fetchDcsMasterTextVerified: apiSize match on first attempt returns body");
     assert(r.verified === true, "fetchDcsMasterTextVerified: verified true on a clean first-attempt match too");
   }
+
+  // ── round 4 codex re-review of bbb7b25 — the TOCTOU race ────────────────
+  // The finding: `apiSize` (dcsFileSize) and the raw fetch were two
+  // independently-timed network calls against a MOVABLE ref. If master grows
+  // between them, apiSize describes the older/smaller revision while the raw
+  // fetch can return the newer/bigger one — a truncated read of that newer
+  // file could still coincidentally satisfy the old `>=` check. The fix pins
+  // both calls to the SAME ref (dcsRawUrl now honors `ref` instead of
+  // silently ignoring it — see the dcsRawUrl cases below) and requires that
+  // ref be a genuine commit SHA — not "master" — for `verified: true` to ever
+  // be possible. These cases pin that contract.
+
+  // 22. Same apiSize/body shape as case 21 (a clean, matching first attempt)
+  //     but WITHOUT a pinned ref (the function's own "master" default) →
+  //     verified MUST be false even though the bytes matched exactly. A
+  //     size/content match against a MOVABLE ref only proves "these two
+  //     requests happened to agree", never "these two requests describe the
+  //     same revision" — exactly the gap a mid-sync master push can exploit.
+  queue = [jsonRes({ body: { size: 11 } }), res({ body: "hello world", contentLength: undefined })];
+  {
+    const r = await fetchDcsMasterTextVerified(env, "en_twl", "twl_PSA.tsv"); // no ref → defaults to "master"
+    assert(r.text === "hello world", "fetchDcsMasterTextVerified: unpinned ref still returns a matching body");
+    assert(
+      r.verified === false,
+      "fetchDcsMasterTextVerified: verified false on an UNPINNED ref, even though apiSize matched exactly — a same-value match on a movable ref is not a same-revision proof",
+    );
+  }
+
+  // 23. THE RACE ITSELF, closed: apiSize describes a 20-byte file (the
+  //     revision at the moment dcsFileSize ran), but the raw endpoint — on
+  //     EVERY attempt — returns a 30-byte body (master grew in between).
+  //     Before this fix, the old `<` comparison would have treated 30 >= 20
+  //     as "complete" and shipped a verified:true result describing the WRONG
+  //     revision's size. The new exact-equality check instead treats this as
+  //     a mismatch on both attempts and fails closed (text: null,
+  //     verified: false) — it never silently accepts a body that disagrees
+  //     with the size it was checked against, pinned ref or not.
+  queue = [
+    jsonRes({ body: { size: 20 } }), // apiSize: the OLDER, smaller revision
+    res({ body: "a".repeat(30), contentLength: undefined }), // raw fetch #1: NEWER, bigger revision
+    res({ body: "a".repeat(30), contentLength: undefined }), // raw fetch #2: same (master didn't shrink back)
+  ];
+  {
+    const r = await fetchDcsMasterTextVerified(env, "en_twl", "twl_PSA.tsv", PINNED_SHA);
+    assert(r.text === null, "fetchDcsMasterTextVerified: size/content mismatch on every attempt → fails closed, never returns the mismatched body");
+    assert(r.verified === false, "fetchDcsMasterTextVerified: verified false — a mismatch can never be verified, pinned ref or not");
+  }
+
+  // ── dcsRawUrl — the actual bug the race lived in ────────────────────────
+  // Before this fix, dcsRawUrl always hit the web "raw/branch/master" route
+  // and IGNORED any `ref` its caller passed — so even a caller that already
+  // had a pinned commit SHA in hand could never actually fetch that exact
+  // revision's raw content; only dcsFileSize's URL was ref-aware. These pin
+  // the fixed contract: no ref → unauthenticated web route (unchanged
+  // behavior for existing unpinned callers); a ref → the api/v1 raw endpoint
+  // with `?ref=`, the same ref-aware shape dcsFileSize already used.
+
+  // 24. No ref → the original web raw-branch route, unchanged.
+  assert(
+    dcsRawUrl(env, "en_twl", "twl_PSA.tsv") === "https://example.test/unfoldingWord/en_twl/raw/branch/master/twl_PSA.tsv",
+    "dcsRawUrl: no ref → unauthenticated web raw/branch/master route (unchanged)",
+  );
+
+  // 25. A pinned ref → the api/v1 raw endpoint, with that exact ref in the
+  //     query string — this is what makes it possible for the raw fetch to
+  //     actually land on the SAME revision dcsFileSize(ref) already sized.
+  assert(
+    dcsRawUrl(env, "en_twl", "twl_PSA.tsv", PINNED_SHA) ===
+      `https://example.test/api/v1/repos/unfoldingWord/en_twl/raw/twl_PSA.tsv?ref=${PINNED_SHA}`,
+    "dcsRawUrl: a ref → the ref-aware api/v1 raw endpoint, not the branch-only web route",
+  );
 
   console.error = origError;
   console.warn = origWarn;
