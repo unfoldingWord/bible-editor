@@ -196,21 +196,50 @@ export interface ReimportCounts {
   // no existing reader changes meaning; this is the specific, gating subset of
   // it. (`skipped_noop` DID change meaning: the PK-conflict case used to be
   // folded into it and no longer is. Readers: reimportSummary.ts's "N unchanged"
-  // and AdminPanel's counter dump.) Fixing the drop itself (reclaiming the id)
-  // is issue #427's option 1 and is deliberately not done here — this run still
-  // loses the row, it just says so and refuses to certify the resource as
-  // synced.
+  // and AdminPanel's counter dump.)
+  //
+  // Issue #427's option 1 (reclaim a reissued id) has SHIPPED — see
+  // `tombstone_reclaimed` below and the tombstone branch of applyTsvRows. This
+  // counter no longer means "master's row was dropped and we only reported it";
+  // for a reissued tombstone the reimport now ATTEMPTS the reclaim in the same
+  // run, and `tombstone_blocked` only still increments for that row when the
+  // reclaim itself lost the version-CAS race (something touched the tombstoned
+  // row between the read and the write) — a residual, expected-to-self-heal-on-
+  // retry case, kept here rather than silently dropped so a lost race is never
+  // quieter than the pre-reclaim behavior. `conflict_skipped` above is unrelated
+  // to reclaim (it's the INSERT-path race) and still behaves exactly as before.
   //
   // NOTE the asymmetry with tsvMerge.ts's `tsvRefMoved`, which answers a
   // similar-sounding question for LIVE rows and also withholds (via
   // apply_incomplete). The two deliberately differ: tsvRefMoved treats any
   // ref_raw difference as a move, including whitespace and a null-vs-populated
   // ref_raw, because for a live row the safe direction is to flag. Here the safe
-  // direction is the opposite — a false positive freezes the book's export with
-  // no automatic release — so isReissuedTombstone normalizes whitespace and
+  // direction is the opposite — a false positive used to freeze the book's
+  // export with no automatic release; now it drives an actual reclaim instead
+  // (see isReissuedTombstone's KNOWN FALSE POSITIVE note in reimportClassify.ts
+  // for what that means) — so isReissuedTombstone normalizes whitespace and
   // falls back to chapter/verse. Keep them separate; do not "unify" one into the
   // other without re-deciding which direction each should fail.
   tombstone_blocked: number;
+  // ── Issue #427, option 1: reclaim a reissued tombstone's slot ────────────────
+  //
+  // A tombstoned row master's file now carries at a DIFFERENT reference (see
+  // isReissuedTombstone) — the exact condition that used to only increment
+  // tombstone_blocked and freeze the export — is now RECLAIMED: master's
+  // incoming row is written into the freed-up (book, id) slot (deleted_at
+  // cleared, content/ref/chapter/verse/sort_order set to master's, version
+  // bumped, updated_by reset to NULL so the row is master-owned going forward).
+  // The old tombstoned row's content and protection flags (trashed_at/preserve/
+  // hint/updated_by) are irrelevant to this decision — master's new row is a
+  // completely different logical entity being written into a slot the old row
+  // merely happened to vacate, not a continuation of it. See the "Batch the
+  // reclaims" write site for the CAS guard this relies on, and the lost-CAS
+  // fallback that still counts tombstone_blocked (never a silent drop).
+  // Audited as "create" (edit_log): from this slot's new life's perspective,
+  // master's row IS a fresh row. Does NOT gate the watermark by itself — a
+  // landed reclaim means master's content IS now in D1, so there is nothing
+  // left to withhold for; only the lost-CAS fallback (tombstone_blocked) does.
+  tombstone_reclaimed: number;
   // Human-readable identification of the rows the two counters above dropped —
   // resource, id, and both references. Capped at BLOCKED_SAMPLE_CAP because the
   // failure mode is a whole book's ids being re-minted at once, and this rides
@@ -446,6 +475,7 @@ function zeroCounts(): ReimportCounts {
     skipped_dup: 0,
     conflict_skipped: 0,
     tombstone_blocked: 0,
+    tombstone_reclaimed: 0,
     resurrected: 0,
     source_attr_reconciled: 0,
     source_attr_divergent: 0,
@@ -541,6 +571,15 @@ function addCounts(into: ReimportCounts, from: ReimportCounts): void {
   into.skipped_dup += from.skipped_dup;
   into.conflict_skipped += from.conflict_skipped ?? 0;
   into.tombstone_blocked += from.tombstone_blocked ?? 0;
+  // tombstone_reclaimed (issue #427, option 1) deliberately does NOT join the
+  // `incomplete` taint check above, mirroring tombstones_swept/tombstones_locked
+  // (option 3): a landed reclaim means master's content IS now in D1, so there
+  // is no watermark decision here for an absent-vs-zero distinction to protect
+  // — only the lost-CAS fallback (which still increments tombstone_blocked,
+  // already covered above) withholds. Plain `?? 0` coercion is the right and
+  // sufficient handling for a legacy/replayed chunk result that predates this
+  // field.
+  into.tombstone_reclaimed += from.tombstone_reclaimed ?? 0;
   // Diagnostic list, merged under the same cap. Never gates anything, so a
   // truncation here cannot affect a watermark decision.
   if (from.blocked_samples?.length) {
@@ -1139,6 +1178,16 @@ export async function applyTsvRows(
   // untouched. Counted `reimported_ai`.
   const aiReseeds: Array<{ row: ParsedTsvRow; sortOrder: number; oldVersion: number }> = [];
   const resurrects: Array<{ row: ParsedTsvRow; sortOrder: number; oldVersion: number }> = [];
+  // Issue #427, option 1: reissued tombstones whose slot master's row will
+  // reclaim. Deliberately its OWN array, not folded into `resurrects` — reclaim
+  // is semantically different (see the tombstone branch below and the "Batch
+  // the reclaims" write site): resurrect only fires for a narrow self-heal case
+  // (pristine content AND the last delete was a reimport prune bug) and keeps
+  // the pristine guard (trashed_at/preserve/hint); reclaim fires for ANY
+  // tombstone regardless of how/why it was deleted, because the row being
+  // written is a completely different logical entity from whatever the
+  // tombstone used to protect.
+  const reclaims: Array<{ row: ParsedTsvRow; sortOrder: number; oldVersion: number }> = [];
   // Rows classified "edited" (human-owned) that diverge from master. Deferred
   // and resolved AFTER this loop so the three-way-merge ancestor can be
   // reconstructed for all of them in ONE batched edit_log read
@@ -1270,36 +1319,35 @@ export async function applyTsvRows(
     if (cur.deleted_at != null) {
       if (isPristineTombstone(kind, cur) && (await lastTsvDeleteWasReimport(env, kind, row.id, book))) {
         resurrects.push({ row, sortOrder, oldVersion: Number(cur.version) });
-      } else {
-        counts.skipped_edited++;
-        // Issue #427. The tombstone keeps its (book, id) primary key forever,
-        // so master's row for that id cannot land — and that is CORRECT when
-        // master still carries it at the same reference (a delete awaiting
-        // export). When master carries it at a DIFFERENT reference the id has
-        // been reissued to a genuinely different row, and we have just dropped
-        // real master content with no error and no distinguishable counter.
-        // Count that case separately so the sync report shows it and the
-        // (book, resource) watermark is withheld — see isReissuedTombstone and
-        // the reimport-sync step. Reclaiming the slot is option 1, not this.
+      } else if (
+        // Issue #427, option 1. The tombstone keeps its (book, id) primary key
+        // forever, so master's row for that id cannot land via the normal INSERT
+        // path — and that is CORRECT when master still carries it at the same
+        // reference (a delete awaiting export: reclaiming there would resurrect
+        // every pending deletion on the next nightly run). When master carries it
+        // at a DIFFERENT reference the id has been reissued to a genuinely
+        // different row, and master is authoritative for a row it still carries
+        // — so RECLAIM the slot (batched below) instead of dropping it.
         // `!row.idCoerced` first: for a coerced id the "master reissued this id
         // to a different row" inference is meaningless — the id is ours, hashed
         // into a 96-id space, so landing on an unrelated tombstone at a
         // different reference is an expected collision, not evidence master
-        // moved anything. Counting it would withhold the watermark and freeze
-        // the export over a documented-benign no-op. See ParsedTsvRow.idCoerced.
-        if (
-          !row.idCoerced &&
-          isReissuedTombstone(
-            { refRaw: (cur.ref_raw as string | null) ?? null, chapter: Number(cur.chapter), verse: Number(cur.verse) },
-            { refRaw: row.refRaw, chapter: row.chapter, verse: row.verse },
-          )
-        ) {
-          counts.tombstone_blocked++;
-          noteBlockedSample(
-            counts,
-            `${kind} ${row.id}: deleted row at ${cur.ref_raw ?? `${cur.chapter}:${cur.verse}`}, master now uses it at ${row.refRaw}`,
-          );
-        }
+        // moved anything. Reclaiming (or counting it blocked) would either
+        // corrupt an unrelated row or freeze the export over a documented-benign
+        // no-op. See ParsedTsvRow.idCoerced.
+        !row.idCoerced &&
+        isReissuedTombstone(
+          { refRaw: (cur.ref_raw as string | null) ?? null, chapter: Number(cur.chapter), verse: Number(cur.verse) },
+          { refRaw: row.refRaw, chapter: row.chapter, verse: row.verse },
+        )
+      ) {
+        reclaims.push({ row, sortOrder, oldVersion: Number(cur.version) });
+      } else {
+        // Same-reference tombstone (a delete awaiting export) — stays dead,
+        // exactly as before this fix. Not counted tombstone_blocked: that would
+        // withhold the watermark for a condition that clears itself once
+        // tonight's export runs.
+        counts.skipped_edited++;
       }
       continue;
     }
@@ -1773,6 +1821,62 @@ export async function applyTsvRows(
     }
   }
 
+  // Batch the reclaims (issue #427, option 1: overwrite a reissued tombstone's
+  // slot with master's row — deliberately its own write, not folded into the
+  // resurrect batch above). The guard is narrower than every other write in
+  // this file on purpose: `deleted_at IS NOT NULL AND version = oldVersion`
+  // ONLY — no `updated_by IS NULL` / trashed_at / preserve / hint re-assertion.
+  // Those flags describe the OLD tombstoned row's protection state, and reclaim
+  // discards that row's content wholesale in favor of master's — a completely
+  // different logical row moving into a primary-key slot the old row merely
+  // happened to vacate, not a continuation of it, so re-asserting its
+  // protections would be checking the wrong row. version-CAS is still the full
+  // safety net: a concurrent modification to the SAME tombstoned row (another
+  // writer's resurrect/reclaim/edit landing between the read and this batch)
+  // bumps its version and fails the CAS — that is NOT silently dropped (the
+  // whole point of this fix is to stop silent drops): it falls back to
+  // `tombstone_blocked`, exactly the pre-reclaim safety net, so a lost race is
+  // never quieter than before this change. `updated_by = NULL` in the SET
+  // starts master's row life master-owned, same as a fresh insert. Audited as
+  // "create" — from this slot's new life's perspective, master's row IS a
+  // fresh row, not an update to whatever used to occupy the slot.
+  for (let i = 0; i < reclaims.length; i += WRITE_BATCH) {
+    const slice = reclaims.slice(i, i + WRITE_BATCH);
+    try {
+      const results = await env.DB.batch(
+        slice.map((u) => buildTsvUpdateStmt(env, book, kind, u.row, u.sortOrder, u.oldVersion, now, false, false, true)),
+      );
+      const logs: D1PreparedStatement[] = [];
+      slice.forEach((u, j) => {
+        if ((results[j]?.meta.changes ?? 0) > 0) {
+          counts.tombstone_reclaimed++;
+          console.warn("reimport: reclaimed reissued tombstone slot for master's row", {
+            book,
+            kind,
+            id: u.row.id,
+            chapter: u.row.chapter,
+            verse: u.row.verse,
+          });
+          logs.push(logEditStmt(env, kind, u.row.id, book, userId, u.oldVersion, u.oldVersion + 1, "create", u.row));
+        } else {
+          // Lost the version-CAS race — something touched this tombstoned row
+          // between the read and this batch. Fall back to the pre-reclaim
+          // safety net so a lost race is never silently dropped: count it
+          // tombstone_blocked (withholds the watermark) exactly as if reclaim
+          // had never been attempted for this row.
+          counts.tombstone_blocked++;
+          noteBlockedSample(
+            counts,
+            `${kind} ${u.row.id}: reclaim lost the version-CAS race, deleted row now reissued at ${u.row.refRaw}`,
+          );
+        }
+      });
+      if (logs.length) await env.DB.batch(logs);
+    } catch (e) {
+      counts.errors.push(`${kind} reclaim batch: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+
   // Batch the combined edited-row merges (three-way adoptions unioned with the
   // ancestor-free tags/whitespace field merge). Modeled on the verse
   // master-adoption batch (applyVerseRows step 7): version-CAS UPDATE (`AND
@@ -2189,12 +2293,32 @@ async function tsvFetchLooksTruncated(
 // `resurrect` flips the deleted_at guard: a normal pristine UPDATE requires a
 // LIVE row (deleted_at IS NULL); a resurrection requires a TOMBSTONE
 // (deleted_at IS NOT NULL) and clears it in the SET. `reseedAi` (mutually
-// exclusive with resurrect) is the AI-only re-seed: it DROPS the
+// exclusive with resurrect and reclaim) is the AI-only re-seed: it DROPS the
 // `updated_by IS NULL` guard (the row is AI-owned) and sets `updated_by = NULL`
 // to reclaim it to master-owned — safety now rests on the version-CAS + the
-// retained deleted_at/trashed_at/preserve/hint re-assertions. Bound-param
-// positions are identical in all modes (the `= NULL` clauses carry no param), so
-// the .bind() lists below are unchanged.
+// retained deleted_at/trashed_at/preserve/hint re-assertions.
+// `reclaim` (mutually exclusive with resurrect and reseedAi; issue #427, option
+// 1) is the reissued-tombstone slot reclaim: like resurrect it requires a
+// TOMBSTONE (deleted_at IS NOT NULL) and clears it, but UNLIKE every other mode
+// it drops the trashed_at/preserve/hint re-assertion entirely (`pristine`
+// collapses to just the deletedGuard) — those flags describe the OLD
+// tombstoned row's protection state, and master's incoming row is a
+// completely different logical entity moving into a slot the old row merely
+// vacated, not a continuation of it, so re-asserting them would be checking
+// the wrong row's history. For the SAME reason, a tn reclaim also explicitly
+// CLEARS trashed_at/preserve/hint in the SET (`clearProtections` below) rather
+// than leaving whatever the tombstoned row happened to hold — those columns
+// aren't part of the pristine guard's WHERE for reclaim, so nothing else would
+// ever reset them, and a human's "preserve this note"/"queue this as an AI
+// hint" intent for the OLD content must never silently apply to master's new
+// content. It also drops the `updated_by IS NULL` guard (like reseedAi) and
+// sets `updated_by = NULL`, starting master's row master-owned.
+// version-CAS is the only guard reclaim keeps, and it is load-bearing: a
+// concurrent write to the SAME tombstoned row between the read and this batch
+// still fails the CAS and is caught by the caller (falls back to
+// tombstone_blocked, never a silent drop). Bound-param positions are identical
+// in all modes (the `= NULL` clauses carry no param), so the .bind() lists
+// below are unchanged.
 function buildTsvUpdateStmt(
   env: Env,
   book: string,
@@ -2205,20 +2329,33 @@ function buildTsvUpdateStmt(
   now: number,
   resurrect = false,
   reseedAi = false,
+  reclaim = false,
 ): D1PreparedStatement {
-  const deletedGuard = resurrect ? "deleted_at IS NOT NULL" : "deleted_at IS NULL";
-  const ownerGuard = reseedAi ? "" : "updated_by IS NULL AND ";
-  const pristine =
-    kind === "tn"
+  const deletedGuard = resurrect || reclaim ? "deleted_at IS NOT NULL" : "deleted_at IS NULL";
+  const ownerGuard = reseedAi || reclaim ? "" : "updated_by IS NULL AND ";
+  const pristine = reclaim
+    ? deletedGuard
+    : kind === "tn"
       ? `${ownerGuard}${deletedGuard} AND trashed_at IS NULL AND preserve = 0 AND hint = 0`
       : `${ownerGuard}${deletedGuard}`;
-  const clearDeleted = resurrect ? "deleted_at = NULL, " : "";
-  const clearOwner = reseedAi ? "updated_by = NULL, " : "";
+  const clearDeleted = resurrect || reclaim ? "deleted_at = NULL, " : "";
+  const clearOwner = reseedAi || reclaim ? "updated_by = NULL, " : "";
+  // Reclaim ONLY (tn): master's row is starting a fresh life in this slot, the
+  // same as a brand-new INSERT would (whose columns default to NULL/0 — see
+  // tryInsertTsvRow, which never sets these three either). A tombstoned row's
+  // trashed_at/preserve/hint describe intent a human set for the OLD content
+  // (the trash queue, "protect from the AI sweep", "queue as an AI hint") —
+  // carrying any of those forward onto master's unrelated new content would be
+  // applying a human's decision to a row they never made it about. Every other
+  // mode leaves these three columns alone (there's nothing to clear: the
+  // pristine guard above already requires them clear before a normal
+  // UPDATE/resurrect/reseed can proceed at all).
+  const clearProtections = reclaim && kind === "tn" ? "trashed_at = NULL, preserve = 0, hint = 0, " : "";
   const newVersion = oldVersion + 1;
   if (kind === "tn") {
     return env.DB.prepare(
       `UPDATE tn_rows
-          SET ${clearDeleted}${clearOwner}ref_raw = ?1, chapter = ?2, verse = ?3, tags = ?4,
+          SET ${clearDeleted}${clearOwner}${clearProtections}ref_raw = ?1, chapter = ?2, verse = ?3, tags = ?4,
               support_reference = ?5, quote = ?6, occurrence = ?7, note = ?8,
               sort_order = ?9, version = ?10, updated_at = ?11
         WHERE id = ?12 AND book = ?13 AND ${pristine} AND version = ?14`,
@@ -3905,29 +4042,47 @@ async function noteOwnPublishDecline(
 // Banner for issue #427's withhold. This one NEEDS an alert in a way the
 // lock-held withholds do not, and the difference is the whole reason it exists:
 // a chapter lock clears when the AI job finishes, so that withhold releases
-// itself overnight. A tombstone does not. The soft-deleted row keeps its
-// (book, id) slot forever, master keeps carrying that id, and every subsequent
-// night re-stages the file (the SHA gate cannot skip it — the watermark was
-// never advanced), re-drops the same rows, and re-withholds. **There is no
-// automatic release.** Until a human acts, or until issue #427's option 1
-// (reclaim a reissued id) or option 3 (sweep obsolete tombstones) ships, this
-// book+resource stops exporting to Door43 entirely.
+// itself overnight. Before option 1 shipped, a reissued tombstone did not: it
+// blocked EVERY run, forever, until a human acted — the soft-deleted row keeps
+// its (book, id) slot forever, master keeps carrying that id, and every
+// subsequent night re-stages the file (the SHA gate cannot skip it — the
+// watermark was never advanced), re-drops the same rows, and re-withholds.
 //
-// That is the correct fail-safe direction — exporting instead would render a D1
-// that is short of master back over master, deleting master's rows, which is the
-// original 1CH failure — but a freeze nobody is told about is not safe, it is
-// just quiet. The existing freshness-gate banner (exportWorkflow.ts's
-// recordStaleSkipAlert) fires too, and its advice — "re-run the sync, then
-// re-export" — cannot possibly work here, because re-running the sync
+// Issue #427's option 1 (reclaim a reissued id) has now SHIPPED — see the
+// tombstone branch of applyTsvRows and the "Batch the reclaims" write site —
+// and runs automatically, in the SAME run a reissued tombstone is first
+// detected, so the common case this alert used to describe no longer produces
+// a `tombstone_blocked` count at all: master's row lands, reclaimed, same
+// night. `tombstone_blocked` now fires ONLY for the residual: a reclaim
+// attempt that LOST the version-CAS race against a concurrent writer touching
+// the SAME tombstoned row between the read and the write. Unlike the pre-fix
+// permanent freeze, that is expected to self-heal on the NEXT sync once the
+// race that caused it has resolved — but "usually self-heals" is not the same
+// as "guaranteed to clear silently," so this alert still fires for it.
+// `conflict_skipped` (the OTHER half of this alert — an INSERT-path race
+// against a row the in-memory diff never saw) is unrelated to option 1 and
+// keeps its original semantics and its original "does not clear on its own"
+// framing.
+//
+// The freeze itself is still the correct fail-safe direction while either
+// count is nonzero — exporting instead would render a D1 that is short of
+// master back over master, deleting master's rows, which is the original 1CH
+// failure — but a freeze nobody is told about is not safe, it is just quiet.
+// The existing freshness-gate banner (exportWorkflow.ts's recordStaleSkipAlert)
+// fires too, and its advice — "re-run the sync, then re-export" — cannot
+// possibly work for the conflict_skipped half, because re-running the sync
 // re-encounters the same collision. So this alert names the measured cause and
 // the rows, and gives a remedy that can actually clear it.
 //
 // The wording states only what the code measured: the counters, and the sampled
 // rows themselves. It does NOT claim which of the two situations produced any
-// given row (an id genuinely re-minted for a new row, versus a maintainer
-// re-anchoring the Reference of a row we had deleted) — the reference test
-// cannot separate those, and asserting either would repeat the mistake this
-// repo has a standing lesson about.
+// given `tombstone_blocked` row (an id genuinely re-minted for a new row, versus
+// a maintainer re-anchoring the Reference of a row we had deleted) — the
+// reference test cannot separate those, and asserting either would repeat the
+// mistake this repo has a standing lesson about. That ambiguity now drives an
+// actual reclaim WRITE rather than merely a freeze — see isReissuedTombstone's
+// KNOWN FALSE POSITIVE note in reimportClassify.ts for what that means.
+
 // #540 item 2's scale alarm. A handful of kept-over-Door43 rows is the policy
 // working; a book-full of them has the shape of every incident this area exists
 // to prevent — and unlike a refusal, this outcome PUBLISHES over Door43 rather
@@ -3993,13 +4148,22 @@ async function raiseTombstoneBlockAlert(
     `MISSING from the app, so ${book} ${resource.toUpperCase()} has been left marked out of sync and ` +
     `will NOT export to Door43 until this is cleared — otherwise the export would delete those same ` +
     `rows from Door43. ` +
-    (blocked > 0 ? `${blocked} blocked by a deleted row whose ID Door43 now uses at a different reference` : "") +
+    (blocked > 0
+      ? `${blocked} lost the automatic reclaim's version-CAS race against a concurrent writer on the ` +
+        `same deleted row (usually clears on its own next sync, once that race resolves)`
+      : "") +
     (blocked > 0 && conflicts > 0 ? "; " : "") +
     (conflicts > 0 ? `${conflicts} refused by the database as an ID already in use` : "") +
     `. Affected: ${shown.join(" | ")}${more > 0 ? ` (and ${more} more)` : ""}. ` +
-    `This does NOT clear on its own — the next sync hits the same collision. To clear it, either give ` +
-    `the affected row(s) a different ID on Door43, or land the ID-reclaim / tombstone-sweep fix ` +
-    `(GitHub issue #427, options 1 and 3).`;
+    (conflicts > 0
+      ? `The ID-already-in-use row(s) do NOT clear on their own — the next sync hits the same collision; ` +
+        `give the affected row(s) a different ID on Door43. `
+      : "") +
+    (blocked > 0
+      ? `The reclaim-race row(s) above should resolve automatically; if this persists across multiple ` +
+        `nights for the same row, something is wrong with the automatic reclaim (GitHub issue #427, ` +
+        `option 1) and it needs a human look.`
+      : "");
   try {
     await env.DB.prepare(`DELETE FROM system_alerts WHERE username = ?1 AND source = ?2 AND dismissed_at IS NULL`)
       .bind(OWN_PUBLISH_ALERT_USERNAME, source)

@@ -1,6 +1,8 @@
-// End-to-end journey for issue #427's option-2 instrumentation, against the
-// REAL production schema (every file in api/migrations, applied in order) and
-// the REAL functions — not hand-copied SQL.
+// End-to-end journey for issue #427's option-2 instrumentation AND option 1
+// (the reclaim it made visible; see api/src/bookReimport.ts's tombstone
+// branch and tombstoneReclaim.test.mjs for reclaim's own dedicated coverage),
+// against the REAL production schema (every file in api/migrations, applied
+// in order) and the REAL functions — not hand-copied SQL.
 //
 // Run from api/ (needs the sqlite flag):
 //   node --experimental-sqlite --experimental-strip-types --no-warnings src/reimportJourney.test.mjs
@@ -15,10 +17,15 @@
 // So this file drives the real applyTsvRows and the real gate.
 //
 // What the journey covers:
-//   (a) the drop is COUNTED   — real applyTsvRows over a real tombstone
-//   (b) the watermark is WITHHELD, and the withhold is visible in the STORED
-//       book_resource_syncs row (not merely in a return value), including that
-//       the taint survives the addCounts aggregation step
+//   (a) a reissued tombstone is now RECLAIMED automatically — the case that
+//       used to only produce a `tombstone_blocked` count now lands master's
+//       row in the same run (option 1, GitHub issue #427)
+//   (a2) a reclaim that LOSES its version-CAS race falls back to
+//        tombstone_blocked exactly as before this fix — never a silent drop
+//   (b) the watermark is WITHHELD (now driven by the (a2) race, since a clean
+//       reclaim no longer needs a withhold), and the withhold is visible in
+//       the STORED book_resource_syncs row (not merely in a return value),
+//       including that the taint survives the addCounts aggregation step
 //   (c) the banner is QUERYABLE from system_alerts, where the UI reads it
 //   (d) the HEALTHY path still stamps origin='reimport' — no false withhold
 
@@ -114,37 +121,100 @@ function masterRow({ id = ID, ref = "23:7", chapter = 23, verse = 7, idCoerced =
   };
 }
 
-console.log("\n[(a) the drop is COUNTED — real applyTsvRows over a real tombstone]");
+console.log("\n[(a) a reissued tombstone is now RECLAIMED — real applyTsvRows, issue #427 option 1]");
 {
   const { sqlite, env } = freshEnv();
   seedTombstone(sqlite);
   const counts = await applyTsvRows(env, BOOK, "tq", [masterRow()], null);
 
-  eq(counts.tombstone_blocked, 1, "tombstone_blocked === 1 (was silent before this fix)");
-  eq(counts.inserted, 0, "nothing was inserted");
-  eq(counts.skipped_edited, 1, "still also counted skipped_edited — existing readers unchanged");
-  eq(counts.conflict_skipped, 0, "NOT counted as a PK conflict: the tombstone branch owns this drop");
-  eq(
-    (counts.blocked_samples ?? []).length,
-    1,
-    "one sample recorded, so the banner can name the row a human must go fix",
-  );
-  eq(
-    (counts.blocked_samples ?? [])[0].includes("5:4") && (counts.blocked_samples ?? [])[0].includes("23:7"),
-    true,
-    "the sample names BOTH references, which is what makes it actionable",
-  );
+  // Before option 1 shipped, this exact scenario (a tombstone master's file
+  // now carries at a DIFFERENT reference) only counted tombstone_blocked and
+  // dropped the row. Now the reimport reclaims the slot in the SAME run.
+  eq(counts.tombstone_reclaimed, 1, "tombstone_reclaimed === 1 — issue #427's option 1 running automatically");
+  eq(counts.tombstone_blocked, 0, "NOT counted blocked — the reclaim landed, nothing left to withhold for");
+  eq(counts.inserted, 0, "not an insert — the existing (book, id) slot was reclaimed in place, not created fresh");
+  eq(counts.skipped_edited, 0, "NOT counted skipped_edited — a landed reclaim is neither a skip nor a plain edit");
+  eq(counts.conflict_skipped, 0, "NOT counted as a PK conflict: the tombstone branch owns this row");
+  eq((counts.blocked_samples ?? []).length, 0, "no blocked sample — nothing was blocked this run");
 
-  // The data loss is real: master's row is genuinely absent from D1.
-  const stored = sqlite.prepare(`SELECT chapter, question, deleted_at FROM tq_rows WHERE book = ? AND id = ?`).all(BOOK, ID);
+  // Master's row genuinely lives in D1 now, in the SAME primary-key slot the
+  // tombstone used to hold.
+  const stored = sqlite
+    .prepare(`SELECT chapter, verse, question, deleted_at, updated_by, version FROM tq_rows WHERE book = ? AND id = ?`)
+    .all(BOOK, ID);
   eq(stored.length, 1, "still exactly one row for that (book, id)");
-  eq(stored[0].chapter, 5, "the surviving row is the old 5:4 tombstone");
-  eq(stored[0].question, "old question", "master's text never landed — option 2 reports the loss, it does not fix it");
+  eq(stored[0].chapter, 23, "the row now carries master's chapter — the REISSUED reference, not the tombstone's old one");
+  eq(stored[0].verse, 7, "and master's verse");
+  eq(stored[0].question, "new question", "and master's content — the reclaim actually landed the row, it did not just report it");
+  eq(stored[0].deleted_at, null, "no longer a tombstone");
+  eq(stored[0].updated_by, null, "master-owned going forward, same as a fresh insert");
+  eq(stored[0].version, 2, "version bumped from the tombstone's stored version — CAS stays live for future writes");
 
   // THE DRIFT DETECTOR. If anyone adds `deleted_at IS NULL` to applyTsvRows'
   // `existing` read, the tombstone stops being found, this row takes the INSERT
-  // path instead, and these two assertions flip — which is the whole point.
-  eq(counts.conflict_skipped + counts.tombstone_blocked, 1, "exactly one drop counted, by exactly one route");
+  // path instead, and these assertions flip — which is the whole point.
+  eq(
+    counts.conflict_skipped + counts.tombstone_blocked + counts.tombstone_reclaimed,
+    1,
+    "exactly one drop-or-reclaim counted, by exactly one route",
+  );
+}
+
+// Wrap an env.DB so the FIRST reclaim write this run issues is preceded by an
+// out-of-band version bump on the SAME tombstoned row — exactly as a
+// concurrent writer (another reimport instance, a hand-edit landing between
+// applyTsvRows' initial `existing` read and this batched write) would do. The
+// reclaim write is identified by its distinctive SQL shape: `updated_by =
+// NULL,` in the SET clause together with `deleted_at IS NOT NULL` in the
+// WHERE — only buildTsvUpdateStmt's `reclaim` mode produces that combination
+// (resurrect's SET never touches updated_by; reseedAi's WHERE requires
+// `deleted_at IS NULL`, the opposite). This drives a REAL, CAS-losing reclaim
+// through the real function, instead of hand-asserting what "should" happen
+// on a race — see api/src/bookReimport.ts's reclaim batch for the fallback
+// this is meant to prove.
+function withReclaimRace(env, sqlite, book, id) {
+  let fired = false;
+  return {
+    ...env,
+    DB: {
+      ...env.DB,
+      async batch(stmts) {
+        if (
+          !fired &&
+          stmts.some((s) => s.sql.includes("updated_by = NULL,") && s.sql.includes("deleted_at IS NOT NULL"))
+        ) {
+          fired = true;
+          sqlite.prepare(`UPDATE tq_rows SET version = version + 1 WHERE book = ? AND id = ?`).run(book, id);
+        }
+        return env.DB.batch(stmts);
+      },
+    },
+  };
+}
+
+console.log("\n[(a2) a reclaim that LOSES its version-CAS race falls back to tombstone_blocked, never a silent drop]");
+{
+  const { sqlite, env } = freshEnv();
+  seedTombstone(sqlite);
+  const raced = withReclaimRace(env, sqlite, BOOK, ID);
+  const counts = await applyTsvRows(raced, BOOK, "tq", [masterRow()], null);
+
+  eq(counts.tombstone_reclaimed, 0, "the reclaim did NOT land — the race won");
+  eq(counts.tombstone_blocked, 1, "falls back to tombstone_blocked — exactly as if reclaim had never been attempted");
+  eq(
+    (counts.blocked_samples ?? [])[0]?.includes(ID),
+    true,
+    "the sample still names the row, so the fallback is exactly as actionable as the pre-reclaim behavior",
+  );
+
+  // And nothing was clobbered: the row that won the race is untouched by this
+  // run's reclaim attempt (still the OLD tombstone content, just at the newer
+  // version the race stamped).
+  const stored = sqlite.prepare(`SELECT chapter, question, deleted_at, version FROM tq_rows WHERE book = ? AND id = ?`).all(BOOK, ID);
+  eq(stored[0].chapter, 5, "the row the race left behind is untouched by the losing reclaim write");
+  eq(stored[0].question, "old question", "content untouched — a lost CAS never partially applies");
+  eq(stored[0].deleted_at != null, true, "still a tombstone — the race bumped version, not deleted_at");
+  eq(stored[0].version, 2, "version reflects the race's bump, not the reclaim's (failed) write");
 }
 
 console.log("\n[the same-reference tombstone must NOT count — it is a delete awaiting export]");
@@ -173,7 +243,11 @@ console.log("\n[(b) the watermark is WITHHELD, and the STORED row proves it]");
 {
   const { sqlite, env } = freshEnv();
   seedTombstone(sqlite);
-  const counts = await applyTsvRows(env, BOOK, "tq", [masterRow()], null);
+  // Force the lost-CAS fallback (see (a2) above) so this run still produces a
+  // real tombstone_blocked count to withhold on — the ordinary reissue case in
+  // (a) now reclaims and no longer needs (or triggers) a withhold at all.
+  const raced = withReclaimRace(env, sqlite, BOOK, ID);
+  const counts = await applyTsvRows(raced, BOOK, "tq", [masterRow()], null);
 
   // The gate is consulted on the AGGREGATE, not on this raw object — that is the
   // step where an absent counter could be laundered into a present zero. Prove
@@ -205,7 +279,8 @@ console.log("\n[(c) the banner is QUERYABLE where the UI reads it]");
 {
   const { sqlite, env } = freshEnv();
   seedTombstone(sqlite);
-  const counts = await applyTsvRows(env, BOOK, "tq", [masterRow()], null);
+  const raced = withReclaimRace(env, sqlite, BOOK, ID);
+  const counts = await applyTsvRows(raced, BOOK, "tq", [masterRow()], null);
   const { raiseTombstoneBlockAlertForTest } = await import("./bookReimport.ts");
   await raiseTombstoneBlockAlertForTest(env, BOOK, "tq", counts);
 
@@ -216,10 +291,19 @@ console.log("\n[(c) the banner is QUERYABLE where the UI reads it]");
   eq(alert?.severity, "error", "raised at error severity");
   eq(alert?.message.includes("1CH"), true, "names the book");
   eq(alert?.message.includes("hoig"), true, "names the actual blocked row id, so it is actionable");
+  // Since option 1 shipped, a `tombstone_blocked` count means the reclaim
+  // LOST its version-CAS race (this scenario), not a permanent freeze — the
+  // message now says so, instead of the pre-fix "does NOT clear on its own"
+  // framing, which no longer describes this case honestly.
+  eq(
+    alert?.message.includes("should resolve automatically"),
+    true,
+    "states the expected-to-self-heal-on-retry consequence, not a permanent freeze",
+  );
   eq(
     alert?.message.includes("does NOT clear on its own"),
-    true,
-    "states the freeze-until-a-human-acts consequence plainly",
+    false,
+    "the pre-reclaim 'does NOT clear on its own' framing no longer applies to a pure reclaim-race block",
   );
   eq(
     alert?.message.includes("re-run the sync"),

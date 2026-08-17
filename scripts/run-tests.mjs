@@ -35,11 +35,13 @@ const SQLITE_FILES = new Set([
   // gate themselves on availability.
   "src/pipelineDispatchTimeout.test.mjs",
   "src/lockOverrideAlert.test.mjs",
+  "src/tombstoneReclaim.test.mjs",
 ]);
 
 const EXTRA_IMPORTS = new Map([
   ["src/reimportJourney.test.mjs", "./src/tsResolveHook.mjs"],
   ["src/applyVerseRows.test.mjs", "./src/tsResolveHook.mjs"],
+  ["src/tombstoneReclaim.test.mjs", "./src/tsResolveHook.mjs"],
 ]);
 
 function findTestFiles(dir) {
