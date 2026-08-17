@@ -26,7 +26,11 @@ import { readdirSync, readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { changedTsvChapters } from "./bookReimport.ts";
+import {
+  changedTsvChapters,
+  softDeleteRemovedTsvRowsForTest as softDeleteRemovedTsvRows,
+  tsvFetchLooksTruncatedForTest as tsvFetchLooksTruncated,
+} from "./bookReimport.ts";
 
 let failed = 0;
 function eq(actual, expected, msg) {
@@ -214,6 +218,64 @@ console.log("\n[an AI-only row deleted in a DIFFERENT chapter does not falsely f
   const changed = await changedTsvChapters(env, BOOK, "tn", raw);
   eq(changed.has(3), false, "chapter 3 unaffected");
   eq(changed.has(7), true, "chapter 7 (where the AI-only row actually lived) IS flagged");
+}
+
+// ── P1 follow-up (codex review on PR #501) ─────────────────────────────────
+// The widened gate above correctly flags a chapter master emptied
+// COMPLETELY, but softDeleteRemovedTsvRows' `coveredChapters` skip only knew
+// about chapters with at least one incoming row — a chapter master emptied
+// entirely (the AI-only row was the LAST row in it) never got pruned, so
+// issue #485 persisted for exactly that case. These cases drive the REAL
+// prune (softDeleteRemovedTsvRowsForTest), not just the gate, to prove the
+// row is actually removed — and pin the completeness gate it depends on.
+
+console.log("\n[issue #485 P1 follow-up — AI-only row is the ONLY row in its chapter: gate flags AND prune removes it]");
+{
+  const { sqlite, env } = freshEnv();
+  seedPristineRow(sqlite, { id: "aaaa", chapter: 3, verse: 1, ref: "3:1" });
+  // chapter 5 has exactly one row, and it's AI-only. Master's file carries
+  // nothing at all for chapter 5 — a full deletion of the chapter's only row.
+  seedAiOnlyRow(sqlite, { id: "bbbb", chapter: 5, verse: 1, ref: "5:1" });
+  const raw = [TN_TSV_HEADER, tnTsvRow({ id: "aaaa", ref: "3:1", note: "pristine note" })].join("\n");
+
+  const changed = await changedTsvChapters(env, BOOK, "tn", raw);
+  eq(changed.has(5), true, "chapter 5 IS flagged changed — the widened gate catches the fully-emptied chapter");
+
+  const res = await softDeleteRemovedTsvRows(env, BOOK, "tn", raw, [...changed]);
+  eq(res.deleted, 1, "the prune actually deletes the AI-only row, not just flags its chapter");
+
+  const row = sqlite.prepare(`SELECT deleted_at, updated_by FROM tn_rows WHERE book = ? AND id = 'bbbb'`).all(BOOK)[0];
+  eq(row.deleted_at !== null, true, "the row is tombstoned (deleted_at set)");
+  eq(row.updated_by, null, "updated_by reclaimed to NULL — reimport-owned tombstone");
+}
+
+console.log("\n[control — a truncated/incomplete fetch must NOT be trusted as a genuinely-emptied chapter]");
+{
+  const { sqlite, env } = freshEnv();
+  // A book-sized live D1 (>= SHRINK_GUARD_MIN_LIVE) so the shrink guard can
+  // trip: 21 pristine rows across chapter 3, plus the AI-only row at chapter 5
+  // that a truncated fetch would otherwise look like it emptied.
+  for (let i = 0; i < 21; i++) {
+    seedPristineRow(sqlite, { id: `p${String(i).padStart(3, "0")}`, chapter: 3, verse: i + 1, ref: `3:${i + 1}` });
+  }
+  seedAiOnlyRow(sqlite, { id: "bbbb", chapter: 5, verse: 1, ref: "5:1" });
+
+  // A ~1-row body — the HAB tn incident shape (no Content-Length, a partial
+  // read) — parses to far fewer rows than the 22 D1 holds live, so it must
+  // read as truncated, not as "master emptied chapter 5".
+  const raw = [TN_TSV_HEADER, tnTsvRow({ id: "p000", ref: "3:1", note: "pristine note" })].join("\n");
+
+  const truncated = await tsvFetchLooksTruncated(env, BOOK, "tn", raw);
+  eq(truncated, true, "the completeness gate flags this fetch as truncated");
+
+  // Mirrors what both real callers do: a truncated fetch is treated as
+  // not-fetched (raw discarded) BEFORE it can reach the prune at all — so the
+  // prune must never run here, and the AI-only row must survive untouched.
+  if (!truncated) {
+    await softDeleteRemovedTsvRows(env, BOOK, "tn", raw, [3, 5]);
+  }
+  const row = sqlite.prepare(`SELECT deleted_at FROM tn_rows WHERE book = ? AND id = 'bbbb'`).all(BOOK)[0];
+  eq(row.deleted_at, null, "the AI-only row survives — a truncated fetch never gets to drive the prune");
 }
 
 if (failed > 0) {

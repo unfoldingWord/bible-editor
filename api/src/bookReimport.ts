@@ -399,6 +399,28 @@ export const raiseTombstoneBlockAlertForTest = (
   resource: Resource,
   counts: ReimportCounts,
 ): Promise<void> => raiseTombstoneBlockAlert(env, book, resource, counts);
+// aiRowDiffGate.test.mjs (issue #485 P1 follow-up): softDeleteRemovedTsvRows is
+// the prune half of the diff gate — this alias lets the test drive the REAL
+// prune against the real SQL (same rationale as the aliases above) to confirm
+// a gate-flagged chapter is actually processed, not just flagged.
+export const softDeleteRemovedTsvRowsForTest = (
+  env: Env,
+  book: string,
+  kind: TsvKind,
+  rawTsv: string,
+  candidateChapters: number[],
+): Promise<{ deleted: number; skippedLocked: number }> =>
+  softDeleteRemovedTsvRows(env, book, kind, rawTsv, candidateChapters);
+// The completeness gate softDeleteRemovedTsvRows' coverage fix relies on its
+// callers already having run — exposed so the control test can prove the gate
+// itself still catches a truncated fetch (the safety invariant the coverage
+// fix must not weaken), independent of the prune's own behavior.
+export const tsvFetchLooksTruncatedForTest = (
+  env: Env,
+  book: string,
+  kind: TsvKind,
+  raw: string,
+): Promise<boolean> => tsvFetchLooksTruncated(env, book, kind, raw);
 
 function addCounts(into: ReimportCounts, from: ReimportCounts): void {
   into.updated += from.updated;
@@ -3822,14 +3844,17 @@ export async function changedTsvChapters(
 // apply path uses, so a row the AI wrote and master later dropped is pruned
 // instead of lingering and re-exporting (the apply/prune consistency the
 // reimported_ai fix would otherwise miss). Conservative on every axis: only
-// chapters the incoming file covers AND the diff gate flagged as changed (a
-// deletion always flags its chapter), never under an active pipeline lock, and
-// the WRITE re-asserts version-CAS + the deleted/trashed/preserve/hint
-// protections (NOT updated_by IS NULL — an AI-only row carries the starter's id,
-// exactly as deleteUnkeptTns notes) so a human edit landing after the SELECT
-// bumps version → 0 rows → skipped. updated_by → NULL reclaims the tombstone to
-// reimport-owned. The id comparison is against the WHOLE file's id set so a row
-// the update path just moved to another chapter isn't mistaken for removed.
+// chapters the incoming file covers (a chapter master emptied entirely also
+// counts as "covered" when it still holds a live D1 row — see the coverage
+// extension inside, the issue #485 P1 follow-up) AND the diff gate flagged as
+// changed (a deletion always flags its chapter), never under an active
+// pipeline lock, and the WRITE re-asserts version-CAS + the
+// deleted/trashed/preserve/hint protections (NOT updated_by IS NULL — an
+// AI-only row carries the starter's id, exactly as deleteUnkeptTns notes) so a
+// human edit landing after the SELECT bumps version → 0 rows → skipped.
+// updated_by → NULL reclaims the tombstone to reimport-owned. The id
+// comparison is against the WHOLE file's id set so a row the update path just
+// moved to another chapter isn't mistaken for removed.
 async function softDeleteRemovedTsvRows(
   env: Env,
   book: string,
@@ -3860,6 +3885,45 @@ async function softDeleteRemovedTsvRows(
     kind === "tn"
       ? `deleted_at IS NULL AND trashed_at IS NULL AND preserve = 0 AND hint = 0`
       : `deleted_at IS NULL`;
+
+  // Issue #485 P1 follow-up (codex review on PR #501): a chapter master
+  // emptied COMPLETELY — zero incoming rows for that (book, kind, chapter) —
+  // never lands in coveredChapters above, so it was skipped by the loop below
+  // even after changedTsvChapters' liveIds pass correctly flagged it as
+  // changed (this is exactly what happens when the deleted AI-only row was
+  // the LAST row in its chapter). That left issue #485 half-fixed: the common
+  // case (chapter keeps other rows) prunes correctly, but a fully-emptied
+  // chapter's deletion still got resurrected every night.
+  //
+  // Both callers of this function (runReimport's inline prune and
+  // runChunkedReimport's reimport-prune-* step) only ever pass a `rawTsv`
+  // that has already survived tsvFetchLooksTruncated's book-wide completeness
+  // check — see the `tnRaw = null` / staging guards at those call sites — so
+  // by the time control reaches here, a chapter's total absence from the
+  // incoming file is trustworthy: master genuinely has nothing left for that
+  // chapter, not "the fetch got cut short." That is the exact trust condition
+  // the review asked for ("only trust emptiness when the book-wide file
+  // passed the completeness checks") — it already holds for every caller, so
+  // this fix relies on it rather than re-deriving it.
+  //
+  // Extend coverage to every chapter that currently holds a LIVE D1 row for
+  // this (book, kind): that is the only shape of "flagged-changed but
+  // empty-in-incoming" this prune ever needs to reach — a chapter with no
+  // live rows has nothing to prune regardless. Read as ONE batched
+  // DISTINCT-chapter query (not one query per candidate chapter) so the
+  // subrequest cost stays flat no matter how many chapters candidateChapters
+  // spans — postExport's runReimport call passes the WHOLE book's chapter
+  // range on every run.
+  const liveChaptersRes = await env.DB.prepare(
+    `SELECT DISTINCT chapter FROM ${kind}_rows WHERE book = ?1 AND ${selectProtections}`,
+  )
+    .bind(book)
+    .all<{ chapter: number }>();
+  for (const row of liveChaptersRes.results ?? []) {
+    const ch = Number(row.chapter);
+    if (ch >= 0) coveredChapters.add(ch);
+  }
+
   const writeGuard =
     kind === "tn"
       ? `deleted_at IS NULL AND trashed_at IS NULL AND preserve = 0 AND hint = 0 AND version = ?4`
