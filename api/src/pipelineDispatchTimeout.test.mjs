@@ -138,6 +138,33 @@ await withFetch(
   },
 );
 
+console.log("\n[a timeout during the response BODY read (not just connect/headers) is caught the same way]");
+await withFetch(
+  async () => ({
+    // fetch() itself resolves fine (headers arrived) — the AbortSignal fires
+    // later, while streaming the body, which is exactly what dispatchNext's
+    // `await upstream.text()` call exercises. This must be caught by the
+    // SAME try/catch as the fetch() call itself, not escape past it.
+    ok: true,
+    status: 200,
+    text: async () => {
+      const err = new Error("The operation was aborted due to timeout");
+      err.name = "TimeoutError";
+      throw err;
+    },
+  }),
+  async () => {
+    const env = fakeDispatchEnv();
+    await dispatchNext(env); // must not throw/reject
+    assert(env.failCalls.length === 1, "fail() was called exactly once for a body-read timeout");
+    assert(env.failCalls[0]?.kind === "transient_outage", "body-read timeout is classified as transient_outage");
+    assert(
+      /timeout/i.test(env.failCalls[0]?.message ?? ""),
+      `body-read timeout message names the timeout (got ${JSON.stringify(env.failCalls[0]?.message)})`,
+    );
+  },
+);
+
 console.log("\n[a plain network failure (not a timeout) still reports the pre-existing unreachable message]");
 await withFetch(
   async () => {

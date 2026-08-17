@@ -458,7 +458,16 @@ export async function dispatchNext(env: Env): Promise<void> {
   };
 
   let upstream: Response;
+  let text: string;
   try {
+    // The AbortSignal governs the whole request/response lifecycle, not just
+    // the fetch() promise — a stalled response BODY past the deadline aborts
+    // just as much as a stalled connect/header phase does, and that abort
+    // surfaces from upstream.text() (the body read), not from fetch() itself.
+    // Both calls must share this one try/catch, or a body-side stall would
+    // throw past this function uncaught, leaving the row in 'dispatching'
+    // for the stale sweep to race — exactly the bug DISPATCH_POST_TIMEOUT_MS
+    // exists to close, just relocated to the body-read phase.
     upstream = await fetch(`${upstreamBase(env)}/api/pipeline/start`, {
       method: "POST",
       headers: {
@@ -475,6 +484,7 @@ export async function dispatchNext(env: Env): Promise<void> {
       // would just reopen the exact race this exists to close.
       signal: AbortSignal.timeout(DISPATCH_POST_TIMEOUT_MS),
     });
+    text = await upstream.text();
   } catch (e) {
     if (e instanceof Error && e.name === "TimeoutError") {
       await fail("transient_outage", "upstream_dispatch_timeout");
@@ -484,7 +494,6 @@ export async function dispatchNext(env: Env): Promise<void> {
     return;
   }
 
-  const text = await upstream.text();
   if (!upstream.ok) {
     await fail("sdk_error", `upstream ${upstream.status}: ${text.slice(0, 200)}`);
     return;
