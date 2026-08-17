@@ -14,8 +14,9 @@
 // (extractVersesForRange in api/src/importParsers.ts — the function
 // bookImport.ts's insertVerses() and bookReimport.ts's chapter-reimport both
 // call), and diffs. It writes:
-//   scripts/out/refresh-uhb.sql             -- UPDATE statements, changed verses only
-//   scripts/out/refresh-uhb-manifest.json   -- human-reviewable before/after log
+//   scripts/out/refresh-uhb.sql               -- UPDATE + edit_log INSERT pairs, changed verses only
+//   scripts/out/refresh-uhb-manifest.json     -- human-reviewable before/after log (80-char snippets)
+//   scripts/out/refresh-uhb.sql.manifest.json -- same changes, FULL content_json + plain_text (for real review)
 //
 // It NEVER calls `wrangler d1 execute --file` to apply anything. Applying is
 // a separate, explicit, human-approved step.
@@ -167,6 +168,7 @@ async function main() {
   sqlLines.push("-- UPDATE-only, non-destructive. No BEGIN/COMMIT (remote D1 rejects explicit transactions).");
 
   const manifest = [];
+  const fullManifest = []; // same changes as `manifest`, but full content_json/plain_text, not 80-char snippets
   const skippedBooks = [];
   const churnFlags = [];
   let grandTotal = 0;
@@ -218,23 +220,46 @@ async function main() {
     // verses must not be treated as authoritative for the verses it DID find.
     const droppedFromD1 = [...d1ByKey.keys()].filter((k) => !freshKeys.has(k)).length;
 
+    // Also computed before touching a verse: an upstream key with NO matching
+    // D1 row. The dangerous shape here isn't "brand new verse" — it's a split
+    // verse bridge: D1 holds verse 1 with verse_end=2 (a bridge) but upstream
+    // now has separate verses 1 and 2. Verse 1's own UPDATE would clear
+    // verse_end, and verse 2 would have no D1 row to update at all — an
+    // INSERT would be needed, which this UPDATE-only, non-destructive script
+    // deliberately never emits. droppedFromD1 alone can't see this (verse 1's
+    // key is still present in D1). Reject the whole book instead: a
+    // structural bridge change deserves a human, not an auto-generated UPDATE.
+    const missingKeys = [...freshKeys].filter((k) => !d1ByKey.has(k));
+    if (missingKeys.length > 0) {
+      const shown =
+        missingKeys.slice(0, 20).join(", ") +
+        (missingKeys.length > 20 ? ` (+${missingKeys.length - 20} more)` : "");
+      console.error(
+        `  !! ${book}: REJECTED (fail-closed) — ${missingKeys.length} upstream verse key(s) have no matching ` +
+          `D1 row (possible verse-bridge split or other structural change): ${shown}`,
+      );
+      skippedBooks.push({
+        book,
+        reason: `suppressed: ${missingKeys.length} upstream key(s) not in D1, possible bridge split: ${shown}`,
+      });
+      hadRejection = true;
+      continue;
+    }
+
     let changedCount = 0;
-    let missingInD1 = 0; // verse exists upstream now but not in D1 (no INSERT emitted — non-destructive)
     const changedRefs = [];
-    // Buffered per-book, not pushed straight to sqlLines/manifest: if
-    // droppedFromD1 turns out nonzero we discard this book's UPDATEs
+    // Buffered per-book, not pushed straight to sqlLines/manifest/fullManifest:
+    // if droppedFromD1 turns out nonzero we discard this book's UPDATEs
     // entirely instead of shipping a partial set generated from an
     // incomplete fetch.
     const bookSqlLines = [];
     const bookManifest = [];
+    const bookFullManifest = [];
 
     for (const v of fresh) {
       const key = `${v.chapter}:${v.verse}`;
+      // Guaranteed present: missingKeys.length === 0 was just checked above.
       const d1Row = d1ByKey.get(key);
-      if (!d1Row) {
-        missingInD1++;
-        continue;
-      }
 
       let d1Parsed;
       try {
@@ -260,12 +285,26 @@ async function main() {
 
       changedCount++;
       changedRefs.push(key);
+
+      const rowKey = `${book}/${v.chapter}/${v.verse}/UHB`;
+      const prevVersion = d1Row.version;
+      const newVersion = d1Row.version + 1;
+      const payloadJson = JSON.stringify({ plain_text: v.plainText, content: v.contentJson });
+
       // Version-CAS'd: the WHERE clause also requires the row still be at
       // the version we observed it at, so a row edited between generation
       // and apply no-ops instead of getting silently overwritten. See the
       // expected-count comment block appended to the end of the file.
       bookSqlLines.push(
-        `UPDATE verses SET content_json=${q(v.contentJson)}, plain_text=${q(v.plainText)}, verse_end=${q(v.verseEnd)}, version=version+1, updated_at=${GENERATED_UPDATED_AT} WHERE book=${q(book)} AND chapter=${q(v.chapter)} AND verse=${q(v.verse)} AND bible_version='UHB' AND version=${q(d1Row.version)};`,
+        `UPDATE verses SET content_json=${q(v.contentJson)}, plain_text=${q(v.plainText)}, verse_end=${q(v.verseEnd)}, version=version+1, updated_at=${GENERATED_UPDATED_AT} WHERE book=${q(book)} AND chapter=${q(v.chapter)} AND verse=${q(v.verse)} AND bible_version='UHB' AND version=${q(prevVersion)};`,
+      );
+      // Same interleaved UPDATE + edit_log-INSERT-gated-on-changes()>0 shape
+      // bookReimport.ts's reimportVersesForChapter uses (logEditStmt call
+      // sites): the CAS above may lose the race, and changes()>0 makes the
+      // audit row conditional on the immediately-preceding UPDATE actually
+      // landing, instead of logging a phantom restorable version.
+      bookSqlLines.push(
+        `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, payload_json, source) SELECT 'verse', ${q(rowKey)}, ${q(book)}, NULL, ${q(prevVersion)}, ${q(newVersion)}, 'update', ${q(payloadJson)}, 'uhb_refresh' WHERE changes() > 0;`,
       );
       bookManifest.push({
         book,
@@ -276,6 +315,16 @@ async function main() {
         after: snippet(v.plainText),
         verseEndChanged,
         d1Version: d1Row.version,
+      });
+      bookFullManifest.push({
+        book,
+        chapter: v.chapter,
+        verse: v.verse,
+        ref: `${book} ${key}`,
+        verseEndChanged,
+        d1Version: d1Row.version,
+        before: { plain_text: d1Row.plain_text, content_json: d1Row.content_json },
+        after: { plain_text: v.plainText, content_json: v.contentJson },
       });
     }
 
@@ -299,11 +348,11 @@ async function main() {
       grandChanged += changedCount;
       sqlLines.push(...bookSqlLines);
       manifest.push(...bookManifest);
+      fullManifest.push(...bookFullManifest);
     }
 
     console.log(
       `  ${book}: ${fresh.length} verses, ${changedCount} changed` +
-        (missingInD1 ? `, ${missingInD1} new (not in D1, no INSERT emitted)` : "") +
         (droppedFromD1 ? `, ${droppedFromD1} in D1 but absent upstream (UPDATEs suppressed, fail-closed)` : ""),
     );
     if (changedCount > 0) {
@@ -332,24 +381,31 @@ async function main() {
     }
   }
 
-  // Trailing comment block for whoever applies this file by hand: each
-  // UPDATE above is version-gated (AND version=<observed>), so a row edited
-  // between generation and apply no-ops instead of overwriting a newer edit.
-  // That makes the changed-row count returned by the apply step the thing to
-  // check — if it's short, some rows were stale and the manifest needs
-  // regenerating, not re-running as-is.
-  sqlLines.push("");
-  sqlLines.push(`-- Expected changed-row count: ${grandChanged}`);
-  sqlLines.push("-- Each UPDATE above is version-CAS'd (AND version=<observed>). After applying this");
-  sqlLines.push("-- file, verify the reported changed-row count equals the expected count on the line");
-  sqlLines.push("-- above. If it's lower, one or more rows changed since this file was generated (their");
-  sqlLines.push("-- UPDATE no-op'd rather than overwriting) — regenerate against current prod D1 before");
-  sqlLines.push("-- re-applying rather than assuming the shortfall is safe to ignore.");
-
   const outDir = resolve(repoRoot, "scripts/out");
   mkdirSync(outDir, { recursive: true });
   const sqlPath = resolve(outDir, "refresh-uhb.sql");
   const manifestPath = resolve(outDir, "refresh-uhb-manifest.json");
+  const fullManifestPath = resolve(outDir, "refresh-uhb.sql.manifest.json");
+
+  // Trailing comment block for whoever applies this file by hand: each
+  // UPDATE above is version-gated (AND version=<observed>), so a row edited
+  // between generation and apply no-ops instead of overwriting a newer edit
+  // — and its paired edit_log INSERT is itself gated on that UPDATE actually
+  // landing (WHERE changes() > 0), so a lost CAS logs nothing. That makes the
+  // changed-row count returned by the apply step (for the UPDATE statements)
+  // the thing to check — if it's short, some rows were stale and the
+  // manifest needs regenerating, not re-running as-is.
+  sqlLines.push("");
+  sqlLines.push(`-- Expected changed-row count: ${grandChanged} (each verse = 1 UPDATE + 1 conditional edit_log INSERT)`);
+  sqlLines.push("-- Each UPDATE above is version-CAS'd (AND version=<observed>). After applying this");
+  sqlLines.push("-- file, verify the reported changed-row count for the UPDATE statements equals the");
+  sqlLines.push("-- expected count on the line above. If it's lower, one or more rows changed since this");
+  sqlLines.push("-- file was generated (their UPDATE no-op'd rather than overwriting, and their edit_log");
+  sqlLines.push("-- INSERT logged nothing) — regenerate against current prod D1 before re-applying rather");
+  sqlLines.push("-- than assuming the shortfall is safe to ignore.");
+  sqlLines.push(`-- Full before/after content_json + plain_text per changed verse (not just an 80-char`);
+  sqlLines.push(`-- snippet) is in: ${fullManifestPath}`);
+
   writeFileSync(sqlPath, sqlLines.join("\n") + "\n", "utf8");
   writeFileSync(
     manifestPath,
@@ -367,9 +423,28 @@ async function main() {
     ),
     "utf8",
   );
+  // Full-content companion to manifestPath above: manifestPath's before/after
+  // are 80-char snippets (fine for a plain-text skim, blind to alignment- or
+  // morphology-only content_json changes, and to anything past 80 chars).
+  // This file carries the complete content_json + plain_text pair per
+  // changed verse, for a real review before ever applying refresh-uhb.sql.
+  writeFileSync(
+    fullManifestPath,
+    JSON.stringify(
+      {
+        generatedAt: new Date().toISOString(),
+        totalChanged: grandChanged,
+        changes: fullManifest,
+      },
+      null,
+      2,
+    ),
+    "utf8",
+  );
 
-  console.log(`\nWrote ${sqlPath} (${grandChanged} UPDATE statements)`);
+  console.log(`\nWrote ${sqlPath} (${grandChanged} UPDATE + edit_log INSERT pairs)`);
   console.log(`Wrote ${manifestPath} (${manifest.length} manifest entries)`);
+  console.log(`Wrote ${fullManifestPath} (${fullManifest.length} full before/after entries)`);
   console.log("\nDRY RUN ONLY — nothing was applied to prod. Review the files above before ever running them.");
 
   if (hadRejection) {
