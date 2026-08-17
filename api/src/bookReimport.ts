@@ -1873,6 +1873,17 @@ export async function applyTsvRows(
       });
       if (logs.length) await env.DB.batch(logs);
     } catch (e) {
+      // Correctness-bearing, same as the edited-merge and verse master-adoption
+      // batches below/above: a thrown write batch means master's row(s) for this
+      // slice are NOT in D1 (or, if only the trailing edit_log batch threw, ARE
+      // in D1 but with no audit trail) — either way this run must not be
+      // certified in sync, or the reimport-sync step stamps the watermark over
+      // still-missing content and the nightly export never retries (Codex
+      // review on PR #506). Taint apply_incomplete so shouldRecordResourceSync
+      // withholds it; the next sync retries harmlessly (a landed-but-unlogged
+      // reclaim is no longer a tombstone, so it simply won't match the reclaim
+      // branch again).
+      counts.apply_incomplete = true;
       counts.errors.push(`${kind} reclaim batch: ${e instanceof Error ? e.message : String(e)}`);
     }
   }
@@ -2306,11 +2317,13 @@ async function tsvFetchLooksTruncated(
 // completely different logical entity moving into a slot the old row merely
 // vacated, not a continuation of it, so re-asserting them would be checking
 // the wrong row's history. For the SAME reason, a tn reclaim also explicitly
-// CLEARS trashed_at/preserve/hint in the SET (`clearProtections` below) rather
-// than leaving whatever the tombstoned row happened to hold — those columns
-// aren't part of the pristine guard's WHERE for reclaim, so nothing else would
-// ever reset them, and a human's "preserve this note"/"queue this as an AI
-// hint" intent for the OLD content must never silently apply to master's new
+// CLEARS trashed_at/preserve/hint in the SET (`clearProtections` below), and
+// EVERY kind's reclaim clears restored_from_version/review_kind/review_reason
+// (`clearReviewMeta` below) — rather than leaving whatever the tombstoned row
+// happened to hold. None of those columns are part of the pristine guard's
+// WHERE for reclaim, so nothing else would ever reset them, and a human's
+// "preserve this note"/"queue this as an AI hint"/"flag for review"/"showing
+// as vN" intent for the OLD content must never silently apply to master's new
 // content. It also drops the `updated_by IS NULL` guard (like reseedAi) and
 // sets `updated_by = NULL`, starting master's row master-owned.
 // version-CAS is the only guard reclaim keeps, and it is load-bearing: a
@@ -2351,11 +2364,21 @@ function buildTsvUpdateStmt(
   // pristine guard above already requires them clear before a normal
   // UPDATE/resurrect/reseed can proceed at all).
   const clearProtections = reclaim && kind === "tn" ? "trashed_at = NULL, preserve = 0, hint = 0, " : "";
+  // Reclaim ONLY, all three kinds: restored_from_version (the "switch to vN"
+  // display chip) and review_kind/review_reason (the flag-for-review markers —
+  // e.g. 'ref_moved', a keep_alignment_refused-style note) describe the OLD
+  // tombstoned row, same rationale as clearProtections above. Left uncleared, a
+  // human's stale "this needs review because X" or "showing as vN" carries onto
+  // master's unrelated new content with no way to tell it's wrong. Fresh-insert
+  // default for both is NULL (tryInsertTsvRow never sets either).
+  const clearReviewMeta = reclaim
+    ? "restored_from_version = NULL, review_kind = NULL, review_reason = NULL, "
+    : "";
   const newVersion = oldVersion + 1;
   if (kind === "tn") {
     return env.DB.prepare(
       `UPDATE tn_rows
-          SET ${clearDeleted}${clearOwner}${clearProtections}ref_raw = ?1, chapter = ?2, verse = ?3, tags = ?4,
+          SET ${clearDeleted}${clearOwner}${clearProtections}${clearReviewMeta}ref_raw = ?1, chapter = ?2, verse = ?3, tags = ?4,
               support_reference = ?5, quote = ?6, occurrence = ?7, note = ?8,
               sort_order = ?9, version = ?10, updated_at = ?11
         WHERE id = ?12 AND book = ?13 AND ${pristine} AND version = ?14`,
@@ -2368,7 +2391,7 @@ function buildTsvUpdateStmt(
   if (kind === "tq") {
     return env.DB.prepare(
       `UPDATE tq_rows
-          SET ${clearDeleted}${clearOwner}ref_raw = ?1, chapter = ?2, verse = ?3, tags = ?4,
+          SET ${clearDeleted}${clearOwner}${clearReviewMeta}ref_raw = ?1, chapter = ?2, verse = ?3, tags = ?4,
               quote = ?5, occurrence = ?6, question = ?7, response = ?8,
               sort_order = ?9, version = ?10, updated_at = ?11
         WHERE id = ?12 AND book = ?13 AND ${pristine} AND version = ?14`,
@@ -2380,7 +2403,7 @@ function buildTsvUpdateStmt(
   }
   return env.DB.prepare(
     `UPDATE twl_rows
-        SET ${clearDeleted}${clearOwner}ref_raw = ?1, chapter = ?2, verse = ?3, tags = ?4,
+        SET ${clearDeleted}${clearOwner}${clearReviewMeta}ref_raw = ?1, chapter = ?2, verse = ?3, tags = ?4,
             orig_words = ?5, occurrence = ?6, tw_link = ?7,
             sort_order = ?8, version = ?9, updated_at = ?10
       WHERE id = ?11 AND book = ?12 AND ${pristine} AND version = ?13`,

@@ -36,6 +36,13 @@
 //       state, not master's new one), which resurrect would have refused —
 //       AND the write explicitly CLEARS all three, so they don't silently
 //       carry over onto master's unrelated new content.
+//   (g) a THROWN reclaim write (or its trailing edit_log) batch taints
+//       apply_incomplete — Codex review on PR #506, P1: without this, a
+//       failed reclaim write is certified in-sync while master's row is still
+//       absent from D1, and the export never retries.
+//   (h) reclaim resets restored_from_version/review_kind/review_reason (all
+//       three TSV kinds, not just tn's trashed_at/preserve/hint) to
+//       fresh-insert defaults — Codex review on PR #506, P2.
 
 import { DatabaseSync } from "node:sqlite";
 import { readdirSync, readFileSync } from "node:fs";
@@ -360,6 +367,79 @@ console.log("\n[(f) reclaim IGNORES the trashed_at/preserve/hint GUARD, and also
   eq(stored[0].trashed_at, null, "trashed_at is CLEARED by reclaim — the old row's trash-queue state does not survive");
   eq(stored[0].preserve, 0, "preserve is CLEARED — the old row's AI-sweep protection does not apply to new content");
   eq(stored[0].hint, 0, "hint is CLEARED — the old row's AI-hint-stub flag does not apply to new content");
+}
+
+// Wrap an env.DB so the reclaim write batch THROWS instead of running —
+// simulating a D1 error mid-batch (network blip, subrequest budget, etc.).
+// Identified by the same distinctive SQL shape withReclaimRace uses.
+function withReclaimThrow(env) {
+  return {
+    ...env,
+    DB: {
+      ...env.DB,
+      async batch(stmts) {
+        if (stmts.some((s) => s.sql.includes("updated_by = NULL,") && s.sql.includes("deleted_at IS NOT NULL"))) {
+          throw new Error("simulated D1 failure mid reclaim-batch");
+        }
+        return env.DB.batch(stmts);
+      },
+    },
+  };
+}
+
+console.log("\n[(g) a THROWN reclaim batch taints apply_incomplete — never certified in-sync over a still-missing row]");
+{
+  const { sqlite, env } = freshEnv();
+  seedTqTombstone(sqlite);
+  const counts = await applyTsvRows(withReclaimThrow(env), BOOK, "tq", [tqMasterRow()], null);
+
+  eq(counts.tombstone_reclaimed, 0, "the write never landed — not counted reclaimed");
+  eq(counts.tombstone_blocked, 0, "not the lost-CAS fallback path either — this is a harder failure (thrown, not 0 rows)");
+  eq(counts.apply_incomplete, true, "apply_incomplete IS tainted — Codex P1: a thrown reclaim batch must not be certified in sync");
+  eq(counts.errors.length, 1, "the failure is recorded in errors");
+  // apply_incomplete is a SIBLING withhold condition to shouldRecordResourceSync
+  // at the actual call site (`!shouldRecordResourceSync(...) || ... ||
+  // applyIncomplete` in bookReimport.ts's reimport-sync step), not folded into
+  // it — so the gate this asserts is the real combined condition, matching
+  // that call site, not shouldRecordResourceSync alone.
+  eq(
+    !shouldRecordResourceSync(counts) || counts.apply_incomplete === true,
+    true,
+    "the combined watermark gate withholds this resource (via apply_incomplete)",
+  );
+
+  const stored = sqlite.prepare(`SELECT deleted_at FROM tq_rows WHERE book = ? AND id = ?`).all(BOOK, ID);
+  eq(stored[0].deleted_at, 1753900000, "the row is untouched — still tombstoned, exactly as before the failed attempt");
+}
+
+console.log("\n[(h) reclaim resets restored_from_version/review_kind/review_reason to fresh-insert defaults, for a NON-tn kind]");
+{
+  const { sqlite, env } = freshEnv();
+  // A tq tombstone carrying every shared review-metadata column a human could
+  // have set on the OLD row before it was deleted: a "switch to v3" restore
+  // chip, and a flag-for-review marker with its reason. None of these describe
+  // master's incoming (unrelated) row and must not survive onto it — Codex P2
+  // on PR #506. review_kind/review_reason exist on tq/twl too (migration
+  // 0047), not just tn, so this deliberately exercises a non-tn kind — (f)
+  // above already covers tn's trashed_at/preserve/hint.
+  sqlite
+    .prepare(
+      `INSERT INTO tq_rows
+         (id, book, chapter, verse, ref_raw, question, response, sort_order, deleted_at, updated_by,
+          restored_from_version, review_kind, review_reason)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .run(ID, BOOK, 5, 4, "5:4", "old question", "old response", 10, 1753900000, null, 3, "ref_moved", "master moved this row's reference");
+
+  const counts = await applyTsvRows(env, BOOK, "tq", [tqMasterRow()], null);
+  eq(counts.tombstone_reclaimed, 1, "reclaimed");
+
+  const stored = sqlite
+    .prepare(`SELECT restored_from_version, review_kind, review_reason FROM tq_rows WHERE book = ? AND id = ?`)
+    .all(BOOK, ID);
+  eq(stored[0].restored_from_version, null, "restored_from_version reset — the OLD row's 'showing as v3' chip does not apply to master's new content");
+  eq(stored[0].review_kind, null, "review_kind reset — the OLD row's flag-for-review does not apply to master's new content");
+  eq(stored[0].review_reason, null, "review_reason reset alongside review_kind");
 }
 
 if (failed > 0) {
