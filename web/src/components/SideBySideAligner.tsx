@@ -74,7 +74,16 @@ export interface PanelSlot {
 
 // Imperative surface the gate uses to flush or revert a reading line.
 export interface ReadingLineHandle {
-  save: () => void;
+  // `afterCommit` mirrors AlignmentPanelHandle.save (#490): a reading-text
+  // save is NOT unconditionally synchronous — it can trip the collateral-loss
+  // guard (Shell's guardBlocksSave) and defer behind the "Words will be
+  // unaligned" confirm. `afterCommit` runs only once the save actually lands
+  // (immediately for a plain/no-op save, or after "Save anyway"); it never
+  // runs if the user cancels. Callers that close/unmount the reading line
+  // after saving MUST pass that as `afterCommit` rather than proceeding
+  // right after calling `save`, or a pending confirm's Cancel silently
+  // discards the edit (no enqueue, no draft, DOM already gone).
+  save: (afterCommit?: () => void) => void;
   discard: () => void;
 }
 
@@ -93,8 +102,17 @@ interface Props {
   right: PanelSlot;
   // Commit a reading-text edit (smart-edit + enqueue). Fired only by the
   // explicit Save button — the reading line no longer autosaves on blur.
-  // Keyed by bibleVersion so the same callback serves both sides.
-  onSaveReading: (bibleVersion: string, plain: string, base: VerseDto) => void;
+  // Keyed by bibleVersion so the same callback serves both sides. `afterCommit`
+  // (present when the gate/ReadingLineHandle.save passed one through) must be
+  // invoked once the enqueue actually happens — synchronously for a plain
+  // save, or from the collateral-loss confirm's "Save anyway" — and never on
+  // Cancel (#490).
+  onSaveReading: (
+    bibleVersion: string,
+    plain: string,
+    base: VerseDto,
+    afterCommit?: () => void,
+  ) => void;
   // Verse nav (titlebar arrows). Undefined at the chapter's ends.
   onPrevVerse?: () => void;
   onNextVerse?: () => void;
@@ -497,7 +515,7 @@ function SharedUhbStrip({
 // + enqueue) or Undo (revert to the last-saved text) — nothing autosaves.
 const ReadingLine = forwardRef<ReadingLineHandle, {
   slot: PanelSlot;
-  onSave: (bibleVersion: string, plain: string, base: VerseDto) => void;
+  onSave: (bibleVersion: string, plain: string, base: VerseDto, afterCommit?: () => void) => void;
   onDirtyChange: (dirty: boolean) => void;
   // Locked while this side's AlignmentPanel has unsaved drags: a text edit
   // here would swap the verse prop and silently wipe those drags (see the
@@ -544,11 +562,24 @@ const ReadingLine = forwardRef<ReadingLineHandle, {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [editable]);
 
-  const handleSave = () => {
+  // `afterCommit` mirrors AlignmentPanelHandle's handleSave (#490): `onSave`
+  // (ultimately Shell's saveVerseDraft → enqueueVerseSafely) can defer this
+  // save behind the collateral-loss confirm rather than enqueueing
+  // synchronously. markDirty(false) — which is what lets a caller believe
+  // there's nothing left to lose — must wait for onSave's own afterCommit,
+  // not fire unconditionally right after calling it, or a still-open confirm
+  // that the user then Cancels loses the edit with no trace (never enqueued,
+  // no draft, and by then usually DOM-unmounted too).
+  const handleSave = (afterCommit?: () => void) => {
     const el = elRef.current;
-    if (!el || !verse) return;
-    onSave(bibleVersion, el.textContent ?? "", verse);
-    markDirty(false);
+    if (!el || !verse) {
+      afterCommit?.();
+      return;
+    }
+    onSave(bibleVersion, el.textContent ?? "", verse, () => {
+      markDirty(false);
+      afterCommit?.();
+    });
   };
 
   const handleUndo = () => {
@@ -612,7 +643,7 @@ const ReadingLine = forwardRef<ReadingLineHandle, {
             <Button
               size="small"
               variant="contained"
-              onClick={handleSave}
+              onClick={() => handleSave()}
               disabled={!dirty}
               sx={{
                 textTransform: "uppercase",
