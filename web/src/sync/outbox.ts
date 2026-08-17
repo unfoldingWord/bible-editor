@@ -27,6 +27,11 @@ import {
   serverRefusalReason,
   willRetryOnItsOwn,
 } from "./refusalReason";
+import {
+  eligibleForVersionThread,
+  isMaxAttemptsBlocked,
+  targetKey,
+} from "./outboxTargeting.ts";
 
 const DB_NAME = "bible-editor-outbox";
 const DB_VERSION = 1;
@@ -236,16 +241,11 @@ function noopOp(target: OpTarget, action: OpAction, patch: Record<string, unknow
   };
 }
 
-// Two ops belong to the same target iff they touch the same row/verse. A
-// conflict on one of them must not block ops to *other* targets — but it
-// must keep blocking siblings, since the user's expectedVersion is stale
-// for them too.
-function targetKey(t: OpTarget): string {
-  if (t.kind === "row") return `row:${t.rowKind}:${t.book}:${t.id}`;
-  if (t.kind === "verse_status") return `vstatus:${t.book}:${t.chapter}:${t.verse}`;
-  if (t.kind === "lane_check") return `lanecheck:${t.book}:${t.chapter}:${t.verse}:${t.lane}`;
-  return `verse:${t.book}:${t.chapter}:${t.verse}:${t.bibleVersion}`;
-}
+// targetKey / isMaxAttemptsBlocked / eligibleForVersionThread live in
+// outboxTargeting.ts, not here — that module has no dependency on api.ts (its
+// ApiError class uses a TS parameter-property constructor Node's strip-types
+// loader can't erase), so it can be `import()`ed directly by a plain Node
+// regression test. See outboxTargeting.test.mjs for the issue #487 coverage.
 
 export const outbox = {
   subscribe(fn: Subscriber): () => void {
@@ -558,13 +558,34 @@ export const outbox = {
       await tx.done;
       return;
     }
+    // A max-attempts-blocked op (isMaxAttemptsBlocked) was holding its
+    // target's place in the FIFO: nothing queued behind it while it sat
+    // failed could leapfrog ahead and get threaded a version this op would
+    // later land on top of. Flipping status to "pending" already forfeits
+    // that protection (isMaxAttemptsBlocked only fires on `status ===
+    // "failed"`), so if we also bump queuedAt/seq to "now", this op sorts
+    // *behind* any sibling that queued while it was failed — that sibling
+    // then drains first, threadVersionToSiblings hands its fresh version to
+    // this now-pending op (eligibleForVersionThread allows any pending op),
+    // and this op lands cleanly on top of it, silently reverting the newer
+    // edit. Same bug as #487, reached through Retry instead of automatic
+    // revival. Keeping the original queuedAt/seq preserves this op's
+    // rightful place ahead of those siblings, so plain FIFO ordering (not
+    // the `blocked` set) keeps it draining — and re-threading — first, the
+    // same as if it had never failed. A fatal (non-blocking) failure never
+    // had this protection — it's threaded continuously while failed (see
+    // eligibleForVersionThread) — so it keeps getting a fresh queue
+    // position, as before.
+    const preserveQueuePosition = isMaxAttemptsBlocked(op);
     op.status = "pending";
     op.attempts = 0;
     op.hardAttempts = 0;
     op.lastError = undefined;
     op.lastErrorReason = undefined;
-    op.queuedAt = Date.now();
-    op.seq = nextSeq();
+    if (!preserveQueuePosition) {
+      op.queuedAt = Date.now();
+      op.seq = nextSeq();
+    }
     await tx.store.put(op);
     await tx.done;
     void notify();
@@ -791,8 +812,9 @@ async function recoverInFlight(): Promise<number | undefined> {
 // apply). Thread the confirmed version into them — with several siblings
 // queued, each landing re-threads the rest. Skips `conflict` ops (those are
 // owned by the user-resolve flow: drain won't pick them up, and
-// resolveConflict overwrites expectedVersion anyway) and anything without a
-// numeric version in the response (verse_status upserts, row deletes).
+// resolveConflict overwrites expectedVersion anyway), max-attempts-failed ops
+// (see eligibleForVersionThread — issue #487), and anything without a numeric
+// version in the response (verse_status upserts, row deletes).
 async function threadVersionToSiblings(done: OutboxOp, updated: unknown) {
   const version = (updated as { version?: unknown } | null | undefined)?.version;
   if (typeof version !== "number") return;
@@ -808,7 +830,7 @@ async function threadVersionToSiblings(done: OutboxOp, updated: unknown) {
   for (const o of all) {
     if (
       targetKey(o.target) === key &&
-      (o.status === "pending" || o.status === "failed") &&
+      eligibleForVersionThread(o) &&
       o.expectedVersion !== version
     ) {
       o.expectedVersion = version;
@@ -840,9 +862,15 @@ async function drainPass() {
     if (typeof navigator !== "undefined" && navigator.onLine === false) break;
     const ops = await listAll();
     // Mark any target with a still-conflicted op as blocked, so we don't
-    // pick up sibling pending ops with stale expectedVersion either.
+    // pick up sibling pending ops with stale expectedVersion either. A
+    // max-attempts-failed op blocks the same way (isMaxAttemptsBlocked —
+    // issue #487): it WILL auto-revive with a stale expectedVersion, so a
+    // younger pending sibling must not be allowed to land ahead of it and
+    // then get silently reverted when the older op re-arms. Fatal
+    // (non-revivable) failed ops are excluded from this — nothing will ever
+    // re-send them, so blocking on them would freeze the target forever.
     for (const o of ops) {
-      if (o.status === "conflict") blocked.add(targetKey(o.target));
+      if (o.status === "conflict" || isMaxAttemptsBlocked(o)) blocked.add(targetKey(o.target));
     }
     let next = ops.find(
       (o) => o.status === "pending" && !blocked.has(targetKey(o.target)),
