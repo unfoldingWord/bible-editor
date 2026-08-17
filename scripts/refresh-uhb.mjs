@@ -134,10 +134,15 @@ async function fetchUhbUsfm(book) {
       completenessFailure: true,
     };
   }
-  if (buf.byteLength !== expected) {
+  // >= , not === : fetch() exposes the DECODED body, but Content-Length can
+  // describe the compressed wire bytes, so a valid content-encoded response
+  // can legitimately have buf.byteLength > expected. Mirror fetchText()'s
+  // comparison (api/src/dcsSources.ts) — only a SHORTER-than-declared body is
+  // truncation; a longer one is not evidence of anything wrong.
+  if (buf.byteLength < expected) {
     return {
       ok: false,
-      reason: `byte length mismatch (got ${buf.byteLength}B, expected ${expected}B) — truncated or corrupt fetch (fail-closed)`,
+      reason: `short read (got ${buf.byteLength}B, expected ${expected}B) — truncated fetch (fail-closed)`,
       url,
       completenessFailure: true,
     };
@@ -391,17 +396,23 @@ async function main() {
   // UPDATE above is version-gated (AND version=<observed>), so a row edited
   // between generation and apply no-ops instead of overwriting a newer edit
   // — and its paired edit_log INSERT is itself gated on that UPDATE actually
-  // landing (WHERE changes() > 0), so a lost CAS logs nothing. That makes the
-  // changed-row count returned by the apply step (for the UPDATE statements)
-  // the thing to check — if it's short, some rows were stale and the
-  // manifest needs regenerating, not re-running as-is.
+  // landing (WHERE changes() > 0), so a lost CAS logs nothing. On a fully
+  // successful apply, `wrangler d1 execute --file` reports a changed row for
+  // BOTH statements of every landed pair, so the total changed-row count it
+  // reports is 2x the number of verses changed, not 1x — state that
+  // combined total explicitly rather than the per-verse count, so an
+  // applier isn't misled into expecting a number half of what a clean run
+  // actually produces.
   sqlLines.push("");
-  sqlLines.push(`-- Expected changed-row count: ${grandChanged} (each verse = 1 UPDATE + 1 conditional edit_log INSERT)`);
+  sqlLines.push(
+    `-- Expected total changed-row count across the whole file: ${grandChanged * 2} ` +
+      `(${grandChanged} verse(s) changed, each = 1 UPDATE + 1 conditional edit_log INSERT pair, both counted on success)`,
+  );
   sqlLines.push("-- Each UPDATE above is version-CAS'd (AND version=<observed>). After applying this");
-  sqlLines.push("-- file, verify the reported changed-row count for the UPDATE statements equals the");
-  sqlLines.push("-- expected count on the line above. If it's lower, one or more rows changed since this");
-  sqlLines.push("-- file was generated (their UPDATE no-op'd rather than overwriting, and their edit_log");
-  sqlLines.push("-- INSERT logged nothing) — regenerate against current prod D1 before re-applying rather");
+  sqlLines.push("-- file, verify the reported total changed-row count equals the expected total above.");
+  sqlLines.push("-- If it's lower, one or more rows changed since this file was generated (their UPDATE");
+  sqlLines.push("-- no-op'd rather than overwriting, and their edit_log INSERT logged nothing — each lost");
+  sqlLines.push("-- pair costs 2 off the total, not 1) — regenerate against current prod D1 before re-applying rather");
   sqlLines.push("-- than assuming the shortfall is safe to ignore.");
   sqlLines.push(`-- Full before/after content_json + plain_text per changed verse (not just an 80-char`);
   sqlLines.push(`-- snippet) is in: ${fullManifestPath}`);
