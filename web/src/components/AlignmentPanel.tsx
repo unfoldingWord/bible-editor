@@ -56,7 +56,7 @@ import {
 } from "../lib/alignmentHover";
 import type { TwlRow, VerseDto } from "../sync/api";
 import { alignmentDrafts, alignmentDraftKey } from "../sync/alignmentDrafts";
-import { lostAlignedWords } from "../lib/alignmentDelta";
+import { lostAlignedWords, sameVerseContent } from "../lib/alignmentDelta";
 import { useLexicon, type LexiconEntry } from "../hooks/useLexicon";
 import { useAlignmentSuggestions } from "../hooks/useAlignmentSuggestions";
 import {
@@ -250,6 +250,13 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
     useEffect(() => {
       stateRef.current = state;
     });
+    // (target key, verse.content) the panel last synced `initial`/`state` to.
+    // Lets the reset effect tell a version-only bump (our own save
+    // round-tripping through the outbox: V -> V+1, same bytes) apart from a
+    // genuine content change (a foreign edit, a different verse) — see #488.
+    // Starts null so the very first run (mount / crash-recovery load) always
+    // takes the full-reset path, same as before this fix.
+    const lastSyncRef = useRef<{ key: string; content: unknown } | null>(null);
     const [selectedUnaligned, setSelectedUnaligned] = useState<Set<string>>(new Set());
     const [selectionAnchor, setSelectionAnchor] = useState<string | null>(null);
     const [showOnlyUnaligned, setShowOnlyUnaligned] = useState(false);
@@ -303,26 +310,52 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
       });
     };
 
-    // Sync to upstream verse changes (find/replace, version swap, etc.).
-    // In-memory drag state is dropped from React state here; but if a
-    // crash-saved draft exists for this verse it is re-hydrated below, so an
-    // unsaved edit survives a reload/crash (and a normal navigation-away that
-    // wasn't saved or discarded) rather than being silently lost.
+    // Sync to upstream verse changes (find/replace, version swap, etc.). On a
+    // genuine content change, in-memory drag state is dropped from React
+    // state here; but if a crash-saved draft exists for this verse it is
+    // re-hydrated below, so an unsaved edit survives a reload/crash (and a
+    // normal navigation-away that wasn't saved or discarded) rather than
+    // being silently lost.
     //
-    // On the SAME dependency, attempt to restore a crash-saved alignment draft
-    // (Fix C — a browser crash can't be caught by the beforeunload guard, so
-    // in-progress drags are persisted per-change to alignmentDrafts). The reset
-    // above runs synchronously to computedInitial; the draft load is async, so
-    // its setState resolves AFTER and wins — that is deliberate. Three guards:
-    // (1) the draft's version must still match the current base (otherwise the
-    // base changed under it — another tab's save, a reimport — and applying it
-    // would clobber newer content; a mismatched draft is discarded); (2) the
-    // user must not have started editing in the async-read window (stateRef
-    // still === computedInitial) so a restore never overwrites a fresh drag;
-    // (3) the `cancelled` flag drops a resolution whose verse changed again.
-    // `initial` stays computedInitial so the restored state reads as dirty
-    // (state !== initial) and can be saved or reset.
+    // #488: that full reset is also what used to fire when the panel's OWN save
+    // round-trips through the outbox — Shell applies an optimistic VerseDto,
+    // then useChapter's onOutboxResult applies the server-confirmed row
+    // (same content, version+1, new object identity). Both re-arrivals carry
+    // byte-identical content, so wiping `state` here would silently discard
+    // any drags the user made in the seconds/minutes between clicking Save
+    // and the PATCH landing — and if a crash-draft picked those up, the
+    // hydration guard below would then read it, see the draft's
+    // `expectedVersion` (the pre-save version) doesn't match the now-bumped
+    // `verse.version`, and delete the very draft that would have recovered
+    // them. `lastSyncRef` tracks (target, content) the panel last synced to
+    // so a same-target/same-content re-arrival is treated as a REBASE
+    // (rebase `initial`, and `state` too if the panel wasn't mid-drag) rather
+    // than a foreign change — leaving in-flight drags and their crash-draft
+    // alone. A content change (or a different verse target) still takes the
+    // full reset path below, unaffected.
     useEffect(() => {
+      const targetKey = `${book}|${chapter}|${verseNum}|${bibleVersion}`;
+      const isRebase =
+        lastSyncRef.current !== null &&
+        lastSyncRef.current.key === targetKey &&
+        verse != null &&
+        sameVerseContent(lastSyncRef.current.content, verse.content);
+
+      if (isRebase) {
+        // Same verse/version target, content unchanged from what the panel
+        // already synced to — a version-only bump. Rebase the baseline: if
+        // the panel wasn't mid-drag (state === initial, not dirty), carry
+        // `state` along too so it stays not-dirty; if the user kept
+        // aligning after Save, leave `state` untouched so those drags (and
+        // the crash-draft persist effect tracking them) survive. `dirty` is
+        // pure reference identity (`state !== initial`), so either branch
+        // keeps it reporting the truth.
+        if (stateRef.current === initial) setState(computedInitial);
+        setInitial(computedInitial);
+        lastSyncRef.current = { key: targetKey, content: verse.content };
+        return;
+      }
+
       setInitial(computedInitial);
       setState(computedInitial);
       setSelectedUnaligned(new Set());
@@ -330,15 +363,32 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
       setMergeUndo(null);
       setDraggingGroupId(null);
       setRestored(false);
+      lastSyncRef.current = verse != null ? { key: targetKey, content: verse.content } : null;
 
       if (!computedInitial || !verse) return;
-      const key = alignmentDraftKey(book, chapter, verseNum, bibleVersion);
+      // Attempt to restore a crash-saved alignment draft (Fix C — a browser
+      // crash can't be caught by the beforeunload guard, so in-progress
+      // drags are persisted per-change to alignmentDrafts). The reset above
+      // runs synchronously to computedInitial; the draft load is async, so
+      // its setState resolves AFTER and wins — that is deliberate. Three
+      // guards: (1) the draft's version must still match the current base
+      // (otherwise the base changed under it — another tab's save, a
+      // reimport — and applying it would clobber newer content; a
+      // mismatched draft is discarded — this branch only runs on a genuine
+      // content change per the isRebase gate above, so that's the correct
+      // call here); (2) the user must not have started editing in the
+      // async-read window (stateRef still === computedInitial) so a restore
+      // never overwrites a fresh drag; (3) the `cancelled` flag drops a
+      // resolution whose verse changed again. `initial` stays computedInitial
+      // so the restored state reads as dirty (state !== initial) and can be
+      // saved or reset.
+      const draftKey = alignmentDraftKey(book, chapter, verseNum, bibleVersion);
       const baseVersion = verse.version;
       let cancelled = false;
-      void alignmentDrafts.get(key).then((rec) => {
+      void alignmentDrafts.get(draftKey).then((rec) => {
         if (cancelled || !rec) return;
         if (rec.expectedVersion !== baseVersion) {
-          void alignmentDrafts.clear(key);
+          void alignmentDrafts.clear(draftKey);
           return;
         }
         // The user dragged during the async read — keep their edit; the persist

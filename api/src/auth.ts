@@ -111,7 +111,7 @@ async function isViewerOrgMember(
 
 type AppContext = Context<{
   Bindings: Env;
-  Variables: { userId?: number; username?: string; role?: Role };
+  Variables: { userId?: number; username?: string; role?: Role; authVia?: "cookie" | "bearer" };
 }>;
 
 // COLLATE NOCASE on user_roles.dcs_username means the WHERE compare is case-
@@ -160,27 +160,36 @@ export async function verifyToken(token: string, env: Env): Promise<AuthClaims |
 
 // Pulls an Access JWT off the request — first from the Access cookie (the
 // browser flow), falling back to Authorization: Bearer for non-browser
-// callers + the cutover window for any still-cached localStorage tokens.
-// Doesn't reject on missing/invalid token; that's requireAuth's job. Running
-// on every request lets reads become user-aware later without re-plumbing.
+// callers + the cutover window for any still-cached localStorage tokens. A
+// present-but-expired/invalid Access cookie falls through to the Bearer
+// header too, rather than shadowing an otherwise-valid header. Doesn't
+// reject on missing/invalid token; that's requireAuth's job. Running on
+// every request lets reads become user-aware later without re-plumbing.
+//
+// Records which credential actually authenticated the request (`authVia`)
+// so requireCsrf can tell a cookie session (needs the double-submit check)
+// from a Bearer caller (header isn't ambient, so CSRF doesn't apply).
 export const attachAuth: MiddlewareHandler = async (c, next) => {
-  let token: string | undefined;
   const cookieToken = getCookie(c, ACCESS_COOKIE);
+  const header = c.req.header("authorization");
+  const bearerToken =
+    header && header.toLowerCase().startsWith("bearer ") ? header.slice(7).trim() : undefined;
+
+  let claims: AuthClaims | null = null;
+  let authVia: "cookie" | "bearer" | undefined;
   if (cookieToken) {
-    token = cookieToken;
-  } else {
-    const header = c.req.header("authorization");
-    if (header && header.toLowerCase().startsWith("bearer ")) {
-      token = header.slice(7).trim();
-    }
+    claims = await verifyToken(cookieToken, c.env as Env);
+    if (claims) authVia = "cookie";
   }
-  if (token) {
-    const claims = await verifyToken(token, c.env as Env);
-    if (claims) {
-      (c as AppContext).set("userId", claims.userId);
-      if (claims.username) (c as AppContext).set("username", claims.username);
-      if (claims.role) (c as AppContext).set("role", claims.role);
-    }
+  if (!claims && bearerToken) {
+    claims = await verifyToken(bearerToken, c.env as Env);
+    if (claims) authVia = "bearer";
+  }
+  if (claims) {
+    (c as AppContext).set("userId", claims.userId);
+    if (claims.username) (c as AppContext).set("username", claims.username);
+    if (claims.role) (c as AppContext).set("role", claims.role);
+    (c as AppContext).set("authVia", authVia);
   }
   await next();
 };
@@ -210,6 +219,16 @@ export const requireCsrf: MiddlewareHandler = async (c, next) => {
     return next();
   }
   if (CSRF_EXEMPT_PATHS.has(c.req.path)) {
+    return next();
+  }
+  // Authorization: Bearer isn't ambient the way cookies are — a cross-origin
+  // page can get the browser to auto-attach a cookie to a forged request,
+  // but it can't make the browser attach an arbitrary header. So a request
+  // that authenticated via the Bearer header (attachAuth records this in
+  // authVia) doesn't need the double-submit cookie/header check; requiring
+  // it made the documented Bearer fallback unable to write at all, since
+  // Bearer callers have no be_csrf cookie to mirror.
+  if ((c as AppContext).get("authVia") === "bearer") {
     return next();
   }
   const cookieValue = getCookie(c, CSRF_COOKIE);

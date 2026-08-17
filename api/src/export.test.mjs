@@ -7,6 +7,7 @@
 
 import { attributeTsvShrink, buildAlignmentShrinkAlertMessage, buildUsfmInvalidAlertMessage, classifyAlignmentLossSeverity, offenderProvenanceFromLog, buildExportBranch, buildTnTsv, buildTqTsv, buildTwlTsv, buildUsfm, classifyAlignmentShrinkOffenders, classifyRevertSeverity, commitToDcs, countDuplicateMasterIds, describeShrinkRefusal, ensureDcsPr, exportTags, exportTsvShrinkRefused, findDcsOpenPr, isMasterConfirmed, mechanicalOverwriteAlert, parseTsvIds, recreateExportBranchFromMaster, shouldRecordRevertReport, tsvRevertReport, updateDcsPrBranch, usfmAlignmentShrinkRefused, usfmRevertReport } from "./export.ts";
 import { CorruptContentJsonError } from "./contentJson.ts";
+import { extractVersesForRange } from "./importParsers.ts";
 import { validateUsfm } from "./usfmValidate.ts";
 
 function assert(cond, msg) {
@@ -209,6 +210,72 @@ function utf8Base64(s) {
   const noMilestone = [w("plain")];
   const outNone = buildUsfm({ book: "MIC", bibleVersion: "ULT", headers: null, verses: [verseRow("ULT", noMilestone)] });
   assert(!outNone.includes("x-lemma"), `non-milestone node gets no x-lemma attribute`);
+}
+
+// --- export never writes a fake \x cross-reference built from `\w` attribute
+// residue (issue #481: four invalid \x markers reached en_ust/24-JER.usfm) ---
+{
+  // The exact malformed master line (JER 30:3): the attribute section after the
+  // `|` starts with a spurious backslash, and the trailing `.”` is trapped
+  // inside the word. usfm-js reads that `\x` as a marker opener, so before the
+  // fix the attribute residue left the word as a junk `{tag:"x"}` node and
+  // export rendered it as a REAL `\x -occurrence="1" x-occurrences="1"\x*`.
+  const malformed =
+    '\\id JER\n\\c 30\n\\p\n\\v 3 \\zaln-s |x-strong="H3063" x-lemma="l" x-morph="He" ' +
+    'x-occurrence="1" x-occurrences="1" x-content="Judah"\\*' +
+    '\\w Judah.”|\\x-occurrence="1" x-occurrences="1"\\w*\\zaln-e\\*\n';
+
+  const ingested = extractVersesForRange(malformed, 30, 30).find((v) => v.verse === 3);
+  const out = buildUsfm({
+    book: "JER",
+    bibleVersion: "UST",
+    headers: null,
+    verses: [{
+      book: "JER", chapter: 30, verse: 3, verse_end: null, bible_version: "UST",
+      content_json: ingested.contentJson, plain_text: ingested.plainText,
+      version: 1, updated_by: null, updated_at: 0,
+    }],
+  });
+  assert(!/\\x[ *]/.test(out), `no \\x cross-reference marker in the exported USFM (got ${JSON.stringify(out.split("\n").find((l) => l.startsWith("\\v 3")))})`);
+  assert(out.includes('\\w Judah|x-occurrence="1" x-occurrences="1"\\w*.”'), `word/punctuation split still happens: \\w Judah\\w* then .” outside`);
+  assert(out.includes("\\zaln-e\\*"), `the enclosing alignment milestone survives`);
+
+  // Second line of defence: a row ALREADY stored in D1 from a pre-fix ingest
+  // still carries the junk node. Export must drop it, not re-emit it.
+  const stale = {
+    book: "JER", chapter: 30, verse: 10, verse_end: null, bible_version: "UST",
+    content_json: JSON.stringify({
+      verseObjects: [{
+        type: "milestone", tag: "zaln", strong: "H3063", lemma: "l", morph: "He",
+        occurrence: "1", occurrences: "1", content: "Judah",
+        children: [
+          { type: "word", tag: "w", text: "Judah" },
+          { type: "text", text: ".”" },
+          { tag: "x", content: '-occurrence="1" x-occurrences="1"', nesting: 1 },
+        ],
+        endTag: "zaln-e\\*",
+      }],
+    }),
+    plain_text: "Judah.”", version: 1, updated_by: null, updated_at: 0,
+  };
+  const staleOut = buildUsfm({ book: "JER", bibleVersion: "UST", headers: null, verses: [stale] });
+  assert(!/\\x[ *]/.test(staleOut), `stored attribute residue is dropped, not exported as \\x`);
+  assert(staleOut.includes("\\w Judah|"), `the word itself survives the residue drop`);
+  assert(staleOut.includes(".”"), `the punctuation text node survives the residue drop`);
+
+  // A REAL cross-reference is prose with its own inner markers — never dropped.
+  const realXref = {
+    book: "JER", chapter: 30, verse: 11, verse_end: null, bible_version: "UST",
+    content_json: JSON.stringify({
+      verseObjects: [
+        { type: "word", tag: "w", text: "word", occurrence: "1", occurrences: "1" },
+        { tag: "x", content: "+ \\xo 30:11 \\xt Isa 2:2", nesting: 1, endTag: "x*" },
+      ],
+    }),
+    plain_text: "word", version: 1, updated_by: null, updated_at: 0,
+  };
+  const xrefOut = buildUsfm({ book: "JER", bibleVersion: "UST", headers: null, verses: [realXref] });
+  assert(xrefOut.includes("\\xt Isa 2:2"), `a genuine \\x cross-reference is preserved`);
 }
 
 // --- tsvCell escapes bare \r (and \r\n) instead of leaking it into the TSV ---
@@ -1348,6 +1415,36 @@ function utf8Base64(s) {
     /truncated-load signature/.test(attributed.signature) && /20 of the 62/.test(attributed.signature),
     `attribution refusal: reports the unexplained/missing split`,
   );
+
+  // ADDITIONS PRESENT (the routine case): master 430 rows, render 400 rows,
+  // and the render carries 40 NEW ids master doesn't have — so the ID-set
+  // measurement is missing = |master IDs ∉ render| = 70 (30 tombstoned +
+  // 40 unexplained), while the row-COUNT delta `lost` is only 30. The old
+  // wording used `lost` as the denominator and read "40 of the 30 missing
+  // rows" — impossible arithmetic that discredits the alert. The denominator
+  // must be explained + unexplained (70), and the additions deserve a mention.
+  const withAdditions = describeShrinkRefusal("shrink_30_of_430_unexplained_40", {
+    renderedRows: 400,
+    masterRows: 430,
+    explained: 30,
+    unexplained: 40,
+  });
+  assert(
+    /40 of the 70 missing rows/.test(withAdditions.signature),
+    `additions present: denominator is explained+unexplained (70), not the count delta (got: ${withAdditions.signature})`,
+  );
+  assert(
+    !/40 of the 30/.test(withAdditions.signature),
+    `additions present: never states impossible arithmetic ("40 of the 30")`,
+  );
+  assert(
+    /30 of the 70 were human deletions/.test(withAdditions.signature),
+    `additions present: explainedNote uses the same denominator`,
+  );
+  assert(
+    /adds 40 new row/.test(withAdditions.signature),
+    `additions present: mentions the 40 rows the render adds (got: ${withAdditions.signature})`,
+  );
 }
 
 // --- usfmAlignmentShrinkRefused: ULT/UST verse alignment backstop ---
@@ -1485,6 +1582,23 @@ function utf8Base64(s) {
   // master actually having aligned verses.
   const r8freshboth = usfmAlignmentShrinkRefused("", "");
   assert(r8freshboth.refused === false, `empty render + empty master never refuses`);
+
+  // (8c) Master fetched but UNPARSEABLE (usfm.toJSON throws — reachable today
+  // only via non-string input, but the trap must stay closed). The ship
+  // decision stays refused:false (loss unprovable), but the result must carry
+  // masterUnparseable so the workflow maps it to its own detail
+  // ("master_unparseable") instead of "ok" — detail:"ok" is what authorizes
+  // clearAlignmentAttention, and an absent measurement must never erase prior
+  // evidence (STATE.md class: alignment_attention replace-all snapshot).
+  const r8masterNull = usfmAlignmentShrinkRefused(master, null);
+  assert(r8masterNull.refused === false, `unparseable master: ship decision stays refused:false`);
+  assert(
+    r8masterNull.masterUnparseable === true,
+    `unparseable master: flagged masterUnparseable so it can never map to detail:"ok"`,
+  );
+  // A normally-compared clean run must NOT carry the flag — that is the only
+  // path allowed to clear alignment_attention.
+  assert(r2.masterUnparseable === undefined, `a real clean comparison carries no masterUnparseable flag`);
 
   // (9) `sequenceUnchanged` per-offender flag — distinguishes true collateral
   // de-alignment on untouched text (JER 36:11 shape: same word sequence, one

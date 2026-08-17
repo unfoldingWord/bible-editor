@@ -46,7 +46,7 @@ import {
 } from "../lib/laneChecks";
 import { ChapterBoard } from "./ChapterBoard";
 import { BookLocksDialog } from "./BookLocksDialog";
-import { drafts, verseKey } from "../sync/drafts";
+import { drafts, verseKey, pinVerseBase } from "../sync/drafts";
 import { generationForSavedPlain } from "../sync/draftSaveState";
 import { smartEditVerse } from "../lib/replace";
 import { extractEditableText, extractPlainText, normalizeEditable, SECTION_HEADER_TAGS } from "../lib/usfm";
@@ -58,6 +58,7 @@ import {
   type AlignmentIntent,
 } from "../lib/alignmentDelta";
 import { buildVerseIndex, concatSourceRange, formatVerseLabel, noteCoveredVerses } from "../lib/verseRange";
+import { runSaveChain } from "../lib/saveChain";
 import { buildTnQuickRequest } from "../lib/tnQuickRequest";
 import { findSourceForTargetText, extractTargetSelectionText, type HighlightKey, type ReorderHighlight } from "../lib/highlight";
 import { buildQuoteFromSelection, selectionFromQuote } from "../lib/quoteBuilder";
@@ -2201,22 +2202,56 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         action?.run();
         return;
       }
-      // Save. Reading-line edits are plain text — synchronous, no unalign confirm.
-      if (dualLeftReadingDirty) dualLeftReadingRef.current?.save();
-      if (dualRightReadingDirty) dualRightReadingRef.current?.save();
-      // Each alignment panel may defer behind the unalign confirm, so CHAIN them:
-      // run the close/nav only after both have actually committed. Chaining (vs.
-      // firing both saves up front) also guarantees at most one unalign confirm is
-      // open at a time — the right panel's confirm opens only after the left one
-      // resolves — so a second setPendingAlignmentLoss can't clobber the first
-      // pending commit. A cancel anywhere in the chain stops the close entirely.
-      const finish = () => action?.run();
-      const saveRight = () => {
-        if (dualRightDirty && dualRightRef.current) dualRightRef.current.save(finish);
-        else finish();
-      };
-      if (dualLeftDirty && dualLeftRef.current) dualLeftRef.current.save(saveRight);
-      else saveRight();
+      // Save. A reading-line edit is NOT unconditionally synchronous — it can
+      // trip the collateral-loss guard (Shell's guardBlocksSave, via
+      // saveVerseDraft → enqueueVerseSafely) and defer behind the "Words will
+      // be unaligned" confirm exactly like an alignment panel's unalign
+      // confirm. So CHAIN every dirty side (both reading lines, then both
+      // alignment panels): run the close/nav only once each has actually
+      // committed. Chaining (vs. firing them all up front) also guarantees at
+      // most one confirm is open at a time — each step's confirm opens only
+      // after the previous step resolves — so a later setPendingAlignmentLoss
+      // can't clobber an earlier pending commit. A Cancel anywhere in the
+      // chain stalls it — `finish` (and thus the close) never runs — which is
+      // the fix for #490 (the dialog used to close, unmounting the reading
+      // line, while its confirm was still pending).
+      runSaveChain(
+        [
+          {
+            dirty: dualLeftReadingDirty,
+            save: (afterCommit) => {
+              const ref = dualLeftReadingRef.current;
+              if (ref) ref.save(afterCommit);
+              else afterCommit();
+            },
+          },
+          {
+            dirty: dualRightReadingDirty,
+            save: (afterCommit) => {
+              const ref = dualRightReadingRef.current;
+              if (ref) ref.save(afterCommit);
+              else afterCommit();
+            },
+          },
+          {
+            dirty: dualLeftDirty,
+            save: (afterCommit) => {
+              const ref = dualLeftRef.current;
+              if (ref) ref.save(afterCommit);
+              else afterCommit();
+            },
+          },
+          {
+            dirty: dualRightDirty,
+            save: (afterCommit) => {
+              const ref = dualRightRef.current;
+              if (ref) ref.save(afterCommit);
+              else afterCommit();
+            },
+          },
+        ],
+        () => action?.run(),
+      );
     },
     [pendingDualAction, dualLeftDirty, dualRightDirty, dualLeftReadingDirty, dualRightReadingDirty],
   );
@@ -2632,10 +2667,16 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     plain: string,
     base: VerseDto,
   ) => {
+    const key = verseKey(book, chapterNum, verseNum, bibleVersion);
+    // Pin the diff/save baseline to whatever `base` this edit session's FIRST
+    // keystroke saw. A version bump that lands mid-edit (WS verse.updated,
+    // nightly reconcile) must not rebase later keystrokes onto content the
+    // user never saw — see pinVerseBase's comment and issue #474.
+    const pinned = pinVerseBase(key, base);
     void drafts.set(
-      verseKey(book, chapterNum, verseNum, bibleVersion),
+      key,
       { plainText: plain },
-      base.version,
+      pinned.version,
       { kind: "verse", book, chapter: chapterNum, verse: verseNum, bibleVersion },
     );
   };
@@ -2650,14 +2691,38 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // base content produces the matching baseline for the diff. The DB
   // `plain_text` column stays marker-free, so we recompute it from the
   // resulting tree via extractPlainText.
+  //
+  // `afterCommit` mirrors AlignmentPanelHandle.save (#490): this save is NOT
+  // unconditionally synchronous — enqueueVerseSafely can trip the
+  // collateral-loss guard and defer behind the "Words will be unaligned"
+  // confirm. `afterCommit` runs once the save actually lands — immediately
+  // on the no-op / clean-save paths below, or after "Save anyway" — and
+  // never if the user cancels the confirm. A caller that closes/unmounts the
+  // editor after saving (e.g. the dual aligner's reading line) MUST pass its
+  // continuation here rather than proceeding right after calling this.
   const saveVerseDraft = (
     chapterNum: number,
     verseNum: number,
     bibleVersion: string,
     plain: string,
     base: VerseDto,
+    afterCommit?: () => void,
   ) => {
-    const oldEditable = extractEditableText(base.content);
+    const key = verseKey(book, chapterNum, verseNum, bibleVersion);
+    // Diff and save against the SAME baseline this edit session's first
+    // keystroke pinned — never the live `base` this call happened to receive.
+    // `base` is recomputed from the chapter cache on every render, so a WS
+    // verse.updated (another tab's edit, or the nightly reconcile) that lands
+    // mid-edit would otherwise rebase the diff onto content the user never
+    // saw: their still-in-DOM stale text would read as "added back" against
+    // the new baseline, and get saved under ITS (valid) version — a
+    // stale-content/fresh-version save that can silently resurrect deleted
+    // text. Pinning both content and version together, and sending the
+    // pinned version as expected_version, means a real intervening change
+    // now surfaces as an ordinary 409 merge conflict instead. See #474.
+    const pinned = pinVerseBase(key, base);
+    const effectiveBase = { ...base, version: pinned.version, content: pinned.content } as VerseDto;
+    const oldEditable = extractEditableText(effectiveBase.content);
     // No-op guard: a focus/blur (or any save) with no actual text change must
     // not enqueue a PATCH — it would bump the verse version server-side for
     // nothing, adding noisy history and leaving a stale expected_version that a
@@ -2672,7 +2737,6 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     // leaves an orphaned draft (dirty border + SyncStatusBar entry + "unsaved
     // edits" toast whose Save button re-hits this guard and never resolves).
     if (oldEditable === normalizeEditable(plain)) {
-      const key = verseKey(book, chapterNum, verseNum, bibleVersion);
       void drafts
         .get(key)
         .then((draft) => {
@@ -2682,9 +2746,10 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         .catch(() => {
           /* conservative: leave an unreadable draft in place */
         });
+      afterCommit?.();
       return;
     }
-    const result = smartEditVerse(base.content, oldEditable, plain);
+    const result = smartEditVerse(effectiveBase.content, oldEditable, plain);
     // Heads-up when this save drops alignment. Editing a word's text or order
     // unaligns that word by design — the engine preserves only the words it
     // didn't have to touch — and the loss is otherwise easy to miss: the editor
@@ -2696,7 +2761,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     // INCREASED, so a pure punctuation / spacing edit — which keeps every \zaln —
     // stays silent.
     const beforeUnaligned = countUnalignedTargetWords(
-      (base.content as { verseObjects?: unknown[] } | null)?.verseObjects,
+      (effectiveBase.content as { verseObjects?: unknown[] } | null)?.verseObjects,
     );
     const afterUnaligned = countUnalignedTargetWords(
       (result.content as { verseObjects?: unknown[] } | null)?.verseObjects,
@@ -2710,7 +2775,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     }
     const newPlainText = extractPlainText(result.content);
     const newDto = {
-      ...base,
+      ...effectiveBase,
       chapter: chapterNum,
       verse: verseNum,
       bible_version: bibleVersion,
@@ -2721,16 +2786,24 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       bookHook?.applyLocalVerse(newDto);
       if (chapterNum === chapter) applyLocalVerse(newDto);
     };
-    const key = verseKey(book, chapterNum, verseNum, bibleVersion);
     // Resolve the durable draft before queueing so the outbox records the exact
     // generation represented by `plain`. If the user typed again after clicking
     // Save, generationForSavedPlain refuses to associate that newer draft with
     // this older payload, so the eventual 200 cannot clear the new work.
     const enqueueCapturedSave = (draftGeneration?: string) => {
-      if (!enqueueVerseSafely(chapterNum, verseNum, bibleVersion, base, result.content, newPlainText, "text_edit", base.version, applyLocal, draftGeneration)) {
+      // onConfirmedApply (5th positional) fires from the collateral-loss
+      // confirm's "Save anyway" when the guard defers this save — it must
+      // also run afterCommit, since that path never reaches the `applyLocal();
+      // afterCommit?.();` below.
+      const onConfirmedApply = () => {
+        applyLocal();
+        afterCommit?.();
+      };
+      if (!enqueueVerseSafely(chapterNum, verseNum, bibleVersion, effectiveBase, result.content, newPlainText, "text_edit", effectiveBase.version, onConfirmedApply, draftGeneration)) {
         return;
       }
       applyLocal();
+      afterCommit?.();
     };
     void drafts
       .get(key)
@@ -3598,10 +3671,14 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           right={dualAlignerProps.right}
           onPrevVerse={dualNav.prev != null ? () => dualNavTo(dualNav.prev!) : undefined}
           onNextVerse={dualNav.next != null ? () => dualNavTo(dualNav.next!) : undefined}
-          onSaveReading={(bv, plain, base) =>
+          onSaveReading={(bv, plain, base, afterCommit) =>
             // base.verse, not verseNum — each side's row may start at a
             // different verse (ULT v7 singleton vs UST 6-9 range row).
-            saveVerseDraft(dualAlignerProps.chapter, base.verse, bv, plain, base)
+            // afterCommit threads through so ReadingLineHandle.save (and thus
+            // the resolveDualAction save chain, #490) only proceeds once this
+            // actually lands — synchronously, or after the collateral-loss
+            // confirm's "Save anyway".
+            saveVerseDraft(dualAlignerProps.chapter, base.verse, bv, plain, base, afterCommit)
           }
         />
       )}

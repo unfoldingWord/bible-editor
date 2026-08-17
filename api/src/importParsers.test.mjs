@@ -25,6 +25,7 @@ import {
   normalizeNoteWhitespace,
   findSuspiciousDoubleSpaces,
   sanitizeMarkerSpacing,
+  sanitizeWordAttributes,
   dropDuplicateSourceMilestones,
   joinSplitSourceMilestones,
   curlifyVerseObjects,
@@ -1044,6 +1045,67 @@ const zalnMs = (attrs, targetText) => ({
   assert(sanitizeMarkerSpacing("\\qm1word") === "\\qm1 word", `\\qm1word → "\\qm1 word"`);
 }
 
+// --- sanitizeWordAttributes: a stray `\` in a \w attribute section (#481) ---
+// The exact malformed line from en_ust/24-JER.usfm master (JER 30:3). Without
+// the repair, usfm-js reads the `\x` after the `|` as a MARKER OPENER, so the
+// attribute section leaves the word as a junk `{tag:"x"}` node — which the
+// nightly export then wrote back to master as a real `\x … \x*` cross-reference.
+{
+  const malformed =
+    '\\id JER\n\\c 30\n\\p\n\\v 3 \\zaln-s |x-strong="H3063" x-lemma="l" x-morph="He" ' +
+    'x-occurrence="1" x-occurrences="1" x-content="Judah"\\*' +
+    '\\w Judah.”|\\x-occurrence="1" x-occurrences="1"\\w*\\zaln-e\\*\n';
+
+  // Baseline: prove the hazard is real in usfm-js (this is what we're fixing).
+  const badChildren = usfm.toJSON(malformed).chapters["30"]["3"].verseObjects[0].children;
+  const junk = badChildren.find((n) => n.tag === "x");
+  assert(!!junk, `usfm-js turns the stray backslash into a junk \\x node (the hazard)`);
+  assert(junk.content === '-occurrence="1" x-occurrences="1"', `junk node carries the attribute residue as content`);
+
+  // Repaired: the attributes land on the word, and no \x node is created.
+  const repaired = sanitizeWordAttributes(malformed);
+  assert(
+    repaired.includes('\\w Judah.”|x-occurrence="1" x-occurrences="1"\\w*'),
+    `stray backslash stripped from the attribute section (got ${JSON.stringify(repaired.split("\n")[3])})`,
+  );
+  const goodChildren = usfm.toJSON(repaired).chapters["30"]["3"].verseObjects[0].children;
+  assert(!goodChildren.some((n) => n.tag === "x"), `no junk \\x node after the repair`);
+  const word = goodChildren.find((n) => n.tag === "w");
+  assert(word?.occurrence === "1" && word?.occurrences === "1", `the word keeps its real occurrence attributes`);
+
+  // The shared import chokepoint applies it: no \x anywhere in the stored row,
+  // and the trapped punctuation still splits out of the word as plain text.
+  const v3 = extractVersesForRange(malformed, 30, 30).find((v) => v.verse === 3);
+  const stored = JSON.parse(v3.contentJson);
+  const kids = stored.verseObjects[0].children;
+  assert(!/"tag"\s*:\s*"x"/.test(v3.contentJson), `stored content_json holds no \\x node`);
+  assert(kids.some((n) => n.tag === "w" && n.text === "Judah"), `\\w Judah survives as a word`);
+  assert(kids.some((n) => n.type === "text" && n.text === ".”"), `trailing .” splits out as plain text`);
+}
+{
+  // Identity / safety: valid attribute sections and neighbouring markers are
+  // never touched, and the repair cannot reach outside one word marker.
+  const clean = '\\w Judah|x-occurrence="1" x-occurrences="1"\\w*';
+  assert(sanitizeWordAttributes(clean) === clean, `a clean \\w attribute section is unchanged`);
+  const noAttrs = "\\w Judah\\w*";
+  assert(sanitizeWordAttributes(noAttrs) === noAttrs, `a \\w with no attribute section is unchanged`);
+  const milestone = '\\zaln-s |x-strong="H3063"\\*\\w a\\w*\\zaln-e\\*';
+  assert(sanitizeWordAttributes(milestone) === milestone, `\\zaln-s / \\zaln-e milestones are unchanged`);
+  const xref = "\\w word\\w* \\x + \\xo 1:1 \\xt Isa 2:2\\x*";
+  assert(sanitizeWordAttributes(xref) === xref, `a REAL \\x cross-reference outside a word is unchanged`);
+  // Two words on one line: only the malformed one is repaired, and the repair
+  // stops at that word's own `\w*` rather than swallowing the next word.
+  const twoWords =
+    '\\w one|\\x-occurrence="1"\\w* \\w two|x-occurrence="1"\\w*';
+  assert(
+    sanitizeWordAttributes(twoWords) === '\\w one|x-occurrence="1"\\w* \\w two|x-occurrence="1"\\w*',
+    `only the malformed word is repaired (got ${JSON.stringify(sanitizeWordAttributes(twoWords))})`,
+  );
+  // An unterminated `\w` must not let the repair run onto a later line.
+  const unterminated = '\\w one|\\x-occurrence="1"\n\\w two|x-occurrence="1"\\w*';
+  assert(sanitizeWordAttributes(unterminated) === unterminated, `repair never crosses a line break`);
+}
+
 // --- TSV: leading UTF-8 BOM must not corrupt the header row ---
 // Regression: without the BOM strip, headers[0] becomes "﻿ID", so every
 // r["ID"] lookup is undefined and the entire import is silently skipped (0
@@ -1555,6 +1617,25 @@ function countNodes(nodes) {
   assert(curlifyText("") === "", "curlifyText: no-op on empty string");
   assert(curlifyText('say "hi" now') === "say “hi” now", `curlifyText: curls a simple quoted phrase (got ${JSON.stringify(curlifyText('say "hi" now'))})`);
   assert(curlifyText("LORD's house") === "LORD’s house", `curlifyText: curls a possessive apostrophe (got ${JSON.stringify(curlifyText("LORD's house"))})`);
+
+  // The two-char literal `\n` escape (unfoldingWord's TSV line-break
+  // convention in note/question/response prose) is an OPENING context.
+  // Regression: isOpeningQuoteContext only looked one character back, saw the
+  // "n", and curled the quote closing (”/’).
+  assert(
+    curlifyText('He said:\\n"Go to the land."') === "He said:\\n“Go to the land.”",
+    `curlifyText: double quote after a literal \\n escape opens (got ${JSON.stringify(curlifyText('He said:\\n"Go to the land."'))})`,
+  );
+  assert(
+    curlifyText("He said:\\n'Go to the land.'") === "He said:\\n‘Go to the land.’",
+    `curlifyText: single quote after a literal \\n escape opens (got ${JSON.stringify(curlifyText("He said:\\n'Go to the land.'"))})`,
+  );
+  // Guard against over-reach: a word merely ending in "n" (no backslash before
+  // it) must still read as a closing context.
+  assert(
+    curlifyText('the "land in" question') === "the “land in” question",
+    `curlifyText: a plain trailing n is still a closing context (got ${JSON.stringify(curlifyText('the "land in" question'))})`,
+  );
 }
 
 // ─── extractPlainText (exported for pipelineImport.ts's plain_text re-derive) ─

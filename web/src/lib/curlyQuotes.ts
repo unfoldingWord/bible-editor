@@ -24,17 +24,33 @@ function curlyFor(ch: '"' | "'", prev: string | undefined): string {
   return isOpeningContext(prev) ? LSQUO : RSQUO;
 }
 
-export function curlifyString(s: string): string {
+// `prevContext` (optional) is the character immediately before the insertion
+// point in the surrounding document — it decides the curl direction of a quote
+// at position 0 without ever becoming part of the output.
+export function curlifyString(s: string, prevContext?: string): string {
   let out = "";
   for (let i = 0; i < s.length; i++) {
     const ch = s[i];
     if (ch === '"' || ch === "'") {
-      out += curlyFor(ch as '"' | "'", out[out.length - 1]);
+      out += curlyFor(ch as '"' | "'", out.length > 0 ? out[out.length - 1] : prevContext);
     } else {
       out += ch;
     }
   }
   return out.replace(/\.\.\.+/g, ELLIPSIS);
+}
+
+// What handlePaste inserts at the caret: the pasted text curlified, with the
+// FIRST char's quote direction decided by the character before the caret
+// (`prev`). Exported for tests.
+//
+// `prev` is passed as CONTEXT, never prepended into the curlified string: the
+// old prepend-then-slice approach let curlifyString's `...` → "…" collapse
+// merge the seed char into an ellipsis (prev "." + pasted "..." became "…",
+// and slicing off "the seed" deleted the ellipsis instead), so pasting "..."
+// after a period inserted nothing and "...abc" lost its ellipsis.
+export function curlifyPaste(text: string, prev: string | undefined): string {
+  return curlifyString(text, prev);
 }
 
 function isTextInput(el: EventTarget | null): el is HTMLInputElement {
@@ -137,7 +153,7 @@ function handlePaste(e: ClipboardEvent) {
     const start = target.selectionStart ?? target.value.length;
     const end = target.selectionEnd ?? start;
     const prev = start > 0 ? target.value[start - 1] : undefined;
-    const seeded = curlifyString((prev ?? "") + text).slice(prev ? 1 : 0);
+    const seeded = curlifyPaste(text, prev);
     e.preventDefault();
     setNativeValue(target, target.value.slice(0, start) + seeded + target.value.slice(end));
     const caret = start + seeded.length;
@@ -154,7 +170,7 @@ function handlePaste(e: ClipboardEvent) {
         prev = (r.startContainer as Text).data[r.startOffset - 1];
       }
     }
-    const seeded = curlifyString((prev ?? "") + text).slice(prev ? 1 : 0);
+    const seeded = curlifyPaste(text, prev);
     e.preventDefault();
     document.execCommand("insertText", false, seeded);
   }

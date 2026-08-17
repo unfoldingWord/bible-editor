@@ -73,7 +73,7 @@ import { loadTwTitles } from "./twTitles";
 import { loadTwlOrderLocks } from "./twlOrderLocks";
 import { runPostExport, VALIDATORS } from "./postExport";
 import { runChunkedReimport, storedResourceSha, ALL_RESOURCES as REIMPORT_RESOURCES } from "./bookReimport";
-import { dcsRawUrl, dcsResourceFile, fetchText, fileCommitSha, type ReimportResource } from "./dcsSources";
+import { dcsResourceFile, fetchDcsMasterText, fileCommitSha, type ReimportResource } from "./dcsSources";
 import { gitBlobSha } from "./ownPublish";
 import type { TnRow, TqRow, TwlRow, VerseRow } from "./types";
 import { lintUsfmVerses } from "./lint";
@@ -1519,9 +1519,14 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
 
   // Fetch master's current TSV row count and decide whether this render would
   // shrink it dangerously (see export.ts exportTsvShrinkRefused). Fail closed
-  // when master can't be read — a truncated master fetch now returns null from
-  // fetchText too, so "unreadable" rightly blocks rather than letting an
-  // unverified commit through.
+  // when master can't be read — a truncated master fetch now returns null,
+  // verified independently of Content-Length (fetchDcsMasterText cross-checks
+  // against the Gitea contents API's own size for the file; see issue #494 —
+  // relying on Content-Length alone left a no-Content-Length truncated fetch
+  // reading as a legitimately smaller master, which a D1 partial from the
+  // SAME correlated truncation could then wave through as "no shrink"), so
+  // "unreadable" rightly blocks rather than letting an unverified commit
+  // through.
   private async checkTsvShrink(
     book: string,
     resource: Resource,
@@ -1541,7 +1546,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
   }> {
     const file = dcsResourceFile(book, resource as ReimportResource);
     if (!file) return { ok: true, detail: "no_file", masterRows: null, masterContent: null };
-    const raw = await fetchText(dcsRawUrl(this.env, file.repo, file.path));
+    const raw = await fetchDcsMasterText(this.env, file.repo, file.path);
     if (raw == null) return { ok: false, detail: "master_unreadable", masterRows: null, masterContent: null };
     // Data rows = non-empty lines minus the header (mirrors parseTsv's model).
     const masterRows = Math.max(0, raw.split(/\r?\n/).filter((l) => l.length > 0).length - 1);
@@ -1699,8 +1704,10 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
   // Fetch master's current USFM and decide whether this ULT/UST render would
   // silently drop \zaln word alignment (the 1CH 4:21 / NUM 24 signature; see
   // export.ts usfmAlignmentShrinkRefused). Fail closed when master can't be
-  // read — a truncated master fetch returns null from fetchText, and an
-  // unverifiable master must block rather than let an unchecked render through.
+  // read — a truncated master fetch returns null, verified independently of
+  // Content-Length the same way checkTsvShrink's fetch is (see issue #494 and
+  // fetchDcsMasterText in dcsSources.ts), and an unverifiable master must
+  // block rather than let an unchecked render through.
   private async checkUsfmAlignmentShrink(
     book: string,
     resource: Resource,
@@ -1717,7 +1724,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
   }> {
     const file = dcsResourceFile(book, resource as ReimportResource);
     if (!file) return { ok: true, detail: "no_file", masterContent: null };
-    const masterUsfm = await fetchText(dcsRawUrl(this.env, file.repo, file.path));
+    const masterUsfm = await fetchDcsMasterText(this.env, file.repo, file.path);
     if (masterUsfm == null) return { ok: false, detail: "master_unreadable", masterContent: null };
     const result = usfmAlignmentShrinkRefused(renderedUsfm, masterUsfm);
     if (result.refused) {
@@ -1736,6 +1743,14 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
         offenders: result.offenders,
         masterContent: masterUsfm,
       };
+    }
+    // Master fetched but did not parse: nothing was compared, so this must
+    // not surface as detail:"ok" — that detail is what authorizes
+    // clearAlignmentAttention, and an absent measurement must never erase
+    // prior evidence (STATE.md). Ship decision unchanged (ok:true, as
+    // designed for an unprovable loss); only the "measured clean" claim goes.
+    if (result.masterUnparseable) {
+      return { ok: true, detail: "master_unparseable", masterContent: masterUsfm };
     }
     return { ok: true, detail: "ok", masterContent: masterUsfm };
   }

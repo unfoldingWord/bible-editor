@@ -1187,6 +1187,8 @@ export function ResourceColumn({
               : undefined
           }
           onGripDragStart={() => setDragId(r.id)}
+          prevNoteId={prevNote?.id ?? null}
+          nextNoteId={nextNote?.id ?? null}
           onMoveUp={
             prevNote
               ? () => {

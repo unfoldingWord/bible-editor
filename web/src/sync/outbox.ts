@@ -579,7 +579,21 @@ export const outbox = {
 // ---------- drain ----------
 
 let draining = false;
+// Set when drain() is called while a drain is already active — mirrors
+// notify()'s notifyPendingRerun. An enqueue whose IDB put commits after the
+// running pass's final listAll() snapshot, and whose drain() call lands
+// before `draining` flips false, is neither seen by that pass nor able to
+// start a new one; without this flag the op sits pending until an unrelated
+// trigger (focus/online/next enqueue). The active drain consumes the flag by
+// re-running drainPass before it finishes.
+let drainRequested = false;
 let drainTimer: ReturnType<typeof setTimeout> | null = null;
+// Wall-clock deadline of the pending drainTimer, 0 when none. scheduleDrain
+// only replaces the timer when the new deadline is EARLIER — with a single
+// shared timer, a long reschedule (young in-flight recovery, up to the 60s
+// recovery age) would otherwise clobber a short due retry (~250ms backoff)
+// and an op due in 250ms could wait the full recovery age.
+let drainTimerAt = 0;
 
 type Result =
   | { kind: "ok"; updated: unknown }
@@ -990,7 +1004,13 @@ async function drainPass() {
 }
 
 export async function drain() {
-  if (draining) return;
+  if (draining) {
+    // A pass is active. Request a re-run instead of dropping the wakeup —
+    // the running pass's final listAll() may already have resolved, so the
+    // op that prompted this call could be invisible to it.
+    drainRequested = true;
+    return;
+  }
   draining = true;
   try {
     // Cross-tab mutual exclusion. Two tabs share one IndexedDB store; both
@@ -1004,6 +1024,12 @@ export async function drain() {
         async (lock) => {
           if (!lock) return false;
           await drainPass();
+          // Consume queued wakeups while the lock is still held, so the
+          // re-pass keeps the cross-tab exclusion drainPass relies on.
+          while (drainRequested) {
+            drainRequested = false;
+            await drainPass();
+          }
           return true;
         },
       );
@@ -1011,17 +1037,37 @@ export async function drain() {
     } else {
       // No Web Locks (very old browser) — fall back to single-tab behavior.
       await drainPass();
+      while (drainRequested) {
+        drainRequested = false;
+        await drainPass();
+      }
     }
   } finally {
     draining = false;
     void notify();
+    // A wakeup can still land in the awaits between the re-pass loop above
+    // and this line (lock release, promise resolution). `draining` is false
+    // again now, so a fresh drain() re-acquires the lock and handles it.
+    if (drainRequested) {
+      drainRequested = false;
+      void drain();
+    }
   }
 }
 
 function scheduleDrain(ms: number) {
-  if (drainTimer) clearTimeout(drainTimer);
+  const at = Date.now() + ms;
+  if (drainTimer) {
+    // Keep the pending timer when it fires no later than the new request —
+    // clearing it unconditionally let a longer reschedule silently push out
+    // an already-due retry (see drainTimerAt).
+    if (at >= drainTimerAt) return;
+    clearTimeout(drainTimer);
+  }
+  drainTimerAt = at;
   drainTimer = setTimeout(() => {
     drainTimer = null;
+    drainTimerAt = 0;
     void drain();
   }, ms);
 }
@@ -1032,17 +1078,25 @@ function scheduleDrain(ms: number) {
 // forever (drain only picks up `pending`), one discard click from gone.
 async function reviveMaxAttemptsFailed() {
   const idb = await db();
+  // Read AND write inside ONE readwrite tx (same shape as resolveConflict).
+  // The old two-step (index read in a readonly tx, puts in a new tx) raced
+  // drop(): a user's Discard could delete the record in the gap, and the put
+  // here would RE-CREATE it as pending — a user-discarded edit saving to the
+  // server. Re-check status + the revivable predicate on the freshly-read
+  // records inside the tx so we only revive ops still parked as failed.
+  const tx = idb.transaction(STORE, "readwrite");
   // Only `failed` ops are candidates — query the status index rather than
   // scanning the whole store.
-  const failedOps = (await idb
-    .transaction(STORE, "readonly")
-    .store.index("status")
-    .getAll("failed")) as OutboxOp[];
+  const failedOps = (await tx.store.index("status").getAll("failed")) as OutboxOp[];
   // Same predicate the failed-ops panel uses to label an op "still trying" —
   // imported, not re-tested, so the label can never outlive the behaviour.
-  const revivable = failedOps.filter((o) => willRetryOnItsOwn(o.lastError));
-  if (revivable.length === 0) return;
-  const tx = idb.transaction(STORE, "readwrite");
+  const revivable = failedOps.filter(
+    (o) => o.status === "failed" && willRetryOnItsOwn(o.lastError),
+  );
+  if (revivable.length === 0) {
+    await tx.done;
+    return;
+  }
   for (const o of revivable) {
     o.status = "pending";
     o.attempts = 0;

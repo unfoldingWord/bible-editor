@@ -575,6 +575,28 @@ t("lone-poetry-marker join is idempotent", () => {
   assert.equal(norm(once), once);
 });
 
+// Regression for issue #431. FIX D (dropping a content-less \q* stranded
+// before \c/EOF) was removed by PR #435 in favor of always preserving a lone
+// poetry marker — but that drop was also the ONLY thing making this specific
+// shape non-idempotent: dropping the \q* made \p and \ts\* newly adjacent, a
+// run reorderMarkerRuns (which runs BEFORE the drop) had already missed, so a
+// second pass sorted that run and moved \ts\* across the \c 9/\c 10 boundary
+// while collapsing chapter 9's \p. With FIX D gone there is nothing left to
+// create that adjacency, but pin it anyway so a future pass added to this
+// pipeline can't reopen the same "creates a run after reorder already ran"
+// hazard unnoticed.
+t("content-less \\q* before \\ts\\*/\\c stays idempotent and keeps both \\p (#431)", () => {
+  const src = `\\id HAB\n\\h Habakkuk\n\n\\c 9\n\\p\n\\q1\n\\ts\\*\n\\c 10\n\\p\n\\v 1 text\n`;
+  const once = norm(src);
+  const twice = norm(once);
+  assert.equal(twice, once, "second normalization pass must be a no-op");
+  const countP = (s) => s.split("\n").filter((l) => l.trim() === "\\p").length;
+  assert.equal(countP(once), 2, "both chapters' \\p markers must survive");
+  const c9Idx = once.split("\n").findIndex((l) => l.trim() === "\\c 9");
+  const tsIdx = once.split("\n").findIndex((l) => l.trim() === "\\ts\\*");
+  assert.ok(tsIdx > c9Idx, "\\ts\\* must not move above \\c 9");
+});
+
 t("lone-poetry-marker join never produces a line with two \\v markers", () => {
   const out = norm(`${HDR}\\q1\n\\v 11\n\\q2 \\w a\\w*\n\\q1\n\\v 12 \\w b\\w*\n`);
   for (const l of out.split("\n")) {

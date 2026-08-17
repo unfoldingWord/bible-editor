@@ -1984,6 +1984,133 @@ function countAligned(content) {
   );
 }
 
+// ─── Case 70: punctuation MOVE with identical concatenated skeleton is not
+// silently mangled ("says Yahweh." → "says .ahweh") ─────────────────────────
+// Regression: skeleton() concatenated ALL non-word chars of the range into one
+// string, so "Yahweh." and ".ahweh" both skeletonized to "." and passed the
+// preserve gate — the typed leading period silently relocated back to the end
+// ("says ahweh.") with preservedAlignment:true. The gate must compare the gap
+// SEQUENCES element-wise so a punctuation move falls through to a lower tier.
+{
+  console.log("\n[Case 70] Skeleton gate: '.ahweh' is not treated as 'Yahweh.'");
+  const verse = {
+    verseObjects: [
+      zaln("H1", [zaln("H2", [w("on"), t(" "), w("that"), t(" "), w("day")])]),
+      t(", "),
+      zaln("H3", [w("says"), t(" ")]),
+      zaln("H4", [w("Yahweh"), t(".")]),
+    ],
+  };
+  const old = extractEditableText(verse);
+  const next = "on that day, says .ahweh";
+  const r = smartEditVerse(verse, old, next);
+  assert(
+    extractEditableText(r.content) === next,
+    `edit lands verbatim — period stays where typed (got ${JSON.stringify(extractEditableText(r.content))})`,
+  );
+  const words = alignedWords(r.content);
+  assert(words.find((x) => x.text === "says")?.strongs.includes("H3"), "untouched 'says' keeps alignment");
+  assert(words.find((x) => x.text === "day")?.strongs.includes("H1"), "untouched 'day' keeps alignment");
+}
+
+// ─── Case 71: pure punctuation move must not be silently DISCARDED ──────────
+// Regression companion to Case 70: when relayoutUnchangedWords bails (split
+// possessive + interior marker), the preserve tier's word loop found every word
+// unchanged, anyChanged stayed false, and the whole edit no-opped — the verse
+// came back byte-identical to the baseline.
+{
+  console.log("\n[Case 71] Skeleton gate: punctuation move is applied, not discarded");
+  const verse = {
+    verseObjects: [
+      zaln("H1", [w("Yahweh"), t("’"), w("s")]),
+      t(" "),
+      { type: "quote", tag: "q1" },
+      zaln("H2", [w("anger"), t(" ")]),
+      zaln("H3", [w("burned"), t(".")]),
+    ],
+  };
+  const old = extractEditableText(verse); // "Yahweh’s \q1 anger burned."
+  const next = "Yahweh’s \\q1 anger .burned";
+  const r = smartEditVerse(verse, old, next);
+  assert(
+    extractEditableText(r.content) !== old,
+    `the edit is applied — output must differ from baseline (got ${JSON.stringify(extractEditableText(r.content))})`,
+  );
+  assert(
+    extractEditableText(r.content) === next,
+    `output matches the typed text (got ${JSON.stringify(extractEditableText(r.content))})`,
+  );
+}
+
+// ─── Case 72: marker strip must not fuse across a word CONNECTOR ─────────────
+// Regression: stripMarkerTokens bridged with a space only when a LETTER sat on
+// both sides of the marker — but a connector (’ ' - grouping ,) binds two runs
+// into ONE WORD_RUN_RE token, so `walkede’\q2 and` stripped to `walkede’and`.
+// Editing "walked," → "walkede’" against the \q2 chip fused the UNTOUCHED word
+// "and" into \w walkede’and, destroyed both alignments, and relocated the
+// marker. The bridge must fire whenever the join would tokenize as one run.
+{
+  console.log("\n[Case 72] Connector before a \\q marker does not fuse the next word");
+  const verse = {
+    verseObjects: [
+      { type: "quote", tag: "q1" },
+      zaln("H1", [w("The"), t(" ")]),
+      zaln("H2", [w("people"), t(" ")]),
+      zaln("H3", [w("walked"), t(",")]),
+      t(" "),
+      { type: "quote", tag: "q2" },
+      zaln("H4", [w("and"), t(" ")]),
+      zaln("H5", [w("saw"), t(" ")]),
+      zaln("H6", [w("light"), t(".")]),
+    ],
+  };
+  const old = extractEditableText(verse); // "\q1 The people walked, \q2 and saw light."
+  const next = "\\q1 The people walkede’\\q2 and saw light.";
+  const r = smartEditVerse(verse, old, next);
+  const words = alignedWords(r.content);
+  assert(
+    !words.some((x) => /and/.test(x.text) && x.text !== "and"),
+    `untouched 'and' is not fused into another token (got ${JSON.stringify(words.map((x) => x.text))})`,
+  );
+  assert(words.find((x) => x.text === "and")?.strongs.includes("H4"), "untouched 'and' keeps alignment");
+  assert(words.find((x) => x.text === "saw")?.strongs.includes("H5"), "untouched 'saw' keeps alignment");
+  assert(words.find((x) => x.text === "light")?.strongs.includes("H6"), "untouched 'light' keeps alignment");
+  const out = extractEditableText(r.content);
+  assert(
+    /walkede’\s*\\q2 and/.test(out),
+    `\\q2 stays between walkede’ and 'and' (got ${JSON.stringify(out)})`,
+  );
+}
+
+// ─── Case 73: PRE-EXISTING glued connector shape still round-trips ───────────
+// Guard for the Case 72 fix: a verse whose line already ends with `him’`
+// directly abutting the \q2 marker (no space) must survive an edit to a
+// DIFFERENT word without fusing or unaligning "him"/"and".
+{
+  console.log("\n[Case 73] Pre-existing glued `him’\\q2 and` shape round-trips through an unrelated edit");
+  const verse = {
+    verseObjects: [
+      zaln("H1", [w("against"), t(" ")]),
+      zaln("H2", [w("him"), t("’")]),
+      { type: "quote", tag: "q2" },
+      zaln("H3", [w("and"), t(" ")]),
+      zaln("H4", [w("saw"), t(" ")]),
+      zaln("H5", [w("light"), t(".")]),
+    ],
+  };
+  const old = extractEditableText(verse); // "against him’\q2 and saw light."
+  const next = old.replace("saw", "watched");
+  const r = smartEditVerse(verse, old, next);
+  assert(
+    extractEditableText(r.content) === next,
+    `only 'saw' changed (got ${JSON.stringify(extractEditableText(r.content))})`,
+  );
+  const words = alignedWords(r.content);
+  assert(words.find((x) => x.text === "him")?.strongs.includes("H2"), "'him' keeps alignment");
+  assert(words.find((x) => x.text === "and")?.strongs.includes("H3"), "'and' keeps alignment");
+  assert(words.find((x) => x.text === "watched")?.strongs.length === 0, "edited 'watched' is unaligned");
+}
+
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed.`);
   process.exit(1);

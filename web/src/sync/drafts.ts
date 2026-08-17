@@ -11,6 +11,8 @@ import { openDB, type IDBPDatabase } from "idb";
 import { isReadOnly, type RowKind } from "./api";
 import { onOutboxResult } from "./outbox";
 import { generationForSuccessfulOp } from "./draftSaveState";
+import { unpinVerseBase } from "./versePin";
+export { pinVerseBase, peekPinnedVerseBase } from "./versePin";
 
 const DB_NAME = "bible-editor-drafts";
 const DB_VERSION = 1;
@@ -186,6 +188,7 @@ export const drafts = {
   async clear(key: string): Promise<void> {
     pendingKeys.delete(key);
     latestGenerationByKey.delete(key);
+    unpinVerseBase(key);
     await (await db()).delete(STORE, key);
     void notify();
   },
@@ -208,6 +211,7 @@ export const drafts = {
     if (latestGenerationByKey.get(key) === generation) {
       latestGenerationByKey.delete(key);
       pendingKeys.delete(key);
+      unpinVerseBase(key);
     }
     void notify();
     return true;
