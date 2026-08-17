@@ -829,8 +829,12 @@ async function runReimport(
     // way here; skippedLocked folds into skipped_locked, mirroring exactly how
     // the soft-delete pass's own skippedLocked is handled two lines up — this
     // path has no prune_locked/chapters_locked gate to keep separate from.
+    // No `chapters` argument: `raw` here is always the WHOLE-book file (see
+    // this function's opening comment — chapter filtering happens after
+    // parse), and the sweep now covers every chapter it parses out of it, not
+    // just whatever range the caller requested.
     try {
-      const res = await sweepObsoleteTombstones(env, book, kind, raw, chapters);
+      const res = await sweepObsoleteTombstones(env, book, kind, raw);
       perResource[kind].tombstones_swept += res.swept;
       perResource[kind].tombstones_locked += res.skippedLocked;
       perResource[kind].skipped_locked += res.skippedLocked;
@@ -3948,7 +3952,13 @@ async function softDeleteRemovedTsvRows(
 // exact mechanism behind the 1CH 23 tQ incident that motivated
 // isReissuedTombstone/tombstone_blocked). This HARD-deletes — an actual
 // `DELETE FROM ...`, not another soft-delete — because the whole point is to
-// free the primary key, not to re-tombstone an already-tombstoned row.
+// free the primary key, not to re-tombstone an already-tombstoned row. Each
+// successful delete also purges the id's edit_log entries (kind, row_key,
+// book-or-null) — the row's identity is gone for good, and leaving its audit
+// trail behind would let a future row that reuses this exact id inherit a
+// dead row's history (and, via the app's restore-a-version action, its
+// content) through the history endpoint's (kind, row_key) key. See the
+// purge's own comment at the DELETE site for the full reasoning.
 //
 // DISJOINT FROM tombstone_blocked BY CONSTRUCTION, not by observation. Read
 // this before touching either function. isReissuedTombstone (reimportClassify
@@ -3969,10 +3979,22 @@ async function softDeleteRemovedTsvRows(
 // parsing is cheap relative to the USFM/CPU concerns this file's batching
 // exists for): an empty/garbled file must never be read as "master has
 // nothing", which would make every tombstone in the book look obsolete and
-// sweep the whole book clean; only chapters this run's file actually COVERS;
-// never a chapter an active AI pipeline job currently holds (see
-// tombstones_locked on ReimportCounts for why that deferral does NOT gate the
-// sync watermark the way prune_locked does).
+// sweep the whole book clean; never a chapter an active AI pipeline job
+// currently holds (see tombstones_locked on ReimportCounts for why that
+// deferral does NOT gate the sync watermark the way prune_locked does).
+//
+// Deliberately takes NO candidate-chapters restriction — it sweeps every
+// chapter its own whole-file parse covers. An earlier version of this
+// function accepted the same changed-chapters list softDeleteRemovedTsvRows
+// does and intersected against it, which is wrong for this function
+// specifically: that list is built from a LIVE-row diff (changedTsvChapters),
+// and a chapter whose only discrepancy is an already-obsolete tombstone never
+// appears in it. Restricting to it meant the sweep could only reach such a
+// chapter opportunistically, when an unrelated row also happened to change —
+// starving the exact steady-state case (10,641 of the issue's 10,645
+// production tombstones) this function exists to handle. Both call sites are
+// therefore responsible for only invoking this once per run for a resource
+// whose file was actually (re)fetched this run — see each call site.
 //
 // Runs at the SAME call sites as softDeleteRemovedTsvRows, AFTER it — which is
 // itself after the apply/chunk phase that computes THIS run's tombstone_
@@ -3984,7 +4006,6 @@ async function sweepObsoleteTombstones(
   book: string,
   kind: TsvKind,
   rawTsv: string,
-  candidateChapters: number[],
 ): Promise<{ swept: number; skippedLocked: number }> {
   const incomingIds = new Set<string>();
   const coveredChapters = new Set<number>();
@@ -4000,10 +4021,21 @@ async function sweepObsoleteTombstones(
   // nothing", which would make every tombstone in the book look obsolete.
   if (incomingIds.size === 0) return { swept: 0, skippedLocked: 0 };
 
+  // Iterate EVERY chapter this run's file covers — deliberately NOT restricted
+  // to a caller-supplied "changed chapters" list. A tombstone's eligibility
+  // here (its id is absent from `incomingIds`) is orthogonal to whether any
+  // LIVE row differs in that chapter, which is what a changed-chapters diff
+  // (changedTsvChapters) measures. An earlier version of this function took
+  // such a list as `candidateChapters` and intersected it here — which meant a
+  // chapter whose only discrepancy was an already-obsolete tombstone (the
+  // common case: 10,641 of 10,645 tombstones in the issue's production sweep)
+  // could only ever be reached opportunistically, when some UNRELATED row in
+  // that chapter happened to change too. That starved the sweep of the exact
+  // steady-state case it exists for. See the two call sites for how "this
+  // run's file" is scoped (only resources whose fetch actually ran).
   let swept = 0;
   let skippedLocked = 0;
-  for (const ch of candidateChapters) {
-    if (!coveredChapters.has(ch)) continue;
+  for (const ch of coveredChapters) {
     if (await activePipelineForChapter(env, book, ch)) {
       skippedLocked++;
       continue;
@@ -4025,7 +4057,24 @@ async function sweepObsoleteTombstones(
       )
         .bind(t.id, book)
         .run();
-      if (del.meta.changes) swept++;
+      if (!del.meta.changes) continue;
+      swept++;
+      // Purge this identity's audit trail too, not just the row. The whole
+      // point of freeing the (book, id) slot is that a future master row may
+      // reuse this exact id for something UNRELATED — that is the scenario
+      // this sweep exists to make safe. rows.ts' history handler reads
+      // edit_log keyed by (kind, row_key) alone, falling back across a NULL
+      // book for pre-migration-0017 rows (`el.book = ?3 OR el.book IS NULL`);
+      // a left-behind entry under a reused id would interleave the dead row's
+      // history into the new row's, and the app's restore-a-version action
+      // could write the dead row's payload_json onto the new row. There is
+      // nothing left to audit once the row itself is unrecoverably gone, so
+      // match the same (kind, row_key, book-or-null) scope the read side uses.
+      await env.DB.prepare(
+        `DELETE FROM edit_log WHERE kind = ?1 AND row_key = ?2 AND (book = ?3 OR book IS NULL)`,
+      )
+        .bind(kind, t.id, book)
+        .run();
     }
   }
   return { swept, skippedLocked };
@@ -4040,9 +4089,8 @@ export const sweepObsoleteTombstonesForTest = (
   book: string,
   kind: TsvKind,
   rawTsv: string,
-  candidateChapters: number[],
 ): Promise<{ swept: number; skippedLocked: number }> =>
-  sweepObsoleteTombstones(env, book, kind, rawTsv, candidateChapters);
+  sweepObsoleteTombstones(env, book, kind, rawTsv);
 
 // SHA-gate each requested resource and stage the changed ones to R2. Returns
 // the book's chapter extent + a manifest the chunk steps read from.
@@ -4384,13 +4432,23 @@ export async function runChunkedReimport(
   for (const e of changed) {
     const kind = e.resource;
     if (kind === "ult" || kind === "ust" || !e.r2Key) continue;
-    const chs = changedTsv[kind];
-    if (!chs || chs.length === 0) continue;
+    // `chs` gates the live-row prune below (a chapter only needs it if a live
+    // row's presence/content actually differs from master) but must NOT gate
+    // the tombstone sweep just after it — see sweepObsoleteTombstones' header
+    // for why restricting it to a live-row-diff chapter list starves it of
+    // the exact steady-state case it exists for. So this loop no longer skips
+    // the whole step when `chs` is empty: it always fetches `raw` (still once
+    // per changed resource, same as before) and always runs the sweep: only
+    // the live-row prune stays conditional on `chs`.
+    const chs = changedTsv[kind] ?? [];
     const r2Key = e.r2Key;
     const res = await step.do(`reimport-prune-${book}-${kind}`, async () => {
       const raw = await readStaged(env, r2Key);
       if (raw == null) return { deleted: 0, skippedLocked: 0, tombstonesSwept: 0, tombstonesLocked: 0 };
-      const pruneRes = await softDeleteRemovedTsvRows(env, book, kind, raw, chs);
+      const pruneRes =
+        chs.length > 0
+          ? await softDeleteRemovedTsvRows(env, book, kind, raw, chs)
+          : { deleted: 0, skippedLocked: 0 };
       if (pruneRes.deleted > 0 || pruneRes.skippedLocked > 0) {
         console.log("reimport pruned rows removed on master", { book, resource: kind, ...pruneRes });
       }
@@ -4400,8 +4458,9 @@ export async function runChunkedReimport(
       // this run's tombstone_blocked count is already final by the time any
       // tombstone could be swept (see sweepObsoleteTombstones' header for why
       // that ordering is what makes the two counters provably disjoint, not
-      // merely disjoint by luck this run).
-      const sweepRes = await sweepObsoleteTombstones(env, book, kind, raw, chs);
+      // merely disjoint by luck this run). Deliberately UNGATED by `chs` — it
+      // computes its own whole-file chapter coverage directly from `raw`.
+      const sweepRes = await sweepObsoleteTombstones(env, book, kind, raw);
       if (sweepRes.swept > 0 || sweepRes.skippedLocked > 0) {
         console.log("reimport swept obsolete tombstones", { book, resource: kind, ...sweepRes });
       }
