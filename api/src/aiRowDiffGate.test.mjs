@@ -1,0 +1,223 @@
+// Regression coverage for issue #485: changedTsvChapters (the nightly reimport
+// diff gate) was blind to a master-side deletion of an AI-only row.
+//
+// Run from api/ (needs the sqlite flag + the extensionless-import resolve
+// hook — same pattern as reimportJourney.test.mjs):
+//   node --experimental-sqlite --experimental-strip-types --no-warnings --import ./src/tsResolveHook.mjs src/aiRowDiffGate.test.mjs
+//
+// Bug recap. changedTsvChapters built its stored side from PRISTINE rows only
+// (updated_by IS NULL). softDeleteRemovedTsvRows (the nightly prune) is
+// documented to also delete AI-only rows (updated_by set, latest edit_log
+// source = ai_pipeline) master no longer carries — but the prune only ever
+// runs for chapters changedTsvChapters flags as "changed". An AI-only row was
+// invisible to the stored-pristine map, so when a Door43 maintainer deleted it
+// on master, BOTH sides of the comparison excluded it: master's incoming map
+// (row is gone) and D1's pristine map (row was never pristine). The maps
+// matched, the chapter read "unchanged", the prune never ran, and the AI row
+// re-exported to master every night — permanently reverting the maintainer's
+// deletion, silently.
+//
+// This file drives the REAL changedTsvChapters against a real (in-memory)
+// copy of the production schema, not a hand-typed re-implementation of its
+// SQL — the same rationale reimportJourney.test.mjs gives for doing so.
+
+import { DatabaseSync } from "node:sqlite";
+import { readdirSync, readFileSync } from "node:fs";
+import { join, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
+
+import { changedTsvChapters } from "./bookReimport.ts";
+
+let failed = 0;
+function eq(actual, expected, msg) {
+  if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+    console.error(`FAIL: ${msg}\n    expected ${JSON.stringify(expected)}\n    got      ${JSON.stringify(actual)}`);
+    failed++;
+  } else {
+    console.log(`  ok: ${msg}`);
+  }
+}
+
+// ── Minimal D1 shim over node:sqlite — mirrors reimportJourney.test.mjs ────
+function makeDb(sqlite) {
+  const mk = (sql, args) => ({
+    sql,
+    args,
+    bind: (...a) => mk(sql, a),
+    all() {
+      return { results: sqlite.prepare(sql).all(...args), success: true };
+    },
+    first() {
+      const r = sqlite.prepare(sql).all(...args);
+      return r.length ? r[0] : null;
+    },
+    run() {
+      const r = sqlite.prepare(sql).run(...args);
+      return { success: true, meta: { changes: Number(r.changes), last_row_id: Number(r.lastInsertRowid) } };
+    },
+  });
+  return {
+    prepare: (sql) => mk(sql, []),
+    async batch(stmts) {
+      const out = [];
+      for (const s of stmts) out.push(s.run());
+      return out;
+    },
+  };
+}
+
+function freshEnv() {
+  const sqlite = new DatabaseSync(":memory:");
+  const dir = join(dirname(fileURLToPath(import.meta.url)), "..", "migrations");
+  for (const f of readdirSync(dir).filter((f) => f.endsWith(".sql")).sort()) {
+    sqlite.exec(readFileSync(join(dir, f), "utf8"));
+  }
+  // Stub users for the updated_by FK — seedAiOnlyRow/seedHumanEditedRow's
+  // fixed ids (999, 42) must exist for node:sqlite's FK enforcement.
+  sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (999, 999, 'ai-pipeline-user')`).run();
+  sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (42, 42, 'a-translator')`).run();
+  return { sqlite, env: { DB: makeDb(sqlite) } };
+}
+
+const BOOK = "ZEC";
+
+// A pristine tn row that master still carries unchanged — the "nothing to see
+// here" chapter, present in both maps at chapter 3.
+function seedPristineRow(sqlite, { id = "aaaa", chapter = 3, verse = 1, ref = "3:1", note = "pristine note" } = {}) {
+  sqlite
+    .prepare(
+      `INSERT INTO tn_rows (id, book, chapter, verse, ref_raw, tags, support_reference, quote, occurrence, note, sort_order)
+       VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, ?, 1)`,
+    )
+    .run(id, BOOK, chapter, verse, ref, note);
+}
+
+// An AI-only row: updated_by is set (the pipeline's synthetic user id), and
+// its latest edit_log entry is source='ai_pipeline' — the exact shape
+// isReimportableRow / softDeleteRemovedTsvRows key on.
+function seedAiOnlyRow(sqlite, { id = "bbbb", chapter = 3, verse = 2, ref = "3:2", note = "ai note" } = {}) {
+  sqlite
+    .prepare(
+      `INSERT INTO tn_rows (id, book, chapter, verse, ref_raw, tags, support_reference, quote, occurrence, note, sort_order, updated_by)
+       VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, ?, 2, 999)`,
+    )
+    .run(id, BOOK, chapter, verse, ref, note);
+  sqlite
+    .prepare(
+      `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, source)
+       VALUES ('tn', ?, ?, NULL, 0, 1, 'create', 'ai_pipeline')`,
+    )
+    .run(id, BOOK);
+}
+
+// A human-edited row: updated_by is set, but the latest edit_log entry has no
+// ai_pipeline source (a real translator PATCH logs source=NULL).
+function seedHumanEditedRow(sqlite, { id = "cccc", chapter = 3, verse = 3, ref = "3:3", note = "human note" } = {}) {
+  sqlite
+    .prepare(
+      `INSERT INTO tn_rows (id, book, chapter, verse, ref_raw, tags, support_reference, quote, occurrence, note, sort_order, updated_by)
+       VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, ?, 3, 42)`,
+    )
+    .run(id, BOOK, chapter, verse, ref, note);
+  sqlite
+    .prepare(
+      `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, source)
+       VALUES ('tn', ?, ?, 42, 0, 1, 'update', NULL)`,
+    )
+    .run(id, BOOK);
+}
+
+const TN_TSV_HEADER = "ID\tReference\tTags\tSupportReference\tQuote\tOccurrence\tNote";
+function tnTsvRow({ id, ref, note }) {
+  return `${id}\t${ref}\t\t\t\t\t${note}`;
+}
+
+console.log("\n[issue #485 — master deletes an AI-only row: the diff gate must flag its chapter]");
+{
+  const { sqlite, env } = freshEnv();
+  seedPristineRow(sqlite);
+  seedAiOnlyRow(sqlite);
+  // Master's file now carries ONLY the pristine row — exactly D1's pristine
+  // set, so the OLD pristine-only comparison would read this chapter as
+  // unchanged even though the AI-only row was deleted on master.
+  const raw = [TN_TSV_HEADER, tnTsvRow({ id: "aaaa", ref: "3:1", note: "pristine note" })].join("\n");
+
+  const changed = await changedTsvChapters(env, BOOK, "tn", raw);
+  eq(changed.has(3), true, "chapter 3 IS flagged changed — the AI-only row's deletion is no longer invisible");
+}
+
+console.log("\n[control — no AI-only row ever existed: chapter genuinely unchanged]");
+{
+  const { sqlite, env } = freshEnv();
+  seedPristineRow(sqlite);
+  const raw = [TN_TSV_HEADER, tnTsvRow({ id: "aaaa", ref: "3:1", note: "pristine note" })].join("\n");
+
+  const changed = await changedTsvChapters(env, BOOK, "tn", raw);
+  eq(changed.has(3), false, "chapter 3 is NOT flagged — nothing changed, the fix must not over-flag");
+}
+
+console.log("\n[control — AI-only row still present on master: already caught before this fix]");
+{
+  const { sqlite, env } = freshEnv();
+  seedPristineRow(sqlite);
+  seedAiOnlyRow(sqlite);
+  const raw = [
+    TN_TSV_HEADER,
+    tnTsvRow({ id: "aaaa", ref: "3:1", note: "pristine note" }),
+    tnTsvRow({ id: "bbbb", ref: "3:2", note: "ai note" }),
+  ].join("\n");
+
+  const changed = await changedTsvChapters(env, BOOK, "tn", raw);
+  // The AI row is present in `incoming` but absent from the pristine `stored`
+  // map, so size mismatch alone already flags this — pre-existing behavior,
+  // pinned here so a future refactor can't quietly regress it.
+  eq(changed.has(3), true, "chapter 3 IS flagged — a.size !== b.size still fires (pristine map excludes AI row)");
+}
+
+console.log("\n[master deletes a HUMAN-edited row: also flagged (harmless — the prune won't touch it)]");
+{
+  const { sqlite, env } = freshEnv();
+  seedPristineRow(sqlite);
+  seedHumanEditedRow(sqlite);
+  const raw = [TN_TSV_HEADER, tnTsvRow({ id: "aaaa", ref: "3:1", note: "pristine note" })].join("\n");
+
+  const changed = await changedTsvChapters(env, BOOK, "tn", raw);
+  eq(changed.has(3), true, "chapter 3 IS flagged — errs toward changed for any missing live id, human-edited included");
+}
+
+console.log("\n[an already-tombstoned row's absence from master does NOT force a flag]");
+{
+  const { sqlite, env } = freshEnv();
+  seedPristineRow(sqlite);
+  sqlite
+    .prepare(
+      `INSERT INTO tn_rows (id, book, chapter, verse, ref_raw, tags, support_reference, quote, occurrence, note, sort_order, deleted_at)
+       VALUES ('dddd', ?, 3, 4, '3:4', NULL, NULL, NULL, NULL, 'already gone', 4, 1753900000)`,
+    )
+    .run(BOOK);
+  const raw = [TN_TSV_HEADER, tnTsvRow({ id: "aaaa", ref: "3:1", note: "pristine note" })].join("\n");
+
+  const changed = await changedTsvChapters(env, BOOK, "tn", raw);
+  eq(changed.has(3), false, "chapter 3 stays unchanged — an already-deleted row is not 'live', so its absence is expected");
+}
+
+console.log("\n[an AI-only row deleted in a DIFFERENT chapter does not falsely flag an unrelated chapter]");
+{
+  const { sqlite, env } = freshEnv();
+  seedPristineRow(sqlite, { id: "aaaa", chapter: 3, verse: 1, ref: "3:1" });
+  seedAiOnlyRow(sqlite, { id: "bbbb", chapter: 7, verse: 2, ref: "7:2" });
+  // Master carries chapter 3 unchanged and never had chapter 7 in this file at
+  // all (a book file always covers every chapter it has, but this proves the
+  // per-chapter bucketing keys off the row's OWN chapter, not book-wide).
+  const raw = [TN_TSV_HEADER, tnTsvRow({ id: "aaaa", ref: "3:1", note: "pristine note" })].join("\n");
+
+  const changed = await changedTsvChapters(env, BOOK, "tn", raw);
+  eq(changed.has(3), false, "chapter 3 unaffected");
+  eq(changed.has(7), true, "chapter 7 (where the AI-only row actually lived) IS flagged");
+}
+
+if (failed > 0) {
+  console.error(`\n${failed} assertion(s) failed`);
+  process.exit(1);
+}
+console.log("\nAll aiRowDiffGate assertions passed.");

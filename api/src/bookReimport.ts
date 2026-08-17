@@ -3697,10 +3697,29 @@ function storedTsvRowToParsed(kind: TsvKind, row: Record<string, unknown>): Pars
 
 // Chapters whose pristine D1 content differs from the incoming DCS TSV. A
 // chapter is "unchanged" (skippable) ONLY when its incoming {id → signature}
-// map equals its stored-pristine map exactly. Detects add/change/delete and id
-// moves; errs toward "changed" whenever an edited (non-pristine) row is present
-// (excluded from the stored map → chapter re-runs, edited row skipped
-// harmlessly). A perf filter — it can never skip a real update.
+// map equals its stored-pristine map exactly AND every live D1 id in the
+// chapter is still present in the incoming file (see the liveIds pass below).
+// Detects add/change/delete and id moves; errs toward "changed" whenever an
+// edited (non-pristine) row is present (excluded from the stored map → chapter
+// re-runs, edited row skipped harmlessly). A perf filter — it can never skip a
+// real update.
+//
+// Issue #485: the pristine-only comparison above is blind to a master-side
+// deletion of an AI-only row (updated_by set, latest edit_log source =
+// ai_pipeline — softDeleteRemovedTsvRows's own header explains why that row is
+// still prunable). Such a row is excluded from BOTH the incoming map (master
+// dropped it) and the stored-pristine map (it was never pristine), so the two
+// maps can still match exactly and the chapter reads as "unchanged" — the
+// prune that depends on `changed` then never runs for that chapter, and the
+// row lives on in D1 to be re-exported to master every night, silently
+// reverting the deletion forever. The liveIds pass below closes that hole: it
+// reads every LIVE (non-tombstoned) id in the chapter — pristine, AI-only, and
+// human-edited alike — and flags the chapter as changed if any of those ids is
+// absent from the incoming file, regardless of whether that id ever
+// contributed to the pristine signature comparison. Flagging on a missing
+// human-edited id is harmless — softDeleteRemovedTsvRows's own
+// isReimportableRow check refuses to prune it — so this only ever widens
+// "changed", never narrows it.
 export async function changedTsvChapters(
   env: Env,
   book: string,
@@ -3711,6 +3730,14 @@ export async function changedTsvChapters(
     kind === "tn"
       ? `updated_by IS NULL AND deleted_at IS NULL AND trashed_at IS NULL AND preserve = 0 AND hint = 0`
       : `updated_by IS NULL AND deleted_at IS NULL`;
+  // Mirrors softDeleteRemovedTsvRows' selectProtections: every row eligible
+  // for pruning consideration (pristine OR non-pristine), excluding rows
+  // already tombstoned/trashed/preserved/hinted — those aren't "live" and
+  // their absence from the incoming file is expected, not a deletion to catch.
+  const live =
+    kind === "tn"
+      ? `deleted_at IS NULL AND trashed_at IS NULL AND preserve = 0 AND hint = 0`
+      : `deleted_at IS NULL`;
 
   // Chapter 0 (refParts("front:intro") in importParsers.ts) is a real,
   // syncable chapter — a book-level intro TN/TQ/TWL row — NOT a sentinel to
@@ -3745,14 +3772,41 @@ export async function changedTsvChapters(
     m.set(p.id, tsvRowSignature(kind, p));
   }
 
+  // Second, wider read: every live id per chapter (not just pristine), so an
+  // AI-only (or human-edited) row's id is still visible to this gate even
+  // though it's excluded from the pristine signature maps above. See the
+  // issue #485 note on this function.
+  const liveIds = new Map<number, Set<string>>();
+  const liveRes = await env.DB.prepare(
+    `SELECT id, chapter FROM ${kind}_rows WHERE book = ?1 AND ${live}`,
+  )
+    .bind(book)
+    .all<{ id: string; chapter: number }>();
+  for (const row of liveRes.results ?? []) {
+    const ch = Number(row.chapter);
+    if (ch < 0) continue;
+    let s = liveIds.get(ch);
+    if (!s) liveIds.set(ch, (s = new Set()));
+    s.add(String(row.id));
+  }
+
   const changed = new Set<number>();
-  for (const ch of new Set<number>([...incoming.keys(), ...stored.keys()])) {
+  for (const ch of new Set<number>([...incoming.keys(), ...stored.keys(), ...liveIds.keys()])) {
     const a = incoming.get(ch) ?? new Map<string, string>();
     const b = stored.get(ch) ?? new Map<string, string>();
-    if (a.size !== b.size) { changed.add(ch); continue; }
-    let same = true;
-    for (const [id, sig] of a) {
-      if (b.get(id) !== sig) { same = false; break; }
+    let same = a.size === b.size;
+    if (same) {
+      for (const [id, sig] of a) {
+        if (b.get(id) !== sig) { same = false; break; }
+      }
+    }
+    // A live D1 id (pristine or not) that master no longer carries is always a
+    // change, even when the pristine-only comparison above already agreed —
+    // this is the additive check that catches an AI-only row's deletion.
+    if (same) {
+      for (const id of liveIds.get(ch) ?? []) {
+        if (!a.has(id)) { same = false; break; }
+      }
     }
     if (!same) changed.add(ch);
   }
