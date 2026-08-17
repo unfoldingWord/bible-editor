@@ -477,16 +477,7 @@ export async function dispatchNext(env: Env): Promise<void> {
   };
 
   let upstream: Response;
-  let text: string;
   try {
-    // The AbortSignal governs the whole request/response lifecycle, not just
-    // the fetch() promise — a stalled response BODY past the deadline aborts
-    // just as much as a stalled connect/header phase does, and that abort
-    // surfaces from upstream.text() (the body read), not from fetch() itself.
-    // Both calls must share this one try/catch, or a body-side stall would
-    // throw past this function uncaught, leaving the row in 'dispatching'
-    // for the stale sweep to race — exactly the bug DISPATCH_POST_TIMEOUT_MS
-    // exists to close, just relocated to the body-read phase.
     upstream = await fetch(`${upstreamBase(env)}/api/pipeline/start`, {
       method: "POST",
       headers: {
@@ -499,22 +490,38 @@ export async function dispatchNext(env: Env): Promise<void> {
       // sweep from ever racing a still-live POST (issue #493).
       signal: AbortSignal.timeout(DISPATCH_POST_TIMEOUT_MS),
     });
-    text = await upstream.text();
   } catch (e) {
     if (e instanceof Error && e.name === "TimeoutError") {
-      // Our OWN timeout, not a connection failure — the request may well
-      // have reached the bot before we gave up waiting on it. See
-      // DISPATCH_TIMEOUT_ERROR_KIND/MESSAGE's doc comment: this does NOT
-      // free the slot immediately (progresses, does not fully close, #493 —
-      // see #511 for what would).
+      // Our OWN timeout firing before we even got a Response back — still
+      // ambiguous, not a connection failure: the request bytes (method +
+      // headers + body) may already have reached the bot even though we
+      // gave up waiting on ITS response headers. See DISPATCH_TIMEOUT_ERROR_
+      // KIND/MESSAGE's doc comment: this does NOT free the slot immediately
+      // (progresses, does not fully close, #493 — see #511 for what would).
       await markDispatchAmbiguous();
     } else {
-      // A genuine connection failure (DNS, refused, reset) is NOT ambiguous
-      // — the request never reached the bot, so there is nothing to hold
-      // the slot open for. Fail immediately, same as the pre-existing
-      // unreachable/non-OK paths below.
+      // fetch() itself rejected with NO Response at all — a genuine
+      // pre-connection failure (DNS, refused, reset before any bytes came
+      // back). That is the one case that is NOT ambiguous: the request
+      // never reached the bot, so there is nothing to hold the slot open
+      // for. Fail immediately, same as the pre-existing non-OK path below.
       await fail("transient_outage", "upstream_unreachable");
     }
+    return;
+  }
+
+  let text: string;
+  try {
+    text = await upstream.text();
+  } catch {
+    // We already HAVE a Response here — headers arrived, which proves the
+    // request reached the bot. ANY failure reading the body from this point
+    // on (our own AbortSignal firing mid-stream, or a genuine connection
+    // reset/stream error) means the bot may already be processing this job;
+    // unlike the fetch()-phase catch above, there is no "definitely never
+    // reached upstream" case once we're here, so this ALWAYS routes to the
+    // ambiguous path, regardless of the error's name/type.
+    await markDispatchAmbiguous();
     return;
   }
 
@@ -1472,6 +1479,18 @@ export async function pollAllNonTerminal(env: Env): Promise<void> {
     // outcome, governed by the separate, longer sweep just below — this one
     // is only for a row that never got that far (Worker crashed/evicted
     // before dispatchNext's own catch could run at all).
+    //
+    // The exclusion MUST be NULL-safe: an ordinary dispatch that never hit
+    // dispatchNext's catch block has error_kind/error_message = NULL (their
+    // column default), and SQL's three-valued logic makes a plain `NOT
+    // (error_kind = ?2 AND error_message = ?3)` evaluate to NULL — not
+    // TRUE — for a NULL/NULL row, which a WHERE clause treats as "does not
+    // match." That would silently exclude EVERY ordinary dead dispatch from
+    // this sweep, wedging the single global slot forever the next time a
+    // Worker genuinely died mid-POST. `IS NOT` compares NULL-safely (`NULL
+    // IS NOT 'x'` is TRUE, matching the "this row does not carry the
+    // marker" intent), so an untouched NULL/NULL row is correctly INCLUDED
+    // and only an exact-marker match is excluded.
     await env.DB.prepare(
       `UPDATE pipeline_jobs
           SET state = 'failed',
@@ -1480,7 +1499,7 @@ export async function pollAllNonTerminal(env: Env): Promise<void> {
               updated_at = unixepoch()
         WHERE state = 'dispatching'
           AND updated_at < unixepoch() - ?1
-          AND NOT (error_kind = ?2 AND error_message = ?3)`,
+          AND (error_kind IS NOT ?2 OR error_message IS NOT ?3)`,
     )
       .bind(STUCK_DISPATCH_THRESHOLD_SECONDS, DISPATCH_TIMEOUT_ERROR_KIND, DISPATCH_TIMEOUT_ERROR_MESSAGE)
       .run();

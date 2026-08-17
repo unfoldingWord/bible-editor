@@ -19,8 +19,22 @@
 // file that covers dispatchNext's F2 promote-guard) — see that file's header
 // for what this style of test proves and doesn't prove.
 //
+// The final section below is a real-SQLite integration test (mirrors
+// reimportJourney.test.mjs / applyVerseRows.test.mjs's shim), not a fake-D1
+// SQL-text regex check — deliberately, because the NULL-safety bug it covers
+// is exactly the class pipelinesForceFail.test.mjs's own header warns about:
+// "a WHERE clause that reads as correct English but is semantically wrong
+// under SQLite's three-valued NULL logic ... would still pass every
+// guard-text-is-present assertion." Only a real SQLite engine can prove a
+// NULL-safety fix is actually NULL-safe.
+//
 // Run from api/:
-//   node --experimental-strip-types --no-warnings src/pipelineDispatchTimeout.test.mjs
+//   node --experimental-sqlite --experimental-strip-types --no-warnings src/pipelineDispatchTimeout.test.mjs
+
+import { DatabaseSync } from "node:sqlite";
+import { readdirSync, readFileSync } from "node:fs";
+import { join, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { dispatchNext, pollAllNonTerminal } from "./pipelines.ts";
 
@@ -192,7 +206,33 @@ await withFetch(
   },
 );
 
-console.log("\n[a plain network failure (not a timeout) is NOT ambiguous — still fails the row immediately]");
+console.log("\n[a NON-timeout failure reading the response body is ALSO ambiguous, not an immediate fail]");
+await withFetch(
+  async () => ({
+    // fetch() resolved — headers arrived, which PROVES the request reached
+    // the bot. A stream error here (connection reset, decode error — NOT a
+    // TimeoutError) is just as ambiguous as a timeout would be: unlike a
+    // pre-connection failure, there is no "definitely never reached
+    // upstream" reading of an error that happens after we already have a
+    // Response. Must route to markDispatchAmbiguous, not fail().
+    ok: true,
+    status: 200,
+    text: async () => {
+      throw new Error("terminated: ECONNRESET");
+    },
+  }),
+  async () => {
+    const env = fakeDispatchEnv();
+    await dispatchNext(env);
+    assert(env.failCalls.length === 0, "fail() was NOT called for a non-timeout body-read failure");
+    assert(
+      env.ambiguousCalls.length === 1,
+      "markDispatchAmbiguous's UPDATE ran exactly once for a non-timeout body-read failure — headers already arrived",
+    );
+  },
+);
+
+console.log("\n[a pre-connection network failure (fetch() itself rejects, no Response at all) is NOT ambiguous — still fails the row immediately]");
 await withFetch(
   async () => {
     throw new TypeError("fetch failed");
@@ -200,7 +240,7 @@ await withFetch(
   async () => {
     const env = fakeDispatchEnv();
     await dispatchNext(env);
-    assert(env.ambiguousCalls.length === 0, "a genuine connection failure is never marked ambiguous");
+    assert(env.ambiguousCalls.length === 0, "a genuine pre-connection failure is never marked ambiguous");
     assert(env.failCalls.length === 1, "fail() was called exactly once");
     assert(env.failCalls[0]?.kind === "transient_outage", "still classified as transient_outage");
     assert(
@@ -280,6 +320,136 @@ console.log("\n[pollAllNonTerminal: the ambiguous-dispatch grace-period sweep ru
   assert(
     env.ambiguousSweepBinds?.[1] === "transient_outage" && env.ambiguousSweepBinds?.[2] === "upstream_dispatch_timeout",
     "ambiguous sweep targets exactly the marker markDispatchAmbiguous stamps",
+  );
+}
+
+// ─── Real-SQLite NULL-safety proof for the exclusion clause ────────────────
+// The fake-D1 tests above prove the SQL TEXT and bind wiring; they cannot
+// prove the WHERE clause is semantically correct under SQLite's
+// three-valued NULL logic (a fake D1 stub that just regex-matches SQL text
+// would pass even if `NOT (a = ?2 AND b = ?3)` silently excluded every
+// NULL/NULL row — exactly the bug this section exists to catch). Same shim
+// as reimportJourney.test.mjs / applyVerseRows.test.mjs: real node:sqlite,
+// every migration applied in order.
+function makeDb(sqlite) {
+  const mk = (sql, args) => ({
+    sql,
+    args,
+    bind: (...a) => mk(sql, a),
+    all() {
+      return { results: sqlite.prepare(sql).all(...args), success: true };
+    },
+    first() {
+      const r = sqlite.prepare(sql).all(...args);
+      return r.length ? r[0] : null;
+    },
+    run() {
+      const r = sqlite.prepare(sql).run(...args);
+      return { success: true, meta: { changes: Number(r.changes), last_row_id: Number(r.lastInsertRowid) } };
+    },
+  });
+  return {
+    prepare: (sql) => mk(sql, []),
+    async batch(stmts) {
+      const out = [];
+      for (const s of stmts) out.push(s.run());
+      return out;
+    },
+  };
+}
+
+function freshEnv() {
+  const sqlite = new DatabaseSync(":memory:");
+  const dir = join(dirname(fileURLToPath(import.meta.url)), "..", "migrations");
+  for (const f of readdirSync(dir).filter((f) => f.endsWith(".sql")).sort()) {
+    sqlite.exec(readFileSync(join(dir, f), "utf8"));
+  }
+  // BT_API_TOKEN must be set — pollAllNonTerminal's early guard (`if
+  // (!env.BT_API_TOKEN) return;`) would otherwise skip every sweep, silently
+  // passing every assertion below for the wrong reason.
+  return { sqlite, env: { DB: makeDb(sqlite), BT_API_TOKEN: "tok" } };
+}
+
+function seedDispatchingJob(sqlite, { jobId, updatedAt, errorKind = null, errorMessage = null }) {
+  sqlite
+    .prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (1, 1, 'translator') ON CONFLICT(id) DO NOTHING`)
+    .run();
+  sqlite
+    .prepare(
+      `INSERT INTO pipeline_jobs
+         (job_id, user_id, pipeline_type, book, start_chapter, end_chapter,
+          session_key, state, error_kind, error_message, updated_at)
+       VALUES (?, 1, 'notes', 'NUM', 27, 27, 'sess', 'dispatching', ?, ?, ?)`,
+    )
+    .run(jobId, errorKind, errorMessage, updatedAt);
+}
+
+const NOW = 1_800_000_000; // arbitrary fixed epoch second, well past any migration's own timestamps
+
+console.log("\n[NULL-safety: an ORDINARY dead dispatch (error_kind/message untouched — the column default) is still caught by the generic sweep]");
+{
+  const { sqlite, env } = freshEnv();
+  // Died 200s ago — past STUCK_DISPATCH_THRESHOLD_SECONDS (120s), never
+  // reached dispatchNext's own catch block, so error_kind/error_message are
+  // genuinely NULL (the column default — see the 0008 migration), not
+  // merely absent from an INSERT list.
+  seedDispatchingJob(sqlite, { jobId: "job-ordinary-dead", updatedAt: NOW - 200 });
+  // pollAllNonTerminal reads `unixepoch()` for its own "now" — node:sqlite's
+  // unixepoch() reflects the real wall clock, so seed relative to that
+  // instead of the fixed NOW constant above (which only fixes the ROW's
+  // stored updated_at, not what the sweep compares it against).
+  const realNow = sqlite.prepare("SELECT unixepoch() AS n").get().n;
+  sqlite.prepare(`UPDATE pipeline_jobs SET updated_at = ? WHERE job_id = ?`).run(realNow - 200, "job-ordinary-dead");
+
+  await pollAllNonTerminal(env);
+
+  const row = sqlite.prepare("SELECT state, error_kind FROM pipeline_jobs WHERE job_id = ?").get("job-ordinary-dead");
+  assert(
+    row.state === "failed",
+    `an ordinary NULL/NULL dead dispatch IS caught and failed by the generic sweep — the slot is not wedged forever (got state=${row.state})`,
+  );
+  assert(row.error_kind === "interrupted", `failed via the generic sweep's own error_kind, not the ambiguous marker (got ${row.error_kind})`);
+}
+
+console.log("\n[NULL-safety: an ambiguous-marked row is still excluded from the generic sweep and caught by its own grace-period sweep instead]");
+{
+  const { sqlite, env } = freshEnv();
+  const realNow = sqlite.prepare("SELECT unixepoch() AS n").get().n;
+  // Marked ambiguous 200s ago: past the generic sweep's 120s threshold
+  // (must NOT be caught there) but under the ambiguous sweep's own 300s
+  // grace period (must NOT be caught yet either) — proves the two sweeps'
+  // thresholds are genuinely independent, not just their marker filters.
+  seedDispatchingJob(sqlite, {
+    jobId: "job-ambiguous-recent",
+    updatedAt: realNow - 200,
+    errorKind: "transient_outage",
+    errorMessage: "upstream_dispatch_timeout",
+  });
+  // Marked ambiguous 400s ago: past BOTH thresholds — must be caught by the
+  // grace-period sweep now.
+  seedDispatchingJob(sqlite, {
+    jobId: "job-ambiguous-expired",
+    updatedAt: realNow - 400,
+    errorKind: "transient_outage",
+    errorMessage: "upstream_dispatch_timeout",
+  });
+
+  await pollAllNonTerminal(env);
+
+  const recent = sqlite.prepare("SELECT state FROM pipeline_jobs WHERE job_id = ?").get("job-ambiguous-recent");
+  assert(
+    recent.state === "dispatching",
+    `an ambiguous row still within its 300s grace period stays 'dispatching' — the slot stays held (got ${recent.state})`,
+  );
+
+  const expired = sqlite.prepare("SELECT state, error_kind FROM pipeline_jobs WHERE job_id = ?").get("job-ambiguous-expired");
+  assert(
+    expired.state === "failed",
+    `an ambiguous row past its 300s grace period IS finally failed, freeing the slot (got ${expired.state})`,
+  );
+  assert(
+    expired.error_kind === "transient_outage",
+    `the grace-period sweep's own failure is also transient_outage (got ${expired.error_kind})`,
   );
 }
 

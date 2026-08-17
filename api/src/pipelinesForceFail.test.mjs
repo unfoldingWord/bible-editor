@@ -1172,12 +1172,16 @@ await (async () => {
   // Issue #493/#511: this sweep now ALSO excludes a row dispatchNext itself
   // marked ambiguous (DISPATCH_TIMEOUT_ERROR_KIND/MESSAGE) — that row is
   // governed by the separate, longer AMBIGUOUS_DISPATCH_GRACE_SECONDS sweep
-  // instead (see pipelineDispatchTimeout.test.mjs). 3 args: its own
-  // threshold, plus the (kind, message) pair of the exclusion — still none
-  // of them IMPORT_CLAIM_STALE_SECONDS, per the assertion above.
+  // instead (see pipelineDispatchTimeout.test.mjs, which also proves this
+  // exclusion is NULL-safe against a real SQLite engine — a plain `NOT
+  // (a = ?2 AND b = ?3)` would silently exclude every ordinary NULL/NULL
+  // row too under SQL's three-valued logic, which a SQL-text regex check
+  // like this one can't catch on its own). 3 args: its own threshold, plus
+  // the (kind, message) pair of the exclusion — still none of them
+  // IMPORT_CLAIM_STALE_SECONDS, per the assertion above.
   assert(
-    /AND NOT \(error_kind = \?2 AND error_message = \?3\)/.test(dispatchSweep.sql),
-    "the dispatching-sweep excludes rows carrying the ambiguous-dispatch marker",
+    /AND \(error_kind IS NOT \?2 OR error_message IS NOT \?3\)/.test(dispatchSweep.sql),
+    "the dispatching-sweep excludes rows carrying the ambiguous-dispatch marker, using NULL-safe IS NOT",
   );
   assert(
     dispatchSweep.args.length === 3,
