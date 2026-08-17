@@ -635,28 +635,35 @@ export function lintChapterOpeningMarkers(verses: VerseRow[]): LintIssue[] {
 }
 
 // Port of the "matched open/closed quotation marks" judgement call named in
-// #438 (the uw-content-validation check an editor "can easily fix" once
-// pointed at it) — stack-based pairing over the curly double quotes ULT/UST
-// actually use for direct discourse, same shape as bracketProblems above.
-// Deliberately narrow: straight `"` is auto-normalized to curly at export (see
+// #438 — narrowed, after two review rounds on PR #483, to the one claim that
+// is actually provable from plain text: a CLOSING curly quote (”) with no
+// opening quote (“) anywhere earlier in the book. Deliberately narrow in two
+// more ways: straight `"` is auto-normalized to curly at export (see
 // docs/export-validation-cleanup.md) so it is not linted, and curly single
 // quotes (‘ ’) double as apostrophes inside words — a naive pairing check
-// cannot tell "don't" from a genuine unmatched single quote, so those are out
-// of scope rather than guessed at.
+// cannot tell "don't" from a genuine unmatched single quote.
 //
-// CHAPTER-scoped, not per-verse: quoted discourse in ULT/UST routinely spans
-// several verses (a speech that opens in v2 and closes in v5), so the stack
-// carries across every verse of a chapter, in verse order — resetting it at
-// each verse boundary was measured to double-flag ordinary multi-verse
-// quotations (open in one verse, close in a later one) and was mostly noise
-// on real scripture (e.g. ZEC 1:2 opens a quote that 1:3 closes). The stack
-// resets at each chapter boundary rather than running book-wide: an unrelated
-// unmatched quote in one chapter should not silently pair with — and mask —
-// an unrelated unmatched quote in another. `entries` is sorted defensively
-// rather than trusting caller order, since a mis-ordered scan would
-// misattribute pairing across verses that aren't actually adjacent.
+// This deliberately does NOT flag a leftover, never-closed opening quote, and
+// deliberately runs BOOK-wide rather than resetting at any boundary. Two real
+// ULT/UST conventions make "every opener needs a closer" unprovable from
+// plain text alone:
+//   - Continuation openers: multi-paragraph dialogue re-opens each paragraph
+//     with “ and closes only the final one ("“first paragraph…" "“second
+//     paragraph…”") — usfm-js's plain text has no paragraph markers left in
+//     it (extractPlainText strips them), so the checker cannot tell a
+//     continuation opener from a genuinely unclosed one.
+//   - Cross-chapter spans: quoted speech can open near the end of one
+//     chapter and close in the next — chapter breaks do not terminate a
+//     quotation, so per-chapter scoping (tried and reverted) double-flagged
+//     ordinary text at every chapter boundary too.
+// A running, never-negative counter sidesteps both: it only ever objects to a
+// ” for which there is provably no “ anywhere before it — true regardless of
+// how many paragraphs or chapters separate them — and silently accepts any
+// number of unconsumed opens. `entries` is sorted defensively (chapter, then
+// verse) rather than trusting caller order, since a mis-ordered scan could
+// consume a closer against an opener that doesn't actually precede it.
 function quoteIssues(verses: VerseRow[]): LintIssue[] {
-  const byChapter = new Map<number, Array<{ ref: string; verse: number; text: string }>>();
+  const entries: Array<{ ref: string; chapter: number; verse: number; text: string }> = [];
   for (const v of verses) {
     if (v.verse === 0) continue;
     let parsed: unknown;
@@ -667,31 +674,29 @@ function quoteIssues(verses: VerseRow[]): LintIssue[] {
     }
     const vos = (parsed as { verseObjects?: unknown[] })?.verseObjects;
     if (!Array.isArray(vos)) continue;
-    const list = byChapter.get(v.chapter) ?? [];
-    list.push({ ref: `${v.chapter}:${v.verse}`, verse: v.verse, text: extractPlainText(parsed) });
-    byChapter.set(v.chapter, list);
+    entries.push({ ref: `${v.chapter}:${v.verse}`, chapter: v.chapter, verse: v.verse, text: extractPlainText(parsed) });
   }
+  entries.sort((a, b) => a.chapter - b.chapter || a.verse - b.verse);
 
   const issues: LintIssue[] = [];
-  for (const entries of byChapter.values()) {
-    entries.sort((a, b) => a.verse - b.verse);
-    const stack: Array<{ ref: string; pos: number }> = [];
-    for (const e of entries) {
-      for (let i = 0; i < e.text.length; i++) {
-        const ch = e.text[i];
-        if (ch === "“") {
-          stack.push({ ref: e.ref, pos: i + 1 });
-        } else if (ch === "”") {
-          if (stack.length === 0) {
-            issues.push({ check: "Quotation Mark", bucket: "flag", ref: e.ref, message: `Closing quote '”' at character ${i + 1} has no matching opening quote.` });
-          } else {
-            stack.pop();
-          }
+  let openCount = 0;
+  for (const e of entries) {
+    for (let i = 0; i < e.text.length; i++) {
+      const ch = e.text[i];
+      if (ch === "“") {
+        openCount++;
+      } else if (ch === "”") {
+        if (openCount === 0) {
+          issues.push({
+            check: "Quotation Mark",
+            bucket: "flag",
+            ref: e.ref,
+            message: `Closing quote '”' at character ${i + 1} has no opening quote anywhere earlier in the book.`,
+          });
+        } else {
+          openCount--;
         }
       }
-    }
-    for (const open of stack) {
-      issues.push({ check: "Quotation Mark", bucket: "flag", ref: open.ref, message: `Opening quote '“' at character ${open.pos} has no matching closing quote.` });
     }
   }
   return issues;

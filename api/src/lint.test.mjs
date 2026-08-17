@@ -173,35 +173,51 @@ t("nested balanced curly quotes pass", () => {
   const i = lintUsfmVerses([verseFromUsfm("\\c 1\n\\p\n\\v 1 “outer “inner” more”\n")]);
   assert.equal(quoteChecks(i).length, 0);
 });
-t("unmatched opening curly quote flagged", () => {
+// Codex review round 2 on PR #483: flagging a leftover, never-closed opening
+// quote is itself a false positive — multi-paragraph dialogue in ULT/UST
+// re-opens each paragraph with “ and closes only the final one, and
+// extractPlainText has already stripped the \p markers that would tell the
+// checker where a paragraph (and therefore a legitimate continuation opener)
+// begins. So an unclosed “ is deliberately NOT reported at all.
+t("an unclosed opening quote is NOT flagged (continuation-opener dialogue convention)", () => {
   const i = quoteChecks(lintUsfmVerses([verseFromUsfm("\\c 1\n\\p\n\\v 1 he said, “hello.\n")]));
-  assert.equal(i.length, 1);
-  assert.equal(i[0].bucket, "flag");
-  assert.match(i[0].message, /Opening quote/);
+  assert.equal(i.length, 0);
 });
-t("unmatched closing curly quote flagged", () => {
+t("continuation-opener dialogue (a paragraph break that re-opens without closing) is NOT flagged", () => {
+  // "“first paragraph…" "“second paragraph…”" — two opens, one close.
+  const verses = versesFromUsfm("\\c 1\n\\p\n\\v 1 “first paragraph statement\n\\p\n\\v 2 “second paragraph statement.”\n");
+  assert.equal(quoteChecks(lintUsfmVerses(verses)).length, 0);
+});
+t("unmatched closing curly quote (no opener anywhere earlier) IS flagged", () => {
   const i = quoteChecks(lintUsfmVerses([verseFromUsfm("\\c 1\n\\p\n\\v 1 he said hello.”\n")]));
   assert.equal(i.length, 1);
+  assert.equal(i[0].bucket, "flag");
   assert.match(i[0].message, /Closing quote/);
 });
 t("straight quotes and apostrophes are NOT linted (out of scope)", () => {
   const i = lintUsfmVerses([verseFromUsfm("\\c 1\n\\p\n\\v 1 don't say \"hello\n")]);
   assert.equal(quoteChecks(i).length, 0);
 });
-// Codex review on PR #483: per-verse quote pairing double-flagged ordinary
-// multi-verse discourse (ZEC 1:2 opens a quote that 1:3 closes) — the check
-// must carry quote state across an ordered chapter, not reset at every verse.
+// Codex review round 1 on PR #483: per-verse quote pairing double-flagged
+// ordinary multi-verse discourse (ZEC 1:2 opens a quote that 1:3 closes) —
+// state has to carry across an ordered sequence of verses, not reset at
+// every verse.
 t("quote opened in one verse and closed in a later verse of the same chapter is NOT flagged (ZEC 1:2/1:3 shape)", () => {
   const verses = versesFromUsfm("\\c 1\n\\p\n\\v 1 word\n\\v 2 he said, “hello\n\\v 3 world.”\n");
   assert.equal(quoteChecks(lintUsfmVerses(verses)).length, 0);
 });
-t("genuinely unmatched quotes in DIFFERENT chapters are both still flagged, not paired against each other", () => {
+// Codex review round 2: chapter-scoping (round 1's fix) was ALSO wrong —
+// quoted speech can legitimately open near the end of one chapter and close
+// in the next, so a chapter boundary must not terminate a quotation either.
+t("quote opened near the end of one chapter and closed in the next chapter is NOT flagged (cross-chapter span)", () => {
   const verses = versesFromUsfm("\\c 1\n\\p\n\\v 1 he said, “hello\n\\c 2\n\\p\n\\v 1 world.”\n");
+  assert.equal(quoteChecks(lintUsfmVerses(verses)).length, 0);
+});
+t("two INDEPENDENT unmatched closing quotes in different chapters are both still flagged (one doesn't consume the other's opener)", () => {
+  const verses = versesFromUsfm("\\c 1\n\\p\n\\v 1 hello.”\n\\c 2\n\\p\n\\v 1 world.”\n");
   const issues = quoteChecks(lintUsfmVerses(verses));
   assert.equal(issues.length, 2);
   assert.deepEqual(issues.map((i) => i.ref).sort(), ["1:1", "2:1"]);
-  assert.ok(issues.some((i) => /Opening quote/.test(i.message) && i.ref === "1:1"));
-  assert.ok(issues.some((i) => /Closing quote/.test(i.message) && i.ref === "2:1"));
 });
 t("out-of-order verse rows are sorted before pairing (defensive against caller order)", () => {
   const verses = versesFromUsfm("\\c 1\n\\p\n\\v 1 word\n\\v 2 he said, “hello\n\\v 3 world.”\n").reverse();
