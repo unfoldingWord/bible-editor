@@ -2255,10 +2255,17 @@ async function applyVerseRows(
   const pristineWrites: Array<{
     v: VerseExtract;
     isInsert: boolean;
-    // Version the UPDATE's audit row should log as `prev_version` (null for
-    // an INSERT, which always logs prev_version NULL / new_version 1).
-    oldVersion: number | null;
     stmt: D1PreparedStatement;
+    // The audit row, gated on SQL-side `changes() > 0` (not a JS check after
+    // the fact) so it MUST land in the exact same batch() call as `stmt`,
+    // immediately after it — D1 batches are transactional, so this keeps the
+    // write and its audit row atomic: either both commit or neither does.
+    // Splitting them into two separate batch() calls (write batch, then a
+    // JS-gated log batch) was tried and reverted — a log-batch failure after
+    // a landed write batch left version-bumped verses with no edit_log row,
+    // and the per-row fallback couldn't recover them (it would see the
+    // content already matching and count a no-op). See step 3 below.
+    logStmt: D1PreparedStatement;
   }> = [];
   // Edited verses whose source-owned alignment attrs were reconciled from master
   // (target text + grouping unchanged). Written in a separate version-CAS batch.
@@ -2320,15 +2327,23 @@ async function applyVerseRows(
   for (const v of verses) {
     const ex = existing.get(`${v.chapter}:${v.verse}`);
     if (!ex) {
+      const rowKey = `${book}/${v.chapter}/${v.verse}/${bibleVersion}`;
       pristineWrites.push({
         v,
         isInsert: true,
-        oldVersion: null,
         stmt: env.DB.prepare(
           `INSERT INTO verses (book, chapter, verse, verse_end, bible_version, content_json, plain_text)
            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
            ON CONFLICT(book, chapter, verse, bible_version) DO NOTHING`,
         ).bind(book, v.chapter, v.verse, v.verseEnd, bibleVersion, v.contentJson, v.plainText),
+        // Conditional on the INSERT actually landing: ON CONFLICT DO NOTHING
+        // means a verse that already exists (created between our read and
+        // this batch) inserts 0 rows — don't log a phantom restorable v1.
+        logStmt: env.DB.prepare(
+          `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, payload_json, source)
+           SELECT 'verse', ?1, ?2, ?3, NULL, 1, 'create', ?4, ?5
+            WHERE changes() > 0`,
+        ).bind(rowKey, book, userId, JSON.stringify({ plain_text: v.plainText, content: v.contentJson }), REIMPORT_SOURCE),
       });
       continue;
     }
@@ -2480,66 +2495,72 @@ async function applyVerseRows(
     }
     // Pristine + changed → update. The guard stays on the UPDATE; new_version is
     // ex.version + 1 because the update only applies while the row is untouched.
-    pristineWrites.push({
-      v,
-      isInsert: false,
-      oldVersion: ex.version,
-      stmt: env.DB.prepare(
-        `UPDATE verses
-            SET content_json = ?1, plain_text = ?2, verse_end = ?3,
-                version = version + 1, updated_at = ?4
-          WHERE book = ?5 AND chapter = ?6 AND verse = ?7 AND bible_version = ?8
-            AND updated_by IS NULL`,
-      ).bind(v.contentJson, v.plainText, v.verseEnd, now, book, v.chapter, v.verse, bibleVersion),
-    });
+    {
+      const rowKey = `${book}/${v.chapter}/${v.verse}/${bibleVersion}`;
+      pristineWrites.push({
+        v,
+        isInsert: false,
+        stmt: env.DB.prepare(
+          `UPDATE verses
+              SET content_json = ?1, plain_text = ?2, verse_end = ?3,
+                  version = version + 1, updated_at = ?4
+            WHERE book = ?5 AND chapter = ?6 AND verse = ?7 AND bible_version = ?8
+              AND updated_by IS NULL`,
+        ).bind(v.contentJson, v.plainText, v.verseEnd, now, book, v.chapter, v.verse, bibleVersion),
+        // Conditional on the UPDATE actually landing. The UPDATE is guarded
+        // on `updated_by IS NULL`, so if an editor touched this verse between
+        // our read and this batch the UPDATE matches 0 rows — but the
+        // content we'd log never landed. An unconditional insert would
+        // record a phantom restorable version carrying stale DCS content.
+        logStmt: env.DB.prepare(
+          `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, payload_json, source)
+           SELECT 'verse', ?1, ?2, ?3, ?4, ?5, 'update', ?6, ?7
+            WHERE changes() > 0`,
+        ).bind(rowKey, book, userId, ex.version, ex.version + 1, JSON.stringify({ plain_text: v.plainText, content: v.contentJson }), REIMPORT_SOURCE),
+      });
+    }
   }
 
-  // 3. Chunked batches (WRITE_BATCH statements each — D1 caps a batch at 100,
-  //    same limit bookReimport.ts asserts at every other write site) for all
-  //    pristine INSERT/UPDATE writes. Each slice's audit rows are written in a
-  //    separate follow-up batch, gated in JS on that statement's own
-  //    meta.changes > 0 — not the SQL-side `changes()` trick the single
-  //    unchunked batch used to rely on — so a lost race (ON CONFLICT DO
-  //    NOTHING on the INSERT; the `updated_by IS NULL` guard losing to a
-  //    concurrent edit on the UPDATE) is never logged as a phantom restorable
-  //    version and never counted as inserted/updated. A lost UPDATE is routed
-  //    to skipped_edited (mirrors the aiReseeds/sourceReconciles batches
-  //    below); a lost INSERT is routed to skipped_noop (the verse now exists,
-  //    same as reading it fresh would have shown). On a slice failure, only
-  //    that slice falls back to the isolated per-row path so one bad verse —
-  //    or one oversized chapter's worth of verses — can't sink the whole book.
-  for (let i = 0; i < pristineWrites.length; i += WRITE_BATCH) {
-    const slice = pristineWrites.slice(i, i + WRITE_BATCH);
+  // 3. Chunked batches for all pristine INSERT/UPDATE writes, each verse's
+  //    write statement immediately followed by its own SQL-`changes()`-gated
+  //    audit row IN THE SAME batch() call — two statements per verse, so
+  //    chunked at PRISTINE_PAIR_BATCH (half of WRITE_BATCH) to stay within
+  //    the same ≤100-statement D1 cap this file asserts everywhere else.
+  //    Keeping the write and its audit row in one atomic batch (rather than
+  //    a separate follow-up batch of logs) matters: a batch() call is one D1
+  //    transaction, so either both land or neither does. Splitting them
+  //    across two batch() calls was tried and reverted — if the (separate)
+  //    log batch failed after the write batch had already landed, the catch
+  //    below would fall back to the per-row path, which would see the
+  //    content already matching and count a silent no-op, permanently
+  //    losing the audit row for a verse whose version really did bump.
+  //    changes() reflects the immediately-preceding statement, so a lost
+  //    race (ON CONFLICT DO NOTHING on the INSERT; the `updated_by IS NULL`
+  //    guard losing to a concurrent edit on the UPDATE) is never logged as a
+  //    phantom restorable version and never counted as inserted/updated — a
+  //    lost UPDATE is routed to skipped_edited (mirrors the aiReseeds/
+  //    sourceReconciles batches below); a lost INSERT is routed to
+  //    skipped_noop (the verse now exists, same as reading it fresh would
+  //    have shown). On a slice failure, only that slice falls back to the
+  //    isolated per-row path so one bad verse — or one oversized chapter's
+  //    worth of verses — can't sink the whole book.
+  const PRISTINE_PAIR_BATCH = Math.floor(WRITE_BATCH / 2);
+  for (let i = 0; i < pristineWrites.length; i += PRISTINE_PAIR_BATCH) {
+    const slice = pristineWrites.slice(i, i + PRISTINE_PAIR_BATCH);
+    const stmts: D1PreparedStatement[] = [];
+    for (const w of slice) stmts.push(w.stmt, w.logStmt);
     try {
-      const results = await env.DB.batch(slice.map((w) => w.stmt));
-      const logs: D1PreparedStatement[] = [];
+      const results = await env.DB.batch(stmts);
       slice.forEach((w, j) => {
-        const changed = (results[j]?.meta.changes ?? 0) > 0;
-        const wRowKey = `${book}/${w.v.chapter}/${w.v.verse}/${bibleVersion}`;
+        const changed = (results[j * 2]?.meta.changes ?? 0) > 0;
         if (!changed) {
           if (w.isInsert) counts.skipped_noop++;
           else counts.skipped_edited++;
           return;
         }
-        if (w.isInsert) {
-          counts.inserted++;
-          logs.push(
-            logEditStmt(env, "verse", wRowKey, book, userId, null, 1, "create", {
-              plain_text: w.v.plainText,
-              content: w.v.contentJson,
-            }),
-          );
-        } else {
-          counts.updated++;
-          logs.push(
-            logEditStmt(env, "verse", wRowKey, book, userId, w.oldVersion, (w.oldVersion ?? 0) + 1, "update", {
-              plain_text: w.v.plainText,
-              content: w.v.contentJson,
-            }),
-          );
-        }
+        if (w.isInsert) counts.inserted++;
+        else counts.updated++;
       });
-      if (logs.length > 0) await env.DB.batch(logs);
     } catch (e) {
       console.error("reimport verse batch failed; falling back per-row", {
         book,

@@ -168,6 +168,67 @@ console.log("\n[a plain no-op (nothing changed) is still counted skipped_noop, n
   eq(counts.skipped_noop, 1, "second identical run counts the no-op");
 }
 
+console.log("\n[each verse's write and its audit row are atomic — one batch() call per chunk, not a separate write batch then a separate log batch]");
+{
+  // A split (write batch, then a separate log batch) was tried and
+  // reverted: if the log batch failed after the write batch had already
+  // landed, the fallback would see the content already matching and count
+  // a silent no-op, permanently losing the audit row for a verse whose
+  // version really did bump. Proving "one batch() call per chunk" is
+  // proving that failure mode is structurally impossible now — a thrown
+  // batch() can only mean NEITHER the write NOR its log landed (D1 batches
+  // are transactional), never one without the other.
+  const { env, sqlite } = freshEnv();
+  const verses = Array.from({ length: 100 }, (_, i) => verse(50, i + 1, `verse ${i + 1}`));
+  const counts = await applyVerseRowsForTest(env, BOOK, VERSION, verses, null, null, false);
+
+  eq(counts.inserted, 100, "all 100 verses counted inserted");
+  // 100 verses at PRISTINE_PAIR_BATCH=45 verses/chunk (90 statements: 45
+  // writes + 45 logs, under the 100-statement cap) is ceil(100/45) = 3
+  // batch() calls — never more, which would mean writes and logs split
+  // across separate calls again.
+  eq(env.DB._batchCalls.count, 3, "exactly 3 batch() calls — one per chunk, carrying both writes and logs together");
+  eq(
+    env.DB._batchCalls.sizes.every((n) => n <= 90),
+    true,
+    "every batch() call stayed within the paired-statement cap (≤45 verses × 2 statements)",
+  );
+
+  const logCount = sqlite
+    .prepare("SELECT COUNT(*) AS n FROM edit_log WHERE kind = 'verse' AND action = 'create' AND book = ?")
+    .all(BOOK)[0].n;
+  eq(logCount, 100, "every inserted verse has exactly one matching edit_log row — none lost, none duplicated");
+}
+
+console.log("\n[a chunk that fails outright falls back to per-row, which still writes both content AND its audit row]");
+{
+  const { env, sqlite } = freshEnv();
+  // 90 verses -> 2 chunks at PRISTINE_PAIR_BATCH=45. Fail only the SECOND
+  // chunk's batch() call so the first lands normally and the second must
+  // recover through applyVerseRowsPerRow.
+  const verses = Array.from({ length: 90 }, (_, i) => verse(60, i + 1, `verse ${i + 1}`));
+  const originalBatch = env.DB.batch.bind(env.DB);
+  let call = 0;
+  env.DB.batch = async (stmts) => {
+    call++;
+    if (call === 2) throw new Error("simulated transient D1 failure");
+    return originalBatch(stmts);
+  };
+
+  const counts = await applyVerseRowsForTest(env, BOOK, VERSION, verses, null, null, false);
+
+  eq(counts.inserted, 90, "all 90 verses still counted inserted (45 batched cleanly + 45 recovered per-row)");
+  eq(counts.errors.length, 0, "the per-row fallback recovers the failed chunk without surfacing an error");
+
+  const rowCount = sqlite.prepare("SELECT COUNT(*) AS n FROM verses WHERE book = ? AND chapter = 60").all(BOOK)[0].n;
+  eq(rowCount, 90, "all 90 verses actually landed in D1, including the fallback chunk");
+
+  const logCount = sqlite
+    .prepare("SELECT COUNT(*) AS n FROM edit_log WHERE kind = 'verse' AND action = 'create' AND book = ?")
+    .all(BOOK)[0].n;
+  eq(logCount, 90, "every one of the 90 verses has its audit row — the fallback chunk did not silently drop its logs");
+}
+
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed`);
   process.exit(1);
