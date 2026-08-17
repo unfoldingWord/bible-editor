@@ -10,6 +10,7 @@ import {
   devSignIn,
   fetchAuthMe,
   onAuthError,
+  onAuthRefreshed,
   setReadOnlyReason,
   setRole,
   updateLastLocation,
@@ -170,6 +171,11 @@ export function App() {
   }, []);
 
   useEffect(() => onAuthError(() => setSessionExpired(true)), []);
+  // A later *successful* silent refresh (api.ts fires onAuthRefreshed) means
+  // the session is alive after all — a transient network blip / timeout during
+  // one refresh attempt must not leave "session expired" up forever while the
+  // outbox drains fine. Nothing else clears the flag.
+  useEffect(() => onAuthRefreshed(() => setSessionExpired(false)), []);
 
   // Shell has acted on a `?c=<id>` deep link. Clear it from the URL AND from
   // our own state: replaceState fires no hashchange, so the hashchange listener

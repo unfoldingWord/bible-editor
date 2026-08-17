@@ -1744,6 +1744,14 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
         masterContent: masterUsfm,
       };
     }
+    // Master fetched but did not parse: nothing was compared, so this must
+    // not surface as detail:"ok" — that detail is what authorizes
+    // clearAlignmentAttention, and an absent measurement must never erase
+    // prior evidence (STATE.md). Ship decision unchanged (ok:true, as
+    // designed for an unprovable loss); only the "measured clean" claim goes.
+    if (result.masterUnparseable) {
+      return { ok: true, detail: "master_unparseable", masterContent: masterUsfm };
+    }
     return { ok: true, detail: "ok", masterContent: masterUsfm };
   }
 

@@ -335,10 +335,26 @@ function wrapInChain2(children: unknown[], chain: Record<string, unknown>[]): un
   return inner[0];
 }
 
-// Letters / marks / numbers — the "word core" test, kept byte-identical to
-// replace.ts LETTER_RE so this module's marker bridge agrees with the caller's
-// stripMarkerTokens about when two marker-separated tokens must stay apart.
-const LETTER_RE = /[\p{L}\p{M}\p{N}]/u;
+// Would gluing `left + right` (the text on either side of a removed marker)
+// bind the chars at the seam into ONE WORD_RUN_RE token? Kept byte-identical
+// to replace.ts joinWouldFuse so this module's marker bridge agrees with the
+// caller's stripMarkerTokens about when two marker-separated tokens must stay
+// apart — change both together. A letter pair is the obvious case, but
+// intra-word connectors reach across too: `walkede’` + `and` tokenizes as
+// `walkede’and` (apostrophe binds two letter runs) and `300` + `,000` as
+// `300,000` (grouping comma — ONLY between digits). Decide by actually
+// tokenizing a 2-char window on each side of the seam — WORD_RUN_RE itself is
+// the ground truth. Two chars suffice: every binding decision involves at most
+// the seam char plus one char beyond it on each side.
+function joinWouldFuse(left: string, right: string): boolean {
+  const l = left.slice(-2);
+  const joined = l + right.slice(0, 2);
+  for (const m of joined.matchAll(WORD_RUN_RE)) {
+    const start = m.index ?? 0;
+    if (start < l.length && start + m[0].length > l.length) return true;
+  }
+  return false;
+}
 
 // Rebuild the raw concatenated text of a verseObjects tree. In-flow line markers
 // (`\q`/`\p`/`\b`) carry no text of their own, but each IS a word separator.
@@ -348,32 +364,38 @@ const LETTER_RE = /[\p{L}\p{M}\p{N}]/u;
 // `Ephraimand`, so oldTokens under-counts by one and GATE 1 wrongly declines
 // reassembly — which is how a two-edge deletion in ZEC 9:10 UST flattened the
 // whole verse. Mirror replace.ts stripMarkerTokens EXACTLY: bridge with a single
-// space ONLY when a word char sits on both sides of the marker; leave
-// punctuation-separated pairs (`Jerusalem,` `He`) untouched. Because this same
-// function feeds both GATE 1 (old text) and the output self-check, the bridge
-// stays consistent with the caller's already-bridged newStripped either way.
+// space ONLY when the join would fuse into one WORD_RUN_RE token
+// (joinWouldFuse — letters on both sides, or an intra-word connector reaching
+// across, `him’\q2 and`); leave separator-punctuation pairs (`Jerusalem,` `He`)
+// untouched. Because this same function feeds both GATE 1 (old text) and the
+// output self-check, the bridge stays consistent with the caller's
+// already-bridged newStripped either way.
+//
+// Marker positions are recorded during the walk and the bridges resolved
+// afterwards against the full concatenated text, so the 2-char right context
+// can span node boundaries (a marker followed by a 1-char text node). Resolved
+// end-to-start so insertions don't shift pending positions; a second marker at
+// the same position sees the just-inserted space as its right context and
+// correctly declines to double-bridge.
 function rebuildRaw(nodes: unknown[]): string {
   let out = "";
-  let pendingMarker = false;
+  const markerAt: number[] = [];
   const walk = (ns: unknown[]) => {
     for (const n of ns ?? []) {
       const o = n as Record<string, unknown> | null;
       if (!o) continue;
-      if (isInFlowMarker(o)) pendingMarker = true;
-      if (typeof o["text"] === "string") {
-        const text = o["text"] as string;
-        if (pendingMarker) {
-          const before = out.slice(-1);
-          const after = text.slice(0, 1);
-          if (LETTER_RE.test(before) && LETTER_RE.test(after)) out += " ";
-          pendingMarker = false;
-        }
-        out += text;
-      }
+      if (isInFlowMarker(o)) markerAt.push(out.length);
+      if (typeof o["text"] === "string") out += o["text"] as string;
       if (Array.isArray(o["children"])) walk(o["children"] as unknown[]);
     }
   };
   walk(nodes);
+  for (let i = markerAt.length - 1; i >= 0; i--) {
+    const p = markerAt[i];
+    if (joinWouldFuse(out.slice(Math.max(0, p - 2), p), out.slice(p, p + 2))) {
+      out = out.slice(0, p) + " " + out.slice(p);
+    }
+  }
   return out;
 }
 

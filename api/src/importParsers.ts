@@ -452,9 +452,14 @@ const CURLY_RDQUO = "”"; // ”
 const CURLY_LSQUO = "‘"; // ‘
 const CURLY_RSQUO = "’"; // ’
 
-function isOpeningQuoteContext(prev: string | undefined): boolean {
+function isOpeningQuoteContext(prev: string | undefined, prevPrev?: string | undefined): boolean {
   if (!prev) return true;
   if (/\s/.test(prev)) return true;
+  // The two-character literal `\n` escape is unfoldingWord's TSV line-break
+  // convention (note/question/response prose — a TSV cell can't hold a real
+  // newline): a quote right after it starts a new line, so it opens. Needs the
+  // char BEFORE prev — a lone trailing "n" (e.g. "in\"…") stays closing.
+  if (prev === "n" && prevPrev === "\\") return true;
   return /[(\[{<\-–—/“‘]/.test(prev);
 }
 
@@ -471,13 +476,21 @@ function isOpeningQuoteContext(prev: string | undefined): boolean {
 // straight quote, force strict alternation instead of consulting context:
 // `""` → `“”` (an empty quoted phrase), `"a""b"` → `“a”“b”` (two
 // back-to-back quoted words).
-function curlifyChar(ch: '"' | "'", prevRaw: string | undefined, prevCurled: string | undefined): string {
+// `prevCurled2` is the curled character emitted before `prevCurled` — needed
+// only so isOpeningQuoteContext can recognize the two-character literal `\n`
+// escape ("\\" then "n") as an opening context.
+function curlifyChar(
+  ch: '"' | "'",
+  prevRaw: string | undefined,
+  prevCurled: string | undefined,
+  prevCurled2?: string | undefined,
+): string {
   if (prevRaw === ch) {
     if (ch === '"') return prevCurled === CURLY_LDQUO ? CURLY_RDQUO : CURLY_LDQUO;
     return prevCurled === CURLY_LSQUO ? CURLY_RSQUO : CURLY_LSQUO;
   }
-  if (ch === '"') return isOpeningQuoteContext(prevCurled) ? CURLY_LDQUO : CURLY_RDQUO;
-  return isOpeningQuoteContext(prevCurled) ? CURLY_LSQUO : CURLY_RSQUO;
+  if (ch === '"') return isOpeningQuoteContext(prevCurled, prevCurled2) ? CURLY_LDQUO : CURLY_RDQUO;
+  return isOpeningQuoteContext(prevCurled, prevCurled2) ? CURLY_LSQUO : CURLY_RSQUO;
 }
 
 // Curl every straight quote in one text string, threading in the last
@@ -495,15 +508,22 @@ function curlifyTextWithContext(
   let out = "";
   let changed = false;
   let curled = prevCurled;
+  // Char before `curled` — threaded so the literal `\n` escape (two chars) is
+  // visible as an opening context. Starts unknown at a node/string boundary,
+  // which only means a `\n` SPLIT across two nodes isn't recognized — verse
+  // trees never carry the escape (it's TSV-prose-only), so nothing is lost.
+  let curled2: string | undefined = undefined;
   let raw = prevRaw;
   for (const ch of text) {
     if (ch === '"' || ch === "'") {
-      const curly = curlifyChar(ch, raw, curled);
+      const curly = curlifyChar(ch, raw, curled, curled2);
       out += curly;
       if (curly !== ch) changed = true;
+      curled2 = curled;
       curled = curly;
     } else {
       out += ch;
+      curled2 = curled;
       curled = ch;
     }
     raw = ch;

@@ -591,10 +591,19 @@ async function insertTnRows(
   const { rows } = parseTsv(raw);
   if (rows.length === 0) return 0;
 
+  // ON CONFLICT(book, id) DO NOTHING — the composite PK (migration 0015).
+  // Master TSVs really do ship duplicate IDs (ISA 48 delete+duplicate, the AI
+  // TN doubling), and the wipe above already deleted the prior rows, so a
+  // plain INSERT would throw and 502 the whole book on every retry until
+  // master is fixed. First-in wins, matching the reimport path's skipped_dup
+  // handling. The `seen` set below skips dup lines BEFORE the batch so the
+  // paired edit_log 'create' row and the returned count stay truthful (the
+  // ON CONFLICT is the DB-level backstop).
   const insertStmt = env.DB.prepare(
     `INSERT INTO tn_rows
        (id, book, chapter, verse, ref_raw, tags, support_reference, quote, occurrence, note, sort_order)
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)`,
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+     ON CONFLICT(book, id) DO NOTHING`,
   );
   const auditStmt = env.DB.prepare(
     `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, payload_json)
@@ -603,6 +612,7 @@ async function insertTnRows(
 
   let count = 0;
   const nextSort = makeVerseSortOrder();
+  const seen = new Set<string>();
   let batch: D1PreparedStatement[] = [];
   const flush = async () => {
     if (batch.length === 0) return;
@@ -613,6 +623,8 @@ async function insertTnRows(
   for (const r of rows) {
     const id = r["ID"];
     if (!id) continue;
+    if (seen.has(id)) continue; // duplicate ID in master's file — first-in wins
+    seen.add(id);
     const refRaw = r["Reference"] ?? "";
     const [ch, v] = refParts(refRaw);
     const occRaw = r["Occurrence"];
@@ -653,10 +665,13 @@ async function insertTqRows(
   const { rows } = parseTsv(raw);
   if (rows.length === 0) return 0;
 
+  // Duplicate-ID tolerance: see insertTnRows above (ON CONFLICT backstop +
+  // `seen` skip so audit/count stay truthful; first-in wins).
   const insertStmt = env.DB.prepare(
     `INSERT INTO tq_rows
        (id, book, chapter, verse, ref_raw, tags, quote, occurrence, question, response, sort_order)
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)`,
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+     ON CONFLICT(book, id) DO NOTHING`,
   );
   const auditStmt = env.DB.prepare(
     `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, payload_json)
@@ -665,6 +680,7 @@ async function insertTqRows(
 
   let count = 0;
   const nextSort = makeVerseSortOrder();
+  const seen = new Set<string>();
   let batch: D1PreparedStatement[] = [];
   const flush = async () => {
     if (batch.length === 0) return;
@@ -675,6 +691,8 @@ async function insertTqRows(
   for (const r of rows) {
     const id = r["ID"];
     if (!id) continue;
+    if (seen.has(id)) continue; // duplicate ID in master's file — first-in wins
+    seen.add(id);
     const refRaw = r["Reference"] ?? "";
     const [ch, v] = refParts(refRaw);
     const occRaw = r["Occurrence"];
@@ -715,10 +733,13 @@ async function insertTwlRows(
   const { rows } = parseTsv(raw);
   if (rows.length === 0) return 0;
 
+  // Duplicate-ID tolerance: see insertTnRows above (ON CONFLICT backstop +
+  // `seen` skip so audit/count stay truthful; first-in wins).
   const insertStmt = env.DB.prepare(
     `INSERT INTO twl_rows
        (id, book, chapter, verse, ref_raw, tags, orig_words, occurrence, tw_link, sort_order)
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)`,
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+     ON CONFLICT(book, id) DO NOTHING`,
   );
   const auditStmt = env.DB.prepare(
     `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, payload_json)
@@ -727,6 +748,7 @@ async function insertTwlRows(
 
   let count = 0;
   const nextSort = makeVerseSortOrder();
+  const seen = new Set<string>();
   let batch: D1PreparedStatement[] = [];
   const flush = async () => {
     if (batch.length === 0) return;
@@ -737,6 +759,8 @@ async function insertTwlRows(
   for (const r of rows) {
     const id = r["ID"];
     if (!id) continue;
+    if (seen.has(id)) continue; // duplicate ID in master's file — first-in wins
+    seen.add(id);
     const refRaw = r["Reference"] ?? "";
     const [ch, v] = refParts(refRaw);
     const occRaw = r["Occurrence"];

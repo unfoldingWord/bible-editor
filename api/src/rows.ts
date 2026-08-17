@@ -7,6 +7,7 @@ import { activePipelineForChapter, lockedResponseBody } from "./chapterLock";
 import { broadcastChapter } from "./wsEvents";
 import { newRowId } from "./rowId";
 import { blankStubClause } from "./blankStub";
+import { contentPatchClearClauses } from "./contentPatchClauses";
 import { reopenLaneChecks } from "./laneReopen";
 import { refParts, coveredVersesFromRef } from "./importParsers";
 import { requiredOccurrence } from "./occurrenceRule";
@@ -801,13 +802,14 @@ rows.patch("/:kind/:id", requireEditor, async (c) => {
   const userId = currentUserId(c);
   const now = Math.floor(Date.now() / 1000);
   const setClauses = fields.map((f, i) => `${f} = ?${i + 1}`);
-  // Any content edit clears a pending review flag (the adapted-note verify
-  // queue for tn; the merged-Door43-edit conflict flag for all three kinds —
-  // migration 0047). Literal NULLs — no bind params, so positional indices
-  // below are unaffected. The reorder-only fast path above returns before here,
-  // so a drag never clears a flag. All three tables carry the columns.
-  setClauses.push("review_kind = NULL");
-  setClauses.push("review_reason = NULL");
+  // Any content edit clears a pending review flag, and (tn only) also
+  // UN-trashes the row — a versioned edit landing on a trashed row must not
+  // be silently tombstoned by the nightly finalize (see
+  // contentPatchClauses.ts for the full rationale and the SQL-backed
+  // regression test). Literal NULLs — no bind params, so positional indices
+  // below are unaffected. The reorder-only fast path above returns before
+  // here, so a drag never clears a flag or revives a trashed note.
+  setClauses.push(...contentPatchClearClauses(kind));
   const baseParams = fields.length;
   // version bump and metadata go after the patch fields, then the WHERE
   // params (id + expected version + book) tail the bindings.

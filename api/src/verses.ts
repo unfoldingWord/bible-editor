@@ -119,10 +119,17 @@ verses.get("/:book/:chapter/:verse/:bibleVersion", async (c) => {
   if (!isAllowedBibleVersion(bv)) {
     return c.json({ error: "invalid_bible_version" }, 400);
   }
+  // Non-numeric path segments parse to NaN, and a NaN bind 500s inside D1 —
+  // validate up front and 400 instead (mirrors chapters.ts).
+  const chapterNum = parseInt(chapter, 10);
+  const verseNum = parseInt(verse, 10);
+  if (!Number.isFinite(chapterNum) || !Number.isFinite(verseNum)) {
+    return c.json({ error: "invalid_params" }, 400);
+  }
   const row = await c.env.DB.prepare(
     `SELECT * FROM verses WHERE book = ?1 AND chapter = ?2 AND verse = ?3 AND bible_version = ?4`,
   )
-    .bind(book.toUpperCase(), parseInt(chapter, 10), parseInt(verse, 10), bv)
+    .bind(book.toUpperCase(), chapterNum, verseNum, bv)
     .first<VerseRow>();
   if (!row) return c.json({ error: "not_found" }, 404);
   let parsed: unknown;
@@ -158,6 +165,10 @@ verses.get("/:book/:chapter/:verse/:bibleVersion/history", requireEditor, async 
   const bibleVersion = c.req.param("bibleVersion").toUpperCase();
   if (!isAllowedBibleVersion(bibleVersion)) {
     return c.json({ error: "invalid_bible_version" }, 400);
+  }
+  // NaN binds 500 inside D1 — 400 up front instead (mirrors chapters.ts).
+  if (!Number.isFinite(chapter) || !Number.isFinite(verse)) {
+    return c.json({ error: "invalid_params" }, 400);
   }
 
   const row = await c.env.DB.prepare(
@@ -213,6 +224,10 @@ verses.patch("/:book/:chapter/:verse/:bibleVersion", requireEditor, async (c) =>
   const bibleVersion = c.req.param("bibleVersion").toUpperCase();
   if (!isAllowedBibleVersion(bibleVersion)) {
     return c.json({ error: "invalid_bible_version" }, 400);
+  }
+  // NaN binds 500 inside D1 — 400 up front instead (mirrors chapters.ts).
+  if (!Number.isFinite(chapter) || !Number.isFinite(verse)) {
+    return c.json({ error: "invalid_params" }, 400);
   }
   const expected = parseIfMatch(c.req.header("if-match"));
   if (expected === null) {

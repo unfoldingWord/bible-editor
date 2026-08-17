@@ -74,7 +74,10 @@ function mapRow(row: CommentRow): CommentDto {
     parentId: row.parent_id,
     kind: row.kind,
     body: row.body,
-    mentions: row.mentions_json ? (JSON.parse(row.mentions_json) as string[]) : [],
+    // Guarded parse — one corrupt row must not 500 the whole chapter GET
+    // (and a client retry of the 500 would duplicate comments). See
+    // parseMentionsJson below.
+    mentions: parseMentionsJson(row.mentions_json),
     authorId: row.author_id,
     authorName: row.author_name,
     createdAt: row.created_at,
@@ -352,7 +355,9 @@ comments.patch("/:id", async (c) => {
   const username = c.get("username");
   const knownUsernames = await allUsernames(c.env.DB);
   const newMentions = resolveMentions(parsed.data.body, knownUsernames, username);
-  const oldMentions: string[] = existing.mentions_json ? JSON.parse(existing.mentions_json) : [];
+  // Guarded parse — a corrupt mentions_json must not 500 the edit (see
+  // parseMentionsJson); worst case every mention counts as newly added.
+  const oldMentions: string[] = parseMentionsJson(existing.mentions_json);
   const oldLower = new Set(oldMentions.map((u) => u.toLowerCase()));
   const addedMentions = newMentions.filter((u) => !oldLower.has(u.toLowerCase()));
 

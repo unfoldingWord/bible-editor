@@ -1617,6 +1617,25 @@ function countNodes(nodes) {
   assert(curlifyText("") === "", "curlifyText: no-op on empty string");
   assert(curlifyText('say "hi" now') === "say “hi” now", `curlifyText: curls a simple quoted phrase (got ${JSON.stringify(curlifyText('say "hi" now'))})`);
   assert(curlifyText("LORD's house") === "LORD’s house", `curlifyText: curls a possessive apostrophe (got ${JSON.stringify(curlifyText("LORD's house"))})`);
+
+  // The two-char literal `\n` escape (unfoldingWord's TSV line-break
+  // convention in note/question/response prose) is an OPENING context.
+  // Regression: isOpeningQuoteContext only looked one character back, saw the
+  // "n", and curled the quote closing (”/’).
+  assert(
+    curlifyText('He said:\\n"Go to the land."') === "He said:\\n“Go to the land.”",
+    `curlifyText: double quote after a literal \\n escape opens (got ${JSON.stringify(curlifyText('He said:\\n"Go to the land."'))})`,
+  );
+  assert(
+    curlifyText("He said:\\n'Go to the land.'") === "He said:\\n‘Go to the land.’",
+    `curlifyText: single quote after a literal \\n escape opens (got ${JSON.stringify(curlifyText("He said:\\n'Go to the land.'"))})`,
+  );
+  // Guard against over-reach: a word merely ending in "n" (no backslash before
+  // it) must still read as a closing context.
+  assert(
+    curlifyText('the "land in" question') === "the “land in” question",
+    `curlifyText: a plain trailing n is still a closing context (got ${JSON.stringify(curlifyText('the "land in" question'))})`,
+  );
 }
 
 // ─── extractPlainText (exported for pipelineImport.ts's plain_text re-derive) ─

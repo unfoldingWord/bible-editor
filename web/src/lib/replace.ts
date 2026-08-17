@@ -229,20 +229,50 @@ export function tokenizeEditableText(text: string): unknown[] {
 // — so a later marker lands a word early and a word jumps across the line
 // break (Perry's "no space between the word and the \q marker" report).
 //
-// Bridge with a single space ONLY when a word char sits on BOTH sides; collapse
-// to "" otherwise. Punctuation-adjacent markers (`says,\q2`, `them.\q1`) keep
-// collapsing to "" — the comma/period already separates the words, so a bare
-// "" doesn't miscount, and preserving it avoids churning marker-adjacent
-// spacing into the stored tree on every edit. Every consumer tolerates the
-// inserted space: word counts and mapStrippedPosToRaw (collapses whitespace
-// runs on both sides) are whitespace-insensitive, and smartEditVerse wraps the
-// result in normalizeEditable.
+// Bridge with a single space ONLY when the join would tokenize as ONE
+// WORD_RUN_RE run (joinWouldFuse); collapse to "" otherwise. That covers the
+// letter-on-both-sides case AND the intra-word connectors that reach across
+// the seam: `walkede’\q2 and` glues to `walkede’and` — one token — so the
+// LETTER_RE-only test used here before let an edit against the \q2 chip fuse
+// the UNTOUCHED next word into the edited one (both alignments destroyed,
+// marker relocated). Separator-punctuation-adjacent markers (`says,\q2`,
+// `them.\q1`) keep collapsing to "" — the comma/period already separates the
+// words, so a bare "" doesn't miscount, and preserving it avoids churning
+// marker-adjacent spacing into the stored tree on every edit. Every consumer
+// tolerates the inserted space: word counts and mapStrippedPosToRaw (collapses
+// whitespace runs on both sides) are whitespace-insensitive, and
+// smartEditVerse wraps the result in normalizeEditable.
 function stripMarkerTokens(text: string): string {
   return text.replace(MARKER_TOKEN_RE, (match: string, _tag: string, offset: number) => {
-    const before = text[offset - 1] ?? "";
-    const after = text[offset + match.length] ?? "";
-    return LETTER_RE.test(before) && LETTER_RE.test(after) ? " " : "";
+    const left = text.slice(Math.max(0, offset - 2), offset);
+    const right = text.slice(offset + match.length, offset + match.length + 2);
+    return joinWouldFuse(left, right) ? " " : "";
   });
+}
+
+// Would gluing `left + right` (the text on either side of a removed marker)
+// bind the chars at the seam into ONE WORD_RUN_RE token? A letter pair is the
+// obvious case, but intra-word connectors reach across too: `walkede’` + `and`
+// tokenizes as `walkede’and` (apostrophe binds two letter runs, mirroring
+// snapDiffToWordBoundaries' connector rule) and `300` + `,000` as `300,000`
+// (grouping comma — but ONLY between digits, so `says,` + `and` stays two
+// tokens). Decide by actually tokenizing a 2-char window on each side of the
+// seam — WORD_RUN_RE itself is the ground truth, so this can't drift from its
+// connector rules the way a hand-written char-class check did. Two chars
+// suffice: every binding decision involves at most the seam char plus one
+// char beyond it on each side.
+//
+// MIRRORED in alignmentReassembly.ts (rebuildRaw) — the two must agree on when
+// a marker separates words, or GATE 1's old-token count diverges from the
+// caller's stripped streams. Change both together.
+function joinWouldFuse(left: string, right: string): boolean {
+  const l = left.slice(-2);
+  const joined = l + right.slice(0, 2);
+  for (const m of joined.matchAll(WORD_RUN_RE)) {
+    const start = m.index ?? 0;
+    if (start < l.length && start + m[0].length > l.length) return true;
+  }
+  return false;
 }
 
 // Letters / marks / numbers count as "core" word content — mirrors
@@ -1160,8 +1190,31 @@ export function smartReplaceVerse(
   //     collapse a pure 1:1 word replacement spanning such a break fails the
   //     skeleton check and drops to the localized rewrite, which unaligns even
   //     the UNCHANGED words inside the match.
-  const skeleton = (s: string): string => s.replace(WORD_RUN_RE, "").replace(/\s+/g, " ");
-  const sameSkeleton = skeleton(rawMatchText) === skeleton(replaceText);
+  //
+  //     Compare the gaps ELEMENT-WISE, not as one concatenated string:
+  //     concatenation is position-blind — "Yahweh." and ".ahweh" both
+  //     concatenate to ".", so a punctuation MOVE passed the gate and the
+  //     preserve loop (which keeps every non-word text leaf verbatim) either
+  //     silently relocated the typed punctuation back to its old slot, or —
+  //     when every word was textually unchanged too — discarded the edit
+  //     entirely (anyChanged stayed false). Each gap is the run of non-word
+  //     chars between two adjacent words (plus the leading/trailing runs),
+  //     whitespace-collapsed per the paragraph above.
+  const nonWordGaps = (s: string): string[] => {
+    const gaps: string[] = [];
+    let last = 0;
+    for (const m of s.matchAll(WORD_RUN_RE)) {
+      const start = m.index ?? 0;
+      gaps.push(s.slice(last, start).replace(/\s+/g, " "));
+      last = start + m[0].length;
+    }
+    gaps.push(s.slice(last).replace(/\s+/g, " "));
+    return gaps;
+  };
+  const matchGaps = nonWordGaps(rawMatchText);
+  const replaceGaps = nonWordGaps(replaceText);
+  const sameSkeleton =
+    matchGaps.length === replaceGaps.length && matchGaps.every((g, i) => g === replaceGaps[i]);
   const canPreserve =
     startsAtBoundary &&
     endsAtBoundary &&

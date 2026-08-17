@@ -58,6 +58,16 @@ t("apostrophe between letters → ’", () => assert.equal(educateQuotes("a pers
 t("quoted phrase → curly pair", () => assert.equal(educateQuotes('mean "will die."'), "mean “will die.”"));
 t("leaves existing curly quotes", () => assert.equal(educateQuotes("“already” curly"), "“already” curly"));
 t("no-op when no straight quotes", () => assert.equal(educateQuotes("no quotes here"), "no quotes here"));
+// The two-char literal \n escape (TSV line-break convention) is an OPENING
+// context: a quote right after it starts a new line. Regression — this used
+// to curl the wrong way (closing ”/’) because the context class only looked
+// one character back and saw the "n".
+t("double quote after a literal \\n escape OPENS", () =>
+  assert.equal(educateQuotes('He said:\\n"Go to the land."'), "He said:\\n“Go to the land.”"));
+t("single quote after a literal \\n escape OPENS", () =>
+  assert.equal(educateQuotes("He said:\\n'Go to the land.'"), "He said:\\n‘Go to the land.’"));
+t("a word merely ending in n is still a CLOSING context", () =>
+  assert.equal(educateQuotes('the "land in" question'), "the “land in” question"));
 
 // ── Alternate translation label (Check 12, auto-fixable subset) ──
 t("Alternative → Alternate", () => assert.equal(normalizeAltLabel("X. Alternative translation: Y"), "X. Alternate translation: Y"));
