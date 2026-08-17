@@ -44,6 +44,16 @@
 //       from the same review: a future row that reuses a freed id must not
 //       inherit the swept row's history via the (kind, book, row_key) key the
 //       history endpoint (rows.ts) reads.
+//   (i) EXTRA — more targets than one WRITE_BATCH/2-sized chunk (Codex
+//       re-review on PR #484) are all swept + purged, not just the first chunk.
+//   (j) EXTRA — a chapter master removed ENTIRELY (zero rows left anywhere in
+//       the incoming file) still gets its tombstone swept (Codex second
+//       re-review on PR #484): chapter coverage is read from D1's stored
+//       tombstones, not from the incoming file's own chapter set.
+//   (k) EXTRA — a thrown sweep batch sets applyIncomplete: true so the
+//       watermark gets withheld and the resource is retried, instead of a
+//       failed chunk's tombstones being silently certified as swept (Codex
+//       second re-review on PR #484).
 
 import { DatabaseSync } from "node:sqlite";
 import { readdirSync, readFileSync } from "node:fs";
@@ -324,7 +334,7 @@ console.log("\n[(f) an empty/garbled incoming file sweeps nothing — same defen
   seedTombstone(sqlite, { id: "obs1", ref: "5:1", chapter: 5, verse: 1 });
 
   const sweepEmpty = await sweepObsoleteTombstonesForTest(env, BOOK, "tq", "");
-  eq(sweepEmpty, { swept: 0, skippedLocked: 0 }, "an empty file sweeps nothing at all");
+  eq(sweepEmpty, { swept: 0, skippedLocked: 0, applyIncomplete: false }, "an empty file sweeps nothing at all");
 
   const sweepGarbled = await sweepObsoleteTombstonesForTest(env, BOOK, "tq", "not a tsv file\nat all");
   eq(sweepGarbled.swept, 0, "a headers-only/garbled file (no parseable ID column) sweeps nothing either");
@@ -388,10 +398,12 @@ console.log(
     seedTombstone(sqlite, { id, ref: "10:1", chapter: 10, verse: 1 });
     seedEditLog(sqlite, { id });
   }
-  // One live padding row so chapter 10 is "covered" by the incoming file.
-  seedLive(sqlite, { id: "pad0", ref: "10:9", chapter: 10, verse: 9 });
+  // A live row in an UNRELATED chapter — just enough to make `incomingIds`
+  // non-empty and clear the empty/garbled-file guard. Chapter coverage no
+  // longer needs a padding row in chapter 10 itself (see (j) below).
+  seedLive(sqlite, { id: "pad0", ref: "99:9", chapter: 99, verse: 9 });
 
-  const raw = tqMasterTsv([{ id: "pad0", ref: "10:9", chapter: 10, verse: 9 }]);
+  const raw = tqMasterTsv([{ id: "pad0", ref: "99:9", chapter: 99, verse: 9 }]);
   const sweep = await sweepObsoleteTombstonesForTest(env, BOOK, "tq", raw);
   eq(sweep.swept, N, `(i) all ${N} obsolete tombstones swept across multiple batch() chunks, not just the first 45`);
 
@@ -402,6 +414,64 @@ console.log(
     .prepare(`SELECT COUNT(*) AS n FROM edit_log WHERE kind = 'tq' AND row_key LIKE 't0%'`)
     .all()[0].n;
   eq(remainingLogs, 0, "(i) and every one of their edit_log entries was purged along with them");
+}
+
+console.log(
+  "\n[(j) REGRESSION (Codex second re-review on PR #484): a chapter master removed ENTIRELY still gets swept]",
+);
+{
+  // The bug: an earlier version derived chapter coverage from the INCOMING
+  // file's own rows. If master drops a chapter completely — zero rows left
+  // anywhere in the file — that chapter has no representation there either,
+  // so a tombstone sitting in it was permanently unreachable. Prove the fix
+  // by seeding a tombstone in chapter 12 and an incoming file that mentions
+  // chapter 12 NOWHERE AT ALL (only an unrelated chapter, to keep
+  // `incomingIds` non-empty).
+  const { sqlite, env } = freshEnv();
+  seedTombstone(sqlite, { id: "gon1", ref: "12:1", chapter: 12, verse: 1 });
+
+  const raw = tqMasterTsv([{ id: "pad0", ref: "1:1", chapter: 1, verse: 1 }]);
+  // Prove the premise: chapter 12 has zero rows in the incoming file at all —
+  // no Reference column value starts with "12:".
+  const refs = raw.split("\n").slice(1).map((line) => line.split("\t")[0]);
+  eq(refs.some((ref) => ref.startsWith("12:")), false, "(j) chapter 12 appears nowhere in the incoming file");
+
+  const sweep = await sweepObsoleteTombstonesForTest(env, BOOK, "tq", raw);
+  eq(sweep.swept, 1, "(j) gon1 swept even though chapter 12 has no rows anywhere in the incoming file");
+
+  const gon1 = sqlite.prepare(`SELECT deleted_at FROM tq_rows WHERE book = ? AND id = ?`).all(BOOK, "gon1");
+  eq(gon1.length, 0, "(j) and it is genuinely gone");
+}
+
+console.log(
+  "\n[(k) REGRESSION (Codex second re-review on PR #484): a thrown sweep batch sets applyIncomplete]",
+);
+{
+  const { sqlite, env } = freshEnv();
+  seedTombstone(sqlite, { id: "boom", ref: "13:1", chapter: 13, verse: 1 });
+
+  // Force env.DB.batch() to throw, simulating a D1 batch failure mid-sweep —
+  // the same shape as any other correctness-bearing write throw in this file
+  // (TSV three-way merge, verse master-adoption).
+  const realBatch = env.DB.batch.bind(env.DB);
+  let batchCalls = 0;
+  env.DB.batch = async (stmts) => {
+    batchCalls++;
+    throw new Error("simulated D1 batch failure");
+  };
+
+  const raw = tqMasterTsv([{ id: "pad0", ref: "1:1", chapter: 1, verse: 1 }]);
+  const sweep = await sweepObsoleteTombstonesForTest(env, BOOK, "tq", raw);
+  eq(batchCalls, 1, "(k) sanity: the sweep's batch() call actually ran (and threw)");
+  eq(sweep.swept, 0, "(k) nothing counted as swept when the batch threw");
+  eq(sweep.applyIncomplete, true, "(k) applyIncomplete is set so the caller withholds the watermark and retries");
+
+  // The row is untouched — the batch threw before (or during) its D1 round
+  // trip, so nothing committed.
+  env.DB.batch = realBatch;
+  const boom = sqlite.prepare(`SELECT deleted_at FROM tq_rows WHERE book = ? AND id = ?`).all(BOOK, "boom");
+  eq(boom.length, 1, "(k) the tombstone is untouched — the failed batch changed nothing");
+  eq(boom[0].deleted_at != null, true, "(k) and is still a tombstone, not half-deleted");
 }
 
 if (failed > 0) {
