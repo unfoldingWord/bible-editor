@@ -241,7 +241,10 @@ console.log("\n[issue #485 P1 follow-up — AI-only row is the ONLY row in its c
   const changed = await changedTsvChapters(env, BOOK, "tn", raw);
   eq(changed.has(5), true, "chapter 5 IS flagged changed — the widened gate catches the fully-emptied chapter");
 
-  const res = await softDeleteRemovedTsvRows(env, BOOK, "tn", raw, [...changed]);
+  // verifiedComplete: true — this fetch is treated as carrying fetchDcsMasterText's
+  // independent completeness proof (fetchTsvMasterVerified succeeded), so the
+  // widened coveredChapters extension is trusted.
+  const res = await softDeleteRemovedTsvRows(env, BOOK, "tn", raw, [...changed], true);
   eq(res.deleted, 1, "the prune actually deletes the AI-only row, not just flags its chapter");
 
   const row = sqlite.prepare(`SELECT deleted_at, updated_by FROM tn_rows WHERE book = ? AND id = 'bbbb'`).all(BOOK)[0];
@@ -272,10 +275,62 @@ console.log("\n[control — a truncated/incomplete fetch must NOT be trusted as 
   // not-fetched (raw discarded) BEFORE it can reach the prune at all — so the
   // prune must never run here, and the AI-only row must survive untouched.
   if (!truncated) {
-    await softDeleteRemovedTsvRows(env, BOOK, "tn", raw, [3, 5]);
+    await softDeleteRemovedTsvRows(env, BOOK, "tn", raw, [3, 5], false);
   }
   const row = sqlite.prepare(`SELECT deleted_at FROM tn_rows WHERE book = ? AND id = 'bbbb'`).all(BOOK)[0];
   eq(row.deleted_at, null, "the AI-only row survives — a truncated fetch never gets to drive the prune");
+}
+
+// ── Second P1 follow-up (codex re-review of b826dcb) ───────────────────────
+// b826dcb's coveredChapters widening was gated only on "the caller already
+// survived tsvFetchLooksTruncated" — but that gate is a LOSS-PERCENTAGE
+// heuristic (isCatastrophicTsvShrink: >=50% drop, and only above
+// SHRINK_GUARD_MIN_LIVE live rows), not a positive completeness guarantee. A
+// fetch that is genuinely partial — e.g. it silently dropped one chapter's
+// only row — but whose overall loss stays under that 50% threshold sails
+// through tsvFetchLooksTruncated as "not truncated" while still being wrong
+// about chapter 5 specifically. This proves that shape: the same fixture as
+// the fully-emptied-chapter case above, but WITHOUT a positive completeness
+// proof for this fetch (verifiedComplete: false — simulating
+// fetchDcsMasterText being unavailable/returning null so only the
+// loss-percentage heuristic passed). The prune must fall back to the
+// conservative pre-b826dcb behavior and leave chapter 5 alone.
+console.log("\n[second P1 follow-up — a partial fetch that PASSES the loss-percentage heuristic, without positive completeness proof, must NOT prune an absent chapter]");
+{
+  const { sqlite, env } = freshEnv();
+  // 21 pristine rows in chapter 3 + 1 AI-only row in chapter 5 = 22 live rows
+  // (>= SHRINK_GUARD_MIN_LIVE). The incoming body carries all 21 chapter-3 rows
+  // but omits chapter 5 entirely: incoming=21 vs live=22, a ~4.5% loss — nowhere
+  // near isCatastrophicTsvShrink's 50% threshold, so tsvFetchLooksTruncated
+  // reads this as a perfectly healthy fetch even though it silently dropped an
+  // entire chapter (the "60 of 100 rows" shape the review described).
+  for (let i = 0; i < 21; i++) {
+    seedPristineRow(sqlite, { id: `p${String(i).padStart(3, "0")}`, chapter: 3, verse: i + 1, ref: `3:${i + 1}` });
+  }
+  seedAiOnlyRow(sqlite, { id: "bbbb", chapter: 5, verse: 1, ref: "5:1" });
+
+  const raw = [
+    TN_TSV_HEADER,
+    ...Array.from({ length: 21 }, (_, i) =>
+      tnTsvRow({ id: `p${String(i).padStart(3, "0")}`, ref: `3:${i + 1}`, note: "pristine note" }),
+    ),
+  ].join("\n");
+
+  const truncated = await tsvFetchLooksTruncated(env, BOOK, "tn", raw);
+  eq(truncated, false, "the loss-percentage heuristic does NOT flag this fetch — the exact gap the review found");
+
+  const changed = await changedTsvChapters(env, BOOK, "tn", raw);
+  eq(changed.has(5), true, "chapter 5 is still flagged changed by the diff gate (the AI-only row is absent)");
+
+  // verifiedComplete: false — no independent completeness proof for this fetch
+  // (fetchDcsMasterText unavailable/null; only the heuristic above passed).
+  // coveredChapters must fall back to body-present chapters only, so chapter 5
+  // (absent from the body) is never touched by the prune.
+  const res = await softDeleteRemovedTsvRows(env, BOOK, "tn", raw, [...changed], false);
+  eq(res.deleted, 0, "nothing is deleted — chapter 5 is not covered without a positive completeness proof");
+
+  const row = sqlite.prepare(`SELECT deleted_at FROM tn_rows WHERE book = ? AND id = 'bbbb'`).all(BOOK)[0];
+  eq(row.deleted_at, null, "the AI-only row survives — the unverified fetch's absence is not trusted as an emptied chapter");
 }
 
 if (failed > 0) {
