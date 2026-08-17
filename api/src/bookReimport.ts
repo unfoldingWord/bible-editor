@@ -47,8 +47,7 @@ import {
   dcsRawUrl,
   fileCommitSha,
   fetchText,
-  fetchDcsMasterText,
-  dcsFileSize,
+  fetchDcsMasterTextVerified,
   NT_BOOKS,
 } from "./dcsSources";
 import { gitBlobShaOrNull, recognizeOwnPublish, type OwnPublishResult } from "./ownPublish";
@@ -1880,27 +1879,35 @@ async function lastTsvDeleteWasReimport(
 // prune would tombstone every pristine/AI-owned row in them — exactly the
 // blast radius the review flagged.
 //
-// PR #502 (issue #494) added fetchDcsMasterText/dcsFileSize: an INDEPENDENT
-// positive proof, cross-checking the downloaded byte count against Gitea's
-// own contents-API-recorded size for the file (not just a possibly-absent
-// Content-Length), fail-closed (null) on a persistent short read. This wrapper
-// calls dcsFileSize directly (in addition to fetchDcsMasterText's own internal
-// call) purely to observe, for THIS fetch, whether that independent size
-// source was actually available — non-null means fetchDcsMasterText's byte
-// cross-check was genuinely exercised, so a non-null `raw` here is trustworthy
-// as "the WHOLE file", not merely "enough of the file to dodge the shrink
-// heuristic". `verifiedComplete` is what softDeleteRemovedTsvRows' widened
-// coveredChapters is now gated on (see there) — when it's false, coverage
-// falls back to the original conservative behavior (only chapters with rows
-// actually present in the incoming body).
+// PR #502 (issue #494) added fetchDcsMasterTextVerified/dcsFileSize: an
+// INDEPENDENT positive proof, cross-checking the downloaded byte count
+// against Gitea's own contents-API-recorded size for the file (not just a
+// possibly-absent Content-Length), fail-closed (null/false) on a persistent
+// short read. This thin adapter renames its `{text, verified}` result to the
+// `raw`/`verifiedComplete` shape the rest of this module's TSV-fetch call
+// sites already use — nothing more.
+//
+// FINAL P1 follow-up (a later codex re-review of THIS fix's first version):
+// the original version of this function made its OWN separate dcsFileSize()
+// call and then called fetchDcsMasterText() (which does its own, separately
+// -timed, internal dcsFileSize() call) — two independent network round trips
+// to the same "is the size available right now" question, which can
+// disagree. `verifiedComplete` was computed from THIS function's own probe,
+// not from whatever fetchDcsMasterText's internal probe actually used to
+// check the bytes it returned — so `verifiedComplete: true` could land
+// alongside a `raw` whose own completeness check never actually ran (that
+// internal probe could have failed transiently even though this one
+// succeeded). fetchDcsMasterTextVerified closes that gap: the verified flag
+// is computed INSIDE the one function that performs the fetch and the check,
+// from the exact apiSize/buffer it used — no second, separately-timed probe,
+// so "verified" and "raw" can never desynchronize.
 async function fetchTsvMasterVerified(
   env: Env,
   repo: string,
   path: string,
 ): Promise<{ raw: string | null; verifiedComplete: boolean }> {
-  const apiSize = await dcsFileSize(env, repo, path);
-  const raw = await fetchDcsMasterText(env, repo, path);
-  return { raw, verifiedComplete: raw != null && apiSize != null };
+  const { text, verified } = await fetchDcsMasterTextVerified(env, repo, path);
+  return { raw: text, verifiedComplete: verified };
 }
 
 // ── Truncated-fetch completeness gate ───────────────────────────────────────

@@ -241,18 +241,30 @@ export async function dcsFileSize(
 // (e.g. a stripped BOM) that would make this comparison unreliable. Fetching
 // once here and checking both the header and the API size against the same
 // ArrayBuffer keeps the byte count exact.
-export async function fetchDcsMasterText(
+//
+// `verified` (issue #485's second/final P1 follow-up, PR #501): true only
+// when `apiSize` — the independent Gitea contents-API byte count — was
+// available for and used by THIS fetch's own check, computed from the exact
+// same `apiSize`/buffer the loop below already checked. Deliberately NOT
+// derived by having a caller make its own separate dcsFileSize() call before
+// or after calling this function: two separately-timed network calls to the
+// same "is it available right now" question can disagree (a transient
+// failure on one but not the other), so a caller-side "verified = my own
+// probe succeeded" can be true even though THIS fetch's own completeness
+// check never actually ran against a size. The verified flag has to be born
+// inside the one function that performs the check, from the value it used.
+export async function fetchDcsMasterTextVerified(
   env: Env,
   repo: string,
   path: string,
   ref = "master",
-): Promise<string | null> {
+): Promise<{ text: string | null; verified: boolean }> {
   const url = dcsRawUrl(env, repo, path);
   const apiSize = await dcsFileSize(env, repo, path, ref);
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
       const r = await fetch(url);
-      if (!r.ok) return null;
+      if (!r.ok) return { text: null, verified: false };
       const buf = await r.arrayBuffer();
       const cl = r.headers.get("content-length");
       const expectedCl = cl == null ? null : Number(cl);
@@ -284,10 +296,28 @@ export async function fetchDcsMasterText(
           gotBytes: buf.byteLength,
         });
       }
-      return new TextDecoder("utf-8").decode(buf);
+      // verified: true only when apiSize (the independent Gitea size) was
+      // actually available and cross-checked above — a Content-Length-only
+      // pass, or the fully-unverifiable case just warned about, is NOT
+      // "verified" in the sense a caller can use to trust a body-absent
+      // chapter as genuinely emptied (see softDeleteRemovedTsvRows).
+      return { text: new TextDecoder("utf-8").decode(buf), verified: apiSize != null };
     } catch {
       // network error → retry once, then null
     }
   }
-  return null;
+  return { text: null, verified: false };
+}
+
+// Plain-text convenience wrapper over fetchDcsMasterTextVerified for callers
+// (the export shrink guards) that only ever check `raw == null` and don't
+// need the verified flag — preserves the original fetchDcsMasterText call
+// shape those sites already use.
+export async function fetchDcsMasterText(
+  env: Env,
+  repo: string,
+  path: string,
+  ref = "master",
+): Promise<string | null> {
+  return (await fetchDcsMasterTextVerified(env, repo, path, ref)).text;
 }

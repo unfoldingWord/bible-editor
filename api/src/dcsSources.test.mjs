@@ -5,7 +5,7 @@
 //
 // Not a test framework; a failed assert exits non-zero.
 
-import { dcsFileSize, fetchDcsMasterText, fetchText } from "./dcsSources.ts";
+import { dcsFileSize, fetchDcsMasterText, fetchDcsMasterTextVerified, fetchText } from "./dcsSources.ts";
 
 function assert(cond, msg) {
   if (!cond) {
@@ -209,6 +209,81 @@ async function run() {
   calls = 0;
   assert((await fetchDcsMasterText(env, "en_twl", "twl_PSA.tsv")) === null, "fetchDcsMasterText: non-ok raw response → null");
   assert(calls === 2, "  ...no retry on non-ok");
+
+  // ── fetchDcsMasterTextVerified — issue #485 final P1 follow-up ─────────
+  // The defect this closes: an EARLIER version of the reimport's own
+  // fetchTsvMasterVerified wrapper (bookReimport.ts) made its own SEPARATE
+  // dcsFileSize() call, then called fetchDcsMasterText() — which does its
+  // OWN, separately-timed, internal dcsFileSize() call — and derived
+  // `verified` from ITS OWN probe rather than from whatever
+  // fetchDcsMasterText's internal probe actually used to check the returned
+  // bytes. Two independent network round trips answering the same "is the
+  // size available right now" question can disagree, so `verified: true`
+  // could land next to a `raw` whose own completeness check never actually
+  // ran. fetchDcsMasterTextVerified fixes this by computing `verified`
+  // INSIDE the one function that performs both the fetch and the check, from
+  // the exact apiSize/buffer it used — these cases pin that contract.
+
+  // 17. apiSize available and used to validate the returned bytes (after a
+  //     retry) → verified: true, paired with the complete body.
+  queue = [
+    jsonRes({ body: { size: 20 } }),
+    res({ body: "short", contentLength: undefined }),
+    res({ body: "the complete master body", contentLength: undefined }),
+  ];
+  calls = 0;
+  {
+    const r = await fetchDcsMasterTextVerified(env, "en_twl", "twl_PSA.tsv");
+    assert(r.text === "the complete master body", "fetchDcsMasterTextVerified: retried body returned");
+    assert(r.verified === true, "fetchDcsMasterTextVerified: verified true — apiSize was available and checked");
+  }
+
+  // 18. Truncated on both attempts → text: null, verified: false (never claim
+  //     verified alongside a null body).
+  queue = [
+    jsonRes({ body: { size: 20 } }),
+    res({ body: "short", contentLength: undefined }),
+    res({ body: "short", contentLength: undefined }),
+  ];
+  {
+    const r = await fetchDcsMasterTextVerified(env, "en_twl", "twl_PSA.tsv");
+    assert(r.text === null, "fetchDcsMasterTextVerified: gives up after retry → text null");
+    assert(r.verified === false, "fetchDcsMasterTextVerified: verified false alongside a null body");
+  }
+
+  // 19. Content-Length present and correct, but the Gitea contents-API size
+  //     was UNAVAILABLE (404/network) → text is still returned (the
+  //     Content-Length-only check passed), but verified MUST be false: the
+  //     independent positive proof this flag promises never actually ran.
+  queue = [jsonRes({ ok: false, body: {} }), res({ body: "hello world", contentLength: "11" })];
+  {
+    const r = await fetchDcsMasterTextVerified(env, "en_twl", "twl_PSA.tsv");
+    assert(r.text === "hello world", "fetchDcsMasterTextVerified: Content-Length-only pass still returns the body");
+    assert(
+      r.verified === false,
+      "fetchDcsMasterTextVerified: verified false — a Content-Length-only pass is NOT the independent proof",
+    );
+  }
+
+  // 20. Neither Content-Length nor contents-API size available → text still
+  //     returned (matches fetchDcsMasterText's documented blind spot), but
+  //     verified is unambiguously false.
+  queue = [jsonRes({ ok: false, body: {} }), res({ body: "unverifiable body", contentLength: undefined })];
+  {
+    const r = await fetchDcsMasterTextVerified(env, "en_twl", "twl_PSA.tsv");
+    assert(r.text === "unverifiable body", "fetchDcsMasterTextVerified: wholly unverifiable body still returned");
+    assert(r.verified === false, "fetchDcsMasterTextVerified: verified false — no independent signal existed at all");
+  }
+
+  // 21. apiSize available AND the body matches on the FIRST attempt (no
+  //     retry needed) → verified: true. Confirms verified doesn't require a
+  //     retry to have happened — just that apiSize was checked at all.
+  queue = [jsonRes({ body: { size: 11 } }), res({ body: "hello world", contentLength: undefined })];
+  {
+    const r = await fetchDcsMasterTextVerified(env, "en_twl", "twl_PSA.tsv");
+    assert(r.text === "hello world", "fetchDcsMasterTextVerified: apiSize match on first attempt returns body");
+    assert(r.verified === true, "fetchDcsMasterTextVerified: verified true on a clean first-attempt match too");
+  }
 
   console.error = origError;
   console.warn = origWarn;
