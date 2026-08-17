@@ -35,7 +35,6 @@ export interface Env {
   DCS_OAUTH_AUTHORIZE_URL: string;
   DCS_OAUTH_TOKEN_URL: string;
   JWT_ISSUER: string;
-  JWT_TTL_SECONDS: string;
   ALLOWED_ORIGINS?: string;
   DEV_AUTH_ENABLED?: string;
   DCS_CLIENT_ID?: string;
