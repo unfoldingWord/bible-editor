@@ -891,6 +891,14 @@ export interface ReimportCounts {
   // does NOT carry at all. See api/src/bookReimport.ts's sweepObsoleteTombstones.
   // Optional: an older/cached response may omit it.
   tombstones_swept?: number;
+  // Chapters whose sweep was deferred for an active AI pipeline lock (this
+  // run). Optional: an older/cached response may omit it.
+  tombstones_locked?: number;
+  // First-seen obsolete-eligible tombstones marked but not yet hard-deleted —
+  // the two-phase confirmation gate (a fresh candidate needs a LATER,
+  // independent run to also see it as obsolete before the irreversible
+  // delete fires). Optional: an older/cached response may omit it.
+  tombstones_pending?: number;
   dcs_404: number;
   errors: string[];
 }
@@ -1307,11 +1315,16 @@ export interface AdminImportCounts {
   tombstone_blocked?: number;
   // Issue #427, option 3 — see ReimportCounts.tombstones_swept above for the
   // disjointness note (identical reasoning, same server object). tombstones_
-  // locked is diagnostic only (chapters this run's sweep deferred for an
-  // active pipeline lock); unlike prune_locked/chapters_locked it never gates
-  // the sync watermark. Optional: an older/cached response may omit them.
+  // locked (chapters this run's sweep deferred for an active pipeline lock)
+  // DOES gate the sync watermark, same as prune_locked/chapters_locked — the
+  // only mechanism guaranteeing the deferred chapter gets revisited, since the
+  // SHA gate can otherwise skip an unchanged file forever. tombstones_pending
+  // (first-seen obsolete-eligible ids marked but not yet hard-deleted — the
+  // two-phase confirmation gate) is purely informational, like
+  // tombstones_swept. Optional: an older/cached response may omit them.
   tombstones_swept?: number;
   tombstones_locked?: number;
+  tombstones_pending?: number;
   resurrected: number;
   source_attr_reconciled: number;
   source_attr_divergent: number;

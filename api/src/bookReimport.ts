@@ -64,6 +64,7 @@ import {
   computeEditedFieldMerge,
   isReissuedTombstone,
   isObsoleteTombstoneId,
+  ownPublishSweepBlocksStamp,
 } from "./reimportClassify";
 import {
   computeTsvMerge,
@@ -247,6 +248,13 @@ export interface ReimportCounts {
   // self-clearing cost (AI pipeline jobs are short-lived), and the same
   // tradeoff chapters_locked/prune_locked already accept.
   tombstones_locked: number;
+  // First-seen obsolete-eligible tombstones this run marked (edit_log,
+  // action=SWEEP_CANDIDATE_ACTION) but did NOT hard-delete — the two-phase
+  // confirmation gate added after Codex's third re-review on PR #484 (see
+  // sweepObsoleteTombstones' Phase 1.5). Pure observability, like
+  // tombstones_swept: never gates the watermark. A pending id costs nothing
+  // but one extra run before its slot is actually reclaimed.
+  tombstones_pending: number;
   // Pristine tombstone that master still carries, brought back to life because
   // an earlier reimport prune had erroneously soft-deleted it (the HAB tn
   // truncated-fetch incident). Human-deleted/trashed rows are never resurrected.
@@ -384,6 +392,20 @@ export interface ReimportResult {
 
 const REIMPORT_SOURCE = "dcs_reimport";
 
+// edit_log.action value for a tombstone-sweep two-phase confirmation marker
+// (see sweepObsoleteTombstones). Deliberately outside the ('create', 'update',
+// 'delete', 'restore') set every history/latest_source read already filters
+// on (rows.ts's history handler, and every `latest_source` sub-select in this
+// file) — a marker must be invisible to those, not just harmless to them.
+const SWEEP_CANDIDATE_ACTION = "sweep_candidate";
+
+// Minimum age (seconds) a SWEEP_CANDIDATE_ACTION marker must have before it
+// counts as "an earlier, independent run" rather than a same-`step.do`-retry
+// re-execution. See its use in sweepObsoleteTombstones for the full reasoning
+// — comfortably longer than the reimport-fetch step's retry backoff window
+// (limit 2, ~10-30s), comfortably shorter than the ~24h nightly cadence.
+const SWEEP_CANDIDATE_MIN_AGE_SECONDS = 300;
+
 // Cap on ReimportCounts.blocked_samples. Also caps the per-row console.warn at
 // each drop site: a mass id-reissue would otherwise emit one Workers log line
 // per row, and the per-resource summary at the reimport-sync step already
@@ -416,6 +438,7 @@ function zeroCounts(): ReimportCounts {
     tombstone_blocked: 0,
     tombstones_swept: 0,
     tombstones_locked: 0,
+    tombstones_pending: 0,
     resurrected: 0,
     source_attr_reconciled: 0,
     source_attr_divergent: 0,
@@ -502,6 +525,7 @@ function addCounts(into: ReimportCounts, from: ReimportCounts): void {
   into.tombstone_blocked += from.tombstone_blocked ?? 0;
   into.tombstones_swept += from.tombstones_swept ?? 0;
   into.tombstones_locked += from.tombstones_locked ?? 0;
+  into.tombstones_pending += from.tombstones_pending ?? 0;
   // Diagnostic list, merged under the same cap. Never gates anything, so a
   // truncation here cannot affect a watermark decision.
   if (from.blocked_samples?.length) {
@@ -851,6 +875,7 @@ async function runReimport(
       const res = await sweepObsoleteTombstones(env, book, kind, raw);
       perResource[kind].tombstones_swept += res.swept;
       perResource[kind].tombstones_locked += res.skippedLocked;
+      perResource[kind].tombstones_pending += res.pending;
       perResource[kind].skipped_locked += res.skippedLocked;
       if (res.applyIncomplete) perResource[kind].apply_incomplete = true;
     } catch (e) {
@@ -3186,6 +3211,17 @@ interface StagedResource {
   // `changed: false`, but for a completely different reason than a SHA match or
   // a 404, so it is reported separately (own_publish_converged).
   ownPublish?: boolean;
+  // Issue #427, option 3 (Codex third re-review on PR #484): sweepObsoleteTombstones'
+  // result when it ran during OWN-PUBLISH recognition — the most common
+  // steady-state path an obsolete tombstone's id ever takes (a translator's
+  // app-side delete propagates to master via export; the NEXT reimport
+  // recognizes it as our own publish, `changed: false`, so the `changed`-only
+  // loop in runChunkedReimport can never reach it). See the own-publish branch
+  // below for why this is also uniquely strong completeness evidence.
+  tombstonesSwept?: number;
+  tombstonesLocked?: number;
+  tombstonesPending?: number;
+  tombstonesApplyIncomplete?: boolean;
 }
 
 interface ReimportPlan {
@@ -3957,7 +3993,9 @@ async function softDeleteRemovedTsvRows(
 
 // Sweep obsolete tombstones (issue #427, option 3): free the (book, id)
 // primary-key slot a soft-deleted row occupies FOREVER once master's TSV no
-// longer carries that id ANYWHERE in the book. Complements
+// longer carries that id ANYWHERE in the book — confirmed independently on
+// TWO separate runs before the irreversible hard-delete actually fires (see
+// Phase 1.5 below; Codex third re-review on PR #484). Complements
 // softDeleteRemovedTsvRows just above (which soft-deletes a LIVE row master
 // dropped) by finishing the other half of the same lifecycle: once a row is
 // already dead AND master has moved on from its id entirely, there is nothing
@@ -4032,7 +4070,7 @@ async function sweepObsoleteTombstones(
   book: string,
   kind: TsvKind,
   rawTsv: string,
-): Promise<{ swept: number; skippedLocked: number; applyIncomplete: boolean }> {
+): Promise<{ swept: number; skippedLocked: number; pending: number; applyIncomplete: boolean }> {
   const incomingIds = new Set<string>();
   for (const r of parseTsv(rawTsv).rows) {
     const p = parseTsvRow(r, kind);
@@ -4041,7 +4079,7 @@ async function sweepObsoleteTombstones(
   }
   // Defensive: an empty or garbled file must never be read as "master carries
   // nothing", which would make every tombstone in the book look obsolete.
-  if (incomingIds.size === 0) return { swept: 0, skippedLocked: 0, applyIncomplete: false };
+  if (incomingIds.size === 0) return { swept: 0, skippedLocked: 0, pending: 0, applyIncomplete: false };
 
   // Phase 1: read EVERY tombstoned row for this (book, kind) — book-wide, in
   // ONE query, NOT scoped to chapters the incoming file happens to still
@@ -4085,13 +4123,96 @@ async function sweepObsoleteTombstones(
     }
     targetIds.push(...ids);
   }
-  if (targetIds.length === 0) return { swept: 0, skippedLocked, applyIncomplete: false };
+  if (targetIds.length === 0) return { swept: 0, skippedLocked, pending: 0, applyIncomplete: false };
 
-  // Phase 2: delete each target row and purge its edit_log entries as an
-  // INTERLEAVED PAIR inside ONE atomic env.DB.batch() call per chunk — the
-  // same pattern applyVerseRows uses for its INSERT + conditional edit_log
-  // INSERT (see that function's header comment). Two things this fixes vs. a
-  // per-target `await`ed pair:
+  // Phase 1.5: two-phase confirmation before the irreversible hard-delete
+  // (Codex third re-review on PR #484). tsvFetchLooksTruncated — the
+  // completeness gate that decides whether this function is even called this
+  // run — is a HEURISTIC (a row-count shrink check), not a positive proof: a
+  // partial body that keeps enough rows to evade it (a small resource, or a
+  // truncation that still retains >=50%) makes every tombstone whose master
+  // row fell in the missing portion look obsolete, and this function would
+  // otherwise hard-delete them WITH their audit history, unrecoverably, on a
+  // run that ALSO stamps the watermark. Unlike softDeleteRemovedTsvRows'
+  // reversible soft-delete — a resurrect path already exists for exactly this
+  // shape of mistake, see isPristineTombstone/lastTsvDeleteWasReimport — a
+  // hard delete has no self-healing path once it lands.
+  //
+  // So: an id is never hard-deleted on the FIRST run that observes it as
+  // obsolete. It is marked instead — an edit_log row, action =
+  // SWEEP_CANDIDATE_ACTION — and only proceeds to Phase 2 on a LATER,
+  // independent run that observes it as obsolete AGAIN, i.e. a marker that
+  // already existed BEFORE this call. A single truncated-but-uncaught fetch
+  // can therefore, at worst, delay a real sweep by one cycle; on its own it
+  // can never cause a hard delete, because it would have to strike the SAME
+  // id in the SAME way on two SEPARATE, independently-fetched runs. The
+  // marker itself needs no separate cleanup: Phase 2's audit purge below
+  // deletes every edit_log entry for the row_key, marker included.
+  //
+  // "Existed before this call" is deliberately checked with a minimum AGE,
+  // not just presence: both call sites run inside a Workflow `step.do` with
+  // retries (reimport-fetch-${book}: limit 2, ~10-30s exponential backoff).
+  // A step that throws AFTER this function already committed a marker for
+  // one resource (e.g. a transient R2 write failure staging a LATER
+  // resource) retries the WHOLE step — which would call this function again
+  // for the SAME resource within seconds, and an age-blind marker check
+  // would read that as "an earlier, independent run confirmed this",
+  // collapsing two attempts of the SAME logical run into an immediate
+  // hard-delete. SWEEP_CANDIDATE_MIN_AGE_SECONDS is comfortably longer than
+  // the retry policy's total backoff window and comfortably shorter than the
+  // ~24h nightly cadence, so it only ever excludes a same-retry-cycle marker.
+  const markerCutoff = Math.floor(Date.now() / 1000) - SWEEP_CANDIDATE_MIN_AGE_SECONDS;
+  const alreadyMarked = new Set<string>();
+  for (let i = 0; i < targetIds.length; i += WRITE_BATCH) {
+    const slice = targetIds.slice(i, i + WRITE_BATCH);
+    const placeholders = slice.map((_, j) => `?${j + 5}`).join(", ");
+    const rs = await env.DB.prepare(
+      `SELECT DISTINCT row_key FROM edit_log
+        WHERE kind = ?1 AND book = ?2 AND action = ?3 AND created_at < ?4 AND row_key IN (${placeholders})`,
+    )
+      .bind(kind, book, SWEEP_CANDIDATE_ACTION, markerCutoff, ...slice)
+      .all<{ row_key: string }>();
+    for (const r of rs.results ?? []) alreadyMarked.add(r.row_key);
+  }
+
+  const confirmedIds: string[] = [];
+  const firstSeenIds: string[] = [];
+  for (const id of targetIds) {
+    (alreadyMarked.has(id) ? confirmedIds : firstSeenIds).push(id);
+  }
+
+  let pending = 0;
+  for (let i = 0; i < firstSeenIds.length; i += WRITE_BATCH) {
+    const slice = firstSeenIds.slice(i, i + WRITE_BATCH);
+    const stmts = slice.map((id) =>
+      env.DB.prepare(
+        `INSERT INTO edit_log (kind, row_key, book, action, source) VALUES (?1, ?2, ?3, ?4, ?5)`,
+      ).bind(kind, id, book, SWEEP_CANDIDATE_ACTION, REIMPORT_SOURCE),
+    );
+    try {
+      await env.DB.batch(stmts);
+      pending += slice.length;
+    } catch (e) {
+      // Non-fatal: nothing destructive was attempted, and no watermark
+      // consequence — the id is simply still obsolete-eligible and will be
+      // re-observed (and re-marked) on a later run.
+      console.error("reimport: tombstone sweep candidate-marker batch failed (will retry next run)", {
+        book,
+        kind,
+        count: slice.length,
+        error: e instanceof Error ? e.message : String(e),
+      });
+    }
+  }
+
+  if (confirmedIds.length === 0) return { swept: 0, skippedLocked, pending, applyIncomplete: false };
+
+  // Phase 2: delete each CONFIRMED target row (id was already marked before
+  // this call — a second, independent obsolete-sighting) and purge its
+  // edit_log entries as an INTERLEAVED PAIR inside ONE atomic env.DB.batch()
+  // call per chunk — the same pattern applyVerseRows uses for its INSERT +
+  // conditional edit_log INSERT (see that function's header comment). Two
+  // things this fixes vs. a per-target `await`ed pair:
   //   - Subrequest budget: a book can hold thousands of obsolete tombstones
   //     (10,641 in the issue's production sweep) — two unbatched D1 calls per
   //     target would blow the per-invocation subrequest cap the same way the
@@ -4115,8 +4236,8 @@ async function sweepObsoleteTombstones(
   // a later night instead of a failed chunk's tombstones being silently
   // certified as swept (Codex re-review on PR #484).
   let applyIncomplete = false;
-  for (let i = 0; i < targetIds.length; i += PAIR_BATCH) {
-    const slice = targetIds.slice(i, i + PAIR_BATCH);
+  for (let i = 0; i < confirmedIds.length; i += PAIR_BATCH) {
+    const slice = confirmedIds.slice(i, i + PAIR_BATCH);
     const stmts: D1PreparedStatement[] = [];
     for (const id of slice) {
       stmts.push(
@@ -4155,7 +4276,7 @@ async function sweepObsoleteTombstones(
       });
     }
   }
-  return { swept, skippedLocked, applyIncomplete };
+  return { swept, skippedLocked, pending, applyIncomplete };
 }
 
 // Exported for the integration test ONLY (tombstoneSweep.test.mjs), mirroring
@@ -4167,7 +4288,7 @@ export const sweepObsoleteTombstonesForTest = (
   book: string,
   kind: TsvKind,
   rawTsv: string,
-): Promise<{ swept: number; skippedLocked: number; applyIncomplete: boolean }> =>
+): Promise<{ swept: number; skippedLocked: number; pending: number; applyIncomplete: boolean }> =>
   sweepObsoleteTombstones(env, book, kind, rawTsv);
 
 // SHA-gate each requested resource and stage the changed ones to R2. Returns
@@ -4231,6 +4352,68 @@ async function planAndStageBookResources(
     // saves its D1 count query on a converged resource.
     const own = await recognizePushedRender(env, book, resource, raw, sync);
     if (own.recognized) {
+      // Issue #427, option 3 (Codex third re-review on PR #484): sweep
+      // BEFORE stamping. Own-publish is the MOST COMMON steady-state path an
+      // obsolete tombstone's id ever takes — a translator's app-side delete
+      // propagates to master via export, and the NEXT reimport recognizes it
+      // as our own publish (`changed: false`) rather than a "change", so a
+      // sweep that only ran inside the `changed`-only loop in
+      // runChunkedReimport could reach it only opportunistically, exactly
+      // like the changed-chapters-list and incoming-file-chapter-set bugs
+      // already fixed above (see sweepObsoleteTombstones' own header). `raw`
+      // here is also uniquely strong completeness evidence: recognizePushedRender
+      // only returns `recognized: true` when these bytes are EXACTLY our own
+      // last full D1 render (a git-blob-SHA match) — a truncated fetch could
+      // not have produced this branch at all, since a partial body's bytes
+      // would not match. Only tn/tq/twl carry tombstones; ult/ust never call
+      // sweepObsoleteTombstones anywhere in this file.
+      let ownPublishSweep: { swept: number; skippedLocked: number; pending: number; applyIncomplete: boolean } | null = null;
+      if (resource === "tn" || resource === "tq" || resource === "twl") {
+        try {
+          ownPublishSweep = await sweepObsoleteTombstones(env, book, resource, raw);
+          if (
+            ownPublishSweep.swept > 0 ||
+            ownPublishSweep.skippedLocked > 0 ||
+            ownPublishSweep.pending > 0 ||
+            ownPublishSweep.applyIncomplete
+          ) {
+            console.log("reimport swept obsolete tombstones during own-publish recognition", {
+              book,
+              resource,
+              ...ownPublishSweep,
+            });
+          }
+        } catch (e) {
+          ownPublishSweep = { swept: 0, skippedLocked: 0, pending: 0, applyIncomplete: true };
+          console.error("reimport: tombstone sweep threw during own-publish recognition", {
+            book,
+            resource,
+            error: e instanceof Error ? e.message : String(e),
+          });
+        }
+      }
+      const sweepFields = ownPublishSweep && {
+        tombstonesSwept: ownPublishSweep.swept,
+        tombstonesLocked: ownPublishSweep.skippedLocked,
+        tombstonesPending: ownPublishSweep.pending,
+        tombstonesApplyIncomplete: ownPublishSweep.applyIncomplete,
+      };
+      if (ownPublishSweepBlocksStamp(ownPublishSweep)) {
+        // Do NOT call markOwnPublishConverged this run — leaving source_sha at
+        // its OLD (now stale-relative-to-master) value is what makes the NEXT
+        // run's SHA gate re-fetch and retry both recognition and the sweep,
+        // instead of a still-incomplete sweep being silently certified by a
+        // watermark that also happens to unlock the SHA-skip for good. See
+        // ownPublishSweepBlocksStamp's doc (reimportClassify.ts) for the full
+        // reasoning.
+        console.error("reimport: own-publish watermark NOT stamped — tombstone sweep incomplete, will retry next run", {
+          book,
+          resource,
+          ...ownPublishSweep,
+        });
+        entries.push({ resource, changed: false, masterSha, r2Key: null, ...sweepFields });
+        continue;
+      }
       const stamped = await markOwnPublishConverged(env, book, resource, own.readAt, sync.pushedEditId, masterSha);
       console.log("reimport recognized master's movement as our own publish", {
         book,
@@ -4243,7 +4426,7 @@ async function planAndStageBookResources(
       // markOwnPublishConverged's contract. The resource is skipped either way
       // (master holds our own render, so there is nothing to import), but a run
       // must not report a watermark advance it did not get.
-      entries.push({ resource, changed: false, masterSha, r2Key: null, ownPublish: stamped });
+      entries.push({ resource, changed: false, masterSha, r2Key: null, ownPublish: stamped, ...sweepFields });
       continue;
     }
     if (own.reason === "content_differs") {
@@ -4457,6 +4640,15 @@ export async function runChunkedReimport(
   const perResource = freshPerResource();
   for (const e of plan.entries) {
     if (e.ownPublish) perResource[e.resource].own_publish_converged++;
+    // Issue #427, option 3 (Codex third re-review on PR #484): fold in a
+    // sweep that ran during own-publish recognition, whether or not the
+    // stamp itself landed (ownPublishSweepBlocksStamp can decline the stamp
+    // while the sweep's own work — a mark, or a genuine sweep from an
+    // earlier-confirmed id — already committed independently in D1).
+    perResource[e.resource].tombstones_swept += e.tombstonesSwept ?? 0;
+    perResource[e.resource].tombstones_locked += e.tombstonesLocked ?? 0;
+    perResource[e.resource].tombstones_pending += e.tombstonesPending ?? 0;
+    if (e.tombstonesApplyIncomplete) perResource[e.resource].apply_incomplete = true;
   }
 
   const changed = plan.entries.filter((e) => e.changed);
@@ -4523,7 +4715,14 @@ export async function runChunkedReimport(
     const res = await step.do(`reimport-prune-${book}-${kind}`, async () => {
       const raw = await readStaged(env, r2Key);
       if (raw == null) {
-        return { deleted: 0, skippedLocked: 0, tombstonesSwept: 0, tombstonesLocked: 0, applyIncomplete: false };
+        return {
+          deleted: 0,
+          skippedLocked: 0,
+          tombstonesSwept: 0,
+          tombstonesLocked: 0,
+          tombstonesPending: 0,
+          applyIncomplete: false,
+        };
       }
       const pruneRes =
         chs.length > 0
@@ -4550,6 +4749,7 @@ export async function runChunkedReimport(
         skippedLocked: pruneRes.skippedLocked,
         tombstonesSwept: sweepRes.swept,
         tombstonesLocked: sweepRes.skippedLocked,
+        tombstonesPending: sweepRes.pending,
         applyIncomplete: sweepRes.applyIncomplete,
       };
     });
@@ -4577,6 +4777,7 @@ export async function runChunkedReimport(
     // numeric for logging.)
     perResource[kind].tombstones_swept += res.tombstonesSwept ?? 0;
     perResource[kind].tombstones_locked += res.tombstonesLocked ?? 0;
+    perResource[kind].tombstones_pending += res.tombstonesPending ?? 0;
   }
 
   // Canonical TWL order: recompute the ULT-position ordering for the book now

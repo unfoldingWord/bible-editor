@@ -305,3 +305,37 @@ export function isReissuedTombstone(stored: TombstoneRef, incoming: TombstoneRef
 export function isObsoleteTombstoneId(id: string, masterIds: ReadonlySet<string>): boolean {
   return !masterIds.has(id);
 }
+
+// ── Own-publish sweep watermark gate (issue #427, option 3, Codex third
+//    re-review on PR #484) ──────────────────────────────────────────────────
+//
+// planAndStageBookResources runs sweepObsoleteTombstones during OWN-PUBLISH
+// recognition (the most common steady-state path an obsolete tombstone ever
+// takes — see that call site's comment) BEFORE deciding whether to call
+// markOwnPublishConverged, which stamps book_resource_syncs.source_sha — the
+// exact value the SHA-gate at the top of planAndStageBookResources compares
+// against to decide whether to even re-fetch this resource's file next run.
+// If this sweep run left something unfinished, stamping anyway would lock in
+// a SHA that makes the next run skip the fetch entirely — the identical
+// "certifies data it didn't fully apply" shape shouldRecordResourceSync
+// exists to prevent for the changed-file path, just reached through the
+// own-publish shortcut instead. Two conditions must block the stamp:
+//   - applyIncomplete: the hard-delete batch itself threw. Certifying now
+//     would mean master's SHA is recorded as fully processed when it is not.
+//   - skippedLocked > 0: a chapter's sweep was deferred for an active AI
+//     pipeline lock. Same reasoning as tombstones_locked gating
+//     shouldRecordResourceSync on the changed-file path (see ReimportCounts'
+//     doc on that field) — withholding the stamp is the only mechanism this
+//     codebase has for guaranteeing the deferred chapter gets revisited,
+//     since leaving source_sha at its OLD (now stale-vs-master) value is what
+//     makes the next run's SHA gate re-fetch and retry instead of skipping.
+// `tombstones_pending` (the two-phase confirmation marker) does NOT block —
+// same as it never gates shouldRecordResourceSync either: nothing destructive
+// happened, and the marker persists in D1 regardless of whether the
+// watermark stamps, so it is still there to confirm on a later run.
+export function ownPublishSweepBlocksStamp(
+  sweep: { skippedLocked: number; applyIncomplete: boolean } | null,
+): boolean {
+  if (!sweep) return false;
+  return sweep.applyIncomplete || sweep.skippedLocked > 0;
+}

@@ -19,6 +19,7 @@ import {
   computeEditedFieldMerge,
   isReissuedTombstone,
   isObsoleteTombstoneId,
+  ownPublishSweepBlocksStamp,
   AI_SOURCE,
 } from "./reimportClassify.ts";
 
@@ -471,6 +472,32 @@ console.log("\n[disjointness: isObsoleteTombstoneId vs isReissuedTombstone]");
     eq(masterIds.has(id), false, `obsolete id ${id} is confirmed absent from masterIds — never reaches isReissuedTombstone`);
   }
 }
+
+// ── ownPublishSweepBlocksStamp (issue #427, option 3, Codex third re-review
+// on PR #484) ────────────────────────────────────────────────────────────
+console.log("\n[ownPublishSweepBlocksStamp]");
+
+eq(ownPublishSweepBlocksStamp(null), false, "no sweep ran at all (non-TSV resource) → never blocks the stamp");
+eq(
+  ownPublishSweepBlocksStamp({ skippedLocked: 0, applyIncomplete: false }),
+  false,
+  "sweep ran clean (nothing locked, nothing threw) → does not block the stamp",
+);
+eq(
+  ownPublishSweepBlocksStamp({ skippedLocked: 0, applyIncomplete: true }),
+  true,
+  "the hard-delete batch threw → blocks the stamp (an incomplete sweep must not be certified as done)",
+);
+eq(
+  ownPublishSweepBlocksStamp({ skippedLocked: 1, applyIncomplete: false }),
+  true,
+  "a chapter's sweep was deferred for an active pipeline lock → blocks the stamp (the only guaranteed-retry mechanism)",
+);
+eq(
+  ownPublishSweepBlocksStamp({ skippedLocked: 1, applyIncomplete: true }),
+  true,
+  "both conditions at once → still blocks (not double-negated into a false)",
+);
 
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed`);

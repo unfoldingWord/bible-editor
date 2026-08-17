@@ -43,6 +43,11 @@ export function summarizeReimport(res: ReimportResponse): string {
   // (issue #427, option 3) — informational, not actionable, so it sits after
   // the blocked-row line rather than competing with it for attention.
   if (t.tombstones_swept) parts.push(`${t.tombstones_swept} obsolete tombstone(s) cleared`);
+  // First-seen obsolete-eligible tombstones marked this run but not yet
+  // hard-deleted — the two-phase confirmation gate needs a LATER, independent
+  // run to also see the id as obsolete before it actually clears. Also purely
+  // informational.
+  if (t.tombstones_pending) parts.push(`${t.tombstones_pending} tombstone(s) pending confirmation`);
   if (t.dcs_404) parts.push(`${t.dcs_404} resource(s) not on DCS`);
   if (parts.length === 0) return `Imported ${res.book} — no changes.`;
   return `Imported ${res.book}: ${parts.join(", ")}.`;

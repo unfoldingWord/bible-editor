@@ -166,6 +166,31 @@ eq(
   "the actionable blocked-row count comes BEFORE the informational swept line",
 );
 
+console.log("\n-- obsolete tombstones pending confirmation (two-phase sweep gate, Codex third re-review on PR #484) --");
+
+lacks(summarizeReimport(res({ tombstones_pending: 0 })), "pending confirmation", "0 pending -> no line");
+lacks(summarizeReimport(res({})), "pending confirmation", "field absent -> no line");
+
+has(
+  summarizeReimport(res({ tombstones_pending: 4 })),
+  "4 tombstone(s) pending confirmation",
+  "pending count is reported",
+);
+eq(
+  summarizeReimport(res({ tombstones_pending: 4 })),
+  "Imported AMO: 4 tombstone(s) pending confirmation.",
+  "pending alone -> a complete sentence, not the plain no-changes message",
+);
+
+const sweptAndPending = summarizeReimport(res({ tombstones_swept: 2, tombstones_pending: 7 }));
+has(sweptAndPending, "2 obsolete tombstone(s) cleared", "swept line still present alongside pending");
+has(sweptAndPending, "7 tombstone(s) pending confirmation", "pending line still present alongside swept");
+eq(
+  sweptAndPending.indexOf("cleared") < sweptAndPending.indexOf("pending confirmation"),
+  true,
+  "the swept line comes BEFORE the pending line, matching source order",
+);
+
 if (failed > 0) {
   console.error(`\n${failed} failure(s)`);
   process.exit(1);
