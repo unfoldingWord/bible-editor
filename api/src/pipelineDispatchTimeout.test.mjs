@@ -232,6 +232,32 @@ await withFetch(
   },
 );
 
+console.log("\n[a NON-OK status whose body also fails to read is NOT ambiguous — the status line already proves rejection]");
+await withFetch(
+  async () => ({
+    // The bot's status line (already fully received, independent of the
+    // body stream) says REJECTED — a definitive negative signal. The body
+    // failing to read too must not override that with a ~300s ambiguous
+    // hold: there is nothing to wait and see about.
+    ok: false,
+    status: 409,
+    text: async () => {
+      throw new Error("terminated: ECONNRESET");
+    },
+  }),
+  async () => {
+    const env = fakeDispatchEnv();
+    await dispatchNext(env);
+    assert(env.ambiguousCalls.length === 0, "a non-OK status is never held as ambiguous, even when its body is unreadable");
+    assert(env.failCalls.length === 1, "fail() was called exactly once");
+    assert(env.failCalls[0]?.kind === "sdk_error", `classified as sdk_error, not transient_outage (got ${env.failCalls[0]?.kind})`);
+    assert(
+      /409/.test(env.failCalls[0]?.message ?? ""),
+      `failure message names the status code (got ${JSON.stringify(env.failCalls[0]?.message)})`,
+    );
+  },
+);
+
 console.log("\n[a pre-connection network failure (fetch() itself rejects, no Response at all) is NOT ambiguous — still fails the row immediately]");
 await withFetch(
   async () => {

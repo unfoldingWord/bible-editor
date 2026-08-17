@@ -515,13 +515,22 @@ export async function dispatchNext(env: Env): Promise<void> {
     text = await upstream.text();
   } catch {
     // We already HAVE a Response here — headers arrived, which proves the
-    // request reached the bot. ANY failure reading the body from this point
-    // on (our own AbortSignal firing mid-stream, or a genuine connection
-    // reset/stream error) means the bot may already be processing this job;
-    // unlike the fetch()-phase catch above, there is no "definitely never
-    // reached upstream" case once we're here, so this ALWAYS routes to the
-    // ambiguous path, regardless of the error's name/type.
-    await markDispatchAmbiguous();
+    // request reached the bot. But `upstream.ok`/`upstream.status` are
+    // header-level metadata, already fully received regardless of whether
+    // the BODY stream later fails to read — so a non-OK status line is
+    // still a definitive, readable signal even when the body isn't. When
+    // the bot's status line already says the dispatch was REJECTED, we
+    // don't need the body to know that: fail immediately with a
+    // status-only message rather than holding the global slot for up to
+    // AMBIGUOUS_DISPATCH_GRACE_SECONDS over a run that never started.
+    // Only an OK status (or the fetch()-phase failure above, before any
+    // status line exists at all) leaves genuine ambiguity about whether
+    // the bot accepted and is now running this job.
+    if (!upstream.ok) {
+      await fail("sdk_error", `upstream ${upstream.status} (body unreadable)`);
+    } else {
+      await markDispatchAmbiguous();
+    }
     return;
   }
 
