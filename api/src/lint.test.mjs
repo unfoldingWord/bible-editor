@@ -144,6 +144,25 @@ t("intra-word U+2060 joiner is NOT flagged as glued", () => {
   assert.equal(i.filter((x) => x.check === "Glued alignment").length, 0);
 });
 
+// Multi-verse variant of verseFromUsfm: returns one VerseRow per \v in the
+// given text, across however many \c chapters it contains. Needed for the
+// cross-verse/cross-chapter quote-pairing tests below (verseFromUsfm only
+// ever returns chapter 1 verse 1).
+const versesFromUsfm = (usfmText) => {
+  const j = usfm.toJSON(usfmText);
+  const out = [];
+  for (const [chapterStr, versesObj] of Object.entries(j.chapters)) {
+    const chapter = Number(chapterStr);
+    if (!Number.isFinite(chapter)) continue;
+    for (const [verseStr, vObj] of Object.entries(versesObj)) {
+      const verse = Number(verseStr);
+      if (!Number.isFinite(verse)) continue;
+      out.push({ book: "1CH", chapter, verse, verse_end: null, bible_version: "ULT", version: 1, content_json: JSON.stringify({ verseObjects: vObj.verseObjects }) });
+    }
+  }
+  return out;
+};
+
 // Unmatched curly quotation mark detector (#438).
 const quoteChecks = (issues) => issues.filter((x) => x.check === "Quotation Mark");
 t("balanced curly quotes pass", () => {
@@ -168,6 +187,25 @@ t("unmatched closing curly quote flagged", () => {
 t("straight quotes and apostrophes are NOT linted (out of scope)", () => {
   const i = lintUsfmVerses([verseFromUsfm("\\c 1\n\\p\n\\v 1 don't say \"hello\n")]);
   assert.equal(quoteChecks(i).length, 0);
+});
+// Codex review on PR #483: per-verse quote pairing double-flagged ordinary
+// multi-verse discourse (ZEC 1:2 opens a quote that 1:3 closes) — the check
+// must carry quote state across an ordered chapter, not reset at every verse.
+t("quote opened in one verse and closed in a later verse of the same chapter is NOT flagged (ZEC 1:2/1:3 shape)", () => {
+  const verses = versesFromUsfm("\\c 1\n\\p\n\\v 1 word\n\\v 2 he said, “hello\n\\v 3 world.”\n");
+  assert.equal(quoteChecks(lintUsfmVerses(verses)).length, 0);
+});
+t("genuinely unmatched quotes in DIFFERENT chapters are both still flagged, not paired against each other", () => {
+  const verses = versesFromUsfm("\\c 1\n\\p\n\\v 1 he said, “hello\n\\c 2\n\\p\n\\v 1 world.”\n");
+  const issues = quoteChecks(lintUsfmVerses(verses));
+  assert.equal(issues.length, 2);
+  assert.deepEqual(issues.map((i) => i.ref).sort(), ["1:1", "2:1"]);
+  assert.ok(issues.some((i) => /Opening quote/.test(i.message) && i.ref === "1:1"));
+  assert.ok(issues.some((i) => /Closing quote/.test(i.message) && i.ref === "2:1"));
+});
+t("out-of-order verse rows are sorted before pairing (defensive against caller order)", () => {
+  const verses = versesFromUsfm("\\c 1\n\\p\n\\v 1 word\n\\v 2 he said, “hello\n\\v 3 world.”\n").reverse();
+  assert.equal(quoteChecks(lintUsfmVerses(verses)).length, 0);
 });
 
 // Reused-source-token detector (ZEC 14:8 UST doubled-Hebrew defect): a single

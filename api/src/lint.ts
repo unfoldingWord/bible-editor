@@ -643,33 +643,69 @@ export function lintChapterOpeningMarkers(verses: VerseRow[]): LintIssue[] {
 // quotes (‘ ’) double as apostrophes inside words — a naive pairing check
 // cannot tell "don't" from a genuine unmatched single quote, so those are out
 // of scope rather than guessed at.
-function quoteProblems(text: string): string[] {
-  const out: string[] = [];
-  const stack: number[] = [];
-  for (let i = 0; i < text.length; i++) {
-    const ch = text[i];
-    if (ch === "“") {
-      stack.push(i);
-    } else if (ch === "”") {
-      if (stack.length === 0) {
-        out.push(`Closing quote '”' at character ${i + 1} has no matching opening quote.`);
-      } else {
-        stack.pop();
+//
+// CHAPTER-scoped, not per-verse: quoted discourse in ULT/UST routinely spans
+// several verses (a speech that opens in v2 and closes in v5), so the stack
+// carries across every verse of a chapter, in verse order — resetting it at
+// each verse boundary was measured to double-flag ordinary multi-verse
+// quotations (open in one verse, close in a later one) and was mostly noise
+// on real scripture (e.g. ZEC 1:2 opens a quote that 1:3 closes). The stack
+// resets at each chapter boundary rather than running book-wide: an unrelated
+// unmatched quote in one chapter should not silently pair with — and mask —
+// an unrelated unmatched quote in another. `entries` is sorted defensively
+// rather than trusting caller order, since a mis-ordered scan would
+// misattribute pairing across verses that aren't actually adjacent.
+function quoteIssues(verses: VerseRow[]): LintIssue[] {
+  const byChapter = new Map<number, Array<{ ref: string; verse: number; text: string }>>();
+  for (const v of verses) {
+    if (v.verse === 0) continue;
+    let parsed: unknown;
+    try {
+      parsed = parseVerseContentJson(v);
+    } catch {
+      continue;
+    }
+    const vos = (parsed as { verseObjects?: unknown[] })?.verseObjects;
+    if (!Array.isArray(vos)) continue;
+    const list = byChapter.get(v.chapter) ?? [];
+    list.push({ ref: `${v.chapter}:${v.verse}`, verse: v.verse, text: extractPlainText(parsed) });
+    byChapter.set(v.chapter, list);
+  }
+
+  const issues: LintIssue[] = [];
+  for (const entries of byChapter.values()) {
+    entries.sort((a, b) => a.verse - b.verse);
+    const stack: Array<{ ref: string; pos: number }> = [];
+    for (const e of entries) {
+      for (let i = 0; i < e.text.length; i++) {
+        const ch = e.text[i];
+        if (ch === "“") {
+          stack.push({ ref: e.ref, pos: i + 1 });
+        } else if (ch === "”") {
+          if (stack.length === 0) {
+            issues.push({ check: "Quotation Mark", bucket: "flag", ref: e.ref, message: `Closing quote '”' at character ${i + 1} has no matching opening quote.` });
+          } else {
+            stack.pop();
+          }
+        }
       }
     }
+    for (const open of stack) {
+      issues.push({ check: "Quotation Mark", bucket: "flag", ref: open.ref, message: `Opening quote '“' at character ${open.pos} has no matching closing quote.` });
+    }
   }
-  for (const pos of stack) {
-    out.push(`Opening quote '“' at character ${pos + 1} has no matching closing quote.`);
-  }
-  return out;
+  return issues;
 }
 
 // USFM (ult/ust) integrity lint over the stored verse rows: unbalanced footnotes,
-// joiner-glued alignment milestones, and unmatched curly quotation marks, per
-// verse. (Verse-coverage / chapter-count are guarded by the export shrink guard
-// and validated whole-file downstream; not duplicated here.)
+// joiner-glued alignment milestones, and unmatched curly quotation marks.
+// Footnotes/glued-milestones/reused-tokens are genuinely per-verse; quotation
+// marks are not (see quoteIssues) and are checked once across the whole call,
+// not inside this per-verse loop. (Verse-coverage / chapter-count are guarded
+// by the export shrink guard and validated whole-file downstream; not
+// duplicated here.)
 export function lintUsfmVerses(verses: VerseRow[]): LintIssue[] {
-  const issues: LintIssue[] = [];
+  const issues: LintIssue[] = [...quoteIssues(verses)];
   for (const v of verses) {
     if (v.verse === 0) continue;
     let parsed: unknown;
@@ -705,9 +741,6 @@ export function lintUsfmVerses(verses: VerseRow[]): LintIssue[] {
         ref,
         message: "the same source word is aligned in more than one group (renders as doubled Hebrew); re-align the verse.",
       });
-    }
-    for (const msg of quoteProblems(extractPlainText(parsed))) {
-      issues.push({ check: "Quotation Mark", bucket: "flag", ref, message: msg });
     }
   }
   return issues;
