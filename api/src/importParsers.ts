@@ -1338,12 +1338,46 @@ export function sanitizeMarkerSpacing(rawUsfm: string): string {
   return rawUsfm.replace(GLUED_NUMBERED_MARKER_RE, "$1 ");
 }
 
+// Companion pre-parse repair for a STRAY BACKSLASH inside a `\w` attribute
+// section. USFM 3 attributes are plain `key="value"` pairs — a backslash is
+// never legal between the `|` and the closing `\w*`. Master carries instances
+// of the invalid shape (en_ust/24-JER.usfm, JER 30:3 / 30:10 / 31:7 / 31:10):
+//
+//   \w Judah.”|\x-occurrence="1" x-occurrences="1"\w*
+//                ^ spurious backslash
+//
+// usfm-js reads that `\x` as a MARKER OPENER, so the whole attribute section
+// parses out of the word into a junk sibling node
+// `{tag:"x", content:"-occurrence=\"1\" x-occurrences=\"1\""}` and the word
+// itself loses its occurrence attributes. Rendering that tree back out (the
+// nightly export) emits the junk node as a REAL cross-reference —
+// `\w Judah|x-occurrence="1" x-occurrences="1"\w*.”\x -occurrence="1" x-occurrences="1"\x*`
+// — which is how four invalid `\x` markers were written to en_ust master by
+// the 2026-06-18 and 2026-06-25 exports (issue #481). Nothing renders from
+// them, so they accumulate silently.
+//
+// Repair before parsing, so the attributes land on the word where they belong
+// and no junk node is ever created. Same principle as the malformed-alignment
+// normalizers above: a malformed input is normalized on ingest, never
+// re-emitted in a new malformed shape.
+//
+// The match is bounded on both ends by the word's own markers (`\w ` … `\w*`)
+// and cannot cross a neighbouring word marker or a line break, so a legitimate
+// `\w`, `\zaln-s`, `\f` or `\x` outside the attribute section is unreachable.
+// Identity no-op on clean USFM (a valid attribute section holds no backslash).
+const WORD_ATTR_SECTION_RE = /(\\w [^\\|\n]*\|)((?:[^\\\n]|\\(?!w[ *]))*)(\\w\*)/g;
+export function sanitizeWordAttributes(rawUsfm: string): string {
+  return rawUsfm.replace(WORD_ATTR_SECTION_RE, (whole, open: string, attrs: string, close: string) =>
+    attrs.includes("\\") ? `${open}${attrs.replace(/\\/g, "")}${close}` : whole,
+  );
+}
+
 export function extractVersesForRange(
   rawUsfm: string,
   startChapter: number,
   endChapter: number,
 ): VerseExtract[] {
-  const json = usfm.toJSON(sanitizeMarkerSpacing(rawUsfm));
+  const json = usfm.toJSON(sanitizeWordAttributes(sanitizeMarkerSpacing(rawUsfm)));
   const out: VerseExtract[] = [];
   const chapters = json.chapters ?? {};
   for (const chapterKey of Object.keys(chapters)) {
