@@ -253,16 +253,28 @@ console.log("\n[(a)-(d)+(h) combined: obsolete swept + history purged, pending-d
   const sweptIds = ["obs1"]; // the only id this run's sweep actually deleted
   eq(sweptIds.includes("hoig"), false, "the swept set and the tombstone_blocked row are disjoint, driven end to end");
 
-  // tombstones_swept/tombstones_locked never gate the sync watermark, unlike
-  // prune_locked/chapters_locked/conflict_skipped/tombstone_blocked — prove it
-  // on the real gate rather than just asserting it in a comment.
-  const aggregate = zeroCountsForTest();
-  aggregate.tombstones_swept = sweep.swept;
-  aggregate.tombstones_locked = sweep.skippedLocked;
+  // tombstones_swept never gates the sync watermark on its own — prove it on
+  // the real gate rather than just asserting it in a comment.
+  const sweptOnly = zeroCountsForTest();
+  sweptOnly.tombstones_swept = sweep.swept;
   eq(
-    shouldRecordResourceSync(aggregate),
+    shouldRecordResourceSync(sweptOnly),
     true,
-    "a run that only swept/deferred tombstones (everything else zero) still permits the watermark stamp",
+    "a run that only swept tombstones (tombstones_locked zero, everything else zero) still permits the watermark stamp",
+  );
+  // tombstones_locked DOES gate (Codex review on PR #484: it's the only
+  // mechanism guaranteeing the deferred chapter gets retried, since the outer
+  // SHA gate can otherwise skip an unchanged file forever) — this run really
+  // did defer chapter 7's sweep (sweep.skippedLocked === 1 from (d) above), so
+  // the watermark must be withheld even though nothing else in the run failed.
+  const withLocked = zeroCountsForTest();
+  withLocked.tombstones_swept = sweep.swept;
+  withLocked.tombstones_locked = sweep.skippedLocked;
+  eq(sweep.skippedLocked, 1, "sanity: this run really did defer a chapter's sweep");
+  eq(
+    shouldRecordResourceSync(withLocked),
+    false,
+    "a run whose sweep deferred a locked chapter withholds the watermark, even with everything else clean",
   );
 }
 
@@ -358,6 +370,38 @@ console.log(
 
   const obs9 = sqlite.prepare(`SELECT deleted_at FROM tq_rows WHERE book = ? AND id = ?`).all(BOOK, "obs9");
   eq(obs9.length, 0, "(g) and it is genuinely gone, not merely re-tombstoned");
+}
+
+console.log(
+  "\n[(i) REGRESSION (Codex re-review on PR #484): more targets than one batch chunk are all swept + purged]",
+);
+{
+  // sweepObsoleteTombstones batches DELETE row + DELETE edit_log as
+  // interleaved pairs in chunks of WRITE_BATCH/2 (45) targets per
+  // env.DB.batch() call. Seed more than one chunk's worth to prove the
+  // multi-chunk loop actually runs to completion and every chunk's targets
+  // land, not just the first.
+  const { sqlite, env } = freshEnv();
+  const N = 50; // > 45 (WRITE_BATCH / 2) — forces a second batch() call.
+  const ids = Array.from({ length: N }, (_, i) => `t${String(i).padStart(3, "0")}`); // t000..t049, valid 4-char ids
+  for (const id of ids) {
+    seedTombstone(sqlite, { id, ref: "10:1", chapter: 10, verse: 1 });
+    seedEditLog(sqlite, { id });
+  }
+  // One live padding row so chapter 10 is "covered" by the incoming file.
+  seedLive(sqlite, { id: "pad0", ref: "10:9", chapter: 10, verse: 9 });
+
+  const raw = tqMasterTsv([{ id: "pad0", ref: "10:9", chapter: 10, verse: 9 }]);
+  const sweep = await sweepObsoleteTombstonesForTest(env, BOOK, "tq", raw);
+  eq(sweep.swept, N, `(i) all ${N} obsolete tombstones swept across multiple batch() chunks, not just the first 45`);
+
+  const remaining = sqlite.prepare(`SELECT COUNT(*) AS n FROM tq_rows WHERE book = ? AND id LIKE 't0%'`).all(BOOK)[0].n;
+  eq(remaining, 0, "(i) every one of the 50 rows is genuinely gone from the table");
+
+  const remainingLogs = sqlite
+    .prepare(`SELECT COUNT(*) AS n FROM edit_log WHERE kind = 'tq' AND row_key LIKE 't0%'`)
+    .all()[0].n;
+  eq(remainingLogs, 0, "(i) and every one of their edit_log entries was purged along with them");
 }
 
 if (failed > 0) {

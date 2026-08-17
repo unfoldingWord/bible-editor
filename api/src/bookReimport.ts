@@ -224,16 +224,28 @@ export interface ReimportCounts {
   tombstones_swept: number;
   // Chapters this run's sweep DEFERRED because an active AI pipeline job held
   // the chapter lock (same activePipelineForChapter check softDeleteRemovedTsvRows
-  // uses). Deliberately does NOT feed prune_locked and does NOT gate
-  // shouldRecordResourceSync/the sync watermark, unlike prune_locked's own
-  // lock-skip count — and that asymmetry is intentional, not an oversight: every
-  // row a deferred sweep would have removed is ALREADY a tombstone (deleted_at
-  // already set), so it already renders as deleted in every read and every
-  // export regardless of whether this run reclaimed its primary-key slot.
-  // Deferring the sweep costs nothing but a delayed reclaim — a later run over
-  // the same (now-unlocked) chapter catches up — so withholding a watermark
-  // over it would be over-cautious for a condition with zero effect on export
-  // correctness. Tracked separately purely for observability.
+  // uses). Deliberately does NOT feed prune_locked — it is its own field so a
+  // reader can tell which phase deferred — but DOES gate
+  // shouldRecordResourceSync/the sync watermark, same as chapters_locked/
+  // prune_locked (added after Codex review on PR #484).
+  //
+  // Earlier reasoning (kept for the record, and because it is still half
+  // true): every row a deferred sweep would have removed is ALREADY a
+  // tombstone (deleted_at already set), so it already renders as deleted in
+  // every read and every export regardless of whether this run reclaimed its
+  // primary-key slot — there is genuinely no EXPORT-correctness reason to
+  // withhold. What that reasoning missed: withholding the watermark is the
+  // ONLY mechanism this codebase has for guaranteeing a retry. The outer
+  // SHA-diff gate (plan.entries' `changed` filter in runChunkedReimport) can
+  // skip a resource's file fetch entirely once master's bytes stop moving —
+  // so a chapter deferred here, on a book that never gets edited again, would
+  // never be revisited and its dead tombstone would squat on its (book, id)
+  // slot forever, exactly the landmine this whole sweep exists to defuse.
+  // Gating the watermark forces the file to be re-staged every subsequent
+  // night (see raiseTombstoneBlockAlert's comment on the same mechanism)
+  // until the lock clears and the sweep actually completes — a bounded,
+  // self-clearing cost (AI pipeline jobs are short-lived), and the same
+  // tradeoff chapters_locked/prune_locked already accept.
   tombstones_locked: number;
   // Pristine tombstone that master still carries, brought back to life because
   // an earlier reimport prune had erroneously soft-deleted it (the HAB tn
@@ -466,11 +478,21 @@ function addCounts(into: ReimportCounts, from: ReimportCounts): void {
   // them. If their absence only coerced to zero, a run that dropped rows to a
   // tombstone collision mid-deploy would aggregate to a clean present-zero and
   // stamp the watermark — the precise laundering this taint flag exists to stop.
+  //
+  // `tombstones_locked` (issue #427, option 3) joined this list after Codex
+  // review on PR #484: it now gates shouldRecordResourceSync exactly like
+  // chapters_locked/prune_locked (see tombstones_locked's own doc for why —
+  // in short, a lock-deferred sweep has no OTHER way to guarantee a retry,
+  // since the outer SHA gate can skip an unchanged file forever). Its absence
+  // must taint the aggregate the same way, for the same replay reason.
+  // `tombstones_swept` does NOT join this list — it is a pure count of
+  // successful work with no watermark consequence of its own either way.
   const incomplete =
     from.chapters_locked === undefined ||
     from.prune_locked === undefined ||
     from.conflict_skipped === undefined ||
-    from.tombstone_blocked === undefined;
+    from.tombstone_blocked === undefined ||
+    from.tombstones_locked === undefined;
   into.counts_incomplete = Boolean(into.counts_incomplete || from.counts_incomplete || incomplete);
   into.chapters_locked += from.chapters_locked ?? 0;
   into.prune_locked += from.prune_locked ?? 0;
@@ -478,14 +500,6 @@ function addCounts(into: ReimportCounts, from: ReimportCounts): void {
   into.skipped_dup += from.skipped_dup;
   into.conflict_skipped += from.conflict_skipped ?? 0;
   into.tombstone_blocked += from.tombstone_blocked ?? 0;
-  // tombstones_swept / tombstones_locked (issue #427, option 3) deliberately do
-  // NOT join the `incomplete` taint check above: unlike chapters_locked/
-  // prune_locked/conflict_skipped/tombstone_blocked, neither one ever gates
-  // shouldRecordResourceSync (see tombstones_locked's own doc for why a
-  // deferred sweep has no export-correctness consequence to protect), so there
-  // is no watermark decision here for an absent-vs-zero distinction to protect.
-  // Plain `?? 0` coercion is the right and sufficient handling for a legacy/
-  // replayed chunk result that predates this field.
   into.tombstones_swept += from.tombstones_swept ?? 0;
   into.tombstones_locked += from.tombstones_locked ?? 0;
   // Diagnostic list, merged under the same cap. Never gates anything, so a
@@ -3981,7 +3995,7 @@ async function softDeleteRemovedTsvRows(
 // nothing", which would make every tombstone in the book look obsolete and
 // sweep the whole book clean; never a chapter an active AI pipeline job
 // currently holds (see tombstones_locked on ReimportCounts for why that
-// deferral does NOT gate the sync watermark the way prune_locked does).
+// deferral DOES gate the sync watermark, same as prune_locked).
 //
 // Deliberately takes NO candidate-chapters restriction — it sweeps every
 // chapter its own whole-file parse covers. An earlier version of this
@@ -4033,8 +4047,13 @@ async function sweepObsoleteTombstones(
   // that chapter happened to change too. That starved the sweep of the exact
   // steady-state case it exists for. See the two call sites for how "this
   // run's file" is scoped (only resources whose fetch actually ran).
-  let swept = 0;
+  // Phase 1: collect every target id across all covered chapters, deferring
+  // any chapter an active AI pipeline job currently holds. Reads only — one
+  // lock-check + one SELECT per chapter, bounded by the book's chapter count
+  // (mirrors softDeleteRemovedTsvRows' identical per-chapter shape), not by
+  // tombstone count.
   let skippedLocked = 0;
+  const targetIds: string[] = [];
   for (const ch of coveredChapters) {
     if (await activePipelineForChapter(env, book, ch)) {
       skippedLocked++;
@@ -4045,36 +4064,69 @@ async function sweepObsoleteTombstones(
     )
       .bind(book, ch)
       .all<{ id: string }>();
-    const targets = (rs.results ?? []).filter((r) => isObsoleteTombstoneId(r.id, incomingIds));
-    for (const t of targets) {
-      // Re-assert deleted_at IS NOT NULL at write time, mirroring the
-      // version-CAS re-assertion pattern used everywhere else in this file:
-      // the only path that can clear deleted_at (applyTsvRows' resurrect
-      // branch) runs earlier in this same run, so this is defense-in-depth
-      // against a hypothetical overlapping run rather than an expected race.
-      const del = await env.DB.prepare(
-        `DELETE FROM ${kind}_rows WHERE id = ?1 AND book = ?2 AND deleted_at IS NOT NULL`,
-      )
-        .bind(t.id, book)
-        .run();
-      if (!del.meta.changes) continue;
-      swept++;
-      // Purge this identity's audit trail too, not just the row. The whole
-      // point of freeing the (book, id) slot is that a future master row may
-      // reuse this exact id for something UNRELATED — that is the scenario
-      // this sweep exists to make safe. rows.ts' history handler reads
-      // edit_log keyed by (kind, row_key) alone, falling back across a NULL
-      // book for pre-migration-0017 rows (`el.book = ?3 OR el.book IS NULL`);
-      // a left-behind entry under a reused id would interleave the dead row's
-      // history into the new row's, and the app's restore-a-version action
-      // could write the dead row's payload_json onto the new row. There is
-      // nothing left to audit once the row itself is unrecoverably gone, so
-      // match the same (kind, row_key, book-or-null) scope the read side uses.
-      await env.DB.prepare(
-        `DELETE FROM edit_log WHERE kind = ?1 AND row_key = ?2 AND (book = ?3 OR book IS NULL)`,
-      )
-        .bind(kind, t.id, book)
-        .run();
+    for (const r of rs.results ?? []) {
+      if (isObsoleteTombstoneId(r.id, incomingIds)) targetIds.push(r.id);
+    }
+  }
+  if (targetIds.length === 0) return { swept: 0, skippedLocked };
+
+  // Phase 2: delete each target row and purge its edit_log entries as an
+  // INTERLEAVED PAIR inside ONE atomic env.DB.batch() call per chunk — the
+  // same pattern applyVerseRows uses for its INSERT + conditional edit_log
+  // INSERT (see that function's header comment). Two things this fixes vs. a
+  // per-target `await`ed pair:
+  //   - Subrequest budget: a book can hold thousands of obsolete tombstones
+  //     (10,641 in the issue's production sweep) — two unbatched D1 calls per
+  //     target would blow the per-invocation subrequest cap the same way the
+  //     old per-row TSV apply loop once did (see WRITE_BATCH's own comment).
+  //     Batched in WRITE_BATCH/2-sized pairs, it's ~2 subrequests per chunk
+  //     regardless of target count.
+  //   - Atomicity: env.DB.batch() runs as one transaction, so a row's delete
+  //     and its audit purge either both land or neither does. A row whose
+  //     delete DIDN'T land (re-asserted `deleted_at IS NOT NULL` lost a race —
+  //     defense-in-depth against a hypothetical overlapping run) must not have
+  //     its audit purged either; the edit_log DELETE is gated on `changes() >
+  //     0` (SQLite's "rows affected by the immediately preceding statement"),
+  //     the same conditional-log idiom applyVerseRows uses for its own pair.
+  const PAIR_BATCH = Math.floor(WRITE_BATCH / 2);
+  let swept = 0;
+  for (let i = 0; i < targetIds.length; i += PAIR_BATCH) {
+    const slice = targetIds.slice(i, i + PAIR_BATCH);
+    const stmts: D1PreparedStatement[] = [];
+    for (const id of slice) {
+      stmts.push(
+        env.DB.prepare(
+          `DELETE FROM ${kind}_rows WHERE id = ?1 AND book = ?2 AND deleted_at IS NOT NULL`,
+        ).bind(id, book),
+        // Purges this identity's audit trail too, not just the row. The whole
+        // point of freeing the (book, id) slot is that a future master row
+        // may reuse this exact id for something UNRELATED — that is the
+        // scenario this sweep exists to make safe. rows.ts' history handler
+        // reads edit_log keyed by (kind, row_key) alone, falling back across
+        // a NULL book for pre-migration-0017 rows (`el.book = ?3 OR el.book
+        // IS NULL`); a left-behind entry under a reused id would interleave
+        // the dead row's history into the new row's, and the app's
+        // restore-a-version action could write the dead row's payload_json
+        // onto the new row. There is nothing left to audit once the row
+        // itself is unrecoverably gone, so match the same (kind, row_key,
+        // book-or-null) scope the read side uses.
+        env.DB.prepare(
+          `DELETE FROM edit_log WHERE kind = ?1 AND row_key = ?2 AND (book = ?3 OR book IS NULL) AND changes() > 0`,
+        ).bind(kind, id, book),
+      );
+    }
+    try {
+      const results = await env.DB.batch(stmts);
+      for (let j = 0; j < slice.length; j++) {
+        if ((results[j * 2]?.meta.changes ?? 0) > 0) swept++;
+      }
+    } catch (e) {
+      console.error("reimport: tombstone sweep batch failed", {
+        book,
+        kind,
+        count: slice.length,
+        error: e instanceof Error ? e.message : String(e),
+      });
     }
   }
   return { swept, skippedLocked };
@@ -4476,12 +4528,16 @@ export async function runChunkedReimport(
     // than the chunk-apply steps above, so a lock that starts after those
     // steps finish but is still held here is invisible to chapters_locked.
     if (res.skippedLocked > 0) perResource[kind].prune_locked += res.skippedLocked;
-    // The sweep's own lock-skips deliberately do NOT feed prune_locked (see
-    // tombstones_locked's doc on ReimportCounts for why a deferred sweep has no
-    // export-correctness consequence to gate on). `?? 0` guards a step result
-    // memoized by a Workflow instance that started before this field existed —
-    // step.do replays its stored result verbatim on resume, same as every other
-    // `?? 0` coercion in this file.
+    // The sweep's own lock-skips deliberately do NOT feed prune_locked — kept
+    // as its own field so a reader can tell which phase deferred — but DOES
+    // gate the watermark the same way prune_locked does (see tombstones_locked's
+    // doc on ReimportCounts). `?? 0` guards a step result memoized by a
+    // Workflow instance that started before this field existed — step.do
+    // replays its stored result verbatim on resume, same as every other
+    // `?? 0` coercion in this file. (`addCounts`'s own `incomplete` taint is
+    // what actually protects the watermark against that replay case, same as
+    // chapters_locked/prune_locked — this `?? 0` just keeps the running total
+    // numeric for logging.)
     perResource[kind].tombstones_swept += res.tombstonesSwept ?? 0;
     perResource[kind].tombstones_locked += res.tombstonesLocked ?? 0;
   }

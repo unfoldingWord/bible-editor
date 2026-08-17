@@ -75,12 +75,29 @@
 // option 1, and sweeping obsolete tombstones is option 3. It makes the drop
 // visible and stops the run from claiming the resource is current.
 //
+// ── Fifth withhold condition (issue #427, option 3, added after Codex review
+//    on PR #484) ───────────────────────────────────────────────────────────
+//
+//   5. `tombstones_locked` — sweepObsoleteTombstones deferred a chapter this
+//      run because an active AI pipeline job held its lock. Unlike
+//      conflict_skipped/tombstone_blocked, this is NOT about master content
+//      missing from D1 — every row a deferred sweep would have removed is
+//      already a tombstone and already renders as deleted everywhere. It
+//      gates anyway because withholding the watermark is the ONLY mechanism
+//      this codebase has for guaranteeing the deferred chapter gets revisited
+//      at all: the outer SHA-diff gate can skip a resource's file fetch
+//      entirely once master's bytes stop moving, so an un-gated deferral on a
+//      book that never gets edited again would defer forever. The cost is
+//      bounded and self-clearing (AI pipeline jobs are short-lived) — the
+//      same tradeoff chapters_locked/prune_locked already accept for the same
+//      reason. See tombstones_locked's own doc on ReimportCounts.
+//
 // Deliberately NOT gated on `skipped_locked`: that counter is overloaded —
 // besides the chapter-lock skip, it is ALSO incremented by the row-level prune
 // path, a different and much less severe situation that must NOT withhold the
-// watermark on its own. Only `chapters_locked` and `prune_locked` (plus the
-// `counts_incomplete` taint they can leave behind after aggregation) gate this
-// decision.
+// watermark on its own. Only `chapters_locked`, `prune_locked` and
+// `tombstones_locked` (plus the `counts_incomplete` taint they can leave
+// behind after aggregation) gate this decision.
 //
 // Pure (no D1) so it's regression-testable without a Workflow context — see
 // shrinkGuard.ts for the same pattern.
@@ -89,6 +106,7 @@ export function shouldRecordResourceSync(counts: {
   prune_locked?: number;
   conflict_skipped?: number;
   tombstone_blocked?: number;
+  tombstones_locked?: number;
   counts_incomplete?: boolean;
 }): boolean {
   if (counts.chapters_locked === undefined || counts.prune_locked === undefined) return false;
@@ -105,12 +123,16 @@ export function shouldRecordResourceSync(counts: {
   // that hands the gate a raw, un-aggregated object — do not rely on it as the
   // replay guard.
   if (counts.conflict_skipped === undefined || counts.tombstone_blocked === undefined) return false;
+  // Same defence-in-depth presence check, same honest scope note, for the
+  // fifth condition added after Codex review on PR #484.
+  if (counts.tombstones_locked === undefined) return false;
   if (counts.counts_incomplete === true) return false;
   return (
     counts.chapters_locked === 0 &&
     counts.prune_locked === 0 &&
     counts.conflict_skipped === 0 &&
-    counts.tombstone_blocked === 0
+    counts.tombstone_blocked === 0 &&
+    counts.tombstones_locked === 0
   );
 }
 

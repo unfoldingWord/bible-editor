@@ -48,6 +48,8 @@ function counts(overrides = {}) {
     skipped_dup: 0,
     conflict_skipped: 0,
     tombstone_blocked: 0,
+    tombstones_swept: 0,
+    tombstones_locked: 0,
     resurrected: 0,
     source_attr_reconciled: 0,
     source_attr_divergent: 0,
@@ -218,6 +220,50 @@ eq(
   ),
   false,
   "aggregate laundered a legacy chunk's absent drop counters to zero → counts_incomplete still withholds",
+);
+
+// ── Issue #427, option 3, added after Codex review on PR #484: a
+// lock-deferred tombstone sweep must also withhold ────────────────────────
+// Unlike tombstone_blocked/conflict_skipped, tombstones_locked is not about
+// missing master content — it's about guaranteeing the deferred chapter gets
+// retried at all, since the outer SHA gate can otherwise skip an unchanged
+// file forever. Same shape of tests as the option-2 block above.
+eq(
+  shouldRecordResourceSync(counts({ tombstones_locked: 1 })),
+  false,
+  "tombstones_locked > 0 (a chapter's sweep deferred for an active pipeline lock) → withhold the watermark",
+);
+eq(
+  shouldRecordResourceSync(counts({ tombstones_locked: 0 })),
+  true,
+  "tombstones_locked present and zero, everything else clean → stamp",
+);
+// Not reachable via the other counters alone: a run whose ONLY incomplete
+// phase was a deferred tombstone sweep still withholds even though every
+// other lock/drop counter is clean.
+eq(
+  shouldRecordResourceSync(
+    counts({ chapters_locked: 0, prune_locked: 0, conflict_skipped: 0, tombstone_blocked: 0, tombstones_locked: 1 }),
+  ),
+  false,
+  "every other counter clean, only tombstones_locked non-zero → still withhold",
+);
+// Fail-safe presence: a step result memoized before this field existed lacks
+// it entirely. Note every OTHER field is present here, so only the new
+// presence check can catch it.
+eq(
+  shouldRecordResourceSync({ chapters_locked: 0, prune_locked: 0, conflict_skipped: 0, tombstone_blocked: 0 }),
+  false,
+  "counts object missing tombstones_locked only → withhold (fail-safe, not zero-and-stamp)",
+);
+// The aggregation-laundering route, applied to the fifth field: addCounts's
+// `?? 0` coercion would otherwise turn "never measured" into "measured zero"
+// once folded into perResource[resource]; counts_incomplete is what survives
+// that and must still withhold.
+eq(
+  shouldRecordResourceSync(counts({ tombstones_locked: 0, counts_incomplete: true })),
+  false,
+  "aggregate laundered a legacy chunk's absent tombstones_locked to zero → counts_incomplete still withholds",
 );
 
 console.log("\n[isSystemicMergeRefusal]");
