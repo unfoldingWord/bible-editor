@@ -259,12 +259,17 @@ books.post("/:book/lock/push", requireEditor, async (c) => {
 
   // Append-only audit row (migration 0051) — see the PUT /lock handler
   // above. Records that the allowLocked converge-push was invoked, not
-  // that the book's lock state changed (it doesn't).
+  // that the book's lock state changed (it doesn't). `reason` carries the
+  // dispatch outcome ("dispatched N/total") rather than NULL, so a future
+  // investigator can't mistake a push where every create failed for one
+  // that actually ran.
   try {
+    const dispatched = pushed.filter((p) => "instanceId" in p).length;
+    const outcome = `dispatched ${dispatched}/${pushed.length}`;
     await c.env.DB.prepare(
-      `INSERT INTO book_lock_events (book, locked, reason, action, user_id) VALUES (?1, 1, NULL, 'lock_push', ?2)`,
+      `INSERT INTO book_lock_events (book, locked, reason, action, user_id) VALUES (?1, 1, ?2, 'lock_push', ?3)`,
     )
-      .bind(book, userId)
+      .bind(book, outcome, userId)
       .run();
   } catch (e) {
     console.error("book_lock_events insert failed (lock_push)", book, e);
