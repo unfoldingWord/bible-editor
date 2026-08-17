@@ -181,3 +181,21 @@ export function lostAlignedWords(beforeContent: unknown, afterContent: unknown):
     .unexpectedLosses.filter((l) => l.reason === "lost")
     .map((l) => l.text);
 }
+
+// Byte-identity check for two verse `content` values (the { verseObjects }
+// shape on VerseDto). Used by AlignmentPanel to tell a genuine content change
+// (a foreign edit landing, a different verse) apart from a version-only bump
+// — the panel's own save round-tripping through the outbox re-arrives with
+// identical content under version+1 (#488). Both sides are the same
+// usfm-js verseObjects tree with deterministic key order, so JSON string
+// comparison is sufficient; this is the same "deepEqual" idiom already used
+// by this module's own tests.
+export function sameVerseContent(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
+  if (a == null || b == null) return false;
+  try {
+    return JSON.stringify(a) === JSON.stringify(b);
+  } catch {
+    return false;
+  }
+}

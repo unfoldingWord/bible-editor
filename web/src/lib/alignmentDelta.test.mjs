@@ -1,4 +1,9 @@
-import { analyzeAlignmentDelta, guardBlocksSave, lostAlignedWords } from "./alignmentDelta.ts";
+import {
+  analyzeAlignmentDelta,
+  guardBlocksSave,
+  lostAlignedWords,
+  sameVerseContent,
+} from "./alignmentDelta.ts";
 
 let failed = 0;
 function assert(ok, msg) {
@@ -142,6 +147,44 @@ const content = (verseObjects) => ({ verseObjects });
     lostAlignedWords(before, afterRepointed).length === 0,
     "re-pointing a source is not flagged as an unalign",
   );
+}
+
+{
+  // #488 — AlignmentPanel's reset effect uses this to tell a version-only
+  // bump (its own save round-tripping through the outbox) apart from a
+  // genuine content change, so it knows whether to preserve in-flight drags.
+  console.log("[alignmentDelta] sameVerseContent distinguishes a version bump from a real edit");
+  const before = content([
+    zaln("H1", [w("He")]), t(" "),
+    zaln("H2", [w("came")]),
+  ]);
+  // Structurally identical but a different object graph — e.g. one fresh
+  // parse vs. another, or a server round trip through JSON.stringify /
+  // JSON.parse. This is exactly the "same bytes, new identity" shape a
+  // save's optimistic-apply-then-outbox-200 pair produces.
+  const sameBytesNewObject = content([
+    zaln("H1", [w("He")]), t(" "),
+    zaln("H2", [w("came")]),
+  ]);
+  assert(before !== sameBytesNewObject, "sanity: the two fixtures are different object references");
+  assert(
+    sameVerseContent(before, sameBytesNewObject),
+    "structurally identical content compares equal regardless of object identity",
+  );
+  assert(sameVerseContent(before, before), "the exact same reference compares equal");
+
+  const afterRealEdit = content([
+    zaln("H1", [w("He")]), t(" "),
+    zaln("H2", [w("arrived")]),
+  ]);
+  assert(
+    !sameVerseContent(before, afterRealEdit),
+    "a genuine content change (a foreign edit) does not compare equal",
+  );
+
+  assert(!sameVerseContent(before, null), "content vs. null is never equal");
+  assert(!sameVerseContent(null, before), "null vs. content is never equal");
+  assert(sameVerseContent(null, null), "null vs. null is equal (no verse loaded on either side)");
 }
 
 if (failed > 0) {
