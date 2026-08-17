@@ -527,6 +527,11 @@ export const applyVerseRowsForTest = (
   broadcastLaneReopens?: boolean,
 ): Promise<ReimportCounts> =>
   applyVerseRows(env, book, bibleVersion, verses, userId, cutoff, broadcastLaneReopens);
+export const clearTombstoneBlockAlertForTest = (
+  env: Env,
+  book: string,
+  resource: Resource,
+): Promise<void> => clearTombstoneBlockAlert(env, book, resource);
 
 function addCounts(into: ReimportCounts, from: ReimportCounts): void {
   into.updated += from.updated;
@@ -4259,6 +4264,35 @@ async function raiseTombstoneBlockAlert(
   }
 }
 
+// Clears a resource's reimport_id_blocked alert (raiseTombstoneBlockAlert)
+// once its sync actually succeeds and a watermark is recorded. The alert's
+// own text promises the reclaim-race half of the count "usually clears on
+// its own next sync" — but until this function existed, the ONLY place that
+// DELETE ran was inside raiseTombstoneBlockAlert itself, which fires only
+// while the resource is STILL withheld. A resource that recovers next run
+// never calls it again, so a resolved alert stayed active in the banner
+// forever, falsely claiming the resource was still out of sync (Codex review
+// on PR #506, round 3). Called from the sync-success branch in
+// runChunkedReimport, immediately after recordResourceSync lands — see
+// clearTombstoneBlockAlertForTest for the reimportJourney.test.mjs coverage.
+// Best-effort like every other alert helper here: a failed cleanup must
+// never fail the reimport, and clearing an alert that doesn't exist (the
+// common case — most resources never had one) is a harmless no-op DELETE.
+async function clearTombstoneBlockAlert(env: Env, book: string, resource: Resource): Promise<void> {
+  const source = `reimport_id_blocked:${book}:${resource}`;
+  try {
+    await env.DB.prepare(`DELETE FROM system_alerts WHERE username = ?1 AND source = ?2 AND dismissed_at IS NULL`)
+      .bind(OWN_PUBLISH_ALERT_USERNAME, source)
+      .run();
+  } catch (e) {
+    console.error("reimport tombstone-block alert clear failed", {
+      book,
+      resource,
+      error: e instanceof Error ? e.message : String(e),
+    });
+  }
+}
+
 async function raiseOwnPublishInertAlert(
   env: Env,
   book: string,
@@ -5187,6 +5221,12 @@ export async function runChunkedReimport(
       if (!e.masterSha) continue;
       await recordResourceSync(env, book, e.resource, e.masterSha, "reimport");
       recorded++;
+      // The resource just synced cleanly (it reached here, so it was NOT
+      // withheld above) — clear any stale reimport_id_blocked alert from a
+      // past run's tombstone_blocked/conflict_skipped count. See
+      // clearTombstoneBlockAlert's doc comment for why this can't live inside
+      // raiseTombstoneBlockAlert itself.
+      await clearTombstoneBlockAlert(env, book, e.resource);
     }
     if (withheld.length) {
       // Not always "chapter lock held" any more — also fires for systemic

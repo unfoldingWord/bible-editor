@@ -28,6 +28,10 @@
 //       including that the taint survives the addCounts aggregation step
 //   (c) the banner is QUERYABLE from system_alerts, where the UI reads it
 //   (d) the HEALTHY path still stamps origin='reimport' — no false withhold
+//   (e) a RECOVERED resource's stale reimport_id_blocked alert is actually
+//       CLEARED once the sync-success path records a watermark for it, and
+//       clearing is scoped to that (book, resource) only — Codex round-3
+//       review on PR #506
 
 import { DatabaseSync } from "node:sqlite";
 import { readdirSync, readFileSync } from "node:fs";
@@ -660,6 +664,50 @@ console.log("\n[AI-vs-human conflict policy at the caller]");
   const two = zeroCountsForTest();
   one.merge_no_base_refs.push("1:1");
   eq((two.merge_no_base_refs ?? []).length, 0, "zeroCounts allocates a fresh refs array per call (no aliasing)");
+}
+
+console.log("\n[(e) a RECOVERED resource clears its stale reimport_id_blocked alert — Codex round-3 review on PR #506]");
+{
+  // The alert's own message promises the reclaim-race half "usually resolves
+  // automatically" (see (c) above) — but until clearTombstoneBlockAlert
+  // existed, nothing ever actually deleted it once the resource recovered:
+  // raiseTombstoneBlockAlert only runs while STILL withheld, so a resolved
+  // alert sat active in the banner forever, falsely claiming the resource was
+  // still out of sync.
+  const { sqlite, env } = freshEnv();
+  const { raiseTombstoneBlockAlertForTest, clearTombstoneBlockAlertForTest } = await import("./bookReimport.ts");
+
+  // Simulate last night: a reclaim lost its version-CAS race and raised the
+  // banner, exactly like (c) above.
+  seedTombstone(sqlite);
+  const raced = withReclaimRace(env, sqlite, BOOK, ID);
+  const staleCounts = await applyTsvRows(raced, BOOK, "tq", [masterRow()], null);
+  await raiseTombstoneBlockAlertForTest(env, BOOK, "tq", staleCounts);
+  const before = sqlite
+    .prepare(`SELECT COUNT(*) AS n FROM system_alerts WHERE source = ? AND dismissed_at IS NULL`)
+    .all(`reimport_id_blocked:${BOOK}:tq`)[0];
+  eq(Number(before.n), 1, "sanity: the stale alert exists before recovery");
+
+  // Also raise one for a DIFFERENT book/resource — clearing must be scoped,
+  // never a blanket wipe of every open reimport_id_blocked alert.
+  await raiseTombstoneBlockAlertForTest(env, "AMO", "tn", staleCounts);
+
+  // Tonight: the race resolved (the tombstoned row is no longer contested),
+  // so the resource syncs cleanly this run. Exercise exactly the two calls
+  // runChunkedReimport's sync-success branch makes, in the same order:
+  // recordResourceSync (the watermark stamp), then clearTombstoneBlockAlert.
+  await recordResourceSync(env, BOOK, "tq", "def456abc789", "reimport");
+  await clearTombstoneBlockAlertForTest(env, BOOK, "tq");
+
+  const after = sqlite
+    .prepare(`SELECT COUNT(*) AS n FROM system_alerts WHERE source = ? AND dismissed_at IS NULL`)
+    .all(`reimport_id_blocked:${BOOK}:tq`)[0];
+  eq(Number(after.n), 0, "the recovered resource's alert is cleared");
+
+  const otherStillOpen = sqlite
+    .prepare(`SELECT COUNT(*) AS n FROM system_alerts WHERE source = ? AND dismissed_at IS NULL`)
+    .all(`reimport_id_blocked:AMO:tn`)[0];
+  eq(Number(otherStillOpen.n), 1, "a DIFFERENT (book, resource)'s alert is untouched — clearing is scoped, not a blanket wipe");
 }
 
 if (failed > 0) {
