@@ -87,7 +87,14 @@ export function dcsUrls(env: Env, book: string): DcsUrlSet | null {
 // cannot verify completeness without a declared length, so we at least SURFACE
 // the condition (warn) — the real backstop is the reimport's row-count gate
 // (tsvFetchLooksTruncated in bookReimport.ts), which rejects a body that parses
-// to drastically fewer rows than the book already holds in D1.
+// to drastically fewer rows than the book already holds in D1. The EXPORT
+// shrink guard cannot use that same D1-row-count trick (it's comparing D1
+// against master, so a D1 that is itself partial from a correlated
+// truncation hides rather than exposes the shrink — issue #494), so its two
+// master fetches go through fetchDcsMasterText below instead of this
+// function: that helper closes the same blind spot with an independent
+// check (the Gitea contents API's own recorded file size) rather than
+// relying on Content-Length at all.
 export async function fetchText(url: string): Promise<string | null> {
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
@@ -174,4 +181,113 @@ export async function fileCommitSha(env: Env, repo: string, path: string): Promi
   } catch {
     return null;
   }
+}
+
+// ── Independent completeness check for the EXPORT shrink guards (issue #494) ──
+//
+// fetchText's Content-Length check goes blind exactly when the raw endpoint
+// omits the header (the HAB tn incident, documented on fetchText above). The
+// reimport has its own backstop for that blind spot — tsvFetchLooksTruncated
+// in bookReimport.ts, which compares the parsed row count against what D1
+// already holds LIVE. The export shrink guard (exportWorkflow.ts's
+// checkTsvShrink / checkUsfmAlignmentShrink) cannot reuse that same trick: it
+// is comparing D1's render AGAINST master, so a D1 that is itself partial —
+// e.g. from the exact same reimport truncation, which stamped a watermark
+// anyway because the freshness gate only checks the commit SHA, not row
+// completeness — makes the two truncated reads agree with each other and the
+// shrink disappears instead of surfacing. Two correlated truncations of the
+// same misbehaving endpoint, not two independent ones — see issue #494.
+//
+// dcsFileSize asks a SEPARATE DCS endpoint (the contents API, already used
+// elsewhere in the export flow — see fetchDcsContentsNames in
+// exportWorkflow.ts) for the byte size Gitea's git backend actually has on
+// record for the file at `ref`. That size has nothing to do with whatever
+// Content-Length (if any) the raw endpoint decided to send, so it is a
+// genuinely independent source of truth fetchDcsMasterText can cross-check
+// the downloaded bytes against — including in the no-Content-Length case.
+export async function dcsFileSize(
+  env: Env,
+  repo: string,
+  path: string,
+  ref = "master",
+): Promise<number | null> {
+  const base = (env.DCS_BASE_URL ?? "https://git.door43.org").replace(/\/$/, "");
+  const url =
+    `${base}/api/v1/repos/${DCS_OWNER}/${encodeURIComponent(repo)}` +
+    `/contents/${encodeURIComponent(path)}?ref=${encodeURIComponent(ref)}`;
+  try {
+    const headers: Record<string, string> = { Accept: "application/json" };
+    if (env.DCS_SERVICE_TOKEN) headers.Authorization = `token ${env.DCS_SERVICE_TOKEN}`;
+    const r = await fetch(url, { headers });
+    if (!r.ok) return null;
+    const data = (await r.json()) as { size?: number };
+    return typeof data.size === "number" && Number.isFinite(data.size) ? data.size : null;
+  } catch {
+    return null;
+  }
+}
+
+// Master-file fetch for the export shrink guards, verified against
+// dcsFileSize as well as (when present) Content-Length. Same retry-once,
+// null-on-failure shape as fetchText — callers already treat a null master
+// fetch as `master_unreadable` and fail closed, so routing a short read
+// through the SAME return value (rather than returning the truncated text) is
+// what actually closes the blind spot: no new "detail" branch is needed, the
+// existing fail-closed path just fires more often.
+//
+// Deliberately independent of fetchText rather than layered on top of it:
+// fetchText only exposes the decoded string, not the raw byte length, and
+// re-encoding a decoded string to recover a byte count is lossy in edge cases
+// (e.g. a stripped BOM) that would make this comparison unreliable. Fetching
+// once here and checking both the header and the API size against the same
+// ArrayBuffer keeps the byte count exact.
+export async function fetchDcsMasterText(
+  env: Env,
+  repo: string,
+  path: string,
+  ref = "master",
+): Promise<string | null> {
+  const url = dcsRawUrl(env, repo, path);
+  const apiSize = await dcsFileSize(env, repo, path, ref);
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const r = await fetch(url);
+      if (!r.ok) return null;
+      const buf = await r.arrayBuffer();
+      const cl = r.headers.get("content-length");
+      const expectedCl = cl == null ? null : Number(cl);
+      if (expectedCl != null && Number.isFinite(expectedCl) && buf.byteLength < expectedCl) {
+        console.error("fetchDcsMasterText: short read vs Content-Length; retrying", {
+          url,
+          expectedBytes: expectedCl,
+          gotBytes: buf.byteLength,
+          attempt,
+        });
+        continue;
+      }
+      // The independent check: fires whether or not Content-Length was even
+      // present, so it is the part that actually covers the HAB-shaped case.
+      if (apiSize != null && buf.byteLength < apiSize) {
+        console.error(
+          "fetchDcsMasterText: short read vs Gitea contents-API size; retrying",
+          { url, apiSize, gotBytes: buf.byteLength, attempt },
+        );
+        continue;
+      }
+      if (expectedCl == null && apiSize == null) {
+        // Neither independent size source was available — completeness is
+        // genuinely unverifiable here. Surface it (mirrors fetchText's own
+        // no-Content-Length warning) so the condition stays visible even
+        // though we cannot act on it further.
+        console.warn("fetchDcsMasterText: no Content-Length and no contents-API size; completeness unverified", {
+          url,
+          gotBytes: buf.byteLength,
+        });
+      }
+      return new TextDecoder("utf-8").decode(buf);
+    } catch {
+      // network error → retry once, then null
+    }
+  }
+  return null;
 }
