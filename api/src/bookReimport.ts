@@ -1840,15 +1840,36 @@ export async function applyTsvRows(
   // starts master's row life master-owned, same as a fresh insert. Audited as
   // "create" — from this slot's new life's perspective, master's row IS a
   // fresh row, not an update to whatever used to occupy the slot.
-  for (let i = 0; i < reclaims.length; i += WRITE_BATCH) {
-    const slice = reclaims.slice(i, i + WRITE_BATCH);
-    try {
-      const results = await env.DB.batch(
-        slice.map((u) => buildTsvUpdateStmt(env, book, kind, u.row, u.sortOrder, u.oldVersion, now, false, false, true)),
+  // RECLAIM_PAIR_BATCH (half of WRITE_BATCH): each reclaim now travels as TWO
+  // statements — the write immediately followed by its own SQL-`changes()`-
+  // gated edit_log INSERT (gatedLogEditStmt) — in the SAME batch() call, so
+  // chunking halves to stay within D1's ≤100-statement cap. This keeps the
+  // write and its audit row atomic (Codex review on PR #506, round 2): the
+  // audit row IS the boundary rowHistoryBoundary.ts relies on to hide the
+  // dead tombstoned row's history from the reclaimed row, so a write that
+  // landed with no matching log would leave that boundary permanently
+  // missing — a RETRY can't repair it, because a reclaimed row is no longer a
+  // tombstone and won't hit this branch again next run. Previously (like
+  // applyVerseRows' pristine batch before its own PR #496 review fix) the
+  // write batch and a follow-up JS-gated log batch were two separate
+  // env.DB.batch() calls, so a write batch that landed while the log batch
+  // failed independently would go on to be counted `tombstone_reclaimed`
+  // ANYWAY (the JS check only asked whether the WRITE landed) — content
+  // correct, but boundary silently missing forever.
+  const RECLAIM_PAIR_BATCH = Math.floor(WRITE_BATCH / 2);
+  for (let i = 0; i < reclaims.length; i += RECLAIM_PAIR_BATCH) {
+    const slice = reclaims.slice(i, i + RECLAIM_PAIR_BATCH);
+    const stmts: D1PreparedStatement[] = [];
+    for (const u of slice) {
+      stmts.push(
+        buildTsvUpdateStmt(env, book, kind, u.row, u.sortOrder, u.oldVersion, now, false, false, true),
+        gatedLogEditStmt(env, kind, u.row.id, book, userId, u.oldVersion, u.oldVersion + 1, "create", u.row),
       );
-      const logs: D1PreparedStatement[] = [];
+    }
+    try {
+      const results = await env.DB.batch(stmts);
       slice.forEach((u, j) => {
-        if ((results[j]?.meta.changes ?? 0) > 0) {
+        if ((results[j * 2]?.meta.changes ?? 0) > 0) {
           counts.tombstone_reclaimed++;
           console.warn("reimport: reclaimed reissued tombstone slot for master's row", {
             book,
@@ -1857,13 +1878,14 @@ export async function applyTsvRows(
             chapter: u.row.chapter,
             verse: u.row.verse,
           });
-          logs.push(logEditStmt(env, kind, u.row.id, book, userId, u.oldVersion, u.oldVersion + 1, "create", u.row));
         } else {
           // Lost the version-CAS race — something touched this tombstoned row
           // between the read and this batch. Fall back to the pre-reclaim
           // safety net so a lost race is never silently dropped: count it
           // tombstone_blocked (withholds the watermark) exactly as if reclaim
-          // had never been attempted for this row.
+          // had never been attempted for this row. The paired log statement
+          // also no-ops (its own `changes() > 0` gate sees the write's 0), so
+          // no phantom audit row lands for a reclaim that didn't happen.
           counts.tombstone_blocked++;
           noteBlockedSample(
             counts,
@@ -1871,18 +1893,16 @@ export async function applyTsvRows(
           );
         }
       });
-      if (logs.length) await env.DB.batch(logs);
     } catch (e) {
       // Correctness-bearing, same as the edited-merge and verse master-adoption
-      // batches below/above: a thrown write batch means master's row(s) for this
-      // slice are NOT in D1 (or, if only the trailing edit_log batch threw, ARE
-      // in D1 but with no audit trail) — either way this run must not be
-      // certified in sync, or the reimport-sync step stamps the watermark over
-      // still-missing content and the nightly export never retries (Codex
-      // review on PR #506). Taint apply_incomplete so shouldRecordResourceSync
-      // withholds it; the next sync retries harmlessly (a landed-but-unlogged
-      // reclaim is no longer a tombstone, so it simply won't match the reclaim
-      // branch again).
+      // batches below/above: a thrown batch is one D1 transaction that never
+      // committed, so NEITHER the write NOR its paired log landed for this
+      // whole slice — this run must not be certified in sync, or the
+      // reimport-sync step stamps the watermark over still-missing content
+      // and the nightly export never retries (Codex review on PR #506).
+      // Taint apply_incomplete so shouldRecordResourceSync withholds it; the
+      // next sync retries this same slice from scratch (still tombstoned,
+      // since nothing landed).
       counts.apply_incomplete = true;
       counts.errors.push(`${kind} reclaim batch: ${e instanceof Error ? e.message : String(e)}`);
     }
@@ -2431,6 +2451,38 @@ function logEditStmt(
     `INSERT INTO edit_log
        (kind, row_key, book, user_id, prev_version, new_version, action, payload_json, source)
      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)`,
+  ).bind(kind, rowKey, book, userId, prevVersion, newVersion, action, JSON.stringify(payload), REIMPORT_SOURCE);
+}
+
+// SQL-`changes()`-gated sibling of logEditStmt, for a write+log pair that MUST
+// travel in the SAME env.DB.batch() call, immediately adjacent (write, then
+// this). D1 batches are transactional but are NOT one INSERT — two separate
+// batch() calls (write batch, then a JS-meta.changes-gated log batch) can
+// commit the first and lose the second independently, leaving a write with no
+// audit row. `changes()` reflects the immediately-preceding statement in the
+// SAME batch, so this only inserts when that statement actually changed a
+// row — never a phantom audit row for a write that lost its guard/CAS. Same
+// pattern as applyVerseRows' pristine batch (PR #496 review fix, commit
+// 9dad85d) — reused here for the reclaim batch (PR #506 review), which needs
+// the same guarantee: a reclaim's audit row is also a history BOUNDARY
+// (rowHistoryBoundary.ts) that must never land without the write it belongs
+// to, or vice versa.
+function gatedLogEditStmt(
+  env: Env,
+  kind: "tn" | "tq" | "twl" | "verse",
+  rowKey: string,
+  book: string,
+  userId: number | null,
+  prevVersion: number | null,
+  newVersion: number,
+  action: "create" | "update" | "restore",
+  payload: unknown,
+): D1PreparedStatement {
+  return env.DB.prepare(
+    `INSERT INTO edit_log
+       (kind, row_key, book, user_id, prev_version, new_version, action, payload_json, source)
+     SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9
+      WHERE changes() > 0`,
   ).bind(kind, rowKey, book, userId, prevVersion, newVersion, action, JSON.stringify(payload), REIMPORT_SOURCE);
 }
 

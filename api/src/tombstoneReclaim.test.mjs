@@ -43,6 +43,10 @@
 //   (h) reclaim resets restored_from_version/review_kind/review_reason (all
 //       three TSV kinds, not just tn's trashed_at/preserve/hint) to
 //       fresh-insert defaults — Codex review on PR #506, P2.
+//   (i) the reclaim write and its edit_log 'create' row (the history
+//       BOUNDARY rowHistoryBoundary.ts relies on) travel in exactly ONE
+//       atomic batch() call, never split into a write batch + a separate
+//       follow-up log batch — Codex round-2 review on PR #506, P1.
 
 import { DatabaseSync } from "node:sqlite";
 import { readdirSync, readFileSync } from "node:fs";
@@ -440,6 +444,41 @@ console.log("\n[(h) reclaim resets restored_from_version/review_kind/review_reas
   eq(stored[0].restored_from_version, null, "restored_from_version reset — the OLD row's 'showing as v3' chip does not apply to master's new content");
   eq(stored[0].review_kind, null, "review_kind reset — the OLD row's flag-for-review does not apply to master's new content");
   eq(stored[0].review_reason, null, "review_reason reset alongside review_kind");
+}
+
+console.log("\n[(i) the write and its boundary log travel in ONE atomic batch() call — Codex round-2 review on PR #506]");
+{
+  // Codex's round-2 finding: the reclaim write and its edit_log 'create' row
+  // (the history BOUNDARY rowHistoryBoundary.ts relies on) previously landed
+  // via TWO separate env.DB.batch() calls — a write batch, then a follow-up
+  // JS-meta.changes-gated log batch. A landed write whose follow-up log batch
+  // failed independently left the boundary permanently missing, since a
+  // reclaimed row is no longer a tombstone and a retry can't hit this branch
+  // again. Prove the fix directly: count batch() calls (not just outcomes) —
+  // there must be exactly ONE per chunk, containing BOTH statements for every
+  // reclaimed row.
+  const { sqlite, env } = freshEnv();
+  const IDS = ["hoig", "v8f1", "h6b9"];
+  for (const id of IDS) seedTqTombstone(sqlite, { id, ref: "5:4", chapter: 5, verse: 4 });
+  let batchCalls = 0;
+  const countingEnv = {
+    ...env,
+    DB: {
+      ...env.DB,
+      async batch(stmts) {
+        batchCalls++;
+        return env.DB.batch(stmts);
+      },
+    },
+  };
+  const masterRows = IDS.map((id, i) => tqMasterRow({ id, ref: `23:${i + 7}`, chapter: 23, verse: i + 7 }));
+  const counts = await applyTsvRows(countingEnv, BOOK, "tq", masterRows, null);
+
+  eq(counts.tombstone_reclaimed, 3, "all three reclaimed");
+  eq(batchCalls, 1, "exactly ONE batch() call for the whole chunk — write and log are NEVER split into separate calls");
+
+  const logs = sqlite.prepare(`SELECT row_key, action FROM edit_log WHERE kind = 'tq' AND book = ? AND action = 'create'`).all(BOOK);
+  eq(logs.length, 3, "all three audit rows landed, atomically alongside their writes");
 }
 
 if (failed > 0) {
