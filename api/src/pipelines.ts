@@ -432,6 +432,25 @@ export async function dispatchNext(env: Env): Promise<void> {
       .run();
   };
 
+  // Our OWN dispatch-POST timeout firing does NOT mean the upstream request
+  // never landed — only that WE gave up waiting (see DISPATCH_TIMEOUT_ERROR_
+  // KIND/MESSAGE's doc comment for the full reasoning). Unlike `fail`, this
+  // deliberately does NOT touch `state` — the row stays 'dispatching' (still
+  // in ACTIVE_STATES, so the slot stays held) and only stamps error_kind/
+  // error_message so it's visible and so the dedicated grace-period sweep in
+  // pollAllNonTerminal (keyed on exactly this marker) can find it. Guarded on
+  // `state = 'dispatching'` so this can never resurrect a row some other
+  // caller (force-fail) has already moved on from.
+  const markDispatchAmbiguous = async () => {
+    await env.DB.prepare(
+      `UPDATE pipeline_jobs
+          SET error_kind = ?2, error_message = ?3, updated_at = unixepoch()
+        WHERE job_id = ?1 AND state = 'dispatching'`,
+    )
+      .bind(job.job_id, DISPATCH_TIMEOUT_ERROR_KIND, DISPATCH_TIMEOUT_ERROR_MESSAGE)
+      .run();
+  };
+
   const username = await resolveUsernameFromDb(env, job.user_id);
   if (!username) {
     await fail("sdk_error", "username_missing");
@@ -477,18 +496,23 @@ export async function dispatchNext(env: Env): Promise<void> {
       body: JSON.stringify(upstreamBody),
       // See DISPATCH_POST_TIMEOUT_MS's doc comment — bounding this below
       // STUCK_DISPATCH_THRESHOLD_SECONDS is what stops the stale-dispatch
-      // sweep from ever racing a still-live POST (issue #493). On abort we
-      // fail the row locally below, same as the pre-existing unreachable/
-      // non-OK paths — we do NOT know whether the upstream request actually
-      // landed, but leaving OUR row in 'dispatching' past our own timeout
-      // would just reopen the exact race this exists to close.
+      // sweep from ever racing a still-live POST (issue #493).
       signal: AbortSignal.timeout(DISPATCH_POST_TIMEOUT_MS),
     });
     text = await upstream.text();
   } catch (e) {
     if (e instanceof Error && e.name === "TimeoutError") {
-      await fail("transient_outage", "upstream_dispatch_timeout");
+      // Our OWN timeout, not a connection failure — the request may well
+      // have reached the bot before we gave up waiting on it. See
+      // DISPATCH_TIMEOUT_ERROR_KIND/MESSAGE's doc comment: this does NOT
+      // free the slot immediately (progresses, does not fully close, #493 —
+      // see #511 for what would).
+      await markDispatchAmbiguous();
     } else {
+      // A genuine connection failure (DNS, refused, reset) is NOT ambiguous
+      // — the request never reached the bot, so there is nothing to hold
+      // the slot open for. Fail immediately, same as the pre-existing
+      // unreachable/non-OK paths below.
       await fail("transient_outage", "upstream_unreachable");
     }
     return;
@@ -1297,9 +1321,17 @@ const STUCK_JOB_THRESHOLD_SECONDS = 86400 * 2;
 const MAX_POLL_ATTEMPTS = 100;
 
 // A 'dispatching' row is mid-flight on the upstream POST, which returns in
-// seconds. Anything stuck this long is a Worker that died between claiming the
-// slot and recording the result — fail it (don't auto-re-dispatch) so we never
-// risk launching a second concurrent run, and free the slot for the queue.
+// seconds. Anything stuck THIS LONG WITH NO error_kind/error_message SET AT
+// ALL is a Worker that died before it could even record a result (crashed /
+// evicted between claiming the slot and reaching dispatchNext's own catch
+// block) — fail it (don't auto-re-dispatch) so we never risk launching a
+// second concurrent run, and free the slot for the queue. Deliberately
+// EXCLUDES a row carrying DISPATCH_TIMEOUT_ERROR_KIND/MESSAGE — that marker
+// means dispatchNext's own code DID run and DID record an outcome (just an
+// ambiguous one); AMBIGUOUS_DISPATCH_GRACE_SECONDS below governs those
+// instead, on a separate, longer clock. The two sweeps are disjoint by
+// construction (see pollAllNonTerminal): this one requires the marker
+// ABSENT, the other requires it PRESENT.
 const STUCK_DISPATCH_THRESHOLD_SECONDS = 120;
 
 // The dispatch POST itself (below, in dispatchNext) used to have no timeout
@@ -1310,9 +1342,43 @@ const STUCK_DISPATCH_THRESHOLD_SECONDS = 120;
 // dispatchNext safety net could then claim and dispatch a SECOND job —
 // double-occupying the single-slot bot the instant the first POST eventually
 // succeeded upstream (issue #493). Bounding the POST comfortably below the
-// sweep's threshold means OUR OWN catch always fails the row first, so the
-// sweep can never find a 'dispatching' row to race against a still-live POST.
+// sweep's threshold means OUR OWN catch always resolves the row first, so
+// the STUCK_DISPATCH_THRESHOLD_SECONDS sweep can never find a genuinely
+// still-live POST to race against — it now only ever catches a truly dead
+// Worker (see that constant's doc comment).
 const DISPATCH_POST_TIMEOUT_MS = (STUCK_DISPATCH_THRESHOLD_SECONDS - 30) * 1000;
+
+// The (error_kind, error_message) pair dispatchNext stamps on a 'dispatching'
+// row when ITS OWN DISPATCH_POST_TIMEOUT_MS fires — a signal read back by
+// pollAllNonTerminal's ambiguous-dispatch sweep below. Centralized here (not
+// inlined at each of the two call sites) so the stamp and the sweep's WHERE
+// clause can never drift apart into two different strings that stop matching.
+const DISPATCH_TIMEOUT_ERROR_KIND = "transient_outage";
+const DISPATCH_TIMEOUT_ERROR_MESSAGE = "upstream_dispatch_timeout";
+
+// PROGRESSES #493; DOES NOT FULLY CLOSE IT — see issue #511 for what would
+// (an upstream idempotency key, a status-by-sessionKey lookup, or a
+// confirmed-cancel endpoint; bp-assistant offers none of the three today).
+//
+// When dispatchNext's own DISPATCH_POST_TIMEOUT_MS fires, aborting OUR fetch
+// does not cancel the bot's server-side run if the POST already landed there
+// — we genuinely cannot tell. Immediately freeing the slot on our own
+// ambiguous timeout (the naive reading of the issue's own suggested fix)
+// would just relocate the double-dispatch race from "the sweep races a
+// still-live POST" (closed above) to "our own timeout races a POST that
+// might still land" — narrower (bounded to this one ~90s edge case instead
+// of any arbitrarily slow request) but not actually closed.
+//
+// So dispatchNext does NOT fail an ambiguous timeout immediately: it stamps
+// DISPATCH_TIMEOUT_ERROR_KIND/MESSAGE and leaves `state` at 'dispatching' —
+// still holding the slot — and this sweep is what finally frees it, but only
+// after ONE EXTRA cron cycle (the */5 cadence) beyond dispatchNext's own
+// timeout has passed with nothing else having resolved the row. This is a
+// documented, best-effort mitigation, not a guarantee: if the bot's run is
+// BOTH genuinely accepted AND still running past this entire grace window,
+// the double-dispatch this issue describes can still happen — just in a
+// much narrower window than before this constant existed.
+const AMBIGUOUS_DISPATCH_GRACE_SECONDS = 300;
 
 // Auto-resume time-box. A pause older than this is not resumed automatically:
 // the bot's checkpoint may no longer match the repo state, and a stale resume is
@@ -1399,6 +1465,13 @@ export async function pollAllNonTerminal(env: Env): Promise<void> {
     // a row in 'dispatching' hasn't been polled to 'done' yet, so it can never
     // hold a live import claim — that exclusion only matters for the two
     // sweeps that can actually catch a job with an in-flight apply.
+    //
+    // Excludes DISPATCH_TIMEOUT_ERROR_KIND/MESSAGE (see AMBIGUOUS_DISPATCH_
+    // GRACE_SECONDS's doc comment): a row carrying that marker had its own
+    // dispatchNext catch block run and record an ambiguous-but-not-dead
+    // outcome, governed by the separate, longer sweep just below — this one
+    // is only for a row that never got that far (Worker crashed/evicted
+    // before dispatchNext's own catch could run at all).
     await env.DB.prepare(
       `UPDATE pipeline_jobs
           SET state = 'failed',
@@ -1406,9 +1479,29 @@ export async function pollAllNonTerminal(env: Env): Promise<void> {
               error_message = 'auto-failed: dispatch did not complete',
               updated_at = unixepoch()
         WHERE state = 'dispatching'
+          AND updated_at < unixepoch() - ?1
+          AND NOT (error_kind = ?2 AND error_message = ?3)`,
+    )
+      .bind(STUCK_DISPATCH_THRESHOLD_SECONDS, DISPATCH_TIMEOUT_ERROR_KIND, DISPATCH_TIMEOUT_ERROR_MESSAGE)
+      .run();
+    // Issue #493 / #511: a dispatch that timed out on OUR side (marked
+    // ambiguous by dispatchNext's own catch block, see
+    // AMBIGUOUS_DISPATCH_GRACE_SECONDS's doc comment) gets one extra grace
+    // period, longer than STUCK_DISPATCH_THRESHOLD_SECONDS and counted from
+    // when we stamped the marker (updated_at), before we finally give up and
+    // free the slot. This does not confirm whether the upstream run actually
+    // happened — see #511 for the upstream API support that would.
+    await env.DB.prepare(
+      `UPDATE pipeline_jobs
+          SET state = 'failed',
+              error_kind = 'transient_outage',
+              error_message = 'auto-failed: dispatch POST timed out and never confirmed landing upstream (grace period expired)',
+              updated_at = unixepoch()
+        WHERE state = 'dispatching'
+          AND error_kind = ?2 AND error_message = ?3
           AND updated_at < unixepoch() - ?1`,
     )
-      .bind(STUCK_DISPATCH_THRESHOLD_SECONDS)
+      .bind(AMBIGUOUS_DISPATCH_GRACE_SECONDS, DISPATCH_TIMEOUT_ERROR_KIND, DISPATCH_TIMEOUT_ERROR_MESSAGE)
       .run();
   } catch (err) {
     console.error("[scheduled.pipelinePoll] backstop sweeps failed:", err);
