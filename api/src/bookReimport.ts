@@ -2989,6 +2989,8 @@ async function applyVerseRows(
     overwrittenVersion: number | null;
     alignment: VerseMergeResult["alignment"] | null;
     adopted: boolean;
+    // See issue #507's version guard on UPSERT_VERSE_MERGE_CONFLICT_SQL.
+    observedVersion: number | null;
   }> = [];
   for (const v of verses) {
     const ex = existing.get(`${v.chapter}:${v.verse}`);
@@ -3119,6 +3121,12 @@ async function applyVerseRows(
             overwrittenVersion: merge.adopt ? ex.version : null,
             alignment: merge.alignment ?? null,
             adopted: merge.adopt,
+            // See issue #507: the version this verse's merge outcome was
+            // detected at, so the speculative upsert's reactivation carve-out
+            // (keep_alignment_refused / keep_ai_master) can tell a stale
+            // re-detection from a fresh one. Unused (and harmless) for
+            // 'adopt' / 'adopt_conflict'.
+            observedVersion: ex.version,
           });
         }
         if (merge.adopt) {
@@ -3173,6 +3181,8 @@ async function applyVerseRows(
           overwrittenVersion: null,
           alignment: null,
           adopted: false,
+          // See issue #507: the version this divergence was detected at.
+          observedVersion: ex.version,
         });
       }
       if (rec.changed) {
@@ -3430,8 +3440,9 @@ async function applyVerseRows(
       reason: mc.reason,
       overwrittenVersion: mc.overwrittenVersion,
       alignment: mc.alignment,
+      observedVersion: mc.observedVersion,
     }));
-    const recorded = await recordVerseMergeConflicts(env, book, resource, allConflictRows, now);
+    const recorded = await recordVerseMergeConflicts(env, book, resource, bibleVersion, allConflictRows, now);
     if (!recorded) recordFailed = true;
   }
 
