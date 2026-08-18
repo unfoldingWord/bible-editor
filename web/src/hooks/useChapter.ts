@@ -100,6 +100,18 @@ export function useChapter(book: string, chapter: number): UseChapterReturn {
 
   useEffect(() => {
     mounted.current = true;
+    // Clear the previous (book, chapter)'s payload before the new fetch
+    // lands. `refetch` sets status to "loading" but never used to clear
+    // `data`, so from the moment (book, chapter) changed until the new
+    // payload arrived, Shell's `!data` gate fell through and rendered the
+    // PREVIOUS chapter's verses/notes/questions/words under the new
+    // book/chapter labels — and, because the editable UI only mounts in
+    // that data branch, let editing happen against stale content. This
+    // effect only re-runs when `refetch`'s own deps (book, chapter) change
+    // (it's identity-stable otherwise), so manual refetch() calls elsewhere
+    // (retry button, post-import refresh) are unaffected and keep refreshing
+    // in place without this blank. See #531.
+    setData(null);
     void refetch();
     return () => {
       mounted.current = false;
