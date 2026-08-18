@@ -835,6 +835,16 @@ export function classifyAlignmentShrinkOffenders(
 // then collapse the resulting whitespace runs, so "a\nb" (from a real
 // line-break) and "a b" (from a real space) canonicalize identically.
 //
+// Also NFC-normalize (see api/src/canonizeHebrew.ts / web/src/lib/hebrew.ts /
+// docs/hebrew-normalization.md): the UHB stores Hebrew combining marks in
+// legacy Tanakh order (consonant-dagesh-vowel), while AI-emitted `x-content`/
+// `x-lemma` and ZEC/LAM milestones come out in NFC order. Same visible glyph,
+// different bytes — without folding this, every combining-mark reorder reads
+// as a "content" difference and buries genuine reverts in noise (issue #521:
+// ~187 of 193 "substantive" alerts on 2026-08-16 were this plus whitespace).
+// `.normalize("NFC")` is a no-op on non-Hebrew text (issue #521's own success
+// check wants an unrelated English-word change to still classify substantive).
+//
 // This is shared with the TSV report below, where a Note/Question/Response
 // cell can ALSO legitimately contain a literal two-character "\n" (the
 // unfoldingWord convention for a real newline inside a TSV cell — see
@@ -844,7 +854,7 @@ export function classifyAlignmentShrinkOffenders(
 // case for a purely observational report — not worth a second, TSV-specific
 // canonicalizer.
 function canonicalizeForRevertCompare(s: string): string {
-  return s.replace(/\\[nrt]/g, " ").replace(/\s+/g, " ").trim();
+  return s.normalize("NFC").replace(/\\[nrt]/g, " ").replace(/\s+/g, " ").trim();
 }
 
 // Per-verse text extractor for usfmRevertReport. Deliberately a SEPARATE,
