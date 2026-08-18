@@ -3,7 +3,7 @@
 
 import assert from "node:assert/strict";
 import usfm from "usfm-js";
-import { lintChapterOpeningMarkers, lintTnRows, lintTqRows, lintTwlRows, lintUsfmVerses } from "./lint.ts";
+import { lintChapterOpeningMarkers, lintPairedPunctuation, lintTnRows, lintTqRows, lintTwlRows, lintUsfmVerses, lintVerseTextQuality } from "./lint.ts";
 
 let passed = 0;
 function t(name, fn) {
@@ -579,6 +579,185 @@ t("stale-DCS-claim detector catches every phrasing, spares innocent ones", () =>
     "Empty note — the row publishes blank; delete the row if it is not needed.",
   ]) {
     assert.ok(!STALE_CLAIM.test(ok), `false positive on: ${ok}`);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Text-quality checks (issue #438, ported from uw-content-validation).
+// Fixtures built from REAL usfm-js output, per the house rule above. Every
+// tuning decision here was measured against en_ult/en_ust/en_tn master via
+// scripts/scan-text-quality.mjs — see the PR for the corpus numbers.
+// ---------------------------------------------------------------------------
+
+// All verses of a book usfm string, in order (verseFromUsfm above returns only
+// 1:1). Chapter-front material keys as "front" in usfm-js → verse 0 here.
+const versesFromUsfm = (usfmText) => {
+  const j = usfm.toJSON(usfmText);
+  const rows = [];
+  for (const [chStr, verses] of Object.entries(j.chapters ?? {})) {
+    for (const [vStr, obj] of Object.entries(verses)) {
+      rows.push({
+        book: "1CH", chapter: Number(chStr), verse: vStr === "front" ? 0 : Number(vStr.split("-")[0]),
+        verse_end: null, bible_version: "ULT", version: 1,
+        content_json: JSON.stringify({ verseObjects: obj.verseObjects ?? [] }),
+      });
+    }
+  }
+  return rows;
+};
+const quality = (usfmText) => lintVerseTextQuality(versesFromUsfm(usfmText));
+const paired = (usfmText) => lintPairedPunctuation(versesFromUsfm(usfmText));
+
+t("straight quotes in verse prose flagged; typographic ones pass", () => {
+  const i = quality('\\c 1\n\\p\n\\v 1 he said "hi" and left\n').filter((x) => x.check === "Straight quote");
+  assert.equal(i.length, 2);
+  assert.equal(i[0].bucket, "flag");
+  assert.equal(i[0].ref, "1:1");
+  assert.equal(quality("\\c 1\n\\p\n\\v 1 he said “hi” and the servant’s ox\n").filter((x) => x.check === "Straight quote").length, 0);
+});
+t("straight quote inside a FOOTNOTE is not verse prose — not flagged", () => {
+  assert.equal(quality('\\c 1\n\\p\n\\v 1 word \\f + \\ft he said "x"\\f* end\n').filter((x) => x.check === "Straight quote").length, 0);
+});
+t("no-break space in verse prose flagged once per kind, with count", () => {
+  const i = quality("\\c 1\n\\p\n\\v 1 two words and more\n").filter((x) => x.check === "Invisible character");
+  assert.equal(i.length, 1);
+  assert.ok(/2 invisible no-break space/.test(i[0].message));
+});
+t("doubled space inside one text node flagged", () => {
+  const i = quality("\\c 1\n\\p\n\\v 1 two  spaces here\n").filter((x) => x.check === "Doubled space");
+  assert.equal(i.length, 1);
+});
+t("whitespace split ACROSS alignment nodes is NOT a doubled space (JER 23:37 shape)", () => {
+  // "you"'s chain carries an inner trailing space AND the inter-line break
+  // flattens to a second space — rendered USFM has ONE space (measured: raw
+  // JER 23 contains zero doubled spaces; the naive flatten reported 17).
+  const aligned =
+    '\\c 1\n\\p\n\\v 1 \\zaln-s |x-content="א"\\*\\w Thus\\w*\\zaln-e\\*\n' +
+    '\\zaln-s |x-content="ב"\\*\\w you\\w* \\zaln-e\\*\n' +
+    '\\zaln-s |x-content="ג"\\*\\w say\\w*\\zaln-e\\*\n';
+  assert.equal(quality(aligned).filter((x) => x.check === "Doubled space").length, 0);
+});
+t("doubled '.' flagged with the ellipsis hint; a real ellipsis passes", () => {
+  const i = quality("\\c 1\n\\p\n\\v 1 happen soon.. God will\n").filter((x) => x.check === "Doubled punctuation");
+  assert.equal(i.length, 1);
+  assert.ok(/ellipsis/.test(i[0].message));
+  assert.equal(quality("\\c 1\n\\p\n\\v 1 wait… now\n").filter((x) => x.check === "Doubled punctuation").length, 0);
+});
+t("comma glued to the next word flagged; comma before UST implied-text brace passes", () => {
+  const bad = quality("\\c 1\n\\p\n\\v 1 And you,devastated one\n").filter((x) => x.check === "Punctuation spacing");
+  assert.equal(bad.length, 1);
+  const braces = quality("\\c 1\n\\p\n\\v 1 word, {that is,} its blood\n").filter((x) => x.check === "Punctuation spacing");
+  assert.equal(braces.length, 0);
+});
+t("space before a comma flagged; spaced closing-quote convention passes", () => {
+  const bad = quality("\\c 1\n\\p\n\\v 1 word , more\n").filter((x) => x.check === "Punctuation spacing");
+  assert.equal(bad.length, 1);
+  // Adjacent closing quotes are conventionally space-separated (JER 27:11
+  // ULT ends `.’ ” ’ ” ”`). Pair balance is lintPairedPunctuation's business,
+  // not this check's.
+  const conv = quality("\\c 1\n\\p\n\\v 1 he said, ‘go.’ ” more\n").filter((x) => x.check === "Punctuation spacing");
+  assert.equal(conv.length, 0);
+});
+t("verse-leading punctuation at a poetry line break is not 'glued' (separator counts as space)", () => {
+  assert.equal(quality("\\c 1\n\\q1\n\\v 1 line one,\n\\q2 and line two\n").filter((x) => x.check === "Punctuation spacing").length, 0);
+});
+
+t("a quotation spanning verses is balanced — no pair issues", () => {
+  assert.equal(paired("\\c 1\n\\p\n\\v 1 he said, “first verse\n\\v 2 second verse.”\n").length, 0);
+});
+t("closing ” with no opener flagged at ITS verse", () => {
+  const i = paired("\\c 1\n\\p\n\\v 1 plain text\n\\v 2 tail of quote.”\n");
+  assert.equal(i.length, 1);
+  assert.equal(i[0].check, "Paired punctuation");
+  assert.equal(i[0].ref, "1:2");
+  assert.ok(/no matching opening “/.test(i[0].message));
+});
+t("unclosed “ flagged at the OPENER's verse", () => {
+  const i = paired("\\c 1\n\\p\n\\v 1 quiet start\n\\v 2 he said, “never closed\n\\v 3 more text\n");
+  assert.equal(i.length, 1);
+  assert.equal(i[0].ref, "1:2");
+  assert.ok(/never closed/.test(i[0].message));
+});
+t("English continuation: “ re-opened at a \\p paragraph start is not a second opener", () => {
+  const cont = "\\c 1\n\\p\n\\v 1 he said, “first paragraph\n\\p\n\\v 2 “second paragraph.”\n";
+  assert.equal(paired(cont).length, 0);
+});
+t("a “ at a mere \\q poetry line start is a REAL opener (nested quotes), not a continuation", () => {
+  // Balanced when both close…
+  const ok = "\\c 1\n\\q1\n\\v 1 he said, “line one\n\\q1 “inner line” outer end”\n";
+  assert.equal(paired(ok).length, 0);
+  // …and the leftover is reported when they don't (LIFO: the line-start “
+  // matched the first ”, so the leftover is verse 1's opener).
+  const bad = "\\c 1\n\\q1\n\\v 1 he said, “line one\n\\q1\n\\v 2 “inner line” outer never closes\n";
+  const i = paired(bad);
+  assert.equal(i.length, 1);
+  assert.equal(i[0].ref, "1:1");
+});
+t("’ is also the apostrophe: never flagged without an open ‘", () => {
+  assert.equal(paired("\\c 1\n\\p\n\\v 1 the servants’ house\n").length, 0);
+});
+t("unclosed ‘ flagged", () => {
+  const i = paired("\\c 1\n\\p\n\\v 1 he said, ‘never closed\n");
+  assert.equal(i.length, 1);
+  assert.ok(/single quotation mark/.test(i[0].message));
+});
+t("KNOWN GAP: a possessive ’ silently closes a real ‘ (accepted, mirrors uw-content-validation)", () => {
+  assert.equal(paired("\\c 1\n\\p\n\\v 1 he said, ‘James’ house is fine\n").length, 0);
+});
+t("brace closed by a bracket flagged both ways (JER 2:10 UST {west] shape)", () => {
+  const i = paired("\\c 1\n\\p\n\\v 1 you go {west] to the islands\n");
+  assert.equal(i.length, 2);
+  assert.ok(i.some((x) => /closing \]/.test(x.message)));
+  assert.ok(i.some((x) => /opening \{/.test(x.message)));
+});
+t("chapter-front (verse 0) text participates in pair matching", () => {
+  // Opener parked before \v 1 (usfm-js keys it under "front") — the closer in
+  // verse 1 must find it.
+  assert.equal(paired("\\c 1\n\\p “front matter\n\\v 1 closes here”\n").length, 0);
+});
+
+t("unbalanced “ in note prose flagged (GEN tn 10:1 shape)", () => {
+  const i = lintTnRows([tn({ note: "Here, **sons** means “descendants. The author is identifying" })]);
+  assert.equal(i.filter((x) => x.check === "Unbalanced quotation marks").length, 1);
+  assert.equal(i[0].rowId, "abcd");
+});
+t("AT-fragment quotes inside [ ] are masked, not unbalanced (GEN tn 2:18 shape)", () => {
+  const i = lintTnRows([tn({ note: "Alternate translation: [Next, Yahweh who is God declared, “It is not good]" })]);
+  assert.equal(i.filter((x) => x.check === "Unbalanced quotation marks").length, 0);
+});
+t("doubled space in a note NOT flagged — auto-fixed at export (normalizeNoteWhitespace)", () => {
+  const i = lintTnRows([tn({ note: "the author  wrote this\\n  - and a list item" })]);
+  assert.equal(i.filter((x) => x.check === "Doubled space").length, 0);
+});
+t("tC Create \\[\\[ artifact flagged as a bad combination", () => {
+  const i = lintTnRows([tn({ note: "word \\[\\[link\\]\\] end" })]);
+  assert.equal(i.filter((x) => x.check === "Bad character combination").length, 2);
+});
+t("zero-width space in a note flagged; word joiner INSIDE a Hebrew word exempt", () => {
+  const zwsp = lintTnRows([tn({ note: "a zero​width space" })]);
+  assert.equal(zwsp.filter((x) => x.check === "Invisible character").length, 1);
+  const hebrew = lintTnRows([tn({ note: "the word בְּ⁠רֵאשִׁית here" })]);
+  assert.equal(hebrew.filter((x) => x.check === "Invisible character").length, 0);
+  const latin = lintTnRows([tn({ note: "a word⁠joiner here" })]);
+  assert.equal(latin.filter((x) => x.check === "Invisible character").length, 1);
+});
+t("tq question and response get the same text-quality checks", () => {
+  const i = lintTqRows([tq({ question: "What did “he say?", response: "plain answer." })]);
+  assert.equal(i.filter((x) => x.check === "Unbalanced quotation marks").length, 1);
+  assert.equal(i[0].rowId, "abcd");
+});
+t("text-quality messages never claim DCS rejects the content", () => {
+  const STALE_CLAIM =
+    /(?:DCS|validator|validation|whole-repo)[^.]{0,30}\b(?:reject|refus|fail|block)|\b(?:reject|refus|fail|block)\w*[^.]{0,30}(?:DCS|validator|validation|whole-repo)|(?:can'?t|cannot|won'?t|will not)\s+merge|unmergeable|block\w*\s+(?:the\s+)?merg/i;
+  const all = [
+    ...quality('\\c 1\n\\p\n\\v 1 bad"text,glued soon.. two  spaces here , see\n'),
+    ...paired("\\c 1\n\\p\n\\v 1 “open ‘open {west]\n"),
+    ...lintTnRows([tn({ note: "means “broken. And \\[\\[bad and two  spaces and​zwsp" })]),
+  ];
+  assert.ok(all.length >= 8, `expected a rich issue set to vet, got ${all.length}`);
+  for (const i of all) {
+    assert.ok(!STALE_CLAIM.test(i.message), `stale DCS-rejection claim in: ${i.message}`);
+    assert.equal(i.bucket, "flag");
   }
 });
 
