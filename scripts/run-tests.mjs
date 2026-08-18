@@ -34,6 +34,7 @@ const SQLITE_FILES = new Set([
   // sqlite variant — the flag is additive, and the file's sqlite-only cases
   // gate themselves on availability.
   "src/pipelineDispatchTimeout.test.mjs",
+  "src/lockOverrideAlert.test.mjs",
 ]);
 
 const EXTRA_IMPORTS = new Map([
