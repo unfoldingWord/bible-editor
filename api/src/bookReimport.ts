@@ -78,6 +78,7 @@ import { loadTwTitles } from "./twTitles";
 import { loadTwlOrderLocks } from "./twlOrderLocks";
 import type { TwlRow, VerseRow, CheckLane } from "./types";
 import { computeVerseMerge, type VerseMergeResult } from "./verseMerge.ts";
+import { NO_BASE_REF_DISPLAY } from "./verseMergeEditorAlerts.ts";
 import { verseContentJsonFromPayload } from "./verseHistory.ts";
 import { canonizeAlignmentSource } from "./canonizeHebrew.ts";
 import {
@@ -261,6 +262,13 @@ export interface ReimportCounts {
   // warm-up tradeoff, left as a flagged follow-up (see the failed-adoption-write
   // gate, apply_incomplete, which IS gated).
   merge_no_base: number;
+  // The `chapter:verse` refs behind `merge_no_base`, so the banner can NAME the
+  // verses it admits tonight's export may overwrite instead of reporting a bare
+  // integer. Capped at NO_BASE_REF_CAP: this is a diagnostic list that gates
+  // nothing (merge_no_base stays the authoritative count), and it rides back
+  // through a Workflow step's serialized return value, so it must stay small.
+  // verses only — the TSV side shares `merge_no_base` but has no banner.
+  merge_no_base_refs?: string[];
   // Human-edited verse that DIFFERS from master but could not be adjudicated
   // at all, because this book+resource has no `master_confirmed_at` watermark
   // yet (migration 0045 adds the column and does not backfill it — only the
@@ -345,6 +353,15 @@ const REIMPORT_SOURCE = "dcs_reimport";
 // carries the total.
 const BLOCKED_SAMPLE_CAP = 20;
 
+// Cap on ReimportCounts.merge_no_base_refs. Deliberately EQUAL to the banner's
+// display cap: that sentence is the only consumer (AdminPanel's nonZeroCounts
+// type-filters the array out of the admin result view), so anything collected
+// beyond it would ride through every Workflow step's serialized return value
+// only to be sliced off. A book-wide no-ancestor state is real — EZK/JER carry
+// 34-59 such verses per resource today — so the count, not the list, is what
+// has to survive; it does, independently.
+const NO_BASE_REF_CAP = NO_BASE_REF_DISPLAY;
+
 // Record one dropped row's identification, and log it, both capped. Kept as one
 // helper so the cap can never be applied to the list but forgotten on the log.
 function noteBlockedSample(counts: ReimportCounts, sample: string): void {
@@ -377,6 +394,7 @@ function zeroCounts(): ReimportCounts {
     merge_conflicts: 0,
     merge_refused: 0,
     merge_no_base: 0,
+    merge_no_base_refs: [],
     merge_unavailable: 0,
     merge_cosmetic_ignored: 0,
     own_publish_converged: 0,
@@ -474,6 +492,17 @@ function addCounts(into: ReimportCounts, from: ReimportCounts): void {
   into.merge_conflicts += from.merge_conflicts ?? 0;
   into.merge_refused += from.merge_refused ?? 0;
   into.merge_no_base += from.merge_no_base ?? 0;
+  // Same shape as blocked_samples above: diagnostic, capped, gates nothing. A
+  // chunk memoized before this field existed contributes no refs while still
+  // contributing its count, which is why the banner reports the count as
+  // authoritative and the refs as a sample.
+  if (from.merge_no_base_refs?.length) {
+    const into_ = (into.merge_no_base_refs ??= []);
+    for (const r of from.merge_no_base_refs) {
+      if (into_.length >= NO_BASE_REF_CAP) break;
+      into_.push(r);
+    }
+  }
   into.merge_unavailable += from.merge_unavailable ?? 0;
   into.merge_cosmetic_ignored += from.merge_cosmetic_ignored ?? 0;
   into.own_publish_converged += from.own_publish_converged ?? 0;
@@ -762,12 +791,14 @@ async function runReimport(
     await raiseVerseMergeConflictAlert(env, book, "ult", {
       recordingFailed: perResource.ult.merge_record_failed === true,
       noBaseCount: perResource.ult.merge_no_base,
+      noBaseRefs: perResource.ult.merge_no_base_refs,
     });
   }
   if (want.has("ust")) {
     await raiseVerseMergeConflictAlert(env, book, "ust", {
       recordingFailed: perResource.ust.merge_record_failed === true,
       noBaseCount: perResource.ust.merge_no_base,
+      noBaseRefs: perResource.ust.merge_no_base_refs,
     });
   }
 
@@ -2401,7 +2432,15 @@ async function applyVerseRows(
           theirs: v.contentJson,
           humanEditedSinceExport: Number(ex.human_edit_after_export ?? 0) !== 0,
         });
-        if (merge.action === "keep_no_base") counts.merge_no_base++;
+        if (merge.action === "keep_no_base") {
+          counts.merge_no_base++;
+          // Name the verse, capped. keep_no_base writes no verse_merge_conflicts
+          // row (that table only holds adjudicated outcomes), so without this the
+          // banner's own admission — "a Door43-side change to them will still be
+          // overwritten by tonight's export" — points at nothing a human can open.
+          const refs = (counts.merge_no_base_refs ??= []);
+          if (refs.length < NO_BASE_REF_CAP) refs.push(`${v.chapter}:${v.verse}`);
+        }
         if (merge.action === "keep_alignment_refused") counts.merge_refused++;
         // FIX 5: converged-per-stableKey but the raw bytes differed — a real,
         // cosmetic-only edit this comparison silently discards. See
@@ -4263,6 +4302,7 @@ export async function runChunkedReimport(
       await raiseVerseMergeConflictAlert(env, book, e.resource, {
         recordingFailed: perResource[e.resource].merge_record_failed === true,
         noBaseCount: perResource[e.resource].merge_no_base,
+        noBaseRefs: perResource[e.resource].merge_no_base_refs,
       });
     }
   });
