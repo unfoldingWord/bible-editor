@@ -100,6 +100,34 @@ function deep(actual, expected, msg) {
   eq(r.action, "adopt_conflict", "tn real master edit with curly quote still conflicts");
 }
 
+// 2c. The export lens applies ONLY to the fields the export normalizes
+// (note/question/response — export.ts:131/:138). quote, support_reference,
+// orig_words, tw_link render RAW, so for them master really did move when a
+// maintainer fixed an ASCII-quote corruption — the lens must NOT swallow it,
+// or the raw-rendering export reverts the fix nightly.
+{
+  // tn quote: maintainer fixed a straight apostrophe on master, we never
+  // touched the field -> adopt (NOT "unchanged").
+  const r = computeTsvMerge(
+    "tn",
+    { quote: "the fishermen's boats", note: "n" },
+    { quote: "the fishermen's boats", note: "n" },
+    { quote: "the fishermen’s boats", note: "n" },
+  );
+  eq(r.action, "adopt", "tn quote-column ASCII-quote fix on master is adopted (no lens)");
+  deep(r.writeFields, { quote: "the fishermen’s boats" }, "tn quote fix writes master's raw bytes");
+}
+{
+  // twl orig_words: same shape, raw column
+  const r = computeTsvMerge(
+    "twl",
+    { orig_words: "servant's", tw_link: "t" },
+    { orig_words: "servant's", tw_link: "t" },
+    { orig_words: "servant’s", tw_link: "t" },
+  );
+  eq(r.action, "adopt", "twl orig_words ASCII-quote fix on master is adopted (no lens)");
+}
+
 // 3. No ancestor + a real diff -> keep_no_base (keep D1, surfaced).
 {
   const r = computeTsvMerge("tn", null, { note: "ours" }, { note: "theirs" });
