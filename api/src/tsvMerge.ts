@@ -435,9 +435,24 @@ export interface TsvEditLogEntry {
 // attributable. Same entries, same ordering, same "absent means never recorded"
 // contract; no extra D1 read.
 //
-// `chapter`/`verse` are numbers in every writer shape (the DB columns, the POST
-// body, and the move patch), so a non-numeric value is dropped rather than
-// coerced into a NaN that would compare unequal to everything.
+// HETEROGENEOUS KEY NAMES, same hazard readPayloadField exists for above — and
+// it bites harder here, because `ref_raw` is the one reference column whose two
+// spellings are BOTH in production edit_log today:
+//   - bookImport.ts's audit payload and rows.ts's POST/PATCH bodies use
+//     snake_case `ref_raw`;
+//   - bookReimport.ts logs a ParsedTsvRow verbatim (logEditStmt(..., u.row)),
+//     and ParsedTsvRow's field is camelCase `refRaw`.
+// Reading only one spelling would leave `ref_raw` absent from the ancestor of
+// every row whose pre-watermark history came from a reimport, which silently
+// degrades a ref_raw-only reshape (e.g. "1:2" -> "1:2-3", verse unchanged) to
+// `unattributable` forever. That direction is fail-safe — an ABSENT component
+// can only withhold, never mis-attribute — but it defeats the fix for that case,
+// so both spellings are read.
+//
+// `chapter`/`verse` are spelled identically in every writer shape. They are
+// numbers in all of them, so a non-numeric value is dropped rather than coerced
+// into a NaN that would compare unequal to everything (including itself) and
+// manufacture a permanent `unattributable`.
 export function foldTsvRefBase(entries: TsvEditLogEntry[]): TsvRefSide | null {
   let base: TsvRefSide | null = null;
   for (const e of entries) {
@@ -450,9 +465,12 @@ export function foldTsvRefBase(entries: TsvEditLogEntry[]): TsvRefSide | null {
       base ??= {};
       base[k] = n;
     }
-    if (Object.prototype.hasOwnProperty.call(p, "ref_raw")) {
+    // Later spelling wins within one payload only if a payload carried both,
+    // which no writer does; across payloads the newest entry wins either way.
+    for (const key of ["ref_raw", "refRaw"] as const) {
+      if (!Object.prototype.hasOwnProperty.call(p, key)) continue;
       base ??= {};
-      base.ref_raw = p.ref_raw == null ? "" : String(p.ref_raw);
+      base.ref_raw = p[key] == null ? "" : String(p[key]);
     }
   }
   return base;

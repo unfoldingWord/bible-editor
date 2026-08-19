@@ -511,6 +511,43 @@ deep(tsvMergeFields("tq"), ["quote", "question", "response"], "tq field list");
     "none", "blank-ref row is not a move against its own ancestor");
 }
 
+// Both ref_raw spellings really are in production edit_log: bookImport.ts and
+// rows.ts write snake_case `ref_raw`, while bookReimport.ts logs a ParsedTsvRow
+// verbatim, whose field is camelCase `refRaw`. Reading only one leaves ref_raw
+// absent from the ancestor of every reimport-written row, which degrades a
+// ref_raw-only reshape to a permanent `unattributable`.
+{
+  const base = foldTsvRefBase([{ action: "update", payload: { chapter: 1, verse: 2, refRaw: "1:2" } }]);
+  deep(base, { chapter: 1, verse: 2, ref_raw: "1:2" }, "camelCase refRaw (ParsedTsvRow, the reimport shape) folds in");
+  // The case this rescues: verse unchanged, ref_raw reshaped by the app.
+  eq(
+    classifyTsvRefMove({ chapter: 1, verse: 2, ref_raw: "1:2-3" }, { chapter: 1, verse: 2, refRaw: "1:2" }, base, false),
+    "ours_moved",
+    "a ref_raw-only reshape stays attributable against a reimport-written ancestor",
+  );
+}
+{
+  // Mixed history: an old snake_case create, then a camelCase reimport update.
+  // Newest wins, whichever spelling it used.
+  const base = foldTsvRefBase([
+    { action: "create", payload: { chapter: 1, verse: 2, ref_raw: "1:2" } },
+    { action: "update", payload: { chapter: 1, verse: 5, refRaw: "1:5" } },
+  ]);
+  deep(base, { chapter: 1, verse: 5, ref_raw: "1:5" }, "mixed-spelling history folds newest-wins");
+}
+
+// Verse 0 is a real reference in this repo (chapter-front `front:intro` rows),
+// so a recorded 0 must read as PRESENT, never as absent-and-unattributable.
+{
+  const base = foldTsvRefBase([{ action: "create", payload: { chapter: 0, verse: 0, ref_raw: "front:intro" } }]);
+  deep(base, { chapter: 0, verse: 0, ref_raw: "front:intro" }, "a recorded chapter/verse of 0 is present, not absent");
+  eq(
+    classifyTsvRefMove({ chapter: 0, verse: 0, ref_raw: "front:intro" }, { chapter: 0, verse: 1, refRaw: "front:intro" }, base, false),
+    "theirs_moved",
+    "verse 0 ancestor attributes a move off it (0 is not treated as missing)",
+  );
+}
+
 // Numbers arrive as strings from some writer shapes; a non-numeric value is
 // dropped rather than folded in as NaN (NaN compares unequal to everything and
 // would manufacture a permanent unattributable).
