@@ -419,6 +419,14 @@ export interface TsvEditLogEntry {
   action: string;
   /** parsed edit_log.payload_json, or null when the row had none. */
   payload: Record<string, unknown> | null;
+  /**
+   * False when the edit_log row's `book` column is NULL, so we cannot prove the
+   * entry belongs to THIS book's row of that id (ids are unique only per
+   * (book, id)). Undefined means the caller did not report it, which keeps
+   * every existing caller's behavior unchanged. Consumed only by
+   * foldTsvRefBase — see the note there.
+   */
+  bookKnown?: boolean;
 }
 
 // Fold a row's content-bearing edit_log history (already ordered oldest->newest
@@ -453,15 +461,43 @@ export interface TsvEditLogEntry {
 // numbers in all of them, so a non-numeric value is dropped rather than coerced
 // into a NaN that would compare unequal to everything (including itself) and
 // manufacture a permanent `unattributable`.
+// A payload value that is a usable chapter/verse number. `Number()` alone is not
+// enough: `Number(null)`, `Number("")`, `Number(false)` and `Number([])` are all
+// a finite 0, and 0 is a REAL reference here (chapter-front `front:intro` rows
+// live at chapter 0 / verse 0). Coercing an absent-ish value to 0 would turn a
+// fail-safe absence into a fail-unsafe wrong ancestor, which is the one
+// direction this fold must never go.
+function refNumber(value: unknown): number | null {
+  if (typeof value === "number") return Number.isFinite(value) ? value : null;
+  if (typeof value === "string" && value.trim() !== "") {
+    const n = Number(value);
+    return Number.isFinite(n) ? n : null;
+  }
+  return null;
+}
+
 export function foldTsvRefBase(entries: TsvEditLogEntry[]): TsvRefSide | null {
   let base: TsvRefSide | null = null;
   for (const e of entries) {
     if (!CONTENT_ACTIONS.has(e.action) || !e.payload) continue;
+    // CROSS-BOOK POLLUTION. reconstructTsvBases matches `(book = ? OR book IS
+    // NULL)`, and prod holds 7,689 tn/tq/twl edit_log rows with a NULL book
+    // (migration 0017's backfill is best-effort: LIMIT 1 on an ambiguous id, and
+    // rows whose owner no longer exists keep NULL). Row ids are unique only per
+    // (book, id), so a NULL-book entry for id "ab12" can be GEN's history
+    // folding into AMO's "ab12" ancestor. References are low-entropy — chapter 1
+    // verse 2 is common — so a coincidental match is not far-fetched, and here it
+    // would decide whether the export may overwrite master. An entry we cannot
+    // prove belongs to this row is worth less than no entry at all, so it is
+    // skipped. (foldTsvBase keeps the pre-existing behavior: a wrong content
+    // ancestor mis-merges one field, it does not unblock an overwrite. Filed
+    // separately rather than changed under this fix.)
+    if (e.bookKnown === false) continue;
     const p = e.payload;
     for (const k of ["chapter", "verse"] as const) {
       if (!Object.prototype.hasOwnProperty.call(p, k)) continue;
-      const n = Number(p[k]);
-      if (!Number.isFinite(n)) continue;
+      const n = refNumber(p[k]);
+      if (n === null) continue;
       base ??= {};
       base[k] = n;
     }

@@ -1346,13 +1346,50 @@ export async function applyTsvRows(
       const refMove = classifyTsvRefMove(cur, row, bases.get(row.id)?.ref ?? null, protectedRow);
       if (refMove === "ours_moved") {
         // D1 moved and master still holds the ancestor: an ordinary app edit
-        // the export exists to publish. No flag, no hold. If a previous run
-        // mis-attributed it, clear that flag now — otherwise the row keeps
-        // telling its author to undo work that was never wrong. One write, once:
-        // the flag is gone on the next run, so this can't churn versions.
+        // the export exists to publish. No flag, no hold.
+        //
+        // This is the ONE branch that lets the export write over master's
+        // location, so it is the only one where a mis-attribution costs data —
+        // and it is otherwise completely silent (no alert, and deliberately not
+        // in the run summary, since a move we made is not something to review).
+        // Log it, with both sides and the ancestor, so a wrong attribution is
+        // diagnosable from worker logs instead of only from its damage.
+        console.log("reimport: reference move attributed to the app; publishing it", {
+          book,
+          kind,
+          id: row.id,
+          ours: `${cur.chapter}:${cur.verse} ${(cur.ref_raw as string | null) ?? ""}`,
+          theirs: `${row.chapter}:${row.verse} ${row.refRaw ?? ""}`,
+          base: bases.get(row.id)?.ref ?? null,
+        });
+        // If a previous run mis-attributed it, clear that flag now — otherwise
+        // the row keeps telling its author to undo work that was never wrong.
+        // One write, once: the flag is gone on the next run, so this can't churn
+        // versions. Guarded on 'ref_moved' specifically, so it can never clear a
+        // merge_conflict or any other flag.
         if (cur.review_kind === "ref_moved") {
           fields.review_kind = null;
           fields.review_reason = null;
+        }
+        // NEW EXPOSURE this branch creates, closed here. Block (a) above has no
+        // reference gate, so master's quote/orig_words can be adopted into a row
+        // D1 has re-anchored to a different verse — and the co-adopted
+        // `occurrence` is master's, matched to the OLD verse's source. Before
+        // this change apply_incomplete meant that state was never published;
+        // now it would be. So: drop the occurrence co-adopt (its whole
+        // justification is that master's surface+occurrence are a matched pair,
+        // which stops being true once the row sits at a different verse), and
+        // flag for review — WITHOUT holding, since holding is the livelock.
+        const surfaceField = kind === "twl" ? "orig_words" : "quote";
+        if (adopted && surfaceField in fields) {
+          delete fields.occurrence;
+          if (cur.review_kind !== "ref_moved") {
+            fields.review_kind = "ref_moved";
+            fields.review_reason =
+              "You moved this row to a different verse/reference here, and Door43 edited its " +
+              `${surfaceField === "quote" ? "Quote" : "OrigWords"} at the same time. Door43's text was taken; ` +
+              "check that it still matches the verse you moved this to.";
+          }
         }
         counts.ref_moved_ours++;
       } else if (refMove !== "none") {
@@ -1370,6 +1407,14 @@ export async function applyTsvRows(
           // Each message states only what was measured — "a Door43 editor moved
           // this" is a claim we may only make when the ancestor proves master is
           // the side that moved (the standing alert-wording rule).
+          // `unattributable` has two measurably different causes and must not
+          // state the wrong one. When this book+resource has never been
+          // confirmed on master there is no watermark at all, so no ancestor was
+          // even looked up; otherwise there IS history, it just never recorded
+          // the reference column that differs. Saying "no edit history" in the
+          // first case would be the same class of unmeasured claim this branch
+          // was added to avoid.
+          const noWatermark = masterConfirmedAt == null;
           fields.review_reason =
             refMove === "theirs_moved"
               ? "A Door43 editor moved this row to a different verse/reference. " +
@@ -1377,9 +1422,13 @@ export async function applyTsvRows(
               : refMove === "both_moved"
                 ? "This row was moved to a different verse/reference here AND on Door43, to different places. " +
                   "Pick the one you want in the app, and it will sync."
-                : "This row sits at a different verse/reference here than on Door43, and there is no edit " +
-                  "history from before the last publish to say which side moved. Set the reference you want " +
-                  "in the app, and it will sync.";
+                : noWatermark
+                  ? "This row sits at a different verse/reference here than on Door43. This book's " +
+                    `${kind.toUpperCase()} file has not yet been confirmed as holding one of our exports, so ` +
+                    "the sync has no baseline to say which side moved. Set the reference you want in the app."
+                  : "This row sits at a different verse/reference here than on Door43, and the recorded edit " +
+                    "history never captured the part of the reference that differs, so the sync cannot say " +
+                    "which side moved. Set the reference you want in the app.";
         }
       }
 
@@ -1691,7 +1740,7 @@ async function reconstructTsvBases(
     // created_at.
     const inClause = slice.map((_, j) => `?${j + 4}`).join(", ");
     const rs = await env.DB.prepare(
-      `SELECT row_key, action, payload_json FROM edit_log
+      `SELECT row_key, action, payload_json, book FROM edit_log
         WHERE kind = ?2 AND (book = ?1 OR book IS NULL)
           AND action IN ('create', 'update', 'restore')
           AND ${boundaryClause}
@@ -1699,7 +1748,7 @@ async function reconstructTsvBases(
         ORDER BY row_key ASC, id ASC`,
     )
       .bind(book, kind, boundaryBind, ...slice)
-      .all<{ row_key: string; action: string; payload_json: string | null }>();
+      .all<{ row_key: string; action: string; payload_json: string | null; book: string | null }>();
     for (const r of rs.results) {
       let payload: Record<string, unknown> | null = null;
       if (r.payload_json) {
@@ -1711,7 +1760,7 @@ async function reconstructTsvBases(
         }
       }
       const list = entriesById.get(r.row_key) ?? [];
-      list.push({ action: r.action, payload });
+      list.push({ action: r.action, payload, bookKnown: r.book != null });
       entriesById.set(r.row_key, list);
     }
   }

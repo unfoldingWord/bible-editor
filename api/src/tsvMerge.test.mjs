@@ -548,6 +548,55 @@ deep(tsvMergeFields("tq"), ["quote", "question", "response"], "tq field list");
   );
 }
 
+// Cross-book pollution. reconstructTsvBases matches `(book = ? OR book IS
+// NULL)`, and prod holds 7,689 tn/tq/twl edit_log rows with a NULL book
+// (0017's backfill is best-effort). Row ids are unique only per (book, id), so
+// a NULL-book entry can be another book's history landing on this row's id —
+// and here it would decide whether the export may overwrite master. An entry we
+// cannot prove belongs to this row must not contribute.
+{
+  const base = foldTsvRefBase([
+    { action: "create", payload: { chapter: 1, verse: 2, ref_raw: "1:2" }, bookKnown: true },
+    { action: "update", payload: { chapter: 9, verse: 9, ref_raw: "9:9" }, bookKnown: false },
+  ]);
+  deep(base, { chapter: 1, verse: 2, ref_raw: "1:2" }, "a book-NULL entry does not pollute the reference ancestor");
+  eq(
+    foldTsvRefBase([{ action: "create", payload: { chapter: 9, verse: 9, ref_raw: "9:9" }, bookKnown: false }]),
+    null,
+    "a history of only book-NULL entries yields no ancestor (withhold, don't guess)",
+  );
+  // Callers that don't report it keep working unchanged.
+  deep(
+    foldTsvRefBase([{ action: "create", payload: { chapter: 1, verse: 2, ref_raw: "1:2" } }]),
+    { chapter: 1, verse: 2, ref_raw: "1:2" },
+    "an entry with bookKnown unreported still folds (existing callers unchanged)",
+  );
+}
+
+// Absent-ish values must stay ABSENT, not coerce to 0 — because 0 is a REAL
+// reference here (chapter-front `front:intro`). `Number(null)`, `Number("")`,
+// `Number(false)` and `Number([])` are all a finite 0, which would turn a
+// fail-safe absence into a fail-unsafe wrong ancestor.
+{
+  for (const [label, value] of [["null", null], ["empty string", ""], ["false", false], ["empty array", []]]) {
+    const base = foldTsvRefBase([{ action: "create", payload: { chapter: 1, verse: value, ref_raw: "1:2" } }]);
+    eq(base.verse, undefined, `a ${label} verse is absent, not 0`);
+    // Absent is the fail-SAFE state: `verse` differs between the two sides and
+    // the ancestor never recorded it, so the move is unattributable and holds.
+    // Coerced to 0 it would instead read as "the ancestor said verse 0, and D1
+    // moved away from it" — a confident, wrong `ours_moved` that lets the
+    // export overwrite Door43. That flip is the whole point of the guard.
+    eq(
+      classifyTsvRefMove({ chapter: 1, verse: 5, ref_raw: "1:5" }, { chapter: 1, verse: 2, refRaw: "1:2" }, base, false),
+      "unattributable",
+      `…so a ${label} verse withholds instead of asserting a verse-0 ancestor`,
+    );
+  }
+  // A genuine 0 still folds — the two must not be conflated.
+  const real = foldTsvRefBase([{ action: "create", payload: { chapter: 0, verse: 0, ref_raw: "front:intro" } }]);
+  eq(real.verse, 0, "a genuine verse 0 folds in as 0");
+}
+
 // Numbers arrive as strings from some writer shapes; a non-numeric value is
 // dropped rather than folded in as NaN (NaN compares unequal to everything and
 // would manufacture a permanent unattributable).
