@@ -42,3 +42,4 @@ scratch/
 # docs/samples/) are already tracked and stay that way; gitignore only
 # affects untracked files.
 *.usfm
+reports/
