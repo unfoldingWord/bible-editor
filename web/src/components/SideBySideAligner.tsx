@@ -56,7 +56,14 @@ export interface PanelSlot {
   sourceVerse: VerseDto | null;
   twlForVerse: TwlRow[];
   posOffset: number;
-  onSave: (newContent: unknown, plainText: string, expectedVersion: number) => void;
+  // draftGeneration (#508): forwarded verbatim from AlignmentPanel's onSave —
+  // see its doc comment and alignmentDrafts.ts.
+  onSave: (
+    newContent: unknown,
+    plainText: string,
+    expectedVersion: number,
+    draftGeneration?: string,
+  ) => void;
   onDirtyChange: (dirty: boolean) => void;
   // Confirm-before-save when this side's edit would unalign a previously aligned
   // word (forwarded to AlignmentPanel; see its onConfirmUnalign prop).

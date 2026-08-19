@@ -16,7 +16,8 @@
 
 import { openDB, type IDBPDatabase } from "idb";
 import { isReadOnly } from "./api";
-import { onOutboxResult } from "./outbox";
+import { onOutboxResult, type VerseTarget } from "./outbox";
+import { isAlignmentSaveOp } from "./alignmentDraftSaveState";
 
 const DB_NAME = "bible-editor-alignment-drafts";
 const DB_VERSION = 1;
@@ -34,6 +35,15 @@ export interface AlignmentDraftRecord {
   // draft is stale and must be discarded, not applied over newer content.
   expectedVersion: number;
   updatedAt: number;
+  // Opaque identity for this exact draft write, mirroring drafts.ts's
+  // `generation`. AlignmentPanel captures the generation of the draft a save
+  // represents and threads it through the outbox op (as
+  // `alignmentDraftGeneration`); the onOutboxResult listener below then only
+  // deletes that exact generation, so a draft written by CONTINUED dragging
+  // AFTER Save (a different, newer generation) survives a landed op's cleanup
+  // instead of being wiped for the ~400ms until its own persist cycle re-runs
+  // (#508). Absent on records persisted before this field existed.
+  generation?: string;
 }
 
 let dbp: Promise<IDBPDatabase> | null = null;
@@ -61,16 +71,28 @@ export function alignmentDraftKey(
   return `${book}:${chapter}:${verse}:${bibleVersion}`;
 }
 
+let generationSeq = 0;
+function nextGeneration(): string {
+  generationSeq += 1;
+  return `${Date.now()}:${generationSeq}:${Math.random().toString(36).slice(2)}`;
+}
+
 export const alignmentDrafts = {
-  async set(key: string, content: unknown, expectedVersion: number): Promise<void> {
-    if (isReadOnly()) return;
+  // Returns the generation minted for this write (even in read-only mode,
+  // where nothing is actually persisted) so callers that want generation-safe
+  // cleanup later (AlignmentPanel's save path) always have a value to carry.
+  async set(key: string, content: unknown, expectedVersion: number): Promise<string> {
+    const generation = nextGeneration();
+    if (isReadOnly()) return generation;
     const rec: AlignmentDraftRecord = {
       key,
       content,
       expectedVersion,
       updatedAt: Date.now(),
+      generation,
     };
     await (await db()).put(STORE, rec);
+    return generation;
   },
 
   async get(key: string): Promise<AlignmentDraftRecord | undefined> {
@@ -79,6 +101,23 @@ export const alignmentDrafts = {
 
   async clear(key: string): Promise<void> {
     await (await db()).delete(STORE, key);
+  },
+
+  // Delete only if the record currently at `key` still carries `generation` —
+  // the read + conditional delete share one transaction so another committed
+  // write cannot slip between them. A record with no `generation` (pre-#508)
+  // or a mismatched one (a newer draft has since been written) is left alone.
+  async clearGeneration(key: string, generation: string): Promise<boolean> {
+    const idb = await db();
+    const tx = idb.transaction(STORE, "readwrite");
+    const rec = (await tx.store.get(key)) as AlignmentDraftRecord | undefined;
+    if (!rec || rec.generation !== generation) {
+      await tx.done;
+      return false;
+    }
+    await tx.store.delete(key);
+    await tx.done;
+    return true;
   },
 
   // Mirrors drafts.ts's shape; `updatedAt` + `list` are the seam a future
@@ -90,14 +129,21 @@ export const alignmentDrafts = {
   },
 };
 
-// Belt-and-suspenders: when the verse's PATCH lands (200), the alignment the
-// draft was protecting is now durable server-side, so drop it. AlignmentPanel
-// also clears optimistically in its save-commit closure; both are idempotent.
+// Belt-and-suspenders: when an alignment save's PATCH lands (200), the drag
+// state it captured is now durable server-side, so drop the crash-draft that
+// was protecting it. AlignmentPanel also clears optimistically in its
+// save-commit closure; both are idempotent. Generation-gated (falling back to
+// an unconditional clear only for a legacy op enqueued before generation
+// tracking existed) so a draft written by dragging that continued AFTER Save
+// — a newer generation this op never captured — survives (#508).
 onOutboxResult((op, result) => {
   if (result.kind !== "ok") return;
-  if (op.target.kind === "verse") {
-    void alignmentDrafts.clear(
-      alignmentDraftKey(op.target.book, op.target.chapter, op.target.verse, op.target.bibleVersion),
-    );
+  if (!isAlignmentSaveOp(op)) return;
+  const target = op.target as VerseTarget;
+  const key = alignmentDraftKey(target.book, target.chapter, target.verse, target.bibleVersion);
+  if (op.alignmentDraftGeneration) {
+    void alignmentDrafts.clearGeneration(key, op.alignmentDraftGeneration);
+  } else {
+    void alignmentDrafts.clear(key);
   }
 });
