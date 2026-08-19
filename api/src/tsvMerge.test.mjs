@@ -46,6 +46,100 @@ function deep(actual, expected, msg) {
   eq(r.action, "keep_converged", "tn \\n-escape vs space -> converged");
 }
 
+// 2b. Export-normalization-only differences are not a move. Master is always
+// normalizeNoteText(some past D1 value) while the ancestor is folded from raw
+// edit_log payloads, so a straight apostrophe in the ancestor vs the curly one
+// the export educated must NOT read as "Door43 changed it" — that phantom made
+// every later app edit a both-changed conflict that master won, reverting the
+// AMO 3:10 note nightly (2026-08-18/19).
+{
+  // dsj8 regression: ancestor straight apostrophe, master curly (educated),
+  // ours a genuine human rewrite -> master unchanged, our edit stands.
+  const r = computeTsvMerge(
+    "tn",
+    { note: "comes with Yahweh's authority" },
+    { note: "a genuine human rewrite" },
+    { note: "comes with Yahweh’s authority" },
+  );
+  eq(r.action, "keep_master_unchanged", "tn curly-vs-straight apostrophe ancestor -> master unchanged");
+  deep(r.writeFields, {}, "tn apostrophe phantom writes nothing");
+}
+{
+  // educated double quotes
+  const r = computeTsvMerge(
+    "tn",
+    { note: 'he said "go" now' },
+    { note: "our new note" },
+    { note: "he said “go” now" },
+  );
+  eq(r.action, "keep_master_unchanged", "tn educated double quotes -> master unchanged");
+}
+{
+  // Alternate-translation label canonicalization
+  const r = computeTsvMerge(
+    "tn",
+    { note: "Alternative Translation: x" },
+    { note: "our new note" },
+    { note: "Alternate translation: x" },
+  );
+  eq(r.action, "keep_master_unchanged", "tn alt-label canonicalization -> master unchanged");
+}
+{
+  // ours straight vs theirs curly, same text -> converged, no write
+  const r = computeTsvMerge("tn", { note: "x" }, { note: "Yahweh's word" }, { note: "Yahweh’s word" });
+  eq(r.action, "keep_converged", "tn ours-straight vs theirs-curly same text -> converged");
+}
+{
+  // tq question + response are export-normalized too — same phantom shape must
+  // resolve the same way (Codex review coverage finding on PR #541).
+  const r = computeTsvMerge(
+    "tq",
+    { question: "What is Yahweh's word?", response: "It is Yahweh's message." },
+    { question: "Beth's new question?", response: "Beth's new answer." },
+    { question: "What is Yahweh’s word?", response: "It is Yahweh’s message." },
+  );
+  eq(r.action, "keep_master_unchanged", "tq curly-vs-straight ancestor (question+response) -> master unchanged");
+  deep(r.writeFields, {}, "tq apostrophe phantom writes nothing");
+}
+{
+  // a REAL master edit that merely contains a curly quote still conflicts
+  const r = computeTsvMerge(
+    "tn",
+    { note: "orig" },
+    { note: "our edit" },
+    { note: "master’s real edit" },
+  );
+  eq(r.action, "adopt_conflict", "tn real master edit with curly quote still conflicts");
+}
+
+// 2c. The export lens applies ONLY to the fields the export normalizes
+// (note/question/response — export.ts:131/:138). quote, support_reference,
+// orig_words, tw_link render RAW, so for them master really did move when a
+// maintainer fixed an ASCII-quote corruption — the lens must NOT swallow it,
+// or the raw-rendering export reverts the fix nightly.
+{
+  // tn quote: maintainer fixed a straight apostrophe on master, we never
+  // touched the field -> adopt (NOT "unchanged").
+  const r = computeTsvMerge(
+    "tn",
+    { quote: "the fishermen's boats", note: "n" },
+    { quote: "the fishermen's boats", note: "n" },
+    { quote: "the fishermen’s boats", note: "n" },
+  );
+  eq(r.action, "adopt", "tn quote-column ASCII-quote fix on master is adopted (no lens)");
+  deep(r.writeFields, { quote: "the fishermen’s boats" }, "tn quote fix writes master's raw bytes");
+}
+{
+  // twl orig_words: same shape, raw column
+  const r = computeTsvMerge(
+    "twl",
+    { orig_words: "servant's", tw_link: "t" },
+    { orig_words: "servant's", tw_link: "t" },
+    { orig_words: "servant’s", tw_link: "t" },
+  );
+  eq(r.action, "adopt", "twl orig_words ASCII-quote fix on master is adopted (no lens)");
+}
+
 // 3. No ancestor + a real diff -> keep_no_base (keep D1, surfaced).
 {
   const r = computeTsvMerge("tn", null, { note: "ours" }, { note: "theirs" });

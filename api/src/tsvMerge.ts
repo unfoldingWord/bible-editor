@@ -39,6 +39,8 @@
 // reconstructs the ancestor is separate (foldTsvBase below is the pure half of
 // it; bookReimport.ts does the batched edit_log read that feeds it).
 
+import { normalizeNoteText } from "./tsvFormat.ts";
+
 export type TsvMergeKind = "tn" | "tq" | "twl";
 
 export type TsvMergeAction =
@@ -151,15 +153,40 @@ export interface TsvMergeResult {
   conflictFields: TsvMergeField[];
 }
 
-// Collapse a TSV text field to its whitespace-insensitive compare form: the
-// literal two-char "\n" escape (an encoded line break) -> space, every
-// whitespace run -> one space, then trim. Two values differing ONLY by this
-// kind of incidental whitespace read as the same to a human, so they must not
-// count as "moved" (bp-assistant is known to double-space notes — see the
-// tn-double-space-whitespace-churn memory). FOR COMPARISON ONLY — the bytes we
+// The export renders these fields — and ONLY these — through normalizeNoteText
+// (export.ts:131 tn note, :138 tq question/response; quote, support_reference,
+// orig_words, tw_link and the twl builder render raw). The compare lens below
+// must mirror that set exactly: applying it to a raw-rendered column would make
+// a genuine maintainer fix inside the normalization kernel (a stray literal \n
+// on a quote, an ASCII-quote corruption repair) read as "unchanged", so it is
+// never adopted and the raw-rendering export reverts it nightly.
+const EXPORT_NORMALIZED_FIELDS: ReadonlySet<TsvMergeField> = new Set([
+  "note",
+  "question",
+  "response",
+]);
+
+// Collapse a TSV text field to its compare form. For the prose fields the
+// export normalizes, first apply the export's own normalizeNoteText (quote
+// education, Alternate-translation label, literal-\n cleanups); then, for every
+// text field, the literal two-char "\n" escape (an encoded line break) ->
+// space, every whitespace run -> one space, then trim.
+//
+// The export lens is load-bearing for the prose fields: master IS
+// normalizeNoteText(some past D1 value) for them, while the ancestor is folded
+// from raw edit_log payloads. Without it, any note containing a straight
+// apostrophe reads as "Door43 changed it" forever — educateQuotes curls it on
+// every export, the ancestor keeps it straight, so ancestor != master by one
+// character and every later app edit becomes a both-changed conflict that
+// master wins (the AMO 3:10 nightly revert, 2026-08-18/19). Whitespace alone
+// had the same shape: bp-assistant is known to double-space notes — see the
+// tn-double-space-whitespace-churn memory. Applying the same lens to BOTH
+// compared sides can only make values compare MORE equal, so it can suppress
+// phantom moves but never manufacture one. FOR COMPARISON ONLY — the bytes we
 // write are always master's raw value.
-function normText(v: string | null | undefined): string {
-  return (v ?? "").replace(/\\n/g, " ").replace(/\s+/g, " ").trim();
+function normText(v: string | null | undefined, exportNormalized: boolean): string {
+  const s = exportNormalized ? (normalizeNoteText(v ?? "") ?? "") : (v ?? "");
+  return s.replace(/\\n/g, " ").replace(/\s+/g, " ").trim();
 }
 
 // Numeric occurrence compare form. A blank cell (null) and an explicit 0 both
@@ -172,7 +199,8 @@ function normOcc(v: number | null | undefined): number {
 // Are two field values equal in their compare form?
 function fieldEqual(field: TsvMergeField, a: unknown, b: unknown): boolean {
   if (field === "occurrence") return normOcc(a as number | null) === normOcc(b as number | null);
-  return normText(a as string | null) === normText(b as string | null);
+  const lens = EXPORT_NORMALIZED_FIELDS.has(field);
+  return normText(a as string | null, lens) === normText(b as string | null, lens);
 }
 
 // Per-field attribution outcome.
