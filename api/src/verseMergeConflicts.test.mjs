@@ -684,6 +684,70 @@ function confirmAdopted(d, { book, resource, chapter, verse }) {
   assert(rows.length === 1, "banner filter returns exactly the one active, alertable row");
   assert(rows[0].verse === 21 && rows[0].action === "source_attr_divergent",
     "…which is the unresolved source_attr_divergent row (not the audit-only 'adopt', not the resolved one)");
+
+  // #540 item 2. A keep_ai_master row is alertable too — it is the one outcome
+  // whose whole purpose is to be looked at before the export publishes it.
+  // Missing from this filter, the policy would fire silently.
+  d.prepare(
+    `INSERT INTO verse_merge_conflicts (book, resource, chapter, verse, action, reason, overwritten_version, detected_at)
+     VALUES ('EZK','ult',40,24,'keep_ai_master','both_changed_ai_master',NULL,100)`,
+  ).run();
+  const withAi = d.prepare(SELECT_ACTIVE_ALERTABLE_CONFLICTS_SQL).all("EZK", "ult");
+  assert(withAi.some((r) => r.verse === 24 && r.action === "keep_ai_master"),
+    "the banner filter surfaces a keep_ai_master row");
+}
+
+{
+  // #540 item 2, the two upsert rules a keep_ai_master row shares with the other
+  // kept-D1 outcomes: it never carries an overwritten_version pointer (nothing
+  // was overwritten, so the pointer would misdirect a reviewer), and
+  // re-detecting it REACTIVATES a row a human resolved without fixing the
+  // underlying disagreement — the condition is still live, and unlike an
+  // adoption there is no CAS that could lose its race and falsely reactivate.
+  const d = verseDb();
+  d.prepare(UPSERT_VERSE_MERGE_CONFLICT_SQL).run(
+    "AMO", "ult", 4, 2, "adopt_conflict", "both_changed", 9, null, 1000,
+  );
+  d.prepare(UPSERT_VERSE_MERGE_CONFLICT_SQL).run(
+    "AMO", "ult", 4, 2, "keep_ai_master", "both_changed_ai_master", null, null, 2000,
+  );
+  let row = d.prepare(`SELECT * FROM verse_merge_conflicts WHERE book='AMO' AND chapter=4 AND verse=2`).get();
+  assert(row.action === "keep_ai_master" && row.overwritten_version === null,
+    "a verse that becomes keep_ai_master drops any prior overwritten_version pointer");
+
+  d.prepare(`UPDATE verse_merge_conflicts SET resolved_at=1500, resolved_by=30 WHERE book='AMO'`).run();
+  d.prepare(UPSERT_VERSE_MERGE_CONFLICT_SQL).run(
+    "AMO", "ult", 4, 2, "keep_ai_master", "both_changed_ai_master", null, null, 3000,
+  );
+  row = d.prepare(`SELECT * FROM verse_merge_conflicts WHERE book='AMO' AND chapter=4 AND verse=2`).get();
+  assert(row.resolved_at === null && row.resolved_by === null,
+    "re-detecting keep_ai_master reactivates a row resolved while the disagreement persists");
+
+  // But a later clean 'adopt' DOES take it out of the banner — the opposite of
+  // adopt_conflict's anti-downgrade rule, and deliberately so: nothing was
+  // overwritten, so there is nothing to recover, and master's value having been
+  // adopted since means the disagreement resolved. Left sticky, the banner would
+  // keep claiming the editor's version was kept and is about to be published,
+  // about a verse that has since taken master's.
+  d.prepare(UPSERT_VERSE_MERGE_CONFLICT_SQL).run(
+    "AMO", "ult", 4, 2, "adopt", "master_only", 11, null, 4000,
+  );
+  row = d.prepare(`SELECT * FROM verse_merge_conflicts WHERE book='AMO' AND chapter=4 AND verse=2`).get();
+  assert(row.action === "adopt",
+    "a later clean 'adopt' retires a keep_ai_master row from the banner");
+
+  // …while adopt_conflict's own anti-downgrade is untouched by that.
+  const d2 = verseDb();
+  d2.prepare(UPSERT_VERSE_MERGE_CONFLICT_SQL).run(
+    "AMO", "ult", 5, 1, "adopt_conflict", "both_changed", 4, null, 1000,
+  );
+  d2.prepare(UPSERT_VERSE_MERGE_CONFLICT_SQL).run(
+    "AMO", "ult", 5, 1, "adopt", "master_only", 6, null, 2000,
+  );
+  assert(
+    d2.prepare(`SELECT * FROM verse_merge_conflicts WHERE book='AMO' AND chapter=5`).get().action === "adopt_conflict",
+    "an adopt_conflict is still protected from a later routine adoption",
+  );
 }
 
 {
@@ -797,6 +861,37 @@ function confirmAdopted(d, { book, resource, chapter, verse }) {
     "keep_alignment_refused counted as an alignment refusal");
   assert(mixed.includes("1 kept D1 because Door43's original-language source fix"),
     "source_attr_divergent counted as a source-attr divergence, separately from the alignment refusal");
+
+  // #540 item 2. keep_ai_master is also a kept-D1 outcome, but the OPPOSITE one
+  // where the export is concerned: nothing is waiting to be reverted, the export
+  // is about to publish the kept version. Borrowing the other two's warning
+  // would send a human to fight for a change that is already winning.
+  const ai = buildMergeConflictGuidance([{ action: "keep_ai_master" }]);
+  assert(ai.includes("1 kept the editor's version even though Door43 changed too"),
+    "keep_ai_master gets its own sentence");
+  // The measured cause, stated narrowly. Not "no maintainer edit" — the bot
+  // account pushes on a named human's behalf, so a maintainer may well have
+  // directed the change; what was measured is that no commit came from a Door43
+  // editor's own account.
+  assert(ai.includes("no commit from a Door43 editor's own account was found"),
+    "…stating the measured cause, and only that");
+  assert(!ai.includes("no maintainer edit"), "…never the stronger claim about intent");
+  assert(!ai.includes("took Door43's version"), "…and never reports it as an overwrite");
+  assert(!ai.includes("will still write over it"),
+    "…and never borrows the refusal's warning: here the export publishes the kept version");
+  // …but it must not promise a publish either. The watermark is withheld for the
+  // whole book+resource by a systemic refusal, a lock, or a recording failure —
+  // any of which can be described in this same banner.
+  assert(!ai.includes("Tonight's export publishes"),
+    "…and never promises tonight's export, which this banner itself may be reporting as held");
+  assert(ai.includes("the next export that runs for this resource"),
+    "…it says which export, conditionally");
+
+  const withAi = buildMergeConflictGuidance([{ action: "adopt_conflict" }, { action: "keep_ai_master" }]);
+  assert(withAi.includes("1 took Door43's version"),
+    "a keep_ai_master row does not absorb the adopt_conflict count");
+  assert(withAi.includes("1 kept the editor's version even though Door43 changed too"),
+    "…and is counted separately from it");
 }
 
 {

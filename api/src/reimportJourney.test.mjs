@@ -363,6 +363,167 @@ console.log("\n[reference-move attribution at the caller]");
   }
 }
 
+// ── AI-vs-human conflict policy at the caller (#540 item 2) ─────────────────
+// The pure computeTsvMerge decision is covered in tsvMerge.test.mjs. What is
+// NOT — and where every defect in the last change of this shape lived — is the
+// caller: whether a keep_ai_master row is actually written, flagged, counted,
+// and, critically, whether it withholds the resource watermark. It must not:
+// the export is how the kept human edit reaches Door43.
+console.log("\n[AI-vs-human conflict policy at the caller]");
+{
+  const seedContested = (sqlite) => {
+    sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (7, 7007, 'translator')`).run();
+    sqlite
+      .prepare(
+        `INSERT INTO tq_rows (id, book, chapter, verse, ref_raw, quote, question, response, sort_order, updated_by, version)
+         VALUES ('ai01', ?, 1, 2, '1:2', null, 'our question', 'our response', 10, 7, 3)`,
+      )
+      .run(BOOK);
+    // The ancestor: what D1 held when the export last published this row.
+    const e = sqlite
+      .prepare(
+        `INSERT INTO edit_log (kind, row_key, book, action, payload_json, created_at)
+         VALUES ('tq', 'ai01', ?, 'create', ?, 100)`,
+      )
+      .run(
+        BOOK,
+        JSON.stringify({ chapter: 1, verse: 2, ref_raw: "1:2", question: "our question", response: "base response" }),
+      );
+    return Number(e.lastInsertRowid);
+  };
+  // Master's row: the response moved on that side too, so BOTH sides moved it.
+  const masterRowAt = (response) => ({
+    id: "ai01", idCoerced: false, refRaw: "1:2", chapter: 1, verse: 2,
+    occurrence: null, tags: null, quote: null, question: "our question", response,
+  });
+  const AI_ONLY = {
+    mayHoldHumanEdit: false, hasHumanCommit: false, incomplete: false, incompleteReason: "",
+    counts: { ours: 1, ai: 1, human: 0 }, humanShas: [],
+  };
+  const HAS_HUMAN = {
+    mayHoldHumanEdit: true, hasHumanCommit: true, incomplete: false, incompleteReason: "",
+    counts: { ours: 1, ai: 0, human: 1 }, humanShas: ["abc123"],
+  };
+  const readRow = (sqlite) =>
+    sqlite.prepare(`SELECT response, review_kind, review_reason, version FROM tq_rows WHERE id='ai01'`).all()[0];
+
+  // 1. The AMO 4:2 shape. Only our export and the pipeline moved master, so the
+  //    app edit wins — and it is still flagged, because a human should look.
+  {
+    const { sqlite, env } = freshEnv();
+    const boundary = seedContested(sqlite);
+    const counts = await applyTsvRows(env, BOOK, "tq", [masterRowAt("the AI run's response")], null, {
+      confirmedAt: 200, editId: boundary, lineage: AI_ONLY,
+    });
+    const row = readRow(sqlite);
+    eq(row.response, "our response", "the app edit is KEPT — master's AI-authored value never lands");
+    eq(counts.merge_kept_ai, 1, "…counted as merge_kept_ai");
+    eq(counts.merge_adopted, 0, "…and never counted as an adoption");
+    eq(counts.merge_refused, 0, "…and never as a refusal, which would freeze the export at 5");
+    eq(counts.apply_incomplete, false, "…and does NOT withhold the watermark: the export must publish this");
+    // A DISTINCT review_kind, not just distinct prose: the cleanup chip titles
+    // itself from this column, and "Merged Door43 edit" over a kept row is the
+    // reverse of what happened.
+    eq(row.review_kind, "merge_kept", "…the row is flagged for review, as a KEPT row");
+    eq(
+      row.review_reason.startsWith("Your response was kept over Door43's"),
+      true,
+      "…the reason leads with the outcome (the chip clamps to two lines)",
+    );
+    eq(
+      row.review_reason.includes("no commit from a Door43 editor's own account was found"),
+      true,
+      "…and states the measured cause, not an inferred one",
+    );
+    eq(
+      row.review_reason.includes("was merged over your app-side change"),
+      false,
+      "…never the opposite claim, that Door43's edit won",
+    );
+    eq(
+      row.review_reason.includes("will be published to Door43"),
+      false,
+      "…and never promises a publish this per-row code cannot schedule",
+    );
+    eq(row.version, 4, "…the flag write bumps the version once");
+
+    // 2. Re-running the same night's shape must not churn the version. The
+    //    condition recurs every sync until a human resolves it, and a flag-only
+    //    write is still a write (#539).
+    const again = await applyTsvRows(env, BOOK, "tq", [masterRowAt("the AI run's response")], null, {
+      confirmedAt: 200, editId: boundary, lineage: AI_ONLY,
+    });
+    eq(again.merge_kept_ai, 1, "the conflict is still detected on the next run");
+    eq(readRow(sqlite).version, 4, "…but an unchanged flag is not re-written");
+  }
+
+  // 3. A human commit on master since the ancestor: unchanged behaviour, master
+  //    still wins. This is the half of the policy that must NOT move.
+  {
+    const { sqlite, env } = freshEnv();
+    const boundary = seedContested(sqlite);
+    const counts = await applyTsvRows(env, BOOK, "tq", [masterRowAt("a maintainer's fix")], null, {
+      confirmedAt: 200, editId: boundary, lineage: HAS_HUMAN,
+    });
+    const row = readRow(sqlite);
+    eq(row.response, "a maintainer's fix", "a human-authored master edit still wins the collision");
+    eq(counts.merge_adopted, 1, "…counted as an adoption");
+    eq(counts.merge_kept_ai, 0, "…and not as a kept AI conflict");
+    eq(row.review_reason.includes("was merged over your app-side change"), true, "…with the pre-existing wording");
+  }
+
+  // 4. No lineage at all — the field an in-flight Workflow's memoized plan does
+  //    not carry. Must read as "a human may have", i.e. today's behaviour.
+  {
+    const { sqlite, env } = freshEnv();
+    const boundary = seedContested(sqlite);
+    const counts = await applyTsvRows(env, BOOK, "tq", [masterRowAt("a maintainer's fix")], null, {
+      confirmedAt: 200, editId: boundary,
+    });
+    eq(readRow(sqlite).response, "a maintainer's fix", "an absent lineage keeps master-wins, not D1-wins");
+    eq(counts.merge_kept_ai, 0, "…and never reports a kept AI conflict it did not measure");
+  }
+
+  // 5. A row that ALSO moved reference keeps the reference-move flag. That flag
+  //    is the only thing telling the translator why the whole book+resource has
+  //    stopped exporting, and a kept-conflict message replacing it would both
+  //    destroy that and describe an export that is not going to run.
+  {
+    const { sqlite, env } = freshEnv();
+    const boundary = seedContested(sqlite);
+    const moved = { ...masterRowAt("the AI run's response"), refRaw: "1:9", verse: 9 };
+    const counts = await applyTsvRows(env, BOOK, "tq", [moved], null, {
+      confirmedAt: 200, editId: boundary, lineage: AI_ONLY,
+    });
+    const row = readRow(sqlite);
+    eq(counts.apply_incomplete, true, "a master-side reference move still withholds the watermark");
+    eq(row.review_kind, "ref_moved", "…and the row keeps the reference-move flag, not the kept-conflict one");
+    eq(
+      row.review_reason.includes("kept over Door43's"),
+      false,
+      "…so the hold's explanation is not overwritten by a publish the hold prevents",
+    );
+  }
+
+  // 6. An INCOMPLETE walk that happened to see no human commit is not the same
+  //    claim as a complete one that found none — and only the complete one may
+  //    flip the outcome.
+  {
+    const { sqlite, env } = freshEnv();
+    const boundary = seedContested(sqlite);
+    const counts = await applyTsvRows(env, BOOK, "tq", [masterRowAt("a maintainer's fix")], null, {
+      confirmedAt: 200,
+      editId: boundary,
+      lineage: {
+        mayHoldHumanEdit: true, hasHumanCommit: false, incomplete: true, incompleteReason: "page_cap",
+        counts: { ours: 0, ai: 3, human: 0 }, humanShas: [],
+      },
+    });
+    eq(readRow(sqlite).response, "a maintainer's fix", "an incomplete walk protects master exactly like a human commit");
+    eq(counts.merge_kept_ai, 0, "…and does not report a kept AI conflict");
+  }
+}
+
 // ── merge_no_base_refs folds through the REAL addCounts (issue #537) ─────────
 // The banner's ref list is a capped diagnostic sample merged across Workflow
 // chunks. Everything that makes it safe lives in addCounts — the cap, and

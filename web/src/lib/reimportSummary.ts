@@ -20,7 +20,26 @@ export function summarizeReimport(res: ReimportResponse): string {
   if (t.skipped_noop) parts.push(`${t.skipped_noop} unchanged`);
   if (t.source_attr_reconciled) parts.push(`${t.source_attr_reconciled} source-attr fix(es) synced from master`);
   if (t.merge_adopted) parts.push(`${t.merge_adopted} adopted from master (out-of-band correction)`);
-  if (t.merge_conflicts) parts.push(`${t.merge_conflicts} flagged for review (merge conflict)`);
+  // Kept the app's version of a two-sided change, because no commit from a
+  // Door43 editor's own account was found behind Door43's side (#540 item 2).
+  //
+  // Subtracted from the conflict line rather than added beside it: on the verse
+  // side merge_kept_ai is a strict subset of merge_conflicts, so listing both
+  // reported the same three rows as six. `Math.max(0, …)` is not tidying a
+  // negative away — on the TSV side merge_conflicts is only incremented for a
+  // row that also ADOPTED a field, so a kept-only row is genuinely outside it,
+  // and the counters can legitimately cross.
+  const keptOverDoor43 = t.merge_kept_ai ?? 0;
+  const mergedFromDoor43 = Math.max(0, (t.merge_conflicts ?? 0) - keptOverDoor43);
+  if (mergedFromDoor43) parts.push(`${mergedFromDoor43} flagged for review (merge conflict)`);
+  // Names the direction, like every other line in this list, and does not
+  // promise a publish it cannot schedule — the export is the nightly one, not
+  // something the reader of this snackbar triggers.
+  if (keptOverDoor43)
+    parts.push(
+      `${keptOverDoor43} kept the app's version over Door43's (no Door43 editor's commit found) — ` +
+        `check before the next export`,
+    );
   // Rows whose Reference disagrees between the app and Door43. Split by who
   // moved (api/src/tsvMerge.ts's classifyTsvRefMove) because only the held cases
   // need anyone's attention — a move the app made is an ordinary edit the export

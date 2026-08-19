@@ -4,6 +4,7 @@
 // table in one place so they can't drift.
 
 import type { Env } from "./index";
+import type { MasterCommit } from "./masterLineage.ts";
 
 // Standard unfoldingWord book number prefixes for USFM filenames. Mirror of
 // the BOOK_NUMBERS map in scripts/import-book.mjs and api/src/export.ts.
@@ -181,6 +182,164 @@ export async function fileCommitSha(env: Env, repo: string, path: string): Promi
   } catch {
     return null;
   }
+}
+
+// ── Master commit lineage (issue #540 item 1) ───────────────────────────────
+//
+// fileCommitSha above asks the same endpoint for the newest sha and throws the
+// rest away — `limit=1`, and a response type that keeps only `{ sha }`. That is
+// all change DETECTION needs. Attribution needs the range: every commit that
+// touched this file on master since the one we last synced, with enough of each
+// to say who wrote it. See masterLineage.ts for the classification and for the
+// production message/author shapes it was verified against.
+//
+// WHICH BOUNDARY, AND WHY IT IS NOT `source_sha`. The caller's real question is
+// "what happened to master since the ancestor the merge attributes against",
+// and that ancestor is `master_confirmed_at` — the moment master was POSITIVELY
+// measured to hold one of our renders. `source_sha` is a different point:
+// recordResourceSync advances it at the end of any successful reimport, while
+// master_confirmed_at moves only on that positive measurement, so source_sha is
+// routinely NEWER. Walking back only to source_sha therefore skips any commit
+// between the two — including a human one, which is the single answer that
+// unblocks an overwrite. So `sinceTime` (a unix-seconds watermark) is the bound
+// the sync passes, and `sinceSha` is kept for callers that genuinely mean "since
+// this exact commit". The asymmetry to hold on to: walking too FAR back is
+// harmless (an extra commit can only add a protective `human`), stopping too
+// early is the failure.
+//
+// PAGING, AND WHAT THE SERVER ACTUALLY DOES. Gitea has no "since this sha" or
+// "since this date" filter on this endpoint, so the range is walked newest-first
+// until the boundary appears. Measured against git.door43.org on 2026-08-19,
+// because the obvious implementation is wrong in a way no unit test can see:
+//
+//   - **`limit` is IGNORED.** `?limit=2` on a 15-commit file returns all 15;
+//     `?limit=100` on a 143-commit file returns 50. The page size is fixed at 50
+//     server-side. (fileCommitSha above passes `limit=1` and has never noticed,
+//     because it reads `commits[0]` and would be right either way.)
+//   - **`page` works**, and the response carries real pagination headers:
+//     `X-PageCount`, `X-Total`, `X-HasMore`.
+//
+// So "did I reach the end of history" must come from those headers, NOT from
+// `batch.length < requestedPageSize` — that inference reads a number the server
+// ignored. With a requested size above 50 it would call page 1 the end of
+// history every time, and a `sinceSha` sitting on page 2 would be reported as
+// not-in-history forever. The headers are the only honest signal.
+//
+// `pageLimit` remains, as a subrequest budget rather than a correctness
+// mechanism: at most that many fetches per (book, resource), and only on a run
+// where master's sha actually moved — the same condition that already gates the
+// file fetch. The nightly path is chunked and its budget is documented as tight
+// (see reconstructTsvBases), so the default stays small deliberately. At 50
+// commits a page, the default walks 250.
+//
+// EVERY FAILURE IS `incomplete`, NEVER AN EMPTY RANGE. A network error, a
+// non-OK response, an unparseable body, a missing `sinceSha`, or hitting the
+// page cap all return `incomplete: true` — because "we found no human commit"
+// and "we could not look" must not collapse into the same value. Downstream,
+// masterMayHoldHumanEdit treats incomplete exactly like a human commit, so the
+// failure mode of this whole feature is "behaves like today", never "overwrites
+// a maintainer's edit because a fetch timed out".
+export interface MasterCommitPage {
+  commits: MasterCommit[];
+  incomplete: boolean;
+  incompleteReason: string;
+}
+
+export async function listMasterCommitsSince(
+  env: Env,
+  repo: string,
+  path: string,
+  sinceSha: string | null,
+  opts: { pageLimit?: number; sinceTime?: number | null } = {},
+): Promise<MasterCommitPage> {
+  const pageLimit = opts.pageLimit ?? 5;
+  // The watermark bound, in unix seconds. When present it REPLACES the sha as
+  // the boundary (see "WHICH BOUNDARY" above): a sha bound can sit newer than the
+  // ancestor and cut the range short, and the range is what has to be right.
+  const sinceTime = opts.sinceTime ?? null;
+  // No boundary at all means no lower bound to walk to. Returning the newest N
+  // commits would silently answer a different question than the caller asked.
+  if (!sinceSha && sinceTime == null) {
+    return { commits: [], incomplete: true, incompleteReason: "no_source_sha" };
+  }
+
+  const base = (env.DCS_BASE_URL ?? "https://git.door43.org").replace(/\/$/, "");
+  const headers: Record<string, string> = { Accept: "application/json" };
+  if (env.DCS_SERVICE_TOKEN) headers.Authorization = `token ${env.DCS_SERVICE_TOKEN}`;
+
+  const out: MasterCommit[] = [];
+  for (let page = 1; page <= pageLimit; page++) {
+    const url =
+      `${base}/api/v1/repos/${DCS_OWNER}/${encodeURIComponent(repo)}` +
+      `/commits?sha=master&path=${encodeURIComponent(path)}` +
+      `&page=${page}&stat=false&verification=false&files=false`;
+    let batch: Array<Record<string, unknown>>;
+    let lastPage: boolean;
+    try {
+      const r = await fetch(url, { headers });
+      if (!r.ok) return { commits: out, incomplete: true, incompleteReason: `http_${r.status}` };
+      const body = await r.json();
+      if (!Array.isArray(body)) return { commits: out, incomplete: true, incompleteReason: "bad_body" };
+      batch = body as Array<Record<string, unknown>>;
+      // The server's own answer to "is there more". `X-HasMore` is the direct
+      // one; `X-PageCount` is the fallback for a Gitea (or proxy) that omits it.
+      // If NEITHER is present we cannot tell, so we only stop on an empty page —
+      // erring toward one wasted fetch rather than toward a false end-of-history.
+      const hasMore = r.headers.get("x-hasmore");
+      const pageCount = Number(r.headers.get("x-pagecount"));
+      lastPage =
+        hasMore != null
+          ? hasMore.toLowerCase() !== "true"
+          : Number.isFinite(pageCount) && pageCount > 0
+            ? page >= pageCount
+            : batch.length === 0;
+    } catch {
+      return { commits: out, incomplete: true, incompleteReason: "fetch_failed" };
+    }
+
+    for (const raw of batch) {
+      const sha = typeof raw.sha === "string" ? raw.sha : null;
+      // A commit with no sha can't be compared against the boundary, so it
+      // cannot be proven to be inside the range — stop rather than guess.
+      if (!sha) return { commits: out, incomplete: true, incompleteReason: "commit_without_sha" };
+      const commit = (raw.commit ?? {}) as Record<string, unknown>;
+      const author = (commit.author ?? {}) as Record<string, unknown>;
+      if (sinceTime == null) {
+        // EXCLUSIVE: sinceSha is the ancestor itself, already accounted for.
+        if (sha === sinceSha) return { commits: out, incomplete: false, incompleteReason: "" };
+      } else {
+        // The first commit STRICTLY older than the watermark is the far side of
+        // the range; everything above it is in. A date we cannot parse does not
+        // end the walk — an unreadable timestamp is not evidence that we have
+        // gone far enough, and walking on costs at most one more page.
+        const at = typeof author.date === "string" ? Date.parse(author.date) : NaN;
+        if (Number.isFinite(at) && Math.floor(at / 1000) < sinceTime) {
+          return { commits: out, incomplete: false, incompleteReason: "" };
+        }
+      }
+      out.push({
+        sha,
+        message: typeof commit.message === "string" ? commit.message : null,
+        authorEmail: typeof author.email === "string" ? author.email : null,
+        authorName: typeof author.name === "string" ? author.name : null,
+        date: typeof author.date === "string" ? author.date : null,
+      });
+    }
+
+    if (lastPage) {
+      // Under a TIME bound, reaching the end of the file's history means every
+      // commit it has is inside the range — nothing is missing, so the walk is
+      // complete. (The file being younger than the watermark is odd but real:
+      // a delete-and-recreate on Door43.)
+      if (sinceTime != null) return { commits: out, incomplete: false, incompleteReason: "" };
+      // Under a SHA bound, reaching the end without ever seeing sinceSha means
+      // the ancestor is not an ancestor of master any more — a force-push, a
+      // rewritten history, or a stale sha. That is not "no human edits"; it is
+      // "this range is not walkable".
+      return { commits: out, incomplete: true, incompleteReason: "source_sha_not_in_history" };
+    }
+  }
+  return { commits: out, incomplete: true, incompleteReason: "page_cap" };
 }
 
 // ── Independent completeness check for the EXPORT shrink guards (issue #494) ──

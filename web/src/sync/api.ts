@@ -856,6 +856,15 @@ export interface ReimportCounts {
   // Merge refused to adopt master's edit specifically because it would have
   // lost alignment — a subset of merge_conflicts. Optional, diagnostic.
   merge_refused?: number;
+  // Both sides moved since the ancestor, but every Door43 commit to the file
+  // since then came from Bible Editor's own export or the unfoldingWord bot
+  // account — so the app edit was KEPT and flagged instead of overwritten (issue
+  // #540 item 2). A subset of merge_conflicts for VERSES; for tn/tq/twl rows the
+  // two only overlap when the same row also adopted a field master moved on its
+  // own, because merge_conflicts is incremented there only for an adopting write.
+  // This counter does not itself withhold the export (merge_refused does, at
+  // scale) — but other gates in the same run still can. Optional, diagnostic.
+  merge_kept_ai?: number;
   // Merge attempted but no ancestor was recoverable for this verse from before
   // the book+resource's master-confirmed watermark. D1 was kept, the
   // pre-existing safe default. Optional, diagnostic.

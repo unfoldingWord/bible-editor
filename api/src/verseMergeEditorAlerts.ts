@@ -145,8 +145,13 @@ export interface ExistingAlertState {
 //   - 'keep_alignment_refused' -> kept D1; adopting would have cost alignment.
 //   - 'source_attr_divergent'  -> kept D1; master's original-language source fix
 //                                 couldn't be placed (repeated source word).
-// Both kept-D1 outcomes carry the same warning: nothing was taken, so tonight's
-// export will still write D1 back over master until a human resolves it.
+//   - 'keep_ai_master'         -> kept D1; both sides moved, but the commit
+//                                 lineage found no human commit behind master's
+//                                 side (#540 item 2).
+// The first two kept-D1 outcomes carry the same warning: nothing was taken, so
+// tonight's export will still write D1 back over master until a human resolves
+// it. 'keep_ai_master' is the one that does NOT — publishing D1 is the intended
+// outcome there, so its sentence must not borrow their warning.
 
 // Cap on how many no-ancestor refs the sentence lists inline, matching the
 // `+N more` shape raiseVerseMergeConflictAlert already uses for its conflict
@@ -163,6 +168,7 @@ export function buildMergeConflictGuidance(
   const overwritten = rows.filter((r) => r.action === "adopt_conflict").length;
   const keptAlignment = rows.filter((r) => r.action === "keep_alignment_refused").length;
   const keptSourceAttr = rows.filter((r) => r.action === "source_attr_divergent").length;
+  const keptAiMaster = rows.filter((r) => r.action === "keep_ai_master").length;
   return [
     overwritten > 0
       ? `${overwritten} took Door43's version over the editor's — the replaced text is still in that verse's ` +
@@ -176,6 +182,25 @@ export function buildMergeConflictGuidance(
       ? `${keptSourceAttr} kept D1 because Door43's original-language source fix (the spelling/pointing/morphology ` +
         `on \\zaln-s) could not be placed unambiguously — the same source word repeats in the verse — so Door43's ` +
         `change has NOT been taken, and tonight's export will write over it until someone resolves it by hand.`
+      : "",
+    // Bounded to what was measured, and to what will actually happen — see the
+    // matching note over the TSV reason in bookReimport.ts for each clause:
+    // "the unfoldingWord bot account" (not "the note pipeline" — the rule is an
+    // author email, and that account also pushes scripture and pushes on a
+    // human's behalf); "no commit from a Door43 editor's own account" (not "no
+    // maintainer edit" — a maintainer may have directed it); "the next export
+    // that runs for this resource" (not "tonight's export" — the watermark is
+    // withheld for the whole book+resource by a systemic refusal, a lock, or a
+    // recording failure, any of which can be described in this same banner);
+    // "since the last confirmed publish" (not "since the last sync" — the walk
+    // starts at master_confirmed_at). Past tense on the measurement because
+    // these rows survive across runs until a human resolves them.
+    keptAiMaster > 0
+      ? `${keptAiMaster} kept the editor's version even though Door43 changed too: when these were checked, ` +
+        `every Door43 commit to this file since the last confirmed publish came from Bible Editor's own export ` +
+        `or the unfoldingWord bot account — no commit from a Door43 editor's own account was found. Nothing of ` +
+        `Door43's was taken, so the next export that runs for this resource writes the editor's version over ` +
+        `Door43's. If Door43's version is the one you want, put it in the app before then.`
       : "",
     opts.recordingFailed
       ? "NOTE: at least one merge-conflict recording failed to write to verse_merge_conflicts this run " +

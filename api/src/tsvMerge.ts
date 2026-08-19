@@ -17,11 +17,16 @@
 // whichever side actually moved, per field:
 //   - master moved a field, we did not  -> adopt master's value for that field
 //   - we moved it, master did not        -> keep ours (our deliberate edit)
-//   - BOTH moved the same field          -> master wins (the side a human just
-//                                           touched by hand on Door43), and the
-//                                           row is flagged for human review so
-//                                           the overwritten D1 value can be
+//   - BOTH moved the same field          -> master wins IF a human could have
+//                                           written master's side (see
+//                                           masterMayHoldHumanEdit below), and
+//                                           the row is flagged for human review
+//                                           so the overwritten D1 value can be
 //                                           recovered from row version history.
+//                                           When the lineage proves only our own
+//                                           export and the AI pipeline moved
+//                                           master, D1 wins instead and the row
+//                                           is still flagged (keep_ai_master).
 //   - neither moved (equal, or only whitespace differs) -> nothing to do.
 // When no ancestor is recoverable at all (never exported / edit_log aged past
 // the 180-day sweep), attribution is impossible and we keep D1 — the
@@ -47,6 +52,7 @@ export type TsvMergeAction =
   | "keep_converged" // ours and theirs already equal (modulo whitespace)
   | "keep_no_base" // no ancestor recoverable — cannot attribute, keep D1
   | "keep_master_unchanged" // master === base on every field: their side never moved
+  | "keep_ai_master" // >=1 field where BOTH moved, but no human moved master — D1 wins, human must review
   | "adopt" // master moved >=1 field, we moved none of those — adopt them
   | "adopt_conflict"; // >=1 field where BOTH moved — master wins, human must review
 
@@ -218,16 +224,19 @@ export function classifyTsvRefMove(
 
 export interface TsvMergeResult {
   action: TsvMergeAction;
-  /** action is "adopt" | "adopt_conflict" */
+  /** there are fields to write — `writeFields` is non-empty. True for "adopt"
+   *  and "adopt_conflict", and for a "keep_ai_master" row that ALSO had a
+   *  cleanly-attributed field master moved on its own. */
   adopt: boolean;
-  /** needs a human: "adopt_conflict" */
+  /** needs a human: "adopt_conflict" | "keep_ai_master" */
   conflict: boolean;
   /** short stable machine reason, safe to persist and to log */
   reason: string;
   /** raw master values to WRITE for the fields being adopted (verbatim theirs,
    *  NOT the normalized compare form). Empty when nothing is adopted. */
   writeFields: Partial<TsvMergeSide>;
-  /** fields where both sides moved (master won). Empty unless adopt_conflict. */
+  /** fields where BOTH sides moved. `action` says who won them: master on
+   *  "adopt_conflict", D1 on "keep_ai_master". Empty otherwise. */
   conflictFields: TsvMergeField[];
 }
 
@@ -306,13 +315,23 @@ function attributeField(
 // Three-way merge one edited TSV row. `base` is the reconstructed ancestor
 // (foldTsvBase) or null when unrecoverable. `ours` is D1's current row, `theirs`
 // is master's incoming row. Only content fields for `kind` are considered.
+//
+// `opts.masterMayHoldHumanEdit` is the AI-vs-human policy gate (#540 item 2),
+// identical in meaning and in fail-safe direction to computeVerseMerge's field
+// of the same name: FALSE only when a COMPLETE commit-lineage walk of master's
+// file since the ancestor found nothing but our own export commits and
+// bp-assistant pushes. Callers pass `masterMayHoldHumanEdit(lineage)` — the
+// helper in masterLineage.ts — never a boolean of their own making. Omitted
+// means the caller never looked, which keeps today's master-wins behavior.
 export function computeTsvMerge(
   kind: TsvMergeKind,
   base: TsvMergeSide | null,
   ours: TsvMergeSide,
   theirs: TsvMergeSide,
+  opts: { masterMayHoldHumanEdit?: boolean } = {},
 ): TsvMergeResult {
   const fields = FIELDS_BY_KIND[kind];
+  const masterWinsConflicts = opts.masterMayHoldHumanEdit !== false;
 
   const writeFields: Partial<TsvMergeSide> = {};
   const conflictFields: TsvMergeField[] = [];
@@ -330,9 +349,17 @@ export function computeTsvMerge(
     }
     anyAttributable = true;
     if (fate === "keep") continue; // master didn't move it — our edit stands
-    // adopt OR conflict: write master's RAW value for this field.
+    if (fate === "conflict") {
+      conflictFields.push(f);
+      // Both sides moved this field, and the lineage says nothing human moved
+      // master's side — so master's value is our own pipeline's output and must
+      // not overwrite the app edit that came after it (#540 item 2, the AMO 4:2
+      // shape). Keep D1's value: write nothing for this field, and let the row
+      // carry a review flag so a human still sees the collision.
+      if (!masterWinsConflicts) continue;
+    }
+    // adopt, OR a conflict master is allowed to win: write master's RAW value.
     (writeFields as Record<string, unknown>)[f] = theirs[f] ?? null;
-    if (fate === "conflict") conflictFields.push(f);
   }
 
   const noResult = (action: TsvMergeAction, reason: string): TsvMergeResult => ({
@@ -351,6 +378,22 @@ export function computeTsvMerge(
   // missing, or only aged-out fields differ). Keep D1 — the safe default — and
   // let the caller surface it (merge_no_base) so it isn't a silent revert.
   if (!anyAttributable) return noResult("keep_no_base", anyNoBase ? "no_base" : "master_unchanged");
+
+  // A both-changed field D1 won because master's side had no human commit
+  // behind it. Reported BEFORE the "nothing to write" branch below, which would
+  // otherwise swallow it as a plain keep_master_unchanged and lose the flag — a
+  // collision a human should see, whichever side won it. `adopt` stays honest:
+  // a row can hold both a kept conflict and a field master moved on its own.
+  if (!masterWinsConflicts && conflictFields.length > 0) {
+    return {
+      action: "keep_ai_master",
+      adopt: Object.keys(writeFields).length > 0,
+      conflict: true,
+      reason: "both_changed_ai_master",
+      writeFields,
+      conflictFields,
+    };
+  }
 
   // Attributable, but every attributable field was "keep" (master never moved
   // the fields we could reason about). Note if some other field was no_base:

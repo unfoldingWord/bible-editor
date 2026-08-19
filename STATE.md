@@ -71,6 +71,65 @@ For the full corpus, see the memory index at
 `C:\Users\benja\.claude\projects\C--Users-benja-Documents-GitHub-bible-editor\memory\MEMORY.md`.
 Highlights that bite repeatedly:
 
+- **`edit_log` has never aged anything out, and "the history aged out" is the wrong diagnosis for a missing
+  ancestor.** Measured 2026-08-19: the table spans **93 days** (oldest row 2026-05-18), so the 180-day sweep in
+  `index.ts` has deleted nothing, ever. It explained none of the 190 then-unadjudicable verses. The real reason a
+  verse merge finds `base === null` is that **nothing was written to `edit_log` for it before the book's
+  `master_confirmed_at`** — and for 186 of those 190 an ancestor *did* exist and was simply invisible:
+  `pipelineImport.ts` writes an `action='baseline'` row holding the pre-AI content with `created_at` back-dated
+  to that content's own timestamp, while the ancestor sub-select filters `action IN ('create','update')` AND
+  bounds on `id <= master_confirmed_edit_id` — and a back-dated row's **id is not chronological with its
+  content**, so all 186 fail the id test and all 186 pass the timestamp test. Any fold over `edit_log` must decide
+  deliberately which `action` values it accepts (prod also holds `restore_master_verse`, `normalize-*`, `heal-*`,
+  `remove-doubled-q1`) and whether each payload is a full post-state snapshot. See `docs/sync-attribution-handoff.md`.
+
+- **Door43's Gitea IGNORES `limit` on the commits endpoint and pages at a fixed 50.** `?limit=2` on a 15-commit
+  file returns all 15; `?limit=100` on a 143-commit file returns 50. `page` works, and the response carries
+  `X-PageCount` / `X-Total` / `X-HasMore`. So **never infer end-of-history from "the page came back shorter than
+  I asked for"** — that reads a number the server discarded, and with a requested size above 50 it calls page 1
+  the end of history every time. `fileCommitSha` has passed `limit=1` since forever and never noticed, because it
+  reads `commits[0]`. Thirty passing unit tests hid this; only running against the live API found it. Corollary:
+  a mocked contract proves the mock matches itself.
+
+- **Master's three commit producers are distinguishable, and two shapes are traps.** Ours:
+  `bible-editor: {BOOK} {res} → master (#N)` AND `bible-editor export: … → {BRANCH} (export-…)` — the `-be-`
+  branch commit also appears in master's file history once the branch merges. AI: author `bot@unfoldingword.org`,
+  usually `@api.bp-assistant` in the subject. Human: everything else. Trap 1: `Revert "bible-editor: EZK ult →
+  master (#6711)" (#6716)` is a real **human** commit, so the prefix must be anchored at the start of the subject,
+  never a substring test. Trap 2: `ULT: EZK 38 [pjoakes]` is bot-authored with a plain username in the bracket —
+  the bot pushes on a human's behalf, and the content is still machine-written, so the **author** decides, not
+  the bracket. `login` is null on plenty of commits, human ones included; never key on it.
+
+- **In an ancestor fold, "absent" and "wrong" are opposite failures, and only one is safe.** A missing component
+  withholds (the export holds, nothing is overwritten); a component that is present but wrong can *unblock* an
+  overwrite. That makes silent coercion the hazard: `Number(null)`, `Number("")`, `Number(false)` and
+  `Number([])` are all a finite `0`, and **0 is a real reference here** (chapter-front `front:intro` rows).
+  Likewise an explicit `null` in a payload is *absent*, not `""` — `pipelineImport.ts`'s hint expansion writes
+  `ref_raw = COALESCE(?5, ref_raw)`, so a null there leaves the row unchanged. Two more sources of wrong values:
+  writers that log less than they wrote (#546), and `(book = ? OR book IS NULL)` in the ancestor query — prod holds
+  **7,689** tn/tq/twl `edit_log` rows with a NULL `book`, and row ids are unique only per `(book, id)`, so another
+  book's history can fold into this one's ancestor (#545).
+
+- **`source_sha` and `master_confirmed_at` are two different points in master's history, and they drift apart by
+  design.** `recordResourceSync` advances `source_sha` at the end of any successful reimport; `master_confirmed_at`
+  moves only on a POSITIVE measurement that master holds our render (`markOwnPublishConverged`, or
+  `exportWorkflow`'s `confirmMaster` gate). So `source_sha` is routinely NEWER than the merge's content ancestor.
+  Any question of the form *"what happened to master since the ancestor?"* must therefore be bounded by
+  `master_confirmed_at`, **never** by `source_sha`: a human commit landing between the two is invisible to a
+  sha-bounded walk, and "no human commit found" is the one answer that unblocks an overwrite. The same asymmetry as
+  the fold rule above — walking too FAR back is harmless (an extra commit can only add a protective `human`), while
+  stopping too early is the failure. This bit the first version of the commit-lineage wiring, and both cold
+  reviews found it independently.
+
+- **A merge outcome that reverses who wins needs its own `review_kind`, and its message needs its own first
+  line.** The in-app cleanup chip titles itself from `review_kind` and clamps the message to two lines
+  (`BookLintIndicator`), and the title was hardcoded per kind — so a row whose app-side edit was KEPT displayed
+  "Merged Door43 edit", the reverse of what happened, above a message saying the opposite; a reference move,
+  which merges nothing, said the same. Lead every such message with the outcome and the remedy, because for many
+  readers the clamped opening IS the message. And it may not promise a publish: the export watermark is withheld
+  for the WHOLE book+resource by any held reference move, a lock, or a recording failure elsewhere in the same
+  file, so per-row code can only honestly say "the next export that runs for this file".
+
 - **A master row lost to a tombstoned id is dropped by the reimport's TOMBSTONE branch,
   not by its `ON CONFLICT DO NOTHING` insert.** `applyTsvRows`' `existing` read does not
   filter `deleted_at IS NULL`, so a tombstoned id is always found and never reaches the

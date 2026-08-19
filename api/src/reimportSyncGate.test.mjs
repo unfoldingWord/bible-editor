@@ -21,6 +21,8 @@ import {
   shouldRecordResourceSync,
   isSystemicMergeRefusal,
   SYSTEMIC_MERGE_REFUSAL_THRESHOLD,
+  isKeptOverDoor43AtScale,
+  KEPT_OVER_DOOR43_ALERT_THRESHOLD,
   mergeRefusalOverrideAllowed,
 } from "./reimportSyncGate.ts";
 
@@ -353,6 +355,38 @@ eq(
   mergeRefusalOverrideAllowed({ allowMergeRefusal: false, book: "1CH", resource: "ult" }, 1, 1, "ult"),
   false,
   "allowMergeRefusal: false → refused",
+);
+
+console.log("\n[isKeptOverDoor43AtScale]");
+
+// The contrast with its sibling is the whole point: this one ALERTS and never
+// withholds, so nothing here may end up wired into shouldRecordResourceSync.
+eq(isKeptOverDoor43AtScale(0), false, "0 kept-over-Door43 rows → no alarm");
+eq(
+  isKeptOverDoor43AtScale(KEPT_OVER_DOOR43_ALERT_THRESHOLD - 1),
+  false,
+  "threshold - 1 → still the policy working normally",
+);
+eq(
+  isKeptOverDoor43AtScale(KEPT_OVER_DOOR43_ALERT_THRESHOLD),
+  true,
+  "exactly the threshold → alarm (>=, not >), matching its sibling's boundary",
+);
+eq(isKeptOverDoor43AtScale(500), true, "far above the threshold → alarm");
+eq(isKeptOverDoor43AtScale(3, 2), true, "an explicit threshold is honoured");
+// And the property the alarm exists to preserve: keeping the app's version, at
+// any scale, must never withhold the watermark — freezing the export would
+// strand the very app edits the decision protected.
+eq(
+  shouldRecordResourceSync({
+    chapters_locked: 0,
+    prune_locked: 0,
+    conflict_skipped: 0,
+    tombstone_blocked: 0,
+    merge_kept_ai: 999,
+  }),
+  true,
+  "999 kept-over-Door43 rows still stamp the watermark — this outcome never withholds",
 );
 
 if (failed > 0) {
