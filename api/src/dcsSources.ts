@@ -193,13 +193,30 @@ export async function fileCommitSha(env: Env, repo: string, path: string): Promi
 // to say who wrote it. See masterLineage.ts for the classification and for the
 // production message/author shapes it was verified against.
 //
-// PAGING AND ITS CAP. Gitea has no "since this sha" filter on this endpoint, so
-// the range is walked newest-first until `sinceSha` appears. Bounded by
-// `pageLimit` pages of `perPage`, i.e. at most `pageLimit` subrequests for a
-// (book, resource) — and only on a run where master's sha actually moved, which
-// is the same condition that already gates the file fetch. The nightly path is
-// chunked and its budget is documented as tight (see reconstructTsvBases), so
-// the defaults stay small deliberately.
+// PAGING, AND WHAT THE SERVER ACTUALLY DOES. Gitea has no "since this sha"
+// filter on this endpoint, so the range is walked newest-first until `sinceSha`
+// appears. Measured against git.door43.org on 2026-08-19, because the obvious
+// implementation is wrong in a way no unit test can see:
+//
+//   - **`limit` is IGNORED.** `?limit=2` on a 15-commit file returns all 15;
+//     `?limit=100` on a 143-commit file returns 50. The page size is fixed at 50
+//     server-side. (fileCommitSha above passes `limit=1` and has never noticed,
+//     because it reads `commits[0]` and would be right either way.)
+//   - **`page` works**, and the response carries real pagination headers:
+//     `X-PageCount`, `X-Total`, `X-HasMore`.
+//
+// So "did I reach the end of history" must come from those headers, NOT from
+// `batch.length < requestedPageSize` — that inference reads a number the server
+// ignored. With a requested size above 50 it would call page 1 the end of
+// history every time, and a `sinceSha` sitting on page 2 would be reported as
+// not-in-history forever. The headers are the only honest signal.
+//
+// `pageLimit` remains, as a subrequest budget rather than a correctness
+// mechanism: at most that many fetches per (book, resource), and only on a run
+// where master's sha actually moved — the same condition that already gates the
+// file fetch. The nightly path is chunked and its budget is documented as tight
+// (see reconstructTsvBases), so the default stays small deliberately. At 50
+// commits a page, the default walks 250.
 //
 // EVERY FAILURE IS `incomplete`, NEVER AN EMPTY RANGE. A network error, a
 // non-OK response, an unparseable body, a missing `sinceSha`, or hitting the
@@ -219,10 +236,9 @@ export async function listMasterCommitsSince(
   repo: string,
   path: string,
   sinceSha: string | null,
-  opts: { pageLimit?: number; perPage?: number } = {},
+  opts: { pageLimit?: number } = {},
 ): Promise<MasterCommitPage> {
-  const perPage = opts.perPage ?? 50;
-  const pageLimit = opts.pageLimit ?? 4;
+  const pageLimit = opts.pageLimit ?? 5;
   // No ancestor sha means no lower bound to walk to. Returning the newest N
   // commits would silently answer a different question than the caller asked.
   if (!sinceSha) return { commits: [], incomplete: true, incompleteReason: "no_source_sha" };
@@ -236,14 +252,27 @@ export async function listMasterCommitsSince(
     const url =
       `${base}/api/v1/repos/${DCS_OWNER}/${encodeURIComponent(repo)}` +
       `/commits?sha=master&path=${encodeURIComponent(path)}` +
-      `&limit=${perPage}&page=${page}&stat=false&verification=false&files=false`;
+      `&page=${page}&stat=false&verification=false&files=false`;
     let batch: Array<Record<string, unknown>>;
+    let lastPage: boolean;
     try {
       const r = await fetch(url, { headers });
       if (!r.ok) return { commits: out, incomplete: true, incompleteReason: `http_${r.status}` };
       const body = await r.json();
       if (!Array.isArray(body)) return { commits: out, incomplete: true, incompleteReason: "bad_body" };
       batch = body as Array<Record<string, unknown>>;
+      // The server's own answer to "is there more". `X-HasMore` is the direct
+      // one; `X-PageCount` is the fallback for a Gitea (or proxy) that omits it.
+      // If NEITHER is present we cannot tell, so we only stop on an empty page —
+      // erring toward one wasted fetch rather than toward a false end-of-history.
+      const hasMore = r.headers.get("x-hasmore");
+      const pageCount = Number(r.headers.get("x-pagecount"));
+      lastPage =
+        hasMore != null
+          ? hasMore.toLowerCase() !== "true"
+          : Number.isFinite(pageCount) && pageCount > 0
+            ? page >= pageCount
+            : batch.length === 0;
     } catch {
       return { commits: out, incomplete: true, incompleteReason: "fetch_failed" };
     }
@@ -266,11 +295,11 @@ export async function listMasterCommitsSince(
       });
     }
 
-    // A short page is the end of the file's history. Reaching it without ever
-    // seeing sinceSha means the ancestor is not an ancestor of master any more
-    // — a force-push, a rewritten history, or a stale sha. That is not "no
-    // human edits"; it is "this range is not walkable".
-    if (batch.length < perPage) {
+    // Reaching the end of the file's history without ever seeing sinceSha means
+    // the ancestor is not an ancestor of master any more — a force-push, a
+    // rewritten history, or a stale sha. That is not "no human edits"; it is
+    // "this range is not walkable".
+    if (lastPage) {
       return { commits: out, incomplete: true, incompleteReason: "source_sha_not_in_history" };
     }
   }
