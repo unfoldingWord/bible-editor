@@ -856,9 +856,16 @@ export interface ReimportCounts {
   // Merge refused to adopt master's edit specifically because it would have
   // lost alignment — a subset of merge_conflicts. Optional, diagnostic.
   merge_refused?: number;
-  // Merge attempted but no ancestor was recoverable for this verse (edit_log
-  // aged past retention). D1 was kept, the pre-existing safe default.
-  // Optional, diagnostic.
+  // Merge attempted but no ancestor was recoverable for this verse from before
+  // the book+resource's master-confirmed watermark. D1 was kept, the
+  // pre-existing safe default. Optional, diagnostic.
+  //
+  // Do NOT restate this as "edit_log aged past retention", which is what this
+  // comment used to say: measured in prod on 2026-08-19, edit_log spanned 93
+  // days, so the 180-day sweep had deleted nothing and explained none of the
+  // 190 verses then in this state. Aging out is one possible limb of three (see
+  // buildNoBaseSentence in api/src/verseMergeEditorAlerts.ts); the measured
+  // fact is only that no ancestor was recoverable.
   merge_no_base?: number;
   // A tn/tq/twl row whose Reference differs between D1 and Door43, split by
   // which side moved it relative to the last published ancestor (see

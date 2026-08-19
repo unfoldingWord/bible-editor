@@ -363,6 +363,60 @@ console.log("\n[reference-move attribution at the caller]");
   }
 }
 
+// ── merge_no_base_refs folds through the REAL addCounts (issue #537) ─────────
+// The banner's ref list is a capped diagnostic sample merged across Workflow
+// chunks. Everything that makes it safe lives in addCounts — the cap, and
+// tolerating a chunk memoized before the field existed — and none of it was
+// covered, so a dropped `break` or a missing `??` would have gone red nowhere.
+// Folds through the same real aliases the blocked_samples case above uses,
+// rather than re-implementing the aggregation.
+{
+  const { zeroCountsForTest, addCountsForTest } = await import("./bookReimport.ts").then((m) => ({
+    zeroCountsForTest: m.zeroCountsForTest,
+    addCountsForTest: m.addCountsForTest,
+  }));
+
+  // Two chunks' worth of refs merge and accumulate.
+  const agg = zeroCountsForTest();
+  const chunkA = zeroCountsForTest();
+  chunkA.merge_no_base = 2;
+  chunkA.merge_no_base_refs = ["40:5", "40:6"];
+  const chunkB = zeroCountsForTest();
+  chunkB.merge_no_base = 1;
+  chunkB.merge_no_base_refs = ["42:2"];
+  addCountsForTest(agg, chunkA);
+  addCountsForTest(agg, chunkB);
+  eq(agg.merge_no_base, 3, "counts sum across chunks");
+  eq((agg.merge_no_base_refs ?? []).join(","), "40:5,40:6,42:2", "refs concatenate in chunk order");
+
+  // A chunk memoized before the field existed carries a count and NO refs. It
+  // must fold without throwing and without poisoning the count — the banner
+  // then reports a count larger than the sample, which buildNoBaseSentence
+  // renders as "+N more".
+  const legacy = zeroCountsForTest();
+  legacy.merge_no_base = 5;
+  delete legacy.merge_no_base_refs;
+  addCountsForTest(agg, legacy);
+  eq(agg.merge_no_base, 8, "a pre-field chunk still contributes its count");
+  eq((agg.merge_no_base_refs ?? []).length, 3, "…and contributes no refs, rather than undefined-poisoning the list");
+
+  // The cap holds under a flood, and the aggregate never exceeds it.
+  const flood = zeroCountsForTest();
+  flood.merge_no_base = 500;
+  flood.merge_no_base_refs = Array.from({ length: 500 }, (_, i) => `9:${i}`);
+  const capped = zeroCountsForTest();
+  addCountsForTest(capped, flood);
+  const cap = (await import("./verseMergeEditorAlerts.ts")).NO_BASE_REF_DISPLAY;
+  eq((capped.merge_no_base_refs ?? []).length, cap, "addCounts enforces the ref cap");
+  eq(capped.merge_no_base, 500, "…while the authoritative count is uncapped");
+
+  // A fresh zeroCounts must not alias another accumulator's array.
+  const one = zeroCountsForTest();
+  const two = zeroCountsForTest();
+  one.merge_no_base_refs.push("1:1");
+  eq((two.merge_no_base_refs ?? []).length, 0, "zeroCounts allocates a fresh refs array per call (no aliasing)");
+}
+
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed`);
   process.exit(1);
