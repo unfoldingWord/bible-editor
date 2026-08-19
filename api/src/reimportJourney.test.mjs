@@ -249,6 +249,120 @@ console.log("\n[(d) the HEALTHY path still stamps — no false withhold]");
   eq(Number(alerts.n), 0, "and no banner is raised on a clean run");
 }
 
+// ── Reference-move attribution, at the CALLER (issue #540 item 3) ───────────
+// classifyTsvRefMove/foldTsvRefBase are unit-tested, but every consequence that
+// matters lives in applyTsvRows: whether apply_incomplete is set (which withholds
+// the resource watermark and blocks the nightly export), whether the row is
+// flagged, and whether a stale flag is cleared. This drives the REAL applyTsvRows
+// over real SQLite, which is the only place those can be observed.
+console.log("\n[reference-move attribution at the caller]");
+{
+  // An edited tq row that the APP moved 1:2 -> 1:6 after the watermark, while
+  // master still sits at the ancestor. The livelock case.
+  const seedUser = (sqlite) =>
+    sqlite
+      .prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (7, 7007, 'translator')`)
+      .run();
+  const seedMoved = (sqlite, { reviewKind = null } = {}) => {
+    seedUser(sqlite);
+    sqlite
+      .prepare(
+        `INSERT INTO tq_rows (id, book, chapter, verse, ref_raw, question, response, sort_order, updated_by, version, review_kind, review_reason)
+         VALUES ('mv01', ?, 1, 6, '1:6', 'our question', 'our response', 10, 7, 3, ?, ?)`,
+      )
+      .run(BOOK, reviewKind, reviewKind ? "some earlier reason" : null);
+    // Ancestor: the row at 1:2, logged before the boundary.
+    const e = sqlite
+      .prepare(
+        `INSERT INTO edit_log (kind, row_key, book, action, payload_json, created_at)
+         VALUES ('tq', 'mv01', ?, 'create', ?, 100)`,
+      )
+      .run(BOOK, JSON.stringify({ chapter: 1, verse: 2, ref_raw: "1:2", question: "our question", response: "our response" }));
+    return Number(e.lastInsertRowid);
+  };
+  const masterAt = (ref, chapter, verse, extra = {}) => ({
+    id: "mv01", idCoerced: false, refRaw: ref, chapter, verse,
+    occurrence: null, tags: null, quote: null,
+    question: "our question", response: "our response", ...extra,
+  });
+
+  // 1. Pure app-side move: no hold, no flag. This is the whole point.
+  {
+    const { sqlite, env } = freshEnv();
+    const boundary = seedMoved(sqlite);
+    const counts = await applyTsvRows(env, BOOK, "tq", [masterAt("1:2", 1, 2)], null, {
+      confirmedAt: 200, editId: boundary,
+    });
+    eq(counts.ref_moved_ours, 1, "app-side move is attributed to us");
+    eq(counts.apply_incomplete, false, "…and does NOT withhold the resource watermark (the livelock kill)");
+    const row = sqlite.prepare(`SELECT review_kind, version FROM tq_rows WHERE id='mv01'`).all()[0];
+    eq(row.review_kind, null, "…and raises no flag");
+    eq(row.version, 3, "…and writes nothing, so the version does not move");
+  }
+
+  // 2. Same move, but a previous run left the mis-attributed flag. Cleared, once.
+  {
+    const { sqlite, env } = freshEnv();
+    const boundary = seedMoved(sqlite, { reviewKind: "ref_moved" });
+    const counts = await applyTsvRows(env, BOOK, "tq", [masterAt("1:2", 1, 2)], null, {
+      confirmedAt: 200, editId: boundary,
+    });
+    eq(counts.apply_incomplete, false, "clearing a stale flag does not withhold the watermark");
+    const row = sqlite.prepare(`SELECT review_kind, review_reason FROM tq_rows WHERE id='mv01'`).all()[0];
+    eq(row.review_kind, null, "the stale ref_moved flag is cleared");
+    eq(row.review_reason, null, "…reason too");
+  }
+
+  // 3. A merge_conflict flag is NOT collateral damage of that clear.
+  {
+    const { sqlite, env } = freshEnv();
+    const boundary = seedMoved(sqlite, { reviewKind: "merge_conflict" });
+    await applyTsvRows(env, BOOK, "tq", [masterAt("1:2", 1, 2)], null, { confirmedAt: 200, editId: boundary });
+    const row = sqlite.prepare(`SELECT review_kind FROM tq_rows WHERE id='mv01'`).all()[0];
+    eq(row.review_kind, "merge_conflict", "an unacknowledged merge_conflict survives an ours_moved run");
+  }
+
+  // 4. Master moved instead: the old behavior, hold + flag, must be intact.
+  {
+    const { sqlite, env } = freshEnv();
+    // D1 back at the ancestor, master re-anchored.
+    sqlite.prepare(`UPDATE tq_rows SET chapter=1, verse=2, ref_raw='1:2' WHERE id='mv01'`).run();
+    const boundary = seedMoved(sqlite);
+    sqlite.prepare(`UPDATE tq_rows SET chapter=1, verse=2, ref_raw='1:2' WHERE id='mv01'`).run();
+    const counts = await applyTsvRows(env, BOOK, "tq", [masterAt("1:9", 1, 9)], null, {
+      confirmedAt: 200, editId: boundary,
+    });
+    eq(counts.ref_moved_theirs, 1, "a master-side move is attributed to Door43");
+    eq(counts.apply_incomplete, true, "…and still withholds the resource watermark");
+    const row = sqlite.prepare(`SELECT review_kind, review_reason FROM tq_rows WHERE id='mv01'`).all()[0];
+    eq(row.review_kind, "ref_moved", "…and flags the row");
+    eq(row.review_reason.includes("A Door43 editor moved this row"), true, "…naming Door43, which the ancestor proves");
+    eq(row.review_reason.includes("export stays on hold"), true, "…and saying what actually releases the hold");
+  }
+
+  // 5. No ancestor at all: holds, and must NOT name Door43.
+  {
+    const { sqlite, env } = freshEnv();
+    seedUser(sqlite);
+    sqlite
+      .prepare(
+        `INSERT INTO tq_rows (id, book, chapter, verse, ref_raw, question, response, sort_order, updated_by, version)
+         VALUES ('mv02', ?, 1, 6, '1:6', 'q', 'r', 10, 7, 3)`,
+      )
+      .run(BOOK);
+    const counts = await applyTsvRows(
+      env, BOOK, "tq",
+      [{ id: "mv02", idCoerced: false, refRaw: "1:2", chapter: 1, verse: 2, occurrence: null, tags: null, quote: null, question: "q", response: "r" }],
+      null, { confirmedAt: 200, editId: 999999 },
+    );
+    eq(counts.ref_moved_unattributable, 1, "no ancestor -> unattributable");
+    eq(counts.apply_incomplete, true, "…still holds (fail safe)");
+    const row = sqlite.prepare(`SELECT review_reason FROM tq_rows WHERE id='mv02'`).all()[0];
+    eq(row.review_reason.includes("Door43 editor moved"), false, "…and never claims a Door43 editor moved it");
+    eq(row.review_reason.includes("no edit history survives"), true, "…it states the measured cause");
+  }
+}
+
 // ── merge_no_base_refs folds through the REAL addCounts (issue #537) ─────────
 // The banner's ref list is a capped diagnostic sample merged across Workflow
 // chunks. Everything that makes it safe lives in addCounts — the cap, and

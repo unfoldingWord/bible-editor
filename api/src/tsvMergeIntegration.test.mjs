@@ -10,7 +10,7 @@
 //   node --experimental-sqlite --experimental-strip-types --no-warnings src/tsvMergeIntegration.test.mjs
 
 import { DatabaseSync } from "node:sqlite";
-import { foldTsvBase, computeTsvMerge } from "./tsvMerge.ts";
+import { classifyTsvRefMove, computeTsvMerge, foldTsvBase, foldTsvRefBase } from "./tsvMerge.ts";
 
 let failed = 0;
 function eq(actual, expected, msg) {
@@ -53,13 +53,13 @@ ins.run(KIND, ID, BOOK, "delete", null, 250);
 // order (bind: kind, book, boundary, ...ids). Logic identical to bookReimport.ts:
 // when `boundaryId` is given (P1.3), the fold cuts at `id <= boundaryId`; else it
 // falls back to the second-granularity `created_at < CUTOFF` timestamp.
-function reconstructBase(ids, boundaryId = null) {
+function loadEntriesById(ids, boundaryId = null) {
   const inClause = ids.map(() => "?").join(", ");
   const boundaryClause = boundaryId != null ? "id <= ?" : "created_at < ?";
   const boundaryBind = boundaryId != null ? boundaryId : CUTOFF;
   const rows = db
     .prepare(
-      `SELECT row_key, action, payload_json FROM edit_log
+      `SELECT row_key, action, payload_json, book FROM edit_log
         WHERE kind = ? AND (book = ? OR book IS NULL)
           AND action IN ('create', 'update', 'restore')
           AND ${boundaryClause}
@@ -79,11 +79,36 @@ function reconstructBase(ids, boundaryId = null) {
       }
     }
     const list = byId.get(r.row_key) ?? [];
-    list.push({ action: r.action, payload });
+    // `book` and the bookKnown mapping are part of the production shape, not
+    // decoration: the WHERE deliberately admits `book IS NULL` rows, and
+    // foldTsvRefBase refuses them. Dropping `book` from this SELECT would make
+    // `r.book` undefined, so `bookKnown` would be false for EVERY entry, every
+    // reference ancestor would be null, and every move would become
+    // `unattributable` — re-holding every book. That is one keystroke away and
+    // would pass a copy of this query that did not carry the column.
+    list.push({ action: r.action, payload, bookKnown: r.book != null });
     byId.set(r.row_key, list);
   }
+  return byId;
+}
+
+// The content ancestor, folded from those entries — what reconstructTsvBases
+// returns as `.content`.
+function reconstructBase(ids, boundaryId = null) {
+  const byId = loadEntriesById(ids, boundaryId);
   const out = new Map();
   for (const id of ids) out.set(id, foldTsvBase(KIND, byId.get(id) ?? []));
+  return out;
+}
+
+// The REFERENCE ancestor, folded from the SAME entries — what
+// reconstructTsvBases returns as `.ref`. Production folds both from one read;
+// so does this, which is the point of running it here rather than only in the
+// pure test.
+function reconstructRefBase(ids, boundaryId = null) {
+  const byId = loadEntriesById(ids, boundaryId);
+  const out = new Map();
+  for (const id of ids) out.set(id, foldTsvRefBase(byId.get(id) ?? []));
   return out;
 }
 
@@ -139,6 +164,106 @@ eq(merge.writeFields, { note: "n_master" }, "merge writes only master's note; ou
   eq(basePost.note, "n_at_cutoff", "precise boundary: a post-read edit (id > boundary) is excluded");
   // (Referenced so an unused-var lint can't hide a copy-paste of the wrong id.)
   eq(Number(createInfo.lastInsertRowid) < boundaryId, true, "sanity: create id is below the captured boundary");
+}
+
+// ── Reference ancestor end to end (issue #540 item 3) ───────────────────────
+// The pure classifyTsvRefMove / foldTsvRefBase decisions are unit-tested in
+// tsvMerge.test.mjs. What this proves is the part a pure test cannot: that the
+// REAL reconstructTsvBases query hands the fold entries in the shapes production
+// actually wrote, so the reference ancestor is recovered rather than silently
+// absent. An absent one degrades every move to `unattributable`, which fails
+// safe but re-creates the livelock this change exists to kill.
+{
+  const ID3 = "ef56";
+  // Production history, in the two writer shapes that really coexist in
+  // edit_log: bookImport.ts's audit payload (snake_case ref_raw) and
+  // bookReimport.ts's logEditStmt(..., u.row), which stringifies a ParsedTsvRow
+  // (camelCase refRaw). Both predate the boundary.
+  const createInfo = ins.run(
+    KIND, ID3, BOOK, "create",
+    JSON.stringify({ book: BOOK, chapter: 1, verse: 2, ref_raw: "1:2", quote: "q", note: "n" }),
+    100,
+  );
+  // A later reimport brought in a verse-bridge reshape master had made
+  // ("1:2" -> "1:2-3", same leading verse). The value DIFFERS from the create's,
+  // so this assertion is only satisfiable by reading the camelCase spelling —
+  // with `refRaw` ignored the fold would fall back to the create's "1:2" and the
+  // classification below flips to both_moved.
+  const reimportInfo = ins.run(
+    KIND, ID3, BOOK, "update",
+    JSON.stringify({ id: ID3, refRaw: "1:2-3", chapter: 1, verse: 2, quote: "q", note: "n2", occurrence: 1 }),
+    200,
+  );
+  const boundaryId = Number(reimportInfo.lastInsertRowid);
+
+  // The app then moves the row to verse 6 — a PARTIAL patch (rows.ts sends
+  // ref_raw + verse and never chapter, since moves are same-chapter only), and
+  // it lands AFTER the boundary, so it must not fold into the ancestor.
+  ins.run(KIND, ID3, BOOK, "update", JSON.stringify({ ref_raw: "1:6", verse: 6 }), 400);
+
+  const refBase = reconstructRefBase([ID3], boundaryId).get(ID3);
+  eq(refBase, { chapter: 1, verse: 2, ref_raw: "1:2-3" },
+    "reference ancestor is recovered through the real query, across both ref_raw spellings");
+
+  // D1 now holds the move; master still holds what we last published. This is
+  // the exact shape that used to flag the translator and withhold the watermark
+  // forever. It must classify as ours_moved: no flag, no hold, export publishes.
+  eq(
+    classifyTsvRefMove({ chapter: 1, verse: 6, ref_raw: "1:6" }, { chapter: 1, verse: 2, refRaw: "1:2-3" }, refBase, false),
+    "ours_moved",
+    "an app-side move against a real reconstructed ancestor is ours_moved (the livelock case)",
+  );
+
+  // The mirror: D1 untouched since the boundary, master re-anchored out of band.
+  // Still theirs_moved -> flag + hold, exactly as before this change.
+  eq(
+    classifyTsvRefMove({ chapter: 1, verse: 2, ref_raw: "1:2-3" }, { chapter: 1, verse: 9, refRaw: "1:9" }, refBase, false),
+    "theirs_moved",
+    "an out-of-band master move against the same ancestor still holds",
+  );
+
+  // Without the boundary (no watermark yet), reconstructTsvBases is never called
+  // and the base is null — which must withhold, not guess a side.
+  eq(classifyTsvRefMove({ chapter: 1, verse: 6, ref_raw: "1:6" }, { chapter: 1, verse: 2, refRaw: "1:2" }, null, false),
+    "unattributable", "no watermark -> no ancestor -> unattributable, never a guessed side");
+
+  eq(Number(createInfo.lastInsertRowid) < boundaryId, true, "sanity: create id is below the captured boundary");
+}
+
+// The cross-book guard, through the real query rather than hand-built entries.
+// The WHERE deliberately admits `book IS NULL` rows (0017's backfill left 7,689
+// of them in prod), and row ids are unique only per (book, id) — so the SELECT
+// must carry `book` and the fold must refuse what it cannot attribute. Exercised
+// here because a pure test cannot catch the column going missing from the query:
+// `r.book` would be undefined, every entry would be skipped, every reference
+// ancestor would be null, and every move would re-hold.
+{
+  const ID4 = "gh78";
+  // A legacy entry with NO book: another book's history landing on the same
+  // 4-char id. It must not contribute a reference.
+  ins.run(KIND, ID4, null, "create", JSON.stringify({ chapter: 9, verse: 9, ref_raw: "9:9" }), 50);
+  const known = ins.run(
+    KIND, ID4, BOOK, "create", JSON.stringify({ chapter: 1, verse: 2, ref_raw: "1:2" }), 100,
+  );
+  eq(
+    reconstructRefBase([ID4], Number(known.lastInsertRowid)).get(ID4),
+    { chapter: 1, verse: 2, ref_raw: "1:2" },
+    "the book-NULL entry is admitted by the query but refused by the fold",
+  );
+
+  // With ONLY the unattributable entry the ancestor is null — withhold, never a
+  // confident 9:9 lifted from another book.
+  const ID5 = "ij90";
+  const only = ins.run(KIND, ID5, null, "create", JSON.stringify({ chapter: 9, verse: 9, ref_raw: "9:9" }), 50);
+  const noBase = reconstructRefBase([ID5], Number(only.lastInsertRowid)).get(ID5);
+  eq(noBase, null, "a history of only book-NULL entries yields no reference ancestor");
+  eq(
+    classifyTsvRefMove(
+      { chapter: 1, verse: 2, ref_raw: "1:2" }, { chapter: 1, verse: 6, refRaw: "1:6" }, noBase, false,
+    ),
+    "unattributable",
+    "…so the move holds instead of borrowing another book's reference",
+  );
 }
 
 if (failed) {

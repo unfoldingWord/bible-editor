@@ -1586,7 +1586,14 @@ async function applyTqUpsert(
                (kind, row_key, book, user_id, prev_version, new_version, action, payload_json, source)
              VALUES ('tq', ?1, ?2, ?3, ?4, ?5, 'update', ?6, ?7)`,
           )
-          .bind(id, p.book, userId, existing.version, newVersion, JSON.stringify(patch), AI_SOURCE),
+          // `verse` is written by the UPDATE above but was missing from the
+          // logged patch, so edit_log recorded a NEW ref_raw beside a STALE
+          // verse — an internally inconsistent snapshot. Version history
+          // replays these payloads, and so does the sync's reference-ancestor
+          // fold (tsvMerge.ts's foldTsvRefBase), where a torn reference is worse
+          // than an absent one: absence withholds, wrongness can let an export
+          // overwrite Door43. An audit row must record what was written.
+          .bind(id, p.book, userId, existing.version, newVersion, JSON.stringify({ ...patch, verse: p.verse }), AI_SOURCE),
         env.DB
           .prepare(
             `UPDATE pending_imports SET accepted_at = unixepoch(), accepted_by = ?2 WHERE id = ?1`,

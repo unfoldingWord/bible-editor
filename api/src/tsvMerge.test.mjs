@@ -10,7 +10,14 @@
 // silently kept-and-reverted — attributed per field against the reconstructed
 // ancestor. See tsvMerge.ts's header and the edited-row-skips-master-edit memory.
 
-import { computeTsvMerge, foldTsvBase, tsvMergeFields, tsvRefMoved } from "./tsvMerge.ts";
+import {
+  classifyTsvRefMove,
+  computeTsvMerge,
+  foldTsvBase,
+  foldTsvRefBase,
+  tsvMergeFields,
+  tsvRefMoved,
+} from "./tsvMerge.ts";
 
 let failed = 0;
 function eq(actual, expected, msg) {
@@ -379,6 +386,251 @@ deep(tsvMergeFields("tq"), ["quote", "question", "response"], "tq field list");
 // cold-review #1 note in bookReimport.ts).
 {
   eq(tsvRefMoved({ chapter: 3, verse: 4, ref_raw: "3:4" }, { chapter: 5, verse: 1, refRaw: "5:1" }, true), false, "protected row is never treated as moved");
+}
+
+// ── classifyTsvRefMove (issue #540 item 3: WHO moved) ───────────────────────
+// tsvRefMoved above only says the two sides disagree. Its caller used to read
+// that as "Door43 moved it", which is wrong whenever the app moved it — and
+// wrong in a way that could not heal: the flag told the translator to undo her
+// own move, and the withheld watermark stopped the export from ever publishing
+// it, so the same wrong flag returned every night (AMO tq, blocked 2026-08-17).
+// These lock the attribution.
+
+// D1 moved, master still at the ancestor -> an ordinary exportable edit.
+{
+  const base = { chapter: 1, verse: 2, ref_raw: "1:2" };
+  eq(
+    classifyTsvRefMove({ chapter: 1, verse: 6, ref_raw: "1:6" }, { chapter: 1, verse: 2, refRaw: "1:2" }, base, false),
+    "ours_moved",
+    "app moved the row, master still at the ancestor -> ours_moved (no flag, no hold)",
+  );
+}
+
+// Master moved, D1 still at the ancestor -> the out-of-band move (old behavior).
+{
+  const base = { chapter: 1, verse: 2, ref_raw: "1:2" };
+  eq(
+    classifyTsvRefMove({ chapter: 1, verse: 2, ref_raw: "1:2" }, { chapter: 1, verse: 6, refRaw: "1:6" }, base, false),
+    "theirs_moved",
+    "master moved the row, app still at the ancestor -> theirs_moved (flag + hold)",
+  );
+}
+
+// Both re-anchored, to different places -> a human has to pick.
+{
+  const base = { chapter: 1, verse: 2, ref_raw: "1:2" };
+  eq(
+    classifyTsvRefMove({ chapter: 1, verse: 5, ref_raw: "1:5" }, { chapter: 1, verse: 6, refRaw: "1:6" }, base, false),
+    "both_moved",
+    "both sides moved to different references -> both_moved",
+  );
+}
+
+// No ancestor -> we may not name a side. Still holds (fail safe), but the
+// caller's wording must not claim a Door43 editor did it.
+{
+  eq(
+    classifyTsvRefMove({ chapter: 1, verse: 2, ref_raw: "1:2" }, { chapter: 1, verse: 6, refRaw: "1:6" }, null, false),
+    "unattributable",
+    "no ancestor -> unattributable, never a guessed side",
+  );
+}
+
+// The in-app move patch sends ref_raw + verse and never chapter (same-chapter
+// moves only, rows.ts), so a base folded from patches carries no `chapter`. That
+// must NOT make a same-chapter move unattributable: chapter agrees on both
+// sides, so it carries no information about who moved and needs no ancestor.
+{
+  const base = { verse: 2, ref_raw: "1:2" };
+  eq(
+    classifyTsvRefMove({ chapter: 1, verse: 6, ref_raw: "1:6" }, { chapter: 1, verse: 2, refRaw: "1:2" }, base, false),
+    "ours_moved",
+    "same-chapter move stays attributable when the ancestor never recorded chapter",
+  );
+}
+
+// But a component that DOES differ and has no ancestor value is unattributable.
+{
+  const base = { verse: 2, ref_raw: "1:2" };
+  eq(
+    classifyTsvRefMove({ chapter: 1, verse: 2, ref_raw: "1:2" }, { chapter: 5, verse: 2, refRaw: "1:2" }, base, false),
+    "unattributable",
+    "a differing component the ancestor never recorded -> unattributable",
+  );
+}
+
+// Agreement short-circuits before the ancestor is consulted at all.
+{
+  eq(
+    classifyTsvRefMove({ chapter: 1, verse: 2, ref_raw: "1:2" }, { chapter: 1, verse: 2, refRaw: "1:2" }, null, false),
+    "none",
+    "identical references are 'none' even with no ancestor",
+  );
+}
+
+// Protected rows keep tsvRefMoved's contract: never moved, so never a hold.
+{
+  eq(
+    classifyTsvRefMove({ chapter: 3, verse: 4, ref_raw: "3:4" }, { chapter: 5, verse: 1, refRaw: "5:1" }, null, true),
+    "none",
+    "protected row is never treated as moved, ancestor or not",
+  );
+}
+
+// ── foldTsvRefBase ──────────────────────────────────────────────────────────
+
+// Absent means never recorded — not a blank ancestor.
+{
+  eq(foldTsvRefBase([]), null, "no entries -> null (no reference ancestor)");
+  eq(foldTsvRefBase([{ action: "update", payload: { note: "x" } }]), null,
+    "content-only history -> null (nothing recorded a reference)");
+}
+
+// Non-content actions are skipped, exactly as foldTsvBase skips them.
+{
+  eq(foldTsvRefBase([{ action: "delete", payload: { chapter: 1, verse: 2, ref_raw: "1:2" } }]), null,
+    "a non-content action contributes no reference");
+}
+
+// Oldest -> newest overlay: the last recorded value for each component wins,
+// and an entry that mentions only some components leaves the rest intact.
+{
+  const base = foldTsvRefBase([
+    { action: "create", payload: { chapter: 1, verse: 2, ref_raw: "1:2" } },
+    { action: "update", payload: { verse: 4, ref_raw: "1:4" } },
+  ]);
+  deep(base, { chapter: 1, verse: 4, ref_raw: "1:4" }, "later patch overlays verse/ref_raw and keeps chapter");
+}
+
+// An explicit null ref_raw in a payload is ABSENT, not "". pipelineImport.ts's
+// tn hint expansion writes `ref_raw = COALESCE(?5, ref_raw)`, so a payload
+// carrying `ref_raw: null` leaves the row's reference UNCHANGED — folding it to
+// "" would record an ancestor the row never held, and a wrong ancestor is the
+// one thing this fold must never produce.
+{
+  const base = foldTsvRefBase([{ action: "create", payload: { chapter: 1, verse: 2, ref_raw: null } }]);
+  deep(base, { chapter: 1, verse: 2 }, "an explicit null ref_raw is absent, not the empty string");
+  // Absent is fail-safe: ref_raw differs between the sides and the ancestor
+  // never recorded it, so the move withholds rather than asserting "".
+  eq(
+    classifyTsvRefMove({ chapter: 1, verse: 2, ref_raw: "1:2" }, { chapter: 1, verse: 2, refRaw: "" }, base, false),
+    "unattributable",
+    "…so a differing ref_raw with no recorded ancestor withholds",
+  );
+  // An empty string that was genuinely RECORDED still folds, and a blank-ref row
+  // is not a move against its own ancestor.
+  const blank = foldTsvRefBase([{ action: "create", payload: { chapter: 1, verse: 2, ref_raw: "" } }]);
+  deep(blank, { chapter: 1, verse: 2, ref_raw: "" }, "a recorded empty ref_raw folds as \"\"");
+  eq(classifyTsvRefMove({ chapter: 1, verse: 2, ref_raw: null }, { chapter: 1, verse: 2, refRaw: "" }, blank, false),
+    "none", "blank-ref row is not a move against its own ancestor");
+}
+
+// Only a string counts. Every real writer emits one (bookImport's
+// `r["Reference"] ?? ""`, rows.ts's z.string(), ParsedTsvRow's `refRaw: string`),
+// so anything else is a shape we have not seen — and String([...]) / String({})
+// yield confident nonsense that would compare unequal to both sides and pin the
+// row on `both_moved` forever.
+{
+  for (const [label, value] of [["a number", 5], ["an array", ["1:2"]], ["an object", {}], ["a boolean", true]]) {
+    const base = foldTsvRefBase([{ action: "create", payload: { chapter: 1, verse: 2, ref_raw: value } }]);
+    eq(base.ref_raw, undefined, `${label} ref_raw is not coerced into the ancestor`);
+  }
+}
+
+// Both ref_raw spellings really are in production edit_log: bookImport.ts and
+// rows.ts write snake_case `ref_raw`, while bookReimport.ts logs a ParsedTsvRow
+// verbatim, whose field is camelCase `refRaw`. Reading only one leaves ref_raw
+// absent from the ancestor of every reimport-written row, which degrades a
+// ref_raw-only reshape to a permanent `unattributable`.
+{
+  const base = foldTsvRefBase([{ action: "update", payload: { chapter: 1, verse: 2, refRaw: "1:2" } }]);
+  deep(base, { chapter: 1, verse: 2, ref_raw: "1:2" }, "camelCase refRaw (ParsedTsvRow, the reimport shape) folds in");
+  // The case this rescues: verse unchanged, ref_raw reshaped by the app.
+  eq(
+    classifyTsvRefMove({ chapter: 1, verse: 2, ref_raw: "1:2-3" }, { chapter: 1, verse: 2, refRaw: "1:2" }, base, false),
+    "ours_moved",
+    "a ref_raw-only reshape stays attributable against a reimport-written ancestor",
+  );
+}
+{
+  // Mixed history: an old snake_case create, then a camelCase reimport update.
+  // Newest wins, whichever spelling it used.
+  const base = foldTsvRefBase([
+    { action: "create", payload: { chapter: 1, verse: 2, ref_raw: "1:2" } },
+    { action: "update", payload: { chapter: 1, verse: 5, refRaw: "1:5" } },
+  ]);
+  deep(base, { chapter: 1, verse: 5, ref_raw: "1:5" }, "mixed-spelling history folds newest-wins");
+}
+
+// Verse 0 is a real reference in this repo (chapter-front `front:intro` rows),
+// so a recorded 0 must read as PRESENT, never as absent-and-unattributable.
+{
+  const base = foldTsvRefBase([{ action: "create", payload: { chapter: 0, verse: 0, ref_raw: "front:intro" } }]);
+  deep(base, { chapter: 0, verse: 0, ref_raw: "front:intro" }, "a recorded chapter/verse of 0 is present, not absent");
+  eq(
+    classifyTsvRefMove({ chapter: 0, verse: 0, ref_raw: "front:intro" }, { chapter: 0, verse: 1, refRaw: "front:intro" }, base, false),
+    "theirs_moved",
+    "verse 0 ancestor attributes a move off it (0 is not treated as missing)",
+  );
+}
+
+// Cross-book pollution. reconstructTsvBases matches `(book = ? OR book IS
+// NULL)`, and prod holds 7,689 tn/tq/twl edit_log rows with a NULL book
+// (0017's backfill is best-effort). Row ids are unique only per (book, id), so
+// a NULL-book entry can be another book's history landing on this row's id —
+// and here it would decide whether the export may overwrite master. An entry we
+// cannot prove belongs to this row must not contribute.
+{
+  const base = foldTsvRefBase([
+    { action: "create", payload: { chapter: 1, verse: 2, ref_raw: "1:2" }, bookKnown: true },
+    { action: "update", payload: { chapter: 9, verse: 9, ref_raw: "9:9" }, bookKnown: false },
+  ]);
+  deep(base, { chapter: 1, verse: 2, ref_raw: "1:2" }, "a book-NULL entry does not pollute the reference ancestor");
+  eq(
+    foldTsvRefBase([{ action: "create", payload: { chapter: 9, verse: 9, ref_raw: "9:9" }, bookKnown: false }]),
+    null,
+    "a history of only book-NULL entries yields no ancestor (withhold, don't guess)",
+  );
+  // Callers that don't report it keep working unchanged.
+  deep(
+    foldTsvRefBase([{ action: "create", payload: { chapter: 1, verse: 2, ref_raw: "1:2" } }]),
+    { chapter: 1, verse: 2, ref_raw: "1:2" },
+    "an entry with bookKnown unreported still folds (existing callers unchanged)",
+  );
+}
+
+// Absent-ish values must stay ABSENT, not coerce to 0 — because 0 is a REAL
+// reference here (chapter-front `front:intro`). `Number(null)`, `Number("")`,
+// `Number(false)` and `Number([])` are all a finite 0, which would turn a
+// fail-safe absence into a fail-unsafe wrong ancestor.
+{
+  for (const [label, value] of [["null", null], ["empty string", ""], ["false", false], ["empty array", []]]) {
+    const base = foldTsvRefBase([{ action: "create", payload: { chapter: 1, verse: value, ref_raw: "1:2" } }]);
+    eq(base.verse, undefined, `a ${label} verse is absent, not 0`);
+    // Absent is the fail-SAFE state: `verse` differs between the two sides and
+    // the ancestor never recorded it, so the move is unattributable and holds.
+    // Coerced to 0 it would instead read as "the ancestor said verse 0, and D1
+    // moved away from it" — a confident, wrong `ours_moved` that lets the
+    // export overwrite Door43. That flip is the whole point of the guard.
+    eq(
+      classifyTsvRefMove({ chapter: 1, verse: 5, ref_raw: "1:5" }, { chapter: 1, verse: 2, refRaw: "1:2" }, base, false),
+      "unattributable",
+      `…so a ${label} verse withholds instead of asserting a verse-0 ancestor`,
+    );
+  }
+  // A genuine 0 still folds — the two must not be conflated.
+  const real = foldTsvRefBase([{ action: "create", payload: { chapter: 0, verse: 0, ref_raw: "front:intro" } }]);
+  eq(real.verse, 0, "a genuine verse 0 folds in as 0");
+}
+
+// Numbers arrive as strings from some writer shapes; a non-numeric value is
+// dropped rather than folded in as NaN (NaN compares unequal to everything and
+// would manufacture a permanent unattributable).
+{
+  const base = foldTsvRefBase([{ action: "create", payload: { chapter: "1", verse: "2", ref_raw: "1:2" } }]);
+  deep(base, { chapter: 1, verse: 2, ref_raw: "1:2" }, "string chapter/verse coerce to numbers");
+  const junk = foldTsvRefBase([{ action: "create", payload: { chapter: "front", verse: 2, ref_raw: "front:intro" } }]);
+  deep(junk, { verse: 2, ref_raw: "front:intro" }, "a non-numeric chapter is dropped, not folded in as NaN");
 }
 
 if (failed) {

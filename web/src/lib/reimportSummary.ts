@@ -21,6 +21,25 @@ export function summarizeReimport(res: ReimportResponse): string {
   if (t.source_attr_reconciled) parts.push(`${t.source_attr_reconciled} source-attr fix(es) synced from master`);
   if (t.merge_adopted) parts.push(`${t.merge_adopted} adopted from master (out-of-band correction)`);
   if (t.merge_conflicts) parts.push(`${t.merge_conflicts} flagged for review (merge conflict)`);
+  // Rows whose Reference disagrees between the app and Door43. Split by who
+  // moved (api/src/tsvMerge.ts's classifyTsvRefMove) because only the held cases
+  // need anyone's attention — a move the app made is an ordinary edit the export
+  // publishes, and reporting it as "flagged" is what used to tell a translator to
+  // undo her own work. The held cases are summed because the human action is the
+  // same for all of them, and the per-row flag carries the specific reason.
+  //
+  // "differs between here and Door43" - deliberately directionless. The bucket
+  // includes `unattributable`, where the sync explicitly could NOT say which side
+  // moved, and `ours_moved_conflict`, where WE moved it. Any phrasing that reads
+  // as "Door43 changed this" would assert in the summary the very thing the
+  // per-row reasons are careful not to claim. The per-row reason carries the
+  // specific, measured story; this line only says a human should look.
+  const refHeld =
+    (t.ref_moved_theirs ?? 0) +
+    (t.ref_moved_both ?? 0) +
+    (t.ref_moved_unattributable ?? 0) +
+    (t.ref_moved_ours_conflict ?? 0);
+  if (refHeld) parts.push(`${refHeld} flagged for review (reference differs between here and Door43)`);
   // Door43 held exactly the file our last export pushed, so its changes were our
   // own merged export rather than anyone else's edit. The pull still ran; what
   // changed is that those edits are no longer mistaken for someone else's work

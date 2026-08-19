@@ -137,6 +137,28 @@ lacks(
 lacks(summarizeReimport(res({})), "NOT imported", "no blocked rows → no blocked phrase");
 lacks(summarizeReimport(res({})), "NaN", "absent counters never render as NaN");
 
+// Reference moves (issue #540 item 3). A move the APP made is an ordinary edit
+// the export publishes — reporting it as flagged is exactly what used to tell a
+// translator to undo her own work, so it must not appear here at all.
+lacks(
+  summarizeReimport(res({ ref_moved_ours: 4 })),
+  "reference differs",
+  "a move the app made is not reported as something to review",
+);
+has(
+  summarizeReimport(res({ ref_moved_theirs: 3 })),
+  "3 flagged for review (reference differs between here and Door43)",
+  "a move Door43 made is reported",
+);
+// The three held cases sum: the human action is the same for all of them, and
+// the per-row flag already carries the specific reason.
+has(
+  summarizeReimport(res({ ref_moved_theirs: 1, ref_moved_both: 2, ref_moved_unattributable: 3 })),
+  "6 flagged for review (reference differs between here and Door43)",
+  "theirs + both + unattributable are summed, not listed three times",
+);
+lacks(summarizeReimport(res({})), "reference differs", "no reference moves → no reference phrase");
+
 if (failed > 0) {
   console.error(`\n${failed} failure(s)`);
   process.exit(1);

@@ -867,6 +867,16 @@ export interface ReimportCounts {
   // buildNoBaseSentence in api/src/verseMergeEditorAlerts.ts); the measured
   // fact is only that no ancestor was recoverable.
   merge_no_base?: number;
+  // A tn/tq/twl row whose Reference differs between D1 and Door43, split by
+  // which side moved it relative to the last published ancestor (see
+  // api/src/tsvMerge.ts's classifyTsvRefMove). `ours` is an ordinary app edit
+  // the export publishes — no flag, no hold. The other three withhold the
+  // resource watermark and flag the row. Optional, diagnostic.
+  ref_moved_ours?: number;
+  ref_moved_ours_conflict?: number;
+  ref_moved_theirs?: number;
+  ref_moved_both?: number;
+  ref_moved_unattributable?: number;
   merge_unavailable?: number;
   // A "keep_converged" verse whose RAW content_json actually differed — a
   // genuine, cosmetic-only Door43 edit that verseMerge.ts's whitespace-
