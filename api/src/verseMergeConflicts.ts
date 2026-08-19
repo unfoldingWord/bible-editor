@@ -330,13 +330,15 @@ export async function raiseVerseMergeConflictAlert(
   env: Env,
   book: string,
   resource: string,
-  // FIX G: `noBaseCount` — this run's tally of `keep_no_base` verses (the
-  // ancestor aged past edit_log's 180-day sweep, so attribution was
-  // impossible and D1 was kept, same as before verseMerge.ts existed).
-  // Threaded through the same way `recordingFailed` is: the caller reads it
-  // off perResource[resource].merge_no_base (bookReimport.ts) and passes it
-  // here so the ONE place a human sees this table's story can say so.
-  opts: { recordingFailed?: boolean; noBaseCount?: number } = {},
+  // FIX G: `noBaseCount` — this run's tally of `keep_no_base` verses (no
+  // ancestor survived from before the master-confirmed watermark, so
+  // attribution was impossible and D1 was kept, same as before verseMerge.ts
+  // existed). Threaded through the same way `recordingFailed` is: the caller
+  // reads it off perResource[resource].merge_no_base (bookReimport.ts) and
+  // passes it here so the ONE place a human sees this table's story can say so.
+  // `noBaseRefs` (issue #537) is the matching capped sample of `chapter:verse`
+  // refs — the count alone named no verse a human could go look at.
+  opts: { recordingFailed?: boolean; noBaseCount?: number; noBaseRefs?: string[] } = {},
 ): Promise<void> {
   const source = `verse_merge_conflict:${book}:${resource}`;
   // FIX E: this read must not be able to fail the whole reimport. It used to
@@ -422,6 +424,7 @@ export async function raiseVerseMergeConflictAlert(
   const guidance = buildMergeConflictGuidance(rows, {
     recordingFailed: opts.recordingFailed,
     noBaseCount: opts.noBaseCount,
+    noBaseRefs: opts.noBaseRefs,
   });
   const refsClause = rows.length > 0 ? ` Refs: ${refs}${more}.` : "";
   // FIX I: this fires from both the nightly cron and the user-triggered
