@@ -59,8 +59,10 @@ import {
   buildEditorLookupQuery,
   buildMergeConflictGuidance,
   EDITOR_LOOKUP_CHUNK,
+  groupNoBaseVersesByEditor,
   groupOverwrittenVersesByEditor,
   planSystemAlertWrites,
+  type NoBaseVerseRef,
   type OverwrittenVerseRef,
 } from "./verseMergeEditorAlerts.ts";
 import {
@@ -338,7 +340,16 @@ export async function raiseVerseMergeConflictAlert(
   // passes it here so the ONE place a human sees this table's story can say so.
   // `noBaseRefs` (issue #537) is the matching capped sample of `chapter:verse`
   // refs — the count alone named no verse a human could go look at.
-  opts: { recordingFailed?: boolean; noBaseCount?: number; noBaseRefs?: string[] } = {},
+  // `noBaseEditorRefs` (issue #544) is the UNCAPPED list of the same verses,
+  // each carrying its current D1 version so groupNoBaseVersesByEditor can
+  // attribute it to the human who last edited it and give THEM their own
+  // notice too — until this fix that warning reached only ALERT_USERNAME.
+  opts: {
+    recordingFailed?: boolean;
+    noBaseCount?: number;
+    noBaseRefs?: string[];
+    noBaseEditorRefs?: NoBaseVerseRef[];
+  } = {},
 ): Promise<void> {
   const source = `verse_merge_conflict:${book}:${resource}`;
   // FIX E: this read must not be able to fail the whole reimport. It used to
@@ -461,15 +472,37 @@ export async function raiseVerseMergeConflictAlert(
         r.action === "adopt_conflict" && r.overwrittenVersion != null,
     )
     .map((r) => ({ chapter: r.chapter, verse: r.verse, overwrittenVersion: r.overwrittenVersion }));
-  const usernameByKey = await lookupEditorUsernames(env, book, resource, overwrittenRefs);
+  // keep_no_base verses (issue #544): NOTHING was overwritten, but the same
+  // human needs the same warning the admin gets — see groupNoBaseVersesByEditor's
+  // header comment for why this reuses the overwritten-lookup machinery keyed
+  // on the verse's CURRENT version rather than a replaced one. Folded into ONE
+  // lookupEditorUsernames call with overwrittenRefs (rather than a second D1
+  // round trip) — same chunking, same subrequest-budget discipline as the rest
+  // of this file.
+  const noBaseEditorRefs = opts.noBaseEditorRefs ?? [];
+  const noBaseLookupRefs: OverwrittenVerseRef[] = noBaseEditorRefs.map((r) => ({
+    chapter: r.chapter,
+    verse: r.verse,
+    overwrittenVersion: r.version,
+  }));
+  const usernameByKey = await lookupEditorUsernames(env, book, resource, [...overwrittenRefs, ...noBaseLookupRefs]);
   const perEditor = groupOverwrittenVersesByEditor(book, resource, overwrittenRefs, usernameByKey);
+  const perEditorNoBase = groupNoBaseVersesByEditor(book, resource, noBaseEditorRefs, usernameByKey);
+
+  // Combine per-editor content: an editor can appear in BOTH maps in the same
+  // run (an overwritten verse elsewhere in the book, plus a keep_no_base verse
+  // of their own) — system_alerts holds one row per (username, source), so
+  // their two messages are concatenated rather than one clobbering the other.
+  const editorMessages = new Map<string, string>();
+  for (const [username, editor] of perEditor) editorMessages.set(username, editor.message);
+  for (const [username, editor] of perEditorNoBase) {
+    const existing = editorMessages.get(username);
+    editorMessages.set(username, existing ? `${existing} ${editor.message}` : editor.message);
+  }
 
   // The full desired state for this source: the admin's summary plus one
   // entry per affected editor.
-  const desired = new Map<string, string>([
-    [ALERT_USERNAME, message],
-    ...[...perEditor.entries()].map(([username, editor]) => [username, editor.message] as const),
-  ]);
+  const desired = new Map<string, string>([[ALERT_USERNAME, message], ...editorMessages.entries()]);
 
   try {
     // Read the CURRENT state for this exact source (every username, any

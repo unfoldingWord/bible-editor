@@ -62,6 +62,7 @@ import {
   buildMergeConflictGuidance,
   EDITOR_LOOKUP_CHUNK,
   editLogKey,
+  groupNoBaseVersesByEditor,
   groupOverwrittenVersesByEditor,
   NO_BASE_REF_DISPLAY,
   planSystemAlertWrites,
@@ -147,6 +148,66 @@ function assert(cond, msg) {
   const b = { chapter: 1, verse: 1, overwrittenVersion: 2 };
   assert(editLogKey("ZEC", "ult", a) !== editLogKey("HOS", "ult", b), "different book -> different key");
   assert(editLogKey("ZEC", "ult", a) !== editLogKey("ZEC", "ust", b), "different resource -> different key");
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Part 1b: groupNoBaseVersesByEditor (issue #544) — pure, no D1. The
+// keep_no_base analogue of groupOverwrittenVersesByEditor above: NOTHING was
+// overwritten, so the message must never claim otherwise, and the refs carry
+// no "@vN" (there is no replaced version to point a reader at).
+// ─────────────────────────────────────────────────────────────────────────
+
+{
+  // Two verses attributed to the same editor combine into one alert, keyed
+  // off their CURRENT version (not an overwrittenVersion — nothing was
+  // overwritten).
+  const noBase = [
+    { chapter: 1, verse: 2, version: 3 },
+    { chapter: 1, verse: 5, version: 7 },
+  ];
+  const usernameByKey = new Map([
+    [editLogKey("ZEC", "ult", { chapter: 1, verse: 2, overwrittenVersion: 3 }), "bethoakes"],
+    [editLogKey("ZEC", "ult", { chapter: 1, verse: 5, overwrittenVersion: 7 }), "bethoakes"],
+  ]);
+  const grouped = groupNoBaseVersesByEditor("ZEC", "ult", noBase, usernameByKey);
+  assert(grouped.size === 1, "two verses, one editor -> one alert entry");
+  const entry = grouped.get("bethoakes");
+  assert(!!entry, "keyed by username");
+  assert(entry.refs.length === 2, "both refs collected");
+  assert(entry.refs.includes("1:2") && entry.refs.includes("1:5"), "refs carry bare chapter:verse");
+  assert(!entry.refs.some((r) => r.includes("@v")), "…and never an '@vN' suffix — nothing was overwritten");
+  assert(entry.message.includes("ZEC"), "message names the book");
+  assert(entry.message.includes("ULT"), "message names the resource, uppercased");
+  assert(entry.message.includes("2 verse(s)"), "message states the count");
+  assert(!/overwr(itten|ote|ites)/i.test(entry.message.replace("Nothing has been overwritten", "")),
+    "message never claims an overwrite happened, aside from explicitly denying one");
+  assert(entry.message.includes("Nothing has been overwritten"), "message explicitly denies an overwrite");
+  assert(!entry.message.includes("nightly"), "does not overclaim a nightly-only trigger");
+  assert(entry.message.includes("Door43's sync"), 'says "sync", not "nightly sync"');
+}
+
+{
+  // Two different editors get two separate alert entries, not merged.
+  const noBase = [
+    { chapter: 2, verse: 1, version: 4 },
+    { chapter: 3, verse: 9, version: 2 },
+  ];
+  const usernameByKey = new Map([
+    [editLogKey("HOS", "ust", { chapter: 2, verse: 1, overwrittenVersion: 4 }), "pjoakes"],
+    [editLogKey("HOS", "ust", { chapter: 3, verse: 9, overwrittenVersion: 2 }), "Carolyn1970"],
+  ]);
+  const grouped = groupNoBaseVersesByEditor("HOS", "ust", noBase, usernameByKey);
+  assert(grouped.size === 2, "two editors -> two alert entries");
+  assert(grouped.get("pjoakes").refs.length === 1, "pjoakes gets only their own verse");
+  assert(grouped.get("Carolyn1970").refs.length === 1, "Carolyn1970 gets only their own verse");
+}
+
+{
+  // No matching edit_log user (an AI edit, or the ancestor aged out) -> no
+  // alert entry, the same silent-exclusion behavior as the overwritten case.
+  const noBase = [{ chapter: 4, verse: 4, version: 1 }];
+  const grouped = groupNoBaseVersesByEditor("MIC", "ult", noBase, new Map());
+  assert(grouped.size === 0, "no username found -> no alert entry");
 }
 
 // ─────────────────────────────────────────────────────────────────────────
