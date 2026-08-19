@@ -208,5 +208,11 @@ export function masterMayHoldHumanEdit(
 ): boolean {
   if (lineage == null) return true; // never looked -> assume a human did
   if ("mayHoldHumanEdit" in lineage) return lineage.mayHoldHumanEdit !== false;
-  return lineage.incomplete || lineage.hasHumanCommit;
+  // Every comparison is `!== false`, never a truthiness test, so a malformed or
+  // partially-deserialized object answers protectively instead of falling
+  // through to `undefined`. `return a || b` on a missing field returns undefined
+  // — which today's call sites happen to treat as master-wins because they test
+  // `=== false`, but that is the callers being careful, not this function being
+  // safe. Encode it here, where the rule lives.
+  return lineage.incomplete !== false || lineage.hasHumanCommit !== false;
 }

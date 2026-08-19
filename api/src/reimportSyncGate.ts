@@ -164,6 +164,36 @@ export function isSystemicMergeRefusal(
   return refusedCount >= threshold;
 }
 
+// ── Kept-over-Door43 scale alarm (#540 item 2's "keep_ai_master") ───────────
+//
+// The gate above FREEZES a resource's export once refusals look systemic. This
+// one deliberately does NOT, and the contrast is the point: a keep_ai_master
+// verse or row is one the merge decided the APP should win, and the export is
+// how that decision reaches Door43 — freezing it would strand the very edit the
+// decision protected, which is the livelock #543 killed on the TSV side.
+//
+// But it is also the only decision in this system that actively publishes D1
+// OVER master, and it rests on a classification (masterLineage.ts) whose whole
+// input is a commit-message prefix and an author email. If that is ever wrong at
+// scale — a second bot identity, a boundary that drifted, a Door43-side history
+// rewrite — the damage looks exactly like the incidents this area exists to
+// prevent, except spread across per-row flags nobody reads one at a time. So: no
+// freeze, but a loud, named alert once it stops looking like a handful of rows.
+//
+// Deliberately a COUNT of one run's decisions for one (book, resource), not a
+// rate: the alert's job is "look at this book tonight", and a rate would need a
+// denominator this path does not have.
+//
+// Pure, like its siblings, so the threshold has a direct test.
+export const KEPT_OVER_DOOR43_ALERT_THRESHOLD = 5;
+
+export function isKeptOverDoor43AtScale(
+  keptCount: number,
+  threshold: number = KEPT_OVER_DOOR43_ALERT_THRESHOLD,
+): boolean {
+  return keptCount >= threshold;
+}
+
 // Whether an `allowMergeRefusal` request may override the systemic-refusal
 // gate above, for THIS specific resource. Mirrors shrinkOverrideAllowed's
 // shape and rationale exactly (shrinkGuard.ts): deliberately narrow — only a

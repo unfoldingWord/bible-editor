@@ -761,4 +761,33 @@ t("text-quality messages never claim DCS rejects the content", () => {
   }
 });
 
+// The cleanup chip's title comes from review_kind, because the flags it covers
+// say opposite things and the title is the first — often only — line a
+// translator reads. "Merged Door43 edit" over a row whose edit was KEPT states
+// the reverse of what happened, and a reference move merged nothing at all.
+t("review flag titles come from review_kind, not one hardcoded string per kind", () => {
+  const title = (rows, lint) => lint(rows).filter((i) => i.check.endsWith("— verify"))[0].check;
+
+  assert.equal(
+    title([tq({ review_kind: "merge_kept", review_reason: "Your response was kept over Door43's." })], lintTqRows),
+    "Kept over Door43 — verify",
+    "a kept row is not titled as a merged Door43 edit",
+  );
+  assert.equal(
+    title([tq({ review_kind: "merge_conflict", review_reason: "A Door43 edit was merged over yours." })], lintTqRows),
+    "Merged Door43 edit — verify",
+    "a master-wins conflict keeps its existing title",
+  );
+  assert.equal(
+    title([twl({ review_kind: "ref_moved", review_reason: "Reference differs." })], lintTwlRows),
+    "Reference differs from Door43 — verify",
+    "a reference move is not reported as a merge at all",
+  );
+  assert.equal(
+    title([tn({ review_kind: "quote", review_reason: "Adapted from a parallel passage." })], lintTnRows),
+    "Adapted note — verify",
+    "an unmapped flag keeps its kind's pre-existing wording",
+  );
+});
+
 console.log(`\n${passed} lint tests passed`);

@@ -331,7 +331,79 @@ async function run() {
     }
     {
       const r = await listMasterCommitsSince({}, "en_tq", "tq_AMO.tsv", null);
-      assert(r.incomplete === true && r.incompleteReason === "no_source_sha", "no ancestor sha is incomplete without fetching");
+      assert(r.incomplete === true && r.incompleteReason === "no_source_sha", "no boundary at all is incomplete without fetching");
+    }
+
+    // ── The WATERMARK bound (#540 item 1). The sync passes master_confirmed_at,
+    // not source_sha, because the two are different points in master's history
+    // and source_sha is routinely newer — see the "WHICH BOUNDARY" note in
+    // dcsSources.ts. A commit hidden between them is exactly the human commit
+    // whose absence would unblock an overwrite.
+    {
+      const at = (iso, sha, message, email) => ({
+        sha,
+        commit: { message, author: { email, name: "x", date: iso } },
+      });
+      const W = Math.floor(Date.parse("2026-08-10T00:00:00Z") / 1000);
+
+      // The whole point: a human commit that sits BELOW source_sha but ABOVE the
+      // watermark is inside the range and must be walked to.
+      {
+        globalThis.fetch = async () =>
+          commitsRes(
+            [
+              at("2026-08-12T00:00:00Z", "s1", "bible-editor: AMO tq → master (#1)", "b@x"),
+              at("2026-08-11T00:00:00Z", "s2", "a maintainer's hand fix", "rich@x"),
+              at("2026-08-09T00:00:00Z", "s3", "older than the watermark", "rich@x"),
+            ],
+            { pageCount: 1 },
+          );
+        const r = await listMasterCommitsSince({}, "en_tq", "tq_AMO.tsv", "s1", { sinceTime: W });
+        assert(r.incomplete === false, "a time-bounded walk completes at the first commit older than the watermark");
+        assert(r.commits.length === 2, "  ...collecting every commit at or after it");
+        assert(r.commits[1].sha === "s2", "  ...INCLUDING one below the sha bound, which is the whole point");
+        assert(r.commits.every((c) => c.sha !== "s3"), "  ...and stopping before the one that predates it");
+      }
+
+      // The sha bound must not end a time-bounded walk early — that is the
+      // defect this parameter exists to close.
+      {
+        globalThis.fetch = async () =>
+          commitsRes(
+            [
+              at("2026-08-12T00:00:00Z", "s1", "TQ: AMO 5 [q@api.bp-assistant]", "bot@unfoldingword.org"),
+              at("2026-08-11T00:00:00Z", "s2", "a maintainer's hand fix", "rich@x"),
+              at("2026-08-09T00:00:00Z", "s3", "older", "rich@x"),
+            ],
+            { pageCount: 1 },
+          );
+        const r = await listMasterCommitsSince({}, "en_tq", "tq_AMO.tsv", "s1", { sinceTime: W });
+        assert(r.commits.length === 2, "the sha is not a stopping point once a time bound is given");
+      }
+
+      // Running out of history under a time bound is COMPLETE, not
+      // not-in-history: everything the file has is inside the range.
+      {
+        globalThis.fetch = async () =>
+          commitsRes([at("2026-08-12T00:00:00Z", "s1", "hand fix", "rich@x")], { pageCount: 1 });
+        const r = await listMasterCommitsSince({}, "en_tq", "tq_AMO.tsv", null, { sinceTime: W });
+        assert(r.incomplete === false, "reaching the end of history under a time bound is a complete walk");
+        assert(r.commits.length === 1, "  ...having walked everything the file has");
+      }
+
+      // An unparseable date does not end the walk. "I cannot read this
+      // timestamp" is not evidence of having gone far enough, so it walks on and
+      // reports page_cap rather than a confident short range.
+      {
+        let n = 0;
+        globalThis.fetch = async () => {
+          n++;
+          return commitsRes([at("not a date", `s${n}`, "hand fix", "rich@x")], { hasMore: true });
+        };
+        const r = await listMasterCommitsSince({}, "en_tq", "tq_AMO.tsv", null, { sinceTime: W, pageLimit: 2 });
+        assert(n === 2, "an unreadable commit date does not end a time-bounded walk");
+        assert(r.incomplete === true && r.incompleteReason === "page_cap", "  ...it runs to the page cap and says so");
+      }
     }
   }
 

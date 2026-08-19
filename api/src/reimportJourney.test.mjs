@@ -421,16 +421,29 @@ console.log("\n[AI-vs-human conflict policy at the caller]");
     eq(counts.merge_adopted, 0, "…and never counted as an adoption");
     eq(counts.merge_refused, 0, "…and never as a refusal, which would freeze the export at 5");
     eq(counts.apply_incomplete, false, "…and does NOT withhold the watermark: the export must publish this");
-    eq(row.review_kind, "merge_conflict", "…the row is flagged for review");
+    // A DISTINCT review_kind, not just distinct prose: the cleanup chip titles
+    // itself from this column, and "Merged Door43 edit" over a kept row is the
+    // reverse of what happened.
+    eq(row.review_kind, "merge_kept", "…the row is flagged for review, as a KEPT row");
     eq(
-      row.review_reason.includes("came from Bible Editor or the note-writing pipeline"),
+      row.review_reason.startsWith("Your response was kept over Door43's"),
       true,
-      "…and the reason states the measured cause",
+      "…the reason leads with the outcome (the chip clamps to two lines)",
+    );
+    eq(
+      row.review_reason.includes("no commit from a Door43 editor's own account was found"),
+      true,
+      "…and states the measured cause, not an inferred one",
     );
     eq(
       row.review_reason.includes("was merged over your app-side change"),
       false,
       "…never the opposite claim, that Door43's edit won",
+    );
+    eq(
+      row.review_reason.includes("will be published to Door43"),
+      false,
+      "…and never promises a publish this per-row code cannot schedule",
     );
     eq(row.version, 4, "…the flag write bumps the version once");
 
@@ -471,7 +484,28 @@ console.log("\n[AI-vs-human conflict policy at the caller]");
     eq(counts.merge_kept_ai, 0, "…and never reports a kept AI conflict it did not measure");
   }
 
-  // 5. An INCOMPLETE walk that happened to see no human commit is not the same
+  // 5. A row that ALSO moved reference keeps the reference-move flag. That flag
+  //    is the only thing telling the translator why the whole book+resource has
+  //    stopped exporting, and a kept-conflict message replacing it would both
+  //    destroy that and describe an export that is not going to run.
+  {
+    const { sqlite, env } = freshEnv();
+    const boundary = seedContested(sqlite);
+    const moved = { ...masterRowAt("the AI run's response"), refRaw: "1:9", verse: 9 };
+    const counts = await applyTsvRows(env, BOOK, "tq", [moved], null, {
+      confirmedAt: 200, editId: boundary, lineage: AI_ONLY,
+    });
+    const row = readRow(sqlite);
+    eq(counts.apply_incomplete, true, "a master-side reference move still withholds the watermark");
+    eq(row.review_kind, "ref_moved", "…and the row keeps the reference-move flag, not the kept-conflict one");
+    eq(
+      row.review_reason.includes("kept over Door43's"),
+      false,
+      "…so the hold's explanation is not overwritten by a publish the hold prevents",
+    );
+  }
+
+  // 6. An INCOMPLETE walk that happened to see no human commit is not the same
   //    claim as a complete one that found none — and only the complete one may
   //    flip the outcome.
   {

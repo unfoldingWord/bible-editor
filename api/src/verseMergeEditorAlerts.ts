@@ -183,11 +183,24 @@ export function buildMergeConflictGuidance(
         `on \\zaln-s) could not be placed unambiguously — the same source word repeats in the verse — so Door43's ` +
         `change has NOT been taken, and tonight's export will write over it until someone resolves it by hand.`
       : "",
+    // Bounded to what was measured, and to what will actually happen — see the
+    // matching note over the TSV reason in bookReimport.ts for each clause:
+    // "the unfoldingWord bot account" (not "the note pipeline" — the rule is an
+    // author email, and that account also pushes scripture and pushes on a
+    // human's behalf); "no commit from a Door43 editor's own account" (not "no
+    // maintainer edit" — a maintainer may have directed it); "the next export
+    // that runs for this resource" (not "tonight's export" — the watermark is
+    // withheld for the whole book+resource by a systemic refusal, a lock, or a
+    // recording failure, any of which can be described in this same banner);
+    // "since the last confirmed publish" (not "since the last sync" — the walk
+    // starts at master_confirmed_at). Past tense on the measurement because
+    // these rows survive across runs until a human resolves them.
     keptAiMaster > 0
-      ? `${keptAiMaster} kept the editor's version even though Door43 changed too, because every Door43 commit to ` +
-        `this file since the last sync came from Bible Editor or the note-writing pipeline — no maintainer edit ` +
-        `was found. Tonight's export publishes the editor's version to Door43, so check these are the versions ` +
-        `you want on Door43.`
+      ? `${keptAiMaster} kept the editor's version even though Door43 changed too: when these were checked, ` +
+        `every Door43 commit to this file since the last confirmed publish came from Bible Editor's own export ` +
+        `or the unfoldingWord bot account — no commit from a Door43 editor's own account was found. Nothing of ` +
+        `Door43's was taken, so the next export that runs for this resource writes the editor's version over ` +
+        `Door43's. If Door43's version is the one you want, put it in the app before then.`
       : "",
     opts.recordingFailed
       ? "NOTE: at least one merge-conflict recording failed to write to verse_merge_conflicts this run " +

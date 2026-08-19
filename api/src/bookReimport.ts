@@ -88,7 +88,7 @@ import {
   type TsvRefSide,
   type TsvEditLogEntry,
 } from "./tsvMerge.ts";
-import { shouldRecordResourceSync, isSystemicMergeRefusal } from "./reimportSyncGate";
+import { shouldRecordResourceSync, isSystemicMergeRefusal, isKeptOverDoor43AtScale } from "./reimportSyncGate";
 import { computeTwlSortOrderUpdates } from "./twlCanonicalOrder";
 import { applyTwlSortOrderUpdates } from "./twlSortOrderApply";
 import { loadTwTitles } from "./twTitles";
@@ -268,12 +268,19 @@ export interface ReimportCounts {
   // Row or verse where both sides moved since the ancestor but the commit
   // lineage found NO human commit on master's side, so D1 won and the
   // collision was flagged instead (#540 item 2, verseMerge/tsvMerge's
-  // "keep_ai_master"). A subset of merge_conflicts, tracked separately for two
-  // reasons: it is the counter that says whether the AI-vs-human policy is
-  // actually firing in production, and it must never be folded into
-  // merge_refused, which freezes the resource's export at 5 (see
-  // isSystemicMergeRefusal — freezing here would strand the very edit this
-  // outcome protected). verses AND tsv.
+  // "keep_ai_master"). Tracked separately for two reasons: it is the counter
+  // that says whether the AI-vs-human policy is actually firing in production,
+  // and it must never be folded into merge_refused, which freezes the resource's
+  // export at 5 (see isSystemicMergeRefusal — freezing here would strand the very
+  // edit this outcome protected). verses AND tsv.
+  //
+  // Relationship to merge_conflicts differs by side, so do not describe it as a
+  // plain subset: for VERSES it is one, but on the TSV side merge_conflicts is
+  // incremented only for a write that also adopted a field, and a kept-only row
+  // adopts nothing. It also counts DECISIONS, incremented before the write — a
+  // row that then loses the version-CAS race, or whose flag text is unchanged
+  // from last night and so writes nothing, is counted here and skipped_edited
+  // too.
   merge_kept_ai: number;
   // Verse where computeVerseMerge returned "keep_no_base" — no ancestor was
   // recoverable for this specific verse (edit_log aged past the 180-day
@@ -759,18 +766,20 @@ async function runReimport(
   const fetchedRaw: Record<Resource, string | null> = {
     ult: ultRaw, ust: ustRaw, tn: tnRaw, tq: tqRaw, twl: twlRaw,
   };
-  // Who moved master, per resource, for the merges below (#540 item 1). Filled
-  // in the same loop that already reads this pair's sync state, so no extra D1
-  // read; a resource recognized as our own publish never gets one, because
-  // recognition means master did not move under us at all.
-  const lineageByResource: Partial<Record<Resource, MasterLineageSummary | null>> = {};
+  // Which resources still need a "who moved master" walk (#540 item 1). Recorded
+  // here rather than fetched here: the walk is bounded by this pair's
+  // `master_confirmed_at`, which is read below — and it must be read AFTER the
+  // own-publish stamp lands, or the walk would start from a watermark this run
+  // has already superseded. A resource recognized as our own publish is skipped
+  // entirely: recognition means master did not move under us at all.
+  const needsLineage = new Set<Resource>();
   for (const resource of ALL_RESOURCES) {
     const raw = fetchedRaw[resource];
     if (!want.has(resource) || raw == null) continue;
     const state = await resourceSyncState(env, book, resource);
     const own = await recognizePushedRender(env, book, resource, raw, state);
     if (!own.recognized) {
-      lineageByResource[resource] = await loadMasterLineage(env, book, resource, state.sourceSha);
+      needsLineage.add(resource);
       continue;
     }
     const stamped = await markOwnPublishConverged(env, book, resource, own.readAt, state.pushedEditId, null);
@@ -789,16 +798,22 @@ async function runReimport(
   // getMasterConfirmedAt. 2 reads total for this run (ult + ust), down from
   // one per chapter.
   // Carries this run's lineage alongside the cutoff — one object per pair, so a
-  // merge call site cannot receive an ancestor without the attribution that
-  // goes with it.
-  const withLineage = (cutoff: MergeCutoff | null, resource: Resource): MergeCutoff | null =>
-    cutoff == null ? null : { ...cutoff, lineage: lineageByResource[resource] ?? null };
+  // merge call site cannot receive an ancestor without the attribution that goes
+  // with it, and so the walk is bounded by the very watermark the ancestor is
+  // reconstructed from (see loadMasterLineage).
+  const withLineage = async (cutoff: MergeCutoff | null, resource: Resource): Promise<MergeCutoff | null> => {
+    if (cutoff == null) return null;
+    const lineage = needsLineage.has(resource)
+      ? await loadMasterLineage(env, book, resource, cutoff.confirmedAt)
+      : null;
+    return { ...cutoff, lineage };
+  };
 
-  const masterConfirmedAtUlt = withLineage(
+  const masterConfirmedAtUlt = await withLineage(
     want.has("ult") && ultRaw ? await getMasterConfirmedAt(env, book, "ult") : null,
     "ult",
   );
-  const masterConfirmedAtUst = withLineage(
+  const masterConfirmedAtUst = await withLineage(
     want.has("ust") && ustRaw ? await getMasterConfirmedAt(env, book, "ust") : null,
     "ust",
   );
@@ -806,15 +821,15 @@ async function runReimport(
   // three-way merge for edited tn/tq/twl rows reads this in applyTsvRows). NULL
   // means this (book, resource) has never been positively confirmed on master,
   // so the merge stays inert and edited rows behave exactly as before.
-  const masterConfirmedAtTn = withLineage(
+  const masterConfirmedAtTn = await withLineage(
     want.has("tn") && tnRaw ? await getMasterConfirmedAt(env, book, "tn") : null,
     "tn",
   );
-  const masterConfirmedAtTq = withLineage(
+  const masterConfirmedAtTq = await withLineage(
     want.has("tq") && tqRaw ? await getMasterConfirmedAt(env, book, "tq") : null,
     "tq",
   );
-  const masterConfirmedAtTwl = withLineage(
+  const masterConfirmedAtTwl = await withLineage(
     want.has("twl") && twlRaw ? await getMasterConfirmedAt(env, book, "twl") : null,
     "twl",
   );
@@ -1150,6 +1165,10 @@ export async function applyTsvRows(
     // The ancestor-free field merge (tags / whitespace note) contributed fields
     // to this write — tallied as merged_fields INDEPENDENTLY of adopted.
     heuristic: boolean;
+    // A contested field on this row was kept from D1 because no human commit
+    // was behind master's side (#540 item 2). Carried only so the adoption log
+    // line can say a mixed row is mixed.
+    keptAiConflict?: boolean;
   }> = [];
   // Ids this pass has already INSERTED. `existing` is read once, before the
   // loop, and is never updated afterwards — so if master's own file carries the
@@ -1598,21 +1617,54 @@ export async function applyTsvRows(
       // guarded against re-writing an identical message — a flag-only write still
       // bumps the row's version, and this condition recurs every night until a
       // human resolves it (#539).
-      if (conflict) {
+      //
+      // A row the reference-move branch just flagged and HELD keeps that flag:
+      // the hold's message is the only thing telling the translator why this
+      // whole book+resource has stopped exporting, and a kept-conflict message
+      // that replaced it would both destroy that and describe an export that is
+      // not going to run. Scoped to the kept case deliberately — a master-wins
+      // adopt_conflict still overwrites the ref_moved flag exactly as before,
+      // because it also overwrote content and that is the more urgent story.
+      const heldByRefMove = keptAiConflict && fields.review_kind === "ref_moved";
+      if (conflict && !heldByRefMove) {
         const labels = conflictFields.map((f) => TSV_FIELD_LABELS[f] ?? f);
+        // Every clause here is bounded by what was actually measured, because
+        // the cheap version of each is a claim this system cannot support:
+        //  - "the note-writing pipeline" would be wrong — the `ai` rule matches
+        //    the unfoldingWord bot ACCOUNT, which also pushes ULT/UST scripture
+        //    and pushes on a named human's behalf (`ULT: EZK 38 [pjoakes]`).
+        //  - "no Door43 editor edited this" would be wrong for the same shape: a
+        //    maintainer may well have directed the change. What was measured is
+        //    narrower — no commit came from a Door43 editor's own account.
+        //  - "will be published" would be a promise this per-row code cannot
+        //    keep. The export is withheld for the WHOLE book+resource by any
+        //    held reference move, a lock, or a recording failure elsewhere in
+        //    the same file, so "the next export that runs for this file" is the
+        //    honest form.
+        //  - "since the last sync" would be the wrong boundary: the walk starts
+        //    at master_confirmed_at, the last publish positively confirmed on
+        //    master, which can be several syncs back.
+        // Outcome first, evidence second: the cleanup chip clamps this to two
+        // lines (BookLintIndicator), so a reader who sees only the opening must
+        // still learn which way it went and what to do about it.
+        const kindLabel = kind.toUpperCase();
         const reason = keptAiConflict
-          ? // MEASURED, not assumed: the lineage walk completed and found no
-            // human commit on master's file since the ancestor. It may not say
-            // "a Door43 editor", because none was seen (the standing
-            // alert-wording rule) — and the row is NOT held, so the next export
-            // publishes this value to Door43.
-            `This row changed here and on Door43 since the last sync, and every Door43 commit to this file ` +
-            `since then came from Bible Editor or the note-writing pipeline — so your ${labels.join(" and ")} ` +
-            `was kept and will be published to Door43. Please double-check it.`
+          ? `Your ${labels.join(" and ")} was kept over Door43's, and the next export that runs for this ` +
+            `file writes it to Door43. If Door43's version is the one you want, put it in here first. ` +
+            `Why: both sides changed this row since the last confirmed publish, and every Door43 commit to ` +
+            `this book's ${kindLabel} file since then came from Bible Editor's own export or the ` +
+            `unfoldingWord bot account — no commit from a Door43 editor's own account was found.` +
+            // A row can keep one contested field AND take another master moved
+            // on its own. Saying only the first would misdescribe the row.
+            (adopted ? ` Door43's changes to this row's other fields were taken.` : "")
           : `A Door43 edit to this row's ${labels.join(" and ")} was merged over your app-side change. ` +
             `Please double-check it.`;
-        if (cur.review_kind !== "merge_conflict" || cur.review_reason !== reason) {
-          fields.review_kind = "merge_conflict";
+        // Distinct review_kind, not just distinct prose: the cleanup chip titles
+        // itself from this column, and "Merged Door43 edit" over a row whose
+        // edit was KEPT is the reverse of what happened (see reviewFlagTitle).
+        const reviewKind = keptAiConflict ? "merge_kept" : "merge_conflict";
+        if (cur.review_kind !== reviewKind || cur.review_reason !== reason) {
+          fields.review_kind = reviewKind;
           fields.review_reason = reason;
         }
       }
@@ -1630,6 +1682,7 @@ export async function applyTsvRows(
         conflict,
         adopted,
         heuristic,
+        keptAiConflict,
       });
     }
   }
@@ -1745,8 +1798,13 @@ export async function applyTsvRows(
           if (u.adopted) {
             counts.merge_adopted++;
             if (u.conflict) counts.merge_conflicts++;
+            // `keptConflict` distinguishes the mixed row: master's value landed
+            // for a field we never touched, while a CONTESTED field on the same
+            // row was kept from D1 (#540 item 2). Without it this line reads as
+            // "master's correction won" for a row where it half did.
             console.warn("reimport: adopted master's out-of-band TSV correction over D1 (tsvMerge)", {
               book, kind, id: u.id, chapter: u.chapter, verse: u.verse, conflict: u.conflict,
+              keptConflict: u.keptAiConflict === true,
             });
           }
           // merged_fields is INDEPENDENT of merge_adopted: a row can both adopt a
@@ -2326,25 +2384,37 @@ async function getMasterConfirmedAt(env: Env, book: string, resource: string): P
   }
 }
 
-// Who moved master's file for this (book, resource) since the ancestor commit
-// we last confirmed (#540 item 1). One Gitea call per page, default budget 5
-// pages (~250 commits) — and only ever called where master's sha has ALREADY
-// been observed to move, which is the same condition that gates the file fetch
-// itself, so a quiet resource costs nothing.
+// Who moved master's file for this (book, resource) since the merge's ancestor
+// (#540 item 1). One Gitea call per page, default budget 5 pages (~250 commits)
+// — and only ever called where master's sha has ALREADY been observed to move,
+// which is the same condition that gates the file fetch itself, so a quiet
+// resource costs nothing.
 //
-// Returns null only when there is nothing to ask about (no resource file, or no
-// ancestor sha recorded). Every other failure comes back as a summary flagged
-// `incomplete`, which masterMayHoldHumanEdit treats exactly like a found human
-// commit — a fetch that fell over must never read as "no human touched this".
+// BOUNDED BY `master_confirmed_at`, NOT BY `source_sha`. Those are different
+// points in master's history and they drift apart by design: recordResourceSync
+// advances source_sha at the end of any successful reimport, while
+// master_confirmed_at moves only on a positive measurement that master holds our
+// render — so source_sha is routinely NEWER. A sha-bounded walk skips every
+// commit between the two, and a human commit hiding in that gap, reported as "no
+// human found", is the one answer that unblocks an overwrite. The bound has to be
+// the same point the merge attributes CONTENT against, which is the watermark.
+// (See dcsSources.ts's "WHICH BOUNDARY" note. The first version of this wiring
+// passed source_sha and was wrong for exactly this reason.)
+//
+// Returns null when there is nothing to ask about: no resource file, or no
+// watermark — and with no watermark both merges are inert anyway, so there is no
+// decision for a lineage to inform. Every other failure comes back as a summary
+// flagged `incomplete`, which masterMayHoldHumanEdit treats exactly like a found
+// human commit: a fetch that fell over must never read as "no human touched this".
 async function loadMasterLineage(
   env: Env,
   book: string,
   resource: Resource,
-  sinceSha: string | null,
+  confirmedAt: number | null,
 ): Promise<MasterLineageSummary | null> {
   const file = dcsResourceFile(book, resource);
-  if (!file || !sinceSha) return null;
-  const page = await listMasterCommitsSince(env, file.repo, file.path, sinceSha);
+  if (!file || confirmedAt == null) return null;
+  const page = await listMasterCommitsSince(env, file.repo, file.path, null, { sinceTime: confirmedAt });
   const lineage = summarizeLineage(page.commits.map(classifyMasterCommit), {
     incomplete: page.incomplete,
     incompleteReason: page.incompleteReason,
@@ -2356,7 +2426,7 @@ async function loadMasterLineage(
   console.log("reimport master lineage", {
     book,
     resource,
-    sinceSha,
+    confirmedAt,
     mayHoldHumanEdit: summary.mayHoldHumanEdit,
     ...summary.counts,
     incomplete: summary.incomplete,
@@ -3835,6 +3905,52 @@ async function noteOwnPublishDecline(
 // re-anchoring the Reference of a row we had deleted) — the reference test
 // cannot separate those, and asserting either would repeat the mistake this
 // repo has a standing lesson about.
+// #540 item 2's scale alarm. A handful of kept-over-Door43 rows is the policy
+// working; a book-full of them has the shape of every incident this area exists
+// to prevent — and unlike a refusal, this outcome PUBLISHES over Door43 rather
+// than holding. See isKeptOverDoor43AtScale for why it alerts instead of
+// freezing.
+//
+// Claims only the measurement: how many rows, in which (book, resource), and
+// what the walk actually found. It does not say whether a human edited Door43 —
+// the walk sees commits, not intent.
+async function raiseKeptOverDoor43Alert(
+  env: Env,
+  book: string,
+  resource: Resource,
+  kept: number,
+): Promise<void> {
+  const source = `reimport_kept_over_door43:${book}:${resource}`;
+  const res = resource.toUpperCase();
+  const message =
+    `Benjamin — tonight's Door43 sync kept the app's version over Door43's on ${kept} ${book} ${res} ` +
+    `row(s)/verse(s). For each one, both sides had changed since the last confirmed publish AND every ` +
+    `Door43 commit to that file since then came from Bible Editor's own export or the unfoldingWord bot ` +
+    `account — no commit from a Door43 editor's own account was found. That is the intended policy ` +
+    `(AI-written content on Door43 does not overwrite a later app edit), but at this many rows it is ` +
+    `worth a look before the next export writes them to Door43: the same count would appear if the commit ` +
+    `classification were wrong — a second bot identity, or a rewritten history on Door43. Each affected ` +
+    `row is flagged in the app for review, and the verses are in ${book}'s merge-review banner.`;
+  try {
+    await env.DB.prepare(`DELETE FROM system_alerts WHERE username = ?1 AND source = ?2 AND dismissed_at IS NULL`)
+      .bind(OWN_PUBLISH_ALERT_USERNAME, source)
+      .run();
+    await env.DB.prepare(
+      `INSERT INTO system_alerts (username, severity, source, message, link_url) VALUES (?1, ?2, ?3, ?4, ?5)`,
+    )
+      .bind(OWN_PUBLISH_ALERT_USERNAME, "warning", source, message, null)
+      .run();
+  } catch (e) {
+    // Best-effort, like every other alert helper here: a failed banner must
+    // never fail the reimport, and this one gates nothing.
+    console.error("reimport kept-over-Door43 alert failed", {
+      book,
+      resource,
+      error: e instanceof Error ? e.message : String(e),
+    });
+  }
+}
+
 async function raiseTombstoneBlockAlert(
   env: Env,
   book: string,
@@ -4410,9 +4526,17 @@ async function planAndStageBookResources(
     }
     // Master's file moved, and it was not our own render coming back — so
     // SOMEONE moved it, and both merges are about to need to know who (#540
-    // item 1). This is the one point in the nightly path with the ancestor sha
-    // and the file's repo/path both in hand, and it runs once per staged pair.
-    const lineage = await loadMasterLineage(env, book, resource, sync.sourceSha);
+    // item 1). This is the one point in the nightly path that talks to DCS per
+    // pair, so the walk happens here, once, and rides the plan into every chunk
+    // step. The extra D1 read buys the correct boundary: the walk must start
+    // where the merge's ancestor sits (`master_confirmed_at`), not at
+    // `sync.sourceSha`, which this very function is about to move past it.
+    const lineage = await loadMasterLineage(
+      env,
+      book,
+      resource,
+      (await getMasterConfirmedAt(env, book, resource)).confirmedAt,
+    );
     const r2Key = `reimport-stage/${instanceId}/${book}/${resource}`;
     await env.BLOBS.put(r2Key, raw);
     entries.push({ resource, changed: true, masterSha, r2Key, lineage });
@@ -4749,6 +4873,13 @@ export async function runChunkedReimport(
         undefined,
         refusalOverride,
       );
+      // #540 item 2's scale alarm, raised OUTSIDE the withhold branch below and
+      // gating nothing: keeping the app's version at scale does not make the
+      // resource unsafe to export — it makes it worth a human's eye BEFORE the
+      // export publishes those rows to Door43. See isKeptOverDoor43AtScale.
+      if (isKeptOverDoor43AtScale(perResource[e.resource].merge_kept_ai ?? 0)) {
+        await raiseKeptOverDoor43Alert(env, book, e.resource, perResource[e.resource].merge_kept_ai ?? 0);
+      }
       // FIX 1: withhold the watermark when this run's merge-conflict
       // recording failed for this resource (applyVerseRows step 6b —
       // recordVerseMergeConflicts returned false, so the whole adoption

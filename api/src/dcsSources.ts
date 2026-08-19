@@ -193,10 +193,24 @@ export async function fileCommitSha(env: Env, repo: string, path: string): Promi
 // to say who wrote it. See masterLineage.ts for the classification and for the
 // production message/author shapes it was verified against.
 //
-// PAGING, AND WHAT THE SERVER ACTUALLY DOES. Gitea has no "since this sha"
-// filter on this endpoint, so the range is walked newest-first until `sinceSha`
-// appears. Measured against git.door43.org on 2026-08-19, because the obvious
-// implementation is wrong in a way no unit test can see:
+// WHICH BOUNDARY, AND WHY IT IS NOT `source_sha`. The caller's real question is
+// "what happened to master since the ancestor the merge attributes against",
+// and that ancestor is `master_confirmed_at` — the moment master was POSITIVELY
+// measured to hold one of our renders. `source_sha` is a different point:
+// recordResourceSync advances it at the end of any successful reimport, while
+// master_confirmed_at moves only on that positive measurement, so source_sha is
+// routinely NEWER. Walking back only to source_sha therefore skips any commit
+// between the two — including a human one, which is the single answer that
+// unblocks an overwrite. So `sinceTime` (a unix-seconds watermark) is the bound
+// the sync passes, and `sinceSha` is kept for callers that genuinely mean "since
+// this exact commit". The asymmetry to hold on to: walking too FAR back is
+// harmless (an extra commit can only add a protective `human`), stopping too
+// early is the failure.
+//
+// PAGING, AND WHAT THE SERVER ACTUALLY DOES. Gitea has no "since this sha" or
+// "since this date" filter on this endpoint, so the range is walked newest-first
+// until the boundary appears. Measured against git.door43.org on 2026-08-19,
+// because the obvious implementation is wrong in a way no unit test can see:
 //
 //   - **`limit` is IGNORED.** `?limit=2` on a 15-commit file returns all 15;
 //     `?limit=100` on a 143-commit file returns 50. The page size is fixed at 50
@@ -236,12 +250,18 @@ export async function listMasterCommitsSince(
   repo: string,
   path: string,
   sinceSha: string | null,
-  opts: { pageLimit?: number } = {},
+  opts: { pageLimit?: number; sinceTime?: number | null } = {},
 ): Promise<MasterCommitPage> {
   const pageLimit = opts.pageLimit ?? 5;
-  // No ancestor sha means no lower bound to walk to. Returning the newest N
+  // The watermark bound, in unix seconds. When present it REPLACES the sha as
+  // the boundary (see "WHICH BOUNDARY" above): a sha bound can sit newer than the
+  // ancestor and cut the range short, and the range is what has to be right.
+  const sinceTime = opts.sinceTime ?? null;
+  // No boundary at all means no lower bound to walk to. Returning the newest N
   // commits would silently answer a different question than the caller asked.
-  if (!sinceSha) return { commits: [], incomplete: true, incompleteReason: "no_source_sha" };
+  if (!sinceSha && sinceTime == null) {
+    return { commits: [], incomplete: true, incompleteReason: "no_source_sha" };
+  }
 
   const base = (env.DCS_BASE_URL ?? "https://git.door43.org").replace(/\/$/, "");
   const headers: Record<string, string> = { Accept: "application/json" };
@@ -282,10 +302,21 @@ export async function listMasterCommitsSince(
       // A commit with no sha can't be compared against the boundary, so it
       // cannot be proven to be inside the range — stop rather than guess.
       if (!sha) return { commits: out, incomplete: true, incompleteReason: "commit_without_sha" };
-      // EXCLUSIVE: sinceSha is the ancestor itself, already accounted for.
-      if (sha === sinceSha) return { commits: out, incomplete: false, incompleteReason: "" };
       const commit = (raw.commit ?? {}) as Record<string, unknown>;
       const author = (commit.author ?? {}) as Record<string, unknown>;
+      if (sinceTime == null) {
+        // EXCLUSIVE: sinceSha is the ancestor itself, already accounted for.
+        if (sha === sinceSha) return { commits: out, incomplete: false, incompleteReason: "" };
+      } else {
+        // The first commit STRICTLY older than the watermark is the far side of
+        // the range; everything above it is in. A date we cannot parse does not
+        // end the walk — an unreadable timestamp is not evidence that we have
+        // gone far enough, and walking on costs at most one more page.
+        const at = typeof author.date === "string" ? Date.parse(author.date) : NaN;
+        if (Number.isFinite(at) && Math.floor(at / 1000) < sinceTime) {
+          return { commits: out, incomplete: false, incompleteReason: "" };
+        }
+      }
       out.push({
         sha,
         message: typeof commit.message === "string" ? commit.message : null,
@@ -295,11 +326,16 @@ export async function listMasterCommitsSince(
       });
     }
 
-    // Reaching the end of the file's history without ever seeing sinceSha means
-    // the ancestor is not an ancestor of master any more — a force-push, a
-    // rewritten history, or a stale sha. That is not "no human edits"; it is
-    // "this range is not walkable".
     if (lastPage) {
+      // Under a TIME bound, reaching the end of the file's history means every
+      // commit it has is inside the range — nothing is missing, so the walk is
+      // complete. (The file being younger than the watermark is odd but real:
+      // a delete-and-recreate on Door43.)
+      if (sinceTime != null) return { commits: out, incomplete: false, incompleteReason: "" };
+      // Under a SHA bound, reaching the end without ever seeing sinceSha means
+      // the ancestor is not an ancestor of master any more — a force-push, a
+      // rewritten history, or a stale sha. That is not "no human edits"; it is
+      // "this range is not walkable".
       return { commits: out, incomplete: true, incompleteReason: "source_sha_not_in_history" };
     }
   }

@@ -63,10 +63,11 @@ export const RESOLVE_VERSE_MERGE_CONFLICT_SQL = `UPDATE verse_merge_conflicts
 //                              export-reverts-until-resolved shape as a refusal.
 //   'keep_ai_master'         — kept D1 (nothing overwritten): both sides moved,
 //                              but every commit that moved master's file since
-//                              the ancestor was our own export or the note
-//                              pipeline, so the app edit won (#540 item 2).
-//                              Unlike the two above, tonight's export PUBLISHES
-//                              D1 here — that is the point — so what a human is
+//                              the ancestor came from our own export or the
+//                              unfoldingWord bot account, so the app edit won
+//                              (#540 item 2). Unlike the two above, the export —
+//                              when it next runs for this resource — PUBLISHES
+//                              D1 here, which is the point, so what a human is
 //                              asked to check is the kept value, not a revert
 //                              waiting to happen.
 // A clean 'adopt' (master moved, we didn't) is deliberately EXCLUDED — it needs
@@ -146,13 +147,22 @@ export const UPSERT_VERSE_MERGE_CONFLICT_SQL = `INSERT INTO verse_merge_conflict
      -- A row needing human judgement must never be DOWNGRADED by a later
      -- routine adoption — see recordVerseMergeConflicts's own doc comment for
      -- the full Night-1/Night-2 walkthrough this anti-downgrade protects.
+     -- 'keep_ai_master' is deliberately NOT in this carve-out, unlike
+     -- 'adopt_conflict'. The two need opposite treatment: an adopt_conflict
+     -- leaves a human something to RECOVER, which a later routine adoption must
+     -- not hide, whereas a keep_ai_master overwrote nothing, and a later clean
+     -- 'adopt' means master's value was taken after all — the disagreement is
+     -- over. Keeping it sticky would leave the banner asserting "the editor's
+     -- version was kept and the export will publish it" about a verse that has
+     -- since adopted master's. Nothing else un-sticks it: CONFIRM_ADOPTED_
+     -- CONFLICT_SQL below matches only ('adopt','adopt_conflict').
      action = CASE
-       WHEN excluded.action = 'adopt' AND verse_merge_conflicts.action IN ('adopt_conflict', 'keep_ai_master')
+       WHEN excluded.action = 'adopt' AND verse_merge_conflicts.action = 'adopt_conflict'
        THEN verse_merge_conflicts.action
        ELSE excluded.action
      END,
      reason = CASE
-       WHEN excluded.action = 'adopt' AND verse_merge_conflicts.action IN ('adopt_conflict', 'keep_ai_master')
+       WHEN excluded.action = 'adopt' AND verse_merge_conflicts.action = 'adopt_conflict'
        THEN verse_merge_conflicts.reason
        ELSE excluded.reason
      END,

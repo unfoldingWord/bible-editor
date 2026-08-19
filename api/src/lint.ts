@@ -110,6 +110,30 @@ function altLabelProblems(note: string): string[] {
   return out;
 }
 
+// The cleanup chip's title for a workflow review flag. It has to be derived from
+// `review_kind`, because the outcomes it covers say OPPOSITE things and the chip
+// title is the first — often the only — line a translator reads:
+//   merge_conflict — Door43's value replaced theirs.
+//   merge_kept     — theirs was kept over Door43's, and the next export
+//                    publishes it there (#540 item 2).
+//   ref_moved      — nothing was merged at all; the two sides disagree about
+//                    where the row belongs.
+// Hard-coding "Merged Door43 edit" for every flag, as tq/twl did, told a reader
+// of the last two the reverse of what happened. `fallback` preserves each kind's
+// pre-existing wording for a flag with no mapping (tn's older "Adapted note").
+export function reviewFlagTitle(reviewKind: string | null | undefined, fallback: string): string {
+  switch (reviewKind) {
+    case "merge_conflict":
+      return "Merged Door43 edit — verify";
+    case "merge_kept":
+      return "Kept over Door43 — verify";
+    case "ref_moved":
+      return "Reference differs from Door43 — verify";
+    default:
+      return fallback;
+  }
+}
+
 export function lintTnRows(rows: TnRow[]): LintIssue[] {
   const issues: LintIssue[] = [];
   for (const r of rows) {
@@ -153,7 +177,7 @@ export function lintTnRows(rows: TnRow[]): LintIssue[] {
     // jump-to-note loads the chapter parsed from this ref).
     if (r.review_kind) {
       issues.push({
-        check: "Adapted note — verify",
+        check: reviewFlagTitle(r.review_kind, "Adapted note — verify"),
         bucket: "flag",
         ref: `${r.chapter}:${r.verse}`,
         rowId: r.id,
@@ -190,7 +214,7 @@ export function lintTqRows(rows: TqRow[]): LintIssue[] {
     // overwritten value is recoverable from row history.
     if (r.review_kind) {
       issues.push({
-        check: "Merged Door43 edit — verify",
+        check: reviewFlagTitle(r.review_kind, "Merged Door43 edit — verify"),
         bucket: "flag",
         ref,
         rowId: r.id,
@@ -218,7 +242,7 @@ export function lintTwlRows(rows: TwlRow[]): LintIssue[] {
     // conflicted with an app-side edit (tsvMerge.ts).
     if (r.review_kind) {
       issues.push({
-        check: "Merged Door43 edit — verify",
+        check: reviewFlagTitle(r.review_kind, "Merged Door43 edit — verify"),
         bucket: "flag",
         ref,
         rowId: r.id,

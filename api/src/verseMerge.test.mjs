@@ -205,6 +205,23 @@ console.log("\n[#540 item 2: an AI-only master movement never beats a later huma
   );
 }
 
+// Step ORDER matters as much as step 6's new branch: the alignment guard sits
+// above it, and it is the guard that refuses to write a verse whose alignment
+// would be damaged. The AI-vs-human policy decides WHO WINS a conflict; it must
+// never decide it early enough to skip that check.
+{
+  const base = text("original master text");
+  const r = computeVerseMerge({
+    base,
+    ours: "{not json",
+    theirs: text("the AI run's text"),
+    humanEditedSinceExport: false,
+    masterMayHoldHumanEdit: false,
+  });
+  eq(r.action, "keep_alignment_refused", "an unparseable side still refuses at step 4, ahead of the AI-vs-human branch");
+  eq(r.reason, "unparseable", "…with the refusal's own reason, not the policy's");
+}
+
 console.log("\n[stableKey: key-order-only differences do not manufacture false diffs]");
 
 // Regression: base and ours can arrive from different writers with different

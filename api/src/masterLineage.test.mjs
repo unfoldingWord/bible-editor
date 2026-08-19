@@ -144,6 +144,11 @@ eq(
   // Workflow step's serialized plan, and an instance that started before this
   // shipped replays a plan entry with no such field at all.
   eq(masterMayHoldHumanEdit(undefined), true, "an absent lineage protects master exactly like a null one");
+  // A malformed object must answer protectively rather than return undefined.
+  // The callers all test `=== false`, so undefined would land on master-wins
+  // today — but that is the callers being careful, not this function being safe.
+  eq(masterMayHoldHumanEdit({}), true, "a malformed lineage object protects master, and returns a real boolean");
+  eq(masterMayHoldHumanEdit({ commits: [] }), true, "…as does one missing both decision fields");
 }
 
 console.log("\n[the compact summary that crosses a Workflow step boundary]");
