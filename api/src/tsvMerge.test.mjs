@@ -46,6 +46,60 @@ function deep(actual, expected, msg) {
   eq(r.action, "keep_converged", "tn \\n-escape vs space -> converged");
 }
 
+// 2b. Export-normalization-only differences are not a move. Master is always
+// normalizeNoteText(some past D1 value) while the ancestor is folded from raw
+// edit_log payloads, so a straight apostrophe in the ancestor vs the curly one
+// the export educated must NOT read as "Door43 changed it" — that phantom made
+// every later app edit a both-changed conflict that master won, reverting the
+// AMO 3:10 note nightly (2026-08-18/19).
+{
+  // dsj8 regression: ancestor straight apostrophe, master curly (educated),
+  // ours a genuine human rewrite -> master unchanged, our edit stands.
+  const r = computeTsvMerge(
+    "tn",
+    { note: "comes with Yahweh's authority" },
+    { note: "a genuine human rewrite" },
+    { note: "comes with Yahweh’s authority" },
+  );
+  eq(r.action, "keep_master_unchanged", "tn curly-vs-straight apostrophe ancestor -> master unchanged");
+  deep(r.writeFields, {}, "tn apostrophe phantom writes nothing");
+}
+{
+  // educated double quotes
+  const r = computeTsvMerge(
+    "tn",
+    { note: 'he said "go" now' },
+    { note: "our new note" },
+    { note: "he said “go” now" },
+  );
+  eq(r.action, "keep_master_unchanged", "tn educated double quotes -> master unchanged");
+}
+{
+  // Alternate-translation label canonicalization
+  const r = computeTsvMerge(
+    "tn",
+    { note: "Alternative Translation: x" },
+    { note: "our new note" },
+    { note: "Alternate translation: x" },
+  );
+  eq(r.action, "keep_master_unchanged", "tn alt-label canonicalization -> master unchanged");
+}
+{
+  // ours straight vs theirs curly, same text -> converged, no write
+  const r = computeTsvMerge("tn", { note: "x" }, { note: "Yahweh's word" }, { note: "Yahweh’s word" });
+  eq(r.action, "keep_converged", "tn ours-straight vs theirs-curly same text -> converged");
+}
+{
+  // a REAL master edit that merely contains a curly quote still conflicts
+  const r = computeTsvMerge(
+    "tn",
+    { note: "orig" },
+    { note: "our edit" },
+    { note: "master’s real edit" },
+  );
+  eq(r.action, "adopt_conflict", "tn real master edit with curly quote still conflicts");
+}
+
 // 3. No ancestor + a real diff -> keep_no_base (keep D1, surfaced).
 {
   const r = computeTsvMerge("tn", null, { note: "ours" }, { note: "theirs" });

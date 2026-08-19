@@ -39,6 +39,8 @@
 // reconstructs the ancestor is separate (foldTsvBase below is the pure half of
 // it; bookReimport.ts does the batched edit_log read that feeds it).
 
+import { normalizeNoteText } from "./tsvFormat.ts";
+
 export type TsvMergeKind = "tn" | "tq" | "twl";
 
 export type TsvMergeAction =
@@ -151,15 +153,25 @@ export interface TsvMergeResult {
   conflictFields: TsvMergeField[];
 }
 
-// Collapse a TSV text field to its whitespace-insensitive compare form: the
-// literal two-char "\n" escape (an encoded line break) -> space, every
-// whitespace run -> one space, then trim. Two values differing ONLY by this
-// kind of incidental whitespace read as the same to a human, so they must not
-// count as "moved" (bp-assistant is known to double-space notes — see the
-// tn-double-space-whitespace-churn memory). FOR COMPARISON ONLY — the bytes we
-// write are always master's raw value.
+// Collapse a TSV text field to its compare form: first the export's own
+// prose normalization (normalizeNoteText — quote education, Alternate-
+// translation label, literal-\n cleanups), then the literal two-char "\n"
+// escape (an encoded line break) -> space, every whitespace run -> one space,
+// then trim.
+//
+// The export lens is load-bearing: master IS normalizeNoteText(some past D1
+// value), while the ancestor is folded from raw edit_log payloads. Without it,
+// any note containing a straight apostrophe reads as "Door43 changed it"
+// forever — educateQuotes curls it on every export, the ancestor keeps it
+// straight, so ancestor != master by one character and every later app edit
+// becomes a both-changed conflict that master wins (the AMO 3:10 nightly
+// revert, 2026-08-18/19). Whitespace alone had the same shape: bp-assistant is
+// known to double-space notes — see the tn-double-space-whitespace-churn
+// memory. Applying the lens to BOTH sides can only make values compare MORE
+// equal, so it can suppress phantom moves but never manufacture one. FOR
+// COMPARISON ONLY — the bytes we write are always master's raw value.
 function normText(v: string | null | undefined): string {
-  return (v ?? "").replace(/\\n/g, " ").replace(/\s+/g, " ").trim();
+  return (normalizeNoteText(v ?? "") ?? "").replace(/\\n/g, " ").replace(/\s+/g, " ").trim();
 }
 
 // Numeric occurrence compare form. A blank cell (null) and an explicit 0 both
