@@ -110,6 +110,26 @@ Highlights that bite repeatedly:
   **7,689** tn/tq/twl `edit_log` rows with a NULL `book`, and row ids are unique only per `(book, id)`, so another
   book's history can fold into this one's ancestor (#545).
 
+- **`source_sha` and `master_confirmed_at` are two different points in master's history, and they drift apart by
+  design.** `recordResourceSync` advances `source_sha` at the end of any successful reimport; `master_confirmed_at`
+  moves only on a POSITIVE measurement that master holds our render (`markOwnPublishConverged`, or
+  `exportWorkflow`'s `confirmMaster` gate). So `source_sha` is routinely NEWER than the merge's content ancestor.
+  Any question of the form *"what happened to master since the ancestor?"* must therefore be bounded by
+  `master_confirmed_at`, **never** by `source_sha`: a human commit landing between the two is invisible to a
+  sha-bounded walk, and "no human commit found" is the one answer that unblocks an overwrite. The same asymmetry as
+  the fold rule above — walking too FAR back is harmless (an extra commit can only add a protective `human`), while
+  stopping too early is the failure. This bit the first version of the commit-lineage wiring, and both cold
+  reviews found it independently.
+
+- **A merge outcome that reverses who wins needs its own `review_kind`, and its message needs its own first
+  line.** The in-app cleanup chip titles itself from `review_kind` and clamps the message to two lines
+  (`BookLintIndicator`), and the title was hardcoded per kind — so a row whose app-side edit was KEPT displayed
+  "Merged Door43 edit", the reverse of what happened, above a message saying the opposite; a reference move,
+  which merges nothing, said the same. Lead every such message with the outcome and the remedy, because for many
+  readers the clamped opening IS the message. And it may not promise a publish: the export watermark is withheld
+  for the WHOLE book+resource by any held reference move, a lock, or a recording failure elsewhere in the same
+  file, so per-row code can only honestly say "the next export that runs for this file".
+
 - **A master row lost to a tombstoned id is dropped by the reimport's TOMBSTONE branch,
   not by its `ON CONFLICT DO NOTHING` insert.** `applyTsvRows`' `existing` read does not
   filter `deleted_at IS NULL`, so a tombstoned id is always found and never reaches the

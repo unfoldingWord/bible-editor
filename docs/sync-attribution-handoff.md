@@ -17,11 +17,12 @@ says otherwise.
 |---|---|---|
 | #542 | #537 (part) | The nightly banner now NAMES the verses the merge could not adjudicate, and claims only what `base === null` measures. **No merge behavior changed.** |
 | #543 | #540 item 3 | A tn/tq/twl reference difference is attributed from an ancestor instead of blamed on Door43. Only the **pure app-side move** changes behavior (no flag, no hold); every other shape still holds exactly as before. |
+| #548 | #540 items 1 + 2 | **This PR.** The merge now asks WHO moved master — a commit-lineage walk per (book, resource) per run — and resolves a both-changed conflict **D1-wins plus a review flag** (`keep_ai_master`) when no human commit is behind master's side. Master-wins is untouched for a maintainer edit, for an incomplete walk, and for a run that never looked. |
 
-Open, not yet a PR: **`feat/master-commit-lineage`** — #540 item 1's engine
-(`api/src/masterLineage.ts` + `listMasterCommitsSince` in `api/src/dcsSources.ts`).
-It has no consumer. Rebase onto main before continuing; the branch predates
-#542/#543.
+The engine that was sitting unconsumed on `feat/master-commit-lineage`
+(`api/src/masterLineage.ts` + `listMasterCommitsSince` in `api/src/dcsSources.ts`)
+is folded into this PR and has a consumer now; that branch is finished work, not
+pending work.
 
 Filed while doing this work: **#544** (keep_no_base invisible to editors, and
 entirely invisible for tn/tq/twl), **#545** (cross-book ancestor pollution on the
@@ -120,44 +121,61 @@ Two of those deserve attention before the work starts:
 
 ---
 
-## 3. Remaining work, in dependency order
+## 3. The work, in dependency order
 
-### A. #540 items 1 + 2 — make the merge ask who moved master  ← the keystone
+### A. #540 items 1 + 2 — make the merge ask who moved master  ← the keystone — **LANDED IN THIS PR**
 
-Everything else in #540 depends on this, and so does #537's real fix.
+Everything else in #540 depended on this, and so does #537's real fix. What
+shipped, since the shape below is what B, C and D build on:
 
-**Item 1 (finish).** The engine exists on `feat/master-commit-lineage` and is
-tested (49 unit assertions + a live-API check). What is missing is the wiring:
-compute the lineage once per `(book, resource)` before adjudicating — the natural
-place is beside `getMasterConfirmedAt` / `resourceSyncState` in
-`api/src/bookReimport.ts`, which already reads `source_sha` — thread it to the two
-merge call sites, and persist the classification so an alert can cite it. Budget:
-one fetch per pair per run, and only when master's sha moved, which is the same
-condition that already gates the file fetch.
+**Item 1, the wiring.** `loadMasterLineage` (`api/src/bookReimport.ts`) walks the
+file's master commits, classifies each, and compacts the result to a
+`MasterLineageSummary` that rides on `MergeCutoff` into both merge call sites —
+so no call site can receive an ancestor without the attribution that belongs with
+it. It is fetched in `planAndStageBookResources` on the nightly path (the only
+place there that talks to DCS per pair, and it already holds master's sha) and in
+`runReimport`'s own-publish loop on the user path. Cost: one walk per
+(book, resource) per run, only when master's sha moved AND own-publish
+recognition declined — a quiet or self-published resource costs nothing. It rides
+the plan's `step.do` result into every chunk step rather than being re-fetched
+per chunk.
 
-**Item 2 (the policy flip).** Benjamin's ruling: *AI-pipeline-authored master
-content must never beat a later human app edit.*
+**Item 2, the policy.** Benjamin's ruling: *AI-pipeline-authored master content
+must never beat a later human app edit.* Both merges gained a `keep_ai_master`
+outcome: when the lineage holds no human commit, a both-changed conflict resolves
+D1-wins plus a review flag instead of master-wins. Master-wins stays for a
+genuine maintainer edit. This closes the AMO 4:2 shape — Beth's hand fix reverted
+to the text of her own AI run.
 
-- TSV: `attributeField` in `api/src/tsvMerge.ts` returns `"conflict"` when both
-  sides moved, which `computeTsvMerge` turns into `adopt_conflict` — master's raw
-  value goes into `writeFields` and IS written.
-- Verse: `computeVerseMerge` step 6 in `api/src/verseMerge.ts` returns
-  `adopt_conflict` for the same shape.
+Three properties to preserve when touching this:
 
-Change: when the master-side lineage since the ancestor contains **no human
-commit**, a both-changed conflict resolves **D1-wins plus a review flag** instead
-of master-wins. Master-wins stays for genuine maintainer edits. This closes the
-AMO 4:2 shape — Beth's hand fix reverted to the text of her own AI run.
+- **Always `masterMayHoldHumanEdit(lineage)`, never `lineage.hasHumanCommit`.**
+  An **incomplete** walk (fetch failed, page cap, sha not in history) is *not*
+  "no human found", and reading the boolean alone says exactly that. The helper
+  answers `true` for null, for `undefined`, and for incomplete.
+- **The flip rides on an explicit `false` and nothing else.** Omitted, `true`,
+  and `undefined` all keep master-wins, so a caller that forgets to thread the
+  lineage degrades to today's behavior rather than to an overwrite.
+- **`keep_ai_master` must never hold the watermark, and must never join
+  `merge_refused`.** The export is how the protected human edit reaches Door43;
+  withholding it would strand the edit, which is the livelock #543 killed on the
+  TSV side, and `merge_refused` freezes a resource's export at five.
 
-Use `masterMayHoldHumanEdit(lineage)`, never `lineage.hasHumanCommit` directly.
-The helper exists precisely so no call site can reconstruct the fail-safe wrong:
-an **incomplete** walk (fetch failed, page cap, sha not in history) is *not* "no
-human found", and reading the boolean alone says exactly that.
+*Verified:* pure decisions in the three unit suites; both callers end-to-end
+against real SQLite with the production migrations (`reimportJourney`,
+`applyVerseRows`); the four SQL action lists in `verseMergeConflicts`. Every guard
+ablated and the failures counted. Live Door43 walk: `en_ult/26-EZK.usfm` six
+commits back is 3 ours + 3 ai + 0 human (the policy fires there), `en_tq/tq_AMO.tsv`
+finds a real human commit and protects master, and an unknown sha comes back
+`incomplete` / `source_sha_not_in_history`.
 
-*Success check:* a replay of the AMO uadf row against real `edit_log` fixtures
-produces zero human-edit reverts; a quiet book still produces zero adoptions.
+*Not done here:* the classification is threaded through the run and logged, but
+not persisted to a table. #540 item 1 asked for persistence so a later forensic
+question can be answered without re-walking; the alerts this run raises can cite
+it because it is in scope for the run that raises them. Worth a follow-up if
+after-the-fact attribution is ever needed.
 
-### B. #537 — recover the 186 ancestors  (do AFTER A)
+### B. #537 — recover the 186 ancestors  (do AFTER A — A has landed)
 
 Two changes in `applyVerseRows`'s `mergeCols` sub-select
 (`api/src/bookReimport.ts`):
@@ -174,7 +192,10 @@ Two changes in `applyVerseRows`'s `mergeCols` sub-select
 **Why this is sequenced after A:** recovering these ancestors makes the merge start
 *adopting master* on verses where it currently keeps D1 — and all 186 are in
 JER/EZK, which is exactly where bp-assistant pushes land. Without item 2's guard,
-this hands those verses to AI-authored master content.
+this hands those verses to AI-authored master content. **That guard is now in
+place, so this is unblocked** — and the live walk on `en_ult/26-EZK.usfm` shows
+the guard is not theoretical there: six commits back it is 3 ours + 3 ai + 0
+human, so a both-changed conflict in EZK resolves D1-wins today.
 
 Also check whether `restore`, `restore_master_verse` and the `normalize-*` /
 `heal-*` actions should count as ancestors; prod holds 238 `restore_master_verse`,
@@ -243,6 +264,26 @@ Read these before writing code in this area.
 1CH incident. Any new comparison must reach for an ancestor or a lineage signal,
 never a preference.
 
+**There are TWO watermarks and they are not interchangeable.** `source_sha`
+advances at the end of any successful reimport (`recordResourceSync`);
+`master_confirmed_at` advances only on a positive measurement that master holds
+our render (`markOwnPublishConverged`, or `exportWorkflow`'s `confirmMaster`
+gate). So `source_sha` is routinely NEWER than the merge's content ancestor. Any
+question of the form "what happened to master since the ancestor" must be bounded
+by `master_confirmed_at` — a human commit in the gap, reported as "no human
+found", is the one answer that unblocks an overwrite. This is the defect the
+first version of the lineage wiring shipped with; both cold reviews found it
+independently. Same asymmetry as the fold rule below: reading too FAR back is
+harmless (an extra commit can only add a protective `human`), stopping too early
+is the failure.
+
+**A new outcome needs a new `review_kind`, not just new prose.** The cleanup chip
+titles itself from that column, and it was hardcoded per kind — so a row whose
+edit was KEPT displayed "Merged Door43 edit", the reverse of what happened, above
+a message saying the opposite. The chip also clamps the message to two lines, so
+whatever a message leads with is, for many readers, the whole message: lead with
+the outcome and the remedy, not the evidence.
+
 **Absent and wrong are not the same failure.** In every fold here, a *missing*
 component withholds (safe) while a *present but wrong* one can unblock an
 overwrite (unsafe). `Number(null)`, `Number("")`, `Number(false)` and `Number([])`
@@ -287,6 +328,23 @@ None of this has a UI to click; the browser is the wrong tool. What works:
   `npx wrangler d1 execute bible_editor --remote --env production --command "…"`
   from `api/`. Keep queries index-friendly; a self-join over `edit_log` exceeds
   D1's CPU limit.
+- `api/src/applyVerseRows.test.mjs` is the same harness for the VERSE side —
+  real `applyVerseRows`, real migrations, real `verse_merge_conflicts` rows. A
+  merge decision that only has a pure test has not been shown to reach storage.
+- Prod D1 is readable read-only:
+  `npx wrangler d1 execute bible_editor --remote --env production --command "…"`
+  from `api/`. Keep queries index-friendly; a self-join over `edit_log` exceeds
+  D1's CPU limit. Note this needs an authorized wrangler login — it fails with
+  `code: 7403` from a worktree whose CLI is not authenticated, so a claim that
+  rests on a prod count needs the login first, not a guess.
 - The Door43 API is readable unauthenticated for these public repos, which is how
   the commit shapes above were verified. A scratch script that imports the real
-  module and hits the live API caught a bug the whole unit suite missed.
+  module and hits the live API caught a bug the whole unit suite missed. For the
+  lineage specifically: call `listMasterCommitsSince(env, repo, path, null,
+  { sinceTime })` with a watermark N days back and print each commit's `kind`.
+  Measured 2026-08-19 — `en_ult/26-EZK.usfm` over 3 days is 2 ours + 2 ai + 0
+  human, `en_tq/tq_AMO.tsv` over 30 days is 6 ours + 5 ai + 1 human.
+- **Ablate every guard and count the failures.** Two assertions written during
+  this work looked right and were vacuous. Ablation is also what proves a review
+  finding was real: each fix here was re-broken and the failure count recorded in
+  the commit message.
