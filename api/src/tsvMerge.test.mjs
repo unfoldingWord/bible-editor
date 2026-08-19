@@ -90,6 +90,18 @@ function deep(actual, expected, msg) {
   eq(r.action, "keep_converged", "tn ours-straight vs theirs-curly same text -> converged");
 }
 {
+  // tq question + response are export-normalized too — same phantom shape must
+  // resolve the same way (Codex review coverage finding on PR #541).
+  const r = computeTsvMerge(
+    "tq",
+    { question: "What is Yahweh's word?", response: "It is Yahweh's message." },
+    { question: "Beth's new question?", response: "Beth's new answer." },
+    { question: "What is Yahweh’s word?", response: "It is Yahweh’s message." },
+  );
+  eq(r.action, "keep_master_unchanged", "tq curly-vs-straight ancestor (question+response) -> master unchanged");
+  deep(r.writeFields, {}, "tq apostrophe phantom writes nothing");
+}
+{
   // a REAL master edit that merely contains a curly quote still conflicts
   const r = computeTsvMerge(
     "tn",
