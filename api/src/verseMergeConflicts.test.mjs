@@ -63,6 +63,7 @@ import {
   EDITOR_LOOKUP_CHUNK,
   editLogKey,
   groupOverwrittenVersesByEditor,
+  NO_BASE_REF_DISPLAY,
   planSystemAlertWrites,
 } from "./verseMergeEditorAlerts.ts";
 import {
@@ -808,21 +809,40 @@ function confirmAdopted(d, { book, resource, chapter, verse }) {
 
   // The cause claim. Prod on 2026-08-19: edit_log spanned 93 days, so the
   // 180-day sweep had deleted nothing and "aged out" described none of the 190
-  // verses then in this state. The sentence may only say what is measured —
-  // that no ancestor survives from before the watermark.
+  // verses then in this state. The sentence may only say what is measured.
   assert(!/aged out/i.test(g), "…and never claims the history 'aged out' (a cause we did not measure)");
-  assert(g.includes("no ancestor survives"), "…it states only the measured fact");
+  // Nor may the replacement overclaim: `base === null` also covers a payload
+  // that exists but carries no parseable content, where the ancestor DID
+  // survive and merely wasn't recoverable. "recoverable" is the measured word.
+  assert(g.includes("no ancestor was recoverable"), "…it states only the measured fact: not recoverable");
+  assert(!/survives/i.test(g), "…and does not claim the ancestor is gone, only that it could not be recovered");
+  // The lookup is per verse (row_key = book/chapter/verse/RESOURCE), so the
+  // sentence must not read as "this book's history is lost".
+  assert(!/this book's edit history/i.test(g), "…and does not overstate the lookup as book-wide");
+  // Nothing was overwritten in a keep_no_base verse — the reader must not go
+  // hunting version history for a replaced value that does not exist.
+  assert(g.includes("Nothing was overwritten"), "…and says nothing was overwritten yet");
 
   // The ref list is a capped sample; '+N more' counts against what was actually
   // listed, never against the cap, and the authoritative count still leads.
+  const OVER = NO_BASE_REF_DISPLAY + 2;
   const many = buildMergeConflictGuidance([], {
     noBaseCount: 59,
-    noBaseRefs: Array.from({ length: 12 }, (_, i) => `28:${i + 1}`),
+    noBaseRefs: Array.from({ length: OVER }, (_, i) => `28:${i + 1}`),
   });
   assert(many.includes("59 verse(s)"), "count stays authoritative when the ref sample is short");
-  assert(many.includes("28:10"), "…lists up to the display cap");
-  assert(!many.includes("28:11"), "…and no further");
-  assert(many.includes("+49 more"), "…and '+N more' is the count minus what was actually listed");
+  assert(many.includes(`28:${NO_BASE_REF_DISPLAY}`), "…lists up to the display cap");
+  assert(!many.includes(`28:${NO_BASE_REF_DISPLAY + 1}`), "…and no further");
+  assert(many.includes(`+${59 - NO_BASE_REF_DISPLAY} more`), "…and '+N more' is the count minus what was actually listed");
+  // "sample", not a plain list: on a mixed run the listed refs are not
+  // necessarily the first N, so the remainder is not a contiguous tail.
+  assert(many.includes("Verses (sample):"), "…and labels the list as a sample, not an ordered prefix");
+
+  // Never list more refs than the count claims (the helper is exported, so the
+  // invariant is enforced rather than assumed from its only caller).
+  const overListed = buildMergeConflictGuidance([], { noBaseCount: 2, noBaseRefs: ["1:1", "1:2", "1:3", "1:4"] });
+  assert(overListed.includes("1:1, 1:2."), "lists at most `count` refs…");
+  assert(!overListed.includes("1:3"), "…never more than it claims");
 
   // A Workflow chunk memoized before refs were collected contributes a count and
   // no refs. Say nothing about where, rather than guess.

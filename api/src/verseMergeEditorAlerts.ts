@@ -147,9 +147,13 @@ export interface ExistingAlertState {
 //                                 couldn't be placed (repeated source word).
 // Both kept-D1 outcomes carry the same warning: nothing was taken, so tonight's
 // export will still write D1 back over master until a human resolves it.
+
 // Cap on how many no-ancestor refs the sentence lists inline, matching the
 // `+N more` shape raiseVerseMergeConflictAlert already uses for its conflict
-// refs. `noBaseCount` stays authoritative for the number.
+// refs. `noBaseCount` stays authoritative for the number. bookReimport.ts
+// collects exactly this many (NO_BASE_REF_CAP) — collecting more would ride
+// through every Workflow step's serialized return value and then be discarded
+// here, since this sentence is the only consumer.
 export const NO_BASE_REF_DISPLAY = 10;
 
 export function buildMergeConflictGuidance(
@@ -199,22 +203,42 @@ export function buildMergeConflictGuidance(
 //    could not have caused a single one of the 190 verses then in this state.
 //    Every one of them was simply never written to edit_log before its book's
 //    master-confirmed watermark. Aging out remains POSSIBLE once the table is
-//    older than 180 days, which is exactly why this may not name either limb:
-//    what is measured is that no snapshot survives before the watermark, and
-//    that is all this says. (Standing rule — an alert states only what it
-//    measured; see the alert-wording lessons in STATE.md.)
+//    older than 180 days, which is exactly why this may not name either limb.
+//
+//    Nor may it name the *third* limb. What is actually measured is one thing:
+//    computeVerseMerge received `base === null`. That happens when no edit_log
+//    row exists at or before the boundary, AND when a row exists whose payload
+//    carries no `content` or does not parse (verseContentJsonFromPayload —
+//    verseHistory.test.mjs covers both). In those last two the ancestor did
+//    survive; it was simply not RECOVERABLE. So the wording says exactly that,
+//    which is the accurate half of the sentence this replaced. (Standing rule —
+//    an alert states only what it measured; see STATE.md's alert-wording
+//    lessons. That rule applies to the replacement too, which is why the first
+//    draft's "no ancestor survives" did not stand either.)
+//
+// Scope note: the ancestor lookup is PER VERSE (row_key = book/chapter/verse/
+// RESOURCE), so this must not say "this book's edit history" — thousands of
+// other verses in the same book have perfectly good ancestors, and a
+// non-developer could read the book-wide phrasing as "the history is gone".
 export function buildNoBaseSentence(count: number, refs?: string[]): string {
-  const listed = (refs ?? []).slice(0, NO_BASE_REF_DISPLAY);
+  // Never list more refs than the count claims. Unreachable today (refs are
+  // pushed on the same branch that increments the count, and nothing decrements
+  // it), but the invariant is cheap to enforce and the helper is exported.
+  const listed = (refs ?? []).slice(0, Math.min(count, NO_BASE_REF_DISPLAY));
   // `refs` is a capped sample and can be short of `count` — or empty, for a
   // Workflow chunk memoized before it was collected. Only claim "+N more"
   // against what we actually listed, and stay silent rather than guess when the
-  // sample is missing entirely.
+  // sample is missing entirely. "sample" is load-bearing: on a mixed run the
+  // listed refs are not necessarily the first N, so a reader must not take the
+  // unlisted remainder to be a contiguous tail.
   const more = count > listed.length ? `; +${count - listed.length} more` : "";
-  const where = listed.length > 0 ? ` Verses: ${listed.join(", ")}${more}.` : "";
+  const where = listed.length > 0 ? ` Verses (sample): ${listed.join(", ")}${more}.` : "";
   return (
-    `${count} verse(s) could not be adjudicated: no ancestor survives in this book's edit history from before ` +
-    `its last confirmed publish, so the sync cannot tell which side changed and kept the app's version.${where} ` +
-    `A Door43-side change to them will still be overwritten by tonight's export.`
+    `${count} verse(s) could not be adjudicated: no ancestor was recoverable for them from before this ` +
+    `book+resource's master-confirmed watermark, so the sync could not tell which side changed, and so it ` +
+    `kept the app's version.${where} ` +
+    `Nothing was overwritten in these — but a Door43-side change to them will still be overwritten by ` +
+    `tonight's export.`
   );
 }
 

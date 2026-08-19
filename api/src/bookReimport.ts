@@ -78,6 +78,7 @@ import { loadTwTitles } from "./twTitles";
 import { loadTwlOrderLocks } from "./twlOrderLocks";
 import type { TwlRow, VerseRow, CheckLane } from "./types";
 import { computeVerseMerge, type VerseMergeResult } from "./verseMerge.ts";
+import { NO_BASE_REF_DISPLAY } from "./verseMergeEditorAlerts.ts";
 import { verseContentJsonFromPayload } from "./verseHistory.ts";
 import { canonizeAlignmentSource } from "./canonizeHebrew.ts";
 import {
@@ -352,11 +353,14 @@ const REIMPORT_SOURCE = "dcs_reimport";
 // carries the total.
 const BLOCKED_SAMPLE_CAP = 20;
 
-// Cap on ReimportCounts.merge_no_base_refs. Larger than BLOCKED_SAMPLE_CAP
-// because the banner is the ONLY channel that names these verses and a human is
-// meant to review them; still bounded so a book-wide no-ancestor state (EZK/JER
-// today: 34-59 verses per resource) can't bloat a Workflow step's return value.
-const NO_BASE_REF_CAP = 100;
+// Cap on ReimportCounts.merge_no_base_refs. Deliberately EQUAL to the banner's
+// display cap: that sentence is the only consumer (AdminPanel's nonZeroCounts
+// type-filters the array out of the admin result view), so anything collected
+// beyond it would ride through every Workflow step's serialized return value
+// only to be sliced off. A book-wide no-ancestor state is real — EZK/JER carry
+// 34-59 such verses per resource today — so the count, not the list, is what
+// has to survive; it does, independently.
+const NO_BASE_REF_CAP = NO_BASE_REF_DISPLAY;
 
 // Record one dropped row's identification, and log it, both capped. Kept as one
 // helper so the cap can never be applied to the list but forgotten on the log.
