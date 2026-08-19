@@ -59,7 +59,7 @@ function loadEntriesById(ids, boundaryId = null) {
   const boundaryBind = boundaryId != null ? boundaryId : CUTOFF;
   const rows = db
     .prepare(
-      `SELECT row_key, action, payload_json FROM edit_log
+      `SELECT row_key, action, payload_json, book FROM edit_log
         WHERE kind = ? AND (book = ? OR book IS NULL)
           AND action IN ('create', 'update', 'restore')
           AND ${boundaryClause}
@@ -79,7 +79,14 @@ function loadEntriesById(ids, boundaryId = null) {
       }
     }
     const list = byId.get(r.row_key) ?? [];
-    list.push({ action: r.action, payload });
+    // `book` and the bookKnown mapping are part of the production shape, not
+    // decoration: the WHERE deliberately admits `book IS NULL` rows, and
+    // foldTsvRefBase refuses them. Dropping `book` from this SELECT would make
+    // `r.book` undefined, so `bookKnown` would be false for EVERY entry, every
+    // reference ancestor would be null, and every move would become
+    // `unattributable` — re-holding every book. That is one keystroke away and
+    // would pass a copy of this query that did not carry the column.
+    list.push({ action: r.action, payload, bookKnown: r.book != null });
     byId.set(r.row_key, list);
   }
   return byId;
@@ -221,6 +228,42 @@ eq(merge.writeFields, { note: "n_master" }, "merge writes only master's note; ou
     "unattributable", "no watermark -> no ancestor -> unattributable, never a guessed side");
 
   eq(Number(createInfo.lastInsertRowid) < boundaryId, true, "sanity: create id is below the captured boundary");
+}
+
+// The cross-book guard, through the real query rather than hand-built entries.
+// The WHERE deliberately admits `book IS NULL` rows (0017's backfill left 7,689
+// of them in prod), and row ids are unique only per (book, id) — so the SELECT
+// must carry `book` and the fold must refuse what it cannot attribute. Exercised
+// here because a pure test cannot catch the column going missing from the query:
+// `r.book` would be undefined, every entry would be skipped, every reference
+// ancestor would be null, and every move would re-hold.
+{
+  const ID4 = "gh78";
+  // A legacy entry with NO book: another book's history landing on the same
+  // 4-char id. It must not contribute a reference.
+  ins.run(KIND, ID4, null, "create", JSON.stringify({ chapter: 9, verse: 9, ref_raw: "9:9" }), 50);
+  const known = ins.run(
+    KIND, ID4, BOOK, "create", JSON.stringify({ chapter: 1, verse: 2, ref_raw: "1:2" }), 100,
+  );
+  eq(
+    reconstructRefBase([ID4], Number(known.lastInsertRowid)).get(ID4),
+    { chapter: 1, verse: 2, ref_raw: "1:2" },
+    "the book-NULL entry is admitted by the query but refused by the fold",
+  );
+
+  // With ONLY the unattributable entry the ancestor is null — withhold, never a
+  // confident 9:9 lifted from another book.
+  const ID5 = "ij90";
+  const only = ins.run(KIND, ID5, null, "create", JSON.stringify({ chapter: 9, verse: 9, ref_raw: "9:9" }), 50);
+  const noBase = reconstructRefBase([ID5], Number(only.lastInsertRowid)).get(ID5);
+  eq(noBase, null, "a history of only book-NULL entries yields no reference ancestor");
+  eq(
+    classifyTsvRefMove(
+      { chapter: 1, verse: 2, ref_raw: "1:2" }, { chapter: 1, verse: 6, refRaw: "1:6" }, noBase, false,
+    ),
+    "unattributable",
+    "…so the move holds instead of borrowing another book's reference",
+  );
 }
 
 if (failed) {

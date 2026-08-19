@@ -73,14 +73,6 @@ import {
   type TsvRefSide,
   type TsvEditLogEntry,
 } from "./tsvMerge.ts";
-
-// One row's reconstructed ancestor: the content the field merge attributes
-// against, and the reference classifyTsvRefMove attributes against. Folded
-// together from a single edit_log read (see reconstructTsvBases).
-interface TsvBaseRecord {
-  content: TsvMergeSide | null;
-  ref: TsvRefSide | null;
-}
 import { shouldRecordResourceSync, isSystemicMergeRefusal } from "./reimportSyncGate";
 import { computeTwlSortOrderUpdates } from "./twlCanonicalOrder";
 import { applyTwlSortOrderUpdates } from "./twlSortOrderApply";
@@ -277,6 +269,10 @@ export interface ReimportCounts {
   // ref_moved_ours is an ordinary exportable edit and is counted purely so the
   // livelock this replaced stays visible if it ever comes back.
   ref_moved_ours: number;
+  // ours_moved that STILL held, because master edited the row surface in the same
+  // window - a genuine two-sided change, not the livelock. Counted apart from
+  // ref_moved_ours so the livelock canary is not diluted by rows that held.
+  ref_moved_ours_conflict: number;
   ref_moved_theirs: number;
   ref_moved_both: number;
   ref_moved_unattributable: number;
@@ -362,7 +358,20 @@ const REIMPORT_SOURCE = "dcs_reimport";
 // each drop site: a mass id-reissue would otherwise emit one Workers log line
 // per row, and the per-resource summary at the reimport-sync step already
 // carries the total.
+// One row's reconstructed ancestor: the content the field merge attributes
+// against, and the reference classifyTsvRefMove attributes against. Folded
+// together from a single edit_log read (see reconstructTsvBases).
+interface TsvBaseRecord {
+  content: TsvMergeSide | null;
+  ref: TsvRefSide | null;
+}
+
 const BLOCKED_SAMPLE_CAP = 20;
+
+// Cap on the per-row "we attributed this move to the app" log lines. While one
+// held row keeps a resource stuck, every other moved row in the book would
+// otherwise log an object every night; the counters carry the totals.
+const REF_MOVE_LOG_CAP = 20;
 
 // Record one dropped row's identification, and log it, both capped. Kept as one
 // helper so the cap can never be applied to the list but forgotten on the log.
@@ -397,6 +406,7 @@ function zeroCounts(): ReimportCounts {
     merge_refused: 0,
     merge_no_base: 0,
     ref_moved_ours: 0,
+    ref_moved_ours_conflict: 0,
     ref_moved_theirs: 0,
     ref_moved_both: 0,
     ref_moved_unattributable: 0,
@@ -498,6 +508,7 @@ function addCounts(into: ReimportCounts, from: ReimportCounts): void {
   into.merge_refused += from.merge_refused ?? 0;
   into.merge_no_base += from.merge_no_base ?? 0;
   into.ref_moved_ours += from.ref_moved_ours ?? 0;
+  into.ref_moved_ours_conflict += from.ref_moved_ours_conflict ?? 0;
   into.ref_moved_theirs += from.ref_moved_theirs ?? 0;
   into.ref_moved_both += from.ref_moved_both ?? 0;
   into.ref_moved_unattributable += from.ref_moved_unattributable ?? 0;
@@ -1343,92 +1354,123 @@ export async function applyTsvRows(
       // move, and apply_incomplete withheld the watermark so the export could
       // never ship it, so the same wrong flag returned every night (AMO tq,
       // blocked from 2026-08-17). See classifyTsvRefMove.
-      const refMove = classifyTsvRefMove(cur, row, bases.get(row.id)?.ref ?? null, protectedRow);
-      if (refMove === "ours_moved") {
-        // D1 moved and master still holds the ancestor: an ordinary app edit
-        // the export exists to publish. No flag, no hold.
-        //
-        // This is the ONE branch that lets the export write over master's
-        // location, so it is the only one where a mis-attribution costs data —
-        // and it is otherwise completely silent (no alert, and deliberately not
-        // in the run summary, since a move we made is not something to review).
-        // Log it, with both sides and the ancestor, so a wrong attribution is
-        // diagnosable from worker logs instead of only from its damage.
-        console.log("reimport: reference move attributed to the app; publishing it", {
-          book,
-          kind,
-          id: row.id,
-          ours: `${cur.chapter}:${cur.verse} ${(cur.ref_raw as string | null) ?? ""}`,
-          theirs: `${row.chapter}:${row.verse} ${row.refRaw ?? ""}`,
-          base: bases.get(row.id)?.ref ?? null,
-        });
-        // If a previous run mis-attributed it, clear that flag now — otherwise
-        // the row keeps telling its author to undo work that was never wrong.
-        // One write, once: the flag is gone on the next run, so this can't churn
-        // versions. Guarded on 'ref_moved' specifically, so it can never clear a
-        // merge_conflict or any other flag.
+      const refBase = bases.get(row.id)?.ref ?? null;
+      const refMove = classifyTsvRefMove(cur, row, refBase, protectedRow);
+      // The surface field the content merge may have just adopted from master.
+      // It matters to the reference decision: master's `occurrence` is co-adopted
+      // with it (see block (a)) and is matched to MASTER's verse, so a row D1 has
+      // re-anchored elsewhere would publish a surface+occurrence pair anchored to
+      // the wrong verse.
+      const surfaceField = kind === "twl" ? "orig_words" : "quote";
+      const adoptedSurface = adopted && surfaceField in fields;
+
+      // Only ever raise a ref_moved flag over nothing or over an existing
+      // ref_moved. A `merge_conflict` set by the block below (or by a previous
+      // run and not yet acknowledged) says something this one does not and must
+      // not be silently replaced. Rewriting the reason only when it actually
+      // changed keeps this from churning a version every night.
+      const flagRefMoved = (reason: string): void => {
+        if (cur.review_kind != null && cur.review_kind !== "ref_moved") return;
+        if (cur.review_reason === reason) return;
+        fields.review_kind = "ref_moved";
+        fields.review_reason = reason;
+      };
+
+      if (refMove === "ours_moved" && !adoptedSurface) {
+        // D1 moved, master still holds the ancestor, and master did not touch
+        // the surface: an ordinary app edit the export exists to publish. No
+        // flag, no hold. This is the ONE outcome that lets the export write over
+        // master's location, so it is the only place a mis-attribution costs
+        // data — and it is otherwise silent (no alert, and deliberately not in
+        // the run summary, since a move we made is not something to review). Log
+        // it so a wrong attribution is diagnosable from worker logs rather than
+        // only from its damage. Capped: while one held row keeps the resource
+        // stuck, every other moved row in the book would otherwise log nightly.
+        if (counts.ref_moved_ours < REF_MOVE_LOG_CAP) {
+          console.log("reimport: reference move attributed to the app; publishing it", {
+            book,
+            kind,
+            id: row.id,
+            ours: `${cur.chapter}:${cur.verse} ${(cur.ref_raw as string | null) ?? ""}`,
+            theirs: `${row.chapter}:${row.verse} ${row.refRaw ?? ""}`,
+            base: refBase,
+          });
+        }
+        // Clear a flag a previous run raised by mis-attributing this same move —
+        // otherwise the row keeps telling its author to undo work that was never
+        // wrong. Once: the flag is gone next run, so it cannot churn versions.
+        // Guarded on 'ref_moved', so it can never clear a merge_conflict.
         if (cur.review_kind === "ref_moved") {
           fields.review_kind = null;
           fields.review_reason = null;
         }
-        // NEW EXPOSURE this branch creates, closed here. Block (a) above has no
-        // reference gate, so master's quote/orig_words can be adopted into a row
-        // D1 has re-anchored to a different verse — and the co-adopted
-        // `occurrence` is master's, matched to the OLD verse's source. Before
-        // this change apply_incomplete meant that state was never published;
-        // now it would be. So: drop the occurrence co-adopt (its whole
-        // justification is that master's surface+occurrence are a matched pair,
-        // which stops being true once the row sits at a different verse), and
-        // flag for review — WITHOUT holding, since holding is the livelock.
-        const surfaceField = kind === "twl" ? "orig_words" : "quote";
-        if (adopted && surfaceField in fields) {
-          delete fields.occurrence;
-          if (cur.review_kind !== "ref_moved") {
-            fields.review_kind = "ref_moved";
-            fields.review_reason =
-              "You moved this row to a different verse/reference here, and Door43 edited its " +
-              `${surfaceField === "quote" ? "Quote" : "OrigWords"} at the same time. Door43's text was taken; ` +
-              "check that it still matches the verse you moved this to.";
-          }
-        }
         counts.ref_moved_ours++;
       } else if (refMove !== "none") {
-        // theirs_moved / both_moved / unattributable all hold: WITHHOLD the
-        // resource watermark (apply_incomplete) so the export holds instead of
-        // writing D1's location back over master, and flag the row ONCE (guarded
-        // on the existing review_kind to avoid nightly version churn) so a human
-        // can resolve it in-app — which clears the flag and releases the hold.
+        // Everything else HOLDS: withhold the resource watermark
+        // (apply_incomplete) so the export cannot write D1's location over
+        // master, and flag the row for a human.
+        //
+        // `ours_moved` lands here too when master edited the surface in the same
+        // window. That is a genuine two-sided change, not the livelock: block (a)
+        // has no reference gate, so it has already adopted master's surface plus
+        // master's occurrence, a pair anchored to master's verse rather than the
+        // one D1 moved to. Publishing that would either mis-anchor the quote or
+        // hard-reject on export (the occurrence column, per this repo's own
+        // history). Holding is exactly what `main` did for this shape, so the
+        // only behavior this change moves is the pure move — which is the
+        // livelock and nothing else.
         counts.apply_incomplete = true;
-        if (refMove === "theirs_moved") counts.ref_moved_theirs++;
+        if (refMove === "ours_moved") counts.ref_moved_ours_conflict++;
+        else if (refMove === "theirs_moved") counts.ref_moved_theirs++;
         else if (refMove === "both_moved") counts.ref_moved_both++;
         else counts.ref_moved_unattributable++;
-        if (cur.review_kind !== "ref_moved") {
-          fields.review_kind = "ref_moved";
-          // Each message states only what was measured — "a Door43 editor moved
-          // this" is a claim we may only make when the ancestor proves master is
-          // the side that moved (the standing alert-wording rule).
-          // `unattributable` has two measurably different causes and must not
-          // state the wrong one. When this book+resource has never been
-          // confirmed on master there is no watermark at all, so no ancestor was
-          // even looked up; otherwise there IS history, it just never recorded
-          // the reference column that differs. Saying "no edit history" in the
-          // first case would be the same class of unmeasured claim this branch
-          // was added to avoid.
-          const noWatermark = masterConfirmedAt == null;
-          fields.review_reason =
-            refMove === "theirs_moved"
-              ? "A Door43 editor moved this row to a different verse/reference. " +
-                "Move it here in the app to match, then it will sync."
-              : refMove === "both_moved"
-                ? "This row was moved to a different verse/reference here AND on Door43, to different places. " +
-                  "Pick the one you want in the app, and it will sync."
-                : noWatermark
-                  ? "This row sits at a different verse/reference here than on Door43. This book's " +
-                    `${kind.toUpperCase()} file has not yet been confirmed as holding one of our exports, so ` +
-                    "the sync has no baseline to say which side moved. Set the reference you want in the app."
-                  : "This row sits at a different verse/reference here than on Door43, and the recorded edit " +
-                    "history never captured the part of the reference that differs, so the sync cannot say " +
-                    "which side moved. Set the reference you want in the app.";
+
+        // Each message states only what was measured — "a Door43 editor moved
+        // this" is a claim we may make only when the ancestor proves master is
+        // the side that moved (the standing alert-wording rule). Each also has
+        // to be honest about what actually RELEASES the hold: the export stays
+        // withheld until this row's reference matches Door43's, so a message
+        // offering a free choice ("pick the one you want") would promise a
+        // resolution the system does not deliver.
+        const hold = "Until this row's reference matches Door43's, this book's export stays on hold.";
+        if (refMove === "ours_moved") {
+          flagRefMoved(
+            `You moved this row to a different verse/reference here, and Door43 edited its ` +
+              `${surfaceField === "quote" ? "Quote" : "OrigWords"} in the same window. Door43's text was taken, ` +
+              `but it is anchored to Door43's verse — check it against the verse you moved this to. ${hold}`,
+          );
+        } else if (refMove === "theirs_moved") {
+          flagRefMoved(
+            "A Door43 editor moved this row to a different verse/reference. " +
+              `Move it here in the app to match. ${hold}`,
+          );
+        } else if (refMove === "both_moved") {
+          flagRefMoved(
+            "This row was moved to a different verse/reference here AND on Door43, to different places. " +
+              `${hold} To publish yours instead, change it on Door43 as well.`,
+          );
+        } else if (masterConfirmedAt == null) {
+          // No watermark at all: no ancestor was even looked up. Saying "the
+          // edit history never captured it" would name a cause we never measured.
+          flagRefMoved(
+            `This row sits at a different verse/reference here than on Door43. This book's ${kind.toUpperCase()} ` +
+              `file has not yet been confirmed as holding one of our exports, so the sync has no baseline to ` +
+              `say which side moved. ${hold}`,
+          );
+        } else if (refBase == null) {
+          // A watermark exists but no usable edit-history entry survives before
+          // it — distinct from "an entry survives but never recorded this
+          // column", which is the branch below.
+          flagRefMoved(
+            "This row sits at a different verse/reference here than on Door43, and no edit history survives " +
+              `from before the last confirmed publish, so the sync cannot say which side moved. ${hold}`,
+          );
+        } else {
+          flagRefMoved(
+            "This row sits at a different verse/reference here than on Door43, and the recorded edit history " +
+              `never captured the part of the reference that differs, so the sync cannot say which side ` +
+              `moved. ${hold}`,
+          );
         }
       }
 

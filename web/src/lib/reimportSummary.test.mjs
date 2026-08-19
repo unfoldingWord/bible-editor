@@ -147,14 +147,14 @@ lacks(
 );
 has(
   summarizeReimport(res({ ref_moved_theirs: 3 })),
-  "3 flagged for review (reference differs on Door43)",
+  "3 flagged for review (reference differs from Door43)",
   "a move Door43 made is reported",
 );
 // The three held cases sum: the human action is the same for all of them, and
 // the per-row flag already carries the specific reason.
 has(
   summarizeReimport(res({ ref_moved_theirs: 1, ref_moved_both: 2, ref_moved_unattributable: 3 })),
-  "6 flagged for review (reference differs on Door43)",
+  "6 flagged for review (reference differs from Door43)",
   "theirs + both + unattributable are summed, not listed three times",
 );
 lacks(summarizeReimport(res({})), "reference differs", "no reference moves → no reference phrase");

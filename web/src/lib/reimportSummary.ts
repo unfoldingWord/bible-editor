@@ -22,15 +22,22 @@ export function summarizeReimport(res: ReimportResponse): string {
   if (t.merge_adopted) parts.push(`${t.merge_adopted} adopted from master (out-of-band correction)`);
   if (t.merge_conflicts) parts.push(`${t.merge_conflicts} flagged for review (merge conflict)`);
   // Rows whose Reference disagrees between the app and Door43. Split by who
-  // moved (api/src/tsvMerge.ts's classifyTsvRefMove) because only the
-  // not-ours cases need anyone's attention — a move the app made is an ordinary
-  // edit the export publishes, and reporting it as "flagged" is what used to
-  // tell a translator to undo her own work. The three held cases are summed:
-  // the action a human takes is the same for all of them (set the reference you
-  // want in the app), and the per-row flag already carries the specific reason.
+  // moved (api/src/tsvMerge.ts's classifyTsvRefMove) because only the held cases
+  // need anyone's attention — a move the app made is an ordinary edit the export
+  // publishes, and reporting it as "flagged" is what used to tell a translator to
+  // undo her own work. The held cases are summed because the human action is the
+  // same for all of them, and the per-row flag carries the specific reason.
+  //
+  // "differs from Door43", NOT "Door43 moved it": `unattributable` means the sync
+  // explicitly could not say which side moved, and `ours_moved_conflict` means WE
+  // moved it. Naming Door43 here would assert in the summary exactly what the
+  // per-row reasons are careful not to claim.
   const refHeld =
-    (t.ref_moved_theirs ?? 0) + (t.ref_moved_both ?? 0) + (t.ref_moved_unattributable ?? 0);
-  if (refHeld) parts.push(`${refHeld} flagged for review (reference differs on Door43)`);
+    (t.ref_moved_theirs ?? 0) +
+    (t.ref_moved_both ?? 0) +
+    (t.ref_moved_unattributable ?? 0) +
+    (t.ref_moved_ours_conflict ?? 0);
+  if (refHeld) parts.push(`${refHeld} flagged for review (reference differs from Door43)`);
   // Door43 held exactly the file our last export pushed, so its changes were our
   // own merged export rather than anyone else's edit. The pull still ran; what
   // changed is that those edits are no longer mistaken for someone else's work

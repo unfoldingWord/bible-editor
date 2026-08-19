@@ -502,13 +502,39 @@ deep(tsvMergeFields("tq"), ["quote", "question", "response"], "tq field list");
   deep(base, { chapter: 1, verse: 4, ref_raw: "1:4" }, "later patch overlays verse/ref_raw and keeps chapter");
 }
 
-// A recorded null ref_raw folds to "", matching tsvRefMoved's own coercion, so a
-// blank-ref row never reads as a move against its own ancestor.
+// An explicit null ref_raw in a payload is ABSENT, not "". pipelineImport.ts's
+// tn hint expansion writes `ref_raw = COALESCE(?5, ref_raw)`, so a payload
+// carrying `ref_raw: null` leaves the row's reference UNCHANGED — folding it to
+// "" would record an ancestor the row never held, and a wrong ancestor is the
+// one thing this fold must never produce.
 {
   const base = foldTsvRefBase([{ action: "create", payload: { chapter: 1, verse: 2, ref_raw: null } }]);
-  deep(base, { chapter: 1, verse: 2, ref_raw: "" }, "null ref_raw folds to the empty string");
-  eq(classifyTsvRefMove({ chapter: 1, verse: 2, ref_raw: null }, { chapter: 1, verse: 2, refRaw: "" }, base, false),
+  deep(base, { chapter: 1, verse: 2 }, "an explicit null ref_raw is absent, not the empty string");
+  // Absent is fail-safe: ref_raw differs between the sides and the ancestor
+  // never recorded it, so the move withholds rather than asserting "".
+  eq(
+    classifyTsvRefMove({ chapter: 1, verse: 2, ref_raw: "1:2" }, { chapter: 1, verse: 2, refRaw: "" }, base, false),
+    "unattributable",
+    "…so a differing ref_raw with no recorded ancestor withholds",
+  );
+  // An empty string that was genuinely RECORDED still folds, and a blank-ref row
+  // is not a move against its own ancestor.
+  const blank = foldTsvRefBase([{ action: "create", payload: { chapter: 1, verse: 2, ref_raw: "" } }]);
+  deep(blank, { chapter: 1, verse: 2, ref_raw: "" }, "a recorded empty ref_raw folds as \"\"");
+  eq(classifyTsvRefMove({ chapter: 1, verse: 2, ref_raw: null }, { chapter: 1, verse: 2, refRaw: "" }, blank, false),
     "none", "blank-ref row is not a move against its own ancestor");
+}
+
+// Only a string counts. Every real writer emits one (bookImport's
+// `r["Reference"] ?? ""`, rows.ts's z.string(), ParsedTsvRow's `refRaw: string`),
+// so anything else is a shape we have not seen — and String([...]) / String({})
+// yield confident nonsense that would compare unequal to both sides and pin the
+// row on `both_moved` forever.
+{
+  for (const [label, value] of [["a number", 5], ["an array", ["1:2"]], ["an object", {}], ["a boolean", true]]) {
+    const base = foldTsvRefBase([{ action: "create", payload: { chapter: 1, verse: 2, ref_raw: value } }]);
+    eq(base.ref_raw, undefined, `${label} ref_raw is not coerced into the ancestor`);
+  }
 }
 
 // Both ref_raw spellings really are in production edit_log: bookImport.ts and

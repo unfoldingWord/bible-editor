@@ -866,6 +866,7 @@ export interface ReimportCounts {
   // the export publishes — no flag, no hold. The other three withhold the
   // resource watermark and flag the row. Optional, diagnostic.
   ref_moved_ours?: number;
+  ref_moved_ours_conflict?: number;
   ref_moved_theirs?: number;
   ref_moved_both?: number;
   ref_moved_unattributable?: number;

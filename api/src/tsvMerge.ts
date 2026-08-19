@@ -503,10 +503,23 @@ export function foldTsvRefBase(entries: TsvEditLogEntry[]): TsvRefSide | null {
     }
     // Later spelling wins within one payload only if a payload carried both,
     // which no writer does; across payloads the newest entry wins either way.
+    //
+    // ONLY A STRING COUNTS, and an explicit null is ABSENT, not "". Both matter:
+    //   - `pipelineImport.ts`'s tn hint expansion writes
+    //     `ref_raw = COALESCE(?5, ref_raw)` — a payload carrying an explicit
+    //     `ref_raw: null` therefore leaves the row's reference UNCHANGED. Folding
+    //     that null to "" would record an ancestor the row never held, and a
+    //     wrong ancestor is the one thing this fold must never produce (see #546).
+    //   - every real writer emits a string here (bookImport's `r["Reference"] ?? ""`,
+    //     rows.ts's `z.string()`, ParsedTsvRow's `refRaw: string`), so anything
+    //     else is a shape we have not seen and must not coerce — `String([...])`
+    //     and `String({})` both yield confident nonsense.
+    // Absence withholds (`unattributable`); that is the safe direction.
     for (const key of ["ref_raw", "refRaw"] as const) {
       if (!Object.prototype.hasOwnProperty.call(p, key)) continue;
+      if (typeof p[key] !== "string") continue;
       base ??= {};
-      base.ref_raw = p[key] == null ? "" : String(p[key]);
+      base.ref_raw = p[key] as string;
     }
   }
   return base;
