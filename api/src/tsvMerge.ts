@@ -138,6 +138,84 @@ export function tsvRefMoved(
   );
 }
 
+// ── Attributing the move (issue #540 item 3) ────────────────────────────────
+//
+// tsvRefMoved above is a TWO-WAY compare, and a two-way compare cannot say who
+// moved — the same mistake that cost this project months of nightly data loss on
+// the content side (STATE.md). Its caller assumed "differs => Door43 moved it",
+// which is wrong exactly half the time, and the wrong half is self-perpetuating:
+// a translator moves a row in the app, the sync reads the difference as a
+// maintainer's move, flags the row telling her to undo her own edit, and sets
+// apply_incomplete — which WITHHOLDS the resource watermark, so the export never
+// ships her move to master, so master never catches up, so it flags again
+// tomorrow. That livelock blocked AMO tq exports from 2026-08-17.
+//
+// The fix is the same one the content merge already uses: an ancestor. With the
+// row's reference as of the master-confirmed watermark, the three cases separate
+// cleanly and only two of them are anyone's problem.
+export type TsvRefMoveOutcome =
+  | "none" // references agree, or the row is protected
+  | "ours_moved" // D1 moved, master still sits at the ancestor -> a normal exportable edit
+  | "theirs_moved" // master moved, D1 still sits at the ancestor -> the out-of-band move
+  | "both_moved" // both sides re-anchored, to different places -> needs a human
+  | "unattributable"; // no ancestor for the components that differ -> cannot say who moved
+
+// The reference columns as of the ancestor. A key is ABSENT when no surviving
+// edit_log payload before the watermark ever recorded that column — the same
+// "absent means unattributable" convention TsvMergeSide uses for content. This
+// matters in practice: the in-app move sends `ref_raw` + `verse` and never
+// `chapter` (moves are same-chapter only, rows.ts), so a base folded purely from
+// patches legitimately carries no chapter.
+export interface TsvRefSide {
+  chapter?: number;
+  verse?: number;
+  /** "" when the payload recorded a null ref_raw, matching tsvRefMoved's coercion. */
+  ref_raw?: string;
+}
+
+const REF_COMPONENTS = ["chapter", "verse", "ref_raw"] as const;
+
+export function classifyTsvRefMove(
+  cur: Record<string, unknown>,
+  incoming: { chapter: number; verse: number; refRaw: string | null },
+  base: TsvRefSide | null,
+  protectedRow: boolean,
+): TsvRefMoveOutcome {
+  if (!tsvRefMoved(cur, incoming, protectedRow)) return "none";
+  if (base === null) return "unattributable";
+
+  const ours: Required<TsvRefSide> = {
+    chapter: Number(cur.chapter),
+    verse: Number(cur.verse),
+    ref_raw: (cur.ref_raw as string | null) ?? "",
+  };
+  const theirs: Required<TsvRefSide> = {
+    chapter: incoming.chapter,
+    verse: incoming.verse,
+    ref_raw: incoming.refRaw ?? "",
+  };
+
+  let oursMoved = false;
+  let theirsMoved = false;
+  for (const k of REF_COMPONENTS) {
+    // A component both sides agree on carries no information about who moved,
+    // so it never needs an ancestor — only the DIFFERING components do. That is
+    // what keeps the common same-chapter move attributable from a patch-only
+    // history that never recorded `chapter`.
+    if (ours[k] === theirs[k]) continue;
+    if (base[k] === undefined) return "unattributable";
+    if (ours[k] !== base[k]) oursMoved = true;
+    if (theirs[k] !== base[k]) theirsMoved = true;
+  }
+  if (oursMoved && theirsMoved) return "both_moved";
+  if (oursMoved) return "ours_moved";
+  if (theirsMoved) return "theirs_moved";
+  // Unreachable: the sides differ on some component, so at least one of them
+  // differs from the ancestor. Fail toward "nobody moved" rather than inventing
+  // an attribution.
+  return "none";
+}
+
 export interface TsvMergeResult {
   action: TsvMergeAction;
   /** action is "adopt" | "adopt_conflict" */
@@ -350,6 +428,36 @@ export interface TsvEditLogEntry {
 // history never set is simply absent from the returned object (computeTsvMerge
 // treats an absent field as unattributable), which is how a partial, aged-out
 // history degrades gracefully instead of pretending a blank ancestor.
+// Fold the same history into the row's REFERENCE as of the watermark, for
+// classifyTsvRefMove. Separate from foldTsvBase because the reference columns
+// are deliberately excluded from FIELDS_BY_KIND (they are identity, not content,
+// and must never be merged field-wise) — but they still need an ancestor to be
+// attributable. Same entries, same ordering, same "absent means never recorded"
+// contract; no extra D1 read.
+//
+// `chapter`/`verse` are numbers in every writer shape (the DB columns, the POST
+// body, and the move patch), so a non-numeric value is dropped rather than
+// coerced into a NaN that would compare unequal to everything.
+export function foldTsvRefBase(entries: TsvEditLogEntry[]): TsvRefSide | null {
+  let base: TsvRefSide | null = null;
+  for (const e of entries) {
+    if (!CONTENT_ACTIONS.has(e.action) || !e.payload) continue;
+    const p = e.payload;
+    for (const k of ["chapter", "verse"] as const) {
+      if (!Object.prototype.hasOwnProperty.call(p, k)) continue;
+      const n = Number(p[k]);
+      if (!Number.isFinite(n)) continue;
+      base ??= {};
+      base[k] = n;
+    }
+    if (Object.prototype.hasOwnProperty.call(p, "ref_raw")) {
+      base ??= {};
+      base.ref_raw = p.ref_raw == null ? "" : String(p.ref_raw);
+    }
+  }
+  return base;
+}
+
 export function foldTsvBase(kind: TsvMergeKind, entries: TsvEditLogEntry[]): TsvMergeSide | null {
   const fields = FIELDS_BY_KIND[kind];
   let base: TsvMergeSide | null = null;

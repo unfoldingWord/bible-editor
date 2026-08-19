@@ -65,12 +65,22 @@ import {
   isReissuedTombstone,
 } from "./reimportClassify";
 import {
+  classifyTsvRefMove,
   computeTsvMerge,
   foldTsvBase,
-  tsvRefMoved,
+  foldTsvRefBase,
   type TsvMergeSide,
+  type TsvRefSide,
   type TsvEditLogEntry,
 } from "./tsvMerge.ts";
+
+// One row's reconstructed ancestor: the content the field merge attributes
+// against, and the reference classifyTsvRefMove attributes against. Folded
+// together from a single edit_log read (see reconstructTsvBases).
+interface TsvBaseRecord {
+  content: TsvMergeSide | null;
+  ref: TsvRefSide | null;
+}
 import { shouldRecordResourceSync, isSystemicMergeRefusal } from "./reimportSyncGate";
 import { computeTwlSortOrderUpdates } from "./twlCanonicalOrder";
 import { applyTwlSortOrderUpdates } from "./twlSortOrderApply";
@@ -261,6 +271,15 @@ export interface ReimportCounts {
   // warm-up tradeoff, left as a flagged follow-up (see the failed-adoption-write
   // gate, apply_incomplete, which IS gated).
   merge_no_base: number;
+  // Reference-move attribution (issue #540 item 3), split by WHO moved so a run
+  // summary can distinguish "we published a move" from "master moved under us".
+  // Only ref_moved_theirs / _both / _unattributable withhold the watermark;
+  // ref_moved_ours is an ordinary exportable edit and is counted purely so the
+  // livelock this replaced stays visible if it ever comes back.
+  ref_moved_ours: number;
+  ref_moved_theirs: number;
+  ref_moved_both: number;
+  ref_moved_unattributable: number;
   // Human-edited verse that DIFFERS from master but could not be adjudicated
   // at all, because this book+resource has no `master_confirmed_at` watermark
   // yet (migration 0045 adds the column and does not backfill it — only the
@@ -377,6 +396,10 @@ function zeroCounts(): ReimportCounts {
     merge_conflicts: 0,
     merge_refused: 0,
     merge_no_base: 0,
+    ref_moved_ours: 0,
+    ref_moved_theirs: 0,
+    ref_moved_both: 0,
+    ref_moved_unattributable: 0,
     merge_unavailable: 0,
     merge_cosmetic_ignored: 0,
     own_publish_converged: 0,
@@ -474,6 +497,10 @@ function addCounts(into: ReimportCounts, from: ReimportCounts): void {
   into.merge_conflicts += from.merge_conflicts ?? 0;
   into.merge_refused += from.merge_refused ?? 0;
   into.merge_no_base += from.merge_no_base ?? 0;
+  into.ref_moved_ours += from.ref_moved_ours ?? 0;
+  into.ref_moved_theirs += from.ref_moved_theirs ?? 0;
+  into.ref_moved_both += from.ref_moved_both ?? 0;
+  into.ref_moved_unattributable += from.ref_moved_unattributable ?? 0;
   into.merge_unavailable += from.merge_unavailable ?? 0;
   into.merge_cosmetic_ignored += from.merge_cosmetic_ignored ?? 0;
   into.own_publish_converged += from.own_publish_converged ?? 0;
@@ -1225,7 +1252,7 @@ export async function applyTsvRows(
     const bases =
       masterConfirmedAt != null
         ? await reconstructTsvBases(env, book, kind, editedCandidates.map((c) => c.row.id), masterConfirmedAt, masterEditId)
-        : new Map<string, TsvMergeSide | null>();
+        : new Map<string, TsvBaseRecord>();
     for (const { row, cur } of editedCandidates) {
       const fields: Record<string, unknown> = {};
       let conflict = false;
@@ -1251,7 +1278,7 @@ export async function applyTsvRows(
       if (masterConfirmedAt != null && !protectedRow) {
         const merge = computeTsvMerge(
           kind,
-          bases.get(row.id) ?? null,
+          bases.get(row.id)?.content ?? null,
           parsedRowToMergeSide(kind, storedTsvRowToParsed(kind, cur)),
           parsedRowToMergeSide(kind, row),
         );
@@ -1304,25 +1331,55 @@ export async function applyTsvRows(
       let heuristic = false;
       if (heur) for (const [k, v] of Object.entries(heur)) if (!(k in fields)) { fields[k] = v; heuristic = true; }
 
-      // A Door43 maintainer re-anchored this row to a different Reference on
-      // master (same id, different chapter/verse/ref_raw). The field merge can't
-      // safely MOVE a row — a chapter change relocates it out of the chapter this
-      // reimport is processing and needs the quote re-anchored to the new verse's
-      // source (a validated move, tracked as a follow-up) — so it is NOT
-      // auto-adopted. But it must NOT be silently reverted either (the old, and
-      // still-open, revert path this PR exists to close): WITHHOLD the resource
-      // watermark (apply_incomplete) so the export holds instead of writing D1's
-      // old location back over master, and flag the row ONCE (guarded on the
-      // existing review_kind to avoid nightly version churn) so a human can move
-      // it in-app to match — which clears the flag and releases the hold.
-      const refMoved = tsvRefMoved(cur, row, protectedRow);
-      if (refMoved) {
+      // This row's Reference differs between D1 and master (same id, different
+      // chapter/verse/ref_raw). The field merge can't safely MOVE a row — a
+      // chapter change relocates it out of the chapter this reimport is
+      // processing and needs the quote re-anchored to the new verse's source (a
+      // validated move, tracked as a follow-up, #454) — so a move is never
+      // auto-adopted from master. What changes here (issue #540 item 3) is WHO
+      // the difference is attributed to: this used to assume master moved it,
+      // which is wrong exactly when the app moved it, and wrong in a
+      // self-perpetuating way — the flag told the translator to undo her own
+      // move, and apply_incomplete withheld the watermark so the export could
+      // never ship it, so the same wrong flag returned every night (AMO tq,
+      // blocked from 2026-08-17). See classifyTsvRefMove.
+      const refMove = classifyTsvRefMove(cur, row, bases.get(row.id)?.ref ?? null, protectedRow);
+      if (refMove === "ours_moved") {
+        // D1 moved and master still holds the ancestor: an ordinary app edit
+        // the export exists to publish. No flag, no hold. If a previous run
+        // mis-attributed it, clear that flag now — otherwise the row keeps
+        // telling its author to undo work that was never wrong. One write, once:
+        // the flag is gone on the next run, so this can't churn versions.
+        if (cur.review_kind === "ref_moved") {
+          fields.review_kind = null;
+          fields.review_reason = null;
+        }
+        counts.ref_moved_ours++;
+      } else if (refMove !== "none") {
+        // theirs_moved / both_moved / unattributable all hold: WITHHOLD the
+        // resource watermark (apply_incomplete) so the export holds instead of
+        // writing D1's location back over master, and flag the row ONCE (guarded
+        // on the existing review_kind to avoid nightly version churn) so a human
+        // can resolve it in-app — which clears the flag and releases the hold.
         counts.apply_incomplete = true;
+        if (refMove === "theirs_moved") counts.ref_moved_theirs++;
+        else if (refMove === "both_moved") counts.ref_moved_both++;
+        else counts.ref_moved_unattributable++;
         if (cur.review_kind !== "ref_moved") {
           fields.review_kind = "ref_moved";
+          // Each message states only what was measured — "a Door43 editor moved
+          // this" is a claim we may only make when the ancestor proves master is
+          // the side that moved (the standing alert-wording rule).
           fields.review_reason =
-            "A Door43 editor moved this row to a different verse/reference. " +
-            "Move it here in the app to match, then it will sync.";
+            refMove === "theirs_moved"
+              ? "A Door43 editor moved this row to a different verse/reference. " +
+                "Move it here in the app to match, then it will sync."
+              : refMove === "both_moved"
+                ? "This row was moved to a different verse/reference here AND on Door43, to different places. " +
+                  "Pick the one you want in the app, and it will sync."
+                : "This row sits at a different verse/reference here than on Door43, and there is no edit " +
+                  "history from before the last publish to say which side moved. Set the reference you want " +
+                  "in the app, and it will sync.";
         }
       }
 
@@ -1619,8 +1676,8 @@ async function reconstructTsvBases(
   ids: string[],
   cutoff: number,
   boundaryId: number | null,
-): Promise<Map<string, TsvMergeSide | null>> {
-  const out = new Map<string, TsvMergeSide | null>();
+): Promise<Map<string, TsvBaseRecord>> {
+  const out = new Map<string, TsvBaseRecord>();
   const entriesById = new Map<string, TsvEditLogEntry[]>();
   // P1.3: cut at the precise id boundary when we have one, else the timestamp.
   // Either way ?3 carries the single bound value; only the column/operator swaps.
@@ -1658,7 +1715,13 @@ async function reconstructTsvBases(
       entriesById.set(r.row_key, list);
     }
   }
-  for (const id of ids) out.set(id, foldTsvBase(kind, entriesById.get(id) ?? []));
+  for (const id of ids) {
+    const entries = entriesById.get(id) ?? [];
+    // Both folds read the SAME entries — the reference ancestor costs no extra
+    // D1 read, which is what keeps it affordable on the unchunked full-book
+    // paths this function's header already flags as near the subrequest cap.
+    out.set(id, { content: foldTsvBase(kind, entries), ref: foldTsvRefBase(entries) });
+  }
   return out;
 }
 

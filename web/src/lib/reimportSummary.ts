@@ -21,6 +21,16 @@ export function summarizeReimport(res: ReimportResponse): string {
   if (t.source_attr_reconciled) parts.push(`${t.source_attr_reconciled} source-attr fix(es) synced from master`);
   if (t.merge_adopted) parts.push(`${t.merge_adopted} adopted from master (out-of-band correction)`);
   if (t.merge_conflicts) parts.push(`${t.merge_conflicts} flagged for review (merge conflict)`);
+  // Rows whose Reference disagrees between the app and Door43. Split by who
+  // moved (api/src/tsvMerge.ts's classifyTsvRefMove) because only the
+  // not-ours cases need anyone's attention — a move the app made is an ordinary
+  // edit the export publishes, and reporting it as "flagged" is what used to
+  // tell a translator to undo her own work. The three held cases are summed:
+  // the action a human takes is the same for all of them (set the reference you
+  // want in the app), and the per-row flag already carries the specific reason.
+  const refHeld =
+    (t.ref_moved_theirs ?? 0) + (t.ref_moved_both ?? 0) + (t.ref_moved_unattributable ?? 0);
+  if (refHeld) parts.push(`${refHeld} flagged for review (reference differs on Door43)`);
   // Door43 held exactly the file our last export pushed, so its changes were our
   // own merged export rather than anyone else's edit. The pull still ran; what
   // changed is that those edits are no longer mistaken for someone else's work
