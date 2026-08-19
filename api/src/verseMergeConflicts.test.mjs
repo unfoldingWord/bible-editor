@@ -798,6 +798,43 @@ function confirmAdopted(d, { book, resource, chapter, verse }) {
     "source_attr_divergent counted as a source-attr divergence, separately from the alignment refusal");
 }
 
+{
+  // Issue #537. The keep_no_base sentence must NAME the verses it says tonight's
+  // export may overwrite, and must not assert a cause we did not measure.
+  const g = buildMergeConflictGuidance([], { noBaseCount: 3, noBaseRefs: ["40:5", "42:2", "42:3"] });
+  assert(g.includes("40:5, 42:2, 42:3"), "no-ancestor sentence lists the refs it is talking about");
+  assert(g.includes("3 verse(s) could not be adjudicated"), "…and still reports the count");
+  assert(!g.includes("more"), "…with no '+N more' when every ref was listed");
+
+  // The cause claim. Prod on 2026-08-19: edit_log spanned 93 days, so the
+  // 180-day sweep had deleted nothing and "aged out" described none of the 190
+  // verses then in this state. The sentence may only say what is measured —
+  // that no ancestor survives from before the watermark.
+  assert(!/aged out/i.test(g), "…and never claims the history 'aged out' (a cause we did not measure)");
+  assert(g.includes("no ancestor survives"), "…it states only the measured fact");
+
+  // The ref list is a capped sample; '+N more' counts against what was actually
+  // listed, never against the cap, and the authoritative count still leads.
+  const many = buildMergeConflictGuidance([], {
+    noBaseCount: 59,
+    noBaseRefs: Array.from({ length: 12 }, (_, i) => `28:${i + 1}`),
+  });
+  assert(many.includes("59 verse(s)"), "count stays authoritative when the ref sample is short");
+  assert(many.includes("28:10"), "…lists up to the display cap");
+  assert(!many.includes("28:11"), "…and no further");
+  assert(many.includes("+49 more"), "…and '+N more' is the count minus what was actually listed");
+
+  // A Workflow chunk memoized before refs were collected contributes a count and
+  // no refs. Say nothing about where, rather than guess.
+  const noRefs = buildMergeConflictGuidance([], { noBaseCount: 5 });
+  assert(noRefs.includes("5 verse(s) could not be adjudicated"), "count-only still reports the count");
+  assert(!noRefs.includes("Verses:"), "…and omits the ref clause rather than printing an empty one");
+  assert(!noRefs.includes("more"), "…and claims no '+N more' it cannot substantiate");
+
+  // Zero is not a story: no sentence at all.
+  assert(buildMergeConflictGuidance([], { noBaseCount: 0 }) === "", "no no-ancestor sentence when the count is 0");
+}
+
 if (failed) {
   console.error(`\n${failed} assertion(s) failed`);
   process.exit(1);

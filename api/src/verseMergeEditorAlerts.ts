@@ -147,9 +147,14 @@ export interface ExistingAlertState {
 //                                 couldn't be placed (repeated source word).
 // Both kept-D1 outcomes carry the same warning: nothing was taken, so tonight's
 // export will still write D1 back over master until a human resolves it.
+// Cap on how many no-ancestor refs the sentence lists inline, matching the
+// `+N more` shape raiseVerseMergeConflictAlert already uses for its conflict
+// refs. `noBaseCount` stays authoritative for the number.
+export const NO_BASE_REF_DISPLAY = 10;
+
 export function buildMergeConflictGuidance(
   rows: Array<{ action: string }>,
-  opts: { recordingFailed?: boolean; noBaseCount?: number } = {},
+  opts: { recordingFailed?: boolean; noBaseCount?: number; noBaseRefs?: string[] } = {},
 ): string {
   const overwritten = rows.filter((r) => r.action === "adopt_conflict").length;
   const keptAlignment = rows.filter((r) => r.action === "keep_alignment_refused").length;
@@ -172,13 +177,45 @@ export function buildMergeConflictGuidance(
       ? "NOTE: at least one merge-conflict recording failed to write to verse_merge_conflicts this run " +
         "(see worker logs) — this table and count may be missing rows from tonight's sync."
       : "",
-    opts.noBaseCount
-      ? `${opts.noBaseCount} verse(s) could not be adjudicated because their edit history has aged out (no ` +
-        `recoverable ancestor) — a Door43-side change to them will still be overwritten by tonight's export.`
-      : "",
+    opts.noBaseCount ? buildNoBaseSentence(opts.noBaseCount, opts.noBaseRefs) : "",
   ]
     .filter(Boolean)
     .join(" ");
+}
+
+// The `keep_no_base` sentence. Two corrections over the version this replaces,
+// both from the 2026-08-19 prod measurement behind issue #537:
+//
+// 1. IT NAMED NO VERSES. A sentence whose own point is "tonight's export may
+//    overwrite a Door43 edit here" has to say where "here" is — the same rule
+//    the adjudicated refs already follow (`40:5@v8, …`). keep_no_base writes no
+//    verse_merge_conflicts row, so the banner is the only channel these verses
+//    have. No `@vN` suffix: nothing was overwritten yet, so there is no replaced
+//    version to point a restore at.
+//
+// 2. IT ASSERTED A CAUSE WE HAD NOT MEASURED. The old text said the edit history
+//    "has aged out". Prod on 2026-08-19: edit_log spans 93 days (oldest entry
+//    2026-05-18), so the 180-day sweep in index.ts has never deleted a row and
+//    could not have caused a single one of the 190 verses then in this state.
+//    Every one of them was simply never written to edit_log before its book's
+//    master-confirmed watermark. Aging out remains POSSIBLE once the table is
+//    older than 180 days, which is exactly why this may not name either limb:
+//    what is measured is that no snapshot survives before the watermark, and
+//    that is all this says. (Standing rule — an alert states only what it
+//    measured; see the alert-wording lessons in STATE.md.)
+export function buildNoBaseSentence(count: number, refs?: string[]): string {
+  const listed = (refs ?? []).slice(0, NO_BASE_REF_DISPLAY);
+  // `refs` is a capped sample and can be short of `count` — or empty, for a
+  // Workflow chunk memoized before it was collected. Only claim "+N more"
+  // against what we actually listed, and stay silent rather than guess when the
+  // sample is missing entirely.
+  const more = count > listed.length ? `; +${count - listed.length} more` : "";
+  const where = listed.length > 0 ? ` Verses: ${listed.join(", ")}${more}.` : "";
+  return (
+    `${count} verse(s) could not be adjudicated: no ancestor survives in this book's edit history from before ` +
+    `its last confirmed publish, so the sync cannot tell which side changed and kept the app's version.${where} ` +
+    `A Door43-side change to them will still be overwritten by tonight's export.`
+  );
 }
 
 export function planSystemAlertWrites(
