@@ -856,6 +856,13 @@ export interface ReimportCounts {
   // Merge refused to adopt master's edit specifically because it would have
   // lost alignment — a subset of merge_conflicts. Optional, diagnostic.
   merge_refused?: number;
+  // Both sides moved since the ancestor, but every Door43 commit to the file
+  // since then came from Bible Editor's own export or the note-writing pipeline
+  // — so the app edit was KEPT and flagged instead of overwritten (issue #540
+  // item 2). A subset of merge_conflicts. Unlike merge_refused this does NOT
+  // hold the export: publishing the kept edit to Door43 is the point.
+  // Optional, diagnostic.
+  merge_kept_ai?: number;
   // Merge attempted but no ancestor was recoverable for this verse from before
   // the book+resource's master-confirmed watermark. D1 was kept, the
   // pre-existing safe default. Optional, diagnostic.

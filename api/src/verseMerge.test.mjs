@@ -113,6 +113,98 @@ console.log("\n[the six actions]");
   eq(r.reason, "both_changed", "adopt_conflict: reason slug");
 }
 
+console.log("\n[#540 item 2: an AI-only master movement never beats a later human app edit]");
+
+// The AMO 4:2 shape. Both sides moved, so step 6 fires — but the commit lineage
+// says every commit that moved master's file since the ancestor was our own
+// export or a bp-assistant push. Master's "edit" is our own pipeline's output;
+// reverting the app edit to it is the bug. D1 wins, and it is still a conflict.
+{
+  const base = text("original master text");
+  const theirs = text("the AI run's text");
+  const oursMutated = text("Beth's hand fix");
+  const r = computeVerseMerge({
+    base,
+    ours: oursMutated,
+    theirs,
+    humanEditedSinceExport: false,
+    masterMayHoldHumanEdit: false,
+  });
+  eq(r.action, "keep_ai_master", "both changed + no human commit on master → keep_ai_master");
+  eq(r.adopt, false, "keep_ai_master: adopt false — nothing is written, D1 stands");
+  eq(r.conflict, true, "keep_ai_master: conflict true — a human still reviews it");
+  eq(r.reason, "both_changed_ai_master", "keep_ai_master: reason slug");
+}
+
+// The gate is one-directional and explicit. `true` and OMITTED must both keep
+// today's master-wins behavior — the flip may only ever ride on a measured
+// false, because masterMayHoldHumanEdit() returns true for an incomplete walk
+// and for never having looked, and neither may silently become D1-wins.
+{
+  const base = text("original master text");
+  const theirs = text("a maintainer's correction");
+  const oursMutated = text("our local edit text");
+  eq(
+    computeVerseMerge({ base, ours: oursMutated, theirs, humanEditedSinceExport: false, masterMayHoldHumanEdit: true })
+      .action,
+    "adopt_conflict",
+    "masterMayHoldHumanEdit true → master still wins a both-changed conflict",
+  );
+  eq(
+    computeVerseMerge({ base, ours: oursMutated, theirs, humanEditedSinceExport: false }).action,
+    "adopt_conflict",
+    "masterMayHoldHumanEdit omitted (nobody looked) → master still wins",
+  );
+  eq(
+    computeVerseMerge({
+      base,
+      ours: oursMutated,
+      theirs,
+      humanEditedSinceExport: false,
+      masterMayHoldHumanEdit: undefined,
+    }).action,
+    "adopt_conflict",
+    "masterMayHoldHumanEdit explicitly undefined → master still wins",
+  );
+}
+
+// The flip is scoped to step 6 alone. Every earlier step keeps its answer: an
+// AI-authored master edit to a verse WE never touched is still adopted (that is
+// how pipeline work reaches D1 at all), and a no-ancestor or master-unchanged
+// verse is unaffected.
+{
+  const base = text("original master text");
+  const theirs = text("the AI run's text");
+  eq(
+    computeVerseMerge({ base, ours: base, theirs, humanEditedSinceExport: false, masterMayHoldHumanEdit: false })
+      .action,
+    "adopt",
+    "ours === base: an AI-only master edit is still adopted — nothing of ours is at stake",
+  );
+  eq(
+    computeVerseMerge({
+      base: null,
+      ours: text("a"),
+      theirs: text("b"),
+      humanEditedSinceExport: false,
+      masterMayHoldHumanEdit: false,
+    }).action,
+    "keep_no_base",
+    "no ancestor: still keep_no_base, not keep_ai_master — attribution never ran",
+  );
+  eq(
+    computeVerseMerge({
+      base,
+      ours: text("ours"),
+      theirs: base,
+      humanEditedSinceExport: false,
+      masterMayHoldHumanEdit: false,
+    }).action,
+    "keep_master_unchanged",
+    "master never moved: still keep_master_unchanged",
+  );
+}
+
 console.log("\n[stableKey: key-order-only differences do not manufacture false diffs]");
 
 // Regression: base and ours can arrive from different writers with different

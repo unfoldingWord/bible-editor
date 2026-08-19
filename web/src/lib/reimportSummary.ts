@@ -21,6 +21,13 @@ export function summarizeReimport(res: ReimportResponse): string {
   if (t.source_attr_reconciled) parts.push(`${t.source_attr_reconciled} source-attr fix(es) synced from master`);
   if (t.merge_adopted) parts.push(`${t.merge_adopted} adopted from master (out-of-band correction)`);
   if (t.merge_conflicts) parts.push(`${t.merge_conflicts} flagged for review (merge conflict)`);
+  // Kept the app's version of a two-sided change, because no human commit was
+  // found behind Door43's side (#540 item 2). Reported apart from
+  // merge_conflicts above: that line's reader assumes Door43's version won, and
+  // here the app's did and the export is about to publish it. The wording states
+  // only what was measured — which commits moved the file, not anyone's intent.
+  if (t.merge_kept_ai)
+    parts.push(`${t.merge_kept_ai} kept over Door43 (no maintainer commit found there) — check before publishing`);
   // Rows whose Reference disagrees between the app and Door43. Split by who
   // moved (api/src/tsvMerge.ts's classifyTsvRefMove) because only the held cases
   // need anyone's attention — a move the app made is an ordinary edit the export

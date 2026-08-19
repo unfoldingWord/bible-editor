@@ -229,6 +229,108 @@ console.log("\n[a chunk that fails outright falls back to per-row, which still w
   eq(logCount, 90, "every one of the 90 verses has its audit row — the fallback chunk did not silently drop its logs");
 }
 
+console.log("\n[#540 item 2: an AI-only master movement never overwrites a later human app edit]");
+{
+  // The verse analogue of the AMO 4:2 shape, driven through the REAL
+  // applyVerseRows: an edited verse whose text moved on BOTH sides since the
+  // ancestor. Master wins that today. It must not when the commit lineage says
+  // every commit that moved master's file since the ancestor was our own export
+  // or a bp-assistant push — the "Door43 side" is then our own pipeline's
+  // output, and adopting it reverts the translator's later fix.
+  const seedContested = (sqlite) => {
+    sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (1, 1, 'translator')`).run();
+    sqlite
+      .prepare(
+        `INSERT INTO verses (book, chapter, verse, verse_end, bible_version, content_json, plain_text, version, updated_by)
+         VALUES (?, 4, 2, NULL, ?, ?, ?, 5, 1)`,
+      )
+      .run(BOOK, VERSION, contentJson("the translator's fix"), "the translator's fix");
+    // The ancestor: the content we published to master, logged before the
+    // boundary. verseContentJsonFromPayload reads the payload's `content` key.
+    const e = sqlite
+      .prepare(
+        `INSERT INTO edit_log (kind, row_key, book, action, payload_json, created_at)
+         VALUES ('verse', ?, ?, 'update', ?, 100)`,
+      )
+      .run(
+        `${BOOK}/4/2/${VERSION}`,
+        BOOK,
+        JSON.stringify({ content: JSON.parse(contentJson("the published text")) }),
+      );
+    return Number(e.lastInsertRowid);
+  };
+  const readVerse = (sqlite) =>
+    sqlite
+      .prepare("SELECT content_json, version FROM verses WHERE book = ? AND chapter = 4 AND verse = 2")
+      .all(BOOK)[0];
+  const AI_ONLY = {
+    mayHoldHumanEdit: false, hasHumanCommit: false, incomplete: false, incompleteReason: "",
+    counts: { ours: 1, ai: 2, human: 0 }, humanShas: [],
+  };
+
+  {
+    const { env, sqlite } = freshEnv();
+    const boundary = seedContested(sqlite);
+    const counts = await applyVerseRowsForTest(
+      env, BOOK, VERSION, [verse(4, 2, "the AI run's text")], null,
+      { confirmedAt: 200, editId: boundary, lineage: AI_ONLY }, false,
+    );
+    eq(readVerse(sqlite).content_json, contentJson("the translator's fix"), "the app edit survives — master is not adopted");
+    eq(readVerse(sqlite).version, 5, "…and nothing is written, so the version does not move");
+    eq(counts.merge_adopted, 0, "…no adoption is counted");
+    eq(counts.merge_kept_ai, 1, "…it is counted as merge_kept_ai");
+    eq(counts.merge_refused, 0, "…never as a refusal, which at 5 freezes the whole resource's export");
+    const conflict = sqlite
+      .prepare("SELECT action, reason, overwritten_version FROM verse_merge_conflicts WHERE book = ? AND chapter = 4")
+      .all(BOOK)[0];
+    eq(conflict.action, "keep_ai_master", "…and a review row is recorded so a human still sees the collision");
+    eq(conflict.reason, "both_changed_ai_master", "…with the measured reason");
+    eq(conflict.overwritten_version, null, "…and no recovery pointer, because nothing was overwritten");
+  }
+
+  {
+    // The half that must NOT move: a human commit on master since the ancestor
+    // still wins the same collision.
+    const { env, sqlite } = freshEnv();
+    const boundary = seedContested(sqlite);
+    const counts = await applyVerseRowsForTest(
+      env, BOOK, VERSION, [verse(4, 2, "a maintainer's correction")], null,
+      {
+        confirmedAt: 200, editId: boundary,
+        lineage: {
+          mayHoldHumanEdit: true, hasHumanCommit: true, incomplete: false, incompleteReason: "",
+          counts: { ours: 1, ai: 0, human: 1 }, humanShas: ["abc123"],
+        },
+      },
+      false,
+    );
+    eq(
+      readVerse(sqlite).content_json,
+      contentJson("a maintainer's correction"),
+      "a human-authored master edit is still adopted over the app edit",
+    );
+    eq(counts.merge_adopted, 1, "…counted as an adoption");
+    eq(counts.merge_kept_ai, 0, "…and not as a kept AI conflict");
+  }
+
+  {
+    // No lineage at all — an in-flight Workflow replaying a plan staged before
+    // this shipped. Must behave exactly as before: master wins.
+    const { env, sqlite } = freshEnv();
+    const boundary = seedContested(sqlite);
+    const counts = await applyVerseRowsForTest(
+      env, BOOK, VERSION, [verse(4, 2, "a maintainer's correction")], null,
+      { confirmedAt: 200, editId: boundary }, false,
+    );
+    eq(
+      readVerse(sqlite).content_json,
+      contentJson("a maintainer's correction"),
+      "an absent lineage keeps master-wins, not D1-wins",
+    );
+    eq(counts.merge_kept_ai, 0, "…and reports no kept AI conflict it did not measure");
+  }
+}
+
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed`);
   process.exit(1);

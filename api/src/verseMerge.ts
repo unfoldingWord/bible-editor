@@ -67,6 +67,7 @@ export type VerseMergeAction =
   | "keep_no_base" // no ancestor recoverable — cannot attribute, keep D1
   | "keep_master_unchanged" // master === base: their side never moved
   | "keep_alignment_refused" // adopting would lose alignment — keep D1, needs a human
+  | "keep_ai_master" // both moved, but no human moved master — keep D1, needs a human
   | "adopt" // master moved, we did not
   | "adopt_conflict"; // both moved — master wins, but a human must review
 
@@ -79,13 +80,26 @@ export interface VerseMergeInput {
   theirs: string;
   /** True when a human edit_log row exists after our last export commit. */
   humanEditedSinceExport: boolean;
+  /**
+   * Could a human have written master's side of this difference? FALSE only
+   * when a COMPLETE commit-lineage walk of master's file since the ancestor
+   * found nothing but our own export commits and bp-assistant pushes — see
+   * masterLineage.ts. Callers must pass `masterMayHoldHumanEdit(lineage)`, the
+   * helper, never a boolean they reconstructed: an incomplete walk is not "no
+   * human found".
+   *
+   * OMITTED means the caller never looked, which reads as `true` — today's
+   * behavior, master wins a both-changed conflict. Only an explicit `false`
+   * flips step 6.
+   */
+  masterMayHoldHumanEdit?: boolean;
 }
 
 export interface VerseMergeResult {
   action: VerseMergeAction;
   /** action is "adopt" | "adopt_conflict" */
   adopt: boolean;
-  /** needs a human: "adopt_conflict" | "keep_alignment_refused" */
+  /** needs a human: "adopt_conflict" | "keep_alignment_refused" | "keep_ai_master" */
   conflict: boolean;
   /** short stable machine reason, safe to persist and to log */
   reason: string;
@@ -282,7 +296,7 @@ function keysEqual(a: string | null, b: string | null): boolean {
 }
 
 export function computeVerseMerge(input: VerseMergeInput): VerseMergeResult {
-  const { base, ours, theirs, humanEditedSinceExport } = input;
+  const { base, ours, theirs, humanEditedSinceExport, masterMayHoldHumanEdit } = input;
 
   const oursKey = stableKey(ours);
   const theirsKey = stableKey(theirs);
@@ -344,6 +358,28 @@ export function computeVerseMerge(input: VerseMergeInput): VerseMergeResult {
     return { action: "adopt", adopt: true, conflict: false, reason: "master_only" };
   }
 
-  // 6. Both sides moved since the ancestor — master wins, a human must review.
+  // 6. Both sides moved since the ancestor. Master wins — but ONLY if a human
+  // could have written master's side.
+  //
+  // "Master is the side a human just touched by hand on Door43" was always the
+  // justification for master-wins here, and it was never measured: it is also
+  // where bp-assistant's overnight pushes land. AMO 4:2 is the shape — Beth
+  // fixed a note by hand in the app, the pipeline's own earlier run was still
+  // sitting on master, both sides read as moved, and the merge reverted her fix
+  // to the text of her own AI run. Benjamin's ruling (#540 item 2):
+  // AI-pipeline-authored master content must never beat a later human app edit.
+  //
+  // So when the lineage says every commit that moved master since the ancestor
+  // was ours or the pipeline's, D1 wins and a human reviews. Master-wins stays
+  // for a genuine maintainer edit, and for every case where we could not prove
+  // there wasn't one — masterMayHoldHumanEdit is true when the walk was
+  // incomplete and when the caller never looked.
+  //
+  // Nothing is written here, so nothing is lost either way: the export still
+  // publishes D1 over master, which is the point — that is how the human's edit
+  // reaches Door43 instead of being reverted by it.
+  if (masterMayHoldHumanEdit === false) {
+    return { action: "keep_ai_master", adopt: false, conflict: true, reason: "both_changed_ai_master" };
+  }
   return { action: "adopt_conflict", adopt: true, conflict: true, reason: "both_changed" };
 }

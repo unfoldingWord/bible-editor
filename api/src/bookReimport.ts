@@ -41,7 +41,22 @@
 
 import type { Env } from "./index";
 import type { WorkflowStep } from "cloudflare:workers";
-import { dcsUrls, dcsResourceFile, dcsRawUrl, fileCommitSha, fetchText, NT_BOOKS } from "./dcsSources";
+import {
+  dcsUrls,
+  dcsResourceFile,
+  dcsRawUrl,
+  fileCommitSha,
+  fetchText,
+  listMasterCommitsSince,
+  NT_BOOKS,
+} from "./dcsSources";
+import {
+  classifyMasterCommit,
+  compactLineage,
+  masterMayHoldHumanEdit,
+  summarizeLineage,
+  type MasterLineageSummary,
+} from "./masterLineage.ts";
 import { gitBlobShaOrNull, recognizeOwnPublish, type OwnPublishResult } from "./ownPublish";
 import {
   collectSourceWords,
@@ -250,6 +265,16 @@ export interface ReimportCounts {
   // neither side touched. A subset of merge_conflicts (every refusal needs a
   // human) tracked separately so the reason breakdown is visible. verses only.
   merge_refused: number;
+  // Row or verse where both sides moved since the ancestor but the commit
+  // lineage found NO human commit on master's side, so D1 won and the
+  // collision was flagged instead (#540 item 2, verseMerge/tsvMerge's
+  // "keep_ai_master"). A subset of merge_conflicts, tracked separately for two
+  // reasons: it is the counter that says whether the AI-vs-human policy is
+  // actually firing in production, and it must never be folded into
+  // merge_refused, which freezes the resource's export at 5 (see
+  // isSystemicMergeRefusal — freezing here would strand the very edit this
+  // outcome protected). verses AND tsv.
+  merge_kept_ai: number;
   // Verse where computeVerseMerge returned "keep_no_base" — no ancestor was
   // recoverable for this specific verse (edit_log aged past the 180-day
   // retention, or the verse has no edit_log row before book_resource_syncs.
@@ -421,6 +446,7 @@ function zeroCounts(): ReimportCounts {
     merge_adopted: 0,
     merge_conflicts: 0,
     merge_refused: 0,
+    merge_kept_ai: 0,
     merge_no_base: 0,
     merge_no_base_refs: [],
     ref_moved_ours: 0,
@@ -524,6 +550,7 @@ function addCounts(into: ReimportCounts, from: ReimportCounts): void {
   into.merge_adopted += from.merge_adopted ?? 0;
   into.merge_conflicts += from.merge_conflicts ?? 0;
   into.merge_refused += from.merge_refused ?? 0;
+  into.merge_kept_ai += from.merge_kept_ai ?? 0;
   into.merge_no_base += from.merge_no_base ?? 0;
   // Same shape as blocked_samples above: diagnostic, capped, gates nothing. A
   // chunk memoized before this field existed contributes no refs while still
@@ -732,12 +759,20 @@ async function runReimport(
   const fetchedRaw: Record<Resource, string | null> = {
     ult: ultRaw, ust: ustRaw, tn: tnRaw, tq: tqRaw, twl: twlRaw,
   };
+  // Who moved master, per resource, for the merges below (#540 item 1). Filled
+  // in the same loop that already reads this pair's sync state, so no extra D1
+  // read; a resource recognized as our own publish never gets one, because
+  // recognition means master did not move under us at all.
+  const lineageByResource: Partial<Record<Resource, MasterLineageSummary | null>> = {};
   for (const resource of ALL_RESOURCES) {
     const raw = fetchedRaw[resource];
     if (!want.has(resource) || raw == null) continue;
     const state = await resourceSyncState(env, book, resource);
     const own = await recognizePushedRender(env, book, resource, raw, state);
-    if (!own.recognized) continue;
+    if (!own.recognized) {
+      lineageByResource[resource] = await loadMasterLineage(env, book, resource, state.sourceSha);
+      continue;
+    }
     const stamped = await markOwnPublishConverged(env, book, resource, own.readAt, state.pushedEditId, null);
     if (stamped) perResource[resource].own_publish_converged++;
     console.log("reimport recognized master's movement as our own publish", {
@@ -753,15 +788,36 @@ async function runReimport(
   // resource) for this whole run, not once per chapter — see
   // getMasterConfirmedAt. 2 reads total for this run (ult + ust), down from
   // one per chapter.
-  const masterConfirmedAtUlt = want.has("ult") && ultRaw ? await getMasterConfirmedAt(env, book, "ult") : null;
-  const masterConfirmedAtUst = want.has("ust") && ustRaw ? await getMasterConfirmedAt(env, book, "ust") : null;
+  // Carries this run's lineage alongside the cutoff — one object per pair, so a
+  // merge call site cannot receive an ancestor without the attribution that
+  // goes with it.
+  const withLineage = (cutoff: MergeCutoff | null, resource: Resource): MergeCutoff | null =>
+    cutoff == null ? null : { ...cutoff, lineage: lineageByResource[resource] ?? null };
+
+  const masterConfirmedAtUlt = withLineage(
+    want.has("ult") && ultRaw ? await getMasterConfirmedAt(env, book, "ult") : null,
+    "ult",
+  );
+  const masterConfirmedAtUst = withLineage(
+    want.has("ust") && ustRaw ? await getMasterConfirmedAt(env, book, "ust") : null,
+    "ust",
+  );
   // TSV merge ancestor cutoffs — same once-per-run hoist as ult/ust above (the
   // three-way merge for edited tn/tq/twl rows reads this in applyTsvRows). NULL
   // means this (book, resource) has never been positively confirmed on master,
   // so the merge stays inert and edited rows behave exactly as before.
-  const masterConfirmedAtTn = want.has("tn") && tnRaw ? await getMasterConfirmedAt(env, book, "tn") : null;
-  const masterConfirmedAtTq = want.has("tq") && tqRaw ? await getMasterConfirmedAt(env, book, "tq") : null;
-  const masterConfirmedAtTwl = want.has("twl") && twlRaw ? await getMasterConfirmedAt(env, book, "twl") : null;
+  const masterConfirmedAtTn = withLineage(
+    want.has("tn") && tnRaw ? await getMasterConfirmedAt(env, book, "tn") : null,
+    "tn",
+  );
+  const masterConfirmedAtTq = withLineage(
+    want.has("tq") && tqRaw ? await getMasterConfirmedAt(env, book, "tq") : null,
+    "tq",
+  );
+  const masterConfirmedAtTwl = withLineage(
+    want.has("twl") && twlRaw ? await getMasterConfirmedAt(env, book, "twl") : null,
+    "twl",
+  );
 
   // P2.5 (subrequest budget): apply the TSV resources at the BOOK level, not per
   // chapter. The three-way merge for edited tn/tq/twl rows does one batched
@@ -1027,7 +1083,11 @@ export async function applyTsvRows(
     // can tell an AI-only row (updated_by set, latest source = ai_pipeline) apart
     // from a human edit. Mirrors the deleteUnkeptTns correlated subquery.
     const rs = await env.DB.prepare(
-      `SELECT id, ${TSV_STORED_COLS[kind]}, sort_order, ${pristineCols}, review_kind,
+      // review_reason is selected alongside review_kind because two flag writers
+      // below compare against it to avoid re-writing an identical message every
+      // night — and a version bump is not free (#539). Without the column those
+      // comparisons run against `undefined` and never short-circuit.
+      `SELECT id, ${TSV_STORED_COLS[kind]}, sort_order, ${pristineCols}, review_kind, review_reason,
               (SELECT source FROM edit_log
                  WHERE kind = ?2 AND row_key = ${kind}_rows.id
                    AND (book = ?1 OR book IS NULL)
@@ -1300,6 +1360,10 @@ export async function applyTsvRows(
       let conflict = false;
       let conflictFields: string[] = [];
       let adopted = false;
+      // The conflict was resolved D1-wins because master's side had no human
+      // commit behind it (#540 item 2) — the review message has to say that,
+      // not the opposite.
+      let keptAiConflict = false;
 
       // A human-protected tn row (preserve/hint/trashed — deleted_at is already
       // handled at the tombstone branch) must NEVER be overwritten from master,
@@ -1323,8 +1387,19 @@ export async function applyTsvRows(
           bases.get(row.id)?.content ?? null,
           parsedRowToMergeSide(kind, storedTsvRowToParsed(kind, cur)),
           parsedRowToMergeSide(kind, row),
+          // #540 item 2. Always via the helper: an incomplete lineage walk must
+          // protect master exactly like a found human commit, and only
+          // masterMayHoldHumanEdit encodes that.
+          { masterMayHoldHumanEdit: masterMayHoldHumanEdit(cutoff?.lineage) },
         );
         if (merge.action === "keep_no_base") counts.merge_no_base++;
+        // #540 item 2: both sides moved a field, and the lineage found no human
+        // commit behind master's side, so D1 keeps that field. See the counter's
+        // declaration for why this must never join merge_refused.
+        if (merge.action === "keep_ai_master") {
+          counts.merge_kept_ai++;
+          keptAiConflict = true;
+        }
         if (merge.adopt) {
           adopted = true;
           Object.assign(fields, merge.writeFields);
@@ -1336,10 +1411,15 @@ export async function applyTsvRows(
           // rendered occurrence: it is the matched pair DCS itself accepted.
           const surfaceField = kind === "twl" ? "orig_words" : "quote";
           if (surfaceField in fields) fields.occurrence = row.occurrence ?? null;
-          if (merge.conflict) {
-            conflict = true;
-            conflictFields = merge.conflictFields;
-          }
+        }
+        // OUTSIDE the `merge.adopt` branch deliberately. A collision needs a
+        // human whichever side won it, and keep_ai_master can win one for D1
+        // while writing no content field at all — nesting this under `adopt`
+        // (as it was when adopt_conflict was the only conflicting outcome)
+        // would drop the flag for exactly the rows this policy protects.
+        if (merge.conflict) {
+          conflict = true;
+          conflictFields = merge.conflictFields;
         }
       }
 
@@ -1505,21 +1585,41 @@ export async function applyTsvRows(
         }
       }
 
-      if (Object.keys(fields).length === 0) {
-        counts.skipped_edited++;
-        continue;
-      }
       // A both-sides-changed conflict flags the row for in-app review (the
       // cleanup chip, lint.ts) — atomic with the content write, so the flag can
       // never be lost separately from the overwrite. The overwritten value is
       // retained in edit_log (recoverable by an admin) — worded without promising
       // a per-row history UI or naming internal columns (cold-review #5).
+      //
+      // Runs BEFORE the "nothing to write" bail below, because a keep_ai_master
+      // conflict writes no content at all: leaving this where it was would have
+      // counted exactly the rows this policy protects as a plain skipped_edited
+      // and told nobody. It is also the ONLY write such a row makes, so it is
+      // guarded against re-writing an identical message — a flag-only write still
+      // bumps the row's version, and this condition recurs every night until a
+      // human resolves it (#539).
       if (conflict) {
         const labels = conflictFields.map((f) => TSV_FIELD_LABELS[f] ?? f);
-        fields.review_kind = "merge_conflict";
-        fields.review_reason =
-          `A Door43 edit to this row's ${labels.join(" and ")} was merged over your app-side change. ` +
-          `Please double-check it.`;
+        const reason = keptAiConflict
+          ? // MEASURED, not assumed: the lineage walk completed and found no
+            // human commit on master's file since the ancestor. It may not say
+            // "a Door43 editor", because none was seen (the standing
+            // alert-wording rule) — and the row is NOT held, so the next export
+            // publishes this value to Door43.
+            `This row changed here and on Door43 since the last sync, and every Door43 commit to this file ` +
+            `since then came from Bible Editor or the note-writing pipeline — so your ${labels.join(" and ")} ` +
+            `was kept and will be published to Door43. Please double-check it.`
+          : `A Door43 edit to this row's ${labels.join(" and ")} was merged over your app-side change. ` +
+            `Please double-check it.`;
+        if (cur.review_kind !== "merge_conflict" || cur.review_reason !== reason) {
+          fields.review_kind = "merge_conflict";
+          fields.review_reason = reason;
+        }
+      }
+
+      if (Object.keys(fields).length === 0) {
+        counts.skipped_edited++;
+        continue;
       }
       editedWrites.push({
         id: row.id,
@@ -2183,6 +2283,18 @@ function sourceWordsForVerseRange(
 interface MergeCutoff {
   confirmedAt: number | null;
   editId: number | null;
+  /**
+   * WHO moved master's file for this (book, resource) since the ancestor —
+   * issue #540 item 1. Fetched once per pair per run at the only place that
+   * already holds master's sha (planAndStageBookResources / runReimport's
+   * own-publish loop, both via loadMasterLineage), then carried here so both
+   * merges can ask the one question that decides a both-changed conflict.
+   *
+   * ABSENT (undefined) means nobody looked, which masterMayHoldHumanEdit reads
+   * as "a human may have" — today's behavior. Never read this field directly;
+   * pass it to that helper. See masterLineage.ts.
+   */
+  lineage?: MasterLineageSummary | null;
 }
 
 async function getMasterConfirmedAt(env: Env, book: string, resource: string): Promise<MergeCutoff> {
@@ -2212,6 +2324,46 @@ async function getMasterConfirmedAt(env: Env, book: string, resource: string): P
       .first<{ master_confirmed_at: number | null }>();
     return { confirmedAt: row?.master_confirmed_at ?? null, editId: null };
   }
+}
+
+// Who moved master's file for this (book, resource) since the ancestor commit
+// we last confirmed (#540 item 1). One Gitea call per page, default budget 5
+// pages (~250 commits) — and only ever called where master's sha has ALREADY
+// been observed to move, which is the same condition that gates the file fetch
+// itself, so a quiet resource costs nothing.
+//
+// Returns null only when there is nothing to ask about (no resource file, or no
+// ancestor sha recorded). Every other failure comes back as a summary flagged
+// `incomplete`, which masterMayHoldHumanEdit treats exactly like a found human
+// commit — a fetch that fell over must never read as "no human touched this".
+async function loadMasterLineage(
+  env: Env,
+  book: string,
+  resource: Resource,
+  sinceSha: string | null,
+): Promise<MasterLineageSummary | null> {
+  const file = dcsResourceFile(book, resource);
+  if (!file || !sinceSha) return null;
+  const page = await listMasterCommitsSince(env, file.repo, file.path, sinceSha);
+  const lineage = summarizeLineage(page.commits.map(classifyMasterCommit), {
+    incomplete: page.incomplete,
+    incompleteReason: page.incompleteReason,
+  });
+  const summary = compactLineage(lineage);
+  // Logged for every pair that fetched one, not just the ones that changed a
+  // decision: "the merge kept D1 because only the pipeline moved master" is a
+  // claim, and this is the measurement behind it.
+  console.log("reimport master lineage", {
+    book,
+    resource,
+    sinceSha,
+    mayHoldHumanEdit: summary.mayHoldHumanEdit,
+    ...summary.counts,
+    incomplete: summary.incomplete,
+    incompleteReason: summary.incompleteReason,
+    humanShas: summary.humanShas,
+  });
+  return summary;
 }
 
 // Heal AI-mangled U+FFFD in `\zaln-s` source attributes (x-content / x-lemma /
@@ -2585,6 +2737,10 @@ async function applyVerseRows(
           ours: ex.content_json,
           theirs: v.contentJson,
           humanEditedSinceExport: Number(ex.human_edit_after_export ?? 0) !== 0,
+          // #540 item 2. Always the helper, never `cutoff.lineage.hasHumanCommit`
+          // — an incomplete walk must protect master exactly like a found human
+          // commit, and only this function knows that.
+          masterMayHoldHumanEdit: masterMayHoldHumanEdit(cutoff?.lineage),
         });
         if (merge.action === "keep_no_base") {
           counts.merge_no_base++;
@@ -2596,6 +2752,13 @@ async function applyVerseRows(
           if (refs.length < NO_BASE_REF_CAP) refs.push(`${v.chapter}:${v.verse}`);
         }
         if (merge.action === "keep_alignment_refused") counts.merge_refused++;
+        // Deliberately NOT folded into merge_refused: that counter feeds
+        // isSystemicMergeRefusal, which freezes the whole (book, resource)
+        // export once five verses hit it. Freezing is exactly wrong here — the
+        // export is how the human edit this outcome just protected reaches
+        // Door43, and withholding it would re-create the livelock #543 killed on
+        // the TSV side. Counted separately so the class is still visible.
+        if (merge.action === "keep_ai_master") counts.merge_kept_ai++;
         // FIX 5: converged-per-stableKey but the raw bytes differed — a real,
         // cosmetic-only edit this comparison silently discards. See
         // verseMerge.ts's FIX 5 correction and the field's own doc comment.
@@ -3366,6 +3529,17 @@ interface StagedResource {
   // `changed: false`, but for a completely different reason than a SHA match or
   // a 404, so it is reported separately (own_publish_converged).
   ownPublish?: boolean;
+  // Who moved master's file since `sync.sourceSha` (#540 item 1), measured here
+  // because this is the only place in the nightly path that talks to DCS per
+  // pair — and measured only for a resource that is actually being staged, so a
+  // SHA-unchanged or own-publish resource costs nothing. Rides the plan's
+  // `step.do` result into every chunk step, which is what keeps it one fetch per
+  // pair per run rather than one per chunk.
+  //
+  // Absent on a plan replayed from a Workflow instance that started before this
+  // shipped; masterMayHoldHumanEdit reads that absence as "a human may have",
+  // which is the pre-existing behavior.
+  lineage?: MasterLineageSummary | null;
 }
 
 interface ReimportPlan {
@@ -4234,9 +4408,14 @@ async function planAndStageBookResources(
       entries.push({ resource, changed: false, masterSha: null, r2Key: null });
       continue;
     }
+    // Master's file moved, and it was not our own render coming back — so
+    // SOMEONE moved it, and both merges are about to need to know who (#540
+    // item 1). This is the one point in the nightly path with the ancestor sha
+    // and the file's repo/path both in hand, and it runs once per staged pair.
+    const lineage = await loadMasterLineage(env, book, resource, sync.sourceSha);
     const r2Key = `reimport-stage/${instanceId}/${book}/${resource}`;
     await env.BLOBS.put(r2Key, raw);
-    entries.push({ resource, changed: true, masterSha, r2Key });
+    entries.push({ resource, changed: true, masterSha, r2Key, lineage });
   }
   return { maxChapter, entries };
 }
@@ -4308,14 +4487,30 @@ async function reimportStagedChunk(
   // this whole chunk step, not once per chapter — see getMasterConfirmedAt.
   // Up to 2 reads per step (ult + ust), down from up to ~18 (REIMPORT_CHAPTER_
   // CHUNK=8 chapters, +1 for chapter 0 on the first chunk, × 2 resources).
-  const masterConfirmedAtUlt = versesByChapter.ult ? await getMasterConfirmedAt(env, book, "ult") : null;
-  const masterConfirmedAtUst = versesByChapter.ust ? await getMasterConfirmedAt(env, book, "ust") : null;
+  // The lineage rides in on the plan (#540 item 1) — measured ONCE per pair at
+  // stage time, not re-fetched per chunk, which is what keeps this at one Gitea
+  // walk per (book, resource) per night. `?? null` is not a coercion of a
+  // measured value: an entry from a plan staged before this shipped simply has
+  // no field, and null means "nobody looked", which is the protective answer.
+  const lineageOf = (resource: Resource): MasterLineageSummary | null =>
+    staged.find((e) => e.resource === resource)?.lineage ?? null;
+  const withLineage = (cutoff: MergeCutoff | null, resource: Resource): MergeCutoff | null =>
+    cutoff == null ? null : { ...cutoff, lineage: lineageOf(resource) };
+
+  const masterConfirmedAtUlt = withLineage(
+    versesByChapter.ult ? await getMasterConfirmedAt(env, book, "ult") : null,
+    "ult",
+  );
+  const masterConfirmedAtUst = withLineage(
+    versesByChapter.ust ? await getMasterConfirmedAt(env, book, "ust") : null,
+    "ust",
+  );
   // Same hoist for the TSV three-way merge ancestor cutoffs — once per chunk
   // step, read only for a kind that actually has rows staged this chunk.
   const masterConfirmedAtTsv: Record<TsvKind, MergeCutoff | null> = {
-    tn: rowsByChapter.tn ? await getMasterConfirmedAt(env, book, "tn") : null,
-    tq: rowsByChapter.tq ? await getMasterConfirmedAt(env, book, "tq") : null,
-    twl: rowsByChapter.twl ? await getMasterConfirmedAt(env, book, "twl") : null,
+    tn: withLineage(rowsByChapter.tn ? await getMasterConfirmedAt(env, book, "tn") : null, "tn"),
+    tq: withLineage(rowsByChapter.tq ? await getMasterConfirmedAt(env, book, "tq") : null, "tq"),
+    twl: withLineage(rowsByChapter.twl ? await getMasterConfirmedAt(env, book, "twl") : null, "twl"),
   };
 
   for (let chapter = startChapter; chapter <= endChapter; chapter++) {

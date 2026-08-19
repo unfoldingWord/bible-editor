@@ -202,6 +202,82 @@ function deep(actual, expected, msg) {
   deep(r.conflictFields, ["note"], "tn only note is the conflict field");
 }
 
+console.log("\n[#540 item 2: AI-only master movement never beats a later human app edit]");
+
+// 8a. The same both-moved field, but the commit lineage proved every commit that
+// moved master's file since the ancestor was our own export or the note
+// pipeline. D1's value stands, and the collision is still reported.
+{
+  const r = computeTsvMerge(
+    "tn",
+    { note: "orig" },
+    { note: "our edit" },
+    { note: "the AI run's note" },
+    { masterMayHoldHumanEdit: false },
+  );
+  eq(r.action, "keep_ai_master", "tn both-moved + no human commit -> keep_ai_master");
+  eq(r.conflict, true, "keep_ai_master: still a conflict a human reviews");
+  eq(r.adopt, false, "keep_ai_master with nothing else to write: adopt false");
+  deep(r.writeFields, {}, "keep_ai_master writes nothing for the contested field");
+  deep(r.conflictFields, ["note"], "keep_ai_master still names the contested field");
+}
+
+// 8b. A row can hold BOTH a contested field D1 keeps and a field master moved on
+// its own. The clean adopt still lands — the policy is about who wins a
+// collision, not about refusing master's uncontested work.
+{
+  const base = { quote: "q0", note: "n0" };
+  const ours = { quote: "q0", note: "our note" };
+  const theirs = { quote: "q_master", note: "the AI run's note" };
+  const r = computeTsvMerge("tn", base, ours, theirs, { masterMayHoldHumanEdit: false });
+  eq(r.action, "keep_ai_master", "mixed clean-adopt + kept conflict -> keep_ai_master");
+  eq(r.adopt, true, "adopt stays true — there is still a field to write");
+  deep(r.writeFields, { quote: "q_master" }, "adopts the uncontested quote, keeps our note");
+  deep(r.conflictFields, ["note"], "note is reported as the contested field");
+}
+
+// 8c. One-directional, same as the verse side: only a measured `false` flips the
+// outcome. `true` and OMITTED both keep master-wins, because
+// masterMayHoldHumanEdit() answers true for an incomplete walk and for never
+// having looked.
+{
+  const args = ["tn", { note: "orig" }, { note: "our edit" }, { note: "master edit" }];
+  eq(computeTsvMerge(...args).action, "adopt_conflict", "opts omitted -> master still wins");
+  eq(computeTsvMerge(...args, {}).action, "adopt_conflict", "empty opts -> master still wins");
+  eq(
+    computeTsvMerge(...args, { masterMayHoldHumanEdit: true }).action,
+    "adopt_conflict",
+    "masterMayHoldHumanEdit true -> master still wins",
+  );
+  eq(
+    computeTsvMerge(...args, { masterMayHoldHumanEdit: undefined }).action,
+    "adopt_conflict",
+    "masterMayHoldHumanEdit undefined -> master still wins",
+  );
+}
+
+// 8d. Scoped to the collision. A field master moved that we never touched is
+// still adopted with no flag at all, whatever the lineage says — that is how
+// pipeline work reaches D1.
+{
+  const r = computeTsvMerge("tn", { note: "orig" }, { note: "orig" }, { note: "master fix" }, {
+    masterMayHoldHumanEdit: false,
+  });
+  eq(r.action, "adopt", "uncontested master edit is still a clean adopt");
+  eq(r.conflict, false, "uncontested adopt raises no conflict");
+  deep(r.writeFields, { note: "master fix" }, "uncontested adopt still writes master's value");
+}
+
+// 8e. And a row with no recoverable ancestor stays keep_no_base: the policy
+// resolves an attributed collision, it never invents an attribution.
+{
+  const r = computeTsvMerge("tn", null, { note: "our edit" }, { note: "master edit" }, {
+    masterMayHoldHumanEdit: false,
+  });
+  eq(r.action, "keep_no_base", "no ancestor -> keep_no_base, not keep_ai_master");
+  eq(r.conflict, false, "keep_no_base raises no conflict");
+}
+
 // 9. Occurrence is deliberately NOT merged (renderOccurrence coercion makes
 //    D1-vs-master occurrence unreliable — see FIELDS_BY_KIND). A pure occurrence
 //    difference must therefore read as converged (nothing this merge owns

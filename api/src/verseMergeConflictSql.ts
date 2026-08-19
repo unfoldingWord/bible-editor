@@ -51,7 +51,7 @@ export const RESOLVE_VERSE_MERGE_CONFLICT_SQL = `UPDATE verse_merge_conflicts
 // filter against real SQLite, the same anti-drift reason every other statement
 // here is a shared constant.
 //
-// The three alertable actions are the ones a human still needs to look at:
+// The alertable actions are the ones a human still needs to look at:
 //   'adopt_conflict'         — Door43's version replaced a human edit.
 //   'keep_alignment_refused' — kept D1 (nothing overwritten), export will
 //                              still revert master until resolved.
@@ -61,6 +61,14 @@ export const RESOLVE_VERSE_MERGE_CONFLICT_SQL = `UPDATE verse_merge_conflicts
 //                              impossible to place unambiguously (the EZK 40
 //                              repeated-architecture-terms case). Same
 //                              export-reverts-until-resolved shape as a refusal.
+//   'keep_ai_master'         — kept D1 (nothing overwritten): both sides moved,
+//                              but every commit that moved master's file since
+//                              the ancestor was our own export or the note
+//                              pipeline, so the app edit won (#540 item 2).
+//                              Unlike the two above, tonight's export PUBLISHES
+//                              D1 here — that is the point — so what a human is
+//                              asked to check is the kept value, not a revert
+//                              waiting to happen.
 // A clean 'adopt' (master moved, we didn't) is deliberately EXCLUDED — it needs
 // no judgement and stays in the table purely as an audit trail.
 //
@@ -69,7 +77,7 @@ export const RESOLVE_VERSE_MERGE_CONFLICT_SQL = `UPDATE verse_merge_conflicts
 export const SELECT_ACTIVE_ALERTABLE_CONFLICTS_SQL = `SELECT chapter, verse, action, reason, overwritten_version, alignment
      FROM verse_merge_conflicts
     WHERE book = ?1 AND resource = ?2
-      AND action IN ('adopt_conflict', 'keep_alignment_refused', 'source_attr_divergent')
+      AND action IN ('adopt_conflict', 'keep_alignment_refused', 'source_attr_divergent', 'keep_ai_master')
       AND resolved_at IS NULL
     ORDER BY chapter ASC, verse ASC`;
 
@@ -139,12 +147,12 @@ export const UPSERT_VERSE_MERGE_CONFLICT_SQL = `INSERT INTO verse_merge_conflict
      -- routine adoption — see recordVerseMergeConflicts's own doc comment for
      -- the full Night-1/Night-2 walkthrough this anti-downgrade protects.
      action = CASE
-       WHEN excluded.action = 'adopt' AND verse_merge_conflicts.action = 'adopt_conflict'
+       WHEN excluded.action = 'adopt' AND verse_merge_conflicts.action IN ('adopt_conflict', 'keep_ai_master')
        THEN verse_merge_conflicts.action
        ELSE excluded.action
      END,
      reason = CASE
-       WHEN excluded.action = 'adopt' AND verse_merge_conflicts.action = 'adopt_conflict'
+       WHEN excluded.action = 'adopt' AND verse_merge_conflicts.action IN ('adopt_conflict', 'keep_ai_master')
        THEN verse_merge_conflicts.reason
        ELSE excluded.reason
      END,
@@ -157,7 +165,7 @@ export const UPSERT_VERSE_MERGE_CONFLICT_SQL = `INSERT INTO verse_merge_conflict
      -- across a resolve -> new-conflict cycle on the SAME verse — worth a
      -- follow-up if that combination turns out to matter in practice.
      overwritten_version = CASE
-       WHEN excluded.action IN ('keep_alignment_refused', 'source_attr_divergent') THEN NULL
+       WHEN excluded.action IN ('keep_alignment_refused', 'source_attr_divergent', 'keep_ai_master') THEN NULL
        ELSE COALESCE(verse_merge_conflicts.overwritten_version, excluded.overwritten_version)
      END,
      alignment = COALESCE(excluded.alignment, verse_merge_conflicts.alignment),
@@ -181,8 +189,8 @@ export const UPSERT_VERSE_MERGE_CONFLICT_SQL = `INSERT INTO verse_merge_conflict
      -- surface. 'keep_alignment_refused' was originally left out of this
      -- carve-out (only partially masked by the merge_refused systemic
      -- freeze) — see issue #457, closed here.
-     resolved_at = CASE WHEN excluded.action IN ('source_attr_divergent', 'keep_alignment_refused') THEN NULL ELSE verse_merge_conflicts.resolved_at END,
-     resolved_by = CASE WHEN excluded.action IN ('source_attr_divergent', 'keep_alignment_refused') THEN NULL ELSE verse_merge_conflicts.resolved_by END`;
+     resolved_at = CASE WHEN excluded.action IN ('source_attr_divergent', 'keep_alignment_refused', 'keep_ai_master') THEN NULL ELSE verse_merge_conflicts.resolved_at END,
+     resolved_by = CASE WHEN excluded.action IN ('source_attr_divergent', 'keep_alignment_refused', 'keep_ai_master') THEN NULL ELSE verse_merge_conflicts.resolved_by END`;
 
 // ---------------------------------------------------------------------------
 // verseMergeConflicts.ts's confirmAdoptedConflicts — the SECOND phase of

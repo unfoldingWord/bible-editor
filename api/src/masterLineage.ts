@@ -151,10 +151,62 @@ export function summarizeLineage(
   };
 }
 
+// How many human commit shas a summary carries as evidence. The count is
+// authoritative; this list exists so an alert can NAME what it measured instead
+// of asserting it, and it rides through a Workflow step's serialized return
+// value, so it must stay small.
+export const LINEAGE_EVIDENCE_CAP = 5;
+
+// The compact form of a lineage — what actually travels from the one place that
+// can fetch it (planAndStageBookResources, which already holds master's sha) to
+// the merge call sites several Workflow steps later. A full MasterLineage can
+// carry ~250 commits with their whole messages; a step return value must not.
+//
+// `mayHoldHumanEdit` is COMPUTED HERE, by the helper below, and never
+// recomputed downstream: the fail-safe is "incomplete counts as human", and a
+// consumer holding only the compacted booleans could reconstruct that wrong.
+export interface MasterLineageSummary {
+  /** masterMayHoldHumanEdit(lineage), evaluated once, at the fetch. */
+  mayHoldHumanEdit: boolean;
+  hasHumanCommit: boolean;
+  incomplete: boolean;
+  incompleteReason: string;
+  counts: { ours: number; ai: number; human: number };
+  /** Up to LINEAGE_EVIDENCE_CAP human commit shas, newest first. */
+  humanShas: string[];
+}
+
+export function compactLineage(lineage: MasterLineage): MasterLineageSummary {
+  const counts = { ours: 0, ai: 0, human: 0 };
+  const humanShas: string[] = [];
+  for (const c of lineage.commits) {
+    counts[c.kind]++;
+    if (c.kind === "human" && humanShas.length < LINEAGE_EVIDENCE_CAP) humanShas.push(c.sha);
+  }
+  return {
+    mayHoldHumanEdit: masterMayHoldHumanEdit(lineage),
+    hasHumanCommit: lineage.hasHumanCommit,
+    incomplete: lineage.incomplete,
+    incompleteReason: lineage.incompleteReason,
+    counts,
+    humanShas,
+  };
+}
+
 // The single question the merge asks. Separated from the data so no call site
 // can reconstruct the fail-safe wrong: an incomplete walk is NOT "no human
 // found", and reading `hasHumanCommit` on its own would say exactly that.
-export function masterMayHoldHumanEdit(lineage: MasterLineage | null): boolean {
-  if (lineage === null) return true; // never looked -> assume a human did
+//
+// Accepts either form, and — deliberately — `undefined` as well as `null`: a
+// caller that never looked, or one reading a field an in-flight Workflow's
+// memoized step result simply does not carry, must land on the protective
+// answer rather than on `!undefined`. Only a COMPLETE walk that found no human
+// commit returns false, and only that answer lets D1 win a both-changed
+// conflict.
+export function masterMayHoldHumanEdit(
+  lineage: MasterLineage | MasterLineageSummary | null | undefined,
+): boolean {
+  if (lineage == null) return true; // never looked -> assume a human did
+  if ("mayHoldHumanEdit" in lineage) return lineage.mayHoldHumanEdit !== false;
   return lineage.incomplete || lineage.hasHumanCommit;
 }

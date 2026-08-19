@@ -11,6 +11,8 @@
 
 import {
   classifyMasterCommit,
+  compactLineage,
+  LINEAGE_EVIDENCE_CAP,
   masterMayHoldHumanEdit,
   summarizeLineage,
 } from "./masterLineage.ts";
@@ -138,6 +140,67 @@ eq(
   // commits since the ancestor is impossible, but zero-human is not.
   eq(masterMayHoldHumanEdit(summarizeLineage([])), false, "a complete empty lineage holds no human edit");
   eq(masterMayHoldHumanEdit(null), true, "never having looked protects master");
+  // `undefined`, not just `null`: the summary reaches the merge through a
+  // Workflow step's serialized plan, and an instance that started before this
+  // shipped replays a plan entry with no such field at all.
+  eq(masterMayHoldHumanEdit(undefined), true, "an absent lineage protects master exactly like a null one");
+}
+
+console.log("\n[the compact summary that crosses a Workflow step boundary]");
+
+{
+  const cs = [
+    classifyMasterCommit({ sha: "s1", message: "bible-editor: AMO tq → master (#815)", authorEmail: BW }),
+    classifyMasterCommit({ sha: "s2", message: "TQ: AMO 5 [be..s@api.bp-assistant]", authorEmail: BOT }),
+    classifyMasterCommit({ sha: "s3", message: "Adds '0' to Occurrence column (#458)", authorEmail: RICH }),
+  ];
+  const s = compactLineage(summarizeLineage(cs));
+  eq(s.counts.ours, 1, "summary counts our export commits");
+  eq(s.counts.ai, 1, "summary counts AI pushes");
+  eq(s.counts.human, 1, "summary counts human commits");
+  eq(s.hasHumanCommit, true, "summary carries hasHumanCommit");
+  eq(s.mayHoldHumanEdit, true, "summary answers the merge's question directly");
+  eq(JSON.stringify(s.humanShas), JSON.stringify(["s3"]), "summary names the human commit as evidence");
+  eq(masterMayHoldHumanEdit(s), true, "the helper reads a summary as it reads a lineage");
+}
+
+{
+  // The decision-changing shape, and the one thing the summary must never get
+  // wrong: this is the only answer that lets D1 win a conflict.
+  const cs = [
+    classifyMasterCommit({ sha: "s1", message: "bible-editor: AMO tq → master (#815)", authorEmail: BW }),
+    classifyMasterCommit({ sha: "s2", message: "TQ: AMO 5 [be..s@api.bp-assistant]", authorEmail: BOT }),
+  ];
+  const s = compactLineage(summarizeLineage(cs));
+  eq(s.mayHoldHumanEdit, false, "ours + ai only -> the summary says master may not hold a human edit");
+  eq(masterMayHoldHumanEdit(s), false, "and the helper agrees, reading the summary");
+  eq(JSON.stringify(s.humanShas), JSON.stringify([]), "no human shas to cite");
+}
+
+{
+  // Compaction must not launder an incomplete walk into a clean "no human".
+  // This is the whole fail-safe, and it has to survive a JSON round trip.
+  const lin = summarizeLineage(
+    [classifyMasterCommit({ sha: "s1", message: "TQ: AMO 5 [be..s@api.bp-assistant]", authorEmail: BOT })],
+    { incomplete: true, incompleteReason: "source_sha_not_in_history" },
+  );
+  const s = compactLineage(lin);
+  eq(s.hasHumanCommit, false, "incomplete summary still reports no human commit found");
+  eq(s.incomplete, true, "...and reports that the walk was incomplete");
+  eq(s.incompleteReason, "source_sha_not_in_history", "...naming why, for the alert");
+  eq(s.mayHoldHumanEdit, true, "...and protects master anyway");
+  const revived = JSON.parse(JSON.stringify(s));
+  eq(masterMayHoldHumanEdit(revived), true, "the answer survives serialization through a Workflow step");
+}
+
+{
+  // The evidence list is capped; the counts are not.
+  const many = Array.from({ length: 9 }, (_, i) =>
+    classifyMasterCommit({ sha: `h${i}`, message: `a hand fix ${i}`, authorEmail: RICH }),
+  );
+  const s = compactLineage(summarizeLineage(many));
+  eq(s.counts.human, 9, "every human commit is counted");
+  eq(s.humanShas.length, LINEAGE_EVIDENCE_CAP, "the cited shas are capped");
 }
 
 if (failed) {
