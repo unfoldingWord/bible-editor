@@ -46,7 +46,7 @@ import {
 } from "../lib/laneChecks";
 import { ChapterBoard } from "./ChapterBoard";
 import { BookLocksDialog } from "./BookLocksDialog";
-import { drafts, verseKey, pinVerseBase, unpinVerseBase } from "../sync/drafts";
+import { drafts, verseKey, pinVerseBase, unpinVerseBaseIfIdle } from "../sync/drafts";
 import { generationForSavedPlain } from "../sync/draftSaveState";
 import { smartEditVerse } from "../lib/replace";
 import { extractEditableText, extractPlainText, normalizeEditable, SECTION_HEADER_TAGS } from "../lib/usfm";
@@ -2745,8 +2745,10 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           // Draftless no-op (dual-aligner reading line, which never stashes
           // keystrokes): the pinVerseBase above still pinned a baseline, and
           // with no draft record no clear will ever release it — the leaked
-          // pin then poisons every later save of this verse (#563).
-          else if (!draft) unpinVerseBase(key);
+          // pin then poisons every later save of this verse (#563). IfIdle:
+          // a keystroke landing while this get() was in flight re-pins the
+          // session synchronously, and that pin must survive.
+          else if (!draft) unpinVerseBaseIfIdle(key);
         })
         .catch(() => {
           /* conservative: leave an unreadable draft in place */
