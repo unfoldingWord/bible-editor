@@ -20,6 +20,13 @@
 // still applies. If the rebased content still trips the server guard, the
 // refusal is then truthful — the edit genuinely collides with alignment work.
 //
+// Scope honesty: this is a 2-way rebase, not a 3-way merge — the op stores
+// only its RESULT text, never its baseline, so the op's text wins wholesale.
+// What the rebase fixes is the ALIGNMENT side (the server's concurrent
+// alignment state is the base, so it can neither be collaterally dropped nor
+// resurrected); a concurrent third-party TEXT change is still last-write-wins,
+// exactly as the resolve button has always been documented to behave.
+//
 // Split out of outbox.ts so a plain Node test can import it — outbox.ts
 // imports api.ts, whose ApiError uses a TS parameter-property constructor
 // Node's `--experimental-strip-types` loader cannot erase (same reason
@@ -59,11 +66,24 @@ export type VerseRebaseOutcome =
 // body's `content` on the thread path).
 //
 // Intent handling:
-//   - text_edit / find_replace / absent: rebase via smartEditVerse.
+//   - text_edit / find_replace / absent: rebase via smartEditVerse. NOTE the
+//     rebase only carries what extractEditableText can see — content invisible
+//     to it (e.g. \f footnote prose) is adopted from the SERVER tree. Nothing
+//     user-editable travels that way in a text op today; a future producer of
+//     text ops carrying editable-text-invisible changes must not rely on this
+//     path preserving them.
 //   - alignment_edit: the op's intent is the alignment structure itself, not
 //     the text — a text-space rebase would discard it. Verbatim when the
 //     server's text still matches the op's (last-write-wins on alignment is
-//     the aligner's contract); refuse_thread when the text changed.
+//     the aligner's contract); refuse_thread when the text changed. The
+//     intent is overloaded: Shell's guard-confirm "Save anyway" escalation
+//     also ships a TEXT edit as alignment_edit (the only guard-exempt
+//     intent), and such an op queued behind a pending sibling now surfaces a
+//     conflict prompt instead of silently threading. That extra prompt is
+//     accepted as the conservative cost — the two cases are indistinguishable
+//     here, and rebasing a TRUE aligner save across a text change would
+//     discard the alignment work. Resolving the prompt lands the op verbatim
+//     (correct content — its tree includes the sibling's edit).
 //   - section_edit: section headers (\s1/\s2/\s3) are invisible to
 //     extractEditableText, so a text-space rebase would silently drop the
 //     op's own \s change. Keep verbatim (pre-#564 behavior).
