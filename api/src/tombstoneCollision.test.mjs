@@ -139,7 +139,8 @@ eq(
     masterRow,
   ),
   true,
-  "tombstone at 5:4 vs master at 23:7 → tombstone_blocked (the 1CH 23 tQ drop, now measured)",
+  "tombstone at 5:4 vs master at 23:7 → reissued (the 1CH 23 tQ drop; now measured AND, since issue #427's " +
+    "option 1, automatically reclaimed by applyTsvRows — see tombstoneReclaim.test.mjs for that write path)",
 );
 
 // The delete-pending-export case must stay uncounted, or every unexported

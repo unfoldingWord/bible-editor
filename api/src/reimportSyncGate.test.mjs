@@ -50,6 +50,7 @@ function counts(overrides = {}) {
     skipped_dup: 0,
     conflict_skipped: 0,
     tombstone_blocked: 0,
+    tombstone_reclaimed: 0,
     resurrected: 0,
     source_attr_reconciled: 0,
     source_attr_divergent: 0,
@@ -220,6 +221,25 @@ eq(
   ),
   false,
   "aggregate laundered a legacy chunk's absent drop counters to zero → counts_incomplete still withholds",
+);
+
+// ── Issue #427, option 1: a landed reclaim does NOT withhold by itself ──────
+// shouldRecordResourceSync's signature deliberately does not even mention
+// tombstone_reclaimed — a landed reclaim means master's content IS now in D1,
+// so there is nothing left to withhold for. Only the lost-CAS fallback (which
+// still counts tombstone_blocked, exercised above) does. This is a shape test:
+// the gate's decision must be identical whether or not tombstone_reclaimed is
+// present, and a nonzero tombstone_reclaimed alongside a clean tombstone_blocked
+// must still stamp.
+eq(
+  shouldRecordResourceSync(counts({ tombstone_reclaimed: 5, tombstone_blocked: 0 })),
+  true,
+  "a run that reclaimed 5 rows and blocked none still stamps the watermark",
+);
+eq(
+  shouldRecordResourceSync(counts({ tombstone_reclaimed: 5, tombstone_blocked: 1 })),
+  false,
+  "reclaims do not offset a genuine block — a run with both still withholds",
 );
 
 console.log("\n[isSystemicMergeRefusal]");

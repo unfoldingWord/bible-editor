@@ -902,13 +902,22 @@ export interface ReimportCounts {
   // already held in D1 — soft-deleted rows keep their id forever. `conflict_
   // skipped` is the INSERT ... ON CONFLICT DO NOTHING refusal; `tombstone_
   // blocked` is a tombstone whose id master has reissued to a row at a
-  // DIFFERENT reference (a same-reference tombstone is an ordinary delete
-  // awaiting export and is not counted). Either being non-zero also withholds
-  // the (book, resource) sync watermark, so the book is not certified current.
-  // See api/src/reimportClassify.ts and GitHub issue #427. Optional: an
-  // older/cached response may omit them.
+  // DIFFERENT reference and whose automatic reclaim (see tombstone_reclaimed
+  // below) lost the version-CAS race (a same-reference tombstone is an
+  // ordinary delete awaiting export and is not counted). Either being non-zero
+  // also withholds the (book, resource) sync watermark, so the book is not
+  // certified current. See api/src/reimportClassify.ts and GitHub issue #427.
+  // Optional: an older/cached response may omit them.
   conflict_skipped?: number;
   tombstone_blocked?: number;
+  // A reissued tombstone (see tombstone_blocked above) whose slot this run
+  // successfully reclaimed for master — deleted_at cleared, content/reference
+  // set to master's incoming row, ownership reset to master-owned (issue #427,
+  // option 1). Distinct from tombstone_blocked: a landed reclaim means master's
+  // row IS now in D1, so it does NOT withhold the watermark by itself. See
+  // api/src/bookReimport.ts's tombstone branch of applyTsvRows. Optional: an
+  // older/cached response may omit it.
+  tombstone_reclaimed?: number;
   dcs_404: number;
   errors: string[];
 }
@@ -1323,6 +1332,10 @@ export interface AdminImportCounts {
   // watermark. Optional: an older/cached response may omit them.
   conflict_skipped?: number;
   tombstone_blocked?: number;
+  // See ReimportCounts.tombstone_reclaimed above — a reissued tombstone's slot
+  // successfully reclaimed for master (issue #427, option 1). Does NOT withhold
+  // the watermark by itself. Optional: an older/cached response may omit it.
+  tombstone_reclaimed?: number;
   resurrected: number;
   source_attr_reconciled: number;
   source_attr_divergent: number;
