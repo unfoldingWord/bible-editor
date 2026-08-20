@@ -25,10 +25,14 @@ interface AlertRow {
 alerts.get("/me", async (c) => {
   const username = c.get("username");
   if (!username) return c.json({ alerts: [] });
+  // kind = 'review' only (issue #535): a 'info' row is a record of something
+  // that already happened as expected, with nothing for this user to decide —
+  // it belongs in the admin panel's activity log (GET /api/admin/sync-activity),
+  // not this personal banner feed.
   const rs = await c.env.DB.prepare(
     `SELECT id, severity, source, message, link_url, created_at
        FROM system_alerts
-      WHERE username = ?1 AND dismissed_at IS NULL
+      WHERE username = ?1 AND dismissed_at IS NULL AND kind = 'review'
       ORDER BY created_at DESC`,
   )
     .bind(username)
