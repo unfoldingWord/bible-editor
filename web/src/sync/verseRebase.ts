@@ -83,7 +83,10 @@ export type VerseRebaseOutcome =
 //     accepted as the conservative cost — the two cases are indistinguishable
 //     here, and rebasing a TRUE aligner save across a text change would
 //     discard the alignment work. Resolving the prompt lands the op verbatim
-//     (correct content — its tree includes the sibling's edit).
+//     — correct content for the escalated same-tab case (its tree includes
+//     the sibling's edit); for a true aligner save across a genuinely
+//     concurrent text change, verbatim resolve is last-write-wins, the
+//     button's long-documented contract (SyncStatusBar.tsx).
 //   - section_edit: section headers (\s1/\s2/\s3) are invisible to
 //     extractEditableText, so a text-space rebase would silently drop the
 //     op's own \s change. Keep verbatim (pre-#564 behavior).
@@ -114,6 +117,22 @@ export function rebaseVersePatch(
   }
   if (intent === "section_edit") {
     return { kind: "verbatim" };
+  }
+  // Text unchanged (nfc-compared) → adopt the server tree wholesale rather
+  // than handing smartEditVerse two byte-unequal strings. The engine's own
+  // early-return compares RAW strings, so a pure combining-mark-order
+  // difference (UHB vs NFC Hebrew) would otherwise run the diff tiers over a
+  // phantom "edit" and could churn marks on words the translator never
+  // touched. Same outcome as the engine's no-op branch, made mark-order-safe.
+  if (textUnchanged) {
+    return {
+      kind: "rebased",
+      patch: {
+        ...patch,
+        content: serverContent,
+        plain_text: extractPlainText(serverContent),
+      },
+    };
   }
   try {
     const result = smartEditVerse(serverContent, serverText, opText);

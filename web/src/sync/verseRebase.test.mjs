@@ -167,6 +167,26 @@ const sourceOf = (content, word) => (wordSources(content).find(([tx]) => tx === 
   );
 }
 
+// ── Hebrew, text path: mark-order-only difference must not run the engine ──
+//
+// smartEditVerse's own no-op branch compares RAW strings, so a UHB-order op
+// against an NFC-order server row would look like a real edit to it. The
+// rebase's nfc gate short-circuits first, adopting the server tree wholesale
+// — no phantom diff, no mark churn on untouched words.
+{
+  console.log("\n[e2] text_edit across a pure mark-order difference adopts the server tree");
+  const legacy = String.fromCharCode(0x05d1, 0x05bc, 0x05b4); // bet, dagesh, hiriq (UHB order)
+  const canon = legacy.normalize("NFC"); // bet, hiriq, dagesh
+  const server = { verseObjects: [zaln("H1", [w(canon)])] };
+  const stale = { verseObjects: [w(legacy)] }; // stale baseline had it unaligned too
+  const out = rebaseVersePatch({ content: stale, alignment_intent: "text_edit" }, server);
+  check(out.kind === "rebased", "text_edit op with nfc-equal text still rebases");
+  check(
+    JSON.stringify(out.patch.content) === JSON.stringify(server),
+    "the server tree is adopted byte-for-byte (alignment and mark order both the server's)",
+  );
+}
+
 // ── Conservative fall-throughs ──────────────────────────────────────────────
 {
   console.log("\n[f] Non-rebasable shapes fall back to verbatim");
