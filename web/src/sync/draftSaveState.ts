@@ -73,9 +73,77 @@ export function pinReleaseAfterVerseOk(
   draft: DraftRecord | undefined,
   op: OutboxOp,
 ): PinRelease {
-  const generation = generationForSuccessfulOp(draft, op);
+  return pinReleaseForVerseExit(draft, verseOpExitInfo(op, "ok"));
+}
+
+// A verse op leaving the outbox for good, described without the op itself so
+// the description can cross a BroadcastChannel. The pin map (versePin.ts) is
+// per-tab memory but the outbox is shared IndexedDB with a cross-tab-exclusive
+// drain, so the tab that observes an op's exit is often NOT the tab holding
+// the pin — every tab must run the release rule itself (#565).
+//
+// - "ok": the save landed (200).
+// - "locked": the chapter was mid-AI-pipeline; the op was DELETED permanently
+//   (outbox drain), so nothing will ever land to release the pin.
+// - "discarded": the user removed the op (SyncStatusBar discard flows), the
+//   other permanent deletion that no 200 will ever follow.
+export type VerseOpExit = "ok" | "locked" | "discarded";
+
+export interface VerseOpExitInfo {
+  exit: VerseOpExit;
+  draftGeneration?: string;
+  // extractEditableText(op.patch.content), precomputed by the announcing tab
+  // so a receiving tab can run the legacy provenance check without the op.
+  editableText?: string;
+}
+
+export function verseOpExitInfo(op: OutboxOp, exit: VerseOpExit): VerseOpExitInfo {
+  if (op.draftGeneration) return { exit, draftGeneration: op.draftGeneration };
+  const content = (op.patch as { content?: unknown } | undefined)?.content;
+  return {
+    exit,
+    ...(content !== undefined ? { editableText: extractEditableText(content) } : {}),
+  };
+}
+
+// generationForSuccessfulOp over the wire-safe exit description instead of
+// the op. Same provenance rule: an explicit generation must match exactly;
+// a legacy (pre-generation) op matches only when its queued editable text
+// reconstructs the draft's.
+function generationCapturedByExit(
+  draft: DraftRecord,
+  info: VerseOpExitInfo,
+): string | undefined {
+  const generation = draft.generation ?? `legacy:${draft.updatedAt}`;
+  if (info.draftGeneration) {
+    return info.draftGeneration === generation ? generation : undefined;
+  }
+  if (info.editableText === undefined) return undefined;
+  const draftPlain = (draft.payload as { plainText?: unknown }).plainText;
+  if (typeof draftPlain !== "string") return undefined;
+  return info.editableText === normalizeEditable(draftPlain) ? generation : undefined;
+}
+
+// The one pin-release rule, for every terminal exit of a verse op:
+//
+// - "ok" keeps the #563 behavior: clear the matching draft generation
+//   (clearGeneration unpins as it deletes), keep the pin when an unmatched
+//   draft means newer typing still depends on it (#474), unpin when the save
+//   was draftless.
+// - "locked" / "discarded" delete the op with the user's text UNSAVED. A
+//   draft, when one exists, is the only copy of that text and must SURVIVE —
+//   never clear, and keep the pin protecting its baseline. Only the draftless
+//   pin releases; without that, a reading-line save against a locked chapter
+//   (or a discarded refused op) poisons the verse for the session (#565).
+export function pinReleaseForVerseExit(
+  draft: DraftRecord | undefined,
+  info: VerseOpExitInfo,
+): PinRelease {
+  if (!draft) return { kind: "unpin" };
+  if (info.exit !== "ok") return { kind: "keep" };
+  const generation = generationCapturedByExit(draft, info);
   if (generation) return { kind: "clear", generation };
-  return draft ? { kind: "keep" } : { kind: "unpin" };
+  return { kind: "keep" };
 }
 
 // Associate a save only with the draft whose payload it actually captured.
