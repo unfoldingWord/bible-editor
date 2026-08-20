@@ -5,7 +5,7 @@
 // instead of getting silently flattened to `\v 6`. Not a test framework;
 // failures exit non-zero.
 
-import { attributeTsvShrink, buildAlignmentShrinkAlertMessage, buildUsfmInvalidAlertMessage, classifyAlignmentLossSeverity, offenderProvenanceFromLog, buildExportBranch, buildTnTsv, buildTqTsv, buildTwlTsv, buildUsfm, classifyAlignmentShrinkOffenders, classifyRevertSeverity, commitToDcs, countDuplicateMasterIds, describeShrinkRefusal, ensureDcsPr, exportTags, exportTsvShrinkRefused, findDcsOpenPr, isMasterConfirmed, mechanicalOverwriteAlert, parseTsvIds, recreateExportBranchFromMaster, shouldRecordRevertReport, tsvRevertReport, updateDcsPrBranch, usfmAlignmentShrinkRefused, usfmRevertReport } from "./export.ts";
+import { attributeTsvShrink, branchOverrideAllowed, exportBranchOverrideValid, buildAlignmentShrinkAlertMessage, buildUsfmInvalidAlertMessage, classifyAlignmentLossSeverity, offenderProvenanceFromLog, buildExportBranch, buildTnTsv, buildTqTsv, buildTwlTsv, buildUsfm, classifyAlignmentShrinkOffenders, classifyRevertSeverity, commitToDcs, countDuplicateMasterIds, describeShrinkRefusal, ensureDcsPr, exportTags, exportTsvShrinkRefused, findDcsOpenPr, isMasterConfirmed, mechanicalOverwriteAlert, parseTsvIds, recreateExportBranchFromMaster, shouldRecordRevertReport, tsvRevertReport, updateDcsPrBranch, usfmAlignmentShrinkRefused, usfmRevertReport } from "./export.ts";
 import { CorruptContentJsonError } from "./contentJson.ts";
 import { extractVersesForRange } from "./importParsers.ts";
 import { validateUsfm } from "./usfmValidate.ts";
@@ -344,6 +344,43 @@ function utf8Base64(s) {
   for (const b of [buildExportBranch("LAM", []), buildExportBranch("NUM", ["x"])]) {
     assert(b.includes("-be-"), `${b} contains "-be-" (DCS gate literal)`);
   }
+}
+
+// --- Branch-name override: the published-book, maintainer-merges escape hatch ---
+{
+  // The override's ONLY purpose is a branch DCS will NOT auto-merge, so a name
+  // carrying the gate literal must be refused rather than sanitized — accepting
+  // one would silently restore the auto-merge it exists to prevent.
+  assert(exportBranchOverrideValid("BibleEditor-data-restoration"), `the real restoration branch name is valid`);
+  assert(!exportBranchOverrideValid("MIC-be-restore"), `a name carrying "-be-" is REFUSED`);
+  assert(!exportBranchOverrideValid("MIC-be-"), `trailing "-be-" also refused`);
+  assert(exportBranchOverrideValid("MIC-be"), `suffix-less "-be" does not match the DCS glob, so it is allowed`);
+  // git ref rules the character class alone doesn't cover.
+  assert(!exportBranchOverrideValid("foo..bar"), `".." is not a legal ref`);
+  assert(!exportBranchOverrideValid("foo.lock"), `".lock" suffix is not a legal ref`);
+  assert(!exportBranchOverrideValid("foo."), `trailing dot is not a legal ref`);
+  assert(!exportBranchOverrideValid("-leading-dash"), `leading dash refused`);
+  assert(!exportBranchOverrideValid("has space"), `whitespace refused`);
+  assert(!exportBranchOverrideValid("re/store"), `slash refused (keeps the name a single segment)`);
+  assert(!exportBranchOverrideValid(""), `empty refused`);
+
+  // Narrow gating, same shape as lockOverrideAllowed/shrinkOverrideAllowed: an
+  // unrecognized book or resource widens to every book / ALL_RESOURCES upstream,
+  // and handing ONE branch name to a multi-book run would collapse every book
+  // onto that branch, each overwriting the last.
+  const ok = { branchName: "BibleEditor-data-restoration", book: "MIC", resource: "ult" };
+  assert(branchOverrideAllowed(ok, 1, 1) === true, `single book + single resource → allowed`);
+  assert(branchOverrideAllowed(ok, 2, 1) === false, `two books → refused`);
+  assert(branchOverrideAllowed(ok, 1, 5) === false, `all resources → refused`);
+  assert(branchOverrideAllowed({ ...ok, book: undefined }, 1, 1) === false, `no book named → refused`);
+  assert(branchOverrideAllowed({ ...ok, resource: undefined }, 1, 1) === false, `no resource named → refused`);
+  assert(branchOverrideAllowed({ book: "MIC", resource: "ult" }, 1, 1) === false, `no branchName → refused`);
+  assert(
+    branchOverrideAllowed({ ...ok, branchName: "MIC-be-x" }, 1, 1) === false,
+    `an invalid name is refused by the gate too, not just by the route`,
+  );
+  // Every cron path omits branchName entirely — the nightly must be untouched.
+  assert(branchOverrideAllowed({}, 66, 5) === false, `a full nightly run never gets an override`);
 }
 
 // --- OL-quote occurrence invariant: Hebrew/Greek quote forces Occurrence >= 1 ---

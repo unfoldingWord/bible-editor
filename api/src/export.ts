@@ -67,6 +67,64 @@ export function buildExportBranch(book: string, usernames: string[]): string {
   return `${book}-be-${safe.length === 0 ? MECHANICAL_CONTRIBUTOR : safe.join("-")}`;
 }
 
+// ── Branch-name override ─────────────────────────────────────────────────────
+//
+// WHY THIS EXISTS. Everything above is built so a branch carries `-be-` and is
+// therefore validated and AUTO-MERGED by DCS's own workflows. There is one case
+// where auto-merge is exactly wrong: a correction to a PUBLISHED book. Those
+// books are frozen because their content is in a cut release (v90), so a fix to
+// them has to land as a branch + PR that a uW maintainer reviews and merges
+// himself, then re-releases. `allowLocked` already lets such an export through
+// our own gate — but on a `-be-` branch, DCS's `merge-be-pr.yaml` would merge it
+// into master without anyone looking, which is the whole thing we are avoiding.
+//
+// So the override's ONLY purpose is to produce a branch DCS will NOT auto-merge,
+// which is why a name carrying `-be-` is rejected rather than sanitized: passing
+// one would silently restore the auto-merge it exists to prevent.
+//
+// TWO CONSEQUENCES THE OPERATOR MUST KNOW, both from the `push: branches:
+// ['*-be-*']` trigger in docs/dcs-workflows/*.validate-be-branch.yaml:
+//   1. DCS's validate workflow does NOT run on this branch. Our own
+//      validateUsfm / shrink-guard / collapse passes are the only gate, so the
+//      export must be run with them intact (never with a shrink override
+//      stacked on top).
+//   2. Gitea will still report a GREEN combined status, because no/skipped
+//      checks count as success (the same trap the suffix-less `{BOOK}-be` bug
+//      hit). Green here means "nothing ran", not "validated" — the PR body says
+//      so, so the maintainer isn't misled.
+//
+// pruneSupersededBranches globs `{book}-be-*`, so an override branch is never
+// pruned by a later normal export of the same book, and never prunes one.
+const BRANCH_OVERRIDE_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/;
+
+export function exportBranchOverrideValid(name: string): boolean {
+  if (!BRANCH_OVERRIDE_RE.test(name)) return false;
+  // The point of the override (see above) — never an auto-merging branch.
+  if (name.includes("-be-")) return false;
+  // git ref rules the character class alone doesn't cover.
+  if (name.endsWith(".lock") || name.endsWith(".") || name.includes("..")) return false;
+  return true;
+}
+
+// Narrow gating, an EXACT structural mirror of lockOverrideAllowed in
+// publishedGuard.ts and shrinkOverrideAllowed in shrinkGuard.ts — read those
+// comments too. Both resolved counts (never the raw params) must be exactly 1,
+// so an unrecognized book or resource string — which widens to every book /
+// ALL_RESOURCES in exportWorkflow's resolution — cannot hand one branch name to
+// a multi-book run and collapse several books onto a single branch, each
+// overwriting the last. Every cron path omits branchName, so the nightly is
+// untouched no matter what params reach it.
+export function branchOverrideAllowed(
+  params: { branchName?: string; book?: string; resource?: string },
+  resolvedBookCount: number,
+  resolvedResourceCount: number,
+): boolean {
+  if (typeof params.branchName !== "string" || params.branchName.length === 0) return false;
+  if (!exportBranchOverrideValid(params.branchName)) return false;
+  if (!params.book || !params.resource) return false;
+  return resolvedBookCount === 1 && resolvedResourceCount === 1;
+}
+
 // ── TSV builders ─────────────────────────────────────────────────────────────
 // Column order matches docs/samples/*.tsv exactly. Downstream tooling is
 // positional; reorder and consumers break.

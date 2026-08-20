@@ -7,7 +7,7 @@ import { Hono } from "hono";
 import { z } from "zod";
 import type { Env } from "./index";
 import { requireAdmin } from "./auth";
-import { ALL_RESOURCES, type Resource } from "./export";
+import { ALL_RESOURCES, exportBranchOverrideValid, type Resource } from "./export";
 
 export const exports = new Hono<{ Bindings: Env; Variables: { userId?: number } }>();
 
@@ -30,6 +30,12 @@ const RunBody = z.object({
   // explicitly locked) book. Requires book + resource to be set; the workflow
   // ignores it otherwise.
   allowLocked: z.boolean().optional(),
+  // Explicit branch name, for a published-book correction that a uW maintainer
+  // must review and merge by hand rather than DCS's merge bot doing it. Requires
+  // book + resource, and must not contain `-be-` (that substring is what makes
+  // DCS auto-merge, which is the thing this override exists to avoid). See
+  // branchOverrideAllowed in export.ts.
+  branchName: z.string().min(1).max(80).optional(),
 });
 
 exports.post("/run", requireAdmin, async (c) => {
@@ -58,6 +64,15 @@ exports.post("/run", requireAdmin, async (c) => {
   if (parsed.data.allowLocked && !(parsed.data.book && parsed.data.resource)) {
     return c.json({ error: "allow_locked_requires_book_and_resource" }, 400);
   }
+  if (parsed.data.branchName && !(parsed.data.book && parsed.data.resource)) {
+    return c.json({ error: "branch_name_requires_book_and_resource" }, 400);
+  }
+  // Rejected at the route, not silently dropped in the workflow: an operator who
+  // asked for a specific branch and got the generated `-be-` one anyway would
+  // have their published-book fix auto-merged by DCS without noticing.
+  if (parsed.data.branchName && !exportBranchOverrideValid(parsed.data.branchName)) {
+    return c.json({ error: "invalid_branch_name" }, 400);
+  }
   const params = {
     book: parsed.data.book?.toUpperCase(),
     resource: parsed.data.resource as Resource | undefined,
@@ -66,6 +81,7 @@ exports.post("/run", requireAdmin, async (c) => {
     allowShrink: parsed.data.allowShrink,
     allowMergeRefusal: parsed.data.allowMergeRefusal,
     allowLocked: parsed.data.allowLocked,
+    branchName: parsed.data.branchName,
   };
   // Deterministic id (millisecond precision) so a double-submitted manual run
   // rejects on the duplicate instead of racing the first. Second precision
