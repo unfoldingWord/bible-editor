@@ -449,6 +449,30 @@ console.log("\n[reference-move attribution at the caller]");
     eq(row.review_reason.includes("Door43 editor moved"), false, "…and never claims a Door43 editor moved it");
     eq(row.review_reason.includes("no edit history survives"), true, "…it states the measured cause");
   }
+
+  // 6. A second nightly over an UNCHANGED ref_moved row must not re-bump the
+  //    version (#567). flagRefMoved's dedup guard compares cur.review_reason
+  //    to the reason it is about to write and no-ops when they already match —
+  //    which only works if the `existing` SELECT actually fetches review_reason.
+  //    Runs the real master-side-move case (case 4) twice over the same D1
+  //    state and checks the row is byte-for-byte unchanged after the repeat.
+  {
+    const { sqlite, env } = freshEnv();
+    sqlite.prepare(`UPDATE tq_rows SET chapter=1, verse=2, ref_raw='1:2' WHERE id='mv01'`).run();
+    const boundary = seedMoved(sqlite);
+    sqlite.prepare(`UPDATE tq_rows SET chapter=1, verse=2, ref_raw='1:2' WHERE id='mv01'`).run();
+    const opts = { confirmedAt: 200, editId: boundary };
+    const first = await applyTsvRows(env, BOOK, "tq", [masterAt("1:9", 1, 9)], null, opts);
+    eq(first.ref_moved_theirs, 1, "first nightly flags the master-side move");
+    const afterFirst = sqlite.prepare(`SELECT version, review_kind, review_reason FROM tq_rows WHERE id='mv01'`).all()[0];
+    eq(afterFirst.review_kind, "ref_moved", "…row is flagged");
+
+    const second = await applyTsvRows(env, BOOK, "tq", [masterAt("1:9", 1, 9)], null, opts);
+    eq(second.ref_moved_theirs, 1, "second nightly still classifies the row as theirs_moved");
+    const afterSecond = sqlite.prepare(`SELECT version, review_kind, review_reason FROM tq_rows WHERE id='mv01'`).all()[0];
+    eq(afterSecond.version, afterFirst.version, "…but an unchanged reason does not re-bump the version (#567)");
+    eq(afterSecond.review_reason, afterFirst.review_reason, "…the reason text itself is unchanged");
+  }
 }
 
 // ── AI-vs-human conflict policy at the caller (#540 item 2) ─────────────────
