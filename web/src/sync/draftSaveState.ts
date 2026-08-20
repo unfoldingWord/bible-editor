@@ -99,6 +99,12 @@ export interface VerseOpExitInfo {
 
 export function verseOpExitInfo(op: OutboxOp, exit: VerseOpExit): VerseOpExitInfo {
   if (op.draftGeneration) return { exit, draftGeneration: op.draftGeneration };
+  // The reconstructed editable text is only consulted on "ok" (non-ok exits
+  // never clear a draft, so provenance is moot) — and extracting it parses
+  // the queued content, which now happens synchronously inside outbox
+  // listener dispatch. Don't run that parse, or ship its result, for exits
+  // that cannot use it.
+  if (exit !== "ok") return { exit };
   const content = (op.patch as { content?: unknown } | undefined)?.content;
   return {
     exit,

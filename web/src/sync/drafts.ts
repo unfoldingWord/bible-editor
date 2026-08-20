@@ -271,31 +271,42 @@ export function draftDirtyBorderSx() {
 // NOT the tab holding the pin. Every verse-op exit is therefore broadcast, and
 // each tab runs the same release rule against the shared draft store.
 
+// This tab's synchronous bookkeeping (pendingKeys, pin, latestGenerationByKey)
+// can outlive its draft record when the record is cleared by ANOTHER tab —
+// clearGeneration only releases the local trio itself when it performs the
+// delete. Safe to release exactly when this tab's own latest generation is the
+// one confirmed cleared: any newer local keystroke replaces
+// latestGenerationByKey synchronously, so a match proves no live edit session
+// depends on the pin (#474 guard preserved).
+function releaseLocalBookkeeping(key: string, generation: string): void {
+  if (latestGenerationByKey.get(key) !== generation) return;
+  latestGenerationByKey.delete(key);
+  pendingKeys.delete(key);
+  unpinVerseBase(key);
+}
+
 function applyVerseExit(key: string, info: VerseOpExitInfo): void {
   void drafts.get(key).then((draft) => {
     const release = pinReleaseForVerseExit(draft, info);
     if (release.kind === "clear") {
-      void drafts.clearGeneration(key, release.generation);
+      void drafts.clearGeneration(key, release.generation).then((cleared) => {
+        // The draining tab can win the race and delete the record between our
+        // get() above and this clear — clearGeneration then returns false
+        // without touching this tab's bookkeeping, leaving the pin and the
+        // beforeunload dirty flag leaked for a save that has in fact landed.
+        if (!cleared) releaseLocalBookkeeping(key, release.generation);
+      });
     } else if (release.kind === "unpin") {
       // The shared draft record can already be gone — cleared by the draining
-      // tab — while THIS tab's synchronous bookkeeping for it (pendingKeys,
-      // pin, latestGenerationByKey) lingers. When a landed op captured exactly
-      // the generation this tab wrote last, that bookkeeping describes a save
-      // that has succeeded, not live typing: release it here. A newer local
-      // keystroke replaces latestGenerationByKey synchronously, so a mismatch
-      // (or a draftless/legacy op with no generation) falls through to the
-      // idle-guarded unpin and a live edit session keeps its pin (#474).
-      if (
-        info.exit === "ok" &&
-        info.draftGeneration !== undefined &&
-        latestGenerationByKey.get(key) === info.draftGeneration
-      ) {
-        latestGenerationByKey.delete(key);
-        pendingKeys.delete(key);
-        unpinVerseBase(key);
-      } else {
-        unpinVerseBaseIfIdle(key);
+      // tab — while this tab's bookkeeping for it lingers. When a LANDED op
+      // captured exactly the generation this tab wrote last, that bookkeeping
+      // describes a save that has succeeded, not live typing: release it. A
+      // mismatch (or a draftless/legacy op with no generation) falls through
+      // to the idle-guarded unpin and a live edit session keeps its pin.
+      if (info.exit === "ok" && info.draftGeneration !== undefined) {
+        releaseLocalBookkeeping(key, info.draftGeneration);
       }
+      unpinVerseBaseIfIdle(key);
     }
   });
 }
@@ -316,7 +327,16 @@ verseExitChannel?.addEventListener("message", (e: MessageEvent) => {
 function handleVerseExit(op: OutboxOp, exit: VerseOpExit): void {
   if (op.target.kind !== "verse") return;
   const key = verseKey(op.target.book, op.target.chapter, op.target.verse, op.target.bibleVersion);
-  const info = verseOpExitInfo(op, exit);
+  let info: VerseOpExitInfo;
+  try {
+    // For a legacy (pre-generation) ok this parses the queued content, which
+    // used to run inside an async then() where a throw was isolated. This now
+    // runs synchronously inside outbox listener dispatch — keep that isolation
+    // so malformed content can't abort the drain pass's listener loop.
+    info = verseOpExitInfo(op, exit);
+  } catch {
+    return; // same non-release the pre-#565 code gave this op
+  }
   applyVerseExit(key, info);
   // BroadcastChannel never delivers to its own poster — the applyVerseExit
   // above is this tab's copy. Announcement is best-effort: the local release

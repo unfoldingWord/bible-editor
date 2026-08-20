@@ -131,9 +131,14 @@ assert.deepEqual(
   "generation ops announce their draft generation",
 );
 assert.deepEqual(
+  verseOpExitInfo(legacyOp, "ok"),
+  { exit: "ok", editableText: "\\q1" },
+  "pre-generation ok announces the reconstructed editable text instead",
+);
+assert.deepEqual(
   verseOpExitInfo(legacyOp, "locked"),
-  { exit: "locked", editableText: "\\q1" },
-  "pre-generation ops announce their reconstructed editable text instead",
+  { exit: "locked" },
+  "non-ok exits never clear, so the legacy content parse is skipped entirely",
 );
 
 // pinReleaseForVerseExit, non-ok exits — `locked` deletes the op permanently
@@ -201,4 +206,4 @@ assert.equal(
 );
 unpinVerseBase(pinKey);
 
-console.log("draftSaveState: 33 passed");
+console.log("draftSaveState: 34 passed");
