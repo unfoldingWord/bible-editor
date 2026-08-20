@@ -10,7 +10,7 @@
 import { openDB, type IDBPDatabase } from "idb";
 import { isReadOnly, type RowKind } from "./api";
 import { onOutboxResult } from "./outbox";
-import { generationForSuccessfulOp } from "./draftSaveState";
+import { pinReleaseAfterVerseOk } from "./draftSaveState";
 import { unpinVerseBase } from "./versePin";
 export { pinVerseBase, peekPinnedVerseBase } from "./versePin";
 
@@ -87,6 +87,18 @@ const subscribers = new Set<Subscriber>();
 // subscription (and survive the reload regardless, so a missed prompt there is
 // not data loss).
 const pendingKeys = new Set<string>();
+
+// Release the verse-base pin for `key` — unless a draft session has (re)started
+// meanwhile. Callers decide to unpin from an ASYNC drafts.get snapshot, and a
+// new session's first keystroke can land inside that window: stashVerseDraft
+// pins and set() adds to pendingKeys synchronously (before its own async put),
+// so checking pendingKeys at the actual unpin moment closes the race the
+// snapshot leaves open. Mirrors the latestGenerationByKey guard inside
+// clearGeneration, which protects the clear path from the same class of race.
+export function unpinVerseBaseIfIdle(key: string): void {
+  if (pendingKeys.has(key)) return;
+  unpinVerseBase(key);
+}
 const latestGenerationByKey = new Map<string, string>();
 let generationSeq = 0;
 
@@ -245,8 +257,11 @@ onOutboxResult((op, result) => {
   if (op.target.kind === "verse") {
     const key = verseKey(op.target.book, op.target.chapter, op.target.verse, op.target.bibleVersion);
     void drafts.get(key).then((draft) => {
-      const generation = generationForSuccessfulOp(draft, op);
-      if (generation) void drafts.clearGeneration(key, generation);
+      const release = pinReleaseAfterVerseOk(draft, op);
+      if (release.kind === "clear") void drafts.clearGeneration(key, release.generation);
+      // Draftless save landed (dual-aligner reading line): nothing tracks the
+      // pin, so release it here or it poisons every later save (#563).
+      else if (release.kind === "unpin") unpinVerseBaseIfIdle(key);
     });
   } else if (op.target.kind === "row") {
     void drafts.clear(rowKey(op.target.rowKind, op.target.book, op.target.id));
