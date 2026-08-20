@@ -176,6 +176,61 @@ console.log("\n[rows younger than the cutoff are never candidates, exempt or not
   assert(survivingIds(d).join(",") === "1,2", "young ancestor untouched; the older candidate is overkept rather than risk the base");
 }
 
+console.log("\n[P1.3 same-second edit: the id boundary exempts a row whose created_at is AT/after the watermark]");
+{
+  const d = freshDb();
+  // The exact precision case migration 0050 exists for: an edit committed in
+  // the same second as the export's D1 read has created_at == watermark but
+  // id <= master_confirmed_edit_id — the merge counts it as the ancestor, so
+  // the shield must too.
+  syncRow(d, { book: "ZEC", resource: "ult", confirmedAt: 5000, editId: 2 });
+  const key = "ZEC/4/6/ULT";
+  logRow(d, { id: 1, rowKey: key, book: "ZEC", action: "create", createdAt: 1000 });
+  logRow(d, { id: 2, rowKey: key, book: "ZEC", action: "update", createdAt: 5000, payload: '{"content":"same-second"}' });
+
+  sweep(d, 100000);
+
+  assert(survivingIds(d).join(",") === "2", "the same-second row under the id boundary survives; the id arm ignores created_at, as the merge does");
+}
+
+console.log("\n[a row whose book column contradicts its row_key is not exempted over the row the merge would read]");
+{
+  const d = freshDb();
+  // The merge's sub-select requires (book = ?1 OR book IS NULL). A corrupt or
+  // hand-repaired row whose book column disagrees with its row_key is one the
+  // merge SKIPS — exempting it while deleting the lower-id row the merge
+  // actually reads would lose the base.
+  syncRow(d, { book: "ZEC", resource: "ult", confirmedAt: 5000, editId: 10 });
+  const key = "ZEC/5/9/ULT";
+  logRow(d, { id: 1, rowKey: key, book: "ZEC", action: "update", createdAt: 1000, payload: '{"content":"real base"}' });
+  logRow(d, { id: 2, rowKey: key, book: "HOS", action: "update", createdAt: 2000, payload: '{"content":"mismatched"}' });
+
+  sweep(d, 100000);
+
+  const ids = survivingIds(d);
+  assert(ids.includes(1), "the row the merge would pick (book matches) survives");
+  assert(
+    mergeAncestorPayload(d, "ZEC", "5", "9", "ULT", 10) === '{"content":"real base"}',
+    "…and the merge's own lookup still recovers it",
+  );
+}
+
+console.log("\n[two books and both resources coexist without cross-shielding or cross-deleting]");
+{
+  const d = freshDb();
+  syncRow(d, { book: "ZEC", resource: "ult", confirmedAt: 5000, editId: 1 });
+  syncRow(d, { book: "ZEC", resource: "ust", confirmedAt: 5000, editId: 2 });
+  syncRow(d, { book: "HOS", resource: "ult", confirmedAt: 5000, editId: 3 });
+  logRow(d, { id: 1, rowKey: "ZEC/1/1/ULT", book: "ZEC", action: "update", createdAt: 1000 });
+  logRow(d, { id: 2, rowKey: "ZEC/1/1/UST", book: "ZEC", action: "update", createdAt: 1000 });
+  logRow(d, { id: 3, rowKey: "HOS/1/1/ULT", book: "HOS", action: "update", createdAt: 1000 });
+  logRow(d, { id: 4, rowKey: "HOS/1/1/ULT", book: "HOS", action: "create", createdAt: 500 }); // superseded by id 3
+
+  sweep(d, 100000);
+
+  assert(survivingIds(d).join(",") === "1,2,3", "each book+resource keeps exactly its own ancestor; the superseded row is swept");
+}
+
 console.log("\n[a legacy row with book IS NULL is still shielded — the join reads row_key, as the merge does]");
 {
   const d = freshDb();

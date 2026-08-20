@@ -50,19 +50,31 @@
 //   - The exempt set is an UNCORRELATED subquery: computed once per sweep,
 //     never re-evaluated per candidate row (a correlated NOT EXISTS over the
 //     whole table per row is the shape to avoid on D1).
-//   - The subquery scans only rows already past the cutoff
-//     (`el.created_at < ?1`), so its cost is bounded by the deletion
-//     candidates, not the whole table. That can exempt a row that is not the
-//     GLOBAL newest-under-boundary (when the true newest is still younger
-//     than the cutoff) — a harmless overkeep: the row the merge picks
-//     survives either way (young rows are never candidates), and the
-//     overkept row is reclaimed by a later sweep once a newer pre-boundary
-//     row ages past the cutoff.
+//   - Cost (measured via EXPLAIN QUERY PLAN on the real schema): each branch
+//     walks the kind='verse' slice of edit_log via the edit_log_row (kind=…)
+//     index, filtering `created_at < ?1` as a residual — so the fixed cost is
+//     one index walk of the verse rows, NOT just the deletion candidates. The
+//     per-row brs join runs only for rows passing the WHERE (today: zero,
+//     since nothing is past retention). At prod's current ~360k rows this is
+//     well inside D1's statement budget hourly; if the table grows an order
+//     of magnitude, a (kind, action, created_at) index is the cheap fix.
+//   - The candidate-scoped filter (`el.created_at < ?1`) can exempt a row
+//     that is not the GLOBAL newest-under-boundary (when the true newest is
+//     still younger than the cutoff) — a harmless overkeep: the row the
+//     merge picks survives either way (young rows are never candidates), and
+//     the overkept row is reclaimed by a later sweep once a newer
+//     pre-boundary row ages past the cutoff. Exempt survivors themselves
+//     remain candidates forever (at most two rows per verse), so the
+//     steady-state exempt set is bounded by corpus size, not by time.
 //   - The join recovers (book, resource) from row_key by pattern
-//     (`BOOK/%/RESOURCE`), which also covers legacy rows whose `book` column
-//     is NULL — the merge's own sub-select accepts those
-//     (`book = ?1 OR book IS NULL`), so the shield must too. Book codes and
-//     resource names carry no LIKE metacharacters.
+//     (`BOOK/%/RESOURCE`) — anchored both ends, and book codes / resource
+//     names carry no LIKE metacharacters — plus the merge's own book
+//     predicate (`book = ?1 OR book IS NULL`): a row whose book column
+//     contradicts its row_key is one the merge would skip, so the shield
+//     must not exempt it in place of the row the merge would read. NULL-book
+//     legacy rows (pre-0017) are accepted by both, deliberately. brs is
+//     restricted to the two verse resources; tn/tq/twl watermark rows can
+//     never match a verse row_key anyway.
 //   - The NOT IN list is NULL-free (no NULL-poisoning of the outer
 //     predicate): MAX(el.id) over a group is never NULL, and the baseline
 //     branch selects a concrete el.id.
@@ -89,6 +101,8 @@ export const EDIT_LOG_SWEEP_SQL = `
            FROM edit_log el
            JOIN book_resource_syncs brs
              ON el.row_key LIKE brs.book || '/%/' || upper(brs.resource)
+            AND (el.book = brs.book OR el.book IS NULL)
+            AND brs.resource IN ('ult', 'ust')
           WHERE el.kind = 'verse'
             AND el.action IN ('create', 'update')
             AND el.created_at < ?1
@@ -106,6 +120,8 @@ export const EDIT_LOG_SWEEP_SQL = `
              FROM edit_log el
              JOIN book_resource_syncs brs
                ON el.row_key LIKE brs.book || '/%/' || upper(brs.resource)
+              AND (el.book = brs.book OR el.book IS NULL)
+              AND brs.resource IN ('ult', 'ust')
             WHERE el.kind = 'verse'
               AND el.action = 'baseline'
               AND el.created_at < ?1

@@ -352,9 +352,16 @@ export default {
       // editLogSweep.ts for the full story (issue #537).
       const minuteOfHour = Math.floor(Date.now() / 60_000) % 60;
       if (minuteOfHour < 5) {
-        await env.DB.prepare(EDIT_LOG_SWEEP_SQL)
-          .bind(Math.floor(Date.now() / 1000) - EDIT_LOG_RETENTION_SECONDS)
-          .run();
+        // try/catch (same shape as the pipeline_jobs cleanup above): a failed
+        // or D1-timed-out sweep must not fail the whole cron invocation — the
+        // sweep is retention housekeeping, and the next hour retries it.
+        try {
+          await env.DB.prepare(EDIT_LOG_SWEEP_SQL)
+            .bind(Math.floor(Date.now() / 1000) - EDIT_LOG_RETENTION_SECONDS)
+            .run();
+        } catch (e) {
+          console.error("edit_log retention sweep failed", e instanceof Error ? e.message : String(e));
+        }
       }
       return;
     }
