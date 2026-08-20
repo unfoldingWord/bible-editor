@@ -366,6 +366,18 @@ deep(tsvMergeFields("tq"), ["quote", "question", "response"], "tq field list");
   eq(base.tw_link, "l1", "fold camelCase twLink -> tw_link");
 }
 
+// Issue #427 option 1: a `reclaim` (reissued-tombstone overwrite) is
+// content-bearing, same as `restore` — it is what D1 now actually holds for
+// this (book, id), and it must anchor the ancestor for edits that follow it.
+{
+  const base = foldTsvBase("tn", [
+    { action: "create", payload: { quote: "q_old", note: "n_old", occurrence: 1 } },
+    { action: "reclaim", payload: { quote: "q_new", note: "n_new", occurrence: 1 } },
+  ]);
+  eq(base.quote, "q_new", "fold overlays a reclaim's content over the dead row's prior create");
+  eq(base.note, "n_new", "reclaim's note wins too");
+}
+
 // Only partial patches survived (create aged out) -> unmentioned fields absent.
 {
   const base = foldTsvBase("tn", [{ action: "update", payload: { note: "n_late" } }]);

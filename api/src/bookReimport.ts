@@ -192,14 +192,13 @@ export interface ReimportCounts {
   // for the discriminator and why a SAME-reference tombstone is deliberately
   // NOT counted (that skip is what preserves a delete pending export).
   //
-  // These rows are ALSO counted in `skipped_edited`, which is left untouched so
-  // no existing reader changes meaning; this is the specific, gating subset of
-  // it. (`skipped_noop` DID change meaning: the PK-conflict case used to be
-  // folded into it and no longer is. Readers: reimportSummary.ts's "N unchanged"
-  // and AdminPanel's counter dump.) Fixing the drop itself (reclaiming the id)
-  // is issue #427's option 1 and is deliberately not done here — this run still
-  // loses the row, it just says so and refuses to certify the resource as
-  // synced.
+  // These rows are ALSO counted in `skipped_edited` (`skipped_noop` DID change
+  // meaning: the PK-conflict case used to be folded into it and no longer is.
+  // Readers: reimportSummary.ts's "N unchanged" and AdminPanel's counter dump).
+  // Since issue #427 option 1 shipped, a row only reaches this counter (and
+  // `skipped_edited`) when the automatic reclaim itself failed to write — a
+  // row that reclaims successfully is counted in `tombstone_reclaimed` alone,
+  // not here and not in `skipped_edited`, because master's content DID land.
   //
   // NOTE the asymmetry with tsvMerge.ts's `tsvRefMoved`, which answers a
   // similar-sounding question for LIVE rows and also withholds (via
@@ -210,7 +209,19 @@ export interface ReimportCounts {
   // no automatic release — so isReissuedTombstone normalizes whitespace and
   // falls back to chapter/verse. Keep them separate; do not "unify" one into the
   // other without re-deciding which direction each should fail.
+  //
+  // Since issue #427 option 1 shipped, a reissued tombstone is no longer left
+  // permanently blocked — it is reclaimed (see tombstone_reclaimed) and only
+  // lands here when the reclaim WRITE itself failed (lost version-CAS race, or
+  // a protected tn row). The counter and its withhold-the-watermark behavior
+  // are otherwise unchanged.
   tombstone_blocked: number;
+  // Reissued tombstone (master carries the id at a DIFFERENT reference than
+  // the deleted row) successfully reclaimed: the dead (book, id) slot was
+  // overwritten with master's row and deleted_at cleared. Issue #427 option 1.
+  // Diagnostic/observability only — never gates the watermark; a reclaim that
+  // fails to write falls back to tombstone_blocked instead, which does gate it.
+  tombstone_reclaimed: number;
   // Human-readable identification of the rows the two counters above dropped —
   // resource, id, and both references. Capped at BLOCKED_SAMPLE_CAP because the
   // failure mode is a whole book's ids being re-minted at once, and this rides
@@ -446,6 +457,7 @@ function zeroCounts(): ReimportCounts {
     skipped_dup: 0,
     conflict_skipped: 0,
     tombstone_blocked: 0,
+    tombstone_reclaimed: 0,
     resurrected: 0,
     source_attr_reconciled: 0,
     source_attr_divergent: 0,
@@ -541,6 +553,7 @@ function addCounts(into: ReimportCounts, from: ReimportCounts): void {
   into.skipped_dup += from.skipped_dup;
   into.conflict_skipped += from.conflict_skipped ?? 0;
   into.tombstone_blocked += from.tombstone_blocked ?? 0;
+  into.tombstone_reclaimed += from.tombstone_reclaimed ?? 0;
   // Diagnostic list, merged under the same cap. Never gates anything, so a
   // truncation here cannot affect a watermark decision.
   if (from.blocked_samples?.length) {
@@ -1139,6 +1152,12 @@ export async function applyTsvRows(
   // untouched. Counted `reimported_ai`.
   const aiReseeds: Array<{ row: ParsedTsvRow; sortOrder: number; oldVersion: number }> = [];
   const resurrects: Array<{ row: ParsedTsvRow; sortOrder: number; oldVersion: number }> = [];
+  // Reissued tombstones (issue #427 option 1) — resolved separately from
+  // `resurrects` so a failed reclaim (lost version-CAS, or a protected tn
+  // row) falls back to `tombstone_blocked` rather than the resurrect path's
+  // `skipped_edited`. `priorRef` is carried through only for the alert/log
+  // message, never compared against again.
+  const reclaims: Array<{ row: ParsedTsvRow; sortOrder: number; oldVersion: number; priorRef: string }> = [];
   // Rows classified "edited" (human-owned) that diverge from master. Deferred
   // and resolved AFTER this loop so the three-way-merge ancestor can be
   // reconstructed for all of them in ONE batched edit_log read
@@ -1270,36 +1289,47 @@ export async function applyTsvRows(
     if (cur.deleted_at != null) {
       if (isPristineTombstone(kind, cur) && (await lastTsvDeleteWasReimport(env, kind, row.id, book))) {
         resurrects.push({ row, sortOrder, oldVersion: Number(cur.version) });
+      } else if (
+        // Issue #427 option 1. The tombstone keeps its (book, id) primary key
+        // forever, so master's row for that id cannot land as a plain INSERT —
+        // and that is CORRECT when master still carries it at the same
+        // reference (a delete awaiting export; fall through to the plain skip
+        // below). When master carries it at a DIFFERENT reference the id has
+        // been reissued to a genuinely different row: master is authoritative
+        // for a row it still carries, so reclaim the dead slot instead of
+        // silently dropping real content. `!row.idCoerced` first: for a coerced
+        // id the "master reissued this id to a different row" inference is
+        // meaningless — the id is ours, hashed into a 96-id space, so landing on
+        // an unrelated tombstone at a different reference is an expected
+        // collision, not evidence master moved anything. Reclaiming it would
+        // stomp a documented-benign no-op. See ParsedTsvRow.idCoerced.
+        !row.idCoerced &&
+        isReissuedTombstone(
+          { refRaw: (cur.ref_raw as string | null) ?? null, chapter: Number(cur.chapter), verse: Number(cur.verse) },
+          { refRaw: row.refRaw, chapter: row.chapter, verse: row.verse },
+        )
+      ) {
+        // Resolved in its own batch below, under a relaxed guard (version-CAS +
+        // re-asserted tn trashed/preserve/hint protections), so a lost CAS race
+        // or a protected tombstone falls back to tombstone_blocked exactly as
+        // before this fix — the reclaim can lose, but it can never silently
+        // vanish. See isReissuedTombstone's own header for the acknowledged
+        // false-positive: a maintainer re-anchoring the SAME deleted row's
+        // Reference reads identically to a genuine reissue, so a reclaim here
+        // can occasionally resurrect a delete that was merely pending export.
+        // That tradeoff was weighed and accepted in issue #427 (2026-08-17):
+        // the production sweep found 0 reissues misclassified this way across
+        // 10,645 tombstones, and the alternative — leaving it blocked forever
+        // with no automatic release — loses the same real master content with
+        // certainty instead of rarely.
+        reclaims.push({
+          row,
+          sortOrder,
+          oldVersion: Number(cur.version),
+          priorRef: (cur.ref_raw as string | null) || `${cur.chapter}:${cur.verse}`,
+        });
       } else {
         counts.skipped_edited++;
-        // Issue #427. The tombstone keeps its (book, id) primary key forever,
-        // so master's row for that id cannot land — and that is CORRECT when
-        // master still carries it at the same reference (a delete awaiting
-        // export). When master carries it at a DIFFERENT reference the id has
-        // been reissued to a genuinely different row, and we have just dropped
-        // real master content with no error and no distinguishable counter.
-        // Count that case separately so the sync report shows it and the
-        // (book, resource) watermark is withheld — see isReissuedTombstone and
-        // the reimport-sync step. Reclaiming the slot is option 1, not this.
-        // `!row.idCoerced` first: for a coerced id the "master reissued this id
-        // to a different row" inference is meaningless — the id is ours, hashed
-        // into a 96-id space, so landing on an unrelated tombstone at a
-        // different reference is an expected collision, not evidence master
-        // moved anything. Counting it would withhold the watermark and freeze
-        // the export over a documented-benign no-op. See ParsedTsvRow.idCoerced.
-        if (
-          !row.idCoerced &&
-          isReissuedTombstone(
-            { refRaw: (cur.ref_raw as string | null) ?? null, chapter: Number(cur.chapter), verse: Number(cur.verse) },
-            { refRaw: row.refRaw, chapter: row.chapter, verse: row.verse },
-          )
-        ) {
-          counts.tombstone_blocked++;
-          noteBlockedSample(
-            counts,
-            `${kind} ${row.id}: deleted row at ${cur.ref_raw ?? `${cur.chapter}:${cur.verse}`}, master now uses it at ${row.refRaw}`,
-          );
-        }
       }
       continue;
     }
@@ -1773,6 +1803,53 @@ export async function applyTsvRows(
     }
   }
 
+  // Batch the tombstone reclaims (issue #427 option 1: a dead (book, id) slot
+  // master has reissued to a genuinely different row). Same write shape as a
+  // resurrection — clear deleted_at, overwrite every column with master's row
+  // — plus `reseedAi: true` to drop the `updated_by IS NULL` guard and reset
+  // ownership to NULL/reimport-owned: the tombstoned row's prior owner, if any,
+  // has no claim on the new row moving into its slot. Version-CAS plus the tn
+  // trashed/preserve/hint re-assertions (still baked into buildTsvUpdateStmt's
+  // `pristine` predicate) protect a translator's deliberately-protected
+  // tombstone: if either fires, 0 rows change and the row falls back to
+  // `tombstone_blocked` — the same "loudly withheld, never silently lost"
+  // outcome as before this fix, not a silent drop.
+  for (let i = 0; i < reclaims.length; i += WRITE_BATCH) {
+    const slice = reclaims.slice(i, i + WRITE_BATCH);
+    try {
+      const results = await env.DB.batch(
+        slice.map((u) => buildTsvUpdateStmt(env, book, kind, u.row, u.sortOrder, u.oldVersion, now, true, true)),
+      );
+      const logs: D1PreparedStatement[] = [];
+      slice.forEach((u, j) => {
+        if ((results[j]?.meta.changes ?? 0) > 0) {
+          counts.tombstone_reclaimed++;
+          console.warn("reimport: reclaimed tombstoned id reissued by master (issue #427 option 1)", {
+            book,
+            kind,
+            id: u.row.id,
+            from: u.priorRef,
+            to: u.row.refRaw,
+          });
+          logs.push(logEditStmt(env, kind, u.row.id, book, userId, u.oldVersion, u.oldVersion + 1, "reclaim", u.row));
+        } else {
+          // Lost the version-CAS race, or the row is protected (tn
+          // trashed/preserve/hint) — master's row is still dropped, exactly
+          // as it was before this fix, so count and report it the same way.
+          counts.skipped_edited++;
+          counts.tombstone_blocked++;
+          noteBlockedSample(
+            counts,
+            `${kind} ${u.row.id}: reclaim lost (protected row, or raced) — deleted row at ${u.priorRef}, master now uses it at ${u.row.refRaw}`,
+          );
+        }
+      });
+      if (logs.length) await env.DB.batch(logs);
+    } catch (e) {
+      counts.errors.push(`${kind} reclaim batch: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+
   // Batch the combined edited-row merges (three-way adoptions unioned with the
   // ancestor-free tags/whitespace field merge). Modeled on the verse
   // master-adoption batch (applyVerseRows step 7): version-CAS UPDATE (`AND
@@ -1973,7 +2050,7 @@ async function reconstructTsvBases(
     const rs = await env.DB.prepare(
       `SELECT row_key, action, payload_json, book FROM edit_log
         WHERE kind = ?2 AND (book = ?1 OR book IS NULL)
-          AND action IN ('create', 'update', 'restore')
+          AND action IN ('create', 'update', 'restore', 'reclaim')
           AND ${boundaryClause}
           AND row_key IN (${inClause})
         ORDER BY row_key ASC, id ASC`,
@@ -2253,7 +2330,7 @@ function logEditStmt(
   userId: number | null,
   prevVersion: number | null,
   newVersion: number,
-  action: "create" | "update" | "restore",
+  action: "create" | "update" | "restore" | "reclaim",
   payload: unknown,
 ): D1PreparedStatement {
   return env.DB.prepare(
@@ -3970,13 +4047,18 @@ async function raiseTombstoneBlockAlert(
     `MISSING from the app, so ${book} ${resource.toUpperCase()} has been left marked out of sync and ` +
     `will NOT export to Door43 until this is cleared — otherwise the export would delete those same ` +
     `rows from Door43. ` +
-    (blocked > 0 ? `${blocked} blocked by a deleted row whose ID Door43 now uses at a different reference` : "") +
+    (blocked > 0
+      ? `${blocked} whose ID Door43 now uses at a different reference could not be reclaimed automatically ` +
+        `(the deleted row is protected — trashed, preserved, marked hint — or a translator edited it in the ` +
+        `same window)`
+      : "") +
     (blocked > 0 && conflicts > 0 ? "; " : "") +
     (conflicts > 0 ? `${conflicts} refused by the database as an ID already in use` : "") +
     `. Affected: ${shown.join(" | ")}${more > 0 ? ` (and ${more} more)` : ""}. ` +
-    `This does NOT clear on its own — the next sync hits the same collision. To clear it, either give ` +
-    `the affected row(s) a different ID on Door43, or land the ID-reclaim / tombstone-sweep fix ` +
-    `(GitHub issue #427, options 1 and 3).`;
+    `This does NOT clear on its own while the row stays protected — the next sync retries and keeps ` +
+    `hitting the same collision. To clear it, either give the affected row(s) a different ID on Door43, ` +
+    `or clear the D1 row's deleted/trashed/preserve/hint state so the next sync's automatic reclaim ` +
+    `(GitHub issue #427, option 1) can land it.`;
   try {
     await env.DB.prepare(`DELETE FROM system_alerts WHERE username = ?1 AND source = ?2 AND dismissed_at IS NULL`)
       .bind(OWN_PUBLISH_ALERT_USERNAME, source)

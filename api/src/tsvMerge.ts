@@ -431,8 +431,13 @@ export function computeTsvMerge(
 // regardless of who wrote it — an ai_pipeline or dcs_reimport write is a
 // legitimate part of the published content, exactly as on the verse side.
 
-// Actions whose edit_log payload carries row content worth folding.
-const CONTENT_ACTIONS = new Set(["create", "update", "restore"]);
+// Actions whose edit_log payload carries row content worth folding. `reclaim`
+// (issue #427 option 1) is a reissued tombstone overwritten wholesale with
+// master's row — same "this is what D1 now actually holds" reasoning as
+// `restore`, and it must be included: without it, a fold reaching past a
+// reclaim would pick up the DEAD row's pre-reclaim history as the ancestor for
+// a completely different logical row now occupying that (book, id) slot.
+const CONTENT_ACTIONS = new Set(["create", "update", "restore", "reclaim"]);
 
 // Read one canonical field from a heterogeneously-shaped payload, honoring both
 // snake_case (DB/ParsedTsvRow) and camelCase (request body) spellings. Returns

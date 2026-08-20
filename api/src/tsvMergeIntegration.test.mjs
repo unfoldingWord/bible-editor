@@ -61,7 +61,7 @@ function loadEntriesById(ids, boundaryId = null) {
     .prepare(
       `SELECT row_key, action, payload_json, book FROM edit_log
         WHERE kind = ? AND (book = ? OR book IS NULL)
-          AND action IN ('create', 'update', 'restore')
+          AND action IN ('create', 'update', 'restore', 'reclaim')
           AND ${boundaryClause}
           AND row_key IN (${inClause})
         ORDER BY row_key ASC, id ASC`,
