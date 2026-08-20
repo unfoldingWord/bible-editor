@@ -2433,7 +2433,43 @@ async function loadMasterLineage(
     incompleteReason: summary.incompleteReason,
     humanShas: summary.humanShas,
   });
+  // page.commits is newest-first (see listMasterCommitsSince) — its first
+  // entry is the far end of the walk, i.e. the master commit this summary was
+  // computed as of. Empty when nothing on master moved this file since the
+  // watermark; null is honest there rather than a stale prior sha.
+  const asOfSha = page.commits[0]?.sha ?? null;
+  await persistMasterLineage(env, book, resource, summary, asOfSha);
   return summary;
+}
+
+// Durable counterpart to the console.log above — see 0052_master_lineage_snapshot.sql.
+// Last-run-wins on the same (book, resource) row every other watermark here
+// already keys on. Never blocks the caller: a write failure here must not
+// fail a reimport whose only mistake was wanting its evidence remembered.
+async function persistMasterLineage(
+  env: Env,
+  book: string,
+  resource: Resource,
+  summary: MasterLineageSummary,
+  asOfSha: string | null,
+): Promise<void> {
+  try {
+    await env.DB.prepare(
+      `UPDATE book_resource_syncs
+          SET master_lineage_json = ?3,
+              master_lineage_sha = ?4,
+              master_lineage_computed_at = unixepoch()
+        WHERE book = ?1 AND resource = ?2`,
+    )
+      .bind(book, resource, JSON.stringify(summary), asOfSha)
+      .run();
+  } catch (e) {
+    console.error("reimport failed to persist master lineage", {
+      book,
+      resource,
+      error: e instanceof Error ? e.message : String(e),
+    });
+  }
 }
 
 // Heal AI-mangled U+FFFD in `\zaln-s` source attributes (x-content / x-lemma /
