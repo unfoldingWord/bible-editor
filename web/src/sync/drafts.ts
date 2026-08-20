@@ -10,9 +10,9 @@
 import { openDB, type IDBPDatabase } from "idb";
 import { isReadOnly, type RowKind } from "./api";
 import { onOutboxResult } from "./outbox";
-import { generationForSuccessfulOp } from "./draftSaveState";
+import { pinReleaseAfterVerseOk } from "./draftSaveState";
 import { unpinVerseBase } from "./versePin";
-export { pinVerseBase, peekPinnedVerseBase } from "./versePin";
+export { pinVerseBase, peekPinnedVerseBase, unpinVerseBase } from "./versePin";
 
 const DB_NAME = "bible-editor-drafts";
 const DB_VERSION = 1;
@@ -245,8 +245,11 @@ onOutboxResult((op, result) => {
   if (op.target.kind === "verse") {
     const key = verseKey(op.target.book, op.target.chapter, op.target.verse, op.target.bibleVersion);
     void drafts.get(key).then((draft) => {
-      const generation = generationForSuccessfulOp(draft, op);
-      if (generation) void drafts.clearGeneration(key, generation);
+      const release = pinReleaseAfterVerseOk(draft, op);
+      if (release.kind === "clear") void drafts.clearGeneration(key, release.generation);
+      // Draftless save landed (dual-aligner reading line): nothing tracks the
+      // pin, so release it here or it poisons every later save (#563).
+      else if (release.kind === "unpin") unpinVerseBase(key);
     });
   } else if (op.target.kind === "row") {
     void drafts.clear(rowKey(op.target.rowKind, op.target.book, op.target.id));
