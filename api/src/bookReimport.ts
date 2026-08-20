@@ -1820,6 +1820,17 @@ export async function applyTsvRows(
           // field is still stale, so the watermark must be withheld or the export
           // reverts master with no retry (Codex P1.2 — the CAS-race twin of the
           // thrown-batch gate). A lost heuristic-only write is not data loss.
+          //
+          // A `keep_ai_master` row (u.conflict true, u.adopted false — see the
+          // `merge.conflict` block above) can lose this same race with NOTHING
+          // else to show for it: the review_kind/review_reason flag IS the whole
+          // write, so a lost CAS here reports nowhere this run (#552 item 1,
+          // decided rather than left an accident of the adopted-only branch
+          // below). Left this way deliberately: the conflict this flag exists to
+          // surface is recomputed from D1/master on every run, so it either
+          // still holds next sync (and gets flagged then) or the human's own
+          // edit that won this race resolved it — either way there is nothing
+          // to retry, unlike an adoption's stale, unreachable-by-recompute field.
           counts.skipped_edited++;
           if (u.adopted) {
             counts.apply_incomplete = true;
@@ -2828,6 +2839,18 @@ async function applyVerseRows(
         // export is how the human edit this outcome just protected reaches
         // Door43, and withholding it would re-create the livelock #543 killed on
         // the TSV side. Counted separately so the class is still visible.
+        // `merge.adopt` is false for keep_ai_master (same as keep_alignment_refused
+        // above), so it falls through past the `merge.adopt` branch below to the
+        // ordinary edited-verse path — including reconcileEditedVerseSourceAttrs,
+        // which still pulls master's x-content/x-lemma/x-morph onto this verse's
+        // `\zaln-s` milestones (#552 item 2, decided rather than left an accident
+        // of fall-through order). Kept deliberately, not just inherited: we refuse
+        // master's TARGET text here because it's AI-authored with no human commit
+        // behind it, but the original-language source attributes are source-owned,
+        // not translator-owned — the same reasoning keep_alignment_refused already
+        // relies on (the NUM 20–22 combining-mark correction is the case that
+        // reconcile exists for). Refusing the target text is not a reason to also
+        // refuse an unrelated, source-owned correction on the same verse.
         if (merge.action === "keep_ai_master") counts.merge_kept_ai++;
         // FIX 5: converged-per-stableKey but the raw bytes differed — a real,
         // cosmetic-only edit this comparison silently discards. See

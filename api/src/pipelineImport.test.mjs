@@ -27,6 +27,7 @@ import {
   maybeCheckCancelled,
   tnPayload,
   tqPayload,
+  applyTnHintExpansionIfMatch,
 } from "./pipelineImport.ts";
 import { ROW_ID_RE, coerceRowId, deriveAltRowId } from "./rowId.ts";
 
@@ -3140,6 +3141,110 @@ await (async () => {
     `TN dedup key drift: the curled proposal is recognized as a duplicate of the (stale, straight-quote) live row (got tnSkippedDup=${result.applied?.tnSkippedDup})`,
   );
   assert(skippedDupAcceptCount === 1, "TN dedup key drift: the duplicate proposal is still marked accepted (not left unreviewed)");
+})();
+
+// ─── #546: hint-expansion edit_log payload must match the UPDATE's columns ──
+// The UPDATE inside applyTnHintExpansionIfMatch deliberately leaves chapter
+// and verse untouched (a hint expansion never re-anchors the row), but the
+// audit row used to log the entire AI proposal, chapter/verse included. Two
+// replayers trust that payload as history: the row's version-history
+// endpoint, and the nightly sync's reference-ancestor fold (foldTsvRefBase),
+// where a wrong value is worse than a missing one. This drives the REAL
+// function against a fake D1, not a hand-rolled assertion on tnPayload.
+await (async () => {
+  const proposedPayload = {
+    id: "ohr7",
+    book: "MIC",
+    chapter: 99, // AI's own proposal chapter — must NOT reach the audit row
+    verse: 77, // AI's own proposal verse — must NOT reach the audit row
+    ref_raw: "1:10",
+    tags: null,
+    support_reference: null,
+    quote: "בְּגַת֙",
+    occurrence: 1,
+    note: "A note.",
+  };
+  const p = {
+    id: 1,
+    kind: "tn",
+    book: "MIC",
+    chapter: 1,
+    verse: 10,
+    bible_version: null,
+    payload_json: JSON.stringify(proposedPayload),
+  };
+  const job = { jobId: "job-mic1", pipelineType: "notes", book: "MIC", startChapter: 1, endChapter: 1 };
+
+  const stubVersion = 3;
+  let loggedPayload = null;
+
+  function dispatch(sql, args) {
+    if (/SELECT id, version FROM tn_rows\s+WHERE id = \?1/.test(sql)) {
+      return { changes: 0, rows: [], single: { id: "ohr7", version: stubVersion } };
+    }
+    if (/UPDATE tn_rows\s+SET quote/.test(sql)) {
+      return { changes: 1, rows: [], single: null };
+    }
+    if (/INSERT INTO edit_log/.test(sql)) {
+      loggedPayload = JSON.parse(args[5]); // ?6 in the SQL, 0-indexed here
+      return { changes: 1, rows: [], single: null };
+    }
+    if (/SET accepted_at = unixepoch\(\), accepted_by = \?2/.test(sql)) {
+      return { changes: 1, rows: [], single: null };
+    }
+    throw new Error(`fakeHintExpansionDb: unhandled SQL: ${sql}`);
+  }
+
+  const env = {
+    DB: {
+      prepare(sql) {
+        return {
+          bind(...args) {
+            return {
+              sql,
+              args,
+              async run() {
+                const res = dispatch(sql, args);
+                return { meta: { changes: res.changes }, results: res.rows };
+              },
+              async first() {
+                return dispatch(sql, args).single;
+              },
+              async all() {
+                return { results: dispatch(sql, args).rows };
+              },
+            };
+          },
+        };
+      },
+      async batch(stmts) {
+        const results = [];
+        for (const s of stmts) {
+          const res = dispatch(s.sql, s.args);
+          results.push({ meta: { changes: res.changes }, results: res.rows });
+        }
+        return results;
+      },
+    },
+  };
+
+  const applied = await applyTnHintExpansionIfMatch(env, p, job, 1);
+  assert(applied === true, "hint expansion: CAS won against the fake stub");
+  assert(loggedPayload !== null, "hint expansion: an edit_log row was logged");
+  assert(
+    !("chapter" in loggedPayload) && !("verse" in loggedPayload),
+    `#546: edit_log payload omits chapter/verse the UPDATE never wrote (got ${JSON.stringify(loggedPayload)})`,
+  );
+  assert(
+    !("id" in loggedPayload) && !("book" in loggedPayload),
+    `#546: edit_log payload omits id/book (identifiers, not content) (got ${JSON.stringify(loggedPayload)})`,
+  );
+  for (const field of ["ref_raw", "tags", "support_reference", "quote", "occurrence", "note"]) {
+    assert(
+      loggedPayload[field] === proposedPayload[field],
+      `#546: edit_log payload's ${field} matches what the UPDATE wrote`,
+    );
+  }
 })();
 
 console.log("pipelineImport (claim guard): all assertions passed");
