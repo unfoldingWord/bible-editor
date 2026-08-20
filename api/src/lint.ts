@@ -8,7 +8,8 @@
 //   TN: unmatched/mismatched square brackets (13), an Alternate-translation label
 //       with no sentence terminator before it (12), a malformed Reference (6), a
 //       malformed rc:// SupportReference (7).
-//   USFM: unbalanced \f / \f* footnotes (6), missing verses (5).
+//   USFM: unbalanced \f / \f* footnotes (6), missing verses (5), unmatched
+//       curly quotation marks (“ ”).
 // The MECHANICAL checks (formatting, trailing \n, straight quotes, label spacing,
 // reference order, ids, occurrence) are auto-fixed at export and are NOT linted
 // here. See docs/export-validation-cleanup.md.
@@ -25,7 +26,7 @@
 
 import type { TnRow, TqRow, TwlRow, VerseRow } from "./types";
 import { parseVerseContentJson } from "./contentJson.ts";
-import { isTsMilestone } from "./importParsers.ts";
+import { extractPlainText, isTsMilestone } from "./importParsers.ts";
 import { parseRefOrderKey } from "./tsvFormat.ts";
 
 export type IssueBucket = "flag" | "escalate";
@@ -675,12 +676,83 @@ export function lintChapterOpeningMarkers(verses: VerseRow[]): LintIssue[] {
   return issues;
 }
 
-// USFM (ult/ust) integrity lint over the stored verse rows: unbalanced footnotes
-// and joiner-glued alignment milestones, per verse. (Verse-coverage / chapter-
-// count are guarded by the export shrink guard and validated whole-file
-// downstream; not duplicated here.)
-export function lintUsfmVerses(verses: VerseRow[]): LintIssue[] {
+// Port of the "matched open/closed quotation marks" judgement call named in
+// #438 — narrowed, after two review rounds on PR #483, to the one claim that
+// is actually provable from plain text: a CLOSING curly quote (”) with no
+// opening quote (“) anywhere earlier in the book. Deliberately narrow in two
+// more ways: straight `"` is auto-normalized to curly at export (see
+// docs/export-validation-cleanup.md) so it is not linted, and curly single
+// quotes (‘ ’) double as apostrophes inside words — a naive pairing check
+// cannot tell "don't" from a genuine unmatched single quote.
+//
+// This deliberately does NOT flag a leftover, never-closed opening quote, and
+// deliberately runs BOOK-wide rather than resetting at any boundary. Two real
+// ULT/UST conventions make "every opener needs a closer" unprovable from
+// plain text alone:
+//   - Continuation openers: multi-paragraph dialogue re-opens each paragraph
+//     with “ and closes only the final one ("“first paragraph…" "“second
+//     paragraph…”") — usfm-js's plain text has no paragraph markers left in
+//     it (extractPlainText strips them), so the checker cannot tell a
+//     continuation opener from a genuinely unclosed one.
+//   - Cross-chapter spans: quoted speech can open near the end of one
+//     chapter and close in the next — chapter breaks do not terminate a
+//     quotation, so per-chapter scoping (tried and reverted) double-flagged
+//     ordinary text at every chapter boundary too.
+// A running, never-negative counter sidesteps both: it only ever objects to a
+// ” for which there is provably no “ anywhere before it — true regardless of
+// how many paragraphs or chapters separate them — and silently accepts any
+// number of unconsumed opens. `entries` is sorted defensively (chapter, then
+// verse) rather than trusting caller order, since a mis-ordered scan could
+// consume a closer against an opener that doesn't actually precede it.
+function quoteIssues(verses: VerseRow[]): LintIssue[] {
+  const entries: Array<{ ref: string; chapter: number; verse: number; text: string }> = [];
+  for (const v of verses) {
+    if (v.verse === 0) continue;
+    let parsed: unknown;
+    try {
+      parsed = parseVerseContentJson(v);
+    } catch {
+      continue;
+    }
+    const vos = (parsed as { verseObjects?: unknown[] })?.verseObjects;
+    if (!Array.isArray(vos)) continue;
+    entries.push({ ref: `${v.chapter}:${v.verse}`, chapter: v.chapter, verse: v.verse, text: extractPlainText(parsed) });
+  }
+  entries.sort((a, b) => a.chapter - b.chapter || a.verse - b.verse);
+
   const issues: LintIssue[] = [];
+  let openCount = 0;
+  for (const e of entries) {
+    for (let i = 0; i < e.text.length; i++) {
+      const ch = e.text[i];
+      if (ch === "“") {
+        openCount++;
+      } else if (ch === "”") {
+        if (openCount === 0) {
+          issues.push({
+            check: "Quotation Mark",
+            bucket: "flag",
+            ref: e.ref,
+            message: `Closing quote '”' at character ${i + 1} has no opening quote anywhere earlier in the book.`,
+          });
+        } else {
+          openCount--;
+        }
+      }
+    }
+  }
+  return issues;
+}
+
+// USFM (ult/ust) integrity lint over the stored verse rows: unbalanced footnotes,
+// joiner-glued alignment milestones, and unmatched curly quotation marks.
+// Footnotes/glued-milestones/reused-tokens are genuinely per-verse; quotation
+// marks are not (see quoteIssues) and are checked once across the whole call,
+// not inside this per-verse loop. (Verse-coverage / chapter-count are guarded
+// by the export shrink guard and validated whole-file downstream; not
+// duplicated here.)
+export function lintUsfmVerses(verses: VerseRow[]): LintIssue[] {
+  const issues: LintIssue[] = [...quoteIssues(verses)];
   for (const v of verses) {
     if (v.verse === 0) continue;
     let parsed: unknown;
