@@ -6,7 +6,7 @@ import CheckIcon from "@mui/icons-material/Check";
 import type { TwlRow, VerseDto } from "../sync/api";
 import { CopyChapterButton } from "./CopyChapterButton";
 import { LANE_FILL, type TextLaneCheck } from "../lib/laneChecks";
-import { highlightsFor, leadingBreakClass, renderEditableHTML, renderHighlightedHTML, type HighlightKey, type ReorderHighlight } from "../lib/highlight";
+import { highlightsFor, isPaintableHtml, leadingBreakClass, renderEditableHTML, renderHighlightedHTML, type HighlightKey, type ReorderHighlight } from "../lib/highlight";
 import { markHighlightSx } from "../lib/highlightStyles";
 import { extractTrailingMarkers, stripTrailingMarkers, splitSectionHeaders, type SectionHeader } from "../lib/usfm";
 import { SectionHeaderBand } from "./SectionHeaderBand";
@@ -431,9 +431,8 @@ function VerseSpan({
       // caret, and in Firefox `textContent` set here would clobber the verse
       // the user is editing. Restore-on-mount (reload / chapter nav) is the
       // only legitimate reason to push draft text into the DOM.
-      if (hydratedFromDraftRef.current) return;
-      hydratedFromDraftRef.current = true;
       if (
+        !hydratedFromDraftRef.current &&
         rec &&
         typeof (rec.payload as { plainText?: unknown }).plainText === "string" &&
         elRef.current
@@ -444,6 +443,7 @@ function VerseSpan({
           lastSetRef.current = plain;
           lastTextRef.current = plain;
         }
+        hydratedFromDraftRef.current = true;
       }
     });
   }, [draftKey, readOnly]);
@@ -533,12 +533,16 @@ function VerseSpan({
     // change could otherwise slip through and wipe the in-progress edit.
     if (hasDraft || dirtyRef.current) return;
     const dom = elRef.current.textContent;
-    if (html !== null) {
-      if (html !== lastSetRef.current) {
+    // An empty-string render (empty verseObjects tree, or a tree of only
+    // unrecognized/marker nodes) is not paintable content — fall through to
+    // the plain-text baseline rather than blanking the pane. #529
+    const paintable = isPaintableHtml(html) ? html : null;
+    if (paintable !== null) {
+      if (paintable !== lastSetRef.current) {
         // Caret-preserving: activating this verse flips `html` to chip HTML and
         // would otherwise wipe the selection the activating click just placed.
-        setInnerHtmlPreservingCaret(elRef.current, html);
-        lastSetRef.current = html;
+        setInnerHtmlPreservingCaret(elRef.current, paintable);
+        lastSetRef.current = paintable;
         lastTextRef.current = text;
       }
       return;

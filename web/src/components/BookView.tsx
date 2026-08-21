@@ -19,7 +19,7 @@ import { type ChapterCopyBlock } from "../lib/chapterCopy";
 import { CopyChapterButton } from "./CopyChapterButton";
 import { LANE_FILL, type TextLaneCheck } from "../lib/laneChecks";
 import type { ChapterState } from "../hooks/useBook";
-import { highlightsFor, renderEditableHTML, renderHighlightedHTML, type HighlightKey, type ReorderHighlight } from "../lib/highlight";
+import { highlightsFor, isPaintableHtml, renderEditableHTML, renderHighlightedHTML, type HighlightKey, type ReorderHighlight } from "../lib/highlight";
 import { markHighlightSx, bookTsDividerSx } from "../lib/highlightStyles";
 import { extractTrailingMarkers, extractTrailingDividers, stripTrailingDividers, stripTrailingMarkers, splitSectionHeaders, type SectionHeader } from "../lib/usfm";
 import { SectionHeaderBand } from "./SectionHeaderBand";
@@ -757,9 +757,8 @@ const VerseCell = memo(function VerseCell({
       // caret, and in Firefox `textContent` set here would clobber the verse
       // the user is editing. Restore-on-mount (reload / chapter nav) is the
       // only legitimate reason to push draft text into the DOM.
-      if (hydratedFromDraftRef.current) return;
-      hydratedFromDraftRef.current = true;
       if (
+        !hydratedFromDraftRef.current &&
         rec &&
         typeof (rec.payload as { plainText?: unknown }).plainText === "string" &&
         elRef.current
@@ -770,6 +769,7 @@ const VerseCell = memo(function VerseCell({
           lastSetRef.current = plain;
           lastTextRef.current = plain;
         }
+        hydratedFromDraftRef.current = true;
       }
     });
   }, [draftKey, readOnly]);
@@ -914,12 +914,16 @@ const VerseCell = memo(function VerseCell({
     if (hasDraft || dirtyRef.current) return;
     const text = dto?.plain_text ?? "";
     const dom = elRef.current.textContent;
-    if (html !== null) {
-      if (html !== lastSetRef.current) {
+    // An empty-string render (empty verseObjects tree, or a tree of only
+    // unrecognized/marker nodes) is not paintable content — fall through to
+    // the plain-text baseline rather than blanking the pane. #529
+    const paintable = isPaintableHtml(html) ? html : null;
+    if (paintable !== null) {
+      if (paintable !== lastSetRef.current) {
         // Caret-preserving: activating this verse flips `html` to chip HTML and
         // would otherwise wipe the selection the activating click just placed.
-        setInnerHtmlPreservingCaret(elRef.current, html);
-        lastSetRef.current = html;
+        setInnerHtmlPreservingCaret(elRef.current, paintable);
+        lastSetRef.current = paintable;
         lastTextRef.current = text;
       }
       return;
