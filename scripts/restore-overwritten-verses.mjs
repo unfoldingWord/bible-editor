@@ -117,19 +117,22 @@ for (const t of targets) {
             (SELECT el.rowid FROM edit_log el WHERE el.kind='verse' AND el.row_key='${rk}'
               AND el.new_version=${t.overwrittenVersion}
               AND json_extract(el.payload_json,'$.content') IS NOT NULL
-              ORDER BY el.created_at DESC LIMIT 1) AS payload_rowid,
+              ORDER BY el.new_version DESC, el.rowid DESC LIMIT 1) AS payload_rowid,
             (SELECT LENGTH(json_extract(el.payload_json,'$.content')) FROM edit_log el
               WHERE el.kind='verse' AND el.row_key='${rk}' AND el.new_version=${t.overwrittenVersion}
-              ORDER BY el.created_at DESC LIMIT 1) AS payload_len,
+                AND json_extract(el.payload_json,'$.content') IS NOT NULL
+              ORDER BY el.new_version DESC, el.rowid DESC LIMIT 1) AS payload_len,
             (SELECT json_extract(el.payload_json,'$.plain_text') FROM edit_log el
               WHERE el.kind='verse' AND el.row_key='${rk}' AND el.new_version=${t.overwrittenVersion}
-              ORDER BY el.created_at DESC LIMIT 1) AS payload_plain,
+                AND json_extract(el.payload_json,'$.content') IS NOT NULL
+              ORDER BY el.new_version DESC, el.rowid DESC LIMIT 1) AS payload_plain,
             (SELECT COALESCE(el.source,'') FROM edit_log el
               WHERE el.kind='verse' AND el.row_key='${rk}' AND el.new_version IS NOT NULL
               ORDER BY el.new_version DESC LIMIT 1) AS newest_source,
             (SELECT json_extract(el.payload_json,'$.content') FROM edit_log el
               WHERE el.kind='verse' AND el.row_key='${rk}' AND el.new_version=${t.overwrittenVersion}
-              ORDER BY el.created_at DESC LIMIT 1) = v.content_json AS already_identical
+                AND json_extract(el.payload_json,'$.content') IS NOT NULL
+              ORDER BY el.new_version DESC, el.rowid DESC LIMIT 1) = v.content_json AS already_identical
        FROM verses v
       WHERE v.book='${t.book}' AND v.chapter=${t.chapter} AND v.verse=${t.verse}
         AND v.bible_version='${t.resource.toUpperCase()}'`,
@@ -180,6 +183,21 @@ for (const p of plans) {
 }
 console.log(`planned: ${plans.length}, skipped: ${skips.length}`);
 for (const s of skips) console.log(`  SKIP ${s.key}: ${s.why}`);
+
+// plain_text is a denormalized copy used for display fallback and for
+// find/replace. When the restored payload carries none, the UPDATE's COALESCE
+// keeps the row's EXISTING value — which is the overwritten (Door43) text sitting
+// on top of restored (translator) content_json. Usually harmless, because the
+// two sides of these conflicts differed in alignment rather than wording, but it
+// is a real divergence and must not pass silently: the row's own verify only
+// checks the version bump, so nothing else would surface it.
+const noPlain = plans.filter((p) => !p.plainHasText);
+if (noPlain.length) {
+  console.warn(`\nWARNING: ${noPlain.length} verse(s) restore content with NO plain_text in the payload;`);
+  console.warn(`their existing plain_text is kept and may not match the restored content:`);
+  for (const p of noPlain) console.warn(`  ${p.key} (from v${p.overwrittenVersion})`);
+  console.warn(`Verify these with scratchpad/check-plaintext.mjs after the run.\n`);
+}
 
 if (EXECUTE) {
   let ok = 0, failed = 0;

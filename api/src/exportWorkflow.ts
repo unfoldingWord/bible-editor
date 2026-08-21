@@ -20,6 +20,7 @@ import {
   ALL_RESOURCES,
   attributeTsvShrink,
   branchOverrideAllowed,
+  prunableBranches,
   buildExportBranch,
   buildTnTsv,
   buildTqTsv,
@@ -1075,9 +1076,17 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
         // SKIPPED under a branch override. The prune's premise is "this run
         // replaces the previous run's branch for the same (book, resource)",
         // which an override run does not: it is a one-off beside the normal
-        // lineage. Every `{book}-be-*` branch differs from an override name, so
-        // running it here would delete ALL of them — closing their open PRs and
-        // discarding queued edits for a book whose normal export we never made.
+        // lineage. Running it here would delete the normal lineage's OWN
+        // branches — it reads `export_snapshots` history for this
+        // (book, resource) and deletes every branch that is not this run's, so a
+        // one-off override run would take the real `-be-` branch (and its open
+        // PR, holding queued edits) with it.
+        //
+        // The converse hazard — a LATER normal export pruning this override
+        // branch out from under the maintainer reviewing it — is handled inside
+        // pruneSupersededBranches, which now only deletes branches carrying
+        // `-be-`. Both directions have to be closed, because either one silently
+        // destroys an open PR.
         if (!branchOverride) {
           await this.pruneSupersededBranches(book, resource, owner, target.repo, branch);
         }
@@ -1425,7 +1434,9 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     } catch (e) {
       console.error("prune: history query failed", { book, resource, error: e instanceof Error ? e.message : String(e) });
     }
-    const targets = [...new Set([...stale, LEGACY_EXPORT_BRANCH])].filter((b) => b && b !== keepBranch);
+    // Only ever prune branches WE generated — see prunableBranches in export.ts
+    // for why, and for the test that pins it.
+    const targets = prunableBranches(stale, keepBranch, LEGACY_EXPORT_BRANCH);
     for (const b of targets) {
       try {
         await deleteDcsBranch(

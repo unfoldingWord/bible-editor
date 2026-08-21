@@ -5,7 +5,7 @@
 // instead of getting silently flattened to `\v 6`. Not a test framework;
 // failures exit non-zero.
 
-import { attributeTsvShrink, branchOverrideAllowed, exportBranchOverrideValid, buildAlignmentShrinkAlertMessage, buildUsfmInvalidAlertMessage, classifyAlignmentLossSeverity, offenderProvenanceFromLog, buildExportBranch, buildTnTsv, buildTqTsv, buildTwlTsv, buildUsfm, classifyAlignmentShrinkOffenders, classifyRevertSeverity, commitToDcs, countDuplicateMasterIds, describeShrinkRefusal, ensureDcsPr, exportTags, exportTsvShrinkRefused, findDcsOpenPr, isMasterConfirmed, mechanicalOverwriteAlert, parseTsvIds, recreateExportBranchFromMaster, shouldRecordRevertReport, tsvRevertReport, updateDcsPrBranch, usfmAlignmentShrinkRefused, usfmRevertReport } from "./export.ts";
+import { attributeTsvShrink, branchOverrideAllowed, prunableBranches, exportBranchOverrideValid, buildAlignmentShrinkAlertMessage, buildUsfmInvalidAlertMessage, classifyAlignmentLossSeverity, offenderProvenanceFromLog, buildExportBranch, buildTnTsv, buildTqTsv, buildTwlTsv, buildUsfm, classifyAlignmentShrinkOffenders, classifyRevertSeverity, commitToDcs, countDuplicateMasterIds, describeShrinkRefusal, ensureDcsPr, exportTags, exportTsvShrinkRefused, findDcsOpenPr, isMasterConfirmed, mechanicalOverwriteAlert, parseTsvIds, recreateExportBranchFromMaster, shouldRecordRevertReport, tsvRevertReport, updateDcsPrBranch, usfmAlignmentShrinkRefused, usfmRevertReport } from "./export.ts";
 import { CorruptContentJsonError } from "./contentJson.ts";
 import { extractVersesForRange } from "./importParsers.ts";
 import { validateUsfm } from "./usfmValidate.ts";
@@ -1060,6 +1060,29 @@ function utf8Base64(s) {
     result.explained === missingCount && result.unexplained === 0,
     `1CH TQ: all ${missingCount} missing rows explained`,
   );
+}
+
+// --- prunableBranches: never delete a branch a human is reviewing ---
+{
+  const LEGACY = "live-snapshot";
+  // The whole point: an override branch sits in export_snapshots history beside
+  // the generated ones, and deleting it closes the maintainer's review PR.
+  const stale = ["MIC-be-bethoakes", "BibleEditor-data-restoration", "MIC-be-old"];
+  const got = prunableBranches(stale, "MIC-be-bethoakes-pjoakes", LEGACY);
+  assert(!got.includes("BibleEditor-data-restoration"), `an override branch is NEVER pruned`);
+  assert(got.includes("MIC-be-bethoakes") && got.includes("MIC-be-old"), `generated branches still pruned`);
+  assert(got.includes(LEGACY), `the legacy branch is always prunable`);
+  // keepBranch is this run's own branch and must survive even if it is in history.
+  assert(
+    !prunableBranches(["MIC-be-x"], "MIC-be-x", LEGACY).includes("MIC-be-x"),
+    `this run's own branch is never pruned`,
+  );
+  // Suffix-less `{BOOK}-be` is a valid override name (see the override tests
+  // above) and must therefore also survive the prune.
+  assert(!prunableBranches(["MIC-be"], "MIC-be-x", LEGACY).includes("MIC-be"), `"MIC-be" is not prunable`);
+  // No duplicate DELETE calls when the legacy name is also in history.
+  const dedup = prunableBranches([LEGACY, "A-be-x"], "A-be-y", LEGACY);
+  assert(dedup.filter((b) => b === LEGACY).length === 1, `legacy branch appears once`);
 }
 
 // ECC ch1 shape: a repair script run against a human ruling trashed 53 notes in

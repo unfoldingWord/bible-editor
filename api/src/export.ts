@@ -93,8 +93,13 @@ export function buildExportBranch(book: string, usernames: string[]): string {
 //      hit). Green here means "nothing ran", not "validated" — the PR body says
 //      so, so the maintainer isn't misled.
 //
-// pruneSupersededBranches globs `{book}-be-*`, so an override branch is never
-// pruned by a later normal export of the same book, and never prunes one.
+// PRUNING, both directions. pruneSupersededBranches does NOT glob a name shape —
+// it reads this (book, resource)'s `export_snapshots` history and deletes every
+// branch that is not the run's own. So an override run must not run the prune (it
+// would delete the normal lineage's live branch and close its PR), and a later
+// normal export must not delete the override branch (a maintainer is reviewing
+// it). The second half is enforced there by pruning only branches carrying
+// `-be-`; this validator's rejection of `-be-` is what makes that test sound.
 const BRANCH_OVERRIDE_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/;
 
 export function exportBranchOverrideValid(name: string): boolean {
@@ -114,6 +119,29 @@ export function exportBranchOverrideValid(name: string): boolean {
 // a multi-book run and collapse several books onto a single branch, each
 // overwriting the last. Every cron path omits branchName, so the nightly is
 // untouched no matter what params reach it.
+// Which of this (book, resource)'s historical branches may pruneSupersededBranches
+// DELETE. Pure so the rule is testable without a Workflow context — the method it
+// serves is private and reaches DCS, and this decision destroys branches (and,
+// through them, open PRs), so it must not be the untested half of that method.
+//
+// `stale` comes from export_snapshots history, which records EVERY branch we have
+// pushed for this pair — including hand-named ones from the `branchName` override,
+// which a uW maintainer may be mid-review on. buildExportBranch always emits
+// `-be-`; the override refuses it. So that substring is the line between "a branch
+// we generated and can recycle" and "someone is using this".
+//
+// LEGACY_EXPORT_BRANCH is always prunable: it predates the `-be-` scheme and is
+// ours by definition.
+export function prunableBranches(
+  stale: readonly string[],
+  keepBranch: string,
+  legacyBranch: string,
+): string[] {
+  return [...new Set([...stale.filter((b) => b.includes("-be-")), legacyBranch])].filter(
+    (b) => b && b !== keepBranch,
+  );
+}
+
 export function branchOverrideAllowed(
   params: { branchName?: string; book?: string; resource?: string },
   resolvedBookCount: number,

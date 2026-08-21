@@ -59,7 +59,11 @@ function d1(sqlRaw, attempts = 3) {
         [req.resolve("wrangler/bin/wrangler.js"), "d1", "execute", "bible_editor", "--remote", "--env", "production", "--json", "--command", sql],
         { cwd: API_DIR, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
       const parsed = JSON.parse(out.slice(out.indexOf("[")));
-      if (!parsed[0]?.success) throw new Error(`D1 failure: ${out.slice(0, 400)}`);
+      // EVERY statement, not just the first: a multi-statement --command returns one
+      // result object per statement, so a failure in statement 2 or 3 (the audit
+      // INSERT, the conflict resolve) is invisible if only parsed[0] is checked.
+      if (!parsed.length || parsed.some((p) => p && p.success === false))
+        throw new Error(`D1 failure: ${out.slice(0, 400)}`);
       return parsed[0].results ?? [];
     } catch (e) {
       if (i >= attempts) throw e;
@@ -75,7 +79,13 @@ const FIELD_KEYS = {
   note: ["note"], question: ["question"], response: ["response"],
   quote: ["quote"], occurrence: ["occurrence"], tags: ["tags"],
   support_reference: ["support_reference", "supportReference"],
-  orig_words: ["orig_words", "origWords"], twl_link: ["twl_link", "twLink"],
+  // `tw_link`, NOT `twl_link` — the column is twl_rows.tw_link (migration 0001)
+  // and bookReimport.ts's field-name map uses tw_link too. The key here doubles
+  // as the SQL column name in `SET ${f} = …`, so the wrong spelling fails two
+  // ways: a sweep row naming `tw_link` is silently dropped as "no restorable
+  // fields" (a lost TWL link reported as a harmless no-op), and `twl_link` would
+  // produce `SET twl_link = …` → no such column.
+  tw_link: ["tw_link", "twLink"],
 };
 const REF_FIELDS = new Set(["chapter", "verse", "ref_raw", "refRaw", "reference"]);
 
@@ -102,11 +112,36 @@ for (const t of targets) {
 
   // Preflight + per-field source rowid resolution in ONE query per row.
   const fieldSel = restorable.map((f, i) => {
-    const alts = FIELD_KEYS[f].map((k) =>
-      `SELECT el.rowid AS rid, '${k}' AS pkey FROM edit_log el WHERE el.kind='${t.kind}' AND el.row_key='${t.rowId}'
+    // Two conditions on the payload entry, both load-bearing:
+    //
+    //   json_type(...) IS NOT NULL  — the key is PRESENT. Payloads are partial
+    //   PATCH bodies, so the field's effective value can live several versions
+    //   back and a missing key must not be mistaken for a value.
+    //
+    //   json_type(...) <> 'null'    — and it is not an explicit JSON null.
+    //   Every content field in rows.ts's patch schema is .nullable(), and
+    //   rows.ts stores JSON.stringify(patch) verbatim, so {"note": null} (a
+    //   human CLEARING a field) is a real shape. Without this, json_extract
+    //   returns SQL NULL and the UPDATE blanks the column — silent data loss in
+    //   a script whose whole job is preventing it, and the version-bump verify
+    //   would still report OK. Treating an explicit null as absent walks back to
+    //   the last real value instead, which is what "restore" means here.
+    //
+    // ORDER BY new_version DESC, rowid DESC — rowid, not created_at: created_at
+    // is 1-second resolution and ties are common (see restore-overwritten-verses).
+    const alts = FIELD_KEYS[f].map((k, ki) =>
+      `SELECT el.rowid AS rid, '${k}' AS pkey, el.new_version AS nv, ${ki} AS pref
+         FROM edit_log el WHERE el.kind='${t.kind}' AND el.row_key='${t.rowId}'
         AND (el.book='${t.book}' OR el.book IS NULL) AND el.new_version <= ${t.overwrittenVersion}
-        AND json_type(el.payload_json,'$.${k}') IS NOT NULL ORDER BY el.new_version DESC, el.rowid DESC LIMIT 1`);
-    return `(SELECT rid || '|' || pkey FROM (${alts.join(" UNION ALL ")}) LIMIT 1) AS f${i}`;
+        AND json_type(el.payload_json,'$.${k}') IS NOT NULL
+        AND json_type(el.payload_json,'$.${k}') <> 'null'
+        ORDER BY el.new_version DESC, el.rowid DESC LIMIT 1`);
+    // Explicit ORDER BY over the compound select: a bare `(A UNION ALL B) LIMIT 1`
+    // has no defined row order in SQLite, so "snake_case first" was incidental —
+    // and worse, the snake arm could win with an OLDER version than the camelCase
+    // arm's. Newest version wins; `pref` breaks a genuine tie in favour of the
+    // snake spelling.
+    return `(SELECT rid || '|' || pkey FROM (${alts.join(" UNION ALL ")}) ORDER BY nv DESC, pref ASC, rid DESC LIMIT 1) AS f${i}`;
   }).join(", ");
   const pre = d1(
     `SELECT r.version AS cur, r.deleted_at AS del,

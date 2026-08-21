@@ -45,7 +45,11 @@ function d1(sqlRaw, attempts = 3) {
         [req.resolve("wrangler/bin/wrangler.js"), "d1", "execute", "bible_editor", "--remote", "--env", "production", "--json", "--command", sql],
         { cwd: API_DIR, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
       const parsed = JSON.parse(out.slice(out.indexOf("[")));
-      if (!parsed[0]?.success) throw new Error(`D1 failure: ${out.slice(0, 400)}`);
+      // EVERY statement, not just the first: a multi-statement --command returns one
+      // result object per statement, so a failure in statement 2 or 3 (the audit
+      // INSERT, the conflict resolve) is invisible if only parsed[0] is checked.
+      if (!parsed.length || parsed.some((p) => p && p.success === false))
+        throw new Error(`D1 failure: ${out.slice(0, 400)}`);
       return parsed[0].results ?? [];
     } catch (e) {
       if (i >= attempts) throw e;
@@ -54,7 +58,17 @@ function d1(sqlRaw, attempts = 3) {
   }
 }
 
-const BENJAMIN_UID = 2;
+// Resolved from D1, never hardcoded. The two restore scripts already look the
+// operator up and abort on a miss; asserting an id from a comment would
+// misattribute every tombstone/resolution with no error if it were ever wrong
+// (and resolved_by REFERENCES users(id), so a bad id only fails when FK
+// enforcement happens to be on).
+const OPERATOR = process.env.REPAIR_OPERATOR ?? "deferredreward";
+const OPERATOR_UID = (() => {
+  const r = d1(`SELECT id FROM users WHERE dcs_username = '${OPERATOR.replace(/'/g, "''")}'`)[0];
+  if (!r) { console.error(`ABORT: no users row for '${OPERATOR}'`); process.exit(1); }
+  return r.id;
+})();
 // Every decision except 'restore' (already resolved by the restore itself).
 // Named explicitly rather than "everything else" so a new action added to the
 // consolidator has to be considered here on purpose.
@@ -104,7 +118,7 @@ if (EXECUTE) {
   for (const g of plan) {
     if (g.open === 0) continue;
     try {
-      d1(`UPDATE verse_merge_conflicts SET resolved_at = unixepoch(), resolved_by = ${BENJAMIN_UID}
+      d1(`UPDATE verse_merge_conflicts SET resolved_at = unixepoch(), resolved_by = ${OPERATOR_UID}
            WHERE book='${g.book}' AND resource='${g.resource}' AND action='adopt_conflict'
              AND resolved_at IS NULL AND (chapter, verse) IN (VALUES ${g.pairs})`);
       const left = d1(

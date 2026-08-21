@@ -177,6 +177,22 @@ admin.get("/prs", async (c) => {
   const prs: AdminPr[] = [];
   const errors: Array<{ repo: string; message: string }> = [];
 
+  // Hand-named branches we have actually pushed (the `branchName` override), read
+  // once for the whole loop. Empty on a query failure, which degrades to today's
+  // `-be-`-only behavior rather than dropping the list.
+  // Maps branch -> book, because an override name is arbitrary: the usual
+  // `headRef.split("-be-")[0]` would report the book as "BIBLEEDITOR-DATA".
+  const overrideBook = new Map<string, string>();
+  try {
+    const rs = await c.env.DB.prepare(
+      `SELECT DISTINCT branch, book FROM export_snapshots
+        WHERE branch IS NOT NULL AND instr(branch, '-be-') = 0`,
+    ).all<{ branch: string; book: string }>();
+    for (const r of rs.results ?? []) overrideBook.set(r.branch, r.book);
+  } catch (e) {
+    errors.push({ repo: "-", message: `override-branch lookup failed: ${e instanceof Error ? e.message : String(e)}` });
+  }
+
   for (const resource of ALL_RESOURCES) {
     const repo = RESOURCE_TARGETS[resource].repo;
     try {
@@ -184,7 +200,15 @@ admin.get("/prs", async (c) => {
       // `-be-` requires the TRAILING dash — a `{BOOK}-be` branch (no
       // contributor suffix) matches neither the DCS validate workflow nor the
       // merge workflow (see export.ts:41-51), so it's never a real export PR.
-      const bePrs = openPrs.filter((pr) => pr.headRef.includes("-be-"));
+      //
+      // Branches from the `branchName` override are ALSO ours and also belong in
+      // this list — more so than the rest, since by construction they carry no
+      // `-be-` and therefore no DCS check ever runs on them and no bot merges
+      // them: they exist precisely because a human has to act. Filtering them out
+      // would hide the only PRs on this dashboard that cannot clear themselves.
+      // Matched against export_snapshots rather than a name pattern, since an
+      // override name is arbitrary by design.
+      const bePrs = openPrs.filter((pr) => pr.headRef.includes("-be-") || overrideBook.has(pr.headRef));
 
       const checkStates = withChecks
         ? await Promise.all(bePrs.map((pr) => getCommitStatus({ baseUrl, token, owner, repo }, pr.headSha)))
@@ -194,7 +218,7 @@ admin.get("/prs", async (c) => {
         prs.push({
           resource,
           repo,
-          book: pr.headRef.split("-be-")[0].toUpperCase(),
+          book: (overrideBook.get(pr.headRef) ?? pr.headRef.split("-be-")[0]).toUpperCase(),
           number: pr.number,
           title: pr.title,
           branch: pr.headRef,
