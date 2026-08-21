@@ -1402,11 +1402,24 @@ export interface RunExportResponse {
   status: string;
 }
 
-// The branch a published-book fix is staged on, shared by every surface that can
-// stage one (the admin Run tab and the book-locks push prompt). One constant, not
-// a per-form default: the value is a signal to whoever finds the branch on
-// Door43, so it only works if everyone uses the same one.
-export const REVIEW_BRANCH = "BibleEditor-data-restoration";
+// The branch a locked-book fix is staged on, PER BOOK. Used by every surface that
+// can stage one (the admin Run tab and the book-locks push prompt) so the name is
+// recognizable to whoever finds it on Door43.
+//
+// The book code is not decoration — a single shared name silently destroys work.
+// commitToDcs calls resetExportBranchToMaster unconditionally, which force-moves
+// the branch ref to master's SHA, and ensureDcsPr reuses any open PR for that head
+// (title and body are written only at creation). So staging MIC tn and then HOS tn
+// on one shared branch, in the one en_tn repo, would reset away MIC's commit and
+// leave the maintainer reviewing a PR still titled MIC whose diff is HOS — with no
+// error anywhere. Per-book names cannot collide; re-staging the SAME book is the
+// case where reset-and-reuse is exactly right.
+//
+// Stays free of the `-be-` substring (the pattern DCS auto-merges): book codes are
+// uppercase and the check is case-sensitive, so no code can introduce it.
+export function reviewBranchFor(book: string): string {
+  return `BibleEditor-restoration-${book.toUpperCase()}`;
+}
 
 // POST /api/books/:book/lock/push — one Workflow instance per resource, since
 // the server only honors `allowLocked` for an exactly-one-book-one-resource

@@ -1071,17 +1071,36 @@ function utf8Base64(s) {
   assert(publishNow.validateAndMerge === true, `publish-now asks DCS to merge`);
   assert(publishNow.branchName === undefined, `publish-now uses the generated -be- branch`);
 
-  // Staging: a published-book fix a maintainer must review. Leaving
-  // validateAndMerge on here would have our own orchestrator try to land a
-  // change that was explicitly staged for someone else to approve.
-  const staged = lockPushExportParams("MIC", "tn", "BibleEditor-data-restoration");
+  // Staging: a published-book fix a maintainer must review.
+  const staged = lockPushExportParams("MIC", "tn", "BibleEditor-restoration-MIC");
   assert(staged.allowLocked === true, `staged run still clears the lock gate`);
-  assert(staged.validateAndMerge === false, `staging turns auto-merge OFF`);
-  assert(staged.branchName === "BibleEditor-data-restoration", `staged run carries the branch`);
-  assert(
-    !String(staged.branchName).includes("-be-"),
-    `the staged branch cannot carry the substring DCS auto-merges on`,
-  );
+  assert(staged.validateAndMerge === false, `staging sets validateAndMerge false`);
+  assert(staged.branchName === "BibleEditor-restoration-MIC", `staged run carries the branch`);
+
+  // THE REAL GUARD. `-be-` is what DCS's workflows trigger on, so an auto-merging
+  // name must not be usable as a "staging" branch. Asserting
+  // !staged.branchName.includes("-be-") would only re-test the literal passed in
+  // on the line above — this asserts the FUNCTION rejects it.
+  for (const unsafe of ["MIC-be-x", "X-be-Y", "a-be-b"]) {
+    let threw = false;
+    try {
+      lockPushExportParams("MIC", "tn", unsafe);
+    } catch {
+      threw = true;
+    }
+    assert(threw, `lockPushExportParams refuses the auto-merging name ${unsafe}`);
+  }
+  // ...and refuses a name that is not a legal git ref, for the same reason: a
+  // push that fails late is better than one that lands somewhere unintended.
+  for (const bad of ["", "-leading", "has space", "trailing.", "dots..here", "x.lock"]) {
+    let threw = false;
+    try {
+      lockPushExportParams("MIC", "tn", bad);
+    } catch {
+      threw = true;
+    }
+    assert(threw, `lockPushExportParams refuses the invalid ref ${JSON.stringify(bad)}`);
+  }
   // book/resource are always named explicitly: allowLocked is only honored for a
   // single-book, single-resource run, so omitting either would silently disable
   // the override and skip every resource as book_locked.

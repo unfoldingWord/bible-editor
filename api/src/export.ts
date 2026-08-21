@@ -148,20 +148,39 @@ export function prunableBranches(
 // and a Workflow binding to exercise.
 //
 // TWO INTENTS. Without `branchName` this is "publish now": the generated `-be-`
-// branch plus validateAndMerge, which is what a lock admin wants after fixing
-// something in a book they just re-locked. With `branchName` it is "stage for
-// review", and validateAndMerge MUST go off — asking DCS to merge a branch while
-// also asking for one it will not auto-merge is incoherent, and leaving the flag
-// on would mean our own post-export orchestrator tried to land a published-book
-// change that a maintainer was supposed to review first.
+// branch, which is what a lock admin wants after fixing something in a book they
+// just re-locked. With `branchName` it is "stage for review".
+//
+// WHAT ACTUALLY MAKES STAGING SAFE is the branch name alone. `-be-` is the
+// substring DCS's own workflows trigger on: the validate workflow fires on
+// `push: branches: ['*-be-*']` and the merge bot re-checks for it, so a branch
+// without it is neither validated nor merged by anything on their side. Hence the
+// hard guard below.
+//
+// `validateAndMerge` is set consistently with the intent, but do NOT read it as
+// the guard: postExport.ts ships `VALIDATORS = []` (TEMP DISABLED 2026-05-21), so
+// runPostExport is a no-op today, and even re-enabled it acts on the legacy
+// `live-snapshot → master` PR rather than on a staged branch. Stated plainly
+// because a future reader trusting this flag as the safety property would be
+// trusting nothing.
 export function lockPushExportParams(
   book: string,
   resource: Resource,
   branchName?: string,
 ): { book: string; resource: Resource; allowLocked: true; validateAndMerge: boolean; branchName?: string } {
-  return branchName
-    ? { book, resource, allowLocked: true, validateAndMerge: false, branchName }
-    : { book, resource, allowLocked: true, validateAndMerge: true };
+  if (branchName === undefined) {
+    return { book, resource, allowLocked: true, validateAndMerge: true };
+  }
+  // Defense in depth. Every caller validates first (bookImport.ts's /lock/push,
+  // exports.ts's /run, and branchOverrideAllowed downstream), so reaching here
+  // with an auto-merging name is a programming error — and the failure it would
+  // cause is the precise one staging exists to prevent: a published-book change
+  // merged to master with nobody reviewing. Throwing is the only safe direction;
+  // falling back to publish-now would silently BE that failure.
+  if (!exportBranchOverrideValid(branchName)) {
+    throw new Error(`lockPushExportParams: unsafe staging branch ${JSON.stringify(branchName)}`);
+  }
+  return { book, resource, allowLocked: true, validateAndMerge: false, branchName };
 }
 
 export function branchOverrideAllowed(

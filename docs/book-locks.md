@@ -119,9 +119,32 @@ in the app. Re-locking a book (going from unlocked to locked) offers a "Push
 to Door43 now?" prompt, so a fix made during the unlocked window doesn't sit
 in D1 until the next nightly export. Confirming calls
 `POST /api/books/:book/lock/push`, which fires one Workflow instance per
-resource (ult/ust/tn/tq/twl), each carrying `allowLocked: true` and
-`validateAndMerge: true` — see `books.post("/:book/lock/push", ...)` in
-`api/src/bookImport.ts`. This route is gated on `canManageLocks` (the
+resource (ult/ust/tn/tq/twl), each carrying `allowLocked: true` — see
+`books.post("/:book/lock/push", ...)` in `api/src/bookImport.ts`.
+
+The prompt asks which of two things you mean, and **defaults to the safer one**:
+
+- **Stage for maintainer review** (default) — sends an optional `branchName` in
+  the body, which the route validates and passes through
+  `lockPushExportParams`. The push lands on `BibleEditor-restoration-{BOOK}`
+  (per-book, deliberately: one shared branch would be force-reset by the next
+  book's push and would reuse the first book's open PR, silently replacing its
+  contents) and opens a PR. That name carries no `-be-`, so DCS's validate
+  workflow never fires and its merge bot never merges — merging, and re-cutting
+  a release if the book is in one, stay a maintainer's decision.
+- **Publish now** — no `branchName`, so the push goes to the generated
+  `{BOOK}-be-{contributors}` branch that DCS auto-merges to master. Right for a
+  fix you own; wrong for a book that is in a cut release.
+
+An unknown key in the body is a `400`, not a silent fallback: dropping a
+misspelled `branchName` would publish unreviewed while the caller believed they
+had asked for review.
+
+The same choice is available in the admin panel's Run tab, via an "Override the
+book lock" checkbox (enabled only for a single book + single resource, which is
+all `lockOverrideAllowed` honors) plus a staging checkbox and branch field.
+
+This route is gated on `canManageLocks` (the
 `book_lock_admins` allowlist), not `requireAdmin`: Perry (`pjoakes`) is a lock
 admin but only an `editor` in `user_roles`, so he can't reach
 `POST /api/exports/run` (the admin panel's manual push) — the prompt has to

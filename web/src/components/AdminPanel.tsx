@@ -45,7 +45,7 @@ import {
   type AdminUser,
   type ExportSnapshotRow,
   type ExportInstanceStatus,
-  REVIEW_BRANCH,
+  reviewBranchFor,
   type Resource,
 } from "../sync/api";
 import { bookName } from "../lib/bookNames";
@@ -549,7 +549,7 @@ function PushCard({ bookOptions, lockedBooks }: { bookOptions: string[]; lockedB
   const [allowShrink, setAllowShrink] = useState(false);
   const [allowLocked, setAllowLocked] = useState(false);
   const [stageForReview, setStageForReview] = useState(true);
-  const [branchName, setBranchName] = useState(REVIEW_BRANCH);
+  const [branchName, setBranchName] = useState("");
   const [confirmOpen, setConfirmOpen] = useState(false);
   const [runId, setRunId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -564,6 +564,15 @@ function PushCard({ bookOptions, lockedBooks }: { bookOptions: string[]; lockedB
   useEffect(() => {
     setAllowLocked(false);
     setStageForReview(true);
+    // allowShrink resets too, and it is the most destructive of the three: it
+    // permits row DELETION on Door43. Ticking it for one book and switching the
+    // dropdown left it checked (merely disabled) for a book nobody decided it
+    // for.
+    setAllowShrink(false);
+    // Re-derive the branch from the new book rather than carrying the old one
+    // over — a stale name is precisely the cross-book collision reviewBranchFor
+    // exists to prevent.
+    setBranchName(book ? reviewBranchFor(book) : "");
   }, [book, resource]);
 
   // Both overrides are honored only for exactly one book AND one resource (see
@@ -575,11 +584,17 @@ function PushCard({ bookOptions, lockedBooks }: { bookOptions: string[]; lockedB
   const bookIsLocked = Boolean(book) && lockedBooks.has(book);
   const branchOk = !stageForReview || reviewBranchLooksValid(branchName);
 
-  // THE GUARD THAT MATTERS (issue #581). A locked book is usually a PUBLISHED
-  // one, and pushing it to a `-be-` branch hands it to the DCS merge bot, which
-  // rewrites a released book with nobody reviewing. So overriding the lock on a
-  // locked book REQUIRES staging for review; "publish now" has to be chosen
-  // deliberately by unticking it, and the confirm dialog says what that means.
+  // What this actually blocks: a lock override with no single target (the server
+  // would ignore it and skip every resource as book_locked, while the operator
+  // believed it applied), and a staging branch the server would reject.
+  //
+  // What it deliberately does NOT block is "publish now" on a locked book. Both
+  // intents are legitimate — a lock admin fixing their own book wants master —
+  // so unreviewed publishing is discouraged by being off by default, warned
+  // about inline, and named in the confirm dialog, NOT forbidden. Said plainly
+  // because an earlier version of this comment claimed staging was REQUIRED,
+  // which the condition below never enforced; believing a gate exists where
+  // there is only a default is worse than knowing it is a default.
   const pushBlocked = allowLocked && (!singleTarget || !branchOk);
 
   const needsConfirm = !dryDcs || allowShrink || allowLocked;
@@ -672,6 +687,17 @@ function PushCard({ bookOptions, lockedBooks }: { bookOptions: string[]; lockedB
               }
               label="Stage for maintainer review (don't publish straight to master)"
             />
+            {/* The likeliest wrong action in this form: stage a published-book
+                fix with "Render only" still ticked (it defaults ON), read a green
+                run, and believe the fix is waiting for a maintainer when nothing
+                was pushed at all. Said here, next to the decision, rather than
+                only in the confirm dialog. */}
+            {dryDcs && (
+              <Alert severity="info" sx={{ mt: 0.5 }}>
+                “Render only” is ticked, so this will not push or stage anything. Untick it to
+                actually {stageForReview ? "stage this for review" : "publish this"}.
+              </Alert>
+            )}
             {stageForReview ? (
               <>
                 <TextField

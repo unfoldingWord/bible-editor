@@ -232,11 +232,16 @@ books.delete("/:book/lock", requireEditor, async (c) => {
 // human instead of a commit on master.
 //
 // `branchName` is optional so existing callers keep today's behavior exactly.
+// .strict() is load-bearing, not tidiness. A non-strict schema drops unknown keys
+// silently, so `{"branch_name":"X"}` or a typo'd `{"branchNames":"X"}` would 200
+// and then publish-now — auto-merged to master — while the caller believed they
+// had asked for review. That is the same consequence the invalid-name 400 below
+// exists to prevent, so it fails the same way instead of failing open.
 const LockPushBody = z
   .object({
     branchName: z.string().min(1).max(80).optional(),
   })
-  .optional();
+  .strict();
 
 books.post("/:book/lock/push", requireEditor, async (c) => {
   const userId = currentUserId(c);
@@ -249,8 +254,10 @@ books.post("/:book/lock/push", requireEditor, async (c) => {
   const book = c.req.param("book").toUpperCase();
   if (!BOOK_NUMBERS[book]) return c.json({ error: "unknown_book", book }, 400);
 
-  // Read the body defensively: this route accepted none until now, and every
-  // existing caller sends no content-type and no bytes.
+  // Read the body defensively: this route accepted none until now, and existing
+  // callers send an empty one. (They DO set Content-Type: application/json —
+  // web/src/sync/api.ts's request() sets it unconditionally — which is why this
+  // reads text() and parses by hand rather than trusting the header.)
   let branchName: string | undefined;
   {
     const text = await c.req.text().catch(() => "");
@@ -263,7 +270,7 @@ books.post("/:book/lock/push", requireEditor, async (c) => {
       }
       const parsed = LockPushBody.safeParse(parsedBody);
       if (!parsed.success) return c.json({ error: "invalid_body" }, 400);
-      branchName = parsed.data?.branchName;
+      branchName = parsed.data.branchName;
     }
   }
   // Rejected here rather than left for the workflow to ignore. A silently

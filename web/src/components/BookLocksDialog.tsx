@@ -27,7 +27,7 @@ import {
 import LockIcon from "@mui/icons-material/Lock";
 import LockOpenIcon from "@mui/icons-material/LockOpen";
 import HelpOutlineIcon from "@mui/icons-material/HelpOutline";
-import { ApiError, REVIEW_BRANCH, api, type BookListEntry, type PushLockedBookResponse } from "../sync/api";
+import { ApiError, api, reviewBranchFor, type BookListEntry, type PushLockedBookResponse } from "../sync/api";
 import { BOOKS, bookName } from "../lib/bookNames";
 
 interface Props {
@@ -128,7 +128,7 @@ export function BookLocksDialog({ open, onClose, onChanged, books, canManageLock
     setPushState("pushing");
     setPushError(null);
     try {
-      const res = await api.pushLockedBookToDoor43(pushPrompt, stageForReview ? REVIEW_BRANCH : undefined);
+      const res = await api.pushLockedBookToDoor43(pushPrompt, stageForReview ? reviewBranchFor(pushPrompt) : undefined);
       setPushResult(res);
       setPushState("done");
     } catch (e) {
@@ -293,7 +293,7 @@ export function BookLocksDialog({ open, onClose, onChanged, books, canManageLock
               />
               <Alert severity={stageForReview ? "info" : "warning"}>
                 {stageForReview
-                  ? `Lands on the “${REVIEW_BRANCH}” branch and opens a pull request. Nothing merges by itself — a maintainer reviews it and re-releases.`
+                  ? `Lands on the “${reviewBranchFor(pushPrompt)}” branch and opens a pull request. Nothing merges by itself — a maintainer reviews it and re-releases.`
                   : "Merges directly to master. Door43 publishes it without review, which for a released book rewrites what people have already downloaded."}
               </Alert>
             </Stack>
@@ -311,6 +311,16 @@ export function BookLocksDialog({ open, onClose, onChanged, books, canManageLock
                     {p.resource.toUpperCase()}: {p.error}
                   </Typography>
                 ),
+              )}
+              {/* Whoever chose review needs something to hand the maintainer.
+                  "queued" alone doesn't say it was staged, or where to look. */}
+              {stageForReview && pushPrompt && (
+                <Alert severity="info" sx={{ mt: 1 }}>
+                  Staged on <strong>{reviewBranchFor(pushPrompt)}</strong>. A pull request opens on
+                  Door43 for each resource that had changes (a resource with nothing to push opens
+                  none). Nothing merges on its own — send the branch name to whoever re-releases{" "}
+                  {bookName(pushPrompt)}.
+                </Alert>
               )}
             </Stack>
           )}
