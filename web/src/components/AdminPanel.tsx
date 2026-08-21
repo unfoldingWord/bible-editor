@@ -537,7 +537,11 @@ function ImportResultView({ result }: { result: AdminImportResult }) {
 // `invalid_branch_name` regardless of what this thinks.
 function reviewBranchLooksValid(name: string): boolean {
   if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/.test(name)) return false;
-  if (name.includes("-be-")) return false; // the substring DCS auto-merges on
+  // Case-insensitive, mirroring exportBranchOverrideValid on the server. The
+  // point of checking here at all is immediate feedback, so a divergence would
+  // make the form say a name is fine and then have the request 400 on it —
+  // fail-safe, but the field would be lying about what is acceptable.
+  if (/-be-/i.test(name)) return false; // the substring DCS auto-merges on
   if (name.endsWith(".lock") || name.endsWith(".") || name.includes("..")) return false;
   return true;
 }
@@ -715,7 +719,7 @@ function PushCard({ bookOptions, lockedBooks }: { bookOptions: string[]; lockedB
                     branchOk
                       ? "Lands on this branch and opens a PR. No DCS check runs on it and nothing auto-merges — a maintainer reviews, merges, and re-releases."
                       : branchName.includes("-be-")
-                        ? "Can't contain “-be-” — that's the pattern Door43 auto-merges, which is what staging avoids."
+                        ? "Can’t contain “-be-” in any case — that’s the pattern Door43 auto-merges, which is what staging avoids."
                         : "Letters, numbers, dot, dash, underscore. Must start with a letter or number."
                   }
                   sx={{ mt: 0.5 }}
