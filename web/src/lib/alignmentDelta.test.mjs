@@ -2,6 +2,7 @@ import {
   analyzeAlignmentDelta,
   guardBlocksSave,
   intentAllowsUnexpectedAlignmentLoss,
+  isVersionOnlyRebase,
   lostAlignedWords,
   sameVerseContent,
 } from "./alignmentDelta.ts";
@@ -190,7 +191,7 @@ const content = (verseObjects) => ({ verseObjects });
 
 {
   // Issue #575: confirmed_text_edit is the escalated "Save anyway" intent
-  // (Shell.tsx's pendingAlignmentLoss) — split out from alignment_edit so the
+  // (Shell.tsx's pendingAlignmentLoss) - split out from alignment_edit so the
   // two are no longer indistinguishable, but it must behave identically at
   // the guard: exempt from guardBlocksSave, same as a real aligner save.
   console.log("[alignmentDelta] confirmed_text_edit is exempt from guardBlocksSave, same as alignment_edit");
@@ -208,12 +209,61 @@ const content = (verseObjects) => ({ verseObjects });
   assert(delta.unexpectedLosses.length === 1, "sanity: this delta still has collateral loss to guard against");
   assert(guardBlocksSave(delta, "text_edit"), "sanity: plain text_edit is still blocked");
   assert(!guardBlocksSave(delta, "confirmed_text_edit"), "confirmed_text_edit is exempt, like alignment_edit");
-  assert(intentAllowsUnexpectedAlignmentLoss("confirmed_text_edit"), "…and reports itself as guard-exempt");
-  assert(intentAllowsUnexpectedAlignmentLoss("alignment_edit"), "…alignment_edit remains exempt too");
-  assert(!intentAllowsUnexpectedAlignmentLoss("text_edit"), "…but plain text_edit is not conflated with either");
-  assert(!intentAllowsUnexpectedAlignmentLoss("find_replace"), "…nor is find_replace");
-  assert(!intentAllowsUnexpectedAlignmentLoss("section_edit"), "…nor section_edit");
+  assert(intentAllowsUnexpectedAlignmentLoss("confirmed_text_edit"), ".and reports itself as guard-exempt");
+  assert(intentAllowsUnexpectedAlignmentLoss("alignment_edit"), ".alignment_edit remains exempt too");
+  assert(!intentAllowsUnexpectedAlignmentLoss("text_edit"), ".but plain text_edit is not conflated with either");
+  assert(!intentAllowsUnexpectedAlignmentLoss("find_replace"), ".nor is find_replace");
+  assert(!intentAllowsUnexpectedAlignmentLoss("section_edit"), ".nor section_edit");
 }
+
+{
+  console.log("[alignmentDelta] isVersionOnlyRebase requires both target and source content unchanged (#508)");
+  const targetContent = content([zaln("H1", [w("He")]), t(" "), zaln("H2", [w("came")])]);
+  const sourceContent = content([zaln("H1", [w("Hu")]), zaln("H2", [w("bo")])]);
+
+  assert(
+    !isVersionOnlyRebase(null, { content: targetContent, sourceContent }),
+    "no prior sync (mount / crash-recovery load) is never a rebase",
+  );
+
+  assert(
+    isVersionOnlyRebase(
+      { key: "k", content: targetContent, sourceContent },
+      { content: targetContent, sourceContent },
+    ),
+    "identical target AND source content is a version-only rebase",
+  );
+
+  const differentTargetContent = content([zaln("H1", [w("He")]), t(" "), zaln("H2", [w("arrived")])]);
+  assert(
+    !isVersionOnlyRebase(
+      { key: "k", content: targetContent, sourceContent },
+      { content: differentTargetContent, sourceContent },
+    ),
+    "a genuine target content change is never a rebase",
+  );
+
+  // The #508 case: a UHB/UGNT source reimport lands while drags are pending.
+  // The TARGET verse's own content is unchanged, but its source changed
+  // under it - this must fall through to the full-reset path, not rebase.
+  const differentSourceContent = content([zaln("H1", [w("Hu")]), zaln("H2", [w("venit")])]);
+  assert(
+    !isVersionOnlyRebase(
+      { key: "k", content: targetContent, sourceContent },
+      { content: targetContent, sourceContent: differentSourceContent },
+    ),
+    "a source-only content change is never a rebase, even though the target is unchanged",
+  );
+
+  assert(
+    isVersionOnlyRebase(
+      { key: "k", content: targetContent, sourceContent: null },
+      { content: targetContent, sourceContent: null },
+    ),
+    "null source on both sides (no source loaded) still rebases on a target-only version bump",
+  );
+}
+
 
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed.`);

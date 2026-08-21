@@ -146,8 +146,14 @@ export interface OutboxOp {
   // row patches; absent for verse/status/lane ops and pre-baseline records.
   baseline?: Record<string, unknown>;
   // Exact local text-draft generation captured by this save. Used only for
-  // generation-safe cleanup after a successful verse PATCH.
+  // generation-safe cleanup after a successful verse PATCH (drafts.ts).
   draftGeneration?: string;
+  // Exact local ALIGNMENT-draft generation captured by this save (a separate
+  // IndexedDB store — see alignmentDrafts.ts). Deliberately a distinct field
+  // from draftGeneration above: the two stores have disjoint key spaces and
+  // generation sequences, and only ever apply to one of text_edit/find_replace/
+  // section_edit (draftGeneration) or alignment_edit (this one) saves.
+  alignmentDraftGeneration?: string;
 }
 
 type Subscriber = (ops: OutboxOp[]) => void;
@@ -320,7 +326,7 @@ export const outbox = {
     bibleVersion: string,
     expectedVersion: number,
     patch: { content: unknown; plain_text?: string | null; alignment_intent?: AlignmentIntent },
-    opts: { draftGeneration?: string } = {},
+    opts: { draftGeneration?: string; alignmentDraftGeneration?: string } = {},
   ): Promise<OutboxOp> {
     if (isReadOnly()) {
       return noopOp(
@@ -340,6 +346,7 @@ export const outbox = {
       attempts: 0,
       status: "pending",
       ...(opts.draftGeneration ? { draftGeneration: opts.draftGeneration } : {}),
+      ...(opts.alignmentDraftGeneration ? { alignmentDraftGeneration: opts.alignmentDraftGeneration } : {}),
     };
     await (await db()).put(STORE, op);
     void notify();
