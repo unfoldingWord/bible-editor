@@ -44,15 +44,28 @@ if (!sweepPath) {
 
 const REPO = path.resolve(path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1")), "..");
 const API_DIR = path.join(REPO, "api");
-function d1(sqlRaw) {
+// Wrangler on this box intermittently dies with a libuv UV_HANDLE_CLOSING
+// assert, an empty-output 0xC0000409 exit, or a transient Cloudflare auth
+// 10000 — all recoverable on retry. READ retries are always safe. For WRITES
+// this is safe too, but only because every write here is CAS-guarded
+// (version = expected): if the failed attempt actually landed, the retry
+// matches 0 rows and the changes()-gated statements stay inert.
+function d1(sqlRaw, attempts = 3) {
   const sql = sqlRaw.replace(/\s+/g, " ").trim();
   const req = createRequire(path.join(API_DIR, "package.json"));
-  const out = execFileSync(process.execPath,
-    [req.resolve("wrangler/bin/wrangler.js"), "d1", "execute", "bible_editor", "--remote", "--env", "production", "--json", "--command", sql],
-    { cwd: API_DIR, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
-  const parsed = JSON.parse(out.slice(out.indexOf("[")));
-  if (!parsed[0]?.success) throw new Error(`D1 failure: ${out.slice(0, 400)}`);
-  return parsed[0].results ?? [];
+  for (let i = 1; ; i++) {
+    try {
+      const out = execFileSync(process.execPath,
+        [req.resolve("wrangler/bin/wrangler.js"), "d1", "execute", "bible_editor", "--remote", "--env", "production", "--json", "--command", sql],
+        { cwd: API_DIR, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
+      const parsed = JSON.parse(out.slice(out.indexOf("[")));
+      if (!parsed[0]?.success) throw new Error(`D1 failure: ${out.slice(0, 400)}`);
+      return parsed[0].results ?? [];
+    } catch (e) {
+      if (i >= attempts) throw e;
+      execFileSync(process.execPath, ["-e", `setTimeout(()=>{}, ${1500 * i})`]); // plain backoff sleep
+    }
+  }
 }
 
 const KIND_TABLE = { tn: "tn_rows", tq: "tq_rows", twl: "twl_rows" };
