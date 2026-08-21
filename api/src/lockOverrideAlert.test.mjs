@@ -146,6 +146,30 @@ console.log("\n[an identical re-run of the SAME instance still collapses to one 
   eq(Number(count.n), 1, "still exactly one row for the source — no duplicate pile-up");
 }
 
+console.log("\n[issue #587: a dry-run bypass still writes an alert, distinguishable from a live one]");
+{
+  // Re-types exportOne's post-fix gate and message shape verbatim
+  // (exportWorkflow.ts ~line 554-576): the alert now fires whenever
+  // `allowLocked && lockedBooks.has(book)`, regardless of `dcsAllowed` — a
+  // dry-run bypass used to leave no durable record at all.
+  const messageFor = (instanceId, dcsAllowed) =>
+    `REV ULT: book-lock guard bypassed by explicit request — a human cleared the lock so this export could proceed (${instanceId})` +
+    (dcsAllowed ? "." : " (dry run — no Door43 push, but D1 may still have been written).");
+
+  const db = freshDb();
+  // dcsAllowed === false: the exact shape of a dry-run allowLocked run.
+  writeAlert(db, SOURCE, messageFor("export-2026-08-21T05-30-00-000Z", false), linkUrl, "info");
+
+  const row = undismissedRow(db, SOURCE);
+  eq(row !== undefined, true, "dry-run bypass produces a durable alert row — not silently dropped");
+  eq(row?.message.includes("(dry run"), true, "dry-run message names itself as a dry run");
+  eq(
+    row?.message === messageFor("export-2026-08-21T05-30-00-000Z", true),
+    false,
+    "distinct from the live-run message for the same instanceId",
+  );
+}
+
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed`);
   process.exit(1);

@@ -551,11 +551,18 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
         prReason: null,
       };
     }
-    if (dcsAllowed && allowLocked && lockedBooks.has(book)) {
+    if (allowLocked && lockedBooks.has(book)) {
       // A human explicitly cleared the lock guard for this exact (book,
       // resource) — durable record of the bypass, mirroring the shrink-guard
       // override alert above (writeAlert, severity "info": a notice, not a
       // problem).
+      //
+      // Deliberately NOT gated on `dcsAllowed`: a dry run (dryDcs / no service
+      // token) still reaches applyTwlSortOrderUpdates below when the book is a
+      // twl, which mutates D1 for a frozen book with nothing reaching Door43 —
+      // the one bypass path that used to leave no trace at all (issue #587).
+      // The message says whether anything actually pushed, so a dry-run
+      // bypass and a live one are distinguishable in the audit trail.
       //
       // The message MUST carry a per-run varying detail (here, instanceId).
       // writeAlert (below) skips its insert when the most recent alert for
@@ -569,7 +576,8 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       await this.writeAlert(
         `export_lock_override:${book}:${resource}`,
         `${book} ${resource.toUpperCase()}: book-lock guard bypassed by explicit request — ` +
-          `a human cleared the lock so this export could proceed (${instanceId}).`,
+          `a human cleared the lock so this export could proceed (${instanceId})` +
+          (dcsAllowed ? "." : " (dry run — no Door43 push, but D1 may still have been written)."),
         `${this.env.DCS_BASE_URL}/unfoldingWord`,
         "info",
       );
@@ -596,8 +604,20 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
 
     // Apply TWL sort order updates computed during export. Persist the sequence
     // so future operations use the optimal ordering from the ULT alignment.
+    // Gated on dcsAllowed: `built.content` above is already rendered from the
+    // computed order regardless of whether we persist it, so a dry run's
+    // output is unaffected by skipping this — but writing it to D1 anyway
+    // would mutate a frozen/locked book's stored order with nothing reaching
+    // Door43 to review, and (dry run or not) nothing else in this run reads
+    // sort_order back from D1 after this point. See issue #587.
     if (built.sortOrderUpdates.length > 0) {
-      await this.applyTwlSortOrderUpdates(book, built.sortOrderUpdates);
+      if (dcsAllowed) {
+        await this.applyTwlSortOrderUpdates(book, built.sortOrderUpdates);
+      } else {
+        console.log(
+          `export: dry run — discarding ${built.sortOrderUpdates.length} twl sort_order update(s) for ${book} (not written to D1)`,
+        );
+      }
     }
 
     // Book-specific branch named for this resource's human contributors, unless
