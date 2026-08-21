@@ -76,7 +76,15 @@ function d1(sqlRaw) {
   );
   const jsonStart = out.indexOf("[");
   const parsed = JSON.parse(out.slice(jsonStart));
-  if (!parsed[0]?.success) throw new Error(`D1 reported failure: ${out.slice(0, 500)}`);
+  // EVERY statement, not just the first. A multi-statement --command returns one
+  // result object per statement, and this script's write is THREE (verses UPDATE,
+  // edit_log INSERT, conflict resolve) — so checking parsed[0] alone means a
+  // failed audit INSERT or an unresolved conflict row passes as success. What
+  // actually protected the 2026-08-20 run of 38 verses was the verify-by-re-query
+  // below (version bumped, content length matched, conflict closed), not this
+  // check; the re-query is the guarantee and this is the early warning.
+  if (!parsed.length || parsed.some((p) => p && p.success === false))
+    throw new Error(`D1 reported failure: ${out.slice(0, 500)}`);
   return parsed[0].results ?? [];
 }
 
@@ -108,6 +116,7 @@ if (missingUsers.length) {
 // ── Preflight, one query per verse kept simple and auditable ────────────────
 const plans = [];
 const skips = [];
+const resolveOnly = [];
 for (const t of targets) {
   const rk = rowKey(t);
   const user = String(t.overwrittenBy).split(" ")[0];
@@ -145,7 +154,12 @@ for (const t of targets) {
     continue;
   }
   if (r.already_identical === 1) {
-    skips.push({ key: shortKey(t), why: "current content already identical to the overwritten version — resolve-only candidate" });
+    // Nothing to restore — but the conflict row is still open, so the editor
+    // keeps being warned that Door43 overwrote work that is in fact already
+    // theirs. Calling this a "resolve-only candidate" and then resolving nothing
+    // left the warning standing forever. Collected and closed below.
+    resolveOnly.push({ ...t, key: shortKey(t), uid: userId.get(user) });
+    skips.push({ key: shortKey(t), why: "content already identical to the overwritten version — resolving the conflict row only" });
     continue;
   }
   plans.push({
@@ -223,6 +237,38 @@ if (EXECUTE) {
     }
   }
   console.log(`\nexecuted: ${ok} verified OK, ${failed} failed`);
+}
+
+// Close the conflict rows for verses that needed no content change. Same
+// statement verses.ts's PATCH uses, minus the changes() gate — there is no
+// preceding UPDATE in this batch to gate on, and `resolved_at IS NULL` already
+// makes it idempotent and keeps it from re-stamping a conflict someone else
+// resolved.
+if (EXECUTE && resolveOnly.length) {
+  let ro = 0;
+  for (const t of resolveOnly) {
+    try {
+      d1(
+        `UPDATE verse_merge_conflicts SET resolved_at = unixepoch(), resolved_by = ${t.uid}
+          WHERE book='${t.book}' AND resource='${t.resource.toLowerCase()}'
+            AND chapter=${t.chapter} AND verse=${t.verse} AND resolved_at IS NULL`,
+      );
+      const left = d1(
+        `SELECT COUNT(*) AS n FROM verse_merge_conflicts
+          WHERE book='${t.book}' AND resource='${t.resource.toLowerCase()}'
+            AND chapter=${t.chapter} AND verse=${t.verse} AND resolved_at IS NULL`,
+      )[0];
+      if (left && left.n === 0) { ro++; console.log(`  RESOLVED-ONLY ${t.key}`); }
+      else console.error(`  RESOLVE FAILED ${t.key}`);
+    } catch (e) {
+      console.error(`  RESOLVE ERROR ${t.key}: ${String(e).slice(0, 200)}`);
+    }
+  }
+  report.resolveOnly = { attempted: resolveOnly.length, resolved: ro };
+  console.log(`resolve-only conflicts closed: ${ro} of ${resolveOnly.length}`);
+} else if (resolveOnly.length) {
+  report.resolveOnly = { attempted: resolveOnly.length, resolved: 0, note: "dry run" };
+  console.log(`resolve-only candidates (would close their conflict rows): ${resolveOnly.length}`);
 }
 
 const reportPath = path.join(OUT_DIR, `report-${EXECUTE ? "execute" : "dryrun"}-${Date.now()}.json`);

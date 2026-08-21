@@ -1114,7 +1114,8 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
                   `for a uW maintainer to review, merge, and re-release by hand.\n\n` +
                   `⚠️ A green combined status on this PR means **no checks ran**, not that it passed ` +
                   `validation (Gitea counts skipped checks as success). The content was validated by ` +
-                  `bible-editor's own USFM checks before the push.`
+                  `bible-editor's own ${resource === "ult" || resource === "ust" ? "USFM" : "TSV"} ` +
+                  `checks before the push.`
               : `Auto-opened by the bible-editor nightly export so the DCS validate-and-merge workflow can process \`${branch}\`. Holds the latest ${resource.toUpperCase()} edits for ${book}.`,
           );
           prNumber = pr.number;

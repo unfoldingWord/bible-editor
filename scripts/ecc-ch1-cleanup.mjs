@@ -86,7 +86,15 @@ for (const id of ids) {
   // have soft-deleted their fresh work silently. A human's own write (source
   // NULL) or a repair means the row is no longer just "the losing side of a
   // duplicate pair", so it is left alone and reported.
-  if (r.newest_source === "" || r.newest_source === "data_repair") {
+  // `data_restoration` belongs in this list as much as the other two, and its
+  // absence was a live hazard rather than a theoretical one: the TSV restore run
+  // on 2026-08-20 wrote 69 ECC tag restores under exactly that source. A re-run
+  // of this script would have read those as ordinary machine writes and deleted
+  // the restored row. Any source that means "a person decided this" protects the
+  // row; only a plain machine write (dcs_reimport, ai_pipeline) leaves it
+  // eligible.
+  const HUMAN_DECIDED = new Set(["", "data_repair", "data_restoration"]);
+  if (HUMAN_DECIDED.has(r.newest_source)) {
     human++;
     console.log(`  SKIP ${id}: newest edit is a human/repair write (source='${r.newest_source || "null"}') — not deleting`);
     continue;
