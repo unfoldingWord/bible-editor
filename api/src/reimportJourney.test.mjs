@@ -573,6 +573,25 @@ console.log("\n[reference-move attribution at the caller]");
     eq(row.review_kind, kept, `a ${kept} flag survives the no-op path`);
   }
 
+  // 7f. The clear is book-scoped. A same-id flagged row in ANOTHER book must not
+  //     be caught by it — row ids are only unique per book, so dropping `book`
+  //     from the statement's WHERE would silently clear flags across the canon.
+  {
+    const { sqlite, env } = freshEnv();
+    seedMoved(sqlite, { reviewKind: "ref_moved" });
+    sqlite.prepare(`UPDATE tq_rows SET sort_order = 100 WHERE id='mv01'`).run();
+    sqlite
+      .prepare(
+        `INSERT INTO tq_rows (id, book, chapter, verse, ref_raw, question, response, sort_order, updated_by, version, review_kind, review_reason)
+         VALUES ('mv01', 'HOS', 1, 6, '1:6', 'other book', 'other book', 100, 7, 3, 'ref_moved', 'their reason')`,
+      )
+      .run();
+    const counts = await applyTsvRows(env, BOOK, "tq", [masterAt("1:6", 1, 6)], null, { confirmedAt: 200, editId: 1 });
+    eq(counts.ref_moved_resolved, 1, "exactly one row is cleared…");
+    const other = sqlite.prepare(`SELECT review_kind FROM tq_rows WHERE id='mv01' AND book='HOS'`).all()[0];
+    eq(other.review_kind, "ref_moved", "…and the same id in another book keeps its flag");
+  }
+
   // 8. That clear must not become a way to lose an unacknowledged content
   //    conflict, which says something the reference never did.
   {

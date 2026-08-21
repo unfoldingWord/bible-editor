@@ -365,9 +365,13 @@ export interface ReimportCounts {
   ref_moved_theirs: number;
   ref_moved_both: number;
   ref_moved_unattributable: number;
-  // Rows whose reference-move flag this run CLEARED because the two sides now
-  // agree (issue #588). Not a move and not a merge: a flag-only, version-neutral
-  // write that makes a resolved cleanup chip disappear. Optional, diagnostic.
+  // Rows whose reference-move flag this run CLEARED on the NO-OP path because the
+  // two sides now agree (issue #588). Not a move and not a merge: a flag-only,
+  // version-neutral write that makes a resolved cleanup chip disappear. Scoped to
+  // that path deliberately — the same clear in the edited-candidate resolution
+  // rides a content write whose outcome is already counted there (merge_adopted /
+  // merged_fields / skipped_edited on a lost CAS), and double-counting it would
+  // make this number stop meaning "chips that disappeared for free".
   ref_moved_resolved: number;
   // Human-edited verse that DIFFERS from master but could not be adjudicated
   // at all, because this book+resource has no `master_confirmed_at` watermark
@@ -1541,6 +1545,18 @@ export async function applyTsvRows(
       // exist to stop master overwriting CONTENT, and this write touches none —
       // while a preserved row is exactly the one nobody will edit again, so the
       // stale chip would otherwise be permanent.
+      //
+      // What this does NOT reach, and why that is survivable: the nightly staging
+      // gate skips a whole (book, resource) whose Door43 file SHA is unchanged
+      // (see reimportStagedChunk), so this code does not even run on a quiet
+      // file. The route that leaves a flag stale WITHOUT touching master is a
+      // translator moving the row in-app to match — and that move is a versioned
+      // content PATCH, which clears review_kind at the moment it lands
+      // (contentPatchClauses.ts). So the flag this branch exists for is one
+      // resolved from master's side or raised over a reference that already
+      // agreed; either way master moved, the SHA differs, and the resource is
+      // staged. A flag left stale with neither side moving again clears on the
+      // next manual "Pull from Door43", which reads every file unconditionally.
       if (cur.review_kind === "ref_moved") flagClears.push(row.id);
       continue;
     }
