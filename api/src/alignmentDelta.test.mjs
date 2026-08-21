@@ -1,4 +1,4 @@
-import { analyzeAlignmentDelta, guardBlocksSave } from "./alignmentDelta.ts";
+import { analyzeAlignmentDelta, guardBlocksSave, intentAllowsUnexpectedAlignmentLoss } from "./alignmentDelta.ts";
 
 let failed = 0;
 function assert(ok, msg) {
@@ -101,6 +101,28 @@ const content = (verseObjects) => ({ verseObjects });
     "the intentionally-edited word is NOT reported as collateral loss",
   );
   assert(guardBlocksSave(delta, "text_edit"), "de-narrowed guard FIRES on the 1CH 4:21 shape");
+}
+
+{
+  // Issue #575: confirmed_text_edit (the escalated "Save anyway" intent) must
+  // be exempt from guardBlocksSave server-side too — it is the PATCH backstop
+  // mirroring web/src/lib/alignmentDelta.ts's guard.
+  console.log("[alignmentDelta] confirmed_text_edit is exempt from guardBlocksSave, same as alignment_edit");
+  const before = content([
+    zaln("H1", [w("He")]), t(" "),
+    zaln("H2", [w("came")]), t(" "),
+    zaln("H3", [w("home")]),
+  ]);
+  const after = content([
+    zaln("H1", [w("He")]), t(" "),
+    w("went"), t(" "),
+    w("home"),
+  ]);
+  const delta = analyzeAlignmentDelta(before, after);
+  assert(guardBlocksSave(delta, "text_edit"), "sanity: plain text_edit is still blocked");
+  assert(!guardBlocksSave(delta, "confirmed_text_edit"), "confirmed_text_edit is exempt, like alignment_edit");
+  assert(intentAllowsUnexpectedAlignmentLoss("confirmed_text_edit"), "…and reports itself as guard-exempt");
+  assert(!intentAllowsUnexpectedAlignmentLoss("text_edit"), "…but plain text_edit is not conflated with it");
 }
 
 if (failed > 0) {

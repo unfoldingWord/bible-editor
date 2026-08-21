@@ -2827,12 +2827,27 @@ async function applyVerseRows(
   // read and behaves identically to before this change. When a precise id
   // boundary exists (P1.3) both sub-selects cut on `id <= / > ?N` instead of
   // `created_at < / >= ?N`, so a same-second-as-the-export-read edit is
-  // attributed correctly; ?N carries either value. `base_payload` still
-  // ORDER BY id DESC LIMIT 1 (newest surviving edit at/before the boundary).
+  // attributed correctly; ?N carries either value.
   const boundaryParam = chapters.length + 3;
   const baseBoundary = masterEditId != null ? `id <= ?${boundaryParam}` : `created_at < ?${boundaryParam}`;
   const sinceBoundary = masterEditId != null ? `id > ?${boundaryParam}` : `created_at >= ?${boundaryParam}`;
   const boundaryBind = masterEditId != null ? masterEditId : lastExportAt;
+  // Issue #537: `pipelineImport.ts` writes a content-bearing `action='baseline'`
+  // row (the pre-AI content) whose `created_at` is deliberately back-dated to
+  // that content's own timestamp, but whose `id` is assigned at AI-run time —
+  // so a baseline row's id is NOT chronological with its content, and the
+  // id-based `baseBoundary` above wrongly excludes it even when its real,
+  // back-dated timestamp predates the watermark. `baseline` rows are therefore
+  // matched on a parallel, always-timestamp boundary (never the id boundary,
+  // which cannot see them correctly). base_payload orders the combined
+  // candidates by `created_at DESC, id DESC` rather than `id DESC` alone —
+  // for the pre-existing `create`/`update` candidates this is equivalent (id
+  // is monotonic with created_at within one row's real-time history), and it
+  // lets a `baseline` row compete honestly against them for "most recent
+  // ancestor at/before the watermark". Measured against prod: 186 of 190
+  // verses that were permanently `keep_no_base` recover a real ancestor this
+  // way (see issue #537's comment thread for the corpus table).
+  const baselineBoundaryParam = boundaryParam + 1;
   const mergeCols =
     lastExportAt != null
       ? `,
@@ -2840,20 +2855,36 @@ async function applyVerseRows(
                WHERE kind = 'verse'
                  AND row_key = ?1 || '/' || chapter || '/' || verse || '/' || ?2
                  AND (book = ?1 OR book IS NULL)
-                 AND action IN ('create', 'update')
-                 AND ${baseBoundary}
-               ORDER BY id DESC LIMIT 1) AS base_payload,
+                 AND (
+                   (action IN ('create', 'update') AND ${baseBoundary})
+                   OR (action = 'baseline' AND created_at < ?${baselineBoundaryParam})
+                 )
+               ORDER BY created_at DESC, id DESC LIMIT 1) AS base_payload,
             EXISTS (
               SELECT 1 FROM edit_log
                WHERE kind = 'verse'
                  AND row_key = ?1 || '/' || chapter || '/' || verse || '/' || ?2
                  AND (book = ?1 OR book IS NULL)
                  AND source IS NULL
+                 -- Issue #537 fallout: a 'baseline' row is pipelineImport.ts's
+                 -- own pre-AI snapshot (user_id NULL, source NULL, but never a
+                 -- human touching the row), and its id is assigned at AI-run
+                 -- time regardless of how old its (back-dated) content is. Left
+                 -- unfiltered, recovering it as base_payload above would ALSO
+                 -- make it satisfy this "human edited since export" probe on
+                 -- its own id, defeating the clean case-5 adopt in
+                 -- computeVerseMerge and forcing every recovered-ancestor verse
+                 -- through the conflict-flagged both_changed path for no real
+                 -- reason — D1 never moved. Excluded here the same way it is
+                 -- deliberately INCLUDED, on its own timestamp boundary, above.
+                 AND action <> 'baseline'
                  AND ${sinceBoundary}
             ) AS human_edit_after_export`
       : "";
   const existingBind: unknown[] =
-    lastExportAt != null ? [book, bibleVersion, ...chapters, boundaryBind] : [book, bibleVersion, ...chapters];
+    lastExportAt != null
+      ? [book, bibleVersion, ...chapters, boundaryBind, lastExportAt]
+      : [book, bibleVersion, ...chapters];
   const existingRs = await env.DB.prepare(
     `SELECT chapter, verse, content_json, plain_text, verse_end, version, updated_by,
             (SELECT source FROM edit_log

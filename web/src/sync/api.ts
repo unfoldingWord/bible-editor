@@ -98,7 +98,10 @@ export type AlignmentIntent =
   | "text_edit"
   | "find_replace"
   | "section_edit"
-  | "alignment_edit";
+  | "alignment_edit"
+  // Issue #575: an escalated "Save anyway" on a text_edit — see
+  // web/src/lib/alignmentDelta.ts for the full rationale.
+  | "confirmed_text_edit";
 
 export interface VerseStatus {
   book: string;

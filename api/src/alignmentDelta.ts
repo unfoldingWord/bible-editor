@@ -4,7 +4,17 @@ export type AlignmentIntent =
   | "text_edit"
   | "find_replace"
   | "section_edit"
-  | "alignment_edit";
+  | "alignment_edit"
+  // Issue #575: an escalated "Save anyway" on a text_edit that collaterally
+  // de-aligned words (Shell.tsx's pendingAlignmentLoss confirm) used to climb
+  // as plain "alignment_edit" — indistinguishable from a real aligner-panel
+  // re-alignment save. The translator's INTENT was still a text edit; the
+  // alignment loss is accepted collateral, not the point of the save. Guard
+  // behavior is identical to alignment_edit (both are exempt from
+  // guardBlocksSave); this exists so the two can be told apart wherever that
+  // distinction matters (e.g. verse history, future rebase-eligibility
+  // logic), without changing today's guard outcome for either.
+  | "confirmed_text_edit";
 
 export interface AlignmentLoss {
   index: number;
@@ -142,7 +152,7 @@ export function analyzeAlignmentDelta(beforeContent: unknown, afterContent: unkn
 }
 
 export function intentAllowsUnexpectedAlignmentLoss(intent: AlignmentIntent): boolean {
-  return intent === "alignment_edit";
+  return intent === "alignment_edit" || intent === "confirmed_text_edit";
 }
 
 // The single enforced predicate: should this save be BLOCKED for collateral
