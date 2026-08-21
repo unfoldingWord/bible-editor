@@ -466,15 +466,31 @@ function isPinnedCommitSha(ref: string): boolean {
 //       revision raw blob can only ever be short from network truncation, not
 //       long — see fetchText's gzip-decode note above, which is about the
 //       Content-Length header on THIS response, an orthogonal check).
+// `ref` is OPTIONAL rather than defaulting to the string "master", and the
+// difference is load-bearing rather than stylistic. dcsRawUrl branches on
+// whether a ref was SUPPLIED, not on what it says: any truthy ref routes
+// through the api/v1 raw endpoint. So defaulting `ref` to "master" here would
+// hand dcsRawUrl a truthy ref on EVERY unpinned call and silently move every
+// such caller — the export shrink guards when checkMasterFreshness had no SHA
+// to offer (no_file / no_watermark), and the HTTP-route reimport, which has no
+// SHA resolved at all — off the unauthenticated web raw/branch/master route
+// they have always used and onto api/v1, for no benefit: an unpinned "master"
+// is exactly the movable ref isPinnedCommitSha refuses to call verified, so
+// the switch buys no proof, only a different endpoint. Passing the caller's
+// own `undefined` straight through keeps dcsRawUrl's documented contract
+// ("no ref → unchanged behavior for existing unpinned callers") true through
+// this wrapper too. dcsFileSize still resolves its own "master" default
+// below — its URL is ref-aware in every case and always has been, so that one
+// genuinely is just a default.
 export async function fetchDcsMasterTextVerified(
   env: Env,
   repo: string,
   path: string,
-  ref = "master",
+  ref?: string,
 ): Promise<{ text: string | null; verified: boolean }> {
-  const pinned = isPinnedCommitSha(ref);
+  const pinned = ref != null && isPinnedCommitSha(ref);
   const url = dcsRawUrl(env, repo, path, ref);
-  const apiSize = await dcsFileSize(env, repo, path, ref);
+  const apiSize = await dcsFileSize(env, repo, path, ref ?? "master");
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
       const r = await fetch(url);
@@ -535,14 +551,17 @@ export async function fetchDcsMasterTextVerified(
 // need the verified flag — preserves the original fetchDcsMasterText call
 // shape those sites already use. Pass a pinned commit SHA as `ref` whenever
 // the caller already has one (e.g. from fileCommitSha / checkMasterFreshness)
-// rather than leaving it defaulted to "master" — the default exists only for
-// callers with no SHA to offer, and stays honest about that (see
-// isPinnedCommitSha / fetchDcsMasterTextVerified above).
+// rather than omitting it — an omitted ref reads master's current tip
+// unpinned, which stays honestly unverified (see isPinnedCommitSha /
+// fetchDcsMasterTextVerified above). `ref` is optional here for the same
+// reason it is optional there: forwarding the caller's own `undefined`,
+// rather than a "master" default, is what keeps an unpinned caller on the web
+// raw route instead of silently rerouting it through api/v1.
 export async function fetchDcsMasterText(
   env: Env,
   repo: string,
   path: string,
-  ref = "master",
+  ref?: string,
 ): Promise<string | null> {
   return (await fetchDcsMasterTextVerified(env, repo, path, ref)).text;
 }

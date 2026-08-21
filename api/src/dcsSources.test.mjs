@@ -377,6 +377,85 @@ async function run() {
     "dcsRawUrl: a ref → the ref-aware api/v1 raw endpoint, not the branch-only web route",
   );
 
+  // ── The EXPORT shrink guards' own call shape ────────────────────────────
+  // checkTsvShrink / checkUsfmAlignmentShrink (exportWorkflow.ts) are the two
+  // callers that go through the thin `fetchDcsMasterText` wrapper rather than
+  // fetchDcsMasterTextVerified — they only ever test `raw == null` and have no
+  // use for the `verified` flag. They pass `fresh.masterSha ?? undefined`,
+  // where `fresh.masterSha` is checkMasterFreshness's `fileCommitSha` result.
+  // exportOne returns early on `!fresh.ok`, so by the time either guard runs
+  // that value is either a genuine 40-hex commit SHA (detail "current") or
+  // null (detail "no_file"/"no_watermark"/"dry" — nothing to pin to).
+  //
+  // These cases pin BOTH halves of that contract end-to-end through the
+  // wrapper, because the round-4 fix made the fetch strictly stricter (exact
+  // byte equality, and a raw route that now actually honors `ref`) and these
+  // guards BLOCK the nightly export on a null: a false `master_unreadable`
+  // would hold a book back every night. Recorded URLs, not just return
+  // values — the whole point of the pin is WHICH revision was read.
+  const seenUrls = [];
+  const recordingFetch = async (u) => {
+    calls++;
+    seenUrls.push(u);
+    if (queue.length === 0) throw new Error("fetch called more times than queued");
+    return queue.shift();
+  };
+  const plainFetch = globalThis.fetch;
+  globalThis.fetch = recordingFetch;
+
+  // 26. The "current" case: a real pinned SHA, master's bytes agree with the
+  //     size recorded for THAT SHA → body returned (the guards proceed to
+  //     compare rows/alignments), and BOTH round trips name the same SHA.
+  queue = [jsonRes({ body: { size: 11 } }), res({ body: "hello world", contentLength: undefined })];
+  calls = 0;
+  seenUrls.length = 0;
+  assert(
+    (await fetchDcsMasterText(env, "en_twl", "twl_PSA.tsv", PINNED_SHA)) === "hello world",
+    "export shrink guards: a pinned masterSha with agreeing bytes still returns master's body (no false master_unreadable)",
+  );
+  assert(
+    seenUrls[0] === `https://example.test/api/v1/repos/unfoldingWord/en_twl/contents/twl_PSA.tsv?ref=${PINNED_SHA}`,
+    "  ...the size lookup is pinned to that exact SHA",
+  );
+  assert(
+    seenUrls[1] === `https://example.test/api/v1/repos/unfoldingWord/en_twl/raw/twl_PSA.tsv?ref=${PINNED_SHA}`,
+    "  ...and so is the raw fetch — one revision, read twice, not two reads of a moving branch",
+  );
+
+  // 27. Same pinned shape, but the bytes never agree with the pinned size →
+  //     null on both attempts. The guards read that as `master_unreadable`
+  //     and refuse to publish, which is the intended fail-closed direction:
+  //     an unverifiable master must block, never wave a render through.
+  queue = [
+    jsonRes({ body: { size: 11 } }),
+    res({ body: "hello worldXXXX", contentLength: undefined }),
+    res({ body: "hello worldXXXX", contentLength: undefined }),
+  ];
+  calls = 0;
+  assert(
+    (await fetchDcsMasterText(env, "en_twl", "twl_PSA.tsv", PINNED_SHA)) === null,
+    "export shrink guards: a pinned fetch whose bytes disagree with the pinned size → null → master_unreadable → export blocked (fail closed)",
+  );
+
+  // 28. The other reachable caller state: freshness had no SHA to offer
+  //     (no_file / no_watermark), so `masterSha ?? undefined` leaves `ref`
+  //     defaulted. The fetch must stay on the ORIGINAL unauthenticated web
+  //     raw route it always used — the stricter pinning must not change
+  //     behavior for the callers that have nothing to pin with.
+  queue = [jsonRes({ body: { size: 11 } }), res({ body: "hello world", contentLength: undefined })];
+  calls = 0;
+  seenUrls.length = 0;
+  assert(
+    (await fetchDcsMasterText(env, "en_twl", "twl_PSA.tsv", undefined)) === "hello world",
+    "export shrink guards: a null masterSha still reads master and returns the body, exactly as before the pin",
+  );
+  assert(
+    seenUrls[1] === "https://example.test/unfoldingWord/en_twl/raw/branch/master/twl_PSA.tsv",
+    "  ...over the unchanged web raw/branch/master route, never the api/v1 one",
+  );
+
+  globalThis.fetch = plainFetch;
+
   console.error = origError;
   console.warn = origWarn;
 
