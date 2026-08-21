@@ -732,6 +732,136 @@ console.log("\n[(e) a RECOVERED resource clears its stale reimport_id_blocked al
     .prepare(`SELECT COUNT(*) AS n FROM system_alerts WHERE source = ? AND dismissed_at IS NULL`)
     .all(`reimport_id_blocked:AMO:tn`)[0];
   eq(Number(otherStillOpen.n), 1, "a DIFFERENT (book, resource)'s alert is untouched — clearing is scoped, not a blanket wipe");
+
+}
+
+console.log("\n[merge_no_base_editor_refs folds through the REAL addCounts (issue #544)]");
+// Same shape as merge_no_base_refs above (a diagnostic list merged across
+// Workflow chunks under its own cap), but this one FEEDS the editor fan-out -
+// a truncation here silently drops a translator's verse from their own alert,
+// not just from an admin-facing sample - so it gets the identical coverage.
+{
+  const { zeroCountsForTest, addCountsForTest, NO_BASE_EDITOR_REF_CAP } = await import("./bookReimport.ts").then(
+    (m) => ({
+      zeroCountsForTest: m.zeroCountsForTest,
+      addCountsForTest: m.addCountsForTest,
+      NO_BASE_EDITOR_REF_CAP: m.NO_BASE_EDITOR_REF_CAP,
+    }),
+  );
+
+  // Two chunks' worth of refs merge and accumulate, each carrying a version.
+  const agg = zeroCountsForTest();
+  const chunkA = zeroCountsForTest();
+  chunkA.merge_no_base_editor_refs = [
+    { chapter: 40, verse: 5, version: 3 },
+    { chapter: 40, verse: 6, version: 1 },
+  ];
+  const chunkB = zeroCountsForTest();
+  chunkB.merge_no_base_editor_refs = [{ chapter: 42, verse: 2, version: 9 }];
+  addCountsForTest(agg, chunkA);
+  addCountsForTest(agg, chunkB);
+  eq(
+    (agg.merge_no_base_editor_refs ?? []).map((r) => `${r.chapter}:${r.verse}@${r.version}`).join(","),
+    "40:5@3,40:6@1,42:2@9",
+    "editor refs concatenate in chunk order, each carrying its own version",
+  );
+
+  // A chunk memoized before the field existed carries no editor refs. Folding
+  // it must not throw and must not poison the running list.
+  const legacy = zeroCountsForTest();
+  legacy.merge_no_base = 5;
+  delete legacy.merge_no_base_editor_refs;
+  addCountsForTest(agg, legacy);
+  eq((agg.merge_no_base_editor_refs ?? []).length, 3, "a pre-field chunk contributes no editor refs, silently");
+
+  // The cap holds under a flood — unlike the display sample this list is
+  // meant to carry EVERY affected verse, so the cap only guards the
+  // pathological case, but it must still hold.
+  const flood = zeroCountsForTest();
+  flood.merge_no_base_editor_refs = Array.from({ length: NO_BASE_EDITOR_REF_CAP + 50 }, (_, i) => ({
+    chapter: 9,
+    verse: i,
+    version: 1,
+  }));
+  const capped = zeroCountsForTest();
+  addCountsForTest(capped, flood);
+  eq((capped.merge_no_base_editor_refs ?? []).length, NO_BASE_EDITOR_REF_CAP, "addCounts enforces the editor-ref cap");
+
+  // A fresh zeroCounts must not alias another accumulator's array.
+  const one = zeroCountsForTest();
+  const two = zeroCountsForTest();
+  one.merge_no_base_editor_refs.push({ chapter: 1, verse: 1, version: 1 });
+  eq(
+    (two.merge_no_base_editor_refs ?? []).length,
+    0,
+    "zeroCounts allocates a fresh editor-refs array per call (no aliasing)",
+  );
+}
+
+// keep_no_base TSV row gets review_kind='merge_no_base', guarded so a
+// re-run of an unchanged sync never re-bumps the row's version (#539).
+// Unlike the verse side, a keep_no_base tn/tq/twl row had NO surface at all —
+// merge_no_base is a shared counter with no banner for TSV, and this table has
+// no verse_merge_conflicts-style audit row. The fix flags the row itself, the
+// same cleanup-chip mechanism (lint.ts) every other TSV merge outcome already
+// uses — but a flag write bumps `version`, so it must be guarded on the
+// existing review_kind exactly like the ref_moved write above it, or a nightly
+// re-run of an unchanged book would bump every affected row's version forever
+// (issue #539's version-inflation constraint).
+console.log("\n[keep_no_base tn/tq/twl row: review_kind flag set once, guarded against re-bump]");
+{
+  const { sqlite, env } = freshEnv();
+  sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (1, 100, 'translator-tq')`).run();
+  const NB_ID = "msnb";
+  sqlite
+    .prepare(
+      `INSERT INTO tq_rows (id, book, chapter, verse, ref_raw, question, response, version, updated_by)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 1, 1)`,
+    )
+    .run(NB_ID, BOOK, 9, 9, "9:9", "app question", "app response");
+  // Deliberately NO edit_log row for this id at all — foldTsvBase then returns
+  // null (no content-bearing history to fold), so computeTsvMerge sees
+  // base === null and, since `question` differs, returns keep_no_base.
+  const cutoff = { confirmedAt: Math.floor(Date.now() / 1000), editId: null };
+  const incoming = () => [
+    {
+      id: NB_ID,
+      idCoerced: false,
+      refRaw: "9:9",
+      chapter: 9,
+      verse: 9,
+      occurrence: null,
+      tags: null,
+      quote: null,
+      question: "master question", // differs from D1's "app question" -> anyDiff
+      response: "app response", // unchanged -> converged on this field
+    },
+  ];
+
+  const counts1 = await applyTsvRows(env, BOOK, "tq", incoming(), null, cutoff);
+  eq(counts1.merge_no_base, 1, "first run: counted as keep_no_base (no ancestor recoverable)");
+
+  const after1 = sqlite.prepare("SELECT version, review_kind, review_reason, question FROM tq_rows WHERE id = ?").all(NB_ID)[0];
+  eq(after1.review_kind, "merge_no_base", "the row is flagged for the cleanup chip (lint.ts)");
+  eq(typeof after1.review_reason === "string" && after1.review_reason.length > 0, true, "a human-readable reason is stored");
+  eq(
+    /overwritten|overwrote|overwrites/i.test(after1.review_reason.replace("Nothing has been overwritten", "")),
+    false,
+    "the stored reason never claims an overwrite HAPPENED, aside from explicitly denying one",
+  );
+  eq(after1.version, 2, "flagging the row for the first time bumps its version once");
+  eq(after1.question, "app question", "content is untouched — keep_no_base keeps D1, adopts nothing");
+
+  // Re-run with the SAME incoming master row and the SAME cutoff — nothing
+  // about this row's situation has changed, so the guard (cur.review_kind !==
+  // 'merge_no_base') must skip re-setting the field this time.
+  const counts2 = await applyTsvRows(env, BOOK, "tq", incoming(), null, cutoff);
+  eq(counts2.merge_no_base, 1, "second run: still classified keep_no_base (still reported, not hidden)");
+  eq(counts2.skipped_edited, 1, "…but nothing was WRITTEN this time — the flag was already set");
+
+  const after2 = sqlite.prepare("SELECT version, review_kind FROM tq_rows WHERE id = ?").all(NB_ID)[0];
+  eq(after2.version, 2, "NO further version bump on an unchanged re-run — the version-inflation guard (#539) holds");
+  eq(after2.review_kind, "merge_no_base", "the flag is still set");
 }
 
 if (failed > 0) {

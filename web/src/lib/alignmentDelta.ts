@@ -209,3 +209,29 @@ export function sameVerseContent(a: unknown, b: unknown): boolean {
     return false;
   }
 }
+
+// Should a re-sync REBASE the aligner panel's baseline in place (keep any
+// in-flight drags, and the crash-draft tracking them) rather than doing a
+// full reset (dropping drags back to the freshly-parsed content)? True only
+// when BOTH the target verse's content and its source (UHB/UGNT) verse's
+// content are byte-identical to what the panel last synced to — a genuine
+// version-only bump with nothing else changed (#488).
+//
+// The source side matters as much as the target side: a UHB/UGNT source
+// reimport landing while the panel has pending drags changes what
+// `computedInitial` re-parses against, even though the TARGET verse's own
+// content/version pair looks like an ordinary bump. Rebasing in that case
+// would leave `state` (from the old source tree) attached to `initial` (the
+// new source tree) — a save could then serialize alignment data pointing at
+// source milestones the new tree no longer has. Requiring both sides to
+// match forces that case onto the full-reset path instead (#508).
+export function isVersionOnlyRebase(
+  lastSynced: { content: unknown; sourceContent: unknown } | null,
+  current: { content: unknown; sourceContent: unknown },
+): boolean {
+  if (!lastSynced) return false;
+  return (
+    sameVerseContent(lastSynced.content, current.content) &&
+    sameVerseContent(lastSynced.sourceContent, current.sourceContent)
+  );
+}

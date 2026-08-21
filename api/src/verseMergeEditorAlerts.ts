@@ -267,6 +267,68 @@ export function buildNoBaseSentence(count: number, refs?: string[]): string {
   );
 }
 
+// ---------------------------------------------------------------------------
+// keep_no_base editor fan-out (issue #544). buildNoBaseSentence (above) tells
+// the ADMIN which verses could not be adjudicated and warns that tonight's
+// export may still overwrite a Door43-side change to them — but until now
+// that warning reached nobody who could act on it: groupOverwrittenVersesByEditor
+// only fires for 'adopt_conflict' rows, and a keep_no_base verse writes no
+// verse_merge_conflicts row at all (there was nothing to adjudicate), so the
+// translator who owns the app-side text never learned tonight's export might
+// still clobber a Door43 edit to "their" verse.
+//
+// Attribution reuses the exact same edit_log JOIN groupOverwrittenVersesByEditor
+// uses (editLogKey / buildEditorLookupQuery), just keyed differently: an
+// overwritten verse looks up `overwrittenVersion` (the D1 version that WAS
+// replaced); a keep_no_base verse has no such thing — nothing was replaced —
+// so it looks up its CURRENT D1 version instead, i.e. the version whose
+// edit_log row is this verse's most recent edit. The caller (bookReimport.ts)
+// only reaches this path for a verse already established as genuinely
+// human-edited (not AI-only — see applyVerseRows' `aiOnly` branch, which
+// `continue`s before computeVerseMerge ever runs), so that edit_log row is
+// the human who "last edited it in the app," per the issue's own wording.
+//
+// CRITICAL WORDING RULE: unlike groupOverwrittenVersesByEditor's message,
+// this one must NEVER say anything was overwritten — nothing was. D1 was kept
+// precisely because no ancestor was recoverable to tell which side changed.
+export interface NoBaseVerseRef {
+  chapter: number;
+  verse: number;
+  /** The verse's CURRENT D1 version at read time (NOT a replaced version —
+   *  nothing was overwritten). Reused as the edit_log lookup key the same way
+   *  OverwrittenVerseRef.overwrittenVersion is, via editLogKey. */
+  version: number;
+}
+
+export function groupNoBaseVersesByEditor(
+  book: string,
+  resource: string,
+  noBase: NoBaseVerseRef[],
+  usernameByKey: Map<string, string>,
+): Map<string, { refs: string[]; message: string }> {
+  const byUser = new Map<string, string[]>();
+  for (const ref of noBase) {
+    const username = usernameByKey.get(
+      editLogKey(book, resource, { chapter: ref.chapter, verse: ref.verse, overwrittenVersion: ref.version }),
+    );
+    if (!username) continue; // no human on this verse's current version — nothing to notify
+    const list = byUser.get(username) ?? [];
+    list.push(`${ref.chapter}:${ref.verse}`); // no "@vN" — nothing was overwritten, so there is no replaced version to point at
+    byUser.set(username, list);
+  }
+  const out = new Map<string, { refs: string[]; message: string }>();
+  for (const [username, refs] of byUser) {
+    const message =
+      `Door43's sync could not tell whether your edit or a Door43-side edit is newer, for ${refs.length} ` +
+      `verse(s) you last edited in ${book} ${resource.toUpperCase()}: ${refs.join(", ")} — no earlier version was ` +
+      `recoverable to compare against, so it kept your version for now. Nothing has been overwritten — but if ` +
+      `Door43 has changed ${refs.length === 1 ? "it" : "them"} since, tonight's export will still overwrite your ` +
+      `text there unless you open and re-save the verse${refs.length === 1 ? "" : "s"} here first.`;
+    out.set(username, { refs, message });
+  }
+  return out;
+}
+
 export function planSystemAlertWrites(
   existing: Map<string, ExistingAlertState>,
   desired: Map<string, string>,

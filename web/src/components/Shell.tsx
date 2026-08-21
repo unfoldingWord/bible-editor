@@ -2313,6 +2313,10 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     // cache too.
     onConfirmedApply?: () => void,
     draftGeneration?: string,
+    // See outbox.ts's OutboxOp.alignmentDraftGeneration — only ever set by
+    // an alignment_edit save (AlignmentPanel), threaded through so the
+    // eventual PATCH success can generation-gate its crash-draft cleanup.
+    alignmentDraftGeneration?: string,
   ): boolean => {
     const delta = analyzeAlignmentDelta(base.content, content);
     // Block any save that collaterally de-aligns untouched words. The enforced
@@ -2347,7 +2351,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
               bibleVersion,
               expectedVersion,
               { content, plain_text: plainText, alignment_intent: "confirmed_text_edit" },
-              { draftGeneration },
+              { draftGeneration, alignmentDraftGeneration },
             );
             onConfirmedApply?.();
           },
@@ -2371,7 +2375,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       bibleVersion,
       expectedVersion,
       { content, plain_text: plainText, alignment_intent: intent },
-      { draftGeneration },
+      { draftGeneration, alignmentDraftGeneration },
     );
     return true;
   }, [book, pushPipelineToast]);
@@ -2409,7 +2413,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       sourceVerse,
       sourceLabel,
       twlForVerse,
-      onSave: (content, plain, _expectedVersion) => {
+      onSave: (content, plain, _expectedVersion, draftGeneration) => {
         // Key the PATCH by the resolved row's verse_start — alignerTarget.verse
         // may sit INSIDE a range row (v7 of a UST 6-9 block) now that the
         // slice resolves through buildVerseIndex.
@@ -2423,6 +2427,9 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
             plain,
             "alignment_edit",
             _expectedVersion,
+            undefined,
+            undefined,
+            draftGeneration,
           );
         }
         // Optimistically fold the new alignment into the local chapter cache so
@@ -2507,7 +2514,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     // PATCH key is the resolved row's verse_start — dualTarget.verse may sit
     // inside a range row now that slices resolve through buildVerseIndex.
     const enqueue = (bibleVersion: string, row: VerseDto | null) =>
-      (content: unknown, plain: string, _expectedVersion: number) => {
+      (content: unknown, plain: string, _expectedVersion: number, draftGeneration?: string) => {
         if (!row) return;
         enqueueVerseSafely(
           dualTarget.chapter,
@@ -2518,6 +2525,9 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           plain,
           "alignment_edit",
           _expectedVersion,
+          undefined,
+          undefined,
+          draftGeneration,
         );
         // Optimistic local update so content-derived UI (the broken-alignment
         // link) refreshes immediately — same as the single-panel aligner.

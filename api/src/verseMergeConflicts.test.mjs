@@ -62,6 +62,7 @@ import {
   buildMergeConflictGuidance,
   EDITOR_LOOKUP_CHUNK,
   editLogKey,
+  groupNoBaseVersesByEditor,
   groupOverwrittenVersesByEditor,
   NO_BASE_REF_DISPLAY,
   planSystemAlertWrites,
@@ -147,6 +148,66 @@ function assert(cond, msg) {
   const b = { chapter: 1, verse: 1, overwrittenVersion: 2 };
   assert(editLogKey("ZEC", "ult", a) !== editLogKey("HOS", "ult", b), "different book -> different key");
   assert(editLogKey("ZEC", "ult", a) !== editLogKey("ZEC", "ust", b), "different resource -> different key");
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Part 1b: groupNoBaseVersesByEditor (issue #544) — pure, no D1. The
+// keep_no_base analogue of groupOverwrittenVersesByEditor above: NOTHING was
+// overwritten, so the message must never claim otherwise, and the refs carry
+// no "@vN" (there is no replaced version to point a reader at).
+// ─────────────────────────────────────────────────────────────────────────
+
+{
+  // Two verses attributed to the same editor combine into one alert, keyed
+  // off their CURRENT version (not an overwrittenVersion — nothing was
+  // overwritten).
+  const noBase = [
+    { chapter: 1, verse: 2, version: 3 },
+    { chapter: 1, verse: 5, version: 7 },
+  ];
+  const usernameByKey = new Map([
+    [editLogKey("ZEC", "ult", { chapter: 1, verse: 2, overwrittenVersion: 3 }), "bethoakes"],
+    [editLogKey("ZEC", "ult", { chapter: 1, verse: 5, overwrittenVersion: 7 }), "bethoakes"],
+  ]);
+  const grouped = groupNoBaseVersesByEditor("ZEC", "ult", noBase, usernameByKey);
+  assert(grouped.size === 1, "two verses, one editor -> one alert entry");
+  const entry = grouped.get("bethoakes");
+  assert(!!entry, "keyed by username");
+  assert(entry.refs.length === 2, "both refs collected");
+  assert(entry.refs.includes("1:2") && entry.refs.includes("1:5"), "refs carry bare chapter:verse");
+  assert(!entry.refs.some((r) => r.includes("@v")), "…and never an '@vN' suffix — nothing was overwritten");
+  assert(entry.message.includes("ZEC"), "message names the book");
+  assert(entry.message.includes("ULT"), "message names the resource, uppercased");
+  assert(entry.message.includes("2 verse(s)"), "message states the count");
+  assert(!/overwr(itten|ote|ites)/i.test(entry.message.replace("Nothing has been overwritten", "")),
+    "message never claims an overwrite happened, aside from explicitly denying one");
+  assert(entry.message.includes("Nothing has been overwritten"), "message explicitly denies an overwrite");
+  assert(!entry.message.includes("nightly"), "does not overclaim a nightly-only trigger");
+  assert(entry.message.includes("Door43's sync"), 'says "sync", not "nightly sync"');
+}
+
+{
+  // Two different editors get two separate alert entries, not merged.
+  const noBase = [
+    { chapter: 2, verse: 1, version: 4 },
+    { chapter: 3, verse: 9, version: 2 },
+  ];
+  const usernameByKey = new Map([
+    [editLogKey("HOS", "ust", { chapter: 2, verse: 1, overwrittenVersion: 4 }), "pjoakes"],
+    [editLogKey("HOS", "ust", { chapter: 3, verse: 9, overwrittenVersion: 2 }), "Carolyn1970"],
+  ]);
+  const grouped = groupNoBaseVersesByEditor("HOS", "ust", noBase, usernameByKey);
+  assert(grouped.size === 2, "two editors -> two alert entries");
+  assert(grouped.get("pjoakes").refs.length === 1, "pjoakes gets only their own verse");
+  assert(grouped.get("Carolyn1970").refs.length === 1, "Carolyn1970 gets only their own verse");
+}
+
+{
+  // No matching edit_log user (an AI edit, or the ancestor aged out) -> no
+  // alert entry, the same silent-exclusion behavior as the overwritten case.
+  const noBase = [{ chapter: 4, verse: 4, version: 1 }];
+  const grouped = groupNoBaseVersesByEditor("MIC", "ult", noBase, new Map());
+  assert(grouped.size === 0, "no username found -> no alert entry");
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -372,10 +433,13 @@ function saveVerse(d, { book, resource, chapter, verse, matchVersion, userId, no
 // so there is nothing to undo.
 // ─────────────────────────────────────────────────────────────────────────
 
-function upsertConflict(d, { book, resource, chapter, verse, action, reason, overwrittenVersion, now }) {
+function upsertConflict(
+  d,
+  { book, resource, chapter, verse, action, reason, overwrittenVersion, now, bibleVersion = null, observedVersion = null },
+) {
   return d
     .prepare(UPSERT_VERSE_MERGE_CONFLICT_SQL)
-    .run(book, resource, chapter, verse, action, reason, overwrittenVersion, null, now);
+    .run(book, resource, chapter, verse, action, reason, overwrittenVersion, null, now, bibleVersion, observedVersion);
 }
 
 function confirmAdopted(d, { book, resource, chapter, verse }) {
@@ -643,7 +707,7 @@ function confirmAdopted(d, { book, resource, chapter, verse }) {
   // report a stale @v recovery pointer once it becomes source_attr_divergent.
   const d = verseDb();
   d.prepare(UPSERT_VERSE_MERGE_CONFLICT_SQL).run(
-    "EZK", "ult", 40, 21, "source_attr_divergent", "source_attr_ambiguous", null, null, 1000,
+    "EZK", "ult", 40, 21, "source_attr_divergent", "source_attr_ambiguous", null, null, 1000, null, null,
   );
   let row = d.prepare(`SELECT * FROM verse_merge_conflicts WHERE book='EZK' AND chapter=40 AND verse=21`).get();
   assert(row.action === "source_attr_divergent" && row.overwritten_version === null,
@@ -653,10 +717,10 @@ function confirmAdopted(d, { book, resource, chapter, verse }) {
   // real pointer, then diverge again: the pointer must be forced back to NULL.
   const d2 = verseDb();
   d2.prepare(UPSERT_VERSE_MERGE_CONFLICT_SQL).run(
-    "EZK", "ult", 40, 21, "adopt_conflict", "both_changed", 7, null, 1000,
+    "EZK", "ult", 40, 21, "adopt_conflict", "both_changed", 7, null, 1000, null, null,
   );
   d2.prepare(UPSERT_VERSE_MERGE_CONFLICT_SQL).run(
-    "EZK", "ult", 40, 21, "source_attr_divergent", "source_attr_ambiguous", null, null, 2000,
+    "EZK", "ult", 40, 21, "source_attr_divergent", "source_attr_ambiguous", null, null, 2000, null, null,
   );
   row = d2.prepare(`SELECT * FROM verse_merge_conflicts WHERE book='EZK' AND chapter=40 AND verse=21`).get();
   assert(row.action === "source_attr_divergent" && row.overwritten_version === null,
@@ -781,7 +845,7 @@ function confirmAdopted(d, { book, resource, chapter, verse }) {
   ).run();
   // Night 2: re-detected (divergence still present) → speculative re-upsert.
   d.prepare(UPSERT_VERSE_MERGE_CONFLICT_SQL).run(
-    "EZK", "ult", 40, 21, "source_attr_divergent", "source_attr_ambiguous", null, null, 2000,
+    "EZK", "ult", 40, 21, "source_attr_divergent", "source_attr_ambiguous", null, null, 2000, null, null,
   );
   const row = d.prepare(`SELECT * FROM verse_merge_conflicts WHERE book='EZK' AND chapter=40 AND verse=21`).get();
   assert(row.resolved_at === null && row.resolved_by === null,
@@ -796,7 +860,7 @@ function confirmAdopted(d, { book, resource, chapter, verse }) {
      VALUES ('EZK','ult',40,22,'adopt_conflict','both_changed',7,100,150,30,100)`,
   ).run();
   d2.prepare(UPSERT_VERSE_MERGE_CONFLICT_SQL).run(
-    "EZK", "ult", 40, 22, "adopt_conflict", "both_changed", 7, null, 2000,
+    "EZK", "ult", 40, 22, "adopt_conflict", "both_changed", 7, null, 2000, null, null,
   );
   const row2 = d2.prepare(`SELECT * FROM verse_merge_conflicts WHERE book='EZK' AND chapter=40 AND verse=22`).get();
   assert(row2.resolved_at === 150 && row2.resolved_by === 30,
@@ -817,7 +881,7 @@ function confirmAdopted(d, { book, resource, chapter, verse }) {
   ).run();
   // Night 2: re-detected (refusal still holds) → speculative re-upsert.
   d.prepare(UPSERT_VERSE_MERGE_CONFLICT_SQL).run(
-    "EZK", "ult", 40, 21, "keep_alignment_refused", "alignment_loss", null, null, 2000,
+    "EZK", "ult", 40, 21, "keep_alignment_refused", "alignment_loss", null, null, 2000, null, null,
   );
   const row = d.prepare(`SELECT * FROM verse_merge_conflicts WHERE book='EZK' AND chapter=40 AND verse=21`).get();
   assert(row.resolved_at === null && row.resolved_by === null,
@@ -832,11 +896,117 @@ function confirmAdopted(d, { book, resource, chapter, verse }) {
      VALUES ('EZK','ult',40,22,'adopt_conflict','both_changed',7,100,150,30,100)`,
   ).run();
   d2.prepare(UPSERT_VERSE_MERGE_CONFLICT_SQL).run(
-    "EZK", "ult", 40, 22, "adopt_conflict", "both_changed", 7, null, 2000,
+    "EZK", "ult", 40, 22, "adopt_conflict", "both_changed", 7, null, 2000, null, null,
   );
   const row2 = d2.prepare(`SELECT * FROM verse_merge_conflicts WHERE book='EZK' AND chapter=40 AND verse=22`).get();
   assert(row2.resolved_at === 150 && row2.resolved_by === 30,
     "an adoption's speculative re-upsert still leaves resolved_at/resolved_by untouched (widened carve-out does not leak)");
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Part 8 (issue #507): VERSION GUARD on the reactivation carve-out. The
+// speculative upsert's detection was read EARLIER in the same
+// applyVerseRows call (bookReimport.ts's `ex.version`) than the moment this
+// statement executes. If a human saves the verse AND resolves the conflict
+// row in that window, the detection is stale — reactivating would destroy a
+// fresh, legitimate resolution and raise a false alert for a condition that
+// may already be gone. The guard: only reactivate when the verse's CURRENT
+// version (read live, at upsert time) still matches the version the
+// detection was read at.
+// ─────────────────────────────────────────────────────────────────────────
+
+{
+  // *** THE EXACT #507 SCENARIO ***: a human saves a fix (bumping the verse's
+  // version) AND resolves the conflict row, in the window between the
+  // detection read and the speculative upsert. The upsert's observedVersion
+  // (the STALE version from the detection read) no longer matches the verse's
+  // CURRENT version — reactivation must be withheld, preserving the fresh
+  // resolution's audit trail intact.
+  const d = verseDb();
+  d.prepare(
+    `INSERT INTO verses (book, chapter, verse, bible_version, version) VALUES ('EZK', 40, 21, 'ULT', 5)`,
+  ).run();
+  // A human resolves the conflict (their save bumped the verse to version 5).
+  d.prepare(
+    `INSERT INTO verse_merge_conflicts (book, resource, chapter, verse, action, reason, overwritten_version, detected_at, resolved_at, resolved_by, last_recorded_at)
+     VALUES ('EZK','ult',40,21,'source_attr_divergent','source_attr_ambiguous',NULL,100,150,30,100)`,
+  ).run();
+  // Tonight's sync re-detects the SAME condition, but its detection read
+  // happened BEFORE the human's save landed — it observed version 4, not the
+  // verse's current version (5).
+  upsertConflict(d, {
+    book: "EZK", resource: "ult", chapter: 40, verse: 21,
+    action: "source_attr_divergent", reason: "source_attr_ambiguous", overwrittenVersion: null,
+    now: 2000, bibleVersion: "ULT", observedVersion: 4,
+  });
+  const row = d.prepare(`SELECT * FROM verse_merge_conflicts WHERE book='EZK' AND chapter=40 AND verse=21`).get();
+  assert(row.resolved_at === 150 && row.resolved_by === 30,
+    "stale detection (observedVersion != current verses.version) does NOT reactivate — the fresh resolution survives");
+}
+
+{
+  // CONTROL: same shape, but NOTHING raced — the detection's observedVersion
+  // matches the verse's current version (no save happened in the window).
+  // Reactivation must proceed normally, exactly as the pre-#507 behavior did.
+  const d = verseDb();
+  d.prepare(
+    `INSERT INTO verses (book, chapter, verse, bible_version, version) VALUES ('EZK', 40, 21, 'ULT', 4)`,
+  ).run();
+  d.prepare(
+    `INSERT INTO verse_merge_conflicts (book, resource, chapter, verse, action, reason, overwritten_version, detected_at, resolved_at, resolved_by, last_recorded_at)
+     VALUES ('EZK','ult',40,21,'source_attr_divergent','source_attr_ambiguous',NULL,100,150,30,100)`,
+  ).run();
+  upsertConflict(d, {
+    book: "EZK", resource: "ult", chapter: 40, verse: 21,
+    action: "source_attr_divergent", reason: "source_attr_ambiguous", overwrittenVersion: null,
+    now: 2000, bibleVersion: "ULT", observedVersion: 4,
+  });
+  const row = d.prepare(`SELECT * FROM verse_merge_conflicts WHERE book='EZK' AND chapter=40 AND verse=21`).get();
+  assert(row.resolved_at === null && row.resolved_by === null,
+    "matching observedVersion (no race) reactivates normally, unregressed from the pre-#507 behavior");
+}
+
+{
+  // Same race scenario, for 'keep_alignment_refused' — the other action the
+  // carve-out (and therefore the version guard) applies to.
+  const d = verseDb();
+  d.prepare(
+    `INSERT INTO verses (book, chapter, verse, bible_version, version) VALUES ('EZK', 41, 3, 'UST', 9)`,
+  ).run();
+  d.prepare(
+    `INSERT INTO verse_merge_conflicts (book, resource, chapter, verse, action, reason, overwritten_version, detected_at, resolved_at, resolved_by, last_recorded_at)
+     VALUES ('EZK','ust',41,3,'keep_alignment_refused','alignment_shrink',NULL,100,150,30,100)`,
+  ).run();
+  upsertConflict(d, {
+    book: "EZK", resource: "ust", chapter: 41, verse: 3,
+    action: "keep_alignment_refused", reason: "alignment_shrink", overwrittenVersion: null,
+    now: 2000, bibleVersion: "UST", observedVersion: 8,
+  });
+  const row = d.prepare(`SELECT * FROM verse_merge_conflicts WHERE book='EZK' AND chapter=41 AND verse=3`).get();
+  assert(row.resolved_at === 150 && row.resolved_by === 30,
+    "keep_alignment_refused: stale detection also withholds reactivation, preserving the fresh resolution");
+}
+
+{
+  // Same race scenario, for 'keep_ai_master' (#540 item 2) — the third action
+  // the reactivation carve-out (and therefore the version guard) applies to.
+  // Same no-CAS-race shape as the other two, so it must get the same protection.
+  const d = verseDb();
+  d.prepare(
+    `INSERT INTO verses (book, chapter, verse, bible_version, version) VALUES ('AMO', 4, 2, 'ULT', 6)`,
+  ).run();
+  d.prepare(
+    `INSERT INTO verse_merge_conflicts (book, resource, chapter, verse, action, reason, overwritten_version, detected_at, resolved_at, resolved_by, last_recorded_at)
+     VALUES ('AMO','ult',4,2,'keep_ai_master','both_changed_ai_master',NULL,100,150,30,100)`,
+  ).run();
+  upsertConflict(d, {
+    book: "AMO", resource: "ult", chapter: 4, verse: 2,
+    action: "keep_ai_master", reason: "both_changed_ai_master", overwrittenVersion: null,
+    now: 2000, bibleVersion: "ULT", observedVersion: 5,
+  });
+  const row = d.prepare(`SELECT * FROM verse_merge_conflicts WHERE book='AMO' AND chapter=4 AND verse=2`).get();
+  assert(row.resolved_at === 150 && row.resolved_by === 30,
+    "keep_ai_master: stale detection also withholds reactivation, preserving the fresh resolution");
 }
 
 {

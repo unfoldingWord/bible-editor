@@ -438,6 +438,50 @@ console.log("\n[#537 fallout: a GENUINE human edit after export still blocks cle
   eq(counts.merge_adopted, 1, "still adopts (master wins on both_changed by default), but AS a flagged conflict, not silently");
 }
 
+console.log("\n[keep_no_base collects an editor ref carrying the verse's CURRENT version (issue #544)]");
+{
+  // A genuinely human-edited verse (updated_by set, no AI-only edit_log entry)
+  // that differs from master, with NO edit_log row at all — so the merge
+  // ancestor is unrecoverable (base === null) and computeVerseMerge returns
+  // keep_no_base. This is the exact scenario the admin-only banner (#537) used
+  // to leave the owning translator with no notice at all.
+  const { env, sqlite } = freshEnv();
+  sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (9, 900, 'translator9')`).run();
+  sqlite
+    .prepare(
+      `INSERT INTO verses (book, chapter, verse, verse_end, bible_version, content_json, plain_text, version, updated_by)
+       VALUES (?, ?, ?, NULL, ?, ?, ?, 5, 9)`,
+    )
+    .run(BOOK, 7, 3, VERSION, contentJson("app's own text"), "app's own text");
+
+  const cutoff = { confirmedAt: Math.floor(Date.now() / 1000), editId: null };
+  const counts = await applyVerseRowsForTest(
+    env,
+    BOOK,
+    VERSION,
+    [verse(7, 3, "master's differing text")],
+    null,
+    cutoff,
+    false,
+  );
+
+  eq(counts.merge_no_base, 1, "counted as keep_no_base — no ancestor recoverable, ours != theirs");
+  eq(counts.merge_no_base_refs, ["7:3"], "the (capped, display) ref names the verse");
+  eq(
+    counts.merge_no_base_editor_refs,
+    [{ chapter: 7, verse: 3, version: 5 }],
+    "the (uncapped, editor-attribution) ref carries the verse's CURRENT D1 version — not overwritten, so no version bump",
+  );
+
+  // The verse itself was never touched — keep_no_base's whole point is that D1
+  // is kept exactly as it was.
+  const row = sqlite
+    .prepare("SELECT content_json, version FROM verses WHERE book = ? AND chapter = ? AND verse = ?")
+    .all(BOOK, 7, 3)[0];
+  eq(JSON.parse(row.content_json).verseObjects[0].text, "app's own text", "D1's content is untouched");
+  eq(row.version, 5, "D1's version is untouched — nothing was written");
+}
+
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed`);
   process.exit(1);

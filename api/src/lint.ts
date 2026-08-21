@@ -172,11 +172,24 @@ export function lintTnRows(rows: TnRow[]): LintIssue[] {
     for (const p of textFieldProblems(note)) {
       issues.push({ check: p.check, bucket: "flag", ref, rowId: r.id, message: p.message });
     }
-    // Workflow-only review flag for adapted/migrated notes (review_kind set).
-    // Not a DCS check — surfaces the human-verify queue in the same chip.
-    // Use chapter:verse for the ref (ref_raw can be a stale/adapted range, and
-    // jump-to-note loads the chapter parsed from this ref).
-    if (r.review_kind) {
+    // Issue #544: a keep_no_base row (no ancestor recoverable, so the nightly
+    // merge couldn't check it against a Door43-side edit) gets its own check
+    // label — it must not share "Adapted note — verify" (a different meaning:
+    // a migrated/adapted note) or say anything was overwritten, since nothing
+    // was. Checked BEFORE the generic review_kind fallback below.
+    if (r.review_kind === "merge_no_base") {
+      issues.push({
+        check: "Unmerged Door43 edit — verify",
+        bucket: "flag",
+        ref: `${r.chapter}:${r.verse}`,
+        rowId: r.id,
+        message: r.review_reason ?? "No ancestor was recoverable to merge this row against Door43 — verify it.",
+      });
+    } else if (r.review_kind) {
+      // Workflow-only review flag for adapted/migrated notes (review_kind set).
+      // Not a DCS check — surfaces the human-verify queue in the same chip.
+      // Use chapter:verse for the ref (ref_raw can be a stale/adapted range, and
+      // jump-to-note loads the chapter parsed from this ref).
       issues.push({
         check: reviewFlagTitle(r.review_kind, "Adapted note — verify"),
         bucket: "flag",
@@ -209,11 +222,22 @@ export function lintTqRows(rows: TqRow[]): LintIssue[] {
         issues.push({ check: p.check, bucket: "flag", ref, rowId: r.id, message: p.message });
       }
     }
-    // Workflow-only review flag (mirror lintTnRows): set when the nightly
-    // Door43->D1 three-way merge adopted a maintainer's edit that conflicted
-    // with an app-side edit (tsvMerge.ts). Surfaces in the cleanup chip; the
-    // overwritten value is recoverable from row history.
-    if (r.review_kind) {
+    // Issue #544: see lintTnRows' matching branch — a keep_no_base row must not
+    // reuse "Merged Door43 edit — verify" (that label promises a merge landed;
+    // here nothing did) and must not say anything was overwritten.
+    if (r.review_kind === "merge_no_base") {
+      issues.push({
+        check: "Unmerged Door43 edit — verify",
+        bucket: "flag",
+        ref,
+        rowId: r.id,
+        message: r.review_reason ?? "No ancestor was recoverable to merge this row against Door43 — verify it.",
+      });
+    } else if (r.review_kind) {
+      // Workflow-only review flag (mirror lintTnRows): set when the nightly
+      // Door43->D1 three-way merge adopted a maintainer's edit that conflicted
+      // with an app-side edit (tsvMerge.ts). Surfaces in the cleanup chip; the
+      // overwritten value is recoverable from row history.
       issues.push({
         check: reviewFlagTitle(r.review_kind, "Merged Door43 edit — verify"),
         bucket: "flag",
@@ -239,9 +263,18 @@ export function lintTwlRows(rows: TwlRow[]): LintIssue[] {
     if (isBlankRequired(r.tw_link)) {
       issues.push({ check: "Empty TWLink", bucket: "flag", ref, rowId: r.id, message: "Empty TWLink — DCS only warns, so this row publishes with no link on the next export. Add a translationWords link or delete the row." });
     }
-    // Workflow-only review flag (mirror lintTnRows) — a merged Door43 edit that
-    // conflicted with an app-side edit (tsvMerge.ts).
-    if (r.review_kind) {
+    // Issue #544: see lintTnRows' matching branch.
+    if (r.review_kind === "merge_no_base") {
+      issues.push({
+        check: "Unmerged Door43 edit — verify",
+        bucket: "flag",
+        ref,
+        rowId: r.id,
+        message: r.review_reason ?? "No ancestor was recoverable to merge this row against Door43 — verify it.",
+      });
+    } else if (r.review_kind) {
+      // Workflow-only review flag (mirror lintTnRows) — a merged Door43 edit that
+      // conflicted with an app-side edit (tsvMerge.ts).
       issues.push({
         check: reviewFlagTitle(r.review_kind, "Merged Door43 edit — verify"),
         bucket: "flag",

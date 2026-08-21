@@ -37,6 +37,7 @@ const SQLITE_FILES = new Set([
   "src/lockOverrideAlert.test.mjs",
   "src/tombstoneReclaim.test.mjs",
   "src/aiRowDiffGate.test.mjs",
+  "src/masterLineagePersist.test.mjs",
 ]);
 
 const EXTRA_IMPORTS = new Map([
@@ -44,6 +45,7 @@ const EXTRA_IMPORTS = new Map([
   ["src/applyVerseRows.test.mjs", "./src/tsResolveHook.mjs"],
   ["src/tombstoneReclaim.test.mjs", "./src/tsResolveHook.mjs"],
   ["src/aiRowDiffGate.test.mjs", "./src/tsResolveHook.mjs"],
+  ["src/masterLineagePersist.test.mjs", "./src/tsResolveHook.mjs"],
 ]);
 
 function findTestFiles(dir) {

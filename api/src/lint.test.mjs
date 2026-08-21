@@ -94,6 +94,50 @@ t("no review_kind → no adapted-note flag", () => {
   assert.equal(lintTnRows([tn({ review_kind: null })]).filter((x) => x.check === "Adapted note — verify").length, 0);
 });
 
+// Issue #544: review_kind='merge_no_base' (the nightly merge could not
+// recover an ancestor for this row) must get its OWN check label — never the
+// "Adapted note — verify" / "Merged Door43 edit — verify" labels used by other
+// review_kind values, which both promise something happened that did not
+// here — and its message (default or override) must never claim an overwrite.
+t("review_kind='merge_no_base' → its own check label, not 'Adapted note'", () => {
+  const i = lintTnRows([tn({ chapter: 4, verse: 2, id: "nb01", review_kind: "merge_no_base" })]);
+  const flags = i.filter((x) => x.check === "Unmerged Door43 edit — verify");
+  assert.equal(flags.length, 1);
+  assert.equal(flags[0].bucket, "flag");
+  assert.equal(flags[0].ref, "4:2");
+  assert.equal(flags[0].rowId, "nb01");
+  assert.equal(i.some((x) => x.check === "Adapted note — verify"), false, "does not also fire the generic label");
+});
+t("review_kind='merge_no_base' default message never claims an overwrite (tn)", () => {
+  const i = lintTnRows([tn({ review_kind: "merge_no_base" })]);
+  const flag = i.find((x) => x.check === "Unmerged Door43 edit — verify");
+  assert.ok(flag);
+  assert.equal(/overwritten|overwrote|overwrites/i.test(flag.message), false);
+});
+t("review_kind='merge_no_base' honors an explicit review_reason (tn)", () => {
+  const i = lintTnRows([tn({ review_kind: "merge_no_base", review_reason: "custom reason" })]);
+  const flag = i.find((x) => x.check === "Unmerged Door43 edit — verify");
+  assert.equal(flag.message, "custom reason");
+});
+t("review_kind='merge_no_base' → its own check label, not 'Merged Door43 edit' (tq)", () => {
+  const i = lintTqRows([tq({ chapter: 6, verse: 5, id: "nb02", review_kind: "merge_no_base" })]);
+  const flags = i.filter((x) => x.check === "Unmerged Door43 edit — verify");
+  assert.equal(flags.length, 1);
+  assert.equal(flags[0].ref, "6:5");
+  assert.equal(i.some((x) => x.check === "Merged Door43 edit — verify"), false);
+});
+t("review_kind='merge_conflict' still gets the generic tq label (unaffected)", () => {
+  const i = lintTqRows([tq({ review_kind: "merge_conflict", review_reason: "a merged edit" })]);
+  assert.equal(i.some((x) => x.check === "Merged Door43 edit — verify" && x.message === "a merged edit"), true);
+});
+t("review_kind='merge_no_base' → its own check label, not 'Merged Door43 edit' (twl)", () => {
+  const i = lintTwlRows([twl({ chapter: 2, verse: 8, id: "nb03", review_kind: "merge_no_base" })]);
+  const flags = i.filter((x) => x.check === "Unmerged Door43 edit — verify");
+  assert.equal(flags.length, 1);
+  assert.equal(flags[0].ref, "2:8");
+  assert.equal(i.some((x) => x.check === "Merged Door43 edit — verify"), false);
+});
+
 // Build content_json from REAL usfm-js output so the test exercises the actual
 // node shape (a balanced footnote is one `{tag:"f", endTag:"f*"}` node — the
 // close lives in endTag, not as `\f*` text; the original text-node tests missed
