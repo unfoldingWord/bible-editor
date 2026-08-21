@@ -1283,7 +1283,11 @@ const HINT_EXPANSION_SOURCE = "hint_expansion";
 // caller should fall through to applyTnInsert. Scoped to the job's chapter
 // range so an id collision outside that range (vanishingly rare with 4-char
 // random ids, but possible) doesn't accidentally clobber an unrelated row.
-async function applyTnHintExpansionIfMatch(
+// Exported for the direct regression test in pipelineImport.test.mjs, which
+// asserts the edit_log payload matches only the columns the UPDATE writes —
+// same rationale as tnPayload/tqPayload's export above. Not intended as a
+// public API beyond that.
+export async function applyTnHintExpansionIfMatch(
   env: Env,
   p: PendingImportRow,
   job: ImportContext,
@@ -1304,6 +1308,22 @@ async function applyTnHintExpansionIfMatch(
 
   const now = Math.floor(Date.now() / 1000);
   const newVersion = stub.version + 1;
+  // What the UPDATE below actually writes. Deliberately excludes id/book
+  // (identifiers, not content) and chapter/verse (the UPDATE leaves them
+  // untouched — a hint expansion never re-anchors the row). Logging the raw
+  // AI proposal instead would record a reference the row never held; two
+  // replayers of this payload — the row's version-history endpoint and the
+  // nightly sync's reference-ancestor fold (foldTsvRefBase) — would then see
+  // a chapter/verse the write never produced. Same shape as the tq apply
+  // path's `patch` object below.
+  const patch = {
+    ref_raw: (payload.ref_raw as string | null | undefined) ?? null,
+    tags: (payload.tags as string | null | undefined) ?? null,
+    support_reference: (payload.support_reference as string | null | undefined) ?? null,
+    quote: (payload.quote as string | null | undefined) ?? null,
+    occurrence: (payload.occurrence as number | null | undefined) ?? null,
+    note: (payload.note as string | null | undefined) ?? null,
+  };
   const res = await env.DB.batch([
     env.DB
       .prepare(
@@ -1337,12 +1357,12 @@ async function applyTnHintExpansionIfMatch(
             AND hint = 1 AND version = ?10`,
       )
       .bind(
-        (payload.quote as string | null | undefined) ?? null,
-        (payload.support_reference as string | null | undefined) ?? null,
-        (payload.note as string | null | undefined) ?? null,
-        (payload.occurrence as number | null | undefined) ?? null,
-        (payload.ref_raw as string | null | undefined) ?? null,
-        (payload.tags as string | null | undefined) ?? null,
+        patch.quote,
+        patch.support_reference,
+        patch.note,
+        patch.occurrence,
+        patch.ref_raw,
+        patch.tags,
         now,
         stub.id,
         job.book,
@@ -1370,7 +1390,7 @@ async function applyTnHintExpansionIfMatch(
         userId,
         stub.version,
         newVersion,
-        JSON.stringify(payload),
+        JSON.stringify(patch),
         HINT_EXPANSION_SOURCE,
         now,
       ),
@@ -1586,7 +1606,14 @@ async function applyTqUpsert(
                (kind, row_key, book, user_id, prev_version, new_version, action, payload_json, source)
              VALUES ('tq', ?1, ?2, ?3, ?4, ?5, 'update', ?6, ?7)`,
           )
-          .bind(id, p.book, userId, existing.version, newVersion, JSON.stringify(patch), AI_SOURCE),
+          // `verse` is written by the UPDATE above but was missing from the
+          // logged patch, so edit_log recorded a NEW ref_raw beside a STALE
+          // verse — an internally inconsistent snapshot. Version history
+          // replays these payloads, and so does the sync's reference-ancestor
+          // fold (tsvMerge.ts's foldTsvRefBase), where a torn reference is worse
+          // than an absent one: absence withholds, wrongness can let an export
+          // overwrite Door43. An audit row must record what was written.
+          .bind(id, p.book, userId, existing.version, newVersion, JSON.stringify({ ...patch, verse: p.verse }), AI_SOURCE),
         env.DB
           .prepare(
             `UPDATE pending_imports SET accepted_at = unixepoch(), accepted_by = ?2 WHERE id = ?1`,

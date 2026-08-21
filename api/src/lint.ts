@@ -8,14 +8,25 @@
 //   TN: unmatched/mismatched square brackets (13), an Alternate-translation label
 //       with no sentence terminator before it (12), a malformed Reference (6), a
 //       malformed rc:// SupportReference (7).
-//   USFM: unbalanced \f / \f* footnotes (6), missing verses (5).
+//   USFM: unbalanced \f / \f* footnotes (6), missing verses (5), unmatched
+//       curly quotation marks (“ ”).
 // The MECHANICAL checks (formatting, trailing \n, straight quotes, label spacing,
 // reference order, ids, occurrence) are auto-fixed at export and are NOT linted
 // here. See docs/export-validation-cleanup.md.
+//
+// A second family of checks (issue #438) is hand-ported from
+// unfoldingWord/uw-content-validation — NOT taken as a dependency (bundle-size /
+// Worker-compat risk); its check inventory was audited and only the checks an
+// editor can fix in-app were carried over: paired/unpaired punctuation across a
+// book, straight quotes, invisible characters, doubled spaces/punctuation, and
+// punctuation-spacing problems. All are bucket `flag` — none of these block a
+// DCS push, they are copy-quality problems a proofreader wants surfaced. Checks
+// that only make sense against raw USFM markup (marker structure, attributes,
+// versification) are deliberately NOT ported — those are better fixed on DCS.
 
 import type { TnRow, TqRow, TwlRow, VerseRow } from "./types";
 import { parseVerseContentJson } from "./contentJson.ts";
-import { isTsMilestone } from "./importParsers.ts";
+import { extractPlainText, isTsMilestone } from "./importParsers.ts";
 import { parseRefOrderKey } from "./tsvFormat.ts";
 
 export type IssueBucket = "flag" | "escalate";
@@ -100,6 +111,30 @@ function altLabelProblems(note: string): string[] {
   return out;
 }
 
+// The cleanup chip's title for a workflow review flag. It has to be derived from
+// `review_kind`, because the outcomes it covers say OPPOSITE things and the chip
+// title is the first — often the only — line a translator reads:
+//   merge_conflict — Door43's value replaced theirs.
+//   merge_kept     — theirs was kept over Door43's, and the next export
+//                    publishes it there (#540 item 2).
+//   ref_moved      — nothing was merged at all; the two sides disagree about
+//                    where the row belongs.
+// Hard-coding "Merged Door43 edit" for every flag, as tq/twl did, told a reader
+// of the last two the reverse of what happened. `fallback` preserves each kind's
+// pre-existing wording for a flag with no mapping (tn's older "Adapted note").
+export function reviewFlagTitle(reviewKind: string | null | undefined, fallback: string): string {
+  switch (reviewKind) {
+    case "merge_conflict":
+      return "Merged Door43 edit — verify";
+    case "merge_kept":
+      return "Kept over Door43 — verify";
+    case "ref_moved":
+      return "Reference differs from Door43 — verify";
+    default:
+      return fallback;
+  }
+}
+
 export function lintTnRows(rows: TnRow[]): LintIssue[] {
   const issues: LintIssue[] = [];
   for (const r of rows) {
@@ -134,13 +169,16 @@ export function lintTnRows(rows: TnRow[]): LintIssue[] {
     for (const msg of altLabelProblems(note)) {
       issues.push({ check: "12. Alternate translation Label", bucket: "flag", ref, rowId: r.id, message: msg });
     }
+    for (const p of textFieldProblems(note)) {
+      issues.push({ check: p.check, bucket: "flag", ref, rowId: r.id, message: p.message });
+    }
     // Workflow-only review flag for adapted/migrated notes (review_kind set).
     // Not a DCS check — surfaces the human-verify queue in the same chip.
     // Use chapter:verse for the ref (ref_raw can be a stale/adapted range, and
     // jump-to-note loads the chapter parsed from this ref).
     if (r.review_kind) {
       issues.push({
-        check: "Adapted note — verify",
+        check: reviewFlagTitle(r.review_kind, "Adapted note — verify"),
         bucket: "flag",
         ref: `${r.chapter}:${r.verse}`,
         rowId: r.id,
@@ -166,13 +204,18 @@ export function lintTqRows(rows: TqRow[]): LintIssue[] {
     if (isBlankRequired(r.response)) {
       issues.push({ check: "Empty response", bucket: "flag", ref, rowId: r.id, message: "Empty response — DCS only warns, so this row publishes blank on the next export. Add a response or delete the row." });
     }
+    for (const field of [r.question, r.response]) {
+      for (const p of textFieldProblems(field ?? "")) {
+        issues.push({ check: p.check, bucket: "flag", ref, rowId: r.id, message: p.message });
+      }
+    }
     // Workflow-only review flag (mirror lintTnRows): set when the nightly
     // Door43->D1 three-way merge adopted a maintainer's edit that conflicted
     // with an app-side edit (tsvMerge.ts). Surfaces in the cleanup chip; the
     // overwritten value is recoverable from row history.
     if (r.review_kind) {
       issues.push({
-        check: "Merged Door43 edit — verify",
+        check: reviewFlagTitle(r.review_kind, "Merged Door43 edit — verify"),
         bucket: "flag",
         ref,
         rowId: r.id,
@@ -200,7 +243,7 @@ export function lintTwlRows(rows: TwlRow[]): LintIssue[] {
     // conflicted with an app-side edit (tsvMerge.ts).
     if (r.review_kind) {
       issues.push({
-        check: "Merged Door43 edit — verify",
+        check: reviewFlagTitle(r.review_kind, "Merged Door43 edit — verify"),
         bucket: "flag",
         ref,
         rowId: r.id,
@@ -633,12 +676,83 @@ export function lintChapterOpeningMarkers(verses: VerseRow[]): LintIssue[] {
   return issues;
 }
 
-// USFM (ult/ust) integrity lint over the stored verse rows: unbalanced footnotes
-// and joiner-glued alignment milestones, per verse. (Verse-coverage / chapter-
-// count are guarded by the export shrink guard and validated whole-file
-// downstream; not duplicated here.)
-export function lintUsfmVerses(verses: VerseRow[]): LintIssue[] {
+// Port of the "matched open/closed quotation marks" judgement call named in
+// #438 — narrowed, after two review rounds on PR #483, to the one claim that
+// is actually provable from plain text: a CLOSING curly quote (”) with no
+// opening quote (“) anywhere earlier in the book. Deliberately narrow in two
+// more ways: straight `"` is auto-normalized to curly at export (see
+// docs/export-validation-cleanup.md) so it is not linted, and curly single
+// quotes (‘ ’) double as apostrophes inside words — a naive pairing check
+// cannot tell "don't" from a genuine unmatched single quote.
+//
+// This deliberately does NOT flag a leftover, never-closed opening quote, and
+// deliberately runs BOOK-wide rather than resetting at any boundary. Two real
+// ULT/UST conventions make "every opener needs a closer" unprovable from
+// plain text alone:
+//   - Continuation openers: multi-paragraph dialogue re-opens each paragraph
+//     with “ and closes only the final one ("“first paragraph…" "“second
+//     paragraph…”") — usfm-js's plain text has no paragraph markers left in
+//     it (extractPlainText strips them), so the checker cannot tell a
+//     continuation opener from a genuinely unclosed one.
+//   - Cross-chapter spans: quoted speech can open near the end of one
+//     chapter and close in the next — chapter breaks do not terminate a
+//     quotation, so per-chapter scoping (tried and reverted) double-flagged
+//     ordinary text at every chapter boundary too.
+// A running, never-negative counter sidesteps both: it only ever objects to a
+// ” for which there is provably no “ anywhere before it — true regardless of
+// how many paragraphs or chapters separate them — and silently accepts any
+// number of unconsumed opens. `entries` is sorted defensively (chapter, then
+// verse) rather than trusting caller order, since a mis-ordered scan could
+// consume a closer against an opener that doesn't actually precede it.
+function quoteIssues(verses: VerseRow[]): LintIssue[] {
+  const entries: Array<{ ref: string; chapter: number; verse: number; text: string }> = [];
+  for (const v of verses) {
+    if (v.verse === 0) continue;
+    let parsed: unknown;
+    try {
+      parsed = parseVerseContentJson(v);
+    } catch {
+      continue;
+    }
+    const vos = (parsed as { verseObjects?: unknown[] })?.verseObjects;
+    if (!Array.isArray(vos)) continue;
+    entries.push({ ref: `${v.chapter}:${v.verse}`, chapter: v.chapter, verse: v.verse, text: extractPlainText(parsed) });
+  }
+  entries.sort((a, b) => a.chapter - b.chapter || a.verse - b.verse);
+
   const issues: LintIssue[] = [];
+  let openCount = 0;
+  for (const e of entries) {
+    for (let i = 0; i < e.text.length; i++) {
+      const ch = e.text[i];
+      if (ch === "“") {
+        openCount++;
+      } else if (ch === "”") {
+        if (openCount === 0) {
+          issues.push({
+            check: "Quotation Mark",
+            bucket: "flag",
+            ref: e.ref,
+            message: `Closing quote '”' at character ${i + 1} has no opening quote anywhere earlier in the book.`,
+          });
+        } else {
+          openCount--;
+        }
+      }
+    }
+  }
+  return issues;
+}
+
+// USFM (ult/ust) integrity lint over the stored verse rows: unbalanced footnotes,
+// joiner-glued alignment milestones, and unmatched curly quotation marks.
+// Footnotes/glued-milestones/reused-tokens are genuinely per-verse; quotation
+// marks are not (see quoteIssues) and are checked once across the whole call,
+// not inside this per-verse loop. (Verse-coverage / chapter-count are guarded
+// by the export shrink guard and validated whole-file downstream; not
+// duplicated here.)
+export function lintUsfmVerses(verses: VerseRow[]): LintIssue[] {
+  const issues: LintIssue[] = [...quoteIssues(verses)];
   for (const v of verses) {
     if (v.verse === 0) continue;
     let parsed: unknown;
@@ -677,6 +791,379 @@ export function lintUsfmVerses(verses: VerseRow[]): LintIssue[] {
     }
   }
   return issues;
+}
+
+// ---------------------------------------------------------------------------
+// Text-quality checks ported from uw-content-validation (issue #438). These run
+// over the PROSE a reader sees, not the USFM markup — flattenVerseProse below
+// is what defines "prose". Everything here is bucket `flag`: copy-quality
+// problems for a proofreader, none of which block a DCS push.
+// ---------------------------------------------------------------------------
+
+// Subtrees that carry no reader-facing verse prose. Footnote/cross-ref bodies
+// live in the node's `content` STRING (not children), so skipping the node
+// skips the body; they are excluded because footnotes quote source-language
+// text and references ("1:2") that would false-positive the prose checks.
+const PROSE_EXCLUDED_TAGS: ReadonlySet<string> = new Set(["f", "x", "fe", "ef", "ex", "rem"]);
+
+// Flatten a verse's parsed nodes to the prose a reader sees: word/text node
+// text in document order, footnote/cross-ref subtrees dropped, alignment
+// milestones transparent (their `content` is SOURCE text and never included).
+// Markers can carry text (usfm-js parks an opening quote on the marker node —
+// see the usfm-js quirks note in CLAUDE.md), so `text` is taken from every
+// non-excluded node, not just word/text nodes.
+//
+// Break markers emit TWO distinct separators, and lintPairedPunctuation's
+// continuation rule depends on the distinction (measured on en_ult ISA 46: the
+// stanza re-opening “ sits after `\b`, while ordinary poetry lines are `\q1`s):
+//   'U+2029' (paragraph separator) — paragraph-type markers (\p, \b, \m, …) and
+//             section heads: positions where an English continuation quote may
+//             legitimately re-open.
+//   '\n'    — poetry line markers (\q1, \q2, …): a mere line break, NOT a
+//             continuation position.
+// Both count as \s for the spacing checks, so a line boundary never glues two
+// words into a fake "punctuation not followed by space" hit.
+export function flattenVerseProse(nodes: unknown[]): string {
+  let out = "";
+  // Collapse whitespace ACROSS node boundaries: a milestone's inner trailing
+  // space plus the following inter-line text node both flatten to spaces, but
+  // serialize back to ONE rendered space (measured on JER 23:37 \u2014 raw chapter
+  // 23 has zero doubled spaces, the naive flatten reported 17 across JER). A
+  // GENUINE doubled space lives inside a single text node and is preserved.
+  const append = (s: string): void => {
+    if (!s) return;
+    if (out !== "" && /\s$/.test(out)) s = s.replace(/^ +/, "");
+    out += s;
+  };
+  const walk = (list: unknown[]): void => {
+    for (const node of list) {
+      if (!node || typeof node !== "object") continue;
+      const o = node as Record<string, unknown>;
+      const tag = typeof o["tag"] === "string" ? (o["tag"] as string) : "";
+      if (PROSE_EXCLUDED_TAGS.has(tag)) continue;
+      const type = o["type"];
+      if (type === "paragraph" || type === "section") out += "\u2029";
+      else if (type === "quote") out += "\n";
+      const text = o["text"];
+      if (typeof text === "string") append(text);
+      const children = o["children"];
+      if (Array.isArray(children)) walk(children);
+    }
+  };
+  walk(nodes);
+  return out;
+}
+
+// Short context excerpt around a character index, with the invisible characters
+// made visible (uw-content-validation's display convention: zero-width → ‡,
+// no-break space → ⍽) and line breaks flattened so the excerpt stays one line.
+function excerptAround(text: string, index: number, radius = 12): string {
+  const start = Math.max(0, index - radius);
+  const end = Math.min(text.length, index + radius);
+  const raw = (start > 0 ? "…" : "") + text.slice(start, end) + (end < text.length ? "…" : "");
+  return raw
+    .replace(/[\u200B\u2060\u200D]/g, "‡")
+    .replace(/[\u00A0\u202F]/g, "⍽")
+    // 1:1 replacement (NOT a run-collapse) so a doubled space stays visible
+    // in the excerpt of the doubled-space message.
+    .replace(/[\n\r\t\u2028\u2029]/g, " ");
+}
+
+const INVISIBLE_CHARS: ReadonlyArray<{ ch: string; name: string; hebrewLegal: boolean }> = [
+  // hebrewLegal: U+2060/U+200D legitimately sit INSIDE one UHB word (see
+  // contentHasGlueJoiner above), so when a note quotes a Hebrew word they are
+  // not defects — exempted when either neighbour is Hebrew/Greek.
+  { ch: "\u200B", name: "zero-width space", hebrewLegal: false },
+  { ch: "\u00A0", name: "no-break space", hebrewLegal: false },
+  { ch: "\u202F", name: "narrow no-break space", hebrewLegal: false },
+  { ch: "\u2060", name: "word joiner", hebrewLegal: true },
+  { ch: "\u200D", name: "zero-width joiner", hebrewLegal: true },
+];
+
+function isHebrewOrGreekChar(ch: string | undefined): boolean {
+  if (!ch) return false;
+  const cp = ch.codePointAt(0) ?? 0;
+  return (cp >= 0x0590 && cp <= 0x05ff) || (cp >= 0x0370 && cp <= 0x03ff) || (cp >= 0x1f00 && cp <= 0x1fff);
+}
+
+// One message per invisible-character KIND present (not per occurrence — a
+// verse pasted with 30 NBSPs is one problem to fix, not 30 rows in the feed).
+function invisibleCharProblems(text: string, exemptHebrewJoiners: boolean): string[] {
+  const out: string[] = [];
+  for (const { ch, name, hebrewLegal } of INVISIBLE_CHARS) {
+    let count = 0;
+    let first = -1;
+    for (let i = text.indexOf(ch); i !== -1; i = text.indexOf(ch, i + 1)) {
+      if (exemptHebrewJoiners && hebrewLegal && (isHebrewOrGreekChar(text[i - 1]) || isHebrewOrGreekChar(text[i + 1]))) {
+        continue;
+      }
+      count++;
+      if (first === -1) first = i;
+    }
+    if (count > 0) {
+      out.push(
+        `${count} invisible ${name}${count > 1 ? "s" : ""} (shown as ${ch === "\u00A0" || ch === "\u202F" ? "⍽" : "‡"}): “${excerptAround(text, first)}” — retype the affected words or replace with regular spaces.`,
+      );
+    }
+  }
+  return out;
+}
+
+// Doubled sentence punctuation. Quotes are NOT in this list — a stray doubled
+// closer is reported (with better wording) by lintPairedPunctuation. '..' gets
+// the ellipsis hint from uw-content-validation.
+const DOUBLED_PUNCT_CHARS = ",.;:!?";
+function doubledPunctProblems(text: string): string[] {
+  const out: string[] = [];
+  for (const ch of DOUBLED_PUNCT_CHARS) {
+    for (let i = text.indexOf(ch + ch); i !== -1; i = text.indexOf(ch + ch, i + 2)) {
+      const hint = ch === "." ? " (an ellipsis should be the single … character)" : "";
+      out.push(`doubled '${ch}': “${excerptAround(text, i)}”${hint} — remove the extra one.`);
+    }
+  }
+  return out;
+}
+
+// Port of the BAD_CHARACTER_REGEXES core from uw-content-validation
+// text-handling-functions.js, adapted to run over flattened prose: the
+// original allows only ' ' after the mark; prose here contains line-break
+// separators, so \s replaces the literal space. Closing quotes / brackets /
+// dashes stay allowed exactly as upstream. ':' and ',' allow a following
+// digit (times, refs, "1,000"); '.' also allows '.', '/' and digits. A
+// following '}' is allowed everywhere — ULT/UST wrap implied text in { }, so
+// "{that is,}" is normal (measured: the brace convention was 780+ of the 809
+// hits in the first corpus scan).
+const PUNCT_SPACING_RES: ReadonlyArray<{ label: string; re: RegExp }> = [
+  { label: "'?' not followed by a space or closing quote", re: /[?](?![\s"”'’)\]}!—–]|$)/g },
+  { label: "'!' not followed by a space or closing quote", re: /[!](?![\s"”'’)\]}—–]|$)/g },
+  { label: "',' not followed by a space or digit", re: /[,](?![\s0-9"”'’}—–]|$)/g },
+  { label: "':' not followed by a space or digit", re: /[:](?![\s/0-9"”}—–]|$)/g },
+  { label: "';' not followed by a space or closing quote", re: /[;](?![\s"”'’}—–]|$)/g },
+  { label: "'.' not followed by a space, digit, or closing quote", re: /[.](?![\s./0-9"”'’)\]}—–]|$)/g },
+];
+// Space directly before closing/sentence punctuation ("word ," / "word ”").
+const SPACE_BEFORE_PUNCT_RE = / +([,.;:?!’”)\]}])/g;
+
+function punctSpacingProblems(text: string): string[] {
+  const out: string[] = [];
+  for (const { label, re } of PUNCT_SPACING_RES) {
+    for (const m of text.matchAll(re)) {
+      out.push(`${label}: “${excerptAround(text, m.index ?? 0)}” — add the missing space or fix the stray character.`);
+    }
+  }
+  for (const m of text.matchAll(SPACE_BEFORE_PUNCT_RE)) {
+    const i = m.index ?? 0;
+    // Adjacent closing quotes are conventionally space-separated (JER 27:11
+    // ULT ends `.’ ” ’ ” ”`) — a spaced closer PRECEDED by another closer is
+    // that convention, not an error.
+    if ((m[1] === "’" || m[1] === "”") && /[’”'"]/.test(text[i - 1] ?? "")) continue;
+    out.push(`space before '${m[1]}': “${excerptAround(text, i)}” — remove the space.`);
+  }
+  return out;
+}
+
+function doubledSpaceProblems(text: string): string[] {
+  const out: string[] = [];
+  for (const m of text.matchAll(/ {2,}/g)) {
+    const i = m.index ?? 0;
+    // Line-leading runs are indentation, not a doubled space the reader sees —
+    // markdown note lists indent nested items with leading spaces (measured:
+    // "\n  - item" indentation was nearly all of the 1459 hits in the first
+    // corpus scan).
+    const before = text[i - 1];
+    if (i === 0 || before === "\n" || before === "\u2029") continue;
+    out.push(`doubled space: “${excerptAround(text, i)}” — collapse to one space.`);
+  }
+  return out;
+}
+
+// Straight quotes in verse prose. The en resources use typographic marks
+// exclusively (“ ” ‘ ’ and the ’ apostrophe), so a straight mark is a typo.
+function straightQuoteProblems(text: string): string[] {
+  const out: string[] = [];
+  for (const m of text.matchAll(/["']/g)) {
+    const ch = m[0];
+    const wanted = ch === '"' ? "“ or ”" : "‘, ’, or the apostrophe ’";
+    out.push(`straight quote (${ch}): “${excerptAround(text, m.index ?? 0)}” — replace with ${wanted}.`);
+  }
+  return out;
+}
+
+// Per-verse prose quality checks (straight quotes, invisible characters,
+// doubled spaces/punctuation, punctuation spacing). Pair balance is NOT here —
+// quotations legitimately span verses and chapters, so lintPairedPunctuation
+// owns that book-wide.
+export function lintVerseTextQuality(verses: VerseRow[]): LintIssue[] {
+  const issues: LintIssue[] = [];
+  for (const v of verses) {
+    if (v.verse === 0) continue;
+    const prose = flattenVerseProse(verseObjectsOf(v));
+    if (!prose) continue;
+    const ref = `${v.chapter}:${v.verse}`;
+    const push = (check: string, messages: string[]): void => {
+      for (const message of messages) issues.push({ check, bucket: "flag", ref, message });
+    };
+    push("Straight quote", straightQuoteProblems(prose));
+    push("Invisible character", invisibleCharProblems(prose, false));
+    push("Doubled space", doubledSpaceProblems(prose));
+    push("Doubled punctuation", doubledPunctProblems(prose));
+    push("Punctuation spacing", punctSpacingProblems(prose));
+  }
+  return issues;
+}
+
+// Paired punctuation across the WHOLE BOOK, in verse order — the
+// uw-content-validation matched-pairs check (its plain-text nesting scan),
+// re-anchored to per-verse refs so the feed is clickable. Book-wide because
+// quotations legitimately span verses and chapters; per-verse counting would
+// flag half the direct speech in scripture.
+//
+// Each pair gets its own INDEPENDENT stack (no cross-pair nesting check): a
+// strict single-stack nesting scan reports one real error as a cascade of
+// confusing mismatches, and "( spanning a ” boundary" style interleave is not
+// reliably an error in typography. Same-mark nesting (“ inside “ via an inner
+// ‘ level, Jeremiah-style) is handled naturally by pushing every opener.
+//
+// English continuation convention: a multi-paragraph quotation re-opens “ at
+// each paragraph start WITHOUT closing the previous one, and one final ” closes
+// the lot. An opener at line start while the same mark is already open is
+// therefore treated as a continuation and NOT pushed. This can hide a real
+// unclosed “ that happens to precede a paragraph-initial “ — accepted; the
+// alternative flags every multi-paragraph speech in the book.
+//
+// Single quotes: ’ doubles as the apostrophe, so a ’ with no ‘ open is NEVER
+// flagged, and a possessive ’ can silently close a real ‘ (false negative,
+// accepted — this mirrors uw-content-validation, which only reports ‘ excess).
+const PAIRED_MARKS: ReadonlyArray<{ open: string; close: string; name: string; apostropheAmbiguous?: boolean }> = [
+  { open: "“", close: "”", name: "double quotation mark" },
+  { open: "‘", close: "’", name: "single quotation mark", apostropheAmbiguous: true },
+  { open: "«", close: "»", name: "guillemet" },
+  { open: "‹", close: "›", name: "single guillemet" },
+  { open: "(", close: ")", name: "parenthesis" },
+  { open: "[", close: "]", name: "square bracket" },
+  { open: "{", close: "}", name: "brace" },
+];
+
+export function lintPairedPunctuation(verses: VerseRow[]): LintIssue[] {
+  const issues: LintIssue[] = [];
+  const sorted = [...verses].sort((a, b) => a.chapter - b.chapter || a.verse - b.verse);
+  type Open = { ref: string; excerpt: string };
+  const stacks = new Map<string, Open[]>();
+  for (const { open } of PAIRED_MARKS) stacks.set(open, []);
+  // True while only whitespace has been seen since the last PARAGRAPH break
+  // (U+2029 from flattenVerseProse — \p/\b/\m/section, NOT a \q poetry line
+  // break) — the position where a continuation re-opener is legal. Carries
+  // ACROSS verse rows: the separator for a break sits at the tail of the
+  // previous verse's prose. A chapter boundary is always a paragraph start
+  // (its \p may live on a verse-0 row that is missing entirely — that case is
+  // lintChapterOpeningMarkers' business, not a reason to mis-flag quotes).
+  let atParagraphStart = true;
+  let lastChapter = -1;
+  for (const v of sorted) {
+    const prose = flattenVerseProse(verseObjectsOf(v));
+    const ref = `${v.chapter}:${v.verse}`;
+    if (v.chapter !== lastChapter) {
+      atParagraphStart = true;
+      lastChapter = v.chapter;
+    }
+    for (let i = 0; i < prose.length; i++) {
+      const ch = prose[i]!;
+      const pairO = PAIRED_MARKS.find((p) => p.open === ch);
+      const pairC = PAIRED_MARKS.find((p) => p.close === ch);
+      if (pairO) {
+        const stack = stacks.get(pairO.open)!;
+        if (!(atParagraphStart && stack.length > 0)) {
+          stack.push({ ref, excerpt: excerptAround(prose, i) });
+        }
+      } else if (pairC) {
+        const stack = stacks.get(pairC.open)!;
+        if (stack.length > 0) {
+          stack.pop();
+        } else if (!pairC.apostropheAmbiguous) {
+          issues.push({
+            check: "Paired punctuation",
+            bucket: "flag",
+            ref,
+            message: `closing ${pairC.close} has no matching opening ${pairC.open}: “${excerptAround(prose, i)}”.`,
+          });
+        }
+      }
+      // Openers stay transparent to paragraph start so a nested continuation
+      // re-opening ("“ ‘" at a paragraph start) is recognized for BOTH levels.
+      // A '\n' poetry line break neither sets nor clears the state.
+      if (ch === "\u2029") atParagraphStart = true;
+      else if (!pairO && !/[\s\u200B]/.test(ch)) atParagraphStart = false;
+    }
+  }
+  for (const { open, close, name } of PAIRED_MARKS) {
+    for (const o of stacks.get(open)!) {
+      issues.push({
+        check: "Paired punctuation",
+        bucket: "flag",
+        ref: o.ref,
+        message: `opening ${open} (${name}) is never closed — no matching ${close} found by the end of the book: “${o.excerpt}”.`,
+      });
+    }
+  }
+  return issues;
+}
+
+// Note/question/response text-quality problems (the subset of the verse checks
+// that make sense inside a markdown-ish TSV text field). Punctuation-spacing
+// is deliberately NOT run here: note text is full of markdown links, rc://
+// URIs, and inline code whose punctuation would swamp the feed with false
+// positives (uw-content-validation carries a long exception list for exactly
+// this; we skip the check instead of porting the list).
+const BAD_TEXT_COMBINATIONS = ["\\[\\[", "\\]\\]", "] (http", "] (.", "] (/"] as const;
+
+// Doubled spaces and straight quotes are deliberately NOT checked here: the
+// export normalizers auto-fix both in TSV prose cells (normalizeNoteText in
+// tsvFormat.ts — normalizeNoteWhitespace + educateQuotes), and the charter at
+// the top of this file keeps auto-fixed mechanical issues out of the lint.
+// Verse text has no such normalizer, so the verse checks DO cover them.
+function textFieldProblems(field: string): Array<{ check: string; message: string }> {
+  const out: Array<{ check: string; message: string }> = [];
+  for (const msg of invisibleCharProblems(field, true)) {
+    out.push({ check: "Invisible character", message: msg });
+  }
+  // tC Create bug artifacts and space-broken markdown links, verbatim from
+  // uw-content-validation BAD_CHARACTER_COMBINATIONS (a single \[ is legal).
+  for (const combo of BAD_TEXT_COMBINATIONS) {
+    const i = field.indexOf(combo);
+    if (i !== -1) {
+      out.push({
+        check: "Bad character combination",
+        message: `unexpected '${combo}': “${excerptAround(field, i)}” — ${combo.startsWith("]") ? "remove the space inside the markdown link" : "remove the stray backslashes"}.`,
+      });
+    }
+  }
+  // Curly-quote balance per field, with [ ] spans masked out first: an
+  // Alternate-translation suggestion in brackets deliberately quotes a
+  // FRAGMENT of the verse, opening “ without closing (e.g. GEN 2:18
+  // `[…declared, “It is not good]` — measured: 5/5 sampled "unbalanced"
+  // notes in the first corpus scan were this convention, not defects). Notes
+  // don't span rows, so counting the remainder is safe (unlike verse text).
+  // ’ doubles as the apostrophe, so only ‘ excess is reported, mirroring
+  // uw-content-validation.
+  const masked = field.replace(/\[[^\]]*\]/g, "");
+  const count = (ch: string): number => masked.split(ch).length - 1;
+  const dOpen = count("“");
+  const dClose = count("”");
+  if (dOpen !== dClose) {
+    out.push({
+      check: "Unbalanced quotation marks",
+      message: `${dOpen} opening “ but ${dClose} closing ” outside of [ ] spans — add the missing mark or remove the extra one.`,
+    });
+  }
+  const sOpen = count("‘");
+  const sClose = count("’");
+  if (sOpen > sClose) {
+    out.push({
+      check: "Unbalanced quotation marks",
+      message: `${sOpen} opening ‘ but only ${sClose} closing ’ outside of [ ] spans — add the missing closing mark.`,
+    });
+  }
+  return out;
 }
 
 // True when a reference parses (used to keep lint robust to odd inputs).

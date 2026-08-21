@@ -856,10 +856,36 @@ export interface ReimportCounts {
   // Merge refused to adopt master's edit specifically because it would have
   // lost alignment — a subset of merge_conflicts. Optional, diagnostic.
   merge_refused?: number;
-  // Merge attempted but no ancestor was recoverable for this verse (edit_log
-  // aged past retention). D1 was kept, the pre-existing safe default.
-  // Optional, diagnostic.
+  // Both sides moved since the ancestor, but every Door43 commit to the file
+  // since then came from Bible Editor's own export or the unfoldingWord bot
+  // account — so the app edit was KEPT and flagged instead of overwritten (issue
+  // #540 item 2). A subset of merge_conflicts for VERSES; for tn/tq/twl rows the
+  // two only overlap when the same row also adopted a field master moved on its
+  // own, because merge_conflicts is incremented there only for an adopting write.
+  // This counter does not itself withhold the export (merge_refused does, at
+  // scale) — but other gates in the same run still can. Optional, diagnostic.
+  merge_kept_ai?: number;
+  // Merge attempted but no ancestor was recoverable for this verse from before
+  // the book+resource's master-confirmed watermark. D1 was kept, the
+  // pre-existing safe default. Optional, diagnostic.
+  //
+  // Do NOT restate this as "edit_log aged past retention", which is what this
+  // comment used to say: measured in prod on 2026-08-19, edit_log spanned 93
+  // days, so the 180-day sweep had deleted nothing and explained none of the
+  // 190 verses then in this state. Aging out is one possible limb of three (see
+  // buildNoBaseSentence in api/src/verseMergeEditorAlerts.ts); the measured
+  // fact is only that no ancestor was recoverable.
   merge_no_base?: number;
+  // A tn/tq/twl row whose Reference differs between D1 and Door43, split by
+  // which side moved it relative to the last published ancestor (see
+  // api/src/tsvMerge.ts's classifyTsvRefMove). `ours` is an ordinary app edit
+  // the export publishes — no flag, no hold. The other three withhold the
+  // resource watermark and flag the row. Optional, diagnostic.
+  ref_moved_ours?: number;
+  ref_moved_ours_conflict?: number;
+  ref_moved_theirs?: number;
+  ref_moved_both?: number;
+  ref_moved_unattributable?: number;
   merge_unavailable?: number;
   // A "keep_converged" verse whose RAW content_json actually differed — a
   // genuine, cosmetic-only Door43 edit that verseMerge.ts's whitespace-
@@ -876,13 +902,22 @@ export interface ReimportCounts {
   // already held in D1 — soft-deleted rows keep their id forever. `conflict_
   // skipped` is the INSERT ... ON CONFLICT DO NOTHING refusal; `tombstone_
   // blocked` is a tombstone whose id master has reissued to a row at a
-  // DIFFERENT reference (a same-reference tombstone is an ordinary delete
-  // awaiting export and is not counted). Either being non-zero also withholds
-  // the (book, resource) sync watermark, so the book is not certified current.
-  // See api/src/reimportClassify.ts and GitHub issue #427. Optional: an
-  // older/cached response may omit them.
+  // DIFFERENT reference and whose automatic reclaim (see tombstone_reclaimed
+  // below) lost the version-CAS race (a same-reference tombstone is an
+  // ordinary delete awaiting export and is not counted). Either being non-zero
+  // also withholds the (book, resource) sync watermark, so the book is not
+  // certified current. See api/src/reimportClassify.ts and GitHub issue #427.
+  // Optional: an older/cached response may omit them.
   conflict_skipped?: number;
   tombstone_blocked?: number;
+  // A reissued tombstone (see tombstone_blocked above) whose slot this run
+  // successfully reclaimed for master — deleted_at cleared, content/reference
+  // set to master's incoming row, ownership reset to master-owned (issue #427,
+  // option 1). Distinct from tombstone_blocked: a landed reclaim means master's
+  // row IS now in D1, so it does NOT withhold the watermark by itself. See
+  // api/src/bookReimport.ts's tombstone branch of applyTsvRows. Optional: an
+  // older/cached response may omit it.
+  tombstone_reclaimed?: number;
   dcs_404: number;
   errors: string[];
 }
@@ -1297,6 +1332,10 @@ export interface AdminImportCounts {
   // watermark. Optional: an older/cached response may omit them.
   conflict_skipped?: number;
   tombstone_blocked?: number;
+  // See ReimportCounts.tombstone_reclaimed above — a reissued tombstone's slot
+  // successfully reclaimed for master (issue #427, option 1). Does NOT withhold
+  // the watermark by itself. Optional: an older/cached response may omit it.
+  tombstone_reclaimed?: number;
   resurrected: number;
   source_attr_reconciled: number;
   source_attr_divergent: number;

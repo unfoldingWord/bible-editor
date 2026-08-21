@@ -21,6 +21,8 @@ import {
   shouldRecordResourceSync,
   isSystemicMergeRefusal,
   SYSTEMIC_MERGE_REFUSAL_THRESHOLD,
+  isKeptOverDoor43AtScale,
+  KEPT_OVER_DOOR43_ALERT_THRESHOLD,
   mergeRefusalOverrideAllowed,
 } from "./reimportSyncGate.ts";
 
@@ -48,6 +50,7 @@ function counts(overrides = {}) {
     skipped_dup: 0,
     conflict_skipped: 0,
     tombstone_blocked: 0,
+    tombstone_reclaimed: 0,
     resurrected: 0,
     source_attr_reconciled: 0,
     source_attr_divergent: 0,
@@ -220,6 +223,25 @@ eq(
   "aggregate laundered a legacy chunk's absent drop counters to zero → counts_incomplete still withholds",
 );
 
+// ── Issue #427, option 1: a landed reclaim does NOT withhold by itself ──────
+// shouldRecordResourceSync's signature deliberately does not even mention
+// tombstone_reclaimed — a landed reclaim means master's content IS now in D1,
+// so there is nothing left to withhold for. Only the lost-CAS fallback (which
+// still counts tombstone_blocked, exercised above) does. This is a shape test:
+// the gate's decision must be identical whether or not tombstone_reclaimed is
+// present, and a nonzero tombstone_reclaimed alongside a clean tombstone_blocked
+// must still stamp.
+eq(
+  shouldRecordResourceSync(counts({ tombstone_reclaimed: 5, tombstone_blocked: 0 })),
+  true,
+  "a run that reclaimed 5 rows and blocked none still stamps the watermark",
+);
+eq(
+  shouldRecordResourceSync(counts({ tombstone_reclaimed: 5, tombstone_blocked: 1 })),
+  false,
+  "reclaims do not offset a genuine block — a run with both still withholds",
+);
+
 console.log("\n[isSystemicMergeRefusal]");
 
 // Below threshold: fine, don't withhold.
@@ -353,6 +375,38 @@ eq(
   mergeRefusalOverrideAllowed({ allowMergeRefusal: false, book: "1CH", resource: "ult" }, 1, 1, "ult"),
   false,
   "allowMergeRefusal: false → refused",
+);
+
+console.log("\n[isKeptOverDoor43AtScale]");
+
+// The contrast with its sibling is the whole point: this one ALERTS and never
+// withholds, so nothing here may end up wired into shouldRecordResourceSync.
+eq(isKeptOverDoor43AtScale(0), false, "0 kept-over-Door43 rows → no alarm");
+eq(
+  isKeptOverDoor43AtScale(KEPT_OVER_DOOR43_ALERT_THRESHOLD - 1),
+  false,
+  "threshold - 1 → still the policy working normally",
+);
+eq(
+  isKeptOverDoor43AtScale(KEPT_OVER_DOOR43_ALERT_THRESHOLD),
+  true,
+  "exactly the threshold → alarm (>=, not >), matching its sibling's boundary",
+);
+eq(isKeptOverDoor43AtScale(500), true, "far above the threshold → alarm");
+eq(isKeptOverDoor43AtScale(3, 2), true, "an explicit threshold is honoured");
+// And the property the alarm exists to preserve: keeping the app's version, at
+// any scale, must never withhold the watermark — freezing the export would
+// strand the very app edits the decision protected.
+eq(
+  shouldRecordResourceSync({
+    chapters_locked: 0,
+    prune_locked: 0,
+    conflict_skipped: 0,
+    tombstone_blocked: 0,
+    merge_kept_ai: 999,
+  }),
+  true,
+  "999 kept-over-Door43 rows still stamp the watermark — this outcome never withholds",
 );
 
 if (failed > 0) {

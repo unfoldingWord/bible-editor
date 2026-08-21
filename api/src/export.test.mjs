@@ -2128,6 +2128,36 @@ function utf8Base64(s) {
     rOneSided.entries.length === 0,
     `a verse present in only one side (master-only 1:9 here) is not reported`,
   );
+
+  // Differs only by Hebrew combining-mark ORDER (legacy UHB consonant-dagesh-
+  // vowel vs NFC) → "formatting", not "substantive" (issue #521). Bet + dagesh
+  // (U+05BC) + qamats (U+05B8), legacy order (dagesh before vowel) on one side,
+  // NFC-normalized order (vowel before dagesh — lower combining class first) on
+  // the other. Same glyph, different bytes.
+  const bet = "ב";
+  const dagesh = "ּ";
+  const qamats = "ָ";
+  const legacyOrder = bet + dagesh + qamats;
+  const nfcOrder = (bet + dagesh + qamats).normalize("NFC");
+  assert(legacyOrder !== nfcOrder, `test fixture assumption: legacy and NFC order actually differ in bytes`);
+  const masterHeb = verseUsfm("ZEC", 1, 1, `the word ${legacyOrder} spoken`);
+  const renderedHeb = verseUsfm("ZEC", 1, 1, `the word ${nfcOrder} spoken`);
+  const rHeb = usfmRevertReport(renderedHeb, masterHeb);
+  assert(
+    rHeb.entries.length === 1 && rHeb.entries[0].class === "formatting",
+    `combining-mark-order-only difference classifies as "formatting", not "substantive"`,
+  );
+
+  // An actual English-word change still classifies "substantive" even when the
+  // verse also contains Hebrew (NFC folding must not blind the comparison to
+  // real content changes).
+  const masterHebWord = verseUsfm("ZEC", 1, 4, `the word ${legacyOrder} spoken to them`);
+  const renderedHebWord = verseUsfm("ZEC", 1, 4, `the word ${legacyOrder} spoken to us`);
+  const rHebWord = usfmRevertReport(renderedHebWord, masterHebWord);
+  assert(
+    rHebWord.entries.length === 1 && rHebWord.entries[0].class === "substantive",
+    `an actual word change alongside unrelated Hebrew content still classifies as "substantive"`,
+  );
 }
 
 // --- tsvRevertReport: export-time "we overwrote something" report (TSV) ---
@@ -2174,6 +2204,21 @@ function utf8Base64(s) {
   assert(
     rMissing.entries.length === 0,
     `a row present in only one side (master-only ab05 here) is not reported`,
+  );
+
+  // Only a Hebrew combining-mark ORDER difference in Quote (legacy UHB order vs
+  // NFC) → "whitespace_only", not "substantive" (issue #521).
+  const bet = "ב";
+  const dagesh = "ּ";
+  const qamats = "ָ";
+  const legacyOrder = bet + dagesh + qamats;
+  const nfcOrder = (bet + dagesh + qamats).normalize("NFC");
+  const masterNfc = `${TN_HEADER}\n${tnRow("1:6", "ab06", "", legacyOrder, "a note")}\n`;
+  const renderedNfc = `${TN_HEADER}\n${tnRow("1:6", "ab06", "", nfcOrder, "a note")}\n`;
+  const rNfc = tsvRevertReport(renderedNfc, masterNfc, "tn");
+  assert(
+    rNfc.entries.length === 1 && rNfc.entries[0].class === "whitespace_only",
+    `a Quote differing only by Hebrew combining-mark order classifies as "whitespace_only", not "substantive"`,
   );
 }
 

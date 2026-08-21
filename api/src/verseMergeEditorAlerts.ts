@@ -145,15 +145,30 @@ export interface ExistingAlertState {
 //   - 'keep_alignment_refused' -> kept D1; adopting would have cost alignment.
 //   - 'source_attr_divergent'  -> kept D1; master's original-language source fix
 //                                 couldn't be placed (repeated source word).
-// Both kept-D1 outcomes carry the same warning: nothing was taken, so tonight's
-// export will still write D1 back over master until a human resolves it.
+//   - 'keep_ai_master'         -> kept D1; both sides moved, but the commit
+//                                 lineage found no human commit behind master's
+//                                 side (#540 item 2).
+// The first two kept-D1 outcomes carry the same warning: nothing was taken, so
+// tonight's export will still write D1 back over master until a human resolves
+// it. 'keep_ai_master' is the one that does NOT — publishing D1 is the intended
+// outcome there, so its sentence must not borrow their warning.
+
+// Cap on how many no-ancestor refs the sentence lists inline, matching the
+// `+N more` shape raiseVerseMergeConflictAlert already uses for its conflict
+// refs. `noBaseCount` stays authoritative for the number. bookReimport.ts
+// collects exactly this many (NO_BASE_REF_CAP) — collecting more would ride
+// through every Workflow step's serialized return value and then be discarded
+// here, since this sentence is the only consumer.
+export const NO_BASE_REF_DISPLAY = 10;
+
 export function buildMergeConflictGuidance(
   rows: Array<{ action: string }>,
-  opts: { recordingFailed?: boolean; noBaseCount?: number } = {},
+  opts: { recordingFailed?: boolean; noBaseCount?: number; noBaseRefs?: string[] } = {},
 ): string {
   const overwritten = rows.filter((r) => r.action === "adopt_conflict").length;
   const keptAlignment = rows.filter((r) => r.action === "keep_alignment_refused").length;
   const keptSourceAttr = rows.filter((r) => r.action === "source_attr_divergent").length;
+  const keptAiMaster = rows.filter((r) => r.action === "keep_ai_master").length;
   return [
     overwritten > 0
       ? `${overwritten} took Door43's version over the editor's — the replaced text is still in that verse's ` +
@@ -168,17 +183,88 @@ export function buildMergeConflictGuidance(
         `on \\zaln-s) could not be placed unambiguously — the same source word repeats in the verse — so Door43's ` +
         `change has NOT been taken, and tonight's export will write over it until someone resolves it by hand.`
       : "",
+    // Bounded to what was measured, and to what will actually happen — see the
+    // matching note over the TSV reason in bookReimport.ts for each clause:
+    // "the unfoldingWord bot account" (not "the note pipeline" — the rule is an
+    // author email, and that account also pushes scripture and pushes on a
+    // human's behalf); "no commit from a Door43 editor's own account" (not "no
+    // maintainer edit" — a maintainer may have directed it); "the next export
+    // that runs for this resource" (not "tonight's export" — the watermark is
+    // withheld for the whole book+resource by a systemic refusal, a lock, or a
+    // recording failure, any of which can be described in this same banner);
+    // "since the last confirmed publish" (not "since the last sync" — the walk
+    // starts at master_confirmed_at). Past tense on the measurement because
+    // these rows survive across runs until a human resolves them.
+    keptAiMaster > 0
+      ? `${keptAiMaster} kept the editor's version even though Door43 changed too: when these were checked, ` +
+        `every Door43 commit to this file since the last confirmed publish came from Bible Editor's own export ` +
+        `or the unfoldingWord bot account — no commit from a Door43 editor's own account was found. Nothing of ` +
+        `Door43's was taken, so the next export that runs for this resource writes the editor's version over ` +
+        `Door43's. If Door43's version is the one you want, put it in the app before then.`
+      : "",
     opts.recordingFailed
       ? "NOTE: at least one merge-conflict recording failed to write to verse_merge_conflicts this run " +
         "(see worker logs) — this table and count may be missing rows from tonight's sync."
       : "",
-    opts.noBaseCount
-      ? `${opts.noBaseCount} verse(s) could not be adjudicated because their edit history has aged out (no ` +
-        `recoverable ancestor) — a Door43-side change to them will still be overwritten by tonight's export.`
-      : "",
+    opts.noBaseCount ? buildNoBaseSentence(opts.noBaseCount, opts.noBaseRefs) : "",
   ]
     .filter(Boolean)
     .join(" ");
+}
+
+// The `keep_no_base` sentence. Two corrections over the version this replaces,
+// both from the 2026-08-19 prod measurement behind issue #537:
+//
+// 1. IT NAMED NO VERSES. A sentence whose own point is "tonight's export may
+//    overwrite a Door43 edit here" has to say where "here" is — the same rule
+//    the adjudicated refs already follow (`40:5@v8, …`). keep_no_base writes no
+//    verse_merge_conflicts row, so the banner is the only channel these verses
+//    have. No `@vN` suffix: nothing was overwritten yet, so there is no replaced
+//    version to point a restore at.
+//
+// 2. IT ASSERTED A CAUSE WE HAD NOT MEASURED. The old text said the edit history
+//    "has aged out". Prod on 2026-08-19: edit_log spans 93 days (oldest entry
+//    2026-05-18), so the 180-day sweep in index.ts has never deleted a row and
+//    could not have caused a single one of the 190 verses then in this state.
+//    Every one of them was simply never written to edit_log before its book's
+//    master-confirmed watermark. Aging out remains POSSIBLE once the table is
+//    older than 180 days, which is exactly why this may not name either limb.
+//
+//    Nor may it name the *third* limb. What is actually measured is one thing:
+//    computeVerseMerge received `base === null`. That happens when no edit_log
+//    row exists at or before the boundary, AND when a row exists whose payload
+//    carries no `content` or does not parse (verseContentJsonFromPayload —
+//    verseHistory.test.mjs covers both). In those last two the ancestor did
+//    survive; it was simply not RECOVERABLE. So the wording says exactly that,
+//    which is the accurate half of the sentence this replaced. (Standing rule —
+//    an alert states only what it measured; see STATE.md's alert-wording
+//    lessons. That rule applies to the replacement too, which is why the first
+//    draft's "no ancestor survives" did not stand either.)
+//
+// Scope note: the ancestor lookup is PER VERSE (row_key = book/chapter/verse/
+// RESOURCE), so this must not say "this book's edit history" — thousands of
+// other verses in the same book have perfectly good ancestors, and a
+// non-developer could read the book-wide phrasing as "the history is gone".
+export function buildNoBaseSentence(count: number, refs?: string[]): string {
+  // Never list more refs than the count claims. Unreachable today (refs are
+  // pushed on the same branch that increments the count, and nothing decrements
+  // it), but the invariant is cheap to enforce and the helper is exported.
+  const listed = (refs ?? []).slice(0, Math.min(count, NO_BASE_REF_DISPLAY));
+  // `refs` is a capped sample and can be short of `count` — or empty, for a
+  // Workflow chunk memoized before it was collected. Only claim "+N more"
+  // against what we actually listed, and stay silent rather than guess when the
+  // sample is missing entirely. "sample" is load-bearing: on a mixed run the
+  // listed refs are not necessarily the first N, so a reader must not take the
+  // unlisted remainder to be a contiguous tail.
+  const more = count > listed.length ? `; +${count - listed.length} more` : "";
+  const where = listed.length > 0 ? ` Verses (sample): ${listed.join(", ")}${more}.` : "";
+  return (
+    `${count} verse(s) could not be adjudicated: no ancestor was recoverable for them from before this ` +
+    `book+resource's master-confirmed watermark, so the sync could not tell which side changed, and so it ` +
+    `kept the app's version.${where} ` +
+    `Nothing was overwritten in these — but a Door43-side change to them will still be overwritten by ` +
+    `tonight's export.`
+  );
 }
 
 export function planSystemAlertWrites(

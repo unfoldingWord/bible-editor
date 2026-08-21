@@ -63,6 +63,7 @@ import {
   EDITOR_LOOKUP_CHUNK,
   editLogKey,
   groupOverwrittenVersesByEditor,
+  NO_BASE_REF_DISPLAY,
   planSystemAlertWrites,
 } from "./verseMergeEditorAlerts.ts";
 import {
@@ -683,6 +684,70 @@ function confirmAdopted(d, { book, resource, chapter, verse }) {
   assert(rows.length === 1, "banner filter returns exactly the one active, alertable row");
   assert(rows[0].verse === 21 && rows[0].action === "source_attr_divergent",
     "…which is the unresolved source_attr_divergent row (not the audit-only 'adopt', not the resolved one)");
+
+  // #540 item 2. A keep_ai_master row is alertable too — it is the one outcome
+  // whose whole purpose is to be looked at before the export publishes it.
+  // Missing from this filter, the policy would fire silently.
+  d.prepare(
+    `INSERT INTO verse_merge_conflicts (book, resource, chapter, verse, action, reason, overwritten_version, detected_at)
+     VALUES ('EZK','ult',40,24,'keep_ai_master','both_changed_ai_master',NULL,100)`,
+  ).run();
+  const withAi = d.prepare(SELECT_ACTIVE_ALERTABLE_CONFLICTS_SQL).all("EZK", "ult");
+  assert(withAi.some((r) => r.verse === 24 && r.action === "keep_ai_master"),
+    "the banner filter surfaces a keep_ai_master row");
+}
+
+{
+  // #540 item 2, the two upsert rules a keep_ai_master row shares with the other
+  // kept-D1 outcomes: it never carries an overwritten_version pointer (nothing
+  // was overwritten, so the pointer would misdirect a reviewer), and
+  // re-detecting it REACTIVATES a row a human resolved without fixing the
+  // underlying disagreement — the condition is still live, and unlike an
+  // adoption there is no CAS that could lose its race and falsely reactivate.
+  const d = verseDb();
+  d.prepare(UPSERT_VERSE_MERGE_CONFLICT_SQL).run(
+    "AMO", "ult", 4, 2, "adopt_conflict", "both_changed", 9, null, 1000,
+  );
+  d.prepare(UPSERT_VERSE_MERGE_CONFLICT_SQL).run(
+    "AMO", "ult", 4, 2, "keep_ai_master", "both_changed_ai_master", null, null, 2000,
+  );
+  let row = d.prepare(`SELECT * FROM verse_merge_conflicts WHERE book='AMO' AND chapter=4 AND verse=2`).get();
+  assert(row.action === "keep_ai_master" && row.overwritten_version === null,
+    "a verse that becomes keep_ai_master drops any prior overwritten_version pointer");
+
+  d.prepare(`UPDATE verse_merge_conflicts SET resolved_at=1500, resolved_by=30 WHERE book='AMO'`).run();
+  d.prepare(UPSERT_VERSE_MERGE_CONFLICT_SQL).run(
+    "AMO", "ult", 4, 2, "keep_ai_master", "both_changed_ai_master", null, null, 3000,
+  );
+  row = d.prepare(`SELECT * FROM verse_merge_conflicts WHERE book='AMO' AND chapter=4 AND verse=2`).get();
+  assert(row.resolved_at === null && row.resolved_by === null,
+    "re-detecting keep_ai_master reactivates a row resolved while the disagreement persists");
+
+  // But a later clean 'adopt' DOES take it out of the banner — the opposite of
+  // adopt_conflict's anti-downgrade rule, and deliberately so: nothing was
+  // overwritten, so there is nothing to recover, and master's value having been
+  // adopted since means the disagreement resolved. Left sticky, the banner would
+  // keep claiming the editor's version was kept and is about to be published,
+  // about a verse that has since taken master's.
+  d.prepare(UPSERT_VERSE_MERGE_CONFLICT_SQL).run(
+    "AMO", "ult", 4, 2, "adopt", "master_only", 11, null, 4000,
+  );
+  row = d.prepare(`SELECT * FROM verse_merge_conflicts WHERE book='AMO' AND chapter=4 AND verse=2`).get();
+  assert(row.action === "adopt",
+    "a later clean 'adopt' retires a keep_ai_master row from the banner");
+
+  // …while adopt_conflict's own anti-downgrade is untouched by that.
+  const d2 = verseDb();
+  d2.prepare(UPSERT_VERSE_MERGE_CONFLICT_SQL).run(
+    "AMO", "ult", 5, 1, "adopt_conflict", "both_changed", 4, null, 1000,
+  );
+  d2.prepare(UPSERT_VERSE_MERGE_CONFLICT_SQL).run(
+    "AMO", "ult", 5, 1, "adopt", "master_only", 6, null, 2000,
+  );
+  assert(
+    d2.prepare(`SELECT * FROM verse_merge_conflicts WHERE book='AMO' AND chapter=5`).get().action === "adopt_conflict",
+    "an adopt_conflict is still protected from a later routine adoption",
+  );
 }
 
 {
@@ -796,6 +861,93 @@ function confirmAdopted(d, { book, resource, chapter, verse }) {
     "keep_alignment_refused counted as an alignment refusal");
   assert(mixed.includes("1 kept D1 because Door43's original-language source fix"),
     "source_attr_divergent counted as a source-attr divergence, separately from the alignment refusal");
+
+  // #540 item 2. keep_ai_master is also a kept-D1 outcome, but the OPPOSITE one
+  // where the export is concerned: nothing is waiting to be reverted, the export
+  // is about to publish the kept version. Borrowing the other two's warning
+  // would send a human to fight for a change that is already winning.
+  const ai = buildMergeConflictGuidance([{ action: "keep_ai_master" }]);
+  assert(ai.includes("1 kept the editor's version even though Door43 changed too"),
+    "keep_ai_master gets its own sentence");
+  // The measured cause, stated narrowly. Not "no maintainer edit" — the bot
+  // account pushes on a named human's behalf, so a maintainer may well have
+  // directed the change; what was measured is that no commit came from a Door43
+  // editor's own account.
+  assert(ai.includes("no commit from a Door43 editor's own account was found"),
+    "…stating the measured cause, and only that");
+  assert(!ai.includes("no maintainer edit"), "…never the stronger claim about intent");
+  assert(!ai.includes("took Door43's version"), "…and never reports it as an overwrite");
+  assert(!ai.includes("will still write over it"),
+    "…and never borrows the refusal's warning: here the export publishes the kept version");
+  // …but it must not promise a publish either. The watermark is withheld for the
+  // whole book+resource by a systemic refusal, a lock, or a recording failure —
+  // any of which can be described in this same banner.
+  assert(!ai.includes("Tonight's export publishes"),
+    "…and never promises tonight's export, which this banner itself may be reporting as held");
+  assert(ai.includes("the next export that runs for this resource"),
+    "…it says which export, conditionally");
+
+  const withAi = buildMergeConflictGuidance([{ action: "adopt_conflict" }, { action: "keep_ai_master" }]);
+  assert(withAi.includes("1 took Door43's version"),
+    "a keep_ai_master row does not absorb the adopt_conflict count");
+  assert(withAi.includes("1 kept the editor's version even though Door43 changed too"),
+    "…and is counted separately from it");
+}
+
+{
+  // Issue #537. The keep_no_base sentence must NAME the verses it says tonight's
+  // export may overwrite, and must not assert a cause we did not measure.
+  const g = buildMergeConflictGuidance([], { noBaseCount: 3, noBaseRefs: ["40:5", "42:2", "42:3"] });
+  assert(g.includes("40:5, 42:2, 42:3"), "no-ancestor sentence lists the refs it is talking about");
+  assert(g.includes("3 verse(s) could not be adjudicated"), "…and still reports the count");
+  assert(!g.includes("more"), "…with no '+N more' when every ref was listed");
+
+  // The cause claim. Prod on 2026-08-19: edit_log spanned 93 days, so the
+  // 180-day sweep had deleted nothing and "aged out" described none of the 190
+  // verses then in this state. The sentence may only say what is measured.
+  assert(!/aged out/i.test(g), "…and never claims the history 'aged out' (a cause we did not measure)");
+  // Nor may the replacement overclaim: `base === null` also covers a payload
+  // that exists but carries no parseable content, where the ancestor DID
+  // survive and merely wasn't recoverable. "recoverable" is the measured word.
+  assert(g.includes("no ancestor was recoverable"), "…it states only the measured fact: not recoverable");
+  assert(!/survives/i.test(g), "…and does not claim the ancestor is gone, only that it could not be recovered");
+  // The lookup is per verse (row_key = book/chapter/verse/RESOURCE), so the
+  // sentence must not read as "this book's history is lost".
+  assert(!/this book's edit history/i.test(g), "…and does not overstate the lookup as book-wide");
+  // Nothing was overwritten in a keep_no_base verse — the reader must not go
+  // hunting version history for a replaced value that does not exist.
+  assert(g.includes("Nothing was overwritten"), "…and says nothing was overwritten yet");
+
+  // The ref list is a capped sample; '+N more' counts against what was actually
+  // listed, never against the cap, and the authoritative count still leads.
+  const OVER = NO_BASE_REF_DISPLAY + 2;
+  const many = buildMergeConflictGuidance([], {
+    noBaseCount: 59,
+    noBaseRefs: Array.from({ length: OVER }, (_, i) => `28:${i + 1}`),
+  });
+  assert(many.includes("59 verse(s)"), "count stays authoritative when the ref sample is short");
+  assert(many.includes(`28:${NO_BASE_REF_DISPLAY}`), "…lists up to the display cap");
+  assert(!many.includes(`28:${NO_BASE_REF_DISPLAY + 1}`), "…and no further");
+  assert(many.includes(`+${59 - NO_BASE_REF_DISPLAY} more`), "…and '+N more' is the count minus what was actually listed");
+  // "sample", not a plain list: on a mixed run the listed refs are not
+  // necessarily the first N, so the remainder is not a contiguous tail.
+  assert(many.includes("Verses (sample):"), "…and labels the list as a sample, not an ordered prefix");
+
+  // Never list more refs than the count claims (the helper is exported, so the
+  // invariant is enforced rather than assumed from its only caller).
+  const overListed = buildMergeConflictGuidance([], { noBaseCount: 2, noBaseRefs: ["1:1", "1:2", "1:3", "1:4"] });
+  assert(overListed.includes("1:1, 1:2."), "lists at most `count` refs…");
+  assert(!overListed.includes("1:3"), "…never more than it claims");
+
+  // A Workflow chunk memoized before refs were collected contributes a count and
+  // no refs. Say nothing about where, rather than guess.
+  const noRefs = buildMergeConflictGuidance([], { noBaseCount: 5 });
+  assert(noRefs.includes("5 verse(s) could not be adjudicated"), "count-only still reports the count");
+  assert(!noRefs.includes("Verses:"), "…and omits the ref clause rather than printing an empty one");
+  assert(!noRefs.includes("more"), "…and claims no '+N more' it cannot substantiate");
+
+  // Zero is not a story: no sentence at all.
+  assert(buildMergeConflictGuidance([], { noBaseCount: 0 }) === "", "no no-ancestor sentence when the count is 0");
 }
 
 if (failed) {

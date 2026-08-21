@@ -17,11 +17,16 @@
 // whichever side actually moved, per field:
 //   - master moved a field, we did not  -> adopt master's value for that field
 //   - we moved it, master did not        -> keep ours (our deliberate edit)
-//   - BOTH moved the same field          -> master wins (the side a human just
-//                                           touched by hand on Door43), and the
-//                                           row is flagged for human review so
-//                                           the overwritten D1 value can be
+//   - BOTH moved the same field          -> master wins IF a human could have
+//                                           written master's side (see
+//                                           masterMayHoldHumanEdit below), and
+//                                           the row is flagged for human review
+//                                           so the overwritten D1 value can be
 //                                           recovered from row version history.
+//                                           When the lineage proves only our own
+//                                           export and the AI pipeline moved
+//                                           master, D1 wins instead and the row
+//                                           is still flagged (keep_ai_master).
 //   - neither moved (equal, or only whitespace differs) -> nothing to do.
 // When no ancestor is recoverable at all (never exported / edit_log aged past
 // the 180-day sweep), attribution is impossible and we keep D1 — the
@@ -39,12 +44,15 @@
 // reconstructs the ancestor is separate (foldTsvBase below is the pure half of
 // it; bookReimport.ts does the batched edit_log read that feeds it).
 
+import { normalizeNoteText } from "./tsvFormat.ts";
+
 export type TsvMergeKind = "tn" | "tq" | "twl";
 
 export type TsvMergeAction =
   | "keep_converged" // ours and theirs already equal (modulo whitespace)
   | "keep_no_base" // no ancestor recoverable — cannot attribute, keep D1
   | "keep_master_unchanged" // master === base on every field: their side never moved
+  | "keep_ai_master" // >=1 field where BOTH moved, but no human moved master — D1 wins, human must review
   | "adopt" // master moved >=1 field, we moved none of those — adopt them
   | "adopt_conflict"; // >=1 field where BOTH moved — master wins, human must review
 
@@ -136,30 +144,136 @@ export function tsvRefMoved(
   );
 }
 
+// ── Attributing the move (issue #540 item 3) ────────────────────────────────
+//
+// tsvRefMoved above is a TWO-WAY compare, and a two-way compare cannot say who
+// moved — the same mistake that cost this project months of nightly data loss on
+// the content side (STATE.md). Its caller assumed "differs => Door43 moved it",
+// which is wrong exactly half the time, and the wrong half is self-perpetuating:
+// a translator moves a row in the app, the sync reads the difference as a
+// maintainer's move, flags the row telling her to undo her own edit, and sets
+// apply_incomplete — which WITHHOLDS the resource watermark, so the export never
+// ships her move to master, so master never catches up, so it flags again
+// tomorrow. That livelock blocked AMO tq exports from 2026-08-17.
+//
+// The fix is the same one the content merge already uses: an ancestor. With the
+// row's reference as of the master-confirmed watermark, the three cases separate
+// cleanly and only two of them are anyone's problem.
+export type TsvRefMoveOutcome =
+  | "none" // references agree, or the row is protected
+  | "ours_moved" // D1 moved, master still sits at the ancestor -> a normal exportable edit
+  | "theirs_moved" // master moved, D1 still sits at the ancestor -> the out-of-band move
+  | "both_moved" // both sides re-anchored, to different places -> needs a human
+  | "unattributable"; // no ancestor for the components that differ -> cannot say who moved
+
+// The reference columns as of the ancestor. A key is ABSENT when no surviving
+// edit_log payload before the watermark ever recorded that column — the same
+// "absent means unattributable" convention TsvMergeSide uses for content. This
+// matters in practice: the in-app move sends `ref_raw` + `verse` and never
+// `chapter` (moves are same-chapter only, rows.ts), so a base folded purely from
+// patches legitimately carries no chapter.
+export interface TsvRefSide {
+  chapter?: number;
+  verse?: number;
+  /** "" when the payload recorded a null ref_raw, matching tsvRefMoved's coercion. */
+  ref_raw?: string;
+}
+
+const REF_COMPONENTS = ["chapter", "verse", "ref_raw"] as const;
+
+export function classifyTsvRefMove(
+  cur: Record<string, unknown>,
+  incoming: { chapter: number; verse: number; refRaw: string | null },
+  base: TsvRefSide | null,
+  protectedRow: boolean,
+): TsvRefMoveOutcome {
+  if (!tsvRefMoved(cur, incoming, protectedRow)) return "none";
+  if (base === null) return "unattributable";
+
+  const ours: Required<TsvRefSide> = {
+    chapter: Number(cur.chapter),
+    verse: Number(cur.verse),
+    ref_raw: (cur.ref_raw as string | null) ?? "",
+  };
+  const theirs: Required<TsvRefSide> = {
+    chapter: incoming.chapter,
+    verse: incoming.verse,
+    ref_raw: incoming.refRaw ?? "",
+  };
+
+  let oursMoved = false;
+  let theirsMoved = false;
+  for (const k of REF_COMPONENTS) {
+    // A component both sides agree on carries no information about who moved,
+    // so it never needs an ancestor — only the DIFFERING components do. That is
+    // what keeps the common same-chapter move attributable from a patch-only
+    // history that never recorded `chapter`.
+    if (ours[k] === theirs[k]) continue;
+    if (base[k] === undefined) return "unattributable";
+    if (ours[k] !== base[k]) oursMoved = true;
+    if (theirs[k] !== base[k]) theirsMoved = true;
+  }
+  if (oursMoved && theirsMoved) return "both_moved";
+  if (oursMoved) return "ours_moved";
+  if (theirsMoved) return "theirs_moved";
+  // Unreachable: the sides differ on some component, so at least one of them
+  // differs from the ancestor. Fail toward "nobody moved" rather than inventing
+  // an attribution.
+  return "none";
+}
+
 export interface TsvMergeResult {
   action: TsvMergeAction;
-  /** action is "adopt" | "adopt_conflict" */
+  /** there are fields to write — `writeFields` is non-empty. True for "adopt"
+   *  and "adopt_conflict", and for a "keep_ai_master" row that ALSO had a
+   *  cleanly-attributed field master moved on its own. */
   adopt: boolean;
-  /** needs a human: "adopt_conflict" */
+  /** needs a human: "adopt_conflict" | "keep_ai_master" */
   conflict: boolean;
   /** short stable machine reason, safe to persist and to log */
   reason: string;
   /** raw master values to WRITE for the fields being adopted (verbatim theirs,
    *  NOT the normalized compare form). Empty when nothing is adopted. */
   writeFields: Partial<TsvMergeSide>;
-  /** fields where both sides moved (master won). Empty unless adopt_conflict. */
+  /** fields where BOTH sides moved. `action` says who won them: master on
+   *  "adopt_conflict", D1 on "keep_ai_master". Empty otherwise. */
   conflictFields: TsvMergeField[];
 }
 
-// Collapse a TSV text field to its whitespace-insensitive compare form: the
-// literal two-char "\n" escape (an encoded line break) -> space, every
-// whitespace run -> one space, then trim. Two values differing ONLY by this
-// kind of incidental whitespace read as the same to a human, so they must not
-// count as "moved" (bp-assistant is known to double-space notes — see the
-// tn-double-space-whitespace-churn memory). FOR COMPARISON ONLY — the bytes we
+// The export renders these fields — and ONLY these — through normalizeNoteText
+// (export.ts:131 tn note, :138 tq question/response; quote, support_reference,
+// orig_words, tw_link and the twl builder render raw). The compare lens below
+// must mirror that set exactly: applying it to a raw-rendered column would make
+// a genuine maintainer fix inside the normalization kernel (a stray literal \n
+// on a quote, an ASCII-quote corruption repair) read as "unchanged", so it is
+// never adopted and the raw-rendering export reverts it nightly.
+const EXPORT_NORMALIZED_FIELDS: ReadonlySet<TsvMergeField> = new Set([
+  "note",
+  "question",
+  "response",
+]);
+
+// Collapse a TSV text field to its compare form. For the prose fields the
+// export normalizes, first apply the export's own normalizeNoteText (quote
+// education, Alternate-translation label, literal-\n cleanups); then, for every
+// text field, the literal two-char "\n" escape (an encoded line break) ->
+// space, every whitespace run -> one space, then trim.
+//
+// The export lens is load-bearing for the prose fields: master IS
+// normalizeNoteText(some past D1 value) for them, while the ancestor is folded
+// from raw edit_log payloads. Without it, any note containing a straight
+// apostrophe reads as "Door43 changed it" forever — educateQuotes curls it on
+// every export, the ancestor keeps it straight, so ancestor != master by one
+// character and every later app edit becomes a both-changed conflict that
+// master wins (the AMO 3:10 nightly revert, 2026-08-18/19). Whitespace alone
+// had the same shape: bp-assistant is known to double-space notes — see the
+// tn-double-space-whitespace-churn memory. Applying the same lens to BOTH
+// compared sides can only make values compare MORE equal, so it can suppress
+// phantom moves but never manufacture one. FOR COMPARISON ONLY — the bytes we
 // write are always master's raw value.
-function normText(v: string | null | undefined): string {
-  return (v ?? "").replace(/\\n/g, " ").replace(/\s+/g, " ").trim();
+function normText(v: string | null | undefined, exportNormalized: boolean): string {
+  const s = exportNormalized ? (normalizeNoteText(v ?? "") ?? "") : (v ?? "");
+  return s.replace(/\\n/g, " ").replace(/\s+/g, " ").trim();
 }
 
 // Numeric occurrence compare form. A blank cell (null) and an explicit 0 both
@@ -172,7 +286,8 @@ function normOcc(v: number | null | undefined): number {
 // Are two field values equal in their compare form?
 function fieldEqual(field: TsvMergeField, a: unknown, b: unknown): boolean {
   if (field === "occurrence") return normOcc(a as number | null) === normOcc(b as number | null);
-  return normText(a as string | null) === normText(b as string | null);
+  const lens = EXPORT_NORMALIZED_FIELDS.has(field);
+  return normText(a as string | null, lens) === normText(b as string | null, lens);
 }
 
 // Per-field attribution outcome.
@@ -200,13 +315,23 @@ function attributeField(
 // Three-way merge one edited TSV row. `base` is the reconstructed ancestor
 // (foldTsvBase) or null when unrecoverable. `ours` is D1's current row, `theirs`
 // is master's incoming row. Only content fields for `kind` are considered.
+//
+// `opts.masterMayHoldHumanEdit` is the AI-vs-human policy gate (#540 item 2),
+// identical in meaning and in fail-safe direction to computeVerseMerge's field
+// of the same name: FALSE only when a COMPLETE commit-lineage walk of master's
+// file since the ancestor found nothing but our own export commits and
+// bp-assistant pushes. Callers pass `masterMayHoldHumanEdit(lineage)` — the
+// helper in masterLineage.ts — never a boolean of their own making. Omitted
+// means the caller never looked, which keeps today's master-wins behavior.
 export function computeTsvMerge(
   kind: TsvMergeKind,
   base: TsvMergeSide | null,
   ours: TsvMergeSide,
   theirs: TsvMergeSide,
+  opts: { masterMayHoldHumanEdit?: boolean } = {},
 ): TsvMergeResult {
   const fields = FIELDS_BY_KIND[kind];
+  const masterWinsConflicts = opts.masterMayHoldHumanEdit !== false;
 
   const writeFields: Partial<TsvMergeSide> = {};
   const conflictFields: TsvMergeField[] = [];
@@ -224,9 +349,17 @@ export function computeTsvMerge(
     }
     anyAttributable = true;
     if (fate === "keep") continue; // master didn't move it — our edit stands
-    // adopt OR conflict: write master's RAW value for this field.
+    if (fate === "conflict") {
+      conflictFields.push(f);
+      // Both sides moved this field, and the lineage says nothing human moved
+      // master's side — so master's value is our own pipeline's output and must
+      // not overwrite the app edit that came after it (#540 item 2, the AMO 4:2
+      // shape). Keep D1's value: write nothing for this field, and let the row
+      // carry a review flag so a human still sees the collision.
+      if (!masterWinsConflicts) continue;
+    }
+    // adopt, OR a conflict master is allowed to win: write master's RAW value.
     (writeFields as Record<string, unknown>)[f] = theirs[f] ?? null;
-    if (fate === "conflict") conflictFields.push(f);
   }
 
   const noResult = (action: TsvMergeAction, reason: string): TsvMergeResult => ({
@@ -245,6 +378,22 @@ export function computeTsvMerge(
   // missing, or only aged-out fields differ). Keep D1 — the safe default — and
   // let the caller surface it (merge_no_base) so it isn't a silent revert.
   if (!anyAttributable) return noResult("keep_no_base", anyNoBase ? "no_base" : "master_unchanged");
+
+  // A both-changed field D1 won because master's side had no human commit
+  // behind it. Reported BEFORE the "nothing to write" branch below, which would
+  // otherwise swallow it as a plain keep_master_unchanged and lose the flag — a
+  // collision a human should see, whichever side won it. `adopt` stays honest:
+  // a row can hold both a kept conflict and a field master moved on its own.
+  if (!masterWinsConflicts && conflictFields.length > 0) {
+    return {
+      action: "keep_ai_master",
+      adopt: Object.keys(writeFields).length > 0,
+      conflict: true,
+      reason: "both_changed_ai_master",
+      writeFields,
+      conflictFields,
+    };
+  }
 
   // Attributable, but every attributable field was "keep" (master never moved
   // the fields we could reason about). Note if some other field was no_base:
@@ -313,6 +462,14 @@ export interface TsvEditLogEntry {
   action: string;
   /** parsed edit_log.payload_json, or null when the row had none. */
   payload: Record<string, unknown> | null;
+  /**
+   * False when the edit_log row's `book` column is NULL, so we cannot prove the
+   * entry belongs to THIS book's row of that id (ids are unique only per
+   * (book, id)). Undefined means the caller did not report it, which keeps
+   * every existing caller's behavior unchanged. Consumed only by
+   * foldTsvRefBase — see the note there.
+   */
+  bookKnown?: boolean;
 }
 
 // Fold a row's content-bearing edit_log history (already ordered oldest->newest
@@ -322,6 +479,95 @@ export interface TsvEditLogEntry {
 // history never set is simply absent from the returned object (computeTsvMerge
 // treats an absent field as unattributable), which is how a partial, aged-out
 // history degrades gracefully instead of pretending a blank ancestor.
+// Fold the same history into the row's REFERENCE as of the watermark, for
+// classifyTsvRefMove. Separate from foldTsvBase because the reference columns
+// are deliberately excluded from FIELDS_BY_KIND (they are identity, not content,
+// and must never be merged field-wise) — but they still need an ancestor to be
+// attributable. Same entries, same ordering, same "absent means never recorded"
+// contract; no extra D1 read.
+//
+// HETEROGENEOUS KEY NAMES, same hazard readPayloadField exists for above — and
+// it bites harder here, because `ref_raw` is the one reference column whose two
+// spellings are BOTH in production edit_log today:
+//   - bookImport.ts's audit payload and rows.ts's POST/PATCH bodies use
+//     snake_case `ref_raw`;
+//   - bookReimport.ts logs a ParsedTsvRow verbatim (logEditStmt(..., u.row)),
+//     and ParsedTsvRow's field is camelCase `refRaw`.
+// Reading only one spelling would leave `ref_raw` absent from the ancestor of
+// every row whose pre-watermark history came from a reimport, which silently
+// degrades a ref_raw-only reshape (e.g. "1:2" -> "1:2-3", verse unchanged) to
+// `unattributable` forever. That direction is fail-safe — an ABSENT component
+// can only withhold, never mis-attribute — but it defeats the fix for that case,
+// so both spellings are read.
+//
+// `chapter`/`verse` are spelled identically in every writer shape. They are
+// numbers in all of them, so a non-numeric value is dropped rather than coerced
+// into a NaN that would compare unequal to everything (including itself) and
+// manufacture a permanent `unattributable`.
+// A payload value that is a usable chapter/verse number. `Number()` alone is not
+// enough: `Number(null)`, `Number("")`, `Number(false)` and `Number([])` are all
+// a finite 0, and 0 is a REAL reference here (chapter-front `front:intro` rows
+// live at chapter 0 / verse 0). Coercing an absent-ish value to 0 would turn a
+// fail-safe absence into a fail-unsafe wrong ancestor, which is the one
+// direction this fold must never go.
+function refNumber(value: unknown): number | null {
+  if (typeof value === "number") return Number.isFinite(value) ? value : null;
+  if (typeof value === "string" && value.trim() !== "") {
+    const n = Number(value);
+    return Number.isFinite(n) ? n : null;
+  }
+  return null;
+}
+
+export function foldTsvRefBase(entries: TsvEditLogEntry[]): TsvRefSide | null {
+  let base: TsvRefSide | null = null;
+  for (const e of entries) {
+    if (!CONTENT_ACTIONS.has(e.action) || !e.payload) continue;
+    // CROSS-BOOK POLLUTION. reconstructTsvBases matches `(book = ? OR book IS
+    // NULL)`, and prod holds 7,689 tn/tq/twl edit_log rows with a NULL book
+    // (migration 0017's backfill is best-effort: LIMIT 1 on an ambiguous id, and
+    // rows whose owner no longer exists keep NULL). Row ids are unique only per
+    // (book, id), so a NULL-book entry for id "ab12" can be GEN's history
+    // folding into AMO's "ab12" ancestor. References are low-entropy — chapter 1
+    // verse 2 is common — so a coincidental match is not far-fetched, and here it
+    // would decide whether the export may overwrite master. An entry we cannot
+    // prove belongs to this row is worth less than no entry at all, so it is
+    // skipped. (foldTsvBase keeps the pre-existing behavior: a wrong content
+    // ancestor mis-merges one field, it does not unblock an overwrite. Filed
+    // separately rather than changed under this fix.)
+    if (e.bookKnown === false) continue;
+    const p = e.payload;
+    for (const k of ["chapter", "verse"] as const) {
+      if (!Object.prototype.hasOwnProperty.call(p, k)) continue;
+      const n = refNumber(p[k]);
+      if (n === null) continue;
+      base ??= {};
+      base[k] = n;
+    }
+    // Later spelling wins within one payload only if a payload carried both,
+    // which no writer does; across payloads the newest entry wins either way.
+    //
+    // ONLY A STRING COUNTS, and an explicit null is ABSENT, not "". Both matter:
+    //   - `pipelineImport.ts`'s tn hint expansion writes
+    //     `ref_raw = COALESCE(?5, ref_raw)` — a payload carrying an explicit
+    //     `ref_raw: null` therefore leaves the row's reference UNCHANGED. Folding
+    //     that null to "" would record an ancestor the row never held, and a
+    //     wrong ancestor is the one thing this fold must never produce (see #546).
+    //   - every real writer emits a string here (bookImport's `r["Reference"] ?? ""`,
+    //     rows.ts's `z.string()`, ParsedTsvRow's `refRaw: string`), so anything
+    //     else is a shape we have not seen and must not coerce — `String([...])`
+    //     and `String({})` both yield confident nonsense.
+    // Absence withholds (`unattributable`); that is the safe direction.
+    for (const key of ["ref_raw", "refRaw"] as const) {
+      if (!Object.prototype.hasOwnProperty.call(p, key)) continue;
+      if (typeof p[key] !== "string") continue;
+      base ??= {};
+      base.ref_raw = p[key] as string;
+    }
+  }
+  return base;
+}
+
 export function foldTsvBase(kind: TsvMergeKind, entries: TsvEditLogEntry[]): TsvMergeSide | null {
   const fields = FIELDS_BY_KIND[kind];
   let base: TsvMergeSide | null = null;

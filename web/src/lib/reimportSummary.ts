@@ -20,7 +20,45 @@ export function summarizeReimport(res: ReimportResponse): string {
   if (t.skipped_noop) parts.push(`${t.skipped_noop} unchanged`);
   if (t.source_attr_reconciled) parts.push(`${t.source_attr_reconciled} source-attr fix(es) synced from master`);
   if (t.merge_adopted) parts.push(`${t.merge_adopted} adopted from master (out-of-band correction)`);
-  if (t.merge_conflicts) parts.push(`${t.merge_conflicts} flagged for review (merge conflict)`);
+  // Kept the app's version of a two-sided change, because no commit from a
+  // Door43 editor's own account was found behind Door43's side (#540 item 2).
+  //
+  // Subtracted from the conflict line rather than added beside it: on the verse
+  // side merge_kept_ai is a strict subset of merge_conflicts, so listing both
+  // reported the same three rows as six. `Math.max(0, …)` is not tidying a
+  // negative away — on the TSV side merge_conflicts is only incremented for a
+  // row that also ADOPTED a field, so a kept-only row is genuinely outside it,
+  // and the counters can legitimately cross.
+  const keptOverDoor43 = t.merge_kept_ai ?? 0;
+  const mergedFromDoor43 = Math.max(0, (t.merge_conflicts ?? 0) - keptOverDoor43);
+  if (mergedFromDoor43) parts.push(`${mergedFromDoor43} flagged for review (merge conflict)`);
+  // Names the direction, like every other line in this list, and does not
+  // promise a publish it cannot schedule — the export is the nightly one, not
+  // something the reader of this snackbar triggers.
+  if (keptOverDoor43)
+    parts.push(
+      `${keptOverDoor43} kept the app's version over Door43's (no Door43 editor's commit found) — ` +
+        `check before the next export`,
+    );
+  // Rows whose Reference disagrees between the app and Door43. Split by who
+  // moved (api/src/tsvMerge.ts's classifyTsvRefMove) because only the held cases
+  // need anyone's attention — a move the app made is an ordinary edit the export
+  // publishes, and reporting it as "flagged" is what used to tell a translator to
+  // undo her own work. The held cases are summed because the human action is the
+  // same for all of them, and the per-row flag carries the specific reason.
+  //
+  // "differs between here and Door43" - deliberately directionless. The bucket
+  // includes `unattributable`, where the sync explicitly could NOT say which side
+  // moved, and `ours_moved_conflict`, where WE moved it. Any phrasing that reads
+  // as "Door43 changed this" would assert in the summary the very thing the
+  // per-row reasons are careful not to claim. The per-row reason carries the
+  // specific, measured story; this line only says a human should look.
+  const refHeld =
+    (t.ref_moved_theirs ?? 0) +
+    (t.ref_moved_both ?? 0) +
+    (t.ref_moved_unattributable ?? 0) +
+    (t.ref_moved_ours_conflict ?? 0);
+  if (refHeld) parts.push(`${refHeld} flagged for review (reference differs between here and Door43)`);
   // Door43 held exactly the file our last export pushed, so its changes were our
   // own merged export rather than anyone else's edit. The pull still ran; what
   // changed is that those edits are no longer mistaken for someone else's work
@@ -39,6 +77,11 @@ export function summarizeReimport(res: ReimportResponse): string {
   // this run did not have. See api/src/reimportClassify.ts / GitHub issue #427.
   const blocked = (t.tombstone_blocked ?? 0) + (t.conflict_skipped ?? 0);
   if (blocked) parts.push(`${blocked} NOT imported (ID still held by a deleted row)`);
+  // A reissued tombstone (master carries the id at a DIFFERENT reference) whose
+  // slot this run reclaimed for master automatically (issue #427, option 1) —
+  // informational, not actionable, so it sits after the blocked-row line rather
+  // than competing with it for attention.
+  if (t.tombstone_reclaimed) parts.push(`${t.tombstone_reclaimed} reissued tombstone(s) reclaimed`);
   if (t.dcs_404) parts.push(`${t.dcs_404} resource(s) not on DCS`);
   if (parts.length === 0) return `Imported ${res.book} — no changes.`;
   return `Imported ${res.book}: ${parts.join(", ")}.`;

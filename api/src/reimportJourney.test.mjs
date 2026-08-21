@@ -1,6 +1,8 @@
-// End-to-end journey for issue #427's option-2 instrumentation, against the
-// REAL production schema (every file in api/migrations, applied in order) and
-// the REAL functions — not hand-copied SQL.
+// End-to-end journey for issue #427's option-2 instrumentation AND option 1
+// (the reclaim it made visible; see api/src/bookReimport.ts's tombstone
+// branch and tombstoneReclaim.test.mjs for reclaim's own dedicated coverage),
+// against the REAL production schema (every file in api/migrations, applied
+// in order) and the REAL functions — not hand-copied SQL.
 //
 // Run from api/ (needs the sqlite flag):
 //   node --experimental-sqlite --experimental-strip-types --no-warnings src/reimportJourney.test.mjs
@@ -15,12 +17,21 @@
 // So this file drives the real applyTsvRows and the real gate.
 //
 // What the journey covers:
-//   (a) the drop is COUNTED   — real applyTsvRows over a real tombstone
-//   (b) the watermark is WITHHELD, and the withhold is visible in the STORED
-//       book_resource_syncs row (not merely in a return value), including that
-//       the taint survives the addCounts aggregation step
+//   (a) a reissued tombstone is now RECLAIMED automatically — the case that
+//       used to only produce a `tombstone_blocked` count now lands master's
+//       row in the same run (option 1, GitHub issue #427)
+//   (a2) a reclaim that LOSES its version-CAS race falls back to
+//        tombstone_blocked exactly as before this fix — never a silent drop
+//   (b) the watermark is WITHHELD (now driven by the (a2) race, since a clean
+//       reclaim no longer needs a withhold), and the withhold is visible in
+//       the STORED book_resource_syncs row (not merely in a return value),
+//       including that the taint survives the addCounts aggregation step
 //   (c) the banner is QUERYABLE from system_alerts, where the UI reads it
 //   (d) the HEALTHY path still stamps origin='reimport' — no false withhold
+//   (e) a RECOVERED resource's stale reimport_id_blocked alert is actually
+//       CLEARED once the sync-success path records a watermark for it, and
+//       clearing is scoped to that (book, resource) only — Codex round-3
+//       review on PR #506
 
 import { DatabaseSync } from "node:sqlite";
 import { readdirSync, readFileSync } from "node:fs";
@@ -114,37 +125,100 @@ function masterRow({ id = ID, ref = "23:7", chapter = 23, verse = 7, idCoerced =
   };
 }
 
-console.log("\n[(a) the drop is COUNTED — real applyTsvRows over a real tombstone]");
+console.log("\n[(a) a reissued tombstone is now RECLAIMED — real applyTsvRows, issue #427 option 1]");
 {
   const { sqlite, env } = freshEnv();
   seedTombstone(sqlite);
   const counts = await applyTsvRows(env, BOOK, "tq", [masterRow()], null);
 
-  eq(counts.tombstone_blocked, 1, "tombstone_blocked === 1 (was silent before this fix)");
-  eq(counts.inserted, 0, "nothing was inserted");
-  eq(counts.skipped_edited, 1, "still also counted skipped_edited — existing readers unchanged");
-  eq(counts.conflict_skipped, 0, "NOT counted as a PK conflict: the tombstone branch owns this drop");
-  eq(
-    (counts.blocked_samples ?? []).length,
-    1,
-    "one sample recorded, so the banner can name the row a human must go fix",
-  );
-  eq(
-    (counts.blocked_samples ?? [])[0].includes("5:4") && (counts.blocked_samples ?? [])[0].includes("23:7"),
-    true,
-    "the sample names BOTH references, which is what makes it actionable",
-  );
+  // Before option 1 shipped, this exact scenario (a tombstone master's file
+  // now carries at a DIFFERENT reference) only counted tombstone_blocked and
+  // dropped the row. Now the reimport reclaims the slot in the SAME run.
+  eq(counts.tombstone_reclaimed, 1, "tombstone_reclaimed === 1 — issue #427's option 1 running automatically");
+  eq(counts.tombstone_blocked, 0, "NOT counted blocked — the reclaim landed, nothing left to withhold for");
+  eq(counts.inserted, 0, "not an insert — the existing (book, id) slot was reclaimed in place, not created fresh");
+  eq(counts.skipped_edited, 0, "NOT counted skipped_edited — a landed reclaim is neither a skip nor a plain edit");
+  eq(counts.conflict_skipped, 0, "NOT counted as a PK conflict: the tombstone branch owns this row");
+  eq((counts.blocked_samples ?? []).length, 0, "no blocked sample — nothing was blocked this run");
 
-  // The data loss is real: master's row is genuinely absent from D1.
-  const stored = sqlite.prepare(`SELECT chapter, question, deleted_at FROM tq_rows WHERE book = ? AND id = ?`).all(BOOK, ID);
+  // Master's row genuinely lives in D1 now, in the SAME primary-key slot the
+  // tombstone used to hold.
+  const stored = sqlite
+    .prepare(`SELECT chapter, verse, question, deleted_at, updated_by, version FROM tq_rows WHERE book = ? AND id = ?`)
+    .all(BOOK, ID);
   eq(stored.length, 1, "still exactly one row for that (book, id)");
-  eq(stored[0].chapter, 5, "the surviving row is the old 5:4 tombstone");
-  eq(stored[0].question, "old question", "master's text never landed — option 2 reports the loss, it does not fix it");
+  eq(stored[0].chapter, 23, "the row now carries master's chapter — the REISSUED reference, not the tombstone's old one");
+  eq(stored[0].verse, 7, "and master's verse");
+  eq(stored[0].question, "new question", "and master's content — the reclaim actually landed the row, it did not just report it");
+  eq(stored[0].deleted_at, null, "no longer a tombstone");
+  eq(stored[0].updated_by, null, "master-owned going forward, same as a fresh insert");
+  eq(stored[0].version, 2, "version bumped from the tombstone's stored version — CAS stays live for future writes");
 
   // THE DRIFT DETECTOR. If anyone adds `deleted_at IS NULL` to applyTsvRows'
   // `existing` read, the tombstone stops being found, this row takes the INSERT
-  // path instead, and these two assertions flip — which is the whole point.
-  eq(counts.conflict_skipped + counts.tombstone_blocked, 1, "exactly one drop counted, by exactly one route");
+  // path instead, and these assertions flip — which is the whole point.
+  eq(
+    counts.conflict_skipped + counts.tombstone_blocked + counts.tombstone_reclaimed,
+    1,
+    "exactly one drop-or-reclaim counted, by exactly one route",
+  );
+}
+
+// Wrap an env.DB so the FIRST reclaim write this run issues is preceded by an
+// out-of-band version bump on the SAME tombstoned row — exactly as a
+// concurrent writer (another reimport instance, a hand-edit landing between
+// applyTsvRows' initial `existing` read and this batched write) would do. The
+// reclaim write is identified by its distinctive SQL shape: `updated_by =
+// NULL,` in the SET clause together with `deleted_at IS NOT NULL` in the
+// WHERE — only buildTsvUpdateStmt's `reclaim` mode produces that combination
+// (resurrect's SET never touches updated_by; reseedAi's WHERE requires
+// `deleted_at IS NULL`, the opposite). This drives a REAL, CAS-losing reclaim
+// through the real function, instead of hand-asserting what "should" happen
+// on a race — see api/src/bookReimport.ts's reclaim batch for the fallback
+// this is meant to prove.
+function withReclaimRace(env, sqlite, book, id) {
+  let fired = false;
+  return {
+    ...env,
+    DB: {
+      ...env.DB,
+      async batch(stmts) {
+        if (
+          !fired &&
+          stmts.some((s) => s.sql.includes("updated_by = NULL,") && s.sql.includes("deleted_at IS NOT NULL"))
+        ) {
+          fired = true;
+          sqlite.prepare(`UPDATE tq_rows SET version = version + 1 WHERE book = ? AND id = ?`).run(book, id);
+        }
+        return env.DB.batch(stmts);
+      },
+    },
+  };
+}
+
+console.log("\n[(a2) a reclaim that LOSES its version-CAS race falls back to tombstone_blocked, never a silent drop]");
+{
+  const { sqlite, env } = freshEnv();
+  seedTombstone(sqlite);
+  const raced = withReclaimRace(env, sqlite, BOOK, ID);
+  const counts = await applyTsvRows(raced, BOOK, "tq", [masterRow()], null);
+
+  eq(counts.tombstone_reclaimed, 0, "the reclaim did NOT land — the race won");
+  eq(counts.tombstone_blocked, 1, "falls back to tombstone_blocked — exactly as if reclaim had never been attempted");
+  eq(
+    (counts.blocked_samples ?? [])[0]?.includes(ID),
+    true,
+    "the sample still names the row, so the fallback is exactly as actionable as the pre-reclaim behavior",
+  );
+
+  // And nothing was clobbered: the row that won the race is untouched by this
+  // run's reclaim attempt (still the OLD tombstone content, just at the newer
+  // version the race stamped).
+  const stored = sqlite.prepare(`SELECT chapter, question, deleted_at, version FROM tq_rows WHERE book = ? AND id = ?`).all(BOOK, ID);
+  eq(stored[0].chapter, 5, "the row the race left behind is untouched by the losing reclaim write");
+  eq(stored[0].question, "old question", "content untouched — a lost CAS never partially applies");
+  eq(stored[0].deleted_at != null, true, "still a tombstone — the race bumped version, not deleted_at");
+  eq(stored[0].version, 2, "version reflects the race's bump, not the reclaim's (failed) write");
 }
 
 console.log("\n[the same-reference tombstone must NOT count — it is a delete awaiting export]");
@@ -173,7 +247,11 @@ console.log("\n[(b) the watermark is WITHHELD, and the STORED row proves it]");
 {
   const { sqlite, env } = freshEnv();
   seedTombstone(sqlite);
-  const counts = await applyTsvRows(env, BOOK, "tq", [masterRow()], null);
+  // Force the lost-CAS fallback (see (a2) above) so this run still produces a
+  // real tombstone_blocked count to withhold on — the ordinary reissue case in
+  // (a) now reclaims and no longer needs (or triggers) a withhold at all.
+  const raced = withReclaimRace(env, sqlite, BOOK, ID);
+  const counts = await applyTsvRows(raced, BOOK, "tq", [masterRow()], null);
 
   // The gate is consulted on the AGGREGATE, not on this raw object — that is the
   // step where an absent counter could be laundered into a present zero. Prove
@@ -205,7 +283,8 @@ console.log("\n[(c) the banner is QUERYABLE where the UI reads it]");
 {
   const { sqlite, env } = freshEnv();
   seedTombstone(sqlite);
-  const counts = await applyTsvRows(env, BOOK, "tq", [masterRow()], null);
+  const raced = withReclaimRace(env, sqlite, BOOK, ID);
+  const counts = await applyTsvRows(raced, BOOK, "tq", [masterRow()], null);
   const { raiseTombstoneBlockAlertForTest } = await import("./bookReimport.ts");
   await raiseTombstoneBlockAlertForTest(env, BOOK, "tq", counts);
 
@@ -216,10 +295,19 @@ console.log("\n[(c) the banner is QUERYABLE where the UI reads it]");
   eq(alert?.severity, "error", "raised at error severity");
   eq(alert?.message.includes("1CH"), true, "names the book");
   eq(alert?.message.includes("hoig"), true, "names the actual blocked row id, so it is actionable");
+  // Since option 1 shipped, a `tombstone_blocked` count means the reclaim
+  // LOST its version-CAS race (this scenario), not a permanent freeze — the
+  // message now says so, instead of the pre-fix "does NOT clear on its own"
+  // framing, which no longer describes this case honestly.
+  eq(
+    alert?.message.includes("should resolve automatically"),
+    true,
+    "states the expected-to-self-heal-on-retry consequence, not a permanent freeze",
+  );
   eq(
     alert?.message.includes("does NOT clear on its own"),
-    true,
-    "states the freeze-until-a-human-acts consequence plainly",
+    false,
+    "the pre-reclaim 'does NOT clear on its own' framing no longer applies to a pure reclaim-race block",
   );
   eq(
     alert?.message.includes("re-run the sync"),
@@ -247,6 +335,403 @@ console.log("\n[(d) the HEALTHY path still stamps — no false withhold]");
 
   const alerts = sqlite.prepare(`SELECT COUNT(*) AS n FROM system_alerts WHERE source LIKE 'reimport_id_blocked:%'`).all()[0];
   eq(Number(alerts.n), 0, "and no banner is raised on a clean run");
+}
+
+// ── Reference-move attribution, at the CALLER (issue #540 item 3) ───────────
+// classifyTsvRefMove/foldTsvRefBase are unit-tested, but every consequence that
+// matters lives in applyTsvRows: whether apply_incomplete is set (which withholds
+// the resource watermark and blocks the nightly export), whether the row is
+// flagged, and whether a stale flag is cleared. This drives the REAL applyTsvRows
+// over real SQLite, which is the only place those can be observed.
+console.log("\n[reference-move attribution at the caller]");
+{
+  // An edited tq row that the APP moved 1:2 -> 1:6 after the watermark, while
+  // master still sits at the ancestor. The livelock case.
+  const seedUser = (sqlite) =>
+    sqlite
+      .prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (7, 7007, 'translator')`)
+      .run();
+  const seedMoved = (sqlite, { reviewKind = null } = {}) => {
+    seedUser(sqlite);
+    sqlite
+      .prepare(
+        `INSERT INTO tq_rows (id, book, chapter, verse, ref_raw, question, response, sort_order, updated_by, version, review_kind, review_reason)
+         VALUES ('mv01', ?, 1, 6, '1:6', 'our question', 'our response', 10, 7, 3, ?, ?)`,
+      )
+      .run(BOOK, reviewKind, reviewKind ? "some earlier reason" : null);
+    // Ancestor: the row at 1:2, logged before the boundary.
+    const e = sqlite
+      .prepare(
+        `INSERT INTO edit_log (kind, row_key, book, action, payload_json, created_at)
+         VALUES ('tq', 'mv01', ?, 'create', ?, 100)`,
+      )
+      .run(BOOK, JSON.stringify({ chapter: 1, verse: 2, ref_raw: "1:2", question: "our question", response: "our response" }));
+    return Number(e.lastInsertRowid);
+  };
+  const masterAt = (ref, chapter, verse, extra = {}) => ({
+    id: "mv01", idCoerced: false, refRaw: ref, chapter, verse,
+    occurrence: null, tags: null, quote: null,
+    question: "our question", response: "our response", ...extra,
+  });
+
+  // 1. Pure app-side move: no hold, no flag. This is the whole point.
+  {
+    const { sqlite, env } = freshEnv();
+    const boundary = seedMoved(sqlite);
+    const counts = await applyTsvRows(env, BOOK, "tq", [masterAt("1:2", 1, 2)], null, {
+      confirmedAt: 200, editId: boundary,
+    });
+    eq(counts.ref_moved_ours, 1, "app-side move is attributed to us");
+    eq(counts.apply_incomplete, false, "…and does NOT withhold the resource watermark (the livelock kill)");
+    const row = sqlite.prepare(`SELECT review_kind, version FROM tq_rows WHERE id='mv01'`).all()[0];
+    eq(row.review_kind, null, "…and raises no flag");
+    eq(row.version, 3, "…and writes nothing, so the version does not move");
+  }
+
+  // 2. Same move, but a previous run left the mis-attributed flag. Cleared, once.
+  {
+    const { sqlite, env } = freshEnv();
+    const boundary = seedMoved(sqlite, { reviewKind: "ref_moved" });
+    const counts = await applyTsvRows(env, BOOK, "tq", [masterAt("1:2", 1, 2)], null, {
+      confirmedAt: 200, editId: boundary,
+    });
+    eq(counts.apply_incomplete, false, "clearing a stale flag does not withhold the watermark");
+    const row = sqlite.prepare(`SELECT review_kind, review_reason FROM tq_rows WHERE id='mv01'`).all()[0];
+    eq(row.review_kind, null, "the stale ref_moved flag is cleared");
+    eq(row.review_reason, null, "…reason too");
+  }
+
+  // 3. A merge_conflict flag is NOT collateral damage of that clear.
+  {
+    const { sqlite, env } = freshEnv();
+    const boundary = seedMoved(sqlite, { reviewKind: "merge_conflict" });
+    await applyTsvRows(env, BOOK, "tq", [masterAt("1:2", 1, 2)], null, { confirmedAt: 200, editId: boundary });
+    const row = sqlite.prepare(`SELECT review_kind FROM tq_rows WHERE id='mv01'`).all()[0];
+    eq(row.review_kind, "merge_conflict", "an unacknowledged merge_conflict survives an ours_moved run");
+  }
+
+  // 4. Master moved instead: the old behavior, hold + flag, must be intact.
+  {
+    const { sqlite, env } = freshEnv();
+    // D1 back at the ancestor, master re-anchored.
+    sqlite.prepare(`UPDATE tq_rows SET chapter=1, verse=2, ref_raw='1:2' WHERE id='mv01'`).run();
+    const boundary = seedMoved(sqlite);
+    sqlite.prepare(`UPDATE tq_rows SET chapter=1, verse=2, ref_raw='1:2' WHERE id='mv01'`).run();
+    const counts = await applyTsvRows(env, BOOK, "tq", [masterAt("1:9", 1, 9)], null, {
+      confirmedAt: 200, editId: boundary,
+    });
+    eq(counts.ref_moved_theirs, 1, "a master-side move is attributed to Door43");
+    eq(counts.apply_incomplete, true, "…and still withholds the resource watermark");
+    const row = sqlite.prepare(`SELECT review_kind, review_reason FROM tq_rows WHERE id='mv01'`).all()[0];
+    eq(row.review_kind, "ref_moved", "…and flags the row");
+    eq(row.review_reason.includes("A Door43 editor moved this row"), true, "…naming Door43, which the ancestor proves");
+    eq(row.review_reason.includes("export stays on hold"), true, "…and saying what actually releases the hold");
+  }
+
+  // 5. No ancestor at all: holds, and must NOT name Door43.
+  {
+    const { sqlite, env } = freshEnv();
+    seedUser(sqlite);
+    sqlite
+      .prepare(
+        `INSERT INTO tq_rows (id, book, chapter, verse, ref_raw, question, response, sort_order, updated_by, version)
+         VALUES ('mv02', ?, 1, 6, '1:6', 'q', 'r', 10, 7, 3)`,
+      )
+      .run(BOOK);
+    const counts = await applyTsvRows(
+      env, BOOK, "tq",
+      [{ id: "mv02", idCoerced: false, refRaw: "1:2", chapter: 1, verse: 2, occurrence: null, tags: null, quote: null, question: "q", response: "r" }],
+      null, { confirmedAt: 200, editId: 999999 },
+    );
+    eq(counts.ref_moved_unattributable, 1, "no ancestor -> unattributable");
+    eq(counts.apply_incomplete, true, "…still holds (fail safe)");
+    const row = sqlite.prepare(`SELECT review_reason FROM tq_rows WHERE id='mv02'`).all()[0];
+    eq(row.review_reason.includes("Door43 editor moved"), false, "…and never claims a Door43 editor moved it");
+    eq(row.review_reason.includes("no edit history survives"), true, "…it states the measured cause");
+  }
+
+  // 6. A second nightly over an UNCHANGED ref_moved row must not re-bump the
+  //    version (#567). flagRefMoved's dedup guard compares cur.review_reason
+  //    to the reason it is about to write and no-ops when they already match —
+  //    which only works if the `existing` SELECT actually fetches review_reason.
+  //    Runs the real master-side-move case (case 4) twice over the same D1
+  //    state and checks the row is byte-for-byte unchanged after the repeat.
+  {
+    const { sqlite, env } = freshEnv();
+    sqlite.prepare(`UPDATE tq_rows SET chapter=1, verse=2, ref_raw='1:2' WHERE id='mv01'`).run();
+    const boundary = seedMoved(sqlite);
+    sqlite.prepare(`UPDATE tq_rows SET chapter=1, verse=2, ref_raw='1:2' WHERE id='mv01'`).run();
+    const opts = { confirmedAt: 200, editId: boundary };
+    const first = await applyTsvRows(env, BOOK, "tq", [masterAt("1:9", 1, 9)], null, opts);
+    eq(first.ref_moved_theirs, 1, "first nightly flags the master-side move");
+    const afterFirst = sqlite.prepare(`SELECT version, review_kind, review_reason FROM tq_rows WHERE id='mv01'`).all()[0];
+    eq(afterFirst.review_kind, "ref_moved", "…row is flagged");
+
+    const second = await applyTsvRows(env, BOOK, "tq", [masterAt("1:9", 1, 9)], null, opts);
+    eq(second.ref_moved_theirs, 1, "second nightly still classifies the row as theirs_moved");
+    const afterSecond = sqlite.prepare(`SELECT version, review_kind, review_reason FROM tq_rows WHERE id='mv01'`).all()[0];
+    eq(afterSecond.version, afterFirst.version, "…but an unchanged reason does not re-bump the version (#567)");
+    eq(afterSecond.review_reason, afterFirst.review_reason, "…the reason text itself is unchanged");
+  }
+}
+
+// ── AI-vs-human conflict policy at the caller (#540 item 2) ─────────────────
+// The pure computeTsvMerge decision is covered in tsvMerge.test.mjs. What is
+// NOT — and where every defect in the last change of this shape lived — is the
+// caller: whether a keep_ai_master row is actually written, flagged, counted,
+// and, critically, whether it withholds the resource watermark. It must not:
+// the export is how the kept human edit reaches Door43.
+console.log("\n[AI-vs-human conflict policy at the caller]");
+{
+  const seedContested = (sqlite) => {
+    sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (7, 7007, 'translator')`).run();
+    sqlite
+      .prepare(
+        `INSERT INTO tq_rows (id, book, chapter, verse, ref_raw, quote, question, response, sort_order, updated_by, version)
+         VALUES ('ai01', ?, 1, 2, '1:2', null, 'our question', 'our response', 10, 7, 3)`,
+      )
+      .run(BOOK);
+    // The ancestor: what D1 held when the export last published this row.
+    const e = sqlite
+      .prepare(
+        `INSERT INTO edit_log (kind, row_key, book, action, payload_json, created_at)
+         VALUES ('tq', 'ai01', ?, 'create', ?, 100)`,
+      )
+      .run(
+        BOOK,
+        JSON.stringify({ chapter: 1, verse: 2, ref_raw: "1:2", question: "our question", response: "base response" }),
+      );
+    return Number(e.lastInsertRowid);
+  };
+  // Master's row: the response moved on that side too, so BOTH sides moved it.
+  const masterRowAt = (response) => ({
+    id: "ai01", idCoerced: false, refRaw: "1:2", chapter: 1, verse: 2,
+    occurrence: null, tags: null, quote: null, question: "our question", response,
+  });
+  const AI_ONLY = {
+    mayHoldHumanEdit: false, hasHumanCommit: false, incomplete: false, incompleteReason: "",
+    counts: { ours: 1, ai: 1, human: 0 }, humanShas: [],
+  };
+  const HAS_HUMAN = {
+    mayHoldHumanEdit: true, hasHumanCommit: true, incomplete: false, incompleteReason: "",
+    counts: { ours: 1, ai: 0, human: 1 }, humanShas: ["abc123"],
+  };
+  const readRow = (sqlite) =>
+    sqlite.prepare(`SELECT response, review_kind, review_reason, version FROM tq_rows WHERE id='ai01'`).all()[0];
+
+  // 1. The AMO 4:2 shape. Only our export and the pipeline moved master, so the
+  //    app edit wins — and it is still flagged, because a human should look.
+  {
+    const { sqlite, env } = freshEnv();
+    const boundary = seedContested(sqlite);
+    const counts = await applyTsvRows(env, BOOK, "tq", [masterRowAt("the AI run's response")], null, {
+      confirmedAt: 200, editId: boundary, lineage: AI_ONLY,
+    });
+    const row = readRow(sqlite);
+    eq(row.response, "our response", "the app edit is KEPT — master's AI-authored value never lands");
+    eq(counts.merge_kept_ai, 1, "…counted as merge_kept_ai");
+    eq(counts.merge_adopted, 0, "…and never counted as an adoption");
+    eq(counts.merge_refused, 0, "…and never as a refusal, which would freeze the export at 5");
+    eq(counts.apply_incomplete, false, "…and does NOT withhold the watermark: the export must publish this");
+    // A DISTINCT review_kind, not just distinct prose: the cleanup chip titles
+    // itself from this column, and "Merged Door43 edit" over a kept row is the
+    // reverse of what happened.
+    eq(row.review_kind, "merge_kept", "…the row is flagged for review, as a KEPT row");
+    eq(
+      row.review_reason.startsWith("Your response was kept over Door43's"),
+      true,
+      "…the reason leads with the outcome (the chip clamps to two lines)",
+    );
+    eq(
+      row.review_reason.includes("no commit from a Door43 editor's own account was found"),
+      true,
+      "…and states the measured cause, not an inferred one",
+    );
+    eq(
+      row.review_reason.includes("was merged over your app-side change"),
+      false,
+      "…never the opposite claim, that Door43's edit won",
+    );
+    eq(
+      row.review_reason.includes("will be published to Door43"),
+      false,
+      "…and never promises a publish this per-row code cannot schedule",
+    );
+    eq(row.version, 4, "…the flag write bumps the version once");
+
+    // 2. Re-running the same night's shape must not churn the version. The
+    //    condition recurs every sync until a human resolves it, and a flag-only
+    //    write is still a write (#539).
+    const again = await applyTsvRows(env, BOOK, "tq", [masterRowAt("the AI run's response")], null, {
+      confirmedAt: 200, editId: boundary, lineage: AI_ONLY,
+    });
+    eq(again.merge_kept_ai, 1, "the conflict is still detected on the next run");
+    eq(readRow(sqlite).version, 4, "…but an unchanged flag is not re-written");
+  }
+
+  // 3. A human commit on master since the ancestor: unchanged behaviour, master
+  //    still wins. This is the half of the policy that must NOT move.
+  {
+    const { sqlite, env } = freshEnv();
+    const boundary = seedContested(sqlite);
+    const counts = await applyTsvRows(env, BOOK, "tq", [masterRowAt("a maintainer's fix")], null, {
+      confirmedAt: 200, editId: boundary, lineage: HAS_HUMAN,
+    });
+    const row = readRow(sqlite);
+    eq(row.response, "a maintainer's fix", "a human-authored master edit still wins the collision");
+    eq(counts.merge_adopted, 1, "…counted as an adoption");
+    eq(counts.merge_kept_ai, 0, "…and not as a kept AI conflict");
+    eq(row.review_reason.includes("was merged over your app-side change"), true, "…with the pre-existing wording");
+  }
+
+  // 4. No lineage at all — the field an in-flight Workflow's memoized plan does
+  //    not carry. Must read as "a human may have", i.e. today's behaviour.
+  {
+    const { sqlite, env } = freshEnv();
+    const boundary = seedContested(sqlite);
+    const counts = await applyTsvRows(env, BOOK, "tq", [masterRowAt("a maintainer's fix")], null, {
+      confirmedAt: 200, editId: boundary,
+    });
+    eq(readRow(sqlite).response, "a maintainer's fix", "an absent lineage keeps master-wins, not D1-wins");
+    eq(counts.merge_kept_ai, 0, "…and never reports a kept AI conflict it did not measure");
+  }
+
+  // 5. A row that ALSO moved reference keeps the reference-move flag. That flag
+  //    is the only thing telling the translator why the whole book+resource has
+  //    stopped exporting, and a kept-conflict message replacing it would both
+  //    destroy that and describe an export that is not going to run.
+  {
+    const { sqlite, env } = freshEnv();
+    const boundary = seedContested(sqlite);
+    const moved = { ...masterRowAt("the AI run's response"), refRaw: "1:9", verse: 9 };
+    const counts = await applyTsvRows(env, BOOK, "tq", [moved], null, {
+      confirmedAt: 200, editId: boundary, lineage: AI_ONLY,
+    });
+    const row = readRow(sqlite);
+    eq(counts.apply_incomplete, true, "a master-side reference move still withholds the watermark");
+    eq(row.review_kind, "ref_moved", "…and the row keeps the reference-move flag, not the kept-conflict one");
+    eq(
+      row.review_reason.includes("kept over Door43's"),
+      false,
+      "…so the hold's explanation is not overwritten by a publish the hold prevents",
+    );
+  }
+
+  // 6. An INCOMPLETE walk that happened to see no human commit is not the same
+  //    claim as a complete one that found none — and only the complete one may
+  //    flip the outcome.
+  {
+    const { sqlite, env } = freshEnv();
+    const boundary = seedContested(sqlite);
+    const counts = await applyTsvRows(env, BOOK, "tq", [masterRowAt("a maintainer's fix")], null, {
+      confirmedAt: 200,
+      editId: boundary,
+      lineage: {
+        mayHoldHumanEdit: true, hasHumanCommit: false, incomplete: true, incompleteReason: "page_cap",
+        counts: { ours: 0, ai: 3, human: 0 }, humanShas: [],
+      },
+    });
+    eq(readRow(sqlite).response, "a maintainer's fix", "an incomplete walk protects master exactly like a human commit");
+    eq(counts.merge_kept_ai, 0, "…and does not report a kept AI conflict");
+  }
+}
+
+// ── merge_no_base_refs folds through the REAL addCounts (issue #537) ─────────
+// The banner's ref list is a capped diagnostic sample merged across Workflow
+// chunks. Everything that makes it safe lives in addCounts — the cap, and
+// tolerating a chunk memoized before the field existed — and none of it was
+// covered, so a dropped `break` or a missing `??` would have gone red nowhere.
+// Folds through the same real aliases the blocked_samples case above uses,
+// rather than re-implementing the aggregation.
+{
+  const { zeroCountsForTest, addCountsForTest } = await import("./bookReimport.ts").then((m) => ({
+    zeroCountsForTest: m.zeroCountsForTest,
+    addCountsForTest: m.addCountsForTest,
+  }));
+
+  // Two chunks' worth of refs merge and accumulate.
+  const agg = zeroCountsForTest();
+  const chunkA = zeroCountsForTest();
+  chunkA.merge_no_base = 2;
+  chunkA.merge_no_base_refs = ["40:5", "40:6"];
+  const chunkB = zeroCountsForTest();
+  chunkB.merge_no_base = 1;
+  chunkB.merge_no_base_refs = ["42:2"];
+  addCountsForTest(agg, chunkA);
+  addCountsForTest(agg, chunkB);
+  eq(agg.merge_no_base, 3, "counts sum across chunks");
+  eq((agg.merge_no_base_refs ?? []).join(","), "40:5,40:6,42:2", "refs concatenate in chunk order");
+
+  // A chunk memoized before the field existed carries a count and NO refs. It
+  // must fold without throwing and without poisoning the count — the banner
+  // then reports a count larger than the sample, which buildNoBaseSentence
+  // renders as "+N more".
+  const legacy = zeroCountsForTest();
+  legacy.merge_no_base = 5;
+  delete legacy.merge_no_base_refs;
+  addCountsForTest(agg, legacy);
+  eq(agg.merge_no_base, 8, "a pre-field chunk still contributes its count");
+  eq((agg.merge_no_base_refs ?? []).length, 3, "…and contributes no refs, rather than undefined-poisoning the list");
+
+  // The cap holds under a flood, and the aggregate never exceeds it.
+  const flood = zeroCountsForTest();
+  flood.merge_no_base = 500;
+  flood.merge_no_base_refs = Array.from({ length: 500 }, (_, i) => `9:${i}`);
+  const capped = zeroCountsForTest();
+  addCountsForTest(capped, flood);
+  const cap = (await import("./verseMergeEditorAlerts.ts")).NO_BASE_REF_DISPLAY;
+  eq((capped.merge_no_base_refs ?? []).length, cap, "addCounts enforces the ref cap");
+  eq(capped.merge_no_base, 500, "…while the authoritative count is uncapped");
+
+  // A fresh zeroCounts must not alias another accumulator's array.
+  const one = zeroCountsForTest();
+  const two = zeroCountsForTest();
+  one.merge_no_base_refs.push("1:1");
+  eq((two.merge_no_base_refs ?? []).length, 0, "zeroCounts allocates a fresh refs array per call (no aliasing)");
+}
+
+console.log("\n[(e) a RECOVERED resource clears its stale reimport_id_blocked alert — Codex round-3 review on PR #506]");
+{
+  // The alert's own message promises the reclaim-race half "usually resolves
+  // automatically" (see (c) above) — but until clearTombstoneBlockAlert
+  // existed, nothing ever actually deleted it once the resource recovered:
+  // raiseTombstoneBlockAlert only runs while STILL withheld, so a resolved
+  // alert sat active in the banner forever, falsely claiming the resource was
+  // still out of sync.
+  const { sqlite, env } = freshEnv();
+  const { raiseTombstoneBlockAlertForTest, clearTombstoneBlockAlertForTest } = await import("./bookReimport.ts");
+
+  // Simulate last night: a reclaim lost its version-CAS race and raised the
+  // banner, exactly like (c) above.
+  seedTombstone(sqlite);
+  const raced = withReclaimRace(env, sqlite, BOOK, ID);
+  const staleCounts = await applyTsvRows(raced, BOOK, "tq", [masterRow()], null);
+  await raiseTombstoneBlockAlertForTest(env, BOOK, "tq", staleCounts);
+  const before = sqlite
+    .prepare(`SELECT COUNT(*) AS n FROM system_alerts WHERE source = ? AND dismissed_at IS NULL`)
+    .all(`reimport_id_blocked:${BOOK}:tq`)[0];
+  eq(Number(before.n), 1, "sanity: the stale alert exists before recovery");
+
+  // Also raise one for a DIFFERENT book/resource — clearing must be scoped,
+  // never a blanket wipe of every open reimport_id_blocked alert.
+  await raiseTombstoneBlockAlertForTest(env, "AMO", "tn", staleCounts);
+
+  // Tonight: the race resolved (the tombstoned row is no longer contested),
+  // so the resource syncs cleanly this run. Exercise exactly the two calls
+  // runChunkedReimport's sync-success branch makes, in the same order:
+  // recordResourceSync (the watermark stamp), then clearTombstoneBlockAlert.
+  await recordResourceSync(env, BOOK, "tq", "def456abc789", "reimport");
+  await clearTombstoneBlockAlertForTest(env, BOOK, "tq");
+
+  const after = sqlite
+    .prepare(`SELECT COUNT(*) AS n FROM system_alerts WHERE source = ? AND dismissed_at IS NULL`)
+    .all(`reimport_id_blocked:${BOOK}:tq`)[0];
+  eq(Number(after.n), 0, "the recovered resource's alert is cleared");
+
+  const otherStillOpen = sqlite
+    .prepare(`SELECT COUNT(*) AS n FROM system_alerts WHERE source = ? AND dismissed_at IS NULL`)
+    .all(`reimport_id_blocked:AMO:tn`)[0];
+  eq(Number(otherStillOpen.n), 1, "a DIFFERENT (book, resource)'s alert is untouched — clearing is scoped, not a blanket wipe");
 }
 
 if (failed > 0) {

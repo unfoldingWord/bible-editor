@@ -5,7 +5,14 @@
 //
 // Not a test framework; a failed assert exits non-zero.
 
-import { dcsFileSize, dcsRawUrl, fetchDcsMasterText, fetchDcsMasterTextVerified, fetchText } from "./dcsSources.ts";
+import {
+  dcsFileSize,
+  dcsRawUrl,
+  fetchDcsMasterText,
+  fetchDcsMasterTextVerified,
+  fetchText,
+  listMasterCommitsSince,
+} from "./dcsSources.ts";
 
 // A realistic-shaped full commit SHA (40 hex chars) — the only kind of `ref`
 // isPinnedCommitSha() (dcsSources.ts) accepts as proof of a single immutable
@@ -372,7 +379,202 @@ async function run() {
 
   console.error = origError;
   console.warn = origWarn;
-  console.log("dcsSources/fetchText + fetchDcsMasterText: all assertions passed");
+
+  // ── listMasterCommitsSince pagination (issue #540 item 1) ─────────────────
+  // Measured against git.door43.org on 2026-08-19: Gitea IGNORES `limit` on the
+  // commits endpoint (a 15-commit file returns all 15 for `limit=2`; a
+  // 143-commit file returns 50 for `limit=100`) and pages at a fixed 50, but it
+  // does send real `X-PageCount` / `X-HasMore` headers. So end-of-history must
+  // come from the headers, never from `batch.length < requestedPageSize` — that
+  // inference reads a number the server threw away, and with a requested size
+  // above 50 it calls page 1 the end of history every time, reporting a
+  // `sinceSha` that sits on page 2 as not-in-history forever.
+  {
+    const commitsRes = (arr, { pageCount = 1, hasMore = undefined, page = 1 } = {}) => ({
+      ok: true,
+      status: 200,
+      headers: {
+        get: (k) => {
+          const key = k.toLowerCase();
+          if (key === "x-pagecount") return String(pageCount);
+          if (key === "x-hasmore") return hasMore == null ? null : String(hasMore);
+          if (key === "x-page") return String(page);
+          return null;
+        },
+      },
+      json: async () => arr,
+    });
+    const commit = (sha, message, email) => ({
+      sha,
+      commit: { message, author: { email, name: "x", date: "2026-08-19T00:00:00Z" } },
+    });
+
+    // The header-driven multi-page walk: the ancestor sits on page 2, and page 1
+    // comes back FULL, so a length-based end-of-history test would still walk on
+    // — but a request for more than the server's page size would have stopped.
+    {
+      const pages = [
+        [commit("a", "bible-editor: AMO tq → master (#1)", "b@x"), commit("b", "hand fix", "h@x")],
+        [commit("c", "TQ: AMO 1 [q@api.bp-assistant]", "bot@unfoldingword.org"), commit("ancestor", "old", "h@x")],
+      ];
+      let n = 0;
+      globalThis.fetch = async () => commitsRes(pages[n++], { pageCount: 2, page: n });
+      const r = await listMasterCommitsSince({}, "en_tq", "tq_AMO.tsv", "ancestor");
+      assert(n === 2, "walks onto page 2 to reach an ancestor the first page did not contain");
+      assert(r.incomplete === false, "  ...and completes once the ancestor is seen");
+      assert(r.commits.length === 3, "  ...returning every commit above it, exclusive of the ancestor");
+      assert(r.commits[0].sha === "a" && r.commits[2].sha === "c", "  ...in newest-first order across pages");
+    }
+
+    // A FULL last page (batch.length === whatever the server sends) must still
+    // terminate when the headers say it is the last one. Length alone cannot
+    // tell — this is exactly the shape the old code got wrong.
+    {
+      let n = 0;
+      globalThis.fetch = async () => {
+        n++;
+        return commitsRes([commit("a", "hand fix", "h@x"), commit("b", "another", "h@x")], { pageCount: 1 });
+      };
+      const r = await listMasterCommitsSince({}, "en_tq", "tq_AMO.tsv", "never-here");
+      assert(n === 1, "a full page that the headers call the last one stops the walk");
+      assert(r.incomplete === true, "  ...and an ancestor never seen is incomplete");
+      assert(r.incompleteReason === "source_sha_not_in_history", "  ...named as not-in-history, not as 'no human edits'");
+    }
+
+    // X-HasMore takes precedence when present.
+    {
+      let n = 0;
+      globalThis.fetch = async () => {
+        n++;
+        return commitsRes([commit(`s${n}`, "hand fix", "h@x")], { pageCount: 99, hasMore: false });
+      };
+      const r = await listMasterCommitsSince({}, "en_tq", "tq_AMO.tsv", "never-here");
+      assert(n === 1, "X-HasMore:false ends the walk even when X-PageCount claims more");
+      assert(r.incompleteReason === "source_sha_not_in_history", "  ...as not-in-history");
+    }
+
+    // Neither header present: we cannot tell, so only an EMPTY page stops us —
+    // erring toward one wasted fetch rather than a false end-of-history.
+    {
+      const noHdr = (arr) => ({ ok: true, status: 200, headers: { get: () => null }, json: async () => arr });
+      const pages = [[commit("a", "hand fix", "h@x")], []];
+      let n = 0;
+      globalThis.fetch = async () => noHdr(pages[n++] ?? []);
+      const r = await listMasterCommitsSince({}, "en_tq", "tq_AMO.tsv", "never-here");
+      assert(n === 2, "with no pagination headers, a short page does NOT end the walk");
+      assert(r.incompleteReason === "source_sha_not_in_history", "  ...an empty page does");
+    }
+
+    // The budget cap is a separate, separately-named outcome from end-of-history.
+    {
+      let n = 0;
+      globalThis.fetch = async () => {
+        n++;
+        return commitsRes([commit(`s${n}`, "hand fix", "h@x")], { pageCount: 99 });
+      };
+      const r = await listMasterCommitsSince({}, "en_tq", "tq_AMO.tsv", "never-here", { pageLimit: 2 });
+      assert(n === 2, "the page budget bounds the walk");
+      assert(r.incompleteReason === "page_cap", "  ...and is reported as page_cap, distinct from not-in-history");
+      assert(r.commits.length === 2, "  ...while still reporting what it did walk");
+    }
+
+    // Every failure is `incomplete`, never a silent empty range — that is the
+    // whole safety property, since downstream an incomplete lineage protects
+    // master exactly like a human commit.
+    {
+      globalThis.fetch = async () => ({ ok: false, status: 502, headers: { get: () => null }, json: async () => [] });
+      const r = await listMasterCommitsSince({}, "en_tq", "tq_AMO.tsv", "x");
+      assert(r.incomplete === true && r.incompleteReason === "http_502", "a non-ok response is incomplete, named by status");
+    }
+    {
+      globalThis.fetch = async () => { throw new Error("boom"); };
+      const r = await listMasterCommitsSince({}, "en_tq", "tq_AMO.tsv", "x");
+      assert(r.incomplete === true && r.incompleteReason === "fetch_failed", "a thrown fetch is incomplete");
+    }
+    {
+      globalThis.fetch = async () => ({ ok: true, status: 200, headers: { get: () => null }, json: async () => ({ not: "an array" }) });
+      const r = await listMasterCommitsSince({}, "en_tq", "tq_AMO.tsv", "x");
+      assert(r.incomplete === true && r.incompleteReason === "bad_body", "a non-array body is incomplete");
+    }
+    {
+      const r = await listMasterCommitsSince({}, "en_tq", "tq_AMO.tsv", null);
+      assert(r.incomplete === true && r.incompleteReason === "no_source_sha", "no boundary at all is incomplete without fetching");
+    }
+
+    // ── The WATERMARK bound (#540 item 1). The sync passes master_confirmed_at,
+    // not source_sha, because the two are different points in master's history
+    // and source_sha is routinely newer — see the "WHICH BOUNDARY" note in
+    // dcsSources.ts. A commit hidden between them is exactly the human commit
+    // whose absence would unblock an overwrite.
+    {
+      const at = (iso, sha, message, email) => ({
+        sha,
+        commit: { message, author: { email, name: "x", date: iso } },
+      });
+      const W = Math.floor(Date.parse("2026-08-10T00:00:00Z") / 1000);
+
+      // The whole point: a human commit that sits BELOW source_sha but ABOVE the
+      // watermark is inside the range and must be walked to.
+      {
+        globalThis.fetch = async () =>
+          commitsRes(
+            [
+              at("2026-08-12T00:00:00Z", "s1", "bible-editor: AMO tq → master (#1)", "b@x"),
+              at("2026-08-11T00:00:00Z", "s2", "a maintainer's hand fix", "rich@x"),
+              at("2026-08-09T00:00:00Z", "s3", "older than the watermark", "rich@x"),
+            ],
+            { pageCount: 1 },
+          );
+        const r = await listMasterCommitsSince({}, "en_tq", "tq_AMO.tsv", "s1", { sinceTime: W });
+        assert(r.incomplete === false, "a time-bounded walk completes at the first commit older than the watermark");
+        assert(r.commits.length === 2, "  ...collecting every commit at or after it");
+        assert(r.commits[1].sha === "s2", "  ...INCLUDING one below the sha bound, which is the whole point");
+        assert(r.commits.every((c) => c.sha !== "s3"), "  ...and stopping before the one that predates it");
+      }
+
+      // The sha bound must not end a time-bounded walk early — that is the
+      // defect this parameter exists to close.
+      {
+        globalThis.fetch = async () =>
+          commitsRes(
+            [
+              at("2026-08-12T00:00:00Z", "s1", "TQ: AMO 5 [q@api.bp-assistant]", "bot@unfoldingword.org"),
+              at("2026-08-11T00:00:00Z", "s2", "a maintainer's hand fix", "rich@x"),
+              at("2026-08-09T00:00:00Z", "s3", "older", "rich@x"),
+            ],
+            { pageCount: 1 },
+          );
+        const r = await listMasterCommitsSince({}, "en_tq", "tq_AMO.tsv", "s1", { sinceTime: W });
+        assert(r.commits.length === 2, "the sha is not a stopping point once a time bound is given");
+      }
+
+      // Running out of history under a time bound is COMPLETE, not
+      // not-in-history: everything the file has is inside the range.
+      {
+        globalThis.fetch = async () =>
+          commitsRes([at("2026-08-12T00:00:00Z", "s1", "hand fix", "rich@x")], { pageCount: 1 });
+        const r = await listMasterCommitsSince({}, "en_tq", "tq_AMO.tsv", null, { sinceTime: W });
+        assert(r.incomplete === false, "reaching the end of history under a time bound is a complete walk");
+        assert(r.commits.length === 1, "  ...having walked everything the file has");
+      }
+
+      // An unparseable date does not end the walk. "I cannot read this
+      // timestamp" is not evidence of having gone far enough, so it walks on and
+      // reports page_cap rather than a confident short range.
+      {
+        let n = 0;
+        globalThis.fetch = async () => {
+          n++;
+          return commitsRes([at("not a date", `s${n}`, "hand fix", "rich@x")], { hasMore: true });
+        };
+        const r = await listMasterCommitsSince({}, "en_tq", "tq_AMO.tsv", null, { sinceTime: W, pageLimit: 2 });
+        assert(n === 2, "an unreadable commit date does not end a time-bounded walk");
+        assert(r.incomplete === true && r.incompleteReason === "page_cap", "  ...it runs to the page cap and says so");
+      }
+    }
+  }
+
+  console.log("dcsSources/fetchText + fetchDcsMasterText + listMasterCommitsSince: all assertions passed");
 }
 
 run().catch((e) => {

@@ -137,6 +137,58 @@ lacks(
 lacks(summarizeReimport(res({})), "NOT imported", "no blocked rows → no blocked phrase");
 lacks(summarizeReimport(res({})), "NaN", "absent counters never render as NaN");
 
+// Reference moves (issue #540 item 3). A move the APP made is an ordinary edit
+// the export publishes — reporting it as flagged is exactly what used to tell a
+// translator to undo her own work, so it must not appear here at all.
+lacks(
+  summarizeReimport(res({ ref_moved_ours: 4 })),
+  "reference differs",
+  "a move the app made is not reported as something to review",
+);
+has(
+  summarizeReimport(res({ ref_moved_theirs: 3 })),
+  "3 flagged for review (reference differs between here and Door43)",
+  "a move Door43 made is reported",
+);
+// The three held cases sum: the human action is the same for all of them, and
+// the per-row flag already carries the specific reason.
+has(
+  summarizeReimport(res({ ref_moved_theirs: 1, ref_moved_both: 2, ref_moved_unattributable: 3 })),
+  "6 flagged for review (reference differs between here and Door43)",
+  "theirs + both + unattributable are summed, not listed three times",
+);
+lacks(summarizeReimport(res({})), "reference differs", "no reference moves → no reference phrase");
+
+console.log("\n-- reissued tombstones reclaimed (issue #427, option 1) --");
+
+// 0 / absent must print nothing, matching every other optional counter here.
+lacks(summarizeReimport(res({ tombstone_reclaimed: 0 })), "reclaimed", "0 reclaimed -> no line");
+lacks(summarizeReimport(res({})), "reclaimed", "field absent -> no line");
+
+has(
+  summarizeReimport(res({ tombstone_reclaimed: 3 })),
+  "3 reissued tombstone(s) reclaimed",
+  "reclaimed count is reported",
+);
+eq(
+  summarizeReimport(res({ tombstone_reclaimed: 3 })),
+  "Imported AMO: 3 reissued tombstone(s) reclaimed.",
+  "reclaimed alone -> a complete sentence, not the plain no-changes message",
+);
+
+// Must coexist with (and sit after) the blocked-row line — a reclaim landing
+// and the lost-CAS fallback that still counts blocked are disjoint outcomes
+// for different rows in the same run (see bookReimport.ts's reclaim batch), so
+// a single run can legitimately report both at once.
+const reclaimedAndBlocked = summarizeReimport(res({ tombstone_blocked: 2, tombstone_reclaimed: 5 }));
+has(reclaimedAndBlocked, "2 NOT imported (ID still held by a deleted row)", "blocked line still present");
+has(reclaimedAndBlocked, "5 reissued tombstone(s) reclaimed", "reclaimed line still present");
+eq(
+  reclaimedAndBlocked.indexOf("NOT imported") < reclaimedAndBlocked.indexOf("reclaimed"),
+  true,
+  "the actionable blocked-row count comes BEFORE the informational reclaimed line",
+);
+
 if (failed > 0) {
   console.error(`\n${failed} failure(s)`);
   process.exit(1);

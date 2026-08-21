@@ -335,13 +335,19 @@ eqDeep(
   "twl: nothing differs → null (fate stays edited)",
 );
 
-// ── isReissuedTombstone (issue #427, option 2) ─────────────────────────────
+// ── isReissuedTombstone (issue #427, options 1 and 2) ────────────────────────
 // A soft-deleted row keeps its (book, id) primary key forever, so master's row
-// bearing that id cannot land. Which of the two meanings that has is decided
-// purely by the reference, and the production sweep of 10,645 tombstones
-// (2026-08-10) is the calibration: 0 reissued, 4 same-reference deletes pending
-// export, and replaying the six repaired 1CH tQ rows through the classifier
-// reports exactly 6 — so a zero here means "measured none", not "broken".
+// bearing that id cannot land via the normal INSERT path. Which of the two
+// meanings that has is decided purely by the reference, and the production
+// sweep of 10,645 tombstones (2026-08-10) is the calibration: 0 reissued, 4
+// same-reference deletes pending export, and replaying the six repaired 1CH tQ
+// rows through the classifier reports exactly 6 — so a zero here means
+// "measured none", not "broken". This function's own logic is UNCHANGED by
+// option 1 (reclaim) shipping — bookReimport.ts's applyTsvRows now ACTS on a
+// `true` verdict by writing master's row into the reclaimed slot instead of
+// merely counting it, but the discriminator itself still only answers "same
+// reference or different?" — see the integration coverage in
+// tombstoneReclaim.test.mjs for the write-path behavior this drives.
 console.log("\n[isReissuedTombstone]");
 
 // THE BUG. Six 1CH tQ ids tombstoned at 1CH 5:x were reissued by bp-assistant

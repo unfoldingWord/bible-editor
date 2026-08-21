@@ -22,7 +22,7 @@ import {
 import { requireAuth, requireEditor, currentUserId } from "./auth";
 import { BOOK_NUMBERS, dcsUrls, dcsResourceFile, fileCommitSha, fetchText } from "./dcsSources";
 import { reimportBookFromDcs, recordResourceSync, ALL_RESOURCES, type Resource } from "./bookReimport";
-import { lintChapterOpeningMarkers, lintTnRows, lintTqRows, lintTwlRows, lintUsfmVerses } from "./lint";
+import { lintChapterOpeningMarkers, lintPairedPunctuation, lintTnRows, lintTqRows, lintTwlRows, lintUsfmVerses, lintVerseTextQuality } from "./lint";
 import { effectiveBookLock, canManageLocks, type BookLock } from "./bookLock";
 import { isPublishedBook } from "./publishedGuard";
 import type { TnRow, TqRow, TwlRow, VerseRow } from "./types";
@@ -89,13 +89,14 @@ function lockStateResponse(book: string, lock: BookLock | null) {
   };
 }
 
-// Who last changed a book's lock, and when, is recorded by `book_locks.set_by`
-// / `set_at` — that upsert IS the audit record. Deliberately no system_alerts
-// row: those render as persistent top-of-app banners addressed to a username
-// (see alerts.ts), so auditing there would hand the acting maintainer a banner
-// to dismiss after every lock — noise for a user-initiated action that already
-// has immediate UI feedback. If a full lock/unlock *history* is ever needed,
-// that wants its own append-only table, not the banner channel.
+// `book_locks.set_by` / `set_at` only reflect the MOST RECENT change (it's an
+// upsert), which lost the evidence trail during the #512 incident. Each
+// handler below also appends a row to `book_lock_events` (migration 0051), a
+// dedicated append-only audit table — best-effort, never blocks the request.
+// Deliberately no system_alerts row: those render as persistent top-of-app
+// banners addressed to a username (see alerts.ts), so auditing there would
+// hand the acting maintainer a banner to dismiss after every lock — noise for
+// a user-initiated action that already has immediate UI feedback.
 
 // PUT /api/books/:book/lock — explicitly lock a book (freezes app edits and
 // export, independent of whether it's published). requireEditor gates any
@@ -131,6 +132,19 @@ books.put("/:book/lock", requireEditor, async (c) => {
     .bind(book, reason, userId)
     .run();
 
+  // Append-only audit row (migration 0051) — book_locks is an upsert and
+  // loses the history on the next change, which is what happened in #512.
+  // Best-effort: never fail the lock request over the audit write.
+  try {
+    await c.env.DB.prepare(
+      `INSERT INTO book_lock_events (book, locked, reason, action, user_id) VALUES (?1, 1, ?2, 'lock', ?3)`,
+    )
+      .bind(book, reason, userId)
+      .run();
+  } catch (e) {
+    console.error("book_lock_events insert failed (lock)", book, e);
+  }
+
   const lock = await effectiveBookLock(c.env, book);
   return c.json(lockStateResponse(book, lock));
 });
@@ -159,6 +173,17 @@ books.delete("/:book/lock", requireEditor, async (c) => {
   )
     .bind(book, userId)
     .run();
+
+  // Append-only audit row (migration 0051) — see the PUT handler above.
+  try {
+    await c.env.DB.prepare(
+      `INSERT INTO book_lock_events (book, locked, reason, action, user_id) VALUES (?1, 0, NULL, 'unlock', ?2)`,
+    )
+      .bind(book, userId)
+      .run();
+  } catch (e) {
+    console.error("book_lock_events insert failed (unlock)", book, e);
+  }
 
   const lock = await effectiveBookLock(c.env, book);
   return c.json(lockStateResponse(book, lock));
@@ -232,6 +257,24 @@ books.post("/:book/lock/push", requireEditor, async (c) => {
     }),
   );
 
+  // Append-only audit row (migration 0051) — see the PUT /lock handler
+  // above. Records that the allowLocked converge-push was invoked, not
+  // that the book's lock state changed (it doesn't). `reason` carries the
+  // dispatch outcome ("dispatched N/total") rather than NULL, so a future
+  // investigator can't mistake a push where every create failed for one
+  // that actually ran.
+  try {
+    const dispatched = pushed.filter((p) => "instanceId" in p).length;
+    const outcome = `dispatched ${dispatched}/${pushed.length}`;
+    await c.env.DB.prepare(
+      `INSERT INTO book_lock_events (book, locked, reason, action, user_id) VALUES (?1, 1, ?2, 'lock_push', ?3)`,
+    )
+      .bind(book, outcome, userId)
+      .run();
+  } catch (e) {
+    console.error("book_lock_events insert failed (lock_push)", book, e);
+  }
+
   return c.json({ book, pushed });
 });
 
@@ -281,6 +324,10 @@ books.get("/:book/lint", requireAuth, async (c) => {
     ...lintUsfmVerses(ust.results ?? []).map((i) => ({ ...i, resource: "ust" })),
     ...lintChapterOpeningMarkers(ult.results ?? []).map((i) => ({ ...i, resource: "ult" })),
     ...lintChapterOpeningMarkers(ust.results ?? []).map((i) => ({ ...i, resource: "ust" })),
+    ...lintVerseTextQuality(ult.results ?? []).map((i) => ({ ...i, resource: "ult" })),
+    ...lintVerseTextQuality(ust.results ?? []).map((i) => ({ ...i, resource: "ust" })),
+    ...lintPairedPunctuation(ult.results ?? []).map((i) => ({ ...i, resource: "ult" })),
+    ...lintPairedPunctuation(ust.results ?? []).map((i) => ({ ...i, resource: "ust" })),
   ];
   const flagCount = issues.filter((i) => i.bucket === "flag").length;
   const escalateCount = issues.filter((i) => i.bucket === "escalate").length;

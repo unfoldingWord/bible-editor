@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import {
   generationForSavedPlain,
   generationForSuccessfulOp,
+  pinReleaseAfterVerseOk,
   verseDraftHasActiveSave,
 } from "./draftSaveState.ts";
 
@@ -85,4 +86,31 @@ assert.equal(
   "unrelated legacy verse success preserves the text draft",
 );
 
-console.log("draftSaveState: 17 passed");
+// pinReleaseAfterVerseOk — the #563 pin-leak rule. A landed verse save must
+// release the diff-baseline pin exactly once: via clearGeneration when a
+// matching draft exists, via an explicit unpin when the save was draftless
+// (the dual-aligner reading line never stashes keystrokes), and never when a
+// draft it can't be tied to exists — that draft is newer typing whose baseline
+// the pin protects (#474).
+assert.deepEqual(
+  pinReleaseAfterVerseOk(draft, op("pending")),
+  { kind: "clear", generation: "g-intro" },
+  "matching draft: release rides the generation clear",
+);
+assert.deepEqual(
+  pinReleaseAfterVerseOk(undefined, op("pending")),
+  { kind: "unpin" },
+  "draftless save (reading line): pin released explicitly, or it leaks for the session",
+);
+assert.deepEqual(
+  pinReleaseAfterVerseOk({ ...draft, generation: "g-newer" }, op("pending")),
+  { kind: "keep" },
+  "newer typing raced ahead: its draft still needs the pin — keep it",
+);
+assert.deepEqual(
+  pinReleaseAfterVerseOk(draft, unrelatedLegacyOp),
+  { kind: "keep" },
+  "unrelated legacy op landing does not release a pin a live draft depends on",
+);
+
+console.log("draftSaveState: 21 passed");

@@ -48,8 +48,16 @@ import {
   fileCommitSha,
   fetchText,
   fetchDcsMasterTextVerified,
+  listMasterCommitsSince,
   NT_BOOKS,
 } from "./dcsSources";
+import {
+  classifyMasterCommit,
+  compactLineage,
+  masterMayHoldHumanEdit,
+  summarizeLineage,
+  type MasterLineageSummary,
+} from "./masterLineage.ts";
 import { gitBlobShaOrNull, recognizeOwnPublish, type OwnPublishResult } from "./ownPublish";
 import {
   collectSourceWords,
@@ -73,19 +81,22 @@ import {
   isReissuedTombstone,
 } from "./reimportClassify";
 import {
+  classifyTsvRefMove,
   computeTsvMerge,
   foldTsvBase,
-  tsvRefMoved,
+  foldTsvRefBase,
   type TsvMergeSide,
+  type TsvRefSide,
   type TsvEditLogEntry,
 } from "./tsvMerge.ts";
-import { shouldRecordResourceSync, isSystemicMergeRefusal } from "./reimportSyncGate";
+import { shouldRecordResourceSync, isSystemicMergeRefusal, isKeptOverDoor43AtScale } from "./reimportSyncGate";
 import { computeTwlSortOrderUpdates } from "./twlCanonicalOrder";
 import { applyTwlSortOrderUpdates } from "./twlSortOrderApply";
 import { loadTwTitles } from "./twTitles";
 import { loadTwlOrderLocks } from "./twlOrderLocks";
 import type { TwlRow, VerseRow, CheckLane } from "./types";
 import { computeVerseMerge, type VerseMergeResult } from "./verseMerge.ts";
+import { NO_BASE_REF_DISPLAY } from "./verseMergeEditorAlerts.ts";
 import { verseContentJsonFromPayload } from "./verseHistory.ts";
 import { canonizeAlignmentSource } from "./canonizeHebrew.ts";
 import {
@@ -186,21 +197,50 @@ export interface ReimportCounts {
   // no existing reader changes meaning; this is the specific, gating subset of
   // it. (`skipped_noop` DID change meaning: the PK-conflict case used to be
   // folded into it and no longer is. Readers: reimportSummary.ts's "N unchanged"
-  // and AdminPanel's counter dump.) Fixing the drop itself (reclaiming the id)
-  // is issue #427's option 1 and is deliberately not done here — this run still
-  // loses the row, it just says so and refuses to certify the resource as
-  // synced.
+  // and AdminPanel's counter dump.)
+  //
+  // Issue #427's option 1 (reclaim a reissued id) has SHIPPED — see
+  // `tombstone_reclaimed` below and the tombstone branch of applyTsvRows. This
+  // counter no longer means "master's row was dropped and we only reported it";
+  // for a reissued tombstone the reimport now ATTEMPTS the reclaim in the same
+  // run, and `tombstone_blocked` only still increments for that row when the
+  // reclaim itself lost the version-CAS race (something touched the tombstoned
+  // row between the read and the write) — a residual, expected-to-self-heal-on-
+  // retry case, kept here rather than silently dropped so a lost race is never
+  // quieter than the pre-reclaim behavior. `conflict_skipped` above is unrelated
+  // to reclaim (it's the INSERT-path race) and still behaves exactly as before.
   //
   // NOTE the asymmetry with tsvMerge.ts's `tsvRefMoved`, which answers a
   // similar-sounding question for LIVE rows and also withholds (via
   // apply_incomplete). The two deliberately differ: tsvRefMoved treats any
   // ref_raw difference as a move, including whitespace and a null-vs-populated
   // ref_raw, because for a live row the safe direction is to flag. Here the safe
-  // direction is the opposite — a false positive freezes the book's export with
-  // no automatic release — so isReissuedTombstone normalizes whitespace and
+  // direction is the opposite — a false positive used to freeze the book's
+  // export with no automatic release; now it drives an actual reclaim instead
+  // (see isReissuedTombstone's KNOWN FALSE POSITIVE note in reimportClassify.ts
+  // for what that means) — so isReissuedTombstone normalizes whitespace and
   // falls back to chapter/verse. Keep them separate; do not "unify" one into the
   // other without re-deciding which direction each should fail.
   tombstone_blocked: number;
+  // ── Issue #427, option 1: reclaim a reissued tombstone's slot ────────────────
+  //
+  // A tombstoned row master's file now carries at a DIFFERENT reference (see
+  // isReissuedTombstone) — the exact condition that used to only increment
+  // tombstone_blocked and freeze the export — is now RECLAIMED: master's
+  // incoming row is written into the freed-up (book, id) slot (deleted_at
+  // cleared, content/ref/chapter/verse/sort_order set to master's, version
+  // bumped, updated_by reset to NULL so the row is master-owned going forward).
+  // The old tombstoned row's content and protection flags (trashed_at/preserve/
+  // hint/updated_by) are irrelevant to this decision — master's new row is a
+  // completely different logical entity being written into a slot the old row
+  // merely happened to vacate, not a continuation of it. See the "Batch the
+  // reclaims" write site for the CAS guard this relies on, and the lost-CAS
+  // fallback that still counts tombstone_blocked (never a silent drop).
+  // Audited as "create" (edit_log): from this slot's new life's perspective,
+  // master's row IS a fresh row. Does NOT gate the watermark by itself — a
+  // landed reclaim means master's content IS now in D1, so there is nothing
+  // left to withhold for; only the lost-CAS fallback (tombstone_blocked) does.
+  tombstone_reclaimed: number;
   // Human-readable identification of the rows the two counters above dropped —
   // resource, id, and both references. Capped at BLOCKED_SAMPLE_CAP because the
   // failure mode is a whole book's ids being re-minted at once, and this rides
@@ -255,6 +295,23 @@ export interface ReimportCounts {
   // neither side touched. A subset of merge_conflicts (every refusal needs a
   // human) tracked separately so the reason breakdown is visible. verses only.
   merge_refused: number;
+  // Row or verse where both sides moved since the ancestor but the commit
+  // lineage found NO human commit on master's side, so D1 won and the
+  // collision was flagged instead (#540 item 2, verseMerge/tsvMerge's
+  // "keep_ai_master"). Tracked separately for two reasons: it is the counter
+  // that says whether the AI-vs-human policy is actually firing in production,
+  // and it must never be folded into merge_refused, which freezes the resource's
+  // export at 5 (see isSystemicMergeRefusal — freezing here would strand the very
+  // edit this outcome protected). verses AND tsv.
+  //
+  // Relationship to merge_conflicts differs by side, so do not describe it as a
+  // plain subset: for VERSES it is one, but on the TSV side merge_conflicts is
+  // incremented only for a write that also adopted a field, and a kept-only row
+  // adopts nothing. It also counts DECISIONS, incremented before the write — a
+  // row that then loses the version-CAS race, or whose flag text is unchanged
+  // from last night and so writes nothing, is counted here and skipped_edited
+  // too.
+  merge_kept_ai: number;
   // Verse where computeVerseMerge returned "keep_no_base" — no ancestor was
   // recoverable for this specific verse (edit_log aged past the 180-day
   // retention, or the verse has no edit_log row before book_resource_syncs.
@@ -269,6 +326,26 @@ export interface ReimportCounts {
   // warm-up tradeoff, left as a flagged follow-up (see the failed-adoption-write
   // gate, apply_incomplete, which IS gated).
   merge_no_base: number;
+  // The `chapter:verse` refs behind `merge_no_base`, so the banner can NAME the
+  // verses it admits tonight's export may overwrite instead of reporting a bare
+  // integer. Capped at NO_BASE_REF_CAP: this is a diagnostic list that gates
+  // nothing (merge_no_base stays the authoritative count), and it rides back
+  // through a Workflow step's serialized return value, so it must stay small.
+  // verses only - the TSV side shares `merge_no_base` but has no banner.
+  merge_no_base_refs?: string[];
+  // Reference-move attribution (issue #540 item 3), split by WHO moved so a run
+  // summary can distinguish "we published a move" from "master moved under us".
+  // Only ref_moved_theirs / _both / _unattributable / _ours_conflict withhold the
+  // watermark; ref_moved_ours is an ordinary exportable edit and is counted purely
+  // so the livelock this replaced stays visible if it ever comes back.
+  ref_moved_ours: number;
+  // ours_moved that STILL held, because master edited the row surface in the same
+  // window - a genuine two-sided change, not the livelock. Counted apart from
+  // ref_moved_ours so the livelock canary is not diluted by rows that held.
+  ref_moved_ours_conflict: number;
+  ref_moved_theirs: number;
+  ref_moved_both: number;
+  ref_moved_unattributable: number;
   // Human-edited verse that DIFFERS from master but could not be adjudicated
   // at all, because this book+resource has no `master_confirmed_at` watermark
   // yet (migration 0045 adds the column and does not backfill it — only the
@@ -351,7 +428,29 @@ const REIMPORT_SOURCE = "dcs_reimport";
 // each drop site: a mass id-reissue would otherwise emit one Workers log line
 // per row, and the per-resource summary at the reimport-sync step already
 // carries the total.
+// One row's reconstructed ancestor: the content the field merge attributes
+// against, and the reference classifyTsvRefMove attributes against. Folded
+// together from a single edit_log read (see reconstructTsvBases).
+interface TsvBaseRecord {
+  content: TsvMergeSide | null;
+  ref: TsvRefSide | null;
+}
+
 const BLOCKED_SAMPLE_CAP = 20;
+
+// Cap on ReimportCounts.merge_no_base_refs. Deliberately EQUAL to the banner's
+// display cap: that sentence is the only consumer (AdminPanel's nonZeroCounts
+// type-filters the array out of the admin result view), so anything collected
+// beyond it would ride through every Workflow step's serialized return value
+// only to be sliced off. A book-wide no-ancestor state is real - EZK/JER carry
+// 34-59 such verses per resource today - so the count, not the list, is what
+// has to survive; it does, independently.
+const NO_BASE_REF_CAP = NO_BASE_REF_DISPLAY;
+
+// Cap on the per-row "we attributed this move to the app" log lines. While one
+// held row keeps a resource stuck, every other moved row in the book would
+// otherwise log an object every night; the counters carry the totals.
+const REF_MOVE_LOG_CAP = 20;
 
 // Record one dropped row's identification, and log it, both capped. Kept as one
 // helper so the cap can never be applied to the list but forgotten on the log.
@@ -377,6 +476,7 @@ function zeroCounts(): ReimportCounts {
     skipped_dup: 0,
     conflict_skipped: 0,
     tombstone_blocked: 0,
+    tombstone_reclaimed: 0,
     resurrected: 0,
     source_attr_reconciled: 0,
     source_attr_divergent: 0,
@@ -384,7 +484,14 @@ function zeroCounts(): ReimportCounts {
     merge_adopted: 0,
     merge_conflicts: 0,
     merge_refused: 0,
+    merge_kept_ai: 0,
     merge_no_base: 0,
+    merge_no_base_refs: [],
+    ref_moved_ours: 0,
+    ref_moved_ours_conflict: 0,
+    ref_moved_theirs: 0,
+    ref_moved_both: 0,
+    ref_moved_unattributable: 0,
     merge_unavailable: 0,
     merge_cosmetic_ignored: 0,
     own_publish_converged: 0,
@@ -447,6 +554,11 @@ export const applyVerseRowsForTest = (
   broadcastLaneReopens?: boolean,
 ): Promise<ReimportCounts> =>
   applyVerseRows(env, book, bibleVersion, verses, userId, cutoff, broadcastLaneReopens);
+export const clearTombstoneBlockAlertForTest = (
+  env: Env,
+  book: string,
+  resource: Resource,
+): Promise<void> => clearTombstoneBlockAlert(env, book, resource);
 
 function addCounts(into: ReimportCounts, from: ReimportCounts): void {
   into.updated += from.updated;
@@ -491,6 +603,15 @@ function addCounts(into: ReimportCounts, from: ReimportCounts): void {
   into.skipped_dup += from.skipped_dup;
   into.conflict_skipped += from.conflict_skipped ?? 0;
   into.tombstone_blocked += from.tombstone_blocked ?? 0;
+  // tombstone_reclaimed (issue #427, option 1) deliberately does NOT join the
+  // `incomplete` taint check above, mirroring tombstones_swept/tombstones_locked
+  // (option 3): a landed reclaim means master's content IS now in D1, so there
+  // is no watermark decision here for an absent-vs-zero distinction to protect
+  // — only the lost-CAS fallback (which still increments tombstone_blocked,
+  // already covered above) withholds. Plain `?? 0` coercion is the right and
+  // sufficient handling for a legacy/replayed chunk result that predates this
+  // field.
+  into.tombstone_reclaimed += from.tombstone_reclaimed ?? 0;
   // Diagnostic list, merged under the same cap. Never gates anything, so a
   // truncation here cannot affect a watermark decision.
   if (from.blocked_samples?.length) {
@@ -507,7 +628,24 @@ function addCounts(into: ReimportCounts, from: ReimportCounts): void {
   into.merge_adopted += from.merge_adopted ?? 0;
   into.merge_conflicts += from.merge_conflicts ?? 0;
   into.merge_refused += from.merge_refused ?? 0;
+  into.merge_kept_ai += from.merge_kept_ai ?? 0;
   into.merge_no_base += from.merge_no_base ?? 0;
+  // Same shape as blocked_samples above: diagnostic, capped, gates nothing. A
+  // chunk memoized before this field existed contributes no refs while still
+  // contributing its count, which is why the banner reports the count as
+  // authoritative and the refs as a sample.
+  if (from.merge_no_base_refs?.length) {
+    const into_ = (into.merge_no_base_refs ??= []);
+    for (const r of from.merge_no_base_refs) {
+      if (into_.length >= NO_BASE_REF_CAP) break;
+      into_.push(r);
+    }
+  }
+  into.ref_moved_ours += from.ref_moved_ours ?? 0;
+  into.ref_moved_ours_conflict += from.ref_moved_ours_conflict ?? 0;
+  into.ref_moved_theirs += from.ref_moved_theirs ?? 0;
+  into.ref_moved_both += from.ref_moved_both ?? 0;
+  into.ref_moved_unattributable += from.ref_moved_unattributable ?? 0;
   into.merge_unavailable += from.merge_unavailable ?? 0;
   into.merge_cosmetic_ignored += from.merge_cosmetic_ignored ?? 0;
   into.own_publish_converged += from.own_publish_converged ?? 0;
@@ -726,12 +864,22 @@ async function runReimport(
   const fetchedRaw: Record<Resource, string | null> = {
     ult: ultRaw, ust: ustRaw, tn: tnRaw, tq: tqRaw, twl: twlRaw,
   };
+  // Which resources still need a "who moved master" walk (#540 item 1). Recorded
+  // here rather than fetched here: the walk is bounded by this pair's
+  // `master_confirmed_at`, which is read below — and it must be read AFTER the
+  // own-publish stamp lands, or the walk would start from a watermark this run
+  // has already superseded. A resource recognized as our own publish is skipped
+  // entirely: recognition means master did not move under us at all.
+  const needsLineage = new Set<Resource>();
   for (const resource of ALL_RESOURCES) {
     const raw = fetchedRaw[resource];
     if (!want.has(resource) || raw == null) continue;
     const state = await resourceSyncState(env, book, resource);
     const own = await recognizePushedRender(env, book, resource, raw, state);
-    if (!own.recognized) continue;
+    if (!own.recognized) {
+      needsLineage.add(resource);
+      continue;
+    }
     const stamped = await markOwnPublishConverged(env, book, resource, own.readAt, state.pushedEditId, null);
     if (stamped) perResource[resource].own_publish_converged++;
     console.log("reimport recognized master's movement as our own publish", {
@@ -747,15 +895,42 @@ async function runReimport(
   // resource) for this whole run, not once per chapter — see
   // getMasterConfirmedAt. 2 reads total for this run (ult + ust), down from
   // one per chapter.
-  const masterConfirmedAtUlt = want.has("ult") && ultRaw ? await getMasterConfirmedAt(env, book, "ult") : null;
-  const masterConfirmedAtUst = want.has("ust") && ustRaw ? await getMasterConfirmedAt(env, book, "ust") : null;
+  // Carries this run's lineage alongside the cutoff — one object per pair, so a
+  // merge call site cannot receive an ancestor without the attribution that goes
+  // with it, and so the walk is bounded by the very watermark the ancestor is
+  // reconstructed from (see loadMasterLineage).
+  const withLineage = async (cutoff: MergeCutoff | null, resource: Resource): Promise<MergeCutoff | null> => {
+    if (cutoff == null) return null;
+    const lineage = needsLineage.has(resource)
+      ? await loadMasterLineage(env, book, resource, cutoff.confirmedAt)
+      : null;
+    return { ...cutoff, lineage };
+  };
+
+  const masterConfirmedAtUlt = await withLineage(
+    want.has("ult") && ultRaw ? await getMasterConfirmedAt(env, book, "ult") : null,
+    "ult",
+  );
+  const masterConfirmedAtUst = await withLineage(
+    want.has("ust") && ustRaw ? await getMasterConfirmedAt(env, book, "ust") : null,
+    "ust",
+  );
   // TSV merge ancestor cutoffs — same once-per-run hoist as ult/ust above (the
   // three-way merge for edited tn/tq/twl rows reads this in applyTsvRows). NULL
   // means this (book, resource) has never been positively confirmed on master,
   // so the merge stays inert and edited rows behave exactly as before.
-  const masterConfirmedAtTn = want.has("tn") && tnRaw ? await getMasterConfirmedAt(env, book, "tn") : null;
-  const masterConfirmedAtTq = want.has("tq") && tqRaw ? await getMasterConfirmedAt(env, book, "tq") : null;
-  const masterConfirmedAtTwl = want.has("twl") && twlRaw ? await getMasterConfirmedAt(env, book, "twl") : null;
+  const masterConfirmedAtTn = await withLineage(
+    want.has("tn") && tnRaw ? await getMasterConfirmedAt(env, book, "tn") : null,
+    "tn",
+  );
+  const masterConfirmedAtTq = await withLineage(
+    want.has("tq") && tqRaw ? await getMasterConfirmedAt(env, book, "tq") : null,
+    "tq",
+  );
+  const masterConfirmedAtTwl = await withLineage(
+    want.has("twl") && twlRaw ? await getMasterConfirmedAt(env, book, "twl") : null,
+    "twl",
+  );
 
   // P2.5 (subrequest budget): apply the TSV resources at the BOOK level, not per
   // chapter. The three-way merge for edited tn/tq/twl rows does one batched
@@ -823,12 +998,14 @@ async function runReimport(
     await raiseVerseMergeConflictAlert(env, book, "ult", {
       recordingFailed: perResource.ult.merge_record_failed === true,
       noBaseCount: perResource.ult.merge_no_base,
+      noBaseRefs: perResource.ult.merge_no_base_refs,
     });
   }
   if (want.has("ust")) {
     await raiseVerseMergeConflictAlert(env, book, "ust", {
       recordingFailed: perResource.ust.merge_record_failed === true,
       noBaseCount: perResource.ust.merge_no_base,
+      noBaseRefs: perResource.ust.merge_no_base_refs,
     });
   }
 
@@ -1024,7 +1201,11 @@ export async function applyTsvRows(
     // can tell an AI-only row (updated_by set, latest source = ai_pipeline) apart
     // from a human edit. Mirrors the deleteUnkeptTns correlated subquery.
     const rs = await env.DB.prepare(
-      `SELECT id, ${TSV_STORED_COLS[kind]}, sort_order, ${pristineCols}, review_kind,
+      // review_reason is selected alongside review_kind because two flag writers
+      // below compare against it to avoid re-writing an identical message every
+      // night — and a version bump is not free (#539). Without the column those
+      // comparisons run against `undefined` and never short-circuit.
+      `SELECT id, ${TSV_STORED_COLS[kind]}, sort_order, ${pristineCols}, review_kind, review_reason,
               (SELECT source FROM edit_log
                  WHERE kind = ?2 AND row_key = ${kind}_rows.id
                    AND (book = ?1 OR book IS NULL)
@@ -1061,6 +1242,16 @@ export async function applyTsvRows(
   // untouched. Counted `reimported_ai`.
   const aiReseeds: Array<{ row: ParsedTsvRow; sortOrder: number; oldVersion: number }> = [];
   const resurrects: Array<{ row: ParsedTsvRow; sortOrder: number; oldVersion: number }> = [];
+  // Issue #427, option 1: reissued tombstones whose slot master's row will
+  // reclaim. Deliberately its OWN array, not folded into `resurrects` — reclaim
+  // is semantically different (see the tombstone branch below and the "Batch
+  // the reclaims" write site): resurrect only fires for a narrow self-heal case
+  // (pristine content AND the last delete was a reimport prune bug) and keeps
+  // the pristine guard (trashed_at/preserve/hint); reclaim fires for ANY
+  // tombstone regardless of how/why it was deleted, because the row being
+  // written is a completely different logical entity from whatever the
+  // tombstone used to protect.
+  const reclaims: Array<{ row: ParsedTsvRow; sortOrder: number; oldVersion: number }> = [];
   // Rows classified "edited" (human-owned) that diverge from master. Deferred
   // and resolved AFTER this loop so the three-way-merge ancestor can be
   // reconstructed for all of them in ONE batched edit_log read
@@ -1087,6 +1278,10 @@ export async function applyTsvRows(
     // The ancestor-free field merge (tags / whitespace note) contributed fields
     // to this write — tallied as merged_fields INDEPENDENTLY of adopted.
     heuristic: boolean;
+    // A contested field on this row was kept from D1 because no human commit
+    // was behind master's side (#540 item 2). Carried only so the adoption log
+    // line can say a mixed row is mixed.
+    keptAiConflict?: boolean;
   }> = [];
   // Ids this pass has already INSERTED. `existing` is read once, before the
   // loop, and is never updated afterwards — so if master's own file carries the
@@ -1188,36 +1383,35 @@ export async function applyTsvRows(
     if (cur.deleted_at != null) {
       if (isPristineTombstone(kind, cur) && (await lastTsvDeleteWasReimport(env, kind, row.id, book))) {
         resurrects.push({ row, sortOrder, oldVersion: Number(cur.version) });
-      } else {
-        counts.skipped_edited++;
-        // Issue #427. The tombstone keeps its (book, id) primary key forever,
-        // so master's row for that id cannot land — and that is CORRECT when
-        // master still carries it at the same reference (a delete awaiting
-        // export). When master carries it at a DIFFERENT reference the id has
-        // been reissued to a genuinely different row, and we have just dropped
-        // real master content with no error and no distinguishable counter.
-        // Count that case separately so the sync report shows it and the
-        // (book, resource) watermark is withheld — see isReissuedTombstone and
-        // the reimport-sync step. Reclaiming the slot is option 1, not this.
+      } else if (
+        // Issue #427, option 1. The tombstone keeps its (book, id) primary key
+        // forever, so master's row for that id cannot land via the normal INSERT
+        // path — and that is CORRECT when master still carries it at the same
+        // reference (a delete awaiting export: reclaiming there would resurrect
+        // every pending deletion on the next nightly run). When master carries it
+        // at a DIFFERENT reference the id has been reissued to a genuinely
+        // different row, and master is authoritative for a row it still carries
+        // — so RECLAIM the slot (batched below) instead of dropping it.
         // `!row.idCoerced` first: for a coerced id the "master reissued this id
         // to a different row" inference is meaningless — the id is ours, hashed
         // into a 96-id space, so landing on an unrelated tombstone at a
         // different reference is an expected collision, not evidence master
-        // moved anything. Counting it would withhold the watermark and freeze
-        // the export over a documented-benign no-op. See ParsedTsvRow.idCoerced.
-        if (
-          !row.idCoerced &&
-          isReissuedTombstone(
-            { refRaw: (cur.ref_raw as string | null) ?? null, chapter: Number(cur.chapter), verse: Number(cur.verse) },
-            { refRaw: row.refRaw, chapter: row.chapter, verse: row.verse },
-          )
-        ) {
-          counts.tombstone_blocked++;
-          noteBlockedSample(
-            counts,
-            `${kind} ${row.id}: deleted row at ${cur.ref_raw ?? `${cur.chapter}:${cur.verse}`}, master now uses it at ${row.refRaw}`,
-          );
-        }
+        // moved anything. Reclaiming (or counting it blocked) would either
+        // corrupt an unrelated row or freeze the export over a documented-benign
+        // no-op. See ParsedTsvRow.idCoerced.
+        !row.idCoerced &&
+        isReissuedTombstone(
+          { refRaw: (cur.ref_raw as string | null) ?? null, chapter: Number(cur.chapter), verse: Number(cur.verse) },
+          { refRaw: row.refRaw, chapter: row.chapter, verse: row.verse },
+        )
+      ) {
+        reclaims.push({ row, sortOrder, oldVersion: Number(cur.version) });
+      } else {
+        // Same-reference tombstone (a delete awaiting export) — stays dead,
+        // exactly as before this fix. Not counted tombstone_blocked: that would
+        // withhold the watermark for a condition that clears itself once
+        // tonight's export runs.
+        counts.skipped_edited++;
       }
       continue;
     }
@@ -1291,12 +1485,16 @@ export async function applyTsvRows(
     const bases =
       masterConfirmedAt != null
         ? await reconstructTsvBases(env, book, kind, editedCandidates.map((c) => c.row.id), masterConfirmedAt, masterEditId)
-        : new Map<string, TsvMergeSide | null>();
+        : new Map<string, TsvBaseRecord>();
     for (const { row, cur } of editedCandidates) {
       const fields: Record<string, unknown> = {};
       let conflict = false;
       let conflictFields: string[] = [];
       let adopted = false;
+      // The conflict was resolved D1-wins because master's side had no human
+      // commit behind it (#540 item 2) — the review message has to say that,
+      // not the opposite.
+      let keptAiConflict = false;
 
       // A human-protected tn row (preserve/hint/trashed — deleted_at is already
       // handled at the tombstone branch) must NEVER be overwritten from master,
@@ -1317,11 +1515,22 @@ export async function applyTsvRows(
       if (masterConfirmedAt != null && !protectedRow) {
         const merge = computeTsvMerge(
           kind,
-          bases.get(row.id) ?? null,
+          bases.get(row.id)?.content ?? null,
           parsedRowToMergeSide(kind, storedTsvRowToParsed(kind, cur)),
           parsedRowToMergeSide(kind, row),
+          // #540 item 2. Always via the helper: an incomplete lineage walk must
+          // protect master exactly like a found human commit, and only
+          // masterMayHoldHumanEdit encodes that.
+          { masterMayHoldHumanEdit: masterMayHoldHumanEdit(cutoff?.lineage) },
         );
         if (merge.action === "keep_no_base") counts.merge_no_base++;
+        // #540 item 2: both sides moved a field, and the lineage found no human
+        // commit behind master's side, so D1 keeps that field. See the counter's
+        // declaration for why this must never join merge_refused.
+        if (merge.action === "keep_ai_master") {
+          counts.merge_kept_ai++;
+          keptAiConflict = true;
+        }
         if (merge.adopt) {
           adopted = true;
           Object.assign(fields, merge.writeFields);
@@ -1333,10 +1542,15 @@ export async function applyTsvRows(
           // rendered occurrence: it is the matched pair DCS itself accepted.
           const surfaceField = kind === "twl" ? "orig_words" : "quote";
           if (surfaceField in fields) fields.occurrence = row.occurrence ?? null;
-          if (merge.conflict) {
-            conflict = true;
-            conflictFields = merge.conflictFields;
-          }
+        }
+        // OUTSIDE the `merge.adopt` branch deliberately. A collision needs a
+        // human whichever side won it, and keep_ai_master can win one for D1
+        // while writing no content field at all — nesting this under `adopt`
+        // (as it was when adopt_conflict was the only conflicting outcome)
+        // would drop the flag for exactly the rows this policy protects.
+        if (merge.conflict) {
+          conflict = true;
+          conflictFields = merge.conflictFields;
         }
       }
 
@@ -1370,43 +1584,206 @@ export async function applyTsvRows(
       let heuristic = false;
       if (heur) for (const [k, v] of Object.entries(heur)) if (!(k in fields)) { fields[k] = v; heuristic = true; }
 
-      // A Door43 maintainer re-anchored this row to a different Reference on
-      // master (same id, different chapter/verse/ref_raw). The field merge can't
-      // safely MOVE a row — a chapter change relocates it out of the chapter this
-      // reimport is processing and needs the quote re-anchored to the new verse's
-      // source (a validated move, tracked as a follow-up) — so it is NOT
-      // auto-adopted. But it must NOT be silently reverted either (the old, and
-      // still-open, revert path this PR exists to close): WITHHOLD the resource
-      // watermark (apply_incomplete) so the export holds instead of writing D1's
-      // old location back over master, and flag the row ONCE (guarded on the
-      // existing review_kind to avoid nightly version churn) so a human can move
-      // it in-app to match — which clears the flag and releases the hold.
-      const refMoved = tsvRefMoved(cur, row, protectedRow);
-      if (refMoved) {
+      // This row's Reference differs between D1 and master (same id, different
+      // chapter/verse/ref_raw). The field merge can't safely MOVE a row — a
+      // chapter change relocates it out of the chapter this reimport is
+      // processing and needs the quote re-anchored to the new verse's source (a
+      // validated move, tracked as a follow-up, #454) — so a move is never
+      // auto-adopted from master. What changes here (issue #540 item 3) is WHO
+      // the difference is attributed to: this used to assume master moved it,
+      // which is wrong exactly when the app moved it, and wrong in a
+      // self-perpetuating way — the flag told the translator to undo her own
+      // move, and apply_incomplete withheld the watermark so the export could
+      // never ship it, so the same wrong flag returned every night (AMO tq,
+      // blocked from 2026-08-17). See classifyTsvRefMove.
+      const refBase = bases.get(row.id)?.ref ?? null;
+      const refMove = classifyTsvRefMove(cur, row, refBase, protectedRow);
+      // The surface field the content merge may have just adopted from master.
+      // It matters to the reference decision: master's `occurrence` is co-adopted
+      // with it (see block (a)) and is matched to MASTER's verse, so a row D1 has
+      // re-anchored elsewhere would publish a surface+occurrence pair anchored to
+      // the wrong verse.
+      const surfaceField = kind === "twl" ? "orig_words" : "quote";
+      const adoptedSurface = adopted && surfaceField in fields;
+
+      // Only ever raise a ref_moved flag over nothing or over an existing
+      // ref_moved. A `merge_conflict` set by the block below (or by a previous
+      // run and not yet acknowledged) says something this one does not and must
+      // not be silently replaced. Rewriting the reason only when it actually
+      // changed keeps this from churning a version every night.
+      const flagRefMoved = (reason: string): void => {
+        if (cur.review_kind != null && cur.review_kind !== "ref_moved") return;
+        if (cur.review_reason === reason) return;
+        fields.review_kind = "ref_moved";
+        fields.review_reason = reason;
+      };
+
+      if (refMove === "ours_moved" && !adoptedSurface) {
+        // D1 moved, master still holds the ancestor, and master did not touch
+        // the surface: an ordinary app edit the export exists to publish. No
+        // flag, no hold. This is the ONE outcome that lets the export write over
+        // master's location, so it is the only place a mis-attribution costs
+        // data — and it is otherwise silent (no alert, and deliberately not in
+        // the run summary, since a move we made is not something to review). Log
+        // it so a wrong attribution is diagnosable from worker logs rather than
+        // only from its damage. Capped: while one held row keeps the resource
+        // stuck, every other moved row in the book would otherwise log nightly.
+        if (counts.ref_moved_ours < REF_MOVE_LOG_CAP) {
+          console.log("reimport: reference move attributed to the app; publishing it", {
+            book,
+            kind,
+            id: row.id,
+            ours: `${cur.chapter}:${cur.verse} ${(cur.ref_raw as string | null) ?? ""}`,
+            theirs: `${row.chapter}:${row.verse} ${row.refRaw ?? ""}`,
+            base: refBase,
+          });
+        }
+        // Clear a flag a previous run raised by mis-attributing this same move —
+        // otherwise the row keeps telling its author to undo work that was never
+        // wrong. Once: the flag is gone next run, so it cannot churn versions.
+        // Guarded on 'ref_moved', so it can never clear a merge_conflict.
+        if (cur.review_kind === "ref_moved") {
+          fields.review_kind = null;
+          fields.review_reason = null;
+        }
+        counts.ref_moved_ours++;
+      } else if (refMove !== "none") {
+        // Everything else HOLDS: withhold the resource watermark
+        // (apply_incomplete) so the export cannot write D1's location over
+        // master, and flag the row for a human.
+        //
+        // `ours_moved` lands here too when master edited the surface in the same
+        // window. That is a genuine two-sided change, not the livelock: block (a)
+        // has no reference gate, so it has already adopted master's surface plus
+        // master's occurrence, a pair anchored to master's verse rather than the
+        // one D1 moved to. Publishing that would either mis-anchor the quote or
+        // hard-reject on export (the occurrence column, per this repo's own
+        // history). Holding is exactly what `main` did for this shape, so the
+        // only behavior this change moves is the pure move — which is the
+        // livelock and nothing else.
         counts.apply_incomplete = true;
-        if (cur.review_kind !== "ref_moved") {
-          fields.review_kind = "ref_moved";
-          fields.review_reason =
+        if (refMove === "ours_moved") counts.ref_moved_ours_conflict++;
+        else if (refMove === "theirs_moved") counts.ref_moved_theirs++;
+        else if (refMove === "both_moved") counts.ref_moved_both++;
+        else counts.ref_moved_unattributable++;
+
+        // Each message states only what was measured — "a Door43 editor moved
+        // this" is a claim we may make only when the ancestor proves master is
+        // the side that moved (the standing alert-wording rule). Each also has
+        // to be honest about what actually RELEASES the hold: the export stays
+        // withheld until this row's reference matches Door43's, so a message
+        // offering a free choice ("pick the one you want") would promise a
+        // resolution the system does not deliver.
+        const hold = "Until this row's reference matches Door43's, this book's export stays on hold.";
+        if (refMove === "ours_moved") {
+          flagRefMoved(
+            `You moved this row to a different verse/reference here, and Door43 edited its ` +
+              `${surfaceField === "quote" ? "Quote" : "OrigWords"} in the same window. Door43's text was taken, ` +
+              `but it is anchored to Door43's verse — check it against the verse you moved this to. ${hold}`,
+          );
+        } else if (refMove === "theirs_moved") {
+          flagRefMoved(
             "A Door43 editor moved this row to a different verse/reference. " +
-            "Move it here in the app to match, then it will sync.";
+              `Move it here in the app to match. ${hold}`,
+          );
+        } else if (refMove === "both_moved") {
+          flagRefMoved(
+            "This row was moved to a different verse/reference here AND on Door43, to different places. " +
+              `${hold} To publish yours instead, change it on Door43 as well.`,
+          );
+        } else if (masterConfirmedAt == null) {
+          // No watermark at all: no ancestor was even looked up. Saying "the
+          // edit history never captured it" would name a cause we never measured.
+          flagRefMoved(
+            `This row sits at a different verse/reference here than on Door43. This book's ${kind.toUpperCase()} ` +
+              `file has not yet been confirmed as holding one of our exports, so the sync has no baseline to ` +
+              `say which side moved. ${hold}`,
+          );
+        } else if (refBase == null) {
+          // A watermark exists but no usable edit-history entry survives before
+          // it — distinct from "an entry survives but never recorded this
+          // column", which is the branch below.
+          flagRefMoved(
+            "This row sits at a different verse/reference here than on Door43, and no edit history survives " +
+              `from before the last confirmed publish, so the sync cannot say which side moved. ${hold}`,
+          );
+        } else {
+          flagRefMoved(
+            "This row sits at a different verse/reference here than on Door43, and the recorded edit history " +
+              `never captured the part of the reference that differs, so the sync cannot say which side ` +
+              `moved. ${hold}`,
+          );
+        }
+      }
+
+      // A both-sides-changed conflict flags the row for in-app review (the
+      // cleanup chip, lint.ts) — atomic with the content write, so the flag can
+      // never be lost separately from the overwrite. The overwritten value is
+      // retained in edit_log (recoverable by an admin) — worded without promising
+      // a per-row history UI or naming internal columns (cold-review #5).
+      //
+      // Runs BEFORE the "nothing to write" bail below, because a keep_ai_master
+      // conflict writes no content at all: leaving this where it was would have
+      // counted exactly the rows this policy protects as a plain skipped_edited
+      // and told nobody. It is also the ONLY write such a row makes, so it is
+      // guarded against re-writing an identical message — a flag-only write still
+      // bumps the row's version, and this condition recurs every night until a
+      // human resolves it (#539).
+      //
+      // A row the reference-move branch just flagged and HELD keeps that flag:
+      // the hold's message is the only thing telling the translator why this
+      // whole book+resource has stopped exporting, and a kept-conflict message
+      // that replaced it would both destroy that and describe an export that is
+      // not going to run. Scoped to the kept case deliberately — a master-wins
+      // adopt_conflict still overwrites the ref_moved flag exactly as before,
+      // because it also overwrote content and that is the more urgent story.
+      const heldByRefMove = keptAiConflict && fields.review_kind === "ref_moved";
+      if (conflict && !heldByRefMove) {
+        const labels = conflictFields.map((f) => TSV_FIELD_LABELS[f] ?? f);
+        // Every clause here is bounded by what was actually measured, because
+        // the cheap version of each is a claim this system cannot support:
+        //  - "the note-writing pipeline" would be wrong — the `ai` rule matches
+        //    the unfoldingWord bot ACCOUNT, which also pushes ULT/UST scripture
+        //    and pushes on a named human's behalf (`ULT: EZK 38 [pjoakes]`).
+        //  - "no Door43 editor edited this" would be wrong for the same shape: a
+        //    maintainer may well have directed the change. What was measured is
+        //    narrower — no commit came from a Door43 editor's own account.
+        //  - "will be published" would be a promise this per-row code cannot
+        //    keep. The export is withheld for the WHOLE book+resource by any
+        //    held reference move, a lock, or a recording failure elsewhere in
+        //    the same file, so "the next export that runs for this file" is the
+        //    honest form.
+        //  - "since the last sync" would be the wrong boundary: the walk starts
+        //    at master_confirmed_at, the last publish positively confirmed on
+        //    master, which can be several syncs back.
+        // Outcome first, evidence second: the cleanup chip clamps this to two
+        // lines (BookLintIndicator), so a reader who sees only the opening must
+        // still learn which way it went and what to do about it.
+        const kindLabel = kind.toUpperCase();
+        const reason = keptAiConflict
+          ? `Your ${labels.join(" and ")} was kept over Door43's, and the next export that runs for this ` +
+            `file writes it to Door43. If Door43's version is the one you want, put it in here first. ` +
+            `Why: both sides changed this row since the last confirmed publish, and every Door43 commit to ` +
+            `this book's ${kindLabel} file since then came from Bible Editor's own export or the ` +
+            `unfoldingWord bot account — no commit from a Door43 editor's own account was found.` +
+            // A row can keep one contested field AND take another master moved
+            // on its own. Saying only the first would misdescribe the row.
+            (adopted ? ` Door43's changes to this row's other fields were taken.` : "")
+          : `A Door43 edit to this row's ${labels.join(" and ")} was merged over your app-side change. ` +
+            `Please double-check it.`;
+        // Distinct review_kind, not just distinct prose: the cleanup chip titles
+        // itself from this column, and "Merged Door43 edit" over a row whose
+        // edit was KEPT is the reverse of what happened (see reviewFlagTitle).
+        const reviewKind = keptAiConflict ? "merge_kept" : "merge_conflict";
+        if (cur.review_kind !== reviewKind || cur.review_reason !== reason) {
+          fields.review_kind = reviewKind;
+          fields.review_reason = reason;
         }
       }
 
       if (Object.keys(fields).length === 0) {
         counts.skipped_edited++;
         continue;
-      }
-      // A both-sides-changed conflict flags the row for in-app review (the
-      // cleanup chip, lint.ts) — atomic with the content write, so the flag can
-      // never be lost separately from the overwrite. The overwritten value is
-      // retained in edit_log (recoverable by an admin) — worded without promising
-      // a per-row history UI or naming internal columns (cold-review #5).
-      if (conflict) {
-        const labels = conflictFields.map((f) => TSV_FIELD_LABELS[f] ?? f);
-        fields.review_kind = "merge_conflict";
-        fields.review_reason =
-          `A Door43 edit to this row's ${labels.join(" and ")} was merged over your app-side change. ` +
-          `Please double-check it.`;
       }
       editedWrites.push({
         id: row.id,
@@ -1417,6 +1794,7 @@ export async function applyTsvRows(
         conflict,
         adopted,
         heuristic,
+        keptAiConflict,
       });
     }
   }
@@ -1507,6 +1885,93 @@ export async function applyTsvRows(
     }
   }
 
+  // Batch the reclaims (issue #427, option 1: overwrite a reissued tombstone's
+  // slot with master's row — deliberately its own write, not folded into the
+  // resurrect batch above). The guard is narrower than every other write in
+  // this file on purpose: `deleted_at IS NOT NULL AND version = oldVersion`
+  // ONLY — no `updated_by IS NULL` / trashed_at / preserve / hint re-assertion.
+  // Those flags describe the OLD tombstoned row's protection state, and reclaim
+  // discards that row's content wholesale in favor of master's — a completely
+  // different logical row moving into a primary-key slot the old row merely
+  // happened to vacate, not a continuation of it, so re-asserting its
+  // protections would be checking the wrong row. version-CAS is still the full
+  // safety net: a concurrent modification to the SAME tombstoned row (another
+  // writer's resurrect/reclaim/edit landing between the read and this batch)
+  // bumps its version and fails the CAS — that is NOT silently dropped (the
+  // whole point of this fix is to stop silent drops): it falls back to
+  // `tombstone_blocked`, exactly the pre-reclaim safety net, so a lost race is
+  // never quieter than before this change. `updated_by = NULL` in the SET
+  // starts master's row life master-owned, same as a fresh insert. Audited as
+  // "create" — from this slot's new life's perspective, master's row IS a
+  // fresh row, not an update to whatever used to occupy the slot.
+  // RECLAIM_PAIR_BATCH (half of WRITE_BATCH): each reclaim now travels as TWO
+  // statements — the write immediately followed by its own SQL-`changes()`-
+  // gated edit_log INSERT (gatedLogEditStmt) — in the SAME batch() call, so
+  // chunking halves to stay within D1's ≤100-statement cap. This keeps the
+  // write and its audit row atomic (Codex review on PR #506, round 2): the
+  // audit row IS the boundary rowHistoryBoundary.ts relies on to hide the
+  // dead tombstoned row's history from the reclaimed row, so a write that
+  // landed with no matching log would leave that boundary permanently
+  // missing — a RETRY can't repair it, because a reclaimed row is no longer a
+  // tombstone and won't hit this branch again next run. Previously (like
+  // applyVerseRows' pristine batch before its own PR #496 review fix) the
+  // write batch and a follow-up JS-gated log batch were two separate
+  // env.DB.batch() calls, so a write batch that landed while the log batch
+  // failed independently would go on to be counted `tombstone_reclaimed`
+  // ANYWAY (the JS check only asked whether the WRITE landed) — content
+  // correct, but boundary silently missing forever.
+  const RECLAIM_PAIR_BATCH = Math.floor(WRITE_BATCH / 2);
+  for (let i = 0; i < reclaims.length; i += RECLAIM_PAIR_BATCH) {
+    const slice = reclaims.slice(i, i + RECLAIM_PAIR_BATCH);
+    const stmts: D1PreparedStatement[] = [];
+    for (const u of slice) {
+      stmts.push(
+        buildTsvUpdateStmt(env, book, kind, u.row, u.sortOrder, u.oldVersion, now, false, false, true),
+        gatedLogEditStmt(env, kind, u.row.id, book, userId, u.oldVersion, u.oldVersion + 1, "create", u.row),
+      );
+    }
+    try {
+      const results = await env.DB.batch(stmts);
+      slice.forEach((u, j) => {
+        if ((results[j * 2]?.meta.changes ?? 0) > 0) {
+          counts.tombstone_reclaimed++;
+          console.warn("reimport: reclaimed reissued tombstone slot for master's row", {
+            book,
+            kind,
+            id: u.row.id,
+            chapter: u.row.chapter,
+            verse: u.row.verse,
+          });
+        } else {
+          // Lost the version-CAS race — something touched this tombstoned row
+          // between the read and this batch. Fall back to the pre-reclaim
+          // safety net so a lost race is never silently dropped: count it
+          // tombstone_blocked (withholds the watermark) exactly as if reclaim
+          // had never been attempted for this row. The paired log statement
+          // also no-ops (its own `changes() > 0` gate sees the write's 0), so
+          // no phantom audit row lands for a reclaim that didn't happen.
+          counts.tombstone_blocked++;
+          noteBlockedSample(
+            counts,
+            `${kind} ${u.row.id}: reclaim lost the version-CAS race, deleted row now reissued at ${u.row.refRaw}`,
+          );
+        }
+      });
+    } catch (e) {
+      // Correctness-bearing, same as the edited-merge and verse master-adoption
+      // batches below/above: a thrown batch is one D1 transaction that never
+      // committed, so NEITHER the write NOR its paired log landed for this
+      // whole slice — this run must not be certified in sync, or the
+      // reimport-sync step stamps the watermark over still-missing content
+      // and the nightly export never retries (Codex review on PR #506).
+      // Taint apply_incomplete so shouldRecordResourceSync withholds it; the
+      // next sync retries this same slice from scratch (still tombstoned,
+      // since nothing landed).
+      counts.apply_incomplete = true;
+      counts.errors.push(`${kind} reclaim batch: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+
   // Batch the combined edited-row merges (three-way adoptions unioned with the
   // ancestor-free tags/whitespace field merge). Modeled on the verse
   // master-adoption batch (applyVerseRows step 7): version-CAS UPDATE (`AND
@@ -1532,8 +1997,13 @@ export async function applyTsvRows(
           if (u.adopted) {
             counts.merge_adopted++;
             if (u.conflict) counts.merge_conflicts++;
+            // `keptConflict` distinguishes the mixed row: master's value landed
+            // for a field we never touched, while a CONTESTED field on the same
+            // row was kept from D1 (#540 item 2). Without it this line reads as
+            // "master's correction won" for a row where it half did.
             console.warn("reimport: adopted master's out-of-band TSV correction over D1 (tsvMerge)", {
               book, kind, id: u.id, chapter: u.chapter, verse: u.verse, conflict: u.conflict,
+              keptConflict: u.keptAiConflict === true,
             });
           }
           // merged_fields is INDEPENDENT of merge_adopted: a row can both adopt a
@@ -1549,6 +2019,17 @@ export async function applyTsvRows(
           // field is still stale, so the watermark must be withheld or the export
           // reverts master with no retry (Codex P1.2 — the CAS-race twin of the
           // thrown-batch gate). A lost heuristic-only write is not data loss.
+          //
+          // A `keep_ai_master` row (u.conflict true, u.adopted false — see the
+          // `merge.conflict` block above) can lose this same race with NOTHING
+          // else to show for it: the review_kind/review_reason flag IS the whole
+          // write, so a lost CAS here reports nowhere this run (#552 item 1,
+          // decided rather than left an accident of the adopted-only branch
+          // below). Left this way deliberately: the conflict this flag exists to
+          // surface is recomputed from D1/master on every run, so it either
+          // still holds next sync (and gets flagged then) or the human's own
+          // edit that won this race resolved it — either way there is nothing
+          // to retry, unlike an adoption's stale, unreachable-by-recompute field.
           counts.skipped_edited++;
           if (u.adopted) {
             counts.apply_incomplete = true;
@@ -1685,8 +2166,8 @@ async function reconstructTsvBases(
   ids: string[],
   cutoff: number,
   boundaryId: number | null,
-): Promise<Map<string, TsvMergeSide | null>> {
-  const out = new Map<string, TsvMergeSide | null>();
+): Promise<Map<string, TsvBaseRecord>> {
+  const out = new Map<string, TsvBaseRecord>();
   const entriesById = new Map<string, TsvEditLogEntry[]>();
   // P1.3: cut at the precise id boundary when we have one, else the timestamp.
   // Either way ?3 carries the single bound value; only the column/operator swaps.
@@ -1700,7 +2181,7 @@ async function reconstructTsvBases(
     // created_at.
     const inClause = slice.map((_, j) => `?${j + 4}`).join(", ");
     const rs = await env.DB.prepare(
-      `SELECT row_key, action, payload_json FROM edit_log
+      `SELECT row_key, action, payload_json, book FROM edit_log
         WHERE kind = ?2 AND (book = ?1 OR book IS NULL)
           AND action IN ('create', 'update', 'restore')
           AND ${boundaryClause}
@@ -1708,7 +2189,7 @@ async function reconstructTsvBases(
         ORDER BY row_key ASC, id ASC`,
     )
       .bind(book, kind, boundaryBind, ...slice)
-      .all<{ row_key: string; action: string; payload_json: string | null }>();
+      .all<{ row_key: string; action: string; payload_json: string | null; book: string | null }>();
     for (const r of rs.results) {
       let payload: Record<string, unknown> | null = null;
       if (r.payload_json) {
@@ -1720,11 +2201,17 @@ async function reconstructTsvBases(
         }
       }
       const list = entriesById.get(r.row_key) ?? [];
-      list.push({ action: r.action, payload });
+      list.push({ action: r.action, payload, bookKnown: r.book != null });
       entriesById.set(r.row_key, list);
     }
   }
-  for (const id of ids) out.set(id, foldTsvBase(kind, entriesById.get(id) ?? []));
+  for (const id of ids) {
+    const entries = entriesById.get(id) ?? [];
+    // Both folds read the SAME entries — the reference ancestor costs no extra
+    // D1 read, which is what keeps it affordable on the unchunked full-book
+    // paths this function's header already flags as near the subrequest cap.
+    out.set(id, { content: foldTsvBase(kind, entries), ref: foldTsvRefBase(entries) });
+  }
   return out;
 }
 
@@ -1964,12 +2451,34 @@ async function tsvFetchLooksTruncated(
 // `resurrect` flips the deleted_at guard: a normal pristine UPDATE requires a
 // LIVE row (deleted_at IS NULL); a resurrection requires a TOMBSTONE
 // (deleted_at IS NOT NULL) and clears it in the SET. `reseedAi` (mutually
-// exclusive with resurrect) is the AI-only re-seed: it DROPS the
+// exclusive with resurrect and reclaim) is the AI-only re-seed: it DROPS the
 // `updated_by IS NULL` guard (the row is AI-owned) and sets `updated_by = NULL`
 // to reclaim it to master-owned — safety now rests on the version-CAS + the
-// retained deleted_at/trashed_at/preserve/hint re-assertions. Bound-param
-// positions are identical in all modes (the `= NULL` clauses carry no param), so
-// the .bind() lists below are unchanged.
+// retained deleted_at/trashed_at/preserve/hint re-assertions.
+// `reclaim` (mutually exclusive with resurrect and reseedAi; issue #427, option
+// 1) is the reissued-tombstone slot reclaim: like resurrect it requires a
+// TOMBSTONE (deleted_at IS NOT NULL) and clears it, but UNLIKE every other mode
+// it drops the trashed_at/preserve/hint re-assertion entirely (`pristine`
+// collapses to just the deletedGuard) — those flags describe the OLD
+// tombstoned row's protection state, and master's incoming row is a
+// completely different logical entity moving into a slot the old row merely
+// vacated, not a continuation of it, so re-asserting them would be checking
+// the wrong row's history. For the SAME reason, a tn reclaim also explicitly
+// CLEARS trashed_at/preserve/hint in the SET (`clearProtections` below), and
+// EVERY kind's reclaim clears restored_from_version/review_kind/review_reason
+// (`clearReviewMeta` below) — rather than leaving whatever the tombstoned row
+// happened to hold. None of those columns are part of the pristine guard's
+// WHERE for reclaim, so nothing else would ever reset them, and a human's
+// "preserve this note"/"queue this as an AI hint"/"flag for review"/"showing
+// as vN" intent for the OLD content must never silently apply to master's new
+// content. It also drops the `updated_by IS NULL` guard (like reseedAi) and
+// sets `updated_by = NULL`, starting master's row master-owned.
+// version-CAS is the only guard reclaim keeps, and it is load-bearing: a
+// concurrent write to the SAME tombstoned row between the read and this batch
+// still fails the CAS and is caught by the caller (falls back to
+// tombstone_blocked, never a silent drop). Bound-param positions are identical
+// in all modes (the `= NULL` clauses carry no param), so the .bind() lists
+// below are unchanged.
 function buildTsvUpdateStmt(
   env: Env,
   book: string,
@@ -1980,20 +2489,43 @@ function buildTsvUpdateStmt(
   now: number,
   resurrect = false,
   reseedAi = false,
+  reclaim = false,
 ): D1PreparedStatement {
-  const deletedGuard = resurrect ? "deleted_at IS NOT NULL" : "deleted_at IS NULL";
-  const ownerGuard = reseedAi ? "" : "updated_by IS NULL AND ";
-  const pristine =
-    kind === "tn"
+  const deletedGuard = resurrect || reclaim ? "deleted_at IS NOT NULL" : "deleted_at IS NULL";
+  const ownerGuard = reseedAi || reclaim ? "" : "updated_by IS NULL AND ";
+  const pristine = reclaim
+    ? deletedGuard
+    : kind === "tn"
       ? `${ownerGuard}${deletedGuard} AND trashed_at IS NULL AND preserve = 0 AND hint = 0`
       : `${ownerGuard}${deletedGuard}`;
-  const clearDeleted = resurrect ? "deleted_at = NULL, " : "";
-  const clearOwner = reseedAi ? "updated_by = NULL, " : "";
+  const clearDeleted = resurrect || reclaim ? "deleted_at = NULL, " : "";
+  const clearOwner = reseedAi || reclaim ? "updated_by = NULL, " : "";
+  // Reclaim ONLY (tn): master's row is starting a fresh life in this slot, the
+  // same as a brand-new INSERT would (whose columns default to NULL/0 — see
+  // tryInsertTsvRow, which never sets these three either). A tombstoned row's
+  // trashed_at/preserve/hint describe intent a human set for the OLD content
+  // (the trash queue, "protect from the AI sweep", "queue as an AI hint") —
+  // carrying any of those forward onto master's unrelated new content would be
+  // applying a human's decision to a row they never made it about. Every other
+  // mode leaves these three columns alone (there's nothing to clear: the
+  // pristine guard above already requires them clear before a normal
+  // UPDATE/resurrect/reseed can proceed at all).
+  const clearProtections = reclaim && kind === "tn" ? "trashed_at = NULL, preserve = 0, hint = 0, " : "";
+  // Reclaim ONLY, all three kinds: restored_from_version (the "switch to vN"
+  // display chip) and review_kind/review_reason (the flag-for-review markers —
+  // e.g. 'ref_moved', a keep_alignment_refused-style note) describe the OLD
+  // tombstoned row, same rationale as clearProtections above. Left uncleared, a
+  // human's stale "this needs review because X" or "showing as vN" carries onto
+  // master's unrelated new content with no way to tell it's wrong. Fresh-insert
+  // default for both is NULL (tryInsertTsvRow never sets either).
+  const clearReviewMeta = reclaim
+    ? "restored_from_version = NULL, review_kind = NULL, review_reason = NULL, "
+    : "";
   const newVersion = oldVersion + 1;
   if (kind === "tn") {
     return env.DB.prepare(
       `UPDATE tn_rows
-          SET ${clearDeleted}${clearOwner}ref_raw = ?1, chapter = ?2, verse = ?3, tags = ?4,
+          SET ${clearDeleted}${clearOwner}${clearProtections}${clearReviewMeta}ref_raw = ?1, chapter = ?2, verse = ?3, tags = ?4,
               support_reference = ?5, quote = ?6, occurrence = ?7, note = ?8,
               sort_order = ?9, version = ?10, updated_at = ?11
         WHERE id = ?12 AND book = ?13 AND ${pristine} AND version = ?14`,
@@ -2006,7 +2538,7 @@ function buildTsvUpdateStmt(
   if (kind === "tq") {
     return env.DB.prepare(
       `UPDATE tq_rows
-          SET ${clearDeleted}${clearOwner}ref_raw = ?1, chapter = ?2, verse = ?3, tags = ?4,
+          SET ${clearDeleted}${clearOwner}${clearReviewMeta}ref_raw = ?1, chapter = ?2, verse = ?3, tags = ?4,
               quote = ?5, occurrence = ?6, question = ?7, response = ?8,
               sort_order = ?9, version = ?10, updated_at = ?11
         WHERE id = ?12 AND book = ?13 AND ${pristine} AND version = ?14`,
@@ -2018,7 +2550,7 @@ function buildTsvUpdateStmt(
   }
   return env.DB.prepare(
     `UPDATE twl_rows
-        SET ${clearDeleted}${clearOwner}ref_raw = ?1, chapter = ?2, verse = ?3, tags = ?4,
+        SET ${clearDeleted}${clearOwner}${clearReviewMeta}ref_raw = ?1, chapter = ?2, verse = ?3, tags = ?4,
             orig_words = ?5, occurrence = ?6, tw_link = ?7,
             sort_order = ?8, version = ?9, updated_at = ?10
       WHERE id = ?11 AND book = ?12 AND ${pristine} AND version = ?13`,
@@ -2046,6 +2578,38 @@ function logEditStmt(
     `INSERT INTO edit_log
        (kind, row_key, book, user_id, prev_version, new_version, action, payload_json, source)
      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)`,
+  ).bind(kind, rowKey, book, userId, prevVersion, newVersion, action, JSON.stringify(payload), REIMPORT_SOURCE);
+}
+
+// SQL-`changes()`-gated sibling of logEditStmt, for a write+log pair that MUST
+// travel in the SAME env.DB.batch() call, immediately adjacent (write, then
+// this). D1 batches are transactional but are NOT one INSERT — two separate
+// batch() calls (write batch, then a JS-meta.changes-gated log batch) can
+// commit the first and lose the second independently, leaving a write with no
+// audit row. `changes()` reflects the immediately-preceding statement in the
+// SAME batch, so this only inserts when that statement actually changed a
+// row — never a phantom audit row for a write that lost its guard/CAS. Same
+// pattern as applyVerseRows' pristine batch (PR #496 review fix, commit
+// 9dad85d) — reused here for the reclaim batch (PR #506 review), which needs
+// the same guarantee: a reclaim's audit row is also a history BOUNDARY
+// (rowHistoryBoundary.ts) that must never land without the write it belongs
+// to, or vice versa.
+function gatedLogEditStmt(
+  env: Env,
+  kind: "tn" | "tq" | "twl" | "verse",
+  rowKey: string,
+  book: string,
+  userId: number | null,
+  prevVersion: number | null,
+  newVersion: number,
+  action: "create" | "update" | "restore",
+  payload: unknown,
+): D1PreparedStatement {
+  return env.DB.prepare(
+    `INSERT INTO edit_log
+       (kind, row_key, book, user_id, prev_version, new_version, action, payload_json, source)
+     SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9
+      WHERE changes() > 0`,
   ).bind(kind, rowKey, book, userId, prevVersion, newVersion, action, JSON.stringify(payload), REIMPORT_SOURCE);
 }
 
@@ -2127,6 +2691,18 @@ function sourceWordsForVerseRange(
 interface MergeCutoff {
   confirmedAt: number | null;
   editId: number | null;
+  /**
+   * WHO moved master's file for this (book, resource) since the ancestor —
+   * issue #540 item 1. Fetched once per pair per run at the only place that
+   * already holds master's sha (planAndStageBookResources / runReimport's
+   * own-publish loop, both via loadMasterLineage), then carried here so both
+   * merges can ask the one question that decides a both-changed conflict.
+   *
+   * ABSENT (undefined) means nobody looked, which masterMayHoldHumanEdit reads
+   * as "a human may have" — today's behavior. Never read this field directly;
+   * pass it to that helper. See masterLineage.ts.
+   */
+  lineage?: MasterLineageSummary | null;
 }
 
 async function getMasterConfirmedAt(env: Env, book: string, resource: string): Promise<MergeCutoff> {
@@ -2156,6 +2732,58 @@ async function getMasterConfirmedAt(env: Env, book: string, resource: string): P
       .first<{ master_confirmed_at: number | null }>();
     return { confirmedAt: row?.master_confirmed_at ?? null, editId: null };
   }
+}
+
+// Who moved master's file for this (book, resource) since the merge's ancestor
+// (#540 item 1). One Gitea call per page, default budget 5 pages (~250 commits)
+// — and only ever called where master's sha has ALREADY been observed to move,
+// which is the same condition that gates the file fetch itself, so a quiet
+// resource costs nothing.
+//
+// BOUNDED BY `master_confirmed_at`, NOT BY `source_sha`. Those are different
+// points in master's history and they drift apart by design: recordResourceSync
+// advances source_sha at the end of any successful reimport, while
+// master_confirmed_at moves only on a positive measurement that master holds our
+// render — so source_sha is routinely NEWER. A sha-bounded walk skips every
+// commit between the two, and a human commit hiding in that gap, reported as "no
+// human found", is the one answer that unblocks an overwrite. The bound has to be
+// the same point the merge attributes CONTENT against, which is the watermark.
+// (See dcsSources.ts's "WHICH BOUNDARY" note. The first version of this wiring
+// passed source_sha and was wrong for exactly this reason.)
+//
+// Returns null when there is nothing to ask about: no resource file, or no
+// watermark — and with no watermark both merges are inert anyway, so there is no
+// decision for a lineage to inform. Every other failure comes back as a summary
+// flagged `incomplete`, which masterMayHoldHumanEdit treats exactly like a found
+// human commit: a fetch that fell over must never read as "no human touched this".
+async function loadMasterLineage(
+  env: Env,
+  book: string,
+  resource: Resource,
+  confirmedAt: number | null,
+): Promise<MasterLineageSummary | null> {
+  const file = dcsResourceFile(book, resource);
+  if (!file || confirmedAt == null) return null;
+  const page = await listMasterCommitsSince(env, file.repo, file.path, null, { sinceTime: confirmedAt });
+  const lineage = summarizeLineage(page.commits.map(classifyMasterCommit), {
+    incomplete: page.incomplete,
+    incompleteReason: page.incompleteReason,
+  });
+  const summary = compactLineage(lineage);
+  // Logged for every pair that fetched one, not just the ones that changed a
+  // decision: "the merge kept D1 because only the pipeline moved master" is a
+  // claim, and this is the measurement behind it.
+  console.log("reimport master lineage", {
+    book,
+    resource,
+    confirmedAt,
+    mayHoldHumanEdit: summary.mayHoldHumanEdit,
+    ...summary.counts,
+    incomplete: summary.incomplete,
+    incompleteReason: summary.incompleteReason,
+    humanShas: summary.humanShas,
+  });
+  return summary;
 }
 
 // Heal AI-mangled U+FFFD in `\zaln-s` source attributes (x-content / x-lemma /
@@ -2529,9 +3157,40 @@ async function applyVerseRows(
           ours: ex.content_json,
           theirs: v.contentJson,
           humanEditedSinceExport: Number(ex.human_edit_after_export ?? 0) !== 0,
+          // #540 item 2. Always the helper, never `cutoff.lineage.hasHumanCommit`
+          // — an incomplete walk must protect master exactly like a found human
+          // commit, and only this function knows that.
+          masterMayHoldHumanEdit: masterMayHoldHumanEdit(cutoff?.lineage),
         });
-        if (merge.action === "keep_no_base") counts.merge_no_base++;
+        if (merge.action === "keep_no_base") {
+          counts.merge_no_base++;
+          // Name the verse, capped. keep_no_base writes no verse_merge_conflicts
+          // row (that table only holds adjudicated outcomes), so without this the
+          // banner's own admission — "a Door43-side change to them will still be
+          // overwritten by tonight's export" — points at nothing a human can open.
+          const refs = (counts.merge_no_base_refs ??= []);
+          if (refs.length < NO_BASE_REF_CAP) refs.push(`${v.chapter}:${v.verse}`);
+        }
         if (merge.action === "keep_alignment_refused") counts.merge_refused++;
+        // Deliberately NOT folded into merge_refused: that counter feeds
+        // isSystemicMergeRefusal, which freezes the whole (book, resource)
+        // export once five verses hit it. Freezing is exactly wrong here — the
+        // export is how the human edit this outcome just protected reaches
+        // Door43, and withholding it would re-create the livelock #543 killed on
+        // the TSV side. Counted separately so the class is still visible.
+        // `merge.adopt` is false for keep_ai_master (same as keep_alignment_refused
+        // above), so it falls through past the `merge.adopt` branch below to the
+        // ordinary edited-verse path — including reconcileEditedVerseSourceAttrs,
+        // which still pulls master's x-content/x-lemma/x-morph onto this verse's
+        // `\zaln-s` milestones (#552 item 2, decided rather than left an accident
+        // of fall-through order). Kept deliberately, not just inherited: we refuse
+        // master's TARGET text here because it's AI-authored with no human commit
+        // behind it, but the original-language source attributes are source-owned,
+        // not translator-owned — the same reasoning keep_alignment_refused already
+        // relies on (the NUM 20–22 combining-mark correction is the case that
+        // reconcile exists for). Refusing the target text is not a reason to also
+        // refuse an unrelated, source-owned correction on the same verse.
+        if (merge.action === "keep_ai_master") counts.merge_kept_ai++;
         // FIX 5: converged-per-stableKey but the raw bytes differed — a real,
         // cosmetic-only edit this comparison silently discards. See
         // verseMerge.ts's FIX 5 correction and the field's own doc comment.
@@ -3308,6 +3967,17 @@ interface StagedResource {
   // false for ult/ust (unused there; verses are never row-pruned by chapter
   // absence) and for any entry where changed is false (nothing staged).
   verifiedComplete: boolean;
+  // Who moved master's file since `sync.sourceSha` (#540 item 1), measured here
+  // because this is the only place in the nightly path that talks to DCS per
+  // pair — and measured only for a resource that is actually being staged, so a
+  // SHA-unchanged or own-publish resource costs nothing. Rides the plan's
+  // `step.do` result into every chunk step, which is what keeps it one fetch per
+  // pair per run rather than one per chunk.
+  //
+  // Absent on a plan replayed from a Workflow instance that started before this
+  // shipped; masterMayHoldHumanEdit reads that absence as "a human may have",
+  // which is the pre-existing behavior.
+  lineage?: MasterLineageSummary | null;
 }
 
 interface ReimportPlan {
@@ -3580,29 +4250,93 @@ async function noteOwnPublishDecline(
 // Banner for issue #427's withhold. This one NEEDS an alert in a way the
 // lock-held withholds do not, and the difference is the whole reason it exists:
 // a chapter lock clears when the AI job finishes, so that withhold releases
-// itself overnight. A tombstone does not. The soft-deleted row keeps its
-// (book, id) slot forever, master keeps carrying that id, and every subsequent
-// night re-stages the file (the SHA gate cannot skip it — the watermark was
-// never advanced), re-drops the same rows, and re-withholds. **There is no
-// automatic release.** Until a human acts, or until issue #427's option 1
-// (reclaim a reissued id) or option 3 (sweep obsolete tombstones) ships, this
-// book+resource stops exporting to Door43 entirely.
+// itself overnight. Before option 1 shipped, a reissued tombstone did not: it
+// blocked EVERY run, forever, until a human acted — the soft-deleted row keeps
+// its (book, id) slot forever, master keeps carrying that id, and every
+// subsequent night re-stages the file (the SHA gate cannot skip it — the
+// watermark was never advanced), re-drops the same rows, and re-withholds.
 //
-// That is the correct fail-safe direction — exporting instead would render a D1
-// that is short of master back over master, deleting master's rows, which is the
-// original 1CH failure — but a freeze nobody is told about is not safe, it is
-// just quiet. The existing freshness-gate banner (exportWorkflow.ts's
-// recordStaleSkipAlert) fires too, and its advice — "re-run the sync, then
-// re-export" — cannot possibly work here, because re-running the sync
+// Issue #427's option 1 (reclaim a reissued id) has now SHIPPED — see the
+// tombstone branch of applyTsvRows and the "Batch the reclaims" write site —
+// and runs automatically, in the SAME run a reissued tombstone is first
+// detected, so the common case this alert used to describe no longer produces
+// a `tombstone_blocked` count at all: master's row lands, reclaimed, same
+// night. `tombstone_blocked` now fires ONLY for the residual: a reclaim
+// attempt that LOST the version-CAS race against a concurrent writer touching
+// the SAME tombstoned row between the read and the write. Unlike the pre-fix
+// permanent freeze, that is expected to self-heal on the NEXT sync once the
+// race that caused it has resolved — but "usually self-heals" is not the same
+// as "guaranteed to clear silently," so this alert still fires for it.
+// `conflict_skipped` (the OTHER half of this alert — an INSERT-path race
+// against a row the in-memory diff never saw) is unrelated to option 1 and
+// keeps its original semantics and its original "does not clear on its own"
+// framing.
+//
+// The freeze itself is still the correct fail-safe direction while either
+// count is nonzero — exporting instead would render a D1 that is short of
+// master back over master, deleting master's rows, which is the original 1CH
+// failure — but a freeze nobody is told about is not safe, it is just quiet.
+// The existing freshness-gate banner (exportWorkflow.ts's recordStaleSkipAlert)
+// fires too, and its advice — "re-run the sync, then re-export" — cannot
+// possibly work for the conflict_skipped half, because re-running the sync
 // re-encounters the same collision. So this alert names the measured cause and
 // the rows, and gives a remedy that can actually clear it.
 //
 // The wording states only what the code measured: the counters, and the sampled
 // rows themselves. It does NOT claim which of the two situations produced any
-// given row (an id genuinely re-minted for a new row, versus a maintainer
-// re-anchoring the Reference of a row we had deleted) — the reference test
-// cannot separate those, and asserting either would repeat the mistake this
-// repo has a standing lesson about.
+// given `tombstone_blocked` row (an id genuinely re-minted for a new row, versus
+// a maintainer re-anchoring the Reference of a row we had deleted) — the
+// reference test cannot separate those, and asserting either would repeat the
+// mistake this repo has a standing lesson about. That ambiguity now drives an
+// actual reclaim WRITE rather than merely a freeze — see isReissuedTombstone's
+// KNOWN FALSE POSITIVE note in reimportClassify.ts for what that means.
+
+// #540 item 2's scale alarm. A handful of kept-over-Door43 rows is the policy
+// working; a book-full of them has the shape of every incident this area exists
+// to prevent — and unlike a refusal, this outcome PUBLISHES over Door43 rather
+// than holding. See isKeptOverDoor43AtScale for why it alerts instead of
+// freezing.
+//
+// Claims only the measurement: how many rows, in which (book, resource), and
+// what the walk actually found. It does not say whether a human edited Door43 —
+// the walk sees commits, not intent.
+async function raiseKeptOverDoor43Alert(
+  env: Env,
+  book: string,
+  resource: Resource,
+  kept: number,
+): Promise<void> {
+  const source = `reimport_kept_over_door43:${book}:${resource}`;
+  const res = resource.toUpperCase();
+  const message =
+    `Benjamin — tonight's Door43 sync kept the app's version over Door43's on ${kept} ${book} ${res} ` +
+    `row(s)/verse(s). For each one, both sides had changed since the last confirmed publish AND every ` +
+    `Door43 commit to that file since then came from Bible Editor's own export or the unfoldingWord bot ` +
+    `account — no commit from a Door43 editor's own account was found. That is the intended policy ` +
+    `(AI-written content on Door43 does not overwrite a later app edit), but at this many rows it is ` +
+    `worth a look before the next export writes them to Door43: the same count would appear if the commit ` +
+    `classification were wrong — a second bot identity, or a rewritten history on Door43. Each affected ` +
+    `row is flagged in the app for review, and the verses are in ${book}'s merge-review banner.`;
+  try {
+    await env.DB.prepare(`DELETE FROM system_alerts WHERE username = ?1 AND source = ?2 AND dismissed_at IS NULL`)
+      .bind(OWN_PUBLISH_ALERT_USERNAME, source)
+      .run();
+    await env.DB.prepare(
+      `INSERT INTO system_alerts (username, severity, source, message, link_url) VALUES (?1, ?2, ?3, ?4, ?5)`,
+    )
+      .bind(OWN_PUBLISH_ALERT_USERNAME, "warning", source, message, null)
+      .run();
+  } catch (e) {
+    // Best-effort, like every other alert helper here: a failed banner must
+    // never fail the reimport, and this one gates nothing.
+    console.error("reimport kept-over-Door43 alert failed", {
+      book,
+      resource,
+      error: e instanceof Error ? e.message : String(e),
+    });
+  }
+}
+
 async function raiseTombstoneBlockAlert(
   env: Env,
   book: string,
@@ -3622,13 +4356,22 @@ async function raiseTombstoneBlockAlert(
     `MISSING from the app, so ${book} ${resource.toUpperCase()} has been left marked out of sync and ` +
     `will NOT export to Door43 until this is cleared — otherwise the export would delete those same ` +
     `rows from Door43. ` +
-    (blocked > 0 ? `${blocked} blocked by a deleted row whose ID Door43 now uses at a different reference` : "") +
+    (blocked > 0
+      ? `${blocked} lost the automatic reclaim's version-CAS race against a concurrent writer on the ` +
+        `same deleted row (usually clears on its own next sync, once that race resolves)`
+      : "") +
     (blocked > 0 && conflicts > 0 ? "; " : "") +
     (conflicts > 0 ? `${conflicts} refused by the database as an ID already in use` : "") +
     `. Affected: ${shown.join(" | ")}${more > 0 ? ` (and ${more} more)` : ""}. ` +
-    `This does NOT clear on its own — the next sync hits the same collision. To clear it, either give ` +
-    `the affected row(s) a different ID on Door43, or land the ID-reclaim / tombstone-sweep fix ` +
-    `(GitHub issue #427, options 1 and 3).`;
+    (conflicts > 0
+      ? `The ID-already-in-use row(s) do NOT clear on their own — the next sync hits the same collision; ` +
+        `give the affected row(s) a different ID on Door43. `
+      : "") +
+    (blocked > 0
+      ? `The reclaim-race row(s) above should resolve automatically; if this persists across multiple ` +
+        `nights for the same row, something is wrong with the automatic reclaim (GitHub issue #427, ` +
+        `option 1) and it needs a human look.`
+      : "");
   try {
     await env.DB.prepare(`DELETE FROM system_alerts WHERE username = ?1 AND source = ?2 AND dismissed_at IS NULL`)
       .bind(OWN_PUBLISH_ALERT_USERNAME, source)
@@ -3642,6 +4385,35 @@ async function raiseTombstoneBlockAlert(
     // Best-effort, exactly like every other alert helper here: a failed banner
     // must never fail the reimport. The withhold itself already happened.
     console.error("reimport tombstone-block alert failed", {
+      book,
+      resource,
+      error: e instanceof Error ? e.message : String(e),
+    });
+  }
+}
+
+// Clears a resource's reimport_id_blocked alert (raiseTombstoneBlockAlert)
+// once its sync actually succeeds and a watermark is recorded. The alert's
+// own text promises the reclaim-race half of the count "usually clears on
+// its own next sync" — but until this function existed, the ONLY place that
+// DELETE ran was inside raiseTombstoneBlockAlert itself, which fires only
+// while the resource is STILL withheld. A resource that recovers next run
+// never calls it again, so a resolved alert stayed active in the banner
+// forever, falsely claiming the resource was still out of sync (Codex review
+// on PR #506, round 3). Called from the sync-success branch in
+// runChunkedReimport, immediately after recordResourceSync lands — see
+// clearTombstoneBlockAlertForTest for the reimportJourney.test.mjs coverage.
+// Best-effort like every other alert helper here: a failed cleanup must
+// never fail the reimport, and clearing an alert that doesn't exist (the
+// common case — most resources never had one) is a harmless no-op DELETE.
+async function clearTombstoneBlockAlert(env: Env, book: string, resource: Resource): Promise<void> {
+  const source = `reimport_id_blocked:${book}:${resource}`;
+  try {
+    await env.DB.prepare(`DELETE FROM system_alerts WHERE username = ?1 AND source = ?2 AND dismissed_at IS NULL`)
+      .bind(OWN_PUBLISH_ALERT_USERNAME, source)
+      .run();
+  } catch (e) {
+    console.error("reimport tombstone-block alert clear failed", {
       book,
       resource,
       error: e instanceof Error ? e.message : String(e),
@@ -4312,9 +5084,22 @@ async function planAndStageBookResources(
       entries.push({ resource, changed: false, masterSha: null, r2Key: null, verifiedComplete: false });
       continue;
     }
+    // Master's file moved, and it was not our own render coming back — so
+    // SOMEONE moved it, and both merges are about to need to know who (#540
+    // item 1). This is the one point in the nightly path that talks to DCS per
+    // pair, so the walk happens here, once, and rides the plan into every chunk
+    // step. The extra D1 read buys the correct boundary: the walk must start
+    // where the merge's ancestor sits (`master_confirmed_at`), not at
+    // `sync.sourceSha`, which this very function is about to move past it.
+    const lineage = await loadMasterLineage(
+      env,
+      book,
+      resource,
+      (await getMasterConfirmedAt(env, book, resource)).confirmedAt,
+    );
     const r2Key = `reimport-stage/${instanceId}/${book}/${resource}`;
     await env.BLOBS.put(r2Key, raw);
-    entries.push({ resource, changed: true, masterSha, r2Key, verifiedComplete });
+    entries.push({ resource, changed: true, masterSha, r2Key, verifiedComplete, lineage });
   }
   return { maxChapter, entries };
 }
@@ -4386,14 +5171,30 @@ async function reimportStagedChunk(
   // this whole chunk step, not once per chapter — see getMasterConfirmedAt.
   // Up to 2 reads per step (ult + ust), down from up to ~18 (REIMPORT_CHAPTER_
   // CHUNK=8 chapters, +1 for chapter 0 on the first chunk, × 2 resources).
-  const masterConfirmedAtUlt = versesByChapter.ult ? await getMasterConfirmedAt(env, book, "ult") : null;
-  const masterConfirmedAtUst = versesByChapter.ust ? await getMasterConfirmedAt(env, book, "ust") : null;
+  // The lineage rides in on the plan (#540 item 1) — measured ONCE per pair at
+  // stage time, not re-fetched per chunk, which is what keeps this at one Gitea
+  // walk per (book, resource) per night. `?? null` is not a coercion of a
+  // measured value: an entry from a plan staged before this shipped simply has
+  // no field, and null means "nobody looked", which is the protective answer.
+  const lineageOf = (resource: Resource): MasterLineageSummary | null =>
+    staged.find((e) => e.resource === resource)?.lineage ?? null;
+  const withLineage = (cutoff: MergeCutoff | null, resource: Resource): MergeCutoff | null =>
+    cutoff == null ? null : { ...cutoff, lineage: lineageOf(resource) };
+
+  const masterConfirmedAtUlt = withLineage(
+    versesByChapter.ult ? await getMasterConfirmedAt(env, book, "ult") : null,
+    "ult",
+  );
+  const masterConfirmedAtUst = withLineage(
+    versesByChapter.ust ? await getMasterConfirmedAt(env, book, "ust") : null,
+    "ust",
+  );
   // Same hoist for the TSV three-way merge ancestor cutoffs — once per chunk
   // step, read only for a kind that actually has rows staged this chunk.
   const masterConfirmedAtTsv: Record<TsvKind, MergeCutoff | null> = {
-    tn: rowsByChapter.tn ? await getMasterConfirmedAt(env, book, "tn") : null,
-    tq: rowsByChapter.tq ? await getMasterConfirmedAt(env, book, "tq") : null,
-    twl: rowsByChapter.twl ? await getMasterConfirmedAt(env, book, "twl") : null,
+    tn: withLineage(rowsByChapter.tn ? await getMasterConfirmedAt(env, book, "tn") : null, "tn"),
+    tq: withLineage(rowsByChapter.tq ? await getMasterConfirmedAt(env, book, "tq") : null, "tq"),
+    twl: withLineage(rowsByChapter.twl ? await getMasterConfirmedAt(env, book, "twl") : null, "twl"),
   };
 
   for (let chapter = startChapter; chapter <= endChapter; chapter++) {
@@ -4534,6 +5335,7 @@ export async function runChunkedReimport(
       await raiseVerseMergeConflictAlert(env, book, e.resource, {
         recordingFailed: perResource[e.resource].merge_record_failed === true,
         noBaseCount: perResource[e.resource].merge_no_base,
+        noBaseRefs: perResource[e.resource].merge_no_base_refs,
       });
     }
   });
@@ -4632,6 +5434,13 @@ export async function runChunkedReimport(
         undefined,
         refusalOverride,
       );
+      // #540 item 2's scale alarm, raised OUTSIDE the withhold branch below and
+      // gating nothing: keeping the app's version at scale does not make the
+      // resource unsafe to export — it makes it worth a human's eye BEFORE the
+      // export publishes those rows to Door43. See isKeptOverDoor43AtScale.
+      if (isKeptOverDoor43AtScale(perResource[e.resource].merge_kept_ai ?? 0)) {
+        await raiseKeptOverDoor43Alert(env, book, e.resource, perResource[e.resource].merge_kept_ai ?? 0);
+      }
       // FIX 1: withhold the watermark when this run's merge-conflict
       // recording failed for this resource (applyVerseRows step 6b —
       // recordVerseMergeConflicts returned false, so the whole adoption
@@ -4677,6 +5486,12 @@ export async function runChunkedReimport(
       if (!e.masterSha) continue;
       await recordResourceSync(env, book, e.resource, e.masterSha, "reimport");
       recorded++;
+      // The resource just synced cleanly (it reached here, so it was NOT
+      // withheld above) — clear any stale reimport_id_blocked alert from a
+      // past run's tombstone_blocked/conflict_skipped count. See
+      // clearTombstoneBlockAlert's doc comment for why this can't live inside
+      // raiseTombstoneBlockAlert itself.
+      await clearTombstoneBlockAlert(env, book, e.resource);
     }
     if (withheld.length) {
       // Not always "chapter lock held" any more — also fires for systemic
