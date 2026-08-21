@@ -473,6 +473,186 @@ console.log("\n[reference-move attribution at the caller]");
     eq(afterSecond.version, afterFirst.version, "…but an unchanged reason does not re-bump the version (#567)");
     eq(afterSecond.review_reason, afterFirst.review_reason, "…the reason text itself is unchanged");
   }
+
+  // 7. The references AGREE again, and a flag from an earlier run is still on
+  //    the row (issue #588). Before the fix nothing cleared it: the only clear
+  //    lived in the ours_moved branch, so a resolved reference kept its cleanup
+  //    chip forever with nothing left to decide. Observed on AMO tq 3:14.
+  {
+    const { sqlite, env } = freshEnv();
+    const boundary = seedMoved(sqlite, { reviewKind: "ref_moved" });
+    // Master now sits where D1 does — the translator moved it in-app to match.
+    const counts = await applyTsvRows(env, BOOK, "tq", [masterAt("1:6", 1, 6)], null, {
+      confirmedAt: 200, editId: boundary,
+    });
+    eq(counts.apply_incomplete, false, "an agreed reference does not withhold the watermark");
+    eq(counts.ref_moved_theirs, 0, "…and is not counted as a move at all");
+    const row = sqlite.prepare(`SELECT review_kind, review_reason, version, question FROM tq_rows WHERE id='mv01'`).all()[0];
+    eq(row.review_kind, null, "the resolved ref_moved flag is cleared");
+    eq(row.review_reason, null, "…reason too");
+    eq(row.question, "our question", "…and no content field is touched");
+    eq(row.version, 4, "…at the cost of exactly one version bump");
+
+    // Once, not nightly: the second run finds no flag and writes nothing.
+    await applyTsvRows(env, BOOK, "tq", [masterAt("1:6", 1, 6)], null, { confirmedAt: 200, editId: boundary });
+    const after = sqlite.prepare(`SELECT version FROM tq_rows WHERE id='mv01'`).all()[0];
+    eq(after.version, 4, "…and the next nightly does not re-bump it");
+  }
+
+  // 7b. The SHAPE THE BUG WAS REPORTED IN: the reference is reconciled and
+  //     nothing else diverges either, so the row is a plain no-op and never
+  //     reaches the edited-candidate resolution above. The first cut of this fix
+  //     cleared the flag only there, which left the chip standing for every
+  //     tn/twl row (their stored sort_order forces `noop`) and for any tq row
+  //     whose sort_order already matched file order. Found by cold review.
+  {
+    const { sqlite, env } = freshEnv();
+    seedMoved(sqlite, { reviewKind: "ref_moved" });
+    // 100 == the first row's file-order sort_order (makeVerseSortOrder is a
+    // per-verse ordinal x100), so content AND order match: noop.
+    sqlite.prepare(`UPDATE tq_rows SET sort_order = 100 WHERE id='mv01'`).run();
+    const counts = await applyTsvRows(env, BOOK, "tq", [masterAt("1:6", 1, 6)], null, {
+      confirmedAt: 200, editId: 1,
+    });
+    eq(counts.skipped_noop, 1, "the resolved row classifies as a no-op…");
+    eq(counts.ref_moved_resolved, 1, "…and its stale flag is still cleared (#588)");
+    const row = sqlite.prepare(`SELECT review_kind, review_reason, version, question FROM tq_rows WHERE id='mv01'`).all()[0];
+    eq(row.review_kind, null, "flag gone");
+    eq(row.review_reason, null, "…reason too");
+    eq(row.version, 3, "…with NO version bump, so an open editor's If-Match still holds");
+    eq(row.question, "our question", "…and no content touched");
+
+    const second = await applyTsvRows(env, BOOK, "tq", [masterAt("1:6", 1, 6)], null, { confirmedAt: 200, editId: 1 });
+    eq(second.ref_moved_resolved, 0, "…and there is nothing left to clear next night");
+  }
+
+  // 7c. Same, for tn — where a stored sort_order makes `noop` unconditional, so
+  //     before the no-op clear NO tn row could ever shed a resolved flag.
+  {
+    const { sqlite, env } = freshEnv();
+    sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (7, 7007, 'translator')`).run();
+    sqlite
+      .prepare(
+        `INSERT INTO tn_rows (id, book, chapter, verse, ref_raw, note, sort_order, updated_by, version, review_kind, review_reason)
+         VALUES ('tn01', ?, 1, 6, '1:6', 'our note', 42, 7, 3, 'ref_moved', 'some earlier reason')`,
+      )
+      .run(BOOK);
+    const counts = await applyTsvRows(
+      env, BOOK, "tn",
+      [{ id: "tn01", idCoerced: false, refRaw: "1:6", chapter: 1, verse: 6, occurrence: null, tags: null, quote: null, note: "our note", support_reference: null }],
+      null, { confirmedAt: 200, editId: 1 },
+    );
+    eq(counts.ref_moved_resolved, 1, "a tn row sheds its resolved flag despite the preserved local order");
+    const row = sqlite.prepare(`SELECT review_kind, sort_order, version FROM tn_rows WHERE id='tn01'`).all()[0];
+    eq(row.review_kind, null, "flag gone");
+    eq(row.sort_order, 42, "…and the in-app reorder is NOT reverted (the HOS 11 bug stays fixed)");
+    eq(row.version, 3, "…no version bump");
+  }
+
+  // 7d. The no-op clear is guarded the same way: a merge_conflict on an
+  //     otherwise-identical row is not collateral damage.
+  {
+    const { sqlite, env } = freshEnv();
+    seedMoved(sqlite, { reviewKind: "merge_conflict" });
+    sqlite.prepare(`UPDATE tq_rows SET sort_order = 100 WHERE id='mv01'`).run();
+    const counts = await applyTsvRows(env, BOOK, "tq", [masterAt("1:6", 1, 6)], null, { confirmedAt: 200, editId: 1 });
+    eq(counts.ref_moved_resolved, 0, "nothing is counted as resolved");
+    const row = sqlite.prepare(`SELECT review_kind FROM tq_rows WHERE id='mv01'`).all()[0];
+    eq(row.review_kind, "merge_conflict", "a merge_conflict survives the no-op path");
+  }
+
+  // 7e. Every OTHER review_kind this codebase writes survives too — the guard is
+  //     an equality on 'ref_moved', and a widened guard would silently drop these
+  //     (merge_kept and merge_no_base are both live writers).
+  for (const kept of ["merge_kept", "merge_no_base"]) {
+    const { sqlite, env } = freshEnv();
+    seedMoved(sqlite, { reviewKind: kept });
+    sqlite.prepare(`UPDATE tq_rows SET sort_order = 100 WHERE id='mv01'`).run();
+    await applyTsvRows(env, BOOK, "tq", [masterAt("1:6", 1, 6)], null, { confirmedAt: 200, editId: 1 });
+    const row = sqlite.prepare(`SELECT review_kind FROM tq_rows WHERE id='mv01'`).all()[0];
+    eq(row.review_kind, kept, `a ${kept} flag survives the no-op path`);
+  }
+
+  // 7f. The clear is book-scoped. A same-id flagged row in ANOTHER book must not
+  //     be caught by it — row ids are only unique per book, so dropping `book`
+  //     from the statement's WHERE would silently clear flags across the canon.
+  {
+    const { sqlite, env } = freshEnv();
+    seedMoved(sqlite, { reviewKind: "ref_moved" });
+    sqlite.prepare(`UPDATE tq_rows SET sort_order = 100 WHERE id='mv01'`).run();
+    sqlite
+      .prepare(
+        `INSERT INTO tq_rows (id, book, chapter, verse, ref_raw, question, response, sort_order, updated_by, version, review_kind, review_reason)
+         VALUES ('mv01', 'HOS', 1, 6, '1:6', 'other book', 'other book', 100, 7, 3, 'ref_moved', 'their reason')`,
+      )
+      .run();
+    const counts = await applyTsvRows(env, BOOK, "tq", [masterAt("1:6", 1, 6)], null, { confirmedAt: 200, editId: 1 });
+    eq(counts.ref_moved_resolved, 1, "exactly one row is cleared…");
+    const other = sqlite.prepare(`SELECT review_kind FROM tq_rows WHERE id='mv01' AND book='HOS'`).all()[0];
+    eq(other.review_kind, "ref_moved", "…and the same id in another book keeps its flag");
+  }
+
+  // 7g. A PROTECTED tn row (preserve/hint/trashed) whose reference agrees while
+  //     its note diverges. It never reaches the no-op path, and the first cut of
+  //     the edited-path clear excluded protected rows outright — so the chip was
+  //     permanent on exactly the rows nobody will edit again (PR #589 review).
+  //     The clear now keys on measured agreement, and routes through the
+  //     version-neutral statement because buildTsvEditedWriteStmt's WHERE
+  //     re-asserts preserve = 0 and would 0-change.
+  for (const [col, val] of [["preserve", 1], ["hint", 1], ["trashed_at", 1700000000]]) {
+    const { sqlite, env } = freshEnv();
+    sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (7, 7007, 'translator')`).run();
+    sqlite
+      .prepare(
+        `INSERT INTO tn_rows (id, book, chapter, verse, ref_raw, note, sort_order, updated_by, version, review_kind, review_reason, ${col})
+         VALUES ('tnp1', ?, 1, 6, '1:6', 'our note', 42, 7, 3, 'ref_moved', 'some earlier reason', ?)`,
+      )
+      .run(BOOK, val);
+    const counts = await applyTsvRows(
+      env, BOOK, "tn",
+      // Same reference, DIFFERENT note -> classified "edited", not a no-op.
+      [{ id: "tnp1", idCoerced: false, refRaw: "1:6", chapter: 1, verse: 6, occurrence: null, tags: null, quote: null, note: "master note", support_reference: null }],
+      null, { confirmedAt: 200, editId: 1 },
+    );
+    eq(counts.ref_moved_resolved, 1, `a ${col} row sheds its resolved flag`);
+    const row = sqlite.prepare(`SELECT review_kind, review_reason, note, version FROM tn_rows WHERE id='tnp1'`).all()[0];
+    eq(row.review_kind, null, "flag gone");
+    eq(row.review_reason, null, "…reason too");
+    eq(row.note, "our note", "…and the protected note is NOT overwritten from master");
+    eq(row.version, 3, "…no version bump");
+  }
+
+  // 7h. Same protected row, but the references still DIFFER: the flag must stay.
+  //     classifyTsvRefMove answers "none" for a protected row by policy without
+  //     comparing anything, so a clear keyed on that would wrongly fire here.
+  {
+    const { sqlite, env } = freshEnv();
+    sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (7, 7007, 'translator')`).run();
+    sqlite
+      .prepare(
+        `INSERT INTO tn_rows (id, book, chapter, verse, ref_raw, note, sort_order, updated_by, version, review_kind, review_reason, preserve)
+         VALUES ('tnp2', ?, 1, 6, '1:6', 'our note', 42, 7, 3, 'ref_moved', 'some earlier reason', 1)`,
+      )
+      .run(BOOK);
+    const counts = await applyTsvRows(
+      env, BOOK, "tn",
+      [{ id: "tnp2", idCoerced: false, refRaw: "1:9", chapter: 1, verse: 9, occurrence: null, tags: null, quote: null, note: "our note", support_reference: null }],
+      null, { confirmedAt: 200, editId: 1 },
+    );
+    eq(counts.ref_moved_resolved, 0, "a still-divergent reference clears nothing…");
+    const row = sqlite.prepare(`SELECT review_kind FROM tn_rows WHERE id='tnp2'`).all()[0];
+    eq(row.review_kind, "ref_moved", "…and the protected row keeps its flag");
+  }
+
+  // 8. That clear must not become a way to lose an unacknowledged content
+  //    conflict, which says something the reference never did.
+  {
+    const { sqlite, env } = freshEnv();
+    const boundary = seedMoved(sqlite, { reviewKind: "merge_conflict" });
+    await applyTsvRows(env, BOOK, "tq", [masterAt("1:6", 1, 6)], null, { confirmedAt: 200, editId: boundary });
+    const row = sqlite.prepare(`SELECT review_kind FROM tq_rows WHERE id='mv01'`).all()[0];
+    eq(row.review_kind, "merge_conflict", "a merge_conflict survives an agreed-reference run");
+  }
 }
 
 // ── AI-vs-human conflict policy at the caller (#540 item 2) ─────────────────
