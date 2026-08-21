@@ -14,6 +14,7 @@ import { requiredOccurrence } from "./occurrenceRule";
 import { findRawTabField } from "./rawTabGuard";
 import { isValidChapterZeroRef } from "./chapterZeroGuard";
 import { normalizeBookCode, CHAPTER_EXISTS_SQL } from "./rowsCreateGuard";
+import { boundHistoryToLastCreate } from "./rowHistoryBoundary";
 
 export const rows = new Hono<{ Bindings: Env; Variables: { userId?: number } }>();
 
@@ -454,16 +455,14 @@ rows.get("/:kind/:id/history", requireEditor, async (c) => {
       full_name: string | null;
     }>();
 
-  const logEntries = rs.results ?? [];
+  const logEntries = boundHistoryToLastCreate(rs.results ?? []);
   const fields = HISTORY_FIELDS[kind];
 
-  // Always anchor the list with a v1 entry. If a real `create` exists at
-  // version 1, use it; otherwise synthesize one from the current row.
-  const hasCreateAtV1 = logEntries.some(
-    (e) => e.action === "create" && e.version === 1,
-  );
+  // Always anchor the list with a v1 entry. If a real `create` survived
+  // bounding above, use it; otherwise synthesize one from the current row.
+  const hasCreate = logEntries.some((e) => e.action === "create");
   type Entry = (typeof logEntries)[number] & { synthetic?: boolean };
-  const entries: Entry[] = hasCreateAtV1
+  const entries: Entry[] = hasCreate
     ? logEntries
     : [
         {

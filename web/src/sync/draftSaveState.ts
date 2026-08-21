@@ -52,6 +52,32 @@ export function generationForSuccessfulOp(
   return legacyOpCapturedDraft(draft, op) ? generation : undefined;
 }
 
+// What the outbox-ok listener should do about the verse-base pin (and draft)
+// for a landed verse op. clearGeneration releases the pin itself when it
+// deletes the latest draft, so the only case needing an explicit unpin is the
+// draftless save: the dual-aligner reading line holds edits in the DOM (no
+// keystroke stash) and calls saveVerseDraft directly, which pins a baseline at
+// save time — and with no draft record, no clear ever runs, so the pin
+// outlived the session and every later text save of the verse diffed against
+// it. That stale diff drops alignments added since the pin, and the server's
+// guardBlocksSave refuses the re-armed resend ("unexpected_alignment_loss" —
+// issue #563). When a draft EXISTS but this op can't be tied to it (generation
+// mismatch = newer typing raced ahead), the pin must STAY — it is exactly what
+// protects that newer typing's baseline (#474).
+export type PinRelease =
+  | { kind: "clear"; generation: string }
+  | { kind: "unpin" }
+  | { kind: "keep" };
+
+export function pinReleaseAfterVerseOk(
+  draft: DraftRecord | undefined,
+  op: OutboxOp,
+): PinRelease {
+  const generation = generationForSuccessfulOp(draft, op);
+  if (generation) return { kind: "clear", generation };
+  return draft ? { kind: "keep" } : { kind: "unpin" };
+}
+
 // Associate a save only with the draft whose payload it actually captured.
 // If typing raced ahead after the click, the payload differs and the older save
 // must not clear that newer generation when it succeeds.

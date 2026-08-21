@@ -25,6 +25,13 @@
 
 const CHAPTER_RE = /^\\c\s+\d+\s*$/;
 
+// `\s`/`\s1`-`\s5` section headings. Unlike the other markers in
+// `markerPriority` these always carry heading text on the same line (there is
+// no bare/standalone form to match against), so this is matched by leading
+// marker rather than a whole-line equality check — same approach as the
+// `\s`-family branch of `ABORT_LEADING_RE` below.
+const SECTION_HEADING_RE = /^\\s[1-5]?(?![A-Za-z0-9])/;
+
 // Paragraph-family markers that DCS requires to sit ALONE on their own line
 // and NEVER attached to following content or a `\v` line — same requirement
 // as `\p`, extended to the rest of PARAGRAPH_MARKERS (declared below) plus
@@ -362,15 +369,21 @@ function splitStructuralLine(raw: string): string[] {
   return out.length ? out : [""];
 }
 
-// Canonical order for adjacent standalone markers: `\b` < `\ts\*` < `\c` < `\p`.
-// (From uW USFM: `\b` precedes `\ts\*` per fix_usfm_formatting.py, and a section
-// opens `\ts\* \c \p` per real ULT files.) -1 = not a standalone marker.
+// Canonical order for adjacent standalone markers: `\b` < `\ts\*` < `\c` <
+// `\s`-family heading < `\p`. (From uW USFM: `\b` precedes `\ts\*` per
+// fix_usfm_formatting.py, a section opens `\ts\* \c \p` per real ULT files,
+// and the USFM manual places a section heading between the chapter marker and
+// the paragraph that introduces its first verse — issue #384: usfm-js can
+// emit `\c` / `\p` / `\s1 Heading` order, which is legal USFM but reads to a
+// naive front-matter scan as a heading with no paragraph marker behind it.)
+// -1 = not a standalone marker.
 function markerPriority(line: string): number {
   const s = line.trim();
   if (s === "\\b") return 0;
   if (s === "\\ts\\*") return 1;
   if (CHAPTER_RE.test(s)) return 2;
-  if (s === "\\p") return 3;
+  if (SECTION_HEADING_RE.test(s)) return 3;
+  if (s === "\\p") return 4;
   return -1;
 }
 
