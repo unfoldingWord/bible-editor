@@ -17,8 +17,9 @@
 --
 -- See issue #551, split from #540 item 1 while #548 landed.
 --
--- Numbered 0053, not 0052: #555 (system_alerts.kind) also claimed 0052 while
--- both PRs were in flight — see STATE.md's migration-number-collision lesson.
+-- Numbered 0054: #555 landed as 0053_system_alerts_kind.sql on main while
+-- this branch briefly also claimed 0053 — see STATE.md's migration-number-
+-- collision lesson.
 ALTER TABLE book_resource_syncs ADD COLUMN master_lineage_json TEXT;
 ALTER TABLE book_resource_syncs ADD COLUMN master_lineage_sha TEXT;
 ALTER TABLE book_resource_syncs ADD COLUMN master_lineage_computed_at INTEGER;

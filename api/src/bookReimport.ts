@@ -2681,7 +2681,7 @@ async function loadMasterLineage(
   return summary;
 }
 
-// Durable counterpart to the console.log above — see 0053_master_lineage_snapshot.sql.
+// Durable counterpart to the console.log above — see 0054_master_lineage_snapshot.sql.
 // Last-run-wins on the same (book, resource) row every other watermark here
 // already keys on. Never blocks the caller: a write failure here must not
 // fail a reimport whose only mistake was wanting its evidence remembered.
