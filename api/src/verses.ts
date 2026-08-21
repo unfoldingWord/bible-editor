@@ -54,7 +54,7 @@ const PatchSchema = z.object({
   // string|absent so the API contract matches the SQL (omit to keep).
   plain_text: z.string().optional(),
   alignment_intent: z
-    .enum(["text_edit", "find_replace", "section_edit", "alignment_edit"])
+    .enum(["text_edit", "find_replace", "section_edit", "alignment_edit", "confirmed_text_edit"])
     .optional(),
 });
 

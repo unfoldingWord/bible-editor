@@ -1,6 +1,9 @@
 // Admin panel backend — everything here is admin-gated (requireAdmin below).
 //   GET    /api/admin/sync-status        — D1-only view of pull/export state per book x resource.
 //   GET    /api/admin/prs                — live DCS read: open `-be-` export PRs across all 5 repos.
+//   GET    /api/admin/sync-activity      — durable log of "record"-kind system_alerts (issue #535):
+//                                           non-blocking, no-action-needed export/sync records that
+//                                           used to show up as a personal alert on the admin's account.
 //   GET    /api/admin/users              — list the editor/admin allowlist (user_roles).
 //   POST   /api/admin/users              — upsert a user's role.
 //   DELETE /api/admin/users/:username    — remove a user from the allowlist.
@@ -216,6 +219,48 @@ admin.get("/prs", async (c) => {
   prs.sort((a, b) => (a.book === b.book ? a.resource.localeCompare(b.resource) : a.book.localeCompare(b.book)));
 
   return c.json({ prs, errors });
+});
+
+// ── GET /sync-activity ───────────────────────────────────────────────────
+
+// Durable admin-only log of "record"-kind system_alerts (issue #535): rows
+// written by exportWorkflow.ts's recordExportRevertReport for a night's
+// "shipped to Door43 and overwrote master's content" / mechanical-overwrite
+// records. These are non-blocking and need no human decision, so
+// GET /api/alerts/me deliberately excludes them (kind != 'review') — this is
+// their only home. Deliberately NOT filtered by dismissed_at: this is a log
+// of what happened, not a to-do list, so a dismissed row (dismissal only
+// ever applies to the personal-alert copy that no longer exists for 'record'
+// rows going forward) still belongs in the history.
+interface SyncActivityRow {
+  id: number;
+  severity: string;
+  source: string;
+  message: string;
+  link_url: string | null;
+  created_at: number;
+}
+
+admin.get("/sync-activity", async (c) => {
+  const limit = Math.min(Math.max(parseInt(c.req.query("limit") ?? "200", 10) || 200, 1), 500);
+  const rs = await c.env.DB.prepare(
+    `SELECT id, severity, source, message, link_url, created_at
+       FROM system_alerts
+      WHERE kind = 'record'
+      ORDER BY created_at DESC
+      LIMIT ?1`,
+  )
+    .bind(limit)
+    .all<SyncActivityRow>();
+  const entries = (rs.results ?? []).map((r) => ({
+    id: r.id,
+    severity: r.severity,
+    source: r.source,
+    message: r.message,
+    linkUrl: r.link_url,
+    createdAt: r.created_at,
+  }));
+  return c.json({ entries });
 });
 
 // ── User role management ─────────────────────────────────────────────────

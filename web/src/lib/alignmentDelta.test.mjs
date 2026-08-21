@@ -1,6 +1,7 @@
 import {
   analyzeAlignmentDelta,
   guardBlocksSave,
+  intentAllowsUnexpectedAlignmentLoss,
   lostAlignedWords,
   sameVerseContent,
 } from "./alignmentDelta.ts";
@@ -185,6 +186,33 @@ const content = (verseObjects) => ({ verseObjects });
   assert(!sameVerseContent(before, null), "content vs. null is never equal");
   assert(!sameVerseContent(null, before), "null vs. content is never equal");
   assert(sameVerseContent(null, null), "null vs. null is equal (no verse loaded on either side)");
+}
+
+{
+  // Issue #575: confirmed_text_edit is the escalated "Save anyway" intent
+  // (Shell.tsx's pendingAlignmentLoss) — split out from alignment_edit so the
+  // two are no longer indistinguishable, but it must behave identically at
+  // the guard: exempt from guardBlocksSave, same as a real aligner save.
+  console.log("[alignmentDelta] confirmed_text_edit is exempt from guardBlocksSave, same as alignment_edit");
+  const before = content([
+    zaln("H1", [w("He")]), t(" "),
+    zaln("H2", [w("came")]), t(" "),
+    zaln("H3", [w("home")]),
+  ]);
+  const after = content([
+    zaln("H1", [w("He")]), t(" "),
+    w("went"), t(" "),
+    w("home"),
+  ]);
+  const delta = analyzeAlignmentDelta(before, after);
+  assert(delta.unexpectedLosses.length === 1, "sanity: this delta still has collateral loss to guard against");
+  assert(guardBlocksSave(delta, "text_edit"), "sanity: plain text_edit is still blocked");
+  assert(!guardBlocksSave(delta, "confirmed_text_edit"), "confirmed_text_edit is exempt, like alignment_edit");
+  assert(intentAllowsUnexpectedAlignmentLoss("confirmed_text_edit"), "…and reports itself as guard-exempt");
+  assert(intentAllowsUnexpectedAlignmentLoss("alignment_edit"), "…alignment_edit remains exempt too");
+  assert(!intentAllowsUnexpectedAlignmentLoss("text_edit"), "…but plain text_edit is not conflated with either");
+  assert(!intentAllowsUnexpectedAlignmentLoss("find_replace"), "…nor is find_replace");
+  assert(!intentAllowsUnexpectedAlignmentLoss("section_edit"), "…nor section_edit");
 }
 
 if (failed > 0) {

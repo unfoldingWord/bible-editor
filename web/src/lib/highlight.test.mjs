@@ -8,11 +8,14 @@
 
 import {
   findTargetHighlights,
+  isPaintableHtml,
   leadingBreakClass,
   pinSourceOccurrences,
+  renderEditableHTML,
+  renderHighlightedHTML,
   surfaceTotalsFromTokens,
 } from "./highlight.ts";
-import { extractTrailingMarkers } from "./usfm.ts";
+import { extractEditableText, extractTrailingMarkers } from "./usfm.ts";
 import { buildQuoteFromSelection, selectionFromQuote, tokenKey, collectTargetTokens } from "./quoteBuilder.ts";
 
 let failed = 0;
@@ -343,6 +346,32 @@ const JOIN = "⁠";
     `picker keys both split-gloss words to the same appears-once collapsed key, got ${JSON.stringify(
       tokens.map((t) => t.sources[0]?.key),
     )}`,
+  );
+}
+
+// --- 14. isPaintableHtml (#529): an empty-string render must not be
+// mistaken for real paintable content, or the paint effects in
+// ScriptureColumn/DocColumn/BookView write it into the DOM and blank the
+// pane with no way to type the text back.
+{
+  assert(isPaintableHtml("<div>hi</div>") === true, "non-empty HTML is paintable");
+  assert(isPaintableHtml("") === false, "empty string is not paintable");
+  assert(isPaintableHtml("   ") === false, "whitespace-only string is not paintable");
+  assert(isPaintableHtml(null) === false, "null is not paintable");
+  assert(isPaintableHtml(undefined) === false, "undefined is not paintable");
+}
+
+// --- 15. renderHighlightedHTML / renderEditableHTML on an empty verseObjects
+// tree both render to "" (#529's source of the empty-string bug) — callers
+// must treat that as isPaintableHtml(...) === false and fall back to
+// plain_text rather than paint it.
+{
+  assert(renderHighlightedHTML([], new Set()) === "", "renderHighlightedHTML([]) is empty");
+  assert(renderEditableHTML([], new Set()) === "", "renderEditableHTML([]) is empty");
+  assert(extractEditableText([]) === "", "extractEditableText([]) is empty");
+  assert(
+    !isPaintableHtml(renderHighlightedHTML([], new Set())),
+    "empty-tree render is correctly classified as not paintable",
   );
 }
 

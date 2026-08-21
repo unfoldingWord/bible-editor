@@ -98,7 +98,10 @@ export type AlignmentIntent =
   | "text_edit"
   | "find_replace"
   | "section_edit"
-  | "alignment_edit";
+  | "alignment_edit"
+  // Issue #575: an escalated "Save anyway" on a text_edit — see
+  // web/src/lib/alignmentDelta.ts for the full rationale.
+  | "confirmed_text_edit";
 
 export interface VerseStatus {
   book: string;
@@ -1279,6 +1282,23 @@ export interface AdminSyncStatusResponse {
   books: AdminBookSyncStatus[];
 }
 
+// GET /api/admin/sync-activity — durable, admin-only log of non-blocking
+// "record"-kind alerts (issue #535), e.g. "shipped to Door43 and overwrote
+// master's content as expected". These no longer appear in fetchAlerts()'s
+// personal feed since they need no decision from anyone.
+export interface AdminSyncActivityEntry {
+  id: number;
+  severity: AlertSeverity;
+  source: string;
+  message: string;
+  linkUrl: string | null;
+  createdAt: number;
+}
+
+export interface AdminSyncActivityResponse {
+  entries: AdminSyncActivityEntry[];
+}
+
 export type AdminCheckState = "success" | "failure" | "pending" | null;
 
 export interface AdminPr {
@@ -1811,6 +1831,9 @@ export const api = {
       `/api/admin/sync-status${book ? `?book=${encodeURIComponent(book)}` : ""}`,
       { signal },
     ),
+
+  getAdminSyncActivity: (signal?: AbortSignal) =>
+    request<AdminSyncActivityResponse>(`/api/admin/sync-activity`, { signal }),
 
   // `checks` defaults true server-side; the panel's "skip check status
   // (faster)" toggle passes checks=0 to skip the per-PR Gitea status calls.

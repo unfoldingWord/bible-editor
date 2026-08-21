@@ -29,7 +29,7 @@
 // exactly as if it had never failed.
 
 import { willRetryOnItsOwn } from "./refusalReason.ts";
-import type { OpTarget, OutboxOp } from "./outbox.ts";
+import type { OpTarget, OutboxOp, OutboxResult } from "./outbox.ts";
 
 // Two ops belong to the same target iff they touch the same row/verse. A
 // conflict on one of them must not block ops to *other* targets — but it
@@ -72,4 +72,20 @@ export function eligibleForVersionThread(o: TargetingOp): boolean {
   if (o.status === "pending") return true;
   if (o.status === "failed") return !willRetryOnItsOwn(o.lastError);
   return false;
+}
+
+// Whether drainPass should notify onOutboxResult listeners for this outcome.
+// The persist block (the IndexedDB delete/put that finalizes the op) can
+// itself throw; when it does, the catch re-arms the op as `pending` for the
+// next pass, but drainPass used to call listeners with the original result
+// regardless. For a `locked` result several listeners (Shell's pipeline
+// toast, and drafts.ts's verse-base pin release) treat the result as a
+// terminal exit — released state, dismissed UI — for an op that is in fact
+// still queued and will retry (issue #570). `ok` still announces even on a
+// persist failure: the server DID apply the change, so cache-updating
+// listeners (useChapter/useBook/Shell) should adopt it regardless of
+// whether the local delete of the now-redundant outbox entry succeeded.
+export function shouldAnnounceResult(kind: OutboxResult["kind"], persisted: boolean): boolean {
+  if (persisted) return true;
+  return kind !== "locked";
 }

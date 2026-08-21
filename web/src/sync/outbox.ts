@@ -30,8 +30,10 @@ import {
 import {
   eligibleForVersionThread,
   isMaxAttemptsBlocked,
+  shouldAnnounceResult,
   targetKey,
 } from "./outboxTargeting.ts";
+import { rebaseVersePatch } from "./verseRebase.ts";
 
 const DB_NAME = "bible-editor-outbox";
 const DB_VERSION = 1;
@@ -480,7 +482,25 @@ export const outbox = {
     const siblings = all
       .filter((o) => targetKey(o.target) === key && (o.status === "conflict" || o.status === "pending"))
       .sort((a, b) => a.queuedAt - b.queuedAt || (a.seq ?? 0) - (b.seq ?? 0));
+    // Verse ops: don't re-send the op's content verbatim onto the newer server
+    // row — its content was diffed from an older baseline, so verbatim either
+    // gets refused by the server's alignment guard or silently reverts the
+    // concurrent change (issue #564). Rebase the op's text intent onto the
+    // server's current tree (from the 409's conflictCurrent) instead.
+    // rebaseVersePatch is synchronous, so calling it between the tx's IDB
+    // requests is safe. `refuse_thread` (an alignment_edit across a text
+    // change) deliberately re-sends verbatim HERE: this path is the user
+    // explicitly clicking "resolve — my edit wins", which is last-write-wins
+    // by contract; only the automatic thread path refuses.
+    const serverContent =
+      op.target.kind === "verse"
+        ? (op.conflictCurrent as { content?: unknown } | null | undefined)?.content
+        : undefined;
     for (const o of siblings) {
+      if (o.target.kind === "verse" && o.action === "patch") {
+        const outcome = rebaseVersePatch(o.patch, serverContent);
+        if (outcome.kind === "rebased") o.patch = outcome.patch;
+      }
       o.expectedVersion = newExpectedVersion;
       o.status = "pending";
       o.queuedAt = resolvedAt;
@@ -537,6 +557,9 @@ export const outbox = {
     }
     await tx.store.delete(opId);
     await tx.done;
+    // Only when a record was actually deleted (op read non-null above) — a
+    // drop of an already-gone id must not announce a discard twice.
+    if (op) for (const l of discardListeners) l(op);
     void notify();
     void drain();
   },
@@ -636,6 +659,17 @@ const resultListeners = new Set<ResultListener>();
 export function onOutboxResult(fn: ResultListener): () => void {
   resultListeners.add(fn);
   return () => resultListeners.delete(fn);
+}
+
+// Fires when drop() permanently deletes an op (every SyncStatusBar discard
+// flow funnels through drop). A discard is a terminal exit no 200 will ever
+// follow, so anything keyed to the op's eventual landing — the verse-base
+// pin a draftless save left behind (#565) — must release here instead.
+type DiscardListener = (op: OutboxOp) => void;
+const discardListeners = new Set<DiscardListener>();
+export function onOutboxDiscard(fn: DiscardListener): () => void {
+  discardListeners.add(fn);
+  return () => discardListeners.delete(fn);
 }
 
 function unexpectedAlignmentLossReason(body: unknown): string | null {
@@ -827,12 +861,33 @@ async function threadVersionToSiblings(done: OutboxOp, updated: unknown) {
   // so we only thread ops still pending/failed (never an in_flight one).
   const tx = idb.transaction(STORE, "readwrite");
   const all = (await tx.store.getAll()) as OutboxOp[];
+  // Verse ops: the sibling's content was diffed from a baseline that predates
+  // the row the 200 just confirmed. Threading only the version would land that
+  // stale content with a clean If-Match — refused by the server's alignment
+  // guard, or worse, silently reverting the concurrent change (issue #564).
+  // Rebase the sibling's text intent onto the confirmed row's content (the 200
+  // body) instead. rebaseVersePatch is synchronous, so calling it between the
+  // tx's IDB requests is safe. `refuse_thread` (an alignment_edit whose
+  // baseline text no longer matches the server's) skips the sibling entirely:
+  // it keeps its stale expectedVersion, 409s on dispatch, and surfaces the
+  // conflict prompt for the user to decide — the conservative option, since
+  // alignment_edit is guard-exempt and a verbatim auto-thread would silently
+  // revert the text change.
+  const serverContent =
+    done.target.kind === "verse"
+      ? (updated as { content?: unknown } | null | undefined)?.content
+      : undefined;
   for (const o of all) {
     if (
       targetKey(o.target) === key &&
       eligibleForVersionThread(o) &&
       o.expectedVersion !== version
     ) {
+      if (o.target.kind === "verse" && o.action === "patch") {
+        const outcome = rebaseVersePatch(o.patch, serverContent);
+        if (outcome.kind === "refuse_thread") continue;
+        if (outcome.kind === "rebased") o.patch = outcome.patch;
+      }
       o.expectedVersion = version;
       await tx.store.put(o);
     }
@@ -936,7 +991,10 @@ async function drainPass() {
 
     // Persist the new status *before* notifying listeners. If a put() or
     // delete() throws, the catch below resets the op to pending so it
-    // doesn't strand at in_flight.
+    // doesn't strand at in_flight. `persisted` records which of those two
+    // happened, so the listener dispatch below can tell a genuine terminal
+    // exit from one that got walked back (issue #570).
+    let persisted = true;
     try {
       if (result.kind === "ok") {
         await (await db()).delete(STORE, next.id);
@@ -1025,6 +1083,7 @@ async function drainPass() {
         await (await db()).put(STORE, next);
       }
     } catch (persistErr) {
+      persisted = false;
       // Best-effort recovery — if IndexedDB itself failed, the op may be
       // half-written. Force pending so the next drain pass tries again.
       try {
@@ -1040,7 +1099,9 @@ async function drainPass() {
       }
     }
 
-    for (const l of resultListeners) l(next, result);
+    if (shouldAnnounceResult(result.kind, persisted)) {
+      for (const l of resultListeners) l(next, result);
+    }
     void notify();
   }
 }

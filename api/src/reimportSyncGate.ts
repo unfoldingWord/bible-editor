@@ -61,7 +61,10 @@
 //      isReissuedTombstone in reimportClassify.ts). A SAME-reference tombstone
 //      is deliberately excluded: skipping there is what preserves a deletion
 //      that hasn't been exported yet, and reclaiming it would resurrect every
-//      pending delete nightly.
+//      pending delete nightly. Since issue #427 option 1 shipped (#506), a
+//      reissued tombstone is reclaimed automatically; this counter now fires
+//      only when that reclaim itself lost its version-CAS race, so it withholds
+//      on a narrower case than when this gate was written.
 //
 // Both mean the same thing as the two above — master content this run was
 // supposed to apply is NOT in D1 — so both must withhold. This is the 1CH 23
@@ -71,9 +74,12 @@
 // `source_sha` and skips the file, so the stamp is the only thing standing
 // between the drop and a permanent silent divergence.
 //
-// This gate does NOT fix the drop — reclaiming a reissued id is issue #427's
-// option 1, and sweeping obsolete tombstones is option 3. It makes the drop
-// visible and stops the run from claiming the resource is current.
+// This gate does not fix a drop it withholds on — sweeping obsolete tombstones
+// (issue #427 option 3) is still open. Reclaiming a reissued id (option 1) has
+// shipped (#506), which is why this counter now fires far less often than when
+// this gate was written: it withholds on the reclaim's lost-CAS-race case, not
+// on every reissue. Either way, this gate makes a drop visible and stops the
+// run from claiming the resource is current.
 //
 // Deliberately NOT gated on `skipped_locked`: that counter is overloaded —
 // besides the chapter-lock skip, it is ALSO incremented by the row-level prune

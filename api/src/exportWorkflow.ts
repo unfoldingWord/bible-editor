@@ -2121,7 +2121,10 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
   // (class breakdown + refs) — never a cause, per this file's established
   // "state only a cause you measured" discipline (see the comment above
   // buildAlignmentShrinkAlertMessage). severity is always "warning": this
-  // never blocks the export, so it must never read as "error".
+  // never blocks the export, so it must never read as "error". kind is
+  // "record" (issue #535): "master moved because we exported, as expected"
+  // is nothing to decide, so it belongs in the admin panel's activity log,
+  // not a personal alert.
   private async recordExportRevertReport(
     book: string,
     resource: Resource,
@@ -2169,6 +2172,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
         `the export; it is a record of what changed on master, in case a hand-edit there was lost.`,
       `${this.env.DCS_BASE_URL}/unfoldingWord`,
       "warning",
+      "record",
     );
 
     // Second, distinct alert: "mechanical" means no HUMAN contributor was
@@ -2193,6 +2197,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
           `${label}: ${mechAlert.reason} Branch \`${branch}\`, first refs: ${sampleRefs}${extra > 0 ? ` (+${extra} more)` : ""}. This does not block the export.`,
           `${this.env.DCS_BASE_URL}/unfoldingWord`,
           "warning",
+          "record",
         );
       }
     } catch (e) {
@@ -2524,11 +2529,24 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
 
   // Replace-undismissed alert writer shared by the export-side alerts. Best
   // effort: an alert-write failure must never fail or retry the export.
+  //
+  // `kind` (issue #535) routes the row: 'review' (default) is a decision a
+  // human still needs to make and stays in the personal banner
+  // (GET /api/alerts/me); 'record' is a purely observational record of
+  // something that already happened as expected — no action needed — and is
+  // admin-panel-only (GET /api/admin/sync-activity). Deliberately not named
+  // 'info' — `severity` already has an 'info' value, and reusing the literal
+  // for a different axis invites a future caller to bind the wrong
+  // parameter. Almost every alert in this file blocks or holds an export and
+  // is genuinely actionable, so 'review' stays the default; only the two
+  // callers that explicitly say "this does not block the export" pass
+  // 'record'.
   private async writeAlert(
     source: string,
     message: string,
     linkUrl: string,
     severity: "error" | "warning" | "info" = "error",
+    kind: "review" | "record" = "review",
   ): Promise<void> {
     try {
       // Respect a prior dismissal of the *same* condition. Each nightly export
@@ -2555,10 +2573,10 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
         return;
       }
       await this.env.DB.prepare(
-        `INSERT INTO system_alerts (username, severity, source, message, link_url)
-         VALUES (?1, ?5, ?2, ?3, ?4)`,
+        `INSERT INTO system_alerts (username, severity, source, message, link_url, kind)
+         VALUES (?1, ?5, ?2, ?3, ?4, ?6)`,
       )
-        .bind(EXPORT_ALERT_USERNAME, source, message, linkUrl, severity)
+        .bind(EXPORT_ALERT_USERNAME, source, message, linkUrl, severity, kind)
         .run();
     } catch (e) {
       console.error("export alert write failed", { source, error: e instanceof Error ? e.message : String(e) });

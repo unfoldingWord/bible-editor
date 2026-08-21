@@ -17,7 +17,7 @@ import type { FindMatch } from "./FindReplaceOverlay";
 import { HebrewLine } from "./HebrewLine";
 import type { LexiconEntry } from "../hooks/useLexicon";
 import type { ChapterState } from "../hooks/useBook";
-import { highlightsFor, renderEditableHTML, renderHighlightedHTML, type HighlightKey, type ReorderHighlight } from "../lib/highlight";
+import { highlightsFor, isPaintableHtml, renderEditableHTML, renderHighlightedHTML, type HighlightKey, type ReorderHighlight } from "../lib/highlight";
 import { markHighlightSx } from "../lib/highlightStyles";
 import { extractEditableText, extractTrailingMarkers, stripTrailingMarkers, splitSectionHeaders, type SectionHeader } from "../lib/usfm";
 import { introEditBase } from "../lib/verseIntro";
@@ -1385,7 +1385,11 @@ function ActiveLine({
   );
   const editableText = useMemo(() => {
     if (!Array.isArray(verseObjects)) return text;
-    return extractEditableText(verseObjects);
+    // A recognized-but-empty tree (or a tree of only unrecognized/marker
+    // nodes) can extract to "" even though the verse has real plain_text —
+    // fall back to the baseline rather than blanking the pane. See #529.
+    const extracted = extractEditableText(verseObjects);
+    return extracted.trim() ? extracted : text;
   }, [verseObjects, text]);
   const sections = useMemo<SectionHeader[]>(() => {
     if (!Array.isArray(verseObjects)) return [];
@@ -1438,15 +1442,19 @@ function ActiveLine({
     // must not stomp the draft. dirtyRef is the synchronous guard; hasDraft
     // (async state) can still be false in the window right after a keystroke.
     if (hasDraft || dirtyRef.current) return;
-    const next = html ?? domBaseline;
+    // An empty-string render (e.g. an empty verseObjects tree, or one of only
+    // unrecognized/marker nodes) is not paintable content — treat it the same
+    // as null and fall back to domBaseline rather than blanking the pane. #529
+    const paintable = isPaintableHtml(html) ? html : null;
+    const next = paintable ?? domBaseline;
     if (next === lastSetRef.current) return;
-    if (html === null) {
+    if (paintable === null) {
       elRef.current.textContent = domBaseline;
     } else {
-      elRef.current.innerHTML = html;
+      elRef.current.innerHTML = paintable;
     }
     lastSetRef.current = next;
-  }, [html, domBaseline]);
+  }, [html, domBaseline, hasDraft]);
 
   return (
     <Box sx={{ py: 0.5 }}>

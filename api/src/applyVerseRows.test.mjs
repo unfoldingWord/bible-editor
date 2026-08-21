@@ -331,6 +331,113 @@ console.log("\n[#540 item 2: an AI-only master movement never overwrites a later
   }
 }
 
+console.log("\n[#537: a content-bearing 'baseline' edit_log row recovers an ancestor the id boundary alone would miss]");
+{
+  // pipelineImport.ts writes an action='baseline' row holding the pre-AI
+  // content, with `created_at` back-dated to that content's own timestamp —
+  // but its `id` is assigned at AI-run time, so it is not chronological with
+  // its content. A verse whose ONLY pre-watermark content-bearing history is
+  // such a row must still recover it as its merge ancestor via the
+  // created_at boundary, even when the id boundary (masterEditId) sits
+  // BEFORE the baseline row's real (late-assigned) id — reproducing all 186
+  // of the JER/EZK verses issue #537 measured as permanently keep_no_base
+  // before this fix.
+  const { env, sqlite } = freshEnv();
+  sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (1, 1, 'translator')`).run();
+  sqlite
+    .prepare(
+      `INSERT INTO verses (book, chapter, verse, verse_end, bible_version, content_json, plain_text, version, updated_by)
+       VALUES (?, 7, 3, NULL, ?, ?, ?, 1, 1)`,
+    )
+    .run(BOOK, VERSION, contentJson("the baseline text"), "the baseline text");
+  // Back-dated baseline row: created_at (500) predates the watermark
+  // (confirmedAt 1000), but masterEditId (0) is set BELOW this row's real
+  // autoincrement id — exactly the "id is not chronological with content"
+  // shape pipelineImport.ts produces.
+  sqlite
+    .prepare(
+      `INSERT INTO edit_log (kind, row_key, book, action, payload_json, created_at)
+       VALUES ('verse', ?, ?, 'baseline', ?, 500)`,
+    )
+    .run(`${BOOK}/7/3/${VERSION}`, BOOK, JSON.stringify({ content: JSON.parse(contentJson("the baseline text")) }));
+
+  const counts = await applyVerseRowsForTest(
+    env, BOOK, VERSION, [verse(7, 3, "master's differing text")], null,
+    { confirmedAt: 1000, editId: 0 }, false,
+  );
+
+  const row = sqlite
+    .prepare("SELECT content_json, version FROM verses WHERE book = ? AND chapter = 7 AND verse = 3")
+    .all(BOOK)[0];
+  eq(
+    JSON.parse(row.content_json).verseObjects[0].text,
+    "master's differing text",
+    "master's content is adopted — the baseline row was found as a real ancestor, not treated as no-base",
+  );
+  eq(row.version, 2, "the adoption actually wrote a new version");
+  eq(counts.merge_adopted, 1, "counted as a landed adoption");
+  eq(counts.merge_no_base, 0, "NOT counted as unadjudicable — the pre-fix regression this test guards");
+
+  const conflict = sqlite
+    .prepare("SELECT action, reason FROM verse_merge_conflicts WHERE book = ? AND chapter = 7 AND verse = 3")
+    .all(BOOK)[0];
+  eq(
+    conflict.action,
+    "adopt",
+    "a clean adoption, not 'adopt_conflict' — the baseline row's own id must not be misread as a human edit landing after the export (D1 never actually moved)",
+  );
+  eq(conflict.reason, "master_only", "…for the right reason: only master moved since the (recovered) ancestor");
+}
+
+console.log("\n[#537 fallout: a GENUINE human edit after export still blocks clean-adopt, alongside a recovered baseline ancestor]");
+{
+  // Companion to the case above: excluding 'baseline' rows from
+  // human_edit_after_export must not blind the probe to a REAL post-export
+  // human edit landing on the same verse. `ours` is made byte-identical to
+  // `base` (as in the case above) so that, absent the real update row, this
+  // would ALSO clean-adopt via case 5 — the only thing that must change the
+  // outcome here is the genuine 'update' entry after the boundary.
+  const { env, sqlite } = freshEnv();
+  sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (1, 1, 'translator')`).run();
+  sqlite
+    .prepare(
+      `INSERT INTO verses (book, chapter, verse, verse_end, bible_version, content_json, plain_text, version, updated_by)
+       VALUES (?, 8, 4, NULL, ?, ?, ?, 2, 1)`,
+    )
+    .run(BOOK, VERSION, contentJson("the baseline text"), "the baseline text");
+  sqlite
+    .prepare(
+      `INSERT INTO edit_log (kind, row_key, book, action, payload_json, created_at)
+       VALUES ('verse', ?, ?, 'baseline', ?, 500)`,
+    )
+    .run(`${BOOK}/8/4/${VERSION}`, BOOK, JSON.stringify({ content: JSON.parse(contentJson("the baseline text")) }));
+  // A real human edit, logged with a real edit_log id AFTER the boundary —
+  // this is the signal the probe must still catch even though its content
+  // (coincidentally, e.g. an undo) matches the ancestor byte-for-byte.
+  sqlite
+    .prepare(
+      `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, payload_json, created_at)
+       VALUES ('verse', ?, ?, 1, 1, 2, 'update', ?, 1500)`,
+    )
+    .run(`${BOOK}/8/4/${VERSION}`, BOOK, JSON.stringify({ content: JSON.parse(contentJson("the baseline text")) }));
+
+  const counts = await applyVerseRowsForTest(
+    env, BOOK, VERSION, [verse(8, 4, "master's differing text")], null,
+    { confirmedAt: 1000, editId: 0 }, false,
+  );
+
+  const conflict = sqlite
+    .prepare("SELECT action, reason FROM verse_merge_conflicts WHERE book = ? AND chapter = 8 AND verse = 4")
+    .all(BOOK)[0];
+  eq(
+    conflict.action,
+    "adopt_conflict",
+    "the real post-export human edit still blocks the clean-adopt path (case 5), landing on the flagged both_changed path instead",
+  );
+  eq(conflict.reason, "both_changed", "…for the right reason");
+  eq(counts.merge_adopted, 1, "still adopts (master wins on both_changed by default), but AS a flagged conflict, not silently");
+}
+
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed`);
   process.exit(1);

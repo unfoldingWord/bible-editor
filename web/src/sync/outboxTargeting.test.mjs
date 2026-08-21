@@ -23,6 +23,7 @@ import { MAX_ATTEMPTS_SENTINEL } from "./refusalReason.ts";
 import {
   eligibleForVersionThread,
   isMaxAttemptsBlocked,
+  shouldAnnounceResult,
   targetKey,
 } from "./outboxTargeting.ts";
 
@@ -357,6 +358,33 @@ const pinnedFromThisPass = new Set([targetKey(backoffTarget)]);
 check(
   computeNextFixed([[op3PendingBackoff]], pinnedFromThisPass) === undefined,
   "a target this pass just parked on retry-backoff (pinnedBlocked) stays blocked on the very next snapshot, unlike a stale isMaxAttemptsBlocked entry",
+);
+
+// --- issue #570: drainPass must not announce a `locked` result whose
+// persist block (the IndexedDB delete that finalizes the op) threw and got
+// re-armed as `pending`. Listeners that treat `locked` as a terminal exit
+// (Shell's pipeline toast, drafts.ts's verse-base pin release) would
+// otherwise fire for an op that is in fact still queued and will retry.
+
+check(
+  shouldAnnounceResult("locked", true) === true,
+  "a `locked` result that persisted (the delete committed) still announces",
+);
+check(
+  shouldAnnounceResult("locked", false) === false,
+  "FIX (#570): a `locked` result whose persist failed and re-armed as pending must NOT announce",
+);
+check(
+  shouldAnnounceResult("ok", false) === true,
+  "an `ok` result still announces even when the local delete failed — the server DID apply the change, so cache-updating listeners should adopt it",
+);
+check(
+  shouldAnnounceResult("ok", true) === true,
+  "an `ok` result that persisted announces, as before",
+);
+check(
+  shouldAnnounceResult("conflict", false) === true,
+  "non-locked results (conflict/retry/fatal) are unaffected by a persist failure — only `locked` gets suppressed",
 );
 
 console.log(`\noutboxTargeting: ${passed} checks passed`);
