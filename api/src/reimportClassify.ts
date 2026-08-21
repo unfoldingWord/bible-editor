@@ -206,7 +206,7 @@ export function computeEditedFieldMerge(
   return Object.keys(merge).length > 0 ? merge : null;
 }
 
-// ── Reissued-tombstone discriminator (issue #427, option 2) ─────────────────
+// ── Reissued-tombstone discriminator (issue #427, options 1 and 2) ──────────
 //
 // A soft-deleted tn/tq/twl row keeps its `(book, id)` PRIMARY KEY slot forever
 // — the row stays, only `deleted_at` is stamped. So when master's TSV carries
@@ -243,26 +243,34 @@ export function computeEditedFieldMerge(
 // (real loss) from "the SAME row, deleted in-app, whose Reference a Door43
 // maintainer then corrected" — a re-anchor to 1:3, or a bridge widened to
 // "1:2-3". The second loses nothing; the row is deleted and the delete is merely
-// pending export. This function reports both as blocked.
+// pending export. This function reports both as reissued.
 //
-// Do NOT reason about that as "worst case, a delayed export." The caller's
-// withhold has NO automatic release (unlike a chapter lock, a tombstone never
-// expires), so a false positive stops that book+resource exporting until a human
-// intervenes — see raiseTombstoneBlockAlert in bookReimport.ts, which exists
-// precisely so the freeze is visible and actionable rather than silent. The
-// direction is still deliberate: the alternative to withholding is exporting a
-// D1 that is short of master, which DELETES those rows from Door43. But the
-// tradeoff is "a loud freeze vs. silent deletion on Door43", not "slow vs.
-// fast", and any change here should be weighed on those terms.
+// Do NOT reason about that as "worst case, a delayed export." A true positive
+// here now drives an ACTUAL WRITE — see bookReimport.ts's tombstone branch,
+// which reclaims the slot (issue #427, option 1): it clears deleted_at and
+// overwrites the row with master's incoming content at the new reference.
+// So a false positive no longer just freezes the export until a human
+// intervenes (the pre-option-1 behavior); it silently un-deletes a row a
+// translator explicitly deleted, at whatever reference the maintainer's
+// correction happens to name. The direction is still deliberate — the
+// alternative to reclaiming is leaving a D1 that is short of master, which
+// (on export) DELETES rows from Door43 that master genuinely still carries,
+// the original 1CH failure — but this is the sharper edge of that tradeoff,
+// not a free one. When the reclaim instead LOSES its version-CAS race
+// (something touched the tombstoned row between the read and the write), the
+// caller falls back to `tombstone_blocked` and raiseTombstoneBlockAlert makes
+// that visible; see the caller for why that residual case is expected to
+// self-heal on the next sync.
 //
-// The 2026-08-10 production sweep found 0 blocked across 10,645 tombstones,
+// The 2026-08-10 production sweep found 0 reissued across 10,645 tombstones,
 // which bounds how often this fires today — but it is a point-in-time shape,
 // not a bound on the false-positive rate going forward.
 //
-// This function does NOT decide whether master's row should be applied — that
-// would be issue #427's option 1 (id reclaim), deliberately out of scope. It
-// only decides whether the skip is worth REPORTING and worth withholding the
-// (book, resource) watermark for.
+// This function does NOT itself write anything — it only decides whether
+// master's row should be reclaimed. Issue #427's option 1 (id reclaim) has
+// SHIPPED and is the caller (bookReimport.ts's applyTsvRows) that acts on this
+// verdict; this function is unchanged by that — it still only answers "same
+// reference or different?", exactly as before.
 //
 // Pure (no D1) so it is regression-testable — see reimportClassify.test.mjs.
 export interface TombstoneRef {

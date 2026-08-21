@@ -266,4 +266,97 @@ check(
   "FIX (review P1): preserving queuedAt/seq on Retry keeps op1 ahead of op2 in FIFO order — no leapfrog, no silent overwrite of op2's landed edit",
 );
 
+// --- drainPass's `blocked` set must recompute per iteration, not just grow
+// --- (issue #515) ---
+//
+// The bug: drainPass's `while (true)` loop built one `blocked` Set before
+// the loop and only ever added to it. If retry() or reviveMaxAttemptsFailed()
+// flips a blocking op back to "pending" *while a pass is running*, their own
+// drain() call is a no-op (a pass is already active — see drain()'s
+// `draining` guard), so the running pass is the only thing that will ever
+// notice the revival. But since a target, once added to `blocked`, was never
+// removed, the pass kept skipping the now-pending op for the rest of its
+// iterations — even though a fresh snapshot no longer justifies blocking it —
+// and exited without ever draining it. Nothing else re-triggers a pass, so
+// the op sat stranded until an unrelated event (focus/online/next enqueue).
+//
+// The fix: recompute the status-derived portion of `blocked` fresh from each
+// iteration's snapshot (seeded from a separate `pinnedBlocked` set that only
+// holds targets *this pass* just parked as conflict/retry-backoff, which
+// legitimately must stay blocked regardless of a later snapshot). These two
+// helpers model the buggy (ever-growing) and fixed (per-iteration recompute)
+// shapes of drainPass's loop body over the same two-iteration timeline.
+
+function computeNextBuggy(iterations) {
+  // Old shape: one Set built before the loop, only ever grown.
+  const blocked = new Set();
+  let next;
+  for (const ops of iterations) {
+    for (const o of ops) {
+      if (o.status === "conflict" || isMaxAttemptsBlocked(o)) blocked.add(targetKey(o.target));
+    }
+    next = ops.find((o) => o.status === "pending" && !blocked.has(targetKey(o.target)));
+    if (next) break;
+  }
+  return next;
+}
+
+function computeNextFixed(iterations, pinnedBlocked = new Set()) {
+  // New shape: `blocked` reseeded from `pinnedBlocked` every iteration.
+  let next;
+  for (const ops of iterations) {
+    const blocked = new Set(pinnedBlocked);
+    for (const o of ops) {
+      if (o.status === "conflict" || isMaxAttemptsBlocked(o)) blocked.add(targetKey(o.target));
+    }
+    next = ops.find((o) => o.status === "pending" && !blocked.has(targetKey(o.target)));
+    if (next) break;
+  }
+  return next;
+}
+
+// Iteration 1: op1 is still failed (max-attempts blocked) and there's no
+// other pending work in this snapshot — mirrors the moment drainPass has
+// just marked the target blocked and found nothing else to dispatch.
+const iteration1 = [op1FailedA];
+// Between iterations, retry() (or reviveMaxAttemptsFailed) flips op1 to
+// pending mid-pass — its own drain() call is swallowed because this pass is
+// still running.
+const op1RevivedMidPass = { ...op1FailedA, status: "pending", attempts: 0, hardAttempts: 0, lastError: undefined };
+// Iteration 2: a fresh snapshot shows op1 as pending now.
+const iteration2 = [op1RevivedMidPass];
+
+check(
+  computeNextBuggy([iteration1, iteration2]) === undefined,
+  "REGRESSION (#515): the old ever-growing blocked set strands op1 even after it's revived mid-pass",
+);
+check(
+  computeNextFixed([iteration1, iteration2]) === op1RevivedMidPass,
+  "FIX (#515): recomputing blocked from each iteration's snapshot drains op1 as soon as it's revived, no external trigger needed",
+);
+
+// A target this pass itself just parked on conflict/retry-backoff must stay
+// blocked across iterations even under the fixed (recomputed) logic — a
+// fresh snapshot of a "pending" retry-backoff op wouldn't otherwise trip
+// isMaxAttemptsBlocked (that only fires on status "failed"), so without
+// pinning it the very next iteration would redispatch it before its backoff
+// elapsed.
+const backoffTarget = { kind: "row", rowKind: "tn", id: "note-2", book: "ZEC" };
+const op3PendingBackoff = {
+  id: "op3",
+  target: backoffTarget,
+  action: "patch",
+  patch: { note: "C" },
+  expectedVersion: 1,
+  queuedAt: 500,
+  attempts: 1,
+  status: "pending",
+  lastError: "transient 503",
+};
+const pinnedFromThisPass = new Set([targetKey(backoffTarget)]);
+check(
+  computeNextFixed([[op3PendingBackoff]], pinnedFromThisPass) === undefined,
+  "a target this pass just parked on retry-backoff (pinnedBlocked) stays blocked on the very next snapshot, unlike a stale isMaxAttemptsBlocked entry",
+);
+
 console.log(`\noutboxTargeting: ${passed} checks passed`);

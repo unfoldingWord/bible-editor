@@ -144,6 +144,93 @@ t("intra-word U+2060 joiner is NOT flagged as glued", () => {
   assert.equal(i.filter((x) => x.check === "Glued alignment").length, 0);
 });
 
+// Multi-verse variant of verseFromUsfm: returns one VerseRow per \v in the
+// given text, across however many \c chapters it contains. Needed for the
+// cross-verse/cross-chapter quote-pairing tests below (verseFromUsfm only
+// ever returns chapter 1 verse 1).
+//
+// The text-quality block further down has its own near-identical
+// versesFromUsfm. The two differ only in cases this block never exercises
+// (it surfaces chapter-front material as verse 0, and splits verse-range
+// keys). Kept separate to keep this a minimal hotfix, not because the
+// difference is load-bearing here — sharing one would mean hoisting that
+// declaration ~520 lines. See the consolidation follow-up issue.
+const quoteVersesFromUsfm = (usfmText) => {
+  const j = usfm.toJSON(usfmText);
+  const out = [];
+  for (const [chapterStr, versesObj] of Object.entries(j.chapters)) {
+    const chapter = Number(chapterStr);
+    if (!Number.isFinite(chapter)) continue;
+    for (const [verseStr, vObj] of Object.entries(versesObj)) {
+      const verse = Number(verseStr);
+      if (!Number.isFinite(verse)) continue;
+      out.push({ book: "1CH", chapter, verse, verse_end: null, bible_version: "ULT", version: 1, content_json: JSON.stringify({ verseObjects: vObj.verseObjects }) });
+    }
+  }
+  return out;
+};
+
+// Unmatched curly quotation mark detector (#438).
+const quoteChecks = (issues) => issues.filter((x) => x.check === "Quotation Mark");
+t("balanced curly quotes pass", () => {
+  const i = lintUsfmVerses([verseFromUsfm("\\c 1\n\\p\n\\v 1 he said, “hello.”\n")]);
+  assert.equal(quoteChecks(i).length, 0);
+});
+t("nested balanced curly quotes pass", () => {
+  const i = lintUsfmVerses([verseFromUsfm("\\c 1\n\\p\n\\v 1 “outer “inner” more”\n")]);
+  assert.equal(quoteChecks(i).length, 0);
+});
+// Codex review round 2 on PR #483: flagging a leftover, never-closed opening
+// quote is itself a false positive — multi-paragraph dialogue in ULT/UST
+// re-opens each paragraph with “ and closes only the final one, and
+// extractPlainText has already stripped the \p markers that would tell the
+// checker where a paragraph (and therefore a legitimate continuation opener)
+// begins. So an unclosed “ is deliberately NOT reported at all.
+t("an unclosed opening quote is NOT flagged (continuation-opener dialogue convention)", () => {
+  const i = quoteChecks(lintUsfmVerses([verseFromUsfm("\\c 1\n\\p\n\\v 1 he said, “hello.\n")]));
+  assert.equal(i.length, 0);
+});
+t("continuation-opener dialogue (a paragraph break that re-opens without closing) is NOT flagged", () => {
+  // "“first paragraph…" "“second paragraph…”" — two opens, one close.
+  const verses = quoteVersesFromUsfm("\\c 1\n\\p\n\\v 1 “first paragraph statement\n\\p\n\\v 2 “second paragraph statement.”\n");
+  assert.equal(quoteChecks(lintUsfmVerses(verses)).length, 0);
+});
+t("unmatched closing curly quote (no opener anywhere earlier) IS flagged", () => {
+  const i = quoteChecks(lintUsfmVerses([verseFromUsfm("\\c 1\n\\p\n\\v 1 he said hello.”\n")]));
+  assert.equal(i.length, 1);
+  assert.equal(i[0].bucket, "flag");
+  assert.match(i[0].message, /Closing quote/);
+});
+t("straight quotes and apostrophes are NOT linted (out of scope)", () => {
+  const i = lintUsfmVerses([verseFromUsfm("\\c 1\n\\p\n\\v 1 don't say \"hello\n")]);
+  assert.equal(quoteChecks(i).length, 0);
+});
+// Codex review round 1 on PR #483: per-verse quote pairing double-flagged
+// ordinary multi-verse discourse (ZEC 1:2 opens a quote that 1:3 closes) —
+// state has to carry across an ordered sequence of verses, not reset at
+// every verse.
+t("quote opened in one verse and closed in a later verse of the same chapter is NOT flagged (ZEC 1:2/1:3 shape)", () => {
+  const verses = quoteVersesFromUsfm("\\c 1\n\\p\n\\v 1 word\n\\v 2 he said, “hello\n\\v 3 world.”\n");
+  assert.equal(quoteChecks(lintUsfmVerses(verses)).length, 0);
+});
+// Codex review round 2: chapter-scoping (round 1's fix) was ALSO wrong —
+// quoted speech can legitimately open near the end of one chapter and close
+// in the next, so a chapter boundary must not terminate a quotation either.
+t("quote opened near the end of one chapter and closed in the next chapter is NOT flagged (cross-chapter span)", () => {
+  const verses = quoteVersesFromUsfm("\\c 1\n\\p\n\\v 1 he said, “hello\n\\c 2\n\\p\n\\v 1 world.”\n");
+  assert.equal(quoteChecks(lintUsfmVerses(verses)).length, 0);
+});
+t("two INDEPENDENT unmatched closing quotes in different chapters are both still flagged (one doesn't consume the other's opener)", () => {
+  const verses = quoteVersesFromUsfm("\\c 1\n\\p\n\\v 1 hello.”\n\\c 2\n\\p\n\\v 1 world.”\n");
+  const issues = quoteChecks(lintUsfmVerses(verses));
+  assert.equal(issues.length, 2);
+  assert.deepEqual(issues.map((i) => i.ref).sort(), ["1:1", "2:1"]);
+});
+t("out-of-order verse rows are sorted before pairing (defensive against caller order)", () => {
+  const verses = quoteVersesFromUsfm("\\c 1\n\\p\n\\v 1 word\n\\v 2 he said, “hello\n\\v 3 world.”\n").reverse();
+  assert.equal(quoteChecks(lintUsfmVerses(verses)).length, 0);
+});
+
 // Reused-source-token detector (ZEC 14:8 UST doubled-Hebrew defect): a single
 // physical source token claimed by 2+ alignment chains with DIFFERING chain
 // identity. UHB-free — keyed on x-content|x-occurrence, not resolved position.

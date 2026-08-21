@@ -523,10 +523,20 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       // resource) — durable record of the bypass, mirroring the shrink-guard
       // override alert above (writeAlert, severity "info": a notice, not a
       // problem).
+      //
+      // The message MUST carry a per-run varying detail (here, instanceId).
+      // writeAlert (below) skips its insert when the most recent alert for
+      // this source was dismissed and carries an IDENTICAL message — a rule
+      // that exists so a nightly-retried failure doesn't reappear after being
+      // dismissed (issue #458). Unlike those failure alerts, this message used
+      // to be a constant string per (book, resource), so dismissing one bypass
+      // permanently silenced every future bypass of that book+resource — the
+      // "durable record" this alert exists to be stopped being written at all
+      // (issue #514). instanceId also gives 1's triage the run identity.
       await this.writeAlert(
         `export_lock_override:${book}:${resource}`,
         `${book} ${resource.toUpperCase()}: book-lock guard bypassed by explicit request — ` +
-          `a human cleared the lock so this export could proceed.`,
+          `a human cleared the lock so this export could proceed (${instanceId}).`,
         `${this.env.DCS_BASE_URL}/unfoldingWord`,
         "info",
       );

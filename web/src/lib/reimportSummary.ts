@@ -77,6 +77,11 @@ export function summarizeReimport(res: ReimportResponse): string {
   // this run did not have. See api/src/reimportClassify.ts / GitHub issue #427.
   const blocked = (t.tombstone_blocked ?? 0) + (t.conflict_skipped ?? 0);
   if (blocked) parts.push(`${blocked} NOT imported (ID still held by a deleted row)`);
+  // A reissued tombstone (master carries the id at a DIFFERENT reference) whose
+  // slot this run reclaimed for master automatically (issue #427, option 1) —
+  // informational, not actionable, so it sits after the blocked-row line rather
+  // than competing with it for attention.
+  if (t.tombstone_reclaimed) parts.push(`${t.tombstone_reclaimed} reissued tombstone(s) reclaimed`);
   if (t.dcs_404) parts.push(`${t.dcs_404} resource(s) not on DCS`);
   if (parts.length === 0) return `Imported ${res.book} — no changes.`;
   return `Imported ${res.book}: ${parts.join(", ")}.`;

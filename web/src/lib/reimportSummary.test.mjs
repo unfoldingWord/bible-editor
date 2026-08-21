@@ -159,6 +159,36 @@ has(
 );
 lacks(summarizeReimport(res({})), "reference differs", "no reference moves → no reference phrase");
 
+console.log("\n-- reissued tombstones reclaimed (issue #427, option 1) --");
+
+// 0 / absent must print nothing, matching every other optional counter here.
+lacks(summarizeReimport(res({ tombstone_reclaimed: 0 })), "reclaimed", "0 reclaimed -> no line");
+lacks(summarizeReimport(res({})), "reclaimed", "field absent -> no line");
+
+has(
+  summarizeReimport(res({ tombstone_reclaimed: 3 })),
+  "3 reissued tombstone(s) reclaimed",
+  "reclaimed count is reported",
+);
+eq(
+  summarizeReimport(res({ tombstone_reclaimed: 3 })),
+  "Imported AMO: 3 reissued tombstone(s) reclaimed.",
+  "reclaimed alone -> a complete sentence, not the plain no-changes message",
+);
+
+// Must coexist with (and sit after) the blocked-row line — a reclaim landing
+// and the lost-CAS fallback that still counts blocked are disjoint outcomes
+// for different rows in the same run (see bookReimport.ts's reclaim batch), so
+// a single run can legitimately report both at once.
+const reclaimedAndBlocked = summarizeReimport(res({ tombstone_blocked: 2, tombstone_reclaimed: 5 }));
+has(reclaimedAndBlocked, "2 NOT imported (ID still held by a deleted row)", "blocked line still present");
+has(reclaimedAndBlocked, "5 reissued tombstone(s) reclaimed", "reclaimed line still present");
+eq(
+  reclaimedAndBlocked.indexOf("NOT imported") < reclaimedAndBlocked.indexOf("reclaimed"),
+  true,
+  "the actionable blocked-row count comes BEFORE the informational reclaimed line",
+);
+
 if (failed > 0) {
   console.error(`\n${failed} failure(s)`);
   process.exit(1);
