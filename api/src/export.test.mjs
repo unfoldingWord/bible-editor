@@ -5,7 +5,7 @@
 // instead of getting silently flattened to `\v 6`. Not a test framework;
 // failures exit non-zero.
 
-import { attributeTsvShrink, branchOverrideAllowed, lockPushExportParams, prunableBranches, exportBranchOverrideValid, buildAlignmentShrinkAlertMessage, buildUsfmInvalidAlertMessage, classifyAlignmentLossSeverity, offenderProvenanceFromLog, buildExportBranch, buildTnTsv, buildTqTsv, buildTwlTsv, buildUsfm, classifyAlignmentShrinkOffenders, classifyRevertSeverity, commitToDcs, countDuplicateMasterIds, describeShrinkRefusal, ensureDcsPr, exportTags, exportTsvShrinkRefused, findDcsOpenPr, isMasterConfirmed, mechanicalOverwriteAlert, parseTsvIds, recreateExportBranchFromMaster, shouldRecordRevertReport, tsvRevertReport, updateDcsPrBranch, usfmAlignmentShrinkRefused, usfmRevertReport } from "./export.ts";
+import { attributeTsvShrink, branchOverrideAllowed, lockPushExportParams, prunableBranches, exportBranchOverrideValid, buildAlignmentShrinkAlertMessage, buildUsfmInvalidAlertMessage, classifyAlignmentLossSeverity, offenderProvenanceFromLog, buildExportBranch, buildTnTsv, buildTqTsv, buildTwlTsv, buildUsfm, classifyAlignmentShrinkOffenders, classifyRevertSeverity, commitToDcs, countDuplicateMasterIds, describeShrinkRefusal, ensureDcsPr, exportTags, exportTsvShrinkRefused, findDcsOpenPr, isHumanIntentRemoval, isMasterConfirmed, mechanicalOverwriteAlert, parseTsvIds, recreateExportBranchFromMaster, shouldRecordRevertReport, tsvRevertReport, updateDcsPrBranch, usfmAlignmentShrinkRefused, usfmRevertReport } from "./export.ts";
 import { CorruptContentJsonError } from "./contentJson.ts";
 import { extractVersesForRange } from "./importParsers.ts";
 import { validateUsfm } from "./usfmValidate.ts";
@@ -1139,9 +1139,11 @@ function utf8Base64(s) {
 }
 
 // ECC ch1 shape: a repair script run against a human ruling trashed 53 notes in
-// one pass, tagging each tombstone source='data_restoration'. Deliberate by
-// construction, so it must SHIP — credited exactly like an in-app delete. Before
-// data_restoration joined HUMAN_INTENT_REMOVAL_SOURCES these read as 53
+// one pass, tagging each tombstone source='data_restoration' and attributing it
+// to the operator's own user_id (ecc-ch1-cleanup.mjs's OPERATOR_UID). Deliberate
+// by construction, so it must SHIP — credited exactly like an in-app delete, via
+// isHumanIntentRemoval's generic non-null-user_id branch (#580), not because
+// 'data_restoration' is a named exception. Before this these read as 53
 // unexplained losses (the truncated-fetch signature), which would have blocked
 // the export and withheld the watermark, stranding the duplicates on master.
 {
@@ -1152,15 +1154,18 @@ function utf8Base64(s) {
     ...renderedIds.map((id) => ({ id, deleted_at: null, trashed_at: null })),
     ...trashed.map((id) => ({ id, deleted_at: 1787000000, trashed_at: null })),
   ];
-  const removals = trashed.map((id, i) => ({ row_key: id, source: "data_restoration", id: 9000 + i }));
+  const removals = trashed.map((id, i) => ({ row_key: id, source: "data_restoration", user_id: 2, id: 9000 + i }));
   const result = attributeTsvShrink({ masterIds, renderedIds, rowStates, removals, resource: "tn" });
   assert(result.missing === 53, `ECC: 53 rows missing from the render (got ${result.missing})`);
   assert(result.explained === 53 && result.unexplained === 0,
-    `ECC: a data_restoration tombstone is human intent — all 53 explained (got ${result.explained}/${result.unexplained})`);
+    `ECC: a data_restoration tombstone attributed to a real user_id is human intent — all 53 explained (got ${result.explained}/${result.unexplained})`);
 }
 
-// Same shape, but the newest removal entry is machine-authored: still blocks.
-// Guards the widened allowlist from being read as "any tombstone counts".
+// Same shape, but the newest removal entry is machine-authored: still blocks,
+// EVEN when it carries a non-null user_id (pipelineImport.ts binds the
+// triggering user, not a reviewer of this specific deletion) — the
+// MACHINE_REMOVAL_SOURCES denylist wins over any user_id. Guards #580's fix
+// from being read as "any user_id-attributed tombstone counts".
 {
   const masterIds = ["a", "b", "c"];
   const renderedIds = ["a"];
@@ -1170,12 +1175,33 @@ function utf8Base64(s) {
     { id: "c", deleted_at: 1787000000, trashed_at: null },
   ];
   const removals = [
-    { row_key: "b", source: "data_restoration", id: 1 },
-    { row_key: "c", source: "dcs_reimport", id: 2 },
+    { row_key: "b", source: "data_restoration", user_id: 2, id: 1 },
+    { row_key: "c", source: "dcs_reimport", user_id: 9, id: 2 },
   ];
   const result = attributeTsvShrink({ masterIds, renderedIds, rowStates, removals, resource: "tn" });
   assert(result.explained === 1 && result.unexplained === 1,
-    `machine tombstone still unexplained beside a data_restoration one (got ${result.explained}/${result.unexplained})`);
+    `machine tombstone still unexplained beside a data_restoration one, even with a user_id (got ${result.explained}/${result.unexplained})`);
+}
+
+// --- isHumanIntentRemoval (#580): judged by what the entry proves, not by
+// the source name a script's author happened to pick. ---------------------
+{
+  assert(isHumanIntentRemoval(null, null) === true, `null source is always human intent`);
+  assert(isHumanIntentRemoval("nightly_finalize", null) === true,
+    `nightly_finalize is always human intent, even with user_id NULL (index.ts writes it that way)`);
+  assert(isHumanIntentRemoval("dcs_reimport", 7) === false,
+    `dcs_reimport is never human intent, even with a non-null user_id`);
+  assert(isHumanIntentRemoval("ai_pipeline", 7) === false,
+    `ai_pipeline is never human intent, even with a non-null user_id`);
+  // The defect #580 fixes: an unrecognized source name is judged on user_id,
+  // not on whether it happens to match a name someone remembered to allowlist.
+  assert(isHumanIntentRemoval("data_repair", 3) === true,
+    `an unrecognized repair-script source WITH a real user_id is human intent`);
+  assert(isHumanIntentRemoval("data_repair", null) === false,
+    `an unrecognized repair-script source with NO user_id still blocks — same as before #580`);
+  assert(isHumanIntentRemoval("some_future_writer_nobody_allowlisted", null) === false,
+    `an entirely new, unrecognized source with no user_id blocks (ablation: this is the case the old` +
+      ` name-only Set check would have silently widened to admit had the new name been added there instead)`);
 }
 
 // twl_PSA shape: a large share of master's rows are absent from the render

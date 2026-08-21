@@ -174,3 +174,32 @@ export function lockOverrideAllowed(
   if (!params.book || !params.resource) return false;
   return resolvedBookCount === 1 && resolvedResourceCount === 1;
 }
+
+// #581: whether a request must be REJECTED because it uses allowLocked
+// against a locked/published book with no acknowledgement of the consequence.
+// allowLocked alone clears our own book-lock gate, but the export still lands
+// on a generated `{BOOK}-be-{contributors}` branch, and DCS's own
+// merge-be-pr.yaml auto-merges ANY `-be-` branch into master with no human
+// review — exactly wrong for a book that is frozen because its content is in
+// a cut release. branchName (see exportBranchOverrideValid/export.ts) exists
+// to produce a branch DCS will NOT auto-merge, but it is opt-in, so an
+// operator who does not know it exists gets the unattended auto-merge by
+// default. This function makes that opt-in: allowLocked against a
+// locked/published book must carry EITHER branchName (ship on a
+// maintainer-reviewed branch) OR an explicit allowAutoMerge:true (a
+// deliberate, auditable choice to accept the auto-merge) — otherwise reject.
+//
+// `isLocked` is resolved by the caller (api/src/bookLock.ts's
+// effectiveBookLock, which covers both the PUBLISHED_BOOKS default and an
+// explicit book_locks row) so this stays a pure, D1-free predicate, the same
+// shape as lockOverrideAllowed above.
+export function autoMergeConfirmationRequired(
+  params: { allowLocked?: boolean; branchName?: string; allowAutoMerge?: boolean },
+  isLocked: boolean,
+): boolean {
+  if (params.allowLocked !== true) return false;
+  if (!isLocked) return false;
+  if (params.branchName) return false;
+  if (params.allowAutoMerge === true) return false;
+  return true;
+}

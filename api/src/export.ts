@@ -396,39 +396,51 @@ export function countDuplicateMasterIds(masterIds: string[]): number {
 }
 
 // A removal entry's `source` counts as human-authored intent to remove the
-// row. `null` is the in-app human delete (rows.ts:861-865) and trash
-// (rows.ts:973-980) — both omit the column. `nightly_finalize` (index.ts:262)
-// is machine-EXECUTED but human-AUTHORED: it's the nightly promotion of a
-// human's trash to a deleted_at tombstone, so it counts too. Every other
-// source is a machine decision (`dcs_reimport` — bookReimport.ts:1810,
-// truncated-fetch reimport prune; `ai_pipeline` — pipelineImport.ts:695, AI
-// auto-apply) and must NOT be credited.
+// row, unconditionally — by name, not by what it carries in `user_id`. `null`
+// is the in-app human delete (rows.ts:861-865) and trash (rows.ts:973-980) —
+// both omit the column. `nightly_finalize` (index.ts:262) is
+// machine-EXECUTED but human-AUTHORED: it's the nightly promotion of a
+// human's trash to a deleted_at tombstone (written with user_id NULL — see
+// index.ts:280), so it counts too regardless.
 //
-// Deliberately NOT listed, though a human directed them: the one-off repair
-// sources in prod's edit_log (`dedup_repair`, `data_repair_isa48`). A shrink
-// that traces to one of those will still block, and a human clears it with the
-// existing allowShrink override. That's the conservative side of the trade —
-// this set only grows on evidence that a source is routinely human-authored,
-// because every addition widens what can delete rows from master unattended.
+// Every OTHER source — a one-off repair script's delete, the ECC ch1
+// de-duplication (2026-08-20), a future repair not yet written — is judged by
+// `isHumanIntentRemoval` below on what the entry PROVES (a real user_id, on a
+// source that isn't a known machine one) rather than on whether its author
+// happened to spell the source `data_restoration`, `data_repair`, or
+// something not yet invented (#580). This set intentionally stays exactly
+// these two names; a new named exception here would recreate the same
+// naming-convention trap #580 fixed.
 export const HUMAN_INTENT_REMOVAL_SOURCES: ReadonlySet<string | null> = new Set<string | null>([
   null,
   "nightly_finalize",
-  // A repair script's delete, run by a person against a named ruling — the ECC
-  // ch1 de-duplication (2026-08-20) is the first: two full note sets had gone
-  // live in D1 after an AI apply deleted only 20 of the 73 rows it replaced,
-  // and Benjamin ruled to keep the newer set, so 53 rows were trashed at once.
-  //
-  // This belongs here for the same reason `null` does. The guard's question is
-  // "did a human mean to remove this row, or did D1 lose it?" — and a
-  // data_restoration tombstone is deliberate by construction: nothing writes
-  // that source except a repair a person authorized and attributed to their own
-  // user_id. Leaving it out is what the truncated-fetch signature looks like, so
-  // a large, entirely intentional cleanup would have read as 53 unexplained
-  // losses, blocked the export, and withheld the resource watermark — meaning
-  // the duplicates stay on Door43 and no later export can clear them, the same
-  // livelock shape #543 fixed on the reference side.
-  "data_restoration",
 ]);
+
+// Sources whose removal decision is NEVER a person's, however `user_id` reads
+// on the entry — checked before the generic user_id fallback in
+// isHumanIntentRemoval, so neither can ever credit these:
+//   - `dcs_reimport` (bookReimport.ts prune path, e.g. ~line 5116): tombstones
+//     write user_id NULL, but even where other dcs_reimport writes bind a
+//     userId it is contextual (the row's prior editor), not an attribution of
+//     THIS deletion to a person.
+//   - `ai_pipeline` (pipelineImport.ts ~line 1253): the delete's user_id is the
+//     job's triggering user, not a person who reviewed and chose to remove
+//     this specific row — the AI made that call.
+export const MACHINE_REMOVAL_SOURCES: ReadonlySet<string> = new Set(["dcs_reimport", "ai_pipeline"]);
+
+// Whether one removal entry proves a human meant to remove this row (#580).
+// `null` and `nightly_finalize` are always human intent, by construction (see
+// HUMAN_INTENT_REMOVAL_SOURCES above). A known machine source is never human
+// intent, whatever `userId` says (see MACHINE_REMOVAL_SOURCES above). Any
+// other source — the repair-script bucket, named however its author liked —
+// is human intent iff it carries a real `userId`: a person attributed the
+// removal to themselves, which is what actually proves intent, rather than a
+// naming convention nobody enforces.
+export function isHumanIntentRemoval(source: string | null, userId: number | null): boolean {
+  if (HUMAN_INTENT_REMOVAL_SOURCES.has(source)) return true;
+  if (source !== null && MACHINE_REMOVAL_SOURCES.has(source)) return false;
+  return userId != null;
+}
 
 // Splits master's row loss into "explained" (D1's newest removal entry for
 // the row is human-authored, per HUMAN_INTENT_REMOVAL_SOURCES) vs
@@ -494,7 +506,10 @@ export function attributeTsvShrink(args: {
   // tests hand-built already-sorted arrays. The SQL still orders by id ASC —
   // harmless, and it keeps the intent legible — but correctness doesn't lean
   // on it anymore).
-  removals: Array<{ row_key: string; source: string | null; id: number }>;
+  // `user_id` feeds isHumanIntentRemoval's generic (non-named-source) branch
+  // — absent/undefined is normalized to null below, which reads as "nobody
+  // attributed this removal to themselves" (never credited on its own).
+  removals: Array<{ row_key: string; source: string | null; id: number; user_id?: number | null }>;
   resource: "tn" | "tq" | "twl";
 }): { liveCount: number; missing: number; explained: number; unexplained: number } {
   const { masterIds, renderedIds, rowStates, removals, resource } = args;
@@ -522,10 +537,12 @@ export function attributeTsvShrink(args: {
   // Last-write-wins over `removals`, keyed by each entry's own `id` (not
   // arrival order) so out-of-order input can't invert the HAB stale-trash
   // case.
-  const newestRemoval = new Map<string, { source: string | null; id: number }>();
+  const newestRemoval = new Map<string, { source: string | null; userId: number | null; id: number }>();
   for (const r of removals) {
     const cur = newestRemoval.get(r.row_key);
-    if (!cur || r.id > cur.id) newestRemoval.set(r.row_key, { source: r.source, id: r.id });
+    if (!cur || r.id > cur.id) {
+      newestRemoval.set(r.row_key, { source: r.source, userId: r.user_id ?? null, id: r.id });
+    }
   }
 
   const uniqueMasterIds = new Set(masterIds);
@@ -534,10 +551,11 @@ export function attributeTsvShrink(args: {
   for (const id of uniqueMasterIds) {
     if (liveIds.has(id)) continue;
     // Both conditions required: D1 must currently hold the row removed, AND
-    // its newest removal entry must be human-authored. Either alone is not
-    // enough — see the Defect 1 comment above.
+    // its newest removal entry must be human-authored (#580: judged by
+    // isHumanIntentRemoval, not by Set membership on the raw source name).
+    // Either alone is not enough — see the Defect 1 comment above.
     const newest = removedIds.has(id) ? newestRemoval.get(id) : undefined;
-    const isHumanIntent = newest !== undefined && HUMAN_INTENT_REMOVAL_SOURCES.has(newest.source ?? null);
+    const isHumanIntent = newest !== undefined && isHumanIntentRemoval(newest.source ?? null, newest.userId);
     if (isHumanIntent) explained++;
     else unexplained++;
   }

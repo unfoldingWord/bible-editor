@@ -43,6 +43,12 @@ export const RunExportBody = z
     // DCS auto-merge, which is the thing this override exists to avoid). See
     // branchOverrideAllowed in export.ts.
     branchName: z.string().min(1).max(80).optional(),
+    // #581: explicit, auditable acknowledgement that an allowLocked export
+    // against a locked/published book WILL be auto-merged into master by DCS's
+    // own merge-be-pr.yaml, because no branchName was given. Without either
+    // this or branchName, such a request 400s — see autoMergeConfirmationRequired
+    // in publishedGuard.ts. Ignored for an unlocked book.
+    allowAutoMerge: z.boolean().optional(),
   })
   .strict();
 
