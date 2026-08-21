@@ -1062,6 +1062,46 @@ function utf8Base64(s) {
   );
 }
 
+// ECC ch1 shape: a repair script run against a human ruling trashed 53 notes in
+// one pass, tagging each tombstone source='data_restoration'. Deliberate by
+// construction, so it must SHIP — credited exactly like an in-app delete. Before
+// data_restoration joined HUMAN_INTENT_REMOVAL_SOURCES these read as 53
+// unexplained losses (the truncated-fetch signature), which would have blocked
+// the export and withheld the watermark, stranding the duplicates on master.
+{
+  const masterIds = Array.from({ length: 117 }, (_, i) => `ecc${i}`);
+  const renderedIds = masterIds.slice(0, 64);            // the 64 rows we kept
+  const trashed = masterIds.slice(64);                    // the 53 we removed
+  const rowStates = [
+    ...renderedIds.map((id) => ({ id, deleted_at: null, trashed_at: null })),
+    ...trashed.map((id) => ({ id, deleted_at: 1787000000, trashed_at: null })),
+  ];
+  const removals = trashed.map((id, i) => ({ row_key: id, source: "data_restoration", id: 9000 + i }));
+  const result = attributeTsvShrink({ masterIds, renderedIds, rowStates, removals, resource: "tn" });
+  assert(result.missing === 53, `ECC: 53 rows missing from the render (got ${result.missing})`);
+  assert(result.explained === 53 && result.unexplained === 0,
+    `ECC: a data_restoration tombstone is human intent — all 53 explained (got ${result.explained}/${result.unexplained})`);
+}
+
+// Same shape, but the newest removal entry is machine-authored: still blocks.
+// Guards the widened allowlist from being read as "any tombstone counts".
+{
+  const masterIds = ["a", "b", "c"];
+  const renderedIds = ["a"];
+  const rowStates = [
+    { id: "a", deleted_at: null, trashed_at: null },
+    { id: "b", deleted_at: 1787000000, trashed_at: null },
+    { id: "c", deleted_at: 1787000000, trashed_at: null },
+  ];
+  const removals = [
+    { row_key: "b", source: "data_restoration", id: 1 },
+    { row_key: "c", source: "dcs_reimport", id: 2 },
+  ];
+  const result = attributeTsvShrink({ masterIds, renderedIds, rowStates, removals, resource: "tn" });
+  assert(result.explained === 1 && result.unexplained === 1,
+    `machine tombstone still unexplained beside a data_restoration one (got ${result.explained}/${result.unexplained})`);
+}
+
 // twl_PSA shape: a large share of master's rows are absent from the render
 // AND absent from D1 entirely (no rowStates entry at all) — the truncated-
 // load signature, not a tombstone. Must block (nonzero unexplained).

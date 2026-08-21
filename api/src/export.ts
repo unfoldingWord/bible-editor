@@ -338,6 +338,21 @@ export function countDuplicateMasterIds(masterIds: string[]): number {
 export const HUMAN_INTENT_REMOVAL_SOURCES: ReadonlySet<string | null> = new Set<string | null>([
   null,
   "nightly_finalize",
+  // A repair script's delete, run by a person against a named ruling — the ECC
+  // ch1 de-duplication (2026-08-20) is the first: two full note sets had gone
+  // live in D1 after an AI apply deleted only 20 of the 73 rows it replaced,
+  // and Benjamin ruled to keep the newer set, so 53 rows were trashed at once.
+  //
+  // This belongs here for the same reason `null` does. The guard's question is
+  // "did a human mean to remove this row, or did D1 lose it?" — and a
+  // data_restoration tombstone is deliberate by construction: nothing writes
+  // that source except a repair a person authorized and attributed to their own
+  // user_id. Leaving it out is what the truncated-fetch signature looks like, so
+  // a large, entirely intentional cleanup would have read as 53 unexplained
+  // losses, blocked the export, and withheld the resource watermark — meaning
+  // the duplicates stay on Door43 and no later export can clear them, the same
+  // livelock shape #543 fixed on the reference side.
+  "data_restoration",
 ]);
 
 // Splits master's row loss into "explained" (D1's newest removal entry for
