@@ -95,7 +95,7 @@ import { loadTwTitles } from "./twTitles";
 import { loadTwlOrderLocks } from "./twlOrderLocks";
 import type { TwlRow, VerseRow, CheckLane } from "./types";
 import { computeVerseMerge, type VerseMergeResult } from "./verseMerge.ts";
-import { NO_BASE_REF_DISPLAY } from "./verseMergeEditorAlerts.ts";
+import { NO_BASE_REF_DISPLAY, type NoBaseVerseRef } from "./verseMergeEditorAlerts.ts";
 import { verseContentJsonFromPayload } from "./verseHistory.ts";
 import { canonizeAlignmentSource } from "./canonizeHebrew.ts";
 import {
@@ -332,6 +332,16 @@ export interface ReimportCounts {
   // through a Workflow step's serialized return value, so it must stay small.
   // verses only - the TSV side shares `merge_no_base` but has no banner.
   merge_no_base_refs?: string[];
+  // The SAME keep_no_base verses as merge_no_base_refs, but UNCAPPED and each
+  // carrying its current D1 version (issue #544) - the input
+  // raiseVerseMergeConflictAlert's editor fan-out needs to attribute every
+  // affected verse to the human who last edited it (verseMergeEditorAlerts.ts's
+  // groupNoBaseVersesByEditor), not just the first NO_BASE_REF_DISPLAY of them.
+  // Capped separately (NO_BASE_EDITOR_REF_CAP) - generously, since unlike the
+  // display sample this list must not silently drop a translator's verse, but
+  // still bounded so a pathological book can't blow up a Workflow step's
+  // serialized return value. verses only.
+  merge_no_base_editor_refs?: NoBaseVerseRef[];
   // Reference-move attribution (issue #540 item 3), split by WHO moved so a run
   // summary can distinguish "we published a move" from "master moved under us".
   // Only ref_moved_theirs / _both / _unattributable / _ours_conflict withhold the
@@ -446,6 +456,14 @@ const BLOCKED_SAMPLE_CAP = 20;
 // has to survive; it does, independently.
 const NO_BASE_REF_CAP = NO_BASE_REF_DISPLAY;
 
+// Cap on ReimportCounts.merge_no_base_editor_refs (issue #544). Deliberately
+// far above any observed count (EZK/JER carry 34-59 keep_no_base verses per
+// resource today, per NO_BASE_REF_CAP's comment above) - unlike that display
+// cap, every verse here needs to reach an editor, so this cap exists only to
+// bound the worst-case Workflow-step serialized return value, not to shrink
+// a display list.
+export const NO_BASE_EDITOR_REF_CAP = 200;
+
 // Cap on the per-row "we attributed this move to the app" log lines. While one
 // held row keeps a resource stuck, every other moved row in the book would
 // otherwise log an object every night; the counters carry the totals.
@@ -486,6 +504,7 @@ function zeroCounts(): ReimportCounts {
     merge_kept_ai: 0,
     merge_no_base: 0,
     merge_no_base_refs: [],
+    merge_no_base_editor_refs: [],
     ref_moved_ours: 0,
     ref_moved_ours_conflict: 0,
     ref_moved_theirs: 0,
@@ -622,6 +641,16 @@ function addCounts(into: ReimportCounts, from: ReimportCounts): void {
     const into_ = (into.merge_no_base_refs ??= []);
     for (const r of from.merge_no_base_refs) {
       if (into_.length >= NO_BASE_REF_CAP) break;
+      into_.push(r);
+    }
+  }
+  // Same shape, same tolerance for a chunk memoized before the field existed -
+  // see merge_no_base_refs just above. Capped separately (NO_BASE_EDITOR_REF_CAP)
+  // since this list feeds editor attribution, not just the admin sentence.
+  if (from.merge_no_base_editor_refs?.length) {
+    const into_ = (into.merge_no_base_editor_refs ??= []);
+    for (const r of from.merge_no_base_editor_refs) {
+      if (into_.length >= NO_BASE_EDITOR_REF_CAP) break;
       into_.push(r);
     }
   }
@@ -956,6 +985,7 @@ async function runReimport(
       recordingFailed: perResource.ult.merge_record_failed === true,
       noBaseCount: perResource.ult.merge_no_base,
       noBaseRefs: perResource.ult.merge_no_base_refs,
+      noBaseEditorRefs: perResource.ult.merge_no_base_editor_refs,
     });
   }
   if (want.has("ust")) {
@@ -963,6 +993,7 @@ async function runReimport(
       recordingFailed: perResource.ust.merge_record_failed === true,
       noBaseCount: perResource.ust.merge_no_base,
       noBaseRefs: perResource.ust.merge_no_base_refs,
+      noBaseEditorRefs: perResource.ust.merge_no_base_editor_refs,
     });
   }
 
@@ -1475,7 +1506,27 @@ export async function applyTsvRows(
           // masterMayHoldHumanEdit encodes that.
           { masterMayHoldHumanEdit: masterMayHoldHumanEdit(cutoff?.lineage) },
         );
-        if (merge.action === "keep_no_base") counts.merge_no_base++;
+        if (merge.action === "keep_no_base") {
+          counts.merge_no_base++;
+          // Issue #544: unlike the verse side, a keep_no_base tn/tq/twl row got
+          // NO visible surface at all - merge_no_base is a shared counter with
+          // no banner for TSV (see this field's own doc comment above), and
+          // this table has no verse_merge_conflicts-style audit row either. Flag
+          // the row itself (review_kind='merge_no_base'), the same cleanup-chip
+          // mechanism lint.ts already surfaces every other TSV merge outcome
+          // through. Only raise over nothing so we never overwrite a stronger
+          // flag (ref_moved / merge_conflict) - ref_moved precedence - and so
+          // re-running an unchanged sync never re-sets a field that's already
+          // set (issue #539's version-inflation constraint). Cleared the normal
+          // way: any human edit to the row clears review_kind (contentPatchClauses.ts).
+          if (cur.review_kind == null) {
+            fields.review_kind = "merge_no_base";
+            fields.review_reason =
+              "No earlier version of this row was recoverable, so an out-of-band Door43 edit (if any) could not " +
+              "be checked against your change. Nothing has been overwritten - but if Door43 has changed this row, " +
+              "tonight's export will still overwrite it unless you re-save it here.";
+          }
+        }
         // #540 item 2: both sides moved a field, and the lineage found no human
         // commit behind master's side, so D1 keeps that field. See the counter's
         // declaration for why this must never join merge_refused.
@@ -3140,6 +3191,18 @@ async function applyVerseRows(
           // overwritten by tonight's export" — points at nothing a human can open.
           const refs = (counts.merge_no_base_refs ??= []);
           if (refs.length < NO_BASE_REF_CAP) refs.push(`${v.chapter}:${v.verse}`);
+          // Issue #544: the SAME verse, uncapped, carrying its CURRENT D1
+          // version (ex.version, not yet touched by this run — keep_no_base
+          // writes nothing) so raiseVerseMergeConflictAlert can attribute it to
+          // the human who last edited it via edit_log, the same way an
+          // overwritten verse is attributed via overwrittenVersion. Reachable
+          // here only for a verse already established as genuinely human-edited
+          // — see the `aiOnly` branch above, which `continue`s before this ever
+          // runs — so ex.version's edit_log row is that human's edit.
+          const editorRefs = (counts.merge_no_base_editor_refs ??= []);
+          if (editorRefs.length < NO_BASE_EDITOR_REF_CAP) {
+            editorRefs.push({ chapter: v.chapter, verse: v.verse, version: ex.version });
+          }
         }
         if (merge.action === "keep_alignment_refused") counts.merge_refused++;
         // Deliberately NOT folded into merge_refused: that counter feeds
@@ -5173,6 +5236,7 @@ export async function runChunkedReimport(
         recordingFailed: perResource[e.resource].merge_record_failed === true,
         noBaseCount: perResource[e.resource].merge_no_base,
         noBaseRefs: perResource[e.resource].merge_no_base_refs,
+        noBaseEditorRefs: perResource[e.resource].merge_no_base_editor_refs,
       });
     }
   });
