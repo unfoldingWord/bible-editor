@@ -126,6 +126,15 @@ export { REIMPORT_CHAPTER_CHUNK, reimportChunkBoundaries };
 // exact regression (PR #180 batched them → a later refactor un-batched them →
 // PR #195 re-batched) silently reintroduced the cap once. See bookReimport's
 // section header + the nightly-sync-subrequest-cap memory.
+// Row table per TSV kind. Every other statement in this file hard-codes its
+// table inside a per-kind branch; the flag clear (issue #588) is identical for
+// all three, so it interpolates from here rather than repeating itself.
+const TSV_TABLE: Record<"tn" | "tq" | "twl", string> = {
+  tn: "tn_rows",
+  tq: "tq_rows",
+  twl: "twl_rows",
+};
+
 const WRITE_BATCH = 90;
 
 export interface ReimportCounts {
@@ -356,6 +365,10 @@ export interface ReimportCounts {
   ref_moved_theirs: number;
   ref_moved_both: number;
   ref_moved_unattributable: number;
+  // Rows whose reference-move flag this run CLEARED because the two sides now
+  // agree (issue #588). Not a move and not a merge: a flag-only, version-neutral
+  // write that makes a resolved cleanup chip disappear. Optional, diagnostic.
+  ref_moved_resolved: number;
   // Human-edited verse that DIFFERS from master but could not be adjudicated
   // at all, because this book+resource has no `master_confirmed_at` watermark
   // yet (migration 0045 adds the column and does not backfill it — only the
@@ -511,6 +524,7 @@ function zeroCounts(): ReimportCounts {
     ref_moved_theirs: 0,
     ref_moved_both: 0,
     ref_moved_unattributable: 0,
+    ref_moved_resolved: 0,
     merge_unavailable: 0,
     merge_cosmetic_ignored: 0,
     own_publish_converged: 0,
@@ -686,6 +700,7 @@ function addCounts(into: ReimportCounts, from: ReimportCounts): void {
   into.ref_moved_theirs += from.ref_moved_theirs ?? 0;
   into.ref_moved_both += from.ref_moved_both ?? 0;
   into.ref_moved_unattributable += from.ref_moved_unattributable ?? 0;
+  into.ref_moved_resolved += from.ref_moved_resolved ?? 0;
   into.merge_unavailable += from.merge_unavailable ?? 0;
   into.merge_cosmetic_ignored += from.merge_cosmetic_ignored ?? 0;
   into.own_publish_converged += from.own_publish_converged ?? 0;
@@ -1301,6 +1316,13 @@ export async function applyTsvRows(
   // discipline this whole function exists for. Each resolves to either a merge
   // write (adopt master's field(s)) or a plain skipped_edited.
   const editedCandidates: Array<{ row: ParsedTsvRow; cur: Record<string, unknown> }> = [];
+  // Ids of rows carrying a review_kind='ref_moved' flag that this run resolved:
+  // master and D1 now agree on the reference, so the flag has nothing left to
+  // report (issue #588). Collected rather than written inline for the same
+  // subrequest-budget reason as every other array here, and written by its own
+  // small batch below — deliberately NOT folded into `updates`, whose statement
+  // adopts master's content and bumps the version.
+  const flagClears: string[] = [];
   // Combined writes for edited rows: the union of the three-way merge's adopted
   // SUBSTANTIVE fields (tsvMerge.ts) and the ancestor-free computeEditedFieldMerge
   // fields (tags / whitespace-only note), plus review_kind/review_reason on a
@@ -1498,6 +1520,28 @@ export async function applyTsvRows(
     const fate = classifyReimportRow(contentMatches, sortMatches, reimportable, preserveLocalOrder, aiOnly);
     if (fate === "noop") {
       counts.skipped_noop++;
+      // A resolved reference-move flag has to be cleared HERE, on the no-op path,
+      // because this is where the resolved row actually lands (issue #588). Both
+      // no-op shapes prove the references agree: tsvRowSignature covers
+      // chapter/verse/ref_raw, so `contentMatches` is itself the measurement. And
+      // a row whose reference AND content now match master is a no-op by
+      // definition, so it never reaches the edited-candidate resolution below —
+      // which is why clearing the flag only there (the first cut of this fix)
+      // left the chip standing for every tn/twl row and for any tq row whose
+      // sort_order happened to match file order.
+      //
+      // Deliberately NOT a normal write: no version bump and no edit_log entry,
+      // matching the in-app acknowledgement in rows.ts ("no version bump, like a
+      // bit-toggle"). Nothing about the row's content changed, and bumping the
+      // version would invalidate an open editor's If-Match and cost a 409 for a
+      // flag nobody needs to see. Guarded on 'ref_moved' so it can never drop an
+      // unacknowledged merge_conflict / merge_kept / merge_no_base.
+      //
+      // Applies to protected tn rows (trashed/preserve/hint) too: the protections
+      // exist to stop master overwriting CONTENT, and this write touches none —
+      // while a preserved row is exactly the one nobody will edit again, so the
+      // stale chip would otherwise be permanent.
+      if (cur.review_kind === "ref_moved") flagClears.push(row.id);
       continue;
     }
     if (fate === "edited") {
@@ -1712,13 +1756,17 @@ export async function applyTsvRows(
       } else if (refMove === "none" && !protectedRow && cur.review_kind === "ref_moved") {
         // The two sides AGREE now — the translator moved the row in-app to match
         // Door43, or master moved back — and a flag from an earlier run is still
-        // sitting on the row. Nothing above this line clears it: the only other
-        // clear lives in the `ours_moved` branch, so before issue #588 a resolved
-        // reference kept its cleanup chip forever, reading "Reference differs
-        // from Door43 — verify" with nothing left to differ and no way to dismiss
-        // it (the tn/tq/twl save button is disabled unless the row is dirty, so a
-        // translator cannot even produce the no-op re-save that rows.ts accepts as
-        // an acknowledgement). Observed on AMO tq 3:14, reported 2026-08-21.
+        // sitting on the row — while some OTHER column still diverges, which is
+        // what made this row an edited candidate rather than a no-op. (The
+        // resolved-and-otherwise-identical row never reaches here; it is cleared
+        // on the no-op path above, which is where it lands.) Before issue #588
+        // neither site cleared it — the only clear lived in the `ours_moved`
+        // branch — so a resolved reference kept its cleanup chip forever, reading
+        // "Reference differs from Door43 — verify" with nothing left to differ and
+        // no way to dismiss it (the tn/tq/twl save button is disabled unless the
+        // row is dirty, so a translator cannot even produce the no-op re-save that
+        // rows.ts accepts as an acknowledgement). Observed on AMO tq 3:14,
+        // reported 2026-08-21.
         //
         // Guarded on 'ref_moved' exactly like the other clear, so it can never
         // drop an unacknowledged merge_conflict / merge_kept. Excluded for a
@@ -1880,6 +1928,34 @@ export async function applyTsvRows(
         heuristic,
         keptAiConflict,
       });
+    }
+  }
+
+  // Clear the reference-move flags this run resolved (issue #588). Its own tiny
+  // batch, and deliberately the simplest statement in this function: it sets only
+  // review_kind/review_reason, never touches content, never bumps `version`, and
+  // writes no edit_log row — see the collection site for why. No version-CAS is
+  // needed (there is no lost update to guard: the statement's own
+  // `review_kind = 'ref_moved'` predicate means a concurrent write that replaced
+  // the flag with a merge_conflict, or acknowledged it in-app, simply 0-changes),
+  // and `deleted_at IS NULL` keeps it off a tombstone. A batch() error is
+  // recorded and skipped: the flag is re-detected next run.
+  for (let i = 0; i < flagClears.length; i += WRITE_BATCH) {
+    const slice = flagClears.slice(i, i + WRITE_BATCH);
+    try {
+      const results = await env.DB.batch(
+        slice.map((id) =>
+          env.DB.prepare(
+            `UPDATE ${TSV_TABLE[kind]} SET review_kind = NULL, review_reason = NULL, updated_at = ?1
+               WHERE id = ?2 AND book = ?3 AND review_kind = 'ref_moved' AND deleted_at IS NULL`,
+          ).bind(now, id, book),
+        ),
+      );
+      results.forEach((r) => {
+        if ((r?.meta.changes ?? 0) > 0) counts.ref_moved_resolved++;
+      });
+    } catch (e) {
+      counts.errors.push(`flag clear batch: ${String(e)}`);
     }
   }
 

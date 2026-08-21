@@ -889,6 +889,12 @@ export interface ReimportCounts {
   ref_moved_theirs?: number;
   ref_moved_both?: number;
   ref_moved_unattributable?: number;
+  // A row whose reference-move flag the run CLEARED because the two sides agree
+  // again — a flag-only, version-neutral write that makes a resolved cleanup chip
+  // disappear (issue #588). Not a move: it is counted apart from the four above
+  // precisely so a resolved flag never reads as a fresh divergence. Optional,
+  // diagnostic.
+  ref_moved_resolved?: number;
   merge_unavailable?: number;
   // A "keep_converged" verse whose RAW content_json actually differed — a
   // genuine, cosmetic-only Door43 edit that verseMerge.ts's whitespace-
