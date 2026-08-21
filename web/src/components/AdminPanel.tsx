@@ -45,6 +45,7 @@ import {
   type AdminUser,
   type ExportSnapshotRow,
   type ExportInstanceStatus,
+  reviewBranchFor,
   type Resource,
 } from "../sync/api";
 import { bookName } from "../lib/bookNames";
@@ -530,17 +531,81 @@ function ImportResultView({ result }: { result: AdminImportResult }) {
   );
 }
 
-function PushCard({ bookOptions }: { bookOptions: string[] }) {
+// Mirrors exportBranchOverrideValid on the server (api/src/export.ts). Duplicated
+// deliberately, and kept deliberately simple: this exists to give immediate
+// feedback in the form, not to be the gate. The server is the gate and 400s with
+// `invalid_branch_name` regardless of what this thinks.
+function reviewBranchLooksValid(name: string): boolean {
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/.test(name)) return false;
+  // Case-insensitive, mirroring exportBranchOverrideValid on the server. The
+  // point of checking here at all is immediate feedback, so a divergence would
+  // make the form say a name is fine and then have the request 400 on it —
+  // fail-safe, but the field would be lying about what is acceptable.
+  if (/-be-/i.test(name)) return false; // the substring DCS auto-merges on
+  if (name.endsWith(".lock") || name.endsWith(".") || name.includes("..")) return false;
+  return true;
+}
+
+function PushCard({ bookOptions, lockedBooks }: { bookOptions: string[]; lockedBooks: Set<string> }) {
   const [book, setBook] = useState("");
   const [resource, setResource] = useState<Resource | "">("");
   const [dryDcs, setDryDcs] = useState(true);
   const [allowShrink, setAllowShrink] = useState(false);
+  const [allowLocked, setAllowLocked] = useState(false);
+  const [stageForReview, setStageForReview] = useState(true);
+  const [branchName, setBranchName] = useState("");
   const [confirmOpen, setConfirmOpen] = useState(false);
   const [runId, setRunId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const status = useInstancePoll(runId);
 
-  const needsConfirm = !dryDcs || allowShrink;
+  // Re-decide the overrides whenever the target changes. Both of these are
+  // per-book judgements, and inheriting them is how the wrong one gets applied to
+  // the wrong book: tick "override the lock" for MIC, switch the dropdown to JER,
+  // and without this you are still holding an override you chose for a different
+  // book — worse, an unticked "stage for review" would carry over as a standing
+  // decision to publish JER unreviewed, which nobody made.
+  useEffect(() => {
+    setAllowLocked(false);
+    setStageForReview(true);
+    // allowShrink resets too, and it is the most destructive of the three: it
+    // permits row DELETION on Door43. Ticking it for one book and switching the
+    // dropdown left it checked (merely disabled) for a book nobody decided it
+    // for.
+    setAllowShrink(false);
+    // dryDcs back to its safe default too. Unticking "Render only" for one target
+    // and then switching the dropdown left the next push armed to write to Door43
+    // without that having been decided for the new book.
+    setDryDcs(true);
+    // Re-derive the branch from the new book rather than carrying the old one
+    // over — a stale name is precisely the cross-book collision reviewBranchFor
+    // exists to prevent.
+    setBranchName(book ? reviewBranchFor(book) : "");
+  }, [book, resource]);
+
+  // Both overrides are honored only for exactly one book AND one resource (see
+  // lockOverrideAllowed / branchOverrideAllowed on the server). Naming that here
+  // keeps the UI from offering a control the server would silently ignore —
+  // which, for allowLocked, would mean an operator believing they had overridden
+  // the lock while every resource was quietly skipped.
+  const singleTarget = Boolean(book) && Boolean(resource);
+  const bookIsLocked = Boolean(book) && lockedBooks.has(book);
+  const branchOk = !stageForReview || reviewBranchLooksValid(branchName);
+
+  // What this actually blocks: a lock override with no single target (the server
+  // would ignore it and skip every resource as book_locked, while the operator
+  // believed it applied), and a staging branch the server would reject.
+  //
+  // What it deliberately does NOT block is "publish now" on a locked book. Both
+  // intents are legitimate — a lock admin fixing their own book wants master —
+  // so unreviewed publishing is discouraged by being off by default, warned
+  // about inline, and named in the confirm dialog, NOT forbidden. Said plainly
+  // because an earlier version of this comment claimed staging was REQUIRED,
+  // which the condition below never enforced; believing a gate exists where
+  // there is only a default is worse than knowing it is a default.
+  const pushBlocked = allowLocked && (!singleTarget || !branchOk);
+
+  const needsConfirm = !dryDcs || allowShrink || allowLocked;
 
   const doPush = useCallback(() => {
     setError(null);
@@ -550,10 +615,12 @@ function PushCard({ bookOptions }: { bookOptions: string[] }) {
         resource: resource || undefined,
         dryDcs,
         allowShrink,
+        ...(allowLocked ? { allowLocked: true } : {}),
+        ...(allowLocked && stageForReview ? { branchName } : {}),
       })
       .then((res) => setRunId(res.id))
       .catch((e) => setError(String(e)));
-  }, [book, resource, dryDcs, allowShrink]);
+  }, [book, resource, dryDcs, allowShrink, allowLocked, stageForReview, branchName]);
 
   const handlePushClick = () => {
     if (needsConfirm) setConfirmOpen(true);
@@ -601,7 +668,73 @@ function PushCard({ bookOptions }: { bookOptions: string[] }) {
           }
           label="Override the row-deletion guard"
         />
-        <Button variant="contained" onClick={handlePushClick}>
+        <FormControlLabel
+          control={
+            <Checkbox
+              checked={allowLocked}
+              disabled={!singleTarget}
+              onChange={(e) => setAllowLocked(e.target.checked)}
+            />
+          }
+          label={
+            bookIsLocked
+              ? `Override the book lock (${book} is frozen)`
+              : "Override the book lock (published or frozen book)"
+          }
+        />
+        {!singleTarget && (
+          <Typography variant="caption" color="text.secondary" sx={{ mt: -1, ml: 4 }}>
+            Pick one book and one resource to enable the lock and deletion overrides.
+          </Typography>
+        )}
+        {allowLocked && (
+          <Box sx={{ ml: 4, pl: 1.5, borderLeft: 2, borderColor: "warning.main" }}>
+            <FormControlLabel
+              control={
+                <Checkbox checked={stageForReview} onChange={(e) => setStageForReview(e.target.checked)} />
+              }
+              label="Stage for maintainer review (don't publish straight to master)"
+            />
+            {/* The likeliest wrong action in this form: stage a published-book
+                fix with "Render only" still ticked (it defaults ON), read a green
+                run, and believe the fix is waiting for a maintainer when nothing
+                was pushed at all. Said here, next to the decision, rather than
+                only in the confirm dialog. */}
+            {dryDcs && (
+              <Alert severity="info" sx={{ mt: 0.5 }}>
+                “Render only” is ticked, so this will not push or stage anything. Untick it to
+                actually {stageForReview ? "stage this for review" : "publish this"}.
+              </Alert>
+            )}
+            {stageForReview ? (
+              <>
+                <TextField
+                  size="small"
+                  fullWidth
+                  label="Branch name"
+                  value={branchName}
+                  onChange={(e) => setBranchName(e.target.value)}
+                  error={!branchOk}
+                  helperText={
+                    branchOk
+                      ? "Lands on this branch and opens a PR. No DCS check runs on it and nothing auto-merges — a maintainer reviews, merges, and re-releases."
+                      : branchName.includes("-be-")
+                        ? "Can’t contain “-be-” in any case — that’s the pattern Door43 auto-merges, which is what staging avoids."
+                        : "Letters, numbers, dot, dash, underscore. Must start with a letter or number."
+                  }
+                  sx={{ mt: 0.5 }}
+                />
+              </>
+            ) : (
+              <Alert severity="warning" sx={{ mt: 0.5 }}>
+                This publishes straight to master and Door43 will merge it without review. Right for a
+                quick fix you own; wrong for a released book, where re-cutting the release is the
+                maintainer's call.
+              </Alert>
+            )}
+          </Box>
+        )}
+        <Button variant="contained" onClick={handlePushClick} disabled={pushBlocked}>
           Push
         </Button>
         {error && <Alert severity="error">{error}</Alert>}
@@ -610,13 +743,22 @@ function PushCard({ bookOptions }: { bookOptions: string[] }) {
       <ConfirmDialog
         open={confirmOpen}
         title="Push to Door43?"
-        description={
-          !dryDcs && allowShrink
-            ? `This will write ${resource ? RESOURCE_LABELS[resource] : "all resources"} for ${book || "all books"} to Door43 and skip the row-deletion guard, so rows can be deleted on the far side.`
-            : !dryDcs
-              ? `This will write ${resource ? RESOURCE_LABELS[resource] : "all resources"} for ${book || "all books"} to Door43.`
-              : `This will render (but not push) with the row-deletion guard overridden for ${book || "all books"} / ${resource ? RESOURCE_LABELS[resource] : "all resources"}.`
-        }
+        description={(() => {
+          const what = `${resource ? RESOURCE_LABELS[resource] : "all resources"} for ${book || "all books"}`;
+          // Lock override leads, because it is the only one of these that can
+          // rewrite a released book — say which of the two intents is about to
+          // run, in those words, before anything is pushed.
+          if (allowLocked) {
+            const lockPart = `${book} is frozen${bookIsLocked ? "" : " (or will be treated as such)"}, and this overrides that.`;
+            return stageForReview
+              ? `${lockPart} ${what} will be staged on “${branchName}” and left as a PR for a maintainer to review, merge, and re-release. Nothing lands on master by itself.${dryDcs ? " (Render only is still ticked, so nothing is pushed at all.)" : ""}`
+              : `${lockPart} ${what} will be written to master and Door43 will merge it WITHOUT review. For a published book that rewrites a released resource.${dryDcs ? " (Render only is still ticked, so nothing is pushed at all.)" : ""}`;
+          }
+          if (!dryDcs && allowShrink)
+            return `This will write ${what} to Door43 and skip the row-deletion guard, so rows can be deleted on the far side.`;
+          if (!dryDcs) return `This will write ${what} to Door43.`;
+          return `This will render (but not push) with the row-deletion guard overridden for ${book || "all books"} / ${resource ? RESOURCE_LABELS[resource] : "all resources"}.`;
+        })()}
         confirmLabel="Push"
         confirmColor="warning"
         cancelLabel="Cancel"
@@ -815,18 +957,28 @@ function RecentRuns() {
 
 function RunTab() {
   const [books, setBooks] = useState<string[]>([]);
+  // The same response already carries each book's lock state; it was being
+  // discarded. PushCard needs it to say "MIC is frozen" rather than making the
+  // operator remember which books are published.
+  const [lockedBooks, setLockedBooks] = useState<Set<string>>(new Set());
 
   useEffect(() => {
     api
       .getAdminSyncStatus()
-      .then((res) => setBooks(res.books.map((b) => b.book)))
-      .catch(() => setBooks([]));
+      .then((res) => {
+        setBooks(res.books.map((b) => b.book));
+        setLockedBooks(new Set(res.books.filter((b) => b.locked).map((b) => b.book)));
+      })
+      .catch(() => {
+        setBooks([]);
+        setLockedBooks(new Set());
+      });
   }, []);
 
   return (
     <Stack spacing={3}>
       <Stack direction="row" spacing={2}>
-        <PushCard bookOptions={books} />
+        <PushCard bookOptions={books} lockedBooks={lockedBooks} />
         <PullCard bookOptions={books} />
       </Stack>
       <RecentRuns />

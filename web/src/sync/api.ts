@@ -1393,11 +1393,38 @@ export interface RunExportRequest {
   dryDcs?: boolean;
   validateAndMerge?: boolean;
   allowShrink?: boolean;
+  // Override the book-lock gate, for a deliberate fix to a frozen (published or
+  // explicitly locked) book. Honored only for a single named book AND resource.
+  allowLocked?: boolean;
+  // Land the export on this branch instead of the generated `{BOOK}-be-…`.
+  // Must not contain `-be-` (that substring is what makes DCS auto-merge), so
+  // this is how a published-book fix becomes a PR a maintainer reviews rather
+  // than a commit on master. Server 400s with `invalid_branch_name` on a bad one.
+  branchName?: string;
 }
 
 export interface RunExportResponse {
   id: string;
   status: string;
+}
+
+// The branch a locked-book fix is staged on, PER BOOK. Used by every surface that
+// can stage one (the admin Run tab and the book-locks push prompt) so the name is
+// recognizable to whoever finds it on Door43.
+//
+// The book code is not decoration — a single shared name silently destroys work.
+// commitToDcs calls resetExportBranchToMaster unconditionally, which force-moves
+// the branch ref to master's SHA, and ensureDcsPr reuses any open PR for that head
+// (title and body are written only at creation). So staging MIC tn and then HOS tn
+// on one shared branch, in the one en_tn repo, would reset away MIC's commit and
+// leave the maintainer reviewing a PR still titled MIC whose diff is HOS — with no
+// error anywhere. Per-book names cannot collide; re-staging the SAME book is the
+// case where reset-and-reuse is exactly right.
+//
+// Stays free of the `-be-` substring (the pattern DCS auto-merges): book codes are
+// uppercase and the check is case-sensitive, so no code can introduce it.
+export function reviewBranchFor(book: string): string {
+  return `BibleEditor-restoration-${book.toUpperCase()}`;
 }
 
 // POST /api/books/:book/lock/push — one Workflow instance per resource, since
@@ -1507,9 +1534,15 @@ export const api = {
   // instead of waiting for the nightly export. Same lock-admin gate as
   // lockBook/unlockBook above (not requireAdmin) — server 400s with
   // { error: "book_not_locked" } if called on an unlocked book.
-  pushLockedBookToDoor43: (book: string) =>
+  // `branchName` switches the intent from "publish now" (default: pushes to the
+  // generated `-be-` branch, which DCS auto-merges onto master) to "stage for
+  // review" (pushes to the named branch, no auto-merge, PR left for a
+  // maintainer). Use it for a PUBLISHED book, where re-cutting the release is
+  // the maintainer's call, not ours.
+  pushLockedBookToDoor43: (book: string, branchName?: string) =>
     request<PushLockedBookResponse>(`/api/books/${encodeURIComponent(book)}/lock/push`, {
       method: "POST",
+      ...(branchName ? { body: JSON.stringify({ branchName }) } : {}),
     }),
 
   // Trigger a server-side import of a book from DCS. Long-running: ~5-60s

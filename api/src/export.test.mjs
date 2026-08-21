@@ -5,7 +5,7 @@
 // instead of getting silently flattened to `\v 6`. Not a test framework;
 // failures exit non-zero.
 
-import { attributeTsvShrink, branchOverrideAllowed, prunableBranches, exportBranchOverrideValid, buildAlignmentShrinkAlertMessage, buildUsfmInvalidAlertMessage, classifyAlignmentLossSeverity, offenderProvenanceFromLog, buildExportBranch, buildTnTsv, buildTqTsv, buildTwlTsv, buildUsfm, classifyAlignmentShrinkOffenders, classifyRevertSeverity, commitToDcs, countDuplicateMasterIds, describeShrinkRefusal, ensureDcsPr, exportTags, exportTsvShrinkRefused, findDcsOpenPr, isMasterConfirmed, mechanicalOverwriteAlert, parseTsvIds, recreateExportBranchFromMaster, shouldRecordRevertReport, tsvRevertReport, updateDcsPrBranch, usfmAlignmentShrinkRefused, usfmRevertReport } from "./export.ts";
+import { attributeTsvShrink, branchOverrideAllowed, lockPushExportParams, prunableBranches, exportBranchOverrideValid, buildAlignmentShrinkAlertMessage, buildUsfmInvalidAlertMessage, classifyAlignmentLossSeverity, offenderProvenanceFromLog, buildExportBranch, buildTnTsv, buildTqTsv, buildTwlTsv, buildUsfm, classifyAlignmentShrinkOffenders, classifyRevertSeverity, commitToDcs, countDuplicateMasterIds, describeShrinkRefusal, ensureDcsPr, exportTags, exportTsvShrinkRefused, findDcsOpenPr, isMasterConfirmed, mechanicalOverwriteAlert, parseTsvIds, recreateExportBranchFromMaster, shouldRecordRevertReport, tsvRevertReport, updateDcsPrBranch, usfmAlignmentShrinkRefused, usfmRevertReport } from "./export.ts";
 import { CorruptContentJsonError } from "./contentJson.ts";
 import { extractVersesForRange } from "./importParsers.ts";
 import { validateUsfm } from "./usfmValidate.ts";
@@ -353,6 +353,12 @@ function utf8Base64(s) {
   // one would silently restore the auto-merge it exists to prevent.
   assert(exportBranchOverrideValid("BibleEditor-data-restoration"), `the real restoration branch name is valid`);
   assert(!exportBranchOverrideValid("MIC-be-restore"), `a name carrying "-be-" is REFUSED`);
+  // Rejected case-insensitively, deliberately stricter than the DCS glob: a false
+  // refusal costs nothing, whereas waving through a name that a case-folding
+  // merge bot would auto-merge rewrites a released book.
+  for (const cased of ["MIC-BE-x", "MIC-Be-x", "MIC-bE-x"]) {
+    assert(!exportBranchOverrideValid(cased), `"${cased}" is refused regardless of case`);
+  }
   assert(!exportBranchOverrideValid("MIC-be-"), `trailing "-be-" also refused`);
   assert(exportBranchOverrideValid("MIC-be"), `suffix-less "-be" does not match the DCS glob, so it is allowed`);
   // git ref rules the character class alone doesn't cover.
@@ -1060,6 +1066,53 @@ function utf8Base64(s) {
     result.explained === missingCount && result.unexplained === 0,
     `1CH TQ: all ${missingCount} missing rows explained`,
   );
+}
+
+// --- lockPushExportParams: staging must switch auto-merge OFF ---
+{
+  // Default: the intent this route was built for — a lock admin fixed something
+  // in a book they just re-locked and wants it live.
+  const publishNow = lockPushExportParams("MIC", "tn");
+  assert(publishNow.allowLocked === true, `publish-now clears the lock gate`);
+  assert(publishNow.validateAndMerge === true, `publish-now asks DCS to merge`);
+  assert(publishNow.branchName === undefined, `publish-now uses the generated -be- branch`);
+
+  // Staging: a published-book fix a maintainer must review.
+  const staged = lockPushExportParams("MIC", "tn", "BibleEditor-restoration-MIC");
+  assert(staged.allowLocked === true, `staged run still clears the lock gate`);
+  assert(staged.validateAndMerge === false, `staging sets validateAndMerge false`);
+  assert(staged.branchName === "BibleEditor-restoration-MIC", `staged run carries the branch`);
+
+  // THE REAL GUARD. `-be-` is what DCS's workflows trigger on, so an auto-merging
+  // name must not be usable as a "staging" branch. Asserting
+  // !staged.branchName.includes("-be-") would only re-test the literal passed in
+  // on the line above — this asserts the FUNCTION rejects it.
+  for (const unsafe of ["MIC-be-x", "X-be-Y", "a-be-b"]) {
+    let threw = false;
+    try {
+      lockPushExportParams("MIC", "tn", unsafe);
+    } catch {
+      threw = true;
+    }
+    assert(threw, `lockPushExportParams refuses the auto-merging name ${unsafe}`);
+  }
+  // ...and refuses a name that is not a legal git ref, for the same reason: a
+  // push that fails late is better than one that lands somewhere unintended.
+  for (const bad of ["", "-leading", "has space", "trailing.", "dots..here", "x.lock"]) {
+    let threw = false;
+    try {
+      lockPushExportParams("MIC", "tn", bad);
+    } catch {
+      threw = true;
+    }
+    assert(threw, `lockPushExportParams refuses the invalid ref ${JSON.stringify(bad)}`);
+  }
+  // book/resource are always named explicitly: allowLocked is only honored for a
+  // single-book, single-resource run, so omitting either would silently disable
+  // the override and skip every resource as book_locked.
+  for (const p of [publishNow, staged]) {
+    assert(p.book === "MIC" && p.resource === "tn", `book and resource are always named`);
+  }
 }
 
 // --- prunableBranches: never delete a branch a human is reviewing ---

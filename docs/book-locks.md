@@ -119,26 +119,77 @@ in the app. Re-locking a book (going from unlocked to locked) offers a "Push
 to Door43 now?" prompt, so a fix made during the unlocked window doesn't sit
 in D1 until the next nightly export. Confirming calls
 `POST /api/books/:book/lock/push`, which fires one Workflow instance per
-resource (ult/ust/tn/tq/twl), each carrying `allowLocked: true` and
-`validateAndMerge: true` — see `books.post("/:book/lock/push", ...)` in
-`api/src/bookImport.ts`. This route is gated on `canManageLocks` (the
+resource (ult/ust/tn/tq/twl), each carrying `allowLocked: true` — see
+`books.post("/:book/lock/push", ...)` in `api/src/bookImport.ts`.
+
+The prompt asks which of two things you mean, and **defaults to the safer one**:
+
+- **Stage for maintainer review** (default) — sends an optional `branchName` in
+  the body, which the route validates and passes through
+  `lockPushExportParams`. The push lands on `BibleEditor-restoration-{BOOK}`
+  (per-book, deliberately: one shared branch would be force-reset by the next
+  book's push and would reuse the first book's open PR, silently replacing its
+  contents) and opens a PR. That name carries no `-be-`, so DCS's validate
+  workflow never fires and its merge bot never merges — merging, and re-cutting
+  a release if the book is in one, stay a maintainer's decision.
+- **Publish now** — no `branchName`, so the push goes to the generated
+  `{BOOK}-be-{contributors}` branch that DCS auto-merges to master. Right for a
+  fix you own; wrong for a book that is in a cut release.
+
+An unknown key in the body is a `400`, not a silent fallback: dropping a
+misspelled `branchName` would publish unreviewed while the caller believed they
+had asked for review.
+
+The same choice is available in the admin panel's Run tab, via an "Override the
+book lock" checkbox (enabled only for a single book + single resource, which is
+all `lockOverrideAllowed` honors) plus a staging checkbox and branch field.
+
+This route is gated on `canManageLocks` (the
 `book_lock_admins` allowlist), not `requireAdmin`: Perry (`pjoakes`) is a lock
 admin but only an `editor` in `user_roles`, so he can't reach
 `POST /api/exports/run` (the admin panel's manual push) — the prompt has to
 use the narrower gate to work for him too.
 
-**One-off export override** — for pushing a fix without opening the app:
+**One-off export override** — for pushing a fix without opening the app. The
+default here is the same as in the app: **stage for review**, because a locked
+book is usually one that is in a cut release.
 
 ```bash
-curl -X POST .../api/exports/run -d '{"book":"PSA","resource":"tn","allowLocked":true}'
+curl -X POST .../api/exports/run \
+  -H 'Content-Type: application/json' \
+  -d '{"book":"PSA","resource":"tn","allowLocked":true,"branchName":"BibleEditor-restoration-PSA"}'
 ```
 
-`allowLocked` is honored **only** when the run resolves to exactly one book and
-one resource, so no cron path can ever carry it — the same doctrine as
-`allowShrink` (see `api/src/shrinkGuard.ts` for why the check is on the resolved
-counts and not the raw parameters). Using it writes an audit alert. This route
-requires `requireAdmin` (a `user_roles` admin), a stricter gate than the
-in-app prompt above.
+Keep `branchName` per-book (`BibleEditor-restoration-{BOOK}`). One shared name
+across books does not work: the export force-resets the branch ref to master and
+reuses whatever PR is already open on that head, so a second book's push
+overwrites the first and leaves its PR showing the wrong diff.
+
+To publish straight to master instead — auto-merged by DCS, no review — drop
+`branchName`. Correct for a fix you own in a book you just re-locked; **wrong**
+for a book that is in a release, where re-cutting it is the maintainer's call:
+
+```bash
+curl -X POST .../api/exports/run \
+  -H 'Content-Type: application/json' \
+  -d '{"book":"PSA","resource":"tn","allowLocked":true}'
+```
+
+Both bodies are validated `.strict()`, so a misspelled key (`branch_name`,
+`branchNames`) is a `400` rather than a silent drop — dropping it would publish
+unreviewed while you believed you had staged.
+
+`allowLocked` and `branchName` are honored **only** when the run resolves to
+exactly one book and one resource, so no cron path can ever carry them — the same
+doctrine as `allowShrink` (see `api/src/shrinkGuard.ts` for why the check is on
+the resolved counts and not the raw parameters). Using `allowLocked` writes an
+audit alert. This route requires `requireAdmin` (a `user_roles` admin), a
+stricter gate than the in-app prompt above.
+
+**One stage at a time per book × resource.** Two overlapping staged pushes of the
+same book and resource share one branch ref and one open PR, and the PR's title
+and body are written only when it is created — so the second push wins the
+content silently. Let one finish (or be merged) before starting another.
 
 ## Data model
 

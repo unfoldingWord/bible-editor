@@ -25,6 +25,8 @@ import { reimportBookFromDcs, recordResourceSync, ALL_RESOURCES, type Resource }
 import { lintChapterOpeningMarkers, lintPairedPunctuation, lintTnRows, lintTqRows, lintTwlRows, lintUsfmVerses, lintVerseTextQuality } from "./lint";
 import { effectiveBookLock, canManageLocks, type BookLock } from "./bookLock";
 import { isPublishedBook } from "./publishedGuard";
+import { exportBranchOverrideValid, lockPushExportParams } from "./export";
+import { LockPushBody } from "./exportRequestBodies";
 import type { TnRow, TqRow, TwlRow, VerseRow } from "./types";
 
 export const books = new Hono<{ Bindings: Env; Variables: { userId?: number; username?: string } }>();
@@ -218,8 +220,28 @@ books.delete("/:book/lock", requireEditor, async (c) => {
 // exactly-one-book-one-resource run (see publishedGuard.ts) — a single
 // instance with resource omitted would resolve to all 5 resources and the
 // override would be silently ignored, leaving every resource skipped as
-// book_locked. validateAndMerge mirrors the nightly cron so this actually
-// lands on master rather than leaving a PR for someone to merge by hand.
+// book_locked. Whether this lands on master or waits for a maintainer depends on
+// the intent the caller chose — see the note on the two intents below.
+// TWO INTENTS, and conflating them is how a released book gets rewritten
+// unreviewed. The default above ("publish now") is right for the scenario this
+// route was built for: a lock admin unlocked a book, fixed something, re-locked
+// it, and wants that live. But a correction to a PUBLISHED book — one whose
+// content is in a cut release — is not theirs to publish; a uW maintainer has to
+// review it and re-cut the release. Those runs pass `branchName`, which lands the
+// work on a branch DCS will not auto-merge (see branchOverrideAllowed in
+// export.ts) and turns off validateAndMerge, so the result is a PR waiting for a
+// human instead of a commit on master.
+//
+// `branchName` is optional so existing callers keep today's behavior exactly.
+// .strict() is load-bearing, not tidiness. A non-strict schema drops unknown keys
+// silently, so `{"branch_name":"X"}` or a typo'd `{"branchNames":"X"}` would 200
+// and then publish-now — auto-merged to master — while the caller believed they
+// had asked for review. That is the same consequence the invalid-name 400 below
+// exists to prevent, so it fails the same way instead of failing open.
+// The schema itself lives in exportRequestBodies.ts, beside /exports/run's, so
+// both routes' strictness is covered by one unit test rather than trusting a
+// route harness neither of them has.
+
 books.post("/:book/lock/push", requireEditor, async (c) => {
   const userId = currentUserId(c);
   if (!userId) return c.json({ error: "unauthorized" }, 401);
@@ -230,6 +252,32 @@ books.post("/:book/lock/push", requireEditor, async (c) => {
 
   const book = c.req.param("book").toUpperCase();
   if (!BOOK_NUMBERS[book]) return c.json({ error: "unknown_book", book }, 400);
+
+  // Read the body defensively: this route accepted none until now, and existing
+  // callers send an empty one. (They DO set Content-Type: application/json —
+  // web/src/sync/api.ts's request() sets it unconditionally — which is why this
+  // reads text() and parses by hand rather than trusting the header.)
+  let branchName: string | undefined;
+  {
+    const text = await c.req.text().catch(() => "");
+    if (text.trim()) {
+      let parsedBody: unknown;
+      try {
+        parsedBody = JSON.parse(text);
+      } catch {
+        return c.json({ error: "invalid_body" }, 400);
+      }
+      const parsed = LockPushBody.safeParse(parsedBody);
+      if (!parsed.success) return c.json({ error: "invalid_body" }, 400);
+      branchName = parsed.data.branchName;
+    }
+  }
+  // Rejected here rather than left for the workflow to ignore. A silently
+  // dropped override falls back to `{BOOK}-be-…`, which DCS auto-merges — the
+  // exact outcome the caller asked to avoid, and they would have no way to tell.
+  if (branchName !== undefined && !exportBranchOverrideValid(branchName)) {
+    return c.json({ error: "invalid_branch_name", branchName }, 400);
+  }
 
   const lock = await effectiveBookLock(c.env, book);
   if (!lock) return c.json({ error: "book_not_locked", book }, 400);
@@ -248,7 +296,9 @@ books.post("/:book/lock/push", requireEditor, async (c) => {
       try {
         const instance = await c.env.EXPORT_WORKFLOW.create({
           id: `lock-push-${book}-${resource}-${stamp}`,
-          params: { book, resource, allowLocked: true, validateAndMerge: true },
+          // See lockPushExportParams in export.ts for why staging must turn
+          // validateAndMerge off, and for the test that pins it.
+          params: lockPushExportParams(book, resource, branchName),
         });
         return { resource, instanceId: instance.id };
       } catch (e) {
@@ -265,7 +315,18 @@ books.post("/:book/lock/push", requireEditor, async (c) => {
   // that actually ran.
   try {
     const dispatched = pushed.filter((p) => "instanceId" in p).length;
-    const outcome = `dispatched ${dispatched}/${pushed.length}`;
+    // Records WHICH intent ran, not just how many fired — "did this push go
+    // straight to master or wait for review?" is the first question anyone asks
+    // of a published book afterwards.
+    // "staged on X" only when something actually dispatched — at 0/5 nothing was
+    // staged anywhere, and an audit row claiming otherwise is the one place a
+    // later investigator has no way to check.
+    const outcome =
+      branchName && dispatched > 0
+        ? `dispatched ${dispatched}/${pushed.length} staged on ${branchName}`
+        : branchName
+          ? `dispatched 0/${pushed.length} (intended to stage on ${branchName})`
+          : `dispatched ${dispatched}/${pushed.length}`;
     await c.env.DB.prepare(
       `INSERT INTO book_lock_events (book, locked, reason, action, user_id) VALUES (?1, 1, ?2, 'lock_push', ?3)`,
     )

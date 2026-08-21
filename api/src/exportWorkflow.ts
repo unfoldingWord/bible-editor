@@ -1103,19 +1103,30 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
         try {
           const pr = await ensureDcsPr(
             dcsCfg,
+            // Deliberately says only what is MEASURED. An earlier version titled
+            // every override PR "data restoration" and asserted the branch was
+            // "restoring translator edits that an earlier sync overwrote" on a
+            // "published book" — but staging is offered for any locked book (a
+            // book can be locked by an explicit book_locks row without being
+            // published) and for any fix, a typo included. Telling a maintainer a
+            // specific cause nobody measured is the same failure this codebase
+            // has already been bitten by in its alert wording.
             branchOverride
-              ? `bible-editor data restoration: ${book} ${resource} → master`
+              ? `bible-editor: ${book} ${resource} → master (review requested)`
               : `bible-editor: ${book} ${resource} → master`,
             branchOverride
-              ? `Opened by a bible-editor **data-restoration** export of ${book} ${resource.toUpperCase()}, ` +
-                  `restoring translator edits that an earlier sync overwrote with Door43's version.\n\n` +
-                  `**This branch is deliberately not named \`*-be-*\`**, so DCS's validate-and-merge ` +
-                  `workflow neither validates nor auto-merges it. ${book} is a published book — this is ` +
-                  `for a uW maintainer to review, merge, and re-release by hand.\n\n` +
+              ? `Opened by a bible-editor export of ${book} ${resource.toUpperCase()} that was ` +
+                  `explicitly staged for review rather than published.\n\n` +
+                  `${book} is frozen in the app (published, or locked by hand), so an editor used the ` +
+                  `lock override to get this change out. **This branch is deliberately not named ` +
+                  `\`*-be-*\`**, which means DCS's validate-and-merge workflow neither validates nor ` +
+                  `auto-merges it: merging and, if ${book} is in a release, re-cutting that release are ` +
+                  `yours to decide.\n\n` +
                   `⚠️ A green combined status on this PR means **no checks ran**, not that it passed ` +
-                  `validation (Gitea counts skipped checks as success). The content was validated by ` +
-                  `bible-editor's own ${resource === "ult" || resource === "ust" ? "USFM" : "TSV"} ` +
-                  `checks before the push.`
+                  `validation (Gitea counts skipped checks as success). bible-editor ran its own ` +
+                  `${resource === "ult" || resource === "ust" ? "USFM" : "TSV"} checks before pushing.\n\n` +
+                  `Ask whoever staged it what changed and why — this PR body only knows that review ` +
+                  `was requested, not the reason.`
               : `Auto-opened by the bible-editor nightly export so the DCS validate-and-merge workflow can process \`${branch}\`. Holds the latest ${resource.toUpperCase()} edits for ${book}.`,
           );
           prNumber = pr.number;

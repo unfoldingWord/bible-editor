@@ -105,7 +105,13 @@ const BRANCH_OVERRIDE_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/;
 export function exportBranchOverrideValid(name: string): boolean {
   if (!BRANCH_OVERRIDE_RE.test(name)) return false;
   // The point of the override (see above) — never an auto-merging branch.
-  if (name.includes("-be-")) return false;
+  // Case-INSENSITIVE, which is deliberately stricter than the DCS glob we are
+  // guarding against. If that glob is literal, `MIC-BE-x` would not auto-merge
+  // and we reject a name that was technically safe — a harmless false refusal. If
+  // it ever lowercases the ref, `MIC-BE-x` WOULD auto-merge and a case-sensitive
+  // check here would have waved through exactly the branch this rejects. Only one
+  // of those two errors can rewrite a released book.
+  if (/-be-/i.test(name)) return false;
   // git ref rules the character class alone doesn't cover.
   if (name.endsWith(".lock") || name.endsWith(".") || name.includes("..")) return false;
   return true;
@@ -140,6 +146,47 @@ export function prunableBranches(
   return [...new Set([...stale.filter((b) => b.includes("-be-")), legacyBranch])].filter(
     (b) => b && b !== keepBranch,
   );
+}
+
+// The export params for one resource of a locked-book push (books.ts's
+// POST /:book/lock/push). Pure because the choice it encodes is the whole safety
+// property of that route and must not live only inside a handler that needs D1
+// and a Workflow binding to exercise.
+//
+// TWO INTENTS. Without `branchName` this is "publish now": the generated `-be-`
+// branch, which is what a lock admin wants after fixing something in a book they
+// just re-locked. With `branchName` it is "stage for review".
+//
+// WHAT ACTUALLY MAKES STAGING SAFE is the branch name alone. `-be-` is the
+// substring DCS's own workflows trigger on: the validate workflow fires on
+// `push: branches: ['*-be-*']` and the merge bot re-checks for it, so a branch
+// without it is neither validated nor merged by anything on their side. Hence the
+// hard guard below.
+//
+// `validateAndMerge` is set consistently with the intent, but do NOT read it as
+// the guard: postExport.ts ships `VALIDATORS = []` (TEMP DISABLED 2026-05-21), so
+// runPostExport is a no-op today, and even re-enabled it acts on the legacy
+// `live-snapshot → master` PR rather than on a staged branch. Stated plainly
+// because a future reader trusting this flag as the safety property would be
+// trusting nothing.
+export function lockPushExportParams(
+  book: string,
+  resource: Resource,
+  branchName?: string,
+): { book: string; resource: Resource; allowLocked: true; validateAndMerge: boolean; branchName?: string } {
+  if (branchName === undefined) {
+    return { book, resource, allowLocked: true, validateAndMerge: true };
+  }
+  // Defense in depth. Every caller validates first (bookImport.ts's /lock/push,
+  // exports.ts's /run, and branchOverrideAllowed downstream), so reaching here
+  // with an auto-merging name is a programming error — and the failure it would
+  // cause is the precise one staging exists to prevent: a published-book change
+  // merged to master with nobody reviewing. Throwing is the only safe direction;
+  // falling back to publish-now would silently BE that failure.
+  if (!exportBranchOverrideValid(branchName)) {
+    throw new Error(`lockPushExportParams: unsafe staging branch ${JSON.stringify(branchName)}`);
+  }
+  return { book, resource, allowLocked: true, validateAndMerge: false, branchName };
 }
 
 export function branchOverrideAllowed(
