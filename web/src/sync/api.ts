@@ -1280,7 +1280,7 @@ export interface AdminSyncStatusResponse {
 }
 
 // GET /api/admin/sync-activity — durable, admin-only log of non-blocking
-// "info"-kind alerts (issue #535), e.g. "shipped to Door43 and overwrote
+// "record"-kind alerts (issue #535), e.g. "shipped to Door43 and overwrote
 // master's content as expected". These no longer appear in fetchAlerts()'s
 // personal feed since they need no decision from anyone.
 export interface AdminSyncActivityEntry {
