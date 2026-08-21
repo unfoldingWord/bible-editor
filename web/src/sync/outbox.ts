@@ -30,6 +30,7 @@ import {
 import {
   eligibleForVersionThread,
   isMaxAttemptsBlocked,
+  shouldAnnounceResult,
   targetKey,
 } from "./outboxTargeting.ts";
 
@@ -936,7 +937,10 @@ async function drainPass() {
 
     // Persist the new status *before* notifying listeners. If a put() or
     // delete() throws, the catch below resets the op to pending so it
-    // doesn't strand at in_flight.
+    // doesn't strand at in_flight. `persisted` records which of those two
+    // happened, so the listener dispatch below can tell a genuine terminal
+    // exit from one that got walked back (issue #570).
+    let persisted = true;
     try {
       if (result.kind === "ok") {
         await (await db()).delete(STORE, next.id);
@@ -1025,6 +1029,7 @@ async function drainPass() {
         await (await db()).put(STORE, next);
       }
     } catch (persistErr) {
+      persisted = false;
       // Best-effort recovery — if IndexedDB itself failed, the op may be
       // half-written. Force pending so the next drain pass tries again.
       try {
@@ -1040,7 +1045,9 @@ async function drainPass() {
       }
     }
 
-    for (const l of resultListeners) l(next, result);
+    if (shouldAnnounceResult(result.kind, persisted)) {
+      for (const l of resultListeners) l(next, result);
+    }
     void notify();
   }
 }
