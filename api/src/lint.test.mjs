@@ -145,29 +145,38 @@ t("intra-word U+2060 joiner is NOT flagged as glued", () => {
 });
 
 // Multi-verse variant of verseFromUsfm: returns one VerseRow per \v in the
-// given text, across however many \c chapters it contains. Needed for the
-// cross-verse/cross-chapter quote-pairing tests below (verseFromUsfm only
-// ever returns chapter 1 verse 1).
+// given text, across however many \c chapters it contains (verseFromUsfm only
+// ever returns chapter 1 verse 1). Shared by the quote-pairing tests here and
+// the text-quality tests further down.
 //
-// The text-quality block further down has its own near-identical
-// versesFromUsfm. The two differ only in cases this block never exercises
-// (it surfaces chapter-front material as verse 0, and splits verse-range
-// keys). Kept separate to keep this a minimal hotfix, not because the
-// difference is load-bearing here — sharing one would mean hoisting that
-// declaration ~520 lines. See the consolidation follow-up issue.
-const quoteVersesFromUsfm = (usfmText) => {
-  const j = usfm.toJSON(usfmText);
-  const out = [];
-  for (const [chapterStr, versesObj] of Object.entries(j.chapters)) {
-    const chapter = Number(chapterStr);
-    if (!Number.isFinite(chapter)) continue;
-    for (const [verseStr, vObj] of Object.entries(versesObj)) {
-      const verse = Number(verseStr);
-      if (!Number.isFinite(verse)) continue;
-      out.push({ book: "1CH", chapter, verse, verse_end: null, bible_version: "ULT", version: 1, content_json: JSON.stringify({ verseObjects: vObj.verseObjects }) });
+// The row shape mirrors what the importer actually writes to D1, because
+// bookImport.ts hands the identical row set to all three linters
+// (lintUsfmVerses / lintVerseTextQuality / lintPairedPunctuation). So:
+// chapter-front material keys as "front" in usfm-js and lands as verse 0
+// (importParsers.ts:1418), and a "1-2" bridge key becomes one row carrying
+// both ends (importParsers.ts:1424), inverted ranges collapsing to a
+// singleton. No lint check reads verse_end today — `grep verse_end
+// api/src/lint.ts` is empty — but a fixture that lies about it is a trap.
+const versesFromUsfm = (usfmText) => {
+  const rows = [];
+  for (const [chStr, verses] of Object.entries(usfm.toJSON(usfmText).chapters ?? {})) {
+    for (const [vStr, obj] of Object.entries(verses ?? {})) {
+      let verse = 0;
+      let verseEnd = null;
+      if (vStr !== "front") {
+        const m = vStr.match(/^(\d+)(?:-(\d+))?$/);
+        if (!m) continue;
+        verse = Number(m[1]);
+        if (m[2] && Number(m[2]) > verse) verseEnd = Number(m[2]);
+      }
+      rows.push({
+        book: "1CH", chapter: Number(chStr), verse, verse_end: verseEnd,
+        bible_version: "ULT", version: 1,
+        content_json: JSON.stringify({ verseObjects: obj.verseObjects ?? [] }),
+      });
     }
   }
-  return out;
+  return rows;
 };
 
 // Unmatched curly quotation mark detector (#438).
@@ -192,7 +201,7 @@ t("an unclosed opening quote is NOT flagged (continuation-opener dialogue conven
 });
 t("continuation-opener dialogue (a paragraph break that re-opens without closing) is NOT flagged", () => {
   // "“first paragraph…" "“second paragraph…”" — two opens, one close.
-  const verses = quoteVersesFromUsfm("\\c 1\n\\p\n\\v 1 “first paragraph statement\n\\p\n\\v 2 “second paragraph statement.”\n");
+  const verses = versesFromUsfm("\\c 1\n\\p\n\\v 1 “first paragraph statement\n\\p\n\\v 2 “second paragraph statement.”\n");
   assert.equal(quoteChecks(lintUsfmVerses(verses)).length, 0);
 });
 t("unmatched closing curly quote (no opener anywhere earlier) IS flagged", () => {
@@ -210,25 +219,41 @@ t("straight quotes and apostrophes are NOT linted (out of scope)", () => {
 // state has to carry across an ordered sequence of verses, not reset at
 // every verse.
 t("quote opened in one verse and closed in a later verse of the same chapter is NOT flagged (ZEC 1:2/1:3 shape)", () => {
-  const verses = quoteVersesFromUsfm("\\c 1\n\\p\n\\v 1 word\n\\v 2 he said, “hello\n\\v 3 world.”\n");
+  const verses = versesFromUsfm("\\c 1\n\\p\n\\v 1 word\n\\v 2 he said, “hello\n\\v 3 world.”\n");
   assert.equal(quoteChecks(lintUsfmVerses(verses)).length, 0);
 });
 // Codex review round 2: chapter-scoping (round 1's fix) was ALSO wrong —
 // quoted speech can legitimately open near the end of one chapter and close
 // in the next, so a chapter boundary must not terminate a quotation either.
 t("quote opened near the end of one chapter and closed in the next chapter is NOT flagged (cross-chapter span)", () => {
-  const verses = quoteVersesFromUsfm("\\c 1\n\\p\n\\v 1 he said, “hello\n\\c 2\n\\p\n\\v 1 world.”\n");
+  const verses = versesFromUsfm("\\c 1\n\\p\n\\v 1 he said, “hello\n\\c 2\n\\p\n\\v 1 world.”\n");
   assert.equal(quoteChecks(lintUsfmVerses(verses)).length, 0);
 });
 t("two INDEPENDENT unmatched closing quotes in different chapters are both still flagged (one doesn't consume the other's opener)", () => {
-  const verses = quoteVersesFromUsfm("\\c 1\n\\p\n\\v 1 hello.”\n\\c 2\n\\p\n\\v 1 world.”\n");
+  const verses = versesFromUsfm("\\c 1\n\\p\n\\v 1 hello.”\n\\c 2\n\\p\n\\v 1 world.”\n");
   const issues = quoteChecks(lintUsfmVerses(verses));
   assert.equal(issues.length, 2);
   assert.deepEqual(issues.map((i) => i.ref).sort(), ["1:1", "2:1"]);
 });
 t("out-of-order verse rows are sorted before pairing (defensive against caller order)", () => {
-  const verses = quoteVersesFromUsfm("\\c 1\n\\p\n\\v 1 word\n\\v 2 he said, “hello\n\\v 3 world.”\n").reverse();
+  const verses = versesFromUsfm("\\c 1\n\\p\n\\v 1 word\n\\v 2 he said, “hello\n\\v 3 world.”\n").reverse();
   assert.equal(quoteChecks(lintUsfmVerses(verses)).length, 0);
+});
+// Pins the one behaviour the two former helpers disagreed about, now that they
+// share one that always emits chapter-front material as verse 0 (matching what
+// importParsers.ts writes to D1). The two checks genuinely differ, and both are
+// reachable in production because bookImport.ts feeds them the same rows:
+// lintUsfmVerses skips verse 0 outright (lint.ts:757), lintPairedPunctuation
+// does not. So the quote check cannot see a \d superscription at all — if that
+// is ever wanted, the fix belongs in lint.ts, not in a test fixture.
+t("an unmatched quote in chapter-front material is invisible to the quote check, but IS caught by paired punctuation", () => {
+  const verses = versesFromUsfm("\\c 1\n\\d A song of ascents.”\n\\p\n\\v 1 he said hello.\n");
+  assert.deepEqual(verses.map((v) => `${v.chapter}:${v.verse}`).sort(), ["1:0", "1:1"]);
+  assert.equal(quoteChecks(lintUsfmVerses(verses)).length, 0);
+  const p = lintPairedPunctuation(verses).filter((x) => x.check === "Paired punctuation");
+  assert.equal(p.length, 1);
+  assert.equal(p[0].ref, "1:0");
+  assert.match(p[0].message, /closing ” has no matching opening/);
 });
 
 // Reused-source-token detector (ZEC 14:8 UST doubled-Hebrew defect): a single
@@ -676,22 +701,7 @@ t("stale-DCS-claim detector catches every phrasing, spares innocent ones", () =>
 // scripts/scan-text-quality.mjs — see the PR for the corpus numbers.
 // ---------------------------------------------------------------------------
 
-// All verses of a book usfm string, in order (verseFromUsfm above returns only
-// 1:1). Chapter-front material keys as "front" in usfm-js → verse 0 here.
-const versesFromUsfm = (usfmText) => {
-  const j = usfm.toJSON(usfmText);
-  const rows = [];
-  for (const [chStr, verses] of Object.entries(j.chapters ?? {})) {
-    for (const [vStr, obj] of Object.entries(verses)) {
-      rows.push({
-        book: "1CH", chapter: Number(chStr), verse: vStr === "front" ? 0 : Number(vStr.split("-")[0]),
-        verse_end: null, bible_version: "ULT", version: 1,
-        content_json: JSON.stringify({ verseObjects: obj.verseObjects ?? [] }),
-      });
-    }
-  }
-  return rows;
-};
+// versesFromUsfm is declared once, above the quote-pairing block.
 const quality = (usfmText) => lintVerseTextQuality(versesFromUsfm(usfmText));
 const paired = (usfmText) => lintPairedPunctuation(versesFromUsfm(usfmText));
 
