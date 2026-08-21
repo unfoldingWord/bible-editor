@@ -2328,10 +2328,13 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       // region holds a split-unit word like "Yahweh's" that disqualifies the
       // occurrence-keyed reassembly tier — ZEC 9:1). Rather than DISCARD the
       // translator's keystroke draft, surface the same confirm the aligner uses;
-      // on "Save anyway" re-enqueue with the alignment_edit intent — the only
-      // guard-exempt intent, mirrored in the API (verses.ts), so the PATCH MUST
-      // climb as alignment_edit or it is rejected there too. The affected words
-      // land unaligned for the translator to re-align in the Alignment panel.
+      // on "Save anyway" re-enqueue with the confirmed_text_edit intent — a
+      // guard-exempt intent (issue #575) mirrored in the API (verses.ts), so
+      // the PATCH MUST climb as confirmed_text_edit or it is rejected there
+      // too. Distinct from "alignment_edit" (a real aligner-panel save) even
+      // though both are equally guard-exempt: this save's intent is still a
+      // text edit, not a deliberate re-alignment. The affected words land
+      // unaligned for the translator to re-align in the Alignment panel.
       if (intent === "text_edit") {
         setPendingAlignmentLoss({
           ref: `${book} ${chapterNum}:${verseNum} ${bibleVersion}`,
@@ -2343,7 +2346,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
               verseNum,
               bibleVersion,
               expectedVersion,
-              { content, plain_text: plainText, alignment_intent: "alignment_edit" },
+              { content, plain_text: plainText, alignment_intent: "confirmed_text_edit" },
               { draftGeneration },
             );
             onConfirmedApply?.();
@@ -2825,8 +2828,9 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // saveVerseDraft, there is no smartEditVerse pass — we re-save the exact
   // stored content tree verbatim (alignment milestones included). It routes
   // through the same pipe with the alignment_edit intent: a deliberate
-  // full-tree replacement legitimately changes alignment, and that is the only
-  // intent the collateral-loss guard exempts (guardBlocksSave). The version
+  // full-tree replacement legitimately changes alignment, and that intent
+  // (alongside confirmed_text_edit, issue #575) is exempt from the
+  // collateral-loss guard (guardBlocksSave). The version
   // climbs normally, so the new entry's content matches the restored one — no
   // restored_from_version bookkeeping needed (unlike notes).
   const restoreVerse = (

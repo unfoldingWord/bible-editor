@@ -1,7 +1,8 @@
-// Internal admin tool (two users, not a product surface). Four tabs:
-// sync status, run (push/pull), pull requests, users. See task spec in the
-// PR description / CLAUDE.md session notes for the full API contract this
-// codes against — the backend is built to the same contract in parallel.
+// Internal admin tool (two users, not a product surface). Five tabs:
+// sync status, sync activity, run (push/pull), pull requests, users. See task
+// spec in the PR description / CLAUDE.md session notes for the full API
+// contract this codes against — the backend is built to the same contract in
+// parallel.
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   Alert,
@@ -40,6 +41,7 @@ import {
   type AdminImportResult,
   type AdminPr,
   type AdminResourceSyncStatus,
+  type AdminSyncActivityEntry,
   type AdminUser,
   type ExportSnapshotRow,
   type ExportInstanceStatus,
@@ -284,6 +286,104 @@ function SyncStatusTab() {
                   ))}
                 </TableRow>
               ))}
+            </TableBody>
+          </Table>
+        </TableContainer>
+      )}
+    </Stack>
+  );
+}
+
+// ── Tab: Sync activity ───────────────────────────────────────────────────
+
+// `source` for these entries is always `export_revert:${book}:${resource}` or
+// `mechanical_overwrite:${book}:${resource}` today (see admin.ts's
+// /sync-activity route) — parsed just for a compact Book/Resource column;
+// falls back to showing the raw source if a future source doesn't fit that
+// shape rather than hiding the row.
+function parseActivitySource(source: string): { label: string; book: string | null } {
+  const parts = source.split(":");
+  if (parts.length === 3) {
+    const [, book, resource] = parts;
+    return { label: `${book} ${resource.toUpperCase()}`, book };
+  }
+  return { label: source, book: null };
+}
+
+function SyncActivityTab() {
+  const [entries, setEntries] = useState<AdminSyncActivityEntry[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [filter, setFilter] = useState("");
+
+  const load = useCallback(() => {
+    setLoading(true);
+    setError(null);
+    api
+      .getAdminSyncActivity()
+      .then((res) => setEntries(res.entries))
+      .catch((e) => setError(String(e)))
+      .finally(() => setLoading(false));
+  }, []);
+
+  useEffect(() => load(), [load]);
+
+  const filtered = useMemo(() => {
+    const f = filter.trim().toLowerCase();
+    if (!f) return entries;
+    return entries.filter(
+      (e) => e.source.toLowerCase().includes(f) || e.message.toLowerCase().includes(f),
+    );
+  }, [entries, filter]);
+
+  return (
+    <Stack spacing={2}>
+      <Typography variant="body2" color="text.secondary">
+        Non-blocking export/sync records that need no action — "master was overwritten as expected"
+        and similar. Actionable alerts (a stale sync, a blocked export, a merge conflict needing
+        review) still show up as banners for the affected user; this is just the log.
+      </Typography>
+      <Stack direction="row" spacing={2} alignItems="center">
+        <TextField
+          size="small"
+          label="Filter by book or text"
+          value={filter}
+          onChange={(e) => setFilter(e.target.value)}
+        />
+        <IconButton onClick={load} title="Refresh">
+          <RefreshIcon fontSize="small" />
+        </IconButton>
+      </Stack>
+      {error && <Alert severity="error">Failed to load sync activity: {error}</Alert>}
+      {loading ? (
+        <Box sx={{ display: "flex", justifyContent: "center", p: 4 }}>
+          <CircularProgress size={24} />
+        </Box>
+      ) : filtered.length === 0 ? (
+        <Typography variant="body2" color="text.secondary">
+          Nothing recorded yet.
+        </Typography>
+      ) : (
+        <TableContainer component={Paper} variant="outlined">
+          <Table size="small">
+            <TableHead>
+              <TableRow>
+                <TableCell>When</TableCell>
+                <TableCell>Book / resource</TableCell>
+                <TableCell>Message</TableCell>
+              </TableRow>
+            </TableHead>
+            <TableBody>
+              {filtered.map((e) => {
+                const { label } = parseActivitySource(e.source);
+                return (
+                  <TableRow key={e.id}>
+                    <TableCell sx={{ whiteSpace: "nowrap" }}>{fmtTime(e.createdAt)}</TableCell>
+                    <TableCell sx={{ whiteSpace: "nowrap" }}>{label}</TableCell>
+                    <TableCell>{e.message}</TableCell>
+                  </TableRow>
+                );
+              })}
             </TableBody>
           </Table>
         </TableContainer>
@@ -983,6 +1083,7 @@ export function AdminPanel({ onClose }: { onClose: () => void }) {
         <Box sx={{ flex: 1 }} />
         <Tabs value={tab} onChange={(_, v) => setTab(v)}>
           <Tab label="Sync status" />
+          <Tab label="Sync activity" />
           <Tab label="Run" />
           <Tab label="Pull requests" />
           <Tab label="Users" />
@@ -990,9 +1091,10 @@ export function AdminPanel({ onClose }: { onClose: () => void }) {
       </Stack>
       <Box sx={{ flex: 1, overflowY: "auto", p: 3 }}>
         {tab === 0 && <SyncStatusTab />}
-        {tab === 1 && <RunTab />}
-        {tab === 2 && <PrsTab />}
-        {tab === 3 && <UsersTab />}
+        {tab === 1 && <SyncActivityTab />}
+        {tab === 2 && <RunTab />}
+        {tab === 3 && <PrsTab />}
+        {tab === 4 && <UsersTab />}
       </Box>
     </Box>
   );

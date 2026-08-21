@@ -9,8 +9,13 @@
 
 import { openDB, type IDBPDatabase } from "idb";
 import { isReadOnly, type RowKind } from "./api";
-import { onOutboxResult } from "./outbox";
-import { pinReleaseAfterVerseOk } from "./draftSaveState";
+import { onOutboxDiscard, onOutboxResult, type OutboxOp } from "./outbox";
+import {
+  pinReleaseForVerseExit,
+  verseOpExitInfo,
+  type VerseOpExit,
+  type VerseOpExitInfo,
+} from "./draftSaveState";
 import { unpinVerseBase } from "./versePin";
 export { pinVerseBase, peekPinnedVerseBase } from "./versePin";
 
@@ -248,22 +253,113 @@ export function draftDirtyBorderSx() {
   } as const;
 }
 
+// ---------- verse-op terminal exits: draft clear + pin release ----------
+//
 // Auto-clear the draft when the outbox confirms its corresponding PATCH
 // landed. Anything other than a 200 keeps the draft so the user can retry
 // or hand-edit. 409 is special — the user resolves via SyncStatusBar; the
 // draft survives so the next retry has the right payload.
+//
+// Two terminal exits that will never produce a 200 — `locked` (the drain
+// deletes the op permanently) and a user discard — must still release a
+// DRAFTLESS save's verse-base pin, or the leaked pin poisons every later save
+// of the verse (#565). A draft, when one exists, SURVIVES those exits
+// untouched: it is the only copy of the user's unsaved text.
+//
+// The drain is cross-tab-exclusive (navigator.locks) while the pin map
+// (versePin.ts) is per-tab memory, so the tab observing an op's exit is often
+// NOT the tab holding the pin. Every verse-op exit is therefore broadcast, and
+// each tab runs the same release rule against the shared draft store.
+
+// This tab's synchronous bookkeeping (pendingKeys, pin, latestGenerationByKey)
+// can outlive its draft record when the record is cleared by ANOTHER tab —
+// clearGeneration only releases the local trio itself when it performs the
+// delete. Safe to release exactly when this tab's own latest generation is the
+// one confirmed cleared: any newer local keystroke replaces
+// latestGenerationByKey synchronously, so a match proves no live edit session
+// depends on the pin (#474 guard preserved).
+function releaseLocalBookkeeping(key: string, generation: string): void {
+  if (latestGenerationByKey.get(key) !== generation) return;
+  latestGenerationByKey.delete(key);
+  pendingKeys.delete(key);
+  unpinVerseBase(key);
+}
+
+function applyVerseExit(key: string, info: VerseOpExitInfo): void {
+  void drafts.get(key).then((draft) => {
+    const release = pinReleaseForVerseExit(draft, info);
+    if (release.kind === "clear") {
+      void drafts.clearGeneration(key, release.generation).then((cleared) => {
+        // The draining tab can win the race and delete the record between our
+        // get() above and this clear — clearGeneration then returns false
+        // without touching this tab's bookkeeping, leaving the pin and the
+        // beforeunload dirty flag leaked for a save that has in fact landed.
+        if (!cleared) releaseLocalBookkeeping(key, release.generation);
+      });
+    } else if (release.kind === "unpin") {
+      // The shared draft record can already be gone — cleared by the draining
+      // tab — while this tab's bookkeeping for it lingers. When a LANDED op
+      // captured exactly the generation this tab wrote last, that bookkeeping
+      // describes a save that has succeeded, not live typing: release it. A
+      // mismatch (or a draftless/legacy op with no generation) falls through
+      // to the idle-guarded unpin and a live edit session keeps its pin.
+      if (info.exit === "ok" && info.draftGeneration !== undefined) {
+        releaseLocalBookkeeping(key, info.draftGeneration);
+      }
+      unpinVerseBaseIfIdle(key);
+    }
+  });
+}
+
+type VerseExitMessage = { key: string; info: VerseOpExitInfo };
+
+const verseExitChannel =
+  typeof BroadcastChannel !== "undefined" ? new BroadcastChannel("be-verse-op-exits") : null;
+
+verseExitChannel?.addEventListener("message", (e: MessageEvent) => {
+  const data = e.data as Partial<VerseExitMessage> | null;
+  if (!data || typeof data.key !== "string") return;
+  const info = data.info;
+  if (!info || (info.exit !== "ok" && info.exit !== "locked" && info.exit !== "discarded")) return;
+  applyVerseExit(data.key, info);
+});
+
+function handleVerseExit(op: OutboxOp, exit: VerseOpExit): void {
+  if (op.target.kind !== "verse") return;
+  const key = verseKey(op.target.book, op.target.chapter, op.target.verse, op.target.bibleVersion);
+  let info: VerseOpExitInfo;
+  try {
+    // For a legacy (pre-generation) ok this parses the queued content, which
+    // used to run inside an async then() where a throw was isolated. This now
+    // runs synchronously inside outbox listener dispatch — keep that isolation
+    // so malformed content can't abort the drain pass's listener loop.
+    info = verseOpExitInfo(op, exit);
+  } catch {
+    return; // same non-release the pre-#565 code gave this op
+  }
+  applyVerseExit(key, info);
+  // BroadcastChannel never delivers to its own poster — the applyVerseExit
+  // above is this tab's copy. Announcement is best-effort: the local release
+  // has already run, and a failed post only leaves the other tabs where the
+  // pre-#565 behavior left every tab.
+  try {
+    verseExitChannel?.postMessage({ key, info } satisfies VerseExitMessage);
+  } catch {
+    /* best-effort */
+  }
+}
+
 onOutboxResult((op, result) => {
-  if (result.kind !== "ok") return;
   if (op.target.kind === "verse") {
-    const key = verseKey(op.target.book, op.target.chapter, op.target.verse, op.target.bibleVersion);
-    void drafts.get(key).then((draft) => {
-      const release = pinReleaseAfterVerseOk(draft, op);
-      if (release.kind === "clear") void drafts.clearGeneration(key, release.generation);
-      // Draftless save landed (dual-aligner reading line): nothing tracks the
-      // pin, so release it here or it poisons every later save (#563).
-      else if (release.kind === "unpin") unpinVerseBaseIfIdle(key);
-    });
-  } else if (op.target.kind === "row") {
+    if (result.kind === "ok" || result.kind === "locked") handleVerseExit(op, result.kind);
+    return;
+  }
+  if (result.kind !== "ok") return;
+  if (op.target.kind === "row") {
     void drafts.clear(rowKey(op.target.rowKind, op.target.book, op.target.id));
   }
 });
+
+// SyncStatusBar's discard flows (refused, unresolvable-conflict, discard-all)
+// all funnel through outbox.drop — the other permanent deletion (#565).
+onOutboxDiscard((op) => handleVerseExit(op, "discarded"));

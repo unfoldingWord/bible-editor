@@ -1108,6 +1108,15 @@ export function renderEditableHTML(
   return segmentsToHtml(segments, true);
 }
 
+// A recognized-but-empty verseObjects tree (or one of only unrecognized/
+// marker nodes) renders to "" from segmentsToHtml — that is not paintable
+// content. Callers must fall back to the plain_text baseline instead of
+// writing "" into the DOM, which blanks the pane with no way to type the
+// text back. See issue #529.
+export function isPaintableHtml(html: string | null | undefined): html is string {
+  return typeof html === "string" && html.trim() !== "";
+}
+
 // Convenience: pick the right highlight set for a given bible_version.
 // `sourceContent` is the active verse's UHB/UGNT verse content; pass it for
 // ULT/UST so the highlighter can OL-anchor the match (see findTargetHighlights).

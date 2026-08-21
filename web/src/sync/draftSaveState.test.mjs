@@ -3,8 +3,11 @@ import {
   generationForSavedPlain,
   generationForSuccessfulOp,
   pinReleaseAfterVerseOk,
+  pinReleaseForVerseExit,
   verseDraftHasActiveSave,
+  verseOpExitInfo,
 } from "./draftSaveState.ts";
+import { pinVerseBase, unpinVerseBase, peekPinnedVerseBase } from "./versePin.ts";
 
 const draft = {
   key: "verse:MIC:5:0:ULT",
@@ -112,5 +115,95 @@ assert.deepEqual(
   { kind: "keep" },
   "unrelated legacy op landing does not release a pin a live draft depends on",
 );
+assert.deepEqual(
+  pinReleaseAfterVerseOk(draft, legacyOp),
+  { kind: "clear", generation: "g-intro" },
+  "pre-generation op still clears via reconstructed editable text (exit-info plumbing parity)",
+);
 
-console.log("draftSaveState: 21 passed");
+// verseOpExitInfo — the wire-safe description of a verse op's terminal exit.
+// It must carry everything the release rule needs, because the receiving tab
+// never sees the op: the drain is cross-tab-exclusive while the pin map is
+// per-tab memory (#565).
+assert.deepEqual(
+  verseOpExitInfo(op("pending"), "ok"),
+  { exit: "ok", draftGeneration: "g-intro" },
+  "generation ops announce their draft generation",
+);
+assert.deepEqual(
+  verseOpExitInfo(legacyOp, "ok"),
+  { exit: "ok", editableText: "\\q1" },
+  "pre-generation ok announces the reconstructed editable text instead",
+);
+assert.deepEqual(
+  verseOpExitInfo(legacyOp, "locked"),
+  { exit: "locked" },
+  "non-ok exits never clear, so the legacy content parse is skipped entirely",
+);
+
+// pinReleaseForVerseExit, non-ok exits — `locked` deletes the op permanently
+// (chapter mid-AI-pipeline) and a discard deletes it from SyncStatusBar; no
+// 200 will ever follow either, so a DRAFTLESS pin must release here or the
+// verse is poisoned for the session. A draft, when one exists, is the only
+// copy of the user's unsaved text: it must SURVIVE these exits, so the rule
+// never clears and keeps the pin protecting its baseline.
+assert.deepEqual(
+  pinReleaseForVerseExit(undefined, verseOpExitInfo(op("pending"), "locked")),
+  { kind: "unpin" },
+  "locked exit of a draftless save releases the pin",
+);
+assert.deepEqual(
+  pinReleaseForVerseExit(draft, verseOpExitInfo(op("pending"), "locked")),
+  { kind: "keep" },
+  "locked exit never clears a draft — even the one this op captured",
+);
+assert.deepEqual(
+  pinReleaseForVerseExit(undefined, verseOpExitInfo(op("pending"), "discarded")),
+  { kind: "unpin" },
+  "discarding a draftless refused op releases the pin its cleanup used to leak",
+);
+assert.deepEqual(
+  pinReleaseForVerseExit({ ...draft, generation: "g-newer" }, verseOpExitInfo(op("pending"), "discarded")),
+  { kind: "keep" },
+  "discard with newer typing present keeps both the draft and its pin",
+);
+
+// Success check (a), unit-shaped: tab A's draftless save pinned a baseline,
+// but the drain — and the ok result — ran in tab B. Tab B broadcasts the exit
+// info; tab A applies the same rule against its own (draftless) draft state,
+// unpins, and the follow-up save session pins the FRESH base instead of
+// diffing against the stale one.
+const pinKey = "verse:MIC:5:0:ULT";
+pinVerseBase(pinKey, { version: 3, content: "stale" });
+{
+  const announced = verseOpExitInfo(op("pending"), "ok"); // built in "tab B"
+  const release = pinReleaseForVerseExit(undefined, announced); // applied in "tab A"
+  assert.deepEqual(release, { kind: "unpin" }, "cross-tab ok announcement releases in the receiving tab");
+  unpinVerseBase(pinKey);
+}
+assert.equal(peekPinnedVerseBase(pinKey), undefined, "pin map is empty after the cross-tab release");
+assert.equal(
+  pinVerseBase(pinKey, { version: 7, content: "fresh" }).version,
+  7,
+  "tab A's next save session pins the fresh base, not the leaked one",
+);
+unpinVerseBase(pinKey);
+
+// Success check (b), unit-shaped: a reading-line save against a
+// pipeline-locked chapter — the op is deleted permanently, the exit is
+// `locked`, and the draftless pin must release; the save after the lock
+// clears then pins the current version and lands without a conflict prompt.
+pinVerseBase(pinKey, { version: 3, content: "pre-lock" });
+{
+  const release = pinReleaseForVerseExit(undefined, verseOpExitInfo(op("pending"), "locked"));
+  assert.deepEqual(release, { kind: "unpin" }, "locked-exit deletion releases the draftless pin");
+  unpinVerseBase(pinKey);
+}
+assert.equal(
+  pinVerseBase(pinKey, { version: 9, content: "post-lock" }).version,
+  9,
+  "save after the lock clears pins the fresh version — no stale-baseline 409",
+);
+unpinVerseBase(pinKey);
+
+console.log("draftSaveState: 34 passed");
