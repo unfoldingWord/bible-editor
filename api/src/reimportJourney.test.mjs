@@ -473,6 +473,41 @@ console.log("\n[reference-move attribution at the caller]");
     eq(afterSecond.version, afterFirst.version, "…but an unchanged reason does not re-bump the version (#567)");
     eq(afterSecond.review_reason, afterFirst.review_reason, "…the reason text itself is unchanged");
   }
+
+  // 7. The references AGREE again, and a flag from an earlier run is still on
+  //    the row (issue #588). Before the fix nothing cleared it: the only clear
+  //    lived in the ours_moved branch, so a resolved reference kept its cleanup
+  //    chip forever with nothing left to decide. Observed on AMO tq 3:14.
+  {
+    const { sqlite, env } = freshEnv();
+    const boundary = seedMoved(sqlite, { reviewKind: "ref_moved" });
+    // Master now sits where D1 does — the translator moved it in-app to match.
+    const counts = await applyTsvRows(env, BOOK, "tq", [masterAt("1:6", 1, 6)], null, {
+      confirmedAt: 200, editId: boundary,
+    });
+    eq(counts.apply_incomplete, false, "an agreed reference does not withhold the watermark");
+    eq(counts.ref_moved_theirs, 0, "…and is not counted as a move at all");
+    const row = sqlite.prepare(`SELECT review_kind, review_reason, version, question FROM tq_rows WHERE id='mv01'`).all()[0];
+    eq(row.review_kind, null, "the resolved ref_moved flag is cleared");
+    eq(row.review_reason, null, "…reason too");
+    eq(row.question, "our question", "…and no content field is touched");
+    eq(row.version, 4, "…at the cost of exactly one version bump");
+
+    // Once, not nightly: the second run finds no flag and writes nothing.
+    await applyTsvRows(env, BOOK, "tq", [masterAt("1:6", 1, 6)], null, { confirmedAt: 200, editId: boundary });
+    const after = sqlite.prepare(`SELECT version FROM tq_rows WHERE id='mv01'`).all()[0];
+    eq(after.version, 4, "…and the next nightly does not re-bump it");
+  }
+
+  // 8. That clear must not become a way to lose an unacknowledged content
+  //    conflict, which says something the reference never did.
+  {
+    const { sqlite, env } = freshEnv();
+    const boundary = seedMoved(sqlite, { reviewKind: "merge_conflict" });
+    await applyTsvRows(env, BOOK, "tq", [masterAt("1:6", 1, 6)], null, { confirmedAt: 200, editId: boundary });
+    const row = sqlite.prepare(`SELECT review_kind FROM tq_rows WHERE id='mv01'`).all()[0];
+    eq(row.review_kind, "merge_conflict", "a merge_conflict survives an agreed-reference run");
+  }
 }
 
 // ── AI-vs-human conflict policy at the caller (#540 item 2) ─────────────────

@@ -1709,6 +1709,28 @@ export async function applyTsvRows(
           fields.review_reason = null;
         }
         counts.ref_moved_ours++;
+      } else if (refMove === "none" && !protectedRow && cur.review_kind === "ref_moved") {
+        // The two sides AGREE now — the translator moved the row in-app to match
+        // Door43, or master moved back — and a flag from an earlier run is still
+        // sitting on the row. Nothing above this line clears it: the only other
+        // clear lives in the `ours_moved` branch, so before issue #588 a resolved
+        // reference kept its cleanup chip forever, reading "Reference differs
+        // from Door43 — verify" with nothing left to differ and no way to dismiss
+        // it (the tn/tq/twl save button is disabled unless the row is dirty, so a
+        // translator cannot even produce the no-op re-save that rows.ts accepts as
+        // an acknowledgement). Observed on AMO tq 3:14, reported 2026-08-21.
+        //
+        // Guarded on 'ref_moved' exactly like the other clear, so it can never
+        // drop an unacknowledged merge_conflict / merge_kept. Excluded for a
+        // protectedRow, where classifyTsvRefMove returns "none" by policy rather
+        // than by measurement: the references may well still differ there, and
+        // such a row is deliberately left untouched from master.
+        //
+        // This is a flag-only write on a row the run would otherwise skip, so it
+        // bumps the version once — and only once, since the next run finds no
+        // flag to clear.
+        fields.review_kind = null;
+        fields.review_reason = null;
       } else if (refMove !== "none") {
         // Everything else HOLDS: withhold the resource watermark
         // (apply_incomplete) so the export cannot write D1's location over
