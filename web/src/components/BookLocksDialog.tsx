@@ -115,6 +115,12 @@ export function BookLocksDialog({ open, onClose, onChanged, books, canManageLock
     setPushState("idle");
     setPushResult(null);
     setPushError(null);
+    // Reset the intent too, and specifically so that "publish unreviewed" cannot
+    // be inherited. Unticking it for one book and then locking another would
+    // otherwise present the next prompt already set to publish straight to
+    // master, for a book nobody made that decision about. The safe default has
+    // to be re-chosen each time, per book.
+    setStageForReview(true);
   };
 
   const doPushNow = async () => {

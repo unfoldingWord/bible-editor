@@ -555,6 +555,17 @@ function PushCard({ bookOptions, lockedBooks }: { bookOptions: string[]; lockedB
   const [error, setError] = useState<string | null>(null);
   const status = useInstancePoll(runId);
 
+  // Re-decide the overrides whenever the target changes. Both of these are
+  // per-book judgements, and inheriting them is how the wrong one gets applied to
+  // the wrong book: tick "override the lock" for MIC, switch the dropdown to JER,
+  // and without this you are still holding an override you chose for a different
+  // book — worse, an unticked "stage for review" would carry over as a standing
+  // decision to publish JER unreviewed, which nobody made.
+  useEffect(() => {
+    setAllowLocked(false);
+    setStageForReview(true);
+  }, [book, resource]);
+
   // Both overrides are honored only for exactly one book AND one resource (see
   // lockOverrideAllowed / branchOverrideAllowed on the server). Naming that here
   // keeps the UI from offering a control the server would silently ignore —
