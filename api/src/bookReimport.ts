@@ -47,6 +47,7 @@ import {
   dcsRawUrl,
   fileCommitSha,
   fetchText,
+  fetchDcsMasterTextVerified,
   listMasterCommitsSince,
   NT_BOOKS,
 } from "./dcsSources";
@@ -532,6 +533,32 @@ export const raiseTombstoneBlockAlertForTest = (
   resource: Resource,
   counts: ReimportCounts,
 ): Promise<void> => raiseTombstoneBlockAlert(env, book, resource, counts);
+// aiRowDiffGate.test.mjs (issue #485 P1 follow-up): softDeleteRemovedTsvRows is
+// the prune half of the diff gate — this alias lets the test drive the REAL
+// prune against the real SQL (same rationale as the aliases above) to confirm
+// a gate-flagged chapter is actually processed, not just flagged.
+export const softDeleteRemovedTsvRowsForTest = (
+  env: Env,
+  book: string,
+  kind: TsvKind,
+  rawTsv: string,
+  candidateChapters: number[],
+  // Second P1 follow-up: threaded through so the test can drive both the
+  // verified-complete widened-coverage case AND the unverified conservative
+  // fallback case against the REAL function — see softDeleteRemovedTsvRows.
+  verifiedComplete: boolean,
+): Promise<{ deleted: number; skippedLocked: number }> =>
+  softDeleteRemovedTsvRows(env, book, kind, rawTsv, candidateChapters, verifiedComplete);
+// The completeness gate softDeleteRemovedTsvRows' coverage fix relies on its
+// callers already having run — exposed so the control test can prove the gate
+// itself still catches a truncated fetch (the safety invariant the coverage
+// fix must not weaken), independent of the prune's own behavior.
+export const tsvFetchLooksTruncatedForTest = (
+  env: Env,
+  book: string,
+  kind: TsvKind,
+  raw: string,
+): Promise<boolean> => tsvFetchLooksTruncated(env, book, kind, raw);
 // applyVerseRows itself has no D1-mock test harness above this module (see
 // verseMerge.test.mjs's note on collapseWhitespaceForCompare) — exposed here,
 // same convention as zeroCountsForTest, so applyVerseRows.test.mjs can drive
@@ -778,13 +805,40 @@ async function runReimport(
   // Fetch each requested resource once at the book level. ULT/UST/TN/TQ/TWL
   // are whole-book files; chapter filtering happens after parse.
   const want = new Set(resources);
-  let [ultRaw, ustRaw, tnRaw, tqRaw, twlRaw] = await Promise.all([
+  // TSV resources go through fetchTsvMasterVerified (issue #485, second P1
+  // follow-up) rather than plain fetchText: softDeleteRemovedTsvRows' widened
+  // coveredChapters needs to know whether THIS fetch carried the independent
+  // completeness proof fetchDcsMasterText provides — see fetchTsvMasterVerified
+  // and softDeleteRemovedTsvRows for the full rationale. ULT/UST stay on
+  // fetchText: verses are never row-pruned by chapter absence, so there is
+  // nothing here that needs the stronger guarantee.
+  const tnFile = dcsResourceFile(book, "tn");
+  const tqFile = dcsResourceFile(book, "tq");
+  const twlFile = dcsResourceFile(book, "twl");
+  const [ultRaw, ustRaw, tnFetch, tqFetch, twlFetch] = await Promise.all([
     want.has("ult") ? fetchText(urls.ult) : Promise.resolve(null),
     want.has("ust") ? fetchText(urls.ust) : Promise.resolve(null),
-    want.has("tn") ? fetchText(urls.tn) : Promise.resolve(null),
-    want.has("tq") ? fetchText(urls.tq) : Promise.resolve(null),
-    want.has("twl") ? fetchText(urls.twl) : Promise.resolve(null),
+    want.has("tn") && tnFile
+      ? fetchTsvMasterVerified(env, tnFile.repo, tnFile.path)
+      : Promise.resolve({ raw: null, verifiedComplete: false }),
+    want.has("tq") && tqFile
+      ? fetchTsvMasterVerified(env, tqFile.repo, tqFile.path)
+      : Promise.resolve({ raw: null, verifiedComplete: false }),
+    want.has("twl") && twlFile
+      ? fetchTsvMasterVerified(env, twlFile.repo, twlFile.path)
+      : Promise.resolve({ raw: null, verifiedComplete: false }),
   ]);
+  let tnRaw = tnFetch.raw;
+  let tqRaw = tqFetch.raw;
+  let twlRaw = twlFetch.raw;
+  // Tracks whether the (possibly still-live) raw text above carries the
+  // positive completeness proof — read by softDeleteRemovedTsvRows below.
+  // tsvFetchLooksTruncated nulling `raw` out (just below) makes these moot for
+  // that resource (the prune loop already skips a null raw), so they don't
+  // need to be reset in lockstep.
+  const tnVerifiedComplete = tnFetch.verifiedComplete;
+  const tqVerifiedComplete = tqFetch.verifiedComplete;
+  const twlVerifiedComplete = twlFetch.verifiedComplete;
 
   // Completeness gate (TSV only). A truncated master fetch that slipped past
   // fetchText (e.g. a no-Content-Length partial body — the HAB tn incident)
@@ -1006,11 +1060,16 @@ async function runReimport(
   // rows. softDeleteRemovedTsvRows compares against the WHOLE file's id set and
   // only touches pristine rows in covered chapters (see its guardrails).
   const tsvRawByKind: Record<TsvKind, string | null> = { tn: tnRaw, tq: tqRaw, twl: twlRaw };
+  const tsvVerifiedByKind: Record<TsvKind, boolean> = {
+    tn: tnVerifiedComplete,
+    tq: tqVerifiedComplete,
+    twl: twlVerifiedComplete,
+  };
   for (const kind of ["tn", "tq", "twl"] as TsvKind[]) {
     const raw = tsvRawByKind[kind];
     if (!want.has(kind) || !raw) continue;
     try {
-      const res = await softDeleteRemovedTsvRows(env, book, kind, raw, chapters);
+      const res = await softDeleteRemovedTsvRows(env, book, kind, raw, chapters, tsvVerifiedByKind[kind]);
       perResource[kind].deleted += res.deleted;
       perResource[kind].skipped_locked += res.skippedLocked;
     } catch (e) {
@@ -2354,6 +2413,69 @@ async function lastTsvDeleteWasReimport(
     .bind(kind, id, book)
     .first<{ source: string | null }>();
   return row?.source === REIMPORT_SOURCE;
+}
+
+// ── Verified-complete TSV master fetch (issue #485, second P1 follow-up) ───
+// Codex re-review of b826dcb: that commit let softDeleteRemovedTsvRows treat
+// ANY chapter absent from the incoming body as "master emptied it" (extending
+// coveredChapters to every chapter still holding a live D1 row), gated only on
+// the caller already having survived tsvFetchLooksTruncated. But
+// tsvFetchLooksTruncated/isCatastrophicTsvShrink is a LOSS-PERCENTAGE
+// heuristic (rejects >50% loss, and no-ops below SHRINK_GUARD_MIN_LIVE) — not
+// a positive completeness guarantee. A partial fetch that happens to pass it
+// (60 of 100 rows, or any book under the small-file floor) would still widen
+// coveredChapters over chapters the (partial) body never mentions, and the
+// prune would tombstone every pristine/AI-owned row in them — exactly the
+// blast radius the review flagged.
+//
+// PR #502 (issue #494) added fetchDcsMasterTextVerified/dcsFileSize: an
+// INDEPENDENT positive proof, cross-checking the downloaded byte count
+// against Gitea's own contents-API-recorded size for the file (not just a
+// possibly-absent Content-Length), fail-closed (null/false) on a persistent
+// short read. This thin adapter renames its `{text, verified}` result to the
+// `raw`/`verifiedComplete` shape the rest of this module's TSV-fetch call
+// sites already use — nothing more.
+//
+// FINAL P1 follow-up (a later codex re-review of THIS fix's first version):
+// the original version of this function made its OWN separate dcsFileSize()
+// call and then called fetchDcsMasterText() (which does its own, separately
+// -timed, internal dcsFileSize() call) — two independent network round trips
+// to the same "is the size available right now" question, which can
+// disagree. `verifiedComplete` was computed from THIS function's own probe,
+// not from whatever fetchDcsMasterText's internal probe actually used to
+// check the bytes it returned — so `verifiedComplete: true` could land
+// alongside a `raw` whose own completeness check never actually ran (that
+// internal probe could have failed transiently even though this one
+// succeeded). fetchDcsMasterTextVerified closes that gap: the verified flag
+// is computed INSIDE the one function that performs the fetch and the check,
+// from the exact apiSize/buffer it used — no second, separately-timed probe,
+// so "verified" and "raw" can never desynchronize.
+//
+// THIRD P1 follow-up (round 4 codex re-review of bbb7b25): a same-function
+// probe still isn't a same-REVISION proof. `verifiedComplete` used to be
+// obtainable even when master's tip moved between fetchDcsMasterTextVerified's
+// internal size lookup and its raw fetch, because both of those defaulted to
+// the mutable "master" ref — describing "master's tip whenever each request
+// happened to land", not one fixed commit. `ref` (this book+resource's file
+// SHA, already resolved by planAndStageBookResources's SHA-gate check just
+// above this function's one call site — see masterSha there) pins BOTH the
+// size lookup and the raw fetch to that exact revision, so `verifiedComplete`
+// now means "this SHA's size and this SHA's bytes agreed", not just "some
+// size and some bytes agreed". Falls back to fetchDcsMasterTextVerified's own
+// unpinned default when the caller has no SHA yet (fileCommitSha failed
+// transiently) — verifiedComplete then stays honestly false, never true on an
+// unpinned ref (see isPinnedCommitSha in dcsSources.ts).
+async function fetchTsvMasterVerified(
+  env: Env,
+  repo: string,
+  path: string,
+  ref?: string,
+): Promise<{ raw: string | null; verifiedComplete: boolean }> {
+  // `ref` undefined falls through to fetchDcsMasterTextVerified's own default
+  // ("master", never verified) — a plain JS default-parameter substitution,
+  // not a branch worth writing out here.
+  const { text, verified } = await fetchDcsMasterTextVerified(env, repo, path, ref);
+  return { raw: text, verifiedComplete: verified };
 }
 
 // ── Truncated-fetch completeness gate ───────────────────────────────────────
@@ -4003,6 +4125,12 @@ interface StagedResource {
   // `changed: false`, but for a completely different reason than a SHA match or
   // a 404, so it is reported separately (own_publish_converged).
   ownPublish?: boolean;
+  // TSV resources only (issue #485, second P1 follow-up): true when this
+  // staged file's fetch carried fetchDcsMasterText's independent completeness
+  // proof — see fetchTsvMasterVerified and softDeleteRemovedTsvRows. Always
+  // false for ult/ust (unused there; verses are never row-pruned by chapter
+  // absence) and for any entry where changed is false (nothing staged).
+  verifiedComplete: boolean;
   // Who moved master's file since `sync.sourceSha` (#540 item 1), measured here
   // because this is the only place in the nightly path that talks to DCS per
   // pair — and measured only for a resource that is actually being staged, so a
@@ -4707,10 +4835,29 @@ function storedTsvRowToParsed(kind: TsvKind, row: Record<string, unknown>): Pars
 
 // Chapters whose pristine D1 content differs from the incoming DCS TSV. A
 // chapter is "unchanged" (skippable) ONLY when its incoming {id → signature}
-// map equals its stored-pristine map exactly. Detects add/change/delete and id
-// moves; errs toward "changed" whenever an edited (non-pristine) row is present
-// (excluded from the stored map → chapter re-runs, edited row skipped
-// harmlessly). A perf filter — it can never skip a real update.
+// map equals its stored-pristine map exactly AND every live D1 id in the
+// chapter is still present in the incoming file (see the liveIds pass below).
+// Detects add/change/delete and id moves; errs toward "changed" whenever an
+// edited (non-pristine) row is present (excluded from the stored map → chapter
+// re-runs, edited row skipped harmlessly). A perf filter — it can never skip a
+// real update.
+//
+// Issue #485: the pristine-only comparison above is blind to a master-side
+// deletion of an AI-only row (updated_by set, latest edit_log source =
+// ai_pipeline — softDeleteRemovedTsvRows's own header explains why that row is
+// still prunable). Such a row is excluded from BOTH the incoming map (master
+// dropped it) and the stored-pristine map (it was never pristine), so the two
+// maps can still match exactly and the chapter reads as "unchanged" — the
+// prune that depends on `changed` then never runs for that chapter, and the
+// row lives on in D1 to be re-exported to master every night, silently
+// reverting the deletion forever. The liveIds pass below closes that hole: it
+// reads every LIVE (non-tombstoned) id in the chapter — pristine, AI-only, and
+// human-edited alike — and flags the chapter as changed if any of those ids is
+// absent from the incoming file, regardless of whether that id ever
+// contributed to the pristine signature comparison. Flagging on a missing
+// human-edited id is harmless — softDeleteRemovedTsvRows's own
+// isReimportableRow check refuses to prune it — so this only ever widens
+// "changed", never narrows it.
 export async function changedTsvChapters(
   env: Env,
   book: string,
@@ -4721,6 +4868,14 @@ export async function changedTsvChapters(
     kind === "tn"
       ? `updated_by IS NULL AND deleted_at IS NULL AND trashed_at IS NULL AND preserve = 0 AND hint = 0`
       : `updated_by IS NULL AND deleted_at IS NULL`;
+  // Mirrors softDeleteRemovedTsvRows' selectProtections: every row eligible
+  // for pruning consideration (pristine OR non-pristine), excluding rows
+  // already tombstoned/trashed/preserved/hinted — those aren't "live" and
+  // their absence from the incoming file is expected, not a deletion to catch.
+  const live =
+    kind === "tn"
+      ? `deleted_at IS NULL AND trashed_at IS NULL AND preserve = 0 AND hint = 0`
+      : `deleted_at IS NULL`;
 
   // Chapter 0 (refParts("front:intro") in importParsers.ts) is a real,
   // syncable chapter — a book-level intro TN/TQ/TWL row — NOT a sentinel to
@@ -4755,14 +4910,41 @@ export async function changedTsvChapters(
     m.set(p.id, tsvRowSignature(kind, p));
   }
 
+  // Second, wider read: every live id per chapter (not just pristine), so an
+  // AI-only (or human-edited) row's id is still visible to this gate even
+  // though it's excluded from the pristine signature maps above. See the
+  // issue #485 note on this function.
+  const liveIds = new Map<number, Set<string>>();
+  const liveRes = await env.DB.prepare(
+    `SELECT id, chapter FROM ${kind}_rows WHERE book = ?1 AND ${live}`,
+  )
+    .bind(book)
+    .all<{ id: string; chapter: number }>();
+  for (const row of liveRes.results ?? []) {
+    const ch = Number(row.chapter);
+    if (ch < 0) continue;
+    let s = liveIds.get(ch);
+    if (!s) liveIds.set(ch, (s = new Set()));
+    s.add(String(row.id));
+  }
+
   const changed = new Set<number>();
-  for (const ch of new Set<number>([...incoming.keys(), ...stored.keys()])) {
+  for (const ch of new Set<number>([...incoming.keys(), ...stored.keys(), ...liveIds.keys()])) {
     const a = incoming.get(ch) ?? new Map<string, string>();
     const b = stored.get(ch) ?? new Map<string, string>();
-    if (a.size !== b.size) { changed.add(ch); continue; }
-    let same = true;
-    for (const [id, sig] of a) {
-      if (b.get(id) !== sig) { same = false; break; }
+    let same = a.size === b.size;
+    if (same) {
+      for (const [id, sig] of a) {
+        if (b.get(id) !== sig) { same = false; break; }
+      }
+    }
+    // A live D1 id (pristine or not) that master no longer carries is always a
+    // change, even when the pristine-only comparison above already agreed —
+    // this is the additive check that catches an AI-only row's deletion.
+    if (same) {
+      for (const id of liveIds.get(ch) ?? []) {
+        if (!a.has(id)) { same = false; break; }
+      }
     }
     if (!same) changed.add(ch);
   }
@@ -4778,20 +4960,30 @@ export async function changedTsvChapters(
 // apply path uses, so a row the AI wrote and master later dropped is pruned
 // instead of lingering and re-exporting (the apply/prune consistency the
 // reimported_ai fix would otherwise miss). Conservative on every axis: only
-// chapters the incoming file covers AND the diff gate flagged as changed (a
-// deletion always flags its chapter), never under an active pipeline lock, and
-// the WRITE re-asserts version-CAS + the deleted/trashed/preserve/hint
-// protections (NOT updated_by IS NULL — an AI-only row carries the starter's id,
-// exactly as deleteUnkeptTns notes) so a human edit landing after the SELECT
-// bumps version → 0 rows → skipped. updated_by → NULL reclaims the tombstone to
-// reimport-owned. The id comparison is against the WHOLE file's id set so a row
-// the update path just moved to another chapter isn't mistaken for removed.
+// chapters the incoming file covers (a chapter master emptied entirely also
+// counts as "covered" when it still holds a live D1 row AND this fetch carried
+// a positive, independent completeness proof — see `verifiedComplete` and the
+// coverage extension inside, the issue #485 P1 follow-ups) AND the diff gate
+// flagged as changed (a deletion always flags its chapter), never under an
+// active pipeline lock, and the WRITE re-asserts version-CAS + the
+// deleted/trashed/preserve/hint protections (NOT updated_by IS NULL — an
+// AI-only row carries the starter's id, exactly as deleteUnkeptTns notes) so a
+// human edit landing after the SELECT bumps version → 0 rows → skipped.
+// updated_by → NULL reclaims the tombstone to reimport-owned. The id
+// comparison is against the WHOLE file's id set so a row the update path just
+// moved to another chapter isn't mistaken for removed.
 async function softDeleteRemovedTsvRows(
   env: Env,
   book: string,
   kind: TsvKind,
   rawTsv: string,
   candidateChapters: number[],
+  // Second P1 follow-up (codex re-review of b826dcb): true only when the caller's
+  // rawTsv came from fetchTsvMasterVerified with an independent positive
+  // completeness proof (see there). Gates the coveredChapters widening below —
+  // without it, tsvFetchLooksTruncated's loss-percentage heuristic alone is not
+  // enough to trust "absent from the body" as "master emptied this chapter".
+  verifiedComplete: boolean,
 ): Promise<{ deleted: number; skippedLocked: number }> {
   const incomingIds = new Set<string>();
   const coveredChapters = new Set<number>();
@@ -4816,6 +5008,60 @@ async function softDeleteRemovedTsvRows(
     kind === "tn"
       ? `deleted_at IS NULL AND trashed_at IS NULL AND preserve = 0 AND hint = 0`
       : `deleted_at IS NULL`;
+
+  // Issue #485 P1 follow-up (codex review on PR #501): a chapter master
+  // emptied COMPLETELY — zero incoming rows for that (book, kind, chapter) —
+  // never lands in coveredChapters above, so it was skipped by the loop below
+  // even after changedTsvChapters' liveIds pass correctly flagged it as
+  // changed (this is exactly what happens when the deleted AI-only row was
+  // the LAST row in its chapter). That left issue #485 half-fixed: the common
+  // case (chapter keeps other rows) prunes correctly, but a fully-emptied
+  // chapter's deletion still got resurrected every night.
+  //
+  // SECOND P1 follow-up (codex re-review of b826dcb): the original version of
+  // this extension trusted "the caller already ran tsvFetchLooksTruncated" as
+  // sufficient proof a body-absent chapter was genuinely emptied. It is not —
+  // tsvFetchLooksTruncated/isCatastrophicTsvShrink is a LOSS-PERCENTAGE
+  // heuristic (rejects >50% loss vs live D1, and no-ops entirely below
+  // SHRINK_GUARD_MIN_LIVE), not a positive completeness guarantee. A partial
+  // fetch that happens to pass that heuristic (e.g. 60 of 100 rows, or any
+  // book under the small-file floor) would still widen coveredChapters over
+  // chapters the partial body simply never reached, and the prune would then
+  // tombstone every pristine/AI-owned row in them — the review's exact
+  // "blast radius" finding. So this extension now ALSO requires
+  // `verifiedComplete`: true only when the caller's rawTsv came from
+  // fetchTsvMasterVerified with fetchDcsMasterText's independent Gitea
+  // contents-API byte-count cross-check actually available for this fetch
+  // (see fetchTsvMasterVerified above and PR #502 / issue #494). That is a
+  // POSITIVE proof the body is the whole file, not a loss-percentage guess.
+  //
+  // Without `verifiedComplete`, coveredChapters falls back to the original
+  // conservative behavior (only chapters with rows actually present in the
+  // incoming body) — correct but conservative, matching pre-b826dcb
+  // behavior for that fetch: a chapter master genuinely emptied is missed
+  // until a verified-complete fetch catches it, rather than risking pruning a
+  // chapter an unverified partial fetch merely failed to mention.
+  //
+  // When verified, extend coverage to every chapter that currently holds a
+  // LIVE D1 row for this (book, kind): that is the only shape of
+  // "flagged-changed but empty-in-incoming" this prune ever needs to reach —
+  // a chapter with no live rows has nothing to prune regardless. Read as ONE
+  // batched DISTINCT-chapter query (not one query per candidate chapter) so
+  // the subrequest cost stays flat no matter how many chapters
+  // candidateChapters spans — postExport's runReimport call passes the WHOLE
+  // book's chapter range on every run.
+  if (verifiedComplete) {
+    const liveChaptersRes = await env.DB.prepare(
+      `SELECT DISTINCT chapter FROM ${kind}_rows WHERE book = ?1 AND ${selectProtections}`,
+    )
+      .bind(book)
+      .all<{ chapter: number }>();
+    for (const row of liveChaptersRes.results ?? []) {
+      const ch = Number(row.chapter);
+      if (ch >= 0) coveredChapters.add(ch);
+    }
+  }
+
   const writeGuard =
     kind === "tn"
       ? `deleted_at IS NULL AND trashed_at IS NULL AND preserve = 0 AND hint = 0 AND version = ?4`
@@ -4895,20 +5141,41 @@ async function planAndStageBookResources(
   const entries: StagedResource[] = [];
   for (const resource of resources) {
     const file = dcsResourceFile(book, resource);
-    if (!file) { entries.push({ resource, changed: false, masterSha: null, r2Key: null }); continue; }
+    if (!file) { entries.push({ resource, changed: false, masterSha: null, r2Key: null, verifiedComplete: false }); continue; }
 
     const masterSha = await fileCommitSha(env, file.repo, file.path);
     const sync = await resourceSyncState(env, book, resource);
     // Skip ONLY on a positive SHA match (fail-open: null/unknown → reimport).
     if (masterSha && sync.sourceSha && masterSha === sync.sourceSha) {
-      entries.push({ resource, changed: false, masterSha, r2Key: null });
+      entries.push({ resource, changed: false, masterSha, r2Key: null, verifiedComplete: false });
       continue;
     }
 
-    const raw = await fetchText(dcsRawUrl(env, file.repo, file.path));
+    // TSV resources go through fetchTsvMasterVerified (issue #485, second P1
+    // follow-up) so softDeleteRemovedTsvRows can know whether THIS fetch
+    // carried fetchDcsMasterText's independent completeness proof — see
+    // fetchTsvMasterVerified and softDeleteRemovedTsvRows. ULT/UST stay on
+    // plain fetchText: verses are never row-pruned by chapter absence.
+    // Both branches pin to `masterSha` — the exact commit SHA the SHA-gate
+    // check just above already resolved for this (book, resource) — rather
+    // than re-resolving "master"'s current tip independently inside the
+    // fetch. See fetchTsvMasterVerified's third-P1-follow-up comment and
+    // dcsRawUrl in dcsSources.ts. `masterSha` can be null (fileCommitSha
+    // failed transiently); both calls fall back to their unpinned defaults in
+    // that case, same as before this fix.
+    const isTsv = resource === "tn" || resource === "tq" || resource === "twl";
+    let raw: string | null;
+    let verifiedComplete = false;
+    if (isTsv) {
+      const fetched = await fetchTsvMasterVerified(env, file.repo, file.path, masterSha ?? undefined);
+      raw = fetched.raw;
+      verifiedComplete = fetched.verifiedComplete;
+    } else {
+      raw = await fetchText(dcsRawUrl(env, file.repo, file.path, masterSha ?? undefined));
+    }
     if (raw == null) {
       // DCS 404 / fetch error → nothing to import, no watermark.
-      entries.push({ resource, changed: false, masterSha: null, r2Key: null });
+      entries.push({ resource, changed: false, masterSha: null, r2Key: null, verifiedComplete: false });
       continue;
     }
 
@@ -4950,7 +5217,7 @@ async function planAndStageBookResources(
       // markOwnPublishConverged's contract. The resource is skipped either way
       // (master holds our own render, so there is nothing to import), but a run
       // must not report a watermark advance it did not get.
-      entries.push({ resource, changed: false, masterSha, r2Key: null, ownPublish: stamped });
+      entries.push({ resource, changed: false, masterSha, r2Key: null, ownPublish: stamped, verifiedComplete: false });
       continue;
     }
     if (own.reason === "content_differs") {
@@ -4977,11 +5244,8 @@ async function planAndStageBookResources(
     // watermark — otherwise it prunes the book AND certifies it "in sync",
     // hiding the damage (the HAB tn incident). masterSha:null here is critical:
     // the reimport-sync step only stamps watermarks for entries with a masterSha.
-    if (
-      (resource === "tn" || resource === "tq" || resource === "twl") &&
-      (await tsvFetchLooksTruncated(env, book, resource, raw))
-    ) {
-      entries.push({ resource, changed: false, masterSha: null, r2Key: null });
+    if (isTsv && (await tsvFetchLooksTruncated(env, book, resource, raw))) {
+      entries.push({ resource, changed: false, masterSha: null, r2Key: null, verifiedComplete: false });
       continue;
     }
     // Master's file moved, and it was not our own render coming back — so
@@ -4999,7 +5263,7 @@ async function planAndStageBookResources(
     );
     const r2Key = `reimport-stage/${instanceId}/${book}/${resource}`;
     await env.BLOBS.put(r2Key, raw);
-    entries.push({ resource, changed: true, masterSha, r2Key, lineage });
+    entries.push({ resource, changed: true, masterSha, r2Key, verifiedComplete, lineage });
   }
   return { maxChapter, entries };
 }
@@ -5251,10 +5515,11 @@ export async function runChunkedReimport(
     const chs = changedTsv[kind];
     if (!chs || chs.length === 0) continue;
     const r2Key = e.r2Key;
+    const verifiedComplete = e.verifiedComplete;
     const res = await step.do(`reimport-prune-${book}-${kind}`, async () => {
       const raw = await readStaged(env, r2Key);
       if (raw == null) return { deleted: 0, skippedLocked: 0 };
-      const res = await softDeleteRemovedTsvRows(env, book, kind, raw, chs);
+      const res = await softDeleteRemovedTsvRows(env, book, kind, raw, chs, verifiedComplete);
       if (res.deleted > 0 || res.skippedLocked > 0) {
         console.log("reimport pruned rows removed on master", { book, resource: kind, ...res });
       }
