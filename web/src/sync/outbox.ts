@@ -538,6 +538,9 @@ export const outbox = {
     }
     await tx.store.delete(opId);
     await tx.done;
+    // Only when a record was actually deleted (op read non-null above) — a
+    // drop of an already-gone id must not announce a discard twice.
+    if (op) for (const l of discardListeners) l(op);
     void notify();
     void drain();
   },
@@ -637,6 +640,17 @@ const resultListeners = new Set<ResultListener>();
 export function onOutboxResult(fn: ResultListener): () => void {
   resultListeners.add(fn);
   return () => resultListeners.delete(fn);
+}
+
+// Fires when drop() permanently deletes an op (every SyncStatusBar discard
+// flow funnels through drop). A discard is a terminal exit no 200 will ever
+// follow, so anything keyed to the op's eventual landing — the verse-base
+// pin a draftless save left behind (#565) — must release here instead.
+type DiscardListener = (op: OutboxOp) => void;
+const discardListeners = new Set<DiscardListener>();
+export function onOutboxDiscard(fn: DiscardListener): () => void {
+  discardListeners.add(fn);
+  return () => discardListeners.delete(fn);
 }
 
 function unexpectedAlignmentLossReason(body: unknown): string | null {
