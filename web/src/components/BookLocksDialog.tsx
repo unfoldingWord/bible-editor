@@ -9,11 +9,13 @@ import {
   Alert,
   Box,
   Button,
+  Checkbox,
   Chip,
   Dialog,
   DialogActions,
   DialogContent,
   DialogTitle,
+  FormControlLabel,
   IconButton,
   List,
   ListItem,
@@ -25,7 +27,7 @@ import {
 import LockIcon from "@mui/icons-material/Lock";
 import LockOpenIcon from "@mui/icons-material/LockOpen";
 import HelpOutlineIcon from "@mui/icons-material/HelpOutline";
-import { ApiError, api, type BookListEntry, type PushLockedBookResponse } from "../sync/api";
+import { ApiError, REVIEW_BRANCH, api, type BookListEntry, type PushLockedBookResponse } from "../sync/api";
 import { BOOKS, bookName } from "../lib/bookNames";
 
 interface Props {
@@ -53,6 +55,9 @@ export function BookLocksDialog({ open, onClose, onChanged, books, canManageLock
   // nightly export. Holds the just-locked book code; null when no prompt is
   // showing. `pushState` tracks the push-now action itself.
   const [pushPrompt, setPushPrompt] = useState<string | null>(null);
+  // Defaults to staging: the safe intent should be the one you get by not
+  // thinking about it, since the unsafe one rewrites a released book.
+  const [stageForReview, setStageForReview] = useState(true);
   const [pushState, setPushState] = useState<"idle" | "pushing" | "done" | "error">("idle");
   const [pushResult, setPushResult] = useState<PushLockedBookResponse | null>(null);
   const [pushError, setPushError] = useState<string | null>(null);
@@ -117,7 +122,7 @@ export function BookLocksDialog({ open, onClose, onChanged, books, canManageLock
     setPushState("pushing");
     setPushError(null);
     try {
-      const res = await api.pushLockedBookToDoor43(pushPrompt);
+      const res = await api.pushLockedBookToDoor43(pushPrompt, stageForReview ? REVIEW_BRANCH : undefined);
       setPushResult(res);
       setPushState("done");
     } catch (e) {
@@ -260,12 +265,32 @@ export function BookLocksDialog({ open, onClose, onChanged, books, canManageLock
         <DialogTitle>Push to Door43?</DialogTitle>
         <DialogContent>
           {pushState === "idle" && pushPrompt && (
-            <Typography variant="body2">
-              {bookName(pushPrompt)} is now locked. Push it to Door43 now
-              instead of waiting for the nightly export? This sends every
-              resource (ULT, UST, tN, tQ, tWL) and merges directly, bypassing
-              the lock just for this push.
-            </Typography>
+            <Stack spacing={1.5}>
+              <Typography variant="body2">
+                {bookName(pushPrompt)} is now locked. Push it to Door43 now instead of waiting for the
+                nightly export? This sends every resource (ULT, UST, tN, tQ, tWL), bypassing the lock
+                just for this push.
+              </Typography>
+              {/* Two genuinely different intents, and the dialog used to offer only
+                  the riskier one. "Publish now" is right when you own the change and
+                  want it live. Staging is right for a PUBLISHED book, where merging
+                  means re-cutting a release — that call belongs to a maintainer, not
+                  to whoever happened to fix a typo. */}
+              <FormControlLabel
+                control={
+                  <Checkbox
+                    checked={stageForReview}
+                    onChange={(e) => setStageForReview(e.target.checked)}
+                  />
+                }
+                label="Stage for maintainer review instead of publishing"
+              />
+              <Alert severity={stageForReview ? "info" : "warning"}>
+                {stageForReview
+                  ? `Lands on the “${REVIEW_BRANCH}” branch and opens a pull request. Nothing merges by itself — a maintainer reviews it and re-releases.`
+                  : "Merges directly to master. Door43 publishes it without review, which for a released book rewrites what people have already downloaded."}
+              </Alert>
+            </Stack>
           )}
           {pushState === "pushing" && <Typography variant="body2">Pushing…</Typography>}
           {pushState === "done" && pushResult && (

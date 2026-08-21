@@ -142,6 +142,28 @@ export function prunableBranches(
   );
 }
 
+// The export params for one resource of a locked-book push (books.ts's
+// POST /:book/lock/push). Pure because the choice it encodes is the whole safety
+// property of that route and must not live only inside a handler that needs D1
+// and a Workflow binding to exercise.
+//
+// TWO INTENTS. Without `branchName` this is "publish now": the generated `-be-`
+// branch plus validateAndMerge, which is what a lock admin wants after fixing
+// something in a book they just re-locked. With `branchName` it is "stage for
+// review", and validateAndMerge MUST go off — asking DCS to merge a branch while
+// also asking for one it will not auto-merge is incoherent, and leaving the flag
+// on would mean our own post-export orchestrator tried to land a published-book
+// change that a maintainer was supposed to review first.
+export function lockPushExportParams(
+  book: string,
+  resource: Resource,
+  branchName?: string,
+): { book: string; resource: Resource; allowLocked: true; validateAndMerge: boolean; branchName?: string } {
+  return branchName
+    ? { book, resource, allowLocked: true, validateAndMerge: false, branchName }
+    : { book, resource, allowLocked: true, validateAndMerge: true };
+}
+
 export function branchOverrideAllowed(
   params: { branchName?: string; book?: string; resource?: string },
   resolvedBookCount: number,

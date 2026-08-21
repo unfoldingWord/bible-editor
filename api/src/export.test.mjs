@@ -5,7 +5,7 @@
 // instead of getting silently flattened to `\v 6`. Not a test framework;
 // failures exit non-zero.
 
-import { attributeTsvShrink, branchOverrideAllowed, prunableBranches, exportBranchOverrideValid, buildAlignmentShrinkAlertMessage, buildUsfmInvalidAlertMessage, classifyAlignmentLossSeverity, offenderProvenanceFromLog, buildExportBranch, buildTnTsv, buildTqTsv, buildTwlTsv, buildUsfm, classifyAlignmentShrinkOffenders, classifyRevertSeverity, commitToDcs, countDuplicateMasterIds, describeShrinkRefusal, ensureDcsPr, exportTags, exportTsvShrinkRefused, findDcsOpenPr, isMasterConfirmed, mechanicalOverwriteAlert, parseTsvIds, recreateExportBranchFromMaster, shouldRecordRevertReport, tsvRevertReport, updateDcsPrBranch, usfmAlignmentShrinkRefused, usfmRevertReport } from "./export.ts";
+import { attributeTsvShrink, branchOverrideAllowed, lockPushExportParams, prunableBranches, exportBranchOverrideValid, buildAlignmentShrinkAlertMessage, buildUsfmInvalidAlertMessage, classifyAlignmentLossSeverity, offenderProvenanceFromLog, buildExportBranch, buildTnTsv, buildTqTsv, buildTwlTsv, buildUsfm, classifyAlignmentShrinkOffenders, classifyRevertSeverity, commitToDcs, countDuplicateMasterIds, describeShrinkRefusal, ensureDcsPr, exportTags, exportTsvShrinkRefused, findDcsOpenPr, isMasterConfirmed, mechanicalOverwriteAlert, parseTsvIds, recreateExportBranchFromMaster, shouldRecordRevertReport, tsvRevertReport, updateDcsPrBranch, usfmAlignmentShrinkRefused, usfmRevertReport } from "./export.ts";
 import { CorruptContentJsonError } from "./contentJson.ts";
 import { extractVersesForRange } from "./importParsers.ts";
 import { validateUsfm } from "./usfmValidate.ts";
@@ -1060,6 +1060,34 @@ function utf8Base64(s) {
     result.explained === missingCount && result.unexplained === 0,
     `1CH TQ: all ${missingCount} missing rows explained`,
   );
+}
+
+// --- lockPushExportParams: staging must switch auto-merge OFF ---
+{
+  // Default: the intent this route was built for — a lock admin fixed something
+  // in a book they just re-locked and wants it live.
+  const publishNow = lockPushExportParams("MIC", "tn");
+  assert(publishNow.allowLocked === true, `publish-now clears the lock gate`);
+  assert(publishNow.validateAndMerge === true, `publish-now asks DCS to merge`);
+  assert(publishNow.branchName === undefined, `publish-now uses the generated -be- branch`);
+
+  // Staging: a published-book fix a maintainer must review. Leaving
+  // validateAndMerge on here would have our own orchestrator try to land a
+  // change that was explicitly staged for someone else to approve.
+  const staged = lockPushExportParams("MIC", "tn", "BibleEditor-data-restoration");
+  assert(staged.allowLocked === true, `staged run still clears the lock gate`);
+  assert(staged.validateAndMerge === false, `staging turns auto-merge OFF`);
+  assert(staged.branchName === "BibleEditor-data-restoration", `staged run carries the branch`);
+  assert(
+    !String(staged.branchName).includes("-be-"),
+    `the staged branch cannot carry the substring DCS auto-merges on`,
+  );
+  // book/resource are always named explicitly: allowLocked is only honored for a
+  // single-book, single-resource run, so omitting either would silently disable
+  // the override and skip every resource as book_locked.
+  for (const p of [publishNow, staged]) {
+    assert(p.book === "MIC" && p.resource === "tn", `book and resource are always named`);
+  }
 }
 
 // --- prunableBranches: never delete a branch a human is reviewing ---
