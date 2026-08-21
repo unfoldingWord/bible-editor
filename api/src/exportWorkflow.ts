@@ -19,6 +19,8 @@ import type { Env } from "./index";
 import {
   ALL_RESOURCES,
   attributeTsvShrink,
+  branchOverrideAllowed,
+  prunableBranches,
   buildExportBranch,
   buildTnTsv,
   buildTqTsv,
@@ -138,6 +140,15 @@ export interface ExportParams {
   // resource — same narrow shape as allowShrink above — so no cron path can
   // ever carry it and unfreeze every locked book at once.
   allowLocked?: boolean;
+  // Override the generated `{BOOK}-be-{contributors}` branch name with an
+  // explicit one, for a correction to a published book that a uW maintainer
+  // must review and merge by hand instead of DCS's merge bot doing it. Rejected
+  // if it carries `-be-`, and only honored for a single explicitly-named book
+  // AND resource — same narrow shape as allowLocked above. See
+  // branchOverrideAllowed / exportBranchOverrideValid in export.ts for the full
+  // rationale and the two consequences (no DCS validate run; a green combined
+  // status that means "nothing ran").
+  branchName?: string;
   // Scope the pre-export DCS→D1 reimport step to specific resources. Unlike
   // the singular `resource` above (which scopes the export/render step),
   // `resources` is plural and ONLY affects the reimport step — it exists
@@ -218,6 +229,17 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     const lockOverride = lockOverrideAllowed(params, books.length, resources.length);
     if (params.allowLocked === true && !lockOverride) {
       console.log("export: allowLocked ignored — requires an explicit single book + resource");
+    }
+    // Branch-name override, same narrow shape again. Resolved to a string (not a
+    // boolean) so the single call site below can stay a plain `?? generated`.
+    const branchOverride = branchOverrideAllowed(params, books.length, resources.length)
+      ? (params.branchName as string)
+      : null;
+    if (params.branchName !== undefined && branchOverride === null) {
+      console.log(
+        "export: branchName ignored — requires an explicit single book + resource, " +
+          "and a git-ref-safe name that does not contain '-be-'",
+      );
     }
 
     // 1b. Sync D1 from current master before rendering. Pulls out-of-band master
@@ -324,7 +346,17 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
           const result = await step.do(
             stepName,
             { retries: { limit: 3, delay: "5 seconds", backoff: "exponential" } },
-            async () => this.exportOne(book, resource, instanceId, dcsAllowed, shrinkOverride, lockedBooks, lockOverride),
+            async () =>
+              this.exportOne(
+                book,
+                resource,
+                instanceId,
+                dcsAllowed,
+                shrinkOverride,
+                lockedBooks,
+                lockOverride,
+                branchOverride,
+              ),
           );
           results.push(result);
         } catch (e) {
@@ -447,6 +479,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     allowShrink: boolean,
     lockedBooks: Set<string>,
     allowLocked: boolean,
+    branchOverride: string | null = null,
   ): Promise<StepResult> {
     // Clear any undismissed banner the removed blank-field HOLD gate left behind
     // (see the long note further down for why that gate is gone). Its text says
@@ -567,9 +600,11 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       await this.applyTwlSortOrderUpdates(book, built.sortOrderUpdates);
     }
 
-    // Book-specific branch named for this resource's human contributors.
+    // Book-specific branch named for this resource's human contributors, unless
+    // the operator named one explicitly (a published-book fix a maintainer must
+    // merge by hand — see branchOverrideAllowed in export.ts).
     const contributors = await this.contributorsFor(book, resource);
-    const branch = buildExportBranch(book, contributors);
+    const branch = branchOverride ?? buildExportBranch(book, contributors);
     // Derived from the contributor list itself, NOT by string-matching the
     // branch name — a real DCS user named "mechanical" would make that
     // unreliable (see export.ts's comment above MECHANICAL_CONTRIBUTOR).
@@ -1037,17 +1072,51 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
         // this (book, resource) whose name changed because the contributor set
         // changed, plus the legacy live-snapshot branch. Best-effort — a prune
         // failure must never fail or retry the export step.
-        await this.pruneSupersededBranches(book, resource, owner, target.repo, branch);
+        //
+        // SKIPPED under a branch override. The prune's premise is "this run
+        // replaces the previous run's branch for the same (book, resource)",
+        // which an override run does not: it is a one-off beside the normal
+        // lineage. Running it here would delete the normal lineage's OWN
+        // branches — it reads `export_snapshots` history for this
+        // (book, resource) and deletes every branch that is not this run's, so a
+        // one-off override run would take the real `-be-` branch (and its open
+        // PR, holding queued edits) with it.
+        //
+        // The converse hazard — a LATER normal export pruning this override
+        // branch out from under the maintainer reviewing it — is handled inside
+        // pruneSupersededBranches, which now only deletes branches carrying
+        // `-be-`. Both directions have to be closed, because either one silently
+        // destroys an open PR.
+        if (!branchOverride) {
+          await this.pruneSupersededBranches(book, resource, owner, target.repo, branch);
+        }
 
         // Ensure the branch has an open PR into master so the DCS validate-and-
         // merge workflow can act on it (it merges -be- PRs, not bare branches).
         // Best-effort: the commit already succeeded and the snapshot is recorded,
         // so a PR failure must not fail the export — the PR can be opened later.
+        //
+        // An override branch gets a body that says what it is and warns about the
+        // green-status trap, because no DCS check runs on a non-`-be-` branch and
+        // "no checks" reports as success (see export.ts's override comment). The
+        // maintainer reading this PR must not take green for validated.
         try {
           const pr = await ensureDcsPr(
             dcsCfg,
-            `bible-editor: ${book} ${resource} → master`,
-            `Auto-opened by the bible-editor nightly export so the DCS validate-and-merge workflow can process \`${branch}\`. Holds the latest ${resource.toUpperCase()} edits for ${book}.`,
+            branchOverride
+              ? `bible-editor data restoration: ${book} ${resource} → master`
+              : `bible-editor: ${book} ${resource} → master`,
+            branchOverride
+              ? `Opened by a bible-editor **data-restoration** export of ${book} ${resource.toUpperCase()}, ` +
+                  `restoring translator edits that an earlier sync overwrote with Door43's version.\n\n` +
+                  `**This branch is deliberately not named \`*-be-*\`**, so DCS's validate-and-merge ` +
+                  `workflow neither validates nor auto-merges it. ${book} is a published book — this is ` +
+                  `for a uW maintainer to review, merge, and re-release by hand.\n\n` +
+                  `⚠️ A green combined status on this PR means **no checks ran**, not that it passed ` +
+                  `validation (Gitea counts skipped checks as success). The content was validated by ` +
+                  `bible-editor's own ${resource === "ult" || resource === "ust" ? "USFM" : "TSV"} ` +
+                  `checks before the push.`
+              : `Auto-opened by the bible-editor nightly export so the DCS validate-and-merge workflow can process \`${branch}\`. Holds the latest ${resource.toUpperCase()} edits for ${book}.`,
           );
           prNumber = pr.number;
           prReason = pr.reason;
@@ -1366,7 +1435,9 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     } catch (e) {
       console.error("prune: history query failed", { book, resource, error: e instanceof Error ? e.message : String(e) });
     }
-    const targets = [...new Set([...stale, LEGACY_EXPORT_BRANCH])].filter((b) => b && b !== keepBranch);
+    // Only ever prune branches WE generated — see prunableBranches in export.ts
+    // for why, and for the test that pins it.
+    const targets = prunableBranches(stale, keepBranch, LEGACY_EXPORT_BRANCH);
     for (const b of targets) {
       try {
         await deleteDcsBranch(

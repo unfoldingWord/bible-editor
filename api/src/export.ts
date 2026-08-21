@@ -67,6 +67,92 @@ export function buildExportBranch(book: string, usernames: string[]): string {
   return `${book}-be-${safe.length === 0 ? MECHANICAL_CONTRIBUTOR : safe.join("-")}`;
 }
 
+// ── Branch-name override ─────────────────────────────────────────────────────
+//
+// WHY THIS EXISTS. Everything above is built so a branch carries `-be-` and is
+// therefore validated and AUTO-MERGED by DCS's own workflows. There is one case
+// where auto-merge is exactly wrong: a correction to a PUBLISHED book. Those
+// books are frozen because their content is in a cut release (v90), so a fix to
+// them has to land as a branch + PR that a uW maintainer reviews and merges
+// himself, then re-releases. `allowLocked` already lets such an export through
+// our own gate — but on a `-be-` branch, DCS's `merge-be-pr.yaml` would merge it
+// into master without anyone looking, which is the whole thing we are avoiding.
+//
+// So the override's ONLY purpose is to produce a branch DCS will NOT auto-merge,
+// which is why a name carrying `-be-` is rejected rather than sanitized: passing
+// one would silently restore the auto-merge it exists to prevent.
+//
+// TWO CONSEQUENCES THE OPERATOR MUST KNOW, both from the `push: branches:
+// ['*-be-*']` trigger in docs/dcs-workflows/*.validate-be-branch.yaml:
+//   1. DCS's validate workflow does NOT run on this branch. Our own
+//      validateUsfm / shrink-guard / collapse passes are the only gate, so the
+//      export must be run with them intact (never with a shrink override
+//      stacked on top).
+//   2. Gitea will still report a GREEN combined status, because no/skipped
+//      checks count as success (the same trap the suffix-less `{BOOK}-be` bug
+//      hit). Green here means "nothing ran", not "validated" — the PR body says
+//      so, so the maintainer isn't misled.
+//
+// PRUNING, both directions. pruneSupersededBranches does NOT glob a name shape —
+// it reads this (book, resource)'s `export_snapshots` history and deletes every
+// branch that is not the run's own. So an override run must not run the prune (it
+// would delete the normal lineage's live branch and close its PR), and a later
+// normal export must not delete the override branch (a maintainer is reviewing
+// it). The second half is enforced there by pruning only branches carrying
+// `-be-`; this validator's rejection of `-be-` is what makes that test sound.
+const BRANCH_OVERRIDE_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/;
+
+export function exportBranchOverrideValid(name: string): boolean {
+  if (!BRANCH_OVERRIDE_RE.test(name)) return false;
+  // The point of the override (see above) — never an auto-merging branch.
+  if (name.includes("-be-")) return false;
+  // git ref rules the character class alone doesn't cover.
+  if (name.endsWith(".lock") || name.endsWith(".") || name.includes("..")) return false;
+  return true;
+}
+
+// Narrow gating, an EXACT structural mirror of lockOverrideAllowed in
+// publishedGuard.ts and shrinkOverrideAllowed in shrinkGuard.ts — read those
+// comments too. Both resolved counts (never the raw params) must be exactly 1,
+// so an unrecognized book or resource string — which widens to every book /
+// ALL_RESOURCES in exportWorkflow's resolution — cannot hand one branch name to
+// a multi-book run and collapse several books onto a single branch, each
+// overwriting the last. Every cron path omits branchName, so the nightly is
+// untouched no matter what params reach it.
+// Which of this (book, resource)'s historical branches may pruneSupersededBranches
+// DELETE. Pure so the rule is testable without a Workflow context — the method it
+// serves is private and reaches DCS, and this decision destroys branches (and,
+// through them, open PRs), so it must not be the untested half of that method.
+//
+// `stale` comes from export_snapshots history, which records EVERY branch we have
+// pushed for this pair — including hand-named ones from the `branchName` override,
+// which a uW maintainer may be mid-review on. buildExportBranch always emits
+// `-be-`; the override refuses it. So that substring is the line between "a branch
+// we generated and can recycle" and "someone is using this".
+//
+// LEGACY_EXPORT_BRANCH is always prunable: it predates the `-be-` scheme and is
+// ours by definition.
+export function prunableBranches(
+  stale: readonly string[],
+  keepBranch: string,
+  legacyBranch: string,
+): string[] {
+  return [...new Set([...stale.filter((b) => b.includes("-be-")), legacyBranch])].filter(
+    (b) => b && b !== keepBranch,
+  );
+}
+
+export function branchOverrideAllowed(
+  params: { branchName?: string; book?: string; resource?: string },
+  resolvedBookCount: number,
+  resolvedResourceCount: number,
+): boolean {
+  if (typeof params.branchName !== "string" || params.branchName.length === 0) return false;
+  if (!exportBranchOverrideValid(params.branchName)) return false;
+  if (!params.book || !params.resource) return false;
+  return resolvedBookCount === 1 && resolvedResourceCount === 1;
+}
+
 // ── TSV builders ─────────────────────────────────────────────────────────────
 // Column order matches docs/samples/*.tsv exactly. Downstream tooling is
 // positional; reorder and consumers break.
@@ -280,6 +366,21 @@ export function countDuplicateMasterIds(masterIds: string[]): number {
 export const HUMAN_INTENT_REMOVAL_SOURCES: ReadonlySet<string | null> = new Set<string | null>([
   null,
   "nightly_finalize",
+  // A repair script's delete, run by a person against a named ruling — the ECC
+  // ch1 de-duplication (2026-08-20) is the first: two full note sets had gone
+  // live in D1 after an AI apply deleted only 20 of the 73 rows it replaced,
+  // and Benjamin ruled to keep the newer set, so 53 rows were trashed at once.
+  //
+  // This belongs here for the same reason `null` does. The guard's question is
+  // "did a human mean to remove this row, or did D1 lose it?" — and a
+  // data_restoration tombstone is deliberate by construction: nothing writes
+  // that source except a repair a person authorized and attributed to their own
+  // user_id. Leaving it out is what the truncated-fetch signature looks like, so
+  // a large, entirely intentional cleanup would have read as 53 unexplained
+  // losses, blocked the export, and withheld the resource watermark — meaning
+  // the duplicates stay on Door43 and no later export can clear them, the same
+  // livelock shape #543 fixed on the reference side.
+  "data_restoration",
 ]);
 
 // Splits master's row loss into "explained" (D1's newest removal entry for

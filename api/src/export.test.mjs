@@ -5,7 +5,7 @@
 // instead of getting silently flattened to `\v 6`. Not a test framework;
 // failures exit non-zero.
 
-import { attributeTsvShrink, buildAlignmentShrinkAlertMessage, buildUsfmInvalidAlertMessage, classifyAlignmentLossSeverity, offenderProvenanceFromLog, buildExportBranch, buildTnTsv, buildTqTsv, buildTwlTsv, buildUsfm, classifyAlignmentShrinkOffenders, classifyRevertSeverity, commitToDcs, countDuplicateMasterIds, describeShrinkRefusal, ensureDcsPr, exportTags, exportTsvShrinkRefused, findDcsOpenPr, isMasterConfirmed, mechanicalOverwriteAlert, parseTsvIds, recreateExportBranchFromMaster, shouldRecordRevertReport, tsvRevertReport, updateDcsPrBranch, usfmAlignmentShrinkRefused, usfmRevertReport } from "./export.ts";
+import { attributeTsvShrink, branchOverrideAllowed, prunableBranches, exportBranchOverrideValid, buildAlignmentShrinkAlertMessage, buildUsfmInvalidAlertMessage, classifyAlignmentLossSeverity, offenderProvenanceFromLog, buildExportBranch, buildTnTsv, buildTqTsv, buildTwlTsv, buildUsfm, classifyAlignmentShrinkOffenders, classifyRevertSeverity, commitToDcs, countDuplicateMasterIds, describeShrinkRefusal, ensureDcsPr, exportTags, exportTsvShrinkRefused, findDcsOpenPr, isMasterConfirmed, mechanicalOverwriteAlert, parseTsvIds, recreateExportBranchFromMaster, shouldRecordRevertReport, tsvRevertReport, updateDcsPrBranch, usfmAlignmentShrinkRefused, usfmRevertReport } from "./export.ts";
 import { CorruptContentJsonError } from "./contentJson.ts";
 import { extractVersesForRange } from "./importParsers.ts";
 import { validateUsfm } from "./usfmValidate.ts";
@@ -344,6 +344,43 @@ function utf8Base64(s) {
   for (const b of [buildExportBranch("LAM", []), buildExportBranch("NUM", ["x"])]) {
     assert(b.includes("-be-"), `${b} contains "-be-" (DCS gate literal)`);
   }
+}
+
+// --- Branch-name override: the published-book, maintainer-merges escape hatch ---
+{
+  // The override's ONLY purpose is a branch DCS will NOT auto-merge, so a name
+  // carrying the gate literal must be refused rather than sanitized — accepting
+  // one would silently restore the auto-merge it exists to prevent.
+  assert(exportBranchOverrideValid("BibleEditor-data-restoration"), `the real restoration branch name is valid`);
+  assert(!exportBranchOverrideValid("MIC-be-restore"), `a name carrying "-be-" is REFUSED`);
+  assert(!exportBranchOverrideValid("MIC-be-"), `trailing "-be-" also refused`);
+  assert(exportBranchOverrideValid("MIC-be"), `suffix-less "-be" does not match the DCS glob, so it is allowed`);
+  // git ref rules the character class alone doesn't cover.
+  assert(!exportBranchOverrideValid("foo..bar"), `".." is not a legal ref`);
+  assert(!exportBranchOverrideValid("foo.lock"), `".lock" suffix is not a legal ref`);
+  assert(!exportBranchOverrideValid("foo."), `trailing dot is not a legal ref`);
+  assert(!exportBranchOverrideValid("-leading-dash"), `leading dash refused`);
+  assert(!exportBranchOverrideValid("has space"), `whitespace refused`);
+  assert(!exportBranchOverrideValid("re/store"), `slash refused (keeps the name a single segment)`);
+  assert(!exportBranchOverrideValid(""), `empty refused`);
+
+  // Narrow gating, same shape as lockOverrideAllowed/shrinkOverrideAllowed: an
+  // unrecognized book or resource widens to every book / ALL_RESOURCES upstream,
+  // and handing ONE branch name to a multi-book run would collapse every book
+  // onto that branch, each overwriting the last.
+  const ok = { branchName: "BibleEditor-data-restoration", book: "MIC", resource: "ult" };
+  assert(branchOverrideAllowed(ok, 1, 1) === true, `single book + single resource → allowed`);
+  assert(branchOverrideAllowed(ok, 2, 1) === false, `two books → refused`);
+  assert(branchOverrideAllowed(ok, 1, 5) === false, `all resources → refused`);
+  assert(branchOverrideAllowed({ ...ok, book: undefined }, 1, 1) === false, `no book named → refused`);
+  assert(branchOverrideAllowed({ ...ok, resource: undefined }, 1, 1) === false, `no resource named → refused`);
+  assert(branchOverrideAllowed({ book: "MIC", resource: "ult" }, 1, 1) === false, `no branchName → refused`);
+  assert(
+    branchOverrideAllowed({ ...ok, branchName: "MIC-be-x" }, 1, 1) === false,
+    `an invalid name is refused by the gate too, not just by the route`,
+  );
+  // Every cron path omits branchName entirely — the nightly must be untouched.
+  assert(branchOverrideAllowed({}, 66, 5) === false, `a full nightly run never gets an override`);
 }
 
 // --- OL-quote occurrence invariant: Hebrew/Greek quote forces Occurrence >= 1 ---
@@ -1023,6 +1060,69 @@ function utf8Base64(s) {
     result.explained === missingCount && result.unexplained === 0,
     `1CH TQ: all ${missingCount} missing rows explained`,
   );
+}
+
+// --- prunableBranches: never delete a branch a human is reviewing ---
+{
+  const LEGACY = "live-snapshot";
+  // The whole point: an override branch sits in export_snapshots history beside
+  // the generated ones, and deleting it closes the maintainer's review PR.
+  const stale = ["MIC-be-bethoakes", "BibleEditor-data-restoration", "MIC-be-old"];
+  const got = prunableBranches(stale, "MIC-be-bethoakes-pjoakes", LEGACY);
+  assert(!got.includes("BibleEditor-data-restoration"), `an override branch is NEVER pruned`);
+  assert(got.includes("MIC-be-bethoakes") && got.includes("MIC-be-old"), `generated branches still pruned`);
+  assert(got.includes(LEGACY), `the legacy branch is always prunable`);
+  // keepBranch is this run's own branch and must survive even if it is in history.
+  assert(
+    !prunableBranches(["MIC-be-x"], "MIC-be-x", LEGACY).includes("MIC-be-x"),
+    `this run's own branch is never pruned`,
+  );
+  // Suffix-less `{BOOK}-be` is a valid override name (see the override tests
+  // above) and must therefore also survive the prune.
+  assert(!prunableBranches(["MIC-be"], "MIC-be-x", LEGACY).includes("MIC-be"), `"MIC-be" is not prunable`);
+  // No duplicate DELETE calls when the legacy name is also in history.
+  const dedup = prunableBranches([LEGACY, "A-be-x"], "A-be-y", LEGACY);
+  assert(dedup.filter((b) => b === LEGACY).length === 1, `legacy branch appears once`);
+}
+
+// ECC ch1 shape: a repair script run against a human ruling trashed 53 notes in
+// one pass, tagging each tombstone source='data_restoration'. Deliberate by
+// construction, so it must SHIP — credited exactly like an in-app delete. Before
+// data_restoration joined HUMAN_INTENT_REMOVAL_SOURCES these read as 53
+// unexplained losses (the truncated-fetch signature), which would have blocked
+// the export and withheld the watermark, stranding the duplicates on master.
+{
+  const masterIds = Array.from({ length: 117 }, (_, i) => `ecc${i}`);
+  const renderedIds = masterIds.slice(0, 64);            // the 64 rows we kept
+  const trashed = masterIds.slice(64);                    // the 53 we removed
+  const rowStates = [
+    ...renderedIds.map((id) => ({ id, deleted_at: null, trashed_at: null })),
+    ...trashed.map((id) => ({ id, deleted_at: 1787000000, trashed_at: null })),
+  ];
+  const removals = trashed.map((id, i) => ({ row_key: id, source: "data_restoration", id: 9000 + i }));
+  const result = attributeTsvShrink({ masterIds, renderedIds, rowStates, removals, resource: "tn" });
+  assert(result.missing === 53, `ECC: 53 rows missing from the render (got ${result.missing})`);
+  assert(result.explained === 53 && result.unexplained === 0,
+    `ECC: a data_restoration tombstone is human intent — all 53 explained (got ${result.explained}/${result.unexplained})`);
+}
+
+// Same shape, but the newest removal entry is machine-authored: still blocks.
+// Guards the widened allowlist from being read as "any tombstone counts".
+{
+  const masterIds = ["a", "b", "c"];
+  const renderedIds = ["a"];
+  const rowStates = [
+    { id: "a", deleted_at: null, trashed_at: null },
+    { id: "b", deleted_at: 1787000000, trashed_at: null },
+    { id: "c", deleted_at: 1787000000, trashed_at: null },
+  ];
+  const removals = [
+    { row_key: "b", source: "data_restoration", id: 1 },
+    { row_key: "c", source: "dcs_reimport", id: 2 },
+  ];
+  const result = attributeTsvShrink({ masterIds, renderedIds, rowStates, removals, resource: "tn" });
+  assert(result.explained === 1 && result.unexplained === 1,
+    `machine tombstone still unexplained beside a data_restoration one (got ${result.explained}/${result.unexplained})`);
 }
 
 // twl_PSA shape: a large share of master's rows are absent from the render
