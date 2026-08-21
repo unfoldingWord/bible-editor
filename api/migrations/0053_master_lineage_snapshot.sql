@@ -16,6 +16,9 @@
 -- of which name D1's boundary rather than the far end of the walk.
 --
 -- See issue #551, split from #540 item 1 while #548 landed.
+--
+-- Numbered 0053, not 0052: #555 (system_alerts.kind) also claimed 0052 while
+-- both PRs were in flight — see STATE.md's migration-number-collision lesson.
 ALTER TABLE book_resource_syncs ADD COLUMN master_lineage_json TEXT;
 ALTER TABLE book_resource_syncs ADD COLUMN master_lineage_sha TEXT;
 ALTER TABLE book_resource_syncs ADD COLUMN master_lineage_computed_at INTEGER;

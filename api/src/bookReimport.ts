@@ -532,6 +532,17 @@ export const clearTombstoneBlockAlertForTest = (
   book: string,
   resource: Resource,
 ): Promise<void> => clearTombstoneBlockAlert(env, book, resource);
+// persistMasterLineage's own DB write, exposed directly so
+// masterLineagePersist.test.mjs can drive the UPSERT (both the update-existing-
+// row path and the insert-when-absent fallback) against a real SQLite-backed
+// env.DB without re-fetching from DCS.
+export const persistMasterLineageForTest = (
+  env: Env,
+  book: string,
+  resource: Resource,
+  summary: MasterLineageSummary,
+  asOfSha: string | null,
+): Promise<void> => persistMasterLineage(env, book, resource, summary, asOfSha);
 
 function addCounts(into: ReimportCounts, from: ReimportCounts): void {
   into.updated += from.updated;
@@ -2670,10 +2681,21 @@ async function loadMasterLineage(
   return summary;
 }
 
-// Durable counterpart to the console.log above — see 0052_master_lineage_snapshot.sql.
+// Durable counterpart to the console.log above — see 0053_master_lineage_snapshot.sql.
 // Last-run-wins on the same (book, resource) row every other watermark here
 // already keys on. Never blocks the caller: a write failure here must not
 // fail a reimport whose only mistake was wanting its evidence remembered.
+//
+// UPSERT, not a plain UPDATE: loadMasterLineage only ever runs with a non-null
+// confirmedAt, which today always traces back to an existing row's
+// master_confirmed_at — so the INSERT branch should not fire in the current
+// call graph. Written as an upsert anyway (matching recordResourceSync's own
+// pattern below) so a future caller, or a row deleted/recreated between the
+// confirmedAt read and this write, still records the evidence instead of
+// silently no-oping. origin = 'lineage_only' on the insert path is honest
+// about why the row exists — NOT a real sync — and leaves source_sha NULL, so
+// planAndStageBookResources's SHA skip-gate still fails open to a full
+// reimport for this pair, same as a genuinely missing row.
 async function persistMasterLineage(
   env: Env,
   book: string,
@@ -2683,11 +2705,12 @@ async function persistMasterLineage(
 ): Promise<void> {
   try {
     await env.DB.prepare(
-      `UPDATE book_resource_syncs
-          SET master_lineage_json = ?3,
-              master_lineage_sha = ?4,
-              master_lineage_computed_at = unixepoch()
-        WHERE book = ?1 AND resource = ?2`,
+      `INSERT INTO book_resource_syncs (book, resource, origin, synced_at, master_lineage_json, master_lineage_sha, master_lineage_computed_at)
+       VALUES (?1, ?2, 'lineage_only', unixepoch(), ?3, ?4, unixepoch())
+       ON CONFLICT(book, resource) DO UPDATE SET
+         master_lineage_json = excluded.master_lineage_json,
+         master_lineage_sha = excluded.master_lineage_sha,
+         master_lineage_computed_at = excluded.master_lineage_computed_at`,
     )
       .bind(book, resource, JSON.stringify(summary), asOfSha)
       .run();
