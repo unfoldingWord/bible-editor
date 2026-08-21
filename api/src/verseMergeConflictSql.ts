@@ -97,8 +97,8 @@ export const SELECT_ACTIVE_ALERTABLE_CONFLICTS_SQL = `SELECT chapter, verse, act
 //
 // This statement does NOT touch resolved_at/resolved_by for any ADOPTION
 // action (adopt / adopt_conflict) — see the 'source_attr_divergent' /
-// 'keep_alignment_refused' reactivation carve-out at the bottom of the SET
-// clause for the deliberately safe exceptions (neither action has a CAS
+// 'keep_alignment_refused' / 'keep_ai_master' reactivation carve-out at the
+// bottom of the SET clause for the deliberately safe exceptions (none has a CAS
 // write, so the failure mode below cannot arise for either). The first
 // version of this fix (2026-08-14) cleared them here unconditionally, on the
 // theory that any fresh conflict detection should make the row visible
@@ -135,10 +135,16 @@ export const SELECT_ACTIVE_ALERTABLE_CONFLICTS_SQL = `SELECT chapter, verse, act
 // feature this table exists to support, not a bug to route around.
 //
 // Binds, in order: (book, resource, chapter, verse, action, reason,
-// overwrittenVersion, alignmentJson, now). `now` fills BOTH the ?9 slots
-// (detected_at at INSERT time only, and last_recorded_at on every write) —
-// SQLite allows a single bound value to satisfy a repeated numbered
-// parameter.
+// overwrittenVersion, alignmentJson, now, bibleVersion, observedVersion).
+// `now` fills BOTH the ?9 slots (detected_at at INSERT time only, and
+// last_recorded_at on every write) — SQLite allows a single bound value to
+// satisfy a repeated numbered parameter. `bibleVersion` is the verses table's
+// exact bible_version value ("ULT" | "UST" — NOT `resource`, which is
+// lowercased) so the reactivation version guard's subquery (see below) can
+// find the right row. `observedVersion` is the verse's version at the time
+// the caller detected this action (bookReimport.ts's `ex.version`), or NULL
+// for a caller with nothing to compare (unconditional reactivation, see the
+// version guard's own comment below).
 // ---------------------------------------------------------------------------
 export const UPSERT_VERSE_MERGE_CONFLICT_SQL = `INSERT INTO verse_merge_conflicts
      (book, resource, chapter, verse, action, reason, overwritten_version, alignment, detected_at, last_recorded_at)
@@ -180,14 +186,14 @@ export const UPSERT_VERSE_MERGE_CONFLICT_SQL = `INSERT INTO verse_merge_conflict
      END,
      alignment = COALESCE(excluded.alignment, verse_merge_conflicts.alignment),
      last_recorded_at = excluded.last_recorded_at,
-     -- REACTIVATION carve-out, 'source_attr_divergent' and
-     -- 'keep_alignment_refused' ONLY. Every other action leaves
+     -- REACTIVATION carve-out, 'source_attr_divergent', 'keep_alignment_refused',
+     -- and 'keep_ai_master' ONLY. Every other action leaves
      -- resolved_at/resolved_by untouched (the ELSE), preserving the two-phase
-     -- adoption invariant documented above. These two actions are the
-     -- exception because they are safe to be: neither has a CAS write that
-     -- could lose a race (both are unconditional keep-D1 flags, recorded once
-     -- per run and never a candidate for deleteLostAdoptionConflicts), so
-     -- re-detecting either is itself proof the underlying condition still
+     -- adoption invariant documented above. These three actions are the
+     -- exception because they are safe to be: none has a CAS write that
+     -- could lose a race (all three are unconditional keep-D1 flags, recorded
+     -- once per run and never a candidate for deleteLostAdoptionConflicts), so
+     -- re-detecting any of them is itself proof the underlying condition still
      -- exists. The reason the speculative upsert must not clear resolved_at
      -- for ADOPTIONS — a lost CAS would falsely reactivate a row nothing
      -- actually overwrote — simply cannot arise here. Without this, a human
@@ -198,9 +204,41 @@ export const UPSERT_VERSE_MERGE_CONFLICT_SQL = `INSERT INTO verse_merge_conflict
      -- nightly with no banner — the exact silent revert this row exists to
      -- surface. 'keep_alignment_refused' was originally left out of this
      -- carve-out (only partially masked by the merge_refused systemic
-     -- freeze) — see issue #457, closed here.
-     resolved_at = CASE WHEN excluded.action IN ('source_attr_divergent', 'keep_alignment_refused', 'keep_ai_master') THEN NULL ELSE verse_merge_conflicts.resolved_at END,
-     resolved_by = CASE WHEN excluded.action IN ('source_attr_divergent', 'keep_alignment_refused', 'keep_ai_master') THEN NULL ELSE verse_merge_conflicts.resolved_by END`;
+     -- freeze) — see issue #457, closed here. 'keep_ai_master' (#540 item 2)
+     -- shares the exact same no-CAS-race shape, so it gets the same carve-out.
+     --
+     -- VERSION GUARD (issue #507): the condition this run's re-upsert acts on
+     -- was read from verses.content_json EARLIER in the same applyVerseRows
+     -- call (bookReimport.ts's 'ex' snapshot), not at the moment this
+     -- statement executes. If a human saves a fix to the verse AND resolves
+     -- this conflict row in the window between that read and this upsert, the
+     -- detection is stale evidence: reactivating would erase a resolution
+     -- recorded against a condition that may already be gone. Bind ?11 is the
+     -- verse's version AT THE TIME OF THAT READ (ex.version); the subquery
+     -- reads its CURRENT version at the moment this statement runs. A
+     -- mismatch means the verse changed inside that window, so reactivation
+     -- is withheld this run — the next sync re-reads fresh and reactivates
+     -- normally if the condition still holds then. ?11 IS NULL is a
+     -- backward-compatible escape hatch (unconditional reactivation, the
+     -- pre-#507 behavior) for a caller with no observed version to compare;
+     -- production always supplies one for all three of these actions (see
+     -- verseMergeConflicts.ts's recordVerseMergeConflicts).
+     resolved_at = CASE
+       WHEN excluded.action IN ('source_attr_divergent', 'keep_alignment_refused', 'keep_ai_master')
+         AND (?11 IS NULL OR ?11 = (
+           SELECT version FROM verses WHERE book = ?1 AND bible_version = ?10 AND chapter = ?3 AND verse = ?4
+         ))
+       THEN NULL
+       ELSE verse_merge_conflicts.resolved_at
+     END,
+     resolved_by = CASE
+       WHEN excluded.action IN ('source_attr_divergent', 'keep_alignment_refused', 'keep_ai_master')
+         AND (?11 IS NULL OR ?11 = (
+           SELECT version FROM verses WHERE book = ?1 AND bible_version = ?10 AND chapter = ?3 AND verse = ?4
+         ))
+       THEN NULL
+       ELSE verse_merge_conflicts.resolved_by
+     END`;
 
 // ---------------------------------------------------------------------------
 // verseMergeConflicts.ts's confirmAdoptedConflicts — the SECOND phase of

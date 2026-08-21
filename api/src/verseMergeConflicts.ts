@@ -87,6 +87,16 @@ export interface VerseMergeConflictRow {
    */
   overwrittenVersion: number | null;
   alignment: { beforeAligned: number; afterAligned: number; lostWords: string[] } | null | undefined;
+  /**
+   * The verse's D1 `version` at the moment this row's action was detected
+   * (bookReimport.ts's `ex.version`, read earlier in the same applyVerseRows
+   * call). Used ONLY by the 'source_attr_divergent' / 'keep_alignment_refused'
+   * reactivation carve-out (see UPSERT_VERSE_MERGE_CONFLICT_SQL) to withhold
+   * reactivation when the verse changed between that read and this upsert
+   * (issue #507) — irrelevant, and safely ignored, for every other action.
+   * NULL falls back to the pre-#507 unconditional-reactivation behavior.
+   */
+  observedVersion: number | null;
 }
 
 const WRITE_BATCH = 90;
@@ -129,6 +139,7 @@ export async function recordVerseMergeConflicts(
   env: Env,
   book: string,
   resource: string,
+  bibleVersion: string,
   rows: VerseMergeConflictRow[],
   now: number,
 ): Promise<boolean> {
@@ -148,6 +159,8 @@ export async function recordVerseMergeConflicts(
             r.overwrittenVersion,
             r.alignment ? JSON.stringify(r.alignment) : null,
             now,
+            bibleVersion,
+            r.observedVersion,
           ),
         ),
       );
@@ -375,6 +388,9 @@ export async function raiseVerseMergeConflictAlert(
       reason: r.reason,
       overwrittenVersion: r.overwritten_version,
       alignment,
+      // This row is being read for display (the banner alert), not written —
+      // observedVersion only matters to recordVerseMergeConflicts's writer.
+      observedVersion: null,
     };
   });
 
