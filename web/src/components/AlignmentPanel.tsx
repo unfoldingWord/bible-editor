@@ -55,7 +55,7 @@ import {
   type HoverCtx,
 } from "../lib/alignmentHover";
 import type { TwlRow, VerseDto } from "../sync/api";
-import { alignmentDrafts, alignmentDraftKey } from "../sync/alignmentDrafts";
+import { alignmentDrafts, alignmentDraftKey, mintAlignmentDraftGeneration } from "../sync/alignmentDrafts";
 import { isVersionOnlyRebase, lostAlignedWords } from "../lib/alignmentDelta";
 import { useLexicon, type LexiconEntry } from "../hooks/useLexicon";
 import { useAlignmentSuggestions } from "../hooks/useAlignmentSuggestions";
@@ -829,11 +829,17 @@ export const AlignmentPanel = forwardRef<AlignmentPanelHandle, Props>(
       // optimistic baseline reset still uses the state that was saved.
       const commit = () => {
         // Capture the generation of whatever pre-save draft this commit
-        // represents (undefined if the 400ms debounce never got to persist
-        // one) and thread it through the outbox op — see
-        // lastDraftGenerationRef's doc comment and alignmentDrafts.ts's
-        // onOutboxResult listener (#508).
-        onSave(newContent, plain, verse.version, lastDraftGenerationRef.current);
+        // represents. If the 400ms debounce never got to persist one (a save
+        // committed within 400ms of the first drag), mint one now rather than
+        // leaving this undefined — an undefined generation would make the
+        // outbox op fall into onOutboxResult's legacy unconditional-clear
+        // fallback, which could then wipe a draft written by dragging that
+        // continued AFTER this Save. Minting one (even though nothing is
+        // persisted under it) guarantees that fallback is never reached for
+        // an up-to-date client — see lastDraftGenerationRef's doc comment and
+        // alignmentDrafts.ts's onOutboxResult listener (#508).
+        const draftGeneration = lastDraftGenerationRef.current ?? mintAlignmentDraftGeneration();
+        onSave(newContent, plain, verse.version, draftGeneration);
         // Optimistic: the freshly-saved state is now the baseline. When the
         // chapter cache eventually round-trips the new content, computedInitial
         // recomputes and the useEffect resets state to it (idempotent).

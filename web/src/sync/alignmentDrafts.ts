@@ -72,7 +72,15 @@ export function alignmentDraftKey(
 }
 
 let generationSeq = 0;
-function nextGeneration(): string {
+// Exported so a caller can mint an op's provenance identity WITHOUT writing a
+// draft — see AlignmentPanel's commit(), which needs every alignment save to
+// carry a real, unique generation even when its own 400ms persist debounce
+// never got to write one (a save committed within 400ms of the first drag).
+// Without this, that save's op would carry alignmentDraftGeneration=undefined,
+// and the onOutboxResult listener's legacy fallback (unconditional clear)
+// could then wipe a draft written by dragging that continued AFTER Save,
+// exactly the failure #508 exists to prevent.
+export function mintAlignmentDraftGeneration(): string {
   generationSeq += 1;
   return `${Date.now()}:${generationSeq}:${Math.random().toString(36).slice(2)}`;
 }
@@ -82,7 +90,7 @@ export const alignmentDrafts = {
   // where nothing is actually persisted) so callers that want generation-safe
   // cleanup later (AlignmentPanel's save path) always have a value to carry.
   async set(key: string, content: unknown, expectedVersion: number): Promise<string> {
-    const generation = nextGeneration();
+    const generation = mintAlignmentDraftGeneration();
     if (isReadOnly()) return generation;
     const rec: AlignmentDraftRecord = {
       key,
