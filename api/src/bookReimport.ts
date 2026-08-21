@@ -82,6 +82,7 @@ import {
 } from "./reimportClassify";
 import {
   classifyTsvRefMove,
+  tsvRefMoved,
   computeTsvMerge,
   foldTsvBase,
   foldTsvRefBase,
@@ -365,13 +366,15 @@ export interface ReimportCounts {
   ref_moved_theirs: number;
   ref_moved_both: number;
   ref_moved_unattributable: number;
-  // Rows whose reference-move flag this run CLEARED on the NO-OP path because the
-  // two sides now agree (issue #588). Not a move and not a merge: a flag-only,
-  // version-neutral write that makes a resolved cleanup chip disappear. Scoped to
-  // that path deliberately — the same clear in the edited-candidate resolution
-  // rides a content write whose outcome is already counted there (merge_adopted /
-  // merged_fields / skipped_edited on a lost CAS), and double-counting it would
-  // make this number stop meaning "chips that disappeared for free".
+  // Rows whose reference-move flag this run CLEARED by the version-neutral write,
+  // because the two sides now agree (issue #588). Not a move and not a merge: a
+  // flag-only write that makes a resolved cleanup chip disappear. That write
+  // serves the no-op path plus protected tn rows on the edited path (whose clear
+  // cannot ride a content write — the protection predicate would 0-change it).
+  // A non-protected edited row's clear is NOT counted here: it rides a content
+  // write whose outcome is already counted (merge_adopted / merged_fields /
+  // skipped_edited on a lost CAS), and double-counting it would make this number
+  // stop meaning "chips that disappeared for free".
   ref_moved_resolved: number;
   // Human-edited verse that DIFFERS from master but could not be adjudicated
   // at all, because this book+resource has no `master_confirmed_at` watermark
@@ -1720,6 +1723,11 @@ export async function applyTsvRows(
       // blocked from 2026-08-17). See classifyTsvRefMove.
       const refBase = bases.get(row.id)?.ref ?? null;
       const refMove = classifyTsvRefMove(cur, row, refBase, protectedRow);
+      // Do the two sides actually hold the same reference? Asked separately from
+      // the attribution above, and with the protection argument forced off, so the
+      // answer is a measurement even for a protected row (see the stale-flag clear
+      // below, which is the only thing that needs it).
+      const refsAgree = !tsvRefMoved(cur, row, false);
       // The surface field the content merge may have just adopted from master.
       // It matters to the reference decision: master's `occurrence` is co-adopted
       // with it (see block (a)) and is matched to MASTER's verse, so a row D1 has
@@ -1769,7 +1777,7 @@ export async function applyTsvRows(
           fields.review_reason = null;
         }
         counts.ref_moved_ours++;
-      } else if (refMove === "none" && !protectedRow && cur.review_kind === "ref_moved") {
+      } else if (refsAgree && cur.review_kind === "ref_moved") {
         // The two sides AGREE now — the translator moved the row in-app to match
         // Door43, or master moved back — and a flag from an earlier run is still
         // sitting on the row — while some OTHER column still diverges, which is
@@ -1785,16 +1793,28 @@ export async function applyTsvRows(
         // reported 2026-08-21.
         //
         // Guarded on 'ref_moved' exactly like the other clear, so it can never
-        // drop an unacknowledged merge_conflict / merge_kept. Excluded for a
-        // protectedRow, where classifyTsvRefMove returns "none" by policy rather
-        // than by measurement: the references may well still differ there, and
-        // such a row is deliberately left untouched from master.
+        // drop an unacknowledged merge_conflict / merge_kept.
         //
-        // This is a flag-only write on a row the run would otherwise skip, so it
-        // bumps the version once — and only once, since the next run finds no
-        // flag to clear.
-        fields.review_kind = null;
-        fields.review_reason = null;
+        // The condition is MEASURED agreement (tsvRefMoved with the protection
+        // argument forced off), not the classifier's "none". For a protected tn
+        // row classifyTsvRefMove returns "none" by POLICY without comparing
+        // anything, so keying on it would have to exclude protected rows to avoid
+        // clearing a flag whose references still differ — and excluding them then
+        // stranded the chip forever on exactly the rows nobody will edit again
+        // (PR #589 review). Comparing the references directly separates the two
+        // cases instead: agreement clears, disagreement falls through to the hold
+        // below.
+        //
+        // A protected row's clear cannot ride the normal write: buildTsvEdited
+        // WriteStmt's WHERE re-asserts `trashed_at IS NULL AND preserve = 0 AND
+        // hint = 0`, so it would 0-change and then read as a lost CAS. Route it to
+        // the same version-neutral statement the no-op path uses, which carries no
+        // protection predicate because it writes no content.
+        if (protectedRow) flagClears.push(row.id);
+        else {
+          fields.review_kind = null;
+          fields.review_reason = null;
+        }
       } else if (refMove !== "none") {
         // Everything else HOLDS: withhold the resource watermark
         // (apply_incomplete) so the export cannot write D1's location over
