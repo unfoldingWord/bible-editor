@@ -353,6 +353,12 @@ function utf8Base64(s) {
   // one would silently restore the auto-merge it exists to prevent.
   assert(exportBranchOverrideValid("BibleEditor-data-restoration"), `the real restoration branch name is valid`);
   assert(!exportBranchOverrideValid("MIC-be-restore"), `a name carrying "-be-" is REFUSED`);
+  // Rejected case-insensitively, deliberately stricter than the DCS glob: a false
+  // refusal costs nothing, whereas waving through a name that a case-folding
+  // merge bot would auto-merge rewrites a released book.
+  for (const cased of ["MIC-BE-x", "MIC-Be-x", "MIC-bE-x"]) {
+    assert(!exportBranchOverrideValid(cased), `"${cased}" is refused regardless of case`);
+  }
   assert(!exportBranchOverrideValid("MIC-be-"), `trailing "-be-" also refused`);
   assert(exportBranchOverrideValid("MIC-be"), `suffix-less "-be" does not match the DCS glob, so it is allowed`);
   // git ref rules the character class alone doesn't cover.

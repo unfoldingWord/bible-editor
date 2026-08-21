@@ -105,7 +105,13 @@ const BRANCH_OVERRIDE_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/;
 export function exportBranchOverrideValid(name: string): boolean {
   if (!BRANCH_OVERRIDE_RE.test(name)) return false;
   // The point of the override (see above) — never an auto-merging branch.
-  if (name.includes("-be-")) return false;
+  // Case-INSENSITIVE, which is deliberately stricter than the DCS glob we are
+  // guarding against. If that glob is literal, `MIC-BE-x` would not auto-merge
+  // and we reject a name that was technically safe — a harmless false refusal. If
+  // it ever lowercases the ref, `MIC-BE-x` WOULD auto-merge and a case-sensitive
+  // check here would have waved through exactly the branch this rejects. Only one
+  // of those two errors can rewrite a released book.
+  if (/-be-/i.test(name)) return false;
   // git ref rules the character class alone doesn't cover.
   if (name.endsWith(".lock") || name.endsWith(".") || name.includes("..")) return false;
   return true;

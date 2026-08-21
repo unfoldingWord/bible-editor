@@ -26,6 +26,7 @@ import { lintChapterOpeningMarkers, lintPairedPunctuation, lintTnRows, lintTqRow
 import { effectiveBookLock, canManageLocks, type BookLock } from "./bookLock";
 import { isPublishedBook } from "./publishedGuard";
 import { exportBranchOverrideValid, lockPushExportParams } from "./export";
+import { LockPushBody } from "./exportRequestBodies";
 import type { TnRow, TqRow, TwlRow, VerseRow } from "./types";
 
 export const books = new Hono<{ Bindings: Env; Variables: { userId?: number; username?: string } }>();
@@ -219,8 +220,8 @@ books.delete("/:book/lock", requireEditor, async (c) => {
 // exactly-one-book-one-resource run (see publishedGuard.ts) — a single
 // instance with resource omitted would resolve to all 5 resources and the
 // override would be silently ignored, leaving every resource skipped as
-// book_locked. validateAndMerge mirrors the nightly cron so this actually
-// lands on master rather than leaving a PR for someone to merge by hand.
+// book_locked. Whether this lands on master or waits for a maintainer depends on
+// the intent the caller chose — see the note on the two intents below.
 // TWO INTENTS, and conflating them is how a released book gets rewritten
 // unreviewed. The default above ("publish now") is right for the scenario this
 // route was built for: a lock admin unlocked a book, fixed something, re-locked
@@ -237,11 +238,9 @@ books.delete("/:book/lock", requireEditor, async (c) => {
 // and then publish-now — auto-merged to master — while the caller believed they
 // had asked for review. That is the same consequence the invalid-name 400 below
 // exists to prevent, so it fails the same way instead of failing open.
-const LockPushBody = z
-  .object({
-    branchName: z.string().min(1).max(80).optional(),
-  })
-  .strict();
+// The schema itself lives in exportRequestBodies.ts, beside /exports/run's, so
+// both routes' strictness is covered by one unit test rather than trusting a
+// route harness neither of them has.
 
 books.post("/:book/lock/push", requireEditor, async (c) => {
   const userId = currentUserId(c);
@@ -319,9 +318,15 @@ books.post("/:book/lock/push", requireEditor, async (c) => {
     // Records WHICH intent ran, not just how many fired — "did this push go
     // straight to master or wait for review?" is the first question anyone asks
     // of a published book afterwards.
-    const outcome = branchName
-      ? `dispatched ${dispatched}/${pushed.length} staged on ${branchName}`
-      : `dispatched ${dispatched}/${pushed.length}`;
+    // "staged on X" only when something actually dispatched — at 0/5 nothing was
+    // staged anywhere, and an audit row claiming otherwise is the one place a
+    // later investigator has no way to check.
+    const outcome =
+      branchName && dispatched > 0
+        ? `dispatched ${dispatched}/${pushed.length} staged on ${branchName}`
+        : branchName
+          ? `dispatched 0/${pushed.length} (intended to stage on ${branchName})`
+          : `dispatched ${dispatched}/${pushed.length}`;
     await c.env.DB.prepare(
       `INSERT INTO book_lock_events (book, locked, reason, action, user_id) VALUES (?1, 1, ?2, 'lock_push', ?3)`,
     )

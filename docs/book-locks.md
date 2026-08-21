@@ -150,18 +150,46 @@ admin but only an `editor` in `user_roles`, so he can't reach
 `POST /api/exports/run` (the admin panel's manual push) — the prompt has to
 use the narrower gate to work for him too.
 
-**One-off export override** — for pushing a fix without opening the app:
+**One-off export override** — for pushing a fix without opening the app. The
+default here is the same as in the app: **stage for review**, because a locked
+book is usually one that is in a cut release.
 
 ```bash
-curl -X POST .../api/exports/run -d '{"book":"PSA","resource":"tn","allowLocked":true}'
+curl -X POST .../api/exports/run \
+  -H 'Content-Type: application/json' \
+  -d '{"book":"PSA","resource":"tn","allowLocked":true,"branchName":"BibleEditor-restoration-PSA"}'
 ```
 
-`allowLocked` is honored **only** when the run resolves to exactly one book and
-one resource, so no cron path can ever carry it — the same doctrine as
-`allowShrink` (see `api/src/shrinkGuard.ts` for why the check is on the resolved
-counts and not the raw parameters). Using it writes an audit alert. This route
-requires `requireAdmin` (a `user_roles` admin), a stricter gate than the
-in-app prompt above.
+Keep `branchName` per-book (`BibleEditor-restoration-{BOOK}`). One shared name
+across books does not work: the export force-resets the branch ref to master and
+reuses whatever PR is already open on that head, so a second book's push
+overwrites the first and leaves its PR showing the wrong diff.
+
+To publish straight to master instead — auto-merged by DCS, no review — drop
+`branchName`. Correct for a fix you own in a book you just re-locked; **wrong**
+for a book that is in a release, where re-cutting it is the maintainer's call:
+
+```bash
+curl -X POST .../api/exports/run \
+  -H 'Content-Type: application/json' \
+  -d '{"book":"PSA","resource":"tn","allowLocked":true}'
+```
+
+Both bodies are validated `.strict()`, so a misspelled key (`branch_name`,
+`branchNames`) is a `400` rather than a silent drop — dropping it would publish
+unreviewed while you believed you had staged.
+
+`allowLocked` and `branchName` are honored **only** when the run resolves to
+exactly one book and one resource, so no cron path can ever carry them — the same
+doctrine as `allowShrink` (see `api/src/shrinkGuard.ts` for why the check is on
+the resolved counts and not the raw parameters). Using `allowLocked` writes an
+audit alert. This route requires `requireAdmin` (a `user_roles` admin), a
+stricter gate than the in-app prompt above.
+
+**One stage at a time per book × resource.** Two overlapping staged pushes of the
+same book and resource share one branch ref and one open PR, and the PR's title
+and body are written only when it is created — so the second push wins the
+content silently. Let one finish (or be merged) before starting another.
 
 ## Data model
 

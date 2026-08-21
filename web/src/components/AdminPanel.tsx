@@ -569,6 +569,10 @@ function PushCard({ bookOptions, lockedBooks }: { bookOptions: string[]; lockedB
     // dropdown left it checked (merely disabled) for a book nobody decided it
     // for.
     setAllowShrink(false);
+    // dryDcs back to its safe default too. Unticking "Render only" for one target
+    // and then switching the dropdown left the next push armed to write to Door43
+    // without that having been decided for the new book.
+    setDryDcs(true);
     // Re-derive the branch from the new book rather than carrying the old one
     // over — a stale name is precisely the cross-book collision reviewBranchFor
     // exists to prevent.

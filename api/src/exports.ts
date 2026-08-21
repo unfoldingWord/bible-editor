@@ -4,39 +4,13 @@
 //   GET  /api/exports/instance/:id — read a Workflow instance's status by id
 
 import { Hono } from "hono";
-import { z } from "zod";
 import type { Env } from "./index";
 import { requireAdmin } from "./auth";
 import { ALL_RESOURCES, exportBranchOverrideValid, type Resource } from "./export";
 
 export const exports = new Hono<{ Bindings: Env; Variables: { userId?: number } }>();
 
-const RunBody = z.object({
-  book: z.string().min(1).max(8).optional(),
-  resource: z.enum(["tn", "tq", "twl", "ult", "ust"]).optional(),
-  dryDcs: z.boolean().optional(),
-  // Opt-in to the post-export validate-and-merge orchestrator. Defaults
-  // unset (= false) so a manual single-book test export doesn't trigger
-  // the real auto-merge workflow on DCS. The 06:00 UTC cron passes true.
-  validateAndMerge: z.boolean().optional(),
-  // Override the TSV shrink guard for a verified-intentional bulk deletion.
-  // Requires book + resource to be set; the workflow ignores it otherwise.
-  allowShrink: z.boolean().optional(),
-  // FIX H: override reimportSyncGate.ts's systemic-merge-refusal gate for a
-  // book+resource a human has verified by hand — same requirement as
-  // allowShrink (book + resource both set); the workflow ignores it otherwise.
-  allowMergeRefusal: z.boolean().optional(),
-  // Override the book-lock gate for a deliberate fix to a frozen (published or
-  // explicitly locked) book. Requires book + resource to be set; the workflow
-  // ignores it otherwise.
-  allowLocked: z.boolean().optional(),
-  // Explicit branch name, for a published-book correction that a uW maintainer
-  // must review and merge by hand rather than DCS's merge bot doing it. Requires
-  // book + resource, and must not contain `-be-` (that substring is what makes
-  // DCS auto-merge, which is the thing this override exists to avoid). See
-  // branchOverrideAllowed in export.ts.
-  branchName: z.string().min(1).max(80).optional(),
-});
+import { RunExportBody as RunBody } from "./exportRequestBodies";
 
 exports.post("/run", requireAdmin, async (c) => {
   // Read the body unconditionally — gating on content-length silently dropped

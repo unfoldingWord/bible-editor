@@ -313,8 +313,19 @@ export function BookLocksDialog({ open, onClose, onChanged, books, canManageLock
                 ),
               )}
               {/* Whoever chose review needs something to hand the maintainer.
-                  "queued" alone doesn't say it was staged, or where to look. */}
-              {stageForReview && pushPrompt && (
+                  "queued" alone doesn't say it was staged, or where to look.
+                  Gated on at least one instance actually being created, NOT on
+                  pushState: `done` is any HTTP 200, so a response where all five
+                  creates failed would otherwise print a reassuring "Staged on …"
+                  directly above five error lines contradicting it. */}
+              {!pushResult.pushed.some((p) => "instanceId" in p) && (
+                <Alert severity="error" sx={{ mt: 1 }}>
+                  Nothing was queued — every resource failed to start.{" "}
+                  {bookName(pushPrompt ?? "")} has not been{" "}
+                  {stageForReview ? "staged" : "pushed"}.
+                </Alert>
+              )}
+              {stageForReview && pushPrompt && pushResult.pushed.some((p) => "instanceId" in p) && (
                 <Alert severity="info" sx={{ mt: 1 }}>
                   Staged on <strong>{reviewBranchFor(pushPrompt)}</strong>. A pull request opens on
                   Door43 for each resource that had changes (a resource with nothing to push opens
@@ -335,7 +346,7 @@ export function BookLocksDialog({ open, onClose, onChanged, books, canManageLock
             <>
               <Button onClick={closePushPrompt}>Not now</Button>
               <Button onClick={doPushNow} variant="contained">
-                Push now
+                {stageForReview ? "Stage for review" : "Publish now"}
               </Button>
             </>
           )}
