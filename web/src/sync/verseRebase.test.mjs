@@ -145,6 +145,34 @@ const sourceOf = (content, word) => (wordSources(content).find(([tx]) => tx === 
   );
 }
 
+// ── confirmed_text_edit: rebases like text_edit, keeps its own intent ──────
+//
+// Issue #575: the escalated "Save anyway" flow (Shell.tsx's pendingAlignmentLoss
+// confirm) re-enqueues a text edit with alignment_intent "confirmed_text_edit"
+// rather than "alignment_edit" — its intent is the TEXT, not an alignment
+// structure. rebaseVersePatch has no special-case branch for it, so it falls
+// through to the same text-space rebase as text_edit (unlike alignment_edit,
+// which is intentionally NOT rebased in text space — see [d] above). The
+// rebased patch must also keep the guard-exempt intent, so a still-colliding
+// rebase lands as the user already confirmed rather than tripping the guard
+// again on the server.
+{
+  console.log("\n[d2] confirmed_text_edit rebases like text_edit and preserves its intent");
+  const server = { verseObjects: [zaln("H1", [w("he")]), t(" "), zaln("H2", [w("sees")]), t(" "), zaln("H3", [w("clearly")])] };
+  const stale = { verseObjects: [zaln("H1", [w("he")]), t(" "), w("saw"), t(" "), w("clearly")] };
+  const out = rebaseVersePatch(
+    { content: stale, plain_text: "he saw clearly", alignment_intent: "confirmed_text_edit" },
+    server,
+  );
+  check(out.kind === "rebased", "confirmed_text_edit op rebases (not refuse_thread/verbatim like alignment_edit)");
+  check(extractEditableText(out.patch.content) === "he saw clearly", "the op's text edit (sees→saw) is applied");
+  check(sourceOf(out.patch.content, "clearly") === "H3", "the server's concurrent alignment on 'clearly' survives");
+  check(
+    out.patch.alignment_intent === "confirmed_text_edit",
+    "the rebased patch keeps the confirmed_text_edit intent (guard-exempt if it still collides)",
+  );
+}
+
 // ── Hebrew: combining-mark order is not a text change ──────────────────────
 //
 // UHB stores consonant-DAGESH-vowel; NFC canonical order puts the vowel
