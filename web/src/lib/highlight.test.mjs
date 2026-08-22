@@ -375,6 +375,24 @@ const JOIN = "⁠";
   );
 }
 
+// --- 16. isPaintableHtml (#568): a marker-only tree (e.g. a lone \q1 with
+// no following text) does NOT render to "" — segmentsToHtml fills the empty
+// block with a zero-width space so contenteditable has a caret slot,
+// producing non-empty-but-invisible markup. That must still count as not
+// paintable so read-only paths fall back to plain_text instead of painting
+// a text-free pane.
+{
+  const markerOnly = [{ type: "paragraph", tag: "q1" }];
+  const rendered = renderHighlightedHTML(markerOnly, new Set());
+  assert(rendered !== "", "marker-only render is non-empty markup (the #568 trap)");
+  assert(
+    !isPaintableHtml(rendered),
+    `marker-only render with no visible text is correctly classified as not paintable, got ${JSON.stringify(rendered)}`,
+  );
+  assert(isPaintableHtml("<div>&nbsp;</div>") === false, "nbsp-only markup is not paintable");
+  assert(isPaintableHtml("<div>hi</div>") === true, "markup with real text is still paintable");
+}
+
 if (failed) {
   console.error(`\n${failed} test(s) failed`);
   process.exit(1);

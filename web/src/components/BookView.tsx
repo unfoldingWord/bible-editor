@@ -751,12 +751,16 @@ const VerseCell = memo(function VerseCell({
       setHasDraft(!!rec);
       // Keep the synchronous dirty mirror in lockstep with draft existence.
       dirtyRef.current = !!rec;
-      // Hydrate from a PRE-EXISTING draft exactly once, on the first
-      // (mount-snapshot) callback — never from a draft the user is creating
-      // by typing right now. Writing to the live element mid-input resets the
-      // caret, and in Firefox `textContent` set here would clobber the verse
-      // the user is editing. Restore-on-mount (reload / chapter nav) is the
-      // only legitimate reason to push draft text into the DOM.
+      // Hydrate from a PRE-EXISTING draft exactly once — the ref only
+      // latches after an actual hydrate (#533), so this can fire on any
+      // callback, not just the first (mount-snapshot) one, if the draft
+      // store's initial callback races the draft actually being present.
+      // Once latched it never fires again — never from a draft the user is
+      // creating by typing right now. Writing to the live element mid-input
+      // resets the caret, and in Firefox `textContent` set here would
+      // clobber the verse the user is editing. Restore-on-mount (reload /
+      // chapter nav) is the only legitimate reason to push draft text into
+      // the DOM.
       if (
         !hydratedFromDraftRef.current &&
         rec &&
