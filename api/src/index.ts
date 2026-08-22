@@ -20,7 +20,7 @@ import { verseMergeConflicts } from "./verseMergeConflicts";
 import { comments } from "./comments";
 import { books } from "./bookImport";
 import { bookLockGuard } from "./bookLockGuard";
-import { EDIT_LOG_SWEEP_SQL, EDIT_LOG_RETENTION_SECONDS } from "./editLogSweep";
+import { EDIT_LOG_SWEEP_SQL, EDIT_LOG_RETENTION_SECONDS, raiseEditLogSweepBoundaryAlerts } from "./editLogSweep";
 import { attachAuth, requireAuth, requireCsrf, mintDevToken, startDcsAuth, callbackDcsAuth, authMe, authLogout, refreshToken, updateLastLocation, currentUserId, verifyToken } from "./auth";
 
 export interface Env {
@@ -347,9 +347,10 @@ export default {
       // otherwise (every keystroke that lands a PATCH writes a row). Gated
       // on minute-of-hour so it fires ~once/hour instead of every 5 min.
       // The DELETE exempts each verse's three-way-merge ancestor (and its
-      // pre-watermark AI baseline), or the merge would go permanently blind
-      // on that verse the day its last pre-watermark row aged out — see
-      // editLogSweep.ts for the full story (issue #537).
+      // pre-watermark AI baseline, and the newest pre-watermark row of a
+      // handful of pending-ancestor action classes), or the merge would go
+      // permanently blind on that verse the day its last pre-watermark row
+      // aged out — see editLogSweep.ts for the full story (issues #537, #573).
       const minuteOfHour = Math.floor(Date.now() / 60_000) % 60;
       if (minuteOfHour < 5) {
         // try/catch (same shape as the pipeline_jobs cleanup above): a failed
@@ -361,6 +362,24 @@ export default {
             .run();
         } catch (e) {
           console.error("edit_log retention sweep failed", e instanceof Error ? e.message : String(e));
+        }
+      }
+      // Once-per-day edit_log sweep boundary alarm (issue #573 part 1).
+      // Doesn't need hourly granularity — a book+resource's master-confirmed
+      // watermark moves at most once a night (the 05:30 UTC export), so
+      // checking more often than daily can't see anything new. Gated on a
+      // specific hour (04:00 UTC, ahead of the 05:30 export so a fix landed
+      // today is reflected before tonight's run) AND the same minuteOfHour<5
+      // window the hourly sweep uses, so this fires in exactly one of the
+      // POLL_CRON's twelve ticks per hour, once a day. Already best-effort
+      // internally (raiseEditLogSweepBoundaryAlerts has its own try/catch —
+      // this alarm gates nothing and must never fail the cron tick), but
+      // wrapped again here for defense in depth, same as the sweep above.
+      if (minuteOfHour < 5 && new Date(controller.scheduledTime).getUTCHours() === 4) {
+        try {
+          await raiseEditLogSweepBoundaryAlerts(env);
+        } catch (e) {
+          console.error("edit_log sweep boundary alarm failed", e instanceof Error ? e.message : String(e));
         }
       }
       return;

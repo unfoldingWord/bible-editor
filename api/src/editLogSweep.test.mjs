@@ -20,7 +20,14 @@ import { DatabaseSync } from "node:sqlite";
 import { readFileSync, readdirSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { EDIT_LOG_SWEEP_SQL } from "./editLogSweep.ts";
+import {
+  EDIT_LOG_SWEEP_SQL,
+  EDIT_LOG_RETENTION_SECONDS,
+  EDIT_LOG_SWEEP_ALARM_MARGIN_SECONDS,
+  toStaleSweepBoundary,
+  findStaleSweepBoundaries,
+  raiseEditLogSweepBoundaryAlerts,
+} from "./editLogSweep.ts";
 
 let failed = 0;
 function assert(cond, msg) {
@@ -240,6 +247,181 @@ console.log("\n[a legacy row with book IS NULL is still shielded — the join re
   sweep(d, 100000);
 
   assert(survivingIds(d).join(",") === "7", "NULL-book ancestor survives (merge accepts book IS NULL rows, so the shield must too)");
+}
+
+// ---------------------------------------------------------------------------
+// Issue #573 part 2: pending-ancestor action classes survive the sweep too.
+
+console.log(
+  "\n[issue #573 part 2 ablation: a pending-ancestor action class row survives a full age-out sweep, but a same-shaped row from an action NOT on the list does not]",
+);
+{
+  const d = freshDb();
+  syncRow(d, { book: "ZEC", resource: "ult", confirmedAt: 5000, editId: 2 });
+  const key = "ZEC/3/4/ULT";
+  // The verse's real create/update ancestor (branch 1) — kept regardless, so
+  // this test isolates branch 3's own behavior rather than accidentally
+  // passing because branch 1 happened to keep something.
+  logRow(d, { id: 1, rowKey: key, book: "ZEC", action: "create", createdAt: 500, payload: '{"content":"base"}' });
+  // A pending-ancestor class row (docs/sync-attribution-handoff.md), pre-watermark.
+  logRow(d, { id: 2, rowKey: key, book: "ZEC", action: "restore_master_verse", createdAt: 1000, payload: '{"content":"restored"}' });
+  // Same shape, but an action NOT in the #573 list — must still be swept
+  // exactly as before this change (the ablation half: if branch 3's action
+  // filter were accidentally removed or widened, this row would wrongly
+  // survive too).
+  logRow(d, { id: 3, rowKey: key, book: "ZEC", action: "dcs_reimport", createdAt: 1000, payload: '{"content":"not exempt"}' });
+
+  sweep(d, 100000);
+
+  const ids = survivingIds(d);
+  assert(ids.includes(2), "the pending-ancestor-class row (restore_master_verse) survives the age-out sweep");
+  assert(!ids.includes(3), "a same-shaped row from an action NOT on the #573 list is swept (ablation: proves branch 3 isn't just keeping everything)");
+}
+
+console.log(
+  "\n[issue #573 part 2: a verse with rows in MULTIPLE pending-ancestor classes keeps one exemplar of EACH class, not just the newest overall]",
+);
+{
+  const d = freshDb();
+  syncRow(d, { book: "JON", resource: "ust", confirmedAt: 9000, editId: 1 });
+  const key = "JON/2/3/UST";
+  logRow(d, { id: 1, rowKey: key, book: "JON", action: "create", createdAt: 100, payload: '{"content":"base"}' });
+  // Two different pending classes on the same verse, both pre-watermark.
+  // 'heal-replacement-chars' is the NEWER of the two by created_at.
+  logRow(d, { id: 2, rowKey: key, book: "JON", action: "normalize-align-order", createdAt: 1000, payload: '{"content":"norm"}' });
+  logRow(d, { id: 3, rowKey: key, book: "JON", action: "heal-replacement-chars", createdAt: 2000, payload: '{"content":"heal"}' });
+  // An older row of the SAME class as id 3 — must be superseded by id 3
+  // within that class (the "newest per class" half of the GROUP BY).
+  logRow(d, { id: 4, rowKey: key, book: "JON", action: "heal-replacement-chars", createdAt: 1500, payload: '{"content":"heal-old"}' });
+
+  sweep(d, 100000);
+
+  const ids = survivingIds(d);
+  assert(ids.includes(2), "the normalize-align-order exemplar survives even though a newer row exists in a DIFFERENT class");
+  assert(ids.includes(3), "the newest heal-replacement-chars row survives");
+  assert(!ids.includes(4), "the OLDER heal-replacement-chars row is superseded by the newer one of its own class");
+}
+
+console.log("\n[issue #573 part 2: pending-ancestor class rows respect the same watermark/no-watermark boundary as baseline]");
+{
+  const d = freshDb();
+  syncRow(d, { book: "NAM", resource: "ult", confirmedAt: 5000, editId: 1 });
+  const key = "NAM/1/1/ULT";
+  logRow(d, { id: 1, rowKey: key, book: "NAM", action: "create", createdAt: 100, payload: '{"content":"base"}' });
+  logRow(d, { id: 2, rowKey: key, book: "NAM", action: "restore", createdAt: 2000 }); // pre-watermark: exempt
+  logRow(d, { id: 3, rowKey: key, book: "NAM", action: "restore", createdAt: 6000 }); // post-watermark: not exempt by branch 3
+
+  sweep(d, 100000);
+
+  const ids = survivingIds(d);
+  assert(ids.includes(2), "the pre-watermark 'restore' row survives");
+  assert(!ids.includes(3), "the post-watermark 'restore' row is swept (branch 3 only shields pre-watermark rows, same as branch 2)");
+}
+
+// ---------------------------------------------------------------------------
+// Issue #573 part 1: the stale-boundary alarm.
+
+// Minimal D1 shim over node:sqlite — same shape as applyVerseRows.test.mjs's
+// makeDb (prepare().bind().all()/.run(), and batch()), reused here so
+// findStaleSweepBoundaries / raiseEditLogSweepBoundaryAlerts can run against
+// this file's own freshDb() without a second, drifting copy of the schema
+// setup.
+function makeD1(sqlite) {
+  const mk = (sql, args) => ({
+    sql,
+    args,
+    bind: (...a) => mk(sql, a),
+    all() {
+      return { results: sqlite.prepare(sql).all(...args), success: true };
+    },
+    run() {
+      const r = sqlite.prepare(sql).run(...args);
+      return { success: true, meta: { changes: Number(r.changes), last_row_id: Number(r.lastInsertRowid) } };
+    },
+  });
+  return {
+    prepare: (sql) => mk(sql, []),
+    async batch(stmts) {
+      const out = [];
+      for (const s of stmts) out.push(s.run());
+      return out;
+    },
+  };
+}
+
+function alertRows(sqlite, source) {
+  return sqlite
+    .prepare(`SELECT username, severity, source, message, dismissed_at FROM system_alerts WHERE source LIKE ? ORDER BY source`)
+    .all(source);
+}
+
+console.log("\n[toStaleSweepBoundary: day math]");
+{
+  const now = 1_000_000;
+  const s = toStaleSweepBoundary({ book: "ZEC", resource: "ult", master_confirmed_at: now - EDIT_LOG_RETENTION_SECONDS + 5 * 86400 }, now);
+  assert(s.daysRemaining === 5, `boundary 5 days from the retention cutoff reports 5 days remaining (got ${s.daysRemaining})`);
+  const past = toStaleSweepBoundary({ book: "ZEC", resource: "ult", master_confirmed_at: now - EDIT_LOG_RETENTION_SECONDS - 100 }, now);
+  assert(past.daysRemaining === 0, "a boundary already past the retention window clamps to 0, never negative");
+}
+
+console.log("\n[findStaleSweepBoundaries: a fresh watermark produces no alarm; a watermark older than the threshold does]");
+{
+  const d = freshDb();
+  const env = { DB: makeD1(d) };
+  const now = 20_000_000;
+  syncRow(d, { book: "ZEC", resource: "ult", confirmedAt: now - 10 * 86400, editId: 1 });
+  syncRow(d, { book: "JER", resource: "ust", confirmedAt: now - (EDIT_LOG_RETENTION_SECONDS - EDIT_LOG_SWEEP_ALARM_MARGIN_SECONDS + 86400), editId: 1 });
+  syncRow(d, { book: "ECC", resource: "ult", confirmedAt: null, editId: null });
+  syncRow(d, { book: "ZEC", resource: "tn", confirmedAt: now - EDIT_LOG_RETENTION_SECONDS * 2, editId: null });
+
+  const stale = await findStaleSweepBoundaries(env, now);
+
+  assert(stale.length === 1, `exactly one stale boundary found (got ${stale.length})`);
+  assert(stale[0]?.book === "JER" && stale[0]?.resource === "ust", "the stale boundary is JER ust");
+  assert(stale[0]?.daysRemaining < EDIT_LOG_SWEEP_ALARM_MARGIN_SECONDS / 86400, "the stale boundary reports less than the full margin's worth of days remaining");
+}
+
+console.log("\n[raiseEditLogSweepBoundaryAlerts: writes a warning naming the book+resource and runway, dismissing it and re-running doesn't duplicate it, and a healed boundary clears its alert]");
+{
+  const d = freshDb();
+  const env = { DB: makeD1(d) };
+  const now = 20_000_000;
+  const staleAt = now - (EDIT_LOG_RETENTION_SECONDS - EDIT_LOG_SWEEP_ALARM_MARGIN_SECONDS + 2 * 86400);
+  syncRow(d, { book: "JER", resource: "ust", confirmedAt: staleAt, editId: 1 });
+
+  await raiseEditLogSweepBoundaryAlerts(env, now);
+
+  let rows = alertRows(d, "edit_log_sweep_boundary_stale:%");
+  assert(rows.length === 1, `exactly one alert row written (got ${rows.length})`);
+  assert(rows[0]?.severity === "warning", "severity is 'warning', not 'error' — nothing has been lost yet");
+  assert(rows[0]?.source === "edit_log_sweep_boundary_stale:JER:ust", "source names the specific book+resource");
+  assert(rows[0]?.message.includes("JER") && rows[0]?.message.includes("UST"), "message names the specific book+resource");
+  assert(/\d+ day\(s\) of runway/.test(rows[0]?.message ?? ""), "message states roughly how many days of runway remain");
+
+  // Re-running with nothing changed must not create a second row for the
+  // same still-undismissed alert.
+  await raiseEditLogSweepBoundaryAlerts(env, now);
+  rows = alertRows(d, "edit_log_sweep_boundary_stale:%");
+  assert(rows.length === 1, "re-running with an unchanged stale boundary does not duplicate the alert");
+
+  // Dismiss it, then re-run with the SAME still-stale boundary: the
+  // dismissed row must survive as a historical record and must NOT be
+  // resurrected as a fresh undismissed row.
+  d.prepare(`UPDATE system_alerts SET dismissed_at = ?1 WHERE source = 'edit_log_sweep_boundary_stale:JER:ust'`).run(now);
+  await raiseEditLogSweepBoundaryAlerts(env, now);
+  rows = alertRows(d, "edit_log_sweep_boundary_stale:%");
+  assert(rows.length === 1, "still exactly one row after dismiss+re-run (no duplicate created)");
+  assert(rows[0]?.dismissed_at != null, "the dismissed alert is left dismissed rather than being resurrected while the SAME condition persists");
+
+  // Heal the boundary (a fresh export re-confirms it) and re-run: any
+  // lingering UNDISMISSED alert for a now-healthy boundary must clear. Reset
+  // dismissed_at first so we're testing the "healed" clear path specifically,
+  // not the dismissal-survives path just proven above.
+  d.prepare(`UPDATE system_alerts SET dismissed_at = NULL WHERE source = 'edit_log_sweep_boundary_stale:JER:ust'`).run();
+  d.prepare(`UPDATE book_resource_syncs SET master_confirmed_at = ?1 WHERE book = 'JER' AND resource = 'ust'`).run(now - 86400);
+  await raiseEditLogSweepBoundaryAlerts(env, now);
+  rows = alertRows(d, "edit_log_sweep_boundary_stale:%");
+  assert(rows.length === 0, "an undismissed alert for a boundary that healed is cleared, not left stale forever");
 }
 
 if (failed > 0) {
