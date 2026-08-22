@@ -266,6 +266,36 @@ eq(merge.writeFields, { note: "n_master" }, "merge writes only master's note; ou
   );
 }
 
+// The same cross-book guard on the CONTENT ancestor (#545), through the real
+// query. foldTsvBase got the identical `bookKnown === false` skip foldTsvRefBase
+// already had — proven above — this exercises it against the SAME query, not a
+// hand-built entry list, for the same reason: a missing `book` column in the
+// SELECT would silently zero out every content ancestor too.
+{
+  const ID6 = "kl12";
+  // A legacy entry with NO book: another book's note landing on the same
+  // 4-char id. It must not contribute a field to this book's ancestor.
+  ins.run(KIND, ID6, null, "create", JSON.stringify({ quote: "foreign-q", note: "foreign-n" }), 50);
+  const known = ins.run(
+    KIND, ID6, BOOK, "create", JSON.stringify({ quote: "q0", note: "n0" }), 100,
+  );
+  eq(
+    reconstructBase([ID6], Number(known.lastInsertRowid)).get(ID6),
+    { quote: "q0", note: "n0" },
+    "the book-NULL entry is admitted by the query but refused by the content fold",
+  );
+
+  // With ONLY the unattributable entry the ancestor is null — withhold, never a
+  // confident note lifted from another book.
+  const ID7 = "mn34";
+  const only = ins.run(KIND, ID7, null, "create", JSON.stringify({ quote: "foreign-q", note: "foreign-n" }), 50);
+  eq(
+    reconstructBase([ID7], Number(only.lastInsertRowid)).get(ID7),
+    null,
+    "a history of only book-NULL entries yields no content ancestor",
+  );
+}
+
 if (failed) {
   console.error(`\n${failed} assertion(s) FAILED`);
   process.exit(1);
