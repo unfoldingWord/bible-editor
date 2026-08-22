@@ -16,7 +16,7 @@ import {
   type VerseOpExit,
   type VerseOpExitInfo,
 } from "./draftSaveState";
-import { unpinVerseBase } from "./versePin";
+import { peekPinnedVerseBase, unpinVerseBase } from "./versePin";
 export { pinVerseBase, peekPinnedVerseBase } from "./versePin";
 
 const DB_NAME = "bible-editor-drafts";
@@ -363,3 +363,30 @@ onOutboxResult((op, result) => {
 // SyncStatusBar's discard flows (refused, unresolvable-conflict, discard-all)
 // all funnel through outbox.drop — the other permanent deletion (#565).
 onOutboxDiscard((op) => handleVerseExit(op, "discarded"));
+
+// ---------- DEV-only test introspection (#571) ----------
+//
+// The pin map is deliberately unexposed to application code — versePin.ts's
+// own doc comment says so, and nothing outside it and this file touches
+// `pinnedVerseBase` directly. tests/concurrency/s9-verse-pin-release.spec.ts
+// drives the #565/#569 release rule through the real BroadcastChannel/outbox
+// plumbing and mostly asserts on observable outcomes (absence of a 409/merge
+// prompt), per the issue's own preference. But success check (b) — the
+// `locked` exit — has no such externally-observable difference: a pipeline
+// lock rejects the PATCH before the server's version ever moves, so a leaked
+// pin and a freshly-released one carry the SAME expected_version and produce
+// the SAME outcome either way. Only peeking the pin itself can tell the two
+// apart there, so this hook exists purely for that spec, matching the issue's
+// own suggested fallback. Gated on import.meta.env.DEV so it never reaches a
+// production bundle; `typeof window` also keeps it inert for anything that
+// imports this module outside a browser (nothing currently does — this file
+// is side-effecting at import, so the plain-Node draftSaveState.test.mjs
+// deliberately imports draftSaveState.ts / versePin.ts instead).
+declare global {
+  interface Window {
+    __bePinDebug?: { peek: typeof peekPinnedVerseBase };
+  }
+}
+if (typeof window !== "undefined" && import.meta.env.DEV) {
+  window.__bePinDebug = { peek: peekPinnedVerseBase };
+}
