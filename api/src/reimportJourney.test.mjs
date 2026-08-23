@@ -316,6 +316,55 @@ console.log("\n[(c) the banner is QUERYABLE where the UI reads it]");
   );
 }
 
+console.log("\n[(f) issue #473 option A: idBlockedOverride force-releases the withhold]");
+{
+  const { sqlite, env } = freshEnv();
+  seedTombstone(sqlite);
+  const raced = withReclaimRace(env, sqlite, BOOK, ID);
+  const counts = await applyTsvRows(raced, BOOK, "tq", [masterRow()], null);
+  eq(counts.tombstone_blocked, 1, "sanity: this run genuinely blocked a row, same setup as (b)/(c)");
+
+  // The override is scoped to the conflict_skipped/tombstone_blocked half
+  // only — with no other withhold reason active, the aggregate now stamps.
+  const { zeroCountsForTest, addCountsForTest } = await import("./bookReimport.ts");
+  const aggregate = zeroCountsForTest();
+  addCountsForTest(aggregate, counts);
+  eq(shouldRecordResourceSync(aggregate), false, "sanity: withheld without the override, exactly like (b)");
+  eq(shouldRecordResourceSync(aggregate, true), true, "idBlockedOverride true → the aggregate now stamps");
+
+  // The real write path runChunkedReimport's override branch takes: record the
+  // watermark, THEN raise the distinct "force-released" alert (never the
+  // ordinary "still withheld" one, and never clearTombstoneBlockAlert, which
+  // would silently delete this alert since both share the same source).
+  await recordResourceSync(env, BOOK, "tq", "abc123def456", "reimport");
+  const { raiseTombstoneBlockAlertForTest } = await import("./bookReimport.ts");
+  await raiseTombstoneBlockAlertForTest(env, BOOK, "tq", aggregate, true);
+
+  const syncRow = sqlite
+    .prepare(`SELECT origin FROM book_resource_syncs WHERE book = ? AND resource = ?`)
+    .all(BOOK, "tq")[0];
+  eq(syncRow?.origin, "reimport", "the watermark WAS recorded — the override actually let the sync through");
+
+  const alert = sqlite
+    .prepare(`SELECT username, severity, source, message FROM system_alerts WHERE source = ? AND dismissed_at IS NULL`)
+    .all(`reimport_id_blocked:${BOOK}:tq`)[0];
+  eq(alert !== undefined, true, "the override still leaves a durable alert row behind");
+  eq(alert?.severity, "warning", "raised at warning severity, not the ordinary withhold's error");
+  eq(alert?.message.includes("force-released"), true, "names the override explicitly");
+  eq(alert?.message.includes("allowIdBlocked"), true, "names the param a human would recognize");
+  eq(
+    alert?.message.includes("will NOT export to Door43 until this is cleared"),
+    false,
+    "must NOT reuse the ordinary withhold's wording — that promise is false once the override went through",
+  );
+  eq(
+    alert?.message.includes("WILL delete them from master"),
+    true,
+    "states the actual consequence — Door43 loses the still-missing row(s) on this export",
+  );
+  eq(alert?.message.includes("hoig"), true, "still names the actual affected row id");
+}
+
 console.log("\n[(d) the HEALTHY path still stamps — no false withhold]");
 {
   const { sqlite, env } = freshEnv();

@@ -553,7 +553,8 @@ export const raiseTombstoneBlockAlertForTest = (
   book: string,
   resource: Resource,
   counts: ReimportCounts,
-): Promise<void> => raiseTombstoneBlockAlert(env, book, resource, counts);
+  overridden: boolean = false,
+): Promise<void> => raiseTombstoneBlockAlert(env, book, resource, counts, overridden);
 // aiRowDiffGate.test.mjs (issue #485 P1 follow-up): softDeleteRemovedTsvRows is
 // the prune half of the diff gate — this alias lets the test drive the REAL
 // prune against the real SQL (same rationale as the aliases above) to confirm
@@ -4635,11 +4636,18 @@ async function raiseKeptOverDoor43Alert(
   }
 }
 
+// `overridden` (issue #473 option A): the caller granted allowIdBlocked for
+// this exact resource, so the watermark was recorded and tonight's export
+// WILL publish. This is a materially different message from the ordinary
+// withhold below — it must not say "will NOT export until this is cleared"
+// when the opposite just happened. See idBlockedOverrideAllowed /
+// shouldRecordResourceSync's idBlockedOverride doc comment.
 async function raiseTombstoneBlockAlert(
   env: Env,
   book: string,
   resource: Resource,
   counts: ReimportCounts,
+  overridden: boolean = false,
 ): Promise<void> {
   const blocked = counts.tombstone_blocked ?? 0;
   const conflicts = counts.conflict_skipped ?? 0;
@@ -4647,29 +4655,37 @@ async function raiseTombstoneBlockAlert(
   const source = `reimport_id_blocked:${book}:${resource}`;
   const shown = samples.slice(0, 10);
   const more = blocked + conflicts - shown.length;
-  const message =
-    `Benjamin — tonight's Door43 sync could not import ${blocked + conflicts} ${book} ` +
-    `${resource.toUpperCase()} row(s) because their IDs are still held in our database by ` +
-    `soft-deleted rows (a deleted row keeps its ID for that book permanently). Those rows are ` +
-    `MISSING from the app, so ${book} ${resource.toUpperCase()} has been left marked out of sync and ` +
-    `will NOT export to Door43 until this is cleared — otherwise the export would delete those same ` +
-    `rows from Door43. ` +
-    (blocked > 0
-      ? `${blocked} lost the automatic reclaim's version-CAS race against a concurrent writer on the ` +
-        `same deleted row (usually clears on its own next sync, once that race resolves)`
-      : "") +
-    (blocked > 0 && conflicts > 0 ? "; " : "") +
-    (conflicts > 0 ? `${conflicts} refused by the database as an ID already in use` : "") +
-    `. Affected: ${shown.join(" | ")}${more > 0 ? ` (and ${more} more)` : ""}. ` +
-    (conflicts > 0
-      ? `The ID-already-in-use row(s) do NOT clear on their own — the next sync hits the same collision; ` +
-        `give the affected row(s) a different ID on Door43. `
-      : "") +
-    (blocked > 0
-      ? `The reclaim-race row(s) above should resolve automatically; if this persists across multiple ` +
-        `nights for the same row, something is wrong with the automatic reclaim (GitHub issue #427, ` +
-        `option 1) and it needs a human look.`
-      : "");
+  const message = overridden
+    ? `Benjamin — the ID-blocked watermark withhold for ${book} ${resource.toUpperCase()} was force-released ` +
+      `by explicit request (allowIdBlocked). ${blocked + conflicts} row(s) whose IDs are still held in our ` +
+      `database by soft-deleted rows were NOT imported and are still MISSING from the app — Door43 still ` +
+      `carries them, and tonight's export WILL delete them from master, because the sync watermark was ` +
+      `recorded anyway. Affected: ${shown.join(" | ")}${more > 0 ? ` (and ${more} more)` : ""}. If this was ` +
+      `not a deliberate, verified reissue, restore the soft-deleted row(s) before the next export runs.`
+    : `Benjamin — tonight's Door43 sync could not import ${blocked + conflicts} ${book} ` +
+      `${resource.toUpperCase()} row(s) because their IDs are still held in our database by ` +
+      `soft-deleted rows (a deleted row keeps its ID for that book permanently). Those rows are ` +
+      `MISSING from the app, so ${book} ${resource.toUpperCase()} has been left marked out of sync and ` +
+      `will NOT export to Door43 until this is cleared — otherwise the export would delete those same ` +
+      `rows from Door43. ` +
+      (blocked > 0
+        ? `${blocked} lost the automatic reclaim's version-CAS race against a concurrent writer on the ` +
+          `same deleted row (usually clears on its own next sync, once that race resolves)`
+        : "") +
+      (blocked > 0 && conflicts > 0 ? "; " : "") +
+      (conflicts > 0 ? `${conflicts} refused by the database as an ID already in use` : "") +
+      `. Affected: ${shown.join(" | ")}${more > 0 ? ` (and ${more} more)` : ""}. ` +
+      (conflicts > 0
+        ? `The ID-already-in-use row(s) do NOT clear on their own — the next sync hits the same collision; ` +
+          `give the affected row(s) a different ID on Door43. `
+        : "") +
+      (blocked > 0
+        ? `The reclaim-race row(s) above should resolve automatically; if this persists across multiple ` +
+          `nights for the same row, something is wrong with the automatic reclaim (GitHub issue #427, ` +
+          `option 1) and it needs a human look.`
+        : "") +
+      ` An explicit-override escape hatch exists (allowIdBlocked on POST /api/exports/run) for a ` +
+      `verified-genuine reissue — see GitHub issue #473.`;
   try {
     await env.DB.prepare(`DELETE FROM system_alerts WHERE username = ?1 AND source = ?2 AND dismissed_at IS NULL`)
       .bind(OWN_PUBLISH_ALERT_USERNAME, source)
@@ -4677,7 +4693,7 @@ async function raiseTombstoneBlockAlert(
     await env.DB.prepare(
       `INSERT INTO system_alerts (username, severity, source, message, link_url) VALUES (?1, ?2, ?3, ?4, ?5)`,
     )
-      .bind(OWN_PUBLISH_ALERT_USERNAME, "error", source, message, null)
+      .bind(OWN_PUBLISH_ALERT_USERNAME, overridden ? "warning" : "error", source, message, null)
       .run();
   } catch (e) {
     // Best-effort, exactly like every other alert helper here: a failed banner
@@ -5571,7 +5587,12 @@ export async function runChunkedReimport(
   // (exportWorkflow.ts) uses to compute this, gated on the run naming
   // exactly one book AND one resource). Undefined/omitted preserves the
   // pre-existing behavior for every cron path.
-  opts: { chunk?: number; mergeRefusalOverrideResource?: Resource } = {},
+  // Issue #473 option A: `idBlockedOverrideResource` — when set, the
+  // conflict_skipped/tombstone_blocked half of shouldRecordResourceSync is
+  // forced open for exactly this ONE resource, computed the same narrow way
+  // by exportWorkflow.ts's idBlockedOverrideAllowed. Undefined/omitted
+  // preserves the pre-existing behavior for every cron path.
+  opts: { chunk?: number; mergeRefusalOverrideResource?: Resource; idBlockedOverrideResource?: Resource } = {},
 ): Promise<ReimportResult> {
   const chunkSize = opts.chunk ?? REIMPORT_CHAPTER_CHUNK;
 
@@ -5763,11 +5784,22 @@ export async function runChunkedReimport(
       // other holder) already owns their (book, id) primary key. Folded into
       // shouldRecordResourceSync rather than checked separately here, so the
       // aggregation-laundering guard (counts_incomplete) covers them too.
-      if (!shouldRecordResourceSync(perResource[e.resource]) || systemicRefusals || mergeRecordFailed || applyIncomplete) {
+      // Issue #473 option A: the override, when the caller granted it for
+      // exactly this resource, forces shouldRecordResourceSync's
+      // conflict_skipped/tombstone_blocked check open for this run only — see
+      // opts.idBlockedOverrideResource's doc above. It never touches the OTHER
+      // three withhold conditions on this line (systemicRefusals,
+      // mergeRecordFailed, applyIncomplete stay unconditional).
+      const idBlockedOverride = opts.idBlockedOverrideResource === e.resource;
+      const dropped =
+        (perResource[e.resource].conflict_skipped ?? 0) + (perResource[e.resource].tombstone_blocked ?? 0);
+      if (
+        !shouldRecordResourceSync(perResource[e.resource], idBlockedOverride) ||
+        systemicRefusals ||
+        mergeRecordFailed ||
+        applyIncomplete
+      ) {
         withheld.push(e.resource);
-        const dropped =
-          (perResource[e.resource].conflict_skipped ?? 0) +
-          (perResource[e.resource].tombstone_blocked ?? 0);
         if (dropped > 0) {
           await raiseTombstoneBlockAlert(env, book, e.resource, perResource[e.resource]);
         }
@@ -5785,6 +5817,17 @@ export async function runChunkedReimport(
       if (!e.masterSha) continue;
       await recordResourceSync(env, book, e.resource, e.masterSha, "reimport");
       recorded++;
+      // Issue #473 option A: the override let a nonzero drop count through to
+      // a recorded sync above — raise the distinct "force-released, Door43
+      // will lose these rows" alert instead of clearing it. Ordered AFTER
+      // recordResourceSync (so the durable record reflects what actually
+      // happened) and INSTEAD OF clearTombstoneBlockAlert below (which would
+      // otherwise immediately delete the very alert this just wrote — both
+      // share the same `reimport_id_blocked:${book}:${resource}` source).
+      if (idBlockedOverride && dropped > 0) {
+        await raiseTombstoneBlockAlert(env, book, e.resource, perResource[e.resource], true);
+        continue;
+      }
       // The resource just synced cleanly (it reached here, so it was NOT
       // withheld above) — clear any stale reimport_id_blocked alert from a
       // past run's tombstone_blocked/conflict_skipped count. See

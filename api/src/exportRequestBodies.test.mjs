@@ -28,6 +28,7 @@ for (const [label, body] of [
   ["plural branchNames", { book: "PSA", resource: "tn", allowLocked: true, branchNames: "BibleEditor-restoration-PSA" }],
   ["lowercased branchname", { book: "PSA", resource: "tn", allowLocked: true, branchname: "BibleEditor-restoration-PSA" }],
   ["an entirely unknown key", { book: "PSA", resource: "tn", nonsense: 1 }],
+  ["snake_case allow_id_blocked", { book: "PSA", resource: "tq", allow_id_blocked: true }],
 ]) {
   const parsed = RunExportBody.safeParse(body);
   assert(!parsed.success, `/exports/run rejects ${label}`);
@@ -63,6 +64,7 @@ const everything = RunExportBody.safeParse({
   validateAndMerge: false,
   allowShrink: true,
   allowMergeRefusal: true,
+  allowIdBlocked: true,
   allowLocked: true,
   branchName: "BibleEditor-restoration-MIC",
 });

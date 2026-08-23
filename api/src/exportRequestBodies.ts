@@ -33,6 +33,14 @@ export const RunExportBody = z
     // book+resource a human has verified by hand — same requirement as
     // allowShrink (book + resource both set); the workflow ignores it otherwise.
     allowMergeRefusal: z.boolean().optional(),
+    // Issue #473 option A: override reimportSyncGate.ts's conflict_skipped /
+    // tombstone_blocked watermark withhold for a book+resource whose ID
+    // collision a human has verified is a genuine reissue, not a pending
+    // delete. Same requirement as allowShrink/allowMergeRefusal (book +
+    // resource both set); the workflow ignores it otherwise. Unlike those two,
+    // this does not just resume a stalled sync — it consents to Door43 losing
+    // the blocked row(s) on the next export (see raiseTombstoneBlockAlert).
+    allowIdBlocked: z.boolean().optional(),
     // Override the book-lock gate for a deliberate fix to a frozen (published or
     // explicitly locked) book. Requires book + resource to be set; the workflow
     // ignores it otherwise.

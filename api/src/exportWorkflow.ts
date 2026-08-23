@@ -83,7 +83,7 @@ import { hardRejectRows } from "./hardRejectGuard";
 import { validateUsfm, summarizeUsfmIssues } from "./usfmValidate";
 import type { UsfmValidationIssue } from "./usfmValidate";
 import { shrinkOverrideAllowed } from "./shrinkGuard";
-import { mergeRefusalOverrideAllowed } from "./reimportSyncGate";
+import { mergeRefusalOverrideAllowed, idBlockedOverrideAllowed } from "./reimportSyncGate";
 import { lockedBooksIn } from "./bookLock";
 import {
   PUBLISHED_RELEASE_TAG,
@@ -133,6 +133,17 @@ export interface ExportParams {
   // Same narrow gating as allowShrink: only honored for a single explicitly-
   // named book AND resource, via mergeRefusalOverrideAllowed.
   allowMergeRefusal?: boolean;
+  // Issue #473 option A: human override for the conflict_skipped /
+  // tombstone_blocked half of reimportSyncGate.ts's shouldRecordResourceSync —
+  // the watermark withhold that has no automatic release when a soft-deleted
+  // row permanently holds a (book, id) primary-key slot master wants to reissue
+  // (see raiseTombstoneBlockAlert). Same narrow gating as allowMergeRefusal:
+  // only honored for a single explicitly-named book AND resource, via
+  // idBlockedOverrideAllowed. UNLIKE the other overrides here, granting this
+  // does not just resume a stalled sync — it consents to Door43 losing the
+  // still-blocked row(s) on THIS export, so the caller must have verified the
+  // collision is a genuine reissue (or accepted the loss) before setting it.
+  allowIdBlocked?: boolean;
   // Human override for the book-lock gate. A locked book (published, or
   // explicitly frozen via book_locks) is withheld from Door43 by the gate in
   // exportOne; this is the escape hatch for pushing a deliberate fix to a
@@ -223,6 +234,15 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     if (params.allowMergeRefusal === true && !mergeRefusalOverride) {
       console.log("export: allowMergeRefusal ignored — requires an explicit single book + resource");
     }
+    // Issue #473 option A: same narrow gating for the id-blocked watermark
+    // override — only a run naming exactly one book and one resource may
+    // bypass it, and only for that named resource.
+    const idBlockedOverride = params.resource
+      ? idBlockedOverrideAllowed(params, books.length, resources.length, params.resource)
+      : false;
+    if (params.allowIdBlocked === true && !idBlockedOverride) {
+      console.log("export: allowIdBlocked ignored — requires an explicit single book + resource");
+    }
     // Book-lock override, same narrow shape as shrinkOverride above: only a run
     // naming exactly ONE book and ONE resource can carry it, so every cron path
     // (which omits both) keeps the lock gate no matter what params get passed.
@@ -274,6 +294,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
           // DCS commit SHA is unchanged. See bookReimport.ts:runChunkedReimport.
           await runChunkedReimport(this.env, step, book, instanceId, reimportResources, {
             mergeRefusalOverrideResource: mergeRefusalOverride ? (params.resource as Resource) : undefined,
+            idBlockedOverrideResource: idBlockedOverride ? (params.resource as Resource) : undefined,
           });
         } catch (e) {
           // Lock contention / transient DCS failure / Cloudflare subrequest cap:

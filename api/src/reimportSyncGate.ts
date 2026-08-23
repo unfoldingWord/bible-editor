@@ -90,13 +90,27 @@
 //
 // Pure (no D1) so it's regression-testable without a Workflow context — see
 // shrinkGuard.ts for the same pattern.
-export function shouldRecordResourceSync(counts: {
-  chapters_locked?: number;
-  prune_locked?: number;
-  conflict_skipped?: number;
-  tombstone_blocked?: number;
-  counts_incomplete?: boolean;
-}): boolean {
+//
+// `idBlockedOverride` (issue #473, option A): a human escape hatch for the
+// conflict_skipped/tombstone_blocked half of this gate ONLY — chapters_locked
+// and prune_locked still withhold unconditionally, same as
+// isSystemicMergeRefusal's override leaves the OTHER gates untouched. Unlike
+// every other override in this file, forcing this open does not just resume a
+// stalled sync: the blocked row(s) are NOT in D1, so recording the watermark
+// lets tonight's export publish a book to Door43 that is missing them,
+// deleting them from master. See idBlockedOverrideAllowed for the narrow
+// gating and bookReimport.ts's raiseTombstoneBlockAlert for the durable
+// record this override must leave behind.
+export function shouldRecordResourceSync(
+  counts: {
+    chapters_locked?: number;
+    prune_locked?: number;
+    conflict_skipped?: number;
+    tombstone_blocked?: number;
+    counts_incomplete?: boolean;
+  },
+  idBlockedOverride: boolean = false,
+): boolean {
   if (counts.chapters_locked === undefined || counts.prune_locked === undefined) return false;
   // Same fail-safe presence check as the two above, for the same reason: "not
   // measured" must never read as "measured zero".
@@ -115,8 +129,7 @@ export function shouldRecordResourceSync(counts: {
   return (
     counts.chapters_locked === 0 &&
     counts.prune_locked === 0 &&
-    counts.conflict_skipped === 0 &&
-    counts.tombstone_blocked === 0
+    (idBlockedOverride || (counts.conflict_skipped === 0 && counts.tombstone_blocked === 0))
   );
 }
 
@@ -214,6 +227,27 @@ export function mergeRefusalOverrideAllowed(
   resourceBeingChecked: string,
 ): boolean {
   if (params.allowMergeRefusal !== true) return false;
+  if (!params.book || !params.resource) return false;
+  if (params.resource !== resourceBeingChecked) return false;
+  return resolvedBookCount === 1 && resolvedResourceCount === 1;
+}
+
+// Whether an `allowIdBlocked` request may override the conflict_skipped /
+// tombstone_blocked half of shouldRecordResourceSync above, for THIS specific
+// resource (issue #473, option A). Identical shape and rationale to
+// mergeRefusalOverrideAllowed — deliberately narrow, only a run naming
+// exactly ONE book and ONE resource qualifies, so no cron path can ever carry
+// this and unfreeze every id-blocked resource at once. See the doc comment on
+// shouldRecordResourceSync's idBlockedOverride parameter for why this
+// override is unlike the others: it does not just resume a stalled sync, it
+// consents to Door43 losing the blocked row(s) on the next export.
+export function idBlockedOverrideAllowed(
+  params: { allowIdBlocked?: boolean; book?: string; resource?: string },
+  resolvedBookCount: number,
+  resolvedResourceCount: number,
+  resourceBeingChecked: string,
+): boolean {
+  if (params.allowIdBlocked !== true) return false;
   if (!params.book || !params.resource) return false;
   if (params.resource !== resourceBeingChecked) return false;
   return resolvedBookCount === 1 && resolvedResourceCount === 1;
