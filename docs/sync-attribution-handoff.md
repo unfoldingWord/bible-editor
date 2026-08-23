@@ -175,39 +175,52 @@ question can be answered without re-walking; the alerts this run raises can cite
 it because it is in scope for the run that raises them. Worth a follow-up if
 after-the-fact attribution is ever needed.
 
-### B. #537 — recover the 186 ancestors  (do AFTER A — A has landed)
+### B. #537 — recover the 186 ancestors — **LANDED** (#574, #583)
 
-Two changes in `applyVerseRows`'s `mergeCols` sub-select
-(`api/src/bookReimport.ts`):
+Both changes went into `applyVerseRows`'s `mergeCols` sub-select
+(`api/src/bookReimport.ts`, `base_payload` ~lines 3217–3228):
 
-1. include `action='baseline'` alongside `create`/`update`;
-2. for a back-dated row the **id boundary is wrong** — a baseline row's id is
-   assigned at insert time while its content predates it. Either bound baselines
-   on `created_at < master_confirmed_at` specifically, or order by
-   `created_at DESC, id DESC` and bound accordingly. Whichever is chosen, keep
-   P1.3's same-second precision for ordinary rows: the id boundary exists because
-   `created_at <` at second granularity wrongly excluded an edit committed in the
-   same second as the export read.
+1. `action = 'baseline'` is now included alongside `create`/`update`.
+2. Baseline rows are bounded on `created_at < master_confirmed_at` specifically
+   (never the id boundary, which is not chronological with a back-dated row's
+   content) — the combined candidate set orders by `created_at DESC, id DESC`
+   so a baseline row can compete honestly against ordinary `create`/`update`
+   rows for "most recent ancestor at/before the watermark". The companion
+   `human_edit_after_export` probe (~lines 3229–3248) explicitly excludes
+   `action = 'baseline'`, so a recovered ancestor's own row can't false-positive
+   as a post-export human edit.
 
-**Why this is sequenced after A:** recovering these ancestors makes the merge start
-*adopting master* on verses where it currently keeps D1 — and all 186 are in
-JER/EZK, which is exactly where bp-assistant pushes land. Without item 2's guard,
-this hands those verses to AI-authored master content. **That guard is now in
-place, so this is unblocked** — and the live walk on `en_ult/26-EZK.usfm` shows
-the guard is not theoretical there: six commits back it is 3 ours + 3 ai + 0
-human, so a both-changed conflict in EZK resolves D1-wins today.
+This was sequenced after A specifically because recovering these ancestors makes
+the merge start *adopting master* on verses where it previously kept D1, and all
+186 are in JER/EZK — exactly where bp-assistant pushes land. Item 2's
+`keep_ai_master` guard was required to be in place first, and it is: the live
+walk on `en_ult/26-EZK.usfm` shows six commits back is 3 ours + 3 ai + 0 human,
+so a both-changed conflict in EZK resolves D1-wins, not an AI-authored overwrite.
 
-Also check whether `restore`, `restore_master_verse` and the `normalize-*` /
-`heal-*` actions should count as ancestors; prod holds 238 `restore_master_verse`,
-115 `normalize-source-occurrences`, 94 `normalize-align-order`, 69
-`heal-replacement-chars`, 12 `heal-export-align-loss`, 11 `restore`, 4
-`remove-doubled-q1`. Each needs its payload shape checked before inclusion — the
-sub-select takes the **newest** row and reads its payload as "the content D1 held
-then", so an action whose payload is not a full post-state snapshot must not be
-included.
+The retention-sweep half (keeping a book's recovered ancestor row alive past the
+180-day `edit_log` sweep) landed separately in #574 — see
+`api/src/editLogSweep.ts`'s header and `editLogSweep.test.mjs`.
 
-*Success check:* the 186 become adjudicable; ECC×3 and ZEC×1 stay `keep_no_base`;
-no human-edit revert in the replay.
+*Verified:* `api/src/applyVerseRows.test.mjs` (~lines 334–446) — positive
+baseline-recovery case, plus a companion case proving a genuine human edit after
+export still blocks clean-adopt even with a recovered baseline ancestor.
+Corpus inventory measured 2026-08-19: 186 of the 190 then-unadjudicable verses
+(EZK ust 59, EZK ult 57, JER ult 36, JER ust 34) had a `baseline` row earlier
+than their book's watermark and became adjudicable; ECC×3 and ZEC×1 have no
+ancestor at all and correctly stay `keep_no_base`.
+
+**Not done here** — still open, tracked in #573: `human_edit_after_export` and
+`latest_source` (`api/src/bookReimport.ts`) each read edit_log rows the #574
+sweep shield does not exempt, so a book whose watermark boundary stalls past
+180 days can still lose those signals to the sweep even though the ancestor
+itself is now safe. Also open: whether `restore`, `restore_master_verse` and the
+`normalize-*` / `heal-*` actions should count as ancestors; prod holds 238
+`restore_master_verse`, 115 `normalize-source-occurrences`, 94
+`normalize-align-order`, 69 `heal-replacement-chars`, 12
+`heal-export-align-loss`, 11 `restore`, 4 `remove-doubled-q1`. Each needs its
+payload shape checked before inclusion — the sub-select takes the **newest** row
+and reads its payload as "the content D1 held then", so an action whose payload
+is not a full post-state snapshot must not be included.
 
 ### C. #540 item 4 — own-publish resilience
 

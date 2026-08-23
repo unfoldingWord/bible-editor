@@ -43,11 +43,11 @@ function freshDb() {
   return d;
 }
 
-function logRow(d, { id, kind = "verse", rowKey, book = null, action, createdAt, payload = null }) {
+function logRow(d, { id, kind = "verse", rowKey, book = null, action, createdAt, payload = null, source = null }) {
   d.prepare(
-    `INSERT INTO edit_log (id, kind, row_key, book, action, payload_json, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`,
-  ).run(id, kind, rowKey, book, action, payload, createdAt);
+    `INSERT INTO edit_log (id, kind, row_key, book, action, payload_json, created_at, source)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(id, kind, rowKey, book, action, payload, createdAt, source);
 }
 
 function syncRow(d, { book, resource, confirmedAt = null, editId = null }) {
@@ -94,13 +94,16 @@ console.log("\n[a verse edited before the watermark keeps its merge ancestor acr
   const key = "ZEC/1/5/ULT";
   logRow(d, { id: 1, rowKey: key, book: "ZEC", action: "create", createdAt: 1000, payload: '{"content":"v1"}' });
   logRow(d, { id: 2, rowKey: key, book: "ZEC", action: "update", createdAt: 2000, payload: '{"content":"v2"}' }); // the ancestor
-  logRow(d, { id: 3, rowKey: key, book: "ZEC", action: "update", createdAt: 6000, payload: '{"content":"v3"}' }); // post-boundary
+  logRow(d, { id: 3, rowKey: key, book: "ZEC", action: "update", createdAt: 6000, payload: '{"content":"v3"}' }); // post-boundary, but the GLOBAL newest create/update
   logRow(d, { id: 4, kind: "tn", rowKey: "ab3d", book: "ZEC", action: "update", createdAt: 1000 }); // non-verse kind
 
   // Simulate the far future: EVERY row is past retention.
   sweep(d, 100000);
 
-  assert(survivingIds(d).join(",") === "2", "only the newest pre-boundary create/update survives (older history, post-boundary rows, tn rows all swept)");
+  assert(
+    survivingIds(d).join(",") === "2,3",
+    "the ancestor (2) AND the global-newest create/update (3, issue #573 gap 1a, protects latest_source) survive; older history and the tn row are swept",
+  );
   assert(
     mergeAncestorPayload(d, "ZEC", "1", "5", "ULT", 2) === '{"content":"v2"}',
     "the merge's own base_payload lookup still recovers the ancestor after the sweep",
@@ -114,11 +117,14 @@ console.log("\n[0050 warm-up: with master_confirmed_edit_id NULL, the exemption 
   const key = "LAM/3/22/ULT";
   logRow(d, { id: 1, rowKey: key, book: "LAM", action: "create", createdAt: 1000 });
   logRow(d, { id: 2, rowKey: key, book: "LAM", action: "update", createdAt: 2000, payload: '{"content":"pre"}' });
-  logRow(d, { id: 3, rowKey: key, book: "LAM", action: "update", createdAt: 7000 }); // at/after watermark
+  logRow(d, { id: 3, rowKey: key, book: "LAM", action: "update", createdAt: 7000 }); // at/after watermark, but the GLOBAL newest create/update
 
   sweep(d, 100000);
 
-  assert(survivingIds(d).join(",") === "2", "newest create/update with created_at < master_confirmed_at survives; the rest is swept");
+  assert(
+    survivingIds(d).join(",") === "2,3",
+    "the pre-watermark ancestor (2) AND the global-newest create/update (3, gap 1a) survive; older history is swept",
+  );
 }
 
 console.log("\n[the newest pre-watermark 'baseline' survives by content time, not id — back-dating is the whole point]");
@@ -224,11 +230,97 @@ console.log("\n[two books and both resources coexist without cross-shielding or 
   logRow(d, { id: 1, rowKey: "ZEC/1/1/ULT", book: "ZEC", action: "update", createdAt: 1000 });
   logRow(d, { id: 2, rowKey: "ZEC/1/1/UST", book: "ZEC", action: "update", createdAt: 1000 });
   logRow(d, { id: 3, rowKey: "HOS/1/1/ULT", book: "HOS", action: "update", createdAt: 1000 });
-  logRow(d, { id: 4, rowKey: "HOS/1/1/ULT", book: "HOS", action: "create", createdAt: 500 }); // superseded by id 3
+  logRow(d, { id: 4, rowKey: "HOS/1/1/ULT", book: "HOS", action: "create", createdAt: 500 }); // post-boundary as ancestor, but the GLOBAL newest by id
 
   sweep(d, 100000);
 
-  assert(survivingIds(d).join(",") === "1,2,3", "each book+resource keeps exactly its own ancestor; the superseded row is swept");
+  assert(
+    survivingIds(d).join(",") === "1,2,3,4",
+    "each book+resource keeps its own ancestor (1,2,3); id 4 also survives as HOS/1/1/ULT's global-newest create/update (gap 1a)",
+  );
+}
+
+// bookReimport.ts's human_edit_after_export probe (id boundary variant) —
+// mirrors the EXISTS check so the survival claim is proven against what the
+// merge actually reads, not against our intuition about it.
+function humanEditAfterExport(d, book, chapter, verse, bibleVersion, masterEditId) {
+  const row = d
+    .prepare(
+      `SELECT 1 FROM edit_log
+        WHERE kind = 'verse'
+          AND row_key = ?1 || '/' || ?3 || '/' || ?4 || '/' || ?2
+          AND (book = ?1 OR book IS NULL)
+          AND source IS NULL
+          AND action <> 'baseline'
+          AND id > ?5`,
+    )
+    .get(book, bibleVersion, chapter, verse, masterEditId);
+  return !!row;
+}
+
+console.log("\n[issue #573 gap 1b: a post-boundary human edit (source IS NULL) survives a full age-out sweep, so human_edit_after_export still reads true on a stalled-boundary book]");
+{
+  const d = freshDb();
+  syncRow(d, { book: "JON", resource: "ult", confirmedAt: 5000, editId: 3 });
+  const key = "JON/1/1/ULT";
+  logRow(d, { id: 3, rowKey: key, book: "JON", action: "create", createdAt: 1000, payload: '{"content":"ancestor"}' });
+  // A translator edited after the export watermark was stamped. This is
+  // exactly the row bookReimport.ts's human_edit_after_export EXISTS check
+  // needs to keep finding, or a stalled-boundary book (locked/published,
+  // never re-exports) can eventually misread this verse as unedited.
+  logRow(d, { id: 5, rowKey: key, book: "JON", action: "update", createdAt: 6000 }); // source column defaults NULL: a human edit
+
+  sweep(d, 100000);
+
+  assert(survivingIds(d).join(",") === "3,5", "ancestor (3) AND the post-boundary human edit (5, gap 1b) both survive");
+  assert(
+    humanEditAfterExport(d, "JON", "1", "1", "ULT", 3) === true,
+    "the merge's own human_edit_after_export probe still reads true after the sweep",
+  );
+}
+
+console.log("\n[issue #573 gap 1b: an AI-sourced post-boundary row is not shielded by gap 1b — only a genuinely newer human edit is]");
+{
+  const d = freshDb();
+  syncRow(d, { book: "JON", resource: "ust", confirmedAt: 5000, editId: 3 });
+  const key = "JON/1/1/UST";
+  logRow(d, { id: 3, rowKey: key, book: "JON", action: "create", createdAt: 1000, payload: '{"content":"ancestor"}' });
+  logRow(d, { id: 5, rowKey: key, book: "JON", action: "update", createdAt: 6000, source: "ai_pipeline" }); // post-boundary, AI — superseded, not the global newest either
+  logRow(d, { id: 6, rowKey: key, book: "JON", action: "update", createdAt: 7000 }); // newest overall AND the first real human edit
+
+  sweep(d, 100000);
+
+  assert(
+    survivingIds(d).join(",") === "3,6",
+    "the AI-sourced row (5) is swept — it is neither the ancestor, the global newest (6 is), nor a human edit (source IS NULL)",
+  );
+  assert(
+    humanEditAfterExport(d, "JON", "1", "1", "UST", 3) === true,
+    "human_edit_after_export still reads true off the surviving human row (6)",
+  );
+}
+
+console.log("\n[issue #573 gap 2: #548's other candidate-ancestor action classes each get their own newest pre-watermark row shielded]");
+{
+  const d = freshDb();
+  syncRow(d, { book: "NAM", resource: "ult", confirmedAt: 5000, editId: null });
+  const key = "NAM/1/1/ULT";
+  logRow(d, { id: 1, rowKey: key, book: "NAM", action: "restore_master_verse", createdAt: 1000, payload: '{"content":"old-restore"}', source: "data_repair" });
+  logRow(d, { id: 2, rowKey: key, book: "NAM", action: "restore_master_verse", createdAt: 2000, payload: '{"content":"newest-pre-wm-restore"}', source: "data_repair" });
+  // Post-watermark and non-NULL source, so gap 1b's human_edit_after_export
+  // shield (which fires on ANY non-baseline action with source IS NULL,
+  // matching bookReimport.ts's probe exactly) does not also protect this row
+  // — isolating what gap 2 alone shields.
+  logRow(d, { id: 3, rowKey: key, book: "NAM", action: "restore_master_verse", createdAt: 6000, source: "data_repair" }); // post-watermark: not exempt
+  logRow(d, { id: 4, rowKey: key, book: "NAM", action: "heal-replacement-chars", createdAt: 1500, source: "data_repair" }); // a different class: its own newest pre-watermark row
+  logRow(d, { id: 5, rowKey: key, book: "NAM", action: "some_unlisted_action", createdAt: 1500, source: "data_repair" }); // not on #548's list: must not be exempted
+
+  sweep(d, 100000);
+
+  assert(
+    survivingIds(d).join(",") === "2,4",
+    "only the newest pre-watermark row per (verse, action) among #548's listed classes survives — the older same-class row (1), the post-watermark row (3), and the unlisted action (5) are all swept",
+  );
 }
 
 console.log("\n[a legacy row with book IS NULL is still shielded — the join reads row_key, as the merge does]");
