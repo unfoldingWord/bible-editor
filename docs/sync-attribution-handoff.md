@@ -17,7 +17,9 @@ says otherwise.
 |---|---|---|
 | #542 | #537 (part) | The nightly banner now NAMES the verses the merge could not adjudicate, and claims only what `base === null` measures. **No merge behavior changed.** |
 | #543 | #540 item 3 | A tn/tq/twl reference difference is attributed from an ancestor instead of blamed on Door43. Only the **pure app-side move** changes behavior (no flag, no hold); every other shape still holds exactly as before. |
-| #548 | #540 items 1 + 2 | **This PR.** The merge now asks WHO moved master — a commit-lineage walk per (book, resource) per run — and resolves a both-changed conflict **D1-wins plus a review flag** (`keep_ai_master`) when no human commit is behind master's side. Master-wins is untouched for a maintainer edit, for an incomplete walk, and for a run that never looked. |
+| #548 | #540 items 1 + 2 | The merge now asks WHO moved master — a commit-lineage walk per (book, resource) per run — and resolves a both-changed conflict **D1-wins plus a review flag** (`keep_ai_master`) when no human commit is behind master's side. Master-wins is untouched for a maintainer edit, for an incomplete walk, and for a run that never looked. |
+| #574 | #537 (part) | Section B's sweep-shielding half: the hourly `edit_log` retention sweep now exempts each verse's merge-ancestor row and its newest pre-watermark `baseline` row (`api/src/editLogSweep.ts`), so a recoverable ancestor can no longer age out from under a future merge. |
+| #583 | #537 (part) | Section B's baseline-recovery half, below — **shipped**. |
 
 The engine that was sitting unconsumed on `feat/master-commit-lineage`
 (`api/src/masterLineage.ts` + `listMasterCommitsSince` in `api/src/dcsSources.ts`)
@@ -209,12 +211,19 @@ Corpus inventory measured 2026-08-19: 186 of the 190 then-unadjudicable verses
 than their book's watermark and became adjudicable; ECC×3 and ZEC×1 have no
 ancestor at all and correctly stay `keep_no_base`.
 
-**Not done here** — still open, tracked in #573: `human_edit_after_export` and
-`latest_source` (`api/src/bookReimport.ts`) each read edit_log rows the #574
-sweep shield does not exempt, so a book whose watermark boundary stalls past
-180 days can still lose those signals to the sweep even though the ancestor
-itself is now safe. Also open: whether `restore`, `restore_master_verse` and the
-`normalize-*` / `heal-*` actions should count as ancestors; prod holds 238
+**The sweep-shield gap this section used to leave open is now closed** (#597,
+issue #573). `human_edit_after_export` and `latest_source`
+(`api/src/bookReimport.ts`) each read edit_log rows the original #574 shield did
+not exempt, so a book whose watermark boundary stalled past 180 days could lose
+those signals to the sweep even though the ancestor itself was safe. #597 widened
+`EDIT_LOG_SWEEP_SQL` with three further exempt branches — the global newest
+`create`/`update` per verse (gap 1a, for `latest_source`), the newest
+post-boundary row per verse (gap 1b, for `human_edit_after_export`), and the
+newest pre-watermark row per verse per pending-ancestor action class (gap 2).
+
+Still open: whether `restore`, `restore_master_verse` and the
+`normalize-*` / `heal-*` actions should count as ancestors — #597 keeps their
+rows alive, but nothing reads them as ancestors yet. Prod holds 238
 `restore_master_verse`, 115 `normalize-source-occurrences`, 94
 `normalize-align-order`, 69 `heal-replacement-chars`, 12
 `heal-export-align-loss`, 11 `restore`, 4 `remove-doubled-q1`. Each needs its
