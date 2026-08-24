@@ -482,6 +482,249 @@ console.log("\n[keep_no_base collects an editor ref carrying the verse's CURRENT
   eq(row.version, 5, "D1's version is untouched — nothing was written");
 }
 
+// ── Issue #539: a merge adoption that would store the bytes already stored ──
+//
+// THE SHAPE. computeVerseMerge decides "adopt" on master's bytes AS THEY
+// ARRIVE. applyVerseRows then normalizes those bytes toward D1's before
+// writing them — healIncomingReplacementChars, and canonizeAlignmentSource,
+// which rewrites every `\zaln-s` milestone's x-content/x-lemma to the
+// canonical UHB source-word bytes D1 already holds. When master's ONLY
+// divergence was inside that canonization kernel, the adoption lands on
+// exactly D1's stored string. Pre-fix that still wrote: version+1, an
+// edit_log row, a verse_merge_conflicts row, and every open tab's If-Match
+// invalidated — for a change nobody could see. And it recurs EVERY night,
+// because neither side moves: master keeps its form, canonize keeps undoing
+// it. That is a version-inflation engine, not a one-off.
+//
+// WHY IT IS ASSERTED HERE, on the real applyVerseRows over real SQLite: the
+// guard has to sit AFTER canonization and compare the three columns the
+// UPDATE actually binds. A pure test of computeVerseMerge cannot see that —
+// the merge is right to say "master differs"; it is the WRITE that is a no-op.
+console.log("\n[a verse adoption whose canonized bytes already match D1 writes nothing (issue #539)]");
+{
+  const { env, sqlite } = freshEnv();
+  // One aligned word. `lemma` is the only thing master got wrong, and
+  // canonizeAlignmentSource is exactly the pass that repairs it from UHB.
+  // Deliberately not x-content: content feeds alignmentDelta's sourceKey, so
+  // moving it would risk a keep_alignment_refused and test the wrong branch.
+  const UHB_FORM = "בָּרָ֣א";
+  const UHB_LEMMA = "בָּרָא";
+  const tree = (lemma) => ({
+    verseObjects: [
+      {
+        tag: "zaln",
+        type: "milestone",
+        strong: "H1254",
+        lemma,
+        content: UHB_FORM,
+        children: [{ tag: "w", type: "word", text: "created" }],
+      },
+    ],
+  });
+  const oursJson = JSON.stringify(tree(UHB_LEMMA));
+  // Master carries an under-pointed lemma. Same key order, so once canonize
+  // repairs it the re-stringified tree is byte-identical to `oursJson` — which
+  // is the whole point: only a byte comparison of the FINAL value can tell.
+  const theirsJson = JSON.stringify(tree("בּרא"));
+
+  sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (9, 909, 'translator')`).run();
+  // The human-edited ULT verse (updated_by set → routes through the merge).
+  sqlite
+    .prepare(
+      `INSERT INTO verses (book, chapter, verse, verse_end, bible_version, content_json, plain_text, version, updated_by)
+       VALUES (?, 5, 1, NULL, 'ULT', ?, 'created', 4, 9)`,
+    )
+    .run(BOOK, oursJson);
+  // The UHB source row canonizeAlignmentSource reads its canonical bytes from.
+  sqlite
+    .prepare(
+      `INSERT INTO verses (book, chapter, verse, verse_end, bible_version, content_json, plain_text, version)
+       VALUES (?, 5, 1, NULL, 'UHB', ?, ?, 1)`,
+    )
+    .run(
+      BOOK,
+      JSON.stringify({
+        verseObjects: [
+          { tag: "w", type: "word", text: UHB_FORM, strong: "H1254", lemma: UHB_LEMMA, morph: "He,Vqp3ms" },
+        ],
+      }),
+      UHB_FORM,
+    );
+  // The ancestor: D1's own content, logged before the watermark boundary. base
+  // == ours is what makes computeVerseMerge return a clean "adopt".
+  const anc = sqlite
+    .prepare(
+      `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, payload_json, created_at)
+       VALUES ('verse', ?, ?, 9, 3, 4, 'update', ?, 100)`,
+    )
+    .run(`${BOOK}/5/1/ULT`, BOOK, JSON.stringify({ plain_text: "created", content: oursJson }));
+  const boundary = Number(anc.lastInsertRowid);
+
+  const counts = await applyVerseRowsForTest(
+    env,
+    BOOK,
+    "ULT",
+    [{ chapter: 5, verse: 1, verseEnd: null, contentJson: theirsJson, plainText: "created" }],
+    null,
+    { confirmedAt: 200, editId: boundary },
+    false,
+  );
+
+  eq(counts.merge_noop_skipped, 1, "the adoption is counted as a skipped no-op, not silently dropped");
+  eq(counts.merge_adopted, 0, "…and NOT counted as an adoption that landed");
+  eq(
+    counts.apply_incomplete,
+    false,
+    "…and does NOT withhold the resource watermark — D1 already holds master's bytes, so nothing is stale to retry",
+  );
+
+  const row = sqlite
+    .prepare("SELECT content_json, version FROM verses WHERE book = ? AND chapter = 5 AND verse = 1 AND bible_version = 'ULT'")
+    .all(BOOK)[0];
+  eq(row.version, 4, "the version does not move — THE assertion this fix exists for");
+  eq(row.content_json, oursJson, "…and the stored bytes are untouched");
+  eq(
+    sqlite.prepare("SELECT COUNT(*) AS n FROM edit_log WHERE row_key = ?").all(`${BOOK}/5/1/ULT`)[0].n,
+    1,
+    "no edit_log row was written for a write that never happened (only the seeded ancestor remains)",
+  );
+  eq(
+    sqlite.prepare("SELECT COUNT(*) AS n FROM verse_merge_conflicts").all()[0].n,
+    0,
+    "and no verse_merge_conflicts row: overwritten_version would point a reviewer at text nothing replaced",
+  );
+}
+
+// The other half of the same guard — without this, "stop writing" could be
+// satisfied by simply not writing at all. A verse master genuinely moved must
+// still be adopted and must still bump.
+console.log("\n[…but a real out-of-band master change on the same shape STILL adopts and STILL bumps]");
+{
+  const { env, sqlite } = freshEnv();
+  const UHB_FORM = "בָּרָ֣א";
+  const UHB_LEMMA = "בָּרָא";
+  const tree = (target) => ({
+    verseObjects: [
+      {
+        tag: "zaln",
+        type: "milestone",
+        strong: "H1254",
+        lemma: UHB_LEMMA,
+        content: UHB_FORM,
+        children: [{ tag: "w", type: "word", text: target }],
+      },
+    ],
+  });
+  const oursJson = JSON.stringify(tree("created"));
+  const theirsJson = JSON.stringify(tree("made"));
+
+  sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (9, 909, 'translator')`).run();
+  sqlite
+    .prepare(
+      `INSERT INTO verses (book, chapter, verse, verse_end, bible_version, content_json, plain_text, version, updated_by)
+       VALUES (?, 5, 1, NULL, 'ULT', ?, 'created', 4, 9)`,
+    )
+    .run(BOOK, oursJson);
+  sqlite
+    .prepare(
+      `INSERT INTO verses (book, chapter, verse, verse_end, bible_version, content_json, plain_text, version)
+       VALUES (?, 5, 1, NULL, 'UHB', ?, ?, 1)`,
+    )
+    .run(
+      BOOK,
+      JSON.stringify({
+        verseObjects: [
+          { tag: "w", type: "word", text: UHB_FORM, strong: "H1254", lemma: UHB_LEMMA, morph: "He,Vqp3ms" },
+        ],
+      }),
+      UHB_FORM,
+    );
+  const anc = sqlite
+    .prepare(
+      `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, payload_json, created_at)
+       VALUES ('verse', ?, ?, 9, 3, 4, 'update', ?, 100)`,
+    )
+    .run(`${BOOK}/5/1/ULT`, BOOK, JSON.stringify({ plain_text: "created", content: oursJson }));
+
+  const counts = await applyVerseRowsForTest(
+    env,
+    BOOK,
+    "ULT",
+    [{ chapter: 5, verse: 1, verseEnd: null, contentJson: theirsJson, plainText: "made" }],
+    null,
+    { confirmedAt: 200, editId: Number(anc.lastInsertRowid) },
+    false,
+  );
+
+  eq(counts.merge_adopted, 1, "master's real edit is adopted");
+  eq(counts.merge_noop_skipped, 0, "…and is NOT swallowed by the no-change guard");
+  const row = sqlite
+    .prepare("SELECT content_json, version FROM verses WHERE book = ? AND chapter = 5 AND verse = 1 AND bible_version = 'ULT'")
+    .all(BOOK)[0];
+  eq(row.version, 5, "the version DOES move for a real content change");
+  eq(JSON.parse(row.content_json).verseObjects[0].children[0].text, "made", "…and master's text landed");
+}
+
+// ── Characterization, not a regression for the #539 write guard ─────────────
+// The render round-trip gap (STATE.md: extract(render(x)) !== x for 16-19% of
+// verses) is held one layer earlier, by verseMerge's stableKey lens: the two
+// documented artifacts — a marker's `nextChar` flipping " " <-> "\n", and
+// buildUsfm's blank-line reflow being absorbed into the following text node —
+// both normalize away, so the merge returns keep_converged and NOTHING reaches
+// the write path at all. Pinned here so that if anyone ever narrows that lens,
+// the failure shows up as a verse-level no-write regression rather than as
+// silent nightly churn. It passes with or without the #539 write guard, and is
+// labelled as such deliberately.
+console.log("\n[render round-trip churn on an edited verse writes nothing (held by stableKey, not by the #539 guard)]");
+{
+  const { env, sqlite } = freshEnv();
+  const oursJson = JSON.stringify({
+    verseObjects: [
+      { tag: "q1", type: "quote", nextChar: "\n" },
+      { type: "text", text: "In the beginning\n" },
+    ],
+  });
+  // What a render -> reparse pass hands back for the same verse.
+  const theirsJson = JSON.stringify({
+    verseObjects: [
+      { tag: "q1", type: "quote", nextChar: " " },
+      { type: "text", text: "In the beginning\n\n" },
+    ],
+  });
+
+  sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (9, 909, 'translator')`).run();
+  sqlite
+    .prepare(
+      `INSERT INTO verses (book, chapter, verse, verse_end, bible_version, content_json, plain_text, version, updated_by)
+       VALUES (?, 6, 1, NULL, 'ULT', ?, 'In the beginning', 4, 9)`,
+    )
+    .run(BOOK, oursJson);
+  const anc = sqlite
+    .prepare(
+      `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, payload_json, created_at)
+       VALUES ('verse', ?, ?, 9, 3, 4, 'update', ?, 100)`,
+    )
+    .run(`${BOOK}/6/1/ULT`, BOOK, JSON.stringify({ plain_text: "In the beginning", content: oursJson }));
+
+  const counts = await applyVerseRowsForTest(
+    env,
+    BOOK,
+    "ULT",
+    [{ chapter: 6, verse: 1, verseEnd: null, contentJson: theirsJson, plainText: "In the beginning" }],
+    null,
+    { confirmedAt: 200, editId: Number(anc.lastInsertRowid) },
+    false,
+  );
+
+  eq(counts.merge_adopted, 0, "round-trip churn is never adopted");
+  eq(counts.merge_cosmetic_ignored, 1, "…and the raw-byte difference it did carry is still counted, not hidden");
+  const row = sqlite
+    .prepare("SELECT content_json, version FROM verses WHERE book = ? AND chapter = 6 AND verse = 1 AND bible_version = 'ULT'")
+    .all(BOOK)[0];
+  eq(row.version, 4, "the version does not move");
+  eq(row.content_json, oursJson, "…and the stored bytes are untouched");
+}
+
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed`);
   process.exit(1);

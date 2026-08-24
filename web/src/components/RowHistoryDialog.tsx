@@ -40,8 +40,8 @@ interface Props {
   canRestore?: boolean;
   // The version the chip displays — equals `restored_from_version` if the
   // latest edit was a revert, otherwise equals currentVersion. The dialog
-  // surfaces this entry as "current" and hides revert phantoms from the
-  // list (their snapshot is identical to the version they restored).
+  // surfaces this entry as "current"; the restore entry itself is also listed,
+  // labelled "restored from v{N}" (issue #539 item 4).
   effectiveVersion: number;
   onClose: () => void;
   // Fires the chosen version's snapshot + the version number it came from
@@ -101,17 +101,13 @@ export function RowHistoryDialog({
       .then((res) => {
         if (cancelled) return;
         setEntries(res.versions);
-        // Default selection: most recent *visible* entry that isn't the
-        // effective-current one, so the dialog opens showing "what was
-        // here before this one".
-        const visible = res.versions.filter(
-          (v) => v.restored_from_version == null,
-        );
-        const previous = [...visible]
+        // Default selection: most recent entry that isn't the effective-current
+        // one, so the dialog opens showing "what was here before this one".
+        const previous = [...res.versions]
           .reverse()
           .find((v) => v.version !== effectiveVersion);
         setSelectedVersion(
-          previous?.version ?? visible.at(-1)?.version ?? null,
+          previous?.version ?? res.versions.at(-1)?.version ?? null,
         );
         setLoading(false);
       })
@@ -125,14 +121,16 @@ export function RowHistoryDialog({
     };
   }, [open, kind, rowId, book, effectiveVersion]);
 
-  // Most recent first; phantom revert entries (same snapshot as the
-  // version they restored) are filtered out — the user wanted "the other
-  // 3 accessible", not the empty v(current+1) we just wrote.
+  // Most recent first. EVERY entry is listed, restores included (issue #539
+  // item 4). This used to drop every entry with a restored_from_version, on the
+  // theory that a restore is a phantom whose snapshot merely repeats the
+  // version it restored. That is only true of a restore to content the row
+  // already held — which the server no longer writes at all (rows.ts's no-op
+  // short-circuit) — while a restore that DID change the row was being hidden
+  // along with it, taking a real human version out of the recovery net: the
+  // reported case was a translator's v7 vanishing from her own history.
   const ordered = useMemo(
-    () =>
-      [...entries]
-        .filter((e) => e.restored_from_version == null)
-        .sort((a, b) => b.version - a.version),
+    () => [...entries].sort((a, b) => b.version - a.version),
     [entries],
   );
 
@@ -227,6 +225,14 @@ export function RowHistoryDialog({
                                 label="current"
                                 size="small"
                                 color="primary"
+                                variant="outlined"
+                                sx={{ height: 18, fontSize: 10 }}
+                              />
+                            )}
+                            {e.restored_from_version != null && (
+                              <Chip
+                                label={`restored from v${e.restored_from_version}`}
+                                size="small"
                                 variant="outlined"
                                 sx={{ height: 18, fontSize: 10 }}
                               />

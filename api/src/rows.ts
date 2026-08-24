@@ -717,20 +717,32 @@ rows.patch("/:kind/:id", requireEditor, async (c) => {
   }
 
   // No-op short-circuit: if the precondition still holds and every patched
-  // field already matches the stored value (and the restore marker isn't
-  // changing), return the row unchanged. Identical re-saves are common —
-  // picker re-commit, AI completion echoing the same content, an explicit
-  // Save click against a row whose draft was just cleared — and shouldn't
-  // burn a version. The version check guards against the TOCTOU window: if
-  // someone else moved the row forward, fall through and let the UPDATE's
-  // version=expected predicate produce the proper 409.
+  // field already matches the stored value, return the row unchanged.
+  // Identical re-saves are common — picker re-commit, AI completion echoing
+  // the same content, an explicit Save click against a row whose draft was
+  // just cleared — and shouldn't burn a version. The version check guards
+  // against the TOCTOU window: if someone else moved the row forward, fall
+  // through and let the UPDATE's version=expected predicate produce the proper
+  // 409.
+  //
+  // The restore marker is deliberately NOT part of this test (issue #539 item
+  // 3). It used to be: a "switch to v{N}" whose snapshot equalled the row's
+  // current content still failed `restoreMatches` and fell through to a full
+  // versioned write, so picking a version the row already held burnt a version
+  // and pushed a phantom entry into the history dialog — the same restore the
+  // dialog then had to hide, which is how a real human version went missing.
+  // `restored_from_version` records where the row's CURRENT content came from,
+  // and this branch is reached only when that content did not move, so the
+  // marker still describes the row exactly as well as it did a moment ago.
+  // Leaving it alone is therefore not a stale-marker bug: it is the same answer
+  // to an unchanged question. (The two directions this now covers are a restore
+  // arriving at content that already matches, and an ordinary no-op save on a
+  // row that carries a marker — both used to bump.)
   if (current.version === expected) {
     const allMatch = fields.every(
       (f) => (patch as Record<string, unknown>)[f] === current[f],
     );
-    const restoreMatches =
-      (current.restored_from_version ?? null) === restoredFromVersion;
-    if (allMatch && restoreMatches) {
+    if (allMatch) {
       // A re-save that changes no content still acknowledges a review flag:
       // clear it (no version bump, like a bit-toggle) so the cleanup chip
       // drops. Covers "proofreader verified the adapted quote, it was fine".
