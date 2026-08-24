@@ -3499,8 +3499,16 @@ async function applyVerseRows(
           // knows that. The per-verse form answers the file-level question
           // unless a COMPLETE map of every human commit's hunks says this verse
           // is not one they touched: Rich's JER chapter 23 + 31 marker fixes
-          // must not authorize reverting an app edit in chapter 40.
-          masterMayHoldHumanEdit: masterMayHoldHumanEditForVerse(cutoff?.lineage, v.chapter, v.verse),
+          // must not authorize reverting an app edit in chapter 40. `v.verseEnd`
+          // is passed because a bridged row (`\v 14-15`) is ONE row covering two
+          // verses — asking only about its start verse would leave it
+          // unprotected when the human's hunk landed in the second half.
+          masterMayHoldHumanEdit: masterMayHoldHumanEditForVerse(
+            cutoff?.lineage,
+            v.chapter,
+            v.verse,
+            v.verseEnd,
+          ),
         });
         if (merge.action === "keep_no_base") {
           counts.merge_no_base++;

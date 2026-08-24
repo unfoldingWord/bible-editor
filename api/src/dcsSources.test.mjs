@@ -700,6 +700,66 @@ async function run() {
       assert(asked[1].includes(`ref=${SHA}`), "  ...and the file PINNED to that commit, not master's tip");
     }
     {
+      // THE PRODUCTION SHAPE, and the one this file did not cover at first:
+      // measured 2026-08-24, Door43 serves `.diff` chunked with NO
+      // Content-Length, while the raw endpoint DOES send one. So the diff half
+      // of this feature always travels the header-less path, where transport can
+      // prove nothing — the diff body's own hunk counts are the proof instead.
+      serve([
+        [`git/commits/${SHA}.diff`, () => res({ body: DIFF })], // no content-length
+        [`raw/${PATH}`, () => res({ body: USFM, contentLength: USFM.length })],
+      ]);
+      const ev = await fetchHumanTouchedRefs(env, "en_ult", PATH, [commit(SHA)]);
+      assert(ev.complete === true, "a header-less diff (production's actual shape) is still mapped");
+      assert(ev.refs.includes("40:2"), "  ...to the right verse");
+    }
+    {
+      // ...and a SHORT read of that same header-less response must not become a
+      // smaller, confident answer. Transport cannot see it; the hunk counts can.
+      const cut = DIFF.split("\n").slice(0, 5).join("\n"); // header + one body line
+      // The revision IS served here, deliberately: without the body-count check
+      // this call would succeed and return a smaller, confident ref set — the
+      // failure being prevented — rather than falling over on a missing fetch.
+      serve([
+        [`git/commits/${SHA}.diff`, () => res({ body: cut })],
+        [`raw/${PATH}`, () => res({ body: USFM, contentLength: USFM.length })],
+      ]);
+      const ev = await fetchHumanTouchedRefs(env, "en_ult", PATH, [commit(SHA)]);
+      assert(ev.complete === false, "a truncated header-less diff is incomplete, not an under-claimed ref set");
+      assert(ev.reason === "hunk_body_short", "  ...named as a short hunk body");
+      assert(ev.refs.length === 0, "  ...carrying no refs at all");
+    }
+    {
+      // A revision body with no declared length is accepted (transport cannot
+      // verify it), but "no header" and "content-length: 0" are different facts
+      // and the short-read check must still fire on the second.
+      serve([
+        [`git/commits/${SHA}.diff`, () => res({ body: DIFF })],
+        [`raw/${PATH}`, () => res({ body: USFM })],
+      ]);
+      const ev = await fetchHumanTouchedRefs(env, "en_ult", PATH, [commit(SHA)]);
+      assert(ev.complete === true, "a header-less revision body is accepted (unverifiable at this layer)");
+      serve([
+        [`git/commits/${SHA}.diff`, () => res({ body: DIFF })],
+        [`raw/${PATH}`, () => res({ body: "", contentLength: String(USFM.length) })],
+      ]);
+      const short = await fetchHumanTouchedRefs(env, "en_ult", PATH, [commit(SHA)]);
+      assert(short.complete === false, "a revision body short of its DECLARED length is still rejected");
+      assert(short.reason === "revision_fetch_failed", "  ...as a failed fetch, never as an empty file");
+
+      // A HEADER-LESS revision body cannot be checked by transport at all, so
+      // the mapping is what catches a truncated one: a hunk whose lines are no
+      // longer in the file it was computed against runs off the end. This is the
+      // structural reason the raw half does not need a header either.
+      serve([
+        [`git/commits/${SHA}.diff`, () => res({ body: DIFF })],
+        [`raw/${PATH}`, () => res({ body: USFM.split("\n").slice(0, 2).join("\n") })],
+      ]);
+      const cutFile = await fetchHumanTouchedRefs(env, "en_ult", PATH, [commit(SHA)]);
+      assert(cutFile.complete === false, "a truncated header-less revision body is incomplete");
+      assert(cutFile.reason === "hunk_past_end_of_file", "  ...caught by the hunk running past the end of the file");
+    }
+    {
       // The abbreviated-sha trap, measured on 2026-08-24: the raw endpoint
       // silently serves master's CURRENT tip for a short sha, which would map
       // real hunk numbers onto the wrong bytes. Refused before any fetch.

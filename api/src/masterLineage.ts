@@ -266,6 +266,18 @@ export function masterMayHoldHumanEdit(
 // positive, complete mapping. Nothing here can widen master's reach; it can
 // only decline to widen it.
 //
+// THE ONE ASYMMETRY, stated because this module's whole argument is "never claim
+// fewer refs than the commit touched": only the NEW side of a hunk is mapped.
+// Content the human DELETED exists only on the old side, so a verse that a
+// commit only removed lines from is claimed via the surrounding new-side lines
+// rather than via the deleted text itself. In practice the new side still covers
+// it — a modification puts `+` lines inside the verse's own span, git's default
+// three lines of context bracket a pure deletion on both sides, and a
+// zero-context deletion claims both lines of the join (see the newCount === 0
+// branch below). Mapping the old side too would need the PARENT revision, i.e. a
+// third fetch per commit, which the subrequest budget does not have. If a real
+// under-claim is ever measured, that is the fix; nobody has produced one.
+//
 // Pure, like the rest of the module: the two fetches this needs (the commit's
 // diff, and the file as it stood at that commit) live in dcsSources.ts.
 
@@ -324,6 +336,18 @@ const MAX_BRIDGE_WIDTH = 50;
 // history), or the path never appearing at all — the commits API already
 // filtered to commits that touch it, so its absence means we are reading
 // something other than what we asked for.
+//
+// AND THE BODY IS COUNTED, WHICH IS THIS FUNCTION'S ONLY COMPLETENESS PROOF.
+// Measured 2026-08-24: Door43 serves `.diff` chunked, with NO Content-Length —
+// so the transport layer has nothing to check a short read against, and a diff
+// cut off mid-body arrives looking like a valid, smaller diff. That is not a
+// theoretical failure: a two-hunk diff truncated before its second `@@` maps to
+// a SMALLER ref set, and a missing ref is exactly what lets D1 overwrite a
+// maintainer's edit. Refusing every header-less body would disable the feature
+// outright (it is always header-less here), so completeness is proved from the
+// content instead: each `@@ -a,b +c,d @@` declares how many lines follow it, and
+// a truncated hunk comes up short. Mismatch — either direction — is
+// `hunk_body_short`, which is incomplete, which is master-wins.
 export function parseDiffHunksForPath(
   diff: string,
   path: string,
@@ -331,11 +355,31 @@ export function parseDiffHunksForPath(
   if (typeof diff !== "string" || diff.length === 0) {
     return { hunks: [], complete: false, reason: "empty_diff" };
   }
+  const lines = diff.split("\n");
+  // A trailing newline splits into one empty element that is not a diff line.
+  // Dropped so it cannot be miscounted as an (unprefixed) empty context line.
+  if (lines[lines.length - 1] === "") lines.pop();
+
   const hunks: HunkRange[] = [];
   let inTarget = false;
   let sawTarget = false;
-  for (const line of diff.split("\n")) {
+  // The hunk whose body we are counting, if any.
+  let open: { range: HunkRange; oldCount: number; newCount: number; ctx: number; add: number; del: number } | null =
+    null;
+
+  // Close the open hunk, keeping it only if its body is exactly as long as its
+  // header promised on BOTH sides.
+  const closeHunk = (): boolean => {
+    if (open === null) return true;
+    const ok = open.ctx + open.add === open.newCount && open.ctx + open.del === open.oldCount;
+    if (ok) hunks.push(open.range);
+    open = null;
+    return ok;
+  };
+
+  for (const line of lines) {
     if (line.startsWith("diff --git ")) {
+      if (!closeHunk()) return { hunks: [], complete: false, reason: "hunk_body_short" };
       const m = /^diff --git a\/(.+) b\/(.+)$/.exec(line);
       if (!m) return { hunks: [], complete: false, reason: "unparseable_file_header" };
       const [, from, to] = m;
@@ -349,18 +393,46 @@ export function parseDiffHunksForPath(
       continue;
     }
     if (!inTarget) continue;
+    if (line.startsWith("@@")) {
+      if (!closeHunk()) return { hunks: [], complete: false, reason: "hunk_body_short" };
+      const h = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/.exec(line);
+      if (!h) return { hunks: [], complete: false, reason: "unparseable_hunk_header" };
+      // A side with no count means exactly one line (`+12` === `+12,1`).
+      const oldCount = h[2] === undefined ? 1 : Number(h[2]);
+      const newStart = Number(h[3]);
+      const newCount = h[4] === undefined ? 1 : Number(h[4]);
+      open = {
+        range: { newStart, newCount },
+        oldCount,
+        newCount,
+        ctx: 0,
+        add: 0,
+        del: 0,
+      };
+      continue;
+    }
+    if (open !== null) {
+      // Body lines. A content line ALWAYS carries its ' ' / '+' / '-' prefix, so
+      // a bare "" here is an empty context line some proxy stripped, and a
+      // leading '\' is git's "\ No newline at end of file", which is a note
+      // about the previous line rather than a line of its own.
+      if (line === "" || line.startsWith(" ")) open.ctx++;
+      else if (line.startsWith("+")) open.add++;
+      else if (line.startsWith("-")) open.del++;
+      else if (line.startsWith("\\")) continue;
+      else return { hunks: [], complete: false, reason: "unparseable_hunk_body" };
+      continue;
+    }
     if (line.startsWith("GIT binary patch") || line.startsWith("Binary files ")) {
       return { hunks: [], complete: false, reason: "binary_patch" };
     }
     if (line.startsWith("deleted file mode ")) {
       return { hunks: [], complete: false, reason: "file_deleted" };
     }
-    if (!line.startsWith("@@")) continue;
-    const h = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/.exec(line);
-    if (!h) return { hunks: [], complete: false, reason: "unparseable_hunk_header" };
-    // A hunk header with no count means exactly one line (`+12` === `+12,1`).
-    hunks.push({ newStart: Number(h[1]), newCount: h[2] === undefined ? 1 : Number(h[2]) });
   }
+  // The last hunk in the body is the one a truncated fetch cuts, so this close
+  // is the one that matters most.
+  if (!closeHunk()) return { hunks: [], complete: false, reason: "hunk_body_short" };
   if (!sawTarget) return { hunks: [], complete: false, reason: "path_not_in_diff" };
   return { hunks, complete: true, reason: "" };
 }
@@ -412,6 +484,10 @@ export function refsTouchedInUsfm(fileText: string, hunks: HunkRange[]): HumanRe
     if (verseLo < 0) {
       // Chapter front matter (\c, \s1, \p before the first \v). Which verse it
       // affects is not decidable from line position, so claim the chapter.
+      // NOTE: a hunk that starts ON a chapter's first verse line claims `c:*`
+      // too (the line's opening state is still front matter), which is
+      // over-protective — and costs one slot, so a single chapter's effective
+      // budget is LINEAGE_REF_CAP - 1. Both effects are in the safe direction.
       refs.add(`${chapter}:*`);
       return null;
     }
@@ -477,17 +553,34 @@ export function mergeRefEvidence(parts: HumanRefEvidence[]): HumanRefEvidence {
   return { complete: true, refs: [...refs], reason: "" };
 }
 
+// "40:5" or "40:*", and nothing else. Entries are validated rather than trusted:
+// the set arrives through a Workflow step's JSON and out of a D1 text column, and
+// a malformed entry silently fails every `includes` test — which is the
+// NON-protective answer. One bad entry discards the whole set (see refsFrom).
+const REF_KEY_RE = /^\d+:(?:\d+|\*)$/;
+
+function validRefs(refs: unknown): string[] | null {
+  if (!Array.isArray(refs)) return null;
+  for (const r of refs) if (typeof r !== "string" || !REF_KEY_RE.test(r)) return null;
+  return refs as string[];
+}
+
 function refsFrom(lineage: MasterLineage | MasterLineageSummary): HumanRefEvidence | null {
   if ("humanRefs" in lineage) {
     const hr = (lineage as { humanRefs?: unknown }).humanRefs;
     // The uncompacted lineage carries the evidence object itself.
     if (hr != null && !Array.isArray(hr) && typeof hr === "object") {
       const ev = hr as HumanRefEvidence;
-      return ev.complete === true && Array.isArray(ev.refs) ? ev : null;
+      if (ev.complete !== true) return null;
+      const refs = validRefs(ev.refs);
+      return refs === null ? null : { complete: true, refs, reason: "" };
     }
     // The compacted summary carries the flattened pair.
     const complete = (lineage as MasterLineageSummary).refsComplete;
-    if (complete === true && Array.isArray(hr)) return { complete: true, refs: hr as string[], reason: "" };
+    if (complete === true) {
+      const refs = validRefs(hr);
+      if (refs !== null) return { complete: true, refs, reason: "" };
+    }
   }
   return null;
 }
@@ -506,13 +599,19 @@ export function refEvidenceTouches(refs: string[], chapter: number, verse: numbe
 //   - no lineage at all / an unparseable one          -> true
 //   - the commit walk was incomplete                  -> true
 //   - no per-verse evidence, or incomplete evidence   -> true
-//   - a nonsense ref                                  -> true
+//   - a ref set holding anything that is not a ref    -> true
 //   - human commits exist but mapped to zero refs     -> true (a mapping we do
 //     not believe: the commits touched the file, so they touched some verse)
+//
+// `verseEnd` is for a BRIDGED row (a D1 verse covering 14-15, from `\v 14-15`).
+// The whole range is asked, and ANY verse in it being human-touched protects the
+// row — asking only about the start verse would leave a bridge unprotected when
+// the human's hunk landed in its second half.
 export function masterMayHoldHumanEditForVerse(
   lineage: MasterLineage | MasterLineageSummary | null | undefined,
   chapter: number,
   verse: number,
+  verseEnd?: number | null,
 ): boolean {
   if (masterMayHoldHumanEdit(lineage) === false) return false;
   if (lineage == null) return true;
@@ -521,5 +620,13 @@ export function masterMayHoldHumanEditForVerse(
   const ev = refsFrom(lineage);
   if (ev === null) return true;
   if (ev.refs.length === 0) return true;
-  return refEvidenceTouches(ev.refs, chapter, verse);
+  let end = verse;
+  if (verseEnd != null) {
+    // A bridge we cannot believe (backwards, absurd, or not a number) is not a
+    // reason to narrow anything.
+    if (!Number.isInteger(verseEnd) || verseEnd < verse || verseEnd - verse > MAX_BRIDGE_WIDTH) return true;
+    end = verseEnd;
+  }
+  for (let v = verse; v <= end; v++) if (refEvidenceTouches(ev.refs, chapter, v)) return true;
+  return false;
 }

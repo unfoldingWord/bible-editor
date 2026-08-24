@@ -1,5 +1,5 @@
 # unfoldingWord/en_ult 24-JER.usfm @ 127cc1f3696994d967fc25fdd28a3a55d111132e
-# Fixes s5 markers — richmahn, fetched from git.door43.org 2026-08-24
+# Fixes s5 markers — Richard Mahn, fetched from git.door43.org 2026-08-24
 # Every line below is REAL: the line number and the real line text up to the
 # end of its last \c / \v marker. Nothing else in the file affects the
 # hunk -> verse mapping, so the test rebuilds a stand-in file of exactly

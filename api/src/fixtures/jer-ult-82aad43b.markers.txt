@@ -1,5 +1,5 @@
 # unfoldingWord/en_ult 24-JER.usfm @ 82aad43b84ab35ce7139c2e5e47fea0cd5ef41fb
-# Fixes USFM — richmahn, fetched from git.door43.org 2026-08-24
+# Fixes USFM — Richard Mahn, fetched from git.door43.org 2026-08-24
 # Every line below is REAL: the line number and the real line text up to the
 # end of its last \c / \v marker. Nothing else in the file affects the
 # hunk -> verse mapping, so the test rebuilds a stand-in file of exactly
