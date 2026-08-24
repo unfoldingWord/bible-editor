@@ -23,7 +23,7 @@
 // shield installed before the hazard goes live, not a repair.
 //
 // WHAT IS EXEMPT — per verse (row_key = BOOK/chapter/verse/RESOURCE), at
-// most two rows outlive the retention window:
+// most five rows outlive the retention window:
 //   1. The row today's merge picks as the ancestor: the newest
 //      'create'/'update' at/before the same boundary the merge itself cuts
 //      on (id boundary when stamped, timestamp watermark otherwise).
@@ -38,6 +38,31 @@
 //      most one row per verse and keeps that plan viable. Bounded by
 //      created_at, never id: a back-dated row's id is not chronological
 //      with its content.
+//   3. issue #573 gap 1a — the GLOBAL newest 'create'/'update' row per verse,
+//      with no boundary at all. bookReimport.ts's `latest_source` sub-select
+//      reads exactly this row (no time filter). Without this exemption, once
+//      every post-boundary create/update ages out, `latest_source` silently
+//      falls back to (1)'s ancestor — which can be AI-authored — and a
+//      verse a translator genuinely last touched can reclassify as
+//      AI-reseedable.
+//   4. issue #573 gap 1b — the newest POST-boundary row per verse with
+//      `source IS NULL AND action <> 'baseline'`. bookReimport.ts's
+//      `human_edit_after_export` probe is an EXISTS over exactly this set;
+//      once every such row ages out (only reachable if a book/resource's
+//      export boundary itself has stalled past 180 days — e.g. a locked or
+//      published book that never re-exports) the EXISTS silently flips from
+//      true to false, and a later reimport can read an undo-redo verse as
+//      unedited-since-export and adopt master over it.
+//   5. issue #573 gap 2 — the newest pre-watermark row per verse per action,
+//      for each of #548's other candidate merge-ancestor action classes
+//      (`restore`, `restore_master_verse`, `normalize-source-occurrences`,
+//      `normalize-align-order`, `heal-replacement-chars`,
+//      `heal-export-align-loss`, `remove-doubled-q1` — 543 rows corpus-wide
+//      as of 2026-08-20). None of these is wired into the merge as an
+//      ancestor yet — #548's payload-shape review of them is still open —
+//      but exempting them from an irreversible DELETE now is cheap (at most
+//      one row per verse per action present) and preserves the option;
+//      deleting first and reviewing later would not.
 //
 // Everything else older than the cutoff is deleted exactly as before —
 // post-watermark rows, books/resources with no watermark at all, and every
@@ -64,7 +89,9 @@
 //     merge picks survives either way (young rows are never candidates), and
 //     the overkept row is reclaimed by a later sweep once a newer
 //     pre-boundary row ages past the cutoff. Exempt survivors themselves
-//     remain candidates forever (at most two rows per verse), so the
+//     remain candidates forever (at most five rows per verse: ancestor,
+//     baseline, global-newest-source, newest-post-boundary-human-edit, and
+//     one per #548 candidate-ancestor action class actually present), so the
 //     steady-state exempt set is bounded by corpus size, not by time.
 //   - The join recovers (book, resource) from row_key by pattern
 //     (`BOOK/%/RESOURCE`) — anchored both ends, and book codes / resource
@@ -128,6 +155,67 @@ export const EDIT_LOG_SWEEP_SQL = `
               AND brs.master_confirmed_at IS NOT NULL
               AND el.created_at < brs.master_confirmed_at
             GROUP BY el.row_key
+         )
+         UNION ALL
+         -- (3) issue #573 gap 1a: the GLOBAL newest 'create'/'update' row per
+         -- verse, no boundary — protects bookReimport.ts's latest_source,
+         -- which reads this row unconditionally. Still requires a watermark
+         -- to exist (same as (1)/(2)): a book/resource that has never
+         -- exported gets no shield at all, matching the rest of this file.
+         SELECT MAX(el.id) AS keep_id
+           FROM edit_log el
+           JOIN book_resource_syncs brs
+             ON el.row_key LIKE brs.book || '/%/' || upper(brs.resource)
+            AND (el.book = brs.book OR el.book IS NULL)
+            AND brs.resource IN ('ult', 'ust')
+          WHERE el.kind = 'verse'
+            AND el.action IN ('create', 'update')
+            AND el.created_at < ?1
+            AND (brs.master_confirmed_edit_id IS NOT NULL OR brs.master_confirmed_at IS NOT NULL)
+          GROUP BY el.row_key
+         UNION ALL
+         -- (4) issue #573 gap 1b: the newest POST-boundary row per verse with
+         -- source IS NULL and action <> 'baseline' — protects
+         -- bookReimport.ts's human_edit_after_export EXISTS probe. Mirrors
+         -- (1)'s boundary but inverted (id >, not id <=).
+         SELECT MAX(el.id) AS keep_id
+           FROM edit_log el
+           JOIN book_resource_syncs brs
+             ON el.row_key LIKE brs.book || '/%/' || upper(brs.resource)
+            AND (el.book = brs.book OR el.book IS NULL)
+            AND brs.resource IN ('ult', 'ust')
+          WHERE el.kind = 'verse'
+            AND el.source IS NULL
+            AND el.action <> 'baseline'
+            AND el.created_at < ?1
+            AND ((brs.master_confirmed_edit_id IS NOT NULL
+                    AND el.id > brs.master_confirmed_edit_id)
+              OR (brs.master_confirmed_edit_id IS NULL
+                    AND brs.master_confirmed_at IS NOT NULL
+                    AND el.created_at >= brs.master_confirmed_at))
+          GROUP BY el.row_key
+         UNION ALL
+         -- (5) issue #573 gap 2: the newest pre-watermark row per verse per
+         -- action, for #548's other not-yet-wired candidate-ancestor action
+         -- classes. Same shape as (2), grouped by (row_key, action) instead
+         -- of row_key alone so each present action class gets its own kept
+         -- row rather than competing with the others.
+         SELECT keep_id FROM (
+           SELECT el.id AS keep_id, MAX(el.created_at)
+             FROM edit_log el
+             JOIN book_resource_syncs brs
+               ON el.row_key LIKE brs.book || '/%/' || upper(brs.resource)
+              AND (el.book = brs.book OR el.book IS NULL)
+              AND brs.resource IN ('ult', 'ust')
+            WHERE el.kind = 'verse'
+              AND el.action IN ('restore', 'restore_master_verse',
+                'normalize-source-occurrences', 'normalize-align-order',
+                'heal-replacement-chars', 'heal-export-align-loss',
+                'remove-doubled-q1')
+              AND el.created_at < ?1
+              AND brs.master_confirmed_at IS NOT NULL
+              AND el.created_at < brs.master_confirmed_at
+            GROUP BY el.row_key, el.action
          )
        )
      )`;
