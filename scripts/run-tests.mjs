@@ -39,6 +39,7 @@ const SQLITE_FILES = new Set([
   "src/tombstoneSweep.test.mjs",
   "src/aiRowDiffGate.test.mjs",
   "src/masterLineagePersist.test.mjs",
+  "src/bookLock.test.mjs",
 ]);
 
 const EXTRA_IMPORTS = new Map([
