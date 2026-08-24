@@ -5359,9 +5359,21 @@ async function sweepObsoleteTombstones(
     const stmts: D1PreparedStatement[] = [];
     for (const t of slice) {
       stmts.push(
+        // Compare-and-set on BOTH scan conditions, not just "still a
+        // tombstone": between the SELECT above and this DELETE, a concurrent
+        // reclaim could clear deleted_at and a fresh delete could re-set it,
+        // and a bare `deleted_at IS NOT NULL` would then hard-delete a
+        // BRAND-NEW tombstone — bypassing the grace period entirely and
+        // auditing a stale version. Re-asserting `deleted_at < cutoff` and
+        // `version = <scanned>` makes the row we delete provably the row we
+        // scanned; anything changed since simply matches 0 rows, which the
+        // changes() gate below already handles as "lost a race".
         env.DB.prepare(
-          `DELETE FROM ${kind}_rows WHERE book = ?1 AND id = ?2 AND deleted_at IS NOT NULL`,
-        ).bind(book, t.id),
+          `DELETE FROM ${kind}_rows
+             WHERE book = ?1 AND id = ?2
+               AND deleted_at IS NOT NULL AND deleted_at < ?3
+               AND version = ?4`,
+        ).bind(book, t.id, cutoff, t.version),
         // SQL-`changes()`-gated, same idiom as gatedLogEditStmt: only audits a
         // sweep that actually landed a row's worth of DELETE — never a
         // phantom row for one that lost a race (e.g. a concurrent
