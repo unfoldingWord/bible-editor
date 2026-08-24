@@ -10,9 +10,11 @@ import {
   dcsRawUrl,
   fetchDcsMasterText,
   fetchDcsMasterTextVerified,
+  fetchHumanTouchedRefs,
   fetchText,
   listMasterCommitsSince,
 } from "./dcsSources.ts";
+import { LINEAGE_REFINE_MAX_HUMAN_COMMITS } from "./masterLineage.ts";
 
 // A realistic-shaped full commit SHA (40 hex chars) — the only kind of `ref`
 // isPinnedCommitSha() (dcsSources.ts) accepts as proof of a single immutable
@@ -653,7 +655,124 @@ async function run() {
     }
   }
 
-  console.log("dcsSources/fetchText + fetchDcsMasterText + listMasterCommitsSince: all assertions passed");
+  // ── fetchHumanTouchedRefs (issue #557) ────────────────────────────────────
+  // Transport only: which URLs it asks for, and that every failure comes back
+  // as INCOMPLETE evidence (which downstream means "the file-level answer
+  // stands", i.e. master wins — today's behavior). The mapping itself is pure
+  // and is tested against the two real richmahn commits in masterLineage.test.mjs.
+  {
+    const SHA = "82aad43b84ab35ce7139c2e5e47fea0cd5ef41fb";
+    const PATH = "24-JER.usfm";
+    // A stand-in book: line 4 is verse 2 of chapter 40.
+    const USFM = ["\\id JER", "\\c 40", "\\v 1 first", "\\v 2 second", "\\c 41", "\\v 1 other", ""].join("\n");
+    const DIFF = [
+      `diff --git a/${PATH} b/${PATH}`,
+      `--- a/${PATH}`,
+      `+++ b/${PATH}`,
+      "@@ -4 +4 @@",
+      "-\\v 2 old",
+      "+\\v 2 second",
+      "",
+    ].join("\n");
+
+    // url -> response, so the assertions can also check WHAT was asked for.
+    let asked = [];
+    const serve = (map) => {
+      asked = [];
+      globalThis.fetch = async (url) => {
+        asked.push(String(url));
+        for (const [frag, r] of map) if (String(url).includes(frag)) return r();
+        throw new Error(`unexpected fetch: ${url}`);
+      };
+    };
+    const commit = (sha) => ({ sha, message: "Fixes USFM", authorEmail: "rich.mahn@unfoldingword.org" });
+
+    {
+      serve([
+        [`git/commits/${SHA}.diff`, () => res({ body: DIFF, contentLength: DIFF.length })],
+        [`raw/${PATH}`, () => res({ body: USFM, contentLength: USFM.length })],
+      ]);
+      const ev = await fetchHumanTouchedRefs(env, "en_ult", PATH, [commit(SHA)]);
+      assert(ev.complete === true, "a mappable human commit yields complete evidence");
+      assert(ev.refs.includes("40:2"), "  ...naming the verse its hunk landed in");
+      assert(asked.length === 2, "  ...for exactly two subrequests: the diff and the file at that revision");
+      assert(asked[0].includes(`/git/commits/${SHA}.diff`), "  ...the commit's own diff");
+      assert(asked[1].includes(`ref=${SHA}`), "  ...and the file PINNED to that commit, not master's tip");
+    }
+    {
+      // The abbreviated-sha trap, measured on 2026-08-24: the raw endpoint
+      // silently serves master's CURRENT tip for a short sha, which would map
+      // real hunk numbers onto the wrong bytes. Refused before any fetch.
+      serve([]);
+      const ev = await fetchHumanTouchedRefs(env, "en_ult", PATH, [commit("82aad43b")]);
+      assert(ev.complete === false && ev.reason === "abbreviated_sha", "an abbreviated sha is refused");
+      assert(asked.length === 0, "  ...without spending a subrequest");
+    }
+    {
+      serve([[`git/commits/${SHA}.diff`, () => res({ ok: false })]]);
+      const ev = await fetchHumanTouchedRefs(env, "en_ult", PATH, [commit(SHA)]);
+      assert(ev.complete === false && ev.reason === "diff_fetch_failed", "a failed diff fetch is incomplete");
+      assert(asked.length === 1, "  ...and the revision fetch is never attempted");
+    }
+    {
+      serve([
+        [`git/commits/${SHA}.diff`, () => res({ body: DIFF, contentLength: DIFF.length })],
+        [`raw/${PATH}`, () => res({ ok: false })],
+      ]);
+      const ev = await fetchHumanTouchedRefs(env, "en_ult", PATH, [commit(SHA)]);
+      assert(ev.complete === false && ev.reason === "revision_fetch_failed", "a failed revision fetch is incomplete");
+    }
+    {
+      // A short body against a declared length is a truncated read — the
+      // twl_PSA shape. Truncation would shift every line number after the cut.
+      serve([
+        [`git/commits/${SHA}.diff`, () => res({ body: DIFF, contentLength: DIFF.length })],
+        [`raw/${PATH}`, () => res({ body: USFM, contentLength: USFM.length + 5000 })],
+      ]);
+      const ev = await fetchHumanTouchedRefs(env, "en_ult", PATH, [commit(SHA)]);
+      assert(ev.complete === false, "a truncated revision body is incomplete, never mapped");
+    }
+    {
+      // Bigger than the cap: refused on the declared length, before reading.
+      serve([[`git/commits/${SHA}.diff`, () => res({ body: DIFF, contentLength: 99_000_000 })]]);
+      const ev = await fetchHumanTouchedRefs(env, "en_ult", PATH, [commit(SHA)]);
+      assert(ev.complete === false && ev.reason === "diff_fetch_failed", "an oversized diff is refused");
+    }
+    {
+      serve([]);
+      const ev = await fetchHumanTouchedRefs(env, "en_tn", "tn_JER.tsv", [commit(SHA)]);
+      assert(ev.complete === false && ev.reason === "not_usfm", "a TSV resource is not narrowed (it keeps the file-level answer)");
+      assert(asked.length === 0, "  ...and costs nothing");
+    }
+    {
+      // The subrequest budget: past the bound, fall back to the file-level
+      // answer rather than spend two fetches per commit.
+      serve([]);
+      const many = Array.from({ length: LINEAGE_REFINE_MAX_HUMAN_COMMITS + 1 }, (_, i) =>
+        commit(`${i}`.repeat(40).slice(0, 40).replace(/[^0-9a-f]/g, "a")),
+      );
+      const ev = await fetchHumanTouchedRefs(env, "en_ult", PATH, many);
+      assert(ev.complete === false && ev.reason === "too_many_human_commits", "too many human commits to map is incomplete");
+      assert(asked.length === 0, "  ...and is refused before any fetch");
+    }
+    {
+      // One bad commit in a window poisons the whole window: the refs we did
+      // map are not the whole set of verses a human touched.
+      const OTHER = "127cc1f3696994d967fc25fdd28a3a55d111132e";
+      serve([
+        [`git/commits/${SHA}.diff`, () => res({ body: DIFF, contentLength: DIFF.length })],
+        [`git/commits/${OTHER}.diff`, () => res({ ok: false })],
+        [`raw/${PATH}`, () => res({ body: USFM, contentLength: USFM.length })],
+      ]);
+      const ev = await fetchHumanTouchedRefs(env, "en_ult", PATH, [commit(SHA), commit(OTHER)]);
+      assert(ev.complete === false, "one unfetchable commit makes the window incomplete");
+      assert(ev.refs.length === 0, "  ...and carries no partial ref set");
+    }
+  }
+
+  console.log(
+    "dcsSources/fetchText + fetchDcsMasterText + listMasterCommitsSince + fetchHumanTouchedRefs: all assertions passed",
+  );
 }
 
 run().catch((e) => {

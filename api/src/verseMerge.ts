@@ -81,12 +81,17 @@ export interface VerseMergeInput {
   /** True when a human edit_log row exists after our last export commit. */
   humanEditedSinceExport: boolean;
   /**
-   * Could a human have written master's side of this difference? FALSE only
-   * when a COMPLETE commit-lineage walk of master's file since the ancestor
-   * found nothing but our own export commits and bp-assistant pushes — see
-   * masterLineage.ts. Callers must pass `masterMayHoldHumanEdit(lineage)`, the
-   * helper, never a boolean they reconstructed: an incomplete walk is not "no
-   * human found".
+   * Could a human have written master's side of THIS VERSE's difference? FALSE
+   * only when a COMPLETE commit-lineage walk of master's file since the
+   * ancestor found nothing but our own export commits and bp-assistant pushes
+   * — or (issue #557) when it did find human commits but a COMPLETE map of
+   * every one of their diff hunks says none of them landed in this verse. See
+   * masterLineage.ts.
+   *
+   * Callers must pass `masterMayHoldHumanEditForVerse(lineage, chapter, verse)`
+   * — or `masterMayHoldHumanEdit(lineage)` where there is no verse to narrow by
+   * — never a boolean they reconstructed: an incomplete walk is not "no human
+   * found", and a partial hunk map is not "the human touched only these".
    *
    * OMITTED means the caller never looked, which reads as `true` — today's
    * behavior, master wins a both-changed conflict. Only an explicit `false`
@@ -374,6 +379,13 @@ export function computeVerseMerge(input: VerseMergeInput): VerseMergeResult {
   // for a genuine maintainer edit, and for every case where we could not prove
   // there wasn't one — masterMayHoldHumanEdit is true when the walk was
   // incomplete and when the caller never looked.
+  //
+  // #557 narrowed the same flag from the FILE to the VERSE: a maintainer fixing
+  // markers in chapter 23 no longer authorizes reverting an app edit in chapter
+  // 40. The narrowing is upstream (masterMayHoldHumanEditForVerse) and it can
+  // only ever answer the file-level question or a narrower one, on complete
+  // positive evidence; unmapped, unparseable and unfetched all arrive here as
+  // `true`, exactly as they did before.
   //
   // Nothing is written here, so nothing is lost either way: the export still
   // publishes D1 over master, which is the point — that is how the human's edit
