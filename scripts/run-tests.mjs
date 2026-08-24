@@ -36,6 +36,7 @@ const SQLITE_FILES = new Set([
   "src/pipelineDispatchTimeout.test.mjs",
   "src/lockOverrideAlert.test.mjs",
   "src/tombstoneReclaim.test.mjs",
+  "src/tombstoneSweep.test.mjs",
   "src/aiRowDiffGate.test.mjs",
   "src/masterLineagePersist.test.mjs",
 ]);
@@ -44,6 +45,7 @@ const EXTRA_IMPORTS = new Map([
   ["src/reimportJourney.test.mjs", "./src/tsResolveHook.mjs"],
   ["src/applyVerseRows.test.mjs", "./src/tsResolveHook.mjs"],
   ["src/tombstoneReclaim.test.mjs", "./src/tsResolveHook.mjs"],
+  ["src/tombstoneSweep.test.mjs", "./src/tsResolveHook.mjs"],
   ["src/aiRowDiffGate.test.mjs", "./src/tsResolveHook.mjs"],
   ["src/masterLineagePersist.test.mjs", "./src/tsResolveHook.mjs"],
 ]);

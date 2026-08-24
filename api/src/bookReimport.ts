@@ -571,6 +571,17 @@ export const softDeleteRemovedTsvRowsForTest = (
   verifiedComplete: boolean,
 ): Promise<{ deleted: number; skippedLocked: number }> =>
   softDeleteRemovedTsvRows(env, book, kind, rawTsv, candidateChapters, verifiedComplete);
+// tombstoneSweep.test.mjs (issue #427 option 3): same rationale as the alias
+// above — lets the test drive the REAL sweepObsoleteTombstones (hard-delete +
+// gated audit row) against the real SQL instead of proving only that SQLite
+// behaves the way a hand-copied statement claims it does.
+export const sweepObsoleteTombstonesForTest = (
+  env: Env,
+  book: string,
+  kind: TsvKind,
+  rawTsv: string,
+  verifiedComplete: boolean,
+): Promise<{ swept: number }> => sweepObsoleteTombstones(env, book, kind, rawTsv, verifiedComplete);
 // The completeness gate softDeleteRemovedTsvRows' coverage fix relies on its
 // callers already having run — exposed so the control test can prove the gate
 // itself still catches a truncated fetch (the safety invariant the coverage
@@ -1049,6 +1060,25 @@ async function runReimport(
   }
   if (want.has("twl") && twlRaw) {
     addCounts(perResource.twl, await applyTsvRows(env, book, "twl", collectTsvRows(twlRaw, "twl"), userId, masterConfirmedAtTwl));
+  }
+
+  // Issue #427, option 3: sweep tombstones whose id no longer appears
+  // anywhere in master's file for this book — see sweepObsoleteTombstones for
+  // why this is disjoint from applyTsvRows' own tombstone branch above. Runs
+  // against the WHOLE book's raw text (not `collectTsvRows`' nonLockedChapters
+  // filter) — a locked chapter's rows are still on master, just not applied
+  // to D1 this run, and still count as "present" for sweep purposes.
+  if (want.has("tn") && tnRaw) {
+    const res = await sweepObsoleteTombstones(env, book, "tn", tnRaw, tnVerifiedComplete);
+    if (res.swept > 0) console.log("reimport swept obsolete tn tombstones", { book, swept: res.swept });
+  }
+  if (want.has("tq") && tqRaw) {
+    const res = await sweepObsoleteTombstones(env, book, "tq", tqRaw, tqVerifiedComplete);
+    if (res.swept > 0) console.log("reimport swept obsolete tq tombstones", { book, swept: res.swept });
+  }
+  if (want.has("twl") && twlRaw) {
+    const res = await sweepObsoleteTombstones(env, book, "twl", twlRaw, twlVerifiedComplete);
+    if (res.swept > 0) console.log("reimport swept obsolete twl tombstones", { book, swept: res.swept });
   }
 
   // FIX 4: fire the verse-merge-conflict banner once per (book, resource) for
@@ -5273,6 +5303,121 @@ async function softDeleteRemovedTsvRows(
   return { deleted, skippedLocked };
 }
 
+// Issue #427, option 3: sweep a tombstone whose id no longer appears ANYWHERE
+// in master's file for this book — pure dead weight. Mutually exclusive with
+// applyTsvRows' tombstone branch above by construction: that branch only ever
+// leaves a row tombstoned when master DOES still carry the id (same
+// reference: a pending delete not yet exported, deliberately left dead;
+// different reference: reissued, and RECLAIMED rather than left dead). An id
+// absent from master's file entirely is neither of those — it's a slot
+// nothing will ever again read the delete-preservation semantics for.
+//
+// Hard-deletes rather than another soft delete: the row is ALREADY a
+// tombstone, invisible to every reader, so there is nothing left to preserve
+// by keeping the row around — only the (book, id) primary key it still
+// occupies. If master ever reissues this exact id later, it lands via the
+// ordinary INSERT path (tryInsertTsvRow) and gets a fresh 'create' edit_log
+// entry that carries every field — the same "later create resets every
+// field" property boundHistoryToLastCreate and foldTsvBase already rely on
+// for a reclaimed slot (see rowHistoryBoundary.ts) — so no special fold
+// boundary is needed for a swept-then-reissued id either.
+//
+// Conservative on two axes, because a hard delete can't be un-swept the way a
+// soft delete can:
+//  - `verifiedComplete` gate, same reasoning as softDeleteRemovedTsvRows'
+//    coverage widening just above: an id merely missing from a partial or
+//    truncated body is not proof master dropped it — tsvFetchLooksTruncated
+//    is a loss-percentage heuristic, not a positive completeness guarantee.
+//    Every caller of this function already ran the truncation gate before
+//    `rawTsv` reaches here (planAndStageBookResources / runReimport null out
+//    a truncated fetch before it's ever staged or applied), so this is
+//    defense in depth, not the only guard.
+//  - TOMBSTONE_SWEEP_GRACE_SECONDS: only a tombstone at least this old is
+//    swept, so a row THIS SAME run's prune pass (softDeleteRemovedTsvRows)
+//    just tombstoned is never purged in the same breath — it gets a full
+//    retention window during which a bug in that prune could still be caught
+//    before the row becomes unrecoverable.
+const TOMBSTONE_SWEEP_GRACE_SECONDS = 7 * 24 * 60 * 60;
+
+async function sweepObsoleteTombstones(
+  env: Env,
+  book: string,
+  kind: TsvKind,
+  rawTsv: string,
+  verifiedComplete: boolean,
+): Promise<{ swept: number }> {
+  if (!verifiedComplete) return { swept: 0 };
+  const incomingIds = new Set<string>();
+  for (const r of parseTsv(rawTsv).rows) {
+    const p = parseTsvRow(r, kind);
+    if (p) incomingIds.add(p.id);
+  }
+  // Defensive, mirrors softDeleteRemovedTsvRows: an empty/garbled file must
+  // never be read as "master dropped everything".
+  if (incomingIds.size === 0) return { swept: 0 };
+
+  const cutoff = Math.floor(Date.now() / 1000) - TOMBSTONE_SWEEP_GRACE_SECONDS;
+  const rs = await env.DB.prepare(
+    `SELECT id, version FROM ${kind}_rows WHERE book = ?1 AND deleted_at IS NOT NULL AND deleted_at < ?2`,
+  )
+    .bind(book, cutoff)
+    .all<{ id: string; version: number }>();
+  const targets = (rs.results ?? []).filter((r) => !incomingIds.has(String(r.id)));
+  if (targets.length === 0) return { swept: 0 };
+
+  let swept = 0;
+  // Each row costs two statements (delete + gated log), same halving as the
+  // reclaim batch above, for the same reason: stay under D1's per-batch
+  // statement cap.
+  const SWEEP_PAIR_BATCH = Math.floor(WRITE_BATCH / 2);
+  for (let i = 0; i < targets.length; i += SWEEP_PAIR_BATCH) {
+    const slice = targets.slice(i, i + SWEEP_PAIR_BATCH);
+    const stmts: D1PreparedStatement[] = [];
+    for (const t of slice) {
+      stmts.push(
+        // Compare-and-set on BOTH scan conditions, not just "still a
+        // tombstone": between the SELECT above and this DELETE, a concurrent
+        // reclaim could clear deleted_at and a fresh delete could re-set it,
+        // and a bare `deleted_at IS NOT NULL` would then hard-delete a
+        // BRAND-NEW tombstone — bypassing the grace period entirely and
+        // auditing a stale version. Re-asserting `deleted_at < cutoff` and
+        // `version = <scanned>` makes the row we delete provably the row we
+        // scanned; anything changed since simply matches 0 rows, which the
+        // changes() gate below already handles as "lost a race".
+        env.DB.prepare(
+          `DELETE FROM ${kind}_rows
+             WHERE book = ?1 AND id = ?2
+               AND deleted_at IS NOT NULL AND deleted_at < ?3
+               AND version = ?4`,
+        ).bind(book, t.id, cutoff, t.version),
+        // SQL-`changes()`-gated, same idiom as gatedLogEditStmt: only audits a
+        // sweep that actually landed a row's worth of DELETE — never a
+        // phantom row for one that lost a race (e.g. a concurrent
+        // resurrect/reclaim clearing deleted_at first, which makes the
+        // DELETE above match 0 rows).
+        env.DB.prepare(
+          `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, source)
+           SELECT ?1, ?2, ?3, NULL, ?4, NULL, 'tombstone_swept', ?5
+            WHERE changes() > 0`,
+        ).bind(kind, t.id, book, t.version, REIMPORT_SOURCE),
+      );
+    }
+    try {
+      const results = await env.DB.batch(stmts);
+      slice.forEach((_t, j) => {
+        if ((results[j * 2]?.meta.changes ?? 0) > 0) swept++;
+      });
+    } catch (e) {
+      console.warn("reimport: tombstone sweep batch failed", {
+        book,
+        kind,
+        error: e instanceof Error ? e.message : String(e),
+      });
+    }
+  }
+  return { swept };
+}
+
 // SHA-gate each requested resource and stage the changed ones to R2. Returns
 // the book's chapter extent + a manifest the chunk steps read from.
 async function planAndStageBookResources(
@@ -5685,6 +5830,34 @@ export async function runChunkedReimport(
     // than the chunk-apply steps above, so a lock that starts after those
     // steps finish but is still held here is invisible to chapters_locked.
     if (res.skippedLocked > 0) perResource[kind].prune_locked += res.skippedLocked;
+  }
+
+  // Issue #427, option 3: sweep tombstones whose id no longer appears
+  // anywhere in master's file — see sweepObsoleteTombstones's header for the
+  // disjointness argument with the prune loop above (that loop tombstones a
+  // row master no longer carries; this one hard-deletes a tombstone that was
+  // ALREADY dead and stayed unclaimed). Deliberately NOT gated on
+  // changedTsv[kind] the way the prune loop is: an old, otherwise-quiet
+  // chapter can still hold a tombstone worth sweeping even when nothing in it
+  // changed tonight — the file only needs to have been re-fetched this run to
+  // prove the id's absence, which `e.r2Key` already tells us it was.
+  for (const e of changed) {
+    const kind = e.resource;
+    if (kind === "ult" || kind === "ust" || !e.r2Key) continue;
+    const r2Key = e.r2Key;
+    const verifiedComplete = e.verifiedComplete;
+    const res = await step.do(`reimport-tombsweep-${book}-${kind}`, async () => {
+      const raw = await readStaged(env, r2Key);
+      if (raw == null) return { swept: 0 };
+      return sweepObsoleteTombstones(env, book, kind, raw, verifiedComplete);
+    });
+    if (res.swept > 0) {
+      console.log("reimport swept obsolete tombstones (id absent from master entirely)", {
+        book,
+        resource: kind,
+        swept: res.swept,
+      });
+    }
   }
 
   // Canonical TWL order: recompute the ULT-position ordering for the book now
