@@ -398,6 +398,28 @@ deep(tsvMergeFields("tq"), ["quote", "question", "response"], "tq field list");
   eq(base.support_reference, null, "fold present-null overlays to null");
 }
 
+// Cross-book pollution (#545) — same guard foldTsvRefBase got in #543. A
+// NULL-book entry can be another book's history landing on this row's id; an
+// entry we cannot prove belongs to this row must not contribute a field.
+{
+  const base = foldTsvBase("tn", [
+    { action: "create", payload: { quote: "q0", note: "n0" }, bookKnown: true },
+    { action: "update", payload: { note: "foreign-book note" }, bookKnown: false },
+  ]);
+  deep(base, { quote: "q0", note: "n0" }, "a book-NULL entry does not pollute the content ancestor");
+  eq(
+    foldTsvBase("tn", [{ action: "create", payload: { quote: "q0", note: "n0" }, bookKnown: false }]),
+    null,
+    "a history of only book-NULL entries yields no ancestor (withhold, don't guess)",
+  );
+  // Callers that don't report it keep working unchanged.
+  deep(
+    foldTsvBase("tn", [{ action: "create", payload: { quote: "q0", note: "n0" } }]),
+    { quote: "q0", note: "n0" },
+    "an entry with bookKnown unreported still folds (existing callers unchanged)",
+  );
+}
+
 // ── tsvRefMoved (P1.4 reference-move detection) ─────────────────────────────
 // The reimport must detect a Door43 maintainer re-anchoring an app-edited row
 // to a different Reference (same id, new chapter/verse/ref_raw) — identity

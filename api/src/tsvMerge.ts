@@ -532,9 +532,9 @@ export function foldTsvRefBase(entries: TsvEditLogEntry[]): TsvRefSide | null {
     // verse 2 is common — so a coincidental match is not far-fetched, and here it
     // would decide whether the export may overwrite master. An entry we cannot
     // prove belongs to this row is worth less than no entry at all, so it is
-    // skipped. (foldTsvBase keeps the pre-existing behavior: a wrong content
-    // ancestor mis-merges one field, it does not unblock an overwrite. Filed
-    // separately rather than changed under this fix.)
+    // skipped. (foldTsvBase has the same guard, added separately under #545 —
+    // a wrong content ancestor mis-merges one field rather than unblocking an
+    // overwrite, so it didn't need to land under this same fix.)
     if (e.bookKnown === false) continue;
     const p = e.payload;
     for (const k of ["chapter", "verse"] as const) {
@@ -573,6 +573,14 @@ export function foldTsvBase(kind: TsvMergeKind, entries: TsvEditLogEntry[]): Tsv
   let base: TsvMergeSide | null = null;
   for (const e of entries) {
     if (!CONTENT_ACTIONS.has(e.action) || !e.payload) continue;
+    // CROSS-BOOK POLLUTION (#545). Same exposure foldTsvRefBase closed in #543:
+    // reconstructTsvBases matches `(book = ? OR book IS NULL)`, and a NULL-book
+    // entry for id "ab12" can be a different book's history folding into this
+    // row's "ab12" ancestor. A wrong content ancestor here mis-merges a field
+    // rather than unblocking an overwrite (the reason #543 filed this
+    // separately instead of fixing it there), but it is still worth less than
+    // no entry at all, so it is skipped the same way.
+    if (e.bookKnown === false) continue;
     for (const f of fields) {
       const { present, value } = readPayloadField(e.payload, f);
       if (!present) continue;
