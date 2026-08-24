@@ -374,6 +374,23 @@ Highlights that bite repeatedly:
   de-alignment from a revision mismatch — **for wording only.** Never let it narrow the refusal *decision*:
   that exemption is exactly what let the 1CH 4:21 collateral loss ship (see the warning comment in
   `alignmentDelta.ts`).
+- **The `deferredreward/bible-editor-multilingual` downstream fork is not a source of unmerged fixes for us —
+  check their own sync doc before re-triaging from scratch.** It forked at `7f83a398` (2026-07-13) and has
+  since rearchitected into a multi-tenant product (workspaces, per-org config, an `aquifer`/articles import
+  pipeline, an AI-provider BYO-key system, a "flows" UI) with no equivalent surface here. Their own
+  `docs/upstream-sync-2026-08-21.md` (in their repo, not ours) records that they actively triage *our* commits
+  into *their* fork — 298 of our commits reviewed, ~40 ported, the rest deferred or "ruled not applicable
+  (fork verified)" because the subsystem doesn't exist on their side (book locks, comments/mentions,
+  alignment_attention, occurrenceRule, etc.). That list is the mirror image of what would be relevant in the
+  other direction: on 2026-08-24 every candidate backend fix sampled from their commits since the fork point
+  (shrink-guard master-404 bootstrap, force-wipe safety-gate widening, cross-source tn/tq id remap, DCS-fetch
+  error surfacing) was either already superseded by more mature protections already in our `shrinkGuard.ts`/
+  `exportWorkflow.ts`/`bookReimport.ts`, or tied to a feature (multi-source import, admin force-reimport,
+  per-org routing) that doesn't exist in this codebase. Their 3 commits since their own sync
+  (`655e9f6`/`556919e`/`b631959`, 2026-08-22) are all fixes to their own "flows"/admin-desk React components
+  that have no counterpart here. **Next time this routine runs:** read their `docs/upstream-sync-*.md` first
+  (it names the merge-base and what they've already absorbed from us), then diff commits after their latest
+  sync doc's date rather than re-walking the full history back to `7f83a398`.
 
 ## Stop conditions / goals
 
