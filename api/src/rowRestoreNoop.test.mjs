@@ -182,6 +182,33 @@ console.log("\n[an ordinary content edit still bumps]");
   eq(r.restored_from_version, null, "…and an ordinary edit still clears the restore marker");
 }
 
+// F3 (cold review): the no-op short-circuit must never leave a TRASHED tn row
+// heading for deletion.
+//
+// A trashed tn row is queued for the 05:30 finalize, which promotes trashed_at
+// -> deleted_at unconditionally. The full write path applies
+// contentPatchClearClauses, which sets trashed_at = NULL for tn — an edit is the
+// strongest signal the row should live (trashedRowPatch.test.mjs pins the
+// incident). Before the #539 change, a trashed row carrying a restore marker
+// failed the old `restoreMatches` test and fell through to that write even on
+// identical content, so it was revived as a side effect. Short-circuiting would
+// have left it dying. A saved version is not worth a deleted note, so a trashed
+// tn row keeps the full-write path — it is the one carve-out from item 3.
+console.log("\n[a no-op save on a TRASHED tn row still revives it (the item-3 carve-out)]");
+{
+  const { sqlite, patch } = freshApp();
+  seedRow(sqlite, { restoredFrom: 2 });
+  sqlite.prepare(`UPDATE tn_rows SET trashed_at = 1785800000 WHERE id = ? AND book = ?`).run(ID, BOOK);
+
+  const res = await patch({ note: NOTE, restored_from_version: 2 }, 4);
+  eq(res.status, 200, "the save is accepted");
+
+  const r = row(sqlite);
+  eq(r.trashed_at, null, "the row is UN-trashed — it is no longer queued for tonight's finalize");
+  eq(r.version, 5, "…which costs a version, deliberately: reviving the note outranks saving one");
+  eq(r.note, NOTE, "…and the content is unchanged");
+}
+
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed`);
   process.exit(1);

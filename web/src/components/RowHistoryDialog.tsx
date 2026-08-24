@@ -101,13 +101,25 @@ export function RowHistoryDialog({
       .then((res) => {
         if (cancelled) return;
         setEntries(res.versions);
-        // Default selection: most recent entry that isn't the effective-current
-        // one, so the dialog opens showing "what was here before this one".
-        const previous = [...res.versions]
+        // Default selection: the most recent entry that answers "what was here
+        // before this one". Restores are excluded from THIS choice only — they
+        // are listed (see `ordered` below), but a restore's snapshot is by
+        // definition the content the row already holds, so opening on one shows
+        // an empty diff and tells the reader nothing. The row's own last edit
+        // being a restore is exactly when that bites: at version 8 restored from
+        // v3, effectiveVersion is 3, so the plain "not the current one" search
+        // lands on v8 — the phantom — instead of v7.
+        const candidates = res.versions.filter(
+          (v) => v.restored_from_version == null,
+        );
+        const previous = [...candidates]
           .reverse()
           .find((v) => v.version !== effectiveVersion);
         setSelectedVersion(
-          previous?.version ?? res.versions.at(-1)?.version ?? null,
+          previous?.version ??
+            candidates.at(-1)?.version ??
+            res.versions.at(-1)?.version ??
+            null,
         );
         setLoading(false);
       })
@@ -153,7 +165,12 @@ export function RowHistoryDialog({
     [effectiveEntry, fields],
   );
 
-  const isCurrent = selected?.version === effectiveVersion;
+  // "already what you're looking at" — true for the effective entry (whose
+  // snapshot IS the current text) and for the live version itself, which after a
+  // restore is a different number carrying that same text. Both would diff to
+  // nothing, so neither offers the diff toggle or a restore button.
+  const isCurrent =
+    selected?.version === effectiveVersion || selected?.version === currentVersion;
   const canDiff = !isCurrent && selected !== null && effectiveSnapshot !== null;
 
   return (
@@ -199,7 +216,17 @@ export function RowHistoryDialog({
               <List dense disablePadding>
                 {ordered.map((e) => {
                   const isSelected = e.version === selectedVersion;
-                  const isLive = e.version === effectiveVersion;
+                  // "current" marks the row's LIVE version, not the version
+                  // whose text it happens to be showing. Those are the same
+                  // number except after a restore, and keying the chip on
+                  // effectiveVersion there put the blue `current` chip on an
+                  // OLDER entry while the newest one sat unmarked — which reads
+                  // as "v8 is newer than current", i.e. not live. The live entry
+                  // now carries the chip and says where its text came from
+                  // ("current · restored from v3"); the header keeps telling the
+                  // version-number story ("current: v3 (restored)").
+                  const isLive = e.version === currentVersion;
+                  const restoredFrom = e.restored_from_version;
                   return (
                     <ListItemButton
                       key={e.version}
@@ -222,16 +249,20 @@ export function RowHistoryDialog({
                             </Typography>
                             {isLive && (
                               <Chip
-                                label="current"
+                                label={
+                                  restoredFrom != null
+                                    ? `current · restored from v${restoredFrom}`
+                                    : "current"
+                                }
                                 size="small"
                                 color="primary"
                                 variant="outlined"
                                 sx={{ height: 18, fontSize: 10 }}
                               />
                             )}
-                            {e.restored_from_version != null && (
+                            {!isLive && restoredFrom != null && (
                               <Chip
-                                label={`restored from v${e.restored_from_version}`}
+                                label={`restored from v${restoredFrom}`}
                                 size="small"
                                 variant="outlined"
                                 sx={{ height: 18, fontSize: 10 }}

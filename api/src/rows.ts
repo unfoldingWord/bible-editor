@@ -738,7 +738,21 @@ rows.patch("/:kind/:id", requireEditor, async (c) => {
   // to an unchanged question. (The two directions this now covers are a restore
   // arriving at content that already matches, and an ordinary no-op save on a
   // row that carries a marker — both used to bump.)
-  if (current.version === expected) {
+  //
+  // ONE CARVE-OUT, and it is data-loss-shaped rather than cosmetic. A trashed tn
+  // row is queued for the 05:30 finalize, which promotes trashed_at ->
+  // deleted_at unconditionally. The full write path below applies
+  // contentPatchClearClauses, which sets `trashed_at = NULL` for tn — an edit is
+  // the strongest signal the row should live (see trashedRowPatch.test.mjs and
+  // the incident it pins). Before this change, a trashed row carrying a restore
+  // marker failed `restoreMatches` and fell through to that write even on
+  // identical content, so it got revived as a side effect. Short-circuiting
+  // would leave it heading for deletion instead. A saved version is not worth a
+  // deleted note, so a trashed tn row keeps the pre-existing full-write path
+  // even when nothing about its content moved.
+  const trashedTnRow =
+    kind === "tn" && (current as Record<string, unknown>).trashed_at != null;
+  if (current.version === expected && !trashedTnRow) {
     const allMatch = fields.every(
       (f) => (patch as Record<string, unknown>)[f] === current[f],
     );

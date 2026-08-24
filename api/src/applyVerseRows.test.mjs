@@ -665,6 +665,100 @@ console.log("\n[…but a real out-of-band master change on the same shape STILL 
   eq(JSON.parse(row.content_json).verseObjects[0].children[0].text, "made", "…and master's text landed");
 }
 
+// S1 (cold review): a CONFLICTED no-op adopt must keep its review row.
+//
+// The one shape where the no-op is not benign. If a Door43 maintainer's
+// out-of-band fix lived in the `\zaln-s` source attributes and D1's UHB row is
+// stale, canonizeAlignmentSource rewrites that fix back to D1's stale bytes —
+// which is precisely WHY the adopted bytes end up matching. The stored data is
+// no worse than before the guard (the same stale bytes would have been
+// written), but silently dropping the verse_merge_conflicts row would also drop
+// the review-banner entry raiseVerseMergeConflictAlert raises from it, and the
+// condition recurs every night with nobody told. So: still no write, still no
+// version bump — but the row survives, with overwritten_version NULL because
+// nothing was overwritten.
+console.log("\n[a CONFLICTED no-op adopt writes nothing but KEEPS its review row (issue #539, cold review S1)]");
+{
+  const { env, sqlite } = freshEnv();
+  const UHB_FORM = "בָּרָ֣א";
+  const UHB_LEMMA = "בָּרָא";
+  const tree = (lemma) => ({
+    verseObjects: [
+      {
+        tag: "zaln",
+        type: "milestone",
+        strong: "H1254",
+        lemma,
+        content: UHB_FORM,
+        children: [{ tag: "w", type: "word", text: "created" }],
+      },
+    ],
+  });
+  const oursJson = JSON.stringify(tree(UHB_LEMMA));
+  const theirsJson = JSON.stringify(tree("בּרא"));
+  // A THIRD value for the ancestor, so both sides read as moved since it —
+  // that is what makes computeVerseMerge return adopt_conflict rather than a
+  // clean adopt.
+  const baseJson = JSON.stringify(tree("ANCESTOR-LEMMA"));
+
+  sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (9, 909, 'translator')`).run();
+  sqlite
+    .prepare(
+      `INSERT INTO verses (book, chapter, verse, verse_end, bible_version, content_json, plain_text, version, updated_by)
+       VALUES (?, 8, 1, NULL, 'ULT', ?, 'created', 4, 9)`,
+    )
+    .run(BOOK, oursJson);
+  sqlite
+    .prepare(
+      `INSERT INTO verses (book, chapter, verse, verse_end, bible_version, content_json, plain_text, version)
+       VALUES (?, 8, 1, NULL, 'UHB', ?, ?, 1)`,
+    )
+    .run(
+      BOOK,
+      JSON.stringify({
+        verseObjects: [
+          { tag: "w", type: "word", text: UHB_FORM, strong: "H1254", lemma: UHB_LEMMA, morph: "He,Vqp3ms" },
+        ],
+      }),
+      UHB_FORM,
+    );
+  const anc = sqlite
+    .prepare(
+      `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, payload_json, created_at)
+       VALUES ('verse', ?, ?, 9, 3, 4, 'update', ?, 100)`,
+    )
+    .run(`${BOOK}/8/1/ULT`, BOOK, JSON.stringify({ plain_text: "created", content: baseJson }));
+
+  const counts = await applyVerseRowsForTest(
+    env,
+    BOOK,
+    "ULT",
+    [{ chapter: 8, verse: 1, verseEnd: null, contentJson: theirsJson, plainText: "created" }],
+    null,
+    { confirmedAt: 200, editId: Number(anc.lastInsertRowid) },
+    false,
+  );
+
+  eq(counts.merge_noop_skipped, 1, "the conflicted adoption is still skipped as a no-op");
+  eq(counts.merge_adopted, 0, "…and not counted as landed");
+  const row = sqlite
+    .prepare("SELECT content_json, version FROM verses WHERE book = ? AND chapter = 8 AND verse = 1 AND bible_version = 'ULT'")
+    .all(BOOK)[0];
+  eq(row.version, 4, "…the version still does not move");
+  eq(row.content_json, oursJson, "…and the stored bytes are untouched");
+
+  const mc = sqlite
+    .prepare("SELECT action, reason, overwritten_version FROM verse_merge_conflicts WHERE chapter = 8 AND verse = 1")
+    .all();
+  eq(mc.length, 1, "the review row SURVIVES — a human still needs to see this collision");
+  eq(mc[0].action, "adopt_conflict", "…recorded as the conflict it is");
+  eq(
+    mc[0].overwritten_version,
+    null,
+    "…with overwritten_version NULL: nothing was replaced, so it must not point a reviewer at text that still stands",
+  );
+}
+
 // ── Characterization, not a regression for the #539 write guard ─────────────
 // The render round-trip gap (STATE.md: extract(render(x)) !== x for 16-19% of
 // verses) is held one layer earlier, by verseMerge's stableKey lens: the two
