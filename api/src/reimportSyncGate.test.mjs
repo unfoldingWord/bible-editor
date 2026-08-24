@@ -24,6 +24,7 @@ import {
   isKeptOverDoor43AtScale,
   KEPT_OVER_DOOR43_ALERT_THRESHOLD,
   mergeRefusalOverrideAllowed,
+  idBlockedOverrideAllowed,
 } from "./reimportSyncGate.ts";
 
 let failed = 0;
@@ -375,6 +376,101 @@ eq(
   mergeRefusalOverrideAllowed({ allowMergeRefusal: false, book: "1CH", resource: "ult" }, 1, 1, "ult"),
   false,
   "allowMergeRefusal: false → refused",
+);
+
+console.log("\n[issue #473 option A: idBlockedOverride on shouldRecordResourceSync]");
+
+// The override, when true, forces ONLY the conflict_skipped/tombstone_blocked
+// half open — a tombstone_blocked-only run now stamps.
+eq(
+  shouldRecordResourceSync(counts({ tombstone_blocked: 6 }), true),
+  true,
+  "idBlockedOverride true → a tombstone_blocked-only run now stamps",
+);
+eq(
+  shouldRecordResourceSync(counts({ conflict_skipped: 3 }), true),
+  true,
+  "idBlockedOverride true → a conflict_skipped-only run now stamps",
+);
+// The override must NOT touch chapters_locked/prune_locked — those are a
+// different withhold reason (a lock held mid-run), not the id-collision this
+// override exists to bypass.
+eq(
+  shouldRecordResourceSync(counts({ chapters_locked: 1, tombstone_blocked: 6 }), true),
+  false,
+  "idBlockedOverride true, but chapters_locked also nonzero → still withholds (override is scoped)",
+);
+eq(
+  shouldRecordResourceSync(counts({ prune_locked: 1, conflict_skipped: 3 }), true),
+  false,
+  "idBlockedOverride true, but prune_locked also nonzero → still withholds (override is scoped)",
+);
+// Absent/false override must never be coerced into a bypass.
+eq(
+  shouldRecordResourceSync(counts({ tombstone_blocked: 6 })),
+  false,
+  "no override arg at all → gate still withholds on tombstone_blocked",
+);
+eq(
+  shouldRecordResourceSync(counts({ tombstone_blocked: 6 }), false),
+  false,
+  "override explicitly false → gate still withholds",
+);
+// Fail-safe presence still applies even with the override set — a legacy/
+// malformed counts object must still withhold regardless of the override.
+eq(
+  shouldRecordResourceSync({}, true),
+  false,
+  "idBlockedOverride true but counts object missing everything → still withholds (fail-safe)",
+);
+// A no-op override (nothing was actually blocked) changes nothing.
+eq(
+  shouldRecordResourceSync(counts(), true),
+  true,
+  "idBlockedOverride true with a clean run → still stamps (no-op override)",
+);
+
+console.log("\n[issue #473 option A: idBlockedOverrideAllowed]");
+
+eq(
+  idBlockedOverrideAllowed({ allowIdBlocked: true, book: "1CH", resource: "tq" }, 1, 1, "tq"),
+  true,
+  "1CH tq: explicit single book + resource + allowIdBlocked → override permitted",
+);
+eq(
+  idBlockedOverrideAllowed({ allowIdBlocked: true }, 66, 5, "tq"),
+  false,
+  "allowIdBlocked with NO book/resource → refused (cannot blanket-disable the gate)",
+);
+eq(
+  idBlockedOverrideAllowed({ allowIdBlocked: true, resource: "tq" }, 66, 1, "tq"),
+  false,
+  "allowIdBlocked + resource but no book → refused",
+);
+eq(
+  idBlockedOverrideAllowed({ allowIdBlocked: true, book: "1CH" }, 1, 5, "tq"),
+  false,
+  "allowIdBlocked + book but no resource → refused (would cover every resource)",
+);
+eq(
+  idBlockedOverrideAllowed({ allowIdBlocked: true, book: "1CH", resource: "tq" }, 1, 1, "twl"),
+  false,
+  "override for a DIFFERENT resource than the one being checked → refused, never leaks across resources",
+);
+eq(
+  idBlockedOverrideAllowed({ allowIdBlocked: true, book: "1CH", resource: "tq" }, 2, 1, "tq"),
+  false,
+  "resolved book count > 1 → refused (widened resource/book must fail safe)",
+);
+eq(
+  idBlockedOverrideAllowed({ book: "1CH", resource: "tq" }, 1, 1, "tq"),
+  false,
+  "no allowIdBlocked flag → refused (override is strictly opt-in)",
+);
+eq(
+  idBlockedOverrideAllowed({ allowIdBlocked: false, book: "1CH", resource: "tq" }, 1, 1, "tq"),
+  false,
+  "allowIdBlocked: false → refused",
 );
 
 console.log("\n[isKeptOverDoor43AtScale]");
