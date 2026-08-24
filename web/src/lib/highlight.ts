@@ -1113,8 +1113,29 @@ export function renderEditableHTML(
 // content. Callers must fall back to the plain_text baseline instead of
 // writing "" into the DOM, which blanks the pane with no way to type the
 // text back. See issue #529.
+//
+// A marker-only tree (e.g. a lone \q1 with no following text) does NOT
+// render to "": segmentsToHtml fills the empty block with a zero-width
+// space (`&#8203;`) so contenteditable has somewhere to put the caret,
+// producing non-empty-but-invisible markup like `<div class="be-q-1">
+// &#8203;</div>`. That passes a trim()-only check and paints a text-free
+// pane in the read-only paths. Strip tags and known invisible entities
+// before judging emptiness. See issue #568.
+function stripToVisibleText(html: string): string {
+  return html
+    .replace(/<[^>]*>/g, "")
+    .replace(/&#8203;/g, "")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;/g, "'");
+}
+
 export function isPaintableHtml(html: string | null | undefined): html is string {
-  return typeof html === "string" && html.trim() !== "";
+  if (typeof html !== "string" || html.trim() === "") return false;
+  return stripToVisibleText(html).trim() !== "";
 }
 
 // Convenience: pick the right highlight set for a given bible_version.

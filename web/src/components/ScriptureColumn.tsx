@@ -1537,10 +1537,16 @@ function ActiveLine({
                 hydratedFromDraftRef.current = false;
                 if (elRef.current) {
                   // Re-render from the editable baseline so chips are
-                  // restored, not just plain text.
-                  elRef.current.innerHTML = html ?? "";
-                  if (!html) elRef.current.textContent = editableText;
-                  lastSetRef.current = html ?? editableText;
+                  // restored, not just plain text. isPaintableHtml (not a
+                  // raw null check) so a marker-only/empty render falls back
+                  // to editableText here too, same as the paint effect above.
+                  const paintable = isPaintableHtml(html) ? html : null;
+                  if (paintable === null) {
+                    elRef.current.textContent = editableText;
+                  } else {
+                    elRef.current.innerHTML = paintable;
+                  }
+                  lastSetRef.current = paintable ?? editableText;
                 }
               }}
               sx={{ p: 0.5, color: "warning.main" }}
