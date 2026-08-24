@@ -3,43 +3,57 @@
 // Every fixture below is a REAL commit subject/author, not an invented shape:
 // from master history on 2026-08-19 (en_tq/tq_AMO.tsv, en_tn/tn_JER.tsv,
 // en_ult/26-EZK.usfm, en_ust/24-JER.usfm), and — for the #550 section — from
-// the 8,700-commit / 2,727-path-scoped-commit corpus described in
-// masterLineage.ts's header, each one cited by sha. That matters here more than
-// usual: this classifier's output decides whether a Door43 edit can be
-// overwritten, so a fixture that merely looks plausible would lock in a guess.
-// The two places below where a shape is RECONSTRUCTED rather than quoted say so
-// in a comment.
+// the full 46,802-commit history described in masterLineage.ts's header, each
+// one cited by sha. That matters here more than usual: this classifier's output
+// decides whether a Door43 edit can be overwritten, so a fixture that merely
+// looks plausible would lock in a guess. The places below where a shape is
+// RECONSTRUCTED rather than quoted say so in a comment — and a reconstructed
+// fixture may never be the only thing holding up a rule (that is how the
+// verse-range and TWL widenings got in, and out again).
 //
-// ABLATION (run 2026-08-24, by patching masterLineage.ts — AI_PIPELINE_SUBJECT
-// for R1–R5, the classifier's bot branch for R6–R7 — and re-running this file).
-// The point is that a test which still passes with the tightening removed
-// proves nothing:
+// ABLATION (re-run 2026-08-24 after the cold review, by patching
+// masterLineage.ts — AI_PIPELINE_SUBJECT for R1–R5 and R8–R10,
+// AI_PIPELINE_TRAILER for R11, the classifier's bot branch for R6–R7 — and
+// re-running this file). The point is that a test which still passes with the
+// tightening removed proves nothing:
 //
 //   baseline (as shipped)                       exit 0, 0 FAIL
-//   R1 loose prefix `^(ULT|UST|TN|TQ|TWL):\s`   exit 1, 1 FAIL — "3a2432b15b:
-//                                               a book-wide intro pass is human"
+//   R1 loose prefix `^(ULT|UST|TN|TQ):\s`       exit 1, 5 FAIL — 3a2432b15b,
+//                                               plus the verse-range and both
+//                                               book-code narrowings
 //   R2 bracket made optional                    exit 0, 0 FAIL
 //   R3 chapter digits made optional             exit 0, 0 FAIL
 //   R4 end anchor removed                       exit 0, 0 FAIL
-//   R5 digits AND bracket both dropped          exit 1, 1 FAIL — same assertion
-//   R6 `ai` = bot author email alone            exit 1, 10 FAIL — all six
-//      (the pre-#550 rule)                      hand-directed outliers, both
-//                                               reason assertions, the
-//                                               marker-mention case and the
-//                                               retired-vocabulary case
+//   R5 digits AND bracket both dropped          exit 1, 2 FAIL — 3a2432b15b +
+//                                               the verse-range narrowing
+//   R6 `ai` = bot author email alone            exit 1, 15 FAIL — all six
+//      (the pre-#550 rule)                      hand-directed outliers, all
+//                                               four narrowings, both reason
+//                                               assertions, the wrapped
+//                                               trailer, the marker-mention
+//                                               case, the retired vocabulary
 //   R7 trailer accepted with no bot gate        exit 1, 1 FAIL — "a human
 //                                               revert quoting a pipeline
 //                                               trailer … is human"
+//   R8 `TWL` re-added to the alternation        exit 1, 1 FAIL — "a TWL: prefix
+//                                               is NOT an accepted shape"
+//   R9 verse-range group re-added               exit 1, 1 FAIL — "a
+//                                               verse-ranged target is NOT
+//                                               accepted"
+//   R10 book code loosened to                   exit 1, 2 FAIL — both book-code
+//       `[1-3]?[A-Z]{2,3}`                      assertions
+//   R11 trailer separator `\s*`                 exit 1, 1 FAIL — "a trailer
+//       (spans newlines)                        whose value sits on the next
+//                                               line is NOT the measured one"
 //
 // Read that honestly: on MEASURED data the LAM-intro exclusion needs only ONE
 // of {chapter digits, bracket} to survive, which is why R2 and R3 alone break
-// nothing and R5 breaks the assertion. The end anchor (R4) breaks nothing
-// measurable at all — it is kept because it costs nothing (all 807 real
-// pipeline pushes still match) and narrows in the protective direction. What
-// the ablation does establish is the one thing worth pinning: do NOT "simplify"
-// this to the loose prefix, which measurably re-breaks a real commit. R6 and R7
-// are the ones that carry the change — removing EITHER half of the two-signal
-// rule fails the assertions that justify it.
+// nothing and R5 breaks it. The end anchor (R4) breaks nothing measurable at
+// all — it is kept because it costs nothing (all 807 real pipeline pushes still
+// match) and narrows in the protective direction. R6 and R7 are the ones that
+// carry the change — removing EITHER half of the two-signal rule fails the
+// assertions that justify it — and R8–R11 are what keep the pattern from
+// drifting back to accepting shapes nobody has ever observed.
 //
 // Run from api/:
 //   node --experimental-strip-types --no-warnings src/masterLineage.test.mjs
@@ -134,7 +148,7 @@ eq(kind("fix: restore HAB 2:1-10 TN rows lost in AI insert", BOT), "human",
   "e417839d09: a repair OF AI damage must never itself classify as ai");
 // The regression this section exists for, and the one the ablation above turns
 // on. 3a2432b15b is the weakest of the six verdicts on content grounds, but the
-// classification is not close: a LOOSE `^(ULT|UST|TN|TQ|TWL):\s` prefix test
+// classification is not close: a LOOSE `^(ULT|UST|TN|TQ):\s` prefix test
 // stamps it `ai` (R1/R5), while EITHER the required chapter digits OR the
 // required bracket excludes it (R2/R3 pass alone).
 eq(kind("TN: LAM chapter and book introductions", BOT), "human",
@@ -148,15 +162,34 @@ eq(kind("TN: LAM chapter and book introductions", BOT), "human",
 eq(kind("ULT: EZK 38 [pjoakes]", BOT), "ai",
   "plain-username bracket (c70e1f1a84) is still ai — that commit carries the pipeline trailer in its body");
 eq(kind("TQ: AMO 5 [be..s@api.bp-assistant]", BOT), "ai", "the x@api.bp-assistant bracket is ai");
-// RECONSTRUCTED shape, not a quoted subject: the middle (truncated-email)
-// rendering. The bracket's contents are opaque to the regex (`[^\]]*`), so what
-// this pins is that the migration of the rendering cannot change the verdict.
-eq(kind("TN: JER 12 [st..w@noreply.door43.org]", BOT), "ai",
-  "truncated-email bracket is ai too — the era of the rendering must not decide");
-// Grammar variants — also RECONSTRUCTED, pinning that the regex is not
-// resource- or book-specific beyond the shape it asserts.
-eq(kind("TWL: 1CH 4 [de..d@api.bp-assistant]", BOT), "ai", "a numbered book code matches the pipeline shape");
-eq(kind("TN: JER 12:3 [de..d@api.bp-assistant]", BOT), "ai", "a chapter:verse target matches too");
+// The middle (truncated-email) rendering, using a domain that really occurs in
+// it (`@my.wheaton.edu` 18×, `@gmail.com` 11×, `@unfoldingword.org` 1×). What
+// this pins is NOT the bracket contents — those are opaque to the regex
+// (`[^\]]*`) — but that the verdict survives a bracket with no bp-assistant
+// address in it at all: this commit reaches `ai` through the bot email plus the
+// subject SHAPE, never through AI_MARKER.
+eq(kind("TN: JER 12 [st..w@my.wheaton.edu]", BOT), "ai",
+  "a truncated-email bracket with no bp-assistant address in it is still ai, via bot + shape");
+// Numbered book code. RECONSTRUCTED (no `1CH`-style bot subject was quoted in
+// the measurement) — it pins the `[1-3][A-Z]{2}` half of the book-code group.
+eq(kind("TN: 1CH 4 [de..d@api.bp-assistant]", BOT), "ai", "a numbered book code matches the pipeline shape");
+
+// ── #550: what the pipeline shape deliberately does NOT accept ──────────────
+// Every unmeasured shape this regex accepts is a way to stamp a hand edit `ai`,
+// so the narrowings below are pinned as tightly as the exclusions. Each cites
+// its count over the full 46,802-commit history.
+// `TWL:` — zero such subjects exist. (Note this one also carries a
+// bp-assistant address: it is `human` anyway, because a bot commit that fails
+// the shape test returns from the bot branch and never reaches AI_MARKER.)
+eq(kind("TWL: 1CH 4 [de..d@api.bp-assistant]", BOT), "human",
+  "a TWL: prefix is NOT an accepted pipeline shape — zero occurrences measured");
+// Verse / verse-range targets — zero of the bot's 817, zero repo-wide. This is
+// the shape of e417839d09, this change's own motivating hand repair.
+eq(kind("TN: HAB 2:1-10 [benjamin]", BOT), "human",
+  "a verse-ranged target is NOT accepted — it is the shape of a hand repair, not of any measured push");
+// Book code must be three letters, or a digit plus two.
+eq(kind("TN: AB 1 [de..d@api.bp-assistant]", BOT), "human", "a two-letter book code is not a book code");
+eq(kind("TN: 1ABC 1 [de..d@api.bp-assistant]", BOT), "human", "a four-character book code is not a book code");
 eq(classifyMasterCommit({ sha: "x", message: "ULT: EZK 38 [pjoakes]", authorEmail: BOT }).reason,
   "bot_author_pipeline_subject", "…and the reason names the signal that fired");
 
@@ -164,12 +197,23 @@ eq(classifyMasterCommit({ sha: "x", message: "ULT: EZK 38 [pjoakes]", authorEmai
 // bp-assistant writes `X-AI-Pipeline: bp-assistant/{generate|notes|tqs}` into
 // the commit BODY (519 commits, 518 bot-authored). Accepted as an alternative
 // SHAPE signal so a future wording change to the subject does not silently
-// reclassify real pipeline output. Forward-looking: every trailer commit
-// measured so far also has the pipeline subject.
+// reclassify real pipeline output. Be clear about what it buys TODAY: nothing.
+// All 518 bot-authored trailer commits also match the subject rule, so the
+// trailer classifies zero commits on its own — it is insurance against the next
+// format migration, not coverage. The cases below are therefore forward-looking
+// by construction.
 eq(
   kind("TN: regenerate JER notes after prompt change\n\nX-AI-Pipeline: bp-assistant/notes\n", BOT),
   "ai",
   "a bot commit with a non-pipeline subject but a valid trailer is ai",
+);
+// The separator is `[ \t]*`, not `\s*`: a `\s*` would span the newline and
+// accept a WRAPPED trailer, i.e. a body that never actually wrote the header
+// bp-assistant writes. Narrower is the protective direction here.
+eq(
+  kind("TN: regenerate JER notes after prompt change\n\nX-AI-Pipeline:\nbp-assistant/notes\n", BOT),
+  "human",
+  "a trailer whose value sits on the next line is NOT the measured trailer",
 );
 // …but NEVER as a standalone rule. 56fc2ec924 (2026-06-04, Stephen Wunrow) is a
 // HUMAN revert whose body quotes the reverted commit's subject AND its trailer.

@@ -26,11 +26,13 @@
 //          NateKreider, and Benjamin's own hand commits.
 //
 // THE MEASURED BASIS (issue #550, measured 2026-08-24). These rules used to
-// cite a single day's spot check of four files. They now rest on a corpus:
-// 8,700 repo-wide commits across en_ult / en_ust / en_tn / en_tq / en_twl —
-// roughly eight months of history, 51 distinct author emails — plus 2,727
-// PATH-SCOPED commits across 18 files, path-scoped being the shape
-// listMasterCommitsSince actually fetches. What it counted:
+// cite a single day's spot check of four files. They now rest on the FULL
+// history of the five repos: 46,802 commits across en_ult / en_ust / en_tn /
+// en_tq / en_twl, 101 distinct author emails — plus 2,727 PATH-SCOPED commits
+// across 18 files, path-scoped being the shape listMasterCommitsSince actually
+// fetches. (The first pass sampled 8,700 of those commits; a cold review
+// re-derived every count below against all 46,802 and they reproduce exactly.)
+// What it counted:
 //
 //   * `bot@unfoldingword.org` (display name always `BW Bot`) authored 817
 //     commits. 807 are `RES: BOOK CH [requester]`-shaped pipeline pushes. TEN
@@ -50,8 +52,15 @@
 //     (occasionally two), every row/verse in that chapter replaced.
 //   * bp-assistant also writes a trailer in the commit BODY —
 //     `X-AI-Pipeline: bp-assistant/{generate|notes|tqs}`, on 519 commits, 518
-//     of them bot-authored, all of them a strict subset of the 807.
+//     of them bot-authored. ALL 518 also match the subject rule, so the trailer
+//     adds ZERO coverage today. It is not carrying any commit; it is insurance
+//     against the next subject-format migration (the bracket rendering has
+//     already migrated twice — see note 2), and it costs one gated regex.
 //   * OURS_PREFIX has zero false positives in 1,535 matches.
+//   * THE SAFETY PROPERTY, measured rather than argued: replaying the old rule
+//     against the new one over all 46,802 commits flips exactly TEN commits,
+//     every one of them `ai` -> `human`, every one bot-authored. Zero commits
+//     flip toward `ai` or `ours`; no non-bot commit changes at all.
 //
 // FOUR THINGS THE REAL DATA CHANGED, none of which were obvious up front:
 //
@@ -156,12 +165,11 @@ const BOT_EMAILS = new Set(["bot@unfoldingword.org"]);
 // does not match are exactly the outlier set from THE MEASURED BASIS above (six
 // of them hand-directed edits).
 //
-// Three details are load-bearing, and each one is a measured exclusion rather
-// than taste:
+// Three details are load-bearing EXCLUSIONS, each measured rather than taste:
 //   * the required CHAPTER DIGITS and the required BRACKET — either alone
 //     excludes `TN: LAM chapter and book introductions` (3a2432b15b), a
 //     hand-directed book-wide intro pass. Relax BOTH — i.e. fall back to a
-//     loose `^(ULT|UST|TN|TQ|TWL):\s` prefix test — and that commit is stamped
+//     loose `^(ULT|UST|TN|TQ):\s` prefix test — and that commit is stamped
 //     `ai` again. masterLineage.test.mjs pins it, and the ablation in that
 //     file's header records which relaxation breaks which assertion.
 //   * the END ANCHOR, which is what makes this a whole-subject match rather
@@ -172,20 +180,40 @@ const BOT_EMAILS = new Set(["bot@unfoldingword.org"]);
 // opens with `RES:` at all (`UST LAM 3: …` and `fix: restore HAB …` are the
 // near misses), so the anchored prefix alone excludes them.
 //
-// DELIBERATELY NOT ACCEPTED: the older `AI (ULT|UST|TN|TQ) for {BOOK} {CH}`
-// vocabulary. It would keep four stale commits as `ai`, but nothing has used it
-// since 2026-04-01, it appears under three non-bot identities, and one commit
-// it would readmit is the defective run whose damage e417839d09 had to repair.
+// AND THREE DELIBERATE NARROWINGS, which matter just as much, because every
+// unmeasured thing this pattern ACCEPTS is a way to stamp a hand edit `ai`:
+//   * NO `TWL:` in the alternation. Zero `TWL:` subjects exist in all 46,802
+//     commits; the observed prefixes are ULT, UST, TN, TQ only.
+//   * NO verse or verse-range after the chapter. `(?::\d+(?:-\d+)?)?` matched
+//     0 of the bot's 817 commits and 0 repo-wide — and it would have accepted
+//     `TN: HAB 2:1-10 [benjamin]`, which is the exact shape of this change's
+//     own motivating commit (e417839d09, a hand repair of AI damage).
+//   * BOOK CODE is `[1-3][A-Z]{2}` or `[A-Z]{3}`, not `[1-3]?[A-Z]{2,3}`, which
+//     also accepted `AB` and `1ABC`.
+// If bp-assistant ever starts emitting a TWL push, a verse-ranged target, or
+// some other code shape, those commits classify `human` — which only preserves
+// master. RE-ADD ON MEASUREMENT, not on expectation: widen this only with the
+// commits in hand, the way the rest of this comment was earned.
+//
+// DELIBERATELY NOT ACCEPTED either: the older `AI (ULT|UST|TN|TQ) for {BOOK}
+// {CH}` vocabulary. It would keep four stale commits as `ai`, but nothing has
+// used it since 2026-04-01, it appears under three non-bot identities, and one
+// commit it would readmit is the defective run whose damage e417839d09 had to
+// repair.
 const AI_PIPELINE_SUBJECT =
-  /^(ULT|UST|TN|TQ|TWL):\s+[1-3]?[A-Z]{2,3}\s+\d+(?::\d+(?:-\d+)?)?\s*\[[^\]]*\]\s*$/;
+  /^(ULT|UST|TN|TQ):\s+(?:[1-3][A-Z]{2}|[A-Z]{3})\s+\d+\s*\[[^\]]*\]\s*$/;
 
 // bp-assistant's trailer, written into the commit BODY. An alternative SHAPE
-// signal — never a standalone rule, always gated on the bot author email.
+// signal — never a standalone rule, always gated on the bot author email. It
+// currently classifies NOTHING on its own (all 518 bot trailer commits also
+// match the subject rule); it exists so the next subject-format migration does
+// not silently reclassify real pipeline output. `[ \t]*`, not `\s*`, so the
+// separator cannot span a newline and match `X-AI-Pipeline:\nbp-assistant/…`.
 // Why the gate: 56fc2ec924 (2026-06-04, Stephen Wunrow) is a HUMAN
 // `revert 682f8938… (#7036)` whose body quotes the reverted commit's subject
 // AND its trailer. A trailer-only rule calls that human revert `ai` — the same
 // species of trap as `Revert "bible-editor: …"` in note 1.
-const AI_PIPELINE_TRAILER = /^X-AI-Pipeline:\s*bp-assistant\//m;
+const AI_PIPELINE_TRAILER = /^X-AI-Pipeline:[ \t]*bp-assistant\//m;
 
 function firstLine(message: string | null): string {
   if (!message) return "";
