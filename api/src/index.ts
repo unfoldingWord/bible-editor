@@ -351,7 +351,18 @@ export default {
       // handful of pending-ancestor action classes), or the merge would go
       // permanently blind on that verse the day its last pre-watermark row
       // aged out — see editLogSweep.ts for the full story (issues #537, #573).
-      const minuteOfHour = Math.floor(Date.now() / 60_000) % 60;
+      //
+      // Derived from `controller.scheduledTime`, NOT `Date.now()`: by the time
+      // execution reaches this line the handler has already awaited
+      // pollAllNonTerminal, whose per-job polling can run for many minutes on a
+      // large apply (pipelines.ts notes a DAN-11-scale apply outliving its own
+      // */5 tick). A wall-clock read would then land at, say, :12 and skip the
+      // hour outright — and for the once-a-day alarm below, which has exactly
+      // one eligible tick, skip the whole day. scheduledTime is the tick's
+      // INTENDED minute, always a multiple of 5 on this cron, so `< 5` picks
+      // out the :00 tick regardless of how long this invocation has been busy
+      // or how late Cloudflare delivered it.
+      const minuteOfHour = new Date(controller.scheduledTime).getUTCMinutes();
       if (minuteOfHour < 5) {
         // try/catch (same shape as the pipeline_jobs cleanup above): a failed
         // or D1-timed-out sweep must not fail the whole cron invocation — the
@@ -371,7 +382,11 @@ export default {
       // specific hour (04:00 UTC, ahead of the 05:30 export so a fix landed
       // today is reflected before tonight's run) AND the same minuteOfHour<5
       // window the hourly sweep uses, so this fires in exactly one of the
-      // POLL_CRON's twelve ticks per hour, once a day. Already best-effort
+      // POLL_CRON's twelve ticks per hour, once a day. Both halves of that gate
+      // read `controller.scheduledTime`: with only one eligible tick per day,
+      // a wall-clock minute shifted by a slow pollAllNonTerminal would drop the
+      // day's warning entirely and no later tick could stand in for it.
+      // Already best-effort
       // internally (raiseEditLogSweepBoundaryAlerts has its own try/catch —
       // this alarm gates nothing and must never fail the cron tick), but
       // wrapped again here for defense in depth, same as the sweep above.

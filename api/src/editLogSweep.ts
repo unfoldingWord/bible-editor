@@ -303,15 +303,33 @@ export async function findStaleSweepBoundaries(env: Env, now: number): Promise<S
   return (rs.results ?? []).map((r) => toStaleSweepBoundary(r, now));
 }
 
-function boundaryMessage(s: StaleSweepBoundary, now: number): string {
+// The message must stay BYTE-STABLE for as long as the condition persists, or
+// the dismissal stickiness this alarm reuses planSystemAlertWrites for (see
+// that function's header, and the block comment below) is silently defeated:
+// its only dismissal shield is an equality test on the message text, so a
+// message carrying "hasn't advanced in N day(s)" or "N day(s) of runway left"
+// reads as fresh content on the very next daily run — N ticks by one while
+// `masterConfirmedAt` does not — and a dismissed alert gets reinserted
+// undismissed alongside its dismissed copy every single day until the boundary
+// heals.
+//
+// Both facts are therefore stated as the FIXED dates they derive from.
+// `masterConfirmedAt` is frozen while the boundary is stale (that IS the
+// staleness condition), so both dates hold still across runs. No information is
+// lost: an absolute deadline is what the reader acts on anyway, and elapsed
+// days are the difference between the stated date and today.
+function boundaryMessage(s: StaleSweepBoundary): string {
   const res = s.resource.toUpperCase();
+  const day = (epochSeconds: number) => new Date(epochSeconds * 1000).toISOString().slice(0, 10);
   return (
-    `Benjamin — ${s.book} ${res}'s master-confirmed export watermark hasn't advanced in ` +
-    `${Math.floor((now - s.masterConfirmedAt) / 86400)} day(s) (last confirmed ${new Date(s.masterConfirmedAt * 1000).toISOString().slice(0, 10)}). ` +
+    `Benjamin — ${s.book} ${res}'s master-confirmed export watermark hasn't advanced since ` +
+    `${day(s.masterConfirmedAt)}. ` +
     `The edit_log retention sweep (180 days) is heading toward this boundary: once the boundary itself ` +
     `is older than 180 days, a translator's post-boundary edit to ${s.book} ${res} could age out before ` +
     `the nightly Door43 merge ever sees it, and the merge could then silently adopt master over that edit ` +
-    `(see issue #573). Roughly ${s.daysRemaining} day(s) of runway left. Nothing has been lost yet — this ` +
+    `(see issue #573). That boundary passes 180 days on ` +
+    `${day(s.masterConfirmedAt + EDIT_LOG_RETENTION_SECONDS)} — after that date the runway is gone. ` +
+    `Nothing has been lost yet — this ` +
     `is early warning. Find out why ${s.book} ${res}'s export stopped advancing the watermark (a lock, a ` +
     `stuck -be- branch, a published/frozen book) and unblock it.`
   );
@@ -347,7 +365,7 @@ function boundaryMessage(s: StaleSweepBoundary, now: number): string {
 export async function raiseEditLogSweepBoundaryAlerts(env: Env, now: number = Math.floor(Date.now() / 1000)): Promise<void> {
   try {
     const stale = await findStaleSweepBoundaries(env, now);
-    const desired = new Map<string, string>(stale.map((s) => [alarmSource(s.book, s.resource), boundaryMessage(s, now)]));
+    const desired = new Map<string, string>(stale.map((s) => [alarmSource(s.book, s.resource), boundaryMessage(s)]));
 
     const existingRs = await env.DB.prepare(
       `SELECT source, message, dismissed_at FROM system_alerts

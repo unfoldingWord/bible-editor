@@ -396,7 +396,14 @@ console.log("\n[raiseEditLogSweepBoundaryAlerts: writes a warning naming the boo
   assert(rows[0]?.severity === "warning", "severity is 'warning', not 'error' — nothing has been lost yet");
   assert(rows[0]?.source === "edit_log_sweep_boundary_stale:JER:ust", "source names the specific book+resource");
   assert(rows[0]?.message.includes("JER") && rows[0]?.message.includes("UST"), "message names the specific book+resource");
-  assert(/\d+ day\(s\) of runway/.test(rows[0]?.message ?? ""), "message states roughly how many days of runway remain");
+  assert(
+    rows[0]?.message.includes(new Date((staleAt + EDIT_LOG_RETENTION_SECONDS) * 1000).toISOString().slice(0, 10)),
+    "message states the DATE the boundary passes 180 days, so the reader still knows the runway",
+  );
+  assert(
+    !/\d+ day\(s\)/.test(rows[0]?.message ?? ""),
+    "message carries no day-counter — a count that ticks daily reads as new content and defeats dismissal (see boundaryMessage)",
+  );
 
   // Re-running with nothing changed must not create a second row for the
   // same still-undismissed alert.
@@ -412,6 +419,19 @@ console.log("\n[raiseEditLogSweepBoundaryAlerts: writes a warning naming the boo
   rows = alertRows(d, "edit_log_sweep_boundary_stale:%");
   assert(rows.length === 1, "still exactly one row after dismiss+re-run (no duplicate created)");
   assert(rows[0]?.dismissed_at != null, "the dismissed alert is left dismissed rather than being resurrected while the SAME condition persists");
+
+  // ...and re-run again a DAY LATER, which is what production actually does:
+  // this alarm fires once per day, so the run after a dismissal is never the
+  // same `now`. planSystemAlertWrites' only dismissal shield is byte-equality
+  // on the message, so a message embedding elapsed-days or days-remaining
+  // would differ here and resurrect the alert every single day until the
+  // boundary healed. The two assertions above cannot catch that — they re-run
+  // at the identical `now` and so compare identical text no matter what the
+  // message is built from.
+  await raiseEditLogSweepBoundaryAlerts(env, now + 86400);
+  rows = alertRows(d, "edit_log_sweep_boundary_stale:%");
+  assert(rows.length === 1, "a day later, still exactly one row — the dismissed alert is not resurrected by the passage of time");
+  assert(rows[0]?.dismissed_at != null, "the day-later row is still the dismissed one, not a fresh undismissed copy");
 
   // Heal the boundary (a fresh export re-confirms it) and re-run: any
   // lingering UNDISMISSED alert for a now-healthy boundary must clear. Reset
