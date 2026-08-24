@@ -79,6 +79,23 @@ eq(kind("ULT: EZK 38 [pjoakes]", BOT), "ai", "a bot push requested by a human is
 eq(kind("TQ: AMO 9 [xx..y@api.bp-assistant]", "someone-else@example.org"), "ai",
   "the bp-assistant marker alone classifies as ai");
 
+// ── the human-revert-quoting-bp-assistant trap (issue #612) ─────────────────
+// Gitea's revert button emits `Revert "<original subject>"`. A human revert of
+// a bp-assistant push quotes that push's subject verbatim, and AI_MARKER must
+// not fire on the quote — only on the original push.
+eq(
+  kind('Revert "UST: JER 31 [Gr..e@api.bp-assistant]"', RICH),
+  "human",
+  "a human's own revert of a bp-assistant push is human, not ai (it merely quotes the marker)",
+);
+// The unguarded case still fires: the ORIGINAL push (no Revert wrapper) is
+// still ai even under a non-bot author (the marker-alone rule, tested above).
+eq(
+  kind("UST: JER 31 [Gr..e@api.bp-assistant]", RICH),
+  "ai",
+  "the original bp-assistant push (not a revert) is still ai, marker alone is enough",
+);
+
 // ── human ───────────────────────────────────────────────────────────────────
 eq(kind("Adds '0' to Occurrence column (#458)", RICH), "human", "a maintainer edit is human");
 eq(kind("Cleanup of \\s1 tags", RICH), "human", "an unprefixed maintainer commit is human");

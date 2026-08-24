@@ -36,6 +36,21 @@
 //    machine-written, so the AUTHOR is the signal, not the bracket.
 // 3. `login` is null on plenty of commits, human ones included
 //    (`richmahn@users.noreply.github.com` with no login). Never key on it.
+// 4. A human's OWN revert can quote a bp-assistant address without being an AI
+//    push: Gitea's revert button emits `Revert "<original subject>"`, and a
+//    maintainer reverting a bad AI push produces
+//    `Revert "UST: JER 31 [Gr..e@api.bp-assistant]"` under their own (human)
+//    author. AI_MARKER tests the subject only, so unguarded it would classify
+//    that human revert `ai` and let the very content being reverted win a
+//    both-changed conflict back over the maintainer (issue #612). Fixed with
+//    the minimal option (excluding revert subjects from AI_MARKER, mirroring
+//    note 1's OURS_PREFIX anchoring) rather than requiring a bot author for
+//    AI_MARKER too: measured 2026-08-24, every AI_MARKER hit in the repo's
+//    history is a MERGE commit, which Gitea's path-scoped file history drops —
+//    so AI_MARKER already fires 0 times in the shape this classifier actually
+//    sees, and retiring it outright was judged not worth losing its stated
+//    role (recognizing a future bot under a different author) for a rule that
+//    costs nothing today.
 //
 // FAIL-SAFE DIRECTION, and it is the whole safety argument for this module.
 // Downstream, `ai` and `ours` are what let a conflict resolve D1-wins; `human`
@@ -86,6 +101,17 @@ const OURS_PREFIX = /^bible-editor(?: export)?:\s/;
 // future bot that pushes under a different author is still recognized.
 const AI_MARKER = /@api\.bp-assistant\b/;
 
+// Gitea's revert-button format: `Revert "<original subject>"`. A HUMAN revert
+// of a bp-assistant push quotes that push's subject verbatim, so AI_MARKER
+// would otherwise fire on the human's own commit — reverting the very content
+// the maintainer was trying to undo (issue #612). Mirrors OURS_PREFIX's
+// anchoring rationale above: a pattern that only tests for a substring inside
+// the subject cannot tell "this IS an ai push" from "this QUOTES one". Scoped
+// to AI_MARKER only — a revert of one of OUR OWN exports is already handled
+// above (OURS_PREFIX is anchored, so `Revert "bible-editor: …"` never matches
+// it and correctly falls through to `human`).
+const REVERT_PREFIX = /^Revert "/;
+
 // The bot account that authors every bp-assistant push. This is the PRIMARY ai
 // signal: it catches `ULT: EZK 38 [pjoakes]` (bot-authored, human-requested),
 // whose content is still machine-written (see note 2 above).
@@ -111,7 +137,7 @@ export function classifyMasterCommit(commit: MasterCommit): ClassifiedCommit {
   if (email && BOT_EMAILS.has(email)) {
     return { ...commit, kind: "ai", reason: "bot_author_email" };
   }
-  if (AI_MARKER.test(subject)) {
+  if (AI_MARKER.test(subject) && !REVERT_PREFIX.test(subject)) {
     return { ...commit, kind: "ai", reason: "bp_assistant_marker" };
   }
   // Everything unrecognized — including a commit with no message and no author
