@@ -19,9 +19,17 @@
 -- Purely additive and idempotent: only touches rows that are NULL today, only
 -- ever fills in a value never leaves TRUE data out, and re-running it is a
 -- no-op once applied.
+--
+-- json_valid() BEFORE json_extract(), because json_extract() on malformed text
+-- is a hard SQLite error, not a NULL — one corrupt legacy payload would abort
+-- the whole migration and block the deploy (this repo has already eaten an
+-- unapplied migration causing prod 500s). The schema never enforced JSON
+-- validity, and the application already treats an unparseable edit_log payload
+-- as ignorable history, so skipping such a row is the existing contract.
 UPDATE edit_log
    SET book = json_extract(payload_json, '$.book')
  WHERE book IS NULL
    AND kind IN ('tn', 'tq', 'twl')
    AND payload_json IS NOT NULL
+   AND json_valid(payload_json)
    AND json_extract(payload_json, '$.book') IS NOT NULL;
