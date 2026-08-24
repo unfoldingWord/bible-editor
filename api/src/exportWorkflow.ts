@@ -1768,13 +1768,17 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     // can pick each row_key's newest entry itself (Defect 6) — correctness no
     // longer depends on this query's ordering. ORDER BY id ASC is kept anyway
     // (harmless, and it keeps the intent legible).
+    // user_id is selected alongside source so attributeTsvShrink's
+    // isHumanIntentRemoval (#580) can judge a repair-script tombstone by
+    // whether a real person is attributed to it, rather than by the source
+    // string's name.
     const removalsRs = await this.env.DB.prepare(
-      `SELECT row_key, source, id FROM edit_log
+      `SELECT row_key, source, user_id, id FROM edit_log
         WHERE kind = ?1 AND book = ?2 AND action IN ('delete', 'trash')
         ORDER BY id ASC`,
     )
       .bind(resource, book)
-      .all<{ row_key: string; source: string | null; id: number }>();
+      .all<{ row_key: string; source: string | null; user_id: number | null; id: number }>();
 
     const { explained, unexplained } = attributeTsvShrink({
       masterIds,

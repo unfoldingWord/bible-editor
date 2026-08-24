@@ -15,6 +15,7 @@ import {
   releaseSetUsable,
   describePublishedDrift,
   lockOverrideAllowed,
+  autoMergeConfirmationRequired,
 } from "./publishedGuard.ts";
 
 function assert(cond, msg) {
@@ -225,6 +226,37 @@ assert(
 assert(
   lockOverrideAllowed({ allowLocked: true, book: "ISA", resource: "tn" }, 1, 0) === false,
   "resolved resource count 0 -> refused",
+);
+
+// --- autoMergeConfirmationRequired --- (#581)
+assert(
+  autoMergeConfirmationRequired({ allowLocked: true }, true) === true,
+  "allowLocked against a locked book, no branchName, no allowAutoMerge -> confirmation required (the footgun)",
+);
+assert(
+  autoMergeConfirmationRequired({ allowLocked: true, branchName: "MIC-fix" }, true) === false,
+  "branchName present -> no confirmation needed, ships on a non-auto-merging branch",
+);
+assert(
+  autoMergeConfirmationRequired({ allowLocked: true, allowAutoMerge: true }, true) === false,
+  "allowAutoMerge:true is an explicit, auditable acknowledgement -> no confirmation needed",
+);
+assert(
+  autoMergeConfirmationRequired({ allowLocked: true, allowAutoMerge: false }, true) === true,
+  "allowAutoMerge:false is not an acknowledgement -> still required",
+);
+assert(
+  autoMergeConfirmationRequired({ allowLocked: false }, true) === false,
+  "no allowLocked at all -> nothing to confirm (the book-lock gate already blocks unattended)",
+);
+assert(
+  autoMergeConfirmationRequired({ allowLocked: true }, false) === false,
+  "an unlocked book -> normal export unaffected, no confirmation needed",
+);
+assert(
+  autoMergeConfirmationRequired({ allowLocked: true, branchName: "MIC-be-x" }, true) === false,
+  "this predicate only checks presence, not content, of branchName — a -be- name is rejected earlier " +
+    "by exportBranchOverrideValid in the route, before autoMergeConfirmationRequired ever runs",
 );
 
 console.log("publishedGuard: all assertions passed");
