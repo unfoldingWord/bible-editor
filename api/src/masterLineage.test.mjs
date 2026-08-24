@@ -1,10 +1,45 @@
 // Regression tests for masterLineage.ts — classifying who moved Door43 master.
 //
-// Every fixture below is a REAL commit subject/author taken from master history
-// on 2026-08-19 (en_tq/tq_AMO.tsv, en_tn/tn_JER.tsv, en_ult/26-EZK.usfm,
-// en_ust/24-JER.usfm), not an invented shape. That matters here more than usual:
-// this classifier's output decides whether a Door43 edit can be overwritten, so
-// a fixture that merely looks plausible would lock in a guess.
+// Every fixture below is a REAL commit subject/author, not an invented shape:
+// from master history on 2026-08-19 (en_tq/tq_AMO.tsv, en_tn/tn_JER.tsv,
+// en_ult/26-EZK.usfm, en_ust/24-JER.usfm), and — for the #550 section — from
+// the 8,700-commit / 2,727-path-scoped-commit corpus described in
+// masterLineage.ts's header, each one cited by sha. That matters here more than
+// usual: this classifier's output decides whether a Door43 edit can be
+// overwritten, so a fixture that merely looks plausible would lock in a guess.
+// The two places below where a shape is RECONSTRUCTED rather than quoted say so
+// in a comment.
+//
+// ABLATION (run 2026-08-24, by patching masterLineage.ts — AI_PIPELINE_SUBJECT
+// for R1–R5, the classifier's bot branch for R6–R7 — and re-running this file).
+// The point is that a test which still passes with the tightening removed
+// proves nothing:
+//
+//   baseline (as shipped)                       exit 0, 0 FAIL
+//   R1 loose prefix `^(ULT|UST|TN|TQ|TWL):\s`   exit 1, 1 FAIL — "3a2432b15b:
+//                                               a book-wide intro pass is human"
+//   R2 bracket made optional                    exit 0, 0 FAIL
+//   R3 chapter digits made optional             exit 0, 0 FAIL
+//   R4 end anchor removed                       exit 0, 0 FAIL
+//   R5 digits AND bracket both dropped          exit 1, 1 FAIL — same assertion
+//   R6 `ai` = bot author email alone            exit 1, 10 FAIL — all six
+//      (the pre-#550 rule)                      hand-directed outliers, both
+//                                               reason assertions, the
+//                                               marker-mention case and the
+//                                               retired-vocabulary case
+//   R7 trailer accepted with no bot gate        exit 1, 1 FAIL — "a human
+//                                               revert quoting a pipeline
+//                                               trailer … is human"
+//
+// Read that honestly: on MEASURED data the LAM-intro exclusion needs only ONE
+// of {chapter digits, bracket} to survive, which is why R2 and R3 alone break
+// nothing and R5 breaks the assertion. The end anchor (R4) breaks nothing
+// measurable at all — it is kept because it costs nothing (all 807 real
+// pipeline pushes still match) and narrows in the protective direction. What
+// the ablation does establish is the one thing worth pinning: do NOT "simplify"
+// this to the loose prefix, which measurably re-breaks a real commit. R6 and R7
+// are the ones that carry the change — removing EITHER half of the two-signal
+// rule fails the assertions that justify it.
 //
 // Run from api/:
 //   node --experimental-strip-types --no-warnings src/masterLineage.test.mjs
@@ -71,13 +106,102 @@ eq(kind("UST: JER 43 [Gr..e@api.bp-assistant]", BOT), "ai", "bp-assistant ust pu
 
 // The bot also pushes on a human's behalf — real: `ULT: EZK 38 [pjoakes]`, bot
 // author, plain username in the bracket. The content is still machine-written,
-// so the author decides, not the bracket.
-eq(kind("ULT: EZK 38 [pjoakes]", BOT), "ai", "a bot push requested by a human is still ai (author decides)");
+// so the bracket does not decide. (Since #550 the author does not decide alone
+// either — see the two-signal section below.)
+eq(kind("ULT: EZK 38 [pjoakes]", BOT), "ai", "a bot push requested by a human is still ai");
 
 // The marker alone is enough even without the known bot address, so a future
 // bot pushing under a different account is still recognized.
 eq(kind("TQ: AMO 9 [xx..y@api.bp-assistant]", "someone-else@example.org"), "ai",
   "the bp-assistant marker alone classifies as ai");
+
+// ── #550: the bot account is NOT sufficient on its own ──────────────────────
+// The bot authored 817 commits in the corpus. 807 are pipeline pushes; ten are
+// not, and six of those ten are hand-directed edits that the old
+// author-email-only rule stamped `ai` — i.e. made overwritable by our next
+// export. Each subject below is quoted from its commit (sha cited).
+eq(kind("align PSA 7, 8 superscriptions", BOT), "human",
+  "22ba6f3b9e: a bot-pushed hand alignment of two PSA superscriptions is human");
+eq(kind("align PSA 4-9 superscriptions", BOT), "human",
+  "1503b9e4fb: the same hand pass over six chapters is human");
+// Subject abbreviated at the tail (it continues past the \qa tags); nothing
+// after the first word affects the classification.
+eq(kind("Fix LAM 1-4 acrostic \\qa tags", BOT), "human",
+  "9f6417e437: a 93-hunk marker-convention normalization is human, not an AI run");
+eq(kind("UST LAM 3: remove duplicate verses 1-10", BOT), "human",
+  "08f0c4ffa0: a pure +0/-140 deletion is human (note it is `UST LAM 3:`, not `UST:`)");
+eq(kind("fix: restore HAB 2:1-10 TN rows lost in AI insert", BOT), "human",
+  "e417839d09: a repair OF AI damage must never itself classify as ai");
+// The regression this section exists for, and the one the ablation above turns
+// on. 3a2432b15b is the weakest of the six verdicts on content grounds, but the
+// classification is not close: a LOOSE `^(ULT|UST|TN|TQ|TWL):\s` prefix test
+// stamps it `ai` (R1/R5), while EITHER the required chapter digits OR the
+// required bracket excludes it (R2/R3 pass alone).
+eq(kind("TN: LAM chapter and book introductions", BOT), "human",
+  "3a2432b15b: a book-wide intro pass is human — the loose prefix regex would call it ai");
+
+// …and the 807 real pipeline pushes still classify `ai`, in all three
+// renderings of the bracket. The bracket is a REQUESTER field whose rendering
+// migrated (plain username -> truncated email -> x@api.bp-assistant); the
+// recorded decision is that a human's name there does NOT make the commit
+// human, because the content is still machine-written.
+eq(kind("ULT: EZK 38 [pjoakes]", BOT), "ai",
+  "plain-username bracket (c70e1f1a84) is still ai — that commit carries the pipeline trailer in its body");
+eq(kind("TQ: AMO 5 [be..s@api.bp-assistant]", BOT), "ai", "the x@api.bp-assistant bracket is ai");
+// RECONSTRUCTED shape, not a quoted subject: the middle (truncated-email)
+// rendering. The bracket's contents are opaque to the regex (`[^\]]*`), so what
+// this pins is that the migration of the rendering cannot change the verdict.
+eq(kind("TN: JER 12 [st..w@noreply.door43.org]", BOT), "ai",
+  "truncated-email bracket is ai too — the era of the rendering must not decide");
+// Grammar variants — also RECONSTRUCTED, pinning that the regex is not
+// resource- or book-specific beyond the shape it asserts.
+eq(kind("TWL: 1CH 4 [de..d@api.bp-assistant]", BOT), "ai", "a numbered book code matches the pipeline shape");
+eq(kind("TN: JER 12:3 [de..d@api.bp-assistant]", BOT), "ai", "a chapter:verse target matches too");
+eq(classifyMasterCommit({ sha: "x", message: "ULT: EZK 38 [pjoakes]", authorEmail: BOT }).reason,
+  "bot_author_pipeline_subject", "…and the reason names the signal that fired");
+
+// ── #550: the X-AI-Pipeline trailer, gated on the bot author ────────────────
+// bp-assistant writes `X-AI-Pipeline: bp-assistant/{generate|notes|tqs}` into
+// the commit BODY (519 commits, 518 bot-authored). Accepted as an alternative
+// SHAPE signal so a future wording change to the subject does not silently
+// reclassify real pipeline output. Forward-looking: every trailer commit
+// measured so far also has the pipeline subject.
+eq(
+  kind("TN: regenerate JER notes after prompt change\n\nX-AI-Pipeline: bp-assistant/notes\n", BOT),
+  "ai",
+  "a bot commit with a non-pipeline subject but a valid trailer is ai",
+);
+// …but NEVER as a standalone rule. 56fc2ec924 (2026-06-04, Stephen Wunrow) is a
+// HUMAN revert whose body quotes the reverted commit's subject AND its trailer.
+// A trailer-only rule calls that human revert `ai` — the same trap as
+// `Revert "bible-editor: …"`.
+eq(
+  kind(
+    'revert 682f8938 (#7036)\n\nThis reverts commit 682f8938.\n\nUST: JER 31 [Gr..e@api.bp-assistant]\n\nX-AI-Pipeline: bp-assistant/generate\n',
+    "40496+stephenwunrow@noreply.door43.org",
+  ),
+  "human",
+  "a human revert quoting a pipeline trailer (and subject) is human, not ai",
+);
+// The same trailer under the BOT author is ai — the gate is the author, not the
+// wording. (Subject real; the body is reconstructed from the trailer format the
+// corpus measured on 519 commits.)
+eq(kind("TQ: AMO 5 [be..s@api.bp-assistant]\n\nX-AI-Pipeline: bp-assistant/tqs\n", BOT), "ai",
+  "a real bot push with both signals is ai");
+
+// A hand-directed bot push returns `human` from the bot branch itself — it does
+// NOT fall through to AI_MARKER, so a subject that merely MENTIONS a
+// bp-assistant address cannot undo the decision. (No measured commit has this
+// shape; the assertion pins the ordering, which is what would rot.)
+eq(kind("fix: restore HAB 2:1-10 TN rows lost in the be..s@api.bp-assistant insert", BOT), "human",
+  "a bot hand-fix that names the bp-assistant address is still human");
+eq(classifyMasterCommit({ sha: "x", message: "align PSA 7, 8 superscriptions", authorEmail: BOT }).reason,
+  "bot_author_no_pipeline_shape", "…and the reason says WHY it is human, for the alert");
+
+// The dead `AI …for BOOK CH` vocabulary is deliberately NOT accepted: nothing
+// has used it since 2026-04-01, it appears under three non-bot identities, and
+// one commit it would readmit is the defective run e417839d09 had to repair.
+eq(kind("AI TN for HAB 2", BOT), "human", "the retired `AI RES for BOOK CH` vocabulary is not an ai shape");
 
 // ── human ───────────────────────────────────────────────────────────────────
 eq(kind("Adds '0' to Occurrence column (#458)", RICH), "human", "a maintainer edit is human");
