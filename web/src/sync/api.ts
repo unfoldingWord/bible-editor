@@ -1347,6 +1347,10 @@ export interface AdminImportCounts {
   inserted: number;
   deleted: number;
   merged_fields: number;
+  // Pristine tn/tq/twl row whose content matched master exactly but whose
+  // sort_order didn't, written via a version-neutral statement (issue #610).
+  // Optional: an older/cached response may omit it.
+  reordered?: number;
   skipped_edited: number;
   skipped_locked: number;
   chapters_locked: number;

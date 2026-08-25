@@ -161,6 +161,16 @@ export interface ReimportCounts {
   // from skipped_edited/reimported_ai — the row is neither a no-op skip nor
   // reclaimed to master ownership.
   merged_fields: number;
+  // Pristine tn/tq/twl row whose CONTENT matched master exactly but whose
+  // sort_order did not, and whose order master owns (tq, or a tn/twl row with
+  // no stored sort_order to preserve — see classifyReimportRow's
+  // preserveLocalOrder). Written via a version-neutral sort_order-only
+  // statement — no version bump, no edit_log row, same shape as the
+  // ref_moved flag clear — because a reordering is not a translator-visible
+  // content change and must not cost an open editor's If-Match a 409 (issue
+  // #610). Tracked separately from `updated` so a run summary can tell "N
+  // rows' content changed" from "N rows just moved".
+  reordered: number;
   skipped_edited: number;
   skipped_locked: number;
   // Chapters skipped this run because an active AI pipeline job held the
@@ -526,6 +536,7 @@ function zeroCounts(): ReimportCounts {
     inserted: 0,
     deleted: 0,
     merged_fields: 0,
+    reordered: 0,
     skipped_edited: 0,
     skipped_locked: 0,
     chapters_locked: 0,
@@ -671,6 +682,7 @@ function addCounts(into: ReimportCounts, from: ReimportCounts): void {
   into.inserted += from.inserted;
   into.deleted += from.deleted;
   into.merged_fields += from.merged_fields ?? 0;
+  into.reordered += from.reordered ?? 0;
   into.skipped_edited += from.skipped_edited;
   into.skipped_locked += from.skipped_locked;
   // `?? 0` guards a `from` object memoized by a Workflow instance that began
@@ -1374,6 +1386,14 @@ export async function applyTsvRows(
   // resurrections are batched.
   const nextSort = makeVerseSortOrder();
   const updates: Array<{ row: ParsedTsvRow; sortOrder: number; oldVersion: number }> = [];
+  // Pristine rows whose content already matched master and whose sort_order
+  // master owns (tq, or a tn/twl row with no stored order to preserve) but
+  // diverged from file order. Deliberately NOT folded into `updates` — that
+  // batch's statement rewrites every content column and bumps version; this
+  // is a version-neutral sort_order-only write, same shape as `flagClears`
+  // (issue #610). A row whose content also diverged still takes the full
+  // `updates` write, order included.
+  const reorders: Array<{ id: string; sortOrder: number; oldVersion: number }> = [];
   // AI-only rows to re-seed from master AND reclaim to master-owned (updated_by
   // → NULL). Written under a relaxed guard (version-CAS + protection re-assert)
   // in their own batch so the pristine UPDATE's `updated_by IS NULL` guard stays
@@ -1646,6 +1666,15 @@ export async function applyTsvRows(
     }
     if (fate === "update_ai") {
       aiReseeds.push({ row, sortOrder, oldVersion: Number(cur.version) });
+      continue;
+    }
+    // fate === "update": either content genuinely diverged, or content matched
+    // and only the (master-owned) sort_order diverged — classifyReimportRow
+    // returns "update" for both (see its own comment). Only the latter is
+    // version-neutral (issue #610): `contentMatches` here is exactly the
+    // classifier's own signal, already computed above.
+    if (contentMatches) {
+      reorders.push({ id: row.id, sortOrder, oldVersion: Number(cur.version) });
       continue;
     }
     updates.push({ row, sortOrder, oldVersion: Number(cur.version) });
@@ -2066,6 +2095,39 @@ export async function applyTsvRows(
       });
     } catch (e) {
       counts.errors.push(`flag clear batch: ${String(e)}`);
+    }
+  }
+
+  // Batch the sort_order-only reorders (issue #610): a pristine row whose
+  // content already matched master and whose file order master owns (tq, or a
+  // tn/twl row with no locally-preserved sort_order). Version-neutral, same
+  // shape as the flagClears batch above and rows.ts's in-app reorder fast
+  // path: no version bump, no edit_log row, because not one character of
+  // content is changing. version-CAS still guards against a concurrent write
+  // (a content edit, or an in-app drag) landing between the read and this
+  // batch — that 0-changes here and the row is left for next run rather than
+  // silently reverting whatever won the race.
+  const reorderPristine =
+    kind === "tn"
+      ? "updated_by IS NULL AND deleted_at IS NULL AND trashed_at IS NULL AND preserve = 0 AND hint = 0"
+      : "updated_by IS NULL AND deleted_at IS NULL";
+  for (let i = 0; i < reorders.length; i += WRITE_BATCH) {
+    const slice = reorders.slice(i, i + WRITE_BATCH);
+    try {
+      const results = await env.DB.batch(
+        slice.map((u) =>
+          env.DB.prepare(
+            `UPDATE ${TSV_TABLE[kind]} SET sort_order = ?1, updated_at = ?2
+               WHERE id = ?3 AND book = ?4 AND ${reorderPristine} AND version = ?5`,
+          ).bind(u.sortOrder, now, u.id, book, u.oldVersion),
+        ),
+      );
+      results.forEach((r) => {
+        if ((r?.meta.changes ?? 0) > 0) counts.reordered++;
+        else counts.skipped_edited++;
+      });
+    } catch (e) {
+      counts.errors.push(`${kind} reorder batch: ${e instanceof Error ? e.message : String(e)}`);
     }
   }
 
@@ -2745,13 +2807,15 @@ async function tsvFetchLooksTruncated(
 // vacated, not a continuation of it, so re-asserting them would be checking
 // the wrong row's history. For the SAME reason, a tn reclaim also explicitly
 // CLEARS trashed_at/preserve/hint in the SET (`clearProtections` below), and
-// EVERY kind's reclaim clears restored_from_version/review_kind/review_reason
-// (`clearReviewMeta` below) — rather than leaving whatever the tombstoned row
-// happened to hold. None of those columns are part of the pristine guard's
-// WHERE for reclaim, so nothing else would ever reset them, and a human's
-// "preserve this note"/"queue this as an AI hint"/"flag for review"/"showing
-// as vN" intent for the OLD content must never silently apply to master's new
-// content. It also drops the `updated_by IS NULL` guard (like reseedAi) and
+// EVERY kind's reclaim clears review_kind/review_reason (`clearReviewMeta`
+// below) — rather than leaving whatever the tombstoned row happened to hold.
+// Neither column is part of the pristine guard's WHERE for reclaim, so
+// nothing else would ever reset them, and a human's "flag for review" intent
+// for the OLD content must never silently apply to master's new content.
+// (restored_from_version is cleared too, but by `clearRestored` below, which
+// is unconditional — see its own comment: every mode this function builds
+// replaces content, so the chip is stale on all of them, not reclaim alone.)
+// It also drops the `updated_by IS NULL` guard (like reseedAi) and
 // sets `updated_by = NULL`, starting master's row master-owned.
 // version-CAS is the only guard reclaim keeps, and it is load-bearing: a
 // concurrent write to the SAME tombstoned row between the read and this batch
@@ -2791,21 +2855,29 @@ function buildTsvUpdateStmt(
   // pristine guard above already requires them clear before a normal
   // UPDATE/resurrect/reseed can proceed at all).
   const clearProtections = reclaim && kind === "tn" ? "trashed_at = NULL, preserve = 0, hint = 0, " : "";
-  // Reclaim ONLY, all three kinds: restored_from_version (the "switch to vN"
-  // display chip) and review_kind/review_reason (the flag-for-review markers —
-  // e.g. 'ref_moved', a keep_alignment_refused-style note) describe the OLD
-  // tombstoned row, same rationale as clearProtections above. Left uncleared, a
-  // human's stale "this needs review because X" or "showing as vN" carries onto
-  // master's unrelated new content with no way to tell it's wrong. Fresh-insert
-  // default for both is NULL (tryInsertTsvRow never sets either).
-  const clearReviewMeta = reclaim
-    ? "restored_from_version = NULL, review_kind = NULL, review_reason = NULL, "
-    : "";
+  // Reclaim ONLY, both kinds below: review_kind/review_reason (the
+  // flag-for-review markers — e.g. 'ref_moved', a keep_alignment_refused-style
+  // note) describe the OLD tombstoned row, same rationale as clearProtections
+  // above. Left uncleared, a human's stale "this needs review because X"
+  // carries onto master's unrelated new content with no way to tell it's
+  // wrong. Fresh-insert default is NULL (tryInsertTsvRow never sets it).
+  const clearReviewMeta = reclaim ? "review_kind = NULL, review_reason = NULL, " : "";
+  // EVERY mode this function builds (update, resurrect, reseedAi, reclaim)
+  // replaces the row's content wholesale and bumps version — that's the
+  // function's whole job — so restored_from_version (the "v{N} (restored)"
+  // chip) is stale by construction whichever path got here: reclaim's OLD
+  // tombstoned row and update/resurrect/reseedAi's freshly-overwritten
+  // content both describe words that no longer match what the chip claims.
+  // Previously cleared on the reclaim path only, leaving it stale on the
+  // other three (issue #616) — the version-neutral sort_order-only reorder
+  // write (issue #610) deliberately does NOT go through this function, so it
+  // is unaffected: a reorder changes no content and must leave the chip alone.
+  const clearRestored = "restored_from_version = NULL, ";
   const newVersion = oldVersion + 1;
   if (kind === "tn") {
     return env.DB.prepare(
       `UPDATE tn_rows
-          SET ${clearDeleted}${clearOwner}${clearProtections}${clearReviewMeta}ref_raw = ?1, chapter = ?2, verse = ?3, tags = ?4,
+          SET ${clearDeleted}${clearOwner}${clearProtections}${clearReviewMeta}${clearRestored}ref_raw = ?1, chapter = ?2, verse = ?3, tags = ?4,
               support_reference = ?5, quote = ?6, occurrence = ?7, note = ?8,
               sort_order = ?9, version = ?10, updated_at = ?11
         WHERE id = ?12 AND book = ?13 AND ${pristine} AND version = ?14`,
@@ -2818,7 +2890,7 @@ function buildTsvUpdateStmt(
   if (kind === "tq") {
     return env.DB.prepare(
       `UPDATE tq_rows
-          SET ${clearDeleted}${clearOwner}${clearReviewMeta}ref_raw = ?1, chapter = ?2, verse = ?3, tags = ?4,
+          SET ${clearDeleted}${clearOwner}${clearReviewMeta}${clearRestored}ref_raw = ?1, chapter = ?2, verse = ?3, tags = ?4,
               quote = ?5, occurrence = ?6, question = ?7, response = ?8,
               sort_order = ?9, version = ?10, updated_at = ?11
         WHERE id = ?12 AND book = ?13 AND ${pristine} AND version = ?14`,
@@ -2830,7 +2902,7 @@ function buildTsvUpdateStmt(
   }
   return env.DB.prepare(
     `UPDATE twl_rows
-        SET ${clearDeleted}${clearOwner}${clearReviewMeta}ref_raw = ?1, chapter = ?2, verse = ?3, tags = ?4,
+        SET ${clearDeleted}${clearOwner}${clearReviewMeta}${clearRestored}ref_raw = ?1, chapter = ?2, verse = ?3, tags = ?4,
             orig_words = ?5, occurrence = ?6, tw_link = ?7,
             sort_order = ?8, version = ?9, updated_at = ?10
       WHERE id = ?11 AND book = ?12 AND ${pristine} AND version = ?13`,

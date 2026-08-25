@@ -243,6 +243,164 @@ console.log("\n[a COERCED id must never count as blocked — review finding F4]"
   eq(shouldRecordResourceSync(counts), true, "so a coercion collision cannot withhold the watermark");
 }
 
+console.log("\n[issue #610: a sort_order-only divergence on a pristine tq row is a version-neutral reorder]");
+{
+  const { sqlite, env } = freshEnv();
+  sqlite
+    .prepare(
+      `INSERT INTO tq_rows (id, book, chapter, verse, ref_raw, question, response, sort_order, version)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .run(ID, BOOK, 5, 4, "5:4", "same question", "same response", 999, 3);
+  const master = {
+    id: ID,
+    idCoerced: false,
+    refRaw: "5:4",
+    chapter: 5,
+    verse: 4,
+    occurrence: null,
+    tags: null,
+    quote: null,
+    question: "same question",
+    response: "same response",
+  };
+  const counts = await applyTsvRows(env, BOOK, "tq", [master], null);
+
+  eq(counts.reordered, 1, "counted as a reorder, not a content update");
+  eq(counts.updated, 0, "NOT counted as a content update — nothing about the text changed");
+  eq(counts.skipped_edited, 0, "and not skipped either — the write landed");
+
+  const stored = sqlite.prepare(`SELECT sort_order, version FROM tq_rows WHERE book = ? AND id = ?`).all(BOOK, ID);
+  eq(stored[0].sort_order, 100, "sort_order adopted master's file order (single-row incoming -> makeVerseSortOrder's first slot)");
+  eq(stored[0].version, 3, "version UNCHANGED — a pristine reorder must not cost an open editor's If-Match a 409");
+
+  const logRows = sqlite.prepare(`SELECT COUNT(*) AS n FROM edit_log WHERE kind = 'tq' AND row_key = ?`).all(ID);
+  eq(logRows[0].n, 0, "no edit_log row — a reorder is not a translator-visible content change");
+}
+
+console.log("\n[issue #610 ablation: a genuine content divergence on the same row still takes master's content AND bumps]");
+{
+  const { sqlite, env } = freshEnv();
+  sqlite
+    .prepare(
+      `INSERT INTO tq_rows (id, book, chapter, verse, ref_raw, question, response, sort_order, version)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .run(ID, BOOK, 5, 4, "5:4", "old question", "old response", 999, 3);
+  const master = {
+    id: ID,
+    idCoerced: false,
+    refRaw: "5:4",
+    chapter: 5,
+    verse: 4,
+    occurrence: null,
+    tags: null,
+    quote: null,
+    question: "new question",
+    response: "new response",
+  };
+  const counts = await applyTsvRows(env, BOOK, "tq", [master], null);
+  eq(counts.updated, 1, "content genuinely differs -> the full update path, not reordered");
+  eq(counts.reordered, 0, "not counted as a reorder");
+  const stored = sqlite.prepare(`SELECT question, sort_order, version FROM tq_rows WHERE book = ? AND id = ?`).all(BOOK, ID);
+  eq(stored[0].question, "new question", "content adopted from master");
+  eq(stored[0].sort_order, 100, "file order adopted too");
+  eq(stored[0].version, 4, "version bumped — a genuine content change");
+}
+
+console.log("\n[issue #616: buildTsvUpdateStmt clears a stale restored_from_version on the pristine-update path]");
+{
+  const { sqlite, env } = freshEnv();
+  sqlite
+    .prepare(
+      `INSERT INTO tq_rows (id, book, chapter, verse, ref_raw, question, response, sort_order, version, restored_from_version)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .run(ID, BOOK, 5, 4, "5:4", "old question", "old response", 10, 3, 2);
+  const master = {
+    id: ID,
+    idCoerced: false,
+    refRaw: "5:4",
+    chapter: 5,
+    verse: 4,
+    occurrence: null,
+    tags: null,
+    quote: null,
+    question: "new question",
+    response: "new response",
+  };
+  const counts = await applyTsvRows(env, BOOK, "tq", [master], null);
+  eq(counts.updated, 1, "pristine content update");
+  const stored = sqlite
+    .prepare(`SELECT restored_from_version, version FROM tq_rows WHERE book = ? AND id = ?`)
+    .all(BOOK, ID);
+  eq(stored[0].restored_from_version, null, "the stale 'v2 (restored)' chip is cleared — its words are no longer on screen");
+  eq(stored[0].version, 4, "version bumped as normal");
+}
+
+console.log("\n[issue #616: buildTsvUpdateStmt clears a stale restored_from_version on the AI-reseed path]");
+{
+  const { sqlite, env } = freshEnv();
+  sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (7, 707, 'translator7')`).run();
+  sqlite
+    .prepare(
+      `INSERT INTO tq_rows
+         (id, book, chapter, verse, ref_raw, question, response, sort_order, version, updated_by, restored_from_version)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .run(ID, BOOK, 5, 4, "5:4", "AI question", "AI response", 10, 3, 7, 2);
+  sqlite
+    .prepare(`INSERT INTO edit_log (kind, row_key, book, action, source) VALUES ('tq', ?, ?, 'update', 'ai_pipeline')`)
+    .run(ID, BOOK);
+  const master = {
+    id: ID,
+    idCoerced: false,
+    refRaw: "5:4",
+    chapter: 5,
+    verse: 4,
+    occurrence: null,
+    tags: null,
+    quote: null,
+    question: "new master question",
+    response: "new master response",
+  };
+  const counts = await applyTsvRows(env, BOOK, "tq", [master], null);
+  eq(counts.reimported_ai, 1, "AI-only row re-seeded from master");
+  const stored = sqlite
+    .prepare(`SELECT restored_from_version, updated_by, version FROM tq_rows WHERE book = ? AND id = ?`)
+    .all(BOOK, ID);
+  eq(stored[0].restored_from_version, null, "stale restore marker cleared on the AI-reseed path too");
+  eq(stored[0].updated_by, null, "reclaimed to master-owned");
+  eq(stored[0].version, 4, "version bumped");
+}
+
+console.log("\n[issue #616 ablation: a version-neutral reorder must NOT clear restored_from_version]");
+{
+  const { sqlite, env } = freshEnv();
+  sqlite
+    .prepare(
+      `INSERT INTO tq_rows (id, book, chapter, verse, ref_raw, question, response, sort_order, version, restored_from_version)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .run(ID, BOOK, 5, 4, "5:4", "same question", "same response", 999, 3, 2);
+  const master = {
+    id: ID,
+    idCoerced: false,
+    refRaw: "5:4",
+    chapter: 5,
+    verse: 4,
+    occurrence: null,
+    tags: null,
+    quote: null,
+    question: "same question",
+    response: "same response",
+  };
+  const counts = await applyTsvRows(env, BOOK, "tq", [master], null);
+  eq(counts.reordered, 1, "content-identical reorder");
+  const stored = sqlite.prepare(`SELECT restored_from_version FROM tq_rows WHERE book = ? AND id = ?`).all(BOOK, ID);
+  eq(stored[0].restored_from_version, 2, "reorder changes no content, so the chip must stay exactly as it was");
+}
+
 console.log("\n[(b) the watermark is WITHHELD, and the STORED row proves it]");
 {
   const { sqlite, env } = freshEnv();
