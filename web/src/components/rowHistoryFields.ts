@@ -34,3 +34,37 @@ export const TQ_HISTORY_FIELDS: HistoryFieldSpec[] = [
   { key: "question", label: "Question" },
   { key: "response", label: "Response", dividerBefore: true },
 ];
+
+// Minimal shape for picking the history dialog's default "previous" version.
+// Kept here (not in the dialog) so the selection rule can be unit-tested
+// without pulling React/MUI into the strip-types runner (issue #623).
+export interface HistoryVersionCandidate {
+  version: number;
+  restored_from_version: number | null;
+}
+
+// Default selection: the most recent entry that answers "what was here before
+// this one". The live restore entry is excluded from THIS choice only — its
+// snapshot is by definition the content the row already holds, so opening on
+// it shows an empty diff. Older restores stay eligible: after restore-then-
+// edit, the state immediately before the edit IS that restore entry, and
+// excluding every restore (the pre-#623 rule) skipped it and landed on a
+// baseline the row never held as its prior content.
+export function defaultPreviousHistoryVersion(
+  versions: HistoryVersionCandidate[],
+  currentVersion: number,
+  effectiveVersion: number,
+): number | null {
+  const candidates = versions.filter(
+    (v) => v.restored_from_version == null || v.version !== currentVersion,
+  );
+  const previous = [...candidates]
+    .reverse()
+    .find((v) => v.version !== effectiveVersion);
+  return (
+    previous?.version ??
+    candidates.at(-1)?.version ??
+    versions.at(-1)?.version ??
+    null
+  );
+}

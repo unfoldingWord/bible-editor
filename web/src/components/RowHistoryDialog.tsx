@@ -20,7 +20,11 @@ import {
 } from "@mui/material";
 import { api, type RowHistoryEntry, type RowKind } from "../sync/api";
 import { diffWords } from "../lib/wordDiff";
-import type { HistoryFieldSpec, RowSnapshot } from "./rowHistoryFields";
+import {
+  defaultPreviousHistoryVersion,
+  type HistoryFieldSpec,
+  type RowSnapshot,
+} from "./rowHistoryFields";
 
 interface Props {
   open: boolean;
@@ -101,25 +105,14 @@ export function RowHistoryDialog({
       .then((res) => {
         if (cancelled) return;
         setEntries(res.versions);
-        // Default selection: the most recent entry that answers "what was here
-        // before this one". Restores are excluded from THIS choice only — they
-        // are listed (see `ordered` below), but a restore's snapshot is by
-        // definition the content the row already holds, so opening on one shows
-        // an empty diff and tells the reader nothing. The row's own last edit
-        // being a restore is exactly when that bites: at version 8 restored from
-        // v3, effectiveVersion is 3, so the plain "not the current one" search
-        // lands on v8 — the phantom — instead of v7.
-        const candidates = res.versions.filter(
-          (v) => v.restored_from_version == null,
-        );
-        const previous = [...candidates]
-          .reverse()
-          .find((v) => v.version !== effectiveVersion);
+        // See defaultPreviousHistoryVersion — exclude only the live restore
+        // entry, not every historical one (issue #623).
         setSelectedVersion(
-          previous?.version ??
-            candidates.at(-1)?.version ??
-            res.versions.at(-1)?.version ??
-            null,
+          defaultPreviousHistoryVersion(
+            res.versions,
+            currentVersion,
+            effectiveVersion,
+          ),
         );
         setLoading(false);
       })
@@ -131,7 +124,7 @@ export function RowHistoryDialog({
     return () => {
       cancelled = true;
     };
-  }, [open, kind, rowId, book, effectiveVersion]);
+  }, [open, kind, rowId, book, currentVersion, effectiveVersion]);
 
   // Most recent first. EVERY entry is listed, restores included (issue #539
   // item 4). This used to drop every entry with a restored_from_version, on the
