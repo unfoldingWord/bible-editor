@@ -270,14 +270,49 @@ function dropOccurrenceForWordNodes(obj: Record<string, unknown>): Record<string
 // above `normalizeForCompare`) rather than left unfixed, since leaving it
 // would contradict the "no remaining spurious adopts" goal for a cause that
 // is mechanically identical to the already-approved `text` fix.
+//
+// #627 presence half of the same nextChar artifact: after normalizeForCompare
+// collapses `" "` / `"\n"` to `""`, sortKeysDeep used to KEEP the now-empty
+// key, so `nextChar: ""` still stringified differently from an absent
+// `nextChar`. Measured on live JER trees (Door43 master vs prod D1,
+// 2026-08-25): ULT 42:6, UST 42:6/17/18 differed ONLY on that presence —
+// 4 of 13 unresolved merge-review flags, all false. Omit `text` / `nextChar`
+// when the normalized value is the empty string so empty, whitespace-only,
+// and absent all compare equal. Same safety argument: dropping an empty
+// value can only make two sides look MORE equal, never less.
+//
+// #627 empty text nodes: a `type: "text"` node whose text is empty or
+// whitespace-only carries nothing but still occupies an array slot, so one
+// extra empty node on one side shifts every following index and the trees
+// compare unequal. Measured: ULT 42:11 (36 vs 35 empty text nodes) and
+// UST 42:8 (31 vs 30) were byte-identical after stripping them — 2 more of
+// the 13 false JER flags. For comparison ONLY, skip those nodes when walking
+// an array. A real added/removed/reordered word still changes the node array
+// in ways this filter cannot hide. Written adoption bytes stay master's real
+// `theirs` string, untouched — same discipline as the occurrence-drop rule.
+function isEmptyTextNode(value: unknown): boolean {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const obj = value as Record<string, unknown>;
+  if (obj["type"] !== "text") return false;
+  const text = obj["text"];
+  if (typeof text !== "string") return text == null;
+  return (normalizeForCompare(text) as string) === "";
+}
+
 function sortKeysDeep(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(sortKeysDeep);
+  if (Array.isArray(value)) {
+    return value.filter((item) => !isEmptyTextNode(item)).map(sortKeysDeep);
+  }
   if (value !== null && typeof value === "object") {
     const obj = dropOccurrenceForWordNodes(value as Record<string, unknown>);
     const sorted: Record<string, unknown> = {};
     for (const key of Object.keys(obj).sort()) {
-      sorted[key] =
+      const child =
         key === "text" || key === "nextChar" ? normalizeForCompare(sortKeysDeep(obj[key])) : sortKeysDeep(obj[key]);
+      // Omit keys whose compare form collapsed to empty string — `nextChar: ""`
+      // (or whitespace that normalized to "") must equal an absent nextChar.
+      if ((key === "text" || key === "nextChar") && child === "") continue;
+      sorted[key] = child;
     }
     return sorted;
   }
