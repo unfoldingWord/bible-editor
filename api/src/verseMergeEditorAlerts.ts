@@ -161,6 +161,72 @@ export interface ExistingAlertState {
 // here, since this sentence is the only consumer.
 export const NO_BASE_REF_DISPLAY = 10;
 
+export interface GroupableConflictRow {
+  chapter: number;
+  verse: number;
+  reason: string;
+  overwrittenVersion: number | null;
+  detectedAt?: number | null;
+}
+
+// Same cap raiseVerseMergeConflictAlert has always used for its flat ref list
+// (see the pre-#624 `rows.slice(0, 10)` / `+N more` this replaces).
+export const MERGE_CONFLICT_REFS_DISPLAY = 10;
+
+function plainDate(unixSeconds: number): string {
+  return new Date(unixSeconds * 1000).toISOString().slice(0, 10);
+}
+
+// Issue #624: a sync-warning alert used to name a flat, unjoined list of refs
+// (`Refs: 38:2, 41:9, …`) alongside a SEPARATE reason-count breakdown
+// (`1 alignment_shrink, 6 source_attr_ambiguous, …`) — nothing joined a given
+// ref to the reason it was flagged for, so triaging the one reason that
+// actually needs hand work (alignment_shrink / keep_alignment_refused) meant
+// querying prod D1 to find which ref it was. This groups the same refs under
+// their reason instead, each group also carrying the OLDEST `detected_at` in
+// THAT REASON — not just among the displayed refs — as a plain date, so "how
+// long has this been sitting" survives the display cap.
+//
+// The overall display cap is still applied ONCE, globally, exactly like the
+// flat list it replaces — a reason whose refs are entirely past the cap gets
+// no group of its own (its count already surfaced in the reasonBreakdown
+// parenthetical the caller builds separately). Reason order follows first
+// appearance in `rows`, which the caller already orders by chapter/verse —
+// this keeps this clause's reason order identical to that parenthetical,
+// built from the same rows in the same order.
+export function buildGroupedRefsClause(rows: GroupableConflictRow[], cap: number = MERGE_CONFLICT_REFS_DISPLAY): string {
+  if (rows.length === 0) return "";
+  const oldestByReason = new Map<string, number>();
+  for (const r of rows) {
+    if (r.detectedAt == null) continue;
+    const cur = oldestByReason.get(r.reason);
+    if (cur == null || r.detectedAt < cur) oldestByReason.set(r.reason, r.detectedAt);
+  }
+  const displayRows = rows.slice(0, cap);
+  const order: string[] = [];
+  const byReason = new Map<string, GroupableConflictRow[]>();
+  for (const r of displayRows) {
+    let group = byReason.get(r.reason);
+    if (!group) {
+      group = [];
+      byReason.set(r.reason, group);
+      order.push(r.reason);
+    }
+    group.push(r);
+  }
+  const clauses = order.map((reason) => {
+    const group = byReason.get(reason) ?? [];
+    const refsStr = group
+      .map((r) => `${r.chapter}:${r.verse}${r.overwrittenVersion != null ? `@v${r.overwrittenVersion}` : ""}`)
+      .join(", ");
+    const oldest = oldestByReason.get(reason);
+    const dateStr = oldest != null ? ` (first flagged ${plainDate(oldest)})` : "";
+    return `${reason}: ${refsStr}${dateStr}.`;
+  });
+  const more = rows.length > cap ? ` +${rows.length - cap} more.` : "";
+  return ` ${clauses.join(" ")}${more}`;
+}
+
 export function buildMergeConflictGuidance(
   rows: Array<{ action: string }>,
   opts: { recordingFailed?: boolean; noBaseCount?: number; noBaseRefs?: string[] } = {},

@@ -59,11 +59,13 @@
 import { DatabaseSync } from "node:sqlite";
 import {
   buildEditorLookupQuery,
+  buildGroupedRefsClause,
   buildMergeConflictGuidance,
   EDITOR_LOOKUP_CHUNK,
   editLogKey,
   groupNoBaseVersesByEditor,
   groupOverwrittenVersesByEditor,
+  MERGE_CONFLICT_REFS_DISPLAY,
   NO_BASE_REF_DISPLAY,
   planSystemAlertWrites,
 } from "./verseMergeEditorAlerts.ts";
@@ -1118,6 +1120,132 @@ function confirmAdopted(d, { book, resource, chapter, verse }) {
 
   // Zero is not a story: no sentence at all.
   assert(buildMergeConflictGuidance([], { noBaseCount: 0 }) === "", "no no-ancestor sentence when the count is 0");
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// buildGroupedRefsClause — pure, no D1 (issue #624).
+// ─────────────────────────────────────────────────────────────────────────
+
+function ts(dateStr) {
+  return Math.floor(Date.parse(`${dateStr}T00:00:00Z`) / 1000);
+}
+
+{
+  // A mixed-reason row set (the real 2026-08-25 JER UST alert's shape, minus
+  // the extra source_attr_ambiguous rows) produces refs grouped under their
+  // own reason, each carrying the OLDEST detected_at in that reason as a
+  // plain date — not the newest, and not the first-seen row's date.
+  const rows = [
+    { chapter: 38, verse: 2, reason: "both_changed_ai_master", overwrittenVersion: null, detectedAt: ts("2026-08-24") },
+    { chapter: 41, verse: 9, reason: "source_attr_ambiguous", overwrittenVersion: null, detectedAt: ts("2026-08-19") },
+    { chapter: 41, verse: 12, reason: "source_attr_ambiguous", overwrittenVersion: null, detectedAt: ts("2026-08-20") },
+    { chapter: 41, verse: 16, reason: "source_attr_ambiguous", overwrittenVersion: null, detectedAt: ts("2026-08-19") },
+    { chapter: 42, verse: 6, reason: "both_changed_ai_master", overwrittenVersion: null, detectedAt: ts("2026-08-25") },
+    { chapter: 42, verse: 8, reason: "alignment_shrink", overwrittenVersion: 7, detectedAt: ts("2026-08-22") },
+  ];
+  const clause = buildGroupedRefsClause(rows);
+  assert(
+    clause.includes("both_changed_ai_master: 38:2, 42:6 (first flagged 2026-08-24)."),
+    "both_changed_ai_master group lists both its refs, dated by its OLDEST row (38:2), not its newest (42:6)",
+  );
+  assert(
+    clause.includes("source_attr_ambiguous: 41:9, 41:12, 41:16 (first flagged 2026-08-19)."),
+    "source_attr_ambiguous group lists all three refs, dated by the oldest of the two 2026-08-19 rows",
+  );
+  assert(
+    clause.includes("alignment_shrink: 42:8@v7 (first flagged 2026-08-22)."),
+    "alignment_shrink group carries its own single ref and date, and the overwritten-version suffix survives grouping",
+  );
+  // Reason order follows first appearance in `rows` — same order
+  // reasonBreakdown (built from the same array) would produce — not
+  // alphabetical and not grouped-size order.
+  const bothIdx = clause.indexOf("both_changed_ai_master");
+  const sourceIdx = clause.indexOf("source_attr_ambiguous");
+  const alignIdx = clause.indexOf("alignment_shrink");
+  assert(bothIdx < sourceIdx && sourceIdx < alignIdx, "groups appear in first-seen order, matching reasonBreakdown's order");
+  assert(!clause.includes("more"), "no '+N more' when every row fit under the cap");
+}
+
+{
+  // A single-reason set (the common case pre-#624) must not regress: one
+  // group, its own date, no stray formatting from the grouping machinery.
+  const rows = [
+    { chapter: 12, verse: 4, reason: "keep_alignment_refused", overwrittenVersion: null, detectedAt: ts("2026-08-10") },
+    { chapter: 12, verse: 5, reason: "keep_alignment_refused", overwrittenVersion: null, detectedAt: ts("2026-08-12") },
+  ];
+  const clause = buildGroupedRefsClause(rows);
+  assert(
+    clause.trim() === "keep_alignment_refused: 12:4, 12:5 (first flagged 2026-08-10).",
+    "a single-reason set collapses to one group, dated by its oldest row",
+  );
+}
+
+{
+  // The overall display cap is GLOBAL, exactly like the flat "Refs: …; +N
+  // more" it replaces — not reapplied per reason. And critically: a group's
+  // date must reflect its OLDEST row even when that row itself falls PAST
+  // the cap and is never printed as a ref — capping what's shown is not
+  // license to understate how long the reason has been flagged.
+  const rows = [
+    { chapter: 1, verse: 1, reason: "a", overwrittenVersion: null, detectedAt: ts("2026-08-20") },
+    { chapter: 1, verse: 2, reason: "a", overwrittenVersion: null, detectedAt: ts("2026-08-20") },
+    { chapter: 2, verse: 1, reason: "b", overwrittenVersion: null, detectedAt: ts("2026-08-01") },
+    { chapter: 2, verse: 2, reason: "b", overwrittenVersion: null, detectedAt: ts("2026-08-01") },
+    // The true oldest "a" row — past the cap of 3, never displayed as a ref.
+    { chapter: 3, verse: 1, reason: "a", overwrittenVersion: null, detectedAt: ts("2026-08-05") },
+  ];
+  const clause = buildGroupedRefsClause(rows, 3);
+  assert(clause.includes("a: 1:1, 1:2 (first flagged 2026-08-05)."),
+    "group 'a's date is its true oldest row (2026-08-05), even though that row is past the cap and unlisted");
+  assert(!clause.includes("3:1"), "the past-cap row itself is not listed as a ref");
+  assert(clause.includes("+2 more."), "the global cap still reports the uncapped remainder, same as the old flat list");
+}
+
+{
+  // A reason whose rows are ENTIRELY past the cap gets no group of its own —
+  // its count already surfaced in the caller's separate reasonBreakdown
+  // parenthetical, so silently omitting the group (rather than printing an
+  // empty one) is correct, not a truncation bug.
+  const rows = [
+    { chapter: 1, verse: 1, reason: "a", overwrittenVersion: null, detectedAt: ts("2026-08-20") },
+    { chapter: 1, verse: 2, reason: "a", overwrittenVersion: null, detectedAt: ts("2026-08-20") },
+    { chapter: 2, verse: 1, reason: "b", overwrittenVersion: null, detectedAt: ts("2026-08-01") },
+  ];
+  const clause = buildGroupedRefsClause(rows, 2);
+  assert(!clause.includes("reason \"b\""), "sanity: reason 'b' string check below is meaningful");
+  assert(!/\bb:/.test(clause), "reason 'b', entirely past the cap, gets no group at all");
+  assert(clause.includes("+1 more."), "…but the remainder count still includes it");
+}
+
+{
+  // Empty input -> empty string, so the caller's message template does not
+  // grow a stray leading space when there is nothing to report.
+  assert(buildGroupedRefsClause([]) === "", "no rows -> no clause");
+}
+
+{
+  // A row with no detectedAt (the write path never sets it — see
+  // VerseMergeConflictRow.detectedAt's doc comment) must not crash the
+  // formatter or fabricate a date; it degrades to no date for that group.
+  const rows = [{ chapter: 5, verse: 5, reason: "keep_alignment_refused", overwrittenVersion: null, detectedAt: undefined }];
+  const clause = buildGroupedRefsClause(rows);
+  assert(clause.trim() === "keep_alignment_refused: 5:5.", "a row with no detectedAt formats with no date, not 'undefined'");
+}
+
+{
+  // Default cap matches the exported constant (and therefore the pre-#624
+  // flat-list behavior) when the caller does not pass one explicitly.
+  const rows = Array.from({ length: MERGE_CONFLICT_REFS_DISPLAY + 1 }, (_, i) => ({
+    chapter: 1,
+    verse: i + 1,
+    reason: "keep_alignment_refused",
+    overwrittenVersion: null,
+    detectedAt: ts("2026-08-01"),
+  }));
+  const clause = buildGroupedRefsClause(rows);
+  assert(clause.includes(`${MERGE_CONFLICT_REFS_DISPLAY}`) && !clause.includes(`1:${MERGE_CONFLICT_REFS_DISPLAY + 1}`),
+    "default cap lists up to MERGE_CONFLICT_REFS_DISPLAY refs and no further");
+  assert(clause.includes("+1 more."), "…and reports the one remaining row");
 }
 
 if (failed) {
