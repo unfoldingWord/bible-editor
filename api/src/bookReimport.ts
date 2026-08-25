@@ -304,6 +304,22 @@ export interface ReimportCounts {
   // review_kind/review_reason (migration 0047), surfaced by the cleanup chip
   // (lint.ts) rather than the verse banner.
   merge_conflicts: number;
+  // Verse whose merge resolved to "adopt", but the bytes that would actually be
+  // STORED turned out identical to the bytes already stored — so nothing was
+  // written at all (issue #539). Not folded into skipped_noop: a plain no-op
+  // never reached a merge, and this counter is the only way to see how often the
+  // sync decides to adopt something D1 already holds. It must NOT withhold the
+  // watermark the way a lost-CAS adoption does: D1 already holds master's bytes
+  // for this verse, so nothing is stale for the export to revert and there is
+  // nothing to retry.
+  //
+  // VERSES ONLY, deliberately. The TSV edited-write path cannot produce this
+  // outcome: computeTsvMerge only adopts a field whose LENSED compare form
+  // differs, and a lens can only widen "equal", so an adopted value is never
+  // byte-equal to the stored one. A prune+skip was written for that path and
+  // removed again — it could never fire, nothing exercised it, and an inert
+  // path that can still misreport merge_adopted is not worth carrying.
+  merge_noop_skipped: number;
   // Verse where computeVerseMerge returned "keep_alignment_refused" — master's
   // edit was NOT adopted because doing so would lose alignment on words
   // neither side touched. A subset of merge_conflicts (every refusal needs a
@@ -525,6 +541,7 @@ function zeroCounts(): ReimportCounts {
     twl_reordered: 0,
     merge_adopted: 0,
     merge_conflicts: 0,
+    merge_noop_skipped: 0,
     merge_refused: 0,
     merge_kept_ai: 0,
     merge_no_base: 0,
@@ -715,6 +732,7 @@ function addCounts(into: ReimportCounts, from: ReimportCounts): void {
   into.twl_reordered += from.twl_reordered;
   into.merge_adopted += from.merge_adopted ?? 0;
   into.merge_conflicts += from.merge_conflicts ?? 0;
+  into.merge_noop_skipped += from.merge_noop_skipped ?? 0;
   into.merge_refused += from.merge_refused ?? 0;
   into.merge_kept_ai += from.merge_kept_ai ?? 0;
   into.merge_no_base += from.merge_no_base ?? 0;
@@ -2353,6 +2371,16 @@ function buildTsvEditedWriteStmt(
   setClauses.push(`version = version + 1`, `updated_at = ?${p}`);
   binds.push(now);
   p++;
+  // The "current: vN (restored)" chip reads restored_from_version, which says
+  // where the row's CURRENT content came from. This write replaces some of that
+  // content with master's, so the marker no longer describes the row and has to
+  // go, or the chip keeps pointing a translator at a version whose text is no
+  // longer what she is looking at (issue #539 item 4). Scoped to writes that
+  // actually move content: a review_kind/review_reason-only write changes no
+  // text, so the marker still describes the row correctly and must survive.
+  if (cols.some((c) => c !== "review_kind" && c !== "review_reason")) {
+    setClauses.push(`restored_from_version = NULL`);
+  }
   const protection =
     kind === "tn"
       ? `deleted_at IS NULL AND trashed_at IS NULL AND preserve = 0 AND hint = 0`
@@ -3392,7 +3420,7 @@ async function applyVerseRows(
   // both moved and master wins with a flagged conflict). Written in a
   // separate version-CAS batch below; updated_by is deliberately left set
   // (see the write batch's comment). See verseMerge.ts / the 1CH incident.
-  const masterAdoptions: Array<{
+  let masterAdoptions: Array<{
     v: VerseExtract;
     oldVersion: number;
     merge: VerseMergeResult;
@@ -3408,6 +3436,11 @@ async function applyVerseRows(
     // content_json level — must not delete a checker's text sign-off for a
     // change that never touched the verse's actual text).
     beforePlainText: string | null;
+    // D1's verse_end before this adoption. Carried for the same reason as the
+    // two above, but for the no-change guard in step 7 rather than the lane
+    // reopen: the adoption write sets content_json, plain_text AND verse_end, so
+    // all three have to be compared before it can be called a no-op (issue #539).
+    beforeVerseEnd: number | null;
   }> = [];
   // Verses needing a durable record after this run's merge — EVERY landed
   // adoption ("adopt" | "adopt_conflict"), every alignment refusal
@@ -3607,6 +3640,7 @@ async function applyVerseRows(
             plainText: v.plainText,
             beforeContentJson: ex.content_json,
             beforePlainText: ex.plain_text,
+            beforeVerseEnd: ex.verse_end ?? null,
           });
           continue;
         }
@@ -3887,6 +3921,95 @@ async function applyVerseRows(
       } catch {
         /* unparseable adopted content — leave as-is */
       }
+    }
+  }
+
+  // 6b-pre. NO-CHANGE GUARD (issue #539). An adoption whose final bytes turn out to
+  // be the bytes already stored must not be written: it would bump the version,
+  // write an edit_log row and invalidate every open tab's If-Match while
+  // changing nothing a translator could see — and, unlike a one-off, it recurs
+  // EVERY night, because neither side moves. That is the version-inflation
+  // engine on the verse side.
+  //
+  // WHY IT MUST RUN HERE, after step 6. computeVerseMerge decided "adopt" on
+  // master's bytes as they arrived. Two normalizers then rewrite those bytes
+  // toward D1's: healIncomingReplacementChars (step 0) and, just above,
+  // canonizeAlignmentSource, which replaces master's `\zaln-s` x-content /
+  // x-lemma / x-morph with the canonical source-word bytes D1 already holds.
+  // When master's ONLY divergence was in those source attributes — the NUM
+  // 20-22 combining-mark class, master NFC vs D1's UHB byte order — canonizing
+  // lands exactly on D1's stored string. The merge was right to call that a
+  // difference in what arrived; it is no longer a difference in what we would
+  // store.
+  //
+  // WHICH BYTES ARE COMPARED, precisely: `a.v.contentJson` / `a.plainText` /
+  // `a.v.verseEnd` are the three values the UPDATE in step 7 binds, against
+  // `beforeContentJson` / `beforePlainText` / `beforeVerseEnd`, which are the
+  // `content_json` / `plain_text` / `verse_end` columns straight off this
+  // function's `existing` SELECT. Both sides are storage bytes; NOTHING is
+  // rendered to USFM and re-parsed on either side. That matters: `extract(
+  // render(x)) !== x` for 16-19% of real verses in this repo, so a comparison
+  // that rendered either side would report a difference for verses that have
+  // none — manufacturing exactly the adopts this guard exists to remove — and
+  // could equally hide a real one. Byte equality is also deliberately strict
+  // (no key-order or whitespace lens like verseMerge's stableKey): a lens can
+  // only ever make a genuine change look like none, and skipping a genuine
+  // adoption would let the export revert master.
+  if (masterAdoptions.length > 0) {
+    const noopVerses = new Set<string>();
+    for (const a of masterAdoptions) {
+      if (
+        a.v.contentJson === a.beforeContentJson &&
+        (a.plainText ?? null) === (a.beforePlainText ?? null) &&
+        (a.v.verseEnd ?? null) === (a.beforeVerseEnd ?? null)
+      ) {
+        noopVerses.add(`${a.v.chapter}:${a.v.verse}`);
+      }
+    }
+    if (noopVerses.size > 0) {
+      counts.merge_noop_skipped += noopVerses.size;
+      // What happens to the tentative verse_merge_conflicts row 6b is about to
+      // write, and why the two cases differ.
+      //
+      // A clean "adopt" (master moved, D1 did not): DROP it. Its whole content
+      // is `overwrittenVersion`, a pointer at "the text we replaced", and
+      // nothing was replaced — the same invariant the lost-CAS cleanup below
+      // enforces, applied one step earlier so the row is never written rather
+      // than written and deleted. Nothing needs a human: both sides agree.
+      //
+      // A CONFLICTED adopt (`merge.conflict`, i.e. adopt_conflict — both sides
+      // moved since the ancestor): KEEP it, with `overwrittenVersion` cleared to
+      // null and `adopted` false so it never claims an overwrite that did not
+      // happen. There IS something a human should see here, and this is the one
+      // shape where the no-op is not benign: if master's out-of-band fix lived
+      // in the `\zaln-s` source attributes and D1's UHB row is stale,
+      // canonizeAlignmentSource rewrote that fix back to D1's stale bytes, which
+      // is exactly why the bytes now match. The stored data is no worse than it
+      // was before this guard (the same stale bytes would have been written) —
+      // but dropping the row would also drop the review-banner entry
+      // raiseVerseMergeConflictAlert raises from it, and the condition recurs
+      // every night, silently. Keeping it costs one idempotent upsert.
+      //
+      // The set is keyed `${chapter}:${verse}`, so this removes ALL matching
+      // entries for a verse rather than the specific adoption. That is correct
+      // today — the loop above pushes at most one mergeConflicts entry per verse
+      // — and is the same keying masterAdoptions/adoptionsApplied already use
+      // throughout this function; it would need revisiting if a verse could ever
+      // carry two.
+      for (let i = mergeConflicts.length - 1; i >= 0; i--) {
+        const mc = mergeConflicts[i];
+        if (!mc.adopted || !noopVerses.has(`${mc.chapter}:${mc.verse}`)) continue;
+        if (mc.action === "adopt") {
+          mergeConflicts.splice(i, 1);
+        } else {
+          mc.adopted = false;
+          mc.overwrittenVersion = null;
+        }
+      }
+      masterAdoptions = masterAdoptions.filter((a) => !noopVerses.has(`${a.v.chapter}:${a.v.verse}`));
+      console.log("reimport: skipped verse adoption(s) whose adopted bytes already matched D1", {
+        book, bibleVersion, verses: [...noopVerses].slice(0, 10), total: noopVerses.size,
+      });
     }
   }
 
