@@ -24,6 +24,7 @@ import {
   Typography,
 } from "@mui/material";
 import WarningAmberIcon from "@mui/icons-material/WarningAmber";
+import { relativeTime } from "../lib/relativeTime";
 import type { SystemAlert } from "../sync/api";
 
 interface Props {
@@ -88,6 +89,27 @@ export function SyncWarningsIndicator({ alerts, onDismiss }: Props) {
           <Box key={a.id} sx={{ px: 2, py: 1.25 }}>
             <Typography variant="body2" sx={{ whiteSpace: "normal" }}>
               {a.message}
+            </Typography>
+            {/* Every warning carries its own date. These messages describe what a
+                nightly run decided, and an undated one is unreadable: a warning
+                raised last night and one that has sat unresolved for a week look
+                identical, so there is no way to tell a new problem from a stale
+                one. Same idiom (and same helper) as NotificationsMenu's comment
+                rows, with the exact stamp on hover.
+                CAVEAT: this is system_alerts.created_at, i.e. when this exact
+                WORDING first appeared — verseMergeConflicts.ts rewrites the row
+                (delete+insert) whenever the verse list changes, so adding or
+                resolving one verse resets it for the whole book+resource. The
+                per-verse "first flagged" date that is deliberately never reset is
+                verse_merge_conflicts.detected_at, which GET
+                /api/verse-merge-conflicts/:book does not yet select. */}
+            <Typography
+              variant="caption"
+              color="text.secondary"
+              title={new Date(a.createdAt * 1000).toLocaleString()}
+              sx={{ display: "block", mt: 0.25 }}
+            >
+              flagged {relativeTime(a.createdAt)}
             </Typography>
             <Box sx={{ display: "flex", alignItems: "center", gap: 1, mt: 0.75 }}>
               {a.linkUrl &&
