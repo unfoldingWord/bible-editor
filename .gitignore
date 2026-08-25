@@ -29,6 +29,12 @@ scripts/tmp/
 playwright-report/
 test-results/
 
+# Claude Code harness state — per-worktree status notes (STATE.md documents
+# `.claude/state/<worktree-name>.md` as git-ignored) and, in this cloud
+# environment, isolated agent worktrees nested under `.claude/worktrees/`.
+# Nothing under `.claude/` is meant to be tracked.
+.claude/
+
 # Local working files — present in the working tree but not part of the
 # committed history. Listed here so `git status` stays clean across branch
 # switches.
