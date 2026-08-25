@@ -91,11 +91,21 @@
 //    rule now catches.
 // 3. `login` is null on plenty of commits, human ones included
 //    (`richmahn@users.noreply.github.com` with no login). Never key on it.
-// 4. AI_MARKER is INERT in the history this module actually sees. It fires 339×
-//    repo-wide and ZERO times path-scoped: all 339 are `Merge pull request …`
-//    commits, and Gitea's path-scoped history simplification drops merge
-//    commits. Keep it as a cheap net for a future bot pushing under a different
-//    author — but do not credit it with doing work today.
+// 4. AI_MARKER matches the SUBJECT, with no author check — so a HUMAN commit
+//    whose subject merely QUOTES a bp-assistant address also matched it.
+//    Gitea's revert button produces exactly that shape:
+//    `Revert "UST: JER 31 [Gr..e@api.bp-assistant]"`, authored by whoever
+//    clicked revert. Measured on the full history (46,802 commits): the revert
+//    button is in active use (12 human `Revert "bible-editor: …"` commits, ten
+//    on 2026-08-14 alone). Fixed by excluding revert subjects from AI_MARKER,
+//    mirroring OURS_PREFIX's own anchoring rationale (note 1).
+//    AI_MARKER is otherwise INERT in the history this module actually sees: it
+//    fires 339× repo-wide and ZERO times path-scoped, because all 339 are
+//    `Merge pull request …` commits and Gitea's path-scoped history
+//    simplification drops merge commits. Kept rather than retired — it is the
+//    one route that still recognizes a future bot pushing under an author
+//    BOT_EMAILS does not know (see the constant's own note) — but do not
+//    credit it with doing work today. (issue #612)
 //
 // FAIL-SAFE DIRECTION, and it is the whole safety argument for this module.
 // Downstream, `ai` and `ours` are what let a conflict resolve D1-wins; `human`
@@ -149,6 +159,13 @@ const OURS_PREFIX = /^bible-editor(?: export)?:\s/;
 // future bot that pushes under a different author is still recognized — but see
 // note 4: it is inert in path-scoped history, which is the only history we see.
 const AI_MARKER = /@api\.bp-assistant\b/;
+
+// A human clicking Gitea's revert button on a bp-assistant push quotes that
+// push's subject verbatim (`Revert "UST: JER 31 [Gr..e@api.bp-assistant]"`),
+// which would otherwise match AI_MARKER regardless of who authored the
+// revert. See note 4 above. Matches both `Revert "…` (Gitea's own wording)
+// and a plain `revert …` a maintainer might type by hand.
+const REVERT_PREFIX = /^revert\s/i;
 
 // The bot account that authors every bp-assistant push. Necessary for `ai`, and
 // (since #550) no longer sufficient on its own — see classifyMasterCommit.
@@ -256,7 +273,10 @@ export function classifyMasterCommit(commit: MasterCommit): ClassifiedCommit {
     // address undo the decision we just made.
     return { ...commit, kind: "human", reason: "bot_author_no_pipeline_shape" };
   }
-  if (AI_MARKER.test(subject)) {
+  // A revert subject is never an AI push, whatever it quotes — see note 4 and
+  // REVERT_PREFIX above. Checked before AI_MARKER, not instead of it: a
+  // bot-authored revert is still caught by the BOT_EMAILS check above this.
+  if (!REVERT_PREFIX.test(subject) && AI_MARKER.test(subject)) {
     return { ...commit, kind: "ai", reason: "bp_assistant_marker" };
   }
   // Everything unrecognized — including a commit with no message and no author

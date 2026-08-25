@@ -254,6 +254,41 @@ eq(classifyMasterCommit({ sha: "x", message: "align PSA 7, 8 superscriptions", a
 // one commit it would readmit is the defective run e417839d09 had to repair.
 eq(kind("AI TN for HAB 2", BOT), "human", "the retired `AI RES for BOOK CH` vocabulary is not an ai shape");
 
+// ── the Revert-quoting-bp-assistant trap (#612) ─────────────────────────────
+// Gitea's revert button quotes the reverted commit's subject verbatim, so a
+// HUMAN reverting a bp-assistant push produces a subject that still matches
+// AI_MARKER. That must not classify the revert itself as ai — it would let
+// the very content the maintainer reverted overwrite their revert.
+eq(
+  kind('Revert "UST: JER 31 [Gr..e@api.bp-assistant]"', RICH),
+  "human",
+  "a human revert quoting a bp-assistant address is human, not ai",
+);
+// A bot-authored revert of a pipeline push is `human` as of #550: the
+// BOT_EMAILS branch runs first, the `Revert "…"` subject fails
+// AI_PIPELINE_SUBJECT, and the body carries no trailer — so it returns
+// `bot_author_no_pipeline_shape` and never reaches AI_MARKER at all. That is
+// the protective direction: a revert pushed through the bot account is a
+// hand-directed edit, and calling it `ai` would let the reverted content
+// overwrite it. (Before #550 the bare author check made this `ai`.)
+eq(
+  kind('Revert "UST: JER 31 [Gr..e@api.bp-assistant]"', BOT),
+  "human",
+  "a bot-authored revert is human — it fails the pipeline shape test (#550)",
+);
+// Lowercase, unquoted "revert " a maintainer might type by hand is guarded too.
+eq(
+  kind("revert TQ: AMO 5 [be..s@api.bp-assistant] — bad AI push", RICH),
+  "human",
+  "a hand-typed lowercase revert quoting the marker is also human",
+);
+// A revert of something else entirely is unaffected — still human, as before.
+eq(
+  kind('Revert "bible-editor: EZK ult → master (#6711)" (#6716)', BW),
+  "human",
+  "a revert unrelated to bp-assistant is still human (unchanged by the guard)",
+);
+
 // ── human ───────────────────────────────────────────────────────────────────
 eq(kind("Adds '0' to Occurrence column (#458)", RICH), "human", "a maintainer edit is human");
 eq(kind("Cleanup of \\s1 tags", RICH), "human", "an unprefixed maintainer commit is human");
