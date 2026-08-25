@@ -83,6 +83,10 @@
 //     since nothing is past retention). At prod's current ~360k rows this is
 //     well inside D1's statement budget hourly; if the table grows an order
 //     of magnitude, a (kind, action, created_at) index is the cheap fix.
+//     Re-measured after #603's ROW_NUMBER() fix: branches (2) and (5) still
+//     walk the same edit_log_row (kind=…) index feeding the window sort, so
+//     the added cost is a TEMP B-TREE sort of that same already-small row
+//     set — not a new full-table pass.
 //   - The candidate-scoped filter (`el.created_at < ?1`) can exempt a row
 //     that is not the GLOBAL newest-under-boundary (when the true newest is
 //     still younger than the cutoff) — a harmless overkeep: the row the
@@ -105,9 +109,15 @@
 //   - The NOT IN list is NULL-free (no NULL-poisoning of the outer
 //     predicate): MAX(el.id) over a group is never NULL, and the baseline
 //     branch selects a concrete el.id.
-//   - The baseline branch leans on SQLite's bare-column-with-MAX guarantee
-//     (the ungrouped el.id comes from a row where MAX(el.created_at)
-//     occurs) — D1 is SQLite, where that behavior is documented.
+//   - Branches (2) and (5) break created_at ties on id (ROW_NUMBER() ...
+//     ORDER BY created_at DESC, id DESC), matching bookReimport.ts's
+//     base_payload order (`created_at DESC, id DESC`) — see issue #603. A
+//     bare column beside MAX(created_at) picks from *a* row holding the
+//     max, arbitrary on a tie; edit_log.created_at is whole seconds
+//     (unixepoch()), so same-second writes of the same (row_key[, action])
+//     are representable and did tie in practice (repair scripts emit one
+//     row per verse from a single per-run timestamp constant, but two
+//     scripts can race the same second).
 
 export const EDIT_LOG_RETENTION_SECONDS = 180 * 86400;
 
@@ -141,9 +151,14 @@ export const EDIT_LOG_SWEEP_SQL = `
           GROUP BY el.row_key
          UNION ALL
          -- (2) the newest pre-watermark 'baseline' payload, by content time
-         -- (created_at is back-dated on these; id order means nothing).
+         -- (created_at is back-dated on these; id order only breaks ties
+         -- within the same content second — see issue #603).
          SELECT keep_id FROM (
-           SELECT el.id AS keep_id, MAX(el.created_at)
+           SELECT el.id AS keep_id,
+                  ROW_NUMBER() OVER (
+                    PARTITION BY el.row_key
+                    ORDER BY el.created_at DESC, el.id DESC
+                  ) AS rn
              FROM edit_log el
              JOIN book_resource_syncs brs
                ON el.row_key LIKE brs.book || '/%/' || upper(brs.resource)
@@ -154,8 +169,8 @@ export const EDIT_LOG_SWEEP_SQL = `
               AND el.created_at < ?1
               AND brs.master_confirmed_at IS NOT NULL
               AND el.created_at < brs.master_confirmed_at
-            GROUP BY el.row_key
          )
+         WHERE rn = 1
          UNION ALL
          -- (3) issue #573 gap 1a: the GLOBAL newest 'create'/'update' row per
          -- verse, no boundary — protects bookReimport.ts's latest_source,
@@ -197,11 +212,15 @@ export const EDIT_LOG_SWEEP_SQL = `
          UNION ALL
          -- (5) issue #573 gap 2: the newest pre-watermark row per verse per
          -- action, for #548's other not-yet-wired candidate-ancestor action
-         -- classes. Same shape as (2), grouped by (row_key, action) instead
-         -- of row_key alone so each present action class gets its own kept
-         -- row rather than competing with the others.
+         -- classes. Same shape as (2), partitioned by (row_key, action)
+         -- instead of row_key alone so each present action class gets its
+         -- own kept row rather than competing with the others.
          SELECT keep_id FROM (
-           SELECT el.id AS keep_id, MAX(el.created_at)
+           SELECT el.id AS keep_id,
+                  ROW_NUMBER() OVER (
+                    PARTITION BY el.row_key, el.action
+                    ORDER BY el.created_at DESC, el.id DESC
+                  ) AS rn
              FROM edit_log el
              JOIN book_resource_syncs brs
                ON el.row_key LIKE brs.book || '/%/' || upper(brs.resource)
@@ -215,7 +234,7 @@ export const EDIT_LOG_SWEEP_SQL = `
               AND el.created_at < ?1
               AND brs.master_confirmed_at IS NOT NULL
               AND el.created_at < brs.master_confirmed_at
-            GROUP BY el.row_key, el.action
          )
+         WHERE rn = 1
        )
      )`;

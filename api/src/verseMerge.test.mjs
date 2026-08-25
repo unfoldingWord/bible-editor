@@ -9,6 +9,13 @@
 // Not a test framework; failures are counted and reported, non-zero exit.
 
 import { computeVerseMerge, collapseWhitespaceForCompare } from "./verseMerge.ts";
+import {
+  classifyMasterCommit,
+  compactLineage,
+  masterMayHoldHumanEditForVerse,
+  parseDiffHunksForPath,
+  summarizeLineage,
+} from "./masterLineage.ts";
 
 let failed = 0;
 function eq(actual, expected, msg) {
@@ -385,6 +392,71 @@ eq(
   false,
   "a genuine word-boundary change (comma removed) compares UNEQUAL — the reopen guard must still fire",
 );
+
+console.log("\n[#557: a per-verse map we could not build must not un-protect the verse]");
+
+// Step 6's flag is now asked per verse (masterMayHoldHumanEditForVerse). The
+// narrowing rides on evidence fetched from Door43 — a commit's diff, and the
+// file at that commit — and every way that can fail has to land on the SAME
+// answer the file-level gate gave before #557: master wins, adopt_conflict.
+// Absence of evidence is not evidence that no human touched this verse.
+{
+  const base = text("the ancestor we last published");
+  const ours = text("a translator's app edit");
+  const theirs = text("what master holds now");
+  const human = [
+    classifyMasterCommit({ sha: "h1", message: "Fixes s5 markers", authorEmail: "rich.mahn@unfoldingword.org" }),
+  ];
+  const merge = (lineage) =>
+    computeVerseMerge({
+      base,
+      ours,
+      theirs,
+      humanEditedSinceExport: false,
+      masterMayHoldHumanEdit: masterMayHoldHumanEditForVerse(lineage, 40, 5),
+    }).action;
+
+  // (a) The diff came back unparseable — the shape a truncated or non-diff body
+  // produces. parseDiffHunksForPath says so, and the caller turns that into
+  // incomplete evidence.
+  const unparseable = parseDiffHunksForPath("this is not a unified diff", "24-JER.usfm");
+  eq(unparseable.complete, false, "an unparseable diff parses to incomplete");
+  eq(
+    merge(
+      compactLineage(summarizeLineage(human, { humanRefs: { complete: false, refs: [], reason: unparseable.reason } })),
+    ),
+    "adopt_conflict",
+    "an unparseable diff → adopt_conflict (the pre-#557 answer), never keep_ai_master",
+  );
+
+  // (b) The file was absent at that revision, or the fetch fell over.
+  eq(
+    merge(
+      compactLineage(
+        summarizeLineage(human, { humanRefs: { complete: false, refs: [], reason: "revision_fetch_failed" } }),
+      ),
+    ),
+    "adopt_conflict",
+    "a missing or failed revision fetch → adopt_conflict",
+  );
+
+  // (c) Nobody even tried — no evidence on the summary at all, which is also
+  // what a plan staged by a Workflow instance older than #557 replays.
+  eq(merge(compactLineage(summarizeLineage(human))), "adopt_conflict", "no per-verse evidence at all → adopt_conflict");
+  eq(
+    merge(JSON.parse(JSON.stringify({ mayHoldHumanEdit: true, hasHumanCommit: true }))),
+    "adopt_conflict",
+    "a summary serialized before #557 (no refs fields at all) → adopt_conflict",
+  );
+
+  // (d) The control: complete evidence placing every human hunk elsewhere is
+  // the ONLY thing that flips this verse.
+  eq(
+    merge(compactLineage(summarizeLineage(human, { humanRefs: { complete: true, refs: ["23:5", "31:19"], reason: "" } }))),
+    "keep_ai_master",
+    "complete evidence placing every human hunk elsewhere → keep_ai_master",
+  );
+}
 
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed`);

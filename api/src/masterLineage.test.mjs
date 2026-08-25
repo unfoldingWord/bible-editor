@@ -1,21 +1,77 @@
 // Regression tests for masterLineage.ts — classifying who moved Door43 master.
 //
-// Every fixture below is a REAL commit subject/author taken from master history
-// on 2026-08-19 (en_tq/tq_AMO.tsv, en_tn/tn_JER.tsv, en_ult/26-EZK.usfm,
-// en_ust/24-JER.usfm), not an invented shape. That matters here more than usual:
-// this classifier's output decides whether a Door43 edit can be overwritten, so
-// a fixture that merely looks plausible would lock in a guess.
+// Every fixture below is a REAL commit subject/author, not an invented shape:
+// from master history on 2026-08-19 (en_tq/tq_AMO.tsv, en_tn/tn_JER.tsv,
+// en_ult/26-EZK.usfm, en_ust/24-JER.usfm), and — for the #550 section — from
+// the full 46,802-commit history described in masterLineage.ts's header, each
+// one cited by sha. That matters here more than usual: this classifier's output
+// decides whether a Door43 edit can be overwritten, so a fixture that merely
+// looks plausible would lock in a guess. The places below where a shape is
+// RECONSTRUCTED rather than quoted say so in a comment — and a reconstructed
+// fixture may never be the only thing holding up a rule (that is how the
+// verse-range and TWL widenings got in, and out again).
+//
+// ABLATION (re-run 2026-08-24 after the cold review, by patching
+// masterLineage.ts — AI_PIPELINE_SUBJECT for R1–R5 and R8–R10,
+// AI_PIPELINE_TRAILER for R11, the classifier's bot branch for R6–R7 — and
+// re-running this file). The point is that a test which still passes with the
+// tightening removed proves nothing:
+//
+//   baseline (as shipped)                       exit 0, 0 FAIL
+//   R1 loose prefix `^(ULT|UST|TN|TQ):\s`       exit 1, 5 FAIL — 3a2432b15b,
+//                                               plus the verse-range and both
+//                                               book-code narrowings
+//   R2 bracket made optional                    exit 0, 0 FAIL
+//   R3 chapter digits made optional             exit 0, 0 FAIL
+//   R4 end anchor removed                       exit 0, 0 FAIL
+//   R5 digits AND bracket both dropped          exit 1, 2 FAIL — 3a2432b15b +
+//                                               the verse-range narrowing
+//   R6 `ai` = bot author email alone            exit 1, 15 FAIL — all six
+//      (the pre-#550 rule)                      hand-directed outliers, all
+//                                               four narrowings, both reason
+//                                               assertions, the wrapped
+//                                               trailer, the marker-mention
+//                                               case, the retired vocabulary
+//   R7 trailer accepted with no bot gate        exit 1, 1 FAIL — "a human
+//                                               revert quoting a pipeline
+//                                               trailer … is human"
+//   R8 `TWL` re-added to the alternation        exit 1, 1 FAIL — "a TWL: prefix
+//                                               is NOT an accepted shape"
+//   R9 verse-range group re-added               exit 1, 1 FAIL — "a
+//                                               verse-ranged target is NOT
+//                                               accepted"
+//   R10 book code loosened to                   exit 1, 2 FAIL — both book-code
+//       `[1-3]?[A-Z]{2,3}`                      assertions
+//   R11 trailer separator `\s*`                 exit 1, 1 FAIL — "a trailer
+//       (spans newlines)                        whose value sits on the next
+//                                               line is NOT the measured one"
+//
+// Read that honestly: on MEASURED data the LAM-intro exclusion needs only ONE
+// of {chapter digits, bracket} to survive, which is why R2 and R3 alone break
+// nothing and R5 breaks it. The end anchor (R4) breaks nothing measurable at
+// all — it is kept because it costs nothing (all 807 real pipeline pushes still
+// match) and narrows in the protective direction. R6 and R7 are the ones that
+// carry the change — removing EITHER half of the two-signal rule fails the
+// assertions that justify it — and R8–R11 are what keep the pattern from
+// drifting back to accepting shapes nobody has ever observed.
 //
 // Run from api/:
 //   node --experimental-strip-types --no-warnings src/masterLineage.test.mjs
 
+import { readFileSync } from "node:fs";
 import {
   classifyMasterCommit,
   compactLineage,
   LINEAGE_EVIDENCE_CAP,
+  LINEAGE_REF_CAP,
   masterMayHoldHumanEdit,
+  masterMayHoldHumanEditForVerse,
+  mergeRefEvidence,
+  parseDiffHunksForPath,
+  refsTouchedInUsfm,
   summarizeLineage,
 } from "./masterLineage.ts";
+import { computeVerseMerge } from "./verseMerge.ts";
 
 let failed = 0;
 function eq(actual, expected, msg) {
@@ -71,29 +127,166 @@ eq(kind("UST: JER 43 [Gr..e@api.bp-assistant]", BOT), "ai", "bp-assistant ust pu
 
 // The bot also pushes on a human's behalf — real: `ULT: EZK 38 [pjoakes]`, bot
 // author, plain username in the bracket. The content is still machine-written,
-// so the author decides, not the bracket.
-eq(kind("ULT: EZK 38 [pjoakes]", BOT), "ai", "a bot push requested by a human is still ai (author decides)");
+// so the bracket does not decide. (Since #550 the author does not decide alone
+// either — see the two-signal section below.)
+eq(kind("ULT: EZK 38 [pjoakes]", BOT), "ai", "a bot push requested by a human is still ai");
 
 // The marker alone is enough even without the known bot address, so a future
 // bot pushing under a different account is still recognized.
 eq(kind("TQ: AMO 9 [xx..y@api.bp-assistant]", "someone-else@example.org"), "ai",
   "the bp-assistant marker alone classifies as ai");
 
-// ── the human-revert-quoting-bp-assistant trap (issue #612) ─────────────────
-// Gitea's revert button emits `Revert "<original subject>"`. A human revert of
-// a bp-assistant push quotes that push's subject verbatim, and AI_MARKER must
-// not fire on the quote — only on the original push.
+// ── #550: the bot account is NOT sufficient on its own ──────────────────────
+// The bot authored 817 commits in the corpus. 807 are pipeline pushes; ten are
+// not, and six of those ten are hand-directed edits that the old
+// author-email-only rule stamped `ai` — i.e. made overwritable by our next
+// export. Each subject below is quoted from its commit (sha cited).
+eq(kind("align PSA 7, 8 superscriptions", BOT), "human",
+  "22ba6f3b9e: a bot-pushed hand alignment of two PSA superscriptions is human");
+eq(kind("align PSA 4-9 superscriptions", BOT), "human",
+  "1503b9e4fb: the same hand pass over six chapters is human");
+// Subject abbreviated at the tail (it continues past the \qa tags); nothing
+// after the first word affects the classification.
+eq(kind("Fix LAM 1-4 acrostic \\qa tags", BOT), "human",
+  "9f6417e437: a 93-hunk marker-convention normalization is human, not an AI run");
+eq(kind("UST LAM 3: remove duplicate verses 1-10", BOT), "human",
+  "08f0c4ffa0: a pure +0/-140 deletion is human (note it is `UST LAM 3:`, not `UST:`)");
+eq(kind("fix: restore HAB 2:1-10 TN rows lost in AI insert", BOT), "human",
+  "e417839d09: a repair OF AI damage must never itself classify as ai");
+// The regression this section exists for, and the one the ablation above turns
+// on. 3a2432b15b is the weakest of the six verdicts on content grounds, but the
+// classification is not close: a LOOSE `^(ULT|UST|TN|TQ):\s` prefix test
+// stamps it `ai` (R1/R5), while EITHER the required chapter digits OR the
+// required bracket excludes it (R2/R3 pass alone).
+eq(kind("TN: LAM chapter and book introductions", BOT), "human",
+  "3a2432b15b: a book-wide intro pass is human — the loose prefix regex would call it ai");
+
+// …and the 807 real pipeline pushes still classify `ai`, in all three
+// renderings of the bracket. The bracket is a REQUESTER field whose rendering
+// migrated (plain username -> truncated email -> x@api.bp-assistant); the
+// recorded decision is that a human's name there does NOT make the commit
+// human, because the content is still machine-written.
+eq(kind("ULT: EZK 38 [pjoakes]", BOT), "ai",
+  "plain-username bracket (c70e1f1a84) is still ai — that commit carries the pipeline trailer in its body");
+eq(kind("TQ: AMO 5 [be..s@api.bp-assistant]", BOT), "ai", "the x@api.bp-assistant bracket is ai");
+// The middle (truncated-email) rendering, using a domain that really occurs in
+// it (`@my.wheaton.edu` 18×, `@gmail.com` 11×, `@unfoldingword.org` 1×). What
+// this pins is NOT the bracket contents — those are opaque to the regex
+// (`[^\]]*`) — but that the verdict survives a bracket with no bp-assistant
+// address in it at all: this commit reaches `ai` through the bot email plus the
+// subject SHAPE, never through AI_MARKER.
+eq(kind("TN: JER 12 [st..w@my.wheaton.edu]", BOT), "ai",
+  "a truncated-email bracket with no bp-assistant address in it is still ai, via bot + shape");
+// Numbered book code. RECONSTRUCTED (no `1CH`-style bot subject was quoted in
+// the measurement) — it pins the `[1-3][A-Z]{2}` half of the book-code group.
+eq(kind("TN: 1CH 4 [de..d@api.bp-assistant]", BOT), "ai", "a numbered book code matches the pipeline shape");
+
+// ── #550: what the pipeline shape deliberately does NOT accept ──────────────
+// Every unmeasured shape this regex accepts is a way to stamp a hand edit `ai`,
+// so the narrowings below are pinned as tightly as the exclusions. Each cites
+// its count over the full 46,802-commit history.
+// `TWL:` — zero such subjects exist. (Note this one also carries a
+// bp-assistant address: it is `human` anyway, because a bot commit that fails
+// the shape test returns from the bot branch and never reaches AI_MARKER.)
+eq(kind("TWL: 1CH 4 [de..d@api.bp-assistant]", BOT), "human",
+  "a TWL: prefix is NOT an accepted pipeline shape — zero occurrences measured");
+// Verse / verse-range targets — zero of the bot's 817, zero repo-wide. This is
+// the shape of e417839d09, this change's own motivating hand repair.
+eq(kind("TN: HAB 2:1-10 [benjamin]", BOT), "human",
+  "a verse-ranged target is NOT accepted — it is the shape of a hand repair, not of any measured push");
+// Book code must be three letters, or a digit plus two.
+eq(kind("TN: AB 1 [de..d@api.bp-assistant]", BOT), "human", "a two-letter book code is not a book code");
+eq(kind("TN: 1ABC 1 [de..d@api.bp-assistant]", BOT), "human", "a four-character book code is not a book code");
+eq(classifyMasterCommit({ sha: "x", message: "ULT: EZK 38 [pjoakes]", authorEmail: BOT }).reason,
+  "bot_author_pipeline_subject", "…and the reason names the signal that fired");
+
+// ── #550: the X-AI-Pipeline trailer, gated on the bot author ────────────────
+// bp-assistant writes `X-AI-Pipeline: bp-assistant/{generate|notes|tqs}` into
+// the commit BODY (519 commits, 518 bot-authored). Accepted as an alternative
+// SHAPE signal so a future wording change to the subject does not silently
+// reclassify real pipeline output. Be clear about what it buys TODAY: nothing.
+// All 518 bot-authored trailer commits also match the subject rule, so the
+// trailer classifies zero commits on its own — it is insurance against the next
+// format migration, not coverage. The cases below are therefore forward-looking
+// by construction.
+eq(
+  kind("TN: regenerate JER notes after prompt change\n\nX-AI-Pipeline: bp-assistant/notes\n", BOT),
+  "ai",
+  "a bot commit with a non-pipeline subject but a valid trailer is ai",
+);
+// The separator is `[ \t]*`, not `\s*`: a `\s*` would span the newline and
+// accept a WRAPPED trailer, i.e. a body that never actually wrote the header
+// bp-assistant writes. Narrower is the protective direction here.
+eq(
+  kind("TN: regenerate JER notes after prompt change\n\nX-AI-Pipeline:\nbp-assistant/notes\n", BOT),
+  "human",
+  "a trailer whose value sits on the next line is NOT the measured trailer",
+);
+// …but NEVER as a standalone rule. 56fc2ec924 (2026-06-04, Stephen Wunrow) is a
+// HUMAN revert whose body quotes the reverted commit's subject AND its trailer.
+// A trailer-only rule calls that human revert `ai` — the same trap as
+// `Revert "bible-editor: …"`.
+eq(
+  kind(
+    'revert 682f8938 (#7036)\n\nThis reverts commit 682f8938.\n\nUST: JER 31 [Gr..e@api.bp-assistant]\n\nX-AI-Pipeline: bp-assistant/generate\n',
+    "40496+stephenwunrow@noreply.door43.org",
+  ),
+  "human",
+  "a human revert quoting a pipeline trailer (and subject) is human, not ai",
+);
+// The same trailer under the BOT author is ai — the gate is the author, not the
+// wording. (Subject real; the body is reconstructed from the trailer format the
+// corpus measured on 519 commits.)
+eq(kind("TQ: AMO 5 [be..s@api.bp-assistant]\n\nX-AI-Pipeline: bp-assistant/tqs\n", BOT), "ai",
+  "a real bot push with both signals is ai");
+
+// A hand-directed bot push returns `human` from the bot branch itself — it does
+// NOT fall through to AI_MARKER, so a subject that merely MENTIONS a
+// bp-assistant address cannot undo the decision. (No measured commit has this
+// shape; the assertion pins the ordering, which is what would rot.)
+eq(kind("fix: restore HAB 2:1-10 TN rows lost in the be..s@api.bp-assistant insert", BOT), "human",
+  "a bot hand-fix that names the bp-assistant address is still human");
+eq(classifyMasterCommit({ sha: "x", message: "align PSA 7, 8 superscriptions", authorEmail: BOT }).reason,
+  "bot_author_no_pipeline_shape", "…and the reason says WHY it is human, for the alert");
+
+// The dead `AI …for BOOK CH` vocabulary is deliberately NOT accepted: nothing
+// has used it since 2026-04-01, it appears under three non-bot identities, and
+// one commit it would readmit is the defective run e417839d09 had to repair.
+eq(kind("AI TN for HAB 2", BOT), "human", "the retired `AI RES for BOOK CH` vocabulary is not an ai shape");
+
+// ── the Revert-quoting-bp-assistant trap (#612) ─────────────────────────────
+// Gitea's revert button quotes the reverted commit's subject verbatim, so a
+// HUMAN reverting a bp-assistant push produces a subject that still matches
+// AI_MARKER. That must not classify the revert itself as ai — it would let
+// the very content the maintainer reverted overwrite their revert.
 eq(
   kind('Revert "UST: JER 31 [Gr..e@api.bp-assistant]"', RICH),
   "human",
-  "a human's own revert of a bp-assistant push is human, not ai (it merely quotes the marker)",
+  "a human revert quoting a bp-assistant address is human, not ai",
 );
-// The unguarded case still fires: the ORIGINAL push (no Revert wrapper) is
-// still ai even under a non-bot author (the marker-alone rule, tested above).
+// A bot-authored revert of a pipeline push is `human` as of #550: the
+// BOT_EMAILS branch runs first, the `Revert "…"` subject fails
+// AI_PIPELINE_SUBJECT, and the body carries no trailer — so it returns
+// `bot_author_no_pipeline_shape` and never reaches AI_MARKER at all. That is
+// the protective direction: a revert pushed through the bot account is a
+// hand-directed edit, and calling it `ai` would let the reverted content
+// overwrite it. (Before #550 the bare author check made this `ai`.)
 eq(
-  kind("UST: JER 31 [Gr..e@api.bp-assistant]", RICH),
-  "ai",
-  "the original bp-assistant push (not a revert) is still ai, marker alone is enough",
+  kind('Revert "UST: JER 31 [Gr..e@api.bp-assistant]"', BOT),
+  "human",
+  "a bot-authored revert is human — it fails the pipeline shape test (#550)",
+);
+// Lowercase, unquoted "revert " a maintainer might type by hand is guarded too.
+eq(
+  kind("revert TQ: AMO 5 [be..s@api.bp-assistant] — bad AI push", RICH),
+  "human",
+  "a hand-typed lowercase revert quoting the marker is also human",
+);
+// A revert of something else entirely is unaffected — still human, as before.
+eq(
+  kind('Revert "bible-editor: EZK ult → master (#6711)" (#6716)', BW),
+  "human",
+  "a revert unrelated to bp-assistant is still human (unchanged by the guard)",
 );
 
 // ── human ───────────────────────────────────────────────────────────────────
@@ -223,6 +416,450 @@ console.log("\n[the compact summary that crosses a Workflow step boundary]");
   const s = compactLineage(summarizeLineage(many));
   eq(s.counts.human, 9, "every human commit is counted");
   eq(s.humanShas.length, LINEAGE_EVIDENCE_CAP, "the cited shas are capped");
+}
+
+// ── #557: WHICH VERSE did the human touch? ──────────────────────────────────
+//
+// THE FIXTURES ARE REAL, and they have to be: this decides whether one
+// maintainer's marker cleanup can authorize reverting somebody else's app edit
+// in a chapter they never opened.
+//
+//   api/src/fixtures/jer-ult-127cc1f3.diff   `Fixes s5 markers`, richmahn,
+//   api/src/fixtures/jer-ult-82aad43b.diff   `Fixes USFM`, richmahn,
+//                                            both 2026-08-13, unfoldingWord/en_ult
+//
+// are the commits' own unified diffs, byte-for-byte as git.door43.org served
+// them on 2026-08-24 — multi-book, exactly as pushed (82aad43b also touches
+// 04-NUM and 33-MIC, which is why the path filter is not an optimization).
+//
+//   api/src/fixtures/jer-ult-*.markers.txt
+//
+// is 24-JER.usfm AS IT STOOD AT THAT COMMIT, reduced to the only thing the
+// hunk -> verse mapping reads: the real line NUMBER and the real line TEXT of
+// every line carrying a \c or \v marker, plus the file's real line count. The
+// full revisions are 4.6 MB each and cannot live in the repo; the reduction was
+// verified against them — `refsTouchedInUsfm` returns an identical ref set for
+// the real file and for the stand-in rebuilt below (2026-08-24).
+//
+// Both files are produced by `scripts/extract-usfm-markers.mjs` (the exact
+// commands are in its header), so the reduction is re-derivable rather than a
+// one-time transformation nobody can reproduce.
+//
+// The measured facts these commits carry: their hunks land ONLY in chapters 23
+// and 31. On 2026-08-13T20:19Z the reimport nevertheless recorded
+// adopt_conflict / both_changed for JER ULT 40:5, 40:6 and 40:10, overwriting
+// Grant_Ailie's app edits, because the lineage question was asked of the FILE.
+console.log("\n[#557: the hunk -> verse map, from the two real richmahn commits]");
+
+const JER_PATH = "24-JER.usfm";
+const FIXTURE_FILLER = '\\w word|x-occurrence="1" x-occurrences="1"\\w*';
+
+function fixture(name) {
+  return readFileSync(new URL(`./fixtures/${name}`, import.meta.url), "utf8");
+}
+
+// Rebuild the stand-in for one revision: a file of the revision's real line
+// count, carrying the revision's real marker lines at their real line numbers.
+function loadRevision(name) {
+  const markers = [];
+  let totalLines = 0;
+  for (const line of fixture(`${name}.markers.txt`).split("\n")) {
+    if (line === "" || line.startsWith("#")) continue;
+    const tab = line.indexOf("\t");
+    const key = line.slice(0, tab);
+    const val = line.slice(tab + 1);
+    if (key === "lines") {
+      totalLines = Number(val);
+      continue;
+    }
+    markers.push({ line: Number(key), head: val });
+  }
+  const lines = new Array(totalLines).fill(FIXTURE_FILLER);
+  for (const m of markers) lines[m.line - 1] = m.head;
+  return { text: lines.join("\n"), markers, totalLines };
+}
+
+// The marker index also tells us where a given ref really lives in that
+// revision — used below to build the "the human DID touch chapter 40" sibling
+// case out of the same real file rather than an invented one.
+function markerLineOf(markers, wanted) {
+  let chapter = 0;
+  for (let i = 0; i < markers.length; i++) {
+    const head = markers[i].head;
+    const c = /\\c (\d+)/.exec(head);
+    if (c) chapter = Number(c[1]);
+    const v = /\\v (\d+)/.exec(head);
+    const ref = c && !v ? `${chapter}:c` : v ? `${chapter}:${Number(v[1])}` : null;
+    if (ref === wanted) {
+      const next = markers[i + 1]?.line ?? markers[i].line + 1;
+      return { start: markers[i].line, count: Math.max(1, next - markers[i].line) };
+    }
+  }
+  return null;
+}
+
+const RICH_COMMITS = [
+  { name: "jer-ult-127cc1f3", sha: "127cc1f3696994d967fc25fdd28a3a55d111132e", subject: "Fixes s5 markers", chapter: 23, hunks: 15 },
+  { name: "jer-ult-82aad43b", sha: "82aad43b84ab35ce7139c2e5e47fea0cd5ef41fb", subject: "Fixes USFM", chapter: 31, hunks: 2 },
+];
+
+const richEvidence = [];
+for (const c of RICH_COMMITS) {
+  const parsed = parseDiffHunksForPath(fixture(`${c.name}.diff`), JER_PATH);
+  eq(parsed.complete, true, `${c.subject}: its diff parses for ${JER_PATH}`);
+  eq(parsed.hunks.length, c.hunks, `${c.subject}: ${c.hunks} hunks touch ${JER_PATH}`);
+  const rev = loadRevision(c.name);
+  const ev = refsTouchedInUsfm(rev.text, parsed.hunks);
+  eq(ev.complete, true, `${c.subject}: every hunk mapped to a verse`);
+  const chapters = [...new Set(ev.refs.map((r) => Number(r.split(":")[0])))];
+  eq(JSON.stringify(chapters), JSON.stringify([c.chapter]), `${c.subject}: lands only in chapter ${c.chapter}`);
+  richEvidence.push(ev);
+}
+
+// The path filter is load-bearing, not tidiness: `Fixes USFM` also rewrote
+// 04-NUM.usfm and 33-MIC.usfm, and NUM's line numbers mapped onto JER's file
+// would place a human edit in verses nobody touched.
+{
+  const num = parseDiffHunksForPath(fixture("jer-ult-82aad43b.diff"), "04-NUM.usfm");
+  eq(num.complete, true, "the same commit's NUM hunks parse too");
+  eq(num.hunks.length, 10, "...and are a different set of 10 hunks");
+  eq(
+    parseDiffHunksForPath(fixture("jer-ult-127cc1f3.diff"), "04-NUM.usfm").complete,
+    false,
+    "a path the commit never touched is NOT silently 'no hunks, nothing touched'",
+  );
+  eq(
+    parseDiffHunksForPath(fixture("jer-ult-127cc1f3.diff"), "04-NUM.usfm").reason,
+    "path_not_in_diff",
+    "...it is incomplete, and says why",
+  );
+}
+
+const richRefs = mergeRefEvidence(richEvidence);
+eq(richRefs.complete, true, "both commits mapped -> the window's evidence is complete");
+eq(richRefs.refs.includes("23:5"), true, "the window touched JER 23:5");
+eq(richRefs.refs.includes("31:19"), true, "the window touched JER 31:19");
+eq(richRefs.refs.includes("40:5"), false, "the window did NOT touch JER 40:5");
+eq(richRefs.refs.includes("40:*"), false, "...nor chapter 40 as a whole");
+
+console.log("\n[#557: the merge decision, per verse]");
+
+// The real window: our own exports and a bp-assistant push around Rich's two
+// hand commits (subjects and authors from en_ult/24-JER.usfm's history).
+const RICH_WINDOW = summarizeLineage(
+  [
+    classifyMasterCommit({ sha: "5080d90444", message: "bible-editor: JER ult → master (#6706)", authorEmail: BW }),
+    classifyMasterCommit({ sha: RICH_COMMITS[1].sha, message: "Fixes USFM", authorEmail: RICH }),
+    classifyMasterCommit({ sha: RICH_COMMITS[0].sha, message: "Fixes s5 markers", authorEmail: RICH }),
+    classifyMasterCommit({ sha: "27bf9236aa", message: "bible-editor: JER ult → master (#6701)", authorEmail: BW }),
+  ],
+  { humanRefs: richRefs },
+);
+const RICH_SUMMARY = JSON.parse(JSON.stringify(compactLineage(RICH_WINDOW)));
+
+eq(RICH_SUMMARY.counts.human, 2, "the window holds Rich's two hand commits");
+eq(RICH_SUMMARY.mayHoldHumanEdit, true, "the FILE-level answer is unchanged: a human did move this file");
+eq(RICH_SUMMARY.refsComplete, true, "...and the per-verse map is complete");
+eq(RICH_SUMMARY.humanRefs.length, 32, "...naming the 32 verse refs those commits landed in");
+
+// The decision the issue exists for.
+eq(masterMayHoldHumanEditForVerse(RICH_SUMMARY, 40, 5), false, "no human touched JER 40:5");
+eq(masterMayHoldHumanEditForVerse(RICH_SUMMARY, 40, 6), false, "no human touched JER 40:6");
+eq(masterMayHoldHumanEditForVerse(RICH_SUMMARY, 40, 10), false, "no human touched JER 40:10");
+eq(masterMayHoldHumanEditForVerse(RICH_SUMMARY, 23, 5), true, "a human DID touch JER 23:5");
+eq(masterMayHoldHumanEditForVerse(RICH_SUMMARY, 31, 19), true, "a human DID touch JER 31:19");
+
+{
+  // End to end, through the merge itself: the three verses that were actually
+  // overwritten on 2026-08-13.
+  const base = JSON.stringify({ verseObjects: [{ type: "text", text: "the ancestor we last published" }] });
+  const ours = JSON.stringify({ verseObjects: [{ type: "text", text: "Grant_Ailie's app edit" }] });
+  const theirs = JSON.stringify({ verseObjects: [{ type: "text", text: "the AI run sitting on master" }] });
+  for (const verse of [5, 6, 10]) {
+    const r = computeVerseMerge({
+      base,
+      ours,
+      theirs,
+      humanEditedSinceExport: false,
+      masterMayHoldHumanEdit: masterMayHoldHumanEditForVerse(RICH_SUMMARY, 40, verse),
+    });
+    eq(r.action, "keep_ai_master", `JER 40:${verse} both-changed -> keep_ai_master, not a revert`);
+  }
+  // Same window, same run, a verse Rich DID touch: master still wins there.
+  eq(
+    computeVerseMerge({
+      base,
+      ours,
+      theirs,
+      humanEditedSinceExport: false,
+      masterMayHoldHumanEdit: masterMayHoldHumanEditForVerse(RICH_SUMMARY, 23, 5),
+    }).action,
+    "adopt_conflict",
+    "JER 23:5 both-changed -> adopt_conflict: master holds a real hand edit there",
+  );
+}
+
+{
+  // The sibling case the issue names: a human commit that DOES land in chapter
+  // 40. Built from the same real revision — the hunk is the real line range of
+  // JER 40:5 in 24-JER.usfm at 82aad43b, so the mapping runs over real markers.
+  const rev = loadRevision("jer-ult-82aad43b");
+  const at = markerLineOf(rev.markers, "40:5");
+  eq(at !== null, true, "the real revision has a 40:5 marker to aim at");
+  const ev = refsTouchedInUsfm(rev.text, [{ newStart: at.start, newCount: at.count }]);
+  eq(ev.complete, true, "a chapter-40 hunk maps");
+  eq(ev.refs.includes("40:5"), true, "...to 40:5");
+  const summary = JSON.parse(
+    JSON.stringify(
+      compactLineage(
+        summarizeLineage([classifyMasterCommit({ sha: RICH_COMMITS[1].sha, message: "Fixes USFM", authorEmail: RICH })], {
+          humanRefs: ev,
+        }),
+      ),
+    ),
+  );
+  eq(masterMayHoldHumanEditForVerse(summary, 40, 5), true, "a human DID touch 40:5 in this window");
+  const base = JSON.stringify({ verseObjects: [{ type: "text", text: "the ancestor" }] });
+  eq(
+    computeVerseMerge({
+      base,
+      ours: JSON.stringify({ verseObjects: [{ type: "text", text: "our app edit" }] }),
+      theirs: JSON.stringify({ verseObjects: [{ type: "text", text: "the maintainer's fix" }] }),
+      humanEditedSinceExport: false,
+      masterMayHoldHumanEdit: masterMayHoldHumanEditForVerse(summary, 40, 5),
+    }).action,
+    "adopt_conflict",
+    "a human edit IN chapter 40 still wins the both-changed conflict there",
+  );
+}
+
+{
+  // Chapter front matter (a hunk on the \c line itself, before the chapter's
+  // first \v) claims the WHOLE chapter: which verse a \c / \s1 / \p change
+  // affects is not decidable from line position, so it protects all of them.
+  const rev = loadRevision("jer-ult-82aad43b");
+  const at = markerLineOf(rev.markers, "40:c");
+  eq(at !== null, true, "the real revision has a \\c 40 line to aim at");
+  const ev = refsTouchedInUsfm(rev.text, [{ newStart: at.start, newCount: 1 }]);
+  eq(ev.refs.includes("40:*"), true, "a chapter-front hunk claims the chapter, not a verse");
+  const summary = compactLineage(
+    summarizeLineage([classifyMasterCommit({ sha: "h1", message: "Fixes headings", authorEmail: RICH })], {
+      humanRefs: ev,
+    }),
+  );
+  eq(masterMayHoldHumanEditForVerse(summary, 40, 5), true, "...so every verse of chapter 40 stays protected");
+  eq(masterMayHoldHumanEditForVerse(summary, 41, 5), false, "...and only that chapter");
+}
+
+console.log("\n[#557: every uncertainty resolves to the file-level answer]");
+
+{
+  const rev = loadRevision("jer-ult-127cc1f3");
+  // A diff whose file header never arrives (a truncated body, a fetch that
+  // returned the tail): hunks with no file to belong to.
+  const truncated = fixture("jer-ult-127cc1f3.diff").split("\n").slice(6).join("\n");
+  eq(parseDiffHunksForPath(truncated, JER_PATH).complete, false, "a diff with no file header is incomplete");
+  eq(parseDiffHunksForPath("", JER_PATH).reason, "empty_diff", "an empty diff is incomplete, not 'nothing touched'");
+  eq(
+    parseDiffHunksForPath(`diff --git a/${JER_PATH} b/${JER_PATH}\n@@ what even is this @@\n`, JER_PATH).reason,
+    "unparseable_hunk_header",
+    "a hunk header we cannot read is incomplete",
+  );
+  eq(
+    parseDiffHunksForPath(`diff --git a/${JER_PATH} b/${JER_PATH}\nBinary files differ\n`, JER_PATH).reason,
+    "binary_patch",
+    "a binary patch is incomplete",
+  );
+  eq(
+    parseDiffHunksForPath(`diff --git a/old.usfm b/${JER_PATH}\n@@ -1,2 +1,2 @@\n`, JER_PATH).reason,
+    "renamed_file",
+    "a rename is incomplete — the line numbers are against a different history",
+  );
+  // The mismatched-revision guard: real hunks against a file that is not the
+  // one they were computed from. This is what catches an abbreviated sha
+  // resolving to master's tip (measured: the raw endpoint does exactly that).
+  eq(
+    refsTouchedInUsfm("\\c 1\n\\v 1 short file\n", parseDiffHunksForPath(fixture("jer-ult-127cc1f3.diff"), JER_PATH).hunks)
+      .reason,
+    "hunk_past_end_of_file",
+    "hunks that run past the end of the file are incomplete, never mapped to what is there",
+  );
+  eq(refsTouchedInUsfm("", [{ newStart: 1, newCount: 1 }]).reason, "empty_file", "an empty file is incomplete");
+  eq(
+    refsTouchedInUsfm(rev.text, [{ newStart: 1, newCount: 3 }]).reason,
+    "before_first_chapter",
+    "a hunk in the file header, before any \\c, is incomplete — it belongs to no verse",
+  );
+  eq(
+    refsTouchedInUsfm(rev.text, [{ newStart: 1, newCount: rev.totalLines }]).complete,
+    false,
+    "a whole-file rewrite does not narrow anything",
+  );
+  // ── A TRUNCATED DIFF: the shape transport cannot catch ────────────────────
+  // Door43 serves `.diff` chunked with NO Content-Length (measured 2026-08-24),
+  // so a short read arrives looking like a valid, smaller diff. Left unchecked
+  // it maps to a SMALLER ref set — and a ref that goes missing is exactly what
+  // lets D1 overwrite a maintainer's edit. Each hunk header declares how many
+  // lines follow it, so a body cut short is provable from the content alone.
+  {
+    const full = fixture("jer-ult-82aad43b.diff");
+    const diffLines = full.split("\n");
+    // Three lines into the LAST JER hunk's body (its header is fixture line
+    // 119, 1-based) — where a dropped chunk would land.
+    const truncated = parseDiffHunksForPath(diffLines.slice(0, 122).join("\n"), JER_PATH);
+    eq(truncated.complete, false, "a diff cut mid-hunk-body is incomplete");
+    eq(truncated.reason, "hunk_body_short", "...named as a short body, not a generic parse failure");
+    eq(truncated.hunks.length, 0, "...and yields NO hunks, so nothing can map an under-claimed ref set");
+    // The under-claim it prevents, concretely: the surviving hunk covers
+    // 31:10-11 and the cut one covers 31:18-19, so accepting the short body
+    // would have answered "no human touched 31:19" — which is false.
+    const whole = refsTouchedInUsfm(
+      loadRevision("jer-ult-82aad43b").text,
+      parseDiffHunksForPath(full, JER_PATH).hunks,
+    );
+    eq(whole.refs.includes("31:19"), true, "the WHOLE diff claims 31:19 — the ref a truncated read would drop");
+
+    // The residual, stated rather than hidden: a cut landing exactly ON a hunk
+    // boundary is a well-formed smaller diff and is not detectable this way. It
+    // is caught only when it removes our path's section entirely.
+    eq(
+      parseDiffHunksForPath(diffLines.slice(0, 118).join("\n"), JER_PATH).complete,
+      true,
+      "a cut landing exactly on a hunk boundary still parses (the known residual)",
+    );
+    eq(
+      parseDiffHunksForPath(diffLines.slice(0, 100).join("\n"), JER_PATH).complete,
+      false,
+      "...while a cut before our path's section is caught",
+    );
+
+    // The count is a real count, not a shape check: wrong on either side fails.
+    const d = (hdr, body) => parseDiffHunksForPath(`diff --git a/${JER_PATH} b/${JER_PATH}\n${hdr}\n${body}`, JER_PATH);
+    eq(d("@@ -1,3 +1,3 @@", " ctx\n").reason, "hunk_body_short", "a body shorter than its header claims is rejected");
+    eq(d("@@ -1 +1 @@", " ctx\n ctx\n").reason, "hunk_body_short", "...and one longer than it claims");
+    eq(d("@@ -1,2 +1,2 @@", " ctx\n-a\n+b\n").complete, true, "a body matching BOTH sides of its header is complete");
+    eq(d("@@ -1,2 +1,1 @@", " ctx\n-a\n+b\n").reason, "hunk_body_short", "...and the OLD side is counted too");
+    eq(
+      d("@@ -1,2 +1,2 @@", " ctx\n-a\n+b\n\\ No newline at end of file\n").complete,
+      true,
+      "git's no-newline marker is a note, not a line, and is not counted",
+    );
+  }
+
+  eq(mergeRefEvidence([]).complete, false, "no evidence at all is incomplete");
+  eq(
+    mergeRefEvidence([richEvidence[0], { complete: false, refs: [], reason: "diff_fetch_failed" }]).complete,
+    false,
+    "one unmapped commit makes the whole window incomplete — the mapped refs are not the whole set",
+  );
+  eq(
+    mergeRefEvidence([richEvidence[0], { complete: false, refs: [], reason: "diff_fetch_failed" }]).reason,
+    "diff_fetch_failed",
+    "...and the reason survives for the log",
+  );
+}
+
+{
+  // The gate itself. Every one of these must answer the file-level question,
+  // which for a window holding a human commit is `true` — master wins.
+  const human = [classifyMasterCommit({ sha: "h1", message: "Fixes s5 markers", authorEmail: RICH })];
+  const good = { complete: true, refs: ["23:5"], reason: "" };
+
+  eq(
+    masterMayHoldHumanEditForVerse(compactLineage(summarizeLineage(human)), 40, 5),
+    true,
+    "no per-verse evidence at all -> the file-level answer (today's behavior)",
+  );
+  eq(
+    masterMayHoldHumanEditForVerse(
+      compactLineage(summarizeLineage(human, { humanRefs: { complete: false, refs: ["23:5"], reason: "ref_cap_exceeded" } })),
+      40,
+      5,
+    ),
+    true,
+    "INCOMPLETE evidence never narrows, even when it carries refs",
+  );
+  eq(
+    compactLineage(summarizeLineage(human, { humanRefs: { complete: false, refs: ["23:5"], reason: "x" } })).humanRefs.length,
+    0,
+    "...and incomplete refs do not even cross the step boundary",
+  );
+  eq(
+    masterMayHoldHumanEditForVerse(
+      compactLineage(summarizeLineage(human, { humanRefs: good, incomplete: true, incompleteReason: "page_cap" })),
+      40,
+      5,
+    ),
+    true,
+    "an incomplete COMMIT walk is not narrowed by a complete ref map — we never saw the whole window",
+  );
+  eq(
+    masterMayHoldHumanEditForVerse(compactLineage(summarizeLineage(human, { humanRefs: { complete: true, refs: [], reason: "" } })), 40, 5),
+    true,
+    "human commits that mapped to zero refs are not believed",
+  );
+  eq(masterMayHoldHumanEditForVerse(null, 40, 5), true, "never having looked protects master");
+  eq(masterMayHoldHumanEditForVerse(undefined, 40, 5), true, "an absent lineage protects master");
+  eq(masterMayHoldHumanEditForVerse({}, 40, 5), true, "a malformed lineage object protects master");
+  eq(
+    masterMayHoldHumanEditForVerse({ mayHoldHumanEdit: true, refsComplete: true, humanRefs: ["23:5"] }, 40, 5),
+    true,
+    "a partially-deserialized summary with no `incomplete` field protects master",
+  );
+  // A ref set is DATA that came back through JSON and out of a D1 text column,
+  // so its entries are validated, not trusted. A malformed entry fails every
+  // `includes` test silently — the non-protective direction — so one bad entry
+  // discards the whole set.
+  {
+    const withRefs = (refs) => ({
+      mayHoldHumanEdit: true,
+      hasHumanCommit: true,
+      incomplete: false,
+      refsComplete: true,
+      humanRefs: refs,
+    });
+    eq(masterMayHoldHumanEditForVerse(withRefs([null, 42]), 40, 5), true, "refs that are not strings protect master");
+    eq(masterMayHoldHumanEditForVerse(withRefs(["23:5", "nonsense"]), 40, 5), true, "one malformed ref discards the set");
+    eq(masterMayHoldHumanEditForVerse(withRefs(["23:5", "23:"]), 40, 5), true, "...including a half-written one");
+    eq(masterMayHoldHumanEditForVerse(withRefs("23:5"), 40, 5), true, "a refs field that is not an array protects master");
+    eq(masterMayHoldHumanEditForVerse(withRefs(["23:5", "31:*"]), 40, 5), false, "a well-formed set still narrows");
+  }
+
+  // A BRIDGED row (`\v 14-15` — one D1 row covering two verses) must be asked
+  // about its whole range: the human's hunk may have landed in the second half.
+  {
+    const bridge = compactLineage(
+      summarizeLineage(human, { humanRefs: { complete: true, refs: ["40:15"], reason: "" } }),
+    );
+    eq(masterMayHoldHumanEditForVerse(bridge, 40, 14), false, "verse 14 alone is untouched");
+    eq(masterMayHoldHumanEditForVerse(bridge, 40, 14, 15), true, "...but the row bridging 14-15 IS protected");
+    eq(masterMayHoldHumanEditForVerse(bridge, 40, 14, null), false, "a null verseEnd is 'not a bridge', not 'unknown'");
+    eq(masterMayHoldHumanEditForVerse(bridge, 40, 14, 13), true, "a backwards bridge protects master");
+    eq(masterMayHoldHumanEditForVerse(bridge, 40, 14, 9999), true, "an absurd bridge width protects master");
+    eq(masterMayHoldHumanEditForVerse(bridge, 40, 14, Number.NaN), true, "a nonsense verseEnd protects master");
+  }
+
+  eq(
+    masterMayHoldHumanEditForVerse(RICH_SUMMARY, Number.NaN, 5),
+    true,
+    "a nonsense chapter protects master",
+  );
+  eq(masterMayHoldHumanEditForVerse(RICH_SUMMARY, 40, -1), true, "a nonsense verse protects master");
+  // The one direction narrowing may NOT change: a window with no human commit
+  // at all already answers false, and per-verse evidence cannot make it true.
+  const aiOnly = compactLineage(
+    summarizeLineage([classifyMasterCommit({ sha: "s2", message: "ULT: JER 40 [Gr..e@api.bp-assistant]", authorEmail: BOT })]),
+  );
+  eq(masterMayHoldHumanEditForVerse(aiOnly, 40, 5), false, "an AI-only window still answers false everywhere");
+  eq(masterMayHoldHumanEditForVerse(aiOnly, 23, 5), false, "...including in the chapters a human touched in OTHER windows");
+}
+
+{
+  // The cap is a degradation to the file-level answer, never a truncated set:
+  // dropping refs off the end would silently un-protect the verses that fell off.
+  const refs = Array.from({ length: LINEAGE_REF_CAP + 1 }, (_, i) => `1:${i + 1}`);
+  eq(mergeRefEvidence([{ complete: true, refs, reason: "" }]).complete, false, "a ref set past the cap is incomplete");
+  eq(mergeRefEvidence([{ complete: true, refs, reason: "" }]).reason, "ref_cap_exceeded", "...and says why");
 }
 
 if (failed) {

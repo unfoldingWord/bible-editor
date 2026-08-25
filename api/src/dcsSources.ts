@@ -4,7 +4,14 @@
 // table in one place so they can't drift.
 
 import type { Env } from "./index";
-import type { MasterCommit } from "./masterLineage.ts";
+import {
+  LINEAGE_REFINE_MAX_HUMAN_COMMITS,
+  mergeRefEvidence,
+  parseDiffHunksForPath,
+  refsTouchedInUsfm,
+  type HumanRefEvidence,
+  type MasterCommit,
+} from "./masterLineage.ts";
 
 // Standard unfoldingWord book number prefixes for USFM filenames. Mirror of
 // the BOOK_NUMBERS map in scripts/import-book.mjs and api/src/export.ts.
@@ -364,6 +371,140 @@ export async function listMasterCommitsSince(
     }
   }
   return { commits: out, incomplete: true, incompleteReason: "page_cap" };
+}
+
+// ── WHICH VERSES did those human commits touch? (issue #557) ────────────────
+//
+// The walk above answers "did a human touch this FILE since the ancestor", and
+// the merge then applies that to every verse of the book — so Richard Mahn's
+// two 2026-08-13 marker fixes, which land in JER chapters 23 and 31, authorized
+// reverting app edits in chapter 40. This narrows the question to the verse, by
+// asking Door43 for each human commit's own diff and mapping its hunks onto the
+// file as it stood at that commit.
+//
+// The mapping is pure and lives in masterLineage.ts; only the two fetches are
+// here, matching the module split the rest of this feature already uses.
+//
+// EVERY failure returns incomplete evidence, which masterMayHoldHumanEditForVerse
+// reads as "the file-level answer stands" — today's behavior. No path through
+// this function can make master's reach WIDER than the file-level answer
+// already allows; the only thing it can do is decline to widen it.
+
+// A commit diff big enough to be a whole-repo reformat is not one we will map:
+// reading it costs memory we should not spend on a question whose fallback
+// answer is free. Rich's two JER commits were 14 KB and 20 KB.
+const MAX_COMMIT_DIFF_BYTES = 2_000_000;
+// One USFM at one revision. 24-JER.usfm was 4.6 MB on 2026-08-24; the cap is
+// headroom over the largest real book, not a target.
+const MAX_REVISION_FILE_BYTES = 12_000_000;
+
+// Fetch text with a HARD byte cap, refusing rather than truncating. A truncated
+// USFM would silently shift every line number after the cut — the one error
+// that could place a human's hunk in a verse they never touched.
+//
+// ABSENT `content-length` AND `content-length: 0` ARE DIFFERENT FACTS, and
+// collapsing them makes the truncation check dead code: `headers.get()` returns
+// null when the header is absent, `Number(null)` is 0, and `Number.isFinite(0)`
+// is true — so a bare `Number()` read turns "nothing declared" into "declared
+// zero" and the short-read test becomes `byteLength < 0`, which is never true.
+// This is not hypothetical here: measured 2026-08-24, Door43 serves `.diff`
+// chunked with NO Content-Length, so the header-less path is the only path half
+// of this feature ever takes. fetchText above already handles it this way; the
+// first version of this helper regressed it.
+//
+// A header-less body is NOT refused — that would disable the feature outright.
+// It comes back unverified by transport, and the caller proves completeness from
+// the content instead: parseDiffHunksForPath counts every hunk's body against
+// the hunk's own header, so a diff cut mid-body is rejected there.
+async function fetchCappedText(env: Env, url: string, maxBytes: number): Promise<string | null> {
+  const headers: Record<string, string> = {};
+  if (env.DCS_SERVICE_TOKEN) headers.Authorization = `token ${env.DCS_SERVICE_TOKEN}`;
+  try {
+    const r = await fetch(url, { headers });
+    if (!r.ok) return null;
+    const cl = r.headers.get("content-length");
+    const declared = cl == null || !Number.isFinite(Number(cl)) ? null : Number(cl);
+    if (declared != null && declared > maxBytes) return null;
+    const buf = await r.arrayBuffer();
+    // Short of a declared length is a truncated read (the twl_PSA shape — see
+    // fetchText above); over the cap is a body we refuse to map.
+    if (declared != null && buf.byteLength < declared) return null;
+    if (buf.byteLength > maxBytes) return null;
+    return new TextDecoder("utf-8").decode(buf);
+  } catch {
+    return null;
+  }
+}
+
+// A full 40-char object id, and nothing else. MEASURED on 2026-08-24: the raw
+// endpoint silently serves master's CURRENT tip for an abbreviated sha
+// (`?ref=127cc1f3` returned bytes identical to master's tip, not that
+// revision), so an abbreviated sha would map real hunk numbers onto the wrong
+// file's lines.
+const FULL_SHA_RE = /^[0-9a-f]{40}$/;
+
+export async function fetchHumanTouchedRefs(
+  env: Env,
+  repo: string,
+  path: string,
+  humanCommits: MasterCommit[],
+): Promise<HumanRefEvidence> {
+  // USFM only. tn/tq/twl carry their ref in the row itself — a different
+  // mapping, deliberately not attempted here, so those keep the file-level
+  // answer they have today (issue #607).
+  if (!path.toLowerCase().endsWith(".usfm")) return { complete: false, refs: [], reason: "not_usfm" };
+  // No human commit is not "a complete map of no verses" — `{complete: true,
+  // refs: []}` is the exact value this function refuses at the bottom as not
+  // evidence, and it must not be constructed here either. Unreachable from the
+  // nightly caller (which only calls with at least one human commit) precisely
+  // because a window with no human already answers false at the file level.
+  if (humanCommits.length === 0) return { complete: false, refs: [], reason: "no_human_commits" };
+  if (humanCommits.length > LINEAGE_REFINE_MAX_HUMAN_COMMITS) {
+    return { complete: false, refs: [], reason: "too_many_human_commits" };
+  }
+
+  const base = (env.DCS_BASE_URL ?? "https://git.door43.org").replace(/\/$/, "");
+  const parts: HumanRefEvidence[] = [];
+  for (const c of humanCommits) {
+    const sha = (c.sha ?? "").toLowerCase();
+    if (!FULL_SHA_RE.test(sha)) {
+      parts.push({ complete: false, refs: [], reason: "abbreviated_sha" });
+      break;
+    }
+    const diffUrl = `${base}/api/v1/repos/${DCS_OWNER}/${encodeURIComponent(repo)}/git/commits/${sha}.diff`;
+    const diff = await fetchCappedText(env, diffUrl, MAX_COMMIT_DIFF_BYTES);
+    if (diff == null) {
+      parts.push({ complete: false, refs: [], reason: "diff_fetch_failed" });
+      break;
+    }
+    const parsed = parseDiffHunksForPath(diff, path);
+    if (!parsed.complete) {
+      parts.push({ complete: false, refs: [], reason: parsed.reason });
+      break;
+    }
+    // A commit the path-filtered history returned whose diff for that path has
+    // no hunks at all (a mode change) touched no verse. Nothing to add, and no
+    // reason to spend the file fetch.
+    if (parsed.hunks.length === 0) {
+      parts.push({ complete: true, refs: [], reason: "" });
+      continue;
+    }
+    const text = await fetchCappedText(env, dcsRawUrl(env, repo, path, sha), MAX_REVISION_FILE_BYTES);
+    if (text == null) {
+      parts.push({ complete: false, refs: [], reason: "revision_fetch_failed" });
+      break;
+    }
+    const mapped = refsTouchedInUsfm(text, parsed.hunks);
+    parts.push(mapped);
+    if (mapped.complete !== true) break;
+  }
+  const merged = mergeRefEvidence(parts);
+  // A window whose commits ALL mapped to zero refs is not evidence that no
+  // verse was touched — those commits moved the file. Refuse to narrow on it.
+  if (merged.complete && merged.refs.length === 0) {
+    return { complete: false, refs: [], reason: "no_refs_mapped" };
+  }
+  return merged;
 }
 
 // ── Independent completeness check for the EXPORT shrink guards (issue #494) ──
