@@ -48,14 +48,18 @@ import {
   fileCommitSha,
   fetchText,
   fetchDcsMasterTextVerified,
+  fetchHumanTouchedRefs,
   listMasterCommitsSince,
   NT_BOOKS,
 } from "./dcsSources";
 import {
   classifyMasterCommit,
   compactLineage,
+  LINEAGE_REFINE_MAX_HUMAN_COMMITS,
   masterMayHoldHumanEdit,
+  masterMayHoldHumanEditForVerse,
   summarizeLineage,
+  type HumanRefEvidence,
   type MasterLineageSummary,
 } from "./masterLineage.ts";
 import { gitBlobShaOrNull, recognizeOwnPublish, type OwnPublishResult } from "./ownPublish";
@@ -3013,9 +3017,24 @@ async function loadMasterLineage(
   const file = dcsResourceFile(book, resource);
   if (!file || confirmedAt == null) return null;
   const page = await listMasterCommitsSince(env, file.repo, file.path, null, { sinceTime: confirmedAt });
-  const lineage = summarizeLineage(page.commits.map(classifyMasterCommit), {
+  const commits = page.commits.map(classifyMasterCommit);
+  // #557: narrow "a human touched this file" to "a human touched THIS verse",
+  // but only where it is affordable and only where the file-level answer is
+  // actually in play. Skipped when the walk itself was incomplete (that already
+  // protects master, and nothing measured here can un-protect it), when no
+  // human commit is in the window (there is nothing to narrow), and when there
+  // are more human commits than LINEAGE_REFINE_MAX_HUMAN_COMMITS is willing to
+  // pay two subrequests each for. Every skip and every failure leaves the
+  // file-level answer standing.
+  const humans = commits.filter((c) => c.kind === "human");
+  let humanRefs: HumanRefEvidence | null = null;
+  if (!page.incomplete && humans.length > 0 && humans.length <= LINEAGE_REFINE_MAX_HUMAN_COMMITS) {
+    humanRefs = await fetchHumanTouchedRefs(env, file.repo, file.path, humans);
+  }
+  const lineage = summarizeLineage(commits, {
     incomplete: page.incomplete,
     incompleteReason: page.incompleteReason,
+    humanRefs,
   });
   const summary = compactLineage(lineage);
   // Logged for every pair that fetched one, not just the ones that changed a
@@ -3030,6 +3049,15 @@ async function loadMasterLineage(
     incomplete: summary.incomplete,
     incompleteReason: summary.incompleteReason,
     humanShas: summary.humanShas,
+    // #557. `refsComplete: false` is not a failure to report as one — it is the
+    // file-level answer standing, which is what shipped before. `refsReason`
+    // names which of the two it is. The refs themselves are truncated here (the
+    // count is authoritative, and the whole set is persisted below) so a nightly
+    // tail stays readable.
+    refsComplete: summary.refsComplete,
+    refsReason: summary.refsReason,
+    refCount: summary.humanRefs?.length ?? 0,
+    humanRefs: summary.humanRefs?.slice(0, 12),
   });
   // page.commits is newest-first (see listMasterCommitsSince) — its first
   // entry is the far end of the walk, i.e. the master commit this summary was
@@ -3486,10 +3514,22 @@ async function applyVerseRows(
           ours: ex.content_json,
           theirs: v.contentJson,
           humanEditedSinceExport: Number(ex.human_edit_after_export ?? 0) !== 0,
-          // #540 item 2. Always the helper, never `cutoff.lineage.hasHumanCommit`
-          // — an incomplete walk must protect master exactly like a found human
-          // commit, and only this function knows that.
-          masterMayHoldHumanEdit: masterMayHoldHumanEdit(cutoff?.lineage),
+          // #540 item 2, narrowed per verse by #557. Always the helper, never
+          // `cutoff.lineage.hasHumanCommit` — an incomplete walk must protect
+          // master exactly like a found human commit, and only this function
+          // knows that. The per-verse form answers the file-level question
+          // unless a COMPLETE map of every human commit's hunks says this verse
+          // is not one they touched: Rich's JER chapter 23 + 31 marker fixes
+          // must not authorize reverting an app edit in chapter 40. `v.verseEnd`
+          // is passed because a bridged row (`\v 14-15`) is ONE row covering two
+          // verses — asking only about its start verse would leave it
+          // unprotected when the human's hunk landed in the second half.
+          masterMayHoldHumanEdit: masterMayHoldHumanEditForVerse(
+            cutoff?.lineage,
+            v.chapter,
+            v.verse,
+            v.verseEnd,
+          ),
         });
         if (merge.action === "keep_no_base") {
           counts.merge_no_base++;

@@ -137,17 +137,25 @@ export interface MasterLineage {
   incomplete: boolean;
   /** Why it is incomplete, for the alert. Empty when complete. */
   incompleteReason: string;
+  /**
+   * WHICH verses those human commits touched (#557), when that was measurable.
+   * Absent or null means nobody narrowed, so the file-level answer stands —
+   * which is the protective one. See the per-verse section at the bottom of
+   * this file.
+   */
+  humanRefs?: HumanRefEvidence | null;
 }
 
 export function summarizeLineage(
   commits: ClassifiedCommit[],
-  opts: { incomplete?: boolean; incompleteReason?: string } = {},
+  opts: { incomplete?: boolean; incompleteReason?: string; humanRefs?: HumanRefEvidence | null } = {},
 ): MasterLineage {
   return {
     commits,
     hasHumanCommit: commits.some((c) => c.kind === "human"),
     incomplete: opts.incomplete === true,
     incompleteReason: opts.incomplete === true ? (opts.incompleteReason ?? "unknown") : "",
+    humanRefs: opts.humanRefs ?? null,
   };
 }
 
@@ -174,6 +182,19 @@ export interface MasterLineageSummary {
   counts: { ours: number; ai: number; human: number };
   /** Up to LINEAGE_EVIDENCE_CAP human commit shas, newest first. */
   humanShas: string[];
+  /**
+   * #557, the per-verse narrowing. TRUE only when every human commit in the
+   * window was mapped, in full, to a bounded set of verse refs. Anything else —
+   * one unparseable diff, one unmapped hunk, too many human commits to afford
+   * the fetches, a ref set past LINEAGE_REF_CAP — leaves this false and the
+   * file-level answer standing. Absent on a summary serialized before #557
+   * shipped, which reads the same as false.
+   */
+  refsComplete?: boolean;
+  /** The refs those human commits touched: "c:v", or "c:*" for a whole chapter. */
+  humanRefs?: string[];
+  /** Why the narrowing did not complete, for the log. Empty when it did. */
+  refsReason?: string;
 }
 
 export function compactLineage(lineage: MasterLineage): MasterLineageSummary {
@@ -183,6 +204,7 @@ export function compactLineage(lineage: MasterLineage): MasterLineageSummary {
     counts[c.kind]++;
     if (c.kind === "human" && humanShas.length < LINEAGE_EVIDENCE_CAP) humanShas.push(c.sha);
   }
+  const ev = lineage.humanRefs ?? null;
   return {
     mayHoldHumanEdit: masterMayHoldHumanEdit(lineage),
     hasHumanCommit: lineage.hasHumanCommit,
@@ -190,6 +212,13 @@ export function compactLineage(lineage: MasterLineage): MasterLineageSummary {
     incompleteReason: lineage.incompleteReason,
     counts,
     humanShas,
+    // Narrowing evidence only crosses the boundary when it is COMPLETE. A
+    // half-mapped ref set has no downstream use — masterMayHoldHumanEditForVerse
+    // ignores it — and carrying it would only invite a future reader to treat
+    // "the refs we did manage to map" as the whole truth.
+    refsComplete: ev?.complete === true,
+    humanRefs: ev?.complete === true ? ev.refs : [],
+    refsReason: ev == null ? "not_measured" : ev.complete === true ? "" : ev.reason,
   };
 }
 
@@ -215,4 +244,389 @@ export function masterMayHoldHumanEdit(
   // `=== false`, but that is the callers being careful, not this function being
   // safe. Encode it here, where the rule lives.
   return lineage.incomplete !== false || lineage.hasHumanCommit !== false;
+}
+
+// ── WHICH VERSE did the human touch? (issue #557) ───────────────────────────
+//
+// Everything above answers "did a human touch this FILE". Applied per verse,
+// that is far too broad, and the breadth is not theoretical: on 2026-08-13
+// Richard Mahn pushed `Fixes s5 markers` (127cc1f3) and `Fixes USFM`
+// (82aad43b) to en_ult/24-JER.usfm. Both land only in chapters 23 and 31 —
+// measured from their own diffs, committed as fixtures in
+// masterLineage.test.mjs — yet the file-level answer let them authorize
+// reverting Grant_Ailie's app edits in JER ULT 40:5, 40:6 and 40:10.
+//
+// So: for each human commit, map its hunks to the verses they landed in, and
+// let the merge ask about ITS verse. Same fail-safe direction as everything
+// else in this module, and it is the whole safety argument here too: a diff we
+// cannot parse, a hunk we cannot place, a file that does not line up with its
+// own diff, a ref set too big to carry, or simply not having looked ALL leave
+// `refsComplete` false, and a false there means the file-level answer stands —
+// today's behavior, master wins. Narrowing is only ever allowed to fire on a
+// positive, complete mapping. Nothing here can widen master's reach; it can
+// only decline to widen it.
+//
+// THE ONE ASYMMETRY, stated because this module's whole argument is "never claim
+// fewer refs than the commit touched": only the NEW side of a hunk is mapped.
+// Content the human DELETED exists only on the old side, so a verse that a
+// commit only removed lines from is claimed via the surrounding new-side lines
+// rather than via the deleted text itself. In practice the new side still covers
+// it — a modification puts `+` lines inside the verse's own span, git's default
+// three lines of context bracket a pure deletion on both sides, and a
+// zero-context deletion claims both lines of the join (see the newCount === 0
+// branch below). Mapping the old side too would need the PARENT revision, i.e. a
+// third fetch per commit, which the subrequest budget does not have. If a real
+// under-claim is ever measured, that is the fix; nobody has produced one.
+//
+// Pure, like the rest of the module: the two fetches this needs (the commit's
+// diff, and the file as it stood at that commit) live in dcsSources.ts.
+
+// How many human commits in one window we are willing to map. Each one costs
+// TWO subrequests — the commit's `.diff`, plus the file at that exact sha,
+// which for a USFM is several MB (24-JER.usfm was 4.6 MB on 2026-08-24) — and
+// the nightly path's budget is already tight against Cloudflare's ~1000
+// subrequest cap (see dcsSources.ts's paging note and bookReimport.ts's
+// batching). Three keeps the worst case at 6 extra subrequests per (book,
+// resource) per run, on runs where master moved AND a human is in the window;
+// it covers the measured JER case (two commits) with room for one more.
+// Windows above the bound are not a failure — they fall back to the file-level
+// answer, which is exactly what shipped before this.
+export const LINEAGE_REFINE_MAX_HUMAN_COMMITS = 3;
+
+// How many refs a summary will carry. It rides a Workflow step's serialized
+// return value and is persisted to D1 (master_lineage_json), so it must stay
+// small: 200 refs is ~1.8 KB of JSON. A human commit that touched more verses
+// than this is a whole-file reformat, and "the human touched everything" is
+// precisely the file-level answer — so overflowing degrades to it rather than
+// truncating the set, which would silently un-protect the refs that fell off.
+export const LINEAGE_REF_CAP = 200;
+
+export interface HumanRefEvidence {
+  /** True ONLY when every hunk of every human commit was mapped. */
+  complete: boolean;
+  /** "c:v" for one verse, "c:*" for a whole chapter. Empty when incomplete. */
+  refs: string[];
+  /** Why it is incomplete. Empty when complete. */
+  reason: string;
+}
+
+/** One unified-diff hunk, new-side only — that is the side the fetched file is. */
+export interface HunkRange {
+  newStart: number;
+  newCount: number;
+}
+
+const REF_INCOMPLETE = (reason: string): HumanRefEvidence => ({ complete: false, refs: [], reason });
+
+// `\c 23` / `\v 5` / `\v 5-6`. The space after the letter is required, which is
+// what keeps `\va` (alternate verse), `\vp` (published verse) and `\ca` out.
+const CV_MARKER_RE = /\\(c|v) (\d+)(?:-(\d+))?/g;
+
+// A verse bridge wider than this is not a bridge, it is a parse gone wrong.
+const MAX_BRIDGE_WIDTH = 50;
+
+// Pull the new-side hunk ranges for ONE path out of a whole-commit unified
+// diff. Real commits here touch several books at once (82aad43b touched
+// 04-NUM, 24-JER and 33-MIC), so filtering by path is not an optimization —
+// mapping another book's line numbers onto this book's file would place hunks
+// in verses nobody touched.
+//
+// Every shape we cannot read returns incomplete: a header we cannot parse, a
+// binary patch, a rename (the line numbers would be against a different file's
+// history), or the path never appearing at all — the commits API already
+// filtered to commits that touch it, so its absence means we are reading
+// something other than what we asked for.
+//
+// AND THE BODY IS COUNTED, WHICH IS THIS FUNCTION'S ONLY COMPLETENESS PROOF.
+// Measured 2026-08-24: Door43 serves `.diff` chunked, with NO Content-Length —
+// so the transport layer has nothing to check a short read against, and a diff
+// cut off mid-body arrives looking like a valid, smaller diff. That is not a
+// theoretical failure: a two-hunk diff truncated before its second `@@` maps to
+// a SMALLER ref set, and a missing ref is exactly what lets D1 overwrite a
+// maintainer's edit. Refusing every header-less body would disable the feature
+// outright (it is always header-less here), so completeness is proved from the
+// content instead: each `@@ -a,b +c,d @@` declares how many lines follow it, and
+// a truncated hunk comes up short. Mismatch — either direction — is
+// `hunk_body_short`, which is incomplete, which is master-wins.
+export function parseDiffHunksForPath(
+  diff: string,
+  path: string,
+): { hunks: HunkRange[]; complete: boolean; reason: string } {
+  if (typeof diff !== "string" || diff.length === 0) {
+    return { hunks: [], complete: false, reason: "empty_diff" };
+  }
+  const lines = diff.split("\n");
+  // A trailing newline splits into one empty element that is not a diff line.
+  // Dropped so it cannot be miscounted as an (unprefixed) empty context line.
+  if (lines[lines.length - 1] === "") lines.pop();
+
+  const hunks: HunkRange[] = [];
+  let inTarget = false;
+  let sawTarget = false;
+  // The hunk whose body we are counting, if any.
+  let open: { range: HunkRange; oldCount: number; newCount: number; ctx: number; add: number; del: number } | null =
+    null;
+
+  // Close the open hunk, keeping it only if its body is exactly as long as its
+  // header promised on BOTH sides.
+  const closeHunk = (): boolean => {
+    if (open === null) return true;
+    const ok = open.ctx + open.add === open.newCount && open.ctx + open.del === open.oldCount;
+    if (ok) hunks.push(open.range);
+    open = null;
+    return ok;
+  };
+
+  for (const line of lines) {
+    if (line.startsWith("diff --git ")) {
+      if (!closeHunk()) return { hunks: [], complete: false, reason: "hunk_body_short" };
+      const m = /^diff --git a\/(.+) b\/(.+)$/.exec(line);
+      if (!m) return { hunks: [], complete: false, reason: "unparseable_file_header" };
+      const [, from, to] = m;
+      inTarget = from === path || to === path;
+      if (inTarget) {
+        sawTarget = true;
+        // A rename touching our path: the hunk numbers belong to a file that is
+        // only partly this one. Refuse rather than map them.
+        if (from !== to) return { hunks: [], complete: false, reason: "renamed_file" };
+      }
+      continue;
+    }
+    if (!inTarget) continue;
+    if (line.startsWith("@@")) {
+      if (!closeHunk()) return { hunks: [], complete: false, reason: "hunk_body_short" };
+      const h = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/.exec(line);
+      if (!h) return { hunks: [], complete: false, reason: "unparseable_hunk_header" };
+      // A side with no count means exactly one line (`+12` === `+12,1`).
+      const oldCount = h[2] === undefined ? 1 : Number(h[2]);
+      const newStart = Number(h[3]);
+      const newCount = h[4] === undefined ? 1 : Number(h[4]);
+      open = {
+        range: { newStart, newCount },
+        oldCount,
+        newCount,
+        ctx: 0,
+        add: 0,
+        del: 0,
+      };
+      continue;
+    }
+    if (open !== null) {
+      // Body lines. A content line ALWAYS carries its ' ' / '+' / '-' prefix, so
+      // a bare "" here is an empty context line some proxy stripped, and a
+      // leading '\' is git's "\ No newline at end of file", which is a note
+      // about the previous line rather than a line of its own.
+      if (line === "" || line.startsWith(" ")) open.ctx++;
+      else if (line.startsWith("+")) open.add++;
+      else if (line.startsWith("-")) open.del++;
+      else if (line.startsWith("\\")) continue;
+      else return { hunks: [], complete: false, reason: "unparseable_hunk_body" };
+      continue;
+    }
+    if (line.startsWith("GIT binary patch") || line.startsWith("Binary files ")) {
+      return { hunks: [], complete: false, reason: "binary_patch" };
+    }
+    if (line.startsWith("deleted file mode ")) {
+      return { hunks: [], complete: false, reason: "file_deleted" };
+    }
+  }
+  // The last hunk in the body is the one a truncated fetch cuts, so this close
+  // is the one that matters most.
+  if (!closeHunk()) return { hunks: [], complete: false, reason: "hunk_body_short" };
+  if (!sawTarget) return { hunks: [], complete: false, reason: "path_not_in_diff" };
+  return { hunks, complete: true, reason: "" };
+}
+
+// Map new-side hunk ranges onto the verses of the file AS IT STOOD AT THAT
+// COMMIT. `fileText` must be that exact revision: line numbers from one commit
+// against another commit's bytes place hunks in the wrong verses, silently. The
+// bounds check below is the guard for that (a hunk running past the end of the
+// file is the loud half of the mismatch), and the caller pins the fetch to the
+// commit's full 40-char sha.
+//
+// DELIBERATELY OVER-BROAD, in the protective direction: a hunk's whole new-side
+// span is claimed, context lines included, and a line is credited both to the
+// verse in effect when it starts and to every verse it opens. Claiming a
+// neighbouring verse costs nothing but today's behavior for that verse; missing
+// one is the failure this exists to prevent.
+export function refsTouchedInUsfm(fileText: string, hunks: HunkRange[]): HumanRefEvidence {
+  if (typeof fileText !== "string" || fileText.length === 0) return REF_INCOMPLETE("empty_file");
+  if (hunks.length === 0) return { complete: true, refs: [], reason: "" };
+
+  const lines = fileText.split("\n");
+  const spans: Array<[number, number]> = [];
+  for (const h of hunks) {
+    if (!Number.isInteger(h.newStart) || !Number.isInteger(h.newCount) || h.newStart < 0 || h.newCount < 0) {
+      return REF_INCOMPLETE("bad_hunk_range");
+    }
+    if (h.newCount === 0) {
+      // A pure deletion. `newStart` is the line the removed text sat AFTER, so
+      // claim both sides of the join — the deleted text belonged to one of them.
+      const lo = Math.max(1, h.newStart);
+      if (lo > lines.length) return REF_INCOMPLETE("hunk_past_end_of_file");
+      spans.push([lo, Math.min(lines.length, h.newStart + 1)]);
+      continue;
+    }
+    const hi = h.newStart + h.newCount - 1;
+    if (h.newStart < 1 || hi > lines.length) return REF_INCOMPLETE("hunk_past_end_of_file");
+    spans.push([h.newStart, hi]);
+  }
+  spans.sort((a, b) => a[0] - b[0]);
+
+  const refs = new Set<string>();
+  let chapter = 0;
+  let verseLo = -1; // -1 = no verse opened yet in this chapter
+  let verseHi = -1;
+  let si = 0;
+
+  const claim = (): string | null => {
+    if (chapter <= 0) return "before_first_chapter";
+    if (verseLo < 0) {
+      // Chapter front matter (\c, \s1, \p before the first \v). Which verse it
+      // affects is not decidable from line position, so claim the chapter.
+      // NOTE: a hunk that starts ON a chapter's first verse line claims `c:*`
+      // too (the line's opening state is still front matter), which is
+      // over-protective — and costs one slot, so a single chapter's effective
+      // budget is LINEAGE_REF_CAP - 1. Both effects are in the safe direction.
+      refs.add(`${chapter}:*`);
+      return null;
+    }
+    for (let v = verseLo; v <= verseHi; v++) refs.add(`${chapter}:${v}`);
+    return null;
+  };
+
+  for (let i = 0; i < lines.length; i++) {
+    const lineNo = i + 1;
+    // Advance past spans that ended before this line.
+    while (si < spans.length && spans[si][1] < lineNo) si++;
+    if (si >= spans.length) break; // every hunk is behind us; the rest of the file cannot be claimed
+    const covered = spans[si][0] <= lineNo && lineNo <= spans[si][1];
+    const line = lines[i];
+    const hasMarker = line.includes("\\c ") || line.includes("\\v ");
+    if (!hasMarker) {
+      if (covered && claim() !== null) return REF_INCOMPLETE("before_first_chapter");
+      continue;
+    }
+    // The state at the START of the line is claimed first, then each marker on
+    // the line updates the state and is claimed in turn — a line can both end
+    // one verse and open the next (`…\zaln-e\*.` `\q1 \v 5 …` is one line in
+    // real ULT).
+    if (covered && claim() !== null) return REF_INCOMPLETE("before_first_chapter");
+    for (const m of line.matchAll(CV_MARKER_RE)) {
+      const n = Number(m[2]);
+      if (!Number.isFinite(n)) return REF_INCOMPLETE("unparseable_marker");
+      if (m[1] === "c") {
+        chapter = n;
+        verseLo = -1;
+        verseHi = -1;
+      } else {
+        const end = m[3] === undefined ? n : Number(m[3]);
+        if (!Number.isFinite(end) || end < n || end - n > MAX_BRIDGE_WIDTH) {
+          return REF_INCOMPLETE("unparseable_verse_bridge");
+        }
+        verseLo = n;
+        verseHi = end;
+      }
+      if (covered && claim() !== null) return REF_INCOMPLETE("before_first_chapter");
+    }
+    if (refs.size > LINEAGE_REF_CAP) return REF_INCOMPLETE("ref_cap_exceeded");
+  }
+  if (refs.size > LINEAGE_REF_CAP) return REF_INCOMPLETE("ref_cap_exceeded");
+  // Hunks that mapped to nothing at all mean the walk never reached them —
+  // an answer of "no verses touched" from a commit that demonstrably touched
+  // the file is the one shape that must never narrow anything.
+  if (refs.size === 0) return REF_INCOMPLETE("no_refs_mapped");
+  return { complete: true, refs: [...refs], reason: "" };
+}
+
+// Union the per-commit evidence. One incomplete part makes the whole window
+// incomplete: the refs we DID map are not the whole set of verses a human
+// touched, and treating them as if they were is the un-protective error.
+export function mergeRefEvidence(parts: HumanRefEvidence[]): HumanRefEvidence {
+  if (parts.length === 0) return REF_INCOMPLETE("no_evidence");
+  const refs = new Set<string>();
+  for (const p of parts) {
+    if (p == null || p.complete !== true) return REF_INCOMPLETE(p?.reason || "incomplete_part");
+    for (const r of p.refs) refs.add(r);
+  }
+  if (refs.size > LINEAGE_REF_CAP) return REF_INCOMPLETE("ref_cap_exceeded");
+  return { complete: true, refs: [...refs], reason: "" };
+}
+
+// "40:5" or "40:*", and nothing else. Entries are validated rather than trusted:
+// the set arrives through a Workflow step's JSON and out of a D1 text column, and
+// a malformed entry silently fails every `includes` test — which is the
+// NON-protective answer. One bad entry discards the whole set (see refsFrom).
+const REF_KEY_RE = /^\d+:(?:\d+|\*)$/;
+
+function validRefs(refs: unknown): string[] | null {
+  if (!Array.isArray(refs)) return null;
+  for (const r of refs) if (typeof r !== "string" || !REF_KEY_RE.test(r)) return null;
+  return refs as string[];
+}
+
+function refsFrom(lineage: MasterLineage | MasterLineageSummary): HumanRefEvidence | null {
+  if ("humanRefs" in lineage) {
+    const hr = (lineage as { humanRefs?: unknown }).humanRefs;
+    // The uncompacted lineage carries the evidence object itself.
+    if (hr != null && !Array.isArray(hr) && typeof hr === "object") {
+      const ev = hr as HumanRefEvidence;
+      if (ev.complete !== true) return null;
+      const refs = validRefs(ev.refs);
+      return refs === null ? null : { complete: true, refs, reason: "" };
+    }
+    // The compacted summary carries the flattened pair.
+    const complete = (lineage as MasterLineageSummary).refsComplete;
+    if (complete === true) {
+      const refs = validRefs(hr);
+      if (refs !== null) return { complete: true, refs, reason: "" };
+    }
+  }
+  return null;
+}
+
+/** Does this evidence claim (chapter, verse)? "c:*" claims the whole chapter. */
+export function refEvidenceTouches(refs: string[], chapter: number, verse: number): boolean {
+  return refs.includes(`${chapter}:*`) || refs.includes(`${chapter}:${verse}`);
+}
+
+// The per-verse form of masterMayHoldHumanEdit — what the verse merge asks now.
+//
+// It can only ever return the file-level answer or a NARROWER one, and only on
+// complete positive evidence. Every other route returns true (master wins), the
+// behavior that shipped before #557:
+//   - the file-level answer is already false          -> false, nothing to narrow
+//   - no lineage at all / an unparseable one          -> true
+//   - the commit walk was incomplete                  -> true
+//   - no per-verse evidence, or incomplete evidence   -> true
+//   - a ref set holding anything that is not a ref    -> true
+//   - human commits exist but mapped to zero refs     -> true (a mapping we do
+//     not believe: the commits touched the file, so they touched some verse)
+//
+// `verseEnd` is for a BRIDGED row (a D1 verse covering 14-15, from `\v 14-15`).
+// The whole range is asked, and ANY verse in it being human-touched protects the
+// row — asking only about the start verse would leave a bridge unprotected when
+// the human's hunk landed in its second half.
+export function masterMayHoldHumanEditForVerse(
+  lineage: MasterLineage | MasterLineageSummary | null | undefined,
+  chapter: number,
+  verse: number,
+  verseEnd?: number | null,
+): boolean {
+  if (masterMayHoldHumanEdit(lineage) === false) return false;
+  if (lineage == null) return true;
+  if (lineage.incomplete !== false) return true;
+  if (!Number.isInteger(chapter) || !Number.isInteger(verse) || chapter < 0 || verse < 0) return true;
+  const ev = refsFrom(lineage);
+  if (ev === null) return true;
+  if (ev.refs.length === 0) return true;
+  let end = verse;
+  if (verseEnd != null) {
+    // A bridge we cannot believe (backwards, absurd, or not a number) is not a
+    // reason to narrow anything.
+    if (!Number.isInteger(verseEnd) || verseEnd < verse || verseEnd - verse > MAX_BRIDGE_WIDTH) return true;
+    end = verseEnd;
+  }
+  for (let v = verse; v <= end; v++) if (refEvidenceTouches(ev.refs, chapter, v)) return true;
+  return false;
 }
