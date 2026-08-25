@@ -335,7 +335,29 @@ function verseDb() {
     book TEXT, chapter INTEGER, verse INTEGER, bible_version TEXT, version INTEGER,
     content_json TEXT, plain_text TEXT, updated_at INTEGER, updated_by INTEGER
   )`);
+  // Migration 0023's real schema, for the #626 resolved-banner-clear tests below.
+  d.exec(`CREATE TABLE system_alerts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT NOT NULL, severity TEXT NOT NULL,
+    source TEXT NOT NULL, message TEXT NOT NULL, link_url TEXT,
+    created_at INTEGER, dismissed_at INTEGER
+  )`);
   return d;
+}
+
+// Replicates clearResolvedConflictBannerIfLast's exact decision (verses.ts's
+// PATCH route, issue #626) against real SQLite, using the ACTUAL
+// SELECT_ACTIVE_ALERTABLE_CONFLICTS_SQL text so this can't silently drift
+// from what that function really queries. The DELETE is the same literal
+// clearUndismissedAlertsStmt(env, source) issues (unexported — not worth a
+// D1 shim just to call it directly, same reasoning Part 3's saveVerse
+// helper gives for reimplementing the batch instead of faking env.DB).
+function clearResolvedBanner(d, book, resource) {
+  const active = d.prepare(SELECT_ACTIVE_ALERTABLE_CONFLICTS_SQL).all(book, resource);
+  if (active.length > 0) return false;
+  d.prepare(`DELETE FROM system_alerts WHERE source = ? AND dismissed_at IS NULL`).run(
+    `verse_merge_conflict:${book}:${resource}`,
+  );
+  return true;
 }
 
 // Runs the REAL verses.ts PATCH-route UPDATE (VERSE_PATCH_UPDATE_SQL) first
@@ -421,6 +443,105 @@ function saveVerse(d, { book, resource, chapter, verse, matchVersion, userId, no
 
   const row = d.prepare(`SELECT * FROM verse_merge_conflicts WHERE book = 'ZEC' AND chapter = 1 AND verse = 2`).get();
   assert(row.resolved_at === 200 && row.resolved_by === 30, "first resolver's stamp is preserved, not overwritten");
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Part 3b: clearResolvedConflictBannerIfLast (issue #626). The banner alert
+// used to be frozen at whatever the last sync run wrote, even after a human
+// resolved every conflict it named — nothing rewrote it until the next
+// reimport. verses.ts's PATCH route now calls this after a save resolves a
+// conflict row, to clear the (book, resource) banner immediately when that
+// was the LAST active alertable conflict outstanding.
+// ─────────────────────────────────────────────────────────────────────────
+
+{
+  // The measured case from the issue: JER ULT had 3 active conflicts; a
+  // human resolves the only source_attr_ambiguous one; two both_changed_ai_master
+  // rows remain. The banner must NOT be cleared — a partially-stale banner
+  // (still correctly naming the two survivors, if stale on the exact count)
+  // beats fabricating a fresh count from a fragment.
+  const d = verseDb();
+  d.prepare(
+    `INSERT INTO verse_merge_conflicts (book, resource, chapter, verse, action, reason, overwritten_version, detected_at, resolved_at)
+     VALUES ('JER', 'ult', 42, 6, 'keep_ai_master', 'both_changed_ai_master', NULL, 100, NULL)`,
+  ).run();
+  d.prepare(
+    `INSERT INTO verse_merge_conflicts (book, resource, chapter, verse, action, reason, overwritten_version, detected_at, resolved_at)
+     VALUES ('JER', 'ult', 42, 11, 'keep_ai_master', 'both_changed_ai_master', NULL, 100, NULL)`,
+  ).run();
+  d.prepare(
+    `INSERT INTO system_alerts (username, severity, source, message)
+     VALUES ('deferredreward', 'warning', 'verse_merge_conflict:JER:ult', 'Sync flagged 3 verse(s)...')`,
+  ).run();
+
+  const cleared = clearResolvedBanner(d, "JER", "ult");
+  assert(!cleared, "two conflicts still outstanding -> banner is left alone, not cleared");
+  const alert = d.prepare(`SELECT * FROM system_alerts WHERE source = 'verse_merge_conflict:JER:ult'`).get();
+  assert(!!alert, "the (stale but not wrong-count) banner row still exists");
+}
+
+{
+  // The success case: the one remaining conflict for (book, resource) gets
+  // resolved. The banner — both the admin's row and an editor's fan-out row,
+  // same source — disappears immediately, not on the next sync.
+  const d = verseDb();
+  d.prepare(
+    `INSERT INTO verse_merge_conflicts (book, resource, chapter, verse, action, reason, overwritten_version, detected_at, resolved_at)
+     VALUES ('JER', 'ult', 41, 8, 'source_attr_divergent', 'source_attr_ambiguous', NULL, 100, 12345)`,
+  ).run();
+  d.prepare(
+    `INSERT INTO system_alerts (username, severity, source, message)
+     VALUES ('deferredreward', 'warning', 'verse_merge_conflict:JER:ult', 'Sync flagged 1 verse(s)...')`,
+  ).run();
+  d.prepare(
+    `INSERT INTO system_alerts (username, severity, source, message)
+     VALUES ('bethoakes', 'warning', 'verse_merge_conflict:JER:ult', 'Your edit at JER 41:8 was overwritten...')`,
+  ).run();
+
+  const cleared = clearResolvedBanner(d, "JER", "ult");
+  assert(cleared, "the last active conflict just resolved -> banner is cleared");
+  const remaining = d.prepare(`SELECT * FROM system_alerts WHERE source = 'verse_merge_conflict:JER:ult'`).all();
+  assert(remaining.length === 0, "cleared by SOURCE — both the admin's row and the editor's fan-out row are gone");
+}
+
+{
+  // A dismissed banner row must be left alone even when every conflict for
+  // that (book, resource) resolves — the same invariant
+  // clearUndismissedAlertsStmt documents for every other clear in this file.
+  const d = verseDb();
+  d.prepare(
+    `INSERT INTO system_alerts (username, severity, source, message, dismissed_at)
+     VALUES ('deferredreward', 'warning', 'verse_merge_conflict:JER:ult', 'Sync flagged 1 verse(s)...', 999)`,
+  ).run();
+
+  const cleared = clearResolvedBanner(d, "JER", "ult");
+  assert(cleared, "zero active conflicts -> the clear still runs");
+  const alert = d.prepare(`SELECT * FROM system_alerts WHERE source = 'verse_merge_conflict:JER:ult'`).get();
+  assert(!!alert && alert.dismissed_at === 999, "…but a DISMISSED row is never touched — it stays as history");
+}
+
+{
+  // A banner for a DIFFERENT (book, resource) sharing no active conflicts
+  // must not be collaterally cleared just because JER ULT's own resolve ran
+  // through this same call.
+  const d = verseDb();
+  d.prepare(
+    `INSERT INTO verse_merge_conflicts (book, resource, chapter, verse, action, reason, overwritten_version, detected_at, resolved_at)
+     VALUES ('EZK', 'ust', 26, 17, 'source_attr_divergent', 'source_attr_ambiguous', NULL, 100, NULL)`,
+  ).run();
+  d.prepare(
+    `INSERT INTO system_alerts (username, severity, source, message)
+     VALUES ('deferredreward', 'warning', 'verse_merge_conflict:EZK:ust', 'Sync flagged 1 verse(s)...')`,
+  ).run();
+  d.prepare(
+    `INSERT INTO system_alerts (username, severity, source, message)
+     VALUES ('deferredreward', 'warning', 'verse_merge_conflict:JER:ult', 'stale JER banner, nothing active')`,
+  ).run();
+
+  const cleared = clearResolvedBanner(d, "JER", "ult");
+  assert(cleared, "JER ult has zero active conflicts -> its own banner clears");
+  const ezkAlert = d.prepare(`SELECT * FROM system_alerts WHERE source = 'verse_merge_conflict:EZK:ust'`).get();
+  assert(!!ezkAlert, "EZK ust's own still-active banner is untouched by JER ult's clear");
 }
 
 // ─────────────────────────────────────────────────────────────────────────

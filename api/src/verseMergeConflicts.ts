@@ -328,6 +328,46 @@ function clearUndismissedAlertsStmt(env: Env, source: string, username?: string)
   return env.DB.prepare(`DELETE FROM system_alerts WHERE source = ?1 AND dismissed_at IS NULL`).bind(source);
 }
 
+// Issue #626: raiseVerseMergeConflictAlert only reruns from a reimport (the
+// nightly cron or a user-triggered POST /:book/reimport), so a banner it
+// wrote stays frozen at that run's content until the next one — up to a
+// night, longer if the freshness gate skips that (book, resource). Meanwhile
+// resolved_at is set independently, by verses.ts's PATCH route the moment a
+// human re-saves the flagged verse. Nothing in between rewrote the banner,
+// so it kept naming verses a human had already fixed — exactly when someone
+// working the list was most likely to look at it.
+//
+// Called from verses.ts after a save resolves a conflict row, this clears
+// the (book, resource) banner ONLY when that resolve was the LAST active
+// alertable conflict outstanding — otherwise it leaves the banner alone.
+// That is deliberate, not a shortcut: the caller here knows about the ONE
+// verse it just resolved, not the resource's full remaining set, so
+// rewriting the message from that single fact would risk trading a
+// merely-stale count for an actively WRONG one (e.g. dropping a reason from
+// the parenthetical breakdown that still has other rows). A partially-stale
+// banner self-heals on the next sync; a fabricated count does not.
+//
+// Best-effort, like every other alert write in this file — called from
+// waitUntil after the save has already landed, so a failure here must never
+// surface as a save error.
+export async function clearResolvedConflictBannerIfLast(env: Env, book: string, resource: string): Promise<void> {
+  const source = `verse_merge_conflict:${book}:${resource}`;
+  try {
+    const rs = await env.DB.prepare(SELECT_ACTIVE_ALERTABLE_CONFLICTS_SQL).bind(book, resource).all();
+    if ((rs.results?.length ?? 0) > 0) return; // other conflicts still outstanding — leave the banner for the next sync
+    // Clear by SOURCE, not just the admin's username — an undismissed editor
+    // alert from the fan-out below is named by the same source and must
+    // disappear too, same as raiseVerseMergeConflictAlert's own zero-rows branch.
+    await clearUndismissedAlertsStmt(env, source).run();
+  } catch (e) {
+    console.error("verseMergeConflicts: resolved-banner clear failed", {
+      book,
+      resource,
+      error: e instanceof Error ? e.message : String(e),
+    });
+  }
+}
+
 // Banner alert (system_alerts) naming the count, the reason breakdown, and
 // the first 10 refs, plus the plain-English recovery hint. Same shape as
 // ExportWorkflow.writeAlert (delete-undismissed-then-insert), best-effort.
