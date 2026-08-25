@@ -364,7 +364,7 @@ onOutboxResult((op, result) => {
 // all funnel through outbox.drop — the other permanent deletion (#565).
 onOutboxDiscard((op) => handleVerseExit(op, "discarded"));
 
-// ---------- DEV-only test introspection (#571) ----------
+// ---------- DEV-only test introspection (#571, extended #605) ----------
 //
 // The pin map is deliberately unexposed to application code — versePin.ts's
 // own doc comment says so, and nothing outside it and this file touches
@@ -382,11 +382,49 @@ onOutboxDiscard((op) => handleVerseExit(op, "discarded"));
 // imports this module outside a browser (nothing currently does — this file
 // is side-effecting at import, so the plain-Node draftSaveState.test.mjs
 // deliberately imports draftSaveState.ts / versePin.ts instead).
+//
+// #605 extends this SAME hook (rather than adding a second one) with
+// `currentVersion`, so s9's first check can poll for "tab A's chapter cache
+// has actually learned the post-save version over the WebSocket" instead of
+// guessing a fixed delay long enough for that WS frame to arrive. drafts.ts
+// has no access to the React chapter-cache state itself (that lives in
+// useChapter's `data`, read through Shell.tsx's `dataRef`), so Shell.tsx
+// registers a reader here (DEV only) the same way this file already owns the
+// pin map other modules don't reach into directly.
+type VerseVersionReader = (
+  book: string,
+  chapter: number,
+  verse: number,
+  bibleVersion: string,
+) => number | undefined;
+
+let verseVersionReader: VerseVersionReader | undefined;
+
+// Called once by Shell.tsx (DEV only) with a function that reads the live
+// chapter-cache version for a verse. A no-op outside DEV so a stray import in
+// a production bundle can never wire this up.
+export function registerVerseVersionReader(reader: VerseVersionReader): void {
+  if (import.meta.env.DEV) verseVersionReader = reader;
+}
+
+function currentVerseVersion(key: string): number | undefined {
+  const parts = key.split(":");
+  if (parts.length !== 5 || parts[0] !== "verse") return undefined;
+  const [, book, chapterStr, verseStr, bibleVersion] = parts;
+  const chapter = Number(chapterStr);
+  const verse = Number(verseStr);
+  if (!Number.isFinite(chapter) || !Number.isFinite(verse)) return undefined;
+  return verseVersionReader?.(book, chapter, verse, bibleVersion);
+}
+
 declare global {
   interface Window {
-    __bePinDebug?: { peek: typeof peekPinnedVerseBase };
+    __bePinDebug?: {
+      peek: typeof peekPinnedVerseBase;
+      currentVersion: typeof currentVerseVersion;
+    };
   }
 }
 if (typeof window !== "undefined" && import.meta.env.DEV) {
-  window.__bePinDebug = { peek: peekPinnedVerseBase };
+  window.__bePinDebug = { peek: peekPinnedVerseBase, currentVersion: currentVerseVersion };
 }
