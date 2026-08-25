@@ -372,6 +372,96 @@ console.log("\n[occurrence/occurrences-only drift does not manufacture a false a
   eq(r.action, "adopt", "a genuinely added word is still a real difference → adopt, not converged");
 }
 
+console.log("\n[#627: empty nextChar / empty text nodes do not manufacture false diffs]");
+
+// Presence half of the nextChar round-trip: normalizeForCompare collapses
+// `" "` / `"\n"` to `""`, but keeping that empty key still differed from an
+// absent nextChar. base:null + keep_converged is the one-bit probe that step 1
+// matched (keep_no_base would mean the trees still look different).
+{
+  const withEmpty = JSON.stringify({
+    verseObjects: [{ tag: "q1", type: "paragraph", nextChar: "" }, w("hello")],
+  });
+  const absent = JSON.stringify({
+    verseObjects: [{ tag: "q1", type: "paragraph" }, w("hello")],
+  });
+  const r = computeVerseMerge({
+    base: null,
+    ours: withEmpty,
+    theirs: absent,
+    humanEditedSinceExport: false,
+  });
+  eq(r.action, "keep_converged", "nextChar: \"\" vs absent → keep_converged");
+}
+{
+  const withSpace = JSON.stringify({
+    verseObjects: [{ tag: "q1", type: "paragraph", nextChar: " " }, w("hello")],
+  });
+  const absent = JSON.stringify({
+    verseObjects: [{ tag: "q1", type: "paragraph" }, w("hello")],
+  });
+  const r = computeVerseMerge({
+    base: null,
+    ours: withSpace,
+    theirs: absent,
+    humanEditedSinceExport: false,
+  });
+  eq(r.action, "keep_converged", "nextChar: \" \" vs absent → keep_converged");
+}
+{
+  const withNewline = JSON.stringify({
+    verseObjects: [{ tag: "q1", type: "paragraph", nextChar: "\n" }, w("hello")],
+  });
+  const absent = JSON.stringify({
+    verseObjects: [{ tag: "q1", type: "paragraph" }, w("hello")],
+  });
+  const r = computeVerseMerge({
+    base: null,
+    ours: withNewline,
+    theirs: absent,
+    humanEditedSinceExport: false,
+  });
+  eq(r.action, "keep_converged", "nextChar: \"\\n\" vs absent → keep_converged");
+}
+
+// Extra empty / whitespace-only text node shifts every following index under
+// a naive compare, but carries no content — strip for comparison only.
+{
+  const withEmptyNode = content([w("hello"), { type: "text", text: "" }, w("world")]);
+  const without = content([w("hello"), w("world")]);
+  const r = computeVerseMerge({
+    base: null,
+    ours: withEmptyNode,
+    theirs: without,
+    humanEditedSinceExport: false,
+  });
+  eq(r.action, "keep_converged", "extra empty text node → keep_converged");
+}
+{
+  const withWsNode = content([w("hello"), { type: "text", text: " \n " }, w("world")]);
+  const without = content([w("hello"), w("world")]);
+  const r = computeVerseMerge({
+    base: null,
+    ours: withWsNode,
+    theirs: without,
+    humanEditedSinceExport: false,
+  });
+  eq(r.action, "keep_converged", "extra whitespace-only text node → keep_converged");
+}
+
+// Guard against over-collapsing: a real word change must still look different.
+{
+  const ours = content([w("hello"), w("world")]);
+  const theirs = content([w("hello"), w("earth")]);
+  const r = computeVerseMerge({
+    base: null,
+    ours,
+    theirs,
+    humanEditedSinceExport: false,
+  });
+  eq(r.action, "keep_no_base", "genuinely changed word still → keep_no_base (not over-collapsed)");
+}
+
 console.log("\n[collapseWhitespaceForCompare — Task 3's lane-reopen guard input]");
 
 // bookReimport.ts's Task 3 guard (skip reopening the 'text' lane when an
