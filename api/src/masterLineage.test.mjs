@@ -79,6 +79,36 @@ eq(kind("ULT: EZK 38 [pjoakes]", BOT), "ai", "a bot push requested by a human is
 eq(kind("TQ: AMO 9 [xx..y@api.bp-assistant]", "someone-else@example.org"), "ai",
   "the bp-assistant marker alone classifies as ai");
 
+// ── the Revert-quoting-bp-assistant trap (#612) ─────────────────────────────
+// Gitea's revert button quotes the reverted commit's subject verbatim, so a
+// HUMAN reverting a bp-assistant push produces a subject that still matches
+// AI_MARKER. That must not classify the revert itself as ai — it would let
+// the very content the maintainer reverted overwrite their revert.
+eq(
+  kind('Revert "UST: JER 31 [Gr..e@api.bp-assistant]"', RICH),
+  "human",
+  "a human revert quoting a bp-assistant address is human, not ai",
+);
+// A bot-authored revert is still ai — REVERT_PREFIX only guards AI_MARKER,
+// not the BOT_EMAILS check, which runs first.
+eq(
+  kind('Revert "UST: JER 31 [Gr..e@api.bp-assistant]"', BOT),
+  "ai",
+  "a bot-authored revert is still ai (caught by the author check, not the marker)",
+);
+// Lowercase, unquoted "revert " a maintainer might type by hand is guarded too.
+eq(
+  kind("revert TQ: AMO 5 [be..s@api.bp-assistant] — bad AI push", RICH),
+  "human",
+  "a hand-typed lowercase revert quoting the marker is also human",
+);
+// A revert of something else entirely is unaffected — still human, as before.
+eq(
+  kind('Revert "bible-editor: EZK ult → master (#6711)" (#6716)', BW),
+  "human",
+  "a revert unrelated to bp-assistant is still human (unchanged by the guard)",
+);
+
 // ── human ───────────────────────────────────────────────────────────────────
 eq(kind("Adds '0' to Occurrence column (#458)", RICH), "human", "a maintainer edit is human");
 eq(kind("Cleanup of \\s1 tags", RICH), "human", "an unprefixed maintainer commit is human");
