@@ -56,6 +56,7 @@ import { Hono } from "hono";
 import type { Env } from "./index";
 import { requireAuth } from "./auth";
 import {
+  alertMessageCarriesNoBaseWarning,
   buildEditorLookupQuery,
   buildMergeConflictGuidance,
   EDITOR_LOOKUP_CHUNK,
@@ -347,6 +348,13 @@ function clearUndismissedAlertsStmt(env: Env, source: string, username?: string)
 // the parenthetical breakdown that still has other rows). A partially-stale
 // banner self-heals on the next sync; a fabricated count does not.
 //
+// keep_no_base is a second outstanding condition that lives ONLY in the
+// banner message (noBaseCount at raise time — no verse_merge_conflicts row).
+// Clearing by "zero active table rows" would erase that warning while the
+// no-ancestor verses are still at risk of being overwritten on the next
+// export. Per-username: drop conflict-only alerts; preserve any whose
+// message still carries the keep_no_base fingerprint.
+//
 // Best-effort, like every other alert write in this file — called from
 // waitUntil after the save has already landed, so a failure here must never
 // surface as a save error.
@@ -355,10 +363,23 @@ export async function clearResolvedConflictBannerIfLast(env: Env, book: string, 
   try {
     const rs = await env.DB.prepare(SELECT_ACTIVE_ALERTABLE_CONFLICTS_SQL).bind(book, resource).all();
     if ((rs.results?.length ?? 0) > 0) return; // other conflicts still outstanding — leave the banner for the next sync
-    // Clear by SOURCE, not just the admin's username — an undismissed editor
-    // alert from the fan-out below is named by the same source and must
-    // disappear too, same as raiseVerseMergeConflictAlert's own zero-rows branch.
-    await clearUndismissedAlertsStmt(env, source).run();
+    const alerts = await env.DB.prepare(
+      `SELECT username, message FROM system_alerts WHERE source = ?1 AND dismissed_at IS NULL`,
+    )
+      .bind(source)
+      .all<{ username: string; message: string }>();
+    const toClear = (alerts.results ?? []).filter((a) => !alertMessageCarriesNoBaseWarning(a.message));
+    if (toClear.length === 0) return; // nothing undismissed, or every row still carries keep_no_base
+    // Prefer one source-wide clear when every undismissed row is conflict-only
+    // (the common case). Fall back to per-username when a keep_no_base row
+    // must stay — clearUndismissedAlertsStmt already supports both shapes.
+    if (toClear.length === (alerts.results?.length ?? 0)) {
+      await clearUndismissedAlertsStmt(env, source).run();
+      return;
+    }
+    for (const a of toClear) {
+      await clearUndismissedAlertsStmt(env, source, a.username).run();
+    }
   } catch (e) {
     console.error("verseMergeConflicts: resolved-banner clear failed", {
       book,

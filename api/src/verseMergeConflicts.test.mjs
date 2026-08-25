@@ -58,8 +58,10 @@
 
 import { DatabaseSync } from "node:sqlite";
 import {
+  alertMessageCarriesNoBaseWarning,
   buildEditorLookupQuery,
   buildMergeConflictGuidance,
+  buildNoBaseSentence,
   EDITOR_LOOKUP_CHUNK,
   editLogKey,
   groupNoBaseVersesByEditor,
@@ -347,17 +349,33 @@ function verseDb() {
 // Replicates clearResolvedConflictBannerIfLast's exact decision (verses.ts's
 // PATCH route, issue #626) against real SQLite, using the ACTUAL
 // SELECT_ACTIVE_ALERTABLE_CONFLICTS_SQL text so this can't silently drift
-// from what that function really queries. The DELETE is the same literal
-// clearUndismissedAlertsStmt(env, source) issues (unexported — not worth a
-// D1 shim just to call it directly, same reasoning Part 3's saveVerse
-// helper gives for reimplementing the batch instead of faking env.DB).
+// from what that function really queries. The DELETE mirrors
+// clearUndismissedAlertsStmt — source-wide when every undismissed row is
+// conflict-only, per-username when a keep_no_base message must stay (PR #631
+// review P1).
 function clearResolvedBanner(d, book, resource) {
   const active = d.prepare(SELECT_ACTIVE_ALERTABLE_CONFLICTS_SQL).all(book, resource);
-  if (active.length > 0) return false;
-  d.prepare(`DELETE FROM system_alerts WHERE source = ? AND dismissed_at IS NULL`).run(
-    `verse_merge_conflict:${book}:${resource}`,
-  );
-  return true;
+  if (active.length > 0) return { cleared: false, preservedNoBase: false };
+  const source = `verse_merge_conflict:${book}:${resource}`;
+  const alerts = d
+    .prepare(`SELECT username, message FROM system_alerts WHERE source = ? AND dismissed_at IS NULL`)
+    .all(source);
+  const toClear = alerts.filter((a) => !alertMessageCarriesNoBaseWarning(a.message));
+  if (toClear.length === 0) {
+    // Nothing undismissed to delete (only-dismissed history, or every
+    // remaining row carries keep_no_base). The former is vacuously "cleared";
+    // the latter is an intentional preserve.
+    return { cleared: alerts.length === 0, preservedNoBase: alerts.length > 0 };
+  }
+  if (toClear.length === alerts.length) {
+    d.prepare(`DELETE FROM system_alerts WHERE source = ? AND dismissed_at IS NULL`).run(source);
+  } else {
+    const del = d.prepare(
+      `DELETE FROM system_alerts WHERE username = ? AND source = ? AND dismissed_at IS NULL`,
+    );
+    for (const a of toClear) del.run(a.username, source);
+  }
+  return { cleared: true, preservedNoBase: toClear.length < alerts.length };
 }
 
 // Runs the REAL verses.ts PATCH-route UPDATE (VERSE_PATCH_UPDATE_SQL) first
@@ -475,7 +493,7 @@ function saveVerse(d, { book, resource, chapter, verse, matchVersion, userId, no
   ).run();
 
   const cleared = clearResolvedBanner(d, "JER", "ult");
-  assert(!cleared, "two conflicts still outstanding -> banner is left alone, not cleared");
+  assert(!cleared.cleared, "two conflicts still outstanding -> banner is left alone, not cleared");
   const alert = d.prepare(`SELECT * FROM system_alerts WHERE source = 'verse_merge_conflict:JER:ult'`).get();
   assert(!!alert, "the (stale but not wrong-count) banner row still exists");
 }
@@ -499,7 +517,7 @@ function saveVerse(d, { book, resource, chapter, verse, matchVersion, userId, no
   ).run();
 
   const cleared = clearResolvedBanner(d, "JER", "ult");
-  assert(cleared, "the last active conflict just resolved -> banner is cleared");
+  assert(cleared.cleared, "the last active conflict just resolved -> banner is cleared");
   const remaining = d.prepare(`SELECT * FROM system_alerts WHERE source = 'verse_merge_conflict:JER:ult'`).all();
   assert(remaining.length === 0, "cleared by SOURCE — both the admin's row and the editor's fan-out row are gone");
 }
@@ -515,7 +533,7 @@ function saveVerse(d, { book, resource, chapter, verse, matchVersion, userId, no
   ).run();
 
   const cleared = clearResolvedBanner(d, "JER", "ult");
-  assert(cleared, "zero active conflicts -> the clear still runs");
+  assert(cleared.cleared, "zero active conflicts -> the clear still runs");
   const alert = d.prepare(`SELECT * FROM system_alerts WHERE source = 'verse_merge_conflict:JER:ult'`).get();
   assert(!!alert && alert.dismissed_at === 999, "…but a DISMISSED row is never touched — it stays as history");
 }
@@ -539,9 +557,77 @@ function saveVerse(d, { book, resource, chapter, verse, matchVersion, userId, no
   ).run();
 
   const cleared = clearResolvedBanner(d, "JER", "ult");
-  assert(cleared, "JER ult has zero active conflicts -> its own banner clears");
+  assert(cleared.cleared, "JER ult has zero active conflicts -> its own banner clears");
   const ezkAlert = d.prepare(`SELECT * FROM system_alerts WHERE source = 'verse_merge_conflict:EZK:ust'`).get();
   assert(!!ezkAlert, "EZK ust's own still-active banner is untouched by JER ult's clear");
+}
+
+{
+  // PR #631 review P1: keep_no_base warnings ride in the banner message via
+  // noBaseCount at raise time and have NO verse_merge_conflicts row. Resolving
+  // the last ordinary conflict must NOT erase an alert that still warns about
+  // unresolved no-ancestor verses.
+  const d = verseDb();
+  const adminMsg =
+    `Sync flagged 1 verse(s) in JER ULT for review (1 source_attr_ambiguous). Refs: 41:8. ` +
+    buildNoBaseSentence(2, ["42:2", "42:3"]);
+  const editorOverwrite = "Your edit at JER 41:8 was overwritten by Door43's sync...";
+  const editorNoBase = groupNoBaseVersesByEditor(
+    "JER",
+    "ult",
+    [{ chapter: 42, verse: 2, version: 5 }],
+    new Map([[editLogKey("JER", "ult", { chapter: 42, verse: 2, overwrittenVersion: 5 }), "bethoakes"]]),
+  ).get("bethoakes").message;
+
+  d.prepare(
+    `INSERT INTO system_alerts (username, severity, source, message)
+     VALUES ('deferredreward', 'warning', 'verse_merge_conflict:JER:ult', ?)`,
+  ).run(adminMsg);
+  d.prepare(
+    `INSERT INTO system_alerts (username, severity, source, message)
+     VALUES ('grant', 'warning', 'verse_merge_conflict:JER:ult', ?)`,
+  ).run(editorOverwrite);
+  d.prepare(
+    `INSERT INTO system_alerts (username, severity, source, message)
+     VALUES ('bethoakes', 'warning', 'verse_merge_conflict:JER:ult', ?)`,
+  ).run(editorNoBase);
+
+  assert(alertMessageCarriesNoBaseWarning(adminMsg), "admin mixed message carries the no-base fingerprint");
+  assert(alertMessageCarriesNoBaseWarning(editorNoBase), "editor no-base fan-out carries its fingerprint");
+  assert(!alertMessageCarriesNoBaseWarning(editorOverwrite), "overwrite-only fan-out does not");
+
+  const result = clearResolvedBanner(d, "JER", "ult");
+  assert(result.cleared && result.preservedNoBase, "cleared conflict-only rows but preserved keep_no_base carriers");
+
+  const remaining = d
+    .prepare(`SELECT username, message FROM system_alerts WHERE source = 'verse_merge_conflict:JER:ult' ORDER BY username`)
+    .all();
+  assert(remaining.length === 2, "admin + bethoakes kept; grant's overwrite-only alert dropped");
+  assert(
+    remaining.map((r) => r.username).join(",") === "bethoakes,deferredreward",
+    "preserved usernames are the keep_no_base carriers",
+  );
+  assert(
+    remaining.every((r) => alertMessageCarriesNoBaseWarning(r.message)),
+    "every surviving alert still carries the outstanding no-base condition",
+  );
+}
+
+{
+  // Pure keep_no_base banner (zero adjudicated conflicts at raise time): zero
+  // active table rows must leave it untouched — there was never a conflict row
+  // to resolve, and clearing would drop the only warning that exists.
+  const d = verseDb();
+  const msg = `Sync flagged 0 verse(s) in EZK UST for adjudicated review. ${buildNoBaseSentence(3, ["21:9"])}`;
+  d.prepare(
+    `INSERT INTO system_alerts (username, severity, source, message)
+     VALUES ('deferredreward', 'warning', 'verse_merge_conflict:EZK:ust', ?)`,
+  ).run(msg);
+
+  const result = clearResolvedBanner(d, "EZK", "ust");
+  assert(!result.cleared && result.preservedNoBase, "pure keep_no_base banner is not cleared");
+  const alert = d.prepare(`SELECT * FROM system_alerts WHERE source = 'verse_merge_conflict:EZK:ust'`).get();
+  assert(!!alert, "…the row is still there");
 }
 
 // ─────────────────────────────────────────────────────────────────────────

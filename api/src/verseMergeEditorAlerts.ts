@@ -245,6 +245,21 @@ export function buildMergeConflictGuidance(
 // RESOURCE), so this must not say "this book's edit history" — thousands of
 // other verses in the same book have perfectly good ancestors, and a
 // non-developer could read the book-wide phrasing as "the history is gone".
+// Fingerprints shared by buildNoBaseSentence (admin) and
+// groupNoBaseVersesByEditor (translator fan-out). keep_no_base writes no
+// verse_merge_conflicts row, so the banner message is the only durable
+// carrier of that warning until the next reimport — clearResolvedConflictBannerIfLast
+// must not delete an alert that still carries one just because the last
+// ordinary conflict resolved (PR #631 review P1).
+export const NO_BASE_ADMIN_FINGERPRINT = "no ancestor was recoverable";
+export const NO_BASE_EDITOR_FINGERPRINT = "no earlier version was recoverable to compare against";
+
+export function alertMessageCarriesNoBaseWarning(message: string): boolean {
+  return (
+    message.includes(NO_BASE_ADMIN_FINGERPRINT) || message.includes(NO_BASE_EDITOR_FINGERPRINT)
+  );
+}
+
 export function buildNoBaseSentence(count: number, refs?: string[]): string {
   // Never list more refs than the count claims. Unreachable today (refs are
   // pushed on the same branch that increments the count, and nothing decrements
@@ -259,7 +274,7 @@ export function buildNoBaseSentence(count: number, refs?: string[]): string {
   const more = count > listed.length ? `; +${count - listed.length} more` : "";
   const where = listed.length > 0 ? ` Verses (sample): ${listed.join(", ")}${more}.` : "";
   return (
-    `${count} verse(s) could not be adjudicated: no ancestor was recoverable for them from before this ` +
+    `${count} verse(s) could not be adjudicated: ${NO_BASE_ADMIN_FINGERPRINT} for them from before this ` +
     `book+resource's master-confirmed watermark, so the sync could not tell which side changed, and so it ` +
     `kept the app's version.${where} ` +
     `Nothing was overwritten in these — but a Door43-side change to them will still be overwritten by ` +
@@ -320,8 +335,8 @@ export function groupNoBaseVersesByEditor(
   for (const [username, refs] of byUser) {
     const message =
       `Door43's sync could not tell whether your edit or a Door43-side edit is newer, for ${refs.length} ` +
-      `verse(s) you last edited in ${book} ${resource.toUpperCase()}: ${refs.join(", ")} — no earlier version was ` +
-      `recoverable to compare against, so it kept your version for now. Nothing has been overwritten — but if ` +
+      `verse(s) you last edited in ${book} ${resource.toUpperCase()}: ${refs.join(", ")} — ${NO_BASE_EDITOR_FINGERPRINT}, ` +
+      `so it kept your version for now. Nothing has been overwritten — but if ` +
       `Door43 has changed ${refs.length === 1 ? "it" : "them"} since, tonight's export will still overwrite your ` +
       `text there unless you open and re-save the verse${refs.length === 1 ? "" : "s"} here first.`;
     out.set(username, { refs, message });
