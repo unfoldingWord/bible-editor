@@ -12,30 +12,90 @@
 // preceded it.
 //
 // Door43 knows the answer and we never asked. Gitea's commits API returns each
-// commit's message and author, and the three producers are distinguishable —
-// verified against real master history on 2026-08-19 (en_tq/tq_AMO.tsv,
-// en_tn/tn_JER.tsv, en_ult/26-EZK.usfm, en_ust/24-JER.usfm):
+// commit's message and author, and the three producers are distinguishable:
 //
 //   OURS   `bible-editor: AMO tq → master (#815)`      the squash merge, and
 //          `bible-editor export: JER ust → JER-be-Grant_Ailie (export-…)`
 //          the branch commit, which also appears in master's file history once
 //          the branch merges. Both are our own render; neither is anyone's edit.
 //   AI     `TQ: AMO 5 [be..s@api.bp-assistant]`, authored by
-//          `bot@unfoldingword.org`. bp-assistant writes the content.
+//          `bot@unfoldingword.org` AND shaped like a pipeline push (see the
+//          two-signal rule on classifyMasterCommit). bp-assistant writes the
+//          content.
 //   HUMAN  everything else — richmahn, stephenwunrow, lrsallee, justplainjane47,
 //          NateKreider, and Benjamin's own hand commits.
 //
-// THREE THINGS THE REAL DATA CHANGED, none of which were obvious up front:
+// THE MEASURED BASIS (issue #550, measured 2026-08-24). These rules used to
+// cite a single day's spot check of four files. They now rest on the FULL
+// history of the five repos: 46,802 commits across en_ult / en_ust / en_tn /
+// en_tq / en_twl, 101 distinct author emails — plus 2,727 PATH-SCOPED commits
+// across 18 files, path-scoped being the shape listMasterCommitsSince actually
+// fetches. (The first pass sampled 8,700 of those commits; a cold review
+// re-derived every count below against all 46,802 and they reproduce exactly.)
+// What it counted:
+//
+//   * `bot@unfoldingword.org` (display name always `BW Bot`) authored 817
+//     commits. 807 are `RES: BOOK CH [requester]`-shaped pipeline pushes. TEN
+//     ARE NOT — and diffing all ten against known-good bp-assistant output
+//     found SIX HAND-DIRECTED EDITS that the old author-email-only rule stamped
+//     `ai`: 22ba6f3b9e and 1503b9e4fb (align PSA superscriptions — one `\d`
+//     line replaced per chapter, English untouched), 9f6417e437 (LAM `\qa`
+//     acrostic marker normalization, 93 hunks, zero alignment work),
+//     08f0c4ffa0 (`UST LAM 3: remove duplicate verses 1-10`, +0/-140, a pure
+//     deletion), e417839d09 (restoring HAB 2:1-10 TN rows that a DEFECTIVE AI
+//     run had destroyed nine minutes earlier) and 3a2432b15b (LAM TN chapter
+//     and book intros). All ten are reachable in path-scoped history, so this
+//     was production-reachable, not theoretical — and e417839d09 is the whole
+//     failure in miniature: a repair OF AI damage, classified as AI, and
+//     therefore overwritable by the next export.
+//   * The fingerprint of REAL pipeline output: one chapter, one hunk
+//     (occasionally two), every row/verse in that chapter replaced.
+//   * bp-assistant also writes a trailer in the commit BODY —
+//     `X-AI-Pipeline: bp-assistant/{generate|notes|tqs}`, on 519 commits, 518
+//     of them bot-authored. ALL 518 also match the subject rule, so the trailer
+//     adds ZERO coverage today. It is not carrying any commit; it is insurance
+//     against the next subject-format migration (the bracket rendering has
+//     already migrated twice — see note 2), and it costs one gated regex.
+//   * OURS_PREFIX has zero false positives in 1,535 matches.
+//   * THE SAFETY PROPERTY, measured rather than argued: replaying the old rule
+//     against the new one over all 46,802 commits flips exactly TEN commits,
+//     every one of them `ai` -> `human`, every one bot-authored. Zero commits
+//     flip toward `ai` or `ours`; no non-bot commit changes at all.
+//
+// FOUR THINGS THE REAL DATA CHANGED, none of which were obvious up front:
 //
 // 1. `Revert "bible-editor: EZK ult → master (#6711)" (#6716)` is a REAL commit
-//    on en_ult, authored by a human. A substring test for "bible-editor:" calls
-//    it ours and silently drops a deliberate human revert out of the lineage —
-//    so the prefix is anchored at the start of the message.
-// 2. The bot also pushes on a human's behalf: `ULT: EZK 38 [pjoakes]` carries
-//    the bot author but a plain username in the bracket. The content is still
-//    machine-written, so the AUTHOR is the signal, not the bracket.
+//    on en_ult, authored by a human — and it is not a one-off. The corpus holds
+//    20 human-authored reverts, 12 of them `Revert "bible-editor: …"`, TEN of
+//    those on 2026-08-14 alone (af608ef1dc ult EZK, 0644698241 tn ISA,
+//    b508aba798 tn AMO, ecfa7fd93b tn EZK, 5b068498e2 ust EZK, 2a07686d16 ust
+//    NUM, 1c41821993 ult NUM, e391110c81 twl 1CH, 757bab7e44 twl ISA), plus
+//    three `Reverts BE changes` by rich.mahn on 2026-08-17. A substring test
+//    for "bible-editor:" calls every one of them ours and silently drops a
+//    whole revert CAMPAIGN out of the lineage — so the prefix is anchored at
+//    the start of the message. The anchor is structural, not incidental.
+// 2. DECISION — the question issue #550 asked to record: A BOT PUSH CARRYING A
+//    HUMAN'S NAME IN THE BRACKET STAYS `ai`. `ULT: EZK 38 [pjoakes]` is
+//    bot-authored with a plain username where later commits carry
+//    `x@api.bp-assistant`. The reason is evidentiary, not taste: the bracket is
+//    a REQUESTER field, and its RENDERING migrated — plain username (Mar–May
+//    2026) → truncated email → `x@api.bp-assistant` (Jun–Aug) — with the same
+//    people appearing in both forms. Reading the plain form as human would
+//    classify identical pipeline runs by their message-formatting ERA rather
+//    than by their producer. And c70e1f1a84 (`ULT: EZK 38 [pjoakes]`,
+//    2026-08-13) carries `X-AI-Pipeline: bp-assistant/generate` in its body —
+//    the bot's own declaration that the content is machine-written.
+//    RESIDUAL: what genuinely needed protecting was never the bracket, it was
+//    the bot pushing a HAND-AUTHORED REPAIR with no trailer and no pipeline
+//    grammar — the six commits above. That is exactly what the tightened `ai`
+//    rule now catches.
 // 3. `login` is null on plenty of commits, human ones included
 //    (`richmahn@users.noreply.github.com` with no login). Never key on it.
+// 4. AI_MARKER is INERT in the history this module actually sees. It fires 339×
+//    repo-wide and ZERO times path-scoped: all 339 are `Merge pull request …`
+//    commits, and Gitea's path-scoped history simplification drops merge
+//    commits. Keep it as a cheap net for a future bot pushing under a different
+//    author — but do not credit it with doing work today.
 //
 // FAIL-SAFE DIRECTION, and it is the whole safety argument for this module.
 // Downstream, `ai` and `ours` are what let a conflict resolve D1-wins; `human`
@@ -54,12 +114,15 @@
 
 export type MasterCommitAuthorKind =
   | "ours" // our own export: the squash merge, or the -be- branch commit
-  | "ai" // bp-assistant / any bot-authored push
+  | "ai" // a bp-assistant PIPELINE push — bot author AND pipeline shape
   | "human"; // a maintainer's own edit — and the fail-safe default
 
 export interface MasterCommit {
   sha: string;
-  /** Full commit message; only the first line is classified. */
+  /**
+   * Full commit message. The first line decides `ours`; the BODY is read too,
+   * for bp-assistant's `X-AI-Pipeline:` trailer (see classifyMasterCommit).
+   */
   message: string | null;
   /** commit.author.email from Gitea. Null when absent. */
   authorEmail: string | null;
@@ -83,13 +146,74 @@ export interface ClassifiedCommit extends MasterCommit {
 const OURS_PREFIX = /^bible-editor(?: export)?:\s/;
 
 // bp-assistant's own marker. Kept as a second, independent route to `ai` so a
-// future bot that pushes under a different author is still recognized.
+// future bot that pushes under a different author is still recognized — but see
+// note 4: it is inert in path-scoped history, which is the only history we see.
 const AI_MARKER = /@api\.bp-assistant\b/;
 
-// The bot account that authors every bp-assistant push. This is the PRIMARY ai
-// signal: it catches `ULT: EZK 38 [pjoakes]` (bot-authored, human-requested),
-// whose content is still machine-written (see note 2 above).
+// The bot account that authors every bp-assistant push. Necessary for `ai`, and
+// (since #550) no longer sufficient on its own — see classifyMasterCommit.
+//
+// DO NOT ADD `ai@unfoldingword.org` OR `53472+bookpackagebot@…` HERE. They were
+// measured: three and zero path-scoped commits respectively. The `human`
+// fail-safe already handles both correctly, and widening the bot set is the one
+// direction that can only cost us — every address added is another way for a
+// hand edit to be stamped machine-written.
 const BOT_EMAILS = new Set(["bot@unfoldingword.org"]);
+
+// The whole-subject shape of a real bp-assistant pipeline push. Validated
+// against the corpus: it matches 807 of the bot's 817 commits, and the ten it
+// does not match are exactly the outlier set from THE MEASURED BASIS above (six
+// of them hand-directed edits).
+//
+// Three details are load-bearing EXCLUSIONS, each measured rather than taste:
+//   * the required CHAPTER DIGITS and the required BRACKET — either alone
+//     excludes `TN: LAM chapter and book introductions` (3a2432b15b), a
+//     hand-directed book-wide intro pass. Relax BOTH — i.e. fall back to a
+//     loose `^(ULT|UST|TN|TQ):\s` prefix test — and that commit is stamped
+//     `ai` again. masterLineage.test.mjs pins it, and the ablation in that
+//     file's header records which relaxation breaks which assertion.
+//   * the END ANCHOR, which is what makes this a whole-subject match rather
+//     than a prefix: a subject that begins with the pipeline grammar and then
+//     says something else is, by that fact, not a plain pipeline push. It costs
+//     nothing (all 807 still match) and fails in the protective direction.
+// The other five hand-directed subjects never reach any of that — none of them
+// opens with `RES:` at all (`UST LAM 3: …` and `fix: restore HAB …` are the
+// near misses), so the anchored prefix alone excludes them.
+//
+// AND THREE DELIBERATE NARROWINGS, which matter just as much, because every
+// unmeasured thing this pattern ACCEPTS is a way to stamp a hand edit `ai`:
+//   * NO `TWL:` in the alternation. Zero `TWL:` subjects exist in all 46,802
+//     commits; the observed prefixes are ULT, UST, TN, TQ only.
+//   * NO verse or verse-range after the chapter. `(?::\d+(?:-\d+)?)?` matched
+//     0 of the bot's 817 commits and 0 repo-wide — and it would have accepted
+//     `TN: HAB 2:1-10 [benjamin]`, which is the exact shape of this change's
+//     own motivating commit (e417839d09, a hand repair of AI damage).
+//   * BOOK CODE is `[1-3][A-Z]{2}` or `[A-Z]{3}`, not `[1-3]?[A-Z]{2,3}`, which
+//     also accepted `AB` and `1ABC`.
+// If bp-assistant ever starts emitting a TWL push, a verse-ranged target, or
+// some other code shape, those commits classify `human` — which only preserves
+// master. RE-ADD ON MEASUREMENT, not on expectation: widen this only with the
+// commits in hand, the way the rest of this comment was earned.
+//
+// DELIBERATELY NOT ACCEPTED either: the older `AI (ULT|UST|TN|TQ) for {BOOK}
+// {CH}` vocabulary. It would keep four stale commits as `ai`, but nothing has
+// used it since 2026-04-01, it appears under three non-bot identities, and one
+// commit it would readmit is the defective run whose damage e417839d09 had to
+// repair.
+const AI_PIPELINE_SUBJECT =
+  /^(ULT|UST|TN|TQ):\s+(?:[1-3][A-Z]{2}|[A-Z]{3})\s+\d+\s*\[[^\]]*\]\s*$/;
+
+// bp-assistant's trailer, written into the commit BODY. An alternative SHAPE
+// signal — never a standalone rule, always gated on the bot author email. It
+// currently classifies NOTHING on its own (all 518 bot trailer commits also
+// match the subject rule); it exists so the next subject-format migration does
+// not silently reclassify real pipeline output. `[ \t]*`, not `\s*`, so the
+// separator cannot span a newline and match `X-AI-Pipeline:\nbp-assistant/…`.
+// Why the gate: 56fc2ec924 (2026-06-04, Stephen Wunrow) is a HUMAN
+// `revert 682f8938… (#7036)` whose body quotes the reverted commit's subject
+// AND its trailer. A trailer-only rule calls that human revert `ai` — the same
+// species of trap as `Revert "bible-editor: …"` in note 1.
+const AI_PIPELINE_TRAILER = /^X-AI-Pipeline:[ \t]*bp-assistant\//m;
 
 function firstLine(message: string | null): string {
   if (!message) return "";
@@ -99,6 +223,9 @@ function firstLine(message: string | null): string {
 
 export function classifyMasterCommit(commit: MasterCommit): ClassifiedCommit {
   const subject = firstLine(commit.message);
+  // The FULL message, body included — the trailer test below reads the body,
+  // which firstLine() throws away.
+  const message = commit.message ?? "";
   const email = (commit.authorEmail ?? "").trim().toLowerCase();
 
   // `ours` is checked FIRST. Our own export commits are authored under the
@@ -108,8 +235,26 @@ export function classifyMasterCommit(commit: MasterCommit): ClassifiedCommit {
   if (OURS_PREFIX.test(subject)) {
     return { ...commit, kind: "ours", reason: "bible_editor_export_message" };
   }
+  // `ai` requires BOTH signals (issue #550): the bot account AND a commit that
+  // looks like a pipeline push. The author email alone used to be enough, and
+  // that stamped six hand-directed bot commits `ai` — including a repair of AI
+  // damage. Dropping one of them back to `human` costs nothing but today's
+  // master-wins behavior; the reverse costs a maintainer's edit.
   if (email && BOT_EMAILS.has(email)) {
-    return { ...commit, kind: "ai", reason: "bot_author_email" };
+    if (AI_PIPELINE_SUBJECT.test(subject)) {
+      return { ...commit, kind: "ai", reason: "bot_author_pipeline_subject" };
+    }
+    if (AI_PIPELINE_TRAILER.test(message)) {
+      return { ...commit, kind: "ai", reason: "bot_author_pipeline_trailer" };
+    }
+    // A bot commit that is neither is a HAND-DIRECTED bot push — the six
+    // commits in THE MEASURED BASIS. It returns here rather than falling
+    // through to AI_MARKER: we have already established this is the known bot
+    // and the commit does not look like a pipeline push, and AI_MARKER exists
+    // for the opposite case (an UNKNOWN author with the marker). Letting it
+    // fall through would let a subject that merely MENTIONS a bp-assistant
+    // address undo the decision we just made.
+    return { ...commit, kind: "human", reason: "bot_author_no_pipeline_shape" };
   }
   if (AI_MARKER.test(subject)) {
     return { ...commit, kind: "ai", reason: "bp_assistant_marker" };
