@@ -32,6 +32,14 @@ interface Props {
   onDismiss: (id: number) => void;
 }
 
+// Absolute stamp for the row tooltip. `timeZoneName` is deliberately included:
+// the nightly sync fires at 05:30 UTC and every other artifact a reader would
+// cross-reference (wrangler tail, workflow logs, Door43 commits) is UTC too, so
+// a bare local time silently forces them to guess an offset.
+function absoluteStamp(unixSeconds: number): string {
+  return new Date(unixSeconds * 1000).toLocaleString(undefined, { timeZoneName: "short" });
+}
+
 export function SyncWarningsIndicator({ alerts, onDismiss }: Props) {
   const anchorRef = useRef<HTMLButtonElement | null>(null);
   const [open, setOpen] = useState(false);
@@ -92,25 +100,39 @@ export function SyncWarningsIndicator({ alerts, onDismiss }: Props) {
             </Typography>
             {/* Every warning carries its own date. These messages describe what a
                 nightly run decided, and an undated one is unreadable: a warning
-                raised last night and one that has sat unresolved for a week look
-                identical, so there is no way to tell a new problem from a stale
-                one. Same idiom (and same helper) as NotificationsMenu's comment
-                rows, with the exact stamp on hover.
-                CAVEAT: this is system_alerts.created_at, i.e. when this exact
-                WORDING first appeared — verseMergeConflicts.ts rewrites the row
-                (delete+insert) whenever the verse list changes, so adding or
-                resolving one verse resets it for the whole book+resource. The
-                per-verse "first flagged" date that is deliberately never reset is
-                verse_merge_conflicts.detected_at, which GET
-                /api/verse-merge-conflicts/:book does not yet select. */}
-            <Typography
-              variant="caption"
-              color="text.secondary"
-              title={new Date(a.createdAt * 1000).toLocaleString()}
-              sx={{ display: "block", mt: 0.25 }}
-            >
-              flagged {relativeTime(a.createdAt)}
-            </Typography>
+                raised last night and one that has sat unresolved for eleven days
+                look identical, so there is no way to tell a new problem from a
+                stale one.
+                "last reported", NOT "flagged": this is system_alerts.created_at,
+                which is when the CURRENT message was written — never when the
+                problem was first seen. Every writer REPLACES its row instead of
+                updating it: postExport.ts's recordFailureAlert deletes and
+                reinserts on every consecutive failure (so a ten-night-old
+                validator failure always stamps as last night), and
+                verseMergeEditorAlerts.ts's planSystemAlertWrites rewrites
+                whenever the wording changes (so resolving one verse out of twelve
+                resets the stamp for the whole book+resource). A caption reading
+                "flagged" would assert a freshness this column cannot support —
+                worse than no date, because it is confidently wrong.
+                The durable per-verse first-seen date is
+                verse_merge_conflicts.detected_at, deliberately never reset, which
+                no endpoint selects for display yet — issue #624.
+                Tooltip + <time dateTime>, not a bare `title`: `title` on static
+                text is unreachable by keyboard and touch and is announced
+                inconsistently by screen readers, and the absolute stamp is
+                precisely what a reader needs in order to line an alert up against
+                a UTC cron run. */}
+            <Tooltip title={absoluteStamp(a.createdAt)}>
+              <Typography
+                variant="caption"
+                color="text.secondary"
+                component="time"
+                dateTime={new Date(a.createdAt * 1000).toISOString()}
+                sx={{ display: "block", mt: 0.25, width: "fit-content" }}
+              >
+                last reported {relativeTime(a.createdAt)}
+              </Typography>
+            </Tooltip>
             <Box sx={{ display: "flex", alignItems: "center", gap: 1, mt: 0.75 }}>
               {a.linkUrl &&
                 (a.linkUrl.startsWith("/#/") ? (
