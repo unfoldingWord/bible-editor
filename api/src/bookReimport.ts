@@ -599,6 +599,27 @@ export const sweepObsoleteTombstonesForTest = (
   rawTsv: string,
   verifiedComplete: boolean,
 ): Promise<{ swept: number }> => sweepObsoleteTombstones(env, book, kind, rawTsv, verifiedComplete);
+// Issue #604: lets the test drive the REAL hasDueTombstones predicate (a
+// cheap `LIMIT 1` existence check, not the sweep itself) against the real
+// SQL — same rationale as the alias above.
+export const hasDueTombstonesForTest = (
+  env: Env,
+  book: string,
+  kind: TsvKind,
+): Promise<boolean> => hasDueTombstones(env, book, kind);
+// Issue #604: lets the test drive the REAL runTombstoneSweep — the exact
+// step-do'd body runChunkedReimport calls from both the changed-empty
+// early-out and the normal flow — against the real sqlite schema with a fake
+// WorkflowStep and a Map-backed fake env.BLOBS, without mocking any Door43
+// fetch. This proves "given entries staged only for the sweep (simulating a
+// SHA-matched-but-due resource), the sweep still runs and clears the
+// tombstone" end to end.
+export const runTombstoneSweepForTest = (
+  env: Env,
+  step: WorkflowStep,
+  book: string,
+  candidates: StagedResource[],
+): Promise<void> => runTombstoneSweep(env, step, book, candidates);
 // The completeness gate softDeleteRemovedTsvRows' coverage fix relies on its
 // callers already having run — exposed so the control test can prove the gate
 // itself still catches a truncated fetch (the safety invariant the coverage
@@ -5541,6 +5562,65 @@ async function sweepObsoleteTombstones(
   return { swept };
 }
 
+// Issue #604: sweepObsoleteTombstones above is only ever reached for an entry
+// in runChunkedReimport's `changed`/`sweepCandidates` list — but on the most
+// common night (every requested resource is SHA-unchanged or recognized as
+// our own publish), NOTHING is `changed`, and the function used to return
+// before the sweep loop entirely. Worse, even a run that DID reach the sweep
+// loop only iterated `changed`, so a resource that was SHA-skipped never got
+// its tombstones checked, indefinitely — the sweep was starved exactly on the
+// nights it would otherwise run. This is a cheap `LIMIT 1` existence check
+// planAndStageBookResources uses to decide, ONLY for a SHA-unchanged or
+// own-publish TSV resource, whether it's worth paying for a fresh fetch (SHA-
+// match branch) or staging bytes already in hand (own-publish branch) purely
+// so the sweep below can run against them. No network I/O — this never talks
+// to DCS, so it costs nothing on the (overwhelmingly common) night no
+// tombstone is due.
+async function hasDueTombstones(env: Env, book: string, kind: TsvKind): Promise<boolean> {
+  const cutoff = Math.floor(Date.now() / 1000) - TOMBSTONE_SWEEP_GRACE_SECONDS;
+  const row = await env.DB.prepare(
+    `SELECT 1 AS x FROM ${kind}_rows WHERE book = ?1 AND deleted_at IS NOT NULL AND deleted_at < ?2 LIMIT 1`,
+  )
+    .bind(book, cutoff)
+    .first<{ x: number }>();
+  return row != null;
+}
+
+// Issue #604: the sweep step-do body itself, extracted to a top-level
+// function (rather than left as a closure inside runChunkedReimport) so both
+// of that function's call sites — the changed-empty early-out and the normal
+// flow further down — run the exact same steps, and so a *ForTest wrapper can
+// drive it directly with a fake WorkflowStep + real sqlite, the same pattern
+// as sweepObsoleteTombstonesForTest above. `candidates` is expected to
+// already be filtered to entries with a non-null r2Key (the `!r2Key`
+// continue below is defense in depth, not the primary filter — see
+// runChunkedReimport's `sweepCandidates`).
+async function runTombstoneSweep(
+  env: Env,
+  step: WorkflowStep,
+  book: string,
+  candidates: StagedResource[],
+): Promise<void> {
+  for (const e of candidates) {
+    const kind = e.resource as TsvKind;
+    const r2Key = e.r2Key;
+    if (!r2Key) continue;
+    const verifiedComplete = e.verifiedComplete;
+    const res = await step.do(`reimport-tombsweep-${book}-${kind}`, async () => {
+      const raw = await readStaged(env, r2Key);
+      if (raw == null) return { swept: 0 };
+      return sweepObsoleteTombstones(env, book, kind, raw, verifiedComplete);
+    });
+    if (res.swept > 0) {
+      console.log("reimport swept obsolete tombstones (id absent from master entirely)", {
+        book,
+        resource: kind,
+        swept: res.swept,
+      });
+    }
+  }
+}
+
 // SHA-gate each requested resource and stage the changed ones to R2. Returns
 // the book's chapter extent + a manifest the chunk steps read from.
 async function planAndStageBookResources(
@@ -5561,10 +5641,44 @@ async function planAndStageBookResources(
     const file = dcsResourceFile(book, resource);
     if (!file) { entries.push({ resource, changed: false, masterSha: null, r2Key: null, verifiedComplete: false }); continue; }
 
+    // Hoisted above the SHA-match check below (issue #604) so both the
+    // SHA-match and own-publish `changed: false` branches can decide whether
+    // it's worth staging a file purely for the tombstone sweep. Was
+    // previously computed just below, right where the actual fetch happens.
+    const isTsv = resource === "tn" || resource === "tq" || resource === "twl";
+
     const masterSha = await fileCommitSha(env, file.repo, file.path);
     const sync = await resourceSyncState(env, book, resource);
     // Skip ONLY on a positive SHA match (fail-open: null/unknown → reimport).
     if (masterSha && sync.sourceSha && masterSha === sync.sourceSha) {
+      // Issue #604: a SHA-unchanged TSV resource is otherwise permanently
+      // invisible to the tombstone sweep — runChunkedReimport only ever looks
+      // at staged entries, and this resource has nothing staged. Pay for a
+      // fresh fetch here ONLY when a tombstone is actually due for this
+      // (book, kind); tombstones are rare and this predicate is a single
+      // cheap `LIMIT 1` D1 read (same query shape sweepObsoleteTombstones
+      // itself already runs, just capped to one row), so the overwhelmingly
+      // common night (nothing due) costs one D1 read and no new fetch to
+      // Door43 — the SHA-skip
+      // gate's whole point (avoiding a fetch-and-diff every night) still
+      // holds for every pair with nothing due.
+      if (isTsv && (await hasDueTombstones(env, book, resource as TsvKind))) {
+        const fetched = await fetchTsvMasterVerified(env, file.repo, file.path, masterSha ?? undefined);
+        if (fetched.raw != null) {
+          const r2Key = `reimport-stage/${instanceId}/${book}/${resource}`;
+          await env.BLOBS.put(r2Key, fetched.raw);
+          entries.push({
+            resource,
+            changed: false,
+            masterSha,
+            r2Key,
+            verifiedComplete: fetched.verifiedComplete,
+          });
+          continue;
+        }
+        // fetched.raw == null (DCS 404/error): nothing to sweep against
+        // tonight, fall through to the ordinary SHA-match skip below.
+      }
       entries.push({ resource, changed: false, masterSha, r2Key: null, verifiedComplete: false });
       continue;
     }
@@ -5580,8 +5694,8 @@ async function planAndStageBookResources(
     // fetch. See fetchTsvMasterVerified's third-P1-follow-up comment and
     // dcsRawUrl in dcsSources.ts. `masterSha` can be null (fileCommitSha
     // failed transiently); both calls fall back to their unpinned defaults in
-    // that case, same as before this fix.
-    const isTsv = resource === "tn" || resource === "tq" || resource === "twl";
+    // that case, same as before this fix. (`isTsv` itself is hoisted above
+    // the SHA-match check above — issue #604.)
     let raw: string | null;
     let verifiedComplete = false;
     if (isTsv) {
@@ -5635,7 +5749,28 @@ async function planAndStageBookResources(
       // markOwnPublishConverged's contract. The resource is skipped either way
       // (master holds our own render, so there is nothing to import), but a run
       // must not report a watermark advance it did not get.
-      entries.push({ resource, changed: false, masterSha, r2Key: null, ownPublish: stamped, verifiedComplete: false });
+      //
+      // Issue #604: same tombstone-starvation concern as the SHA-match branch
+      // above, but cheaper — `raw` and `verifiedComplete` are already in scope
+      // from the TSV fetch a few lines up (own-publish recognition needed
+      // master's bytes to compare against), so staging them for the sweep
+      // costs no new fetch at all, just an R2 put gated on a tombstone
+      // actually being due.
+      let sweepR2Key: string | null = null;
+      let sweepVerifiedComplete = false;
+      if (isTsv && (await hasDueTombstones(env, book, resource as TsvKind))) {
+        sweepR2Key = `reimport-stage/${instanceId}/${book}/${resource}`;
+        await env.BLOBS.put(sweepR2Key, raw);
+        sweepVerifiedComplete = verifiedComplete;
+      }
+      entries.push({
+        resource,
+        changed: false,
+        masterSha,
+        r2Key: sweepR2Key,
+        ownPublish: stamped,
+        verifiedComplete: sweepVerifiedComplete,
+      });
       continue;
     }
     if (own.reason === "content_differs") {
@@ -5883,7 +6018,52 @@ export async function runChunkedReimport(
   }
 
   const changed = plan.entries.filter((e) => e.changed);
-  if (plan.maxChapter < 1 || changed.length === 0) {
+  // Issue #604: every `changed:true` entry always carries an `r2Key` (see
+  // planAndStageBookResources), so this is a strict superset of `changed`
+  // restricted to the TSV kinds the sweep applies to — it also picks up the
+  // SHA-match/own-publish `changed:false` entries that planAndStageBookResources
+  // staged purely because a tombstone was due (`hasDueTombstones`). ult/ust
+  // excluded: the sweep has never applied to them (verses aren't row-pruned
+  // by chapter absence, so there's nothing for them to sweep).
+  const sweepCandidates = plan.entries.filter(
+    (e) => e.resource !== "ult" && e.resource !== "ust" && e.r2Key != null,
+  );
+
+  if (plan.maxChapter < 1) {
+    const totals = zeroCounts();
+    for (const r of ALL_RESOURCES) addCounts(totals, perResource[r]);
+    return { book, perResource, totals };
+  }
+
+  if (changed.length === 0) {
+    // Issue #604: this is the common shape the bug report is about — every
+    // requested resource was SHA-unchanged or recognized as our own publish,
+    // so there is genuinely nothing to reimport (chunk-apply / mergealert /
+    // prune / twlorder / sync-watermark all require `changed` and correctly
+    // stay skipped). But `sweepCandidates` can be non-empty here: a resource
+    // whose file was staged ONLY because hasDueTombstones was true still
+    // needs its sweep to run, or the tombstone is starved again tonight.
+    if (sweepCandidates.length > 0) {
+      await runTombstoneSweep(env, step, book, sweepCandidates);
+      // Same best-effort R2 cleanup as the normal-flow cleanup step below —
+      // these entries were staged in planAndStageBookResources purely for
+      // this sweep and would otherwise never be deleted (the normal cleanup
+      // step is skipped along with everything else on this path).
+      await step.do(`reimport-cleanup-${book}`, async () => {
+        let cleaned = 0;
+        for (const e of sweepCandidates) {
+          if (e.r2Key) {
+            try {
+              await env.BLOBS.delete(e.r2Key);
+              cleaned++;
+            } catch {
+              /* best-effort */
+            }
+          }
+        }
+        return { cleaned };
+      });
+    }
     const totals = zeroCounts();
     for (const r of ALL_RESOURCES) addCounts(totals, perResource[r]);
     return { book, perResource, totals };
@@ -5964,24 +6144,14 @@ export async function runChunkedReimport(
   // chapter can still hold a tombstone worth sweeping even when nothing in it
   // changed tonight — the file only needs to have been re-fetched this run to
   // prove the id's absence, which `e.r2Key` already tells us it was.
-  for (const e of changed) {
-    const kind = e.resource;
-    if (kind === "ult" || kind === "ust" || !e.r2Key) continue;
-    const r2Key = e.r2Key;
-    const verifiedComplete = e.verifiedComplete;
-    const res = await step.do(`reimport-tombsweep-${book}-${kind}`, async () => {
-      const raw = await readStaged(env, r2Key);
-      if (raw == null) return { swept: 0 };
-      return sweepObsoleteTombstones(env, book, kind, raw, verifiedComplete);
-    });
-    if (res.swept > 0) {
-      console.log("reimport swept obsolete tombstones (id absent from master entirely)", {
-        book,
-        resource: kind,
-        swept: res.swept,
-      });
-    }
-  }
+  //
+  // Issue #604: iterates `sweepCandidates`, not `changed` — a resource that
+  // was SHA-matched or own-publish-recognized (so `changed:false`) can still
+  // be in `sweepCandidates` when planAndStageBookResources staged it purely
+  // because a tombstone was due. Every `changed:true` TSV entry is trivially
+  // included too (`r2Key` is always set when `changed:true`), so this is a
+  // strict superset of the old iteration, not a narrower one.
+  await runTombstoneSweep(env, step, book, sweepCandidates);
 
   // Canonical TWL order: recompute the ULT-position ordering for the book now
   // that this run's ULT + twl changes are applied. The export step canonicalizes
@@ -6139,10 +6309,16 @@ export async function runChunkedReimport(
     return { recorded, withheld };
   });
 
-  // Best-effort cleanup of staged R2 objects.
+  // Best-effort cleanup of staged R2 objects. Issue #604: iterates
+  // `plan.entries` directly (not `changed`) so a `changed:false`
+  // sweep-only entry's staged file — which `sweepCandidates` picked up above
+  // but which the `changed`-filtered loops in this function never touch — is
+  // still deleted rather than leaked in R2 forever. Every `changed:true`
+  // entry is included too (`r2Key` is always set when `changed:true`), so
+  // this cleans up strictly more than before, never less.
   await step.do(`reimport-cleanup-${book}`, async () => {
     let cleaned = 0;
-    for (const e of changed) {
+    for (const e of plan.entries) {
       if (e.r2Key) { try { await env.BLOBS.delete(e.r2Key); cleaned++; } catch { /* best-effort */ } }
     }
     return { cleaned };

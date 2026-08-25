@@ -40,6 +40,7 @@ const SQLITE_FILES = new Set([
   "src/aiRowDiffGate.test.mjs",
   "src/masterLineagePersist.test.mjs",
   "src/rowRestoreNoop.test.mjs",
+  "src/bookLock.test.mjs",
 ]);
 
 const EXTRA_IMPORTS = new Map([

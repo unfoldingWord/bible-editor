@@ -7,7 +7,7 @@
 // unlock, not the same as "no row."
 
 import type { Env } from "./index";
-import { isPublishedBook, PUBLISHED_RELEASE_TAG } from "./publishedGuard.ts";
+import { autoMergeConfirmationRequired, isPublishedBook, PUBLISHED_RELEASE_TAG } from "./publishedGuard.ts";
 
 export interface BookLock {
   book: string;
@@ -32,6 +32,35 @@ export async function effectiveBookLock(env: Env, book: string): Promise<BookLoc
     return { book: upper, reason: `published in ${PUBLISHED_RELEASE_TAG}`, source: "published" };
   }
   return null;
+}
+
+// Shape of the confirmation-required response when an allowLocked:true export
+// against a locked/published book carries neither branchName nor an explicit
+// allowAutoMerge acknowledgement — see publishedGuard.ts's
+// autoMergeConfirmationRequired for why this matters (a branchless export
+// lands on a `-be-` branch DCS auto-merges unattended).
+export interface AutoMergeConfirmationRequired {
+  book: string;
+  reason: string | null;
+}
+
+// The single choke point every route that can create an allowLocked:true
+// export Workflow must call before EXPORT_WORKFLOW.create — issue #602:
+// POST /exports/run consulted publishedGuard.ts's autoMergeConfirmationRequired
+// inline, but POST /books/:book/lock/push created the same kind of branchless
+// locked-book export without ever calling it, because the policy lived at one
+// call site instead of here. Resolves the lock itself (D1), so callers no
+// longer duplicate that lookup only to re-derive the same verdict.
+export async function requireAutoMergeConfirmation(
+  env: Env,
+  book: string,
+  params: { allowLocked?: boolean; branchName?: string; allowAutoMerge?: boolean },
+): Promise<AutoMergeConfirmationRequired | null> {
+  if (params.allowLocked !== true) return null;
+  const lock = await effectiveBookLock(env, book);
+  if (!lock) return null;
+  if (!autoMergeConfirmationRequired(params, true)) return null;
+  return { book: lock.book, reason: lock.reason };
 }
 
 // Shape of the response body when a write is rejected because the book is
