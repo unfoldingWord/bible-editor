@@ -1093,6 +1093,166 @@ console.log("\n[keep_no_base tn/tq/twl row: review_kind flag set once, guarded a
   eq(after2.review_kind, "merge_no_base", "the flag is still set");
 }
 
+// ── Issue #539: the dsj8 apostrophe row cycled through a simulated nightly ──
+//
+// THE MECHANISM. The export renders a tn Note through normalizeNoteText, whose
+// educateQuotes curls every straight apostrophe — so master permanently holds
+// "prophet’s" for a D1 note that says "prophet's". The three-way merge's
+// ancestor is folded from raw edit_log payloads, which keep it straight. Read
+// naively, that says "Door43 changed this note" on every run forever: master
+// wins, the note is rewritten, the version climbs, and the translator's next
+// fix restarts the cycle (AMO tn 3:10, id dsj8, v5→v8 in three days).
+//
+// WHICH LAYER HOLDS IT, stated plainly because it decides what this test is
+// worth. The write-suppression guard added for #539 is NOT what makes this
+// pass: computeTsvMerge's compare lens (tsvMerge.ts, EXPORT_NORMALIZED_FIELDS,
+// PR #541) already runs normalizeNoteText over BOTH sides for note/question/
+// response, so the two sides converge at the ATTRIBUTION step and no field is
+// ever adopted. The #539 write guard is a backstop one layer later. This test
+// is therefore a characterization of the whole path — it fails if either layer
+// regresses — and its value is that it drives the REAL applyTsvRows end to
+// end, which no unit test of either layer does.
+//
+// It is deliberately not vacuous: skipped_noop is asserted to be 0, proving
+// the row really did reach the merge with differing RAW bytes rather than
+// being waved through by the cheap signature comparison upstream.
+console.log("\n[a dsj8-style apostrophe row survives a simulated nightly with no version change (issue #539)]");
+{
+  const TN_ID = "dsj8";
+  const STRAIGHT = "The prophet's message to the exiles.";
+  const CURLED = "The prophet’s message to the exiles.";
+
+  const seed = (sqlite) => {
+    sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (7, 7007, 'translator')`).run();
+    sqlite
+      .prepare(
+        `INSERT INTO tn_rows (id, book, chapter, verse, ref_raw, note, sort_order, updated_by, version)
+         VALUES (?, ?, 3, 10, '3:10', ?, 10, 7, 5)`,
+      )
+      .run(TN_ID, BOOK, STRAIGHT);
+    // The ancestor the fold reconstructs: the human's own edit, straight
+    // apostrophe, logged before the watermark boundary.
+    const e = sqlite
+      .prepare(
+        `INSERT INTO edit_log (kind, row_key, book, action, payload_json, created_at)
+         VALUES ('tn', ?, ?, 'update', ?, 100)`,
+      )
+      .run(TN_ID, BOOK, JSON.stringify({ note: STRAIGHT }));
+    return Number(e.lastInsertRowid);
+  };
+  // Master as the export left it: identical except for the curled apostrophe.
+  const masterTn = (note) => ({
+    id: TN_ID,
+    idCoerced: false,
+    refRaw: "3:10",
+    chapter: 3,
+    verse: 10,
+    occurrence: null,
+    tags: null,
+    support_reference: null,
+    quote: null,
+    note,
+  });
+
+  {
+    const { sqlite, env } = freshEnv();
+    const boundary = seed(sqlite);
+    const opts = { confirmedAt: 200, editId: boundary };
+
+    const first = await applyTsvRows(env, BOOK, "tn", [masterTn(CURLED)], null, opts);
+    eq(first.skipped_noop, 0, "the row DID reach the merge — its raw bytes differ from master's");
+    eq(first.merge_adopted, 0, "…and master's curled apostrophe is not adopted over D1's straight one");
+    eq(first.merged_fields, 0, "…nor pulled in by the ancestor-free field merge");
+    eq(first.apply_incomplete, false, "…and the resource watermark is not withheld");
+    eq(
+      sqlite.prepare(`SELECT version, note FROM tn_rows WHERE id = ?`).all(TN_ID)[0],
+      { version: 5, note: STRAIGHT },
+      "night 1: no version change and the note is untouched",
+    );
+
+    // A second identical night, because the reported failure was that this
+    // repeated every night rather than settling after one.
+    const second = await applyTsvRows(env, BOOK, "tn", [masterTn(CURLED)], null, opts);
+    eq(second.merge_adopted, 0, "night 2: still not adopted");
+    eq(
+      sqlite.prepare(`SELECT version FROM tn_rows WHERE id = ?`).all(TN_ID)[0].version,
+      5,
+      "night 2: still no version change — the cycle does not restart",
+    );
+    eq(
+      sqlite.prepare(`SELECT COUNT(*) AS n FROM edit_log WHERE kind = 'tn' AND row_key = ?`).all(TN_ID)[0].n,
+      1,
+      "and no audit rows beyond the seeded ancestor — nothing was written on either night",
+    );
+  }
+
+  // The control. A guard that suppressed the apostrophe case by suppressing
+  // ALL adoption would pass everything above, so prove a genuine Door43 edit
+  // to the same row still lands and still bumps.
+  {
+    const { sqlite, env } = freshEnv();
+    const boundary = seed(sqlite);
+    const counts = await applyTsvRows(
+      env,
+      BOOK,
+      "tn",
+      [masterTn("A maintainer rewrote this note entirely.")],
+      null,
+      { confirmedAt: 200, editId: boundary },
+    );
+    eq(counts.merge_adopted, 1, "a real out-of-band Door43 edit IS adopted");
+    eq(
+      sqlite.prepare(`SELECT version, note FROM tn_rows WHERE id = ?`).all(TN_ID)[0],
+      { version: 6, note: "A maintainer rewrote this note entirely." },
+      "…and it bumps the version and lands the text",
+    );
+  }
+}
+
+// Issue #539 item 4: a merge write that moves CONTENT must clear the row's
+// restored_from_version, or the "current: v{N} (restored)" chip keeps naming a
+// version whose text is no longer what the row holds. Asserted through the real
+// write, because the column is only reachable via buildTsvEditedWriteStmt's SET.
+console.log("\n[a content-moving merge write clears the stale restore marker (issue #539 item 4)]");
+{
+  const TN_ID = "rst1";
+  const { sqlite, env } = freshEnv();
+  sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (7, 7007, 'translator')`).run();
+  sqlite
+    .prepare(
+      `INSERT INTO tn_rows (id, book, chapter, verse, ref_raw, note, sort_order, updated_by, version, restored_from_version)
+       VALUES (?, ?, 4, 2, '4:2', 'our note', 10, 7, 5, 3)`,
+    )
+    .run(TN_ID, BOOK);
+  const e = sqlite
+    .prepare(
+      `INSERT INTO edit_log (kind, row_key, book, action, payload_json, created_at)
+       VALUES ('tn', ?, ?, 'update', ?, 100)`,
+    )
+    .run(TN_ID, BOOK, JSON.stringify({ note: "our note" }));
+
+  const counts = await applyTsvRows(
+    env,
+    BOOK,
+    "tn",
+    [
+      {
+        id: TN_ID, idCoerced: false, refRaw: "4:2", chapter: 4, verse: 2,
+        occurrence: null, tags: null, support_reference: null, quote: null,
+        note: "Door43's corrected note",
+      },
+    ],
+    null,
+    { confirmedAt: 200, editId: Number(e.lastInsertRowid) },
+  );
+
+  eq(counts.merge_adopted, 1, "master's correction is adopted");
+  const after = sqlite.prepare(`SELECT note, version, restored_from_version FROM tn_rows WHERE id = ?`).all(TN_ID)[0];
+  eq(after.note, "Door43's corrected note", "the note moved");
+  eq(after.version, 6, "…the version bumped");
+  eq(after.restored_from_version, null, "…and the stale restore marker was cleared with it");
+}
+
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed`);
   process.exit(1);

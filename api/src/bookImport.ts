@@ -23,7 +23,7 @@ import { requireAuth, requireEditor, currentUserId } from "./auth";
 import { BOOK_NUMBERS, dcsUrls, dcsResourceFile, fileCommitSha, fetchText } from "./dcsSources";
 import { reimportBookFromDcs, recordResourceSync, ALL_RESOURCES, type Resource } from "./bookReimport";
 import { lintChapterOpeningMarkers, lintPairedPunctuation, lintTnRows, lintTqRows, lintTwlRows, lintUsfmVerses, lintVerseTextQuality } from "./lint";
-import { effectiveBookLock, canManageLocks, type BookLock } from "./bookLock";
+import { effectiveBookLock, canManageLocks, requireAutoMergeConfirmation, type BookLock } from "./bookLock";
 import { isPublishedBook } from "./publishedGuard";
 import { exportBranchOverrideValid, lockPushExportParams } from "./export";
 import { LockPushBody } from "./exportRequestBodies";
@@ -286,6 +286,30 @@ books.post("/:book/lock/push", requireEditor, async (c) => {
     .bind(book)
     .first();
   if (!imported) return c.json({ error: "book_not_imported", book }, 400);
+
+  // #602: this route creates the same branchless, allowLocked:true export
+  // that /exports/run's autoMergeConfirmationRequired check exists to gate,
+  // and used to reach EXPORT_WORKFLOW.create without ever consulting it. The
+  // "publish now" intent documented above IS this route's acknowledgement of
+  // the auto-merge, so allowAutoMerge is true exactly when branchName is
+  // absent — the same condition that already selects publish-now over
+  // staging in lockPushExportParams. Routed through the same centralized
+  // helper /exports/run uses so neither call site can drift from the other.
+  const confirmation = await requireAutoMergeConfirmation(c.env, book, {
+    allowLocked: true,
+    branchName,
+    allowAutoMerge: branchName === undefined,
+  });
+  if (confirmation) {
+    return c.json(
+      {
+        error: "allow_locked_published_book_requires_branch_name_or_allow_auto_merge",
+        book: confirmation.book,
+        reason: confirmation.reason,
+      },
+      400,
+    );
+  }
 
   // Each resource lives in its own DCS repo (RESOURCE_TARGETS in export.ts —
   // en_tn/en_tq/en_twl/en_ult/en_ust), so the 5 creates below share no

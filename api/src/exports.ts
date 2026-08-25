@@ -7,8 +7,7 @@ import { Hono } from "hono";
 import type { Env } from "./index";
 import { requireAdmin } from "./auth";
 import { ALL_RESOURCES, exportBranchOverrideValid, type Resource } from "./export";
-import { autoMergeConfirmationRequired } from "./publishedGuard";
-import { effectiveBookLock } from "./bookLock";
+import { requireAutoMergeConfirmation } from "./bookLock";
 
 export const exports = new Hono<{ Bindings: Env; Variables: { userId?: number } }>();
 
@@ -61,27 +60,28 @@ exports.post("/run", requireAdmin, async (c) => {
   if (parsed.data.branchName && parsed.data.allowShrink) {
     return c.json({ error: "branch_name_and_allow_shrink_not_combinable" }, 400);
   }
-  // #581: allowLocked clears our own book-lock gate, but on the default
+  // #581/#602: allowLocked clears our own book-lock gate, but on the default
   // `-be-` branch DCS auto-merges into master unattended — exactly wrong for
   // a locked/published book. Require either branchName (maintainer-reviewed
   // branch) or an explicit allowAutoMerge acknowledgement before proceeding.
   // Every scheduled() cron path (nightly, the 5-minute pipeline poll) creates
   // the Workflow directly and never passes allowLocked, so this can never
-  // trip on a cron run — only on a POST through this route.
+  // trip on a cron run — only on a POST through this route. Centralized in
+  // bookLock.ts's requireAutoMergeConfirmation so every other route creating
+  // an allowLocked:true export (POST /books/:book/lock/push included) is
+  // guaranteed the same check rather than duplicating it inline.
   if (parsed.data.allowLocked && parsed.data.book && parsed.data.resource) {
-    const lock = await effectiveBookLock(c.env, parsed.data.book);
-    if (
-      lock &&
-      autoMergeConfirmationRequired(
-        { allowLocked: parsed.data.allowLocked, branchName: parsed.data.branchName, allowAutoMerge: parsed.data.allowAutoMerge },
-        true,
-      )
-    ) {
+    const confirmation = await requireAutoMergeConfirmation(c.env, parsed.data.book, {
+      allowLocked: parsed.data.allowLocked,
+      branchName: parsed.data.branchName,
+      allowAutoMerge: parsed.data.allowAutoMerge,
+    });
+    if (confirmation) {
       return c.json(
         {
           error: "allow_locked_published_book_requires_branch_name_or_allow_auto_merge",
-          book: lock.book,
-          reason: lock.reason,
+          book: confirmation.book,
+          reason: confirmation.reason,
         },
         400,
       );

@@ -149,6 +149,40 @@ console.log("\n[the newest pre-watermark 'baseline' survives by content time, no
   );
 }
 
+console.log("\n[issue #603: two same-second baselines tie on created_at — the higher id survives, insert order (id 10 then id 11)]");
+{
+  const d = freshDb();
+  syncRow(d, { book: "JER", resource: "ust", confirmedAt: 5000, editId: 9 });
+  const key = "JER/32/1/UST";
+  logRow(d, { id: 9, rowKey: key, book: "JER", action: "update", createdAt: 1000, payload: '{"content":"human"}' });
+  logRow(d, { id: 10, rowKey: key, book: "JER", action: "baseline", createdAt: 4000, payload: '{"content":"OLD"}' });
+  logRow(d, { id: 11, rowKey: key, book: "JER", action: "baseline", createdAt: 4000, payload: '{"content":"NEW"}' });
+
+  sweep(d, 4500);
+
+  assert(
+    survivingIds(d).join(",") === "9,11",
+    "on a created_at tie the higher id (11, chronologically later) survives, not the lower id — bare MAX(created_at) beside the ungrouped id is arbitrary on a tie",
+  );
+}
+
+console.log("\n[issue #603: same tie as above, inserted in reverse order (id 11 then id 10) — must not depend on insert order]");
+{
+  const d = freshDb();
+  syncRow(d, { book: "JER", resource: "ust", confirmedAt: 5000, editId: 9 });
+  const key = "JER/32/2/UST";
+  logRow(d, { id: 9, rowKey: key, book: "JER", action: "update", createdAt: 1000, payload: '{"content":"human"}' });
+  logRow(d, { id: 11, rowKey: key, book: "JER", action: "baseline", createdAt: 4000, payload: '{"content":"NEWER"}' });
+  logRow(d, { id: 12, rowKey: key, book: "JER", action: "baseline", createdAt: 4000, payload: '{"content":"OLDER"}' });
+
+  sweep(d, 4500);
+
+  assert(
+    survivingIds(d).join(",") === "9,12",
+    "the higher id (12) survives regardless of insert order",
+  );
+}
+
 console.log("\n[no watermark → no shield: behavior is unchanged from the plain age sweep]");
 {
   const d = freshDb();
@@ -321,6 +355,32 @@ console.log("\n[issue #573 gap 2: #548's other candidate-ancestor action classes
     survivingIds(d).join(",") === "2,4",
     "only the newest pre-watermark row per (verse, action) among #548's listed classes survives — the older same-class row (1), the post-watermark row (3), and the unlisted action (5) are all swept",
   );
+}
+
+console.log("\n[issue #603: gap 2 same-second tie within one (row_key, action) — the higher id survives, insert order (id 20 then id 21)]");
+{
+  const d = freshDb();
+  syncRow(d, { book: "NAM", resource: "ult", confirmedAt: 5000, editId: null });
+  const key = "NAM/2/2/ULT";
+  logRow(d, { id: 20, rowKey: key, book: "NAM", action: "heal-replacement-chars", createdAt: 4000, payload: '{"content":"OLDER"}', source: "data_repair" });
+  logRow(d, { id: 21, rowKey: key, book: "NAM", action: "heal-replacement-chars", createdAt: 4000, payload: '{"content":"NEWER"}', source: "data_repair" });
+
+  sweep(d, 4500);
+
+  assert(survivingIds(d).join(",") === "21", "the higher id (21) survives the created_at tie within the same (row_key, action) partition");
+}
+
+console.log("\n[issue #603: same gap 2 tie, inserted in reverse order (id 31 then id 30) — must not depend on insert order]");
+{
+  const d = freshDb();
+  syncRow(d, { book: "NAM", resource: "ult", confirmedAt: 5000, editId: null });
+  const key = "NAM/2/3/ULT";
+  logRow(d, { id: 31, rowKey: key, book: "NAM", action: "heal-replacement-chars", createdAt: 4000, payload: '{"content":"NEWER"}', source: "data_repair" });
+  logRow(d, { id: 30, rowKey: key, book: "NAM", action: "heal-replacement-chars", createdAt: 4000, payload: '{"content":"OLDER"}', source: "data_repair" });
+
+  sweep(d, 4500);
+
+  assert(survivingIds(d).join(",") === "31", "the higher id (31) survives regardless of insert order");
 }
 
 console.log("\n[a legacy row with book IS NULL is still shielded — the join reads row_key, as the merge does]");

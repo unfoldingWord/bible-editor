@@ -46,7 +46,7 @@ import {
 } from "../lib/laneChecks";
 import { ChapterBoard } from "./ChapterBoard";
 import { BookLocksDialog } from "./BookLocksDialog";
-import { drafts, verseKey, pinVerseBase, unpinVerseBaseIfIdle } from "../sync/drafts";
+import { drafts, verseKey, pinVerseBase, unpinVerseBaseIfIdle, registerVerseVersionReader } from "../sync/drafts";
 import { generationForSavedPlain } from "../sync/draftSaveState";
 import { smartEditVerse } from "../lib/replace";
 import { extractEditableText, extractPlainText, normalizeEditable, SECTION_HEADER_TAGS } from "../lib/usfm";
@@ -317,6 +317,19 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   useEffect(() => {
     dataRef.current = data;
   }, [data]);
+  // DEV-only wiring for the #605 extension of window.__bePinDebug (see
+  // drafts.ts) — lets tests/concurrency/s9-verse-pin-release.spec.ts poll
+  // this tab's chapter cache for the version it has actually observed (e.g.
+  // over the WebSocket) instead of guessing a fixed delay. Re-registered
+  // whenever `book`/`chapter` change so the reader always answers for the
+  // currently-open chapter's dataRef, not a stale closure over an earlier one.
+  useEffect(() => {
+    if (!import.meta.env.DEV) return;
+    registerVerseVersionReader((readBook, readChapter, readVerse, bibleVersion) => {
+      if (readBook !== book || readChapter !== chapter) return undefined;
+      return dataRef.current?.verses[bibleVersion]?.[readVerse]?.version;
+    });
+  }, [book, chapter]);
   // The "save & refresh" prompt helper is defined further down (it depends on
   // toast state declared after this hook), so the WS handler reaches it through
   // a ref, mirroring dataRef above.

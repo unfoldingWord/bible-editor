@@ -262,9 +262,45 @@ test.describe("S9 — cross-tab verse pin release (#565 / #569 / #571)", () => {
     const ultAfterFirst = afterFirst.verses[BV][VERSE];
     expect(ultAfterFirst.plain_text as string).toContain(mark1.trim());
 
-    // Give the BroadcastChannel a moment to deliver tab B's "ok" announcement
-    // to tab A — same-process postMessage, but still a task-queue hop.
-    await tabA.waitForTimeout(400);
+    // Same key format drafts.ts's verseKey() produces — used both by the
+    // version poll right below and by the steady-state pin check at the end.
+    const key = `verse:ZEC:${CHAPTER}:${VERSE}:${BV}`;
+
+    // Wait for tab A to have actually LEARNED the post-tab-B-save version —
+    // not a fixed guess at how long that takes. Two things must both catch
+    // up before a follow-up save on tab A can land clean:
+    //   (1) the BroadcastChannel pin-release (~ms, same-process postMessage)
+    //   (2) tab A's chapter cache observing the new version over the
+    //       WebSocket fanout (`Shell.tsx`'s onVerseUpdate) — this is the
+    //       ONLY route tab A has to the post-save version, since tab B (not
+    //       tab A) did the draining, and it's unbounded: the server sends it
+    //       via `c.executionCtx.waitUntil(broadcastChapter(...))` AFTER the
+    //       200 (api/src/verses.ts), fire-and-forget. A fixed 400ms wait
+    //       here raced #605: on a slow run the WS frame can still be in
+    //       flight when the follow-up save fires, so it diffs/sends against
+    //       the STALE version and 409s — misreported by the poll below as
+    //       "the #565 leak" when it's actually just a late WS frame.
+    // Polling the actual observable state (rather than a longer guess) makes
+    // this deterministic on a fast run and robust on a slow one. See #605 and
+    // drafts.ts's `window.__bePinDebug.currentVersion` (DEV-only) for the hook.
+    await expect
+      .poll(
+        () =>
+          tabA.evaluate(
+            (k) =>
+              (
+                window as unknown as {
+                  __bePinDebug?: { currentVersion: (key: string) => number | undefined };
+                }
+              ).__bePinDebug?.currentVersion(k),
+            key,
+          ),
+        {
+          message: "tab A never observed tab B's save (WS fanout) — the follow-up save would race a stale version",
+          timeout: 15_000,
+        },
+      )
+      .toBe(ultAfterFirst.version as number);
 
     // The follow-up: a SECOND draftless save on the SAME verse, same tab,
     // same still-open dialog. Without #569 this diffs against the pin tab A
@@ -298,7 +334,6 @@ test.describe("S9 — cross-tab verse pin release (#565 / #569 / #571)", () => {
 
     // Steady state: no pin left dangling in tab A once both saves have
     // landed (bonus cross-check via the DEV-only hook — see drafts.ts).
-    const key = `verse:ZEC:${CHAPTER}:${VERSE}:${BV}`;
     const finalPin = await tabA.evaluate(
       (k) => (window as unknown as { __bePinDebug?: { peek: (k: string) => unknown } }).__bePinDebug?.peek(k),
       key,

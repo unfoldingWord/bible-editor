@@ -91,6 +91,14 @@ Highlights that bite repeatedly:
   reads `commits[0]`. Thirty passing unit tests hid this; only running against the live API found it. Corollary:
   a mocked contract proves the mock matches itself.
 
+- **Gitea's raw endpoint silently serves master's CURRENT tip for an ABBREVIATED sha.** Measured 2026-08-24:
+  `/api/v1/repos/unfoldingWord/en_ult/raw/24-JER.usfm?ref=127cc1f3` returned bytes identical to master's tip
+  (same md5 for two different commits), while the same call with the full 40-char sha returned the two real,
+  different revisions. It does not error and does not warn — it hands back the wrong file. Anything pinning a
+  fetch to a revision must pass the FULL object id and reject anything shorter (`fetchHumanTouchedRefs` in
+  `dcsSources.ts` does), and keep a second net: `refsTouchedInUsfm`'s hunk-past-end-of-file check exists because
+  real hunk line numbers against the wrong bytes usually run off the end.
+
 - **Master's three commit producers are distinguishable, and two shapes are traps.** Ours:
   `bible-editor: {BOOK} {res} → master (#N)` AND `bible-editor export: … → {BRANCH} (export-…)` — the `-be-`
   branch commit also appears in master's file history once the branch merges. AI: author `bot@unfoldingword.org`,
