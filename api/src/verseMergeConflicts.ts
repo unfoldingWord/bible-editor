@@ -56,6 +56,7 @@ import { Hono } from "hono";
 import type { Env } from "./index";
 import { requireAuth } from "./auth";
 import {
+  alertMessageCarriesNoBaseWarning,
   buildEditorLookupQuery,
   buildMergeConflictGuidance,
   EDITOR_LOOKUP_CHUNK,
@@ -68,6 +69,8 @@ import {
 import {
   CONFIRM_ADOPTED_CONFLICT_SQL,
   DELETE_LOST_ADOPTION_CONFLICT_SQL,
+  CLEAR_CONFLICT_ONLY_ALERTS_BY_SOURCE_SQL,
+  CLEAR_CONFLICT_ONLY_ALERTS_BY_USER_SQL,
   SELECT_ACTIVE_ALERTABLE_CONFLICTS_SQL,
   UPSERT_VERSE_MERGE_CONFLICT_SQL,
 } from "./verseMergeConflictSql.ts";
@@ -326,6 +329,70 @@ function clearUndismissedAlertsStmt(env: Env, source: string, username?: string)
     ).bind(username, source);
   }
   return env.DB.prepare(`DELETE FROM system_alerts WHERE source = ?1 AND dismissed_at IS NULL`).bind(source);
+}
+
+// Issue #626: raiseVerseMergeConflictAlert only reruns from a reimport (the
+// nightly cron or a user-triggered POST /:book/reimport), so a banner it
+// wrote stays frozen at that run's content until the next one — up to a
+// night, longer if the freshness gate skips that (book, resource). Meanwhile
+// resolved_at is set independently, by verses.ts's PATCH route the moment a
+// human re-saves the flagged verse. Nothing in between rewrote the banner,
+// so it kept naming verses a human had already fixed — exactly when someone
+// working the list was most likely to look at it.
+//
+// Called from verses.ts after a save resolves a conflict row, this clears
+// the (book, resource) banner ONLY when that resolve was the LAST active
+// alertable conflict outstanding — otherwise it leaves the banner alone.
+// That is deliberate, not a shortcut: the caller here knows about the ONE
+// verse it just resolved, not the resource's full remaining set, so
+// rewriting the message from that single fact would risk trading a
+// merely-stale count for an actively WRONG one (e.g. dropping a reason from
+// the parenthetical breakdown that still has other rows). A partially-stale
+// banner self-heals on the next sync; a fabricated count does not.
+//
+// keep_no_base is a second outstanding condition that lives ONLY in the
+// banner message (noBaseCount at raise time — no verse_merge_conflicts row).
+// Clearing by "zero active table rows" would erase that warning while the
+// no-ancestor verses are still at risk of being overwritten on the next
+// export. Per-username: drop conflict-only alerts; preserve any whose
+// message still carries the keep_no_base fingerprint.
+//
+// Best-effort, like every other alert write in this file — called from
+// waitUntil after the save has already landed, so a failure here must never
+// surface as a save error.
+export async function clearResolvedConflictBannerIfLast(env: Env, book: string, resource: string): Promise<void> {
+  const source = `verse_merge_conflict:${book}:${resource}`;
+  try {
+    const rs = await env.DB.prepare(SELECT_ACTIVE_ALERTABLE_CONFLICTS_SQL).bind(book, resource).all();
+    if ((rs.results?.length ?? 0) > 0) return; // other conflicts still outstanding — leave the banner for the next sync
+    const alerts = await env.DB.prepare(
+      `SELECT username, message FROM system_alerts WHERE source = ?1 AND dismissed_at IS NULL`,
+    )
+      .bind(source)
+      .all<{ username: string; message: string }>();
+    const toClear = (alerts.results ?? []).filter((a) => !alertMessageCarriesNoBaseWarning(a.message));
+    if (toClear.length === 0) return; // nothing undismissed, or every row still carries keep_no_base
+    // Prefer one source-wide clear when every undismissed row is conflict-only
+    // (the common case). Fall back to per-username when a keep_no_base row
+    // must stay. Both statements re-check "no active alertable conflicts"
+    // inside the DELETE — see the constants' header for the reimport race that
+    // guard closes. NOT clearUndismissedAlertsStmt: its other two call sites
+    // are the raise/replan path, which deletes-then-reinserts precisely WHILE
+    // conflicts are active, so the guard would make them no-ops.
+    if (toClear.length === (alerts.results?.length ?? 0)) {
+      await env.DB.prepare(CLEAR_CONFLICT_ONLY_ALERTS_BY_SOURCE_SQL).bind(source, book, resource).run();
+      return;
+    }
+    for (const a of toClear) {
+      await env.DB.prepare(CLEAR_CONFLICT_ONLY_ALERTS_BY_USER_SQL).bind(a.username, source, book, resource).run();
+    }
+  } catch (e) {
+    console.error("verseMergeConflicts: resolved-banner clear failed", {
+      book,
+      resource,
+      error: e instanceof Error ? e.message : String(e),
+    });
+  }
 }
 
 // Banner alert (system_alerts) naming the count, the reason breakdown, and

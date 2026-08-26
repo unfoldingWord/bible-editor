@@ -83,6 +83,39 @@ export const SELECT_ACTIVE_ALERTABLE_CONFLICTS_SQL = `SELECT chapter, verse, act
     ORDER BY chapter ASC, verse ASC`;
 
 // ---------------------------------------------------------------------------
+// The two DELETEs clearResolvedConflictBannerIfLast runs once it has decided
+// the resolve it was called for was the LAST active alertable conflict.
+//
+// The NOT EXISTS re-states that decision INSIDE the DELETE, and that is the
+// whole point of these two constants existing rather than reusing
+// clearUndismissedAlertsStmt (PR #631 Codex review). The decision and the
+// delete are separate round-trips, so a reimport landing in the gap could
+// record a fresh conflict and raise its banner only for this now-stale clear
+// to delete it — leaving a real Door43/app divergence with no banner until the
+// next sync. Re-checking the predicate atomically closes that window: a
+// reimport writes its verse_merge_conflicts rows BEFORE it raises the alert
+// (raiseVerseMergeConflictAlert derives the message by reading this table), so
+// either those rows are already visible and this DELETE matches nothing, or
+// they land afterwards and the reimport's own alert is written after we are
+// done. Either way the surviving banner reflects the real conflict set.
+//
+// Binds, in order: (source, book, resource).
+export const CLEAR_CONFLICT_ONLY_ALERTS_BY_SOURCE_SQL = `DELETE FROM system_alerts
+    WHERE source = ?1 AND dismissed_at IS NULL
+      AND NOT EXISTS (SELECT 1 FROM verse_merge_conflicts
+                       WHERE book = ?2 AND resource = ?3
+                         AND action IN ('adopt_conflict', 'keep_alignment_refused', 'source_attr_divergent', 'keep_ai_master')
+                         AND resolved_at IS NULL)`;
+
+// Binds, in order: (username, source, book, resource).
+export const CLEAR_CONFLICT_ONLY_ALERTS_BY_USER_SQL = `DELETE FROM system_alerts
+    WHERE username = ?1 AND source = ?2 AND dismissed_at IS NULL
+      AND NOT EXISTS (SELECT 1 FROM verse_merge_conflicts
+                       WHERE book = ?3 AND resource = ?4
+                         AND action IN ('adopt_conflict', 'keep_alignment_refused', 'source_attr_divergent', 'keep_ai_master')
+                         AND resolved_at IS NULL)`;
+
+// ---------------------------------------------------------------------------
 // TWO-PHASE REACTIVATION (2026-08-15 Codex second-opinion review fix,
 // superseding the first six-angle review's "reset resolved_at
 // unconditionally" approach, which had a real bug — see below).

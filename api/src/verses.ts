@@ -21,6 +21,7 @@ import {
 import { buildVerseHistory, type VerseHistoryLogRow } from "./verseHistory.ts";
 import { lanesToReopenOnVerseEdit, reopenLaneChecks } from "./laneReopen.ts";
 import { RESOLVE_VERSE_MERGE_CONFLICT_SQL, VERSE_PATCH_UPDATE_SQL } from "./verseMergeConflictSql.ts";
+import { clearResolvedConflictBannerIfLast } from "./verseMergeConflicts.ts";
 
 // Verse content can carry malformed/missing `\w` occurrence data — colliding
 // `(text, occurrence)` pairs from a bad import or AI alignment (ULT/UST), or no
@@ -429,7 +430,7 @@ verses.patch("/:book/:chapter/:verse/:bibleVersion", requireEditor, async (c) =>
   // plain_text uses COALESCE so an omitted field keeps the stored value
   // instead of nulling the column (null here means "absent" — current
   // callers always send it).
-  const [updateRes] = await c.env.DB.batch([
+  const [updateRes, , resolveRes] = await c.env.DB.batch([
     c.env.DB
       .prepare(VERSE_PATCH_UPDATE_SQL)
       .bind(
@@ -556,6 +557,16 @@ verses.patch("/:book/:chapter/:verse/:bibleVersion", requireEditor, async (c) =>
     c.executionCtx.waitUntil(
       reopenLaneChecks(c.env, updated.book, updated.chapter, updated.verse, lanes),
     );
+    // Issue #626: this save just resolved the merge-conflict row for this
+    // verse (RESOLVE_VERSE_MERGE_CONFLICT_SQL's own `changes() > 0` guard
+    // above only fires when it did) — clear the book+resource sync-warning
+    // banner if that was the last active conflict outstanding, so a human
+    // working the list isn't sent back to a verse that needs nothing.
+    // Best-effort and non-blocking, same as the two waitUntil calls above:
+    // the save already landed either way.
+    if (resolveRes?.meta?.changes) {
+      c.executionCtx.waitUntil(clearResolvedConflictBannerIfLast(c.env, updated.book, bibleVersion.toLowerCase()));
+    }
   }
   return c.json(updated ? { ...updated, content: updatedParsed } : null);
 });

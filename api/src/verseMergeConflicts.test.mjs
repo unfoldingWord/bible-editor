@@ -58,8 +58,10 @@
 
 import { DatabaseSync } from "node:sqlite";
 import {
+  alertMessageCarriesNoBaseWarning,
   buildEditorLookupQuery,
   buildMergeConflictGuidance,
+  buildNoBaseSentence,
   EDITOR_LOOKUP_CHUNK,
   editLogKey,
   groupNoBaseVersesByEditor,
@@ -71,6 +73,8 @@ import {
   CONFIRM_ADOPTED_CONFLICT_SQL,
   DELETE_LOST_ADOPTION_CONFLICT_SQL,
   RESOLVE_VERSE_MERGE_CONFLICT_SQL,
+  CLEAR_CONFLICT_ONLY_ALERTS_BY_SOURCE_SQL,
+  CLEAR_CONFLICT_ONLY_ALERTS_BY_USER_SQL,
   SELECT_ACTIVE_ALERTABLE_CONFLICTS_SQL,
   UPSERT_VERSE_MERGE_CONFLICT_SQL,
   VERSE_PATCH_UPDATE_SQL,
@@ -335,7 +339,48 @@ function verseDb() {
     book TEXT, chapter INTEGER, verse INTEGER, bible_version TEXT, version INTEGER,
     content_json TEXT, plain_text TEXT, updated_at INTEGER, updated_by INTEGER
   )`);
+  // Migration 0023's real schema, for the #626 resolved-banner-clear tests below.
+  d.exec(`CREATE TABLE system_alerts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT NOT NULL, severity TEXT NOT NULL,
+    source TEXT NOT NULL, message TEXT NOT NULL, link_url TEXT,
+    created_at INTEGER, dismissed_at INTEGER
+  )`);
   return d;
+}
+
+// Replicates clearResolvedConflictBannerIfLast's exact decision (verses.ts's
+// PATCH route, issue #626) against real SQLite, using the ACTUAL
+// SELECT_ACTIVE_ALERTABLE_CONFLICTS_SQL text so this can't silently drift
+// from what that function really queries. The DELETE mirrors
+// the ACTUAL CLEAR_CONFLICT_ONLY_ALERTS_BY_* text — source-wide when every
+// undismissed row is conflict-only, per-username when a keep_no_base message
+// must stay (PR #631 review P1).
+function clearResolvedBanner(d, book, resource, raceHook) {
+  const active = d.prepare(SELECT_ACTIVE_ALERTABLE_CONFLICTS_SQL).all(book, resource);
+  if (active.length > 0) return { cleared: false, preservedNoBase: false };
+  const source = `verse_merge_conflict:${book}:${resource}`;
+  const alerts = d
+    .prepare(`SELECT username, message FROM system_alerts WHERE source = ? AND dismissed_at IS NULL`)
+    .all(source);
+  const toClear = alerts.filter((a) => !alertMessageCarriesNoBaseWarning(a.message));
+  if (toClear.length === 0) {
+    // Nothing undismissed to delete (only-dismissed history, or every
+    // remaining row carries keep_no_base). The former is vacuously "cleared";
+    // the latter is an intentional preserve.
+    return { cleared: alerts.length === 0, preservedNoBase: alerts.length > 0 };
+  }
+  // `raceHook` lets a test simulate a reimport landing in the gap between the
+  // decision above and the DELETE below (PR #631 Codex review) — the exact
+  // window the NOT EXISTS inside both statements exists to close.
+  if (raceHook) raceHook(d);
+  let changes = 0;
+  if (toClear.length === alerts.length) {
+    changes = d.prepare(CLEAR_CONFLICT_ONLY_ALERTS_BY_SOURCE_SQL).run(source, book, resource).changes;
+  } else {
+    const del = d.prepare(CLEAR_CONFLICT_ONLY_ALERTS_BY_USER_SQL);
+    for (const a of toClear) changes += del.run(a.username, source, book, resource).changes;
+  }
+  return { cleared: changes > 0, preservedNoBase: toClear.length < alerts.length };
 }
 
 // Runs the REAL verses.ts PATCH-route UPDATE (VERSE_PATCH_UPDATE_SQL) first
@@ -421,6 +466,208 @@ function saveVerse(d, { book, resource, chapter, verse, matchVersion, userId, no
 
   const row = d.prepare(`SELECT * FROM verse_merge_conflicts WHERE book = 'ZEC' AND chapter = 1 AND verse = 2`).get();
   assert(row.resolved_at === 200 && row.resolved_by === 30, "first resolver's stamp is preserved, not overwritten");
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Part 3b: clearResolvedConflictBannerIfLast (issue #626). The banner alert
+// used to be frozen at whatever the last sync run wrote, even after a human
+// resolved every conflict it named — nothing rewrote it until the next
+// reimport. verses.ts's PATCH route now calls this after a save resolves a
+// conflict row, to clear the (book, resource) banner immediately when that
+// was the LAST active alertable conflict outstanding.
+// ─────────────────────────────────────────────────────────────────────────
+
+{
+  // The measured case from the issue: JER ULT had 3 active conflicts; a
+  // human resolves the only source_attr_ambiguous one; two both_changed_ai_master
+  // rows remain. The banner must NOT be cleared — a partially-stale banner
+  // (still correctly naming the two survivors, if stale on the exact count)
+  // beats fabricating a fresh count from a fragment.
+  const d = verseDb();
+  d.prepare(
+    `INSERT INTO verse_merge_conflicts (book, resource, chapter, verse, action, reason, overwritten_version, detected_at, resolved_at)
+     VALUES ('JER', 'ult', 42, 6, 'keep_ai_master', 'both_changed_ai_master', NULL, 100, NULL)`,
+  ).run();
+  d.prepare(
+    `INSERT INTO verse_merge_conflicts (book, resource, chapter, verse, action, reason, overwritten_version, detected_at, resolved_at)
+     VALUES ('JER', 'ult', 42, 11, 'keep_ai_master', 'both_changed_ai_master', NULL, 100, NULL)`,
+  ).run();
+  d.prepare(
+    `INSERT INTO system_alerts (username, severity, source, message)
+     VALUES ('deferredreward', 'warning', 'verse_merge_conflict:JER:ult', 'Sync flagged 3 verse(s)...')`,
+  ).run();
+
+  const cleared = clearResolvedBanner(d, "JER", "ult");
+  assert(!cleared.cleared, "two conflicts still outstanding -> banner is left alone, not cleared");
+  const alert = d.prepare(`SELECT * FROM system_alerts WHERE source = 'verse_merge_conflict:JER:ult'`).get();
+  assert(!!alert, "the (stale but not wrong-count) banner row still exists");
+}
+
+{
+  // The success case: the one remaining conflict for (book, resource) gets
+  // resolved. The banner — both the admin's row and an editor's fan-out row,
+  // same source — disappears immediately, not on the next sync.
+  const d = verseDb();
+  d.prepare(
+    `INSERT INTO verse_merge_conflicts (book, resource, chapter, verse, action, reason, overwritten_version, detected_at, resolved_at)
+     VALUES ('JER', 'ult', 41, 8, 'source_attr_divergent', 'source_attr_ambiguous', NULL, 100, 12345)`,
+  ).run();
+  d.prepare(
+    `INSERT INTO system_alerts (username, severity, source, message)
+     VALUES ('deferredreward', 'warning', 'verse_merge_conflict:JER:ult', 'Sync flagged 1 verse(s)...')`,
+  ).run();
+  d.prepare(
+    `INSERT INTO system_alerts (username, severity, source, message)
+     VALUES ('bethoakes', 'warning', 'verse_merge_conflict:JER:ult', 'Your edit at JER 41:8 was overwritten...')`,
+  ).run();
+
+  const cleared = clearResolvedBanner(d, "JER", "ult");
+  assert(cleared.cleared, "the last active conflict just resolved -> banner is cleared");
+  const remaining = d.prepare(`SELECT * FROM system_alerts WHERE source = 'verse_merge_conflict:JER:ult'`).all();
+  assert(remaining.length === 0, "cleared by SOURCE — both the admin's row and the editor's fan-out row are gone");
+}
+
+{
+  // PR #631 Codex review: the "is this the last one?" decision and the DELETE
+  // are separate round-trips. A reimport landing in that gap records a fresh
+  // conflict and raises its banner — and the now-stale clear used to delete
+  // that brand-new warning, leaving a real divergence unannounced until the
+  // next sync. The NOT EXISTS inside the DELETE must make the clear a no-op.
+  const d = verseDb();
+  d.prepare(
+    `INSERT INTO verse_merge_conflicts (book, resource, chapter, verse, action, reason, overwritten_version, detected_at, resolved_at)
+     VALUES ('JER', 'ult', 41, 8, 'source_attr_divergent', 'source_attr_ambiguous', NULL, 100, 12345)`,
+  ).run();
+  d.prepare(
+    `INSERT INTO system_alerts (username, severity, source, message)
+     VALUES ('deferredreward', 'warning', 'verse_merge_conflict:JER:ult', 'Sync flagged 1 verse(s)...')`,
+  ).run();
+
+  const cleared = clearResolvedBanner(d, "JER", "ult", (db) => {
+    // The interleaved reimport: a new conflict row, then its refreshed banner.
+    db.prepare(
+      `INSERT INTO verse_merge_conflicts (book, resource, chapter, verse, action, reason, overwritten_version, detected_at, resolved_at)
+       VALUES ('JER', 'ult', 43, 2, 'adopt_conflict', 'both_changed', 7, 200, NULL)`,
+    ).run();
+    db.prepare(`DELETE FROM system_alerts WHERE source = 'verse_merge_conflict:JER:ult' AND dismissed_at IS NULL`).run();
+    db.prepare(
+      `INSERT INTO system_alerts (username, severity, source, message)
+       VALUES ('deferredreward', 'warning', 'verse_merge_conflict:JER:ult', 'Sync flagged 1 verse(s) in JER ULT... Refs: 43:2.')`,
+    ).run();
+  });
+
+  assert(!cleared.cleared, "a conflict recorded mid-flight makes the stale clear a no-op");
+  const alert = d.prepare(`SELECT * FROM system_alerts WHERE source = 'verse_merge_conflict:JER:ult'`).get();
+  assert(!!alert, "the reimport's fresh banner survives the racing clear");
+  assert(alert.message.includes("43:2"), "…and it is the NEW banner, naming the newly-flagged verse");
+}
+
+{
+  // A dismissed banner row must be left alone even when every conflict for
+  // that (book, resource) resolves — the same invariant
+  // clearUndismissedAlertsStmt documents for every other clear in this file.
+  const d = verseDb();
+  d.prepare(
+    `INSERT INTO system_alerts (username, severity, source, message, dismissed_at)
+     VALUES ('deferredreward', 'warning', 'verse_merge_conflict:JER:ult', 'Sync flagged 1 verse(s)...', 999)`,
+  ).run();
+
+  const cleared = clearResolvedBanner(d, "JER", "ult");
+  assert(cleared.cleared, "zero active conflicts -> the clear still runs");
+  const alert = d.prepare(`SELECT * FROM system_alerts WHERE source = 'verse_merge_conflict:JER:ult'`).get();
+  assert(!!alert && alert.dismissed_at === 999, "…but a DISMISSED row is never touched — it stays as history");
+}
+
+{
+  // A banner for a DIFFERENT (book, resource) sharing no active conflicts
+  // must not be collaterally cleared just because JER ULT's own resolve ran
+  // through this same call.
+  const d = verseDb();
+  d.prepare(
+    `INSERT INTO verse_merge_conflicts (book, resource, chapter, verse, action, reason, overwritten_version, detected_at, resolved_at)
+     VALUES ('EZK', 'ust', 26, 17, 'source_attr_divergent', 'source_attr_ambiguous', NULL, 100, NULL)`,
+  ).run();
+  d.prepare(
+    `INSERT INTO system_alerts (username, severity, source, message)
+     VALUES ('deferredreward', 'warning', 'verse_merge_conflict:EZK:ust', 'Sync flagged 1 verse(s)...')`,
+  ).run();
+  d.prepare(
+    `INSERT INTO system_alerts (username, severity, source, message)
+     VALUES ('deferredreward', 'warning', 'verse_merge_conflict:JER:ult', 'stale JER banner, nothing active')`,
+  ).run();
+
+  const cleared = clearResolvedBanner(d, "JER", "ult");
+  assert(cleared.cleared, "JER ult has zero active conflicts -> its own banner clears");
+  const ezkAlert = d.prepare(`SELECT * FROM system_alerts WHERE source = 'verse_merge_conflict:EZK:ust'`).get();
+  assert(!!ezkAlert, "EZK ust's own still-active banner is untouched by JER ult's clear");
+}
+
+{
+  // PR #631 review P1: keep_no_base warnings ride in the banner message via
+  // noBaseCount at raise time and have NO verse_merge_conflicts row. Resolving
+  // the last ordinary conflict must NOT erase an alert that still warns about
+  // unresolved no-ancestor verses.
+  const d = verseDb();
+  const adminMsg =
+    `Sync flagged 1 verse(s) in JER ULT for review (1 source_attr_ambiguous). Refs: 41:8. ` +
+    buildNoBaseSentence(2, ["42:2", "42:3"]);
+  const editorOverwrite = "Your edit at JER 41:8 was overwritten by Door43's sync...";
+  const editorNoBase = groupNoBaseVersesByEditor(
+    "JER",
+    "ult",
+    [{ chapter: 42, verse: 2, version: 5 }],
+    new Map([[editLogKey("JER", "ult", { chapter: 42, verse: 2, overwrittenVersion: 5 }), "bethoakes"]]),
+  ).get("bethoakes").message;
+
+  d.prepare(
+    `INSERT INTO system_alerts (username, severity, source, message)
+     VALUES ('deferredreward', 'warning', 'verse_merge_conflict:JER:ult', ?)`,
+  ).run(adminMsg);
+  d.prepare(
+    `INSERT INTO system_alerts (username, severity, source, message)
+     VALUES ('grant', 'warning', 'verse_merge_conflict:JER:ult', ?)`,
+  ).run(editorOverwrite);
+  d.prepare(
+    `INSERT INTO system_alerts (username, severity, source, message)
+     VALUES ('bethoakes', 'warning', 'verse_merge_conflict:JER:ult', ?)`,
+  ).run(editorNoBase);
+
+  assert(alertMessageCarriesNoBaseWarning(adminMsg), "admin mixed message carries the no-base fingerprint");
+  assert(alertMessageCarriesNoBaseWarning(editorNoBase), "editor no-base fan-out carries its fingerprint");
+  assert(!alertMessageCarriesNoBaseWarning(editorOverwrite), "overwrite-only fan-out does not");
+
+  const result = clearResolvedBanner(d, "JER", "ult");
+  assert(result.cleared && result.preservedNoBase, "cleared conflict-only rows but preserved keep_no_base carriers");
+
+  const remaining = d
+    .prepare(`SELECT username, message FROM system_alerts WHERE source = 'verse_merge_conflict:JER:ult' ORDER BY username`)
+    .all();
+  assert(remaining.length === 2, "admin + bethoakes kept; grant's overwrite-only alert dropped");
+  assert(
+    remaining.map((r) => r.username).join(",") === "bethoakes,deferredreward",
+    "preserved usernames are the keep_no_base carriers",
+  );
+  assert(
+    remaining.every((r) => alertMessageCarriesNoBaseWarning(r.message)),
+    "every surviving alert still carries the outstanding no-base condition",
+  );
+}
+
+{
+  // Pure keep_no_base banner (zero adjudicated conflicts at raise time): zero
+  // active table rows must leave it untouched — there was never a conflict row
+  // to resolve, and clearing would drop the only warning that exists.
+  const d = verseDb();
+  const msg = `Sync flagged 0 verse(s) in EZK UST for adjudicated review. ${buildNoBaseSentence(3, ["21:9"])}`;
+  d.prepare(
+    `INSERT INTO system_alerts (username, severity, source, message)
+     VALUES ('deferredreward', 'warning', 'verse_merge_conflict:EZK:ust', ?)`,
+  ).run(msg);
+
+  const result = clearResolvedBanner(d, "EZK", "ust");
+  assert(!result.cleared && result.preservedNoBase, "pure keep_no_base banner is not cleared");
+  const alert = d.prepare(`SELECT * FROM system_alerts WHERE source = 'verse_merge_conflict:EZK:ust'`).get();
+  assert(!!alert, "…the row is still there");
 }
 
 // ─────────────────────────────────────────────────────────────────────────
