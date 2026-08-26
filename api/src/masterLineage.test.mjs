@@ -46,6 +46,27 @@
 //       (spans newlines)                        whose value sits on the next
 //                                               line is NOT the measured one"
 //
+// Re-run 2026-08-26 for #634 (masterLineage.ts's own header note 4 and the
+// AI_PIPELINE_TRAILER / AI_PIPELINE_SUBJECT_PREFIX comments carry the same
+// figures):
+//
+//   R12 AI_PIPELINE_SUBJECT_PREFIX gate           exit 1, 4 FAIL — both #622
+//       removed from the trailer route            trailer-route assertions
+//       (the trailer route's ONLY subject          plus both new #634 ones:
+//       gate before #634; #629's REVERT_PREFIX     a bot-authored revert and
+//       gate on that route turned out to be        a bot-authored hand
+//       provably subsumed by this one — see        REPAIR, each quoting a
+//       AI_PIPELINE_TRAILER's own comment — so      trailer in its body,
+//       there is no longer a narrower ablation      both wrongly become `ai`
+//       to run for #629 alone)                      with no subject gate at all
+//   R13 REVERT_PREFIX narrowed back to             exit 1, 2 FAIL — the two
+//       `/^revert\s/i` (the pre-#634 pattern)       widened-prefix cases:
+//                                                   `Reverts "…"` (no space)
+//                                                   and `Revert:"…"` (colon)
+//                                                   both fall through to
+//                                                   AI_MARKER and wrongly
+//                                                   become `ai`
+//
 // Read that honestly: on MEASURED data the LAM-intro exclusion needs only ONE
 // of {chapter digits, bracket} to survive, which is why R2 and R3 alone break
 // nothing and R5 breaks it. The end anchor (R4) breaks nothing measurable at
@@ -260,6 +281,9 @@ eq(classifyMasterCommit({ sha: "x", message: "align PSA 7, 8 superscriptions", a
 // revert, not a pipeline push. The trailer test must not outvote the subject:
 // a hand-directed revert pushed through the bot account is exactly the class
 // #614 exists to preserve as `human`.
+// RECONSTRUCTED (`sha: "deadbeef"`): no bot-authored revert of this exact
+// shape was ever quoted/measured against the corpus — the fixture is
+// prospective, built to probe the gap #622 describes, not a cited commit.
 eq(
   kind(
     'Revert "UST: JER 31 [Gr..e@api.bp-assistant]"\n\nThis reverts commit deadbeef.\n\nUST: JER 31 [Gr..e@api.bp-assistant]\n\nX-AI-Pipeline: bp-assistant/generate\n',
@@ -277,6 +301,74 @@ eq(
   }).reason,
   "bot_author_no_pipeline_shape",
   "…and the reason says WHY, same as any other hand-directed bot push (#622)",
+);
+
+// ── #634 part 1: a bot-pushed HAND REPAIR that quotes what it repairs ──────
+// #622's REVERT_PREFIX guard only excludes REVERTS from the trailer route. It
+// does nothing for a hand repair whose subject is not a revert at all but
+// whose body pastes the offending commit's own message — trailer included —
+// as a maintainer citing what they fixed naturally would. The module's own
+// motivating case is exactly this shape: e417839d09,
+// `fix: restore HAB 2:1-10 TN rows lost in AI insert` (THE MEASURED BASIS
+// above). RECONSTRUCTED: e417839d09's own real body was not refetched for
+// this fixture; the body below is a plausible worst case built to probe the
+// gap, not that commit's literal text.
+eq(
+  kind(
+    "fix: restore HAB 2:1-10 TN rows lost in AI insert\n\nReverts the damage from:\n\nTN: HAB 2 [be..s@api.bp-assistant]\n\nX-AI-Pipeline: bp-assistant/notes\n",
+    BOT,
+  ),
+  "human",
+  "a bot-pushed hand repair whose body quotes the repaired commit's trailer is human, not ai (#634)",
+);
+eq(
+  classifyMasterCommit({
+    sha: "x",
+    message:
+      "fix: restore HAB 2:1-10 TN rows lost in AI insert\n\nTN: HAB 2 [be..s@api.bp-assistant]\n\nX-AI-Pipeline: bp-assistant/notes\n",
+    authorEmail: BOT,
+  }).reason,
+  "bot_author_no_pipeline_shape",
+  "…and the reason says WHY, same as any other hand-directed bot push (#634)",
+);
+// The gate must not swallow a REAL trailer commit: subjects with a genuine
+// pipeline shape still pass it (already covered above, e.g. the "TN:
+// regenerate JER notes…" case) — this just pins that AI_PIPELINE_SUBJECT_PREFIX
+// alone, without a resource prefix, is what the fail-closed gate rejects.
+eq(
+  classifyMasterCommit({
+    sha: "x",
+    message: "TN: regenerate JER notes after prompt change\n\nX-AI-Pipeline: bp-assistant/notes\n",
+    authorEmail: BOT,
+  }).kind,
+  "ai",
+  "…while a subject that DOES carry a resource prefix still passes the trailer route (#634)",
+);
+
+// ── #634 part 2: REVERT_PREFIX widened from `revert ` to `reverts?\b` ──────
+// The old `/^revert\s/i` needed a literal space right after `revert`, missing
+// `Reverts` (no space before the next word) and `Revert:` (colon, not
+// whitespace) — both real shapes: the file header cites three `Reverts BE
+// changes` commits by rich.mahn (2026-08-17), and Gitea's own revert-button
+// wording can render as `Revert"…"` with no space before the quote. Each case
+// below reaches the (non-bot) AI_MARKER route, where REVERT_PREFIX is the ONLY
+// gate — so these fail against the old regex and pass against `reverts?\b`.
+eq(
+  kind('Reverts "TQ: AMO 5 [be..s@api.bp-assistant]" and related changes', RICH),
+  "human",
+  "RECONSTRUCTED: 'Reverts \"…\"' (no space before the quote) is human, not ai — REVERT_PREFIX now matches without a following space (#634)",
+);
+eq(
+  kind('Revert:"UST: JER 31 [Gr..e@api.bp-assistant]"', RICH),
+  "human",
+  "RECONSTRUCTED: 'Revert:\"…\"' (colon, no space) is human, not ai — \\b matches a word/non-word boundary too (#634)",
+);
+// And the widened prefix must not start matching an unrelated word that
+// merely begins with the same letters.
+eq(
+  kind('Revertsomething "TQ: AMO 5 [be..s@api.bp-assistant]"', RICH),
+  "ai",
+  "'Revertsomething' is NOT a revert — \\b must not fire mid-word (#634)",
 );
 
 // The dead `AI …for BOOK CH` vocabulary is deliberately NOT accepted: nothing

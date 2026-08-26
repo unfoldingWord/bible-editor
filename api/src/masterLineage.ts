@@ -106,6 +106,15 @@
 //    one route that still recognizes a future bot pushing under an author
 //    BOT_EMAILS does not know (see the constant's own note) — but do not
 //    credit it with doing work today. (issue #612)
+//    The same trap applies to the AI_PIPELINE_TRAILER route, which reads the
+//    BOT-authored commit's body rather than an unknown author's subject: a
+//    bot-pushed hand-directed revert or repair can quote another commit's
+//    trailer verbatim. #629 first fixed the revert shape with a REVERT_PREFIX
+//    gate on that route; #634 replaced it with the broader
+//    AI_PIPELINE_SUBJECT_PREFIX gate (the subject must show SOME pipeline
+//    shape, not just an absence of "revert"), which subsumes #629's case and
+//    additionally closes the sibling one: a hand REPAIR whose subject cites
+//    no pipeline shape at all — e417839d09 itself.
 //
 // FAIL-SAFE DIRECTION, and it is the whole safety argument for this module.
 // Downstream, `ai` and `ours` are what let a conflict resolve D1-wins; `human`
@@ -165,7 +174,19 @@ const AI_MARKER = /@api\.bp-assistant\b/;
 // which would otherwise match AI_MARKER regardless of who authored the
 // revert. See note 4 above. Matches both `Revert "…` (Gitea's own wording)
 // and a plain `revert …` a maintainer might type by hand.
-const REVERT_PREFIX = /^revert\s/i;
+//
+// `\b` rather than a required `\s`, and `s?` for the plural (issue #634): the
+// old `/^revert\s/i` needed a literal space right after `revert`, which missed
+// `Reverts` (the corpus's own `Reverts BE changes`, three real commits by
+// rich.mahn on 2026-08-17 — see note 1 above) and `Revert:` (colon, not
+// whitespace). `\b` matches either shape, plus a bare `Revert` with nothing
+// after it, while still rejecting an unrelated word that merely starts with
+// the same letters (`Revertsome` fails: no word/non-word transition after
+// `revert` or after `reverts`). Not widened to `reapply` / `undo` / `rollback`
+// — issue #634 flags them as worth considering but explicitly declines to add
+// them without measuring the real corpus first, and this module does not
+// guess.
+const REVERT_PREFIX = /^reverts?\b/i;
 
 // The bot account that authors every bp-assistant push. Necessary for `ai`, and
 // (since #550) no longer sufficient on its own — see classifyMasterCommit.
@@ -230,7 +251,43 @@ const AI_PIPELINE_SUBJECT =
 // `revert 682f8938… (#7036)` whose body quotes the reverted commit's subject
 // AND its trailer. A trailer-only rule calls that human revert `ai` — the same
 // species of trap as `Revert "bible-editor: …"` in note 1.
+//
+// The trailer route also requires the SUBJECT to carry SOME pipeline shape
+// (AI_PIPELINE_SUBJECT_PREFIX, checked at the call site below). #629
+// originally gated this route on the narrower REVERT_PREFIX — excluding just
+// the case where Gitea's revert button quotes a reverted pipeline commit's
+// trailer verbatim. #634 replaced it with AI_PIPELINE_SUBJECT_PREFIX, which
+// subsumes that case and additionally closes the sibling one: a bot-pushed
+// HAND REPAIR whose subject is not a revert but whose body pastes the message
+// of the commit it repairs, trailer included. e417839d09 (`fix: restore HAB
+// 2:1-10 TN rows lost in AI insert`, THE MEASURED BASIS above) is exactly
+// this shape; a repair that also quotes what it repairs must not flip back to
+// `ai` on the strength of that quote.
+// REVERT_PREFIX is not ALSO checked here: the two patterns are both anchored
+// at `^` and share no prefix (`revert` vs. `ULT|UST|TN|TQ`), so no subject can
+// ever match both — AI_PIPELINE_SUBJECT_PREFIX already excludes every revert
+// subject on its own (measured by ablation, not just argued: removing
+// REVERT_PREFIX from the old combined condition left every assertion in
+// masterLineage.test.mjs passing). Keeping a provably-dead condition around
+// would be exactly the unmeasured guess this module's own discipline refuses
+// elsewhere. Re-add it only if AI_PIPELINE_SUBJECT_PREFIX's alternation ever
+// grows a resource code beginning with the letters `re` — none of
+// ULT/UST/TN/TQ do today.
 const AI_PIPELINE_TRAILER = /^X-AI-Pipeline:[ \t]*bp-assistant\//m;
+
+// The resource-prefix half of AI_PIPELINE_SUBJECT ONLY — no book code, no
+// chapter digits, no bracket, no end anchor. Used solely to gate the trailer
+// route (#634): every real trailer commit's subject already matches the FULL
+// AI_PIPELINE_SUBJECT (518/518, so this loose check costs nothing measured),
+// but a subject with no pipeline shape whatsoever — a hand-typed `fix: …`, a
+// book-wide intro pass, anything not even claiming to be a ULT/UST/TN/TQ
+// push — must not be waved through on a quoted trailer alone. Deliberately
+// looser than the full pattern (rather than requiring the whole thing, which
+// would make this route redundant with the subject rule above it) so the
+// trailer keeps doing its one stated job: surviving a future narrowing of the
+// book/chapter/bracket grammar that a real pipeline push's resource prefix
+// would still be expected to carry.
+const AI_PIPELINE_SUBJECT_PREFIX = /^(ULT|UST|TN|TQ):\s/;
 
 function firstLine(message: string | null): string {
   if (!message) return "";
@@ -261,12 +318,15 @@ export function classifyMasterCommit(commit: MasterCommit): ClassifiedCommit {
     if (AI_PIPELINE_SUBJECT.test(subject)) {
       return { ...commit, kind: "ai", reason: "bot_author_pipeline_subject" };
     }
-    // Gated on REVERT_PREFIX too: Gitea's revert button quotes the reverted
-    // commit's body verbatim, trailer included, so a hand-directed bot revert
-    // of a pipeline push would otherwise match this trailer test on a quoted
-    // header it never wrote itself. A revert subject settles it regardless of
-    // what the body quotes — see note 4 and REVERT_PREFIX above.
-    if (!REVERT_PREFIX.test(subject) && AI_PIPELINE_TRAILER.test(message)) {
+    // Gated on AI_PIPELINE_SUBJECT_PREFIX (#634, subsuming #629's narrower
+    // REVERT_PREFIX gate — see that constant's own comment): a bot-authored
+    // commit whose BODY quotes another commit's pipeline trailer must not
+    // classify `ai` unless its own SUBJECT shows some pipeline shape too.
+    // That covers both a hand-directed revert (Gitea's button quotes the
+    // reverted commit's body verbatim, trailer included) and a hand repair
+    // that instead pastes the message of the commit it repairs — neither
+    // subject looks like a pipeline push.
+    if (AI_PIPELINE_SUBJECT_PREFIX.test(subject) && AI_PIPELINE_TRAILER.test(message)) {
       return { ...commit, kind: "ai", reason: "bot_author_pipeline_trailer" };
     }
     // A bot commit that is neither is a HAND-DIRECTED bot push — the six
