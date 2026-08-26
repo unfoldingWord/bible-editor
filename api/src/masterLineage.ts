@@ -261,7 +261,12 @@ export function classifyMasterCommit(commit: MasterCommit): ClassifiedCommit {
     if (AI_PIPELINE_SUBJECT.test(subject)) {
       return { ...commit, kind: "ai", reason: "bot_author_pipeline_subject" };
     }
-    if (AI_PIPELINE_TRAILER.test(message)) {
+    // Gated on REVERT_PREFIX too: Gitea's revert button quotes the reverted
+    // commit's body verbatim, trailer included, so a hand-directed bot revert
+    // of a pipeline push would otherwise match this trailer test on a quoted
+    // header it never wrote itself. A revert subject settles it regardless of
+    // what the body quotes — see note 4 and REVERT_PREFIX above.
+    if (!REVERT_PREFIX.test(subject) && AI_PIPELINE_TRAILER.test(message)) {
       return { ...commit, kind: "ai", reason: "bot_author_pipeline_trailer" };
     }
     // A bot commit that is neither is a HAND-DIRECTED bot push — the six

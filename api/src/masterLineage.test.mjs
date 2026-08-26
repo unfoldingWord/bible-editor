@@ -249,6 +249,32 @@ eq(kind("fix: restore HAB 2:1-10 TN rows lost in the be..s@api.bp-assistant inse
 eq(classifyMasterCommit({ sha: "x", message: "align PSA 7, 8 superscriptions", authorEmail: BOT }).reason,
   "bot_author_no_pipeline_shape", "…and the reason says WHY it is human, for the alert");
 
+// ── #622: a bot-authored revert whose quoted body carries the trailer ──────
+// Gitea's revert button quotes the reverted commit's body verbatim. If that
+// reverted commit was a real pipeline push, the quoted body still contains
+// `X-AI-Pipeline: bp-assistant/…` even though THIS commit's subject is a
+// revert, not a pipeline push. The trailer test must not outvote the subject:
+// a hand-directed revert pushed through the bot account is exactly the class
+// #614 exists to preserve as `human`.
+eq(
+  kind(
+    'Revert "UST: JER 31 [Gr..e@api.bp-assistant]"\n\nThis reverts commit deadbeef.\n\nUST: JER 31 [Gr..e@api.bp-assistant]\n\nX-AI-Pipeline: bp-assistant/generate\n',
+    BOT,
+  ),
+  "human",
+  "a bot-authored revert quoting a pipeline trailer in its body is human, not ai (#622)",
+);
+eq(
+  classifyMasterCommit({
+    sha: "x",
+    message:
+      'Revert "UST: JER 31 [Gr..e@api.bp-assistant]"\n\nThis reverts commit deadbeef.\n\nX-AI-Pipeline: bp-assistant/generate\n',
+    authorEmail: BOT,
+  }).reason,
+  "bot_author_no_pipeline_shape",
+  "…and the reason says WHY, same as any other hand-directed bot push (#622)",
+);
+
 // The dead `AI …for BOOK CH` vocabulary is deliberately NOT accepted: nothing
 // has used it since 2026-04-01, it appears under three non-bot identities, and
 // one commit it would readmit is the defective run e417839d09 had to repair.
