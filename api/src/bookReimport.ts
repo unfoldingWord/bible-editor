@@ -110,6 +110,7 @@ import {
   deleteLostAdoptionConflicts,
   raiseVerseMergeConflictAlert,
 } from "./verseMergeConflicts.ts";
+import { refineAdoptConflictForVisibleChange } from "./visibleAdoptionChange.ts";
 import { lanesForAdoption, reopenLaneChecksBulk } from "./laneReopen.ts";
 // REIMPORT_CHAPTER_CHUNK / reimportChunkBoundaries live in their own
 // zero-dependency module (reimportChunkPlan.ts) so the chunk-boundary math —
@@ -4085,6 +4086,34 @@ async function applyVerseRows(
     }
   }
 
+  // 6a. Issue #633: refine adopt_conflict on the VISIBLE axes (plain text +
+  // alignment groups) using the post-canonize bytes we are about to store.
+  // Runs AFTER the #539 no-op guard so a conflicted byte-no-op (source-attr
+  // collision that canonize folded back onto D1) keeps its adopt_conflict
+  // review row — refining first would reclassify that case as
+  // adopt_no_visible_change and #539 would drop it. Only rows still marked
+  // adopted (a real write is about to land) are refined: when wording and
+  // groups match, the audit row becomes `adopt_no_visible_change` and stays
+  // out of the editor-facing banner; when they differ, the reason names
+  // wording vs alignment.
+  if (masterAdoptions.length > 0) {
+    for (const a of masterAdoptions) {
+      if (a.merge.action !== "adopt_conflict") continue;
+      const mc = mergeConflicts.find(
+        (row) => row.chapter === a.v.chapter && row.verse === a.v.verse && row.adopted,
+      );
+      if (!mc || mc.action !== "adopt_conflict") continue;
+      const refined = refineAdoptConflictForVisibleChange(
+        "adopt_conflict",
+        a.merge.reason,
+        a.beforeContentJson,
+        a.v.contentJson,
+      );
+      mc.action = refined.action;
+      mc.reason = refined.reason;
+    }
+  }
+
   // 6b. FIX 3: write EVERY merge-conflict row (including tentative "adopt"
   // rows whose CAS hasn't run yet) BEFORE the adoption batch below, not
   // after. `applyVerseRows` runs inside a Workflow `step.do` that retries on
@@ -4307,7 +4336,7 @@ async function applyVerseRows(
   // current text. Refused verses (never attempted a write) are untouched —
   // `mc.adopted` is false for `keep_alignment_refused`, and
   // deleteLostAdoptionConflicts is additionally scoped to
-  // `action IN ('adopt', 'adopt_conflict')` as a second, independent guard.
+  // `action IN ('adopt', 'adopt_conflict', 'adopt_no_visible_change')` as a second, independent guard.
   //
   // FIX 2 CORRECTION: this used to force `lostAdoptionRefs = []` whenever
   // `recordFailed`, on the theory that step 7's adoption-write batch never

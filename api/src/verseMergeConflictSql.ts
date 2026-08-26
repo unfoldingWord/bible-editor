@@ -72,6 +72,9 @@ export const RESOLVE_VERSE_MERGE_CONFLICT_SQL = `UPDATE verse_merge_conflicts
 //                              waiting to happen.
 // A clean 'adopt' (master moved, we didn't) is deliberately EXCLUDED — it needs
 // no judgement and stays in the table purely as an audit trail.
+// Same for 'adopt_no_visible_change' (issue #633): both sides moved by stableKey
+// but plain text and alignment groups match, so the write is cosmetic — audit
+// only, never a banner claiming Door43 replaced the editor's work.
 //
 // Binds, in order: (book, resource).
 // ---------------------------------------------------------------------------
@@ -194,14 +197,20 @@ export const UPSERT_VERSE_MERGE_CONFLICT_SQL = `INSERT INTO verse_merge_conflict
      -- over. Keeping it sticky would leave the banner asserting "the editor's
      -- version was kept and the export will publish it" about a verse that has
      -- since adopted master's. Nothing else un-sticks it: CONFIRM_ADOPTED_
-     -- CONFLICT_SQL below matches only ('adopt','adopt_conflict').
+     -- CONFLICT_SQL below matches only ('adopt','adopt_conflict',
+     -- 'adopt_no_visible_change').
+     -- 'adopt_no_visible_change' (issue #633) is treated like 'adopt' here: it
+     -- is audit-only and must not erase a prior adopt_conflict's recovery
+     -- pointer / banner claim.
      action = CASE
-       WHEN excluded.action = 'adopt' AND verse_merge_conflicts.action = 'adopt_conflict'
+       WHEN excluded.action IN ('adopt', 'adopt_no_visible_change')
+         AND verse_merge_conflicts.action = 'adopt_conflict'
        THEN verse_merge_conflicts.action
        ELSE excluded.action
      END,
      reason = CASE
-       WHEN excluded.action = 'adopt' AND verse_merge_conflicts.action = 'adopt_conflict'
+       WHEN excluded.action IN ('adopt', 'adopt_no_visible_change')
+         AND verse_merge_conflicts.action = 'adopt_conflict'
        THEN verse_merge_conflicts.reason
        ELSE excluded.reason
      END,
@@ -293,15 +302,15 @@ export const UPSERT_VERSE_MERGE_CONFLICT_SQL = `INSERT INTO verse_merge_conflict
 export const CONFIRM_ADOPTED_CONFLICT_SQL = `UPDATE verse_merge_conflicts
     SET resolved_at = NULL, resolved_by = NULL
   WHERE book = ?1 AND resource = ?2 AND chapter = ?3 AND verse = ?4
-    AND action IN ('adopt', 'adopt_conflict')`;
+    AND action IN ('adopt', 'adopt_conflict', 'adopt_no_visible_change')`;
 
 // ---------------------------------------------------------------------------
 // verseMergeConflicts.ts's deleteLostAdoptionConflicts — cleanup for a
 // speculative row written BEFORE the master-adoption CAS batch (see
 // bookReimport.ts step 6b/7b) whose write did NOT actually land (a human
-// wrote the verse first). Scoped to `action IN ('adopt', 'adopt_conflict')`
-// — a 'keep_alignment_refused' row never attempts a write, so it's never a
-// candidate.
+// wrote the verse first). Scoped to `action IN ('adopt', 'adopt_conflict',
+// 'adopt_no_visible_change')` — a 'keep_alignment_refused' row never attempts a
+// write, so it's never a candidate.
 //
 // `last_recorded_at = ?5` (NOT `detected_at` — see UPSERT_VERSE_MERGE_CONFLICT_SQL's
 // doc comment for why the two are kept separate) narrows the delete to rows
@@ -323,6 +332,6 @@ export const CONFIRM_ADOPTED_CONFLICT_SQL = `UPDATE verse_merge_conflicts
 // ---------------------------------------------------------------------------
 export const DELETE_LOST_ADOPTION_CONFLICT_SQL = `DELETE FROM verse_merge_conflicts
     WHERE book = ?1 AND resource = ?2 AND chapter = ?3 AND verse = ?4
-      AND action IN ('adopt', 'adopt_conflict')
+      AND action IN ('adopt', 'adopt_conflict', 'adopt_no_visible_change')
       AND resolved_at IS NULL
       AND last_recorded_at = ?5`;

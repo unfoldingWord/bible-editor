@@ -23,7 +23,13 @@
 //                              recovery pointer (the version it replaced).
 //   'adopt_conflict'         — both D1 and master moved since the last
 //                              published ancestor; master won, and the
-//                              overwritten D1 edit may need recovery.
+//                              overwritten D1 edit may need recovery. Reason
+//                              may be narrowed to both_changed_wording /
+//                              both_changed_alignment / both_changed when the
+//                              visible axes actually differ (issue #633).
+//   'adopt_no_visible_change'— both sides moved by stableKey, but plain text
+//                              and alignment groups match (issue #633). Audit
+//                              trail only — excluded from banners like 'adopt'.
 //   'keep_alignment_refused' — adopting master's edit would have lost
 //                              alignment on words neither side touched, so D1
 //                              was kept instead and a human should look.
@@ -40,9 +46,10 @@
 //                              from bookReimport.ts's applyVerseRows edited-skip
 //                              branch (reconcileSourceAttrsFromMaster's
 //                              `divergent` report).
-// The banner alert (raiseVerseMergeConflictAlert) filters to only the latter
-// three — a clean 'adopt' needs nobody's attention, so it stays in the table
-// (audit trail) but never in the count a human sees.
+// The banner alert (raiseVerseMergeConflictAlert) filters to only the
+// judgement-needed actions — a clean 'adopt' and an 'adopt_no_visible_change'
+// need nobody's attention, so they stay in the table (audit trail) but never
+// in the count a human sees.
 //
 // overwritten_version is the D1 `verses.version` that was replaced — the old
 // text is recoverable from that verse's version history
@@ -569,7 +576,12 @@ export async function raiseVerseMergeConflictAlert(
       (r): r is VerseMergeConflictRow & { overwrittenVersion: number } =>
         r.action === "adopt_conflict" && r.overwrittenVersion != null,
     )
-    .map((r) => ({ chapter: r.chapter, verse: r.verse, overwrittenVersion: r.overwrittenVersion }));
+    .map((r) => ({
+      chapter: r.chapter,
+      verse: r.verse,
+      overwrittenVersion: r.overwrittenVersion,
+      reason: r.reason,
+    }));
   // keep_no_base verses (issue #544): NOTHING was overwritten, but the same
   // human needs the same warning the admin gets — see groupNoBaseVersesByEditor's
   // header comment for why this reuses the overwritten-lookup machinery keyed

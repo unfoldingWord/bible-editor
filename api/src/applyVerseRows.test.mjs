@@ -434,7 +434,10 @@ console.log("\n[#537 fallout: a GENUINE human edit after export still blocks cle
     "adopt_conflict",
     "the real post-export human edit still blocks the clean-adopt path (case 5), landing on the flagged both_changed path instead",
   );
-  eq(conflict.reason, "both_changed", "…for the right reason");
+  // Issue #633: record-time refinement narrows both_changed to what a reader
+  // can see. This fixture only changes plain text (no alignment groups), so
+  // the stored reason is both_changed_wording — still alertable adopt_conflict.
+  eq(conflict.reason, "both_changed_wording", "…for the right (visible-axes) reason");
   eq(counts.merge_adopted, 1, "still adopts (master wins on both_changed by default), but AS a flagged conflict, not silently");
 }
 
