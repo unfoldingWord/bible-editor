@@ -305,8 +305,10 @@ export interface ReimportCounts {
   // Verse flagged for human review after a merge: action "adopt_conflict"
   // (both D1 and master moved since the ancestor) or "keep_alignment_refused"
   // (adopting master would lose alignment). Deliberately EXCLUDES a clean
-  // "adopt" (master moved, we didn't) — that case needs no human judgment, so
-  // it is recorded in verse_merge_conflicts as an audit trail only (see
+  // "adopt" (master moved, we didn't) and "adopt_no_visible_change" (issue
+  // #633: both sides moved by stableKey but plain text + alignment groups
+  // match) — those need no human judgment, so they are recorded in
+  // verse_merge_conflicts as an audit trail only (see
   // recordVerseMergeConflicts) but never counted here or in the banner alert.
   // Recording is best-effort — see merge_record_failed for when it fails. An
   // "adopt_conflict" whose version-CAS write was LOST is not counted or
@@ -4372,12 +4374,17 @@ async function applyVerseRows(
   // it is durably recorded (step 6b, for the audit trail) but not counted
   // here, matching the banner alert's filter (see the book-level call sites
   // in runReimport / runChunkedReimport, which read verse_merge_conflicts
-  // directly rather than the rows this call staged). FIX 5: this run's
-  // recording failure (if any) is surfaced via merge_record_failed so the
-  // caller can fold it into the book-level alert instead of silently letting
-  // the "Recorded durably" claim go unverified.
+  // directly rather than the rows this call staged). Issue #633: also excludes
+  // "adopt_no_visible_change" — same audit-only intent; counting it here would
+  // make the UI reimport summary say "flagged for review (merge conflict)" for
+  // a cosmetic write. FIX 5: this run's recording failure (if any) is surfaced
+  // via merge_record_failed so the caller can fold it into the book-level alert
+  // instead of silently letting the "Recorded durably" claim go unverified.
   const liveConflicts = mergeConflicts.filter(
-    (mc) => (!mc.adopted || adoptionsApplied.has(`${mc.chapter}:${mc.verse}`)) && mc.action !== "adopt",
+    (mc) =>
+      (!mc.adopted || adoptionsApplied.has(`${mc.chapter}:${mc.verse}`)) &&
+      mc.action !== "adopt" &&
+      mc.action !== "adopt_no_visible_change",
   );
   counts.merge_conflicts += liveConflicts.length;
   if (recordFailed) counts.merge_record_failed = true;
