@@ -58,6 +58,7 @@ import { requireAuth } from "./auth";
 import {
   alertMessageCarriesNoBaseWarning,
   buildEditorLookupQuery,
+  buildGroupedRefsClause,
   buildMergeConflictGuidance,
   EDITOR_LOOKUP_CHUNK,
   groupNoBaseVersesByEditor,
@@ -102,6 +103,20 @@ export interface VerseMergeConflictRow {
    * NULL falls back to the pre-#507 unconditional-reactivation behavior.
    */
   observedVersion: number | null;
+  /**
+   * `verse_merge_conflicts.detected_at` — the durable "first flagged" date
+   * (issue #624), preserved across re-detections of the SAME still-unresolved
+   * conflict by the upsert's ON CONFLICT DO UPDATE (see that statement's doc
+   * comment). Optional: only populated on the ALERT READ path
+   * (raiseVerseMergeConflictAlert), where it comes back from D1. It is not
+   * read off THIS field on the write path: recordVerseMergeConflicts binds the
+   * run's own timestamp into detected_at itself (`?9` in
+   * UPSERT_VERSE_MERGE_CONFLICT_SQL, so one run stamps one value across every
+   * row it inserts, rather than each row taking its own `unixepoch()`). So
+   * this field stays absent on that path rather than forcing every writer to
+   * pass a value the statement would ignore.
+   */
+  detectedAt?: number | null;
 }
 
 const WRITE_BATCH = 90;
@@ -266,6 +281,7 @@ interface StoredConflictRow {
   reason: string;
   overwritten_version: number | null;
   alignment: string | null;
+  detected_at: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -469,6 +485,7 @@ export async function raiseVerseMergeConflictAlert(
       // This row is being read for display (the banner alert), not written —
       // observedVersion only matters to recordVerseMergeConflicts's writer.
       observedVersion: null,
+      detectedAt: r.detected_at,
     };
   });
 
@@ -502,14 +519,6 @@ export async function raiseVerseMergeConflictAlert(
   const reasonCounts = new Map<string, number>();
   for (const r of rows) reasonCounts.set(r.reason, (reasonCounts.get(r.reason) ?? 0) + 1);
   const reasonBreakdown = [...reasonCounts.entries()].map(([reason, n]) => `${n} ${reason}`).join(", ") || "none";
-  // FIX 6: include the version in each listed ref (e.g. "12:4@v7") so the
-  // recovery instruction below is self-sufficient instead of pointing at "the
-  // version number recorded for it" without ever stating one.
-  const refs = rows
-    .slice(0, 10)
-    .map((r) => `${r.chapter}:${r.verse}${r.overwrittenVersion != null ? `@v${r.overwrittenVersion}` : ""}`)
-    .join(", ");
-  const more = rows.length > 10 ? `; +${rows.length - 10} more` : "";
   // Per-outcome guidance, classified by ACTION (never by the nullable
   // overwritten_version pointer) — see buildMergeConflictGuidance. Pulled into
   // that pure helper so the three-way overwritten / kept-alignment /
@@ -520,7 +529,13 @@ export async function raiseVerseMergeConflictAlert(
     noBaseCount: opts.noBaseCount,
     noBaseRefs: opts.noBaseRefs,
   });
-  const refsClause = rows.length > 0 ? ` Refs: ${refs}${more}.` : "";
+  // Issue #624: each ref grouped under its own reason, each group carrying
+  // the oldest detected_at in that reason as a plain "first flagged" date —
+  // see buildGroupedRefsClause's header for why (the old flat "Refs: a, b,
+  // c" left every ref unjoined to the reason it was flagged for). Includes
+  // the version in each ref (e.g. "12:4@v7", FIX 6) so the recovery
+  // instruction in `guidance` is self-sufficient.
+  const refsClause = buildGroupedRefsClause(rows);
   // FIX I: this fires from both the nightly cron and the user-triggered
   // POST /:book/reimport route (runReimport calls this too), so "Nightly
   // sync" overclaimed the trigger on the latter — say "sync" without a
@@ -640,6 +655,7 @@ interface VerseMergeConflictRecord {
   reason: string;
   overwritten_version: number | null;
   alignment: string | null;
+  detected_at: number;
 }
 
 export const verseMergeConflicts = new Hono<{
@@ -660,7 +676,7 @@ verseMergeConflicts.get("/:book", async (c) => {
   // the table for the audit trail (see the resolved_at column comment in
   // migration 0049) but must not keep showing up here as outstanding.
   const rs = await c.env.DB.prepare(
-    `SELECT resource, chapter, verse, action, reason, overwritten_version, alignment
+    `SELECT resource, chapter, verse, action, reason, overwritten_version, alignment, detected_at
        FROM verse_merge_conflicts
       WHERE book = ?1 AND resolved_at IS NULL
       ORDER BY chapter ASC, verse ASC, resource ASC`,
@@ -685,6 +701,11 @@ verseMergeConflicts.get("/:book", async (c) => {
       reason: r.reason,
       overwrittenVersion: r.overwritten_version,
       alignment,
+      // Issue #624: the durable "first flagged" date (never reset by
+      // re-detection of the same still-unresolved conflict — see
+      // VerseMergeConflictRow.detectedAt's doc comment), so the in-app
+      // merge-review banner can show it per verse without a prod D1 query.
+      detectedAt: r.detected_at,
     };
   });
   return c.json({ conflicts });

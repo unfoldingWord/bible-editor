@@ -75,7 +75,7 @@ export const RESOLVE_VERSE_MERGE_CONFLICT_SQL = `UPDATE verse_merge_conflicts
 //
 // Binds, in order: (book, resource).
 // ---------------------------------------------------------------------------
-export const SELECT_ACTIVE_ALERTABLE_CONFLICTS_SQL = `SELECT chapter, verse, action, reason, overwritten_version, alignment
+export const SELECT_ACTIVE_ALERTABLE_CONFLICTS_SQL = `SELECT chapter, verse, action, reason, overwritten_version, alignment, detected_at
      FROM verse_merge_conflicts
     WHERE book = ?1 AND resource = ?2
       AND action IN ('adopt_conflict', 'keep_alignment_refused', 'source_attr_divergent', 'keep_ai_master')
