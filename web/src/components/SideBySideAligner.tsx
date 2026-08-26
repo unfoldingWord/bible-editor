@@ -10,12 +10,14 @@ import {
   useState,
 } from "react";
 import { Box, Typography, IconButton, Dialog, Tooltip, Button, useTheme } from "@mui/material";
+import CheckIcon from "@mui/icons-material/Check";
 import CloseIcon from "@mui/icons-material/Close";
 import KeyboardArrowLeftIcon from "@mui/icons-material/KeyboardArrowLeft";
 import KeyboardArrowRightIcon from "@mui/icons-material/KeyboardArrowRight";
 import { AlignmentPanel, type AlignmentPanelHandle } from "./AlignmentPanel";
 import { UhbStrip } from "./UhbStrip";
 import { type HoverHighlight, type HighlightCtx } from "../lib/highlightTypes";
+import { LANE_FILL, type TextLaneCheck } from "../lib/laneChecks";
 import type { TwlRow, VerseDto } from "../sync/api";
 import type { LexiconEntry } from "../hooks/useLexicon";
 import { extractEditableText, normalizeEditable } from "../lib/usfm";
@@ -123,6 +125,86 @@ interface Props {
   // Verse nav (titlebar arrows). Undefined at the chapter's ends.
   onPrevVerse?: () => void;
   onNextVerse?: () => void;
+  // Text-lane checkoff for the current verse — same control as the rail /
+  // column verse markers, so translators can stamp "done" without leaving
+  // the dual aligner (check sits next to the verse chip + next-arrow).
+  textCheck?: TextLaneCheck;
+}
+
+// Text-lane checkoff for the dual-aligner titlebar — same 18×18 cell as the
+// timeline rail (role=checkbox, Cultivate-teal fill), adapted for the dark bar.
+function DualTextCheck({
+  verseNum,
+  textCheck,
+}: {
+  verseNum: number;
+  textCheck: TextLaneCheck;
+}) {
+  const shade = textCheck.shade(verseNum);
+  const filled = shade !== "open";
+  const fill = filled ? LANE_FILL[shade] : null;
+  const disabled = !textCheck.canCheck;
+  const title = `Text — ${textCheck.attribution(verseNum)}`;
+  const box = (
+    <Box
+      role="checkbox"
+      aria-checked={filled}
+      aria-disabled={disabled || undefined}
+      aria-label={title}
+      onClick={(e) => {
+        e.stopPropagation();
+        if (disabled) return;
+        textCheck.onToggle(verseNum);
+      }}
+      sx={{
+        width: 18,
+        height: 18,
+        ml: 0.5,
+        borderRadius: "4px",
+        cursor: disabled ? "not-allowed" : "pointer",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        bgcolor: fill ? fill.bg : "transparent",
+        color: fill ? fill.fg : "transparent",
+        border: fill ? "none" : "1.5px solid",
+        borderColor: fill ? "transparent" : "rgba(255,255,255,0.55)",
+        opacity: disabled ? 0.5 : 1,
+        transition: "background-color 120ms",
+        "&:hover": disabled ? {} : { borderColor: fill ? "transparent" : "rgba(255,255,255,0.9)" },
+      }}
+    >
+      {filled && <CheckIcon sx={{ fontSize: 13 }} />}
+    </Box>
+  );
+  if (disabled) {
+    return (
+      <Tooltip title="Book is locked — checkoff is disabled" placement="bottom">
+        {box}
+      </Tooltip>
+    );
+  }
+  // Unchecked: short discoverability tip (this surface is new). Checked: same
+  // slow attribution tooltip as the rail.
+  if (!filled) {
+    return (
+      <Tooltip title="Mark text done" placement="bottom">
+        {box}
+      </Tooltip>
+    );
+  }
+  return (
+    <Tooltip
+      title={title}
+      placement="bottom"
+      enterDelay={1200}
+      enterNextDelay={1200}
+      leaveDelay={0}
+      TransitionProps={{ timeout: { appear: 0, enter: 150, exit: 0 } }}
+    >
+      {box}
+    </Tooltip>
+  );
 }
 
 // Full-width popup hosting two AlignmentPanels (e.g. ULT + UST) that align to
@@ -145,6 +227,7 @@ export function SideBySideAligner({
   onSaveReading,
   onPrevVerse,
   onNextVerse,
+  textCheck,
 }: Props) {
   const [hover, setHover] = useState<HoverHighlight>(null);
   const [hoverLink, setHoverLink] = useState<boolean>(readHoverLink);
@@ -272,6 +355,7 @@ export function SideBySideAligner({
             >
               {vref}
             </Box>
+            {textCheck && <DualTextCheck verseNum={verseNum} textCheck={textCheck} />}
             <Tooltip title="next verse">
               <span>
                 <IconButton

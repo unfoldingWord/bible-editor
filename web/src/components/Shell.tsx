@@ -3705,6 +3705,12 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           right={dualAlignerProps.right}
           onPrevVerse={dualNav.prev != null ? () => dualNavTo(dualNav.prev!) : undefined}
           onNextVerse={dualNav.next != null ? () => dualNavTo(dualNav.next!) : undefined}
+          // Lane checks live on the loaded chapter's useChapter state; only
+          // wire when the dual popup is on that same chapter (verse arrows
+          // already no-op across chapters for the same reason).
+          textCheck={
+            dualAlignerProps.chapter === chapter ? textLaneCheck : undefined
+          }
           onSaveReading={(bv, plain, base, afterCommit) =>
             // base.verse, not verseNum — each side's row may start at a
             // different verse (ULT v7 singleton vs UST 6-9 range row).
