@@ -69,6 +69,8 @@ import {
 import {
   CONFIRM_ADOPTED_CONFLICT_SQL,
   DELETE_LOST_ADOPTION_CONFLICT_SQL,
+  CLEAR_CONFLICT_ONLY_ALERTS_BY_SOURCE_SQL,
+  CLEAR_CONFLICT_ONLY_ALERTS_BY_USER_SQL,
   SELECT_ACTIVE_ALERTABLE_CONFLICTS_SQL,
   UPSERT_VERSE_MERGE_CONFLICT_SQL,
 } from "./verseMergeConflictSql.ts";
@@ -372,13 +374,17 @@ export async function clearResolvedConflictBannerIfLast(env: Env, book: string, 
     if (toClear.length === 0) return; // nothing undismissed, or every row still carries keep_no_base
     // Prefer one source-wide clear when every undismissed row is conflict-only
     // (the common case). Fall back to per-username when a keep_no_base row
-    // must stay — clearUndismissedAlertsStmt already supports both shapes.
+    // must stay. Both statements re-check "no active alertable conflicts"
+    // inside the DELETE — see the constants' header for the reimport race that
+    // guard closes. NOT clearUndismissedAlertsStmt: its other two call sites
+    // are the raise/replan path, which deletes-then-reinserts precisely WHILE
+    // conflicts are active, so the guard would make them no-ops.
     if (toClear.length === (alerts.results?.length ?? 0)) {
-      await clearUndismissedAlertsStmt(env, source).run();
+      await env.DB.prepare(CLEAR_CONFLICT_ONLY_ALERTS_BY_SOURCE_SQL).bind(source, book, resource).run();
       return;
     }
     for (const a of toClear) {
-      await clearUndismissedAlertsStmt(env, source, a.username).run();
+      await env.DB.prepare(CLEAR_CONFLICT_ONLY_ALERTS_BY_USER_SQL).bind(a.username, source, book, resource).run();
     }
   } catch (e) {
     console.error("verseMergeConflicts: resolved-banner clear failed", {

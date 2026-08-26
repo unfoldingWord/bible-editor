@@ -73,6 +73,8 @@ import {
   CONFIRM_ADOPTED_CONFLICT_SQL,
   DELETE_LOST_ADOPTION_CONFLICT_SQL,
   RESOLVE_VERSE_MERGE_CONFLICT_SQL,
+  CLEAR_CONFLICT_ONLY_ALERTS_BY_SOURCE_SQL,
+  CLEAR_CONFLICT_ONLY_ALERTS_BY_USER_SQL,
   SELECT_ACTIVE_ALERTABLE_CONFLICTS_SQL,
   UPSERT_VERSE_MERGE_CONFLICT_SQL,
   VERSE_PATCH_UPDATE_SQL,
@@ -350,10 +352,10 @@ function verseDb() {
 // PATCH route, issue #626) against real SQLite, using the ACTUAL
 // SELECT_ACTIVE_ALERTABLE_CONFLICTS_SQL text so this can't silently drift
 // from what that function really queries. The DELETE mirrors
-// clearUndismissedAlertsStmt — source-wide when every undismissed row is
-// conflict-only, per-username when a keep_no_base message must stay (PR #631
-// review P1).
-function clearResolvedBanner(d, book, resource) {
+// the ACTUAL CLEAR_CONFLICT_ONLY_ALERTS_BY_* text — source-wide when every
+// undismissed row is conflict-only, per-username when a keep_no_base message
+// must stay (PR #631 review P1).
+function clearResolvedBanner(d, book, resource, raceHook) {
   const active = d.prepare(SELECT_ACTIVE_ALERTABLE_CONFLICTS_SQL).all(book, resource);
   if (active.length > 0) return { cleared: false, preservedNoBase: false };
   const source = `verse_merge_conflict:${book}:${resource}`;
@@ -367,15 +369,18 @@ function clearResolvedBanner(d, book, resource) {
     // the latter is an intentional preserve.
     return { cleared: alerts.length === 0, preservedNoBase: alerts.length > 0 };
   }
+  // `raceHook` lets a test simulate a reimport landing in the gap between the
+  // decision above and the DELETE below (PR #631 Codex review) — the exact
+  // window the NOT EXISTS inside both statements exists to close.
+  if (raceHook) raceHook(d);
+  let changes = 0;
   if (toClear.length === alerts.length) {
-    d.prepare(`DELETE FROM system_alerts WHERE source = ? AND dismissed_at IS NULL`).run(source);
+    changes = d.prepare(CLEAR_CONFLICT_ONLY_ALERTS_BY_SOURCE_SQL).run(source, book, resource).changes;
   } else {
-    const del = d.prepare(
-      `DELETE FROM system_alerts WHERE username = ? AND source = ? AND dismissed_at IS NULL`,
-    );
-    for (const a of toClear) del.run(a.username, source);
+    const del = d.prepare(CLEAR_CONFLICT_ONLY_ALERTS_BY_USER_SQL);
+    for (const a of toClear) changes += del.run(a.username, source, book, resource).changes;
   }
-  return { cleared: true, preservedNoBase: toClear.length < alerts.length };
+  return { cleared: changes > 0, preservedNoBase: toClear.length < alerts.length };
 }
 
 // Runs the REAL verses.ts PATCH-route UPDATE (VERSE_PATCH_UPDATE_SQL) first
@@ -520,6 +525,41 @@ function saveVerse(d, { book, resource, chapter, verse, matchVersion, userId, no
   assert(cleared.cleared, "the last active conflict just resolved -> banner is cleared");
   const remaining = d.prepare(`SELECT * FROM system_alerts WHERE source = 'verse_merge_conflict:JER:ult'`).all();
   assert(remaining.length === 0, "cleared by SOURCE — both the admin's row and the editor's fan-out row are gone");
+}
+
+{
+  // PR #631 Codex review: the "is this the last one?" decision and the DELETE
+  // are separate round-trips. A reimport landing in that gap records a fresh
+  // conflict and raises its banner — and the now-stale clear used to delete
+  // that brand-new warning, leaving a real divergence unannounced until the
+  // next sync. The NOT EXISTS inside the DELETE must make the clear a no-op.
+  const d = verseDb();
+  d.prepare(
+    `INSERT INTO verse_merge_conflicts (book, resource, chapter, verse, action, reason, overwritten_version, detected_at, resolved_at)
+     VALUES ('JER', 'ult', 41, 8, 'source_attr_divergent', 'source_attr_ambiguous', NULL, 100, 12345)`,
+  ).run();
+  d.prepare(
+    `INSERT INTO system_alerts (username, severity, source, message)
+     VALUES ('deferredreward', 'warning', 'verse_merge_conflict:JER:ult', 'Sync flagged 1 verse(s)...')`,
+  ).run();
+
+  const cleared = clearResolvedBanner(d, "JER", "ult", (db) => {
+    // The interleaved reimport: a new conflict row, then its refreshed banner.
+    db.prepare(
+      `INSERT INTO verse_merge_conflicts (book, resource, chapter, verse, action, reason, overwritten_version, detected_at, resolved_at)
+       VALUES ('JER', 'ult', 43, 2, 'adopt_conflict', 'both_changed', 7, 200, NULL)`,
+    ).run();
+    db.prepare(`DELETE FROM system_alerts WHERE source = 'verse_merge_conflict:JER:ult' AND dismissed_at IS NULL`).run();
+    db.prepare(
+      `INSERT INTO system_alerts (username, severity, source, message)
+       VALUES ('deferredreward', 'warning', 'verse_merge_conflict:JER:ult', 'Sync flagged 1 verse(s) in JER ULT... Refs: 43:2.')`,
+    ).run();
+  });
+
+  assert(!cleared.cleared, "a conflict recorded mid-flight makes the stale clear a no-op");
+  const alert = d.prepare(`SELECT * FROM system_alerts WHERE source = 'verse_merge_conflict:JER:ult'`).get();
+  assert(!!alert, "the reimport's fresh banner survives the racing clear");
+  assert(alert.message.includes("43:2"), "…and it is the NEW banner, naming the newly-flagged verse");
 }
 
 {
