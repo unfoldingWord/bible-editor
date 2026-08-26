@@ -1195,26 +1195,48 @@ function ts(dateStr) {
     { chapter: 3, verse: 1, reason: "a", overwrittenVersion: null, detectedAt: ts("2026-08-05") },
   ];
   const clause = buildGroupedRefsClause(rows, 3);
-  assert(clause.includes("a: 1:1, 1:2 (first flagged 2026-08-05)."),
-    "group 'a's date is its true oldest row (2026-08-05), even though that row is past the cap and unlisted");
+  assert(clause.includes("a: 1:1, 1:2, +1 more (first flagged 2026-08-05)."),
+    "group 'a's date is its true oldest row (2026-08-05) — and its own '+1 more' says the dated row is one it did not list");
   assert(!clause.includes("3:1"), "the past-cap row itself is not listed as a ref");
-  assert(clause.includes("+2 more."), "the global cap still reports the uncapped remainder, same as the old flat list");
+  assert(clause.includes("b: 2:1, +1 more (first flagged 2026-08-01)."),
+    "reason 'b' is truncated in its own group too, rather than by a trailing count that reads as 'a's");
+  assert(!/\+\d+ more\./.test(clause.replace(/\+\d+ more \(/g, "")),
+    "no free-floating global remainder: every hidden row is counted inside the group it belongs to");
 }
 
 {
-  // A reason whose rows are ENTIRELY past the cap gets no group of its own —
-  // its count already surfaced in the caller's separate reasonBreakdown
-  // parenthetical, so silently omitting the group (rather than printing an
-  // empty one) is correct, not a truncation bug.
+  // PR #630 review F1, the measured motivation: a reason whose every row sorts
+  // past the cap used to vanish from the clause entirely. That is exactly
+  // backwards — the rare reason is the one needing hand work, and the crowded
+  // one is what a reader can already infer from the count parenthetical.
+  // Round-robin gives every reason its first ref before any gets a second.
   const rows = [
     { chapter: 1, verse: 1, reason: "a", overwrittenVersion: null, detectedAt: ts("2026-08-20") },
     { chapter: 1, verse: 2, reason: "a", overwrittenVersion: null, detectedAt: ts("2026-08-20") },
     { chapter: 2, verse: 1, reason: "b", overwrittenVersion: null, detectedAt: ts("2026-08-01") },
   ];
   const clause = buildGroupedRefsClause(rows, 2);
-  assert(!clause.includes("reason \"b\""), "sanity: reason 'b' string check below is meaningful");
-  assert(!/\bb:/.test(clause), "reason 'b', entirely past the cap, gets no group at all");
-  assert(clause.includes("+1 more."), "…but the remainder count still includes it");
+  assert(/\bb: 2:1\b/.test(clause), "reason 'b', last in chapter order, still names its ref instead of being capped away");
+  assert(clause.includes("a: 1:1, +1 more"), "…the crowded reason yields the slot, and says so in its own group");
+  assert(!clause.includes("1:2"), "…so 'a's second ref is the one dropped, not 'b's only ref");
+}
+
+{
+  // The one case that can still omit a group outright: more distinct reasons
+  // than the cap has slots. Those rows are reported in a trailing clause that
+  // says what it is, rather than silently discarded or folded into the last
+  // group's own overflow.
+  const rows = [
+    { chapter: 1, verse: 1, reason: "a", overwrittenVersion: null, detectedAt: ts("2026-08-20") },
+    { chapter: 2, verse: 1, reason: "b", overwrittenVersion: null, detectedAt: ts("2026-08-20") },
+    { chapter: 3, verse: 1, reason: "c", overwrittenVersion: null, detectedAt: ts("2026-08-20") },
+    { chapter: 3, verse: 2, reason: "c", overwrittenVersion: null, detectedAt: ts("2026-08-20") },
+  ];
+  const clause = buildGroupedRefsClause(rows, 2);
+  assert(/\ba: 1:1\b/.test(clause) && /\bb: 2:1\b/.test(clause), "the reasons that fit are listed");
+  assert(!/\bc:/.test(clause), "reason 'c' has no slot left — the cap is smaller than the reason count");
+  assert(clause.includes("+2 more in reasons not listed."),
+    "…and its rows are counted in a clause naming them as a different reason, not as 'b's overflow");
 }
 
 {
@@ -1243,9 +1265,11 @@ function ts(dateStr) {
     detectedAt: ts("2026-08-01"),
   }));
   const clause = buildGroupedRefsClause(rows);
-  assert(clause.includes(`${MERGE_CONFLICT_REFS_DISPLAY}`) && !clause.includes(`1:${MERGE_CONFLICT_REFS_DISPLAY + 1}`),
-    "default cap lists up to MERGE_CONFLICT_REFS_DISPLAY refs and no further");
-  assert(clause.includes("+1 more."), "…and reports the one remaining row");
+  // Asserting on `1:10`, not the bare "10": the loose form also matches the
+  // "+10 more" tail, so it never actually proved the 10th ref was listed.
+  assert(clause.includes(`1:${MERGE_CONFLICT_REFS_DISPLAY}`), "default cap lists up to MERGE_CONFLICT_REFS_DISPLAY refs");
+  assert(!clause.includes(`1:${MERGE_CONFLICT_REFS_DISPLAY + 1}`), "…and no further");
+  assert(clause.includes("+1 more"), "…and reports the one remaining row, inside the group it belongs to");
 }
 
 if (failed) {

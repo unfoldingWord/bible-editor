@@ -105,10 +105,13 @@ export interface VerseMergeConflictRow {
    * (issue #624), preserved across re-detections of the SAME still-unresolved
    * conflict by the upsert's ON CONFLICT DO UPDATE (see that statement's doc
    * comment). Optional: only populated on the ALERT READ path
-   * (raiseVerseMergeConflictAlert), where it comes back from D1. The WRITE
-   * path (recordVerseMergeConflicts) never sets it — detected_at is a column
-   * default (`unixepoch()`), not a value callers choose — so it stays absent
-   * there rather than forcing every writer to pass a meaningless value.
+   * (raiseVerseMergeConflictAlert), where it comes back from D1. It is not
+   * read off THIS field on the write path: recordVerseMergeConflicts binds the
+   * run's own timestamp into detected_at itself (`?9` in
+   * UPSERT_VERSE_MERGE_CONFLICT_SQL, so one run stamps one value across every
+   * row it inserts, rather than each row taking its own `unixepoch()`). So
+   * this field stays absent on that path rather than forcing every writer to
+   * pass a value the statement would ignore.
    */
   detectedAt?: number | null;
 }

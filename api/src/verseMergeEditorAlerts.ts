@@ -187,13 +187,29 @@ function plainDate(unixSeconds: number): string {
 // THAT REASON — not just among the displayed refs — as a plain date, so "how
 // long has this been sitting" survives the display cap.
 //
-// The overall display cap is still applied ONCE, globally, exactly like the
-// flat list it replaces — a reason whose refs are entirely past the cap gets
-// no group of its own (its count already surfaced in the reasonBreakdown
-// parenthetical the caller builds separately). Reason order follows first
-// appearance in `rows`, which the caller already orders by chapter/verse —
-// this keeps this clause's reason order identical to that parenthetical,
-// built from the same rows in the same order.
+// The cap is spent round-robin across reasons rather than taken off the front
+// of the list (PR #630 review F1/F2). Taking the first N in chapter order let
+// the cap swallow a whole reason: twelve source_attr_ambiguous rows in ch.3
+// plus the single alignment_shrink at 40:5 rendered the ch.3 refs and nothing
+// else, so the ONE ref needing hand work — the stated point of this clause —
+// was the one a reader could not see. Round-robin gives every reason its first
+// ref before any reason gets a second.
+//
+// It also makes the per-reason date honest. `first flagged` is the oldest
+// detected_at in the WHOLE reason, not just among the refs shown, so under the
+// old front-slice a group could be dated by a row it never listed — a reader
+// opening every ref found nothing that old. Now a group is either complete, in
+// which case the oldest row IS listed, or it carries its own `+K more` and the
+// date visibly belongs to the part not shown. Per-group markers also replace
+// the single trailing `+N more`, which sat after the last group and read as
+// that group's alone.
+//
+// Reason order follows first appearance in `rows`, which the caller already
+// orders by chapter/verse — this keeps this clause's reason order identical to
+// the reasonBreakdown parenthetical, built from the same rows in the same
+// order. A reason can still miss out entirely, but only when the distinct
+// reason count exceeds the cap outright; those rows are counted in the
+// trailing clause rather than silently dropped.
 export function buildGroupedRefsClause(rows: GroupableConflictRow[], cap: number = MERGE_CONFLICT_REFS_DISPLAY): string {
   if (rows.length === 0) return "";
   const oldestByReason = new Map<string, number>();
@@ -202,10 +218,9 @@ export function buildGroupedRefsClause(rows: GroupableConflictRow[], cap: number
     const cur = oldestByReason.get(r.reason);
     if (cur == null || r.detectedAt < cur) oldestByReason.set(r.reason, r.detectedAt);
   }
-  const displayRows = rows.slice(0, cap);
   const order: string[] = [];
   const byReason = new Map<string, GroupableConflictRow[]>();
-  for (const r of displayRows) {
+  for (const r of rows) {
     let group = byReason.get(r.reason);
     if (!group) {
       group = [];
@@ -214,16 +229,44 @@ export function buildGroupedRefsClause(rows: GroupableConflictRow[], cap: number
     }
     group.push(r);
   }
-  const clauses = order.map((reason) => {
-    const group = byReason.get(reason) ?? [];
+  // Round-robin: pass N hands every reason its Nth ref, so the cap runs out
+  // across reasons evenly instead of down the front of one.
+  const shown = new Map<string, GroupableConflictRow[]>();
+  let budget = cap;
+  for (let pass = 0; budget > 0; pass++) {
+    let placedAny = false;
+    for (const reason of order) {
+      if (budget === 0) break;
+      const all = byReason.get(reason) ?? [];
+      if (pass >= all.length) continue;
+      const list = shown.get(reason);
+      if (list) list.push(all[pass]);
+      else shown.set(reason, [all[pass]]);
+      budget--;
+      placedAny = true;
+    }
+    if (!placedAny) break;
+  }
+  const clauses: string[] = [];
+  let unlistedReasonRows = 0;
+  for (const reason of order) {
+    const all = byReason.get(reason) ?? [];
+    const group = shown.get(reason);
+    if (!group) {
+      // Only reachable when the distinct reason count exceeds the cap.
+      unlistedReasonRows += all.length;
+      continue;
+    }
     const refsStr = group
       .map((r) => `${r.chapter}:${r.verse}${r.overwrittenVersion != null ? `@v${r.overwrittenVersion}` : ""}`)
       .join(", ");
+    const hidden = all.length - group.length;
+    const moreStr = hidden > 0 ? `, +${hidden} more` : "";
     const oldest = oldestByReason.get(reason);
     const dateStr = oldest != null ? ` (first flagged ${plainDate(oldest)})` : "";
-    return `${reason}: ${refsStr}${dateStr}.`;
-  });
-  const more = rows.length > cap ? ` +${rows.length - cap} more.` : "";
+    clauses.push(`${reason}: ${refsStr}${moreStr}${dateStr}.`);
+  }
+  const more = unlistedReasonRows > 0 ? ` +${unlistedReasonRows} more in reasons not listed.` : "";
   return ` ${clauses.join(" ")}${more}`;
 }
 
