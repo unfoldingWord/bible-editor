@@ -148,6 +148,53 @@ function assert(cond, msg) {
 }
 
 {
+  // Issue #633: name what differs. Wording-only must still offer text recovery;
+  // alignment-only must NOT claim the words were replaced or tell them to re-save.
+  const wordingOnly = [{ chapter: 40, verse: 5, overwrittenVersion: 8, reason: "both_changed_wording" }];
+  const alignmentOnly = [{ chapter: 41, verse: 6, overwrittenVersion: 5, reason: "both_changed_alignment" }];
+  const both = [{ chapter: 40, verse: 10, overwrittenVersion: 6, reason: "both_changed" }];
+  const keyW = editLogKey("JER", "ult", wordingOnly[0]);
+  const keyA = editLogKey("JER", "ult", alignmentOnly[0]);
+  const keyB = editLogKey("JER", "ult", both[0]);
+  const users = new Map([
+    [keyW, "translator"],
+    [keyA, "translator"],
+    [keyB, "translator"],
+  ]);
+
+  const wMsg = groupOverwrittenVersesByEditor("JER", "ult", wordingOnly, users).get("translator").message;
+  assert(wMsg.includes("The wording changed."), "wording-only names wording");
+  assert(wMsg.includes("replaced text is still recoverable"), "wording-only still points at text recovery");
+  assert(!wMsg.includes("re-save"), "overwrite alert never tells the editor to re-save");
+
+  const aMsg = groupOverwrittenVersesByEditor("JER", "ult", alignmentOnly, users).get("translator").message;
+  assert(aMsg.includes("The alignment changed (the wording did not)."), "alignment-only names alignment");
+  assert(aMsg.includes("previous alignment is still recoverable"), "alignment-only recovers alignment, not 'replaced text'");
+  assert(!aMsg.includes("replaced text"), "alignment-only must not claim the words were replaced");
+  assert(!aMsg.includes("re-save"), "alignment-only never tells the editor to re-save");
+
+  const bMsg = groupOverwrittenVersesByEditor("JER", "ult", both, users).get("translator").message;
+  assert(bMsg.includes("The wording and the alignment changed."), "both-axes names both");
+}
+
+{
+  // Issue #633 admin guidance: same wording vs alignment distinction.
+  const w = buildMergeConflictGuidance([{ action: "adopt_conflict", reason: "both_changed_wording" }]);
+  assert(w.includes("The wording changed."), "admin wording-only names wording");
+  assert(w.includes("replaced text is still"), "admin wording-only keeps text recovery");
+
+  const a = buildMergeConflictGuidance([{ action: "adopt_conflict", reason: "both_changed_alignment" }]);
+  assert(a.includes("The alignment changed (the wording did not)."), "admin alignment-only names alignment");
+  assert(a.includes("previous alignment is still"), "admin alignment-only recovers alignment");
+  assert(!a.includes("replaced text"), "admin alignment-only must not claim replaced text");
+
+  // adopt_no_visible_change is not alertable — if it somehow reached guidance
+  // it is not an adopt_conflict, so it must not count as an overwrite.
+  const silent = buildMergeConflictGuidance([{ action: "adopt_no_visible_change", reason: "both_changed_no_visible" }]);
+  assert(!silent.includes("took Door43's version"), "no-visible-change action is not an overwrite sentence");
+}
+
+{
   // Same chapter:verse in two different books/resources must not collide —
   // editLogKey must be scoped by book+resource, not just chapter/verse.
   const a = { chapter: 1, verse: 1, overwrittenVersion: 2 };
@@ -1008,6 +1055,18 @@ function confirmAdopted(d, { book, resource, chapter, verse }) {
   const withAi = d.prepare(SELECT_ACTIVE_ALERTABLE_CONFLICTS_SQL).all("EZK", "ult");
   assert(withAi.some((r) => r.verse === 24 && r.action === "keep_ai_master"),
     "the banner filter surfaces a keep_ai_master row");
+
+  // Issue #633: adopt_no_visible_change is audit-only, same as clean adopt —
+  // wording + alignment groups matched, so it must never reach the banner.
+  d.prepare(
+    `INSERT INTO verse_merge_conflicts (book, resource, chapter, verse, action, reason, overwritten_version, detected_at)
+     VALUES ('EZK','ult',40,25,'adopt_no_visible_change','both_changed_no_visible',8,100)`,
+  ).run();
+  const withSilent = d.prepare(SELECT_ACTIVE_ALERTABLE_CONFLICTS_SQL).all("EZK", "ult");
+  assert(!withSilent.some((r) => r.verse === 25),
+    "adopt_no_visible_change is excluded from the banner filter (audit only)");
+  assert(withSilent.some((r) => r.verse === 24),
+    "…without dropping other alertable rows");
 }
 
 {

@@ -434,7 +434,10 @@ console.log("\n[#537 fallout: a GENUINE human edit after export still blocks cle
     "adopt_conflict",
     "the real post-export human edit still blocks the clean-adopt path (case 5), landing on the flagged both_changed path instead",
   );
-  eq(conflict.reason, "both_changed", "…for the right reason");
+  // Issue #633: record-time refinement narrows both_changed to what a reader
+  // can see. This fixture only changes plain text (no alignment groups), so
+  // the stored reason is both_changed_wording — still alertable adopt_conflict.
+  eq(conflict.reason, "both_changed_wording", "…for the right (visible-axes) reason");
   eq(counts.merge_adopted, 1, "still adopts (master wins on both_changed by default), but AS a flagged conflict, not silently");
 }
 
@@ -756,6 +759,93 @@ console.log("\n[a CONFLICTED no-op adopt writes nothing but KEEPS its review row
     mc[0].overwritten_version,
     null,
     "…with overwritten_version NULL: nothing was replaced, so it must not point a reviewer at text that still stands",
+  );
+}
+
+console.log("\n[#633: no-visible-change adoption is audit-only — not merge_conflicts, not the snackbar flag]");
+{
+  // End-to-end: both sides moved (adopt_conflict), storage bytes differ so the
+  // write lands, but plain text + alignment groups match → adopt_no_visible_change.
+  // That must NOT increment merge_conflicts (the UI snackbar derives
+  // "flagged for review (merge conflict)" from that counter alone).
+  const { summarizeReimport } = await import("../../web/src/lib/reimportSummary.ts");
+  const { env, sqlite } = freshEnv();
+
+  // Same readable text, different text-node boundaries — stableKey still
+  // differs; extractPlainText / alignment groups do not.
+  const oursJson = JSON.stringify({
+    verseObjects: [{ type: "text", text: "Hello world" }],
+  });
+  const theirsJson = JSON.stringify({
+    verseObjects: [
+      { type: "text", text: "Hello" },
+      { type: "text", text: " world" },
+    ],
+  });
+  const baseJson = JSON.stringify({
+    verseObjects: [{ type: "text", text: "ancestor" }],
+  });
+
+  sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (9, 909, 'translator')`).run();
+  sqlite
+    .prepare(
+      `INSERT INTO verses (book, chapter, verse, verse_end, bible_version, content_json, plain_text, version, updated_by)
+       VALUES (?, 9, 1, NULL, 'ULT', ?, 'Hello world', 4, 9)`,
+    )
+    .run(BOOK, oursJson);
+  const anc = sqlite
+    .prepare(
+      `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, payload_json, created_at)
+       VALUES ('verse', ?, ?, 9, 3, 4, 'update', ?, 100)`,
+    )
+    .run(`${BOOK}/9/1/ULT`, BOOK, JSON.stringify({ plain_text: "ancestor", content: baseJson }));
+  // A second post-export human edit so human_edit_after_export is true even
+  // if the content probe alone is ambiguous — both_changed requires both
+  // sides moved since the ancestor.
+  sqlite
+    .prepare(
+      `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, payload_json, created_at)
+       VALUES ('verse', ?, ?, 9, 3, 4, 'update', ?, 1500)`,
+    )
+    .run(
+      `${BOOK}/9/1/ULT`,
+      BOOK,
+      JSON.stringify({ plain_text: "Hello world", content: JSON.parse(oursJson) }),
+    );
+
+  const counts = await applyVerseRowsForTest(
+    env,
+    BOOK,
+    "ULT",
+    [{ chapter: 9, verse: 1, verseEnd: null, contentJson: theirsJson, plainText: "Hello world" }],
+    null,
+    { confirmedAt: 200, editId: Number(anc.lastInsertRowid) },
+    false,
+  );
+
+  const mc = sqlite
+    .prepare("SELECT action, reason, overwritten_version FROM verse_merge_conflicts WHERE chapter = 9 AND verse = 1")
+    .all()[0];
+  eq(mc.action, "adopt_no_visible_change", "audit row records the no-visible-change action");
+  eq(mc.reason, "both_changed_no_visible", "…with the no-visible reason");
+  eq(counts.merge_adopted, 1, "the cosmetic write still lands as an adoption");
+  eq(counts.merge_conflicts, 0, "…but is NOT counted as a merge conflict needing review");
+
+  const summary = summarizeReimport({
+    ok: true,
+    book: BOOK,
+    perResource: {},
+    totals: { ...counts, errors: counts.errors ?? [] },
+  });
+  eq(
+    summary.includes("flagged for review (merge conflict)"),
+    false,
+    `snackbar must not say flagged for review (got: ${summary})`,
+  );
+  eq(
+    summary.includes("adopted from master"),
+    true,
+    "…while still reporting the adoption that did land",
   );
 }
 

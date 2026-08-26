@@ -110,6 +110,7 @@ import {
   deleteLostAdoptionConflicts,
   raiseVerseMergeConflictAlert,
 } from "./verseMergeConflicts.ts";
+import { refineAdoptConflictForVisibleChange } from "./visibleAdoptionChange.ts";
 import { lanesForAdoption, reopenLaneChecksBulk } from "./laneReopen.ts";
 // REIMPORT_CHAPTER_CHUNK / reimportChunkBoundaries live in their own
 // zero-dependency module (reimportChunkPlan.ts) so the chunk-boundary math —
@@ -304,8 +305,10 @@ export interface ReimportCounts {
   // Verse flagged for human review after a merge: action "adopt_conflict"
   // (both D1 and master moved since the ancestor) or "keep_alignment_refused"
   // (adopting master would lose alignment). Deliberately EXCLUDES a clean
-  // "adopt" (master moved, we didn't) — that case needs no human judgment, so
-  // it is recorded in verse_merge_conflicts as an audit trail only (see
+  // "adopt" (master moved, we didn't) and "adopt_no_visible_change" (issue
+  // #633: both sides moved by stableKey but plain text + alignment groups
+  // match) — those need no human judgment, so they are recorded in
+  // verse_merge_conflicts as an audit trail only (see
   // recordVerseMergeConflicts) but never counted here or in the banner alert.
   // Recording is best-effort — see merge_record_failed for when it fails. An
   // "adopt_conflict" whose version-CAS write was LOST is not counted or
@@ -4085,6 +4088,34 @@ async function applyVerseRows(
     }
   }
 
+  // 6a. Issue #633: refine adopt_conflict on the VISIBLE axes (plain text +
+  // alignment groups) using the post-canonize bytes we are about to store.
+  // Runs AFTER the #539 no-op guard so a conflicted byte-no-op (source-attr
+  // collision that canonize folded back onto D1) keeps its adopt_conflict
+  // review row — refining first would reclassify that case as
+  // adopt_no_visible_change and #539 would drop it. Only rows still marked
+  // adopted (a real write is about to land) are refined: when wording and
+  // groups match, the audit row becomes `adopt_no_visible_change` and stays
+  // out of the editor-facing banner; when they differ, the reason names
+  // wording vs alignment.
+  if (masterAdoptions.length > 0) {
+    for (const a of masterAdoptions) {
+      if (a.merge.action !== "adopt_conflict") continue;
+      const mc = mergeConflicts.find(
+        (row) => row.chapter === a.v.chapter && row.verse === a.v.verse && row.adopted,
+      );
+      if (!mc || mc.action !== "adopt_conflict") continue;
+      const refined = refineAdoptConflictForVisibleChange(
+        "adopt_conflict",
+        a.merge.reason,
+        a.beforeContentJson,
+        a.v.contentJson,
+      );
+      mc.action = refined.action;
+      mc.reason = refined.reason;
+    }
+  }
+
   // 6b. FIX 3: write EVERY merge-conflict row (including tentative "adopt"
   // rows whose CAS hasn't run yet) BEFORE the adoption batch below, not
   // after. `applyVerseRows` runs inside a Workflow `step.do` that retries on
@@ -4307,7 +4338,7 @@ async function applyVerseRows(
   // current text. Refused verses (never attempted a write) are untouched —
   // `mc.adopted` is false for `keep_alignment_refused`, and
   // deleteLostAdoptionConflicts is additionally scoped to
-  // `action IN ('adopt', 'adopt_conflict')` as a second, independent guard.
+  // `action IN ('adopt', 'adopt_conflict', 'adopt_no_visible_change')` as a second, independent guard.
   //
   // FIX 2 CORRECTION: this used to force `lostAdoptionRefs = []` whenever
   // `recordFailed`, on the theory that step 7's adoption-write batch never
@@ -4343,12 +4374,17 @@ async function applyVerseRows(
   // it is durably recorded (step 6b, for the audit trail) but not counted
   // here, matching the banner alert's filter (see the book-level call sites
   // in runReimport / runChunkedReimport, which read verse_merge_conflicts
-  // directly rather than the rows this call staged). FIX 5: this run's
-  // recording failure (if any) is surfaced via merge_record_failed so the
-  // caller can fold it into the book-level alert instead of silently letting
-  // the "Recorded durably" claim go unverified.
+  // directly rather than the rows this call staged). Issue #633: also excludes
+  // "adopt_no_visible_change" — same audit-only intent; counting it here would
+  // make the UI reimport summary say "flagged for review (merge conflict)" for
+  // a cosmetic write. FIX 5: this run's recording failure (if any) is surfaced
+  // via merge_record_failed so the caller can fold it into the book-level alert
+  // instead of silently letting the "Recorded durably" claim go unverified.
   const liveConflicts = mergeConflicts.filter(
-    (mc) => (!mc.adopted || adoptionsApplied.has(`${mc.chapter}:${mc.verse}`)) && mc.action !== "adopt",
+    (mc) =>
+      (!mc.adopted || adoptionsApplied.has(`${mc.chapter}:${mc.verse}`)) &&
+      mc.action !== "adopt" &&
+      mc.action !== "adopt_no_visible_change",
   );
   counts.merge_conflicts += liveConflicts.length;
   if (recordFailed) counts.merge_record_failed = true;

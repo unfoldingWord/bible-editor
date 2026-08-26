@@ -159,6 +159,25 @@ has(
 );
 lacks(summarizeReimport(res({})), "reference differs", "no reference moves → no reference phrase");
 
+console.log("\n-- adopt_no_visible_change must not inflate the merge-conflict snackbar (#633) --");
+
+// bookReimport tallies adopt_no_visible_change into merge_adopted but NOT
+// merge_conflicts. If that exclusion regresses, this snackbar is exactly how
+// a translator learns "flagged for review" for a cosmetic write.
+const noVisible = summarizeReimport(res({ merge_adopted: 6, merge_conflicts: 0 }));
+has(noVisible, "6 adopted from master (out-of-band correction)", "adoptions still reported");
+lacks(
+  noVisible,
+  "flagged for review (merge conflict)",
+  "zero merge_conflicts → no review flag, even when adoptions landed",
+);
+// Sanity: a real conflict still surfaces.
+has(
+  summarizeReimport(res({ merge_adopted: 1, merge_conflicts: 1 })),
+  "1 flagged for review (merge conflict)",
+  "a real merge_conflicts count still becomes the review line",
+);
+
 console.log("\n-- reissued tombstones reclaimed (issue #427, option 1) --");
 
 // 0 / absent must print nothing, matching every other optional counter here.

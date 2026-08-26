@@ -18,6 +18,13 @@ export interface OverwrittenVerseRef {
   chapter: number;
   verse: number;
   overwrittenVersion: number;
+  /**
+   * verse_merge_conflicts.reason for this overwrite (issue #633). Names what a
+   * reader can see changed — wording, alignment, or both — so the editor
+   * message can say which, instead of always implying Door43 replaced their
+   * text with someone else's work.
+   */
+  reason?: string;
 }
 
 // edit_log has no (book, chapter, verse, resource) columns of its own — only
@@ -61,6 +68,40 @@ export function buildEditorLookupQuery(
   return { sql, keys };
 }
 
+// Issue #633 axes — string compares stay local so this module keeps its
+// zero-import contract (see file header). Reasons are minted by
+// visibleAdoptionChange.ts's refineAdoptConflictForVisibleChange.
+function reasonImpliesWordingChange(reason: string | undefined): boolean {
+  if (reason == null || reason === "") return true;
+  if (reason === "both_changed_alignment" || reason === "both_changed_no_visible") return false;
+  return (
+    reason === "both_changed" ||
+    reason === "both_changed_wording" ||
+    reason.startsWith("both_changed")
+  );
+}
+
+function reasonImpliesAlignmentChange(reason: string | undefined): boolean {
+  if (reason == null || reason === "") return true;
+  if (reason === "both_changed_wording" || reason === "both_changed_no_visible") return false;
+  return (
+    reason === "both_changed" ||
+    reason === "both_changed_alignment" ||
+    reason.startsWith("both_changed")
+  );
+}
+
+/** What-changed clause for an overwrite alert (issue #633). */
+export function describeOverwriteAxes(reasons: Array<string | undefined>): string {
+  const wording = reasons.some((r) => reasonImpliesWordingChange(r));
+  const alignment = reasons.some((r) => reasonImpliesAlignmentChange(r));
+  if (wording && alignment) return "The wording and the alignment changed.";
+  if (wording) return "The wording changed.";
+  if (alignment) return "The alignment changed (the wording did not).";
+  // Unreachable for alertable adopt_conflict rows; keep a neutral fallback.
+  return "Door43's version was taken.";
+}
+
 // Given the verses that were overwritten this run and the (key -> username)
 // lookup already fetched from D1, produce one message per affected editor. A
 // verse whose edit_log row has no user_id (an AI-pipeline edit with no human
@@ -73,26 +114,36 @@ export function groupOverwrittenVersesByEditor(
   overwritten: OverwrittenVerseRef[],
   usernameByKey: Map<string, string>,
 ): Map<string, { refs: string[]; message: string }> {
-  const byUser = new Map<string, string[]>();
+  const byUser = new Map<string, { refs: string[]; reasons: Array<string | undefined> }>();
   for (const ref of overwritten) {
     const username = usernameByKey.get(editLogKey(book, resource, ref));
     if (!username) continue;
-    const list = byUser.get(username) ?? [];
-    list.push(`${ref.chapter}:${ref.verse}@v${ref.overwrittenVersion}`);
-    byUser.set(username, list);
+    const entry = byUser.get(username) ?? { refs: [], reasons: [] };
+    entry.refs.push(`${ref.chapter}:${ref.verse}@v${ref.overwrittenVersion}`);
+    entry.reasons.push(ref.reason);
+    byUser.set(username, entry);
   }
   const out = new Map<string, { refs: string[]; message: string }>();
-  for (const [username, refs] of byUser) {
+  for (const [username, { refs, reasons }] of byUser) {
     // "Door43's sync", not "Door43's nightly sync": this fan-out fires from
     // raiseVerseMergeConflictAlert, which runs on both the 05:30 UTC cron AND
     // the user-triggered POST /:book/reimport route — the admin message in
     // verseMergeConflicts.ts already made this exact correction (its own
     // "FIX I"), and this message must not reintroduce the same overclaim.
+    //
+    // Issue #633: name what actually differs (wording vs alignment). The
+    // version-history recovery sentence stays when wording changed; when only
+    // alignment changed, point at the previous alignment rather than implying
+    // the words were replaced — and never tell the editor to re-save.
+    const axes = describeOverwriteAxes(reasons);
+    const wording = reasons.some((r) => reasonImpliesWordingChange(r));
+    const recovery = wording
+      ? `Your replaced text is still recoverable from each verse's version history, at the version number given after @v.`
+      : `Your previous alignment is still recoverable from each verse's version history, at the version number given after @v.`;
     const message =
       `Door43's sync overwrote your edit${refs.length === 1 ? "" : "s"} in ${book} ` +
-      `${resource.toUpperCase()} at ${refs.length} verse(s) with Door43's version: ${refs.join(", ")}. Your ` +
-      `replaced text is still recoverable from each verse's version history, at the version number given ` +
-      `after @v.`;
+      `${resource.toUpperCase()} at ${refs.length} verse(s) with Door43's version: ${refs.join(", ")}. ` +
+      `${axes} ${recovery}`;
     out.set(username, { refs, message });
   }
   return out;
@@ -271,17 +322,24 @@ export function buildGroupedRefsClause(rows: GroupableConflictRow[], cap: number
 }
 
 export function buildMergeConflictGuidance(
-  rows: Array<{ action: string }>,
+  rows: Array<{ action: string; reason?: string }>,
   opts: { recordingFailed?: boolean; noBaseCount?: number; noBaseRefs?: string[] } = {},
 ): string {
-  const overwritten = rows.filter((r) => r.action === "adopt_conflict").length;
+  const overwrittenRows = rows.filter((r) => r.action === "adopt_conflict");
+  const overwritten = overwrittenRows.length;
   const keptAlignment = rows.filter((r) => r.action === "keep_alignment_refused").length;
   const keptSourceAttr = rows.filter((r) => r.action === "source_attr_divergent").length;
   const keptAiMaster = rows.filter((r) => r.action === "keep_ai_master").length;
+  // Issue #633: name wording vs alignment on the admin sentence too. Split
+  // recovery copy so an alignment-only overwrite never claims "replaced text".
+  const overwriteAxes = describeOverwriteAxes(overwrittenRows.map((r) => r.reason));
+  const overwriteWording = overwrittenRows.some((r) => reasonImpliesWordingChange(r.reason));
+  const overwriteRecovery = overwriteWording
+    ? `the replaced text is still in that verse's version history, at the version number given after @v in its ref above.`
+    : `the previous alignment is still in that verse's version history, at the version number given after @v in its ref above.`;
   return [
     overwritten > 0
-      ? `${overwritten} took Door43's version over the editor's — the replaced text is still in that verse's ` +
-        `version history, at the version number given after @v in its ref above.`
+      ? `${overwritten} took Door43's version over the editor's — ${overwriteAxes} ${overwriteRecovery}`
       : "",
     keptAlignment > 0
       ? `${keptAlignment} kept the editor's version because adopting Door43's would have cost alignment — Door43's ` +
