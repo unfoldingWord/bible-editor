@@ -108,11 +108,7 @@ export function RowHistoryDialog({
         // See defaultPreviousHistoryVersion — exclude only the live restore
         // entry, not every historical one (issue #623).
         setSelectedVersion(
-          defaultPreviousHistoryVersion(
-            res.versions,
-            currentVersion,
-            effectiveVersion,
-          ),
+          defaultPreviousHistoryVersion(res.versions, effectiveVersion),
         );
         setLoading(false);
       })
@@ -124,7 +120,10 @@ export function RowHistoryDialog({
     return () => {
       cancelled = true;
     };
-  }, [open, kind, rowId, book, currentVersion, effectiveVersion]);
+    // NOT currentVersion: the default selection is derived from the fetched
+    // list alone now, so a cache-lag bump in that prop would only refetch and
+    // discard whatever version the translator had picked in the left rail.
+  }, [open, kind, rowId, book, effectiveVersion]);
 
   // Most recent first. EVERY entry is listed, restores included (issue #539
   // item 4). This used to drop every entry with a restored_from_version, on the
