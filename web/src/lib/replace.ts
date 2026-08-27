@@ -1631,6 +1631,52 @@ function markerSignature(plain: string): string {
   return parts.join(",");
 }
 
+// Number of inline marker tokens (`\q1`, `\p`, `\ts\*`) in an editable string.
+function markerTokenCount(plain: string): number {
+  const re = new RegExp(MARKER_TOKEN_RE.source, MARKER_TOKEN_RE.flags);
+  let n = 0;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(plain)) !== null) {
+    n++;
+    if (m[0].length === 0) re.lastIndex++;
+  }
+  return n;
+}
+
+// True when `newPlain` looks like a contenteditable capture that LOST the
+// editor's marker chips, rather than an edit that deliberately removed them.
+//
+// Markers live in the editable text as inline chips whose textContent the save
+// path reads back. When a capture drops those chips, every word still round-
+// trips — so the word tiers preserve the entire verse and all its alignment —
+// and then Step 2's reconcileMarkers, which rebuilds the marker layout from the
+// captured text ALONE, deletes every marker in the verse and re-inserts none.
+// The result is a total, SILENT loss of poetry lineation: `preservedAlignment`
+// stays true, so neither the collateral-loss guard nor the unaligned-words
+// toast fires. That is exactly what took all 11 `\q` markers out of HOS ULT
+// 11:9 / 11:11 / 11:12 in one editing session on 2026-08-11 and shipped them to
+// Door43 master, where they sat undetected for a fortnight (#606).
+//
+// The signature is deliberately narrow: EVERY marker gone, at least one there
+// before, and NOT ONE WORD changed. A translator genuinely reflowing poetry
+// into prose rewrites words, so that edit still reconciles from the capture. A
+// pure marker edit (`oldStripped === newStripped` — deleting a `\q` and nothing
+// else) never reaches here; the caller handles it as its own case. What this
+// leaves is "the punctuation moved and, at the same instant, all the lineation
+// vanished" — which no editing gesture produces, but a dropped chip does.
+function markerCaptureLooksDropped(
+  oldPlain: string,
+  newPlain: string,
+  oldStripped: string,
+  newStripped: string,
+): boolean {
+  if (markerTokenCount(oldPlain) === 0) return false;
+  if (markerTokenCount(newPlain) !== 0) return false;
+  if (oldStripped === newStripped) return false; // pure marker edit — honor it
+  const words = (s: string) => [...s.matchAll(WORD_RUN_RE)].map((m) => m[0]).join(" ");
+  return words(oldStripped) === words(newStripped);
+}
+
 // Re-lay the inert position markers (\p, \q1, \q2, \ts\*) of a verse to match
 // the edited text. Markers ARE text tokens in editable space but have NO raw
 // text in the verse tree, so diffing them is what destroys alignment: removing
@@ -1882,7 +1928,18 @@ export function smartEditVerse(
   // tiers untouched (they're zero-width position anchors).
   const oldStripped = normalizeEditable(stripMarkerTokens(oldPlain));
   const newStripped = normalizeEditable(stripMarkerTokens(newPlain));
-  const markersChanged = markerSignature(oldPlain) !== markerSignature(newPlain);
+  // The marker layout Step 2 reconciles against. Normally that is the captured
+  // text — but a capture that lost every chip while changing no word is not a
+  // marker layout at all (see markerCaptureLooksDropped, #606). Reconciling
+  // against it would delete the verse's whole poetry lineation and re-insert
+  // nothing. Fall back to the baseline's layout: the word sequence is unchanged,
+  // so every marker's word anchor is still exactly where it was, and both the
+  // relayout tier (which leaves markers in the tree) and the reassembly tier
+  // (which strips them and relies on Step 2 to put them back) come out right.
+  const markerLayout = markerCaptureLooksDropped(oldPlain, newPlain, oldStripped, newStripped)
+    ? oldPlain
+    : newPlain;
+  const markersChanged = markerSignature(oldPlain) !== markerSignature(markerLayout);
 
   // Step 1 — word/punctuation edit against the marker-stripped baseline.
   let result: SmartReplaceResult;
@@ -2020,7 +2077,7 @@ export function smartEditVerse(
     // `;` onto the far side of the `\q` line break (the ZEC 6:12 corruption class).
     const rc = (result.content as { verseObjects?: unknown[] } | null)?.verseObjects;
     const preReconcile = Array.isArray(rc) ? { verseObjects: pruneDeadMilestones(rc) } : result.content;
-    const reconciled = reconcileMarkers(preReconcile, newPlain);
+    const reconciled = reconcileMarkers(preReconcile, markerLayout);
     result = {
       content: reconciled.content,
       plainText: reconciled.plainText,

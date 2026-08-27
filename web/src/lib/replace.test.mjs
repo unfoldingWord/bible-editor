@@ -2111,6 +2111,122 @@ function countAligned(content) {
   assert(words.find((x) => x.text === "watched")?.strongs.length === 0, "edited 'watched' is unaligned");
 }
 
+// --- Case 74: a capture that LOST the editor's marker chips must not wipe the
+// verse's poetry lineation. HOS ULT 11:9 / 11:11 / 11:12 (#606).
+//
+// The marker chips are real text in the editable string. When the DOM capture
+// hands back a `newPlain` with every chip missing, the words still round-trip
+// perfectly — so the relayout tier preserves the whole verse and all its
+// alignment, and `preservedAlignment` stays true — and then Step 2's
+// reconcileMarkers rebuilds the marker layout from the captured text alone,
+// deleting every marker and re-inserting none. Silent, total loss of poetry
+// lineation with no guard and no toast. In prod this took all 11 `\q` markers
+// out of three HOS 11 verses in one twelve-minute editing session and shipped
+// them to Door43 master.
+//
+// Shape below mirrors HOS 11:9: interior \q2/\q1 line breaks, a closing curly
+// quote at the verse end, and a trailing \q1 that belongs to this verse's tree
+// (it renders before the NEXT verse's \v). The edit is the real one — delete
+// the closing quote — captured twice: once well-formed, once with the chips
+// dropped. Both must produce the same markers in the same places.
+{
+  console.log("\n[Case 74] Dropped marker chips in the capture do not wipe \\q lineation (#606)");
+  const verse = {
+    verseObjects: [
+      zaln("H1", [w("I"), t(" ")]),
+      zaln("H2", [w("will"), t(" ")]),
+      zaln("H3", [w("not"), t(" ")]),
+      zaln("H4", [w("come"), t(" ")]),
+      zaln("H5", [w("in"), t(" ")]),
+      zaln("H6", [w("wrath"), t(".")]),
+      t("”"),
+      { type: "quote", tag: "q1" },
+    ],
+  };
+  // Give it interior lineation too, so the "every marker gone" shape is real.
+  verse.verseObjects.splice(3, 0, { type: "quote", tag: "q2" });
+  verse.verseObjects.splice(0, 0, { type: "quote", tag: "q1" });
+
+  const old = extractEditableText(verse);
+  assert(
+    (old.match(/\\q/g) ?? []).length === 3,
+    `baseline has 3 marker chips (got ${JSON.stringify(old)})`,
+  );
+
+  // The edit: delete the closing curly quote. Nothing else changes.
+  const wellFormed = old.replace("”", "");
+  // The same edit as a capture that dropped every chip.
+  const chipsDropped = wellFormed.replace(/\\q\d?\s?/g, "").replace(/\s+/g, " ").trim();
+  assert(!/\\q/.test(chipsDropped), "chip-dropped capture really has no marker tokens");
+
+  const good = smartEditVerse(verse, old, wellFormed);
+  const bad = smartEditVerse(verse, old, chipsDropped);
+
+  const goodOut = extractEditableText(good.content);
+  const badOut = extractEditableText(bad.content);
+  assert(
+    (badOut.match(/\\q/g) ?? []).length === 3,
+    `all 3 markers survive the chip-dropped capture (got ${JSON.stringify(badOut)})`,
+  );
+  assert(
+    badOut === goodOut,
+    `chip-dropped capture matches the well-formed one (got ${JSON.stringify(badOut)}, want ${JSON.stringify(goodOut)})`,
+  );
+  assert(!/”/.test(badOut), "the quote the translator actually deleted is still gone");
+  const words = alignedWords(bad.content);
+  assert(words.length === 6, `all 6 words survive (got ${words.length})`);
+  assert(
+    words.every((x) => x.strongs.length === 1),
+    "every word keeps its alignment",
+  );
+}
+
+// --- Case 74b: the guard must NOT swallow a deliberate marker deletion.
+// Deleting a `\q` and changing nothing else is a pure marker edit and has to
+// keep working — the #606 guard only fires when the capture changed
+// punctuation AND lost every chip at the same time.
+{
+  console.log("\n[Case 74b] A deliberate marker deletion is still honored");
+  const verse = {
+    verseObjects: [
+      zaln("H1", [w("the"), t(" ")]),
+      zaln("H2", [w("people"), t(",")]),
+      t(" "),
+      { type: "quote", tag: "q2" },
+      zaln("H3", [w("and"), t(" ")]),
+      zaln("H4", [w("light"), t(".")]),
+    ],
+  };
+  const old = extractEditableText(verse); // "the people, \q2 and light."
+  const next = old.replace(/\\q2\s?/, ""); // drop the only marker, touch nothing else
+  const r = smartEditVerse(verse, old, next);
+  const out = extractEditableText(r.content);
+  assert(!/\\q/.test(out), `the deleted marker stays deleted (got ${JSON.stringify(out)})`);
+  assert(alignedWords(r.content).length === 4, "all words survive the marker deletion");
+}
+
+// --- Case 74c: a real reflow that rewrites words AND drops the lineation is
+// still taken at face value — the guard requires an UNCHANGED word sequence,
+// so genuine poetry→prose editing is untouched by it.
+{
+  console.log("\n[Case 74c] A word-changing reflow may still remove markers");
+  const verse = {
+    verseObjects: [
+      zaln("H1", [w("the"), t(" ")]),
+      zaln("H2", [w("people"), t(",")]),
+      t(" "),
+      { type: "quote", tag: "q2" },
+      zaln("H3", [w("and"), t(" ")]),
+      zaln("H4", [w("light"), t(".")]),
+    ],
+  };
+  const old = extractEditableText(verse);
+  const next = "the crowd, and light.";
+  const r = smartEditVerse(verse, old, next);
+  const out = extractEditableText(r.content);
+  assert(!/\\q/.test(out), `reflow that changed a word removes the marker (got ${JSON.stringify(out)})`);
+}
+
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed.`);
   process.exit(1);
