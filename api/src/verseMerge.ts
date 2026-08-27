@@ -335,6 +335,31 @@ function keysEqual(a: string | null, b: string | null): boolean {
   return a !== null && b !== null && a === b;
 }
 
+// Issue #609: the SAME lens step 1 (`keep_converged`) uses, exposed for the
+// nightly sync's PRISTINE and AI-only verse writers, which never reach
+// computeVerseMerge at all — they compared master's bytes to D1's raw, so any
+// verse where our own render→reparse does not settle (16-19% of the corpus,
+// STATE.md) was rewritten and version-bumped every single night with nothing a
+// translator could see having changed.
+//
+// Returns true ONLY when both sides parse AND their normalized forms match, so
+// unparseable JSON on either side is never "converged" — the caller writes, which
+// is the pre-existing behavior. Every safety argument above `normalizeForCompare`
+// and `dropOccurrenceForWordNodes` applies unchanged: each rule can only ever move
+// a comparison FROM "different" TOWARD "equal", and only for the artifact classes
+// they enumerate (whitespace-only differences, target-`\w` occurrence renumbering,
+// empty/absent text and nextChar). It cannot report equality for a tree whose node
+// array actually gained, lost or reordered a node.
+//
+// The trade-off is the same one this module already accepts for edited verses, now
+// widened to the pristine majority of the corpus: a Door43 maintainer genuinely
+// adding a missing space after a comma on a pristine verse stops being adopted and
+// is reverted by the next export. Callers must count what they suppress (see
+// bookReimport.ts's `skipped_normalized`) so the class is never invisible.
+export function verseContentConverged(ours: string, theirs: string): boolean {
+  return keysEqual(stableKey(ours), stableKey(theirs));
+}
+
 export function computeVerseMerge(input: VerseMergeInput): VerseMergeResult {
   const { base, ours, theirs, humanEditedSinceExport, masterMayHoldHumanEdit } = input;
 

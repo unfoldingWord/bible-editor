@@ -99,7 +99,12 @@ import { applyTwlSortOrderUpdates } from "./twlSortOrderApply";
 import { loadTwTitles } from "./twTitles";
 import { loadTwlOrderLocks } from "./twlOrderLocks";
 import type { TwlRow, VerseRow, CheckLane } from "./types";
-import { computeVerseMerge, type VerseMergeResult } from "./verseMerge.ts";
+import {
+  collapseWhitespaceForCompare,
+  computeVerseMerge,
+  verseContentConverged,
+  type VerseMergeResult,
+} from "./verseMerge.ts";
 import { NO_BASE_REF_DISPLAY, type NoBaseVerseRef } from "./verseMergeEditorAlerts.ts";
 import { verseContentJsonFromPayload } from "./verseHistory.ts";
 import { canonizeAlignmentSource } from "./canonizeHebrew.ts";
@@ -191,6 +196,22 @@ export interface ReimportCounts {
   // stamped for a resource whose prune phase was incomplete.
   prune_locked: number;
   skipped_noop: number;
+  // Issue #609. A PRISTINE (updated_by IS NULL) or AI-ONLY verse whose incoming
+  // master bytes differ from D1's, but only by artifacts verseMerge.ts's lens
+  // (`verseContentConverged`) normalizes away — render round-trip whitespace, a
+  // marker's `nextChar` flipping " " <-> "\n", target-`\w` occurrence renumbering,
+  // empty-vs-absent text nodes. No write, no version bump, no edit_log row.
+  //
+  // Why it is separate from `skipped_noop`: that counter means "master and D1 are
+  // byte-identical", a fact nobody has to think about. This one means "we chose
+  // NOT to adopt a real byte difference", which carries a real, decided cost — a
+  // genuinely whitespace-only Door43 edit on a pristine verse is now kept out of
+  // D1 and reverted by the next export, exactly as `merge_cosmetic_ignored`
+  // already reports for edited verses. Folding the two together would make that
+  // cost invisible, which is the failure mode STATE.md's "absent measurement is
+  // not evidence" lesson is about. verses only — TSV rows have their own lens
+  // (tsvMerge.ts) on their own paths.
+  skipped_normalized: number;
   // Incoming row not inserted because an identical-content row already exists
   // (Guard 2, content-dedup). Tracked separately from skipped_noop so the guard
   // firing is visible in the reimport summary / logs.
@@ -544,6 +565,7 @@ function zeroCounts(): ReimportCounts {
     chapters_locked: 0,
     prune_locked: 0,
     skipped_noop: 0,
+    skipped_normalized: 0,
     skipped_dup: 0,
     conflict_skipped: 0,
     tombstone_blocked: 0,
@@ -719,6 +741,13 @@ function addCounts(into: ReimportCounts, from: ReimportCounts): void {
   into.chapters_locked += from.chapters_locked ?? 0;
   into.prune_locked += from.prune_locked ?? 0;
   into.skipped_noop += from.skipped_noop;
+  // `?? 0` for the same reason tombstone_reclaimed uses it: a chunk result
+  // serialized by a Worker version that predates this field must not become a
+  // NaN. It gates nothing (a suppressed write leaves D1 holding content the lens
+  // says already matches master, so there is nothing stale for the export to
+  // revert and nothing to retry), so it deliberately stays out of the
+  // `incomplete` taint check above.
+  into.skipped_normalized += from.skipped_normalized ?? 0;
   into.skipped_dup += from.skipped_dup;
   into.conflict_skipped += from.conflict_skipped ?? 0;
   into.tombstone_blocked += from.tombstone_blocked ?? 0;
@@ -3346,6 +3375,39 @@ function reconcileEditedVerseSourceAttrs(
 // DO NOT revert this to a per-row loop: that regression silently reintroduced
 // the subrequest cap once (PR #180 batched it → a refactor un-batched it → PR
 // #195 re-batched). See the nightly-sync-subrequest-cap memory.
+// Issue #609: is this master-vs-D1 difference on a PRISTINE or AI-ONLY verse
+// provably a no-op under the same lens the edited path already uses?
+//
+// Called only after the cheap raw byte comparison has already said "different",
+// so the lens (a JSON parse + re-serialize of both sides) is never paid for the
+// overwhelmingly common no-change verse.
+//
+// SAFETY DIRECTION, deliberately one-way: this function may only ever return
+// true for a difference that is provably invisible; every uncertainty returns
+// false and the caller writes, which is the pre-fix behavior.
+//   - `verse_end` is compared EXACTLY. It is a bridge boundary (`\v 14-15`), not
+//     text, and there is no artifact class that perturbs it — a difference there
+//     is always real.
+//   - `plain_text` goes through collapseWhitespaceForCompare rather than an exact
+//     compare. It is derived from content_json, so once the trees are lens-equal
+//     the only differences it can still carry are the whitespace the same lens
+//     already collapses inside the tree. An exact compare here would re-introduce
+//     the churn on the very artifact (a trailing newline absorbed into the
+//     following text node) this fix exists to suppress.
+//   - `content_json` goes through verseContentConverged (verseMerge.ts's
+//     stableKey), whose per-rule safety arguments live in that module.
+// Nothing here changes what is WRITTEN — only whether a write happens at all.
+function isNormalizedNoopVerseWrite(
+  ex: { content_json: string; plain_text: string | null; verse_end: number | null },
+  v: VerseExtract,
+): boolean {
+  if ((ex.verse_end ?? null) !== (v.verseEnd ?? null)) return false;
+  if (collapseWhitespaceForCompare(ex.plain_text ?? null) !== collapseWhitespaceForCompare(v.plainText ?? null)) {
+    return false;
+  }
+  return verseContentConverged(ex.content_json, v.contentJson);
+}
+
 async function applyVerseRows(
   env: Env,
   book: string,
@@ -3610,6 +3672,15 @@ async function applyVerseRows(
           (ex.verse_end ?? null) === (v.verseEnd ?? null)
         ) {
           counts.skipped_noop++;
+        } else if (isNormalizedNoopVerseWrite(ex, v)) {
+          // Issue #609. Raw bytes differ, the lens says nothing did. Skipping the
+          // re-seed also skips its ownership reclaim (updated_by -> NULL), so this
+          // verse stays AI-owned for another night — which is exactly what the
+          // byte-equal branch directly above has always done for the same class of
+          // verse, so this widens an existing, stable outcome rather than creating
+          // a new one: isReimportableRow routes it back here every night, reaching
+          // the same decision until master or D1 actually moves.
+          counts.skipped_normalized++;
         } else {
           aiReseeds.push({ v, oldVersion: ex.version });
         }
@@ -3799,6 +3870,16 @@ async function applyVerseRows(
       (ex.verse_end ?? null) === (v.verseEnd ?? null)
     ) {
       counts.skipped_noop++;
+      continue;
+    }
+    // Issue #609. The raw comparison above is the cheap fast path; this is the
+    // same difference seen through the lens the edited path already trusts. A
+    // pristine verse is the majority of the corpus, and before this branch every
+    // one of them whose render→reparse does not settle was rewritten and
+    // version-bumped EVERY night, forever — a fresh version, a fresh edit_log row
+    // and every open tab's If-Match invalidated for a change nobody could see.
+    if (isNormalizedNoopVerseWrite(ex, v)) {
+      counts.skipped_normalized++;
       continue;
     }
     // Pristine + changed → update. The guard stays on the UPDATE; new_version is
