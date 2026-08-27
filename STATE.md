@@ -71,6 +71,20 @@ For the full corpus, see the memory index at
 `C:\Users\benja\.claude\projects\C--Users-benja-Documents-GitHub-bible-editor\memory\MEMORY.md`.
 Highlights that bite repeatedly:
 
+- **Marker chips are TEXT, and `smartEditVerse` rebuilds the verse's whole marker layout from the captured text
+  alone — so a capture that loses the chips silently deletes every `\q` in the verse.** `reconcileMarkers`
+  (`web/src/lib/replace.ts`) unconditionally drops every inert in-flow marker and re-inserts only the ones it
+  finds in `newPlain`. When the chips are missing, every word still round-trips, so alignment survives intact and
+  `preservedAlignment` stays **true** — neither the collateral-loss guard nor the unaligned-words toast fires —
+  and the nightly export carries the loss to master. That is #606: HOS ULT 11:9/11/12 lost all 11 of their `\q`
+  markers on 2026-08-11 and it sat live on Door43 for a fortnight. Reproduced exactly by replaying the real edit
+  (delete a curly quote) against the pre-damage trees parsed from export `ce54ec0d76` with the production
+  importer: chips present → 11 markers kept, chips dropped → 0. The engine now guards it
+  (`markerCaptureLooksDropped`), but the guard only covers an edit where **no word changed**; the upstream
+  capture bug is #642 (the Find overlay repaints the editable cell from marker-free `plain_text` while it stays
+  `contentEditable`, and closing Find does not restore the chips once a draft exists). **Lesson for any future
+  marker-loss report: check whether the captured text still had its chips before suspecting the diff tiers.**
+
 - **`edit_log` has never aged anything out, and "the history aged out" is the wrong diagnosis for a missing
   ancestor.** Measured 2026-08-19: the table spans **93 days** (oldest row 2026-05-18), so the 180-day sweep in
   `index.ts` has deleted nothing, ever. It explained none of the 190 then-unadjudicable verses. The real reason a
