@@ -2261,6 +2261,34 @@ function countAligned(content) {
   );
 }
 
+// --- Case 74e: the #606 guard reconciles against the BASELINE layout, so the
+// `leadPunct` reconcileMarkers reads from it is the punctuation the translator
+// typed BEFORE this edit. When the edit changed punctuation right at a marker
+// boundary that lead is stale, and a line-ending em-dash is the sharpest case —
+// it is deliberately NOT in reconcileMarkers' CLOSING class, so a wrong split
+// would strand it on the next poetry line. Pin that it still lands exactly
+// where the well-formed capture puts it.
+{
+  console.log("\n[Case 74e] Stale leadPunct does not move a marker across edited punctuation (#606)");
+  const mk = () => ({
+    verseObjects: [
+      zaln("H1", [w("he"), t(" ")]),
+      zaln("H2", [w("said"), t(",")]),
+      t(" "),
+      { type: "quote", tag: "q1" },
+      zaln("H3", [w("Behold"), t(" ")]),
+      zaln("H4", [w("light"), t(".")]),
+    ],
+  });
+  const old = extractEditableText(mk()); // "he said, \q1 Behold light."
+  const wellFormed = old.replace("said,", "said—"); // punctuation only, at the boundary
+  const chipsDropped = wellFormed.replace(/\\q\d?\s?/g, "").replace(/\s+/g, " ").trim();
+  const good = extractEditableText(smartEditVerse(mk(), old, wellFormed).content);
+  const bad = extractEditableText(smartEditVerse(mk(), old, chipsDropped).content);
+  assert(/said—\s*\\q1/.test(bad), `the em-dash stays on the line it ends (got ${JSON.stringify(bad)})`);
+  assert(bad === good, `matches the well-formed capture (got ${JSON.stringify(bad)}, want ${JSON.stringify(good)})`);
+}
+
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed.`);
   process.exit(1);
