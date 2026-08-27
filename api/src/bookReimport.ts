@@ -94,6 +94,8 @@ import {
   type TsvEditLogEntry,
 } from "./tsvMerge.ts";
 import { shouldRecordResourceSync, isSystemicMergeRefusal, isKeptOverDoor43AtScale } from "./reimportSyncGate";
+import { evaluateStaleBaseReplacement, type StaleBaseHold } from "./staleBaseGate";
+import { recordStaleBaseHold, raiseStaleBaseHoldAlert, clearStaleBaseHold } from "./staleBaseHolds";
 import { computeTwlSortOrderUpdates } from "./twlCanonicalOrder";
 import { applyTwlSortOrderUpdates } from "./twlSortOrderApply";
 import { loadTwTitles } from "./twTitles";
@@ -478,6 +480,20 @@ export interface ReimportCounts {
   // this so it can say the table may be missing rows instead of silently
   // treating a write failure as "nothing to report". verses only.
   merge_record_failed?: boolean;
+  // Issue #639. 0 or 1 per resource per run: master's file was REFUSED whole
+  // because it is a wholesale translationCore re-export taken from a snapshot
+  // older than the state D1 last adopted from master — adopting it would revert
+  // everything that landed in between (the 2CH ULT incident, 2026-08-26). No
+  // verses were applied and the watermark was withheld, so the export cannot
+  // republish the revert. Seeded from the plan (NOT from a chunk), because the
+  // decision is file-level and is made at staging time, before any chapter runs.
+  //
+  // The counter is the cheap summary line, never the record: see
+  // stale_base_holds (migration 0056) and the `reimport_stale_base:` banner for
+  // the durable, queryable half. Per the #609 precedent, a counter alone on
+  // this path is discarded by exportWorkflow.ts and invisible outside
+  // `wrangler tail`.
+  stale_base_held: number;
   dcs_404: number;
   errors: string[];
   // Set when this object (or an object folded into it via addCounts) was
@@ -599,6 +615,7 @@ function zeroCounts(): ReimportCounts {
     merge_cosmetic_ignored: 0,
     own_publish_converged: 0,
     merge_record_failed: false,
+    stale_base_held: 0,
     dcs_404: 0,
     errors: [],
     counts_incomplete: false,
@@ -699,6 +716,18 @@ export const clearTombstoneBlockAlertForTest = (
 // masterLineagePersist.test.mjs can drive the UPSERT (both the update-existing-
 // row path and the insert-when-absent fallback) against a real SQLite-backed
 // env.DB without re-fetching from DCS.
+// Issue #639. Test seam for the stale-base gate's real staging decision — the
+// gate lives inside planAndStageBookResources because that is the only place
+// master's incoming bytes and the previous watermark are both in hand, so a
+// test that stubs `fetch` and drives this replays the actual 2CH shape rather
+// than re-implementing it. See staleBaseGate.test.mjs.
+export const planAndStageBookResourcesForTest = (
+  env: Env,
+  book: string,
+  resources: Resource[],
+  instanceId: string,
+): Promise<ReimportPlan> => planAndStageBookResources(env, book, resources, instanceId);
+
 export const persistMasterLineageForTest = (
   env: Env,
   book: string,
@@ -818,6 +847,12 @@ function addCounts(into: ReimportCounts, from: ReimportCounts): void {
   into.own_publish_converged += from.own_publish_converged ?? 0;
   into.merge_record_failed = Boolean(into.merge_record_failed || from.merge_record_failed);
   into.apply_incomplete = Boolean(into.apply_incomplete || from.apply_incomplete);
+  // `?? 0` for the same reason as every other counter here: a Workflow instance
+  // that began before this shipped replays a memoized step result with no such
+  // field. Unlike chapters_locked / prune_locked this one gates nothing (the
+  // hold rides on the plan entry, not on the counts), so the coercion cannot
+  // launder an absent measurement into a green light.
+  into.stale_base_held += from.stale_base_held ?? 0;
   into.dcs_404 += from.dcs_404;
   if (from.errors.length) into.errors.push(...from.errors);
 }
@@ -4852,6 +4887,22 @@ interface StagedResource {
   // shipped; masterMayHoldHumanEdit reads that absence as "a human may have",
   // which is the pre-existing behavior.
   lineage?: MasterLineageSummary | null;
+  // Issue #639. Set when the stale-base gate REFUSED this resource's incoming
+  // file: master presents a wholesale translationCore re-export taken from a
+  // snapshot older than the state D1 last adopted. Implies `changed: false` AND
+  // `masterSha: null`, deliberately and for two different reasons —
+  //   * `changed: false` keeps reimportStagedChunk from applying a single verse,
+  //     so D1 keeps the content it already has and nothing is version-bumped
+  //     (strictly better than adopting and relying on the export to hold);
+  //   * `masterSha: null` mirrors the TSV truncation gate above: the sync step
+  //     only stamps a watermark for an entry carrying a real SHA, so the
+  //     watermark stays where it was and checkMasterFreshness reports
+  //     `master_ahead`, which stops tonight's export from republishing the
+  //     revert.
+  // The value is a plain JSON object because it rides a Workflow step's
+  // serialized return value into runChunkedReimport's sync step, which is where
+  // the durable record and the banner are written.
+  staleBaseHold?: StaleBaseHold | null;
 }
 
 interface ReimportPlan {
@@ -4913,6 +4964,13 @@ export async function recordResourceSync(
 // recognition free of any extra D1 round trip.
 interface ResourceSyncState {
   sourceSha: string | null;
+  // When we last stamped this pair's watermark, i.e. when D1 adopted
+  // `sourceSha` (migration 0028, so present in every fallback tier below except
+  // the source_sha-only one). Read here rather than in a separate query for the
+  // same subrequest-budget reason the rest of this row is: it feeds the
+  // stale-base gate (issue #639, staleBaseGate.ts), which needs "the newest
+  // master state D1 holds" as its reference point.
+  syncedAt: number | null;
   pushedBlobSha: string | null;
   pushedReadAt: number | null;
   // P1.3: the edit_log id boundary (0050's pushed_edit_id) of the render
@@ -4955,12 +5013,13 @@ interface ResourceSyncState {
 async function resourceSyncState(env: Env, book: string, resource: Resource): Promise<ResourceSyncState> {
   try {
     const row = await env.DB.prepare(
-      `SELECT source_sha, pushed_blob_sha, pushed_read_at, pushed_edit_id, own_publish_declines
+      `SELECT source_sha, synced_at, pushed_blob_sha, pushed_read_at, pushed_edit_id, own_publish_declines
          FROM book_resource_syncs WHERE book = ?1 AND resource = ?2`,
     )
       .bind(book, resource)
       .first<{
         source_sha: string | null;
+        synced_at: number | null;
         pushed_blob_sha: string | null;
         pushed_read_at: number | null;
         pushed_edit_id: number | null;
@@ -4968,6 +5027,7 @@ async function resourceSyncState(env: Env, book: string, resource: Resource): Pr
       }>();
     return {
       sourceSha: row?.source_sha ?? null,
+      syncedAt: row?.synced_at ?? null,
       pushedBlobSha: row?.pushed_blob_sha ?? null,
       pushedReadAt: row?.pushed_read_at ?? null,
       pushedEditId: row?.pushed_edit_id ?? null,
@@ -4987,12 +5047,13 @@ async function resourceSyncState(env: Env, book: string, resource: Resource): Pr
     // is reserved for the case where even the 0048 columns are absent.
     try {
       const row = await env.DB.prepare(
-        `SELECT source_sha, pushed_blob_sha, pushed_read_at, own_publish_declines
+        `SELECT source_sha, synced_at, pushed_blob_sha, pushed_read_at, own_publish_declines
            FROM book_resource_syncs WHERE book = ?1 AND resource = ?2`,
       )
         .bind(book, resource)
         .first<{
           source_sha: string | null;
+          synced_at: number | null;
           pushed_blob_sha: string | null;
           pushed_read_at: number | null;
           own_publish_declines: number | null;
@@ -5003,6 +5064,7 @@ async function resourceSyncState(env: Env, book: string, resource: Resource): Pr
       });
       return {
         sourceSha: row?.source_sha ?? null,
+        syncedAt: row?.synced_at ?? null,
         pushedBlobSha: row?.pushed_blob_sha ?? null,
         pushedReadAt: row?.pushed_read_at ?? null,
         pushedEditId: null,
@@ -5024,7 +5086,11 @@ async function resourceSyncState(env: Env, book: string, resource: Resource): Pr
         book,
         resource,
       });
-      return { sourceSha, pushedBlobSha: null, pushedReadAt: null, pushedEditId: null, declines: 0 };
+      // syncedAt: null degrades the stale-base gate to its fail-open branch
+      // ("no_synced_at") for as long as the schema is behind — the same
+      // direction every other degradation in this function takes, and the
+      // pre-existing adopt behavior.
+      return { sourceSha, syncedAt: null, pushedBlobSha: null, pushedReadAt: null, pushedEditId: null, declines: 0 };
     }
   }
 }
@@ -6202,6 +6268,58 @@ async function planAndStageBookResources(
       entries.push({ resource, changed: false, masterSha: null, r2Key: null, verifiedComplete: false });
       continue;
     }
+    // Stale-base gate (issue #639), verse resources only — the signal it reads
+    // is the USFM `\id` line's translationCore export stamp, which TSV has no
+    // equivalent of. Placed HERE, after own-publish recognition and the
+    // truncation gate, because those two answer "is there anything foreign to
+    // look at" and this one answers "is what we are looking at a step
+    // BACKWARDS". Costs one ranged Door43 read (a kilobyte) per verse file that
+    // actually moved tonight, and nothing at all for a SHA-unchanged or
+    // own-publish resource — those returned above. See staleBaseGate.ts for the
+    // corpus evidence behind each conjunct.
+    if (!isTsv) {
+      const { decision, hold } = await evaluateStaleBaseReplacement(env, {
+        book,
+        resource,
+        repo: file.repo,
+        path: file.path,
+        raw,
+        masterSha,
+        previousSha: sync.sourceSha,
+        syncedAt: sync.syncedAt,
+      });
+      if (hold) {
+        console.warn("reimport: REFUSED master file — wholesale re-export from a stale translationCore base (#639)", {
+          book,
+          resource,
+          masterSha,
+          previousSha: hold.previousSha,
+          incomingTcExportAt: hold.incomingTcExportAt,
+          previousTcExportAt: hold.previousTcExportAt,
+          syncedAt: hold.syncedAt,
+        });
+        entries.push({
+          resource,
+          changed: false,
+          masterSha: null,
+          r2Key: null,
+          verifiedComplete: false,
+          staleBaseHold: hold,
+        });
+        continue;
+      }
+      // Logged on every verse file that moved, not just the refusals: "we
+      // checked and master is not a stale replacement" is a claim, and this is
+      // the measurement behind it (same rule as the master-lineage log below).
+      console.log("reimport stale-base check", {
+        book,
+        resource,
+        reason: decision.reason,
+        incomingTcExportAt: decision.incomingTcExportAt,
+        previousTcExportAt: decision.previousTcExportAt,
+        syncedAt: decision.syncedAt,
+      });
+    }
     // Master's file moved, and it was not our own render coming back — so
     // SOMEONE moved it, and both merges are about to need to know who (#540
     // item 1). This is the one point in the nightly path that talks to DCS per
@@ -6416,6 +6534,41 @@ export async function runChunkedReimport(
   const perResource = freshPerResource();
   for (const e of plan.entries) {
     if (e.ownPublish) perResource[e.resource].own_publish_converged++;
+    // Issue #639. Seeded from the PLAN, not from a chunk: the refusal is
+    // file-level and was decided at staging time, and seeding it out here (not
+    // inside a `step.do`) keeps it correct across a Workflow replay, which
+    // re-serves the memoized plan but does NOT re-run any closure that mutated
+    // `perResource` from inside a step.
+    if (e.staleBaseHold) perResource[e.resource].stale_base_held++;
+  }
+
+  // Issue #639: the durable half of a stale-base refusal — a queryable row plus
+  // a banner. In its OWN step, ahead of every early return below, because a
+  // refusal sets `changed: false` and both early returns (`maxChapter < 1`, and
+  // `changed.length === 0` when every verse resource was refused) would
+  // otherwise drop the whole book's refusal on the floor and leave the watermark
+  // withheld with nothing saying why.
+  //
+  // recordWithheldSyncIfAbsent is called for the same reason FIX B calls it in
+  // the sync step: a (book, resource) that has NO watermark row at all makes
+  // checkMasterFreshness answer `no_watermark` (ok:true) and the export runs
+  // anyway, so withholding would change nothing without a sentinel to refuse
+  // against.
+  const staleBaseHeld = plan.entries.filter((e) => e.staleBaseHold != null);
+  if (staleBaseHeld.length > 0) {
+    await step.do(`reimport-stalebase-${book}`, async () => {
+      const now = Math.floor(Date.now() / 1000);
+      const recorded: string[] = [];
+      for (const e of staleBaseHeld) {
+        const hold = e.staleBaseHold as StaleBaseHold;
+        const ok = await recordStaleBaseHold(env, hold, "stale_tc_reexport", now);
+        await raiseStaleBaseHoldAlert(env, hold, !ok);
+        await recordWithheldSyncIfAbsent(env, book, e.resource);
+        recorded.push(`${e.resource}:${ok ? "recorded" : "record_failed"}`);
+      }
+      console.warn("reimport withheld sync watermark — stale-base replacement refused (#639)", { book, recorded });
+      return { held: recorded };
+    });
   }
 
   const changed = plan.entries.filter((e) => e.changed);
@@ -6701,6 +6854,16 @@ export async function runChunkedReimport(
       // clearTombstoneBlockAlert's doc comment for why this can't live inside
       // raiseTombstoneBlockAlert itself.
       await clearTombstoneBlockAlert(env, book, e.resource);
+      // Issue #639: same shape, same reason. This resource reached a clean
+      // stamp, so master no longer presents the stale replacement — either it
+      // was repaired upstream or a newer revision superseded it. Release the
+      // holds and drop the banner. This is the gate's PRIMARY exit: it needs no
+      // human override endpoint, because the watermark stays withheld only for
+      // as long as master's tip is still the offending revision, and the file
+      // is re-staged and re-judged every night until it isn't.
+      if (e.resource === "ult" || e.resource === "ust") {
+        await clearStaleBaseHold(env, book, e.resource, Math.floor(Date.now() / 1000));
+      }
     }
     if (withheld.length) {
       // Not always "chapter lock held" any more — also fires for systemic

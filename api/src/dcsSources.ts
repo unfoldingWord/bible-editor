@@ -138,6 +138,35 @@ export async function fetchText(url: string): Promise<string | null> {
   return null;
 }
 
+// First line of a text file at `url`, or null on any failure.
+//
+// Deliberately NOT fetchText: this exists for the stale-base gate (issue #639,
+// staleBaseGate.ts), which needs one USFM `\id` header out of a file that can
+// be several megabytes, on a path the nightly's subrequest and CPU budget
+// already calls tight. A `Range` header keeps the transfer to a kilobyte when
+// the server honours it; when it doesn't (a proxy, or a Gitea that ignores
+// Range) the full body arrives and the first line is still exactly right, so
+// correctness never depends on the optimization landing.
+//
+// It also deliberately skips fetchText's Content-Length short-read check —
+// under a satisfied Range request the body is SUPPOSED to be shorter than the
+// full file, so that check would reject every successful ranged read. The
+// completeness question fetchText exists to answer does not apply here: a
+// truncated read of a header line either yields a parseable `\id` line or
+// yields nothing, and "nothing" resolves to the gate's fail-open branch.
+export async function fetchFirstLine(url: string): Promise<string | null> {
+  try {
+    const r = await fetch(url, { headers: { Range: "bytes=0-2047" } });
+    // 206 (ranged) and 200 (Range ignored) are both usable.
+    if (!r.ok && r.status !== 206) return null;
+    const text = await r.text();
+    const nl = text.indexOf("\n");
+    return (nl === -1 ? text : text.slice(0, nl)).replace(/\r$/, "");
+  } catch {
+    return null;
+  }
+}
+
 // ── Per-resource repo/path + git-SHA helpers (incremental self-heal reimport) ──
 // The reimport reads the canonical unfoldingWord source on master — the same
 // org dcsUrls() hardcodes. The SHA check below MUST agree with the raw fetch on
