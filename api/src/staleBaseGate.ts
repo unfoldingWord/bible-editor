@@ -93,10 +93,48 @@
 //   - Both stamps measured and the conjunction holds → HOLD. Never inferred,
 //     never assumed: two parsed timestamps and one stored integer.
 //
+// ── KNOWN LIMITS. Stated here because each one is a real hole, and a gate whose
+// ── blind spots are undocumented gets trusted for more than it measures.
+//
+// 1. THE STAMP MEASURES WHEN translationCore WROTE THE FILE, NOT HOW OLD ITS
+//    PROJECT DATA IS. Someone can open a months-stale tC project this morning,
+//    hit export, and push: the stamp says today, `tc_export_current` fires, and
+//    the replacement is adopted along with every revert it carries. This gate
+//    cannot see that, because nothing in the file records the project's own
+//    vintage. It catches the case where the STALENESS IS VISIBLE IN THE FILE,
+//    which is the 2CH incident and, on the evidence, the common shape — not the
+//    general class. Catching the general class needs per-verse ancestor
+//    comparison (issue #639's option B), which this does not replace.
+//
+// 2. `synced_at` BIASES TOWARD HOLDING, and three writers move it:
+//    recordResourceSync on an ordinary sync, recordWithheldSyncIfAbsent's
+//    sentinel write, and the own-publish convergence path. All three only ever
+//    move it FORWARD, and a later `synced_at` makes `incomingTcExportAt <
+//    syncedAt` easier to satisfy — so every drift here pushes toward a false
+//    HOLD, never toward a false adopt. That is the safe direction (a hold
+//    refuses and alerts; it does not overwrite anything), but it is not free:
+//    the cost of the bias is an operator being asked about a file that was
+//    fine. Worth revisiting if refusals turn out to be noisy in practice.
+//
+// 3. REPEATED-SAME-STAMP BLIND SPOT AFTER A FORCE-RELEASE. The "changed"
+//    conjunct compares against the revision D1 last synced from. Once an
+//    operator force-releases a stale export, THAT export's stamp becomes the
+//    stored baseline — so a second push of the same stale tC snapshot reads as
+//    `tc_stamp_unchanged` and adopts silently. This is a deliberate consequence
+//    of the override (the operator said this file is acceptable), but it means
+//    the override is stickier than a one-time consent: it effectively blesses
+//    that snapshot for as long as it keeps coming back.
+//
 // Pure (no D1, no network) so the whole decision is regression-testable without
 // a Workflow context — same pattern as reimportSyncGate.ts and shrinkGuard.ts.
 // The IO half (reading the previous revision's `\id` line) lives in
 // evaluateStaleBaseReplacement below and does nothing but feed this function.
+//
+// NO UI READER YET. `stale_base_holds` is written and released by this feature
+// and queried by nobody: the human-facing surface is the `reimport_stale_base:`
+// banner plus the reimport summary counters. The table is there so a refusal is
+// queryable after the banner is dismissed, and so a future admin view has
+// something to read. Deliberate, not an oversight.
 
 import type { Env } from "./index";
 import { dcsRawUrl, fetchFirstLine } from "./dcsSources";
@@ -107,32 +145,110 @@ import { dcsRawUrl, fetchFirstLine } from "./dcsSources";
 // against ITSELF and report "stamp unchanged" for every stale-base merge.
 const FULL_SHA_RE = /^[0-9a-f]{40}$/;
 
+// bookReimport.ts's recordWithheldSyncIfAbsent writes this into
+// `book_resource_syncs.source_sha` for a pair it withheld that had no row at
+// all, so the export's freshness gate has something to refuse against. It is not
+// a git ref and must never be handed to `?ref=`. Duplicated here rather than
+// imported to keep this module free of a cycle back into bookReimport.ts —
+// staleBaseGate is imported BY that file. Keep the two in sync.
+const WITHHELD_SYNC_SENTINEL_SHA = "withheld";
+
 // `\id 2CH EN_ULT en_English_ltr Wed Jul 08 2026 06:18:55 GMT-0400 (Eastern Daylight Time) tc`
 //       ^book ^resource      ^lang  ^──────────────── the tC export stamp ─────────────────^
 //
-// Anchored on the trailing ` tc` marker translationCore writes, and applied to
-// the FIRST line only (`m` flag plus a caller that passes one line) so a `\id`
-// appearing anywhere else can't be mistaken for the header. Mirrors
-// scripts/restore-master-verses.mjs's extractTcContentDate, which is the only
-// other reader of this stamp in the repo; kept as a separate copy rather than
-// imported because that file is a CLI script with top-level side effects and
-// cannot be pulled into Worker code.
-const TC_ID_LINE_RE = /^\\id\s+\S+\s+\S+\s+\S+\s+(.+?)\s+tc\s*$/m;
+// Anchored on the trailing ` tc` marker translationCore writes. NO `m` flag and
+// no whole-file scan: the match is run against the file's FIRST LINE ONLY (see
+// firstLine below). USFM puts `\id` on line one by definition, and letting the
+// pattern roam a multi-megabyte body means any `\id`-shaped line anywhere in the
+// text — including one a contributor could introduce — decides whether a whole
+// book gets adopted or refused. First line, or nothing.
+//
+// Mirrors scripts/restore-master-verses.mjs's extractTcContentDate, which is the
+// only other reader of this stamp in the repo; kept as a separate copy rather
+// than imported because that file is a CLI script with top-level side effects
+// and cannot be pulled into Worker code.
+const TC_ID_LINE_RE = /^\\id\s+\S+\s+\S+\s+\S+\s+(.+?)\s+tc\s*$/;
+
+// The captured text must LOOK like translationCore's `toString()` output —
+// `Wed Jul 08 2026 …` — before it is handed to `new Date()`.
+//
+// This guard exists because `new Date(string)` is not a parser, it is a
+// heuristic, and it succeeds on things that are not dates at all. Measured
+// against V8: `new Date("Text Mar 5")` yields 2001-03-05, `new Date("2001")`
+// yields 2001-01-01, `new Date("Version 12")` yields 2012-01-01. Without this
+// guard a `\id` line whose 4th field happens to end in ` tc` could hand the gate
+// a year-2001 timestamp, which is older than every `synced_at` and would refuse
+// the book.
+const TC_STAMP_SHAPE_RE = /^\w{3}\s+\w{3}\s+\d{1,2}\s+\d{4}\b/;
+
+// Plausibility window. translationCore did not produce these files before 2015
+// (the oldest stamp in the whole en_ult + en_ust corpus is 2020-03-20), and a
+// stamp from the future is a clock or parse artifact, not a real export. One
+// day of slack absorbs timezone/skew at the upper edge. Anything outside is
+// reported as implausible and treated as NOT MEASURED — which means adopt, the
+// pre-existing behavior, never a refusal on a number we do not believe.
+const TC_STAMP_MIN = Date.UTC(2015, 0, 1) / 1000;
+const TC_STAMP_FUTURE_SLACK = 86400;
+
+export type TcStampReason = "ok" | "no_id_line" | "unparseable_date" | "implausible_date";
+
+export interface TcStampResult {
+  /** Unix seconds, or null when nothing trustworthy was measured. */
+  at: number | null;
+  /** Why — so a null never reads as a bare "absent" in the nightly log. */
+  reason: TcStampReason;
+}
 
 /**
- * The translationCore export stamp on a USFM file's `\id` line, in unix
- * seconds, or null when the line is absent or the date does not parse.
- * Accepts either a whole file or just its first line.
+ * The translationCore export stamp on a USFM file's `\id` line.
+ *
+ * Accepts either a whole file or a single line; either way ONLY the first line
+ * is examined (leading BOM and blank lines skipped). Returns the reason
+ * alongside the value so "no `\id` line", "the date did not parse", and "the
+ * date parsed but is not believable" stay distinguishable in the logs — they
+ * have the same effect on the gate but very different meanings for a human
+ * debugging why a book did or did not hold.
  */
-export function parseTcExportStamp(usfmText: string | null | undefined): number | null {
-  if (!usfmText) return null;
-  const m = TC_ID_LINE_RE.exec(usfmText);
-  if (!m) return null;
-  const d = new Date(m[1]);
-  const t = d.getTime();
-  if (Number.isNaN(t)) return null;
-  return Math.floor(t / 1000);
+export function parseTcExportStamp(usfmText: string | null | undefined, now?: number): TcStampResult {
+  if (!usfmText) return { at: null, reason: "no_id_line" };
+  // Strip a UTF-8 BOM and any leading blank lines, then take one line. `\id` is
+  // line one in USFM; anything past it is not the header.
+  const head = usfmText.replace(/^﻿/, "").replace(/^[\r\n\s]*/, "");
+  const nl = head.indexOf("\n");
+  const firstLine = (nl === -1 ? head : head.slice(0, nl)).replace(/\r$/, "");
+  const m = TC_ID_LINE_RE.exec(firstLine);
+  if (!m) return { at: null, reason: "no_id_line" };
+  const raw = m[1];
+  if (!TC_STAMP_SHAPE_RE.test(raw)) return { at: null, reason: "unparseable_date" };
+  const t = new Date(raw).getTime();
+  if (Number.isNaN(t)) return { at: null, reason: "unparseable_date" };
+  const at = Math.floor(t / 1000);
+  const ceiling = (now ?? Math.floor(Date.now() / 1000)) + TC_STAMP_FUTURE_SLACK;
+  if (at < TC_STAMP_MIN || at > ceiling) return { at: null, reason: "implausible_date" };
+  return { at, reason: "ok" };
 }
+
+export type StaleBaseReason =
+  // ── the three real outcomes ────────────────────────────────────────────────
+  | "stale_tc_reexport"
+  | "tc_stamp_unchanged"
+  | "tc_export_current"
+  // ── "we could not measure", each named so a null is never a bare absence ───
+  | "no_incoming_stamp"
+  | "incoming_stamp_unparseable"
+  | "incoming_stamp_implausible"
+  | "no_previous_stamp"
+  | "previous_stamp_unparseable"
+  | "previous_stamp_implausible"
+  | "no_synced_at"
+  | "no_master_sha"
+  | "no_previous_sha"
+  // F11: the previous SHA is recordWithheldSyncIfAbsent's sentinel, not a real
+  // revision — this pair is ALREADY withheld for some other reason, so there is
+  // nothing to compare against and this gate is simply not the one deciding.
+  // Distinct from `no_previous_sha` (never synced) on purpose: they look
+  // identical in a counter and mean opposite things to whoever is debugging.
+  | "previous_sha_withheld_sentinel";
 
 export interface StaleBaseDecision {
   /** True → withhold: do not apply these verses and do not stamp the watermark. */
@@ -142,13 +258,7 @@ export interface StaleBaseDecision {
    * was missing or which conjunct failed, so a log line can never say only
    * "no hold" — the same discipline as reimportSyncGate's absent-vs-zero rule.
    */
-  reason:
-    | "no_incoming_stamp"
-    | "no_previous_stamp"
-    | "no_synced_at"
-    | "tc_stamp_unchanged"
-    | "tc_export_current"
-    | "stale_tc_reexport";
+  reason: StaleBaseReason;
   incomingTcExportAt: number | null;
   previousTcExportAt: number | null;
   syncedAt: number | null;
@@ -223,21 +333,54 @@ export async function evaluateStaleBaseReplacement(
   },
 ): Promise<{ decision: StaleBaseDecision; hold: StaleBaseHold | null }> {
   const { book, resource, repo, path, raw, masterSha, previousSha, syncedAt } = args;
-  const incomingTcExportAt = parseTcExportStamp(raw);
-  // Short-circuit before spending the subrequest: with no incoming stamp, no
-  // resolvable previous revision, or no watermark time, the decision is
-  // already fixed at "no hold" and reading the old file cannot change it.
-  if (incomingTcExportAt == null || masterSha == null || !previousSha || !FULL_SHA_RE.test(previousSha) || syncedAt == null) {
-    const decision = decideStaleBaseReplacement({
-      incomingTcExportAt,
-      previousTcExportAt: null,
-      syncedAt,
-    });
-    return { decision, hold: null };
+  const noHold = (
+    reason: StaleBaseReason,
+    incomingTcExportAt: number | null = null,
+    previousTcExportAt: number | null = null,
+  ): { decision: StaleBaseDecision; hold: null } => ({
+    decision: { hold: false, reason, incomingTcExportAt, previousTcExportAt, syncedAt },
+    hold: null,
+  });
+
+  const incoming = parseTcExportStamp(raw);
+  // Each unavailable measurement gets its OWN reason rather than collapsing to
+  // one "we didn't hold" — see StaleBaseReason. All of them mean adopt, which is
+  // the pre-existing behavior, so this gate can only ever subtract adoptions it
+  // has positive evidence against.
+  if (incoming.at == null) {
+    return noHold(
+      incoming.reason === "implausible_date"
+        ? "incoming_stamp_implausible"
+        : incoming.reason === "unparseable_date"
+          ? "incoming_stamp_unparseable"
+          : "no_incoming_stamp",
+    );
   }
+  // Short-circuit before spending the subrequest: each of these fixes the answer
+  // at "no hold", so reading the old revision cannot change it.
+  if (masterSha == null) return noHold("no_master_sha", incoming.at);
+  // F11. `withheld` is recordWithheldSyncIfAbsent's sentinel, never a revision.
+  if (previousSha === WITHHELD_SYNC_SENTINEL_SHA) return noHold("previous_sha_withheld_sentinel", incoming.at);
+  if (!previousSha || !FULL_SHA_RE.test(previousSha)) return noHold("no_previous_sha", incoming.at);
+  if (syncedAt == null) return noHold("no_synced_at", incoming.at);
+
   const previousIdLine = await fetchFirstLine(dcsRawUrl(env, repo, path, previousSha));
-  const previousTcExportAt = parseTcExportStamp(previousIdLine);
-  const decision = decideStaleBaseReplacement({ incomingTcExportAt, previousTcExportAt, syncedAt });
+  const previous = parseTcExportStamp(previousIdLine);
+  if (previous.at == null) {
+    return noHold(
+      previous.reason === "implausible_date"
+        ? "previous_stamp_implausible"
+        : previous.reason === "unparseable_date"
+          ? "previous_stamp_unparseable"
+          : "no_previous_stamp",
+      incoming.at,
+    );
+  }
+  const decision = decideStaleBaseReplacement({
+    incomingTcExportAt: incoming.at,
+    previousTcExportAt: previous.at,
+    syncedAt,
+  });
   if (!decision.hold) return { decision, hold: null };
   return {
     decision,
@@ -245,10 +388,8 @@ export async function evaluateStaleBaseReplacement(
       book,
       resource,
       masterSha,
-      incomingTcExportAt,
-      // Narrowed by decision.hold — the pure function cannot return hold with
-      // either of these null.
-      previousTcExportAt: previousTcExportAt as number,
+      incomingTcExportAt: incoming.at,
+      previousTcExportAt: previous.at,
       syncedAt,
       previousSha,
     },

@@ -99,20 +99,35 @@ export function staleBaseAlertMessage(hold: StaleBaseHold, recordFailed: boolean
       `master's file (${hold.masterSha.slice(0, 8)}) was adopted into the app. That file is a translationCore ` +
       `re-export from a ${iso(hold.incomingTcExportAt)} snapshot, older than the ${iso(hold.syncedAt)} state the app ` +
       `had synced from master (${hold.previousSha.slice(0, 8)}). Anything that landed on master in between is now ` +
-      `gone from the app, and the next export will publish that to Door43. If that was not what you meant, restore ` +
-      `from the affected verses' history before the next export runs.` +
+      `gone from the app for this resource, and the next export will publish that to Door43. If that was not what ` +
+      `you meant, restore from the affected verses' history before the next export runs.` +
       (recordFailed ? ` (The durable record of this override could not be written — see the logs.)` : ``)
     );
   }
+  // F4: every measurement here is per (book, RESOURCE) — book_resource_syncs is
+  // keyed that way and only this resource's file was refused. Say "resource", not
+  // "book": 2CH UST is unaffected by a 2CH ULT refusal and an operator must not
+  // read this as the whole book being frozen.
+  //
+  // F3: the remedies below are the two that ACTUALLY release, and no others.
+  // "Re-apply the newer work on top of the stale export" is deliberately NOT
+  // offered — it leaves the stale translationCore stamp in place, so the gate
+  // re-measures the same conjunction tomorrow and re-holds forever. That is
+  // precisely the shape the override exists for.
   return (
     `Benjamin — the nightly sync REFUSED ${hold.book} ${res} from Door43 and did not update the app. ` +
     `Master's file (${hold.masterSha.slice(0, 8)}) was re-exported from translationCore against a ` +
     `${iso(hold.incomingTcExportAt)} snapshot, which is older than the ${iso(hold.syncedAt)} state the app ` +
     `last synced from master (${hold.previousSha.slice(0, 8)}, exported ${iso(hold.previousTcExportAt)}). ` +
     `Adopting it would have reverted every change made on master in between, and tonight's export would have ` +
-    `republished the revert. Nothing was overwritten and no export ran for this book. ` +
-    `Fix master (re-apply the newer work, or re-export from a current snapshot) and the next nightly clears this ` +
-    `by itself; the app's copy is untouched in the meantime.` +
+    `republished the revert. Nothing was overwritten, and only ${hold.book} ${res} is held — other resources ` +
+    `for this book are unaffected. ` +
+    `Two things release it. (1) Revert that merge on master, so the file goes back to carrying its previous ` +
+    `translationCore stamp — the next nightly then clears this by itself, with no action here. ` +
+    `(2) If the file on master is actually correct and you want it adopted as-is, force-release it: run an ` +
+    `export for exactly this book and resource with allowStaleBase, which adopts master and republishes it. ` +
+    `Re-applying the newer work ON TOP of the stale export does NOT release it — the stale stamp stays, so ` +
+    `this refusal simply repeats tomorrow.` +
     (recordFailed ? ` (The durable record of this refusal could not be written — see the logs.)` : ``)
   );
 }
@@ -185,15 +200,25 @@ export async function raiseStaleBaseHoldAlert(
  */
 export async function clearStaleBaseHold(env: Env, book: string, resource: string, now: number): Promise<void> {
   const source = staleBaseAlertSource(book, resource);
+  // F8: two SEPARATE statements, deliberately NOT one env.DB.batch().
+  //
+  // A D1 batch is one transaction. Batched together, a throw on the
+  // stale_base_holds UPDATE — the deploy-before-migration case, where the table
+  // does not exist yet — rolls back the system_alerts DELETE with it, so a
+  // banner whose condition has genuinely cleared would keep sitting on the
+  // dashboard for the whole migration-lag window. The two writes have no
+  // atomicity requirement between them (releasing a row and dropping a banner
+  // are independently correct), so they must not share a transaction's failure.
   try {
-    await env.DB.batch([
-      env.DB.prepare(`DELETE FROM system_alerts WHERE username = ?1 AND source = ?2 AND dismissed_at IS NULL`).bind(
-        ALERT_USERNAME,
-        source,
-      ),
-      env.DB.prepare(RELEASE_STALE_BASE_HOLDS_SQL).bind(book, resource, now),
-    ]);
+    await env.DB.prepare(`DELETE FROM system_alerts WHERE username = ?1 AND source = ?2 AND dismissed_at IS NULL`)
+      .bind(ALERT_USERNAME, source)
+      .run();
   } catch (e) {
-    console.error("stale-base hold clear failed", { book, resource, error: e instanceof Error ? e.message : String(e) });
+    console.error("stale-base banner clear failed", { book, resource, error: e instanceof Error ? e.message : String(e) });
+  }
+  try {
+    await env.DB.prepare(RELEASE_STALE_BASE_HOLDS_SQL).bind(book, resource, now).run();
+  } catch (e) {
+    console.error("stale-base hold release failed", { book, resource, error: e instanceof Error ? e.message : String(e) });
   }
 }

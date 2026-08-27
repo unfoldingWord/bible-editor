@@ -143,10 +143,18 @@ export async function fetchText(url: string): Promise<string | null> {
 // Deliberately NOT fetchText: this exists for the stale-base gate (issue #639,
 // staleBaseGate.ts), which needs one USFM `\id` header out of a file that can
 // be several megabytes, on a path the nightly's subrequest and CPU budget
-// already calls tight. A `Range` header keeps the transfer to a kilobyte when
-// the server honours it; when it doesn't (a proxy, or a Gitea that ignores
-// Range) the full body arrives and the first line is still exactly right, so
-// correctness never depends on the optimization landing.
+// already calls tight.
+//
+// RANGE IS HONOURED — measured, not assumed. `curl -D -` against
+// git.door43.org's api/v1 raw endpoint with `Range: bytes=0-99` on
+// `en_ult/14-2CH.usfm` (2026-08-27) returns:
+//     HTTP/1.1 206 Partial Content
+//     Content-Length: 100
+//     Content-Range: bytes 0-99/3302171
+// So this reads ~2 KB of a 3.3 MB file. Correctness does not depend on that:
+// if a proxy or a future Gitea ignores Range, the full body arrives and the
+// first line is still exactly right — just at the cost of transferring and
+// decoding the whole file for one header line.
 //
 // It also deliberately skips fetchText's Content-Length short-read check —
 // under a satisfied Range request the body is SUPPOSED to be shorter than the
@@ -154,17 +162,33 @@ export async function fetchText(url: string): Promise<string | null> {
 // completeness question fetchText exists to answer does not apply here: a
 // truncated read of a header line either yields a parseable `\id` line or
 // yields nothing, and "nothing" resolves to the gate's fail-open branch.
+//
+// ONE RETRY, matching fetchText. The gate's failure direction on a null is
+// "adopt", i.e. the pre-#639 behavior — which is safe, but it is also the
+// direction that lets a stale-base replacement through. A single transient
+// hiccup on one of Door43's responses should therefore not be enough to switch
+// the gate off for the night; two in a row is a real outage and adopting is the
+// right answer then.
 export async function fetchFirstLine(url: string): Promise<string | null> {
-  try {
-    const r = await fetch(url, { headers: { Range: "bytes=0-2047" } });
-    // 206 (ranged) and 200 (Range ignored) are both usable.
-    if (!r.ok && r.status !== 206) return null;
-    const text = await r.text();
-    const nl = text.indexOf("\n");
-    return (nl === -1 ? text : text.slice(0, nl)).replace(/\r$/, "");
-  } catch {
-    return null;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const r = await fetch(url, { headers: { Range: "bytes=0-2047" } });
+      // `Response.ok` is already true for 206, so 200 (Range ignored) and 206
+      // (Range honoured) both pass here — no separate status check needed.
+      if (!r.ok) {
+        // A 4xx is an answer ("this revision/path is not there"), not a blip —
+        // retrying it just burns a subrequest. Only retry 5xx / network faults.
+        if (r.status < 500) return null;
+        continue;
+      }
+      const text = await r.text();
+      const nl = text.indexOf("\n");
+      return (nl === -1 ? text : text.slice(0, nl)).replace(/\r$/, "");
+    } catch {
+      // network error → retry once, then null
+    }
   }
+  return null;
 }
 
 // ── Per-resource repo/path + git-SHA helpers (incremental self-heal reimport) ──

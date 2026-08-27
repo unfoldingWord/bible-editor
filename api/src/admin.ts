@@ -414,6 +414,13 @@ const ImportBody = z.object({
   // >= 0 so chapter 0 (front:intro) is a valid target. Absent/empty means
   // "whole book" — see the mode split below.
   chapters: z.array(z.number().int().min(0)).optional(),
+  // Issue #639 (F2): adopt a resource the stale-base gate would refuse — master
+  // presents a wholesale translationCore re-export taken from a snapshot older
+  // than the state D1 last synced. Absent/false runs the gate, same as the
+  // nightly. Scoped to one book by the route itself, so unlike the export route
+  // this needs no book/resource-count check; it still records the override and
+  // raises the force-released banner.
+  allowStaleBase: z.boolean().optional(),
 });
 
 // No force flag here (deliberately out of scope for this PR) — normal
@@ -462,7 +469,10 @@ admin.post("/import", bookLockGuard, async (c) => {
   //     separate steps instead.
   if (chapters.length > 0) {
     try {
-      const result = await reimportBookFromDcs(c.env, book, chapters, resources, userId, { source: "user" });
+      const result = await reimportBookFromDcs(c.env, book, chapters, resources, userId, {
+        source: "user",
+        allowStaleBase: parsed.data.allowStaleBase,
+      });
       return c.json({ mode: "inline", result });
     } catch (e) {
       if (e instanceof BookNotImportedError) return c.json({ error: "book_not_imported", book }, 404);

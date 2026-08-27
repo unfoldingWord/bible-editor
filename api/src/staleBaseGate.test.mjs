@@ -23,7 +23,8 @@ import { readdirSync, readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { parseTcExportStamp, decideStaleBaseReplacement } from "./staleBaseGate.ts";
+import { parseTcExportStamp, decideStaleBaseReplacement, evaluateStaleBaseReplacement } from "./staleBaseGate.ts";
+import { fetchFirstLine } from "./dcsSources.ts";
 import {
   recordStaleBaseHold,
   raiseStaleBaseHoldAlert,
@@ -32,7 +33,7 @@ import {
   staleBaseAlertMessage,
 } from "./staleBaseHolds.ts";
 import { staleBaseOverrideAllowed } from "./reimportSyncGate.ts";
-import { planAndStageBookResourcesForTest } from "./bookReimport.ts";
+import { planAndStageBookResourcesForTest, reimportBookFromDcs } from "./bookReimport.ts";
 
 let failed = 0;
 function eq(actual, expected, msg) {
@@ -51,23 +52,74 @@ const PREV_SHA = "81a00c44b314043a980372c0caaadec724c88060";
 const MASTER_SHA = "a1e8182af6b8b72f762e676d5307f32fee358f84";
 const PREV_ID_LINE = "\\id 2CH EN_ULT en_English_ltr Thu Oct 14 2021 10:35:18 GMT-0500 (Central Daylight Time) tc";
 const INCOMING_ID_LINE = "\\id 2CH EN_ULT en_English_ltr Wed Jul 08 2026 06:18:55 GMT-0400 (Eastern Daylight Time) tc";
-const PREV_TC = parseTcExportStamp(PREV_ID_LINE);
-const INCOMING_TC = parseTcExportStamp(INCOMING_ID_LINE);
+const PREV_TC = parseTcExportStamp(PREV_ID_LINE).at;
+const INCOMING_TC = parseTcExportStamp(INCOMING_ID_LINE).at;
 const SYNCED_AT = secs("2026-08-14T05:42:00Z");
+// Fixed "now" so the plausibility ceiling is deterministic — the corpus dates
+// are in 2026 and a wall-clock `now` would make these cases drift.
+const NOW = secs("2026-08-27T12:00:00Z");
 
 // ── 1. The `\id` parser, against real corpus lines ───────────────────────────
 console.log("\n1. \\id translationCore stamp parser");
 eq(new Date(INCOMING_TC * 1000).toISOString(), "2026-07-08T10:18:55.000Z", "incident merge stamp parses (Jul 08 2026, GMT-0400)");
 eq(new Date(PREV_TC * 1000).toISOString(), "2021-10-14T15:35:18.000Z", "pre-merge stamp parses (Oct 14 2021, GMT-0500)");
 eq(
-  parseTcExportStamp("\\id GEN EN_ULT en_English_ltr Sat May 27 2023 15:49:17 GMT-0500 (Central Daylight Time) tc\n\\h Genesis"),
+  parseTcExportStamp("\\id GEN EN_ULT en_English_ltr Sat May 27 2023 15:49:17 GMT-0500 (Central Daylight Time) tc\n\\h Genesis", NOW).at,
   secs("2023-05-27T20:49:17Z"),
-  "parses out of a whole file, not just a bare line",
+  "parses out of a whole file, reading only its first line",
 );
-eq(parseTcExportStamp("\\id 2CH"), null, "a bare \\id with no tC tail is null, not a guess");
-eq(parseTcExportStamp("\\id 2CH EN_ULT en_English_ltr not a date at all tc"), null, "an unparseable date is null");
-eq(parseTcExportStamp(""), null, "empty file is null");
-eq(parseTcExportStamp(null), null, "null input is null");
+eq(parseTcExportStamp("\\id 2CH", NOW), { at: null, reason: "no_id_line" }, "a bare \\id with no tC tail is null, not a guess");
+eq(parseTcExportStamp("", NOW), { at: null, reason: "no_id_line" }, "empty file is null");
+eq(parseTcExportStamp(null, NOW), { at: null, reason: "no_id_line" }, "null input is null");
+eq(parseTcExportStamp("﻿" + PREV_ID_LINE, NOW).at, PREV_TC, "a UTF-8 BOM before \\id does not defeat the parse");
+
+// F1: `new Date(string)` is a heuristic, not a parser. These three junk shapes
+// were MEASURED against V8 to produce real dates — "Text Mar 5" → 2001-03-05,
+// "2001" → 2001-01-01, "Version 12" → 2012-01-01 — every one of them older than
+// any synced_at, i.e. every one of them a spurious REFUSAL of a whole book.
+console.log("  F1 — junk that new Date() would happily accept:");
+for (const junk of ["Text Mar 5", "2001", "Version 12"]) {
+  eq(
+    parseTcExportStamp(`\\id 2CH EN_ULT en_English_ltr ${junk} tc`, NOW),
+    { at: null, reason: "unparseable_date" },
+    `"${junk}" is rejected by the shape guard (new Date would return ${new Date(junk).getFullYear()})`,
+  );
+}
+eq(
+  parseTcExportStamp("\\id 2CH EN_ULT en_English_ltr not a date at all tc", NOW),
+  { at: null, reason: "unparseable_date" },
+  "free text is rejected",
+);
+// Plausibility window: a mis-clocked exporter must not refuse a book.
+eq(
+  parseTcExportStamp("\\id 2CH EN_ULT en_English_ltr Wed Jul 08 1998 06:18:55 GMT-0400 (X) tc", NOW),
+  { at: null, reason: "implausible_date" },
+  "a pre-2015 stamp is implausible (tC did not write it) → not measured",
+);
+eq(
+  parseTcExportStamp("\\id 2CH EN_ULT en_English_ltr Wed Jul 08 2099 06:18:55 GMT-0400 (X) tc", NOW),
+  { at: null, reason: "implausible_date" },
+  "a future stamp is implausible → not measured",
+);
+eq(
+  parseTcExportStamp(`\\id 2CH EN_ULT en_English_ltr ${new Date((NOW + 3600) * 1000).toDateString()} 00:00:00 GMT+0000 (X) tc`, NOW).reason,
+  "ok",
+  "…but a stamp inside the one-day slack is accepted (timezone/skew at the edge)",
+);
+// F1: a bogus \id-shaped line further down a multi-MB body must not win.
+eq(
+  parseTcExportStamp(
+    `${PREV_ID_LINE}\n\\v 1 text\n\\id 2CH EN_ULT en_English_ltr Wed Jul 08 2026 06:18:55 GMT-0400 (X) tc\n`,
+    NOW,
+  ).at,
+  PREV_TC,
+  "an \\id-shaped line LATER in the body cannot override the real header",
+);
+eq(
+  parseTcExportStamp(`\\v 1 text\n${INCOMING_ID_LINE}\n`, NOW),
+  { at: null, reason: "no_id_line" },
+  "…and a body whose first line is not \\id yields nothing, rather than scanning on",
+);
 
 // ── 2. The gate, and an ablation of every conjunct ───────────────────────────
 // Each case removes exactly ONE input from the incident shape. If the gate
@@ -306,6 +358,66 @@ try {
   globalThis.fetch = realFetch;
 }
 
+// ── 5b. F5: fetchFirstLine's retry ───────────────────────────────────────────
+// The gate's failure direction on a null read is "adopt" — safe, but also the
+// direction that lets a stale-base replacement through. One transient hiccup
+// must not switch the gate off for the night.
+console.log("\n5b. fetchFirstLine — one retry, and when NOT to retry");
+{
+  const realFetch2 = globalThis.fetch;
+  const mkResp = (status, body) => ({
+    ok: status >= 200 && status < 300,
+    status,
+    async text() { return body; },
+  });
+  try {
+    let calls = 0;
+    globalThis.fetch = async () => { calls++; if (calls === 1) throw new Error("ECONNRESET"); return mkResp(206, PREV_ID_LINE + "\n\\h x"); };
+    eq(await fetchFirstLine("https://x/y"), PREV_ID_LINE, "a transient network error retries and succeeds");
+    eq(calls, 2, "…in exactly two attempts");
+
+    calls = 0;
+    globalThis.fetch = async () => { calls++; return mkResp(503, ""); };
+    eq(await fetchFirstLine("https://x/y"), null, "two 5xx in a row gives up (adopt, the safe-for-throughput default)");
+    eq(calls, 2, "…after retrying once");
+
+    calls = 0;
+    globalThis.fetch = async () => { calls++; return mkResp(404, ""); };
+    eq(await fetchFirstLine("https://x/y"), null, "a 404 is an answer, not a blip");
+    eq(calls, 1, "…so it is NOT retried — retrying it would burn a subrequest for nothing");
+
+    calls = 0;
+    globalThis.fetch = async () => { calls++; return mkResp(200, PREV_ID_LINE); };
+    eq(await fetchFirstLine("https://x/y"), PREV_ID_LINE, "a 200 (server ignored Range) is still usable");
+
+    calls = 0;
+    globalThis.fetch = async () => { calls++; return mkResp(206, PREV_ID_LINE + "\r\n\\h x"); };
+    eq(await fetchFirstLine("https://x/y"), PREV_ID_LINE, "CRLF line ending is trimmed");
+  } finally {
+    globalThis.fetch = realFetch2;
+  }
+}
+
+// ── 5c. F11: the withheld sentinel is not a revision ─────────────────────────
+console.log("\n5c. F11 — previousSha === the withheld sentinel");
+{
+  const { env } = freshEnv();
+  const realFetch3 = globalThis.fetch;
+  let fetched = 0;
+  globalThis.fetch = async () => { fetched++; return { ok: true, status: 200, async text() { return PREV_ID_LINE; } }; };
+  try {
+    const { decision, hold } = await evaluateStaleBaseReplacement(env, {
+      book: "2CH", resource: "ult", repo: "en_ult", path: "14-2CH.usfm",
+      raw: bodyWith(INCOMING_ID_LINE), masterSha: MASTER_SHA, previousSha: "withheld", syncedAt: SYNCED_AT,
+    });
+    eq(hold, null, "an already-withheld pair is not refused again by THIS gate");
+    eq(decision.reason, "previous_sha_withheld_sentinel", "…and says so distinctly, not 'no previous stamp'");
+    eq(fetched, 0, "…without spending a subrequest on a sha that is not a revision");
+  } finally {
+    globalThis.fetch = realFetch3;
+  }
+}
+
 // ── 6. The override's own gating ─────────────────────────────────────────────
 console.log("\n6. staleBaseOverrideAllowed — deliberately narrow");
 {
@@ -316,6 +428,52 @@ console.log("\n6. staleBaseOverrideAllowed — deliberately narrow");
   eq(staleBaseOverrideAllowed(p, 1, 2, "ult"), false, "two resources → refused");
   eq(staleBaseOverrideAllowed({ ...p, allowStaleBase: false }, 1, 1, "ult"), false, "flag off → refused");
   eq(staleBaseOverrideAllowed({ allowStaleBase: true }, 1, 1, "ult"), false, "no book/resource (every cron path) → refused");
+}
+
+// ── 6b. F6: convergence via the SHA-match skip must release the hold ────────
+// A held pair is normally released by the sync step, but that step only sees
+// `changed` entries. Two shapes converge WITHOUT the file ever being staged
+// again, and both land on the SHA-match branch: (1) force-released last night,
+// so source_sha now equals master; (2) master force-pushed back to the revision
+// we last synced. Before this fix the row stayed active and the banner stayed up
+// forever in both.
+console.log("\n6b. F6 — release on the SHA-match convergence path");
+{
+  const realFetch4 = globalThis.fetch;
+  try {
+    const { sqlite, env } = freshEnv();
+    sqlite.exec(
+      `INSERT INTO verses (book, chapter, verse, bible_version, content_json, plain_text, version)
+       VALUES ('2CH', 4, 11, 'ULT', '{"a":1}', 'a', 2)`,
+    );
+    // master === what we last synced from: the SHA-match skip branch.
+    sqlite
+      .prepare(`INSERT INTO book_resource_syncs (book, resource, source_sha, synced_at, origin) VALUES ('2CH','ult',?,?,'reimport')`)
+      .run(MASTER_SHA, SYNCED_AT);
+    // …with a hold left over from a previous night, plus its banner.
+    const hold = {
+      book: "2CH", resource: "ult", masterSha: MASTER_SHA,
+      incomingTcExportAt: INCOMING_TC, previousTcExportAt: PREV_TC, syncedAt: SYNCED_AT, previousSha: PREV_SHA,
+    };
+    await recordStaleBaseHold(env, hold, "stale_tc_reexport", 1_756_000_000);
+    await raiseStaleBaseHoldAlert(env, hold, false);
+    const src = staleBaseAlertSource("2CH", "ult");
+    eq(sqlite.prepare(`SELECT COUNT(*) c FROM stale_base_holds WHERE resolved_at IS NULL`).all()[0].c, 1, "precondition: an active hold");
+    eq(sqlite.prepare(`SELECT COUNT(*) c FROM system_alerts WHERE source = ? AND dismissed_at IS NULL`).all(src)[0].c, 1, "precondition: a live banner");
+
+    let rawFetches = 0;
+    stubFetch({ masterSha: MASTER_SHA, masterBody: bodyWith(INCOMING_ID_LINE), prevBodyBySha: {} });
+    const inner = globalThis.fetch;
+    globalThis.fetch = async (u) => { if (String(u).includes("/raw/")) rawFetches++; return inner(u); };
+
+    const plan = await planAndStageBookResourcesForTest(env, "2CH", ["ult"], "inst-f6");
+    eq(plan.entries[0].changed, false, "SHA-match → nothing staged (unchanged behavior)");
+    eq(rawFetches, 0, "…and no file is fetched, so the gate never runs — which is why the clear must live here");
+    eq(sqlite.prepare(`SELECT COUNT(*) c FROM stale_base_holds WHERE resolved_at IS NULL`).all()[0].c, 0, "F6: the stale hold is released on convergence");
+    eq(sqlite.prepare(`SELECT COUNT(*) c FROM system_alerts WHERE source = ? AND dismissed_at IS NULL`).all(src)[0].c, 0, "F6: …and the banner is dropped");
+  } finally {
+    globalThis.fetch = realFetch4;
+  }
 }
 
 // ── 7. The force-released banner is a different sentence, not a suffix ───────
@@ -393,6 +551,88 @@ console.log("\n5. durable record + banner");
   await clearStaleBaseHold(env, "2CH", "ult", t2 + 172800);
   eq(sqlite.prepare(`SELECT COUNT(*) c FROM stale_base_holds WHERE resolved_at IS NULL`).all()[0].c, 0, "clean sync releases every active hold");
   eq(sqlite.prepare(`SELECT COUNT(*) c FROM system_alerts WHERE source = ? AND dismissed_at IS NULL`).all(src)[0].c, 0, "…and clears the banner");
+}
+
+// ── 8. F2: the admin "Pull from Door43" route runs the same gate ────────────
+// This route was originally left unguarded on the theory that a human asking to
+// pull master IS the consent. That made the nightly's refusal banner an
+// instruction to perform the very adoption it had just refused — by hand, with
+// no record, and with the watermark advanced so the export republishes it.
+console.log("\n8. F2 — reimportBookFromDcs (user pull) honours the gate");
+{
+  const realFetch5 = globalThis.fetch;
+  const run = async ({ allowStaleBase }) => {
+    const { sqlite, env } = freshEnv();
+    sqlite.exec(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (1, 1, 'admin')`);
+    sqlite.exec(`INSERT INTO book_imports (book) VALUES ('2CH')`);
+    sqlite.exec(
+      `INSERT INTO verses (book, chapter, verse, bible_version, content_json, plain_text, version)
+       VALUES ('2CH', 4, 11, 'ULT', '{"good":1}', 'good', 2)`,
+    );
+    sqlite
+      .prepare(`INSERT INTO book_resource_syncs (book, resource, source_sha, synced_at, origin) VALUES ('2CH','ult',?,?,'reimport')`)
+      .run(PREV_SHA, SYNCED_AT);
+    stubFetch({
+      masterSha: MASTER_SHA,
+      masterBody: bodyWith(INCOMING_ID_LINE),
+      prevBodyBySha: { [PREV_SHA]: bodyWith(PREV_ID_LINE) },
+    });
+    // dcsUrls() (the unpinned master fetch this route uses) has no ?ref=, so it
+    // must also serve master's body.
+    const inner = globalThis.fetch;
+    globalThis.fetch = async (u) => {
+      const s = String(u);
+      if (s.includes("/raw/branch/master/") || (s.includes("14-2CH.usfm") && !/[?&]ref=/.test(s) && !s.includes("/commits?"))) {
+        const body = bodyWith(INCOMING_ID_LINE);
+        const bytes = new TextEncoder().encode(body).byteLength;
+        return {
+          ok: true, status: 200,
+          headers: { get: (h) => (h.toLowerCase() === "content-length" ? String(bytes) : null) },
+          async text() { return body; },
+          async json() { return JSON.parse(body); },
+          async arrayBuffer() { return new TextEncoder().encode(body).buffer; },
+        };
+      }
+      return inner(u);
+    };
+    const result = await reimportBookFromDcs(env, "2CH", [4], ["ult"], 1, { source: "user", allowStaleBase });
+    return { sqlite, result };
+  };
+  try {
+    const refused = await run({ allowStaleBase: undefined });
+    eq(refused.result.perResource.ult.stale_base_held, 1, "user pull → the gate refuses, same as the nightly");
+    eq(refused.result.perResource.ult.updated, 0, "…and not one verse is rewritten");
+    eq(refused.result.perResource.ult.dcs_404, 0, "…and a refusal is NOT misreported as a missing file");
+    eq(
+      refused.sqlite.prepare(`SELECT content_json FROM verses WHERE book='2CH' AND chapter=4 AND verse=11`).all()[0].content_json,
+      '{"good":1}',
+      "…so D1 still holds the good content",
+    );
+    eq(refused.sqlite.prepare(`SELECT COUNT(*) c FROM stale_base_holds WHERE resolved_at IS NULL`).all()[0].c, 1, "…with a durable record");
+    eq(
+      refused.sqlite.prepare(`SELECT COUNT(*) c FROM system_alerts WHERE source = ?`).all(staleBaseAlertSource("2CH", "ult"))[0].c,
+      1,
+      "…and a banner",
+    );
+    // The watermark must not advance for a refused resource — otherwise the
+    // export's freshness gate would wave the revert through.
+    eq(
+      refused.sqlite.prepare(`SELECT source_sha FROM book_resource_syncs WHERE book='2CH' AND resource='ult'`).all()[0].source_sha,
+      PREV_SHA,
+      "…and the watermark never moved to the refused revision",
+    );
+
+    const forced = await run({ allowStaleBase: true });
+    eq(forced.result.perResource.ult.stale_base_held, 0, "explicit allowStaleBase → not refused");
+    eq(forced.result.perResource.ult.stale_base_overridden, 1, "…counted as an override actually used");
+    eq(
+      forced.sqlite.prepare(`SELECT reason FROM stale_base_holds`).all()[0].reason,
+      "stale_tc_reexport_overridden",
+      "…and recorded as an override, not as a refusal",
+    );
+  } finally {
+    globalThis.fetch = realFetch5;
+  }
 }
 
 console.log(failed === 0 ? "\nAll stale-base gate tests passed." : `\n${failed} test(s) FAILED.`);
