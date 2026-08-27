@@ -160,7 +160,7 @@ const preVerses = extractVersesForRange(preUsfm, CHAPTER, CHAPTER);
 
 // --- 2. Current production rows --------------------------------------------
 const live = executeD1(
-  `SELECT verse, version, content_json, plain_text FROM verses
+  `SELECT verse, version, updated_by, content_json, plain_text FROM verses
     WHERE book = ${q(BOOK)} AND bible_version = ${q(BIBLE_VERSION)}
       AND chapter = ${CHAPTER} AND verse IN (${VERSES.join(",")}) ORDER BY verse`,
 );
@@ -230,6 +230,7 @@ for (const vnum of VERSES) {
       ? "(none)"
       : { preDamage: stripMarkers(preEditable), current: currentEditable },
     oldContentJson, newContentJson, plainText,
+    updatedBy: dbRow.updated_by == null ? null : Number(dbRow.updated_by),
     dbPlainText: dbRow.plain_text,
   });
 }
@@ -321,14 +322,33 @@ db.exec(`
     created_at INTEGER DEFAULT (unixepoch())
   );
 `);
-const seed = db.prepare(`INSERT INTO verses (book, chapter, verse, bible_version, content_json, plain_text, version, updated_at)
-  VALUES (?, ?, ?, ?, ?, ?, ?, unixepoch())`);
-for (const row of reviewed) seed.run(row.book, row.chapter, row.verse, row.bibleVersion, row.oldContentJson, row.dbPlainText, row.currentVersion);
-db.exec(sql.join("\n"));
+const seed = db.prepare(`INSERT INTO verses (book, chapter, verse, bible_version, content_json, plain_text, version, updated_by, updated_at)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, unixepoch())`);
+// Seed the real updated_by so the dry-run can prove the repair leaves it alone.
+// A NULLed updated_by marks the row pristine, and a pristine row silently
+// adopts master on the next sync (#639) — which would undo this repair.
 for (const row of reviewed) {
-  const liveRow = db.prepare(`SELECT content_json, plain_text, version FROM verses WHERE book=? AND chapter=? AND verse=? AND bible_version=?`)
+  seed.run(row.book, row.chapter, row.verse, row.bibleVersion, row.oldContentJson, row.dbPlainText, row.currentVersion, row.updatedBy);
+}
+// Execute the way the runbook does: one statement at a time, not as one
+// db.exec() of the whole file. Multi-statement exec hides exactly the failure
+// mode the per-statement runbook exists to avoid, and it would also mask the
+// audit row's dependence on the verse UPDATE having already landed.
+for (const stmt of sql.join("\n").split(/;\s*(?:\r?\n|$)/)) {
+  const s = stmt.trim();
+  if (!s || /^--/.test(s.split("\n").filter((l) => !/^\s*--/.test(l)).join("\n").trim() || "--")) continue;
+  db.exec(s + ";");
+}
+for (const row of reviewed) {
+  const liveRow = db.prepare(`SELECT content_json, plain_text, version, updated_by FROM verses WHERE book=? AND chapter=? AND verse=? AND bible_version=?`)
     .get(row.book, row.chapter, row.verse, row.bibleVersion);
   if (liveRow.version !== row.currentVersion + 1) throw new Error(`${row.rowKey}: version did not advance by exactly 1`);
+  // The row must NOT come out pristine. A NULL updated_by makes the next sync
+  // adopt master silently (#639), and master still holds the marker-free text —
+  // the repair would be reverted overnight with nothing to show for it.
+  if ((liveRow.updated_by ?? null) !== (row.updatedBy ?? null)) {
+    throw new Error(`${row.rowKey}: updated_by changed (${row.updatedBy} -> ${liveRow.updated_by}); a pristine row re-adopts the damaged master`);
+  }
   if (liveRow.content_json !== row.newContentJson) throw new Error(`${row.rowKey}: content_json is not the reviewed tree`);
   if (liveRow.plain_text !== row.dbPlainText) throw new Error(`${row.rowKey}: plain_text changed — the repair must be marker-only`);
   const audit = db.prepare(`SELECT * FROM edit_log WHERE row_key=?`).all(row.rowKey);

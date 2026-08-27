@@ -1704,37 +1704,144 @@ const CLOSING_RUN_RE = /^[\s,.;:!?)\]}”’…]*/u;
 // actually typed. Handing reconcileMarkers `oldPlain` wholesale instead would
 // give it a pre-edit `leadPunct`, which can split the gap at the wrong
 // character and strand newly typed punctuation on the following line.
-function reanchorMarkers(oldPlain: string, newPlain: string): string {
+const NON_WS = /\s+/g;
+const stripWs = (s: string) => s.replace(NON_WS, "");
+
+// One marker's position expressed the way it can be transplanted: which word it
+// follows, plus the gap it sat in and where inside that gap it sat — both
+// recorded by NON-WHITESPACE content so they survive whitespace normalization.
+interface MarkerPlacement {
+  tag: string;
+  wordsBefore: number;
+  leadNonWs: string; // gap content BEFORE the marker
+  gapNonWs: string; // the whole gap's content
+  padBefore: boolean; // the marker was separated from the text by whitespace
+}
+
+// Split an editable string into its marker-free text and the placement of every
+// marker in it. Positions are measured in the STRIPPED text, so they are
+// directly comparable across two strings that share a word sequence.
+function parseLayout(plain: string): { stripped: string; markers: MarkerPlacement[] } {
   const re = new RegExp(MARKER_TOKEN_RE.source, MARKER_TOKEN_RE.flags);
-  const anchors: { tag: string; wordsBefore: number }[] = [];
+  let stripped = "";
+  let last = 0;
+  const seen: { tag: string; pos: number }[] = [];
   let m: RegExpExecArray | null;
-  while ((m = re.exec(oldPlain)) !== null) {
-    const before = stripMarkerTokens(oldPlain.slice(0, m.index));
-    anchors.push({ tag: m[1], wordsBefore: [...before.matchAll(WORD_RUN_RE)].length });
+  while ((m = re.exec(plain)) !== null) {
+    stripped += plain.slice(last, m.index);
+    // Mirror stripMarkerTokens' anti-fusion rule so the stripped text here and
+    // the engine's own newStripped agree on where words begin and end.
+    const left = plain.slice(Math.max(0, m.index - 2), m.index);
+    const right = plain.slice(m.index + m[0].length, m.index + m[0].length + 2);
+    seen.push({ tag: m[1], pos: stripped.length });
+    if (joinWouldFuse(left, right)) stripped += " ";
+    last = m.index + m[0].length;
     if (m[0].length === 0) re.lastIndex++;
   }
-  const hits = [...newPlain.matchAll(WORD_RUN_RE)];
-  const starts = hits.map((x) => x.index ?? 0);
-  const ends = hits.map((x) => (x.index ?? 0) + x[0].length);
+  stripped += plain.slice(last);
+
+  const hits = [...stripped.matchAll(WORD_RUN_RE)];
+  const starts = hits.map((h) => h.index ?? 0);
+  const ends = hits.map((h) => (h.index ?? 0) + h[0].length);
+  const markers = seen.map(({ tag, pos }) => {
+    let wordsBefore = 0;
+    while (wordsBefore < ends.length && ends[wordsBefore] <= pos) wordsBefore++;
+    const gapStart = wordsBefore === 0 ? 0 : ends[wordsBefore - 1];
+    const gapEnd = wordsBefore >= starts.length ? stripped.length : starts[wordsBefore];
+    const lo = Math.min(gapStart, gapEnd);
+    const hi = Math.max(gapStart, gapEnd);
+    return {
+      tag,
+      wordsBefore,
+      leadNonWs: stripWs(stripped.slice(lo, Math.min(Math.max(pos, lo), hi))),
+      gapNonWs: stripWs(stripped.slice(lo, hi)),
+      // extractEditableText separates a marker from preceding text with the
+      // tree's own whitespace; a verse-final marker's space is trimmed off the
+      // stripped text, so remember it explicitly and re-emit it.
+      padBefore: pos === 0 || /\s/.test(stripped[pos - 1] ?? " "),
+    };
+  });
+  return { stripped, markers };
+}
+
+function reanchorMarkers(oldPlain: string, newPlain: string): string {
+  const base = parseLayout(oldPlain);
+  // Build on the capture's MARKER-FREE text and re-emit the baseline's complete
+  // marker list. Working off the raw capture instead would (a) tokenize a
+  // surviving `\ts\*` label as the word "ts", displacing every anchor after it,
+  // and (b) re-emit that divider on top of the one already there.
+  const stripped = parseLayout(newPlain).stripped;
+  const hits = [...stripped.matchAll(WORD_RUN_RE)];
+  const starts = hits.map((h) => h.index ?? 0);
+  const ends = hits.map((h) => (h.index ?? 0) + h[0].length);
+
+  const inserts: { pos: number; tag: string; padBefore: boolean }[] = [];
+  for (const mk of base.markers) {
+    const gapStart = mk.wordsBefore === 0 ? 0 : (ends[mk.wordsBefore - 1] ?? stripped.length);
+    const gapEnd = mk.wordsBefore >= starts.length ? stripped.length : starts[mk.wordsBefore];
+    const lo = Math.min(gapStart, stripped.length);
+    const hi = Math.max(lo, gapEnd);
+    const gap = stripped.slice(lo, hi);
+    let pos: number;
+    if (stripWs(gap) === mk.gapNonWs) {
+      // The edit did not touch this gap, so the translator's own placement is
+      // still the best answer: replay the baseline's split verbatim, counting
+      // non-whitespace characters. This is what keeps a line-ending em-dash on
+      // the line it ends — the fixed CLOSING class cannot tell that from a
+      // line-OPENING dash, which is precisely what reconcileMarkers' own
+      // comment warns about.
+      let seenNonWs = 0;
+      let i = 0;
+      while (i < gap.length && seenNonWs < mk.leadNonWs.length) {
+        if (!/\s/.test(gap[i])) seenNonWs++;
+        i++;
+      }
+      // Pull the separating space in front of the marker only if the baseline
+      // had one. A marker the translator wrote flush against a word
+      // (`storm\q1 and`) sits BEFORE the space stripMarkerTokens synthesizes to
+      // keep those two words apart, not after it.
+      if (mk.padBefore) while (i < gap.length && /\s/.test(gap[i])) i++;
+      pos = lo + i;
+    } else if (mk.gapNonWs.length > 0 && mk.leadNonWs === mk.gapNonWs) {
+      // The edit changed this gap, but in the baseline the marker sat AFTER all
+      // of its punctuation — the break came at the end of the line. Keep that
+      // role: put it after the new punctuation too. This is what carries a
+      // translator's `deceit,` -> `deceit—` through without stranding the new
+      // dash on the next line, which the CLOSING class alone cannot do (it does
+      // not contain the dash, and cannot tell a line-ending one from a
+      // line-opening one — see reconcileMarkers' own comment).
+      pos = hi;
+    } else if (mk.leadNonWs === "") {
+      // The marker LED its gap's punctuation (an opening quote belongs to the
+      // new line), so keep it at the front.
+      pos = lo;
+    } else {
+      // Mixed: punctuation on both sides of the marker, and the edit changed
+      // it. Nothing in the baseline describes the new gap, so fall back to the
+      // closing-punctuation heuristic.
+      pos = lo + (CLOSING_RUN_RE.exec(gap)?.[0].length ?? 0);
+    }
+    inserts.push({ pos, tag: mk.tag, padBefore: mk.padBefore });
+  }
+
+  inserts.sort((a, b) => a.pos - b.pos);
   let out = "";
   let cursor = 0;
-  for (const a of anchors) {
-    const gapStart = Math.max(a.wordsBefore === 0 ? 0 : ends[a.wordsBefore - 1], cursor);
-    const gapEnd = Math.max(
-      a.wordsBefore >= starts.length ? newPlain.length : starts[a.wordsBefore],
-      gapStart,
-    );
-    // Closing punctuation belongs to the line the marker ends; anything else
-    // (an opening quote, a line-leading dash) belongs after the break.
-    const gap = newPlain.slice(gapStart, gapEnd);
-    const at = gapStart + (CLOSING_RUN_RE.exec(gap)?.[0].length ?? 0);
-    out += newPlain.slice(cursor, at);
-    if (out.length && !/\s$/.test(out)) out += " ";
-    out += `\\${a.tag} `;
+  for (const ins of inserts) {
+    const at = Math.max(ins.pos, cursor);
+    out += stripped.slice(cursor, at);
+    if (ins.padBefore && out.length > 0 && !/\s$/.test(out)) out += " ";
+    out += `\\${ins.tag} `;
     cursor = at;
   }
-  return normalizeEditable(out + newPlain.slice(cursor));
+  return normalizeEditable(out + stripped.slice(cursor));
 }
+
+// Test-only escape hatches for the self-fidelity sweep in
+// scripts/hos606-fidelity.mjs and the property test in replace.test.mjs.
+// Not part of the module's public surface.
+export const __reanchorMarkersForTest = reanchorMarkers;
+export const __stripMarkerTokensForTest = stripMarkerTokens;
 
 // Re-lay the inert position markers (\p, \q1, \q2, \ts\*) of a verse to match
 // the edited text. Markers ARE text tokens in editable space but have NO raw
