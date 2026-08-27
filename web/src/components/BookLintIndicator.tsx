@@ -114,18 +114,21 @@ export function BookLintIndicator({
                 </Box>
               }
               secondary={
-                <Typography
-                  variant="caption"
-                  color="text.secondary"
-                  sx={{
-                    display: "-webkit-box",
-                    WebkitLineClamp: 2,
-                    WebkitBoxOrient: "vertical",
-                    overflow: "hidden",
-                  }}
-                >
-                  {issue.message}
-                </Typography>
+                <Tooltip title={issue.message} placement="bottom-start" enterDelay={300}>
+                  <Typography
+                    variant="caption"
+                    color="text.secondary"
+                    sx={{
+                      display: "-webkit-box",
+                      WebkitLineClamp: 2,
+                      WebkitBoxOrient: "vertical",
+                      overflow: "hidden",
+                      cursor: "default",
+                    }}
+                  >
+                    {issue.message}
+                  </Typography>
+                </Tooltip>
               }
             />
           </MenuItem>
