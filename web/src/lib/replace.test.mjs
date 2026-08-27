@@ -6,7 +6,14 @@
 // Not a test framework; failures exit non-zero. Mirrors
 // src/lib/alignment.test.mjs.
 
-import { smartEditVerse, smartReplaceVerse, tokenizePlainText, tokenizeEditableText } from "./replace.ts";
+import {
+  smartEditVerse,
+  smartReplaceVerse,
+  tokenizePlainText,
+  tokenizeEditableText,
+  __reanchorMarkersForTest as reanchorMarkers,
+  __stripMarkerTokensForTest as stripMarkerTokens,
+} from "./replace.ts";
 import { extractEditableText, extractPlainText } from "./usfm.ts";
 import { analyzeAlignmentDelta } from "./alignmentDelta.ts";
 
@@ -2109,6 +2116,429 @@ function countAligned(content) {
   assert(words.find((x) => x.text === "him")?.strongs.includes("H2"), "'him' keeps alignment");
   assert(words.find((x) => x.text === "and")?.strongs.includes("H3"), "'and' keeps alignment");
   assert(words.find((x) => x.text === "watched")?.strongs.length === 0, "edited 'watched' is unaligned");
+}
+
+// --- Case 74: a capture that LOST the editor's marker chips must not wipe the
+// verse's poetry lineation. HOS ULT 11:9 / 11:11 / 11:12 (#606).
+//
+// The marker chips are real text in the editable string. When the DOM capture
+// hands back a `newPlain` with every chip missing, the words still round-trip
+// perfectly — so the relayout tier preserves the whole verse and all its
+// alignment, and `preservedAlignment` stays true — and then Step 2's
+// reconcileMarkers rebuilds the marker layout from the captured text alone,
+// deleting every marker and re-inserting none. Silent, total loss of poetry
+// lineation with no guard and no toast. In prod this took all 11 `\q` markers
+// out of three HOS 11 verses in one twelve-minute editing session and shipped
+// them to Door43 master.
+//
+// Shape below mirrors HOS 11:9: interior \q2/\q1 line breaks, a closing curly
+// quote at the verse end, and a trailing \q1 that belongs to this verse's tree
+// (it renders before the NEXT verse's \v). The edit is the real one — delete
+// the closing quote — captured twice: once well-formed, once with the chips
+// dropped. Both must produce the same markers in the same places.
+{
+  console.log("\n[Case 74] Dropped marker chips in the capture do not wipe \\q lineation (#606)");
+  const verse = {
+    verseObjects: [
+      zaln("H1", [w("I"), t(" ")]),
+      zaln("H2", [w("will"), t(" ")]),
+      zaln("H3", [w("not"), t(" ")]),
+      zaln("H4", [w("come"), t(" ")]),
+      zaln("H5", [w("in"), t(" ")]),
+      zaln("H6", [w("wrath"), t(".")]),
+      t("”"),
+      { type: "quote", tag: "q1" },
+    ],
+  };
+  // Give it interior lineation too, so the "every marker gone" shape is real.
+  verse.verseObjects.splice(3, 0, { type: "quote", tag: "q2" });
+  verse.verseObjects.splice(0, 0, { type: "quote", tag: "q1" });
+
+  const old = extractEditableText(verse);
+  assert(
+    (old.match(/\\q/g) ?? []).length === 3,
+    `baseline has 3 marker chips (got ${JSON.stringify(old)})`,
+  );
+
+  // The edit: delete the closing curly quote. Nothing else changes.
+  const wellFormed = old.replace("”", "");
+  // The same edit as a capture that dropped every chip.
+  const chipsDropped = wellFormed.replace(/\\q\d?\s?/g, "").replace(/\s+/g, " ").trim();
+  assert(!/\\q/.test(chipsDropped), "chip-dropped capture really has no marker tokens");
+
+  const good = smartEditVerse(verse, old, wellFormed);
+  const bad = smartEditVerse(verse, old, chipsDropped, { capturedFromDom: true });
+
+  const goodOut = extractEditableText(good.content);
+  const badOut = extractEditableText(bad.content);
+  assert(
+    (badOut.match(/\\q/g) ?? []).length === 3,
+    `all 3 markers survive the chip-dropped capture (got ${JSON.stringify(badOut)})`,
+  );
+  assert(
+    badOut === goodOut,
+    `chip-dropped capture matches the well-formed one (got ${JSON.stringify(badOut)}, want ${JSON.stringify(goodOut)})`,
+  );
+  assert(!/”/.test(badOut), "the quote the translator actually deleted is still gone");
+  const words = alignedWords(bad.content);
+  assert(words.length === 6, `all 6 words survive (got ${words.length})`);
+  assert(
+    words.every((x) => x.strongs.length === 1),
+    "every word keeps its alignment",
+  );
+}
+
+// --- Case 74b: the guard must NOT swallow a deliberate marker deletion.
+// Deleting a `\q` and changing nothing else is a pure marker edit and has to
+// keep working — the #606 guard only fires when the capture changed
+// punctuation AND lost every chip at the same time.
+{
+  console.log("\n[Case 74b] A deliberate marker deletion is still honored");
+  const verse = {
+    verseObjects: [
+      zaln("H1", [w("the"), t(" ")]),
+      zaln("H2", [w("people"), t(",")]),
+      t(" "),
+      { type: "quote", tag: "q2" },
+      zaln("H3", [w("and"), t(" ")]),
+      zaln("H4", [w("light"), t(".")]),
+    ],
+  };
+  const old = extractEditableText(verse); // "the people, \q2 and light."
+  const next = old.replace(/\\q2\s?/, ""); // drop the only marker, touch nothing else
+  const r = smartEditVerse(verse, old, next);
+  const out = extractEditableText(r.content);
+  assert(!/\\q/.test(out), `the deleted marker stays deleted (got ${JSON.stringify(out)})`);
+  assert(alignedWords(r.content).length === 4, "all words survive the marker deletion");
+}
+
+// --- Case 74c: a real reflow that rewrites words AND drops the lineation is
+// still taken at face value — the guard requires an UNCHANGED word sequence,
+// so genuine poetry→prose editing is untouched by it.
+{
+  console.log("\n[Case 74c] A word-changing reflow may still remove markers");
+  const verse = {
+    verseObjects: [
+      zaln("H1", [w("the"), t(" ")]),
+      zaln("H2", [w("people"), t(",")]),
+      t(" "),
+      { type: "quote", tag: "q2" },
+      zaln("H3", [w("and"), t(" ")]),
+      zaln("H4", [w("light"), t(".")]),
+    ],
+  };
+  const old = extractEditableText(verse);
+  const next = "the crowd, and light.";
+  const r = smartEditVerse(verse, old, next);
+  const out = extractEditableText(r.content);
+  assert(!/\\q/.test(out), `reflow that changed a word removes the marker (got ${JSON.stringify(out)})`);
+}
+
+// --- Case 74d: the guard has to hold when the whole-verse relayout tier BAILS.
+// A word unit split across leaves ("warrior’s") makes relayoutUnchangedWords
+// return null even though no word changed (its split-unit guard), and
+// reassembleAlignment declines this shape too — measured, it returns null — so
+// the edit falls all the way through to the diff tiers, which drop any marker
+// inside their rewrite range. Step 2 is the only thing that can put the
+// lineation back, which is exactly what the guard has to make possible.
+//
+// NOTE: this does NOT exercise the reassembly tier; that tier bails here. A
+// case that genuinely reaches reassembleAlignment WITH a marker present is
+// still untested.
+{
+  console.log("\n[Case 74d] Guard holds when the relayout tier bails to the diff tiers (#606)");
+  const verse = {
+    verseObjects: [
+      { type: "quote", tag: "q1" },
+      zaln("H1", [w("the"), t(" ")]),
+      zaln("H2", [w("warrior"), t("’"), w("s")]), // one token, three leaves
+      t(" "),
+      { type: "quote", tag: "q2" },
+      zaln("H3", [w("shield"), t(".")]),
+      t("”"),
+    ],
+  };
+  const old = extractEditableText(verse); // "\q1 the warrior’s \q2 shield.”"
+  const wellFormed = old.replace("”", "");
+  const chipsDropped = wellFormed.replace(/\\q\d?\s?/g, "").replace(/\s+/g, " ").trim();
+  const bad = smartEditVerse(verse, old, chipsDropped, { capturedFromDom: true });
+  const out = extractEditableText(bad.content);
+  assert(
+    (out.match(/\\q/g) ?? []).length === 2,
+    `both markers survive when the relayout tier bails (got ${JSON.stringify(out)})`,
+  );
+  assert(
+    out === extractEditableText(smartEditVerse(verse, old, wellFormed).content),
+    `matches the well-formed capture (got ${JSON.stringify(out)})`,
+  );
+}
+
+// --- Case 74e: the #606 guard reconciles against the BASELINE layout, so the
+// `leadPunct` reconcileMarkers reads from it is the punctuation the translator
+// typed BEFORE this edit. When the edit changed punctuation right at a marker
+// boundary that lead is stale, and a line-ending em-dash is the sharpest case —
+// it is deliberately NOT in reconcileMarkers' CLOSING class, so a wrong split
+// would strand it on the next poetry line. Pin that it still lands exactly
+// where the well-formed capture puts it.
+{
+  console.log("\n[Case 74e] Stale leadPunct does not move a marker across edited punctuation (#606)");
+  const mk = () => ({
+    verseObjects: [
+      zaln("H1", [w("he"), t(" ")]),
+      zaln("H2", [w("said"), t(",")]),
+      t(" "),
+      { type: "quote", tag: "q1" },
+      zaln("H3", [w("Behold"), t(" ")]),
+      zaln("H4", [w("light"), t(".")]),
+    ],
+  });
+  const old = extractEditableText(mk()); // "he said, \q1 Behold light."
+  const wellFormed = old.replace("said,", "said—"); // punctuation only, at the boundary
+  const chipsDropped = wellFormed.replace(/\\q\d?\s?/g, "").replace(/\s+/g, " ").trim();
+  const good = extractEditableText(smartEditVerse(mk(), old, wellFormed).content);
+  const bad = extractEditableText(smartEditVerse(mk(), old, chipsDropped, { capturedFromDom: true }).content);
+  assert(/said—\s*\\q1/.test(bad), `the em-dash stays on the line it ends (got ${JSON.stringify(bad)})`);
+  assert(bad === good, `matches the well-formed capture (got ${JSON.stringify(bad)}, want ${JSON.stringify(good)})`);
+}
+
+// --- Case 74f: the guard is a statement about a DOM CAPTURE, so it must not
+// run for callers whose "new text" came from a stored tree. verseRebase renders
+// both sides with extractEditableText, so a tree that genuinely has no markers
+// is authoritative there — firing the guard would resurrect lineation the
+// queued op deliberately removed. Default (no capturedFromDom) must honor the
+// deletion; only the editor's capture path opts in.
+{
+  console.log("\n[Case 74f] Guard does not fire for non-DOM callers (verseRebase) (#606)");
+  const verse = {
+    verseObjects: [
+      { type: "quote", tag: "q1" },
+      zaln("H1", [w("the"), t(" ")]),
+      zaln("H2", [w("people"), t(",")]),
+      t(" "),
+      { type: "quote", tag: "q2" },
+      zaln("H3", [w("and"), t(" ")]),
+      zaln("H4", [w("light"), t(".")]),
+      t("”"),
+    ],
+  };
+  const old = extractEditableText(verse);
+  // An op that deliberately removed all the lineation AND changed punctuation —
+  // the exact shape the guard catches on the capture path.
+  const opText = old.replace("”", "").replace(/\\q\d?\s?/g, "").replace(/\s+/g, " ").trim();
+
+  const rebased = smartEditVerse(verse, old, opText); // no capturedFromDom
+  assert(
+    !/\\q/.test(extractEditableText(rebased.content)),
+    `rebase honors the op's marker deletion (got ${JSON.stringify(extractEditableText(rebased.content))})`,
+  );
+
+  const captured = smartEditVerse(verse, old, opText, { capturedFromDom: true });
+  assert(
+    (extractEditableText(captured.content).match(/\\q/g) ?? []).length === 2,
+    "the same text from a DOM capture keeps the markers",
+  );
+}
+
+// --- Case 74g: a `\ts\*` chunk divider prints its literal label even in the
+// non-chip render, so it can survive a capture that lost every \q/\p chip.
+// Testing "no marker tokens at all" would let that one stray divider defeat the
+// guard and the verse would lose its whole lineation anyway.
+{
+  console.log("\n[Case 74g] A surviving \\ts\\* divider does not defeat the guard (#606)");
+  // Words on BOTH sides of the divider, and a marker after them: the raw
+  // capture tokenizes the surviving `\ts\*` label as the word "ts", so every
+  // anchor past it shifts by one — which only shows up when there is something
+  // past it to shift.
+  const verse = {
+    verseObjects: [
+      zaln("H1", [w("the"), t(" ")]),
+      { tag: "ts", content: "\\*" },
+      zaln("H2", [w("people"), t(" ")]),
+      zaln("H3", [w("said"), t(",")]),
+      t(" "),
+      { type: "quote", tag: "q2" },
+      zaln("H4", [w("light"), t(".")]),
+      t("”"),
+    ],
+  };
+  const old = extractEditableText(verse);
+  const wellFormed = old.replace("”", "");
+  // Chips gone, but the \ts\* label survived the repaint.
+  const chipsDropped = wellFormed.replace(/\\q\d?\s?/g, "").replace(/\s+/g, " ").trim();
+  assert(/\\ts/.test(chipsDropped), "the \\ts\\* label really did survive the capture");
+  const good = smartEditVerse(verse, old, wellFormed, { capturedFromDom: true });
+  const r = smartEditVerse(verse, old, chipsDropped, { capturedFromDom: true });
+  const out = extractEditableText(r.content);
+  // Counting \q alone is not enough: the first cut of this guard tokenized the
+  // surviving `\ts\*` label as the word "ts", which displaced every later anchor
+  // AND re-emitted the divider on top of the one already there — while leaving
+  // the \q count looking perfectly correct. Assert the whole layout, and the
+  // divider count.
+  assert(
+    out === extractEditableText(good.content),
+    `layout matches the well-formed capture (got ${JSON.stringify(out)}, want ${JSON.stringify(extractEditableText(good.content))})`,
+  );
+  assert(
+    (out.match(/\\ts/g) ?? []).length === 1,
+    `the divider is not duplicated (got ${JSON.stringify(out)})`,
+  );
+  const tsNodes = [];
+  const walkTs = (nodes) => {
+    for (const n of nodes ?? []) {
+      if (!n || typeof n !== "object") continue;
+      // usfm-js parks the chunk divider as {tag:"ts\\*"}, not tag "ts".
+      if (typeof n.tag === "string" && n.tag.startsWith("ts")) tsNodes.push(n);
+      if (Array.isArray(n.children)) walkTs(n.children);
+    }
+  };
+  walkTs(r.content.verseObjects);
+  assert(tsNodes.length === 1, `exactly one \\ts\\* NODE in the tree (got ${tsNodes.length})`);
+  assert(
+    (out.match(/\\q/g) ?? []).length === 1,
+    `both \\q markers survive despite the stray divider (got ${JSON.stringify(out)})`,
+  );
+}
+
+// --- Case 74h: the em-dash as a TOP-LEVEL bare text node — the standard uW
+// "punctuation outside \w" form that real USFM actually produces. Case 74e's
+// dash lives INSIDE a milestone, where reconcileMarkers' splitAtLead rescues
+// it; this shape has no such rescue, so it is the one that exposes a re-anchor
+// that splits gaps with the fixed CLOSING class. A line-ending dash must stay
+// on the line it ends, both when the edit leaves that punctuation alone and
+// when the edit is what produced it.
+{
+  console.log("\n[Case 74h] Line-ending em-dash in a bare text node keeps its line (#606)");
+  const mk = () => ({
+    verseObjects: [
+      zaln("H1", [w("scales")]),
+      t(" of "),
+      zaln("H2", [w("deceit")]),
+      t("—"), // top-level bare punctuation, uW's normal form
+      { type: "quote", tag: "q2" },
+      t(" "),
+      zaln("H3", [w("he")]),
+      t(" "),
+      zaln("H4", [w("loves"), t(".")]),
+      t("”"),
+    ],
+  });
+  const old = extractEditableText(mk());
+  assert(/deceit—\s*\\q2/.test(old), `baseline has the dash before the break (got ${JSON.stringify(old)})`);
+  // A marker is a zero-width anchor, so whitespace directly around it is
+  // cosmetic (it renders as a line break either way). Compare layouts with that
+  // whitespace canonicalized; the dash's SIDE of the break is asserted exactly.
+  const sameLayout = (a, b) =>
+    a.replace(/\s*(\\[a-z0-9\\*]+)\s*/g, " $1 ").replace(/\s+/g, " ").trim() ===
+    b.replace(/\s*(\\[a-z0-9\\*]+)\s*/g, " $1 ").replace(/\s+/g, " ").trim();
+
+  // (a) the edit does not touch the dash's gap
+  {
+    const wellFormed = old.replace("”", "");
+    const dropped = wellFormed.replace(/\\q\d?\s?/g, "").replace(/\s+/g, " ").trim();
+    const good = extractEditableText(smartEditVerse(mk(), old, wellFormed, { capturedFromDom: true }).content);
+    const bad = extractEditableText(smartEditVerse(mk(), old, dropped, { capturedFromDom: true }).content);
+    assert(/deceit—\s*\\q2/.test(bad), `untouched: dash stays on its line (got ${JSON.stringify(bad)})`);
+    assert(sameLayout(bad, good), `untouched: matches well-formed (got ${JSON.stringify(bad)}, want ${JSON.stringify(good)})`);
+  }
+
+  // (b) the edit is what added the dash (gap changed -> CLOSING fallback)
+  {
+    const plain = { verseObjects: mk().verseObjects.map((n) => (n.type === "text" && n.text === "—" ? t(",") : n)) };
+    const base = extractEditableText(plain);
+    const wellFormed = base.replace("deceit,", "deceit—").replace("”", "");
+    const dropped = wellFormed.replace(/\\q\d?\s?/g, "").replace(/\s+/g, " ").trim();
+    const good = extractEditableText(smartEditVerse(plain, base, wellFormed, { capturedFromDom: true }).content);
+    const bad = extractEditableText(smartEditVerse(plain, base, dropped, { capturedFromDom: true }).content);
+    assert(sameLayout(bad, good), `edited: matches well-formed (got ${JSON.stringify(bad)}, want ${JSON.stringify(good)})`);
+    assert((bad.match(/\\q/g) ?? []).length === 1, `edited: the marker survives (got ${JSON.stringify(bad)})`);
+  }
+}
+
+// --- Case 74i: self-fidelity property. Re-anchoring a verse's OWN marker
+// layout onto its OWN marker-stripped text must reproduce that layout exactly.
+// Any divergence is punctuation the re-anchor mislaid, and it would show up in
+// real verses as a poetry line break drifting across a dash or a quote. Held
+// over 4968 real marker-bearing verses (HOS/PRO/ISA/PSA) by
+// scripts/hos606-fidelity.mjs; these fixtures keep the property pinned in CI.
+{
+  console.log("\n[Case 74i] Re-anchoring a layout onto its own stripped text is identity (#606)");
+  const layouts = [
+    "I will not come in wrath. \\q1",
+    "the burning of my nose; \\q2 I will not repeat to destroy Ephraim! \\q1",
+    "A merchant—in his hand {are} scales of deceit— \\q2 he loves to oppress. \\q1",
+    "when your dread comes like a storm\\q1 and your calamity happens like a whirlwind, \\q1",
+    "to receive instruction of insight, \\q1 righteousness and justice; \\ts\\* \\q1",
+    "\\q1 “When Israel was a child I loved him, \\q2 and out of Egypt I called my son. \\q1",
+    "a little folding of the hands to lie down”— \\q1",
+  ];
+  for (const layout of layouts) {
+    const stripped = stripMarkerTokens(layout).replace(/\s+/g, " ").trim();
+    const round = reanchorMarkers(layout, stripped);
+    assert(round === layout, `identity for ${JSON.stringify(layout)} (got ${JSON.stringify(round)})`);
+  }
+}
+
+// --- Case 74j: pins the DOCUMENTED trade-off, BY DESIGN.
+//
+// A translator who deletes every marker AND changes punctuation in the same save
+// is overridden: their marker deletion is reverted. That is deliberate. From the
+// text alone this is indistinguishable from a dropped-chip capture, so the only
+// choice is which way to be wrong, and the reverse error is the one that
+// silently destroyed HOS 11's poetry lineation and shipped it to Door43 (#606).
+//
+// Two things bound the cost, and both are asserted here:
+//   * THE ESCAPE HATCH — deleting markers with NO other change is a pure marker
+//     edit, which never reaches the guard and is always honored (Case 74b). So
+//     the translator's route is "delete the marks in a save of their own".
+//   * THE NOTICE — the result carries `markerCaptureGuarded`, which the Shell
+//     save path turns into a toast telling the translator what was restored and
+//     how to remove it on purpose. Codex flagged in review of #645 that the
+//     override was invisible to users (console.warn reaches developers only);
+//     this flag is what makes it visible.
+{
+  console.log("\n[Case 74j] Deliberate delete-all-markers + punctuation change IS overridden (#606)");
+  const verse = {
+    verseObjects: [
+      zaln("H1", [w("the"), t(" ")]),
+      zaln("H2", [w("people"), t(",")]),
+      t(" "),
+      { type: "quote", tag: "q2" },
+      zaln("H3", [w("light"), t(".")]),
+      t("”"),
+    ],
+  };
+  const old = extractEditableText(verse);
+  // The translator removed the marker AND the closing quote in one save.
+  const intentional = old.replace(/\\q\d?\s?/g, "").replace("”", "").replace(/\s+/g, " ").trim();
+  const warnings = [];
+  const realWarn = console.warn;
+  console.warn = (msg) => warnings.push(String(msg));
+  let r;
+  try { r = smartEditVerse(verse, old, intentional, { capturedFromDom: true }); }
+  finally { console.warn = realWarn; }
+  const out = extractEditableText(r.content);
+  assert(/\\q2/.test(out), `the marker is restored, not deleted (got ${JSON.stringify(out)})`);
+  assert(!/”/.test(out), "the punctuation edit is still applied");
+  assert(
+    warnings.some((x) => x.includes("#606")),
+    `the override is announced on console.warn (got ${JSON.stringify(warnings)})`,
+  );
+  // The flag the Shell save path reads to raise the user-facing toast. Without
+  // it the override is invisible to the person it affects.
+  assert(
+    r.markerCaptureGuarded === true,
+    `the result flags the override for the UI (got ${JSON.stringify(r.markerCaptureGuarded)})`,
+  );
+
+  // The escape hatch must stay open: the SAME deletion, with no other change,
+  // is honored and raises no notice.
+  const markersOnly = old.replace(/\\q\d?\s?/g, "").replace(/\s+/g, " ").trim();
+  const pure = smartEditVerse(verse, old, markersOnly, { capturedFromDom: true });
+  assert(
+    !/\\q/.test(extractEditableText(pure.content)),
+    `a marker-only deletion is still honored (got ${JSON.stringify(extractEditableText(pure.content))})`,
+  );
+  assert(!pure.markerCaptureGuarded, "the honored deletion raises no override notice");
 }
 
 if (failed > 0) {
