@@ -1145,6 +1145,141 @@ console.log("\n[#609: marker pileup is a REAL growing difference and still write
   );
 }
 
+// ── Review F1: the two shapes the stableKey lens gets WRONG ─────────────────
+//
+// These are why isNormalizedNoopVerseWrite does not stop at the lens. Both are
+// pure whitespace to `stableKey` — and both change the rendered USFM, fusing a
+// word onto its marker (`and\w God\w*`, `\w*\w`), which is the PR #417 /
+// stripMarkerTokens corruption class. usfmFormat.ts's insertSpaceAfterGluedMarker
+// does not repair either: its regex is anchored to a leading poetry marker.
+//
+// If either of these ever starts skipping, D1 has kept a fused-token tree that the
+// next nightly export publishes to Door43 as corrupt USFM.
+console.log("\n[#609 F1: a text node losing its trailing space before a \\w still writes (fused word token)]");
+{
+  const { env, sqlite } = freshEnv();
+  const spaced = JSON.stringify({
+    verseObjects: [{ type: "text", text: "and " }, { tag: "w", type: "word", text: "God" }],
+  });
+  const fused = JSON.stringify({
+    verseObjects: [{ type: "text", text: "and" }, { tag: "w", type: "word", text: "God" }],
+  });
+  sqlite
+    .prepare(
+      `INSERT INTO verses (book, chapter, verse, verse_end, bible_version, content_json, plain_text, version, updated_by)
+       VALUES (?, 13, 1, NULL, ?, ?, 'and God', 3, NULL)`,
+    )
+    .run(BOOK, VERSION, spaced);
+
+  const counts = await applyVerseRowsForTest(
+    env,
+    BOOK,
+    VERSION,
+    [{ chapter: 13, verse: 1, verseEnd: null, contentJson: fused, plainText: "and God" }],
+    null,
+    null,
+    false,
+  );
+
+  eq(counts.skipped_normalized, 0, "the lens calls this converged — the export-render check must still force the write");
+  eq(counts.updated, 1, "…so the write lands");
+  const row = sqlite
+    .prepare("SELECT content_json, version FROM verses WHERE book = ? AND chapter = 13 AND verse = 1 AND bible_version = ?")
+    .all(BOOK, VERSION)[0];
+  eq(row.version, 4, "…and the version moves");
+  eq(row.content_json, fused, "…and master's bytes landed, not D1's");
+}
+
+console.log("\n[#609 F1: a whitespace-only separator node between two \\w still writes (fused word token)]");
+{
+  const { env, sqlite } = freshEnv();
+  const separated = JSON.stringify({
+    verseObjects: [
+      { tag: "w", type: "word", text: "the" },
+      { type: "text", text: " " },
+      { tag: "w", type: "word", text: "LORD" },
+    ],
+  });
+  const fused = JSON.stringify({
+    verseObjects: [
+      { tag: "w", type: "word", text: "the" },
+      { tag: "w", type: "word", text: "LORD" },
+    ],
+  });
+  sqlite
+    .prepare(
+      `INSERT INTO verses (book, chapter, verse, verse_end, bible_version, content_json, plain_text, version, updated_by)
+       VALUES (?, 13, 2, NULL, ?, ?, 'the LORD', 3, NULL)`,
+    )
+    .run(BOOK, VERSION, separated);
+
+  const counts = await applyVerseRowsForTest(
+    env,
+    BOOK,
+    VERSION,
+    [{ chapter: 13, verse: 2, verseEnd: null, contentJson: fused, plainText: "the LORD" }],
+    null,
+    null,
+    false,
+  );
+
+  eq(counts.skipped_normalized, 0, "dropping the separator is not cosmetic — it fuses \\w* onto \\w");
+  eq(counts.updated, 1, "…so the write lands");
+  eq(
+    sqlite
+      .prepare("SELECT version FROM verses WHERE book = ? AND chapter = 13 AND verse = 2 AND bible_version = ?")
+      .all(BOOK, VERSION)[0].version,
+    4,
+    "…and the version moves",
+  );
+}
+
+// Review F2: the plain_text leg of the guard, which nothing else exercises. The
+// trees are lens-equal AND render-equal; only the stored plain_text disagrees, on
+// a real word. That must still write — plain_text is what search and the
+// translator's own reading view show.
+console.log("\n[#609 F2: lens-equal trees whose plain_text differs by a real word still write]");
+{
+  const { env, sqlite } = freshEnv();
+  const tree = JSON.stringify({ verseObjects: [{ type: "text", text: "In the beginning" }] });
+  sqlite
+    .prepare(
+      `INSERT INTO verses (book, chapter, verse, verse_end, bible_version, content_json, plain_text, version, updated_by)
+       VALUES (?, 13, 3, NULL, ?, ?, 'In the beginning', 3, NULL)`,
+    )
+    .run(BOOK, VERSION, tree);
+
+  const counts = await applyVerseRowsForTest(
+    env,
+    BOOK,
+    VERSION,
+    // Same tree bytes are impossible here (the raw fast path would catch them), so
+    // carry the documented nextChar artifact in the tree while plain_text moves.
+    [
+      {
+        chapter: 13,
+        verse: 3,
+        verseEnd: null,
+        contentJson: JSON.stringify({ verseObjects: [{ type: "text", text: "In the beginning\n" }] }),
+        plainText: "In the very beginning",
+      },
+    ],
+    null,
+    null,
+    false,
+  );
+
+  eq(counts.skipped_normalized, 0, "a real plain_text difference is never a normalized no-op");
+  eq(counts.updated, 1, "…the write lands");
+  eq(
+    sqlite
+      .prepare("SELECT plain_text FROM verses WHERE book = ? AND chapter = 13 AND verse = 3 AND bible_version = ?")
+      .all(BOOK, VERSION)[0].plain_text,
+    "In the very beginning",
+    "…and master's plain text landed",
+  );
+}
+
 // The AI-only branch carried the identical raw comparison a few lines above the
 // pristine one, so it churned the same way — on verses the AI pipeline wrote and
 // no human has ever touched.

@@ -217,16 +217,16 @@ console.log("\n-- lens-suppressed verses (issue #609) --");
 // difference the sync declined to adopt.
 const suppressed = summarizeReimport(res({ skipped_normalized: 12 }));
 lacks(suppressed, "no changes", "a run that only suppressed writes never reports 'no changes'");
-has(suppressed, "12 unchanged apart from formatting", "…it says how many, and why they were left alone");
+has(suppressed, "12 identical once exported", "…it says how many, and why they were left alone");
 
 // …and it must stay distinguishable from the byte-equal no-op count, which is a
 // different fact: those verses really were identical to Door43's.
 const bothNoops = summarizeReimport(res({ skipped_noop: 4, skipped_normalized: 2 }));
 has(bothNoops, "4 unchanged,", "byte-equal verses keep their own plain 'unchanged' count");
-has(bothNoops, "2 unchanged apart from formatting", "…and the lens-suppressed ones are reported separately");
+has(bothNoops, "2 identical once exported", "…and the lens-suppressed ones are reported separately");
 
 // Absent (a Worker response predating the counter) must behave like 0.
-lacks(summarizeReimport(res({})), "apart from formatting", "field absent -> no line");
+lacks(summarizeReimport(res({})), "identical once exported", "field absent -> no line");
 
 if (failed > 0) {
   console.error(`\n${failed} failure(s)`);

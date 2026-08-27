@@ -8,7 +8,7 @@
 //
 // Not a test framework; failures are counted and reported, non-zero exit.
 
-import { computeVerseMerge, collapseWhitespaceForCompare } from "./verseMerge.ts";
+import { computeVerseMerge, collapseWhitespaceForCompare, verseContentConverged } from "./verseMerge.ts";
 import {
   classifyMasterCommit,
   compactLineage,
@@ -545,6 +545,40 @@ console.log("\n[#557: a per-verse map we could not build must not un-protect the
     merge(compactLineage(summarizeLineage(human, { humanRefs: { complete: true, refs: ["23:5", "31:19"], reason: "" } }))),
     "keep_ai_master",
     "complete evidence placing every human hunk elsewhere → keep_ai_master",
+  );
+}
+
+// ── verseContentConverged: the exported lens (issue #609) ───────────────────
+//
+// Review finding F3. The pristine/AI-only write guard calls this on the nightly
+// hot path with content straight out of D1 and straight off Door43, so its
+// unparseable-input contract is a safety property, not an edge case: "cannot
+// compare" must read as "not converged", which makes the caller WRITE. If this
+// ever returned true for input it could not parse, the sync would silently decline
+// to adopt master on exactly the verses whose stored JSON is already broken.
+console.log("\n[verseContentConverged: unparseable input is never converged]");
+{
+  const good = JSON.stringify({ verseObjects: [{ type: "text", text: "hi" }] });
+
+  eq(verseContentConverged("{not json", good), false, "unparseable OURS is never converged (caller writes)");
+  eq(verseContentConverged(good, "{not json"), false, "unparseable THEIRS is never converged (caller writes)");
+  eq(
+    verseContentConverged("{not json", "{not json"),
+    false,
+    "two IDENTICALLY unparseable strings are still not converged — equal garbage is not proof of equal content",
+  );
+
+  // The positive control, so the three assertions above cannot pass merely because
+  // the function always returns false.
+  eq(
+    verseContentConverged(good, JSON.stringify({ verseObjects: [{ type: "text", text: " hi " }] })),
+    true,
+    "…while a genuine whitespace-only difference IS converged under the lens",
+  );
+  eq(
+    verseContentConverged(good, JSON.stringify({ verseObjects: [{ type: "text", text: "bye" }] })),
+    false,
+    "…and a real word change is not",
   );
 }
 

@@ -294,6 +294,15 @@ function isEmptyTextNode(value: unknown): boolean {
   if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
   const obj = value as Record<string, unknown>;
   if (obj["type"] !== "text") return false;
+  // #609 review F7: dropping the node drops EVERYTHING on it, so it may only be
+  // dropped when `type` and `text` are all it carries. A `type: "text"` node that
+  // also has `children` (or any other key) is not "an empty text node" — treating
+  // it as one would silently delete whatever those keys hold from the compared
+  // form, which is a hole the safety argument above does not cover. Cheap, and it
+  // keeps the rule exactly as narrow as its justification.
+  for (const key of Object.keys(obj)) {
+    if (key !== "type" && key !== "text") return false;
+  }
   const text = obj["text"];
   if (typeof text !== "string") return text == null;
   return (normalizeForCompare(text) as string) === "";
@@ -319,14 +328,18 @@ function sortKeysDeep(value: unknown): unknown {
   return value;
 }
 
+// #609 review F8: the try covers sortKeysDeep and the re-stringify too, not just
+// the parse. Either can throw on real input — a cyclic structure, or a tree deep
+// enough to blow the stack — and an uncaught throw here escapes into the nightly
+// sync's verse loop. Returning null instead means "cannot compare", which every
+// caller reads as "not converged" and therefore WRITES: the safety direction is
+// total, with no shape of input that can turn a failure into a suppression.
 function stableKey(json: string): string | null {
-  let parsed: unknown;
   try {
-    parsed = JSON.parse(json);
+    return JSON.stringify(sortKeysDeep(JSON.parse(json)));
   } catch {
     return null;
   }
-  return JSON.stringify(sortKeysDeep(parsed));
 }
 
 // Two stableKey results are "equal" only when both are non-null and match.
@@ -368,14 +381,22 @@ function keysEqual(a: string | null, b: string | null): boolean {
 // (recomputeTargetOccurrences, normalizeUsfmFormatting), so neither survives as a
 // stored difference — but neither is "renumbering" or "blank-line reflow" either.
 //
-// COST, and its standing decision. A Door43 maintainer genuinely adding a missing
-// space after a comma stops being adopted and is reverted by the next export. This
-// module already accepts that for EDITED verses (see the FIX 5 correction above).
-// Extending it to the pristine majority of the corpus is a WIDER blast radius, and
-// issue #609 asks for the owner's explicit ruling on it rather than an inherited
-// one — do not read this comment as that ruling having been given. Callers must
-// count what they suppress (see bookReimport.ts's `skipped_normalized`) so the
-// class is never invisible.
+// NOT SUFFICIENT ON ITS OWN for a write decision, and the pristine caller does not
+// treat it as such. Review finding F1 measured two whitespace shapes this lens
+// normalizes away that CHANGE the rendered USFM — a text node `"and"` vs `"and "`
+// before a `\w`, and a whitespace-only separator between two `\w` nodes, both of
+// which render as a fused word token (the PR #417 class). So
+// bookReimport.ts's isNormalizedNoopVerseWrite ANDs this with a second condition:
+// the export's own renderer must emit identical bytes for both trees. See that
+// function for why both are needed and why neither is a superset of the other.
+//
+// That AND is also what settles the cost this lens would otherwise carry. On the
+// EDITED path (computeVerseMerge, no render check) the FIX 5 correction above still
+// stands: a Door43 maintainer's genuinely whitespace-only edit is classified
+// converged and silently reverted. On the pristine path it is not, because a
+// whitespace edit that survives our render makes the render check fail and the
+// verse WRITES. Callers must still count what they suppress (see bookReimport.ts's
+// `skipped_normalized`) so the class is never invisible.
 export function verseContentConverged(ours: string, theirs: string): boolean {
   return keysEqual(stableKey(ours), stableKey(theirs));
 }
