@@ -1073,6 +1073,31 @@ console.log("\n[#607: every uncertainty resolves to the file-level answer, TSV s
     "hunk_past_end_of_file",
     "a hunk past the end of the file is incomplete, never mapped to what is there",
   );
+  {
+    // A comma-separated verse list: measured real (en_tn/tn_PSA.tsv, "5:1,3,8,12"),
+    // and DIFFERENT from a bridge — discrete verses, not a range.
+    const commaFile = ["Reference\tID", "5:1,3,8,12\tabcd"].join("\n") + "\n";
+    const ev = refsTouchedInTsv(commaFile, [{ newStart: 2, newCount: 1 }]);
+    eq(ev.complete, true, "a comma-separated verse list maps");
+    eq(JSON.stringify([...ev.refs].sort()), JSON.stringify(["5:1", "5:12", "5:3", "5:8"]), "...to exactly those verses");
+    eq(ev.refs.includes("5:2"), false, "...and NOT the verses in between (this is a list, not a bridge)");
+    // A comma segment can itself be a bridge.
+    const mixedFile = ["Reference\tID", "5:1,3-4,8\tabcd"].join("\n") + "\n";
+    const mixedEv = refsTouchedInTsv(mixedFile, [{ newStart: 2, newCount: 1 }]);
+    eq(mixedEv.complete, true, "a comma list with a bridged segment maps");
+    eq(
+      JSON.stringify([...mixedEv.refs].sort()),
+      JSON.stringify(["5:1", "5:3", "5:4", "5:8"]),
+      "...expanding only the bridged segment",
+    );
+    // One bad segment discards the WHOLE ref (fails closed, unlike the display
+    // helper importParsers.ts's coveredVersesFromRef, which would skip it).
+    eq(
+      refsTouchedInTsv(["Reference\tID", "5:1,intro,8\tabcd"].join("\n") + "\n", [{ newStart: 2, newCount: 1 }]).reason,
+      "unparseable_ref_column",
+      "'intro' mixed into a comma list is not a real shape — the whole ref is discarded, not skipped",
+    );
+  }
 
   eq(
     refsTouchedInTsv(["Reference\tID", "not-a-ref\tabcd"].join("\n") + "\n", [{ newStart: 2, newCount: 1 }]).reason,

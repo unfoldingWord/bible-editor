@@ -723,35 +723,49 @@ export function refsTouchedInUsfm(fileText: string, hunks: HunkRange[]): HumanRe
 // that will not parse, a hunk past the end of the file, or a ref set past
 // LINEAGE_REF_CAP all return incomplete rather than guess.
 
-// "front" or a chapter number, then "intro" or a verse number, optionally
-// bridged ("5-6"). Anything else — a malformed ref, a header row's literal
-// "Reference" text — fails to parse, which is incomplete, which is
-// master-wins.
-const TSV_REF_RE = /^(front|\d+):(intro|\d+)(?:-(\d+))?$/;
+// One verse segment: a bare verse ("5") or a bridge ("5-6"). This is the unit
+// a comma-separated ref column's verse part splits into — see
+// parseTsvRefColumn below.
+const TSV_VERSE_SEGMENT_RE = /^(\d+)(?:-(\d+))?$/;
 
-// One ref column -> the "c:v" keys it claims. A bridge ("5-6") expands to
-// every verse it covers rather than claiming the whole chapter — narrower,
-// and correct, because the ref ITSELF states the range; there is no hunk
-// boundary to reason about the way refsTouchedInUsfm's chapter-front case
-// has to. `front:intro` and `N:intro` both collapse to verse 0, matching
-// parseTsvRow's own convention in bookReimport.ts (via importParsers.ts's
-// refParts): the evidence computed here and the (chapter, verse) the merge
-// call site looks it up by must agree on what "this row's verse" means, or a
-// touched intro row would never be found.
+// One ref column -> the "c:v" keys it claims. Measured against real corpus
+// data (2026-08-27, en_tn/tn_PSA.tsv, 8,213 rows): 20 are a single bridge
+// ("5:2-3") and 1 is a comma-separated verse list ("5:1,3,8,12") — both real
+// shapes, not hypothetical, so both are parsed rather than left to fall back.
+// A bridge expands to every verse it covers rather than claiming the whole
+// chapter — narrower, and correct, because the ref ITSELF states the range;
+// there is no hunk boundary to reason about the way refsTouchedInUsfm's
+// chapter-front case has to. `front:intro` and `N:intro` both collapse to
+// verse 0, matching parseTsvRow's own convention in bookReimport.ts (via
+// importParsers.ts's refParts): the evidence computed here and the (chapter,
+// verse) the merge call site looks it up by must agree on what "this row's
+// verse" means, or a touched intro row would never be found.
+//
+// Fails CLOSED on any one bad segment — unlike importParsers.ts's
+// coveredVersesFromRef (a display helper, which skips a malformed comma
+// segment and keeps the rest), this module cannot afford to under-claim: one
+// unparseable segment discards the WHOLE ref, which is incomplete, which is
+// master-wins for the row it belongs to.
 function parseTsvRefColumn(ref: string): string[] | null {
-  const m = TSV_REF_RE.exec(ref.trim());
-  if (!m) return null;
-  const chapter = m[1] === "front" ? 0 : Number(m[1]);
-  if (m[2] === "intro") {
-    if (m[3] !== undefined) return null; // "front:intro-6" is not a real shape
-    return [`${chapter}:0`];
-  }
-  const lo = Number(m[2]);
-  const hi = m[3] === undefined ? lo : Number(m[3]);
-  if (!Number.isFinite(lo) || !Number.isFinite(hi) || hi < lo || hi - lo > MAX_BRIDGE_WIDTH) return null;
+  const trimmed = ref.trim();
+  const colon = trimmed.indexOf(":");
+  if (colon < 0) return null;
+  const chapterPart = trimmed.slice(0, colon);
+  const versePart = trimmed.slice(colon + 1);
+  if (chapterPart !== "front" && !/^\d+$/.test(chapterPart)) return null;
+  const chapter = chapterPart === "front" ? 0 : Number(chapterPart);
+  if (versePart === "intro") return [`${chapter}:0`];
+
   const refs: string[] = [];
-  for (let v = lo; v <= hi; v++) refs.push(`${chapter}:${v}`);
-  return refs;
+  for (const rawSeg of versePart.split(",")) {
+    const m = TSV_VERSE_SEGMENT_RE.exec(rawSeg.trim());
+    if (!m) return null; // "intro" mixed with other segments, or plain garbage
+    const lo = Number(m[1]);
+    const hi = m[2] === undefined ? lo : Number(m[2]);
+    if (!Number.isFinite(lo) || !Number.isFinite(hi) || hi < lo || hi - lo > MAX_BRIDGE_WIDTH) return null;
+    for (let v = lo; v <= hi; v++) refs.push(`${chapter}:${v}`);
+  }
+  return refs.length > 0 ? refs : null;
 }
 
 // Map new-side hunk ranges onto the TSV rows they touched. `fileText` must be
