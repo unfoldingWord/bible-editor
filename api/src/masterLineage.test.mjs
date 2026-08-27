@@ -46,26 +46,35 @@
 //       (spans newlines)                        whose value sits on the next
 //                                               line is NOT the measured one"
 //
-// Re-run 2026-08-26 for #634 (masterLineage.ts's own header note 4 and the
-// AI_PIPELINE_TRAILER / AI_PIPELINE_SUBJECT_PREFIX comments carry the same
-// figures):
+// Re-run 2026-08-27 for #634 and #638 (masterLineage.ts's own header note 4
+// and the AI_PIPELINE_TRAILER / AI_PIPELINE_SUBJECT_LOOSE comments carry the
+// same figures). R12/R13 are #634's rows, re-measured against the #638
+// assertion set; R14 is #638's own:
 //
-//   R12 AI_PIPELINE_SUBJECT_PREFIX gate           exit 1, 4 FAIL — both #622
-//       removed from the trailer route            trailer-route assertions
-//       (the trailer route's ONLY subject          plus both new #634 ones:
-//       gate before #634; #629's REVERT_PREFIX     a bot-authored revert and
-//       gate on that route turned out to be        a bot-authored hand
-//       provably subsumed by this one — see        REPAIR, each quoting a
-//       AI_PIPELINE_TRAILER's own comment — so      trailer in its body,
-//       there is no longer a narrower ablation      both wrongly become `ai`
-//       to run for #629 alone)                      with no subject gate at all
-//   R13 REVERT_PREFIX narrowed back to             exit 1, 2 FAIL — the two
-//       `/^revert\s/i` (the pre-#634 pattern)       widened-prefix cases:
-//                                                   `Reverts "…"` (no space)
-//                                                   and `Revert:"…"` (colon)
-//                                                   both fall through to
-//                                                   AI_MARKER and wrongly
-//                                                   become `ai`
+//   R12 AI_PIPELINE_SUBJECT_LOOSE gate            exit 1, 7 FAIL — both #622
+//       removed from the trailer route            trailer-route assertions,
+//       (the route had NO subject gate at         both #634 ones, and three
+//       all before #634; #629's REVERT_PREFIX     of the #638 ones: a
+//       gate on that route turned out to be       bot-authored revert, a
+//       provably subsumed by this one — see       bot-authored hand REPAIR,
+//       AI_PIPELINE_TRAILER's own comment — so    and 3a2432b15b's book-wide
+//       there is no longer a narrower ablation    intro pass, each quoting a
+//       to run for #629 alone)                    trailer, all wrongly `ai`
+//   R13 REVERT_PREFIX narrowed back to            exit 1, 2 FAIL — the two
+//       `/^revert\s/i` (the pre-#634 pattern)      widened-prefix cases:
+//                                                  `Reverts "…"` (no space)
+//                                                  and `Revert:"…"` (colon)
+//                                                  both fall through to
+//                                                  AI_MARKER and wrongly
+//                                                  become `ai`
+//   R14 AI_PIPELINE_SUBJECT_LOOSE weakened        exit 1, 2 FAIL — both
+//       back to the prefix-only                    3a2432b15b assertions.
+//       `/^(ULT|UST|TN|TQ):\s/` that #634          `TN: LAM chapter and book
+//       shipped (this is R1's regex, on the        introductions` passes a
+//       trailer route instead of the subject       prefix-only gate and its
+//       route)                                     quoted trailer then makes
+//                                                  a real hand-directed bot
+//                                                  commit `ai` again
 //
 // Read that honestly: on MEASURED data the LAM-intro exclusion needs only ONE
 // of {chapter digits, bracket} to survive, which is why R2 and R3 alone break
@@ -75,6 +84,17 @@
 // carry the change — removing EITHER half of the two-signal rule fails the
 // assertions that justify it — and R8–R11 are what keep the pattern from
 // drifting back to accepting shapes nobody has ever observed.
+//
+// R14 is R1's finding applied to the OTHER route, and it is why #638 exists:
+// the prefix-only test R1 measured as re-admitting 3a2432b15b is exactly what
+// #634 installed as the trailer route's gate. R2/R3 say either of {digits,
+// bracket} alone excludes that commit, so the gate now asks for the weaker
+// `digits OR bracket` — enough to shut the door, still loose enough to be
+// insurance against a subject-format migration rather than a copy of the full
+// rule. What R14 does NOT prove: that the gate catches a hand repair whose
+// subject fully matches the pipeline grammar. It does not, by construction —
+// the FLOOR assertion at the end of the #638 section pins that residual `ai`
+// so it stays visible.
 //
 // Run from api/:
 //   node --experimental-strip-types --no-warnings src/masterLineage.test.mjs
@@ -234,8 +254,14 @@ eq(classifyMasterCommit({ sha: "x", message: "ULT: EZK 38 [pjoakes]", authorEmai
 // trailer classifies zero commits on its own — it is insurance against the next
 // format migration, not coverage. The cases below are therefore forward-looking
 // by construction.
+// (Subject carries a chapter number but NOT the full `RES: BOOK CH [req]`
+// grammar, so it misses AI_PIPELINE_SUBJECT and reaches the trailer route.
+// #638 strengthened that route's gate to prefix + {digits or bracket}: this
+// fixture gained the `31` so it still probes the TRAILER rather than dying at
+// the subject gate. The digit-less and bracket-less original now classifies
+// `human` — pinned in the #638 section below.)
 eq(
-  kind("TN: regenerate JER notes after prompt change\n\nX-AI-Pipeline: bp-assistant/notes\n", BOT),
+  kind("TN: regenerate JER 31 notes after prompt change\n\nX-AI-Pipeline: bp-assistant/notes\n", BOT),
   "ai",
   "a bot commit with a non-pipeline subject but a valid trailer is ai",
 );
@@ -243,7 +269,7 @@ eq(
 // accept a WRAPPED trailer, i.e. a body that never actually wrote the header
 // bp-assistant writes. Narrower is the protective direction here.
 eq(
-  kind("TN: regenerate JER notes after prompt change\n\nX-AI-Pipeline:\nbp-assistant/notes\n", BOT),
+  kind("TN: regenerate JER 31 notes after prompt change\n\nX-AI-Pipeline:\nbp-assistant/notes\n", BOT),
   "human",
   "a trailer whose value sits on the next line is NOT the measured trailer",
 );
@@ -333,12 +359,12 @@ eq(
 );
 // The gate must not swallow a REAL trailer commit: subjects with a genuine
 // pipeline shape still pass it (already covered above, e.g. the "TN:
-// regenerate JER notes…" case) — this just pins that AI_PIPELINE_SUBJECT_PREFIX
-// alone, without a resource prefix, is what the fail-closed gate rejects.
+// regenerate JER 31 notes…" case) — this just pins that a subject with NO
+// resource prefix at all is what the fail-closed gate rejects.
 eq(
   classifyMasterCommit({
     sha: "x",
-    message: "TN: regenerate JER notes after prompt change\n\nX-AI-Pipeline: bp-assistant/notes\n",
+    message: "TN: regenerate JER 31 notes after prompt change\n\nX-AI-Pipeline: bp-assistant/notes\n",
     authorEmail: BOT,
   }).kind,
   "ai",
@@ -365,10 +391,104 @@ eq(
 );
 // And the widened prefix must not start matching an unrelated word that
 // merely begins with the same letters.
+//
+// READ THE EXPECTATION HONESTLY: `ai` here is what the CODE does, not what is
+// desirable. RICH is a human, and the subject is a human sentence that merely
+// QUOTES a pipeline marker — but AI_MARKER matches the subject with no author
+// check at all (masterLineage.ts note 4), so anything quoting
+// `@api.bp-assistant` outside a revert lands on `ai`. This assertion pins that
+// wrong-direction outcome deliberately, because what it is really testing is
+// that `\b` does not fire mid-word; the fallout is AI_MARKER's own design gap.
+// That gap fires ZERO times in the path-scoped history this module actually
+// sees, so it is filed rather than fixed here — issue #647 asks for a MEASURED
+// decision on whether AI_MARKER should learn an author check.
 eq(
   kind('Revertsomething "TQ: AMO 5 [be..s@api.bp-assistant]"', RICH),
   "ai",
   "'Revertsomething' is NOT a revert — \\b must not fire mid-word (#634)",
+);
+
+// ── #638: the trailer-route gate is prefix + {chapter digits or bracket} ────
+// #634 gated the trailer route on the resource prefix ALONE,
+// `/^(ULT|UST|TN|TQ):\s/`. That is the exact regex ablation row R1 above
+// records as re-admitting 3a2432b15b, `TN: LAM chapter and book
+// introductions` — a REAL hand-directed bot commit (THE MEASURED BASIS in
+// masterLineage.ts), one of the six the two-signal rule exists to keep
+// `human`. The FULL subject rule excludes it on the required chapter digits
+// and the required bracket; the prefix-only gate handed it a second door,
+// which opens the moment such a commit's body quotes a trailer. R2/R3
+// measured that EITHER of {digits, bracket} alone excludes it, so the gate now
+// requires the weaker `digits OR bracket` — enough to shut the door, still
+// looser than the full pattern. R14 ablates it.
+//
+// RECONSTRUCTED BODY: 3a2432b15b's own body was not refetched, and on the
+// measured corpus it carries no trailer at all (all 519 trailer commits match
+// the full subject rule). The body below is the worst case the gate has to
+// survive — a hand pass citing the run it followed — not that commit's
+// literal text. The SUBJECT is quoted verbatim from the corpus.
+eq(
+  kind(
+    "TN: LAM chapter and book introductions\n\nFollows on from:\n\nTN: LAM 3 [be..s@api.bp-assistant]\n\nX-AI-Pipeline: bp-assistant/notes\n",
+    BOT,
+  ),
+  "human",
+  "3a2432b15b's subject does NOT pass the trailer-route gate — no chapter digits, no bracket (#638)",
+);
+eq(
+  classifyMasterCommit({
+    sha: "3a2432b15b",
+    message: "TN: LAM chapter and book introductions\n\nX-AI-Pipeline: bp-assistant/notes\n",
+    authorEmail: BOT,
+  }).reason,
+  "bot_author_no_pipeline_shape",
+  "…and the reason says WHY, same as any other hand-directed bot push (#638)",
+);
+// EITHER signal alone re-opens the route, which is what makes the gate an OR
+// rather than an AND: these two pin the two halves independently, so a future
+// edit that drops one of them fails here rather than silently narrowing.
+eq(
+  kind("TN: LAM 3 introductions reworked\n\nX-AI-Pipeline: bp-assistant/notes\n", BOT),
+  "ai",
+  "a chapter digit alone satisfies the strengthened gate (#638)",
+);
+eq(
+  kind("TN: LAM introductions [be..s@api.bp-assistant]\n\nX-AI-Pipeline: bp-assistant/notes\n", BOT),
+  "ai",
+  "a bracket alone satisfies the strengthened gate (#638)",
+);
+// The strengthening must not cost a REAL pipeline push. All 518 measured
+// bot-authored trailer commits carry BOTH a chapter number and a bracket, so
+// the gate rejects zero of them; this pins the shape.
+eq(
+  kind("TQ: AMO 5 [be..s@api.bp-assistant] (reformatted)\n\nX-AI-Pipeline: bp-assistant/tqs\n", BOT),
+  "ai",
+  "a real pipeline subject that misses only the END ANCHOR still passes the trailer route (#638)",
+);
+// …and the hand repair #634 was built for is still excluded, by the prefix
+// half, exactly as before the strengthening.
+eq(
+  kind(
+    "fix: restore HAB 2:1-10 TN rows lost in AI insert\n\nTN: HAB 2 [be..s@api.bp-assistant]\n\nX-AI-Pipeline: bp-assistant/notes\n",
+    BOT,
+  ),
+  "human",
+  "`fix: restore HAB 2:1-10 …` still has no resource prefix, so the gate still excludes it (#638)",
+);
+//
+// THE FLOOR, pinned rather than assumed. A hand repair whose subject FULLY
+// matches the pipeline grammar — resource prefix, chapter digits AND bracket —
+// and whose body quotes a trailer is indistinguishable from a real push by any
+// subject-shape test, and classifies `ai`. `ai` is the overwritable direction,
+// so this is a real residual risk, not a cosmetic one. Closing it needs an
+// author-level or content-level signal the trailer route does not have. The
+// expectation below is what the code DOES, not what is desirable.
+eq(
+  kind(
+    "TN: HAB 2 [benjamin] restore rows lost in AI insert\n\nX-AI-Pipeline: bp-assistant/notes\n",
+    BOT,
+  ),
+  "ai",
+  "FLOOR: a hand repair whose subject matches the pipeline grammar is still ai — the route's design limit (#638)",
 );
 
 // The dead `AI …for BOOK CH` vocabulary is deliberately NOT accepted: nothing

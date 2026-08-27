@@ -111,10 +111,16 @@
 //    bot-pushed hand-directed revert or repair can quote another commit's
 //    trailer verbatim. #629 first fixed the revert shape with a REVERT_PREFIX
 //    gate on that route; #634 replaced it with the broader
-//    AI_PIPELINE_SUBJECT_PREFIX gate (the subject must show SOME pipeline
+//    AI_PIPELINE_SUBJECT_LOOSE gate (the subject must show SOME pipeline
 //    shape, not just an absence of "revert"), which subsumes #629's case and
 //    additionally closes the sibling one: a hand REPAIR whose subject cites
-//    no pipeline shape at all — e417839d09 itself.
+//    no pipeline shape at all — e417839d09 itself. #638 then strengthened
+//    that gate from the prefix alone to prefix + {chapter digits or bracket},
+//    because the prefix alone is the same regex ablation row R1 records as
+//    re-admitting 3a2432b15b (`TN: LAM chapter and book introductions`), one
+//    of the six hand-directed bot commits above. A subject that fully matches
+//    the pipeline grammar and still quotes a trailer remains `ai` — that is
+//    the route's floor, and the test suite pins it rather than hiding it.
 //
 // FAIL-SAFE DIRECTION, and it is the whole safety argument for this module.
 // Downstream, `ai` and `ours` are what let a conflict resolve D1-wins; `human`
@@ -186,6 +192,18 @@ const AI_MARKER = /@api\.bp-assistant\b/;
 // — issue #634 flags them as worth considering but explicitly declines to add
 // them without measuring the real corpus first, and this module does not
 // guess.
+//
+// The same decline covers the TENSE FORMS. `Reverted …` and `Reverting …` do
+// NOT match `/^reverts?\b/i` — `\b` fires after `revert`, but the pattern then
+// has to end, and `ed`/`ing` are word characters, so the match fails. That is
+// deliberate, not an oversight of the `s?`: `s` was added because the corpus
+// HOLDS three `Reverts BE changes` commits, and no `Reverted`/`Reverting`
+// subject has been measured in the 46,802 commits. Widening the alternation on
+// the strength of English grammar rather than a commit in hand is the exact
+// guess this module refuses elsewhere. Add either form the day one is
+// measured — the direction is protective (more subjects classify `human`), so
+// the cost of waiting is only that a hypothetical `Reverting "…@api.bp-
+// assistant…"` by a non-bot author would reach AI_MARKER and classify `ai`.
 const REVERT_PREFIX = /^reverts?\b/i;
 
 // The bot account that authors every bp-assistant push. Necessary for `ai`, and
@@ -253,10 +271,10 @@ const AI_PIPELINE_SUBJECT =
 // species of trap as `Revert "bible-editor: …"` in note 1.
 //
 // The trailer route also requires the SUBJECT to carry SOME pipeline shape
-// (AI_PIPELINE_SUBJECT_PREFIX, checked at the call site below). #629
+// (AI_PIPELINE_SUBJECT_LOOSE, checked at the call site below). #629
 // originally gated this route on the narrower REVERT_PREFIX — excluding just
 // the case where Gitea's revert button quotes a reverted pipeline commit's
-// trailer verbatim. #634 replaced it with AI_PIPELINE_SUBJECT_PREFIX, which
+// trailer verbatim. #634 replaced it with AI_PIPELINE_SUBJECT_LOOSE, which
 // subsumes that case and additionally closes the sibling one: a bot-pushed
 // HAND REPAIR whose subject is not a revert but whose body pastes the message
 // of the commit it repairs, trailer included. e417839d09 (`fix: restore HAB
@@ -265,29 +283,64 @@ const AI_PIPELINE_SUBJECT =
 // `ai` on the strength of that quote.
 // REVERT_PREFIX is not ALSO checked here: the two patterns are both anchored
 // at `^` and share no prefix (`revert` vs. `ULT|UST|TN|TQ`), so no subject can
-// ever match both — AI_PIPELINE_SUBJECT_PREFIX already excludes every revert
+// ever match both — AI_PIPELINE_SUBJECT_LOOSE already excludes every revert
 // subject on its own (measured by ablation, not just argued: removing
 // REVERT_PREFIX from the old combined condition left every assertion in
 // masterLineage.test.mjs passing). Keeping a provably-dead condition around
 // would be exactly the unmeasured guess this module's own discipline refuses
-// elsewhere. Re-add it only if AI_PIPELINE_SUBJECT_PREFIX's alternation ever
+// elsewhere. Re-add it only if AI_PIPELINE_SUBJECT_LOOSE's alternation ever
 // grows a resource code beginning with the letters `re` — none of
 // ULT/UST/TN/TQ do today.
 const AI_PIPELINE_TRAILER = /^X-AI-Pipeline:[ \t]*bp-assistant\//m;
 
-// The resource-prefix half of AI_PIPELINE_SUBJECT ONLY — no book code, no
-// chapter digits, no bracket, no end anchor. Used solely to gate the trailer
-// route (#634): every real trailer commit's subject already matches the FULL
-// AI_PIPELINE_SUBJECT (518/518, so this loose check costs nothing measured),
-// but a subject with no pipeline shape whatsoever — a hand-typed `fix: …`, a
-// book-wide intro pass, anything not even claiming to be a ULT/UST/TN/TQ
-// push — must not be waved through on a quoted trailer alone. Deliberately
-// looser than the full pattern (rather than requiring the whole thing, which
-// would make this route redundant with the subject rule above it) so the
-// trailer keeps doing its one stated job: surviving a future narrowing of the
-// book/chapter/bracket grammar that a real pipeline push's resource prefix
-// would still be expected to carry.
-const AI_PIPELINE_SUBJECT_PREFIX = /^(ULT|UST|TN|TQ):\s/;
+// The LOOSE shape test that gates the trailer route (#634, strengthened in
+// #638). Deliberately not the FULL AI_PIPELINE_SUBJECT — no book code, no
+// `RES: BOOK CH` ordering, no end anchor — because requiring the whole thing
+// would make this route redundant with the subject rule above it. What it DOES
+// require is the resource prefix AND at least one of {a digit, a `[`}
+// somewhere after it.
+//
+// WHY BOTH HALVES, and this is the part #634 got wrong. #634 shipped the
+// prefix alone, `/^(ULT|UST|TN|TQ):\s/`. That is the EXACT regex this module's
+// own ablation row R1 (masterLineage.test.mjs) records as re-admitting
+// 3a2432b15b — `TN: LAM chapter and book introductions`, a real hand-directed
+// bot commit and one of the six THE MEASURED BASIS above exists to keep
+// `human`. The FULL subject rule excludes it via the required chapter digits
+// and the required bracket; a prefix-only gate on the trailer route handed it
+// a second door, which opens the moment such a commit's body quotes a trailer.
+// R2/R3 measured that EITHER of {digits, bracket} alone excludes 3a2432b15b,
+// so requiring the weaker `digits OR bracket` still shuts that door while
+// staying looser than the full pattern. R14 ablates the strengthening itself.
+//
+// THE CLAIM THIS COMMENT USED TO MAKE, corrected. "Every real trailer commit's
+// subject already matches the FULL AI_PIPELINE_SUBJECT (518/518), so this
+// loose check costs nothing measured" is true only in the EXCLUSION direction:
+// it says the gate never REJECTS a real pipeline push. It said nothing about
+// what the gate ADMITS, which is exactly where 3a2432b15b came back in. The
+// 518/518 figure still holds and still means the STRENGTHENED gate rejects
+// zero measured pipeline output — every one of those 518 subjects carries both
+// a chapter number and a bracket, so both halves of the new gate pass.
+//
+// WHAT IT STILL CANNOT CATCH, stated because it is a design limit of this
+// route and not an oversight: a hand repair whose subject fully matches the
+// pipeline grammar (digits AND bracket) and whose body quotes a trailer STILL
+// classifies `ai`. No subject-shape test can separate that from a real push —
+// only an author-level or content-level signal could, and neither is available
+// here. masterLineage.test.mjs pins one such case deliberately, so the floor
+// is visible rather than assumed.
+//
+// AND WHAT THE GATE CONSCIOUSLY ACCEPTS LOSING, so the trailer keeps doing its
+// one stated job — surviving the next subject-format MIGRATION (the header's
+// own word; the bracket rendering has already migrated twice, see note 2) —
+// without becoming a blanket bypass. Each of these now classifies `human` on
+// this route, all in the protective direction:
+//   * `TWL:` subjects — zero in all 46,802 measured commits, and no TWL
+//     pipeline exists; the same narrowing the full pattern already makes.
+//   * lowercase prefixes (`tn: …`) — the alternation is case-sensitive.
+//   * colon-less forms (`TN HAB 2 [x]`) — the `:` is required.
+// If a future migration produces any of those, those commits classify `human`,
+// which only preserves master. RE-ADD ON MEASUREMENT, not on expectation.
+const AI_PIPELINE_SUBJECT_LOOSE = /^(ULT|UST|TN|TQ):\s(?=.*[\d[])/;
 
 function firstLine(message: string | null): string {
   if (!message) return "";
@@ -318,15 +371,18 @@ export function classifyMasterCommit(commit: MasterCommit): ClassifiedCommit {
     if (AI_PIPELINE_SUBJECT.test(subject)) {
       return { ...commit, kind: "ai", reason: "bot_author_pipeline_subject" };
     }
-    // Gated on AI_PIPELINE_SUBJECT_PREFIX (#634, subsuming #629's narrower
-    // REVERT_PREFIX gate — see that constant's own comment): a bot-authored
+    // Gated on AI_PIPELINE_SUBJECT_LOOSE (#634, subsuming #629's narrower
+    // REVERT_PREFIX gate; strengthened in #638 from prefix-only to prefix +
+    // {digits or bracket} — see that constant's own comment): a bot-authored
     // commit whose BODY quotes another commit's pipeline trailer must not
     // classify `ai` unless its own SUBJECT shows some pipeline shape too.
-    // That covers both a hand-directed revert (Gitea's button quotes the
-    // reverted commit's body verbatim, trailer included) and a hand repair
-    // that instead pastes the message of the commit it repairs — neither
-    // subject looks like a pipeline push.
-    if (AI_PIPELINE_SUBJECT_PREFIX.test(subject) && AI_PIPELINE_TRAILER.test(message)) {
+    // That covers a hand-directed revert (Gitea's button quotes the reverted
+    // commit's body verbatim, trailer included), a hand repair that instead
+    // pastes the message of the commit it repairs, and — only since the #638
+    // strengthening — a book-wide hand pass that happens to open with a
+    // resource prefix (3a2432b15b). None of those subjects looks like a
+    // pipeline push.
+    if (AI_PIPELINE_SUBJECT_LOOSE.test(subject) && AI_PIPELINE_TRAILER.test(message)) {
       return { ...commit, kind: "ai", reason: "bot_author_pipeline_trailer" };
     }
     // A bot commit that is neither is a HAND-DIRECTED bot push — the six
