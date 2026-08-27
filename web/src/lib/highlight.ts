@@ -1160,3 +1160,138 @@ export function highlightsFor(
   const sourceVo = (sourceContent as { verseObjects?: unknown[] } | null)?.verseObjects;
   return findTargetHighlights(verseObjects, quote, occ, Array.isArray(sourceVo) ? sourceVo : undefined);
 }
+
+// Splits an HTML string into a flat sequence of `<tag ...>` tokens and raw
+// text-run tokens, in document order. No nesting/tree is built — callers
+// that need to reason about text content across tag boundaries (like
+// overlayFindMarks below) walk this list directly. Never handles arbitrary
+// HTML (no comments, no `>` inside attribute values) — safe here because
+// every caller only ever feeds it output from this module's own renderers.
+function splitHtmlTokens(html: string): Array<{ tag: string } | { text: string }> {
+  const tokens: Array<{ tag: string } | { text: string }> = [];
+  let i = 0;
+  while (i < html.length) {
+    if (html[i] === "<") {
+      const end = html.indexOf(">", i);
+      if (end === -1) {
+        tokens.push({ tag: html.slice(i) });
+        break;
+      }
+      tokens.push({ tag: html.slice(i, end + 1) });
+      i = end + 1;
+    } else {
+      const next = html.indexOf("<", i);
+      const raw = next === -1 ? html.slice(i) : html.slice(i, next);
+      tokens.push({ text: raw });
+      i = next === -1 ? html.length : next;
+    }
+  }
+  return tokens;
+}
+
+// Decodes the small, fixed set of entities this module's own renderers ever
+// emit (escapeHtml's &<>"', plus the literal &nbsp; / &#8203; segmentsToHtml
+// uses for spacing) back to their real characters — i.e. the same string a
+// browser's `textContent` would read for this run. Not a general HTML
+// entity decoder; every caller only ever feeds it this module's own output.
+function decodeKnownEntities(raw: string): string {
+  return raw.replace(/&amp;|&lt;|&gt;|&quot;|&#39;|&nbsp;|&#(\d+);/g, (m, num) => {
+    switch (m) {
+      case "&amp;":
+        return "&";
+      case "&lt;":
+        return "<";
+      case "&gt;":
+        return ">";
+      case "&quot;":
+        return '"';
+      case "&#39;":
+        return "'";
+      case "&nbsp;":
+        return " ";
+      default:
+        return num ? String.fromCodePoint(parseInt(num, 10)) : m;
+    }
+  });
+}
+
+// Paint Find-overlay match marks onto an already-rendered chip HTML string
+// (renderEditableHTML / renderHighlightedHTML output) instead of replacing
+// it with plain, marker-free text. See #642: the editable cell stays
+// contentEditable while Find is open, and whatever HTML is painted here is
+// exactly what a keystroke's `textContent` capture reads back — substituting
+// marker-free plain text there silently drops every `\q`/`\p` chip from the
+// save. Operating on the chip HTML's own text runs (not its markup) means
+// this never has to understand chip structure: whatever text is already
+// there — chip labels, escaped verse text — is exactly what the DOM's
+// `textContent` will present, tag tokens pass through byte-for-byte.
+//
+// A match that would span more than one text run (crossing a chip's tag
+// boundary) is silently skipped rather than force-split across it — this is
+// decoration only, and a botched split risks corrupting the very markup the
+// capture reads.
+//
+// `activeRange` is a [start,end) pair from the Find overlay's match index,
+// which is built against marker-free plain_text — one coordinate system
+// short of this chip HTML's own text (marker tokens like "\q1" shift every
+// offset after them). So in a verse with leading/interleaved markers, the
+// "which match is the active one" comparison can miss; every match still
+// gets a `be-find` mark, just possibly not `-active` on the right one. A
+// verse with no markers (the common case) has identical coordinates in
+// both and highlights correctly either way.
+export function overlayFindMarks(
+  html: string,
+  re: RegExp,
+  activeRange?: { start: number; end: number } | null,
+): string {
+  if (!html) return html;
+  const tokens = splitHtmlTokens(html);
+  const decoded = tokens.map((tok) => ("text" in tok ? decodeKnownEntities(tok.text) : null));
+  const starts: number[] = [];
+  let full = "";
+  for (const text of decoded) {
+    starts.push(text === null ? -1 : full.length);
+    if (text !== null) full += text;
+  }
+  const local = new RegExp(re.source, re.flags.includes("g") ? re.flags : `${re.flags}g`);
+  const hits: Array<{ start: number; end: number; isActive: boolean }> = [];
+  let m: RegExpExecArray | null;
+  local.lastIndex = 0;
+  while ((m = local.exec(full)) !== null) {
+    const isActive =
+      !!activeRange && m.index === activeRange.start && m.index + m[0].length === activeRange.end;
+    hits.push({ start: m.index, end: m.index + m[0].length, isActive });
+    if (m[0].length === 0) local.lastIndex++;
+  }
+  if (hits.length === 0) return html;
+  let hitIdx = 0;
+  const out: string[] = [];
+  for (let i = 0; i < tokens.length; i++) {
+    const text = decoded[i];
+    if (text === null) {
+      out.push((tokens[i] as { tag: string }).tag);
+      continue;
+    }
+    const nodeStart = starts[i];
+    const nodeEnd = nodeStart + text.length;
+    let cursor = 0;
+    // Every hit's start falls in exactly one run (runs partition `full`
+    // contiguously). One that also ends within this run is fully contained
+    // and gets decorated; one that starts here but ends past `nodeEnd`
+    // crosses into the next tag/run — skip decorating it (its tail bytes
+    // just render as plain text in whichever run they land in) but still
+    // consume it so a later run doesn't try to re-match its start.
+    while (hitIdx < hits.length && hits[hitIdx].start >= nodeStart && hits[hitIdx].start < nodeEnd) {
+      const h = hits[hitIdx];
+      hitIdx++;
+      if (h.end > nodeEnd) continue;
+      const ls = h.start - nodeStart;
+      const le = h.end - nodeStart;
+      out.push(escapeHtml(text.slice(cursor, ls)));
+      out.push(`<mark class="${h.isActive ? "be-find be-find-active" : "be-find"}">${escapeHtml(text.slice(ls, le))}</mark>`);
+      cursor = le;
+    }
+    out.push(escapeHtml(text.slice(cursor)));
+  }
+  return out.join("");
+}

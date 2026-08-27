@@ -17,7 +17,7 @@ import type { FindMatch } from "./FindReplaceOverlay";
 import { HebrewLine } from "./HebrewLine";
 import type { LexiconEntry } from "../hooks/useLexicon";
 import type { ChapterState } from "../hooks/useBook";
-import { highlightsFor, isPaintableHtml, renderEditableHTML, renderHighlightedHTML, type HighlightKey, type ReorderHighlight } from "../lib/highlight";
+import { highlightsFor, isPaintableHtml, overlayFindMarks, renderEditableHTML, renderHighlightedHTML, type HighlightKey, type ReorderHighlight } from "../lib/highlight";
 import { markHighlightSx } from "../lib/highlightStyles";
 import { extractEditableText, extractTrailingMarkers, stripTrailingMarkers, splitSectionHeaders, type SectionHeader } from "../lib/usfm";
 import { introEditBase } from "../lib/verseIntro";
@@ -1413,7 +1413,8 @@ function ActiveLine({
   }, [prevHighlights, nextHighlights]);
 
   const noteHTML = useMemo(() => {
-    if (findHTML) return null;
+    // Editable cells need this even while Find is open — see `html` below.
+    if (findHTML && !(editable && !readOnly)) return null;
     if (!Array.isArray(verseObjects)) return null;
     const hlSet = highlights ?? (new Set() as Set<HighlightKey>);
     // Edit mode surfaces paragraph / poetry markers as literal chips; read-only
@@ -1425,7 +1426,26 @@ function ActiveLine({
     }
     return renderHighlightedHTML(verseObjects, hlSet, roles);
   }, [findHTML, verseObjects, highlights, editable, readOnly, roles]);
-  const html = findHTML ?? noteHTML;
+  // The editable cell stays contentEditable throughout, and whatever HTML is
+  // painted here is exactly what a keystroke's `textContent` capture reads
+  // back on save. `findHTML` is built from marker-free `text`, so letting it
+  // win here (as it safely can for read-only/inactive cells) would delete
+  // every `\q`/`\p` chip from the capture the moment Find is open (#642).
+  // Paint find matches onto the chip render instead of substituting it; when
+  // there's no chip tree to protect (no verseObjects), fall back to the old
+  // precedence since there's nothing for it to destroy.
+  const html = useMemo(() => {
+    if (editable && !readOnly) {
+      if (noteHTML) {
+        if (search?.re && (!isSource || search.sourceQuery.kind === "english")) {
+          return overlayFindMarks(noteHTML, search.re, activeRange);
+        }
+        return noteHTML;
+      }
+      return findHTML;
+    }
+    return findHTML ?? noteHTML;
+  }, [editable, readOnly, noteHTML, findHTML, search, isSource, activeRange]);
 
   // Only resync the DOM when the highlight/content state actually changes —
   // not on every keystroke. This lets the user type freely; clicking a

@@ -19,7 +19,7 @@ import { type ChapterCopyBlock } from "../lib/chapterCopy";
 import { CopyChapterButton } from "./CopyChapterButton";
 import { LANE_FILL, type TextLaneCheck } from "../lib/laneChecks";
 import type { ChapterState } from "../hooks/useBook";
-import { highlightsFor, isPaintableHtml, renderEditableHTML, renderHighlightedHTML, type HighlightKey, type ReorderHighlight } from "../lib/highlight";
+import { highlightsFor, isPaintableHtml, overlayFindMarks, renderEditableHTML, renderHighlightedHTML, type HighlightKey, type ReorderHighlight } from "../lib/highlight";
 import { markHighlightSx, bookTsDividerSx } from "../lib/highlightStyles";
 import { extractTrailingMarkers, extractTrailingDividers, stripTrailingDividers, stripTrailingMarkers, splitSectionHeaders, type SectionHeader } from "../lib/usfm";
 import { SectionHeaderBand } from "./SectionHeaderBand";
@@ -845,18 +845,28 @@ const VerseCell = memo(function VerseCell({
   }, [prevHighlights, nextHighlights]);
 
   const html = useMemo(() => {
-    if (findHTML) return findHTML;
     const verseObjects = (dto?.content as { verseObjects?: unknown[] } | null)?.verseObjects;
-    if (!Array.isArray(verseObjects)) return null;
     // Active editable verse: surface paragraph / poetry markers as literal
     // "\p" / "\q1" chips so they can be seen and adjusted in place — same as
     // the rows view active line. Render the verse's OWN objects (not the
     // drifted-composed set) so the contentEditable's textContent matches
     // extractEditableText and the smartEditVerse save diff lines up. Only the
     // active verse gets chips; the rest of the book stays clean.
-    if (isActive && !readOnly) {
-      return renderEditableHTML(verseObjects, highlights ?? new Set(), roles);
+    //
+    // This must win over `findHTML` even while Find is open: this cell stays
+    // contentEditable throughout, and findHTML is built from marker-free
+    // plain_text, so letting it win here would delete every `\q`/`\p` chip
+    // from the DOM a keystroke's save capture reads (#642). Paint find
+    // matches onto the chip render instead of substituting it.
+    if (isActive && !readOnly && Array.isArray(verseObjects)) {
+      const chipHtml = renderEditableHTML(verseObjects, highlights ?? new Set(), roles);
+      if (search?.re && (!isSource || search.sourceQuery.kind === "english")) {
+        return overlayFindMarks(chipHtml, search.re, activeRange);
+      }
+      return chipHtml;
     }
+    if (findHTML) return findHTML;
+    if (!Array.isArray(verseObjects)) return null;
     // Drift trailing `\q1`/`\p` etc. from the previous verse so the
     // visual break introduces this verse — usfm-js attaches markers
     // to the prior verse (per USFM convention `\q1 \v N+1`).
@@ -886,7 +896,7 @@ const VerseCell = memo(function VerseCell({
     // Render unconditionally so paragraph / poetry markers turn into
     // visual breaks / indents in book view even without active highlights.
     return renderHighlightedHTML(composed, highlights ?? new Set(), roles);
-  }, [findHTML, dto?.content, highlights, prevDto?.content, isActive, readOnly, roles]);
+  }, [findHTML, dto?.content, highlights, prevDto?.content, isActive, readOnly, roles, search, isSource, activeRange]);
 
   // Markers that drifted from the previous verse, for the lookback band. The
   // active-editable render above deliberately drops them from the verse body (its

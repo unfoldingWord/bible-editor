@@ -10,6 +10,7 @@ import {
   findTargetHighlights,
   isPaintableHtml,
   leadingBreakClass,
+  overlayFindMarks,
   pinSourceOccurrences,
   renderEditableHTML,
   renderHighlightedHTML,
@@ -391,6 +392,86 @@ const JOIN = "⁠";
   );
   assert(isPaintableHtml("<div>&nbsp;</div>") === false, "nbsp-only markup is not paintable");
   assert(isPaintableHtml("<div>hi</div>") === true, "markup with real text is still paintable");
+}
+
+// --- 17. overlayFindMarks (#642): the Find overlay must paint match marks
+// onto the chip-bearing render, not substitute marker-free plain text for
+// it — the editable cell stays contentEditable throughout, so whatever HTML
+// lands here is exactly what a keystroke's save capture reads back. A
+// marker-free substitute would delete every `\q`/`\p` chip from that
+// capture the moment Find is open.
+{
+  const verseObjects = [
+    { type: "paragraph", tag: "q1" },
+    { type: "text", text: "For the LORD is good to those who wait." },
+  ];
+  const chipHtml = renderEditableHTML(verseObjects, new Set());
+  const stripped = chipHtml.replace(/<[^>]*>/g, "");
+  assert(
+    stripped.includes("\\q1"),
+    `sanity: the chip render's own textContent carries the \\q1 chip (got ${JSON.stringify(stripped)})`,
+  );
+
+  const painted = overlayFindMarks(chipHtml, /good/gi, null);
+  const paintedText = painted.replace(/<[^>]*>/g, "");
+  assert(
+    paintedText.includes("\\q1"),
+    `painted HTML's textContent still carries the \\q1 chip (got ${JSON.stringify(paintedText)})`,
+  );
+  assert(
+    paintedText === stripped,
+    `painting find marks changes only markup, never the underlying textContent a save capture reads (before=${JSON.stringify(stripped)}, after=${JSON.stringify(paintedText)})`,
+  );
+  assert(
+    painted.includes('<mark class="be-find">good</mark>'),
+    `the match is wrapped in a be-find mark (got ${JSON.stringify(painted)})`,
+  );
+}
+
+// --- 18. overlayFindMarks: activeRange still flags the right occurrence as
+// `be-find-active` when the run has no leading markers (the common case —
+// verses with markers are documented as a known coordinate-mismatch, since
+// activeRange is computed against marker-free plain_text).
+{
+  const verseObjects = [{ type: "text", text: "good news, very good." }];
+  const chipHtml = renderEditableHTML(verseObjects, new Set());
+  const painted = overlayFindMarks(chipHtml, /good/gi, { start: 16, end: 20 });
+  const activeMarks = (painted.match(/<mark class="be-find be-find-active">good<\/mark>/g) || []).length;
+  const plainMarks = (painted.match(/<mark class="be-find">good<\/mark>/g) || []).length;
+  assert(activeMarks === 1, `exactly one occurrence is flagged active (got ${activeMarks} in ${JSON.stringify(painted)})`);
+  assert(plainMarks === 1, `the other occurrence is flagged non-active (got ${plainMarks} in ${JSON.stringify(painted)})`);
+}
+
+// --- 19. overlayFindMarks: a match that would span two text runs (crossing
+// a chip's own tag markup) is left undecorated rather than force-split —
+// decoration only, and a botched split risks corrupting the markup a save
+// capture reads.
+{
+  const html = '<span class="be-tok" data-tag="p">a</span>bc';
+  const painted = overlayFindMarks(html, /ab/, null);
+  assert(
+    painted.replace(/<[^>]*>/g, "") === "abc",
+    `textContent is unchanged when a match is skipped (got ${JSON.stringify(painted)})`,
+  );
+  assert(
+    !painted.includes("<mark"),
+    `no mark is inserted when the match would split a chip's markup (got ${JSON.stringify(painted)})`,
+  );
+}
+
+// --- 20. overlayFindMarks: escaped punctuation round-trips through the
+// decode/re-escape untouched (the entity decoder only understands this
+// module's own fixed escaping, so a mismatch here would corrupt text).
+{
+  const verseObjects = [{ type: "text", text: `A & "B" good` }];
+  const chipHtml = renderEditableHTML(verseObjects, new Set());
+  const painted = overlayFindMarks(chipHtml, /good/, null);
+  const strippedBefore = chipHtml.replace(/<[^>]*>/g, "");
+  const strippedAfter = painted.replace(/<[^>]*>/g, "");
+  assert(
+    strippedAfter === strippedBefore,
+    `textContent is byte-identical before/after painting (before=${JSON.stringify(strippedBefore)}, after=${JSON.stringify(strippedAfter)})`,
+  );
 }
 
 if (failed) {
