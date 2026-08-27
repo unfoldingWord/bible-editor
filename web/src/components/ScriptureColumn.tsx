@@ -1416,15 +1416,25 @@ function ActiveLine({
     // Editable cells need this even while Find is open — see `html` below.
     if (findHTML && !(editable && !readOnly)) return null;
     if (!Array.isArray(verseObjects)) return null;
-    const hlSet = highlights ?? (new Set() as Set<HighlightKey>);
+    // Find marks take precedence over note highlights while the overlay has a
+    // hit in this cell — BookView / DocColumn state that by nulling their
+    // `highlights` outright. It is not cosmetic here: a `<mark class="be-hl">`
+    // wrapper splits the chip render into separate text runs, and
+    // overlayFindMarks refuses to split a match across a run boundary, so a
+    // multi-word query spanning a highlighted word would paint nothing at all.
+    const findLive = !!findHTML;
+    const hlSet = findLive
+      ? (new Set() as Set<HighlightKey>)
+      : (highlights ?? (new Set() as Set<HighlightKey>));
+    const roleSets = findLive ? undefined : roles;
     // Edit mode surfaces paragraph / poetry markers as literal chips; read-only
     // emits block layout. Both render even with an empty active set so the
     // paragraph structure still shows; `roles` adds the prev/next channels when
     // a reorder is live (the parent uses FindAwareText for pure inactive rows).
     if (editable && !readOnly) {
-      return renderEditableHTML(verseObjects, hlSet, roles);
+      return renderEditableHTML(verseObjects, hlSet, roleSets);
     }
-    return renderHighlightedHTML(verseObjects, hlSet, roles);
+    return renderHighlightedHTML(verseObjects, hlSet, roleSets);
   }, [findHTML, verseObjects, highlights, editable, readOnly, roles]);
   // The editable cell stays contentEditable throughout, and whatever HTML is
   // painted here is exactly what a keystroke's `textContent` capture reads

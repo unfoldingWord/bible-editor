@@ -493,7 +493,6 @@ function VerseSpan({
   }, [prevHighlights, nextHighlights]);
 
   const html = useMemo(() => {
-    if (!content) return null;
     const verseObjects = (content as { verseObjects?: unknown[] } | null)?.verseObjects;
     // Active editable verse: surface paragraph / poetry markers as literal
     // "\p" / "\q1" chips so they can be seen and adjusted in place — same as
@@ -508,13 +507,26 @@ function VerseSpan({
     // from the DOM a keystroke's save capture reads (#642). Paint find
     // matches onto the chip render instead of substituting it.
     if (isActive && !readOnly && Array.isArray(verseObjects)) {
-      const chipHtml = renderEditableHTML(verseObjects, highlights ?? new Set(), roles);
+      // Find marks take precedence over note highlights while the overlay has
+      // a hit here. Not cosmetic: a `<mark class="be-hl">` wrapper splits the
+      // chip render into separate text runs, and overlayFindMarks refuses to
+      // split a match across a run boundary, so a multi-word query spanning a
+      // highlighted word would paint nothing at all.
+      const findLive = !!findHTML;
+      const chipHtml = renderEditableHTML(
+        verseObjects,
+        findLive ? new Set() : (highlights ?? new Set()),
+        findLive ? undefined : roles,
+      );
       if (search?.re && (!isSource || search.sourceQuery.kind === "english")) {
         return overlayFindMarks(chipHtml, search.re, activeRange);
       }
       return chipHtml;
     }
     if (findHTML) return findHTML;
+    // A verse with plain_text but no content tree still paints find
+    // highlighting above; only past that point is there nothing to render.
+    if (!content) return null;
     if (!Array.isArray(verseObjects)) return null;
     // Compose any drifted-down markers (from the previous verse's
     // trailing `\q1`/`\p` etc.) at the front so the visual break

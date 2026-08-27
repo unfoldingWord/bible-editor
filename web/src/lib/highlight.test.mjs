@@ -474,6 +474,106 @@ const JOIN = "⁠";
   );
 }
 
+// --- 21. overlayFindMarks (#646 review F2): `activeRange` arrives in
+// marker-free plain_text coordinates, but the chip render carries the
+// literal "\q1 " label — 4 characters that exist in no plain_text. Without
+// translating between the two, `be-find-active` lands on the wrong
+// occurrence (or, as here, on none at all) in every marker-bearing verse.
+{
+  const verseObjects = [
+    { type: "paragraph", tag: "q1" },
+    { type: "text", text: "good news, very good." },
+  ];
+  const chipHtml = renderEditableHTML(verseObjects, new Set());
+  // plain_text for this verse is "good news, very good." — the second "good"
+  // sits at 16 there, and at 20 in the chip render.
+  const painted = overlayFindMarks(chipHtml, /good/gi, { start: 16, end: 20 });
+  const actives = painted.match(/<mark class="be-find be-find-active">good<\/mark>/g) || [];
+  assert(actives.length === 1, `exactly one occurrence is flagged active (got ${actives.length} in ${JSON.stringify(painted)})`);
+  // The active one must be the SECOND — assert on position, not just count.
+  const activeAt = painted.indexOf('<mark class="be-find be-find-active">');
+  const plainAt = painted.indexOf('<mark class="be-find">');
+  assert(
+    plainAt !== -1 && plainAt < activeAt,
+    `the ACTIVE mark is the second occurrence, not the first (got ${JSON.stringify(painted)})`,
+  );
+  assert(
+    painted.replace(/<[^>]*>/g, "").includes("\\q1"),
+    `the \\q1 chip survives the paint (got ${JSON.stringify(painted.replace(/<[^>]*>/g, ""))})`,
+  );
+}
+
+// --- 22. overlayFindMarks (#646 review F3): a query that matches inside a
+// chip's own literal label ("q" in "\q1") must not paint there. The chip is
+// editor chrome, not verse text; the Find overlay counted no such match, so
+// decorating one shows a hit the results list does not have.
+{
+  const verseObjects = [
+    { type: "paragraph", tag: "q1" },
+    { type: "text", text: "quiet waters" },
+  ];
+  const chipHtml = renderEditableHTML(verseObjects, new Set());
+  const painted = overlayFindMarks(chipHtml, /q/gi, null);
+  const marks = painted.match(/<mark class="be-find[^"]*">/g) || [];
+  assert(marks.length === 1, `only the verse-text hit is painted, not the chip label (got ${marks.length} in ${JSON.stringify(painted)})`);
+  assert(
+    painted.includes('<span class="be-tok be-tok-q1" data-tag="q1">\\q1</span>'),
+    `the chip label is left byte-for-byte alone (got ${JSON.stringify(painted)})`,
+  );
+}
+
+// --- 23. overlayFindMarks (#646 review F1): note highlights split the chip
+// render into separate text runs, and a find hit crossing a run boundary is
+// deliberately skipped (see 19). So a multi-word query spanning a
+// note-highlighted word paints NOTHING unless the editable cell renders with
+// an empty highlight set while Find is open. This pins both halves: the
+// highlighted render drops the phrase, the find-open render keeps it.
+{
+  const verseObjects = [
+    { type: "text", text: "hold " },
+    tgt("fast", 1),
+    { type: "text", text: " to hope" },
+  ];
+  const withNoteHl = renderEditableHTML(verseObjects, new Set(["fast|1"]));
+  assert(
+    withNoteHl.includes('<mark class="be-hl">fast</mark>'),
+    `sanity: the note highlight splits the run (got ${JSON.stringify(withNoteHl)})`,
+  );
+  const paintedOverHl = overlayFindMarks(withNoteHl, /hold fast/gi, null);
+  assert(
+    !paintedOverHl.includes("be-find"),
+    `a phrase crossing a note highlight cannot be painted — which is why the cell must drop note highlights while Find is open (got ${JSON.stringify(paintedOverHl)})`,
+  );
+
+  const findOpen = renderEditableHTML(verseObjects, new Set());
+  const painted = overlayFindMarks(findOpen, /hold fast/gi, null);
+  assert(
+    painted.includes('<mark class="be-find">hold fast</mark>'),
+    `with no note highlights in the way the phrase paints (got ${JSON.stringify(painted)})`,
+  );
+}
+
+// --- 24. isPaintableHtml (#646 review F5, #568 trap): a literal zero-width
+// space must classify exactly like the `&#8203;` entity it decodes from.
+// overlayFindMarks re-escapes the runs it touches, turning entities into
+// literal characters — if only the entity form counted as invisible, a
+// painted render could be judged "paintable" where its unpainted twin is not,
+// and the pane would paint text-free markup.
+{
+  assert(
+    isPaintableHtml('<div class="be-q-1">&#8203;</div>') === false,
+    "the entity form of a caret-filler-only render is not paintable",
+  );
+  assert(
+    isPaintableHtml('<div class="be-q-1">​</div>') === false,
+    "the literal-character form classifies identically",
+  );
+  assert(
+    isPaintableHtml('<div class="be-q-1">​word</div>') === true,
+    "a filler next to real text is still paintable",
+  );
+}
+
 if (failed) {
   console.error(`\n${failed} test(s) failed`);
   process.exit(1);

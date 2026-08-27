@@ -1125,6 +1125,13 @@ function stripToVisibleText(html: string): string {
   return html
     .replace(/<[^>]*>/g, "")
     .replace(/&#8203;/g, "")
+    // …and the same filler in its LITERAL form. overlayFindMarks re-escapes
+    // every run it paints into, which turns a `&#8203;` back into a bare
+    // U+200B — if only the entity spelling counted as invisible here, a
+    // painted render could classify paintable where its unpainted twin does
+    // not, and the caller would write text-free markup into the pane. Same
+    // #568 trap, one encoding along.
+    .replace(/​/g, "")
     .replace(/&nbsp;/gi, " ")
     .replace(/&amp;/gi, "&")
     .replace(/&lt;/gi, "<")
@@ -1231,14 +1238,18 @@ function decodeKnownEntities(raw: string): string {
 // decoration only, and a botched split risks corrupting the very markup the
 // capture reads.
 //
+// A match that falls inside a chip's own literal label ("q" in "\q1") is
+// skipped too: the chip is editor chrome, not verse text, and the Find
+// overlay — which searches marker-free plain_text — counted no such hit.
+// Painting one would show a result the results list does not have.
+//
 // `activeRange` is a [start,end) pair from the Find overlay's match index,
-// which is built against marker-free plain_text — one coordinate system
-// short of this chip HTML's own text (marker tokens like "\q1" shift every
-// offset after them). So in a verse with leading/interleaved markers, the
-// "which match is the active one" comparison can miss; every match still
-// gets a `be-find` mark, just possibly not `-active` on the right one. A
-// verse with no markers (the common case) has identical coordinates in
-// both and highlights correctly either way.
+// built against that same marker-free plain_text — one coordinate system
+// short of this chip HTML's own text, since every "\q1 " label shifts the
+// offsets after it by 4. `plainOffsets` below rebuilds the translation
+// between the two (extractPlainText's rules: a marker reads as one
+// separating space, whitespace runs collapse, ends are trimmed) so the
+// `-active` class lands on the occurrence the overlay actually selected.
 export function overlayFindMarks(
   html: string,
   re: RegExp,
@@ -1246,22 +1257,105 @@ export function overlayFindMarks(
 ): string {
   if (!html) return html;
   const tokens = splitHtmlTokens(html);
-  const decoded = tokens.map((tok) => ("text" in tok ? decodeKnownEntities(tok.text) : null));
+  // Decode each text run to the string a browser's `textContent` would read,
+  // and note whether it sits inside a chip label (`span.be-tok`).
+  const decoded: Array<string | null> = [];
+  const inChip: boolean[] = [];
   const starts: number[] = [];
+  const openIsChip: boolean[] = [];
+  let chipDepth = 0;
   let full = "";
-  for (const text of decoded) {
-    starts.push(text === null ? -1 : full.length);
-    if (text !== null) full += text;
+  for (const tok of tokens) {
+    if ("text" in tok) {
+      const text = decodeKnownEntities(tok.text);
+      decoded.push(text);
+      inChip.push(chipDepth > 0);
+      starts.push(full.length);
+      full += text;
+      continue;
+    }
+    decoded.push(null);
+    inChip.push(false);
+    starts.push(-1);
+    const info = classifyTag(tok.tag);
+    if (info.kind === "open") {
+      openIsChip.push(info.isChip);
+      if (info.isChip) chipDepth++;
+    } else if (info.kind === "close") {
+      if (openIsChip.pop()) chipDepth = Math.max(0, chipDepth - 1);
+    }
+  }
+  // full-offset → plain_text-offset, for the activeRange comparison.
+  const plainOffsets = new Int32Array(full.length + 1);
+  {
+    let plainLen = 0;
+    // Leading whitespace (and a verse-leading marker's separator) is trimmed
+    // out of plain_text, so start as if a space had just been emitted.
+    let lastWasSpace = true;
+    let chipJustClosed = false;
+    for (let i = 0; i < tokens.length; i++) {
+      const text = decoded[i];
+      if (text === null) continue;
+      const base = starts[i];
+      if (inChip[i]) {
+        // The literal "\q1" label exists only in the chip render.
+        for (let k = 0; k < text.length; k++) plainOffsets[base + k] = plainLen;
+        if (text.length > 0) chipJustClosed = true;
+        continue;
+      }
+      let k = 0;
+      if (chipJustClosed) {
+        // segmentsToHtml emits exactly one space after a chip; it belongs to
+        // the label, not to the verse text.
+        if (text[0] === " ") {
+          plainOffsets[base] = plainLen;
+          k = 1;
+        }
+        // extractPlainText reads the marker itself as one separating space,
+        // then collapses runs — so emit one only if there isn't one already.
+        if (!lastWasSpace) {
+          plainLen++;
+          lastWasSpace = true;
+        }
+        chipJustClosed = false;
+      }
+      for (; k < text.length; k++) {
+        plainOffsets[base + k] = plainLen;
+        const ch = text[k];
+        // Caret filler for an empty block — render-only, never in plain_text.
+        if (ch === "​") continue;
+        if (/\s/.test(ch)) {
+          if (!lastWasSpace) {
+            plainLen++;
+            lastWasSpace = true;
+          }
+        } else {
+          plainLen++;
+          lastWasSpace = false;
+        }
+      }
+    }
+    plainOffsets[full.length] = plainLen;
+  }
+  const chipRanges: Array<[number, number]> = [];
+  for (let i = 0; i < tokens.length; i++) {
+    const text = decoded[i];
+    if (text !== null && inChip[i] && text.length > 0) chipRanges.push([starts[i], starts[i] + text.length]);
   }
   const local = new RegExp(re.source, re.flags.includes("g") ? re.flags : `${re.flags}g`);
   const hits: Array<{ start: number; end: number; isActive: boolean }> = [];
   let m: RegExpExecArray | null;
   local.lastIndex = 0;
   while ((m = local.exec(full)) !== null) {
-    const isActive =
-      !!activeRange && m.index === activeRange.start && m.index + m[0].length === activeRange.end;
-    hits.push({ start: m.index, end: m.index + m[0].length, isActive });
+    const start = m.index;
+    const end = m.index + m[0].length;
     if (m[0].length === 0) local.lastIndex++;
+    if (chipRanges.some(([cs, ce]) => start < ce && end > cs)) continue;
+    const isActive =
+      !!activeRange &&
+      plainOffsets[start] === activeRange.start &&
+      plainOffsets[end] === activeRange.end;
+    hits.push({ start, end, isActive });
   }
   if (hits.length === 0) return html;
   let hitIdx = 0;
@@ -1274,17 +1368,26 @@ export function overlayFindMarks(
     }
     const nodeStart = starts[i];
     const nodeEnd = nodeStart + text.length;
-    let cursor = 0;
     // Every hit's start falls in exactly one run (runs partition `full`
     // contiguously). One that also ends within this run is fully contained
     // and gets decorated; one that starts here but ends past `nodeEnd`
     // crosses into the next tag/run — skip decorating it (its tail bytes
     // just render as plain text in whichever run they land in) but still
     // consume it so a later run doesn't try to re-match its start.
+    const mine: Array<{ start: number; end: number; isActive: boolean }> = [];
     while (hitIdx < hits.length && hits[hitIdx].start >= nodeStart && hits[hitIdx].start < nodeEnd) {
       const h = hits[hitIdx];
       hitIdx++;
-      if (h.end > nodeEnd) continue;
+      if (h.end <= nodeEnd) mine.push(h);
+    }
+    // Untouched runs go back verbatim, so entity spellings this module emits
+    // (`&#8203;`, `&nbsp;`) survive the round trip byte-for-byte.
+    if (mine.length === 0) {
+      out.push((tokens[i] as { text: string }).text);
+      continue;
+    }
+    let cursor = 0;
+    for (const h of mine) {
       const ls = h.start - nodeStart;
       const le = h.end - nodeStart;
       out.push(escapeHtml(text.slice(cursor, ls)));
@@ -1294,4 +1397,13 @@ export function overlayFindMarks(
     out.push(escapeHtml(text.slice(cursor)));
   }
   return out.join("");
+}
+
+// Where a tag token sits in the element stack, and whether it opens a chip
+// label (`span.be-tok`) — the literal "\p"/"\q1" text that exists only in
+// the editable chip render and in no plain_text.
+function classifyTag(tag: string): { kind: "open" | "close" | "self"; isChip: boolean } {
+  if (tag.startsWith("</")) return { kind: "close", isChip: false };
+  if (/\/\s*>$/.test(tag)) return { kind: "self", isChip: false };
+  return { kind: "open", isChip: /class="[^"]*\bbe-tok\b/.test(tag) };
 }
