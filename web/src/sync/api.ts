@@ -901,6 +901,12 @@ export interface ReimportCounts {
   // insensitive comparison treats as "no change" (and every nightly export
   // then reverts). Optional, diagnostic — see bookReimport.ts's field doc.
   merge_cosmetic_ignored?: number;
+  // The same class as `merge_cosmetic_ignored`, on the other side of the corpus:
+  // a PRISTINE or AI-only verse whose master bytes differ from D1's only by
+  // artifacts the verse-merge lens normalizes away (issue #609), so the sync
+  // wrote nothing instead of bumping its version for the Nth consecutive night.
+  // Optional, diagnostic — see api/src/bookReimport.ts's field doc.
+  skipped_normalized?: number;
   // Door43 master held EXACTLY the file our last export pushed, so master moved
   // because our own `-be-` branch merged, not because anyone edited master — and
   // the merge ancestor was corrected accordingly. Before this was recognized,

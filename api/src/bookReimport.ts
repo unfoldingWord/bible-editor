@@ -99,10 +99,19 @@ import { applyTwlSortOrderUpdates } from "./twlSortOrderApply";
 import { loadTwTitles } from "./twTitles";
 import { loadTwlOrderLocks } from "./twlOrderLocks";
 import type { TwlRow, VerseRow, CheckLane } from "./types";
-import { computeVerseMerge, type VerseMergeResult } from "./verseMerge.ts";
+import {
+  collapseWhitespaceForCompare,
+  computeVerseMerge,
+  verseContentConverged,
+  type VerseMergeResult,
+} from "./verseMerge.ts";
 import { NO_BASE_REF_DISPLAY, type NoBaseVerseRef } from "./verseMergeEditorAlerts.ts";
 import { verseContentJsonFromPayload } from "./verseHistory.ts";
 import { canonizeAlignmentSource } from "./canonizeHebrew.ts";
+// The export's own renderer, used ONLY as a read-only comparison oracle by
+// isNormalizedNoopVerseWrite (issue #609). export.ts does not import this module,
+// so this stays a one-way dependency.
+import { buildUsfm } from "./export.ts";
 import {
   recordVerseMergeConflicts,
   confirmAdoptedConflicts,
@@ -191,6 +200,25 @@ export interface ReimportCounts {
   // stamped for a resource whose prune phase was incomplete.
   prune_locked: number;
   skipped_noop: number;
+  // Issue #609. A PRISTINE (updated_by IS NULL) or AI-ONLY verse whose incoming
+  // master bytes differ from D1's, but where BOTH the stableKey lens AND the
+  // export's own renderer say the difference is invisible — render round-trip
+  // whitespace, a marker's `nextChar` flipping " " <-> "\n", target-`\w` occurrence
+  // renumbering, empty-vs-absent text nodes. No write, no version bump, no
+  // edit_log row. See isNormalizedNoopVerseWrite for why both conditions are
+  // required.
+  //
+  // Why it is separate from `skipped_noop`: that counter means "master and D1 are
+  // byte-identical", a fact nobody has to think about. This one means "we chose
+  // NOT to store a real byte difference" — weaker than it sounds, since the render
+  // check proves the export emits the same bytes either way, but still a decision
+  // rather than an observation, and one worth being able to see. Folding the two
+  // together would hide it, which is the failure mode STATE.md's "absent
+  // measurement is not evidence" lesson is about — so this counter is ALSO
+  // reported by summarizeReimport (web/src/lib/reimportSummary.ts) and logged with
+  // its refs on the nightly path, not just dumped in the admin counters. verses
+  // only — TSV rows have their own lens (tsvMerge.ts) on their own paths.
+  skipped_normalized: number;
   // Incoming row not inserted because an identical-content row already exists
   // (Guard 2, content-dedup). Tracked separately from skipped_noop so the guard
   // firing is visible in the reimport summary / logs.
@@ -544,6 +572,7 @@ function zeroCounts(): ReimportCounts {
     chapters_locked: 0,
     prune_locked: 0,
     skipped_noop: 0,
+    skipped_normalized: 0,
     skipped_dup: 0,
     conflict_skipped: 0,
     tombstone_blocked: 0,
@@ -719,6 +748,13 @@ function addCounts(into: ReimportCounts, from: ReimportCounts): void {
   into.chapters_locked += from.chapters_locked ?? 0;
   into.prune_locked += from.prune_locked ?? 0;
   into.skipped_noop += from.skipped_noop;
+  // `?? 0` for the same reason tombstone_reclaimed uses it: a chunk result
+  // serialized by a Worker version that predates this field must not become a
+  // NaN. It gates nothing (a suppressed write leaves D1 holding content the lens
+  // says already matches master, so there is nothing stale for the export to
+  // revert and nothing to retry), so it deliberately stays out of the
+  // `incomplete` taint check above.
+  into.skipped_normalized += from.skipped_normalized ?? 0;
   into.skipped_dup += from.skipped_dup;
   into.conflict_skipped += from.conflict_skipped ?? 0;
   into.tombstone_blocked += from.tombstone_blocked ?? 0;
@@ -3346,6 +3382,135 @@ function reconcileEditedVerseSourceAttrs(
 // DO NOT revert this to a per-row loop: that regression silently reintroduced
 // the subrequest cap once (PR #180 batched it → a refactor un-batched it → PR
 // #195 re-batched). See the nightly-sync-subrequest-cap memory.
+// Issue #609: is this master-vs-D1 difference on a PRISTINE or AI-ONLY verse
+// provably a no-op — invisible in D1 AND invisible in what we publish?
+//
+// TWO NECESSARY CONDITIONS, ANDed. Both must say "no change" to suppress a write.
+//
+//   (1) The stableKey lens the edited path already uses (verseContentConverged).
+//   (2) The EXPORT'S OWN RENDERER emits identical bytes for both trees.
+//
+// WHY (2) EXISTS — review finding F1, measured, not theorized. The lens alone is
+// NOT a safe arbiter here, because two of the whitespace shapes it normalizes away
+// are load-bearing in the rendered USFM:
+//   - a text node `"and"` vs `"and "` immediately before a `\w` renders as
+//     `and\w God\w*` vs `and\n\w God\w*` — the first FUSES the word onto the
+//     marker (the PR #417 / stripMarkerTokens marker-fusion class);
+//   - a whitespace-only separator text node between two `\w` nodes renders as
+//     `\w*\w` vs `\w*\n\w`, same fusion.
+// usfmFormat.ts's insertSpaceAfterGluedMarker does NOT repair either (its regex is
+// anchored to a leading poetry marker). Suppressing those would let D1 keep a
+// fused-token tree that the next export publishes as corrupt USFM.
+//
+// WHY (2) IS THE RIGHT ARBITER, and why it is not merely a stricter version of
+// (1): buildUsfm is the ONLY thing that turns D1 content into the bytes we push to
+// Door43. So "would the export emit different bytes for these two trees?" is
+// exactly the question a suppression has to answer, and it is answered by running
+// the real renderer rather than by reasoning about which differences ought to
+// matter. Measured on the 11 shapes in applyVerseRows.test.mjs: it separates every
+// documented artifact (nextChar " "/"\n", blank-line reflow absorbed into a text
+// node, target `\w` occurrence renumber, empty-vs-absent text node) from every
+// render-load-bearing difference.
+//
+// WHY BOTH, rather than (2) alone. Export-render equality is not a superset of the
+// lens — the two disagree in BOTH directions. `\p` marker PILEUP (the EZK/2/0/UST
+// shape) renders identically, because normalizeUsfmFormatting collapses the
+// duplicate marker; so (2) alone would suppress it, and #609 explicitly requires
+// that a genuinely growing content difference keep writing. Under the AND it does:
+// (1) sees the extra node, says "different", and (2) is never consulted. The AND
+// is monotone — it can only ever suppress FEWER writes than either condition on
+// its own.
+//
+// WHAT THIS BUYS, beyond correctness: every suppressed difference is now
+// export-invisible BY CONSTRUCTION. The cost the first draft of this change had to
+// escalate — "a genuinely whitespace-only Door43 edit stops being adopted and is
+// reverted by the next export" — cannot arise, because a difference we suppress is
+// one the export renders identically either way. A whitespace edit that DOES
+// survive our render now writes.
+//
+// Called only after the cheap raw byte comparison has already said "different", so
+// neither condition is paid for the overwhelmingly common no-change verse, and (2)
+// is paid only for the artifact population. Measured: 0.166 ms per render, 0.33 ms
+// per suppressed verse, ~0.8 s worst case for an entire PSA-sized book across
+// chunked Workflow steps.
+//
+// SAFETY DIRECTION, deliberately one-way: this function may only ever return
+// true for a difference that is provably invisible; every uncertainty returns
+// false and the caller writes, which is the pre-fix behavior.
+//   - `verse_end` is compared EXACTLY. It is a bridge boundary (`\v 14-15`), not
+//     text, and there is no artifact class that perturbs it — a difference there
+//     is always real.
+//   - `plain_text` goes through collapseWhitespaceForCompare rather than an exact
+//     compare. It is derived from content_json, so once the trees are lens-equal
+//     the only differences it can still carry are the whitespace the same lens
+//     already collapses inside the tree. An exact compare here would re-introduce
+//     the churn on the very artifact (a trailing newline absorbed into the
+//     following text node) this fix exists to suppress. It is D1's STORED
+//     plain_text, deliberately, not one recomputed from D1's content_json: a
+//     stored value that has drifted from its own tree then differs from master's
+//     and we WRITE, which both repairs the drift and is the safe direction. The
+//     mirror-image shape (D1's tree corrupted while its stored plain_text still
+//     reads correctly) would be suppressed instead — no live write path was found
+//     that produces it on a PRISTINE row, so it is recorded here as a known
+//     latent, not defended as impossible.
+//   - `content_json` goes through verseContentConverged (verseMerge.ts's
+//     stableKey), whose per-rule safety arguments live in that module.
+// Nothing here changes what is WRITTEN — only whether a write happens at all.
+function isNormalizedNoopVerseWrite(
+  book: string,
+  bibleVersion: string,
+  ex: { content_json: string; plain_text: string | null; verse_end: number | null },
+  v: VerseExtract,
+): boolean {
+  if ((ex.verse_end ?? null) !== (v.verseEnd ?? null)) return false;
+  if (collapseWhitespaceForCompare(ex.plain_text ?? null) !== collapseWhitespaceForCompare(v.plainText ?? null)) {
+    return false;
+  }
+  if (!verseContentConverged(ex.content_json, v.contentJson)) return false;
+  // Condition (2). Only reached for a difference the lens already called
+  // invisible, so this is the final safety check, never the primary filter.
+  const oursUsfm = exportRenderForVerse(book, bibleVersion, v, ex.content_json);
+  const theirsUsfm = exportRenderForVerse(book, bibleVersion, v, v.contentJson);
+  return oursUsfm !== null && theirsUsfm !== null && oursUsfm === theirsUsfm;
+}
+
+// One verse through the real export renderer. Returns null when the render fails
+// — a corrupt tree is exactly when we must NOT claim two verses are equivalent, so
+// every caller reads null as "different" and writes. `headers: null` makes buildUsfm
+// synthesize a header block; it is identical on both sides of the comparison and
+// cancels out. Nothing here is stored: this render exists only to be compared and
+// thrown away.
+function exportRenderForVerse(
+  book: string,
+  bibleVersion: string,
+  v: VerseExtract,
+  contentJson: string,
+): string | null {
+  try {
+    return buildUsfm({
+      book,
+      bibleVersion,
+      headers: null,
+      verses: [
+        {
+          book,
+          chapter: v.chapter,
+          verse: v.verse,
+          verse_end: v.verseEnd ?? null,
+          bible_version: bibleVersion,
+          content_json: contentJson,
+          plain_text: null,
+          version: 1,
+          updated_by: null,
+          updated_at: 0,
+        },
+      ],
+    });
+  } catch {
+    return null;
+  }
+}
+
 async function applyVerseRows(
   env: Env,
   book: string,
@@ -3539,6 +3704,14 @@ async function applyVerseRows(
     // all three have to be compared before it can be called a no-op (issue #539).
     beforeVerseEnd: number | null;
   }> = [];
+  // Issue #609 (review F6): the `chapter:verse` refs whose write this run
+  // suppressed as a normalized no-op. The user-triggered path reports the COUNT in
+  // the snackbar, but the nightly cron has no snackbar and nobody watching — a
+  // counter alone in a Workflow step result cannot tell an operator WHICH verses
+  // the sync declined to adopt, which is the first thing anyone debugging "Door43
+  // says X and the app says Y" needs. Logged (capped) at the end of the diff,
+  // mirroring the #539 no-op guard's own log. Diagnostic only: gates nothing.
+  const suppressedRefs: string[] = [];
   // Verses needing a durable record after this run's merge — EVERY landed
   // adoption ("adopt" | "adopt_conflict"), every alignment refusal
   // ("keep_alignment_refused"), and every edited verse whose source-owned
@@ -3610,6 +3783,19 @@ async function applyVerseRows(
           (ex.verse_end ?? null) === (v.verseEnd ?? null)
         ) {
           counts.skipped_noop++;
+        } else if (isNormalizedNoopVerseWrite(book, bibleVersion, ex, v)) {
+          suppressedRefs.push(`${v.chapter}:${v.verse}`);
+          // Issue #609. Raw bytes differ, the lens says nothing did. Skipping the
+          // re-seed also skips its ownership reclaim (updated_by -> NULL), so this
+          // verse stays AI-owned indefinitely — not just for one night, since
+          // isReimportableRow routes it back here and reaches the same decision
+          // until master or D1 actually moves. Stated plainly rather than sold as
+          // harmless: the byte-equal branch directly above has always deferred the
+          // reclaim the same way for the same class of verse, and nothing found
+          // reads `verses.updated_by` for a verse in a way this changes (export's
+          // offender provenance keys off edit_log's latest_source, which is
+          // unaffected) — but this does extend that deferral to a wider set.
+          counts.skipped_normalized++;
         } else {
           aiReseeds.push({ v, oldVersion: ex.version });
         }
@@ -3801,6 +3987,19 @@ async function applyVerseRows(
       counts.skipped_noop++;
       continue;
     }
+    // Issue #609. The raw comparison above is the cheap fast path; this is the
+    // same difference seen through the lens the edited path already trusts. A
+    // pristine verse is the majority of the corpus, and before this branch one
+    // whose render→reparse does not settle was rewritten and version-bumped for a
+    // change nobody could see — a fresh version, a fresh edit_log row and every
+    // open tab's If-Match invalidated. See verseMerge.ts's `verseContentConverged`
+    // for the measured size of that class (smaller than "every verse every night"
+    // — round trips converge) and for the cost this suppression accepts.
+    if (isNormalizedNoopVerseWrite(book, bibleVersion, ex, v)) {
+      counts.skipped_normalized++;
+      suppressedRefs.push(`${v.chapter}:${v.verse}`);
+      continue;
+    }
     // Pristine + changed → update. The guard stays on the UPDATE; new_version is
     // ex.version + 1 because the update only applies while the row is untouched.
     {
@@ -3827,6 +4026,12 @@ async function applyVerseRows(
         ).bind(rowKey, book, userId, ex.version, ex.version + 1, JSON.stringify({ plain_text: v.plainText, content: v.contentJson }), REIMPORT_SOURCE),
       });
     }
+  }
+
+  if (suppressedRefs.length > 0) {
+    console.log("reimport: skipped verse write(s) the export would render identically (issue #609)", {
+      book, bibleVersion, verses: suppressedRefs.slice(0, 10), total: suppressedRefs.length,
+    });
   }
 
   // 3. Chunked batches for all pristine INSERT/UPDATE writes, each verse's
@@ -4052,6 +4257,23 @@ async function applyVerseRows(
   // (no key-order or whitespace lens like verseMerge's stableKey): a lens can
   // only ever make a genuine change look like none, and skipping a genuine
   // adoption would let the export revert master.
+  //
+  // NOT A CONTRADICTION with issue #609's guard on the pristine/AI-only branches,
+  // which DOES use a lens — the two answer different questions, and the difference
+  // is load-bearing rather than incidental:
+  //   - HERE the merge has already decided master moved and D1 must change. The
+  //     only question left is whether the bytes about to be stored differ from the
+  //     bytes already stored. Both sides are D1-storage bytes; a lens could only
+  //     lose information, so strict equality is right.
+  //   - THERE the question is whether master's arriving bytes represent a change
+  //     at all, against a D1 side that never went through the merge. The two sides
+  //     are NOT comparable byte-for-byte (that is the render round-trip gap), so a
+  //     lens is unavoidable — and #609's guard therefore does not stop at the lens:
+  //     it additionally requires the EXPORT'S OWN RENDERER to emit identical bytes
+  //     for both trees, which is what makes its suppressions provably invisible
+  //     rather than merely lens-invisible. This guard needs no such check, because
+  //     it is not suppressing a difference — it is declining to rewrite identical
+  //     bytes.
   if (masterAdoptions.length > 0) {
     const noopVerses = new Set<string>();
     for (const a of masterAdoptions) {
@@ -4473,6 +4695,15 @@ async function applyVerseRowsPerRow(
           updated_by: number | null;
           latest_source: string | null;
         }>();
+      // Issue #609 deliberately does NOT add its normalization lens here, and this
+      // is not drift-by-omission: this function is only ever called with verses
+      // the batched path had ALREADY staged for a write, so a verse the lens
+      // suppressed can never reach it, and adding the lens here would change
+      // nothing except which counter a human-edited verse lands in. If that
+      // calling contract ever changes — if this becomes reachable for verses the
+      // batched diff skipped — this comparison has to grow the same lens the
+      // pristine/AI-only branches use (isNormalizedNoopVerseWrite) or the churn
+      // comes back through the fallback.
       if (
         existing &&
         existing.content_json === v.contentJson &&

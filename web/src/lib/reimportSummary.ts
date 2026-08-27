@@ -18,6 +18,15 @@ export function summarizeReimport(res: ReimportResponse): string {
   if (t.skipped_edited) parts.push(`${t.skipped_edited} skipped (already edited)`);
   if (t.skipped_locked) parts.push(`${t.skipped_locked} skipped (AI pipeline running)`);
   if (t.skipped_noop) parts.push(`${t.skipped_noop} unchanged`);
+  // Issue #609. NOT folded into "unchanged": these verses DID differ from Door43
+  // byte-for-byte. The sync declined to adopt the difference because rendering
+  // both versions through the export produces identical USFM — so the wording says
+  // what was actually measured ("identical once exported"), not the weaker
+  // "formatting", which would understate a difference that could change word
+  // boundaries. On a chapter the last export reflowed, every verse can land here,
+  // so without this line the list would be empty and the snackbar would report "no
+  // changes" for a pull that declined every verse.
+  if (t.skipped_normalized) parts.push(`${t.skipped_normalized} identical once exported`);
   if (t.source_attr_reconciled) parts.push(`${t.source_attr_reconciled} source-attr fix(es) synced from master`);
   if (t.merge_adopted) parts.push(`${t.merge_adopted} adopted from master (out-of-band correction)`);
   // Kept the app's version of a two-sided change, because no commit from a

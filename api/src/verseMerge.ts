@@ -294,6 +294,15 @@ function isEmptyTextNode(value: unknown): boolean {
   if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
   const obj = value as Record<string, unknown>;
   if (obj["type"] !== "text") return false;
+  // #609 review F7: dropping the node drops EVERYTHING on it, so it may only be
+  // dropped when `type` and `text` are all it carries. A `type: "text"` node that
+  // also has `children` (or any other key) is not "an empty text node" — treating
+  // it as one would silently delete whatever those keys hold from the compared
+  // form, which is a hole the safety argument above does not cover. Cheap, and it
+  // keeps the rule exactly as narrow as its justification.
+  for (const key of Object.keys(obj)) {
+    if (key !== "type" && key !== "text") return false;
+  }
   const text = obj["text"];
   if (typeof text !== "string") return text == null;
   return (normalizeForCompare(text) as string) === "";
@@ -319,20 +328,77 @@ function sortKeysDeep(value: unknown): unknown {
   return value;
 }
 
+// #609 review F8: the try covers sortKeysDeep and the re-stringify too, not just
+// the parse. Either can throw on real input — a cyclic structure, or a tree deep
+// enough to blow the stack — and an uncaught throw here escapes into the nightly
+// sync's verse loop. Returning null instead means "cannot compare", which every
+// caller reads as "not converged" and therefore WRITES: the safety direction is
+// total, with no shape of input that can turn a failure into a suppression.
 function stableKey(json: string): string | null {
-  let parsed: unknown;
   try {
-    parsed = JSON.parse(json);
+    return JSON.stringify(sortKeysDeep(JSON.parse(json)));
   } catch {
     return null;
   }
-  return JSON.stringify(sortKeysDeep(parsed));
 }
 
 // Two stableKey results are "equal" only when both are non-null and match.
 // A null on either side (unparseable JSON) is never equal to anything.
 function keysEqual(a: string | null, b: string | null): boolean {
   return a !== null && b !== null && a === b;
+}
+
+// Issue #609: the SAME lens step 1 (`keep_converged`) uses, exposed for the
+// nightly sync's PRISTINE and AI-only verse writers, which never reach
+// computeVerseMerge at all — they compared master's bytes to D1's raw, so a verse
+// where our own render→reparse does not settle (16-19% of the corpus, STATE.md)
+// was rewritten and version-bumped with nothing a translator could see having
+// changed.
+//
+// MAGNITUDE, stated at the size it was actually measured. This is NOT "every
+// verse, every night, forever": STATE.md measures round trips as CONVERGENT, not
+// oscillating — a verse differs once and then stabilizes over 5 passes. What #539
+// measured is that 7,461 of 11,768 sync verse writes (63.4%) landed on a verse the
+// sync had already rewritten before, i.e. 1.34 writes per touched verse over ~36
+// days, and #609 warns — with evidence — that the WORST repeaters (LAM/1/22/UST,
+// EZK/2/0/UST) are `\p` marker PILEUP, a genuinely growing content difference no
+// lens should suppress and this one does not (a changed node array is never
+// lens-equal). How much of the remaining churn this lens actually removes is
+// unmeasured; do not cite this comment as if it were measured.
+//
+// Returns true ONLY when both sides parse AND their normalized forms match, so
+// unparseable JSON on either side is never "converged" — the caller writes, which
+// is the pre-existing behavior. Every safety argument above `normalizeForCompare`
+// and `dropOccurrenceForWordNodes` applies unchanged: each rule can only ever move
+// a comparison FROM "different" TOWARD "equal". It cannot report equality for a
+// tree whose node array actually gained, lost or reordered a node.
+//
+// What the rules suppress is slightly WIDER than the artifacts that motivated
+// them, so read them as written, not as a list of causes: a target `\w`'s
+// occurrence/occurrences compare equal when one side merely OMITS them (not only
+// when they are renumbered), and a whitespace-only text node dropped next to an
+// in-flow marker compares equal too. Both are re-derived on export
+// (recomputeTargetOccurrences, normalizeUsfmFormatting), so neither survives as a
+// stored difference — but neither is "renumbering" or "blank-line reflow" either.
+//
+// NOT SUFFICIENT ON ITS OWN for a write decision, and the pristine caller does not
+// treat it as such. Review finding F1 measured two whitespace shapes this lens
+// normalizes away that CHANGE the rendered USFM — a text node `"and"` vs `"and "`
+// before a `\w`, and a whitespace-only separator between two `\w` nodes, both of
+// which render as a fused word token (the PR #417 class). So
+// bookReimport.ts's isNormalizedNoopVerseWrite ANDs this with a second condition:
+// the export's own renderer must emit identical bytes for both trees. See that
+// function for why both are needed and why neither is a superset of the other.
+//
+// That AND is also what settles the cost this lens would otherwise carry. On the
+// EDITED path (computeVerseMerge, no render check) the FIX 5 correction above still
+// stands: a Door43 maintainer's genuinely whitespace-only edit is classified
+// converged and silently reverted. On the pristine path it is not, because a
+// whitespace edit that survives our render makes the render check fail and the
+// verse WRITES. Callers must still count what they suppress (see bookReimport.ts's
+// `skipped_normalized`) so the class is never invisible.
+export function verseContentConverged(ours: string, theirs: string): boolean {
+  return keysEqual(stableKey(ours), stableKey(theirs));
 }
 
 export function computeVerseMerge(input: VerseMergeInput): VerseMergeResult {

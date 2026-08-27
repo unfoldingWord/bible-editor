@@ -909,6 +909,468 @@ console.log("\n[render round-trip churn on an edited verse writes nothing (held 
   eq(row.content_json, oursJson, "…and the stored bytes are untouched");
 }
 
+// ── Issue #609: the PRISTINE / AI-only writers get the same lens ────────────
+//
+// The characterization test directly above pins the EDITED path: stableKey holds
+// the round-trip gap there, so nothing reaches the write. A pristine verse
+// (updated_by IS NULL — the large majority of the corpus) never reaches
+// computeVerseMerge at all; its write decision was a raw string comparison, so a
+// verse whose render→reparse does not settle (16-19% of the corpus per STATE.md)
+// was rewritten and version-bumped for a change nobody could see. Not "every
+// verse every night": STATE.md measures round trips as convergent, and #609's own
+// query puts the observed repeat rate at 1.34 writes per touched verse over ~36
+// days — see verseMerge.ts's verseContentConverged for the measured numbers.
+//
+// The fixture is the SAME documented artifact pair the edited-path test uses —
+// a marker's `nextChar` flipping "\n" -> " ", and buildUsfm's blank-line reflow
+// absorbed into the following text node — so the two paths are provably held to
+// one lens, not two that can drift.
+const ROUNDTRIP_OURS = JSON.stringify({
+  verseObjects: [
+    { tag: "q1", type: "quote", nextChar: "\n" },
+    { type: "text", text: "In the beginning\n" },
+  ],
+});
+const ROUNDTRIP_THEIRS = JSON.stringify({
+  verseObjects: [
+    { tag: "q1", type: "quote", nextChar: " " },
+    { type: "text", text: "In the beginning\n\n" },
+  ],
+});
+
+console.log("\n[#609: render round-trip churn on a PRISTINE verse writes nothing and does not bump]");
+{
+  const { env, sqlite } = freshEnv();
+  sqlite
+    .prepare(
+      `INSERT INTO verses (book, chapter, verse, verse_end, bible_version, content_json, plain_text, version, updated_by)
+       VALUES (?, 11, 1, NULL, ?, ?, 'In the beginning', 3, NULL)`,
+    )
+    .run(BOOK, VERSION, ROUNDTRIP_OURS);
+
+  const counts = await applyVerseRowsForTest(
+    env,
+    BOOK,
+    VERSION,
+    [{ chapter: 11, verse: 1, verseEnd: null, contentJson: ROUNDTRIP_THEIRS, plainText: "In the beginning" }],
+    null,
+    null,
+    false,
+  );
+
+  eq(counts.skipped_normalized, 1, "the suppressed write is COUNTED — the class must never be invisible");
+  eq(counts.updated, 0, "…and no update landed");
+  eq(counts.skipped_noop, 0, "…and it is not laundered into the byte-equal no-op counter");
+
+  const row = sqlite
+    .prepare("SELECT content_json, version FROM verses WHERE book = ? AND chapter = 11 AND verse = 1 AND bible_version = ?")
+    .all(BOOK, VERSION)[0];
+  eq(row.version, 3, "the version does not move — THE assertion this fix exists for");
+  eq(row.content_json, ROUNDTRIP_OURS, "…and the stored bytes are untouched");
+  eq(
+    sqlite.prepare("SELECT COUNT(*) AS n FROM edit_log WHERE row_key = ?").all(`${BOOK}/11/1/${VERSION}`)[0].n,
+    0,
+    "…and no edit_log row was written for a write that never happened",
+  );
+}
+
+// The other half of the guard: without this, "stop writing" could be satisfied
+// by never writing at all, and master's real corrections would stop reaching D1.
+console.log("\n[#609: a REAL master change on a pristine verse still writes and still bumps]");
+{
+  const { env, sqlite } = freshEnv();
+  sqlite
+    .prepare(
+      `INSERT INTO verses (book, chapter, verse, verse_end, bible_version, content_json, plain_text, version, updated_by)
+       VALUES (?, 11, 2, NULL, ?, ?, 'In the beginning', 3, NULL)`,
+    )
+    .run(BOOK, VERSION, ROUNDTRIP_OURS);
+
+  // Same round-trip noise AS WELL AS a real word change, so this proves the lens
+  // does not swallow a genuine edit that arrives wearing the artifact.
+  const realChange = JSON.stringify({
+    verseObjects: [
+      { tag: "q1", type: "quote", nextChar: " " },
+      { type: "text", text: "In the very beginning\n\n" },
+    ],
+  });
+
+  const counts = await applyVerseRowsForTest(
+    env,
+    BOOK,
+    VERSION,
+    [{ chapter: 11, verse: 2, verseEnd: null, contentJson: realChange, plainText: "In the very beginning" }],
+    null,
+    null,
+    false,
+  );
+
+  eq(counts.updated, 1, "master's real edit is written");
+  eq(counts.skipped_normalized, 0, "…and is NOT suppressed by the lens");
+  const row = sqlite
+    .prepare("SELECT content_json, version FROM verses WHERE book = ? AND chapter = 11 AND verse = 2 AND bible_version = ?")
+    .all(BOOK, VERSION)[0];
+  eq(row.version, 4, "the version DOES move for a real content change");
+  eq(row.content_json, realChange, "…and master's bytes landed");
+}
+
+// A verse_end (bridge boundary) change is compared EXACTLY, never through the
+// lens — `\v 14` becoming `\v 14-15` is always a real change, and a content tree
+// that is otherwise lens-identical must not hide it.
+console.log("\n[#609: a verse_end change on a lens-identical tree still writes]");
+{
+  const { env, sqlite } = freshEnv();
+  sqlite
+    .prepare(
+      `INSERT INTO verses (book, chapter, verse, verse_end, bible_version, content_json, plain_text, version, updated_by)
+       VALUES (?, 11, 3, NULL, ?, ?, 'In the beginning', 3, NULL)`,
+    )
+    .run(BOOK, VERSION, ROUNDTRIP_OURS);
+
+  const counts = await applyVerseRowsForTest(
+    env,
+    BOOK,
+    VERSION,
+    [{ chapter: 11, verse: 3, verseEnd: 4, contentJson: ROUNDTRIP_THEIRS, plainText: "In the beginning" }],
+    null,
+    null,
+    false,
+  );
+
+  eq(counts.updated, 1, "the bridge boundary change is written");
+  eq(counts.skipped_normalized, 0, "…and never suppressed");
+  const row = sqlite
+    .prepare("SELECT verse_end, version FROM verses WHERE book = ? AND chapter = 11 AND verse = 3 AND bible_version = ?")
+    .all(BOOK, VERSION)[0];
+  eq(row.verse_end, 4, "master's bridge boundary landed");
+  eq(row.version, 4, "…and the version moved");
+}
+
+// The class `plain_text` CANNOT guard: a real change that is invisible in the
+// verse's readable text, so the whole discrimination rests on stableKey. Source
+// attrs on a `\zaln` milestone are compared exactly (they are not `text` /
+// `nextChar`), which is what makes a curated original-language fix — the NUM
+// 20-22 combining-mark class — still reach D1 on a pristine verse.
+console.log("\n[#609: a source-attr-only master fix (invisible in plain_text) still writes]");
+{
+  const { env, sqlite } = freshEnv();
+  const tree = (lemma) =>
+    JSON.stringify({
+      verseObjects: [
+        {
+          tag: "zaln",
+          type: "milestone",
+          strong: "H1254",
+          lemma,
+          content: "בָּרָ֣א",
+          children: [{ tag: "w", type: "word", text: "created" }],
+        },
+      ],
+    });
+  sqlite
+    .prepare(
+      `INSERT INTO verses (book, chapter, verse, verse_end, bible_version, content_json, plain_text, version, updated_by)
+       VALUES (?, 11, 4, NULL, ?, ?, 'created', 3, NULL)`,
+    )
+    .run(BOOK, VERSION, tree("בּרא"));
+
+  const counts = await applyVerseRowsForTest(
+    env,
+    BOOK,
+    VERSION,
+    [{ chapter: 11, verse: 4, verseEnd: null, contentJson: tree("בָּרָא"), plainText: "created" }],
+    null,
+    null,
+    false,
+  );
+
+  eq(counts.updated, 1, "the source-owned fix is written even though plain_text is identical");
+  eq(counts.skipped_normalized, 0, "…and never suppressed");
+  const row = sqlite
+    .prepare("SELECT content_json, version FROM verses WHERE book = ? AND chapter = 11 AND verse = 4 AND bible_version = ?")
+    .all(BOOK, VERSION)[0];
+  eq(JSON.parse(row.content_json).verseObjects[0].lemma, "בָּרָא", "master's corrected lemma landed");
+  eq(row.version, 4, "…and the version moved");
+}
+
+// #609 names this case explicitly and warns against suppressing it: the worst
+// repeat-writers in prod are chapter-front `\p` PILEUP, a genuinely GROWING
+// content difference (EZK/2/0/UST went 24 -> 25 -> 26 markers on consecutive
+// nights). A lens must never hide that — the fix for it is the collapse pass, not
+// a comparison that stops noticing. An added node changes the node array, which
+// stableKey cannot normalize away; this pins that.
+console.log("\n[#609: marker pileup is a REAL growing difference and still writes]");
+{
+  const { env, sqlite } = freshEnv();
+  const ours = JSON.stringify({
+    verseObjects: [
+      { tag: "p", type: "paragraph", nextChar: "\n" },
+      { type: "text", text: "In the beginning" },
+    ],
+  });
+  const pileup = JSON.stringify({
+    verseObjects: [
+      { tag: "p", type: "paragraph", nextChar: "\n" },
+      { tag: "p", type: "paragraph", nextChar: "\n" },
+      { type: "text", text: "In the beginning" },
+    ],
+  });
+  sqlite
+    .prepare(
+      `INSERT INTO verses (book, chapter, verse, verse_end, bible_version, content_json, plain_text, version, updated_by)
+       VALUES (?, 11, 5, NULL, ?, ?, 'In the beginning', 3, NULL)`,
+    )
+    .run(BOOK, VERSION, ours);
+
+  const counts = await applyVerseRowsForTest(
+    env,
+    BOOK,
+    VERSION,
+    [{ chapter: 11, verse: 5, verseEnd: null, contentJson: pileup, plainText: "In the beginning" }],
+    null,
+    null,
+    false,
+  );
+
+  eq(counts.updated, 1, "the extra marker node is written — pileup is content, not noise");
+  eq(counts.skipped_normalized, 0, "…and the lens does not hide it");
+  eq(
+    JSON.parse(
+      sqlite
+        .prepare("SELECT content_json FROM verses WHERE book = ? AND chapter = 11 AND verse = 5 AND bible_version = ?")
+        .all(BOOK, VERSION)[0].content_json,
+    ).verseObjects.length,
+    3,
+    "…master's node count landed",
+  );
+}
+
+// ── Review F1: the two shapes the stableKey lens gets WRONG ─────────────────
+//
+// These are why isNormalizedNoopVerseWrite does not stop at the lens. Both are
+// pure whitespace to `stableKey` — and both change the rendered USFM, fusing a
+// word onto its marker (`and\w God\w*`, `\w*\w`), which is the PR #417 /
+// stripMarkerTokens corruption class. usfmFormat.ts's insertSpaceAfterGluedMarker
+// does not repair either: its regex is anchored to a leading poetry marker.
+//
+// If either of these ever starts skipping, D1 has kept a fused-token tree that the
+// next nightly export publishes to Door43 as corrupt USFM.
+console.log("\n[#609 F1: a text node losing its trailing space before a \\w still writes (fused word token)]");
+{
+  const { env, sqlite } = freshEnv();
+  const spaced = JSON.stringify({
+    verseObjects: [{ type: "text", text: "and " }, { tag: "w", type: "word", text: "God" }],
+  });
+  const fused = JSON.stringify({
+    verseObjects: [{ type: "text", text: "and" }, { tag: "w", type: "word", text: "God" }],
+  });
+  sqlite
+    .prepare(
+      `INSERT INTO verses (book, chapter, verse, verse_end, bible_version, content_json, plain_text, version, updated_by)
+       VALUES (?, 13, 1, NULL, ?, ?, 'and God', 3, NULL)`,
+    )
+    .run(BOOK, VERSION, spaced);
+
+  const counts = await applyVerseRowsForTest(
+    env,
+    BOOK,
+    VERSION,
+    [{ chapter: 13, verse: 1, verseEnd: null, contentJson: fused, plainText: "and God" }],
+    null,
+    null,
+    false,
+  );
+
+  eq(counts.skipped_normalized, 0, "the lens calls this converged — the export-render check must still force the write");
+  eq(counts.updated, 1, "…so the write lands");
+  const row = sqlite
+    .prepare("SELECT content_json, version FROM verses WHERE book = ? AND chapter = 13 AND verse = 1 AND bible_version = ?")
+    .all(BOOK, VERSION)[0];
+  eq(row.version, 4, "…and the version moves");
+  eq(row.content_json, fused, "…and master's bytes landed, not D1's");
+}
+
+console.log("\n[#609 F1: a whitespace-only separator node between two \\w still writes (fused word token)]");
+{
+  const { env, sqlite } = freshEnv();
+  const separated = JSON.stringify({
+    verseObjects: [
+      { tag: "w", type: "word", text: "the" },
+      { type: "text", text: " " },
+      { tag: "w", type: "word", text: "LORD" },
+    ],
+  });
+  const fused = JSON.stringify({
+    verseObjects: [
+      { tag: "w", type: "word", text: "the" },
+      { tag: "w", type: "word", text: "LORD" },
+    ],
+  });
+  sqlite
+    .prepare(
+      `INSERT INTO verses (book, chapter, verse, verse_end, bible_version, content_json, plain_text, version, updated_by)
+       VALUES (?, 13, 2, NULL, ?, ?, 'the LORD', 3, NULL)`,
+    )
+    .run(BOOK, VERSION, separated);
+
+  const counts = await applyVerseRowsForTest(
+    env,
+    BOOK,
+    VERSION,
+    [{ chapter: 13, verse: 2, verseEnd: null, contentJson: fused, plainText: "the LORD" }],
+    null,
+    null,
+    false,
+  );
+
+  eq(counts.skipped_normalized, 0, "dropping the separator is not cosmetic — it fuses \\w* onto \\w");
+  eq(counts.updated, 1, "…so the write lands");
+  eq(
+    sqlite
+      .prepare("SELECT version FROM verses WHERE book = ? AND chapter = 13 AND verse = 2 AND bible_version = ?")
+      .all(BOOK, VERSION)[0].version,
+    4,
+    "…and the version moves",
+  );
+}
+
+// Review F2: the plain_text leg of the guard, which nothing else exercises. The
+// trees are lens-equal AND render-equal; only the stored plain_text disagrees, on
+// a real word. That must still write — plain_text is what search and the
+// translator's own reading view show.
+console.log("\n[#609 F2: lens-equal trees whose plain_text differs by a real word still write]");
+{
+  const { env, sqlite } = freshEnv();
+  const tree = JSON.stringify({ verseObjects: [{ type: "text", text: "In the beginning" }] });
+  sqlite
+    .prepare(
+      `INSERT INTO verses (book, chapter, verse, verse_end, bible_version, content_json, plain_text, version, updated_by)
+       VALUES (?, 13, 3, NULL, ?, ?, 'In the beginning', 3, NULL)`,
+    )
+    .run(BOOK, VERSION, tree);
+
+  const counts = await applyVerseRowsForTest(
+    env,
+    BOOK,
+    VERSION,
+    // Same tree bytes are impossible here (the raw fast path would catch them), so
+    // carry the documented nextChar artifact in the tree while plain_text moves.
+    [
+      {
+        chapter: 13,
+        verse: 3,
+        verseEnd: null,
+        contentJson: JSON.stringify({ verseObjects: [{ type: "text", text: "In the beginning\n" }] }),
+        plainText: "In the very beginning",
+      },
+    ],
+    null,
+    null,
+    false,
+  );
+
+  eq(counts.skipped_normalized, 0, "a real plain_text difference is never a normalized no-op");
+  eq(counts.updated, 1, "…the write lands");
+  eq(
+    sqlite
+      .prepare("SELECT plain_text FROM verses WHERE book = ? AND chapter = 13 AND verse = 3 AND bible_version = ?")
+      .all(BOOK, VERSION)[0].plain_text,
+    "In the very beginning",
+    "…and master's plain text landed",
+  );
+}
+
+// The AI-only branch carried the identical raw comparison a few lines above the
+// pristine one, so it churned the same way — on verses the AI pipeline wrote and
+// no human has ever touched.
+console.log("\n[#609: render round-trip churn on an AI-ONLY verse writes nothing and does not bump]");
+{
+  const { env, sqlite } = freshEnv();
+  sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (7, 707, 'ai-writer')`).run();
+  sqlite
+    .prepare(
+      `INSERT INTO verses (book, chapter, verse, verse_end, bible_version, content_json, plain_text, version, updated_by)
+       VALUES (?, 12, 1, NULL, ?, ?, 'In the beginning', 3, 7)`,
+    )
+    .run(BOOK, VERSION, ROUNDTRIP_OURS);
+  // What makes it AI-only rather than human-edited: the latest content edit_log
+  // row for this verse carries source 'ai_pipeline' (reimportClassify.ts's
+  // isReimportableRow).
+  sqlite
+    .prepare(
+      `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, payload_json, source, created_at)
+       VALUES ('verse', ?, ?, 7, 2, 3, 'update', ?, 'ai_pipeline', 100)`,
+    )
+    .run(`${BOOK}/12/1/${VERSION}`, BOOK, JSON.stringify({ plain_text: "In the beginning", content: ROUNDTRIP_OURS }));
+
+  const counts = await applyVerseRowsForTest(
+    env,
+    BOOK,
+    VERSION,
+    [{ chapter: 12, verse: 1, verseEnd: null, contentJson: ROUNDTRIP_THEIRS, plainText: "In the beginning" }],
+    null,
+    null,
+    false,
+  );
+
+  eq(counts.skipped_normalized, 1, "the suppressed AI-only re-seed is counted");
+  eq(counts.reimported_ai, 0, "…and no re-seed landed");
+  const row = sqlite
+    .prepare("SELECT content_json, version FROM verses WHERE book = ? AND chapter = 12 AND verse = 1 AND bible_version = ?")
+    .all(BOOK, VERSION)[0];
+  eq(row.version, 3, "the version does not move");
+  eq(row.content_json, ROUNDTRIP_OURS, "…and the stored bytes are untouched");
+  eq(
+    sqlite.prepare("SELECT COUNT(*) AS n FROM edit_log WHERE row_key = ?").all(`${BOOK}/12/1/${VERSION}`)[0].n,
+    1,
+    "…and no new edit_log row (only the seeded ai_pipeline one remains)",
+  );
+}
+
+console.log("\n[#609: a REAL master change on an AI-only verse still re-seeds and still bumps]");
+{
+  const { env, sqlite } = freshEnv();
+  sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (7, 707, 'ai-writer')`).run();
+  sqlite
+    .prepare(
+      `INSERT INTO verses (book, chapter, verse, verse_end, bible_version, content_json, plain_text, version, updated_by)
+       VALUES (?, 12, 2, NULL, ?, ?, 'In the beginning', 3, 7)`,
+    )
+    .run(BOOK, VERSION, ROUNDTRIP_OURS);
+  sqlite
+    .prepare(
+      `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, payload_json, source, created_at)
+       VALUES ('verse', ?, ?, 7, 2, 3, 'update', ?, 'ai_pipeline', 100)`,
+    )
+    .run(`${BOOK}/12/2/${VERSION}`, BOOK, JSON.stringify({ plain_text: "In the beginning", content: ROUNDTRIP_OURS }));
+
+  const realChange = JSON.stringify({
+    verseObjects: [
+      { tag: "q1", type: "quote", nextChar: " " },
+      { type: "text", text: "In the very beginning\n\n" },
+    ],
+  });
+
+  const counts = await applyVerseRowsForTest(
+    env,
+    BOOK,
+    VERSION,
+    [{ chapter: 12, verse: 2, verseEnd: null, contentJson: realChange, plainText: "In the very beginning" }],
+    null,
+    null,
+    false,
+  );
+
+  eq(counts.reimported_ai, 1, "master's real edit re-seeds the AI-only verse");
+  eq(counts.skipped_normalized, 0, "…and is NOT suppressed by the lens");
+  const row = sqlite
+    .prepare("SELECT content_json, version, updated_by FROM verses WHERE book = ? AND chapter = 12 AND verse = 2 AND bible_version = ?")
+    .all(BOOK, VERSION)[0];
+  eq(row.version, 4, "the version DOES move");
+  eq(row.content_json, realChange, "…master's bytes landed");
+  eq(row.updated_by, null, "…and the verse is reclaimed to master-owned, exactly as before this guard");
+}
+
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed`);
   process.exit(1);
