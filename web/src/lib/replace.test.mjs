@@ -2227,6 +2227,40 @@ function countAligned(content) {
   assert(!/\\q/.test(out), `reflow that changed a word removes the marker (got ${JSON.stringify(out)})`);
 }
 
+// --- Case 74d: the #606 guard has to hold on the tier that STRIPS markers.
+// A word unit split across leaves ("warrior’s") makes relayoutUnchangedWords
+// bail even though no word changed, so the edit lands on the reassembly engine
+// — which drops every marker from its output and depends entirely on Step 2 to
+// put them back. That is the path where reconciling against an empty capture is
+// unrecoverable, so it is worth pinning separately from Case 74.
+{
+  console.log("\n[Case 74d] Guard holds on the marker-stripping reassembly tier (#606)");
+  const verse = {
+    verseObjects: [
+      { type: "quote", tag: "q1" },
+      zaln("H1", [w("the"), t(" ")]),
+      zaln("H2", [w("warrior"), t("’"), w("s")]), // one token, three leaves
+      t(" "),
+      { type: "quote", tag: "q2" },
+      zaln("H3", [w("shield"), t(".")]),
+      t("”"),
+    ],
+  };
+  const old = extractEditableText(verse); // "\q1 the warrior’s \q2 shield.”"
+  const wellFormed = old.replace("”", "");
+  const chipsDropped = wellFormed.replace(/\\q\d?\s?/g, "").replace(/\s+/g, " ").trim();
+  const bad = smartEditVerse(verse, old, chipsDropped);
+  const out = extractEditableText(bad.content);
+  assert(
+    (out.match(/\\q/g) ?? []).length === 2,
+    `both markers survive on the reassembly tier (got ${JSON.stringify(out)})`,
+  );
+  assert(
+    out === extractEditableText(smartEditVerse(verse, old, wellFormed).content),
+    `matches the well-formed capture (got ${JSON.stringify(out)})`,
+  );
+}
+
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed.`);
   process.exit(1);
