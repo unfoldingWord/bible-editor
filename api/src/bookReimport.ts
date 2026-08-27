@@ -6601,6 +6601,15 @@ export async function runChunkedReimport(
   // checkMasterFreshness answer `no_watermark` (ok:true) and the export runs
   // anyway, so withholding would change nothing without a sentinel to refuse
   // against.
+  // ORDERING NOTE for the force-released case: this step runs BEFORE the chunk
+  // apply steps, so the "adopted, the export will publish this" banner is
+  // written before the adoption has actually landed. That is deliberate and is
+  // the safer of the two directions. Deferring it to the sync step would read
+  // more truthfully, but the sync step is skippable — a chapter lock, a systemic
+  // refusal, a thrown adoption batch all `continue` past it — and an override
+  // that consents to a data-loss risk must leave a record of having been used
+  // even on a run that then went sideways. A banner that slightly leads reality
+  // beats an override with no trace.
   const staleBaseEvents = plan.entries.filter((e) => e.staleBaseHold != null || e.staleBaseOverridden != null);
   if (staleBaseEvents.length > 0) {
     await step.do(`reimport-stalebase-${book}`, async () => {
