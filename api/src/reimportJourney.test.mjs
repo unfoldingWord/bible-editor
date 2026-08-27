@@ -1021,6 +1021,53 @@ console.log("\n[AI-vs-human conflict policy at the caller]");
     eq(readRow(sqlite).response, "a maintainer's fix", "an incomplete walk protects master exactly like a human commit");
     eq(counts.merge_kept_ai, 0, "…and does not report a kept AI conflict");
   }
+
+  // 7. Issue #607: the per-row narrowing itself, through the REAL call site
+  //    (applyTsvRows -> masterMayHoldHumanEditForVerse(cutoff.lineage,
+  //    row.chapter, row.verse)) — not just the pure computeTsvMerge decision,
+  //    which masterLineage.test.mjs already covers against two real richmahn
+  //    tn_JER.tsv commits. This is what proves row.chapter/row.verse are the
+  //    values actually threaded through, the same way #557's own per-verse
+  //    fix had to be proven at computeVerseMerge's caller, not just at
+  //    computeVerseMerge itself.
+  {
+    const humanTouchedElsewhere = {
+      mayHoldHumanEdit: true, hasHumanCommit: true, incomplete: false, incompleteReason: "",
+      counts: { ours: 1, ai: 0, human: 1 }, humanShas: ["abc123"],
+      // Complete per-ref evidence — but the human commit landed at 5:5, not at
+      // this row's own ref (1:2).
+      refsComplete: true, humanRefs: ["5:5"],
+    };
+    const { sqlite, env } = freshEnv();
+    const boundary = seedContested(sqlite);
+    const counts = await applyTsvRows(env, BOOK, "tq", [masterRowAt("the AI run's response")], null, {
+      confirmedAt: 200, editId: boundary, lineage: humanTouchedElsewhere,
+    });
+    const row = readRow(sqlite);
+    eq(
+      row.response, "our response",
+      "file-level mayHoldHumanEdit=true, but the human commit's own ref evidence never touched THIS row -> kept",
+    );
+    eq(counts.merge_kept_ai, 1, "…counted as merge_kept_ai, same as the file-level AI_ONLY case");
+    eq(counts.merge_adopted, 0, "…never counted as an adoption");
+  }
+  {
+    const humanTouchedThisRow = {
+      mayHoldHumanEdit: true, hasHumanCommit: true, incomplete: false, incompleteReason: "",
+      counts: { ours: 1, ai: 0, human: 1 }, humanShas: ["abc123"],
+      // Same shape, but this time the evidence DOES name this row's own ref.
+      refsComplete: true, humanRefs: ["1:2"],
+    };
+    const { sqlite, env } = freshEnv();
+    const boundary = seedContested(sqlite);
+    const counts = await applyTsvRows(env, BOOK, "tq", [masterRowAt("a maintainer's fix")], null, {
+      confirmedAt: 200, editId: boundary, lineage: humanTouchedThisRow,
+    });
+    const row = readRow(sqlite);
+    eq(row.response, "a maintainer's fix", "…and when the evidence DOES name this row, master still wins there");
+    eq(counts.merge_adopted, 1, "…counted as an adoption, same as the file-level HAS_HUMAN case");
+    eq(counts.merge_kept_ai, 0, "…and never as a kept AI conflict");
+  }
 }
 
 // ── merge_no_base_refs folds through the REAL addCounts (issue #537) ─────────

@@ -68,10 +68,12 @@ import {
   masterMayHoldHumanEditForVerse,
   mergeRefEvidence,
   parseDiffHunksForPath,
+  refsTouchedInTsv,
   refsTouchedInUsfm,
   summarizeLineage,
 } from "./masterLineage.ts";
 import { computeVerseMerge } from "./verseMerge.ts";
+import { computeTsvMerge } from "./tsvMerge.ts";
 
 let failed = 0;
 function eq(actual, expected, msg) {
@@ -886,6 +888,238 @@ console.log("\n[#557: every uncertainty resolves to the file-level answer]");
   const refs = Array.from({ length: LINEAGE_REF_CAP + 1 }, (_, i) => `1:${i + 1}`);
   eq(mergeRefEvidence([{ complete: true, refs, reason: "" }]).complete, false, "a ref set past the cap is incomplete");
   eq(mergeRefEvidence([{ complete: true, refs, reason: "" }]).reason, "ref_cap_exceeded", "...and says why");
+}
+
+// ── #607: the TSV half of #557's per-verse narrowing ────────────────────────
+//
+// #557 narrowed the lineage guard from "did a human touch this FILE" to "did
+// a human touch this VERSE" for ult/ust only — fetchHumanTouchedRefs refused
+// anything that did not end in `.usfm`. #607 gives tn/tq/twl the same
+// narrowing: a TSV row's ref is its own first column, so the map is per-line
+// and needs no \c/\v walk (see refsTouchedInTsv's header comment).
+//
+// THE FIXTURES ARE REAL, same standard as #557's:
+//
+//   api/src/fixtures/jer-tn-bbdc2cbc.diff   `Fixes lashes and periods`,
+//   api/src/fixtures/jer-tn-72a4062d.diff   `Fixes word before AT`,
+//                                           both Richard Mahn, unfoldingWord/en_tn
+//
+// are the commits' own unified diffs, byte-for-byte as git.door43.org served
+// them on 2026-08-27 (each is a whole-repo whitespace/punctuation sweep across
+// every tn_*.tsv file, which is why the path filter matters here too).
+//
+//   api/src/fixtures/jer-tn-*.rows.txt
+//
+// is tn_JER.tsv AS IT STOOD AT THAT COMMIT, reduced to only the lines the
+// commit's own hunks cover — real line NUMBER, real line TEXT, plus the
+// file's real line count. Unlike the USFM reduction, no \c/\v state needs
+// preserving: refsTouchedInTsv reads each covered line independently, so the
+// lines it never reads are provably irrelevant, not just presumed so. Both
+// files are produced by `scripts/extract-tsv-rows.mjs` (a full 40-char sha is
+// required — same trap as extract-usfm-markers.mjs: an abbreviated sha
+// silently serves master's current tip).
+console.log("\n[#607: the TSV hunk -> ref map, from two real richmahn commits]");
+
+const JER_TSV_PATH = "tn_JER.tsv";
+
+function loadTsvRevision(name) {
+  const rows = new Map();
+  let totalLines = 0;
+  for (const line of fixture(`${name}.rows.txt`).split("\n")) {
+    if (line === "" || line.startsWith("#")) continue;
+    const tab = line.indexOf("\t");
+    const key = line.slice(0, tab);
+    const val = line.slice(tab + 1);
+    if (key === "lines") {
+      totalLines = Number(val);
+      continue;
+    }
+    rows.set(Number(key), val);
+  }
+  // Filler that is NOT a valid ref column — if the mapper ever reads a line
+  // outside its hunks (a bug this fixture would otherwise hide), it fails
+  // loudly (unparseable_ref_column) instead of silently passing.
+  const lines = new Array(totalLines).fill("NOT-A-REAL-ROW\tunclaimed filler, never inside any hunk");
+  for (const [lineNo, val] of rows) lines[lineNo - 1] = val;
+  return { text: lines.join("\n"), totalLines };
+}
+
+const TN_COMMITS = [
+  { name: "jer-tn-bbdc2cbc", sha: "bbdc2cbc14974eb45ea9b1a8d0c9f995260b5e36", subject: "Fixes lashes and periods", hunks: 1, chapters: [22] },
+  { name: "jer-tn-72a4062d", sha: "72a4062d565c370c82f06a1c05513ebb1b776aed", subject: "Fixes word before AT", hunks: 3, chapters: [48, 51] },
+];
+
+const tnEvidence = [];
+for (const c of TN_COMMITS) {
+  const parsed = parseDiffHunksForPath(fixture(`${c.name}.diff`), JER_TSV_PATH);
+  eq(parsed.complete, true, `${c.subject}: its diff parses for ${JER_TSV_PATH}`);
+  eq(parsed.hunks.length, c.hunks, `${c.subject}: ${c.hunks} hunk(s) touch ${JER_TSV_PATH}`);
+  const rev = loadTsvRevision(c.name);
+  const ev = refsTouchedInTsv(rev.text, parsed.hunks);
+  eq(ev.complete, true, `${c.subject}: every hunk mapped to a ref`);
+  const chapters = [...new Set(ev.refs.map((r) => Number(r.split(":")[0])))].sort((a, b) => a - b);
+  eq(JSON.stringify(chapters), JSON.stringify(c.chapters), `${c.subject}: lands only in chapter(s) ${c.chapters.join(",")}`);
+  tnEvidence.push(ev);
+}
+eq(tnEvidence[0].refs.includes("22:19"), true, "commit 1 (single hunk) touched JER TN 22:19");
+eq(tnEvidence[1].refs.includes("48:8"), true, "commit 2 (three hunks) touched JER TN 48:8");
+eq(tnEvidence[1].refs.includes("51:55"), true, "...and 51:55");
+
+// The path filter matters here too: both commits are whole-repo sweeps.
+{
+  const other = parseDiffHunksForPath(fixture("jer-tn-bbdc2cbc.diff"), "tn_1KI.tsv");
+  eq(other.complete, true, "the same commit's 1KI hunks parse too (a different path in the same diff)");
+  eq(
+    parseDiffHunksForPath(fixture("jer-tn-bbdc2cbc.diff"), "tn_NOTABOOK.tsv").reason,
+    "path_not_in_diff",
+    "a path the commit never touched is NOT silently 'no hunks, nothing touched'",
+  );
+}
+
+const tnWindowEvidence = mergeRefEvidence(tnEvidence);
+eq(tnWindowEvidence.complete, true, "both commits mapped -> the window's evidence is complete");
+eq(tnWindowEvidence.refs.includes("22:19"), true, "the window touched JER TN 22:19");
+eq(tnWindowEvidence.refs.includes("48:8"), true, "...and 48:8");
+eq(tnWindowEvidence.refs.includes("40:5"), false, "the window did NOT touch JER TN 40:5");
+eq(tnWindowEvidence.refs.includes("40:*"), false, "...nor chapter 40 as a whole");
+
+console.log("\n[#607: the merge decision, per row]");
+
+const TN_WINDOW = summarizeLineage(
+  [
+    classifyMasterCommit({ sha: "5080d90444", message: "bible-editor: JER tn → master (#7415)", authorEmail: BW }),
+    classifyMasterCommit({ sha: TN_COMMITS[1].sha, message: TN_COMMITS[1].subject, authorEmail: RICH }),
+    classifyMasterCommit({ sha: TN_COMMITS[0].sha, message: TN_COMMITS[0].subject, authorEmail: RICH }),
+    classifyMasterCommit({ sha: "27bf9236aa", message: "bible-editor: JER tn → master (#7444)", authorEmail: BW }),
+  ],
+  { humanRefs: tnWindowEvidence },
+);
+const TN_SUMMARY = JSON.parse(JSON.stringify(compactLineage(TN_WINDOW)));
+
+eq(TN_SUMMARY.counts.human, 2, "the window holds Rich's two hand commits");
+eq(TN_SUMMARY.mayHoldHumanEdit, true, "the FILE-level answer is unchanged: a human did move this file");
+eq(TN_SUMMARY.refsComplete, true, "...and the per-row map is complete");
+
+// The decision the issue exists for — asked the way bookReimport.ts's
+// resolveEditedCandidates actually asks it: row.chapter, row.verse, no
+// verseEnd (a TSV bridge already collapses to its first verse in those
+// fields; see the ParsedTsvRow / refParts note this fix's call-site comment
+// cites).
+eq(masterMayHoldHumanEditForVerse(TN_SUMMARY, 22, 19), true, "a human DID touch JER TN 22:19");
+eq(masterMayHoldHumanEditForVerse(TN_SUMMARY, 48, 8), true, "...and 48:8");
+eq(masterMayHoldHumanEditForVerse(TN_SUMMARY, 51, 55), true, "...and 51:55");
+eq(masterMayHoldHumanEditForVerse(TN_SUMMARY, 40, 5), false, "no human touched JER TN 40:5");
+eq(masterMayHoldHumanEditForVerse(TN_SUMMARY, 1, 1), false, "...nor JER TN 1:1");
+
+{
+  // End to end, through computeTsvMerge itself — the same shape as the #557
+  // verse-merge block above, for the tn kind.
+  const base = { note: "the ancestor we last published" };
+  const ours = { note: "the translator's app edit" };
+  const theirs = { note: "the AI run sitting on master" };
+  eq(
+    computeTsvMerge("tn", base, ours, theirs, {
+      masterMayHoldHumanEdit: masterMayHoldHumanEditForVerse(TN_SUMMARY, 40, 5),
+    }).action,
+    "keep_ai_master",
+    "JER TN 40:5 both-changed -> keep_ai_master, not a revert (no human touched this row)",
+  );
+  eq(
+    computeTsvMerge("tn", base, ours, theirs, {
+      masterMayHoldHumanEdit: masterMayHoldHumanEditForVerse(TN_SUMMARY, 22, 19),
+    }).action,
+    "adopt_conflict",
+    "JER TN 22:19 both-changed -> adopt_conflict: master holds a real hand edit there",
+  );
+}
+
+console.log("\n[#607: every uncertainty resolves to the file-level answer, TSV side]");
+
+{
+  eq(refsTouchedInTsv("", [{ newStart: 1, newCount: 1 }]).reason, "empty_file", "an empty TSV file is incomplete");
+  {
+    const noHunks = refsTouchedInTsv("Reference\tID\n1:1\tabcd\n", []);
+    eq(noHunks.complete, true, "no hunks -> complete, nothing touched");
+    eq(noHunks.refs.length, 0, "...with an empty ref set");
+  }
+
+  const goodFile =
+    ["Reference\tID\tNote", "front:intro\taaaa\tintro note", "1:1\tbbbb\tfirst note", "1:2-3\tcccc\tbridged note"].join("\n") +
+    "\n";
+
+  eq(
+    refsTouchedInTsv(goodFile, [{ newStart: 1, newCount: 1 }]).reason,
+    "unparseable_ref_column",
+    "the header row's own column 1 ('Reference') does not parse as a ref",
+  );
+
+  {
+    // front:intro -> chapter 0, verse 0 — parseTsvRow's own convention
+    // (refParts in importParsers.ts), which the merge call site relies on.
+    const ev = refsTouchedInTsv(goodFile, [{ newStart: 2, newCount: 1 }]);
+    eq(ev.complete, true, "front:intro maps");
+    eq(JSON.stringify(ev.refs), JSON.stringify(["0:0"]), "...to 0:0");
+  }
+  {
+    // A bridge expands to every verse it covers, not the whole chapter — the
+    // ref itself states the range, unlike refsTouchedInUsfm's chapter-front
+    // case which has no such information to go on.
+    const ev = refsTouchedInTsv(goodFile, [{ newStart: 4, newCount: 1 }]);
+    eq(ev.complete, true, "a bridged ref maps");
+    eq(JSON.stringify([...ev.refs].sort()), JSON.stringify(["1:2", "1:3"]), "...to every verse it covers");
+  }
+  eq(
+    refsTouchedInTsv(goodFile, [{ newStart: 1, newCount: 999 }]).reason,
+    "hunk_past_end_of_file",
+    "a hunk past the end of the file is incomplete, never mapped to what is there",
+  );
+
+  eq(
+    refsTouchedInTsv(["Reference\tID", "not-a-ref\tabcd"].join("\n") + "\n", [{ newStart: 2, newCount: 1 }]).reason,
+    "unparseable_ref_column",
+    "garbage in the ref column is incomplete, never silently skipped",
+  );
+  eq(
+    refsTouchedInTsv(["Reference\tID", "totally malformed, no tab at all"].join("\n") + "\n", [{ newStart: 2, newCount: 1 }])
+      .complete,
+    false,
+    "a line with no tab separator reads whole as the ref column, and still fails safely",
+  );
+  eq(
+    refsTouchedInTsv(["Reference\tID", "front:intro-6\tabcd"].join("\n") + "\n", [{ newStart: 2, newCount: 1 }]).reason,
+    "unparseable_ref_column",
+    "'front:intro' with a trailing range is not a real shape",
+  );
+  eq(
+    refsTouchedInTsv(["Reference\tID", "1:9-3\tabcd"].join("\n") + "\n", [{ newStart: 2, newCount: 1 }]).reason,
+    "unparseable_ref_column",
+    "an inverted bridge (9-3) is not narrowed, not collapsed to a singleton",
+  );
+
+  {
+    // The cap is a degradation, same direction as refsTouchedInUsfm's.
+    const rows = ["Reference\tID"];
+    for (let i = 1; i <= LINEAGE_REF_CAP + 1; i++) rows.push(`1:${i}\tid${i}`);
+    const manyFile = rows.join("\n") + "\n";
+    const ev = refsTouchedInTsv(manyFile, [{ newStart: 2, newCount: LINEAGE_REF_CAP + 1 }]);
+    eq(ev.complete, false, "more refs than the cap degrades to the file-level answer");
+    eq(ev.reason, "ref_cap_exceeded", "...and says why");
+  }
+
+  {
+    // Zero-context pure deletion (newCount === 0): claims both sides of the
+    // join, same rule as refsTouchedInUsfm's.
+    const delFile = ["Reference\tID", "1:1\ta", "1:2\tb", "1:3\tc"].join("\n") + "\n";
+    const ev = refsTouchedInTsv(delFile, [{ newStart: 2, newCount: 0 }]);
+    eq(ev.complete, true, "a pure-deletion hunk maps");
+    eq(JSON.stringify([...ev.refs].sort()), JSON.stringify(["1:1", "1:2"]), "...claiming both sides of the join");
+  }
+
+  eq(
+    mergeRefEvidence([tnEvidence[0], { complete: false, refs: [], reason: "diff_fetch_failed" }]).complete,
+    false,
+    "one unmapped TSV commit makes the whole window incomplete",
+  );
 }
 
 if (failed) {

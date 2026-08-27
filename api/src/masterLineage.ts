@@ -709,6 +709,103 @@ export function refsTouchedInUsfm(fileText: string, hunks: HunkRange[]): HumanRe
   return { complete: true, refs: [...refs], reason: "" };
 }
 
+// ── TSV per-row mapping (issue #607) ─────────────────────────────────────
+//
+// refsTouchedInUsfm has to WALK the file, because a USFM line does not carry
+// its own verse — it inherits whatever \c/\v marker came before it. A TSV row
+// has no such problem: its ref IS column 1 ("40:5", "40:5-6", "front:intro"),
+// so the map is per-line and stateless. No state carried between lines, no
+// walk — just read each covered line's own first column.
+//
+// Same contract as refsTouchedInUsfm (HumanRefEvidence, same over-broad-in-
+// the-safe-direction posture, same requirement that `fileText` be the file AS
+// IT STOOD AT THAT COMMIT), and the same fail-safe direction: a ref column
+// that will not parse, a hunk past the end of the file, or a ref set past
+// LINEAGE_REF_CAP all return incomplete rather than guess.
+
+// "front" or a chapter number, then "intro" or a verse number, optionally
+// bridged ("5-6"). Anything else — a malformed ref, a header row's literal
+// "Reference" text — fails to parse, which is incomplete, which is
+// master-wins.
+const TSV_REF_RE = /^(front|\d+):(intro|\d+)(?:-(\d+))?$/;
+
+// One ref column -> the "c:v" keys it claims. A bridge ("5-6") expands to
+// every verse it covers rather than claiming the whole chapter — narrower,
+// and correct, because the ref ITSELF states the range; there is no hunk
+// boundary to reason about the way refsTouchedInUsfm's chapter-front case
+// has to. `front:intro` and `N:intro` both collapse to verse 0, matching
+// parseTsvRow's own convention in bookReimport.ts (via importParsers.ts's
+// refParts): the evidence computed here and the (chapter, verse) the merge
+// call site looks it up by must agree on what "this row's verse" means, or a
+// touched intro row would never be found.
+function parseTsvRefColumn(ref: string): string[] | null {
+  const m = TSV_REF_RE.exec(ref.trim());
+  if (!m) return null;
+  const chapter = m[1] === "front" ? 0 : Number(m[1]);
+  if (m[2] === "intro") {
+    if (m[3] !== undefined) return null; // "front:intro-6" is not a real shape
+    return [`${chapter}:0`];
+  }
+  const lo = Number(m[2]);
+  const hi = m[3] === undefined ? lo : Number(m[3]);
+  if (!Number.isFinite(lo) || !Number.isFinite(hi) || hi < lo || hi - lo > MAX_BRIDGE_WIDTH) return null;
+  const refs: string[] = [];
+  for (let v = lo; v <= hi; v++) refs.push(`${chapter}:${v}`);
+  return refs;
+}
+
+// Map new-side hunk ranges onto the TSV rows they touched. `fileText` must be
+// that exact revision, same requirement as refsTouchedInUsfm and for the same
+// reason (see its header comment). DELIBERATELY OVER-BROAD in the same way
+// too: a hunk's whole new-side span is claimed, context lines included — a
+// context line is a real row that existed at that revision, and claiming it
+// costs nothing but today's behavior for that row.
+export function refsTouchedInTsv(fileText: string, hunks: HunkRange[]): HumanRefEvidence {
+  if (typeof fileText !== "string" || fileText.length === 0) return REF_INCOMPLETE("empty_file");
+  if (hunks.length === 0) return { complete: true, refs: [], reason: "" };
+
+  const lines = fileText.split("\n");
+  // A trailing newline splits into one empty element that is not a row.
+  if (lines[lines.length - 1] === "") lines.pop();
+
+  const spans: Array<[number, number]> = [];
+  for (const h of hunks) {
+    if (!Number.isInteger(h.newStart) || !Number.isInteger(h.newCount) || h.newStart < 0 || h.newCount < 0) {
+      return REF_INCOMPLETE("bad_hunk_range");
+    }
+    if (h.newCount === 0) {
+      // A pure deletion. `newStart` is the line the removed row sat AFTER;
+      // claim both sides of the join, same as refsTouchedInUsfm.
+      const lo = Math.max(1, h.newStart);
+      if (lo > lines.length) return REF_INCOMPLETE("hunk_past_end_of_file");
+      spans.push([lo, Math.min(lines.length, h.newStart + 1)]);
+      continue;
+    }
+    const hi = h.newStart + h.newCount - 1;
+    if (h.newStart < 1 || hi > lines.length) return REF_INCOMPLETE("hunk_past_end_of_file");
+    spans.push([h.newStart, hi]);
+  }
+
+  const refs = new Set<string>();
+  for (const [lo, hi] of spans) {
+    for (let lineNo = lo; lineNo <= hi; lineNo++) {
+      const line = lines[lineNo - 1];
+      const tab = line.indexOf("\t");
+      const refCol = tab === -1 ? line : line.slice(0, tab);
+      const mapped = parseTsvRefColumn(refCol);
+      if (mapped === null) return REF_INCOMPLETE("unparseable_ref_column");
+      for (const r of mapped) refs.add(r);
+      if (refs.size > LINEAGE_REF_CAP) return REF_INCOMPLETE("ref_cap_exceeded");
+    }
+  }
+  // No "hunks touched nothing" guard here, unlike refsTouchedInUsfm: every
+  // covered line either fails to parse (returned above) or contributes at
+  // least one ref (parseTsvRefColumn never returns an empty array), so
+  // `hunks.length > 0` guarantees `refs.size > 0` by construction — the shape
+  // that guard exists to catch cannot occur on this per-line, stateless path.
+  return { complete: true, refs: [...refs], reason: "" };
+}
+
 // Union the per-commit evidence. One incomplete part makes the whole window
 // incomplete: the refs we DID map are not the whole set of verses a human
 // touched, and treating them as if they were is the un-protective error.

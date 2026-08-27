@@ -56,7 +56,6 @@ import {
   classifyMasterCommit,
   compactLineage,
   LINEAGE_REFINE_MAX_HUMAN_COMMITS,
-  masterMayHoldHumanEdit,
   masterMayHoldHumanEditForVerse,
   summarizeLineage,
   type HumanRefEvidence,
@@ -1729,10 +1728,16 @@ export async function applyTsvRows(
           bases.get(row.id)?.content ?? null,
           parsedRowToMergeSide(kind, storedTsvRowToParsed(kind, cur)),
           parsedRowToMergeSide(kind, row),
-          // #540 item 2. Always via the helper: an incomplete lineage walk must
-          // protect master exactly like a found human commit, and only
-          // masterMayHoldHumanEdit encodes that.
-          { masterMayHoldHumanEdit: masterMayHoldHumanEdit(cutoff?.lineage) },
+          // #540 item 2, narrowed per row by #607 (the tn/tq/twl half of
+          // #557's per-verse narrowing). Always via the helper: an incomplete
+          // lineage walk must protect master exactly like a found human
+          // commit, and only masterMayHoldHumanEditForVerse encodes that. No
+          // verseEnd — a TSV bridge ("40:5-6") already collapses to its first
+          // verse in `row.chapter`/`row.verse` (refParts), and refsTouchedInTsv
+          // expands that same bridge into every verse it covers when the row
+          // itself is the one a human commit touched, so the single-verse
+          // lookup still finds it.
+          { masterMayHoldHumanEdit: masterMayHoldHumanEditForVerse(cutoff?.lineage, row.chapter, row.verse) },
         );
         if (merge.action === "keep_no_base") {
           counts.merge_no_base++;

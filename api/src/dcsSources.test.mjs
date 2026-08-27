@@ -799,9 +799,42 @@ async function run() {
       assert(ev.complete === false && ev.reason === "diff_fetch_failed", "an oversized diff is refused");
     }
     {
+      // TSV routing (issue #607): a .tsv path now maps too, via refsTouchedInTsv
+      // instead of refsTouchedInUsfm — dispatched by extension. The mapping
+      // itself is pure and is tested against two real richmahn tn_JER.tsv
+      // commits in masterLineage.test.mjs; this is transport-only, same as the
+      // USFM block above.
+      const TSV_PATH = "tn_JER.tsv";
+      const TSV = ["Reference\tID\tNote", "40:1\taaaa\tfirst", "40:2\tbbbb\told note", "40:3\tcccc\tthird"].join("\n") + "\n";
+      const TSV_DIFF = [
+        `diff --git a/${TSV_PATH} b/${TSV_PATH}`,
+        `--- a/${TSV_PATH}`,
+        `+++ b/${TSV_PATH}`,
+        "@@ -3 +3 @@",
+        "-40:2\tbbbb\tstale note",
+        "+40:2\tbbbb\told note",
+        "",
+      ].join("\n");
+      serve([
+        [`git/commits/${SHA}.diff`, () => res({ body: TSV_DIFF, contentLength: TSV_DIFF.length })],
+        [`raw/${TSV_PATH}`, () => res({ body: TSV, contentLength: TSV.length })],
+      ]);
+      const ev = await fetchHumanTouchedRefs(env, "en_tn", TSV_PATH, [commit(SHA)]);
+      assert(ev.complete === true, "a mappable TSV human commit yields complete evidence");
+      assert(ev.refs.includes("40:2"), "  ...naming the ref its hunk landed in");
+      assert(!ev.refs.includes("40:1") && !ev.refs.includes("40:3"), "  ...and only that ref, not its neighbors");
+      assert(asked.length === 2, "  ...for exactly two subrequests: the diff and the file at that revision");
+      assert(asked[1].includes(`ref=${SHA}`), "  ...the file PINNED to that commit, not master's tip");
+    }
+    {
+      // A path that is neither .usfm nor .tsv is refused outright — there is
+      // no mapper for it, so the file-level answer stands.
       serve([]);
-      const ev = await fetchHumanTouchedRefs(env, "en_tn", "tn_JER.tsv", [commit(SHA)]);
-      assert(ev.complete === false && ev.reason === "not_usfm", "a TSV resource is not narrowed (it keeps the file-level answer)");
+      const ev = await fetchHumanTouchedRefs(env, "en_tn", "tn_JER.json", [commit(SHA)]);
+      assert(
+        ev.complete === false && ev.reason === "unsupported_path",
+        "a path with no mapper (neither .usfm nor .tsv) is not narrowed",
+      );
       assert(asked.length === 0, "  ...and costs nothing");
     }
     {

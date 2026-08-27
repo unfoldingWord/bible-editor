@@ -8,6 +8,7 @@ import {
   LINEAGE_REFINE_MAX_HUMAN_COMMITS,
   mergeRefEvidence,
   parseDiffHunksForPath,
+  refsTouchedInTsv,
   refsTouchedInUsfm,
   type HumanRefEvidence,
   type MasterCommit,
@@ -449,10 +450,14 @@ export async function fetchHumanTouchedRefs(
   path: string,
   humanCommits: MasterCommit[],
 ): Promise<HumanRefEvidence> {
-  // USFM only. tn/tq/twl carry their ref in the row itself — a different
-  // mapping, deliberately not attempted here, so those keep the file-level
-  // answer they have today (issue #607).
-  if (!path.toLowerCase().endsWith(".usfm")) return { complete: false, refs: [], reason: "not_usfm" };
+  // USFM and TSV both map (issue #607: TSV used to refuse here and keep the
+  // file-level answer — `not_usfm` — because only refsTouchedInUsfm existed).
+  // A TSV row carries its own ref in column 1, which is a different mapping
+  // from USFM's \c/\v walk, so which mapper runs is decided by extension.
+  const lowerPath = path.toLowerCase();
+  const isUsfm = lowerPath.endsWith(".usfm");
+  const isTsv = lowerPath.endsWith(".tsv");
+  if (!isUsfm && !isTsv) return { complete: false, refs: [], reason: "unsupported_path" };
   // No human commit is not "a complete map of no verses" — `{complete: true,
   // refs: []}` is the exact value this function refuses at the bottom as not
   // evidence, and it must not be constructed here either. Unreachable from the
@@ -494,7 +499,7 @@ export async function fetchHumanTouchedRefs(
       parts.push({ complete: false, refs: [], reason: "revision_fetch_failed" });
       break;
     }
-    const mapped = refsTouchedInUsfm(text, parsed.hunks);
+    const mapped = isUsfm ? refsTouchedInUsfm(text, parsed.hunks) : refsTouchedInTsv(text, parsed.hunks);
     parts.push(mapped);
     if (mapped.complete !== true) break;
   }

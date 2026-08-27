@@ -320,9 +320,12 @@ function attributeField(
 // identical in meaning and in fail-safe direction to computeVerseMerge's field
 // of the same name: FALSE only when a COMPLETE commit-lineage walk of master's
 // file since the ancestor found nothing but our own export commits and
-// bp-assistant pushes. Callers pass `masterMayHoldHumanEdit(lineage)` — the
-// helper in masterLineage.ts — never a boolean of their own making. Omitted
-// means the caller never looked, which keeps today's master-wins behavior.
+// bp-assistant pushes. Callers pass `masterMayHoldHumanEditForVerse(lineage,
+// row.chapter, row.verse)` — narrowed per row since #607, the tn/tq/twl half
+// of #557's per-verse narrowing — or the file-level `masterMayHoldHumanEdit
+// (lineage)` before a per-ref map exists; both live in masterLineage.ts.
+// Never a boolean of the caller's own making. Omitted means the caller never
+// looked, which keeps today's master-wins behavior.
 export function computeTsvMerge(
   kind: TsvMergeKind,
   base: TsvMergeSide | null,
