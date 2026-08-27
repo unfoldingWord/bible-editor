@@ -2810,6 +2810,17 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         "info",
       );
     }
+    // The editor handed back text with none of its paragraph/poetry marks and
+    // no word changed, so the engine restored them rather than wipe the verse's
+    // lineation (#606). That is the right call for a dropped-chip capture, but
+    // it also overrides a translator who genuinely meant to remove every mark in
+    // the same save — so say so, and name the way to do it.
+    if (result.markerCaptureGuarded) {
+      pushPipelineToast(
+        `Paragraph and poetry marks were restored in ${book} ${chapterNum}:${verseNum} ${bibleVersion} — the editor lost them during this edit. To remove them on purpose, delete the marks in a save of their own.`,
+        "info",
+      );
+    }
     const newPlainText = extractPlainText(result.content);
     const newDto = {
       ...effectiveBase,

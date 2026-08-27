@@ -27,6 +27,11 @@ export interface SmartReplaceResult {
   content: unknown;
   plainText: string;
   preservedAlignment: boolean;
+  // Set when the dropped-marker-chip guard overrode the captured layout and
+  // restored the baseline's paragraph/poetry marks (#606). The save path
+  // surfaces this to the translator, because the override can also revert a
+  // deliberate marker removal — see markerCaptureLooksDropped.
+  markerCaptureGuarded?: boolean;
 }
 
 interface Leaf {
@@ -1668,6 +1673,27 @@ function lineBreakMarkerCount(plain: string): number {
 // else) never reaches here; the caller handles it as its own case. What this
 // leaves is "the punctuation moved and, at the same instant, all the lineation
 // vanished" — which no editing gesture produces, but a dropped chip does.
+//
+// SCOPE: this covers only the punctuation-only slice. A capture that drops chips
+// while ALSO changing a word, or that drops only SOME of them, still loses those
+// markers. It has to — from the text alone those are indistinguishable from a
+// translator deliberately deleting a marker. This is a backstop, not the cure;
+// the root fix is the capture bug (#642).
+//
+// THE TRADE, accepted deliberately: this ALSO overrides a translator who really
+// did mean to delete every mark in a save that changed punctuation as well.
+// Their removal is reverted. The ambiguity is fundamental — nothing in the text
+// separates the two — so the only choice is which way to be wrong, and the
+// reverse error is the one that silently destroyed a chapter's poetry lineation
+// and shipped it to Door43. Two things bound the cost:
+//   * A marker deletion with NO other change is a PURE marker edit, which never
+//     reaches this function and is always honored. "Delete the marks in a save
+//     of their own" is the escape hatch.
+//   * The save path raises a toast naming what was restored and how to remove it
+//     on purpose, so the override is visible to the translator, not just to a
+//     developer reading console.warn.
+// Codex raised the silent-revert in review of #645; the toast is the answer to
+// it. Case 74j pins the behavior so that changing it fails a test.
 function markerCaptureLooksDropped(
   oldPlain: string,
   newPlain: string,
@@ -2287,9 +2313,13 @@ export function smartEditVerse(
     // alignment on disk. smartRebuildRange prunes its own output, but the other
     // tiers don't, so prune globally here. Then clear any empty text it exposes.
     const normalized = pruneEmptyText(pruneDeadMilestones(normalizeWordPunctuation(verseObjects)));
-    return { ...result, content: { verseObjects: normalized } };
+    return {
+      ...result,
+      content: { verseObjects: normalized },
+      ...(captureDroppedMarkers ? { markerCaptureGuarded: true } : {}),
+    };
   }
-  return result;
+  return captureDroppedMarkers ? { ...result, markerCaptureGuarded: true } : result;
 }
 
 // Full raw text length of a verseObjects node, recursing into milestone

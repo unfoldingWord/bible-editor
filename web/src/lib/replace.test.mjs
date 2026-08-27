@@ -2478,12 +2478,23 @@ function countAligned(content) {
   }
 }
 
-// --- Case 74j: pins the DOCUMENTED trade-off. A translator who deletes every
-// marker AND changes punctuation in one save is overridden by the guard — their
-// marker deletion does not stick. That is deliberate: from the text alone it is
-// indistinguishable from a dropped-chip capture, and silently destroying a
-// verse's lineation is the worse failure. Recorded here so the choice is in
-// code, not only in a comment, and so that changing it fails a test.
+// --- Case 74j: pins the DOCUMENTED trade-off, BY DESIGN.
+//
+// A translator who deletes every marker AND changes punctuation in the same save
+// is overridden: their marker deletion is reverted. That is deliberate. From the
+// text alone this is indistinguishable from a dropped-chip capture, so the only
+// choice is which way to be wrong, and the reverse error is the one that
+// silently destroyed HOS 11's poetry lineation and shipped it to Door43 (#606).
+//
+// Two things bound the cost, and both are asserted here:
+//   * THE ESCAPE HATCH — deleting markers with NO other change is a pure marker
+//     edit, which never reaches the guard and is always honored (Case 74b). So
+//     the translator's route is "delete the marks in a save of their own".
+//   * THE NOTICE — the result carries `markerCaptureGuarded`, which the Shell
+//     save path turns into a toast telling the translator what was restored and
+//     how to remove it on purpose. Codex flagged in review of #645 that the
+//     override was invisible to users (console.warn reaches developers only);
+//     this flag is what makes it visible.
 {
   console.log("\n[Case 74j] Deliberate delete-all-markers + punctuation change IS overridden (#606)");
   const verse = {
@@ -2512,6 +2523,22 @@ function countAligned(content) {
     warnings.some((x) => x.includes("#606")),
     `the override is announced on console.warn (got ${JSON.stringify(warnings)})`,
   );
+  // The flag the Shell save path reads to raise the user-facing toast. Without
+  // it the override is invisible to the person it affects.
+  assert(
+    r.markerCaptureGuarded === true,
+    `the result flags the override for the UI (got ${JSON.stringify(r.markerCaptureGuarded)})`,
+  );
+
+  // The escape hatch must stay open: the SAME deletion, with no other change,
+  // is honored and raises no notice.
+  const markersOnly = old.replace(/\\q\d?\s?/g, "").replace(/\s+/g, " ").trim();
+  const pure = smartEditVerse(verse, old, markersOnly, { capturedFromDom: true });
+  assert(
+    !/\\q/.test(extractEditableText(pure.content)),
+    `a marker-only deletion is still honored (got ${JSON.stringify(extractEditableText(pure.content))})`,
+  );
+  assert(!pure.markerCaptureGuarded, "the honored deletion raises no override notice");
 }
 
 if (failed > 0) {
