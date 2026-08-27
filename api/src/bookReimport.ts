@@ -204,12 +204,15 @@ export interface ReimportCounts {
   //
   // Why it is separate from `skipped_noop`: that counter means "master and D1 are
   // byte-identical", a fact nobody has to think about. This one means "we chose
-  // NOT to adopt a real byte difference", which carries a real, decided cost — a
-  // genuinely whitespace-only Door43 edit on a pristine verse is now kept out of
-  // D1 and reverted by the next export, exactly as `merge_cosmetic_ignored`
-  // already reports for edited verses. Folding the two together would make that
-  // cost invisible, which is the failure mode STATE.md's "absent measurement is
-  // not evidence" lesson is about. verses only — TSV rows have their own lens
+  // NOT to adopt a real byte difference", which carries a real cost — a genuinely
+  // whitespace-only Door43 edit on a pristine verse is now kept out of D1 and
+  // reverted by the next export, exactly as `merge_cosmetic_ignored` already
+  // reports for edited verses. Folding the two together would make that cost
+  // invisible, which is the failure mode STATE.md's "absent measurement is not
+  // evidence" lesson is about — so this counter is ALSO reported by
+  // summarizeReimport (web/src/lib/reimportSummary.ts), not just dumped in the
+  // admin counters, or the one human-facing path would still say "N unchanged"
+  // about verses that were not. verses only — TSV rows have their own lens
   // (tsvMerge.ts) on their own paths.
   skipped_normalized: number;
   // Incoming row not inserted because an identical-content row already exists
@@ -3393,7 +3396,14 @@ function reconcileEditedVerseSourceAttrs(
 //     the only differences it can still carry are the whitespace the same lens
 //     already collapses inside the tree. An exact compare here would re-introduce
 //     the churn on the very artifact (a trailing newline absorbed into the
-//     following text node) this fix exists to suppress.
+//     following text node) this fix exists to suppress. It is D1's STORED
+//     plain_text, deliberately, not one recomputed from D1's content_json: a
+//     stored value that has drifted from its own tree then differs from master's
+//     and we WRITE, which both repairs the drift and is the safe direction. The
+//     mirror-image shape (D1's tree corrupted while its stored plain_text still
+//     reads correctly) would be suppressed instead — no live write path was found
+//     that produces it on a PRISTINE row, so it is recorded here as a known
+//     latent, not defended as impossible.
 //   - `content_json` goes through verseContentConverged (verseMerge.ts's
 //     stableKey), whose per-rule safety arguments live in that module.
 // Nothing here changes what is WRITTEN — only whether a write happens at all.
@@ -3675,11 +3685,14 @@ async function applyVerseRows(
         } else if (isNormalizedNoopVerseWrite(ex, v)) {
           // Issue #609. Raw bytes differ, the lens says nothing did. Skipping the
           // re-seed also skips its ownership reclaim (updated_by -> NULL), so this
-          // verse stays AI-owned for another night — which is exactly what the
-          // byte-equal branch directly above has always done for the same class of
-          // verse, so this widens an existing, stable outcome rather than creating
-          // a new one: isReimportableRow routes it back here every night, reaching
-          // the same decision until master or D1 actually moves.
+          // verse stays AI-owned indefinitely — not just for one night, since
+          // isReimportableRow routes it back here and reaches the same decision
+          // until master or D1 actually moves. Stated plainly rather than sold as
+          // harmless: the byte-equal branch directly above has always deferred the
+          // reclaim the same way for the same class of verse, and nothing found
+          // reads `verses.updated_by` for a verse in a way this changes (export's
+          // offender provenance keys off edit_log's latest_source, which is
+          // unaffected) — but this does extend that deferral to a wider set.
           counts.skipped_normalized++;
         } else {
           aiReseeds.push({ v, oldVersion: ex.version });
@@ -3874,10 +3887,12 @@ async function applyVerseRows(
     }
     // Issue #609. The raw comparison above is the cheap fast path; this is the
     // same difference seen through the lens the edited path already trusts. A
-    // pristine verse is the majority of the corpus, and before this branch every
-    // one of them whose render→reparse does not settle was rewritten and
-    // version-bumped EVERY night, forever — a fresh version, a fresh edit_log row
-    // and every open tab's If-Match invalidated for a change nobody could see.
+    // pristine verse is the majority of the corpus, and before this branch one
+    // whose render→reparse does not settle was rewritten and version-bumped for a
+    // change nobody could see — a fresh version, a fresh edit_log row and every
+    // open tab's If-Match invalidated. See verseMerge.ts's `verseContentConverged`
+    // for the measured size of that class (smaller than "every verse every night"
+    // — round trips converge) and for the cost this suppression accepts.
     if (isNormalizedNoopVerseWrite(ex, v)) {
       counts.skipped_normalized++;
       continue;
@@ -4554,6 +4569,15 @@ async function applyVerseRowsPerRow(
           updated_by: number | null;
           latest_source: string | null;
         }>();
+      // Issue #609 deliberately does NOT add its normalization lens here, and this
+      // is not drift-by-omission: this function is only ever called with verses
+      // the batched path had ALREADY staged for a write, so a verse the lens
+      // suppressed can never reach it, and adding the lens here would change
+      // nothing except which counter a human-edited verse lands in. If that
+      // calling contract ever changes — if this becomes reachable for verses the
+      // batched diff skipped — this comparison has to grow the same lens the
+      // pristine/AI-only branches use (isNormalizedNoopVerseWrite) or the churn
+      // comes back through the fallback.
       if (
         existing &&
         existing.content_json === v.contentJson &&

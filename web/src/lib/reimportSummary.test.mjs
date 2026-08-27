@@ -208,6 +208,26 @@ eq(
   "the actionable blocked-row count comes BEFORE the informational reclaimed line",
 );
 
+console.log("\n-- lens-suppressed verses (issue #609) --");
+
+// The failure this guards: a pull on a chapter the last export reflowed can put
+// EVERY verse in skipped_normalized and nothing anywhere else. Before this line
+// existed, `parts` came back empty and the snackbar said "no changes" — asserting
+// an equality nobody measured, about verses that did differ from Door43 and whose
+// difference the sync declined to adopt.
+const suppressed = summarizeReimport(res({ skipped_normalized: 12 }));
+lacks(suppressed, "no changes", "a run that only suppressed writes never reports 'no changes'");
+has(suppressed, "12 unchanged apart from formatting", "…it says how many, and why they were left alone");
+
+// …and it must stay distinguishable from the byte-equal no-op count, which is a
+// different fact: those verses really were identical to Door43's.
+const bothNoops = summarizeReimport(res({ skipped_noop: 4, skipped_normalized: 2 }));
+has(bothNoops, "4 unchanged,", "byte-equal verses keep their own plain 'unchanged' count");
+has(bothNoops, "2 unchanged apart from formatting", "…and the lens-suppressed ones are reported separately");
+
+// Absent (a Worker response predating the counter) must behave like 0.
+lacks(summarizeReimport(res({})), "apart from formatting", "field absent -> no line");
+
 if (failed > 0) {
   console.error(`\n${failed} failure(s)`);
   process.exit(1);

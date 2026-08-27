@@ -337,25 +337,45 @@ function keysEqual(a: string | null, b: string | null): boolean {
 
 // Issue #609: the SAME lens step 1 (`keep_converged`) uses, exposed for the
 // nightly sync's PRISTINE and AI-only verse writers, which never reach
-// computeVerseMerge at all — they compared master's bytes to D1's raw, so any
-// verse where our own render→reparse does not settle (16-19% of the corpus,
-// STATE.md) was rewritten and version-bumped every single night with nothing a
-// translator could see having changed.
+// computeVerseMerge at all — they compared master's bytes to D1's raw, so a verse
+// where our own render→reparse does not settle (16-19% of the corpus, STATE.md)
+// was rewritten and version-bumped with nothing a translator could see having
+// changed.
+//
+// MAGNITUDE, stated at the size it was actually measured. This is NOT "every
+// verse, every night, forever": STATE.md measures round trips as CONVERGENT, not
+// oscillating — a verse differs once and then stabilizes over 5 passes. What #539
+// measured is that 7,461 of 11,768 sync verse writes (63.4%) landed on a verse the
+// sync had already rewritten before, i.e. 1.34 writes per touched verse over ~36
+// days, and #609 warns — with evidence — that the WORST repeaters (LAM/1/22/UST,
+// EZK/2/0/UST) are `\p` marker PILEUP, a genuinely growing content difference no
+// lens should suppress and this one does not (a changed node array is never
+// lens-equal). How much of the remaining churn this lens actually removes is
+// unmeasured; do not cite this comment as if it were measured.
 //
 // Returns true ONLY when both sides parse AND their normalized forms match, so
 // unparseable JSON on either side is never "converged" — the caller writes, which
 // is the pre-existing behavior. Every safety argument above `normalizeForCompare`
 // and `dropOccurrenceForWordNodes` applies unchanged: each rule can only ever move
-// a comparison FROM "different" TOWARD "equal", and only for the artifact classes
-// they enumerate (whitespace-only differences, target-`\w` occurrence renumbering,
-// empty/absent text and nextChar). It cannot report equality for a tree whose node
-// array actually gained, lost or reordered a node.
+// a comparison FROM "different" TOWARD "equal". It cannot report equality for a
+// tree whose node array actually gained, lost or reordered a node.
 //
-// The trade-off is the same one this module already accepts for edited verses, now
-// widened to the pristine majority of the corpus: a Door43 maintainer genuinely
-// adding a missing space after a comma on a pristine verse stops being adopted and
-// is reverted by the next export. Callers must count what they suppress (see
-// bookReimport.ts's `skipped_normalized`) so the class is never invisible.
+// What the rules suppress is slightly WIDER than the artifacts that motivated
+// them, so read them as written, not as a list of causes: a target `\w`'s
+// occurrence/occurrences compare equal when one side merely OMITS them (not only
+// when they are renumbered), and a whitespace-only text node dropped next to an
+// in-flow marker compares equal too. Both are re-derived on export
+// (recomputeTargetOccurrences, normalizeUsfmFormatting), so neither survives as a
+// stored difference — but neither is "renumbering" or "blank-line reflow" either.
+//
+// COST, and its standing decision. A Door43 maintainer genuinely adding a missing
+// space after a comma stops being adopted and is reverted by the next export. This
+// module already accepts that for EDITED verses (see the FIX 5 correction above).
+// Extending it to the pristine majority of the corpus is a WIDER blast radius, and
+// issue #609 asks for the owner's explicit ruling on it rather than an inherited
+// one — do not read this comment as that ruling having been given. Callers must
+// count what they suppress (see bookReimport.ts's `skipped_normalized`) so the
+// class is never invisible.
 export function verseContentConverged(ours: string, theirs: string): boolean {
   return keysEqual(stableKey(ours), stableKey(theirs));
 }

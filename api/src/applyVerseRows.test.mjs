@@ -914,9 +914,12 @@ console.log("\n[render round-trip churn on an edited verse writes nothing (held 
 // The characterization test directly above pins the EDITED path: stableKey holds
 // the round-trip gap there, so nothing reaches the write. A pristine verse
 // (updated_by IS NULL — the large majority of the corpus) never reaches
-// computeVerseMerge at all; its write decision was a raw string comparison, so
-// every verse whose render→reparse does not settle (16-19% of the corpus per
-// STATE.md) was rewritten and version-bumped every single night, forever.
+// computeVerseMerge at all; its write decision was a raw string comparison, so a
+// verse whose render→reparse does not settle (16-19% of the corpus per STATE.md)
+// was rewritten and version-bumped for a change nobody could see. Not "every
+// verse every night": STATE.md measures round trips as convergent, and #609's own
+// query puts the observed repeat rate at 1.34 writes per touched verse over ~36
+// days — see verseMerge.ts's verseContentConverged for the measured numbers.
 //
 // The fixture is the SAME documented artifact pair the edited-path test uses —
 // a marker's `nextChar` flipping "\n" -> " ", and buildUsfm's blank-line reflow
@@ -1041,6 +1044,105 @@ console.log("\n[#609: a verse_end change on a lens-identical tree still writes]"
     .all(BOOK, VERSION)[0];
   eq(row.verse_end, 4, "master's bridge boundary landed");
   eq(row.version, 4, "…and the version moved");
+}
+
+// The class `plain_text` CANNOT guard: a real change that is invisible in the
+// verse's readable text, so the whole discrimination rests on stableKey. Source
+// attrs on a `\zaln` milestone are compared exactly (they are not `text` /
+// `nextChar`), which is what makes a curated original-language fix — the NUM
+// 20-22 combining-mark class — still reach D1 on a pristine verse.
+console.log("\n[#609: a source-attr-only master fix (invisible in plain_text) still writes]");
+{
+  const { env, sqlite } = freshEnv();
+  const tree = (lemma) =>
+    JSON.stringify({
+      verseObjects: [
+        {
+          tag: "zaln",
+          type: "milestone",
+          strong: "H1254",
+          lemma,
+          content: "בָּרָ֣א",
+          children: [{ tag: "w", type: "word", text: "created" }],
+        },
+      ],
+    });
+  sqlite
+    .prepare(
+      `INSERT INTO verses (book, chapter, verse, verse_end, bible_version, content_json, plain_text, version, updated_by)
+       VALUES (?, 11, 4, NULL, ?, ?, 'created', 3, NULL)`,
+    )
+    .run(BOOK, VERSION, tree("בּרא"));
+
+  const counts = await applyVerseRowsForTest(
+    env,
+    BOOK,
+    VERSION,
+    [{ chapter: 11, verse: 4, verseEnd: null, contentJson: tree("בָּרָא"), plainText: "created" }],
+    null,
+    null,
+    false,
+  );
+
+  eq(counts.updated, 1, "the source-owned fix is written even though plain_text is identical");
+  eq(counts.skipped_normalized, 0, "…and never suppressed");
+  const row = sqlite
+    .prepare("SELECT content_json, version FROM verses WHERE book = ? AND chapter = 11 AND verse = 4 AND bible_version = ?")
+    .all(BOOK, VERSION)[0];
+  eq(JSON.parse(row.content_json).verseObjects[0].lemma, "בָּרָא", "master's corrected lemma landed");
+  eq(row.version, 4, "…and the version moved");
+}
+
+// #609 names this case explicitly and warns against suppressing it: the worst
+// repeat-writers in prod are chapter-front `\p` PILEUP, a genuinely GROWING
+// content difference (EZK/2/0/UST went 24 -> 25 -> 26 markers on consecutive
+// nights). A lens must never hide that — the fix for it is the collapse pass, not
+// a comparison that stops noticing. An added node changes the node array, which
+// stableKey cannot normalize away; this pins that.
+console.log("\n[#609: marker pileup is a REAL growing difference and still writes]");
+{
+  const { env, sqlite } = freshEnv();
+  const ours = JSON.stringify({
+    verseObjects: [
+      { tag: "p", type: "paragraph", nextChar: "\n" },
+      { type: "text", text: "In the beginning" },
+    ],
+  });
+  const pileup = JSON.stringify({
+    verseObjects: [
+      { tag: "p", type: "paragraph", nextChar: "\n" },
+      { tag: "p", type: "paragraph", nextChar: "\n" },
+      { type: "text", text: "In the beginning" },
+    ],
+  });
+  sqlite
+    .prepare(
+      `INSERT INTO verses (book, chapter, verse, verse_end, bible_version, content_json, plain_text, version, updated_by)
+       VALUES (?, 11, 5, NULL, ?, ?, 'In the beginning', 3, NULL)`,
+    )
+    .run(BOOK, VERSION, ours);
+
+  const counts = await applyVerseRowsForTest(
+    env,
+    BOOK,
+    VERSION,
+    [{ chapter: 11, verse: 5, verseEnd: null, contentJson: pileup, plainText: "In the beginning" }],
+    null,
+    null,
+    false,
+  );
+
+  eq(counts.updated, 1, "the extra marker node is written — pileup is content, not noise");
+  eq(counts.skipped_normalized, 0, "…and the lens does not hide it");
+  eq(
+    JSON.parse(
+      sqlite
+        .prepare("SELECT content_json FROM verses WHERE book = ? AND chapter = 11 AND verse = 5 AND bible_version = ?")
+        .all(BOOK, VERSION)[0].content_json,
+    ).verseObjects.length,
+    3,
+    "…master's node count landed",
+  );
 }
 
 // The AI-only branch carried the identical raw comparison a few lines above the
