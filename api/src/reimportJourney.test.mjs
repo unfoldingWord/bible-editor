@@ -1068,6 +1068,42 @@ console.log("\n[AI-vs-human conflict policy at the caller]");
     eq(counts.merge_adopted, 1, "…counted as an adoption, same as the file-level HAS_HUMAN case");
     eq(counts.merge_kept_ai, 0, "…and never as a kept AI conflict");
   }
+
+  // 9. PR #644 review finding F2: the per-ref evidence is keyed to the ref AS
+  //    IT STOOD when the human's own commit touched it — but a LATER bot/AI
+  //    commit can move a row's Reference before this run's HEAD parse (the
+  //    real, independently-tracked ref_moved phenomenon covered above, issue
+  //    #588). Checking only `row`'s CURRENT ref (master's fresh parse) would
+  //    miss evidence recorded under the OLD ref and wrongly let master's
+  //    later content win a both-changed conflict over a genuine human edit.
+  //    The call site now ALSO checks `cur`'s (D1's own last-known) ref,
+  //    OR'd in — strictly protective, since OR can only add coverage.
+  {
+    const humanTouchedOldRef = {
+      mayHoldHumanEdit: true, hasHumanCommit: true, incomplete: false, incompleteReason: "",
+      counts: { ours: 1, ai: 0, human: 1 }, humanShas: ["def456"],
+      // Evidence recorded under the OLD ref (1:2) — where the human's own
+      // commit actually landed, before a later commit moved the row.
+      refsComplete: true, humanRefs: ["1:2"],
+    };
+    const { sqlite, env } = freshEnv();
+    const boundary = seedContested(sqlite); // D1's cur row: still at chapter=1, verse=2
+    // Master's CURRENT HEAD: this same id now sits at 1:9 (moved since the
+    // human's commit) and its content changed too.
+    const moved = { ...masterRowAt("a maintainer's fix at the new ref"), refRaw: "1:9", verse: 9 };
+    const counts = await applyTsvRows(env, BOOK, "tq", [moved], null, {
+      confirmedAt: 200, editId: boundary, lineage: humanTouchedOldRef,
+    });
+    const row = readRow(sqlite);
+    eq(
+      row.response,
+      "a maintainer's fix at the new ref",
+      "evidence recorded under the OLD ref still protects the row after a later ref move — the call site also " +
+        "checks D1's OWN stored ref (cur.chapter/cur.verse), not just master's current one",
+    );
+    eq(counts.merge_adopted, 1, "…the content is a normal adoption, not a kept-AI conflict");
+    eq(counts.merge_kept_ai, 0, "…never treated as untrusted AI/bot content because the ref moved");
+  }
 }
 
 // ── merge_no_base_refs folds through the REAL addCounts (issue #537) ─────────

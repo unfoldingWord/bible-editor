@@ -1737,7 +1737,24 @@ export async function applyTsvRows(
           // expands that same bridge into every verse it covers when the row
           // itself is the one a human commit touched, so the single-verse
           // lookup still finds it.
-          { masterMayHoldHumanEdit: masterMayHoldHumanEditForVerse(cutoff?.lineage, row.chapter, row.verse) },
+          //
+          // Asked at BOTH `row`'s ref (master's ref for this id as of the
+          // fresh HEAD parse) AND `cur`'s (D1's own last-known ref for the
+          // same id) — OR'd, never AND'd, so this can only ever ADD
+          // protection, never remove it. They can genuinely differ: the
+          // per-ref evidence is keyed to whatever ref a human's commit
+          // recorded AT THAT COMMIT, but a later bot/AI commit can move a
+          // row's Reference before this run's HEAD parse (a real,
+          // independently-tracked phenomenon — see the review_kind
+          // 'ref_moved' handling above, issue #588). Asking only `row`'s
+          // current ref would miss evidence recorded under the OLD one and
+          // wrongly let master win; asking `cur`'s too catches that case
+          // without weakening the other.
+          {
+            masterMayHoldHumanEdit:
+              masterMayHoldHumanEditForVerse(cutoff?.lineage, row.chapter, row.verse) ||
+              masterMayHoldHumanEditForVerse(cutoff?.lineage, Number(cur.chapter), Number(cur.verse)),
+          },
         );
         if (merge.action === "keep_no_base") {
           counts.merge_no_base++;

@@ -68,12 +68,14 @@ import {
   masterMayHoldHumanEditForVerse,
   mergeRefEvidence,
   parseDiffHunksForPath,
+  refEvidenceTouches,
   refsTouchedInTsv,
   refsTouchedInUsfm,
   summarizeLineage,
 } from "./masterLineage.ts";
 import { computeVerseMerge } from "./verseMerge.ts";
 import { computeTsvMerge } from "./tsvMerge.ts";
+import { refParts } from "./importParsers.ts";
 
 let failed = 0;
 function eq(actual, expected, msg) {
@@ -1145,6 +1147,112 @@ console.log("\n[#607: every uncertainty resolves to the file-level answer, TSV s
     false,
     "one unmapped TSV commit makes the whole window incomplete",
   );
+}
+
+// ── PR #644 review, F1: a verse number near Number.MAX_SAFE_INTEGER must
+// never reach a `for` loop ──────────────────────────────────────────────────
+//
+// Both mappers loop `for (let v = lo; v <= hi; v++)` over a verse range. Once
+// `v` exceeds 2^53 (Number.MAX_SAFE_INTEGER + 1), `v++` stops changing `v` —
+// float precision cannot represent every integer past that point — so the
+// loop never terminates. `hi - lo > MAX_BRIDGE_WIDTH` does NOT catch this: a
+// single verse with no bridge has `hi === lo`, so its width is 0. Reproduced
+// in isolation (a throwaway probe, not committed) against the exact pre-fix
+// loop shape with `\v 9007199254740993` / `"1:9007199254740993"` — killed by
+// an OS-level timeout after 6s and tens of millions of iterations with `v`
+// frozen at 9007199254740992 (2^53). MAX_VERSE_NUMBER is the fix: it is
+// checked BEFORE either loop runs, so these assertions must resolve
+// immediately, not merely "eventually" — a regression here would hang this
+// whole test file, not just fail one assertion.
+console.log("\n[PR #644 review F1: a huge verse number must not hang, in either mapper]");
+{
+  const HUGE = "9007199254740993"; // rounds to 2^53 once coerced to a Number
+  const t0 = Date.now();
+
+  const tsvFile = ["Reference\tID", `1:${HUGE}\tabcd`].join("\n") + "\n";
+  const tsvEv = refsTouchedInTsv(tsvFile, [{ newStart: 2, newCount: 1 }]);
+  eq(tsvEv.complete, false, "refsTouchedInTsv: a single huge verse number (no bridge) is incomplete, not a hang");
+  eq(tsvEv.reason, "unparseable_ref_column", "...via the ref-column parse, not silently accepted");
+
+  const usfmText = ["\\id JER", "\\c 1", `\\v ${HUGE} huge`].join("\n") + "\n";
+  const usfmEv = refsTouchedInUsfm(usfmText, [{ newStart: 3, newCount: 1 }]);
+  eq(usfmEv.complete, false, "refsTouchedInUsfm: the same shape via a \\v marker is incomplete, not a hang");
+  eq(usfmEv.reason, "unparseable_verse_bridge", "...via the marker's own bridge check, not silently accepted");
+
+  // A huge verse as the BRIDGE END (dash present) must be caught too — the
+  // width-only check does not fire when lo itself is already past the bound.
+  const tsvBridgeFile = ["Reference\tID", `1:5-${HUGE}\tabcd`].join("\n") + "\n";
+  eq(
+    refsTouchedInTsv(tsvBridgeFile, [{ newStart: 2, newCount: 1 }]).complete,
+    false,
+    "a huge BRIDGE END is caught too, not just a bare huge verse",
+  );
+  const usfmBridgeText = ["\\id JER", "\\c 1", `\\v 5-${HUGE} huge`].join("\n") + "\n";
+  eq(
+    refsTouchedInUsfm(usfmBridgeText, [{ newStart: 3, newCount: 1 }]).complete,
+    false,
+    "...same for the USFM marker's bridge end",
+  );
+
+  // The point of the fix: this whole block resolves fast. A regenerated
+  // pre-fix build would not reach this line inside any sane test timeout.
+  eq(Date.now() - t0 < 5000, true, "all four assertions above resolved in well under 5s");
+}
+
+// ── PR #644 review, F4: an emitted key must itself be a valid "c:v" ref ─────
+//
+// A chapter number so large it stringifies in scientific notation
+// ("1e+24:1") is finite, so it clears every isFinite/width check — the gap is
+// that nothing validated the emitted KEY, not the input magnitude. Without
+// this, refsTouchedInTsv would return `complete:true` with a ref set the
+// consumer's own REF_KEY_RE validation (masterLineage.ts's `validRefs`, via
+// refsFrom) silently discards — a persisted lineage record claiming a
+// completeness the consumer does not actually honor.
+console.log("\n[PR #644 review F4: an emitted key that fails REF_KEY_RE discards the whole ref]");
+{
+  const hugeChapterFile = ["Reference\tID", "999999999999999999999999:1\tabcd"].join("\n") + "\n";
+  const ev = refsTouchedInTsv(hugeChapterFile, [{ newStart: 2, newCount: 1 }]);
+  eq(ev.complete, false, "a chapter number that stringifies in scientific notation is incomplete, not complete:true");
+  eq(ev.reason, "unparseable_ref_column", "...caught at the ref-column parse, before any completeness claim is made");
+}
+
+// ── PR #644 review, F6: parseTsvRefColumn's key format must never drift from
+// refParts, the consumer's own key producer ─────────────────────────────────
+//
+// masterMayHoldHumanEditForVerse looks evidence up by (chapter, verse) —
+// which for a TSV row comes from parseTsvRow's refParts (importParsers.ts),
+// NOT from refsTouchedInTsv's own parsing. If the two ever disagreed on what
+// a ref STRING means, the evidence computed here would silently never be
+// found at the lookup site, quietly degrading every narrowing back to the
+// file-level answer — safe, but pointless. Table-driven so a future change to
+// either parser is caught here instead of a production alert nobody expected.
+// `refParts` intentionally collapses a bridge/comma-list to its FIRST verse
+// only ("range collapses to first verse for indexing" — its own comment), so
+// the contract this pins is narrower than "identical output": the (chapter,
+// verse) pair refParts extracts must always be a member of the ref set
+// parseTsvRefColumn (via refsTouchedInTsv) produces for the same string.
+console.log("\n[PR #644 review F6: parseTsvRefColumn keys agree with refParts, the consumer's own parser]");
+{
+  const REF_SHAPE_CASES = [
+    { ref: "front:intro", label: "chapter-front intro" },
+    { ref: "1:intro", label: "in-chapter intro" },
+    { ref: "40:5-6", label: "a bridge" },
+    { ref: "5:1,3,8,12", label: "a comma-separated verse list" },
+    { ref: "01:05", label: "leading zeros" },
+    { ref: "  40:5  ", label: "outer whitespace" },
+  ];
+  for (const { ref, label } of REF_SHAPE_CASES) {
+    const file = ["Reference\tID", `${ref}\tabcd`].join("\n") + "\n";
+    const ev = refsTouchedInTsv(file, [{ newStart: 2, newCount: 1 }]);
+    eq(ev.complete, true, `${label} ("${ref}"): parseTsvRefColumn maps it`);
+    const [chapter, verse] = refParts(ref);
+    eq(
+      refEvidenceTouches(ev.refs, chapter, verse),
+      true,
+      `${label}: refParts's own (chapter, verse) key — (${chapter}, ${verse}) — is a member of the evidence set, ` +
+        `so masterMayHoldHumanEditForVerse's lookup actually finds what this mapper claimed`,
+    );
+  }
 }
 
 if (failed) {
