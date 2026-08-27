@@ -495,6 +495,19 @@ const CV_MARKER_RE = /\\(c|v) (\d+)(?:-(\d+))?/g;
 // A verse bridge wider than this is not a bridge, it is a parse gone wrong.
 const MAX_BRIDGE_WIDTH = 50;
 
+// No real Bible chapter has anywhere near this many verses (PSA 119, the
+// longest, has 176). A verse number past this is corrupt input, not a
+// generous allowance — and it is load-bearing, not just a sanity check: a
+// `for (let v = lo; v <= hi; v++)` loop over a verse number near
+// Number.MAX_SAFE_INTEGER (2^53-1) can spin forever, because `v++` stops
+// changing `v` once it exceeds the range floats can represent every integer
+// in. `hi - lo > MAX_BRIDGE_WIDTH` does NOT catch a single huge verse number
+// with no bridge (lo === hi, so the width is 0) — this bound is the one that
+// does, and it is checked BEFORE any verse loop runs, in both
+// refsTouchedInUsfm (a `\v` marker's own number) and parseTsvRefColumn (a TSV
+// ref column's verse segment).
+const MAX_VERSE_NUMBER = 999;
+
 // Pull the new-side hunk ranges for ONE path out of a whole-commit unified
 // diff. Real commits here touch several books at once (82aad43b touched
 // 04-NUM, 24-JER and 33-MIC), so filtering by path is not an optimization —
@@ -691,7 +704,18 @@ export function refsTouchedInUsfm(fileText: string, hunks: HunkRange[]): HumanRe
         verseHi = -1;
       } else {
         const end = m[3] === undefined ? n : Number(m[3]);
-        if (!Number.isFinite(end) || end < n || end - n > MAX_BRIDGE_WIDTH) {
+        // `n > MAX_VERSE_NUMBER` on its own (not just the bridge width) is
+        // what stops `\v 9007199254740993` — a single verse, no bridge, so
+        // `end - n === 0` never trips MAX_BRIDGE_WIDTH — from reaching the
+        // `for` loop in claim() below, where a verse number that large makes
+        // `v++` stop advancing and the loop never terminates.
+        if (
+          !Number.isFinite(end) ||
+          end < n ||
+          end - n > MAX_BRIDGE_WIDTH ||
+          n > MAX_VERSE_NUMBER ||
+          end > MAX_VERSE_NUMBER
+        ) {
           return REF_INCOMPLETE("unparseable_verse_bridge");
         }
         verseLo = n;
@@ -706,6 +730,153 @@ export function refsTouchedInUsfm(fileText: string, hunks: HunkRange[]): HumanRe
   // an answer of "no verses touched" from a commit that demonstrably touched
   // the file is the one shape that must never narrow anything.
   if (refs.size === 0) return REF_INCOMPLETE("no_refs_mapped");
+  return { complete: true, refs: [...refs], reason: "" };
+}
+
+// ── TSV per-row mapping (issue #607) ─────────────────────────────────────
+//
+// refsTouchedInUsfm has to WALK the file, because a USFM line does not carry
+// its own verse — it inherits whatever \c/\v marker came before it. A TSV row
+// has no such problem: its ref IS column 1 ("40:5", "40:5-6", "front:intro"),
+// so the map is per-line and stateless. No state carried between lines, no
+// walk — just read each covered line's own first column.
+//
+// Same contract as refsTouchedInUsfm (HumanRefEvidence, same over-broad-in-
+// the-safe-direction posture, same requirement that `fileText` be the file AS
+// IT STOOD AT THAT COMMIT), and the same fail-safe direction: a ref column
+// that will not parse, a hunk past the end of the file, or a ref set past
+// LINEAGE_REF_CAP all return incomplete rather than guess.
+
+// One verse segment: a bare verse ("5") or a bridge ("5-6"). This is the unit
+// a comma-separated ref column's verse part splits into — see
+// parseTsvRefColumn below.
+const TSV_VERSE_SEGMENT_RE = /^(\d+)(?:-(\d+))?$/;
+
+// One ref column -> the "c:v" keys it claims. Measured against real corpus
+// data (2026-08-27, en_tn/tn_PSA.tsv, 8,213 rows): 20 are a single bridge
+// ("5:2-3") and 1 is a comma-separated verse list ("5:1,3,8,12") — both real
+// shapes, not hypothetical, so both are parsed rather than left to fall back.
+// A bridge expands to every verse it covers rather than claiming the whole
+// chapter — narrower, and correct, because the ref ITSELF states the range;
+// there is no hunk boundary to reason about the way refsTouchedInUsfm's
+// chapter-front case has to. `front:intro` and `N:intro` both collapse to
+// verse 0, matching parseTsvRow's own convention in bookReimport.ts (via
+// importParsers.ts's refParts): the evidence computed here and the (chapter,
+// verse) the merge call site looks it up by must agree on what "this row's
+// verse" means, or a touched intro row would never be found.
+//
+// Fails CLOSED on any one bad segment — unlike importParsers.ts's
+// coveredVersesFromRef (a display helper, which skips a malformed comma
+// segment and keeps the rest), this module cannot afford to under-claim: one
+// unparseable segment discards the WHOLE ref, which is incomplete, which is
+// master-wins for the row it belongs to.
+function parseTsvRefColumn(ref: string): string[] | null {
+  const trimmed = ref.trim();
+  const colon = trimmed.indexOf(":");
+  if (colon < 0) return null;
+  const chapterPart = trimmed.slice(0, colon);
+  const versePart = trimmed.slice(colon + 1);
+  if (chapterPart !== "front" && !/^\d+$/.test(chapterPart)) return null;
+  const chapter = chapterPart === "front" ? 0 : Number(chapterPart);
+  if (versePart === "intro") {
+    const key = `${chapter}:0`;
+    return REF_KEY_RE.test(key) ? [key] : null;
+  }
+
+  const refs: string[] = [];
+  for (const rawSeg of versePart.split(",")) {
+    const m = TSV_VERSE_SEGMENT_RE.exec(rawSeg.trim());
+    if (!m) return null; // "intro" mixed with other segments, or plain garbage
+    const lo = Number(m[1]);
+    const hi = m[2] === undefined ? lo : Number(m[2]);
+    // `lo`/`hi > MAX_VERSE_NUMBER` (not just the bridge width) is what stops
+    // a single huge verse number with no dash ("999999999999999") — its
+    // width is 0, so MAX_BRIDGE_WIDTH alone never catches it — from reaching
+    // the `for` loop below, where `v++` stops advancing once `v` passes
+    // Number.MAX_SAFE_INTEGER and the loop never terminates. See
+    // MAX_VERSE_NUMBER's own comment.
+    if (
+      !Number.isFinite(lo) ||
+      !Number.isFinite(hi) ||
+      hi < lo ||
+      hi - lo > MAX_BRIDGE_WIDTH ||
+      lo > MAX_VERSE_NUMBER ||
+      hi > MAX_VERSE_NUMBER
+    ) {
+      return null;
+    }
+    for (let v = lo; v <= hi; v++) {
+      const key = `${chapter}:${v}`;
+      // A chapter number so large it prints in scientific notation
+      // ("1e+24:1") would otherwise sail through as `complete:true` with a
+      // key the consumer (masterMayHoldHumanEditForVerse's own REF_KEY_RE
+      // check, via refsFrom) silently discards — this catches it here
+      // instead, so the evidence never claims a completeness it does not
+      // have.
+      if (!REF_KEY_RE.test(key)) return null;
+      refs.push(key);
+    }
+  }
+  return refs.length > 0 ? refs : null;
+}
+
+// Map new-side hunk ranges onto the TSV rows they touched. `fileText` must be
+// that exact revision, same requirement as refsTouchedInUsfm and for the same
+// reason (see its header comment). DELIBERATELY OVER-BROAD in the same way
+// too: a hunk's whole new-side span is claimed, context lines included — a
+// context line is a real row that existed at that revision, and claiming it
+// costs nothing but today's behavior for that row.
+export function refsTouchedInTsv(fileText: string, hunks: HunkRange[]): HumanRefEvidence {
+  if (typeof fileText !== "string" || fileText.length === 0) return REF_INCOMPLETE("empty_file");
+  if (hunks.length === 0) return { complete: true, refs: [], reason: "" };
+
+  const lines = fileText.split("\n");
+  // A trailing newline splits into one empty element that is not a row.
+  if (lines[lines.length - 1] === "") lines.pop();
+
+  const spans: Array<[number, number]> = [];
+  for (const h of hunks) {
+    if (!Number.isInteger(h.newStart) || !Number.isInteger(h.newCount) || h.newStart < 0 || h.newCount < 0) {
+      return REF_INCOMPLETE("bad_hunk_range");
+    }
+    if (h.newCount === 0) {
+      // A pure deletion. `newStart` is the line the removed row sat AFTER —
+      // claim both surviving rows at the join, NOT because a deleted row's
+      // own ref needs protecting (it does not: a row master deleted never
+      // reaches applyTsvRows' merge loop for that ref, since prune handles a
+      // gone id on its own path, not resolveEditedCandidates). It is because
+      // the two rows still standing at that join are real rows that existed
+      // at this revision, and if the human's edit landed on one of THEM — a
+      // different row, sharing a ref with the one deleted here, that the
+      // human never touched — under-claiming it would be the unprotective
+      // failure this module exists to avoid.
+      const lo = Math.max(1, h.newStart);
+      if (lo > lines.length) return REF_INCOMPLETE("hunk_past_end_of_file");
+      spans.push([lo, Math.min(lines.length, h.newStart + 1)]);
+      continue;
+    }
+    const hi = h.newStart + h.newCount - 1;
+    if (h.newStart < 1 || hi > lines.length) return REF_INCOMPLETE("hunk_past_end_of_file");
+    spans.push([h.newStart, hi]);
+  }
+
+  const refs = new Set<string>();
+  for (const [lo, hi] of spans) {
+    for (let lineNo = lo; lineNo <= hi; lineNo++) {
+      const line = lines[lineNo - 1];
+      const tab = line.indexOf("\t");
+      const refCol = tab === -1 ? line : line.slice(0, tab);
+      const mapped = parseTsvRefColumn(refCol);
+      if (mapped === null) return REF_INCOMPLETE("unparseable_ref_column");
+      for (const r of mapped) refs.add(r);
+      if (refs.size > LINEAGE_REF_CAP) return REF_INCOMPLETE("ref_cap_exceeded");
+    }
+  }
+  // No "hunks touched nothing" guard here, unlike refsTouchedInUsfm: every
+  // covered line either fails to parse (returned above) or contributes at
+  // least one ref (parseTsvRefColumn never returns an empty array), so
+  // `hunks.length > 0` guarantees `refs.size > 0` by construction — the shape
+  // that guard exists to catch cannot occur on this per-line, stateless path.
   return { complete: true, refs: [...refs], reason: "" };
 }
 
