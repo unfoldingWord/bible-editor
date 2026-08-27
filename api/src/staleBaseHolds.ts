@@ -87,8 +87,23 @@ export async function recordStaleBaseHold(env: Env, hold: StaleBaseHold, reason:
 const iso = (t: number): string => new Date(t * 1000).toISOString().slice(0, 10);
 
 /** The banner text. Extracted so the test can assert stickiness on byte-identity. */
-export function staleBaseAlertMessage(hold: StaleBaseHold, recordFailed: boolean): string {
+export function staleBaseAlertMessage(hold: StaleBaseHold, recordFailed: boolean, overridden = false): string {
   const res = hold.resource.toUpperCase();
+  // Force-released variant. Deliberately a different sentence, not a suffix on
+  // the refusal text: the outcome is the opposite one, and an operator scanning
+  // banners must not read "REFUSED" on a run that adopted. Same source key, so
+  // it REPLACES the refusal banner rather than sitting beside it.
+  if (overridden) {
+    return (
+      `Benjamin — ${hold.book} ${res} was FORCE-RELEASED past the stale-base gate on your instruction, and ` +
+      `master's file (${hold.masterSha.slice(0, 8)}) was adopted into the app. That file is a translationCore ` +
+      `re-export from a ${iso(hold.incomingTcExportAt)} snapshot, older than the ${iso(hold.syncedAt)} state the app ` +
+      `had synced from master (${hold.previousSha.slice(0, 8)}). Anything that landed on master in between is now ` +
+      `gone from the app, and the next export will publish that to Door43. If that was not what you meant, restore ` +
+      `from the affected verses' history before the next export runs.` +
+      (recordFailed ? ` (The durable record of this override could not be written — see the logs.)` : ``)
+    );
+  }
   return (
     `Benjamin — the nightly sync REFUSED ${hold.book} ${res} from Door43 and did not update the app. ` +
     `Master's file (${hold.masterSha.slice(0, 8)}) was re-exported from translationCore against a ` +
@@ -116,7 +131,12 @@ export function staleBaseAlertMessage(hold: StaleBaseHold, recordFailed: boolean
  * banner. The message only changes when the underlying revision or its
  * measurements change, and then it SHOULD reappear.
  */
-export async function raiseStaleBaseHoldAlert(env: Env, hold: StaleBaseHold, recordFailed: boolean): Promise<void> {
+export async function raiseStaleBaseHoldAlert(
+  env: Env,
+  hold: StaleBaseHold,
+  recordFailed: boolean,
+  overridden = false,
+): Promise<void> {
   const source = staleBaseAlertSource(hold.book, hold.resource);
   try {
     const rs = await env.DB.prepare(`SELECT username, message, dismissed_at FROM system_alerts WHERE source = ?1`)
@@ -128,7 +148,7 @@ export async function raiseStaleBaseHoldAlert(env: Env, hold: StaleBaseHold, rec
         { message: r.message, dismissedAt: r.dismissed_at },
       ]),
     );
-    const desired = new Map<string, string>([[ALERT_USERNAME, staleBaseAlertMessage(hold, recordFailed)]]);
+    const desired = new Map<string, string>([[ALERT_USERNAME, staleBaseAlertMessage(hold, recordFailed, overridden)]]);
     const { toDelete, toInsert } = planSystemAlertWrites(existing, desired);
     const stmts = [
       ...toDelete.map((u) =>

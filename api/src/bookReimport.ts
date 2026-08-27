@@ -726,7 +726,8 @@ export const planAndStageBookResourcesForTest = (
   book: string,
   resources: Resource[],
   instanceId: string,
-): Promise<ReimportPlan> => planAndStageBookResources(env, book, resources, instanceId);
+  staleBaseOverrideResource?: Resource,
+): Promise<ReimportPlan> => planAndStageBookResources(env, book, resources, instanceId, staleBaseOverrideResource);
 
 export const persistMasterLineageForTest = (
   env: Env,
@@ -4903,6 +4904,13 @@ interface StagedResource {
   // serialized return value into runChunkedReimport's sync step, which is where
   // the durable record and the banner are written.
   staleBaseHold?: StaleBaseHold | null;
+  // Issue #639. The MIRROR of staleBaseHold: the gate fired and the operator's
+  // narrow `allowStaleBase` override let it through anyway, so this entry is
+  // `changed: true` and master WILL be adopted. Carried so the sync step can
+  // still write the durable record and raise the force-released banner —
+  // an override that consents to a risk must leave a record of having been
+  // used, exactly like idBlockedOverride's raise-instead-of-clear.
+  staleBaseOverridden?: StaleBaseHold | null;
 }
 
 interface ReimportPlan {
@@ -6095,6 +6103,11 @@ async function planAndStageBookResources(
   book: string,
   resources: Resource[],
   instanceId: string,
+  // Issue #639. When it names this resource, the stale-base gate still MEASURES
+  // and still records, but adopts instead of refusing — see
+  // staleBaseOverrideAllowed for the narrow gating and for why the record is
+  // written anyway rather than skipped because an operator approved.
+  staleBaseOverrideResource?: Resource,
 ): Promise<ReimportPlan> {
   const maxRow = await env.DB
     .prepare(`SELECT MAX(chapter) AS m FROM verses WHERE book = ?1`)
@@ -6277,6 +6290,7 @@ async function planAndStageBookResources(
     // actually moved tonight, and nothing at all for a SHA-unchanged or
     // own-publish resource — those returned above. See staleBaseGate.ts for the
     // corpus evidence behind each conjunct.
+    let staleBaseOverridden: StaleBaseHold | null = null;
     if (!isTsv) {
       const { decision, hold } = await evaluateStaleBaseReplacement(env, {
         book,
@@ -6289,7 +6303,8 @@ async function planAndStageBookResources(
         syncedAt: sync.syncedAt,
       });
       if (hold) {
-        console.warn("reimport: REFUSED master file — wholesale re-export from a stale translationCore base (#639)", {
+        const overridden = staleBaseOverrideResource === resource;
+        console.warn("reimport: master file is a wholesale re-export from a stale translationCore base (#639)", {
           book,
           resource,
           masterSha,
@@ -6297,16 +6312,25 @@ async function planAndStageBookResources(
           incomingTcExportAt: hold.incomingTcExportAt,
           previousTcExportAt: hold.previousTcExportAt,
           syncedAt: hold.syncedAt,
+          action: overridden ? "FORCE-RELEASED by operator — adopting anyway" : "REFUSED",
         });
-        entries.push({
-          resource,
-          changed: false,
-          masterSha: null,
-          r2Key: null,
-          verifiedComplete: false,
-          staleBaseHold: hold,
-        });
-        continue;
+        if (!overridden) {
+          entries.push({
+            resource,
+            changed: false,
+            masterSha: null,
+            r2Key: null,
+            verifiedComplete: false,
+            staleBaseHold: hold,
+          });
+          continue;
+        }
+        // Force-released: fall through and stage exactly as if the gate had not
+        // fired, but carry the evidence so the sync step still writes the
+        // durable record and raises the force-released banner. An override that
+        // consents to a risk must leave a record OF having been used — the same
+        // invariant idBlockedOverride's raise-instead-of-clear encodes.
+        staleBaseOverridden = hold;
       }
       // Logged on every verse file that moved, not just the refusals: "we
       // checked and master is not a stale replacement" is a claim, and this is
@@ -6335,7 +6359,17 @@ async function planAndStageBookResources(
     );
     const r2Key = `reimport-stage/${instanceId}/${book}/${resource}`;
     await env.BLOBS.put(r2Key, raw);
-    entries.push({ resource, changed: true, masterSha, r2Key, verifiedComplete, lineage });
+    entries.push({
+      resource,
+      changed: true,
+      masterSha,
+      r2Key,
+      verifiedComplete,
+      lineage,
+      // Null on every ordinary night. Non-null ONLY on a force-released
+      // stale-base adoption — see the gate above and staleBaseOverridden below.
+      staleBaseOverridden,
+    });
   }
   return { maxChapter, entries };
 }
@@ -6514,14 +6548,27 @@ export async function runChunkedReimport(
   // forced open for exactly this ONE resource, computed the same narrow way
   // by exportWorkflow.ts's idBlockedOverrideAllowed. Undefined/omitted
   // preserves the pre-existing behavior for every cron path.
-  opts: { chunk?: number; mergeRefusalOverrideResource?: Resource; idBlockedOverrideResource?: Resource } = {},
+  // Issue #639: `staleBaseOverrideResource` — when set, the stale-base gate is
+  // forced open for exactly this ONE resource, computed the same narrow way by
+  // exportWorkflow.ts's staleBaseOverrideAllowed. Undefined/omitted preserves
+  // the pre-existing behavior for every cron path. Unlike the two above, this
+  // one has to reach planAndStageBookResources rather than the sync step: the
+  // gate decides at STAGING time (it is what withholds the file from the chunk
+  // steps in the first place), so a sync-step-only override would leave D1
+  // un-updated while stamping the watermark — the worst of both.
+  opts: {
+    chunk?: number;
+    mergeRefusalOverrideResource?: Resource;
+    idBlockedOverrideResource?: Resource;
+    staleBaseOverrideResource?: Resource;
+  } = {},
 ): Promise<ReimportResult> {
   const chunkSize = opts.chunk ?? REIMPORT_CHAPTER_CHUNK;
 
   const plan = await step.do(
     `reimport-fetch-${book}`,
     { retries: { limit: 2, delay: "10 seconds", backoff: "exponential" } },
-    async () => planAndStageBookResources(env, book, resources, instanceId),
+    async () => planAndStageBookResources(env, book, resources, instanceId, opts.staleBaseOverrideResource),
   );
 
   // Own-publish recognition already ran inside planAndStageBookResources (it
@@ -6554,19 +6601,23 @@ export async function runChunkedReimport(
   // checkMasterFreshness answer `no_watermark` (ok:true) and the export runs
   // anyway, so withholding would change nothing without a sentinel to refuse
   // against.
-  const staleBaseHeld = plan.entries.filter((e) => e.staleBaseHold != null);
-  if (staleBaseHeld.length > 0) {
+  const staleBaseEvents = plan.entries.filter((e) => e.staleBaseHold != null || e.staleBaseOverridden != null);
+  if (staleBaseEvents.length > 0) {
     await step.do(`reimport-stalebase-${book}`, async () => {
       const now = Math.floor(Date.now() / 1000);
       const recorded: string[] = [];
-      for (const e of staleBaseHeld) {
-        const hold = e.staleBaseHold as StaleBaseHold;
-        const ok = await recordStaleBaseHold(env, hold, "stale_tc_reexport", now);
-        await raiseStaleBaseHoldAlert(env, hold, !ok);
-        await recordWithheldSyncIfAbsent(env, book, e.resource);
-        recorded.push(`${e.resource}:${ok ? "recorded" : "record_failed"}`);
+      for (const e of staleBaseEvents) {
+        const overridden = e.staleBaseOverridden != null;
+        const hold = (e.staleBaseHold ?? e.staleBaseOverridden) as StaleBaseHold;
+        const ok = await recordStaleBaseHold(env, hold, overridden ? "stale_tc_reexport_overridden" : "stale_tc_reexport", now);
+        await raiseStaleBaseHoldAlert(env, hold, !ok, overridden);
+        // Only a REFUSAL needs the sentinel. A force-released resource is about
+        // to take the ordinary sync path and stamp a real watermark, and writing
+        // the sentinel first would be overwritten a moment later anyway.
+        if (!overridden) await recordWithheldSyncIfAbsent(env, book, e.resource);
+        recorded.push(`${e.resource}:${overridden ? "force_released" : "refused"}:${ok ? "recorded" : "record_failed"}`);
       }
-      console.warn("reimport withheld sync watermark — stale-base replacement refused (#639)", { book, recorded });
+      console.warn("reimport stale-base gate fired (#639)", { book, recorded });
       return { held: recorded };
     });
   }
@@ -6861,7 +6912,13 @@ export async function runChunkedReimport(
       // human override endpoint, because the watermark stays withheld only for
       // as long as master's tip is still the offending revision, and the file
       // is re-staged and re-judged every night until it isn't.
-      if (e.resource === "ult" || e.resource === "ust") {
+      //
+      // Skipped for a FORCE-RELEASED entry, for the reason the idBlockedOverride
+      // branch just above documents: both share the same alert source, so
+      // clearing here would immediately delete the "force-released, the export
+      // will publish this" banner the stale-base step wrote moments ago, and
+      // resolve the record of the override along with it.
+      if ((e.resource === "ult" || e.resource === "ust") && e.staleBaseOverridden == null) {
         await clearStaleBaseHold(env, book, e.resource, Math.floor(Date.now() / 1000));
       }
     }

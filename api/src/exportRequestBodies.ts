@@ -41,6 +41,13 @@ export const RunExportBody = z
     // this does not just resume a stalled sync — it consents to Door43 losing
     // the blocked row(s) on the next export (see raiseTombstoneBlockAlert).
     allowIdBlocked: z.boolean().optional(),
+    // Issue #639: adopt a resource the stale-base gate refused (master presents
+    // a wholesale translationCore re-export taken from a snapshot older than the
+    // state D1 last synced). Same requirement as the three above (book +
+    // resource both set); the workflow ignores it otherwise. Like allowIdBlocked
+    // this consents to a risk rather than just unsticking a sync: if the
+    // operator is wrong, the revert lands in D1 and the export republishes it.
+    allowStaleBase: z.boolean().optional(),
     // Override the book-lock gate for a deliberate fix to a frozen (published or
     // explicitly locked) book. Requires book + resource to be set; the workflow
     // ignores it otherwise.

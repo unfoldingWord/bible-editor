@@ -24,7 +24,14 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { parseTcExportStamp, decideStaleBaseReplacement } from "./staleBaseGate.ts";
-import { recordStaleBaseHold, raiseStaleBaseHoldAlert, clearStaleBaseHold, staleBaseAlertSource } from "./staleBaseHolds.ts";
+import {
+  recordStaleBaseHold,
+  raiseStaleBaseHoldAlert,
+  clearStaleBaseHold,
+  staleBaseAlertSource,
+  staleBaseAlertMessage,
+} from "./staleBaseHolds.ts";
+import { staleBaseOverrideAllowed } from "./reimportSyncGate.ts";
 import { planAndStageBookResourcesForTest } from "./bookReimport.ts";
 
 let failed = 0;
@@ -210,7 +217,7 @@ function stubFetch({ masterSha, masterBody, prevBodyBySha }) {
   return seen;
 }
 
-async function stagePlan({ incomingIdLine, previousIdLine, syncedAt }) {
+async function stagePlan({ incomingIdLine, previousIdLine, syncedAt, override }) {
   const { sqlite, env, puts } = freshEnv();
   // A book with verses, all PRISTINE — the majority-of-corpus case the issue is
   // about (2CH ULT: 858 rows, every one updated_by IS NULL).
@@ -229,7 +236,7 @@ async function stagePlan({ incomingIdLine, previousIdLine, syncedAt }) {
     masterBody: bodyWith(incomingIdLine),
     prevBodyBySha: { [PREV_SHA]: bodyWith(previousIdLine) },
   });
-  const plan = await planAndStageBookResourcesForTest(env, "2CH", ["ult"], "inst-1");
+  const plan = await planAndStageBookResourcesForTest(env, "2CH", ["ult"], "inst-1", override);
   return { plan, entry: plan.entries[0], seen, puts, sqlite, env };
 }
 
@@ -269,8 +276,60 @@ try {
     true,
     "every pinned raw fetch uses a full 40-hex sha",
   );
+  // 4e. Human release. The gate normally clears itself once master is repaired,
+  // because the file is re-staged and re-judged every night — but the one shape
+  // that cannot self-release is master keeping the stale tC stamp forever
+  // because the newer work was hand-re-applied on top of the stale export. The
+  // narrow `allowStaleBase` override is the escape hatch for that, and it must
+  // still leave a record of having been used.
+  const forced = await stagePlan({
+    incomingIdLine: INCOMING_ID_LINE,
+    previousIdLine: PREV_ID_LINE,
+    syncedAt: SYNCED_AT,
+    override: "ult",
+  });
+  eq(forced.entry.changed, true, "force-released → resource stages and master IS adopted");
+  eq(forced.entry.masterSha, MASTER_SHA, "force-released → the watermark will be stamped");
+  eq(forced.entry.staleBaseHold, undefined, "force-released → not recorded as a refusal");
+  eq(forced.entry.staleBaseOverridden?.masterSha, MASTER_SHA, "force-released → but the override IS recorded");
+
+  // The override is per-resource, never wholesale: naming a different resource
+  // must leave this one refused.
+  const wrongResource = await stagePlan({
+    incomingIdLine: INCOMING_ID_LINE,
+    previousIdLine: PREV_ID_LINE,
+    syncedAt: SYNCED_AT,
+    override: "ust",
+  });
+  eq(wrongResource.entry.changed, false, "an override naming a DIFFERENT resource does not release this one");
 } finally {
   globalThis.fetch = realFetch;
+}
+
+// ── 6. The override's own gating ─────────────────────────────────────────────
+console.log("\n6. staleBaseOverrideAllowed — deliberately narrow");
+{
+  const p = { allowStaleBase: true, book: "2CH", resource: "ult" };
+  eq(staleBaseOverrideAllowed(p, 1, 1, "ult"), true, "one book + one resource + a match → allowed");
+  eq(staleBaseOverrideAllowed(p, 1, 1, "ust"), false, "…but only for the resource actually named");
+  eq(staleBaseOverrideAllowed(p, 2, 1, "ult"), false, "two books → refused");
+  eq(staleBaseOverrideAllowed(p, 1, 2, "ult"), false, "two resources → refused");
+  eq(staleBaseOverrideAllowed({ ...p, allowStaleBase: false }, 1, 1, "ult"), false, "flag off → refused");
+  eq(staleBaseOverrideAllowed({ allowStaleBase: true }, 1, 1, "ult"), false, "no book/resource (every cron path) → refused");
+}
+
+// ── 7. The force-released banner is a different sentence, not a suffix ───────
+console.log("\n7. force-released banner");
+{
+  const hold = {
+    book: "2CH", resource: "ult", masterSha: MASTER_SHA,
+    incomingTcExportAt: INCOMING_TC, previousTcExportAt: PREV_TC, syncedAt: SYNCED_AT, previousSha: PREV_SHA,
+  };
+  const refused = staleBaseAlertMessage(hold, false, false);
+  const released = staleBaseAlertMessage(hold, false, true);
+  eq(/REFUSED/.test(refused) && !/FORCE-RELEASED/.test(refused), true, "the refusal banner says REFUSED");
+  eq(/FORCE-RELEASED/.test(released) && !/REFUSED 2CH/.test(released), true, "the override banner never says REFUSED");
+  eq(released !== refused, true, "…and is a distinct message, so it replaces rather than matches the refusal");
 }
 
 // ── 5. The durable half: record, banner, stickiness, release ────────────────
