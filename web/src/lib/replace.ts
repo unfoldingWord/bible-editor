@@ -21,6 +21,7 @@
 
 import { normalizeEditable, isInFlowMarker, isCharacterWrapper, liftMarkerText } from "./usfm.ts";
 import { reassembleAlignment } from "./alignmentReassembly.ts";
+import { nfc } from "./hebrew.ts";
 
 export interface SmartReplaceResult {
   content: unknown;
@@ -1631,13 +1632,16 @@ function markerSignature(plain: string): string {
   return parts.join(",");
 }
 
-// Number of inline marker tokens (`\q1`, `\p`, `\ts\*`) in an editable string.
-function markerTokenCount(plain: string): number {
+// Number of inline LINE-BREAK marker tokens (`\q1`, `\p`, `\b`, …) in an
+// editable string. `\ts\*` is excluded on purpose: it is a chunk divider whose
+// literal label survives the non-chip render, so its presence says nothing
+// about whether the editor's chips made it into a capture.
+function lineBreakMarkerCount(plain: string): number {
   const re = new RegExp(MARKER_TOKEN_RE.source, MARKER_TOKEN_RE.flags);
   let n = 0;
   let m: RegExpExecArray | null;
   while ((m = re.exec(plain)) !== null) {
-    n++;
+    if (!m[1].startsWith("ts")) n++;
     if (m[0].length === 0) re.lastIndex++;
   }
   return n;
@@ -1670,11 +1674,66 @@ function markerCaptureLooksDropped(
   oldStripped: string,
   newStripped: string,
 ): boolean {
-  if (markerTokenCount(oldPlain) === 0) return false;
-  if (markerTokenCount(newPlain) !== 0) return false;
+  // Count only LINE-BREAK markers. A `\ts\*` chunk divider prints its literal
+  // label even in the non-chip render (highlight.ts:1066), so it can survive a
+  // capture that lost every `\q`/`\p` chip — testing "no markers at all" would
+  // let one stray divider defeat the whole guard.
+  if (lineBreakMarkerCount(oldPlain) === 0) return false;
+  if (lineBreakMarkerCount(newPlain) !== 0) return false;
   if (oldStripped === newStripped) return false; // pure marker edit — honor it
-  const words = (s: string) => [...s.matchAll(WORD_RUN_RE)].map((m) => m[0]).join(" ");
+  // nfc() so a pure combining-mark-order difference between the tree-derived
+  // baseline and the DOM capture cannot read as a changed word (the UHB-vs-NFC
+  // hazard hebrew.ts documents). The join character can never appear inside a
+  // word token, so the comparison stays injective over the token array.
+  const words = (s: string) =>
+    nfc([...s.matchAll(WORD_RUN_RE)].map((m) => m[0]).join("\u0000"));
   return words(oldStripped) === words(newStripped);
+}
+
+// Punctuation that ENDS a line, so it stays before an anchored line break.
+// Mirrors reconcileMarkers' own CLOSING class (whitespace included) so a layout
+// built here splits each gap exactly where reconcileMarkers would.
+const CLOSING_RUN_RE = /^[\s,.;:!?)\]}”’…]*/u;
+
+// Rebuild the baseline's marker layout ON TOP OF the captured text.
+//
+// The anchors (how many words precede each marker) come from `oldPlain`, which
+// is valid precisely because the guard only fires when the word sequence is
+// unchanged. But the punctuation each marker leads is read from `newPlain`, so
+// punctuation the translator edited AT a line break is taken from what they
+// actually typed. Handing reconcileMarkers `oldPlain` wholesale instead would
+// give it a pre-edit `leadPunct`, which can split the gap at the wrong
+// character and strand newly typed punctuation on the following line.
+function reanchorMarkers(oldPlain: string, newPlain: string): string {
+  const re = new RegExp(MARKER_TOKEN_RE.source, MARKER_TOKEN_RE.flags);
+  const anchors: { tag: string; wordsBefore: number }[] = [];
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(oldPlain)) !== null) {
+    const before = stripMarkerTokens(oldPlain.slice(0, m.index));
+    anchors.push({ tag: m[1], wordsBefore: [...before.matchAll(WORD_RUN_RE)].length });
+    if (m[0].length === 0) re.lastIndex++;
+  }
+  const hits = [...newPlain.matchAll(WORD_RUN_RE)];
+  const starts = hits.map((x) => x.index ?? 0);
+  const ends = hits.map((x) => (x.index ?? 0) + x[0].length);
+  let out = "";
+  let cursor = 0;
+  for (const a of anchors) {
+    const gapStart = Math.max(a.wordsBefore === 0 ? 0 : ends[a.wordsBefore - 1], cursor);
+    const gapEnd = Math.max(
+      a.wordsBefore >= starts.length ? newPlain.length : starts[a.wordsBefore],
+      gapStart,
+    );
+    // Closing punctuation belongs to the line the marker ends; anything else
+    // (an opening quote, a line-leading dash) belongs after the break.
+    const gap = newPlain.slice(gapStart, gapEnd);
+    const at = gapStart + (CLOSING_RUN_RE.exec(gap)?.[0].length ?? 0);
+    out += newPlain.slice(cursor, at);
+    if (out.length && !/\s$/.test(out)) out += " ";
+    out += `\\${a.tag} `;
+    cursor = at;
+  }
+  return normalizeEditable(out + newPlain.slice(cursor));
 }
 
 // Re-lay the inert position markers (\p, \q1, \q2, \ts\*) of a verse to match
@@ -1886,6 +1945,13 @@ export function smartEditVerse(
   content: unknown,
   oldPlain: string,
   newPlain: string,
+  // Set ONLY by the editor's DOM-capture save path. The dropped-marker-chip
+  // guard below is a statement about a contenteditable capture, so it must not
+  // run where `newPlain` was derived from a stored TREE — verseRebase renders
+  // both sides with extractEditableText, and a tree that genuinely has no
+  // markers is authoritative there. Defaults off so every non-DOM caller keeps
+  // the old behavior. (#606)
+  opts: { capturedFromDom?: boolean } = {},
 ): SmartReplaceResult {
   // The diff is character-exact (diffSingleChange), but `oldPlain` is the
   // whitespace-collapsed extractEditableText baseline while `newPlain` is
@@ -1932,14 +1998,28 @@ export function smartEditVerse(
   // text — but a capture that lost every chip while changing no word is not a
   // marker layout at all (see markerCaptureLooksDropped, #606). Reconciling
   // against it would delete the verse's whole poetry lineation and re-insert
-  // nothing. Fall back to the baseline's layout: the word sequence is unchanged,
-  // so every marker's word anchor is still exactly where it was, and both the
-  // relayout tier (which leaves markers in the tree) and the reassembly tier
-  // (which strips them and relies on Step 2 to put them back) come out right.
-  const markerLayout = markerCaptureLooksDropped(oldPlain, newPlain, oldStripped, newStripped)
-    ? oldPlain
-    : newPlain;
-  const markersChanged = markerSignature(oldPlain) !== markerSignature(markerLayout);
+  // nothing. Rebuild the baseline's layout on top of the captured text instead:
+  // the word sequence is unchanged, so every anchor still holds, while the
+  // punctuation each marker leads comes from what the translator actually typed.
+  const captureDroppedMarkers =
+    opts.capturedFromDom === true &&
+    markerCaptureLooksDropped(oldPlain, newPlain, oldStripped, newStripped);
+  const markerLayout = captureDroppedMarkers ? reanchorMarkers(oldPlain, newPlain) : newPlain;
+  if (captureDroppedMarkers) {
+    // Leave a trace. This overrides what the editor handed us, so when the next
+    // marker-loss report arrives the console says whether the guard was the
+    // reason the layout differs from the capture.
+    console.warn(
+      `[replace] capture lost all ${lineBreakMarkerCount(oldPlain)} marker chip(s) with no word change — ` +
+        `restoring the baseline layout instead of deleting the verse's lineation (#606).`,
+    );
+  }
+  // When the guard fires the tree may have come from a tier that STRIPS markers
+  // (reassembly) or one that drops any marker inside its rewrite range (the diff
+  // tiers), so Step 2 has to run to re-place the restored layout — even though
+  // comparing the baseline against itself would say "unchanged".
+  const markersChanged =
+    captureDroppedMarkers || markerSignature(oldPlain) !== markerSignature(markerLayout);
 
   // Step 1 — word/punctuation edit against the marker-stripped baseline.
   let result: SmartReplaceResult;

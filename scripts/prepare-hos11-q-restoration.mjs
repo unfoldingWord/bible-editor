@@ -63,6 +63,12 @@ const stamp = generatedAt.slice(0, 10);
 const q = (s) => `'${String(s).replace(/'/g, "''")}'`;
 
 function executeD1(sql) {
+  // Hard stop: this script is an AUDIT. It reads production and writes files;
+  // it must never be the thing that mutates a verse. Anything but a SELECT is a
+  // programming error here, not a runtime condition.
+  if (!/^\s*SELECT\b/i.test(sql)) {
+    throw new Error(`executeD1 is read-only; refusing non-SELECT statement: ${sql.slice(0, 80)}`);
+  }
   const raw = execFileSync(
     process.execPath,
     [wranglerBin, "d1", "execute", "bible_editor", "--remote", "--env", "production", "--json", "--command", sql],
@@ -240,9 +246,15 @@ const sql = [
   `-- moved since this file was generated, that statement matches 0 rows, skips`,
   `-- its audit row, and the trailing SELECT reports it.`,
   `--`,
-  `-- Apply with:`,
+  `-- Apply STATEMENT BY STATEMENT with --command, not --file.`,
+  `-- \`wrangler d1 execute --file\` has silently executed only part of a multi-`,
+  `-- statement file and still reported success, which here would land an UPDATE`,
+  `-- with no matching edit_log row (or vice versa). Paste each statement below`,
+  `-- individually:`,
   `--   cd api`,
-  `--   npx wrangler d1 execute bible_editor --remote --env production --file ../reports/restore-hos11-q-markers-${stamp}.sql`,
+  `--   npx wrangler d1 execute bible_editor --remote --env production --command "<one statement>"`,
+  `-- After each UPDATE, run its INSERT immediately, then re-run the verification`,
+  `-- SELECT at the bottom before moving to the next verse.`,
   `--`,
   `-- NOTE: HOS is a locked book (PUBLISHED_BOOKS). Coordinate the unlock and a`,
   `-- re-export before expecting these markers to reach Door43 master.`,
@@ -257,13 +269,26 @@ for (const row of reviewed) {
   sql.push(
     `-- ${row.rowKey}: restore ${row.markersRestored.join(", ")} (text untouched).`,
     `UPDATE verses`,
+    // updated_by is deliberately NOT touched. Setting it to NULL would mark the
+    // row PRISTINE, and a pristine row silently adopts master on the next sync
+    // (#639) — master still holds the marker-free text, so the repair would be
+    // reverted overnight with no flag. The verse really was last edited by that
+    // user; leaving the column alone keeps it correctly "edited".
     `   SET content_json = ${q(row.newContentJson)}, version = version + 1,`,
-    `       updated_at = unixepoch(), updated_by = NULL`,
+    `       updated_at = unixepoch()`,
     ` WHERE book = ${q(row.book)} AND chapter = ${row.chapter} AND verse = ${row.verse} AND bible_version = ${q(row.bibleVersion)}`,
     `   AND version = ${row.currentVersion} AND content_json = ${q(row.oldContentJson)};`,
+    // Gated on the verse's NEW version, not on changes(): the runbook applies
+    // these one --command at a time, and changes() does not carry across
+    // separate wrangler invocations. The NOT EXISTS also makes a re-run safe.
     `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, payload_json, source)`,
     `SELECT 'verse', ${q(row.rowKey)}, ${q(row.book)}, NULL, ${row.currentVersion}, ${row.currentVersion + 1}, 'restore', ${q(payload)}, ${q(SOURCE)}`,
-    ` WHERE changes() > 0;`,
+    ` WHERE EXISTS (SELECT 1 FROM verses`,
+    `                WHERE book = ${q(row.book)} AND chapter = ${row.chapter} AND verse = ${row.verse}`,
+    `                  AND bible_version = ${q(row.bibleVersion)} AND version = ${row.currentVersion + 1})`,
+    `   AND NOT EXISTS (SELECT 1 FROM edit_log`,
+    `                    WHERE kind = 'verse' AND row_key = ${q(row.rowKey)}`,
+    `                      AND new_version = ${row.currentVersion + 1} AND source = ${q(SOURCE)});`,
     ``,
   );
 }

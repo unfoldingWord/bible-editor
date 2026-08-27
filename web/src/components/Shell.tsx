@@ -2782,7 +2782,11 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       afterCommit?.();
       return;
     }
-    const result = smartEditVerse(effectiveBase.content, oldEditable, plain);
+    // `plain` is raw DOM textContent, so the dropped-marker-chip guard applies
+    // here and only here — see smartEditVerse's `capturedFromDom` (#606).
+    const result = smartEditVerse(effectiveBase.content, oldEditable, plain, {
+      capturedFromDom: true,
+    });
     // Heads-up when this save drops alignment. Editing a word's text or order
     // unaligns that word by design — the engine preserves only the words it
     // didn't have to touch — and the loss is otherwise easy to miss: the editor

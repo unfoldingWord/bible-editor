@@ -2160,7 +2160,7 @@ function countAligned(content) {
   assert(!/\\q/.test(chipsDropped), "chip-dropped capture really has no marker tokens");
 
   const good = smartEditVerse(verse, old, wellFormed);
-  const bad = smartEditVerse(verse, old, chipsDropped);
+  const bad = smartEditVerse(verse, old, chipsDropped, { capturedFromDom: true });
 
   const goodOut = extractEditableText(good.content);
   const badOut = extractEditableText(bad.content);
@@ -2227,14 +2227,19 @@ function countAligned(content) {
   assert(!/\\q/.test(out), `reflow that changed a word removes the marker (got ${JSON.stringify(out)})`);
 }
 
-// --- Case 74d: the #606 guard has to hold on the tier that STRIPS markers.
+// --- Case 74d: the guard has to hold when the whole-verse relayout tier BAILS.
 // A word unit split across leaves ("warrior’s") makes relayoutUnchangedWords
-// bail even though no word changed, so the edit lands on the reassembly engine
-// — which drops every marker from its output and depends entirely on Step 2 to
-// put them back. That is the path where reconciling against an empty capture is
-// unrecoverable, so it is worth pinning separately from Case 74.
+// return null even though no word changed (its split-unit guard), and
+// reassembleAlignment declines this shape too — measured, it returns null — so
+// the edit falls all the way through to the diff tiers, which drop any marker
+// inside their rewrite range. Step 2 is the only thing that can put the
+// lineation back, which is exactly what the guard has to make possible.
+//
+// NOTE: this does NOT exercise the reassembly tier; that tier bails here. A
+// case that genuinely reaches reassembleAlignment WITH a marker present is
+// still untested.
 {
-  console.log("\n[Case 74d] Guard holds on the marker-stripping reassembly tier (#606)");
+  console.log("\n[Case 74d] Guard holds when the relayout tier bails to the diff tiers (#606)");
   const verse = {
     verseObjects: [
       { type: "quote", tag: "q1" },
@@ -2249,11 +2254,11 @@ function countAligned(content) {
   const old = extractEditableText(verse); // "\q1 the warrior’s \q2 shield.”"
   const wellFormed = old.replace("”", "");
   const chipsDropped = wellFormed.replace(/\\q\d?\s?/g, "").replace(/\s+/g, " ").trim();
-  const bad = smartEditVerse(verse, old, chipsDropped);
+  const bad = smartEditVerse(verse, old, chipsDropped, { capturedFromDom: true });
   const out = extractEditableText(bad.content);
   assert(
     (out.match(/\\q/g) ?? []).length === 2,
-    `both markers survive on the reassembly tier (got ${JSON.stringify(out)})`,
+    `both markers survive when the relayout tier bails (got ${JSON.stringify(out)})`,
   );
   assert(
     out === extractEditableText(smartEditVerse(verse, old, wellFormed).content),
@@ -2284,9 +2289,77 @@ function countAligned(content) {
   const wellFormed = old.replace("said,", "said—"); // punctuation only, at the boundary
   const chipsDropped = wellFormed.replace(/\\q\d?\s?/g, "").replace(/\s+/g, " ").trim();
   const good = extractEditableText(smartEditVerse(mk(), old, wellFormed).content);
-  const bad = extractEditableText(smartEditVerse(mk(), old, chipsDropped).content);
+  const bad = extractEditableText(smartEditVerse(mk(), old, chipsDropped, { capturedFromDom: true }).content);
   assert(/said—\s*\\q1/.test(bad), `the em-dash stays on the line it ends (got ${JSON.stringify(bad)})`);
   assert(bad === good, `matches the well-formed capture (got ${JSON.stringify(bad)}, want ${JSON.stringify(good)})`);
+}
+
+// --- Case 74f: the guard is a statement about a DOM CAPTURE, so it must not
+// run for callers whose "new text" came from a stored tree. verseRebase renders
+// both sides with extractEditableText, so a tree that genuinely has no markers
+// is authoritative there — firing the guard would resurrect lineation the
+// queued op deliberately removed. Default (no capturedFromDom) must honor the
+// deletion; only the editor's capture path opts in.
+{
+  console.log("\n[Case 74f] Guard does not fire for non-DOM callers (verseRebase) (#606)");
+  const verse = {
+    verseObjects: [
+      { type: "quote", tag: "q1" },
+      zaln("H1", [w("the"), t(" ")]),
+      zaln("H2", [w("people"), t(",")]),
+      t(" "),
+      { type: "quote", tag: "q2" },
+      zaln("H3", [w("and"), t(" ")]),
+      zaln("H4", [w("light"), t(".")]),
+      t("”"),
+    ],
+  };
+  const old = extractEditableText(verse);
+  // An op that deliberately removed all the lineation AND changed punctuation —
+  // the exact shape the guard catches on the capture path.
+  const opText = old.replace("”", "").replace(/\\q\d?\s?/g, "").replace(/\s+/g, " ").trim();
+
+  const rebased = smartEditVerse(verse, old, opText); // no capturedFromDom
+  assert(
+    !/\\q/.test(extractEditableText(rebased.content)),
+    `rebase honors the op's marker deletion (got ${JSON.stringify(extractEditableText(rebased.content))})`,
+  );
+
+  const captured = smartEditVerse(verse, old, opText, { capturedFromDom: true });
+  assert(
+    (extractEditableText(captured.content).match(/\\q/g) ?? []).length === 2,
+    "the same text from a DOM capture keeps the markers",
+  );
+}
+
+// --- Case 74g: a `\ts\*` chunk divider prints its literal label even in the
+// non-chip render, so it can survive a capture that lost every \q/\p chip.
+// Testing "no marker tokens at all" would let that one stray divider defeat the
+// guard and the verse would lose its whole lineation anyway.
+{
+  console.log("\n[Case 74g] A surviving \\ts\\* divider does not defeat the guard (#606)");
+  const verse = {
+    verseObjects: [
+      { type: "quote", tag: "q1" },
+      zaln("H1", [w("the"), t(" ")]),
+      { tag: "ts", content: "\\*" },
+      zaln("H2", [w("people"), t(",")]),
+      t(" "),
+      { type: "quote", tag: "q2" },
+      zaln("H3", [w("light"), t(".")]),
+      t("”"),
+    ],
+  };
+  const old = extractEditableText(verse);
+  // Chips gone, but the \ts\* label survived the repaint.
+  const chipsDropped = old.replace("”", "").replace(/\\q\d?\s?/g, "").replace(/\s+/g, " ").trim();
+  assert(/\\ts/.test(chipsDropped), "the \\ts\\* label really did survive the capture");
+  const r = smartEditVerse(verse, old, chipsDropped, { capturedFromDom: true });
+  const out = extractEditableText(r.content);
+  assert(
+    (out.match(/\\q/g) ?? []).length === 2,
+    `both \\q markers survive despite the stray divider (got ${JSON.stringify(out)})`,
+  );
 }
 
 if (failed > 0) {
