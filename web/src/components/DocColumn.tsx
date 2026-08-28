@@ -6,7 +6,7 @@ import CheckIcon from "@mui/icons-material/Check";
 import type { TwlRow, VerseDto } from "../sync/api";
 import { CopyChapterButton } from "./CopyChapterButton";
 import { LANE_FILL, type TextLaneCheck } from "../lib/laneChecks";
-import { highlightsFor, isPaintableHtml, leadingBreakClass, renderEditableHTML, renderHighlightedHTML, type HighlightKey, type ReorderHighlight } from "../lib/highlight";
+import { highlightsFor, isPaintableHtml, leadingBreakClass, overlayFindMarks, renderEditableHTML, renderHighlightedHTML, type HighlightKey, type ReorderHighlight } from "../lib/highlight";
 import { markHighlightSx } from "../lib/highlightStyles";
 import { extractTrailingMarkers, stripTrailingMarkers, splitSectionHeaders, type SectionHeader } from "../lib/usfm";
 import { SectionHeaderBand } from "./SectionHeaderBand";
@@ -493,19 +493,41 @@ function VerseSpan({
   }, [prevHighlights, nextHighlights]);
 
   const html = useMemo(() => {
-    if (findHTML) return findHTML;
-    if (!content) return null;
     const verseObjects = (content as { verseObjects?: unknown[] } | null)?.verseObjects;
-    if (!Array.isArray(verseObjects)) return null;
     // Active editable verse: surface paragraph / poetry markers as literal
     // "\p" / "\q1" chips so they can be seen and adjusted in place — same as
     // the rows view active line. Render the verse's OWN objects (not the
     // drifted-composed set) so the contentEditable's textContent matches
     // extractEditableText and the smartEditVerse save diff lines up. Only the
     // active verse gets chips; the rest of the column stays clean.
-    if (isActive && !readOnly) {
-      return renderEditableHTML(verseObjects, highlights ?? new Set(), roles);
+    //
+    // This must win over `findHTML` even while Find is open: this cell stays
+    // contentEditable throughout, and findHTML is built from marker-free
+    // plain_text, so letting it win here would delete every `\q`/`\p` chip
+    // from the DOM a keystroke's save capture reads (#642). Paint find
+    // matches onto the chip render instead of substituting it.
+    if (isActive && !readOnly && Array.isArray(verseObjects)) {
+      // Find marks take precedence over note highlights while the overlay has
+      // a hit here. Not cosmetic: a `<mark class="be-hl">` wrapper splits the
+      // chip render into separate text runs, and overlayFindMarks refuses to
+      // split a match across a run boundary, so a multi-word query spanning a
+      // highlighted word would paint nothing at all.
+      const findLive = !!findHTML;
+      const chipHtml = renderEditableHTML(
+        verseObjects,
+        findLive ? new Set() : (highlights ?? new Set()),
+        findLive ? undefined : roles,
+      );
+      if (search?.re && (!isSource || search.sourceQuery.kind === "english")) {
+        return overlayFindMarks(chipHtml, search.re, activeRange);
+      }
+      return chipHtml;
     }
+    if (findHTML) return findHTML;
+    // A verse with plain_text but no content tree still paints find
+    // highlighting above; only past that point is there nothing to render.
+    if (!content) return null;
+    if (!Array.isArray(verseObjects)) return null;
     // Compose any drifted-down markers (from the previous verse's
     // trailing `\q1`/`\p` etc.) at the front so the visual break
     // introduces this verse, matching USFM intent.
@@ -518,7 +540,7 @@ function VerseSpan({
     // Render unconditionally so paragraph / poetry markers turn into
     // visual breaks / indents even without an active highlight set.
     return renderHighlightedHTML(drifted, highlights ?? new Set(), roles);
-  }, [findHTML, content, highlights, precedingMarkers, isActive, readOnly, roles]);
+  }, [findHTML, content, highlights, precedingMarkers, isActive, readOnly, roles, search, isSource, activeRange]);
 
   // Resync the editable span when (a) text changes from outside and the user
   // hasn't been typing since, or (b) highlights change. We let the user type
