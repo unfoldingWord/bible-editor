@@ -408,12 +408,83 @@ admin.delete("/users/:username", async (c) => {
 
 // ── On-demand DCS→D1 pull ────────────────────────────────────────────────
 
+// ── Issue #639: the stale-base override's scoping, as two pure functions ──────
+//
+// Extracted rather than inlined in the route so they are testable without an
+// HTTP harness. A test that re-derives the route's behavior instead of calling
+// it cannot catch the route regressing, which is exactly the class of bug these
+// two encode.
+
+/**
+ * Resolve `allowStaleBase` to the ONE resource it releases, or an error code.
+ *
+ * The override is per (book, resource). This route already scopes itself to one
+ * book, but `resources` is an array — and as a bare boolean the flag applied to
+ * every verse resource in the request, so a single consent alongside
+ * `["ult","ust"]` force-adopted BOTH wholesale stale re-exports. Mirrors
+ * reimportSyncGate.ts's allowIdBlocked convention: a boolean honored only for a
+ * request naming one book AND one resource.
+ *
+ * Rejects rather than narrowing. Silently applying to `resources[0]` would leave
+ * the other resource refused with no explanation, and silently applying to all
+ * of them is the bug itself.
+ */
+export function staleBaseOverrideForRequest(
+  allowStaleBase: boolean | undefined,
+  resources: readonly string[],
+): { error?: string; resource?: ReimportResource } {
+  if (!allowStaleBase) return {};
+  if (resources.length !== 1) return { error: "allow_stale_base_requires_single_resource" };
+  return { resource: resources[0] as ReimportResource };
+}
+
+/**
+ * Params for the whole-book (no-chapters) reimport Workflow dispatch.
+ *
+ * `allowStaleBase` has to travel, or this route's behavior would be
+ * MODE-DEPENDENT: the same request body force-releases when it names chapters
+ * (the inline path) and is silently refused when it doesn't, with nothing
+ * telling the operator why.
+ *
+ * `resource` (singular) rides along ONLY when the override is set, because that
+ * is the field exportWorkflow.ts's staleBaseOverrideAllowed reads to confirm the
+ * run names exactly one resource. Safe under `reimportOnly`: the Workflow
+ * returns before any export step, and the reimport resolves its own resource
+ * list from `resources`. Omitted otherwise so an ordinary multi-resource pull is
+ * byte-for-byte the dispatch it always was.
+ */
+export function reimportWorkflowParams(
+  book: string,
+  resources: readonly string[],
+  staleBaseOverrideResource: ReimportResource | undefined,
+): Record<string, unknown> {
+  return {
+    book,
+    resources,
+    reimportOnly: true,
+    ...(staleBaseOverrideResource ? { allowStaleBase: true, resource: staleBaseOverrideResource } : {}),
+  };
+}
+
 const ImportBody = z.object({
   book: z.string().min(1).max(8),
   resources: z.array(z.enum(["ult", "ust", "tn", "tq", "twl"])).min(1),
   // >= 0 so chapter 0 (front:intro) is a valid target. Absent/empty means
   // "whole book" — see the mode split below.
   chapters: z.array(z.number().int().min(0)).optional(),
+  // Issue #639 (F2): adopt a resource the stale-base gate would refuse — master
+  // presents a wholesale translationCore re-export taken from a snapshot older
+  // than the state D1 last synced. Absent/false runs the gate, same as the
+  // nightly.
+  //
+  // MUST name exactly ONE resource (enforced below, 400 otherwise). The route
+  // scopes itself to one book, but `resources` is an array: without that check a
+  // single `allowStaleBase: true` alongside `["ult","ust"]` force-adopts BOTH
+  // wholesale stale re-exports, when the operator had almost certainly inspected
+  // one. This mirrors reimportSyncGate.ts's allowIdBlocked convention exactly —
+  // a boolean flag that is only honored for a run naming one book AND one
+  // resource — rather than inventing a second override shape.
+  allowStaleBase: z.boolean().optional(),
 });
 
 // No force flag here (deliberately out of scope for this PR) — normal
@@ -451,6 +522,10 @@ admin.post("/import", bookLockGuard, async (c) => {
   const chapters = parsed.data.chapters ?? [];
   const userId = c.get("userId") ?? null;
 
+  const staleBase = staleBaseOverrideForRequest(parsed.data.allowStaleBase, resources);
+  if (staleBase.error) return c.json({ error: staleBase.error, resources }, 400);
+  const staleBaseOverrideResource = staleBase.resource;
+
   // Two modes:
   //   - chapters present  → inline, via the same non-destructive per-chapter
   //     logic as POST /api/books/:book/reimport (bookImport.ts). Cheap enough
@@ -462,7 +537,10 @@ admin.post("/import", bookLockGuard, async (c) => {
   //     separate steps instead.
   if (chapters.length > 0) {
     try {
-      const result = await reimportBookFromDcs(c.env, book, chapters, resources, userId, { source: "user" });
+      const result = await reimportBookFromDcs(c.env, book, chapters, resources, userId, {
+        source: "user",
+        staleBaseOverrideResource,
+      });
       return c.json({ mode: "inline", result });
     } catch (e) {
       if (e instanceof BookNotImportedError) return c.json({ error: "book_not_imported", book }, 404);
@@ -476,7 +554,8 @@ admin.post("/import", bookLockGuard, async (c) => {
   try {
     const instance = await c.env.EXPORT_WORKFLOW.create({
       id,
-      params: { book, resources, reimportOnly: true },
+      // Issue #639 (Codex finding 2) — see reimportWorkflowParams.
+      params: reimportWorkflowParams(book, resources, staleBaseOverrideResource),
     });
     return c.json({ mode: "workflow", id: instance.id }, 202);
   } catch (e) {

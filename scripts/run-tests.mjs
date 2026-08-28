@@ -41,6 +41,7 @@ const SQLITE_FILES = new Set([
   "src/masterLineagePersist.test.mjs",
   "src/rowRestoreNoop.test.mjs",
   "src/bookLock.test.mjs",
+  "src/staleBaseGate.test.mjs",
 ]);
 
 const EXTRA_IMPORTS = new Map([
@@ -51,6 +52,7 @@ const EXTRA_IMPORTS = new Map([
   ["src/tombstoneSweep.test.mjs", "./src/tsResolveHook.mjs"],
   ["src/aiRowDiffGate.test.mjs", "./src/tsResolveHook.mjs"],
   ["src/masterLineagePersist.test.mjs", "./src/tsResolveHook.mjs"],
+  ["src/staleBaseGate.test.mjs", "./src/tsResolveHook.mjs"],
 ]);
 
 function findTestFiles(dir) {

@@ -907,6 +907,16 @@ export interface ReimportCounts {
   // wrote nothing instead of bumping its version for the Nth consecutive night.
   // Optional, diagnostic — see api/src/bookReimport.ts's field doc.
   skipped_normalized?: number;
+  // Issue #639. A whole verse file (ult/ust) the sync REFUSED because Door43's
+  // copy is a wholesale translationCore re-export taken from a snapshot older
+  // than the state the app last synced from master — adopting it would revert
+  // everything that landed in between. Nothing was written for that resource and
+  // its watermark was withheld, so the export cannot republish the revert.
+  // `stale_base_overridden` is the same detection with an operator's explicit
+  // allowStaleBase override, i.e. master WAS adopted anyway. Optional,
+  // diagnostic — see api/src/staleBaseGate.ts.
+  stale_base_held?: number;
+  stale_base_overridden?: number;
   // Door43 master held EXACTLY the file our last export pushed, so master moved
   // because our own `-be-` branch merged, not because anyone edited master — and
   // the merge ancestor was corrected accordingly. Before this was recognized,

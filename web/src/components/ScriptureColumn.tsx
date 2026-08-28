@@ -17,7 +17,7 @@ import type { FindMatch } from "./FindReplaceOverlay";
 import { HebrewLine } from "./HebrewLine";
 import type { LexiconEntry } from "../hooks/useLexicon";
 import type { ChapterState } from "../hooks/useBook";
-import { highlightsFor, isPaintableHtml, renderEditableHTML, renderHighlightedHTML, type HighlightKey, type ReorderHighlight } from "../lib/highlight";
+import { highlightsFor, isPaintableHtml, overlayFindMarks, renderEditableHTML, renderHighlightedHTML, type HighlightKey, type ReorderHighlight } from "../lib/highlight";
 import { markHighlightSx } from "../lib/highlightStyles";
 import { extractEditableText, extractTrailingMarkers, stripTrailingMarkers, splitSectionHeaders, type SectionHeader } from "../lib/usfm";
 import { introEditBase } from "../lib/verseIntro";
@@ -1413,19 +1413,49 @@ function ActiveLine({
   }, [prevHighlights, nextHighlights]);
 
   const noteHTML = useMemo(() => {
-    if (findHTML) return null;
+    // Editable cells need this even while Find is open — see `html` below.
+    if (findHTML && !(editable && !readOnly)) return null;
     if (!Array.isArray(verseObjects)) return null;
-    const hlSet = highlights ?? (new Set() as Set<HighlightKey>);
+    // Find marks take precedence over note highlights while the overlay has a
+    // hit in this cell — BookView / DocColumn state that by nulling their
+    // `highlights` outright. It is not cosmetic here: a `<mark class="be-hl">`
+    // wrapper splits the chip render into separate text runs, and
+    // overlayFindMarks refuses to split a match across a run boundary, so a
+    // multi-word query spanning a highlighted word would paint nothing at all.
+    const findLive = !!findHTML;
+    const hlSet = findLive
+      ? (new Set() as Set<HighlightKey>)
+      : (highlights ?? (new Set() as Set<HighlightKey>));
+    const roleSets = findLive ? undefined : roles;
     // Edit mode surfaces paragraph / poetry markers as literal chips; read-only
     // emits block layout. Both render even with an empty active set so the
     // paragraph structure still shows; `roles` adds the prev/next channels when
     // a reorder is live (the parent uses FindAwareText for pure inactive rows).
     if (editable && !readOnly) {
-      return renderEditableHTML(verseObjects, hlSet, roles);
+      return renderEditableHTML(verseObjects, hlSet, roleSets);
     }
-    return renderHighlightedHTML(verseObjects, hlSet, roles);
+    return renderHighlightedHTML(verseObjects, hlSet, roleSets);
   }, [findHTML, verseObjects, highlights, editable, readOnly, roles]);
-  const html = findHTML ?? noteHTML;
+  // The editable cell stays contentEditable throughout, and whatever HTML is
+  // painted here is exactly what a keystroke's `textContent` capture reads
+  // back on save. `findHTML` is built from marker-free `text`, so letting it
+  // win here (as it safely can for read-only/inactive cells) would delete
+  // every `\q`/`\p` chip from the capture the moment Find is open (#642).
+  // Paint find matches onto the chip render instead of substituting it; when
+  // there's no chip tree to protect (no verseObjects), fall back to the old
+  // precedence since there's nothing for it to destroy.
+  const html = useMemo(() => {
+    if (editable && !readOnly) {
+      if (noteHTML) {
+        if (search?.re && (!isSource || search.sourceQuery.kind === "english")) {
+          return overlayFindMarks(noteHTML, search.re, activeRange);
+        }
+        return noteHTML;
+      }
+      return findHTML;
+    }
+    return findHTML ?? noteHTML;
+  }, [editable, readOnly, noteHTML, findHTML, search, isSource, activeRange]);
 
   // Only resync the DOM when the highlight/content state actually changes —
   // not on every keystroke. This lets the user type freely; clicking a
