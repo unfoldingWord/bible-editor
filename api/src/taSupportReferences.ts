@@ -57,6 +57,7 @@ export const TA_SUPPORT_REFERENCE_IDS: string[] = [
   "figs-rquestion",
   "figs-simile",
   "figs-synecdoche",
+  "figs-you",
   "figs-youcrowd",
   "figs-youdual",
   "figs-youformal",
