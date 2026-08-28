@@ -33,6 +33,7 @@ import {
   staleBaseAlertMessage,
 } from "./staleBaseHolds.ts";
 import { staleBaseOverrideAllowed } from "./reimportSyncGate.ts";
+import { staleBaseOverrideForRequest, reimportWorkflowParams } from "./admin.ts";
 import { planAndStageBookResourcesForTest, reimportBookFromDcs } from "./bookReimport.ts";
 
 let failed = 0;
@@ -561,7 +562,7 @@ console.log("\n5. durable record + banner");
 console.log("\n8. F2 — reimportBookFromDcs (user pull) honours the gate");
 {
   const realFetch5 = globalThis.fetch;
-  const run = async ({ allowStaleBase }) => {
+  const run = async ({ staleBaseOverrideResource, resources = ["ult"], seedUst = false }) => {
     const { sqlite, env } = freshEnv();
     sqlite.exec(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (1, 1, 'admin')`);
     sqlite.exec(`INSERT INTO book_imports (book) VALUES ('2CH')`);
@@ -572,6 +573,15 @@ console.log("\n8. F2 — reimportBookFromDcs (user pull) honours the gate");
     sqlite
       .prepare(`INSERT INTO book_resource_syncs (book, resource, source_sha, synced_at, origin) VALUES ('2CH','ult',?,?,'reimport')`)
       .run(PREV_SHA, SYNCED_AT);
+    if (seedUst) {
+      sqlite.exec(
+        `INSERT INTO verses (book, chapter, verse, bible_version, content_json, plain_text, version)
+         VALUES ('2CH', 4, 11, 'UST', '{"good":1}', 'good', 2)`,
+      );
+      sqlite
+        .prepare(`INSERT INTO book_resource_syncs (book, resource, source_sha, synced_at, origin) VALUES ('2CH','ust',?,?,'reimport')`)
+        .run(PREV_SHA, SYNCED_AT);
+    }
     stubFetch({
       masterSha: MASTER_SHA,
       masterBody: bodyWith(INCOMING_ID_LINE),
@@ -595,11 +605,14 @@ console.log("\n8. F2 — reimportBookFromDcs (user pull) honours the gate");
       }
       return inner(u);
     };
-    const result = await reimportBookFromDcs(env, "2CH", [4], ["ult"], 1, { source: "user", allowStaleBase });
+    const result = await reimportBookFromDcs(env, "2CH", [4], resources, 1, {
+      source: "user",
+      staleBaseOverrideResource,
+    });
     return { sqlite, result };
   };
   try {
-    const refused = await run({ allowStaleBase: undefined });
+    const refused = await run({ staleBaseOverrideResource: undefined });
     eq(refused.result.perResource.ult.stale_base_held, 1, "user pull → the gate refuses, same as the nightly");
     eq(refused.result.perResource.ult.updated, 0, "…and not one verse is rewritten");
     eq(refused.result.perResource.ult.dcs_404, 0, "…and a refusal is NOT misreported as a missing file");
@@ -622,7 +635,7 @@ console.log("\n8. F2 — reimportBookFromDcs (user pull) honours the gate");
       "…and the watermark never moved to the refused revision",
     );
 
-    const forced = await run({ allowStaleBase: true });
+    const forced = await run({ staleBaseOverrideResource: "ult" });
     eq(forced.result.perResource.ult.stale_base_held, 0, "explicit allowStaleBase → not refused");
     eq(forced.result.perResource.ult.stale_base_overridden, 1, "…counted as an override actually used");
     eq(
@@ -630,9 +643,71 @@ console.log("\n8. F2 — reimportBookFromDcs (user pull) honours the gate");
       "stale_tc_reexport_overridden",
       "…and recorded as an override, not as a refusal",
     );
+
+    // Codex finding 1. As a bare boolean, one consent released EVERY verse
+    // resource in the request: `{resources:["ult","ust"], allowStaleBase:true}`
+    // force-adopted two wholesale stale re-exports when the operator had
+    // inspected one. The override now NAMES its resource, so releasing ULT says
+    // nothing about UST.
+    const spill = await run({ staleBaseOverrideResource: "ult", resources: ["ult", "ust"], seedUst: true });
+    eq(spill.result.perResource.ult.stale_base_overridden, 1, "the NAMED resource is released");
+    eq(spill.result.perResource.ust.stale_base_overridden, 0, "the unnamed one is NOT released by the same consent");
+    eq(spill.result.perResource.ust.stale_base_held, 1, "…it is still refused");
+    eq(
+      spill.sqlite.prepare(`SELECT content_json FROM verses WHERE book='2CH' AND bible_version='UST'`).all()[0].content_json,
+      '{"good":1}',
+      "…and UST's good content survives an ULT-scoped override",
+    );
+    eq(
+      spill.sqlite.prepare(`SELECT resource, reason FROM stale_base_holds ORDER BY resource`).all(),
+      [
+        { resource: "ult", reason: "stale_tc_reexport_overridden" },
+        { resource: "ust", reason: "stale_tc_reexport" },
+      ],
+      "…and the two are recorded differently",
+    );
   } finally {
     globalThis.fetch = realFetch5;
   }
+}
+
+// ── 9. Codex findings on the admin route's override plumbing ────────────────
+console.log("\n9. admin route — override scoping and mode-independence");
+{
+  // Finding 1: a multi-resource request carrying the flag is rejected outright,
+  // rather than silently applying to all of them (the bug) or silently to the
+  // first (equally surprising). This mirrors reimportSyncGate's allowIdBlocked
+  // convention: a boolean honored only for one book AND one resource.
+  eq(
+    staleBaseOverrideForRequest(true, ["ult", "ust"]),
+    { error: "allow_stale_base_requires_single_resource" },
+    "allowStaleBase + two resources → rejected, not applied to both",
+  );
+  eq(staleBaseOverrideForRequest(true, ["ult", "ust", "tn"]).error, "allow_stale_base_requires_single_resource", "…and for three");
+  eq(staleBaseOverrideForRequest(true, ["ult"]), { resource: "ult" }, "allowStaleBase + exactly one resource → scoped to that one");
+  eq(staleBaseOverrideForRequest(false, ["ult", "ust"]), {}, "no flag + many resources → the gate runs for all of them");
+  eq(staleBaseOverrideForRequest(undefined, ["ult"]), {}, "absent flag → no override");
+
+  // Finding 2: the whole-book path (no chapters → Workflow) must carry the flag,
+  // or the SAME body behaves differently depending on whether it named chapters.
+  // The Workflow reads `resource` (singular) to confirm single-resource scoping,
+  // so both fields have to travel together.
+  eq(
+    reimportWorkflowParams("2CH", ["ult"], "ult"),
+    { book: "2CH", resources: ["ult"], reimportOnly: true, allowStaleBase: true, resource: "ult" },
+    "whole-book dispatch carries allowStaleBase AND the resource the Workflow gates on",
+  );
+  eq(
+    reimportWorkflowParams("2CH", ["ult", "ust"], undefined),
+    { book: "2CH", resources: ["ult", "ust"], reimportOnly: true },
+    "…and an ordinary pull is unchanged — no resource narrowing, no flag",
+  );
+  // The Workflow's own gate must then accept exactly this shape.
+  eq(
+    staleBaseOverrideAllowed({ allowStaleBase: true, book: "2CH", resource: "ult" }, 1, 1, "ult"),
+    true,
+    "…and staleBaseOverrideAllowed honours what the dispatch sends",
+  );
 }
 
 console.log(failed === 0 ? "\nAll stale-base gate tests passed." : `\n${failed} test(s) FAILED.`);

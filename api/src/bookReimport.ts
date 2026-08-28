@@ -929,12 +929,19 @@ export async function reimportBookFromDcs(
   chapters: number[],
   resources: Resource[],
   userId: number | null,
-  // Issue #639 (F2): `allowStaleBase` is the admin's explicit consent to adopt a
-  // file the stale-base gate would refuse. Absent/false, this route now runs the
+  // Issue #639 (F2): `staleBaseOverrideResource` is the admin's explicit consent
+  // to adopt a file the stale-base gate would refuse. Absent, this route runs the
   // SAME gate as the nightly — see runReimport's call to
   // evaluateStaleBaseReplacement for why leaving it unguarded made the nightly's
   // own banner an instruction to do the damage by hand.
-  _opts: { source: "user" | "cron"; allowStaleBase?: boolean },
+  //
+  // A NAMED RESOURCE, not a boolean. As a boolean it applied to every verse
+  // resource in the request, so one `allowStaleBase: true` alongside
+  // `["ult","ust"]` force-adopted BOTH wholesale stale re-exports off a single
+  // consent. The route also rejects a multi-resource request carrying the flag
+  // (see admin.ts), but the type is what makes over-applying impossible rather
+  // than merely unreachable.
+  _opts: { source: "user" | "cron"; staleBaseOverrideResource?: Resource },
 ): Promise<ReimportResult> {
   const urls = dcsUrls(env, book);
   if (!urls) throw new Error(`unknown book: ${book}`);
@@ -963,7 +970,7 @@ export async function reimportBookFromDcs(
   if (!lock.meta.changes) throw new ImportInProgressError(book);
 
   try {
-    return await runReimport(env, book, chapters, resources, userId, _opts.allowStaleBase === true);
+    return await runReimport(env, book, chapters, resources, userId, _opts.staleBaseOverrideResource);
   } finally {
     await env.DB.prepare(`DELETE FROM book_import_locks WHERE book = ?1`)
       .bind(book)
@@ -977,7 +984,11 @@ async function runReimport(
   chapters: number[],
   resources: Resource[],
   userId: number | null,
-  allowStaleBase: boolean = false,
+  // Issue #639. Names the ONE resource an operator consented to force-adopt past
+  // the stale-base gate, or undefined to run the gate for everything. Never a
+  // boolean — see reimportBookFromDcs's doc for the over-application this shape
+  // rules out.
+  staleBaseOverrideResource?: Resource,
 ): Promise<ReimportResult> {
   const urls = dcsUrls(env, book)!;
 
@@ -1065,9 +1076,9 @@ async function runReimport(
   // So the same measurement runs here, with the same outcome (the resource's raw
   // text is dropped, so nothing is applied and nothing downstream stamps for it),
   // and the SAME durable record + banner. The difference from the nightly is only
-  // in how it is released: `allowStaleBase` is passed straight through from the
-  // admin request rather than computed from an export's book/resource scoping,
-  // because this route is already scoped to one book by construction.
+  // in how it is released: the override names its resource, resolved by the admin
+  // route (which rejects a multi-resource request carrying the flag) rather than
+  // computed from an export run's book/resource scoping.
   //
   // Runs AFTER the dcs_404 tally (a refusal is not a missing file and must not be
   // reported as one) and BEFORE the own-publish loop (which advances
@@ -1098,13 +1109,15 @@ async function runReimport(
       continue;
     }
     const now = Math.floor(Date.now() / 1000);
+    // Per-resource: an operator who released ULT has said nothing about UST.
+    const overridden = staleBaseOverrideResource === resource;
     const ok = await recordStaleBaseHold(
       env,
       hold,
-      allowStaleBase ? "stale_tc_reexport_overridden" : "stale_tc_reexport",
+      overridden ? "stale_tc_reexport_overridden" : "stale_tc_reexport",
       now,
     );
-    await raiseStaleBaseHoldAlert(env, hold, !ok, allowStaleBase);
+    await raiseStaleBaseHoldAlert(env, hold, !ok, overridden);
     console.warn("reimport (user pull): master file is a wholesale re-export from a stale translationCore base (#639)", {
       book,
       resource,
@@ -1113,9 +1126,9 @@ async function runReimport(
       incomingTcExportAt: hold.incomingTcExportAt,
       previousTcExportAt: hold.previousTcExportAt,
       syncedAt: hold.syncedAt,
-      action: allowStaleBase ? "FORCE-RELEASED by operator — adopting anyway" : "REFUSED",
+      action: overridden ? "FORCE-RELEASED by operator — adopting anyway" : "REFUSED",
     });
-    if (allowStaleBase) {
+    if (overridden) {
       perResource[resource].stale_base_overridden++;
       continue;
     }
