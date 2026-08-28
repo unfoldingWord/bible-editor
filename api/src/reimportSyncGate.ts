@@ -252,3 +252,35 @@ export function idBlockedOverrideAllowed(
   if (params.resource !== resourceBeingChecked) return false;
   return resolvedBookCount === 1 && resolvedResourceCount === 1;
 }
+
+// Issue #639: may this run adopt a resource the stale-base gate REFUSED
+// (staleBaseGate.ts)? Same deliberately narrow shape as the three overrides
+// above — only a run naming exactly ONE book and ONE resource qualifies, so no
+// cron path can ever carry it and force-adopt a stale replacement across the
+// corpus.
+//
+// The gate normally releases itself: it is re-evaluated every night against
+// master's current file, so repairing master upstream clears the hold, the
+// banner and the durable record with no human action here. This override exists
+// for the case that does NOT self-release — master keeps the stale
+// translationCore stamp permanently because the newer work was re-applied on
+// top of the stale export by hand. The file is then harmless but the gate
+// cannot tell, and the resource's export would stay frozen forever.
+//
+// Like idBlockedOverrideAllowed, and unlike allowShrink/allowMergeRefusal, this
+// is a consent to a data-loss RISK rather than a plain unstick: if the operator
+// is wrong about the file, this adopts a revert into D1 and the export
+// republishes it. That is why the durable record is written anyway (the
+// force-released variant of the banner), never skipped because the operator
+// approved.
+export function staleBaseOverrideAllowed(
+  params: { allowStaleBase?: boolean; book?: string; resource?: string },
+  resolvedBookCount: number,
+  resolvedResourceCount: number,
+  resourceBeingChecked: string,
+): boolean {
+  if (params.allowStaleBase !== true) return false;
+  if (!params.book || !params.resource) return false;
+  if (params.resource !== resourceBeingChecked) return false;
+  return resolvedBookCount === 1 && resolvedResourceCount === 1;
+}

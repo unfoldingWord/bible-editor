@@ -39,6 +39,9 @@ exports.post("/run", requireAdmin, async (c) => {
   if (parsed.data.allowIdBlocked && !(parsed.data.book && parsed.data.resource)) {
     return c.json({ error: "allow_id_blocked_requires_book_and_resource" }, 400);
   }
+  if (parsed.data.allowStaleBase && !(parsed.data.book && parsed.data.resource)) {
+    return c.json({ error: "allow_stale_base_requires_book_and_resource" }, 400);
+  }
   if (parsed.data.allowLocked && !(parsed.data.book && parsed.data.resource)) {
     return c.json({ error: "allow_locked_requires_book_and_resource" }, 400);
   }
@@ -95,6 +98,7 @@ exports.post("/run", requireAdmin, async (c) => {
     allowShrink: parsed.data.allowShrink,
     allowMergeRefusal: parsed.data.allowMergeRefusal,
     allowIdBlocked: parsed.data.allowIdBlocked,
+    allowStaleBase: parsed.data.allowStaleBase,
     allowLocked: parsed.data.allowLocked,
     branchName: parsed.data.branchName,
   };

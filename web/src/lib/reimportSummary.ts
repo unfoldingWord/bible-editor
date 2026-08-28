@@ -27,6 +27,22 @@ export function summarizeReimport(res: ReimportResponse): string {
   // so without this line the list would be empty and the snackbar would report "no
   // changes" for a pull that declined every verse.
   if (t.skipped_normalized) parts.push(`${t.skipped_normalized} identical once exported`);
+  // Issue #639, same precedent as skipped_normalized directly above: a decision
+  // the sync made that nobody can see from the row counts. Without these two
+  // lines a pull that refused a whole resource reports "no changes" — the single
+  // most misleading thing this snackbar could say about a refusal, since the
+  // operator would reasonably read it as "Door43 and the app already agree".
+  //
+  // Worded per-resource ("file"), because the measurement is per (book,
+  // resource) and other resources for the same book are unaffected.
+  if (t.stale_base_held) {
+    parts.push(`${t.stale_base_held} file(s) held — Door43 has an older translationCore export (see alerts)`);
+  }
+  // The override having been USED gets its own, louder line: this one published a
+  // known revert rather than refusing it.
+  if (t.stale_base_overridden) {
+    parts.push(`${t.stale_base_overridden} stale file(s) ADOPTED by override — will publish to Door43`);
+  }
   if (t.source_attr_reconciled) parts.push(`${t.source_attr_reconciled} source-attr fix(es) synced from master`);
   if (t.merge_adopted) parts.push(`${t.merge_adopted} adopted from master (out-of-band correction)`);
   // Kept the app's version of a two-sided change, because no commit from a

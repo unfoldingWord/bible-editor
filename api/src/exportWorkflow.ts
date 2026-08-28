@@ -83,7 +83,7 @@ import { hardRejectRows } from "./hardRejectGuard";
 import { validateUsfm, summarizeUsfmIssues } from "./usfmValidate";
 import type { UsfmValidationIssue } from "./usfmValidate";
 import { shrinkOverrideAllowed } from "./shrinkGuard";
-import { mergeRefusalOverrideAllowed, idBlockedOverrideAllowed } from "./reimportSyncGate";
+import { mergeRefusalOverrideAllowed, idBlockedOverrideAllowed, staleBaseOverrideAllowed } from "./reimportSyncGate";
 import { lockedBooksIn } from "./bookLock";
 import {
   PUBLISHED_RELEASE_TAG,
@@ -144,6 +144,14 @@ export interface ExportParams {
   // still-blocked row(s) on THIS export, so the caller must have verified the
   // collision is a genuine reissue (or accepted the loss) before setting it.
   allowIdBlocked?: boolean;
+  // Issue #639: human override for the stale-base gate (staleBaseGate.ts) — the
+  // refusal to adopt a wholesale translationCore re-export whose snapshot
+  // predates the state D1 last synced from master. The gate normally releases
+  // itself once master is repaired (it is re-judged nightly), so this exists for
+  // the one shape that cannot: master keeps the stale tC stamp permanently
+  // because the newer work was hand-re-applied on top of the stale export.
+  // Same narrow gating as the three above, via staleBaseOverrideAllowed.
+  allowStaleBase?: boolean;
   // Human override for the book-lock gate. A locked book (published, or
   // explicitly frozen via book_locks) is withheld from Door43 by the gate in
   // exportOne; this is the escape hatch for pushing a deliberate fix to a
@@ -243,6 +251,15 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     if (params.allowIdBlocked === true && !idBlockedOverride) {
       console.log("export: allowIdBlocked ignored — requires an explicit single book + resource");
     }
+    // Issue #639: same narrow gating for the stale-base gate override — only a
+    // run naming exactly one book and one resource may bypass it, and only for
+    // that named resource.
+    const staleBaseOverride = params.resource
+      ? staleBaseOverrideAllowed(params, books.length, resources.length, params.resource)
+      : false;
+    if (params.allowStaleBase === true && !staleBaseOverride) {
+      console.log("export: allowStaleBase ignored — requires an explicit single book + resource");
+    }
     // Book-lock override, same narrow shape as shrinkOverride above: only a run
     // naming exactly ONE book and ONE resource can carry it, so every cron path
     // (which omits both) keeps the lock gate no matter what params get passed.
@@ -295,6 +312,7 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
           await runChunkedReimport(this.env, step, book, instanceId, reimportResources, {
             mergeRefusalOverrideResource: mergeRefusalOverride ? (params.resource as Resource) : undefined,
             idBlockedOverrideResource: idBlockedOverride ? (params.resource as Resource) : undefined,
+            staleBaseOverrideResource: staleBaseOverride ? (params.resource as Resource) : undefined,
           });
         } catch (e) {
           // Lock contention / transient DCS failure / Cloudflare subrequest cap:
