@@ -1053,7 +1053,16 @@ const VerseCell = memo(function VerseCell({
           <IconButton
             onClick={(e) => {
               e.stopPropagation();
-              onSaveVerse(bibleVersion, chapter, verseNum, lastTextRef.current, dto);
+              // Read the live DOM, not lastTextRef: lastTextRef is reseeded
+              // from marker-free `plain_text` in several places (mount,
+              // resync, undo) and only the active-editable `onInput` handler
+              // ever corrects it to the chip-bearing text. A draft created
+              // without an intervening keystroke in this mount (e.g.
+              // restored on reload, or AI auto-apply) would otherwise ship a
+              // stale, marker-free save even though the DOM itself carries
+              // the correct \q/\p chips (#642 defect 1). Mirrors
+              // ScriptureColumn's elRef.current?.textContent save read.
+              onSaveVerse(bibleVersion, chapter, verseNum, elRef.current?.textContent ?? lastTextRef.current, dto);
             }}
             size="small"
             sx={{ color: "primary.main", p: 0.25, ml: 0.75, verticalAlign: "-3px" }}
@@ -1093,17 +1102,42 @@ const VerseCell = memo(function VerseCell({
           elRef.current = node;
         }}
         data-dirty={hasDraft ? "true" : undefined}
+        // Deliberately NOT gated on `isActive` (unlike the chip render
+        // above): gating it would mean the click that activates a verse
+        // arrives with contentEditable still false, so the browser's native
+        // mousedown caret-placement can't run — reintroducing the
+        // already-fixed "click twice to type" bug that
+        // setInnerHtmlPreservingCaret exists to avoid. Instead, the
+        // isActive check lives in onInput below, which rejects/reverts any
+        // keystroke landing here before activation completes, without
+        // touching this element's editability or the caret mechanics
+        // (#642 defect 2).
         contentEditable={!readOnly}
         suppressContentEditableWarning
         spellCheck={!rtl}
         dir={rtl ? "rtl" : "ltr"}
         onInput={(e) => {
           if (readOnly) return;
+          const el = e.currentTarget as HTMLSpanElement;
+          if (!isActive) {
+            // This span is contentEditable so a click's native caret
+            // placement lands here even before activation completes (e.g.
+            // the alignment-dirty-gate dialog in Shell defers
+            // setActiveVerse) — but only the ACTIVE verse's render includes
+            // \q/\p chips (see the `html` memo above). Accepting a keystroke
+            // here would stash a draft built from this marker-drifted "clean"
+            // text, dropping paragraph/poetry markers on save (#642 defect
+            // 2). Revert the stray input and ignore it rather than starting
+            // a draft; once activation lands the chip render takes over and
+            // typing behaves normally.
+            el.textContent = lastTextRef.current;
+            return;
+          }
           // textContent, not innerText: in Firefox `innerText` read inside the
           // input handler returns a stale/truncated value (layout not flushed),
           // which then corrupts the stored draft and the verse. textContent is
           // synchronous and reliable in both browsers (matches the rows editor).
-          const value = (e.currentTarget as HTMLSpanElement).textContent ?? "";
+          const value = el.textContent ?? "";
           onEditVerse(chapter, verseNum, bibleVersion, value, dto);
           lastTextRef.current = value;
           lastSetRef.current = value;
