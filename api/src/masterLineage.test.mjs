@@ -400,12 +400,28 @@ eq(
 // wrong-direction outcome deliberately, because what it is really testing is
 // that `\b` does not fire mid-word; the fallout is AI_MARKER's own design gap.
 // That gap fires ZERO times in the path-scoped history this module actually
-// sees, so it is filed rather than fixed here — issue #647 asks for a MEASURED
-// decision on whether AI_MARKER should learn an author check.
+// sees, so it is filed rather than fixed here — issue #647 asked for a
+// MEASURED decision on whether AI_MARKER should learn an author check, and
+// masterLineage.ts note 4 now records that decision: no, leave it, because the
+// shape this would protect against (a non-bot, non-revert subject quoting the
+// marker) has a measured count of ZERO across the full 46,802-commit corpus.
 eq(
   kind('Revertsomething "TQ: AMO 5 [be..s@api.bp-assistant]"', RICH),
   "ai",
   "'Revertsomething' is NOT a revert — \\b must not fire mid-word (#634)",
+);
+// #647's own motivating example: an ordinary, non-revert human edit message
+// that happens to quote the marker. Same residual gap as above, pinned
+// separately because it is the shape the issue actually worried about (the
+// `Revertsomething` case above exists to test `\b`'s word-boundary behavior,
+// not this). masterLineage.ts note 4 records why this stays `ai`: measured
+// zero occurrences of this shape in the full corpus, and an author check would
+// cost AI_MARKER's one remaining job (catching an unknown future bot) against
+// a shape that has never once happened.
+eq(
+  kind('Fix bad rows from TQ: AMO 5 [be..s@api.bp-assistant]', RICH),
+  "ai",
+  "a non-revert human edit message that merely quotes the marker still classifies ai — the recorded, measured decision, not an oversight (#647)",
 );
 
 // ── #638: the trailer-route gate is prefix + {chapter digits or bracket} ────

@@ -106,6 +106,29 @@
 //    one route that still recognizes a future bot pushing under an author
 //    BOT_EMAILS does not know (see the constant's own note) — but do not
 //    credit it with doing work today. (issue #612)
+//    RE-MEASURED 2026-08-30 (issue #647), asking the narrower question note 4
+//    left open: not "does AI_MARKER fire on a non-revert subject" (it can, by
+//    construction — the regex has no author or revert check) but "has it EVER
+//    fired on the shape that would actually hurt", i.e. a human's own edit
+//    message that happens to quote the marker outside a revert (the issue's
+//    own example: `Fix bad rows from TQ: AMO 5 [be..s@api.bp-assistant]`).
+//    It has not: ALL 339 repo-wide AI_MARKER matches are `Merge pull request
+//    …`-shaped (this note's own count above), zero of them share the
+//    "ordinary sentence that cites the marker" shape the issue is worried
+//    about, and — independently — Gitea's path-scoped history simplification
+//    drops every one of the 339 before this classifier ever sees it. So the
+//    measured count of "non-bot, non-revert, marker-quoting, classifier-
+//    visible" commits across the full 46,802-commit corpus is ZERO, and per
+//    this issue's own decision rule ("if that count is 0 ... the decision is
+//    leave it, with the number written down") the answer is: leave AI_MARKER
+//    as a bare subject match, do not add an author check. An author check
+//    would also cost something real — it is the one route that still catches
+//    an UNKNOWN future bot (see the constant's own comment) — so paying that
+//    cost against a shape that has never once occurred is the wrong trade.
+//    masterLineage.test.mjs pins the residual gap this leaves (a non-bot,
+//    non-revert subject that quotes the marker still classifies `ai`) so it
+//    stays visible rather than silently relied upon; re-open this note the day
+//    a real commit of that shape is found.
 //    The same trap applies to the AI_PIPELINE_TRAILER route, which reads the
 //    BOT-authored commit's body rather than an unknown author's subject: a
 //    bot-pushed hand-directed revert or repair can quote another commit's
