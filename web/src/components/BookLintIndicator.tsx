@@ -16,6 +16,7 @@ import {
   ListItemText,
   Menu,
   MenuItem,
+  Portal,
   Snackbar,
   Tooltip,
   Typography,
@@ -59,8 +60,13 @@ interface Props {
   onDismissed?: () => void;
 }
 
+// A row can carry SEVERAL independent lint findings with the same rowId
+// (e.g. the dismissible review flag plus unrelated content checks like
+// "13. Paired Square Bracket" or "Empty note") — keying on resource+rowId
+// alone made dismissing one hide the row's other live findings. `check` is
+// included so only the specific finding just dismissed is filtered.
 function issueKey(issue: BookLintIssue): string {
-  return `${issue.resource}|${issue.rowId ?? ""}`;
+  return `${issue.resource}|${issue.rowId ?? ""}|${issue.check}`;
 }
 
 // Compact Door43-vs-here detail for a dismissible issue. Module-level (not
@@ -111,31 +117,44 @@ export function BookLintIndicator({
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   // Optimistically-cleared issues (issue #653 direction 2 "Mark reviewed").
   // Filtered out of the local list immediately; the parent's refetch (via
-  // onDismissed) eventually replaces flagIssues wholesale and this resets.
+  // onDismissed) eventually replaces flagIssues wholesale, which — combined
+  // with the check-scoped issueKey above — correctly re-filters a row whose
+  // dismissed flag transiently reappears in a refetch without touching any
+  // of that row's OTHER (still-live) findings.
   const [dismissedKeys, setDismissedKeys] = useState<Set<string>>(new Set());
-  // rowId set currently mid-flight for a group "Dismiss all" run.
-  const [dismissingGroup, setDismissingGroup] = useState<string | null>(null);
+  // A single flag disables every dismiss control (per-issue and group)
+  // while ANY dismissal is in flight — simplest way to avoid two concurrent
+  // group runs stomping each other's busy state, or a double-click firing a
+  // duplicate POST. `busyKey` is cosmetic only (which control shows the
+  // spinner); the actual gate is `dismissBusy`.
+  const [dismissBusy, setDismissBusy] = useState(false);
+  const [busyKey, setBusyKey] = useState<string | null>(null);
   const [dismissError, setDismissError] = useState<string | null>(null);
 
-  // Local dismiss/expand state is keyed to THIS book's issue set — reset on
-  // book change so a stale entry can't coincidentally match a same-rowId
-  // issue in the next book navigated to.
+  // Local dismiss/expand state is keyed to THIS book's issue set. In
+  // practice App.tsx keys <Shell> on `book`, so this component remounts
+  // (fresh state) on book change rather than receiving a `book` prop update
+  // — this effect is currently dead but harmless, kept as a defensive
+  // backstop against a stale entry surviving a future change to that
+  // remount behavior.
   useEffect(() => {
     setDismissedKeys(new Set());
     setExpanded(new Set());
   }, [book]);
 
-  // Nothing to clean up — stay out of the way.
-  if (flagCount <= 0) return null;
-
   const visibleIssues = flagIssues.filter((i) => !dismissedKeys.has(issueKey(i)));
-  const groups = groupLintIssues(visibleIssues);
   // The server's flagCount is the source of truth once a refetch lands, but
   // between an optimistic dismiss and that refetch it would otherwise read
   // stale (higher than what the menu now shows) — subtract what we've
-  // already cleared locally so the chip/header agree with the list.
+  // already cleared locally so the chip/header/early-return all agree with
+  // the list, including not lingering at "0" with an open empty menu.
   const dismissedFlagCount = flagIssues.length - visibleIssues.length;
   const displayFlagCount = Math.max(flagCount - dismissedFlagCount, 0);
+
+  // Nothing left to clean up — stay out of the way.
+  if (displayFlagCount <= 0) return null;
+
+  const groups = groupLintIssues(visibleIssues);
 
   const tooltip = `${displayFlagCount} issue${displayFlagCount === 1 ? "" : "s"} to clean up in ${book}${
     escalateCount > 0 ? ` (+${escalateCount} integrity)` : ""
@@ -152,34 +171,45 @@ export function BookLintIndicator({
 
   const dismissOne = async (issue: BookLintIssue) => {
     const kind = dismissibleKind(issue.resource);
-    if (!issue.rowId || !kind) return;
+    if (!issue.rowId || !kind || dismissBusy) return;
+    setDismissBusy(true);
+    setBusyKey(issueKey(issue));
     try {
-      await api.dismissReviewFlag(kind, book, issue.rowId);
+      await api.dismissReviewFlag(kind, book, issue.rowId, issue.reviewKind);
       setDismissedKeys((prev) => new Set(prev).add(issueKey(issue)));
       onDismissed?.();
     } catch {
       setDismissError("Could not mark reviewed — try again.");
+    } finally {
+      setDismissBusy(false);
+      setBusyKey(null);
     }
   };
 
   const dismissGroup = async (group: { key: string; issues: BookLintIssue[] }) => {
-    setDismissingGroup(group.key);
+    if (dismissBusy) return;
+    setDismissBusy(true);
+    setBusyKey(group.key);
     let failed = 0;
-    for (const issue of group.issues) {
-      const kind = dismissibleKind(issue.resource);
-      if (!issue.rowId || !kind) continue;
-      try {
-        await api.dismissReviewFlag(kind, book, issue.rowId);
-        setDismissedKeys((prev) => new Set(prev).add(issueKey(issue)));
-      } catch {
-        failed++;
+    try {
+      for (const issue of group.issues) {
+        const kind = dismissibleKind(issue.resource);
+        if (!issue.rowId || !kind) continue;
+        try {
+          await api.dismissReviewFlag(kind, book, issue.rowId, issue.reviewKind);
+          setDismissedKeys((prev) => new Set(prev).add(issueKey(issue)));
+        } catch {
+          failed++;
+        }
       }
+      if (failed > 0) {
+        setDismissError(`${failed} of ${group.issues.length} failed to clear — try again.`);
+      }
+      onDismissed?.();
+    } finally {
+      setDismissBusy(false);
+      setBusyKey(null);
     }
-    setDismissingGroup(null);
-    if (failed > 0) {
-      setDismissError(`${failed} of ${group.issues.length} failed to clear — try again.`);
-    }
-    onDismissed?.();
   };
 
   return (
@@ -252,19 +282,27 @@ export function BookLintIndicator({
                       <DoorDiff issue={issue} />
                     </>
                   }
+                  secondaryTypographyProps={{ component: "div" }}
                 />
                 {issue.dismissible && issue.rowId && dismissibleKind(issue.resource) && (
                   <Tooltip title="Mark reviewed — clears this flag without changing the row">
-                    <IconButton
-                      size="small"
-                      sx={{ ml: 0.5, mt: 0.25 }}
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        void dismissOne(issue);
-                      }}
-                    >
-                      <CheckCircleOutlineIcon fontSize="small" />
-                    </IconButton>
+                    <span>
+                      <IconButton
+                        size="small"
+                        disabled={dismissBusy}
+                        sx={{ ml: 0.5, mt: 0.25 }}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          void dismissOne(issue);
+                        }}
+                      >
+                        {busyKey === issueKey(issue) ? (
+                          <CircularProgress size={16} />
+                        ) : (
+                          <CheckCircleOutlineIcon fontSize="small" />
+                        )}
+                      </IconButton>
+                    </span>
                   </Tooltip>
                 )}
               </MenuItem>,
@@ -279,7 +317,7 @@ export function BookLintIndicator({
           // MenuList sees each item as a direct child for keyboard nav.
           const isExpanded = expanded.has(group.key);
           const fullyDismissible = isGroupFullyDismissible(group.issues);
-          const groupBusy = dismissingGroup === group.key;
+          const groupSpinning = dismissBusy && busyKey === group.key;
           const items = [
             <MenuItem
               key={group.key}
@@ -309,14 +347,14 @@ export function BookLintIndicator({
                   <span>
                     <IconButton
                       size="small"
-                      disabled={groupBusy}
+                      disabled={dismissBusy}
                       sx={{ ml: 0.5, mt: 0.25 }}
                       onClick={(e) => {
                         e.stopPropagation();
                         void dismissGroup(group);
                       }}
                     >
-                      {groupBusy ? (
+                      {groupSpinning ? (
                         <CircularProgress size={16} />
                       ) : (
                         <CheckCircleOutlineIcon fontSize="small" />
@@ -365,16 +403,23 @@ export function BookLintIndicator({
                   </Box>
                   {issue.dismissible && issue.rowId && dismissibleKind(issue.resource) && (
                     <Tooltip title="Mark reviewed — clears this flag without changing the row">
-                      <IconButton
-                        size="small"
-                        sx={{ ml: 0.5 }}
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          void dismissOne(issue);
-                        }}
-                      >
-                        <CheckCircleOutlineIcon fontSize="small" />
-                      </IconButton>
+                      <span>
+                        <IconButton
+                          size="small"
+                          disabled={dismissBusy}
+                          sx={{ ml: 0.5 }}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            void dismissOne(issue);
+                          }}
+                        >
+                          {busyKey === issueKey(issue) ? (
+                            <CircularProgress size={16} />
+                          ) : (
+                            <CheckCircleOutlineIcon fontSize="small" />
+                          )}
+                        </IconButton>
+                      </span>
                     </Tooltip>
                   )}
                 </MenuItem>
@@ -384,16 +429,22 @@ export function BookLintIndicator({
           return items;
         })}
       </Menu>
-      <Snackbar
-        open={dismissError !== null}
-        autoHideDuration={6000}
-        onClose={() => setDismissError(null)}
-        anchorOrigin={{ vertical: "bottom", horizontal: "center" }}
-      >
-        <Alert severity="error" onClose={() => setDismissError(null)}>
-          {dismissError}
-        </Alert>
-      </Snackbar>
+      {/* MUI's Snackbar isn't itself portaled — rendered inline it would nest
+          a <div> inside this component's root <span>. Portal moves it out to
+          document.body so it stays valid markup regardless of where this
+          indicator is mounted. */}
+      <Portal>
+        <Snackbar
+          open={dismissError !== null}
+          autoHideDuration={6000}
+          onClose={() => setDismissError(null)}
+          anchorOrigin={{ vertical: "bottom", horizontal: "center" }}
+        >
+          <Alert severity="error" onClose={() => setDismissError(null)}>
+            {dismissError}
+          </Alert>
+        </Snackbar>
+      </Portal>
     </Box>
   );
 }
