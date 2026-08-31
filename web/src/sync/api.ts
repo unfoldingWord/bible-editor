@@ -175,7 +175,9 @@ export interface BookSummary {
 // One DCS-validation finding from GET /api/books/:book/lint. `bucket` splits
 // content problems a translator must resolve ("flag") from integrity issues
 // like footnotes ("escalate"). `ref` is "chapter:verse" (or "chapter"); `rowId`
-// is present for TN findings so the UI can jump straight to the offending note.
+// is present for tn/tq/twl findings so the UI can jump straight to the
+// offending row (Shell's goToLintIssue); ult/ust findings are whole-verse USFM
+// checks and carry no rowId.
 // `dismissible`/`door43`/`ours`/`reviewKind`/`reviewReason` are present ONLY on
 // review_kind-derived issues (the nightly-merge "verify this" flags) — never
 // on the mechanical/USFM integrity checks, which have no flag to dismiss (see

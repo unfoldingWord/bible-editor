@@ -93,6 +93,11 @@ interface Props {
   twl: TwlRow[];
   activeNoteId: string | null;
   activeWordId: string | null;
+  // Mirrors activeNoteId/activeWordId for the Questions (tq) tab — set on a
+  // manual click into a question row (onQuestionFocus below) or an external
+  // jump (a lint "go to issue" for a tq finding). Optional/defaulted so
+  // existing call sites that don't track it keep compiling.
+  activeQuestionId?: string | null;
   // Find-in-notes highlight: query marks every match in each note body; the
   // active match (by note id + occurrence index) is emphasized + scrolled to.
   findNoteQuery?: { find: string; regex: boolean; caseSensitive: boolean } | null;
@@ -147,6 +152,9 @@ interface Props {
   ) => void;
   onQuestionDelete: (id: string) => void;
   onQuestionCreate: () => void;
+  // Mirrors onNoteFocus/onWordFocus for a manual click into a question row.
+  // Optional — pinned (whole-chapter) question groups aren't wired to it yet.
+  onQuestionFocus?: (row: TqRow) => void;
   // A mid-flight AI pipeline locks only the resource it will overwrite:
   // the notes run locks notes, the questions run locks questions. Nothing
   // locks the word links — no pipeline writes them. Hides "new" buttons,
@@ -325,6 +333,7 @@ export function ResourceColumn({
   twl,
   activeNoteId,
   activeWordId,
+  activeQuestionId = null,
   findNoteQuery,
   activeNoteMatch,
   scrollNonce,
@@ -351,6 +360,7 @@ export function ResourceColumn({
   onQuestionSave,
   onQuestionDelete,
   onQuestionCreate,
+  onQuestionFocus,
   lockedTn = false,
   lockedTq = false,
   bookLocked = false,
@@ -655,22 +665,30 @@ export function ResourceColumn({
   };
 
   // Keep the resource column lined up with the active selection. We fire on:
-  //   - scrollNonce (Shell's "go to active" button)
-  //   - activeNoteId / activeWordId (focus shifts that came from elsewhere)
+  //   - scrollNonce (Shell's "go to active" button, and any external jump —
+  //     a find/replace match, a lint "go to issue")
+  //   - activeNoteId / activeWordId / activeQuestionId (focus shifts that
+  //     came from elsewhere)
   //   - activeVerse (timeline click, especially relevant when a section is
   //     pinned and the user wants to jump into that verse's group)
   //   - pinned.* (pin toggles, so the user lands on the same conceptual
   //     spot they were viewing before the layout reshuffled)
-  // Priority: active note > active word > active-verse group in any pinned
-  // section. Without any of those, no scroll.
+  // Priority: active note > active word > active question > active-verse
+  // group in any pinned section. Without any of those, no scroll.
   const prevNonceRef = useRef(scrollNonce);
   const prevVerseRef = useRef(activeVerse);
   const prevPinnedRef = useRef(pinned);
+  // Carries "this jump should center, not just nudge into view" across the
+  // extra render a tab switch costs below — scrollNonce (and so `fromButton`)
+  // has already been consumed by the time the newly-mounted tab's target
+  // exists to scroll to, but the jump is still the same user action.
+  const centerPendingRef = useRef(false);
   useEffect(() => {
     const root = scrollBodyRef.current;
     if (!root) return;
     const fromButton = prevNonceRef.current !== scrollNonce;
     prevNonceRef.current = scrollNonce;
+    if (fromButton) centerPendingRef.current = true;
     const verseChanged = prevVerseRef.current !== activeVerse;
     prevVerseRef.current = activeVerse;
     const pinChanged =
@@ -684,12 +702,29 @@ export function ResourceColumn({
     // card is trashed, which would otherwise jerk the list back to the top of
     // the verse's note group.
     const navTriggered = fromButton || verseChanged || pinChanged;
+    // An explicit external jump (scrollNonce bump) that targets a resource on
+    // a tab the user isn't currently viewing must switch tabs first — e.g. a
+    // tq/twl lint "go to issue" arriving while the Notes tab (the default) is
+    // showing. Same-tab jumps (e.g. clicking a note while already on Notes)
+    // leave resourceTab alone.
+    if (fromButton) {
+      const wantsTab: ResourceTab | null = activeNoteId
+        ? "notes"
+        : activeWordId
+          ? "words"
+          : activeQuestionId
+            ? "questions"
+            : null;
+      if (wantsTab && wantsTab !== resourceTab) showResource(wantsTab);
+    }
     let target: HTMLElement | null = null;
     let isVerseGroup = false;
     if (activeNoteId) {
       target = root.querySelector<HTMLElement>(`[data-note-id="${activeNoteId}"]`);
     } else if (activeWordId) {
       target = root.querySelector<HTMLElement>(`[data-word-id="${activeWordId}"]`);
+    } else if (activeQuestionId) {
+      target = root.querySelector<HTMLElement>(`[data-question-id="${activeQuestionId}"]`);
     }
     if (navTriggered && !target && (pinned.notes || pinned.words || pinned.questions)) {
       target = root.querySelector<HTMLElement>(`[data-verse-group="${activeVerse}"]`);
@@ -727,18 +762,26 @@ export function ResourceColumn({
       root.scrollTo({ top: 0, behavior: "auto" });
       return;
     }
-    target?.scrollIntoView({
-      behavior: "smooth",
-      block: isVerseGroup ? "start" : atVerseEnd ? "end" : fromButton ? "center" : "nearest",
-    });
+    if (target) {
+      target.scrollIntoView({
+        behavior: "smooth",
+        block: isVerseGroup ? "start" : atVerseEnd ? "end" : centerPendingRef.current ? "center" : "nearest",
+      });
+      centerPendingRef.current = false;
+    }
   }, [
     scrollNonce,
     activeNoteId,
     activeWordId,
+    activeQuestionId,
     activeVerse,
     pinned.notes,
     pinned.words,
     pinned.questions,
+    // resourceTab: a tab switch triggered by this same effect (below) mounts
+    // the target's DOM for the first time — re-run so the scroll it deferred
+    // above can actually happen against a target that now exists.
+    resourceTab,
   ]);
 
   return (
@@ -993,12 +1036,12 @@ export function ResourceColumn({
                 tqGroups.map(([verse, rows]) => (
                   <Fragment key={`tq-${verse}`}>
                     <VerseGroupHead verse={verse} active={verse === activeVerse} section="questions" />
-                    <QuestionsTable rows={rows} onSave={onQuestionSave} onDelete={onQuestionDelete} locked={lockedTq || bookLocked} />
+                    <QuestionsTable rows={rows} onSave={onQuestionSave} onDelete={onQuestionDelete} locked={lockedTq || bookLocked} activeId={activeQuestionId} onFocus={onQuestionFocus} />
                   </Fragment>
                 ))
               )
             ) : (
-              <QuestionsTable rows={tqForVerse} onSave={onQuestionSave} onDelete={onQuestionDelete} locked={lockedTq || bookLocked} />
+              <QuestionsTable rows={tqForVerse} onSave={onQuestionSave} onDelete={onQuestionDelete} locked={lockedTq || bookLocked} activeId={activeQuestionId} onFocus={onQuestionFocus} />
             )}
           </>
         )}
