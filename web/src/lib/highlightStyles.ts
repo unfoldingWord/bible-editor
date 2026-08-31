@@ -96,6 +96,15 @@ function paragraphLayoutSx(mode: Mode) {
       fontSize: "0.95em",
       color: mode === "dark" ? "#bfd5e0" : "#345e74",
     },
+    // `\qs Selah` — a liturgical marker, not body text. Styled exactly like the
+    // `\d` superscription above (italic + muted) so the two non-body inline
+    // wrappers read as one visual category; without a rule of its own Selah
+    // rendered identical to the verse it punctuates (#357).
+    "& span.be-qs": {
+      fontStyle: "italic",
+      fontSize: "0.95em",
+      color: mode === "dark" ? "#bfd5e0" : "#345e74",
+    },
     "& span.be-tok": {
       display: "inline-block",
       padding: "0 4px",
