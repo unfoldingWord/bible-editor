@@ -193,7 +193,7 @@ export function BookLintIndicator({
     // reality). Either way this key never outlives this one request cycle.
     setDismissedKeys((prev) => new Set(prev).add(key));
     try {
-      await api.dismissReviewFlag(kind, book, issue.rowId, issue.reviewKind);
+      await api.dismissReviewFlag(kind, book, issue.rowId, issue.reviewKind, issue.reviewReason);
       await onDismissed?.();
     } catch {
       setDismissError("Could not mark reviewed — try again.");
@@ -222,7 +222,7 @@ export function BookLintIndicator({
         const kind = dismissibleKind(issue.resource);
         if (!issue.rowId || !kind) continue;
         try {
-          await api.dismissReviewFlag(kind, book, issue.rowId, issue.reviewKind);
+          await api.dismissReviewFlag(kind, book, issue.rowId, issue.reviewKind, issue.reviewReason);
           const key = issueKey(issue);
           ownKeys.push(key);
           setDismissedKeys((prev) => new Set(prev).add(key));
