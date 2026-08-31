@@ -116,11 +116,15 @@ export function BookLintIndicator({
   // their individual refs. Starts empty — a run of duplicates opens collapsed.
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   // Optimistically-cleared issues (issue #653 direction 2 "Mark reviewed").
-  // Filtered out of the local list immediately; the parent's refetch (via
-  // onDismissed) eventually replaces flagIssues wholesale, which — combined
-  // with the check-scoped issueKey above — correctly re-filters a row whose
-  // dismissed flag transiently reappears in a refetch without touching any
-  // of that row's OTHER (still-live) findings.
+  // Filtered out of the local list immediately, BEFORE the server confirms —
+  // this Set only needs to bridge the gap between the dismiss POST resolving
+  // and the subsequent refetch's fresh report landing. It is NOT meant to
+  // persist for the component's whole lifetime: once a fresh report arrives
+  // (see the flagIssues effect below), the server's own data is truth and
+  // this resets to empty. Without that reset, a flag re-minted later by a
+  // nightly reimport — same (resource, rowId, check) as one dismissed
+  // earlier in this session — would arrive in a later report but stay
+  // filtered out forever, invisibly suppressing a live warning.
   const [dismissedKeys, setDismissedKeys] = useState<Set<string>>(new Set());
   // A single flag disables every dismiss control (per-issue and group)
   // while ANY dismissal is in flight — simplest way to avoid two concurrent
@@ -131,14 +135,34 @@ export function BookLintIndicator({
   const [busyKey, setBusyKey] = useState<string | null>(null);
   const [dismissError, setDismissError] = useState<string | null>(null);
 
-  // Local dismiss/expand state is keyed to THIS book's issue set. In
-  // practice App.tsx keys <Shell> on `book`, so this component remounts
-  // (fresh state) on book change rather than receiving a `book` prop update
-  // — this effect is currently dead but harmless, kept as a defensive
-  // backstop against a stale entry surviving a future change to that
-  // remount behavior.
+  // Mirrors dismissBusy for the effect below to read without depending on
+  // it — updated during render (safe for a ref), so it's always current by
+  // the time an effect runs, without making dismissBusy itself a dependency
+  // (which would fire the reset the instant OUR OWN in-flight dismiss flips
+  // dismissBusy back to false, before its own refetch has actually landed).
+  const dismissBusyRef = useRef(dismissBusy);
+  dismissBusyRef.current = dismissBusy;
+
+  // flagIssues is memoized by useBookLint on its `report`, so its identity
+  // only changes when a fresh report actually lands (not on every unrelated
+  // re-render of the caller). When that happens with no dismissal in
+  // flight, the server is truth — clear dismissedKeys so it goes back to
+  // bridging only the next dismiss's own POST→refetch gap, per the
+  // dismissedKeys comment above. A dismissal in flight is excluded (its own
+  // refetch, once it lands, will trigger this same reset).
   useEffect(() => {
-    setDismissedKeys(new Set());
+    if (!dismissBusyRef.current) {
+      setDismissedKeys(new Set());
+    }
+  }, [flagIssues]);
+
+  // Local expand state is keyed to THIS book's issue set. In practice
+  // App.tsx keys <Shell> on `book`, so this component remounts (fresh
+  // state) on book change rather than receiving a `book` prop update — this
+  // effect is currently dead but harmless, kept as a defensive backstop
+  // against stale expansion surviving a future change to that remount
+  // behavior.
+  useEffect(() => {
     setExpanded(new Set());
   }, [book]);
 

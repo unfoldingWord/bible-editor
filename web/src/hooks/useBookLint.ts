@@ -5,7 +5,7 @@
 // we expose the flag list + both counts. Book-level, so it fetches once per
 // book change — not per chapter — and offers a refetch for on-demand refresh.
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, type BookLintIssue, type BookLintReport } from "../sync/api";
 import { fetchWithRetry } from "../sync/fetchWithRetry";
 
@@ -58,7 +58,14 @@ export function useBookLint(book: string, enabled: boolean): UseBookLintReturn {
   // Only the flag bucket needs a human decision; escalate (footnotes) is a
   // secondary count. Recompute the list from the report so the dropdown and the
   // badge can never disagree, but trust the server's flagCount as the source.
-  const flagIssues = (report?.issues ?? []).filter((i) => i.bucket === "flag");
+  // Memoized on `report` (not recomputed — and re-referenced — on every
+  // unrelated render of the caller) so BookLintIndicator can key an effect
+  // off this array's identity to mean "a fresh report actually landed,"
+  // not "something else made the caller re-render."
+  const flagIssues = useMemo(
+    () => (report?.issues ?? []).filter((i) => i.bucket === "flag"),
+    [report],
+  );
 
   return {
     status,
