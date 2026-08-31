@@ -296,6 +296,104 @@ eq(merge.writeFields, { note: "n_master" }, "merge writes only master's note; ou
   );
 }
 
+// ── Create-as-ancestor fallback (#653) ──────────────────────────────────────
+//
+// The prod shape: bp-assistant pushed AI notes to master, the reimport CREATED
+// them in D1 with a full-payload edit_log 'create', a translator then edited
+// them — and the create's id sits ABOVE master_confirmed_edit_id because the
+// evening pushes froze own-publish recognition. The bounded fold returns
+// nothing and the row is flagged merge_no_base forever.
+//
+// The fallback query, re-typed here the way this file re-types the bounded one,
+// and for the same reason: it is the SQL that has to be right.
+function loadCreateFallback(ids) {
+  const inClause = ids.map(() => "?").join(", ");
+  const rows = db
+    .prepare(
+      `SELECT row_key, action, payload_json, book FROM edit_log
+        WHERE kind = ? AND (book = ? OR book IS NULL)
+          AND action = 'create'
+          AND row_key IN (${inClause})
+        ORDER BY row_key ASC, id ASC`,
+    )
+    .all(KIND, BOOK, ...ids);
+  const byId = new Map();
+  for (const r of rows) {
+    if (byId.has(r.row_key)) continue; // earliest create per row_key
+    let payload = null;
+    if (r.payload_json) {
+      try {
+        const p = JSON.parse(r.payload_json);
+        if (p && typeof p === "object" && !Array.isArray(p)) payload = p;
+      } catch {
+        /* ignore */
+      }
+    }
+    byId.set(r.row_key, [{ action: r.action, payload, bookKnown: r.book != null }]);
+  }
+  return byId;
+}
+
+// Production's composition: bounded first, fallback ONLY where the bounded
+// candidate set came back empty.
+function reconstructBaseWithFallback(ids, boundaryId) {
+  const bounded = loadEntriesById(ids, boundaryId);
+  const missing = ids.filter((id) => !bounded.has(id));
+  const fallback = missing.length ? loadCreateFallback(missing) : new Map();
+  const out = new Map();
+  for (const id of ids) out.set(id, foldTsvBase(KIND, bounded.get(id) ?? fallback.get(id) ?? []));
+  return out;
+}
+
+{
+  const NEW_ID = "cr56";
+  const BOUNDARY = 1; // every entry below is above it
+  ins.run(KIND, NEW_ID, BOOK, "create", JSON.stringify({ quote: "imported-q", note: "imported-n" }), 900);
+  // The translator's own edit, AFTER the create. It must never be folded — it
+  // is the very change being merged.
+  ins.run(KIND, NEW_ID, BOOK, "update", JSON.stringify({ note: "app-n" }), 950);
+
+  eq(
+    reconstructBase([NEW_ID], BOUNDARY).get(NEW_ID),
+    null,
+    "control: the bounded fold alone finds nothing — this is the prod bug",
+  );
+  eq(
+    reconstructBaseWithFallback([NEW_ID], BOUNDARY).get(NEW_ID),
+    { quote: "imported-q", note: "imported-n" },
+    "the create is the ancestor, and the post-create app edit is NOT folded in",
+  );
+  // And the merge that follows: master unchanged since the import, D1 edited ->
+  // our edit stands, cleanly, instead of an unattributable keep_no_base.
+  const merged = computeTsvMerge(
+    KIND,
+    reconstructBaseWithFallback([NEW_ID], BOUNDARY).get(NEW_ID),
+    { quote: "imported-q", note: "app-n", occurrence: null, support_reference: null },
+    { quote: "imported-q", note: "imported-n", occurrence: null, support_reference: null },
+  );
+  eq(merged.action, "keep_master_unchanged", "…so the merge attributes the difference to us, not to nobody");
+
+  // A create that never carried a field degrades PER FIELD, not wholesale.
+  const THIN_ID = "cr78";
+  ins.run(KIND, THIN_ID, BOOK, "create", JSON.stringify({ note: "only-a-note" }), 900);
+  eq(
+    reconstructBaseWithFallback([THIN_ID], BOUNDARY).get(THIN_ID),
+    { note: "only-a-note" },
+    "a create missing a field leaves that field absent (computeTsvMerge reads it as no_base)",
+  );
+
+  // The fallback is STRICTLY a fallback: a non-empty bounded set is never
+  // supplemented with a post-boundary entry.
+  const HELD_ID = "cr90";
+  const held = ins.run(KIND, HELD_ID, BOOK, "create", JSON.stringify({ quote: "old-q", note: "old-n" }), 100);
+  ins.run(KIND, HELD_ID, BOOK, "create", JSON.stringify({ quote: "later-q", note: "later-n" }), 900);
+  eq(
+    reconstructBaseWithFallback([HELD_ID], Number(held.lastInsertRowid)).get(HELD_ID),
+    { quote: "old-q", note: "old-n" },
+    "a non-empty bounded set is used as-is — no post-boundary entry is mixed in",
+  );
+}
+
 if (failed) {
   console.error(`\n${failed} assertion(s) FAILED`);
   process.exit(1);
