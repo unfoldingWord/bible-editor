@@ -277,6 +277,16 @@ export function BookLintIndicator({
         {groups.flatMap((group) => {
           if (group.issues.length === 1) {
             const issue = group.issues[0];
+            // A single-issue row's `message` can run several sentences
+            // (issue #648) — clamped to 2 lines by default, with a chevron
+            // toggle (same expand/collapse Set the duplicate-group header
+            // below uses, keyed the same way via `group.key`, which is
+            // unique per group regardless of size) to reveal the rest. A
+            // Tooltip was tried first (PR #650) and rejected: it overlaps
+            // the next menu row and never fires on touch. The chevron needs
+            // its own click handler (stopPropagation) since the row's own
+            // onClick navigates to the issue.
+            const isMessageExpanded = expanded.has(group.key);
             return [
               <MenuItem
                 key={group.key}
@@ -309,7 +319,11 @@ export function BookLintIndicator({
                   }
                   secondary={
                     <>
-                      <Typography variant="caption" color="text.secondary" sx={clampSx}>
+                      <Typography
+                        variant="caption"
+                        color="text.secondary"
+                        sx={isMessageExpanded ? undefined : clampSx}
+                      >
                         {issue.message}
                       </Typography>
                       <DoorDiff issue={issue} />
@@ -338,6 +352,21 @@ export function BookLintIndicator({
                     </span>
                   </Tooltip>
                 )}
+                <IconButton
+                  size="small"
+                  aria-label={isMessageExpanded ? "Show less" : "Show full message"}
+                  sx={{ ml: 0.5, mt: 0.25 }}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    toggleExpanded(group.key);
+                  }}
+                >
+                  {isMessageExpanded ? (
+                    <ExpandLessIcon fontSize="small" />
+                  ) : (
+                    <ExpandMoreIcon fontSize="small" />
+                  )}
+                </IconButton>
               </MenuItem>,
             ];
           }
@@ -432,6 +461,20 @@ export function BookLintIndicator({
                         {issue.resource}
                       </Typography>
                     </Box>
+                    {/* Duplicate-group sub-items previously rendered only
+                        ref + resource with no reason text at all (issue
+                        #648) — a translator who expanded a group still had
+                        no explanation for any individual row in it. Every
+                        issue in a group shares the same message by
+                        construction (groupLintIssues keys on check+message),
+                        so this is the same text as the group header's, just
+                        anchored to this specific ref; clamped like every
+                        other message in this menu rather than given its own
+                        expand toggle, since the un-clamped text is already
+                        one click away via the group header above. */}
+                    <Typography variant="caption" color="text.secondary" sx={{ ...clampSx, mt: 0.25 }}>
+                      {issue.message}
+                    </Typography>
                     <DoorDiff issue={issue} />
                   </Box>
                   {issue.dismissible && issue.rowId && dismissibleKind(issue.resource) && (
