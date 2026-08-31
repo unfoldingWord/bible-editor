@@ -176,22 +176,30 @@ export interface BookSummary {
 // content problems a translator must resolve ("flag") from integrity issues
 // like footnotes ("escalate"). `ref` is "chapter:verse" (or "chapter"); `rowId`
 // is present for TN findings so the UI can jump straight to the offending note.
+// `dismissible`/`door43`/`ours`/`reviewKind`/`reviewReason` are present ONLY on
+// review_kind-derived issues (the nightly-merge "verify this" flags) — never
+// on the mechanical/USFM integrity checks, which have no flag to dismiss (see
+// lint.ts's LintIssue for the server-side detail). `door43` is Door43's row
+// value at flag time (or null when absent/unparseable — the migration that
+// populates it may not be applied yet); `ours` holds the same fields from the
+// live row, so the popup can show what changed. `reviewKind`/`reviewReason`
+// identify which specific review flag this issue represents (a row can carry
+// several independent findings with the same rowId) — sent back on dismiss so
+// the server only clears the flag the popup was actually looking at, not
+// every flag on the row (`reviewReason` closes a second race the kind alone
+// can't: a same-kind re-stamp with different content, see PR #664).
 export interface BookLintIssue {
   check: string;
   bucket: "flag" | "escalate";
   ref: string;
   rowId?: string;
   message: string;
-  resource: "tn" | "ult" | "ust";
-  // Present only on review_kind-derived issues (the nightly-merge "verify
-  // this" flags) — never on the mechanical/USFM integrity checks, which have
-  // no flag to dismiss. See lint.ts's LintIssue for the server-side detail.
-  /** True when this issue can be cleared via dismissReviewFlag(). */
+  resource: "tn" | "tq" | "twl" | "ult" | "ust";
   dismissible?: boolean;
-  /** Door43's row value at flag time, or null when absent/unparseable. */
   door43?: Record<string, unknown> | null;
-  /** The live row's own current value for the same field set. */
   ours?: Record<string, unknown>;
+  reviewKind?: string;
+  reviewReason?: string;
 }
 
 export interface BookLintReport {
@@ -1688,15 +1696,25 @@ export const api = {
       ),
     }),
 
-  // Clear a workflow review_kind/review_reason flag without touching content
-  // (the real affordance for "I looked, it's fine" — see rows.ts's
-  // dismiss-review route for why it has no If-Match). Returns the fresh full
-  // row; the caller replaces its whole cached row with it, same as patchRow.
-  dismissReviewFlag: <T = unknown>(kind: RowKind, book: string, id: string) =>
+  // Clears a dismissible book-lint "review" flag without changing the row
+  // itself (issue #653 direction 2). Contract'd by the companion API PR
+  // (POST /api/rows/:kind/:id/dismiss-review, body {book, review_kind?,
+  // review_reason?}) — that PR, and PR #664 (the stale-popup race fixes
+  // reviewKind/reviewReason close), are the source of truth if this drifts.
+  // `reviewKind`/`reviewReason` are both optional and independent: when
+  // given, the server only clears the flag whose stored value(s) still match
+  // what the caller was looking at, instead of every review flag on the row
+  // (a row can carry several) or a DIFFERENT flag of the same kind that was
+  // re-stamped with new content since the caller last saw it. Returns the
+  // fresh row.
+  dismissReviewFlag: <T = unknown>(kind: RowKind, book: string, id: string, reviewKind?: string, reviewReason?: string) =>
     request<T>(`/api/rows/${kind}/${encodeURIComponent(id)}/dismiss-review`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ book }),
+      body: JSON.stringify({
+        book,
+        ...(reviewKind ? { review_kind: reviewKind } : {}),
+        ...(reviewReason ? { review_reason: reviewReason } : {}),
+      }),
     }),
 
   deleteRow: (kind: RowKind, id: string, expectedVersion: number, book: string) =>

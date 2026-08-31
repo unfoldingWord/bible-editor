@@ -929,12 +929,17 @@ rows.patch("/:kind/:id", requireEditor, async (c) => {
   return c.json(updated);
 });
 
-// review_kind is OPTIONAL: when the client sends the value it saw in the
-// lint feed, the UPDATE below only clears a flag that still matches — see
-// the "stale dismiss" guard in the handler.
+// review_kind/review_reason are OPTIONAL: when the client sends the values
+// it saw in the lint feed, the UPDATE below only clears a flag that still
+// matches — see the "stale dismiss" guard in the handler. Two independent
+// tokens because review_kind alone still lets a stale dismiss clear a NEWER
+// flag of the SAME kind whose content changed (a same-kind re-stamp with a
+// different reason) — review_reason changes exactly when the flag's content
+// changes, unlike updated_at (which also moves on unrelated row touches).
 const DismissReviewBody = z.object({
   book: z.string(),
   review_kind: z.string().optional(),
+  review_reason: z.string().optional(),
 });
 
 // POST /api/rows/:kind/:id/dismiss-review — clear a workflow review_kind/
@@ -963,7 +968,7 @@ rows.post("/:kind/:id/dismiss-review", requireEditor, async (c) => {
   }
   const parsed = DismissReviewBody.safeParse(body);
   if (!parsed.success) return c.json({ error: "invalid_body", details: parsed.error.format() }, 400);
-  const { book, review_kind: expectedReviewKind } = parsed.data;
+  const { book, review_kind: expectedReviewKind, review_reason: expectedReviewReason } = parsed.data;
   // Same shape as every other row route's missing-book response — a blank
   // string satisfies z.string() so this can't be folded into the schema.
   if (!book) return c.json({ error: "book_required" }, 400);
@@ -1010,15 +1015,29 @@ rows.post("/:kind/:id/dismiss-review", requireEditor, async (c) => {
   // on the other two tables).
   const trashedGuard = kind === "tn" ? " AND trashed_at IS NULL" : "";
   // The "stale dismiss" guard (issue #653 follow-up from Codex review): when
-  // the client sends the review_kind it actually saw, only clear a flag that
-  // still matches it. If the nightly reimport re-stamped a DIFFERENT flag on
-  // this row between the client loading the lint feed and this POST landing,
-  // the UPDATE below matches 0 rows and the response falls through to the
-  // no-op path, returning the row's CURRENT (different) flag — the client
-  // sees the truth instead of silently losing a warning it never reviewed.
-  const reviewKindGuard = expectedReviewKind !== undefined ? " AND review_kind = ?4" : "";
+  // the client sends the review_kind/review_reason it actually saw, only
+  // clear a flag that still matches. If the nightly reimport re-stamped a
+  // DIFFERENT flag on this row between the client loading the lint feed and
+  // this POST landing — a different kind, OR the SAME kind re-stamped with
+  // new content (review_reason changed) — the UPDATE below matches 0 rows
+  // and the response falls through to the no-op path, returning the row's
+  // CURRENT flag — the client sees the truth instead of silently losing a
+  // warning it never reviewed. Two independent, optional tokens: params are
+  // numbered dynamically since either, both, or neither may be present.
   const updateBinds: unknown[] = [now, id, book];
-  if (expectedReviewKind !== undefined) updateBinds.push(expectedReviewKind);
+  let nextParam = 4;
+  let reviewKindGuard = "";
+  if (expectedReviewKind !== undefined) {
+    reviewKindGuard = ` AND review_kind = ?${nextParam}`;
+    updateBinds.push(expectedReviewKind);
+    nextParam++;
+  }
+  let reviewReasonGuard = "";
+  if (expectedReviewReason !== undefined) {
+    reviewReasonGuard = ` AND review_reason = ?${nextParam}`;
+    updateBinds.push(expectedReviewReason);
+    nextParam++;
+  }
 
   // Batch: the audit INSERT is conditional on the UPDATE actually clearing a
   // flag (`changes() > 0`, same pattern as the PATCH/setTnBit/setTnTrashed
@@ -1033,7 +1052,7 @@ rows.post("/:kind/:id/dismiss-review", requireEditor, async (c) => {
     c.env.DB
       .prepare(
         `UPDATE ${KIND_TO_TABLE[kind]} SET review_kind = NULL, review_reason = NULL, updated_at = ?1
-           WHERE id = ?2${bookClause(3)} AND review_kind IS NOT NULL AND deleted_at IS NULL${trashedGuard}${reviewKindGuard}`,
+           WHERE id = ?2${bookClause(3)} AND review_kind IS NOT NULL AND deleted_at IS NULL${trashedGuard}${reviewKindGuard}${reviewReasonGuard}`,
       )
       .bind(...updateBinds),
     c.env.DB

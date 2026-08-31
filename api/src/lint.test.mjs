@@ -1043,6 +1043,18 @@ t("a flagged issue carries reviewKind so the client can echo it back on dismiss"
   assert.ok(flag);
   assert.equal(flag.reviewKind, "merge_conflict");
 });
+t("a flagged issue also carries reviewReason — the second stale-dismiss token (PR #664)", () => {
+  const i = lintTnRows([tn({ review_kind: "merge_conflict", review_reason: "a specific merged edit" })]);
+  const flag = i.find((x) => x.check === "Merged Door43 edit — verify");
+  assert.ok(flag);
+  assert.equal(flag.reviewReason, "a specific merged edit");
+});
+t("reviewReason is omitted (not null) when review_reason is null, so the client sends no stale reason token", () => {
+  const i = lintTnRows([tn({ review_kind: "merge_no_base", review_reason: null })]);
+  const flag = i.find((x) => x.check === "Unmerged Door43 edit — verify");
+  assert.ok(flag);
+  assert.equal(flag.reviewReason, undefined);
+});
 t("a JSON array in review_master_json is NOT treated as a row snapshot (door43 stays null)", () => {
   const i = lintTnRows([tn({ review_kind: "quote", review_reason: "x", review_master_json: JSON.stringify(["not", "an", "object"]) })]);
   const flag = i.find((x) => x.check === "Adapted note — verify");

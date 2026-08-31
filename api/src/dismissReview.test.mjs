@@ -218,6 +218,38 @@ console.log("\n[stale-dismiss guard: a MATCHING review_kind clears normally]");
   eq(editLogRows(sqlite, "tn", "ab12").length, 1, "and it's audited");
 }
 
+console.log("\n[stale-dismiss guard, second token: same review_kind but a DIFFERENT reason leaves the flag intact]");
+{
+  const { sqlite, dismiss, broadcasts } = freshApp();
+  // The nightly reimport re-stamped the SAME review_kind ('quote') but with
+  // NEW content — review_kind alone can't tell these apart, only the reason.
+  seedTn(sqlite, { reviewKind: "quote", reviewReason: "a newer, unseen reason" });
+
+  const res = await dismiss("tn", "ab12", BOOK, { review_kind: "quote", review_reason: "the stale reason the client saw" });
+  eq(res.status, 200, "still a 200 (idempotent no-op)");
+  const body = await res.json();
+  eq(body.review_reason, "a newer, unseen reason", "the response surfaces the CURRENT (different) reason");
+
+  const r = tnRow(sqlite);
+  eq(r.review_kind, "quote", "the flag survives — kind matched but reason didn't");
+  eq(r.review_reason, "a newer, unseen reason", "the newer, unseen reason is untouched");
+  eq(editLogRows(sqlite, "tn", "ab12").length, 0, "no audit row — nothing was actually dismissed");
+  eq(broadcasts.length, 0, "no broadcast");
+}
+
+console.log("\n[stale-dismiss guard, second token: matching kind AND reason clears normally]");
+{
+  const { sqlite, dismiss } = freshApp();
+  seedTn(sqlite, { reviewKind: "quote", reviewReason: "verify it" });
+
+  const res = await dismiss("tn", "ab12", BOOK, { review_kind: "quote", review_reason: "verify it" });
+  eq(res.status, 200, "accepted");
+  const r = tnRow(sqlite);
+  eq(r.review_kind, null, "cleared — both tokens matched what was actually there");
+  eq(r.review_reason, null, "cleared");
+  eq(editLogRows(sqlite, "tn", "ab12").length, 1, "and it's audited");
+}
+
 console.log("\n[a dismiss with no review_kind in the body still works (guard is optional)]");
 {
   const { sqlite, dismiss } = freshApp();

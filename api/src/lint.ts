@@ -53,6 +53,13 @@ export interface LintIssue {
    *  DIFFERENT one the nightly reimport re-stamped in the meantime (see the
    *  "stale dismiss" guard on the dismiss-review route in rows.ts). */
   reviewKind?: string;
+  /** The row's review_reason at the time this issue was built — a SECOND
+   *  identity token alongside reviewKind. reviewKind alone still lets a
+   *  stale dismiss clear a NEWER flag of the SAME kind whose content
+   *  changed (a re-stamp with a different reason); reviewReason changes
+   *  exactly when the flag's content changes, unlike updated_at (which
+   *  moves on unrelated row touches too), so it closes that gap. */
+  reviewReason?: string;
 }
 
 // A required field is "blank" when it is missing or only whitespace. Computed
@@ -237,6 +244,7 @@ export function lintTnRows(rows: TnRow[]): LintIssue[] {
         door43: reviewMasterSnapshot(r as unknown as Record<string, unknown>),
         ours: ownFields(r as unknown as Record<string, unknown>, TN_REVIEW_FIELDS),
         reviewKind: r.review_kind,
+        reviewReason: r.review_reason ?? undefined,
       });
     } else if (r.review_kind) {
       // Workflow-only review flag for adapted/migrated notes (review_kind set).
@@ -253,6 +261,7 @@ export function lintTnRows(rows: TnRow[]): LintIssue[] {
         door43: reviewMasterSnapshot(r as unknown as Record<string, unknown>),
         ours: ownFields(r as unknown as Record<string, unknown>, TN_REVIEW_FIELDS),
         reviewKind: r.review_kind,
+        reviewReason: r.review_reason ?? undefined,
       });
     }
   }
@@ -293,6 +302,7 @@ export function lintTqRows(rows: TqRow[]): LintIssue[] {
         door43: reviewMasterSnapshot(r as unknown as Record<string, unknown>),
         ours: ownFields(r as unknown as Record<string, unknown>, TQ_REVIEW_FIELDS),
         reviewKind: r.review_kind,
+        reviewReason: r.review_reason ?? undefined,
       });
     } else if (r.review_kind) {
       // Workflow-only review flag (mirror lintTnRows): set when the nightly
@@ -309,6 +319,7 @@ export function lintTqRows(rows: TqRow[]): LintIssue[] {
         door43: reviewMasterSnapshot(r as unknown as Record<string, unknown>),
         ours: ownFields(r as unknown as Record<string, unknown>, TQ_REVIEW_FIELDS),
         reviewKind: r.review_kind,
+        reviewReason: r.review_reason ?? undefined,
       });
     }
   }
@@ -340,6 +351,7 @@ export function lintTwlRows(rows: TwlRow[]): LintIssue[] {
         door43: reviewMasterSnapshot(r as unknown as Record<string, unknown>),
         ours: ownFields(r as unknown as Record<string, unknown>, TWL_REVIEW_FIELDS),
         reviewKind: r.review_kind,
+        reviewReason: r.review_reason ?? undefined,
       });
     } else if (r.review_kind) {
       // Workflow-only review flag (mirror lintTnRows) — a merged Door43 edit that
@@ -354,6 +366,7 @@ export function lintTwlRows(rows: TwlRow[]): LintIssue[] {
         door43: reviewMasterSnapshot(r as unknown as Record<string, unknown>),
         ours: ownFields(r as unknown as Record<string, unknown>, TWL_REVIEW_FIELDS),
         reviewKind: r.review_kind,
+        reviewReason: r.review_reason ?? undefined,
       });
     }
   }
