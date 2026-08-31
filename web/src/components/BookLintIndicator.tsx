@@ -2,8 +2,8 @@
 // validation findings that need a human decision (the lint "flag" bucket),
 // a quiet warning chip shows the count; clicking it opens a menu of each
 // issue with a "go to" affordance that navigates straight to the ref (and,
-// for TN findings, activates the offending note). Hidden entirely when the
-// book is clean — it's a nudge, not a permanent fixture.
+// for tn/tq/twl findings, activates + scrolls to the offending row). Hidden
+// entirely when the book is clean — it's a nudge, not a permanent fixture.
 
 import { useEffect, useRef, useState } from "react";
 import {
@@ -54,7 +54,7 @@ interface Props {
   flagIssues: BookLintIssue[];
   flagCount: number;
   escalateCount: number;
-  /** Navigate to (and, for TN issues, activate) the offending row. */
+  /** Navigate to (and, for tn/tq/twl issues, activate) the offending row. */
   onGoToIssue: (issue: BookLintIssue) => void;
   /**
    * Called after a dismiss (single or group) succeeds, so the caller can

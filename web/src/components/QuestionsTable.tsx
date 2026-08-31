@@ -27,9 +27,18 @@ interface Props {
   // while an AI pipeline is mid-flight for the chapter — the auto-apply step
   // will overwrite TQs anyway.
   locked?: boolean;
+  // The row to highlight + carry `data-question-id` for scroll-into-view —
+  // mirrors WordsTable's activeId. Set from a manual click (onFocus below) or
+  // from an external jump (find/replace, a lint "go to issue", a future
+  // comment deep link).
+  activeId?: string | null;
+  // Fired on mousedown/focus anywhere in a row, mirroring WordsTable's
+  // onFocus. Optional — callers that don't track an active question (e.g. the
+  // pinned-chapter groups aren't wired for this yet) can omit it.
+  onFocus?: (row: TqRow) => void;
 }
 
-function QuestionsTableInner({ rows, onSave, onDelete, locked = false }: Props) {
+function QuestionsTableInner({ rows, onSave, onDelete, locked = false, activeId = null, onFocus }: Props) {
   if (rows.length === 0) {
     return (
       <Typography variant="body2" color="text.disabled" sx={{ py: 1, pl: 1 }}>
@@ -73,6 +82,8 @@ function QuestionsTableInner({ rows, onSave, onDelete, locked = false }: Props) 
           onSave={(p, opts) => onSave(r.id, p, opts)}
           onDelete={() => onDelete(r.id)}
           locked={locked}
+          active={r.id === activeId}
+          onFocus={onFocus ? () => onFocus(r) : undefined}
         />
       ))}
     </Paper>
@@ -83,7 +94,7 @@ function QuestionsTableInner({ rows, onSave, onDelete, locked = false }: Props) 
 // useMemo) referentially stable, so the questions table skips re-render.
 export const QuestionsTable = memo(
   QuestionsTableInner,
-  (a, b) => a.rows === b.rows && a.locked === b.locked,
+  (a, b) => a.rows === b.rows && a.locked === b.locked && a.activeId === b.activeId,
 );
 
 // Container-query breakpoint: under this table width the ref lane + two text
@@ -117,11 +128,15 @@ const Row = memo(function Row({
   onSave,
   onDelete,
   locked,
+  active = false,
+  onFocus,
 }: {
   row: TqRow;
   onSave: (patch: Partial<TqRow>, opts?: { restoredFromVersion?: number }) => void;
   onDelete: () => void;
   locked: boolean;
+  active?: boolean;
+  onFocus?: () => void;
 }) {
   const [refRaw, setRefRaw] = useState(row.ref_raw ?? "");
   const [question, setQuestion] = useState(row.question ?? "");
@@ -222,12 +237,17 @@ const Row = memo(function Row({
 
   return (
     <Box
+      data-question-id={row.id}
+      onMouseDown={onFocus}
+      onFocus={onFocus}
       sx={{
         ...responsiveGridSx,
         px: 1,
         py: 0.5,
         borderBottom: "1px dashed",
         borderColor: "divider",
+        bgcolor: active ? "primary.50" : "transparent",
+        boxShadow: active ? "inset 2px 0 0 0 var(--mui-palette-primary-main, #31ADE3)" : "none",
         "&:last-of-type": { borderBottom: "none" },
       }}
     >
@@ -373,5 +393,6 @@ const Row = memo(function Row({
   );
 }, (a, b) =>
   // Skip sibling question rows when the table re-renders; row is stable unless
-  // THIS question changed. Callbacks (onSave/onDelete) intentionally ignored.
-  a.row === b.row && a.locked === b.locked);
+  // THIS question changed. Callbacks (onSave/onDelete/onFocus) intentionally
+  // ignored — active is the only externally-driven flag that must repaint.
+  a.row === b.row && a.locked === b.locked && a.active === b.active);
