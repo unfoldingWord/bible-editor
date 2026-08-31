@@ -6,7 +6,10 @@
 //
 // - Any content edit clears a pending review flag (the adapted-note verify
 //   queue for tn; the merged-Door43-edit conflict flag for all three kinds —
-//   migration 0047). All three tables carry the columns.
+//   migration 0047). All three tables carry the columns. review_master_json
+//   (migration 0057) is the Door43-side snapshot the flag was raised against,
+//   so it goes with the flag: a snapshot behind a NULL review_kind is invisible
+//   and describes nothing.
 // - A versioned content edit on a TRASHED tn row also UN-trashes it
 //   (`trashed_at = NULL`; tn only — migration 0026 added the column to tn_rows
 //   alone). Without this, a queued outbox PATCH from user B lands with 200 on
@@ -23,7 +26,7 @@
 // bit-toggles) deliberately do NOT apply these — a drag or a flag-ack must
 // never resurrect a trashed note.
 export function contentPatchClearClauses(kind: "tn" | "tq" | "twl"): string[] {
-  const clauses = ["review_kind = NULL", "review_reason = NULL"];
+  const clauses = ["review_kind = NULL", "review_reason = NULL", "review_master_json = NULL"];
   if (kind === "tn") clauses.push("trashed_at = NULL");
   return clauses;
 }

@@ -769,7 +769,7 @@ rows.patch("/:kind/:id", requireEditor, async (c) => {
       if (!reorderOnly && (current as Record<string, unknown>).review_kind != null) {
         const now = Math.floor(Date.now() / 1000);
         const res = await c.env.DB.prepare(
-          `UPDATE ${KIND_TO_TABLE[kind]} SET review_kind = NULL, review_reason = NULL, updated_at = ?1
+          `UPDATE ${KIND_TO_TABLE[kind]} SET review_kind = NULL, review_reason = NULL, review_master_json = NULL, updated_at = ?1
              WHERE id = ?2 AND version = ?3 AND deleted_at IS NULL${bookClause(4)}`,
         )
           .bind(now, id, expected, book)

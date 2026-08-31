@@ -1315,7 +1315,11 @@ console.log("\n[keep_no_base tn/tq/twl row: review_kind flag set once, guarded a
   eq(after1.review_kind, "merge_no_base", "the row is flagged for the cleanup chip (lint.ts)");
   eq(typeof after1.review_reason === "string" && after1.review_reason.length > 0, true, "a human-readable reason is stored");
   eq(
-    /overwritten|overwrote|overwrites/i.test(after1.review_reason.replace("Nothing has been overwritten", "")),
+    // The denial itself is the one allowed use of the word, in either of the
+    // two phrasings this message has had (#653 rewrote the sentence).
+    /overwritten|overwrote|overwrites/i.test(
+      after1.review_reason.replace("Nothing has been overwritten", "").replace("Nothing was overwritten", ""),
+    ),
     false,
     "the stored reason never claims an overwrite HAPPENED, aside from explicitly denying one",
   );
