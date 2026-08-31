@@ -306,14 +306,14 @@ eq(merge.writeFields, { note: "n_master" }, "merge writes only master's note; ou
 //
 // The fallback query, re-typed here the way this file re-types the bounded one,
 // and for the same reason: it is the SQL that has to be right.
-function loadCreateFallback(ids) {
+function loadCreateFallback(ids, boundaryId = null) {
   const inClause = ids.map(() => "?").join(", ");
   const rows = db
     .prepare(
       // book-known ONLY, unlike the bounded query: a NULL-book create for the
       // same short id belongs to some other book, the folds discard it, and
       // letting it win the pick would leave the row with no ancestor at all.
-      `SELECT row_key, action, payload_json, book FROM edit_log
+      `SELECT row_key, id, created_at, action, payload_json, book FROM edit_log
         WHERE kind = ? AND book = ?
           AND action = 'create'
           AND row_key IN (${inClause})
@@ -332,19 +332,27 @@ function loadCreateFallback(ids) {
         /* ignore */
       }
     }
-    byId.set(r.row_key, [{ action: r.action, payload, bookKnown: r.book != null }]);
+    // The same comparison the bounded query makes, so the two cannot disagree
+    // about which side of the line an entry falls on.
+    const aboveBoundary = boundaryId != null ? !(r.id <= boundaryId) : !(r.created_at < CUTOFF);
+    byId.set(r.row_key, { aboveBoundary, entry: { action: r.action, payload, bookKnown: r.book != null } });
   }
   return byId;
 }
 
-// Production's composition: bounded first, fallback ONLY where the bounded
-// candidate set came back empty.
+// Production's composition. The discriminator is LIFECYCLE, not emptiness: when
+// the row's newest book-known create sits ABOVE the boundary, everything below
+// it belongs to a previous life of the slot and the bounded fold is discarded
+// wholesale. Otherwise the bounded fold stands, exactly as on main.
 function reconstructBaseWithFallback(ids, boundaryId) {
   const bounded = loadEntriesById(ids, boundaryId);
-  const missing = ids.filter((id) => !bounded.has(id));
-  const fallback = missing.length ? loadCreateFallback(missing) : new Map();
+  const creates = loadCreateFallback(ids, boundaryId);
   const out = new Map();
-  for (const id of ids) out.set(id, foldTsvBase(KIND, bounded.get(id) ?? fallback.get(id) ?? []));
+  for (const id of ids) {
+    const c = creates.get(id);
+    const entries = c && c.aboveBoundary ? [c.entry] : (bounded.get(id) ?? []);
+    out.set(id, foldTsvBase(KIND, entries));
+  }
   return out;
 }
 
@@ -412,15 +420,55 @@ function reconstructBaseWithFallback(ids, boundaryId) {
     "a book-NULL create does not shadow this book's own, even when it is newer",
   );
 
-  // The fallback is STRICTLY a fallback: a non-empty bounded set is never
-  // supplemented with a post-boundary entry.
+  // BOUNDARY EQUALITY on the warm-up (timestamp) path, where the bounded cut is
+  // `created_at < CUTOFF`. A create AT the cutoff second is therefore OUTSIDE
+  // the bounded set — so it must read as above the boundary and be recovered,
+  // or the row has no ancestor at all. The two comparisons have to agree
+  // exactly; `<=` here would drop the row back to keep_no_base.
+  const EDGE_ID = "cr94";
+  ins.run(KIND, EDGE_ID, BOOK, "create", JSON.stringify({ quote: "edge-q", note: "edge-n" }), CUTOFF);
+  eq(
+    reconstructBase([EDGE_ID], null).get(EDGE_ID),
+    null,
+    "control: a create AT the cutoff second is outside the bounded fold",
+  );
+  eq(
+    reconstructBaseWithFallback([EDGE_ID], null).get(EDGE_ID),
+    { quote: "edge-q", note: "edge-n" },
+    "…so it counts as above the boundary and is recovered — the two cuts agree",
+  );
+
+  // A NORMAL row — newest create at or below the boundary — is untouched by the
+  // discriminator: the bounded fold stands, post-boundary entries stay out of
+  // it, and the base is fully trusted (non-provisional) exactly as on main.
   const HELD_ID = "cr90";
   const held = ins.run(KIND, HELD_ID, BOOK, "create", JSON.stringify({ quote: "old-q", note: "old-n" }), 100);
-  ins.run(KIND, HELD_ID, BOOK, "create", JSON.stringify({ quote: "later-q", note: "later-n" }), 900);
+  ins.run(KIND, HELD_ID, BOOK, "update", JSON.stringify({ note: "post-boundary app edit" }), 900);
   eq(
     reconstructBaseWithFallback([HELD_ID], Number(held.lastInsertRowid)).get(HELD_ID),
     { quote: "old-q", note: "old-n" },
-    "a non-empty bounded set is used as-is — no post-boundary entry is mixed in",
+    "a below-boundary create keeps the bounded fold — no post-boundary entry is mixed in",
+  );
+
+  // THE RECLAIM SHAPE. Old life below the boundary, current life's reclaim
+  // create above it. Keyed on emptiness the bounded set is non-empty and the
+  // DEAD row's payload becomes a fully-trusted ancestor; keyed on lifecycle the
+  // dead life is discarded and the current life's create is the (provisional)
+  // base.
+  const RECLAIM_ID = "cr92";
+  const deadCreate = ins.run(KIND, RECLAIM_ID, BOOK, "create", JSON.stringify({ quote: "life1-q", note: "life1-n" }), 100);
+  ins.run(KIND, RECLAIM_ID, BOOK, "update", JSON.stringify({ note: "life1-edited" }), 150);
+  ins.run(KIND, RECLAIM_ID, BOOK, "create", JSON.stringify({ quote: "life2-q", note: "life2-n" }), 900);
+  const reclaimBoundary = Number(deadCreate.lastInsertRowid) + 1; // both dead-life rows are at/below it
+  eq(
+    reconstructBase([RECLAIM_ID], reclaimBoundary).get(RECLAIM_ID),
+    { quote: "life1-q", note: "life1-edited" },
+    "control: the bounded fold alone hands back the DEAD life's payload (create + its own update)",
+  );
+  eq(
+    reconstructBaseWithFallback([RECLAIM_ID], reclaimBoundary).get(RECLAIM_ID),
+    { quote: "life2-q", note: "life2-n" },
+    "the lifecycle discriminator discards the dead life and folds the current one",
   );
 }
 

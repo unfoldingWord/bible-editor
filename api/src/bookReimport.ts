@@ -2988,17 +2988,28 @@ async function reconstructTsvBases(
   // that is a true shared ancestor of both sides. Only the create is folded —
   // never a later update, which is precisely the app-side edit being merged.
   //
-  // Strictly a fallback: a NON-empty bounded set is never supplemented with a
-  // post-boundary entry.
+  // THE ENTRY CONDITION IS LIFECYCLE, NOT EMPTINESS — and that is a fix to a
+  // hole `main` already had, not merely a restoration of it. (book, id) can be
+  // reused: the tombstone machinery reclaims an id, and a reclaim logs a SECOND
+  // `create` for the same row_key. So a slot can hold an OLD life's
+  // create/updates BELOW the boundary while the current life's reclaim-create
+  // sits ABOVE it. Keying on "the bounded set is empty" would leave that row on
+  // the bounded fold, which folds the dead row's payload into a fully-trusted,
+  // NON-provisional ancestor — obsolete base, translator's current value and
+  // master all differing, read as a both-changed conflict, and master-wins then
+  // writes over the translator whenever the lineage is incomplete or holds a
+  // human commit. That is exactly the overwrite the provisional floor exists to
+  // stop, reached on the one path that bypasses it.
   //
-  // REISSUED IDS (isReissuedTombstone, reimportClassify.ts): (book, id) can be
-  // reused, and a tombstone reclaim logs a SECOND create for the same row_key,
-  // so a slot can genuinely hold two lives' worth of creates. The NEWEST create
-  // is taken, never the oldest: it is the current life's entry into D1, and for
-  // the overwhelmingly common single-create row the two are the same entry.
-  // Taking the oldest would hand life #2's row life #1's content as its
-  // ancestor — a WRONG ancestor, which is the one thing this fold must never
-  // produce (a missing one merely withholds).
+  // So: when the row's NEWEST book-known `create` sits ABOVE the boundary,
+  // everything below it belongs to a previous lifecycle and is DISCARDED — the
+  // current-life create becomes the base, provisional, exonerate-only. A row
+  // whose newest create sits at or below the boundary is a normal row and keeps
+  // today's bounded, fully-trusted fold, untouched.
+  //
+  // NEWEST, never oldest, for the same reason: the newest create is the current
+  // life's entry into D1, and for the overwhelmingly common single-create row
+  // the two are the same entry.
   //
   // A NULL-book entry is skipped outright rather than merely being refused by
   // the folds later. Ids are unique only per (book, id) and prod holds ~7,689
@@ -3016,20 +3027,31 @@ async function reconstructTsvBases(
   // ancestor recovered from the boundary that just failed. The content merge
   // has a floor for exactly this (computeTsvMerge's `baseProvisional`); the
   // reference decision has none, so it keeps seeing bounded entries only.
-  const provisionalIds = new Set<string>();
-  const missing = ids.filter((id) => !entriesById.has(id));
-  for (let i = 0; i < missing.length; i += WRITE_BATCH) {
-    const slice = missing.slice(i, i + WRITE_BATCH);
+  //
+  // COST: one extra batched read per WRITE_BATCH ids, now unconditional rather
+  // than only for ids the bounded read missed — the lifecycle question cannot be
+  // answered without asking it. Same order of magnitude as the bounded read it
+  // sits beside, and it reads at most one `create` row per candidate id.
+  const currentLifeCreate = new Map<string, { aboveBoundary: boolean; entry: TsvEditLogEntry }>();
+  for (let i = 0; i < ids.length; i += WRITE_BATCH) {
+    const slice = ids.slice(i, i + WRITE_BATCH);
     const inClause = slice.map((_, j) => `?${j + 3}`).join(", ");
     const rs = await env.DB.prepare(
-      `SELECT row_key, action, payload_json, book FROM edit_log
+      `SELECT row_key, id, created_at, action, payload_json, book FROM edit_log
         WHERE kind = ?2 AND book = ?1
           AND action = 'create'
           AND row_key IN (${inClause})
         ORDER BY row_key ASC, id ASC`,
     )
       .bind(book, kind, ...slice)
-      .all<{ row_key: string; action: string; payload_json: string | null; book: string | null }>();
+      .all<{
+        row_key: string;
+        id: number | null;
+        created_at: number | null;
+        action: string;
+        payload_json: string | null;
+        book: string | null;
+      }>();
     for (const r of rs.results) {
       // NEWEST create per row_key: the ORDER BY is ascending, so each row seen
       // replaces the previous one and the last write wins.
@@ -3042,8 +3064,38 @@ async function reconstructTsvBases(
           /* unparseable payload — treat as no content for this entry */
         }
       }
-      entriesById.set(r.row_key, [{ action: r.action, payload, bookKnown: r.book != null }]);
-      provisionalIds.add(r.row_key);
+      // Is this create OUTSIDE the bounded fold's own cut? Asked with the exact
+      // comparison the bounded query makes — `id <= boundaryId`, or
+      // `created_at < cutoff` during 0050's warm-up — so the two can never
+      // disagree about which side of the line an entry falls on.
+      //
+      // ABSENT IS NOT ABOVE. A missing or non-numeric id/created_at cannot be
+      // PROVEN to sit above the boundary, and `Number(null)` is a finite 0 that
+      // would answer "below" for one comparison and "above" for the other. So
+      // an unreadable value answers `false` explicitly — the row keeps the
+      // bounded fold, which is main's behavior, rather than being reclassified
+      // on a coercion.
+      const entryId = typeof r.id === "number" && Number.isFinite(r.id) ? r.id : null;
+      const entryAt = typeof r.created_at === "number" && Number.isFinite(r.created_at) ? r.created_at : null;
+      const aboveBoundary =
+        boundaryId != null
+          ? entryId != null && !(entryId <= boundaryId)
+          : entryAt != null && !(entryAt < cutoff);
+      currentLifeCreate.set(r.row_key, {
+        aboveBoundary,
+        entry: { action: r.action, payload, bookKnown: r.book != null },
+      });
+    }
+  }
+  const provisionalIds = new Set<string>();
+  for (const id of ids) {
+    const create = currentLifeCreate.get(id);
+    if (create?.aboveBoundary) {
+      // The current life began after the boundary: whatever the bounded read
+      // returned for this id belongs to a previous life of the slot (or to
+      // nothing at all) and is discarded wholesale.
+      entriesById.set(id, [create.entry]);
+      provisionalIds.add(id);
     }
   }
   for (const id of ids) {

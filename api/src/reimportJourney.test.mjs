@@ -1864,6 +1864,118 @@ console.log("\n[#653: a create-as-ancestor base may EXONERATE but never CONVICT]
   }
 }
 
+console.log("\n[#653: boundary equality on the warm-up (timestamp) path]");
+{
+  // With migration 0050 still warming up, `editId` is null and the bounded cut
+  // is `created_at < confirmedAt` — so a create AT the confirmedAt second is
+  // OUTSIDE the bounded set. The lifecycle test has to make the identical cut,
+  // or the row falls between the two and has no ancestor at all. One second,
+  // and it decides whether the row is adjudicable.
+  const { sqlite, env } = freshEnv();
+  sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (1, 100, 'translator')`).run();
+  sqlite
+    .prepare(
+      `INSERT INTO tq_rows (id, book, chapter, verse, ref_raw, question, response, version, updated_by)
+       VALUES ('eq01', ?, 9, 9, '9:9', 'her edit', 'imported response', 2, 1)`,
+    )
+    .run(BOOK);
+  sqlite
+    .prepare(
+      `INSERT INTO edit_log (kind, row_key, book, action, payload_json, created_at)
+       VALUES ('tq', 'eq01', ?, 'create', ?, 200)`,
+    )
+    .run(BOOK, JSON.stringify({ question: "imported question", response: "imported response" }));
+
+  const counts = await applyTsvRows(
+    env, BOOK, "tq",
+    [{
+      id: "eq01", idCoerced: false, refRaw: "9:9", chapter: 9, verse: 9,
+      occurrence: null, tags: null, quote: null,
+      question: "imported question", response: "imported response",
+    }],
+    null, { confirmedAt: 200, editId: null },
+  );
+  eq(counts.merge_no_base, 0, "a create at the cutoff second is recovered, not lost between the two cuts");
+  const row = sqlite.prepare(`SELECT review_kind, question FROM tq_rows WHERE id='eq01'`).all()[0];
+  eq(row.review_kind, null, "…so the row is adjudicable and needs no flag");
+  eq(row.question, "her edit", "…and her edit stands");
+}
+
+console.log("\n[#653: a RECLAIMED id's old lifecycle never becomes a trusted ancestor]");
+{
+  // The Codex finding, and a hole `main` already had. (book, id) is reusable —
+  // the tombstone machinery reclaims one and logs a SECOND 'create' — so an OLD
+  // life's create/update can sit BELOW the boundary while the current life's
+  // reclaim-create sits ABOVE it. Keyed on "the bounded set is empty" the row
+  // stays on the bounded fold, which folds the DEAD row's payload into a
+  // fully-trusted ancestor: obsolete base, translator's value and master all
+  // differ, that reads as a both-changed conflict, and master-wins then writes
+  // over the translator. The discriminator is lifecycle, not emptiness.
+  const boundary = 1000000;
+  const seedReclaimed = (sqlite, id, ourQuestion) => {
+    sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (1, 100, 'translator')`).run();
+    sqlite
+      .prepare(
+        `INSERT INTO tq_rows (id, book, chapter, verse, ref_raw, question, response, version, updated_by)
+         VALUES (?, ?, 9, 9, '9:9', ?, 'life2 response', 3, 1)`,
+      )
+      .run(id, BOOK, ourQuestion);
+    const ins = sqlite.prepare(
+      `INSERT INTO edit_log (id, kind, row_key, book, action, payload_json, created_at) VALUES (?, 'tq', ?, ?, ?, ?, ?)`,
+    );
+    // The DEAD life, entirely below the boundary.
+    ins.run(boundary - 900, id, BOOK, "create", JSON.stringify({ question: "life1 question", response: "life1 response" }), 100);
+    ins.run(boundary - 800, id, BOOK, "update", JSON.stringify({ question: "life1 edited" }), 200);
+    // The reclaim: the current life's entry into D1, ABOVE the boundary.
+    ins.run(boundary + 40, id, BOOK, "create", JSON.stringify({ question: "life2 question", response: "life2 response" }), 900);
+  };
+
+  // 1. All three differ, and master is allowed to win a conflict (no lineage).
+  //    The dead life must not authorize an overwrite.
+  {
+    const { sqlite, env } = freshEnv();
+    seedReclaimed(sqlite, "rc01", "her edit on the new life");
+    const counts = await applyTsvRows(
+      env, BOOK, "tq",
+      [{
+        id: "rc01", idCoerced: false, refRaw: "9:9", chapter: 9, verse: 9,
+        occurrence: null, tags: null, quote: null,
+        question: "master's own different text", response: "life2 response",
+      }],
+      null, { confirmedAt: 200, editId: boundary },
+    );
+    const row = sqlite.prepare(`SELECT question, response, review_kind FROM tq_rows WHERE id='rc01'`).all()[0];
+    eq(row.question, "her edit on the new life", "the dead life's payload does NOT authorize master-wins");
+    eq(counts.merge_conflicts, 0, "…nothing is adopted");
+    eq(counts.merge_no_base, 1, "…the row degrades to keep_no_base, the exonerate-only floor");
+    eq(row.response, "life2 response", "…no content field is rewritten");
+    // The only write is the flag itself (no lineage was walked, so the mint
+    // stands), which is what the version bump here is.
+    eq(row.review_kind, "merge_no_base", "…and the row is flagged rather than silently kept");
+  }
+
+  // 2. Master still holds exactly what the CURRENT life was created with, so
+  //    the difference is ours and the edit stands clean — the fallback's
+  //    headline win, reached through the same lifecycle discriminator.
+  {
+    const { sqlite, env } = freshEnv();
+    seedReclaimed(sqlite, "rc02", "her edit on the new life");
+    const counts = await applyTsvRows(
+      env, BOOK, "tq",
+      [{
+        id: "rc02", idCoerced: false, refRaw: "9:9", chapter: 9, verse: 9,
+        occurrence: null, tags: null, quote: null,
+        question: "life2 question", response: "life2 response",
+      }],
+      null, { confirmedAt: 200, editId: boundary },
+    );
+    eq(counts.merge_no_base, 0, "attributed against the CURRENT life's create — a clean keep");
+    const row = sqlite.prepare(`SELECT review_kind, question FROM tq_rows WHERE id='rc02'`).all()[0];
+    eq(row.review_kind, null, "…no flag");
+    eq(row.question, "her edit on the new life", "…and her edit stands");
+  }
+}
+
 console.log("\n[#653: with NO ancestor at all, the mint is gated on the measured lineage]");
 {
   const seed = (sqlite) => {
