@@ -43,11 +43,13 @@ const SQLITE_FILES = new Set([
   "src/dismissReview.test.mjs",
   "src/bookLock.test.mjs",
   "src/staleBaseGate.test.mjs",
+  "src/reviewFlagBroadcast.test.mjs",
 ]);
 
 const EXTRA_IMPORTS = new Map([
   ["src/rowRestoreNoop.test.mjs", "./src/tsResolveHook.mjs"],
   ["src/dismissReview.test.mjs", "./src/tsResolveHook.mjs"],
+  ["src/reviewFlagBroadcast.test.mjs", "./src/tsResolveHook.mjs"],
   ["src/reimportJourney.test.mjs", "./src/tsResolveHook.mjs"],
   ["src/applyVerseRows.test.mjs", "./src/tsResolveHook.mjs"],
   ["src/tombstoneReclaim.test.mjs", "./src/tsResolveHook.mjs"],
