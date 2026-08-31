@@ -356,6 +356,14 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       ) {
         applyLocalRowReplacement(kind, row);
       }
+      // This room is scoped to the currently open {book, chapter}, so any
+      // row.upserted event here is for this book — regardless of whether the
+      // dedupe guard above applied it, the server may have flipped
+      // lint-relevant state (e.g. a no-op review-flag clear, which doesn't
+      // touch row content or version — see api/src/rows.ts). The lint chip is
+      // drawn from a separate fetch (useBookLint), so nudge it via the same
+      // debounced refetch the outbox listener below uses.
+      scheduleLintRefetch();
     },
     onDelete: (kind, id) => applyLocalRowDelete(kind, id),
     onVerseUpdate: (verse) => {

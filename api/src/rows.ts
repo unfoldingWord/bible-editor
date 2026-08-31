@@ -776,6 +776,12 @@ rows.patch("/:kind/:id", requireEditor, async (c) => {
           .run();
         if (res.meta.changes) {
           const fresh = await selectRowWithLatestSource(c.env, kind, id, book);
+          if (fresh) {
+            const row = fresh as unknown as TnRow | TqRow | TwlRow;
+            c.executionCtx.waitUntil(
+              broadcastChapter(c.env, row.book, row.chapter, { type: "row.upserted", kind, row }),
+            );
+          }
           return c.json(fresh ?? current);
         }
         // Row moved or was deleted between the SELECT and this UPDATE — surface
