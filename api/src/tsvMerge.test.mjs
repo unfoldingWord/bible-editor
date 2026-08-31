@@ -765,6 +765,48 @@ deep(tsvMergeFields("tq"), ["quote", "question", "response"], "tq field list");
   deep(junk, { verse: 2, ref_raw: "front:intro" }, "a non-numeric chapter is dropped, not folded in as NaN");
 }
 
+// ── #653: a provisional (create-as-ancestor) base exonerates, never convicts ─
+{
+  const base = { quote: "q0", note: "n0", occurrence: 1, support_reference: null };
+  const side = (o) => ({ quote: "q0", note: "n0", occurrence: 1, support_reference: null, ...o });
+
+  // Exoneration — the entire point of the fallback — is unaffected.
+  eq(
+    computeTsvMerge("tn", base, side({ note: "our edit" }), side({}), { baseProvisional: true }).action,
+    "keep_master_unchanged",
+    "provisional: master never moved the field, so our edit stands clean",
+  );
+
+  // Conviction is suppressed. Three-way different, master allowed to win: on a
+  // bounded base this adopts master's value; on a provisional one it must not.
+  const conflict = computeTsvMerge("tn", base, side({ note: "ours" }), side({ note: "theirs" }), {
+    baseProvisional: true,
+  });
+  eq(conflict.action, "keep_no_base", "provisional: a both-changed conflict degrades to keep_no_base");
+  deep(conflict.writeFields, {}, "…writing nothing, so nobody is reverted");
+  eq(
+    computeTsvMerge("tn", base, side({ note: "ours" }), side({ note: "theirs" })).action,
+    "adopt_conflict",
+    "…control: the SAME inputs on a bounded base still let master win",
+  );
+
+  // A field only master moved would be an adopt on a bounded base. Withheld
+  // here: our render is not round-trip stable, so this difference may be
+  // phantom, and a provisional base cannot tell the two apart.
+  const adopt = computeTsvMerge("tn", base, side({}), side({ note: "theirs" }), { baseProvisional: true });
+  eq(adopt.action, "keep_no_base", "provisional: a master-only change is withheld, not adopted");
+  eq(adopt.adopt, false, "…nothing is written");
+
+  // keep_ai_master is a D1-WINS outcome, so the floor leaves it alone: the
+  // translator keeps her text and still gets the collision flag.
+  const kept = computeTsvMerge("tn", base, side({ note: "ours" }), side({ note: "theirs" }), {
+    baseProvisional: true,
+    masterMayHoldHumanEdit: false,
+  });
+  eq(kept.action, "keep_ai_master", "provisional + a lineage with no human: D1 wins the conflict, as it should");
+  eq(kept.conflict, true, "…and the row is still flagged for a human");
+}
+
 if (failed) {
   console.error(`\n${failed} assertion(s) FAILED`);
   process.exit(1);
