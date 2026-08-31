@@ -1037,5 +1037,17 @@ t("non-review issues never carry dismissible/door43/ours", () => {
   assert.equal(bracketIssue.door43, undefined);
   assert.equal(bracketIssue.ours, undefined);
 });
+t("a flagged issue carries reviewKind so the client can echo it back on dismiss", () => {
+  const i = lintTnRows([tn({ review_kind: "merge_conflict", review_reason: "x" })]);
+  const flag = i.find((x) => x.check === "Merged Door43 edit — verify");
+  assert.ok(flag);
+  assert.equal(flag.reviewKind, "merge_conflict");
+});
+t("a JSON array in review_master_json is NOT treated as a row snapshot (door43 stays null)", () => {
+  const i = lintTnRows([tn({ review_kind: "quote", review_reason: "x", review_master_json: JSON.stringify(["not", "an", "object"]) })]);
+  const flag = i.find((x) => x.check === "Adapted note — verify");
+  assert.ok(flag);
+  assert.equal(flag.door43, null);
+});
 
 console.log(`\n${passed} lint tests passed`);

@@ -929,7 +929,13 @@ rows.patch("/:kind/:id", requireEditor, async (c) => {
   return c.json(updated);
 });
 
-const DismissReviewBody = z.object({ book: z.string() });
+// review_kind is OPTIONAL: when the client sends the value it saw in the
+// lint feed, the UPDATE below only clears a flag that still matches — see
+// the "stale dismiss" guard in the handler.
+const DismissReviewBody = z.object({
+  book: z.string(),
+  review_kind: z.string().optional(),
+});
 
 // POST /api/rows/:kind/:id/dismiss-review — clear a workflow review_kind/
 // review_reason flag (the nightly merge's "verify this" chip) WITHOUT editing
@@ -942,8 +948,8 @@ const DismissReviewBody = z.object({ book: z.string() });
 // Clearing a flag is not a content edit, so it must never phantom-409 an
 // open editor tab that happens to be mid-save on the same row — the flag is
 // stale metadata, not something anyone can lose by a concurrent write.
-// Idempotent: dismissing an already-clear flag is a 200 no-op (guarded on
-// `review_kind IS NOT NULL`), and only a row that doesn't exist at all 404s.
+// Idempotent: dismissing an already-clear (or already-mismatched) flag is a
+// 200 no-op, and only a row that doesn't exist at all 404s.
 rows.post("/:kind/:id/dismiss-review", requireEditor, async (c) => {
   const kind = c.req.param("kind");
   const id = c.req.param("id");
@@ -957,24 +963,108 @@ rows.post("/:kind/:id/dismiss-review", requireEditor, async (c) => {
   }
   const parsed = DismissReviewBody.safeParse(body);
   if (!parsed.success) return c.json({ error: "invalid_body", details: parsed.error.format() }, 400);
-  const { book } = parsed.data;
+  const { book, review_kind: expectedReviewKind } = parsed.data;
+  // Same shape as every other row route's missing-book response — a blank
+  // string satisfies z.string() so this can't be folded into the schema.
+  if (!book) return c.json({ error: "book_required" }, 400);
 
-  const now = Math.floor(Date.now() / 1000);
-  await c.env.DB.prepare(
-    `UPDATE ${KIND_TO_TABLE[kind]} SET review_kind = NULL, review_reason = NULL, updated_at = ?1
-       WHERE id = ?2${bookClause(3)} AND review_kind IS NOT NULL AND deleted_at IS NULL`,
+  // Pre-read: needed for (a) the chapter-lock check below (book/chapter/kind
+  // scope it), (b) the trashed-row guard (tn only), and (c) the edit_log
+  // audit payload — by the time the UPDATE below runs, the review_kind/
+  // review_reason values it's clearing are gone, so they have to be captured
+  // now or not at all.
+  const current = await c.env.DB.prepare(
+    `SELECT * FROM ${KIND_TO_TABLE[kind]} WHERE id = ?1${bookClause(2)}`,
   )
-    .bind(now, id, book)
-    .run();
+    .bind(id, book)
+    .first<
+      Record<string, unknown> & {
+        chapter: number;
+        deleted_at: number | null;
+        review_kind: string | null;
+        review_reason: string | null;
+        trashed_at?: number | null;
+      }
+    >();
+  if (!current || current.deleted_at) return c.json({ error: "not_found" }, 404);
+  // A trashed tn row is invisible to the lint feed (bookImport.ts's
+  // /:book/lint route filters `trashed_at IS NOT NULL` out entirely) — a
+  // dismiss against one is treated the same way, as not found, so a crafted
+  // call can't clear (or broadcast) a flag nobody can see is set.
+  if (kind === "tn" && current.trashed_at != null) {
+    return c.json({ error: "not_found" }, 404);
+  }
+
+  // Same lock carve-out as PATCH/DELETE above: tn edits are always allowed
+  // during an AI run, but tq/twl are not — a dismiss landing mid-pipeline on
+  // a row about to be rewritten by auto-apply would race it.
+  if (kind !== "tn") {
+    const lock = await activePipelineForChapter(c.env, book, current.chapter, kind);
+    if (lock) return c.json(lockedResponseBody(lock), 409);
+  }
+
+  const userId = currentUserId(c);
+  const now = Math.floor(Date.now() / 1000);
+  // tq_rows/twl_rows have no trashed_at column at all, so this guard is only
+  // ever spliced in for tn (adding it unconditionally would be a SQL error
+  // on the other two tables).
+  const trashedGuard = kind === "tn" ? " AND trashed_at IS NULL" : "";
+  // The "stale dismiss" guard (issue #653 follow-up from Codex review): when
+  // the client sends the review_kind it actually saw, only clear a flag that
+  // still matches it. If the nightly reimport re-stamped a DIFFERENT flag on
+  // this row between the client loading the lint feed and this POST landing,
+  // the UPDATE below matches 0 rows and the response falls through to the
+  // no-op path, returning the row's CURRENT (different) flag — the client
+  // sees the truth instead of silently losing a warning it never reviewed.
+  const reviewKindGuard = expectedReviewKind !== undefined ? " AND review_kind = ?4" : "";
+  const updateBinds: unknown[] = [now, id, book];
+  if (expectedReviewKind !== undefined) updateBinds.push(expectedReviewKind);
+
+  // Batch: the audit INSERT is conditional on the UPDATE actually clearing a
+  // flag (`changes() > 0`, same pattern as the PATCH/setTnBit/setTnTrashed
+  // audits above), so a no-op dismiss — already clear, wrong review_kind, or
+  // a lost race — never writes a phantom edit_log row. `dismiss_review` is a
+  // NEW action name deliberately kept out of every existing edit_log
+  // allowlist (tsvMerge.ts's CONTENT_ACTIONS, the history route's action
+  // filter, bookReimport.ts's various `action IN (...)` scans) — its payload
+  // is the CLEARED flag values only, never row content, so nothing that
+  // reads edit_log as a content snapshot can mistake this for one.
+  const [updateRes] = await c.env.DB.batch([
+    c.env.DB
+      .prepare(
+        `UPDATE ${KIND_TO_TABLE[kind]} SET review_kind = NULL, review_reason = NULL, updated_at = ?1
+           WHERE id = ?2${bookClause(3)} AND review_kind IS NOT NULL AND deleted_at IS NULL${trashedGuard}${reviewKindGuard}`,
+      )
+      .bind(...updateBinds),
+    c.env.DB
+      .prepare(
+        `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, payload_json)
+         SELECT ?1, ?2, ?3, ?4, version, version, 'dismiss_review', ?5
+           FROM ${KIND_TO_TABLE[kind]}
+          WHERE id = ?2 AND book = ?3 AND changes() > 0`,
+      )
+      .bind(
+        kind,
+        id,
+        book,
+        userId ?? null,
+        JSON.stringify({ review_kind: current.review_kind, review_reason: current.review_reason }),
+      ),
+  ]);
 
   const fresh = await selectRowWithLatestSource(c.env, kind, id, book);
   if (!fresh || (fresh as Record<string, unknown>).deleted_at) {
     return c.json({ error: "not_found" }, 404);
   }
-  const row = fresh as unknown as TnRow | TqRow | TwlRow;
-  c.executionCtx.waitUntil(
-    broadcastChapter(c.env, row.book, row.chapter, { type: "row.upserted", kind, row }),
-  );
+  // Suppress the broadcast on a no-op (already clear, mismatched
+  // review_kind, or a lost race): nothing changed, so telling the whole
+  // chapter room otherwise is pure WS churn, matching PATCH's no-op paths.
+  if (updateRes.meta.changes) {
+    const row = fresh as unknown as TnRow | TqRow | TwlRow;
+    c.executionCtx.waitUntil(
+      broadcastChapter(c.env, row.book, row.chapter, { type: "row.upserted", kind, row }),
+    );
+  }
   return c.json(fresh);
 });
 
