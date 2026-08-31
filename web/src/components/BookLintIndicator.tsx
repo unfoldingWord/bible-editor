@@ -5,7 +5,7 @@
 // for TN findings, activates the offending note). Hidden entirely when the
 // book is clean — it's a nudge, not a permanent fixture.
 
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   Alert,
   Box,
@@ -25,7 +25,12 @@ import ExpandLessIcon from "@mui/icons-material/ExpandLess";
 import ExpandMoreIcon from "@mui/icons-material/ExpandMore";
 import CheckCircleOutlineIcon from "@mui/icons-material/CheckCircleOutline";
 import { api, type BookLintIssue } from "../sync/api";
-import { diffDoor43Fields, groupLintIssues, isGroupFullyDismissible } from "./bookLintGrouping";
+import {
+  diffDoor43Fields,
+  dismissibleKind,
+  groupLintIssues,
+  isGroupFullyDismissible,
+} from "./bookLintGrouping";
 
 // Kindle warning accent (#E59D33 from CLAUDE.md brand palette), matching the
 // other "needs attention" chips (VersionIndicator's update nudge, the
@@ -34,6 +39,13 @@ const flagAccentSx = {
   color: "#E59D33",
   borderColor: "#E59D33",
   "& .MuiChip-icon": { color: "#E59D33" },
+} as const;
+
+const clampSx = {
+  display: "-webkit-box",
+  WebkitLineClamp: 2,
+  WebkitBoxOrient: "vertical",
+  overflow: "hidden",
 } as const;
 
 interface Props {
@@ -49,6 +61,39 @@ interface Props {
 
 function issueKey(issue: BookLintIssue): string {
   return `${issue.resource}|${issue.rowId ?? ""}`;
+}
+
+// Compact Door43-vs-here detail for a dismissible issue. Module-level (not
+// defined inside BookLintIndicator's render) so it isn't redefined every
+// render. Renders nothing when the issue isn't dismissible or carries no
+// door43 snapshot.
+function DoorDiff({ issue }: { issue: BookLintIssue }) {
+  if (!issue.dismissible || !issue.door43) return null;
+  const diffs = diffDoor43Fields(issue.door43, issue.ours);
+  if (diffs.length === 0) {
+    return (
+      <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: 0.5 }}>
+        Door43 and this row currently match.
+      </Typography>
+    );
+  }
+  return (
+    <Box sx={{ mt: 0.5 }}>
+      {diffs.map((d) => (
+        <Box key={d.field} sx={{ mb: 0.5 }}>
+          <Typography variant="caption" color="text.secondary" sx={{ display: "block", fontWeight: 600 }}>
+            {d.field}
+          </Typography>
+          <Typography variant="caption" color="text.secondary" sx={{ ...clampSx, fontFamily: "monospace" }}>
+            Door43: {d.door43 || "(empty)"}
+          </Typography>
+          <Typography variant="caption" color="text.secondary" sx={{ ...clampSx, fontFamily: "monospace" }}>
+            Here: {d.ours || "(empty)"}
+          </Typography>
+        </Box>
+      ))}
+    </Box>
+  );
 }
 
 export function BookLintIndicator({
@@ -72,15 +117,29 @@ export function BookLintIndicator({
   const [dismissingGroup, setDismissingGroup] = useState<string | null>(null);
   const [dismissError, setDismissError] = useState<string | null>(null);
 
+  // Local dismiss/expand state is keyed to THIS book's issue set — reset on
+  // book change so a stale entry can't coincidentally match a same-rowId
+  // issue in the next book navigated to.
+  useEffect(() => {
+    setDismissedKeys(new Set());
+    setExpanded(new Set());
+  }, [book]);
+
   // Nothing to clean up — stay out of the way.
   if (flagCount <= 0) return null;
 
-  const tooltip = `${flagCount} issue${flagCount === 1 ? "" : "s"} to clean up in ${book}${
-    escalateCount > 0 ? ` (+${escalateCount} integrity)` : ""
-  } — click to review`;
-
   const visibleIssues = flagIssues.filter((i) => !dismissedKeys.has(issueKey(i)));
   const groups = groupLintIssues(visibleIssues);
+  // The server's flagCount is the source of truth once a refetch lands, but
+  // between an optimistic dismiss and that refetch it would otherwise read
+  // stale (higher than what the menu now shows) — subtract what we've
+  // already cleared locally so the chip/header agree with the list.
+  const dismissedFlagCount = flagIssues.length - visibleIssues.length;
+  const displayFlagCount = Math.max(flagCount - dismissedFlagCount, 0);
+
+  const tooltip = `${displayFlagCount} issue${displayFlagCount === 1 ? "" : "s"} to clean up in ${book}${
+    escalateCount > 0 ? ` (+${escalateCount} integrity)` : ""
+  } — click to review`;
 
   const toggleExpanded = (key: string) => {
     setExpanded((prev) => {
@@ -92,9 +151,10 @@ export function BookLintIndicator({
   };
 
   const dismissOne = async (issue: BookLintIssue) => {
-    if (!issue.rowId) return;
+    const kind = dismissibleKind(issue.resource);
+    if (!issue.rowId || !kind) return;
     try {
-      await api.dismissReviewFlag(issue.resource as "tn" | "tq" | "twl", book, issue.rowId);
+      await api.dismissReviewFlag(kind, book, issue.rowId);
       setDismissedKeys((prev) => new Set(prev).add(issueKey(issue)));
       onDismissed?.();
     } catch {
@@ -106,9 +166,10 @@ export function BookLintIndicator({
     setDismissingGroup(group.key);
     let failed = 0;
     for (const issue of group.issues) {
-      if (!issue.rowId) continue;
+      const kind = dismissibleKind(issue.resource);
+      if (!issue.rowId || !kind) continue;
       try {
-        await api.dismissReviewFlag(issue.resource as "tn" | "tq" | "twl", book, issue.rowId);
+        await api.dismissReviewFlag(kind, book, issue.rowId);
         setDismissedKeys((prev) => new Set(prev).add(issueKey(issue)));
       } catch {
         failed++;
@@ -121,50 +182,12 @@ export function BookLintIndicator({
     onDismissed?.();
   };
 
-  const clampSx = {
-    display: "-webkit-box",
-    WebkitLineClamp: 2,
-    WebkitBoxOrient: "vertical",
-    overflow: "hidden",
-  } as const;
-
-  // Compact Door43-vs-here detail for a dismissible issue. Renders nothing
-  // when the issue isn't dismissible or carries no door43 snapshot.
-  const DoorDiff = ({ issue }: { issue: BookLintIssue }) => {
-    if (!issue.dismissible || !issue.door43) return null;
-    const diffs = diffDoor43Fields(issue.door43, issue.ours);
-    if (diffs.length === 0) {
-      return (
-        <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: 0.5 }}>
-          Door43 and this row currently match.
-        </Typography>
-      );
-    }
-    return (
-      <Box sx={{ mt: 0.5 }}>
-        {diffs.map((d) => (
-          <Box key={d.field} sx={{ mb: 0.5 }}>
-            <Typography variant="caption" color="text.secondary" sx={{ display: "block", fontWeight: 600 }}>
-              {d.field}
-            </Typography>
-            <Typography variant="caption" color="text.secondary" sx={{ ...clampSx, fontFamily: "monospace" }}>
-              Door43: {d.door43 || "(empty)"}
-            </Typography>
-            <Typography variant="caption" color="text.secondary" sx={{ ...clampSx, fontFamily: "monospace" }}>
-              Here: {d.ours || "(empty)"}
-            </Typography>
-          </Box>
-        ))}
-      </Box>
-    );
-  };
-
   return (
     <Box ref={anchorRef} component="span" sx={{ display: "inline-flex" }}>
       <Tooltip title={tooltip}>
         <Chip
           icon={<ReportProblemOutlinedIcon />}
-          label={flagCount}
+          label={displayFlagCount}
           size="small"
           variant="outlined"
           clickable
@@ -183,7 +206,7 @@ export function BookLintIndicator({
         <Box sx={{ px: 2, py: 1 }}>
           <Typography variant="subtitle2">{book} — issues to clean up</Typography>
           <Typography variant="caption" color="text.secondary">
-            {flagCount} need{flagCount === 1 ? "s" : ""} a decision
+            {displayFlagCount} need{displayFlagCount === 1 ? "s" : ""} a decision
             {escalateCount > 0 ? ` · ${escalateCount} integrity` : ""}
           </Typography>
         </Box>
@@ -230,7 +253,7 @@ export function BookLintIndicator({
                     </>
                   }
                 />
-                {issue.dismissible && issue.rowId && (
+                {issue.dismissible && issue.rowId && dismissibleKind(issue.resource) && (
                   <Tooltip title="Mark reviewed — clears this flag without changing the row">
                     <IconButton
                       size="small"
@@ -340,7 +363,7 @@ export function BookLintIndicator({
                     </Box>
                     <DoorDiff issue={issue} />
                   </Box>
-                  {issue.dismissible && issue.rowId && (
+                  {issue.dismissible && issue.rowId && dismissibleKind(issue.resource) && (
                     <Tooltip title="Mark reviewed — clears this flag without changing the row">
                       <IconButton
                         size="small"

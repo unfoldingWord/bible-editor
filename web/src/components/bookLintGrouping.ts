@@ -6,7 +6,7 @@
 // of indistinguishable items. A group of size 1 renders exactly as before.
 // Order is first-seen (stable), so the popup's overall ordering doesn't churn.
 
-import type { BookLintIssue } from "../sync/api";
+import type { BookLintIssue, RowKind } from "../sync/api";
 
 export interface LintIssueGroup {
   key: string;
@@ -47,6 +47,10 @@ export interface FieldDiff {
 
 function normalizeForCompare(v: unknown): string {
   if (v === null || v === undefined || v === "") return "";
+  // Object/array fields would otherwise collapse to the useless "[object
+  // Object]" via String() and silently compare equal to any other object —
+  // JSON.stringify keeps a real structural difference visible.
+  if (typeof v === "object") return JSON.stringify(v);
   return String(v);
 }
 
@@ -73,10 +77,21 @@ export function diffDoor43Fields(
   return diffs;
 }
 
+// dismiss-review only exists for row-backed resources (tn/tq/twl) — ult/ust
+// issues are scripture-text findings with no row to dismiss against. Returns
+// the resource narrowed to a RowKind, or null when it isn't one.
+export function dismissibleKind(resource: BookLintIssue["resource"]): RowKind | null {
+  return resource === "tn" || resource === "tq" || resource === "twl" ? resource : null;
+}
+
 /**
- * True when every issue in a group is dismissible and carries a rowId — the
- * precondition for showing a group-level "Dismiss all" affordance.
+ * True when every issue in a group is dismissible, carries a rowId, and has
+ * a row-backed resource — the precondition for showing a group-level
+ * "Dismiss all" affordance.
  */
 export function isGroupFullyDismissible(issues: BookLintIssue[]): boolean {
-  return issues.length > 0 && issues.every((i) => i.dismissible && i.rowId);
+  return (
+    issues.length > 0 &&
+    issues.every((i) => i.dismissible && i.rowId && dismissibleKind(i.resource) !== null)
+  );
 }
