@@ -2541,6 +2541,95 @@ function countAligned(content) {
   assert(!pure.markerCaptureGuarded, "the honored deletion raises no override notice");
 }
 
+// --- Case 75: a capture shaped like the INACTIVE book/columns render relocates
+// the chunk divider — which is why Save is gated on `isActive` (PR #654) ------
+// usfm-js parks a `\ts\*` chunk divider at the END of the verse it follows.
+// Book view's INACTIVE composed render deliberately paints the PREVIOUS verse's
+// divider at the TOP of this cell (so the divider line runs straight across the
+// ULT/UST grid) and strips this verse's own trailing one — see the
+// extractTrailingDividers / stripTrailingDividers comments in BookView.tsx. That
+// render is display-only: its `textContent` is NOT a valid edit capture.
+//
+// This case pins what happens if such a capture ever reaches the engine. It is
+// not a bug in smartEditVerse — the engine cannot tell a corrupt capture from a
+// translator deliberately moving a divider, so it faithfully applies the move.
+// The defense has to live in the UI: the Save button renders only for the active
+// verse, whose DOM holds the editable chip render (whose textContent DOES match
+// extractEditableText). Note especially that the #606 marker-capture guard does
+// NOT fire here — divider count in equals divider count out, so a RELOCATION
+// looks like an ordinary edit to it.
+{
+  console.log("\n[Case 75] An inactive-render capture relocates \\ts\\* — Save must stay isActive-gated (#654)");
+  const verse = {
+    verseObjects: [
+      { type: "milestone", tag: "zaln", strong: "H1", endTag: "zaln-e\\*",
+        children: [{ type: "word", tag: "w", text: "alpha", occurrence: "1", occurrences: "1" }] },
+      { type: "text", text: " " },
+      { type: "milestone", tag: "zaln", strong: "H2", endTag: "zaln-e\\*",
+        children: [{ type: "word", tag: "w", text: "beta", occurrence: "1", occurrences: "1" }] },
+      { type: "text", text: ".\n" },
+      // This verse's OWN trailing divider.
+      { tag: "ts\\*" },
+      { type: "text", text: "\n" },
+    ],
+  };
+  const old = extractEditableText(verse);
+  assert(
+    /alpha beta\.\s*\\ts\\\*$/.test(old),
+    `the edit baseline carries the divider at the END (got ${JSON.stringify(old)})`,
+  );
+  // What the inactive composed render's textContent looks like: the previous
+  // verse's divider leading, this verse's own trailing divider absent.
+  const captured = "\\ts\\* alpha beta.";
+  const warnings = [];
+  const realWarn = console.warn;
+  console.warn = (m) => warnings.push(String(m));
+  let r;
+  try { r = smartEditVerse(verse, old, captured, { capturedFromDom: true }); }
+  finally { console.warn = realWarn; }
+  const out = extractEditableText(r.content);
+
+  // Not duplicated, not deleted — but MOVED to the front. That relocation is
+  // the whole reason Save may not render for an inactive verse.
+  const tsNodes = [];
+  (function walk(nodes) {
+    for (const n of nodes ?? []) {
+      if (n && typeof n.tag === "string" && n.tag.startsWith("ts")) tsNodes.push(n);
+      if (n && Array.isArray(n.children)) walk(n.children);
+    }
+  })(r.content.verseObjects);
+  assert(
+    tsNodes.length === 1,
+    `exactly one divider node — the engine neither duplicates nor drops it (got ${JSON.stringify(tsNodes)})`,
+  );
+  assert(
+    tsNodes[0].tag === "ts\\*" && tsNodes[0].content === undefined,
+    `divider keeps the usfm-js parse shape {tag:"ts\\\\*"} (got ${JSON.stringify(tsNodes[0])})`,
+  );
+  assert(
+    out.startsWith("\\ts\\*") && !/\\ts\\\*\s*$/.test(out),
+    `the divider is RELOCATED to the front by such a capture — the damage the isActive Save gate prevents (got ${JSON.stringify(out)})`,
+  );
+  // The words themselves are untouched, and their alignment survives — so
+  // nothing downstream flags this. The corruption is silent.
+  assert(
+    r.preservedAlignment === true,
+    `alignment is preserved, so the relocation raises no alignment alarm (got ${JSON.stringify(r.preservedAlignment)})`,
+  );
+  const aligned = alignedWords(r.content);
+  assert(
+    aligned.find((x) => x.text === "alpha")?.strongs.includes("H1") &&
+      aligned.find((x) => x.text === "beta")?.strongs.includes("H2"),
+    `both words keep their milestone ancestors (got ${JSON.stringify(aligned)})`,
+  );
+  // Pin the guard gap explicitly: #606 counts markers, and a move does not
+  // change the count, so it cannot be the defense here.
+  assert(
+    !r.markerCaptureGuarded,
+    `the #606 marker-capture guard does NOT catch a relocation (got ${JSON.stringify(r.markerCaptureGuarded)}, warnings ${JSON.stringify(warnings)})`,
+  );
+}
+
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed.`);
   process.exit(1);

@@ -949,6 +949,32 @@ const VerseCell = memo(function VerseCell({
     lastTextRef.current = text;
   }, [dto?.plain_text, html, hasDraft]);
 
+  // Latest `isActive` for the native `beforeinput` guard below. The listener is
+  // attached per element, not per render, so reading `isActive` straight out of
+  // the closure that defined it would pin whatever value that render saw.
+  const isActiveRef = useRef(isActive);
+  isActiveRef.current = isActive;
+
+  // Refuse input on a verse that is not (yet) the active one. The span stays
+  // contentEditable regardless of `isActive` (see the comment on it below), so
+  // a click's native mousedown caret-placement can land here before React's
+  // onClick-driven activation runs — e.g. while Shell's alignment-dirty gate
+  // defers setActiveVerse behind a confirm dialog. Accepting a keystroke there
+  // would build a draft from the inactive composed render (#642 defect 2).
+  // `beforeinput` is cancelable, so preventing it stops the mutation before it
+  // happens: the painted poetry/divider/highlight HTML is never flattened (no
+  // repaint needed — the resync effect above would no-op, since `lastSetRef`
+  // still matches), and an in-flight IME composition is never torn apart.
+  useEffect(() => {
+    const el = elRef.current;
+    if (!el) return;
+    const block = (e: Event) => {
+      if (!isActiveRef.current) e.preventDefault();
+    };
+    el.addEventListener("beforeinput", block);
+    return () => el.removeEventListener("beforeinput", block);
+  }, [readOnly, rtl, dto]);
+
   if (!dto) {
     return (
       <Typography variant="caption" color="text.disabled" sx={{ fontStyle: "italic" }}>
@@ -1048,7 +1074,14 @@ const VerseCell = memo(function VerseCell({
           </IconButton>
         </Tooltip>
       )}
-      {!readOnly && hasDraft && dto && (
+      {/* Save only renders for the ACTIVE verse: the DOM read below must never
+          capture the inactive composed render, which carries literal `\ts\*`
+          token text, the previous verse's relocated chunk divider, and
+          U+200B/U+00A0 layout artifacts — saving that relocates chunk dividers
+          between verses. Gating on `isActive` makes ScriptureColumn's
+          precondition (the chip render is guaranteed in the DOM at click) hold
+          here too. */}
+      {isActive && !readOnly && hasDraft && dto && (
         <Tooltip title={`save verse ${verseNum}`}>
           <IconButton
             onClick={(e) => {
@@ -1107,11 +1140,11 @@ const VerseCell = memo(function VerseCell({
         // arrives with contentEditable still false, so the browser's native
         // mousedown caret-placement can't run — reintroducing the
         // already-fixed "click twice to type" bug that
-        // setInnerHtmlPreservingCaret exists to avoid. Instead, the
-        // isActive check lives in onInput below, which rejects/reverts any
-        // keystroke landing here before activation completes, without
-        // touching this element's editability or the caret mechanics
-        // (#642 defect 2).
+        // setInnerHtmlPreservingCaret exists to avoid. Instead, the isActive
+        // check lives in the cancelable `beforeinput` listener above (with an
+        // onInput fallback below), which refuses any keystroke landing here
+        // before activation completes, without touching this element's
+        // editability or the caret mechanics (#642 defect 2).
         contentEditable={!readOnly}
         suppressContentEditableWarning
         spellCheck={!rtl}
@@ -1120,17 +1153,30 @@ const VerseCell = memo(function VerseCell({
           if (readOnly) return;
           const el = e.currentTarget as HTMLSpanElement;
           if (!isActive) {
-            // This span is contentEditable so a click's native caret
-            // placement lands here even before activation completes (e.g.
-            // the alignment-dirty-gate dialog in Shell defers
-            // setActiveVerse) — but only the ACTIVE verse's render includes
-            // \q/\p chips (see the `html` memo above). Accepting a keystroke
-            // here would stash a draft built from this marker-drifted "clean"
-            // text, dropping paragraph/poetry markers on save (#642 defect
-            // 2). Revert the stray input and ignore it rather than starting
-            // a draft; once activation lands the chip render takes over and
-            // typing behaves normally.
-            el.textContent = lastTextRef.current;
+            // Fallback only — the cancelable `beforeinput` listener above
+            // normally stops the mutation before the DOM changes. Some input
+            // types are not cancelable (notably IME `insertCompositionText`),
+            // so repair the render here if one slipped through.
+            //
+            // NOTE: `isActive` is necessary but NOT sufficient for "the DOM
+            // holds the chip render" — that render also requires
+            // `Array.isArray(verseObjects)` and a paintable result (see the
+            // `html` memo above). So this branch is "not the editable chip
+            // render", which is a superset of "inactive"; don't read it as a
+            // guarantee that an active verse always carries chips.
+            if ((e.nativeEvent as InputEvent).isComposing) return;
+            if (isPaintableHtml(html)) {
+              // innerHTML, not textContent: the inactive render paints block
+              // wrappers (poetry/paragraph), the `\ts\*` divider block, note
+              // highlights and find marks. Flattening to text would destroy
+              // all of it, and nothing repaints — the resync effect above
+              // no-ops because `lastSetRef` still equals the unchanged html.
+              el.innerHTML = html;
+              lastSetRef.current = html;
+            } else {
+              el.textContent = lastTextRef.current;
+              lastSetRef.current = lastTextRef.current;
+            }
             return;
           }
           // textContent, not innerText: in Firefox `innerText` read inside the
