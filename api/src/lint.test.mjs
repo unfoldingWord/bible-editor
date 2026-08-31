@@ -1068,5 +1068,22 @@ t("a JSON array in review_master_json is NOT treated as a row snapshot (door43 s
   assert.ok(flag);
   assert.equal(flag.door43, null);
 });
+t("a _meta key inside review_master_json (PR #665's flag bookkeeping) is stripped from door43", () => {
+  const i = lintTnRows([
+    tn({
+      review_kind: "quote",
+      review_reason: "x",
+      review_master_json: JSON.stringify({
+        note: "door43's note",
+        quote: "door43's quote",
+        _meta: { flaggedAt: "2026-08-30T00:00:00Z", autoClearAttempts: 2 },
+      }),
+    }),
+  ]);
+  const flag = i.find((x) => x.check === "Adapted note — verify");
+  assert.ok(flag);
+  assert.deepEqual(flag.door43, { note: "door43's note", quote: "door43's quote" }, "real Door43 fields survive, _meta does not");
+  assert.equal("_meta" in flag.door43, false, "no bookkeeping key leaks through as a fake Door43 field");
+});
 
 console.log(`\n${passed} lint tests passed`);

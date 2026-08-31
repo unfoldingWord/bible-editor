@@ -180,7 +180,17 @@ function reviewMasterSnapshot(row: Record<string, unknown>): Record<string, unkn
     const parsed = JSON.parse(raw) as unknown;
     // `typeof [] === "object"` in JS — an array is not a row snapshot, so
     // exclude it explicitly rather than let it masquerade as one.
-    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : null;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+    // The merge-engine PR (#665) reserves a `_meta` key inside this same
+    // column for its OWN bookkeeping (flag timestamps, auto-clear attempt
+    // records) — not Door43 row data. Strip it before handing the object
+    // back as `door43`, so the UI never renders that bookkeeping as a fake
+    // Door43 field. A no-op until #665 lands (the key simply isn't there
+    // yet); a shallow delete is correct either way since `_meta` is a
+    // reserved top-level key, not nested inside a real field's value.
+    const snapshot = { ...(parsed as Record<string, unknown>) };
+    delete snapshot["_meta"];
+    return snapshot;
   } catch {
     return null;
   }
