@@ -929,6 +929,55 @@ rows.patch("/:kind/:id", requireEditor, async (c) => {
   return c.json(updated);
 });
 
+const DismissReviewBody = z.object({ book: z.string() });
+
+// POST /api/rows/:kind/:id/dismiss-review — clear a workflow review_kind/
+// review_reason flag (the nightly merge's "verify this" chip) WITHOUT editing
+// content. Today the only way to clear a flag is the accidental no-op-save
+// path inside PATCH above (add a space, save, remove it, save) — this is the
+// real affordance for "I looked, it's fine."
+//
+// Deliberately race-tolerant like the twl-order-lock route and the ref_moved
+// batch clear in bookReimport.ts: no version bump, no If-Match/version-CAS.
+// Clearing a flag is not a content edit, so it must never phantom-409 an
+// open editor tab that happens to be mid-save on the same row — the flag is
+// stale metadata, not something anyone can lose by a concurrent write.
+// Idempotent: dismissing an already-clear flag is a 200 no-op (guarded on
+// `review_kind IS NOT NULL`), and only a row that doesn't exist at all 404s.
+rows.post("/:kind/:id/dismiss-review", requireEditor, async (c) => {
+  const kind = c.req.param("kind");
+  const id = c.req.param("id");
+  if (!isRowKind(kind)) return c.json({ error: "invalid_kind" }, 400);
+
+  let body: unknown;
+  try {
+    body = await c.req.json();
+  } catch {
+    return c.json({ error: "invalid_body" }, 400);
+  }
+  const parsed = DismissReviewBody.safeParse(body);
+  if (!parsed.success) return c.json({ error: "invalid_body", details: parsed.error.format() }, 400);
+  const { book } = parsed.data;
+
+  const now = Math.floor(Date.now() / 1000);
+  await c.env.DB.prepare(
+    `UPDATE ${KIND_TO_TABLE[kind]} SET review_kind = NULL, review_reason = NULL, updated_at = ?1
+       WHERE id = ?2${bookClause(3)} AND review_kind IS NOT NULL AND deleted_at IS NULL`,
+  )
+    .bind(now, id, book)
+    .run();
+
+  const fresh = await selectRowWithLatestSource(c.env, kind, id, book);
+  if (!fresh || (fresh as Record<string, unknown>).deleted_at) {
+    return c.json({ error: "not_found" }, 404);
+  }
+  const row = fresh as unknown as TnRow | TqRow | TwlRow;
+  c.executionCtx.waitUntil(
+    broadcastChapter(c.env, row.book, row.chapter, { type: "row.upserted", kind, row }),
+  );
+  return c.json(fresh);
+});
+
 // Soft delete with the same atomic version guard as PATCH.
 rows.delete("/:kind/:id", requireEditor, async (c) => {
   const kind = c.req.param("kind");
