@@ -310,8 +310,11 @@ function loadCreateFallback(ids) {
   const inClause = ids.map(() => "?").join(", ");
   const rows = db
     .prepare(
+      // book-known ONLY, unlike the bounded query: a NULL-book create for the
+      // same short id belongs to some other book, the folds discard it, and
+      // letting it win the pick would leave the row with no ancestor at all.
       `SELECT row_key, action, payload_json, book FROM edit_log
-        WHERE kind = ? AND (book = ? OR book IS NULL)
+        WHERE kind = ? AND book = ?
           AND action = 'create'
           AND row_key IN (${inClause})
         ORDER BY row_key ASC, id ASC`,
@@ -319,7 +322,7 @@ function loadCreateFallback(ids) {
     .all(KIND, BOOK, ...ids);
   const byId = new Map();
   for (const r of rows) {
-    if (byId.has(r.row_key)) continue; // earliest create per row_key
+    // NEWEST create per row_key: ascending order, last write wins.
     let payload = null;
     if (r.payload_json) {
       try {
@@ -380,6 +383,33 @@ function reconstructBaseWithFallback(ids, boundaryId) {
     reconstructBaseWithFallback([THIN_ID], BOUNDARY).get(THIN_ID),
     { note: "only-a-note" },
     "a create missing a field leaves that field absent (computeTsvMerge reads it as no_base)",
+  );
+
+  // A REISSUED slot: the id was tombstoned and reclaimed, so it holds two
+  // creates, both above the boundary. The ancestor of the row living in the
+  // slot NOW is the second create — taking the first would hand life #2's row
+  // life #1's content, a WRONG ancestor rather than a missing one.
+  const REUSED_ID = "rs12";
+  ins.run(KIND, REUSED_ID, BOOK, "create", JSON.stringify({ quote: "life1-q", note: "life1-n" }), 900);
+  ins.run(KIND, REUSED_ID, BOOK, "create", JSON.stringify({ quote: "life2-q", note: "life2-n" }), 950);
+  eq(
+    reconstructBaseWithFallback([REUSED_ID], BOUNDARY).get(REUSED_ID),
+    { quote: "life2-q", note: "life2-n" },
+    "a reclaimed slot folds its CURRENT life's create, not the dead row's",
+  );
+
+  // A NULL-book create for the same short id belongs to another book. It must
+  // not shadow this book's own create — the folds discard book-NULL entries, so
+  // a shadowed pick would silently leave the row unrecovered.
+  // Seeded NEWER than this book's own create, which is the hazardous order:
+  // "newest create wins" would otherwise pick it, and the folds then discard it.
+  const SHADOWED_ID = "sh34";
+  ins.run(KIND, SHADOWED_ID, BOOK, "create", JSON.stringify({ quote: "ours-q", note: "ours-n" }), 900);
+  ins.run(KIND, SHADOWED_ID, null, "create", JSON.stringify({ quote: "foreign-q", note: "foreign-n" }), 950);
+  eq(
+    reconstructBaseWithFallback([SHADOWED_ID], BOUNDARY).get(SHADOWED_ID),
+    { quote: "ours-q", note: "ours-n" },
+    "a book-NULL create does not shadow this book's own, even when it is newer",
   );
 
   // The fallback is STRICTLY a fallback: a non-empty bounded set is never

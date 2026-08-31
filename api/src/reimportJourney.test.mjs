@@ -1599,6 +1599,78 @@ console.log("\n[#653: a row created ABOVE the boundary folds its create as the a
   eq(row.version, 2, "…and nothing is written, so the version does not move");
 }
 
+console.log("\n[#653: the fallback takes the CURRENT life's create, and is not shadowed by another book's]");
+{
+  // A reclaimed slot: the id was tombstoned and reissued, so edit_log holds two
+  // creates for it, both above the boundary (the only case the fallback runs
+  // in). Master holds the CURRENT life's content. Fold the dead life's create
+  // instead and both sides look moved -> a conflict flag over nothing, and a
+  // real risk of adopting master over the translator on a coincidental match.
+  {
+    const { sqlite, env } = freshEnv();
+    sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (1, 100, 'translator')`).run();
+    sqlite
+      .prepare(
+        `INSERT INTO tq_rows (id, book, chapter, verse, ref_raw, question, response, version, updated_by)
+         VALUES ('rs12', ?, 9, 9, '9:9', 'app question', 'life2 response', 2, 1)`,
+      )
+      .run(BOOK);
+    const boundary = 1000000;
+    const ins = sqlite.prepare(
+      `INSERT INTO edit_log (id, kind, row_key, book, action, payload_json, created_at) VALUES (?, 'tq', 'rs12', ?, 'create', ?, ?)`,
+    );
+    ins.run(boundary + 5, BOOK, JSON.stringify({ question: "life1 question", response: "life1 response" }), 500);
+    ins.run(boundary + 9, BOOK, JSON.stringify({ question: "life2 question", response: "life2 response" }), 600);
+
+    const counts = await applyTsvRows(
+      env, BOOK, "tq",
+      [{
+        id: "rs12", idCoerced: false, refRaw: "9:9", chapter: 9, verse: 9,
+        occurrence: null, tags: null, quote: null, question: "life2 question", response: "life2 response",
+      }],
+      null, { confirmedAt: 200, editId: boundary },
+    );
+    eq(counts.merge_conflicts, 0, "the current life's create is the ancestor — no phantom conflict");
+    const row = sqlite.prepare(`SELECT review_kind, question FROM tq_rows WHERE id='rs12'`).all()[0];
+    eq(row.review_kind, null, "…no flag");
+    eq(row.question, "app question", "…and the translator's edit stands");
+  }
+
+  // A NULL-book create for the same short id belongs to ANOTHER book (prod
+  // holds ~7,689 such rows). Here it is NEWER than this book's own create, so a
+  // query that admits it would pick it — and the folds discard book-NULL
+  // entries, leaving the row with no ancestor and the very flag the fallback
+  // exists to remove.
+  {
+    const { sqlite, env } = freshEnv();
+    sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (1, 100, 'translator')`).run();
+    sqlite
+      .prepare(
+        `INSERT INTO tq_rows (id, book, chapter, verse, ref_raw, question, response, version, updated_by)
+         VALUES ('sh34', ?, 9, 9, '9:9', 'app question', 'imported response', 2, 1)`,
+      )
+      .run(BOOK);
+    const boundary = 1000000;
+    const ins = sqlite.prepare(
+      `INSERT INTO edit_log (id, kind, row_key, book, action, payload_json, created_at) VALUES (?, 'tq', 'sh34', ?, 'create', ?, ?)`,
+    );
+    ins.run(boundary + 5, BOOK, JSON.stringify({ question: "imported question", response: "imported response" }), 500);
+    ins.run(boundary + 9, null, JSON.stringify({ question: "another book's question", response: "x" }), 600);
+
+    const counts = await applyTsvRows(
+      env, BOOK, "tq",
+      [{
+        id: "sh34", idCoerced: false, refRaw: "9:9", chapter: 9, verse: 9,
+        occurrence: null, tags: null, quote: null, question: "imported question", response: "imported response",
+      }],
+      null, { confirmedAt: 200, editId: boundary },
+    );
+    eq(counts.merge_no_base, 0, "this book's own create is found, not shadowed by the foreign one");
+    const row = sqlite.prepare(`SELECT review_kind FROM tq_rows WHERE id='sh34'`).all()[0];
+    eq(row.review_kind, null, "…so no flag is raised");
+  }
+}
+
 console.log("\n[#653: master AI-edited AFTER the import — a real conflict, resolved D1-wins with a snapshot]");
 {
   // Same setup, but master's question moved too (the evening AI push). Both
@@ -1696,6 +1768,11 @@ console.log("\n[#653: with NO ancestor at all, the mint is gated on the measured
       "…never the incomplete-history cause, which was not what happened",
     );
     eq(parseSnap(row.review_master_json).question, "master question", "…with Door43's value recorded for comparison");
+    eq(
+      parseSnap(row.review_master_json).flag_since,
+      200,
+      "…and the watermark this flag's claim is bounded by, which is what the auto-clear must cover",
+    );
   }
 
   // 3. INCOMPLETE walk -> mint, and the message says so instead of naming an editor.
@@ -1745,24 +1822,34 @@ console.log("\n[#653: the auto-clear retires flags the commit history now dispro
 {
   const MINT_AT = 1787000000;
   const FILE = { repo: "en_tq", path: "tq_1CH.tsv" };
-  const seedFlagged = (sqlite, n = 2) => {
+  // FLAG_SINCE is the watermark the flag's claim is bounded by — written into
+  // the snapshot at the mint, and the ONLY honest window start (see
+  // masterReviewSnapshot). `updated_at` is deliberately seeded LATER than the
+  // mint here, the way a reorder drag or a preserve toggle leaves it: those
+  // paths move updated_at and leave review_kind standing, so anything keying
+  // the window on updated_at would walk a range that starts after the human
+  // commit it has to see.
+  const FLAG_SINCE = MINT_AT - 7 * 86400;
+  const seedFlagged = (sqlite, n = 2, { snapshot } = {}) => {
     sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (1, 100, 'translator')`).run();
+    const snap = snapshot === undefined ? JSON.stringify({ question: "master q", flag_at: MINT_AT, flag_since: FLAG_SINCE }) : snapshot;
     for (let i = 0; i < n; i++) {
       sqlite
         .prepare(
           `INSERT INTO tq_rows (id, book, chapter, verse, ref_raw, question, response, version, updated_by,
                                 updated_at, review_kind, review_reason, review_master_json)
-           VALUES (?, ?, 3, ?, ?, 'app question', 'r', 4, 1, ?, 'merge_no_base', 'some earlier reason', '{"question":"master q"}')`,
+           VALUES (?, ?, 3, ?, ?, 'app question', 'r', 4, 1, ?, 'merge_no_base', 'some earlier reason', ?)`,
         )
-        .run(`cl0${i}`, BOOK, i + 1, `3:${i + 1}`, MINT_AT);
+        .run(`cl0${i}`, BOOK, i + 1, `3:${i + 1}`, MINT_AT + 5 * 86400, snap);
     }
   };
 
-  // 1. Complete walk, human-free, and its window covers the mint -> cleared.
+  // 1. Complete walk, human-free, reaching back past the flag's own window
+  //    (walkStart <= flag_since) -> cleared, on the run's own walk, no refetch.
   {
     const { sqlite, env } = freshEnv();
     seedFlagged(sqlite);
-    const cleared = await clearResolvedMergeNoBaseForTest(env, BOOK, "tq", MINT_AT - 86400, OURS_AND_AI_PAGE, FILE);
+    const cleared = await clearResolvedMergeNoBaseForTest(env, BOOK, "tq", FLAG_SINCE - 10, OURS_AND_AI_PAGE, FILE);
     eq(cleared, 2, "both flags are retired");
     const rows = sqlite.prepare(`SELECT review_kind, review_reason, review_master_json, version FROM tq_rows`).all();
     eq(rows.map((r) => r.review_kind), [null, null], "review_kind cleared");
@@ -1776,7 +1863,7 @@ console.log("\n[#653: the auto-clear retires flags the commit history now dispro
   {
     const { sqlite, env } = freshEnv();
     seedFlagged(sqlite);
-    const cleared = await clearResolvedMergeNoBaseForTest(env, BOOK, "tq", MINT_AT - 86400, HUMAN_PAGE, FILE);
+    const cleared = await clearResolvedMergeNoBaseForTest(env, BOOK, "tq", FLAG_SINCE - 10, HUMAN_PAGE, FILE);
     eq(cleared, 0, "a human commit in the window blocks the clear");
     const rows = sqlite.prepare(`SELECT review_kind FROM tq_rows`).all();
     eq(rows.map((r) => r.review_kind), ["merge_no_base", "merge_no_base"], "…the flags stand");
@@ -1787,17 +1874,17 @@ console.log("\n[#653: the auto-clear retires flags the commit history now dispro
     const { sqlite, env } = freshEnv();
     seedFlagged(sqlite);
     const cleared = await clearResolvedMergeNoBaseForTest(
-      env, BOOK, "tq", MINT_AT - 86400,
+      env, BOOK, "tq", FLAG_SINCE - 10,
       { commits: OURS_AND_AI_PAGE.commits, incomplete: true, incompleteReason: "page_cap" },
       FILE,
     );
     eq(cleared, 0, "'we could not read the history' is not 'no human touched it'");
   }
 
-  // 4. The run's own walk starts AFTER the mint, so its window does not cover
-  //    the flag. The clear must extend the walk rather than clear on evidence
-  //    it does not have — and when that extended walk cannot be completed
-  //    (here: the fetch fails), nothing is cleared.
+  // 4. The run's own walk starts AFTER the window the flag was raised over, so
+  //    it cannot see a human commit sitting between the two. The clear must
+  //    extend the walk rather than clear on evidence it does not have — and
+  //    when that extended walk cannot be completed, nothing is cleared.
   {
     const { sqlite, env } = freshEnv();
     seedFlagged(sqlite);
@@ -1808,14 +1895,67 @@ console.log("\n[#653: the auto-clear retires flags the commit history now dispro
       throw new Error("network down");
     };
     try {
-      const cleared = await clearResolvedMergeNoBaseForTest(env, BOOK, "tq", MINT_AT + 5000, OURS_AND_AI_PAGE, FILE);
-      eq(extended > 0, true, "an uncovered mint time forces a fresh walk instead of reusing the run's");
+      const cleared = await clearResolvedMergeNoBaseForTest(env, BOOK, "tq", FLAG_SINCE + 5000, OURS_AND_AI_PAGE, FILE);
+      eq(extended > 0, true, "an uncovered window forces a fresh walk instead of reusing the run's");
       eq(cleared, 0, "…and a walk that could not complete clears nothing");
     } finally {
       globalThis.fetch = realFetch;
     }
     const rows = sqlite.prepare(`SELECT review_kind FROM tq_rows`).all();
     eq(rows.map((r) => r.review_kind), ["merge_no_base", "merge_no_base"], "…the flags stand");
+  }
+
+  // 4b. THE REASON the window comes from the flag and not from the row: a
+  //     reorder drag (rows.ts's non-versioning fast path) moves updated_at and
+  //     leaves review_kind standing, so a June flag can carry an August
+  //     timestamp. Here the run's walk covers everything since well after
+  //     flag_since but well before updated_at — a window derived from
+  //     updated_at would call that covered and clear on evidence that never
+  //     included the flag's own range.
+  {
+    const { sqlite, env } = freshEnv();
+    seedFlagged(sqlite);
+    const realFetch = globalThis.fetch;
+    let extended = 0;
+    globalThis.fetch = async () => { extended++; throw new Error("network down"); };
+    try {
+      const cleared = await clearResolvedMergeNoBaseForTest(env, BOOK, "tq", MINT_AT + 86400, OURS_AND_AI_PAGE, FILE);
+      eq(extended > 0, true, "a walk starting after flag_since is extended, however recent the row's updated_at");
+      eq(cleared, 0, "…and nothing is cleared on the un-extended evidence");
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  }
+
+  // 4c. A flag carrying NO recorded window — every flag minted before #653,
+  //     including the 79 standing in prod — is NOT cleared. Its range is
+  //     unknown, and an absent measurement may not be laundered into a clean
+  //     one. Those clear by hand instead.
+  {
+    const { sqlite, env } = freshEnv();
+    seedFlagged(sqlite, 2, { snapshot: JSON.stringify({ question: "master q" }) });
+    const realFetch = globalThis.fetch;
+    let called = 0;
+    globalThis.fetch = async () => { called++; throw new Error("should not be called"); };
+    try {
+      const cleared = await clearResolvedMergeNoBaseForTest(env, BOOK, "tq", FLAG_SINCE - 10, OURS_AND_AI_PAGE, FILE);
+      eq(cleared, 0, "a flag with no recorded window is left alone");
+      eq(called, 0, "…and no walk is spent on it");
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+    const rows = sqlite.prepare(`SELECT review_kind FROM tq_rows`).all();
+    eq(rows.map((r) => r.review_kind), ["merge_no_base", "merge_no_base"], "…the flags stand");
+  }
+
+  // 4d. A snapshot whose flag_since is not a usable number is the same absence
+  //     — never a Number()-coerced 0, which would read as "walk from the epoch",
+  //     the most permissive window there is.
+  {
+    const { sqlite, env } = freshEnv();
+    seedFlagged(sqlite, 1, { snapshot: JSON.stringify({ flag_since: null }) });
+    const cleared = await clearResolvedMergeNoBaseForTest(env, BOOK, "tq", FLAG_SINCE - 10, OURS_AND_AI_PAGE, FILE);
+    eq(cleared, 0, "an explicit null window is absent, not epoch 0");
   }
 
   // 5. Nothing flagged -> no walk, no write, no cost. This is what makes the
@@ -1840,15 +1980,16 @@ console.log("\n[#653: the auto-clear retires flags the commit history now dispro
     }
   }
 
-  // 6. A STRONGER flag raised in between is not collateral damage: the clear is
-  //    guarded on review_kind = 'merge_no_base', like the ref_moved clear. Two
-  //    rows, so the clear actually RUNS (a book with only the stronger flag
-  //    returns at the count) and has the chance to sweep the wrong one up.
+  // 6. A STRONGER flag is not collateral damage. The id list is built from a
+  //    'merge_no_base' SELECT, so the statement's own re-assertion of that
+  //    predicate is a RACE guard (a flag raised between the SELECT and the
+  //    batch) and is not reachable from a single-process test — this case pins
+  //    the selection instead, which is the half a test CAN observe.
   {
     const { sqlite, env } = freshEnv();
     seedFlagged(sqlite, 2);
     sqlite.prepare(`UPDATE tq_rows SET review_kind = 'merge_conflict' WHERE id = 'cl00'`).run();
-    const cleared = await clearResolvedMergeNoBaseForTest(env, BOOK, "tq", MINT_AT - 86400, OURS_AND_AI_PAGE, FILE);
+    const cleared = await clearResolvedMergeNoBaseForTest(env, BOOK, "tq", FLAG_SINCE - 10, OURS_AND_AI_PAGE, FILE);
     eq(cleared, 1, "only the merge_no_base row is retired");
     const rows = sqlite.prepare(`SELECT id, review_kind FROM tq_rows ORDER BY id`).all();
     eq(rows.map((r) => r.review_kind), ["merge_conflict", null], "…an unacknowledged merge_conflict stands");
