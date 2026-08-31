@@ -176,13 +176,42 @@ export interface BookSummary {
 // content problems a translator must resolve ("flag") from integrity issues
 // like footnotes ("escalate"). `ref` is "chapter:verse" (or "chapter"); `rowId`
 // is present for TN findings so the UI can jump straight to the offending note.
+// `dismissible`/`door43`/`ours`/`reviewKind`/`reviewReason` are present ONLY on
+// review_kind-derived issues (the nightly-merge "verify this" flags) — never
+// on the mechanical/USFM integrity checks, which have no flag to dismiss (see
+// lint.ts's LintIssue for the server-side detail). `door43` is Door43's row
+// value at flag time (or null when absent/unparseable — the migration that
+// populates it may not be applied yet); `ours` holds the same fields from the
+// live row, so the popup can show what changed. `reviewKind`/`reviewReason`
+// identify which specific review flag this issue represents (a row can carry
+// several independent findings with the same rowId) — sent back on dismiss so
+// the server only clears the flag the popup was actually looking at, not
+// every flag on the row (`reviewReason` closes a second race the kind alone
+// can't: a same-kind re-stamp with different content, see PR #664).
+//
+// `reviewReason` is `string | null | undefined` with THREE distinct meanings
+// — undefined never occurs on a dismissible issue (it's always sent, `null`
+// included) but the type allows it for a non-dismissible issue, where the
+// whole field is absent. `null` means "this flag genuinely has no reason" —
+// a real, distinct observation from "no token was sent". Collapsing null to
+// undefined here was the bug PR #664's Codex re-verify caught (the
+// absent-vs-wrong trap, see docs/sync-attribution-handoff.md): a null-reason
+// flag's dismiss would omit the token entirely, so the server's guard never
+// fired, and a stale dismiss could clear a LATER same-kind re-stamp that DID
+// have a reason. Always pass reviewReason through to dismissReviewFlag
+// exactly as received, never `?? undefined` / `|| undefined` it away.
 export interface BookLintIssue {
   check: string;
   bucket: "flag" | "escalate";
   ref: string;
   rowId?: string;
   message: string;
-  resource: "tn" | "ult" | "ust";
+  resource: "tn" | "tq" | "twl" | "ult" | "ust";
+  dismissible?: boolean;
+  door43?: Record<string, unknown> | null;
+  ours?: Record<string, unknown>;
+  reviewKind?: string;
+  reviewReason?: string | null;
 }
 
 export interface BookLintReport {
@@ -1677,6 +1706,41 @@ export const api = {
           ? { ...patch, restored_from_version: opts.restoredFromVersion }
           : patch,
       ),
+    }),
+
+  // Clears a dismissible book-lint "review" flag without changing the row
+  // itself (issue #653 direction 2). Contract'd by the companion API PR
+  // (POST /api/rows/:kind/:id/dismiss-review, body {book, review_kind?,
+  // review_reason?}) — that PR, and PR #664 (the stale-popup race fixes
+  // reviewKind/reviewReason close), are the source of truth if this drifts.
+  // `reviewKind`/`reviewReason` are both optional and independent: when
+  // given, the server only clears the flag whose stored value(s) still match
+  // what the caller was looking at, instead of every review flag on the row
+  // (a row can carry several) or a DIFFERENT flag of the same kind that was
+  // re-stamped with new content since the caller last saw it. Returns the
+  // fresh row.
+  //
+  // Both spreads key on `!== undefined`, NEVER truthiness: reviewReason is
+  // `string | null`, and `null` ("this flag has no reason") is a value the
+  // server's guard must receive and match against, not a falsy signal to
+  // drop the key — dropping it is exactly the absent-vs-wrong bug PR #664's
+  // Codex re-verify caught (see BookLintIssue's reviewReason doc above). An
+  // empty-string reviewKind/reviewReason is likewise a real value, not a
+  // reason to omit the key — always pass through what the issue carried.
+  dismissReviewFlag: <T = unknown>(
+    kind: RowKind,
+    book: string,
+    id: string,
+    reviewKind?: string,
+    reviewReason?: string | null,
+  ) =>
+    request<T>(`/api/rows/${kind}/${encodeURIComponent(id)}/dismiss-review`, {
+      method: "POST",
+      body: JSON.stringify({
+        book,
+        ...(reviewKind !== undefined ? { review_kind: reviewKind } : {}),
+        ...(reviewReason !== undefined ? { review_reason: reviewReason } : {}),
+      }),
     }),
 
   deleteRow: (kind: RowKind, id: string, expectedVersion: number, book: string) =>

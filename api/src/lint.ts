@@ -37,6 +37,37 @@ export interface LintIssue {
   ref: string; // chapter:verse (or chapter) for navigation
   rowId?: string; // row id (for jump-to-row)
   message: string;
+  // The next three are present ONLY on review_kind-derived issues (the
+  // nightly-merge "verify this" flags) — never on the mechanical/USFM
+  // integrity checks below, which have no flag to dismiss.
+  /** True when this issue can be cleared via POST .../dismiss-review. */
+  dismissible?: boolean;
+  /** Door43's row value at flag time (review_master_json), or null when the
+   *  column/value is absent — read DEFENSIVELY (see reviewSnapshot below), a
+   *  separate in-flight PR owns the migration that populates it. */
+  door43?: Record<string, unknown> | null;
+  /** The live row's own current value for the same per-kind field set. */
+  ours?: Record<string, unknown>;
+  /** The row's review_kind at the time this issue was built — the client
+   *  echoes this back on dismiss so a stale flag never silently clears a
+   *  DIFFERENT one the nightly reimport re-stamped in the meantime (see the
+   *  "stale dismiss" guard on the dismiss-review route in rows.ts). */
+  reviewKind?: string;
+  /** The row's review_reason at the time this issue was built — a SECOND
+   *  identity token alongside reviewKind. reviewKind alone still lets a
+   *  stale dismiss clear a NEWER flag of the SAME kind whose content
+   *  changed (a re-stamp with a different reason); reviewReason changes
+   *  exactly when the flag's content changes, unlike updated_at (which
+   *  moves on unrelated row touches too), so it closes that gap.
+   *
+   *  ALWAYS present (never omitted) on a dismissible issue, and explicit
+   *  `null` is a real, distinct value here — "I saw a flag with no reason"
+   *  — not the same as "no token sent at all". Collapsing it to `undefined`
+   *  (the absent-vs-wrong trap: see docs/sync-attribution-handoff.md) let a
+   *  stale dismiss of a null-reason flag silently clear a LATER same-kind
+   *  re-stamp that DID have a reason, because "no token" and "empty token"
+   *  both skipped the guard. */
+  reviewReason?: string | null;
 }
 
 // A required field is "blank" when it is missing or only whitespace. Computed
@@ -135,6 +166,49 @@ export function reviewFlagTitle(reviewKind: string | null | undefined, fallback:
   }
 }
 
+// review_master_json (a snapshot of Door43's row value at flag time) is a
+// column added by a SEPARATE in-flight PR (migration not yet applied on
+// every deploy). Read it DEFENSIVELY: `row.review_master_json` may be
+// `undefined` (column doesn't exist yet), NULL (never populated for this
+// row), or a JSON string. Any of those — or malformed JSON — yields `null`,
+// never a thrown 500. Never reference the column by name in SQL; the caller
+// already does `SELECT *`.
+function reviewMasterSnapshot(row: Record<string, unknown>): Record<string, unknown> | null {
+  const raw = row["review_master_json"];
+  if (typeof raw !== "string" || raw === "") return null;
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    // `typeof [] === "object"` in JS — an array is not a row snapshot, so
+    // exclude it explicitly rather than let it masquerade as one.
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+    // The merge-engine PR (#665) reserves a `_meta` key inside this same
+    // column for its OWN bookkeeping (flag timestamps, auto-clear attempt
+    // records) — not Door43 row data. Strip it before handing the object
+    // back as `door43`, so the UI never renders that bookkeeping as a fake
+    // Door43 field. A no-op until #665 lands (the key simply isn't there
+    // yet); a shallow delete is correct either way since `_meta` is a
+    // reserved top-level key, not nested inside a real field's value.
+    const snapshot = { ...(parsed as Record<string, unknown>) };
+    delete snapshot["_meta"];
+    return snapshot;
+  } catch {
+    return null;
+  }
+}
+
+// The live row's own value for a per-kind field allowlist — kept narrow so
+// `ours` never leaks internal columns (version, updated_by, review_kind,
+// etc.) into the lint feed.
+function ownFields(row: Record<string, unknown>, fields: readonly string[]): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const f of fields) out[f] = row[f] ?? null;
+  return out;
+}
+
+const TN_REVIEW_FIELDS = ["ref_raw", "support_reference", "quote", "occurrence", "note", "tags"] as const;
+const TQ_REVIEW_FIELDS = ["ref_raw", "question", "response", "tags"] as const;
+const TWL_REVIEW_FIELDS = ["ref_raw", "orig_words", "occurrence", "tw_link", "tags"] as const;
+
 export function lintTnRows(rows: TnRow[]): LintIssue[] {
   const issues: LintIssue[] = [];
   for (const r of rows) {
@@ -184,6 +258,11 @@ export function lintTnRows(rows: TnRow[]): LintIssue[] {
         ref: `${r.chapter}:${r.verse}`,
         rowId: r.id,
         message: r.review_reason ?? "No ancestor was recoverable to merge this row against Door43 — verify it.",
+        dismissible: true,
+        door43: reviewMasterSnapshot(r as unknown as Record<string, unknown>),
+        ours: ownFields(r as unknown as Record<string, unknown>, TN_REVIEW_FIELDS),
+        reviewKind: r.review_kind,
+        reviewReason: r.review_reason,
       });
     } else if (r.review_kind) {
       // Workflow-only review flag for adapted/migrated notes (review_kind set).
@@ -196,6 +275,11 @@ export function lintTnRows(rows: TnRow[]): LintIssue[] {
         ref: `${r.chapter}:${r.verse}`,
         rowId: r.id,
         message: r.review_reason ?? "Adapted from a parallel passage — verify the Hebrew quote and wording.",
+        dismissible: true,
+        door43: reviewMasterSnapshot(r as unknown as Record<string, unknown>),
+        ours: ownFields(r as unknown as Record<string, unknown>, TN_REVIEW_FIELDS),
+        reviewKind: r.review_kind,
+        reviewReason: r.review_reason,
       });
     }
   }
@@ -232,6 +316,11 @@ export function lintTqRows(rows: TqRow[]): LintIssue[] {
         ref,
         rowId: r.id,
         message: r.review_reason ?? "No ancestor was recoverable to merge this row against Door43 — verify it.",
+        dismissible: true,
+        door43: reviewMasterSnapshot(r as unknown as Record<string, unknown>),
+        ours: ownFields(r as unknown as Record<string, unknown>, TQ_REVIEW_FIELDS),
+        reviewKind: r.review_kind,
+        reviewReason: r.review_reason,
       });
     } else if (r.review_kind) {
       // Workflow-only review flag (mirror lintTnRows): set when the nightly
@@ -244,6 +333,11 @@ export function lintTqRows(rows: TqRow[]): LintIssue[] {
         ref,
         rowId: r.id,
         message: r.review_reason ?? "A Door43 edit was merged over your change — verify it.",
+        dismissible: true,
+        door43: reviewMasterSnapshot(r as unknown as Record<string, unknown>),
+        ours: ownFields(r as unknown as Record<string, unknown>, TQ_REVIEW_FIELDS),
+        reviewKind: r.review_kind,
+        reviewReason: r.review_reason,
       });
     }
   }
@@ -271,6 +365,11 @@ export function lintTwlRows(rows: TwlRow[]): LintIssue[] {
         ref,
         rowId: r.id,
         message: r.review_reason ?? "No ancestor was recoverable to merge this row against Door43 — verify it.",
+        dismissible: true,
+        door43: reviewMasterSnapshot(r as unknown as Record<string, unknown>),
+        ours: ownFields(r as unknown as Record<string, unknown>, TWL_REVIEW_FIELDS),
+        reviewKind: r.review_kind,
+        reviewReason: r.review_reason,
       });
     } else if (r.review_kind) {
       // Workflow-only review flag (mirror lintTnRows) — a merged Door43 edit that
@@ -281,6 +380,11 @@ export function lintTwlRows(rows: TwlRow[]): LintIssue[] {
         ref,
         rowId: r.id,
         message: r.review_reason ?? "A Door43 edit was merged over your change — verify it.",
+        dismissible: true,
+        door43: reviewMasterSnapshot(r as unknown as Record<string, unknown>),
+        ours: ownFields(r as unknown as Record<string, unknown>, TWL_REVIEW_FIELDS),
+        reviewKind: r.review_kind,
+        reviewReason: r.review_reason,
       });
     }
   }

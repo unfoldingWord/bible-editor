@@ -931,4 +931,159 @@ t("review flag titles come from review_kind, not one hardcoded string per kind",
   );
 });
 
+// Issue #653 direction 2: review_kind-derived issues carry a dismissible
+// flag plus a door43/ours pair so the UI can show what changed. The
+// review_master_json column belongs to a SEPARATE in-flight PR (migration
+// not applied yet everywhere) — lint.ts must read it defensively.
+t("flagged tn row: dismissible + door43 (parsed) + ours (field allowlist)", () => {
+  const i = lintTnRows([
+    tn({
+      chapter: 3,
+      verse: 5,
+      id: "ab12",
+      review_kind: "quote",
+      review_reason: "verify it",
+      quote: "our quote",
+      support_reference: "rc://*/ta/man/translate/x",
+      occurrence: 1,
+      tags: null,
+      review_master_json: JSON.stringify({ note: "door43's note", quote: "door43's quote" }),
+    }),
+  ]);
+  const flag = i.find((x) => x.check === "Adapted note — verify");
+  assert.ok(flag, "the review flag fired");
+  assert.equal(flag.dismissible, true);
+  assert.deepEqual(flag.door43, { note: "door43's note", quote: "door43's quote" });
+  assert.deepEqual(flag.ours, {
+    ref_raw: "1:1",
+    support_reference: "rc://*/ta/man/translate/x",
+    quote: "our quote",
+    occurrence: 1,
+    note: "a note",
+    tags: null,
+  });
+});
+t("flagged tq row: dismissible + door43 + ours (tq field allowlist)", () => {
+  const i = lintTqRows([
+    tq({
+      chapter: 6,
+      verse: 5,
+      id: "nb02",
+      review_kind: "merge_conflict",
+      question: "our question",
+      response: "our response",
+      tags: "x",
+      review_master_json: JSON.stringify({ question: "door43 question" }),
+    }),
+  ]);
+  const flag = i.find((x) => x.check === "Merged Door43 edit — verify");
+  assert.ok(flag);
+  assert.equal(flag.dismissible, true);
+  assert.deepEqual(flag.door43, { question: "door43 question" });
+  assert.deepEqual(flag.ours, { ref_raw: null, question: "our question", response: "our response", tags: "x" });
+});
+t("flagged twl row: dismissible + door43 + ours (twl field allowlist)", () => {
+  const i = lintTwlRows([
+    twl({
+      chapter: 2,
+      verse: 8,
+      id: "nb03",
+      review_kind: "ref_moved",
+      orig_words: "מִלָּה",
+      tw_link: "rc://*/tw/dict/bible/kt/word",
+      occurrence: 2,
+      tags: null,
+      review_master_json: JSON.stringify({ tw_link: "rc://*/tw/dict/bible/kt/other" }),
+    }),
+  ]);
+  const flag = i.find((x) => x.check === "Reference differs from Door43 — verify");
+  assert.ok(flag);
+  assert.equal(flag.dismissible, true);
+  assert.deepEqual(flag.door43, { tw_link: "rc://*/tw/dict/bible/kt/other" });
+  assert.deepEqual(flag.ours, {
+    ref_raw: null,
+    orig_words: "מִלָּה",
+    occurrence: 2,
+    tw_link: "rc://*/tw/dict/bible/kt/word",
+    tags: null,
+  });
+});
+t("door43 is null when review_master_json is absent (column not yet migrated / never populated)", () => {
+  const i = lintTnRows([tn({ review_kind: "quote", review_reason: "x" })]);
+  const flag = i.find((x) => x.check === "Adapted note — verify");
+  assert.ok(flag);
+  assert.equal(flag.door43, null);
+  assert.equal(flag.dismissible, true, "still dismissible even with no Door43 snapshot to compare");
+});
+t("malformed review_master_json yields door43 null, never throws", () => {
+  assert.doesNotThrow(() => {
+    const i = lintTnRows([tn({ review_kind: "quote", review_reason: "x", review_master_json: "{not json" })]);
+    const flag = i.find((x) => x.check === "Adapted note — verify");
+    assert.equal(flag.door43, null);
+  });
+});
+t("merge_no_base flags also carry dismissible + door43 + ours", () => {
+  const i = lintTnRows([tn({ review_kind: "merge_no_base", review_master_json: JSON.stringify({ note: "x" }) })]);
+  const flag = i.find((x) => x.check === "Unmerged Door43 edit — verify");
+  assert.ok(flag);
+  assert.equal(flag.dismissible, true);
+  assert.deepEqual(flag.door43, { note: "x" });
+});
+t("non-review issues never carry dismissible/door43/ours", () => {
+  const i = lintTnRows([tn({ note: "text] more", review_kind: null })]);
+  const bracketIssue = i.find((x) => x.check === "13. Paired Square Bracket");
+  assert.ok(bracketIssue);
+  assert.equal(bracketIssue.dismissible, undefined);
+  assert.equal(bracketIssue.door43, undefined);
+  assert.equal(bracketIssue.ours, undefined);
+});
+t("a flagged issue carries reviewKind so the client can echo it back on dismiss", () => {
+  const i = lintTnRows([tn({ review_kind: "merge_conflict", review_reason: "x" })]);
+  const flag = i.find((x) => x.check === "Merged Door43 edit — verify");
+  assert.ok(flag);
+  assert.equal(flag.reviewKind, "merge_conflict");
+});
+t("a flagged issue also carries reviewReason — the second stale-dismiss token (PR #664)", () => {
+  const i = lintTnRows([tn({ review_kind: "merge_conflict", review_reason: "a specific merged edit" })]);
+  const flag = i.find((x) => x.check === "Merged Door43 edit — verify");
+  assert.ok(flag);
+  assert.equal(flag.reviewReason, "a specific merged edit");
+});
+t("reviewReason is explicit null (not omitted) when review_reason is null — a real observation, not 'no token'", () => {
+  // The fix for the absent-vs-wrong bug (PR #664, Codex re-verify): a
+  // flagged issue ALWAYS carries reviewReason, and null must survive as
+  // null so a dismiss can be guarded on "the flag I saw had no reason" —
+  // collapsing this to undefined let a stale dismiss of a null-reason flag
+  // silently clear a LATER same-kind re-stamp that DID have a reason.
+  const i = lintTnRows([tn({ review_kind: "merge_no_base", review_reason: null })]);
+  const flag = i.find((x) => x.check === "Unmerged Door43 edit — verify");
+  assert.ok(flag);
+  assert.equal(flag.reviewReason, null);
+  assert.notEqual(flag.reviewReason, undefined);
+  assert.ok("reviewReason" in flag, "the key itself is present, not omitted");
+});
+t("a JSON array in review_master_json is NOT treated as a row snapshot (door43 stays null)", () => {
+  const i = lintTnRows([tn({ review_kind: "quote", review_reason: "x", review_master_json: JSON.stringify(["not", "an", "object"]) })]);
+  const flag = i.find((x) => x.check === "Adapted note — verify");
+  assert.ok(flag);
+  assert.equal(flag.door43, null);
+});
+t("a _meta key inside review_master_json (PR #665's flag bookkeeping) is stripped from door43", () => {
+  const i = lintTnRows([
+    tn({
+      review_kind: "quote",
+      review_reason: "x",
+      review_master_json: JSON.stringify({
+        note: "door43's note",
+        quote: "door43's quote",
+        _meta: { flaggedAt: "2026-08-30T00:00:00Z", autoClearAttempts: 2 },
+      }),
+    }),
+  ]);
+  const flag = i.find((x) => x.check === "Adapted note — verify");
+  assert.ok(flag);
+  assert.deepEqual(flag.door43, { note: "door43's note", quote: "door43's quote" }, "real Door43 fields survive, _meta does not");
+  assert.equal("_meta" in flag.door43, false, "no bookkeeping key leaks through as a fake Door43 field");
+});
+
 console.log(`\n${passed} lint tests passed`);

@@ -929,6 +929,199 @@ rows.patch("/:kind/:id", requireEditor, async (c) => {
   return c.json(updated);
 });
 
+// review_kind/review_reason are OPTIONAL: when the client sends the values
+// it saw in the lint feed, the UPDATE below only clears a flag that still
+// matches — see the "stale dismiss" guard in the handler. Two independent
+// tokens because review_kind alone still lets a stale dismiss clear a NEWER
+// flag of the SAME kind whose content changed (a same-kind re-stamp with a
+// different reason) — review_reason changes exactly when the flag's content
+// changes, unlike updated_at (which also moves on unrelated row touches).
+//
+// `.nullable()` on both: a lint issue's reviewReason can legitimately BE
+// null (a flag with no reason text is real, not "no token sent"), and
+// zod would otherwise reject `{review_reason: null}` outright. The handler
+// still has to distinguish "key absent" from "key present with value null"
+// to build the right guard — safeParse's OUTPUT can't reliably carry that
+// distinction (an absent optional key and a present-but-undefined one both
+// end up `undefined` on `parsed.data`), so the handler checks key presence
+// on the RAW parsed body instead (see hasOwn below).
+const DismissReviewBody = z.object({
+  book: z.string(),
+  review_kind: z.string().nullable().optional(),
+  review_reason: z.string().nullable().optional(),
+});
+
+// POST /api/rows/:kind/:id/dismiss-review — clear a workflow review_kind/
+// review_reason flag (the nightly merge's "verify this" chip) WITHOUT editing
+// content. Today the only way to clear a flag is the accidental no-op-save
+// path inside PATCH above (add a space, save, remove it, save) — this is the
+// real affordance for "I looked, it's fine."
+//
+// Deliberately race-tolerant like the twl-order-lock route and the ref_moved
+// batch clear in bookReimport.ts: no version bump, no If-Match/version-CAS.
+// Clearing a flag is not a content edit, so it must never phantom-409 an
+// open editor tab that happens to be mid-save on the same row — the flag is
+// stale metadata, not something anyone can lose by a concurrent write.
+// Idempotent: dismissing an already-clear (or already-mismatched) flag is a
+// 200 no-op, and only a row that doesn't exist at all 404s.
+rows.post("/:kind/:id/dismiss-review", requireEditor, async (c) => {
+  const kind = c.req.param("kind");
+  const id = c.req.param("id");
+  if (!isRowKind(kind)) return c.json({ error: "invalid_kind" }, 400);
+
+  let body: unknown;
+  try {
+    body = await c.req.json();
+  } catch {
+    return c.json({ error: "invalid_body" }, 400);
+  }
+  const parsed = DismissReviewBody.safeParse(body);
+  if (!parsed.success) return c.json({ error: "invalid_body", details: parsed.error.format() }, 400);
+  const { book, review_kind: expectedReviewKind, review_reason: expectedReviewReason } = parsed.data;
+  // Same shape as every other row route's missing-book response — a blank
+  // string satisfies z.string() so this can't be folded into the schema.
+  if (!book) return c.json({ error: "book_required" }, 400);
+
+  // Key-presence, read off the RAW body (not parsed.data — see the schema
+  // comment above for why). `{review_reason: null}` and an omitted
+  // review_reason key both surface as `expectedReviewReason === undefined`
+  // after parsing, but they mean opposite things: "the flag I saw has no
+  // reason, match that" vs. "I have no opinion, don't guard on reason at
+  // all". Collapsing them was the absent-vs-wrong bug PR #664's Codex
+  // re-verify caught (docs/sync-attribution-handoff.md) — a stale dismiss of
+  // a null-reason flag silently cleared a LATER same-kind re-stamp that DID
+  // have a reason, because "no token" and "null token" both skipped the
+  // guard identically.
+  const rawBody = body as Record<string, unknown>;
+  const hasReviewKind = Object.prototype.hasOwnProperty.call(rawBody, "review_kind");
+  const hasReviewReason = Object.prototype.hasOwnProperty.call(rawBody, "review_reason");
+
+  // Pre-read: needed for (a) the chapter-lock check below (book/chapter/kind
+  // scope it), (b) the trashed-row guard (tn only), and (c) the edit_log
+  // audit payload — by the time the UPDATE below runs, the review_kind/
+  // review_reason values it's clearing are gone, so they have to be captured
+  // now or not at all.
+  const current = await c.env.DB.prepare(
+    `SELECT * FROM ${KIND_TO_TABLE[kind]} WHERE id = ?1${bookClause(2)}`,
+  )
+    .bind(id, book)
+    .first<
+      Record<string, unknown> & {
+        chapter: number;
+        deleted_at: number | null;
+        review_kind: string | null;
+        review_reason: string | null;
+        trashed_at?: number | null;
+      }
+    >();
+  if (!current || current.deleted_at) return c.json({ error: "not_found" }, 404);
+  // A trashed tn row is invisible to the lint feed (bookImport.ts's
+  // /:book/lint route filters `trashed_at IS NOT NULL` out entirely) — a
+  // dismiss against one is treated the same way, as not found, so a crafted
+  // call can't clear (or broadcast) a flag nobody can see is set.
+  if (kind === "tn" && current.trashed_at != null) {
+    return c.json({ error: "not_found" }, 404);
+  }
+
+  // Same lock carve-out as PATCH/DELETE above: tn edits are always allowed
+  // during an AI run, but tq/twl are not — a dismiss landing mid-pipeline on
+  // a row about to be rewritten by auto-apply would race it.
+  if (kind !== "tn") {
+    const lock = await activePipelineForChapter(c.env, book, current.chapter, kind);
+    if (lock) return c.json(lockedResponseBody(lock), 409);
+  }
+
+  const userId = currentUserId(c);
+  const now = Math.floor(Date.now() / 1000);
+  // tq_rows/twl_rows have no trashed_at column at all, so this guard is only
+  // ever spliced in for tn (adding it unconditionally would be a SQL error
+  // on the other two tables).
+  const trashedGuard = kind === "tn" ? " AND trashed_at IS NULL" : "";
+  // The "stale dismiss" guard (issue #653 follow-up from Codex review): when
+  // the client sends the review_kind/review_reason it actually saw, only
+  // clear a flag that still matches. If the nightly reimport re-stamped a
+  // DIFFERENT flag on this row between the client loading the lint feed and
+  // this POST landing — a different kind, OR the SAME kind re-stamped with
+  // new content (review_reason changed) — the UPDATE below matches 0 rows
+  // and the response falls through to the no-op path, returning the row's
+  // CURRENT flag — the client sees the truth instead of silently losing a
+  // warning it never reviewed. Two independent, optional tokens: params are
+  // numbered dynamically since either, both, or neither may be present. Each
+  // guard is built off KEY PRESENCE, not the parsed value: a present `null`
+  // means "match a row whose column is NULL" (IS NULL — no bind param, since
+  // SQL can't `= NULL`), a present string means "match that exact value", and
+  // an ABSENT key means "don't guard on this token at all".
+  const updateBinds: unknown[] = [now, id, book];
+  let nextParam = 4;
+  let reviewKindGuard = "";
+  if (hasReviewKind) {
+    if (expectedReviewKind === null) {
+      reviewKindGuard = " AND review_kind IS NULL";
+    } else {
+      reviewKindGuard = ` AND review_kind = ?${nextParam}`;
+      updateBinds.push(expectedReviewKind);
+      nextParam++;
+    }
+  }
+  let reviewReasonGuard = "";
+  if (hasReviewReason) {
+    if (expectedReviewReason === null) {
+      reviewReasonGuard = " AND review_reason IS NULL";
+    } else {
+      reviewReasonGuard = ` AND review_reason = ?${nextParam}`;
+      updateBinds.push(expectedReviewReason);
+      nextParam++;
+    }
+  }
+
+  // Batch: the audit INSERT is conditional on the UPDATE actually clearing a
+  // flag (`changes() > 0`, same pattern as the PATCH/setTnBit/setTnTrashed
+  // audits above), so a no-op dismiss — already clear, wrong review_kind, or
+  // a lost race — never writes a phantom edit_log row. `dismiss_review` is a
+  // NEW action name deliberately kept out of every existing edit_log
+  // allowlist (tsvMerge.ts's CONTENT_ACTIONS, the history route's action
+  // filter, bookReimport.ts's various `action IN (...)` scans) — its payload
+  // is the CLEARED flag values only, never row content, so nothing that
+  // reads edit_log as a content snapshot can mistake this for one.
+  const [updateRes] = await c.env.DB.batch([
+    c.env.DB
+      .prepare(
+        `UPDATE ${KIND_TO_TABLE[kind]} SET review_kind = NULL, review_reason = NULL, updated_at = ?1
+           WHERE id = ?2${bookClause(3)} AND review_kind IS NOT NULL AND deleted_at IS NULL${trashedGuard}${reviewKindGuard}${reviewReasonGuard}`,
+      )
+      .bind(...updateBinds),
+    c.env.DB
+      .prepare(
+        `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action, payload_json)
+         SELECT ?1, ?2, ?3, ?4, version, version, 'dismiss_review', ?5
+           FROM ${KIND_TO_TABLE[kind]}
+          WHERE id = ?2 AND book = ?3 AND changes() > 0`,
+      )
+      .bind(
+        kind,
+        id,
+        book,
+        userId ?? null,
+        JSON.stringify({ review_kind: current.review_kind, review_reason: current.review_reason }),
+      ),
+  ]);
+
+  const fresh = await selectRowWithLatestSource(c.env, kind, id, book);
+  if (!fresh || (fresh as Record<string, unknown>).deleted_at) {
+    return c.json({ error: "not_found" }, 404);
+  }
+  // Suppress the broadcast on a no-op (already clear, mismatched
+  // review_kind, or a lost race): nothing changed, so telling the whole
+  // chapter room otherwise is pure WS churn, matching PATCH's no-op paths.
+  if (updateRes.meta.changes) {
+    const row = fresh as unknown as TnRow | TqRow | TwlRow;
+    c.executionCtx.waitUntil(
+      broadcastChapter(c.env, row.book, row.chapter, { type: "row.upserted", kind, row }),
+    );
+  }
+  return c.json(fresh);
+});
+
 // Soft delete with the same atomic version guard as PATCH.
 rows.delete("/:kind/:id", requireEditor, async (c) => {
   const kind = c.req.param("kind");
