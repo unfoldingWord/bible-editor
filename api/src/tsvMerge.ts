@@ -114,13 +114,30 @@ export function tsvMergeFields(kind: TsvMergeKind): TsvMergeField[] {
 }
 
 // Did a Door43 maintainer re-anchor this row to a different Reference on master
-// (same id, new chapter / verse / ref_raw)? Identity/reference columns are
-// deliberately EXCLUDED from computeTsvMerge (see FIELDS_BY_KIND above), so a
-// pure move is INVISIBLE to the field merge and would otherwise be silently
-// reverted by the next export (D1's old location rendered back over master).
-// This is the detector the caller (bookReimport.ts's edited-candidate
-// resolution) uses to instead WITHHOLD the resource watermark (apply_incomplete)
-// and flag the row (review_kind='ref_moved') for a human to move it in-app.
+// (same id, new ref_raw)? Identity/reference columns are deliberately EXCLUDED
+// from computeTsvMerge (see FIELDS_BY_KIND above), so a pure move is INVISIBLE
+// to the field merge and would otherwise be silently reverted by the next
+// export (D1's old location rendered back over master). This is the detector
+// the caller (bookReimport.ts's edited-candidate resolution) uses to instead
+// WITHHOLD the resource watermark (apply_incomplete) and flag the row
+// (review_kind='ref_moved') for a human to move it in-app.
+//
+// KEYED ON ref_raw ALONE (issue #547 item 2). `export.ts` writes `ref_raw`
+// verbatim as the Reference column — `chapter`/`verse` only feed
+// `sortRowsByReference` and, on the master side, are themselves DERIVED from
+// `ref_raw` by `parseTsvRow`'s `refParts`. So a `chapter`/`verse`-only
+// divergence between D1's stored columns and master's derived ones can never
+// reach master (the export cannot publish it) and must not withhold the
+// resource's watermark — and the converse, `rows.ts` deliberately leaving
+// `chapter` untouched on a cross-chapter in-app "change reference" edit
+// (same-chapter moves only; see the comment there), must not read as
+// "Door43 moved it" merely because D1's stored `chapter`/`verse` haven't
+// caught up yet. Comparing `ref_raw` — the one column both sides actually
+// agree is authoritative — resolves both without inventing a chapter/verse
+// self-heal pass, which stays a separate, undone follow-up (see #547 item 2's
+// own text). A stored `chapter`/`verse` that disagrees with the row's own
+// `ref_raw` (a torn row) is therefore no longer flagged by this detector —
+// deliberately out of scope here, not a regression this function owns.
 //
 // A `protectedRow` (tn deleted/trashed/preserve/hint) is never treated as moved:
 // such a row is left untouched from master regardless, so the caller keeps it a
@@ -137,11 +154,7 @@ export function tsvRefMoved(
 ): boolean {
   if (protectedRow) return false;
   const curRef = (cur.ref_raw as string | null) ?? "";
-  return (
-    Number(cur.chapter) !== incoming.chapter ||
-    Number(cur.verse) !== incoming.verse ||
-    curRef !== (incoming.refRaw ?? "")
-  );
+  return curRef !== (incoming.refRaw ?? "");
 }
 
 // ── Attributing the move (issue #540 item 3) ────────────────────────────────
@@ -164,22 +177,21 @@ export type TsvRefMoveOutcome =
   | "ours_moved" // D1 moved, master still sits at the ancestor -> a normal exportable edit
   | "theirs_moved" // master moved, D1 still sits at the ancestor -> the out-of-band move
   | "both_moved" // both sides re-anchored, to different places -> needs a human
-  | "unattributable"; // no ancestor for the components that differ -> cannot say who moved
+  | "unattributable"; // no ancestor ref_raw -> cannot say who moved
 
 // The reference columns as of the ancestor. A key is ABSENT when no surviving
 // edit_log payload before the watermark ever recorded that column — the same
-// "absent means unattributable" convention TsvMergeSide uses for content. This
-// matters in practice: the in-app move sends `ref_raw` + `verse` and never
-// `chapter` (moves are same-chapter only, rows.ts), so a base folded purely from
-// patches legitimately carries no chapter.
+// "absent means unattributable" convention TsvMergeSide uses for content.
+// `chapter`/`verse` are folded and kept here purely for diagnostics (the
+// caller's ref-move log line, bookReimport.ts) — attribution below (issue #547
+// item 2) keys on `ref_raw` alone, since that is the only reference data the
+// export actually publishes; see tsvRefMoved's comment for why.
 export interface TsvRefSide {
   chapter?: number;
   verse?: number;
   /** "" when the payload recorded a null ref_raw, matching tsvRefMoved's coercion. */
   ref_raw?: string;
 }
-
-const REF_COMPONENTS = ["chapter", "verse", "ref_raw"] as const;
 
 export function classifyTsvRefMove(
   cur: Record<string, unknown>,
@@ -188,37 +200,18 @@ export function classifyTsvRefMove(
   protectedRow: boolean,
 ): TsvRefMoveOutcome {
   if (!tsvRefMoved(cur, incoming, protectedRow)) return "none";
-  if (base === null) return "unattributable";
+  if (base === null || base.ref_raw === undefined) return "unattributable";
 
-  const ours: Required<TsvRefSide> = {
-    chapter: Number(cur.chapter),
-    verse: Number(cur.verse),
-    ref_raw: (cur.ref_raw as string | null) ?? "",
-  };
-  const theirs: Required<TsvRefSide> = {
-    chapter: incoming.chapter,
-    verse: incoming.verse,
-    ref_raw: incoming.refRaw ?? "",
-  };
-
-  let oursMoved = false;
-  let theirsMoved = false;
-  for (const k of REF_COMPONENTS) {
-    // A component both sides agree on carries no information about who moved,
-    // so it never needs an ancestor — only the DIFFERING components do. That is
-    // what keeps the common same-chapter move attributable from a patch-only
-    // history that never recorded `chapter`.
-    if (ours[k] === theirs[k]) continue;
-    if (base[k] === undefined) return "unattributable";
-    if (ours[k] !== base[k]) oursMoved = true;
-    if (theirs[k] !== base[k]) theirsMoved = true;
-  }
+  const oursRef = (cur.ref_raw as string | null) ?? "";
+  const theirsRef = incoming.refRaw ?? "";
+  const oursMoved = oursRef !== base.ref_raw;
+  const theirsMoved = theirsRef !== base.ref_raw;
   if (oursMoved && theirsMoved) return "both_moved";
   if (oursMoved) return "ours_moved";
   if (theirsMoved) return "theirs_moved";
-  // Unreachable: the sides differ on some component, so at least one of them
-  // differs from the ancestor. Fail toward "nobody moved" rather than inventing
-  // an attribution.
+  // Unreachable: tsvRefMoved already proved ref_raw differs between the two
+  // sides, so at least one of them differs from the ancestor too. Fail toward
+  // "nobody moved" rather than inventing an attribution.
   return "none";
 }
 
