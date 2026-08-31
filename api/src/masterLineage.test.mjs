@@ -26,12 +26,16 @@
 //   R4 end anchor removed                       exit 0, 0 FAIL
 //   R5 digits AND bracket both dropped          exit 1, 2 FAIL — 3a2432b15b +
 //                                               the verse-range narrowing
-//   R6 `ai` = bot author email alone            exit 1, 15 FAIL — all six
-//      (the pre-#550 rule)                      hand-directed outliers, all
+//   R6 `ai` = bot author email alone            exit 1, 15 FAIL as first
+//      (the pre-#550 rule)                      measured 2026-08-24 — all six
+//                                               hand-directed outliers, all
 //                                               four narrowings, both reason
 //                                               assertions, the wrapped
 //                                               trailer, the marker-mention
-//                                               case, the retired vocabulary
+//                                               case, the retired vocabulary.
+//                                               STALE — see the 2026-08-31
+//                                               re-run below (issue #670):
+//                                               22 FAIL on current main.
 //   R7 trailer accepted with no bot gate        exit 1, 1 FAIL — "a human
 //                                               revert quoting a pipeline
 //                                               trailer … is human"
@@ -95,6 +99,33 @@
 // subject fully matches the pipeline grammar. It does not, by construction —
 // the FLOOR assertion at the end of the #638 section pins that residual `ai`
 // so it stays visible.
+//
+// Re-run 2026-08-31 (issue #670), R6 ONLY, against current main (HEAD
+// c0b1e4f): the 15-FAIL number above was measured 2026-08-24, before #634 and
+// #638 added the trailer-route hardening sections (the #622/#634/#638
+// assertions folded into R12–R14 above), so it undercounts what R6 actually
+// breaks today. Reproduced by temporarily replacing the bot branch's whole
+// two-signal body in masterLineage.ts — the `AI_PIPELINE_SUBJECT` check, the
+// `AI_PIPELINE_SUBJECT_LOOSE`+`AI_PIPELINE_TRAILER` check, and the
+// `bot_author_no_pipeline_shape` fallback — with a single unconditional
+// `return { ...commit, kind: "ai", reason: "bot_author_pipeline_subject" }`
+// (bot author decides alone, nothing else consulted), then running this file
+// unmodified, then reverting masterLineage.ts (confirmed byte-identical to
+// HEAD via `git diff` afterward — this file's own assertions were never
+// touched). Result: exit 1, 22 FAIL. The 22 is the original 15 (same six
+// hand-directed outliers, four narrowings, wrapped trailer, marker-mention
+// reason pair, retired vocabulary, and the #550 bot-authored-revert case)
+// PLUS 7 new failures from the #622/#634/#638 trailer-route sections that did
+// not exist in the 2026-08-24 test file — each a kind+reason pair or a
+// gate-exclusion assertion added since. Every failure, old and new, is a
+// case the two-signal rule exists to fix, so the shape of the ablation is
+// unchanged; only the count grew as the test file did. Do not cite the
+// issue-filing-time claim of "24 FAIL on main, 25 after #655's #647
+// assertion" — that #647 assertion (the "non-revert human edit message that
+// merely quotes the marker" case, below) exercises the AI_MARKER route on a
+// NON-bot author, which R6's patch never touches, so it cannot be part of
+// R6's count; 22, measured directly above, is what this exact patch against
+// this exact HEAD produces.
 //
 // Run from api/:
 //   node --experimental-strip-types --no-warnings src/masterLineage.test.mjs
