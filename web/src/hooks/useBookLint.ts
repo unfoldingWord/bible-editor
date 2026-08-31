@@ -14,7 +14,12 @@ export interface UseBookLintReturn {
   flagIssues: BookLintIssue[];
   flagCount: number;
   escalateCount: number;
-  refetch: () => void;
+  // Returns the in-flight fetch's completion (resolves whether it lands,
+  // fails, or is aborted) so a caller can await "the report I asked for has
+  // now either landed or given up" — e.g. BookLintIndicator's dismiss flows
+  // bound an optimistic key's lifetime to this promise rather than to a
+  // shared reset effect.
+  refetch: () => Promise<void>;
 }
 
 export function useBookLint(book: string, enabled: boolean): UseBookLintReturn {
@@ -22,13 +27,13 @@ export function useBookLint(book: string, enabled: boolean): UseBookLintReturn {
   const [status, setStatus] = useState<UseBookLintReturn["status"]>("idle");
   const fetchCtrl = useRef<AbortController | null>(null);
 
-  const load = useCallback(() => {
-    if (!enabled) return;
+  const load = useCallback((): Promise<void> => {
+    if (!enabled) return Promise.resolve();
     fetchCtrl.current?.abort();
     const ctrl = new AbortController();
     fetchCtrl.current = ctrl;
     setStatus("loading");
-    fetchWithRetry((signal) => api.getBookLint(book, signal), { signal: ctrl.signal })
+    return fetchWithRetry((signal) => api.getBookLint(book, signal), { signal: ctrl.signal })
       .then((r) => {
         if (ctrl.signal.aborted) return;
         setReport(r);
@@ -49,7 +54,7 @@ export function useBookLint(book: string, enabled: boolean): UseBookLintReturn {
       return;
     }
     setReport(null);
-    load();
+    void load();
     return () => {
       fetchCtrl.current?.abort();
     };
@@ -58,10 +63,9 @@ export function useBookLint(book: string, enabled: boolean): UseBookLintReturn {
   // Only the flag bucket needs a human decision; escalate (footnotes) is a
   // secondary count. Recompute the list from the report so the dropdown and the
   // badge can never disagree, but trust the server's flagCount as the source.
-  // Memoized on `report` (not recomputed — and re-referenced — on every
-  // unrelated render of the caller) so BookLintIndicator can key an effect
-  // off this array's identity to mean "a fresh report actually landed,"
-  // not "something else made the caller re-render."
+  // Memoized on `report` so this array keeps a stable identity across
+  // unrelated re-renders of the caller, changing only when a fresh report
+  // actually lands.
   const flagIssues = useMemo(
     () => (report?.issues ?? []).filter((i) => i.bucket === "flag"),
     [report],

@@ -56,8 +56,13 @@ interface Props {
   escalateCount: number;
   /** Navigate to (and, for TN issues, activate) the offending row. */
   onGoToIssue: (issue: BookLintIssue) => void;
-  /** Called after a dismiss (single or group) succeeds, so the caller can refetch the lint report. */
-  onDismissed?: () => void;
+  /**
+   * Called after a dismiss (single or group) succeeds, so the caller can
+   * refetch the lint report. Its returned promise (if any) is awaited so a
+   * dismiss flow can bound its own optimistic key to "my own POST, then my
+   * own refetch" rather than to a shared, cross-talk-prone reset.
+   */
+  onDismissed?: () => Promise<void> | void;
 }
 
 // A row can carry SEVERAL independent lint findings with the same rowId
@@ -116,45 +121,28 @@ export function BookLintIndicator({
   // their individual refs. Starts empty — a run of duplicates opens collapsed.
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   // Optimistically-cleared issues (issue #653 direction 2 "Mark reviewed").
-  // Filtered out of the local list immediately, BEFORE the server confirms —
-  // this Set only needs to bridge the gap between the dismiss POST resolving
-  // and the subsequent refetch's fresh report landing. It is NOT meant to
-  // persist for the component's whole lifetime: once a fresh report arrives
-  // (see the flagIssues effect below), the server's own data is truth and
-  // this resets to empty. Without that reset, a flag re-minted later by a
-  // nightly reimport — same (resource, rowId, check) as one dismissed
-  // earlier in this session — would arrive in a later report but stay
-  // filtered out forever, invisibly suppressing a live warning.
+  // Filtered out of the local list immediately, BEFORE the server confirms.
+  // Each key's lifetime is bounded to its OWN dismiss request cycle, not to
+  // the component's lifetime or to any shared reset: dismissOne/dismissGroup
+  // add a key right before awaiting their POST, then await their OWN
+  // refetch, then remove that same key in a `finally` — win or lose. A key
+  // can therefore never outlive the request that added it, so two
+  // concurrent dismissals (or a dismiss racing an unrelated refetch) can't
+  // leave a key stranded: each flow owns and clears only its own keys. This
+  // replaces an earlier design (a single effect resetting the whole Set
+  // whenever a fresh report landed, guarded by a "no dismissal in flight"
+  // ref) that had irreducible cross-talk between concurrent dismissals — a
+  // second dismiss's failure could clear the busy guard before the first
+  // dismiss's own refetch had landed, permanently stranding its key.
   const [dismissedKeys, setDismissedKeys] = useState<Set<string>>(new Set());
   // A single flag disables every dismiss control (per-issue and group)
-  // while ANY dismissal is in flight — simplest way to avoid two concurrent
-  // group runs stomping each other's busy state, or a double-click firing a
-  // duplicate POST. `busyKey` is cosmetic only (which control shows the
-  // spinner); the actual gate is `dismissBusy`.
+  // while ANY dismissal is in flight — simplest way to avoid a double-click
+  // firing a duplicate POST. Purely a UI affordance now; it plays no part in
+  // dismissedKeys' lifetime (see above). `busyKey` is cosmetic only (which
+  // control shows the spinner).
   const [dismissBusy, setDismissBusy] = useState(false);
   const [busyKey, setBusyKey] = useState<string | null>(null);
   const [dismissError, setDismissError] = useState<string | null>(null);
-
-  // Mirrors dismissBusy for the effect below to read without depending on
-  // it — updated during render (safe for a ref), so it's always current by
-  // the time an effect runs, without making dismissBusy itself a dependency
-  // (which would fire the reset the instant OUR OWN in-flight dismiss flips
-  // dismissBusy back to false, before its own refetch has actually landed).
-  const dismissBusyRef = useRef(dismissBusy);
-  dismissBusyRef.current = dismissBusy;
-
-  // flagIssues is memoized by useBookLint on its `report`, so its identity
-  // only changes when a fresh report actually lands (not on every unrelated
-  // re-render of the caller). When that happens with no dismissal in
-  // flight, the server is truth — clear dismissedKeys so it goes back to
-  // bridging only the next dismiss's own POST→refetch gap, per the
-  // dismissedKeys comment above. A dismissal in flight is excluded (its own
-  // refetch, once it lands, will trigger this same reset).
-  useEffect(() => {
-    if (!dismissBusyRef.current) {
-      setDismissedKeys(new Set());
-    }
-  }, [flagIssues]);
 
   // Local expand state is keyed to THIS book's issue set. In practice
   // App.tsx keys <Shell> on `book`, so this component remounts (fresh
@@ -196,15 +184,25 @@ export function BookLintIndicator({
   const dismissOne = async (issue: BookLintIssue) => {
     const kind = dismissibleKind(issue.resource);
     if (!issue.rowId || !kind || dismissBusy) return;
+    const key = issueKey(issue);
     setDismissBusy(true);
-    setBusyKey(issueKey(issue));
+    setBusyKey(key);
+    // Add BEFORE awaiting the POST (optimistic hide); remove in `finally` —
+    // on success once our own refetch has landed (server is truth then), on
+    // failure immediately (nothing actually changed, so un-hiding matches
+    // reality). Either way this key never outlives this one request cycle.
+    setDismissedKeys((prev) => new Set(prev).add(key));
     try {
       await api.dismissReviewFlag(kind, book, issue.rowId, issue.reviewKind);
-      setDismissedKeys((prev) => new Set(prev).add(issueKey(issue)));
-      onDismissed?.();
+      await onDismissed?.();
     } catch {
       setDismissError("Could not mark reviewed — try again.");
     } finally {
+      setDismissedKeys((prev) => {
+        const next = new Set(prev);
+        next.delete(key);
+        return next;
+      });
       setDismissBusy(false);
       setBusyKey(null);
     }
@@ -214,6 +212,10 @@ export function BookLintIndicator({
     if (dismissBusy) return;
     setDismissBusy(true);
     setBusyKey(group.key);
+    // Keys this run added — each is added only once its OWN POST succeeds,
+    // and all of them are removed together (in `finally`, below) once the
+    // single trailing refetch for the whole group has settled.
+    const ownKeys: string[] = [];
     let failed = 0;
     try {
       for (const issue of group.issues) {
@@ -221,7 +223,9 @@ export function BookLintIndicator({
         if (!issue.rowId || !kind) continue;
         try {
           await api.dismissReviewFlag(kind, book, issue.rowId, issue.reviewKind);
-          setDismissedKeys((prev) => new Set(prev).add(issueKey(issue)));
+          const key = issueKey(issue);
+          ownKeys.push(key);
+          setDismissedKeys((prev) => new Set(prev).add(key));
         } catch {
           failed++;
         }
@@ -229,8 +233,13 @@ export function BookLintIndicator({
       if (failed > 0) {
         setDismissError(`${failed} of ${group.issues.length} failed to clear — try again.`);
       }
-      onDismissed?.();
+      await onDismissed?.();
     } finally {
+      setDismissedKeys((prev) => {
+        const next = new Set(prev);
+        for (const key of ownKeys) next.delete(key);
+        return next;
+      });
       setDismissBusy(false);
       setBusyKey(null);
     }
