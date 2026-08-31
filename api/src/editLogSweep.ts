@@ -22,6 +22,10 @@
 // (edit_log spanned 93 days against the 180-day retention), so this is a
 // shield installed before the hazard goes live, not a repair.
 //
+// Branch (6) is the tn/tq/twl half, added by #653 — same hazard, different
+// table: a TSV row whose create is its only recoverable ancestor loses that
+// ancestor to age and becomes permanently unadjudicable.
+//
 // WHAT IS EXEMPT — per verse (row_key = BOOK/chapter/verse/RESOURCE), at
 // most five rows outlive the retention window:
 //   1. The row today's merge picks as the ancestor: the newest
@@ -236,5 +240,36 @@ export const EDIT_LOG_SWEEP_SQL = `
               AND el.created_at < brs.master_confirmed_at
          )
          WHERE rn = 1
+         UNION ALL
+         -- (6) issue #653: the newest book-known 'create' per LIVE tn/tq/twl
+         -- row. bookReimport.ts's reconstructTsvBases now falls back to exactly
+         -- this row when a row's bounded history is empty — which is the state
+         -- of every row created after its book's export boundary froze. Those
+         -- are the rows the fallback exists for, and their create is the ONLY
+         -- ancestor they have: once it ages out, the row is permanently
+         -- unadjudicable again and the recovery silently expires.
+         --
+         -- Unlike (1)-(5) this needs no watermark join: a TSV row_key is the
+         -- row id (not BOOK/ch/verse/RESOURCE), the fold keys on (kind, book,
+         -- row_key), and the fallback reads book-known entries only — a
+         -- book-NULL row cannot be proven to belong to this row (ids are unique
+         -- per (book, id) only) and is skipped by the fold, so sheltering one
+         -- would cost a row and buy nothing. Restricted to rows still LIVE in
+         -- their table, so a deleted row's history still ages out normally.
+         SELECT MAX(el.id) AS keep_id
+           FROM edit_log el
+          WHERE el.kind IN ('tn', 'tq', 'twl')
+            AND el.action = 'create'
+            AND el.book IS NOT NULL
+            AND el.created_at < ?1
+            AND (
+              (el.kind = 'tn' AND EXISTS (
+                 SELECT 1 FROM tn_rows r WHERE r.id = el.row_key AND r.book = el.book AND r.deleted_at IS NULL))
+              OR (el.kind = 'tq' AND EXISTS (
+                 SELECT 1 FROM tq_rows r WHERE r.id = el.row_key AND r.book = el.book AND r.deleted_at IS NULL))
+              OR (el.kind = 'twl' AND EXISTS (
+                 SELECT 1 FROM twl_rows r WHERE r.id = el.row_key AND r.book = el.book AND r.deleted_at IS NULL))
+            )
+          GROUP BY el.kind, el.book, el.row_key
        )
      )`;

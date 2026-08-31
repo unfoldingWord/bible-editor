@@ -39,7 +39,7 @@ function db() {
     id TEXT, book TEXT, chapter INTEGER, verse INTEGER, ref_raw TEXT,
     tags TEXT, support_reference TEXT, quote TEXT, occurrence INTEGER,
     note TEXT, sort_order REAL, version INTEGER NOT NULL DEFAULT 1,
-    review_kind TEXT, review_reason TEXT,
+    review_kind TEXT, review_reason TEXT, review_master_json TEXT,
     updated_at INTEGER, updated_by INTEGER, restored_from_version INTEGER,
     trashed_at INTEGER, deleted_at INTEGER,
     PRIMARY KEY (book, id)

@@ -319,15 +319,44 @@ function attributeField(
 // (lineage)` before a per-ref map exists; both live in masterLineage.ts.
 // Never a boolean of the caller's own making. Omitted means the caller never
 // looked, which keeps today's master-wins behavior.
+// `opts.baseProvisional` marks an ancestor recovered by #653's create-as-
+// ancestor fallback — the row's own `create` payload, taken from ABOVE the
+// export boundary because nothing survived at or below it. That base is good
+// enough to EXONERATE (master still holds exactly what the row was created
+// with, so a difference is ours and our edit stands) and NOT good enough to
+// convict, because the boundary that would prove master moved is precisely the
+// one that failed. The measured shape: a watermark frozen while exports keep
+// landing leaves base = the import, ours = the translator's newest edit, and
+// theirs = OUR OWN export of her older edit — three-way different, which reads
+// as a both-changed conflict and, on an incomplete lineage walk, would let
+// "master" (us) revert her. On main that population is unconditionally
+// keep_no_base, so this floor keeps it no worse than main.
+//
+// So with a provisional base, every MASTER-WINS outcome is suppressed:
+//   - `adopt`   -> withheld (would write master's value)
+//   - `conflict` while master may hold a human edit -> withheld
+// Both degrade to no_base (keep D1, report keep_no_base). What survives is the
+// whole point of the fallback: `keep` (theirs === base, master never moved,
+// our edit stands clean with no flag) and — when the lineage EXPLICITLY says
+// no human is behind master — keep_ai_master, which is a D1-wins outcome and
+// so cannot revert anyone.
+//
+// A per-field `adopt` could in principle be allowed where ours === base (the
+// translator never touched that field since import), but only if our own
+// export of an untouched field always rendered byte-equal to the create
+// payload. It does not: render/re-parse is not round-trip stable for 16-19% of
+// content (STATE.md), so that adopt would fire on phantom differences. Left
+// out deliberately.
 export function computeTsvMerge(
   kind: TsvMergeKind,
   base: TsvMergeSide | null,
   ours: TsvMergeSide,
   theirs: TsvMergeSide,
-  opts: { masterMayHoldHumanEdit?: boolean } = {},
+  opts: { masterMayHoldHumanEdit?: boolean; baseProvisional?: boolean } = {},
 ): TsvMergeResult {
   const fields = FIELDS_BY_KIND[kind];
   const masterWinsConflicts = opts.masterMayHoldHumanEdit !== false;
+  const provisional = opts.baseProvisional === true;
 
   const writeFields: Partial<TsvMergeSide> = {};
   const conflictFields: TsvMergeField[] = [];
@@ -342,6 +371,13 @@ export function computeTsvMerge(
     if (fate === "no_base") {
       anyNoBase = true;
       continue; // keep ours for this field; can't attribute it
+    }
+    // A provisional base may not convict (see the header): the two master-wins
+    // fates degrade to "unattributable", which keeps D1 and reports the row as
+    // keep_no_base — main's behavior for this population, never worse.
+    if (provisional && (fate === "adopt" || (fate === "conflict" && masterWinsConflicts))) {
+      anyNoBase = true;
+      continue;
     }
     anyAttributable = true;
     if (fate === "keep") continue; // master didn't move it — our edit stands

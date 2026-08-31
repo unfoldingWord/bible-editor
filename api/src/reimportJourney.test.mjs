@@ -40,10 +40,59 @@ import { fileURLToPath } from "node:url";
 
 import {
   applyTsvRows,
+  clearResolvedMergeNoBaseForTest,
   recordResourceSync,
   recordWithheldSyncIfAbsent,
 } from "./bookReimport.ts";
+import { contentPatchClearClauses } from "./contentPatchClauses.ts";
+import { lintTqRows } from "./lint.ts";
 import { shouldRecordResourceSync } from "./reimportSyncGate.ts";
+
+// Snapshot reader that tolerates a missing or garbled snapshot, so ablating the
+// snapshot write reports a FAILED ASSERTION instead of crashing the run.
+const parseSnap = (s) => {
+  try {
+    return JSON.parse(s ?? "null") ?? {};
+  } catch {
+    return {};
+  }
+};
+
+// ── Lineage fixtures (#653) ────────────────────────────────────────────────
+// Compacted summaries, exactly the shape compactLineage produces and the shape
+// that rides a Workflow step's return value into applyTsvRows.
+const AI_ONLY_LINEAGE = {
+  mayHoldHumanEdit: false, hasHumanCommit: false, incomplete: false, incompleteReason: "",
+  counts: { ours: 2, ai: 3, human: 0 }, humanShas: [], refsComplete: false, humanRefs: [], refsReason: "not_measured",
+};
+const HUMAN_LINEAGE = {
+  mayHoldHumanEdit: true, hasHumanCommit: true, incomplete: false, incompleteReason: "",
+  counts: { ours: 1, ai: 1, human: 1 }, humanShas: ["deadbeef"], refsComplete: false, humanRefs: [], refsReason: "too_many_human_commits",
+};
+const INCOMPLETE_LINEAGE = {
+  mayHoldHumanEdit: true, hasHumanCommit: false, incomplete: true, incompleteReason: "page_cap",
+  counts: { ours: 1, ai: 1, human: 0 }, humanShas: [], refsComplete: false, humanRefs: [], refsReason: "not_measured",
+};
+
+// Commit pages for the auto-clear, in the MasterCommitPage shape
+// listMasterCommitsSince returns. Messages/authors are the real production
+// shapes classifyMasterCommit was verified against (see masterLineage.ts).
+const OURS_AND_AI_PAGE = {
+  commits: [
+    { sha: "aaa1", message: "bible-editor: 1CH tq → master (#7001)", authorEmail: "someone@example.com", authorName: "Someone", date: "2026-08-28T00:00:00Z" },
+    { sha: "aaa2", message: "TQ: 1CH 3 [bp-assistant]", authorEmail: "bot@unfoldingword.org", authorName: "bot", date: "2026-08-27T00:00:00Z" },
+  ],
+  incomplete: false,
+  incompleteReason: "",
+};
+const HUMAN_PAGE = {
+  commits: [
+    ...OURS_AND_AI_PAGE.commits,
+    { sha: "bbb1", message: "Fixes a typo in 1CH 3:2", authorEmail: "maintainer@example.com", authorName: "Maintainer", date: "2026-08-27T12:00:00Z" },
+  ],
+  incomplete: false,
+  incompleteReason: "",
+};
 
 let failed = 0;
 function eq(actual, expected, msg) {
@@ -1315,7 +1364,11 @@ console.log("\n[keep_no_base tn/tq/twl row: review_kind flag set once, guarded a
   eq(after1.review_kind, "merge_no_base", "the row is flagged for the cleanup chip (lint.ts)");
   eq(typeof after1.review_reason === "string" && after1.review_reason.length > 0, true, "a human-readable reason is stored");
   eq(
-    /overwritten|overwrote|overwrites/i.test(after1.review_reason.replace("Nothing has been overwritten", "")),
+    // The denial itself is the one allowed use of the word, in either of the
+    // two phrasings this message has had (#653 rewrote the sentence).
+    /overwritten|overwrote|overwrites/i.test(
+      after1.review_reason.replace("Nothing has been overwritten", "").replace("Nothing was overwritten", ""),
+    ),
     false,
     "the stored reason never claims an overwrite HAPPENED, aside from explicitly denying one",
   );
@@ -1492,6 +1545,937 @@ console.log("\n[a content-moving merge write clears the stale restore marker (is
   eq(after.note, "Door43's corrected note", "the note moved");
   eq(after.version, 6, "…the version bumped");
   eq(after.restored_from_version, null, "…and the stale restore marker was cleared with it");
+}
+
+// ── Issue #653: create-as-ancestor, the lineage gate, and the auto-clear ────
+//
+// The prod shape all three pieces were built for, measured 2026-08-30: 79
+// tn/tq/twl rows carried review_kind='merge_no_base' (JER tn 66, AMO tn 8,
+// ECC tq 3, AMO tq 2) and every one was a false alarm. bp-assistant pushed AI
+// notes to master in the evening, the reimport CREATED them in D1 (a full-
+// payload edit_log 'create' whose id sits ABOVE master_confirmed_edit_id,
+// because the evening pushes froze own-publish recognition), and a translator
+// then edited them in the app. The ancestor was one id above the boundary the
+// whole time, and reconstructTsvBases cut hard at `id <= boundaryId`.
+//
+// Driven through the REAL applyTsvRows and the REAL SQL, because every one of
+// these is a storage outcome (a flag written or not written, a snapshot, a
+// version bump) that a pure test cannot observe.
+console.log("\n[#653: a row created ABOVE the boundary folds its create as the ancestor]");
+{
+  // Master's row is EXACTLY what the create imported — nobody touched it since.
+  // Ours differs (the app edit). Attributed against the create: theirs === base,
+  // so master never moved this field and our edit stands. Clean, no flag.
+  const { sqlite, env } = freshEnv();
+  sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (1, 100, 'translator')`).run();
+  sqlite
+    .prepare(
+      `INSERT INTO tq_rows (id, book, chapter, verse, ref_raw, question, response, version, updated_by)
+       VALUES ('ca01', ?, 9, 9, '9:9', 'app question', 'imported response', 2, 1)`,
+    )
+    .run(BOOK);
+  // The create sits ABOVE the boundary (id > editId) — this is the whole bug.
+  const boundary = 1000000;
+  sqlite
+    .prepare(
+      `INSERT INTO edit_log (id, kind, row_key, book, action, payload_json, created_at)
+       VALUES (?, 'tq', 'ca01', ?, 'create', ?, 500)`,
+    )
+    .run(
+      boundary + 5,
+      BOOK,
+      JSON.stringify({ ref_raw: "9:9", chapter: 9, verse: 9, question: "imported question", response: "imported response" }),
+    );
+  const master = () => [{
+    id: "ca01", idCoerced: false, refRaw: "9:9", chapter: 9, verse: 9,
+    occurrence: null, tags: null, quote: null,
+    question: "imported question", response: "imported response",
+  }];
+
+  const counts = await applyTsvRows(env, BOOK, "tq", master(), null, { confirmedAt: 200, editId: boundary });
+  eq(counts.merge_no_base, 0, "the create IS an ancestor — no keep_no_base at all");
+  const row = sqlite.prepare(`SELECT review_kind, version, question FROM tq_rows WHERE id='ca01'`).all()[0];
+  eq(row.review_kind, null, "…so no flag is raised");
+  eq(row.question, "app question", "…the app edit stands (master never moved this field)");
+  eq(row.version, 2, "…and nothing is written, so the version does not move");
+}
+
+console.log("\n[#653: the fallback takes the CURRENT life's create, and is not shadowed by another book's]");
+{
+  // A reclaimed slot: the id was tombstoned and reissued, so edit_log holds two
+  // creates for it, both above the boundary (the only case the fallback runs
+  // in). Master holds the CURRENT life's content. Fold the dead life's create
+  // instead and both sides look moved -> a conflict flag over nothing, and a
+  // real risk of adopting master over the translator on a coincidental match.
+  {
+    const { sqlite, env } = freshEnv();
+    sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (1, 100, 'translator')`).run();
+    sqlite
+      .prepare(
+        `INSERT INTO tq_rows (id, book, chapter, verse, ref_raw, question, response, version, updated_by)
+         VALUES ('rs12', ?, 9, 9, '9:9', 'app question', 'life2 response', 2, 1)`,
+      )
+      .run(BOOK);
+    const boundary = 1000000;
+    const ins = sqlite.prepare(
+      `INSERT INTO edit_log (id, kind, row_key, book, action, payload_json, created_at) VALUES (?, 'tq', 'rs12', ?, 'create', ?, ?)`,
+    );
+    ins.run(boundary + 5, BOOK, JSON.stringify({ question: "life1 question", response: "life1 response" }), 500);
+    ins.run(boundary + 9, BOOK, JSON.stringify({ question: "life2 question", response: "life2 response" }), 600);
+
+    const counts = await applyTsvRows(
+      env, BOOK, "tq",
+      [{
+        id: "rs12", idCoerced: false, refRaw: "9:9", chapter: 9, verse: 9,
+        occurrence: null, tags: null, quote: null, question: "life2 question", response: "life2 response",
+      }],
+      null, { confirmedAt: 200, editId: boundary },
+    );
+    eq(counts.merge_conflicts, 0, "the current life's create is the ancestor — no phantom conflict");
+    const row = sqlite.prepare(`SELECT review_kind, question FROM tq_rows WHERE id='rs12'`).all()[0];
+    eq(row.review_kind, null, "…no flag");
+    eq(row.question, "app question", "…and the translator's edit stands");
+  }
+
+  // A NULL-book create for the same short id belongs to ANOTHER book (prod
+  // holds ~7,689 such rows). Here it is NEWER than this book's own create, so a
+  // query that admits it would pick it — and the folds discard book-NULL
+  // entries, leaving the row with no ancestor and the very flag the fallback
+  // exists to remove.
+  {
+    const { sqlite, env } = freshEnv();
+    sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (1, 100, 'translator')`).run();
+    sqlite
+      .prepare(
+        `INSERT INTO tq_rows (id, book, chapter, verse, ref_raw, question, response, version, updated_by)
+         VALUES ('sh34', ?, 9, 9, '9:9', 'app question', 'imported response', 2, 1)`,
+      )
+      .run(BOOK);
+    const boundary = 1000000;
+    const ins = sqlite.prepare(
+      `INSERT INTO edit_log (id, kind, row_key, book, action, payload_json, created_at) VALUES (?, 'tq', 'sh34', ?, 'create', ?, ?)`,
+    );
+    ins.run(boundary + 5, BOOK, JSON.stringify({ question: "imported question", response: "imported response" }), 500);
+    ins.run(boundary + 9, null, JSON.stringify({ question: "another book's question", response: "x" }), 600);
+
+    const counts = await applyTsvRows(
+      env, BOOK, "tq",
+      [{
+        id: "sh34", idCoerced: false, refRaw: "9:9", chapter: 9, verse: 9,
+        occurrence: null, tags: null, quote: null, question: "imported question", response: "imported response",
+      }],
+      null, { confirmedAt: 200, editId: boundary },
+    );
+    eq(counts.merge_no_base, 0, "this book's own create is found, not shadowed by the foreign one");
+    const row = sqlite.prepare(`SELECT review_kind FROM tq_rows WHERE id='sh34'`).all()[0];
+    eq(row.review_kind, null, "…so no flag is raised");
+  }
+}
+
+console.log("\n[#653: master AI-edited AFTER the import — a real conflict, resolved D1-wins with a snapshot]");
+{
+  // Same setup, but master's question moved too (the evening AI push). Both
+  // sides changed it: a genuine conflict, which the lineage resolves D1-wins
+  // (#540 item 2) because no human commit is behind master's side.
+  const { sqlite, env } = freshEnv();
+  sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (1, 100, 'translator')`).run();
+  sqlite
+    .prepare(
+      `INSERT INTO tq_rows (id, book, chapter, verse, ref_raw, question, response, version, updated_by)
+       VALUES ('ca02', ?, 9, 9, '9:9', 'app question', 'imported response', 2, 1)`,
+    )
+    .run(BOOK);
+  const boundary = 1000000;
+  sqlite
+    .prepare(
+      `INSERT INTO edit_log (id, kind, row_key, book, action, payload_json, created_at)
+       VALUES (?, 'tq', 'ca02', ?, 'create', ?, 500)`,
+    )
+    .run(boundary + 5, BOOK, JSON.stringify({ question: "imported question", response: "imported response" }));
+
+  const counts = await applyTsvRows(
+    env, BOOK, "tq",
+    [{
+      id: "ca02", idCoerced: false, refRaw: "9:9", chapter: 9, verse: 9,
+      occurrence: null, tags: null, quote: null,
+      question: "ai-rewritten question", response: "imported response",
+    }],
+    null,
+    { confirmedAt: 200, editId: boundary, lineage: AI_ONLY_LINEAGE },
+  );
+  eq(counts.merge_kept_ai, 1, "both sides moved the question -> keep_ai_master, D1 wins");
+  eq(counts.merge_no_base, 0, "…and it is NOT reported as unattributable");
+  const row = sqlite.prepare(`SELECT review_kind, question, review_master_json FROM tq_rows WHERE id='ca02'`).all()[0];
+  eq(row.review_kind, "merge_kept", "the row is flagged merge_kept");
+  eq(row.question, "app question", "…the translator's question is kept");
+  eq(
+    parseSnap(row.review_master_json).question,
+    "ai-rewritten question",
+    "…and Door43's own value is recorded with the flag (#653 piece 4)",
+  );
+  eq(parseSnap(row.review_master_json).ref_raw, "9:9", "…ref_raw rides in the snapshot too");
+}
+
+console.log("\n[#653: a create-as-ancestor base may EXONERATE but never CONVICT]");
+{
+  // THE SHAPE THAT MADE THIS A BLOCKER. The watermark is frozen while our own
+  // exports keep landing, so: base = the import (recovered by the fallback),
+  // ours = the translator's NEWEST edit, theirs = OUR OWN export of her OLDER
+  // edit. All three differ, which reads as a both-changed conflict — and with
+  // master allowed to win one (no lineage / an incomplete walk), master-wins
+  // would revert her newest edit to our stale render of her older one. On main
+  // this population is unconditionally keep_no_base, so the floor keeps it no
+  // worse than main.
+  const seedProvisional = (sqlite, id) => {
+    sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (1, 100, 'translator')`).run();
+    sqlite
+      .prepare(
+        `INSERT INTO tq_rows (id, book, chapter, verse, ref_raw, question, response, version, updated_by)
+         VALUES (?, ?, 9, 9, '9:9', 'her newest edit', 'imported response', 3, 1)`,
+      )
+      .run(id, BOOK);
+    const boundary = 1000000;
+    sqlite
+      .prepare(
+        `INSERT INTO edit_log (id, kind, row_key, book, action, payload_json, created_at)
+         VALUES (?, 'tq', ?, ?, 'create', ?, 500)`,
+      )
+      .run(boundary + 5, id, BOOK, JSON.stringify({ question: "imported question", response: "imported response" }));
+    return boundary;
+  };
+  const masterStale = (id) => [{
+    id, idCoerced: false, refRaw: "9:9", chapter: 9, verse: 9,
+    occurrence: null, tags: null, quote: null,
+    question: "our stale export of her older edit", response: "imported response",
+  }];
+
+  // 1. No lineage — master is allowed to win a conflict. It must NOT.
+  {
+    const { sqlite, env } = freshEnv();
+    const boundary = seedProvisional(sqlite, "pv01");
+    const counts = await applyTsvRows(env, BOOK, "tq", masterStale("pv01"), null, {
+      confirmedAt: 200, editId: boundary,
+    });
+    const row = sqlite.prepare(`SELECT question, version, review_kind FROM tq_rows WHERE id='pv01'`).all()[0];
+    eq(row.question, "her newest edit", "the translator's newest edit is NOT reverted to our stale render");
+    eq(counts.merge_conflicts, 0, "…the row is not adopted at all");
+    eq(counts.merge_no_base, 1, "…it degrades to keep_no_base, exactly what main does for this population");
+    eq(row.review_kind, "merge_no_base", "…and it says so on the row");
+  }
+
+  // 2. Same row, but the lineage EXPLICITLY rules out a human behind master.
+  //    keep_ai_master is a D1-wins outcome, so it survives the floor — the
+  //    translator keeps her text and gets the merge_kept chip.
+  {
+    const { sqlite, env } = freshEnv();
+    const boundary = seedProvisional(sqlite, "pv02");
+    const counts = await applyTsvRows(env, BOOK, "tq", masterStale("pv02"), null, {
+      confirmedAt: 200, editId: boundary, lineage: AI_ONLY_LINEAGE,
+    });
+    eq(counts.merge_kept_ai, 1, "a D1-wins conflict still fires under a clean lineage");
+    const row = sqlite.prepare(`SELECT question, review_kind FROM tq_rows WHERE id='pv02'`).all()[0];
+    eq(row.question, "her newest edit", "…her text is kept");
+    eq(row.review_kind, "merge_kept", "…with the chip that says so");
+  }
+
+  // 3. Master moved a field the translator never touched. Adopting would be
+  //    master-wins on a provisional base, and our own render is NOT round-trip
+  //    stable (STATE.md), so this is withheld rather than adopted on what may
+  //    be a phantom difference.
+  {
+    const { sqlite, env } = freshEnv();
+    const boundary = seedProvisional(sqlite, "pv03");
+    const counts = await applyTsvRows(
+      env, BOOK, "tq",
+      [{
+        id: "pv03", idCoerced: false, refRaw: "9:9", chapter: 9, verse: 9,
+        occurrence: null, tags: null, quote: null,
+        question: "imported question", response: "master moved this alone",
+      }],
+      null, { confirmedAt: 200, editId: boundary },
+    );
+    eq(counts.merge_adopted, 0, "no adopt on a provisional base");
+    eq(counts.merge_no_base, 1, "…it reports as unattributable instead");
+    const row = sqlite.prepare(`SELECT response FROM tq_rows WHERE id='pv03'`).all()[0];
+    eq(row.response, "imported response", "…and D1 keeps its value");
+  }
+
+  // 4. THE HEADLINE WIN is untouched: master still holds exactly what the row
+  //    was created with, so the difference is ours and our edit stands clean.
+  {
+    const { sqlite, env } = freshEnv();
+    const boundary = seedProvisional(sqlite, "pv04");
+    const counts = await applyTsvRows(
+      env, BOOK, "tq",
+      [{
+        id: "pv04", idCoerced: false, refRaw: "9:9", chapter: 9, verse: 9,
+        occurrence: null, tags: null, quote: null,
+        question: "imported question", response: "imported response",
+      }],
+      null, { confirmedAt: 200, editId: boundary },
+    );
+    eq(counts.merge_no_base, 0, "exoneration still works — this is the whole point of the fallback");
+    const row = sqlite.prepare(`SELECT review_kind, version FROM tq_rows WHERE id='pv04'`).all()[0];
+    eq(row.review_kind, null, "…no flag");
+    eq(row.version, 3, "…and no write");
+  }
+
+  // 5. The REFERENCE decision never sees a provisional ancestor. Set up as the
+  //    exact shape that WOULD read `ours_moved` from one: the create carries
+  //    the reference, D1 has since moved the row, and master still sits where
+  //    the create put it. `ours_moved` is the single outcome in this file that
+  //    publishes D1's location over master's — its own comment calls it the
+  //    only place a mis-attribution costs data — so an ancestor recovered from
+  //    the boundary that just failed must not unlock it. With no reference
+  //    ancestor the move stays unattributable and HOLDS.
+  {
+    const { sqlite, env } = freshEnv();
+    sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (1, 100, 'translator')`).run();
+    sqlite
+      .prepare(
+        `INSERT INTO tq_rows (id, book, chapter, verse, ref_raw, question, response, version, updated_by)
+         VALUES ('pv05', ?, 9, 6, '9:6', 'imported question', 'her edit', 3, 1)`,
+      )
+      .run(BOOK);
+    const boundary = 1000000;
+    sqlite
+      .prepare(
+        `INSERT INTO edit_log (id, kind, row_key, book, action, payload_json, created_at)
+         VALUES (?, 'tq', 'pv05', ?, 'create', ?, 500)`,
+      )
+      .run(
+        boundary + 5,
+        BOOK,
+        JSON.stringify({ chapter: 9, verse: 9, ref_raw: "9:9", question: "imported question", response: "imported response" }),
+      );
+    const counts = await applyTsvRows(
+      env, BOOK, "tq",
+      [{
+        id: "pv05", idCoerced: false, refRaw: "9:9", chapter: 9, verse: 9,
+        occurrence: null, tags: null, quote: null,
+        question: "imported question", response: "imported response",
+      }],
+      null, { confirmedAt: 200, editId: boundary },
+    );
+    eq(counts.ref_moved_ours, 0, "a provisional base never attributes the move to us…");
+    eq(counts.ref_moved_unattributable, 1, "…it stays unattributable");
+    eq(counts.apply_incomplete, true, "…and holds the resource watermark, the fail-safe direction");
+    const row = sqlite.prepare(`SELECT review_kind FROM tq_rows WHERE id='pv05'`).all()[0];
+    eq(row.review_kind, "ref_moved", "…and flags the row rather than silently publishing the move");
+  }
+}
+
+console.log("\n[#653: boundary equality on the warm-up (timestamp) path]");
+{
+  // With migration 0050 still warming up, `editId` is null and the bounded cut
+  // is `created_at < confirmedAt` — so a create AT the confirmedAt second is
+  // OUTSIDE the bounded set. The lifecycle test has to make the identical cut,
+  // or the row falls between the two and has no ancestor at all. One second,
+  // and it decides whether the row is adjudicable.
+  const { sqlite, env } = freshEnv();
+  sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (1, 100, 'translator')`).run();
+  sqlite
+    .prepare(
+      `INSERT INTO tq_rows (id, book, chapter, verse, ref_raw, question, response, version, updated_by)
+       VALUES ('eq01', ?, 9, 9, '9:9', 'her edit', 'imported response', 2, 1)`,
+    )
+    .run(BOOK);
+  sqlite
+    .prepare(
+      `INSERT INTO edit_log (kind, row_key, book, action, payload_json, created_at)
+       VALUES ('tq', 'eq01', ?, 'create', ?, 200)`,
+    )
+    .run(BOOK, JSON.stringify({ question: "imported question", response: "imported response" }));
+
+  const counts = await applyTsvRows(
+    env, BOOK, "tq",
+    [{
+      id: "eq01", idCoerced: false, refRaw: "9:9", chapter: 9, verse: 9,
+      occurrence: null, tags: null, quote: null,
+      question: "imported question", response: "imported response",
+    }],
+    null, { confirmedAt: 200, editId: null },
+  );
+  eq(counts.merge_no_base, 0, "a create at the cutoff second is recovered, not lost between the two cuts");
+  const row = sqlite.prepare(`SELECT review_kind, question FROM tq_rows WHERE id='eq01'`).all()[0];
+  eq(row.review_kind, null, "…so the row is adjudicable and needs no flag");
+  eq(row.question, "her edit", "…and her edit stands");
+}
+
+console.log("\n[#653: a RECLAIMED id's old lifecycle never becomes a trusted ancestor]");
+{
+  // The Codex finding, and a hole `main` already had. (book, id) is reusable —
+  // the tombstone machinery reclaims one and logs a SECOND 'create' — so an OLD
+  // life's create/update can sit BELOW the boundary while the current life's
+  // reclaim-create sits ABOVE it. Keyed on "the bounded set is empty" the row
+  // stays on the bounded fold, which folds the DEAD row's payload into a
+  // fully-trusted ancestor: obsolete base, translator's value and master all
+  // differ, that reads as a both-changed conflict, and master-wins then writes
+  // over the translator. The discriminator is lifecycle, not emptiness.
+  const boundary = 1000000;
+  const seedReclaimed = (sqlite, id, ourQuestion) => {
+    sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (1, 100, 'translator')`).run();
+    sqlite
+      .prepare(
+        `INSERT INTO tq_rows (id, book, chapter, verse, ref_raw, question, response, version, updated_by)
+         VALUES (?, ?, 9, 9, '9:9', ?, 'life2 response', 3, 1)`,
+      )
+      .run(id, BOOK, ourQuestion);
+    const ins = sqlite.prepare(
+      `INSERT INTO edit_log (id, kind, row_key, book, action, payload_json, created_at) VALUES (?, 'tq', ?, ?, ?, ?, ?)`,
+    );
+    // The DEAD life, entirely below the boundary.
+    ins.run(boundary - 900, id, BOOK, "create", JSON.stringify({ question: "life1 question", response: "life1 response" }), 100);
+    ins.run(boundary - 800, id, BOOK, "update", JSON.stringify({ question: "life1 edited" }), 200);
+    // The reclaim: the current life's entry into D1, ABOVE the boundary.
+    ins.run(boundary + 40, id, BOOK, "create", JSON.stringify({ question: "life2 question", response: "life2 response" }), 900);
+  };
+
+  // 1. All three differ, and master is allowed to win a conflict (no lineage).
+  //    The dead life must not authorize an overwrite.
+  {
+    const { sqlite, env } = freshEnv();
+    seedReclaimed(sqlite, "rc01", "her edit on the new life");
+    const counts = await applyTsvRows(
+      env, BOOK, "tq",
+      [{
+        id: "rc01", idCoerced: false, refRaw: "9:9", chapter: 9, verse: 9,
+        occurrence: null, tags: null, quote: null,
+        question: "master's own different text", response: "life2 response",
+      }],
+      null, { confirmedAt: 200, editId: boundary },
+    );
+    const row = sqlite.prepare(`SELECT question, response, review_kind FROM tq_rows WHERE id='rc01'`).all()[0];
+    eq(row.question, "her edit on the new life", "the dead life's payload does NOT authorize master-wins");
+    eq(counts.merge_conflicts, 0, "…nothing is adopted");
+    eq(counts.merge_no_base, 1, "…the row degrades to keep_no_base, the exonerate-only floor");
+    eq(row.response, "life2 response", "…no content field is rewritten");
+    // The only write is the flag itself (no lineage was walked, so the mint
+    // stands), which is what the version bump here is.
+    eq(row.review_kind, "merge_no_base", "…and the row is flagged rather than silently kept");
+  }
+
+  // 2. Master still holds exactly what the CURRENT life was created with, so
+  //    the difference is ours and the edit stands clean — the fallback's
+  //    headline win, reached through the same lifecycle discriminator.
+  {
+    const { sqlite, env } = freshEnv();
+    seedReclaimed(sqlite, "rc02", "her edit on the new life");
+    const counts = await applyTsvRows(
+      env, BOOK, "tq",
+      [{
+        id: "rc02", idCoerced: false, refRaw: "9:9", chapter: 9, verse: 9,
+        occurrence: null, tags: null, quote: null,
+        question: "life2 question", response: "life2 response",
+      }],
+      null, { confirmedAt: 200, editId: boundary },
+    );
+    eq(counts.merge_no_base, 0, "attributed against the CURRENT life's create — a clean keep");
+    const row = sqlite.prepare(`SELECT review_kind, question FROM tq_rows WHERE id='rc02'`).all()[0];
+    eq(row.review_kind, null, "…no flag");
+    eq(row.question, "her edit on the new life", "…and her edit stands");
+  }
+}
+
+console.log("\n[#653: with NO ancestor at all, the mint is gated on the measured lineage]");
+{
+  const seed = (sqlite) => {
+    sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (1, 100, 'translator')`).run();
+    sqlite
+      .prepare(
+        `INSERT INTO tq_rows (id, book, chapter, verse, ref_raw, question, response, version, updated_by)
+         VALUES ('nb99', ?, 9, 9, '9:9', 'app question', 'r', 1, 1)`,
+      )
+      .run(BOOK);
+  };
+  // No edit_log row of ANY action for this id, so neither the bounded fold nor
+  // the create fallback finds anything: base === null, genuinely.
+  const master = () => [{
+    id: "nb99", idCoerced: false, refRaw: "9:9", chapter: 9, verse: 9,
+    occurrence: null, tags: null, quote: null, question: "master question", response: "r",
+  }];
+
+  // 1. Complete walk, no human commit -> the flag's own claim is disproved.
+  {
+    const { sqlite, env } = freshEnv();
+    seed(sqlite);
+    const counts = await applyTsvRows(env, BOOK, "tq", master(), null, {
+      confirmedAt: 200, editId: null, lineage: AI_ONLY_LINEAGE,
+    });
+    eq(counts.merge_no_base, 1, "the merge outcome is unchanged — still keep_no_base");
+    eq(counts.merge_no_base_mint_skipped, 1, "…but the flag is withheld, and the skip is counted");
+    const row = sqlite.prepare(`SELECT review_kind, version FROM tq_rows WHERE id='nb99'`).all()[0];
+    eq(row.review_kind, null, "…no flag on the row");
+    eq(row.version, 1, "…and no version bump for a flag nobody needed");
+  }
+
+  // 2. Complete walk that FOUND a human commit -> mint, human-variant message.
+  {
+    const { sqlite, env } = freshEnv();
+    seed(sqlite);
+    const counts = await applyTsvRows(env, BOOK, "tq", master(), null, {
+      confirmedAt: 200, editId: null, lineage: HUMAN_LINEAGE,
+    });
+    eq(counts.merge_no_base_mint_skipped, 0, "a human commit in the window is not a skip");
+    const row = sqlite.prepare(`SELECT review_kind, review_reason, review_master_json FROM tq_rows WHERE id='nb99'`).all()[0];
+    eq(row.review_kind, "merge_no_base", "the flag is raised");
+    eq(
+      row.review_reason.includes("a Door43 editor changed this file"),
+      true,
+      "…and states the measured cause: a human commit was found",
+    );
+    eq(
+      row.review_reason.includes("could not be read in full"),
+      false,
+      "…never the incomplete-history cause, which was not what happened",
+    );
+    eq(parseSnap(row.review_master_json).question, "master question", "…with Door43's value recorded for comparison");
+    eq(
+      parseSnap(row.review_master_json)._meta?.flag_since,
+      200,
+      "…and the watermark this flag's claim is bounded by, which is what the auto-clear must cover",
+    );
+    // #664 emits everything OUTSIDE _meta as the lint feed's "Door43's row
+    // value", so bookkeeping at the top level would render as a Door43 column.
+    eq(
+      Object.keys(parseSnap(row.review_master_json)).filter((k) => k.startsWith("flag_")),
+      [],
+      "…kept under _meta, never beside the Door43 fields",
+    );
+    // Exactly the fields the feed reads for tq (#664's TQ_REVIEW_FIELDS) —
+    // no more (tq does not display quote/occurrence) and no less.
+    eq(
+      Object.keys(parseSnap(row.review_master_json)).filter((k) => k !== "_meta").sort(),
+      ["question", "ref_raw", "response", "tags"],
+      "…and the snapshot carries exactly the fields the review feed reads for tq",
+    );
+  }
+
+  // 3. INCOMPLETE walk -> mint, and the message says so instead of naming an editor.
+  {
+    const { sqlite, env } = freshEnv();
+    seed(sqlite);
+    await applyTsvRows(env, BOOK, "tq", master(), null, {
+      confirmedAt: 200, editId: null, lineage: INCOMPLETE_LINEAGE,
+    });
+    const row = sqlite.prepare(`SELECT review_kind, review_reason FROM tq_rows WHERE id='nb99'`).all()[0];
+    eq(row.review_kind, "merge_no_base", "an incomplete walk still mints — absent is not 'no human'");
+    eq(row.review_reason.includes("could not be read in full"), true, "…and says the history could not be read");
+    eq(row.review_reason.includes("a Door43 editor changed this file"), false, "…and claims no editor it never saw");
+  }
+
+  // 3b. A human commit the per-ref narrowing places in OTHER verses still
+  //     mints. Withholding a warning is the same user-visible act as clearing
+  //     one, and the clear refuses to run on narrowed evidence — so the mint
+  //     gate reads the same file-level tier, and the two can never disagree
+  //     about one row.
+  {
+    const { sqlite, env } = freshEnv();
+    seed(sqlite);
+    const counts = await applyTsvRows(env, BOOK, "tq", master(), null, {
+      confirmedAt: 200,
+      editId: null,
+      lineage: { ...HUMAN_LINEAGE, refsComplete: true, humanRefs: ["1:1"], refsReason: "" },
+    });
+    eq(counts.merge_no_base_mint_skipped, 0, "narrowed evidence does not withhold the flag…");
+    const row = sqlite.prepare(`SELECT review_kind FROM tq_rows WHERE id='nb99'`).all()[0];
+    eq(row.review_kind, "merge_no_base", "…the row is still flagged on the file-level answer");
+  }
+
+  // 3c. A row ALREADY carrying the flag skipped nothing, so it must not be
+  //     counted as a withholding every night for the rest of its life.
+  {
+    const { sqlite, env } = freshEnv();
+    seed(sqlite);
+    sqlite.prepare(`UPDATE tq_rows SET review_kind='merge_no_base', review_reason='from an earlier run' WHERE id='nb99'`).run();
+    const counts = await applyTsvRows(env, BOOK, "tq", master(), null, {
+      confirmedAt: 200, editId: null, lineage: AI_ONLY_LINEAGE,
+    });
+    eq(counts.merge_no_base_mint_skipped, 0, "nothing was skipped — the flag was already there");
+    eq(counts.merge_no_base, 1, "…and the outcome is still counted");
+  }
+
+  // 4. NO lineage at all (nobody looked) -> mint, exactly as before #653.
+  {
+    const { sqlite, env } = freshEnv();
+    seed(sqlite);
+    const counts = await applyTsvRows(env, BOOK, "tq", master(), null, { confirmedAt: 200, editId: null });
+    eq(counts.merge_no_base_mint_skipped, 0, "a run that never looked skips nothing");
+    const row = sqlite.prepare(`SELECT review_kind FROM tq_rows WHERE id='nb99'`).all()[0];
+    eq(row.review_kind, "merge_no_base", "…and mints, which is today's behavior");
+  }
+
+  // 5. A content PATCH clears the snapshot along with the flag (#653 piece 4).
+  {
+    const { sqlite, env } = freshEnv();
+    seed(sqlite);
+    await applyTsvRows(env, BOOK, "tq", master(), null, { confirmedAt: 200, editId: null, lineage: HUMAN_LINEAGE });
+    const before = sqlite.prepare(`SELECT review_master_json FROM tq_rows WHERE id='nb99'`).all()[0];
+    eq(before.review_master_json !== null, true, "a snapshot is stored at the mint");
+    // The REAL fragment rows.ts builds every versioned content PATCH from.
+    sqlite
+      .prepare(
+        `UPDATE tq_rows SET question = ?1, ${contentPatchClearClauses("tq").join(", ")}, version = version + 1
+          WHERE id = 'nb99' AND book = ?2`,
+      )
+      .run("the translator's next edit", BOOK);
+    const after = sqlite.prepare(`SELECT review_kind, review_master_json FROM tq_rows WHERE id='nb99'`).all()[0];
+    eq(after.review_kind, null, "the content edit clears the flag");
+    eq(after.review_master_json, null, "…and the snapshot with it — a snapshot behind a NULL flag is invisible");
+  }
+}
+
+console.log("\n[#653 x #664: a flag minted HERE emits real Door43 fields, and no bookkeeping, THERE]");
+{
+  // The seam between this PR and #664, exercised end to end rather than
+  // asserted from either side: the nightly mints the snapshot (this branch
+  // writes `_meta` bookkeeping inside the same column), the row is stored, and
+  // the lint feed (#664, now on main) emits it as the UI's "Door43's row
+  // value". If either side changed its mind about `_meta` the reader would see
+  // `flag_since` rendered as a Door43 column that does not exist.
+  const { sqlite, env } = freshEnv();
+  sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (1, 100, 'translator')`).run();
+  sqlite
+    .prepare(
+      `INSERT INTO tq_rows (id, book, chapter, verse, ref_raw, question, response, tags, version, updated_by)
+       VALUES ('sx01', ?, 9, 9, '9:9', 'app question', 'r', NULL, 1, 1)`,
+    )
+    .run(BOOK);
+  // No edit_log at all -> genuinely no ancestor -> keep_no_base -> a real mint
+  // through the production path, snapshot and all.
+  await applyTsvRows(
+    env, BOOK, "tq",
+    [{
+      id: "sx01", idCoerced: false, refRaw: "9:9", chapter: 9, verse: 9,
+      occurrence: null, tags: null, quote: null, question: "master question", response: "r",
+    }],
+    null, { confirmedAt: 200, editId: null, lineage: HUMAN_LINEAGE },
+  );
+
+  const stored = sqlite.prepare(`SELECT * FROM tq_rows WHERE id = 'sx01'`).all()[0];
+  eq(stored.review_kind, "merge_no_base", "the nightly minted the flag");
+  eq(
+    typeof parseSnap(stored.review_master_json)._meta?.flag_since,
+    "number",
+    "…and the stored column DOES carry this branch's bookkeeping",
+  );
+
+  // Now through the REAL lint feed, the same call the API route makes.
+  const issue = lintTqRows([stored]).find((x) => x.rowId === "sx01");
+  eq(issue != null, true, "the lint feed surfaces the flag");
+  eq(
+    Object.keys(issue.door43).sort(),
+    ["question", "ref_raw", "response", "tags"],
+    "…and emits exactly the tq review fields as Door43's value",
+  );
+  eq("_meta" in issue.door43, false, "…with the bookkeeping stripped, never rendered as a Door43 field");
+  eq(issue.door43.question, "master question", "…carrying master's real value");
+  eq(issue.ours.question, "app question", "…against ours, for the side-by-side");
+  eq(issue.dismissible, true, "…and it can be dismissed from the popup");
+}
+
+console.log("\n[#653: the auto-clear retires flags the commit history now disproves]");
+{
+  // Relative to NOW, not an absolute stamp: the clear refuses to walk a window
+  // older than NO_BASE_CLEAR_MAX_WINDOW_SECONDS (30 days), so a hard-coded
+  // timestamp would quietly start exercising the stale branch as the calendar
+  // moved past it and every case below would pass for the wrong reason.
+  const NOW = Math.floor(Date.now() / 1000);
+  const MINT_AT = NOW - 3 * 86400;
+  const FILE = { repo: "en_tq", path: "tq_1CH.tsv" };
+  // FLAG_SINCE is the watermark the flag's claim is bounded by — written into
+  // the snapshot at the mint, and the ONLY honest window start (see
+  // masterReviewSnapshot). `updated_at` is deliberately seeded LATER than the
+  // mint here, the way a reorder drag or a preserve toggle leaves it: those
+  // paths move updated_at and leave review_kind standing, so anything keying
+  // the window on updated_at would walk a range that starts after the human
+  // commit it has to see.
+  const FLAG_SINCE = MINT_AT - 7 * 86400;
+  // Bookkeeping lives under `_meta` — #664 emits the rest of this object
+  // verbatim as the lint feed's "Door43's row value", so a top-level flag_since
+  // would render as a Door43 column that does not exist.
+  const seedFlagged = (sqlite, n = 2, { snapshot } = {}) => {
+    sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (1, 100, 'translator')`).run();
+    const snap =
+      snapshot === undefined
+        ? JSON.stringify({ question: "master q", _meta: { flag_at: MINT_AT, flag_since: FLAG_SINCE } })
+        : snapshot;
+    for (let i = 0; i < n; i++) {
+      sqlite
+        .prepare(
+          `INSERT INTO tq_rows (id, book, chapter, verse, ref_raw, question, response, version, updated_by,
+                                updated_at, review_kind, review_reason, review_master_json)
+           VALUES (?, ?, 3, ?, ?, 'app question', 'r', 4, 1, ?, 'merge_no_base', 'some earlier reason', ?)`,
+        )
+        .run(`cl0${i}`, BOOK, i + 1, `3:${i + 1}`, MINT_AT + 5 * 86400, snap);
+    }
+  };
+
+  // 1. Complete walk, human-free, reaching back past the flag's own window
+  //    (walkStart <= flag_since) -> cleared, on the run's own walk, no refetch.
+  {
+    const { sqlite, env } = freshEnv();
+    seedFlagged(sqlite);
+    const cleared = await clearResolvedMergeNoBaseForTest(env, BOOK, "tq", FLAG_SINCE - 10, OURS_AND_AI_PAGE, FILE);
+    eq(cleared, 2, "both flags are retired");
+    const rows = sqlite.prepare(`SELECT review_kind, review_reason, review_master_json, version FROM tq_rows`).all();
+    eq(rows.map((r) => r.review_kind), [null, null], "review_kind cleared");
+    eq(rows.map((r) => r.review_reason), [null, null], "…reason too");
+    eq(rows.map((r) => r.review_master_json), [null, null], "…and the snapshot, which described the retired flag");
+    eq(rows.map((r) => r.version), [4, 4], "…with NO version bump, so an open editor's If-Match still holds");
+
+    // Every incident in this repo is reconstructed from edit_log. A warning
+    // that disappears with only a console line behind it cannot be audited six
+    // weeks later, so each clear writes its own row WITH its evidence.
+    const logs = sqlite.prepare(`SELECT * FROM edit_log WHERE action = 'sync_clear_review' ORDER BY row_key`).all();
+    eq(logs.length, 2, "one audit row per cleared flag");
+    eq(logs[0].kind, "tq", "…on the row's own kind");
+    eq(logs[0].book, BOOK, "…and book");
+    const payload = JSON.parse(logs[0].payload_json);
+    eq(payload.review_kind, "merge_no_base", "…naming the flag that was cleared");
+    eq(payload.evidence.human, 0, "…and the measurement that justified it: zero human commits");
+    eq(payload.evidence.window_start, FLAG_SINCE, "…over the window the flag itself was raised about");
+    eq(typeof payload.review_master_json, "string", "…keeping the snapshot that is being dropped");
+  }
+
+  // 1b. The audit row is PAIRED with its clear (gatedLogEditStmt): a row whose
+  //     UPDATE 0-changes must not leave an audit row claiming a clear that
+  //     never happened. Simulated by a flag that changes to a stronger one
+  //     between the SELECT and the batch — here, seeded that way from the
+  //     start, so the id is in the list but the UPDATE cannot match.
+  {
+    const { sqlite, env } = freshEnv();
+    seedFlagged(sqlite, 2);
+    const realBatch = env.DB.batch.bind(env.DB);
+    let flipped = false;
+    env.DB.batch = async (stmts) => {
+      if (!flipped) {
+        flipped = true;
+        sqlite.prepare(`UPDATE tq_rows SET review_kind='merge_conflict' WHERE id='cl00'`).run();
+      }
+      return realBatch(stmts);
+    };
+    const cleared = await clearResolvedMergeNoBaseForTest(env, BOOK, "tq", FLAG_SINCE - 10, OURS_AND_AI_PAGE, FILE);
+    eq(cleared, 1, "only the row that actually cleared is counted");
+    const logs = sqlite.prepare(`SELECT row_key FROM edit_log WHERE action = 'sync_clear_review'`).all();
+    eq(logs.map((l) => l.row_key), ["cl01"], "…and only it gets an audit row — no phantom audit for the lost race");
+  }
+
+  // 2. A human commit in the same window -> nothing is cleared. This is the
+  //    guard that keeps the auto-clear from erasing a real warning.
+  {
+    const { sqlite, env } = freshEnv();
+    seedFlagged(sqlite);
+    const cleared = await clearResolvedMergeNoBaseForTest(env, BOOK, "tq", FLAG_SINCE - 10, HUMAN_PAGE, FILE);
+    eq(cleared, 0, "a human commit in the window blocks the clear");
+    const rows = sqlite.prepare(`SELECT review_kind FROM tq_rows`).all();
+    eq(rows.map((r) => r.review_kind), ["merge_no_base", "merge_no_base"], "…the flags stand");
+  }
+
+  // 3. An INCOMPLETE walk -> nothing is cleared, whatever it did or did not see.
+  {
+    const { sqlite, env } = freshEnv();
+    seedFlagged(sqlite);
+    const cleared = await clearResolvedMergeNoBaseForTest(
+      env, BOOK, "tq", FLAG_SINCE - 10,
+      { commits: OURS_AND_AI_PAGE.commits, incomplete: true, incompleteReason: "page_cap" },
+      FILE,
+    );
+    eq(cleared, 0, "'we could not read the history' is not 'no human touched it'");
+  }
+
+  // 4. The run's own walk starts AFTER the window the flag was raised over, so
+  //    it cannot see a human commit sitting between the two. The clear must
+  //    extend the walk rather than clear on evidence it does not have — and
+  //    when that extended walk cannot be completed, nothing is cleared.
+  {
+    const { sqlite, env } = freshEnv();
+    seedFlagged(sqlite);
+    const realFetch = globalThis.fetch;
+    let extended = 0;
+    globalThis.fetch = async () => {
+      extended++;
+      throw new Error("network down");
+    };
+    try {
+      const cleared = await clearResolvedMergeNoBaseForTest(env, BOOK, "tq", FLAG_SINCE + 5000, OURS_AND_AI_PAGE, FILE);
+      eq(extended > 0, true, "an uncovered window forces a fresh walk instead of reusing the run's");
+      eq(cleared, 0, "…and a walk that could not complete clears nothing");
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+    const rows = sqlite.prepare(`SELECT review_kind FROM tq_rows`).all();
+    eq(rows.map((r) => r.review_kind), ["merge_no_base", "merge_no_base"], "…the flags stand");
+  }
+
+  // 4b. THE REASON the window comes from the flag and not from the row: a
+  //     reorder drag (rows.ts's non-versioning fast path) moves updated_at and
+  //     leaves review_kind standing, so a June flag can carry an August
+  //     timestamp. Here the run's walk covers everything since well after
+  //     flag_since but well before updated_at — a window derived from
+  //     updated_at would call that covered and clear on evidence that never
+  //     included the flag's own range.
+  {
+    const { sqlite, env } = freshEnv();
+    seedFlagged(sqlite);
+    const realFetch = globalThis.fetch;
+    let extended = 0;
+    globalThis.fetch = async () => { extended++; throw new Error("network down"); };
+    try {
+      const cleared = await clearResolvedMergeNoBaseForTest(env, BOOK, "tq", MINT_AT + 86400, OURS_AND_AI_PAGE, FILE);
+      eq(extended > 0, true, "a walk starting after flag_since is extended, however recent the row's updated_at");
+      eq(cleared, 0, "…and nothing is cleared on the un-extended evidence");
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  }
+
+  // 4c. A flag carrying NO recorded window — every flag minted before #653,
+  //     including the 79 standing in prod — is NOT cleared. Its range is
+  //     unknown, and an absent measurement may not be laundered into a clean
+  //     one. Those clear by hand instead.
+  {
+    const { sqlite, env } = freshEnv();
+    seedFlagged(sqlite, 2, { snapshot: JSON.stringify({ question: "master q" }) });
+    const realFetch = globalThis.fetch;
+    let called = 0;
+    globalThis.fetch = async () => { called++; throw new Error("should not be called"); };
+    try {
+      const cleared = await clearResolvedMergeNoBaseForTest(env, BOOK, "tq", FLAG_SINCE - 10, OURS_AND_AI_PAGE, FILE);
+      eq(cleared, 0, "a flag with no recorded window is left alone");
+      eq(called, 0, "…and no walk is spent on it");
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+    const rows = sqlite.prepare(`SELECT review_kind FROM tq_rows`).all();
+    eq(rows.map((r) => r.review_kind), ["merge_no_base", "merge_no_base"], "…the flags stand");
+  }
+
+  // 4c2. A window-less flag must not RIDE ALONG on a neighbour's window. With
+  //      one clearable flag in the same book, the walk happens anyway — and a
+  //      legacy flag swept up by it would be cleared on evidence covering a
+  //      range that has nothing to do with it.
+  {
+    const { sqlite, env } = freshEnv();
+    seedFlagged(sqlite, 1); // cl00: carries _meta.flag_since
+    sqlite
+      .prepare(
+        `INSERT INTO tq_rows (id, book, chapter, verse, ref_raw, question, response, version, updated_by,
+                              updated_at, review_kind, review_reason, review_master_json)
+         VALUES ('lg01', ?, 3, 9, '3:9', 'app question', 'r', 4, 1, ?, 'merge_no_base', 'raised before #653', '{"question":"master q"}')`,
+      )
+      .run(BOOK, MINT_AT);
+    const cleared = await clearResolvedMergeNoBaseForTest(env, BOOK, "tq", FLAG_SINCE - 10, OURS_AND_AI_PAGE, FILE);
+    eq(cleared, 1, "only the flag that carries its own window is retired");
+    const rows = sqlite.prepare(`SELECT id, review_kind FROM tq_rows ORDER BY id`).all();
+    eq(rows.map((r) => r.review_kind), [null, "merge_no_base"], "…the legacy flag stands, it did not ride along");
+  }
+
+  // 4d. A snapshot whose flag_since is not a usable number is the same absence
+  //     — never a Number()-coerced 0, which would read as "walk from the epoch",
+  //     the most permissive window there is.
+  {
+    const { sqlite, env } = freshEnv();
+    seedFlagged(sqlite, 1, { snapshot: JSON.stringify({ _meta: { flag_since: null } }) });
+    const cleared = await clearResolvedMergeNoBaseForTest(env, BOOK, "tq", FLAG_SINCE - 10, OURS_AND_AI_PAGE, FILE);
+    eq(cleared, 0, "an explicit null window is absent, not epoch 0");
+  }
+
+  // 4e. A window older than the 30-day bound is not walked at all. flag_since
+  //     is frozen while master_confirmed_at advances, so an unclearable flag's
+  //     window widens by a day every day — and a widening walk eventually
+  //     outgrows the page budget, goes permanently `page_cap`, and pays five
+  //     Gitea fetches a night forever for an answer it can never reach.
+  {
+    const { sqlite, env } = freshEnv();
+    seedFlagged(sqlite, 2, {
+      snapshot: JSON.stringify({ question: "master q", _meta: { flag_since: NOW - 45 * 86400 } }),
+    });
+    const realFetch = globalThis.fetch;
+    let called = 0;
+    globalThis.fetch = async () => { called++; throw new Error("should not be called"); };
+    try {
+      const cleared = await clearResolvedMergeNoBaseForTest(env, BOOK, "tq", NOW, OURS_AND_AI_PAGE, FILE);
+      eq(cleared, 0, "a window past the bound clears nothing");
+      eq(called, 0, "…and costs no Gitea fetch — it is left to the dismiss path");
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  }
+
+  // 4f. A BLOCKED attempt is memoized against master's tip sha, so the same
+  //     unanswerable question is not re-bought every night for an unchanged
+  //     file. This is the other half of "self-extinguishing".
+  {
+    const { sqlite, env } = freshEnv();
+    seedFlagged(sqlite, 2);
+    const first = await clearResolvedMergeNoBaseForTest(env, BOOK, "tq", FLAG_SINCE - 10, HUMAN_PAGE, FILE, "tip1");
+    eq(first, 0, "the human commit blocks the clear");
+    const memo = sqlite.prepare(`SELECT review_master_json FROM tq_rows ORDER BY id`).all();
+    eq(
+      memo.map((r) => parseSnap(r.review_master_json)._meta?.clear_blocked_sha),
+      ["tip1", "tip1"],
+      "…and the blocked attempt is recorded against the sha it was measured at",
+    );
+    eq(
+      memo.map((r) => parseSnap(r.review_master_json).question),
+      ["master q", "master q"],
+      "…without disturbing the Door43 values the snapshot exists to hold",
+    );
+
+    // Same master tip on the next run: nothing walkable, so not one fetch.
+    const realFetch = globalThis.fetch;
+    let called = 0;
+    globalThis.fetch = async () => { called++; throw new Error("should not be called"); };
+    try {
+      const second = await clearResolvedMergeNoBaseForTest(env, BOOK, "tq", NOW, HUMAN_PAGE, FILE, "tip1");
+      eq(second, 0, "still nothing cleared");
+      eq(called, 0, "…and the memo means the re-walk is never paid for again");
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+
+    // Master moves: the memo no longer applies and the question is asked again.
+    const third = await clearResolvedMergeNoBaseForTest(env, BOOK, "tq", FLAG_SINCE - 10, OURS_AND_AI_PAGE, FILE, "tip2");
+    eq(third, 2, "a new master tip re-opens the question, and the clean walk clears both");
+  }
+
+  // 5. Nothing flagged -> no walk, no write, no cost. This is what makes the
+  //    feature self-extinguishing rather than a nightly Gitea walk forever.
+  {
+    const { sqlite, env } = freshEnv();
+    sqlite
+      .prepare(
+        `INSERT INTO tq_rows (id, book, chapter, verse, ref_raw, question, response, review_kind)
+         VALUES ('ok01', ?, 3, 1, '3:1', 'q', 'r', NULL)`,
+      )
+      .run(BOOK);
+    const realFetch = globalThis.fetch;
+    let called = 0;
+    globalThis.fetch = async () => { called++; throw new Error("should not be called"); };
+    try {
+      const cleared = await clearResolvedMergeNoBaseForTest(env, BOOK, "tq", MINT_AT + 5000, OURS_AND_AI_PAGE, FILE);
+      eq(cleared, 0, "nothing to clear");
+      eq(called, 0, "…and not one Gitea fetch was spent finding that out");
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  }
+
+  // 6. A STRONGER flag is not collateral damage. The id list is built from a
+  //    'merge_no_base' SELECT, so the statement's own re-assertion of that
+  //    predicate is a RACE guard (a flag raised between the SELECT and the
+  //    batch) and is not reachable from a single-process test — this case pins
+  //    the selection instead, which is the half a test CAN observe.
+  {
+    const { sqlite, env } = freshEnv();
+    seedFlagged(sqlite, 2);
+    sqlite.prepare(`UPDATE tq_rows SET review_kind = 'merge_conflict' WHERE id = 'cl00'`).run();
+    const cleared = await clearResolvedMergeNoBaseForTest(env, BOOK, "tq", FLAG_SINCE - 10, OURS_AND_AI_PAGE, FILE);
+    eq(cleared, 1, "only the merge_no_base row is retired");
+    const rows = sqlite.prepare(`SELECT id, review_kind FROM tq_rows ORDER BY id`).all();
+    eq(rows.map((r) => r.review_kind), ["merge_conflict", null], "…an unacknowledged merge_conflict stands");
+  }
 }
 
 if (failed > 0) {

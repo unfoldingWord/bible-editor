@@ -394,6 +394,73 @@ console.log("\n[a legacy row with book IS NULL is still shielded — the join re
   assert(survivingIds(d).join(",") === "7", "NULL-book ancestor survives (merge accepts book IS NULL rows, so the shield must too)");
 }
 
+// ── issue #653, branch (6): the tn/tq/twl create shield ─────────────────────
+//
+// reconstructTsvBases now falls back to a row's newest book-known 'create'
+// when its bounded history is empty — the state of every row created after its
+// book's export boundary froze. That create is the row's ONLY ancestor, so an
+// age-based sweep would silently expire the whole recovery.
+function tnRow(d, { id, book = "JER", deletedAt = null }) {
+  d.prepare(
+    `INSERT INTO tn_rows (id, book, chapter, verse, ref_raw, note, sort_order, deleted_at)
+     VALUES (?, ?, 9, 9, '9:9', 'a note', 10, ?)`,
+  ).run(id, book, deletedAt);
+}
+
+console.log("\n[#653: a LIVE tn row's newest book-known 'create' survives a full age-out sweep]");
+{
+  const d = freshDb();
+  tnRow(d, { id: "ab12" });
+  logRow(d, { id: 1, kind: "tn", rowKey: "ab12", book: "JER", action: "create", createdAt: 1000, payload: '{"note":"life one"}' });
+  logRow(d, { id: 2, kind: "tn", rowKey: "ab12", book: "JER", action: "create", createdAt: 2000, payload: '{"note":"life two"}' });
+  logRow(d, { id: 3, kind: "tn", rowKey: "ab12", book: "JER", action: "update", createdAt: 3000, payload: '{"note":"an app edit"}' });
+
+  sweep(d, 100000);
+
+  assert(
+    survivingIds(d).join(",") === "2",
+    "the NEWEST create survives — the same entry the fallback folds (the app edit and the dead life's create age out)",
+  );
+}
+
+console.log("\n[#653: a book-NULL create is NOT shielded — the fallback refuses it, so sheltering it would buy nothing]");
+{
+  const d = freshDb();
+  tnRow(d, { id: "cd34" });
+  logRow(d, { id: 5, kind: "tn", rowKey: "cd34", book: null, action: "create", createdAt: 1000, payload: '{"note":"another book"}' });
+
+  sweep(d, 100000);
+
+  assert(survivingIds(d).length === 0, "an entry the fold discards is not kept alive by this branch");
+}
+
+console.log("\n[#653: a DELETED tn row's create ages out normally — nothing will ever merge it again]");
+{
+  const d = freshDb();
+  tnRow(d, { id: "ef56", deletedAt: 900 });
+  logRow(d, { id: 6, kind: "tn", rowKey: "ef56", book: "JER", action: "create", createdAt: 1000, payload: '{"note":"gone"}' });
+
+  sweep(d, 100000);
+
+  assert(survivingIds(d).length === 0, "the shield is scoped to rows still live in their table");
+}
+
+console.log("\n[#653: tq and twl get the same shield, and one kind's row does not shield another's id]");
+{
+  const d = freshDb();
+  d.prepare(
+    `INSERT INTO tq_rows (id, book, chapter, verse, ref_raw, question, response, sort_order)
+     VALUES ('gh78', 'JER', 9, 9, '9:9', 'q', 'r', 10)`,
+  ).run();
+  logRow(d, { id: 7, kind: "tq", rowKey: "gh78", book: "JER", action: "create", createdAt: 1000, payload: '{"question":"q"}' });
+  // Same id, different kind, and NO twl row exists for it.
+  logRow(d, { id: 8, kind: "twl", rowKey: "gh78", book: "JER", action: "create", createdAt: 1000, payload: '{"tw_link":"x"}' });
+
+  sweep(d, 100000);
+
+  assert(survivingIds(d).join(",") === "7", "the tq row's create survives; the twl entry with no live row does not");
+}
+
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed`);
   process.exit(1);

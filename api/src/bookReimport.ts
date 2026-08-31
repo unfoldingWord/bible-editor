@@ -51,11 +51,14 @@ import {
   fetchHumanTouchedRefs,
   listMasterCommitsSince,
   NT_BOOKS,
+  type MasterCommitPage,
 } from "./dcsSources";
 import {
   classifyMasterCommit,
   compactLineage,
+  LINEAGE_EVIDENCE_CAP,
   LINEAGE_REFINE_MAX_HUMAN_COMMITS,
+  masterMayHoldHumanEdit,
   masterMayHoldHumanEditForVerse,
   summarizeLineage,
   type HumanRefEvidence,
@@ -398,6 +401,22 @@ export interface ReimportCounts {
   // warm-up tradeoff, left as a flagged follow-up (see the failed-adoption-write
   // gate, apply_incomplete, which IS gated).
   merge_no_base: number;
+  // tn/tq/twl rows that reached keep_no_base and would have been flagged
+  // `merge_no_base`, but were NOT, because this run's commit-lineage walk was
+  // complete and found no human commit behind master's side of the row (#653).
+  // The merge outcome is unchanged (D1 is kept either way) — only the flag is
+  // withheld, and only on a positive measurement. Counted so a night that
+  // silently raised nothing is still distinguishable from a night with nothing
+  // to raise; merge_no_base above stays the authoritative outcome count and
+  // includes these rows. tsv only.
+  merge_no_base_mint_skipped: number;
+  // Standing `merge_no_base` flags this run RETIRED, because a complete,
+  // human-free commit walk covering each flag's own window disproved its claim
+  // (#653, clearResolvedMergeNoBase). Seeded per (book, resource) from the run
+  // that did the walk, never per chapter. The durable record is the
+  // `sync_clear_review` edit_log row written with each clear; this counter is
+  // the summary line. tsv only.
+  merge_no_base_cleared: number;
   // The `chapter:verse` refs behind `merge_no_base`, so the banner can NAME the
   // verses it admits tonight's export may overwrite instead of reporting a bare
   // integer. Capped at NO_BASE_REF_CAP: this is a diagnostic list that gates
@@ -548,6 +567,15 @@ const REIMPORT_SOURCE = "dcs_reimport";
 interface TsvBaseRecord {
   content: TsvMergeSide | null;
   ref: TsvRefSide | null;
+  /**
+   * #653: the content ancestor came from the create-as-ancestor FALLBACK (a
+   * `create` above the export boundary), not from the bounded history. Such a
+   * base may exonerate but never convict — see computeTsvMerge's
+   * `baseProvisional`. Always false for a bounded base, and `ref` is null
+   * whenever this is true (the reference decision never sees a provisional
+   * ancestor).
+   */
+  provisional: boolean;
 }
 
 const BLOCKED_SAMPLE_CAP = 20;
@@ -611,6 +639,8 @@ function zeroCounts(): ReimportCounts {
     merge_refused: 0,
     merge_kept_ai: 0,
     merge_no_base: 0,
+    merge_no_base_mint_skipped: 0,
+    merge_no_base_cleared: 0,
     merge_no_base_refs: [],
     merge_no_base_editor_refs: [],
     ref_moved_ours: 0,
@@ -828,6 +858,8 @@ function addCounts(into: ReimportCounts, from: ReimportCounts): void {
   into.merge_refused += from.merge_refused ?? 0;
   into.merge_kept_ai += from.merge_kept_ai ?? 0;
   into.merge_no_base += from.merge_no_base ?? 0;
+  into.merge_no_base_mint_skipped += from.merge_no_base_mint_skipped ?? 0;
+  into.merge_no_base_cleared += from.merge_no_base_cleared ?? 0;
   // Same shape as blocked_samples above: diagnostic, capped, gates nothing. A
   // chunk memoized before this field existed contributes no refs while still
   // contributing its count, which is why the banner reports the count as
@@ -1216,9 +1248,14 @@ async function runReimport(
   // reconstructed from (see loadMasterLineage).
   const withLineage = async (cutoff: MergeCutoff | null, resource: Resource): Promise<MergeCutoff | null> => {
     if (cutoff == null) return null;
+    // #653: the same walk retires resolved merge_no_base flags, and the count
+    // has to reach this run's summary — it is per (book, resource), so it is
+    // added once here rather than inside the per-chapter row loops.
+    const stats = { noBaseCleared: 0 };
     const lineage = needsLineage.has(resource)
-      ? await loadMasterLineage(env, book, resource, cutoff.confirmedAt, cutoff.editId)
+      ? await loadMasterLineage(env, book, resource, cutoff.confirmedAt, cutoff.editId, stats)
       : null;
+    perResource[resource].merge_no_base_cleared += stats.noBaseCleared;
     return { ...cutoff, lineage };
   };
 
@@ -1903,6 +1940,25 @@ export async function applyTsvRows(
         kind === "tn" &&
         (cur.trashed_at != null || Number(cur.preserve ?? 0) !== 0 || Number(cur.hint ?? 0) !== 0);
 
+      // Does master's side of THIS row possibly carry a human's own edit?
+      // Hoisted out of the merge call below (its full rationale is there).
+      const masterMayHoldHuman =
+        masterMayHoldHumanEditForVerse(cutoff?.lineage, row.chapter, row.verse) ||
+        masterMayHoldHumanEditForVerse(cutoff?.lineage, Number(cur.chapter), Number(cur.verse));
+
+      // The same question at FILE level, for the merge_no_base mint gate.
+      // Deliberately NOT the per-row narrowing above (#607/#557), even though
+      // it is sitting right there: narrowing exists to let master win a
+      // conflict on a verse a human demonstrably did not touch, and its
+      // evidence is a hunk-to-verse mapping that can be complete for the file
+      // while saying nothing useful about one row. WITHHOLDING A WARNING is
+      // the same user-visible act as clearing one, and clearResolvedMergeNoBase
+      // already refuses to clear on narrowed evidence — so the mint gate reads
+      // the same tier, and the two can never disagree about one row. Only an
+      // explicit `false` gates it: absent, incomplete and "nobody looked" all
+      // keep today's behavior (masterMayHoldHumanEdit's own fail-safe).
+      const fileMayHoldHuman = masterMayHoldHumanEdit(cutoff?.lineage);
+
       // (a) Substantive three-way merge (quote/note/support_reference /
       //     orig_words/tw_link/question/response), attributed against the
       //     reconstructed ancestor. Only when a watermark exists for this run.
@@ -1935,9 +1991,9 @@ export async function applyTsvRows(
           // wrongly let master win; asking `cur`'s too catches that case
           // without weakening the other.
           {
-            masterMayHoldHumanEdit:
-              masterMayHoldHumanEditForVerse(cutoff?.lineage, row.chapter, row.verse) ||
-              masterMayHoldHumanEditForVerse(cutoff?.lineage, Number(cur.chapter), Number(cur.verse)),
+            masterMayHoldHumanEdit: masterMayHoldHuman,
+            // #653: a create-as-ancestor base may exonerate, never convict.
+            baseProvisional: bases.get(row.id)?.provisional === true,
           },
         );
         if (merge.action === "keep_no_base") {
@@ -1953,12 +2009,56 @@ export async function applyTsvRows(
           // re-running an unchanged sync never re-sets a field that's already
           // set (issue #539's version-inflation constraint). Cleared the normal
           // way: any human edit to the row clears review_kind (contentPatchClauses.ts).
-          if (cur.review_kind == null) {
+          //
+          // LINEAGE GATE (#653). The flag's entire claim is "a human Door43
+          // edit could not be ruled out". When the run's FILE-level
+          // commit-lineage walk is COMPLETE and holds no human commit, one WAS
+          // ruled out, and the flag would be telling a translator to check
+          // something that is measurably not there. All 79 prod flags on
+          // 2026-08-30 were this shape. Only an explicit false skips: an
+          // incomplete walk, a run that never looked, and a summary missing the
+          // field all still mint, exactly as before.
+          //
+          // The skip is counted only when a flag WOULD have been written. A row
+          // already carrying one had nothing to skip (and a row carrying a
+          // STRONGER flag was never a candidate), so counting it would report
+          // the same row every night as a fresh withholding.
+          if (!fileMayHoldHuman) {
+            if (cur.review_kind == null) counts.merge_no_base_mint_skipped++;
+          } else if (cur.review_kind == null) {
             fields.review_kind = "merge_no_base";
+            // THREE variants, because there are three different things that get
+            // us here and each message may state only the one that was measured
+            // (the standing alert-wording rule). Outcome and remedy lead, because
+            // the cleanup chip clamps this to two lines (BookLintIndicator).
+            const lin = cutoff?.lineage;
+            //
+            // Every variant says HUMAN, because that is the predicate both the
+            // gate above and the auto-clear actually measure: an AI/bot commit
+            // on Door43 is deliberately not protected (#540 item 2's policy —
+            // pipeline output must not beat a later human edit), so calling it
+            // "an out-of-band Door43 edit" would name a condition the code does
+            // not act on and send a translator to check something the system
+            // has already decided against.
+            const opening =
+              "Nothing was overwritten. Check this row against Door43's version, because the next export that " +
+              "runs for this file writes what is here now. Why: no earlier version of this row survives to " +
+              "compare against, and ";
             fields.review_reason =
-              "No earlier version of this row was recoverable, so an out-of-band Door43 edit (if any) could not " +
-              "be checked against your change. Nothing has been overwritten - but if Door43 has changed this row, " +
-              "tonight's export will still overwrite it unless you re-save it here.";
+              lin == null
+                ? // Nobody walked master's history this run at all — saying it
+                  // "could not be read" would name a failure that never happened.
+                  opening + "Door43's history for this file was not examined, so a human Door43 edit cannot " +
+                    "be ruled out."
+                : lin.incomplete === false && lin.hasHumanCommit === true
+                  ? opening + "a Door43 editor changed this file since the last confirmed publish, so the sync " +
+                      "could not tell which side changed it."
+                  : opening + "Door43's history for this file could not be read in full, so a human Door43 " +
+                      "edit cannot be ruled out.";
+            // The snapshot carries the window this flag is ABOUT (see
+            // masterReviewSnapshot): the clear may not retire it on a walk that
+            // does not cover that window.
+            fields.review_master_json = masterReviewSnapshot(kind, row, { at: now, since: masterConfirmedAt });
           }
         }
         // #540 item 2: both sides moved a field, and the lineage found no human
@@ -2058,6 +2158,12 @@ export async function applyTsvRows(
         if (cur.review_reason === reason) return;
         fields.review_kind = "ref_moved";
         fields.review_reason = reason;
+        // #653: the reference this flag is ABOUT is master's, and the row in
+        // front of the translator carries D1's. Record master's side with the
+        // flag. Inside the dedup guard above deliberately — a night that writes
+        // no new flag writes no new snapshot either, so this cannot re-bump a
+        // version on its own.
+        fields.review_master_json = masterReviewSnapshot(kind, row);
       };
 
       if (refMove === "ours_moved" && !adoptedSurface) {
@@ -2087,6 +2193,7 @@ export async function applyTsvRows(
         if (cur.review_kind === "ref_moved") {
           fields.review_kind = null;
           fields.review_reason = null;
+          fields.review_master_json = null;
         }
         counts.ref_moved_ours++;
       } else if (refsAgree && cur.review_kind === "ref_moved") {
@@ -2126,6 +2233,7 @@ export async function applyTsvRows(
         else {
           fields.review_kind = null;
           fields.review_reason = null;
+          fields.review_master_json = null;
         }
       } else if (refMove !== "none") {
         // Everything else HOLDS: withhold the resource watermark
@@ -2258,6 +2366,11 @@ export async function applyTsvRows(
         if (cur.review_kind !== reviewKind || cur.review_reason !== reason) {
           fields.review_kind = reviewKind;
           fields.review_reason = reason;
+          // #653: master's own values for the row, so "your value was kept over
+          // Door43's" / "Door43's edit was merged over yours" can be checked
+          // rather than believed. Inside the dedup guard for the same reason as
+          // flagRefMoved's.
+          fields.review_master_json = masterReviewSnapshot(kind, row);
         }
       }
 
@@ -2294,7 +2407,7 @@ export async function applyTsvRows(
       const results = await env.DB.batch(
         slice.map((id) =>
           env.DB.prepare(
-            `UPDATE ${TSV_TABLE[kind]} SET review_kind = NULL, review_reason = NULL, updated_at = ?1
+            `UPDATE ${TSV_TABLE[kind]} SET review_kind = NULL, review_reason = NULL, review_master_json = NULL, updated_at = ?1
                WHERE id = ?2 AND book = ?3 AND review_kind = 'ref_moved' AND deleted_at IS NULL`,
           ).bind(now, id, book),
         ),
@@ -2607,9 +2720,9 @@ const TSV_FIELD_LABELS: Record<string, string> = {
 };
 
 const TSV_MERGE_WRITE_COLS: Record<TsvKind, Set<string>> = {
-  tn: new Set(["quote", "note", "occurrence", "support_reference", "tags", "review_kind", "review_reason"]),
-  tq: new Set(["quote", "question", "response", "occurrence", "tags", "review_kind", "review_reason"]),
-  twl: new Set(["orig_words", "tw_link", "occurrence", "tags", "review_kind", "review_reason"]),
+  tn: new Set(["quote", "note", "occurrence", "support_reference", "tags", "review_kind", "review_reason", "review_master_json"]),
+  tq: new Set(["quote", "question", "response", "occurrence", "tags", "review_kind", "review_reason", "review_master_json"]),
+  twl: new Set(["orig_words", "tw_link", "occurrence", "tags", "review_kind", "review_reason", "review_master_json"]),
 };
 
 // Build (don't run) the combined merge UPDATE for one edited TSV row, for
@@ -2649,7 +2762,7 @@ function buildTsvEditedWriteStmt(
   // longer what she is looking at (issue #539 item 4). Scoped to writes that
   // actually move content: a review_kind/review_reason-only write changes no
   // text, so the marker still describes the row correctly and must survive.
-  if (cols.some((c) => c !== "review_kind" && c !== "review_reason")) {
+  if (cols.some((c) => c !== "review_kind" && c !== "review_reason" && c !== "review_master_json")) {
     setClauses.push(`restored_from_version = NULL`);
   }
   const protection =
@@ -2681,6 +2794,109 @@ function parsedRowToMergeSide(kind: TsvKind, row: ParsedTsvRow): TsvMergeSide {
   return { orig_words: row.orig_words ?? null, occurrence: row.occurrence, tw_link: row.tw_link ?? null };
 }
 
+// What Door43 actually held for this row, at the moment a review flag was
+// raised over it (#653, migration 0057). Written at every tn/tq/twl flag mint
+// and cleared everywhere review_kind is cleared, so a translator reading "your
+// value was kept / could not be checked" can see the value it was measured
+// against instead of taking it on trust.
+//
+// EXACTLY the field set lint.ts's review feed reads back per kind (#664's
+// TN/TQ/TWL_REVIEW_FIELDS), so the "Door43's row value" panel shows every
+// field it compares and nothing it does not. Deliberately NOT
+// FIELDS_BY_KIND: that is the MERGEABLE set, which differs in both
+// directions — it omits `tags` (owned by computeEditedFieldMerge) and
+// carries tq `quote`/`occurrence`, which the feed does not display.
+const REVIEW_SNAPSHOT_FIELDS: Record<TsvKind, readonly string[]> = {
+  tn: ["ref_raw", "support_reference", "quote", "occurrence", "note", "tags"],
+  tq: ["ref_raw", "question", "response", "tags"],
+  twl: ["ref_raw", "orig_words", "occurrence", "tw_link", "tags"],
+};
+
+// What Door43 held for this row when a review flag was raised over it.
+// Display evidence only — nothing reads it back into a merge decision, which
+// is why it is JSON rather than columns.
+//
+// `mint` is BOOKKEEPING, and it lives under a reserved `_meta` key rather than
+// beside the fields: #664 emits this object verbatim as the lint feed's
+// "Door43's row value", so a top-level `flag_since` would render as a Door43
+// column that does not exist. `_meta` is stripped there.
+//
+// It records when the flag was raised (`flag_at`) and, load-bearing, the
+// watermark its claim is bounded by (`flag_since` — master_confirmed_at as of
+// that run). The auto-clear needs the latter and cannot get it any other way:
+// the row's `updated_at` is NOT the mint time (rows.ts's non-versioning fast
+// paths — a reorder drag, a preserve/hint/trash toggle — move it and
+// deliberately leave review_kind standing), and even a true mint time is the
+// wrong end of the range, since the commit that could justify the flag may sit
+// anywhere back to that run's watermark.
+function masterReviewSnapshot(
+  kind: TsvKind,
+  row: ParsedTsvRow,
+  mint?: { at: number; since: number | null },
+): string {
+  const parsed = row as unknown as Record<string, unknown>;
+  const out: Record<string, unknown> = {};
+  for (const f of REVIEW_SNAPSHOT_FIELDS[kind]) {
+    // ParsedTsvRow spells this one field camelCase; every other name matches.
+    out[f] = (f === "ref_raw" ? (row.refRaw ?? null) : (parsed[f] ?? null)) as unknown;
+  }
+  if (mint) out._meta = { flag_at: mint.at, flag_since: mint.since };
+  return JSON.stringify(out);
+}
+
+// Read the mint bookkeeping back out of a stored snapshot. Returns null for
+// anything that is not a usable number — an absent, unparseable or pre-#653
+// snapshot has no window, and `Number(null)`/`Number("")` would turn that
+// absence into epoch 0, the most permissive window there is.
+function snapshotFlagSince(json: string | null): number | null {
+  if (!json) return null;
+  try {
+    const p = JSON.parse(json);
+    if (!p || typeof p !== "object" || Array.isArray(p)) return null;
+    const meta = (p as Record<string, unknown>)._meta;
+    if (!meta || typeof meta !== "object") return null;
+    const since = (meta as Record<string, unknown>).flag_since;
+    return typeof since === "number" && Number.isFinite(since) ? since : null;
+  } catch {
+    return null;
+  }
+}
+
+// The master sha a previous clearing attempt was BLOCKED at, from the same
+// `_meta`. While master's tip is unchanged, re-walking would re-measure the
+// identical range and reach the identical answer — so the memo is what stops
+// an unclearable flag paying for a Gitea walk every night forever.
+function snapshotBlockedSha(json: string | null): string | null {
+  if (!json) return null;
+  try {
+    const p = JSON.parse(json);
+    if (!p || typeof p !== "object" || Array.isArray(p)) return null;
+    const meta = (p as Record<string, unknown>)._meta;
+    if (!meta || typeof meta !== "object") return null;
+    const sha = (meta as Record<string, unknown>).clear_blocked_sha;
+    return typeof sha === "string" && sha.length > 0 ? sha : null;
+  } catch {
+    return null;
+  }
+}
+
+// Rewrite a stored snapshot's `_meta.clear_blocked_sha`, leaving every Door43
+// field untouched. Returns null when the snapshot cannot be parsed (nothing to
+// annotate — that row simply keeps paying, which is the safe direction).
+function withBlockedSha(json: string | null, sha: string): string | null {
+  if (!json) return null;
+  try {
+    const p = JSON.parse(json);
+    if (!p || typeof p !== "object" || Array.isArray(p)) return null;
+    const obj = p as Record<string, unknown>;
+    const meta = obj._meta && typeof obj._meta === "object" ? (obj._meta as Record<string, unknown>) : {};
+    obj._meta = { ...meta, clear_blocked_sha: sha };
+    return JSON.stringify(obj);
+  } catch {
+    return null;
+  }
+}
+
 // Reconstruct the three-way-merge ancestor for a set of edited TSV rows: the row
 // content D1 held as of the master-confirmed watermark (`cutoff`), which is what
 // the export rendered to master. Because a human TSV edit logs only the CHANGED
@@ -2688,7 +2904,9 @@ function parsedRowToMergeSide(kind: TsvKind, row: ParsedTsvRow): TsvMergeSide {
 // ancestor is FOLDED from the row's edit_log history up to the cutoff (see
 // foldTsvBase). Batched under the bound-param limit; one read per WRITE_BATCH ids
 // regardless of how long each row's history is. A row with no content-bearing
-// history before the cutoff maps to null (caller keeps D1 as keep_no_base).
+// history before the cutoff falls back to its own `create` entry (#653, see the
+// fallback block below); a row with neither maps to null (caller keeps D1 as
+// keep_no_base).
 //
 // PRECISE BOUNDARY (Codex P1.3, fixed). When `boundaryId` is non-null the fold
 // cuts at `id <= boundaryId` — the MAX(edit_log.id) the export captured at its D1
@@ -2756,12 +2974,147 @@ async function reconstructTsvBases(
       entriesById.set(r.row_key, list);
     }
   }
+  // CREATE-AS-ANCESTOR FALLBACK (#653). A row whose bounded candidate set is
+  // EMPTY entered D1 entirely after the boundary — 79 prod rows are in exactly
+  // this state (JER tn 66, AMO tn 8, ECC tq 3, AMO tq 2, measured 2026-08-30):
+  // bp-assistant pushed AI notes to master in the evening, the reimport created
+  // them in D1, a translator then edited them in the app. Every one was flagged
+  // merge_no_base for want of an ancestor that was sitting one id above the
+  // boundary the whole time.
+  //
+  // A row absent from D1 at the boundary has no EARLIER state to miss, so
+  // nothing is being skipped over here: its `create` payload IS the content it
+  // entered D1 with (master's own imported row, or a translator's new row), and
+  // that is a true shared ancestor of both sides. Only the create is folded —
+  // never a later update, which is precisely the app-side edit being merged.
+  //
+  // THE ENTRY CONDITION IS LIFECYCLE, NOT EMPTINESS — and that is a fix to a
+  // hole `main` already had, not merely a restoration of it. (book, id) can be
+  // reused: the tombstone machinery reclaims an id, and a reclaim logs a SECOND
+  // `create` for the same row_key. So a slot can hold an OLD life's
+  // create/updates BELOW the boundary while the current life's reclaim-create
+  // sits ABOVE it. Keying on "the bounded set is empty" would leave that row on
+  // the bounded fold, which folds the dead row's payload into a fully-trusted,
+  // NON-provisional ancestor — obsolete base, translator's current value and
+  // master all differing, read as a both-changed conflict, and master-wins then
+  // writes over the translator whenever the lineage is incomplete or holds a
+  // human commit. That is exactly the overwrite the provisional floor exists to
+  // stop, reached on the one path that bypasses it.
+  //
+  // So: when the row's NEWEST book-known `create` sits ABOVE the boundary,
+  // everything below it belongs to a previous lifecycle and is DISCARDED — the
+  // current-life create becomes the base, provisional, exonerate-only. A row
+  // whose newest create sits at or below the boundary is a normal row and keeps
+  // today's bounded, fully-trusted fold, untouched.
+  //
+  // NEWEST, never oldest, for the same reason: the newest create is the current
+  // life's entry into D1, and for the overwhelmingly common single-create row
+  // the two are the same entry.
+  //
+  // A NULL-book entry is skipped outright rather than merely being refused by
+  // the folds later. Ids are unique only per (book, id) and prod holds ~7,689
+  // book-NULL tn/tq/twl edit_log rows, so another book's create can carry the
+  // same short id; letting one win the pick would leave the fold with a single
+  // entry it then discards (bookKnown === false), and the row would silently
+  // keep the very keep_no_base this fallback exists to remove.
+  //
+  // CONTENT ONLY — the recovered create never reaches the REFERENCE fold. A
+  // reference ancestor decides classifyTsvRefMove, whose `ours_moved` outcome
+  // is the one place in this file where the export writes D1's location over
+  // master's; today a row with no reference ancestor is `unattributable` and
+  // HOLDS. Feeding a provisional base in there would convert a fail-safe hold
+  // into the single outcome that can cost data on a mis-attribution, on an
+  // ancestor recovered from the boundary that just failed. The content merge
+  // has a floor for exactly this (computeTsvMerge's `baseProvisional`); the
+  // reference decision has none, so it keeps seeing bounded entries only.
+  //
+  // COST: one extra batched read per WRITE_BATCH ids, now unconditional rather
+  // than only for ids the bounded read missed — the lifecycle question cannot be
+  // answered without asking it. Same order of magnitude as the bounded read it
+  // sits beside, and it reads at most one `create` row per candidate id.
+  const currentLifeCreate = new Map<string, { aboveBoundary: boolean; entry: TsvEditLogEntry }>();
+  for (let i = 0; i < ids.length; i += WRITE_BATCH) {
+    const slice = ids.slice(i, i + WRITE_BATCH);
+    const inClause = slice.map((_, j) => `?${j + 3}`).join(", ");
+    const rs = await env.DB.prepare(
+      `SELECT row_key, id, created_at, action, payload_json, book FROM edit_log
+        WHERE kind = ?2 AND book = ?1
+          AND action = 'create'
+          AND row_key IN (${inClause})
+        ORDER BY row_key ASC, id ASC`,
+    )
+      .bind(book, kind, ...slice)
+      .all<{
+        row_key: string;
+        id: number | null;
+        created_at: number | null;
+        action: string;
+        payload_json: string | null;
+        book: string | null;
+      }>();
+    for (const r of rs.results) {
+      // NEWEST create per row_key: the ORDER BY is ascending, so each row seen
+      // replaces the previous one and the last write wins.
+      let payload: Record<string, unknown> | null = null;
+      if (r.payload_json) {
+        try {
+          const p = JSON.parse(r.payload_json);
+          if (p && typeof p === "object" && !Array.isArray(p)) payload = p as Record<string, unknown>;
+        } catch {
+          /* unparseable payload — treat as no content for this entry */
+        }
+      }
+      // Is this create OUTSIDE the bounded fold's own cut? Asked with the exact
+      // comparison the bounded query makes — `id <= boundaryId`, or
+      // `created_at < cutoff` during 0050's warm-up — so the two can never
+      // disagree about which side of the line an entry falls on.
+      //
+      // ABSENT IS NOT ABOVE. A missing or non-numeric id/created_at cannot be
+      // PROVEN to sit above the boundary, and `Number(null)` is a finite 0 that
+      // would answer "below" for one comparison and "above" for the other. So
+      // an unreadable value answers `false` explicitly — the row keeps the
+      // bounded fold, which is main's behavior, rather than being reclassified
+      // on a coercion.
+      const entryId = typeof r.id === "number" && Number.isFinite(r.id) ? r.id : null;
+      const entryAt = typeof r.created_at === "number" && Number.isFinite(r.created_at) ? r.created_at : null;
+      const aboveBoundary =
+        boundaryId != null
+          ? entryId != null && !(entryId <= boundaryId)
+          : entryAt != null && !(entryAt < cutoff);
+      currentLifeCreate.set(r.row_key, {
+        aboveBoundary,
+        entry: { action: r.action, payload, bookKnown: r.book != null },
+      });
+    }
+  }
+  const provisionalIds = new Set<string>();
+  for (const id of ids) {
+    const create = currentLifeCreate.get(id);
+    if (create?.aboveBoundary) {
+      // The current life began after the boundary: whatever the bounded read
+      // returned for this id belongs to a previous life of the slot (or to
+      // nothing at all) and is discarded wholesale.
+      entriesById.set(id, [create.entry]);
+      provisionalIds.add(id);
+    }
+  }
   for (const id of ids) {
     const entries = entriesById.get(id) ?? [];
-    // Both folds read the SAME entries — the reference ancestor costs no extra
-    // D1 read, which is what keeps it affordable on the unchunked full-book
-    // paths this function's header already flags as near the subrequest cap.
-    out.set(id, { content: foldTsvBase(kind, entries), ref: foldTsvRefBase(entries) });
+    const provisional = provisionalIds.has(id);
+    // Both folds read the SAME entries whenever the entries are BOUNDED — the
+    // reference ancestor then costs no extra D1 read, which is what keeps it
+    // affordable on the unchunked full-book paths this function's header
+    // already flags as near the subrequest cap. A provisional (fallback) entry
+    // feeds the content fold alone; the reference fold is given nothing, so its
+    // ancestor stays null and a reference difference keeps holding.
+    // Per-field graceful degradation is unchanged: a create that never carried
+    // a field leaves that field absent, which computeTsvMerge reads as
+    // unattributable (no_base) for that field alone.
+    out.set(id, {
+      content: foldTsvBase(kind, entries),
+      ref: provisional ? null : foldTsvRefBase(entries),
+      provisional,
+    });
   }
   return out;
 }
@@ -3070,7 +3423,7 @@ function buildTsvUpdateStmt(
   // above. Left uncleared, a human's stale "this needs review because X"
   // carries onto master's unrelated new content with no way to tell it's
   // wrong. Fresh-insert default is NULL (tryInsertTsvRow never sets it).
-  const clearReviewMeta = reclaim ? "review_kind = NULL, review_reason = NULL, " : "";
+  const clearReviewMeta = reclaim ? "review_kind = NULL, review_reason = NULL, review_master_json = NULL, " : "";
   // EVERY mode this function builds (update, resurrect, reseedAi, reclaim)
   // replaces the row's content wholesale and bumps version — that's the
   // function's whole job — so restored_from_version (the "v{N} (restored)"
@@ -3163,7 +3516,7 @@ function gatedLogEditStmt(
   userId: number | null,
   prevVersion: number | null,
   newVersion: number,
-  action: "create" | "update" | "restore",
+  action: "create" | "update" | "restore" | "sync_clear_review",
   payload: unknown,
 ): D1PreparedStatement {
   return env.DB.prepare(
@@ -3323,6 +3676,13 @@ async function loadMasterLineage(
   resource: Resource,
   confirmedAt: number | null,
   confirmedEditId: number | null = null,
+  // #653: out-param for the merge_no_base flags this run's walk retired. The
+  // clear happens here (this is the one place per (book, resource) per run that
+  // holds a walk), but it has to be REPORTED through the same ReimportCounts
+  // every other outcome travels in, and this function's return value is a
+  // lineage summary that is persisted and serialized into Workflow steps —
+  // carrying a per-run side-effect count on it would leak into both.
+  stats?: { noBaseCleared: number },
 ): Promise<MasterLineageSummary | null> {
   const file = dcsResourceFile(book, resource);
   if (!file || confirmedAt == null) return null;
@@ -3375,8 +3735,267 @@ async function loadMasterLineage(
   // watermark; null is honest there rather than a stale prior sha.
   const asOfSha = page.commits[0]?.sha ?? null;
   await persistMasterLineage(env, book, resource, summary, asOfSha, confirmedEditId, confirmedAt);
+  // #653: this walk is also the evidence that RETIRES merge_no_base flags an
+  // earlier run raised for want of one. Only for the TSV kinds (the verse side
+  // has no such row flag), and only while such flags exist.
+  if (resource === "tn" || resource === "tq" || resource === "twl") {
+    const cleared = await clearResolvedMergeNoBase(env, book, resource, confirmedAt, page, file, asOfSha);
+    if (stats) stats.noBaseCleared += cleared;
+  }
   return summary;
 }
+
+// How far back a clearing walk is willing to reach. `flag_since` is frozen at
+// the mint while master_confirmed_at keeps advancing, so an UNCLEARABLE flag's
+// window widens by a day every day — and a widening walk is one that eventually
+// outgrows listMasterCommitsSince's page budget, becomes permanently
+// `page_cap`, and pays five Gitea fetches a night forever for an answer it can
+// never reach. The nightly has already died once on Cloudflare's ~1000
+// subrequest cap. Past this bound the flag is left to the dismiss path instead:
+// 30 days is comfortably longer than any observed mint-to-clear gap (the prod
+// backlog's oldest is ~5 days) and well inside 250 commits for these files.
+const NO_BASE_CLEAR_MAX_WINDOW_SECONDS = 30 * 24 * 3600;
+
+// Retire the merge_no_base flags on a (book, kind) that the commit history now
+// disproves (#653).
+//
+// A merge_no_base flag claims exactly one thing: "a human Door43 edit to this
+// row could not be ruled out". It is set once and then has no way to clear
+// except a human editing the row — so 79 of them were still standing in prod on
+// 2026-08-30 over rows nobody needs to look at, on files whose complete Door43
+// history since the flags were raised holds nothing but our own exports and
+// bp-assistant pushes. That is the claim being MEASURED false, so the flags go.
+//
+// THE WINDOW IS THE WHOLE SAFETY ARGUMENT, and it is not derivable from the
+// row. A flag raised on run R is about master's history since R's own watermark
+// (master_confirmed_at at that moment), so a walk that starts later than that
+// watermark can report "no human commit" while the human commit sits just
+// behind its start. The row's `updated_at` is no help and is actively
+// misleading: the non-versioning fast paths in rows.ts (a reorder drag, a
+// preserve/hint/trash toggle) move it and deliberately leave review_kind
+// standing, so a flag from June can carry an August timestamp. So the window is
+// taken from the flag itself — `flag_since` in review_master_json, written at
+// the mint (masterReviewSnapshot) — and a flag that does not carry one is NOT
+// cleared. That deliberately excludes every flag minted before this shipped,
+// including the 79: an absent measurement may not be laundered into a clean
+// one, and those have the dismiss path instead.
+//
+// The rest is the same fail-safe as everywhere else here: an INCOMPLETE walk
+// clears nothing ("we could not read the history" is not "no human touched
+// it"), and one human commit in the window clears nothing. Asked at FILE level,
+// not per row — the per-ref narrowing (#557/#607) exists to let master win a
+// conflict more narrowly, and using it to clear a warning would let one
+// unmapped hunk retire a flag it never covered.
+//
+// Cost, and why it self-extinguishes. One indexed D1 read per (book, kind) per
+// run that loads a lineage (migration 0057's partial index covers it), and NO
+// Gitea fetch unless clearable flags exist AND the run's own walk starts later
+// than the oldest of their windows. Two bounds stop an unclearable flag paying
+// that forever: a window older than NO_BASE_CLEAR_MAX_WINDOW_SECONDS is not
+// walked at all, and a blocked attempt is MEMOIZED against master's tip sha in
+// the flag's own `_meta`, so re-running against an unchanged master costs zero
+// fetches. Never throws: a failure here must not take down a reimport, and the
+// flags simply stand for another night.
+async function clearResolvedMergeNoBase(
+  env: Env,
+  book: string,
+  kind: TsvKind,
+  walkStart: number,
+  walked: MasterCommitPage,
+  file: { repo: string; path: string },
+  // Master's tip sha for this file as of the run's own walk, or null when
+  // nothing moved it since the watermark. Only used to memoize a blocked
+  // attempt; a null simply means this run cannot memoize.
+  masterSha: string | null,
+): Promise<number> {
+  try {
+    const rs = await env.DB.prepare(
+      `SELECT id, review_master_json FROM ${TSV_TABLE[kind]}
+        WHERE book = ?1 AND review_kind = 'merge_no_base' AND deleted_at IS NULL`,
+    )
+      .bind(book)
+      .all<{ id: string; review_master_json: string | null }>();
+    const flagged = rs.results.length;
+    if (flagged === 0) return 0;
+
+    const now = Math.floor(Date.now() / 1000);
+    const clearable: string[] = [];
+    let windowStart: number | null = null;
+    let skippedNoWindow = 0;
+    let skippedStale = 0;
+    let skippedMemo = 0;
+    for (const r of rs.results) {
+      const since = snapshotFlagSince(r.review_master_json);
+      if (since == null) {
+        skippedNoWindow++; // pre-#653 flag, or a snapshot we cannot read
+        continue;
+      }
+      if (now - since > NO_BASE_CLEAR_MAX_WINDOW_SECONDS) {
+        skippedStale++; // too far back to walk — see the bound's own comment
+        continue;
+      }
+      // A previous attempt was blocked against this exact master tip. Nothing
+      // about the answer can have changed, so do not pay for it again.
+      if (masterSha != null && snapshotBlockedSha(r.review_master_json) === masterSha) {
+        skippedMemo++;
+        continue;
+      }
+      clearable.push(r.id);
+      windowStart = windowStart == null ? since : Math.min(windowStart, since);
+    }
+    if (clearable.length === 0 || windowStart == null) {
+      console.log("reimport merge_no_base clear: nothing walkable", {
+        book,
+        kind,
+        flagged,
+        skippedNoWindow,
+        skippedStale,
+        skippedMemo,
+      });
+      return 0;
+    }
+
+    // Reuse the run's walk when it already reaches back past every window —
+    // then the clear costs no extra Gitea fetch at all.
+    let walk = walked;
+    if (walkStart > windowStart) {
+      walk = await listMasterCommitsSince(env, file.repo, file.path, null, { sinceTime: windowStart });
+    }
+    // A blocked outcome is recorded on the rows themselves, keyed by master's
+    // tip, so tonight's answer is not re-bought tomorrow for an unchanged file.
+    const memoBlocked = async (reason: string): Promise<void> => {
+      if (masterSha == null) return;
+      const stmts: D1PreparedStatement[] = [];
+      for (const r of rs.results) {
+        if (!clearable.includes(r.id)) continue;
+        const next = withBlockedSha(r.review_master_json, masterSha);
+        if (next == null) continue;
+        stmts.push(
+          env.DB.prepare(
+            // review_master_json ONLY: no version bump, no updated_at move, and
+            // guarded on the flag still being the one we measured. This is
+            // bookkeeping about the flag, not a change to the row or to what
+            // the flag says.
+            `UPDATE ${TSV_TABLE[kind]} SET review_master_json = ?1
+              WHERE id = ?2 AND book = ?3 AND review_kind = 'merge_no_base' AND deleted_at IS NULL`,
+          ).bind(next, r.id, book),
+        );
+      }
+      for (let i = 0; i < stmts.length; i += WRITE_BATCH) {
+        await env.DB.batch(stmts.slice(i, i + WRITE_BATCH));
+      }
+      console.log("reimport merge_no_base clear: memoized a blocked attempt", { book, kind, reason, masterSha });
+    };
+    if (walk.incomplete) {
+      console.log("reimport merge_no_base clear: skipped, lineage walk incomplete", {
+        book,
+        kind,
+        flagged,
+        reason: walk.incompleteReason,
+      });
+      await memoBlocked(`incomplete:${walk.incompleteReason}`);
+      return 0;
+    }
+    const humans = walk.commits.map(classifyMasterCommit).filter((c) => c.kind === "human");
+    if (humans.length > 0) {
+      console.log("reimport merge_no_base clear: skipped, a human commit is in the window", {
+        book,
+        kind,
+        flagged,
+        humanShas: humans.slice(0, LINEAGE_EVIDENCE_CAP).map((c) => c.sha),
+      });
+      await memoBlocked("human_commit");
+      return 0;
+    }
+
+    // Same write shape as the ref_moved clear above: one statement per row in
+    // batches, guarded on the flag being retired (so a run that raised a
+    // stronger flag in between 0-changes), no version bump and no version-CAS
+    // (there is no lost update to guard — nothing about the row's content
+    // moves), never on a tombstone. By id, not by predicate: the ids are
+    // exactly the rows whose own window this walk covered. The `review_kind =
+    // 'merge_no_base'` re-assertion is therefore a RACE guard only — it cannot
+    // fire on the id list itself — and it is what makes a stronger flag raised
+    // between the SELECT and this batch 0-change instead of being swept up.
+    //
+    // Each clear is PAIRED with an edit_log row, in the same batch and
+    // immediately after its UPDATE, via gatedLogEditStmt — every incident in
+    // this repo is reconstructed from edit_log, and a warning that disappears
+    // with nothing but a console line behind it is exactly the shape nobody can
+    // audit six weeks later. The payload carries what was cleared AND the
+    // evidence that justified it. `sync_clear_review` (sibling of #664's
+    // `dismiss_review`) is deliberately outside every content-fold action list
+    // — the two ancestor folds take create/update/restore, the verse fold adds
+    // baseline — so an audit row can never be mistaken for row content.
+    const kindCounts = { ours: 0, ai: 0, human: 0 };
+    for (const c of walk.commits.map(classifyMasterCommit)) kindCounts[c.kind]++;
+    const evidence = {
+      window_start: windowStart,
+      walked_sha: masterSha,
+      commits: walk.commits.length,
+      ...kindCounts,
+    };
+    const byId = new Map(rs.results.map((r) => [r.id, r] as const));
+    let cleared = 0;
+    for (let i = 0; i < clearable.length; i += WRITE_BATCH) {
+      const slice = clearable.slice(i, i + WRITE_BATCH);
+      const stmts: D1PreparedStatement[] = [];
+      for (const id of slice) {
+        stmts.push(
+          env.DB.prepare(
+            `UPDATE ${TSV_TABLE[kind]}
+                SET review_kind = NULL, review_reason = NULL, review_master_json = NULL, updated_at = ?1
+              WHERE id = ?2 AND book = ?3 AND review_kind = 'merge_no_base' AND deleted_at IS NULL`,
+          ).bind(now, id, book),
+        );
+        stmts.push(
+          gatedLogEditStmt(env, kind, id, book, null, null, 0, "sync_clear_review", {
+            review_kind: "merge_no_base",
+            review_reason: null,
+            review_master_json: byId.get(id)?.review_master_json ?? null,
+            evidence,
+          }),
+        );
+      }
+      const results = await env.DB.batch(stmts);
+      // Two statements per row, UPDATE first: only the UPDATEs are counted.
+      results.forEach((r, j) => {
+        if (j % 2 === 0 && (r?.meta.changes ?? 0) > 0) cleared++;
+      });
+    }
+    console.log("reimport merge_no_base clear", {
+      book,
+      kind,
+      flagged,
+      clearable: clearable.length,
+      cleared,
+      skippedNoWindow,
+      skippedStale,
+      skippedMemo,
+      ...evidence,
+    });
+    return cleared;
+  } catch (e) {
+    console.error("reimport merge_no_base clear failed", {
+      book,
+      kind,
+      error: e instanceof Error ? e.message : String(e),
+    });
+    return 0;
+  }
+}
+
+// Lets reimportJourney.test.mjs drive the REAL clear (its SQL included) against
+// the real schema — same rationale as the other *ForTest aliases above.
+export const clearResolvedMergeNoBaseForTest = (
+  env: Env,
+  book: string,
+  kind: TsvKind,
+  walkStart: number,
+  walked: MasterCommitPage,
+  file: { repo: string; path: string },
+  masterSha: string | null = null,
+): Promise<number> => clearResolvedMergeNoBase(env, book, kind, walkStart, walked, file, masterSha);
 
 // Durable counterpart to the console.log above — see 0054_master_lineage_snapshot.sql
 // and, for the two boundary columns, 0058_master_lineage_confirmed_boundary.sql.
@@ -5050,6 +5669,12 @@ interface StagedResource {
   // shipped; masterMayHoldHumanEdit reads that absence as "a human may have",
   // which is the pre-existing behavior.
   lineage?: MasterLineageSummary | null;
+  // #653: merge_no_base flags the SAME walk retired for this (book, resource).
+  // Seeded into the run summary from the plan, not from a chunk — the clear is
+  // per pair and happens at staging time, so counting it in a chunk would
+  // either multiply it by the chunk count or be lost on a Workflow replay that
+  // re-serves the memoized plan. Absent on a plan staged before this shipped.
+  noBaseCleared?: number;
   // Issue #639. Set when the stale-base gate REFUSED this resource's incoming
   // file: master presents a wholesale translationCore re-export taken from a
   // snapshot older than the state D1 last adopted. Implies `changed: false` AND
@@ -6532,8 +7157,16 @@ async function planAndStageBookResources(
     // step. The extra D1 read buys the correct boundary: the walk must start
     // where the merge's ancestor sits (`master_confirmed_at`), not at
     // `sync.sourceSha`, which this very function is about to move past it.
+    const noBaseStats = { noBaseCleared: 0 };
     const stageCutoff = await getMasterConfirmedAt(env, book, resource);
-    const lineage = await loadMasterLineage(env, book, resource, stageCutoff.confirmedAt, stageCutoff.editId);
+    const lineage = await loadMasterLineage(
+      env,
+      book,
+      resource,
+      stageCutoff.confirmedAt,
+      stageCutoff.editId,
+      noBaseStats,
+    );
     const r2Key = `reimport-stage/${instanceId}/${book}/${resource}`;
     await env.BLOBS.put(r2Key, raw);
     entries.push({
@@ -6543,6 +7176,7 @@ async function planAndStageBookResources(
       r2Key,
       verifiedComplete,
       lineage,
+      noBaseCleared: noBaseStats.noBaseCleared,
       // Null on every ordinary night. Non-null ONLY on a force-released
       // stale-base adoption — see the gate above and staleBaseOverridden below.
       staleBaseOverridden,
@@ -6763,6 +7397,9 @@ export async function runChunkedReimport(
     // inside a `step.do`) keeps it correct across a Workflow replay, which
     // re-serves the memoized plan but does NOT re-run any closure that mutated
     // `perResource` from inside a step.
+    // #653: same seeding rationale as own_publish_converged above — the clear
+    // ran inside the plan step, so its count comes from the plan.
+    if (e.noBaseCleared) perResource[e.resource].merge_no_base_cleared += e.noBaseCleared;
     if (e.staleBaseHold) perResource[e.resource].stale_base_held++;
     if (e.staleBaseOverridden) perResource[e.resource].stale_base_overridden++;
   }
