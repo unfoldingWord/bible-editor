@@ -4,7 +4,12 @@
 // render them as a single collapsible entry instead of dozens of duplicates.
 
 import assert from "node:assert/strict";
-import { groupLintIssues } from "./bookLintGrouping.ts";
+import {
+  diffDoor43Fields,
+  dismissibleKind,
+  groupLintIssues,
+  isGroupFullyDismissible,
+} from "./bookLintGrouping.ts";
 
 let passed = 0;
 const check = (cond, msg) => {
@@ -94,6 +99,80 @@ console.log("[mixed: duplicates and singletons interleave, order preserved]");
   check(groups.length === 2, "2 groups: one dup pair, one singleton");
   check(groups[0].issues.length === 2, "the 'A'/'dup' group comes first (first-seen) and holds both");
   check(groups[1].issues.length === 1, "the singleton 'B' group holds its one issue");
+}
+
+console.log("[diffDoor43Fields: differing fields are detected]");
+{
+  const door43 = { quote: "old text", note: "same" };
+  const ours = { quote: "new text", note: "same" };
+  const diffs = diffDoor43Fields(door43, ours);
+  check(diffs.length === 1, `only the changed field is reported (got ${diffs.length})`);
+  check(diffs[0].field === "quote", "the differing field is 'quote'");
+  check(diffs[0].door43 === "old text" && diffs[0].ours === "new text", "raw values are carried through");
+}
+
+console.log("[diffDoor43Fields: empty vs null/undefined treated as equal]");
+{
+  const door43 = { note: "", missing: null };
+  const ours = { note: undefined, missing: undefined };
+  const diffs = diffDoor43Fields(door43, ours);
+  check(diffs.length === 0, "empty-string/null/undefined are all treated as equivalent 'empty'");
+}
+
+console.log("[diffDoor43Fields: all-match case produces no diffs]");
+{
+  const door43 = { a: "1", b: "2" };
+  const ours = { a: "1", b: "2" };
+  check(diffDoor43Fields(door43, ours).length === 0, "identical objects produce zero diffs");
+}
+
+console.log("[diffDoor43Fields: null door43 (no snapshot) produces no diffs]");
+{
+  check(diffDoor43Fields(null, { a: "1" }).length === 0, "null door43 short-circuits to no diffs");
+  check(diffDoor43Fields(undefined, { a: "1" }).length === 0, "undefined door43 short-circuits to no diffs");
+}
+
+console.log("[diffDoor43Fields: differing object-valued fields are detected, not collapsed]");
+{
+  const door43 = { tags: { a: 1 } };
+  const ours = { tags: { a: 2 } };
+  const diffs = diffDoor43Fields(door43, ours);
+  check(
+    diffs.length === 1 && diffs[0].field === "tags",
+    "a structural difference in an object field is not masked by String() coercion",
+  );
+  check(
+    diffDoor43Fields({ tags: { a: 1 } }, { tags: { a: 1 } }).length === 0,
+    "structurally-identical object fields compare equal",
+  );
+}
+
+console.log("[isGroupFullyDismissible: detects group-level dismiss eligibility]");
+{
+  const dismissible = (overrides = {}) =>
+    issue({ dismissible: true, rowId: "r1", ...overrides });
+  check(
+    isGroupFullyDismissible([dismissible(), dismissible({ rowId: "r2" })]) === true,
+    "all dismissible with rowId -> true",
+  );
+  check(
+    isGroupFullyDismissible([dismissible(), dismissible({ dismissible: false })]) === false,
+    "one non-dismissible issue -> false",
+  );
+  check(
+    isGroupFullyDismissible([dismissible(), dismissible({ rowId: undefined })]) === false,
+    "one issue missing rowId -> false",
+  );
+  check(isGroupFullyDismissible([]) === false, "empty group -> false");
+}
+
+console.log("[dismissibleKind: only row-backed resources are dismissible]");
+{
+  check(dismissibleKind("tn") === "tn", "tn -> tn");
+  check(dismissibleKind("tq") === "tq", "tq -> tq");
+  check(dismissibleKind("twl") === "twl", "twl -> twl");
+  check(dismissibleKind("ult") === null, "ult (scripture text, no row) -> null");
+  check(dismissibleKind("ust") === null, "ust (scripture text, no row) -> null");
 }
 
 console.log(`\n  bookLintGrouping: ${passed} assertions passed`);

@@ -2996,6 +2996,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
             flagCount={bookLint.flagCount}
             escalateCount={bookLint.escalateCount}
             onGoToIssue={goToLintIssue}
+            onDismissed={bookLint.refetch}
           />
         }
         alignIndicator={
