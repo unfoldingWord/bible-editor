@@ -250,6 +250,60 @@ console.log("\n[stale-dismiss guard, second token: matching kind AND reason clea
   eq(editLogRows(sqlite, "tn", "ab12").length, 1, "and it's audited");
 }
 
+console.log("\n[absent-vs-wrong: a null-reason flag survives a stale dismiss after a re-stamp WITH a reason]");
+{
+  // The Codex re-verify bug: the client saw review_reason=null, then the
+  // nightly reimport re-stamped the SAME kind with a NEW, non-null reason.
+  // A dismiss that omits the review_reason key (the pre-fix client
+  // behavior — it dropped null via truthiness) would never guard on it at
+  // all and would wrongly clear this newer flag. The fixed client sends
+  // review_reason: null explicitly, which must NOT match a row whose
+  // stored reason is now a string.
+  const { sqlite, dismiss, broadcasts } = freshApp();
+  seedTn(sqlite, { reviewKind: "merge_no_base", reviewReason: "a newer reason after the re-stamp" });
+
+  const res = await dismiss("tn", "ab12", BOOK, { review_kind: "merge_no_base", review_reason: null });
+  eq(res.status, 200, "still a 200 (idempotent no-op)");
+  const body = await res.json();
+  eq(body.review_reason, "a newer reason after the re-stamp", "the response surfaces the CURRENT (non-null) reason");
+
+  const r = tnRow(sqlite);
+  eq(r.review_kind, "merge_no_base", "the flag survives");
+  eq(r.review_reason, "a newer reason after the re-stamp", "…with its new reason untouched");
+  eq(editLogRows(sqlite, "tn", "ab12").length, 0, "no audit row — nothing was actually dismissed");
+  eq(broadcasts.length, 0, "no broadcast");
+}
+
+console.log("\n[absent-vs-wrong: a null-reason flag dismissed with review_reason:null while unchanged clears normally]");
+{
+  const { sqlite, dismiss } = freshApp();
+  seedTn(sqlite, { reviewKind: "merge_no_base", reviewReason: null });
+
+  const res = await dismiss("tn", "ab12", BOOK, { review_kind: "merge_no_base", review_reason: null });
+  eq(res.status, 200, "accepted");
+  const r = tnRow(sqlite);
+  eq(r.review_kind, null, "cleared — both tokens matched (kind equal, reason IS NULL on both sides)");
+  eq(editLogRows(sqlite, "tn", "ab12").length, 1, "and it's audited");
+}
+
+console.log("\n[an empty-string review_reason round-trips as a real value, not a dropped/falsy one]");
+{
+  const { sqlite, dismiss } = freshApp();
+  seedTn(sqlite, { reviewKind: "quote", reviewReason: "" });
+
+  // A mismatched guess (non-empty) must NOT clear an empty-string reason.
+  const stale = await dismiss("tn", "ab12", BOOK, { review_kind: "quote", review_reason: "not empty" });
+  eq(stale.status, 200, "idempotent no-op");
+  eq(tnRow(sqlite).review_kind, "quote", "an empty stored reason is not matched by a non-empty guess");
+
+  // The matching empty-string guess DOES clear it.
+  const res = await dismiss("tn", "ab12", BOOK, { review_kind: "quote", review_reason: "" });
+  eq(res.status, 200, "accepted");
+  const r = tnRow(sqlite);
+  eq(r.review_kind, null, "cleared — the empty-string reason matched exactly");
+  eq(editLogRows(sqlite, "tn", "ab12").length, 1, "audited");
+}
+
 console.log("\n[a dismiss with no review_kind in the body still works (guard is optional)]");
 {
   const { sqlite, dismiss } = freshApp();

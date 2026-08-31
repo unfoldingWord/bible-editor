@@ -188,6 +188,18 @@ export interface BookSummary {
 // the server only clears the flag the popup was actually looking at, not
 // every flag on the row (`reviewReason` closes a second race the kind alone
 // can't: a same-kind re-stamp with different content, see PR #664).
+//
+// `reviewReason` is `string | null | undefined` with THREE distinct meanings
+// — undefined never occurs on a dismissible issue (it's always sent, `null`
+// included) but the type allows it for a non-dismissible issue, where the
+// whole field is absent. `null` means "this flag genuinely has no reason" —
+// a real, distinct observation from "no token was sent". Collapsing null to
+// undefined here was the bug PR #664's Codex re-verify caught (the
+// absent-vs-wrong trap, see docs/sync-attribution-handoff.md): a null-reason
+// flag's dismiss would omit the token entirely, so the server's guard never
+// fired, and a stale dismiss could clear a LATER same-kind re-stamp that DID
+// have a reason. Always pass reviewReason through to dismissReviewFlag
+// exactly as received, never `?? undefined` / `|| undefined` it away.
 export interface BookLintIssue {
   check: string;
   bucket: "flag" | "escalate";
@@ -199,7 +211,7 @@ export interface BookLintIssue {
   door43?: Record<string, unknown> | null;
   ours?: Record<string, unknown>;
   reviewKind?: string;
-  reviewReason?: string;
+  reviewReason?: string | null;
 }
 
 export interface BookLintReport {
@@ -1707,13 +1719,27 @@ export const api = {
   // (a row can carry several) or a DIFFERENT flag of the same kind that was
   // re-stamped with new content since the caller last saw it. Returns the
   // fresh row.
-  dismissReviewFlag: <T = unknown>(kind: RowKind, book: string, id: string, reviewKind?: string, reviewReason?: string) =>
+  //
+  // Both spreads key on `!== undefined`, NEVER truthiness: reviewReason is
+  // `string | null`, and `null` ("this flag has no reason") is a value the
+  // server's guard must receive and match against, not a falsy signal to
+  // drop the key — dropping it is exactly the absent-vs-wrong bug PR #664's
+  // Codex re-verify caught (see BookLintIssue's reviewReason doc above). An
+  // empty-string reviewKind/reviewReason is likewise a real value, not a
+  // reason to omit the key — always pass through what the issue carried.
+  dismissReviewFlag: <T = unknown>(
+    kind: RowKind,
+    book: string,
+    id: string,
+    reviewKind?: string,
+    reviewReason?: string | null,
+  ) =>
     request<T>(`/api/rows/${kind}/${encodeURIComponent(id)}/dismiss-review`, {
       method: "POST",
       body: JSON.stringify({
         book,
-        ...(reviewKind ? { review_kind: reviewKind } : {}),
-        ...(reviewReason ? { review_reason: reviewReason } : {}),
+        ...(reviewKind !== undefined ? { review_kind: reviewKind } : {}),
+        ...(reviewReason !== undefined ? { review_reason: reviewReason } : {}),
       }),
     }),
 

@@ -1049,11 +1049,18 @@ t("a flagged issue also carries reviewReason — the second stale-dismiss token 
   assert.ok(flag);
   assert.equal(flag.reviewReason, "a specific merged edit");
 });
-t("reviewReason is omitted (not null) when review_reason is null, so the client sends no stale reason token", () => {
+t("reviewReason is explicit null (not omitted) when review_reason is null — a real observation, not 'no token'", () => {
+  // The fix for the absent-vs-wrong bug (PR #664, Codex re-verify): a
+  // flagged issue ALWAYS carries reviewReason, and null must survive as
+  // null so a dismiss can be guarded on "the flag I saw had no reason" —
+  // collapsing this to undefined let a stale dismiss of a null-reason flag
+  // silently clear a LATER same-kind re-stamp that DID have a reason.
   const i = lintTnRows([tn({ review_kind: "merge_no_base", review_reason: null })]);
   const flag = i.find((x) => x.check === "Unmerged Door43 edit — verify");
   assert.ok(flag);
-  assert.equal(flag.reviewReason, undefined);
+  assert.equal(flag.reviewReason, null);
+  assert.notEqual(flag.reviewReason, undefined);
+  assert.ok("reviewReason" in flag, "the key itself is present, not omitted");
 });
 t("a JSON array in review_master_json is NOT treated as a row snapshot (door43 stays null)", () => {
   const i = lintTnRows([tn({ review_kind: "quote", review_reason: "x", review_master_json: JSON.stringify(["not", "an", "object"]) })]);

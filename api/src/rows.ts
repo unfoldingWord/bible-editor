@@ -936,10 +936,19 @@ rows.patch("/:kind/:id", requireEditor, async (c) => {
 // flag of the SAME kind whose content changed (a same-kind re-stamp with a
 // different reason) — review_reason changes exactly when the flag's content
 // changes, unlike updated_at (which also moves on unrelated row touches).
+//
+// `.nullable()` on both: a lint issue's reviewReason can legitimately BE
+// null (a flag with no reason text is real, not "no token sent"), and
+// zod would otherwise reject `{review_reason: null}` outright. The handler
+// still has to distinguish "key absent" from "key present with value null"
+// to build the right guard — safeParse's OUTPUT can't reliably carry that
+// distinction (an absent optional key and a present-but-undefined one both
+// end up `undefined` on `parsed.data`), so the handler checks key presence
+// on the RAW parsed body instead (see hasOwn below).
 const DismissReviewBody = z.object({
   book: z.string(),
-  review_kind: z.string().optional(),
-  review_reason: z.string().optional(),
+  review_kind: z.string().nullable().optional(),
+  review_reason: z.string().nullable().optional(),
 });
 
 // POST /api/rows/:kind/:id/dismiss-review — clear a workflow review_kind/
@@ -972,6 +981,20 @@ rows.post("/:kind/:id/dismiss-review", requireEditor, async (c) => {
   // Same shape as every other row route's missing-book response — a blank
   // string satisfies z.string() so this can't be folded into the schema.
   if (!book) return c.json({ error: "book_required" }, 400);
+
+  // Key-presence, read off the RAW body (not parsed.data — see the schema
+  // comment above for why). `{review_reason: null}` and an omitted
+  // review_reason key both surface as `expectedReviewReason === undefined`
+  // after parsing, but they mean opposite things: "the flag I saw has no
+  // reason, match that" vs. "I have no opinion, don't guard on reason at
+  // all". Collapsing them was the absent-vs-wrong bug PR #664's Codex
+  // re-verify caught (docs/sync-attribution-handoff.md) — a stale dismiss of
+  // a null-reason flag silently cleared a LATER same-kind re-stamp that DID
+  // have a reason, because "no token" and "null token" both skipped the
+  // guard identically.
+  const rawBody = body as Record<string, unknown>;
+  const hasReviewKind = Object.prototype.hasOwnProperty.call(rawBody, "review_kind");
+  const hasReviewReason = Object.prototype.hasOwnProperty.call(rawBody, "review_reason");
 
   // Pre-read: needed for (a) the chapter-lock check below (book/chapter/kind
   // scope it), (b) the trashed-row guard (tn only), and (c) the edit_log
@@ -1023,20 +1046,32 @@ rows.post("/:kind/:id/dismiss-review", requireEditor, async (c) => {
   // and the response falls through to the no-op path, returning the row's
   // CURRENT flag — the client sees the truth instead of silently losing a
   // warning it never reviewed. Two independent, optional tokens: params are
-  // numbered dynamically since either, both, or neither may be present.
+  // numbered dynamically since either, both, or neither may be present. Each
+  // guard is built off KEY PRESENCE, not the parsed value: a present `null`
+  // means "match a row whose column is NULL" (IS NULL — no bind param, since
+  // SQL can't `= NULL`), a present string means "match that exact value", and
+  // an ABSENT key means "don't guard on this token at all".
   const updateBinds: unknown[] = [now, id, book];
   let nextParam = 4;
   let reviewKindGuard = "";
-  if (expectedReviewKind !== undefined) {
-    reviewKindGuard = ` AND review_kind = ?${nextParam}`;
-    updateBinds.push(expectedReviewKind);
-    nextParam++;
+  if (hasReviewKind) {
+    if (expectedReviewKind === null) {
+      reviewKindGuard = " AND review_kind IS NULL";
+    } else {
+      reviewKindGuard = ` AND review_kind = ?${nextParam}`;
+      updateBinds.push(expectedReviewKind);
+      nextParam++;
+    }
   }
   let reviewReasonGuard = "";
-  if (expectedReviewReason !== undefined) {
-    reviewReasonGuard = ` AND review_reason = ?${nextParam}`;
-    updateBinds.push(expectedReviewReason);
-    nextParam++;
+  if (hasReviewReason) {
+    if (expectedReviewReason === null) {
+      reviewReasonGuard = " AND review_reason IS NULL";
+    } else {
+      reviewReasonGuard = ` AND review_reason = ?${nextParam}`;
+      updateBinds.push(expectedReviewReason);
+      nextParam++;
+    }
   }
 
   // Batch: the audit INSERT is conditional on the UPDATE actually clearing a
