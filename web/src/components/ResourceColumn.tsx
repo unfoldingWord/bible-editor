@@ -106,6 +106,12 @@ interface Props {
   // recentre on the active note / word / verse group alongside the
   // scripture column.
   scrollNonce: number;
+  // Explicit "show this tab" request. Only the lint go-to sets it (Shell's
+  // requestJumpTab) — a plain scrollNonce bump ("go to active", an unsaved-
+  // changes toast jump) must scroll without moving the panel off the tab the
+  // user chose. `n` distinguishes successive requests so a consumed one can't
+  // re-fire.
+  jumpTab?: { tab: ResourceTab; n: number } | null;
   onNoteChange: (id: string, patch: Partial<TnRow>) => void;
   onNoteSave: (
     id: string,
@@ -337,6 +343,7 @@ export function ResourceColumn({
   findNoteQuery,
   activeNoteMatch,
   scrollNonce,
+  jumpTab = null,
   onNoteChange,
   onNoteSave,
   onNoteDelete,
@@ -669,6 +676,7 @@ export function ResourceColumn({
   //     a find/replace match, a lint "go to issue")
   //   - activeNoteId / activeWordId / activeQuestionId (focus shifts that
   //     came from elsewhere)
+  //   - jumpTab (an explicit lint go-to tab request)
   //   - activeVerse (timeline click, especially relevant when a section is
   //     pinned and the user wants to jump into that verse's group)
   //   - pinned.* (pin toggles, so the user lands on the same conceptual
@@ -681,8 +689,11 @@ export function ResourceColumn({
   // Carries "this jump should center, not just nudge into view" across the
   // extra render a tab switch costs below — scrollNonce (and so `fromButton`)
   // has already been consumed by the time the newly-mounted tab's target
-  // exists to scroll to, but the jump is still the same user action.
+  // exists to scroll to, but the jump is still the same user action. Cleared
+  // on EVERY terminal path below: left set, a later unrelated active-id change
+  // would scroll with block:"center" and jerk the list.
   const centerPendingRef = useRef(false);
+  const prevJumpTabNonceRef = useRef(jumpTab?.n ?? 0);
   useEffect(() => {
     const root = scrollBodyRef.current;
     if (!root) return;
@@ -702,21 +713,23 @@ export function ResourceColumn({
     // card is trashed, which would otherwise jerk the list back to the top of
     // the verse's note group.
     const navTriggered = fromButton || verseChanged || pinChanged;
-    // An explicit external jump (scrollNonce bump) that targets a resource on
-    // a tab the user isn't currently viewing must switch tabs first — e.g. a
-    // tq/twl lint "go to issue" arriving while the Notes tab (the default) is
-    // showing. Same-tab jumps (e.g. clicking a note while already on Notes)
-    // leave resourceTab alone.
-    if (fromButton) {
-      const wantsTab: ResourceTab | null = activeNoteId
-        ? "notes"
-        : activeWordId
-          ? "words"
-          : activeQuestionId
-            ? "questions"
-            : null;
-      if (wantsTab && wantsTab !== resourceTab) showResource(wantsTab);
-    }
+    // A caller that explicitly asked for a tab (only the lint "go to issue" —
+    // see Shell's requestJumpTab) switches to it first, so a tq/twl finding
+    // arriving on the default Notes tab actually shows its row. Deliberately
+    // NOT inferred from the active*Id trio on any scrollNonce bump: "go to
+    // active" and the unsaved-changes toasts bump the nonce with no such
+    // intent and would otherwise yank the panel back to the wrong tab.
+    const jumpNonce = jumpTab?.n ?? 0;
+    const fromJumpTab = prevJumpTabNonceRef.current !== jumpNonce;
+    prevJumpTabNonceRef.current = jumpNonce;
+    const switchingTab = fromJumpTab && !!jumpTab && jumpTab.tab !== resourceTab;
+    if (switchingTab && jumpTab) showResource(jumpTab.tab);
+    // Every path out of here drops the pending-center flag, EXCEPT the one pass
+    // that just asked for a tab switch — that pass has no mounted target yet
+    // and hands the center off to the re-run resourceTab triggers.
+    const clearCenter = () => {
+      if (!switchingTab) centerPendingRef.current = false;
+    };
     let target: HTMLElement | null = null;
     let isVerseGroup = false;
     if (activeNoteId) {
@@ -760,6 +773,7 @@ export function ResourceColumn({
     // scroll wherever the previous verse left it.
     if (!target && verseChanged && !pinned.notes && !pinned.words && !pinned.questions) {
       root.scrollTo({ top: 0, behavior: "auto" });
+      clearCenter();
       return;
     }
     if (target) {
@@ -768,9 +782,12 @@ export function ResourceColumn({
         block: isVerseGroup ? "start" : atVerseEnd ? "end" : centerPendingRef.current ? "center" : "nearest",
       });
       centerPendingRef.current = false;
+      return;
     }
+    clearCenter();
   }, [
     scrollNonce,
+    jumpTab,
     activeNoteId,
     activeWordId,
     activeQuestionId,
@@ -778,9 +795,9 @@ export function ResourceColumn({
     pinned.notes,
     pinned.words,
     pinned.questions,
-    // resourceTab: a tab switch triggered by this same effect (below) mounts
-    // the target's DOM for the first time — re-run so the scroll it deferred
-    // above can actually happen against a target that now exists.
+    // resourceTab: a tab switch triggered by this same effect (the jumpTab
+    // branch above) mounts the target's DOM for the first time — re-run so the
+    // scroll it deferred can actually happen against a target that now exists.
     resourceTab,
   ]);
 

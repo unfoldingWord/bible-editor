@@ -181,7 +181,19 @@ let pendingRowJump: {
   chapter: number;
   kind: "tn" | "tq" | "twl";
   rowId: string;
+  // Only a lint "go to issue" asks the resource column to change tabs on
+  // arrival (see requestJumpTab). A find-overlay TN match leaves the tab
+  // alone, matching the pre-#669 behaviour.
+  switchTab?: boolean;
 } | null = null;
+
+// Which resource tab owns each row kind — used by the lint go-to's explicit
+// tab request.
+const TAB_FOR_ROW_KIND = {
+  tn: "notes",
+  tq: "questions",
+  twl: "words",
+} as const;
 
 // Stable empty list so the popover's `threads` prop doesn't churn identity while
 // a target has no threads yet.
@@ -722,6 +734,22 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // when the active selection changes through other paths).
   const [scrollNonce, setScrollNonce] = useState(0);
   const requestScrollToActive = useCallback(() => setScrollNonce((n) => n + 1), []);
+
+  // Explicit "switch the resource column to this tab" signal. Deliberately a
+  // channel of its own rather than something the resource column infers from a
+  // scrollNonce bump: the toolbar "go to active" button and the unsaved-changes
+  // toasts bump scrollNonce with no intent to change tabs, and inferring a tab
+  // from whichever active*Id happened to be set yanked the panel back (e.g.
+  // click a note, switch to Words, press "go to active" → back to Notes).
+  // Only the lint go-to below sets this. `n` makes each request distinct so a
+  // consumed one can't re-fire on an unrelated re-render.
+  const [jumpTab, setJumpTab] = useState<{ tab: "notes" | "questions" | "words"; n: number } | null>(
+    null,
+  );
+  const requestJumpTab = useCallback(
+    (tab: "notes" | "questions" | "words") => setJumpTab((prev) => ({ tab, n: (prev?.n ?? 0) + 1 })),
+    [],
+  );
 
   const [splitRatio, setSplitRatio] = useState<number | null>(null);
   const splitContainerRef = useRef<HTMLDivElement>(null);
@@ -1949,13 +1977,15 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // (book mode) routes through the URL so the chapter payload reloads; the
   // common same-chapter case just focuses the verse + note, and the bumped
   // scrollNonce makes the resource column scroll it into view.
+  // `switchTab` is opt-in and only the lint go-to passes it — the find overlay
+  // must not move the user off the tab they're on.
   const focusNoteMatch = useCallback(
-    (ch: number, v: number, noteId: string) => {
+    (ch: number, v: number, noteId: string, switchTab = false) => {
       runWithDirtyGate(() => {
         if (ch !== chapter) {
           // The hash carries only book/chapter/verse; stash the note id so the
           // remounted Shell can activate + scroll to it once its payload loads.
-          pendingRowJump = { book, chapter: ch, kind: "tn", rowId: noteId };
+          pendingRowJump = { book, chapter: ch, kind: "tn", rowId: noteId, switchTab };
           onNavigate?.(book, ch, v);
           return;
         }
@@ -1963,10 +1993,11 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         setActiveWordId(null);
         setActiveQuestionId(null);
         setActiveNoteId(noteId);
+        if (switchTab) requestJumpTab("notes");
         setScrollNonce((n) => n + 1);
       });
     },
-    [runWithDirtyGate, chapter, book, onNavigate],
+    [runWithDirtyGate, chapter, book, onNavigate, requestJumpTab],
   );
 
   // tq/twl equivalents of focusNoteMatch above — same cross-chapter stash /
@@ -1975,10 +2006,10 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
   // finding always carries a rowId — see api/src/lint.ts's lintTqRows /
   // lintTwlRows).
   const focusQuestionMatch = useCallback(
-    (ch: number, v: number, questionId: string) => {
+    (ch: number, v: number, questionId: string, switchTab = false) => {
       runWithDirtyGate(() => {
         if (ch !== chapter) {
-          pendingRowJump = { book, chapter: ch, kind: "tq", rowId: questionId };
+          pendingRowJump = { book, chapter: ch, kind: "tq", rowId: questionId, switchTab };
           onNavigate?.(book, ch, v);
           return;
         }
@@ -1986,17 +2017,18 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         setActiveNoteId(null);
         setActiveWordId(null);
         setActiveQuestionId(questionId);
+        if (switchTab) requestJumpTab("questions");
         setScrollNonce((n) => n + 1);
       });
     },
-    [runWithDirtyGate, chapter, book, onNavigate],
+    [runWithDirtyGate, chapter, book, onNavigate, requestJumpTab],
   );
 
   const focusWordMatch = useCallback(
-    (ch: number, v: number, wordId: string) => {
+    (ch: number, v: number, wordId: string, switchTab = false) => {
       runWithDirtyGate(() => {
         if (ch !== chapter) {
-          pendingRowJump = { book, chapter: ch, kind: "twl", rowId: wordId };
+          pendingRowJump = { book, chapter: ch, kind: "twl", rowId: wordId, switchTab };
           onNavigate?.(book, ch, v);
           return;
         }
@@ -2004,10 +2036,11 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
         setActiveNoteId(null);
         setActiveQuestionId(null);
         setActiveWordId(wordId);
+        if (switchTab) requestJumpTab("words");
         setScrollNonce((n) => n + 1);
       });
     },
-    [runWithDirtyGate, chapter, book, onNavigate],
+    [runWithDirtyGate, chapter, book, onNavigate, requestJumpTab],
   );
 
   // Jump to a lint issue from the topbar indicator. `ref` is "chapter:verse"
@@ -2024,16 +2057,18 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
       const v = vStr ? parseInt(vStr, 10) : 1;
       const verse = Number.isNaN(v) ? 1 : v;
       if (issue.rowId) {
+        // switchTab: a lint finding almost always arrives while a different
+        // tab is showing, so this is the one path that may move the panel.
         if (issue.resource === "tn") {
-          focusNoteMatch(ch, verse, issue.rowId);
+          focusNoteMatch(ch, verse, issue.rowId, true);
           return;
         }
         if (issue.resource === "tq") {
-          focusQuestionMatch(ch, verse, issue.rowId);
+          focusQuestionMatch(ch, verse, issue.rowId, true);
           return;
         }
         if (issue.resource === "twl") {
-          focusWordMatch(ch, verse, issue.rowId);
+          focusWordMatch(ch, verse, issue.rowId, true);
           return;
         }
       }
@@ -2110,14 +2145,26 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     if (!jump) return;
     if (jump.book !== book || jump.chapter !== chapter) return;
     if (!data) return;
+    // Wait for THIS chapter's payload: useChapter keeps the previous chapter's
+    // rows visible while the new ones load, so a miss against stale data would
+    // wrongly look like a deleted row.
+    if (data.chapter !== chapter) return;
     const rows = jump.kind === "tn" ? data.tn : jump.kind === "tq" ? data.tq : data.twl;
-    if (!rows.some((r) => r.id === jump.rowId)) return;
+    if (!rows.some((r) => r.id === jump.rowId)) {
+      // The chapter loaded and the row isn't in it — a stale lint report, or the
+      // row was deleted. Drop the stash instead of leaving it to fire on some
+      // unrelated later visit to this chapter.
+      pendingRowJump = null;
+      return;
+    }
+    const { switchTab, kind } = jump;
     pendingRowJump = null;
-    setActiveNoteId(jump.kind === "tn" ? jump.rowId : null);
-    setActiveQuestionId(jump.kind === "tq" ? jump.rowId : null);
-    setActiveWordId(jump.kind === "twl" ? jump.rowId : null);
+    setActiveNoteId(kind === "tn" ? jump.rowId : null);
+    setActiveQuestionId(kind === "tq" ? jump.rowId : null);
+    setActiveWordId(kind === "twl" ? jump.rowId : null);
+    if (switchTab) requestJumpTab(TAB_FOR_ROW_KIND[kind]);
     setScrollNonce((n) => n + 1);
-  }, [data, book, chapter]);
+  }, [data, book, chapter, requestJumpTab]);
 
   // Consume a comment deep link — `?c=<id>` in the hash (initialCommentId).
   // Waits for this chapter's comments to load and for that id to actually be
@@ -2166,7 +2213,12 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
     }
     consumedCommentKeyRef.current = key;
     setActiveVerse(comment.verse);
+    // Set the focus id matching the comment's row kind and clear the other two
+    // — the trio must stay consistent (same rule goToLintIssue follows), or a
+    // stale question/word highlight lingers from wherever focus was before.
     setActiveNoteId(comment.rowKind === "tn" ? comment.rowId : null);
+    setActiveQuestionId(comment.rowKind === "tq" ? comment.rowId : null);
+    setActiveWordId(comment.rowKind === "twl" ? comment.rowId : null);
     // No clicked element on a deep-link arrival, so anchor stays null and the
     // popover falls back to the centred anchor.
     setCommentPanel({
@@ -3396,6 +3448,7 @@ export function Shell({ book, chapter, initialVerse = 1, onNavigate, bookHook, o
           findNoteQuery={findNoteQuery}
           activeNoteMatch={activeNoteMatch}
           scrollNonce={scrollNonce}
+          jumpTab={jumpTab}
           onNoteChange={(id, patch) => {
             applyLocalRowPatch("tn", id, patch);
           }}
