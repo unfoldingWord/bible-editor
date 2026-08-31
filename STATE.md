@@ -396,23 +396,33 @@ Highlights that bite repeatedly:
   de-alignment from a revision mismatch — **for wording only.** Never let it narrow the refusal *decision*:
   that exemption is exactly what let the 1CH 4:21 collateral loss ship (see the warning comment in
   `alignmentDelta.ts`).
-- **The `deferredreward/bible-editor-multilingual` downstream fork is not a source of unmerged fixes for us —
-  check their own sync doc before re-triaging from scratch.** It forked at `7f83a398` (2026-07-13) and has
-  since rearchitected into a multi-tenant product (workspaces, per-org config, an `aquifer`/articles import
-  pipeline, an AI-provider BYO-key system, a "flows" UI) with no equivalent surface here. Their own
-  `docs/upstream-sync-2026-08-21.md` (in their repo, not ours) records that they actively triage *our* commits
-  into *their* fork — 298 of our commits reviewed, ~40 ported, the rest deferred or "ruled not applicable
-  (fork verified)" because the subsystem doesn't exist on their side (book locks, comments/mentions,
-  alignment_attention, occurrenceRule, etc.). That list is the mirror image of what would be relevant in the
-  other direction: on 2026-08-24 every candidate backend fix sampled from their commits since the fork point
-  (shrink-guard master-404 bootstrap, force-wipe safety-gate widening, cross-source tn/tq id remap, DCS-fetch
-  error surfacing) was either already superseded by more mature protections already in our `shrinkGuard.ts`/
-  `exportWorkflow.ts`/`bookReimport.ts`, or tied to a feature (multi-source import, admin force-reimport,
-  per-org routing) that doesn't exist in this codebase. Their 3 commits since their own sync
-  (`655e9f6`/`556919e`/`b631959`, 2026-08-22) are all fixes to their own "flows"/admin-desk React components
-  that have no counterpart here. **Next time this routine runs:** read their `docs/upstream-sync-*.md` first
-  (it names the merge-base and what they've already absorbed from us), then diff commits after their latest
-  sync doc's date rather than re-walking the full history back to `7f83a398`.
+- **The `deferredreward/bible-editor-multilingual` downstream fork is mostly not a source of unmerged fixes for
+  us, but their shared (non-multi-tenant) rendering modules — `web/src/lib/highlight.ts` in particular — are
+  worth a real diff, not just their sync-doc summary.** It forked at `7f83a398` (2026-07-13) and has since
+  rearchitected into a multi-tenant product (workspaces, per-org config, an `aquifer`/articles import pipeline,
+  an AI-provider BYO-key system, a "flows" UI) with no equivalent surface here — but `highlight.ts` stayed
+  byte-identical to ours for long stretches, so their bug-fix commits against it are directly portable. On
+  2026-08-31, checked their history through HEAD `d0408de` (2026-08-28) and found 7 genuinely applicable
+  `highlight.ts` fixes whose pre-fix code matched ours byte-for-byte, all ported (see `web/src/lib/highlight.ts`,
+  `highlightStyles.ts`, and new regression cases in `highlight.test.mjs`/`replace.test.mjs`):
+  `7e73e7e` (edge-punctuation stripping in quote matching, #322), `339b480` (render `\qs`/Selah character-wrapper
+  content, #345), `fab1e6b` (descend `\qs` wrappers collecting milestone target words, #331), `c0fbeaf` (descend
+  wrappers collecting milestone runs + source words, #331), `1a2798d` (`\b`/`\ts\*` render↔baseline parity, #386
+  — applied before `cee5da8` here since the fork's own history has it first and `cee5da8`'s diff assumes it),
+  `cee5da8` (open-span tracking so a `\qs`/`\d` wrapper's styling never crosses a segment boundary, #357),
+  `d0408de` (gate the `\d` superscription render branch on the tag alone — usfm-js 3.5.0 never emits
+  `type:"section"` for a real `\d`, #384). One more was identified but **not** ported: `affc9ff` (descend `\qs`
+  wrappers in the quote picker, touching `web/src/lib/quoteBuilder.ts`'s `collectTargetTokens`) is a real bug but
+  not a mechanical port — the fork's `collectUhbWords`/`collectTargetTokens` is a different single-walk design
+  than our `quoteBuilder.ts`'s `MilestoneRecord`-based walk, so it needs hand-adaptation. Left for a future
+  session, ideally bundled with re-verifying picker/matcher parity now that the matcher side has moved (this
+  sync's #331 fixes). Their own `docs/upstream-sync-2026-08-21.md` and `docs/upstream-sync-2026-08-28.md` (in
+  their repo, not ours) record their side of the sync — *our* commits triaged into *their* fork, ~40 ported —
+  which is the mirror image of this check and not itself a source of fixes for us. **Next time this routine
+  runs:** diff `web/src/lib/highlight.ts` (and any other shared, non-multi-tenant `lib/` module) against fork
+  commits after `d0408de` (2026-08-28) — check their `docs/upstream-sync-*.md` past that date first for the
+  merge-base, then look for the equivalent byte-identical-pre-fix pattern rather than trusting their sync doc's
+  "not applicable" verdicts alone, since that doc is written from their side of the diff, not ours.
 
 ## Stop conditions / goals
 

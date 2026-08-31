@@ -6,6 +6,7 @@
 // Not a test framework; failures exit non-zero. Mirrors
 // src/lib/alignment.test.mjs.
 
+import usfm from "usfm-js";
 import {
   smartEditVerse,
   smartReplaceVerse,
@@ -14,7 +15,8 @@ import {
   __reanchorMarkersForTest as reanchorMarkers,
   __stripMarkerTokensForTest as stripMarkerTokens,
 } from "./replace.ts";
-import { extractEditableText, extractPlainText } from "./usfm.ts";
+import { extractEditableText, extractPlainText, normalizeEditable } from "./usfm.ts";
+import { renderHighlightedHTML, renderEditableHTML } from "./highlight.ts";
 import { analyzeAlignmentDelta } from "./alignmentDelta.ts";
 
 let failed = 0;
@@ -2539,6 +2541,233 @@ function countAligned(content) {
     `a marker-only deletion is still honored (got ${JSON.stringify(extractEditableText(pure.content))})`,
   );
   assert(!pure.markerCaptureGuarded, "the honored deletion raises no override notice");
+}
+
+// ─── Downstream-sync ports: highlight.ts rendering fixes (2026-08-31) ─────────
+// The four cases below (S1-S4) port render/save-path regressions found and
+// fixed in the deferredreward/bible-editor-multilingual fork (issues #345,
+// #357, #386, #384) whose pre-fix code was byte-identical to this repo's
+// highlight.ts. All four exercise the SAME hazard shape: segmentByParagraphs
+// drops or misrenders content that extractEditableText still surfaces, so
+// Shell.saveVerseDraft's no-op guard (which diffs the editable render's DOM
+// textContent against extractEditableText) misses and a zero-typing blur/Save
+// fires a real PATCH that can silently delete verse content or alignment.
+// Every case therefore asserts render↔baseline parity, not just "does it
+// render" — a substring check alone passed on some of these bugs too.
+
+const textContentOf = (html) =>
+  html
+    .replace(/<[^>]*>/g, "")
+    .replace(/&#8203;/g, "​")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&amp;/g, "&");
+
+// A generic tag-nesting validator (ported from the fork's Case 47c helper).
+// The failure mode IS crossing/unbalanced HTML tags, so a substring check
+// ("does the html contain X") passes on broken output too — walk the tag
+// stack instead.
+function nestingErrors(html) {
+  const errs = [];
+  const stack = [];
+  const re = /<(\/?)([A-Za-z][\w-]*)\b[^>]*?(\/?)>/g;
+  let m;
+  while ((m = re.exec(html)) !== null) {
+    const [, closing, name, selfClosing] = m;
+    if (selfClosing) continue;
+    if (closing) {
+      const top = stack.pop();
+      if (top !== name) errs.push(`</${name}> closes <${top ?? "nothing"}> in ${JSON.stringify(html)}`);
+    } else {
+      stack.push(name);
+    }
+  }
+  if (stack.length > 0) errs.push(`unclosed <${stack.join(">, <")}> in ${JSON.stringify(html)}`);
+  return errs;
+}
+
+// --- S1: a well-closed \qs Selah must render + round-trip an edit elsewhere
+// (issue #345). Real production shape (qs → zaln → w), parsed from actual
+// USFM per repo convention — a hand-built tree is exactly what let the
+// inverted-nesting premise hide upstream.
+{
+  console.log("\n[Case S1] Classic render of a well-closed \\qs (Selah) verse shows Selah (#345)");
+  const target = String.raw`\id PSA
+\c 3
+\p
+\v 8 \q1 \zaln-s |x-strong="H3068" x-content="יְהוָה"\*\w Salvation belongs to Yahweh|x-occurrence="1" x-occurrences="1"\w*\zaln-e\*. \qs \zaln-s |x-strong="H5542" x-lemma="סֶלָה" x-content="סֶלָה"\*\w Selah|x-occurrence="1" x-occurrences="1"\w*\zaln-e\*\qs*
+`;
+  const tvo = usfm.toJSON(target).chapters["3"]["8"].verseObjects;
+
+  const shown = renderHighlightedHTML(tvo, new Set());
+  assert(shown.includes("Selah"), `renderHighlightedHTML shows "Selah" (got ${JSON.stringify(shown)})`);
+  assert(shown.includes("Salvation belongs to Yahweh"), "renderHighlightedHTML still shows the rest of the verse");
+
+  const editable = renderEditableHTML(tvo, new Set());
+  assert(editable.includes("Selah"), `renderEditableHTML shows "Selah" (got ${JSON.stringify(editable)})`);
+  assert(!editable.includes("be-tok-qs"), "renderEditableHTML emits no spurious \\qs marker chip");
+  assert(editable.includes('class="be-qs"'), "the wrapper carries its .be-qs styling class (#357)");
+
+  // The REAL classic save path: Shell.saveVerseDraft diffs the contentEditable's
+  // DOM textContent (== textContent of renderEditableHTML's output) against
+  // extractEditableText(base) as a no-op guard, then runs smartEditVerse. So the
+  // displayed text MUST be derived from the renderer, never the baseline string.
+  const baseline = extractEditableText({ verseObjects: tvo });
+  const displayed = textContentOf(editable);
+  assert(
+    normalizeEditable(displayed) === baseline,
+    `displayed textContent matches the diff baseline (displayed ${JSON.stringify(normalizeEditable(displayed))} vs baseline ${JSON.stringify(baseline)})`,
+  );
+
+  // A real edit far from Selah, applied to the DISPLAYED text, round-trips
+  // with Selah + its H5542 alignment intact.
+  const typed = displayed.replace("Salvation", "Rescue");
+  const edited = smartEditVerse({ verseObjects: tvo }, baseline, typed);
+  assert(edited.plainText.includes("Selah"), `edit keeps "Selah" in plain text (got ${JSON.stringify(edited.plainText)})`);
+  assert(edited.plainText.includes("Rescue"), "edit applied (Salvation → Rescue)");
+  const selahAfter = alignedWords(edited.content).find((x) => x.text === "Selah");
+  assert(!!selahAfter, "'Selah' survives the classic-editor edit");
+}
+
+// --- S2: an UNCLOSED \qs Selah — a real corpus shape — must not cross a
+// segment boundary (issue #357). usfm-js nests everything that follows an
+// unclosed `\qs Selah` (including the next `\q1`) UNDER the wrapper node.
+// segmentByParagraphs opened `<span class="be-qs">`, walked the children
+// (pushing a new block-level segment for the `\q1`), then closed the span in
+// whatever segment was current by then — crossing HTML that the browser
+// repairs by dropping the following line, while extractEditableText keeps it.
+{
+  console.log("\n[Case S2] Unclosed \\qs wrapper: span stays inside its own segment (#357)");
+  const target = String.raw`\id PSA
+\c 3
+\q1
+\v 8 \zaln-s |x-strong="H3068" x-content="יְהוָה"\*\w Salvation|x-occurrence="1" x-occurrences="1"\w*\zaln-e\*. \qs \zaln-s |x-strong="H5542" x-lemma="סֶלָה" x-content="סֶלָה"\*\w Selah|x-occurrence="1" x-occurrences="1"\w*\zaln-e\*
+\q1 next line here
+`;
+  const tvo = usfm.toJSON(target).chapters["3"]["8"].verseObjects;
+  const qs = tvo.find((n) => n && n.tag === "qs");
+  assert(!!qs && qs.endTag === "", "premise: usfm-js parsed \\qs as an unclosed wrapper");
+  assert(
+    !!qs && (qs.children ?? []).some((c) => c && c.tag === "q1"),
+    "premise: usfm-js nested the following \\q1 UNDER the unclosed \\qs",
+  );
+
+  for (const [label, html] of [
+    ["renderHighlightedHTML", renderHighlightedHTML(tvo, new Set())],
+    ["renderEditableHTML", renderEditableHTML(tvo, new Set())],
+  ]) {
+    assert(nestingErrors(html).length === 0, `${label}: valid nesting — ${nestingErrors(html).join("; ")}`);
+    assert(html.includes("Selah"), `${label}: renders "Selah" (got ${JSON.stringify(html)})`);
+    assert(html.includes("next line here"), `${label}: renders the line after the unclosed wrapper (got ${JSON.stringify(html)})`);
+    assert(
+      (html.match(/class="be-qs"/g) ?? []).length === 1,
+      `${label}: .be-qs styling does not leak onto the following line (got ${JSON.stringify(html)})`,
+    );
+  }
+
+  const baseline = extractEditableText({ verseObjects: tvo });
+  const displayed = textContentOf(renderEditableHTML(tvo, new Set()));
+  assert(
+    normalizeEditable(displayed) === baseline,
+    `displayed textContent matches the diff baseline across the unclosed wrapper (displayed ${JSON.stringify(normalizeEditable(displayed))} vs baseline ${JSON.stringify(baseline)})`,
+  );
+  const typed = displayed.replace("Salvation", "Rescue");
+  const edited = smartEditVerse({ verseObjects: tvo }, baseline, typed);
+  assert(edited.plainText.includes("Selah"), `edit keeps "Selah" (got ${JSON.stringify(edited.plainText)})`);
+  assert(edited.plainText.includes("next line here"), "edit keeps the line after the unclosed wrapper");
+}
+
+// --- S3: \b / \ts\* render↔baseline parity + content after \b survives
+// (issue #386). Two hazards: (A) segmentsToHtml emitted the \b/\ts\* chip with
+// NO trailing space while extractEditableText emits "\b " / "\ts\* " — one
+// space apart, so a zero-typing blur PATCHed. (B) content after a \b
+// accumulated into the (discarded) blank segment's html and vanished from the
+// render while the baseline kept it.
+{
+  console.log("\n[Case S3] \\b spacer: render↔baseline parity + text after \\b survives (#386)");
+  const shapeA = String.raw`\id PSA
+\c 3
+\p
+\v 8 Salvation. \qs Selah\qs*
+\b
+\q1 next line here
+`;
+  const voA = usfm.toJSON(shapeA).chapters["3"]["8"].verseObjects;
+  const baselineA = extractEditableText({ verseObjects: voA });
+  const displayedA = normalizeEditable(textContentOf(renderEditableHTML(voA, new Set())));
+  assert(
+    displayedA === baselineA,
+    `editable textContent matches the diff baseline across \\b (displayed ${JSON.stringify(displayedA)} vs baseline ${JSON.stringify(baselineA)})`,
+  );
+
+  const shapeB = String.raw`\id PSA
+\c 3
+\p
+\v 2 Before.
+\b
+after blank
+`;
+  const voB = usfm.toJSON(shapeB).chapters["3"]["2"].verseObjects;
+  const shownB = textContentOf(renderHighlightedHTML(voB, new Set()));
+  assert(shownB.includes("after blank"), `text after \\b survives into the render (got ${JSON.stringify(shownB)})`);
+  const baselineB = extractEditableText({ verseObjects: voB });
+  const displayedB = normalizeEditable(textContentOf(renderEditableHTML(voB, new Set())));
+  assert(
+    displayedB === baselineB,
+    `editable textContent matches baseline with text after \\b (displayed ${JSON.stringify(displayedB)} vs baseline ${JSON.stringify(baselineB)})`,
+  );
+}
+
+// --- S4: a real \d Psalm superscription must render (issue #384). usfm-js
+// 3.5.0 parses a real `\d …` as `{tag:"d", text}` with NO `type` (only
+// \s/\s1…\s5 get `type:"section"`), so the old `type:"section" && tag:"d"`
+// render gate matched nothing usfm.toJSON ever emits, and the superscription
+// silently dropped from the render while extractEditableText kept it.
+{
+  console.log("\n[Case S4] Real \\d superscription renders + parity (#384)");
+  const textD = String.raw`\id PSA
+\c 3
+\p
+\v 1 \d A psalm of David
+\q1 next line here
+`;
+  const tvo = usfm.toJSON(textD).chapters["3"]["1"].verseObjects;
+  const dNode = tvo.find((n) => n && n.tag === "d");
+  assert(!!dNode && dNode.type === undefined, `premise: \\d parses as {tag:"d"} with no type (got ${JSON.stringify(dNode)})`);
+
+  const shown = renderHighlightedHTML(tvo, new Set());
+  assert(shown.includes("A psalm of David"), `renderHighlightedHTML shows the superscription (got ${JSON.stringify(shown)})`);
+  assert(shown.includes("be-d"), "superscription rendered inside a .be-d span");
+  assert(shown.includes("next line here"), "the following \\q1 line still renders");
+
+  const editable = renderEditableHTML(tvo, new Set());
+  const baseline = extractEditableText({ verseObjects: tvo });
+  assert(baseline.includes("A psalm of David"), "extractEditableText baseline surfaces the superscription");
+  assert(
+    normalizeEditable(textContentOf(editable)) === baseline,
+    `displayed textContent matches the diff baseline (displayed ${JSON.stringify(normalizeEditable(textContentOf(editable)))} vs baseline ${JSON.stringify(baseline)})`,
+  );
+
+  // Aligned \d — the superscription text is an aligned \zaln/\w sibling of the
+  // (empty) \d node.
+  const alignedD = String.raw`\id PSA
+\c 3
+\p
+\v 1 \d \zaln-s |x-strong="H4210" x-content="מִזְמֹור"\*\w A psalm of David|x-occurrence="1" x-occurrences="1"\w*\zaln-e\*
+\q1 next line here
+`;
+  const avo = usfm.toJSON(alignedD).chapters["3"]["1"].verseObjects;
+  const shownA = renderHighlightedHTML(avo, new Set());
+  assert(shownA.includes("A psalm of David"), `aligned superscription renders (got ${JSON.stringify(shownA)})`);
+  const editableA = renderEditableHTML(avo, new Set());
+  const baselineA = extractEditableText({ verseObjects: avo });
+  assert(
+    normalizeEditable(textContentOf(editableA)) === baselineA,
+    `aligned displayed textContent matches baseline (displayed ${JSON.stringify(normalizeEditable(textContentOf(editableA)))} vs baseline ${JSON.stringify(baselineA)})`,
+  );
 }
 
 if (failed > 0) {

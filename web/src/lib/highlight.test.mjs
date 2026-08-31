@@ -6,8 +6,13 @@
 // quoting the whole second sentence left "the meat of" and "their hooves" dark
 // in the UST and the 2nd/4th "not" dark in the ULT.
 
+import usfm from "usfm-js";
 import {
   findTargetHighlights,
+  findSourceHighlights,
+  findSourceForTargetText,
+  matchSourceTokens,
+  extractTargetSelectionText,
   isPaintableHtml,
   leadingBreakClass,
   overlayFindMarks,
@@ -572,6 +577,183 @@ const JOIN = "⁠";
     isPaintableHtml('<div class="be-q-1">​word</div>') === true,
     "a filler next to real text is still paintable",
   );
+}
+
+// --- 25. Edge-punctuation quote matching (issue #322, ported from downstream
+// fork commit 7e73e7e). en_tn quotes are cut straight out of the verse, so
+// they carry sentence punctuation the OL `\w` token does not — MRK 13:2's
+// figs-activepassive quote ends "… ἐπὶ λίθον, ὃς …" while the UGNT `\w` is a
+// bare "λίθον" (the comma lives in a sibling text node). matchNorm now strips
+// a conservative edge-punctuation class from both sides of every quote↔token
+// equality; gap markers ("&", "…", "...") and the maqqef still split BEFORE
+// any stripping, so they are untouched.
+{
+  const gw = (text, occurrence = 1, occurrences = 1) => ({
+    type: "word", tag: "w", text,
+    occurrence: String(occurrence), occurrences: String(occurrences),
+  });
+  const gt = (text) => ({ type: "text", text });
+  const ugnt = [
+    gw("καὶ"), gt(" "), gw("ὁ"), gt(" "), gw("Ἰησοῦς"), gt(" "),
+    gw("εἶπεν"), gt(" "), gw("αὐτῷ"), gt(", "),
+    gw("βλέπεις"), gt(" "), gw("ταύτας"), gt(" "), gw("τὰς"), gt(" "),
+    gw("μεγάλας"), gt(" "), gw("οἰκοδομάς"), gt("? "),
+    gw("οὐ", 1, 2), gt(" "), gw("μὴ", 1, 2), gt(" "), gw("ἀφεθῇ"), gt(" "),
+    gw("ὧδε"), gt(" "), gw("λίθος"), gt(" "), gw("ἐπὶ"), gt(" "),
+    gw("λίθον"), gt(", "), gw("ὃς"), gt(" "),
+    gw("οὐ", 2, 2), gt(" "), gw("μὴ", 2, 2), gt(" "), gw("καταλυθῇ"), gt("."),
+  ];
+
+  const quoted = "οὐ μὴ ἀφεθῇ ὧδε λίθος ἐπὶ λίθον, ὃς οὐ μὴ καταλυθῇ";
+  const bare = "οὐ μὴ ἀφεθῇ ὧδε λίθος ἐπὶ λίθον ὃς οὐ μὴ καταλυθῇ";
+  const matched = matchSourceTokens(ugnt, quoted, 1);
+  assert(matched.length === 11, `comma-bearing quote resolves all 11 source words (got ${matched.length})`);
+  assert(
+    matched.map((t) => t.text).join(" ") === bare,
+    `matched tokens are the phrase in document order (got ${JSON.stringify(matched.map((t) => t.text).join(" "))})`,
+  );
+  assert(
+    JSON.stringify(matchSourceTokens(ugnt, bare, 1)) === JSON.stringify(matched),
+    "comma-bearing and comma-free quotes resolve identically",
+  );
+  const hlSrc = findSourceHighlights(ugnt, quoted, 1);
+  assert(hlSrc.has("λίθον|1"), `λίθον lights from the comma-bearing quote (got ${[...hlSrc].join(",")})`);
+  assert(!hlSrc.has("βλέπεις|1"), `quote must NOT bleed onto βλέπεις (got ${[...hlSrc].join(",")})`);
+  assert(
+    matchSourceTokens(ugnt, "μεγάλας οἰκοδομάς?", 1).length === 2,
+    "trailing Greek question mark strips (μεγάλας οἰκοδομάς?)",
+  );
+  assert(
+    matchSourceTokens(ugnt, "«καταλυθῇ.»", 1).length === 1,
+    "surrounding guillemets + full stop strip («καταλυθῇ.»)",
+  );
+  // A token that is nothing but punctuation is dropped, not matched as "".
+  assert(matchSourceTokens(ugnt, ",", 1).length === 0, "a punctuation-only quote matches nothing");
+  assert(
+    matchSourceTokens(ugnt, "οὐ μὴ , ἀφεθῇ", 1).length === 3,
+    "an orphan comma token is dropped without breaking adjacency",
+  );
+  // Gap markers still split FIRST — punctuation stripping must never eat one.
+  for (const [label, gapQuote, expect] of [
+    ["&", "ἐπὶ λίθον, & καταλυθῇ", ["ἐπὶ", "λίθον", "καταλυθῇ"]],
+    ["...", "λίθον...καταλυθῇ", ["λίθον", "καταλυθῇ"]],
+  ]) {
+    const got = matchSourceTokens(ugnt, gapQuote, 1).map((t) => t.text);
+    assert(got.join(" ") === expect.join(" "), `gap marker ${label} still resolves (got ${JSON.stringify(got.join(" "))})`);
+  }
+  // Occurrence selection is unaffected by stripping.
+  const occ2 = matchSourceTokens(ugnt, "οὐ μὴ", 2);
+  assert(
+    occ2.map((t) => t.occurrence).join(",") === "2,2",
+    `οὐ μὴ occ 2 picks the second instance (got ${occ2.map((t) => t.occurrence).join(",")})`,
+  );
+  assert(
+    JSON.stringify(matchSourceTokens(ugnt, "οὐ μὴ,", 2)) === JSON.stringify(occ2),
+    "a trailing comma does not shift which occurrence is chosen",
+  );
+  // Hebrew side: sof pasuq / paseq / a trailing comma all strip too; maqqef
+  // is still a SEPARATOR, not stripped punctuation.
+  const hw = (text) => ({ type: "word", tag: "w", text });
+  const hebVo = [hw("דָּבָר"), hw("יְהוָ֑ה"), hw("צְבָאֽוֹת")];
+  for (const [label, hebQuote] of [
+    ["sof pasuq", "יְהוָ֑ה צְבָאֽוֹת׃"],
+    ["paseq", "יְהוָ֑ה ׀ צְבָאֽוֹת"],
+    ["comma", "יְהוָ֑ה צְבָאֽוֹת,"],
+  ]) {
+    const hlHeb = findSourceHighlights(hebVo, hebQuote, 1);
+    assert(
+      hlHeb.has("יְהוָ֑ה|1") && hlHeb.has("צְבָאֽוֹת|1") && hlHeb.size === 2,
+      `Hebrew quote with ${label} lights both words, raw keys (got ${[...hlHeb].join(",")})`,
+    );
+  }
+  const maqqefHl = findSourceHighlights(hebVo, "דָּבָר־יְהוָ֑ה", 1);
+  assert(
+    maqqefHl.has("דָּבָר|1") && maqqefHl.has("יְהוָ֑ה|1"),
+    `maqqef still splits a quote into adjacent tokens (got ${[...maqqefHl].join(",")})`,
+  );
+}
+
+// --- 26. \qs (Selah) character-wrapper descent when collecting milestone
+// target words (issue #331, ported from downstream fork commits fab1e6b +
+// c0fbeaf). A `\w` aligned inside a `\qs` wrapper must still highlight,
+// regardless of whether the wrapper sits INSIDE the milestone
+// (`zaln → qs → w`, synthetic) or OUTSIDE it (`qs → zaln → w`, the real
+// production ULT shape), and regardless of whether the wrapper sits between
+// two nested milestone levels of a merge group.
+{
+  // (a) wrapper INSIDE the milestone — synthetic shape.
+  const insideVo = [
+    zaln("ס", 1, 1, [
+      { type: "quote", tag: "qs", endTag: "\\qs*", children: [tgt("Selah")] },
+    ]),
+  ];
+  const hlInside = findTargetHighlights(insideVo, "ס", 1);
+  assert(
+    hlInside.has("Selah|1"),
+    `#331: quote "ס" highlights the \\qs-wrapped word Selah (got ${[...hlInside].join(",") || "<empty>"})`,
+  );
+  const selInside = extractTargetSelectionText(insideVo, "ס", 1);
+  assert(selInside === "Selah", `#331: extractTargetSelectionText resolves the wrapped selection (got ${JSON.stringify(selInside)})`);
+
+  // (b) wrapper OUTSIDE the milestone — the real production ULT shape, parsed
+  // from actual USFM (never hand-built — that is how the inverted nesting hid).
+  const target = String.raw`\id PSA
+\c 3
+\p
+\v 8 \q1 \zaln-s |x-strong="H3068" x-content="יְהוָה"\*\w Salvation belongs to Yahweh|x-occurrence="1" x-occurrences="1"\w*\zaln-e\*. \qs \zaln-s |x-strong="H5542" x-lemma="סֶלָה" x-content="סֶלָה"\*\w Selah|x-occurrence="1" x-occurrences="1"\w*\zaln-e\*\qs*
+`;
+  const source = String.raw`\id PSA
+\c 3
+\v 8 \w יְהוָה|x-strong="H3068" x-occurrence="1"\w* \w סֶלָה|x-strong="H5542" x-occurrence="1"\w*
+`;
+  const tvo = usfm.toJSON(target).chapters["3"]["8"].verseObjects;
+  const svo = usfm.toJSON(source).chapters["3"]["8"].verseObjects;
+  const qsNode = tvo.find((n) => n.tag === "qs");
+  assert(!!qsNode && (qsNode.children ?? []).some((c) => c.tag === "zaln"), "premise: the fixture really parses as qs → zaln → w");
+  const hlOl = findTargetHighlights(tvo, "סֶלָה", 1, svo);
+  assert(hlOl.has("Selah|1"), `#331: OL-anchored highlight finds the wrapper-outside Selah (got ${[...hlOl].join(",") || "<empty>"})`);
+  const hlGl = findTargetHighlights(tvo, "סֶלָה", 1);
+  assert(hlGl.has("Selah|1"), `#331: GL-only degradation highlight finds it too (got ${[...hlGl].join(",") || "<empty>"})`);
+  const sel = extractTargetSelectionText(tvo, "סֶלָה", 1, svo);
+  assert(sel === "Selah", `#331: extractTargetSelectionText returns "Selah" on the production shape (got ${JSON.stringify(sel)})`);
+  const src2 = findSourceForTargetText(tvo, "Selah");
+  assert(src2 === "סֶלָה", `#331: findSourceForTargetText resolves the wrapped word back to its source (got ${JSON.stringify(src2)})`);
+  const hlSibling = findTargetHighlights(tvo, "יְהוָה", 1, svo);
+  assert(
+    hlSibling.has("Salvation belongs to Yahweh|1") && hlSibling.size === 1,
+    `#331 control: the unwrapped sibling milestone still highlights alone (got ${[...hlSibling].join(",") || "<empty>"})`,
+  );
+
+  // (c) wrapper BETWEEN two nested milestone levels of a merge group.
+  const nestedTarget = String.raw`\id PSA
+\c 3
+\v 9 \zaln-s |x-strong="H5921" x-content="עַל"\*\qs \zaln-s |x-strong="H5542" x-content="סֶלָה"\*\w Selah|x-occurrence="1" x-occurrences="1"\w*\zaln-e\*\qs*\zaln-e\*
+`;
+  const nvo = usfm.toJSON(nestedTarget).chapters["3"]["9"].verseObjects;
+  const inner = findTargetHighlights(nvo, "סֶלָה", 1);
+  assert(inner.has("Selah|1"), `#331: the INNER milestone inside a \\qs wrapper keeps its run (got ${[...inner].join(",") || "<empty>"})`);
+  const outer = findTargetHighlights(nvo, "עַל", 1);
+  assert(outer.has("Selah|1"), `#331: the OUTER milestone still lights the whole merge group (got ${[...outer].join(",") || "<empty>"})`);
+}
+
+// --- 27. source-side (UHB/UGNT) \qs wrapper descent (issue #331, ported from
+// downstream fork commit c0fbeaf). collectSourceWords / collectBareWords must
+// descend a source-side character wrapper too, or a \qs-wrapped source word
+// can neither highlight in UHB/UGNT nor anchor a ULT/UST match.
+{
+  const source = String.raw`\id PSA
+\c 3
+\v 8 \w יְהוָה|x-strong="H3068" x-occurrence="1"\w* \qs \w סֶלָה|x-strong="H5542" x-occurrence="1"\w*\qs*
+`;
+  const svo = usfm.toJSON(source).chapters["3"]["8"].verseObjects;
+  const toks = matchSourceTokens(svo, "סֶלָה", 1);
+  assert(
+    toks.length === 1 && toks[0].text === "סֶלָה",
+    `#331: matchSourceTokens finds the \\qs-wrapped source word (got ${JSON.stringify(toks.map((t) => t.text))})`,
+  );
+  const hl = findSourceHighlights(svo, "סֶלָה", 1);
+  assert(hl.has("סֶלָה|1"), `#331: findSourceHighlights lights the \\qs-wrapped source word (got ${[...hl].join(",")})`);
+  assert(findSourceHighlights(svo, "יְהוָה", 1).has("יְהוָה|1"), "#331 control: unwrapped source word still highlights");
 }
 
 if (failed) {
