@@ -59,10 +59,27 @@ function freshEnv() {
   return { sqlite, env: { DB: makeDb(sqlite) } };
 }
 
+// Same as freshEnv, but stops applying migrations before 0058 — simulates the
+// deploy-before-migrate window this fix is for: the worker's INSERT names
+// master_lineage_confirmed_edit_id / master_lineage_confirmed_at, but the D1
+// schema doesn't have them yet.
+function freshEnvWithoutBoundaryColumns() {
+  const sqlite = new DatabaseSync(":memory:");
+  const dir = join(dirname(fileURLToPath(import.meta.url)), "..", "migrations");
+  for (const f of readdirSync(dir)
+    .filter((f) => f.endsWith(".sql"))
+    .sort()
+    .filter((f) => !f.startsWith("0058_"))) {
+    sqlite.exec(readFileSync(join(dir, f), "utf8"));
+  }
+  return { sqlite, env: { DB: makeDb(sqlite) } };
+}
+
 function readRow(sqlite, book, resource) {
   return sqlite
     .prepare(
-      `SELECT source_sha, origin, synced_at, master_lineage_json, master_lineage_sha, master_lineage_computed_at
+      `SELECT source_sha, origin, synced_at, master_lineage_json, master_lineage_sha, master_lineage_computed_at,
+              master_lineage_confirmed_edit_id, master_lineage_confirmed_at
          FROM book_resource_syncs WHERE book = ? AND resource = ?`,
     )
     .all(book, resource)[0];
@@ -85,15 +102,42 @@ console.log("\n[persistMasterLineage: an EXISTING (book, resource) row is update
      VALUES ('JER', 'tn', 'deadbeef', 1000, 'reimport', 900)`,
   );
 
-  await persistMasterLineageForTest(env, "JER", "tn", SUMMARY, "cafef00d");
+  // #661: confirmedEditId/confirmedAt are the merge boundary THIS run's
+  // lineage walk was bounded by — passed alongside the snapshot so the
+  // boundary a given snapshot used is answerable from the row later.
+  // Deliberately distinct from the seeded LIVE watermark (900) so a bug that
+  // wrote into the live columns instead of the snapshot-scoped ones would
+  // show up as a mismatch below, rather than passing by coincidence.
+  await persistMasterLineageForTest(env, "JER", "tn", SUMMARY, "cafef00d", 4242, 555);
 
   const row = readRow(sqlite, "JER", "tn");
   eq(row.master_lineage_json, JSON.stringify(SUMMARY), "the compact summary is stored verbatim as JSON");
   eq(row.master_lineage_sha, "cafef00d", "the as-of sha is stored");
   eq(typeof row.master_lineage_computed_at, "number", "a computed_at timestamp is stamped");
+  eq(
+    row.master_lineage_confirmed_edit_id,
+    4242,
+    "#661: master_lineage_confirmed_edit_id captures this run's merge boundary alongside the snapshot",
+  );
+  eq(
+    row.master_lineage_confirmed_at,
+    555,
+    "#661: master_lineage_confirmed_at captures this run's merge boundary alongside the snapshot",
+  );
   eq(row.source_sha, "deadbeef", "source_sha — a different watermark's field — is left untouched");
   eq(row.origin, "reimport", "origin is left untouched, not stomped by the lineage write");
   eq(row.synced_at, 1000, "synced_at is left untouched");
+  // master_confirmed_at / master_confirmed_edit_id (the LIVE watermark) are
+  // untouched by the lineage write, unlike master_lineage_confirmed_at /
+  // master_lineage_confirmed_edit_id (the snapshot-scoped copies) — the two
+  // are deliberately separate columns, see 0058's own comment. Seeded live
+  // master_confirmed_at is 900 and the passed confirmedAt is 555, so these
+  // assertions can actually fail if a bug wrote into the live columns.
+  const liveRow = sqlite
+    .prepare(`SELECT master_confirmed_at, master_confirmed_edit_id FROM book_resource_syncs WHERE book = 'JER' AND resource = 'tn'`)
+    .all()[0];
+  eq(liveRow.master_confirmed_at, 900, "the live master_confirmed_at watermark is left untouched by the lineage write");
+  eq(liveRow.master_confirmed_edit_id, null, "the live master_confirmed_edit_id watermark is left untouched (still NULL) by the lineage write");
 }
 
 console.log("\n[persistMasterLineage: NO existing row — inserts one instead of silently no-oping]");
@@ -101,18 +145,64 @@ console.log("\n[persistMasterLineage: NO existing row — inserts one instead of
   const { env, sqlite } = freshEnv();
   eq(readRow(sqlite, "ZEC", "ust"), undefined, "sanity: no row exists yet for this pair");
 
-  await persistMasterLineageForTest(env, "ZEC", "ust", SUMMARY, "f00dcafe");
+  await persistMasterLineageForTest(env, "ZEC", "ust", SUMMARY, "f00dcafe", 17, 555);
 
   const row = readRow(sqlite, "ZEC", "ust");
   eq(row !== undefined, true, "a row was inserted rather than the write silently affecting zero rows");
   eq(row.master_lineage_json, JSON.stringify(SUMMARY), "the summary lands on the new row");
   eq(row.master_lineage_sha, "f00dcafe", "the as-of sha lands on the new row");
+  eq(row.master_lineage_confirmed_edit_id, 17, "#661: the boundary edit id lands on the new row too");
+  eq(row.master_lineage_confirmed_at, 555, "#661: the boundary timestamp lands on the new row too");
   eq(row.source_sha, null, "source_sha stays NULL — this is not a real sync watermark");
   eq(
     row.origin,
     "lineage_only",
     "origin names why the row exists, distinct from 'import'/'reimport'/'export'/'reimport_withheld'",
   );
+}
+
+console.log("\n[persistMasterLineage: boundary args omitted — both new columns land NULL, not crash]");
+{
+  const { env, sqlite } = freshEnv();
+
+  await persistMasterLineageForTest(env, "AMO", "tq", SUMMARY, "0ff1ce00");
+
+  const row = readRow(sqlite, "AMO", "tq");
+  eq(row.master_lineage_confirmed_edit_id, null, "an omitted boundary edit id is stored as NULL, not 0/undefined");
+  eq(row.master_lineage_confirmed_at, null, "an omitted boundary timestamp is stored as NULL, not 0/undefined");
+}
+
+console.log(
+  "\n[persistMasterLineage: migration 0058 not yet applied — falls back to the 0054-only column set instead of silently dropping the whole write]",
+);
+{
+  const { env, sqlite } = freshEnvWithoutBoundaryColumns();
+  sqlite.exec(
+    `INSERT INTO book_resource_syncs (book, resource, source_sha, synced_at, origin, master_confirmed_at)
+     VALUES ('LAM', 'twl', 'beeff00d', 2000, 'reimport', 900)`,
+  );
+
+  // Same call shape as the #661 boundary-carrying call above — the fallback
+  // must engage transparently, not require a different call site.
+  await persistMasterLineageForTest(env, "LAM", "twl", SUMMARY, "0ddba11", 4242, 555);
+
+  const row = sqlite
+    .prepare(
+      `SELECT source_sha, origin, synced_at, master_lineage_json, master_lineage_sha, master_lineage_computed_at
+         FROM book_resource_syncs WHERE book = 'LAM' AND resource = 'twl'`,
+    )
+    .all()[0];
+  eq(
+    row !== undefined,
+    true,
+    "the 0054 snapshot write still lands even though the 0058 boundary columns don't exist yet",
+  );
+  eq(row.master_lineage_json, JSON.stringify(SUMMARY), "the compact summary is stored verbatim as JSON via the fallback");
+  eq(row.master_lineage_sha, "0ddba11", "the as-of sha is stored via the fallback");
+  eq(typeof row.master_lineage_computed_at, "number", "a computed_at timestamp is stamped via the fallback");
+  eq(row.source_sha, "beeff00d", "source_sha — a different watermark's field — is left untouched by the fallback");
+  eq(row.origin, "reimport", "origin is left untouched by the fallback, not stomped by the lineage write");
+  eq(row.synced_at, 2000, "synced_at is left untouched by the fallback");
 }
 
 console.log(failed === 0 ? "\nAll masterLineagePersist assertions passed." : `\n${failed} assertion(s) FAILED.`);

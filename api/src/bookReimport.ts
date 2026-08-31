@@ -744,7 +744,10 @@ export const persistMasterLineageForTest = (
   resource: Resource,
   summary: MasterLineageSummary,
   asOfSha: string | null,
-): Promise<void> => persistMasterLineage(env, book, resource, summary, asOfSha);
+  confirmedEditId: number | null = null,
+  confirmedAt: number | null = null,
+): Promise<void> =>
+  persistMasterLineage(env, book, resource, summary, asOfSha, confirmedEditId, confirmedAt);
 
 function addCounts(into: ReimportCounts, from: ReimportCounts): void {
   into.updated += from.updated;
@@ -1214,7 +1217,7 @@ async function runReimport(
   const withLineage = async (cutoff: MergeCutoff | null, resource: Resource): Promise<MergeCutoff | null> => {
     if (cutoff == null) return null;
     const lineage = needsLineage.has(resource)
-      ? await loadMasterLineage(env, book, resource, cutoff.confirmedAt)
+      ? await loadMasterLineage(env, book, resource, cutoff.confirmedAt, cutoff.editId)
       : null;
     return { ...cutoff, lineage };
   };
@@ -3319,6 +3322,7 @@ async function loadMasterLineage(
   book: string,
   resource: Resource,
   confirmedAt: number | null,
+  confirmedEditId: number | null = null,
 ): Promise<MasterLineageSummary | null> {
   const file = dcsResourceFile(book, resource);
   if (!file || confirmedAt == null) return null;
@@ -3370,14 +3374,30 @@ async function loadMasterLineage(
   // computed as of. Empty when nothing on master moved this file since the
   // watermark; null is honest there rather than a stale prior sha.
   const asOfSha = page.commits[0]?.sha ?? null;
-  await persistMasterLineage(env, book, resource, summary, asOfSha);
+  await persistMasterLineage(env, book, resource, summary, asOfSha, confirmedEditId, confirmedAt);
   return summary;
 }
 
-// Durable counterpart to the console.log above — see 0054_master_lineage_snapshot.sql.
+// Durable counterpart to the console.log above — see 0054_master_lineage_snapshot.sql
+// and, for the two boundary columns, 0058_master_lineage_confirmed_boundary.sql.
 // Last-run-wins on the same (book, resource) row every other watermark here
 // already keys on. Never blocks the caller: a write failure here must not
 // fail a reimport whose only mistake was wanting its evidence remembered.
+//
+// `confirmedEditId` / `confirmedAt` (issue #661) are the master_confirmed_edit_id
+// / master_confirmed_at values THIS RUN's lineage walk was bounded by — i.e.
+// the boundary in effect at snapshot/stage time — copied into
+// master_lineage_confirmed_edit_id / master_lineage_confirmed_at atomically
+// with the snapshot. NOTE this is not necessarily the boundary any given
+// chunk's merges actually ran on: reimportStagedChunk re-reads
+// getMasterConfirmedAt fresh per chunk step (see its "FIX 1 (hoist)" comment),
+// so a later chunk's merges can run on a later watermark than the one pinned
+// here. What this column answers is "what boundary was in effect when this
+// snapshot was computed", not "what boundary every merge for this run used"
+// (see #653). Written verbatim, including null — loadMasterLineage
+// never runs with confirmedAt null, but persistMasterLineageForTest and any
+// future caller should not have that assumption silently baked into this
+// function too.
 //
 // UPSERT, not a plain UPDATE: loadMasterLineage only ever runs with a non-null
 // confirmedAt, which today always traces back to an existing row's
@@ -3395,18 +3415,51 @@ async function persistMasterLineage(
   resource: Resource,
   summary: MasterLineageSummary,
   asOfSha: string | null,
+  confirmedEditId: number | null = null,
+  confirmedAt: number | null = null,
 ): Promise<void> {
   try {
-    await env.DB.prepare(
-      `INSERT INTO book_resource_syncs (book, resource, origin, synced_at, master_lineage_json, master_lineage_sha, master_lineage_computed_at)
-       VALUES (?1, ?2, 'lineage_only', unixepoch(), ?3, ?4, unixepoch())
-       ON CONFLICT(book, resource) DO UPDATE SET
-         master_lineage_json = excluded.master_lineage_json,
-         master_lineage_sha = excluded.master_lineage_sha,
-         master_lineage_computed_at = excluded.master_lineage_computed_at`,
-    )
-      .bind(book, resource, JSON.stringify(summary), asOfSha)
-      .run();
+    try {
+      await env.DB.prepare(
+        `INSERT INTO book_resource_syncs
+           (book, resource, origin, synced_at, master_lineage_json, master_lineage_sha, master_lineage_computed_at,
+            master_lineage_confirmed_edit_id, master_lineage_confirmed_at)
+         VALUES (?1, ?2, 'lineage_only', unixepoch(), ?3, ?4, unixepoch(), ?5, ?6)
+         ON CONFLICT(book, resource) DO UPDATE SET
+           master_lineage_json = excluded.master_lineage_json,
+           master_lineage_sha = excluded.master_lineage_sha,
+           master_lineage_computed_at = excluded.master_lineage_computed_at,
+           master_lineage_confirmed_edit_id = excluded.master_lineage_confirmed_edit_id,
+           master_lineage_confirmed_at = excluded.master_lineage_confirmed_at`,
+      )
+        .bind(book, resource, JSON.stringify(summary), asOfSha, confirmedEditId, confirmedAt)
+        .run();
+    } catch (e) {
+      // 0058 not applied yet (deploy raced its migration — same class as
+      // getMasterConfirmedAt's 0050 fallback above). Retry with the pre-#661
+      // column set so a deploy that outruns the migration doesn't silently
+      // stop persisting the 0054 snapshot columns too — only the two new
+      // boundary columns are dropped, and only until 0058 lands.
+      if (!(e instanceof Error) || !/no column named master_lineage_confirmed/.test(e.message)) {
+        throw e;
+      }
+      console.error("reimport master lineage persist: boundary columns unavailable (migration 0058 unapplied?) — falling back to the pre-#661 column set", {
+        book,
+        resource,
+        error: e.message,
+      });
+      await env.DB.prepare(
+        `INSERT INTO book_resource_syncs
+           (book, resource, origin, synced_at, master_lineage_json, master_lineage_sha, master_lineage_computed_at)
+         VALUES (?1, ?2, 'lineage_only', unixepoch(), ?3, ?4, unixepoch())
+         ON CONFLICT(book, resource) DO UPDATE SET
+           master_lineage_json = excluded.master_lineage_json,
+           master_lineage_sha = excluded.master_lineage_sha,
+           master_lineage_computed_at = excluded.master_lineage_computed_at`,
+      )
+        .bind(book, resource, JSON.stringify(summary), asOfSha)
+        .run();
+    }
   } catch (e) {
     console.error("reimport failed to persist master lineage", {
       book,
@@ -6479,12 +6532,8 @@ async function planAndStageBookResources(
     // step. The extra D1 read buys the correct boundary: the walk must start
     // where the merge's ancestor sits (`master_confirmed_at`), not at
     // `sync.sourceSha`, which this very function is about to move past it.
-    const lineage = await loadMasterLineage(
-      env,
-      book,
-      resource,
-      (await getMasterConfirmedAt(env, book, resource)).confirmedAt,
-    );
+    const stageCutoff = await getMasterConfirmedAt(env, book, resource);
+    const lineage = await loadMasterLineage(env, book, resource, stageCutoff.confirmedAt, stageCutoff.editId);
     const r2Key = `reimport-stage/${instanceId}/${book}/${resource}`;
     await env.BLOBS.put(r2Key, raw);
     entries.push({

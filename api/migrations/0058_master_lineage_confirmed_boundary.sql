@@ -1,0 +1,45 @@
+-- Persists the merge boundary alongside the per-run lineage snapshot
+-- (issue #661, the deferred "persist the classification" follow-up from
+-- #540 item 1, sharpened during the #653 forensics).
+--
+-- THE PROBLEM. 0054 added master_lineage_sha / master_lineage_json /
+-- master_lineage_computed_at so a nightly run's classification of master's
+-- history is durable instead of living only in a worker log line that ages
+-- out. But master_confirmed_edit_id (0050) / master_confirmed_at (0045) —
+-- the merge-ancestor BOUNDARY that lineage walk was bounded by (see
+-- loadMasterLineage's own "BOUNDED BY master_confirmed_at, NOT BY
+-- source_sha" note in bookReimport.ts) — are overwritten in place by every
+-- later run, with no history. During the #653 forensics (2026-08-30) the
+-- frozen 08-29 JER tn boundary could only be reconstructed INDIRECTLY,
+-- because master_lineage_json's snapshot happened to still pin the right
+-- commit window. That was luck, not a durable answer.
+--
+-- THE FIX. Snapshot-scoped copies of master_confirmed_edit_id /
+-- master_confirmed_at, written atomically with the lineage snapshot in the
+-- SAME UPDATE persistMasterLineage already runs (see bookReimport.ts) —
+-- last-run-only, exactly like the lineage snapshot itself already is. This
+-- is the "last-run-only column pair" the issue recommends over an
+-- append-only sync_run_log table: the lineage snapshot is already
+-- last-run-scoped, so pairing it with the boundary it was walked from
+-- answers "what boundary did the merge use on the run that raised this
+-- alert" without a second table.
+--
+-- Deliberately separate columns from master_confirmed_edit_id /
+-- master_confirmed_at themselves, not a rename or reuse: those two are a
+-- LIVE watermark, advanced by exportWorkflow.ts's stampMasterConfirmed and
+-- bookReimport.ts's markOwnPublishConverged independently of whether a
+-- lineage walk ever ran for this (book, resource) this run (loadMasterLineage
+-- returns null — no lineage — whenever master's file did not move, which is
+-- most nights). Persisting into the live columns would either overwrite them
+-- with a value that is not what those columns mean (they are not
+-- lineage-scoped) or leave them unstamped on the common "nothing moved"
+-- night, silently going stale. A dedicated pair, written only alongside an
+-- actual lineage snapshot, has neither problem: it is always exactly the
+-- boundary that snapshot's walk started from.
+--
+-- No backfill — same warm-up contract 0045/0050/0054 all chose, for the same
+-- reason: only a run that computed a lineage snapshot can state the boundary
+-- that snapshot used. Existing rows keep both columns NULL until their next
+-- lineage-producing run stamps them.
+ALTER TABLE book_resource_syncs ADD COLUMN master_lineage_confirmed_edit_id INTEGER;
+ALTER TABLE book_resource_syncs ADD COLUMN master_lineage_confirmed_at INTEGER;
