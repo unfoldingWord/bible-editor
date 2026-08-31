@@ -123,9 +123,9 @@ function freshApp() {
     },
     passThroughOnException() {},
   };
-  const patch = async (body, ifMatch) => {
+  const patch = async (body, ifMatch, kind = "tn") => {
     const res = await app.request(
-      `/api/rows/tn/${ID}?book=${BOOK}`,
+      `/api/rows/${kind}/${ID}?book=${BOOK}`,
       {
         method: "PATCH",
         headers: { "if-match": String(ifMatch), "content-type": "application/json" },
@@ -151,6 +151,22 @@ function seedRow(sqlite, { note = NOTE, version = 4, reviewKind = "quote", revie
 
 const row = (sqlite) => sqlite.prepare(`SELECT * FROM tn_rows WHERE id = ? AND book = ?`).all(ID, BOOK)[0];
 
+const QUESTION = "What did the prophet say?";
+
+// tq/twl gained review_kind/review_reason in migration 0047 — the no-op clear
+// branch above is kind-generic (KIND_TO_TABLE-driven), so it must work for
+// them too, not just tn.
+function seedTqRow(sqlite, { question = QUESTION, version = 4, reviewKind = "quote", reviewReason = "adapted quote, please verify" } = {}) {
+  sqlite
+    .prepare(
+      `INSERT INTO tq_rows (id, book, chapter, verse, ref_raw, question, sort_order, version, updated_by, review_kind, review_reason)
+       VALUES (?, ?, 36, 21, '36:21', ?, 10, ?, 9, ?, ?)`,
+    )
+    .run(ID, BOOK, question, version, reviewKind, reviewReason);
+}
+
+const tqRow = (sqlite) => sqlite.prepare(`SELECT * FROM tq_rows WHERE id = ? AND book = ?`).all(ID, BOOK)[0];
+
 console.log("\n[a no-op re-save that clears a review flag broadcasts the fresh row]");
 {
   const { sqlite, patch, broadcasts } = freshApp();
@@ -170,7 +186,11 @@ console.log("\n[a no-op re-save that clears a review flag broadcasts the fresh r
   eq(event.type, "row.upserted", "broadcast carries the row.upserted contract other tabs already replace-on");
   eq(event.kind, "tn", "broadcast carries the row kind");
   eq(event.row.id, ID, "broadcast carries the fresh row");
-  eq(event.row.review_kind, null, "…with review_kind cleared, so the flag chip drops in every open tab");
+  eq(
+    event.row.review_kind,
+    null,
+    "broadcasts row.upserted on a no-op review-flag clear — client-side refetch is covered in Shell",
+  );
   eq(event.row.review_reason, null, "…and review_reason cleared too");
 }
 
@@ -203,6 +223,32 @@ console.log("\n[a reorder-only patch on a flagged row does NOT acknowledge the f
 
   eq(broadcasts.length, 1, "the pre-existing reorder fast path still broadcasts exactly once");
   eq(broadcasts[0].event.row.review_kind, "quote", "…and the broadcast row still carries the untouched flag");
+}
+
+console.log("\n[tq: a no-op re-save that clears a review flag broadcasts the fresh row]");
+{
+  // Mirrors the tn block above — the clear branch is kind-generic
+  // (KIND_TO_TABLE[kind]), and tq carries review_kind/review_reason since
+  // migration 0047, so this must behave identically for tq.
+  const { sqlite, patch, broadcasts } = freshApp();
+  seedTqRow(sqlite);
+
+  const res = await patch({ question: QUESTION }, 4, "tq");
+  eq(res.status, 200, "the no-op save is accepted");
+
+  const r = tqRow(sqlite);
+  eq(r.review_kind, null, "review_kind is cleared in D1");
+  eq(r.review_reason, null, "review_reason is cleared in D1");
+  eq(r.version, 4, "no version bump — this is a bit-toggle, not a content edit");
+
+  eq(broadcasts.length, 1, "exactly one chapter broadcast fired");
+  const { roomName, event } = broadcasts[0];
+  eq(roomName, `${BOOK}:36`, "broadcast targets the row's own chapter room");
+  eq(event.type, "row.upserted", "broadcast carries the row.upserted contract other tabs already replace-on");
+  eq(event.kind, "tq", "broadcast carries the row kind");
+  eq(event.row.id, ID, "broadcast carries the fresh row");
+  eq(event.row.review_kind, null, "broadcasts row.upserted on a no-op review-flag clear — client-side refetch is covered in Shell");
+  eq(event.row.review_reason, null, "…and review_reason cleared too");
 }
 
 if (failed > 0) {
