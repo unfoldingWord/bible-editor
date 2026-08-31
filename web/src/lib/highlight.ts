@@ -18,13 +18,14 @@
 //
 // Hebrew note: TN/TQ quote text typically arrives NFC-normalized while UHB
 // stores legacy combining-mark order (see lib/hebrew.ts), so all source-
-// text equality checks go through `matchNorm()` (NFC + joiner stripping).
+// text equality checks go through `matchNorm()` (NFC + joiner stripping +
+// edge-punctuation stripping).
 // The Set keys still carry the RAW verseObjects text — the consumer
 // (HebrewLine, renderHighlightedHTML) reads from the same tree, so raw
 // matches raw with no further work.
 
 import { nfc } from "./hebrew.ts";
-import { isInFlowMarker, isTsMilestone, liftMarkerText, SECTION_HEADER_TAGS } from "./usfm.ts";
+import { isCharacterWrapper, isInFlowMarker, isTsMilestone, liftMarkerText, SECTION_HEADER_TAGS } from "./usfm.ts";
 
 // U+2060 WORD JOINER glues UHB clitic morphemes to their host word
 // (הָ⁠אֶ֧בֶן); U+200D ZERO WIDTH JOINER plays the same role in some corpora.
@@ -33,8 +34,46 @@ import { isInFlowMarker, isTsMilestone, liftMarkerText, SECTION_HEADER_TAGS } fr
 // 4:10's הָאֶ֧בֶן), so every quote↔token EQUALITY check strips them from
 // BOTH sides. Matching only: stored text, rendered text, and HighlightKey
 // sets keep the raw joiners.
+// Punctuation that sits at the EDGE of a word in running text without being
+// part of the word. Upstream en_tn quotes are cut straight out of the verse, so
+// they carry the sentence punctuation the OL `\w` token does not: MRK 13:2's
+// figs-activepassive quote ends "… ἐπὶ λίθον, ὃς …" while the UGNT holds a bare
+// "λίθον" with the comma in a sibling text node. 516 of 4,352 seeded quoted
+// notes (~12%) carry a comma, so this is stripped from BOTH sides of every
+// quote↔token equality (issue #322).
+//
+// Deliberately EXCLUDED: `&`, `…` and `...` (gap markers — quoteGroups splits
+// on them BEFORE any stripping, so a gap can never be eaten), `־` maqqef (a
+// token separator, same place), and every letter / combining mark (Hebrew
+// pointing and Greek diacritics are part of the word) — with ONE letter-category
+// exception: U+02BC MODIFIER LETTER APOSTROPHE is included because UGNT elision
+// (ἀλλ', δι') drifts between apostrophe characters across corpora, and no real
+// Greek word collapses onto another without it.
+//
+// Greek's own sentence punctuation (U+0387 ano teleia, U+037E question mark) is
+// handled WITHOUT being listed: both have singleton canonical decompositions to
+// U+00B7 / `;`, and matchNorm runs nfc() BEFORE the strip. Keep that order.
+//
+// String.raw means EDGE_PUNCT's literal value is regex SOURCE (backslash-u
+// escape text), only meaningful once compiled by `new RegExp` — never use it
+// with .includes()/.split(). The two compiled regexes are deliberately
+// non-global: a shared `g` regex carries lastIndex state, so a future
+// `.test()` against it would alternate true/false.
+const EDGE_PUNCT = String.raw`,;:!?.\u00b7\u05c3\u05c0()\[\]{}\u00ab\u00bb\u2039\u203a"'\u201c\u201d\u201e\u201f\u2018\u2019\u201a\u02bc`;
+const EDGE_PUNCT_LEAD = new RegExp(`^[${EDGE_PUNCT}]+`, "u");
+const EDGE_PUNCT_TRAIL = new RegExp(`[${EDGE_PUNCT}]+$`, "u");
+
+function stripEdgePunct(s: string): string {
+  return s.replace(EDGE_PUNCT_LEAD, "").replace(EDGE_PUNCT_TRAIL, "");
+}
+
+// Contract: matchNorm is for ORIGINAL-LANGUAGE text only (quote words, OL `\w`
+// text, `\zaln-s` x-content). OL tokens never carry edge punctuation (measured
+// zero across the sample corpora), so the strip is an equality-widening no-op
+// there. GL `\w` text DOES carry it ("“What" vs "What"), so keying GL tokens
+// through matchNorm/tokenKey would silently collide occurrences — don't.
 export function matchNorm(s: string): string {
-  return nfc(s).replace(/[\u2060\u200d]/g, "");
+  return stripEdgePunct(nfc(s).replace(/[\u2060\u200d]/g, ""));
 }
 
 // `occurrence` is the token's OWN `x-occurrence` attribute (defaulting to 1).
@@ -64,7 +103,14 @@ function quoteGroups(quote: string): string[][] {
       segment
         .split(/[\s־]+/)
         .map((w) => w.trim())
-        .filter((w) => w.length > 0),
+        // Tokens keep their punctuation here (matchNorm strips it on both sides
+        // downstream), but a token that would normalize to "" — a stray "."
+        // left over from a 4-dot gap, an orphan "»", a bare joiner+comma —
+        // would then match every text-less token, so drop it. Filter with the
+        // FULL normalization, not just the punctuation strip: a joiner+comma
+        // survives stripEdgePunct (the joiner remains) yet matchNorm folds it
+        // to "".
+        .filter((w) => matchNorm(w).length > 0),
     )
     .filter((g) => g.length > 0);
 }
@@ -133,11 +179,14 @@ function nodeIsPsalmTitle(n: unknown): n is Record<string, unknown> {
   return !!o && o["type"] === "section" && o["tag"] === "d";
 }
 
-// Collect every `\w` token in a subtree (descending through nested milestones
-// and \d sections), in document order. A merge group serializes as a chain of
-// nested `\zaln-s` with ALL its target words at the innermost level, so a run's
-// `targets` must be its whole subtree — see collectMilestoneRuns / atomic-group
-// note below.
+// Collect every `\w` token in a subtree (descending through nested milestones,
+// \d sections, and \qs-style character wrappers), in document order. A merge
+// group serializes as a chain of nested `\zaln-s` with ALL its target words at
+// the innermost level, so a run's `targets` must be its whole subtree — see
+// collectMilestoneRuns / atomic-group note below. A character wrapper
+// (`isCharacterWrapper`, e.g. a Selah aligned as `zaln → qs → w`) holds
+// alignable `\w` children too, so descend it or the wrapped words never enter
+// any run's target set and a quote naming that milestone highlights nothing.
 function collectSubtreeWords(children: unknown[]): WordToken[] {
   const out: WordToken[] = [];
   function walk(nodes: unknown[]) {
@@ -148,7 +197,7 @@ function collectSubtreeWords(children: unknown[]): WordToken[] {
           occurrence:
             parseInt(String((c as Record<string, unknown>)["occurrence"] ?? "1"), 10) || 1,
         });
-      } else if (nodeIsMilestone(c) || nodeIsPsalmTitle(c)) {
+      } else if (nodeIsMilestone(c) || nodeIsPsalmTitle(c) || isCharacterWrapper(c)) {
         walk(((c as Record<string, unknown>)["children"] as unknown[] | undefined) ?? []);
       }
     }
@@ -219,6 +268,15 @@ function collectRawRuns(verseObjects: unknown[]): RawRun[] {
         walk((node["children"] as unknown[] | undefined) ?? []);
         continue;
       }
+      // A `\qs`-style character wrapper can sit OUTSIDE the milestone, not just
+      // inside it: the production ULT Selah shape parses as `qs → zaln → w`.
+      // Descend the wrapper looking for milestones, or the `\zaln` it contains
+      // never becomes a run and a quote naming that source highlights nothing
+      // at all (issue #331).
+      if (isCharacterWrapper(node)) {
+        walk(((node as Record<string, unknown>)["children"] as unknown[] | undefined) ?? []);
+        continue;
+      }
       if (!nodeIsMilestone(node)) continue;
       const source = String(node["content"] ?? "");
       const occurrence = parseInt(String(node["occurrence"] ?? "1"), 10) || 1;
@@ -226,9 +284,12 @@ function collectRawRuns(verseObjects: unknown[]): RawRun[] {
       const children = (node["children"] as unknown[] | undefined) ?? [];
       const targets = collectSubtreeWords(children);
       out.push({ source, occurrence, occurrences, targets });
-      // Recurse into nested milestones as their own runs.
+      // Recurse into nested milestones as their own runs. A character wrapper
+      // between the two levels (`zaln → qs → zaln → w`) must be looked through
+      // here too — walk() descends wrappers, so handing it the wrapper reaches
+      // the inner milestone and keeps its run (issue #331).
       for (const c of children) {
-        if (nodeIsMilestone(c)) walk([c]);
+        if (nodeIsMilestone(c) || isCharacterWrapper(c)) walk([c]);
       }
     }
   }
@@ -477,9 +538,13 @@ export function collectSourceWords(verseObjects: unknown[]): SourceWordToken[] {
         // maqqef / inter-word space as a bare text sibling of the \w tokens.
         const prev = out[out.length - 1];
         if (prev) prev.trailing += String(o["text"] ?? "");
-      } else if (o["type"] === "milestone" || nodeIsPsalmTitle(o)) {
+      } else if (o["type"] === "milestone" || nodeIsPsalmTitle(o) || isCharacterWrapper(o)) {
         // \d (Psalm superscription) is `type:"section"` but its content IS
         // alignable verse body — descend it like the highlight matchers do.
+        // A `\qs`-style character wrapper descends the same way: it holds
+        // verse body and can sit either side of a `\zaln` (issue #331), so
+        // without this a wrapped source `\w` never enters the source word
+        // list at all.
         walk((o["children"] as unknown[] | undefined) ?? []);
       }
     }
@@ -677,10 +742,14 @@ export function findSourceForTargetText(
         const source = String(o["content"] ?? "");
         const children = (o["children"] as unknown[] | undefined) ?? [];
         walk(children, source ? [...stack, source] : stack);
-      } else if (nodeIsPsalmTitle(o)) {
+      } else if (nodeIsPsalmTitle(o) || isCharacterWrapper(o)) {
         // \d (Psalm superscription) is type:"section" but its content IS
         // alignable verse body — walk its children like a milestone (no
         // source contribution of its own). Mirrors collectMilestoneRuns.
+        // A `\qs`-style character wrapper descends the same way: it holds verse
+        // body and can sit either side of a `\zaln` (issue #331), so without
+        // this the reverse English→Hebrew walk loses every wrapped word and the
+        // tn-quick handoff resolves no source at all.
         walk((o["children"] as unknown[] | undefined) ?? [], stack);
       } else if (nodeIsWord(o)) {
         const text = String(o["text"] ?? "");
@@ -769,9 +838,12 @@ export function extractTargetSelectionText(
           lastSelected = index;
           words.push(text);
         }
-      } else if (nodeIsMilestone(o) || nodeIsPsalmTitle(o)) {
+      } else if (nodeIsMilestone(o) || nodeIsPsalmTitle(o) || isCharacterWrapper(o)) {
         // \d (Psalm superscription) descends like a milestone — its inner
-        // \w tokens are alignable verse body. Mirrors collectMilestoneRuns.
+        // \w tokens are alignable verse body. A \qs-style character wrapper
+        // (isCharacterWrapper) likewise holds alignable \w children (e.g. a
+        // Selah aligned as `zaln → qs → w`). Mirrors collectSubtreeWords /
+        // collectMilestoneRuns.
         const children = (o["children"] as unknown[] | undefined) ?? [];
         walk(children);
       }
@@ -951,10 +1023,87 @@ function segmentByParagraphs(
   const segments: Segment[] = [{ wrapper: "", tag: null, html: "", isBlank: false }];
   let current = segments[0];
 
+  // Inline styling spans (`.be-qs`, `.be-d`) currently open, innermost last.
+  // Each segment becomes its own block-level <div>, so a span may never cross a
+  // segment boundary — but an in-flow marker NESTED inside one of these wrappers
+  // does push a new segment mid-span. usfm-js nests everything that follows an
+  // unclosed `\qs Selah` under the wrapper, including the next `\q1`, so this is
+  // a real corpus shape. Emitting the `</span>` into whatever segment happened
+  // to be current then produced crossing HTML
+  // (`<div>…<span></div><div></span>…`), which the browser repairs by dropping
+  // the following line's text — while extractEditableText still surfaces it, so
+  // Shell's no-op guard misses and a blur/Save can silently delete that line
+  // (#357).
+  //
+  // So a segment switch CLOSES every span open in the segment that opened it,
+  // and does not re-open it in the new one. The styling is deliberately scoped
+  // to the opening segment: an unclosed `\qs` is malformed data whose author
+  // meant to write `\qs Selah\qs*`, and re-opening would render every remaining
+  // line of the verse in Selah's italic/muted treatment. Closing degrades
+  // gracefully instead — Selah keeps its cue, the rest of the verse reads as
+  // ordinary body text.
+  //
+  // `live` is false once a segment switch has retired the span — it stays on the
+  // stack so the matching `closeSpan` still balances, but it never styles
+  // anything again. `emitted` says whether its opening tag is actually written
+  // into `current`; opening lazily means an empty wrapper leaves no
+  // `<span></span>` husk to defeat segmentsToHtml's empty-segment drop, and
+  // `closeSpan` never writes a closer for a tag that was never opened.
+  const openSpans: { cls: string; live: boolean; emitted: boolean }[] = [];
+
+  function emit(html: string) {
+    for (const s of openSpans) {
+      if (s.live && !s.emitted) {
+        current.html += `<span class="${s.cls}">`;
+        s.emitted = true;
+      }
+    }
+    current.html += html;
+  }
+  function openSpan(cls: string) {
+    openSpans.push({ cls, live: true, emitted: false });
+  }
+  function closeSpan() {
+    const s = openSpans.pop();
+    if (s?.emitted) current.html += "</span>";
+  }
+  function switchSegment(seg: Segment) {
+    for (let i = openSpans.length - 1; i >= 0; i--) {
+      if (openSpans[i].emitted) current.html += "</span>";
+      openSpans[i].emitted = false;
+      openSpans[i].live = false;
+    }
+    current = seg;
+  }
+
   function walk(nodes: unknown[]) {
     for (const node of nodes ?? []) {
       const o = node as Record<string, unknown> | null;
       if (!o) continue;
+      if (isCharacterWrapper(o)) {
+        // Character-style wrappers (`\qs Selah\qs*`, isCharacterWrapper) are
+        // `type:"quote"` with a tag, so isInFlowMarker matches them below — but
+        // they hold inline verse CONTENT (aligned \w words, or bare text), not a
+        // paragraph break. Treating them as in-flow markers pushed an empty
+        // paragraph segment and dropped their children (`continue`), so Selah
+        // was invisible in the scripture column and a data-loss trap in the
+        // editor: extractEditableText's diff baseline DOES include "Selah", so an
+        // edit elsewhere diffed against a render that had dropped it and could
+        // nuke the \qs content and its alignment. Descend the wrapper's children
+        // into the CURRENT segment instead (its own styling span), mirroring the
+        // `\d` handling and the isInFlowMarker(...) && !isCharacterWrapper(...)
+        // guard the other walks (extractPlainText/extractEditableText,
+        // collectSubtreeWords) already use.
+        openSpan("be-qs");
+        if (typeof o["text"] === "string" && o["text"] !== "") {
+          emit(escapeHtml(String(o["text"])));
+        }
+        if (Array.isArray(o["children"])) {
+          walk(o["children"] as unknown[]);
+        }
+        closeSpan();
+        continue;
+      }
       if (isInFlowMarker(o)) {
         // Collapse every `\ts\*` node shape to the canonical "ts" tag before it
         // reaches the segment logic. usfm-js 3.5.0 parks the marker in the tag
@@ -965,14 +1114,35 @@ function segmentByParagraphs(
         const { wrapper, isBlank } = paragraphClass(tag);
         const seg: Segment = { wrapper, tag, html: "", isBlank };
         segments.push(seg);
-        if (tag === "ts") {
-          // \ts\* is a standalone chunk divider — anything that follows
-          // (text, the next paragraph marker, ...) belongs to a fresh
-          // segment, not inside the divider block.
-          current = { wrapper: "", tag: null, html: "", isBlank: false };
-          segments.push(current);
+        if (tag === "ts" || isBlank) {
+          // \ts\* and \b are standalone spacer blocks that render no inline
+          // content of their own — segmentsToHtml discards a blank segment's
+          // html — so anything that follows (text, the next paragraph marker,
+          // ...) belongs to a fresh segment, not accumulated into the spacer
+          // where it would be thrown away. Without this a bare text node after
+          // a \b vanished from the render while extractEditableText kept it —
+          // the #345/#357 save-path drop reaching through the blank branch (#386B).
+          // Route through switchSegment (not a bare `current = …`) so any wrapper
+          // span still open at the spacer boundary is closed and retired (#357),
+          // never left dangling across the divider.
+          const after: Segment = { wrapper: "", tag: null, html: "", isBlank: false };
+          segments.push(after);
+          switchSegment(after);
         } else {
-          current = seg;
+          switchSegment(seg);
+        }
+        // Leading text usfm-js parked on the marker node (`\q1 next line here`).
+        // liftMarkerText splits this out into a following text node, but only at
+        // the TOP level — it does not descend — so a marker nested under an
+        // unclosed `\qs` still carries its whole line here. Dropping it lost that
+        // line from the render while extractEditableText kept it, which is the
+        // other half of the #357 content-drop. No-op on already-lifted top-level
+        // markers (they carry no text). `ts` is excluded to match
+        // extractEditableText, which emits `\ts\* ` and never a ts node's text:
+        // emitting it here would put text in the render that the diff baseline
+        // does not have, which is the very mismatch this fix is closing.
+        if (tag !== "ts" && typeof o["text"] === "string" && o["text"] !== "") {
+          emit(escapeHtml(String(o["text"])));
         }
         continue;
       }
@@ -983,25 +1153,31 @@ function segmentByParagraphs(
       ) {
         continue;
       }
-      // \d (Psalm superscription) is `type:"section"` but its text IS
-      // alignable Hebrew. Render inline with `.be-d` styling so children
-      // (\zaln-s milestones, \w words) still walk and align.
-      if (o["type"] === "section" && o["tag"] === "d") {
-        current.html += '<span class="be-d">';
+      // \d (Psalm superscription) — its text IS alignable Hebrew. Render
+      // inline with `.be-d` styling so children (\zaln-s milestones, \w words)
+      // still walk and align. Gate on the TAG alone, not `type:"section"`:
+      // usfm-js 3.5.0 parses a real `\d` as `{tag:"d", text}` with NO type
+      // (only \s/\s1…\s5 get `type:"section"`), so the old `type:"section"`
+      // predicate matched nothing usfm.toJSON emits and the superscription was
+      // dropped from the render while extractEditableText kept it — the classic
+      // silent-content-drop-on-save signature (#345/#357/#384). Tag-only is a
+      // superset that still covers any legacy `{type:"section", tag:"d"}` rows.
+      if (o["tag"] === "d") {
+        openSpan("be-d");
         if (Array.isArray(o["children"]) && (o["children"] as unknown[]).length > 0) {
           walk(o["children"] as unknown[]);
         } else if (typeof o["text"] === "string") {
-          current.html += escapeHtml(String(o["text"]));
+          emit(escapeHtml(String(o["text"])));
         }
-        current.html += "</span>";
+        closeSpan();
         continue;
       }
       if (o["type"] === "text") {
-        current.html += escapeHtml(String(o["text"] ?? ""));
+        emit(escapeHtml(String(o["text"] ?? "")));
       } else if (nodeIsWord(o)) {
         const text = String(o["text"] ?? "");
         const occurrence = parseInt(String(o["occurrence"] ?? "1"), 10) || 1;
-        current.html += renderWord(text, occurrence);
+        emit(renderWord(text, occurrence));
       } else if (nodeIsMilestone(o)) {
         const children = (o["children"] as unknown[] | undefined) ?? [];
         walk(children);
@@ -1047,7 +1223,11 @@ function segmentsToHtml(segments: Segment[], emitChips: boolean): string {
     if (seg.html === "" && !seg.wrapper) continue;
     const cls = seg.wrapper || "be-line";
     if (seg.isBlank) {
-      out.push(`<div class="${cls}">${emitChips && seg.tag ? chipForTag(seg.tag) : "&nbsp;"}</div>`);
+      // Chip mode emits the marker chip with a trailing space so the editor's
+      // textContent matches extractEditableText's "\b " (usfm.ts). Without it
+      // the two are one space apart, so Shell.saveVerseDraft's no-op guard
+      // misses and a zero-typing blur fires a phantom PATCH (#386A).
+      out.push(`<div class="${cls}">${emitChips && seg.tag ? chipForTag(seg.tag) + " " : "&nbsp;"}</div>`);
       continue;
     }
     if (seg.tag === "ts") {
@@ -1063,7 +1243,9 @@ function segmentsToHtml(segments: Segment[], emitChips: boolean): string {
       // the line break) intact. Book mode restates `div.be-ts` wholesale and
       // therefore keeps its label: it draws the divider at the top of the verse
       // the marker introduces, which is the whole point of that treatment.
-      const chip = emitChips ? chipForTag("ts") : `<span class="be-tok be-tok-ts">\\ts\\*</span>`;
+      // Chip mode adds the trailing space extractEditableText emits for
+      // "\ts\* ", same parity fix as the blank branch above (#386A).
+      const chip = emitChips ? chipForTag("ts") + " " : `<span class="be-tok be-tok-ts">\\ts\\*</span>`;
       out.push(`<div class="${cls}${emitChips ? "" : " be-ts-quiet"}">${chip}</div>`);
       continue;
     }
