@@ -466,10 +466,35 @@ deep(tsvMergeFields("tq"), ["quote", "question", "response"], "tq field list");
   eq(tsvRefMoved({ chapter: 1, verse: 2, ref_raw: "1:2" }, { chapter: 1, verse: 2, refRaw: "1:2" }, false), false, "identical location is not a move");
 }
 
-// D1's chapter/verse arrive as strings from the stored row (Record<string,
-// unknown>); Number() coercion must not read "1" !== 1 as a move.
+// Issue #547 item 2: a chapter/verse-only divergence, with ref_raw agreeing on
+// both sides, is NOT a move. `export.ts` publishes `ref_raw` verbatim and
+// never `chapter`/`verse` (those are re-derived from `ref_raw` on the master
+// side by `refParts`), so this shape can never reach master — flagging it and
+// withholding the resource's export watermark protects nothing.
 {
-  eq(tsvRefMoved({ chapter: "1", verse: "2", ref_raw: "1:2" }, { chapter: 1, verse: 2, refRaw: "1:2" }, false), false, "string chapter/verse coerce and compare equal");
+  eq(tsvRefMoved({ chapter: 1, verse: 2, ref_raw: "1:2" }, { chapter: 5, verse: 2, refRaw: "1:2" }, false), false, "chapter-only divergence with agreeing ref_raw is not a move (#547 item 2)");
+  eq(tsvRefMoved({ chapter: 1, verse: 2, ref_raw: "1:2" }, { chapter: 1, verse: 9, refRaw: "1:2" }, false), false, "verse-only divergence with agreeing ref_raw is not a move (#547 item 2)");
+}
+
+// Issue #547 item 3: a cross-chapter reference TYPED IN THE APP. rows.ts never
+// writes a changed `chapter` (same-chapter moves only) and only re-derives
+// `verse` when the typed ref's chapter matches the row's own — so a row
+// retargeted to "2:3" from a chapter-1 row leaves D1 at
+// { chapter: 1, verse: 5, ref_raw: "2:3" }. Once the export has published that
+// `ref_raw` and the NEXT reimport parses master's file, `refParts` derives
+// { chapter: 2, verse: 3 } from the very same "2:3" text — so `chapter`/`verse`
+// disagree with D1's stored columns even though nobody on Door43 touched the
+// row. Keying on `ref_raw` alone means this converges cleanly instead of
+// reading as "a Door43 editor moved it".
+{
+  eq(tsvRefMoved({ chapter: 1, verse: 5, ref_raw: "2:3" }, { chapter: 2, verse: 3, refRaw: "2:3" }, false), false, "post-export cross-chapter round-trip is not a move once ref_raw agrees (#547 item 3)");
+}
+
+// `chapter`/`verse` are irrelevant to this function post-#547 (it compares
+// `ref_raw` only), so a differently-typed stored chapter/verse (D1's
+// Record<string, unknown> row can hold either) changes nothing.
+{
+  eq(tsvRefMoved({ chapter: "1", verse: "2", ref_raw: "1:2" }, { chapter: 1, verse: 2, refRaw: "1:2" }, false), false, "chapter/verse type/value never affects the ref_raw compare");
 }
 
 // A null stored ref_raw normalizes to "" and matches an incoming "" (never a
@@ -535,25 +560,29 @@ deep(tsvMergeFields("tq"), ["quote", "question", "response"], "tq field list");
 }
 
 // The in-app move patch sends ref_raw + verse and never chapter (same-chapter
-// moves only, rows.ts), so a base folded from patches carries no `chapter`. That
-// must NOT make a same-chapter move unattributable: chapter agrees on both
-// sides, so it carries no information about who moved and needs no ancestor.
+// moves only, rows.ts), so a base folded from patches carries no `chapter`.
+// Attribution (issue #547 item 2) keys on `ref_raw` alone, so the missing
+// `chapter` key never matters — only `base.ref_raw` is ever consulted.
 {
   const base = { verse: 2, ref_raw: "1:2" };
   eq(
     classifyTsvRefMove({ chapter: 1, verse: 6, ref_raw: "1:6" }, { chapter: 1, verse: 2, refRaw: "1:2" }, base, false),
     "ours_moved",
-    "same-chapter move stays attributable when the ancestor never recorded chapter",
+    "same-chapter move stays attributable from ref_raw alone, chapter ancestor or not",
   );
 }
 
-// But a component that DOES differ and has no ancestor value is unattributable.
+// Issue #547 item 2: `chapter`/`verse` disagreeing while `ref_raw` agrees is
+// NOT a move — the export can never publish a `chapter`/`verse`-only
+// divergence (see tsvRefMoved's comment), so it must not withhold the
+// resource's watermark. This used to classify `unattributable` (a component
+// with no ancestor value) purely because chapter was compared at all.
 {
   const base = { verse: 2, ref_raw: "1:2" };
   eq(
     classifyTsvRefMove({ chapter: 1, verse: 2, ref_raw: "1:2" }, { chapter: 5, verse: 2, refRaw: "1:2" }, base, false),
-    "unattributable",
-    "a differing component the ancestor never recorded -> unattributable",
+    "none",
+    "chapter-only divergence with agreeing ref_raw is 'none', not a hold (#547 item 2)",
   );
 }
 
@@ -661,14 +690,19 @@ deep(tsvMergeFields("tq"), ["quote", "question", "response"], "tq field list");
 }
 
 // Verse 0 is a real reference in this repo (chapter-front `front:intro` rows),
-// so a recorded 0 must read as PRESENT, never as absent-and-unattributable.
+// so a recorded 0 must read as PRESENT, never as absent — foldTsvRefBase still
+// folds it in for diagnostics even though classifyTsvRefMove no longer reads
+// chapter/verse for attribution (#547 item 2).
 {
   const base = foldTsvRefBase([{ action: "create", payload: { chapter: 0, verse: 0, ref_raw: "front:intro" } }]);
   deep(base, { chapter: 0, verse: 0, ref_raw: "front:intro" }, "a recorded chapter/verse of 0 is present, not absent");
+  // A verse-only divergence on a front:intro row (ref_raw identical) is exactly
+  // the #547 item 2 shape: it cannot reach master (export publishes ref_raw,
+  // not verse), so it must not classify as a move.
   eq(
     classifyTsvRefMove({ chapter: 0, verse: 0, ref_raw: "front:intro" }, { chapter: 0, verse: 1, refRaw: "front:intro" }, base, false),
-    "theirs_moved",
-    "verse 0 ancestor attributes a move off it (0 is not treated as missing)",
+    "none",
+    "verse-only divergence with agreeing ref_raw is 'none', even at verse 0 (#547 item 2)",
   );
 }
 
@@ -699,21 +733,21 @@ deep(tsvMergeFields("tq"), ["quote", "question", "response"], "tq field list");
 
 // Absent-ish values must stay ABSENT, not coerce to 0 — because 0 is a REAL
 // reference here (chapter-front `front:intro`). `Number(null)`, `Number("")`,
-// `Number(false)` and `Number([])` are all a finite 0, which would turn a
-// fail-safe absence into a fail-unsafe wrong ancestor.
+// `Number(false)` and `Number([])` are all a finite 0, which would fold a
+// fail-safe absence into a fail-unsafe wrong `verse` ancestor. (`verse` is
+// diagnostics-only for classifyTsvRefMove post-#547 — see below — but
+// foldTsvRefBase's own contract still must not manufacture a false 0.)
 {
   for (const [label, value] of [["null", null], ["empty string", ""], ["false", false], ["empty array", []]]) {
     const base = foldTsvRefBase([{ action: "create", payload: { chapter: 1, verse: value, ref_raw: "1:2" } }]);
     eq(base.verse, undefined, `a ${label} verse is absent, not 0`);
-    // Absent is the fail-SAFE state: `verse` differs between the two sides and
-    // the ancestor never recorded it, so the move is unattributable and holds.
-    // Coerced to 0 it would instead read as "the ancestor said verse 0, and D1
-    // moved away from it" — a confident, wrong `ours_moved` that lets the
-    // export overwrite Door43. That flip is the whole point of the guard.
+    // classifyTsvRefMove (#547 item 2) attributes on `ref_raw` alone, so a
+    // missing `verse` ancestor never withholds attribution — only a missing
+    // `ref_raw` ancestor does (covered separately above).
     eq(
       classifyTsvRefMove({ chapter: 1, verse: 5, ref_raw: "1:5" }, { chapter: 1, verse: 2, refRaw: "1:2" }, base, false),
-      "unattributable",
-      `…so a ${label} verse withholds instead of asserting a verse-0 ancestor`,
+      "ours_moved",
+      `…and a ${label} verse ancestor still attributes cleanly from ref_raw alone`,
     );
   }
   // A genuine 0 still folds — the two must not be conflated.
