@@ -1092,7 +1092,14 @@ rows.post("/:kind/:id/dismiss-review", requireEditor, async (c) => {
   const [updateRes] = await c.env.DB.batch([
     c.env.DB
       .prepare(
-        `UPDATE ${KIND_TO_TABLE[kind]} SET review_kind = NULL, review_reason = NULL, updated_at = ?1
+        // review_master_json goes with the flag (#653, migration 0057): it is
+        // the Door43-side snapshot the flag was raised against, and behind a
+        // NULL review_kind it describes nothing, renders nowhere (the lint feed
+        // gates `door43` on the flag's own presence) and would be overwritten
+        // at the next mint anyway. Cleared here for the same reason every other
+        // clear site clears it — a dismissed row should carry no residue of the
+        // warning it dismissed.
+        `UPDATE ${KIND_TO_TABLE[kind]} SET review_kind = NULL, review_reason = NULL, review_master_json = NULL, updated_at = ?1
            WHERE id = ?2${bookClause(3)} AND review_kind IS NOT NULL AND deleted_at IS NULL${trashedGuard}${reviewKindGuard}${reviewReasonGuard}`,
       )
       .bind(...updateBinds),

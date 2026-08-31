@@ -449,6 +449,52 @@ console.log("\n[chapter-lock parity: a lock on a DIFFERENT resource does not blo
   eq(res.status, 200, "twl is unlocked by a tqs-only run");
 }
 
+// ── #653: the Door43 snapshot goes with the flag ────────────────────────────
+//
+// review_master_json (migration 0057) holds what Door43 held for the row when
+// the flag was raised. Behind a NULL review_kind it describes nothing and
+// renders nowhere (the lint feed gates `door43` on the flag's presence), so a
+// dismissed row must not keep it — same rule every other clear site follows.
+console.log("\n[#653: a dismiss clears the Door43 snapshot along with the flag]");
+{
+  const { sqlite, dismiss } = freshApp();
+  seedTn(sqlite, { reviewKind: "merge_no_base", reviewReason: "could not be checked" });
+  const snapshot = JSON.stringify({
+    ref_raw: "36:21",
+    note: "Door43's own note",
+    _meta: { flag_at: 1787000000, flag_since: 1786000000 },
+  });
+  sqlite.prepare(`UPDATE tn_rows SET review_master_json = ? WHERE id = 'ab12' AND book = ?`).run(snapshot, BOOK);
+
+  const res = await dismiss("tn", "ab12", BOOK);
+  eq(res.status, 200, "the dismiss is accepted");
+
+  const r = tnRow(sqlite);
+  eq(r.review_kind, null, "the flag is cleared");
+  eq(r.review_master_json, null, "…and the snapshot with it — no residue of the dismissed warning");
+  eq(r.note, NOTE, "…content still untouched");
+  eq(r.version, 4, "…and still no version bump");
+}
+
+console.log("\n[#653: a NO-OP dismiss leaves the snapshot alone]");
+{
+  // The stale-dismiss guard's whole point is that a flag the client never saw
+  // is not silently dropped. The snapshot rides that decision: if the flag
+  // survives, its evidence must survive with it, or the chip would be left
+  // describing a comparison the reader can no longer see.
+  const { sqlite, dismiss } = freshApp();
+  seedTn(sqlite, { reviewKind: "merge_kept", reviewReason: "your value was kept" });
+  const snapshot = JSON.stringify({ ref_raw: "36:21", note: "Door43's own note" });
+  sqlite.prepare(`UPDATE tn_rows SET review_master_json = ? WHERE id = 'ab12' AND book = ?`).run(snapshot, BOOK);
+
+  const res = await dismiss("tn", "ab12", BOOK, { review_kind: "merge_no_base" });
+  eq(res.status, 200, "a stale dismiss still answers 200 with the current truth");
+  const r = tnRow(sqlite);
+  eq(r.review_kind, "merge_kept", "the flag the client never saw survives");
+  eq(r.review_master_json, snapshot, "…and so does the snapshot it is about");
+  eq(r.updated_at, PAST_UPDATED_AT, "…the UPDATE never fired at all");
+}
+
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed`);
   process.exit(1);

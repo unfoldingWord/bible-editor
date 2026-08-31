@@ -45,6 +45,7 @@ import {
   recordWithheldSyncIfAbsent,
 } from "./bookReimport.ts";
 import { contentPatchClearClauses } from "./contentPatchClauses.ts";
+import { lintTqRows } from "./lint.ts";
 import { shouldRecordResourceSync } from "./reimportSyncGate.ts";
 
 // Snapshot reader that tolerates a missing or garbled snapshot, so ablating the
@@ -2122,6 +2123,55 @@ console.log("\n[#653: with NO ancestor at all, the mint is gated on the measured
     eq(after.review_kind, null, "the content edit clears the flag");
     eq(after.review_master_json, null, "…and the snapshot with it — a snapshot behind a NULL flag is invisible");
   }
+}
+
+console.log("\n[#653 x #664: a flag minted HERE emits real Door43 fields, and no bookkeeping, THERE]");
+{
+  // The seam between this PR and #664, exercised end to end rather than
+  // asserted from either side: the nightly mints the snapshot (this branch
+  // writes `_meta` bookkeeping inside the same column), the row is stored, and
+  // the lint feed (#664, now on main) emits it as the UI's "Door43's row
+  // value". If either side changed its mind about `_meta` the reader would see
+  // `flag_since` rendered as a Door43 column that does not exist.
+  const { sqlite, env } = freshEnv();
+  sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (1, 100, 'translator')`).run();
+  sqlite
+    .prepare(
+      `INSERT INTO tq_rows (id, book, chapter, verse, ref_raw, question, response, tags, version, updated_by)
+       VALUES ('sx01', ?, 9, 9, '9:9', 'app question', 'r', NULL, 1, 1)`,
+    )
+    .run(BOOK);
+  // No edit_log at all -> genuinely no ancestor -> keep_no_base -> a real mint
+  // through the production path, snapshot and all.
+  await applyTsvRows(
+    env, BOOK, "tq",
+    [{
+      id: "sx01", idCoerced: false, refRaw: "9:9", chapter: 9, verse: 9,
+      occurrence: null, tags: null, quote: null, question: "master question", response: "r",
+    }],
+    null, { confirmedAt: 200, editId: null, lineage: HUMAN_LINEAGE },
+  );
+
+  const stored = sqlite.prepare(`SELECT * FROM tq_rows WHERE id = 'sx01'`).all()[0];
+  eq(stored.review_kind, "merge_no_base", "the nightly minted the flag");
+  eq(
+    typeof parseSnap(stored.review_master_json)._meta?.flag_since,
+    "number",
+    "…and the stored column DOES carry this branch's bookkeeping",
+  );
+
+  // Now through the REAL lint feed, the same call the API route makes.
+  const issue = lintTqRows([stored]).find((x) => x.rowId === "sx01");
+  eq(issue != null, true, "the lint feed surfaces the flag");
+  eq(
+    Object.keys(issue.door43).sort(),
+    ["question", "ref_raw", "response", "tags"],
+    "…and emits exactly the tq review fields as Door43's value",
+  );
+  eq("_meta" in issue.door43, false, "…with the bookkeeping stripped, never rendered as a Door43 field");
+  eq(issue.door43.question, "master question", "…carrying master's real value");
+  eq(issue.ours.question, "app question", "…against ours, for the side-by-side");
+  eq(issue.dismissible, true, "…and it can be dismissed from the popup");
 }
 
 console.log("\n[#653: the auto-clear retires flags the commit history now disproves]");
