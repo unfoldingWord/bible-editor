@@ -61,6 +61,7 @@ function freshDb() {
       book TEXT NOT NULL,
       sort_order INTEGER NOT NULL,
       version INTEGER NOT NULL DEFAULT 1,
+      updated_at INTEGER NOT NULL DEFAULT 0,
       PRIMARY KEY (book, id)
     );
   `);
@@ -68,8 +69,10 @@ function freshDb() {
 }
 
 function seed(sqlite, rows) {
-  const stmt = sqlite.prepare(`INSERT INTO twl_rows (id, book, sort_order, version) VALUES (?, ?, ?, ?)`);
-  for (const r of rows) stmt.run(r.id, r.book, r.sort_order, r.version ?? 1);
+  const stmt = sqlite.prepare(
+    `INSERT INTO twl_rows (id, book, sort_order, version, updated_at) VALUES (?, ?, ?, ?, ?)`,
+  );
+  for (const r of rows) stmt.run(r.id, r.book, r.sort_order, r.version ?? 1, r.updated_at ?? 0);
 }
 
 function readRow(sqlite, book, id) {
@@ -107,7 +110,7 @@ console.log("\n[issue #587 success check: allowLocked + dry run leaves twl_rows.
   eq(readRow(sqlite, BOOK, "bbbb"), { sort_order: 2, version: 1 }, "dry run: row bbbb's sort_order is untouched");
 }
 
-console.log("\n[a non-dry allowLocked run keeps today's behavior: sort_order IS written]");
+console.log("\n[a non-dry allowLocked run keeps today's behavior: sort_order IS written, version untouched (#687)]");
 {
   const sqlite = freshDb();
   seed(sqlite, [
@@ -118,15 +121,19 @@ console.log("\n[a non-dry allowLocked run keeps today's behavior: sort_order IS 
 
   await maybeApplyTwlSortOrder(db, BOOK, updates, /* dcsAllowed */ true);
 
+  // #687: a pure reorder is positional metadata, not content — it must not
+  // bump version (which would have no edit_log row to explain it) and must
+  // match rows.ts's in-app reorder fast path, which likewise leaves version
+  // alone.
   eq(
     readRow(sqlite, BOOK, "aaaa"),
-    { sort_order: 5, version: 2 },
-    "live run: row aaaa's sort_order is written, version bumped",
+    { sort_order: 5, version: 1 },
+    "live run: row aaaa's sort_order is written, version unchanged",
   );
   eq(
     readRow(sqlite, BOOK, "bbbb"),
-    { sort_order: 6, version: 2 },
-    "live run: row bbbb's sort_order is written, version bumped",
+    { sort_order: 6, version: 1 },
+    "live run: row bbbb's sort_order is written, version unchanged",
   );
 }
 
