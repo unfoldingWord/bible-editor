@@ -174,8 +174,17 @@ export function App() {
   // A later *successful* silent refresh (api.ts fires onAuthRefreshed) means
   // the session is alive after all — a transient network blip / timeout during
   // one refresh attempt must not leave "session expired" up forever while the
-  // outbox drains fine. Nothing else clears the flag.
+  // outbox drains fine.
   useEffect(() => onAuthRefreshed(() => setSessionExpired(false)), []);
+  // The auth gate can also land back on "ready" via a path that never goes
+  // through refreshAuthOnce() — dev mode's silent /api/auth/dev mint on a
+  // cold load, or a fresh /api/auth/me 200. Either means the session is fine,
+  // so any stale "session expired" toast raised earlier in the same boot
+  // (e.g. a background request's 401 firing before the mint lands) must not
+  // outlive it.
+  useEffect(() => {
+    if (auth.kind === "ready") setSessionExpired(false);
+  }, [auth.kind]);
 
   // Shell has acted on a `?c=<id>` deep link. Clear it from the URL AND from
   // our own state: replaceState fires no hashchange, so the hashchange listener
@@ -409,10 +418,12 @@ export function App() {
       <Snackbar
         open={sessionExpired}
         anchorOrigin={{ vertical: "top", horizontal: "center" }}
+        sx={{ pointerEvents: "none" }}
       >
         <Alert
           severity="warning"
           variant="filled"
+          sx={{ pointerEvents: "auto" }}
           action={
             <Button color="inherit" size="small" onClick={handleSessionExpired}>
               Sign in
