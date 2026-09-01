@@ -468,12 +468,12 @@ chapters.delete("/:book/:chapter/twl-order-lock", requireEditor, async (c) => {
       const updates = computeTwlSortOrderUpdates(twlRows.results, ultVerse.results, twTitles);
       // #686: this re-sequence is the ONE interactive caller of
       // applyTwlSortOrderUpdates — a signed-in human dismissed the order lock
-      // and the rows moved as a direct result. Its other two callers (the
-      // nightly reimport and the nightly export) take the helper's default,
-      // which stamps a dcs_sync/"Door43 sync" reorder. Passing the user
-      // provenance explicitly here is what keeps a translator's own click from
-      // being recorded as a Door43 sync — exactly the confusion this issue is
-      // about, and one the default would silently produce.
+      // and the rows moved as a direct result. Provenance is a REQUIRED
+      // parameter of the helper (no default since the F2 fix): the other two
+      // callers, the nightly reimport (dcs_sync) and the nightly export
+      // (system), each state their own. Stamping the user here keeps a
+      // translator's own click from reading as an unattended reorder —
+      // exactly the confusion this issue is about.
       await applyTwlSortOrderUpdates(c.env.DB, book, updates, {
         // 'reorder', not 'sync_reorder': the two differ precisely by who did it,
         // and only sort_order moved here — the same change the drag fast path in
