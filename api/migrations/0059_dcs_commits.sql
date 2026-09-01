@@ -69,6 +69,12 @@ CREATE TABLE dcs_commits (
 -- The read pattern: "what happened on this repo lately", newest first.
 CREATE INDEX dcs_commits_recent ON dcs_commits (repo, committed_at DESC);
 
+-- The OTHER read pattern: "what happened anywhere lately", newest first, with
+-- no repo filter. The index above cannot serve it (repo is the leading column),
+-- so a repo-less GET /api/dcs-commits would scan the table and sort it. The
+-- route branches its SQL so each shape hits one of these two indexes.
+CREATE INDEX dcs_commits_by_time ON dcs_commits (committed_at DESC);
+
 -- Per-repo poll state. Same idea as book_resource_syncs (0028) — a watermark
 -- plus what wrote it — kept in its own small table because the grain is the
 -- repo, not (book, resource).
@@ -95,7 +101,17 @@ CREATE TABLE dcs_repo_polls (
   -- force-push). We still advance last_sha to the new tip, because refusing to
   -- advance would re-walk the same capped range forever and never record
   -- anything new; the sha we could NOT reach is recorded here so the hole is
-  -- visible rather than silently absorbed. Backfilling it is a follow-up.
+  -- visible rather than silently absorbed.
+  --
+  -- OLDEST unresolved gap WINS, and nothing in the poller ever clears it. A
+  -- newer gap must not overwrite an older one (the first version of the upsert
+  -- COALESCEd the other way, which made a repo that capped twice look more
+  -- contiguous than it was), because the field's meaning is "history below this
+  -- sha is not proven contiguous" — the conservative claim. Only a backfill
+  -- that actually walks and closes the hole may clear these two columns, and
+  -- that backfill is the follow-up this table is shaped for. Until then, a
+  -- non-null gap_since_sha is exactly the signal that stops anything from
+  -- treating this ledger as complete coverage of a window.
   gap_since_sha TEXT,
   gap_at INTEGER
 );

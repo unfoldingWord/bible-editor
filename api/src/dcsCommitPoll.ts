@@ -52,7 +52,7 @@
 
 import type { Env } from "./index";
 import { listMasterCommitsSince, TRACKED_DCS_REPOS } from "./dcsSources.ts";
-import { classifyMasterCommit, type MasterCommit, type ClassifiedCommit } from "./masterLineage.ts";
+import { classifyMasterCommit, OURS_PREFIX, type MasterCommit, type ClassifiedCommit } from "./masterLineage.ts";
 
 /** One real poll per repo per this many seconds (the 5-min cron just checks). */
 export const DCS_POLL_INTERVAL_SECONDS = 30 * 60;
@@ -67,6 +67,15 @@ export const DCS_POLL_COMMIT_CAP = 200;
  * that rides in the final chunk (81 worst case) and stays clear of the cap.
  */
 export const DCS_POLL_WRITE_BATCH = 80;
+/**
+ * Per-fetch timeout (review finding F14). Without it a hanging Door43 holds the
+ * whole scheduled invocation, and this poller shares its tick with the pipeline
+ * poll, the stale-lock sweep and the hourly edit_log retention sweep — none of
+ * which should be starved by one slow upstream. 20s × 4 pages is still a
+ * generous ceiling, and an abort is just `fetch_failed`, which already means
+ * "do not advance the mark, retry next interval".
+ */
+export const DCS_POLL_FETCH_TIMEOUT_MS = 20_000;
 /** How far back a never-polled repo is seeded. */
 export const DCS_POLL_BOOTSTRAP_SECONDS = 30 * 86400;
 /**
@@ -105,7 +114,22 @@ export function repoNeedsPoll(
   return nowSeconds - last >= intervalSeconds;
 }
 
-/** The boundary to walk to: the stored sha, or the bootstrap time window. */
+/**
+ * The boundary to walk to: the stored sha, or the bootstrap time window.
+ *
+ * KNOWN LIMIT OF THE TIME BOUND (review finding F2, documented not fixed).
+ * listMasterCommitsSince ends a time-bounded walk at the first commit whose
+ * AUTHOR date predates `sinceTime`, and repo-scoped history is not sorted by
+ * author date — a rebased or cherry-picked commit carries an old author date
+ * while sitting near the tip. So a bootstrap walk can terminate early, on that
+ * one commit, and report `incomplete: false`: no gap is recorded, because the
+ * walker genuinely believes it reached the far side of the range. The blast
+ * radius is bounded to BOOTSTRAP only (every later poll uses the sha bound,
+ * which is exact) and the loss is old history, never a new commit. Fixing it
+ * properly means bounding on committer date, which the walker cannot do without
+ * changing what gating reads — hence a follow-up issue rather than a change
+ * here.
+ */
 export function pollBounds(
   state: DcsPollStateRow | null | undefined,
   nowSeconds: number,
@@ -135,20 +159,73 @@ function subjectOf(message: string | null | undefined): string | null {
   return (nl === -1 ? message : message.slice(0, nl)).trimEnd();
 }
 
+// Gitea's own merge-commit subject: `Merge pull request '<inner subject>' (#N)
+// from <branch> into master`. Measured verbatim on git.door43.org 2026-09-01.
+const MERGE_SUBJECT = /^Merge pull request\s+['"](.+)['"]\s*\(#\d+\)/;
+
 /**
- * Turn one walk's commits into ledger rows. Pure — the classification is
- * whatever classifyMasterCommit says, with no second opinion applied here, and
- * the cap is applied to the NEWEST commits (the array is newest-first) so a
- * truncated walk still leaves the tip contiguous with the mark we then store.
+ * LEDGER-LOCAL classification. Wraps classifyMasterCommit; never replaces it,
+ * and does not touch it — the gating paths share that function and its rules
+ * rest on a measured 46,802-commit corpus of PATH-scoped history.
+ *
+ * WHY A WRAPPER IS NEEDED HERE (review finding F4, and it is the common case,
+ * not an edge). This poller walks REPO-scoped history, which is full of Gitea
+ * merge commits that path-scoped history mostly hides. classifyMasterCommit's
+ * `ours` test is anchored at the start of the subject — deliberately, so that a
+ * human `Revert "bible-editor: …"` cannot be misread as our own export — and an
+ * anchored test cannot see through a `Merge pull request '…'` wrapper. MEASURED
+ * over the newest 1,000 commits of en_ult + en_tn (2026-09-01): 262 are merge
+ * commits and 113 of those wrap one of our own exports, e.g.
+ *
+ *     Merge pull request 'bible-editor: LAM ult → master' (#6555) from LAM-be into master
+ *
+ * Every one of those 113 would be recorded as a HUMAN maintainer's edit — in a
+ * table whose entire purpose is saying who did what. So: unwrap the merge
+ * subject, and if the INNER subject is one of ours, say `ours`. Anything else
+ * defers to classifyMasterCommit on the FULL subject, which is what keeps the
+ * existing rules in charge: a merge of a bp-assistant push still reaches
+ * AI_MARKER, and `Revert "Merge pull request '…'"` never matches the anchored
+ * MERGE_SUBJECT at all, so it stays human.
+ *
+ * The wrapper only ever moves a commit human → ours, i.e. it can only ever
+ * REMOVE our own machine's pushes from the human column. It cannot mask a real
+ * maintainer edit, because a maintainer's subject does not contain our export
+ * prefix inside a merge wrapper.
+ */
+export function classifyForLedger(commit: MasterCommit): { kind: ClassifiedCommit["kind"]; reason: string } {
+  const subject = subjectOf(commit.message) ?? "";
+  const merge = MERGE_SUBJECT.exec(subject);
+  if (merge && OURS_PREFIX.test(merge[1])) {
+    return { kind: "ours", reason: "merge_of_bible_editor_export" };
+  }
+  const classified = classifyMasterCommit(commit);
+  return { kind: classified.kind, reason: classified.reason };
+}
+
+/**
+ * Turn one walk's commits into ledger rows. Pure. The cap is applied to the
+ * NEWEST commits (the array is newest-first) so a truncated walk still leaves
+ * the tip contiguous with the mark we then store — and `dropped` reports
+ * whether it actually cut anything, because a silent truncation would be a
+ * coverage hole indistinguishable from complete data (review finding F7). The
+ * cap is normally unreachable (4 pages × 50 = exactly 200), so a non-zero
+ * `dropped` means Gitea's page size changed under us; the caller records it the
+ * same way it records a page cap rather than discarding the difference.
  */
 export function ledgerRowsFromCommits(
   repo: string,
   commits: MasterCommit[],
   cap: number = DCS_POLL_COMMIT_CAP,
-): LedgerRow[] {
-  return commits.slice(0, cap).map((c) => {
-    const classified = classifyMasterCommit(c);
-    const at = typeof c.date === "string" ? Date.parse(c.date) : NaN;
+): { rows: LedgerRow[]; dropped: number } {
+  const kept = commits.slice(0, cap);
+  const rows = kept.map((c) => {
+    const classified = classifyForLedger(c);
+    // COMMITTER date first (review finding F6): the ledger's question is "when
+    // did this land on master", and author date answers "when was it first
+    // written" — different on every rebase, cherry-pick and squash merge, which
+    // is most of how work reaches these repos. Author date is the fallback for
+    // a payload without a committer block.
+    const at = Date.parse(c.committerDate ?? c.date ?? "");
     const files = c.files;
     return {
       repo,
@@ -163,6 +240,7 @@ export function ledgerRowsFromCommits(
       filesJson: files == null ? null : JSON.stringify(files.slice(0, DCS_POLL_MAX_FILES)),
     };
   });
+  return { rows, dropped: commits.length - kept.length };
 }
 
 /**
@@ -180,18 +258,46 @@ const INSERT_COMMIT_SQL = `INSERT INTO dcs_commits
  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
  ON CONFLICT (repo, sha) DO NOTHING`;
 
+// ATTEMPT CLAIM (review finding F1). Written BEFORE the walk, in its own tiny
+// batch-free statement, because the alternative was a fetch loop with no exit:
+// last_attempted_at used to be stamped only by the results upsert in the FINAL
+// write batch, so ANY write failure — a D1 outage, or simply the migration not
+// yet applied in prod — left the stamp unwritten, every repo permanently "due",
+// and all five re-polled on every 5-minute tick forever. Claiming the attempt
+// first inverts that: a broken write path costs one poll per repo per interval,
+// which is the same cost as a broken Door43.
+const CLAIM_ATTEMPT_SQL = `INSERT INTO dcs_repo_polls (repo, last_attempted_at)
+ VALUES (?1, ?2)
+ ON CONFLICT (repo) DO UPDATE SET last_attempted_at = excluded.last_attempted_at`;
+
 const UPSERT_POLL_SQL = `INSERT INTO dcs_repo_polls
    (repo, last_sha, last_committed_at, last_attempted_at, last_success_at,
     last_status, gap_since_sha, gap_at)
  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
  ON CONFLICT (repo) DO UPDATE SET
-   last_sha = COALESCE(excluded.last_sha, dcs_repo_polls.last_sha),
-   last_committed_at = COALESCE(excluded.last_committed_at, dcs_repo_polls.last_committed_at),
+   -- ?9 = "the ingest completed, advance the mark". last_sha and
+   -- last_committed_at move TOGETHER off that one flag (review finding F12):
+   -- COALESCEing them independently let a tip with an unparseable date write
+   -- the new sha while keeping the PREVIOUS commit's timestamp, so the pair
+   -- described two different commits. A null date for the current tip is the
+   -- honest answer; a stale one from another commit is not.
+   last_sha = CASE WHEN ?9 = 1 THEN excluded.last_sha ELSE dcs_repo_polls.last_sha END,
+   last_committed_at = CASE WHEN ?9 = 1 THEN excluded.last_committed_at ELSE dcs_repo_polls.last_committed_at END,
    last_attempted_at = excluded.last_attempted_at,
    last_success_at = COALESCE(excluded.last_success_at, dcs_repo_polls.last_success_at),
    last_status = excluded.last_status,
-   gap_since_sha = COALESCE(excluded.gap_since_sha, dcs_repo_polls.gap_since_sha),
-   gap_at = COALESCE(excluded.gap_at, dcs_repo_polls.gap_at)`;
+   -- OLDEST unresolved gap WINS (review finding F3). The COALESCE used to run
+   -- the other way and let each new gap overwrite the previous one, so a repo
+   -- that hit its page cap twice reported only the second hole and looked more
+   -- contiguous than it was. Coverage claims must err conservative: the field
+   -- means "history below this sha is not proven contiguous", and only a
+   -- backfill that actually closes the hole may clear it (no code clears it
+   -- today — that is the follow-up this table is shaped for). Set as a pair
+   -- with gap_at, for the same reason as last_sha/last_committed_at above.
+   gap_since_sha = CASE WHEN dcs_repo_polls.gap_since_sha IS NULL
+                          THEN excluded.gap_since_sha ELSE dcs_repo_polls.gap_since_sha END,
+   gap_at = CASE WHEN dcs_repo_polls.gap_since_sha IS NULL
+                   THEN excluded.gap_at ELSE dcs_repo_polls.gap_at END`;
 
 export interface RepoPollResult {
   repo: string;
@@ -220,20 +326,28 @@ export async function pollDcsRepo(env: Env, repo: string, nowSeconds: number): P
     return { repo, polled: false, fetched: 0, inserted: 0, status: "not_due", advanced: false, gapSince: null };
   }
 
+  // Claim the attempt BEFORE spending a single fetch. See CLAIM_ATTEMPT_SQL.
+  await env.DB.prepare(CLAIM_ATTEMPT_SQL).bind(repo, nowSeconds).run();
+
   const { sinceSha, sinceTime } = pollBounds(state, nowSeconds);
   const page = await listMasterCommitsSince(env, repo, null, sinceSha, {
     pageLimit: DCS_POLL_PAGE_LIMIT,
     sinceTime,
     files: true,
+    timeoutMs: DCS_POLL_FETCH_TIMEOUT_MS,
   });
 
-  const rows = ledgerRowsFromCommits(repo, page.commits);
-  const status = page.incomplete ? page.incompleteReason || "incomplete" : "ok";
-  const advance = !page.incomplete || advancesDespiteIncomplete(page.incompleteReason);
+  const { rows, dropped } = ledgerRowsFromCommits(repo, page.commits);
+  // A defensive-cap truncation is a coverage hole exactly like a page cap, and
+  // must be recorded as one rather than discarded (review finding F7). It can
+  // only happen if Gitea's fixed 50-per-page changes under us, so it also
+  // doubles as the alarm for that.
+  const status = dropped > 0 ? "commit_cap" : page.incomplete ? page.incompleteReason || "incomplete" : "ok";
+  const advance = dropped > 0 || !page.incomplete || advancesDespiteIncomplete(page.incompleteReason);
   // The tip is rows[0] — the walk is newest-first.
   const tip = rows[0] ?? null;
   const gapSince =
-    page.incomplete && advancesDespiteIncomplete(page.incompleteReason)
+    dropped > 0 || (page.incomplete && advancesDespiteIncomplete(page.incompleteReason))
       ? (sinceSha ?? rows[rows.length - 1]?.sha ?? null)
       : null;
 
@@ -268,13 +382,17 @@ export async function pollDcsRepo(env: Env, repo: string, nowSeconds: number): P
   );
   const pollStatement = env.DB.prepare(UPSERT_POLL_SQL).bind(
     repo,
-    advance ? (tip?.sha ?? null) : null,
-    advance ? (tip?.committedAt ?? null) : null,
+    // The pair travels together and the ?9 flag below decides whether it lands
+    // — see UPSERT_POLL_SQL. `tip?.committedAt` may legitimately be null.
+    tip?.sha ?? null,
+    tip?.committedAt ?? null,
     nowSeconds,
     page.incomplete && !advance ? null : nowSeconds,
     status,
     gapSince,
     gapSince ? nowSeconds : null,
+    // ?9 — advance the (last_sha, last_committed_at) pair, or leave both.
+    advance ? 1 : 0,
   );
 
   // The poll upsert rides in the LAST chunk, so the watermark can only advance
@@ -311,6 +429,16 @@ export async function pollDcsRepo(env: Env, repo: string, nowSeconds: number): P
  * is nowhere near needing concurrency, and serial keeps the subrequest and D1
  * pressure of one tick flat and predictable. A failure on one repo must not
  * skip the rest, so each is wrapped.
+ *
+ * NO IN-FLIGHT LOCK, deliberately (review finding F13). Two overlapping
+ * scheduled invocations — a retry, or a slow tick still running when the next
+ * fires — can both decide the same repo is due and walk it twice. That is
+ * WASTE, not corruption: the attempt claim makes the second one see a fresh
+ * last_attempted_at in most orderings, every insert is ON CONFLICT DO NOTHING,
+ * and the watermark can only move forward to a tip both walks would agree on.
+ * The worst case is a few duplicated fetches. A real lock (a claim row with an
+ * expiry, plus the stale-lock sweep it would then need — see
+ * book_import_locks) costs more moving parts than the waste it prevents.
  */
 export async function pollDcsCommits(env: Env, nowSeconds?: number): Promise<RepoPollResult[]> {
   const now = nowSeconds ?? Math.floor(Date.now() / 1000);

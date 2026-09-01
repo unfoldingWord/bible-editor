@@ -179,6 +179,15 @@ export interface MasterCommit {
   /** commit.author.date, ISO-8601. Diagnostic only. */
   date?: string | null;
   /**
+   * commit.committer.date, ISO-8601 — WHEN THE COMMIT LANDED, as opposed to
+   * when its author first wrote it. The two differ on a rebase, a cherry-pick,
+   * or a squash merge, which is most of how work reaches these repos. Read only
+   * by the dcs_commits ledger (issue #685), whose question is "when did this
+   * arrive on master"; never classified on, and deliberately NOT substituted for
+   * `date` anywhere gating reads it.
+   */
+  committerDate?: string | null;
+  /**
    * parents[0].sha — first parent only, i.e. "master's previous tip". Present
    * only for callers that need to store lineage (the dcs_commits ledger,
    * issue #685); never classified on. Absent on every existing caller's
@@ -205,7 +214,12 @@ export interface ClassifiedCommit extends MasterCommit {
 // checked: this classifier is already scoped to one file's history by the
 // caller, and a stricter match would fail closed to `human` on any future
 // wording change, which is the safe direction anyway.
-const OURS_PREFIX = /^bible-editor(?: export)?:\s/;
+// EXPORTED so the dcs_commits ledger's merge-commit wrapper (issue #685,
+// dcsCommitPoll.ts) can test the SAME anchored pattern against a subject it has
+// unwrapped, instead of writing a second copy of it that could drift. Exporting
+// a regex changes no behavior here; the wrapper deliberately does not touch
+// classifyMasterCommit itself, because gating shares it.
+export const OURS_PREFIX = /^bible-editor(?: export)?:\s/;
 
 // bp-assistant's own marker. Kept as a second, independent route to `ai` so a
 // future bot that pushes under a different author is still recognized — but see

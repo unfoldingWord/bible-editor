@@ -364,7 +364,7 @@ export async function listMasterCommitsSince(
   repo: string,
   path: string | null,
   sinceSha: string | null,
-  opts: { pageLimit?: number; sinceTime?: number | null; files?: boolean } = {},
+  opts: { pageLimit?: number; sinceTime?: number | null; files?: boolean; timeoutMs?: number } = {},
 ): Promise<MasterCommitPage> {
   const pageLimit = opts.pageLimit ?? 5;
   // The watermark bound, in unix seconds. When present it REPLACES the sha as
@@ -391,7 +391,16 @@ export async function listMasterCommitsSince(
     let batch: Array<Record<string, unknown>>;
     let lastPage: boolean;
     try {
-      const r = await fetch(url, { headers });
+      // `timeoutMs` is opt-in (issue #685 review): a hanging Door43 otherwise
+      // holds the whole Worker invocation, and the poller shares its cron tick
+      // with the pipeline poll and the hourly edit_log sweep. An abort lands in
+      // the catch below as `fetch_failed`, which is already the
+      // treat-as-incomplete path — no new failure mode. Existing callers pass
+      // nothing and keep today's unbounded wait.
+      const r = await fetch(url, {
+        headers,
+        ...(opts.timeoutMs ? { signal: AbortSignal.timeout(opts.timeoutMs) } : {}),
+      });
       if (!r.ok) return { commits: out, incomplete: true, incompleteReason: `http_${r.status}` };
       const body = await r.json();
       if (!Array.isArray(body)) return { commits: out, incomplete: true, incompleteReason: "bad_body" };
@@ -419,6 +428,7 @@ export async function listMasterCommitsSince(
       if (!sha) return { commits: out, incomplete: true, incompleteReason: "commit_without_sha" };
       const commit = (raw.commit ?? {}) as Record<string, unknown>;
       const author = (commit.author ?? {}) as Record<string, unknown>;
+      const committer = (commit.committer ?? {}) as Record<string, unknown>;
       if (sinceTime == null) {
         // EXCLUSIVE: sinceSha is the ancestor itself, already accounted for.
         if (sha === sinceSha) return { commits: out, incomplete: false, incompleteReason: "" };
@@ -432,9 +442,13 @@ export async function listMasterCommitsSince(
           return { commits: out, incomplete: false, incompleteReason: "" };
         }
       }
-      // parents[0] only — first-parent IS "master's previous tip". A merge's
-      // second parent is the branch that was merged in, which is not on the
-      // line we are walking.
+      // parents[0] — the commit's FIRST GIT PARENT, and nothing more than that
+      // (review finding F5 corrected an earlier comment here). It equals
+      // "master's previous tip" only for a commit made directly on master or for
+      // a merge commit; under repo-scoped history the list also contains commits
+      // that arrived on a feature branch, whose first parent is their own branch
+      // predecessor. A merge's SECOND parent (the merged branch) is deliberately
+      // not stored — first-parent is the line "walking master back" follows.
       const parents = Array.isArray(raw.parents) ? (raw.parents as Array<Record<string, unknown>>) : [];
       const parentSha = typeof parents[0]?.sha === "string" ? (parents[0].sha as string) : null;
       // Only present when the caller asked (`files: true`); `null` distinguishes
@@ -450,6 +464,10 @@ export async function listMasterCommitsSince(
         authorEmail: typeof author.email === "string" ? author.email : null,
         authorName: typeof author.name === "string" ? author.name : null,
         date: typeof author.date === "string" ? author.date : null,
+        // WHEN IT LANDED, which is a different question from when it was
+        // authored (rebase / cherry-pick / squash merge). Measured present on
+        // this endpoint alongside commit.author — see the ledger's committed_at.
+        committerDate: typeof committer.date === "string" ? committer.date : null,
         parentSha,
         ...(opts.files === true ? { files } : {}),
       });

@@ -22,6 +22,7 @@ import {
   DCS_POLL_PAGE_LIMIT,
   DCS_POLL_WRITE_BATCH,
   advancesDespiteIncomplete,
+  classifyForLedger,
   ledgerRowsFromCommits,
   pollBounds,
   pollDcsRepo,
@@ -113,6 +114,11 @@ function mockDb(stateRow) {
     async all() {
       return { results: [] };
     },
+    // The attempt claim (F1) is a single statement outside any batch.
+    async run() {
+      executed.push({ sql: this.sql, args: this.args, viaRun: true });
+      return { success: true };
+    },
   });
   return {
     executed,
@@ -132,8 +138,13 @@ function mockDb(stateRow) {
   };
 }
 
+// The RESULTS upsert, not the attempt claim — both touch dcs_repo_polls, and
+// only the results one carries last_status.
 function pollUpsert(db) {
-  return db.executed.find((e) => e.sql.includes("dcs_repo_polls"));
+  return db.executed.find((e) => e.sql.includes("dcs_repo_polls") && e.sql.includes("last_status"));
+}
+function claimStmt(db) {
+  return db.executed.find((e) => e.viaRun === true);
 }
 function inserts(db) {
   return db.executed.filter((e) => e.sql.includes("INSERT INTO dcs_commits"));
@@ -294,14 +305,14 @@ async function main() {
     assert(res.status === "http_502", "a 502 mid-walk is reported as http_502");
     assert(inserts(db).length === 50, "  ...page 1's commits are still recorded (rows are keyed, so this is safe)");
     const upsert = pollUpsert(db);
-    assert(upsert.args[1] === null, "  ...the high-water mark is NOT advanced, so the next interval re-walks");
+    assert(upsert.args[8] === 0, "  ...the advance flag is 0, so the high-water mark is NOT moved");
     assert(upsert.args[4] === null, "  ...and last_success_at is left alone");
     assert(upsert.args[3] === NOW, "  ...while last_attempted_at moves, so we retry per interval not per tick");
   }
 
   // ── classification is a PASS-THROUGH of classifyMasterCommit ─────────────
   {
-    const rows = ledgerRowsFromCommits("en_ult", [
+    const { rows } = ledgerRowsFromCommits("en_ult", [
       {
         sha: "s1",
         message: "bible-editor: EZK ult → master (#6711)",
@@ -344,17 +355,182 @@ async function main() {
     const db = mockDb({ repo: "en_tn", last_sha: "tip", last_attempted_at: NOW - 3600 });
     await pollDcsRepo({ DB: db, DCS_BASE_URL: "https://example.test" }, "en_tn", NOW);
     const [row] = inserts(db);
-    assert(row.args[2] === "p1", "parent_sha comes from parents[0].sha (first parent = master's previous tip)");
+    assert(row.args[2] === "p1", "parent_sha comes from parents[0].sha (the FIRST GIT PARENT — not necessarily master's previous tip)");
     assert(row.args[3] === "Someone" && row.args[4] === "h@x", "identity is commit.author.{name,email}, never author.login");
     assert(row.args[9] === '["tn_ZEC.tsv","tn_AMO.tsv"]', "files_json holds the list endpoint's own filenames");
   }
 
   // ── a commit with no files in the response stores NULL, not "[]" ─────────
   {
-    const rows = ledgerRowsFromCommits("en_tn", [
+    const { rows } = ledgerRowsFromCommits("en_tn", [
       { sha: "x", message: "m", authorEmail: null, files: null },
     ]);
     assert(rows[0].filesJson === null, "no file list in the response → files_json NULL, not an empty array");
+  }
+
+  // ── F1: the attempt is CLAIMED BEFORE any fetch ──────────────────────────
+  // Stamping last_attempted_at only in the final write batch meant any write
+  // failure (D1 down, or the migration simply not applied in prod) left every
+  // repo permanently "due" and re-polled all five on every 5-minute tick,
+  // forever. The claim must therefore be written first, and it must be the
+  // first thing that touches D1 after the state read.
+  {
+    let fetchedBeforeClaim = null;
+    const db = mockDb({ repo: "en_tn", last_sha: "tip", last_attempted_at: NOW - 3600 });
+    mockGitea([[commit("n1", "hand fix", "h@x"), commit("tip", "old", "h@x")]]);
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = async (url) => {
+      if (fetchedBeforeClaim === null) fetchedBeforeClaim = claimStmt(db) == null;
+      return realFetch(url);
+    };
+    await pollDcsRepo({ DB: db, DCS_BASE_URL: "https://example.test" }, "en_tn", NOW);
+    assert(fetchedBeforeClaim === false, "the attempt claim is written BEFORE the first Door43 fetch");
+    const claim = claimStmt(db);
+    assert(claim.args[0] === "en_tn" && claim.args[1] === NOW, "  ...stamping last_attempted_at for this repo");
+    assert(
+      db.executed[0].viaRun === true,
+      "  ...as the very first write, so a later write failure cannot un-rate-limit the poller",
+    );
+  }
+
+  // A write failure AFTER the claim must still leave the repo rate-limited.
+  {
+    const db = mockDb({ repo: "en_tn", last_sha: "tip", last_attempted_at: NOW - 3600 });
+    mockGitea([[commit("n1", "hand fix", "h@x"), commit("tip", "old", "h@x")]]);
+    db.batch = async () => {
+      throw new Error("D1_ERROR: database is locked");
+    };
+    let threw = false;
+    try {
+      await pollDcsRepo({ DB: db, DCS_BASE_URL: "https://example.test" }, "en_tn", NOW);
+    } catch {
+      threw = true;
+    }
+    assert(threw, "a failing batch propagates (pollDcsCommits logs it per repo)");
+    assert(claimStmt(db) != null, "  ...but the attempt claim already landed — no 5-minute fetch loop");
+  }
+
+  // ── F4: a merge commit wrapping OUR export is ours, not human ────────────
+  // MEASURED over the newest 1,000 commits of en_ult + en_tn (2026-09-01): 262
+  // are merge commits, and 113 of those wrap one of our own exports. Under the
+  // anchored OURS prefix alone, every one of those 113 was recorded as a human
+  // maintainer's edit — in the table whose whole job is saying who did what.
+  {
+    const cases = [
+      [
+        "Merge pull request 'bible-editor: LAM ult → master' (#6555) from LAM-be into master",
+        "someone@example.com",
+        "ours",
+        "merge_of_bible_editor_export",
+      ],
+      // A merge of a bp-assistant push still reaches AI_MARKER on the full
+      // subject — the wrapper defers rather than deciding.
+      [
+        "Merge pull request 'AI ULT for EZK 22 [bc..3@api.bp-assistant]' (#6802) from AI-EZK-22 into master",
+        "53472+bookpackagebot@noreply.door43.org",
+        "ai",
+        "bp_assistant_marker",
+      ],
+      // The anchoring trap survives one level up: a human reverting a merge of
+      // our export must NOT become ours. MERGE_SUBJECT is anchored at ^Merge,
+      // so this never unwraps and classifyMasterCommit's revert rule stands.
+      [
+        'Revert "Merge pull request \'bible-editor: LAM ult → master\' (#6555)"',
+        "rich.mahn@example.com",
+        "human",
+        null,
+      ],
+      // A maintainer's own merge of their own branch stays human.
+      [
+        "Merge pull request 'Fix EZK 40 marker spacing' (#6600) from ezk-markers into master",
+        "rich.mahn@example.com",
+        "human",
+        null,
+      ],
+    ];
+    for (const [message, authorEmail, expectKind, expectReason] of cases) {
+      const { rows } = ledgerRowsFromCommits("en_ult", [{ sha: "m", message, authorEmail, authorName: "x" }]);
+      assert(
+        rows[0].classification === expectKind,
+        `merge subject classifies ${expectKind}: ${message.slice(0, 58)}…`,
+      );
+      if (expectReason) assert(rows[0].reason === expectReason, `  ...reason ${expectReason}`);
+    }
+    assert(
+      classifyForLedger({ sha: "x", message: "bible-editor: AMO tq → master", authorEmail: "h@x" }).kind === "ours",
+      "a plain (unwrapped) export subject still classifies ours through the wrapper",
+    );
+  }
+
+  // ── F6: committed_at is the COMMITTER date (when it landed) ──────────────
+  {
+    const { rows } = ledgerRowsFromCommits("en_tn", [
+      {
+        sha: "r1",
+        message: "hand fix",
+        authorEmail: "h@x",
+        // Authored in June, landed in August — a rebase or cherry-pick, which is
+        // most of how work reaches these repos.
+        date: "2026-06-01T00:00:00Z",
+        committerDate: "2026-08-30T12:00:00Z",
+      },
+      { sha: "r2", message: "no committer block", authorEmail: "h@x", date: "2026-06-01T00:00:00Z" },
+    ]);
+    assert(
+      rows[0].committedAt === Math.floor(Date.parse("2026-08-30T12:00:00Z") / 1000),
+      "committed_at stores when the commit LANDED, not when it was authored",
+    );
+    assert(
+      rows[1].committedAt === Math.floor(Date.parse("2026-06-01T00:00:00Z") / 1000),
+      "  ...falling back to the author date when the payload has no committer",
+    );
+  }
+
+  // ── F7: a defensive-cap truncation is recorded, never silent ─────────────
+  {
+    const many = Array.from({ length: 5 }, (_, i) => ({
+      sha: `s${i}`,
+      message: "hand fix",
+      authorEmail: "h@x",
+      date: "2026-08-30T12:00:00Z",
+    }));
+    const { rows, dropped } = ledgerRowsFromCommits("en_tn", many, 3);
+    assert(rows.length === 3 && dropped === 2, "ledgerRowsFromCommits reports how many commits the cap dropped");
+    assert(rows[0].sha === "s0", "  ...keeping the NEWEST, so the tip stays contiguous with the mark");
+  }
+
+  // ── F12: last_sha and last_committed_at move as a PAIR ──────────────────
+  // A tip whose date will not parse must write a NULL timestamp beside its sha,
+  // never keep the previous commit's timestamp — that pair would describe two
+  // different commits.
+  {
+    mockGitea([[commit("n1", "hand fix", "h@x", { date: "not-a-date" }), commit("tip", "old", "h@x")]]);
+    const db = mockDb({ repo: "en_tn", last_sha: "tip", last_committed_at: 12345, last_attempted_at: NOW - 3600 });
+    await pollDcsRepo({ DB: db, DCS_BASE_URL: "https://example.test" }, "en_tn", NOW);
+    const upsert = pollUpsert(db);
+    assert(upsert.args[1] === "n1" && upsert.args[2] === null, "an unparseable tip date writes sha + NULL, as a pair");
+    assert(upsert.args[8] === 1, "  ...and still advances (the walk completed)");
+    assert(
+      /last_sha = CASE WHEN \?9 = 1/.test(upsert.sql) && /last_committed_at = CASE WHEN \?9 = 1/.test(upsert.sql),
+      "  ...both driven by the same advance flag, not COALESCEd independently",
+    );
+  }
+
+  // ── F3: the OLDEST unresolved gap survives a later one ──────────────────
+  {
+    const pages = [fullPage("a"), fullPage("b"), fullPage("c"), fullPage("d"), fullPage("e")];
+    mockGitea(pages);
+    const db = mockDb({ repo: "en_tn", last_sha: "unreachable", gap_since_sha: "older-hole", last_attempted_at: NOW - 3600 });
+    await pollDcsRepo({ DB: db, DCS_BASE_URL: "https://example.test" }, "en_tn", NOW);
+    const upsert = pollUpsert(db);
+    assert(
+      /gap_since_sha = CASE WHEN dcs_repo_polls\.gap_since_sha IS NULL/.test(upsert.sql),
+      "the gap upsert keeps an existing hole rather than overwriting it with a newer one",
+    );
+    assert(
+      /gap_at = CASE WHEN dcs_repo_polls\.gap_since_sha IS NULL/.test(upsert.sql),
+      "  ...and gap_at is gated on the same condition, so the pair cannot split",
+    );
   }
 
   console.log("dcsCommitPoll: all assertions passed");
