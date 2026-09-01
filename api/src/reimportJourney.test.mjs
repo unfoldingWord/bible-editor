@@ -952,6 +952,18 @@ console.log("\n[AI-vs-human conflict policy at the caller]");
     mayHoldHumanEdit: true, hasHumanCommit: true, incomplete: false, incompleteReason: "",
     counts: { ours: 1, ai: 0, human: 1 }, humanShas: ["abc123"],
   };
+  // #684: the current shape, sha + author + date, so the merge_conflict reason
+  // can NAME the commit — not just assert one exists. A full 40-char sha, like
+  // the real thing listMasterCommitsSince returns, so the message's 7-char
+  // truncation is exercised the same way it is in production.
+  const HAS_HUMAN_ATTRIBUTED = {
+    mayHoldHumanEdit: true, hasHumanCommit: true, incomplete: false, incompleteReason: "",
+    counts: { ours: 1, ai: 0, human: 1 },
+    humanCommits: [
+      { sha: "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0", author: "rich.mahn", date: "2026-08-30T12:34:56Z" },
+    ],
+    humanShas: ["a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0"],
+  };
   const readRow = (sqlite) =>
     sqlite.prepare(`SELECT response, review_kind, review_reason, version FROM tq_rows WHERE id='ai01'`).all()[0];
 
@@ -1018,6 +1030,56 @@ console.log("\n[AI-vs-human conflict policy at the caller]");
     eq(counts.merge_adopted, 1, "…counted as an adoption");
     eq(counts.merge_kept_ai, 0, "…and not as a kept AI conflict");
     eq(row.review_reason.includes("was merged over your app-side change"), true, "…with the pre-existing wording");
+    // #684, backward-compat channel: a lineage summary carrying only the OLD
+    // `humanShas` shape (no `humanCommits` at all — exactly what a pre-#684
+    // `master_lineage_json` row, or a Workflow step's memoized pre-#684
+    // result, would still be holding) still names the sha, degraded rather
+    // than silently dropped.
+    eq(
+      row.review_reason.includes("Measured: Door43 edit by an unknown author on an unknown date (abc123)."),
+      true,
+      "…and, reading only the old humanShas shape, cites the sha with an honest 'unknown' for what it never had",
+    );
+  }
+
+  // 3b. #684: the CURRENT shape (sha + author + date) names the commit a
+  //     non-developer can act on — this is the success check's own scenario.
+  {
+    const { sqlite, env } = freshEnv();
+    const boundary = seedContested(sqlite);
+    const counts = await applyTsvRows(env, BOOK, "tq", [masterRowAt("a maintainer's fix")], null, {
+      confirmedAt: 200, editId: boundary, lineage: HAS_HUMAN_ATTRIBUTED,
+    });
+    const row = readRow(sqlite);
+    eq(row.response, "a maintainer's fix", "a human-authored master edit still wins the collision");
+    eq(counts.merge_adopted, 1, "…counted as an adoption");
+    eq(row.review_reason.includes("was merged over your app-side change"), true, "…with the pre-existing wording");
+    eq(
+      row.review_reason.includes("Measured: Door43 edit by rich.mahn on 2026-08-30 (a1b2c3d)."),
+      true,
+      "…and names WHO (rich.mahn), WHEN (2026-08-30) and the short sha (a1b2c3d) — not just that an edit exists",
+    );
+  }
+
+  // 3c. The fail-safe cases must NEVER name a commit — nothing was measured.
+  {
+    const { sqlite, env } = freshEnv();
+    const boundary = seedContested(sqlite);
+    // An incomplete walk still protects master (masterMayHoldHumanEdit
+    // reads it exactly like a found human commit), but it is NOT a found
+    // commit — the standing alert-wording rule says this reason may not
+    // claim one.
+    const INCOMPLETE = {
+      mayHoldHumanEdit: true, hasHumanCommit: false, incomplete: true, incompleteReason: "page_cap",
+      counts: { ours: 1, ai: 1, human: 0 }, humanShas: [],
+    };
+    const counts = await applyTsvRows(env, BOOK, "tq", [masterRowAt("a maintainer's fix")], null, {
+      confirmedAt: 200, editId: boundary, lineage: INCOMPLETE,
+    });
+    const row = readRow(sqlite);
+    eq(counts.merge_adopted, 1, "an incomplete walk still protects master (adopts, same as before)");
+    eq(row.review_reason.includes("was merged over your app-side change"), true, "…with the generic wording");
+    eq(row.review_reason.includes("Measured:"), false, "…and never a commit it did not actually measure");
   }
 
   // 4. No lineage at all — the field an in-flight Workflow's memoized plan does
@@ -1385,6 +1447,66 @@ console.log("\n[keep_no_base tn/tq/twl row: review_kind flag set once, guarded a
   const after2 = sqlite.prepare("SELECT version, review_kind FROM tq_rows WHERE id = ?").all(NB_ID)[0];
   eq(after2.version, 2, "NO further version bump on an unchanged re-run — the version-inflation guard (#539) holds");
   eq(after2.review_kind, "merge_no_base", "the flag is still set");
+}
+
+// #684: the merge_no_base "human commit found" variant — this run's own
+// commit-lineage walk (#653's gate) found a genuine human commit, so the
+// review_reason must name WHO and WHEN, not just assert a Door43 edit exists.
+// Same seeding shape as the plain keep_no_base test above (no edit_log
+// ancestor -> base === null -> keep_no_base), but with a `lineage` that has
+// hasHumanCommit: true, incomplete: false — the one branch of the #653 gate
+// that both mints the flag AND has a specific commit to cite.
+console.log("\n[keep_no_base tn/tq/twl row: the human-found variant names the commit (#684)]");
+{
+  const { sqlite, env } = freshEnv();
+  sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (1, 100, 'translator-tq')`).run();
+  const NB_ID = "msnb2";
+  sqlite
+    .prepare(
+      `INSERT INTO tq_rows (id, book, chapter, verse, ref_raw, question, response, version, updated_by)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 1, 1)`,
+    )
+    .run(NB_ID, BOOK, 9, 9, "9:9", "app question", "app response");
+  const cutoff = {
+    confirmedAt: Math.floor(Date.now() / 1000),
+    editId: null,
+    lineage: {
+      mayHoldHumanEdit: true, hasHumanCommit: true, incomplete: false, incompleteReason: "",
+      counts: { ours: 0, ai: 0, human: 1 },
+      humanCommits: [
+        { sha: "b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1", author: "stephenwunrow", date: "2026-08-25T09:00:00Z" },
+      ],
+      humanShas: ["b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1"],
+    },
+  };
+  const counts = await applyTsvRows(
+    env,
+    BOOK,
+    "tq",
+    [
+      {
+        id: NB_ID, idCoerced: false, refRaw: "9:9", chapter: 9, verse: 9,
+        occurrence: null, tags: null, quote: null,
+        question: "master question", // differs -> anyDiff, base === null -> keep_no_base
+        response: "app response",
+      },
+    ],
+    null,
+    cutoff,
+  );
+  eq(counts.merge_no_base, 1, "counted as keep_no_base (no ancestor recoverable)");
+  const row = sqlite.prepare("SELECT review_kind, review_reason FROM tq_rows WHERE id = ?").all(NB_ID)[0];
+  eq(row.review_kind, "merge_no_base", "the row is flagged for the cleanup chip (lint.ts)");
+  eq(
+    row.review_reason.includes("a Door43 editor changed this file since the last confirmed publish"),
+    true,
+    "…the existing wording is preserved",
+  );
+  eq(
+    row.review_reason.includes("Measured: Door43 edit by stephenwunrow on 2026-08-25 (b2c3d4e)."),
+    true,
+    "…and, this being the branch that actually found a human commit, the reason names WHO, WHEN and the short sha",
+  );
 }
 
 // ── Issue #539: the dsj8 apostrophe row cycled through a simulated nightly ──

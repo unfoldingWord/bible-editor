@@ -103,6 +103,8 @@ import { readFileSync } from "node:fs";
 import {
   classifyMasterCommit,
   compactLineage,
+  describeHumanCommitEvidence,
+  humanCommitsFromLineage,
   LINEAGE_EVIDENCE_CAP,
   LINEAGE_REF_CAP,
   masterMayHoldHumanEdit,
@@ -635,6 +637,94 @@ console.log("\n[the compact summary that crosses a Workflow step boundary]");
   eq(s.mayHoldHumanEdit, true, "summary answers the merge's question directly");
   eq(JSON.stringify(s.humanShas), JSON.stringify(["s3"]), "summary names the human commit as evidence");
   eq(masterMayHoldHumanEdit(s), true, "the helper reads a summary as it reads a lineage");
+  // #684: humanShas is now DERIVED from humanCommits, which carries the
+  // author + date the classifier already measured off `s3` (RICH's commit
+  // has no message-level author name in this fixture set, so it falls back
+  // to the email — see compactLineage's own author-fallback comment).
+  eq(s.humanCommits.length, 1, "summary carries one human commit's full evidence");
+  eq(s.humanCommits[0].sha, "s3", "…the same sha humanShas names");
+  eq(s.humanCommits[0].author, RICH, "…falling back to the author EMAIL when no display name was given");
+  eq(s.humanCommits[0].date, null, "…and null date when the fixture supplied none, not a crash");
+}
+
+console.log("\n[#684: naming WHO and WHEN a human commit was made]");
+
+{
+  // The happy path: sha, author name, and date all present.
+  const commits = [
+    { sha: "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0", author: "rich.mahn", date: "2026-08-30T12:34:56Z" },
+  ];
+  eq(
+    describeHumanCommitEvidence(commits),
+    "Door43 edit by rich.mahn on 2026-08-30 (a1b2c3d)",
+    "singular phrasing, calendar-day date, git's own 7-char short sha",
+  );
+}
+{
+  // Two commits: plural phrasing, both cited.
+  const commits = [
+    { sha: "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0", author: "rich.mahn", date: "2026-08-30T12:34:56Z" },
+    { sha: "b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1", author: "stephenwunrow", date: "2026-08-29T00:00:00Z" },
+  ];
+  const desc = describeHumanCommitEvidence(commits);
+  eq(desc.startsWith("Door43 edits by "), true, "plural phrasing for more than one commit");
+  eq(desc.includes("rich.mahn on 2026-08-30 (a1b2c3d)"), true, "…names the first");
+  eq(desc.includes("stephenwunrow on 2026-08-29 (b2c3d4e)"), true, "…and the second");
+}
+{
+  // Missing author / date must degrade to a labeled placeholder, never throw
+  // or silently omit the clause — the sha is still worth having on its own.
+  eq(
+    describeHumanCommitEvidence([{ sha: "abc123", author: null, date: null }]),
+    "Door43 edit by an unknown author on an unknown date (abc123)",
+    "a commit with no author/date names both as unknown rather than omitting them",
+  );
+}
+{
+  eq(describeHumanCommitEvidence([]), "", "no evidence -> empty string, so a caller can splice it in unconditionally");
+}
+
+{
+  // humanCommitsFromLineage: the NEW shape is read as-is.
+  const withNew = {
+    humanCommits: [{ sha: "s1", author: "rich.mahn", date: "2026-08-30" }],
+    humanShas: ["s1"],
+  };
+  eq(
+    JSON.stringify(humanCommitsFromLineage(withNew)),
+    JSON.stringify([{ sha: "s1", author: "rich.mahn", date: "2026-08-30" }]),
+    "a summary already carrying humanCommits is read straight through",
+  );
+}
+{
+  // The OLD shape — exactly what a pre-#684 `master_lineage_json` row, or a
+  // Workflow step's memoized pre-#684 result, still holds: `humanShas` only,
+  // no `humanCommits` field at all. Must degrade to shas with no
+  // attribution, not throw and not read as "no evidence".
+  const oldShape = JSON.parse(
+    JSON.stringify({ mayHoldHumanEdit: true, hasHumanCommit: true, incomplete: false, humanShas: ["deadbee"] }),
+  );
+  eq(
+    JSON.stringify(humanCommitsFromLineage(oldShape)),
+    JSON.stringify([{ sha: "deadbee", author: null, date: null }]),
+    "a pre-#684 summary (bare humanShas, no humanCommits) degrades to sha-only evidence",
+  );
+  eq(
+    describeHumanCommitEvidence(humanCommitsFromLineage(oldShape)),
+    "Door43 edit by an unknown author on an unknown date (deadbee)",
+    "…which still formats into a usable (if attribution-less) sentence",
+  );
+}
+{
+  // Absent/malformed lineage: no evidence, not a throw.
+  eq(JSON.stringify(humanCommitsFromLineage(null)), "[]", "null lineage -> no evidence");
+  eq(JSON.stringify(humanCommitsFromLineage(undefined)), "[]", "undefined lineage -> no evidence");
+  eq(JSON.stringify(humanCommitsFromLineage({})), "[]", "a lineage with neither field -> no evidence");
+  eq(
+    JSON.stringify(humanCommitsFromLineage({ humanCommits: [{ sha: 42 }, { notASha: true }] })),
+    "[]",
+    "malformed entries (non-string sha, or no sha at all) are filtered out rather than crashing the formatter",
+  );
 }
 
 {

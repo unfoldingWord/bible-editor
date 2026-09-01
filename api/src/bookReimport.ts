@@ -56,6 +56,8 @@ import {
 import {
   classifyMasterCommit,
   compactLineage,
+  describeHumanCommitEvidence,
+  humanCommitsFromLineage,
   LINEAGE_EVIDENCE_CAP,
   LINEAGE_REFINE_MAX_HUMAN_COMMITS,
   masterMayHoldHumanEdit,
@@ -2044,6 +2046,15 @@ export async function applyTsvRows(
               "Nothing was overwritten. Check this row against Door43's version, because the next export that " +
               "runs for this file writes what is here now. Why: no earlier version of this row survives to " +
               "compare against, and ";
+            // #684: name WHO and WHEN, not just assert a human edit exists —
+            // only in the branch that actually measured one. Empty for the
+            // other two branches (nobody looked / walk incomplete), so the
+            // splice below is a no-op there rather than printing a dangling
+            // "Measured: .".
+            const humanEvidence =
+              lin != null && lin.incomplete === false && lin.hasHumanCommit === true
+                ? describeHumanCommitEvidence(humanCommitsFromLineage(lin))
+                : "";
             fields.review_reason =
               lin == null
                 ? // Nobody walked master's history this run at all — saying it
@@ -2052,7 +2063,8 @@ export async function applyTsvRows(
                     "be ruled out."
                 : lin.incomplete === false && lin.hasHumanCommit === true
                   ? opening + "a Door43 editor changed this file since the last confirmed publish, so the sync " +
-                      "could not tell which side changed it."
+                      "could not tell which side changed it." +
+                      (humanEvidence ? ` Measured: ${humanEvidence}.` : "")
                   : opening + "Door43's history for this file could not be read in full, so a human Door43 " +
                       "edit cannot be ruled out.";
             // The snapshot carries the window this flag is ABOUT (see
@@ -2348,6 +2360,18 @@ export async function applyTsvRows(
         // lines (BookLintIndicator), so a reader who sees only the opening must
         // still learn which way it went and what to do about it.
         const kindLabel = kind.toUpperCase();
+        // #684: this branch is `adopt_conflict` — masterWinsConflicts fired
+        // because masterMayHoldHumanEdit was NOT explicitly false, which is
+        // true both for a genuinely FOUND human commit and for the fail-safe
+        // (incomplete walk / never looked — see tsvMerge.ts). Only name a
+        // commit when this run's own lineage measured one; the fail-safe
+        // cases keep the existing generic wording rather than a claim this
+        // walk did not make (the standing alert-wording rule).
+        const conflictLin = cutoff?.lineage;
+        const conflictHumanEvidence =
+          conflictLin != null && conflictLin.incomplete === false && conflictLin.hasHumanCommit === true
+            ? describeHumanCommitEvidence(humanCommitsFromLineage(conflictLin))
+            : "";
         const reason = keptAiConflict
           ? `Your ${labels.join(" and ")} was kept over Door43's, and the next export that runs for this ` +
             `file writes it to Door43. If Door43's version is the one you want, put it in here first. ` +
@@ -2358,7 +2382,8 @@ export async function applyTsvRows(
             // on its own. Saying only the first would misdescribe the row.
             (adopted ? ` Door43's changes to this row's other fields were taken.` : "")
           : `A Door43 edit to this row's ${labels.join(" and ")} was merged over your app-side change. ` +
-            `Please double-check it.`;
+            `Please double-check it.` +
+            (conflictHumanEvidence ? ` Measured: ${conflictHumanEvidence}.` : "");
         // Distinct review_kind, not just distinct prose: the cleanup chip titles
         // itself from this column, and "Merged Door43 edit" over a row whose
         // edit was KEPT is the reverse of what happened (see reviewFlagTitle).

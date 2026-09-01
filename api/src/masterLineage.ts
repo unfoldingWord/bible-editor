@@ -474,6 +474,28 @@ export function summarizeLineage(
 // value, so it must stay small.
 export const LINEAGE_EVIDENCE_CAP = 5;
 
+// One human commit, with enough to say WHO and WHEN (issue #684). A review
+// flag or alert that says "a Door43 edit touched this" and stops there is
+// throwing away information the classifier already has — `authorName`,
+// `authorEmail` and `date` all arrive on MasterCommit from Gitea, and were
+// previously "Diagnostic only" per that field's own comment. This is the
+// compacted, alert-ready form of that same evidence.
+export interface HumanCommitEvidence {
+  sha: string;
+  /**
+   * The commit AUTHOR's display name, or their email when Gitea omitted a
+   * name, or null when neither was present. NEVER the bracketed requester a
+   * bot push carries (`ULT: EZK 38 [pjoakes]`) — classifyMasterCommit's own
+   * note is explicit that the account which AUTHORED the commit is what
+   * decides classification, and it is what must be named here too. A
+   * `human`-classified commit is, by construction, not bot-authored, so this
+   * is always the actual editor's own identity.
+   */
+  author: string | null;
+  /** commit.author.date, ISO-8601, or null when Gitea omitted it. */
+  date: string | null;
+}
+
 // The compact form of a lineage — what actually travels from the one place that
 // can fetch it (planAndStageBookResources, which already holds master's sha) to
 // the merge call sites several Workflow steps later. A full MasterLineage can
@@ -489,7 +511,24 @@ export interface MasterLineageSummary {
   incomplete: boolean;
   incompleteReason: string;
   counts: { ours: number; ai: number; human: number };
-  /** Up to LINEAGE_EVIDENCE_CAP human commit shas, newest first. */
+  /**
+   * Up to LINEAGE_EVIDENCE_CAP human commits, newest first — sha, author and
+   * date (issue #684). This is what an alert should read to NAME the commit;
+   * go through `humanCommitsFromLineage` rather than this field directly, so
+   * an OLDER summary (a pre-#684 D1 row in `master_lineage_json`, or a
+   * Workflow step's memoized result from a deploy that landed mid-run) that
+   * carries only `humanShas` still degrades to "shas with no attribution"
+   * instead of the reader silently treating a missing field as "no evidence".
+   */
+  humanCommits: HumanCommitEvidence[];
+  /**
+   * Up to LINEAGE_EVIDENCE_CAP human commit shas, newest first. DERIVED from
+   * `humanCommits` (`humanCommits.map(c => c.sha)`) and kept, for one
+   * release, purely for backward compatibility: `master_lineage_json` is
+   * last-run-wins JSON a PRE-#684 write may still be sitting on, and a reader
+   * of that older row has no `humanCommits` to fall back to. New readers
+   * should not need this field at all — go through `humanCommitsFromLineage`.
+   */
   humanShas: string[];
   /**
    * #557, the per-verse narrowing. TRUE only when every human commit in the
@@ -508,10 +547,13 @@ export interface MasterLineageSummary {
 
 export function compactLineage(lineage: MasterLineage): MasterLineageSummary {
   const counts = { ours: 0, ai: 0, human: 0 };
-  const humanShas: string[] = [];
+  const humanCommits: HumanCommitEvidence[] = [];
   for (const c of lineage.commits) {
     counts[c.kind]++;
-    if (c.kind === "human" && humanShas.length < LINEAGE_EVIDENCE_CAP) humanShas.push(c.sha);
+    if (c.kind === "human" && humanCommits.length < LINEAGE_EVIDENCE_CAP) {
+      const author = (c.authorName ?? "").trim() || (c.authorEmail ?? "").trim() || null;
+      humanCommits.push({ sha: c.sha, author, date: c.date ?? null });
+    }
   }
   const ev = lineage.humanRefs ?? null;
   return {
@@ -520,7 +562,10 @@ export function compactLineage(lineage: MasterLineage): MasterLineageSummary {
     incomplete: lineage.incomplete,
     incompleteReason: lineage.incompleteReason,
     counts,
-    humanShas,
+    humanCommits,
+    // Derived, not independently tracked — see this field's own comment on
+    // why it still ships for one release.
+    humanShas: humanCommits.map((c) => c.sha),
     // Narrowing evidence only crosses the boundary when it is COMPLETE. A
     // half-mapped ref set has no downstream use — masterMayHoldHumanEditForVerse
     // ignores it — and carrying it would only invite a future reader to treat
@@ -529,6 +574,66 @@ export function compactLineage(lineage: MasterLineage): MasterLineageSummary {
     humanRefs: ev?.complete === true ? ev.refs : [],
     refsReason: ev == null ? "not_measured" : ev.complete === true ? "" : ev.reason,
   };
+}
+
+// ── Naming the commit an alert measured (issue #684) ────────────────────────
+//
+// Every mint site that states "a human Door43 commit is in the window" used to
+// stop there — the classifier had already thrown away WHO and WHEN. These two
+// functions are the one place that turns the compacted evidence back into
+// something a non-developer can act on, so every call site produces the same
+// wording and the same fail-safe reading of an older snapshot.
+
+// Read the human-commit evidence off a summary that may be either shape: the
+// current `humanCommits` (sha + author + date), or an OLDER one — a
+// `master_lineage_json` row written before #684, or a Workflow step's
+// memoized result from a run whose deploy landed mid-execution — that carries
+// only the bare `humanShas`. Go through this rather than reading either field
+// directly: an old snapshot degrades to "shas with no attribution" here,
+// rather than a caller reading `summary.humanCommits` as `undefined` and
+// treating that as "no evidence at all" (which would silently drop the
+// row-count/hasHumanCommit claims those old snapshots still carry correctly).
+export function humanCommitsFromLineage(
+  lineage: MasterLineageSummary | null | undefined,
+): HumanCommitEvidence[] {
+  if (lineage == null) return [];
+  if (Array.isArray(lineage.humanCommits) && lineage.humanCommits.length > 0) {
+    return lineage.humanCommits.filter(
+      (c): c is HumanCommitEvidence => c != null && typeof c === "object" && typeof c.sha === "string",
+    );
+  }
+  if (Array.isArray(lineage.humanShas)) {
+    return lineage.humanShas
+      .filter((s): s is string => typeof s === "string")
+      .map((sha) => ({ sha, author: null, date: null }));
+  }
+  return [];
+}
+
+function describeOneHumanCommit(c: HumanCommitEvidence): string {
+  const who = (c.author ?? "").trim() || "an unknown author";
+  // ISO-8601's own YYYY-MM-DD prefix, truncated to the calendar day — a
+  // translator does not need the time-of-day to act on this. Anything that
+  // does not start that way (absent, or a shape Gitea never actually sends)
+  // prints "an unknown date" rather than a raw, possibly-confusing string.
+  const when = c.date && /^\d{4}-\d{2}-\d{2}/.test(c.date) ? c.date.slice(0, 10) : "an unknown date";
+  // Git's own 7-char short-sha convention. `sha` is always the full 40-char
+  // form coming out of listMasterCommitsSince, so slicing is safe; a shorter
+  // string (should never happen) is printed as-is rather than throwing.
+  const sha = c.sha ? c.sha.slice(0, 7) : "unknown";
+  return `${who} on ${when} (${sha})`;
+}
+
+// "Door43 edit by rich.mahn on 2026-08-30 (a1b2c3d)" for one commit;
+// "Door43 edits by X on ...; Y on ..." for more than one. Empty string for no
+// evidence, so a call site can splice this straight into a sentence with
+// `evidence ? ... : ""` and never print a dangling "Measured: .". Never
+// truncates further — `commits` already arrives capped at
+// LINEAGE_EVIDENCE_CAP from compactLineage.
+export function describeHumanCommitEvidence(commits: HumanCommitEvidence[]): string {
+  if (commits.length === 0) return "";
+  const label = commits.length === 1 ? "Door43 edit by " : "Door43 edits by ";
+  return label + commits.map(describeOneHumanCommit).join("; ");
 }
 
 // The single question the merge asks. Separated from the data so no call site
