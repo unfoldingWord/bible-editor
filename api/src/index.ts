@@ -18,6 +18,8 @@ import { alerts } from "./alerts";
 import { alignmentAttention } from "./alignmentAttention";
 import { verseMergeConflicts } from "./verseMergeConflicts";
 import { comments } from "./comments";
+import { pollDcsCommits } from "./dcsCommitPoll";
+import { dcsCommits } from "./dcsCommits";
 import { books } from "./bookImport";
 import { bookLockGuard } from "./bookLockGuard";
 import { EDIT_LOG_SWEEP_SQL, EDIT_LOG_RETENTION_SECONDS } from "./editLogSweep";
@@ -206,6 +208,7 @@ app.route("/api/alerts", alerts);
 app.route("/api/alignment-attention", alignmentAttention);
 app.route("/api/verse-merge-conflicts", verseMergeConflicts);
 app.route("/api/comments", comments);
+app.route("/api/dcs-commits", dcsCommits);
 
 // WebSocket upgrade into the ChapterRoom DO. WS handshakes are normal HTTP
 // upgrades, so they carry the Access cookie (same-origin) and attachAuth has
@@ -342,6 +345,20 @@ export default {
       await env.DB.prepare(
         `DELETE FROM book_import_locks WHERE started_at < unixepoch() - 600`,
       ).run();
+      // Door43 master-commit ledger (issue #685). Self-rate-limited to one real
+      // poll per repo per 30 minutes off its own stored state, so most ticks
+      // cost one D1 read and zero Door43 fetches; a due tick costs 5-20
+      // subrequests, each fetch capped at 20s so a hanging Door43 cannot eat
+      // the invocation the edit_log sweep below shares. No new cron: this
+      // belongs on the same "keep the DB honest even with nobody watching" tick
+      // as the pipeline poll above, and a second trigger would only add a
+      // schedule to keep in sync. Wrapped — the ledger is observability, and
+      // Door43 being down must not fail the rest of this handler.
+      try {
+        await pollDcsCommits(env);
+      } catch (e) {
+        console.error("dcs commit poll tick failed", e instanceof Error ? e.message : String(e));
+      }
       // Once-per-hour edit_log retention sweep. 180 days is defensive — we
       // don't have a real policy yet, but the table grows without bound
       // otherwise (every keystroke that lands a PATCH writes a row). Gated

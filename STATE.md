@@ -96,6 +96,12 @@ Highlights that bite repeatedly:
   `loadMasterLineage`, which runs only when a resource's master file moved; 12 flags on AMO and ECC therefore
   survived it because those books had gone quiet. Fixed by a once-per-run sweep driven by "which rows still hold a
   flag" rather than "which books did we sync" — the shape to reuse for any future row-state cleanup.
+- **A module that imports `hono` cannot be unit-tested.** `api/src/*.test.mjs` runs under plain
+  `node --experimental-strip-types`, which cannot resolve the `hono` package from `node_modules`
+  (`ERR_MODULE_NOT_FOUND … Did you mean to import "hono/dist/cjs/index.js"?`) — only wrangler's bundler can.
+  So keep testable logic in a Hono-free module and put the router beside it in its own file
+  (`dcsCommitPoll.ts` + `dcsCommits.ts` is the pattern). Runtime imports inside a `.ts` file that a test
+  traverses also need the explicit `.ts` extension; extensionless works for `tsc` but not for node.
 
 - **Marker chips are TEXT, and `smartEditVerse` rebuilds the verse's whole marker layout from the captured text
   alone — so a capture that loses the chips silently deletes every `\q` in the verse.** `reconcileMarkers`
