@@ -1029,6 +1029,19 @@ t("merge_no_base flags also carry dismissible + door43 + ours", () => {
   assert.equal(flag.dismissible, true);
   assert.deepEqual(flag.door43, { note: "x" });
 });
+t("a snapshot holding only _meta bookkeeping yields door43 null, not a row of blanks (#683)", () => {
+  // #683's auto-clear memo synthesizes exactly this container on a pre-#653
+  // flag, which by definition never captured master's values. Returning `{}`
+  // would render a Door43 side whose every field is empty — a claim about what
+  // Door43 holds that nobody ever measured.
+  const i = lintTnRows([
+    tn({ review_kind: "merge_no_base", review_master_json: JSON.stringify({ _meta: { clear_blocked_sha: "abc123" } }) }),
+  ]);
+  const flag = i.find((x) => x.check === "Unmerged Door43 edit — verify");
+  assert.ok(flag);
+  assert.equal(flag.door43, null);
+  assert.equal(flag.dismissible, true, "still dismissible — only the phantom Door43 side is suppressed");
+});
 t("non-review issues never carry dismissible/door43/ours", () => {
   const i = lintTnRows([tn({ note: "text] more", review_kind: null })]);
   const bracketIssue = i.find((x) => x.check === "13. Paired Square Bracket");
