@@ -74,7 +74,12 @@ import { applyTwlSortOrderUpdates } from "./twlSortOrderApply";
 import { loadTwTitles } from "./twTitles";
 import { loadTwlOrderLocks } from "./twlOrderLocks";
 import { runPostExport, VALIDATORS } from "./postExport";
-import { runChunkedReimport, storedResourceSha, ALL_RESOURCES as REIMPORT_RESOURCES } from "./bookReimport";
+import {
+  runChunkedReimport,
+  storedResourceSha,
+  sweepStaleMergeNoBase,
+  ALL_RESOURCES as REIMPORT_RESOURCES,
+} from "./bookReimport";
 import { dcsResourceFile, fetchDcsMasterText, fileCommitSha, type ReimportResource } from "./dcsSources";
 import { gitBlobSha } from "./ownPublish";
 import type { TnRow, TqRow, TwlRow, VerseRow } from "./types";
@@ -331,6 +336,32 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
             /* alert is best-effort; never let it abort the export run */
           }
         }
+      }
+
+      // 1b-ii. Retire stale merge_no_base flags on books this run never walked
+      //        (#683). The per-book work above only reaches #665's auto-clear
+      //        for a (book, resource) whose master file moved, so a book that
+      //        stops changing keeps showing translators an "Unmerged Door43
+      //        edit — verify" warning the system itself can measure false — 12
+      //        of them in prod on 2026-09-01, on AMO and ECC. This sweep asks
+      //        "which books still carry a flag" instead of "which did we sync";
+      //        see sweepStaleMergeNoBase for the budget cap and why it does NOT
+      //        subtract the run's own book list.
+      //
+      //        Its own step.do, at the same altitude as "locked-books" below:
+      //        one retryable unit with its own subrequest budget rather than
+      //        spending a book's, and once per run rather than per book. Placed
+      //        inside the dcsAllowed / reimportOnly guard (it walks Door43 and
+      //        writes D1, so a dry run must not reach it) and before the
+      //        reimportOnly return, so the 08:00 self-heal sweeps too.
+      //        try/catch because a warning that failed to clear is not a reason
+      //        to abandon the export that follows.
+      try {
+        await step.do("sweep-stale-review-flags", async () => sweepStaleMergeNoBase(this.env));
+      } catch (e) {
+        console.error("export stale review-flag sweep failed", {
+          error: e instanceof Error ? e.message : String(e),
+        });
       }
     }
 

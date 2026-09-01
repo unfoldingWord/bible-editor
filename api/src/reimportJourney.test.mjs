@@ -43,6 +43,7 @@ import {
   clearResolvedMergeNoBaseForTest,
   recordResourceSync,
   recordWithheldSyncIfAbsent,
+  sweepStaleMergeNoBase,
 } from "./bookReimport.ts";
 import { contentPatchClearClauses } from "./contentPatchClauses.ts";
 import { lintTqRows } from "./lint.ts";
@@ -2475,6 +2476,292 @@ console.log("\n[#653: the auto-clear retires flags the commit history now dispro
     eq(cleared, 1, "only the merge_no_base row is retired");
     const rows = sqlite.prepare(`SELECT id, review_kind FROM tq_rows ORDER BY id`).all();
     eq(rows.map((r) => r.review_kind), ["merge_conflict", null], "…an unacknowledged merge_conflict stands");
+  }
+}
+
+console.log("\n[#683: the sweep reaches books no run visits, and pre-#653 flags get a derived window]");
+{
+  // Same relative-to-NOW discipline as the #653 block: the 30-day bound must be
+  // exercised on purpose, never drifted into by the calendar.
+  const NOW = Math.floor(Date.now() / 1000);
+  const MINT_AT = NOW - 5 * 86400;
+  // The watermark the mint run's OWN lineage walk was bounded by, persisted in
+  // book_resource_syncs.master_lineage_confirmed_at — what a post-#653 mint
+  // would have written into the snapshot as flag_since.
+  const WATERMARK = MINT_AT - 6 * 86400;
+  const FILE = { repo: "en_tq", path: "tq_1CH.tsv" };
+
+  // A pre-#653 flag: review_master_json NULL, because migration 0057's column
+  // did not exist when it was minted. `updated_at` is seeded LATER than the
+  // mint on purpose — that is what a reorder drag or a preserve toggle leaves
+  // behind (rows.ts:815 / :1244 / :1317), and it is why the derivation may not
+  // key on it.
+  const seedLegacy = (sqlite, ids, book = BOOK) => {
+    for (const id of ids) {
+      sqlite
+        .prepare(
+          `INSERT INTO tq_rows (id, book, chapter, verse, ref_raw, question, response, version, updated_at,
+                                review_kind, review_reason, review_master_json)
+           VALUES (?, ?, 3, 1, '3:1', 'app question', 'r', 4, ?, 'merge_no_base', 'raised before #653', NULL)`,
+        )
+        .run(id, book, MINT_AT + 3 * 86400);
+    }
+  };
+  // The mint's own edit_log row — the immutable mint time the derivation is
+  // proved against. Shape and payload match logEditStmt's (bookReimport.ts:2668):
+  // action 'update', payload = the merge write object verbatim.
+  const seedMintLog = (sqlite, ids, at = MINT_AT, book = BOOK) => {
+    for (const id of ids) {
+      sqlite
+        .prepare(
+          `INSERT INTO edit_log (kind, row_key, book, action, payload_json, created_at)
+           VALUES ('tq', ?, ?, 'update', ?, ?)`,
+        )
+        .run(id, book, JSON.stringify({ review_kind: "merge_no_base", review_reason: "raised before #653" }), at);
+    }
+  };
+  const seedLineage = (sqlite, { confirmedAt = WATERMARK, computedAt = MINT_AT - 60, sha = "tipA", book = BOOK } = {}) => {
+    sqlite
+      .prepare(
+        `INSERT INTO book_resource_syncs (book, resource, source_sha, origin, master_lineage_confirmed_at,
+                                          master_lineage_computed_at, master_lineage_sha)
+         VALUES (?, 'tq', 'sha0', 'reimport', ?, ?, ?)`,
+      )
+      .run(book, confirmedAt, computedAt, sha);
+  };
+  // A Gitea /commits page in the raw wire shape, so the clear's OWN fetch path
+  // (the one a sweep always takes — it holds no walk to reuse) is exercised
+  // rather than handed a pre-built page.
+  const giteaPage = (commits) => async () => ({
+    ok: true,
+    headers: { get: (h) => (h.toLowerCase() === "x-hasmore" ? "false" : null) },
+    json: async () =>
+      commits.map((c) => ({
+        sha: c.sha,
+        commit: { message: c.message, author: { email: c.authorEmail, name: c.authorName, date: c.date } },
+      })),
+  });
+
+  // (a) THE STRUCTURAL BUG. The clear lives inside loadMasterLineage, which the
+  //     nightly reaches only for a (book, resource) whose master file moved — so
+  //     AMO and ECC, quiet since the runs that flagged them, were never revisited
+  //     and their flags could not heal. The sweep finds them by asking which
+  //     books still carry a flag, and clears on its own walk.
+  {
+    const { sqlite, env } = freshEnv();
+    seedLegacy(sqlite, ["sw00", "sw01"]);
+    seedMintLog(sqlite, ["sw00", "sw01"]);
+    seedLineage(sqlite);
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = giteaPage(OURS_AND_AI_PAGE.commits);
+    let result;
+    try {
+      result = await sweepStaleMergeNoBase(env);
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+    eq(result.cleared, 2, "a flagged book the run never visited is swept and cleared");
+    eq(result.swept, 1, "…one (book, kind) pair held flags");
+    const rows = sqlite.prepare(`SELECT review_kind, review_reason, version FROM tq_rows ORDER BY id`).all();
+    eq(rows.map((r) => r.review_kind), [null, null], "…the flags are retired");
+    eq(rows.map((r) => r.version), [4, 4], "…with no version bump, so an open editor's If-Match still holds");
+    const logs = sqlite.prepare(`SELECT * FROM edit_log WHERE action = 'sync_clear_review' ORDER BY row_key`).all();
+    eq(logs.length, 2, "one audit row per cleared flag, exactly as the visited path writes");
+    const payload = JSON.parse(logs[0].payload_json);
+    eq(payload.evidence.window_start, WATERMARK, "…over the mint run's own watermark, not the row's updated_at");
+    eq(payload.evidence.human, 0, "…with the measurement that justified it");
+    eq(payload.evidence.derived_windows, 2, "…and the audit says the window was derived, not carried by the flag");
+  }
+
+  // (b) The derivation in isolation: a NULL-review_master_json flag inside the
+  //     30-day bound clears on a complete, human-free walk.
+  {
+    const { sqlite, env } = freshEnv();
+    seedLegacy(sqlite, ["sw00", "sw01"]);
+    seedMintLog(sqlite, ["sw00", "sw01"]);
+    const cleared = await clearResolvedMergeNoBaseForTest(
+      env, BOOK, "tq", WATERMARK - 10, OURS_AND_AI_PAGE, FILE, "tipA",
+      { windowStart: WATERMARK, computedAt: MINT_AT - 60 },
+    );
+    eq(cleared, 2, "a pre-#653 flag with a derived window clears on complete human=0 evidence");
+  }
+
+  // (b2) …and WITHOUT a fallback it still does not, so the visited path's
+  //      behavior is unchanged: only the sweep may derive a window.
+  {
+    const { sqlite, env } = freshEnv();
+    seedLegacy(sqlite, ["sw00"]);
+    seedMintLog(sqlite, ["sw00"]);
+    const cleared = await clearResolvedMergeNoBaseForTest(env, BOOK, "tq", WATERMARK - 10, OURS_AND_AI_PAGE, FILE, "tipA");
+    eq(cleared, 0, "no fallback offered means no window — #665's behavior, untouched");
+  }
+
+  // (c) THE INEQUALITY THE DERIVATION RESTS ON. A lineage computed AFTER the
+  //     mint is not the mint's evidence: the watermark may have advanced past
+  //     the flag's own, so a walk from it can miss the very commit the flag is
+  //     about. Refused, and not one fetch spent on it.
+  {
+    const { sqlite, env } = freshEnv();
+    seedLegacy(sqlite, ["sw00"]);
+    seedMintLog(sqlite, ["sw00"]);
+    seedLineage(sqlite, { computedAt: MINT_AT + 60 });
+    const realFetch = globalThis.fetch;
+    let called = 0;
+    // A walk that WOULD succeed, so ablating the inequality shows up as a false
+    // clear rather than merely as a wasted fetch.
+    globalThis.fetch = async (...a) => { called++; return giteaPage(OURS_AND_AI_PAGE.commits)(...a); };
+    try {
+      const result = await sweepStaleMergeNoBase(env);
+      eq(result.cleared, 0, "a lineage newer than the mint cannot supply the mint's window");
+      eq(called, 0, "…and costs no Gitea fetch");
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  }
+
+  // (c2) No mint log — a lost log batch, or a mint older than edit_log's
+  //      180-day retention — means no immutable mint time, so nothing can be
+  //      proved and the flag keeps the dismiss path.
+  {
+    const { sqlite, env } = freshEnv();
+    seedLegacy(sqlite, ["sw00"]);
+    seedLineage(sqlite);
+    const realFetch = globalThis.fetch;
+    let called = 0;
+    // Likewise a succeeding walk: without the mint record the flag must stand
+    // even when the history is clean, because its range is unknown.
+    globalThis.fetch = async (...a) => { called++; return giteaPage(OURS_AND_AI_PAGE.commits)(...a); };
+    try {
+      const result = await sweepStaleMergeNoBase(env);
+      eq(result.cleared, 0, "no mint record means no window, exactly as before");
+      eq(called, 0, "…and no walk is spent on it");
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  }
+
+  // (d) A human commit in the derived window blocks the clear, and the blocked
+  //     attempt is MEMOIZED — on a row that has no snapshot to annotate, so the
+  //     memo container is synthesized. Without that, the sweep would re-buy this
+  //     same answer every night for exactly the flags it exists to serve.
+  {
+    const { sqlite, env } = freshEnv();
+    seedLegacy(sqlite, ["sw00", "sw01"]);
+    seedMintLog(sqlite, ["sw00", "sw01"]);
+    seedLineage(sqlite);
+    const realFetch = globalThis.fetch;
+    let called = 0;
+    globalThis.fetch = async (...a) => { called++; return giteaPage(HUMAN_PAGE.commits)(...a); };
+    try {
+      const first = await sweepStaleMergeNoBase(env);
+      eq(first.cleared, 0, "a human commit in the derived window blocks the clear");
+      eq(called > 0, true, "…the walk was actually paid for once");
+      const memo = sqlite.prepare(`SELECT review_master_json FROM tq_rows ORDER BY id`).all();
+      eq(
+        memo.map((r) => parseSnap(r.review_master_json)._meta?.clear_blocked_sha),
+        ["tipA", "tipA"],
+        "…and recorded against master's tip in a synthesized container",
+      );
+      eq(
+        memo.map((r) => Object.keys(parseSnap(r.review_master_json)).filter((k) => k !== "_meta").length),
+        [0, 0],
+        "…which invents no Door43 field values, because none were ever captured",
+      );
+      called = 0;
+      const second = await sweepStaleMergeNoBase(env);
+      eq(second.cleared, 0, "the next night still clears nothing");
+      eq(called, 0, "…and the memo means the same unanswerable walk is never re-bought");
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  }
+
+  // (d2) An INCOMPLETE walk clears nothing either — "we could not read the
+  //      history" is not "no human touched it" — and memoizes the same way.
+  {
+    const { sqlite, env } = freshEnv();
+    seedLegacy(sqlite, ["sw00"]);
+    seedMintLog(sqlite, ["sw00"]);
+    seedLineage(sqlite);
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = async () => { throw new Error("network down"); };
+    try {
+      const result = await sweepStaleMergeNoBase(env);
+      eq(result.cleared, 0, "an incomplete walk clears no derived-window flag");
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+    const row = sqlite.prepare(`SELECT review_kind, review_master_json FROM tq_rows`).all()[0];
+    eq(row.review_kind, "merge_no_base", "…the flag stands");
+    eq(parseSnap(row.review_master_json)._meta?.clear_blocked_sha, "tipA", "…with the blocked attempt memoized");
+  }
+
+  // (e) The 30-day bound applies to a derived window exactly as it does to a
+  //     recorded one: measured on the watermark, because that is the far end of
+  //     the range a walk would have to cover.
+  {
+    const { sqlite, env } = freshEnv();
+    seedLegacy(sqlite, ["sw00"]);
+    seedMintLog(sqlite, ["sw00"]);
+    seedLineage(sqlite, { confirmedAt: NOW - 45 * 86400 });
+    const realFetch = globalThis.fetch;
+    let called = 0;
+    globalThis.fetch = async () => { called++; throw new Error("should not be called"); };
+    try {
+      const result = await sweepStaleMergeNoBase(env);
+      eq(result.cleared, 0, "a pre-#653 flag whose window is past the bound is skipped");
+      eq(called, 0, "…and costs no Gitea fetch — it is left to the dismiss path");
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  }
+
+  // (f) THE BUDGET CAP. The nightly has already died once on Cloudflare's
+  //     subrequest limit, so one sweep hands at most NO_BASE_SWEEP_MAX_PAIRS
+  //     (10) pairs to the clear however many books hold flags. Every book here
+  //     is walkable, so the number of pairs that reached a walk is exactly the
+  //     number of first-page fetches.
+  {
+    const { sqlite, env } = freshEnv();
+    const books = ["1CH", "2CH", "AMO", "DAN", "ECC", "EZK", "HAB", "HOS", "ISA", "JER", "JOB", "JOL", "JON", "LAM", "MIC"];
+    for (const b of books) {
+      seedLegacy(sqlite, [`sw_${b}`], b);
+      seedMintLog(sqlite, [`sw_${b}`], MINT_AT, b);
+      seedLineage(sqlite, { book: b });
+    }
+    const realFetch = globalThis.fetch;
+    let called = 0;
+    globalThis.fetch = async () => { called++; throw new Error("network down"); };
+    try {
+      const result = await sweepStaleMergeNoBase(env);
+      eq(result.pairs, 15, "every flagged pair is found…");
+      eq(result.swept, 10, "…but only the night's ration is handed to the clear");
+      eq(called, 10, "…so the walk budget is bounded no matter how many books are flagged");
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  }
+
+  // (g) Nothing flagged anywhere -> three indexed reads and no walk. The steady
+  //     state this is designed for.
+  {
+    const { sqlite, env } = freshEnv();
+    sqlite
+      .prepare(
+        `INSERT INTO tq_rows (id, book, chapter, verse, ref_raw, question, response, review_kind)
+         VALUES ('ok01', ?, 3, 1, '3:1', 'q', 'r', NULL)`,
+      )
+      .run(BOOK);
+    const realFetch = globalThis.fetch;
+    let called = 0;
+    globalThis.fetch = async () => { called++; throw new Error("should not be called"); };
+    try {
+      const result = await sweepStaleMergeNoBase(env);
+      eq(result, { pairs: 0, swept: 0, cleared: 0 }, "no flags anywhere means nothing to sweep");
+      eq(called, 0, "…and not one Gitea fetch was spent finding that out");
+    } finally {
+      globalThis.fetch = realFetch;
+    }
   }
 }
 
