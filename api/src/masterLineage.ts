@@ -178,6 +178,20 @@ export interface MasterCommit {
   authorName?: string | null;
   /** commit.author.date, ISO-8601. Diagnostic only. */
   date?: string | null;
+  /**
+   * parents[0].sha — first parent only, i.e. "master's previous tip". Present
+   * only for callers that need to store lineage (the dcs_commits ledger,
+   * issue #685); never classified on. Absent on every existing caller's
+   * commits, which is why it is optional rather than nullable-required.
+   */
+  parentSha?: string | null;
+  /**
+   * In-repo paths the commit touched, from the list endpoint's own
+   * `files=true`. Requested only by callers that pass `{ files: true }` to
+   * listMasterCommitsSince; undefined means "not requested", null means
+   * "requested but the response carried none". Never classified on.
+   */
+  files?: string[] | null;
 }
 
 export interface ClassifiedCommit extends MasterCommit {

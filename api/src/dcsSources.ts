@@ -217,6 +217,19 @@ export function dcsResourceFile(
   }
 }
 
+// Every resource the reimport/export path handles. Exported so a caller that
+// needs "all of them" iterates this instead of writing its own literal list.
+export const REIMPORT_RESOURCES: readonly ReimportResource[] = ["ult", "ust", "tn", "tq", "twl"];
+
+// The repos our exports target, DERIVED from dcsResourceFile above rather than
+// listed again (issue #685). A second hardcoded copy is exactly how the repo
+// set would silently drift the day a resource is added or renamed; the sentinel
+// book only picks a row out of BOOK_NUMBERS — the repo name in each row does
+// not depend on which book you ask for.
+export const TRACKED_DCS_REPOS: readonly string[] = Array.from(
+  new Set(REIMPORT_RESOURCES.map((r) => dcsResourceFile("GEN", r)!.repo)),
+);
+
 // Raw content URL for a repo/path. With no `ref`, resolves to git.door43.org's
 // web raw-branch route (unauthenticated) — "master's current tip" — which is
 // what dcsUrls() and the plain best-effort fetchText() import paths want: they
@@ -330,12 +343,28 @@ export interface MasterCommitPage {
   incompleteReason: string;
 }
 
+// TWO OPTIONAL WIDENINGS, both added for the dcs_commits ledger (issue #685)
+// and both inert for every pre-existing caller:
+//
+//   * `path === null` drops the `&path=` filter and walks the REPO's master
+//     history instead of one file's. The ledger's question is "what happened on
+//     Door43", which is not scoped to a book we happen to have imported. Note
+//     that repo-scoped history contains Gitea merge commits that path-scoped
+//     history mostly hides — a real difference in what the classifier sees, not
+//     just more rows.
+//   * `opts.files` flips the endpoint's own `files` flag on, populating
+//     MasterCommit.files. MEASURED on git.door43.org 2026-09-01: page 1 of
+//     en_ult/en_tn with `files=true` is 102,595 bytes against 100,445 with
+//     `files=false` (~2%), for ZERO extra subrequests — so this is the cheap
+//     route to a per-commit file list, and the per-commit fetch fanout the
+//     issue warned about is not needed. Default stays false so the nightly
+//     path's payload does not grow.
 export async function listMasterCommitsSince(
   env: Env,
   repo: string,
-  path: string,
+  path: string | null,
   sinceSha: string | null,
-  opts: { pageLimit?: number; sinceTime?: number | null } = {},
+  opts: { pageLimit?: number; sinceTime?: number | null; files?: boolean } = {},
 ): Promise<MasterCommitPage> {
   const pageLimit = opts.pageLimit ?? 5;
   // The watermark bound, in unix seconds. When present it REPLACES the sha as
@@ -356,8 +385,9 @@ export async function listMasterCommitsSince(
   for (let page = 1; page <= pageLimit; page++) {
     const url =
       `${base}/api/v1/repos/${DCS_OWNER}/${encodeURIComponent(repo)}` +
-      `/commits?sha=master&path=${encodeURIComponent(path)}` +
-      `&page=${page}&stat=false&verification=false&files=false`;
+      `/commits?sha=master` +
+      (path ? `&path=${encodeURIComponent(path)}` : "") +
+      `&page=${page}&stat=false&verification=false&files=${opts.files === true ? "true" : "false"}`;
     let batch: Array<Record<string, unknown>>;
     let lastPage: boolean;
     try {
@@ -402,12 +432,26 @@ export async function listMasterCommitsSince(
           return { commits: out, incomplete: false, incompleteReason: "" };
         }
       }
+      // parents[0] only — first-parent IS "master's previous tip". A merge's
+      // second parent is the branch that was merged in, which is not on the
+      // line we are walking.
+      const parents = Array.isArray(raw.parents) ? (raw.parents as Array<Record<string, unknown>>) : [];
+      const parentSha = typeof parents[0]?.sha === "string" ? (parents[0].sha as string) : null;
+      // Only present when the caller asked (`files: true`); `null` distinguishes
+      // "asked and got none" from "never asked" (undefined).
+      const rawFiles = Array.isArray(raw.files) ? (raw.files as Array<Record<string, unknown>>) : null;
+      const files =
+        rawFiles == null
+          ? null
+          : rawFiles.map((f) => (typeof f.filename === "string" ? f.filename : null)).filter((f): f is string => f != null);
       out.push({
         sha,
         message: typeof commit.message === "string" ? commit.message : null,
         authorEmail: typeof author.email === "string" ? author.email : null,
         authorName: typeof author.name === "string" ? author.name : null,
         date: typeof author.date === "string" ? author.date : null,
+        parentSha,
+        ...(opts.files === true ? { files } : {}),
       });
     }
 

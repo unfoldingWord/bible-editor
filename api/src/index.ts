@@ -18,6 +18,8 @@ import { alerts } from "./alerts";
 import { alignmentAttention } from "./alignmentAttention";
 import { verseMergeConflicts } from "./verseMergeConflicts";
 import { comments } from "./comments";
+import { pollDcsCommits } from "./dcsCommitPoll";
+import { dcsCommits } from "./dcsCommits";
 import { books } from "./bookImport";
 import { bookLockGuard } from "./bookLockGuard";
 import { EDIT_LOG_SWEEP_SQL, EDIT_LOG_RETENTION_SECONDS } from "./editLogSweep";
@@ -206,6 +208,7 @@ app.route("/api/alerts", alerts);
 app.route("/api/alignment-attention", alignmentAttention);
 app.route("/api/verse-merge-conflicts", verseMergeConflicts);
 app.route("/api/comments", comments);
+app.route("/api/dcs-commits", dcsCommits);
 
 // WebSocket upgrade into the ChapterRoom DO. WS handshakes are normal HTTP
 // upgrades, so they carry the Access cookie (same-origin) and attachAuth has
@@ -350,6 +353,19 @@ export default {
       // pre-watermark AI baseline), or the merge would go permanently blind
       // on that verse the day its last pre-watermark row aged out — see
       // editLogSweep.ts for the full story (issue #537).
+      // Door43 master-commit ledger (issue #685). Self-rate-limited to one real
+      // poll per repo per 30 minutes off its own stored state, so most ticks
+      // cost one D1 read and zero Door43 fetches; a due tick costs 5-20
+      // subrequests. No new cron: this belongs on the same "keep the DB honest
+      // even with nobody watching" tick as the pipeline poll above, and a
+      // second trigger would only add a schedule to keep in sync. Wrapped —
+      // the ledger is observability, and Door43 being down must not fail the
+      // cron invocation that also sweeps locks below.
+      try {
+        await pollDcsCommits(env);
+      } catch (e) {
+        console.error("dcs commit poll tick failed", e instanceof Error ? e.message : String(e));
+      }
       const minuteOfHour = Math.floor(Date.now() / 60_000) % 60;
       if (minuteOfHour < 5) {
         // try/catch (same shape as the pipeline_jobs cleanup above): a failed
