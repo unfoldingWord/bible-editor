@@ -82,8 +82,15 @@ Highlights that bite repeatedly:
   `"review_kind":"merge_no_base"`, `logEditStmt` at `bookReimport.ts:2668`) for older ones. Note that edit_log is
   *not* forever: `editLogSweep.ts` deletes `update` rows past 180 days (only the newest `create` per live row is
   exempt), so mint evidence expires. #683 (`sweepStaleMergeNoBase`) derives a pre-#653 flag's window from the mint
-  run's persisted lineage (`book_resource_syncs.master_lineage_confirmed_at`), admitted only when
-  `master_lineage_computed_at <= mintAt` proves that lineage is the mint's own and not a later overwrite.
+  run's persisted lineage, admitted only when `master_lineage_computed_at <= mintAt` proves that lineage is the
+  mint's own and not a later overwrite.
+- **A column added by a migration is NULL for exactly the rows a backlog-draining fix cares about, because those
+  rows are stuck precisely for want of a later run to fill it.** #683's first cut derived its window from
+  `book_resource_syncs.master_lineage_confirmed_at` (migration 0058, deployed 2026-08-31). Measured read-only in
+  prod on 2026-09-01: NULL for all three stuck pairs (AMO tn, AMO tq, ECC tq) — the column only fills on a run
+  after that deploy, and "no run has visited this pair since" is the *definition* of the backlog. The fix needed a
+  second evidence tier over a column that predated the flags (`master_lineage_computed_at`, 0054). Before relying
+  on a recently-added column to heal historical rows, check whether those rows can ever have it.
 - **A per-book nightly step can only heal books the nightly visits, so any self-healing wired inside the sync
   reaches exactly the books that did not need healing.** #665's merge_no_base auto-clear sat inside
   `loadMasterLineage`, which runs only when a resource's master file moved; 12 flags on AMO and ECC therefore

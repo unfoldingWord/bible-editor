@@ -3821,11 +3821,69 @@ const NO_BASE_CLEAR_MAX_WINDOW_SECONDS = 30 * 24 * 3600;
 // Every other guard is untouched and still applies to the derived window: the
 // 30-day bound (measured on the watermark, same as `flag_since`), a COMPLETE
 // walk required, zero human commits required, and the blocked-sha memo.
+//
+// TWO EVIDENCE TIERS, because the first one is empty for the flags this was
+// built for. Measured read-only in prod after the above shipped: all three
+// backlog pairs (AMO tn, AMO tq, ECC tq) have master_lineage_confirmed_at NULL.
+// Migration 0058 added that column on 2026-08-31 and it only fills on a run
+// AFTER that deploy — and these pairs are in the backlog precisely because no
+// run has visited them since. So `confirmed_at` can never arrive for them, and
+// a derivation that needs it drains nothing.
+//
+//   TIER 1 `confirmed_at` — windowStart = master_lineage_confirmed_at, the
+//     watermark the mint run's walk was bounded by. Strongest: it is literally
+//     the `flag_since` a post-#653 mint would have recorded.
+//
+//   TIER 2 `computed_at_clean` — confirmed_at NULL, so use
+//     master_lineage_computed_at (0054, present since well before the backlog)
+//     — but ONLY when the pair's stored verdict is clean on all three fields:
+//     `incomplete === false && hasHumanCommit === false && mayHoldHumanEdit ===
+//     false`. Anything else (a missing field, an unparseable summary, an
+//     incomplete walk, a human commit, or "nobody looked") refuses the tier.
+//
+// WHY TIER 2 COVERS THE FLAG'S CLAIM. `computed_at` is NOT a watermark, so on
+// its own it is exactly the too-late start this whole comment warns about — the
+// flag's claim reaches back to the mint run's watermark, which is older. What
+// closes that older half is the STORED VERDICT: the same
+// `computedAt <= mintAt` inequality that admits tier 1 proves (with
+// last-run-wins persistence) that the stored verdict IS the mint run's own
+// measurement, and that measurement was a COMPLETE walk over
+// [its watermark → computed_at] that found zero human commits. So the older
+// half of the range is already covered by evidence, recorded at the time, by
+// the very run that raised the flag. The clear's own fresh walk then covers
+// [computed_at → now] under the identical complete-and-human-free requirement.
+// The union of the two spans the flag's whole claim with a measurement at every
+// point, which is the only thing that has ever justified a clear here.
+//
+// The stored verdict ALONE is not sufficient and is never used that way:
+// commits landing in the seconds between `computed_at` and the mint (the prod
+// gap is 10, 10 and 2 seconds), and everything since, are ruled out only by the
+// fresh walk. Tier 2 shortens the fresh walk; it does not replace it.
 interface NoBaseFallbackWindow {
-  /** book_resource_syncs.master_lineage_confirmed_at for this pair. */
+  /** Where the walk must start: see the tier notes above. */
   windowStart: number;
   /** book_resource_syncs.master_lineage_computed_at for this pair. */
   computedAt: number;
+  /** Which tier supplied `windowStart` — carried into the audit evidence. */
+  tier: "confirmed_at" | "computed_at_clean";
+}
+
+// Is a pair's PERSISTED lineage verdict clean on every axis? Only an explicit
+// `false` on all three counts as clean — the same fail-safe shape
+// masterMayHoldHumanEdit enforces for the live summary, restated here because
+// this reads a JSON blob out of D1 where a field can simply be missing (an
+// older summary shape, a truncated write) and `!undefined` would read as
+// "measured false". Nobody-looked, could-not-read and found-a-human all refuse.
+function persistedLineageVerdictIsClean(json: string | null): boolean {
+  if (!json) return false;
+  try {
+    const p = JSON.parse(json);
+    if (!p || typeof p !== "object" || Array.isArray(p)) return false;
+    const s = p as Record<string, unknown>;
+    return s.incomplete === false && s.hasHumanCommit === false && s.mayHoldHumanEdit === false;
+  } catch {
+    return false;
+  }
 }
 
 // The immutable mint time for each of `ids`, from the mint's own edit_log row.
@@ -4090,8 +4148,11 @@ async function clearResolvedMergeNoBase(
       // #683: how many of these flags had no window of their own and were
       // walked against one derived from the mint run's persisted lineage. An
       // audit row has to say which evidence retired the flag, and "the window
-      // came from somewhere other than the flag" is part of that.
+      // came from somewhere other than the flag" is part of that — including
+      // WHICH tier supplied it, since the two rest on different arguments (see
+      // NoBaseFallbackWindow). Null when no window was derived at all.
       derived_windows: derivedWindows,
+      window_tier: derivedWindows > 0 ? (fallback?.tier ?? null) : null,
     };
     const byId = new Map(rs.results.map((r) => [r.id, r] as const));
     let cleared = 0;
@@ -4239,11 +4300,12 @@ export async function sweepStaleMergeNoBase(env: Env): Promise<{ pairs: number; 
         master_lineage_confirmed_at: number | null;
         master_lineage_computed_at: number | null;
         master_lineage_sha: string | null;
+        master_lineage_json: string | null;
       } | null = null;
       try {
         lineage =
           (await env.DB.prepare(
-            `SELECT master_lineage_confirmed_at, master_lineage_computed_at, master_lineage_sha
+            `SELECT master_lineage_confirmed_at, master_lineage_computed_at, master_lineage_sha, master_lineage_json
                FROM book_resource_syncs WHERE book = ?1 AND resource = ?2`,
           )
             .bind(book, kind)
@@ -4251,6 +4313,7 @@ export async function sweepStaleMergeNoBase(env: Env): Promise<{ pairs: number; 
               master_lineage_confirmed_at: number | null;
               master_lineage_computed_at: number | null;
               master_lineage_sha: string | null;
+              master_lineage_json: string | null;
             }>()) ?? null;
       } catch (e) {
         // 0054/0058 unapplied (deploy raced its migration). The sweep still runs
@@ -4263,7 +4326,19 @@ export async function sweepStaleMergeNoBase(env: Env): Promise<{ pairs: number; 
       }
       const w = lineage?.master_lineage_confirmed_at ?? null;
       const c = lineage?.master_lineage_computed_at ?? null;
-      const fallback: NoBaseFallbackWindow | null = w != null && c != null ? { windowStart: w, computedAt: c } : null;
+      // Tier 1 when the mint run's watermark is on record; tier 2 when it is
+      // not (0058 postdates these flags) and the mint run's own verdict was
+      // clean on all three axes. `computedAt` stays the same value in both
+      // tiers — it is what the `computedAt <= mintAt` proof is about — while
+      // `windowStart` is what changes. See NoBaseFallbackWindow.
+      const fallback: NoBaseFallbackWindow | null =
+        c == null
+          ? null
+          : w != null
+            ? { windowStart: w, computedAt: c, tier: "confirmed_at" }
+            : persistedLineageVerdictIsClean(lineage?.master_lineage_json ?? null)
+              ? { windowStart: c, computedAt: c, tier: "computed_at_clean" }
+              : null;
       swept++;
       cleared += await clearResolvedMergeNoBase(
         env,

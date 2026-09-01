@@ -2520,14 +2520,21 @@ console.log("\n[#683: the sweep reaches books no run visits, and pre-#653 flags 
         .run(id, book, JSON.stringify({ review_kind: "merge_no_base", review_reason: "raised before #653" }), at);
     }
   };
-  const seedLineage = (sqlite, { confirmedAt = WATERMARK, computedAt = MINT_AT - 60, sha = "tipA", book = BOOK } = {}) => {
+  // The mint run's own persisted lineage. `confirmedAt: null` is the REAL prod
+  // shape for the backlog (migration 0058 postdates those flags, and their pairs
+  // were never revisited to fill it), which is what tier 2 exists for.
+  const CLEAN_VERDICT = { incomplete: false, hasHumanCommit: false, mayHoldHumanEdit: false };
+  const seedLineage = (
+    sqlite,
+    { confirmedAt = WATERMARK, computedAt = MINT_AT - 60, sha = "tipA", book = BOOK, verdict = CLEAN_VERDICT } = {},
+  ) => {
     sqlite
       .prepare(
         `INSERT INTO book_resource_syncs (book, resource, source_sha, origin, master_lineage_confirmed_at,
-                                          master_lineage_computed_at, master_lineage_sha)
-         VALUES (?, 'tq', 'sha0', 'reimport', ?, ?, ?)`,
+                                          master_lineage_computed_at, master_lineage_sha, master_lineage_json)
+         VALUES (?, 'tq', 'sha0', 'reimport', ?, ?, ?, ?)`,
       )
-      .run(book, confirmedAt, computedAt, sha);
+      .run(book, confirmedAt, computedAt, sha, verdict === null ? null : JSON.stringify(verdict));
   };
   // A Gitea /commits page in the raw wire shape, so the clear's OWN fetch path
   // (the one a sweep always takes — it holds no walk to reuse) is exercised
@@ -2571,6 +2578,91 @@ console.log("\n[#683: the sweep reaches books no run visits, and pre-#653 flags 
     eq(payload.evidence.window_start, WATERMARK, "…over the mint run's own watermark, not the row's updated_at");
     eq(payload.evidence.human, 0, "…with the measurement that justified it");
     eq(payload.evidence.derived_windows, 2, "…and the audit says the window was derived, not carried by the flag");
+    eq(payload.evidence.window_tier, "confirmed_at", "…naming which evidence tier supplied that window");
+  }
+
+  // (a2) TIER 2, and the shape the prod backlog is ACTUALLY in: measured
+  //      read-only on 2026-09-01, all three stuck pairs (AMO tn, AMO tq, ECC tq)
+  //      have master_lineage_confirmed_at NULL — migration 0058 added that
+  //      column after they were flagged, and it only fills on a later visit,
+  //      which is exactly what never happened. So tier 1 can never arrive for
+  //      them. Tier 2 walks from master_lineage_computed_at instead, admitted by
+  //      the mint run's own clean verdict covering everything older than it.
+  {
+    const { sqlite, env } = freshEnv();
+    seedLegacy(sqlite, ["sw00"]);
+    seedMintLog(sqlite, ["sw00"]);
+    seedLineage(sqlite, { confirmedAt: null });
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = giteaPage(OURS_AND_AI_PAGE.commits);
+    let result;
+    try {
+      result = await sweepStaleMergeNoBase(env);
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+    eq(result.cleared, 1, "a pre-0058 pair with no recorded watermark still clears on its own clean verdict");
+    const payload = JSON.parse(
+      sqlite.prepare(`SELECT payload_json FROM edit_log WHERE action = 'sync_clear_review'`).all()[0].payload_json,
+    );
+    eq(payload.evidence.window_tier, "computed_at_clean", "…and the audit names the weaker tier it rested on");
+    eq(
+      payload.evidence.window_start,
+      MINT_AT - 60,
+      "…walking from when that verdict was computed, the point its coverage ends",
+    );
+  }
+
+  // (a3) Tier 2 refuses every verdict that is not clean on all three axes. An
+  //      incomplete walk, a human commit found, and "nobody looked"
+  //      (mayHoldHumanEdit true) each leave the older half of the flag's range
+  //      unmeasured — and the stored verdict is the ONLY thing covering that
+  //      half, so a defect there is not recoverable by the fresh walk. A
+  //      verdict missing a field, or absent entirely, is the same absence: never
+  //      `!undefined` read as "measured false".
+  for (const [label, verdict] of [
+    ["a human commit was found", { incomplete: false, hasHumanCommit: true, mayHoldHumanEdit: true }],
+    ["the walk was incomplete", { incomplete: true, hasHumanCommit: false, mayHoldHumanEdit: true }],
+    ["nobody could rule a human out", { incomplete: false, hasHumanCommit: false, mayHoldHumanEdit: true }],
+    ["a field is missing from the verdict", { incomplete: false, hasHumanCommit: false }],
+    ["there is no stored verdict at all", null],
+  ]) {
+    const { sqlite, env } = freshEnv();
+    seedLegacy(sqlite, ["sw00"]);
+    seedMintLog(sqlite, ["sw00"]);
+    seedLineage(sqlite, { confirmedAt: null, verdict });
+    const realFetch = globalThis.fetch;
+    let called = 0;
+    // A walk that WOULD succeed, so an ablated verdict check shows up as a
+    // false clear rather than as a wasted fetch.
+    globalThis.fetch = async (...a) => { called++; return giteaPage(OURS_AND_AI_PAGE.commits)(...a); };
+    try {
+      const result = await sweepStaleMergeNoBase(env);
+      eq(result.cleared, 0, `tier 2 refuses a verdict where ${label}`);
+      eq(called, 0, `…and spends no walk on it (${label})`);
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  }
+
+  // (a4) Tier 2 is still bound by the SAME inequality as tier 1: a lineage
+  //      computed after the mint is not the mint run's measurement, so its
+  //      verdict says nothing about the flag's own range however clean it is.
+  {
+    const { sqlite, env } = freshEnv();
+    seedLegacy(sqlite, ["sw00"]);
+    seedMintLog(sqlite, ["sw00"]);
+    seedLineage(sqlite, { confirmedAt: null, computedAt: MINT_AT + 60 });
+    const realFetch = globalThis.fetch;
+    let called = 0;
+    globalThis.fetch = async (...a) => { called++; return giteaPage(OURS_AND_AI_PAGE.commits)(...a); };
+    try {
+      const result = await sweepStaleMergeNoBase(env);
+      eq(result.cleared, 0, "a clean verdict computed AFTER the mint cannot supply the window either");
+      eq(called, 0, "…and costs no Gitea fetch");
+    } finally {
+      globalThis.fetch = realFetch;
+    }
   }
 
   // (b) The derivation in isolation: a NULL-review_master_json flag inside the
