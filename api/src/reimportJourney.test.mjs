@@ -58,6 +58,11 @@ const parseSnap = (s) => {
   }
 };
 
+// #684: displayAuthor wraps every Door43 author name in bidi isolates
+// (FSI…PDI) before interpolating it — an RTL name would otherwise reorder the
+// date and sha that follow it. Expectations below go through this helper.
+const ISO_NAME = (name) => `\u2068${name}\u2069`;
+
 // ── Lineage fixtures (#653) ────────────────────────────────────────────────
 // Compacted summaries, exactly the shape compactLineage produces and the shape
 // that rides a Workflow step's return value into applyTsvRows.
@@ -1033,7 +1038,7 @@ console.log("\n[AI-vs-human conflict policy at the caller]");
       editId: boundary,
       lineage: {
         ...HAS_HUMAN,
-        humanCommits: [{ sha: "b39f0c72aa18", author: "Stephen Wunrow", date: "2026-08-14" }],
+        humanCommits: [{ sha: "b39f0c72aa18", author: "Stephen Wunrow", date: "2026-08-14T09:05:41Z" }],
       },
     });
     const row = readRow(sqlite);
@@ -1047,10 +1052,40 @@ console.log("\n[AI-vs-human conflict policy at the caller]");
       "…the outcome still leads (the chip clamps to two lines)",
     );
     eq(
-      row.review_reason.includes("Door43 edits to this file: Stephen Wunrow on 2026-08-14 (b39f0c7)."),
+      row.review_reason.includes(`Door43 edits to this file: ${ISO_NAME('Stephen Wunrow')} on 2026-08-14 (b39f0c7).`),
       true,
       "…with the who/when appended, scoped to the file because that is what the walk measured",
     );
+
+    // COLD REVIEW F1 at THIS site, which is the one whose dedup guard compares
+    // reason text (bookReimport.ts: stripHumanCommitEvidence on both sides).
+    // The translator re-edits the row, so tonight's run re-detects the very same
+    // both-changed finding — but the window now holds one more human commit, so
+    // the clause renders differently. The reason must NOT be rewritten: the
+    // finding did not change, and only the identity drifted.
+    //
+    // ABLATION: replace the guard with the pre-fix `cur.review_reason !== reason`
+    // and this assertion fails (the reason is rewritten to name Richard Mahn).
+    sqlite.prepare(`UPDATE tq_rows SET response = 'our response', version = 5 WHERE id='ai01'`).run();
+    const reasonBefore = readRow(sqlite).review_reason;
+    await applyTsvRows(env, BOOK, "tq", [masterRowAt("a maintainer's fix")], null, {
+      confirmedAt: 200,
+      editId: boundary,
+      lineage: {
+        ...HAS_HUMAN,
+        counts: { ours: 1, ai: 0, human: 2 },
+        humanShas: ["c41d0e99aa71", "b39f0c72aa18"],
+        humanCommits: [
+          { sha: "c41d0e99aa71", author: "Richard Mahn", date: "2026-08-17T11:31:02Z" },
+          { sha: "b39f0c72aa18", author: "Stephen Wunrow", date: "2026-08-14T09:05:41Z" },
+        ],
+      },
+    });
+    const reRun = readRow(sqlite);
+    eq(reRun.response, "a maintainer's fix", "the re-detected conflict still resolves master-wins");
+    eq(reRun.review_kind, "merge_conflict", "…still flagged the same way");
+    eq(reRun.review_reason, reasonBefore, "…and the reason is NOT rewritten for identity drift alone");
+    eq(reRun.review_reason.includes(ISO_NAME("Richard Mahn")), false, "…so no churn from the newly measured commit");
   }
 
   // 4. No lineage at all — the field an in-flight Workflow's memoized plan does
@@ -2101,7 +2136,7 @@ console.log("\n[#653: with NO ancestor at all, the mint is gated on the measured
     const namedLineage = {
       ...HUMAN_LINEAGE,
       humanCommits: [
-        { sha: "7d1c9ab4e05f", author: "justplainjane47", date: "2026-08-15" },
+        { sha: "7d1c9ab4e05f", author: "justplainjane47", date: "2026-08-15T14:22:07Z" },
       ],
     };
     const { sqlite, env } = freshEnv();
@@ -2121,7 +2156,7 @@ console.log("\n[#653: with NO ancestor at all, the mint is gated on the measured
       "…and the measured cause still leads",
     );
     eq(
-      row.review_reason.includes("Door43 edits to this file: justplainjane47 on 2026-08-15 (7d1c9ab)."),
+      row.review_reason.includes(`Door43 edits to this file: ${ISO_NAME('justplainjane47')} on 2026-08-15 (7d1c9ab).`),
       true,
       "…now naming the person, the day and the commit — the ISA 2026-08-15 flags' real cause",
     );
@@ -2136,6 +2171,47 @@ console.log("\n[#653: with NO ancestor at all, the mint is gated on the measured
       row.review_reason.indexOf("Door43 edits to this file:") > row.review_reason.indexOf("could not tell which side"),
       true,
       "…and the who/when placed last, after the cause",
+    );
+  }
+
+  // 2c. COLD REVIEW F1, the churn rule: "versions don't bump unless something
+  //     actually changed". A standing flag is re-examined every night, and the
+  //     identity clause drifts on its own — a new Door43 commit lands, or the
+  //     watermark the walk is bounded by advances. That drift must not rewrite
+  //     the flag or bump the row's version, because a version bump on a row
+  //     nobody touched 409s the outbox op of any tab holding it.
+  {
+    const { sqlite, env } = freshEnv();
+    seed(sqlite);
+    const night1 = {
+      ...HUMAN_LINEAGE,
+      humanCommits: [{ sha: "7d1c9ab4e05f", author: "justplainjane47", date: "2026-08-15T14:22:07Z" }],
+    };
+    // The next night: one MORE human commit in the window, by someone else, so
+    // the clause this run would render is different text for the same finding.
+    const night2 = {
+      ...HUMAN_LINEAGE,
+      counts: { ours: 1, ai: 1, human: 2 },
+      humanShas: ["b39f0c72aa18", "7d1c9ab4e05f"],
+      humanCommits: [
+        { sha: "b39f0c72aa18", author: "Stephen Wunrow", date: "2026-08-16T09:05:41Z" },
+        { sha: "7d1c9ab4e05f", author: "justplainjane47", date: "2026-08-15T14:22:07Z" },
+      ],
+    };
+    await applyTsvRows(env, BOOK, "tq", master(), null, { confirmedAt: 200, editId: null, lineage: night1 });
+    const after1 = sqlite.prepare(`SELECT review_reason, review_master_json, version FROM tq_rows WHERE id='nb99'`).all()[0];
+    eq(after1.version, 2, "night one mints the flag: one version bump");
+    eq(after1.review_reason.includes(ISO_NAME("justplainjane47")), true, "…naming the commit it measured");
+
+    await applyTsvRows(env, BOOK, "tq", master(), null, { confirmedAt: 200, editId: null, lineage: night2 });
+    const after2 = sqlite.prepare(`SELECT review_reason, review_master_json, version FROM tq_rows WHERE id='nb99'`).all()[0];
+    eq(after2.version, 2, "night two, with a DIFFERENT set of commits measured, does not bump the version");
+    eq(after2.review_reason, after1.review_reason, "…and does not rewrite the reason");
+    eq(after2.review_master_json, after1.review_master_json, "…nor the Door43 snapshot beside it");
+    eq(
+      after2.review_reason.includes(ISO_NAME("Stephen Wunrow")),
+      false,
+      "…so the flag keeps the identity measured when the finding was made, and the row is never touched",
     );
   }
 
@@ -2168,7 +2244,7 @@ console.log("\n[#653: with NO ancestor at all, the mint is gated on the measured
         hasHumanCommit: true,
         counts: { ours: 1, ai: 1, human: 1 },
         humanShas: ["7d1c9ab4e05f"],
-        humanCommits: [{ sha: "7d1c9ab4e05f", author: "justplainjane47", date: "2026-08-15" }],
+        humanCommits: [{ sha: "7d1c9ab4e05f", author: "justplainjane47", date: "2026-08-15T14:22:07Z" }],
       },
     });
     const row = sqlite.prepare(`SELECT review_kind, review_reason FROM tq_rows WHERE id='nb99'`).all()[0];
