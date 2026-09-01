@@ -74,7 +74,12 @@ import { applyTwlSortOrderUpdates } from "./twlSortOrderApply";
 import { loadTwTitles } from "./twTitles";
 import { loadTwlOrderLocks } from "./twlOrderLocks";
 import { runPostExport, VALIDATORS } from "./postExport";
-import { runChunkedReimport, storedResourceSha, ALL_RESOURCES as REIMPORT_RESOURCES } from "./bookReimport";
+import {
+  runChunkedReimport,
+  storedResourceSha,
+  sweepStaleMergeNoBase,
+  ALL_RESOURCES as REIMPORT_RESOURCES,
+} from "./bookReimport";
 import { dcsResourceFile, fetchDcsMasterText, fileCommitSha, type ReimportResource } from "./dcsSources";
 import { gitBlobSha } from "./ownPublish";
 import type { TnRow, TqRow, TwlRow, VerseRow } from "./types";
@@ -330,6 +335,51 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
           } catch {
             /* alert is best-effort; never let it abort the export run */
           }
+        }
+      }
+
+      // 1b-ii. Retire stale merge_no_base flags on books this run never walked
+      //        (#683). The per-book work above only reaches #665's auto-clear
+      //        for a (book, resource) whose master file moved, so a book that
+      //        stops changing keeps showing translators an "Unmerged Door43
+      //        edit — verify" warning the system itself can measure false — 12
+      //        of them in prod on 2026-09-01, on AMO and ECC. This sweep asks
+      //        "which books still carry a flag" instead of "which did we sync";
+      //        see sweepStaleMergeNoBase for the budget cap and why it does NOT
+      //        subtract the run's own book list.
+      //
+      //        Its own step.do, at the same altitude as "locked-books" below:
+      //        one retryable unit, and once per run rather than per book. (Its
+      //        cost is small either way — a handful of D1 reads and at most
+      //        ~60 Gitea fetches; whether a step.do gets a fresh subrequest
+      //        budget is not something this repo has verified.)
+      //
+      //        TWO GATES beyond the enclosing one, both narrowing:
+      //
+      //        `!params.dryDcs` — the enclosing `dcsAllowed || reimportOnly`
+      //        lets a dryDcs + reimportOnly run through, and dryDcs means "do
+      //        not touch Door43 or push anything live". The sweep both walks
+      //        Door43 and writes D1, so it must not run there (Codex F6).
+      //
+      //        FULL NIGHTLY ONLY — no `book`, no `resource`, no `resources`.
+      //        The sweep's whole point is to reach pairs the run did NOT visit,
+      //        so under a scoped admin run ("Pull from Door43" for one book) it
+      //        would clear flags on up to ten unrelated pairs the operator
+      //        never asked about (Codex F7). Both crons (05:30 export, 08:00
+      //        self-heal) are unscoped and so both sweep; with the CAP-per-day
+      //        rotation stride they land on the same day's slice, and the memo
+      //        makes the second pass cheap — waste, not harm.
+      //
+      //        try/catch because a warning that failed to clear is not a reason
+      //        to abandon the export that follows.
+      const sweepScopeIsFullNightly = !params.book && !params.resource && !params.resources?.length;
+      if (!params.dryDcs && sweepScopeIsFullNightly) {
+        try {
+          await step.do("sweep-stale-review-flags", async () => sweepStaleMergeNoBase(this.env));
+        } catch (e) {
+          console.error("export stale review-flag sweep failed", {
+            error: e instanceof Error ? e.message : String(e),
+          });
         }
       }
     }

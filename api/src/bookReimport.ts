@@ -2926,8 +2926,21 @@ function snapshotBlockedSha(json: string | null): string | null {
 // Rewrite a stored snapshot's `_meta.clear_blocked_sha`, leaving every Door43
 // field untouched. Returns null when the snapshot cannot be parsed (nothing to
 // annotate — that row simply keeps paying, which is the safe direction).
+//
+// A NULL snapshot gets a SYNTHESIZED container (#683). Before the sweep, a
+// pre-#653 flag could never reach the memo at all — it was skipped for want of
+// a window long before this — so "nothing to annotate" was the whole story.
+// Now those flags DO get walked (see NoBaseFallbackWindow), and a blocked
+// attempt on one has to be recordable or the sweep re-buys the same answer
+// every night for exactly the flags it was added to serve. The container holds
+// `_meta` and nothing else: it is bookkeeping about the flag, and it must never
+// read as "Door43 held blank values for this row" — lint.ts's
+// reviewMasterSnapshot strips `_meta` and now returns null for what is left,
+// so the UI still shows no Door43 side, which is the truth here (no snapshot
+// was ever taken). snapshotFlagSince stays null on it too, so the row keeps
+// coming back through the fallback path rather than acquiring a fake window.
 function withBlockedSha(json: string | null, sha: string): string | null {
-  if (!json) return null;
+  if (!json) return JSON.stringify({ _meta: { clear_blocked_sha: sha } });
   try {
     const p = JSON.parse(json);
     if (!p || typeof p !== "object" || Array.isArray(p)) return null;
@@ -3802,6 +3815,207 @@ async function loadMasterLineage(
 // backlog's oldest is ~5 days) and well inside 250 commits for these files.
 const NO_BASE_CLEAR_MAX_WINDOW_SECONDS = 30 * 24 * 3600;
 
+// How far BEFORE `master_lineage_computed_at` a tier-2 walk starts, to cover the
+// seam between the stored walk's fetch and the persist that stamped that
+// timestamp. See NoBaseFallbackWindow's "THE SECONDS-WIDE SEAM": widening a walk
+// can only push toward refusal, so a generous day costs at most an extra page.
+const NO_BASE_TIER2_SLACK_SECONDS = 86400;
+
+// WHERE A PRE-#653 FLAG'S WINDOW COMES FROM (#683), and why it is not
+// `updated_at`.
+//
+// A flag minted before migration 0057 has review_master_json NULL — no
+// `flag_since`, so the clear above counts it `skippedNoWindow` forever. In prod
+// on 2026-09-01 that was 12 flags (tn AMO ×7, tq AMO ×2, tq ECC ×3) the system
+// itself holds the evidence to exonerate, and no human had dismissed.
+//
+// The obvious-looking source is the row's own `updated_at`, and it is WRONG in
+// the one direction that matters. The mint is guarded on `cur.review_kind ==
+// null`, so a flag is written once — but rows.ts's NON-VERSIONING fast paths
+// (reorder drag `SET sort_order = ?1, updated_at = ?2`, rows.ts:815; the
+// preserve/hint bit toggles, rows.ts:1244; the trash toggles, rows.ts:1317 and
+// :1338) move `updated_at` and deliberately leave review_kind standing. So
+// `updated_at >= mint`, never `==`, and a window that starts at `updated_at`
+// can start AFTER the human commit the flag is about — reporting "no human
+// found" over a range that never contained it. That is the one answer that
+// retires a true warning, so this path does not use `updated_at` at all.
+//
+// It uses the evidence the mint run itself persisted for the (book, resource)
+// pair (migrations 0054 + 0058, written by persistMasterLineage):
+//
+//   windowStart = master_lineage_confirmed_at — the watermark THAT walk was
+//                 bounded by, i.e. the same `flag_since` a post-#653 mint would
+//                 have written into the snapshot.
+//   computedAt  = master_lineage_computed_at — when that walk ran.
+//
+// The safety argument is one inequality, and it is STRICT. persistMasterLineage
+// is last-run-wins, so `computedAt` is the LATEST lineage this pair has. If
+// `computedAt < mintAt` then no lineage was computed after the mint, so the
+// persisted watermark is the one that was in effect at the mint (the mint run
+// walks, persists, and then merges — bookReimport.ts:3737 before :3742), and a
+// walk from it covers the flag's whole claim. If `computedAt >= mintAt` the pair
+// may have been re-walked since and that evidence is gone: the watermark may
+// have advanced past the flag's own, so the derivation is REFUSED and the flag
+// keeps the dismiss path.
+//
+// EQUALITY IS A REFUSAL (Codex P1). Both timestamps are unix SECONDS, so
+// `computedAt == mintAt` is ambiguous: it is equally consistent with the mint
+// run's own walk (persisted a fraction of a second before the merge wrote the
+// flag) and with a LATER run that re-walked inside the same second the mint
+// landed in. Only the second reading is unsafe, and nothing at this resolution
+// can tell them apart — so the ambiguous case is refused. It costs nothing
+// real: the whole measured backlog clears the bar with 10, 10 and 2 seconds of
+// margin (AMO tn 1787981649 vs 1787981661, AMO tq 1787981651 vs 1787981661,
+// ECC tq 1787463089 vs 1787463091). That is why this is the sweep's tool and not the visited
+// path's — a run that just walked has already overwritten `computedAt` with
+// `now`, and correctly gets no fallback window.
+//
+// `mintAt` therefore has to be immutable, which rules `updated_at` out a second
+// time. It comes from edit_log: the mint writes an `action = 'update'` row whose
+// payload is the merge write object verbatim, containing
+// `"review_kind":"merge_no_base"` (logEditStmt at bookReimport.ts:2668). MIN()
+// over those rows is used, so a row that was minted, cleared and re-minted
+// resolves to the FIRST mint — an earlier bound, i.e. a longer walk, which can
+// only make clearing harder. A flag whose mint log is absent (the log goes in a
+// second batch, so a lost log batch is possible; editLogSweep.ts also deletes
+// `update` rows past 180 days) gets NO window and is skipped, exactly as today.
+//
+// Every other guard is untouched and still applies to the derived window: the
+// 30-day bound (measured on the watermark, same as `flag_since`), a COMPLETE
+// walk required, zero human commits required, and the blocked-sha memo.
+//
+// TWO EVIDENCE TIERS, because the first one is empty for the flags this was
+// built for. Measured read-only in prod after the above shipped: all three
+// backlog pairs (AMO tn, AMO tq, ECC tq) have master_lineage_confirmed_at NULL.
+// Migration 0058 added that column on 2026-08-31 and it only fills on a run
+// AFTER that deploy — and these pairs are in the backlog precisely because no
+// run has visited them since. So `confirmed_at` can never arrive for them, and
+// a derivation that needs it drains nothing.
+//
+//   TIER 1 `confirmed_at` — windowStart = master_lineage_confirmed_at, the
+//     watermark the mint run's walk was bounded by. Strongest: it is literally
+//     the `flag_since` a post-#653 mint would have recorded.
+//
+//   TIER 2 `computed_at_clean` — confirmed_at NULL, so use
+//     master_lineage_computed_at (0054, present since well before the backlog)
+//     — but ONLY when the pair's stored verdict is clean on all three fields:
+//     `incomplete === false && hasHumanCommit === false && mayHoldHumanEdit ===
+//     false`. Anything else (a missing field, an unparseable summary, an
+//     incomplete walk, a human commit, or "nobody looked") refuses the tier.
+//
+// WHY TIER 2 COVERS THE FLAG'S CLAIM. `computed_at` is NOT a watermark, so on
+// its own it is exactly the too-late start this whole comment warns about — the
+// flag's claim reaches back to the mint run's watermark, which is older. What
+// closes that older half is the STORED VERDICT: the same
+// `computedAt < mintAt` inequality that admits tier 1 proves (with
+// last-run-wins persistence) that the stored verdict IS the mint run's own
+// measurement, and that measurement was a COMPLETE walk over
+// [its watermark → computed_at] that found zero human commits. So the older
+// half of the range is already covered by evidence, recorded at the time, by
+// the very run that raised the flag. The clear's own fresh walk then covers
+// [computed_at → now] under the identical complete-and-human-free requirement.
+// The union of the two spans the flag's whole claim with a measurement at every
+// point, which is the only thing that has ever justified a clear here.
+//
+// The stored verdict ALONE is not sufficient and is never used that way:
+// commits landing in the seconds between `computed_at` and the mint (the prod
+// gap is 10, 10 and 2 seconds), and everything since, are ruled out only by the
+// fresh walk. Tier 2 shortens the fresh walk; it does not replace it.
+//
+// THE SECONDS-WIDE SEAM, and the slack that closes it. The two halves do not
+// actually meet at a point: the stored walk's evidence ends at its FETCH, while
+// `computed_at` is stamped later at persist — after summarizeLineage and, when
+// it runs, fetchHumanTouchedRefs' extra round-trips. A commit whose author date
+// falls in that seam is behind the fresh walk's start and ahead of the stored
+// walk's end, so neither would see it. So the tier-2 walk starts a whole day
+// EARLIER than `computed_at` (NO_BASE_TIER2_SLACK_SECONDS). Widening a walk can
+// only ever push toward refusal — re-seeing commits the stored walk already
+// measured costs at most one more page and can add a human commit, never remove
+// one — so the slack is free in the only direction that matters. A day also
+// absorbs modest author-date backdating.
+//
+// A SHARED LIMIT, NOT THIS TIER'S: every walk in this system bounds by
+// `author.date` (listMasterCommitsSince's sinceTime compares it), so a commit
+// PUSHED later carrying an author date older than the window start is invisible
+// to the mint gate, to #665's clear, and to tier 1 alike — this derivation is no
+// more exposed to it than the code it extends. Tracked as issue #691.
+interface NoBaseFallbackWindow {
+  /** Where the walk must start: see the tier notes above. */
+  windowStart: number;
+  /** book_resource_syncs.master_lineage_computed_at for this pair. */
+  computedAt: number;
+  /** Which tier supplied `windowStart` — carried into the audit evidence. */
+  tier: "confirmed_at" | "computed_at_clean";
+}
+
+// Is a pair's PERSISTED lineage verdict clean on every axis? Only an explicit
+// `false` on all three counts as clean — the same fail-safe shape
+// masterMayHoldHumanEdit enforces for the live summary, restated here because
+// this reads a JSON blob out of D1 where a field can simply be missing (an
+// older summary shape, a truncated write) and `!undefined` would read as
+// "measured false". Nobody-looked, could-not-read and found-a-human all refuse.
+function persistedLineageVerdictIsClean(json: string | null): boolean {
+  if (!json) return false;
+  try {
+    const p = JSON.parse(json);
+    if (!p || typeof p !== "object" || Array.isArray(p)) return false;
+    const s = p as Record<string, unknown>;
+    return s.incomplete === false && s.hasHumanCommit === false && s.mayHoldHumanEdit === false;
+  } catch {
+    return false;
+  }
+}
+
+// The immutable mint time for each of `ids`, from the mint's own edit_log row.
+// See NoBaseFallbackWindow's note for why this and not `updated_at`. Indexed by
+// `edit_log_row_by_book (kind, book, row_key)` (migration 0017), one seek per
+// id, chunked at MINT_LOOKUP_BATCH to stay under D1's 100-bound-param cap
+// (kind + book + one param per id). Never throws: a failure here must
+// leave the rest of the clear (post-#653 flags included) running, and an empty
+// map degrades to exactly today's `skippedNoWindow`.
+async function mintTimesFromEditLog(
+  env: Env,
+  kind: TsvKind,
+  book: string,
+  ids: string[],
+): Promise<Map<string, number>> {
+  const out = new Map<string, number>();
+  try {
+    for (let i = 0; i < ids.length; i += MINT_LOOKUP_BATCH) {
+      const slice = ids.slice(i, i + MINT_LOOKUP_BATCH);
+      const ph = slice.map((_, j) => `?${j + 3}`).join(",");
+      const rs = await env.DB.prepare(
+        `SELECT row_key, MIN(created_at) AS mint_at FROM edit_log
+          WHERE kind = ?1 AND book = ?2 AND row_key IN (${ph})
+            AND action = 'update'
+            AND payload_json LIKE '%"review_kind":"merge_no_base"%'
+          GROUP BY row_key`,
+      )
+        .bind(kind, book, ...slice)
+        .all<{ row_key: string; mint_at: number | null }>();
+      for (const r of rs.results) {
+        if (typeof r.mint_at === "number" && Number.isFinite(r.mint_at)) out.set(String(r.row_key), r.mint_at);
+      }
+    }
+  } catch (e) {
+    console.error("reimport merge_no_base clear: mint-time lookup failed", {
+      book,
+      kind,
+      error: e instanceof Error ? e.message : String(e),
+    });
+    return new Map();
+  }
+  return out;
+}
+
+// Ids per mint-lookup statement. D1 caps a statement at 100 BOUND PARAMS and
+// this one binds kind + book + one per id, so the ceiling is 98 — and the repo
+// convention for batched D1 statements here is 90 (see WRITE_BATCH). Over the
+// cap the statement throws, mintTimesFromEditLog returns an empty map, and the
+// whole pair silently loses its derivation — which is exactly what 100 did
+// (Codex F2).
+const MINT_LOOKUP_BATCH = 90;
+
 // Retire the merge_no_base flags on a (book, kind) that the commit history now
 // disproves (#653).
 //
@@ -3846,13 +4060,21 @@ async function clearResolvedMergeNoBase(
   env: Env,
   book: string,
   kind: TsvKind,
-  walkStart: number,
-  walked: MasterCommitPage,
+  // The run's own walk, and where it started. BOTH null when the caller holds
+  // no walk to reuse — the #683 sweep, which reaches pairs precisely because no
+  // run walked them. Then the clear always fetches its own walk, bounded by the
+  // flags' own windows exactly as the reuse path is.
+  walkStart: number | null,
+  walked: MasterCommitPage | null,
   file: { repo: string; path: string },
   // Master's tip sha for this file as of the run's own walk, or null when
   // nothing moved it since the watermark. Only used to memoize a blocked
   // attempt; a null simply means this run cannot memoize.
   masterSha: string | null,
+  // Only the sweep passes this: where a pre-#653 flag's window may be derived
+  // from, and under what proof. See NoBaseFallbackWindow. Absent (the visited
+  // path) leaves this function's behavior byte-for-byte what #665 shipped.
+  fallback: NoBaseFallbackWindow | null = null,
 ): Promise<number> {
   try {
     const rs = await env.DB.prepare(
@@ -3870,24 +4092,91 @@ async function clearResolvedMergeNoBase(
     let skippedNoWindow = 0;
     let skippedStale = 0;
     let skippedMemo = 0;
+    let derivedWindows = 0;
+    // Which rows' windows were DERIVED (fallback) rather than carried by the
+    // flag itself. Per row, because the audit payload is per row: a row holding
+    // its own flag_since must not be stamped with a tier it never used.
+    const derivedIds = new Set<string>();
+
+    // #683: only the sweep passes a fallback, and only the flags with no window
+    // of their own can use one — so the mint-time lookup is paid only when both
+    // are true. `derivable` maps a row id to the derived window; anything not in
+    // it keeps counting as skippedNoWindow, unchanged.
+    const derivable = new Map<string, number>();
+    if (fallback != null) {
+      const noWindowIds = rs.results.filter((r) => snapshotFlagSince(r.review_master_json) == null).map((r) => r.id);
+      if (noWindowIds.length > 0) {
+        const mints = await mintTimesFromEditLog(env, kind, book, noWindowIds);
+        for (const id of noWindowIds) {
+          const mintAt = mints.get(id);
+          // The inequality the whole derivation rests on: the persisted lineage
+          // must NOT be newer than the mint, or its watermark is not the one
+          // this flag's claim is bounded by. See NoBaseFallbackWindow.
+          if (mintAt != null && fallback.computedAt < mintAt) derivable.set(id, fallback.windowStart);
+        }
+      }
+    }
+
+    // PASS A — which flags have a walkable window at all, and where does it
+    // start. No Gitea call happens here: everything is read from the flag or
+    // from the pair's own persisted lineage, so a pair with nothing to do stays
+    // free. `derivedIds` records only the rows whose window came from the
+    // fallback AND survived to a real attempt (Codex F5) — counting the ones
+    // that were skipped for staleness or a memo hit would report a derivation
+    // that never happened.
+    const candidates: Array<{ id: string; since: number; derived: boolean }> = [];
     for (const r of rs.results) {
-      const since = snapshotFlagSince(r.review_master_json);
+      const own = snapshotFlagSince(r.review_master_json);
+      const since = own ?? derivable.get(r.id) ?? null;
       if (since == null) {
-        skippedNoWindow++; // pre-#653 flag, or a snapshot we cannot read
+        skippedNoWindow++; // pre-#653 flag with no derivable window, or a snapshot we cannot read
         continue;
       }
       if (now - since > NO_BASE_CLEAR_MAX_WINDOW_SECONDS) {
         skippedStale++; // too far back to walk — see the bound's own comment
         continue;
       }
-      // A previous attempt was blocked against this exact master tip. Nothing
-      // about the answer can have changed, so do not pay for it again.
-      if (masterSha != null && snapshotBlockedSha(r.review_master_json) === masterSha) {
+      candidates.push({ id: r.id, since, derived: own == null });
+    }
+
+    // THE MEMO KEY MUST BE A TIP THAT MOVES WHEN MASTER MOVES (Codex F3). The
+    // visited path hands in the sha its own walk just observed, which is exactly
+    // that. The sweep cannot: an unvisited pair's stored `master_lineage_sha` is
+    // frozen at whatever the last visiting run saw, so memoizing against it
+    // would (a) never invalidate — one flaky Gitea night would skip that pair
+    // for good, even after a Door43 human edit landed — and (b) be unavailable
+    // at all when the stored sha is NULL, leaving the pair paying a full 5-page
+    // walk every night. So when no tip is supplied, ONE page is fetched here to
+    // learn master's current tip for this file, and that is the memo key for
+    // both the read below and any write later. It is a single subrequest, taken
+    // only when a pair actually has candidates, and it buys the right to skip
+    // the up-to-5-page walk entirely on a memo hit.
+    let tip = masterSha;
+    if (tip == null && candidates.length > 0) {
+      const probe = await listMasterCommitsSince(env, file.repo, file.path, null, {
+        sinceTime: Math.min(...candidates.map((c) => c.since)),
+        pageLimit: 1,
+      });
+      // A failed probe simply means this run cannot memoize (tip stays null) —
+      // never a reason to skip a clear, because the walk and the pre-write
+      // recheck below both still have to pass on their own evidence.
+      tip = probe.commits[0]?.sha ?? null;
+    }
+
+    // PASS B — drop the candidates a previous attempt already answered against
+    // this exact tip, and take the window from what is left.
+    for (const c of candidates) {
+      const row = rs.results.find((r) => r.id === c.id);
+      if (tip != null && snapshotBlockedSha(row?.review_master_json ?? null) === tip) {
         skippedMemo++;
         continue;
       }
-      clearable.push(r.id);
-      windowStart = windowStart == null ? since : Math.min(windowStart, since);
+      clearable.push(c.id);
+      if (c.derived) {
+        derivedIds.add(c.id);
+        derivedWindows++;
+      }
+      windowStart = windowStart == null ? c.since : Math.min(windowStart, c.since);
     }
     if (clearable.length === 0 || windowStart == null) {
       console.log("reimport merge_no_base clear: nothing walkable", {
@@ -3897,24 +4186,37 @@ async function clearResolvedMergeNoBase(
         skippedNoWindow,
         skippedStale,
         skippedMemo,
+        derivedWindows,
       });
       return 0;
     }
 
     // Reuse the run's walk when it already reaches back past every window —
-    // then the clear costs no extra Gitea fetch at all.
+    // then the clear costs no extra Gitea fetch at all. A caller with no walk
+    // (the sweep) always fetches; that is the point of it.
     let walk = walked;
-    if (walkStart > windowStart) {
+    // The lower bound the walk we end up using was ACTUALLY taken with. The
+    // staleness recheck below has to re-ask under the same bound: page 1 is
+    // newest-first either way, but a reused run walk starts EARLIER than
+    // `windowStart`, so its newest commit can itself be older than
+    // `windowStart` — and a recheck bounded by `windowStart` would then see an
+    // empty page and read "no commits" as "the tip moved".
+    let walkSince = walkStart ?? windowStart;
+    if (walk == null || walkStart == null || walkStart > windowStart) {
       walk = await listMasterCommitsSince(env, file.repo, file.path, null, { sinceTime: windowStart });
+      walkSince = windowStart;
     }
     // A blocked outcome is recorded on the rows themselves, keyed by master's
     // tip, so tonight's answer is not re-bought tomorrow for an unchanged file.
     const memoBlocked = async (reason: string): Promise<void> => {
-      if (masterSha == null) return;
+      // `tip` not `masterSha`: on the sweep path this is the freshly probed tip
+      // (Codex F3), which self-invalidates as master moves; on the visited path
+      // the two are the same value.
+      if (tip == null) return;
       const stmts: D1PreparedStatement[] = [];
       for (const r of rs.results) {
         if (!clearable.includes(r.id)) continue;
-        const next = withBlockedSha(r.review_master_json, masterSha);
+        const next = withBlockedSha(r.review_master_json, tip);
         if (next == null) continue;
         stmts.push(
           env.DB.prepare(
@@ -3930,7 +4232,7 @@ async function clearResolvedMergeNoBase(
       for (let i = 0; i < stmts.length; i += WRITE_BATCH) {
         await env.DB.batch(stmts.slice(i, i + WRITE_BATCH));
       }
-      console.log("reimport merge_no_base clear: memoized a blocked attempt", { book, kind, reason, masterSha });
+      console.log("reimport merge_no_base clear: memoized a blocked attempt", { book, kind, reason, tip });
     };
     if (walk.incomplete) {
       console.log("reimport merge_no_base clear: skipped, lineage walk incomplete", {
@@ -3951,6 +4253,112 @@ async function clearResolvedMergeNoBase(
         humanShas: humans.slice(0, LINEAGE_EVIDENCE_CAP).map((c) => c.sha),
       });
       await memoBlocked("human_commit");
+      return 0;
+    }
+
+    // THE WALK'S EVIDENCE MUST STILL BE TRUE WHEN THE WRITE LANDS (Codex P0 on
+    // #683). Everything above measures Door43's history and then writes to D1,
+    // and the two are minutes apart on a slow nightly. The final UPDATE's
+    // `review_kind = 'merge_no_base'` re-assertion does NOT cover this: it is a
+    // D1 race guard, and a human pushing to Door43 changes nothing in D1 for it
+    // to catch. Worse, the flag would not be re-minted in the meantime — the
+    // mint is guarded on `cur.review_kind == null`, and this row still holds a
+    // flag — so a stale clear erases the one warning that would have sent a
+    // translator to look at the edit it is about, and the next export writes
+    // over it.
+    //
+    // So the tip is re-read immediately before the batch, under the SAME bound
+    // the walk used, and the clear is abandoned unless master's newest commit
+    // for this file is still the one the walk covered. Costs one subrequest per
+    // pair that is actually about to clear — after every other gate, in a steady
+    // state where clearing is rare — and it protects the VISITED path too, since
+    // that path runs through this same function.
+    //
+    // Fails toward keeping the flag in every ambiguous case: an unreadable
+    // recheck (fetch failure, HTTP error, an empty page that reports itself
+    // incomplete) aborts exactly like a moved tip. Nothing is memoized on an
+    // abort: the memo's premise is "the answer cannot have changed while master
+    // is unchanged", and a tip that just moved is the opposite of that —
+    // memoizing the old sha would be a lie about what was measured, and
+    // memoizing the new one would suppress tomorrow's legitimate re-walk.
+    //
+    // THE RACE IS NARROWED, NOT CLOSED, and that is a deliberate accept. D1
+    // cannot condition a write on Door43's state atomically — there is no
+    // cross-system transaction to be had — so a commit landing between this
+    // recheck and the batch below is still measured as absent. Two reasons that
+    // residue is acceptable, both checked rather than assumed:
+    //
+    //   (a) It STRICTLY TIGHTENS what already shipped. #665's clear (commit
+    //       c0b1e4f8) ran walk → human-commit check → env.DB.batch with no tip
+    //       re-read anywhere between, so the live exposure was the whole
+    //       walk-to-write span — minutes on a slow nightly, and longer on the
+    //       sweep, which walks up to five pages. This shrinks that to the gap
+    //       between two adjacent statements.
+    //
+    //   (b) The consequence is BOUNDED, not permanent. A human commit moves the
+    //       file's commit sha, and the nightly skips a resource ONLY on a
+    //       positive sha match (:7468, "fail-open: null/unknown → reimport"), so
+    //       the next run does not sha-skip this pair. It cannot have quietly
+    //       advanced the watermark past that commit either. Both writers of
+    //       master_confirmed_at are gated on master's BYTES equalling a render of
+    //       ours: the export path stamps it only when the pre-commit comparison
+    //       finds master already byte-identical to what it was about to write
+    //       (exportWorkflow.ts:2254, via export.ts:2089's `branchTouched:
+    //       false`), and the reimport path only through markOwnPublishConverged
+    //       (:6822), reached only when recognizeOwnPublish matches master's blob
+    //       against our last pushed render (:7573, ownPublish.ts:156 declines
+    //       with `content_differs`). An ordinary human edit changes those bytes,
+    //       so both decline and the watermark stays frozen behind the commit.
+    //       The revisit's lineage walk is bounded by that same frozen watermark
+    //       (:3689), so the commit — newer than it by construction — is inside
+    //       the window, where masterMayHoldHumanEdit picks it up (:1960) and the
+    //       mint gate can re-mint over the NULL review_kind this clear wrote.
+    //
+    // Qualifications on (b), none of which make it circular but all of which
+    // make it CONDITIONAL — verified, not assumed:
+    //   · The gate is "master's blob differs from our last pushed render", not
+    //     "a human committed". A human commit that lands on exactly our bytes
+    //     (a revert to our render, most plausibly) is recognized as our own
+    //     publish, the watermark DOES advance, and the pair is skipped at :7573.
+    //     That case is also the one where there is least to warn about, but it
+    //     is not nothing.
+    //   · A moved sha means "not sha-skipped", not "merged": a null fetch
+    //     (:7542), a truncated TSV (:7634) or own-publish recognition all still
+    //     emit `changed: false` and reach no merge that night.
+    //   · The re-mint additionally needs the row to still be an edited candidate
+    //     (:1912), not preserve/hint/trashed-protected (:1965), the pair to have
+    //     a watermark at all (:3701), and the merge to again produce
+    //     `keep_no_base` (:1999). What (b) really guarantees is that the human's
+    //     commit becomes VISIBLE to the next run's gate — restoring the
+    //     protection the flag stood for — not that the identical flag reappears.
+    //   · The revisit's walk inherits the author-date bound described in
+    //     NoBaseFallbackWindow: a commit authored before the watermark but
+    //     pushed after it is invisible to that walk exactly as it is to every
+    //     other walk here (issue #691).
+    const walkTip = walk.commits[0]?.sha ?? null;
+    const recheck = await listMasterCommitsSince(env, file.repo, file.path, null, {
+      sinceTime: walkSince,
+      // Only the newest commit is needed, so this never pays the 5-page budget.
+      pageLimit: 1,
+    });
+    if (recheck.commits.length === 0 && recheck.incomplete) {
+      console.log("reimport merge_no_base clear: skipped, master tip could not be re-read before the write", {
+        book,
+        kind,
+        flagged,
+        reason: recheck.incompleteReason,
+      });
+      return 0;
+    }
+    const tipNow = recheck.commits[0]?.sha ?? null;
+    if (tipNow !== walkTip) {
+      console.log("reimport merge_no_base clear: skipped, master moved between the walk and the write", {
+        book,
+        kind,
+        flagged,
+        walkTip,
+        tipNow,
+      });
       return 0;
     }
 
@@ -3977,9 +4385,16 @@ async function clearResolvedMergeNoBase(
     for (const c of walk.commits.map(classifyMasterCommit)) kindCounts[c.kind]++;
     const evidence = {
       window_start: windowStart,
-      walked_sha: masterSha,
+      walked_sha: tip,
       commits: walk.commits.length,
       ...kindCounts,
+      // #683: how many of these flags had no window of their own and were
+      // walked against one derived from the mint run's persisted lineage. An
+      // audit row has to say which evidence retired the flag, and "the window
+      // came from somewhere other than the flag" is part of that — including
+      // WHICH tier supplied it, since the two rest on different arguments (see
+      // NoBaseFallbackWindow). Null when no window was derived at all.
+      derived_windows: derivedWindows,
     };
     const byId = new Map(rs.results.map((r) => [r.id, r] as const));
     let cleared = 0;
@@ -3999,7 +4414,12 @@ async function clearResolvedMergeNoBase(
             review_kind: "merge_no_base",
             review_reason: null,
             review_master_json: byId.get(id)?.review_master_json ?? null,
-            evidence,
+            // PER ROW (Codex F5): which evidence supplied THIS row's window.
+            // "flag_since" is a row carrying its own recorded window; the two
+            // fallback tiers are #683's derivations. One shared field would tell
+            // a future incident reader that a row rested on evidence it never
+            // touched.
+            evidence: { ...evidence, window_tier: derivedIds.has(id) ? (fallback?.tier ?? null) : "flag_since" },
           }),
         );
       }
@@ -4037,11 +4457,193 @@ export const clearResolvedMergeNoBaseForTest = (
   env: Env,
   book: string,
   kind: TsvKind,
-  walkStart: number,
-  walked: MasterCommitPage,
+  walkStart: number | null,
+  walked: MasterCommitPage | null,
   file: { repo: string; path: string },
   masterSha: string | null = null,
-): Promise<number> => clearResolvedMergeNoBase(env, book, kind, walkStart, walked, file, masterSha);
+  fallback: NoBaseFallbackWindow | null = null,
+): Promise<number> => clearResolvedMergeNoBase(env, book, kind, walkStart, walked, file, masterSha, fallback);
+
+// How many (book, kind) pairs one sweep will hand to the clear. THE BUDGET
+// GUARANTEE, and the reason the sweep can be unconditional. Measured cost of one
+// swept pair, worst case:
+//
+//   D1:    1 lineage read (book_resource_syncs) + 1 flagged-row read + 1
+//          mint-time read (only for flags with no window of their own) + one
+//          write batch per WRITE_BATCH slice of rows it clears or memoizes.
+//   Gitea: 0 on a pair with nothing walkable; otherwise THREE components —
+//          1 tip probe (the memo key, always paid once a pair has candidates)
+//          + up to listMasterCommitsSince's 5-page walk (skipped entirely on a
+//          memo hit) + 1 pre-write tip recheck (only for a pair that survives
+//          every gate and reaches the write). So 7 at worst per pair, 1 on a
+//          memo hit.
+//
+// So a full sweep is bounded at roughly 30 D1 reads, a handful of write batches,
+// and up to 70 Gitea fetches (10 pairs x 7) however many books hold flags. Plus the three
+// DISTINCT-book queries that find the pairs in the first place. The nightly has
+// already died once on Cloudflare's ~1000-subrequest cap, and this runs in its
+// own Workflow step (exportWorkflow.ts) so none of it is spent from a book's
+// budget. (Whether a step.do gets its own fresh subrequest budget is not
+// verified in this repo; the totals above are small either way.)
+//
+// The cap is a per-night ration, not a permanent ceiling: the start offset
+// advances by a WHOLE CAP per day (see the sweep), so N flagged pairs are fully
+// covered every ceil(N/CAP) nights. Advancing by one pair per day instead — the
+// first version of this — left an unlucky pair waiting ~N-CAP nights, long
+// enough to age past the 30-day walk bound and become permanently unclearable
+// without ever having been examined. A fixed order is worse still: the first ten
+// unclearable pairs would starve the eleventh forever. Pairs that stay
+// unclearable memoize against master's tip and then cost no fetch on their turn,
+// so the steady state converges to "cheap" rather than to "capped".
+const NO_BASE_SWEEP_MAX_PAIRS = 10;
+
+// Sweep the (book, kind) pairs that still hold merge_no_base flags but no run
+// visited (#683).
+//
+// #665's auto-clear lives inside loadMasterLineage, which the nightly reaches
+// only for a (book, resource) whose master file MOVED — so a book that stops
+// changing can never heal its own flags. Prod on 2026-09-01: 12 flags on AMO
+// and ECC, both quiet since the runs that minted them (2026-08-29 and
+// 2026-08-23), each pair's own persisted lineage showing a COMPLETE walk with
+// human = 0. The evidence to retire them existed; nothing was ever going to
+// look at it again.
+//
+// This asks the question the other way round: not "which books did we sync",
+// but "which books still carry a flag". Migration 0057's partial indexes
+// (`ON <table>(book) WHERE review_kind IS NOT NULL`) make that a scan of the
+// flagged rows alone, and the steady state it is built for is zero rows.
+//
+// NO VISITED-SET EXCLUSION, deliberately. "Visited" is the wrong predicate — a
+// book the run visited without WALKING (its sha did not move) is exactly the
+// case this exists for, so subtracting the run's book list would subtract AMO
+// and ECC too. Double work is instead prevented by the two things that are
+// already true after a visited pair's clear ran: a cleared flag is gone (so the
+// pair is not in this query's results at all), and a BLOCKED one carries the
+// memo keyed to master's tip sha — the very sha this sweep passes back in from
+// `master_lineage_sha`, which the visited run just refreshed. So a pair the
+// nightly already handled costs one D1 read here and no fetch.
+//
+// Fail-soft at every level, like the clear itself: one kind's query or one
+// pair's clear failing must not take the nightly down, and the flags simply
+// stand for another night.
+//
+// KNOWN, SHARED WITH THE VISITED PATH: this does not consult book_locks or the
+// published-book gate, so it can retire a flag on a locked or published book.
+// That is pre-existing behavior — #665's clear, which runs inside the nightly
+// reimport, has never consulted them either, and clearing a flag changes no
+// exported content — but it is a real question about who may quiet a warning on
+// a frozen book, and it belongs with the locks work rather than here.
+export async function sweepStaleMergeNoBase(env: Env): Promise<{ pairs: number; swept: number; cleared: number }> {
+  const kinds: TsvKind[] = ["tn", "tq", "twl"];
+  const pairs: Array<{ book: string; kind: TsvKind }> = [];
+  for (const kind of kinds) {
+    try {
+      const rs = await env.DB.prepare(
+        `SELECT DISTINCT book FROM ${TSV_TABLE[kind]}
+          WHERE review_kind = 'merge_no_base' AND deleted_at IS NULL`,
+      ).all<{ book: string }>();
+      for (const r of rs.results) if (r.book) pairs.push({ book: String(r.book), kind });
+    } catch (e) {
+      console.error("merge_no_base sweep: flagged-book query failed", {
+        kind,
+        error: e instanceof Error ? e.message : String(e),
+      });
+    }
+  }
+  if (pairs.length === 0) return { pairs: 0, swept: 0, cleared: 0 };
+
+  // Deterministic order, rotated by a WHOLE CAP per day so consecutive nights
+  // cover disjoint slices and every pair is reached within ceil(N/CAP) nights.
+  // (Rotating by one pair per day, as this first did, leaves the pair just past
+  // the cap waiting ~N-CAP nights — long enough to age past the 30-day walk
+  // bound before anything ever looks at it.)
+  pairs.sort((a, b) => (a.book === b.book ? a.kind.localeCompare(b.kind) : a.book.localeCompare(b.book)));
+  const offset = (Math.floor(Date.now() / 1000 / 86400) * NO_BASE_SWEEP_MAX_PAIRS) % pairs.length;
+  const turn = [...pairs.slice(offset), ...pairs.slice(0, offset)].slice(0, NO_BASE_SWEEP_MAX_PAIRS);
+
+  let cleared = 0;
+  let swept = 0;
+  for (const { book, kind } of turn) {
+    try {
+      const file = dcsResourceFile(book, kind);
+      if (!file) continue; // no resource file for this pair — nothing to walk
+      // The mint run's own persisted evidence: the watermark its walk was
+      // bounded by, when it ran, and master's tip as of it. All three come from
+      // one indexed read; see NoBaseFallbackWindow for what makes them usable
+      // and the memo note above for why the sha is the right memo key here.
+      let lineage: {
+        master_lineage_confirmed_at: number | null;
+        master_lineage_computed_at: number | null;
+        master_lineage_sha: string | null;
+        master_lineage_json: string | null;
+      } | null = null;
+      try {
+        lineage =
+          (await env.DB.prepare(
+            `SELECT master_lineage_confirmed_at, master_lineage_computed_at, master_lineage_sha, master_lineage_json
+               FROM book_resource_syncs WHERE book = ?1 AND resource = ?2`,
+          )
+            .bind(book, kind)
+            .first<{
+              master_lineage_confirmed_at: number | null;
+              master_lineage_computed_at: number | null;
+              master_lineage_sha: string | null;
+              master_lineage_json: string | null;
+            }>()) ?? null;
+      } catch (e) {
+        // 0054/0058 unapplied (deploy raced its migration). The sweep still runs
+        // for flags that carry their own window; only the derivation is lost.
+        console.error("merge_no_base sweep: lineage read failed (migrations 0054/0058 unapplied?)", {
+          book,
+          kind,
+          error: e instanceof Error ? e.message : String(e),
+        });
+      }
+      const w = lineage?.master_lineage_confirmed_at ?? null;
+      const c = lineage?.master_lineage_computed_at ?? null;
+      // Tier 1 when the mint run's watermark is on record; tier 2 when it is
+      // not (0058 postdates these flags) and the mint run's own verdict was
+      // clean on all three axes. `computedAt` stays the same value in both
+      // tiers — it is what the `computedAt < mintAt` proof is about — while
+      // `windowStart` is what changes. See NoBaseFallbackWindow.
+      const fallback: NoBaseFallbackWindow | null =
+        c == null
+          ? null
+          : w != null
+            ? { windowStart: w, computedAt: c, tier: "confirmed_at" }
+            : persistedLineageVerdictIsClean(lineage?.master_lineage_json ?? null)
+              ? // Start a day before the stored walk's own stamp, so the seam
+                // between its fetch and its persist cannot hide a commit from
+                // both halves of the argument.
+                { windowStart: c - NO_BASE_TIER2_SLACK_SECONDS, computedAt: c, tier: "computed_at_clean" }
+              : null;
+      swept++;
+      cleared += await clearResolvedMergeNoBase(
+        env,
+        book,
+        kind,
+        null,
+        null,
+        file,
+        // NO memo key from here (Codex F3). The stored master_lineage_sha is
+        // frozen at the last visiting run, and an unvisited pair never
+        // refreshes it — memoizing against it would skip the pair forever after
+        // one flaky night. Passing null makes the clear probe master's CURRENT
+        // tip for itself, which self-invalidates as master moves.
+        null,
+        fallback,
+      );
+    } catch (e) {
+      console.error("merge_no_base sweep: pair failed", {
+        book,
+        kind,
+        error: e instanceof Error ? e.message : String(e),
+      });
+    }
+  }
+  console.log("merge_no_base sweep", { flaggedPairs: pairs.length, offset, swept, cleared });
+  return { pairs: pairs.length, swept, cleared };
+}
 
 // Durable counterpart to the console.log above — see 0054_master_lineage_snapshot.sql
 // and, for the two boundary columns, 0058_master_lineage_confirmed_boundary.sql.
