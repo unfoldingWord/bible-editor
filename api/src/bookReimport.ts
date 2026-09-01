@@ -127,6 +127,18 @@ import {
 } from "./verseMergeConflicts.ts";
 import { refineAdoptConflictForVisibleChange } from "./visibleAdoptionChange.ts";
 import { lanesForAdoption, reopenLaneChecksBulk } from "./laneReopen.ts";
+// Issue #686: the row-level "what/where/who" provenance columns (migration
+// 0060). `door43Actor` is the ONLY way this file names a Door43 commit author —
+// never build that string by hand — and it is measured-or-nothing: it names an
+// author only when THIS run's lineage actually found one (see rowProvenance.ts
+// for the full attribution-honesty rule this repo already enforces elsewhere).
+import {
+  provenanceSet,
+  provenanceValues,
+  door43Actor,
+  DOOR43_ACTOR_UNMEASURED,
+  type RowProvenance,
+} from "./rowProvenance.ts";
 // REIMPORT_CHAPTER_CHUNK / reimportChunkBoundaries live in their own
 // zero-dependency module (reimportChunkPlan.ts) so the chunk-boundary math —
 // including the chapter-0 handling — is unit-testable directly under plain
@@ -940,7 +952,16 @@ async function canonicalizeTwlOrder(env: Env, book: string): Promise<number> {
     twTitles,
     lockedVerses,
   );
-  await applyTwlSortOrderUpdates(env.DB, book, updates);
+  // #686: the one caller of this helper that IS a Door43 sync — the nightly
+  // reimport's canonical post-pass, re-deriving order after master's file
+  // landed. The other two state 'system' (the export's own computed order) and
+  // 'user' (an interactive order-lock dismiss); the parameter is required so
+  // that distinction can never be inherited by accident.
+  await applyTwlSortOrderUpdates(env.DB, book, updates, {
+    action: "sync_reorder",
+    source: "dcs_sync",
+    actor: DOOR43_ACTOR_UNMEASURED,
+  });
   return updates.length;
 }
 
@@ -1559,6 +1580,13 @@ export async function applyTsvRows(
   const now = Math.floor(Date.now() / 1000);
   const masterConfirmedAt = cutoff?.confirmedAt ?? null;
   const masterEditId = cutoff?.editId ?? null;
+  // #686, hoisted ONCE per (book, kind) rather than evaluated per row. The
+  // lineage is measured once per (book, resource) per run and rides in on the
+  // cutoff, so every row in this call gets the identical string — and the
+  // per-row form ran displayAuthor's regex passes over every author for every
+  // row in a book (thousands, for a late-alphabet TSV). Nothing about the
+  // value is row-specific; see the granularity note on door43Actor.
+  const door43 = door43Actor(cutoff?.lineage);
 
   // One read of the comparable + pristine-predicate columns for the incoming
   // ids (chunked under the 100 bound-param limit) so classification is in memory.
@@ -1712,7 +1740,15 @@ export async function applyTsvRows(
         continue;
       }
       try {
-        const outcome = await tryInsertTsvRow(env, book, kind, row, sortOrder);
+        // #686: master's row is new to D1 — a sync_merge, attributed to
+        // whichever Door43 author this run's lineage actually measured (never
+        // guessed; door43Actor falls back to the honest "Door43 sync" when
+        // nobody was).
+        const outcome = await tryInsertTsvRow(env, book, kind, row, sortOrder, {
+          action: "sync_merge",
+          source: "dcs_sync",
+          actor: door43,
+        });
         if (outcome === "inserted") {
           counts.inserted++;
           insertedThisPass.add(row.id);
@@ -2450,9 +2486,13 @@ export async function applyTsvRows(
       const results = await env.DB.batch(
         slice.map((id) =>
           env.DB.prepare(
-            `UPDATE ${TSV_TABLE[kind]} SET review_kind = NULL, review_reason = NULL, review_master_json = NULL, updated_at = ?1
+            `UPDATE ${TSV_TABLE[kind]} SET review_kind = NULL, review_reason = NULL, review_master_json = NULL, updated_at = ?1, ${provenanceSet(4)}
                WHERE id = ?2 AND book = ?3 AND review_kind = 'ref_moved' AND deleted_at IS NULL`,
-          ).bind(now, id, book),
+            // #686: clearing our own review flag once master and D1 agree is
+            // housekeeping the reimport does to itself, not an authored Door43
+            // change — DOOR43_ACTOR_UNMEASURED, never the measured-author
+            // string in `door43`.
+          ).bind(now, id, book, ...provenanceValues({ action: "review_clear", source: "dcs_sync", actor: DOOR43_ACTOR_UNMEASURED })),
         ),
       );
       results.forEach((r) => {
@@ -2482,9 +2522,14 @@ export async function applyTsvRows(
       const results = await env.DB.batch(
         slice.map((u) =>
           env.DB.prepare(
-            `UPDATE ${TSV_TABLE[kind]} SET sort_order = ?1, updated_at = ?2
+            // #686: sync_reorder — file-order-only, attributed to whichever
+            // Door43 author this run's lineage measured.
+            `UPDATE ${TSV_TABLE[kind]} SET sort_order = ?1, updated_at = ?2, ${provenanceSet(6)}
                WHERE id = ?3 AND book = ?4 AND ${reorderPristine} AND version = ?5`,
-          ).bind(u.sortOrder, now, u.id, book, u.oldVersion),
+          ).bind(
+            u.sortOrder, now, u.id, book, u.oldVersion,
+            ...provenanceValues({ action: "sync_reorder", source: "dcs_sync", actor: door43 }),
+          ),
         ),
       );
       results.forEach((r) => {
@@ -2504,7 +2549,15 @@ export async function applyTsvRows(
     const slice = updates.slice(i, i + WRITE_BATCH);
     try {
       const results = await env.DB.batch(
-        slice.map((u) => buildTsvUpdateStmt(env, book, kind, u.row, u.sortOrder, u.oldVersion, now)),
+        // #686: pristine master overwrite — sync_merge, attributed to
+        // whichever Door43 author this run's lineage measured.
+        slice.map((u) =>
+          buildTsvUpdateStmt(env, book, kind, u.row, u.sortOrder, u.oldVersion, now, false, false, false, {
+            action: "sync_merge",
+            source: "dcs_sync",
+            actor: door43,
+          }),
+        ),
       );
       const logs: D1PreparedStatement[] = [];
       slice.forEach((u, j) => {
@@ -2532,7 +2585,14 @@ export async function applyTsvRows(
     const slice = aiReseeds.slice(i, i + WRITE_BATCH);
     try {
       const results = await env.DB.batch(
-        slice.map((u) => buildTsvUpdateStmt(env, book, kind, u.row, u.sortOrder, u.oldVersion, now, false, true)),
+        // #686: AI-only re-seed + reclaim to master-owned — sync_reseed.
+        slice.map((u) =>
+          buildTsvUpdateStmt(env, book, kind, u.row, u.sortOrder, u.oldVersion, now, false, true, false, {
+            action: "sync_reseed",
+            source: "dcs_sync",
+            actor: door43,
+          }),
+        ),
       );
       const logs: D1PreparedStatement[] = [];
       slice.forEach((u, j) => {
@@ -2558,7 +2618,14 @@ export async function applyTsvRows(
     const slice = resurrects.slice(i, i + WRITE_BATCH);
     try {
       const results = await env.DB.batch(
-        slice.map((u) => buildTsvUpdateStmt(env, book, kind, u.row, u.sortOrder, u.oldVersion, now, true)),
+        // #686: self-heal resurrection of a pristine tombstone — sync_reseed.
+        slice.map((u) =>
+          buildTsvUpdateStmt(env, book, kind, u.row, u.sortOrder, u.oldVersion, now, true, false, false, {
+            action: "sync_reseed",
+            source: "dcs_sync",
+            actor: door43,
+          }),
+        ),
       );
       const logs: D1PreparedStatement[] = [];
       slice.forEach((u, j) => {
@@ -2623,7 +2690,13 @@ export async function applyTsvRows(
     const stmts: D1PreparedStatement[] = [];
     for (const u of slice) {
       stmts.push(
-        buildTsvUpdateStmt(env, book, kind, u.row, u.sortOrder, u.oldVersion, now, false, false, true),
+        // #686: reissued-tombstone slot reclaim — sync_reseed (a fresh life
+        // for the slot, same category as an AI-only re-seed).
+        buildTsvUpdateStmt(env, book, kind, u.row, u.sortOrder, u.oldVersion, now, false, false, true, {
+          action: "sync_reseed",
+          source: "dcs_sync",
+          actor: door43,
+        }),
         gatedLogEditStmt(env, kind, u.row.id, book, userId, u.oldVersion, u.oldVersion + 1, "create", u.row),
       );
     }
@@ -2686,7 +2759,16 @@ export async function applyTsvRows(
     const slice = editedWrites.slice(i, i + WRITE_BATCH);
     try {
       const results = await env.DB.batch(
-        slice.map((u) => buildTsvEditedWriteStmt(env, book, kind, u.id, u.fields, u.oldVersion, now)),
+        // #686: the three-way merge / master-adoption write on a human-edited
+        // row — the key attribution site. sync_merge, and the actor MUST be
+        // the measured author (never a fallback built here).
+        slice.map((u) =>
+          buildTsvEditedWriteStmt(env, book, kind, u.id, u.fields, u.oldVersion, now, {
+            action: "sync_merge",
+            source: "dcs_sync",
+            actor: door43,
+          }),
+        ),
       );
       const logs: D1PreparedStatement[] = [];
       slice.forEach((u, j) => {
@@ -2778,6 +2860,10 @@ const TSV_MERGE_WRITE_COLS: Record<TsvKind, Set<string>> = {
 // attributed to that human. The same protections isReimportableRow checks are
 // re-asserted in the WHERE clause so a delete/trash/preserve/hint change landing
 // between the read and this batch blocks the write rather than racing it.
+// `provenance` (issue #686): this is the KEY attribution site — the one write
+// where master's content actually overwrites a human-owned row (the three-way
+// merge adoption). The actor must be the measured commit author, never a
+// fallback string built here; the caller passes its hoisted `door43` value.
 function buildTsvEditedWriteStmt(
   env: Env,
   book: string,
@@ -2786,6 +2872,7 @@ function buildTsvEditedWriteStmt(
   fields: Record<string, unknown>,
   oldVersion: number,
   now: number,
+  provenance: RowProvenance,
 ): D1PreparedStatement {
   const allowed = TSV_MERGE_WRITE_COLS[kind];
   const cols = Object.keys(fields).filter((c) => allowed.has(c));
@@ -2816,6 +2903,11 @@ function buildTsvEditedWriteStmt(
   const bookParam = p++;
   const versionParam = p++;
   binds.push(id, book, oldVersion);
+  // Provenance params go LAST — after id/book/version — so they never disturb
+  // the hand-counted numbers those WHERE params were just assigned above.
+  const provenanceParam = p;
+  setClauses.push(provenanceSet(provenanceParam));
+  binds.push(...provenanceValues(provenance));
   return env.DB.prepare(
     `UPDATE ${kind}_rows
         SET ${setClauses.join(", ")}
@@ -3207,24 +3299,32 @@ function insertOutcome(r: { meta?: { changes?: number } }): TsvInsertOutcome {
 // Returns "inserted" if the row was written, "conflict" if the (book, id) slot
 // was already taken, "unknown" if D1 reported no row count (caller must not
 // treat that as either).
+//
+// `provenance` rides the SAME INSERT (issue #686, constraint: one statement per
+// row) — the caller (applyTsvRows) already knows whether this run's lineage
+// measured a Door43 author, so the three columns are appended to each kind's
+// column/VALUES list rather than costing a second write.
 async function tryInsertTsvRow(
   env: Env,
   book: string,
   kind: TsvKind,
   row: ParsedTsvRow,
   sortOrder: number,
+  provenance: RowProvenance,
 ): Promise<TsvInsertOutcome> {
   if (kind === "tn") {
     const r = await env.DB.prepare(
       `INSERT INTO tn_rows
-         (id, book, chapter, verse, ref_raw, tags, support_reference, quote, occurrence, note, sort_order)
-       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+         (id, book, chapter, verse, ref_raw, tags, support_reference, quote, occurrence, note, sort_order,
+          last_change_action, last_change_source, last_change_actor)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
        ON CONFLICT(id, book) DO NOTHING`,
     )
       .bind(
         row.id, book, row.chapter, row.verse, row.refRaw,
         row.tags, row.support_reference ?? null, row.quote ?? null,
         row.occurrence, row.note ?? null, sortOrder,
+        ...provenanceValues(provenance),
       )
       .run();
     return insertOutcome(r);
@@ -3232,27 +3332,31 @@ async function tryInsertTsvRow(
   if (kind === "tq") {
     const r = await env.DB.prepare(
       `INSERT INTO tq_rows
-         (id, book, chapter, verse, ref_raw, tags, quote, occurrence, question, response, sort_order)
-       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+         (id, book, chapter, verse, ref_raw, tags, quote, occurrence, question, response, sort_order,
+          last_change_action, last_change_source, last_change_actor)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
        ON CONFLICT(id, book) DO NOTHING`,
     )
       .bind(
         row.id, book, row.chapter, row.verse, row.refRaw,
         row.tags, row.quote ?? null, row.occurrence,
         row.question ?? null, row.response ?? null, sortOrder,
+        ...provenanceValues(provenance),
       )
       .run();
     return insertOutcome(r);
   }
   const r = await env.DB.prepare(
     `INSERT INTO twl_rows
-       (id, book, chapter, verse, ref_raw, tags, orig_words, occurrence, tw_link, sort_order)
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+       (id, book, chapter, verse, ref_raw, tags, orig_words, occurrence, tw_link, sort_order,
+        last_change_action, last_change_source, last_change_actor)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
      ON CONFLICT(id, book) DO NOTHING`,
   )
     .bind(
       row.id, book, row.chapter, row.verse, row.refRaw,
       row.tags, row.orig_words ?? null, row.occurrence, row.tw_link ?? null, sortOrder,
+      ...provenanceValues(provenance),
     )
     .run();
   return insertOutcome(r);
@@ -3441,6 +3545,12 @@ async function tsvFetchLooksTruncated(
 // tombstone_blocked, never a silent drop). Bound-param positions are identical
 // in all modes (the `= NULL` clauses carry no param), so the .bind() lists
 // below are unchanged.
+// `provenance` (issue #686): each of this function's four call sites states
+// its own action (pristine → sync_merge; aiReseed/resurrect/reclaim →
+// sync_reseed) and actor, appended to the END of the existing bind list at
+// fresh, higher-numbered params — never renumbering the hand-counted params
+// above — so the SET clause can reference them without disturbing any
+// existing `?N`.
 function buildTsvUpdateStmt(
   env: Env,
   book: string,
@@ -3452,6 +3562,7 @@ function buildTsvUpdateStmt(
   resurrect = false,
   reseedAi = false,
   reclaim = false,
+  provenance: RowProvenance,
 ): D1PreparedStatement {
   const deletedGuard = resurrect || reclaim ? "deleted_at IS NOT NULL" : "deleted_at IS NULL";
   const ownerGuard = reseedAi || reclaim ? "" : "updated_by IS NULL AND ";
@@ -3497,12 +3608,13 @@ function buildTsvUpdateStmt(
       `UPDATE tn_rows
           SET ${clearDeleted}${clearOwner}${clearProtections}${clearReviewMeta}${clearRestored}ref_raw = ?1, chapter = ?2, verse = ?3, tags = ?4,
               support_reference = ?5, quote = ?6, occurrence = ?7, note = ?8,
-              sort_order = ?9, version = ?10, updated_at = ?11
+              sort_order = ?9, version = ?10, updated_at = ?11, ${provenanceSet(15)}
         WHERE id = ?12 AND book = ?13 AND ${pristine} AND version = ?14`,
     ).bind(
       row.refRaw, row.chapter, row.verse, row.tags,
       row.support_reference ?? null, row.quote ?? null, row.occurrence, row.note ?? null,
       sortOrder, newVersion, now, row.id, book, oldVersion,
+      ...provenanceValues(provenance),
     );
   }
   if (kind === "tq") {
@@ -3510,24 +3622,26 @@ function buildTsvUpdateStmt(
       `UPDATE tq_rows
           SET ${clearDeleted}${clearOwner}${clearReviewMeta}${clearRestored}ref_raw = ?1, chapter = ?2, verse = ?3, tags = ?4,
               quote = ?5, occurrence = ?6, question = ?7, response = ?8,
-              sort_order = ?9, version = ?10, updated_at = ?11
+              sort_order = ?9, version = ?10, updated_at = ?11, ${provenanceSet(15)}
         WHERE id = ?12 AND book = ?13 AND ${pristine} AND version = ?14`,
     ).bind(
       row.refRaw, row.chapter, row.verse, row.tags,
       row.quote ?? null, row.occurrence, row.question ?? null, row.response ?? null,
       sortOrder, newVersion, now, row.id, book, oldVersion,
+      ...provenanceValues(provenance),
     );
   }
   return env.DB.prepare(
     `UPDATE twl_rows
         SET ${clearDeleted}${clearOwner}${clearReviewMeta}${clearRestored}ref_raw = ?1, chapter = ?2, verse = ?3, tags = ?4,
             orig_words = ?5, occurrence = ?6, tw_link = ?7,
-            sort_order = ?8, version = ?9, updated_at = ?10
+            sort_order = ?8, version = ?9, updated_at = ?10, ${provenanceSet(14)}
       WHERE id = ?11 AND book = ?12 AND ${pristine} AND version = ?13`,
   ).bind(
     row.refRaw, row.chapter, row.verse, row.tags,
     row.orig_words ?? null, row.occurrence, row.tw_link ?? null,
     sortOrder, newVersion, now, row.id, book, oldVersion,
+    ...provenanceValues(provenance),
   );
 }
 
@@ -4224,6 +4338,13 @@ async function clearResolvedMergeNoBase(
             // guarded on the flag still being the one we measured. This is
             // bookkeeping about the flag, not a change to the row or to what
             // the flag says.
+            //
+            // #686: deliberately NOT stamped with provenance. This memo does not
+            // move the row's own timestamps or content, so it cannot be read as
+            // "the last thing that happened to this row" — stamping it would
+            // overwrite a real prior change's provenance with a memo about a
+            // blocked review-clear ATTEMPT, which is a lie about what last
+            // touched the row.
             `UPDATE ${TSV_TABLE[kind]} SET review_master_json = ?1
               WHERE id = ?2 AND book = ?3 AND review_kind = 'merge_no_base' AND deleted_at IS NULL`,
           ).bind(next, r.id, book),
@@ -4404,10 +4525,15 @@ async function clearResolvedMergeNoBase(
       for (const id of slice) {
         stmts.push(
           env.DB.prepare(
+            // #686: review_clear — this is OUR housekeeping (retiring a flag a
+            // completed lineage walk just cleared), not an authored Door43
+            // change, so DOOR43_ACTOR_UNMEASURED even though `walk` above did
+            // measure a lineage — the walk's job here was to justify the
+            // clear, not to author a content change on the row.
             `UPDATE ${TSV_TABLE[kind]}
-                SET review_kind = NULL, review_reason = NULL, review_master_json = NULL, updated_at = ?1
+                SET review_kind = NULL, review_reason = NULL, review_master_json = NULL, updated_at = ?1, ${provenanceSet(4)}
               WHERE id = ?2 AND book = ?3 AND review_kind = 'merge_no_base' AND deleted_at IS NULL`,
-          ).bind(now, id, book),
+          ).bind(now, id, book, ...provenanceValues({ action: "review_clear", source: "dcs_sync", actor: DOOR43_ACTOR_UNMEASURED })),
         );
         stmts.push(
           gatedLogEditStmt(env, kind, id, book, null, null, 0, "sync_clear_review", {
@@ -5005,6 +5131,10 @@ async function applyVerseRows(
   await healIncomingReplacementChars(env, book, bibleVersion, verses);
 
   const now = Math.floor(Date.now() / 1000);
+  // #686, hoisted once per call for the same reason as applyTsvRows's copy: the
+  // lineage is per (book, resource) per run, so the value is identical for
+  // every verse here and the per-row form re-ran the name sanitation for each.
+  const door43 = door43Actor(cutoff?.lineage);
 
   // 1. Read the current rows for exactly these verses' chapters in ONE query
   //    (callers pass a single chapter's verses, so the IN list is tiny).
@@ -5213,11 +5343,17 @@ async function applyVerseRows(
       pristineWrites.push({
         v,
         isInsert: true,
+        // #686: verse absent from D1 entirely — sync_merge, attributed to
+        // whichever Door43 author this run's lineage measured.
         stmt: env.DB.prepare(
-          `INSERT INTO verses (book, chapter, verse, verse_end, bible_version, content_json, plain_text)
-           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+          `INSERT INTO verses (book, chapter, verse, verse_end, bible_version, content_json, plain_text,
+             last_change_action, last_change_source, last_change_actor)
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
            ON CONFLICT(book, chapter, verse, bible_version) DO NOTHING`,
-        ).bind(book, v.chapter, v.verse, v.verseEnd, bibleVersion, v.contentJson, v.plainText),
+        ).bind(
+          book, v.chapter, v.verse, v.verseEnd, bibleVersion, v.contentJson, v.plainText,
+          ...provenanceValues({ action: "sync_merge", source: "dcs_sync", actor: door43 }),
+        ),
         // Conditional on the INSERT actually landing: ON CONFLICT DO NOTHING
         // means a verse that already exists (created between our read and
         // this batch) inserts 0 rows — don't log a phantom restorable v1.
@@ -5472,13 +5608,18 @@ async function applyVerseRows(
       pristineWrites.push({
         v,
         isInsert: false,
+        // #686: pristine verse overwrite from master — sync_merge, attributed
+        // to whichever Door43 author this run's lineage measured.
         stmt: env.DB.prepare(
           `UPDATE verses
               SET content_json = ?1, plain_text = ?2, verse_end = ?3,
-                  version = version + 1, updated_at = ?4
+                  version = version + 1, updated_at = ?4, ${provenanceSet(9)}
             WHERE book = ?5 AND chapter = ?6 AND verse = ?7 AND bible_version = ?8
               AND updated_by IS NULL`,
-        ).bind(v.contentJson, v.plainText, v.verseEnd, now, book, v.chapter, v.verse, bibleVersion),
+        ).bind(
+          v.contentJson, v.plainText, v.verseEnd, now, book, v.chapter, v.verse, bibleVersion,
+          ...provenanceValues({ action: "sync_merge", source: "dcs_sync", actor: door43 }),
+        ),
         // Conditional on the UPDATE actually landing. The UPDATE is guarded
         // on `updated_by IS NULL`, so if an editor touched this verse between
         // our read and this batch the UPDATE matches 0 rows — but the
@@ -5561,13 +5702,19 @@ async function applyVerseRows(
     const slice = sourceReconciles.slice(i, i + WRITE_BATCH);
     try {
       const results = await env.DB.batch(
+        // #686: source-attribute reconcile on an edited verse (spelling only,
+        // never the translator's target text) — sync_merge, attributed to
+        // whichever Door43 author this run's lineage measured.
         slice.map((u) =>
           env.DB.prepare(
             `UPDATE verses
-                SET content_json = ?1, version = version + 1, updated_at = ?2
+                SET content_json = ?1, version = version + 1, updated_at = ?2, ${provenanceSet(8)}
               WHERE book = ?3 AND chapter = ?4 AND verse = ?5 AND bible_version = ?6
                 AND version = ?7`,
-          ).bind(u.mergedJson, now, book, u.v.chapter, u.v.verse, bibleVersion, u.oldVersion),
+          ).bind(
+            u.mergedJson, now, book, u.v.chapter, u.v.verse, bibleVersion, u.oldVersion,
+            ...provenanceValues({ action: "sync_merge", source: "dcs_sync", actor: door43 }),
+          ),
         ),
       );
       const logs: D1PreparedStatement[] = [];
@@ -5609,14 +5756,18 @@ async function applyVerseRows(
     const slice = aiReseeds.slice(i, i + WRITE_BATCH);
     try {
       const results = await env.DB.batch(
+        // #686: AI-only verse re-seed + reclaim to master-owned — sync_reseed.
         slice.map((u) =>
           env.DB.prepare(
             `UPDATE verses
                 SET content_json = ?1, plain_text = ?2, verse_end = ?3,
-                    updated_by = NULL, version = version + 1, updated_at = ?4
+                    updated_by = NULL, version = version + 1, updated_at = ?4, ${provenanceSet(10)}
               WHERE book = ?5 AND chapter = ?6 AND verse = ?7 AND bible_version = ?8
                 AND version = ?9`,
-          ).bind(u.v.contentJson, u.v.plainText, u.v.verseEnd, now, book, u.v.chapter, u.v.verse, bibleVersion, u.oldVersion),
+          ).bind(
+            u.v.contentJson, u.v.plainText, u.v.verseEnd, now, book, u.v.chapter, u.v.verse, bibleVersion, u.oldVersion,
+            ...provenanceValues({ action: "sync_reseed", source: "dcs_sync", actor: door43 }),
+          ),
         ),
       );
       const logs: D1PreparedStatement[] = [];
@@ -5916,14 +6067,22 @@ async function applyVerseRows(
       const slice = masterAdoptions.slice(i, i + WRITE_BATCH);
       try {
         const results = await env.DB.batch(
+          // #686: master-adoption of an out-of-band Door43 correction over a
+          // human-edited verse — the second key attribution site. sync_merge,
+          // and the actor MUST be the measured commit author (never a
+          // fallback built here) — this is the write computeVerseMerge only
+          // reaches when the human's own edit did NOT explain the difference.
           slice.map((a) =>
             env.DB.prepare(
               `UPDATE verses
                   SET content_json = ?1, plain_text = ?2, verse_end = ?3,
-                      version = version + 1, updated_at = ?4
+                      version = version + 1, updated_at = ?4, ${provenanceSet(10)}
                 WHERE book = ?5 AND chapter = ?6 AND verse = ?7 AND bible_version = ?8
                   AND version = ?9`,
-            ).bind(a.v.contentJson, a.plainText, a.v.verseEnd, now, book, a.v.chapter, a.v.verse, bibleVersion, a.oldVersion),
+            ).bind(
+              a.v.contentJson, a.plainText, a.v.verseEnd, now, book, a.v.chapter, a.v.verse, bibleVersion, a.oldVersion,
+              ...provenanceValues({ action: "sync_merge", source: "dcs_sync", actor: door43 }),
+            ),
           ),
         );
         const logs: D1PreparedStatement[] = [];
@@ -6118,12 +6277,21 @@ async function applyVerseRowsPerRow(
   for (const v of verses) {
     try {
       // Try insert first; cheap signal for "doesn't exist locally".
+      //
+      // #686: sync_merge, DOOR43_ACTOR_UNMEASURED. This per-row fallback path
+      // (only reached when the batched applyVerseRows path threw) has no
+      // MergeCutoff/lineage in scope — it is not worth threading one through
+      // just to name an author on the rare fallback slice.
       const ins = await env.DB.prepare(
-        `INSERT INTO verses (book, chapter, verse, verse_end, bible_version, content_json, plain_text)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        `INSERT INTO verses (book, chapter, verse, verse_end, bible_version, content_json, plain_text,
+           last_change_action, last_change_source, last_change_actor)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
          ON CONFLICT(book, chapter, verse, bible_version) DO NOTHING`,
       )
-        .bind(book, v.chapter, v.verse, v.verseEnd, bibleVersion, v.contentJson, v.plainText)
+        .bind(
+          book, v.chapter, v.verse, v.verseEnd, bibleVersion, v.contentJson, v.plainText,
+          ...provenanceValues({ action: "sync_merge", source: "dcs_sync", actor: DOOR43_ACTOR_UNMEASURED }),
+        )
         .run();
       if ((ins.meta.changes ?? 0) > 0) {
         counts.inserted++;
@@ -6193,14 +6361,19 @@ async function applyVerseRowsPerRow(
           kind: "verse",
         });
       if (aiOnly) {
+        // #686: sync_reseed, DOOR43_ACTOR_UNMEASURED — same fallback-path
+        // reasoning as the insert above.
         const upd = await env.DB.prepare(
           `UPDATE verses
               SET content_json = ?1, plain_text = ?2, verse_end = ?3,
-                  updated_by = NULL, version = version + 1, updated_at = ?4
+                  updated_by = NULL, version = version + 1, updated_at = ?4, ${provenanceSet(10)}
             WHERE book = ?5 AND chapter = ?6 AND verse = ?7 AND bible_version = ?8
               AND version = ?9`,
         )
-          .bind(v.contentJson, v.plainText, v.verseEnd, now, book, v.chapter, v.verse, bibleVersion, existing!.version)
+          .bind(
+            v.contentJson, v.plainText, v.verseEnd, now, book, v.chapter, v.verse, bibleVersion, existing!.version,
+            ...provenanceValues({ action: "sync_reseed", source: "dcs_sync", actor: DOOR43_ACTOR_UNMEASURED }),
+          )
           .run();
         if ((upd.meta.changes ?? 0) > 0) {
           counts.reimported_ai++;
@@ -6215,14 +6388,19 @@ async function applyVerseRowsPerRow(
         }
         continue;
       }
+      // #686: sync_merge, DOOR43_ACTOR_UNMEASURED — same fallback-path
+      // reasoning as the insert above.
       const upd = await env.DB.prepare(
         `UPDATE verses
             SET content_json = ?1, plain_text = ?2, verse_end = ?3,
-                version = version + 1, updated_at = ?4
+                version = version + 1, updated_at = ?4, ${provenanceSet(9)}
           WHERE book = ?5 AND chapter = ?6 AND verse = ?7 AND bible_version = ?8
             AND updated_by IS NULL`,
       )
-        .bind(v.contentJson, v.plainText, v.verseEnd, now, book, v.chapter, v.verse, bibleVersion)
+        .bind(
+          v.contentJson, v.plainText, v.verseEnd, now, book, v.chapter, v.verse, bibleVersion,
+          ...provenanceValues({ action: "sync_merge", source: "dcs_sync", actor: DOOR43_ACTOR_UNMEASURED }),
+        )
         .run();
       if ((upd.meta.changes ?? 0) > 0) {
         counts.updated++;
@@ -7337,12 +7515,15 @@ async function softDeleteRemovedTsvRows(
       // updated_by → NULL reclaims the tombstone to reimport-owned; version-CAS
       // (?4) + the re-asserted protections abort if a human touched the row
       // between the SELECT and here (bumps version → 0 rows changed).
+      // #686: sync_prune. This function has no lineage in scope (it is not
+      // handed a MergeCutoff — see the caller chain) and does not thread one
+      // through solely to name an author here, so DOOR43_ACTOR_UNMEASURED.
       const upd = await env.DB.prepare(
         `UPDATE ${kind}_rows
-            SET deleted_at = ?1, updated_by = NULL, version = version + 1, updated_at = ?1
+            SET deleted_at = ?1, updated_by = NULL, version = version + 1, updated_at = ?1, ${provenanceSet(5)}
           WHERE id = ?2 AND book = ?3 AND ${writeGuard}`,
       )
-        .bind(now, t.id, book, t.version)
+        .bind(now, t.id, book, t.version, ...provenanceValues({ action: "sync_prune", source: "dcs_sync", actor: DOOR43_ACTOR_UNMEASURED }))
         .run();
       if (!upd.meta.changes) continue;
       deleted++;

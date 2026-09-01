@@ -1510,7 +1510,21 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
   ): Promise<void> {
     // Delegates to the shared helper (twlSortOrderApply.ts) so the export and the
     // reimport canonical post-pass write sort_order identically.
-    await applyTwlSortOrderUpdates(this.env.DB, book, updates);
+    //
+    // #686 review F2: 'system', NOT 'dcs_sync'. This order is computed HERE,
+    // from the ULT alignment in D1, by our own nightly — Door43 neither sent it
+    // nor asked for it, and the export writes it back before pushing. Labelling
+    // it a Door43 sync would tell a translator that Door43 reordered her rows
+    // when Bible Editor did, which is precisely the mislabel these columns
+    // exist to remove. 'reorder' rather than 'sync_reorder' for the same
+    // reason: 'sync_reorder' means "master's file order won", and this is not
+    // that. Unattended, so there is no username to name — the actor names the
+    // job instead.
+    await applyTwlSortOrderUpdates(this.env.DB, book, updates, {
+      action: "reorder",
+      source: "system",
+      actor: "nightly TWL canonical reorder",
+    });
   }
 
   // Delete branches this export's branch replaces. Sources:
