@@ -239,8 +239,8 @@ console.log("\n[BEHAVIOURAL 3: reimport adopt with a MEASURED human lineage stam
   const row = sqlite
     .prepare(`SELECT last_change_action, last_change_source, last_change_actor FROM tq_rows WHERE book = ? AND id = 'aaaa'`)
     .all(BOOK)[0];
-  const EXPECTED_ACTOR = `Door43: ⁨Stephen Wunrow⁩`; // built from the same isolate chars door43Actor uses, not pasted invisibly
-  eq(row.last_change_actor, EXPECTED_ACTOR, "adoption with a measured human commit stamps 'Door43: <name>' (bidi-isolated)");
+  const EXPECTED_ACTOR = `Door43 (commits by ⁨Stephen Wunrow⁩)`; // built from the same isolate chars door43Actor uses, not pasted invisibly
+  eq(row.last_change_actor, EXPECTED_ACTOR, "adoption with a measured human commit stamps 'Door43 (commits by <name>)' (bidi-isolated)");
   eq(row.last_change_action, "sync_merge", "…action is sync_merge");
   eq(row.last_change_source, "dcs_sync", "…source is dcs_sync");
 }
@@ -454,9 +454,17 @@ console.log("\n[BEHAVIOURAL 7: applyTwlSortOrderUpdates stamps its CALLER's prov
        VALUES ('ffff', ?, 2, 1, '2:1', NULL, 1, 'rc://*/tw/dict/bible/kt/god', 999, 3)`,
     )
     .run(BOOK);
-  // 7a. Default provenance (no explicit `provenance` arg) — the nightly export /
-  // reimport canonical post-pass caller.
-  await applyTwlSortOrderUpdates(env.DB, BOOK, [{ id: "ffff", sort_order: 100 }]);
+  // 7a. The nightly REIMPORT canonical post-pass — the one caller for which
+  // "Door43 decided this order" is true, because it is re-sequencing to match
+  // the TSV master sent. Passed explicitly: the parameter is required and has
+  // no default (#686 review F2), because the first cut's dcs_sync default was
+  // silently inherited by the EXPORT, whose order is computed here — telling
+  // translators Door43 reordered rows Bible Editor reordered.
+  await applyTwlSortOrderUpdates(env.DB, BOOK, [{ id: "ffff", sort_order: 100 }], {
+    action: "sync_reorder",
+    source: "dcs_sync",
+    actor: "Door43 sync",
+  });
   {
     const row = sqlite
       .prepare(
@@ -466,12 +474,12 @@ console.log("\n[BEHAVIOURAL 7: applyTwlSortOrderUpdates stamps its CALLER's prov
       .all(BOOK)[0];
     eq(row.sort_order, 100, "sort_order actually landed");
     eq(row.version, 4, "…and version bumped exactly once (unchanged existing behavior — issue #687's separate question)");
-    eq(row.last_change_action, "sync_reorder", "default provenance: action='sync_reorder'");
+    eq(row.last_change_action, "sync_reorder", "the reimport caller: action='sync_reorder'");
     eq(row.last_change_source, "dcs_sync", "…source='dcs_sync'");
     eq(row.last_change_actor, "Door43 sync", "…actor='Door43 sync'");
   }
 
-  // 7b. Explicit user provenance — chapters.ts's interactive order-lock dismiss.
+  // 7b. The interactive order-lock dismiss (chapters.ts) — a translator's click.
   await applyTwlSortOrderUpdates(env.DB, BOOK, [{ id: "ffff", sort_order: 200 }], {
     action: "reorder",
     source: "user",
@@ -486,9 +494,29 @@ console.log("\n[BEHAVIOURAL 7: applyTwlSortOrderUpdates stamps its CALLER's prov
       .all(BOOK)[0];
     eq(row.sort_order, 200, "…second update also landed");
     eq(row.version, 5, "…and bumped again");
-    eq(row.last_change_action, "reorder", "an explicitly-passed caller provenance overrides the default: action='reorder'");
+    eq(row.last_change_action, "reorder", "the interactive caller: action='reorder', not 'sync_reorder'");
     eq(row.last_change_source, "user", "…source='user'");
     eq(row.last_change_actor, "benjamin", "…actor is the caller's own username, not the hardcoded 'Door43 sync'");
+  }
+
+  // 7c. The nightly EXPORT's own canonical re-sequence — the caller the removed
+  // default was mislabelling. Its order is computed here from the ULT
+  // alignment; Door43 neither sent it nor asked for it.
+  await applyTwlSortOrderUpdates(env.DB, BOOK, [{ id: "ffff", sort_order: 300 }], {
+    action: "reorder",
+    source: "system",
+    actor: "nightly TWL canonical reorder",
+  });
+  {
+    const row = sqlite
+      .prepare(
+        `SELECT last_change_action, last_change_source, last_change_actor
+           FROM twl_rows WHERE book = ? AND id = 'ffff'`,
+      )
+      .all(BOOK)[0];
+    eq(row.last_change_source, "system", "the export caller: source='system', NEVER 'dcs_sync'");
+    eq(row.last_change_action, "reorder", "…and action='reorder' — our own order, not master's");
+    eq(row.last_change_actor, "nightly TWL canonical reorder", "…attributed to the job, and to no Door43 author");
   }
 }
 
@@ -521,7 +549,10 @@ console.log("\n[source] rows.ts create/PATCH/delete/dismiss-review/trash paths a
 {
   const sites = [
     ['create (INSERT_COLS + PROVENANCE_COLUMNS + provenanceValues({ action: "create" ...))', /PROVENANCE_COLUMNS\]/, /action:\s*"create"/],
-    ["PATCH content update", /provenanceSet\(baseParams \+ 4\)/, /action:\s*"update"/],
+    // The PATCH action became a ternary in #686 review F5 (update, unless the
+    // patch carries restored_from_version, in which case restore), so match
+    // that expression rather than a bare action: "update".
+    ["PATCH content update", /provenanceSet\(baseParams \+ 4\)/, /action:\s*restoredFromVersion == null \? "update" : "restore"/],
     ["delete (soft delete)", /provenanceSet\(6\)/, /action:\s*"delete"/],
     ["dismiss-review", /provenanceSet\(nextParam\)/, /action:\s*"dismiss_review"/],
     ["trash / untrash", /provenanceSet\(3\)/, /action:\s*"trash"/],
@@ -566,6 +597,32 @@ console.log("\n[source] index.ts's nightly trash finalize stamps finalize_trash 
     /last_change_actor = 'nightly trash finalize'/.test(indexTs),
     true,
     "[source] …last_change_actor='nightly trash finalize'",
+  );
+}
+
+console.log("\n[source] rows.ts stamps the DIRECTION of a change, not just its subject (#686 review F5/F6)");
+{
+  // F5. 'restore' is in the vocabulary for the history-restore PATCH, which is
+  // distinguished by carrying restored_from_version. Stamping 'update' there
+  // left 'restore' as a documented value nothing ever wrote — a column that
+  // advertises a distinction it does not actually record.
+  eq(
+    rowsTs.includes('restoredFromVersion == null ? "update" : "restore"'),
+    true,
+    "[source] the PATCH path stamps 'restore' when the patch carries restored_from_version, else 'update'",
+  );
+  // F6. Both directions of the preserve/hint bits. Stamping the bare bit name
+  // for both made a just-UNpreserved row read "preserve" — the exact opposite
+  // of what last happened to it, which is the one thing this column is for.
+  eq(
+    rowsTs.includes('column === "preserve" ? "unpreserve" : "unhint"'),
+    true,
+    "[source] clearing a preserve/hint bit stamps 'unpreserve'/'unhint', not the bit's bare name",
+  );
+  eq(
+    rowsTs.includes('provenanceValues({ action, source: "user", actor })'),
+    true,
+    "[source] …and the bit toggle binds that direction-aware action, not the column name",
   );
 }
 

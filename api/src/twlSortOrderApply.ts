@@ -16,25 +16,24 @@ import { provenanceSet, provenanceValues, type RowProvenance } from "./rowProven
 // of all rows would blow the 100-statement cap.
 const D1_MAX_STATEMENTS = 90;
 
-// Default provenance: this helper has three callers and only one of them is a
-// signed-in human (chapters.ts's interactive order-lock dismiss, #686). The
-// other two — bookReimport.ts's nightly canonicalizeTwlOrder and
-// exportWorkflow.ts's nightly export — are unattended Door43 sync, which is
-// what this default states. Given as a default (not required) so those two
-// existing call sites compile and behave unchanged without passing anything;
-// chapters.ts must pass `{ action: 'sync_reorder', source: 'user', actor }`
-// explicitly for its human-initiated dismiss.
-const DEFAULT_PROVENANCE: RowProvenance = {
-  action: "sync_reorder",
-  source: "dcs_sync",
-  actor: "Door43 sync",
-};
-
 export async function applyTwlSortOrderUpdates(
   db: D1Database,
   book: string,
   updates: Array<{ id: string; sort_order: number }>,
-  provenance: RowProvenance = DEFAULT_PROVENANCE,
+  // REQUIRED, with no default, and that is the point (#686 review F2). This
+  // helper's three callers are three DIFFERENT answers to "who reordered these
+  // rows", and they are not interchangeable:
+  //   bookReimport.ts  canonicalizeTwlOrder → dcs_sync, master's file order
+  //   exportWorkflow.ts nightly export     → system, OUR OWN computed order
+  //   chapters.ts      order-lock dismiss  → user, a translator's click
+  // The first cut gave this parameter a dcs_sync default so the two nightly
+  // call sites compiled untouched — and that default immediately did the exact
+  // harm this issue exists to remove: the EXPORT's locally-computed canonical
+  // reorder stamped "Door43 sync", telling translators Door43 had changed rows
+  // that Bible Editor changed. A default here cannot be safe, because the wrong
+  // answer is silent and looks plausible. Making it required means a new caller
+  // must state who it is or fail to compile.
+  provenance: RowProvenance,
 ): Promise<void> {
   if (updates.length === 0) return;
   // One UPDATE per row (3 bound values each, now +3 for provenance), chunked

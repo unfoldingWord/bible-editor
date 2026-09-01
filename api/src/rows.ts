@@ -15,7 +15,13 @@ import { findRawTabField } from "./rawTabGuard";
 import { isValidChapterZeroRef } from "./chapterZeroGuard";
 import { normalizeBookCode, CHAPTER_EXISTS_SQL } from "./rowsCreateGuard";
 import { boundHistoryToLastCreate } from "./rowHistoryBoundary";
-import { PROVENANCE_COLUMNS, provenanceSet, provenanceValues, resolveActorUsername } from "./rowProvenance.ts";
+import {
+  PROVENANCE_COLUMNS,
+  provenanceSet,
+  provenanceValues,
+  resolveActorUsername,
+  type LastChangeAction,
+} from "./rowProvenance.ts";
 
 export const rows = new Hono<{ Bindings: Env; Variables: { userId?: number; username?: string } }>();
 
@@ -889,7 +895,11 @@ rows.patch("/:kind/:id", requireEditor, async (c) => {
     now,
     userId,
     restoredFromVersion,
-    ...provenanceValues({ action: "update", source: "user", actor }),
+    // #686 review F5: a restore-from-history PATCH carries
+    // restored_from_version, and 'restore' is in the vocabulary precisely for
+    // it — stamping 'update' there threw away the distinction the column
+    // advertises, and left 'restore' as a value nothing ever wrote.
+    ...provenanceValues({ action: restoredFromVersion == null ? "update" : "restore", source: "user", actor }),
     id,
     expected,
     book,
@@ -1269,9 +1279,15 @@ async function setTnBit(
   value: 0 | 1,
 ): Promise<TnRow | null> {
   const now = Math.floor(Date.now() / 1000);
-  const action = value === 1 ? column : `un${column}`;
-  // last_change_action is the bit's own name regardless of direction — `action`
-  // above (preserve/unpreserve) is the edit_log verb, a separate vocabulary.
+  // Typed as the provenance union rather than inferred as `string`: the four
+  // verbs are exactly the four the vocabulary carries, and annotating it here
+  // means a future fifth bit cannot silently stamp an action nothing documents.
+  const action: LastChangeAction = value === 1 ? column : column === "preserve" ? "unpreserve" : "unhint";
+  // #686 review F6: last_change_action follows the DIRECTION, so it matches
+  // `action` (the edit_log verb) exactly. Stamping the bare bit name for both
+  // directions made a just-UNpreserved row read "preserve" — the opposite of
+  // what last happened to it, which is the one thing this column is for. The
+  // vocabulary carries all four verbs, so there is nothing to collapse.
   const actor = await resolveActorUsername(env.DB, userId, usernameHint);
   const [updateRes] = await env.DB.batch([
     env.DB
@@ -1283,7 +1299,7 @@ async function setTnBit(
            SET ${column} = ?1, updated_at = ?2, ${provenanceSet(3)}
          WHERE id = ?6 AND deleted_at IS NULL${bookClause(7)}`,
       )
-      .bind(value, now, ...provenanceValues({ action: column, source: "user", actor }), id, book),
+      .bind(value, now, ...provenanceValues({ action, source: "user", actor }), id, book),
     env.DB
       .prepare(
         `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action)

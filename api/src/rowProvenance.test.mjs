@@ -18,7 +18,8 @@
 //   A1 drop the `incomplete !== false` check        exit 1, 2 FAIL — an
 //      (an unfinished walk allowed to name people)  incomplete walk that HAD a
 //                                                   named author starts claiming
-//                                                   "Door43: Stephen Wunrow",
+//                                                   "Door43 (commits by Stephen
+//                                                   Wunrow)",
 //                                                   and an incomplete walk with
 //                                                   no human commit starts
 //                                                   claiming "(AI/bot push)"
@@ -27,7 +28,8 @@
 //                                                   naming an author it never
 //                                                   recorded
 //   A3 drop the `named.length === 0` fallback       exit 1, 2 FAIL — renders
-//                                                   "Door43: " with nobody in it,
+//                                                   "Door43 (commits by )" with
+//                                                   nobody in it,
 //                                                   both for a lineage whose
 //                                                   authors are all null and for
 //                                                   the pre-#684 summary (which
@@ -125,7 +127,7 @@ const MAHN = "Richard Mahn";
     humanShas: ["b39f0c7aa1"],
     humanCommits: [{ sha: "b39f0c7aa1", author: WUNROW, date: "2026-08-14T09:12:00-05:00" }],
   });
-  eq(door43Actor(one), `Door43: ⁨${WUNROW}⁩`, "one measured author is named, bidi-isolated");
+  eq(door43Actor(one), `Door43 (commits by ⁨${WUNROW}⁩)`, "one measured author is named, bidi-isolated");
 
   const two = summary({
     hasHumanCommit: true,
@@ -137,7 +139,7 @@ const MAHN = "Richard Mahn";
       { sha: "aa12bc3ff0", author: MAHN, date: "2026-08-13T17:40:00-06:00" },
     ],
   });
-  eq(door43Actor(two), `Door43: ⁨${WUNROW}⁩ and ⁨${MAHN}⁩`, "two measured authors, newest first");
+  eq(door43Actor(two), `Door43 (commits by ⁨${WUNROW}⁩, ⁨${MAHN}⁩)`, "two measured authors, newest first");
 
   // Three commits by one person is ONE fact about one person.
   const repeated = summary({
@@ -150,7 +152,7 @@ const MAHN = "Richard Mahn";
       { sha: "c", author: WUNROW, date: "2026-08-13T22:31:00-05:00" },
     ],
   });
-  eq(door43Actor(repeated), `Door43: ⁨${WUNROW}⁩`, "a repeated author is named once, not three times");
+  eq(door43Actor(repeated), `Door43 (commits by ⁨${WUNROW}⁩)`, "a repeated author is named once, not three times");
 
   // Past two DISTINCT authors the field says so without inventing a count of
   // people it never saw.
@@ -166,7 +168,7 @@ const MAHN = "Richard Mahn";
   });
   eq(
     door43Actor(many),
-    `Door43: ⁨${WUNROW}⁩ and ⁨${MAHN}⁩ and others`,
+    `Door43 (commits by ⁨${WUNROW}⁩, ⁨${MAHN}⁩ and others)`,
     "a third distinct author becomes 'and others', never a precise-looking wrong number",
   );
 }
@@ -210,7 +212,7 @@ const MAHN = "Richard Mahn";
     humanShas: ["a"],
     humanCommits: [{ sha: "a", author: "Bad\nName‮", date: "2026-08-14T09:12:00-05:00" }],
   });
-  eq(door43Actor(nasty), "Door43: ⁨Bad Name⁩", "controls and legacy bidi overrides are stripped from the name");
+  eq(door43Actor(nasty), "Door43 (commits by ⁨Bad Name⁩)", "controls and legacy bidi overrides are stripped from the name");
 
   const long = "A".repeat(80);
   const clamped = summary({
@@ -219,7 +221,7 @@ const MAHN = "Richard Mahn";
     humanShas: ["a"],
     humanCommits: [{ sha: "a", author: long, date: null }],
   });
-  eq(door43Actor(clamped), `Door43: ⁨${"A".repeat(39)}…⁩`, "a very long name is clamped, not carried whole");
+  eq(door43Actor(clamped), `Door43 (commits by ⁨${"A".repeat(39)}…⁩)`, "a very long name is clamped, not carried whole");
 }
 
 // ── the AI actor carries BOTH facts ──────────────────────────────────────────

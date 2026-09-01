@@ -19,10 +19,15 @@
 -- untouched, deliberately, and must stay that way.
 --
 -- last_change_action — WHAT: 'create' | 'update' | 'delete' | 'restore' |
---   'reorder' | 'preserve' | 'hint' | 'trash' | 'untrash' | 'review_clear' |
---   'dismiss_review' | 'hint_expansion' | 'ai_apply' | 'import' |
---   'finalize_trash' | 'sync_merge' | 'sync_reseed' | 'sync_prune' |
---   'sync_reorder'.
+--   'reorder' | 'preserve' | 'unpreserve' | 'hint' | 'unhint' | 'trash' |
+--   'untrash' | 'review_clear' | 'dismiss_review' | 'hint_expansion' |
+--   'ai_apply' | 'import' | 'finalize_trash' | 'sync_merge' | 'sync_reseed' |
+--   'sync_prune' | 'sync_reorder'.
+--   Note 'reorder' vs 'sync_reorder': both mean "only sort_order moved", and
+--   they differ by WHO decided the order. 'reorder' is Bible Editor's own
+--   ordering (the in-app drag, the order-lock dismiss, and the nightly
+--   export's canonical pass, which computes order here from the ULT
+--   alignment); 'sync_reorder' is master's file order winning.
 -- last_change_source — WHERE: 'user' | 'ai_pipeline' | 'dcs_sync' | 'import' |
 --   'system'.
 -- last_change_actor — WHO, human-readable and DENORMALIZED ON PURPOSE: the DCS
@@ -30,11 +35,18 @@
 --   renamed, merged, or removed. "AI pipeline (run by <username>)" for an AI
 --   apply — the only encoding that keeps both facts (a machine wrote it; a named
 --   human asked for it) without overloading one column the way updated_by was.
---   For a Door43 sync it carries the MEASURED commit author when the run's
---   lineage measured one ("Door43: <name>"), "Door43 (AI/bot push)" only when a
+--   For a Door43 sync it names the commits the run's lineage walk measured
+--   ("Door43 (commits by <names>)"), "Door43 (AI/bot push)" only when a
 --   COMPLETE walk found no human commit, and the bare "Door43 sync" otherwise.
 --   Never a name the lineage did not measure — the standing repo rule that a
 --   label states only measured causes.
+--   READ THE DOOR43 NAMES AT FILE GRANULARITY, NOT ROW. The lineage walk
+--   measures the commits that moved a whole RESOURCE FILE (say en_tn/tn_JER.tsv)
+--   between two watermarks; it does not attribute individual rows. So the names
+--   answer "whose Door43 commits are behind this file's sync", and every row the
+--   run touched in that file carries the same ones. That is why the string names
+--   the commits rather than reading "Door43: <name>", which would assert that
+--   the named person wrote THIS row — a claim the measurement cannot support.
 --
 -- NULL MEANS "no change since this migration shipped" — consult edit_log. It
 -- does NOT mean unknown-forever and it does not mean unedited. There is

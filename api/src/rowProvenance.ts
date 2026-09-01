@@ -43,12 +43,22 @@ export type LastChangeAction =
   | "delete"
   /** A restore-from-history write. */
   | "restore"
-  /** sort_order changed and nothing else — the drag fast path. */
+  /**
+   * sort_order changed and nothing else, and BIBLE EDITOR decided the order —
+   * the in-app drag fast path, the interactive order-lock dismiss, and the
+   * nightly export's own canonical re-sequence (which is computed here from the
+   * ULT alignment, not received from Door43). `source` separates the human
+   * cases from the unattended one. Contrast 'sync_reorder'.
+   */
   | "reorder"
-  /** tn preserve bit toggled (either direction). */
+  /** tn preserve bit SET (survive future AI sweeps). */
   | "preserve"
-  /** tn hint bit toggled (either direction). */
+  /** tn preserve bit CLEARED. */
+  | "unpreserve"
+  /** tn hint bit SET (queued for the next AI run). */
   | "hint"
+  /** tn hint bit CLEARED. */
+  | "unhint"
   /** tn moved to the trash tray. */
   | "trash"
   /** tn brought back out of the trash tray. */
@@ -71,7 +81,13 @@ export type LastChangeAction =
   | "sync_reseed"
   /** The nightly DCS sync soft-deleted a row master no longer carries. */
   | "sync_prune"
-  /** The nightly DCS sync (or the canonical TWL reorder) changed only sort_order. */
+  /**
+   * Only sort_order changed, and MASTER'S FILE ORDER is why — the nightly
+   * reimport re-sequencing rows to match the TSV Door43 sent. Not the export's
+   * own canonical pass, which is 'reorder' + source 'system' (#686 review F2:
+   * labelling our own computed order a Door43 sync is the mislabel this
+   * column exists to remove).
+   */
   | "sync_reorder";
 
 /** WHERE the change happened. */
@@ -135,8 +151,17 @@ export function provenanceValues(p: RowProvenance): [string, string, string | nu
  * A machine wrote the row; a named human asked it to. Collapsing that to either
  * one alone is exactly the lie #686 is about: `updated_by` already stores the
  * starter's id, and reading THAT as the actor is what makes the row claim a
- * human typed an AI note. When the starter cannot be named the string still says
- * a pipeline wrote it, which is the load-bearing half.
+ * human typed an AI note.
+ *
+ * ON THE BARE "AI pipeline" BRANCH (#686 review F4). No production path reaches
+ * it today: every caller sources its username from `resolveActorUsername`,
+ * which never returns null or "". It is kept, and covered by a direct test,
+ * because the load-bearing half of this string is "a pipeline wrote this" — so
+ * a future caller with no starter to name (a scheduled run, a backfill) must
+ * degrade to that rather than to a NULL actor, which would read as "no change
+ * since 0060 shipped". Documented as presently unreachable rather than
+ * described as if it fires, so nobody reads it as evidence that a nameless
+ * pipeline write exists in the wild.
  */
 export function aiPipelineActor(username: string | null | undefined): string {
   return username ? `AI pipeline (run by ${username})` : "AI pipeline";
@@ -199,7 +224,8 @@ const DOOR43_NAMED_AUTHORS_MAX = 2;
  *   - a COMPLETE walk that found no human commit → "Door43 (AI/bot push)"
  *     This one IS a measurement: the walk finished and every commit in the
  *     window was ours or a bot's.
- *   - human commits measured WITH identity → "Door43: NAME" / "Door43: A and B"
+ *   - human commits measured WITH identity → "Door43 (commits by NAME)" /
+ *     "Door43 (commits by A, B)" — see the granularity note at the return.
  *   - human commits measured with NO legible identity, or a summary persisted
  *     before #684 (`humanCommits` absent) → "Door43 sync"
  *     Something moved master and this record cannot say who. Naming the
@@ -239,6 +265,13 @@ export function door43Actor(lineage: MasterLineage | MasterLineageSummary | null
   // lineage's capped evidence happened to carry, not of everyone who touched
   // the file, and a precise-looking number that is not the real one is worse
   // than the vaguer true statement.
-  const list = named.join(" and ");
-  return `Door43: ${list}${extra > 0 ? " and others" : ""}`;
+  //
+  // "Door43 (commits by …)" and NOT "Door43: <name>" (#686 review F3). The
+  // measurement behind these names is per FILE WINDOW — the commits that moved
+  // en_tn/tn_JER.tsv between two watermarks — never per row. "Door43: Stephen
+  // Wunrow" on a row reads as "Stephen Wunrow wrote THIS row", a claim the
+  // lineage cannot support and which would be wrong for every other row in a
+  // file he touched once. Naming the commits instead keeps the sentence true at
+  // the granularity it was actually measured at.
+  return `Door43 (commits by ${named.join(", ")}${extra > 0 ? " and others" : ""})`;
 }

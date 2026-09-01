@@ -61,7 +61,7 @@ export interface TnRow {
    * `LastChangeSource` unions in `rowProvenance.ts`; `last_change_actor` is a
    * human-readable STRING, denormalized on purpose so it survives a user being
    * renamed or removed ("justplainjane47", "AI pipeline (run by …)",
-   * "Door43: …", "Door43 sync", "nightly trash finalize").
+   * "Door43 (commits by …)", "Door43 sync", "nightly trash finalize").
    *
    * ALL THREE NULL means "no change since 0060 shipped" — consult edit_log.
    * It does NOT mean unedited, and it is NOT a substitute for `updated_by`,

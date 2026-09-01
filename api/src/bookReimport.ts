@@ -952,7 +952,16 @@ async function canonicalizeTwlOrder(env: Env, book: string): Promise<number> {
     twTitles,
     lockedVerses,
   );
-  await applyTwlSortOrderUpdates(env.DB, book, updates);
+  // #686: the one caller of this helper that IS a Door43 sync — the nightly
+  // reimport's canonical post-pass, re-deriving order after master's file
+  // landed. The other two state 'system' (the export's own computed order) and
+  // 'user' (an interactive order-lock dismiss); the parameter is required so
+  // that distinction can never be inherited by accident.
+  await applyTwlSortOrderUpdates(env.DB, book, updates, {
+    action: "sync_reorder",
+    source: "dcs_sync",
+    actor: DOOR43_ACTOR_UNMEASURED,
+  });
   return updates.length;
 }
 
@@ -1571,6 +1580,13 @@ export async function applyTsvRows(
   const now = Math.floor(Date.now() / 1000);
   const masterConfirmedAt = cutoff?.confirmedAt ?? null;
   const masterEditId = cutoff?.editId ?? null;
+  // #686, hoisted ONCE per (book, kind) rather than evaluated per row. The
+  // lineage is measured once per (book, resource) per run and rides in on the
+  // cutoff, so every row in this call gets the identical string — and the
+  // per-row form ran displayAuthor's regex passes over every author for every
+  // row in a book (thousands, for a late-alphabet TSV). Nothing about the
+  // value is row-specific; see the granularity note on door43Actor.
+  const door43 = door43Actor(cutoff?.lineage);
 
   // One read of the comparable + pristine-predicate columns for the incoming
   // ids (chunked under the 100 bound-param limit) so classification is in memory.
@@ -1731,7 +1747,7 @@ export async function applyTsvRows(
         const outcome = await tryInsertTsvRow(env, book, kind, row, sortOrder, {
           action: "sync_merge",
           source: "dcs_sync",
-          actor: door43Actor(cutoff?.lineage),
+          actor: door43,
         });
         if (outcome === "inserted") {
           counts.inserted++;
@@ -2474,7 +2490,8 @@ export async function applyTsvRows(
                WHERE id = ?2 AND book = ?3 AND review_kind = 'ref_moved' AND deleted_at IS NULL`,
             // #686: clearing our own review flag once master and D1 agree is
             // housekeeping the reimport does to itself, not an authored Door43
-            // change — DOOR43_ACTOR_UNMEASURED, never door43Actor(cutoff?.lineage).
+            // change — DOOR43_ACTOR_UNMEASURED, never the measured-author
+            // string in `door43`.
           ).bind(now, id, book, ...provenanceValues({ action: "review_clear", source: "dcs_sync", actor: DOOR43_ACTOR_UNMEASURED })),
         ),
       );
@@ -2511,7 +2528,7 @@ export async function applyTsvRows(
                WHERE id = ?3 AND book = ?4 AND ${reorderPristine} AND version = ?5`,
           ).bind(
             u.sortOrder, now, u.id, book, u.oldVersion,
-            ...provenanceValues({ action: "sync_reorder", source: "dcs_sync", actor: door43Actor(cutoff?.lineage) }),
+            ...provenanceValues({ action: "sync_reorder", source: "dcs_sync", actor: door43 }),
           ),
         ),
       );
@@ -2538,7 +2555,7 @@ export async function applyTsvRows(
           buildTsvUpdateStmt(env, book, kind, u.row, u.sortOrder, u.oldVersion, now, false, false, false, {
             action: "sync_merge",
             source: "dcs_sync",
-            actor: door43Actor(cutoff?.lineage),
+            actor: door43,
           }),
         ),
       );
@@ -2573,7 +2590,7 @@ export async function applyTsvRows(
           buildTsvUpdateStmt(env, book, kind, u.row, u.sortOrder, u.oldVersion, now, false, true, false, {
             action: "sync_reseed",
             source: "dcs_sync",
-            actor: door43Actor(cutoff?.lineage),
+            actor: door43,
           }),
         ),
       );
@@ -2606,7 +2623,7 @@ export async function applyTsvRows(
           buildTsvUpdateStmt(env, book, kind, u.row, u.sortOrder, u.oldVersion, now, true, false, false, {
             action: "sync_reseed",
             source: "dcs_sync",
-            actor: door43Actor(cutoff?.lineage),
+            actor: door43,
           }),
         ),
       );
@@ -2678,7 +2695,7 @@ export async function applyTsvRows(
         buildTsvUpdateStmt(env, book, kind, u.row, u.sortOrder, u.oldVersion, now, false, false, true, {
           action: "sync_reseed",
           source: "dcs_sync",
-          actor: door43Actor(cutoff?.lineage),
+          actor: door43,
         }),
         gatedLogEditStmt(env, kind, u.row.id, book, userId, u.oldVersion, u.oldVersion + 1, "create", u.row),
       );
@@ -2749,7 +2766,7 @@ export async function applyTsvRows(
           buildTsvEditedWriteStmt(env, book, kind, u.id, u.fields, u.oldVersion, now, {
             action: "sync_merge",
             source: "dcs_sync",
-            actor: door43Actor(cutoff?.lineage),
+            actor: door43,
           }),
         ),
       );
@@ -2846,7 +2863,7 @@ const TSV_MERGE_WRITE_COLS: Record<TsvKind, Set<string>> = {
 // `provenance` (issue #686): this is the KEY attribution site — the one write
 // where master's content actually overwrites a human-owned row (the three-way
 // merge adoption). The actor must be the measured commit author, never a
-// fallback string built here; the caller passes door43Actor(cutoff?.lineage).
+// fallback string built here; the caller passes its hoisted `door43` value.
 function buildTsvEditedWriteStmt(
   env: Env,
   book: string,
@@ -5114,6 +5131,10 @@ async function applyVerseRows(
   await healIncomingReplacementChars(env, book, bibleVersion, verses);
 
   const now = Math.floor(Date.now() / 1000);
+  // #686, hoisted once per call for the same reason as applyTsvRows's copy: the
+  // lineage is per (book, resource) per run, so the value is identical for
+  // every verse here and the per-row form re-ran the name sanitation for each.
+  const door43 = door43Actor(cutoff?.lineage);
 
   // 1. Read the current rows for exactly these verses' chapters in ONE query
   //    (callers pass a single chapter's verses, so the IN list is tiny).
@@ -5331,7 +5352,7 @@ async function applyVerseRows(
            ON CONFLICT(book, chapter, verse, bible_version) DO NOTHING`,
         ).bind(
           book, v.chapter, v.verse, v.verseEnd, bibleVersion, v.contentJson, v.plainText,
-          ...provenanceValues({ action: "sync_merge", source: "dcs_sync", actor: door43Actor(cutoff?.lineage) }),
+          ...provenanceValues({ action: "sync_merge", source: "dcs_sync", actor: door43 }),
         ),
         // Conditional on the INSERT actually landing: ON CONFLICT DO NOTHING
         // means a verse that already exists (created between our read and
@@ -5597,7 +5618,7 @@ async function applyVerseRows(
               AND updated_by IS NULL`,
         ).bind(
           v.contentJson, v.plainText, v.verseEnd, now, book, v.chapter, v.verse, bibleVersion,
-          ...provenanceValues({ action: "sync_merge", source: "dcs_sync", actor: door43Actor(cutoff?.lineage) }),
+          ...provenanceValues({ action: "sync_merge", source: "dcs_sync", actor: door43 }),
         ),
         // Conditional on the UPDATE actually landing. The UPDATE is guarded
         // on `updated_by IS NULL`, so if an editor touched this verse between
@@ -5692,7 +5713,7 @@ async function applyVerseRows(
                 AND version = ?7`,
           ).bind(
             u.mergedJson, now, book, u.v.chapter, u.v.verse, bibleVersion, u.oldVersion,
-            ...provenanceValues({ action: "sync_merge", source: "dcs_sync", actor: door43Actor(cutoff?.lineage) }),
+            ...provenanceValues({ action: "sync_merge", source: "dcs_sync", actor: door43 }),
           ),
         ),
       );
@@ -5745,7 +5766,7 @@ async function applyVerseRows(
                 AND version = ?9`,
           ).bind(
             u.v.contentJson, u.v.plainText, u.v.verseEnd, now, book, u.v.chapter, u.v.verse, bibleVersion, u.oldVersion,
-            ...provenanceValues({ action: "sync_reseed", source: "dcs_sync", actor: door43Actor(cutoff?.lineage) }),
+            ...provenanceValues({ action: "sync_reseed", source: "dcs_sync", actor: door43 }),
           ),
         ),
       );
@@ -6060,7 +6081,7 @@ async function applyVerseRows(
                   AND version = ?9`,
             ).bind(
               a.v.contentJson, a.plainText, a.v.verseEnd, now, book, a.v.chapter, a.v.verse, bibleVersion, a.oldVersion,
-              ...provenanceValues({ action: "sync_merge", source: "dcs_sync", actor: door43Actor(cutoff?.lineage) }),
+              ...provenanceValues({ action: "sync_merge", source: "dcs_sync", actor: door43 }),
             ),
           ),
         );
