@@ -4235,6 +4235,60 @@ async function clearResolvedMergeNoBase(
     // is unchanged", and a tip that just moved is the opposite of that —
     // memoizing the old sha would be a lie about what was measured, and
     // memoizing the new one would suppress tomorrow's legitimate re-walk.
+    //
+    // THE RACE IS NARROWED, NOT CLOSED, and that is a deliberate accept. D1
+    // cannot condition a write on Door43's state atomically — there is no
+    // cross-system transaction to be had — so a commit landing between this
+    // recheck and the batch below is still measured as absent. Two reasons that
+    // residue is acceptable, both checked rather than assumed:
+    //
+    //   (a) It STRICTLY TIGHTENS what already shipped. #665's clear (commit
+    //       c0b1e4f8) ran walk → human-commit check → env.DB.batch with no tip
+    //       re-read anywhere between, so the live exposure was the whole
+    //       walk-to-write span — minutes on a slow nightly, and longer on the
+    //       sweep, which walks up to five pages. This shrinks that to the gap
+    //       between two adjacent statements.
+    //
+    //   (b) The consequence is BOUNDED, not permanent. A human commit moves the
+    //       file's commit sha, and the nightly skips a resource ONLY on a
+    //       positive sha match (:7468, "fail-open: null/unknown → reimport"), so
+    //       the next run does not sha-skip this pair. It cannot have quietly
+    //       advanced the watermark past that commit either. Both writers of
+    //       master_confirmed_at are gated on master's BYTES equalling a render of
+    //       ours: the export path stamps it only when the pre-commit comparison
+    //       finds master already byte-identical to what it was about to write
+    //       (exportWorkflow.ts:2254, via export.ts:2089's `branchTouched:
+    //       false`), and the reimport path only through markOwnPublishConverged
+    //       (:6822), reached only when recognizeOwnPublish matches master's blob
+    //       against our last pushed render (:7573, ownPublish.ts:156 declines
+    //       with `content_differs`). An ordinary human edit changes those bytes,
+    //       so both decline and the watermark stays frozen behind the commit.
+    //       The revisit's lineage walk is bounded by that same frozen watermark
+    //       (:3689), so the commit — newer than it by construction — is inside
+    //       the window, where masterMayHoldHumanEdit picks it up (:1960) and the
+    //       mint gate can re-mint over the NULL review_kind this clear wrote.
+    //
+    // Qualifications on (b), none of which make it circular but all of which
+    // make it CONDITIONAL — verified, not assumed:
+    //   · The gate is "master's blob differs from our last pushed render", not
+    //     "a human committed". A human commit that lands on exactly our bytes
+    //     (a revert to our render, most plausibly) is recognized as our own
+    //     publish, the watermark DOES advance, and the pair is skipped at :7573.
+    //     That case is also the one where there is least to warn about, but it
+    //     is not nothing.
+    //   · A moved sha means "not sha-skipped", not "merged": a null fetch
+    //     (:7542), a truncated TSV (:7634) or own-publish recognition all still
+    //     emit `changed: false` and reach no merge that night.
+    //   · The re-mint additionally needs the row to still be an edited candidate
+    //     (:1912), not preserve/hint/trashed-protected (:1965), the pair to have
+    //     a watermark at all (:3701), and the merge to again produce
+    //     `keep_no_base` (:1999). What (b) really guarantees is that the human's
+    //     commit becomes VISIBLE to the next run's gate — restoring the
+    //     protection the flag stood for — not that the identical flag reappears.
+    //   · The revisit's walk inherits the author-date bound described in
+    //     NoBaseFallbackWindow: a commit authored before the watermark but
+    //     pushed after it is invisible to that walk exactly as it is to every
+    //     other walk here (issue #691).
     const walkTip = walk.commits[0]?.sha ?? null;
     const recheck = await listMasterCommitsSince(env, file.repo, file.path, null, {
       sinceTime: walkSince,
@@ -4371,12 +4425,15 @@ export const clearResolvedMergeNoBaseForTest = (
 //   D1:    1 lineage read (book_resource_syncs) + 1 flagged-row read + 1
 //          mint-time read (only for flags with no window of their own) + one
 //          write batch per WRITE_BATCH slice of rows it clears or memoizes.
-//   Gitea: 0 on a memo hit or a pair with nothing walkable; otherwise up to
-//          listMasterCommitsSince's 5-page budget, plus 1 tip recheck for a
-//          pair that reaches the write.
+//   Gitea: 0 on a pair with nothing walkable; otherwise THREE components —
+//          1 tip probe (the memo key, always paid once a pair has candidates)
+//          + up to listMasterCommitsSince's 5-page walk (skipped entirely on a
+//          memo hit) + 1 pre-write tip recheck (only for a pair that survives
+//          every gate and reaches the write). So 7 at worst per pair, 1 on a
+//          memo hit.
 //
 // So a full sweep is bounded at roughly 30 D1 reads, a handful of write batches,
-// and ~50-60 Gitea fetches however many books hold flags. Plus the three
+// and up to 70 Gitea fetches (10 pairs x 7) however many books hold flags. Plus the three
 // DISTINCT-book queries that find the pairs in the first place. The nightly has
 // already died once on Cloudflare's ~1000-subrequest cap, and this runs in its
 // own Workflow step (exportWorkflow.ts) so none of it is spent from a book's
