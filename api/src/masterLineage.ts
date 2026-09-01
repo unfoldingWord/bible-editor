@@ -580,8 +580,12 @@ const NAME_UNSAFE = /[\u0000-\u001f\u007f-\u009f\u200e\u200f\u202a-\u202e\u2066-
  * One author name, made safe to interpolate: controls stripped, whitespace
  * collapsed, clamped to AUTHOR_NAME_MAX, wrapped in bidi isolates. Null when
  * nothing legible survives, which reads the same as "Gitea reported no author".
+ *
+ * Exported for `rowProvenance.ts` (#686), which lands the same third-party
+ * author names in the same kind of one-line UI (the row's `last_change_actor`)
+ * and must not grow a second, subtly different sanitizer for them.
  */
-function displayAuthor(name: string | null | undefined): string | null {
+export function displayAuthor(name: string | null | undefined): string | null {
   const flat = (name ?? "").replace(NAME_UNSAFE, " ").replace(/\s+/g, " ").trim();
   if (!flat) return null;
   // The ellipsis is inside the isolate so a clamped RTL name still renders as

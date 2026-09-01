@@ -15,8 +15,9 @@ import { findRawTabField } from "./rawTabGuard";
 import { isValidChapterZeroRef } from "./chapterZeroGuard";
 import { normalizeBookCode, CHAPTER_EXISTS_SQL } from "./rowsCreateGuard";
 import { boundHistoryToLastCreate } from "./rowHistoryBoundary";
+import { PROVENANCE_COLUMNS, provenanceSet, provenanceValues, resolveActorUsername } from "./rowProvenance.ts";
 
-export const rows = new Hono<{ Bindings: Env; Variables: { userId?: number } }>();
+export const rows = new Hono<{ Bindings: Env; Variables: { userId?: number; username?: string } }>();
 
 const KIND_TO_TABLE: Record<RowKind, string> = {
   tn: "tn_rows",
@@ -307,13 +308,21 @@ rows.post("/:kind", requireEditor, async (c) => {
   const dataCols = INSERT_COLS[kind].filter((name) =>
     Object.prototype.hasOwnProperty.call(data, name),
   );
-  const cols = ["id", ...dataCols, "updated_by"];
+  const cols = ["id", ...dataCols, "updated_by", ...PROVENANCE_COLUMNS];
   const placeholders = cols.map((_c, i) => `?${i + 1}`).join(", ");
+  // Resolved once outside the retry loop — a fresh row this handler creates is
+  // always a `user`/`create` write, so the actor cannot change across retries.
+  const actor = await resolveActorUsername(c.env.DB, userId, c.get("username"));
   let id = "";
   let lastErr: unknown = null;
   for (let i = 0; i < 8; i++) {
     id = newRowId();
-    const values: unknown[] = [id, ...dataCols.map((name) => data[name]), userId];
+    const values: unknown[] = [
+      id,
+      ...dataCols.map((name) => data[name]),
+      userId,
+      ...provenanceValues({ action: "create", source: "user", actor }),
+    ];
     try {
       await c.env.DB.batch([
         c.env.DB
@@ -595,6 +604,12 @@ rows.patch("/:kind/:id", requireEditor, async (c) => {
     return c.json({ error: "empty_patch" }, 400);
   }
 
+  // Hoisted above every branch below (no-op review-clear, reorder fast path,
+  // full content write) — all three are `source: 'user'` provenance stamps and
+  // the actor lookup is one shared await, not one per branch.
+  const userId = currentUserId(c);
+  const actor = await resolveActorUsername(c.env.DB, userId, c.get("username"));
+
   // Pull the current row once — used for the lock-scope lookup, the no-op
   // short-circuit, and to disambiguate 404 vs 409 if the UPDATE later misses.
   // Carries latest_source (see selectRowWithLatestSource) because a true
@@ -768,11 +783,14 @@ rows.patch("/:kind/:id", requireEditor, async (c) => {
       const reorderOnly = fields.length === 1 && fields[0] === "sort_order";
       if (!reorderOnly && (current as Record<string, unknown>).review_kind != null) {
         const now = Math.floor(Date.now() / 1000);
+        // No version bump here (this is the no-op re-save's flag-ack path), so
+        // `review_clear` is the honest last-change action even though the row's
+        // content is unchanged.
         const res = await c.env.DB.prepare(
-          `UPDATE ${KIND_TO_TABLE[kind]} SET review_kind = NULL, review_reason = NULL, review_master_json = NULL, updated_at = ?1
+          `UPDATE ${KIND_TO_TABLE[kind]} SET review_kind = NULL, review_reason = NULL, review_master_json = NULL, updated_at = ?1, ${provenanceSet(5)}
              WHERE id = ?2 AND version = ?3 AND deleted_at IS NULL${bookClause(4)}`,
         )
-          .bind(now, id, expected, book)
+          .bind(now, id, expected, book, ...provenanceValues({ action: "review_clear", source: "user", actor }))
           .run();
         if (res.meta.changes) {
           const fresh = await selectRowWithLatestSource(c.env, kind, id, book);
@@ -810,12 +828,21 @@ rows.patch("/:kind/:id", requireEditor, async (c) => {
   // sort_order — a tq patch can never reach here (its schema has no field).
   if (fields.length === 1 && fields[0] === "sort_order") {
     const now = Math.floor(Date.now() / 1000);
+    // Previously wrote no audit trail at all (no version bump, no edit_log
+    // row) — this is the first record of who dragged a row and when.
     const res = await c.env.DB.prepare(
       `UPDATE ${KIND_TO_TABLE[kind]}
-         SET sort_order = ?1, updated_at = ?2
-       WHERE id = ?3 AND version = ?4 AND deleted_at IS NULL${bookClause(5)}`,
+         SET sort_order = ?1, updated_at = ?2, ${provenanceSet(3)}
+       WHERE id = ?6 AND version = ?7 AND deleted_at IS NULL${bookClause(8)}`,
     )
-      .bind((patch as Record<string, unknown>).sort_order, now, id, expected, book)
+      .bind(
+        (patch as Record<string, unknown>).sort_order,
+        now,
+        ...provenanceValues({ action: "reorder", source: "user", actor }),
+        id,
+        expected,
+        book,
+      )
       .run();
     if (!res.meta.changes) {
       // Version moved on under us (a content edit landed first). Surface 409
@@ -839,7 +866,6 @@ rows.patch("/:kind/:id", requireEditor, async (c) => {
     return c.json(updated);
   }
 
-  const userId = currentUserId(c);
   const now = Math.floor(Date.now() / 1000);
   const setClauses = fields.map((f, i) => `${f} = ?${i + 1}`);
   // Any content edit clears a pending review flag, and (tn only) also
@@ -857,11 +883,13 @@ rows.patch("/:kind/:id", requireEditor, async (c) => {
   setClauses.push(`updated_at = ?${baseParams + 1}`);
   setClauses.push(`updated_by = ?${baseParams + 2}`);
   setClauses.push(`restored_from_version = ?${baseParams + 3}`);
+  setClauses.push(provenanceSet(baseParams + 4));
   const values = [
     ...fields.map((f) => (patch as Record<string, unknown>)[f]),
     now,
     userId,
     restoredFromVersion,
+    ...provenanceValues({ action: "update", source: "user", actor }),
     id,
     expected,
     book,
@@ -880,9 +908,9 @@ rows.patch("/:kind/:id", requireEditor, async (c) => {
       .prepare(
         `UPDATE ${KIND_TO_TABLE[kind]}
            SET ${setClauses.join(", ")}
-         WHERE id = ?${baseParams + 4}
-           AND version = ?${baseParams + 5}
-           AND deleted_at IS NULL${bookClause(baseParams + 6)}`,
+         WHERE id = ?${baseParams + 7}
+           AND version = ?${baseParams + 8}
+           AND deleted_at IS NULL${bookClause(baseParams + 9)}`,
       )
       .bind(...values),
     c.env.DB
@@ -1080,6 +1108,12 @@ rows.post("/:kind/:id/dismiss-review", requireEditor, async (c) => {
     }
   }
 
+  // Provenance params tail the dynamic guard params above — nextParam already
+  // accounts for however many of reviewKindGuard/reviewReasonGuard bound.
+  const actor = await resolveActorUsername(c.env.DB, userId, c.get("username"));
+  const provenanceClause = provenanceSet(nextParam);
+  updateBinds.push(...provenanceValues({ action: "dismiss_review", source: "user", actor }));
+
   // Batch: the audit INSERT is conditional on the UPDATE actually clearing a
   // flag (`changes() > 0`, same pattern as the PATCH/setTnBit/setTnTrashed
   // audits above), so a no-op dismiss — already clear, wrong review_kind, or
@@ -1099,7 +1133,7 @@ rows.post("/:kind/:id/dismiss-review", requireEditor, async (c) => {
         // at the next mint anyway. Cleared here for the same reason every other
         // clear site clears it — a dismissed row should carry no residue of the
         // warning it dismissed.
-        `UPDATE ${KIND_TO_TABLE[kind]} SET review_kind = NULL, review_reason = NULL, review_master_json = NULL, updated_at = ?1
+        `UPDATE ${KIND_TO_TABLE[kind]} SET review_kind = NULL, review_reason = NULL, review_master_json = NULL, updated_at = ?1, ${provenanceClause}
            WHERE id = ?2${bookClause(3)} AND review_kind IS NOT NULL AND deleted_at IS NULL${trashedGuard}${reviewKindGuard}${reviewReasonGuard}`,
       )
       .bind(...updateBinds),
@@ -1161,16 +1195,17 @@ rows.delete("/:kind/:id", requireEditor, async (c) => {
   }
 
   const userId = currentUserId(c);
+  const actor = await resolveActorUsername(c.env.DB, userId, c.get("username"));
   const now = Math.floor(Date.now() / 1000);
   const newVersion = expected + 1;
   const [updateRes] = await c.env.DB.batch([
     c.env.DB
       .prepare(
         `UPDATE ${KIND_TO_TABLE[kind]}
-           SET deleted_at = ?1, version = version + 1, updated_at = ?1, updated_by = ?2
+           SET deleted_at = ?1, version = version + 1, updated_at = ?1, updated_by = ?2, ${provenanceSet(6)}
          WHERE id = ?3 AND version = ?4 AND deleted_at IS NULL${bookClause(5)}`,
       )
-      .bind(now, userId, id, expected, book),
+      .bind(now, userId, id, expected, book, ...provenanceValues({ action: "delete", source: "user", actor })),
     c.env.DB
       .prepare(
         // changes()-gated like PATCH: the audit lands only when THIS batch's
@@ -1229,11 +1264,15 @@ async function setTnBit(
   id: string,
   book: string,
   userId: number | null,
+  usernameHint: string | undefined,
   column: "preserve" | "hint",
   value: 0 | 1,
 ): Promise<TnRow | null> {
   const now = Math.floor(Date.now() / 1000);
   const action = value === 1 ? column : `un${column}`;
+  // last_change_action is the bit's own name regardless of direction — `action`
+  // above (preserve/unpreserve) is the edit_log verb, a separate vocabulary.
+  const actor = await resolveActorUsername(env.DB, userId, usernameHint);
   const [updateRes] = await env.DB.batch([
     env.DB
       .prepare(
@@ -1241,10 +1280,10 @@ async function setTnBit(
         // mtime-based view, but updated_by stays NULL — standing authorship
         // is whoever wrote the note content, not whoever toggled the bit.
         `UPDATE tn_rows
-           SET ${column} = ?1, updated_at = ?2
-         WHERE id = ?3 AND deleted_at IS NULL${bookClause(4)}`,
+           SET ${column} = ?1, updated_at = ?2, ${provenanceSet(3)}
+         WHERE id = ?6 AND deleted_at IS NULL${bookClause(7)}`,
       )
-      .bind(value, now, id, book),
+      .bind(value, now, ...provenanceValues({ action: column, source: "user", actor }), id, book),
     env.DB
       .prepare(
         `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action)
@@ -1281,9 +1320,11 @@ async function setTnTrashed(
   // stub. A no-op result means the row changed under us; the caller turns that
   // into a 409 rather than silently reporting success.
   onlyIfBlankStub = false,
+  usernameHint?: string,
 ): Promise<TnRow | null> {
   const now = Math.floor(Date.now() / 1000);
   const action = trashed ? "trash" : "untrash";
+  const actor = await resolveActorUsername(env.DB, userId, usernameHint);
   const auditStmt = env.DB
     .prepare(
       `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action)
@@ -1313,11 +1354,14 @@ async function setTnTrashed(
     const [guardedUpdate] = await env.DB.batch([
       env.DB
         .prepare(
+          // Auto-discard of an abandoned blank stub — still a `trash`, from
+          // the row's own author (the userId the blankStubClause ownership
+          // check requires).
           `UPDATE tn_rows
-             SET trashed_at = ?1, updated_at = ?2
-           WHERE id = ?3 AND deleted_at IS NULL${bookClause(4)}${blankStubClause(5)}`,
+             SET trashed_at = ?1, updated_at = ?2, ${provenanceSet(3)}
+           WHERE id = ?6 AND deleted_at IS NULL${bookClause(7)}${blankStubClause(8)}`,
         )
-        .bind(now, now, id, book, userId),
+        .bind(now, now, ...provenanceValues({ action: "trash", source: "user", actor }), id, book, userId),
       env.DB
         .prepare(
           `INSERT INTO edit_log (kind, row_key, book, user_id, prev_version, new_version, action)
@@ -1335,10 +1379,10 @@ async function setTnTrashed(
     env.DB
       .prepare(
         `UPDATE tn_rows
-           SET trashed_at = ?1, updated_at = ?2
-         WHERE id = ?3 AND deleted_at IS NULL${bookClause(4)}`,
+           SET trashed_at = ?1, updated_at = ?2, ${provenanceSet(3)}
+         WHERE id = ?6 AND deleted_at IS NULL${bookClause(7)}`,
       )
-      .bind(trashed ? now : null, now, id, book),
+      .bind(trashed ? now : null, now, ...provenanceValues({ action, source: "user", actor }), id, book),
     auditStmt,
   ]);
   if (!updateRes.meta.changes) return null;
@@ -1362,7 +1406,7 @@ rows.post("/tn/:id/preserve", requireEditor, async (c) => {
   if (!parsed.success) {
     return c.json({ error: "validation_failed", issues: parsed.error.issues }, 400);
   }
-  const updated = await setTnBit(c.env, id, book, userId, "preserve", coerceBitValue(parsed.data.value));
+  const updated = await setTnBit(c.env, id, book, userId, c.get("username"), "preserve", coerceBitValue(parsed.data.value));
   if (!updated) return c.json({ error: "not_found" }, 404);
   c.executionCtx.waitUntil(
     broadcastChapter(c.env, updated.book, updated.chapter, { type: "row.upserted", kind: "tn", row: updated }),
@@ -1407,7 +1451,7 @@ rows.post("/tn/:id/hint", requireEditor, async (c) => {
       );
     }
   }
-  const updated = await setTnBit(c.env, id, book, userId, "hint", value);
+  const updated = await setTnBit(c.env, id, book, userId, c.get("username"), "hint", value);
   if (!updated) return c.json({ error: "not_found" }, 404);
   c.executionCtx.waitUntil(
     broadcastChapter(c.env, updated.book, updated.chapter, { type: "row.upserted", kind: "tn", row: updated }),
@@ -1424,7 +1468,7 @@ rows.post("/tn/:id/keep", requireEditor, async (c) => {
   const book = c.req.query("book");
   if (!book) return c.json({ error: "book_required" }, 400);
   const userId = currentUserId(c);
-  const updated = await setTnBit(c.env, id, book, userId, "preserve", 1);
+  const updated = await setTnBit(c.env, id, book, userId, c.get("username"), "preserve", 1);
   if (!updated) return c.json({ error: "not_found" }, 404);
   c.executionCtx.waitUntil(
     broadcastChapter(c.env, updated.book, updated.chapter, { type: "row.upserted", kind: "tn", row: updated }),
@@ -1450,7 +1494,7 @@ rows.post("/tn/:id/trash", requireEditor, async (c) => {
   // job would promote that to a permanent tombstone. Distinguish it from
   // not_found: the row exists, it simply is no longer discardable.
   const onlyIfBlankStub = c.req.query("onlyIfBlankStub") === "1";
-  const updated = await setTnTrashed(c.env, id, book, userId, true, onlyIfBlankStub);
+  const updated = await setTnTrashed(c.env, id, book, userId, true, onlyIfBlankStub, c.get("username"));
   if (!updated && onlyIfBlankStub) {
     const exists = await c.env.DB.prepare(
       `SELECT id FROM tn_rows WHERE id = ?1 AND deleted_at IS NULL${bookClause(2)}`,
@@ -1480,7 +1524,7 @@ rows.post("/tn/:id/restore", requireEditor, async (c) => {
   const book = c.req.query("book");
   if (!book) return c.json({ error: "book_required" }, 400);
   const userId = currentUserId(c);
-  const updated = await setTnTrashed(c.env, id, book, userId, false);
+  const updated = await setTnTrashed(c.env, id, book, userId, false, undefined, c.get("username"));
   if (!updated) return c.json({ error: "not_found" }, 404);
   c.executionCtx.waitUntil(
     broadcastChapter(c.env, updated.book, updated.chapter, { type: "row.upserted", kind: "tn", row: updated }),

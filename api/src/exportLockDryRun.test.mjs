@@ -61,6 +61,9 @@ function freshDb() {
       book TEXT NOT NULL,
       sort_order INTEGER NOT NULL,
       version INTEGER NOT NULL DEFAULT 1,
+      last_change_action TEXT,
+      last_change_source TEXT,
+      last_change_actor TEXT,
       PRIMARY KEY (book, id)
     );
   `);

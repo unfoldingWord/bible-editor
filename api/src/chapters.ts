@@ -26,9 +26,10 @@ import {
 } from "./contentJson.ts";
 import { computeTwlSortOrderUpdates } from "./twlCanonicalOrder";
 import { applyTwlSortOrderUpdates } from "./twlSortOrderApply";
+import { resolveActorUsername } from "./rowProvenance.ts";
 
-export const chapters = new Hono<{ Bindings: Env; Variables: { userId?: number } }>();
-type AppContext = Context<{ Bindings: Env; Variables: { userId?: number } }>;
+export const chapters = new Hono<{ Bindings: Env; Variables: { userId?: number; username?: string } }>();
+type AppContext = Context<{ Bindings: Env; Variables: { userId?: number; username?: string } }>;
 
 // Bulk read everything for a chapter.
 chapters.get("/:book/:chapter", async (c) => {
@@ -465,7 +466,22 @@ chapters.delete("/:book/:chapter/twl-order-lock", requireEditor, async (c) => {
           : Promise.resolve(new Map<string, string>()),
       ]);
       const updates = computeTwlSortOrderUpdates(twlRows.results, ultVerse.results, twTitles);
-      await applyTwlSortOrderUpdates(c.env.DB, book, updates);
+      // #686: this re-sequence is the ONE interactive caller of
+      // applyTwlSortOrderUpdates — a signed-in human dismissed the order lock
+      // and the rows moved as a direct result. Its other two callers (the
+      // nightly reimport and the nightly export) take the helper's default,
+      // which stamps a dcs_sync/"Door43 sync" reorder. Passing the user
+      // provenance explicitly here is what keeps a translator's own click from
+      // being recorded as a Door43 sync — exactly the confusion this issue is
+      // about, and one the default would silently produce.
+      await applyTwlSortOrderUpdates(c.env.DB, book, updates, {
+        // 'reorder', not 'sync_reorder': the two differ precisely by who did it,
+        // and only sort_order moved here — the same change the drag fast path in
+        // rows.ts records.
+        action: "reorder",
+        source: "user",
+        actor: await resolveActorUsername(c.env.DB, currentUserId(c), c.get("username")),
+      });
     }
   } catch (e) {
     // Best-effort, mirroring applyTwlSortOrderUpdates's own posture: the lock

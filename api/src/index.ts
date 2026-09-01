@@ -284,7 +284,12 @@ export default {
                FROM tn_rows WHERE trashed_at IS NOT NULL AND deleted_at IS NULL`,
           ),
           env.DB.prepare(
-            `UPDATE tn_rows SET deleted_at = trashed_at, trashed_at = NULL
+            // Book-wide, no caller identity behind it — the nightly promotion
+            // of trashed_at -> deleted_at, not an editor's own delete. Literal
+            // values: no bind params needed for a constant stamp.
+            `UPDATE tn_rows SET deleted_at = trashed_at, trashed_at = NULL,
+                    last_change_action = 'finalize_trash', last_change_source = 'system',
+                    last_change_actor = 'nightly trash finalize'
               WHERE trashed_at IS NOT NULL AND deleted_at IS NULL`,
           ),
         ]);
