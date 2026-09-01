@@ -2881,10 +2881,16 @@ function snapshotBlockedSha(json: string | null): string | null {
 }
 
 // Rewrite a stored snapshot's `_meta.clear_blocked_sha`, leaving every Door43
-// field untouched. Returns null when the snapshot cannot be parsed (nothing to
-// annotate — that row simply keeps paying, which is the safe direction).
+// field untouched. A NULL snapshot (pre-#653: nothing to preserve) gets a
+// bookkeeping-only container synthesized instead of being left unmemoizable
+// (#683) — no Door43 field is invented, `_meta` is the only key, and
+// lint.ts's reviewMasterSnapshot already treats an object that strips down to
+// nothing but `_meta` as "no snapshot" (door43: null) for display, so this
+// never renders as a fake empty Door43 row. Returns null only when the JSON IS
+// present but cannot be parsed (nothing safe to annotate — that row simply
+// keeps paying, which is the safe direction).
 function withBlockedSha(json: string | null, sha: string): string | null {
-  if (!json) return null;
+  if (!json) return JSON.stringify({ _meta: { clear_blocked_sha: sha } });
   try {
     const p = JSON.parse(json);
     if (!p || typeof p !== "object" || Array.isArray(p)) return null;
@@ -3767,18 +3773,35 @@ const NO_BASE_CLEAR_MAX_WINDOW_SECONDS = 30 * 24 * 3600;
 // bp-assistant pushes. That is the claim being MEASURED false, so the flags go.
 //
 // THE WINDOW IS THE WHOLE SAFETY ARGUMENT, and it is not derivable from the
-// row. A flag raised on run R is about master's history since R's own watermark
-// (master_confirmed_at at that moment), so a walk that starts later than that
-// watermark can report "no human commit" while the human commit sits just
-// behind its start. The row's `updated_at` is no help and is actively
-// misleading: the non-versioning fast paths in rows.ts (a reorder drag, a
-// preserve/hint/trash toggle) move it and deliberately leave review_kind
-// standing, so a flag from June can carry an August timestamp. So the window is
-// taken from the flag itself — `flag_since` in review_master_json, written at
-// the mint (masterReviewSnapshot) — and a flag that does not carry one is NOT
-// cleared. That deliberately excludes every flag minted before this shipped,
-// including the 79: an absent measurement may not be laundered into a clean
-// one, and those have the dismiss path instead.
+// row IN GENERAL. A flag raised on run R is about master's history since R's
+// own watermark (master_confirmed_at at that moment), so a walk that starts
+// later than that watermark can report "no human commit" while the human
+// commit sits just behind its start. The row's `updated_at` is actively
+// misleading WHEN A REAL WATERMARK EXISTS TO COMPARE IT AGAINST: the
+// non-versioning fast paths in rows.ts (a reorder drag, a preserve/hint/trash
+// toggle) move it and deliberately leave review_kind standing, so a flag from
+// June can carry an August timestamp. So whenever the flag carries its own
+// `flag_since` (in review_master_json, written at the mint — masterReviewSnapshot),
+// THAT is the window, never updated_at.
+//
+// A flag that does not carry one — every flag minted before #653 shipped (79
+// of them standing in prod on 2026-08-30), plus one this same clear already
+// measured-and-blocked once (see withBlockedSha: the memo container it
+// synthesizes for a NULL review_master_json carries no flag_since either) — has
+// no recorded watermark at all. #683: rather than leave those permanently to
+// the dismiss path, the window falls back to the row's own `updated_at`.
+// updated_at IS the mint time for a freshly-flagged row (the merge write that
+// sets review_kind='merge_no_base' always bumps it, and nothing about the
+// clear path here ever moves it) — but it is only a SOUND UPPER BOUND once a
+// reorder/preserve/hint/trash toggle has touched the row since: those can only
+// push updated_at LATER than the true mint, never earlier, which narrows the
+// derived window rather than widening it — the unsafe direction for "no human
+// commit found" to mean anything. This is judged acceptable because the flag
+// itself is purely informational (a "verify this" prompt on the row; it gates
+// no export write and reverts no content), the 30-day cap below already bounds
+// the exposure, and the alternative today is that these can never self-clear at
+// all. A flag with neither an explicit `flag_since` nor a usable `updated_at`
+// is left alone, same as before.
 //
 // The rest is the same fail-safe as everywhere else here: an INCOMPLETE walk
 // clears nothing ("we could not read the history" is not "no human touched
@@ -3796,6 +3819,13 @@ const NO_BASE_CLEAR_MAX_WINDOW_SECONDS = 30 * 24 * 3600;
 // the flag's own `_meta`, so re-running against an unchanged master costs zero
 // fetches. Never throws: a failure here must not take down a reimport, and the
 // flags simply stand for another night.
+//
+// #683: this is also called from a NIGHTLY SWEEP (sweepAllMergeNoBaseFlags,
+// below) for every (book, kind) still holding a flag, independent of whether
+// this run's own reimport happened to visit that book — the gap the walk-per-
+// visited-book design above could never close on its own, since a book whose
+// master file stops moving never re-enters the reimport's SHA-gated path at
+// all.
 async function clearResolvedMergeNoBase(
   env: Env,
   book: string,
@@ -3810,11 +3840,11 @@ async function clearResolvedMergeNoBase(
 ): Promise<number> {
   try {
     const rs = await env.DB.prepare(
-      `SELECT id, review_master_json FROM ${TSV_TABLE[kind]}
+      `SELECT id, review_master_json, updated_at FROM ${TSV_TABLE[kind]}
         WHERE book = ?1 AND review_kind = 'merge_no_base' AND deleted_at IS NULL`,
     )
       .bind(book)
-      .all<{ id: string; review_master_json: string | null }>();
+      .all<{ id: string; review_master_json: string | null; updated_at: number }>();
     const flagged = rs.results.length;
     if (flagged === 0) return 0;
 
@@ -3824,10 +3854,20 @@ async function clearResolvedMergeNoBase(
     let skippedNoWindow = 0;
     let skippedStale = 0;
     let skippedMemo = 0;
+    let derivedWindow = 0;
     for (const r of rs.results) {
-      const since = snapshotFlagSince(r.review_master_json);
+      // #683: a real #653+ mint always carries `_meta.flag_since` (the merge
+      // write that sets review_kind='merge_no_base' only ever fires once
+      // masterConfirmedAt is known — see the mint call site). Its absence
+      // means there is no recorded watermark — a pre-#653 flag, an earlier
+      // sweep's memo-only container, or a malformed snapshot — and the
+      // window falls back to the row's own `updated_at` (see the doc comment
+      // above this function for the caveat that fallback carries).
+      const explicitSince = snapshotFlagSince(r.review_master_json);
+      const since = explicitSince ?? r.updated_at;
+      if (explicitSince == null && since != null) derivedWindow++;
       if (since == null) {
-        skippedNoWindow++; // pre-#653 flag, or a snapshot we cannot read
+        skippedNoWindow++; // no explicit window and no updated_at to fall back to
         continue;
       }
       if (now - since > NO_BASE_CLEAR_MAX_WINDOW_SECONDS) {
@@ -3851,6 +3891,7 @@ async function clearResolvedMergeNoBase(
         skippedNoWindow,
         skippedStale,
         skippedMemo,
+        derivedWindow,
       });
       return 0;
     }
@@ -3972,6 +4013,7 @@ async function clearResolvedMergeNoBase(
       skippedNoWindow,
       skippedStale,
       skippedMemo,
+      derivedWindow,
       ...evidence,
     });
     return cleared;
@@ -3996,6 +4038,89 @@ export const clearResolvedMergeNoBaseForTest = (
   file: { repo: string; path: string },
   masterSha: string | null = null,
 ): Promise<number> => clearResolvedMergeNoBase(env, book, kind, walkStart, walked, file, masterSha);
+
+const TSV_KINDS: readonly TsvKind[] = ["tn", "tq", "twl"];
+
+// #683: every (book, kind) STILL holding a merge_no_base flag, regardless of
+// whether this run's own pre-export reimport visited that book. One DISTINCT
+// read per kind, covered end-to-end by migration 0057's partial index
+// (`(book) WHERE review_kind IS NOT NULL`) — steady state is an empty result
+// on every kind, so this is cheap on every run once the backlog is clear.
+// Exported standalone (not folded into sweepAllMergeNoBaseFlags) so its own
+// test can prove the discovery itself — that it finds a book with no other
+// activity this run — without touching the network the rest of the sweep
+// needs.
+export async function findMergeNoBaseBookKinds(env: Env): Promise<Array<{ book: string; kind: TsvKind }>> {
+  const out: Array<{ book: string; kind: TsvKind }> = [];
+  for (const kind of TSV_KINDS) {
+    try {
+      const rs = await env.DB.prepare(
+        `SELECT DISTINCT book FROM ${TSV_TABLE[kind]}
+          WHERE review_kind = 'merge_no_base' AND deleted_at IS NULL
+          ORDER BY book`,
+      ).all<{ book: string }>();
+      for (const r of rs.results) out.push({ book: r.book, kind });
+    } catch (e) {
+      console.error("sweep merge_no_base: book list failed", {
+        kind,
+        error: e instanceof Error ? e.message : String(e),
+      });
+    }
+  }
+  return out;
+}
+
+// #683: the nightly self-heal for issue #683 — the per-book clear wired
+// through loadMasterLineage above only ever runs for a (book, resource) this
+// run's pre-export reimport actually visits, and the reimport deliberately
+// SKIPS a book whose file's DCS commit sha is unchanged (see
+// runChunkedReimport / fileCommitSha). A book that stops moving therefore
+// never re-enters that path, and a merge_no_base flag on it — including every
+// one minted before #653, which carried no snapshot to begin with — can stand
+// forever even once it is measurably resolved. Wired into exportWorkflow.ts's
+// scheduled run, once per night, independent of which books that run's own
+// reimport touched.
+//
+// Cost-bounded the same way the per-book path is, just without a walk to
+// piggyback on. fileCommitSha is ONE lightweight request (a single commits
+// page, not a paginated walk) — it gets a real master-tip sha for the memo
+// check before clearResolvedMergeNoBase would pay for a full
+// listMasterCommitsSince. A book whose every clearable flag is already
+// memoized against that same tip costs exactly that one request and nothing
+// more; only a book with something genuinely new to check pays for the full
+// walk clearResolvedMergeNoBase does internally. The walkStart sentinel below
+// (larger than any real window, which is always <= `now`) forces that
+// function past its "reuse the caller's walk" branch and into a fresh walk of
+// its own rather than let it trust an unfetched, misleadingly-empty page as
+// "walked and found nothing" — the one way this helper could accidentally
+// clear a flag with no genuine sha history behind it.
+//
+// Never throws — same doctrine as clearResolvedMergeNoBase and every other
+// best-effort nightly step: a failure here must leave the flags standing for
+// another night, not take down the export run it's wired into.
+export async function sweepAllMergeNoBaseFlags(env: Env): Promise<{ booksSwept: number; cleared: number }> {
+  const pairs = await findMergeNoBaseBookKinds(env);
+  let cleared = 0;
+  for (const { book, kind } of pairs) {
+    try {
+      const file = dcsResourceFile(book, kind);
+      if (!file) continue; // unrecognized book — nothing to walk against
+      const masterSha = await fileCommitSha(env, file.repo, file.path);
+      const emptyPage: MasterCommitPage = { commits: [], incomplete: false, incompleteReason: "" };
+      cleared += await clearResolvedMergeNoBase(env, book, kind, Number.MAX_SAFE_INTEGER, emptyPage, file, masterSha);
+    } catch (e) {
+      console.error("sweep merge_no_base: pair failed", {
+        book,
+        kind,
+        error: e instanceof Error ? e.message : String(e),
+      });
+    }
+  }
+  if (pairs.length > 0) {
+    console.log("sweep merge_no_base: done", { booksSwept: pairs.length, cleared });
+  }
+  return { booksSwept: pairs.length, cleared };
+}
 
 // Durable counterpart to the console.log above — see 0054_master_lineage_snapshot.sql
 // and, for the two boundary columns, 0058_master_lineage_confirmed_boundary.sql.

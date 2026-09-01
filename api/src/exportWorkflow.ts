@@ -74,7 +74,12 @@ import { applyTwlSortOrderUpdates } from "./twlSortOrderApply";
 import { loadTwTitles } from "./twTitles";
 import { loadTwlOrderLocks } from "./twlOrderLocks";
 import { runPostExport, VALIDATORS } from "./postExport";
-import { runChunkedReimport, storedResourceSha, ALL_RESOURCES as REIMPORT_RESOURCES } from "./bookReimport";
+import {
+  runChunkedReimport,
+  storedResourceSha,
+  ALL_RESOURCES as REIMPORT_RESOURCES,
+  sweepAllMergeNoBaseFlags,
+} from "./bookReimport";
 import { dcsResourceFile, fetchDcsMasterText, fileCommitSha, type ReimportResource } from "./dcsSources";
 import { gitBlobSha } from "./ownPublish";
 import type { TnRow, TqRow, TwlRow, VerseRow } from "./types";
@@ -437,6 +442,28 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       const validatorCfg = VALIDATORS.find((v) => v.resource === resource);
       if (validatorCfg && params.validateAndMerge === true) {
         await runPostExport(this.env, step, validatorCfg, dcsAllowed);
+      }
+    }
+
+    // 2b. #683 self-heal: sweep every (book, kind) STILL holding a
+    //     merge_no_base flag, not just the ones the per-book loop above
+    //     happened to visit this run — a book whose master file stops moving
+    //     never re-enters that loop's SHA-gated reimport at all, so its flags
+    //     could otherwise stand forever even once resolved. See
+    //     bookReimport.ts's sweepAllMergeNoBaseFlags for the full story.
+    //
+    //     Scoped to a genuine full run (no params.book): every cron path
+    //     already omits it, and gating on its absence keeps a manual
+    //     single-book /api/exports/run test from reaching into every other
+    //     book's flags as a side effect. Gated on dcsAllowed for the same
+    //     reason published-drift-check above is — it needs real Gitea
+    //     fetches. Best-effort, matching every other nightly housekeeping
+    //     step here: a failure must not abort the export run.
+    if (dcsAllowed && !params.book) {
+      try {
+        await step.do("sweep-merge-no-base", async () => sweepAllMergeNoBaseFlags(this.env));
+      } catch (e) {
+        console.error("export sweep-merge-no-base failed", { error: e instanceof Error ? e.message : String(e) });
       }
     }
 

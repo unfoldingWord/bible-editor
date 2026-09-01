@@ -41,6 +41,8 @@ import { fileURLToPath } from "node:url";
 import {
   applyTsvRows,
   clearResolvedMergeNoBaseForTest,
+  findMergeNoBaseBookKinds,
+  sweepAllMergeNoBaseFlags,
   recordResourceSync,
   recordWithheldSyncIfAbsent,
 } from "./bookReimport.ts";
@@ -2330,55 +2332,53 @@ console.log("\n[#653: the auto-clear retires flags the commit history now dispro
     }
   }
 
-  // 4c. A flag carrying NO recorded window — every flag minted before #653,
-  //     including the 79 standing in prod — is NOT cleared. Its range is
-  //     unknown, and an absent measurement may not be laundered into a clean
-  //     one. Those clear by hand instead.
+  // 4c. #683: a flag carrying NO recorded window — every flag minted before
+  //     #653, including the 79 standing in prod — used to be left alone
+  //     forever. It now derives its window from the row's own `updated_at`
+  //     (seedFlagged's default: MINT_AT + 5 days, comfortably inside the
+  //     30-day bound either way) and clears exactly like a #653+ flag would,
+  //     on the same human-free evidence.
   {
     const { sqlite, env } = freshEnv();
     seedFlagged(sqlite, 2, { snapshot: JSON.stringify({ question: "master q" }) });
-    const realFetch = globalThis.fetch;
-    let called = 0;
-    globalThis.fetch = async () => { called++; throw new Error("should not be called"); };
-    try {
-      const cleared = await clearResolvedMergeNoBaseForTest(env, BOOK, "tq", FLAG_SINCE - 10, OURS_AND_AI_PAGE, FILE);
-      eq(cleared, 0, "a flag with no recorded window is left alone");
-      eq(called, 0, "…and no walk is spent on it");
-    } finally {
-      globalThis.fetch = realFetch;
-    }
+    const cleared = await clearResolvedMergeNoBaseForTest(env, BOOK, "tq", FLAG_SINCE - 10, OURS_AND_AI_PAGE, FILE);
+    eq(cleared, 2, "a flag with no recorded window now clears via its updated_at fallback");
     const rows = sqlite.prepare(`SELECT review_kind FROM tq_rows`).all();
-    eq(rows.map((r) => r.review_kind), ["merge_no_base", "merge_no_base"], "…the flags stand");
+    eq(rows.map((r) => r.review_kind), [null, null], "…both flags retired");
   }
 
-  // 4c2. A window-less flag must not RIDE ALONG on a neighbour's window. With
-  //      one clearable flag in the same book, the walk happens anyway — and a
-  //      legacy flag swept up by it would be cleared on evidence covering a
-  //      range that has nothing to do with it.
+  // 4c2. A window-less flag's DERIVED window is still evaluated on its own
+  //      merits, not borrowed from a neighbour's real window — a stale
+  //      updated_at (outside the 30-day bound) is skipped independently of
+  //      whatever window a same-book row with a real flag_since carries.
   {
     const { sqlite, env } = freshEnv();
-    seedFlagged(sqlite, 1); // cl00: carries _meta.flag_since
+    seedFlagged(sqlite, 1); // cl00: carries _meta.flag_since, clears normally
     sqlite
       .prepare(
         `INSERT INTO tq_rows (id, book, chapter, verse, ref_raw, question, response, version, updated_by,
                               updated_at, review_kind, review_reason, review_master_json)
          VALUES ('lg01', ?, 3, 9, '3:9', 'app question', 'r', 4, 1, ?, 'merge_no_base', 'raised before #653', '{"question":"master q"}')`,
       )
-      .run(BOOK, MINT_AT);
+      .run(BOOK, NOW - 45 * 86400); // lg01: no _meta at all, and its OWN updated_at is stale
     const cleared = await clearResolvedMergeNoBaseForTest(env, BOOK, "tq", FLAG_SINCE - 10, OURS_AND_AI_PAGE, FILE);
-    eq(cleared, 1, "only the flag that carries its own window is retired");
+    eq(cleared, 1, "only the flag whose own window (explicit or derived) is inside the bound is retired");
     const rows = sqlite.prepare(`SELECT id, review_kind FROM tq_rows ORDER BY id`).all();
-    eq(rows.map((r) => r.review_kind), [null, "merge_no_base"], "…the legacy flag stands, it did not ride along");
+    eq(rows.map((r) => r.review_kind), [null, "merge_no_base"], "…the stale-derived flag stands on its own evidence");
   }
 
-  // 4d. A snapshot whose flag_since is not a usable number is the same absence
-  //     — never a Number()-coerced 0, which would read as "walk from the epoch",
-  //     the most permissive window there is.
+  // 4d. A snapshot whose flag_since is not a usable number is the same
+  //     absence as no snapshot at all — never a Number()-coerced 0, which
+  //     would read as "walk from the epoch" (the most permissive window
+  //     there is, and always stale). It falls back to updated_at exactly like
+  //     4c: if the null were ever wrongly coerced to 0, this would flip back
+  //     to skippedStale/cleared=0, so this still pins the non-coercion
+  //     invariant, just via the new fallback's outcome instead of a bare skip.
   {
     const { sqlite, env } = freshEnv();
     seedFlagged(sqlite, 1, { snapshot: JSON.stringify({ _meta: { flag_since: null } }) });
     const cleared = await clearResolvedMergeNoBaseForTest(env, BOOK, "tq", FLAG_SINCE - 10, OURS_AND_AI_PAGE, FILE);
-    eq(cleared, 0, "an explicit null window is absent, not epoch 0");
+    eq(cleared, 1, "an explicit null window falls back to updated_at, not epoch 0");
   }
 
   // 4e. A window older than the 30-day bound is not walked at all. flag_since
@@ -2475,6 +2475,211 @@ console.log("\n[#653: the auto-clear retires flags the commit history now dispro
     eq(cleared, 1, "only the merge_no_base row is retired");
     const rows = sqlite.prepare(`SELECT id, review_kind FROM tq_rows ORDER BY id`).all();
     eq(rows.map((r) => r.review_kind), ["merge_conflict", null], "…an unacknowledged merge_conflict stands");
+  }
+}
+
+console.log("\n[#683: sweep discovers and clears standing merge_no_base flags across ALL books, not just ones a run visited]");
+{
+  // Discovery alone: findMergeNoBaseBookKinds is the migration-0057-indexed
+  // query the nightly sweep uses to find every (book, kind) STILL holding a
+  // flag. None of these books are referenced anywhere else in this file —
+  // there is no "run" that visited them, which is exactly the gap #683
+  // closes: a book with no other activity still gets found.
+  {
+    const { sqlite, env } = freshEnv();
+    sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (1, 100, 'translator')`).run();
+    sqlite.prepare(
+      `INSERT INTO tq_rows (id, book, chapter, verse, ref_raw, question, response, review_kind) VALUES
+         ('a1', '2CH', 1, 1, '1:1', 'q', 'r', 'merge_no_base'),
+         ('a2', '2CH', 1, 2, '1:2', 'q', 'r', 'merge_no_base'),
+         ('b1', 'HAG', 1, 1, '1:1', 'q', 'r', 'merge_conflict'),
+         ('c1', 'ZEC', 1, 1, '1:1', 'q', 'r', NULL)`,
+    ).run();
+    sqlite.prepare(
+      `INSERT INTO tn_rows (id, book, chapter, verse, ref_raw, note, review_kind) VALUES
+         ('d1', 'MAL', 1, 1, '1:1', 'n', 'merge_no_base')`,
+    ).run();
+    // Tombstoned — the export never renders it and the flag is moot.
+    sqlite.prepare(
+      `INSERT INTO tq_rows (id, book, chapter, verse, ref_raw, question, response, review_kind, deleted_at) VALUES
+         ('e1', 'JON', 1, 1, '1:1', 'q', 'r', 'merge_no_base', unixepoch())`,
+    ).run();
+    const pairs = await findMergeNoBaseBookKinds(env);
+    eq(pairs.length, 2, "exactly the two (book, kind) pairs actually carrying a standing merge_no_base flag");
+    eq(
+      pairs.map((p) => `${p.book}:${p.kind}`).sort(),
+      ["2CH:tq", "MAL:tn"].sort(),
+      "…deduped per (book, kind), excluding other review_kind values, unflagged rows, and tombstones",
+    );
+  }
+
+  const SWEEP_NOW = Math.floor(Date.now() / 1000);
+  const seedSweepRow = (sqlite, id, updatedAt) => {
+    sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (1, 100, 'translator')`).run();
+    sqlite
+      .prepare(
+        `INSERT INTO tq_rows (id, book, chapter, verse, ref_raw, question, response, version, updated_by,
+                              updated_at, review_kind, review_reason, review_master_json)
+         VALUES (?, 'OBA', 1, 1, '1:1', 'app question', 'r', 4, 1, ?, 'merge_no_base', 'some earlier reason', NULL)`,
+      )
+      .run(id, updatedAt);
+  };
+  // Every scenario below drives the REAL sweepAllMergeNoBaseFlags, including
+  // its own fileCommitSha call — with global fetch stubbed to canned
+  // Gitea-shaped responses (same technique the rest of this file already uses
+  // for clearResolvedMergeNoBaseForTest), so nothing here touches the real
+  // network. fileCommitSha's request is distinguished by `limit=1`;
+  // everything else is listMasterCommitsSince's own paginated walk.
+
+  // (a)+(b) A NULL review_master_json flag on a book this "run" never visited
+  // (OBA appears nowhere else in this file) is found by the sweep and cleared
+  // when its derived (updated_at) window is inside 30 days and the real walk
+  // is complete and human-free.
+  {
+    const { sqlite, env } = freshEnv();
+    seedSweepRow(sqlite, "sw01", SWEEP_NOW - 5 * 86400);
+    const realFetch = globalThis.fetch;
+    let walkCalls = 0;
+    globalThis.fetch = async (url) => {
+      const u = String(url);
+      if (u.includes("limit=1")) return { ok: true, headers: { get: () => null }, json: async () => [{ sha: "sweeptip1" }] };
+      walkCalls++;
+      return { ok: true, headers: { get: () => null }, json: async () => [] };
+    };
+    let result;
+    try {
+      result = await sweepAllMergeNoBaseFlags(env);
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+    eq(result, { booksSwept: 1, cleared: 1 }, "a never-visited book's NULL-window flag is found and cleared");
+    eq(walkCalls > 0, true, "…via a real (stubbed) history walk, not a rubber stamp");
+    const row = sqlite.prepare(`SELECT review_kind, review_master_json FROM tq_rows WHERE id='sw01'`).all()[0];
+    eq(row.review_kind, null, "review_kind cleared");
+    eq(row.review_master_json, null, "…and the (absent) snapshot stays absent");
+    const logs = sqlite.prepare(`SELECT * FROM edit_log WHERE action = 'sync_clear_review'`).all();
+    eq(logs.length, 1, "…with the exact same sync_clear_review audit shape every other clear writes");
+    eq(
+      JSON.parse(logs[0].payload_json).evidence.walked_sha,
+      "sweeptip1",
+      "…evidenced against the real master tip the sweep fetched for it",
+    );
+  }
+
+  // (c) Same NULL-window flag, but a human commit sits in the derived window
+  // — the sweep leaves it flagged, exactly like the per-book clear would.
+  {
+    const { sqlite, env } = freshEnv();
+    seedSweepRow(sqlite, "sw02", SWEEP_NOW - 5 * 86400);
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = async (url) => {
+      const u = String(url);
+      if (u.includes("limit=1")) return { ok: true, headers: { get: () => null }, json: async () => [{ sha: "sweeptip1" }] };
+      return {
+        ok: true,
+        // x-hasmore: false — a real Gitea response for a one-commit file
+        // history — so the walk completes cleanly on page 1 instead of
+        // paging on into page_cap (which would also clear nothing, but for
+        // the wrong reason: this is meant to pin the human-found branch).
+        headers: { get: (k) => (k.toLowerCase() === "x-hasmore" ? "false" : null) },
+        json: async () => [
+          {
+            sha: "human1",
+            commit: {
+              message: "Fixes a typo",
+              author: {
+                name: "Maintainer",
+                email: "maintainer@example.com",
+                date: new Date((SWEEP_NOW - 2 * 86400) * 1000).toISOString(),
+              },
+            },
+          },
+        ],
+      };
+    };
+    let result;
+    try {
+      result = await sweepAllMergeNoBaseFlags(env);
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+    eq(result.cleared, 0, "a human commit in the derived window blocks the sweep's clear too");
+    const row = sqlite.prepare(`SELECT review_kind FROM tq_rows WHERE id='sw02'`).all()[0];
+    eq(row.review_kind, "merge_no_base", "…the flag stands");
+  }
+
+  // (c2) Same, but the walk itself is INCOMPLETE (a fetch failure) — the same
+  // fail-safe as everywhere else: "could not read the history" clears nothing.
+  {
+    const { sqlite, env } = freshEnv();
+    seedSweepRow(sqlite, "sw03", SWEEP_NOW - 5 * 86400);
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = async (url) => {
+      const u = String(url);
+      if (u.includes("limit=1")) return { ok: true, headers: { get: () => null }, json: async () => [{ sha: "sweeptip1" }] };
+      throw new Error("network down");
+    };
+    let result;
+    try {
+      result = await sweepAllMergeNoBaseFlags(env);
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+    eq(result.cleared, 0, "an incomplete walk clears nothing, even when the pair was reached via the sweep");
+    const row = sqlite.prepare(`SELECT review_kind FROM tq_rows WHERE id='sw03'`).all()[0];
+    eq(row.review_kind, "merge_no_base", "…the flag stands");
+  }
+
+  // (d) A NULL-window flag whose updated_at is older than the 30-day bound is
+  // skipped, not cleared — and costs only the ONE lightweight fileCommitSha
+  // lookup, never the deep history walk (the same self-extinguishing cost
+  // bound the per-book path already has for an explicit flag_since).
+  {
+    const { sqlite, env } = freshEnv();
+    seedSweepRow(sqlite, "sw04", SWEEP_NOW - 45 * 86400);
+    const realFetch = globalThis.fetch;
+    let shaCalls = 0;
+    let walkCalls = 0;
+    globalThis.fetch = async (url) => {
+      const u = String(url);
+      if (u.includes("limit=1")) {
+        shaCalls++;
+        return { ok: true, headers: { get: () => null }, json: async () => [{ sha: "sweeptip1" }] };
+      }
+      walkCalls++;
+      throw new Error("should not be called — the flag is stale before any walk is attempted");
+    };
+    let result;
+    try {
+      result = await sweepAllMergeNoBaseFlags(env);
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+    eq(result.cleared, 0, "an older-than-30-days derived window is skipped, not cleared");
+    eq(shaCalls, 1, "…costing exactly the one lightweight tip-sha lookup");
+    eq(walkCalls, 0, "…and never the deep history walk");
+    const row = sqlite.prepare(`SELECT review_kind FROM tq_rows WHERE id='sw04'`).all()[0];
+    eq(row.review_kind, "merge_no_base", "…the flag stands, left to the dismiss path");
+  }
+
+  // Nothing flagged anywhere -> the sweep is a true no-op: three empty
+  // (indexed) SELECTs and not one network call.
+  {
+    const { sqlite, env } = freshEnv();
+    const realFetch = globalThis.fetch;
+    let called = 0;
+    globalThis.fetch = async () => {
+      called++;
+      throw new Error("should not be called");
+    };
+    let result;
+    try {
+      result = await sweepAllMergeNoBaseFlags(env);
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+    eq(result, { booksSwept: 0, cleared: 0 }, "a DB with zero merge_no_base flags is a cheap no-op");
+    eq(called, 0, "…and touches the network not at all");
   }
 }
 

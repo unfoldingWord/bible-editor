@@ -190,7 +190,15 @@ function reviewMasterSnapshot(row: Record<string, unknown>): Record<string, unkn
     // reserved top-level key, not nested inside a real field's value.
     const snapshot = { ...(parsed as Record<string, unknown>) };
     delete snapshot["_meta"];
-    return snapshot;
+    // #683: the auto-clear can synthesize a container that carries NOTHING
+    // but `_meta` bookkeeping (a blocked-attempt memo on a flag that had no
+    // real snapshot to begin with — see bookReimport.ts's withBlockedSha).
+    // Stripped of `_meta`, that is an empty object, not a Door43 snapshot —
+    // and `{}` is truthy, so returning it as-is would render as "Door43 held
+    // nothing" for every real field instead of the true "no snapshot exists"
+    // (door43: null) the UI's `!issue.door43` check relies on to hide the
+    // diff entirely.
+    return Object.keys(snapshot).length > 0 ? snapshot : null;
   } catch {
     return null;
   }

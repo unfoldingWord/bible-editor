@@ -1085,5 +1085,23 @@ t("a _meta key inside review_master_json (PR #665's flag bookkeeping) is strippe
   assert.deepEqual(flag.door43, { note: "door43's note", quote: "door43's quote" }, "real Door43 fields survive, _meta does not");
   assert.equal("_meta" in flag.door43, false, "no bookkeeping key leaks through as a fake Door43 field");
 });
+t("#683: a review_master_json that strips down to nothing but _meta (a blocked-clear-attempt memo on a pre-#653 flag with no real snapshot) reads as door43: null, not {}", () => {
+  // bookReimport.ts's withBlockedSha synthesizes exactly this shape —
+  // `{"_meta":{"clear_blocked_sha":"..."}}` — when it memoizes a blocked
+  // sweep attempt against a row that had review_master_json = NULL to begin
+  // with. {} is truthy, so without this the UI's `!issue.door43` check would
+  // render a diff against an empty Door43 snapshot for every real field
+  // instead of hiding the diff entirely, as it does for a true NULL.
+  const i = lintTnRows([
+    tn({
+      review_kind: "merge_no_base",
+      review_reason: "verify this",
+      review_master_json: JSON.stringify({ _meta: { clear_blocked_sha: "deadbeef" } }),
+    }),
+  ]);
+  const flag = i.find((x) => x.check === "Unmerged Door43 edit — verify");
+  assert.ok(flag);
+  assert.equal(flag.door43, null, "a memo-only snapshot is treated the same as no snapshot at all");
+});
 
 console.log(`\n${passed} lint tests passed`);
