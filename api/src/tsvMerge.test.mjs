@@ -13,6 +13,7 @@
 import {
   classifyTsvRefMove,
   computeTsvMerge,
+  detectTornTsvRef,
   foldTsvBase,
   foldTsvRefBase,
   tsvMergeFields,
@@ -805,6 +806,94 @@ deep(tsvMergeFields("tq"), ["quote", "question", "response"], "tq field list");
   });
   eq(kept.action, "keep_ai_master", "provisional + a lineage with no human: D1 wins the conflict, as it should");
   eq(kept.conflict, true, "…and the row is still flagged for a human");
+}
+
+// ── detectTornTsvRef (issue #672) ────────────────────────────────────────────
+// The self-heal detector: does a row's own ref_raw parse (via refParts) to a
+// chapter/verse that disagrees with its own stored columns?
+
+{
+  deep(detectTornTsvRef("2:3", 2, 3), null, "ref_raw agrees with stored chapter/verse -> not torn");
+  deep(detectTornTsvRef("2:3", 1, 5), { chapter: 2, verse: 3 }, "chapter AND verse disagree -> healed to ref_raw's own parse");
+  deep(detectTornTsvRef("2:3", 2, 9), { chapter: 2, verse: 3 }, "verse alone disagrees -> still healed");
+  deep(detectTornTsvRef("5:1", 1, 1), { chapter: 5, verse: 1 }, "chapter alone disagrees -> still healed");
+  // Verse bridges collapse to their leading verse, exactly like the import
+  // parser (refParts) — a bridge row stored at its own leading verse is not torn.
+  deep(detectTornTsvRef("12:11-12", 12, 11), null, "a verse bridge stored at its leading verse is not torn");
+  deep(detectTornTsvRef("12:11-12", 12, 1), { chapter: 12, verse: 11 }, "…but a real disagreement on a bridge row still heals");
+  // front:intro convention.
+  deep(detectTornTsvRef("front:intro", 0, 0), null, "front:intro at chapter/verse 0 is not torn");
+  deep(detectTornTsvRef("front:intro", 1, 1), { chapter: 0, verse: 0 }, "a front:intro row stranded at a real chapter heals back to 0/0");
+}
+
+// A blank/absent ref_raw must NEVER be treated as torn, even against a
+// non-zero stored chapter/verse. refParts(undefined) === [0, 0] is a parse
+// FALLBACK, not a claim the row belongs at chapter-front — a row that has
+// simply never had its Reference set must not be "healed" into a wrong
+// location. Manufacturing a location is the one direction this heal must
+// never go (worse than leaving a real tear alone).
+{
+  eq(detectTornTsvRef(null, 3, 4), null, "null ref_raw is never torn, whatever chapter/verse hold");
+  eq(detectTornTsvRef(undefined, 3, 4), null, "undefined ref_raw is never torn");
+  eq(detectTornTsvRef("", 3, 4), null, "empty-string ref_raw is never torn");
+  eq(detectTornTsvRef("   ", 3, 4), null, "whitespace-only ref_raw is never torn");
+  // The one case where [0, 0] IS the honest answer: a genuinely blank ref_raw
+  // on a row that is ALSO already at chapter/verse 0/0 stays not-torn too —
+  // covered by the same null-guard, not by falling through to the parse.
+  eq(detectTornTsvRef(null, 0, 0), null, "a blank ref_raw on a chapter/verse-0 row is still not torn");
+}
+
+// ── classifyTsvRefMove: torn-row robustness (issue #672 review gaps) ────────
+// Three shapes noted as untested in the #657 review. classifyTsvRefMove keys
+// attribution on ref_raw ALONE (#547 item 2) — chapter/verse are
+// diagnostics-only there — so none of these should be able to confuse it,
+// even though the D1 side of each is internally torn.
+
+// (a) A torn D1 row (stored chapter disagrees with its own ref_raw) plus a
+// GENUINE master move must still attribute correctly from ref_raw alone. The
+// torn stored chapter (1, though ref_raw says "2:3") must not leak into the
+// comparison.
+{
+  const base = { chapter: 2, verse: 3, ref_raw: "2:3" };
+  eq(
+    classifyTsvRefMove({ chapter: 1, verse: 3, ref_raw: "2:3" }, { chapter: 2, verse: 7, refRaw: "2:7" }, base, false),
+    "theirs_moved",
+    "a torn D1 row (stored chapter 1, ref_raw '2:3') still attributes a real master move correctly",
+  );
+}
+
+// (b) The exact #547 item-3 narrative: an in-app cross-chapter REF retype
+// leaves D1 torn (ref_raw '2:3', chapter/verse stuck at the pre-edit '1:5'),
+// and master has since caught up via export+reimport (its parsed chapter/verse
+// derive from the SAME ref_raw). Pre-#657 this classified as a false
+// "theirs_moved" (chapter/verse compared, and D1's stale chapter/verse
+// disagreed with master's freshly-derived ones) — telling the translator a
+// Door43 editor moved a row she moved herself. Since #657 keys on ref_raw
+// alone, and ref_raw agrees on both sides throughout, it must be 'none'.
+{
+  const base = { chapter: 1, verse: 5, ref_raw: "1:5" };
+  eq(
+    classifyTsvRefMove({ chapter: 1, verse: 5, ref_raw: "2:3" }, { chapter: 2, verse: 3, refRaw: "2:3" }, base, false),
+    "none",
+    "#547 item 3: a torn-but-ref_raw-agreeing row is 'none', never a false theirs_moved",
+  );
+}
+
+// (c) Both sides hold a blank Reference (a row whose ref_raw was never set),
+// while their stored chapter/verse happen to differ. tsvRefMoved compares
+// `(ref_raw ?? "")` on both sides, so "" === "" short-circuits before
+// chapter/verse — which are diagnostics-only here — are ever consulted.
+{
+  eq(
+    classifyTsvRefMove({ chapter: 3, verse: 4, ref_raw: "" }, { chapter: 9, verse: 1, refRaw: "" }, null, false),
+    "none",
+    "both sides blank Reference -> 'none', even though stored chapter/verse differ",
+  );
+  eq(
+    classifyTsvRefMove({ chapter: 3, verse: 4, ref_raw: null }, { chapter: 9, verse: 1, refRaw: null }, null, false),
+    "none",
+    "…same for an explicit null on both sides",
+  );
 }
 
 if (failed) {

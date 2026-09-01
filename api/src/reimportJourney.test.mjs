@@ -2478,6 +2478,104 @@ console.log("\n[#653: the auto-clear retires flags the commit history now dispro
   }
 }
 
+console.log("\n[issue #672: a torn row (ref_raw ahead of its own stored chapter/verse) self-heals]");
+{
+  // The shape rows.ts's cross-chapter REF retype produces: ref_raw already
+  // shows the new reference, but chapter/verse are stuck at the pre-edit
+  // values (that PATCH path deliberately never writes chapter on a
+  // cross-chapter move — see rows.ts). Master has since caught up (the export
+  // publishes ref_raw verbatim), so its incoming row is internally consistent
+  // at the NEW reference with otherwise-identical content — exactly the
+  // post-export state issue #672 describes as "permanent and silent" before
+  // this fix, because #657 keyed classifyTsvRefMove on ref_raw alone and
+  // ref_raw already agrees on both sides.
+  const { sqlite, env } = freshEnv();
+  sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (7, 7007, 'translator')`).run();
+  sqlite
+    .prepare(
+      `INSERT INTO tn_rows (id, book, chapter, verse, ref_raw, note, sort_order, updated_by, version)
+       VALUES ('tn01', ?, 1, 5, '2:3', 'same note', 555, 7, 3)`,
+    )
+    .run(BOOK);
+  const counts = await applyTsvRows(
+    env, BOOK, "tn",
+    [{ id: "tn01", idCoerced: false, refRaw: "2:3", chapter: 2, verse: 3, occurrence: null, tags: null, quote: null, note: "same note", support_reference: null }],
+    null,
+  );
+
+  eq(counts.ref_healed, 1, "the torn row's chapter/verse are healed to match its own ref_raw");
+  // Content already matched master once the tear is healed — a clean no-op,
+  // not a spurious edited/update purely because of the stale chapter/verse.
+  eq(counts.skipped_noop, 1, "no-op once the tear no longer manufactures a phantom difference");
+
+  const stored = sqlite.prepare(`SELECT chapter, verse, ref_raw, sort_order, version FROM tn_rows WHERE id='tn01'`).all()[0];
+  eq(stored.chapter, 2, "stored chapter now matches ref_raw's own chapter");
+  eq(stored.verse, 3, "stored verse now matches ref_raw's own verse");
+  eq(stored.ref_raw, "2:3", "ref_raw itself is untouched — only chapter/verse were corrected");
+  eq(stored.sort_order, 555, "the in-app order is preserved, not reverted to master's file order (heal must not fight the reorder-preservation invariant)");
+  eq(stored.version, 4, "version bumped by the heal write");
+
+  const log = sqlite.prepare(`SELECT action, source, payload_json FROM edit_log WHERE kind='tn' AND row_key='tn01'`).all();
+  eq(log.length, 1, "exactly one edit_log entry — the heal, and nothing else (the row otherwise no-ops)");
+  eq(log[0].action, "update", "logged as an update");
+  const payload = JSON.parse(log[0].payload_json);
+  eq(payload.chapter, 2, "…payload records the healed chapter");
+  eq(payload.verse, 3, "…and verse");
+  eq(payload.reason, "torn_ref_heal", "…tagged so the correction is distinguishable from an ordinary content update");
+}
+
+console.log("\n[issue #672: the heal is independent of the row's content classification]");
+{
+  // Same tear, but this time content ALSO genuinely diverges from master and
+  // there is no watermark (no ancestor) to attribute it — the row should still
+  // be healed AND still fall through to a plain skipped_edited on the content
+  // question, exactly as an untorn edited row would.
+  const { sqlite, env } = freshEnv();
+  sqlite.prepare(`INSERT INTO users (id, dcs_user_id, dcs_username) VALUES (7, 7007, 'translator')`).run();
+  sqlite
+    .prepare(
+      `INSERT INTO tn_rows (id, book, chapter, verse, ref_raw, note, updated_by, version)
+       VALUES ('tn02', ?, 9, 9, '3:1', 'our note', 7, 5)`,
+    )
+    .run(BOOK);
+  const counts = await applyTsvRows(
+    env, BOOK, "tn",
+    [{ id: "tn02", idCoerced: false, refRaw: "3:1", chapter: 3, verse: 1, occurrence: null, tags: null, quote: null, note: "their note", support_reference: null }],
+    null,
+  );
+
+  eq(counts.ref_healed, 1, "still healed — the tear is unconditional, independent of what else diverges");
+  eq(counts.skipped_edited, 1, "content genuinely differs with no ancestor to attribute it — D1's note stands");
+
+  const stored = sqlite.prepare(`SELECT chapter, verse, note, version FROM tn_rows WHERE id='tn02'`).all()[0];
+  eq(stored.chapter, 3, "chapter healed to match ref_raw");
+  eq(stored.verse, 1, "verse healed to match ref_raw");
+  eq(stored.note, "our note", "the human's note is untouched — the heal never touches content");
+  eq(stored.version, 6, "version bumped exactly once, by the heal — the content question wrote nothing");
+
+  const log = sqlite.prepare(`SELECT COUNT(*) AS n FROM edit_log WHERE kind='tn' AND row_key='tn02'`).all()[0];
+  eq(log.n, 1, "only the heal's edit_log entry — the skipped content question logs nothing");
+}
+
+console.log("\n[issue #672: an untorn row (ref_raw already agrees with its own chapter/verse) is left alone]");
+{
+  const { sqlite, env } = freshEnv();
+  sqlite
+    .prepare(
+      `INSERT INTO tq_rows (id, book, chapter, verse, ref_raw, question, response, version)
+       VALUES ('tq01', ?, 3, 1, '3:1', 'q', 'r', 3)`,
+    )
+    .run(BOOK);
+  const counts = await applyTsvRows(
+    env, BOOK, "tq",
+    [{ id: "tq01", idCoerced: false, refRaw: "3:1", chapter: 3, verse: 1, occurrence: null, tags: null, quote: null, question: "q", response: "r" }],
+    null,
+  );
+  eq(counts.ref_healed, 0, "nothing to heal — chapter/verse already match ref_raw");
+  const stored = sqlite.prepare(`SELECT version FROM tq_rows WHERE id='tq01'`).all()[0];
+  eq(stored.version, 3, "no spurious version bump");
+}
+
 if (failed > 0) {
   console.error(`\n${failed} assertion(s) failed`);
   process.exit(1);

@@ -45,6 +45,7 @@
 // it; bookReimport.ts does the batched edit_log read that feeds it).
 
 import { normalizeNoteText } from "./tsvFormat.ts";
+import { refParts } from "./importParsers.ts";
 
 export type TsvMergeKind = "tn" | "tq" | "twl";
 
@@ -213,6 +214,53 @@ export function classifyTsvRefMove(
   // sides, so at least one of them differs from the ancestor too. Fail toward
   // "nobody moved" rather than inventing an attribution.
   return "none";
+}
+
+// ── Torn-row self-heal (issue #672) ─────────────────────────────────────────
+//
+// rows.ts's in-app REF retype deliberately writes `ref_raw` without touching
+// the stored `chapter`/`verse` columns on a CROSS-CHAPTER edit (same-chapter
+// edits re-derive `verse`; chapter is never written by that path at all — see
+// the comment there). That is correct for what rows.ts owns — a cross-chapter
+// move isn't supported by the surrounding machinery (the lock check, WS
+// broadcast, chapter-scoped caches) — but it leaves the row "torn": `ref_raw`
+// already shows the new reference while `chapter`/`verse` still hold the old
+// one. `export.ts` publishes `ref_raw` verbatim, so master eventually catches
+// up; D1's own stored `chapter`/`verse` never do, because nothing else ever
+// writes them either. The row then stays permanently misgrouped — chapter
+// fetch, `changedTsvChapters`, TWL canonical ordering and
+// `masterMayHoldHumanEditForVerse` all key off the stored columns, not
+// `ref_raw` — and, per #547 item 2 / #657, `classifyTsvRefMove` now keys
+// attribution on `ref_raw` alone, so a torn row whose `ref_raw` already agrees
+// with master is invisible to that detector too: nothing flags it, nothing
+// heals it.
+//
+// This is the self-heal: recompute `chapter`/`verse` from the row's own
+// `ref_raw` (via `refParts`, the same parse the import path uses) and report a
+// correction whenever they disagree. Deliberately independent of master's
+// incoming row — this is D1 fixing its OWN bookkeeping to match its OWN
+// `ref_raw`, not a merge decision, so it needs no ancestor and no incoming
+// value.
+//
+// A blank/absent `ref_raw` is NOT torn. `refParts(undefined)` returns `[0, 0]`
+// as a parse fallback, not as a claim that the row belongs at chapter-front —
+// treating that as a correction would relocate a row that has simply never had
+// its Reference set, which is the one direction this heal must never go
+// (manufacturing a wrong location is worse than leaving a real tear alone).
+export interface TornTsvRef {
+  chapter: number;
+  verse: number;
+}
+
+export function detectTornTsvRef(
+  refRaw: string | null | undefined,
+  chapter: number,
+  verse: number,
+): TornTsvRef | null {
+  if (!refRaw || refRaw.trim() === "") return null;
+  const [ch, vs] = refParts(refRaw);
+  if (ch === chapter && vs === verse) return null;
+  return { chapter: ch, verse: vs };
 }
 
 export interface TsvMergeResult {

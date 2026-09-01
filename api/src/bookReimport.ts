@@ -90,6 +90,7 @@ import {
   classifyTsvRefMove,
   tsvRefMoved,
   computeTsvMerge,
+  detectTornTsvRef,
   foldTsvBase,
   foldTsvRefBase,
   type TsvMergeSide,
@@ -457,6 +458,12 @@ export interface ReimportCounts {
   // skipped_edited on a lost CAS), and double-counting it would make this number
   // stop meaning "chips that disappeared for free".
   ref_moved_resolved: number;
+  // A row whose `ref_raw` had already drifted from its own stored `chapter`/
+  // `verse` (issue #672) — an in-app cross-chapter REF retype, which rows.ts
+  // deliberately never writes to `chapter` — got its stored columns rewritten
+  // to match `ref_raw`. Independent of ref_moved_*: this is D1 healing its own
+  // bookkeeping, not an attribution of who moved what against master.
+  ref_healed: number;
   // Human-edited verse that DIFFERS from master but could not be adjudicated
   // at all, because this book+resource has no `master_confirmed_at` watermark
   // yet (migration 0045 adds the column and does not backfill it — only the
@@ -649,6 +656,7 @@ function zeroCounts(): ReimportCounts {
     ref_moved_both: 0,
     ref_moved_unattributable: 0,
     ref_moved_resolved: 0,
+    ref_healed: 0,
     merge_unavailable: 0,
     merge_cosmetic_ignored: 0,
     own_publish_converged: 0,
@@ -887,6 +895,7 @@ function addCounts(into: ReimportCounts, from: ReimportCounts): void {
   into.ref_moved_both += from.ref_moved_both ?? 0;
   into.ref_moved_unattributable += from.ref_moved_unattributable ?? 0;
   into.ref_moved_resolved += from.ref_moved_resolved ?? 0;
+  into.ref_healed += from.ref_healed ?? 0;
   into.merge_unavailable += from.merge_unavailable ?? 0;
   into.merge_cosmetic_ignored += from.merge_cosmetic_ignored ?? 0;
   into.own_publish_converged += from.own_publish_converged ?? 0;
@@ -1617,6 +1626,14 @@ export async function applyTsvRows(
   // (issue #610). A row whose content also diverged still takes the full
   // `updates` write, order included.
   const reorders: Array<{ id: string; sortOrder: number; oldVersion: number }> = [];
+  // Torn rows (issue #672): `ref_raw` parses (via refParts) to a chapter/verse
+  // that disagrees with the row's own stored `chapter`/`verse` columns — an
+  // in-app cross-chapter REF retype, which rows.ts deliberately never writes
+  // to `chapter`. Its own tiny batch: this rewrites ONLY chapter/verse to
+  // match the row's own ref_raw, independent of anything master's incoming
+  // row says, so it can't share a statement with `updates` (which writes
+  // master's content) or `reorders` (which is version-neutral).
+  const refHeals: Array<{ id: string; oldVersion: number; chapter: number; verse: number }> = [];
   // AI-only rows to re-seed from master AND reclaim to master-owned (updated_by
   // → NULL). Written under a relaxed guard (version-CAS + protection re-assert)
   // in their own batch so the pristine UPDATE's `updated_by IS NULL` guard stays
@@ -1802,6 +1819,28 @@ export async function applyTsvRows(
         counts.skipped_edited++;
       }
       continue;
+    }
+    // Torn-row self-heal (issue #672). Reached for every LIVE row (the
+    // tombstone branch above always `continue`s), independent of this row's
+    // reimport fate below — a row can be torn whether it turns out noop,
+    // edited, or an ordinary update. Detected and (if torn) corrected against
+    // the row's OWN ref_raw, never against master's incoming row: this is D1
+    // fixing its own bookkeeping, not a merge decision. Patch `cur` in place
+    // so every classification below (tsvRowSignature, isReimportableRow,
+    // classifyTsvRefMove) sees the now-consistent chapter/verse rather than
+    // the stale ones, and bump `cur.version` to match the write queued below —
+    // safe because that write is always the first one to touch this row in
+    // this pass (nothing above this point wrote to it).
+    const torn = detectTornTsvRef(
+      (cur.ref_raw as string | null) ?? null,
+      Number(cur.chapter),
+      Number(cur.verse),
+    );
+    if (torn) {
+      refHeals.push({ id: row.id, oldVersion: Number(cur.version), chapter: torn.chapter, verse: torn.verse });
+      cur.chapter = torn.chapter;
+      cur.verse = torn.verse;
+      cur.version = Number(cur.version) + 1;
     }
     // Classify content vs sort_order independently. A divergent sort_order on a
     // content-identical tn/twl row that already carries an order is a local
@@ -2450,6 +2489,54 @@ export async function applyTsvRows(
       });
     } catch (e) {
       counts.errors.push(`${kind} reorder batch: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+
+  // Batch the torn-row heals (issue #672): rewrite ONLY chapter/verse to match
+  // the row's own ref_raw, with an edit_log entry so the correction is
+  // auditable. No protection predicate (preserve/hint/trashed) — this never
+  // touches content or ownership, only the row's own internal bookkeeping, so
+  // a protected row is healed exactly like any other. `deleted_at IS NULL`
+  // re-asserted (a concurrent delete between the read and this batch loses the
+  // CAS, same as everywhere else here) and version-CAS guards a concurrent
+  // content edit; either 0-changes and the row is left for next run.
+  for (let i = 0; i < refHeals.length; i += WRITE_BATCH) {
+    const slice = refHeals.slice(i, i + WRITE_BATCH);
+    try {
+      const results = await env.DB.batch(
+        slice.map((h) =>
+          env.DB.prepare(
+            `UPDATE ${TSV_TABLE[kind]} SET chapter = ?1, verse = ?2, version = ?3, updated_at = ?4
+               WHERE id = ?5 AND book = ?6 AND deleted_at IS NULL AND version = ?7`,
+          ).bind(h.chapter, h.verse, h.oldVersion + 1, now, h.id, book, h.oldVersion),
+        ),
+      );
+      const logs: D1PreparedStatement[] = [];
+      slice.forEach((h, j) => {
+        if ((results[j]?.meta.changes ?? 0) > 0) {
+          counts.ref_healed++;
+          console.log("reimport: healed a torn row's stored chapter/verse to match its own ref_raw", {
+            book,
+            kind,
+            id: h.id,
+            chapter: h.chapter,
+            verse: h.verse,
+          });
+          logs.push(
+            logEditStmt(env, kind, h.id, book, userId, h.oldVersion, h.oldVersion + 1, "update", {
+              chapter: h.chapter,
+              verse: h.verse,
+              reason: "torn_ref_heal",
+            }),
+          );
+        }
+        // A lost CAS here just means the row is left torn until the next run
+        // re-detects it — no counter, matching how a lost-race reorder/update
+        // silently retries rather than being reported as a failure.
+      });
+      if (logs.length) await env.DB.batch(logs);
+    } catch (e) {
+      counts.errors.push(`${kind} ref-heal batch: ${e instanceof Error ? e.message : String(e)}`);
     }
   }
 
