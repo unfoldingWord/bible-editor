@@ -349,19 +349,38 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       //        subtract the run's own book list.
       //
       //        Its own step.do, at the same altitude as "locked-books" below:
-      //        one retryable unit with its own subrequest budget rather than
-      //        spending a book's, and once per run rather than per book. Placed
-      //        inside the dcsAllowed / reimportOnly guard (it walks Door43 and
-      //        writes D1, so a dry run must not reach it) and before the
-      //        reimportOnly return, so the 08:00 self-heal sweeps too.
+      //        one retryable unit, and once per run rather than per book. (Its
+      //        cost is small either way — a handful of D1 reads and at most
+      //        ~60 Gitea fetches; whether a step.do gets a fresh subrequest
+      //        budget is not something this repo has verified.)
+      //
+      //        TWO GATES beyond the enclosing one, both narrowing:
+      //
+      //        `!params.dryDcs` — the enclosing `dcsAllowed || reimportOnly`
+      //        lets a dryDcs + reimportOnly run through, and dryDcs means "do
+      //        not touch Door43 or push anything live". The sweep both walks
+      //        Door43 and writes D1, so it must not run there (Codex F6).
+      //
+      //        FULL NIGHTLY ONLY — no `book`, no `resource`, no `resources`.
+      //        The sweep's whole point is to reach pairs the run did NOT visit,
+      //        so under a scoped admin run ("Pull from Door43" for one book) it
+      //        would clear flags on up to ten unrelated pairs the operator
+      //        never asked about (Codex F7). Both crons (05:30 export, 08:00
+      //        self-heal) are unscoped and so both sweep; with the CAP-per-day
+      //        rotation stride they land on the same day's slice, and the memo
+      //        makes the second pass cheap — waste, not harm.
+      //
       //        try/catch because a warning that failed to clear is not a reason
       //        to abandon the export that follows.
-      try {
-        await step.do("sweep-stale-review-flags", async () => sweepStaleMergeNoBase(this.env));
-      } catch (e) {
-        console.error("export stale review-flag sweep failed", {
-          error: e instanceof Error ? e.message : String(e),
-        });
+      const sweepScopeIsFullNightly = !params.book && !params.resource && !params.resources?.length;
+      if (!params.dryDcs && sweepScopeIsFullNightly) {
+        try {
+          await step.do("sweep-stale-review-flags", async () => sweepStaleMergeNoBase(this.env));
+        } catch (e) {
+          console.error("export stale review-flag sweep failed", {
+            error: e instanceof Error ? e.message : String(e),
+          });
+        }
       }
     }
 
