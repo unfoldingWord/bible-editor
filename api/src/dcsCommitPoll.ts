@@ -60,6 +60,13 @@ export const DCS_POLL_INTERVAL_SECONDS = 30 * 60;
 export const DCS_POLL_PAGE_LIMIT = 4;
 /** Defensive row cap per repo per poll, independent of the page math above. */
 export const DCS_POLL_COMMIT_CAP = 200;
+/**
+ * Statements per env.DB.batch() write. D1 caps a batch at 100 statements —
+ * same constraint, same reason, as bookImport.ts's CHUNK (80) and
+ * bookReimport.ts's WRITE_BATCH (90). 80 leaves room for the poll-state upsert
+ * that rides in the final chunk (81 worst case) and stays clear of the cap.
+ */
+export const DCS_POLL_WRITE_BATCH = 80;
 /** How far back a never-polled repo is seeded. */
 export const DCS_POLL_BOOTSTRAP_SECONDS = 30 * 86400;
 /**
@@ -230,9 +237,21 @@ export async function pollDcsRepo(env: Env, repo: string, nowSeconds: number): P
       ? (sinceSha ?? rows[rows.length - 1]?.sha ?? null)
       : null;
 
-  // One batch: D1 runs a batch sequentially in a single transaction, so a
-  // half-written page can't leave the mark claiming coverage it doesn't have.
-  const statements = rows.map((r) =>
+  // CHUNKED, because D1 caps a batch at 100 statements (documented at
+  // bookImport.ts's CHUNK and bookReimport.ts's WRITE_BATCH). A single batch of
+  // every insert plus the poll upsert would be up to 201 statements and would
+  // fail ATOMICALLY on the most important path there is — the bootstrap poll,
+  // which is 4 pages × 50 by design. Nothing would be ingested, the watermark
+  // would never advance, and every following tick would repeat the same failure
+  // forever. Caught in review of #685 before it shipped; the mock D1 in the
+  // tests now enforces the cap so the next version of this mistake fails loudly.
+  //
+  // OLDEST-FIRST. `rows` is newest-first (the walk order); inserts go out in
+  // reverse, so whatever lands before a mid-poll failure is a CONTIGUOUS run
+  // upward from the existing high-water mark, never an island below the tip
+  // with a hole under it.
+  const ordered = [...rows].reverse();
+  const insertStatements = ordered.map((r) =>
     env.DB.prepare(INSERT_COMMIT_SQL).bind(
       r.repo,
       r.sha,
@@ -247,19 +266,34 @@ export async function pollDcsRepo(env: Env, repo: string, nowSeconds: number): P
       nowSeconds,
     ),
   );
-  statements.push(
-    env.DB.prepare(UPSERT_POLL_SQL).bind(
-      repo,
-      advance ? (tip?.sha ?? null) : null,
-      advance ? (tip?.committedAt ?? null) : null,
-      nowSeconds,
-      page.incomplete && !advance ? null : nowSeconds,
-      status,
-      gapSince,
-      gapSince ? nowSeconds : null,
-    ),
+  const pollStatement = env.DB.prepare(UPSERT_POLL_SQL).bind(
+    repo,
+    advance ? (tip?.sha ?? null) : null,
+    advance ? (tip?.committedAt ?? null) : null,
+    nowSeconds,
+    page.incomplete && !advance ? null : nowSeconds,
+    status,
+    gapSince,
+    gapSince ? nowSeconds : null,
   );
-  await env.DB.batch(statements);
+
+  // The poll upsert rides in the LAST chunk, so the watermark can only advance
+  // in the same transaction that finishes the ingest. An earlier chunk failing
+  // therefore leaves the mark where it was, and the next interval re-walks the
+  // same range — safe, because every insert is ON CONFLICT DO NOTHING, so a
+  // re-walk re-inserts what is missing and leaves what landed untouched. The
+  // alternative (stamping a watermark per chunk) would need its own partial
+  // status vocabulary to earn nothing: a chunk failing here means D1 is
+  // erroring, and re-walking is the right answer to that anyway.
+  const chunks: (typeof pollStatement)[][] = [];
+  for (let i = 0; i < insertStatements.length; i += DCS_POLL_WRITE_BATCH) {
+    chunks.push(insertStatements.slice(i, i + DCS_POLL_WRITE_BATCH));
+  }
+  if (chunks.length === 0) chunks.push([]);
+  chunks[chunks.length - 1].push(pollStatement);
+  for (const chunk of chunks) {
+    await env.DB.batch(chunk);
+  }
 
   return {
     repo,

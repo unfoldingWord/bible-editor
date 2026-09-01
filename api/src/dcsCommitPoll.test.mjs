@@ -20,6 +20,7 @@
 import {
   DCS_POLL_INTERVAL_SECONDS,
   DCS_POLL_PAGE_LIMIT,
+  DCS_POLL_WRITE_BATCH,
   advancesDespiteIncomplete,
   ledgerRowsFromCommits,
   pollBounds,
@@ -89,8 +90,17 @@ function fullPage(prefix) {
 
 // ── mock D1 ──────────────────────────────────────────────────────────────────
 // Records every statement. `stateRow` is what the poll-state SELECT returns.
+// D1's REAL limit, enforced here on purpose. The first version of this poller
+// pushed up to 201 statements (200 inserts + the poll upsert) into ONE batch,
+// and this mock happily accepted it — so the tests passed while the bootstrap
+// path was guaranteed to fail atomically in production. A mock that does not
+// enforce the constraints of the thing it stands in for is not a test.
+// Documented at bookImport.ts's CHUNK and bookReimport.ts's WRITE_BATCH.
+const D1_MAX_BATCH_STATEMENTS = 100;
+
 function mockDb(stateRow) {
   const executed = [];
+  const batchSizes = [];
   const stmt = (sql) => ({
     sql,
     args: null,
@@ -106,10 +116,16 @@ function mockDb(stateRow) {
   });
   return {
     executed,
+    batchSizes,
     prepare(sql) {
       return stmt(sql);
     },
     async batch(list) {
+      if (list.length > D1_MAX_BATCH_STATEMENTS) {
+        // What D1 does: the whole batch fails, so nothing in it persists.
+        throw new Error(`D1_ERROR: too many statements in batch (${list.length} > ${D1_MAX_BATCH_STATEMENTS})`);
+      }
+      batchSizes.push(list.length);
       for (const s of list) executed.push({ sql: s.sql, args: s.args });
       return list.map(() => ({ success: true }));
     },
@@ -228,6 +244,46 @@ async function main() {
       "page_cap and a force-pushed mark both advance");
     assert(!advancesDespiteIncomplete("fetch_failed") && !advancesDespiteIncomplete("http_502"),
       "transport failures do NOT advance");
+  }
+
+  // ── a full 200-commit poll ingests COMPLETELY, in chunks under D1's cap ──
+  // This is the bootstrap path (4 pages × 50), and the first version of the
+  // poller sent all 201 statements in one batch — over D1's 100-statement cap,
+  // so the whole thing failed atomically: no rows, no watermark, and every
+  // later tick repeating it. The mock now throws exactly as D1 would, so this
+  // test fails if anyone re-collapses the chunking.
+  {
+    const pages = [fullPage("a"), fullPage("b"), fullPage("c"), fullPage("d"), fullPage("e")];
+    mockGitea(pages);
+    const db = mockDb({ repo: "en_tn", last_sha: null, last_attempted_at: null });
+    const res = await pollDcsRepo({ DB: db, DCS_BASE_URL: "https://example.test" }, "en_tn", NOW);
+
+    assert(res.inserted === 200, "a 200-commit bootstrap poll ingests all 200 rows");
+    assert(inserts(db).length === 200, "  ...every one of them actually reaching D1");
+    assert(
+      db.batchSizes.every((n) => n <= 100),
+      `  ...with no batch over D1's 100-statement cap (sizes: ${db.batchSizes.join(",")})`,
+    );
+    assert(
+      db.batchSizes.length === Math.ceil(200 / DCS_POLL_WRITE_BATCH) &&
+        db.batchSizes[0] === DCS_POLL_WRITE_BATCH,
+      `  ...chunked at DCS_POLL_WRITE_BATCH=${DCS_POLL_WRITE_BATCH}`,
+    );
+    assert(
+      db.batchSizes.reduce((a, b) => a + b, 0) === 201,
+      "  ...201 statements total: 200 inserts plus exactly one poll upsert",
+    );
+
+    const ins = inserts(db);
+    assert(
+      ins[0].args[1] === "d49" && ins[ins.length - 1].args[1] === "a0",
+      "inserts go out OLDEST-first, so a mid-poll failure leaves a contiguous run above the old mark",
+    );
+    assert(
+      db.executed[db.executed.length - 1].sql.includes("dcs_repo_polls"),
+      "the poll upsert is the LAST statement — the watermark cannot advance before the ingest finishes",
+    );
+    assert(pollUpsert(db).args[1] === "a0", "  ...and it advances the mark to the tip, not to the oldest row");
   }
 
   // ── transport failure: keep what arrived, do not move the mark ───────────
