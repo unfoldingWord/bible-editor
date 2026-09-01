@@ -59,6 +59,11 @@ const parseSnap = (s) => {
   }
 };
 
+// #684: displayAuthor wraps every Door43 author name in bidi isolates
+// (FSI…PDI) before interpolating it — an RTL name would otherwise reorder the
+// date and sha that follow it. Expectations below go through this helper.
+const ISO_NAME = (name) => `\u2068${name}\u2069`;
+
 // ── Lineage fixtures (#653) ────────────────────────────────────────────────
 // Compacted summaries, exactly the shape compactLineage produces and the shape
 // that rides a Workflow step's return value into applyTsvRows.
@@ -1049,6 +1054,69 @@ console.log("\n[AI-vs-human conflict policy at the caller]");
     eq(counts.merge_adopted, 1, "…counted as an adoption");
     eq(counts.merge_kept_ai, 0, "…and not as a kept AI conflict");
     eq(row.review_reason.includes("was merged over your app-side change"), true, "…with the pre-existing wording");
+    // #684: HAS_HUMAN is the pre-#684 shape (shas, no identity), so the message
+    // is byte-identical to what it was before this shipped.
+    eq(row.review_reason.includes("Door43 edits to this file:"), false, "…and, with no identity measured, names nobody");
+  }
+
+  // 3b. #684: the same collision with identity in the lineage. Same winner,
+  //     same counts, same flag — the message now says who moved the file.
+  {
+    const { sqlite, env } = freshEnv();
+    const boundary = seedContested(sqlite);
+    const counts = await applyTsvRows(env, BOOK, "tq", [masterRowAt("a maintainer's fix")], null, {
+      confirmedAt: 200,
+      editId: boundary,
+      lineage: {
+        ...HAS_HUMAN,
+        humanCommits: [{ sha: "b39f0c72aa18", author: "Stephen Wunrow", date: "2026-08-14T09:05:41Z" }],
+      },
+    });
+    const row = readRow(sqlite);
+    eq(row.response, "a maintainer's fix", "master still wins — presentation only, no decision moved");
+    eq(counts.merge_adopted, 1, "…still counted as an adoption");
+    eq(counts.merge_kept_ai, 0, "…and not as a kept AI conflict");
+    eq(row.review_kind, "merge_conflict", "…flagged the same way");
+    eq(
+      row.review_reason.startsWith("A Door43 edit to this row's response was merged over your app-side change."),
+      true,
+      "…the outcome still leads (the chip clamps to two lines)",
+    );
+    eq(
+      row.review_reason.includes(`Door43 edits to this file: ${ISO_NAME('Stephen Wunrow')} on 2026-08-14 (b39f0c7).`),
+      true,
+      "…with the who/when appended, scoped to the file because that is what the walk measured",
+    );
+
+    // COLD REVIEW F1 at THIS site, which is the one whose dedup guard compares
+    // reason text (bookReimport.ts: stripHumanCommitEvidence on both sides).
+    // The translator re-edits the row, so tonight's run re-detects the very same
+    // both-changed finding — but the window now holds one more human commit, so
+    // the clause renders differently. The reason must NOT be rewritten: the
+    // finding did not change, and only the identity drifted.
+    //
+    // ABLATION: replace the guard with the pre-fix `cur.review_reason !== reason`
+    // and this assertion fails (the reason is rewritten to name Richard Mahn).
+    sqlite.prepare(`UPDATE tq_rows SET response = 'our response', version = 5 WHERE id='ai01'`).run();
+    const reasonBefore = readRow(sqlite).review_reason;
+    await applyTsvRows(env, BOOK, "tq", [masterRowAt("a maintainer's fix")], null, {
+      confirmedAt: 200,
+      editId: boundary,
+      lineage: {
+        ...HAS_HUMAN,
+        counts: { ours: 1, ai: 0, human: 2 },
+        humanShas: ["c41d0e99aa71", "b39f0c72aa18"],
+        humanCommits: [
+          { sha: "c41d0e99aa71", author: "Richard Mahn", date: "2026-08-17T11:31:02Z" },
+          { sha: "b39f0c72aa18", author: "Stephen Wunrow", date: "2026-08-14T09:05:41Z" },
+        ],
+      },
+    });
+    const reRun = readRow(sqlite);
+    eq(reRun.response, "a maintainer's fix", "the re-detected conflict still resolves master-wins");
+    eq(reRun.review_kind, "merge_conflict", "…still flagged the same way");
+    eq(reRun.review_reason, reasonBefore, "…and the reason is NOT rewritten for identity drift alone");
+    eq(reRun.review_reason.includes(ISO_NAME("Richard Mahn")), false, "…so no churn from the newly measured commit");
   }
 
   // 4. No lineage at all — the field an in-flight Workflow's memoized plan does
@@ -2080,6 +2148,102 @@ console.log("\n[#653: with NO ancestor at all, the mint is gated on the measured
       ["question", "ref_raw", "response", "tags"],
       "…and the snapshot carries exactly the fields the review feed reads for tq",
     );
+    // #684 BACKWARD COMPAT, at the real call site. HUMAN_LINEAGE is the
+    // PRE-#684 shape — humanShas, no identity — which is exactly what
+    // master_lineage_json holds for every pair last walked before this shipped.
+    // The message must be the one that shipped before, with nobody named.
+    eq(
+      row.review_reason.includes("Door43 edits to this file:"),
+      false,
+      "…and a pre-#684 lineage names nobody: the wording is byte-identical to before #684",
+    );
+  }
+
+  // 2b. #684: the SAME run, with the identity #684 added to the lineage. Same
+  //     decision, same flag, same counts — the reason text now says WHO and
+  //     WHEN. The editor report this fixes: "a cryptic message that says
+  //     something moved and we don't know what's going on."
+  {
+    const namedLineage = {
+      ...HUMAN_LINEAGE,
+      humanCommits: [
+        { sha: "7d1c9ab4e05f", author: "justplainjane47", date: "2026-08-15T14:22:07Z" },
+      ],
+    };
+    const { sqlite, env } = freshEnv();
+    seed(sqlite);
+    const counts = await applyTsvRows(env, BOOK, "tq", master(), null, {
+      confirmedAt: 200, editId: null, lineage: namedLineage,
+    });
+    const row = sqlite.prepare(`SELECT review_kind, review_reason, version FROM tq_rows WHERE id='nb99'`).all()[0];
+    // DECISIONS FIRST, and identical to case 2's: this is presentation only.
+    eq(counts.merge_no_base, 1, "the merge outcome is unchanged by carrying identity");
+    eq(counts.merge_no_base_mint_skipped, 0, "…the mint gate is unchanged");
+    eq(row.review_kind, "merge_no_base", "…the same flag is raised");
+    eq(row.version, 2, "…with the same single flag write");
+    eq(
+      row.review_reason.includes("a Door43 editor changed this file"),
+      true,
+      "…and the measured cause still leads",
+    );
+    eq(
+      row.review_reason.includes(`Door43 edits to this file: ${ISO_NAME('justplainjane47')} on 2026-08-15 (7d1c9ab).`),
+      true,
+      "…now naming the person, the day and the commit — the ISA 2026-08-15 flags' real cause",
+    );
+    // Outcome and remedy stay in front of the identity: the cleanup chip clamps
+    // to two lines (BookLintIndicator), so the who/when must not displace them.
+    eq(
+      row.review_reason.startsWith("Nothing was overwritten. Check this row against Door43's version"),
+      true,
+      "…with the outcome and the remedy still leading the message",
+    );
+    eq(
+      row.review_reason.indexOf("Door43 edits to this file:") > row.review_reason.indexOf("could not tell which side"),
+      true,
+      "…and the who/when placed last, after the cause",
+    );
+  }
+
+  // 2c. COLD REVIEW F1, the churn rule: "versions don't bump unless something
+  //     actually changed". A standing flag is re-examined every night, and the
+  //     identity clause drifts on its own — a new Door43 commit lands, or the
+  //     watermark the walk is bounded by advances. That drift must not rewrite
+  //     the flag or bump the row's version, because a version bump on a row
+  //     nobody touched 409s the outbox op of any tab holding it.
+  {
+    const { sqlite, env } = freshEnv();
+    seed(sqlite);
+    const night1 = {
+      ...HUMAN_LINEAGE,
+      humanCommits: [{ sha: "7d1c9ab4e05f", author: "justplainjane47", date: "2026-08-15T14:22:07Z" }],
+    };
+    // The next night: one MORE human commit in the window, by someone else, so
+    // the clause this run would render is different text for the same finding.
+    const night2 = {
+      ...HUMAN_LINEAGE,
+      counts: { ours: 1, ai: 1, human: 2 },
+      humanShas: ["b39f0c72aa18", "7d1c9ab4e05f"],
+      humanCommits: [
+        { sha: "b39f0c72aa18", author: "Stephen Wunrow", date: "2026-08-16T09:05:41Z" },
+        { sha: "7d1c9ab4e05f", author: "justplainjane47", date: "2026-08-15T14:22:07Z" },
+      ],
+    };
+    await applyTsvRows(env, BOOK, "tq", master(), null, { confirmedAt: 200, editId: null, lineage: night1 });
+    const after1 = sqlite.prepare(`SELECT review_reason, review_master_json, version FROM tq_rows WHERE id='nb99'`).all()[0];
+    eq(after1.version, 2, "night one mints the flag: one version bump");
+    eq(after1.review_reason.includes(ISO_NAME("justplainjane47")), true, "…naming the commit it measured");
+
+    await applyTsvRows(env, BOOK, "tq", master(), null, { confirmedAt: 200, editId: null, lineage: night2 });
+    const after2 = sqlite.prepare(`SELECT review_reason, review_master_json, version FROM tq_rows WHERE id='nb99'`).all()[0];
+    eq(after2.version, 2, "night two, with a DIFFERENT set of commits measured, does not bump the version");
+    eq(after2.review_reason, after1.review_reason, "…and does not rewrite the reason");
+    eq(after2.review_master_json, after1.review_master_json, "…nor the Door43 snapshot beside it");
+    eq(
+      after2.review_reason.includes(ISO_NAME("Stephen Wunrow")),
+      false,
+      "…so the flag keeps the identity measured when the finding was made, and the row is never touched",
+    );
   }
 
   // 3. INCOMPLETE walk -> mint, and the message says so instead of naming an editor.
@@ -2093,6 +2257,35 @@ console.log("\n[#653: with NO ancestor at all, the mint is gated on the measured
     eq(row.review_kind, "merge_no_base", "an incomplete walk still mints — absent is not 'no human'");
     eq(row.review_reason.includes("could not be read in full"), true, "…and says the history could not be read");
     eq(row.review_reason.includes("a Door43 editor changed this file"), false, "…and claims no editor it never saw");
+    eq(row.review_reason.includes("Door43 edits to this file:"), false, "…and names nobody (#684)");
+  }
+
+  // 3c. #684: an incomplete walk that DID see human commits, carrying their
+  //     identity. Naming them would be the exact mistake this repo has a
+  //     standing rule about — the walk has not established that a human moved
+  //     this file, so the message stays the could-not-verify one, unchanged.
+  {
+    const { sqlite, env } = freshEnv();
+    seed(sqlite);
+    await applyTsvRows(env, BOOK, "tq", master(), null, {
+      confirmedAt: 200,
+      editId: null,
+      lineage: {
+        ...INCOMPLETE_LINEAGE,
+        hasHumanCommit: true,
+        counts: { ours: 1, ai: 1, human: 1 },
+        humanShas: ["7d1c9ab4e05f"],
+        humanCommits: [{ sha: "7d1c9ab4e05f", author: "justplainjane47", date: "2026-08-15T14:22:07Z" }],
+      },
+    });
+    const row = sqlite.prepare(`SELECT review_kind, review_reason FROM tq_rows WHERE id='nb99'`).all()[0];
+    eq(row.review_kind, "merge_no_base", "an incomplete walk still mints");
+    eq(row.review_reason.includes("could not be read in full"), true, "…with the could-not-verify wording");
+    eq(
+      row.review_reason.includes("justplainjane47"),
+      false,
+      "…and names nobody: an incomplete walk has not established the cause it would be naming",
+    );
   }
 
   // 3b. A human commit the per-ref narrowing places in OTHER verses still

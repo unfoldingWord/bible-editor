@@ -58,6 +58,8 @@ import {
   compactLineage,
   LINEAGE_EVIDENCE_CAP,
   LINEAGE_REFINE_MAX_HUMAN_COMMITS,
+  humanCommitEvidenceClause,
+  stripHumanCommitEvidence,
   masterMayHoldHumanEdit,
   masterMayHoldHumanEditForVerse,
   summarizeLineage,
@@ -2032,6 +2034,14 @@ export async function applyTsvRows(
             // (the standing alert-wording rule). Outcome and remedy lead, because
             // the cleanup chip clamps this to two lines (BookLintIndicator).
             const lin = cutoff?.lineage;
+            // #684: WHO and WHEN, for the one variant that measured a human
+            // commit. Empty for every other case — no lineage, an incomplete
+            // walk, no human found, or a snapshot persisted before #684 carried
+            // identity — and an empty string leaves the wording exactly as it
+            // was (see describeHumanCommits). File-scoped, because that is the
+            // scope of the walk: these commits touched this book's file, which
+            // is the same evidence the mint gate itself reads.
+            const who = humanCommitEvidenceClause(lin);
             //
             // Every variant says HUMAN, because that is the predicate both the
             // gate above and the auto-clear actually measure: an AI/bot commit
@@ -2052,7 +2062,7 @@ export async function applyTsvRows(
                     "be ruled out."
                 : lin.incomplete === false && lin.hasHumanCommit === true
                   ? opening + "a Door43 editor changed this file since the last confirmed publish, so the sync " +
-                      "could not tell which side changed it."
+                      "could not tell which side changed it." + who
                   : opening + "Door43's history for this file could not be read in full, so a human Door43 " +
                       "edit cannot be ruled out.";
             // The snapshot carries the window this flag is ABOUT (see
@@ -2348,6 +2358,12 @@ export async function applyTsvRows(
         // lines (BookLintIndicator), so a reader who sees only the opening must
         // still learn which way it went and what to do about it.
         const kindLabel = kind.toUpperCase();
+        // #684. Only the master-wins branch below uses it: the KEPT branch's
+        // whole measured claim is that NO Door43 editor's commit was found, so
+        // there is nobody to name there. Empty whenever identity was not
+        // measured (absent lineage, incomplete walk, pre-#684 snapshot), which
+        // leaves both messages byte-identical to what they were.
+        const whoConflict = humanCommitEvidenceClause(cutoff?.lineage);
         const reason = keptAiConflict
           ? `Your ${labels.join(" and ")} was kept over Door43's, and the next export that runs for this ` +
             `file writes it to Door43. If Door43's version is the one you want, put it in here first. ` +
@@ -2358,12 +2374,39 @@ export async function applyTsvRows(
             // on its own. Saying only the first would misdescribe the row.
             (adopted ? ` Door43's changes to this row's other fields were taken.` : "")
           : `A Door43 edit to this row's ${labels.join(" and ")} was merged over your app-side change. ` +
-            `Please double-check it.`;
+            `Please double-check it.` +
+            // File-scoped, and said so: the walk sees commits to this book's
+            // file, not to this row. Naming them as this row's own edit would
+            // be a claim the measurement does not make.
+            whoConflict;
         // Distinct review_kind, not just distinct prose: the cleanup chip titles
         // itself from this column, and "Merged Door43 edit" over a row whose
         // edit was KEPT is the reverse of what happened (see reviewFlagTitle).
         const reviewKind = keptAiConflict ? "merge_kept" : "merge_conflict";
-        if (cur.review_kind !== reviewKind || cur.review_reason !== reason) {
+        // The dedup guard compares the reason WITHOUT its #684 identity clause,
+        // on both sides (cold review F1).
+        //
+        // The clause names commits, and which commits it names drifts on its own
+        // — a new Door43 commit lands, or the watermark the walk is bounded by
+        // advances, and the same finding renders different text. Compared whole,
+        // that drift reads as "the message changed" on a row whose finding did
+        // not change, and this branch would then rewrite review_reason and
+        // review_master_json. Every write here bumps the row's version, and a
+        // version bump on a row nobody touched 409s the outbox op of any tab
+        // holding it (the standing rule: versions don't bump unless something
+        // actually changed, #539). Stripping the clause from both sides makes
+        // this decision byte-identical to its pre-#684 behavior for any base
+        // reason that matches, whatever the identity is doing.
+        //
+        // A row with NO flag yet compares "" against the base reason, so a mint
+        // still writes the full text WITH the identity — which is the whole
+        // point of #684. Only a re-examination of an already-correct flag is
+        // suppressed, and the identity it keeps is the one measured when the
+        // finding was first made, which is the honest one for that finding.
+        const sameFinding =
+          cur.review_kind === reviewKind &&
+          stripHumanCommitEvidence(cur.review_reason) === stripHumanCommitEvidence(reason);
+        if (!sameFinding) {
           fields.review_kind = reviewKind;
           fields.review_reason = reason;
           // #653: master's own values for the row, so "your value was kept over
@@ -3732,6 +3775,9 @@ async function loadMasterLineage(
     incomplete: summary.incomplete,
     incompleteReason: summary.incompleteReason,
     humanShas: summary.humanShas,
+    // #684: the identity behind those shas, so a nightly tail shows WHO moved
+    // master and not only that somebody did.
+    humanCommits: summary.humanCommits,
     // #557. `refsComplete: false` is not a failure to report as one — it is the
     // file-level answer standing, which is what shipped before. `refsReason`
     // names which of the two it is. The refs themselves are truncated here (the
