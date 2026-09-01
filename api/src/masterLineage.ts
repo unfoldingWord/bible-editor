@@ -174,9 +174,12 @@ export interface MasterCommit {
   message: string | null;
   /** commit.author.email from Gitea. Null when absent. */
   authorEmail: string | null;
-  /** commit.author.name from Gitea. Diagnostic only — never classified on. */
+  /**
+   * commit.author.name from Gitea. Never classified on — but DISPLAYED since
+   * #684 (see LineageHumanCommit), so it is no longer diagnostic-only.
+   */
   authorName?: string | null;
-  /** commit.author.date, ISO-8601. Diagnostic only. */
+  /** commit.author.date, ISO-8601. Never classified on; displayed as a day (#684). */
   date?: string | null;
 }
 
@@ -474,6 +477,89 @@ export function summarizeLineage(
 // value, so it must stay small.
 export const LINEAGE_EVIDENCE_CAP = 5;
 
+// One human commit's identity, as Door43 reported it (#684).
+//
+// THE BRACKET TRAP, stated here because this is the shape a display reads. The
+// bot pushes on a named human's behalf with that person's username in the
+// SUBJECT (`ULT: EZK 38 [pjoakes]`). `author` is the commit's own author field
+// and nothing else — never the bracket. classifyMasterCommit already decides on
+// the author, so a display that parsed the subject instead could name a person
+// on a commit the classifier called `ai`, i.e. show identity for a commit whose
+// content the system deliberately does not protect.
+export interface LineageHumanCommit {
+  sha: string;
+  /** commit.author.name. Null when Gitea reported none. */
+  author: string | null;
+  /** The ISO DAY of commit.author.date ("2026-08-15"). Null when absent or unparseable. */
+  date: string | null;
+}
+
+// How many commits a user-facing message will NAME. The chip and the alert
+// clamp to about two lines, so this is a display budget, not an evidence one —
+// the summary still carries up to LINEAGE_EVIDENCE_CAP, and `counts.human` is
+// the authoritative total, which is what the "+N more" tail is computed from.
+export const LINEAGE_NAMED_COMMITS_MAX = 3;
+
+// Just the day. A full ISO timestamp reads as machine output in a sentence a
+// translator has to act on, and the hour was never the useful part.
+function isoDay(date: string | null | undefined): string | null {
+  const m = /^(\d{4}-\d{2}-\d{2})/.exec((date ?? "").trim());
+  return m ? m[1] : null;
+}
+
+/**
+ * "justplainjane47 on 2026-08-15 (a1b2c3d)" for the human commits a lineage
+ * MEASURED — or `""` when it measured none it can name (#684).
+ *
+ * Empty is the honest answer in every one of these cases, and each maps to a
+ * caller keeping the wording it had before this existed:
+ *   - no lineage at all (nobody walked master's history)
+ *   - an INCOMPLETE walk (the standing rule: state only measured causes — an
+ *     unfinished walk has not established who, or even that anyone, moved it)
+ *   - a complete walk that found no human commit
+ *   - a summary persisted before #684, which carries `humanShas` but no
+ *     identity: something moved master, and we cannot say who from this record
+ *
+ * Accepts either lineage shape. Pure — no fetch, no D1.
+ */
+export function describeHumanCommits(
+  lineage: MasterLineage | MasterLineageSummary | null | undefined,
+  max: number = LINEAGE_NAMED_COMMITS_MAX,
+): string {
+  if (lineage == null) return "";
+  if (lineage.incomplete !== false) return "";
+  if (lineage.hasHumanCommit !== true) return "";
+  let entries: LineageHumanCommit[];
+  let total: number;
+  if ("commits" in lineage) {
+    const humans = lineage.commits.filter((c) => c.kind === "human");
+    total = humans.length;
+    entries = humans.map((c) => ({ sha: c.sha, author: c.authorName ?? null, date: isoDay(c.date) }));
+  } else {
+    // The compacted form. `humanCommits` absent = pre-#684 snapshot.
+    entries = lineage.humanCommits ?? [];
+    total = lineage.counts?.human ?? entries.length;
+  }
+  const parts: string[] = [];
+  for (const e of entries) {
+    if (parts.length >= max) break;
+    const day = isoDay(e.date);
+    const short = (e.sha ?? "").slice(0, 7);
+    // A bare sha names nobody and no when — it is not what this is for, and it
+    // would read as identity while carrying none. Skipped, which can leave the
+    // whole string empty and the caller on its prior wording.
+    if (!e.author && !day) continue;
+    const who = e.author ? e.author : "a Door43 editor";
+    const when = day ? ` on ${day}` : "";
+    parts.push(short ? `${who}${when} (${short})` : `${who}${when}`);
+  }
+  if (parts.length === 0) return "";
+  // `total` is the count of human commits in the whole window, not of the
+  // capped list, so this never under-reports how many there were.
+  const extra = Math.max(0, total - parts.length);
+  return extra > 0 ? `${parts.join("; ")}; +${extra} more` : parts.join("; ");
+}
+
 // The compact form of a lineage — what actually travels from the one place that
 // can fetch it (planAndStageBookResources, which already holds master's sha) to
 // the merge call sites several Workflow steps later. A full MasterLineage can
@@ -492,6 +578,17 @@ export interface MasterLineageSummary {
   /** Up to LINEAGE_EVIDENCE_CAP human commit shas, newest first. */
   humanShas: string[];
   /**
+   * The SAME commits as `humanShas`, same cap and same order, with the identity
+   * Door43 reported for each (#684). `humanShas` is kept alongside rather than
+   * replaced: this field is ABSENT on every summary persisted to
+   * book_resource_syncs.master_lineage_json before #684 shipped, and that column
+   * is last-run-wins, so a reader must treat absent as "identity was not
+   * measured" and fall back to the wording it used before. Nothing decides on
+   * this — it exists so a flag or an alert can name who moved master instead of
+   * saying only that something did.
+   */
+  humanCommits?: LineageHumanCommit[];
+  /**
    * #557, the per-verse narrowing. TRUE only when every human commit in the
    * window was mapped, in full, to a bounded set of verse refs. Anything else —
    * one unparseable diff, one unmapped hunk, too many human commits to afford
@@ -509,9 +606,16 @@ export interface MasterLineageSummary {
 export function compactLineage(lineage: MasterLineage): MasterLineageSummary {
   const counts = { ours: 0, ai: 0, human: 0 };
   const humanShas: string[] = [];
+  const humanCommits: LineageHumanCommit[] = [];
   for (const c of lineage.commits) {
     counts[c.kind]++;
-    if (c.kind === "human" && humanShas.length < LINEAGE_EVIDENCE_CAP) humanShas.push(c.sha);
+    if (c.kind === "human" && humanShas.length < LINEAGE_EVIDENCE_CAP) {
+      humanShas.push(c.sha);
+      // #684. Same commits, same cap, same order — carried alongside the bare
+      // shas rather than replacing them, because a persisted pre-#684 snapshot
+      // has only the shas and every reader must still work off that.
+      humanCommits.push({ sha: c.sha, author: c.authorName ?? null, date: isoDay(c.date) });
+    }
   }
   const ev = lineage.humanRefs ?? null;
   return {
@@ -521,6 +625,7 @@ export function compactLineage(lineage: MasterLineage): MasterLineageSummary {
     incompleteReason: lineage.incompleteReason,
     counts,
     humanShas,
+    humanCommits,
     // Narrowing evidence only crosses the boundary when it is COMPLETE. A
     // half-mapped ref set has no downstream use — masterMayHoldHumanEditForVerse
     // ignores it — and carrying it would only invite a future reader to treat

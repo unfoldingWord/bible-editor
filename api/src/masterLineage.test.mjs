@@ -103,7 +103,9 @@ import { readFileSync } from "node:fs";
 import {
   classifyMasterCommit,
   compactLineage,
+  describeHumanCommits,
   LINEAGE_EVIDENCE_CAP,
+  LINEAGE_NAMED_COMMITS_MAX,
   LINEAGE_REF_CAP,
   masterMayHoldHumanEdit,
   masterMayHoldHumanEditForVerse,
@@ -1481,6 +1483,147 @@ console.log("\n[PR #644 review F6: parseTsvRefColumn keys agree with refParts, t
         `so masterMayHoldHumanEditForVerse's lookup actually finds what this mapper claimed`,
     );
   }
+}
+
+// ── #684: the summary carries WHO, and says nothing when it did not measure it ─
+//
+// FIXTURE PROVENANCE. The two commit subjects, author names and dates below are
+// the two real prod commits named in issue #684 — the actual cause of the
+// tn_ISA.tsv flags dated 2026-08-15, which said only that something had moved.
+// The author EMAILS are a stand-in (the issue records the names, not the
+// addresses); nothing here turns on them beyond "not the bot", which is what
+// makes these commits classify `human` in the first place, and that rule is
+// already covered by its own fixtures above.
+console.log("\n[#684: naming the Door43 commit a flag measured]");
+
+const ISA_HUMANS = [
+  {
+    sha: "7d1c9ab4e05f",
+    message: "justplainjane47 merged justplainjane47-tc-create-1 into master (#7502)",
+    authorEmail: "justplainjane47@example.door43.org",
+    authorName: "justplainjane47",
+    date: "2026-08-15T14:22:07Z",
+  },
+  {
+    sha: "b39f0c72aa18",
+    message: "Changed missed Ketiv-Qere (#7494)",
+    authorEmail: "stephen.wunrow@example.door43.org",
+    authorName: "Stephen Wunrow",
+    date: "2026-08-14T09:05:41Z",
+  },
+];
+
+{
+  const s = compactLineage(summarizeLineage(ISA_HUMANS.map(classifyMasterCommit)));
+  eq(s.counts.human, 2, "both prod commits classify human");
+  // The old field is not replaced. Anything still reading it reads the same
+  // thing it read before, in the same order.
+  eq(
+    JSON.stringify(s.humanShas),
+    JSON.stringify(["7d1c9ab4e05f", "b39f0c72aa18"]),
+    "humanShas is still populated, unchanged, for every existing reader",
+  );
+  eq(s.humanCommits.length, 2, "…and humanCommits carries the same commits");
+  eq(
+    JSON.stringify(s.humanCommits.map((c) => c.sha)),
+    JSON.stringify(s.humanShas),
+    "…in the same order, one-for-one with the shas",
+  );
+  eq(s.humanCommits[0].author, "justplainjane47", "the AUTHOR name Door43 reported");
+  eq(s.humanCommits[0].date, "2026-08-15", "the ISO DAY, not the full timestamp");
+  eq(
+    describeHumanCommits(s),
+    "justplainjane47 on 2026-08-15 (7d1c9ab); Stephen Wunrow on 2026-08-14 (b39f0c7)",
+    "the display names the person, the day and the short sha — the answer the ISA flags never gave",
+  );
+  // The same answer off the UNCOMPACTED lineage, so a caller that holds one
+  // does not have to compact first to name anything.
+  eq(
+    describeHumanCommits(summarizeLineage(ISA_HUMANS.map(classifyMasterCommit))),
+    describeHumanCommits(s),
+    "a full lineage and its compaction describe the window identically",
+  );
+  // It rides a Workflow step return value and D1's master_lineage_json.
+  eq(
+    describeHumanCommits(JSON.parse(JSON.stringify(s))),
+    describeHumanCommits(s),
+    "…and survives the JSON round trip it is persisted through",
+  );
+}
+
+{
+  // BACKWARD COMPAT, the mandatory half. master_lineage_json is last-run-wins,
+  // so a summary persisted before #684 is what a reader gets tonight: it has
+  // humanShas and no identity at all. It must produce NO name, which is what
+  // keeps every message on the wording it had before this shipped.
+  const preFix = {
+    mayHoldHumanEdit: true,
+    hasHumanCommit: true,
+    incomplete: false,
+    incompleteReason: "",
+    counts: { ours: 1, ai: 0, human: 1 },
+    humanShas: ["7d1c9ab4e05f"],
+  };
+  eq(masterMayHoldHumanEdit(preFix), true, "a pre-#684 snapshot still answers the merge's question");
+  eq(
+    describeHumanCommits(preFix),
+    "",
+    "…and names nobody: identity was never measured, and an absent measurement may not be invented",
+  );
+  // The other three "say nothing" cases, each one a caller keeping its old text.
+  eq(describeHumanCommits(null), "", "no lineage at all names nobody");
+  eq(describeHumanCommits(undefined), "", "…nor does a field a memoized step does not carry");
+  eq(
+    describeHumanCommits(compactLineage(summarizeLineage(ISA_HUMANS.map(classifyMasterCommit), {
+      incomplete: true,
+      incompleteReason: "page_cap",
+    }))),
+    "",
+    "an INCOMPLETE walk names nobody even though it saw these commits — it has not established the cause",
+  );
+  eq(
+    describeHumanCommits(compactLineage(summarizeLineage([
+      classifyMasterCommit({ sha: "s1", message: "bible-editor: ISA tn → master (#815)", authorEmail: BW }),
+    ]))),
+    "",
+    "a complete walk that found no human commit names nobody",
+  );
+  eq(
+    describeHumanCommits({
+      mayHoldHumanEdit: true, hasHumanCommit: true, incomplete: false, incompleteReason: "",
+      counts: { ours: 0, ai: 0, human: 1 }, humanShas: ["abc1234"],
+      // Identity fields present but empty — a Gitea response with no author.
+      humanCommits: [{ sha: "abc1234", author: null, date: null }],
+    }),
+    "",
+    "a bare sha with neither author nor date names nobody: it would read as identity while carrying none",
+  );
+}
+
+{
+  // The display budget is smaller than the evidence cap (the chip clamps to two
+  // lines), and the overflow tail is computed from the AUTHORITATIVE count, not
+  // from the capped list — so it can never under-report how many there were.
+  const many = Array.from({ length: 9 }, (_, i) =>
+    classifyMasterCommit({
+      sha: `h${i}0000000`,
+      message: `a hand fix ${i}`,
+      authorEmail: RICH,
+      authorName: "Richard Mahn",
+      date: `2026-08-0${i + 1}T00:00:00Z`,
+    }),
+  );
+  const s = compactLineage(summarizeLineage(many));
+  eq(s.humanShas.length, LINEAGE_EVIDENCE_CAP, "the sha evidence is capped, as before");
+  eq(s.humanCommits.length, LINEAGE_EVIDENCE_CAP, "…and the identity list rides the SAME cap");
+  const text = describeHumanCommits(s);
+  eq(
+    text.split(";").length - 1,
+    LINEAGE_NAMED_COMMITS_MAX,
+    `only ${LINEAGE_NAMED_COMMITS_MAX} commits are named, plus the overflow tail`,
+  );
+  eq(text.endsWith("; +6 more"), true, "the tail counts against counts.human (9), not against the 5 carried");
+  eq(describeHumanCommits(s, 1).endsWith("; +8 more"), true, "…and tracks the caller's own budget");
 }
 
 if (failed) {
