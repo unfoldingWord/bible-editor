@@ -47,11 +47,30 @@ export function extractPlainText(verseObjects: unknown): string {
 
 // In-flow paragraph / poetry / blank markers. These have no text payload
 // (they're position-anchors only) and survive verseObjects round-trips
-// as `{type:"paragraph", tag}` nodes. The display layer turns them into
-// visual line breaks / indents; the edit layer surfaces them as visible
-// literal `\p`/`\q1` tokens so users can add/remove them.
+// as `{type:"paragraph", tag}` (paragraph family) or `{type:"quote", tag}`
+// (poetry family) nodes. The display layer turns them into visual line
+// breaks / indents; the edit layer surfaces them as visible literal
+// `\p`/`\q1` tokens so users can add/remove them.
+//
+// This is the ONE canonical set. The other consumers that decide
+// "marker vs word" derive from it: alignment.ts's LINE_TEXT_MARKER_TAGS
+// IS this set, and replace.ts's MARKER_TOKEN_RE is asserted against it by
+// a consistency test (marker.test.mjs). When a marker in this class is
+// missing here it gets mistaken for an alignable word on the edit
+// round-trip — the `\pmo` bug (issue #702): a proofreader's embedded-text
+// marker showed up as a draggable word to align.
+//
+// Coverage note: the `\p`-family embedded/margin/letter markers below are
+// the ones present in production ULT/UST (`\pm`, `\pmo`, `\pmc`) plus
+// their USFM 3.1 siblings (`\pmr`, `\po`, `\pr`, `\cls`), all of which
+// usfm-js parses as `type:"paragraph"` exactly like `\p`. Markers still
+// NOT covered (each needs its own handling — see #702 followups): `\qa`
+// acrostic headings (a heading LABEL, not verse body), the list family
+// `\li*`/`\lh`/`\lf`/`\lim*` (usfm-js gives them no `type` field), and
+// `\qr`/`\qc`/`\qd` poetry variants not seen in the current corpus.
 export const PARAGRAPH_TAGS: ReadonlySet<string> = new Set([
   "p", "m", "mi", "nb", "pi", "pi1", "pi2", "pi3", "pc",
+  "pm", "pmo", "pmc", "pmr", "po", "pr", "cls",
   "q", "q1", "q2", "q3", "q4", "qm", "qm1", "qm2", "qm3",
   "b",
 ]);
