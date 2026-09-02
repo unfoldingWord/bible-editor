@@ -55,6 +55,9 @@ function freshDb() {
       sort_order INTEGER NOT NULL,
       version INTEGER NOT NULL DEFAULT 1,
       updated_at INTEGER NOT NULL DEFAULT 0,
+      last_change_action TEXT,
+      last_change_source TEXT,
+      last_change_actor TEXT,
       PRIMARY KEY (book, id)
     );
   `);
@@ -69,8 +72,16 @@ function seed(sqlite, rows) {
 }
 
 function readRow(sqlite, book, id) {
-  return sqlite.prepare(`SELECT sort_order, version, updated_at FROM twl_rows WHERE book = ? AND id = ?`).all(book, id)[0];
+  return sqlite
+    .prepare(
+      `SELECT sort_order, version, updated_at, last_change_action, last_change_source, last_change_actor FROM twl_rows WHERE book = ? AND id = ?`,
+    )
+    .all(book, id)[0];
 }
+
+// #686: provenance is a REQUIRED parameter (no default) — any test call must
+// state one explicitly, same as every real caller.
+const PROVENANCE = { action: "sync_reorder", source: "dcs_sync", actor: "Door43 sync (unmeasured)" };
 
 const BOOK = "REV";
 
@@ -83,16 +94,24 @@ console.log("\n[issue #687: applyTwlSortOrderUpdates leaves version unchanged, w
   ]);
   const db = makeDb(sqlite);
 
-  await applyTwlSortOrderUpdates(db, BOOK, [
-    { id: "aaaa", sort_order: 5 },
-    { id: "bbbb", sort_order: 6 },
-  ]);
+  await applyTwlSortOrderUpdates(
+    db,
+    BOOK,
+    [
+      { id: "aaaa", sort_order: 5 },
+      { id: "bbbb", sort_order: 6 },
+    ],
+    PROVENANCE,
+  );
 
   const aaaa = readRow(sqlite, BOOK, "aaaa");
   const bbbb = readRow(sqlite, BOOK, "bbbb");
   eq(aaaa.sort_order, 5, "aaaa: sort_order written");
   eq(aaaa.version, 3, "aaaa: version unchanged (was 3)");
   eq(aaaa.updated_at > 100, true, "aaaa: updated_at advanced");
+  eq(aaaa.last_change_action, PROVENANCE.action, "aaaa: last_change_action stamped");
+  eq(aaaa.last_change_source, PROVENANCE.source, "aaaa: last_change_source stamped");
+  eq(aaaa.last_change_actor, PROVENANCE.actor, "aaaa: last_change_actor stamped");
   eq(bbbb.sort_order, 6, "bbbb: sort_order written");
   eq(bbbb.version, 7, "bbbb: version unchanged (was 7)");
   eq(bbbb.updated_at > 100, true, "bbbb: updated_at advanced");
@@ -104,10 +123,21 @@ console.log("\n[a row not in the updates list is untouched]");
   seed(sqlite, [{ id: "cccc", book: BOOK, sort_order: 9, version: 1, updated_at: 42 }]);
   const db = makeDb(sqlite);
 
-  await applyTwlSortOrderUpdates(db, BOOK, [{ id: "aaaa", sort_order: 5 }]);
+  await applyTwlSortOrderUpdates(db, BOOK, [{ id: "aaaa", sort_order: 5 }], PROVENANCE);
 
   const cccc = readRow(sqlite, BOOK, "cccc");
-  eq(cccc, { sort_order: 9, version: 1, updated_at: 42 }, "cccc: untouched (not in the update batch)");
+  eq(
+    cccc,
+    {
+      sort_order: 9,
+      version: 1,
+      updated_at: 42,
+      last_change_action: null,
+      last_change_source: null,
+      last_change_actor: null,
+    },
+    "cccc: untouched (not in the update batch)",
+  );
 }
 
 if (failed > 0) {
