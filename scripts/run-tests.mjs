@@ -29,6 +29,7 @@ const SQLITE_FILES = new Set([
   "src/trashedRowPatch.test.mjs",
   "src/rowsCreateGuard.test.mjs",
   "src/applyVerseRows.test.mjs",
+  "src/rowProvenanceStamps.test.mjs",
   // The old chain ran this one twice: once plain, once with
   // --experimental-sqlite. Globbing runs each file once, so it takes the
   // sqlite variant — the flag is additive, and the file's sqlite-only cases
@@ -52,6 +53,7 @@ const EXTRA_IMPORTS = new Map([
   ["src/reviewFlagBroadcast.test.mjs", "./src/tsResolveHook.mjs"],
   ["src/reimportJourney.test.mjs", "./src/tsResolveHook.mjs"],
   ["src/applyVerseRows.test.mjs", "./src/tsResolveHook.mjs"],
+  ["src/rowProvenanceStamps.test.mjs", "./src/tsResolveHook.mjs"],
   ["src/tombstoneReclaim.test.mjs", "./src/tsResolveHook.mjs"],
   ["src/tombstoneSweep.test.mjs", "./src/tsResolveHook.mjs"],
   ["src/aiRowDiffGate.test.mjs", "./src/tsResolveHook.mjs"],

@@ -61,6 +61,9 @@ function freshDb() {
       book TEXT NOT NULL,
       sort_order INTEGER NOT NULL,
       version INTEGER NOT NULL DEFAULT 1,
+      last_change_action TEXT,
+      last_change_source TEXT,
+      last_change_actor TEXT,
       PRIMARY KEY (book, id)
     );
   `);
@@ -81,10 +84,19 @@ function readRow(sqlite, book, id) {
 async function maybeApplyTwlSortOrder(db, book, updates, dcsAllowed) {
   if (updates.length === 0) return;
   if (dcsAllowed) {
-    await applyTwlSortOrderUpdates(db, book, updates);
+    // Mirrors exportWorkflow's own call verbatim, provenance included (#686
+    // review F2). 'system'/'reorder', NOT 'dcs_sync'/'sync_reorder': this order
+    // is computed by the export from the ULT alignment in D1, so labelling it a
+    // Door43 sync would tell a translator Door43 reordered rows that Bible
+    // Editor reordered. The helper takes this REQUIRED, with no default, so
+    // that a caller cannot inherit the wrong answer silently — which is exactly
+    // how the mislabel got in.
+    await applyTwlSortOrderUpdates(db, book, updates, EXPORT_PROVENANCE);
   }
   // else: dry run — discarded, matching exportOne's console.log-only branch.
 }
+
+const EXPORT_PROVENANCE = { action: "reorder", source: "system", actor: "nightly TWL canonical reorder" };
 
 const BOOK = "REV";
 const updates = [
@@ -123,6 +135,17 @@ console.log("\n[a non-dry allowLocked run keeps today's behavior: sort_order IS 
     { sort_order: 5, version: 2 },
     "live run: row aaaa's sort_order is written, version bumped",
   );
+  // #686 review F2 regression: the export's own reorder must not be attributed
+  // to Door43. If this ever reads 'dcs_sync'/"Door43 sync" again, the nightly
+  // is telling translators Door43 made a change Bible Editor made.
+  {
+    const prov = sqlite
+      .prepare(`SELECT last_change_action, last_change_source, last_change_actor FROM twl_rows WHERE book = ? AND id = ?`)
+      .all(BOOK, "aaaa")[0];
+    eq(prov.last_change_source, "system", "live run: the export's own reorder is stamped 'system', never 'dcs_sync'");
+    eq(prov.last_change_action, "reorder", "live run: …and 'reorder', never 'sync_reorder' (master's order did not decide it)");
+    eq(prov.last_change_actor, "nightly TWL canonical reorder", "live run: …attributed to the job, not to Door43");
+  }
   eq(
     readRow(sqlite, BOOK, "bbbb"),
     { sort_order: 6, version: 2 },
@@ -136,7 +159,7 @@ console.log("\n[canary: reverting exportOne's gate (calling applyTwlSortOrderUpd
   seed(sqlite, [{ id: "aaaa", book: BOOK, sort_order: 1 }]);
   const db = makeDb(sqlite);
   // The pre-#587 behavior: no gate at all.
-  await applyTwlSortOrderUpdates(db, BOOK, [{ id: "aaaa", sort_order: 5 }]);
+  await applyTwlSortOrderUpdates(db, BOOK, [{ id: "aaaa", sort_order: 5 }], EXPORT_PROVENANCE);
   const row = readRow(sqlite, BOOK, "aaaa");
   eq(
     row.sort_order === 5,

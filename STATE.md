@@ -71,6 +71,38 @@ For the full corpus, see the memory index at
 `C:\Users\benja\.claude\projects\C--Users-benja-Documents-GitHub-bible-editor\memory\MEMORY.md`.
 Highlights that bite repeatedly:
 
+- **A TSV row's `updated_at` is NOT the time its review flag was minted, and keying any flag-age decision on it is
+  unsafe in the one direction that matters.** The mint IS guarded on `cur.review_kind == null`, so the flag is
+  written once — but rows.ts's non-versioning fast paths (reorder drag `rows.ts:815`, preserve/hint toggles
+  `:1244`, trash toggles `:1317`/`:1338`) move `updated_at` and deliberately leave `review_kind` standing. So
+  `updated_at >= mint`, never `==`, and a walk window starting there can start *after* the Door43 human commit the
+  flag is about — reporting "no human found" over a range that never contained it, which is the one answer that
+  retires a true warning. Immutable mint evidence exists in two places instead: `review_master_json._meta.flag_at`
+  / `flag_since` for post-#653 flags, and the mint's own `edit_log` row (`action='update'`, payload carries
+  `"review_kind":"merge_no_base"`, `logEditStmt` at `bookReimport.ts:2668`) for older ones. Note that edit_log is
+  *not* forever: `editLogSweep.ts` deletes `update` rows past 180 days (only the newest `create` per live row is
+  exempt), so mint evidence expires. #683 (`sweepStaleMergeNoBase`) derives a pre-#653 flag's window from the mint
+  run's persisted lineage, admitted only when `master_lineage_computed_at <= mintAt` proves that lineage is the
+  mint's own and not a later overwrite.
+- **A column added by a migration is NULL for exactly the rows a backlog-draining fix cares about, because those
+  rows are stuck precisely for want of a later run to fill it.** #683's first cut derived its window from
+  `book_resource_syncs.master_lineage_confirmed_at` (migration 0058, deployed 2026-08-31). Measured read-only in
+  prod on 2026-09-01: NULL for all three stuck pairs (AMO tn, AMO tq, ECC tq) — the column only fills on a run
+  after that deploy, and "no run has visited this pair since" is the *definition* of the backlog. The fix needed a
+  second evidence tier over a column that predated the flags (`master_lineage_computed_at`, 0054). Before relying
+  on a recently-added column to heal historical rows, check whether those rows can ever have it.
+- **A per-book nightly step can only heal books the nightly visits, so any self-healing wired inside the sync
+  reaches exactly the books that did not need healing.** #665's merge_no_base auto-clear sat inside
+  `loadMasterLineage`, which runs only when a resource's master file moved; 12 flags on AMO and ECC therefore
+  survived it because those books had gone quiet. Fixed by a once-per-run sweep driven by "which rows still hold a
+  flag" rather than "which books did we sync" — the shape to reuse for any future row-state cleanup.
+- **A module that imports `hono` cannot be unit-tested.** `api/src/*.test.mjs` runs under plain
+  `node --experimental-strip-types`, which cannot resolve the `hono` package from `node_modules`
+  (`ERR_MODULE_NOT_FOUND … Did you mean to import "hono/dist/cjs/index.js"?`) — only wrangler's bundler can.
+  So keep testable logic in a Hono-free module and put the router beside it in its own file
+  (`dcsCommitPoll.ts` + `dcsCommits.ts` is the pattern). Runtime imports inside a `.ts` file that a test
+  traverses also need the explicit `.ts` extension; extensionless works for `tsc` but not for node.
+
 - **Marker chips are TEXT, and `smartEditVerse` rebuilds the verse's whole marker layout from the captured text
   alone — so a capture that loses the chips silently deletes every `\q` in the verse.** `reconcileMarkers`
   (`web/src/lib/replace.ts`) unconditionally drops every inert in-flow marker and re-inserts only the ones it

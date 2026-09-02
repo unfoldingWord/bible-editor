@@ -462,7 +462,7 @@ await (async () => {
   const proposals = [];
   for (let v = 32; v <= 45; v++) proposals.push(tnProposal(11, v));
   const { calls, env } = fakeDeleteDb();
-  await deleteUnkeptTns(env, job11, 1, proposals, newHeartbeat());
+  await deleteUnkeptTns(env, job11, 1, "AI pipeline", proposals, newHeartbeat());
 
   const sels = selectCalls(calls);
   assert(sels.length > 0, "DAN 11 SQL regression: deleteUnkeptTns issued at least one SELECT");
@@ -495,7 +495,7 @@ await (async () => {
 await (async () => {
   const proposals = [tnProposal(11, 32)];
   const { calls, env } = fakeDeleteDb();
-  await deleteUnkeptTns(env, job11, 1, proposals, newHeartbeat());
+  await deleteUnkeptTns(env, job11, 1, "AI pipeline", proposals, newHeartbeat());
 
   const sels = selectCalls(calls);
   assert(sels.length > 0, "guard-preservation: at least one SELECT issued");
@@ -531,7 +531,7 @@ await (async () => {
   const proposals = [tnProposal(11, 5), tnProposal(11, 6), tnProposal(11, 7)];
   const resolvedRows = [{ chapter: 11, verse: 5 }];
   const { calls, env } = fakeDeleteDb(resolvedRows);
-  await deleteUnkeptTns(env, job11, 1, proposals, newHeartbeat());
+  await deleteUnkeptTns(env, job11, 1, "AI pipeline", proposals, newHeartbeat());
 
   const sels = selectCalls(calls);
   assert(sels.length > 0, "Codex straddled-verse fix: at least one target SELECT issued");
@@ -558,7 +558,7 @@ await (async () => {
   for (let v = 1; v <= 95; v++) inputPairs.push({ chapter: 11, verse: v });
   const proposals = inputPairs.map((p) => tnProposal(p.chapter, p.verse));
   const { calls, env } = fakeDeleteDb();
-  await deleteUnkeptTns(env, job11, 1, proposals, newHeartbeat());
+  await deleteUnkeptTns(env, job11, 1, "AI pipeline", proposals, newHeartbeat());
 
   const sels = selectCalls(calls);
   assert(
@@ -3228,7 +3228,7 @@ await (async () => {
     },
   };
 
-  const applied = await applyTnHintExpansionIfMatch(env, p, job, 1);
+  const applied = await applyTnHintExpansionIfMatch(env, p, job, 1, "AI pipeline");
   assert(applied === true, "hint expansion: CAS won against the fake stub");
   assert(loggedPayload !== null, "hint expansion: an edit_log row was logged");
   assert(

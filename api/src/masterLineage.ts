@@ -174,10 +174,36 @@ export interface MasterCommit {
   message: string | null;
   /** commit.author.email from Gitea. Null when absent. */
   authorEmail: string | null;
-  /** commit.author.name from Gitea. Diagnostic only — never classified on. */
+  /**
+   * commit.author.name from Gitea. Never classified on — but DISPLAYED since
+   * #684 (see LineageHumanCommit), so it is no longer diagnostic-only.
+   */
   authorName?: string | null;
-  /** commit.author.date, ISO-8601. Diagnostic only. */
+  /** commit.author.date, ISO-8601. Never classified on; displayed as a day (#684). */
   date?: string | null;
+  /**
+   * commit.committer.date, ISO-8601 — WHEN THE COMMIT LANDED, as opposed to
+   * when its author first wrote it. The two differ on a rebase, a cherry-pick,
+   * or a squash merge, which is most of how work reaches these repos. Read only
+   * by the dcs_commits ledger (issue #685), whose question is "when did this
+   * arrive on master"; never classified on, and deliberately NOT substituted for
+   * `date` anywhere gating reads it.
+   */
+  committerDate?: string | null;
+  /**
+   * parents[0].sha — first parent only, i.e. "master's previous tip". Present
+   * only for callers that need to store lineage (the dcs_commits ledger,
+   * issue #685); never classified on. Absent on every existing caller's
+   * commits, which is why it is optional rather than nullable-required.
+   */
+  parentSha?: string | null;
+  /**
+   * In-repo paths the commit touched, from the list endpoint's own
+   * `files=true`. Requested only by callers that pass `{ files: true }` to
+   * listMasterCommitsSince; undefined means "not requested", null means
+   * "requested but the response carried none". Never classified on.
+   */
+  files?: string[] | null;
 }
 
 export interface ClassifiedCommit extends MasterCommit {
@@ -191,7 +217,12 @@ export interface ClassifiedCommit extends MasterCommit {
 // checked: this classifier is already scoped to one file's history by the
 // caller, and a stricter match would fail closed to `human` on any future
 // wording change, which is the safe direction anyway.
-const OURS_PREFIX = /^bible-editor(?: export)?:\s/;
+// EXPORTED so the dcs_commits ledger's merge-commit wrapper (issue #685,
+// dcsCommitPoll.ts) can test the SAME anchored pattern against a subject it has
+// unwrapped, instead of writing a second copy of it that could drift. Exporting
+// a regex changes no behavior here; the wrapper deliberately does not touch
+// classifyMasterCommit itself, because gating shares it.
+export const OURS_PREFIX = /^bible-editor(?: export)?:\s/;
 
 // bp-assistant's own marker. Kept as a second, independent route to `ai` so a
 // future bot that pushes under a different author is still recognized — but see
@@ -474,6 +505,256 @@ export function summarizeLineage(
 // value, so it must stay small.
 export const LINEAGE_EVIDENCE_CAP = 5;
 
+// One human commit's identity, as Door43 reported it (#684).
+//
+// THE BRACKET TRAP, stated here because this is the shape a display reads. The
+// bot pushes on a named human's behalf with that person's username in the
+// SUBJECT (`ULT: EZK 38 [pjoakes]`). `author` is the commit's own author field
+// and nothing else — never the bracket. classifyMasterCommit already decides on
+// the author, so a display that parsed the subject instead could name a person
+// on a commit the classifier called `ai`, i.e. show identity for a commit whose
+// content the system deliberately does not protect.
+export interface LineageHumanCommit {
+  sha: string;
+  /** commit.author.name. Null when Gitea reported none. */
+  author: string | null;
+  /**
+   * commit.author.date, the FULL ISO-8601 timestamp Door43 reported —
+   * "2026-08-15T14:22:07Z", not "2026-08-15".
+   *
+   * Persisted at full precision deliberately (cold review F6). This value lands
+   * in book_resource_syncs.master_lineage_json, which is the durable record an
+   * incident is reconstructed from six weeks later, and the reconstructions in
+   * this repo routinely hinge on INTRA-DAY ordering — which of two commits on
+   * the same day came first, and whether it preceded or followed our own export.
+   * A day-only field cannot answer that and cannot be widened after the fact.
+   * The truncation to a day is a DISPLAY concern and happens only in
+   * describeHumanCommits, via isoDay.
+   */
+  date: string | null;
+}
+
+// How many commits a user-facing message will NAME. The chip and the alert
+// clamp to about two lines, so this is a display budget, not an evidence one —
+// the summary still carries up to LINEAGE_EVIDENCE_CAP, and `counts.human` is
+// the authoritative total, which is what the "+N more" tail is computed from.
+//
+// WHICH commits get named, since only some do (cold review F7). The list is
+// newest-first (listMasterCommitsSince's own order, preserved through
+// compactLineage), so this names the NEWEST few and folds the oldest into
+// "+N more". Deliberate, not incidental: the most recent Door43 edit is the one
+// whose content is on master right now and the one a translator opening the row
+// will be looking at, and the tail still says how many older ones there were,
+// so nothing is hidden — only deferred to the full record in
+// master_lineage_json. An oldest-first display would name the commit least
+// likely to explain what the reader is seeing.
+export const LINEAGE_NAMED_COMMITS_MAX = 3;
+
+// How much of an author's name a message will carry. Door43 commit author names
+// are third-party input interpolated into a review reason, so they are clamped
+// (cold review F4): the field is free text on Door43's side, and one very long
+// name would eat the whole two-line chip and push the outcome and the remedy —
+// the parts a translator has to act on — out of view.
+const AUTHOR_NAME_MAX = 40;
+
+// Unicode bidi isolates. An author name is arbitrary third-party text and this
+// is a Bible-translation tool, so RTL names (Hebrew, Arabic, Persian) are an
+// ordinary case, not an exotic one. Interpolated raw, an RTL name reorders the
+// LTR text around it — the date and the sha that follow can visually jump to
+// the other side of the name, so the message would attribute a commit to the
+// wrong day or sha ON SCREEN while the stored string is correct. FSI…PDI makes
+// each name its own bidi run, which is exactly what that hazard needs (cold
+// review F4). Applied to the NAME only, never to our own words.
+const FSI = "\u2068";
+const PDI = "\u2069";
+
+// Everything a name must not carry into a one-line message: C0/C1 controls
+// (a newline would break the chip's two-line clamp outright) and the LEGACY
+// bidi overrides/embeddings, which — unlike the isolates above — have no
+// terminator of their own and can leak their direction into the rest of the
+// sentence. The isolate pair we add ourselves is the sanctioned mechanism; a
+// name is not allowed to bring its own.
+const NAME_UNSAFE = /[\u0000-\u001f\u007f-\u009f\u200e\u200f\u202a-\u202e\u2066-\u2069]/g;
+
+/**
+ * One author name, made safe to interpolate: controls stripped, whitespace
+ * collapsed, clamped to AUTHOR_NAME_MAX, wrapped in bidi isolates. Null when
+ * nothing legible survives, which reads the same as "Gitea reported no author".
+ *
+ * Exported for `rowProvenance.ts` (#686), which lands the same third-party
+ * author names in the same kind of one-line UI (the row's `last_change_actor`)
+ * and must not grow a second, subtly different sanitizer for them.
+ */
+export function displayAuthor(name: string | null | undefined): string | null {
+  const flat = (name ?? "").replace(NAME_UNSAFE, " ").replace(/\s+/g, " ").trim();
+  if (!flat) return null;
+  // The ellipsis is inside the isolate so a clamped RTL name still renders as
+  // one run. Array spread, not slice: a name ending in an emoji or any other
+  // astral character must not be cut through the middle of a surrogate pair.
+  const chars = [...flat];
+  const clamped = chars.length > AUTHOR_NAME_MAX ? `${chars.slice(0, AUTHOR_NAME_MAX - 1).join("")}…` : flat;
+  return `${FSI}${clamped}${PDI}`;
+}
+
+// Just the day, for display.
+//
+// This keeps the day AS DOOR43 REPORTED IT — commit.author.date carries the
+// author's own UTC offset, and the leading 10 characters are therefore that
+// person's local calendar day, not the UTC day (cold review F5). Deliberate:
+// the reader is going to ask the named editor "what did you change on the
+// 15th?", and the answer has to match the date THEY would give. A UTC
+// normalization would silently shift a late-evening commit to the next day for
+// editors east of Greenwich and to the previous day for those west of it. The
+// full timestamp, offset included, is preserved in the persisted evidence (see
+// LineageHumanCommit.date), so forensics never has to rely on this.
+function isoDay(date: string | null | undefined): string | null {
+  const m = /^(\d{4}-\d{2}-\d{2})/.exec((date ?? "").trim());
+  return m ? m[1] : null;
+}
+
+// The one literal that introduces the identity clause, and the boundary a
+// churn guard splits a reason on (cold review F1). Defined once, here, because
+// two things depend on it being the SAME string: the clause builder below, and
+// stripHumanCommitEvidence, which a dedup guard uses to compare two reasons
+// while ignoring identity drift.
+export const LINEAGE_EVIDENCE_LEAD = "Door43 edits to this file:";
+
+/**
+ * A review reason with its #684 identity clause removed (cold review F1).
+ *
+ * WHY A DEDUP GUARD MUST USE THIS. The identity clause is not stable across
+ * nights the way the rest of a reason is: the commits named in it change
+ * whenever Door43's history moves or the watermark the walk is bounded by
+ * advances. A guard comparing whole reason strings would therefore see "the
+ * message changed" on a row where nothing about the FINDING changed, rewrite
+ * the flag, and bump the row's version — and a version bump on a row nobody
+ * touched 409s the outbox op of any tab holding that row. Comparing the base
+ * reason keeps the guard's decision exactly what it was before #684: identical
+ * finding, no write.
+ *
+ * Applied to BOTH sides of a comparison. Also trims the trailing space the
+ * clause is joined with, so "base." and "base. Door43 edits to this file: …"
+ * compare equal.
+ */
+// `unknown` rather than `string | null`: the value on the other side of a
+// comparison is a column read off a D1 row, which arrives untyped. Narrowing
+// here keeps every call site from casting, and a non-string (a NULL column, a
+// number from a malformed row) compares as "" — the answer that mints rather
+// than suppresses, which is the protective direction for a guard.
+export function stripHumanCommitEvidence(reason: unknown): string {
+  const s = typeof reason === "string" ? reason : "";
+  const i = s.indexOf(LINEAGE_EVIDENCE_LEAD);
+  return (i < 0 ? s : s.slice(0, i)).trimEnd();
+}
+
+/**
+ * The identity clause to append to a review reason, or `""` when nothing was
+ * measured — " Door43 edits to this file: NAME on 2026-08-15 (a1b2c3d)."
+ *
+ * Callers append this and compare with stripHumanCommitEvidence; going through
+ * one builder is what guarantees the delimiter the guard splits on is the
+ * delimiter the text actually carries.
+ *
+ * ONE ACCEPTED COST, so nobody rediscovers it as a bug (cold review F2).
+ * BookLintIndicator's popup collapses identical flags into one counted entry,
+ * keyed on `check | message` (web/src/components/bookLintGrouping.ts). Two rows
+ * flagged on DIFFERENT nights can now carry different identity clauses, so they
+ * land in two groups where before they shared one. Accepted, because the
+ * within-a-night case — the one that produced #653's 63-row JER pile the
+ * grouping exists for — is unaffected: a lineage is measured once per (book,
+ * resource) per run, so every row flagged by the same run carries the exact same
+ * clause and still collapses into a single entry. The alternative, keying the
+ * group on the stripped base reason, would hide from a translator that two
+ * groups were caused by two different people, which is precisely the
+ * information #684 exists to surface.
+ */
+export function humanCommitEvidenceClause(
+  lineage: MasterLineage | MasterLineageSummary | null | undefined,
+  max: number = LINEAGE_NAMED_COMMITS_MAX,
+): string {
+  const who = describeHumanCommits(lineage, max);
+  return who ? ` ${LINEAGE_EVIDENCE_LEAD} ${who}.` : "";
+}
+
+/**
+ * "justplainjane47 on 2026-08-15 (a1b2c3d)" for the human commits a lineage
+ * MEASURED — or `""` when it measured none it can name (#684).
+ *
+ * Empty is the honest answer in every one of these cases, and each maps to a
+ * caller keeping the wording it had before this existed:
+ *   - no lineage at all (nobody walked master's history)
+ *   - an INCOMPLETE walk (the standing rule: state only measured causes — an
+ *     unfinished walk has not established who, or even that anyone, moved it)
+ *   - a complete walk that found no human commit
+ *   - a summary persisted before #684, which carries `humanShas` but no
+ *     identity: something moved master, and we cannot say who from this record
+ *
+ * Repeated authors are named ONCE, with their dates gathered (cold review F4):
+ * three commits by one person on one afternoon is one fact about one person, and
+ * repeating the name three times spent the whole two-line chip saying it. So
+ * "Stephen Wunrow on 2026-08-14 (b39f0c7), 2026-08-13 (aa12bc3)", never the
+ * name twice. `max` still bounds the COMMITS named, not the people.
+ *
+ * Accepts either lineage shape. Pure — no fetch, no D1.
+ */
+export function describeHumanCommits(
+  lineage: MasterLineage | MasterLineageSummary | null | undefined,
+  max: number = LINEAGE_NAMED_COMMITS_MAX,
+): string {
+  if (lineage == null) return "";
+  if (lineage.incomplete !== false) return "";
+  if (lineage.hasHumanCommit !== true) return "";
+  let entries: LineageHumanCommit[];
+  let total: number;
+  if ("commits" in lineage) {
+    const humans = lineage.commits.filter((c) => c.kind === "human");
+    total = humans.length;
+    // Full timestamp, exactly as the compacted form carries it (F6) — isoDay is
+    // applied below, at display, and in one place only.
+    entries = humans.map((c) => ({ sha: c.sha, author: c.authorName ?? null, date: c.date ?? null }));
+  } else {
+    // The compacted form. `humanCommits` absent = pre-#684 snapshot.
+    entries = lineage.humanCommits ?? [];
+    total = lineage.counts?.human ?? entries.length;
+  }
+  // Grouped by displayed author, insertion-ordered (newest commit first — see
+  // LINEAGE_NAMED_COMMITS_MAX on why newest). `named` counts COMMITS, so the
+  // budget is spent on commits whether or not they share an author.
+  const groups = new Map<string, { label: string; whens: { day: string | null; sha: string }[] }>();
+  let named = 0;
+  for (const e of entries) {
+    if (named >= max) break;
+    const day = isoDay(e.date);
+    const short = (e.sha ?? "").slice(0, 7);
+    const who = displayAuthor(e.author);
+    // A bare sha names nobody and no when — it is not what this is for, and it
+    // would read as identity while carrying none. Skipped, which can leave the
+    // whole string empty and the caller on its prior wording.
+    if (!who && !day) continue;
+    named++;
+    // Our own words when Door43 named no author, so they carry no isolates:
+    // the hazard the isolates answer is third-party text, and wrapping a
+    // literal would only make the stored string harder to read back.
+    const label = who ?? "a Door43 editor";
+    const g = groups.get(label);
+    if (g) g.whens.push({ day, sha: short });
+    else groups.set(label, { label, whens: [{ day, sha: short }] });
+  }
+  if (named === 0) return "";
+  const parts: string[] = [];
+  for (const g of groups.values()) {
+    const whens = g.whens.map((w) => (w.day ? (w.sha ? `${w.day} (${w.sha})` : w.day) : `(${w.sha})`));
+    // "on" only when there is a day to hang it on; a sha-only group reads
+    // "NAME (a1b2c3d)".
+    parts.push(g.whens.some((w) => w.day) ? `${g.label} on ${whens.join(", ")}` : `${g.label} ${whens.join(", ")}`);
+  }
+  // `total` is the count of human commits in the whole window, and `named`
+  // counts commits rather than groups, so the tail never under-reports how many
+  // there were — not even when three of them share one author.
+  const extra = Math.max(0, total - named);
+  return extra > 0 ? `${parts.join("; ")}; +${extra} more` : parts.join("; ");
+}
+
 // The compact form of a lineage — what actually travels from the one place that
 // can fetch it (planAndStageBookResources, which already holds master's sha) to
 // the merge call sites several Workflow steps later. A full MasterLineage can
@@ -492,6 +773,17 @@ export interface MasterLineageSummary {
   /** Up to LINEAGE_EVIDENCE_CAP human commit shas, newest first. */
   humanShas: string[];
   /**
+   * The SAME commits as `humanShas`, same cap and same order, with the identity
+   * Door43 reported for each (#684). `humanShas` is kept alongside rather than
+   * replaced: this field is ABSENT on every summary persisted to
+   * book_resource_syncs.master_lineage_json before #684 shipped, and that column
+   * is last-run-wins, so a reader must treat absent as "identity was not
+   * measured" and fall back to the wording it used before. Nothing decides on
+   * this — it exists so a flag or an alert can name who moved master instead of
+   * saying only that something did.
+   */
+  humanCommits?: LineageHumanCommit[];
+  /**
    * #557, the per-verse narrowing. TRUE only when every human commit in the
    * window was mapped, in full, to a bounded set of verse refs. Anything else —
    * one unparseable diff, one unmapped hunk, too many human commits to afford
@@ -509,9 +801,19 @@ export interface MasterLineageSummary {
 export function compactLineage(lineage: MasterLineage): MasterLineageSummary {
   const counts = { ours: 0, ai: 0, human: 0 };
   const humanShas: string[] = [];
+  const humanCommits: LineageHumanCommit[] = [];
   for (const c of lineage.commits) {
     counts[c.kind]++;
-    if (c.kind === "human" && humanShas.length < LINEAGE_EVIDENCE_CAP) humanShas.push(c.sha);
+    if (c.kind === "human" && humanShas.length < LINEAGE_EVIDENCE_CAP) {
+      humanShas.push(c.sha);
+      // #684. Same commits, same cap, same order — carried alongside the bare
+      // shas rather than replacing them, because a persisted pre-#684 snapshot
+      // has only the shas and every reader must still work off that.
+      // The FULL timestamp, not the day (cold review F6): this is the persisted
+      // forensic record, and intra-day ordering is what an incident
+      // reconstruction needs. isoDay runs at display only.
+      humanCommits.push({ sha: c.sha, author: c.authorName ?? null, date: c.date ?? null });
+    }
   }
   const ev = lineage.humanRefs ?? null;
   return {
@@ -521,6 +823,7 @@ export function compactLineage(lineage: MasterLineage): MasterLineageSummary {
     incompleteReason: lineage.incompleteReason,
     counts,
     humanShas,
+    humanCommits,
     // Narrowing evidence only crosses the boundary when it is COMPLETE. A
     // half-mapped ref set has no downstream use — masterMayHoldHumanEditForVerse
     // ignores it — and carrying it would only invite a future reader to treat
