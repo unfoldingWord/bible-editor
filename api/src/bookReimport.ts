@@ -6826,24 +6826,20 @@ async function accountOwnPublishDecline(
   const prior = sync.declines ?? 0;
   try {
     if (!sync.pushedBlobSha) return; // content_differs implies a pushed render; defensive only
-    // The export PR opened for THE render pushed_blob_sha describes: the newest
-    // snapshot row for this pair that carries a PR number AND was written at or
-    // after that render's D1 read (recordSnapshot runs after recordPushedRender
-    // in the same export step). An older PR row means the current push has no
-    // PR on record (creation failed, or nothing was pushed) — then there is no
-    // merge to look for, and matching an earlier PR's merge would compare an
-    // earlier render's bytes against this one's (Codex review on PR #704).
-    const pr =
-      sync.pushedReadAt == null
-        ? null
-        : await env.DB.prepare(
-            `SELECT pr_number FROM export_snapshots
-              WHERE book = ?1 AND resource = ?2 AND pr_number IS NOT NULL AND committed_at >= ?3
-              ORDER BY committed_at DESC, id DESC LIMIT 1`,
-          )
-            .bind(book, resource, sync.pushedReadAt)
-            .first<{ pr_number: number }>();
-    const prNumber = pr?.pr_number ?? null;
+    // The export PR opened for THE render pushed_blob_sha describes, stamped by
+    // the export onto the same row and guarded on that render's read time
+    // (exportWorkflow.ts recordPushedPr; migration 0061). NULL means the current
+    // push has no PR on record — creation failed, or it predates the column —
+    // and then there is no merge to look for. Not derived from export_snapshots
+    // by time: two overlapping exports can record their snapshots out of order,
+    // and the newest row after the read could be the OTHER export's PR (Codex
+    // verify pass on PR #704).
+    const pr = await env.DB.prepare(
+      `SELECT pushed_pr_number FROM book_resource_syncs WHERE book = ?1 AND resource = ?2`,
+    )
+      .bind(book, resource)
+      .first<{ pushed_pr_number: number | null }>();
+    const prNumber = pr?.pushed_pr_number ?? null;
     const page =
       walked ??
       (sync.pushedReadAt == null

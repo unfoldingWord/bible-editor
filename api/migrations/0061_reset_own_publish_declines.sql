@@ -23,3 +23,12 @@ UPDATE book_resource_syncs SET own_publish_declines = 0;
 -- on this migration — which is safe: a later rewrite is necessarily a different
 -- merge, so a stale sha here can only ever fail to match. NULL = nothing counted.
 ALTER TABLE book_resource_syncs ADD COLUMN own_publish_rewrite_sha TEXT;
+
+-- pushed_pr_number — the export PR opened for THE render pushed_blob_sha /
+-- pushed_read_at describe (exportWorkflow.ts recordPushedPr, stamped only when
+-- pushed_read_at still equals that render's read, so an overlapping slower
+-- export cannot stamp its PR over a newer render). Gitea's squash merge titles
+-- the master commit `<PR title> (#N)`, which is how the sync finds that render's
+-- merge and measures the bytes it landed. NULL = no PR on record for the current
+-- push (creation failed, or pushed before this column existed) → not measured.
+ALTER TABLE book_resource_syncs ADD COLUMN pushed_pr_number INTEGER;

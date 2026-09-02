@@ -1302,6 +1302,10 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
     }
 
     await this.recordSnapshot(book, resource, branch, dcsCommitSha, built.rowCount, dcsSkippedReason, prNumber, prError);
+    // The PR that will merge THE render recordPushedRender just recorded, tied to
+    // it by its readAt — see recordPushedPr for why a snapshot-time lookup is
+    // not a substitute.
+    if (prNumber != null) await this.recordPushedPr(book, resource, built.readAt, prNumber);
 
     return {
       book,
@@ -1642,6 +1646,37 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       console.error("export conflict-recovery failed", { book, resource, repo, branch, error: detail });
       await this.recordPrConflictAlert(book, resource, repo, branch, detail.slice(0, 120));
       return null;
+    }
+  }
+
+  // Records which export PR carries the render recordPushedRender just stored
+  // (migration 0061's pushed_pr_number), so the nightly sync can find that
+  // render's MERGE on master by the `(#N)` Gitea appends to a squash commit and
+  // measure the bytes it landed (bookReimport.ts accountOwnPublishDecline).
+  //
+  // Guarded on `pushed_read_at = readAt`: two exports of the same pair can
+  // overlap and finish out of order — B's newer render wins recordPushedRender's
+  // monotonic guard, then slower A opens its PR and reaches here afterwards. A
+  // must NOT stamp its PR over B's render, or the sync would compare A's merge
+  // against B's blob and read a preserved merge as a rewrite (Codex verify pass
+  // on PR #704: the snapshot-order lookup this replaces had exactly that hole).
+  // Best-effort: a failed stamp leaves the column NULL, which the sync reads as
+  // "no PR on record → nothing to measure", never as a match or a mismatch.
+  private async recordPushedPr(book: string, resource: Resource, readAt: number, prNumber: number): Promise<void> {
+    try {
+      await this.env.DB.prepare(
+        `UPDATE book_resource_syncs SET pushed_pr_number = ?3
+          WHERE book = ?1 AND resource = ?2 AND pushed_read_at = ?4`,
+      )
+        .bind(book, resource, prNumber, readAt)
+        .run();
+    } catch (e) {
+      console.error("export pushed-PR stamp failed (migration 0061 unapplied?)", {
+        book,
+        resource,
+        prNumber,
+        error: e instanceof Error ? e.message : String(e),
+      });
     }
   }
 

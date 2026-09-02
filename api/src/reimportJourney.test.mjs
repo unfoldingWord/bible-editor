@@ -3369,24 +3369,15 @@ console.log("\n[own-publish decline accounting: measured at the merge commit, re
   const BOT_PUSH = { sha: "863fbfa65119", message: "TQ: JER 10 [ju..7@api.bp-assistant]", authorEmail: "bot@bp-assistant", authorName: "BW Bot", date: "2026-09-01T23:49:46Z" };
   const FILE = { repo: "en_tq", path: `tq_${BOOK}.tsv` };
   const SOURCE = `own_publish_inert:${BOOK}:tq`;
-  // The export's own record of the push: pushed_blob_sha/read_at on the sync row,
-  // and the PR it opened for that render on export_snapshots (written after the
-  // render read, in the same export step).
-  const seedSync = (sqlite, declines, { prNumber = 859, prAt = READ_AT + 120 } = {}) => {
+  // The export's own record of the push: pushed_blob_sha/read_at and the PR it
+  // opened for that render (pushed_pr_number, 0061), all on the sync row.
+  const seedSync = (sqlite, declines, { prNumber = 859 } = {}) => {
     sqlite
       .prepare(
-        `INSERT INTO book_resource_syncs (book, resource, source_sha, origin, pushed_blob_sha, pushed_read_at, own_publish_declines)
-         VALUES (?, 'tq', 'sha0', 'reimport', ?, ?, ?)`,
+        `INSERT INTO book_resource_syncs (book, resource, source_sha, origin, pushed_blob_sha, pushed_read_at, own_publish_declines, pushed_pr_number)
+         VALUES (?, 'tq', 'sha0', 'reimport', ?, ?, ?, ?)`,
       )
-      .run(BOOK, PUSHED, READ_AT, declines);
-    if (prNumber != null) {
-      sqlite
-        .prepare(
-          `INSERT INTO export_snapshots (book, resource, branch, commit_sha, rows_exported, pr_number, committed_at)
-           VALUES (?, 'tq', 'JER-be-x', 'd1861f72363b', 900, ?, ?)`,
-        )
-        .run(BOOK, prNumber, prAt);
-    }
+      .run(BOOK, PUSHED, READ_AT, declines, prNumber);
     return { sourceSha: "sha0", syncedAt: null, pushedBlobSha: PUSHED, pushedReadAt: READ_AT, pushedEditId: null, declines };
   };
   const seedBanner = (sqlite) =>
@@ -3472,11 +3463,8 @@ console.log("\n[own-publish decline accounting: measured at the merge commit, re
 
     // A NEW export (#861) whose merge is also rewritten: counts, banner NOT re-raised.
     sqlite
-      .prepare(
-        `INSERT INTO export_snapshots (book, resource, branch, commit_sha, rows_exported, pr_number, committed_at)
-         VALUES (?, 'tq', 'JER-be-x', 'aaaa1111', 900, 861, ?)`,
-      )
-      .run(BOOK, READ_AT + 86400);
+      .prepare(`UPDATE book_resource_syncs SET pushed_pr_number = 861, pushed_read_at = ? WHERE book = ? AND resource = 'tq'`)
+      .run(READ_AT + 86000, BOOK);
     const MERGE_861 = { ...OUR_MERGE, sha: "5555aaaa6666", message: "bible-editor: JER tq → master (#861)", date: "2026-09-02T05:40:00Z" };
     await withGitea(gitea([MERGE_861, BOT_PUSH, OUR_MERGE], "1111deadbeef00000000000000000000deadbeef"), () =>
       accountOwnPublishDeclineForTest(env, BOOK, "tq", FILE, null, { ...sync, pushedReadAt: READ_AT + 86000, declines: 3 }),
@@ -3498,13 +3486,13 @@ console.log("\n[own-publish decline accounting: measured at the merge commit, re
     eq(g.calls.trees, 0, "…and no tree read is spent on it");
   }
 
-  // (f) The push has no PR on record (only an OLDER export's PR row exists): nothing to look for.
+  // (f) The push has no PR on record (creation failed, or it predates 0061): nothing to look for.
   {
     const { sqlite, env } = freshEnv();
-    const sync = seedSync(sqlite, 2, { prNumber: 859, prAt: READ_AT - 86400 });
+    const sync = seedSync(sqlite, 2, { prNumber: null });
     const g = gitea([BOT_PUSH, OUR_MERGE], "0000deadbeef00000000000000000000deadbeef");
     await withGitea(g, () => accountOwnPublishDeclineForTest(env, BOOK, "tq", FILE, null, sync));
-    eq(readState(sqlite).declines, 2, "a PR row older than the render read does not identify this push's merge → counter unchanged");
+    eq(readState(sqlite).declines, 2, "no PR recorded for this push → nothing to measure, counter unchanged");
     eq(g.calls.trees, 0, "…and no tree read is spent on it");
   }
 

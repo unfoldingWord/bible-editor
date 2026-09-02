@@ -224,8 +224,9 @@ export type OurMergeMatch =
 // walk, newest-first, over a window that starts at or before the render read
 // (master_confirmed_at is always older than pushed_read_at; a dedicated walk
 // from pushed_read_at is used when there is no watermark yet). `prNumber` is
-// the export PR opened for that render (export_snapshots.pr_number on the row
-// written after the push; null when PR creation failed or nothing is recorded).
+// the export PR opened for that render (book_resource_syncs.pushed_pr_number,
+// stamped by the export onto the pushed render itself and guarded on its read
+// time; null when PR creation failed or nothing is recorded).
 //
 // Gitea's squash merge titles the master commit `<PR title> (#N)` — measured on
 // every `bible-editor:` merge in en_tq's history — and only `ours` commits are

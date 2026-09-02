@@ -78,8 +78,9 @@ Highlights that bite repeatedly:
   was `BW Bot` pushing a TQ chapter (`TQ: JER N [..@api.bp-assistant]`, squash-merged from an `AI TQ for JER N` PR)
   between every one of our ~05:40Z merges (23:49Z, 01:16Z, 17:56Z …). What the code now encodes:
   `accountOwnPublishDecline` MEASURES a `content_differs` decline — it finds the merge of our push (the `ours`
-  commit whose subject carries our export PR's `(#N)`, from `export_snapshots.pr_number`; Gitea's squash appends
-  it) and reads the file's blob sha at that commit via Gitea's tree endpoint (`fileBlobShaAtCommit`). Equal to
+  commit whose subject carries our export PR's `(#N)` — Gitea's squash appends it; the PR is stamped on the
+  pushed render as `pushed_pr_number`, guarded on its read time so overlapping exports cannot cross) and reads the
+  file's blob sha at that commit via Gitea's tree endpoint (`fileBlobShaAtCommit`). Equal to
   `pushed_blob_sha` → preserved: counter 0, banner down, the later commit named. Different → a measured rewrite,
   counted once per merge (`own_publish_rewrite_sha`), the only thing that counts toward the banner, even under a
   later bot push. Do not infer this from the newest commit's author (a bot push on top of a real rewrite would
