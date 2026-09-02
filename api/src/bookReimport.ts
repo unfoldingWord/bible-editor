@@ -67,12 +67,14 @@ import {
   type MasterLineageSummary,
 } from "./masterLineage.ts";
 import {
+  findOurMergeAfterRead,
   gitBlobShaOrNull,
   judgeOwnPublishDecline,
   recognizeOwnPublish,
   type OwnPublishDeclineVerdict,
   type OwnPublishResult,
 } from "./ownPublish";
+import { fileBlobShaAtCommit } from "./dcsSources";
 import {
   collectSourceWords,
   extractVersesForRange,
@@ -3879,9 +3881,18 @@ async function loadMasterLineage(
   ownDecline: ResourceSyncState | null = null,
 ): Promise<MasterLineageSummary | null> {
   const file = dcsResourceFile(book, resource);
-  if (!file || confirmedAt == null) return null;
+  if (!file) return null;
+  if (confirmedAt == null) {
+    // No watermark, so no lineage to compute — but the decline still has to be
+    // accounted for, on its own walk. A pair whose very first merge is being
+    // rewritten never GETS a watermark (recognition never fires), so gating the
+    // detector on one would leave it blind for exactly the pairs it exists for
+    // (cold review F3 / Codex P1 on this change).
+    if (ownDecline) await accountOwnPublishDecline(env, book, resource, file, null, ownDecline);
+    return null;
+  }
   const page = await listMasterCommitsSince(env, file.repo, file.path, null, { sinceTime: confirmedAt });
-  if (ownDecline) await accountOwnPublishDecline(env, book, resource, page, ownDecline);
+  if (ownDecline) await accountOwnPublishDecline(env, book, resource, file, page, ownDecline);
   const commits = page.commits.map(classifyMasterCommit);
   // #557: narrow "a human touched this file" to "a human touched THIS verse",
   // but only where it is affordable and only where the file-level answer is
@@ -6608,7 +6619,7 @@ export async function recordResourceSync(
 // method is shaped the way it is is the Cloudflare subrequest budget (see the
 // nightly-sync-subrequest-cap lesson in STATE.md) — this keeps the own-publish
 // recognition free of any extra D1 round trip.
-interface ResourceSyncState {
+export interface ResourceSyncState {
   sourceSha: string | null;
   // When we last stamped this pair's watermark, i.e. when D1 adopted
   // `sourceSha` (migration 0028, so present in every fallback tier below except
@@ -6778,18 +6789,25 @@ async function recognizePushedRender(raw: string, sync: ResourceSyncState): Prom
   });
 }
 
-// Attribute tonight's `content_differs` decline from the lineage walk's newest
-// commit (judgeOwnPublishDecline in ownPublish.ts has the argument), and keep the
-// consecutive-"rewritten" counter that drives the inert banner:
-//   explained  — a non-ours commit is master's newest for this file. The
-//                divergence has a measured cause, so it is NOT evidence of
-//                inertness: counter to 0, and any standing banner (whose premise
-//                was "cannot tell them apart") comes down.
-//   rewritten  — our own merge is the newest commit, it landed after the render
-//                was read, and the bytes still differ: the merge job changed
-//                what we pushed. Counter +1; at the threshold, the banner.
+// Attribute tonight's `content_differs` decline by MEASURING the merge of our
+// push (findOurMergeAfterRead + judgeOwnPublishDecline in ownPublish.ts have the
+// argument), and keep the measured-rewrite counter that drives the inert banner:
+//   preserved  — the merge of our push holds exactly the bytes we pushed, so the
+//                merge job is proven not to be rewriting this file; tonight's
+//                mismatch is whatever landed after it (named from the walk).
+//                Counter to 0, and any standing banner comes down — this is the
+//                one observation that refutes the banner's claim.
+//   rewritten  — the merge of our push holds other bytes: the merge job changed
+//                what we pushed, measured directly, whatever landed afterwards.
+//                Counter +1; on crossing the threshold, the banner.
 //   unmeasured — nothing to say tonight (walk empty, tonight's branch not merged
-//                yet, missing dates). The counter does not move on absence.
+//                yet, missing dates, tree read failed). The counter does not move
+//                on absence, in either direction.
+// The walk is the lineage walk when the pair has one (its window starts at
+// master_confirmed_at, which is always older than pushed_read_at), and a fresh
+// one from pushed_read_at when it does not. The blob read is one tree fetch per
+// declining pair per night, only when a merge after the read exists.
+//
 // Only `content_differs` reaches here (the call sites gate on it). The other
 // declines mean the comparison never really ran (unhashable master, half-written
 // row), and counting "we couldn't measure" as "we measured a difference" is the
@@ -6800,25 +6818,44 @@ async function accountOwnPublishDecline(
   env: Env,
   book: string,
   resource: Resource,
-  page: MasterCommitPage,
+  file: { repo: string; path: string },
+  walked: MasterCommitPage | null,
   sync: ResourceSyncState,
 ): Promise<void> {
-  const newest = page.commits[0] ? classifyMasterCommit(page.commits[0]) : null;
-  const judged = judgeOwnPublishDecline(newest, sync.pushedReadAt);
   const source = `own_publish_inert:${book}:${resource}`;
   const prior = sync.declines ?? 0;
   try {
+    if (!sync.pushedBlobSha) return; // content_differs implies a pushed render; defensive only
+    const page =
+      walked ??
+      (sync.pushedReadAt == null
+        ? { commits: [], incomplete: true, incompleteReason: "no_pushed_read_at" }
+        : await listMasterCommitsSince(env, file.repo, file.path, null, {
+            sinceTime: sync.pushedReadAt,
+            pageLimit: 2,
+          }));
+    const commits = page.commits.map(classifyMasterCommit);
+    const ourMerge = findOurMergeAfterRead(commits, sync.pushedReadAt);
+    const mergedBlobSha = ourMerge.found ? await fileBlobShaAtCommit(env, file.repo, file.path, ourMerge.commit.sha) : null;
+    const judged = judgeOwnPublishDecline({
+      ourMerge,
+      mergedBlobSha,
+      pushedBlobSha: sync.pushedBlobSha,
+      newest: commits[0],
+    });
+
     if (judged.verdict === "unmeasured") {
       console.log("reimport own-publish decline unmeasured: counter unchanged", {
         book,
         resource,
         reason: judged.reason,
-        consecutiveRewrites: prior,
+        measuredRewrites: prior,
         pushedReadAt: sync.pushedReadAt,
+        walkedFrom: walked ? "lineage" : "pushed_read_at",
       });
       return;
     }
-    if (judged.verdict === "explained") {
+    if (judged.verdict === "preserved") {
       if (prior !== 0) {
         await env.DB.prepare(
           `UPDATE book_resource_syncs SET own_publish_declines = 0 WHERE book = ?1 AND resource = ?2`,
@@ -6829,41 +6866,64 @@ async function accountOwnPublishDecline(
       await env.DB.prepare(`DELETE FROM system_alerts WHERE username = ?1 AND source = ?2 AND dismissed_at IS NULL`)
         .bind(OWN_PUBLISH_ALERT_USERNAME, source)
         .run();
-      console.log("reimport own-publish decline explained: master's newest commit to this file is not ours", {
+      console.log("reimport own-publish decline explained: our merge landed our exact bytes; a later commit moved the file", {
         book,
         resource,
-        commitKind: judged.kind,
-        commitSha: judged.sha,
-        commitAuthor: judged.author,
-        commitDate: judged.date,
+        mergeSha: judged.mergeSha,
+        mergeDate: judged.mergeDate,
+        pushedBlobSha: sync.pushedBlobSha,
+        newestKind: judged.newest?.kind ?? null,
+        newestSha: judged.newest?.sha ?? null,
+        newestAuthor: judged.newest?.author ?? null,
+        newestDate: judged.newest?.date ?? null,
         resetFrom: prior,
       });
       return;
     }
-    const next = prior + 1;
-    await env.DB.prepare(
-      `UPDATE book_resource_syncs SET own_publish_declines = ?3 WHERE book = ?1 AND resource = ?2`,
+    // Atomic increment: this runs inside a retried Workflow step, and a
+    // read-modify-write from `prior` would double-count a retry (cold review F7).
+    const row = await env.DB.prepare(
+      `UPDATE book_resource_syncs SET own_publish_declines = own_publish_declines + 1
+        WHERE book = ?1 AND resource = ?2 RETURNING own_publish_declines`,
     )
-      .bind(book, resource, next)
-      .run();
-    console.log("reimport own-publish decline measured as a rewrite: our own merge is newest and the bytes differ", {
+      .bind(book, resource)
+      .first<{ own_publish_declines: number }>();
+    const next = row?.own_publish_declines ?? prior + 1;
+    console.log("reimport own-publish decline measured as a rewrite: the merge of our push holds different bytes", {
       book,
       resource,
-      mergeSha: judged.sha,
-      mergeDate: judged.date,
+      mergeSha: judged.mergeSha,
+      mergeDate: judged.mergeDate,
+      mergedBlobSha: judged.mergedBlobSha,
       pushedBlobSha: sync.pushedBlobSha,
-      consecutiveRewrites: next,
+      measuredRewrites: next,
     });
-    if (next >= OWN_PUBLISH_INERT_THRESHOLD) await raiseOwnPublishInertAlert(env, book, resource, next, sync, judged);
+    // Raise on the CROSSING only (prior below, next at or above), so a standing
+    // state does not re-raise nightly — and a dismissed banner stays dismissed
+    // until a preserved/recognized night resets the count and it climbs again.
+    if (prior < OWN_PUBLISH_INERT_THRESHOLD && next >= OWN_PUBLISH_INERT_THRESHOLD) {
+      await raiseOwnPublishInertAlert(env, book, resource, next, sync, judged);
+    }
   } catch (e) {
     console.error("reimport own-publish decline accounting failed", {
       book,
       resource,
-      verdict: judged.verdict,
       error: e instanceof Error ? e.message : String(e),
     });
   }
 }
+
+// Lets reimportJourney.test.mjs drive the REAL accounting (its SQL and its
+// Gitea reads, against a mocked fetch) — same rationale as the other *ForTest
+// aliases above.
+export const accountOwnPublishDeclineForTest = (
+  env: Env,
+  book: string,
+  resource: Resource,
+  file: { repo: string; path: string },
+  walked: MasterCommitPage | null,
+  sync: ResourceSyncState,
+): Promise<void> => accountOwnPublishDecline(env, book, resource, file, walked, sync);
 
 // Banner for issue #427's withhold. This one NEEDS an alert in a way the
 // lock-held withholds do not, and the difference is the whole reason it exists:
@@ -7055,18 +7115,21 @@ async function clearTombstoneBlockAlert(env: Env, book: string, resource: Resour
 }
 
 // Banner for "the merge keeps changing our bytes." Raised by accountOwnPublishDecline
-// once the consecutive-rewrite counter reaches the threshold, and kept to ONE active
-// row per (book, resource): the counter keeps climbing while the state persists, but
-// an already-standing banner is left alone rather than rewritten every night. It
-// comes down on the first byte match (markOwnPublishConverged) or the first night a
-// non-ours commit explains the difference instead (accountOwnPublishDecline).
+// on the night the measured-rewrite counter CROSSES the threshold (once per climb —
+// the counter keeps climbing while the state persists, but the banner is not
+// rewritten nightly, and a dismissed one stays dismissed until the count resets and
+// climbs again). It comes down on the first byte match (markOwnPublishConverged) or
+// the first night the merge of our push is measured to hold our exact bytes
+// (accountOwnPublishDecline's `preserved`).
 //
 // The wording states ONLY what was measured, and this banner now has a measurement
-// to state: master's newest commit to the file is our own export's merge, dated
-// after the render it merged was read, and the file's bytes are still not the ones
-// we pushed. That is the merge job changing our content, not an editor — so the
-// text names the cause and its consequence, and the two shas that let a human
-// confirm it, instead of listing two explanations and asking for a `git hash-object`.
+// to state: the file's blob sha at the master commit that merged our push is not
+// the blob sha we pushed. That is the merge job changing our content — whatever an
+// editor or the bot did afterwards — so the text names the cause, its consequence,
+// and the shas that let a human confirm it, instead of listing two explanations
+// and asking for a `git hash-object`. "Measured on N syncs" rather than "N in a
+// row": nights the merge had not landed yet, or the tree read failed, are not
+// counted either way and may sit between the measured ones.
 async function raiseOwnPublishInertAlert(
   env: Env,
   book: string,
@@ -7077,22 +7140,16 @@ async function raiseOwnPublishInertAlert(
 ): Promise<void> {
   const source = `own_publish_inert:${book}:${resource}`;
   const message =
-    `Benjamin — for ${rewrites} syncs in a row, Door43's ${book} ${resource.toUpperCase()} file has come back ` +
-    `different from the exact bytes our export pushed (our blob ${(sync.pushedBlobSha ?? "none").slice(0, 12)}), ` +
-    `and each time the newest commit to that file on master was our own export's merge ` +
-    `(latest ${judged.sha.slice(0, 12)}${judged.date ? ` on ${judged.date.slice(0, 10)}` : ""}) — no editor and no ` +
-    `bot committed after it. So Door43's validate-and-merge job is changing the file as it merges. While that ` +
-    `holds, master never reads as our own render, the merge-ancestor watermark for this file stays frozen, and ` +
-    `the protection against the nightly sync reverting editor work is inert for it. Confirm by comparing the ` +
-    `file's blob sha at that master commit against our pushed blob above. This clears itself the first time ` +
-    `they match, or the first night another account's commit explains the difference.`;
+    `Benjamin — on ${rewrites} nightly syncs since the last time Door43's ${book} ${resource.toUpperCase()} file ` +
+    `matched our export, the merge of our own push has landed with different bytes from the ones we pushed. ` +
+    `Latest: master commit ${judged.mergeSha.slice(0, 12)}${judged.mergeDate ? ` (${judged.mergeDate.slice(0, 10)})` : ""} ` +
+    `holds blob ${judged.mergedBlobSha.slice(0, 12)}; we pushed blob ${(sync.pushedBlobSha ?? "none").slice(0, 12)}. ` +
+    `That is Door43's validate-and-merge job changing the file as it merges — measured at the merge commit itself, ` +
+    `so it is not an editor's or the bot's later commit. While that holds, master never reads as our own render, ` +
+    `the merge-ancestor watermark for this file stays frozen, and the protection against the nightly sync ` +
+    `reverting editor work is inert for it. Confirm with \`git hash-object\` on the file at that commit. This ` +
+    `clears itself the first night the merge of our push holds our exact bytes.`;
   try {
-    const standing = await env.DB.prepare(
-      `SELECT 1 AS one FROM system_alerts WHERE username = ?1 AND source = ?2 AND dismissed_at IS NULL LIMIT 1`,
-    )
-      .bind(OWN_PUBLISH_ALERT_USERNAME, source)
-      .first<{ one: number }>();
-    if (standing) return;
     await env.DB.prepare(`DELETE FROM system_alerts WHERE username = ?1 AND source = ?2 AND dismissed_at IS NULL`)
       .bind(OWN_PUBLISH_ALERT_USERNAME, source)
       .run();

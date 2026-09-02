@@ -76,11 +76,14 @@ Highlights that bite repeatedly:
   #859, #863, #864, #865): the PR head's blob sha equalled master's blob sha at the squash commit every time — #859's
   head was exactly the `ba421e896eab` the JER tq inert banner named. What tripped that banner three nights running
   was `BW Bot` pushing a TQ chapter (`TQ: JER N [..@api.bp-assistant]`, squash-merged from an `AI TQ for JER N` PR)
-  between every one of our ~05:40Z merges (23:49Z, 01:16Z, 17:56Z …). Two consequences the code now encodes:
-  `accountOwnPublishDecline` attributes a `content_differs` decline from the lineage walk's NEWEST commit (not ours →
-  explained, counter reset, banner down; ours and dated after the render read → measured rewrite, the only thing that
-  counts toward the banner), and `merge_kept` is a retired flag kind — a keep_ai_master outcome rests on a complete
-  human=0 lineage, so it asks nothing of a proofreader. The deeper cause both symptoms share is still open as #658:
+  between every one of our ~05:40Z merges (23:49Z, 01:16Z, 17:56Z …). What the code now encodes:
+  `accountOwnPublishDecline` MEASURES a `content_differs` decline — it finds the merge of our push (newest `ours`
+  commit dated at/after `pushed_read_at`) and reads the file's blob sha at that commit via Gitea's tree endpoint
+  (`fileBlobShaAtCommit`). Equal to `pushed_blob_sha` → preserved: counter 0, banner down, the later commit named.
+  Different → a measured rewrite, the only thing that counts toward the banner, even under a later bot push. Do not
+  infer this from the newest commit's author: a bot push on top of a real rewrite would hide it. (`merge_kept` is
+  retired as a flag kind on the sibling branch `fix/retire-merge-kept-flag`: a keep_ai_master outcome rests on a
+  complete human=0 lineage, so it asks nothing of a proofreader.) The deeper cause both symptoms share is still #658:
   the own-publish watermark freezes whenever a bot push lands after our export, so every later app edit reads as
   "both sides changed since the last confirmed publish". Also measured: a Gitea squash commit's author date is the
   merge time (05:42:19Z for a branch committed 05:41:14Z), and Gitea reports our merged `-be-` PRs as

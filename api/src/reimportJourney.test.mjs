@@ -39,6 +39,7 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
+  accountOwnPublishDeclineForTest,
   applyTsvRows,
   clearResolvedMergeNoBaseForTest,
   recordResourceSync,
@@ -3353,6 +3354,134 @@ console.log("\n[#683: the sweep reaches books no run visits, and pre-#653 flags 
     } finally {
       globalThis.fetch = realFetch;
     }
+  }
+}
+
+console.log("\n[own-publish decline accounting: measured at the merge commit, real SQL, mocked Gitea]");
+{
+  // PROD SHAPE (JER tq, 2026-09-01/02): our nightly push merges at ~05:40Z, the
+  // bp-assistant bot pushes a chapter on top in the evening, and the next
+  // morning's byte comparison declines. The blind counter had reached 3 and raised
+  // the "cannot tell them apart" banner. Here the same night is measured.
+  const READ_AT = Date.parse("2026-09-01T05:31:00Z") / 1000;
+  const PUSHED = "ba421e896eab0000000000000000000000000000";
+  const OUR_MERGE = { sha: "22d652732b18", message: "bible-editor: JER tq → master (#859)", authorEmail: "b@x", authorName: "Benjamin Wright", date: "2026-09-01T05:38:03Z" };
+  const BOT_PUSH = { sha: "863fbfa65119", message: "TQ: JER 10 [ju..7@api.bp-assistant]", authorEmail: "bot@bp-assistant", authorName: "BW Bot", date: "2026-09-01T23:49:46Z" };
+  const FILE = { repo: "en_tq", path: `tq_${BOOK}.tsv` };
+  const SOURCE = `own_publish_inert:${BOOK}:tq`;
+  const seedSync = (sqlite, declines) => {
+    sqlite
+      .prepare(
+        `INSERT INTO book_resource_syncs (book, resource, source_sha, origin, pushed_blob_sha, pushed_read_at, own_publish_declines)
+         VALUES (?, 'tq', 'sha0', 'reimport', ?, ?, ?)`,
+      )
+      .run(BOOK, PUSHED, READ_AT, declines);
+    return { sourceSha: "sha0", syncedAt: null, pushedBlobSha: PUSHED, pushedReadAt: READ_AT, pushedEditId: null, declines };
+  };
+  const seedBanner = (sqlite) =>
+    sqlite
+      .prepare(`INSERT INTO system_alerts (username, severity, source, message) VALUES ('deferredreward', 'warning', ?, 'old blind banner')`)
+      .run(SOURCE);
+  const readState = (sqlite) => ({
+    declines: sqlite.prepare(`SELECT own_publish_declines AS d FROM book_resource_syncs WHERE book = ? AND resource = 'tq'`).get(BOOK).d,
+    banners: sqlite.prepare(`SELECT message FROM system_alerts WHERE source = ? AND dismissed_at IS NULL`).all(SOURCE),
+  });
+  // A Gitea that serves the commit walk AND the merge commit's tree, counting each.
+  const gitea = (commits, blobAtMerge) => {
+    const calls = { commits: 0, trees: 0 };
+    const fetchImpl = async (url) => {
+      if (String(url).includes("/git/trees/")) {
+        calls.trees++;
+        return { ok: true, json: async () => ({ sha: OUR_MERGE.sha, truncated: false, tree: [{ path: FILE.path, type: "blob", sha: blobAtMerge }] }) };
+      }
+      calls.commits++;
+      return giteaPage(commits)();
+    };
+    return { calls, fetchImpl };
+  };
+  const withGitea = async (g, fn) => {
+    const real = globalThis.fetch;
+    globalThis.fetch = g.fetchImpl;
+    try {
+      return await fn();
+    } finally {
+      globalThis.fetch = real;
+    }
+  };
+
+  // (a) THE JER NIGHT, measured: the merge holds our exact bytes → preserved. The
+  //     blind-era counter (3) resets and the standing banner comes down.
+  {
+    const { sqlite, env } = freshEnv();
+    const sync = seedSync(sqlite, 3);
+    seedBanner(sqlite);
+    const g = gitea([BOT_PUSH, OUR_MERGE], PUSHED);
+    await withGitea(g, () => accountOwnPublishDeclineForTest(env, BOOK, "tq", FILE, null, sync));
+    const s = readState(sqlite);
+    eq(s.declines, 0, "merge blob == pushed blob resets the counter (the bot's push explains tonight's mismatch)");
+    eq(s.banners.length, 0, "…and the standing banner comes down");
+    eq(g.calls.commits, 1, "with no lineage walk to reuse, one commit walk from pushed_read_at was fetched");
+    eq(g.calls.trees, 1, "…and one tree read at the merge commit");
+  }
+
+  // (b) The same night with the lineage walk handed in: no second commit fetch.
+  {
+    const { sqlite, env } = freshEnv();
+    const sync = seedSync(sqlite, 2);
+    const g = gitea([BOT_PUSH, OUR_MERGE], PUSHED);
+    const walked = { commits: [BOT_PUSH, OUR_MERGE], incomplete: false, incompleteReason: "" };
+    await withGitea(g, () => accountOwnPublishDeclineForTest(env, BOOK, "tq", FILE, walked, sync));
+    eq(readState(sqlite).declines, 0, "a reused walk reaches the same verdict");
+    eq(g.calls.commits, 0, "…without a second commit fetch");
+    eq(g.calls.trees, 1, "…paying only the tree read");
+  }
+
+  // (c) A REWRITE, under the bot's push: the merge commit holds other bytes. The
+  //     counter climbs, and on crossing the threshold the banner names the measurement.
+  {
+    const { sqlite, env } = freshEnv();
+    const sync = seedSync(sqlite, 2);
+    const g = gitea([BOT_PUSH, OUR_MERGE], "0000deadbeef00000000000000000000deadbeef");
+    await withGitea(g, () => accountOwnPublishDeclineForTest(env, BOOK, "tq", FILE, null, sync));
+    const s = readState(sqlite);
+    eq(s.declines, 3, "merge blob != pushed blob counts as a measured rewrite even with a bot push on top");
+    eq(s.banners.length, 1, "…and crossing the threshold raises the banner");
+    eq(s.banners[0].message.includes("holds blob 0000deadbeef"), true, "…which states the blob the merge holds");
+    eq(s.banners[0].message.includes("we pushed blob ba421e896eab"), true, "…and the blob we pushed");
+    eq(s.banners[0].message.includes("22d652732b18"), true, "…and the merge commit");
+    eq(s.banners[0].message.includes("cannot tell them apart"), false, "…and never the old two-explanations text");
+
+    // Another rewritten night: the counter climbs, the banner is NOT re-raised.
+    const sync2 = { ...sync, declines: 3 };
+    await withGitea(gitea([BOT_PUSH, OUR_MERGE], "0000deadbeef00000000000000000000deadbeef"), () =>
+      accountOwnPublishDeclineForTest(env, BOOK, "tq", FILE, null, sync2),
+    );
+    const s2 = readState(sqlite);
+    eq(s2.declines, 4, "a further measured rewrite keeps counting");
+    eq(s2.banners.length, 1, "…without a second banner (raise on the crossing only)");
+  }
+
+  // (d) Unmeasured nights leave the counter alone, in both directions.
+  {
+    const { sqlite, env } = freshEnv();
+    const sync = seedSync(sqlite, 2);
+    seedBanner(sqlite);
+    // Tonight's branch has not merged: only a merge from BEFORE the read is on master.
+    const older = { ...OUR_MERGE, sha: "0abeb26ff896", date: "2026-08-31T05:36:55Z" };
+    const g1 = gitea([older], PUSHED);
+    await withGitea(g1, () => accountOwnPublishDeclineForTest(env, BOOK, "tq", FILE, null, sync));
+    eq(readState(sqlite).declines, 2, "merge pending → counter unchanged");
+    eq(g1.calls.trees, 0, "…and no tree read is spent on it");
+    eq(readState(sqlite).banners.length, 1, "…and a standing banner is left standing");
+    // The merge is there but the tree read fails.
+    const g2 = { calls: { commits: 0, trees: 0 }, fetchImpl: async (url) => (String(url).includes("/git/trees/") ? { ok: false, json: async () => ({}) } : giteaPage([BOT_PUSH, OUR_MERGE])()) };
+    await withGitea(g2, () => accountOwnPublishDeclineForTest(env, BOOK, "tq", FILE, null, sync));
+    eq(readState(sqlite).declines, 2, "a failed tree read → counter unchanged");
+    // No read time recorded: nothing can be placed.
+    await withGitea(gitea([BOT_PUSH, OUR_MERGE], PUSHED), () =>
+      accountOwnPublishDeclineForTest(env, BOOK, "tq", FILE, null, { ...sync, pushedReadAt: null }),
+    );
+    eq(readState(sqlite).declines, 2, "no pushed_read_at → counter unchanged");
   }
 }
 

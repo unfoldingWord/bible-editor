@@ -183,19 +183,23 @@ export function recognizeOwnPublish(input: OwnPublishInput): OwnPublishResult {
 //   (b) Door43's validate-and-merge job rewrote our bytes when it merged, so
 //       master never reads as our own render — the one way recognition can be
 //       quietly inert while the nightly reverts continue.
-// The lineage walk the sync runs a moment later fetches the file's commits
-// newest-first, and the NEWEST commit settles it: if it is not ours, master
-// moved after us for a reason the walk can name (a); if it IS our own merge and
-// landed after the render was read, then the merge landed and the bytes still
-// differ (b). Our merge landing BEFORE the render was read is the previous
-// night's merge — tonight's `-be-` branch has not merged yet — which is a
-// normal state, not a measurement of either. Pure, so the decision has a unit
-// test; bookReimport.ts owns the counter and the banner it drives.
+// The question is answered DIRECTLY, not inferred from who committed last: find
+// the merge of the render we pushed — the newest `ours` commit on master dated
+// at or after the render's D1 read — and read the file's blob sha AT THAT
+// COMMIT (dcsSources.ts fileBlobShaAtCommit, one tree read). Equal to the blob
+// we pushed: the merge preserved our bytes, and tonight's mismatch is whatever
+// landed after it (a), which the walk names. Different: the merge changed our
+// bytes (b), measured even when a bot pushed on top afterwards — a cold review
+// of the first draft showed that inferring from the newest commit alone let an
+// interleaved bot push reset a real rewrite's count and hide it. No `ours`
+// commit dated after the read: tonight's `-be-` branch has not merged yet,
+// which is a normal state and measures nothing. Two pure steps so both have
+// unit tests; bookReimport.ts owns the fetches, the counter and the banner.
 //
 // Measured against git.door43.org 2026-09-02, five recent `bible-editor:` PRs
 // across three books: the PR head's blob sha equalled master's blob sha at the
-// squash commit every time — so (b) is not happening today. This function
-// exists so that, the day it does, the banner says so from evidence instead of
+// squash commit every time — so (b) is not happening today. This code exists
+// so that, the day it does, the banner says so from evidence instead of
 // listing both explanations and asking a human to run `git hash-object`.
 
 /** The structural subset of masterLineage.ts's ClassifiedCommit this reads. */
@@ -207,50 +211,87 @@ export interface OwnPublishDeclineCommit {
   authorName?: string | null;
 }
 
+export type OurMergeAfterRead =
+  | { found: true; commit: OwnPublishDeclineCommit }
+  | { found: false; reason: "no_commits" | "no_pushed_read_at" | "no_commit_date" | "merge_pending" };
+
+// Step 1 (pure): which commit merged the render we pushed? `commits` is the
+// walk, newest-first, over a window that starts at or before the render read
+// (master_confirmed_at is always older than pushed_read_at; a dedicated walk
+// from pushed_read_at is used when there is no watermark yet).
+//
+// Measured 2026-09-02 on en_tq #864: a Gitea squash commit's author date is the
+// merge time itself (05:42:19Z, for a -be- branch committed 05:41:14Z), and
+// both sit AFTER recordPushedRender's D1 read of that render. So the newest
+// `ours` commit dated >= the read is tonight's merge; an `ours` commit dated
+// before it is an earlier night's, and if that is all there is, tonight's
+// branch is still waiting to merge.
+export function findOurMergeAfterRead(
+  commits: readonly OwnPublishDeclineCommit[],
+  pushedReadAt: number | null,
+): OurMergeAfterRead {
+  if (commits.length === 0) return { found: false, reason: "no_commits" };
+  if (pushedReadAt == null) return { found: false, reason: "no_pushed_read_at" };
+  let undatedOurs = 0;
+  for (const c of commits) {
+    if (c.kind !== "ours") continue;
+    const at = c.date ? Date.parse(c.date) : NaN;
+    if (!Number.isFinite(at)) {
+      undatedOurs++;
+      continue;
+    }
+    if (at / 1000 >= pushedReadAt) return { found: true, commit: c };
+  }
+  // An undated `ours` commit cannot be placed relative to the read, so "pending"
+  // would be a guess; say what was actually missing.
+  return { found: false, reason: undatedOurs > 0 ? "no_commit_date" : "merge_pending" };
+}
+
 export type OwnPublishDeclineVerdict =
   | {
-      /** Master's newest commit to the file is not ours: the divergence has a named cause. */
-      verdict: "explained";
-      kind: "ai" | "human";
-      sha: string;
-      author: string | null;
-      date: string | null;
+      /** The merge landed the bytes we pushed; whatever is newest on master now came after it. */
+      verdict: "preserved";
+      mergeSha: string;
+      mergeDate: string | null;
+      /** Master's newest commit — the cause of tonight's byte mismatch — when it is not that merge. */
+      newest: { kind: "ai" | "human" | "ours"; sha: string; author: string | null; date: string | null } | null;
     }
   | {
-      /** Master's newest commit IS our own merge, landed after the render was read, and the bytes still differ. */
+      /** The merge of our push holds bytes other than the ones we pushed. */
       verdict: "rewritten";
-      sha: string;
-      date: string | null;
+      mergeSha: string;
+      mergeDate: string | null;
+      mergedBlobSha: string;
     }
   | {
       verdict: "unmeasured";
-      reason: "no_commits" | "no_commit_date" | "no_pushed_read_at" | "merge_pending";
+      reason: "no_commits" | "no_pushed_read_at" | "no_commit_date" | "merge_pending" | "merge_blob_unknown";
     };
 
-export function judgeOwnPublishDecline(
-  newest: OwnPublishDeclineCommit | null | undefined,
-  pushedReadAt: number | null,
-): OwnPublishDeclineVerdict {
-  // No commit in the walked window at all (or the fetch fell over and the page
-  // is empty). Nothing measured — the counter must not move on absence.
-  if (!newest) return { verdict: "unmeasured", reason: "no_commits" };
-  if (newest.kind !== "ours") {
-    return {
-      verdict: "explained",
-      kind: newest.kind,
-      sha: newest.sha,
-      author: newest.authorName ?? null,
-      date: newest.date ?? null,
-    };
+// Step 2 (pure): the verdict, given step 1's answer and the blob sha the caller
+// read at that merge commit (`null` when the read failed — absence is not a
+// match, and not a mismatch either).
+export function judgeOwnPublishDecline(input: {
+  ourMerge: OurMergeAfterRead;
+  mergedBlobSha: string | null;
+  pushedBlobSha: string;
+  /** The walk's newest commit, for naming what landed after a preserved merge. */
+  newest: OwnPublishDeclineCommit | null | undefined;
+}): OwnPublishDeclineVerdict {
+  const { ourMerge, mergedBlobSha, pushedBlobSha, newest } = input;
+  if (!ourMerge.found) return { verdict: "unmeasured", reason: ourMerge.reason };
+  if (!mergedBlobSha) return { verdict: "unmeasured", reason: "merge_blob_unknown" };
+  const { commit } = ourMerge;
+  if (mergedBlobSha !== pushedBlobSha) {
+    return { verdict: "rewritten", mergeSha: commit.sha, mergeDate: commit.date ?? null, mergedBlobSha };
   }
-  if (pushedReadAt == null) return { verdict: "unmeasured", reason: "no_pushed_read_at" };
-  const landed = newest.date ? Date.parse(newest.date) : NaN;
-  if (!Number.isFinite(landed)) return { verdict: "unmeasured", reason: "no_commit_date" };
-  // Measured 2026-09-02 on en_tq #864: the squash commit's author date is the
-  // merge time itself (05:42:19Z, for a -be- branch committed 05:41:14Z), and
-  // both sit AFTER recordPushedRender's D1 read of that render. A merge dated
-  // before that read is therefore an earlier night's — tonight's branch is
-  // still waiting to merge — and nothing about tonight has been measured.
-  if (landed / 1000 < pushedReadAt) return { verdict: "unmeasured", reason: "merge_pending" };
-  return { verdict: "rewritten", sha: newest.sha, date: newest.date ?? null };
+  return {
+    verdict: "preserved",
+    mergeSha: commit.sha,
+    mergeDate: commit.date ?? null,
+    newest:
+      newest && newest.sha !== commit.sha
+        ? { kind: newest.kind, sha: newest.sha, author: newest.authorName ?? null, date: newest.date ?? null }
+        : null,
+  };
 }

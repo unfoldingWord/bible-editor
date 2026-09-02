@@ -1,0 +1,13 @@
+-- own_publish_declines changes meaning with the accountOwnPublishDecline change
+-- (2026-09-02). Until now it counted consecutive nights the byte comparison
+-- returned `content_differs` for ANY reason — an editor's commit, the
+-- bp-assistant bot's evening push, or our own -be- branch not having merged yet.
+-- From now on it counts nights on which the merge of our own push was MEASURED
+-- to have landed different bytes from the ones we pushed (fileBlobShaAtCommit
+-- against pushed_blob_sha), which is the only reading the inert banner acts on.
+--
+-- The stored values are therefore in the old unit (prod's JER tq stood at 3+ for
+-- three nights of bot pushes), and carrying them forward would let a single
+-- measured rewrite raise a "3 syncs" banner. Zero them once; the new accounting
+-- rebuilds the count from measured nights only.
+UPDATE book_resource_syncs SET own_publish_declines = 0;
