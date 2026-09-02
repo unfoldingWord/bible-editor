@@ -26,7 +26,7 @@
 
 import type { TnRow, TqRow, TwlRow, VerseRow } from "./types";
 import { parseVerseContentJson } from "./contentJson.ts";
-import { extractPlainText, isTsMilestone } from "./importParsers.ts";
+import { extractPlainText, isInFlowMarker, isTsMilestone } from "./importParsers.ts";
 import { parseRefOrderKey } from "./tsvFormat.ts";
 
 export type IssueBucket = "flag" | "escalate";
@@ -817,6 +817,64 @@ export function lintChapterOpeningMarkers(verses: VerseRow[]): LintIssue[] {
         ? `chapter ${chapter} starts without a paragraph / poetry marker (\\p, \\q1, …) — add one to the chapter intro.`
         : `chapter ${chapter} has no chapter-intro row, so it starts without a paragraph / poetry marker (\\p, \\q1, …) — add one to the chapter intro.`,
     });
+  }
+  return issues;
+}
+
+// Does a node carry text a reader would see? Whitespace-only text (including the
+// U+200B the editor's empty-block placeholder leaves behind) does not — the
+// trailing `\b` in ECC 2:14 has only a "\n" after it and must not flag.
+function nodeCarriesContent(node: unknown): boolean {
+  const o = node as Record<string, unknown> | null;
+  if (!o) return false;
+  const type = o["type"];
+  if (type === "text") {
+    const text = o["text"];
+    return typeof text === "string" && !/^[\s​]*$/.test(text);
+  }
+  // A word or an alignment milestone (which wraps words) is visible content.
+  return type === "word" || type === "milestone";
+}
+
+// Flag verse text stranded after a `\b` blank line with no paragraph / poetry
+// marker of its own (ECC 2:14, 3:14). `\b` is a spacer, not a render target:
+// usfm-js parses `\b` then bare text as a blank-line node followed by a text
+// node, and the renderer has no line to hang that text on — it was silently
+// DROPPED before the segment fix, and even once rendered it is malformed USFM a
+// human must repair by adding the missing `\p`/`\q`. This is the mid-verse
+// companion to lintChapterOpeningMarkers, which only inspects the chapter-
+// opening boundary (verse 0 trailing / verse 1 leading) and so cannot see an
+// orphan deeper in the verse. Bucket `flag`, not `escalate`: a human must
+// choose which marker belongs (`\p` prose vs `\q1` poetry), and it does not
+// corrupt the export. One flag per verse is enough to send a human there.
+export function lintOrphanedBlankText(verses: VerseRow[]): LintIssue[] {
+  const issues: LintIssue[] = [];
+  for (const v of verses) {
+    // blankGoverns = the line the next content would render on is the `\b`
+    // blank block, which has no home for it. Mirrors the renderer's segment
+    // state (segmentByParagraphs in web/src/lib/highlight.ts): `\b` opens a
+    // blank segment; every other in-flow marker — and `\ts\*`, which opens a
+    // fresh line of its own — opens a normal one.
+    let blankGoverns = false;
+    for (const node of verseObjectsOf(v)) {
+      if (isTsMilestone(node)) {
+        blankGoverns = false;
+        continue;
+      }
+      if (isInFlowMarker(node)) {
+        blankGoverns = (node as { tag?: unknown }).tag === "b";
+        continue;
+      }
+      if (blankGoverns && nodeCarriesContent(node)) {
+        issues.push({
+          check: "Blank line without paragraph",
+          bucket: "flag",
+          ref: `${v.chapter}:${v.verse}`,
+          message: `${v.chapter}:${v.verse} has text after a \\b blank line but no paragraph / poetry marker (\\p, \\q1, …) — add one so the text has a line to render on.`,
+        });
+        break;
+      }
+    }
   }
   return issues;
 }

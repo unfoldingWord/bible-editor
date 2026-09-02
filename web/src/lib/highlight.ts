@@ -1007,10 +1007,14 @@ function segmentByParagraphs(
         const { wrapper, isBlank } = paragraphClass(tag);
         const seg: Segment = { wrapper, tag, html: "", isBlank };
         segments.push(seg);
-        if (tag === "ts") {
-          // \ts\* is a standalone chunk divider — anything that follows
-          // (text, the next paragraph marker, ...) belongs to a fresh
-          // segment, not inside the divider block.
+        if (tag === "ts" || isBlank) {
+          // \ts\* is a standalone chunk divider and \b is a standalone blank
+          // line — in both cases anything that follows (text, the next
+          // paragraph marker, ...) belongs to a fresh segment, not inside the
+          // divider/blank block. A blank segment's html is discarded by
+          // segmentsToHtml, so text that lands there disappears: ECC 2:14 /
+          // 3:14 have real verse text right after \b with no intervening
+          // \p/\q, which was silently dropped before this branch.
           current = { wrapper: "", tag: null, html: "", isBlank: false };
           segments.push(current);
         } else {
