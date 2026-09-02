@@ -890,6 +890,14 @@ export function paragraphClass(tag: string): { wrapper: string; isBlank: boolean
   if (tag === "mi") return { wrapper: "be-para be-mi", isBlank: false };
   if (tag === "m") return { wrapper: "be-para be-m", isBlank: false };
   if (tag === "nb") return { wrapper: "be-para be-nb", isBlank: false };
+  // \li*/\lim* list items indent by level; \lim* (embedded list) shares the
+  // level indents. \lh/\lf are the list header/footer lines (#709).
+  if (tag === "li" || tag === "li1" || tag === "lim" || tag === "lim1") return { wrapper: "be-para be-li-1", isBlank: false };
+  if (tag === "li2" || tag === "lim2") return { wrapper: "be-para be-li-2", isBlank: false };
+  if (tag === "li3" || tag === "lim3") return { wrapper: "be-para be-li-3", isBlank: false };
+  if (tag === "li4" || tag === "lim4") return { wrapper: "be-para be-li-4", isBlank: false };
+  if (tag === "lh") return { wrapper: "be-para be-lh", isBlank: false };
+  if (tag === "lf") return { wrapper: "be-para be-lf", isBlank: false };
   return { wrapper: "be-para be-p", isBlank: false };
 }
 

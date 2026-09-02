@@ -11,8 +11,10 @@
 import {
   PARAGRAPH_TAGS,
   ACROSTIC_HEADING_TAGS,
+  LIST_TAGS,
   isInFlowMarker,
   isAcrosticHeading,
+  listMarkerTag,
   extractEditableText,
   extractTrailingMarkers,
   liftMarkerText,
@@ -158,6 +160,59 @@ assert(
   ),
   "\\qa drifts as a trailing marker to the verse it heads",
 );
+
+// ── 7. \li* / \lh / \lf / \lim* list family (#709). usfm-js parses these with
+//       NO `type` field (`\li1 x` → {tag:"li1", content:"x"}; `\lh`/`\lf`/
+//       `\lim*` → {tag, text:"x"}), so every type-based predicate missed them:
+//       the marker was dropped and its text lost or minted as `\w` words.
+//       liftMarkerText normalizes each to a `type:"paragraph"` line marker plus
+//       a following text node, so they behave like the `\p`-family (already
+//       covered by §1's drift lock, since they are now canonical PARAGRAPH_TAGS).
+assert([...LIST_TAGS].every((t) => PARAGRAPH_TAGS.has(t)), "every LIST_TAG is a canonical PARAGRAPH_TAG");
+assert(listMarkerTag({ tag: "li1", content: "x" }) === "li1" && listMarkerTag({ tag: "p" }) === null, "listMarkerTag recognizes the list family only");
+
+// Content-folded shape: lift splits the parked `content` into a paragraph
+// marker + a following text node (alignable body). Neither the marker tag nor a
+// letter of it survives as a `\w` word.
+{
+  const lifted = liftMarkerText([{ tag: "li1", content: "first item\n" }]);
+  assert(lifted.length === 2, "\\li1 content lifts to marker + text sibling");
+  assert(lifted[0].type === "paragraph" && lifted[0].tag === "li1" && lifted[0].content === undefined, "\\li1 marker gains type:paragraph, loses content");
+  assert(lifted[1].type === "text" && lifted[1].text === "first item\n", "\\li1 item text becomes a following text node");
+}
+// `\lh`/`\lf`/`\lim*` park their text on `text`, not `content` — lift the same way.
+{
+  const lifted = liftMarkerText([{ tag: "lh", text: "header\n" }]);
+  assert(lifted.length === 2 && lifted[0].tag === "lh" && lifted[0].type === "paragraph" && lifted[1].text === "header\n", "\\lh text lifts to marker + text sibling");
+}
+// Bare marker whose aligned content already broke out into sibling nodes: only
+// the `type` is added; no phantom text node is minted.
+{
+  const lifted = liftMarkerText([{ tag: "li1", nextChar: " " }, { type: "text", text: "x" }]);
+  assert(lifted.length === 2 && lifted[0].type === "paragraph" && lifted[0].tag === "li1", "bare \\li1 just gains type:paragraph");
+}
+
+// The full family recognizes in bare text (MARKER_TOKEN_RE) and never leaks as a
+// word — including the prefix hazards (`\lim` must not split into `\li`+"m").
+for (const tag of ["li1", "li4", "lim1", "lim", "li", "lh", "lf"]) {
+  const nodes = tokenizeEditableText(`\\${tag} some words`);
+  assert(nodes.some((n) => isMarkerNode(n, tag)), `\\${tag} tokenizes to a {tag:"${tag}"} marker (list family, #709)`);
+  assert(!nodes.some((n) => isWordNode(n) && n.text === tag), `\\${tag} does NOT leak through as a \\w word`);
+}
+assert(isMarkerNode(tokenizeEditableText("\\lim1 x")[0], "lim1"), "\\lim1 wins over \\li1 (longest-first)");
+
+// Edit round-trip: the content-folded list survives with markers intact and its
+// text as alignable words (not dropped, not the marker tag).
+{
+  const raw = [{ tag: "li1", content: "first item\n" }];
+  const ed = extractEditableText(raw);
+  assert(ed === "\\li1 first item", `\\li1 content surfaces in the edit baseline (got: ${JSON.stringify(ed)})`);
+  const res = smartEditVerse({ verseObjects: raw }, ed, ed.replace("first", "primary"), { capturedFromDom: true });
+  const vo = res.content.verseObjects;
+  assert(vo.some((n) => n.tag === "li1" && n.type === "paragraph"), "\\li1 marker survives a real edit");
+  assert(vo.some((n) => isWordNode(n) && n.text === "primary"), "the edited list-item word aligns");
+  assert(!vo.some((n) => isWordNode(n) && n.text === "li1"), "\\li1 is never minted as a draggable word (#709)");
+}
 
 if (failed) {
   console.error(`\n${failed} assertion(s) FAILED`);

@@ -96,6 +96,14 @@ function paragraphLayoutSx(mode: Mode) {
     "& .be-pm": { paddingLeft: "1.5em" },
     "& .be-pmr": { paddingLeft: "1.5em", textAlign: "right" },
     "& .be-pr": { textAlign: "right" },
+    // \li*/\lim* list items — indent by level. \lh list header sits at the base
+    // margin (bold); \lf list footer indents one level like a first-level item.
+    "& .be-li-1": { paddingLeft: "1.5em" },
+    "& .be-li-2": { paddingLeft: "2.5em" },
+    "& .be-li-3": { paddingLeft: "3.5em" },
+    "& .be-li-4": { paddingLeft: "4.5em" },
+    "& .be-lh": { fontWeight: 600 },
+    "& .be-lf": { paddingLeft: "1.5em" },
     "& span.be-d": {
       fontStyle: "italic",
       fontSize: "0.95em",

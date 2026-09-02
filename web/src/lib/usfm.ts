@@ -66,16 +66,43 @@ export function extractPlainText(verseObjects: unknown): string {
 // usfm-js parses as `type:"paragraph"` exactly like `\p`. `\qa` acrostic
 // headings are handled OUT of this set (see isAcrosticHeading, #708): their
 // text is a heading LABEL, not alignable verse body, so they must never be
-// tokenized as `\w` words. Markers still NOT covered (each needs its own
-// handling — see #702 followups): the list family `\li*`/`\lh`/`\lf`/`\lim*`
-// (usfm-js gives them no `type` field, #709) and `\qr`/`\qc`/`\qd` poetry
-// variants not seen in the current corpus.
+// tokenized as `\w` words. The list family (`\li*`/`\lh`/`\lf`/`\lim*`) IS in
+// this set (see LIST_TAGS / #709): usfm-js gives those NO `type` field, so
+// liftMarkerText normalizes them to `type:"paragraph"` line markers first —
+// after that they behave exactly like `\p`. Markers still NOT covered:
+// `\qr`/`\qc`/`\qd` poetry variants not seen in the current corpus.
+//
+// List family (USFM 3.1). usfm-js parses these WITHOUT a `type` field —
+// `\li1 x` → {tag:"li1", content:"x"}, `\lh`/`\lf`/`\lim*` → {tag, text:"x"} —
+// so every type-based predicate skipped them and the marker was dropped (its
+// text lost or minted as `\w` words). liftMarkerText normalizes each to a
+// `type:"paragraph"` line marker plus a following text node, so they flow
+// through the same machinery as `\p` (render, edit round-trip, drift, export).
+export const LIST_TAGS: ReadonlySet<string> = new Set([
+  "li", "li1", "li2", "li3", "li4",
+  "lim", "lim1", "lim2", "lim3", "lim4",
+  "lh", "lf",
+]);
+
 export const PARAGRAPH_TAGS: ReadonlySet<string> = new Set([
   "p", "m", "mi", "nb", "pi", "pi1", "pi2", "pi3", "pc",
   "pm", "pmo", "pmc", "pmr", "po", "pr", "cls",
   "q", "q1", "q2", "q3", "q4", "qm", "qm1", "qm2", "qm3",
+  "li", "li1", "li2", "li3", "li4",
+  "lim", "lim1", "lim2", "lim3", "lim4",
+  "lh", "lf",
   "b",
 ]);
+
+// The list-family tag of `node`, or null. Tag-based (usfm-js gives these no
+// `type`), so it matches the raw shape; after liftMarkerText normalizes them to
+// `type:"paragraph"` it still matches (idempotent — a re-lift is a no-op).
+export function listMarkerTag(node: unknown): string | null {
+  const o = node as Record<string, unknown> | null;
+  if (!o) return null;
+  const tag = o["tag"];
+  return typeof tag === "string" && LIST_TAGS.has(tag) ? tag : null;
+}
 
 // Acrostic heading markers. `\qa` labels the stanzas of an acrostic poem with
 // the Hebrew letter that begins them (Psalm 119's Aleph/Beth/…, the acrostics
@@ -266,6 +293,25 @@ export function liftMarkerText(verseObjects: unknown[]): unknown[] {
       }
       continue;
     }
+    // \li*/\lh/\lf/\lim* list family. usfm-js gives these NO `type` field, so
+    // every type-based predicate (isInFlowMarker, the renderer, the edit round-
+    // trip) skipped them — the marker was dropped and its text lost or minted as
+    // `\w` words (#709). Normalize to a `type:"paragraph"` line marker so all
+    // that machinery just works, exactly as the `\p`-family already does. The
+    // item text usfm-js parked on `content` (bare `\li1 text`) or `text`
+    // (`\lh`/`\lf`/`\lim*`) is lifted into a following text node so it is
+    // alignable verse body, like the text after a `\p`. A marker with neither
+    // (aligned content already broke out into sibling `\w`/`\zaln` nodes, or a
+    // standalone `\li1`) just gets its `type`. toUSFM round-trips all of these
+    // losslessly. Idempotent: a normalized `{type:"paragraph",tag:"li1"}` has no
+    // content/text, so a re-lift adds no sibling and leaves it unchanged.
+    if (o && listMarkerTag(o)) {
+      const { content, text, type: _type, ...rest } = o;
+      const label = typeof content === "string" ? content : typeof text === "string" ? text : "";
+      out.push({ ...rest, type: "paragraph" });
+      if (label !== "") out.push({ type: "text", text: label });
+      continue;
+    }
     // A character wrapper (`\qs Selah\qs*`) is `type:"quote"` so isInFlowMarker
     // matches it, but its `text` is CONTENT held between `\qs … \qs*`, not a
     // quote parked on a line marker. Lifting it would move the word OUTSIDE the
@@ -427,6 +473,22 @@ export function extractEditableText(verseObjects: unknown): string {
       // OUTSIDE the captured contenteditable text. The heading survives the save
       // because reconcileMarkers keeps it as a content node (#708).
       if (isAcrosticHeading(v)) continue;
+      // \li*/\lh/\lf/\lim* list family (#709). usfm-js gives these no `type`, so
+      // the isInFlowMarker branch below misses them: emit the literal marker
+      // token here so the edit baseline matches the lifted editable render
+      // (segmentByParagraphs normalizes them to `type:"paragraph"` chips). The
+      // item text usfm-js parked on `content` (bare `\li1 text`) or `text`
+      // (`\lh`/`\lf`/`\lim*`) is surfaced as ordinary editable text — alignable
+      // verse body, like the text after a `\p`. A bare marker whose aligned
+      // content is in sibling `\w`/`\zaln` nodes carries neither here; those
+      // siblings emit their own text via the normal recursion below.
+      const listTag = listMarkerTag(v);
+      if (listTag) {
+        parts.push(`\\${listTag} `);
+        const label = typeof v["content"] === "string" ? v["content"] : typeof v["text"] === "string" ? v["text"] : "";
+        if (label) parts.push(String(label));
+        continue;
+      }
       // Character-style wrappers (`\qs Selah\qs*`) are also `type:"quote"`, so
       // isInFlowMarker matches them — but they hold aligned verse CONTENT, not a
       // line break. Fall through to the generic text/children recursion below so
