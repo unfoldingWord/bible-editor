@@ -170,3 +170,128 @@ export function recognizeOwnPublish(input: OwnPublishInput): OwnPublishResult {
 
   return { recognized: true, readAt: pushedReadAt, reason: "own_publish" };
 }
+
+// ---------------------------------------------------------------------------
+// Attributing a `content_differs` decline.
+//
+// A decline says master's bytes are not the render we last pushed. Two things
+// produce that, and the byte comparison alone cannot tell them apart:
+//   (a) somebody else committed to the file after our push landed — an editor,
+//       or the bp-assistant pipeline's evening pushes (measured on prod
+//       2026-09-02: en_tq's tq_JER.tsv had a bot commit between every one of
+//       our nightly merges for a week, which is what tripped the inert banner);
+//   (b) Door43's validate-and-merge job rewrote our bytes when it merged, so
+//       master never reads as our own render — the one way recognition can be
+//       quietly inert while the nightly reverts continue.
+// The question is answered DIRECTLY, not inferred from who committed last: find
+// the merge of the render we pushed — the `ours` commit on master whose subject
+// carries our export PR's number, `(#N)`, which Gitea appends on a squash merge
+// (measured: `bible-editor: JER tq → master (#864)`) — and read the file's blob
+// sha AT THAT COMMIT (dcsSources.ts fileBlobShaAtCommit, one tree read). Equal
+// to the blob we pushed: the merge preserved our bytes, and tonight's mismatch
+// is whatever landed after it (a), which the walk names. Different: the merge
+// changed our bytes (b), measured even when a bot pushed on top afterwards — a
+// cold review of the first draft showed that inferring from the newest commit
+// alone let an interleaved bot push reset a real rewrite's count and hide it.
+// No commit with that PR number: tonight's `-be-` branch has not merged yet,
+// which is a normal state and measures nothing. Matching by PR number rather
+// than by date (the second draft) is what keeps two overlapping exports of the
+// same pair apart: export A's merge landing after export B's render was read
+// would otherwise be compared against B's blob and read as a rewrite (Codex
+// review on PR #704). Two pure steps so both have unit tests; bookReimport.ts
+// owns the fetches, the counter and the banner.
+//
+// Measured against git.door43.org 2026-09-02, five recent `bible-editor:` PRs
+// across three books: the PR head's blob sha equalled master's blob sha at the
+// squash commit every time — so (b) is not happening today. This code exists
+// so that, the day it does, the banner says so from evidence instead of
+// listing both explanations and asking a human to run `git hash-object`.
+
+/** The structural subset of masterLineage.ts's ClassifiedCommit this reads. */
+export interface OwnPublishDeclineCommit {
+  sha: string;
+  kind: "ours" | "ai" | "human";
+  /** commit.author.date, ISO-8601. */
+  date?: string | null;
+  authorName?: string | null;
+}
+
+export type OurMergeMatch =
+  | { found: true; commit: OwnPublishDeclineCommit }
+  | { found: false; reason: "no_commits" | "no_pr_number" | "merge_pending" };
+
+// Step 1 (pure): which commit merged the render we pushed? `commits` is the
+// walk, newest-first, over a window that starts at or before the render read
+// (master_confirmed_at is always older than pushed_read_at; a dedicated walk
+// from pushed_read_at is used when there is no watermark yet). `prNumber` is
+// the export PR opened for that render (book_resource_syncs.pushed_pr_number,
+// stamped by the export onto the pushed render itself and guarded on its read
+// time; null when PR creation failed or nothing is recorded).
+//
+// Gitea's squash merge titles the master commit `<PR title> (#N)` — measured on
+// every `bible-editor:` merge in en_tq's history — and only `ours` commits are
+// eligible, so a human `Revert "bible-editor: … (#N)"` (classified human) can
+// never be taken for the merge itself.
+export function findOurMergeForPr(
+  commits: readonly (OwnPublishDeclineCommit & { message?: string | null })[],
+  prNumber: number | null,
+): OurMergeMatch {
+  if (commits.length === 0) return { found: false, reason: "no_commits" };
+  if (prNumber == null || !Number.isInteger(prNumber) || prNumber <= 0) return { found: false, reason: "no_pr_number" };
+  const tag = `(#${prNumber})`;
+  for (const c of commits) {
+    if (c.kind !== "ours") continue;
+    const subject = (c.message ?? "").split("\n", 1)[0];
+    if (subject.includes(tag)) return { found: true, commit: c };
+  }
+  return { found: false, reason: "merge_pending" };
+}
+
+export type OwnPublishDeclineVerdict =
+  | {
+      /** The merge landed the bytes we pushed; whatever is newest on master now came after it. */
+      verdict: "preserved";
+      mergeSha: string;
+      mergeDate: string | null;
+      /** Master's newest commit — the cause of tonight's byte mismatch — when it is not that merge. */
+      newest: { kind: "ai" | "human" | "ours"; sha: string; author: string | null; date: string | null } | null;
+    }
+  | {
+      /** The merge of our push holds bytes other than the ones we pushed. */
+      verdict: "rewritten";
+      mergeSha: string;
+      mergeDate: string | null;
+      mergedBlobSha: string;
+    }
+  | {
+      verdict: "unmeasured";
+      reason: "no_commits" | "no_pr_number" | "merge_pending" | "merge_blob_unknown";
+    };
+
+// Step 2 (pure): the verdict, given step 1's answer and the blob sha the caller
+// read at that merge commit (`null` when the read failed — absence is not a
+// match, and not a mismatch either).
+export function judgeOwnPublishDecline(input: {
+  ourMerge: OurMergeMatch;
+  mergedBlobSha: string | null;
+  pushedBlobSha: string;
+  /** The walk's newest commit, for naming what landed after a preserved merge. */
+  newest: OwnPublishDeclineCommit | null | undefined;
+}): OwnPublishDeclineVerdict {
+  const { ourMerge, mergedBlobSha, pushedBlobSha, newest } = input;
+  if (!ourMerge.found) return { verdict: "unmeasured", reason: ourMerge.reason };
+  if (!mergedBlobSha) return { verdict: "unmeasured", reason: "merge_blob_unknown" };
+  const { commit } = ourMerge;
+  if (mergedBlobSha !== pushedBlobSha) {
+    return { verdict: "rewritten", mergeSha: commit.sha, mergeDate: commit.date ?? null, mergedBlobSha };
+  }
+  return {
+    verdict: "preserved",
+    mergeSha: commit.sha,
+    mergeDate: commit.date ?? null,
+    newest:
+      newest && newest.sha !== commit.sha
+        ? { kind: newest.kind, sha: newest.sha, author: newest.authorName ?? null, date: newest.date ?? null }
+        : null,
+  };
+}

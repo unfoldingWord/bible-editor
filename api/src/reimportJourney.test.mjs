@@ -39,6 +39,7 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
+  accountOwnPublishDeclineForTest,
   applyTsvRows,
   clearResolvedMergeNoBaseForTest,
   recordResourceSync,
@@ -3370,6 +3371,201 @@ console.log("\n[#683: the sweep reaches books no run visits, and pre-#653 flags 
   }
 }
 
+console.log("\n[own-publish decline accounting: measured at the merge commit, real SQL, mocked Gitea]");
+{
+  // PROD SHAPE (JER tq, 2026-09-01/02): our nightly push merges at ~05:40Z, the
+  // bp-assistant bot pushes a chapter on top in the evening, and the next
+  // morning's byte comparison declines. The blind counter had reached 3 and raised
+  // the "cannot tell them apart" banner. Here the same night is measured.
+  const READ_AT = Date.parse("2026-09-01T05:31:00Z") / 1000;
+  const PUSHED = "ba421e896eab0000000000000000000000000000";
+  const OUR_MERGE = { sha: "22d652732b18", message: "bible-editor: JER tq → master (#859)", authorEmail: "b@x", authorName: "Benjamin Wright", date: "2026-09-01T05:38:03Z" };
+  const BOT_PUSH = { sha: "863fbfa65119", message: "TQ: JER 10 [ju..7@api.bp-assistant]", authorEmail: "bot@bp-assistant", authorName: "BW Bot", date: "2026-09-01T23:49:46Z" };
+  const FILE = { repo: "en_tq", path: `tq_${BOOK}.tsv` };
+  const SOURCE = `own_publish_inert:${BOOK}:tq`;
+  // The export's own record of the push: pushed_blob_sha/read_at and the PR it
+  // opened for that render (pushed_pr_number, 0061), all on the sync row.
+  const seedSync = (sqlite, declines, { prNumber = 859, prReadAt = READ_AT } = {}) => {
+    sqlite
+      .prepare(
+        `INSERT INTO book_resource_syncs (book, resource, source_sha, origin, pushed_blob_sha, pushed_read_at, own_publish_declines, pushed_pr_number, pushed_pr_read_at)
+         VALUES (?, 'tq', 'sha0', 'reimport', ?, ?, ?, ?, ?)`,
+      )
+      .run(BOOK, PUSHED, READ_AT, declines, prNumber, prNumber == null ? null : prReadAt);
+    return { sourceSha: "sha0", syncedAt: null, pushedBlobSha: PUSHED, pushedReadAt: READ_AT, pushedEditId: null, declines };
+  };
+  const seedBanner = (sqlite) =>
+    sqlite
+      .prepare(`INSERT INTO system_alerts (username, severity, source, message) VALUES ('deferredreward', 'warning', ?, 'old blind banner')`)
+      .run(SOURCE);
+  const readState = (sqlite) => ({
+    declines: sqlite.prepare(`SELECT own_publish_declines AS d FROM book_resource_syncs WHERE book = ? AND resource = 'tq'`).get(BOOK).d,
+    banners: sqlite.prepare(`SELECT message FROM system_alerts WHERE source = ? AND dismissed_at IS NULL`).all(SOURCE),
+  });
+  // A Gitea that serves the commit walk AND the merge commit's tree, counting each.
+  const gitea = (commits, blobAtMerge) => {
+    const calls = { commits: 0, trees: 0 };
+    const fetchImpl = async (url) => {
+      if (String(url).includes("/git/trees/")) {
+        calls.trees++;
+        return { ok: true, json: async () => ({ sha: OUR_MERGE.sha, truncated: false, tree: [{ path: FILE.path, type: "blob", sha: blobAtMerge }] }) };
+      }
+      calls.commits++;
+      return giteaPage(commits)();
+    };
+    return { calls, fetchImpl };
+  };
+  const withGitea = async (g, fn) => {
+    const real = globalThis.fetch;
+    globalThis.fetch = g.fetchImpl;
+    try {
+      return await fn();
+    } finally {
+      globalThis.fetch = real;
+    }
+  };
+
+  // (a) THE JER NIGHT, measured: the merge holds our exact bytes → preserved. The
+  //     blind-era counter (3) resets and the standing banner comes down.
+  {
+    const { sqlite, env } = freshEnv();
+    const sync = seedSync(sqlite, 3);
+    seedBanner(sqlite);
+    const g = gitea([BOT_PUSH, OUR_MERGE], PUSHED);
+    await withGitea(g, () => accountOwnPublishDeclineForTest(env, BOOK, "tq", FILE, null, sync));
+    const s = readState(sqlite);
+    eq(s.declines, 0, "merge blob == pushed blob resets the counter (the bot's push explains tonight's mismatch)");
+    eq(s.banners.length, 0, "…and the standing banner comes down");
+    eq(g.calls.commits, 1, "with no lineage walk to reuse, one commit walk from pushed_read_at was fetched");
+    eq(g.calls.trees, 1, "…and one tree read at the merge commit");
+  }
+
+  // (b) The same night with the lineage walk handed in: no second commit fetch.
+  {
+    const { sqlite, env } = freshEnv();
+    const sync = seedSync(sqlite, 2);
+    const g = gitea([BOT_PUSH, OUR_MERGE], PUSHED);
+    const walked = { commits: [BOT_PUSH, OUR_MERGE], incomplete: false, incompleteReason: "" };
+    await withGitea(g, () => accountOwnPublishDeclineForTest(env, BOOK, "tq", FILE, walked, sync));
+    eq(readState(sqlite).declines, 0, "a reused walk reaches the same verdict");
+    eq(g.calls.commits, 0, "…without a second commit fetch");
+    eq(g.calls.trees, 1, "…paying only the tree read");
+  }
+
+  // (c) A REWRITE, under the bot's push: the merge commit holds other bytes. The
+  //     counter climbs, and on crossing the threshold the banner names the measurement.
+  {
+    const { sqlite, env } = freshEnv();
+    const sync = seedSync(sqlite, 2);
+    const g = gitea([BOT_PUSH, OUR_MERGE], "0000deadbeef00000000000000000000deadbeef");
+    await withGitea(g, () => accountOwnPublishDeclineForTest(env, BOOK, "tq", FILE, null, sync));
+    const s = readState(sqlite);
+    eq(s.declines, 3, "merge blob != pushed blob counts as a measured rewrite even with a bot push on top");
+    eq(s.banners.length, 1, "…and crossing the threshold raises the banner");
+    eq(s.banners[0].message.includes("holds blob 0000deadbeef"), true, "…which states the blob the merge holds");
+    eq(s.banners[0].message.includes("we pushed blob ba421e896eab"), true, "…and the blob we pushed");
+    eq(s.banners[0].message.includes("22d652732b18"), true, "…and the merge commit");
+    eq(s.banners[0].message.includes("cannot tell them apart"), false, "…and never the old two-explanations text");
+
+    // The SAME merge measured again — a retried step tonight, or a later night
+    // with no new push — adds nothing (0061's own_publish_rewrite_sha).
+    const sync2 = { ...sync, declines: 3 };
+    await withGitea(gitea([BOT_PUSH, OUR_MERGE], "0000deadbeef00000000000000000000deadbeef"), () =>
+      accountOwnPublishDeclineForTest(env, BOOK, "tq", FILE, null, sync2),
+    );
+    eq(readState(sqlite).declines, 3, "re-measuring the same rewritten merge does not count it twice");
+
+    // A NEW export (#861) whose merge is also rewritten: counts, banner NOT re-raised.
+    sqlite
+      .prepare(
+        `UPDATE book_resource_syncs SET pushed_pr_number = 861, pushed_read_at = ?1, pushed_pr_read_at = ?1
+          WHERE book = ?2 AND resource = 'tq'`,
+      )
+      .run(READ_AT + 86000, BOOK);
+    const MERGE_861 = { ...OUR_MERGE, sha: "5555aaaa6666", message: "bible-editor: JER tq → master (#861)", date: "2026-09-02T05:40:00Z" };
+    await withGitea(gitea([MERGE_861, BOT_PUSH, OUR_MERGE], "1111deadbeef00000000000000000000deadbeef"), () =>
+      accountOwnPublishDeclineForTest(env, BOOK, "tq", FILE, null, { ...sync, pushedReadAt: READ_AT + 86000, declines: 3 }),
+    );
+    const s2 = readState(sqlite);
+    eq(s2.declines, 4, "a further rewritten merge (a different commit) keeps counting");
+    eq(s2.banners.length, 1, "…without a second banner (raise on the crossing only)");
+  }
+
+  // (e) Two overlapping exports (Codex finding on PR #704): export A (#859) merged
+  //     after export B's render was read, and B (#864) is still pending. By PR
+  //     number this is pending — A's blob is never compared against B's push.
+  {
+    const { sqlite, env } = freshEnv();
+    const sync = seedSync(sqlite, 2, { prNumber: 864 });
+    const g = gitea([BOT_PUSH, OUR_MERGE], "0000deadbeef00000000000000000000deadbeef");
+    await withGitea(g, () => accountOwnPublishDeclineForTest(env, BOOK, "tq", FILE, null, sync));
+    eq(readState(sqlite).declines, 2, "another export's merge is not measured as ours → counter unchanged");
+    eq(g.calls.trees, 0, "…and no tree read is spent on it");
+  }
+
+  // (f) The push has no PR on record (creation failed, or it predates 0061): nothing to look for.
+  {
+    const { sqlite, env } = freshEnv();
+    const sync = seedSync(sqlite, 2, { prNumber: null });
+    const g = gitea([BOT_PUSH, OUR_MERGE], "0000deadbeef00000000000000000000deadbeef");
+    await withGitea(g, () => accountOwnPublishDeclineForTest(env, BOOK, "tq", FILE, null, sync));
+    eq(readState(sqlite).declines, 2, "no PR recorded for this push → nothing to measure, counter unchanged");
+    eq(g.calls.trees, 0, "…and no tree read is spent on it");
+  }
+
+  // (g) A STALE PR on the row (Codex verify, round 2): a newer render advanced
+  //     pushed_read_at/pushed_blob_sha, its PR is not stamped yet (or never will
+  //     be), and pushed_pr_number still names the PREVIOUS render's PR (#859),
+  //     whose merge IS on master. Comparing that merge's blob against the new
+  //     push would be a false rewrite; the read-time mismatch says "no PR for
+  //     this render" instead.
+  {
+    const { sqlite, env } = freshEnv();
+    const sync = seedSync(sqlite, 2, { prNumber: 859, prReadAt: READ_AT - 86400 });
+    const g = gitea([BOT_PUSH, OUR_MERGE], "0000deadbeef00000000000000000000deadbeef");
+    await withGitea(g, () => accountOwnPublishDeclineForTest(env, BOOK, "tq", FILE, null, sync));
+    eq(readState(sqlite).declines, 2, "a PR stamped for an earlier render is not this push's PR → counter unchanged");
+    eq(g.calls.trees, 0, "…and its merge's blob is never read");
+  }
+
+  // (h) The render moved between the comparison and the accounting (an export
+  //     landed mid-run): the decline was about a render no longer on the row.
+  {
+    const { sqlite, env } = freshEnv();
+    const sync = seedSync(sqlite, 2);
+    sqlite
+      .prepare(`UPDATE book_resource_syncs SET pushed_blob_sha = 'newer000', pushed_read_at = ? WHERE book = ? AND resource = 'tq'`)
+      .run(READ_AT + 600, BOOK);
+    const g = gitea([BOT_PUSH, OUR_MERGE], "0000deadbeef00000000000000000000deadbeef");
+    await withGitea(g, () => accountOwnPublishDeclineForTest(env, BOOK, "tq", FILE, null, sync));
+    eq(readState(sqlite).declines, 2, "a render that moved during the run is not attributed → counter unchanged");
+    eq(g.calls.commits + g.calls.trees, 0, "…and nothing is fetched for it");
+  }
+
+  // (d) Unmeasured nights leave the counter alone, in both directions.
+  {
+    const { sqlite, env } = freshEnv();
+    const sync = seedSync(sqlite, 2);
+    seedBanner(sqlite);
+    // Tonight's branch (#859) has not merged: only an earlier export's merge (#854) is on master.
+    const older = { ...OUR_MERGE, sha: "0abeb26ff896", message: "bible-editor: JER tq → master (#854)", date: "2026-08-31T05:36:55Z" };
+    const g1 = gitea([older], PUSHED);
+    await withGitea(g1, () => accountOwnPublishDeclineForTest(env, BOOK, "tq", FILE, null, sync));
+    eq(readState(sqlite).declines, 2, "merge pending → counter unchanged");
+    eq(g1.calls.trees, 0, "…and no tree read is spent on it");
+    eq(readState(sqlite).banners.length, 1, "…and a standing banner is left standing");
+    // The merge is there but the tree read fails.
+    const g2 = { calls: { commits: 0, trees: 0 }, fetchImpl: async (url) => (String(url).includes("/git/trees/") ? { ok: false, json: async () => ({}) } : giteaPage([BOT_PUSH, OUR_MERGE])()) };
+    await withGitea(g2, () => accountOwnPublishDeclineForTest(env, BOOK, "tq", FILE, null, sync));
+    eq(readState(sqlite).declines, 2, "a failed tree read → counter unchanged");
+    // No read time recorded on the row (half-written render): nothing can be placed.
+    sqlite.prepare(`UPDATE book_resource_syncs SET pushed_read_at = NULL WHERE book = ? AND resource = 'tq'`).run(BOOK);
+    await withGitea(gitea([BOT_PUSH, OUR_MERGE], PUSHED), () =>
+      accountOwnPublishDeclineForTest(env, BOOK, "tq", FILE, null, { ...sync, pushedReadAt: null }),
+    );
+    eq(readState(sqlite).declines, 2, "no pushed_read_at → counter unchanged");
+  }
+}
 console.log("\n[merge_kept retire: standing flags come down, D1-only, and nothing else is touched]");
 {
   // PROD SHAPE: JER tq 3:6 / 3:8 / 3:19, flagged merge_kept on 2026-08-29 against
