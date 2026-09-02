@@ -371,6 +371,22 @@ export interface ReimportCounts {
   // review_kind/review_reason (migration 0047), surfaced by the cleanup chip
   // (lint.ts) rather than the verse banner.
   merge_conflicts: number;
+  // The rows this run flagged for HUMAN review as a merge conflict — exactly what
+  // the "Pull from Door43" summary renders as "flagged for review (merge
+  // conflict)". Its own counter, not merge_conflicts minus merge_kept_ai, because
+  // that subtraction is only valid on the verse side: there keep_ai_master IS a
+  // subset of merge_conflicts, but on the TSV side merge_conflicts counts only an
+  // adopting write while a kept-ALONE row lands in merge_kept_ai and nowhere in
+  // merge_conflicts — so one master-wins flag plus one kept-alone row cancelled to
+  // zero and hid a real flag (#706). Counts:
+  //   - TSV: an adopt_conflict write that actually landed (master won the
+  //     contested field), EXCLUDING a mixed row that also kept a contested field
+  //     for D1 (keptAiConflict) — that row mints no review flag.
+  //   - verses: every landed liveConflict except keep_ai_master, i.e. adopt_conflict
+  //     PLUS the D1-kept-but-flagged outcomes (keep_alignment_refused,
+  //     source_attr_divergent). This matches the pre-#706 render for verses exactly.
+  // Never counts keep_ai_master (that is merge_kept_ai, its own summary line).
+  merge_master_wins: number;
   // Verse whose merge resolved to "adopt", but the bytes that would actually be
   // STORED turned out identical to the bytes already stored — so nothing was
   // written at all (issue #539). Not folded into skipped_noop: a plain no-op
@@ -660,6 +676,7 @@ function zeroCounts(): ReimportCounts {
     twl_reordered: 0,
     merge_adopted: 0,
     merge_conflicts: 0,
+    merge_master_wins: 0,
     merge_noop_skipped: 0,
     merge_refused: 0,
     merge_kept_ai: 0,
@@ -879,6 +896,7 @@ function addCounts(into: ReimportCounts, from: ReimportCounts): void {
   into.twl_reordered += from.twl_reordered;
   into.merge_adopted += from.merge_adopted ?? 0;
   into.merge_conflicts += from.merge_conflicts ?? 0;
+  into.merge_master_wins += from.merge_master_wins ?? 0;
   into.merge_noop_skipped += from.merge_noop_skipped ?? 0;
   into.merge_refused += from.merge_refused ?? 0;
   into.merge_kept_ai += from.merge_kept_ai ?? 0;
@@ -2788,7 +2806,14 @@ export async function applyTsvRows(
         if ((results[j]?.meta.changes ?? 0) > 0) {
           if (u.adopted) {
             counts.merge_adopted++;
-            if (u.conflict) counts.merge_conflicts++;
+            if (u.conflict) {
+              counts.merge_conflicts++;
+              // The merge_conflict review flag (set above only when
+              // `conflict && !keptAiConflict`) is what "flagged for review" counts.
+              // A mixed row that adopted one field but KEPT a contested one for D1
+              // mints no flag, so it must not inflate merge_master_wins (#706).
+              if (!u.keptAiConflict) counts.merge_master_wins++;
+            }
             // `keptConflict` distinguishes the mixed row: master's value landed
             // for a field we never touched, while a CONTESTED field on the same
             // row was kept from D1 (#540 item 2). Without it this line reads as
@@ -6375,6 +6400,15 @@ async function applyVerseRows(
       mc.action !== "adopt_no_visible_change",
   );
   counts.merge_conflicts += liveConflicts.length;
+  // The rows a human must review — every landed conflict EXCEPT keep_ai_master,
+  // which is D1-wins and reported on its own summary line (#706). On verses this
+  // equals the old `merge_conflicts - merge_kept_ai` render exactly (keep_ai_master
+  // is a subset of liveConflicts here); it is a distinct counter so the TSV side,
+  // where the two counters do not nest, can report the same fact without the
+  // subtraction cancelling a real flag against an unrelated kept-alone row.
+  counts.merge_master_wins += liveConflicts.filter(
+    (mc) => mc.action !== "keep_ai_master",
+  ).length;
   if (recordFailed) counts.merge_record_failed = true;
 
   return counts;
