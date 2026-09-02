@@ -66,7 +66,13 @@ import {
   type HumanRefEvidence,
   type MasterLineageSummary,
 } from "./masterLineage.ts";
-import { gitBlobShaOrNull, recognizeOwnPublish, type OwnPublishResult } from "./ownPublish";
+import {
+  gitBlobShaOrNull,
+  judgeOwnPublishDecline,
+  recognizeOwnPublish,
+  type OwnPublishDeclineVerdict,
+  type OwnPublishResult,
+} from "./ownPublish";
 import {
   collectSourceWords,
   extractVersesForRange,
@@ -1241,13 +1247,18 @@ async function runReimport(
   // has already superseded. A resource recognized as our own publish is skipped
   // entirely: recognition means master did not move under us at all.
   const needsLineage = new Set<Resource>();
+  // The pairs whose decline was a measured byte difference, with the state the
+  // comparison ran against — handed to the walk so it can say why master differs
+  // (accountOwnPublishDecline). Same gate as the nightly path.
+  const ownDeclines = new Map<Resource, ResourceSyncState>();
   for (const resource of ALL_RESOURCES) {
     const raw = fetchedRaw[resource];
     if (!want.has(resource) || raw == null) continue;
     const state = await resourceSyncState(env, book, resource);
-    const own = await recognizePushedRender(env, book, resource, raw, state);
+    const own = await recognizePushedRender(raw, state);
     if (!own.recognized) {
       needsLineage.add(resource);
+      if (own.reason === "content_differs") ownDeclines.set(resource, state);
       continue;
     }
     const stamped = await markOwnPublishConverged(env, book, resource, own.readAt, state.pushedEditId, null);
@@ -1276,7 +1287,15 @@ async function runReimport(
     // added once here rather than inside the per-chapter row loops.
     const stats = { noBaseCleared: 0 };
     const lineage = needsLineage.has(resource)
-      ? await loadMasterLineage(env, book, resource, cutoff.confirmedAt, cutoff.editId, stats)
+      ? await loadMasterLineage(
+          env,
+          book,
+          resource,
+          cutoff.confirmedAt,
+          cutoff.editId,
+          stats,
+          ownDeclines.get(resource) ?? null,
+        )
       : null;
     perResource[resource].merge_no_base_cleared += stats.noBaseCleared;
     return { ...cutoff, lineage };
@@ -3853,10 +3872,16 @@ async function loadMasterLineage(
   // lineage summary that is persisted and serialized into Workflow steps —
   // carrying a per-run side-effect count on it would leak into both.
   stats?: { noBaseCleared: number },
+  // Non-null when own-publish recognition declined tonight with `content_differs`
+  // for this pair: the sync state that comparison ran against. The walk fetched
+  // here is the evidence that attributes the decline (accountOwnPublishDecline),
+  // so it is judged here rather than paying a second Gitea fetch for it.
+  ownDecline: ResourceSyncState | null = null,
 ): Promise<MasterLineageSummary | null> {
   const file = dcsResourceFile(book, resource);
   if (!file || confirmedAt == null) return null;
   const page = await listMasterCommitsSince(env, file.repo, file.path, null, { sinceTime: confirmedAt });
+  if (ownDecline) await accountOwnPublishDecline(env, book, resource, page, ownDecline);
   const commits = page.commits.map(classifyMasterCommit);
   // #557: narrow "a human touched this file" to "a human touched THIS verse",
   // but only where it is affordable and only where the file-level answer is
@@ -6721,12 +6746,14 @@ async function resourceSyncState(env: Env, book: string, resource: Resource): Pr
 // EXPORT_ALERT_USERNAME, both local copies for the same reason. Keep in sync.
 const OWN_PUBLISH_ALERT_USERNAME = "deferredreward";
 
-// Consecutive declines before we raise a banner. Three, not one: a single decline
-// is the ordinary healthy case (a real Door43 edit, or our branch simply hasn't
-// merged yet), and even two in a row is unremarkable for an actively-edited book.
-// Three consecutive nights where the comparison had something real to compare
-// against and still differed is the point where "the merge is rewriting our bytes,
-// so this whole fix is inert" becomes worth a human's attention.
+// Consecutive MEASURED rewrites (accountOwnPublishDecline's "rewritten" verdict:
+// our own merge is master's newest commit to the file and the bytes still differ)
+// before we raise a banner. Declines that a Door43 editor's or the bot's commit
+// explains no longer count at all — they were what tripped this banner for JER
+// tq on 2026-09-01, three nights of evening AI pushes in a row — so a single
+// rewrite is already strong evidence. Three stays as the bar anyway: one night's
+// verdict rests on one author date and one classification, and the banner asks a
+// human to act on it.
 const OWN_PUBLISH_INERT_THRESHOLD = 3;
 
 // The ONE place both entry paths run the byte comparison, so the nightly cron and
@@ -6734,80 +6761,110 @@ const OWN_PUBLISH_INERT_THRESHOLD = 3;
 // decided or accounted for. What each does with the verdict still differs, and
 // deliberately (see the call sites) — this owns the decision, not the response.
 //
-// Also owns the decline bookkeeping that makes the fix's own inertness visible:
-// a `content_differs` verdict increments the counter and, at the threshold, raises
-// a banner. A recognition resets the counter for free, inside the watermark UPDATE.
-async function recognizePushedRender(
-  env: Env,
-  book: string,
-  resource: Resource,
-  raw: string,
-  sync: ResourceSyncState,
-): Promise<OwnPublishResult> {
+// The decline bookkeeping that makes the fix's own inertness visible does NOT
+// live here any more: a `content_differs` verdict is attributed later the same
+// run, from the lineage walk (accountOwnPublishDecline, called by
+// loadMasterLineage), because only the walk can say WHY master differs. A
+// recognition still resets the counter for free, inside the watermark UPDATE.
+async function recognizePushedRender(raw: string, sync: ResourceSyncState): Promise<OwnPublishResult> {
   // Warm-up short-circuit: with nothing recorded to compare against the verdict is
   // fixed regardless of the bytes, so don't hash a whole book file to learn it.
   if (!sync.pushedBlobSha) return { recognized: false, readAt: null, reason: "no_pushed_render" };
 
-  const own = recognizeOwnPublish({
+  return recognizeOwnPublish({
     masterBlobSha: await gitBlobShaOrNull(raw),
     pushedBlobSha: sync.pushedBlobSha,
     pushedReadAt: sync.pushedReadAt,
   });
-
-  // Only `content_differs` counts. The other declines mean the comparison never
-  // really ran (unhashable master, half-written row), and counting "we couldn't
-  // measure" as "we measured a difference" is the absent-measurement-as-evidence
-  // mistake this codebase has a standing rule against.
-  if (own.reason === "content_differs") {
-    await noteOwnPublishDecline(env, book, resource, sync);
-  }
-  return own;
 }
 
-// Increment the consecutive-decline counter and, on crossing the threshold, raise
-// the banner. Best-effort throughout: this is observability, and it must never
-// fail a sync that is otherwise doing its job correctly.
-async function noteOwnPublishDecline(
+// Attribute tonight's `content_differs` decline from the lineage walk's newest
+// commit (judgeOwnPublishDecline in ownPublish.ts has the argument), and keep the
+// consecutive-"rewritten" counter that drives the inert banner:
+//   explained  — a non-ours commit is master's newest for this file. The
+//                divergence has a measured cause, so it is NOT evidence of
+//                inertness: counter to 0, and any standing banner (whose premise
+//                was "cannot tell them apart") comes down.
+//   rewritten  — our own merge is the newest commit, it landed after the render
+//                was read, and the bytes still differ: the merge job changed
+//                what we pushed. Counter +1; at the threshold, the banner.
+//   unmeasured — nothing to say tonight (walk empty, tonight's branch not merged
+//                yet, missing dates). The counter does not move on absence.
+// Only `content_differs` reaches here (the call sites gate on it). The other
+// declines mean the comparison never really ran (unhashable master, half-written
+// row), and counting "we couldn't measure" as "we measured a difference" is the
+// absent-measurement-as-evidence mistake this codebase has a standing rule
+// against. Best-effort throughout: this is observability, and it must never fail
+// a sync that is otherwise doing its job correctly.
+async function accountOwnPublishDecline(
   env: Env,
   book: string,
   resource: Resource,
+  page: MasterCommitPage,
   sync: ResourceSyncState,
 ): Promise<void> {
-  const next = (sync.declines ?? 0) + 1;
+  const newest = page.commits[0] ? classifyMasterCommit(page.commits[0]) : null;
+  const judged = judgeOwnPublishDecline(newest, sync.pushedReadAt);
+  const source = `own_publish_inert:${book}:${resource}`;
+  const prior = sync.declines ?? 0;
   try {
+    if (judged.verdict === "unmeasured") {
+      console.log("reimport own-publish decline unmeasured: counter unchanged", {
+        book,
+        resource,
+        reason: judged.reason,
+        consecutiveRewrites: prior,
+        pushedReadAt: sync.pushedReadAt,
+      });
+      return;
+    }
+    if (judged.verdict === "explained") {
+      if (prior !== 0) {
+        await env.DB.prepare(
+          `UPDATE book_resource_syncs SET own_publish_declines = 0 WHERE book = ?1 AND resource = ?2`,
+        )
+          .bind(book, resource)
+          .run();
+      }
+      await env.DB.prepare(`DELETE FROM system_alerts WHERE username = ?1 AND source = ?2 AND dismissed_at IS NULL`)
+        .bind(OWN_PUBLISH_ALERT_USERNAME, source)
+        .run();
+      console.log("reimport own-publish decline explained: master's newest commit to this file is not ours", {
+        book,
+        resource,
+        commitKind: judged.kind,
+        commitSha: judged.sha,
+        commitAuthor: judged.author,
+        commitDate: judged.date,
+        resetFrom: prior,
+      });
+      return;
+    }
+    const next = prior + 1;
     await env.DB.prepare(
       `UPDATE book_resource_syncs SET own_publish_declines = ?3 WHERE book = ?1 AND resource = ?2`,
     )
       .bind(book, resource, next)
       .run();
-  } catch (e) {
-    console.error("reimport own-publish decline counter failed", {
+    console.log("reimport own-publish decline measured as a rewrite: our own merge is newest and the bytes differ", {
       book,
       resource,
+      mergeSha: judged.sha,
+      mergeDate: judged.date,
+      pushedBlobSha: sync.pushedBlobSha,
+      consecutiveRewrites: next,
+    });
+    if (next >= OWN_PUBLISH_INERT_THRESHOLD) await raiseOwnPublishInertAlert(env, book, resource, next, sync, judged);
+  } catch (e) {
+    console.error("reimport own-publish decline accounting failed", {
+      book,
+      resource,
+      verdict: judged.verdict,
       error: e instanceof Error ? e.message : String(e),
     });
-    return;
   }
-  console.log("reimport own-publish declined: master differs from our last render", {
-    book,
-    resource,
-    consecutiveDeclines: next,
-  });
-  if (next === OWN_PUBLISH_INERT_THRESHOLD) await raiseOwnPublishInertAlert(env, book, resource, next, sync);
 }
 
-// Banner for "recognition keeps declining." Fires ONCE, on the run that crosses
-// the threshold (`next === THRESHOLD`, not `>=`), so a book that stays in this
-// state doesn't rewrite the alert every night; the counter keeps climbing and a
-// single match clears it.
-//
-// The wording states ONLY what was measured. Two explanations fit these
-// observations and this code cannot tell them apart: continuous out-of-band Door43
-// editing (benign, expected for an actively-worked file) or Door43's merge
-// rewriting the bytes we pushed (which makes this entire fix inert and lets the
-// nightly reverts continue silently). Asserting either would repeat the mistake
-// this repo has a standing lesson about, so the message names both and gives the
-// one comparison that separates them.
 // Banner for issue #427's withhold. This one NEEDS an alert in a way the
 // lock-held withholds do not, and the difference is the whole reason it exists:
 // a chapter lock clears when the AI job finishes, so that withhold releases
@@ -6997,24 +7054,45 @@ async function clearTombstoneBlockAlert(env: Env, book: string, resource: Resour
   }
 }
 
+// Banner for "the merge keeps changing our bytes." Raised by accountOwnPublishDecline
+// once the consecutive-rewrite counter reaches the threshold, and kept to ONE active
+// row per (book, resource): the counter keeps climbing while the state persists, but
+// an already-standing banner is left alone rather than rewritten every night. It
+// comes down on the first byte match (markOwnPublishConverged) or the first night a
+// non-ours commit explains the difference instead (accountOwnPublishDecline).
+//
+// The wording states ONLY what was measured, and this banner now has a measurement
+// to state: master's newest commit to the file is our own export's merge, dated
+// after the render it merged was read, and the file's bytes are still not the ones
+// we pushed. That is the merge job changing our content, not an editor — so the
+// text names the cause and its consequence, and the two shas that let a human
+// confirm it, instead of listing two explanations and asking for a `git hash-object`.
 async function raiseOwnPublishInertAlert(
   env: Env,
   book: string,
   resource: Resource,
-  declines: number,
+  rewrites: number,
   sync: ResourceSyncState,
+  judged: Extract<OwnPublishDeclineVerdict, { verdict: "rewritten" }>,
 ): Promise<void> {
   const source = `own_publish_inert:${book}:${resource}`;
   const message =
-    `Benjamin — for ${declines} syncs in a row, Door43's ${book} ${resource.toUpperCase()} file has differed from ` +
-    `the exact bytes our export last pushed (our blob ${(sync.pushedBlobSha ?? "none").slice(0, 12)}). ` +
-    `Two things produce this and the sync cannot tell them apart: someone is editing that file on Door43 ` +
-    `between every run (normal for an actively-edited book), or Door43's validate-and-merge job is rewriting ` +
-    `our file when it merges — the second would mean the fix that stops the nightly sync reverting editor ` +
-    `work is silently doing nothing for this file. To tell them apart, compare Door43's current file against ` +
-    `our last push: \`git hash-object\` the file from master and check it against that blob sha. ` +
-    `This clears itself the first time they match.`;
+    `Benjamin — for ${rewrites} syncs in a row, Door43's ${book} ${resource.toUpperCase()} file has come back ` +
+    `different from the exact bytes our export pushed (our blob ${(sync.pushedBlobSha ?? "none").slice(0, 12)}), ` +
+    `and each time the newest commit to that file on master was our own export's merge ` +
+    `(latest ${judged.sha.slice(0, 12)}${judged.date ? ` on ${judged.date.slice(0, 10)}` : ""}) — no editor and no ` +
+    `bot committed after it. So Door43's validate-and-merge job is changing the file as it merges. While that ` +
+    `holds, master never reads as our own render, the merge-ancestor watermark for this file stays frozen, and ` +
+    `the protection against the nightly sync reverting editor work is inert for it. Confirm by comparing the ` +
+    `file's blob sha at that master commit against our pushed blob above. This clears itself the first time ` +
+    `they match, or the first night another account's commit explains the difference.`;
   try {
+    const standing = await env.DB.prepare(
+      `SELECT 1 AS one FROM system_alerts WHERE username = ?1 AND source = ?2 AND dismissed_at IS NULL LIMIT 1`,
+    )
+      .bind(OWN_PUBLISH_ALERT_USERNAME, source)
+      .first<{ one: number }>();
+    if (standing) return;
     await env.DB.prepare(`DELETE FROM system_alerts WHERE username = ?1 AND source = ?2 AND dismissed_at IS NULL`)
       .bind(OWN_PUBLISH_ALERT_USERNAME, source)
       .run();
@@ -7850,7 +7928,7 @@ async function planAndStageBookResources(
     // byte match against our own render is strictly stronger evidence of
     // completeness than that gate's row-count heuristic, and running first
     // saves its D1 count query on a converged resource.
-    const own = await recognizePushedRender(env, book, resource, raw, sync);
+    const own = await recognizePushedRender(raw, sync);
     if (own.recognized) {
       const stamped = await markOwnPublishConverged(env, book, resource, own.readAt, sync.pushedEditId, masterSha);
       console.log("reimport recognized master's movement as our own publish", {
@@ -7889,18 +7967,15 @@ async function planAndStageBookResources(
       continue;
     }
     if (own.reason === "content_differs") {
-      // How we find out whether this fix is actually working in prod. A decline
-      // here is EITHER the correct answer (a genuine foreign commit on master,
-      // which is what the three-way merge is for) OR the one way this fix could
-      // be quietly inert: if the DCS validate-and-merge Action rewrites the file
-      // on merge — reformatting, re-encoding, normalizing line endings — master's
-      // bytes would never equal ours and recognition would never fire, with no
-      // symptom other than the AMOS reverts continuing. The two are
-      // indistinguishable from inside this function, so log the fact rather than
-      // assert a cause (standing rule: an alert may only state what it measured).
-      // `wrangler tail | grep own-publish` across a few nights separates them:
-      // all-declines on books nobody edits on Door43 means the bytes are being
-      // rewritten and the recognition needs to move to a normalized comparison.
+      // A decline here is EITHER the correct answer (a genuine foreign commit on
+      // master, which is what the three-way merge is for) OR the one way this fix
+      // could be quietly inert: if the DCS validate-and-merge Action rewrites the
+      // file on merge — reformatting, re-encoding, normalizing line endings —
+      // master's bytes would never equal ours and recognition would never fire,
+      // with no symptom other than the AMOS reverts continuing. The two are
+      // indistinguishable from the bytes alone, so this logs the fact and leaves
+      // the cause to the lineage walk below (loadMasterLineage →
+      // accountOwnPublishDecline), whose newest commit says which it was.
       console.log("reimport own-publish declined: master differs from our last render", {
         book,
         resource,
@@ -7995,6 +8070,9 @@ async function planAndStageBookResources(
       stageCutoff.confirmedAt,
       stageCutoff.editId,
       noBaseStats,
+      // Tonight's own-publish decline, for the walk to attribute — only the
+      // verdict that means "we measured a difference" (see accountOwnPublishDecline).
+      own.reason === "content_differs" ? sync : null,
     );
     const r2Key = `reimport-stage/${instanceId}/${book}/${resource}`;
     await env.BLOBS.put(r2Key, raw);

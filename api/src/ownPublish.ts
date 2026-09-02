@@ -170,3 +170,87 @@ export function recognizeOwnPublish(input: OwnPublishInput): OwnPublishResult {
 
   return { recognized: true, readAt: pushedReadAt, reason: "own_publish" };
 }
+
+// ---------------------------------------------------------------------------
+// Attributing a `content_differs` decline.
+//
+// A decline says master's bytes are not the render we last pushed. Two things
+// produce that, and the byte comparison alone cannot tell them apart:
+//   (a) somebody else committed to the file after our push landed — an editor,
+//       or the bp-assistant pipeline's evening pushes (measured on prod
+//       2026-09-02: en_tq's tq_JER.tsv had a bot commit between every one of
+//       our nightly merges for a week, which is what tripped the inert banner);
+//   (b) Door43's validate-and-merge job rewrote our bytes when it merged, so
+//       master never reads as our own render — the one way recognition can be
+//       quietly inert while the nightly reverts continue.
+// The lineage walk the sync runs a moment later fetches the file's commits
+// newest-first, and the NEWEST commit settles it: if it is not ours, master
+// moved after us for a reason the walk can name (a); if it IS our own merge and
+// landed after the render was read, then the merge landed and the bytes still
+// differ (b). Our merge landing BEFORE the render was read is the previous
+// night's merge — tonight's `-be-` branch has not merged yet — which is a
+// normal state, not a measurement of either. Pure, so the decision has a unit
+// test; bookReimport.ts owns the counter and the banner it drives.
+//
+// Measured against git.door43.org 2026-09-02, five recent `bible-editor:` PRs
+// across three books: the PR head's blob sha equalled master's blob sha at the
+// squash commit every time — so (b) is not happening today. This function
+// exists so that, the day it does, the banner says so from evidence instead of
+// listing both explanations and asking a human to run `git hash-object`.
+
+/** The structural subset of masterLineage.ts's ClassifiedCommit this reads. */
+export interface OwnPublishDeclineCommit {
+  sha: string;
+  kind: "ours" | "ai" | "human";
+  /** commit.author.date, ISO-8601. */
+  date?: string | null;
+  authorName?: string | null;
+}
+
+export type OwnPublishDeclineVerdict =
+  | {
+      /** Master's newest commit to the file is not ours: the divergence has a named cause. */
+      verdict: "explained";
+      kind: "ai" | "human";
+      sha: string;
+      author: string | null;
+      date: string | null;
+    }
+  | {
+      /** Master's newest commit IS our own merge, landed after the render was read, and the bytes still differ. */
+      verdict: "rewritten";
+      sha: string;
+      date: string | null;
+    }
+  | {
+      verdict: "unmeasured";
+      reason: "no_commits" | "no_commit_date" | "no_pushed_read_at" | "merge_pending";
+    };
+
+export function judgeOwnPublishDecline(
+  newest: OwnPublishDeclineCommit | null | undefined,
+  pushedReadAt: number | null,
+): OwnPublishDeclineVerdict {
+  // No commit in the walked window at all (or the fetch fell over and the page
+  // is empty). Nothing measured — the counter must not move on absence.
+  if (!newest) return { verdict: "unmeasured", reason: "no_commits" };
+  if (newest.kind !== "ours") {
+    return {
+      verdict: "explained",
+      kind: newest.kind,
+      sha: newest.sha,
+      author: newest.authorName ?? null,
+      date: newest.date ?? null,
+    };
+  }
+  if (pushedReadAt == null) return { verdict: "unmeasured", reason: "no_pushed_read_at" };
+  const landed = newest.date ? Date.parse(newest.date) : NaN;
+  if (!Number.isFinite(landed)) return { verdict: "unmeasured", reason: "no_commit_date" };
+  // Measured 2026-09-02 on en_tq #864: the squash commit's author date is the
+  // merge time itself (05:42:19Z, for a -be- branch committed 05:41:14Z), and
+  // both sit AFTER recordPushedRender's D1 read of that render. A merge dated
+  // before that read is therefore an earlier night's — tonight's branch is
+  // still waiting to merge — and nothing about tonight has been measured.
+  if (landed / 1000 < pushedReadAt) return { verdict: "unmeasured", reason: "merge_pending" };
+  return { verdict: "rewritten", sha: newest.sha, date: newest.date ?? null };
+}

@@ -26,7 +26,7 @@
 // watermark advances. Asserting the OLD outcome is the point — a regression
 // test that only checks the new behavior can't tell you it was ever broken.
 
-import { gitBlobSha, recognizeOwnPublish } from "./ownPublish.ts";
+import { gitBlobSha, judgeOwnPublishDecline, recognizeOwnPublish } from "./ownPublish.ts";
 import { computeVerseMerge } from "./verseMerge.ts";
 
 let failed = 0;
@@ -288,9 +288,61 @@ const foreignMerge = computeVerseMerge({
 eq(foreignMerge.action, "adopt", "a real foreign edit is still adopted (the 1CH behavior is preserved)");
 eq(foreignMerge.adopt, true, "adopt -> master's out-of-band correction reaches D1");
 
+// --- judgeOwnPublishDecline: attributing a content_differs decline ------------
+//
+// PROD SHAPE UNDER TEST (2026-09-01/02, en_tq tq_JER.tsv): the bp-assistant bot
+// pushed a chapter every evening (23:49Z on 09-01) between our nightly merges
+// (05:38Z / 05:42Z), so the byte comparison declined three nights running and the
+// blind counter raised the "cannot tell them apart" banner — while the merge job
+// was measured landing our exact bytes every time (five PRs, three books).
+// Dates below are the real ones.
+const READ_AT_0901 = Date.parse("2026-09-01T05:31:00Z") / 1000; // render read, night of 09-01
+const READ_AT_0902 = Date.parse("2026-09-02T05:31:00Z") / 1000;
+const botPush = { sha: "863fbfa65119", kind: "ai", date: "2026-09-01T23:49:46Z", authorName: "BW Bot" };
+const ourMerge0901 = { sha: "22d652732b18", kind: "ours", date: "2026-09-01T05:38:03Z", authorName: "Benjamin Wright" };
+const ourMerge0902 = { sha: "744f2ee87f2a", kind: "ours", date: "2026-09-02T05:42:19Z", authorName: "Benjamin Wright" };
+const humanEdit = { sha: "dd522309086b", kind: "human", date: "2026-06-06T15:32:07Z", authorName: "Richard Mahn" };
+
+// The JER tq night: the bot's push is newest -> explained, and it names the bot.
+const explained = judgeOwnPublishDecline(botPush, READ_AT_0901);
+eq(explained.verdict, "explained", "a bot commit newer than our merge explains the byte difference");
+eq(explained.kind, "ai", "…as the pipeline's push");
+eq(explained.author, "BW Bot", "…naming the account the walk saw");
+eq(explained.sha, "863fbfa65119", "…and the commit");
+
+// A maintainer's edit on top of our merge: explained, and the human is named.
+const humanExplained = judgeOwnPublishDecline(humanEdit, READ_AT_0901);
+eq(humanExplained.verdict, "explained", "a human commit newer than our merge explains the difference");
+eq(humanExplained.kind, "human", "…as a human edit");
+eq(humanExplained.author, "Richard Mahn", "…naming the editor");
+
+// Tonight's branch has not merged yet: the newest ours commit is LAST night's
+// merge, dated before tonight's render was read. Nothing measured.
+const pending = judgeOwnPublishDecline(ourMerge0901, READ_AT_0902);
+eq(pending.verdict, "unmeasured", "our previous night's merge as newest means tonight's branch is still pending");
+eq(pending.reason, "merge_pending", "…and says so");
+
+// The rewrite signature: our own merge is newest, it landed after the render was
+// read, and (the caller already knows) the bytes differ. This is the ONLY shape
+// that counts toward the banner.
+const rewritten = judgeOwnPublishDecline(ourMerge0902, READ_AT_0902);
+eq(rewritten.verdict, "rewritten", "our merge newest, dated after the read, bytes differ -> the merge changed our content");
+eq(rewritten.sha, "744f2ee87f2a", "…citing the merge commit");
+
+// Absence is not evidence, in every form it takes.
+eq(judgeOwnPublishDecline(null, READ_AT_0902).verdict, "unmeasured", "an empty walk measures nothing");
+eq(judgeOwnPublishDecline(null, READ_AT_0902).reason, "no_commits", "…for the stated reason");
+eq(judgeOwnPublishDecline({ ...ourMerge0902, date: null }, READ_AT_0902).reason, "no_commit_date", "an undated ours commit cannot be placed relative to the read");
+eq(judgeOwnPublishDecline({ ...ourMerge0902, date: "not a date" }, READ_AT_0902).reason, "no_commit_date", "…nor an unparseable one");
+eq(judgeOwnPublishDecline(ourMerge0902, null).reason, "no_pushed_read_at", "a half-written sync row (no read time) measures nothing");
+// A non-ours newest commit is explanatory regardless of dates — the walk saw it
+// after our push by construction (newest-first over a window that starts at the
+// watermark), so it needs no read time to be placed.
+eq(judgeOwnPublishDecline({ ...botPush, date: null }, null).verdict, "explained", "an undated bot commit still explains: it is newer than anything of ours by position");
+
 if (failed > 0) {
   console.error(`\n${failed} failure(s)`);
   process.exit(1);
 } else {
-  console.log("\nAll gitBlobSha / recognizeOwnPublish / AMOS-timeline checks passed.");
+  console.log("\nAll gitBlobSha / recognizeOwnPublish / judgeOwnPublishDecline / AMOS-timeline checks passed.");
 }
