@@ -12,16 +12,20 @@ import {
   PARAGRAPH_TAGS,
   ACROSTIC_HEADING_TAGS,
   LIST_TAGS,
+  HEADER_LABEL_TAGS,
   isInFlowMarker,
   isAcrosticHeading,
+  isHeaderLabelNode,
   listMarkerTag,
   extractEditableText,
+  extractPlainText,
   extractTrailingMarkers,
+  splitSectionHeaders,
   liftMarkerText,
 } from "./usfm.ts";
 import { tokenizeEditableText, smartEditVerse } from "./replace.ts";
-import { paragraphClass } from "./highlight.ts";
-import { renderHighlightedHTML, renderEditableHTML } from "./highlight.ts";
+import { paragraphClass, renderHighlightedHTML, renderEditableHTML } from "./highlight.ts";
+import { toJSON, toUSFM } from "usfm-js";
 
 let failed = 0;
 function assert(cond, msg) {
@@ -99,7 +103,79 @@ assert(paragraphClass("pr").wrapper === "be-para be-pr", "\\pr → be-para be-pr
 assert(paragraphClass("cls").wrapper === "be-para be-pr", "\\cls → be-para be-pr");
 assert(paragraphClass("po").wrapper === "be-para be-p", "\\po → default paragraph (be-para be-p)");
 
-// ── 6. \qa acrostic headings (#708). usfm-js parses `\qa Aleph` as
+// ── 6. Header/reference/label family (#710): \sp \sr \r \cl. usfm-js parses
+//       these WITHOUT a `type` field — unlike \s1-\s4, which are
+//       `type:"section"`. \sp parks its label on `text` (matching a line
+//       marker's same-line-text shape); \sr/\r/\cl park it on `content`
+//       (matching \s1's shape). Build fixtures with usfm-js itself so the
+//       node shapes are exactly what real corpus data produces, not a
+//       hand-guessed approximation.
+for (const tag of HEADER_LABEL_TAGS) {
+  const usfm = `\\c 1\n\\v 1 First verse.\n\\${tag} Some Label\n\\v 2 Second verse.`;
+  const parsed = toJSON(usfm);
+  const v1 = parsed.chapters["1"]["1"].verseObjects;
+  const labelNode = v1[v1.length - 1];
+  assert(labelNode && labelNode.tag === tag, `\\${tag} fixture: usfm-js parks it at the tail of v1 (got ${JSON.stringify(labelNode)})`);
+  assert(labelNode.type === undefined, `\\${tag} fixture: usfm-js gives it no "type" field`);
+
+  assert(isHeaderLabelNode(labelNode), `isHeaderLabelNode recognizes \\${tag}`);
+
+  const { sections, body } = splitSectionHeaders(v1);
+  assert(
+    sections.length === 1 && sections[0].tag === tag && sections[0].text === "Some Label",
+    `splitSectionHeaders hoists \\${tag} into the header band (got ${JSON.stringify(sections)})`,
+  );
+  assert(!body.includes(labelNode), `splitSectionHeaders' body drops the \\${tag} node`);
+
+  const editable = extractEditableText(v1);
+  assert(!editable.includes("Some Label"), `extractEditableText excludes \\${tag}'s label text (got: ${JSON.stringify(editable)})`);
+  assert(!editable.includes(`\\${tag}`), `extractEditableText excludes the literal \\${tag} token (got: ${JSON.stringify(editable)})`);
+
+  const plain = extractPlainText(v1);
+  assert(!plain.includes("Some Label"), `extractPlainText excludes \\${tag}'s label text (got: ${JSON.stringify(plain)})`);
+
+  // The #710 failure mode: the label text re-tokenized into draggable \w
+  // words ("Some", "Label") on the edit round-trip.
+  const reparsed = tokenizeEditableText(editable);
+  assert(
+    !reparsed.some((n) => isWordNode(n) && (n.text === "Some" || n.text === "Label")),
+    `\\${tag}'s label does NOT leak through the edit round-trip as a \\w word`,
+  );
+
+  // splitSectionHeaders only ever FILTERS — it never mutates or clones a
+  // node — so recombining body + the untouched original label node
+  // reproduces the exact source verse, and usfm-js re-serializes it
+  // byte-identical to the input. Confirms no export-time loss end-to-end.
+  const recombined = { ...parsed, chapters: { ...parsed.chapters, "1": { ...parsed.chapters["1"], "1": { verseObjects: [...body, labelNode] } } } };
+  assert(toUSFM(recombined).trim() === usfm.trim(), `\\${tag} round-trips losslessly through usfm-js export (got: ${JSON.stringify(toUSFM(recombined))})`);
+}
+
+// ── 7. \d (Psalm superscription) is `type:"section"` but is deliberately
+//       EXCLUDED from the header-label treatment — its text IS alignable
+//       Hebrew and must stay in the verse body / plain text.
+{
+  const dNode = { type: "section", tag: "d", text: "A psalm of David." };
+  assert(!isHeaderLabelNode(dNode), "\\d (Psalm title) is NOT a header-label node");
+  const plain = extractPlainText([dNode]);
+  assert(plain === "A psalm of David.", `extractPlainText still includes \\d's text (got: ${JSON.stringify(plain)})`);
+}
+
+// ── 8. \s5 (legacy chunk marker) must NOT be swept into the header-label
+//       treatment alongside \s1 — it is a chunk BOUNDARY, not a label, and
+//       usfm-js also gives it no text/content in the common case. Guards
+//       against exactly the mis-bucketing #710 warns about.
+{
+  const usfm = "\\c 1\n\\v 1 First verse.\n\\s5\n\\v 2 Second verse.";
+  const v1 = toJSON(usfm).chapters["1"]["1"].verseObjects;
+  const s5Node = v1[v1.length - 1];
+  assert(s5Node && s5Node.tag === "s5", `\\s5 fixture shape (got ${JSON.stringify(s5Node)})`);
+  assert(!isHeaderLabelNode(s5Node), "\\s5 is NOT recognized as a header-label node");
+  assert(!HEADER_LABEL_TAGS.has("s5"), "HEADER_LABEL_TAGS does not include s5");
+  const { sections } = splitSectionHeaders(v1);
+  assert(sections.length === 0, `\\s5 is not hoisted into the header band (got ${JSON.stringify(sections)})`);
+}
+
+// ── 9. \qa acrostic headings (#708). usfm-js parses `\qa Aleph` as
 //       {tag:"qa", type:"quote", text:"Aleph"} — same type as a `\q1` poetry
 //       LINE, but its text is a heading LABEL. It must round-trip intact while
 //       NEVER becoming a draggable `\w` word, and must NOT be a canonical
@@ -161,7 +237,7 @@ assert(
   "\\qa drifts as a trailing marker to the verse it heads",
 );
 
-// ── 7. \li* / \lh / \lf / \lim* list family (#709). usfm-js parses these with
+// ── 10. \li* / \lh / \lf / \lim* list family (#709). usfm-js parses these with
 //       NO `type` field (`\li1 x` → {tag:"li1", content:"x"}; `\lh`/`\lf`/
 //       `\lim*` → {tag, text:"x"}), so every type-based predicate missed them:
 //       the marker was dropped and its text lost or minted as `\w` words.
