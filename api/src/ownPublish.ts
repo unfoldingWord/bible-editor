@@ -184,17 +184,22 @@ export function recognizeOwnPublish(input: OwnPublishInput): OwnPublishResult {
 //       master never reads as our own render — the one way recognition can be
 //       quietly inert while the nightly reverts continue.
 // The question is answered DIRECTLY, not inferred from who committed last: find
-// the merge of the render we pushed — the newest `ours` commit on master dated
-// at or after the render's D1 read — and read the file's blob sha AT THAT
-// COMMIT (dcsSources.ts fileBlobShaAtCommit, one tree read). Equal to the blob
-// we pushed: the merge preserved our bytes, and tonight's mismatch is whatever
-// landed after it (a), which the walk names. Different: the merge changed our
-// bytes (b), measured even when a bot pushed on top afterwards — a cold review
-// of the first draft showed that inferring from the newest commit alone let an
-// interleaved bot push reset a real rewrite's count and hide it. No `ours`
-// commit dated after the read: tonight's `-be-` branch has not merged yet,
-// which is a normal state and measures nothing. Two pure steps so both have
-// unit tests; bookReimport.ts owns the fetches, the counter and the banner.
+// the merge of the render we pushed — the `ours` commit on master whose subject
+// carries our export PR's number, `(#N)`, which Gitea appends on a squash merge
+// (measured: `bible-editor: JER tq → master (#864)`) — and read the file's blob
+// sha AT THAT COMMIT (dcsSources.ts fileBlobShaAtCommit, one tree read). Equal
+// to the blob we pushed: the merge preserved our bytes, and tonight's mismatch
+// is whatever landed after it (a), which the walk names. Different: the merge
+// changed our bytes (b), measured even when a bot pushed on top afterwards — a
+// cold review of the first draft showed that inferring from the newest commit
+// alone let an interleaved bot push reset a real rewrite's count and hide it.
+// No commit with that PR number: tonight's `-be-` branch has not merged yet,
+// which is a normal state and measures nothing. Matching by PR number rather
+// than by date (the second draft) is what keeps two overlapping exports of the
+// same pair apart: export A's merge landing after export B's render was read
+// would otherwise be compared against B's blob and read as a rewrite (Codex
+// review on PR #704). Two pure steps so both have unit tests; bookReimport.ts
+// owns the fetches, the counter and the banner.
 //
 // Measured against git.door43.org 2026-09-02, five recent `bible-editor:` PRs
 // across three books: the PR head's blob sha equalled master's blob sha at the
@@ -211,40 +216,34 @@ export interface OwnPublishDeclineCommit {
   authorName?: string | null;
 }
 
-export type OurMergeAfterRead =
+export type OurMergeMatch =
   | { found: true; commit: OwnPublishDeclineCommit }
-  | { found: false; reason: "no_commits" | "no_pushed_read_at" | "no_commit_date" | "merge_pending" };
+  | { found: false; reason: "no_commits" | "no_pr_number" | "merge_pending" };
 
 // Step 1 (pure): which commit merged the render we pushed? `commits` is the
 // walk, newest-first, over a window that starts at or before the render read
 // (master_confirmed_at is always older than pushed_read_at; a dedicated walk
-// from pushed_read_at is used when there is no watermark yet).
+// from pushed_read_at is used when there is no watermark yet). `prNumber` is
+// the export PR opened for that render (export_snapshots.pr_number on the row
+// written after the push; null when PR creation failed or nothing is recorded).
 //
-// Measured 2026-09-02 on en_tq #864: a Gitea squash commit's author date is the
-// merge time itself (05:42:19Z, for a -be- branch committed 05:41:14Z), and
-// both sit AFTER recordPushedRender's D1 read of that render. So the newest
-// `ours` commit dated >= the read is tonight's merge; an `ours` commit dated
-// before it is an earlier night's, and if that is all there is, tonight's
-// branch is still waiting to merge.
-export function findOurMergeAfterRead(
-  commits: readonly OwnPublishDeclineCommit[],
-  pushedReadAt: number | null,
-): OurMergeAfterRead {
+// Gitea's squash merge titles the master commit `<PR title> (#N)` — measured on
+// every `bible-editor:` merge in en_tq's history — and only `ours` commits are
+// eligible, so a human `Revert "bible-editor: … (#N)"` (classified human) can
+// never be taken for the merge itself.
+export function findOurMergeForPr(
+  commits: readonly (OwnPublishDeclineCommit & { message?: string | null })[],
+  prNumber: number | null,
+): OurMergeMatch {
   if (commits.length === 0) return { found: false, reason: "no_commits" };
-  if (pushedReadAt == null) return { found: false, reason: "no_pushed_read_at" };
-  let undatedOurs = 0;
+  if (prNumber == null || !Number.isInteger(prNumber) || prNumber <= 0) return { found: false, reason: "no_pr_number" };
+  const tag = `(#${prNumber})`;
   for (const c of commits) {
     if (c.kind !== "ours") continue;
-    const at = c.date ? Date.parse(c.date) : NaN;
-    if (!Number.isFinite(at)) {
-      undatedOurs++;
-      continue;
-    }
-    if (at / 1000 >= pushedReadAt) return { found: true, commit: c };
+    const subject = (c.message ?? "").split("\n", 1)[0];
+    if (subject.includes(tag)) return { found: true, commit: c };
   }
-  // An undated `ours` commit cannot be placed relative to the read, so "pending"
-  // would be a guess; say what was actually missing.
-  return { found: false, reason: undatedOurs > 0 ? "no_commit_date" : "merge_pending" };
+  return { found: false, reason: "merge_pending" };
 }
 
 export type OwnPublishDeclineVerdict =
@@ -265,14 +264,14 @@ export type OwnPublishDeclineVerdict =
     }
   | {
       verdict: "unmeasured";
-      reason: "no_commits" | "no_pushed_read_at" | "no_commit_date" | "merge_pending" | "merge_blob_unknown";
+      reason: "no_commits" | "no_pr_number" | "merge_pending" | "merge_blob_unknown";
     };
 
 // Step 2 (pure): the verdict, given step 1's answer and the blob sha the caller
 // read at that merge commit (`null` when the read failed — absence is not a
 // match, and not a mismatch either).
 export function judgeOwnPublishDecline(input: {
-  ourMerge: OurMergeAfterRead;
+  ourMerge: OurMergeMatch;
   mergedBlobSha: string | null;
   pushedBlobSha: string;
   /** The walk's newest commit, for naming what landed after a preserved merge. */

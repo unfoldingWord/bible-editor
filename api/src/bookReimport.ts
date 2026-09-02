@@ -67,7 +67,7 @@ import {
   type MasterLineageSummary,
 } from "./masterLineage.ts";
 import {
-  findOurMergeAfterRead,
+  findOurMergeForPr,
   gitBlobShaOrNull,
   judgeOwnPublishDecline,
   recognizeOwnPublish,
@@ -6826,6 +6826,24 @@ async function accountOwnPublishDecline(
   const prior = sync.declines ?? 0;
   try {
     if (!sync.pushedBlobSha) return; // content_differs implies a pushed render; defensive only
+    // The export PR opened for THE render pushed_blob_sha describes: the newest
+    // snapshot row for this pair that carries a PR number AND was written at or
+    // after that render's D1 read (recordSnapshot runs after recordPushedRender
+    // in the same export step). An older PR row means the current push has no
+    // PR on record (creation failed, or nothing was pushed) — then there is no
+    // merge to look for, and matching an earlier PR's merge would compare an
+    // earlier render's bytes against this one's (Codex review on PR #704).
+    const pr =
+      sync.pushedReadAt == null
+        ? null
+        : await env.DB.prepare(
+            `SELECT pr_number FROM export_snapshots
+              WHERE book = ?1 AND resource = ?2 AND pr_number IS NOT NULL AND committed_at >= ?3
+              ORDER BY committed_at DESC, id DESC LIMIT 1`,
+          )
+            .bind(book, resource, sync.pushedReadAt)
+            .first<{ pr_number: number }>();
+    const prNumber = pr?.pr_number ?? null;
     const page =
       walked ??
       (sync.pushedReadAt == null
@@ -6835,7 +6853,7 @@ async function accountOwnPublishDecline(
             pageLimit: 2,
           }));
     const commits = page.commits.map(classifyMasterCommit);
-    const ourMerge = findOurMergeAfterRead(commits, sync.pushedReadAt);
+    const ourMerge = findOurMergeForPr(commits, prNumber);
     const mergedBlobSha = ourMerge.found ? await fileBlobShaAtCommit(env, file.repo, file.path, ourMerge.commit.sha) : null;
     const judged = judgeOwnPublishDecline({
       ourMerge,
@@ -6849,6 +6867,7 @@ async function accountOwnPublishDecline(
         book,
         resource,
         reason: judged.reason,
+        prNumber,
         measuredRewrites: prior,
         pushedReadAt: sync.pushedReadAt,
         walkedFrom: walked ? "lineage" : "pushed_read_at",
@@ -6856,19 +6875,19 @@ async function accountOwnPublishDecline(
       return;
     }
     if (judged.verdict === "preserved") {
-      if (prior !== 0) {
-        await env.DB.prepare(
-          `UPDATE book_resource_syncs SET own_publish_declines = 0 WHERE book = ?1 AND resource = ?2`,
-        )
-          .bind(book, resource)
-          .run();
-      }
+      await env.DB.prepare(
+        `UPDATE book_resource_syncs SET own_publish_declines = 0, own_publish_rewrite_sha = NULL
+          WHERE book = ?1 AND resource = ?2 AND (own_publish_declines <> 0 OR own_publish_rewrite_sha IS NOT NULL)`,
+      )
+        .bind(book, resource)
+        .run();
       await env.DB.prepare(`DELETE FROM system_alerts WHERE username = ?1 AND source = ?2 AND dismissed_at IS NULL`)
         .bind(OWN_PUBLISH_ALERT_USERNAME, source)
         .run();
       console.log("reimport own-publish decline explained: our merge landed our exact bytes; a later commit moved the file", {
         book,
         resource,
+        prNumber,
         mergeSha: judged.mergeSha,
         mergeDate: judged.mergeDate,
         pushedBlobSha: sync.pushedBlobSha,
@@ -6880,18 +6899,32 @@ async function accountOwnPublishDecline(
       });
       return;
     }
-    // Atomic increment: this runs inside a retried Workflow step, and a
-    // read-modify-write from `prior` would double-count a retry (cold review F7).
+    // Count each rewritten MERGE once (0061's own_publish_rewrite_sha): the same
+    // merge measured again — by a retried Workflow step tonight, or on later
+    // nights when no new export pushed (locked book, nothing changed) — adds
+    // nothing. Atomic in the same statement, so a retry cannot double-count.
     const row = await env.DB.prepare(
-      `UPDATE book_resource_syncs SET own_publish_declines = own_publish_declines + 1
-        WHERE book = ?1 AND resource = ?2 RETURNING own_publish_declines`,
+      `UPDATE book_resource_syncs
+          SET own_publish_declines = own_publish_declines + 1, own_publish_rewrite_sha = ?3
+        WHERE book = ?1 AND resource = ?2 AND (own_publish_rewrite_sha IS NULL OR own_publish_rewrite_sha <> ?3)
+        RETURNING own_publish_declines`,
     )
-      .bind(book, resource)
+      .bind(book, resource, judged.mergeSha)
       .first<{ own_publish_declines: number }>();
-    const next = row?.own_publish_declines ?? prior + 1;
+    if (!row) {
+      console.log("reimport own-publish decline: this rewritten merge was already counted", {
+        book,
+        resource,
+        mergeSha: judged.mergeSha,
+        measuredRewrites: prior,
+      });
+      return;
+    }
+    const next = row.own_publish_declines;
     console.log("reimport own-publish decline measured as a rewrite: the merge of our push holds different bytes", {
       book,
       resource,
+      prNumber,
       mergeSha: judged.mergeSha,
       mergeDate: judged.mergeDate,
       mergedBlobSha: judged.mergedBlobSha,

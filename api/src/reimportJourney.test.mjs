@@ -3369,13 +3369,24 @@ console.log("\n[own-publish decline accounting: measured at the merge commit, re
   const BOT_PUSH = { sha: "863fbfa65119", message: "TQ: JER 10 [ju..7@api.bp-assistant]", authorEmail: "bot@bp-assistant", authorName: "BW Bot", date: "2026-09-01T23:49:46Z" };
   const FILE = { repo: "en_tq", path: `tq_${BOOK}.tsv` };
   const SOURCE = `own_publish_inert:${BOOK}:tq`;
-  const seedSync = (sqlite, declines) => {
+  // The export's own record of the push: pushed_blob_sha/read_at on the sync row,
+  // and the PR it opened for that render on export_snapshots (written after the
+  // render read, in the same export step).
+  const seedSync = (sqlite, declines, { prNumber = 859, prAt = READ_AT + 120 } = {}) => {
     sqlite
       .prepare(
         `INSERT INTO book_resource_syncs (book, resource, source_sha, origin, pushed_blob_sha, pushed_read_at, own_publish_declines)
          VALUES (?, 'tq', 'sha0', 'reimport', ?, ?, ?)`,
       )
       .run(BOOK, PUSHED, READ_AT, declines);
+    if (prNumber != null) {
+      sqlite
+        .prepare(
+          `INSERT INTO export_snapshots (book, resource, branch, commit_sha, rows_exported, pr_number, committed_at)
+           VALUES (?, 'tq', 'JER-be-x', 'd1861f72363b', 900, ?, ?)`,
+        )
+        .run(BOOK, prNumber, prAt);
+    }
     return { sourceSha: "sha0", syncedAt: null, pushedBlobSha: PUSHED, pushedReadAt: READ_AT, pushedEditId: null, declines };
   };
   const seedBanner = (sqlite) =>
@@ -3451,14 +3462,50 @@ console.log("\n[own-publish decline accounting: measured at the merge commit, re
     eq(s.banners[0].message.includes("22d652732b18"), true, "…and the merge commit");
     eq(s.banners[0].message.includes("cannot tell them apart"), false, "…and never the old two-explanations text");
 
-    // Another rewritten night: the counter climbs, the banner is NOT re-raised.
+    // The SAME merge measured again — a retried step tonight, or a later night
+    // with no new push — adds nothing (0061's own_publish_rewrite_sha).
     const sync2 = { ...sync, declines: 3 };
     await withGitea(gitea([BOT_PUSH, OUR_MERGE], "0000deadbeef00000000000000000000deadbeef"), () =>
       accountOwnPublishDeclineForTest(env, BOOK, "tq", FILE, null, sync2),
     );
+    eq(readState(sqlite).declines, 3, "re-measuring the same rewritten merge does not count it twice");
+
+    // A NEW export (#861) whose merge is also rewritten: counts, banner NOT re-raised.
+    sqlite
+      .prepare(
+        `INSERT INTO export_snapshots (book, resource, branch, commit_sha, rows_exported, pr_number, committed_at)
+         VALUES (?, 'tq', 'JER-be-x', 'aaaa1111', 900, 861, ?)`,
+      )
+      .run(BOOK, READ_AT + 86400);
+    const MERGE_861 = { ...OUR_MERGE, sha: "5555aaaa6666", message: "bible-editor: JER tq → master (#861)", date: "2026-09-02T05:40:00Z" };
+    await withGitea(gitea([MERGE_861, BOT_PUSH, OUR_MERGE], "1111deadbeef00000000000000000000deadbeef"), () =>
+      accountOwnPublishDeclineForTest(env, BOOK, "tq", FILE, null, { ...sync, pushedReadAt: READ_AT + 86000, declines: 3 }),
+    );
     const s2 = readState(sqlite);
-    eq(s2.declines, 4, "a further measured rewrite keeps counting");
+    eq(s2.declines, 4, "a further rewritten merge (a different commit) keeps counting");
     eq(s2.banners.length, 1, "…without a second banner (raise on the crossing only)");
+  }
+
+  // (e) Two overlapping exports (Codex finding on PR #704): export A (#859) merged
+  //     after export B's render was read, and B (#864) is still pending. By PR
+  //     number this is pending — A's blob is never compared against B's push.
+  {
+    const { sqlite, env } = freshEnv();
+    const sync = seedSync(sqlite, 2, { prNumber: 864 });
+    const g = gitea([BOT_PUSH, OUR_MERGE], "0000deadbeef00000000000000000000deadbeef");
+    await withGitea(g, () => accountOwnPublishDeclineForTest(env, BOOK, "tq", FILE, null, sync));
+    eq(readState(sqlite).declines, 2, "another export's merge is not measured as ours → counter unchanged");
+    eq(g.calls.trees, 0, "…and no tree read is spent on it");
+  }
+
+  // (f) The push has no PR on record (only an OLDER export's PR row exists): nothing to look for.
+  {
+    const { sqlite, env } = freshEnv();
+    const sync = seedSync(sqlite, 2, { prNumber: 859, prAt: READ_AT - 86400 });
+    const g = gitea([BOT_PUSH, OUR_MERGE], "0000deadbeef00000000000000000000deadbeef");
+    await withGitea(g, () => accountOwnPublishDeclineForTest(env, BOOK, "tq", FILE, null, sync));
+    eq(readState(sqlite).declines, 2, "a PR row older than the render read does not identify this push's merge → counter unchanged");
+    eq(g.calls.trees, 0, "…and no tree read is spent on it");
   }
 
   // (d) Unmeasured nights leave the counter alone, in both directions.
@@ -3466,8 +3513,8 @@ console.log("\n[own-publish decline accounting: measured at the merge commit, re
     const { sqlite, env } = freshEnv();
     const sync = seedSync(sqlite, 2);
     seedBanner(sqlite);
-    // Tonight's branch has not merged: only a merge from BEFORE the read is on master.
-    const older = { ...OUR_MERGE, sha: "0abeb26ff896", date: "2026-08-31T05:36:55Z" };
+    // Tonight's branch (#859) has not merged: only an earlier export's merge (#854) is on master.
+    const older = { ...OUR_MERGE, sha: "0abeb26ff896", message: "bible-editor: JER tq → master (#854)", date: "2026-08-31T05:36:55Z" };
     const g1 = gitea([older], PUSHED);
     await withGitea(g1, () => accountOwnPublishDeclineForTest(env, BOOK, "tq", FILE, null, sync));
     eq(readState(sqlite).declines, 2, "merge pending → counter unchanged");
