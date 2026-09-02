@@ -615,6 +615,9 @@ export const NO_BASE_EDITOR_REF_CAP = 200;
 // held row keeps a resource stuck, every other moved row in the book would
 // otherwise log an object every night; the counters carry the totals.
 const REF_MOVE_LOG_CAP = 20;
+// Same cap for the per-row "kept over Door43" log in applyTsvRows — see the
+// keep_ai_master branch; the run's merge_kept_ai counter is authoritative.
+const KEPT_LOG_CAP = 20;
 
 // Record one dropped row's identification, and log it, both capped. Kept as one
 // helper so the cap can never be applied to the list but forgotten on the log.
@@ -1897,7 +1900,8 @@ export async function applyTsvRows(
       // bit-toggle"). Nothing about the row's content changed, and bumping the
       // version would invalidate an open editor's If-Match and cost a 409 for a
       // flag nobody needs to see. Guarded on 'ref_moved' so it can never drop an
-      // unacknowledged merge_conflict / merge_kept / merge_no_base.
+      // unacknowledged merge_conflict / merge_no_base (or a merge_kept still
+      // standing from before that kind was retired — the nightly sweep owns those).
       //
       // Applies to protected tn rows (trashed/preserve/hint) too: the protections
       // exist to stop master overwriting CONTENT, and this write touches none —
@@ -2258,7 +2262,7 @@ export async function applyTsvRows(
         // reported 2026-08-21.
         //
         // Guarded on 'ref_moved' exactly like the other clear, so it can never
-        // drop an unacknowledged merge_conflict / merge_kept.
+        // drop an unacknowledged merge_conflict (or a pre-retirement merge_kept).
         //
         // The condition is MEASURED agreement (tsvRefMoved with the protection
         // argument forced off), not the classifier's "none". For a protected tn
@@ -2374,7 +2378,11 @@ export async function applyTsvRows(
       // flagged and HELD keeps that flag, as before: the hold's message is the
       // only thing telling the translator why this whole book+resource stopped
       // exporting.
-      if (keptAiConflict) {
+      // Capped like the ref_moved_ours log (REF_MOVE_LOG_CAP): an AI re-run over
+      // a chapter of human-edited rows yields dozens of kept rows, every night
+      // until the export publishes them, and each line carries master's text.
+      // merge_kept_ai (already incremented above) is the authoritative count.
+      if (keptAiConflict && counts.merge_kept_ai <= KEPT_LOG_CAP) {
         console.log("reimport merge kept the app's value over Door43's: no Door43 editor commit measured behind master", {
           book,
           kind,
@@ -4774,6 +4782,8 @@ export async function sweepStaleMergeNoBase(env: Env): Promise<{ pairs: number; 
 // is unscoped-nightly-only and skipped on dryDcs like the sweep it rides with.
 // Cheap and self-limiting: one SELECT per kind, one write batch per WRITE_BATCH
 // rows, and once the backlog is gone every night's SELECT comes back empty.
+const MERGE_KEPT_RETIRE_ACTOR = "nightly merge_kept flag retirement";
+
 export async function retireMergeKeptFlags(env: Env): Promise<{ flagged: number; cleared: number }> {
   const kinds: TsvKind[] = ["tn", "tq", "twl"];
   let flagged = 0;
@@ -4786,16 +4796,25 @@ export async function retireMergeKeptFlags(env: Env): Promise<{ flagged: number;
           WHERE review_kind = 'merge_kept' AND deleted_at IS NULL`,
       ).all<{ id: string; book: string; review_reason: string | null; review_master_json: string | null }>();
       flagged += rs.results.length;
-      for (let i = 0; i < rs.results.length; i += WRITE_BATCH) {
-        const slice = rs.results.slice(i, i + WRITE_BATCH);
+      // Two statements per row (UPDATE + audit INSERT), so the slice is HALF
+      // WRITE_BATCH: D1 caps one batch() at 100 statements, and a 90-row slice
+      // would be 180 (Codex review). Same halving as RECLAIM_PAIR_BATCH.
+      const pairBatch = Math.floor(WRITE_BATCH / 2);
+      for (let i = 0; i < rs.results.length; i += pairBatch) {
+        const slice = rs.results.slice(i, i + pairBatch);
         const stmts: D1PreparedStatement[] = [];
         for (const r of slice) {
           stmts.push(
             env.DB.prepare(
+              // #686: review_clear by an unattended code-policy sweep. Door43 had
+              // no part in this write (nothing was walked, nothing on master is
+              // being reported), so `system` with the job named as actor — the
+              // same shape as the nightly TWL reorder — rather than the
+              // `dcs_sync` / "Door43 sync" the lineage-justified clears use.
               `UPDATE ${TSV_TABLE[kind]}
                   SET review_kind = NULL, review_reason = NULL, review_master_json = NULL, updated_at = ?1, ${provenanceSet(4)}
                 WHERE id = ?2 AND book = ?3 AND review_kind = 'merge_kept' AND deleted_at IS NULL`,
-            ).bind(now, r.id, r.book, ...provenanceValues({ action: "review_clear", source: "dcs_sync", actor: DOOR43_ACTOR_UNMEASURED })),
+            ).bind(now, r.id, r.book, ...provenanceValues({ action: "review_clear", source: "system", actor: MERGE_KEPT_RETIRE_ACTOR })),
           );
           stmts.push(
             gatedLogEditStmt(env, kind, r.id, r.book, null, null, 0, "sync_clear_review", {
@@ -6934,8 +6953,10 @@ async function raiseKeptOverDoor43Alert(
     `account — no commit from a Door43 editor's own account was found. That is the intended policy ` +
     `(AI-written content on Door43 does not overwrite a later app edit), but at this many rows it is ` +
     `worth a look before the next export writes them to Door43: the same count would appear if the commit ` +
-    `classification were wrong — a second bot identity, or a rewritten history on Door43. Each affected ` +
-    `row is flagged in the app for review, and the verses are in ${book}'s merge-review banner.`;
+    `classification were wrong — a second bot identity, or a rewritten history on Door43. TSV rows carry ` +
+    `no review flag for this (the outcome was measured, not inferred); each is logged in the nightly tail ` +
+    `as "reimport merge kept the app's value over Door43's" with Door43's values. The verses are in ` +
+    `${book}'s merge-review banner.`;
   try {
     await env.DB.prepare(`DELETE FROM system_alerts WHERE username = ?1 AND source = ?2 AND dismissed_at IS NULL`)
       .bind(OWN_PUBLISH_ALERT_USERNAME, source)

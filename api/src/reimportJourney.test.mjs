@@ -1027,6 +1027,35 @@ console.log("\n[AI-vs-human conflict policy at the caller]");
     eq(readRow(sqlite).version, versionBefore, "…and still writes nothing");
   }
 
+  // 2b. The MIXED row: master moved a field the translator never touched (question)
+  //     AND the contested field (response). The untouched field is adopted — a
+  //     real content write, with a version bump and an `update` audit row — while
+  //     the contested one is kept, and still no review flag results.
+  {
+    const { sqlite, env } = freshEnv();
+    const boundary = seedContested(sqlite);
+    const versionBefore = readRow(sqlite).version;
+    const counts = await applyTsvRows(
+      env,
+      BOOK,
+      "tq",
+      [{ ...masterRowAt("the AI run's response"), question: "master's reworded question" }],
+      null,
+      { confirmedAt: 200, editId: boundary, lineage: AI_ONLY },
+    );
+    const row = sqlite
+      .prepare(`SELECT question, response, review_kind, version FROM tq_rows WHERE id='ai01'`)
+      .all()[0];
+    eq(row.response, "our response", "the contested field is kept");
+    eq(row.question, "master's reworded question", "…the field only master moved is adopted");
+    eq(counts.merge_kept_ai, 1, "…counted as kept");
+    eq(counts.merge_adopted, 1, "…and as an adoption");
+    eq(row.review_kind, null, "…and still no review flag");
+    eq(row.version, versionBefore + 1, "…the adoption is a real write: one version bump");
+    const audit = sqlite.prepare(`SELECT action FROM edit_log WHERE row_key = 'ai01' ORDER BY id DESC LIMIT 1`).all()[0];
+    eq(audit?.action, "update", "…with an update audit row behind it");
+  }
+
   // 3. A human commit on master since the ancestor: unchanged behaviour, master
   //    still wins. This is the half of the policy that must NOT move.
   {
@@ -3382,11 +3411,20 @@ console.log("\n[merge_kept retire: standing flags come down, D1-only, and nothin
 
   const byId = Object.fromEntries(
     sqlite
-      .prepare(`SELECT id, review_kind, review_reason, review_master_json, version, updated_at FROM tq_rows`)
+      .prepare(
+        `SELECT id, review_kind, review_reason, review_master_json, version, updated_at,
+                last_change_action, last_change_source, last_change_actor FROM tq_rows`,
+      )
       .all()
       .map((r) => [r.id, r]),
   );
   eq(byId.mk01.review_kind, null, "mk01's flag is gone");
+  eq(
+    [byId.mk01.last_change_action, byId.mk01.last_change_source, byId.mk01.last_change_actor],
+    ["review_clear", "system", "nightly merge_kept flag retirement"],
+    "…stamped as unattended housekeeping, not as a Door43 sync (Door43 had no part in it)",
+  );
+  eq(byId.ok01.last_change_source, null, "…and an untouched row's provenance is untouched");
   eq(byId.mk01.review_reason, null, "…reason too");
   eq(byId.mk01.review_master_json, null, "…and its snapshot");
   eq(byId.mk02.review_kind, null, "mk02's flag is gone");
