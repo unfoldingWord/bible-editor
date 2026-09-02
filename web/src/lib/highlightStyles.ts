@@ -91,6 +91,11 @@ function paragraphLayoutSx(mode: Mode) {
     "& .be-pc": { textAlign: "center" },
     "& .be-mi": { paddingLeft: "1em" },
     "& .be-nb": { marginTop: 0 },
+    // \p-family: embedded discourse (\pm/\pmo/\pmc) indents; \pmr indents +
+    // right-aligns; \pr / \cls right-align (letter closure, right-aligned para).
+    "& .be-pm": { paddingLeft: "1.5em" },
+    "& .be-pmr": { paddingLeft: "1.5em", textAlign: "right" },
+    "& .be-pr": { textAlign: "right" },
     "& span.be-d": {
       fontStyle: "italic",
       fontSize: "0.95em",

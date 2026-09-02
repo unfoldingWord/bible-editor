@@ -881,6 +881,12 @@ export function paragraphClass(tag: string): { wrapper: string; isBlank: boolean
   if (tag === "pi2") return { wrapper: "be-para be-pi-2", isBlank: false };
   if (tag === "pi3") return { wrapper: "be-para be-pi-3", isBlank: false };
   if (tag === "pc") return { wrapper: "be-para be-pc", isBlank: false };
+  // \p-family: embedded discourse (\pm, \pmo opening, \pmc closing) indents like
+  // a block quote; \pmr embedded refrain + \pr right-aligned + \cls letter
+  // closure sit right. \po (letter opening) is a plain paragraph → default.
+  if (tag === "pm" || tag === "pmo" || tag === "pmc") return { wrapper: "be-para be-pm", isBlank: false };
+  if (tag === "pmr") return { wrapper: "be-para be-pmr", isBlank: false };
+  if (tag === "pr" || tag === "cls") return { wrapper: "be-para be-pr", isBlank: false };
   if (tag === "mi") return { wrapper: "be-para be-mi", isBlank: false };
   if (tag === "m") return { wrapper: "be-para be-m", isBlank: false };
   if (tag === "nb") return { wrapper: "be-para be-nb", isBlank: false };
