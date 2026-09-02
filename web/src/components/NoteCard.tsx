@@ -1,4 +1,5 @@
 import { lazy, Suspense, memo, useEffect, useMemo, useRef, useState } from "react";
+import type { Theme } from "@mui/material";
 import {
   Paper,
   Stack,
@@ -54,6 +55,7 @@ import {
 import { drafts, rowKey, draftDirtyBorderSx } from "../sync/drafts";
 import { CommentBadge } from "./CommentBadge";
 import type { CommentCounts } from "../lib/commentsIndex";
+import { parseNoteSegments } from "../lib/noteLinks";
 
 const NoteHistoryDialog = lazy(() =>
   import("./NoteHistoryDialog").then((m) => ({ default: m.NoteHistoryDialog })),
@@ -242,19 +244,26 @@ function buildNoteFindRegex(q: {
   }
 }
 
-// Read-only render of a note body with the ACTIVE find match highlighted
-// (orange, "here I am"). Shown in place of the textarea while the user is
-// navigating find and hasn't clicked into this note to edit — a real inline
-// <mark> in a normal block, so it's pixel-accurate and scrolls naturally (no
-// overlay alignment games). Clicking anywhere swaps to the editable textarea.
+// Read-only render of a note body. This is the DEFAULT display whenever the
+// card isn't actively being edited (see the `showReadView` gate at the call
+// site below) — plain text, except for two things rendered specially:
+//   - a "see how you translated this in [C:V](../CC/VV.md)" markdown link
+//     (issue #715) becomes a clickable in-app navigation link;
+//   - the ACTIVE find match, if any, highlighted orange ("here I am").
+// A real inline block (not a textarea), so it's pixel-accurate and scrolls
+// naturally — no overlay alignment games. Clicking anywhere that isn't a link
+// swaps to the editable textarea; editing mode always shows the raw markdown
+// so the link syntax itself stays editable.
 function NoteBodyReadView({
   text,
+  book,
   query,
   activeOccurrence,
   onActivate,
 }: {
   text: string;
-  query: { find: string; regex: boolean; caseSensitive: boolean };
+  book: string;
+  query: { find: string; regex: boolean; caseSensitive: boolean } | null;
   activeOccurrence: number | null;
   onActivate: () => void;
 }) {
@@ -265,6 +274,7 @@ function NoteBodyReadView({
   // by `\n` escape ↔ newline, so the Nth match lines up unless a match sits
   // inside an escape — a rare cosmetic edge for the emphasis only.
   const range = useMemo(() => {
+    if (!query) return null;
     const re = buildNoteFindRegex(query);
     if (!re || activeOccurrence == null) return null;
     let m: RegExpExecArray | null;
@@ -281,28 +291,75 @@ function NoteBodyReadView({
     markRef.current?.scrollIntoView({ block: "nearest", inline: "nearest" });
   }, [range]);
 
-  const nodes = range
-    ? [
-        <span key="a">{text.slice(0, range.start)}</span>,
+  // Tokenize the body into text/link segments once per body+book, independent
+  // of find state, then overlay the active-match highlight on whichever
+  // segment(s) it falls in. A match overlapping a link segment highlights the
+  // link as a unit (it stays clickable) rather than splitting it — the two
+  // features compose without either regressing the other.
+  const segments = useMemo(() => parseNoteSegments(text, book), [text, book]);
+
+  const markSx = {
+    borderRadius: "2px",
+    padding: "0 1px",
+    color: "inherit",
+    backgroundColor: (t: Theme) => (t.palette.mode === "dark" ? "rgba(251, 146, 60, 0.5)" : "#fb923c"),
+    outline: (t: Theme) => `2px solid ${t.palette.mode === "dark" ? "#fb923c" : "#c2410c"}`,
+  } as const;
+
+  // At most one segment gets the scroll-target ref, even if the active match
+  // spans more than one (e.g. straddling a link boundary) — scrollIntoView
+  // only needs one anchor.
+  let markAssigned = false;
+  const assignMarkRef = () => {
+    if (markAssigned) return undefined;
+    markAssigned = true;
+    return (el: HTMLElement | null) => {
+      markRef.current = el;
+    };
+  };
+
+  const nodes: React.ReactNode[] = segments.map((seg, i) => {
+    const overlaps = range != null && seg.start < range.end && range.start < seg.end;
+    if (seg.type === "link") {
+      return (
         <Box
-          component="mark"
-          key="m"
-          ref={(el: HTMLElement | null) => {
-            markRef.current = el;
+          component="span"
+          key={i}
+          ref={overlaps ? assignMarkRef() : undefined}
+          title={`Go to ${seg.target.book} ${seg.target.chapter}:${seg.target.verse}`}
+          onClick={(e: React.MouseEvent) => {
+            // Don't also let this bubble into the outer Box's onActivate —
+            // clicking a link navigates away, it doesn't mean "start editing".
+            e.stopPropagation();
+            location.hash = `#/${seg.target.book}/${seg.target.chapter}/${seg.target.verse}`;
           }}
           sx={{
-            borderRadius: "2px",
-            padding: "0 1px",
-            color: "inherit",
-            backgroundColor: (t) => (t.palette.mode === "dark" ? "rgba(251, 146, 60, 0.5)" : "#fb923c"),
-            outline: (t) => `2px solid ${t.palette.mode === "dark" ? "#fb923c" : "#c2410c"}`,
+            color: "primary.main",
+            textDecoration: "underline",
+            textDecorationStyle: "dotted",
+            textUnderlineOffset: "2px",
+            cursor: "pointer",
+            "&:hover": { textDecorationStyle: "solid" },
+            ...(overlaps ? markSx : null),
           }}
         >
-          {text.slice(range.start, range.end)}
-        </Box>,
-        <span key="b">{text.slice(range.end)}</span>,
-      ]
-    : text;
+          {seg.text}
+        </Box>
+      );
+    }
+    if (!overlaps) return <span key={i}>{seg.text}</span>;
+    const localStart = Math.max(range!.start, seg.start) - seg.start;
+    const localEnd = Math.min(range!.end, seg.end) - seg.start;
+    return (
+      <span key={i}>
+        {seg.text.slice(0, localStart)}
+        <Box component="mark" ref={assignMarkRef()} sx={markSx}>
+          {seg.text.slice(localStart, localEnd)}
+        </Box>
+        {seg.text.slice(localEnd)}
+      </span>
+    );
+  });
 
   return (
     <Box
@@ -392,8 +449,14 @@ function NoteCardInner({
   const readOnly = trashed || bookLocked || (locked && !isPreserved && !isHint);
   const [quote, setQuote] = useState(tsvToDisplay(row.quote));
   const [note, setNote] = useState(tsvToDisplay(row.note));
-  // Find-highlight: the active match note shows a read view (with the match
-  // highlighted) until the user clicks in; then it swaps to the textarea.
+  // Body display: an INACTIVE card (not the one the user is focused on) shows
+  // the read view — plain text, with any see-how-you-translated-this link
+  // rendered as clickable navigation (issue #715) — until the user clicks in,
+  // which flips this to true and swaps in the editable textarea. The ACTIVE
+  // card shows the textarea directly (so "add note" → type still works with
+  // no extra click) UNLESS a find match is live on it, matching the read view
+  // used to be gated on before this note gained links. See `showReadView`
+  // near the render call below for the combined condition.
   const noteTextareaRef = useRef<HTMLTextAreaElement | null>(null);
   const [editingBody, setEditingBody] = useState(false);
   // A new find target (different occurrence / note) always returns to the read
@@ -401,6 +464,12 @@ function NoteCardInner({
   useEffect(() => {
     setEditingBody(false);
   }, [activeMatchOccurrence, row.id]);
+  // Leaving the note (session end) reverts it to the read view, so revisiting
+  // shows any link as clickable again instead of leaving it stuck as a raw-
+  // markdown textarea forever after the first edit.
+  useEffect(() => {
+    if (!active) setEditingBody(false);
+  }, [active]);
   // When the user clicks the read view to edit, focus the now-shown textarea
   // and put the caret at the end.
   useEffect(() => {
@@ -1039,6 +1108,14 @@ function NoteCardInner({
   if (supportRef !== savedRef.current.support_reference) rowDiff.support_reference = supportRef;
   const hasRowDiff = Object.keys(rowDiff).length > 0;
   const draftKey = rowKey("tn", row.book, row.id);
+  // Show the read view (plain text + clickable note links) except while the
+  // card is actively being edited: either the user clicked in (editingBody),
+  // or it's the focused card and there's no find match holding it in the read
+  // view for highlighting. An inactive card always reads as plain text/links
+  // regardless of editingBody — leaving the note (active → false) resets
+  // editingBody above, so a re-visited note shows its links again rather than
+  // staying pinned to the textarea it was last edited through.
+  const showReadView = !editingBody && (!active || (!!findQuery && activeMatchOccurrence != null));
   const pendingAtRender = pendingRef.current;
   useEffect(() => {
     if (readOnly) return;
@@ -1567,9 +1644,10 @@ function NoteCardInner({
             </span>
           </Tooltip>
         </Stack>
-        {findQuery && activeMatchOccurrence != null && !editingBody ? (
+        {showReadView ? (
           <NoteBodyReadView
             text={note}
+            book={row.book}
             query={findQuery}
             activeOccurrence={activeMatchOccurrence}
             onActivate={() => setEditingBody(true)}
