@@ -39,6 +39,31 @@ foreach ($t in $legacy) {
     }
 }
 
+# api/.dev.vars (JWT_SIGNING_KEY, etc.) is gitignored, so a fresh worktree has
+# none and every e2e spec fails jwt_signing_key_not_configured until one
+# exists. Copy the main checkout's real file when there is one -- same signing
+# key means a token minted against one checkout still verifies in the other.
+# Falls back to the committed .example (a dev-only placeholder key, fine for
+# local wrangler dev / test:e2e) so a cold worktree still boots even when main
+# hasn't been provisioned either. Runs on every invocation (idempotent - never
+# overwrites an existing api\.dev.vars), not just on a fresh install, so it
+# still fires when node_modules already exists below.
+$devVarsRel = "api\.dev.vars"
+$devVarsDest = Join-Path $worktreeRoot $devVarsRel
+if (-not (Test-Path $devVarsDest)) {
+    $devVarsSrc = Join-Path $mainRoot $devVarsRel
+    if (Test-Path $devVarsSrc) {
+        Copy-Item $devVarsSrc $devVarsDest
+        Write-Host "copied api\.dev.vars from main checkout"
+    } else {
+        $exampleSrc = Join-Path $worktreeRoot "api\.dev.vars.example"
+        if (Test-Path $exampleSrc) {
+            Copy-Item $exampleSrc $devVarsDest
+            Write-Host "main checkout has no api\.dev.vars either - seeded from api\.dev.vars.example (dev-only placeholder key)"
+        }
+    }
+}
+
 if (Test-Path (Join-Path $worktreeRoot "node_modules")) {
     Write-Host "node_modules already present (real install) - skipping. Delete it to force a reinstall."
     exit 0
