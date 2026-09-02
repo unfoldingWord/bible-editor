@@ -163,6 +163,27 @@ function subjectOf(message: string | null | undefined): string | null {
 // from <branch> into master`. Measured verbatim on git.door43.org 2026-09-01.
 const MERGE_SUBJECT = /^Merge pull request\s+['"](.+)['"]\s*\(#\d+\)/;
 
+// The AI pipeline's PR-title grammar (issue #696): `AI (ULT|UST|TN|TQ) for
+// {BOOK} {CH} [name]`. This is the SAME "older" vocabulary
+// masterLineage.ts's AI_PIPELINE_SUBJECT deliberately excludes — see that
+// constant's own comment. There it is checked against a DIRECT commit
+// subject in PATH-scoped history, measured to appear under three non-bot
+// identities, so accepting it there risks stamping a hand-typed commit `ai`.
+// Here it is checked ONLY against the INNER subject of an already-unwrapped
+// MERGE commit, which is different data: nobody hand-types a real Door43 PR
+// titled literally "AI UST for EZK 39 [pjoakes]" and merges it under their
+// own account through Gitea's ordinary merge button. Every repo-scoped
+// sample of this shape (2026-09-01, en_ust + en_ult) is a
+// "Merge pull request '...'" envelope — the PR itself opened and merged by
+// the bot pipeline. Same text, different context; not a contradiction of the
+// exclusion above.
+//
+// Same book-code/digits/bracket/end-anchor shape as AI_PIPELINE_SUBJECT, for
+// the same reasons (see that constant's comment): a looser match would
+// accept more than has ever been measured.
+const AI_PIPELINE_MERGE_TITLE =
+  /^AI\s+(?:ULT|UST|TN|TQ)\s+for\s+(?:[1-3][A-Z]{2}|[A-Z]{3})\s+\d+\s*\[[^\]]*\]\s*$/;
+
 /**
  * LEDGER-LOCAL classification. Wraps classifyMasterCommit; never replaces it,
  * and does not touch it — the gating paths share that function and its rules
@@ -187,10 +208,22 @@ const MERGE_SUBJECT = /^Merge pull request\s+['"](.+)['"]\s*\(#\d+\)/;
  * AI_MARKER, and `Revert "Merge pull request '…'"` never matches the anchored
  * MERGE_SUBJECT at all, so it stays human.
  *
- * The wrapper only ever moves a commit human → ours, i.e. it can only ever
- * REMOVE our own machine's pushes from the human column. It cannot mask a real
- * maintainer edit, because a maintainer's subject does not contain our export
- * prefix inside a merge wrapper.
+ * issue #696 adds a THIRD, LAST-RESORT check, tried only when the above still
+ * says `human`: an AI-pipeline PR merge
+ * ("Merge pull request 'AI UST for EZK 39 [pjoakes]' (#N) …") carries neither
+ * our export prefix nor the bp-assistant marker anywhere in the full subject
+ * — the bracket names the requesting translator, not the bot — so it used to
+ * fall all the way through. See AI_PIPELINE_MERGE_TITLE's own comment for why
+ * that shape is safe to accept here specifically, even though the shared
+ * classifier deliberately excludes it for direct (non-merge) subjects. Tried
+ * last, not alongside `ours`, so a merge classifyMasterCommit already
+ * resolves via AI_MARKER keeps that more specific reason.
+ *
+ * The wrapper only ever moves a commit human → ours/ai, i.e. it can only ever
+ * REMOVE our own machine's or the bot pipeline's pushes from the human
+ * column. It cannot mask a real maintainer edit, because a maintainer's
+ * subject does not contain our export prefix or the pipeline's PR-title
+ * grammar inside a merge wrapper.
  */
 export function classifyForLedger(commit: MasterCommit): { kind: ClassifiedCommit["kind"]; reason: string } {
   const subject = subjectOf(commit.message) ?? "";
@@ -199,6 +232,15 @@ export function classifyForLedger(commit: MasterCommit): { kind: ClassifiedCommi
     return { kind: "ours", reason: "merge_of_bible_editor_export" };
   }
   const classified = classifyMasterCommit(commit);
+  // Fallback only — checked after classifyMasterCommit, not before, so a
+  // merge that classifyMasterCommit already resolves via AI_MARKER on the
+  // FULL subject (e.g. a bracket that itself quotes the bp-assistant address)
+  // keeps that more specific reason. This only fires when the full-subject
+  // rules found nothing, i.e. exactly the #696 gap: an inner subject with the
+  // pipeline's PR-title grammar but no marker text anywhere in the envelope.
+  if (merge && classified.kind === "human" && AI_PIPELINE_MERGE_TITLE.test(merge[1])) {
+    return { kind: "ai", reason: "merge_of_ai_pipeline_pr" };
+  }
   return { kind: classified.kind, reason: classified.reason };
 }
 
