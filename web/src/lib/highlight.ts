@@ -24,7 +24,7 @@
 // matches raw with no further work.
 
 import { nfc } from "./hebrew.ts";
-import { isInFlowMarker, isTsMilestone, liftMarkerText, isHeaderLabelNode } from "./usfm.ts";
+import { isAcrosticHeading, isHeaderLabelNode, isInFlowMarker, isTsMilestone, liftMarkerText } from "./usfm.ts";
 
 // U+2060 WORD JOINER glues UHB clitic morphemes to their host word
 // (הָ⁠אֶ֧בֶן); U+200D ZERO WIDTH JOINER plays the same role in some corpora.
@@ -890,6 +890,14 @@ export function paragraphClass(tag: string): { wrapper: string; isBlank: boolean
   if (tag === "mi") return { wrapper: "be-para be-mi", isBlank: false };
   if (tag === "m") return { wrapper: "be-para be-m", isBlank: false };
   if (tag === "nb") return { wrapper: "be-para be-nb", isBlank: false };
+  // \li*/\lim* list items indent by level; \lim* (embedded list) shares the
+  // level indents. \lh/\lf are the list header/footer lines (#709).
+  if (tag === "li" || tag === "li1" || tag === "lim" || tag === "lim1") return { wrapper: "be-para be-li-1", isBlank: false };
+  if (tag === "li2" || tag === "lim2") return { wrapper: "be-para be-li-2", isBlank: false };
+  if (tag === "li3" || tag === "lim3") return { wrapper: "be-para be-li-3", isBlank: false };
+  if (tag === "li4" || tag === "lim4") return { wrapper: "be-para be-li-4", isBlank: false };
+  if (tag === "lh") return { wrapper: "be-para be-lh", isBlank: false };
+  if (tag === "lf") return { wrapper: "be-para be-lf", isBlank: false };
   return { wrapper: "be-para be-p", isBlank: false };
 }
 
@@ -944,6 +952,11 @@ interface Segment {
   html: string;
   // \b — emit as an empty block (the html is intentionally empty).
   isBlank: boolean;
+  // \qa acrostic heading (Psalm 119 / Lamentations stanza letters). Rendered as
+  // a heading label in the read views, but OMITTED from the editable render so
+  // the label never lands in the contenteditable's captured textContent — the
+  // heading is a label, not editable verse body (#708).
+  acrostic?: boolean;
 }
 
 // Walk the verse tree once and partition into segments separated by
@@ -961,6 +974,29 @@ function segmentByParagraphs(
     for (const node of nodes ?? []) {
       const o = node as Record<string, unknown> | null;
       if (!o) continue;
+      // \qa acrostic heading — its own heading block, NOT a poetry line. Checked
+      // before isInFlowMarker (which also matches it, since usfm-js gives it
+      // `type:"quote"`) so its label is drawn as a heading rather than fused
+      // into the following poetry line's text. liftMarkerText has moved the
+      // label onto `content`; tolerate a raw `text` too. The label is escaped
+      // plain text — never a renderWord() chip — so it can't become draggable
+      // (#708). segmentsToHtml renders it in read views and omits it when
+      // editing (emitChips), keeping it out of the captured editable text.
+      if (isAcrosticHeading(o)) {
+        const label = String(o["content"] ?? o["text"] ?? "").replace(/\n+$/, "");
+        segments.push({
+          wrapper: "be-qa",
+          tag: "qa",
+          html: escapeHtml(label),
+          isBlank: false,
+          acrostic: true,
+        });
+        // Anything after the heading opens a fresh segment, so the heading block
+        // never swallows the following poetry line.
+        current = { wrapper: "", tag: null, html: "", isBlank: false };
+        segments.push(current);
+        continue;
+      }
       if (isInFlowMarker(o)) {
         // Collapse every `\ts\*` node shape to the canonical "ts" tag before it
         // reaches the segment logic. usfm-js 3.5.0 parks the marker in the tag
@@ -971,10 +1007,14 @@ function segmentByParagraphs(
         const { wrapper, isBlank } = paragraphClass(tag);
         const seg: Segment = { wrapper, tag, html: "", isBlank };
         segments.push(seg);
-        if (tag === "ts") {
-          // \ts\* is a standalone chunk divider — anything that follows
-          // (text, the next paragraph marker, ...) belongs to a fresh
-          // segment, not inside the divider block.
+        if (tag === "ts" || isBlank) {
+          // \ts\* is a standalone chunk divider and \b is a standalone blank
+          // line — in both cases anything that follows (text, the next
+          // paragraph marker, ...) belongs to a fresh segment, not inside the
+          // divider/blank block. A blank segment's html is discarded by
+          // segmentsToHtml, so text that lands there disappears: ECC 2:14 /
+          // 3:14 have real verse text right after \b with no intervening
+          // \p/\q, which was silently dropped before this branch.
           current = { wrapper: "", tag: null, html: "", isBlank: false };
           segments.push(current);
         } else {
@@ -1051,6 +1091,17 @@ function segmentsToHtml(segments: Segment[], emitChips: boolean): string {
     // divider, or from the initial pre-marker slot when the verse opens
     // with a marker.
     if (seg.html === "" && !seg.wrapper) continue;
+    // \qa acrostic heading. In the read views draw it as a heading label; in the
+    // editable render (emitChips) omit it entirely, so the label is neither
+    // editable nor captured into the saved verse text (it would otherwise be
+    // read back as a draggable word). The heading is preserved on the node and
+    // reappears on blur — the same way `\s1` headings live outside the editable
+    // body (#708).
+    if (seg.acrostic) {
+      if (emitChips) continue;
+      out.push(`<div class="${seg.wrapper || "be-qa"}">${seg.html}</div>`);
+      continue;
+    }
     const cls = seg.wrapper || "be-line";
     if (seg.isBlank) {
       out.push(`<div class="${cls}">${emitChips && seg.tag ? chipForTag(seg.tag) : "&nbsp;"}</div>`);

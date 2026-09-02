@@ -22,7 +22,7 @@ import {
 import { requireAuth, requireEditor, currentUserId } from "./auth";
 import { BOOK_NUMBERS, dcsUrls, dcsResourceFile, fileCommitSha, fetchText } from "./dcsSources";
 import { reimportBookFromDcs, recordResourceSync, ALL_RESOURCES, type Resource } from "./bookReimport";
-import { lintChapterOpeningMarkers, lintPairedPunctuation, lintTnRows, lintTqRows, lintTwlRows, lintUsfmVerses, lintVerseTextQuality } from "./lint";
+import { lintChapterOpeningMarkers, lintOrphanedBlankText, lintPairedPunctuation, lintTnRows, lintTqRows, lintTwlRows, lintUsfmVerses, lintVerseTextQuality } from "./lint";
 import { effectiveBookLock, canManageLocks, requireAutoMergeConfirmation, type BookLock } from "./bookLock";
 import { isPublishedBook } from "./publishedGuard";
 import { exportBranchOverrideValid, lockPushExportParams } from "./export";
@@ -410,6 +410,8 @@ books.get("/:book/lint", requireAuth, async (c) => {
     ...lintUsfmVerses(ust.results ?? []).map((i) => ({ ...i, resource: "ust" })),
     ...lintChapterOpeningMarkers(ult.results ?? []).map((i) => ({ ...i, resource: "ult" })),
     ...lintChapterOpeningMarkers(ust.results ?? []).map((i) => ({ ...i, resource: "ust" })),
+    ...lintOrphanedBlankText(ult.results ?? []).map((i) => ({ ...i, resource: "ult" })),
+    ...lintOrphanedBlankText(ust.results ?? []).map((i) => ({ ...i, resource: "ust" })),
     ...lintVerseTextQuality(ult.results ?? []).map((i) => ({ ...i, resource: "ult" })),
     ...lintVerseTextQuality(ust.results ?? []).map((i) => ({ ...i, resource: "ust" })),
     ...lintPairedPunctuation(ult.results ?? []).map((i) => ({ ...i, resource: "ult" })),

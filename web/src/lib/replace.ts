@@ -19,7 +19,7 @@
 // Pure insertions (oldLen === 0) and pure deletions (newSubstring === "")
 // flow through the localized rewrite path too.
 
-import { normalizeEditable, isInFlowMarker, isCharacterWrapper, liftMarkerText } from "./usfm.ts";
+import { normalizeEditable, isInFlowMarker, isCharacterWrapper, isAcrosticHeading, liftMarkerText } from "./usfm.ts";
 import { reassembleAlignment } from "./alignmentReassembly.ts";
 import { nfc } from "./hebrew.ts";
 
@@ -165,8 +165,15 @@ export function tokenizePlainText(text: string): unknown[] {
 //
 // The optional trailing \s is consumed (both branches) so the marker token
 // doesn't leave a stranded space between marker and following text.
+//
+// The list family (`\li1`-`\li4`, `\lim1`-`\lim4` digit forms; `\li`, `\lim`,
+// `\lh`, `\lf` bare forms) is included for #709 — usfm-js emits them with no
+// `type`, so liftMarkerText normalizes them to `type:"paragraph"` markers and
+// they must be recognized here too. `\lim*` goes before `\li*` (longest-first)
+// so `\lim1`/`\lim` isn't mis-split into `\li` + "m…"; bare `\li` keeps the
+// boundary so it can't bite into `\lim`/`\li1`.
 const MARKER_TOKEN_RE =
-  /\\((?:pi[1-3]|q[1-4]|qm[1-3])|(?:pmo|pmc|pmr|cls|pm|po|pr|mi|nb|pc|pi|qm|p|m|q|b|ts\\\*)(?=\s|$|[^a-z0-9]))\s?/g;
+  /\\((?:pi[1-3]|lim[1-4]|li[1-4]|q[1-4]|qm[1-3])|(?:pmo|pmc|pmr|cls|pm|po|pr|lim|lh|lf|li|mi|nb|pc|pi|qm|p|m|q|b|ts\\\*)(?=\s|$|[^a-z0-9]))\s?/g;
 
 // usfm-js distinguishes "paragraph" markers (\p, \m, \mi, \nb, \pi*,
 // \pc, \b) from "quote" markers (\q, \q1..q4, \qm*) using different
@@ -1911,7 +1918,13 @@ function reconcileMarkers(content: unknown, newPlain: string): SmartReplaceResul
   // Character wrappers (`\qs Selah\qs*`) are `type:"quote"` too, so
   // isInFlowMarker matches them — but they hold aligned content, not a line
   // break; keep them as content nodes or their wrapped word is dropped.
-  const contentNodes = cloned.filter((n) => !isInFlowMarker(n) || isCharacterWrapper(n));
+  // `\qa` acrostic headings are `type:"quote"` as well, and are NOT in
+  // MARKER_TOKEN_RE (they never enter the editable text) — so if they were
+  // dropped here they would never be rebuilt and the heading would be lost.
+  // Keep them as content nodes; their label rides along on `content` (#708).
+  const contentNodes = cloned.filter(
+    (n) => !isInFlowMarker(n) || isCharacterWrapper(n) || isAcrosticHeading(n),
+  );
 
   const countWords = (s: string): number => [...s.matchAll(WORD_RUN_RE)].length;
 
