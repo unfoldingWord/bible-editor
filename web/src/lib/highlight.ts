@@ -24,7 +24,7 @@
 // matches raw with no further work.
 
 import { nfc } from "./hebrew.ts";
-import { isInFlowMarker, isTsMilestone, liftMarkerText, SECTION_HEADER_TAGS } from "./usfm.ts";
+import { isInFlowMarker, isTsMilestone, liftMarkerText, isHeaderLabelNode } from "./usfm.ts";
 
 // U+2060 WORD JOINER glues UHB clitic morphemes to their host word
 // (הָ⁠אֶ֧בֶן); U+200D ZERO WIDTH JOINER plays the same role in some corpora.
@@ -982,11 +982,11 @@ function segmentByParagraphs(
         }
         continue;
       }
-      if (
-        o["type"] === "section" &&
-        typeof o["tag"] === "string" &&
-        SECTION_HEADER_TAGS.has(o["tag"] as string)
-      ) {
+      // Header/reference/label nodes (`\s1`, `\sp`, `\sr`, `\r`, `\cl`, …)
+      // live in the header band, hoisted out before rendering — never in the
+      // verse body. #710: `\sp`/`\sr`/`\r`/`\cl` carry no `type` field, so
+      // this can't key on `type==="section"` alone the way `\s1`-`\s4` do.
+      if (isHeaderLabelNode(o)) {
         continue;
       }
       // \d (Psalm superscription) is `type:"section"` but its text IS

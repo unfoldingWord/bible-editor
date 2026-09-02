@@ -32,6 +32,15 @@ export function extractPlainText(verseObjects: unknown): string {
         if (typeof v.text === "string") parts.push(v.text);
         continue;
       }
+      // Header/reference/label nodes (`\s1`, `\sp`, `\sr`, `\r`, `\cl`, …)
+      // live in the header band (splitSectionHeaders), not the verse body —
+      // skip their label text here. Section-heading tags are already
+      // excluded by construction (their text is parked on `content`, which
+      // this walk never reads), but `\sp` parks its label on `text` exactly
+      // like a line marker's same-line text, so without this it leaks into
+      // plain_text. `\d` (Psalm superscription) is deliberately NOT in this
+      // set — its text IS alignable Hebrew and must keep flowing through.
+      if (isHeaderLabelNode(vo)) continue;
       if (typeof v.text === "string") parts.push(v.text);
       if (Array.isArray(v.children)) walk(v.children);
     }
@@ -82,6 +91,34 @@ export const PARAGRAPH_TAGS: ReadonlySet<string> = new Set([
 // the verse body alongside its `\zaln-s` children.
 export const SECTION_HEADER_TAGS: ReadonlySet<string> = new Set(["s1", "s2", "s3", "s4", "ms", "ms1", "ms2"]);
 
+// Header/reference/label markers usfm-js parses WITHOUT a `type` field at
+// all (unlike `\s1`-`\s4`/`\ms*`, which carry `type:"section"`) — `\sp`
+// (speaker label, parked on `text`), `\sr` (section reference range),
+// `\r` (parallel passage reference), `\cl` (chapter label) — the latter
+// three parked on `content`. Same treatment as SECTION_HEADER_TAGS: hoisted
+// out of the verse body into the header-band affordance, never alignable
+// verse text. See #710. Deliberately EXCLUDES `\s5` (legacy chunk marker,
+// also typeless in some usfm-js shapes but structurally a chunk BOUNDARY,
+// not a label — bucketing it here would render an empty header band for
+// every occurrence).
+export const HEADER_LABEL_TAGS: ReadonlySet<string> = new Set(["sp", "sr", "r", "cl"]);
+
+// True iff `node` is a hoistable header/reference/label node — the union of
+// SECTION_HEADER_TAGS (`type:"section"`) and HEADER_LABEL_TAGS (no `type`
+// field). The ONE predicate every "this lives in the header band, not the
+// verse body" call site shares (splitSectionHeaders here, the editable-text
+// skip below, segmentByParagraphs in highlight.ts, saveSectionEdit in
+// Shell.tsx) so they can't drift apart the way the #702 p-family allowlists
+// did.
+export function isHeaderLabelNode(node: unknown): boolean {
+  const o = node as Record<string, unknown> | null;
+  if (!o || typeof o["tag"] !== "string") return false;
+  const tag = o["tag"] as string;
+  if (o["type"] === "section") return SECTION_HEADER_TAGS.has(tag);
+  if (o["type"] !== undefined) return false;
+  return HEADER_LABEL_TAGS.has(tag);
+}
+
 export interface SectionHeader {
   tag: string;
   text: string;
@@ -93,8 +130,9 @@ export interface SplitContent {
 }
 
 // Split a verse's verseObjects into:
-//   - sections: leading `\s1`/`\s2`/`\s3` heading nodes, hoisted out
-//     for separate header-band rendering. Source-unalignable.
+//   - sections: leading `\s1`/`\s2`/`\s3` heading nodes (plus the typeless
+//     `\sp`/`\sr`/`\r`/`\cl` label family — see isHeaderLabelNode), hoisted
+//     out for separate header-band rendering. Source-unalignable.
 //   - body: everything else, preserved in original order (paragraph
 //     markers, words, milestones, `\d` Psalm superscriptions).
 // USFM places section headers before the verse they introduce, so in
@@ -106,15 +144,10 @@ export function splitSectionHeaders(verseObjects: unknown[] | undefined | null):
   if (!Array.isArray(verseObjects)) return { sections, body };
   for (const node of verseObjects) {
     const o = node as Record<string, unknown> | null;
-    if (
-      o &&
-      o["type"] === "section" &&
-      typeof o["tag"] === "string" &&
-      SECTION_HEADER_TAGS.has(o["tag"] as string)
-    ) {
+    if (o && isHeaderLabelNode(o)) {
       // usfm-js stores the heading text as `content` on \s* nodes (not
-      // `text`, which is what \d uses). Try both — strip trailing newline
-      // that usfm-js often appends.
+      // `text`, which is what \d uses); `\sp` parks its label on `text`.
+      // Try both — strip trailing newline that usfm-js often appends.
       const raw = String(o["content"] ?? o["text"] ?? "");
       sections.push({
         tag: o["tag"] as string,
@@ -367,8 +400,8 @@ export function normalizeEditable(s: string): string {
 // the BASELINE for diffing edits in the active-verse contenteditable
 // when markers are surfaced as chips — the chip's textContent is
 // exactly "\p" / "\q1", so the captured textContent stream lines up
-// with this representation. Section-heading nodes (\s1/\s2/\s3) are
-// skipped — they live in a separate header band.
+// with this representation. Header/reference/label nodes (\s1/\s2/\s3,
+// \sp, \sr, \r, \cl, …) are skipped — they live in a separate header band.
 export function extractEditableText(verseObjects: unknown): string {
   const parts: string[] = [];
   const walk = (vos: unknown[]): void => {
@@ -395,13 +428,14 @@ export function extractEditableText(verseObjects: unknown): string {
         }
         continue;
       }
-      if (
-        v["type"] === "section" &&
-        typeof v["tag"] === "string" &&
-        SECTION_HEADER_TAGS.has(v["tag"] as string)
-      ) {
-        continue;
-      }
+      // Header/reference/label nodes (`\s1`, `\sp`, `\sr`, `\r`, `\cl`, …)
+      // live in a separate header band, edited through its own affordance
+      // (saveSectionEdit) — never through this contentEditable diff. `\sp`
+      // parks its label on `text` exactly like a marker's same-line text; the
+      // isHeaderLabelNode check must come BEFORE the generic `v["text"]` read
+      // below or that label leaks into the baseline with no marker token
+      // around it (the extractPlainText half of the same bug, #710).
+      if (isHeaderLabelNode(v)) continue;
       if (typeof v["text"] === "string") parts.push(v["text"] as string);
       if (Array.isArray(v["children"])) walk(v["children"] as unknown[]);
     }
