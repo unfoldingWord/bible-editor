@@ -147,18 +147,26 @@ export function tokenizePlainText(text: string): unknown[] {
 //      recognized even when typed glued to the next word (`\q2destroy` →
 //      marker `\q2` + "destroy"). This is the gap that left a hand-typed,
 //      button-less marker sitting as literal text.
-//   2. Bare forms (`p`, `m`, `mi`, `nb`, `pi`, `pc`, `q`, `qm`, `b`, `ts\*`):
-//      these keep the `(?=\s|$|[^a-z0-9])` boundary, because several are a
-//      PREFIX of a longer marker — bare `\q` must NOT bite into `\qa`/`\qr`
-//      (acrostic/right-aligned, not in this set) nor `\qm`, `\p` into `\pi`/
-//      `\pc`, `\m` into `\mi`. Longest-first ordering (`mi` before `m`, `pi`/
-//      `pc` before `p`, `qm` before `q`) keeps the boundary picking the full
-//      marker. `ts\\\*` matches the literal `\ts\*` chunk milestone.
+//   2. Bare forms (`pmo`, `pmc`, `pmr`, `cls`, `pm`, `po`, `pr`, `mi`, `nb`,
+//      `pc`, `pi`, `qm`, `p`, `m`, `q`, `b`, `ts\*`): these keep the
+//      `(?=\s|$|[^a-z0-9])` boundary, because several are a PREFIX of a longer
+//      marker — bare `\q` must NOT bite into `\qa`/`\qr` (acrostic/right-
+//      aligned, not in this set) nor `\qm`; `\p` must not bite into `\pi`/`\pc`/
+//      `\pm`/`\pmo`/`\po`/`\pr`; `\pm` not into `\pmo`/`\pmc`/`\pmr`; `\m` not
+//      into `\mi`. Longest-first ordering (`pmo`/`pmc`/`pmr`/`cls` before `pm`/
+//      `po`/`pr`, `mi` before `m`, `pi`/`pc` before `p`, `qm` before `q`) keeps
+//      the boundary picking the full marker. `ts\\\*` matches the literal
+//      `\ts\*` chunk milestone.
+//
+// The bare set MUST stay in lockstep with PARAGRAPH_TAGS (usfm.ts) — a marker
+// listed there but missing here is re-tokenized into a `\w` word on the edit
+// round-trip (the `\pmo` bug, #702). marker.test.mjs asserts every
+// PARAGRAPH_TAG is recognized here.
 //
 // The optional trailing \s is consumed (both branches) so the marker token
 // doesn't leave a stranded space between marker and following text.
 const MARKER_TOKEN_RE =
-  /\\((?:pi[1-3]|q[1-4]|qm[1-3])|(?:mi|nb|pc|pi|qm|p|m|q|b|ts\\\*)(?=\s|$|[^a-z0-9]))\s?/g;
+  /\\((?:pi[1-3]|q[1-4]|qm[1-3])|(?:pmo|pmc|pmr|cls|pm|po|pr|mi|nb|pc|pi|qm|p|m|q|b|ts\\\*)(?=\s|$|[^a-z0-9]))\s?/g;
 
 // usfm-js distinguishes "paragraph" markers (\p, \m, \mi, \nb, \pi*,
 // \pc, \b) from "quote" markers (\q, \q1..q4, \qm*) using different
