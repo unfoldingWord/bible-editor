@@ -615,6 +615,9 @@ export const NO_BASE_EDITOR_REF_CAP = 200;
 // held row keeps a resource stuck, every other moved row in the book would
 // otherwise log an object every night; the counters carry the totals.
 const REF_MOVE_LOG_CAP = 20;
+// Same cap for the per-row "kept over Door43" log in applyTsvRows — see the
+// keep_ai_master branch; the run's merge_kept_ai counter is authoritative.
+const KEPT_LOG_CAP = 20;
 
 // Record one dropped row's identification, and log it, both capped. Kept as one
 // helper so the cap can never be applied to the list but forgotten on the log.
@@ -1897,7 +1900,8 @@ export async function applyTsvRows(
       // bit-toggle"). Nothing about the row's content changed, and bumping the
       // version would invalidate an open editor's If-Match and cost a 409 for a
       // flag nobody needs to see. Guarded on 'ref_moved' so it can never drop an
-      // unacknowledged merge_conflict / merge_kept / merge_no_base.
+      // unacknowledged merge_conflict / merge_no_base (or a merge_kept still
+      // standing from before that kind was retired — the nightly sweep owns those).
       //
       // Applies to protected tn rows (trashed/preserve/hint) too: the protections
       // exist to stop master overwriting CONTENT, and this write touches none —
@@ -2258,7 +2262,7 @@ export async function applyTsvRows(
         // reported 2026-08-21.
         //
         // Guarded on 'ref_moved' exactly like the other clear, so it can never
-        // drop an unacknowledged merge_conflict / merge_kept.
+        // drop an unacknowledged merge_conflict (or a pre-retirement merge_kept).
         //
         // The condition is MEASURED agreement (tsvRefMoved with the protection
         // argument forced off), not the classifier's "none". For a protected tn
@@ -2350,75 +2354,64 @@ export async function applyTsvRows(
         }
       }
 
-      // A both-sides-changed conflict flags the row for in-app review (the
-      // cleanup chip, lint.ts) — atomic with the content write, so the flag can
-      // never be lost separately from the overwrite. The overwritten value is
-      // retained in edit_log (recoverable by an admin) — worded without promising
-      // a per-row history UI or naming internal columns (cold-review #5).
+      // A keep_ai_master conflict (#540 item 2) — both sides changed the field,
+      // and a COMPLETE lineage walk found no Door43 editor's commit behind
+      // master's side — is decided on evidence and asks nothing of a translator:
+      // the app-side edit stands, and the next export that runs for this file
+      // writes it to Door43. Until 2026-09-02 this minted a `merge_kept` review
+      // flag ("Kept over Door43 — verify") on every such row, and prod showed
+      // what that asked of a proofreader: JER tq 3:6, 3:8 and 3:19 sat flagged
+      // from 08-29, because bp-assistant's evening AI push of that chapter was
+      // master's side of the conflict — a fact the flag's own text stated while
+      // asking for a human "verify" anyway. The policy stands (the app-side edit
+      // is the human's, master's side is AI or our own render, so the human's
+      // version wins); what changes is that the outcome is no longer a per-row
+      // warning. It is still counted (merge_kept_ai, above) into the run summary,
+      // and logged per row here WITH master's values, so it can be checked from
+      // the nightly tail rather than believed — the same evidence the flag's
+      // review_master_json used to carry.
       //
-      // Runs BEFORE the "nothing to write" bail below, because a keep_ai_master
-      // conflict writes no content at all: leaving this where it was would have
-      // counted exactly the rows this policy protects as a plain skipped_edited
-      // and told nobody. It is also the ONLY write such a row makes, so it is
-      // guarded against re-writing an identical message — a flag-only write still
-      // bumps the row's version, and this condition recurs every night until a
-      // human resolves it (#539).
-      //
-      // A row the reference-move branch just flagged and HELD keeps that flag:
-      // the hold's message is the only thing telling the translator why this
-      // whole book+resource has stopped exporting, and a kept-conflict message
-      // that replaced it would both destroy that and describe an export that is
-      // not going to run. Scoped to the kept case deliberately — a master-wins
-      // adopt_conflict still overwrites the ref_moved flag exactly as before,
-      // because it also overwrote content and that is the more urgent story.
-      const heldByRefMove = keptAiConflict && fields.review_kind === "ref_moved";
-      if (conflict && !heldByRefMove) {
+      // A kept-ALONE row therefore writes nothing: no flag, no version bump, so
+      // it never 409s an open tab (#539) and recurs harmlessly each night until
+      // the export publishes it. A row that also adopted a field master moved on
+      // its own still writes that adoption. A row the reference-move branch just
+      // flagged and HELD keeps that flag, as before: the hold's message is the
+      // only thing telling the translator why this whole book+resource stopped
+      // exporting.
+      // Capped like the ref_moved_ours log (REF_MOVE_LOG_CAP): an AI re-run over
+      // a chapter of human-edited rows yields dozens of kept rows, every night
+      // until the export publishes them, and each line carries master's text.
+      // merge_kept_ai (already incremented above) is the authoritative count.
+      if (keptAiConflict && counts.merge_kept_ai <= KEPT_LOG_CAP) {
+        console.log("reimport merge kept the app's value over Door43's: no Door43 editor commit measured behind master", {
+          book,
+          kind,
+          id: row.id,
+          keptFields: conflictFields,
+          adoptedOtherFields: adopted,
+          master: masterReviewSnapshot(kind, row),
+        });
+      }
+      // A master-wins conflict flags the row for in-app review (the cleanup
+      // chip, lint.ts) — atomic with the content write, so the flag can never be
+      // lost separately from the overwrite. The overwritten value is retained in
+      // edit_log (recoverable by an admin) — worded without promising a per-row
+      // history UI or naming internal columns (cold-review #5).
+      if (conflict && !keptAiConflict) {
         const labels = conflictFields.map((f) => TSV_FIELD_LABELS[f] ?? f);
-        // Every clause here is bounded by what was actually measured, because
-        // the cheap version of each is a claim this system cannot support:
-        //  - "the note-writing pipeline" would be wrong — the `ai` rule matches
-        //    the unfoldingWord bot ACCOUNT, which also pushes ULT/UST scripture
-        //    and pushes on a named human's behalf (`ULT: EZK 38 [pjoakes]`).
-        //  - "no Door43 editor edited this" would be wrong for the same shape: a
-        //    maintainer may well have directed the change. What was measured is
-        //    narrower — no commit came from a Door43 editor's own account.
-        //  - "will be published" would be a promise this per-row code cannot
-        //    keep. The export is withheld for the WHOLE book+resource by any
-        //    held reference move, a lock, or a recording failure elsewhere in
-        //    the same file, so "the next export that runs for this file" is the
-        //    honest form.
-        //  - "since the last sync" would be the wrong boundary: the walk starts
-        //    at master_confirmed_at, the last publish positively confirmed on
-        //    master, which can be several syncs back.
-        // Outcome first, evidence second: the cleanup chip clamps this to two
-        // lines (BookLintIndicator), so a reader who sees only the opening must
-        // still learn which way it went and what to do about it.
-        const kindLabel = kind.toUpperCase();
-        // #684. Only the master-wins branch below uses it: the KEPT branch's
-        // whole measured claim is that NO Door43 editor's commit was found, so
-        // there is nobody to name there. Empty whenever identity was not
-        // measured (absent lineage, incomplete walk, pre-#684 snapshot), which
-        // leaves both messages byte-identical to what they were.
+        // #684: the identity behind master's side. Empty whenever identity was
+        // not measured (absent lineage, incomplete walk, pre-#684 snapshot),
+        // which leaves the message byte-identical to what it was.
+        //
+        // File-scoped, and said so: the walk sees commits to this book's file,
+        // not to this row. Naming them as this row's own edit would be a claim
+        // the measurement does not make.
         const whoConflict = humanCommitEvidenceClause(cutoff?.lineage);
-        const reason = keptAiConflict
-          ? `Your ${labels.join(" and ")} was kept over Door43's, and the next export that runs for this ` +
-            `file writes it to Door43. If Door43's version is the one you want, put it in here first. ` +
-            `Why: both sides changed this row since the last confirmed publish, and every Door43 commit to ` +
-            `this book's ${kindLabel} file since then came from Bible Editor's own export or the ` +
-            `unfoldingWord bot account — no commit from a Door43 editor's own account was found.` +
-            // A row can keep one contested field AND take another master moved
-            // on its own. Saying only the first would misdescribe the row.
-            (adopted ? ` Door43's changes to this row's other fields were taken.` : "")
-          : `A Door43 edit to this row's ${labels.join(" and ")} was merged over your app-side change. ` +
-            `Please double-check it.` +
-            // File-scoped, and said so: the walk sees commits to this book's
-            // file, not to this row. Naming them as this row's own edit would
-            // be a claim the measurement does not make.
-            whoConflict;
-        // Distinct review_kind, not just distinct prose: the cleanup chip titles
-        // itself from this column, and "Merged Door43 edit" over a row whose
-        // edit was KEPT is the reverse of what happened (see reviewFlagTitle).
-        const reviewKind = keptAiConflict ? "merge_kept" : "merge_conflict";
+        const reason =
+          `A Door43 edit to this row's ${labels.join(" and ")} was merged over your app-side change. ` +
+          `Please double-check it.` +
+          whoConflict;
+        const reviewKind = "merge_conflict";
         // The dedup guard compares the reason WITHOUT its #684 identity clause,
         // on both sides (cold review F1).
         //
@@ -2445,10 +2438,9 @@ export async function applyTsvRows(
         if (!sameFinding) {
           fields.review_kind = reviewKind;
           fields.review_reason = reason;
-          // #653: master's own values for the row, so "your value was kept over
-          // Door43's" / "Door43's edit was merged over yours" can be checked
-          // rather than believed. Inside the dedup guard for the same reason as
-          // flagRefMoved's.
+          // #653: master's own values for the row, so "Door43's edit was merged
+          // over yours" can be checked rather than believed. Inside the dedup
+          // guard for the same reason as flagRefMoved's.
           fields.review_master_json = masterReviewSnapshot(kind, row);
         }
       }
@@ -4771,6 +4763,91 @@ export async function sweepStaleMergeNoBase(env: Env): Promise<{ pairs: number; 
   return { pairs: pairs.length, swept, cleared };
 }
 
+// Retire every standing `merge_kept` flag. The kind is no longer minted (see the
+// keep_ai_master branch in applyTsvRows): a kept-over-Door43 outcome was decided
+// on a complete lineage walk that found no Door43 editor's commit behind master's
+// side, so the flag asked a translator to verify a finding the system had already
+// measured — prod's three JER tq rows (3:6, 3:8, 3:19, flagged 2026-08-29 against
+// bp-assistant's evening AI push) are the case that retired it. Every row this
+// touches was minted under exactly that condition, which is why, unlike
+// clearResolvedMergeNoBase, no re-walk is needed to justify the clear: the mint
+// itself was the measurement.
+//
+// Same write shape as that clear: no version bump (nothing about the row's
+// content moves), guarded on the flag still being `merge_kept` so a stronger flag
+// raised in between 0-changes, never on a tombstone, and PAIRED with an edit_log
+// `sync_clear_review` row carrying the retired flag and its snapshot — a warning
+// that disappears with nothing but a console line behind it is the shape nobody
+// can audit later. Runs inside the nightly sweep step (exportWorkflow.ts), so it
+// is unscoped-nightly-only and skipped on dryDcs like the sweep it rides with.
+// Cheap and self-limiting: one SELECT per kind, one write batch per WRITE_BATCH
+// rows, and once the backlog is gone every night's SELECT comes back empty.
+const MERGE_KEPT_RETIRE_ACTOR = "nightly merge_kept flag retirement";
+
+export async function retireMergeKeptFlags(env: Env): Promise<{ flagged: number; cleared: number }> {
+  const kinds: TsvKind[] = ["tn", "tq", "twl"];
+  let flagged = 0;
+  let cleared = 0;
+  const now = Math.floor(Date.now() / 1000);
+  for (const kind of kinds) {
+    try {
+      const rs = await env.DB.prepare(
+        `SELECT id, book, review_reason, review_master_json FROM ${TSV_TABLE[kind]}
+          WHERE review_kind = 'merge_kept' AND deleted_at IS NULL`,
+      ).all<{ id: string; book: string; review_reason: string | null; review_master_json: string | null }>();
+      flagged += rs.results.length;
+      // Two statements per row (UPDATE + audit INSERT), so the slice is HALF
+      // WRITE_BATCH: D1 caps one batch() at 100 statements, and a 90-row slice
+      // would be 180 (Codex review). Same halving as RECLAIM_PAIR_BATCH.
+      const pairBatch = Math.floor(WRITE_BATCH / 2);
+      for (let i = 0; i < rs.results.length; i += pairBatch) {
+        const slice = rs.results.slice(i, i + pairBatch);
+        const stmts: D1PreparedStatement[] = [];
+        for (const r of slice) {
+          stmts.push(
+            env.DB.prepare(
+              // #686: review_clear by an unattended code-policy sweep. Door43 had
+              // no part in this write (nothing was walked, nothing on master is
+              // being reported), so `system` with the job named as actor — the
+              // same shape as the nightly TWL reorder — rather than the
+              // `dcs_sync` / "Door43 sync" the lineage-justified clears use.
+              `UPDATE ${TSV_TABLE[kind]}
+                  SET review_kind = NULL, review_reason = NULL, review_master_json = NULL, updated_at = ?1, ${provenanceSet(4)}
+                WHERE id = ?2 AND book = ?3 AND review_kind = 'merge_kept' AND deleted_at IS NULL`,
+            ).bind(now, r.id, r.book, ...provenanceValues({ action: "review_clear", source: "system", actor: MERGE_KEPT_RETIRE_ACTOR })),
+          );
+          stmts.push(
+            gatedLogEditStmt(env, kind, r.id, r.book, null, null, 0, "sync_clear_review", {
+              review_kind: "merge_kept",
+              review_reason: r.review_reason,
+              review_master_json: r.review_master_json,
+              evidence: {
+                retired_kind: true,
+                reason:
+                  "merge_kept is no longer minted: the kept-over-Door43 outcome was decided on a complete " +
+                  "lineage walk with no Door43 editor commit behind master's side, so the flag asked a " +
+                  "translator to verify an already-measured finding",
+              },
+            }),
+          );
+        }
+        const results = await env.DB.batch(stmts);
+        // Two statements per row, UPDATE first: only the UPDATEs are counted.
+        results.forEach((r, j) => {
+          if (j % 2 === 0 && (r?.meta.changes ?? 0) > 0) cleared++;
+        });
+      }
+    } catch (e) {
+      console.error("merge_kept retire: failed", {
+        kind,
+        error: e instanceof Error ? e.message : String(e),
+      });
+    }
+  }
+  if (flagged > 0) console.log("merge_kept retire", { flagged, cleared });
+  return { flagged, cleared };
+}
+
 // Durable counterpart to the console.log above — see 0054_master_lineage_snapshot.sql
 // and, for the two boundary columns, 0058_master_lineage_confirmed_boundary.sql.
 // Last-run-wins on the same (book, resource) row every other watermark here
@@ -6876,8 +6953,10 @@ async function raiseKeptOverDoor43Alert(
     `account — no commit from a Door43 editor's own account was found. That is the intended policy ` +
     `(AI-written content on Door43 does not overwrite a later app edit), but at this many rows it is ` +
     `worth a look before the next export writes them to Door43: the same count would appear if the commit ` +
-    `classification were wrong — a second bot identity, or a rewritten history on Door43. Each affected ` +
-    `row is flagged in the app for review, and the verses are in ${book}'s merge-review banner.`;
+    `classification were wrong — a second bot identity, or a rewritten history on Door43. TSV rows carry ` +
+    `no review flag for this (the outcome was measured, not inferred); each is logged in the nightly tail ` +
+    `as "reimport merge kept the app's value over Door43's" with Door43's values. The verses are in ` +
+    `${book}'s merge-review banner.`;
   try {
     await env.DB.prepare(`DELETE FROM system_alerts WHERE username = ?1 AND source = ?2 AND dismissed_at IS NULL`)
       .bind(OWN_PUBLISH_ALERT_USERNAME, source)

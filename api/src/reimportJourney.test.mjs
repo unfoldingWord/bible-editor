@@ -43,6 +43,7 @@ import {
   clearResolvedMergeNoBaseForTest,
   recordResourceSync,
   recordWithheldSyncIfAbsent,
+  retireMergeKeptFlags,
   sweepStaleMergeNoBase,
 } from "./bookReimport.ts";
 import { contentPatchClearClauses } from "./contentPatchClauses.ts";
@@ -855,7 +856,8 @@ console.log("\n[reference-move attribution at the caller]");
 
   // 7e. Every OTHER review_kind this codebase writes survives too — the guard is
   //     an equality on 'ref_moved', and a widened guard would silently drop these
-  //     (merge_kept and merge_no_base are both live writers).
+  //     (merge_no_base is a live writer; merge_kept is retired but may still sit
+  //     on rows until the nightly retire sweep reaches them).
   for (const kept of ["merge_kept", "merge_no_base"]) {
     const { sqlite, env } = freshEnv();
     seedMoved(sqlite, { reviewKind: kept });
@@ -992,53 +994,66 @@ console.log("\n[AI-vs-human conflict policy at the caller]");
     sqlite.prepare(`SELECT response, review_kind, review_reason, version FROM tq_rows WHERE id='ai01'`).all()[0];
 
   // 1. The AMO 4:2 shape. Only our export and the pipeline moved master, so the
-  //    app edit wins — and it is still flagged, because a human should look.
+  //    app edit wins — and, since 2026-09-02, WITHOUT a review flag: the decision
+  //    rested on a complete lineage walk with no Door43 editor's commit, so there
+  //    is nothing for a translator to verify. (JER tq 3:6/3:8/3:19 sat under a
+  //    "Kept over Door43 — verify" chip for days against bp-assistant's own
+  //    evening push; the chip's text said no editor was involved.)
   {
     const { sqlite, env } = freshEnv();
     const boundary = seedContested(sqlite);
+    const versionBefore = readRow(sqlite).version;
     const counts = await applyTsvRows(env, BOOK, "tq", [masterRowAt("the AI run's response")], null, {
       confirmedAt: 200, editId: boundary, lineage: AI_ONLY,
     });
     const row = readRow(sqlite);
     eq(row.response, "our response", "the app edit is KEPT — master's AI-authored value never lands");
-    eq(counts.merge_kept_ai, 1, "…counted as merge_kept_ai");
+    eq(counts.merge_kept_ai, 1, "…counted as merge_kept_ai, so the run summary still reports it");
     eq(counts.merge_adopted, 0, "…and never counted as an adoption");
     eq(counts.merge_refused, 0, "…and never as a refusal, which would freeze the export at 5");
     eq(counts.apply_incomplete, false, "…and does NOT withhold the watermark: the export must publish this");
-    // A DISTINCT review_kind, not just distinct prose: the cleanup chip titles
-    // itself from this column, and "Merged Door43 edit" over a kept row is the
-    // reverse of what happened.
-    eq(row.review_kind, "merge_kept", "…the row is flagged for review, as a KEPT row");
-    eq(
-      row.review_reason.startsWith("Your response was kept over Door43's"),
-      true,
-      "…the reason leads with the outcome (the chip clamps to two lines)",
-    );
-    eq(
-      row.review_reason.includes("no commit from a Door43 editor's own account was found"),
-      true,
-      "…and states the measured cause, not an inferred one",
-    );
-    eq(
-      row.review_reason.includes("was merged over your app-side change"),
-      false,
-      "…never the opposite claim, that Door43's edit won",
-    );
-    eq(
-      row.review_reason.includes("will be published to Door43"),
-      false,
-      "…and never promises a publish this per-row code cannot schedule",
-    );
-    eq(row.version, 4, "…the flag write bumps the version once");
+    eq(row.review_kind, null, "…and the row is NOT flagged: the finding was measured, not inferred");
+    eq(row.review_reason, null, "…no reason text either");
+    // A kept-alone row makes no write at all — no flag-only write, so no
+    // version bump to 409 an open tab (#539).
+    eq(row.version, versionBefore, "…and no write happened: the version is untouched");
 
-    // 2. Re-running the same night's shape must not churn the version. The
-    //    condition recurs every sync until a human resolves it, and a flag-only
-    //    write is still a write (#539).
+    // 2. Re-running the same night's shape is equally silent. The condition
+    //    recurs every sync until the export publishes the kept value.
     const again = await applyTsvRows(env, BOOK, "tq", [masterRowAt("the AI run's response")], null, {
       confirmedAt: 200, editId: boundary, lineage: AI_ONLY,
     });
     eq(again.merge_kept_ai, 1, "the conflict is still detected on the next run");
-    eq(readRow(sqlite).version, 4, "…but an unchanged flag is not re-written");
+    eq(readRow(sqlite).version, versionBefore, "…and still writes nothing");
+  }
+
+  // 2b. The MIXED row: master moved a field the translator never touched (question)
+  //     AND the contested field (response). The untouched field is adopted — a
+  //     real content write, with a version bump and an `update` audit row — while
+  //     the contested one is kept, and still no review flag results.
+  {
+    const { sqlite, env } = freshEnv();
+    const boundary = seedContested(sqlite);
+    const versionBefore = readRow(sqlite).version;
+    const counts = await applyTsvRows(
+      env,
+      BOOK,
+      "tq",
+      [{ ...masterRowAt("the AI run's response"), question: "master's reworded question" }],
+      null,
+      { confirmedAt: 200, editId: boundary, lineage: AI_ONLY },
+    );
+    const row = sqlite
+      .prepare(`SELECT question, response, review_kind, version FROM tq_rows WHERE id='ai01'`)
+      .all()[0];
+    eq(row.response, "our response", "the contested field is kept");
+    eq(row.question, "master's reworded question", "…the field only master moved is adopted");
+    eq(counts.merge_kept_ai, 1, "…counted as kept");
+    eq(counts.merge_adopted, 1, "…and as an adoption");
+    eq(row.review_kind, null, "…and still no review flag");
+    eq(row.version, versionBefore + 1, "…the adoption is a real write: one version bump");
+    const audit = sqlite.prepare(`SELECT action FROM edit_log WHERE row_key = 'ai01' ORDER BY id DESC LIMIT 1`).all()[0];
+    eq(audit?.action, "update", "…with an update audit row behind it");
   }
 
   // 3. A human commit on master since the ancestor: unchanged behaviour, master
@@ -1805,14 +1820,13 @@ console.log("\n[#653: master AI-edited AFTER the import — a real conflict, res
   eq(counts.merge_kept_ai, 1, "both sides moved the question -> keep_ai_master, D1 wins");
   eq(counts.merge_no_base, 0, "…and it is NOT reported as unattributable");
   const row = sqlite.prepare(`SELECT review_kind, question, review_master_json FROM tq_rows WHERE id='ca02'`).all()[0];
-  eq(row.review_kind, "merge_kept", "the row is flagged merge_kept");
-  eq(row.question, "app question", "…the translator's question is kept");
   eq(
-    parseSnap(row.review_master_json).question,
-    "ai-rewritten question",
-    "…and Door43's own value is recorded with the flag (#653 piece 4)",
+    row.review_kind,
+    null,
+    "the row is NOT flagged: keep_ai_master rests on a complete no-human lineage, so there is nothing to verify",
   );
-  eq(parseSnap(row.review_master_json).ref_raw, "9:9", "…ref_raw rides in the snapshot too");
+  eq(row.question, "app question", "…the translator's question is kept");
+  eq(row.review_master_json, null, "…and no snapshot is written — a kept-alone row makes no write at all");
 }
 
 console.log("\n[#653: a create-as-ancestor base may EXONERATE but never CONVICT]");
@@ -1864,7 +1878,7 @@ console.log("\n[#653: a create-as-ancestor base may EXONERATE but never CONVICT]
 
   // 2. Same row, but the lineage EXPLICITLY rules out a human behind master.
   //    keep_ai_master is a D1-wins outcome, so it survives the floor — the
-  //    translator keeps her text and gets the merge_kept chip.
+  //    translator keeps her text, and with no chip: the outcome was measured.
   {
     const { sqlite, env } = freshEnv();
     const boundary = seedProvisional(sqlite, "pv02");
@@ -1874,7 +1888,7 @@ console.log("\n[#653: a create-as-ancestor base may EXONERATE but never CONVICT]
     eq(counts.merge_kept_ai, 1, "a D1-wins conflict still fires under a clean lineage");
     const row = sqlite.prepare(`SELECT question, review_kind FROM tq_rows WHERE id='pv02'`).all()[0];
     eq(row.question, "her newest edit", "…her text is kept");
-    eq(row.review_kind, "merge_kept", "…with the chip that says so");
+    eq(row.review_kind, null, "…with no review chip — a measured keep asks nothing of her");
   }
 
   // 3. Master moved a field the translator never touched. Adopting would be
@@ -3354,6 +3368,91 @@ console.log("\n[#683: the sweep reaches books no run visits, and pre-#653 flags 
       globalThis.fetch = realFetch;
     }
   }
+}
+
+console.log("\n[merge_kept retire: standing flags come down, D1-only, and nothing else is touched]");
+{
+  // PROD SHAPE: JER tq 3:6 / 3:8 / 3:19, flagged merge_kept on 2026-08-29 against
+  // bp-assistant's own evening push — the flag kind is retired (see the
+  // keep_ai_master branch), and every standing one was minted on the very
+  // measurement that retired it, so the sweep needs no Door43 walk to justify
+  // the clear. Sibling kinds and tombstones must come through untouched.
+  const { sqlite, env } = freshEnv();
+  const seed = (id, kind, reason, deletedAt = null) =>
+    sqlite
+      .prepare(
+        `INSERT INTO tq_rows (id, book, chapter, verse, ref_raw, question, response, version,
+                              review_kind, review_reason, review_master_json, updated_at, deleted_at)
+         VALUES (?, ?, 3, 6, '3:6', 'q', 'r', 4, ?, ?, ?, 1000, ?)`,
+      )
+      .run(id, BOOK, kind, reason, kind ? JSON.stringify({ ref_raw: "3:6", response: "Door43's AI response" }) : null, deletedAt);
+  seed("mk01", "merge_kept", "Your response was kept over Door43's, and the next export…");
+  seed("mk02", "merge_kept", "Your question was kept over Door43's, and the next export…");
+  seed("mk99", "merge_kept", "kept, on a tombstone", 999);
+  seed("mc01", "merge_conflict", "A Door43 edit to this row's response was merged over your app-side change.");
+  seed("nb01", "merge_no_base", "Nothing was overwritten. Check this row against Door43's version…");
+  seed("ok01", null, null);
+
+  let fetches = 0;
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async () => {
+    fetches++;
+    throw new Error("the retire must not walk Door43");
+  };
+  let result;
+  try {
+    result = await retireMergeKeptFlags(env);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+  eq(result.flagged, 2, "the two live merge_kept rows are found (the tombstone is not)");
+  eq(result.cleared, 2, "…and both are retired");
+  eq(fetches, 0, "…without a single Gitea fetch: the mint was the measurement");
+
+  const byId = Object.fromEntries(
+    sqlite
+      .prepare(
+        `SELECT id, review_kind, review_reason, review_master_json, version, updated_at,
+                last_change_action, last_change_source, last_change_actor FROM tq_rows`,
+      )
+      .all()
+      .map((r) => [r.id, r]),
+  );
+  eq(byId.mk01.review_kind, null, "mk01's flag is gone");
+  eq(
+    [byId.mk01.last_change_action, byId.mk01.last_change_source, byId.mk01.last_change_actor],
+    ["review_clear", "system", "nightly merge_kept flag retirement"],
+    "…stamped as unattended housekeeping, not as a Door43 sync (Door43 had no part in it)",
+  );
+  eq(byId.ok01.last_change_source, null, "…and an untouched row's provenance is untouched");
+  eq(byId.mk01.review_reason, null, "…reason too");
+  eq(byId.mk01.review_master_json, null, "…and its snapshot");
+  eq(byId.mk02.review_kind, null, "mk02's flag is gone");
+  eq([byId.mk01.version, byId.mk02.version], [4, 4], "…with no version bump, so an open editor's If-Match still holds");
+  eq(byId.mk01.updated_at > 1000, true, "…updated_at moves, like every other flag clear");
+  eq(byId.mk99.review_kind, "merge_kept", "a tombstoned row is never touched");
+  eq(byId.mc01.review_kind, "merge_conflict", "a master-wins flag (a Door43 human may be behind it) stays");
+  eq(byId.nb01.review_kind, "merge_no_base", "an unattributable flag stays for its own clear");
+  eq(byId.ok01.updated_at, 1000, "an unflagged row is not written at all");
+
+  const logs = sqlite
+    .prepare(`SELECT row_key, payload_json FROM edit_log WHERE action = 'sync_clear_review' ORDER BY row_key`)
+    .all();
+  eq(logs.map((l) => l.row_key), ["mk01", "mk02"], "one audit row per retired flag");
+  const payload = JSON.parse(logs[0].payload_json);
+  eq(payload.review_kind, "merge_kept", "…naming the kind that was retired");
+  eq(JSON.parse(payload.review_master_json).response, "Door43's AI response", "…and carrying the snapshot the flag was about");
+  eq(payload.evidence.retired_kind, true, "…marked as a kind retirement, not a lineage-justified clear");
+
+  // Idempotent: the next night finds nothing and writes nothing.
+  const again = await retireMergeKeptFlags(env);
+  eq(again.flagged, 0, "a second pass finds no standing merge_kept flag");
+  eq(again.cleared, 0, "…and clears nothing");
+  eq(
+    sqlite.prepare(`SELECT COUNT(*) AS n FROM edit_log WHERE action = 'sync_clear_review'`).all()[0].n,
+    2,
+    "…and adds no audit rows",
+  );
 }
 
 if (failed > 0) {

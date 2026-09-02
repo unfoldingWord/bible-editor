@@ -57,14 +57,12 @@ export function summarizeReimport(res: ReimportResponse): string {
   const keptOverDoor43 = t.merge_kept_ai ?? 0;
   const mergedFromDoor43 = Math.max(0, (t.merge_conflicts ?? 0) - keptOverDoor43);
   if (mergedFromDoor43) parts.push(`${mergedFromDoor43} flagged for review (merge conflict)`);
-  // Names the direction, like every other line in this list, and does not
-  // promise a publish it cannot schedule — the export is the nightly one, not
-  // something the reader of this snackbar triggers.
+  // Names the direction, like every other line in this list. No "check before
+  // the next export": these rows no longer carry a review flag (the outcome was
+  // measured, not inferred — see the keep_ai_master branch in bookReimport.ts),
+  // so there is nothing for the reader to go and check.
   if (keptOverDoor43)
-    parts.push(
-      `${keptOverDoor43} kept the app's version over Door43's (no Door43 editor's commit found) — ` +
-        `check before the next export`,
-    );
+    parts.push(`${keptOverDoor43} kept the app's version over Door43's (no Door43 editor's commit found)`);
   // Rows whose Reference disagrees between the app and Door43. Split by who
   // moved (api/src/tsvMerge.ts's classifyTsvRefMove) because only the held cases
   // need anyone's attention — a move the app made is an ordinary edit the export

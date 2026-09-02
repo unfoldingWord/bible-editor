@@ -146,8 +146,10 @@ function altLabelProblems(note: string): string[] {
 // `review_kind`, because the outcomes it covers say OPPOSITE things and the chip
 // title is the first — often the only — line a translator reads:
 //   merge_conflict — Door43's value replaced theirs.
-//   merge_kept     — theirs was kept over Door43's, and the next export
-//                    publishes it there (#540 item 2).
+//   merge_kept     — RETIRED kind, no longer minted: theirs was kept over
+//                    Door43's on a measured no-human lineage (#540 item 2).
+//                    Kept here so a flag still standing between deploy and the
+//                    nightly retire sweep titles correctly.
 //   ref_moved      — nothing was merged at all; the two sides disagree about
 //                    where the row belongs.
 // Hard-coding "Merged Door43 edit" for every flag, as tq/twl did, told a reader

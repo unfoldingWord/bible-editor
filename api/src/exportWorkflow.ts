@@ -77,6 +77,7 @@ import { runPostExport, VALIDATORS } from "./postExport";
 import {
   runChunkedReimport,
   storedResourceSha,
+  retireMergeKeptFlags,
   sweepStaleMergeNoBase,
   ALL_RESOURCES as REIMPORT_RESOURCES,
 } from "./bookReimport";
@@ -375,7 +376,14 @@ export class ExportWorkflow extends WorkflowEntrypoint<Env, ExportParams> {
       const sweepScopeIsFullNightly = !params.book && !params.resource && !params.resources?.length;
       if (!params.dryDcs && sweepScopeIsFullNightly) {
         try {
-          await step.do("sweep-stale-review-flags", async () => sweepStaleMergeNoBase(this.env));
+          await step.do("sweep-stale-review-flags", async () => {
+            const noBase = await sweepStaleMergeNoBase(this.env);
+            // Same gates, same step: `merge_kept` is a retired flag kind, and
+            // every standing one was minted on the measurement that retired it
+            // (see retireMergeKeptFlags). D1-only — no Door43 walk.
+            const kept = await retireMergeKeptFlags(this.env);
+            return { noBase, kept };
+          });
         } catch (e) {
           console.error("export stale review-flag sweep failed", {
             error: e instanceof Error ? e.message : String(e),
